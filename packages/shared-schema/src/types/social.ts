@@ -1,6 +1,8 @@
 // Social / Follow types
 
 export type PublicUserProfile = {
+  isPrivate?: boolean;
+  canViewActivity?: boolean;
   id: string;
   displayName?: string;
   avatarUrl?: string;
@@ -110,6 +112,7 @@ export type SocialEventType =
   | 'comment.reply'
   | 'vote.cast'
   | 'follow.created'
+  | 'follow.requested'
   | 'climb.created'
   | 'ascent.logged'
   | 'proposal.created'

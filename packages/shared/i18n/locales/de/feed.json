@@ -22,6 +22,60 @@
         "everyone": "Alle",
         "findGym": "Halle in deiner Nähe finden",
         "hint": "Legt fest, wessen Boulder du siehst"
+      },
+      "sections": {
+        "week": {
+          "title": "Diese Woche",
+          "sessions_one": "{{count}} Session",
+          "sessions_other": "{{count}} Sessions",
+          "sends_one": "{{count}} Begehung",
+          "sends_other": "{{count}} Begehungen",
+          "hardest": "Am schwersten diese Woche: {{grade}}",
+          "weeksRunning_one": "{{count}} Woche am Stück",
+          "weeksRunning_other": "{{count}} Wochen am Stück",
+          "recordFirstGrade": "Neu: dein erster {{grade}}",
+          "recordHardestFlash": "Neu: dein schwerster Flash, {{grade}}",
+          "recordClimb": "{{record}} · {{climb}}",
+          "empty": "Trag eine Begehung ein, um deine Woche zu starten",
+          "dayClimbed": "{{day}}, geklettert",
+          "openRecord": "{{climb}} öffnen"
+        },
+        "session": {
+          "startTitle": "Starte eine Session",
+          "startBody": "Wähl ein Workout oder kletter einfach",
+          "running": "Session läuft",
+          "open": "Session öffnen",
+          "lastWorkoutToday": "Letztes Workout · Heute",
+          "lastWorkoutYesterday": "Letztes Workout · Gestern",
+          "lastWorkoutOn": "Letztes Workout · {{day}}",
+          "lastWorkoutSends_one": "{{count}} Begehung",
+          "lastWorkoutSends_other": "{{count}} Begehungen"
+        },
+        "projects": {
+          "title": "Zurück zu deinen Projekten",
+          "tries_one": "{{count}} Versuch",
+          "tries_other": "{{count}} Versuche",
+          "seeAll": "Alle ansehen",
+          "unknownClimb": "Unbekannter Boulder"
+        },
+        "playlists": {
+          "title": "Auf deinem Level, noch nicht getoppt",
+          "all": "Alle Playlists"
+        },
+        "empty": {
+          "title": "Dein Start ist leer",
+          "body": "Schalte Abschnitte wieder ein, um dein Board, deine Session oder deine Crew zu sehen."
+        },
+        "beta": {
+          "title": "Frische Beta",
+          "titleBoard": "Frische Beta auf diesem Board",
+          "empty": "Noch keine Beta-Videos",
+          "error": "Beta-Videos ließen sich nicht laden.",
+          "offline": "Kein Netz. Frische Beta taucht wieder auf, sobald du online bist.",
+          "offlineMode": "Offline-Modus ist an. Frische Beta taucht wieder auf, sobald du ihn ausschaltest.",
+          "unknownClimb": "Unbekannter Boulder",
+          "openClimb": "{{climb}} öffnen"
+        }
       }
     },
     "liveSessions": {

@@ -90,13 +90,15 @@ vi.mock('../../lib/graphql/ws-client', () => ({ getWsClient: () => ws.client }))
 vi.mock('../../lib/session-store', () => sessionStore);
 vi.mock('../../lib/queue-snapshot-store', () => ({
   getStoredQueueSnapshot: vi.fn(async () => null),
+  getQueueSnapshotGeneration: () => 0,
   setStoredQueueSnapshot: vi.fn(async () => {}),
   clearStoredQueueSnapshot: vi.fn(async () => {}),
 }));
 vi.mock('../../lib/active-board-store', () => ({ getStoredActiveBoard: activeBoard.getStoredActiveBoard }));
 vi.mock('../../lib/graphql/use-active-board', () => ({
+  getActiveBoardWriteGeneration: () => 0,
   useActiveBoard: () => ({ data: activeBoard.stored }),
-  useSetActiveBoard: () => vi.fn(async () => {}),
+  useSetActiveBoard: () => vi.fn(async () => true),
 }));
 vi.mock('../../lib/graphql/client', () => ({ getHttpClient: () => ({ request: http.request }) }));
 vi.mock('../../lib/analytics', () => ({ track: vi.fn(), registerRenderSuperProperties: vi.fn() }));

@@ -2,8 +2,15 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { HeadObjectCommand, ListObjectsV2Command, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import { desiredR2Buckets } from '../infra/cloudflare/config';
+import {
+  GetObjectCommand,
+  HeadObjectCommand,
+  ListObjectsV2Command,
+  PutObjectCommand,
+  S3Client,
+  type ListObjectsV2CommandOutput,
+} from '@aws-sdk/client-s3';
+import { ASSETS_STAGING_HOSTNAME, desiredR2Buckets } from '../infra/cloudflare/config';
 import { STATIC_ASSET_OBJECT_KEYS, STATIC_ASSET_ORIGIN } from '../packages/shared/static-assets/src';
 import type { StaticAssetManifest, StaticAssetRecord } from '../packages/shared/static-assets/src';
 import {
@@ -36,6 +43,7 @@ import {
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PUBLIC_VALIDATION_ATTEMPTS = 6;
 const PUBLIC_VALIDATION_REQUEST_TIMEOUT_MS = 30_000;
+const SIGNED_GET_TIMEOUT_MS = 30_000;
 const MAX_REQUEST_STARTS_PER_SECOND = 5;
 
 function requiredEnvironment(name: string): string {
@@ -56,22 +64,51 @@ function loadCurrentStaticAssetManifest(): StaticAssetManifest {
   return freshManifest;
 }
 
-async function listRemoteStaticAssets(
+const delay = (milliseconds: number): Promise<void> =>
+  new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
+
+interface ListRetryOptions {
+  retryDelaysMs?: readonly number[];
+  sleep?: (milliseconds: number) => Promise<void>;
+}
+
+/**
+ * Waits before the second and third try of one listing page. R2 once answered a
+ * ListObjectsV2 with a body the SDK could not parse ("XML parse error: unexpected
+ * content", run 41641393063, 2026-11-03). The SDK's own retries never see that,
+ * because it fails while reading the response, after the retry decision. Listing
+ * is read-only, so retrying the page is safe.
+ */
+export const LIST_PAGE_RETRY_DELAYS_MS = [2_000, 8_000] as const;
+
+export async function listRemoteStaticAssets(
   client: S3Client,
   bucket: string,
   beforeRequest: RequestStartLimiter,
+  { retryDelaysMs = LIST_PAGE_RETRY_DELAYS_MS, sleep = delay }: ListRetryOptions = {},
 ): Promise<RemoteStaticAsset[]> {
   const objects: RemoteStaticAsset[] = [];
   let continuationToken: string | undefined;
   do {
-    await beforeRequest();
-    const response = await client.send(
-      new ListObjectsV2Command({
-        Bucket: bucket,
-        Prefix: `${STATIC_ASSET_KEY_PREFIX}/`,
-        ContinuationToken: continuationToken,
-      }),
-    );
+    const command = new ListObjectsV2Command({
+      Bucket: bucket,
+      Prefix: `${STATIC_ASSET_KEY_PREFIX}/`,
+      ContinuationToken: continuationToken,
+    });
+    let response: ListObjectsV2CommandOutput;
+    for (let attempt = 1; ; attempt += 1) {
+      await beforeRequest();
+      try {
+        response = await client.send(command);
+        break;
+      } catch (error) {
+        if (attempt > retryDelaysMs.length) throw error;
+        const delayMs = retryDelaysMs[attempt - 1]!;
+        const reason = error instanceof Error ? error.message : String(error);
+        console.warn(`Listing stored assets failed (${reason}); retrying in ${delayMs / 1000}s.`);
+        await sleep(delayMs);
+      }
+    }
     for (const object of response.Contents ?? []) {
       if (object.Key) objects.push({ key: object.Key, bytes: object.Size });
     }
@@ -110,10 +147,7 @@ async function uploadAsset(
   });
 }
 
-const delay = (milliseconds: number): Promise<void> =>
-  new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
-
-async function validateRemoteAsset(
+export async function validateRemoteAsset(
   client: S3Client,
   bucket: string,
   asset: StaticAssetRecord,
@@ -123,12 +157,31 @@ async function validateRemoteAsset(
   const response = await client.send(
     new HeadObjectCommand({ Bucket: bucket, Key: asset.objectKey, ChecksumMode: 'ENABLED' }),
   );
-  assertRemoteStaticAssetMetadata(asset, {
-    bytes: response.ContentLength,
-    contentType: response.ContentType,
-    cacheControl: response.CacheControl,
-    checksumSha256: response.ChecksumSHA256,
-  });
+  let downloadedContents: Uint8Array | undefined;
+  if (!response.ChecksumSHA256) {
+    console.log(`S3 HEAD checksum missing for ${asset.logicalPath}; hashing signed GET bytes.`);
+    await beforeRequest();
+    const signal = AbortSignal.timeout(SIGNED_GET_TIMEOUT_MS);
+    const download = await client.send(new GetObjectCommand({ Bucket: bucket, Key: asset.objectKey }), {
+      abortSignal: signal,
+    });
+    if (!download.Body) throw new Error(`S3 GET body missing for ${asset.logicalPath}`);
+    downloadedContents = await readResponseBodyWithinLimit(
+      new Response(download.Body.transformToWebStream()),
+      asset.bytes,
+      signal,
+    );
+  }
+  assertRemoteStaticAssetMetadata(
+    asset,
+    {
+      bytes: response.ContentLength,
+      contentType: response.ContentType,
+      cacheControl: response.CacheControl,
+      checksumSha256: response.ChecksumSHA256,
+    },
+    downloadedContents,
+  );
 }
 
 /**
@@ -147,7 +200,7 @@ const CORS_PROBE_SAMPLE_SIZE = 5;
  * Measured 2026-09-15: Tigris sends `access-control-allow-origin: *` on every
  * response; R2 sends it only in reply to a request that carried `Origin`. The
  * board art is loaded both ways — `<img src>` sends no Origin, while
- * `ensureImagesPreloaded` in packages/web/app/lib/board-render-worker/worker-manager.ts
+ * the Expo worker in packages/mobile/public/wasm/board-render.worker.js
  * does a real `fetch()` — and Cloudflare does not key its cache on `Vary` below
  * Enterprise, so the header-less copy can be served to the `fetch()`. It fails
  * CORS, the failure is swallowed as a `console.warn`, and the board renders with
@@ -236,11 +289,8 @@ export function resolvePublicStaticAssetOrigin(environment: Record<string, strin
 /**
  * Whether the public origin is expected to be served by Cloudflare.
  *
- * Derived from the desired R2 state rather than an env knob, so it is true for
- * exactly the hostnames this repo has declared as R2 custom domains — and turns
- * itself on for `assets.boardsesh.com` in the same commit that moves the bucket
- * onto it. Today that hostname is still the DNS-only Tigris CNAME, where there
- * is no `cf-ray` and asserting one would break every production publish.
+ * Desired R2 custom domains and the explicitly retained staging hostname must
+ * prove Cloudflare delivery during publication and migration verification.
  */
 export function expectsCloudflareOrigin(origin: string): boolean {
   const hostname = (() => {
@@ -250,22 +300,27 @@ export function expectsCloudflareOrigin(origin: string): boolean {
       return '';
     }
   })();
-  return desiredR2Buckets.some((bucket) => bucket.customDomain === hostname);
+  return hostname === ASSETS_STAGING_HOSTNAME || desiredR2Buckets.some((bucket) => bucket.customDomain === hostname);
 }
 
-async function validatePublicAsset(asset: StaticAssetRecord, beforeRequest: RequestStartLimiter): Promise<void> {
-  const origin = resolvePublicStaticAssetOrigin();
+export async function validatePublicAsset(
+  asset: StaticAssetRecord,
+  beforeRequest: RequestStartLimiter,
+  fetchImpl: typeof fetch = fetch,
+  origin: string = resolvePublicStaticAssetOrigin(),
+): Promise<void> {
   const url = `${origin}/${asset.objectKey}`;
   let lastError: unknown;
   for (let attempt = 1; attempt <= PUBLIC_VALIDATION_ATTEMPTS; attempt += 1) {
     try {
       await beforeRequest();
-      const response = await fetch(url, {
+      const signal = AbortSignal.timeout(PUBLIC_VALIDATION_REQUEST_TIMEOUT_MS);
+      const response = await fetchImpl(url, {
         headers: { Origin: 'https://www.boardsesh.com' },
         // A half-open CDN connection must not hold the serialized production
         // deployment indefinitely. Each aborted attempt follows the same
         // bounded retry path as other transient network failures.
-        signal: AbortSignal.timeout(PUBLIC_VALIDATION_REQUEST_TIMEOUT_MS),
+        signal,
       });
       if (!response.ok) {
         const httpError = new Error(`HTTP ${response.status}`);
@@ -273,7 +328,7 @@ async function validatePublicAsset(asset: StaticAssetRecord, beforeRequest: Requ
         throw httpError;
       }
       assertPublicStaticAssetHeaders(asset, response.headers, { expectCloudflare: expectsCloudflareOrigin(origin) });
-      const contents = await readResponseBodyWithinLimit(response, asset.bytes);
+      const contents = await readResponseBodyWithinLimit(response, asset.bytes, signal);
       if (contents.byteLength !== asset.bytes) {
         throw new Error(`Byte-length mismatch: expected ${asset.bytes}, received ${contents.byteLength}`);
       }

@@ -1,0 +1,92 @@
+appId: com.boardsesh.app.dev
+name: Tutorial - real photo spray wall
+---
+# Enter through the owned wall card so the renderer has its real photo/hold registry.
+- openLink: com.boardsesh.app://boards
+- waitForAnimationToEnd
+- tapOn: Tutorial Spray Wall
+- extendedWaitUntil:
+    visible: Crew Project
+    timeout: 90000
+- tapOn: Crew Project
+- extendedWaitUntil:
+    visible: '.*Board:.*'
+    timeout: 90000
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/flow-start')}
+- assertVisible: '.*Board:.*'
+- assertVisible: Crew Project
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/photo')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true
+- swipe:
+    start: '85%,42%'
+    end: '18%,42%'
+    duration: 400
+- waitForAnimationToEnd
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/highlight')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true
+- openLink: com.boardsesh.app://settings/board-look
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element: Use my look on spray walls
+    centerElement: true
+    direction: DOWN
+    timeout: 90000
+- runFlow:
+    when:
+      notVisible:
+        rightOf: Use my look on spray walls
+        below: Spray walls
+        above: Board lighting
+        checked: true
+    commands:
+      - tapOn:
+          rightOf: Use my look on spray walls
+          below: Spray walls
+          above: Board lighting
+          checked: false
+- assertVisible:
+    rightOf: Use my look on spray walls
+    below: Spray walls
+    above: Board lighting
+    checked: true
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/look')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true
+- openLink: com.boardsesh.app://boards
+- waitForAnimationToEnd
+- tapOn: Tutorial Spray Wall
+- extendedWaitUntil:
+    visible: Crew Project
+    timeout: 90000
+- tapOn: Crew Project
+- extendedWaitUntil:
+    visible: '.*Board:.*'
+    timeout: 90000
+- assertVisible: Crew Project
+- openLink: com.boardsesh.app://boards
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element: Open details for Tutorial Spray Wall
+    direction: DOWN
+    timeout: 90000
+- tapOn: Open details for Tutorial Spray Wall
+- tapOn: Share link
+- assertVisible: Share this wall
+- assertVisible: QR code for Tutorial Spray Wall
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/share')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true
+# Dismiss both real sheets after the readable QR hold, before the capture tail.
+- back
+- assertNotVisible: Share this wall
+- back

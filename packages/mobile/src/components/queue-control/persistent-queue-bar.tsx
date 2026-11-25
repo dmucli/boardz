@@ -2,65 +2,65 @@
  * PersistentQueueBar — the persistent climb toolbar that mounts at the app root
  * and is visible on every screen while a current climb is set.
  *
- * It is a thin adapter: it decides *whether* the climb bar should show (a current
- * climb exists and the native iOS 26 bottom accessory isn't already owning it),
+ * It is a thin adapter: it decides *whether* the climb bar should show (a climb
+ * to show exists, the climber's last pick or the queue's current, and the
+ * native iOS 26 bottom accessory isn't already owning it),
  * then lays it out per variant via {@link ActiveContextBar}:
  *
  *   Liquid Glass / fallback   [ grade · name ]        [ ✓ tick ]
- *     centered capsule + standalone hero tick (tap = PlayDrawer, swipe = prev/next)
+ *     centered capsule + standalone hero tick (tap = PlayDrawer)
  *
- *   Material                  [ ▢ grade · name              ✓ ]
- *     one full-width opaque active-context bar docked above the tab bar
+ *   Material                 ╭ ▢ name · byline   ⏭  💡  ✓ ╮
+ *     the MiniPlayer card (`FloatingMiniPlayerCard`): the iOS accessory's row
+ *     on a rounded M3 card, 8dp in from each edge, sitting straight on the tab bar
  *
  * On the Liquid Glass variant on iOS 26 the native bottom accessory owns this
- * pair, so `jsQueueToolbarVisible` is false here and this returns null.
+ * pair (iPhone and iPad), so `useCurrentClimbSurface` answers `nativeAccessory`
+ * and this returns null.
  */
 
-import { useWindowDimensions } from 'react-native';
 import { useSegments } from 'expo-router';
-import {
-  MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT,
-  SIDEBAR_WIDTH,
-  TOOLBAR_RESERVE,
-  TAB_BAR_HEIGHT,
-  glassSize,
-} from '../../theme/layout';
-import { resolveDetailPaneSurface } from '../../theme/size-class';
-import { useQueue, useQueueSessionId } from '../../providers/queue-provider';
+import { Platform } from 'react-native';
+import { MATERIAL_MINI_PLAYER_CARD_GAP, TOOLBAR_RESERVE, TAB_BAR_HEIGHT, glassSize } from '../../theme/layout';
+import { useQueueSessionId } from '../../providers/queue-provider';
 import { useTheme } from '../../providers/theme-provider';
-import { selectByVariant } from '../../theme/variants';
+import { resolveMiniPlayerHost } from '../../hooks/mini-player-host';
 import { isTopLevelTabRoute, tabsActiveSegment } from '../../lib/route-segments';
-import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
-import { useDeviceLayout } from '../../hooks/use-device-layout';
+import { useCurrentClimbSurface } from '../../hooks/use-current-climb-surface';
 import { ActiveContextBar } from './ActiveContextBar';
 import { ClimbCapsule } from './ClimbCapsule';
 import { LogAscentFab } from './LogAscentFab';
-import { LogAscentToolbarButton } from './LogAscentToolbarButton';
+import { MATERIAL_MINI_PLAYER_CARD_INSET } from './mini-player-controls';
+import { FloatingMiniPlayerCard } from '../navigation/FloatingMiniPlayerCard';
+import { TabBarHideFollower } from '../navigation/TabBarHideFollower';
 import { ReturnToSessionButton } from './ReturnToSessionButton';
+import { useBarClimb } from './use-bar-climb';
 
 // Re-export so layout consumers that already import toolbar metrics from this
 // module don't need to know which file owns them. Source of truth: theme/layout.
 export { TOOLBAR_RESERVE, TAB_BAR_HEIGHT };
 
 export function PersistentQueueBar() {
-  const { state } = useQueue();
   const { variant } = useTheme();
   const segments = useSegments();
-  const bottomChrome = useBottomChromeMetrics();
-  const { widthClass } = useDeviceLayout();
-  const { width } = useWindowDimensions();
+  const { home, sidebarShell } = useCurrentClimbSurface();
+  const miniPlayerHost = resolveMiniPlayerHost({ home, variant, platformOS: Platform.OS, sidebarShell });
+  const browserSidebar = Platform.OS === 'web' && sidebarShell;
   // sessionId-only subscription (mirrors the tab layout's own read) — a "return to
   // session" affordance while a session is live and the user isn't already on the
   // Record tab.
   const { sessionId } = useQueueSessionId();
 
-  // Queue head only — the wall's lit climb lives in the top "On the wall" strip.
-  const currentClimb = state.currentClimbQueueItem?.climb ?? null;
-  const detailPaneOwnsQueue = resolveDetailPaneSurface({ width, widthClass, sidebarWidth: SIDEBAR_WIDTH }) === 'pane';
+  // The climber's last pick, or the queue's current when THAT changed after it
+  // (owner decision A). Never the wall's lit climb: that lives in the top "On
+  // the wall" strip. ✓ logs the climb the bar shows.
+  const { climb: currentClimb, pick } = useBarClimb();
+  // A pick logs the flip the bar draws, its own; the queue's current, its slot's.
+  const pickMirrored = pick ? pick.mirrored : undefined;
 
-  // The iPad shell shows the current climb in the persistent right-column pane
-  // (IpadPlayPane), so the floating bar must not also render there.
-  if (detailPaneOwnsQueue) return null;
+  // The desktop bar accompanies its selection pane; native tablet panes and
+  // the native accessory still own the climb without a second floating bar.
+  if (home !== 'floatingBar' && miniPlayerHost !== 'materialCard') return null;
   if (!currentClimb) return null;
   // Show the climb bar only on a top-level tab page (a tab's own index), never on a
   // pushed sub-route or any root push/modal. This single gate subsumes the old
@@ -68,25 +68,23 @@ export function PersistentQueueBar() {
   // routes, and every in-tab sub-route is ≥ 3 segments deep, so all of them read as
   // not-top-level here.
   if (!isTopLevelTabRoute(segments)) return null;
-  if (!bottomChrome.jsQueueToolbarVisible && bottomChrome.nativeAccessoryPresented) return null;
 
-  const isMaterial = selectByVariant(variant, { material: true, liquidGlass: false });
-  if (isMaterial) {
+  if (miniPlayerHost === 'materialCard') {
+    // The card logs and lights from its own row, so it needs neither the tick
+    // nor the return-to-session button the glass capsule floats beside it. On an
+    // Android phone it follows the nav bar down when the bar hides on scroll,
+    // landing straight on the gesture inset with every control still there.
     return (
-      <ActiveContextBar
-        fillPrimary
-        dockToTabBar
-        horizontalInset={0}
-        primary={
-          <ClimbCapsule
-            fillWidth
-            height={MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT}
-            surfaceTreatment="docked"
-            endAction={<LogAscentToolbarButton climb={currentClimb} size={glassSize.inline} />}
-            endActionSize={glassSize.inline}
-          />
-        }
-      />
+      <TabBarHideFollower>
+        <ActiveContextBar
+          fillPrimary
+          anchorToMeasuredTabBar={!browserSidebar}
+          alignToContentColumn={browserSidebar}
+          gapAboveTabBar={MATERIAL_MINI_PLAYER_CARD_GAP}
+          horizontalInset={MATERIAL_MINI_PLAYER_CARD_INSET}
+          primary={<FloatingMiniPlayerCard />}
+        />
+      </TabBarHideFollower>
     );
   }
 
@@ -96,15 +94,21 @@ export function PersistentQueueBar() {
   const onRecordTab = tabsActiveSegment(segments) === 'record';
   const showReturnToSession = sessionId !== null && !onRecordTab;
 
+  // The capsule follows the nav bar too: an Android phone with the Liquid Glass
+  // preference still gets the Material bar, which still hides on scroll, and the
+  // rest pill above the capsule moves with it. Wrapping both branches keeps every
+  // floating control in step (on iOS and the web the follower is a passthrough).
   return (
-    <ActiveContextBar
-      primary={
-        <ClimbCapsule
-          endAction={showReturnToSession ? <ReturnToSessionButton /> : undefined}
-          endActionSize={showReturnToSession ? glassSize.inline : undefined}
-        />
-      }
-      trailing={<LogAscentFab climb={currentClimb} />}
-    />
+    <TabBarHideFollower>
+      <ActiveContextBar
+        primary={
+          <ClimbCapsule
+            endAction={showReturnToSession ? <ReturnToSessionButton /> : undefined}
+            endActionSize={showReturnToSession ? glassSize.inline : undefined}
+          />
+        }
+        trailing={<LogAscentFab climb={currentClimb} isMirror={pickMirrored} />}
+      />
+    </TabBarHideFollower>
   );
 }

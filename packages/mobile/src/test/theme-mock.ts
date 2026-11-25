@@ -15,6 +15,8 @@ import {
   brandColorsDark,
   materialSurfaces,
   androidFallbackColors,
+  tertiaryFillFallback,
+  tertiaryGroupedBackgroundFallback,
   materialSurfaceContainers,
 } from '../theme/colors';
 import { buildPaperTheme } from '../theme/paper-theme';
@@ -22,6 +24,9 @@ import {
   resolveActionColors,
   resolveChartColors,
   resolveHeatRamp,
+  resolveSelectionColors,
+  resolveStatusColors,
+  resolveSurfaces,
   sectionCaptionByVariant,
 } from '../theme/variants/variant-tokens';
 import { variantFeatures } from '../theme/variants/variant-features';
@@ -29,9 +34,9 @@ import { variantFeatures } from '../theme/variants/variant-features';
 /**
  * Build a complete `Theme` for unit tests. One factory so every test gets the
  * full shape — including the variant-resolved fields (`actionColors`,
- * `chartColors`, `sectionCaption`) — and a migration that relocates a colour
- * into a new token only updates this file, not the ~25 inline `vi.mock`s that
- * otherwise each hand-roll a partial theme.
+ * `chartColors`, `sectionCaption`, `surfaces`, `selection`, `status`) — and a
+ * migration that relocates a colour into a new token only updates this file,
+ * not the ~25 inline `vi.mock`s that otherwise each hand-roll a partial theme.
  *
  * Pass `{ variant }` / `{ colorScheme }` to resolve everything for that
  * combination the way the provider does, or override any field directly. Uses
@@ -42,9 +47,18 @@ export function makeThemeMock(overrides: Partial<Theme> = {}): Theme {
   const variant = overrides.variant ?? 'liquidGlass';
   const colorScheme = overrides.colorScheme ?? 'light';
   const brand = colorScheme === 'dark' ? brandColorsDark : brandColors;
-  const systemColors =
-    overrides.systemColors ??
-    (variant === 'material' ? materialSurfaces[colorScheme] : androidFallbackColors[colorScheme]);
+  const systemColors = overrides.systemColors ?? {
+    ...(variant === 'material' ? materialSurfaces[colorScheme] : androidFallbackColors[colorScheme]),
+    secondaryGroupedBackground: (variant === 'material' ? materialSurfaces : androidFallbackColors)[colorScheme]
+      .secondaryBackground,
+    tertiaryGroupedBackground: tertiaryGroupedBackgroundFallback(
+      (variant === 'material' ? materialSurfaces : androidFallbackColors)[colorScheme],
+      colorScheme,
+    ),
+    // The provider adds the error role on top of the surface palette (M3 error here).
+    error: brand.error,
+    tertiaryFill: tertiaryFillFallback[variant][colorScheme],
+  };
   // Hoisted for the same reason as the provider: `sheetSurface` is the plain-string
   // ground the @expo/ui sheet background needs, taken from the chart palette.
   const resolvedChartColors = resolveChartColors(variant, colorScheme);
@@ -76,7 +90,11 @@ export function makeThemeMock(overrides: Partial<Theme> = {}): Theme {
       accent: systemColors.accent,
       brandSuccess: brand.success,
       brandPrimary: brand.primary,
+      error: systemColors.error,
     }),
+    surfaces: resolveSurfaces(systemColors),
+    selection: resolveSelectionColors(systemColors, brand.primaryFill, colorScheme),
+    status: resolveStatusColors(systemColors),
     chartColors: resolvedChartColors,
     heatRamp: resolveHeatRamp(colorScheme),
     sheetSurface: resolvedChartColors.secondaryBackground,

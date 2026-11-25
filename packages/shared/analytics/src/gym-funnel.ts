@@ -33,7 +33,7 @@
 //
 // Two amendments to #4374's literal wording, both documented at the type they
 // affect: `admin_review` (not `admin_sent`), and the three `GymPageCta` members
-// that have no call site. Full write-up: docs/gym-funnel-analytics.md.
+// that have no call site. Full write-up: docs/analytics/gym-funnel-analytics.md.
 
 import type { AnalyticsPropertyValue } from './client';
 
@@ -80,8 +80,39 @@ export type GymClaimViewerState = 'signed-in' | 'signed-out';
  *                      NOT in #4374's list; added because the call site is real
  *                      and folding it into the directory would mix "browsing
  *                      the directory" with "about to create a duplicate".
+ *  - `similar-gyms-refusal` — Claim on a gym listed in the "Is it one of these?"
+ *                      dialog, shown when createGym refuses a gym that looks
+ *                      listed (GYM_SIMILAR_EXISTS). Its own value, not
+ *                      `similar-gyms`: the climber already pressed Save, so a
+ *                      claim here is a duplicate the server stopped, not one
+ *                      the live suggestions caught.
+ *  - `gym-page-header` — "Run this gym? Claim it" in the run-by line under the
+ *                      gym page's H1 (packages/web/app/gym/[gym_slug]/gym-run-by-line.tsx).
+ *                      Its own value, not `gym-page`: the call-out and the line
+ *                      sit on the same page, and the point of the line is to
+ *                      learn whether a claim offer in the first screen is found.
+ *  - `directory-result` — the Claim this gym button a result card carries in
+ *                      the directory's claim mode (`/gyms?claim=1`). Per gym,
+ *                      so `gymUuid` is set. Not the retired `directory-card`,
+ *                      which counted a prompt on every row of every visit.
+ *  - `manage-lock`   — Claim this gym on the manage page's "you can't edit this
+ *                      gym" state (packages/web/app/gym/[gym_slug]/manage/manage-no-access-actions.tsx).
+ *  - `app-gym-list`  — Claim this gym on an expanded row of the app's gym map list.
+ *  - `app-gym-page`  — the claim card and "Run this gym? Claim it" on the app's gym page.
+ *
+ * The two `app-` values are the only ones the app fires; every other one is www.
  */
-export type GymClaimPlacement = 'gym-page' | 'preview-sheet' | 'directory-footer' | 'similar-gyms';
+export type GymClaimPlacement =
+  | 'gym-page'
+  | 'preview-sheet'
+  | 'directory-footer'
+  | 'similar-gyms'
+  | 'similar-gyms-refusal'
+  | 'gym-page-header'
+  | 'directory-result'
+  | 'manage-lock'
+  | 'app-gym-list'
+  | 'app-gym-page';
 
 /**
  * Which proof path the claimant submitted. Mirrors the `GymClaimMethod` GraphQL
@@ -111,24 +142,25 @@ export type GymClaimResultStatus = 'email_sent' | 'approved' | 'admin_review' | 
 /**
  * Physical medium the scanned QR code was printed on or displayed by.
  *
- * PRODUCER REALITY, and it is not what the member list suggests: only `poster`
- * currently has a producer that can reach a gym page. `Gym QR Scanned` fires
- * from the QR landing tracker, which mounts on `/gym/[gym_slug]` and nowhere
- * else. The kiosk's per-board QR (`components/kiosk/board-slot/board-install-qr.tsx`)
- * encodes `/b/{slug}`, and `app/b/[board_slug]/page.tsx` redirects to
- * `/b/{slug}/{angle}/list`, which renders no tracker. A `kiosk` or `board` scan
- * therefore cannot fire this event today.
+ * PRODUCER REALITY: only `poster` reaches a gym page, so only `poster` fires
+ * `Gym QR Scanned`, whose tracker mounts on `/gym/[gym_slug]` and nowhere else.
+ * The kiosk's per-board QR (`components/kiosk/board-slot/board-install-qr.tsx`)
+ * and the per-board poster (#4415) encode `/b/{slug}`, which the `/b/{slug}`
+ * page carries through `gymQrAttributionQuery` onto `/b/{slug}/{angle}/list`.
+ * That page counts them as `Board QR Scanned` (board-qr-events.ts), which names
+ * no board and so has no `gymSlug`.
  *
- * The params themselves DO survive that hop as of #4379 — the redirect carries
- * them through `gymQrAttributionQuery` (`packages/web/app/lib/gym-attribution.ts`),
- * so a kiosk scan is attributable from a server log. It is the missing tracker
- * at the destination, and only that, which keeps the event unfireable.
+ * `desktop` is not printed: it is the code a climb page shows beside its
+ * "Open in your browser" button on a laptop, so a climber can carry the climb
+ * to their phone. It encodes the climb page itself, which counts the scan as
+ * `Climb QR Scanned` (climb-qr-events.ts). A board's climb list, a setter's
+ * page and a public playlist show the same code, each encoding itself, which
+ * count it as `List QR Scanned`, `Setter QR Scanned` and `Playlist QR Scanned`.
  *
- * Both members are kept anyway: the param contract has to parse all three so a
- * future gym-page-targeted kiosk or board QR is a call-site change, not a
- * vocabulary change that breaks the printed codes already on walls.
+ * One vocabulary and one parser for every event: a code printed today has to
+ * keep parsing whichever page it is pointed at later.
  */
-export const GYM_QR_MEDIUMS = ['poster', 'kiosk', 'board'] as const;
+export const GYM_QR_MEDIUMS = ['poster', 'kiosk', 'board', 'desktop'] as const;
 export type GymQrMedium = (typeof GYM_QR_MEDIUMS)[number];
 
 /**
@@ -153,20 +185,25 @@ export type GymQrMedium = (typeof GYM_QR_MEDIUMS)[number];
  *    alongside it. #4374's AC2 describes only the two new properties; it is not
  *    asking for `source` to be repurposed.
  *
- *    `App Install Click` is web-only with no mobile counterpart, so its builder
- *    does NOT belong in this shared package. It lands in
- *    packages/web/app/lib/app-install-event.ts in the wiring PR.
+ *    `App Install Click` has no native counterpart, so its builder does NOT
+ *    belong in this shared package. www's lands in
+ *    packages/web/app/lib/app-install-event.ts; the browser app's store prompt
+ *    has its own in packages/mobile/src/lib/store-links.ts.
  *  - `directions` — there is no directions CTA on the gym page. The address is
  *    rendered as plain text (gym/[gym_slug]/page.tsx), not a map link.
  *  - `report-listing` — belongs to #4385 and is out of scope for this epic tier.
  *    Report-a-DUPLICATE is a different, existing CTA and is kept.
+ *
+ * `report-problem` is Report a problem (the gym's own button or a board row's
+ * flag), which replaces Report a duplicate while the `directory-reports` flag is
+ * on. `report-duplicate` keeps its call site for as long as the flag can be off.
  *
  * `manage` (GymPageManageButton, editors only) is also a real gym-page button
  * but is intentionally not a member: it is not part of #4374's vocabulary, and
  * it is an owner action rather than a step in the discovery funnel. Add it here
  * with its own comment if a later PR needs it measured.
  */
-export type GymPageCta = 'follow' | 'kiosk' | 'website' | 'report-duplicate';
+export type GymPageCta = 'follow' | 'kiosk' | 'website' | 'report-duplicate' | 'report-problem';
 
 /**
  * Tabs of the gym management console.
@@ -368,9 +405,13 @@ export function gymDirectorySearched(
 // ---------------------------------------------------------------------------
 //
 // Printed QR codes point at a normal Boardsesh URL with two extra params:
-// `?src=qr&medium=<poster|kiosk|board>`. The landing surface reads them, fires
-// `Gym QR Scanned` once, then rewrites the URL without them so a shared or
-// bookmarked link doesn't re-attribute someone else's visit to a poster.
+// `?src=qr&medium=<poster|kiosk|board|desktop>`. The landing surface reads them,
+// fires its scan event once (`Gym QR Scanned` on a gym page, `Board QR Scanned`
+// on a board page, `Climb QR Scanned` on a climb page, and `List QR Scanned`,
+// `Setter QR Scanned` or `Playlist QR Scanned` for the desktop code on a board
+// list, a setter page or a playlist), then rewrites the URL
+// without them so a shared or bookmarked link doesn't re-attribute someone
+// else's visit to a poster.
 
 export const GYM_QR_SRC_PARAM = 'src';
 export const GYM_QR_MEDIUM_PARAM = 'medium';
@@ -383,12 +424,31 @@ export type GymQrLanding = {
   medium: GymQrMedium;
 };
 
+/**
+ * The mediums that may land on a GYM page: a gym poster, and the kiosk and
+ * board codes that once pointed there. `desktop` is a climb page's own code and
+ * never names a gym, so `parseGymQrLanding` refuses it and `Gym QR Scanned`
+ * cannot carry it.
+ */
+export const GYM_PAGE_QR_MEDIUMS = ['poster', 'kiosk', 'board'] as const satisfies readonly GymQrMedium[];
+export type GymPageQrMedium = (typeof GYM_PAGE_QR_MEDIUMS)[number];
+
+export type GymPageQrLanding = {
+  medium: GymPageQrMedium;
+};
+
 function isGymQrMedium(candidate: string): candidate is GymQrMedium {
   return (GYM_QR_MEDIUMS as readonly string[]).includes(candidate);
 }
 
+function isGymPageQrMedium(medium: GymQrMedium): medium is GymPageQrMedium {
+  return (GYM_PAGE_QR_MEDIUMS as readonly GymQrMedium[]).includes(medium);
+}
+
 /**
- * Recognise a QR landing, or return `null`.
+ * Recognise a QR landing with any medium in the shared vocabulary, or return
+ * `null`. The landing pages narrow it to the mediums their codes print:
+ * `parseGymQrLanding`, `parseBoardQrLanding`, `parseClimbQrLanding`.
  *
  * Deliberately strict — this decides whether an acquisition event fires, so
  * every ambiguity resolves to "not a QR scan":
@@ -398,7 +458,7 @@ function isGymQrMedium(candidate: string): candidate is GymQrMedium {
  *    rejected outright rather than picking one, because a duplicated param is a
  *    hand-edited or crawler-mangled URL, not a scan.
  */
-export function parseGymQrLanding(searchParams: GymQrSearchParams): GymQrLanding | null {
+export function parseQrLanding(searchParams: GymQrSearchParams): GymQrLanding | null {
   // Own properties only. Next's searchParams is a plain object so this is not
   // reachable today, but the function gates an acquisition event and callers
   // will hand it whatever object they have; a `medium` inherited from a
@@ -410,6 +470,17 @@ export function parseGymQrLanding(searchParams: GymQrSearchParams): GymQrLanding
   if (typeof source !== 'string' || source !== GYM_QR_SRC_VALUE) return null;
   if (typeof medium !== 'string' || !isGymQrMedium(medium)) return null;
   return { medium };
+}
+
+/**
+ * Recognise a QR landing on a gym page, or return `null`: `parseQrLanding`'s
+ * strict rules, narrowed to `GYM_PAGE_QR_MEDIUMS`. `?src=qr&medium=desktop` on a
+ * gym page is a hand-edited link, not a scan of anything we made.
+ */
+export function parseGymQrLanding(searchParams: GymQrSearchParams): GymPageQrLanding | null {
+  const landing = parseQrLanding(searchParams);
+  if (!landing || !isGymPageQrMedium(landing.medium)) return null;
+  return { medium: landing.medium };
 }
 
 /**

@@ -1,10 +1,13 @@
-import { Pressable, StyleSheet, type ViewStyle } from 'react-native';
+import { PressableSurface } from '../PressableSurface';
+import type { ReactNode } from 'react';
+import { StyleSheet, type ColorValue, type ViewStyle } from 'react-native';
 import { Icon } from '../Icon';
 import { ActivityIndicator } from '../ActivityIndicator';
 import type { IconName } from '../icon-map';
-import { iosSystemColors } from '../../theme/ios-colors';
-import { spacing } from '../../theme/tokens';
+import { useTheme } from '../../providers/theme-provider';
+import { opacity, spacing } from '../../theme/tokens';
 import { glassSize } from '../../theme/layout';
+import { useVariantValue } from '../../theme/variants';
 
 // Shared building blocks for the Play Drawer and Create Drawer action bars: the
 // circular icon button, its size scale, and the two-row container/row styles.
@@ -28,7 +31,7 @@ type ActionButtonProps = {
   disabled?: boolean;
   active?: boolean;
   activeColor?: string;
-  iconColor?: string;
+  iconColor?: ColorValue;
   accessibilityLabel: string;
   /**
    * Why the button is unavailable. A disabled icon-only button is ~1.1:1
@@ -44,6 +47,12 @@ type ActionButtonProps = {
   checked?: boolean;
   /** Spoken after the label, e.g. the heatmap's current mode. */
   accessibilityValueText?: string;
+  testID?: string;
+  /**
+   * Drawn over the glyph, inside the pressable, so it presses with the button
+   * (a count badge on the corner). Visual only: say its meaning in the label.
+   */
+  badge?: ReactNode;
 };
 
 export function ActionButton({
@@ -59,7 +68,15 @@ export function ActionButton({
   busy = false,
   checked,
   accessibilityValueText,
+  testID,
+  badge,
 }: ActionButtonProps) {
+  const { systemColors } = useTheme();
+  const neutralActionColor = useVariantValue({
+    liquidGlass: systemColors.label,
+    material: systemColors.secondaryLabel,
+  });
+  const defaultIconColor = busy ? systemColors.secondaryLabel : neutralActionColor;
   const { dim, icon } = SIZES[size];
   const buttonStyle: ViewStyle[] = [
     drawerActionBarStyles.actionButton,
@@ -70,11 +87,12 @@ export function ActionButton({
   }
 
   const resolvedColor = disabled
-    ? iosSystemColors.systemGray4
-    : (iconColor ?? (active && activeColor ? activeColor : iosSystemColors.systemGray));
+    ? systemColors.tertiaryLabel
+    : (iconColor ?? (active && activeColor ? activeColor : defaultIconColor));
 
   return (
-    <Pressable
+    <PressableSurface
+      testID={testID}
       onPress={onPress}
       disabled={disabled}
       accessibilityRole={checked === undefined ? 'button' : 'togglebutton'}
@@ -91,16 +109,17 @@ export function ActionButton({
       {busy ? (
         <ActivityIndicator size="small" color={resolvedColor} />
       ) : (
-        <Icon name={iconName} size={icon} color={resolvedColor} />
+        <Icon maxFontSizeMultiplier={1} name={iconName} size={icon} color={resolvedColor} />
       )}
-    </Pressable>
+      {badge}
+    </PressableSurface>
   );
 }
 
 export const drawerActionBarStyles = StyleSheet.create({
   container: {
+    // Colour comes from the theme separator at the call site (adapts to dark mode).
     borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: iosSystemColors.separator,
   },
   rowPrimary: {
     flexDirection: 'row',
@@ -129,7 +148,7 @@ export const drawerActionBarStyles = StyleSheet.create({
     justifyContent: 'center',
   },
   actionButtonDisabled: {
-    opacity: 0.4,
+    opacity: opacity.disabled,
   },
   actionButtonPressed: {
     opacity: 0.6,

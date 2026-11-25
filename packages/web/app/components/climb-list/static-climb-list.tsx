@@ -7,11 +7,12 @@ import { useTranslation } from 'react-i18next';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
 import type { LogbookEntry } from '@boardsesh/board-react';
 import ErrorBoundary from '@/app/components/error-boundary';
-import StaticClimbRow from '@/app/components/climb-list/static-climb-row';
+import StaticClimbRow, { type StaticClimbRowVariant } from '@/app/components/climb-list/static-climb-row';
 import { useInfiniteScroll } from '@/app/hooks/use-infinite-scroll';
 import { LIST_ROW_HEIGHT } from '@/app/lib/climb-list-constants';
 import { themeTokens } from '@/app/theme/theme-config';
-import type { BoardDetails, Climb } from '@/app/lib/types';
+import type { BoardImageDetails, Climb } from '@/app/lib/types';
+import type { ClimbThumbnailCrop } from '@/app/lib/climb-thumbnail-crop';
 
 /**
  * The crawlable climb list: every row is a real `<a href>` to the canonical
@@ -33,12 +34,13 @@ import type { BoardDetails, Climb } from '@/app/lib/types';
  */
 export type StaticClimbListProps = {
   climbs: Climb[];
+  thumbnailCropsByClimb?: Record<string, ClimbThumbnailCrop>;
   /** Board used for any climb without an entry in `boardDetailsByClimb`. */
-  boardDetails: BoardDetails;
+  boardDetails: BoardImageDetails;
   /** Explicit physical-board identity supplied by a named-board front door. */
   boardSlug?: string;
   /** Per-climb board override, keyed by climb uuid — cross-board lists need it. */
-  boardDetailsByClimb?: Record<string, BoardDetails>;
+  boardDetailsByClimb?: Record<string, BoardImageDetails>;
   /**
    * Climbs with no resolvable canonical URL, keyed by uuid. Their rows render
    * as plain rows instead of anchors. The session page needs it: a tick whose
@@ -46,6 +48,13 @@ export type StaticClimbListProps = {
    * point at an invented board and a climb that doesn't resolve.
    */
   unlinkedClimbUuids?: ReadonlySet<string>;
+  /**
+   * One key per entry of `climbs`, for a list that holds a climb more than
+   * once (a workout's 4x4 sets, #6903). Defaults to the climb's uuid.
+   */
+  rowKeys?: readonly string[];
+  /** Rows drawn faded, by row key: a workout climb the climber skipped on the session page. */
+  dimmedRowKeys?: ReadonlySet<string>;
   /** Viewer's ticks for the ascent badges. Absent on anonymous/crawler renders. */
   logbook?: readonly LogbookEntry[];
   /**
@@ -82,10 +91,26 @@ export type StaticClimbListProps = {
   emptyState?: React.ReactNode;
   hideEndMessage?: boolean;
   showBottomSpacer?: boolean;
-  /** How many leading rows render from image layers rather than the canvas (LCP). */
-  initialImageCount?: number;
   /** Extra content under a row, inside the measured wrapper but outside the link. */
-  renderItemExtra?: (climb: Climb) => React.ReactNode;
+  renderItemExtra?: (climb: Climb, rowKey: string) => React.ReactNode;
+  /** `card` draws the app's rows: rounded cards, grade on a coloured chip. See `StaticClimbRow`. */
+  rowVariant?: StaticClimbRowVariant;
+  /** Name the setter on every row (default). A setter's own page turns it off. */
+  showSetter?: boolean;
+  /** Add each row's angle to its byline. */
+  showAngle?: boolean;
+  /**
+   * `2` lays card rows out two to a line from the md breakpoint up. Only the
+   * non-virtualized path reads it: the virtualizer measures one row per line.
+   */
+  columns?: 1 | 2;
+  /**
+   * Ask for the first row's thumbnail at `fetchpriority="high"` (default): on a
+   * list page it is the largest thing in the first screen. A page that puts
+   * bigger art above the list (the setter's most-sent cards) turns it off, so
+   * the two do not compete for the first bytes.
+   */
+  prioritizeFirstRow?: boolean;
 };
 
 const sentinelBoxSx = { minHeight: `${themeTokens.spacing[5]}px` };
@@ -93,29 +118,59 @@ const sentinelBoxSx = { minHeight: `${themeTokens.spacing[5]}px` };
 const noMoreClimbsBoxSx = {
   textAlign: 'center' as const,
   padding: `${themeTokens.spacing[5]}px`,
-  color: 'var(--neutral-400)',
+  color: 'var(--neutral-500)',
 };
 
 const noop = () => {};
 
+const plainRowsSx = { width: '100%', backgroundColor: 'inherit' } as const;
+
+// Card rows sit apart on the page ground instead of sharing hairlines.
+const cardRowsSx = {
+  ...plainRowsSx,
+  display: 'grid',
+  gridTemplateColumns: 'minmax(0, 1fr)',
+  gap: `${themeTokens.spacing[2]}px`,
+} as const;
+
+const twoColumnCardRowsSx = {
+  ...cardRowsSx,
+  gridTemplateColumns: { xs: 'minmax(0, 1fr)', md: 'repeat(2, minmax(0, 1fr))' },
+  columnGap: { md: `${themeTokens.spacing[4]}px` },
+} as const;
+
+function plainRowsContainerSx(rowVariant: StaticClimbRowVariant, columns: 1 | 2) {
+  if (rowVariant !== 'card') return plainRowsSx;
+  return columns === 2 ? twoColumnCardRowsSx : cardRowsSx;
+}
+
 /** Row props every row shares, whichever path renders it. */
 type SharedRowProps = {
   climbs: Climb[];
+  thumbnailCropsByClimb?: Record<string, ClimbThumbnailCrop>;
   boardSlug?: string;
-  resolveBoardDetails: (climb: Climb) => BoardDetails;
+  resolveBoardDetails: (climb: Climb) => BoardImageDetails;
   unlinkedClimbUuids?: ReadonlySet<string>;
+  rowKeys?: readonly string[];
+  dimmedRowKeys?: ReadonlySet<string>;
   pathname: string;
   logbook?: readonly LogbookEntry[];
-  initialImageCount: number;
-  renderItemExtra?: (climb: Climb) => React.ReactNode;
+  renderItemExtra?: (climb: Climb, rowKey: string) => React.ReactNode;
+  rowVariant: StaticClimbRowVariant;
+  showSetter: boolean;
+  showAngle: boolean;
+  prioritizeFirstRow: boolean;
 };
 
 export default function StaticClimbList({
   climbs,
+  thumbnailCropsByClimb,
   boardDetails,
   boardSlug,
   boardDetailsByClimb,
   unlinkedClimbUuids,
+  rowKeys,
+  dimmedRowKeys,
   logbook,
   virtualize = true,
   isFetching = false,
@@ -125,8 +180,12 @@ export default function StaticClimbList({
   emptyState,
   hideEndMessage = false,
   showBottomSpacer = false,
-  initialImageCount = 0,
   renderItemExtra,
+  rowVariant = 'list',
+  showSetter = true,
+  showAngle = false,
+  columns = 1,
+  prioritizeFirstRow = true,
 }: StaticClimbListProps) {
   // Read once at list level: ClimbThumbnail takes the pathname as a prop
   // rather than each row paying for its own context lookup.
@@ -139,13 +198,19 @@ export default function StaticClimbList({
 
   const rowProps: SharedRowProps = {
     climbs,
+    thumbnailCropsByClimb,
     boardSlug,
     resolveBoardDetails,
     unlinkedClimbUuids,
+    rowKeys,
+    dimmedRowKeys,
     pathname,
     logbook,
-    initialImageCount,
     renderItemExtra,
+    rowVariant,
+    showSetter,
+    showAngle,
+    prioritizeFirstRow,
   };
 
   return (
@@ -164,7 +229,7 @@ export default function StaticClimbList({
           {virtualize ? (
             <VirtualizedRows {...rowProps} hasMore={hasMore} isFetching={isFetching} onLoadMore={onLoadMore} />
           ) : (
-            <PlainRows {...rowProps} />
+            <PlainRows {...rowProps} columns={columns} />
           )}
         </ErrorBoundary>
       )}
@@ -193,32 +258,53 @@ export default function StaticClimbList({
  */
 function PlainRows({
   climbs,
+  thumbnailCropsByClimb,
   boardSlug,
   resolveBoardDetails,
   unlinkedClimbUuids,
+  rowKeys,
+  dimmedRowKeys,
   pathname,
   logbook,
-  initialImageCount,
   renderItemExtra,
-}: SharedRowProps) {
+  rowVariant,
+  showSetter,
+  showAngle,
+  prioritizeFirstRow,
+  columns,
+}: SharedRowProps & { columns: 1 | 2 }) {
   return (
-    <div style={{ width: '100%', backgroundColor: 'inherit' }}>
-      {climbs.map((climb, index) => (
-        <div key={climb.uuid} data-index={index} style={{ width: '100%', minHeight: LIST_ROW_HEIGHT }}>
-          <StaticClimbRow
-            climb={climb}
-            boardSlug={boardSlug}
-            boardDetails={resolveBoardDetails(climb)}
-            unlinked={unlinkedClimbUuids?.has(climb.uuid)}
-            pathname={pathname}
-            logbook={logbook}
-            preferImageLayers={index < initialImageCount}
-            fetchPriority={index === 0 ? 'high' : undefined}
-          />
-          {renderItemExtra?.(climb)}
-        </div>
-      ))}
-    </div>
+    <Box sx={plainRowsContainerSx(rowVariant, columns)}>
+      {climbs.map((climb, index) => {
+        const rowKey = rowKeys?.[index] ?? climb.uuid;
+        return (
+          <div
+            key={rowKey}
+            data-index={index}
+            style={{
+              width: '100%',
+              minHeight: LIST_ROW_HEIGHT,
+              opacity: dimmedRowKeys?.has(rowKey) ? themeTokens.opacity.disabled : undefined,
+            }}
+          >
+            <StaticClimbRow
+              climb={climb}
+              thumbnailCrop={thumbnailCropsByClimb?.[climb.uuid]}
+              boardSlug={boardSlug}
+              boardDetails={resolveBoardDetails(climb)}
+              unlinked={unlinkedClimbUuids?.has(climb.uuid)}
+              pathname={pathname}
+              logbook={logbook}
+              fetchPriority={prioritizeFirstRow && index === 0 ? 'high' : undefined}
+              variant={rowVariant}
+              showSetter={showSetter}
+              showAngle={showAngle}
+            />
+            {renderItemExtra?.(climb, rowKey)}
+          </div>
+        );
+      })}
+    </Box>
   );
 }
 
@@ -247,13 +333,19 @@ function InfiniteScrollSentinel({
 
 function VirtualizedRows({
   climbs,
+  thumbnailCropsByClimb,
   boardSlug,
   resolveBoardDetails,
   unlinkedClimbUuids,
+  rowKeys,
+  dimmedRowKeys,
   pathname,
   logbook,
-  initialImageCount,
   renderItemExtra,
+  rowVariant,
+  showSetter,
+  showAngle,
+  prioritizeFirstRow,
   hasMore,
   isFetching,
   onLoadMore,
@@ -266,14 +358,14 @@ function VirtualizedRows({
   // ResizeObserver) — that dominated the render delay (76% of LCP / 2.2s of
   // forced reflow).
   //
-  // The estimate matches the row wrapper's fixed minHeight below, so a row
-  // measures to exactly the estimate on mount: no reflow shifting every row
-  // beneath it (the loading-time CLS issue #3086 was filed for).
+  // The estimate reserves unmounted space. Mounted rows stay in normal flow,
+  // so responsive thumbnails and session details never overlap before the
+  // virtualizer can measure their actual heights.
   const virtualizer = useWindowVirtualizer({
     count: climbs.length,
     estimateSize: () => LIST_ROW_HEIGHT,
     overscan: 10,
-    getItemKey: (index) => climbs[index]?.uuid ?? index,
+    getItemKey: (index) => rowKeys?.[index] ?? climbs[index]?.uuid ?? index,
     // Provide a fake viewport so the virtualizer renders items during SSR.
     // Without this, getVirtualItems() returns [] on the server and the list is
     // entirely client-rendered — which on this list would mean zero crawlable
@@ -287,6 +379,8 @@ function VirtualizedRows({
   // reaches the bottom. The sentinel below still covers the case where the
   // whole list fits in one screen.
   const lastVirtualItem = virtualItems[virtualItems.length - 1];
+  const leadingSpace = virtualItems[0]?.start ?? 0;
+  const trailingSpace = Math.max(0, virtualizer.getTotalSize() - (lastVirtualItem?.end ?? 0));
   useEffect(() => {
     if (!lastVirtualItem) return;
     if (lastVirtualItem.index >= climbs.length - 5 && hasMore && !isFetching) {
@@ -295,37 +389,31 @@ function VirtualizedRows({
   }, [lastVirtualItem, climbs.length, hasMore, isFetching, onLoadMore]);
 
   return (
-    /* Plain div with inline style, as in board-page/climbs-list: the height
-       changes on every measure, so an sx object would mint a fresh emotion
-       class per render. */
+    // Only the unmounted rows need estimated spacers. The contiguous mounted
+    // window uses normal DOM flow, including before JavaScript runs.
     <div
       style={{
-        height: virtualizer.getTotalSize(),
         width: '100%',
-        position: 'relative',
         backgroundColor: 'inherit',
       }}
     >
+      <div aria-hidden="true" data-virtual-spacer="before" style={{ height: leadingSpace }} />
       {virtualItems.map((virtualItem) => {
         const climb = climbs[virtualItem.index];
         if (!climb) return null;
+        const rowKey = rowKeys?.[virtualItem.index] ?? climb.uuid;
         return (
           <div
             key={virtualItem.key}
             ref={virtualizer.measureElement}
             data-index={virtualItem.index}
             style={{
-              position: 'absolute',
-              top: 0,
-              left: 0,
               width: '100%',
-              // Floor at the estimated row height so a plain row measures
-              // to exactly the estimate (no post-mount reflow / CLS).
-              // Rows with extra content below (renderItemExtra) still
-              // grow past this via measureElement.
+              // This is a minimum, not an absolute-position interval. Larger
+              // previews and extra session content establish their own height.
               minHeight: LIST_ROW_HEIGHT,
               boxSizing: 'border-box',
-              transform: `translateY(${virtualItem.start}px)`,
+              opacity: dimmedRowKeys?.has(rowKey) ? themeTokens.opacity.disabled : undefined,
               // No `paint` here, unlike the classic list: paint
               // containment clips descendants to this box, and the row
               // is one big anchor whose keyboard focus ring is drawn
@@ -337,18 +425,22 @@ function VirtualizedRows({
           >
             <StaticClimbRow
               climb={climb}
+              thumbnailCrop={thumbnailCropsByClimb?.[climb.uuid]}
               boardSlug={boardSlug}
               boardDetails={resolveBoardDetails(climb)}
               unlinked={unlinkedClimbUuids?.has(climb.uuid)}
               pathname={pathname}
               logbook={logbook}
-              preferImageLayers={virtualItem.index < initialImageCount}
-              fetchPriority={virtualItem.index === 0 ? 'high' : undefined}
+              fetchPriority={prioritizeFirstRow && virtualItem.index === 0 ? 'high' : undefined}
+              variant={rowVariant}
+              showSetter={showSetter}
+              showAngle={showAngle}
             />
-            {renderItemExtra?.(climb)}
+            {renderItemExtra?.(climb, rowKey)}
           </div>
         );
       })}
+      <div aria-hidden="true" data-virtual-spacer="after" style={{ height: trailingSpace }} />
     </div>
   );
 }

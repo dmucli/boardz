@@ -15,15 +15,17 @@
 import React from 'react';
 import { createWebBoardPresenceClient } from '@/app/lib/realtime/board-presence-client';
 import { useWsAuthToken } from '@/app/hooks/use-ws-auth-token';
+import { socketCredentialHandle } from '@/app/lib/auth/browser-access-token';
 import { KioskPresenceHubInner, type KioskPresenceHubProps } from './kiosk-presence-hub';
 
-export function ViewerKioskPresenceHub({ boardIds, children }: KioskPresenceHubProps) {
+export function ViewerKioskPresenceHub({ boardIds, boardUuids, children }: KioskPresenceHubProps) {
   const { token, isLoading } = useWsAuthToken();
 
   return (
     <KioskPresenceHubInner
       boardIds={boardIds}
-      authToken={token}
+      boardUuids={boardUuids}
+      authToken={socketCredentialHandle(token)}
       isAuthResolving={isLoading}
       createPresenceClient={createWebBoardPresenceClient}
     >

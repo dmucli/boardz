@@ -9,7 +9,8 @@
     "sessions": "Sessions",
     "logbook": "Carnet",
     "social": "Social",
-    "climbs": "Blocs"
+    "climbs": "Blocs",
+    "created": "Créés"
   },
   "mobile": {
     "unknownName": "Grimpeur",
@@ -35,6 +36,7 @@
       "following": "Abonnements",
       "newFollowers": "Nouveaux abonnés",
       "findFriends": "Chercher",
+      "searchTitle": "Trouver des grimpeurs",
       "searchPlaceholder": "Chercher des grimpeurs",
       "clearSearch": "Effacer la recherche",
       "you": "Vous",
@@ -87,43 +89,29 @@
       "all": "Tout",
       "year": "Année",
       "month": "Mois",
-      "week": "Semaine",
-      "done": "Terminé"
+      "week": "Semaine"
     },
     "logbook": {
       "empty": "Ton carnet est vide — enregistre ta première croix.",
-      "emptyFiltered": "Aucun bloc ne correspond à ces filtres.",
+      "emptyFiltered": "Rien ne correspond à ces filtres. Assouplis-en un ou efface-les tous.",
       "errorTitle": "Impossible de charger ton carnet",
       "errorBody": "Vérifie ta connexion et réessaie.",
       "retry": "Réessaie",
-      "searchPlaceholder": "Cherche tes blocs",
-      "filter": "Filtrer",
-      "sort": "Trier",
-      "refine": "Affiner",
-      "advanced": "Avancé",
-      "preset": {
-        "latest": "Récents",
-        "hardest": "Plus durs"
-      },
-      "flashOnly": "Flash seulement",
       "grade": "Cotation",
       "angle": "Angle",
-      "show": "Afficher",
-      "angleMin": "Angle min.",
-      "angleMax": "Angle max.",
-      "dateRange": "Plage de dates",
       "dateFrom": "Du",
       "dateTo": "Au",
       "dateAny": "Toutes",
       "dateSince": "Depuis le {{date}}",
       "dateUntil": "Jusqu'au {{date}}",
-      "benchmarksOnly": "Références seulement",
       "reset": "Réinitialiser",
       "editTitle": "Modifier la croix",
-      "statusLabel": "Statut",
       "delete": "Supprimer",
+      "deleteAll": "Tout supprimer",
       "deleteTitle": "Supprimer la croix",
+      "deleteAllTitle": "Supprimer {{count}} entrées",
       "deleteConfirm": "Cela supprime la croix enregistrée et est irréversible.",
+      "deleteAllConfirm": "Cela supprime les {{count}} entrées de ce jour et est irréversible.",
       "saveError": "Impossible d'enregistrer tes modifications. Réessaie.",
       "deleteError": "Impossible de supprimer la croix. Réessaie.",
       "tries_one": "{{count}} essai",
@@ -134,7 +122,8 @@
         "attempt": "Essai",
         "sends": "Croix",
         "attempts": "Essais",
-        "both": "Tout"
+        "all": "Tous",
+        "flashes": "Flashs"
       },
       "row": {
         "project": "Projet",
@@ -148,8 +137,7 @@
         "a11yHasBetaVideo": "avec vidéo de beta",
         "a11yMirrored": "en miroir",
         "editAction": "Modifier l'entrée",
-        "deleteAction": "Supprimer l'entrée",
-        "moreActions": "Plus d'actions"
+        "deleteAction": "Supprimer l'entrée"
       },
       "day": {
         "today": "Aujourd'hui",
@@ -162,7 +150,112 @@
       },
       "chooser": {
         "editTitle": "Quelle entrée modifier ?",
-        "deleteTitle": "Quelle entrée supprimer ?"
+        "deleteTitle": "Quelle entrée supprimer ?",
+        "deleteAll": "Tout supprimer ({{count}})"
+      },
+      "boardLabel": "Board",
+      "boardNone": "Aucune",
+      "boardPickerLabel": "Choisir une board",
+      "boardBack": "Revenir à la modification",
+      "boardRetry": "Impossible de charger les boards. Appuie pour réessayer.",
+      "boardEmpty": "Aucune board enregistrée ou récente ne convient à ce bloc.",
+      "emptyOther": "Rien d'enregistré ici pour l'instant.",
+      "clearFilters": "Effacer les filtres",
+      "capsules": {
+        "filters": "Filtres",
+        "filtersWithCount": "Filtres · {{count}}",
+        "status": "Statut",
+        "stars": "Étoiles",
+        "anyStars": "Toutes étoiles",
+        "starsAtLeast": "{{count}}★+",
+        "when": "Quand",
+        "customDates": "Personnalisé…",
+        "board": "Board",
+        "boardLayouts_one": "{{board}} · {{count}} layout",
+        "boardLayouts_other": "{{board}} · {{count}} layouts",
+        "setter": "Ouvreur",
+        "setterAria": "Choisir des ouvreurs",
+        "setterPickedAria": "Ouvreur : {{setters}}, choisir des ouvreurs",
+        "setters_one": "{{count}} ouvreur",
+        "setters_other": "{{count}} ouvreurs",
+        "benchmarks": "Benchmarks",
+        "verified": "Vérifiés",
+        "gradeOpenHint": "Affiche la ligne des cotations",
+        "gradeCloseHint": "Masque la ligne des cotations",
+        "angleOpenHint": "Affiche la ligne des angles",
+        "angleCloseHint": "Masque la ligne des angles",
+        "nameToken": "« {{name}} »"
+      },
+      "dateWindow": {
+        "any": "Toute période",
+        "last7": "7 derniers jours",
+        "month": "Ce mois-ci",
+        "last3months": "3 derniers mois",
+        "year": "Cette année",
+        "custom": "Personnalisé"
+      },
+      "sortLabel": {
+        "latest": "Récents",
+        "oldest": "Anciens",
+        "hardest": "Plus durs",
+        "easiest": "Plus faciles",
+        "yourHardest": "Tes plus durs",
+        "yourEasiest": "Tes plus faciles",
+        "theirHardest": "Ses plus durs",
+        "theirEasiest": "Ses plus faciles",
+        "nameAsc": "Nom A–Z",
+        "nameDesc": "Nom Z–A",
+        "mostTries": "Plus d'essais",
+        "fewestTries": "Moins d'essais"
+      },
+      "filterSheet": {
+        "title": "Filtres",
+        "close": "Fermer les filtres",
+        "entryCount_one": "{{count}} entrée",
+        "entryCount_other": "{{count}} entrées",
+        "sectionName": "Nom du bloc",
+        "namePlaceholder": "Rechercher des blocs et des notes",
+        "sectionDifficulty": "Difficulté",
+        "gradeRange": "Plage de cotation",
+        "sectionYourAscents": "Tes ascensions",
+        "sectionTheirAscents": "Ses ascensions",
+        "status": "Statut",
+        "yourStars": "Tes étoiles",
+        "theirStars": "Ses étoiles",
+        "anyStars": "Toutes",
+        "when": "Quand",
+        "sectionTheClimb": "Le bloc",
+        "board": "Board",
+        "layout": "Layout",
+        "allLayouts": "Tous les layouts",
+        "setter": "Ouvreur",
+        "setterAny": "Tous",
+        "benchmarks": "Benchmarks",
+        "onlyBenchmarks": "Blocs benchmark uniquement",
+        "verified": "Vérifiés",
+        "onlyVerified": "Blocs vérifiés uniquement",
+        "sectionSort": "Tri",
+        "sortBy": "Trier par",
+        "order": "Ordre",
+        "descending": "Décroissant",
+        "ascending": "Croissant",
+        "sortKey": {
+          "date": "Date",
+          "grade": "Cotation",
+          "yourGrade": "Ta cotation",
+          "theirGrade": "Sa cotation",
+          "name": "Nom",
+          "attempts": "Essais"
+        }
+      },
+      "setterPicker": {
+        "title": "Ouvreurs",
+        "showResults": "Voir les blocs",
+        "tickCount_one": "{{count}} entrée",
+        "tickCount_other": "{{count}} entrées",
+        "empty": "Aucun ouvreur dans ce carnet pour l'instant.",
+        "error": "Impossible de charger les ouvreurs.",
+        "limit": "Choisis jusqu'à {{count}} ouvreurs."
       }
     },
     "boardLink": {
@@ -176,6 +269,10 @@
       "moonboardBody": "Demandez vos données à MoonBoard, puis importez le fichier ici pour récupérer votre carnet.",
       "moonboardCta": "Importer mon carnet MoonBoard",
       "dismiss": "Pas maintenant"
+    },
+    "loadError": {
+      "sessions": "Impossible de charger tes sessions",
+      "progress": "Impossible de charger ta progression"
     }
   }
 }

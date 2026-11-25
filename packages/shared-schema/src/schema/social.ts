@@ -130,6 +130,8 @@ export const socialTypeDefs = /* GraphQL */ `
     linkedUserDisplayName: String
     "Linked user's avatar URL"
     linkedUserAvatarUrl: String
+    "Sends across this setter's listable climbs, summing each climb's best angle so a climber who sent it at two angles counts once. Includes imported Aurora ascents."
+    totalAscents: Int!
   }
 
   """
@@ -368,6 +370,7 @@ export const socialTypeDefs = /* GraphQL */ `
   Input for adding a comment.
   """
   input AddCommentInput {
+    privacy: PrivacyPublicationInput
     "Entity type to comment on"
     entityType: SocialEntityType!
     "Entity ID to comment on"
@@ -382,6 +385,7 @@ export const socialTypeDefs = /* GraphQL */ `
   Input for updating a comment.
   """
   input UpdateCommentInput {
+    privacy: PrivacyPublicationInput
     "UUID of the comment to update"
     commentUuid: ID!
     "New body text"

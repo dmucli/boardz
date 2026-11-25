@@ -1,13 +1,11 @@
 name: iOS TestFlight Deploy (React Native)
 
+run-name: ${{ format('ios:{0}', inputs.source_sha || github.sha) }}
+
 on:
   push:
-    # Native store candidates are cut from the release train, not main. Regular
-    # (JS-only) work keeps landing on main; a PR that moves the native fingerprint
-    # targets release/next, and merging it there is what starts a store build.
-    # A workflow_dispatch from main is still allowed (a hotfix rebuild after a
-    # merge-back) — see the job gates below. docs/mobile-store-release.md.
-    branches: [release/next]
+    # Raw main changes wait for the coordinator's validated version-bump stamp.
+    branches: [main]
     paths:
       - 'packages/mobile/**'
       - 'packages/shared/**'
@@ -20,16 +18,35 @@ on:
       - '.github/workflows/ios-testflight-rn.yml'
   workflow_dispatch:
     inputs:
+      source_sha:
+        description: 'Exact native release stamp on main to recover; blank builds the selected main commit'
+        type: string
+        required: false
       build_number_offset:
         description: 'Added to GH run_number for CFBundleVersion (raise to clear ASC collisions)'
         required: false
         default: '100000'
+      # Same lever as android-apk-rn.yml (issue #3098): on, a dispatch builds even
+      # when this fingerprint and version already shipped, to push an urgent
+      # JS-only fix to binaries that can no longer receive an OTA. Off, it honours
+      # the same gate as a push; the main coordinator dispatches it that way to
+      # retry a version that has no build yet.
+      force_native:
+        description: 'Force a native build even if this fingerprint and version already shipped (push an urgent JS-only fix to orphaned binaries). Uncheck to honour the gate.'
+        type: boolean
+        required: false
+        default: true
 
 concurrency:
   # Platform-global so App Store build-number reads/uploads cannot race across a
   # scheduled release build and an emergency manual dispatch.
   group: ios-testflight-rn
   cancel-in-progress: false
+  # QUEUE, never supersede. cancel-in-progress governs only the RUNNING run; by
+  # default GitHub still replaces a *pending* run when a newer one queues. With
+  # frequent native snapshots that would drop a pending hotfix or recovery.
+  # Only a newer validated stamp supersedes an older automatic build.
+  queue: max
 
 # ─── SHARED BUILD ENV (workflow-level) ───────────────────────────────────────
 # Declared at the workflow level so the cheap `gate` job (fingerprint resolve)
@@ -52,7 +69,7 @@ env:
   # endpoint (e.g. https://updates.boardsesh.com/manifest), set as a repo variable
   # so the domain isn't hardcoded; until it's set, app.config.ts falls back to
   # the EAS URL and OTA stays inert (harmless). The production + xprem headers
-  # are literals in app.config.ts. See docs/mobile-ota-updates.md.
+  # are literals in app.config.ts. See docs/operations/mobile-ota-updates.md.
   EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL }}
   # Read at runtime by src/lib/sentry.ts (Sentry.init) — Sentry is the mobile
   # error + native-crash sink (PostHog is product analytics only). Same DSN/
@@ -67,53 +84,82 @@ env:
   # false, so every track() silently no-ops (the app shipped zero events before).
   EXPO_PUBLIC_POSTHOG_KEY: ${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
   # Manifest base for the offline snapshot bootstrap (bundle-only, no fingerprint
-  # effect). Public Tigris bucket; keep in sync with SNAPSHOT_PUBLIC_BASE_URL in
-  # export-board-snapshots.yml.
-  EXPO_PUBLIC_SNAPSHOT_BASE_URL: https://boardsesh-board-snapshots.t3.tigrisfiles.io/board-snapshots/v1-gzip
+  # effect). Public R2 host; keep in sync with SNAPSHOT_PUBLIC_BASE_URL in
+  # blackheathdc-ansible/inventories/boardsesh_workers.yml (batch defaults).
+  # Cutover: docs/data/board-snapshots.md#batch-worker-owner-export-board-snapshots-family.
+  EXPO_PUBLIC_SNAPSHOT_BASE_URL: https://snapshots.boardsesh.com/board-snapshots/v1-gzip
   # Pin RN's fetch as the global `fetch` (not expo/fetch), which crashes Hermes by
   # tearing down JSI promises off-thread (Sentry 7595562195). Bundle-only flag — it
   # doesn't enter the resolved config, so it never moves the fingerprint. Kept in
-  # lockstep with the other mobile fingerprint workflows. See docs/mobile-ota-updates.md.
+  # lockstep with the other mobile fingerprint workflows. See docs/operations/mobile-ota-updates.md.
   EXPO_PUBLIC_USE_RN_FETCH: '1'
 
 jobs:
   # Fingerprint gate: resolve the iOS runtimeVersion fingerprint on a cheap Linux
   # runner and skip the ~60-min macOS build when a binary with that fingerprint
-  # already shipped (a fingerprint-ios-<hash> tag exists). The OTA publish
+  # already uploaded in the current uninterrupted iOS runtime history. Android-only
+  # stamps can reuse that upload across shared marketing versions. The OTA publish
   # (mobile-ota-production.yml) still delivers the JS to matching binaries. This
   # gate is the ONE canonical resolution: the build job embeds this exact value in
   # the binary via EXPO_UPDATES_FINGERPRINT_OVERRIDE (no macOS re-resolve) and tags
   # it, so binary-rv == tag == the OTA-published rv by construction — no cross-OS
-  # divergence to over-build around or strand OTAs over. See docs/mobile-ota-updates.md.
+  # divergence to over-build around or strand OTAs over. See docs/operations/mobile-ota-updates.md.
   gate:
-    # Automatic uploads come only from the release train; a manual dispatch may
-    # also come from main (the hotfix rebuild after a merge-back, when main's
-    # fingerprint already equals the train's). Arbitrary feature refs never
-    # receive Production credentials.
-    if: github.ref == 'refs/heads/release/next' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/next'))
+    # Only main may use Production signing credentials.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       contents: read
+      actions: read # inspect prior upload attempts before rebuilding an untagged source
     outputs:
-      should_build: ${{ steps.fp.outputs.should_build }}
+      should_build: ${{ steps.fp.outputs.should_build || 'false' }}
       fingerprint: ${{ steps.fp.outputs.fingerprint }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
     steps:
-      - name: Checkout repository
+      - name: Checkout trusted native release tooling
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
 
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version: '22.x'
           cache: true
 
+      - name: Resolve the exact main native release source
+        id: source
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          FORCE_NATIVE: ${{ inputs.force_native }}
+        run: node --experimental-strip-types scripts/mobile-native-release.ts source
+
+      - name: Preserve trusted release guards before pinning native source
+        if: steps.source.outputs.eligible == 'true'
+        run: |
+          mkdir -p "$RUNNER_TEMP/native-release-tools/scripts/lib"
+          cp scripts/mobile-native-release.ts "$RUNNER_TEMP/native-release-tools/scripts/"
+          cp scripts/lib/native-release.ts scripts/lib/mobile-release-version.ts scripts/lib/mobile-release-policy.ts scripts/lib/release-tags.ts "$RUNNER_TEMP/native-release-tools/scripts/lib/"
+
+      - name: Checkout exact native source
+        if: steps.source.outputs.eligible == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.source.outputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
       - name: Install Node.js dependencies (workspace root)
+        if: steps.source.outputs.eligible == 'true'
         run: vp install --frozen-lockfile
 
       # The .env is hashed into the fingerprint, so it must be byte-identical to
       # the build job's (same heredoc + same workflow env) or the gate would
       # resolve a different fingerprint than the build bakes.
       - name: Write .env for Expo build-time inlining
+        if: steps.source.outputs.eligible == 'true'
         working-directory: packages/mobile
         run: |
           cat > .env <<EOF
@@ -130,36 +176,22 @@ jobs:
           EOF
 
       - name: Resolve fingerprint and check for an existing native build
+        if: steps.source.outputs.eligible == 'true'
         id: fp
+        env:
+          NATIVE_PLATFORM: ios
+          NATIVE_SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+          NATIVE_RELEASE_ROOT: ${{ github.workspace }}
+          FORCE_NATIVE: ${{ inputs.force_native }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -uo pipefail
-          # No GOOGLE_MAPS_API_KEY here: iOS uses Apple Maps, so the iOS binary's
-          # fingerprint is resolved without it (the Android gate sets it).
-          raw="$(cd packages/mobile && vp exec expo-updates runtimeversion:resolve --platform ios 2>/dev/null || true)"
-          fp="$(printf '%s' "$raw" | jq -r '.runtimeVersion // empty' 2>/dev/null || true)"
-          if ! printf '%s' "$fp" | grep -qiE '^[0-9a-f]{8,}$'; then
-            echo "::warning::Could not resolve the iOS fingerprint — building to be safe."
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          echo "fingerprint=$fp" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::Manual dispatch — building iOS regardless of fingerprint $fp."
-            exit 0
-          fi
-          tag="fingerprint-ios-$fp"
-          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
-            echo "should_build=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::iOS fingerprint $fp already built (tag $tag) — skipping the native build; the OTA delivers the JS."
-          else
-            echo "should_build=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::iOS fingerprint $fp is new — running the native build."
-          fi
-
+          set -euo pipefail
+          raw="$(cd packages/mobile && vp exec expo-updates runtimeversion:resolve --platform ios)"
+          export RESOLVED_FINGERPRINT="$(printf '%s' "$raw" | jq -r '.runtimeVersion // empty')"
+          node --experimental-strip-types "$RUNNER_TEMP/native-release-tools/scripts/mobile-native-release.ts" gate
   build-and-upload:
     needs: gate
-    if: needs.gate.outputs.should_build == 'true' && (github.ref == 'refs/heads/release/next' || (github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/next')))
+    if: needs.gate.outputs.should_build == 'true' && github.ref == 'refs/heads/main'
     permissions:
       contents: read # protected release tags are pushed with the repository App token
       # Dispatches the OTA republish below. `workflow_dispatch` is the documented
@@ -169,14 +201,14 @@ jobs:
       # Actions:write to every token minted from that App, including one live for an
       # hour in this job while third-party actions run.
       actions: write
-    # macos-26 = Xcode 26 + iOS 26 SDK, which App Store Connect now requires
-    # for all uploads. Expo SDK 57 / RN 0.86 ships a fmt that compiles cleanly
-    # under Xcode 26's strict C++20 constexpr evaluator.
-    runs-on: macos-26
+    # Build SDK 58 with Xcode 27 / iOS 27, matching the native PR CI lane.
+    # macos-26 selects Xcode 26 and cannot validate the new SDK's startup.
+    runs-on: xcode-27
     timeout-minutes: 60
     environment: Production
 
     env:
+      NATIVE_SOURCE_SHA: ${{ needs.gate.outputs.source_sha }}
       WORKSPACE_PATH: packages/mobile/ios/Boardsesh.xcworkspace
       SCHEME: Boardsesh
       ARCHIVE_PATH: packages/mobile/ios/build/Boardsesh.xcarchive
@@ -191,19 +223,22 @@ jobs:
       # app.config.ts reads this and emits it as a LITERAL runtimeVersion, so
       # `expo prebuild` bakes this exact value into Expo.plist and the macOS runner
       # never resolves its own (divergent) fingerprint. Job-level so it's live at
-      # prebuild AND the xcodebuild archive phase. See docs/mobile-ota-updates.md.
+      # prebuild AND the xcodebuild archive phase. See docs/operations/mobile-ota-updates.md.
       EXPO_UPDATES_FINGERPRINT_OVERRIDE: ${{ needs.gate.outputs.fingerprint }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.source_sha }}
+          fetch-depth: 0 # freeze the previous uploaded native build before this upload
 
       # Needed by the post-archive `vp run mobile:upload-dsyms` step at the end
       # of this job; the rest of the build shells out to vp exec/xcodebuild directly.
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       - name: Install Node.js dependencies (workspace root)
         run: vp install --frozen-lockfile
@@ -262,7 +297,7 @@ jobs:
           # likely. There is no committed Podfile.lock to reconcile it against
           # (.gitignore ignores packages/mobile/ios/), so a key miss must mean a
           # clean `pod install`, not a partially-stale one.
-          key: ${{ runner.os }}-pods-rn-${{ hashFiles('packages/mobile/package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'packages/mobile/app.config.ts', 'packages/mobile/plugins/**', 'packages/mobile/modules/**', 'packages/mobile/locales/**', 'packages/mobile/eas.json', 'packages/mobile/assets/icon.png', 'packages/mobile/assets/adaptive-icon.png', 'packages/mobile/assets/splash-icon.png', 'packages/mobile/targets/**', 'patches/**') }}
+          key: ${{ runner.os }}-pods-rn-${{ hashFiles('packages/mobile/package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'packages/mobile/app.config.ts', 'packages/mobile/react-native.config.js', 'packages/mobile/plugins/**', 'packages/mobile/modules/**', 'packages/mobile/locales/**', 'packages/mobile/eas.json', 'packages/mobile/assets/icon.png', 'packages/mobile/assets/adaptive-icon.png', 'packages/mobile/assets/splash-icon.png', 'packages/mobile/targets/**', 'patches/**') }}
 
       - name: Install CocoaPods dependencies
         working-directory: packages/mobile/ios
@@ -272,8 +307,13 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
-          bundler-cache: true
           working-directory: fastlane
+      - name: Install fastlane gems
+        working-directory: fastlane
+        run: |
+          bundle config set --local path "$PWD/vendor/bundle"
+          bundle config set --local deployment true
+          bundle install --jobs 4
 
       - name: Setup App Store Connect API key
         env:
@@ -337,6 +377,13 @@ jobs:
           const version = versionMatch[1];
           fs.appendFileSync(process.env.GITHUB_ENV, `BOARDSESH_MOBILE_VERSION=${version}\n`);
           NODE
+
+      - name: Freeze TestFlight build and previous native baseline
+        id: testflight_receipt
+        if: env.FINGERPRINT_IOS != ''
+        env:
+          IOS_BUILD_NUMBER: ${{ steps.build_number.outputs.value }}
+        run: vp exec tsx scripts/testflight-build.ts capture --output "$RUNNER_TEMP/testflight-receipt/testflight-build.json"
 
       - name: Set build number
         working-directory: packages/mobile/ios
@@ -532,6 +579,7 @@ jobs:
           # the upload actually runs.
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
         run: |
+          set -o pipefail
           xcodebuild archive \
             -workspace "$WORKSPACE_PATH" \
             -scheme "$SCHEME" \
@@ -539,7 +587,10 @@ jobs:
             -archivePath "$ARCHIVE_PATH" \
             -destination "generic/platform=iOS" \
             CURRENT_PROJECT_VERSION=${{ steps.build_number.outputs.value }} \
-            DEVELOPMENT_TEAM=9L3HKPZBH3
+            DEVELOPMENT_TEAM=9L3HKPZBH3 2>&1 | tee archive.log
+
+      - name: Assert the SchedulerDelegate lifetime guard compiled (#5293)
+        run: node scripts/assert-ios-scheduler-guard-compiled.mjs archive.log packages/mobile/ios
 
       # The archive just wrote app.manifest, and its commitTime decides whether an
       # OTA can ever reach this binary: expo-updates launches whichever update has
@@ -592,23 +643,11 @@ jobs:
 
       - name: Export archive (uploads to TestFlight)
         id: testflight_upload
+        working-directory: fastlane
         env:
           APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
           APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-        run: |
-          if [ -z "$APP_STORE_CONNECT_ISSUER_ID" ]; then
-            echo "::error::Missing APP_STORE_CONNECT_ISSUER_ID."
-            exit 1
-          fi
-
-          xcodebuild -exportArchive \
-            -archivePath "$ARCHIVE_PATH" \
-            -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
-            -exportPath "$EXPORT_PATH" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath ~/.private_keys/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8 \
-            -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID" \
-            -authenticationKeyIssuerID "$APP_STORE_CONNECT_ISSUER_ID"
+        run: bundle exec fastlane ios testflight
 
       - name: Upload IPA as artifact
         uses: actions/upload-artifact@v4
@@ -624,7 +663,7 @@ jobs:
         env:
           DISCORD_DEPLOY_WEBHOOK: ${{ secrets.DISCORD_DEPLOY_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_SHA: ${{ needs.gate.outputs.source_sha }}
           BUILD_NUMBER: ${{ steps.build_number.outputs.value }}
         run: |
           if [ -z "$DISCORD_DEPLOY_WEBHOOK" ]; then
@@ -642,7 +681,7 @@ jobs:
         env:
           DISCORD_DEPLOY_WEBHOOK: ${{ secrets.DISCORD_DEPLOY_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          COMMIT_SHA: ${{ github.sha }}
+          COMMIT_SHA: ${{ needs.gate.outputs.source_sha }}
           BUILD_NUMBER: ${{ steps.build_number.outputs.value }}
         run: |
           if [ -z "$DISCORD_DEPLOY_WEBHOOK" ]; then
@@ -663,6 +702,8 @@ jobs:
           app-id: ${{ vars.OTA_PUSH_APP_ID }}
           private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
           permission-contents: write
+          # Pinned native sources can include workflow changes.
+          permission-workflows: write
 
       # Publish the exact build-number lookup and fingerprint gate. A new
       # fingerprint publishes both atomically; a forced rebuild preserves the
@@ -688,8 +729,8 @@ jobs:
           assert_missing_or_exact() {
             local tag="$1"
             local target="$2"
-            if [ -n "$target" ] && [ "$target" != "$GITHUB_SHA" ]; then
-              echo "::error::$tag already points to $target, expected $GITHUB_SHA."
+            if [ -n "$target" ] && [ "$target" != "$NATIVE_SOURCE_SHA" ]; then
+              echo "::error::$tag already points to $target, expected $NATIVE_SOURCE_SHA."
               exit 1
             fi
           }
@@ -711,18 +752,18 @@ jobs:
             local target
             target="$(remote_target "$build_tag")"
             assert_missing_or_exact "$build_tag" "$target"
-            if [ "$target" = "$GITHUB_SHA" ]; then
+            if [ "$target" = "$NATIVE_SOURCE_SHA" ]; then
               echo "::notice::$build_tag already points to this build."
               return 0
             fi
-            git tag --force "$build_tag" "$GITHUB_SHA"
+            git tag --force "$build_tag" "$NATIVE_SOURCE_SHA"
             if authenticated_push "$remote" "refs/tags/$build_tag"; then
               echo "::notice::Tagged exact uploaded build $build_tag."
               return 0
             fi
             target="$(remote_target "$build_tag")"
             assert_missing_or_exact "$build_tag" "$target"
-            [ "$target" = "$GITHUB_SHA" ] || {
+            [ "$target" = "$NATIVE_SOURCE_SHA" ] || {
               echo "::error::Failed to publish exact uploaded build tag $build_tag."
               return 1
             }
@@ -737,8 +778,8 @@ jobs:
             publish_build_tag
             echo "::notice::Preserved immutable $fingerprint_tag at $fingerprint_target."
           else
-            git tag --force "$build_tag" "$GITHUB_SHA"
-            git tag --force "$fingerprint_tag" "$GITHUB_SHA"
+            git tag --force "$build_tag" "$NATIVE_SOURCE_SHA"
+            git tag --force "$fingerprint_tag" "$NATIVE_SOURCE_SHA"
             if authenticated_push --atomic "$remote" "refs/tags/$build_tag" "refs/tags/$fingerprint_tag"; then
               echo "::notice::Atomically tagged $build_tag and $fingerprint_tag."
             else
@@ -752,6 +793,63 @@ jobs:
             fi
           fi
           unset git_auth
+
+      - name: Record exact uploaded native source
+        id: native_source
+        if: steps.tag_token.outcome == 'success'
+        env:
+          SOURCE_WORKFLOW_SHA: ${{ github.sha }}
+          SOURCE_BUILD_NUMBER: ${{ steps.build_number.outputs.value }}
+        run: |
+          node <<'NODE'
+          const { writeFileSync } = require('node:fs');
+          const { join } = require('node:path');
+          const { NATIVE_SOURCE_SHA, SOURCE_WORKFLOW_SHA, GITHUB_RUN_ID, BOARDSESH_MOBILE_VERSION, SOURCE_BUILD_NUMBER, FINGERPRINT_IOS, RUNNER_TEMP } = process.env;
+          writeFileSync(join(RUNNER_TEMP, 'native-build-source.json'), JSON.stringify({
+            schemaVersion: 1, platform: 'ios', sourceSha: NATIVE_SOURCE_SHA,
+            workflowSha: SOURCE_WORKFLOW_SHA, sourceRunId: GITHUB_RUN_ID,
+            version: BOARDSESH_MOBILE_VERSION, buildNumber: SOURCE_BUILD_NUMBER,
+            buildTag: `build-ios-v${BOARDSESH_MOBILE_VERSION}-${SOURCE_BUILD_NUMBER}-${FINGERPRINT_IOS.slice(0, 12)}`,
+          }) + '\n');
+          NODE
+
+      - name: Retain exact uploaded native source
+        if: steps.native_source.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-build-source-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native-build-source.json
+          retention-days: 90
+          if-no-files-found: error
+
+      # The external-group follow-up consumes this exact run's receipt. It never
+      # re-derives a baseline after the new build tag has been published.
+      - name: Save uploaded TestFlight build receipt
+        if: steps.testflight_upload.outcome == 'success' && steps.testflight_receipt.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-testflight-build-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/testflight-receipt/testflight-build.json
+          retention-days: 90
+          if-no-files-found: error
+
+      # Hand this exact upload to the Discord Users distribution. A dispatch, not
+      # workflow_run: GitHub sends no workflow_run for a run GITHUB_TOKEN started,
+      # and Main Native Release starts recovery builds that way. The distribution
+      # waits for this run to finish before trusting it. Non-blocking: if the
+      # dispatch fails, its hourly check delivers the newest never-attempted upload.
+      - name: Hand the uploaded build to Discord Users distribution
+        if: steps.testflight_upload.outcome == 'success' && steps.testflight_receipt.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh workflow run ios-testflight-distribute.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref main \
+            -f source_run_id="$GITHUB_RUN_ID"
+          echo "::notice::Dispatched Discord Users distribution for run $GITHUB_RUN_ID."
 
       # Un-strand the binary we just uploaded. expo-updates launches whichever
       # update has the newest commitTime, and this binary stamped its embedded
@@ -768,9 +866,8 @@ jobs:
       # native code for. Non-blocking: the store upload has already succeeded and a
       # failed dispatch must not red an otherwise good release.
       #
-      # Dispatched against the branch that BUILT (github.ref_name), not a literal
-      # main: a train binary's fingerprint only exists on release/next, so a
-      # `--ref main` dispatch could never publish an update it can receive.
+      # Main rechecks expect_fingerprint, so a later native snapshot cannot
+      # accidentally publish an incompatible update for this binary.
       - name: Republish the production OTA so it outranks this build
         if: steps.testflight_upload.outcome == 'success' && env.FINGERPRINT_IOS != ''
         continue-on-error: true
@@ -779,7 +876,7 @@ jobs:
         run: |
           set -euo pipefail
           gh workflow run mobile-ota-production.yml \
-            --ref "${{ github.ref_name }}" \
+            --ref main \
             -f platform=ios \
             -f expect_fingerprint="$FINGERPRINT_IOS"
           echo "::notice::Dispatched a production OTA republish for iOS fingerprint $FINGERPRINT_IOS."

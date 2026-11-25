@@ -1,17 +1,15 @@
-// Pure label builders for the persistent filter-chip row, shared by both
-// implementations (FilterChipRow.ios.tsx SwiftUI menus, FilterChipRow.android.tsx
-// Jetpack Compose dropdowns). The chip wording is sourced once here so the two
-// platforms can't word the same filter differently, and so the popularity/rating
-// bucket → label mapping stays unit-testable without a native host (the
-// FilterChipRow vite alias swaps the COMPONENT for a null stub under Vitest, but
-// this `.logic` module is not aliased, so its functions run for real).
+// Pure label builders for the climbs filter row, used by buildClimbCapsules
+// (climb-capsules.ts), which every platform's capsule row renders. The chip
+// wording is sourced once here so a filter is never worded two ways, and so the
+// popularity/rating bucket → label mapping stays unit-testable without a native
+// host.
 //
-// The native JSX lives in the platform files; only the `t(...)`-bound wording lives
-// here. Keep using the shared POPULARITY_BUCKETS / RATING_BUCKETS from
+// Keep using the shared POPULARITY_BUCKETS / RATING_BUCKETS from
 // `filter-chip-menus.ts` at the call sites so the chip and the sheet never diverge.
 
 import type { TFunction } from 'i18next';
 import {
+  CLIMB_TYPE_VALUES,
   formatMinAscentsFilterCount,
   gradeAccuracyBucket,
   GRADE_ACCURACY_VALUES,
@@ -79,20 +77,20 @@ export function climbTypeChipLabel(value: ClimbTypeFilter, t: TFunction<'climbs'
 
 /** Narrows a raw native-picker tag to a {@link ClimbTypeFilter}. */
 export function isClimbType(value: string): value is ClimbTypeFilter {
-  return value === 'boulders' || value === 'routes' || value === 'both';
+  return (CLIMB_TYPE_VALUES as readonly string[]).includes(value);
 }
 
 /**
- * Label for the "Collection" single-select: the chip shows "Benchmarks" / "My
- * drafts" when active, and "Any" for the neutral value (the resting chip uses the
+ * Label for the "Collection" single-select: the chip shows "My drafts" /
+ * "Liked" when active, and "Any" for the neutral value (the resting chip uses the
  * group name "Collection" instead — see the call site).
  */
-export function collectionChipLabel(value: CollectionFilter, t: TFunction<'climbs'>): string {
+export function collectionChipLabel(value: CollectionFilter, t: TFunction<'climbs'>, isSprayWall = false): string {
   switch (value) {
-    case 'benchmarks':
-      return t('mobile.filter.benchmark');
     case 'drafts':
-      return t('mobile.filter.drafts');
+      return isSprayWall ? t('mobile.filter.wallDrafts') : t('mobile.filter.drafts');
+    case 'liked':
+      return t('mobile.filter.collection.liked');
     case 'any':
       return t('mobile.filter.collection.any');
   }

@@ -37,13 +37,16 @@ export interface BoardPresenceClient {
    * Subscribe to a board's live "now on the wall" feed. Each event is one
    * `BoardPresenceEvent` (set or cleared). Returns an unsubscribe function the
    * hook calls on board change / unmount. `onError` (optional) reports a
-   * transport-level failure without tearing down the hook's state.
+   * terminal failure without tearing down the hook's state. The transport is
+   * expected to auto-reconnect ordinary socket interruptions; the hook retries
+   * terminal non-denial failures with capped exponential backoff.
    */
   subscribeNowPlaying(
     boardId: number,
     onEvent: (event: BoardPresenceEvent) => void,
     onError?: (err: unknown) => void,
     onComplete?: () => void,
+    boardUuid?: string | null,
   ): () => void;
 
   /**
@@ -58,28 +61,39 @@ export interface BoardPresenceClient {
   onReconnect?(callback: () => void): () => void;
 
   /** Newest-first recent climbs, used to backfill history for a late joiner. */
-  fetchRecentClimbs(boardId: number): Promise<BoardPresenceClimb[]>;
-  fetchRecentHistory?(boardId: number): Promise<BoardPresenceClimb[]>;
-  fetchHistoryPage?(boardId: number, opts?: { limit?: number; before?: string }): Promise<BoardHistoryPage>;
+  fetchRecentClimbs(boardId: number, boardUuid?: string | null): Promise<BoardPresenceClimb[]>;
+  fetchRecentHistory?(boardId: number, boardUuid?: string | null): Promise<BoardPresenceClimb[]>;
+  fetchHistoryPage?(
+    boardId: number,
+    opts?: { limit?: number; before?: string; boardUuid?: string | null },
+  ): Promise<BoardHistoryPage>;
 
   /**
    * Durable, keyset-paged history of what was lit on the board, from the
    * `board_climb_events` log — beyond the ~50 / 24h window `fetchRecentClimbs`
-   * covers. Newest-first; pass `before` (the `seq` of the previous page's last
+   * covers, within the last seven days. Newest-first; pass `before` (the `seq` of the previous page's last
    * row) to page back, and `limit` (server-capped 1–100, default 50) for page
    * size. Optional so read-only / web clients that only need the live feed plus
    * recent backfill still satisfy the interface.
    */
-  fetchHistory?(boardId: number, opts?: { limit?: number; before?: BoardHistoryCursor }): Promise<BoardPresenceClimb[]>;
+  fetchHistory?(
+    boardId: number,
+    opts?: { limit?: number; before?: BoardHistoryCursor; boardUuid?: string | null },
+  ): Promise<BoardPresenceClimb[]>;
 
   /**
    * Up to five distinct recent senders for one climb + angle on this physical
    * board. Optional so existing read-only/fake clients degrade to no byline.
    */
-  fetchClimbRecentSenders?(boardId: number, climbUuid: string, angle: number): Promise<BoardClimbRecentSender[]>;
+  fetchClimbRecentSenders?(
+    boardId: number,
+    climbUuid: string,
+    angle: number,
+    boardUuid?: string | null,
+  ): Promise<BoardClimbRecentSender[]>;
 
   /** Durable + live stats for the board's wall feed. */
-  fetchStats(boardId: number): Promise<BoardPresenceStats>;
+  fetchStats(boardId: number, boardUuid?: string | null): Promise<BoardPresenceStats>;
 
   /**
    * Current connection holder for the board, used to seed a late joiner before
@@ -87,7 +101,7 @@ export interface BoardPresenceClient {
    * board is free. Optional so a client that doesn't track holders still
    * satisfies the interface.
    */
-  fetchConnection?(boardId: number): Promise<BoardConnectionHolder | null>;
+  fetchConnection?(boardId: number, boardUuid?: string | null): Promise<BoardConnectionHolder | null>;
 
   /**
    * Release this client's hold on the board (e.g. on BLE disconnect). Resolves
@@ -97,18 +111,32 @@ export interface BoardPresenceClient {
   reportDisconnect?(boardId: number): Promise<boolean>;
 
   /**
+   * Tell every viewer this client turned off all the wall's lights while keeping
+   * its link (#7015). Resolves to the server's accepted flag: false when another
+   * emitter holds the board. Optional so a read-only client still satisfies the
+   * interface.
+   */
+  reportClear?(boardId: number): Promise<boolean>;
+
+  /**
    * Report the climb just lit on the wall. `angle` is the wall angle (null =
    * unspecified). Resolves to the server's accepted flag.
    */
   reportClimb(boardId: number, climb: ClimbQueueItemInput, angle: number | null): Promise<boolean>;
 
-  /** Resolve (and bind) the shared board for a BLE serial. */
+  /**
+   * Resolve (and bind) the shared board for a BLE serial. Pass
+   * `selectedBoardUuid` when the caller already has a board selected (map
+   * finder / board picker) — a selection matching the connected config wins
+   * over serial matching, so connecting never moves the user off that wall.
+   */
   resolveBoardForSerial(args: {
     serial: string;
     boardType: string;
     layoutId: number;
     sizeId: number;
     setIds: string;
+    selectedBoardUuid?: string | null;
   }): Promise<ResolvedBoard>;
 
   /** Resolve the selected named board's wall feed before BLE connects. */

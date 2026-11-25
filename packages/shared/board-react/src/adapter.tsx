@@ -3,6 +3,8 @@ import type { QueryClient } from '@tanstack/react-query';
 import type { SaveTickMutationResponse, SaveTickMutationVariables } from '@boardsesh/graphql/operations';
 import type { ClimbStatsForClimbEntry } from '@boardsesh/graphql/operations';
 import type { ClimbStatsEvent } from '@boardsesh/shared-schema';
+import type { SaveClimbInput, UpdateClimbInput } from '@boardsesh/shared-schema';
+import type { SaveClimbResponse, UpdateClimbResponse } from './climb-helpers';
 
 export type ClimbStatsSubscriptionHandlers = {
   next: (event: ClimbStatsEvent) => void;
@@ -17,6 +19,7 @@ export type OfflineMutationDelivery = {
   tableName: string;
   operation: string;
   idempotencyKey: string;
+  entityKey?: string;
   status: 'acknowledged' | 'dead_letter';
 };
 
@@ -44,6 +47,24 @@ export type BoardAdapter = {
   isAuthLoading: boolean;
   executeHttp: ExecuteHttp;
   executeWs: ExecuteWs;
+  /** Atomic local climb + replay storage; null keeps the platform's network path. */
+  saveClimbOffline?: (
+    input: SaveClimbInput,
+    helpers: { queryClient: QueryClient },
+  ) => Promise<SaveClimbResponse | null>;
+  updateClimbOffline?: (
+    input: UpdateClimbInput,
+    helpers: { queryClient: QueryClient },
+  ) => Promise<UpdateClimbResponse | null>;
+  /** Await local mirroring after remote success, before query invalidation. */
+  afterClimbWrite?: (write: {
+    boardType: string;
+    climbUuid: string;
+    layoutId?: number;
+    sizeId?: number;
+    sprayWallUuid?: string;
+    authEpoch?: number;
+  }) => Promise<void>;
   /**
    * Returns the platform-specific active-session id used as the default
    * when a SaveTickOptions call omits `sessionId`. Web reads from
@@ -87,6 +108,20 @@ export type BoardAdapter = {
     helpers: { queryClient: QueryClient; executeHttp: ExecuteHttp },
   ) => Promise<SaveTickMutationResponse['saveTick'] | null>;
   /**
+   * Optional read of which climb version each of the climber's own ticks was
+   * logged on, keyed by tick uuid, for the given climbs. Mobile answers from
+   * its SQLite copy of the ticks. `GetTicks` cannot select
+   * `Tick.climbRevision` while the screenshot fixtures pin its text, so this
+   * is where a fetched logbook row gets its version (#6023).
+   *
+   * Three answers per tick, and the difference matters to whether a send still
+   * counts: a number for a tick with a version, `null` for a tick the platform
+   * holds a copy of that has none (it reads as version 1), and NO KEY for a
+   * tick the platform holds no copy of (unknown, and the tick still counts).
+   * May reject; the logbook then keeps its rows without versions.
+   */
+  readLocalTickRevisions?: (boardType: string, climbUuids: string[]) => Promise<ReadonlyMap<string, number | null>>;
+  /**
    * Optional post-save side-effect. Web wires `clearTickDraft` (IndexedDB);
    * mobile has no tick-draft store today and may omit it.
    */
@@ -101,7 +136,7 @@ export type BoardAdapter = {
 };
 
 /** Stable identifiers for fallback-toast errors the shared hooks can raise. */
-export type BoardErrorReason = 'saveClimbFailed' | 'updateClimbFailed';
+export type BoardErrorReason = 'saveClimbFailed' | 'updateClimbFailed' | 'localClimbRefreshFailed';
 
 const BoardAdapterContext = createContext<BoardAdapter | undefined>(undefined);
 

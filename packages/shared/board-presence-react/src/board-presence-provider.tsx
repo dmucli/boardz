@@ -2,19 +2,18 @@
 // "now playing" state anywhere in the tree without prop-drilling. Renderer-
 // agnostic — `react` only, no host components.
 
-import { createContext, useContext, useMemo, type ReactNode } from 'react';
+import { createContext, useContext, useMemo, useReducer, type ReactNode } from 'react';
 import {
   useBoardPresence,
   type BoardPresenceActions,
   type BoardPresenceCatchUpInfo,
   type BoardPresenceCurrentState,
   type BoardPresenceFeedState,
-  type UseBoardPresenceResult,
 } from './use-board-presence';
 import type { BoardPresenceClient } from './types';
 import type { BoardPresenceClimb } from '@boardsesh/shared-schema';
+import { BoardHistoryRefreshContext, useRecentBoardHistory } from './use-recent-board-history';
 
-const BoardPresenceContext = createContext<UseBoardPresenceResult | undefined>(undefined);
 const BoardPresenceActionsContext = createContext<BoardPresenceActions | undefined>(undefined);
 const BoardPresenceCurrentContext = createContext<BoardPresenceCurrentState | undefined>(undefined);
 const BoardPresenceFeedContext = createContext<BoardPresenceFeedState | undefined>(undefined);
@@ -28,19 +27,25 @@ const BoardPresenceHasClimbContext = createContext<boolean | undefined>(undefine
 // Narrow selector: the wall's lit climb when live, else `null`. `undefined`
 // means "outside the provider" (mirrors every other context here); `null` is a
 // real value (no board bound, or the feed isn't live). Consumers that only
-// need "what's lit right now" (e.g. mobile's `useWallClimbIfDistinct`) read
+// need "what's lit right now" (e.g. mobile's `useLiveWallClimb`) read
 // this instead of `BoardPresenceCurrentContext`, so they don't re-render on
 // holder/stats/undo-target churn that context also carries.
 const BoardPresenceWallClimbContext = createContext<BoardPresenceClimb | null | undefined>(undefined);
+// Narrow primitive: the climb a "Turn off all lights" left dark while the feed
+// is live, else `null` (#7015). A string, so it only re-renders consumers when a
+// clear lands or the wall lights up again — the play drawer reads it on every
+// render path and must not churn on holder/stats events.
+const BoardPresenceClearedClimbContext = createContext<string | null | undefined>(undefined);
 
 /** The board + client pair a consumer needs to drive its own platform I/O
  * against — currently just `use-board-history-pagination`'s `fetchHistory`
  * paging, which lives outside the reducer/feed context on purpose (see that
- * hook's docstring). Memoized on `[boardId, client]` only, so it changes
- * exactly when the bound board or transport itself changes, never on a wall
+ * hook's docstring). Memoized on `[boardId, boardUuid, client]` only, so it changes
+ * exactly when the bound board, held link, or transport itself changes, never on a wall
  * event. */
 export type BoardPresenceClientValue = {
   boardId: number | null;
+  boardUuid?: string | null;
   client: BoardPresenceClient | null;
 };
 
@@ -48,11 +53,13 @@ const BoardPresenceClientContext = createContext<BoardPresenceClientValue | unde
 
 export function BoardPresenceProvider({
   boardId,
+  boardUuid = null,
   client,
   onCatchUp,
   children,
 }: {
   boardId: number | null;
+  boardUuid?: string | null;
   client: BoardPresenceClient | null;
   /**
    * Optional telemetry hook fired after a catch-up (reconnect / foreground /
@@ -63,16 +70,26 @@ export function BoardPresenceProvider({
   onCatchUp?: (info: BoardPresenceCatchUpInfo) => void;
   children: ReactNode;
 }) {
-  const value = useBoardPresence(boardId, client, onCatchUp);
+  const [historyRefreshVersion, recheckHistory] = useReducer((revision: number) => revision + 1, 0);
+  const value = useBoardPresence(boardId, client, onCatchUp, boardUuid, recheckHistory);
+  const { history } = useRecentBoardHistory(value.history, historyRefreshVersion);
   const actions = useMemo<BoardPresenceActions>(
     () => ({
       reportClimb: value.reportClimb,
       reportClimbWithUndoTarget: value.reportClimbWithUndoTarget,
       reportDisconnect: value.reportDisconnect,
+      reportClear: value.reportClear,
       getUndoTarget: value.getUndoTarget,
       refresh: value.refresh,
     }),
-    [value.reportClimb, value.reportClimbWithUndoTarget, value.reportDisconnect, value.getUndoTarget, value.refresh],
+    [
+      value.reportClimb,
+      value.reportClimbWithUndoTarget,
+      value.reportDisconnect,
+      value.reportClear,
+      value.getUndoTarget,
+      value.refresh,
+    ],
   );
   const current = useMemo<BoardPresenceCurrentState>(
     () => ({
@@ -81,16 +98,27 @@ export function BoardPresenceProvider({
       undoTarget: value.undoTarget,
       holder: value.holder,
       lastConnectionSeq: value.lastConnectionSeq,
+      lastHolderChangeSeq: value.lastHolderChangeSeq,
+      clearedClimbUuid: value.clearedClimbUuid,
       isLive: value.isLive,
     }),
-    [value.currentClimb, value.previousClimb, value.undoTarget, value.holder, value.lastConnectionSeq, value.isLive],
+    [
+      value.currentClimb,
+      value.previousClimb,
+      value.undoTarget,
+      value.holder,
+      value.lastConnectionSeq,
+      value.lastHolderChangeSeq,
+      value.clearedClimbUuid,
+      value.isLive,
+    ],
   );
   const feed = useMemo<BoardPresenceFeedState>(
     () => ({
-      history: value.history,
+      history,
       stats: value.stats,
     }),
-    [value.history, value.stats],
+    [history, value.stats],
   );
   // Bare primitive on purpose — no useMemo. A boolean is compared by value, so
   // the context only re-renders consumers when it actually flips (not on every
@@ -100,36 +128,34 @@ export function BoardPresenceProvider({
   // when live (or the stable `null` literal otherwise), so there is nothing to
   // memoize: the reference only changes when `currentClimb` itself does.
   const wallClimb = value.isLive ? value.currentClimb : null;
-  // Changes only on a board switch or client rebuild (props identity), never
-  // on a wall event — safe for a hook like `use-board-history-pagination` to
-  // key an effect on without re-running per climb.
-  const clientValue = useMemo<BoardPresenceClientValue>(() => ({ boardId, client }), [boardId, client]);
+  const clearedClimbUuid = value.isLive ? value.clearedClimbUuid : null;
+  // Retire all independent paging/byline caches when the server refuses this
+  // reader. A transport failure only turns `isLive` off, so pages stay. Ordinary
+  // climb pushes keep this scope stable.
+  const clientValue = useMemo<BoardPresenceClientValue>(
+    () => ({ boardId, boardUuid, client: value.isDenied ? null : client }),
+    [boardId, boardUuid, client, value.isDenied],
+  );
 
   return (
-    <BoardPresenceContext.Provider value={value}>
-      <BoardPresenceActionsContext.Provider value={actions}>
-        <BoardPresenceCurrentContext.Provider value={current}>
-          <BoardPresenceHasClimbContext.Provider value={hasClimb}>
-            <BoardPresenceWallClimbContext.Provider value={wallClimb}>
+    <BoardPresenceActionsContext.Provider value={actions}>
+      <BoardPresenceCurrentContext.Provider value={current}>
+        <BoardPresenceHasClimbContext.Provider value={hasClimb}>
+          <BoardPresenceWallClimbContext.Provider value={wallClimb}>
+            <BoardPresenceClearedClimbContext.Provider value={clearedClimbUuid}>
               <BoardPresenceFeedContext.Provider value={feed}>
                 <BoardPresenceClientContext.Provider value={clientValue}>
-                  {children}
+                  <BoardHistoryRefreshContext.Provider value={historyRefreshVersion}>
+                    {children}
+                  </BoardHistoryRefreshContext.Provider>
                 </BoardPresenceClientContext.Provider>
               </BoardPresenceFeedContext.Provider>
-            </BoardPresenceWallClimbContext.Provider>
-          </BoardPresenceHasClimbContext.Provider>
-        </BoardPresenceCurrentContext.Provider>
-      </BoardPresenceActionsContext.Provider>
-    </BoardPresenceContext.Provider>
+            </BoardPresenceClearedClimbContext.Provider>
+          </BoardPresenceWallClimbContext.Provider>
+        </BoardPresenceHasClimbContext.Provider>
+      </BoardPresenceCurrentContext.Provider>
+    </BoardPresenceActionsContext.Provider>
   );
-}
-
-export function useBoardPresenceContext(): UseBoardPresenceResult {
-  const context = useContext(BoardPresenceContext);
-  if (context === undefined) {
-    throw new Error('useBoardPresenceContext must be used within a BoardPresenceProvider');
-  }
-  return context;
 }
 
 export function useBoardPresenceActions(): BoardPresenceActions {
@@ -169,12 +195,25 @@ export function useBoardPresenceHasClimb(): boolean {
  * `useBoardPresenceCurrent()`: this context only changes when the lit climb
  * itself changes, not on holder/undo-target/isLive-independent churn, so
  * consumers that just need "what's on the wall right now" (e.g. mobile's
- * `useWallClimbIfDistinct`) avoid re-rendering on every presence event.
+ * `useLiveWallClimb`) avoid re-rendering on every presence event.
  */
 export function useBoardPresenceWallClimb(): BoardPresenceClimb | null {
   const context = useContext(BoardPresenceWallClimbContext);
   if (context === undefined) {
     throw new Error('useBoardPresenceWallClimb must be used within a BoardPresenceProvider');
+  }
+  return context;
+}
+
+/**
+ * The climb a "Turn off all lights" left dark while the feed is live, else
+ * `null` (#7015). Compare it with the climb on screen; never read it as "the
+ * wall is dark".
+ */
+export function useBoardPresenceClearedClimbUuid(): string | null {
+  const context = useContext(BoardPresenceClearedClimbContext);
+  if (context === undefined) {
+    throw new Error('useBoardPresenceClearedClimbUuid must be used within a BoardPresenceProvider');
   }
   return context;
 }
@@ -196,11 +235,11 @@ export function useBoardPresenceClient(): BoardPresenceClientValue {
 }
 
 export {
-  BoardPresenceContext,
   BoardPresenceActionsContext,
   BoardPresenceCurrentContext,
   BoardPresenceFeedContext,
   BoardPresenceHasClimbContext,
   BoardPresenceWallClimbContext,
+  BoardPresenceClearedClimbContext,
   BoardPresenceClientContext,
 };

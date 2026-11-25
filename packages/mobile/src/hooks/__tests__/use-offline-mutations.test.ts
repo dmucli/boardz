@@ -38,10 +38,17 @@ vi.mock('@tanstack/react-query', () => ({
 // The drain now routes through the mobile adapter, which binds AppState/NetInfo
 // at module load — stub both so this suite keeps running in the node env.
 vi.mock('react-native', () => ({
+  Platform: { OS: 'ios' },
   AppState: { addEventListener: () => ({ remove: () => {} }) },
 }));
 vi.mock('@react-native-community/netinfo', () => ({
   default: { addEventListener: () => () => {} },
+}));
+// Secure-store I/O belongs to the adapter's own tests, not these SQLite write checks.
+vi.mock('../../lib/auth-store', () => ({
+  getAuthToken: async () => null,
+  captureAuthCredentialGeneration: () => 1,
+  isAuthCredentialGenerationCurrent: () => true,
 }));
 
 // The reporter itself is unit-tested in offline/__tests__/outbox-telemetry.test.ts;
@@ -78,6 +85,8 @@ import {
 } from '../use-offline-mutations';
 import { getDeadLetterCount, runMigrations, stampLocalUserId, type GraphQLFetch } from '@boardsesh/offline-sync';
 import { readAuthorSnapshot, saveAuthorSnapshot } from '../../db/queries/followed-authors-local';
+import { searchClimbsLocal } from '../../db/queries/search-climbs-local';
+import type { ClimbSearchInput } from '@boardsesh/shared-schema';
 import { createTestDatabase, __resetDrainerStateForTests, type TestSqliteDb } from '@boardsesh/offline-sync/testing';
 
 type Row = Record<string, unknown>;
@@ -231,6 +240,104 @@ describe('writeTickLocal', () => {
     // waiting" count is driven off this, and a write that queues silently would
     // leave the climber's send uncounted until the next drain tick.
     expect(notifyOutboxChangedMock).toHaveBeenCalledTimes(1);
+  });
+
+  // The local row is stamped with the phone's copy of the climb's version, so
+  // the local sent marks (which compare it with the climb's holds version)
+  // count the send before the pull. The queued payload never carries a version:
+  // the server picks it.
+  it("stamps the local row with the phone's climb version and queues no version", async () => {
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, is_listed, is_draft, revision_number, holds_revision_number)
+       VALUES ('climb-1', 'kilter', 1, 'Edited', 'p1r12', 1, 0, 3, 2)`,
+    );
+    await writeTickLocal(db, makeTickInput(), 'tick-rev-1');
+
+    const tick = await db.getFirstAsync<Row>('SELECT climb_revision FROM boardsesh_ticks WHERE uuid = ?', [
+      'tick-rev-1',
+    ]);
+    expect(tick?.climb_revision).toBe(3);
+
+    const queued = await db.getFirstAsync<Row>('SELECT payload FROM pending_mutations WHERE idempotency_key = ?', [
+      'tick-rev-1',
+    ]);
+    expect('climbRevision' in (JSON.parse(queued?.payload as string) as Record<string, unknown>)).toBe(false);
+  });
+
+  it("does not take another board's climb version", async () => {
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, is_listed, is_draft, revision_number, holds_revision_number)
+       VALUES ('climb-1', 'tension', 1, 'Other board', 'p1r12', 1, 0, 5, 5)`,
+    );
+    await writeTickLocal(db, makeTickInput(), 'tick-rev-other');
+
+    const tick = await db.getFirstAsync<Row>('SELECT climb_revision FROM boardsesh_ticks WHERE uuid = ?', [
+      'tick-rev-other',
+    ]);
+    expect(tick?.climb_revision).toBeNull();
+  });
+
+  // Why the stamp exists: local search counts a send only when its version is
+  // at or past the climb's holds version, and a NULL reads as 1.
+  it('a tick written on a climb whose holds moved reads back as sent in local search', async () => {
+    await stampLocalUserId(db, 'viewer');
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, frames_count, is_listed, is_draft,
+         compatible_size_ids, revision_number, holds_revision_number, created_at, updated_at)
+       VALUES ('climb-1', 'kilter', 1, 'Edited', 'p1r12', 1, 1, 0, '[5]', 3, 3,
+         '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')`,
+    );
+    await writeTickLocal(db, makeTickInput({ isMirror: false }), 'tick-sent');
+
+    const { climbs } = await searchClimbsLocal(db, {
+      boardName: 'kilter',
+      layoutId: 1,
+      sizeId: 5,
+      setIds: '',
+      angle: 40,
+      page: 0,
+      pageSize: 20,
+      sortBy: 'ascents',
+      sortOrder: 'desc',
+    } as ClimbSearchInput);
+    expect(climbs.find((climb) => climb.uuid === 'climb-1')?.userAscents).toBe(1);
+  });
+
+  it('leaves the local version NULL when the phone row has no version yet', async () => {
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, is_listed, is_draft, revision_number, holds_revision_number)
+       VALUES ('climb-1', 'kilter', 1, 'Pre-v11 row', 'p1r12', 1, 0, NULL, NULL)`,
+    );
+    await writeTickLocal(db, makeTickInput(), 'tick-rev-null');
+
+    const tick = await db.getFirstAsync<Row>('SELECT climb_revision FROM boardsesh_ticks WHERE uuid = ?', [
+      'tick-rev-null',
+    ]);
+    expect(tick?.climb_revision).toBeNull();
+  });
+
+  it('does not re-stamp a tick on a retried write', async () => {
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, is_listed, is_draft, revision_number, holds_revision_number)
+       VALUES ('climb-1', 'kilter', 1, 'Edited', 'p1r12', 1, 0, 3, 3)`,
+    );
+    await writeTickLocal(db, makeTickInput(), 'tick-retried');
+    await db.runAsync("UPDATE board_climbs SET revision_number = 5, holds_revision_number = 5 WHERE uuid = 'climb-1'");
+    await writeTickLocal(db, makeTickInput(), 'tick-retried');
+
+    const ticks = await db.getAllAsync<Row>('SELECT climb_revision FROM boardsesh_ticks WHERE uuid = ?', [
+      'tick-retried',
+    ]);
+    expect(ticks).toEqual([{ climb_revision: 3 }]);
+  });
+
+  it('leaves the local version NULL when the phone holds no copy of the climb', async () => {
+    await writeTickLocal(db, makeTickInput(), 'tick-rev-2');
+
+    const tick = await db.getFirstAsync<Row>('SELECT climb_revision FROM boardsesh_ticks WHERE uuid = ?', [
+      'tick-rev-2',
+    ]);
+    expect(tick?.climb_revision).toBeNull();
   });
 
   it('persists a null session_id when the input omits sessionId', async () => {
@@ -492,6 +599,75 @@ describe('favorite queue coalescing', () => {
     expect(queued).toHaveLength(1);
     expect(queued[0].operation).toBe('create');
     expect(queued[0].idempotency_key).toBe('add:user_favorites:kilter:climb-9:40');
+  });
+});
+
+// A heart belongs to the climb, not the angle (#6077 review): the server's
+// remove clears every angle, and Collection → Liked ignores angle.
+describe('favorite removal across angles', () => {
+  const at40 = { boardName: 'kilter', climbUuid: 'climb-9', angle: 40 };
+  const at25 = { ...at40, angle: 25 };
+
+  it('removing at 25° deletes the heart given at 40°', async () => {
+    await addFavoriteLocal(db, at40);
+    await removeFavoriteLocal(db, at25);
+
+    expect(await db.getAllAsync<Row>('SELECT * FROM user_favorites')).toEqual([]);
+  });
+
+  it('keeps hearts on other climbs and other boards', async () => {
+    await addFavoriteLocal(db, at40);
+    await addFavoriteLocal(db, { ...at40, climbUuid: 'climb-10' });
+    await addFavoriteLocal(db, { ...at40, boardName: 'tension' });
+    await removeFavoriteLocal(db, at25);
+
+    const rows = await db.getAllAsync<Row>(
+      'SELECT board_name, climb_uuid FROM user_favorites ORDER BY board_name, climb_uuid',
+    );
+    expect(rows).toEqual([
+      { board_name: 'kilter', climb_uuid: 'climb-10' },
+      { board_name: 'tension', climb_uuid: 'climb-9' },
+    ]);
+  });
+
+  it('drops the climb from a local Collection → Liked search after a remove at another angle', async () => {
+    const { searchClimbsLocal } = await import('../../db/queries/search-climbs-local');
+    await stampLocalUserId(db, 'me');
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, layout_id, name, is_listed, is_draft, frames_count, compatible_size_ids, required_set_ids)
+       VALUES ('climb-9', 'kilter', 1, 'Climb 9', 1, 0, 1, '[5]', '[]')`,
+    );
+    const liked = {
+      boardName: 'kilter',
+      layoutId: 1,
+      sizeId: 5,
+      setIds: '',
+      angle: 25,
+      onlyFavorited: true,
+    };
+
+    await addFavoriteLocal(db, at40);
+    expect((await searchClimbsLocal(db, liked)).climbs.map((climb) => climb.uuid)).toEqual(['climb-9']);
+
+    await removeFavoriteLocal(db, at25);
+    expect((await searchClimbsLocal(db, liked)).climbs).toEqual([]);
+  });
+
+  it('a remove at 25° cancels the queued add at 40°, leaving only the remove', async () => {
+    await addFavoriteLocal(db, at40);
+    await removeFavoriteLocal(db, at25);
+
+    const queued = await db.getAllAsync<Row>('SELECT operation, idempotency_key FROM pending_mutations');
+    expect(queued).toEqual([{ operation: 'delete', idempotency_key: favoriteRemoveKey(at25) }]);
+  });
+
+  it('add at 40°, remove at 25°, add at 40° again nets one add', async () => {
+    await addFavoriteLocal(db, at40);
+    await removeFavoriteLocal(db, at25);
+    await addFavoriteLocal(db, at40);
+
+    const queued = await db.getAllAsync<Row>('SELECT operation, idempotency_key FROM pending_mutations');
+    expect(queued).toEqual([{ operation: 'create', idempotency_key: favoriteAddKey(at40) }]);
   });
 });
 

@@ -26,7 +26,8 @@ function invalidatedRoots(calls: unknown[][]): unknown[] {
 
 describe('useSaveClimb (shared)', () => {
   it('rejects with "Authentication required to create climbs" when unauthenticated', async () => {
-    const { wrapper } = createWrapper({ isAuthenticated: false });
+    const saveClimbOffline = vi.fn();
+    const { wrapper } = createWrapper({ isAuthenticated: false, saveClimbOffline });
     const { result } = renderHook(() => useSaveClimb('kilter'), { wrapper });
 
     await act(async () => {
@@ -35,6 +36,7 @@ describe('useSaveClimb (shared)', () => {
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.message).toBe('Authentication required to create climbs');
+    expect(saveClimbOffline).not.toHaveBeenCalled();
   });
 
   it('rejects with "No board selected" when boardName is null', async () => {
@@ -76,6 +78,48 @@ describe('useSaveClimb (shared)', () => {
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(showError).toHaveBeenCalledWith('saveClimbFailed');
+  });
+
+  it('saves the current form after recovering a create whose response was lost', async () => {
+    const executeWs = vi
+      .fn()
+      .mockResolvedValueOnce({ saveClimb: { uuid: 'stable-uuid', replayed: true } })
+      .mockResolvedValueOnce({ updateClimb: { uuid: 'stable-uuid', isDraft: true } });
+    const afterClimbWrite = vi.fn();
+    const { wrapper } = createWrapper({ executeWs: executeWs as unknown as ExecuteWs, afterClimbWrite });
+    const { result } = renderHook(() => useSaveClimb('spray'), { wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({ ...climbOptions(), uuid: 'stable-uuid', name: 'Edited after timeout' });
+    });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    expect(executeWs.mock.calls[1][0].variables.input).toMatchObject({
+      uuid: 'stable-uuid',
+      boardType: 'spray',
+      name: 'Edited after timeout',
+    });
+    expect(executeWs.mock.calls[1][0].variables.input).not.toHaveProperty('layoutId');
+    expect(afterClimbWrite).toHaveBeenCalledTimes(1);
+    expect(result.current.data).toEqual({ uuid: 'stable-uuid', isDraft: true });
+  });
+
+  it('keeps recovery failed when the current form cannot be saved', async () => {
+    const executeWs = vi
+      .fn()
+      .mockResolvedValueOnce({ saveClimb: { uuid: 'stable-uuid', replayed: true } })
+      .mockRejectedValueOnce(new Error('The 24 hour edit window has expired'));
+    const afterClimbWrite = vi.fn();
+    const { wrapper } = createWrapper({ executeWs: executeWs as unknown as ExecuteWs, afterClimbWrite });
+    const { result } = renderHook(() => useSaveClimb('spray'), { wrapper });
+
+    await act(async () => {
+      result.current.mutate({ ...climbOptions(), uuid: 'stable-uuid', name: 'Unsaved edit' });
+    });
+
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(afterClimbWrite).not.toHaveBeenCalled();
+    expect(result.current.data).toBeUndefined();
   });
 
   it('suppresses showError when the failure is a duplicate-climb rejection', async () => {
@@ -122,7 +166,8 @@ describe('useUpdateClimb (shared)', () => {
   const updateInput = { uuid: 'climb-1', boardType: 'kilter', name: 'New name' };
 
   it('rejects with "Authentication required to update climbs" when unauthenticated', async () => {
-    const { wrapper } = createWrapper({ isAuthenticated: false });
+    const updateClimbOffline = vi.fn();
+    const { wrapper } = createWrapper({ isAuthenticated: false, updateClimbOffline });
     const { result } = renderHook(() => useUpdateClimb(), { wrapper });
 
     await act(async () => {
@@ -131,6 +176,7 @@ describe('useUpdateClimb (shared)', () => {
 
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error?.message).toBe('Authentication required to update climbs');
+    expect(updateClimbOffline).not.toHaveBeenCalled();
   });
 
   it('returns the UpdateClimbResponse on success', async () => {
@@ -177,5 +223,159 @@ describe('useUpdateClimb (shared)', () => {
     expect(invalidatedRoots(invalidateSpy.mock.calls)).toEqual(
       expect.arrayContaining(['climb', 'searchClimbs', 'infiniteSearchClimbs', 'searchClimbsCount', 'myClimbs']),
     );
+  });
+});
+
+describe('saved climb post-write mirror ordering', () => {
+  it('awaits mirror completion before invalidating downloaded queries', async () => {
+    let finishMirror!: () => void;
+    const mirror = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishMirror = resolve;
+        }),
+    );
+    const executeWs = vi.fn().mockResolvedValue({ saveClimb: { uuid: 'saved-uuid' } }) as unknown as ExecuteWs;
+    const { wrapper, queryClient } = createWrapper({ executeWs, afterClimbWrite: mirror });
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    const { result } = renderHook(() => useSaveClimb('spray'), { wrapper });
+    let pending!: Promise<unknown>;
+    await act(async () => {
+      pending = result.current.mutateAsync(climbOptions());
+    });
+    await waitFor(() => expect(mirror).toHaveBeenCalledOnce());
+    expect(invalidate).not.toHaveBeenCalled();
+    await act(async () => {
+      finishMirror();
+      await pending;
+    });
+    expect(invalidatedRoots(invalidate.mock.calls)).toContain('infiniteSearchClimbs');
+  });
+
+  it('keeps successful save and update results when their local mirror fails', async () => {
+    const mirror = vi.fn().mockRejectedValue(new Error('SQLite unavailable'));
+    const showError = vi.fn();
+    const executeWs = vi.fn().mockResolvedValue({
+      saveClimb: { uuid: 'saved-uuid' },
+      updateClimb: { uuid: 'updated-uuid' },
+    }) as unknown as ExecuteWs;
+    const { wrapper } = createWrapper({ executeWs, afterClimbWrite: mirror, showError });
+    const save = renderHook(() => useSaveClimb('spray'), { wrapper });
+    const update = renderHook(() => useUpdateClimb(), { wrapper });
+    await act(async () => {
+      expect(await save.result.current.mutateAsync(climbOptions())).toEqual({ uuid: 'saved-uuid' });
+      expect(await update.result.current.mutateAsync({ uuid: 'updated-uuid', boardType: 'spray' })).toEqual({
+        uuid: 'updated-uuid',
+      });
+    });
+    expect(executeWs).toHaveBeenCalledTimes(2);
+    expect(showError.mock.calls).toEqual([['localClimbRefreshFailed'], ['localClimbRefreshFailed']]);
+    await waitFor(() => {
+      expect(save.result.current.isSuccess).toBe(true);
+      expect(update.result.current.isSuccess).toBe(true);
+    });
+  });
+
+  it('does not mirror a remote save after an account generation transition', async () => {
+    const mirror = vi.fn();
+    const executeWs = vi.fn().mockResolvedValue({ saveClimb: { uuid: 'saved-uuid' } }) as unknown as ExecuteWs;
+    const { wrapper } = createWrapper({
+      executeWs,
+      afterClimbWrite: mirror,
+      captureAuthEpoch: () => 5,
+      isAuthEpochCurrent: () => false,
+    });
+    const { result } = renderHook(() => useSaveClimb('spray'), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync(climbOptions());
+    });
+    expect(mirror).not.toHaveBeenCalled();
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+  });
+});
+
+describe('durable platform climb writes', () => {
+  const uuid = '0123456789ABCDEF0123456789ABCDEF';
+
+  it('returns an offline save and refreshes its list without requiring a network mirror', async () => {
+    const queued = { uuid, delivery: 'queued' as const };
+    const saveClimbOffline = vi.fn().mockResolvedValue(queued);
+    const executeWs = vi.fn();
+    const afterClimbWrite = vi.fn();
+    const { wrapper, queryClient } = createWrapper({ saveClimbOffline, executeWs, afterClimbWrite });
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    const { result } = renderHook(() => useSaveClimb('spray'), { wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({ ...climbOptions(), uuid, spray_wall_uuid: 'wall-link' });
+    });
+
+    await waitFor(() => expect(result.current.data).toEqual(queued));
+    expect(saveClimbOffline).toHaveBeenCalledWith(
+      expect.objectContaining({ uuid, boardType: 'spray', sprayWallUuid: 'wall-link' }),
+      { queryClient },
+    );
+    expect(executeWs).not.toHaveBeenCalled();
+    expect(afterClimbWrite).not.toHaveBeenCalled();
+    expect(invalidatedRoots(invalidate.mock.calls)).toContain('infiniteSearchClimbs');
+  });
+
+  it('preserves the client identity when a platform declines the local save', async () => {
+    const saveClimbOffline = vi.fn().mockResolvedValue(null);
+    const executeWs = vi.fn().mockResolvedValue({ saveClimb: { uuid } });
+    const { wrapper } = createWrapper({ saveClimbOffline, executeWs });
+    const { result } = renderHook(() => useSaveClimb('spray'), { wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({ ...climbOptions(), uuid });
+    });
+
+    expect(executeWs).toHaveBeenCalledWith(
+      expect.objectContaining({ variables: { input: expect.objectContaining({ uuid, boardType: 'spray' }) } }),
+    );
+  });
+
+  it('does not bypass a failed local transaction with another remote create', async () => {
+    const saveClimbOffline = vi.fn().mockRejectedValue(new Error('Local write could not commit'));
+    const executeWs = vi.fn();
+    const { wrapper } = createWrapper({ saveClimbOffline, executeWs });
+    const { result } = renderHook(() => useSaveClimb('spray'), { wrapper });
+
+    await act(async () => {
+      await expect(result.current.mutateAsync({ ...climbOptions(), uuid })).rejects.toThrow('could not commit');
+    });
+
+    expect(executeWs).not.toHaveBeenCalled();
+  });
+
+  it('returns an offline edit without trying to send or fetch canonical data', async () => {
+    const queued = { uuid, isDraft: true, delivery: 'queued' as const };
+    const updateClimbOffline = vi.fn().mockResolvedValue(queued);
+    const executeWs = vi.fn();
+    const afterClimbWrite = vi.fn();
+    const { wrapper } = createWrapper({ updateClimbOffline, executeWs, afterClimbWrite });
+    const { result } = renderHook(() => useUpdateClimb(), { wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync({ uuid, boardType: 'spray', name: 'Offline edit' });
+    });
+
+    await waitFor(() => expect(result.current.data).toEqual(queued));
+    expect(executeWs).not.toHaveBeenCalled();
+    expect(afterClimbWrite).not.toHaveBeenCalled();
+  });
+
+  it('retains remote editing on platforms without an applicable local path', async () => {
+    const updateClimbOffline = vi.fn().mockResolvedValue(null);
+    const executeWs = vi.fn().mockResolvedValue({ updateClimb: { uuid, isDraft: true } });
+    const { wrapper } = createWrapper({ updateClimbOffline, executeWs });
+    const { result } = renderHook(() => useUpdateClimb(), { wrapper });
+    const input = { uuid, boardType: 'kilter', name: 'Remote edit' };
+
+    await act(async () => {
+      await result.current.mutateAsync(input);
+    });
+
+    expect(executeWs).toHaveBeenCalledWith(expect.objectContaining({ variables: { input } }));
   });
 });

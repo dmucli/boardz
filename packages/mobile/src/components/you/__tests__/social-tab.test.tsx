@@ -1,4 +1,18 @@
 // @vitest-environment jsdom
+vi.mock('../../../hooks/use-native-root-header', () => ({ useNativeRootHeader: () => false }));
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { act, render, fireEvent } from '@testing-library/react';
 import { createElement, forwardRef, useImperativeHandle, type ReactNode } from 'react';
@@ -12,6 +26,8 @@ const social = vi.hoisted(() => ({
   searchRefetch: vi.fn(),
   refresh: null as (() => void) | null,
   searchError: false,
+  // Every prop the mounted list was given.
+  listProps: undefined as Record<string, unknown> | undefined,
 }));
 
 const follower = {
@@ -78,17 +94,33 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 
+// ReadableColumn pads by the side safe area; a portrait phone has none.
+vi.mock('react-native-safe-area-context', () => ({
+  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+}));
+
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   Pressable: ({
     children,
     onPress,
     accessibilityLabel,
+    accessibilityState,
   }: {
     children?: ReactNode;
     onPress?: () => void;
     accessibilityLabel?: string;
-  }) => createElement('button', { onClick: onPress, 'aria-label': accessibilityLabel }, children),
+    accessibilityState?: { selected?: boolean };
+  }) =>
+    createElement(
+      'button',
+      {
+        onClick: onPress,
+        'aria-label': accessibilityLabel,
+        'data-selected': accessibilityState?.selected === undefined ? undefined : String(accessibilityState.selected),
+      },
+      children,
+    ),
   TextInput: ({
     value,
     onChangeText,
@@ -107,20 +139,17 @@ vi.mock('react-native', () => ({
     social.refresh = onRefresh ?? null;
     return null;
   },
-  StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 vi.mock('@shopify/flash-list', () => ({
   FlashList: forwardRef(
     (
-      {
-        data,
-        renderItem,
-        refreshControl,
-        ListHeaderComponent,
-        ListEmptyComponent,
-        ListFooterComponent,
-      }: {
+      props: {
         data?: unknown[];
         renderItem: (input: { item: unknown; index: number }) => ReactNode;
         refreshControl?: ReactNode;
@@ -130,10 +159,12 @@ vi.mock('@shopify/flash-list', () => ({
       },
       ref,
     ) => {
+      const { data, renderItem, refreshControl, ListHeaderComponent, ListEmptyComponent, ListFooterComponent } = props;
+      social.listProps = props;
       useImperativeHandle(ref, () => ({ scrollToTop: vi.fn() }));
       return createElement(
         'div',
-        null,
+        { 'data-list': 'true' },
         ListHeaderComponent,
         refreshControl,
         data?.length
@@ -146,7 +177,9 @@ vi.mock('@shopify/flash-list', () => ({
 }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
+    selection: { text: '#111111', checkmark: '#00AA55', fill: 'rgba(0, 170, 85, 0.18)' },
     systemColors: {
       fill: '#eee',
       label: '#000',
@@ -164,6 +197,7 @@ vi.mock('../../../hooks/use-bottom-chrome-metrics', () => ({
   useBottomChromeMetrics: () => ({ scrollBottomPadding: 0 }),
 }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 5: 20, 8: 32, 16: 64 },
   borderRadius: { lg: 12, full: 9999 },
 }));
@@ -267,6 +301,7 @@ vi.mock('../../../lib/graphql/hooks', () => ({
 }));
 
 import { SocialTab } from '../SocialTab';
+import { createScrollEdgeBackdrop, type ScrollEdgeBackdrop } from '../../../hooks/use-scroll-edge-backdrop';
 
 describe('SocialTab', () => {
   beforeEach(() => {
@@ -279,10 +314,28 @@ describe('SocialTab', () => {
     social.searchRefetch.mockReset();
     social.refresh = null;
     social.searchError = false;
+    social.listProps = undefined;
   });
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('marks only the active filter card as selected and gives it a checkmark', () => {
+    const { container, getAllByRole } = render(<SocialTab userId="me" />);
+    const selected = () => Array.from(container.querySelectorAll('[data-selected="true"]'));
+
+    expect(selected()).toHaveLength(1);
+    expect(selected()[0].querySelector('[data-icon="check.small"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-icon="check.small"]')).toHaveLength(1);
+
+    // Switch to the other card: selection and checkmark move with it.
+    const unselectedCard = container.querySelector('[data-selected="false"]') as HTMLElement;
+    fireEvent.click(unselectedCard);
+    expect(selected()).toHaveLength(1);
+    expect(selected()[0]).toBe(unselectedCard);
+    expect(unselectedCard.querySelector('[data-icon="check.small"]')).not.toBeNull();
+    expect(getAllByRole('button').length).toBeGreaterThan(1);
   });
 
   it('shows follower rows by default', () => {
@@ -380,5 +433,49 @@ describe('SocialTab', () => {
     fireEvent.click(getByText('Try again'));
     expect(social.publicProfileRefetch).toHaveBeenCalledOnce();
     expect(social.searchRefetch).toHaveBeenCalledOnce();
+  });
+
+  // On iOS 26 the Profile tab's segmented control floats over this list. The list
+  // tells the header, through a store, when its rows are under the control.
+  describe('under the floating profile header', () => {
+    const SCROLL_LISTENERS = [
+      'onScroll',
+      'onScrollBeginDrag',
+      'onScrollEndDrag',
+      'onMomentumScrollBegin',
+      'onMomentumScrollEnd',
+    ] as const;
+    const scrollListTo = (scrollEdge: ScrollEdgeBackdrop, offsetY: number) =>
+      scrollEdge.listProps.onScroll({ nativeEvent: { contentOffset: { x: 0, y: offsetY } } } as Parameters<
+        ScrollEdgeBackdrop['listProps']['onScroll']
+      >[0]);
+
+    it("gives its list every one of the store's scroll listeners", () => {
+      const scrollEdge = createScrollEdgeBackdrop();
+      render(<SocialTab userId="me" scrollEdge={scrollEdge} />);
+
+      for (const listener of SCROLL_LISTENERS)
+        expect(social.listProps?.[listener]).toBe(scrollEdge.listProps[listener]);
+    });
+
+    // Under an opaque header the screen passes no store.
+    it('gives its list no scroll listeners without a store', () => {
+      render(<SocialTab userId="me" />);
+
+      for (const listener of SCROLL_LISTENERS) expect(social.listProps?.[listener]).toBeUndefined();
+    });
+
+    it('puts the store at rest when the list goes away', () => {
+      const scrollEdge = createScrollEdgeBackdrop();
+      const { container, rerender } = render(<SocialTab userId="me" scrollEdge={scrollEdge} />);
+      act(() => scrollListTo(scrollEdge, 400));
+      expect(scrollEdge.isScrolledUnder()).toBe(true);
+
+      // Signed out: a spinner takes the list's place.
+      rerender(<SocialTab userId={undefined} scrollEdge={scrollEdge} />);
+
+      expect(container.querySelector('[data-list]')).toBeNull();
+      expect(scrollEdge.isScrolledUnder()).toBe(false);
+    });
   });
 });

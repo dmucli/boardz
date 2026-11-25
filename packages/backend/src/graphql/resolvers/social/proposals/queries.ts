@@ -2,13 +2,15 @@ import { eq, and, count, desc, inArray, sql, type SQL } from 'drizzle-orm';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { db } from '../../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
-import { sprayReferenceVisibilityCondition } from '@boardsesh/db/queries';
+import { sprayReferenceClimbExistsCondition, sprayReferenceVisibilityCondition } from '@boardsesh/db/queries';
 import { validateInput } from '../../shared/helpers';
-import { isSprayBoardType, sprayClimbUuidIsReadable } from '../../climbs/spray-read-access';
+import { readableSprayClimbUuids } from '../entity-read-access';
+import { isSprayBoardType, sprayClimbRowExists, sprayClimbUuidIsReadable } from '../../climbs/spray-read-access';
 import { GetClimbProposalsInputSchema, BrowseProposalsInputSchema } from '../../../../validation/schemas';
 import { resolveCommunitySetting } from '../community-settings';
 import { batchEnrichProposals } from './enrichment';
 import { analyzeGradeOutlier } from './grade-analysis';
+import { proposalClimbVisibilityCondition } from './privacy';
 
 export const socialProposalQueries = {
   climbProposals: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
@@ -26,11 +28,18 @@ export const socialProposalQueries = {
     // Short-circuited on the board type, which this resolver has in hand, so the
     // eight catalogue boards pay nothing — not even the round trip.
     // `comments(input)` cannot do the same: it is keyed on an entity, not a board.
-    if (isSprayBoardType(boardType) && !(await sprayClimbUuidIsReadable(climbUuid, authenticatedUserId))) {
+    //
+    // `sprayClimbRowExists`: a spray climb whose row has been hard-deleted has no
+    // wall left to check, so its proposals answer the empty page too (#5981).
+    if (
+      isSprayBoardType(boardType) &&
+      (!(await sprayClimbUuidIsReadable(climbUuid, authenticatedUserId)) || !(await sprayClimbRowExists(climbUuid)))
+    ) {
       return { proposals: [], totalCount: 0, hasMore: false };
     }
 
     const conditions = [
+      proposalClimbVisibilityCondition(dbSchema.climbProposals, authenticatedUserId),
       eq(dbSchema.climbProposals.climbUuid, climbUuid),
       eq(dbSchema.climbProposals.boardType, boardType),
     ];
@@ -87,11 +96,22 @@ export const socialProposalQueries = {
     // COUNT below, so a private wall's proposal neither shortens a page nor
     // inflates a total. `browseProposals` is unauthenticated, so the viewer is
     // null for an anonymous caller — never a hopeful value.
+    //
+    // The second condition fails closed on a spray proposal whose climb row has
+    // been hard-deleted (`deleteDraftClimb`, account deletion). The reference
+    // form passes it for everybody, and the row carries the proposer and their
+    // reason (#5981). Nobody is exempt: with the climb gone there is nothing
+    // left to vote on.
     const conditions: SQL[] = [
+      proposalClimbVisibilityCondition(dbSchema.climbProposals, authenticatedUserId),
       sprayReferenceVisibilityCondition(
         { boardType: dbSchema.climbProposals.boardType, climbUuid: dbSchema.climbProposals.climbUuid },
         authenticatedUserId,
       ),
+      sprayReferenceClimbExistsCondition({
+        boardType: dbSchema.climbProposals.boardType,
+        climbUuid: dbSchema.climbProposals.climbUuid,
+      }),
     ];
     if (boardTypeFilter) conditions.push(eq(dbSchema.climbProposals.boardType, boardTypeFilter));
     if (type) conditions.push(eq(dbSchema.climbProposals.type, type));
@@ -131,6 +151,22 @@ export const socialProposalQueries = {
     { climbUuid, boardType, angle }: { climbUuid: string; boardType: string; angle: number },
     ctx: ConnectionContext,
   ) => {
+    const viewerUserId = ctx.isAuthenticated ? ctx.userId : null;
+    if (isSprayBoardType(boardType) && !(await readableSprayClimbUuids([climbUuid], viewerUserId)).has(climbUuid)) {
+      return {
+        climbUuid,
+        boardType,
+        angle,
+        communityGrade: null,
+        isBenchmark: false,
+        isClassic: false,
+        isFrozen: false,
+        freezeReason: null,
+        openProposalCount: 0,
+        outlierAnalysis: null,
+        updatedAt: null,
+      };
+    }
     // Get community status
     const [status] = await db
       .select()
@@ -196,30 +232,41 @@ export const socialProposalQueries = {
   bulkClimbCommunityStatus: async (
     _: unknown,
     { climbUuids, boardType, angle }: { climbUuids: string[]; boardType: string; angle: number },
-    _ctx: ConnectionContext,
+    ctx: ConnectionContext,
   ) => {
     if (climbUuids.length === 0) return [];
+    const viewerUserId = ctx.isAuthenticated ? ctx.userId : null;
+    const readableClimbs = isSprayBoardType(boardType)
+      ? await readableSprayClimbUuids(climbUuids, viewerUserId)
+      : new Set(climbUuids);
+    const visibleClimbUuids = climbUuids.filter((climbUuid) => readableClimbs.has(climbUuid));
 
-    const statuses = await db
-      .select()
-      .from(dbSchema.climbCommunityStatus)
-      .where(
-        and(
-          inArray(dbSchema.climbCommunityStatus.climbUuid, climbUuids),
-          eq(dbSchema.climbCommunityStatus.boardType, boardType),
-          eq(dbSchema.climbCommunityStatus.angle, angle),
-        ),
-      );
+    const statuses =
+      visibleClimbUuids.length === 0
+        ? []
+        : await db
+            .select()
+            .from(dbSchema.climbCommunityStatus)
+            .where(
+              and(
+                inArray(dbSchema.climbCommunityStatus.climbUuid, visibleClimbUuids),
+                eq(dbSchema.climbCommunityStatus.boardType, boardType),
+                eq(dbSchema.climbCommunityStatus.angle, angle),
+              ),
+            );
 
-    const classicStatuses = await db
-      .select()
-      .from(dbSchema.climbClassicStatus)
-      .where(
-        and(
-          inArray(dbSchema.climbClassicStatus.climbUuid, climbUuids),
-          eq(dbSchema.climbClassicStatus.boardType, boardType),
-        ),
-      );
+    const classicStatuses =
+      visibleClimbUuids.length === 0
+        ? []
+        : await db
+            .select()
+            .from(dbSchema.climbClassicStatus)
+            .where(
+              and(
+                inArray(dbSchema.climbClassicStatus.climbUuid, visibleClimbUuids),
+                eq(dbSchema.climbClassicStatus.boardType, boardType),
+              ),
+            );
 
     const statusMap = new Map(statuses.map((s) => [s.climbUuid, s]));
     const classicMap = new Map(classicStatuses.map((s) => [s.climbUuid, s]));
@@ -246,8 +293,12 @@ export const socialProposalQueries = {
   climbClassicStatus: async (
     _: unknown,
     { climbUuid, boardType }: { climbUuid: string; boardType: string },
-    _ctx: ConnectionContext,
+    ctx: ConnectionContext,
   ) => {
+    const viewerUserId = ctx.isAuthenticated ? ctx.userId : null;
+    if (isSprayBoardType(boardType) && !(await readableSprayClimbUuids([climbUuid], viewerUserId)).has(climbUuid)) {
+      return { climbUuid, boardType, isClassic: false, updatedAt: null };
+    }
     const [status] = await db
       .select()
       .from(dbSchema.climbClassicStatus)

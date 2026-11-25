@@ -1,11 +1,15 @@
 import { describe, it, expect } from 'vite-plus/test';
 import { SITE_URL } from '@/app/lib/seo/base-url';
+import { parseClimbQrLanding } from '@boardsesh/analytics';
 import {
   boardQrUrl,
-  gymInstallCampaign,
+  climbQrUrl,
   gymQrAttributionQuery,
   gymQrUrl,
-  playStoreUrlForGym,
+  gymRedirectAttributionQuery,
+  listQrUrl,
+  playlistQrUrl,
+  setterQrUrl,
 } from '../gym-attribution';
 
 describe('gymQrUrl', () => {
@@ -40,6 +44,77 @@ describe('boardQrUrl', () => {
 
   it('percent-encodes a slug that is not URL-safe', () => {
     expect(boardQrUrl('kilter 45', 'kiosk')).toBe(`${SITE_URL}/b/kilter%2045?src=qr&medium=kiosk`);
+  });
+
+  it("puts an unlisted wall's capability first, as its share link does", () => {
+    // `/b/{slug}` re-emits `wall` onto its redirect alongside the QR pair, so
+    // this exact string opens the wall instead of a 404.
+    expect(boardQrUrl('garage-wall', 'board', { wallUuid: '0144249a-3a8c-47c2-8c1e-54c0c572fe02' })).toBe(
+      'https://www.boardsesh.com/b/garage-wall?wall=0144249a-3a8c-47c2-8c1e-54c0c572fe02&src=qr&medium=board',
+    );
+  });
+
+  it('adds nothing when there is no capability to carry', () => {
+    expect(boardQrUrl('garage-wall', 'board', {})).toBe('https://www.boardsesh.com/b/garage-wall?src=qr&medium=board');
+  });
+});
+
+describe('climbQrUrl', () => {
+  it('encodes the climb page itself with the desktop pair', () => {
+    expect(climbQrUrl('/b/main-kilter/40/view/abc-the-climb', 'en-US')).toBe(
+      `${SITE_URL}/b/main-kilter/40/view/abc-the-climb?src=qr&medium=desktop`,
+    );
+  });
+
+  it("keeps the reader's language, so the phone opens the same page", () => {
+    expect(climbQrUrl('/kilter/original/12x12-square/screw_bolt/40/view/abc-the-climb', 'de')).toBe(
+      `${SITE_URL}/de/kilter/original/12x12-square/screw_bolt/40/view/abc-the-climb?src=qr&medium=desktop`,
+    );
+  });
+
+  it('parses back as a climb scan', () => {
+    const scanned = new URL(climbQrUrl('/b/main-kilter/40/view/abc-the-climb', 'fr'));
+
+    expect(scanned.pathname).toBe('/fr/b/main-kilter/40/view/abc-the-climb');
+    expect(parseClimbQrLanding(Object.fromEntries(scanned.searchParams))).toEqual({ medium: 'desktop' });
+  });
+});
+
+describe('listQrUrl', () => {
+  it('encodes the board list itself with the desktop pair, on either tree', () => {
+    expect(listQrUrl('/kilter/original/12x12-square/screw_bolt/40/list', 'en-US')).toBe(
+      `${SITE_URL}/kilter/original/12x12-square/screw_bolt/40/list?src=qr&medium=desktop`,
+    );
+    expect(listQrUrl('/b/main-kilter/40/list', 'en-US')).toBe(
+      `${SITE_URL}/b/main-kilter/40/list?src=qr&medium=desktop`,
+    );
+  });
+
+  it("keeps the reader's language and parses back as a desktop scan", () => {
+    const scanned = new URL(listQrUrl('/b/main-kilter/40/list', 'es'));
+
+    expect(scanned.pathname).toBe('/es/b/main-kilter/40/list');
+    expect(parseClimbQrLanding(Object.fromEntries(scanned.searchParams))).toEqual({ medium: 'desktop' });
+  });
+});
+
+describe('setterQrUrl', () => {
+  it("encodes the setter's page with the desktop pair, in the reader's language", () => {
+    expect(setterQrUrl('/setter/jimmy%20webb', 'en-US')).toBe(`${SITE_URL}/setter/jimmy%20webb?src=qr&medium=desktop`);
+    const scanned = new URL(setterQrUrl('/setter/jimmy%20webb', 'de'));
+
+    expect(scanned.pathname).toBe('/de/setter/jimmy%20webb');
+    expect(parseClimbQrLanding(Object.fromEntries(scanned.searchParams))).toEqual({ medium: 'desktop' });
+  });
+});
+
+describe('playlistQrUrl', () => {
+  it("encodes the playlist's own page with the desktop pair, in the reader's language", () => {
+    expect(playlistQrUrl('5d3b1c7e-2a4f', 'en-US')).toBe(`${SITE_URL}/playlists/5d3b1c7e-2a4f?src=qr&medium=desktop`);
+    const scanned = new URL(playlistQrUrl('5d3b1c7e-2a4f', 'fr'));
+
+    expect(scanned.pathname).toBe('/fr/playlists/5d3b1c7e-2a4f');
+    expect(parseClimbQrLanding(Object.fromEntries(scanned.searchParams))).toEqual({ medium: 'desktop' });
   });
 });
 
@@ -89,46 +164,71 @@ describe('gymQrAttributionQuery', () => {
   });
 });
 
-describe('playStoreUrlForGym', () => {
-  it('names the campaign after the gym', () => {
-    expect(gymInstallCampaign('boulderwelt-munich')).toBe('gym-boulderwelt-munich');
+describe('gymRedirectAttributionQuery', () => {
+  it('returns an empty string for a plain visit', () => {
+    expect(gymRedirectAttributionQuery({})).toBe('');
   });
 
-  it('builds the exact Play URL, with referrer as well as the bare utm params', () => {
-    expect(playStoreUrlForGym('boulderwelt-munich')).toBe(
-      'https://play.google.com/store/apps/details?id=com.boardsesh.app' +
-        '&utm_source=boardsesh&utm_medium=qr&utm_campaign=gym-boulderwelt-munich' +
-        '&referrer=utm_source%3Dboardsesh%26utm_medium%3Dqr%26utm_campaign%3Dgym-boulderwelt-munich',
+  it('carries the QR pair exactly as gymQrAttributionQuery does', () => {
+    expect(gymRedirectAttributionQuery({ src: 'qr', medium: 'poster' })).toBe('?src=qr&medium=poster');
+    expect(gymRedirectAttributionQuery({ src: 'qr', medium: 'evil' })).toBe('');
+  });
+
+  it("carries a tagged visit's campaign params", () => {
+    expect(gymRedirectAttributionQuery({ utm_source: 'instagram', utm_medium: 'social' })).toBe(
+      '?utm_source=instagram&utm_medium=social',
     );
   });
 
-  it('round-trips the referrer back through the mobile parser contract', () => {
-    // THIS is the consumer contract, not an implementation detail.
-    // `packages/mobile/src/lib/install-referrer.ts` reads Play's Install
-    // Referrer string with `new URLSearchParams(raw)` and pulls `utm_source`,
-    // `utm_medium` and `utm_campaign` out of it — and Play populates that string
-    // from the `referrer` QUERY PARAM of the store URL, not from the bare
-    // `utm_*` params. A link carrying only the bare params looks right to a
-    // human, matches #4379's literal wording, and attributes zero installs.
-    const referrer = new URL(playStoreUrlForGym('boulderwelt-munich')).searchParams.get('referrer');
-    expect(referrer).not.toBeNull();
-
-    const parsed = new URLSearchParams(referrer ?? '');
-    expect(parsed.get('utm_source')).toBe('boardsesh');
-    expect(parsed.get('utm_medium')).toBe('qr');
-    expect(parsed.get('utm_campaign')).toBe('gym-boulderwelt-munich');
+  it('carries every campaign param, in the reported order, after the QR pair', () => {
+    expect(
+      gymRedirectAttributionQuery({
+        gclid: 'EAIaIQobChMI',
+        utm_term: 'kilter',
+        utm_content: 'creative-7',
+        utm_campaign: 'spray-launch',
+        utm_medium: 'cpc',
+        utm_source: 'google',
+        medium: 'poster',
+        src: 'qr',
+      }),
+    ).toBe(
+      '?src=qr&medium=poster&utm_source=google&utm_medium=cpc&utm_campaign=spray-launch&utm_content=creative-7&utm_term=kilter&gclid=EAIaIQobChMI',
+    );
   });
 
-  it('keeps the referrer parseable for a slug carrying characters that need escaping', () => {
-    const url = new URL(playStoreUrlForGym('a&b=c gym'));
-    const parsed = new URLSearchParams(url.searchParams.get('referrer') ?? '');
-    // The nested query string is encoded once as a param value, so the inner
-    // `&` and `=` cannot break out and forge a fourth utm param.
-    expect(parsed.get('utm_campaign')).toBe('gym-a&b=c gym');
-    expect(url.searchParams.get('utm_campaign')).toBe('gym-a&b=c gym');
+  it('carries the Meta and Reddit click ids', () => {
+    expect(gymRedirectAttributionQuery({ fbclid: 'IwAR1', rdt_cid: 'abc' })).toBe('?fbclid=IwAR1&rdt_cid=abc');
   });
 
-  it('leaves the app id intact', () => {
-    expect(new URL(playStoreUrlForGym('any-gym')).searchParams.get('id')).toBe('com.boardsesh.app');
+  it('drops every param outside the two allowlists', () => {
+    expect(
+      gymRedirectAttributionQuery({
+        utm_source: 'instagram',
+        tab: 'members',
+        claim: '1',
+        next: 'https://evil.example.com',
+        redirect: 'https://evil.example.com',
+        utm_id: '42',
+        msclkid: 'abc',
+      }),
+    ).toBe('?utm_source=instagram');
+  });
+
+  it('re-encodes a value, so it cannot open a fragment or add a param of its own', () => {
+    expect(gymRedirectAttributionQuery({ utm_source: 'a&next=https://evil.example.com#frag' })).toBe(
+      '?utm_source=a%26next%3Dhttps%3A%2F%2Fevil.example.com%23frag',
+    );
+  });
+
+  it('trims and caps a value the way the landing parser does', () => {
+    expect(gymRedirectAttributionQuery({ utm_source: '  instagram  ' })).toBe('?utm_source=instagram');
+    expect(gymRedirectAttributionQuery({ utm_source: 'x'.repeat(500) })).toBe(`?utm_source=${'x'.repeat(200)}`);
+  });
+
+  it('drops a blank param and keeps the first of a repeated one', () => {
+    expect(gymRedirectAttributionQuery({ utm_source: '   ', utm_medium: 'social' })).toBe('?utm_medium=social');
+    expect(gymRedirectAttributionQuery({ utm_source: ['instagram', 'reddit'] })).toBe('?utm_source=instagram');
+    expect(gymRedirectAttributionQuery({ utm_source: [] })).toBe('');
   });
 });

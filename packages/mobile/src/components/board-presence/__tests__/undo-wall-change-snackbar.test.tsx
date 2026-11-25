@@ -1,9 +1,23 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi } from 'vitest';
 import { render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 
-const ctrl = vi.hoisted(() => ({ variant: 'material' as 'material' | 'liquidGlass' }));
+const ctrl = vi.hoisted(() => ({ variant: 'material' as 'material' | 'liquidGlass', os: 'ios' as 'ios' | 'android' }));
+const announce = vi.hoisted(() => vi.fn());
 
 type ViewMockProps = { children?: ReactNode; accessibilityRole?: string };
 vi.mock('react-native', () => ({
@@ -18,7 +32,19 @@ vi.mock('react-native', () => ({
     onPress?: () => void;
     accessibilityLabel?: string;
   }) => createElement('button', { onClick: onPress, 'data-label': accessibilityLabel ?? '' }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, absoluteFill: {} },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    absoluteFill: {},
+  },
+  Platform: {
+    get OS() {
+      return ctrl.os;
+    },
+  },
+  AccessibilityInfo: {
+    announceForAccessibilityWithOptions: (message: string, options: unknown) => announce(message, options),
+  },
 }));
 
 vi.mock('react-native-reanimated', () => ({
@@ -72,11 +98,13 @@ vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', { 'data-text': 'true' }, children),
 }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   borderRadius: { lg: 12 },
   spacing: { 2: 8, 3: 12, 4: 16 },
   shadowColor: '#000',
 }));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     variant: ctrl.variant,
     brandColors: { primary: '#6D28D9' },
@@ -130,5 +158,28 @@ describe('UndoWallChangeSnackbar', () => {
     const { container } = render(<UndoWallChangeSnackbar {...base} onUndo={onUndo} />);
     (container.querySelector('[data-label="mobile.boardPresence.undoAria"]') as HTMLElement).click();
     expect(onUndo).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('UndoWallChangeSnackbar VoiceOver', () => {
+  it('announces once per show on iOS, again only for a new nonce', () => {
+    ctrl.os = 'ios';
+    announce.mockClear();
+    const { rerender } = render(<UndoWallChangeSnackbar {...base} />);
+    expect(announce).toHaveBeenCalledTimes(1);
+    expect(announce).toHaveBeenCalledWith('mobile.boardPresence.wallChanged', { queue: true });
+    rerender(<UndoWallChangeSnackbar {...base} />);
+    expect(announce).toHaveBeenCalledTimes(1);
+    rerender(<UndoWallChangeSnackbar {...base} nonce={2} />);
+    expect(announce).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves Android to the Snackbar and stays quiet while hidden', () => {
+    announce.mockClear();
+    ctrl.os = 'android';
+    render(<UndoWallChangeSnackbar {...base} />);
+    ctrl.os = 'ios';
+    render(<UndoWallChangeSnackbar {...base} visible={false} />);
+    expect(announce).not.toHaveBeenCalled();
   });
 });

@@ -8,8 +8,9 @@ import {
   ogClimbQuerySchema,
   type OutputFormat,
 } from '@boardsesh/board-render';
+import { BOARD_RENDER_VERSION } from '@boardsesh/board-render/version';
 import { applyCorsHeaders } from './cors';
-import { describeBoardConfig } from '../services/og-card-board-line';
+import { describeBoardConfig } from '@boardsesh/board-render/og-board-line';
 import { getPublicClientIp } from '../utils/client-ip';
 import { checkRateLimitRedis } from '../utils/redis-rate-limiter';
 import { RateLimitError } from '../utils/rate-limiter';
@@ -98,14 +99,14 @@ export async function handleOgClimb(req: IncomingMessage, res: ServerResponse, u
     set_ids: rawSetIds,
     frames: url.searchParams.get('frames') ?? '',
     format: url.searchParams.get('format') ?? undefined,
-    // Aura render options (issue #2202) — see docs/og-climb.md. `render_mode`
+    // Aura render options (issue #2202) — see docs/web/og-climb.md. `render_mode`
     // defaults to aura, the app's own drawing; the rest default closed.
     render_mode: url.searchParams.get('render_mode') ?? undefined,
     glow_falloff: url.searchParams.get('glow_falloff') ?? undefined,
     glyphs: url.searchParams.get('glyphs') ?? undefined,
     field_color: url.searchParams.get('field_color') ?? undefined,
-    // Climb identity for the card's right-hand column. All optional: a URL from
-    // an already-shipped mobile binary renders the board on its own.
+    // Climb identity for the card's text column. All optional: a URL from
+    // an already-shipped mobile binary gets a card led by the board's brand.
     n: cardTextEnabled ? (rawName ?? undefined) : undefined,
     s: cardTextEnabled ? (rawSetter ?? undefined) : undefined,
     // Not gated by the kill switch: a grade is a closed vocabulary matched by
@@ -152,7 +153,14 @@ export async function handleOgClimb(req: IncomingMessage, res: ServerResponse, u
   // availability check: the card is sharp + SVG over a fetched photograph, so a
   // renderer that failed to boot has nothing to do with it and must not 503 it.
   if (query.board_name === 'spray') {
-    await serveSprayOgCard(res, { layoutId: query.layout_id, frames: query.frames, format });
+    await serveSprayOgCard(res, {
+      layoutId: query.layout_id,
+      frames: query.frames,
+      format,
+      // The wall's own name comes from the database, after its gates; the board
+      // line is never taken from the caller.
+      card: { name: query.n, grade: query.g, setter: query.s, angle: query.angle, fontFamily: OG_CARD_FONT_FAMILY },
+    });
     return;
   }
 
@@ -163,7 +171,7 @@ export async function handleOgClimb(req: IncomingMessage, res: ServerResponse, u
 
   try {
     const totalT0 = performance.now();
-    const { buffer, contentType, cache, timings } = await renderOgClimb({
+    const { buffer, contentType, cache, timings, iconMissing } = await renderOgClimb({
       boardName: query.board_name,
       layoutId: query.layout_id,
       sizeId: query.size_id,
@@ -181,7 +189,9 @@ export async function handleOgClimb(req: IncomingMessage, res: ServerResponse, u
         angle: query.angle,
         // Derived here, not taken from the caller: the board and size are
         // already fully determined by the config params, so a `board_label`
-        // param would be a second, forgeable source for the same fact.
+        // param would be a second, forgeable source for the same fact. Its
+        // first part, the brand, leads a card from a binary that sends no
+        // identity params.
         boardLine: describeBoardConfig(query.board_name, query.layout_id, query.size_id),
         fontFamily: OG_CARD_FONT_FAMILY,
       },
@@ -199,13 +209,21 @@ export async function handleOgClimb(req: IncomingMessage, res: ServerResponse, u
 
     // The shared helper also emits Vercel-CDN-Cache-Control for the web route;
     // that header is meaningless from this origin, so drop it.
+    // A URL carrying some other render's version asked for bytes this process
+    // does not draw. Answering it `immutable` would pin the new pixels under the
+    // old version for a year, so it gets the daily tier and the edge lets go of
+    // it. URLs with no `v` are the already-shipped callers and stay immutable.
+    const requestedVersion = url.searchParams.get('v');
+    const pinsOldBytes = requestedVersion !== null && requestedVersion !== BOARD_RENDER_VERSION;
     const { 'Vercel-CDN-Cache-Control': _vercelOnlyHeader, ...ogImageHeaders } = createOgImageHeaders({
       contentType,
-      version: 'immutable',
+      version: pinsOldBytes ? null : 'immutable',
+      unversionedTier: 'daily',
       serverTiming,
     });
     res.writeHead(200, {
       ...ogImageHeaders,
+      ...(iconMissing ? UNCACHEABLE_CARD_HEADERS : {}),
       'Content-Length': buffer.length,
       'X-Content-Type-Options': 'nosniff',
     });
@@ -242,6 +260,13 @@ export async function handleOgClimb(req: IncomingMessage, res: ServerResponse, u
   }
 }
 
+/**
+ * A card drawn without its app icon (the icon file could not be read) still has
+ * its words, but it is not the final drawing, so neither the edge nor a chat app
+ * may keep it. The next request retries the read.
+ */
+const UNCACHEABLE_CARD_HEADERS = { 'Cache-Control': 'no-store', 'CDN-Cache-Control': 'no-store' } as const;
+
 // Resolved once. The deps close over the drizzle client and the media bucket,
 // neither of which changes for the life of the process.
 let sprayOgCardDeps: SprayOgCardDeps | null = null;
@@ -263,10 +288,7 @@ function getSprayOgCardDeps(): SprayOgCardDeps {
  * the photograph and the holds under an unchanged `layout_id` + `frames`, so a
  * year-long immutable header would pin last year's wall at the edge forever.
  */
-async function serveSprayOgCard(
-  res: ServerResponse,
-  params: { layoutId: number; frames: string; format: OutputFormat },
-): Promise<void> {
+async function serveSprayOgCard(res: ServerResponse, params: Parameters<typeof renderSprayOgCard>[0]): Promise<void> {
   const totalT0 = performance.now();
   let result: Awaited<ReturnType<typeof renderSprayOgCard>>;
   try {
@@ -296,7 +318,7 @@ async function serveSprayOgCard(
   if (result.kind === 'not-found') {
     // Never cached: a wall its owner makes public tomorrow must not stay a 404
     // at the edge, and a cached 404 on a shareable URL is the exact failure
-    // docs/og-climb.md warns about.
+    // docs/web/og-climb.md warns about.
     res.writeHead(404, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify({ error: 'Not found' }));
     return;
@@ -318,6 +340,7 @@ async function serveSprayOgCard(
   });
   res.writeHead(200, {
     ...ogImageHeaders,
+    ...(result.iconMissing ? UNCACHEABLE_CARD_HEADERS : {}),
     'Content-Length': result.buffer.length,
     'X-Content-Type-Options': 'nosniff',
   });

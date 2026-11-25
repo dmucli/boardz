@@ -22,6 +22,60 @@
         "everyone": "Tout le monde",
         "findGym": "Trouver une salle près de toi",
         "hint": "Change les voies que vous voyez"
+      },
+      "sections": {
+        "week": {
+          "title": "Cette semaine",
+          "sessions_one": "{{count}} session",
+          "sessions_other": "{{count}} sessions",
+          "sends_one": "{{count}} croix",
+          "sends_other": "{{count}} croix",
+          "hardest": "Le plus dur cette semaine : {{grade}}",
+          "weeksRunning_one": "{{count}} semaine d’affilée",
+          "weeksRunning_other": "{{count}} semaines d’affilée",
+          "recordFirstGrade": "Nouveau : ton premier {{grade}}",
+          "recordHardestFlash": "Nouveau : ton flash le plus dur, {{grade}}",
+          "recordClimb": "{{record}} · {{climb}}",
+          "empty": "Enregistre une croix pour lancer ta semaine",
+          "dayClimbed": "{{day}} : séance de grimpe",
+          "openRecord": "Ouvrir {{climb}}"
+        },
+        "session": {
+          "startTitle": "Démarre une session",
+          "startBody": "Choisis un entraînement ou grimpe librement",
+          "running": "Session en cours",
+          "open": "Ouvrir la session",
+          "lastWorkoutToday": "Dernier entraînement · Aujourd’hui",
+          "lastWorkoutYesterday": "Dernier entraînement · Hier",
+          "lastWorkoutOn": "Dernier entraînement · {{day}}",
+          "lastWorkoutSends_one": "{{count}} croix",
+          "lastWorkoutSends_other": "{{count}} croix"
+        },
+        "projects": {
+          "title": "Retour à tes projets",
+          "tries_one": "{{count}} essai",
+          "tries_other": "{{count}} essais",
+          "seeAll": "Tout voir",
+          "unknownClimb": "Bloc inconnu"
+        },
+        "playlists": {
+          "title": "À ton niveau, pas encore enchaînées",
+          "all": "Toutes les listes"
+        },
+        "empty": {
+          "title": "Ton accueil est vide",
+          "body": "Réactive des sections pour voir ta board, ta session ou ton crew."
+        },
+        "beta": {
+          "title": "Beta récente",
+          "titleBoard": "Beta récente sur cette board",
+          "empty": "Aucune vidéo beta pour le moment",
+          "error": "Impossible de charger les vidéos beta.",
+          "offline": "Pas de réseau. La beta récente réapparaîtra quand tu seras de nouveau en ligne.",
+          "offlineMode": "Le mode hors ligne est activé. La beta récente réapparaîtra quand tu le désactiveras.",
+          "unknownClimb": "Bloc inconnu",
+          "openClimb": "Ouvrir {{climb}}"
+        }
       }
     },
     "liveSessions": {

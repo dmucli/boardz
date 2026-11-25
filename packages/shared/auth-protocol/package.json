@@ -1,0 +1,100 @@
+{
+  "name": "@boardsesh/auth-protocol",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    "./native-oauth-attempt": {
+      "types": "./src/native-oauth-attempt.ts",
+      "import": "./src/native-oauth-attempt.ts",
+      "default": "./src/native-oauth-attempt.ts"
+    },
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./auth-time": {
+      "types": "./src/auth-time.ts",
+      "import": "./src/auth-time.ts",
+      "default": "./src/auth-time.ts"
+    },
+    "./partner-oauth": {
+      "types": "./src/partner-oauth.ts",
+      "import": "./src/partner-oauth.ts",
+      "default": "./src/partner-oauth.ts"
+    },
+    "./partner-oauth-mode": {
+      "types": "./src/partner-oauth-mode.ts",
+      "import": "./src/partner-oauth-mode.ts",
+      "default": "./src/partner-oauth-mode.ts"
+    },
+    "./browser-session-cookie": {
+      "types": "./src/browser-session-cookie.ts",
+      "import": "./src/browser-session-cookie.ts",
+      "default": "./src/browser-session-cookie.ts"
+    },
+    "./viewer-marker": {
+      "types": "./src/viewer-marker.ts",
+      "import": "./src/viewer-marker.ts",
+      "default": "./src/viewer-marker.ts"
+    },
+    "./legacy-login-precedence": {
+      "types": "./src/legacy-login-precedence.ts",
+      "import": "./src/legacy-login-precedence.ts",
+      "default": "./src/legacy-login-precedence.ts"
+    },
+    "./legacy-login-precedence-vectors": {
+      "types": "./src/legacy-login-precedence-vectors.ts",
+      "import": "./src/legacy-login-precedence-vectors.ts",
+      "default": "./src/legacy-login-precedence-vectors.ts"
+    },
+    "./browser-session-mode": {
+      "types": "./src/browser-session-mode.ts",
+      "import": "./src/browser-session-mode.ts",
+      "default": "./src/browser-session-mode.ts"
+    },
+    "./client-errors": {
+      "types": "./src/client-errors.ts",
+      "import": "./src/client-errors.ts",
+      "default": "./src/client-errors.ts"
+    },
+    "./transport": {
+      "types": "./src/private-command-transport.ts",
+      "import": "./src/private-command-transport.ts",
+      "default": "./src/private-command-transport.ts"
+    },
+    "./password-hash": {
+      "types": "./src/password-hash.ts",
+      "import": "./src/password-hash.ts",
+      "default": "./src/password-hash.ts"
+    },
+    "./account-email": {
+      "types": "./src/account-email.ts",
+      "import": "./src/account-email.ts",
+      "default": "./src/account-email.ts"
+    },
+    "./native-v1": {
+      "types": "./src/native-v1.ts",
+      "import": "./src/native-v1.ts",
+      "default": "./src/native-v1.ts"
+    },
+    "./device-token": {
+      "types": "./src/device-token.ts",
+      "import": "./src/device-token.ts",
+      "default": "./src/device-token.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "typescript": "~7.0.2"
+  }
+}

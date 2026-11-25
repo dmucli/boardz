@@ -1,18 +1,35 @@
 import { GraphQLError } from 'graphql';
+import { canAccessBoard, canAccessResource } from '../../../services/privacy';
 import { and, asc, eq, inArray, isNotNull, isNull, sql } from 'drizzle-orm';
 import type { SQLWrapper } from 'drizzle-orm';
+import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 import { createHash } from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 import type { BoardConnectionHolder, ResolvedBoard } from '@boardsesh/shared-schema';
 import { normaliseSetIds } from '@boardsesh/board-config';
 import { executeRows } from '@boardsesh/db/client';
+import {
+  SYSTEM_BOARD_OWNER_ID,
+  SYSTEM_BOARD_OWNER_EMAIL,
+  SYSTEM_BOARD_OWNER_NAME,
+} from '@boardsesh/db/queries/constants';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
+import type { ProjectionGym } from '../../../services/board-location-projection';
 import { pubsub } from '../../../pubsub/index';
 import { logger } from '../../../utils/logger';
 import { isUniqueViolation } from '../../../utils/postgres-errors';
+import { currentStoreSystemBoardOwnerConfiguration } from '../../../auth/current-store/authority-configuration';
+import { ensureSelectedSystemBoardOwner } from '../../../auth/current-store/system-board-owner';
+import { assertLegacyIdentityWriterAllowed } from '../../../auth/current-store/identity-writer-gate';
+import { transactionSettings } from '../../../auth/current-store/command-context';
 import { assertKnownBoardConfig } from './board-catalog';
 import { lockBoardSerialWrite, type BoardSerialWriteCommandDb } from '../board-serial-write-lock';
+import {
+  assertSprayBoardIsReadable,
+  sprayLayoutIsReadable,
+  sprayLayoutIsReadableWithCapability,
+} from '../climbs/spray-read-access';
 
 /**
  * Validate the `boardId` argument is a positive integer. The SDL types it as
@@ -26,8 +43,7 @@ export function assertValidBoardId(boardId: number): number {
   return boardId;
 }
 
-export const SYSTEM_BOARD_OWNER_ID = '00000000-0000-0000-0000-000000000000';
-const SYSTEM_BOARD_OWNER_EMAIL = 'system@boardsesh.com';
+export { SYSTEM_BOARD_OWNER_ID };
 
 export type ActivePresenceBoard = Pick<
   typeof dbSchema.userBoards.$inferSelect,
@@ -43,10 +59,10 @@ export type ActivePresenceBoard = Pick<
  */
 export type PresenceBoardIdentity = Pick<typeof dbSchema.userBoards.$inferSelect, 'ownerId' | 'slug'>;
 
-export function toResolvedBoard(board: ActivePresenceBoard): ResolvedBoard {
+export function toResolvedBoard(board: ActivePresenceBoard, revealName = false): ResolvedBoard {
   return {
     boardId: Number(board.id),
-    boardName: board.name,
+    boardName: revealName ? board.name : defaultBoardName(board.boardType),
     boardType: board.boardType,
     layoutId: Number(board.layoutId),
     sizeId: Number(board.sizeId),
@@ -56,8 +72,10 @@ export function toResolvedBoard(board: ActivePresenceBoard): ResolvedBoard {
 
 /**
  * A board sharing a (now non-unique) serial, with the extra fields the
- * disambiguation picker needs. Location fields are redacted later for
- * non-public boards the caller doesn't own (see `toBoardCandidate`).
+ * disambiguation picker needs. `locationName` and `gym` are the board's own,
+ * unprojected: `toBoardCandidate` decides per viewer what of them, or of a
+ * public gym's place, to show (`projectBoardLocation`). Nothing else may read
+ * them out to a client.
  */
 export type SerialCandidateBoard = {
   id: number;
@@ -72,7 +90,9 @@ export type SerialCandidateBoard = {
   angle: number;
   isPublic: boolean;
   locationName: string | null;
-  gymName: string | null;
+  gymId: number | null;
+  /** The board's live gym, or null. */
+  gym: ProjectionGym | null;
 };
 
 export function candidateToActiveBoard(candidate: SerialCandidateBoard): ActivePresenceBoard {
@@ -91,6 +111,7 @@ export function candidateToActiveBoard(candidate: SerialCandidateBoard): ActiveP
 type BoardPresenceReadDb = Pick<typeof db, 'select'>;
 type BoardPresenceWriteDb = Pick<typeof db, 'insert'>;
 type BoardPresenceSerialTransactionDb = BoardPresenceReadDb & BoardSerialWriteCommandDb;
+type BoardPresenceClaimDb = PgDatabase<PgQueryResultHKT, Record<string, unknown>>;
 
 type ChosenBoardLookup = {
   board: ActivePresenceBoard;
@@ -128,8 +149,17 @@ export async function findActiveBoardsBySerial(
       angle: dbSchema.userBoards.angle,
       isPublic: dbSchema.userBoards.isPublic,
       locationName: dbSchema.userBoards.locationName,
-      hideLocation: dbSchema.userBoards.hideLocation,
-      gymName: dbSchema.gyms.name,
+      gymId: dbSchema.userBoards.gymId,
+      gym: {
+        id: dbSchema.gyms.id,
+        uuid: dbSchema.gyms.uuid,
+        name: dbSchema.gyms.name,
+        latitude: dbSchema.gyms.latitude,
+        longitude: dbSchema.gyms.longitude,
+        isPublic: dbSchema.gyms.isPublic,
+        isListed: dbSchema.gyms.isListed,
+        deletedAt: dbSchema.gyms.deletedAt,
+      },
     })
     .from(dbSchema.userBoards)
     .leftJoin(dbSchema.gyms, and(eq(dbSchema.gyms.id, dbSchema.userBoards.gymId), isNull(dbSchema.gyms.deletedAt)))
@@ -154,11 +184,183 @@ export async function findActiveBoardsBySerial(
     serialNumber: row.serialNumber,
     angle: Number(row.angle),
     isPublic: row.isPublic,
-    // A board that opts into hiding its location is treated as location-private
-    // even when the board itself is public.
-    locationName: row.hideLocation ? null : row.locationName,
-    gymName: row.gymName ?? null,
+    locationName: row.locationName,
+    gymId: row.gymId,
+    // A left join yields an all-null object when the board has no live gym.
+    gym: row.gym?.id != null ? { ...row.gym, id: Number(row.gym.id) } : null,
   }));
+}
+
+/** A board the caller had selected when they connected, plus what the serial claim needs. */
+export type SelectedConnectBoard = ActivePresenceBoard & { uuid: string; ownerId: string; gymId: number | null };
+
+/** A synced gym listing: the system-owned mirror of a wall that belongs to a gym. */
+export function isSyncedGymListing(board: Pick<SelectedConnectBoard, 'ownerId' | 'gymId'>): boolean {
+  return board.ownerId === SYSTEM_BOARD_OWNER_ID && board.gymId !== null;
+}
+
+/**
+ * Whether a synced gym listing carries this serial *and* describes the wall
+ * that just connected.
+ *
+ * The config comparison is the half that keeps a reused serial local. The LED
+ * supplier hands the same serial to unrelated walls — 9 genuine cross-gym
+ * reuses in production, 4 km to 7,400 km apart — so a listing at some other gym
+ * with a different layout / size / hold sets says nothing about the controller
+ * in front of this climber, and must not outrank the board they picked. Only a
+ * listing that could actually BE this wall gets to. `normaliseSetIds` runs in
+ * JS because synced catalog rows keep the upstream set-id string verbatim while
+ * our own writers store the canonical form.
+ */
+export async function hasSyncedGymBoardForSerial(
+  serial: string,
+  config: { boardType: string; layoutId: number; sizeId: number; setIds: string },
+  readDb: BoardPresenceReadDb = db,
+  advertisedBoardType?: string | null,
+): Promise<boolean> {
+  const listings = await readDb
+    .select({ setIds: dbSchema.userBoards.setIds })
+    .from(dbSchema.userBoards)
+    .where(
+      and(
+        eq(dbSchema.userBoards.serialNumber, serial),
+        isNull(dbSchema.userBoards.deletedAt),
+        eq(dbSchema.userBoards.ownerId, SYSTEM_BOARD_OWNER_ID),
+        isNotNull(dbSchema.userBoards.gymId),
+        advertisedBoardType ? eq(dbSchema.userBoards.boardType, advertisedBoardType) : undefined,
+        eq(dbSchema.userBoards.boardType, config.boardType),
+        eq(dbSchema.userBoards.layoutId, config.layoutId),
+        eq(dbSchema.userBoards.sizeId, config.sizeId),
+      ),
+    );
+  const connectedSetIds = normaliseSetIds(config.setIds);
+  return listings.some((listing) => normaliseSetIds(listing.setIds) === connectedSetIds);
+}
+
+/**
+ * The board the caller already had selected when the BLE connect landed (the
+ * map finder / board picker choice), when it is reachable, active, and
+ * genuinely describes the wall they just plugged into.
+ *
+ * The config equality check is what makes this safe to trust over serial
+ * matching: a selection whose board type / layout / size / hold sets don't
+ * match what the controller advertised is stale (they picked one wall and
+ * walked to another), so the serial stays authoritative there. Set ids are
+ * compared through `normaliseSetIds` because synced catalog boards store the
+ * upstream string verbatim while our own writers store the canonical form.
+ */
+export async function findSelectedBoardForConnect(
+  userId: string,
+  boardUuid: string,
+  config: { boardType: string; layoutId: number; sizeId: number; setIds: string },
+  readDb: BoardPresenceReadDb = db,
+): Promise<SelectedConnectBoard | undefined> {
+  const [board] = await readDb
+    .select({
+      id: dbSchema.userBoards.id,
+      uuid: dbSchema.userBoards.uuid,
+      ownerId: dbSchema.userBoards.ownerId,
+      name: dbSchema.userBoards.name,
+      boardType: dbSchema.userBoards.boardType,
+      layoutId: dbSchema.userBoards.layoutId,
+      sizeId: dbSchema.userBoards.sizeId,
+      setIds: dbSchema.userBoards.setIds,
+      serialNumber: dbSchema.userBoards.serialNumber,
+      angle: dbSchema.userBoards.angle,
+      gymId: dbSchema.userBoards.gymId,
+    })
+    .from(dbSchema.userBoards)
+    .where(and(eq(dbSchema.userBoards.uuid, boardUuid), isNull(dbSchema.userBoards.deletedAt)))
+    .limit(1);
+  if (!board) return undefined;
+  // The client names the picked board by uuid, which is its link: an Unlisted
+  // board a climber opened by its link stays their pick when they connect.
+  if (!(await canAccessResource('board', board.uuid, userId))) return undefined;
+  if (!(await sprayLayoutIsReadable(board.boardType, Number(board.layoutId), userId))) return undefined;
+  if (
+    board.boardType !== config.boardType ||
+    Number(board.layoutId) !== config.layoutId ||
+    Number(board.sizeId) !== config.sizeId ||
+    normaliseSetIds(board.setIds) !== normaliseSetIds(config.setIds)
+  ) {
+    return undefined;
+  }
+  return {
+    ...board,
+    id: Number(board.id),
+    layoutId: Number(board.layoutId),
+    sizeId: Number(board.sizeId),
+    gymId: board.gymId === null ? null : Number(board.gymId),
+  };
+}
+
+/**
+ * Whether a connect may stamp its controller serial onto this board. Limited to
+ * the caller's own boards and the system-owned synced catalog: a gym listing we
+ * mirror is exactly the row that should learn its serial, whereas letting
+ * anyone brand a stranger's board would redirect that serial for every climber
+ * who connects to it afterwards.
+ */
+export function canClaimSerialForBoard(board: Pick<SelectedConnectBoard, 'ownerId'>, userId: string): boolean {
+  return board.ownerId === userId || board.ownerId === SYSTEM_BOARD_OWNER_ID;
+}
+
+/**
+ * Stamp a controller serial onto a board that carries none, so the next
+ * climber's connect resolves straight to it instead of minting a private
+ * duplicate. `WHERE serial_number IS NULL` makes a concurrent claim fail-safe —
+ * the loser re-reads and binds the same board either way.
+ *
+ * Returns the refreshed board. Never throws on the per-owner duplicate-serial
+ * index: if the caller already has this serial on another of their boards the
+ * claim is simply skipped and the board is returned unchanged, because binding
+ * to the selected board still has to succeed.
+ * The claim uses a savepoint when passed a transaction, so a duplicate serial
+ * cannot abort the caller's remaining work.
+ */
+export async function claimSerialForBoard(
+  board: SelectedConnectBoard,
+  serial: string,
+  commandDb: BoardPresenceClaimDb = db,
+): Promise<SelectedConnectBoard> {
+  try {
+    const updated = await commandDb.transaction(async (claimTx) => {
+      const [claimed] = await claimTx
+        .update(dbSchema.userBoards)
+        .set({ serialNumber: serial, updatedAt: new Date() })
+        .where(
+          and(
+            eq(dbSchema.userBoards.id, board.id),
+            isNull(dbSchema.userBoards.serialNumber),
+            isNull(dbSchema.userBoards.deletedAt),
+          ),
+        )
+        .returning({ serialNumber: dbSchema.userBoards.serialNumber });
+      return claimed;
+    });
+    if (updated) {
+      return { ...board, serialNumber: updated.serialNumber };
+    }
+  } catch (error) {
+    if (!isDuplicateBoardSerialError(error)) {
+      throw error;
+    }
+    logger.warn('[board-presence] serial claim skipped, already bound elsewhere');
+    return board;
+  }
+  // Lost the `serial_number IS NULL` race — re-read what the winner wrote so
+  // the caller reports the board's real serial. Same `deleted_at` guard as the
+  // UPDATE: if the board was soft-deleted in between, reporting a serial read
+  // off a dead row would be worse than reporting none. That degenerate case
+  // (the owner deleted the board mid-connect) reports no serial and binds this
+  // one connect to the just-deleted board; the next connect skips it, because
+  // findChosenBoardForSerial only joins rows with `deleted_at IS NULL`.
+  const [current] = await commandDb
+    .select({ serialNumber: dbSchema.userBoards.serialNumber })
+    .from(dbSchema.userBoards)
+    .where(and(eq(dbSchema.userBoards.id, board.id), isNull(dbSchema.userBoards.deletedAt)))
+    .limit(1);
+  return { ...board, serialNumber: current?.serialNumber ?? board.serialNumber };
 }
 
 /**
@@ -177,13 +379,24 @@ export async function findChosenBoardForSerial(
   userId: string,
   serial: string,
   advertisedBoardType?: string | null,
+  connectedConfig?: { boardType: string; layoutId: number; sizeId: number; setIds: string },
 ): Promise<ActivePresenceBoard | undefined> {
   // Keep the serial-first lookup read-only. Updating board_uuid would make the
   // FK acquire an implicit user_boards KEY SHARE lock after the serial lock,
   // inverting every row-changing writer's row→serial order.
   const lookup = await db.transaction(async (tx) => {
     await lockBoardSerialWrite(tx, serial);
-    return findChosenBoardForSerialLocked(tx, userId, serial, advertisedBoardType);
+    const chosen = await findChosenBoardForSerialLocked(tx, userId, serial, advertisedBoardType);
+    // Recheck gym precedence while the same serial is fenced. A claim between
+    // an earlier read and this pointer lookup must not revive an unbound hint.
+    if (
+      chosen &&
+      connectedConfig &&
+      chosen.board.serialNumber !== serial &&
+      (await hasSyncedGymBoardForSerial(serial, connectedConfig, tx, advertisedBoardType))
+    )
+      return undefined;
+    return chosen;
   });
 
   if (!lookup) return undefined;
@@ -447,9 +660,17 @@ export async function findReachableActiveBoardByUuid(
   if (!canonical) return undefined;
 
   // Reachability is deliberately evaluated on the canonical board, never the
-  // stale loser. Owning a private loser must not grant access to another
-  // owner's private survivor; anonymous callers can only reach public boards.
-  if (!canonical.isPublic && canonical.ownerId !== userId) return undefined;
+  // stale loser: owning a private loser must not grant access to another
+  // owner's private survivor. The uuid is the requested board's link, so it
+  // opens an Unlisted board. Across a merge it stays a link only when one owner
+  // holds both boards; otherwise the survivor gets the no-link reading.
+  const presentedLink = !requested.deletedAt || requested.ownerId === canonical.ownerId ? canonical.uuid : null;
+  if (!(await canAccessBoard(canonical.uuid, userId, presentedLink))) return undefined;
+  if (
+    canonical.boardType === 'spray' &&
+    !(await sprayLayoutIsReadableWithCapability('spray', canonical.layoutId, userId, presentedLink, db))
+  )
+    return undefined;
 
   return toActivePresenceBoard(canonical);
 }
@@ -499,86 +720,152 @@ export async function requireActiveBoardById(boardId: number): Promise<ActivePre
   const board = await findActiveBoardById(boardId);
   if (!board) {
     // NOT_FOUND matches requireAnonReadableBoard's mask below, so a missing
-    // board and a private board masked from an anonymous viewer produce the
-    // identical error shape (message + extensions.code) on the wire.
+    // board and a board the viewer may not read produce the identical error
+    // shape (message + extensions.code) on the wire.
     throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
   }
   return board;
 }
 
-export type BoardVisibility = Pick<typeof dbSchema.userBoards.$inferSelect, 'isPublic' | 'ownerId'>;
+export type BoardVisibility = Pick<typeof dbSchema.userBoards.$inferSelect, 'uuid' | 'isPublic' | 'ownerId'>;
 
 /**
- * THE anonymous board-visibility rule, applied to a board row already in hand:
- * a **public** board, or a system-owned shared per-config board (the serial-less
- * MoonBoard-style feeds anon is first-class for). Viewer-independent.
- *
- * Every board read reachable without a session MUST route its anonymous gate
- * through this one predicate — `isBoardAnonReadable` (by id),
- * `assertAnonReadableBoard` (throwing), and the `board(boardUuid)` entity read
- * all call it, so a private board can never be visible on one anonymous surface
- * and hidden on another.
- *
- * `isUnlisted` is deliberately NOT part of the rule: unlisted means "reachable
- * by direct link, never enumerated", so an unlisted-but-public board stays
- * readable by uuid. Enumerating reads (searchBoards, gymBoards) filter unlisted
- * separately.
+ * The legacy-boolean anonymous mask: a board flagged `is_public`, or a
+ * system-owned shared per-config board. It ignores the board's privacy policy,
+ * so an Unlisted board saved with the current controls (`is_public = false`
+ * plus a `resource_privacy` row) fails it. Home-board reads therefore do not use
+ * it: they read the policy through `canAccessResource` (the link) or
+ * `canAccessBoard` (a numeric id). Only the spray wall slug path in
+ * `boardBySlug` still applies it, ahead of the wall's own rule.
  */
 export function isRowAnonReadable(board: BoardVisibility): boolean {
   return board.isPublic || board.ownerId === SYSTEM_BOARD_OWNER_ID;
 }
 
 /**
- * `isRowAnonReadable` for a board identified by id — for callers that don't
- * already hold the row. Also the publish gate for the board-queue-preview
- * producer, which has no viewer at all. False for missing/deleted boards.
+ * Whether anybody without an account could read this board through its link:
+ * the policy's Public and Unlisted audiences (a signed-out viewer has no owner,
+ * grant or follower standing, so `canAccessResource` admits exactly those).
+ * Viewer-independent: the publish gate for the board-queue-preview producer,
+ * which has no viewer at all. Who may subscribe to that preview is the
+ * subscriber gate's call (`requireReadablePresenceBoard`), so an Unlisted
+ * board's preview reaches only callers who presented its uuid. False for
+ * missing/deleted boards.
  */
 export async function isBoardAnonReadable(boardId: number): Promise<boolean> {
   assertValidBoardId(boardId);
   const [board] = await db
-    .select({ isPublic: dbSchema.userBoards.isPublic, ownerId: dbSchema.userBoards.ownerId })
+    .select({ uuid: dbSchema.userBoards.uuid })
     .from(dbSchema.userBoards)
     .where(and(eq(dbSchema.userBoards.id, boardId), isNull(dbSchema.userBoards.deletedAt)))
     .limit(1);
-  return Boolean(board && isRowAnonReadable(board));
+  return Boolean(board && (await canAccessResource('board', board.uuid, null)));
 }
 
 /**
- * Bound anonymous reads of the live "now on the wall" feed (boardNowPlaying /
- * boardRecentClimbs / boardConnection) to boards an anonymous viewer is allowed
- * to see. Logged-in callers keep the pre-existing membership-free access to any
- * active board (a board's send feed is shared, leaderboard-style data among
- * authenticated users). Anonymous callers — who could otherwise enumerate the
- * sequential board ids — are restricted to the `isBoardAnonReadable` set.
- * Throws the same `Board not found` as a missing board so a private board's
- * existence isn't revealed to anon. No-op for logged-in.
- *
- * Returns whether anon-readability was actually VERIFIED — true only on the
- * anonymous path (where not throwing means `isBoardAnonReadable` held), false
- * for logged-in viewers (nothing was checked). Callers that re-apply the same
- * viewer-independent gate downstream (boardQueuePreview) use it to skip a
- * duplicate `isBoardAnonReadable` query — never treat `false` as "not
- * readable", only as "not verified here".
+ * The presence gate: the board's own policy, read by the key the caller holds
+ * (`canAccessBoard`). Gym edit authority (a gym owner, admin or editor, or a
+ * community admin or leader whose role covers the gym) adds nothing here. The
+ * gym lists a board to its editors by the same no-link reading (`gymBoards`),
+ * so a stranger's Invite-only or Only-me board linked to the gym stays
+ * not-found to them, exactly as `board(uuid)` is. An Unlisted board opens for a
+ * caller who presents its uuid, but the kiosk preview only shows slots
+ * `gymBoards` lists, so another owner's Unlisted board is a missing tile there
+ * and the public TV page leaves it out.
+ */
+async function canReadPresenceBoard(
+  board: Pick<BoardVisibility, 'uuid'>,
+  viewerUserId: string | null | undefined,
+  presentedBoardUuid?: string | null,
+): Promise<boolean> {
+  return canAccessBoard(board.uuid, viewerUserId, presentedBoardUuid);
+}
+
+/**
+ * The board gate for reads keyed on a numeric board id (boardNowPlaying, the
+ * leaderboard). `user_boards.id` is a sequential bigserial anyone can count, so
+ * the id alone gets the no-link reading: Public, plus whatever the viewer holds
+ * already (owner, grant, follower inheritance). An Unlisted board opens only
+ * when the caller also presents the board's uuid (`presentedBoardUuid`) and it
+ * is this row's own. Throws the same `Board not found` as a missing board, so a
+ * board the viewer may not read is no oracle.
  */
 export async function requireAnonReadableBoard(
   boardId: number,
   viewerUserId: string | null | undefined,
-): Promise<boolean> {
+  presentedBoardUuid?: string | null,
+): Promise<void> {
   assertValidBoardId(boardId);
-  if (viewerUserId) return false;
-  if (!(await isBoardAnonReadable(boardId))) {
-    throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
-  }
-  return true;
+  const board = await requireActiveBoardWithVisibilityById(boardId);
+  await assertAnonReadableBoard(board, viewerUserId, presentedBoardUuid);
 }
 
 /**
- * Same shape as `requireActiveBoardById`, plus the `isPublic`/`ownerId`
- * columns `requireAnonReadableBoard` needs. Callers that need both checks
- * (`boardHistory`, `boardPresenceStats`, `boardRecentClimbs`) can do a single
- * indexed by-id lookup and pass the row to `assertAnonReadableBoard` instead
- * of `requireActiveBoardById` + `requireAnonReadableBoard` issuing two
- * separate round-trips for the same row on every anonymous request.
+ * `requireAnonReadableBoard` plus the spray wall rule, in ONE `user_boards`
+ * read — for the polled presence reads keyed on a bare board id
+ * (`boardConnection`, `boardQueuePreview`) that do not otherwise load the row.
+ *
+ * Behaviour is exactly the two gates in sequence:
+ *  - a missing or deleted board, or one the viewer may not read by id (no-link
+ *    reading, unless `presentedBoardUuid` is this row's uuid), is NOT_FOUND;
+ *  - a found spray wall rechecks its current policy with the same presented
+ *    UUID; hidden walls remain owner-only. Every other board type returns
+ *    before that helper issues a query.
+ *
+ * Returns `anonReadableVerified` (true for a signed-out viewer, whose passing
+ * this gate already means `isBoardAnonReadable` holds: a signed-out viewer
+ * passes only the Public and Unlisted audiences) and the row's type and layout
+ * so a subscription can build its per-event `sprayStreamGate` without reading
+ * the row again.
+ */
+export async function requireReadablePresenceBoard(
+  boardId: number,
+  viewerUserId: string | null | undefined,
+  presentedBoardUuid?: string | null,
+): Promise<{ anonReadableVerified: boolean; board: { boardType: string; layoutId: number } | null }> {
+  assertValidBoardId(boardId);
+  const [row] = await db
+    .select({
+      uuid: dbSchema.userBoards.uuid,
+      isPublic: dbSchema.userBoards.isPublic,
+      ownerId: dbSchema.userBoards.ownerId,
+      boardType: dbSchema.userBoards.boardType,
+      layoutId: dbSchema.userBoards.layoutId,
+      deletedAt: dbSchema.userBoards.deletedAt,
+    })
+    .from(dbSchema.userBoards)
+    .where(eq(dbSchema.userBoards.id, boardId))
+    .limit(1);
+
+  if (!row || row.deletedAt !== null || !(await canReadPresenceBoard(row, viewerUserId, presentedBoardUuid))) {
+    throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+  }
+  if (!row) return { anonReadableVerified: !viewerUserId, board: null };
+  // Fail closed: a spray row with no layout names no wall whose rule could admit
+  // anybody. The column is NOT NULL today; this is what keeps the gate honest if
+  // that ever relaxes, rather than skipping the spray check.
+  if (row.layoutId == null) {
+    if (row.boardType === 'spray') {
+      throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+    }
+    return { anonReadableVerified: !viewerUserId, board: null };
+  }
+  await assertSprayBoardIsReadable(
+    { boardType: row.boardType, layoutId: row.layoutId },
+    viewerUserId,
+    presentedBoardUuid,
+    db,
+  );
+  return { anonReadableVerified: !viewerUserId, board: { boardType: row.boardType, layoutId: row.layoutId } };
+}
+
+/**
+ * Same shape as `requireActiveBoardById`, plus the `uuid` the board gate reads
+ * the policy by. Callers that need both checks (`boardHistory`,
+ * `boardPresenceStats`, `boardRecentClimbs`) can do a single indexed by-id
+ * lookup and pass the row to `assertAnonReadableBoard` instead of
+ * `requireActiveBoardById` + `requireAnonReadableBoard` issuing two separate
+ * round-trips for the same row on every request.
  */
 export async function requireActiveBoardWithVisibilityById(
   boardId: number,
@@ -594,6 +881,7 @@ export async function requireActiveBoardWithVisibilityById(
       setIds: dbSchema.userBoards.setIds,
       serialNumber: dbSchema.userBoards.serialNumber,
       angle: dbSchema.userBoards.angle,
+      uuid: dbSchema.userBoards.uuid,
       isPublic: dbSchema.userBoards.isPublic,
       ownerId: dbSchema.userBoards.ownerId,
     })
@@ -611,14 +899,16 @@ export async function requireActiveBoardWithVisibilityById(
 /**
  * `requireAnonReadableBoard`'s gate, applied to a board row already loaded via
  * `requireActiveBoardWithVisibilityById` instead of re-querying by id. Same
- * masking behaviour: no-op for logged-in callers, NOT_FOUND for anonymous
- * callers on a non-public board that isn't system-owned.
+ * rule: the no-link reading for the id alone, the link reading when
+ * `presentedBoardUuid` is this row's uuid, NOT_FOUND otherwise.
  */
-export function assertAnonReadableBoard(board: BoardVisibility, viewerUserId: string | null | undefined): void {
-  if (viewerUserId) return;
-  if (!isRowAnonReadable(board)) {
+export async function assertAnonReadableBoard(
+  board: BoardVisibility,
+  viewerUserId: string | null | undefined,
+  presentedBoardUuid?: string | null,
+): Promise<void> {
+  if (!(await canReadPresenceBoard(board, viewerUserId, presentedBoardUuid)))
     throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
-  }
 }
 
 /**
@@ -796,16 +1086,40 @@ export async function resolveBoardHolder(boardId: number): Promise<BoardConnecti
 }
 
 async function ensureSystemBoardOwner(): Promise<void> {
-  await db
-    .insert(dbSchema.users)
-    .values({
-      id: SYSTEM_BOARD_OWNER_ID,
-      email: SYSTEM_BOARD_OWNER_EMAIL,
-      name: 'Boardsesh',
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    })
-    .onConflictDoNothing();
+  let configuration: ReturnType<typeof currentStoreSystemBoardOwnerConfiguration>;
+  try {
+    configuration = currentStoreSystemBoardOwnerConfiguration();
+    if (configuration.mode === 'reserved-staging') {
+      await ensureSelectedSystemBoardOwner(db, configuration.authority);
+      return;
+    }
+  } catch {
+    logger.warn('[board-presence] System board owner unavailable', { category: 'authority-or-database' });
+    throw new GraphQLError('Shared board creation is temporarily unavailable.', {
+      extensions: { code: 'SERVICE_UNAVAILABLE', http: { status: 503 } },
+    });
+  }
+  try {
+    await db.transaction(async (transaction) => {
+      await transactionSettings(transaction);
+      await assertLegacyIdentityWriterAllowed(transaction);
+      await transaction
+        .insert(dbSchema.users)
+        .values({
+          id: SYSTEM_BOARD_OWNER_ID,
+          email: SYSTEM_BOARD_OWNER_EMAIL,
+          name: SYSTEM_BOARD_OWNER_NAME,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .onConflictDoNothing();
+    });
+  } catch {
+    logger.warn('[board-presence] System board owner unavailable', { category: 'authority-or-database' });
+    throw new GraphQLError('Shared board creation is temporarily unavailable.', {
+      extensions: { code: 'SERVICE_UNAVAILABLE', http: { status: 503 } },
+    });
+  }
 }
 
 /**
@@ -890,7 +1204,7 @@ export async function resolveSharedBoardForConfig(
     .where(and(eq(dbSchema.userBoards.slug, slug), isNull(dbSchema.userBoards.deletedAt)))
     .limit(1);
   if (existing) {
-    return toResolvedBoard(existing);
+    return toResolvedBoard(existing, true);
   }
 
   if (!allowCreate) {
@@ -919,19 +1233,19 @@ export async function resolveSharedBoardForConfig(
         isOwned: false,
       })
       .returning();
-    return toResolvedBoard(created);
+    return toResolvedBoard(created, true);
   } catch (error) {
     if (!isUniqueViolation(error, 'user_boards_unique_slug')) {
       throw error;
     }
-    logger.warn(`[board-presence] resolveSharedBoardForConfig create race: ${String(error)}`);
+    logger.warn('[board-presence] resolveSharedBoardForConfig create race');
     const [winner] = await db
       .select()
       .from(dbSchema.userBoards)
       .where(and(eq(dbSchema.userBoards.slug, slug), isNull(dbSchema.userBoards.deletedAt)))
       .limit(1);
     if (winner) {
-      return toResolvedBoard(winner);
+      return toResolvedBoard(winner, true);
     }
     throw error;
   }

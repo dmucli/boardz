@@ -568,6 +568,44 @@ describe('useSaveTick (shared)', () => {
     expect(roots).toContain('searchClimbsCount');
   });
 
+  // #6023: the server picks the climb version, so a tick never names one, on
+  // the network path or the offline one. The saved row's version stays
+  // unknown, which counts as sent.
+  it('never sends climbRevision, and the saved row has no version', async () => {
+    const executeHttp = vi.fn().mockResolvedValue({ saveTick: savedTick({ uuid: 'real-rev' }) });
+    const { wrapper, queryClient } = createWrapper({ executeHttp: executeHttp as unknown as ExecuteHttp });
+    queryClient.setQueryData(accumulatedLogbookQueryKey('kilter'), []);
+    const { result } = renderHook(() => useSaveTick('kilter'), { wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync(tickOptions());
+    });
+
+    const [, variables] = executeHttp.mock.calls[0] as [string, { input: Record<string, unknown> }];
+    expect('climbRevision' in variables.input).toBe(false);
+    const cache = queryClient.getQueryData<LogbookEntry[]>(accumulatedLogbookQueryKey('kilter'));
+    expect(cache).toEqual([expect.objectContaining({ uuid: 'real-rev' })]);
+    expect(cache?.[0]?.climb_revision).toBeUndefined();
+  });
+
+  it('hands the offline save path an input without climbRevision', async () => {
+    const saveTickOffline = vi.fn().mockResolvedValue(savedTick({ uuid: 'queued-rev' }));
+    const executeHttp = vi.fn();
+    const { wrapper, queryClient } = createWrapper({
+      executeHttp: executeHttp as unknown as ExecuteHttp,
+      saveTickOffline,
+    });
+    queryClient.setQueryData(accumulatedLogbookQueryKey('kilter'), []);
+    const { result } = renderHook(() => useSaveTick('kilter'), { wrapper });
+
+    await act(async () => {
+      await result.current.mutateAsync(tickOptions());
+    });
+
+    expect(executeHttp).not.toHaveBeenCalled();
+    expect('climbRevision' in saveTickOffline.mock.calls[0][0].input).toBe(false);
+  });
+
   it('forwards a resolved presence boardId when provided', async () => {
     const executeHttp = vi.fn().mockResolvedValue({ saveTick: savedTick({ uuid: 'real-42' }) });
     const { wrapper } = createWrapper({ executeHttp: executeHttp as unknown as ExecuteHttp });

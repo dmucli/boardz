@@ -1,7 +1,7 @@
 /**
  * The backend's job queue: pg-boss, in this process, on the same Postgres.
  *
- * `docs/partner-workouts-internal.md` ("The job queue") is the design. The short
+ * `docs/integrations/partner-workouts-internal.md` ("The job queue") is the design. The short
  * version of why it is pg-boss and not BullMQ on the Redis we already run:
  *
  * 1. **A job can commit with the state change.** `send()` takes a `db` option, so
@@ -17,7 +17,7 @@
  * schema under the reserved migration owner; runtime startup disables DDL.
  * That schema is outside `packages/db/drizzle`, so
  * `check:db-migrations` does not see it and `pg_dump` carries it like any other
- * schema. See `docs/db-migrations.md`.
+ * schema. See `docs/operations/db-migrations.md`.
  *
  * Two notes on the installed version (12.x), because the design doc was written
  * against assumptions and asked for them to be checked:
@@ -66,7 +66,10 @@ export const DEFAULT_JOB_OPTIONS: SendOptions = {
 
 let boss: PgBoss | null = null;
 
-/** The running queue, or null before `startJobQueue()` / after `stopJobQueue()`. */
+/**
+ * The queue, or null before `startJobQueue()` / after `stopJobQueue()`. Between
+ * `stopJobQueueWorkers()` and `stopJobQueue()` it still takes jobs but works none.
+ */
 export function getJobQueue(): PgBoss | null {
   return boss;
 }
@@ -76,12 +79,19 @@ export function requireJobQueue(): PgBoss {
   return boss;
 }
 
+/**
+ * pg-boss pool per backend replica when `PGBOSS_POOL_SIZE` is unset. Its work is
+ * short timer statements and a handful of once-a-minute jobs, which 2
+ * connections serve; see the connection budget in docs/operations/db-connectivity.md.
+ */
+export const DEFAULT_PGBOSS_POOL_SIZE = 2;
+
 export async function startJobQueue(): Promise<PgBoss> {
   if (boss) return boss;
 
   const instance = createJobQueueClient({
     connectionString: getConnectionConfig().connectionString,
-    poolSize: Number(process.env.PGBOSS_POOL_SIZE ?? 4),
+    poolSize: Number(process.env.PGBOSS_POOL_SIZE ?? DEFAULT_PGBOSS_POOL_SIZE),
     owner: 'backend',
     testBootstrap: process.env.NODE_ENV === 'test',
   });
@@ -97,14 +107,30 @@ export async function startJobQueue(): Promise<PgBoss> {
   return instance;
 }
 
-export async function stopJobQueue(): Promise<void> {
+/**
+ * First half of a shutdown: stop this replica's workers, timers and
+ * maintenance, and keep the pool open. `getJobQueue()` still returns the
+ * instance and `send()` still works, so a mutation that is still running
+ * during the drain can enqueue inside its transaction. `stopJobQueue()` closes
+ * the pool once nothing can enqueue any more.
+ */
+export async function stopJobQueueWorkers(): Promise<void> {
   if (!boss) return;
-  const instance = boss;
-  boss = null;
   // Graceful: let an in-flight job finish rather than orphaning it into the
   // supervisor's reclaim window on every deploy. `timeout` bounds that wait so a
   // wedged handler cannot hold the deploy open past Railway's drain window
   // (`drainingSeconds = 15` in railway.toml).
+  await boss.stop({ graceful: true, close: false, timeout: 10_000 });
+  logger.info('[job-queue] workers stopped; still accepting jobs');
+}
+
+/** Stop the queue (workers too, if `stopJobQueueWorkers()` did not) and close its pool. */
+export async function stopJobQueue(): Promise<void> {
+  if (!boss) return;
+  const instance = boss;
+  boss = null;
+  // A no-op stop plus a pool close when the workers already stopped; otherwise
+  // the same graceful, bounded stop as above.
   await instance.stop({ graceful: true, close: true, timeout: 10_000 });
   logger.info('[job-queue] stopped');
 }

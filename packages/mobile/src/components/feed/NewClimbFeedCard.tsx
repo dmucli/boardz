@@ -1,6 +1,6 @@
 import { memo, useCallback, useMemo, useState } from 'react';
 import { View, StyleSheet, type LayoutChangeEvent } from 'react-native';
-import { useRouter } from 'expo-router';
+import { useScopedRouter as useRouter } from '../../lib/routing/scoped-navigation';
 import { useTranslation } from 'react-i18next';
 import type { ActivityFeedItem, CrewFeedItem } from '@boardsesh/shared-schema';
 import { formatBoardDisplayName } from '@boardsesh/board-config';
@@ -156,14 +156,14 @@ export const NewClimbFeedCard = memo(function NewClimbFeedCard({ item }: { item:
             size={36}
           />
           <View style={styles.headerText}>
-            <Text variant="subheadline" style={styles.title} numberOfLines={1}>
+            <Text emphasized variant="subheadline" numberOfLines={1}>
               {lead.actorDisplayName ?? setterUsername ?? t('authors.newClimb')}
             </Text>
             {/* One line, count first: the count in a bolder secondary colour, the
                 time quieter — the same two-tier treatment the session card uses,
                 so the two cards read as one system. */}
-            <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={1} style={styles.metaLine}>
-              <Text variant="caption1" color={systemColors.secondaryLabel} style={styles.statEmphasis}>
+            <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={1} style={styles.metaLine}>
+              <Text emphasized variant="caption1" color={systemColors.secondaryLabel}>
                 {t('authors.newClimbCount', { count: total })}
               </Text>
               {' · '}
@@ -235,7 +235,9 @@ const ClimbHero = memo(function ClimbHero({
     : null;
   // Fall back to the raw grade name when the climber's preferred system can't
   // express it, rather than dropping the grade — the session card's rule.
-  const grade = climb.difficultyName ? (formatGrade(climb.difficultyName) ?? climb.difficultyName) : null;
+  const grade = climb.difficultyName
+    ? (formatGrade(climb.difficultyName, climb.boardType) ?? climb.difficultyName)
+    : null;
   // Angle and board are separate elements, not a joined string: an ungraded
   // climb loses the grade slot instead of collapsing into a bare "30°".
   const angle = climb.angle == null ? null : `${climb.angle}°`;
@@ -284,7 +286,7 @@ const ClimbHero = memo(function ClimbHero({
               {angle}
             </Text>
           ) : null}
-          <Text variant="footnote" color={systemColors.tertiaryLabel} numberOfLines={1}>
+          <Text variant="footnote" color={systemColors.secondaryLabel} numberOfLines={1}>
             {boardName}
           </Text>
         </View>
@@ -321,9 +323,7 @@ const styles = StyleSheet.create({
   wrapper: { marginHorizontal: spacing[4], marginTop: spacing[3] },
   header: { flexDirection: 'row', alignItems: 'center', gap: spacing[3] },
   headerText: { flex: 1 },
-  title: { fontWeight: '600' },
   metaLine: { marginTop: 2 },
-  statEmphasis: { fontWeight: '600' },
   heroSlot: { marginTop: spacing[2] },
   heroPressable: { margin: -spacing[1], padding: spacing[1], borderRadius: borderRadius.md },
   carouselContent: { paddingHorizontal: 0 },

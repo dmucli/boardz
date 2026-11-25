@@ -1,15 +1,17 @@
+import { AccessibleBottomSheetTextInput as BottomSheetTextInput } from '../AccessibleBottomSheetTextInput';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { MEDIUM_LARGE_SNAP_POINTS } from '../sheet-snap-points';
 import { useCallback, useMemo, useRef, useState, type RefObject } from 'react';
-import { StyleSheet, View } from 'react-native';
-import { BottomSheetTextInput } from '@expo/ui/community/bottom-sheet';
+import { StyleSheet } from 'react-native';
+
 import * as Updates from 'expo-updates';
 import { useTranslation } from 'react-i18next';
 import type { QaVerdictKind } from '@boardsesh/shared-schema';
 import { useProfile } from '../../lib/graphql/hooks';
 import { ModalSheet } from '../ModalSheet';
+import { SheetTopBar } from '../SheetTopBar';
 import { Text } from '../Text';
-import { Icon } from '../Icon';
 import { Button } from '../Button';
-import { PressableSurface } from '../PressableSurface';
 import { ScreenshotPicker } from '../feedback/ScreenshotPicker';
 import { SegmentedControl } from '../SegmentedControl';
 import { useTheme } from '../../providers/theme-provider';
@@ -19,7 +21,9 @@ import { setSetting } from '../../settings';
 import { track } from '../../lib/analytics';
 import { reportHandledError } from '../../lib/error-reporting';
 import { clearScreenshotUploadCache, uploadFeedbackScreenshots } from '../../lib/feedback/screenshot-upload';
-import { qaSurfingAvailable, readRunningPrNumber, surfToProduction } from '../../lib/qa/qa-surf';
+import { qaSurfingAvailable, readRunningPrNumber } from '../../lib/qa/qa-surf';
+import { returnToOwnTrack } from '../../lib/qa/early-updates';
+import { useEarlyUpdatesMember } from '../../lib/qa/use-early-updates';
 import { prBranchName } from '../../lib/qa/pr-branch';
 import { qaSessionKey } from '../../lib/qa/qa-keys';
 import { useQaPreviews, useSubmitQaVerdict } from '../../lib/qa/use-qa-previews';
@@ -29,7 +33,7 @@ import {
   QA_VERDICT_SUBMITTED_EVENT,
   surfFailureReason,
 } from '../../lib/qa/qa-analytics';
-import type { ManagedSheetHandle } from '../../providers/sheet-presentation-provider';
+import { dismissManagedSheetAndWait, type ManagedSheetHandle } from '../../providers/sheet-presentation-provider';
 
 // This sheet was tester-only (hardcoded English, like the other QA screens and
 // the dev rows on the More tab) until it opened to every user in #5126.
@@ -41,6 +45,8 @@ const DEV_HINT = 'Surfing is unavailable in a dev build — the sheet will not s
 
 const DECLINE_COMMENT_MIN_LENGTH = 10;
 const COMMENT_MAX_LENGTH = 2000;
+
+type QaActionOwner = 'submitting' | 'leaving';
 
 type QaVerdictSheetProps = {
   sheetRef: RefObject<ManagedSheetHandle | null>;
@@ -59,6 +65,7 @@ type QaVerdictSheetProps = {
  * live native presentation.
  */
 export function QaVerdictSheet({ sheetRef }: QaVerdictSheetProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('common');
   const { systemColors, brandColors } = useTheme();
   const { showToast } = useToast();
@@ -87,7 +94,25 @@ export function QaVerdictSheet({ sheetRef }: QaVerdictSheetProps) {
   const [comment, setComment] = useState('');
   const [screenshotUris, setScreenshotUris] = useState<string[]>([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [actionOwner, setActionOwner] = useState<QaActionOwner | null>(null);
+  const actionOwnerRef = useRef<QaActionOwner | null>(null);
+  // Retained handlers must read current mutation/upload state, not the render
+  // that produced the callback. The owner also closes React's scheduling gap.
+  const submissionPendingRef = useRef(false);
+  submissionPendingRef.current = isPending || isUploading;
+  const claimAction = useCallback((nextOwner: QaActionOwner) => {
+    if (actionOwnerRef.current !== null || submissionPendingRef.current) return false;
+    actionOwnerRef.current = nextOwner;
+    setActionOwner(nextOwner);
+    return true;
+  }, []);
+  const releaseAction = useCallback(() => {
+    actionOwnerRef.current = null;
+    setActionOwner(null);
+  }, []);
   const surfingAvailable = qaSurfingAvailable();
+  // A "Get updates early" member leaves a preview for early updates, not production.
+  const earlyUpdatesMember = useEarlyUpdatesMember();
 
   const trimmedComment = comment.trim();
   const remainingDeclineChars = Math.max(0, DECLINE_COMMENT_MIN_LENGTH - trimmedComment.length);
@@ -97,93 +122,117 @@ export function QaVerdictSheet({ sheetRef }: QaVerdictSheetProps) {
   const canSubmit =
     runningPrNumber !== null && userId !== undefined && (verdict === 'approved' || remainingDeclineChars === 0);
 
-  // Set before dismissing, read after the dismissal has really settled.
-  const leaveAfterDismissRef = useRef(false);
+  const leavePreview = useCallback(
+    (withoutFeedback: boolean) => {
+      if (actionOwnerRef.current !== 'leaving') return;
+      if (!surfingAvailable) {
+        releaseAction();
+        return;
+      }
+      void returnToOwnTrack(earlyUpdatesMember)
+        .then((outcome) => {
+          // A native restart retains ownership until this runtime goes away.
+          if (outcome !== 'reloading') releaseAction();
+          if (withoutFeedback) track(QA_PREVIEW_LEFT_EVENT, { prNumber: runningPrNumber });
+          // nothing-to-load confirms production is the selected track. A refused
+          // exit rejects into the failure handler instead of reporting success.
+          if (outcome === 'nothing-to-load') showToast(t('qa.shared.backOnProduction'), 'info');
+          if (outcome === 'early-updates-next-launch') showToast(t('qa.shared.backOnEarlyUpdates'), 'info');
+        })
+        .catch((error: unknown) => {
+          releaseAction();
+          reportHandledError(error, { tags: { source: 'qa', op: 'surf-to-production' } });
+          track(QA_SURF_FAILED_EVENT, { prNumber: null, reason: surfFailureReason(error) });
+          // Only the surf back failed; on the submit path the verdict has already
+          // landed and been toasted, so saying "could not send that verdict" here
+          // would be a lie about which half broke. The thrown message itself goes
+          // to Sentry and to the event's `reason` rather than into the tester's face.
+          showToast(t('qa.shared.leaveFailed'), 'error');
+        });
+    },
+    [earlyUpdatesMember, releaseAction, runningPrNumber, showToast, surfingAvailable, t],
+  );
 
-  const leavePreview = useCallback(() => {
-    if (!surfingAvailable) return;
-    void surfToProduction()
-      .then((outcome) => {
-        // Production is not *newer* than a fresh pr-N bundle, so the running JS
-        // usually stays put until production publishes again. The branch pin is
-        // gone either way, which is the part that matters.
-        if (outcome === 'nothing-to-load') showToast(t('qa.shared.backOnProduction'), 'info');
-      })
-      .catch((error: unknown) => {
-        reportHandledError(error, { tags: { source: 'qa', op: 'surf-to-production' } });
-        track(QA_SURF_FAILED_EVENT, { prNumber: null, reason: surfFailureReason(error) });
-        // Only the surf back failed; on the submit path the verdict has already
-        // landed and been toasted, so saying "could not send that verdict" here
-        // would be a lie about which half broke. The thrown message itself goes
-        // to Sentry and to the event's `reason` rather than into the tester's face.
-        showToast(t('qa.shared.leaveFailed'), 'error');
-      });
-  }, [showToast, surfingAvailable, t]);
-
-  const handleFullyDismissed = useCallback(() => {
-    if (!leaveAfterDismissRef.current) return;
-    leaveAfterDismissRef.current = false;
-    leavePreview();
-  }, [leavePreview]);
+  const dismissBeforeLeaving = useCallback(
+    async (withoutFeedback: boolean) => {
+      // The tester may have closed the sheet while upload/submission was pending.
+      // The managed wait also resolves when it is already gone; a second native
+      // onFullyDismissed callback would never arrive in that case.
+      const dismissal = await dismissManagedSheetAndWait(sheetRef.current);
+      if (dismissal.status !== 'dismissed') {
+        releaseAction();
+        return;
+      }
+      leavePreview(withoutFeedback);
+    },
+    [leavePreview, releaseAction, sheetRef],
+  );
 
   const handleSubmit = async () => {
-    if (!canSubmit || isPending || isUploading || runningPrNumber === null || userId === undefined) return;
+    if (!canSubmit || runningPrNumber === null || userId === undefined || !claimAction('submitting')) return;
     const branch = prBranchName(runningPrNumber);
 
-    // Uploaded before the verdict so the mutation carries keys the backend can
-    // resolve. A failed upload keeps the typed comment and the picked shots on
-    // screen — the tester retries rather than retypes.
-    let screenshotKeys: string[] = [];
-    if (screenshotUris.length > 0) {
-      setIsUploading(true);
-      try {
-        screenshotKeys = await uploadFeedbackScreenshots(screenshotUris);
-      } catch (error) {
-        reportHandledError(error, { tags: { source: 'qa', op: 'upload-screenshots' } });
-        showToast(t('screenshots.uploadFailed'), 'error');
-        return;
-      } finally {
-        setIsUploading(false);
-      }
-    }
-
     try {
-      await mutateAsync({
-        prNumber: runningPrNumber,
-        branch,
-        verdict,
-        comment: trimmedComment.length > 0 ? trimmedComment : null,
-        // null, not [], for "none" — the same shape FeedbackSheet sends down the
-        // same path, and the same shape the column stores.
-        screenshotKeys: screenshotKeys.length > 0 ? screenshotKeys : null,
-      });
-      // Written before the dismissal so a relaunch that beats the surf still
-      // knows this bundle is signed off — leaving usually can't reload the app,
-      // so the marker is what stops the gate re-prompting.
-      setSetting('qaVerdictSubmittedKey', qaSessionKey(userId, branch, Updates.updateId));
-      track(QA_VERDICT_SUBMITTED_EVENT, { prNumber: runningPrNumber, verdict, risk: preview?.risk ?? null });
-      showToast(t('qa.verdict.verdictSentToast', { prNumber: runningPrNumber }), 'success');
-      leaveAfterDismissRef.current = true;
-      sheetRef.current?.dismiss();
-      // The sheet lives at the provider root for the whole app session, so it is
-      // never remounted — clearing here is what stops the next verdict opening
-      // pre-filled with the last one.
-      setVerdict('approved');
-      setComment('');
-      setScreenshotUris([]);
-      // The verdict is filed, so the uploaded objects now belong to it. The next
-      // one must upload its own rather than reuse these.
-      clearScreenshotUploadCache();
-    } catch (error) {
-      reportHandledError(error, { tags: { source: 'qa', op: 'submit-verdict' } });
-      showToast(t('qa.verdict.submitError'), 'error');
+      // Uploaded before the verdict so the mutation carries keys the backend can
+      // resolve. A failed upload keeps the typed comment and the picked shots on
+      // screen — the tester retries rather than retypes.
+      let screenshotKeys: string[] = [];
+      if (screenshotUris.length > 0) {
+        setIsUploading(true);
+        try {
+          screenshotKeys = await uploadFeedbackScreenshots(screenshotUris);
+        } catch (error) {
+          reportHandledError(error, { tags: { source: 'qa', op: 'upload-screenshots' } });
+          showToast(t('screenshots.uploadFailed'), 'error');
+          return;
+        } finally {
+          setIsUploading(false);
+        }
+      }
+
+      try {
+        await mutateAsync({
+          prNumber: runningPrNumber,
+          branch,
+          verdict,
+          comment: trimmedComment.length > 0 ? trimmedComment : null,
+          // null, not [], for "none" — the same shape FeedbackSheet sends down the
+          // same path, and the same shape the column stores.
+          screenshotKeys: screenshotKeys.length > 0 ? screenshotKeys : null,
+        });
+        // Written before the dismissal so a relaunch that beats the surf still
+        // knows this bundle is signed off — leaving usually can't reload the app,
+        // so the marker is what stops the gate re-prompting.
+        setSetting('qaVerdictSubmittedKey', qaSessionKey(userId, branch, Updates.updateId));
+        track(QA_VERDICT_SUBMITTED_EVENT, { prNumber: runningPrNumber, verdict, risk: preview?.risk ?? null });
+        showToast(t('qa.verdict.verdictSentToast', { prNumber: runningPrNumber }), 'success');
+        // Transfer ownership without a gap between submitting and dismissal.
+        actionOwnerRef.current = 'leaving';
+        setActionOwner('leaving');
+        void dismissBeforeLeaving(false);
+        // The sheet lives at the provider root for the whole app session, so it is
+        // never remounted — clearing here is what stops the next verdict opening
+        // pre-filled with the last one.
+        setVerdict('approved');
+        setComment('');
+        setScreenshotUris([]);
+        // The verdict is filed, so the uploaded objects now belong to it. The next
+        // one must upload its own rather than reuse these.
+        clearScreenshotUploadCache();
+      } catch (error) {
+        releaseAction();
+        reportHandledError(error, { tags: { source: 'qa', op: 'submit-verdict' } });
+        showToast(t('qa.verdict.submitError'), 'error');
+      }
+    } finally {
+      if (actionOwnerRef.current === 'submitting') releaseAction();
     }
   };
 
   const handleLeaveWithoutFeedback = () => {
-    track(QA_PREVIEW_LEFT_EVENT, { prNumber: runningPrNumber });
-    leaveAfterDismissRef.current = true;
-    sheetRef.current?.dismiss();
+    if (!surfingAvailable || !claimAction('leaving')) return;
+    // Ownership begins before the dismissal request, not when it settles.
+    void dismissBeforeLeaving(true);
   };
 
   const title =
@@ -194,26 +243,25 @@ export function QaVerdictSheet({ sheetRef }: QaVerdictSheetProps) {
       ref={sheetRef}
       snapPoints={SNAP_POINTS}
       scrollable
-      surface="solid"
+      androidContentSized
       contentContainerStyle={styles.content}
-      onFullyDismissed={handleFullyDismissed}
+      header={
+        <SheetTopBar
+          title={title}
+          leading={{ kind: 'close', onPress: () => sheetRef.current?.dismiss() }}
+          trailing={{
+            kind: 'confirm',
+            label: t('qa.verdict.submitLabel'),
+            onPress: () => {
+              void handleSubmit();
+            },
+            disabled: !canSubmit || isPending || isUploading || actionOwner !== null,
+            loading: isPending || isUploading || actionOwner === 'submitting',
+            prominent: true,
+          }}
+        />
+      }
     >
-      <View style={styles.headerRow}>
-        <Text variant="title3" numberOfLines={2} style={styles.title}>
-          {title}
-        </Text>
-        <PressableSurface
-          onPress={() => sheetRef.current?.dismiss()}
-          feedback="opacity"
-          hitSlop={8}
-          accessibilityRole="button"
-          accessibilityLabel={t('actions.close')}
-          style={styles.closeButton}
-        >
-          <Icon name="close" size={20} color={systemColors.secondaryLabel} />
-        </PressableSurface>
-      </View>
-
       {runningPrNumber === null ? (
         <Text variant="subheadline" color={systemColors.secondaryLabel}>
           {t('qa.verdict.notOnPreview')}
@@ -261,65 +309,36 @@ export function QaVerdictSheet({ sheetRef }: QaVerdictSheetProps) {
       ) : null}
 
       <Button
-        title={t('qa.verdict.submitLabel')}
-        onPress={() => {
-          void handleSubmit();
-        }}
-        variant="filled"
-        size="large"
-        disabled={!canSubmit || isUploading}
-        loading={isPending || isUploading}
-        style={styles.submitButton}
-      />
-
-      <Button
         title={t('qa.verdict.leaveLabel')}
         onPress={handleLeaveWithoutFeedback}
         variant="text"
-        size="large"
-        disabled={!surfingAvailable}
+        disabled={!surfingAvailable || isPending || isUploading || actionOwner !== null}
+        loading={actionOwner === 'leaving'}
       />
     </ModalSheet>
   );
 }
 
-const SNAP_POINTS = ['64%', '90%'];
+const SNAP_POINTS = MEDIUM_LARGE_SNAP_POINTS;
 
-const styles = StyleSheet.create({
-  content: {
-    paddingHorizontal: spacing[4],
-    paddingBottom: spacing[6],
-    gap: spacing[4],
-  },
-  headerRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: spacing[3],
-  },
-  title: {
-    flex: 1,
-    fontWeight: '700',
-  },
-  closeButton: {
-    width: 36,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  input: {
-    minHeight: 116,
-    maxHeight: 220,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: borderRadius.lg,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    fontSize: 16,
-  },
-  helperText: {
-    marginTop: -spacing[2],
-  },
-  submitButton: {
-    marginTop: spacing[1],
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    content: {
+      paddingHorizontal: spacing[4],
+      paddingTop: spacing[4],
+      paddingBottom: spacing[6],
+      gap: spacing[4],
+    },
+    input: {
+      minHeight: 116,
+      maxHeight: 220,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: borderRadius.lg,
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      fontSize: textStyles.callout.fontSize,
+    },
+    helperText: {
+      marginTop: -spacing[2],
+    },
+  });

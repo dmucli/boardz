@@ -1,3 +1,4 @@
+import { useTypographyStyles, type TypographyScale } from '../hooks/use-typography-styles';
 // MoreForm — web implementation (react-native-web + react-native-paper). The main
 // "More" settings screen, rendered from the same plain `MoreFormModel` the native
 // files consume. Structurally follows MoreForm.android.tsx: each section is an
@@ -10,52 +11,89 @@
 // exact card insets) is a Phase-1 item. The row-kind exhaustiveness guard and the
 // select-label lookup live in MoreForm.logic.ts, shared with both native files.
 
-import { useState, type ReactNode } from 'react';
-import { ScrollView, StyleSheet, View } from 'react-native';
-import { Divider, List, Menu, Surface, Switch, Text } from 'react-native-paper';
+import { useId, useState, type ReactNode } from 'react';
+import { Text as RNText, ScrollView, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, Divider, List, Menu, Surface, Switch, Text } from 'react-native-paper';
 import { useTheme } from '../providers/theme-provider';
 import { spacing } from '../theme/tokens';
 import { Button } from './Button';
 import { SegmentedControl } from './SegmentedControl';
 import { MarkerMultiplierSlider } from './settings/MarkerMultiplierSlider';
-import { assertNeverRow, selectedOptionLabel } from './MoreForm.logic';
-import type { MoreFormProps, MoreIconName, MoreRow, MoreSelectRow } from './MoreForm.types';
+import {
+  assertNeverRow,
+  disabledOptionKeys,
+  guardedButtonPress,
+  selectedOptionLabel,
+  toggleRowSubtitle,
+  useOpensOutsideAppHint,
+} from './MoreForm.logic';
+import type { MoreFormProps, MoreIconName, MoreRow, MoreSelectRow, MoreToggleRow } from './MoreForm.types';
 
 // Semantic leading-icon name → MaterialCommunityIcons glyph (Paper routes `icon`
 // through the app's MDI font). Minimal-functional: each glyph reads sensibly for
 // its row; exact parity with the bundled Android vector set is a Phase-1 item.
 const MORE_ICON: Record<MoreIconName, string> = {
-  notifications: 'bell-outline',
-  playlists: 'playlist-music',
-  gyms: 'office-building',
-  integrations: 'puzzle-outline',
-  watch: 'link-variant',
+  integrations: 'link-variant',
   boardLook: 'tune',
   accessibility: 'human',
   storage: 'database-outline',
   translate: 'translate',
-  replay: 'replay',
-  changelog: 'star-four-points',
   devServers: 'server',
   otaChannel: 'cloud-download-outline',
   featureFlags: 'flag-outline',
   branchSwitcher: 'source-branch',
   editProfile: 'account-edit-outline',
-  moderation: 'gavel',
+  privacy: 'lock-outline',
+  account: 'account-circle-outline',
+  general: 'cog-outline',
+  climbs: 'format-list-bulleted',
+  home: 'home-outline',
+  timers: 'timer-outline',
+  earlyAccess: 'flask-outline',
+  developer: 'wrench-outline',
+  export: 'export-variant',
+  policy: 'file-document-outline',
 };
 
+/**
+ * A row's own name for assistive tech (`accessibilityLabel`) replaces the name
+ * the browser builds from the row's text, and with it the line under the label
+ * and the value. So the value rides the name, as the native renderers say it,
+ * and the line under the label is the row's description (`aria-describedby`).
+ * Without its own name, the row is named from its text as before.
+ */
+function useNamedRowText(accessibilityLabel: string | undefined, description: string | undefined) {
+  const descriptionId = useId();
+  if (!accessibilityLabel || !description) return { description, describedBy: undefined };
+  return {
+    // Nested inside Paper's description Text, so it keeps that line's style.
+    description: <RNText nativeID={descriptionId}>{description}</RNText>,
+    describedBy: descriptionId,
+  };
+}
+
 function SelectRow({ row }: { row: MoreSelectRow }) {
+  const styles = useTypographyStyles(createStyles);
   const [visible, setVisible] = useState(false);
   const { systemColors } = useTheme();
   const currentLabel = selectedOptionLabel(row.options, row.selectedKey);
+  const named = useNamedRowText(row.accessibilityLabel, row.subtitle);
   return (
     <Menu
-      visible={visible}
+      visible={visible && !row.disabled}
       onDismiss={() => setVisible(false)}
       anchor={
         <List.Item
           title={row.label}
-          onPress={() => setVisible(true)}
+          description={named.description}
+          accessibilityLabel={row.accessibilityLabel ? `${row.accessibilityLabel}, ${currentLabel}` : undefined}
+          aria-describedby={named.describedBy}
+          disabled={row.disabled}
+          style={row.disabled ? styles.disabledRow : undefined}
+          aria-disabled={row.disabled ?? false}
+          onPress={() => {
+            if (!row.disabled) setVisible(true);
+          }}
           right={() => (
             <Text style={[styles.selectValue, { color: systemColors.secondaryLabel as string }]}>{currentLabel}</Text>
           )}
@@ -68,7 +106,7 @@ function SelectRow({ row }: { row: MoreSelectRow }) {
           title={option.label}
           onPress={() => {
             setVisible(false);
-            row.onSelect(option.key);
+            if (!row.disabled) row.onSelect(option.key);
           }}
         />
       ))}
@@ -76,7 +114,33 @@ function SelectRow({ row }: { row: MoreSelectRow }) {
   );
 }
 
-function renderRow(row: MoreRow): ReactNode {
+function ToggleRow({ row }: { row: MoreToggleRow }) {
+  const styles = useTypographyStyles(createStyles);
+  // The reason replaces the description while greyed out (`toggleRowSubtitle`).
+  const named = useNamedRowText(row.accessibilityLabel, toggleRowSubtitle(row).text);
+  return (
+    <List.Item
+      title={row.label}
+      description={named.description}
+      accessibilityLabel={row.accessibilityLabel}
+      aria-describedby={named.describedBy}
+      disabled={row.disabled}
+      style={row.disabled ? styles.disabledToggle : undefined}
+      onPress={() => {
+        if (!row.disabled) row.onValueChange(!row.value);
+      }}
+      accessibilityRole="switch"
+      aria-checked={row.value}
+      aria-disabled={row.disabled ?? false}
+      right={() => <Switch value={row.value} disabled={row.disabled} pointerEvents="none" />}
+    />
+  );
+}
+
+function RenderRow({ row }: { row: MoreRow }): ReactNode {
+  const styles = useTypographyStyles(createStyles);
+  const { systemColors } = useTheme();
+  const opensOutsideAppHint = useOpensOutsideAppHint();
   switch (row.kind) {
     case 'nav':
       return (
@@ -85,27 +149,50 @@ function renderRow(row: MoreRow): ReactNode {
           title={row.label}
           description={row.subtitle}
           onPress={row.onPress}
+          accessibilityHint={row.external ? opensOutsideAppHint : undefined}
           left={row.icon ? (props) => <List.Icon {...props} icon={MORE_ICON[row.icon as MoreIconName]} /> : undefined}
           right={(props) => (
             <View style={styles.trailing}>
               {row.badge ? <Text style={styles.badge}>{row.badge}</Text> : null}
-              <List.Icon {...props} icon="chevron-right" />
+              {row.value ? (
+                <Text style={[styles.trailingValue, { color: systemColors.secondaryLabel as string }]}>
+                  {row.value}
+                </Text>
+              ) : null}
+              <List.Icon {...props} icon={row.external ? 'open-in-new' : 'chevron-right'} />
             </View>
           )}
         />
       );
-    case 'toggle':
+    case 'value': {
+      const valueBelow = row.valuePlacement === 'below';
       return (
         <List.Item
           key={row.key}
           title={row.label}
-          description={row.subtitle}
-          onPress={() => row.onValueChange(!row.value)}
-          accessibilityRole="switch"
-          accessibilityState={{ checked: row.value }}
-          right={() => <Switch value={row.value} pointerEvents="none" />}
+          // Below, the value leads the description, on its own line.
+          description={valueBelow ? [row.value, row.subtitle].filter(Boolean).join('\n') : row.subtitle}
+          // A value row's subtitle can be several facts (a stored board's size,
+          // config and last sync), so don't clip it at Paper's default 2 lines.
+          descriptionNumberOfLines={4}
+          onPress={row.onPress}
+          accessibilityHint={row.accessibilityHint}
+          aria-busy={row.busy ?? false}
+          right={() => (
+            <View style={styles.trailing}>
+              {row.busy ? <ActivityIndicator size="small" /> : null}
+              {!valueBelow && row.value ? (
+                <Text style={[styles.trailingValue, { color: systemColors.secondaryLabel as string }]}>
+                  {row.value}
+                </Text>
+              ) : null}
+            </View>
+          )}
         />
       );
+    }
+    case 'toggle':
+      return <ToggleRow key={row.key} row={row} />;
     case 'segmented':
       return (
         <View key={row.key} style={styles.segmentedRow}>
@@ -113,7 +200,7 @@ function renderRow(row: MoreRow): ReactNode {
             options={row.options.map((option) => ({ key: option.key, label: option.label }))}
             selectedKey={row.selectedKey}
             onSelect={row.onSelect}
-            disabledKeys={row.disabledKeys}
+            disabledKeys={disabledOptionKeys(row.options, row.disabled, row.disabledKeys)}
             accessibilityLabel={row.label}
           />
         </View>
@@ -134,20 +221,22 @@ function renderRow(row: MoreRow): ReactNode {
           ) : null}
         </View>
       );
-    case 'button': {
-      const isSubtleDestructive = row.role === 'destructive' && row.emphasis === 'subtle';
+    case 'button':
+      // `subtle` is always a text button, whatever the role: red for Delete
+      // Account, the brand colour for a board-look Reset.
       return (
         <View key={row.key} style={styles.buttonRow}>
           <Button
             title={row.label}
-            onPress={row.onPress}
-            variant={isSubtleDestructive ? 'text' : 'filled'}
+            onPress={guardedButtonPress(row)}
+            variant={row.emphasis === 'subtle' ? 'text' : 'filled'}
             role={row.role === 'destructive' ? 'destructive' : 'default'}
+            disabled={row.disabled ?? false}
+            loading={row.loading ?? false}
             style={styles.fullWidth}
           />
         </View>
       );
-    }
     case 'slider':
       return (
         <View key={row.key} style={styles.sliderRow}>
@@ -178,12 +267,14 @@ function renderRow(row: MoreRow): ReactNode {
 }
 
 export function MoreForm({ model }: MoreFormProps) {
+  const styles = useTypographyStyles(createStyles);
   const { systemColors } = useTheme();
 
   return (
     <ScrollView style={styles.scroll} contentContainerStyle={styles.content} contentInsetAdjustmentBehavior="automatic">
       {model.sections.map((section) => {
         const allButtons = section.rows.every((row) => row.kind === 'button');
+        const fullBleed = section.rows.some((row) => row.kind === 'custom' && row.fullBleed);
         return (
           <View key={section.key} style={styles.section}>
             {section.title ? (
@@ -191,14 +282,20 @@ export function MoreForm({ model }: MoreFormProps) {
                 {section.title}
               </Text>
             ) : null}
-            {allButtons ? (
-              section.rows.map((row) => renderRow(row))
+            {fullBleed ? (
+              <View style={styles.fullBleed}>
+                {section.rows.map((row) => (
+                  <RenderRow key={row.key} row={row} />
+                ))}
+              </View>
+            ) : allButtons ? (
+              section.rows.map((row) => <RenderRow key={row.key} row={row} />)
             ) : (
               <Surface style={styles.card} elevation={1}>
                 {section.rows.map((row, index) => (
                   <View key={row.key}>
                     {index > 0 ? <Divider /> : null}
-                    {renderRow(row)}
+                    {<RenderRow key={row.key} row={row} />}
                   </View>
                 ))}
               </Surface>
@@ -215,75 +312,85 @@ export function MoreForm({ model }: MoreFormProps) {
   );
 }
 
-const styles = StyleSheet.create({
-  scroll: {
-    flex: 1,
-  },
-  content: {
-    padding: spacing[4],
-    paddingBottom: spacing[10],
-    gap: spacing[3],
-  },
-  section: {
-    gap: spacing[2],
-  },
-  sectionTitle: {
-    fontSize: 13,
-    fontWeight: '600',
-    opacity: 0.7,
-  },
-  sectionFooter: {
-    fontSize: 12,
-    opacity: 0.6,
-  },
-  card: {
-    borderRadius: 12,
-    overflow: 'hidden',
-  },
-  trailing: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-  },
-  badge: {
-    fontSize: 12,
-    fontWeight: '600',
-  },
-  selectValue: {
-    alignSelf: 'center',
-    fontSize: 15,
-  },
-  segmentedRow: {
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[3],
-  },
-  sliderRow: {
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[2],
-  },
-  customRow: {
-    paddingHorizontal: spacing[4],
-  },
-  infoRow: {
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[3],
-    gap: spacing[1],
-  },
-  infoLabel: {
-    fontSize: 12,
-    opacity: 0.6,
-  },
-  infoBody: {
-    fontSize: 14,
-  },
-  infoDetail: {
-    fontSize: 11,
-    opacity: 0.6,
-  },
-  buttonRow: {
-    paddingVertical: spacing[1],
-  },
-  fullWidth: {
-    alignSelf: 'stretch',
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    disabledToggle: { opacity: 0.4 },
+    disabledRow: { opacity: 0.4 },
+    scroll: {
+      flex: 1,
+    },
+    content: {
+      padding: spacing[4],
+      paddingBottom: spacing[10],
+      gap: spacing[3],
+    },
+    section: {
+      gap: spacing[2],
+    },
+    sectionTitle: {
+      fontSize: textStyles.footnote.fontSize,
+      fontWeight: '600',
+      opacity: 0.7,
+    },
+    sectionFooter: {
+      fontSize: textStyles.caption1.fontSize,
+      opacity: 0.6,
+    },
+    card: {
+      borderRadius: 12,
+      overflow: 'hidden',
+    },
+    fullBleed: {
+      marginHorizontal: -spacing[4],
+    },
+    trailing: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing[2],
+    },
+    badge: {
+      fontSize: textStyles.caption1.fontSize,
+      fontWeight: '600',
+    },
+    trailingValue: {
+      alignSelf: 'center',
+      fontSize: textStyles.subheadline.fontSize,
+    },
+    selectValue: {
+      alignSelf: 'center',
+      fontSize: textStyles.subheadline.fontSize,
+    },
+    segmentedRow: {
+      paddingHorizontal: spacing[4],
+      paddingVertical: spacing[3],
+    },
+    sliderRow: {
+      paddingHorizontal: spacing[4],
+      paddingVertical: spacing[2],
+    },
+    customRow: {
+      paddingHorizontal: spacing[4],
+    },
+    infoRow: {
+      paddingHorizontal: spacing[4],
+      paddingVertical: spacing[3],
+      gap: spacing[1],
+    },
+    infoLabel: {
+      fontSize: textStyles.caption1.fontSize,
+      opacity: 0.6,
+    },
+    infoBody: {
+      fontSize: textStyles.subheadline.fontSize,
+    },
+    infoDetail: {
+      fontSize: textStyles.caption2.fontSize,
+      opacity: 0.6,
+    },
+    buttonRow: {
+      paddingVertical: spacing[1],
+    },
+    fullWidth: {
+      alignSelf: 'stretch',
+    },
+  });

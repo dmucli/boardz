@@ -1,6 +1,7 @@
 import { useCallback, useEffect, type ReactNode } from 'react';
 import { StyleSheet, View } from 'react-native';
-import { router, useLocalSearchParams } from 'expo-router';
+import { useLocalSearchParams } from 'expo-router';
+import { scopedRouter as router } from '../src/lib/routing/scoped-navigation';
 import { useTheme as usePaperTheme } from 'react-native-paper';
 import { OnboardingPrompt } from '../src/components/onboarding/OnboardingPrompt';
 import { OnboardingBoardRoute } from '../src/components/onboarding/OnboardingBoardRoute';
@@ -10,6 +11,7 @@ import { useTheme } from '../src/providers/theme-provider';
 import { useVariantValue } from '../src/theme/variants';
 import { useBoardPreviewClimb } from '../src/hooks/use-board-preview-climb';
 import { useEffectiveBoardRenderSettings } from '../src/hooks/use-native-climb-render';
+import { holdUntilLaunchReady } from '../src/components/launch-update/hold-until-launch-ready';
 
 /**
  * The onboarding route, which hosts the walkthrough (issue #4961). Since #5654
@@ -36,29 +38,27 @@ import { useEffectiveBoardRenderSettings } from '../src/hooks/use-native-climb-r
  * Presented as a `transparentModal` over the live tabs (see app/_layout.tsx),
  * with the swipe-to-dismiss gesture disabled. The mandatory steps swallow Android
  * hardware back; optional linking treats Back as a decline. Transparent so UIKit
- * never snapshots the iOS 26 tab bar (hard rule 2 in docs/mobile-sheets-vs-routes.md),
+ * never snapshots the iOS 26 tab bar (hard rule 2 in docs/mobile/mobile-sheets-vs-routes.md),
  * which is why one `OnboardingBacking` paints an opaque page under every step: the
  * live tabs must not show through.
  * The steps are variant-agnostic — this route resolves the palette from the
  * active UI variant (Liquid Glass / HIG vs Material 3) and injects it.
  */
-export default function OnboardingScreen() {
+function OnboardingScreen() {
   const { step } = useLocalSearchParams<{ step?: string }>();
   const { systemColors } = useTheme();
   const paperTheme = usePaperTheme();
 
   // Material reads MD3 roles from the Paper theme; HIG / Liquid Glass reads the
   // iOS-style system colours. Background stays opaque under the reading text in
-  // both (no glass behind the copy — only the floating footer is glass).
-  const { accentColor, iconColor, bodyColor, backgroundColor } = useVariantValue({
+  // both: no glass behind the copy.
+  const { iconColor, bodyColor, backgroundColor } = useVariantValue({
     material: {
-      accentColor: paperTheme.colors.primary,
       iconColor: paperTheme.colors.primary,
       bodyColor: paperTheme.colors.onSurfaceVariant,
       backgroundColor: paperTheme.colors.background,
     },
     liquidGlass: {
-      accentColor: systemColors.accent as string,
       iconColor: systemColors.accent as string,
       bodyColor: systemColors.secondaryLabel as string,
       backgroundColor: systemColors.background as string,
@@ -78,24 +78,14 @@ export default function OnboardingScreen() {
   // and let the live Climbs tabs show through whatever it leaves unpainted.
   let stepContent: ReactNode;
   if (step === 'board-look') {
-    stepContent = <BoardLookRoute accentColor={accentColor} bodyColor={bodyColor} backgroundColor={backgroundColor} />;
+    stepContent = <BoardLookRoute bodyColor={bodyColor} backgroundColor={backgroundColor} />;
   } else if (step === 'link') {
-    stepContent = (
-      <OnboardingLinkRoute
-        accentColor={accentColor}
-        iconColor={iconColor}
-        bodyColor={bodyColor}
-        backgroundColor={backgroundColor}
-      />
-    );
+    stepContent = <OnboardingLinkRoute iconColor={iconColor} bodyColor={bodyColor} backgroundColor={backgroundColor} />;
   } else if (step === 'board') {
-    stepContent = (
-      <OnboardingBoardRoute accentColor={accentColor} bodyColor={bodyColor} backgroundColor={backgroundColor} />
-    );
+    stepContent = <OnboardingBoardRoute bodyColor={bodyColor} backgroundColor={backgroundColor} />;
   } else {
     stepContent = (
       <OnboardingPrompt
-        accentColor={accentColor}
         iconColor={iconColor}
         bodyColor={bodyColor}
         backgroundColor={backgroundColor}
@@ -110,7 +100,7 @@ export default function OnboardingScreen() {
 /**
  * The opaque page under every step. The route is a `transparentModal`, so the
  * live tabs screen sits right behind it; a step that leaves any part of the
- * screen unpainted (a glass footer, a frame before its data lands) would
+ * screen unpainted (a frame before its data lands) would
  * otherwise show the Climbs list through it. Same job as the player's backstop
  * in app/play.tsx.
  */
@@ -125,15 +115,7 @@ function OnboardingBacking({ backgroundColor, children }: { backgroundColor: str
  * renderer capability probe) are only mounted when this step is the one being
  * shown — the first-run framing screen must not pay for them.
  */
-function BoardLookRoute({
-  accentColor,
-  bodyColor,
-  backgroundColor,
-}: {
-  accentColor: string;
-  bodyColor: string;
-  backgroundColor: string;
-}) {
+function BoardLookRoute({ bodyColor, backgroundColor }: { bodyColor: string; backgroundColor: string }) {
   const { status, preview } = useBoardPreviewClimb();
   const { boardseshRendererAvailable } = useEffectiveBoardRenderSettings();
 
@@ -170,7 +152,6 @@ function BoardLookRoute({
 
   return (
     <BoardLookStep
-      accentColor={accentColor}
       bodyColor={bodyColor}
       backgroundColor={backgroundColor}
       preview={preview}
@@ -186,3 +167,8 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 });
+
+// iOS presents this route as a native modal, above the launch update
+// placeholder, and a URL can open it on a cold start. Held until launch is
+// ready so a gate reload cannot land mid-tap (#6006).
+export default holdUntilLaunchReady(OnboardingScreen);

@@ -10,6 +10,10 @@ describe('gymIsIndexableVenue', () => {
     expect(gymIsIndexableVenue(candidate())).toBe(true);
   });
 
+  it('rejects an unlisted public gym even with a pin', () => {
+    expect(gymIsIndexableVenue(candidate({ isListed: false }))).toBe(false);
+  });
+
   it('rejects a public gym with no pin', () => {
     expect(gymIsIndexableVenue(candidate({ latitude: null, longitude: null }))).toBe(false);
   });
@@ -32,6 +36,12 @@ describe('gymIsIndexableVenue', () => {
   // A Null Island row is a broken geocode on a real venue, not a home wall.
   it('treats zero as a coordinate, not as absent', () => {
     expect(gymIsIndexableVenue(candidate({ latitude: 0, longitude: 0 }))).toBe(true);
+  });
+
+  it('rejects out-of-range coordinates', () => {
+    expect(gymIsIndexableVenue(candidate({ latitude: 91 }))).toBe(false);
+    expect(gymIsIndexableVenue(candidate({ longitude: -181 }))).toBe(false);
+    expect(gymIsIndexableVenue(candidate({ latitude: -90, longitude: 180 }))).toBe(true);
   });
 
   it('rejects a non-finite coordinate', () => {

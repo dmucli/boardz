@@ -26,7 +26,7 @@ vi.mock('@/app/lib/analytics', () => ({
   trackBeforeNavigation: mocks.trackBeforeNavigation,
 }));
 
-const ClimbHandoffCta = (await import('../climb-handoff-cta')).default;
+const { ClimbHandoffLink } = await import('../climb-handoff-cta');
 
 const PATHNAME = '/kilter/original/12x12-square/screw_bolt/40/view/CLIMB1';
 const EXPECTED_HREF = `${APP_URL}${PATHNAME}`;
@@ -47,20 +47,27 @@ afterEach(() => {
   Object.defineProperty(window, 'location', { value: originalLocation, writable: true, configurable: true });
 });
 
+const HANDOFF_PROPS = {
+  pathname: PATHNAME,
+  ariaLabel: 'Climb this',
+  surface: 'climb_front_door',
+  tree: 'config-tuple',
+  boardName: 'kilter',
+  layoutId: 1,
+  angle: 40,
+  climbUuid: 'CLIMB1',
+  locale: 'en-US',
+} as const;
+
+/**
+ * The bare link the climb page and the board list dress as a text link on a
+ * phone and a filled button on a laptop (`FrontDoorHeroCta`).
+ */
 function renderCta() {
   return render(
-    <ClimbHandoffCta
-      pathname={PATHNAME}
-      label="Climb this"
-      ariaLabel="Climb this"
-      surface="climb_front_door"
-      tree="config-tuple"
-      boardName="kilter"
-      layoutId={1}
-      angle={40}
-      climbUuid="CLIMB1"
-      locale="en-US"
-    />,
+    <ClimbHandoffLink {...HANDOFF_PROPS} ctaName="handoff">
+      <span>Or open it in your browser</span>
+    </ClimbHandoffLink>,
   );
 }
 
@@ -68,7 +75,7 @@ function cta() {
   return screen.getByRole('link', { name: 'Climb this' });
 }
 
-describe('ClimbHandoffCta', () => {
+describe('ClimbHandoffLink delivery', () => {
   it('is a real anchor at the app origin, so it works with JS off and to a crawler', () => {
     renderCta();
 
@@ -136,5 +143,20 @@ describe('ClimbHandoffCta', () => {
       'Climb Handoff Clicked',
       expect.objectContaining({ campaign: 'front_door' }),
     );
+  });
+});
+
+describe('ClimbHandoffLink', () => {
+  it('names itself for the page and leaves its look to the caller', () => {
+    render(
+      <ClimbHandoffLink {...HANDOFF_PROPS} ctaName="handoff">
+        <span>Open in your browser</span>
+      </ClimbHandoffLink>,
+    );
+
+    const link = screen.getByRole('link', { name: 'Climb this' });
+    expect(link.getAttribute('data-cta')).toBe('handoff');
+    expect(link.className).toContain('MuiButton-text');
+    expect(link.className).not.toContain('MuiButton-contained');
   });
 });

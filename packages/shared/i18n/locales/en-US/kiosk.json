@@ -75,6 +75,12 @@
   "gymPage": {
     "metaTitle": "{{gymName}} climbing gym",
     "metaDescription": "See the boards and live wall at {{gymName}} on Boardsesh.",
+    "metaTitleName": "{{gymName}}",
+    "metaTitleLocation": "{{gymName}}, {{location}}",
+    "metaTitleBoards": "{{venue}}: {{boards}}",
+    "metaBoardAngle": "{{board}} at {{angle}}°",
+    "metaDescriptionBoards": "{{venue}} has {{boards}}. See what is lit on the wall and open the climbs in Boardsesh.",
+    "metaDescriptionLocation": "{{gymName}} ({{location}}). See the boards and live wall on Boardsesh.",
     "breadcrumbHome": "Boardsesh",
     "breadcrumbGyms": "Gyms",
     "manageGym": "Manage gym",
@@ -87,14 +93,13 @@
     "visitWebsite": "Visit website",
     "install": {
       "heading": "Get the app for this wall",
-      "body": "Light up the boards at {{gymName}} from your phone and log every send.",
-      "googlePlay": "Get it on Google Play",
-      "appStore": "Download on the App Store"
+      "body": "Light up the boards at {{gymName}} from your phone and log every send."
     },
     "noBoardsYet": "No boards listed here yet.",
     "explorePlaylists": "See what people are building",
-    "claimTitle": "Is this your gym?",
-    "claimBody": "Claim it to run the boards, the branding, and what shows up on the wall.",
+    "startDiscussion": "Start the discussion",
+    "claimTitle": "Run this gym?",
+    "claimBody": "Claim it to fix boards, add your hours and put the wall on a TV. It's free.",
     "claimCta": "Claim this gym",
     "claimCtaSignedOut": "Log in and claim it",
     "claimPendingTitle": "Your claim is under review",
@@ -137,12 +142,52 @@
       "printAction": "Print this poster",
       "backToGym": "Back to the gym page"
     },
-    "sprayWallsHeading": "Spray walls",
-    "sprayWallCount_one": "{{count}} wall",
-    "sprayWallCount_other": "{{count}} walls",
-    "sprayWallsIntro": "This gym's spray walls, hold for hold. Open one to see what's been set on it.",
+    "sprayWallsHeading": "Spraywalls",
+    "sprayWallCount_one": "{{count}} Spraywall",
+    "sprayWallCount_other": "{{count}} Spraywalls",
+    "sprayWallsIntro": "This gym's Spraywalls, hold for hold. Open one to see what's been set on it.",
     "sprayWallPhotoAlt": "Photo of {{wallName}}",
-    "sprayWallMeta": "{{angle}}° · {{holds}} holds"
+    "sprayWallMeta": "{{angle}}° · {{holds}} holds",
+    "ogTitle": "{{gymName}} · {{boards}}",
+    "ogDescriptionOneType": "{{board}} board at {{gymName}}. See what's set on it and log your sends.",
+    "ogDescriptionManyTypes": "{{boards}} boards at {{gymName}}. See what's set on them and log your sends.",
+    "ogDescriptionNoBoards": "No boards listed here yet. Climb here? Claim the gym and add them.",
+    "openMaps": "Open {{gymName}} in maps",
+    "mapsLocation": "Open map",
+    "boardAngle": "{{configuration}} · {{angle}}°",
+    "seeClimbs": "See the climbs",
+    "popularClimbHeading": "Most logged climb at this wall",
+    "popularClimbBody": "From public sends and flashes logged here. Repeat sends count."
+  },
+  "boardPoster": {
+    "metaTitle": "QR poster for {{boardName}}",
+    "fallbackTitle": "QR poster",
+    "metaDescription": "A print-ready QR code. Climbers scan it to see the climbs here and log their sends.",
+    "scanStep": "Scan the code with your camera",
+    "openSource": "Boardsesh is free and open source.",
+    "printedOn": "Printed {{monthYear}}",
+    "layoutLabel": "Poster layout",
+    "layouts": {
+      "photo": "Photo poster",
+      "plain": "Plain poster",
+      "cards": "Cards"
+    },
+    "unlistedNotice": "Anyone who scans this can open the Spraywall.",
+    "spray": {
+      "headline": "This Spraywall is on Boardsesh",
+      "pickStep": "Pick a climb on the photo",
+      "logStep": "Log your send or set your own",
+      "justInstalled": "Just installed? Scan again to open this Spraywall.",
+      "backAction": "Back to the Spraywall"
+    },
+    "led": {
+      "headline": "This board is on Boardsesh",
+      "pickStep": "Pick a climb and light it up",
+      "logStep": "Topped it? Log your send",
+      "justInstalled": "Just installed? Scan again to open this board.",
+      "compatibility": "Works with {{boardBrand}}.",
+      "backAction": "Back to the board"
+    }
   },
   "manage": {
     "welcome": {
@@ -161,8 +206,8 @@
           "body": "Add your logo and colors"
         },
         "boards": {
-          "title": "Link your boards",
-          "body": "Connect the walls in your gym"
+          "title": "Check your boards",
+          "body": "Fix or remove any that aren't on your walls"
         },
         "members": {
           "title": "Invite your crew",
@@ -172,7 +217,6 @@
     },
     "title": "Manage {{gymName}}",
     "backToGym": "Back to gym page",
-    "accessDenied": "You don't have permission to manage this gym.",
     "tabs": {
       "kiosks": "Kiosks",
       "branding": "Branding",
@@ -182,27 +226,6 @@
       "overview": "Overview",
       "profile": "Profile",
       "comments": "Comments"
-    },
-    "insights": {
-      "subtitle": "How your boards did this week compared with last.",
-      "uniqueClimbers": "Climbers",
-      "ascents": "Sends",
-      "busiestDay": "Busiest day",
-      "byDay": "Sends by day",
-      "byDayAria": "Sends per day of the week",
-      "topClimbs": "What everyone's projecting",
-      "noTopClimbs": "No sends logged yet this week.",
-      "unnamedClimb": "Unnamed climb",
-      "ascentsCount_one": "{{count}} send",
-      "ascentsCount_other": "{{count}} sends",
-      "deltaUp": "+{{count}} vs last week",
-      "deltaDown": "−{{count}} vs last week",
-      "deltaFlat": "Same as last week",
-      "loadError": "Couldn't load this week's numbers.",
-      "empty": {
-        "title": "No sends this week",
-        "body": "Time to reset the wall? As soon as climbers log a send here, you'll see who showed up and what they're projecting."
-      }
     },
     "navGuard": {
       "title": "Discard unsaved changes?",
@@ -271,26 +294,21 @@
     },
     "boards": {
       "heading": "Boards at this gym",
-      "description": "Link the boards you own so they show up on your gym page and kiosks.",
+      "description": "Climbers and public board data put these boards here. Fix any that are wrong, and remove the ones that aren't on your walls.",
       "addBoard": "Add a board",
       "empty": "No boards linked yet. Add one to get started.",
       "loadError": "Couldn't load this gym's boards.",
-      "unlink": "Unlink",
-      "onlyOwnerCanUnlink": "Only the board's owner can unlink it",
-      "readOnlyHint": "Only the gym owner or an admin can link boards.",
-      "unlinkTitle": "Unlink this board?",
-      "unlinkBody": "\"{{name}}\" stops showing on this gym's page and kiosks. You can re-link it anytime.",
-      "unlinkConfirm": "Unlink",
+      "readOnlyHint": "The owner and admins add their own boards and delete the synced ones. You can remove boards climbers added and add ones near your gym.",
+      "askAdminToDelete": "Ask an owner or admin to delete this one.",
       "cancel": "Cancel",
       "linked": "Board linked.",
       "linkFailed": "Couldn't link the board.",
-      "unlinked": "Board unlinked.",
-      "unlinkFailed": "Couldn't unlink the board.",
       "visibility": {
         "public": "Public",
         "unlisted": "Unlisted",
         "private": "Private"
       },
+      "printPoster": "Print poster",
       "addDialog": {
         "title": "Add one of your boards",
         "body": "Pick a board you own to link to this gym.",
@@ -300,8 +318,8 @@
         "close": "Close"
       },
       "strays": {
-        "heading": "Boards that might be yours",
-        "description": "These sit at your gym or drifted off a merged listing. Add the ones that belong here.",
+        "heading": "Boards near your gym",
+        "description": "These are within 150 m of your gym, or came from a merged listing. Add the ones on your walls.",
         "reasonMerged": "Was on a merged listing",
         "reasonNearby": "{{meters}} m away",
         "reasonNearbyGeneric": "Right nearby",
@@ -316,7 +334,9 @@
         "empty": "Nothing loose right now. Every board near your gym is already on your listing.",
         "loadError": "Couldn't check for stray boards.",
         "retry": "Try again"
-      }
+      },
+      "back": "All boards",
+      "editLoadError": "Couldn't load this board for editing."
     },
     "presets": {
       "single": "Single wall",
@@ -337,6 +357,12 @@
       "createFailed": "Couldn't create the kiosk."
     },
     "editor": {
+      "appearance": {
+        "label": "Appearance",
+        "light": "Light",
+        "dark": "Dark",
+        "description": "Choose how this screen looks. Other kiosks keep their own appearance."
+      },
       "back": "All kiosks",
       "save": "Save layout",
       "saved": "Kiosk saved.",
@@ -402,8 +428,8 @@
           "body": "Add your logo and brand colors"
         },
         "boards": {
-          "title": "Link your boards",
-          "body": "Connect the walls in your gym"
+          "title": "Check your boards",
+          "body": "Fix or remove any that aren't on your walls"
         },
         "members": {
           "title": "Invite your crew",
@@ -441,6 +467,19 @@
     "comments": {
       "intro": "Reply to your gym's comment thread without leaving the console.",
       "heading": "What your crew's saying"
+    },
+    "aiAssistants": {
+      "title": "AI assistants",
+      "body": "Manage your gyms with ChatGPT or Claude. Connect your Boardsesh account once.",
+      "connect": "Connect an assistant",
+      "connections": "Manage connections",
+      "checking": "Checking assistant connections…",
+      "connected": "An assistant is connected",
+      "paused": "Assistant access is paused",
+      "notConnected": "No assistant connected yet",
+      "statusUnavailable": "Check your connections in Settings",
+      "pilotBody": "Assistant connections are in an invitation-only pilot. Wait for a Boardsesh invitation before starting sign-in.",
+      "pilotDetails": "Read pilot access details"
     }
   },
   "branding": {

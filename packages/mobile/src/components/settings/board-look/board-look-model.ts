@@ -4,12 +4,14 @@ import type { BoardLookSuggestion } from '../../../lib/board-render/board-look-s
 import type { MoreFormModel, MoreRow, MoreSection } from '../../MoreForm.types';
 
 /**
- * The Board look screen as plain data — the parent of the two leaves.
+ * The Board page as plain data — the parent of the two look leaves.
  *
- * The screen used to be one scroll of seven headed blocks and about twenty-five
+ * The look used to be one scroll of seven headed blocks and about twenty-five
  * controls, with accessibility settings and renderer tuning knobs sitting at the
  * same level. It now leads with the looks and puts everything else one tap away,
- * so the first screen answers "which look?" and nothing else.
+ * so the top of the page answers "which look?". Below that come the lighting and
+ * Bluetooth groups, which used to be a Board lighting page of their own. Each
+ * leaf keeps its own reset, so this page has none.
  *
  * Takes the carousel as a `ReactNode` rather than importing it: that keeps this a
  * pure function of state, so which rows appear — and what the two nav rows say
@@ -23,7 +25,7 @@ export type BoardLookModelInput = {
   matchingOptionId: BoardLookOptionId;
   /** Localised label of the current look (e.g. "Bold"). */
   currentLookLabel: string;
-  /** How many hold-marker settings are off default, for the Accessibility subtitle. */
+  /** How many hold-marker settings are off default, for the Hold colours & shapes subtitle. */
   overriddenCount: number;
   /** `false` = this build cannot draw the Boardsesh look, so say so up front. */
   boardseshRendererAvailable: boolean | null;
@@ -31,7 +33,6 @@ export type BoardLookModelInput = {
   t: (key: string, options?: Record<string, unknown>) => string;
   onOpenCustomLook: () => void;
   onOpenAccessibility: () => void;
-  onResetBoardLook: () => void;
   /**
    * What the phone's own accessibility settings suggest, or `null` for the
    * overwhelmingly common case of nothing to say. Chosen by
@@ -40,7 +41,37 @@ export type BoardLookModelInput = {
   suggestion: BoardLookSuggestion | null;
   onApplySuggestion: () => void;
   onDismissSuggestion: () => void;
+  /**
+   * The "use my look on spray walls" switch, or `null` to leave the section out
+   * (spray walls not enabled for this climber).
+   */
+  sprayWalls: { useOwnLook: boolean; onUseOwnLookChange: (useOwnLook: boolean) => void } | null;
+  /**
+   * The MoonBoard grid letters and numbers switch, or `null` to leave the section
+   * out (the active board is not a MoonBoard).
+   */
+  moonboardGridLabels: { enabled: boolean; onChange: (enabled: boolean) => void } | null;
+  /**
+   * The GPU acceleration switch, or `null` to leave it out (this binary has no
+   * native overlay module, or the remote kill switch is off: the row would do
+   * nothing).
+   */
+  gpuAcceleration: { enabled: boolean; onChange: (enabled: boolean) => void } | null;
+  /** What lights the board and when the phone lets go of it (`useBoardLightingSections`), last on the page. */
+  lightingSections: readonly MoreSection[];
+  /**
+   * The page was opened for its lighting group (`?section=lighting`, the
+   * player's preview-first card): that group leads, the looks follow.
+   */
+  leadWithLighting?: boolean;
 };
+
+/**
+ * `/settings/board-look?section=lighting` opens the Board page on its lighting
+ * group. A SwiftUI `Form` can't be scrolled to a section, so the group moves to
+ * the top instead.
+ */
+export const BOARD_LOOK_LIGHTING_SECTION = 'lighting';
 
 export function buildBoardLookModel(input: BoardLookModelInput): MoreFormModel {
   const {
@@ -132,7 +163,7 @@ export function buildBoardLookModel(input: BoardLookModelInput): MoreFormModel {
     {
       kind: 'nav',
       key: 'accessibility',
-      label: t('mobile.settings.boardLook.accessibility.title'),
+      label: t('mobile.settings.boardLook.accessibility.pageTitle'),
       subtitle:
         overriddenCount === 0
           ? t('mobile.settings.boardLook.accessibility.rowSubtitleDefault')
@@ -144,21 +175,63 @@ export function buildBoardLookModel(input: BoardLookModelInput): MoreFormModel {
 
   sections.push({ key: 'destinations', rows: destinations });
 
-  sections.push({
-    key: 'reset',
-    rows: [
-      {
-        kind: 'button',
-        key: 'resetBoardLook',
-        label: t('mobile.settings.boardLook.resetAll'),
-        emphasis: 'subtle',
-        onPress: input.onResetBoardLook,
-      },
-    ],
-    // The footer is what makes the reset split legible: this button used to wipe
-    // the climber's hold colours too, under a label that never mentioned them.
-    footer: t('mobile.settings.boardLook.resetAllNote'),
-  });
+  if (input.sprayWalls) {
+    const { useOwnLook, onUseOwnLookChange } = input.sprayWalls;
+    sections.push({
+      key: 'sprayWalls',
+      title: t('mobile.settings.boardLook.sprayWalls.title'),
+      rows: [
+        {
+          kind: 'toggle',
+          key: 'sprayWallsUseOwnLook',
+          label: t('mobile.settings.boardLook.sprayWalls.useOwnLook'),
+          value: useOwnLook,
+          onValueChange: onUseOwnLookChange,
+        },
+      ],
+      footer: t('mobile.settings.boardLook.sprayWalls.footer'),
+    });
+  }
 
-  return { sections };
+  if (input.moonboardGridLabels) {
+    const { enabled, onChange } = input.moonboardGridLabels;
+    sections.push({
+      key: 'moonboard',
+      title: t('mobile.settings.boardLook.moonboard.title'),
+      rows: [
+        {
+          kind: 'toggle',
+          key: 'moonboardGridLabels',
+          label: t('mobile.settings.boardLook.moonboard.gridLabels'),
+          value: enabled,
+          onValueChange: onChange,
+        },
+      ],
+      footer: t('mobile.settings.boardLook.moonboard.footer'),
+    });
+  }
+
+  if (input.gpuAcceleration) {
+    const { enabled, onChange } = input.gpuAcceleration;
+    sections.push({
+      key: 'gpuAcceleration',
+      rows: [
+        {
+          kind: 'toggle',
+          key: 'gpuAcceleration',
+          label: t('mobile.settings.boardLook.gpuAcceleration.title'),
+          // Rides as the switch's accessibility hint on iOS.
+          subtitle: t('mobile.settings.boardLook.gpuAcceleration.description'),
+          value: enabled,
+          onValueChange: onChange,
+        },
+      ],
+    });
+  }
+
+  return {
+    sections: input.leadWithLighting
+      ? [...input.lightingSections, ...sections]
+      : [...sections, ...input.lightingSections],
+  };
 }

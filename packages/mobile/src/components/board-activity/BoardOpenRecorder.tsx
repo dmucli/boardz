@@ -15,6 +15,7 @@ import { useActiveBoard } from '../../lib/graphql/use-active-board';
 import { useRecordBoardOpened } from '../../lib/graphql/hooks';
 import { useAuth } from '../../providers/auth-provider';
 import { useStoredUserId } from '../../hooks/use-current-user-id';
+import { boardUuidOrNull } from '../../lib/boards/board-identity';
 
 /**
  * The last (user, board) pair recorded, at module scope rather than in a ref.
@@ -37,19 +38,25 @@ export function BoardOpenRecorder(): null {
   const recordBoardOpened = useRecordBoardOpened();
 
   // The uuid scalar, never the board object: the query hands back a fresh object
-  // identity on every refetch and on every angle write.
-  const boardUuid = activeBoard?.uuid ?? null;
+  // identity on every refetch and on every angle write. A hidden board picked
+  // from a signed-out scan has uuid '', which is no board to record.
+  const boardUuid = boardUuidOrNull(activeBoard?.uuid);
   const record = recordBoardOpened.mutate;
 
   useEffect(() => {
     // `data` is undefined while the AsyncStorage read is in flight; treating
     // that tick as "no board" would fire again the moment it resolves.
     if (isPending) return;
-    if (!isAuthenticated || boardUuid == null || userId == null) return;
+    // A hidden board ('') or no board is not recordable, but it is still a
+    // selection: the next real board is a new open, even the one recorded last.
+    if (boardUuid == null) {
+      lastRecordedKey = null;
+      return;
+    }
+    if (!isAuthenticated || userId == null) return;
     // Screenshot builds drive the active board themselves to stage captures.
     // Recording those would reorder the store-shot account's board list between
     // runs. Inlined so it dead-strips from normal builds.
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return;
 
     const key = `${userId}:${boardUuid}`;
     if (lastRecordedKey === key) return;

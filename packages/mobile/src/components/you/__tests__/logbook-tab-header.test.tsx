@@ -1,0 +1,327 @@
+// @vitest-environment jsdom
+import { DEFAULT_LOGBOOK_FILTERS, DEFAULT_LOGBOOK_SORT } from '@boardsesh/logbook';
+import { act, cleanup, fireEvent } from '@testing-library/react';
+import { renderWithNativeTextCheck as render } from '../../../../test/native-text-contract';
+import { createElement, type ReactNode } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const state = vi.hoisted(() => ({
+  native: true,
+  feedInputs: [] as Array<Record<string, unknown>>,
+  offline: false,
+  pending: false,
+  error: false,
+  measure: undefined as ((height: number) => void) | undefined,
+  listProps: undefined as
+    | {
+        contentContainerStyle: { paddingTop: number };
+        scrollIndicatorInsets: { top: number };
+        contentInsetAdjustmentBehavior: string;
+        maintainVisibleContentPosition?: { disabled: boolean };
+      }
+    | undefined,
+}));
+
+function flattenStyles(styles: unknown): Record<string, unknown> {
+  return Object.assign({}, ...[styles].flat(10).filter(Boolean));
+}
+
+// The list-play hook has its own suite; here a tap only has to reach it.
+vi.mock('../../../lib/playlists/use-tick-list-activation', () => ({ useTickListActivation: () => vi.fn() }));
+// ReadableColumn pads by the side safe area; a portrait phone has none.
+vi.mock('react-native-safe-area-context', () => ({
+  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+}));
+
+vi.mock('react-native', () => ({
+  Platform: { OS: 'ios' },
+  useWindowDimensions: () => ({ fontScale: 1 }),
+  RefreshControl: () => null,
+  StyleSheet: { create: (styles: unknown) => styles, flatten: flattenStyles, hairlineWidth: 1 },
+  View: ({
+    children,
+    style,
+    pointerEvents,
+    accessibilityElementsHidden,
+  }: {
+    children?: ReactNode;
+    style?: unknown;
+    pointerEvents?: string;
+    accessibilityElementsHidden?: boolean;
+  }) =>
+    createElement(
+      'div',
+      {
+        'data-native-view': true,
+        'data-style': JSON.stringify(flattenStyles(style)),
+        'data-pointer': pointerEvents,
+        'data-accessibility-hidden': accessibilityElementsHidden,
+      },
+      children,
+    ),
+}));
+vi.mock('@shopify/flash-list', () => ({
+  FlashList: (props: NonNullable<typeof state.listProps>) => {
+    state.listProps = props;
+    return createElement('div', { 'data-testid': 'results' });
+  },
+}));
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en-US' } }) }));
+vi.mock('expo-router', () => ({ useRouter: () => ({}) }));
+vi.mock('../../../hooks/use-native-root-header', () => ({ useNativeRootHeader: () => state.native }));
+vi.mock('../../../providers/theme-provider', () => ({
+  useTheme: () => ({
+    variant: 'material',
+    systemColors: {},
+    brandColors: {},
+  }),
+}));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: { 2: 8, 3: 12, 4: 16, 5: 20, 8: 32 },
+  borderRadius: { full: 9999 },
+}));
+vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { black: '#000' } }));
+vi.mock('../../../providers/feature-flags-provider', () => ({ useFeatureFlag: () => true }));
+vi.mock('../../../hooks/use-bottom-chrome-metrics', () => ({
+  useBottomChromeMetrics: () => ({ scrollBottomPadding: 0 }),
+}));
+vi.mock('../../../hooks/use-offline-query-state', () => ({
+  useOfflineQueryState: () => ({
+    isBlocked: state.offline,
+    reason: state.offline ? 'offline' : undefined,
+  }),
+}));
+vi.mock('../../../providers/logbook-delete-provider', () => ({
+  usePendingLogbookDeletes: () => new Set(),
+  useLogbookDeleteActions: () => ({ getDeleteScope: vi.fn(), scheduleDelete: vi.fn() }),
+}));
+vi.mock('../../../providers/drawer-host-provider', () => ({ useDrawerHost: () => ({}) }));
+vi.mock('../../../providers/dialog-provider', () => ({ useConfirm: () => vi.fn() }));
+vi.mock('../../../lib/analytics', () => ({ track: vi.fn() }));
+vi.mock('../../../lib/haptics', () => ({ hapticSelection: vi.fn() }));
+vi.mock('../../../lib/tick-to-climb', () => ({ tickToClimb: vi.fn() }));
+vi.mock('../../../lib/playlists/board-details-for-playlist', () => ({ renderBoardToPlaylistConfig: vi.fn() }));
+vi.mock('../../../lib/graphql/hooks', () => {
+  const feed = (_userId: string | undefined, input: Record<string, unknown>) => {
+    state.feedInputs.push(input);
+    return {
+      data: undefined,
+      isPending: state.pending,
+      isError: state.error,
+      refetch: vi.fn(),
+      fetchNextPage: vi.fn(),
+    };
+  };
+  return { useGrades: () => ({}), useUserAscentsFeed: feed, useUserGroupedAscentsFeed: feed };
+});
+vi.mock('../use-logbook-search', () => ({
+  useLogbookSearch: () => ({ filters: DEFAULT_LOGBOOK_FILTERS, sort: DEFAULT_LOGBOOK_SORT, name: '', hydrated: true }),
+  countActiveLogbookFilters: () => 0,
+}));
+vi.mock('../../Text', () => ({
+  Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+}));
+vi.mock('../../PressableSurface', () => ({
+  PressableSurface: ({ children }: { children?: ReactNode }) => createElement('button', null, children),
+}));
+vi.mock('../../search/FilterTokenRow', () => ({ FilterTokenRow: () => null }));
+vi.mock('../use-logbook-board-options', () => ({ useLogbookBoardOptions: () => [] }));
+vi.mock('../../../hooks/use-today', () => ({ useToday: () => new Date(2026, 5, 30) }));
+vi.mock('../../../hooks/use-grade-format', () => ({ useGradeFormat: () => ({ gradeFormat: 'v' }) }));
+vi.mock('../../../lib/routing/scoped-navigation', () => ({ useScopedRouter: () => ({ push: vi.fn() }) }));
+vi.mock('../../../lib/logbook-pinned-chips-store', () => ({
+  useLogbookPinnedChips: () => ({ pinned: [], loaded: true, isPinned: () => false, togglePin: vi.fn() }),
+}));
+vi.mock('../../ActivityIndicator', () => ({
+  ActivityIndicator: () => createElement('div', { 'data-testid': 'loading' }),
+}));
+vi.mock('../../OfflineState', () => ({ OfflineState: () => createElement('div', { 'data-testid': 'offline' }) }));
+vi.mock('../../Icon', () => ({ Icon: () => null }));
+vi.mock('../LogbookRow', () => ({ LogbookRow: () => null }));
+vi.mock('../LogbookDayDivider', () => ({ LogbookDayDivider: () => null, LogbookWallSubDivider: () => null }));
+vi.mock('../LogbookEditSheet', () => ({ LogbookEditSheet: () => null }));
+vi.mock('../LogbookEntryChooserSheet', () => ({ LogbookEntryChooserSheet: () => null }));
+vi.mock('../LogbookFilterSheet', () => ({
+  LogbookFilterSheet: () => createElement('div', { 'data-testid': 'filter-sheet' }),
+}));
+vi.mock('../BoardLinkPrompt', () => ({ BoardLinkPrompt: () => null }));
+// The capsule row, reduced to its Filters opener.
+vi.mock('../LogbookChipRow', () => ({
+  LogbookChipRow: ({ onOpenFilters }: { onOpenFilters: () => void }) =>
+    createElement('button', { 'data-testid': 'capsules', onClick: onOpenFilters }),
+}));
+vi.mock('../LogbookFacetRail', () => ({ LogbookFacetRail: () => null }));
+
+import { createScrollEdgeBackdrop } from '../../../hooks/use-scroll-edge-backdrop';
+import { LogbookTab } from '../LogbookTab';
+
+function renderHeader(controls: ReactNode, onHeightChange: (height: number) => void) {
+  state.measure = onHeightChange;
+  return createElement('div', { 'data-testid': 'composed-header' }, controls);
+}
+
+beforeEach(() => {
+  state.feedInputs = [];
+  state.native = true;
+  state.offline = false;
+  state.pending = false;
+  state.error = false;
+  state.listProps = undefined;
+  state.measure = undefined;
+});
+afterEach(() => {
+  cleanup();
+  vi.unstubAllEnvs();
+});
+
+describe('Logbook composed profile header', () => {
+  it('puts the capsule row in the composed header without the duplicate heading', () => {
+    const { getByTestId, queryByText } = render(<LogbookTab userId="me" renderHeader={renderHeader} />);
+    expect(getByTestId('composed-header').contains(getByTestId('capsules'))).toBe(true);
+    expect(queryByText('tabs.logbook')).toBeNull();
+    expect(queryByText('mobile.filter.allBoards')).toBeNull();
+    fireEvent.click(getByTestId('capsules'));
+    expect(getByTestId('filter-sheet')).toBeTruthy();
+  });
+
+  it('drops the heading in any composed header: the selected tab names the page', () => {
+    const { getByTestId, queryByText } = render(
+      <LogbookTab userId="other" viewerIsOwner={false} renderHeader={renderHeader} />,
+    );
+    expect(queryByText('tabs.logbook')).toBeNull();
+    expect(getByTestId('capsules')).toBeTruthy();
+  });
+
+  it('reports list scrolling to the floating header and clears it on unmount', () => {
+    const scrollEdge = createScrollEdgeBackdrop();
+    const { unmount } = render(<LogbookTab userId="me" renderHeader={renderHeader} scrollEdge={scrollEdge} />);
+    for (const [listener, callback] of Object.entries(scrollEdge.listProps)) {
+      expect(state.listProps?.[listener as keyof NonNullable<typeof state.listProps>]).toBe(callback);
+    }
+    act(() =>
+      scrollEdge.listProps.onScroll({ nativeEvent: { contentOffset: { x: 0, y: 400 } } } as Parameters<
+        typeof scrollEdge.listProps.onScroll
+      >[0]),
+    );
+    expect(scrollEdge.isScrolledUnder()).toBe(true);
+    unmount();
+    expect(scrollEdge.isScrolledUnder()).toBe(false);
+  });
+
+  it.each(['missing-user', 'loading', 'error', 'offline'] as const)(
+    'clears the floating backdrop when %s replaces the list',
+    (status) => {
+      const scrollEdge = createScrollEdgeBackdrop();
+      const { rerender, queryByTestId } = render(
+        <LogbookTab userId="me" renderHeader={renderHeader} scrollEdge={scrollEdge} />,
+      );
+      act(() =>
+        scrollEdge.listProps.onScroll({ nativeEvent: { contentOffset: { x: 0, y: 400 } } } as Parameters<
+          typeof scrollEdge.listProps.onScroll
+        >[0]),
+      );
+      expect(scrollEdge.isScrolledUnder()).toBe(true);
+      state.pending = status === 'loading';
+      state.error = status === 'error';
+      state.offline = status === 'offline';
+      rerender(
+        <LogbookTab
+          userId={status === 'missing-user' ? undefined : 'me'}
+          renderHeader={renderHeader}
+          scrollEdge={scrollEdge}
+        />,
+      );
+      expect(queryByTestId('results')).toBeNull();
+      expect(scrollEdge.isScrolledUnder()).toBe(false);
+      state.pending = false;
+      state.error = false;
+      state.offline = false;
+      rerender(<LogbookTab userId="me" renderHeader={renderHeader} scrollEdge={scrollEdge} />);
+      expect(queryByTestId('results')).toBeTruthy();
+      expect(scrollEdge.isScrolledUnder()).toBe(false);
+    },
+  );
+
+  it('keeps native results mounted invisibly until measurement and counts supplementary height once', () => {
+    const { getByTestId } = render(<LogbookTab userId="me" renderHeader={renderHeader} />);
+    const resultsFrame = getByTestId('results').parentElement!;
+    expect(resultsFrame.dataset.style).toContain('"opacity":0');
+    expect(resultsFrame.dataset.pointer).toBe('none');
+    expect(resultsFrame.dataset.accessibilityHidden).toBe('true');
+    expect(state.listProps?.contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(state.listProps?.maintainVisibleContentPosition).toEqual({ disabled: true });
+    expect(getByTestId('results').compareDocumentPosition(getByTestId('composed-header'))).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+
+    act(() => state.measure?.(180));
+    expect(resultsFrame.dataset.style).not.toContain('"opacity":0');
+    expect(resultsFrame.dataset.pointer).toBe('auto');
+    expect(state.listProps?.contentContainerStyle.paddingTop).toBe(180);
+    expect(state.listProps?.scrollIndicatorInsets.top).toBe(180);
+    expect(state.listProps?.maintainVisibleContentPosition).toEqual({ disabled: true });
+    expect(resultsFrame.dataset.style).not.toContain('"paddingTop"');
+
+    // An expanded facet rail contributes to the same measurement, not a second inset.
+    act(() => state.measure?.(260));
+    expect(state.listProps?.contentContainerStyle.paddingTop).toBe(260);
+    expect(state.listProps?.scrollIndicatorInsets.top).toBe(260);
+    expect(state.listProps?.maintainVisibleContentPosition).toEqual({ disabled: true });
+
+    // Closing the rail must also leave the native offset free of row anchoring.
+    act(() => state.measure?.(180));
+    expect(state.listProps?.contentContainerStyle.paddingTop).toBe(180);
+    expect(state.listProps?.maintainVisibleContentPosition).toEqual({ disabled: true });
+  });
+
+  it('starts Material results below the entire opaque measured header', () => {
+    state.native = false;
+    const { getByTestId, queryByText } = render(<LogbookTab userId="me" renderHeader={renderHeader} />);
+    expect(queryByText('tabs.logbook')).toBeNull();
+    expect(getByTestId('composed-header').contains(getByTestId('capsules'))).toBe(true);
+    act(() => state.measure?.(280));
+    expect(getByTestId('results').parentElement!.dataset.style).toContain('"paddingTop":280');
+    expect(getByTestId('results').parentElement!.dataset.style).toContain('"overflow":"hidden"');
+    expect(state.listProps?.contentContainerStyle.paddingTop).toBe(0);
+    expect(state.listProps?.contentInsetAdjustmentBehavior).toBe('never');
+    expect(state.listProps?.maintainVisibleContentPosition).toBeUndefined();
+  });
+
+  it('leaves public profile controls in flow without adding supplementary padding', () => {
+    const { getByTestId, getByText, queryByTestId } = render(
+      <LogbookTab userId="other" viewerIsOwner={false} topInset={24} />,
+    );
+    expect(queryByTestId('composed-header')).toBeNull();
+    expect(getByText('tabs.logbook')).toBeTruthy();
+    expect(getByText('mobile.filter.allBoards')).toBeTruthy();
+    expect(getByTestId('capsules').compareDocumentPosition(getByTestId('results'))).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(state.listProps?.contentContainerStyle.paddingTop).toBe(0);
+    expect(state.listProps?.maintainVisibleContentPosition).toBeUndefined();
+    expect(getByTestId('results').parentElement!.dataset.pointer).toBe('auto');
+  });
+
+  it.each(['missing-user', 'loading', 'error', 'offline'] as const)(
+    'retains tabs and controls in the %s state',
+    (status) => {
+      state.pending = status === 'loading';
+      state.error = status === 'error';
+      state.offline = status === 'offline';
+      const { getByTestId, queryByTestId } = render(
+        <LogbookTab userId={status === 'missing-user' ? undefined : 'me'} renderHeader={renderHeader} />,
+      );
+      expect(getByTestId('composed-header').contains(getByTestId('capsules'))).toBe(true);
+      expect(queryByTestId('results')).toBeNull();
+      act(() => state.measure?.(180));
+      expect(getByTestId('composed-header')).toBeTruthy();
+    },
+  );
+  it('keeps ordinary logbook scope independent of capture configuration', () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_CPP_URL', 'http://localhost:19870/cpp');
+    render(<LogbookTab userId="me" />);
+    expect(state.feedInputs.at(-1)).not.toHaveProperty('boardType');
+  });
+});

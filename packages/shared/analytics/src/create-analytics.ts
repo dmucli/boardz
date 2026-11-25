@@ -13,10 +13,9 @@ export type AnalyticsApi = {
   track(name: string, properties?: AnalyticsEventProperties, options?: AnalyticsCaptureOptions): void;
   // The capture/identity methods return whether a client was present and the
   // call was forwarded — preserves the boolean contract the web wrapper exposes.
-  capture(name: string, properties?: AnalyticsEventProperties): boolean;
+  capture(name: string, properties?: AnalyticsEventProperties, options?: AnalyticsCaptureOptions): boolean;
   identify(distinctId: string, properties?: AnalyticsEventProperties): boolean;
   setPersonProperties(set?: AnalyticsEventProperties, setOnce?: AnalyticsEventProperties): boolean;
-  alias(newId: string): boolean;
   reset(): boolean;
 };
 
@@ -60,10 +59,11 @@ export function createAnalytics(
         client.capture(name, sanitizeForPosthog(properties));
       }
     },
-    capture(name, properties) {
+    capture(name, properties, options) {
       const client = resolveClient();
       if (!client) return false;
-      client.capture(name, sanitizeForPosthog(properties));
+      if (options) client.capture(name, sanitizeForPosthog(properties), options);
+      else client.capture(name, sanitizeForPosthog(properties));
       return true;
     },
     identify(distinctId, properties) {
@@ -76,12 +76,6 @@ export function createAnalytics(
       const client = resolveClient();
       if (!client) return false;
       client.setPersonProperties(sanitizeForPosthog(set), sanitizeForPosthog(setOnce));
-      return true;
-    },
-    alias(newId) {
-      const client = resolveClient();
-      if (!client) return false;
-      client.alias(newId);
       return true;
     },
     reset() {

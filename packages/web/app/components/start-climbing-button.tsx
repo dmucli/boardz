@@ -3,6 +3,8 @@
 import React from 'react';
 import Button from '@mui/material/Button';
 import type { SxProps, Theme } from '@mui/material/styles';
+import { webAppOpened, type WebsiteJourneyPlacement } from '@boardsesh/analytics';
+import { trackWebsiteJourneyLinkClick } from '@/app/lib/website-journey-analytics';
 import { APP_URL } from '@/app/lib/app-origin';
 
 type StartClimbingButtonProps = {
@@ -10,6 +12,9 @@ type StartClimbingButtonProps = {
   label: string;
   /** Resolved aria-label. */
   ariaLabel: string;
+  placement?: WebsiteJourneyPlacement;
+  /** A deep link into the browser app; the app's root by default. */
+  href?: string;
   size?: 'small' | 'medium' | 'large';
   variant?: 'text' | 'outlined' | 'contained';
   startIcon?: React.ReactNode;
@@ -28,6 +33,8 @@ type StartClimbingButtonProps = {
 export default function StartClimbingButton({
   label,
   ariaLabel,
+  placement = 'hero',
+  href = APP_URL,
   size = 'medium',
   variant = 'contained',
   startIcon,
@@ -36,7 +43,8 @@ export default function StartClimbingButton({
   return (
     <Button
       component="a"
-      href={APP_URL}
+      href={href}
+      onClick={(click) => trackWebsiteJourneyLinkClick(click, webAppOpened(placement))}
       aria-label={ariaLabel}
       size={size}
       variant={variant}

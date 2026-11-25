@@ -1,5 +1,5 @@
-import { memo, useCallback, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Linking, Modal, ScrollView, StyleSheet, View } from 'react-native';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Linking, Modal, Platform, ScrollView, StyleSheet, View } from 'react-native';
 import { File } from 'expo-file-system';
 import * as Clipboard from 'expo-clipboard';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -10,8 +10,11 @@ import { LinkBoardAccountModal, errorMessageFor } from './LinkBoardAccountModal'
 import {
   AURORA_CREDENTIALS_QUERY_KEY,
   AURORA_UNSYNCED_QUERY_KEY,
-} from '../../lib/integrations/use-board-account-credentials';
-import { DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR } from '@boardsesh/shared-schema/sync-error-codes';
+} from '../../lib/integrations/board-account-query-keys';
+import { invalidateOwnDataAfterImport } from '../../lib/integrations/board-import-completion';
+import { pendingSyncRefetchInterval } from '../../lib/integrations/use-board-account-credentials';
+import { getImportPickerTypes } from '../../lib/integrations/import-picker-types';
+import { circuitPlaylistSyncWarningKind } from '@boardsesh/shared-schema/sync-error-codes';
 import {
   AURORA_BOARDS,
   parseAuroraExportJson,
@@ -25,6 +28,7 @@ import { Button } from '../Button';
 import { Icon } from '../Icon';
 import { OfflineState } from '../OfflineState';
 import { SectionHeader } from '../SectionHeader';
+import { StatusPill } from '../StatusPill';
 import { Text } from '../Text';
 import { useOfflineQueryState } from '../../hooks/use-offline-query-state';
 import { useTheme } from '../../providers/theme-provider';
@@ -53,6 +57,13 @@ import {
 } from '../../lib/aurora-credentials';
 
 type ImportPhase = 'preview' | 'importing' | 'complete' | 'error';
+type AuroraImportPhase = ImportPhase | 'selecting' | 'preparing';
+type AuroraImportSession = {
+  boardType: AuroraBoardName;
+  pickerStarted: boolean;
+  importStarted: boolean;
+  canRetry: boolean;
+};
 type ImportStep = 'climbs' | 'resolving' | 'dedup' | 'ascents' | 'attempts' | 'circuits';
 type MoonBoardExportPreview = {
   username?: string;
@@ -62,7 +73,7 @@ type MoonBoardExportPreview = {
   attempts: number;
   projects: number;
   fails: number;
-  angle: number;
+  angles: number[];
 };
 
 // Kilter renders two cards: `kilterAurora` for the legacy Aurora-built app (JSON
@@ -89,6 +100,7 @@ type ParsedMoonBoardExport = {
 };
 
 type MoonBoardSharedSchemaModule = {
+  decodeMoonBoardExportBytes?: (bytes: Uint8Array) => string;
   parseMoonBoardExportCsv?: (csv: string) => unknown | Promise<unknown>;
 };
 
@@ -128,6 +140,17 @@ function readString(record: Record<string, unknown>, keys: string[]): string | u
   return undefined;
 }
 
+function readAngles(preview: Record<string, unknown>): number[] {
+  const { angles } = preview;
+  if (Array.isArray(angles)) {
+    const numericAngles = angles.filter(
+      (angle): angle is number => typeof angle === 'number' && Number.isFinite(angle),
+    );
+    if (numericAngles.length > 0) return numericAngles;
+  }
+  return [readNumber(preview, ['angle', 'boardAngle']) ?? 40];
+}
+
 function normalizeMoonBoardParsedExport(parsed: unknown): ParsedMoonBoardExport {
   if (!isRecord(parsed) || !('data' in parsed) || !isRecord(parsed.preview)) {
     throw new Error('moonboard_parser_invalid_result');
@@ -144,16 +167,22 @@ function normalizeMoonBoardParsedExport(parsed: unknown): ParsedMoonBoardExport 
       attempts: readNumber(preview, ['attempts', 'attemptCount']) ?? 0,
       projects: readNumber(preview, ['projects', 'projectCount']) ?? 0,
       fails: readNumber(preview, ['fails', 'failures', 'failCount']) ?? 0,
-      angle: readNumber(preview, ['angle', 'boardAngle']) ?? 40,
+      angles: readAngles(preview),
     },
   };
 }
 
-async function parseMoonBoardCsvForImport(csv: string): Promise<ParsedMoonBoardExport> {
+// Takes raw bytes because Moon's exports are sometimes Windows-1252, which a
+// plain UTF-8 read turns into replacement characters ("Bj�rk").
+async function parseMoonBoardCsvForImport(bytes: Uint8Array): Promise<ParsedMoonBoardExport> {
   const sharedSchema = (await import('@boardsesh/shared-schema')) as unknown as MoonBoardSharedSchemaModule;
-  if (typeof sharedSchema.parseMoonBoardExportCsv !== 'function') {
+  if (
+    typeof sharedSchema.parseMoonBoardExportCsv !== 'function' ||
+    typeof sharedSchema.decodeMoonBoardExportBytes !== 'function'
+  ) {
     throw new Error('moonboard_parser_unavailable');
   }
+  const csv = sharedSchema.decodeMoonBoardExportBytes(bytes);
   return normalizeMoonBoardParsedExport(await sharedSchema.parseMoonBoardExportCsv(csv));
 }
 
@@ -222,9 +251,6 @@ function getMoonBoardProgressLabel(t: TFunction<'settings'>, progress: MoonBoard
 
 const SYNCABLE_SYNC_STATUSES = new Set(['pending', 'active', 'error']);
 
-/** While a board sync is waiting, re-read the cards this often so "Syncing" clears on its own. */
-const PENDING_SYNC_REFRESH_MS = 20_000;
-
 function requestProviderSync(boardType: AuroraBoardName) {
   return getHttpClient().request<RequestProviderSyncMutationResponse, RequestProviderSyncMutationVariables>(
     REQUEST_PROVIDER_SYNC,
@@ -242,6 +268,24 @@ function getSyncNowErrorMessage(t: TFunction<'settings'>, error: unknown): strin
     default:
       return t('aurora.mobile.syncNowFailed');
   }
+}
+
+// Android's picker shows every file, so these messages are what tells a
+// climber they picked the wrong one.
+function getAuroraFileErrorMessage(t: TFunction<'settings'>, error: unknown): string {
+  // JSON.parse throws a SyntaxError for anything that isn't JSON at all.
+  if (error instanceof SyntaxError) return t('aurora.mobile.importNotJson');
+  const errorCode = error instanceof Error ? error.message : '';
+  if (errorCode === 'missing_user' || errorCode === 'invalid_json') return t('aurora.mobile.importMissingUser');
+  return t('aurora.import.parseError');
+}
+
+function getMoonBoardFileErrorMessage(t: TFunction<'settings'>, error: unknown): string {
+  const errorCode = error instanceof Error ? error.message : '';
+  if (errorCode === 'moonboard_parser_unavailable') return t('aurora.moonboard.csvImport.parserUnavailable');
+  // No row looked like a MoonBoard log header: not an export at all.
+  if (errorCode === 'missing_moonboard_log_header') return t('aurora.moonboard.csvImport.notMoonExport');
+  return t('aurora.moonboard.csvImport.parseError');
 }
 
 function getMoonBoardImportErrorMessage(t: TFunction<'settings'>, error: unknown): string {
@@ -263,8 +307,7 @@ export function BoardAccountsSection() {
   const credentialsQuery = useQuery({
     queryKey: AURORA_CREDENTIALS_QUERY_KEY,
     queryFn: getAuroraCredentials,
-    refetchInterval: (query) =>
-      query.state.data?.credentials.some((credential) => credential.pendingRunId) ? PENDING_SYNC_REFRESH_MS : false,
+    refetchInterval: pendingSyncRefetchInterval,
   });
   const unsyncedQuery = useQuery({
     queryKey: AURORA_UNSYNCED_QUERY_KEY,
@@ -278,9 +321,18 @@ export function BoardAccountsSection() {
   const [importBoard, setImportBoard] = useState<AuroraBoardName | null>(null);
   const [importPreview, setImportPreview] = useState<AuroraExportPreview | null>(null);
   const [importData, setImportData] = useState<StrippedAuroraExportData | null>(null);
-  const [importPhase, setImportPhase] = useState<ImportPhase | null>(null);
+  const [importPhase, setImportPhase] = useState<AuroraImportPhase | null>(null);
   const [importProgress, setImportProgress] = useState<ImportProgress | null>(null);
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
+  const [importFileError, setImportFileError] = useState<string | null>(null);
+  const [importWarning, setImportWarning] = useState<string | null>(null);
+  const importSession = useRef<AuroraImportSession | null>(null);
+  useEffect(
+    () => () => {
+      importSession.current = null;
+    },
+    [],
+  );
 
   const deleteCredentialMutation = useMutation({
     mutationFn: deleteAuroraCredential,
@@ -348,6 +400,9 @@ export function BoardAccountsSection() {
   );
 
   const resetImport = useCallback(() => {
+    importSession.current = null;
+    setImportFileError(null);
+    setImportWarning(null);
     setImportBoard(null);
     setImportPreview(null);
     setImportData(null);
@@ -383,66 +438,104 @@ export function BoardAccountsSection() {
     [confirm, deleteCredentialMutation, t, tCommon],
   );
 
-  const handleImportPress = useCallback(
-    (boardType: AuroraBoardName) => {
-      setImportBoard(boardType);
+  const selectAuroraFile = useCallback(
+    (session: AuroraImportSession) => {
+      if (importSession.current !== session || session.pickerStarted) return;
+      session.pickerStarted = true;
       void (async () => {
+        let parsingFile = false;
         try {
           const DocumentPicker = await import('expo-document-picker');
+          if (importSession.current !== session) return;
           const document = await DocumentPicker.getDocumentAsync({
-            type: 'application/json',
+            type: getImportPickerTypes('auroraJson', Platform.OS),
             copyToCacheDirectory: true,
           });
+          if (importSession.current !== session) return;
           if (document.canceled) {
-            setImportBoard(null);
+            resetImport();
             return;
           }
 
           const asset = document.assets[0];
-          if (!asset) {
-            setImportBoard(null);
-            return;
-          }
+          if (!asset) throw new Error('missing_file');
           if (asset.size != null && asset.size > MAX_IMPORT_SIZE_BYTES) {
-            showToast(t('aurora.import.tooLarge'), 'error');
-            setImportBoard(null);
+            session.canRetry = true;
+            setImportFileError(t('aurora.import.tooLarge'));
+            setImportPhase('error');
             return;
           }
 
+          setImportPhase('preparing');
           const text = await new File(asset.uri).text();
+          if (importSession.current !== session) return;
+          parsingFile = true;
           const parsedJson = JSON.parse(text) as unknown;
           if (!isRecord(parsedJson)) throw new Error('invalid_json');
-          const parsed = parseAuroraExportJson(parsedJson, boardType);
+          const parsed = parseAuroraExportJson(parsedJson, session.boardType);
 
-          if (parsed.boardMismatchLayoutName) {
-            showToast(
-              t('aurora.mobile.importBoardWarning', {
-                layoutName: parsed.boardMismatchLayoutName,
-                boardName: boardTypeLabel(boardType),
-              }),
-              'warning',
-              5000,
-            );
-          }
-
+          setImportWarning(
+            parsed.boardMismatchLayoutName
+              ? t('aurora.mobile.importBoardWarning', {
+                  layoutName: parsed.boardMismatchLayoutName,
+                  boardName: boardTypeLabel(session.boardType),
+                })
+              : null,
+          );
           setImportData(parsed.data);
           setImportPreview(parsed.preview);
           setImportPhase('preview');
         } catch (error) {
-          const message =
-            error instanceof Error && error.message === 'missing_user'
-              ? t('aurora.mobile.importMissingUser')
-              : t('aurora.import.parseError');
-          showToast(message, 'error');
-          setImportBoard(null);
+          if (importSession.current !== session) return;
+          session.canRetry = true;
+          setImportFileError(parsingFile ? getAuroraFileErrorMessage(t, error) : t('aurora.import.readError'));
+          setImportPhase('error');
         }
       })();
     },
-    [showToast, t],
+    [resetImport, t],
   );
 
+  const handleImportPress = useCallback(
+    (boardType: AuroraBoardName) => {
+      if (importSession.current) return;
+      const session = { boardType, pickerStarted: false, importStarted: false, canRetry: false };
+      importSession.current = session;
+      setImportBoard(boardType);
+      setImportPhase('selecting');
+      // Browsers require the file chooser to start from the user's tap. Native
+      // waits for onShow, so Files is presented above an already-visible host.
+      if (Platform.OS === 'web') selectAuroraFile(session);
+    },
+    [selectAuroraFile],
+  );
+
+  const handleImportShown = useCallback(() => {
+    if (importSession.current) selectAuroraFile(importSession.current);
+  }, [selectAuroraFile]);
+
+  const handleImportRetry = useCallback(() => {
+    const previousSession = importSession.current;
+    if (!previousSession?.canRetry) return;
+    previousSession.canRetry = false;
+    const session = {
+      boardType: previousSession.boardType,
+      pickerStarted: false,
+      importStarted: false,
+      canRetry: false,
+    };
+    importSession.current = session;
+    setImportFileError(null);
+    setImportWarning(null);
+    setImportPhase('selecting');
+    // The host is already presented when retry is tapped.
+    selectAuroraFile(session);
+  }, [selectAuroraFile]);
+
   const handleImportConfirm = useCallback(() => {
-    if (!importBoard || !importData) return;
+    const session = importSession.current;
+    if (!session || session.importStarted || !importBoard || !importData) return;
+    session.importStarted = true;
 
     setImportPhase('importing');
     setImportPreview(null);
@@ -452,6 +545,7 @@ export function BoardAccountsSection() {
     void (async () => {
       try {
         await streamAuroraImport(importBoard, importData, (event: ImportProgressEvent) => {
+          if (importSession.current !== session) return;
           if (event.type === 'progress') {
             setImportProgress({
               step: event.step,
@@ -471,6 +565,7 @@ export function BoardAccountsSection() {
               event.results.partialError ? 'warning' : 'success',
             );
             void queryClient.invalidateQueries({ queryKey: AURORA_UNSYNCED_QUERY_KEY });
+            invalidateOwnDataAfterImport(queryClient);
             return;
           }
 
@@ -478,10 +573,9 @@ export function BoardAccountsSection() {
           showToast(t('aurora.mobile.importFailed'), 'error');
         });
       } catch {
-        setImportPhase('error');
-        showToast(t('aurora.mobile.importFailed'), 'error');
+        if (importSession.current === session) setImportPhase('error');
       } finally {
-        setImportData(null);
+        if (importSession.current === session) setImportData(null);
       }
     })();
   }, [importBoard, importData, queryClient, showToast, t]);
@@ -581,6 +675,10 @@ export function BoardAccountsSection() {
       <ImportDialog
         visible={importPhase !== null}
         phase={importPhase}
+        fileError={importFileError}
+        warning={importWarning}
+        onShow={handleImportShown}
+        onRetry={handleImportRetry}
         boardName={importBoard ? boardTypeLabel(importBoard) : ''}
         preview={importPreview}
         progress={importProgress}
@@ -600,6 +698,7 @@ const MoonBoardAccountCard = memo(function MoonBoardAccountCard() {
   const { t } = useTranslation('settings');
   const { systemColors } = useTheme();
   const { showToast } = useToast();
+  const queryClient = useQueryClient();
   const confirm = useConfirm();
   const [importPreview, setImportPreview] = useState<MoonBoardExportPreview | null>(null);
   const [importData, setImportData] = useState<StrippedMoonBoardExportData | null>(null);
@@ -653,7 +752,7 @@ const MoonBoardAccountCard = memo(function MoonBoardAccountCard() {
       try {
         const DocumentPicker = await import('expo-document-picker');
         const document = await DocumentPicker.getDocumentAsync({
-          type: ['text/csv', 'text/plain', 'application/vnd.ms-excel'],
+          type: getImportPickerTypes('moonBoardCsv', Platform.OS),
           copyToCacheDirectory: true,
         });
         if (document.canceled) return;
@@ -665,8 +764,7 @@ const MoonBoardAccountCard = memo(function MoonBoardAccountCard() {
           return;
         }
 
-        const csv = await new File(asset.uri).text();
-        const parsed = await parseMoonBoardCsvForImport(csv);
+        const parsed = await parseMoonBoardCsvForImport(await new File(asset.uri).bytes());
         setImportData(parsed.data);
         setImportPreview(parsed.preview);
         setImportPhase('preview');
@@ -674,11 +772,7 @@ const MoonBoardAccountCard = memo(function MoonBoardAccountCard() {
         setImportResult(null);
         setImportError(null);
       } catch (error) {
-        const message =
-          error instanceof Error && error.message === 'moonboard_parser_unavailable'
-            ? t('aurora.moonboard.csvImport.parserUnavailable')
-            : t('aurora.moonboard.csvImport.parseError');
-        showToast(message, 'error');
+        showToast(getMoonBoardFileErrorMessage(t, error), 'error');
         setImportPreview(null);
         setImportData(null);
         setImportPhase(null);
@@ -717,6 +811,7 @@ const MoonBoardAccountCard = memo(function MoonBoardAccountCard() {
                 : t('aurora.moonboard.csvImport.successCount', { count: totalMoonBoardImported(event.results) }),
               event.results.partialError ? 'warning' : 'success',
             );
+            invalidateOwnDataAfterImport(queryClient);
             return;
           }
 
@@ -734,7 +829,7 @@ const MoonBoardAccountCard = memo(function MoonBoardAccountCard() {
         setImportData(null);
       }
     })();
-  }, [importData, showToast, t]);
+  }, [importData, queryClient, showToast, t]);
 
   return (
     <View
@@ -742,7 +837,7 @@ const MoonBoardAccountCard = memo(function MoonBoardAccountCard() {
         styles.card,
         styles.accountCard,
         styles.accountCardSpacing,
-        { backgroundColor: systemColors.secondaryBackground },
+        { backgroundColor: systemColors.secondaryGroupedBackground },
       ]}
     >
       <View style={styles.accountHeader}>
@@ -852,7 +947,9 @@ function MoonBoardImportDialog({
                 {preview.fails > 0 ? (
                   <SummaryLine label={t('aurora.moonboard.importDialog.fails', { count: preview.fails })} />
                 ) : null}
-                <SummaryLine label={t('aurora.moonboard.importDialog.angleNote', { angle: preview.angle })} />
+                <SummaryLine
+                  label={t('aurora.moonboard.importDialog.angleNote', { angle: preview.angles.join('° / ') })}
+                />
               </View>
               <Text variant="footnote" color={systemColors.secondaryLabel}>
                 {t('aurora.moonboard.importDialog.previewNote')}
@@ -945,7 +1042,7 @@ function BoardAccountSkeletonCard({ isLast, systemColors }: BoardAccountSkeleton
         styles.card,
         styles.accountCard,
         !isLast && styles.accountCardSpacing,
-        { backgroundColor: systemColors.secondaryBackground },
+        { backgroundColor: systemColors.secondaryGroupedBackground },
       ]}
     >
       <View style={styles.accountHeader}>
@@ -976,7 +1073,7 @@ function BoardAccountsLoadError({ systemColors, brandColors, isRetrying, onRetry
   const { t: tCommon } = useTranslation('common');
 
   return (
-    <View style={[styles.card, styles.loadErrorCard, { backgroundColor: systemColors.secondaryBackground }]}>
+    <View style={[styles.card, styles.loadErrorCard, { backgroundColor: systemColors.secondaryGroupedBackground }]}>
       <Icon name="warning" size={20} color={brandColors.warning} />
       <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.loadErrorText}>
         {t('aurora.mobile.loadFailed')}
@@ -1046,11 +1143,22 @@ function BoardAccountCard({
   // client is expected to explain in the viewer's language (#3526). Everything
   // else in `sync_error` is still free text from an older path — those keep the
   // generic error pill rather than being swallowed.
-  const hasDuplicateAccountCircuits = credential?.syncError === DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR;
+  const circuitPlaylistWarning = circuitPlaylistSyncWarningKind(
+    credential?.syncError ?? null,
+    credential?.syncErrorReason,
+  );
+  const circuitPlaylistWarningCopy =
+    circuitPlaylistWarning === 'foreign'
+      ? t('aurora.status.foreignAccountCircuits')
+      : circuitPlaylistWarning === 'ambiguous'
+        ? t('aurora.status.ambiguousAccountCircuits')
+        : circuitPlaylistWarning === 'legacy'
+          ? t('aurora.status.duplicateAccountCircuits')
+          : null;
   // A warning, not a failure: the credential is active and syncing, only the
   // playlist mirror is paused. Red text here would tell a healthy account it is
   // broken, with nothing to act on.
-  const hasSyncFailure = Boolean(credential?.syncError) && !hasDuplicateAccountCircuits;
+  const hasSyncFailure = Boolean(credential?.syncError) && !circuitPlaylistWarning;
   const connectedLabel = credential?.auroraUsername
     ? t('aurora.mobile.connectedAs', { name: credential.auroraUsername })
     : t('aurora.mobile.connected');
@@ -1064,7 +1172,7 @@ function BoardAccountCard({
         styles.card,
         styles.accountCard,
         !isLast && styles.accountCardSpacing,
-        { backgroundColor: systemColors.secondaryBackground },
+        { backgroundColor: systemColors.secondaryGroupedBackground },
       ]}
     >
       <View style={styles.accountHeader}>
@@ -1077,17 +1185,16 @@ function BoardAccountCard({
           ) : null}
         </View>
         {showStatus ? (
-          <View
-            style={[styles.statusPill, { backgroundColor: credential ? brandColors.primaryFill : systemColors.fill }]}
-          >
-            <Text variant="caption1" color={credential ? brandColors.onPrimary : systemColors.secondaryLabel}>
-              {!credential
+          <StatusPill
+            tone={credential ? 'positive' : 'neutral'}
+            label={
+              !credential
                 ? t('aurora.mobile.notConnected')
                 : isSyncing && !isExpired
                   ? t('aurora.status.syncing')
-                  : t('aurora.status.connected')}
-            </Text>
-          </View>
+                  : t('aurora.status.connected')
+            }
+          />
         ) : null}
       </View>
 
@@ -1102,11 +1209,11 @@ function BoardAccountCard({
               {t('aurora.status.error')}
             </Text>
           ) : null}
-          {!isExpired && hasDuplicateAccountCircuits ? (
-            <View style={[styles.warningBlock, { backgroundColor: systemColors.tertiaryBackground }]}>
+          {!isExpired && circuitPlaylistWarningCopy ? (
+            <View style={[styles.warningBlock, { backgroundColor: systemColors.tertiaryGroupedBackground }]}>
               <Icon name="warning" size={18} color={brandColors.warning} />
               <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.warningText}>
-                {t('aurora.status.duplicateAccountCircuits')}
+                {circuitPlaylistWarningCopy}
               </Text>
             </View>
           ) : null}
@@ -1119,7 +1226,7 @@ function BoardAccountCard({
             </View>
           ) : null}
           {totalUnsynced > 0 ? (
-            <View style={[styles.warningBlock, { backgroundColor: systemColors.tertiaryBackground }]}>
+            <View style={[styles.warningBlock, { backgroundColor: systemColors.tertiaryGroupedBackground }]}>
               <Icon name="warning" size={18} color={brandColors.warning} />
               <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.warningText}>
                 {t('aurora.unsynced.title', { count: totalUnsynced })}
@@ -1193,8 +1300,12 @@ function BoardAccountCard({
 }
 
 type ImportDialogProps = {
+  fileError: string | null;
+  warning: string | null;
+  onShow: () => void;
+  onRetry: () => void;
   visible: boolean;
-  phase: ImportPhase | null;
+  phase: AuroraImportPhase | null;
   boardName: string;
   preview: AuroraExportPreview | null;
   progress: ImportProgress | null;
@@ -1206,6 +1317,10 @@ type ImportDialogProps = {
 };
 
 function ImportDialog({
+  fileError,
+  warning,
+  onShow,
+  onRetry,
   visible,
   phase,
   boardName,
@@ -1220,7 +1335,9 @@ function ImportDialog({
   const { t } = useTranslation('settings');
   const { t: tCommon } = useTranslation('common');
   let title = t('aurora.import.dialog.errorTitle');
-  if (phase === 'preview') {
+  if (phase === 'selecting' || phase === 'preparing') {
+    title = t('aurora.mobile.importPreparingTitle');
+  } else if (phase === 'preview') {
     title = t('aurora.import.dialog.previewTitle');
   } else if (phase === 'importing') {
     title = t('aurora.import.dialog.importingTitle');
@@ -1233,7 +1350,8 @@ function ImportDialog({
       visible={visible}
       transparent
       animationType="fade"
-      onRequestClose={phase === 'importing' ? undefined : onCancel}
+      onShow={onShow}
+      onRequestClose={phase === 'importing' || phase === 'selecting' ? undefined : onCancel}
     >
       <View style={styles.modalBackdrop}>
         <View style={[styles.modalCard, styles.importModalCard, { backgroundColor: systemColors.secondaryBackground }]}>
@@ -1241,11 +1359,22 @@ function ImportDialog({
             {title}
           </Text>
 
+          {phase === 'selecting' || phase === 'preparing' ? (
+            <View style={styles.importProgressBlock}>
+              <ActivityIndicator />
+              <Text variant="subheadline" color={systemColors.secondaryLabel}>
+                {phase === 'selecting' ? t('aurora.mobile.importSelecting') : t('aurora.mobile.importPreparing')}
+              </Text>
+              <Button title={tCommon('actions.cancel')} variant="text" role="cancel" onPress={onCancel} />
+            </View>
+          ) : null}
+
           {phase === 'preview' && preview ? (
             <>
               <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.modalCopy}>
                 {t('aurora.mobile.importPreviewIntro', { username: preview.username, boardName })}
               </Text>
+              {warning ? <Text variant="subheadline">{warning}</Text> : null}
               <View style={[styles.summaryBox, { backgroundColor: systemColors.tertiaryBackground }]}>
                 <SummaryLine label={t('aurora.import.dialog.draftClimbs', { count: preview.climbs })} />
                 <SummaryLine label={t('aurora.import.dialog.ascents', { count: preview.ascents })} />
@@ -1286,10 +1415,11 @@ function ImportDialog({
           {phase === 'error' ? (
             <>
               <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.modalCopy}>
-                {t('aurora.mobile.importInterrupted')}
+                {fileError ?? t('aurora.mobile.importInterrupted')}
               </Text>
               <View style={styles.modalActions}>
                 <Button title={tCommon('actions.close')} onPress={onCancel} />
+                {fileError ? <Button title={t('aurora.mobile.importChooseAnother')} onPress={onRetry} /> : null}
               </View>
             </>
           ) : null}
@@ -1413,11 +1543,6 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     justifyContent: 'space-between',
     gap: spacing[3],
-  },
-  statusPill: {
-    borderRadius: borderRadius.full,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[1],
   },
   accountCopy: {
     marginTop: spacing[3],

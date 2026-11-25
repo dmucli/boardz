@@ -7,6 +7,7 @@
 import type { SmartPlaylistType } from '@boardsesh/graphql/operations/playlists';
 
 export type SmartPlaylistSlug =
+  | 'created-climbs'
   | 'five-stars'
   | 'most-repeated'
   | 'projects'
@@ -30,6 +31,14 @@ export type SmartPlaylistPresentation = {
 };
 
 export const SMART_PLAYLISTS: SmartPlaylistPresentation[] = [
+  {
+    type: 'CREATED_CLIMBS',
+    slug: 'created-climbs',
+    icon: '🛠️',
+    color: '#9C27B0',
+    titleI18nKey: 'library.smart.createdClimbs.title',
+    descriptionI18nKey: 'library.smart.createdClimbs.description',
+  },
   {
     type: 'RECOMMENDED_CROWD_FAVORITES',
     slug: 'crowd-favorites',
@@ -102,7 +111,43 @@ const BY_TYPE = new Map<SmartPlaylistType, SmartPlaylistPresentation>(
   SMART_PLAYLISTS.map((preset) => [preset.type, preset]),
 );
 
+/**
+ * Where a smart-playlist open came from, for `Smart Playlist Opened`. The
+ * screen event keeps `[type]` verbatim, so without this a Liked Climbs open
+ * cannot be told from any other smart list, or its entry point named.
+ */
+export type SmartPlaylistOpenSource = 'discover' | 'home' | 'other';
+
+const OPEN_SOURCES: readonly SmartPlaylistOpenSource[] = ['discover', 'home', 'other'];
+
+/** A deep link or an old caller carries no source: that reads as `other`. */
+export function parseSmartPlaylistOpenSource(raw: unknown): SmartPlaylistOpenSource {
+  return OPEN_SOURCES.find((source) => source === raw) ?? 'other';
+}
+
+/** The smart-playlist detail route, tagged with the surface that opened it. */
+export function smartPlaylistHref(type: SmartPlaylistType, source: SmartPlaylistOpenSource) {
+  return { pathname: '/(tabs)/discover/smart/[type]', params: { type, source } } as const;
+}
+
 /** Resolve a smart-playlist type to its presentation, or null when unknown. */
 export function smartPlaylistByType(type: string): SmartPlaylistPresentation | null {
   return BY_TYPE.get(type as SmartPlaylistType) ?? null;
+}
+
+/**
+ * The smart lists computed from a climber's own logbook. Only these take a sort
+ * and filters, and only these list their setters (#6651): the RECOMMENDED_*
+ * lists are already ranked for the climber, and the server rejects a view on one.
+ */
+export const LOGBOOK_SMART_TYPES = [
+  'LIKED_CLIMBS',
+  'FIVE_STARS',
+  'PROJECTS',
+  'MOST_REPEATED',
+] as const satisfies readonly SmartPlaylistType[];
+export type LogbookSmartType = (typeof LOGBOOK_SMART_TYPES)[number];
+
+export function isLogbookSmartType(type: string): type is LogbookSmartType {
+  return (LOGBOOK_SMART_TYPES as readonly string[]).includes(type);
 }

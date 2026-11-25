@@ -7,9 +7,10 @@ const analytics = vi.hoisted(() => ({ track: vi.fn() }));
 
 const queue = vi.hoisted(() => ({
   sessionId: null as string | null,
-  joinSession: vi.fn(async () => {}),
+  joinSession: vi.fn(async () => true),
   clearSession: vi.fn(async () => {}),
 }));
+const authGeneration = vi.hoisted(() => ({ value: 0 }));
 
 const router = vi.hoisted(() => ({ replace: vi.fn(), back: vi.fn() }));
 // The route's search params. `source` is set by a live-session card.
@@ -45,7 +46,13 @@ const slugBoardQuery = vi.hoisted(() => ({ data: null as unknown }));
 // Capture the confirmation card's Join button so the test can press it.
 const buttons = vi.hoisted(() => ({ joinPress: null as (() => void) | null }));
 
+vi.mock('../../../src/components/privacy/RequestResourceAccess', () => ({ RequestResourceAccess: () => null }));
 vi.mock('../../../src/lib/analytics', () => ({ track: analytics.track }));
+
+// The launch hold is covered by its own suite; here the screen renders as is.
+vi.mock('../../../src/components/launch-update/hold-until-launch-ready', () => ({
+  holdUntilLaunchReady: <Screen,>(Screen: Screen) => Screen,
+}));
 
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
@@ -68,9 +75,19 @@ vi.mock('@boardsesh/board-config', () => ({
 
 // The first Button rendered in the confirmation card is the Join action.
 vi.mock('../../../src/components/Button', () => ({
-  Button: ({ onPress }: { onPress?: () => void }) => {
+  Button: ({
+    onPress,
+    title,
+    variant,
+    size,
+  }: {
+    onPress?: () => void;
+    title?: string;
+    variant?: string;
+    size?: string;
+  }) => {
     if (buttons.joinPress === null && onPress) buttons.joinPress = onPress;
-    return createElement('button');
+    return createElement('button', { 'data-variant': variant ?? 'filled', 'data-size': size ?? 'medium' }, title);
   },
 }));
 vi.mock('../../../src/components/Text', () => ({
@@ -86,6 +103,10 @@ vi.mock('../../../src/providers/theme-provider', () => ({
   useTheme: () => ({ systemColors: {}, brandColors: {} }),
 }));
 vi.mock('../../../src/providers/auth-provider', () => ({ useAuth: () => ({ isAuthenticated: true }) }));
+vi.mock('../../../src/lib/auth-store', () => ({
+  captureAuthCredentialGeneration: () => authGeneration.value,
+  isAuthCredentialGenerationCurrent: (generation: number) => generation === authGeneration.value,
+}));
 vi.mock('../../../src/providers/queue-provider', () => ({
   useQueueSessionId: () => ({ sessionId: queue.sessionId }),
   useQueueActions: () => ({
@@ -96,26 +117,32 @@ vi.mock('../../../src/providers/queue-provider', () => ({
 vi.mock('../../../src/providers/toast-provider', () => ({ useToast: () => ({ showToast: vi.fn() }) }));
 vi.mock('../../../src/lib/graphql/hooks', () => ({
   useSessionPreview: () => preview,
-  useMyBoards: () => ({ data: { boards: [] }, refetch: vi.fn(async () => ({ data: { boards: [] } })) }),
   useCreateBoard: () => ({ mutateAsync: vi.fn(async () => ({})) }),
   useBoardBySlug: () => slugBoardQuery,
+  fetchAllMyOwnedBoards: vi.fn(async () => ({ viewerId: 'viewer-1', boards: [] })),
   fetchBoardBySlug: vi.fn(async () => null),
+  fetchBoardByUuid: vi.fn(async () => null),
+}));
+vi.mock('../../../src/lib/graphql/hooks/fetch-all-my-owned-boards', () => ({
+  fetchAllMyOwnedBoards: vi.fn(async () => ({ viewerId: 'viewer-1', boards: [] })),
 }));
 vi.mock('../../../src/lib/board-path-to-user-board', () => ({
   resolveBoardForSession: boardResolver.resolveBoardForSession,
 }));
-vi.mock('../../../src/theme/tokens', () => ({ spacing: {}, borderRadius: {} }));
+vi.mock('../../../src/theme/tokens', () => ({ spacing: {}, cardCorners: {} }));
 
 import JoinSessionScreen from '../[sessionId]';
 
 beforeEach(() => {
   analytics.track.mockClear();
+  authGeneration.value = 0;
   queue.sessionId = null;
   queue.joinSession.mockClear();
   router.replace.mockClear();
   buttons.joinPress = null;
   searchParams.current = { sessionId: 'session-42' };
   preview.data.boardPath = '/kilter/1/10/1,2/40';
+  preview.data.endedAt = null;
   boardConfig.parseBoardPath.mockReturnValue({ boardName: 'kilter', layoutId: 1, angle: 40 });
   boardConfig.parseNamedBoardPath.mockReturnValue(null);
   boardResolver.resolveBoardForSession.mockResolvedValue({ uuid: 'board-1', boardType: 'kilter', layoutId: 1 });
@@ -237,5 +264,21 @@ describe('JoinSessionScreen live-session funnel', () => {
     await waitFor(() => expect(queue.joinSession).toHaveBeenCalledTimes(1));
 
     expect(analytics.track).not.toHaveBeenCalledWith('Live Session Joined', expect.anything());
+  });
+});
+
+// HIG Buttons: a dead-end screen's only way out is not a prominent call to
+// action, and "Cancel" means abandoning a task that no longer exists here.
+describe('JoinSessionScreen ended session', () => {
+  it('offers a non-prominent Done instead of a large filled Cancel', () => {
+    preview.data.endedAt = '2026-10-01T10:00:00Z';
+    const { container } = render(createElement(JoinSessionScreen));
+
+    const exit = [...container.querySelectorAll('button')].find(
+      (button) => button.textContent === 'common:actions.done',
+    );
+    expect(exit?.getAttribute('data-variant')).toBe('outlined');
+    expect(exit?.getAttribute('data-size')).toBe('medium');
+    expect(container.textContent).not.toContain('mobileJoin.cancel');
   });
 });

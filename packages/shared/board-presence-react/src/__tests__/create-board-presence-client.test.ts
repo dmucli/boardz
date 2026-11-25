@@ -87,7 +87,7 @@ describe('createBoardPresenceClient', () => {
     const unsub = client.subscribeNowPlaying(42, onEvent, onError, onComplete);
 
     expect(harness.subscribe).toHaveBeenCalledTimes(1);
-    expect(harness.subscribeCalls[0].variables).toEqual({ boardId: 42 });
+    expect(harness.subscribeCalls[0].variables).toEqual({ boardId: 42, includeAurora: true });
     expect(harness.subscribeCalls[0].query).toContain('boardNowPlaying');
 
     const event: BoardPresenceEvent = { __typename: 'BoardClimbSet', climb: makeClimb('c1') };
@@ -401,5 +401,50 @@ describe('createBoardPresenceClient — onReconnect', () => {
     unsubscribe();
     harness.fireConnected();
     expect(callback).toHaveBeenCalledTimes(1);
+  });
+});
+
+it('forwards the held UUID to every presence read and the subscription', async () => {
+  const harness = makeTransport();
+  harness.setExecuteResult({
+    boardRecentHistory: [],
+    boardRecentClimbs: [],
+    boardHistory: [],
+    boardHistoryPage: { entries: [], nextCursor: null },
+    boardPresenceStats: null,
+    boardConnection: null,
+    boardClimbRecentSenders: [],
+  });
+  const client = createBoardPresenceClient(harness.transport);
+  const boardUuid = 'held-wall-uuid';
+  client.subscribeNowPlaying(42, vi.fn(), undefined, undefined, boardUuid);
+  await client.fetchRecentHistory(42, boardUuid);
+  await client.fetchRecentClimbs(42, boardUuid);
+  await client.fetchStats(42, boardUuid);
+  await client.fetchConnection(42, boardUuid);
+  await client.fetchHistory(42, { boardUuid });
+  await client.fetchHistoryPage(42, { boardUuid });
+  await client.fetchClimbRecentSenders(42, 'climb-uuid', 40, boardUuid);
+  for (const operation of [...harness.executeCalls, ...harness.subscribeCalls]) {
+    expect(operation.variables).toMatchObject({ boardId: 42, boardUuid });
+    expect(operation.query).toContain('$boardUuid: ID');
+    expect(operation.query).toContain('boardUuid: $boardUuid');
+  }
+  expect(harness.executeCalls).toHaveLength(7);
+});
+
+describe('Aurora history capability', () => {
+  it('opts every imported-history read into Aurora while preserving the wall access key', async () => {
+    const harness = makeTransport();
+    const client = createBoardPresenceClient(harness.transport);
+    const boardUuid = 'wall-access-key';
+    harness.setExecuteResult({ boardRecentHistory: [], boardHistoryPage: { entries: [], nextCursor: null } });
+    await client.fetchRecentHistory(42, boardUuid);
+    await client.fetchHistoryPage(42, { boardUuid, limit: 25 });
+    client.subscribeNowPlaying(42, () => {}, undefined, undefined, boardUuid);
+    for (const operation of [...harness.executeCalls, ...harness.subscribeCalls]) {
+      expect(operation.variables).toMatchObject({ boardId: 42, boardUuid, includeAurora: true });
+      expect(operation.query).toContain('includeAurora: $includeAurora');
+    }
   });
 });

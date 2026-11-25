@@ -1,5 +1,6 @@
+import { HoldFilterView } from '../../../src/components/climbs/HoldFilterView';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, Pressable, StyleSheet, useWindowDimensions } from 'react-native';
+import { useWindowDimensions, type LayoutChangeEvent } from 'react-native';
 import { useLocalSearchParams, useNavigation, useFocusEffect } from 'expo-router';
 import { useTranslation } from 'react-i18next';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -7,16 +8,19 @@ import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { getLayout } from '@boardsesh/board-constants/product-sizes';
 import { countFilteredHolds, parseHoldsFilter, toggleHoldFilterType } from '@boardsesh/climb-filters';
 import type { BoardName, HoldFilterEntry, HoldFilterMode, HoldFilterType, HoldsFilter } from '@boardsesh/shared-schema';
-import { Text } from '../../../src/components/Text';
-import { ActivityIndicator } from '../../../src/components/ActivityIndicator';
-import { InteractiveFilterBoard } from '../../../src/components/search/InteractiveFilterBoard';
-import { HoldFilterPicker } from '../../../src/components/search/HoldFilterPicker';
+import { HeaderTrailingButton } from '../../../src/components/HeaderActionButtons';
+import { HoldFilterHeatmapPanel } from '../../../src/components/search/heatmap/HoldFilterHeatmapPanel';
+import { useHoldFilterHeatmap } from '../../../src/components/search/heatmap/use-hold-filter-heatmap';
+import { parseHeatmapSearch } from '../../../src/components/search/heatmap/heatmap-search-input';
+import { ActionButton } from '../../../src/components/drawer-action-bar/DrawerActionBar';
 import { useTheme } from '../../../src/providers/theme-provider';
-import { useScreenshotBoardParams } from '../../../src/hooks/use-screenshot-board-params';
+import { useAuth } from '../../../src/providers/auth-provider';
+import { useActiveBoard } from '../../../src/lib/graphql/use-active-board';
 import { getCreateBoardHolds, parseSetIdsParam } from '../../../src/lib/create-board-holds';
 import { useSprayWallToken } from '../../../src/lib/spray/use-spray-wall-token';
 import { emitHoldsFilterSelection } from '../../../src/lib/hold-filter-handoff';
 import { track } from '../../../src/lib/analytics';
+import { hapticMedium } from '../../../src/lib/haptics';
 import { spacing } from '../../../src/theme/tokens';
 
 type Params = {
@@ -24,7 +28,17 @@ type Params = {
   layoutId?: string;
   sizeId?: string;
   setIds?: string;
+  angle?: string;
   holdsFilter?: string;
+  /** The filter sheet's draft search, for the heatmap. */
+  heatmapSearch?: string;
+  /**
+   * `off` from a list the heatmap cannot describe (a playlist): it counts the
+   * board's catalogue, not the list, so the flame is not offered.
+   */
+  heatmap?: string;
+  /** Which filter sheet gets the hold filter back (see lib/filter-picker-handoff-id.ts). */
+  handoffId?: string;
 };
 
 // Vertical space (px) reserved for the on-screen chrome around the board so the
@@ -43,25 +57,21 @@ const CHROME_BUDGET = 300;
  * types, and hands the edited filter back via `emitHoldsFilterSelection` when the
  * screen pops (Done or swipe-back). A pushed route — not a stacked sheet —
  * because native sheets can't stack above the filter sheet, and the board's
- * pan/pinch shouldn't fight a modal's pan. See docs/mobile-sheets-vs-routes.md.
+ * pan/pinch shouldn't fight a modal's pan. See docs/mobile/mobile-sheets-vs-routes.md.
  */
 export default function HoldFilterScreen() {
   const params = useLocalSearchParams<Params>();
   const navigation = useNavigation();
   const { t } = useTranslation('climbs');
-  const { systemColors, brandColors } = useTheme();
+  const { brandColors } = useTheme();
   const insets = useSafeAreaInsets();
   const { width: windowWidth, height: windowHeight } = useWindowDimensions();
 
-  // A screenshot deep link (`://climbs/holds`) opens this route with none of the
-  // params the filter sheet pushes, which would render an empty board. In
-  // screenshot mode only, fall back to the wall the capture activated on boot;
-  // `null` in every normal build and whenever the route carried a board.
-  const screenshotBoard = useScreenshotBoardParams(params.boardName);
-  const boardName = (screenshotBoard?.boardName ?? params.boardName ?? '') as BoardName;
-  const layoutId = Number(screenshotBoard?.layoutId ?? params.layoutId ?? 0);
-  const sizeId = Number(screenshotBoard?.sizeId ?? params.sizeId ?? 0);
-  const setIds = screenshotBoard?.setIds ?? params.setIds ?? '';
+  const boardName = (params.boardName ?? '') as BoardName;
+  const layoutId = Number(params.layoutId ?? 0);
+  const sizeId = Number(params.sizeId ?? 0);
+  const setIds = params.setIds ?? '';
+  const angle = Number(params.angle ?? 0);
   // Matches the web `boardLayout` property: the layout NAME (web sends
   // `boardDetails.layout_name`), not the numeric id, so the hold-filter events
   // join cleanly with web across platforms. Falls back to '' for unknown ids.
@@ -91,25 +101,75 @@ export default function HoldFilterScreen() {
     // `sprayToken` moves when the wall arrives or is reset.
   }, [boardName, layoutId, sizeId, setIds, sprayToken]);
 
+  // The hold heatmap, counting the climbs the sheet's other filters match. A
+  // read that answers from a downloaded board (or offers the download), which a
+  // signed-out climber has no way to use, so they get no toggle. A list that is
+  // not the board's catalogue (a playlist) turns it off: the heat would count
+  // climbs the list does not hold.
+  const { isAuthenticated } = useAuth();
+  const heatmapOffered = isAuthenticated && params.heatmap !== 'off';
+  const [heatmapDraft] = useState(() => parseHeatmapSearch(params.heatmapSearch));
+  const heatmap = useHoldFilterHeatmap({ boardName, layoutId, sizeId, setIds, angle, holds: boardHolds }, heatmapDraft);
+  const { data: activeBoard } = useActiveBoard();
+  const heatmapNudgeBoard =
+    activeBoard &&
+    activeBoard.boardType === boardName &&
+    activeBoard.layoutId === layoutId &&
+    activeBoard.sizeId === sizeId
+      ? activeBoard
+      : null;
+  const heatmapModeLabel =
+    heatmap.mode === 'grade'
+      ? t('mobile.heatmap.modes.grade')
+      : heatmap.mode === 'startsFinishes'
+        ? t('mobile.heatmap.modes.startsFinishes')
+        : t('mobile.heatmap.modes.climbs');
+  const { toggle: toggleHeatmap } = heatmap;
+  const handleToggleHeatmap = useCallback(() => {
+    hapticMedium();
+    toggleHeatmap();
+  }, [toggleHeatmap]);
+  const heatmapToggle = heatmapOffered ? (
+    <ActionButton
+      size="sm"
+      iconName={heatmap.enabled ? 'flame.fill' : 'flame'}
+      onPress={handleToggleHeatmap}
+      active={heatmap.enabled}
+      activeColor={brandColors.primary}
+      busy={heatmap.enabled && heatmap.isBusy}
+      checked={heatmap.enabled}
+      accessibilityLabel={t('mobile.heatmap.toggle')}
+      accessibilityValueText={heatmap.enabled ? heatmapModeLabel : undefined}
+    />
+  ) : null;
+
+  // The heatmap panel's measured height (0 while it renders nothing), so the
+  // board gives up exactly the room the legend, caption or download line takes.
+  const [heatmapPanelHeight, setHeatmapPanelHeight] = useState(0);
+  const handleHeatmapPanelLayout = useCallback((event: LayoutChangeEvent) => {
+    setHeatmapPanelHeight(Math.round(event.nativeEvent.layout.height));
+  }, []);
+  const chromeBudget = CHROME_BUDGET + heatmapPanelHeight;
   const boardRender = useMemo(() => {
     if (!boardHolds) return { width: 0, height: 0 };
     const boardAspect = boardHolds.boardWidth / boardHolds.boardHeight;
     const availWidth = windowWidth - spacing[4] * 2;
     // Clamp to a 200px floor so a short window (small device in landscape, or an
     // over-large CHROME_BUDGET estimate) never collapses the board to nothing.
-    const availHeight = Math.max(200, windowHeight - insets.top - insets.bottom - CHROME_BUDGET);
+    const availHeight = Math.max(200, windowHeight - insets.top - insets.bottom - chromeBudget);
     if (availWidth / availHeight > boardAspect) {
       return { width: availHeight * boardAspect, height: availHeight };
     }
     return { width: availWidth, height: availWidth / boardAspect };
-  }, [boardHolds, windowWidth, windowHeight, insets.top, insets.bottom]);
+  }, [boardHolds, windowWidth, windowHeight, insets.top, insets.bottom, chromeBudget]);
 
   // Hand the current filter back to the sheet whenever this screen loses focus
   // (Done button pops, or swipe-back). Matches the setters handoff timing.
+  const handoffId = params.handoffId ?? '';
   useFocusEffect(
     useCallback(() => {
-      return () => emitHoldsFilterSelection(holdsFilterRef.current);
-    }, []),
+      return () => emitHoldsFilterSelection({ handoffId, holdsFilter: holdsFilterRef.current });
+    }, [handoffId]),
   );
 
   // Paint the selected brush (type + include/exclude) onto the tapped hold:
@@ -151,70 +211,41 @@ export default function HoldFilterScreen() {
     navigation.setOptions({
       headerRight:
         filteredCount > 0
-          ? () => (
-              <Pressable onPress={handleClearAll} hitSlop={8} accessibilityRole="button">
-                <Text variant="subheadline" color={brandColors.primary}>
-                  {t('mobile.filter.clearAll')}
-                </Text>
-              </Pressable>
-            )
+          ? () => <HeaderTrailingButton label={t('mobile.filter.clearAll')} onPress={handleClearAll} />
           : undefined,
     });
-  }, [navigation, filteredCount, handleClearAll, brandColors.primary, t]);
-
-  if (!boardHolds || !boardName) {
-    return (
-      <View style={[styles.loading, { backgroundColor: systemColors.background }]}>
-        <ActivityIndicator size="large" />
-      </View>
-    );
-  }
+  }, [navigation, filteredCount, handleClearAll, t]);
 
   return (
-    <View style={[styles.container, { backgroundColor: systemColors.background }]}>
-      <View style={styles.boardSection}>
-        {/* Known follow-up (not in this PR): `BoardSearchConfig` doesn't carry a
-            `mirrored` flag today, so the board always renders un-mirrored here
-            and a mirrored search shows its hold rings on the opposite side. Wire
-            `mirrored` through `BoardSearchConfig` to fix it. */}
-        <InteractiveFilterBoard
-          boardName={boardName}
-          layoutId={layoutId}
-          sizeId={sizeId}
-          setIds={setIds}
-          boardWidth={boardHolds.boardWidth}
-          boardHeight={boardHolds.boardHeight}
-          holdTargets={boardHolds.holdTargets}
-          holdsFilter={holdsFilter}
-          onHoldTap={handleHoldTap}
-          renderWidth={boardRender.width}
-          renderHeight={boardRender.height}
-        />
-      </View>
-
-      <HoldFilterPicker
-        boardName={boardName}
-        selectedType={selectedType}
-        onSelectType={setSelectedType}
-        applyMode={applyMode}
-        onApplyModeChange={setApplyMode}
-      />
-    </View>
+    <HoldFilterView
+      board={
+        boardHolds && boardName
+          ? {
+              boardName,
+              layoutId,
+              sizeId,
+              setIds,
+              boardWidth: boardHolds.boardWidth,
+              boardHeight: boardHolds.boardHeight,
+              holdTargets: boardHolds.holdTargets,
+              holdsFilter,
+              onHoldTap: handleHoldTap,
+              renderWidth: boardRender.width,
+              renderHeight: boardRender.height,
+              underOverlay: heatmap.overlay,
+            }
+          : null
+      }
+      picker={{
+        boardName,
+        selectedType,
+        onSelectType: setSelectedType,
+        applyMode,
+        onApplyModeChange: setApplyMode,
+        modeRowAccessory: heatmapToggle,
+      }}
+      onHeatmapPanelLayout={handleHeatmapPanelLayout}
+      heatmapPanel={<HoldFilterHeatmapPanel heatmap={heatmap} boardName={boardName} nudgeBoard={heatmapNudgeBoard} />}
+    />
   );
 }
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  loading: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  boardSection: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-});

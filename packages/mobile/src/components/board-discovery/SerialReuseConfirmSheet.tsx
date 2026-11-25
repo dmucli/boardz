@@ -1,8 +1,11 @@
-import { Modal, Pressable, StyleSheet, View } from 'react-native';
+import { PressableSurface } from '../PressableSurface';
+import { Modal, StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import { spacing, borderRadius } from '../../theme/tokens';
 import { useTheme } from '../../providers/theme-provider';
+import { useWindowBottomInset } from '../../hooks/use-window-bottom-inset';
+import { useReduceMotion } from '../../hooks/use-reduce-motion';
 import { iosSystemColors } from '../../theme/ios-colors';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
@@ -33,6 +36,11 @@ type SerialReuseConfirmSheetProps = {
  * stats on one wall — with a de-emphasised "create a duplicate anyway" escape
  * hatch. A plain RN `Modal`, mirroring `BoardDisambiguationSheet`, so it works
  * from the create screen without a bottom-sheet host.
+ *
+ * Its buttons stay in the card rather than moving to a top bar: a two-choice
+ * confirmation is an alert / action sheet in HIG terms, and the card has no
+ * scroll body or keyboard for them to jump with. The card clears the window's
+ * bottom inset (home indicator / Android navigation bar) itself.
  */
 export function SerialReuseConfirmSheet({
   visible,
@@ -44,16 +52,29 @@ export function SerialReuseConfirmSheet({
 }: SerialReuseConfirmSheetProps) {
   const { systemColors } = useTheme();
   const { t } = useTranslation('boards');
+  const windowInsetBottom = useWindowBottomInset();
+  // Reduce Motion swaps the slide-up for a fade (HIG "Motion").
+  const reduceMotion = useReduceMotion();
 
   const boardName = board?.name ?? '';
   const location = board?.gymName ?? board?.locationName ?? null;
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
-      <Pressable style={styles.backdrop} onPress={onCancel}>
-        <Pressable
-          onPress={(event) => event.stopPropagation()}
-          style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}
+    <Modal visible={visible} transparent animationType={reduceMotion ? 'fade' : 'slide'} onRequestClose={onCancel}>
+      <View style={styles.backdrop}>
+        {/* Sibling, not parent: a tappable ancestor hides the card's buttons from VoiceOver. */}
+        <PressableSurface
+          accessible={false}
+          importantForAccessibility="no"
+          style={StyleSheet.absoluteFill}
+          onPress={onCancel}
+        />
+        <View
+          accessibilityViewIsModal
+          style={[
+            styles.card,
+            { backgroundColor: systemColors.secondaryBackground, paddingBottom: windowInsetBottom + spacing[4] },
+          ]}
         >
           <View style={styles.headingRow}>
             <Icon name="info" size={22} color={iosSystemColors.systemOrange} />
@@ -77,7 +98,7 @@ export function SerialReuseConfirmSheet({
                 </Text>
               ) : null}
               {board.ownerDisplayName ? (
-                <Text variant="footnote" color={systemColors.tertiaryLabel}>
+                <Text variant="footnote" color={systemColors.secondaryLabel}>
                   {board.ownerDisplayName}
                 </Text>
               ) : null}
@@ -89,13 +110,17 @@ export function SerialReuseConfirmSheet({
               title={t('boardForm.serialReuse.useExisting')}
               onPress={onUseExisting}
               variant="filled"
-              size="large"
               style={styles.primaryAction}
             />
           ) : null}
-          <Button title={t('boardForm.serialReuse.createAnyway')} onPress={onCreateAnyway} variant="text" />
-        </Pressable>
-      </Pressable>
+          <Button
+            title={t('boardForm.serialReuse.createAnyway')}
+            onPress={onCreateAnyway}
+            variant="text"
+            style={styles.fullWidth}
+          />
+        </View>
+      </View>
     </Modal>
   );
 }
@@ -110,7 +135,6 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: borderRadius.lg,
     borderTopRightRadius: borderRadius.lg,
     padding: spacing[4],
-    paddingBottom: spacing[8],
     maxHeight: '80%',
   },
   headingRow: {
@@ -133,6 +157,10 @@ const styles = StyleSheet.create({
     marginBottom: spacing[4],
   },
   primaryAction: {
+    alignSelf: 'stretch',
     marginBottom: spacing[2],
+  },
+  fullWidth: {
+    alignSelf: 'stretch',
   },
 });

@@ -11,7 +11,7 @@
 # `command:` (e.g. docker-compose, or Railway's custom start command), so one
 # image serves every CLI. kilter and aurora expose a long-running `daemon`;
 # moonboard is locations-only (no daemon subcommand); the scheduler's `start`
-# runs the cron loop and a /health server (see docs/scheduler.md):
+# runs the cron loop and a /health server (see docs/backend/scheduler.md):
 #   node --import tsx packages/kilter-sync/src/cli/index.ts daemon
 #   node --import tsx packages/aurora-sync/src/cli/index.ts daemon
 #   node --import tsx packages/moonboard-sync/src/cli/index.ts locations
@@ -33,6 +33,7 @@ COPY manifests/package.json manifests/pnpm-lock.yaml manifests/pnpm-workspace.ya
 # fetch: pnpm resolves patch hashes from the lockfile and needs the files.
 COPY manifests/patches ./patches
 COPY manifests/packages/db/patches ./packages/db/patches
+COPY manifests/packages/web/patches ./packages/web/patches
 
 # --- the NETWORK layer -------------------------------------------------------
 # `pnpm fetch` populates the store from the LOCKFILE ALONE, so this layer's

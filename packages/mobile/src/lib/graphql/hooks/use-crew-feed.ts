@@ -3,7 +3,7 @@ import { GET_CREW_FEED } from '@boardsesh/graphql/operations';
 import type { CrewFeedResult } from '@boardsesh/shared-schema';
 import { useStoredUserId } from '../../../hooks/use-current-user-id';
 import { getHttpClient } from '../client';
-import { screenshotModeNextPageParam } from '../../screenshot-mode';
+import { getDeviceTimezone } from '../../device-timezone';
 
 /**
  * The zone the server draws each setter's day boundary in, so a climb published
@@ -18,15 +18,7 @@ import { screenshotModeNextPageParam } from '../../screenshot-mode';
  * Intl on every render or wiring a foreground listener. The zone is part of the
  * query key, so the restart re-fetches rather than serving the old grouping.
  */
-function deviceTimeZone(): string | undefined {
-  try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-const TIME_ZONE = deviceTimeZone();
+const TIME_ZONE = getDeviceTimezone();
 
 export function useCrewFeed(enabled: boolean) {
   const { userId } = useStoredUserId(enabled);
@@ -42,11 +34,7 @@ export function useCrewFeed(enabled: boolean) {
         // for it crashes rather than ignoring it.
         input: { limit: 20, cursor: pageParam, timeZone: TIME_ZONE, groupClimbs: true },
       }),
-    getNextPageParam: (lastPage, allPages) =>
-      screenshotModeNextPageParam(
-        lastPage.crewFeed.hasMore ? (lastPage.crewFeed.cursor ?? undefined) : undefined,
-        allPages.length,
-      ),
+    getNextPageParam: (lastPage) => (lastPage.crewFeed.hasMore ? (lastPage.crewFeed.cursor ?? undefined) : undefined),
     enabled: enabled && !!userId,
   });
 }

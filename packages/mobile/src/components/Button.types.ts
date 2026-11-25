@@ -19,8 +19,14 @@ export type ButtonSize = 'small' | 'medium' | 'large';
  * middle/low-emphasis tiers drop their translucent Liquid Glass for a solid,
  * legible capsule. The filled CTA is solid on EVERY surface, so it never depends
  * on this.
+ *
+ * `glass` is a region that already IS Liquid Glass (a glass panel, island, or a
+ * native iOS 26 bar item, which wraps its content in a glass capsule). HIG
+ * Materials: never stack glass on glass, so the middle tier draws a `bordered`
+ * capsule instead, and every `GlassSurface` inside the region drops its own
+ * glass layer (see GlassSurface).
  */
-export type ButtonSurface = 'surface' | 'content';
+export type ButtonSurface = 'surface' | 'content' | 'glass';
 
 /**
  * Native semantic role. `destructive` paints the system red and adds the
@@ -47,10 +53,22 @@ export type ButtonProps = {
    * row of 44dp controls and must not be the one under the touch floor.
    */
   minHeight?: number;
+  /** Label scaling cap for fixed chrome. Unset or zero follows all system text sizes. */
+  maxFontSizeMultiplier?: number;
   /** See {@link ButtonSurface}. Per-button override of the surrounding provider. */
   over?: ButtonSurface;
   /** See {@link ButtonRole}. */
   role?: ButtonRole;
+  /**
+   * iOS only. Set it on a button that can mount while it is scrolled out of
+   * view, such as one in a list header that appears after a network answer.
+   * Each iOS button is its own SwiftUI host, and a host that mounts above the
+   * top of the screen insets its label by the safe area and keeps that inset
+   * when it scrolls back: the label then sits about 50pt below the button's
+   * own frame. With this on the host ignores every safe-area edge, not only
+   * the keyboard. No effect on Android or web.
+   */
+  ignoreContainerSafeArea?: boolean;
   /** Native test identifier (used by Maestro screenshot flows). */
   testID?: string;
   style?: ViewStyle;

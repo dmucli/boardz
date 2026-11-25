@@ -1,3 +1,4 @@
+import { playlistVisibilityCondition } from '@boardsesh/db/queries';
 import { eq, and, inArray, sql } from 'drizzle-orm';
 import { db } from '../../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
@@ -83,7 +84,38 @@ export type PublicPlaylistRow = {
   creatorName: string;
   climbCount: number;
   generatedRecommendation: string | null;
+  /** From the LEFT JOIN on `playlist_grade_summaries`: all null when the playlist has no summary. */
+  gradedClimbCount?: number | null;
+  gradeMin?: number | null;
+  gradeP10?: number | null;
+  gradeMedian?: number | null;
+  gradeP90?: number | null;
+  gradeMax?: number | null;
 };
+
+/** The `PlaylistGradeSummary` of a public playlist row, or null when it has none. */
+export function formatGradeSummary(
+  p: Pick<PublicPlaylistRow, 'gradedClimbCount' | 'gradeMin' | 'gradeP10' | 'gradeMedian' | 'gradeP90' | 'gradeMax'>,
+) {
+  if (
+    p.gradedClimbCount == null ||
+    p.gradeMin == null ||
+    p.gradeP10 == null ||
+    p.gradeMedian == null ||
+    p.gradeP90 == null ||
+    p.gradeMax == null
+  ) {
+    return null;
+  }
+  return {
+    gradedClimbCount: p.gradedClimbCount,
+    minDifficulty: p.gradeMin,
+    p10Difficulty: p.gradeP10,
+    medianDifficulty: p.gradeMedian,
+    p90Difficulty: p.gradeP90,
+    maxDifficulty: p.gradeMax,
+  };
+}
 
 /** Transform a public playlist DB row into the GraphQL response shape. */
 export function formatPublicPlaylist(p: PublicPlaylistRow) {
@@ -102,47 +134,33 @@ export function formatPublicPlaylist(p: PublicPlaylistRow) {
     creatorId: p.creatorId,
     creatorName: p.creatorName,
     isGeneratedRecommendation: p.generatedRecommendation !== null,
+    gradeSummary: formatGradeSummary(p),
   };
+}
+
+/**
+ * The caller may not read this playlist. Same message as the plain error it
+ * replaces, so clients see no change; the type lets the share card answer a 404
+ * without treating every other failure as one.
+ */
+export class PlaylistAccessDeniedError extends Error {
+  constructor() {
+    super('Playlist not found or access denied');
+    this.name = 'PlaylistAccessDeniedError';
+  }
 }
 
 /**
  * Check if a user has access to a playlist. Returns the numeric playlist ID.
  * Throws if playlist not found or user lacks access to a private playlist.
  */
+export { playlistVisibilityCondition, playlistPrivacyCondition } from '@boardsesh/db/queries';
 export async function verifyPlaylistAccess(playlistUuid: string, userId: string | null): Promise<bigint> {
-  const playlistResult = await db
-    .select({
-      id: dbSchema.playlists.id,
-      isPublic: dbSchema.playlists.isPublic,
-    })
+  const [playlist] = await db
+    .select({ id: dbSchema.playlists.id })
     .from(dbSchema.playlists)
-    .where(eq(dbSchema.playlists.uuid, playlistUuid))
+    .where(and(eq(dbSchema.playlists.uuid, playlistUuid), playlistVisibilityCondition(userId)))
     .limit(1);
-
-  if (playlistResult.length === 0) {
-    throw new Error('Playlist not found or access denied');
-  }
-
-  if (!playlistResult[0].isPublic) {
-    if (!userId) {
-      throw new Error('Playlist not found or access denied');
-    }
-
-    const ownershipResult = await db
-      .select({ role: dbSchema.playlistOwnership.role })
-      .from(dbSchema.playlistOwnership)
-      .where(
-        and(
-          eq(dbSchema.playlistOwnership.playlistId, playlistResult[0].id),
-          eq(dbSchema.playlistOwnership.userId, userId),
-        ),
-      )
-      .limit(1);
-
-    if (ownershipResult.length === 0) {
-      throw new Error('Playlist not found or access denied');
-    }
-  }
-
-  return playlistResult[0].id;
+  if (!playlist) throw new PlaylistAccessDeniedError();
+  return playlist.id;
 }

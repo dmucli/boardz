@@ -1,34 +1,31 @@
 // @vitest-environment jsdom
 //
-// The three sheet props the tick-sheet redesign added — `surface`,
-// `footerSurface` and `header` — for BOTH wrappers, since Sheet and ModalSheet
-// carry byte-identical copies of that code and a fix applied to one has already
-// been forgotten on the other.
-//
-// The load-bearing case is `surface="solid"`. @expo/ui's `extractBackgroundColor`
-// (BottomSheet.ios.tsx:26) does `typeof color === 'string'` and SILENTLY falls
-// back to the glass material for anything else — a `PlatformColor`, an
-// `OpaqueColorValue`, a themed object. No warning, no error: the form just goes
-// see-through again. So the assertion here is on the string-ness of the value,
-// not only on which token it came from.
+// Both wrappers share one sheet background rule (useSheetBackgroundStyle). On
+// iOS the native Apple presentation shows unless Material or Reduce
+// Transparency picks an opaque plain-string colour. On Android and web every
+// sheet paints the opaque `sheetSurface`: an unset colour lets Android's
+// Compose sheet fall back to the phone wallpaper's colours. The iOS resolver's mode selection is
+// tested separately in use-ios-sheet-background-style.test.tsx.
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render } from '@testing-library/react';
 import { createElement, forwardRef, type ComponentType, type ReactNode, type Ref } from 'react';
 
-// What the wrappers hand the native sheet: the background style (the `surface`
-// decision), the KeyboardAvoidingView's style (the #3330 detent bound), the
+// What the wrappers hand the native sheet: the background style, the chrome column's style (the #3330 detent bound), the
 // scroll body's style, and every plain View style (the footer bar is found
 // among them by its hairline top border).
 const captures = vi.hoisted(() => ({
   backgroundStyle: undefined as unknown,
-  kavRendered: false,
-  kavStyle: undefined as unknown,
+  columnRendered: false,
+  columnStyle: undefined as unknown,
   scrollStyle: undefined as unknown,
   viewStyles: [] as unknown[],
 }));
+const iosBackground = vi.hoisted(() => ({ style: undefined as { backgroundColor: string } | undefined }));
+// Read on every render, so a test can switch platform after the imports.
+const platform = vi.hoisted(() => ({ OS: 'ios' as 'ios' | 'android' | 'web' }));
 
 type SheetMockProps = { children?: ReactNode; backgroundStyle?: unknown };
-type ViewMockProps = { children?: ReactNode; style?: unknown };
+type ViewMockProps = { children?: ReactNode; style?: unknown; testID?: string };
 
 // Faithful recursive flatten (nested arrays merge left-to-right) so the tests
 // read the effective style the way React Native would.
@@ -60,20 +57,25 @@ vi.mock('react-native', () => ({
   // numeric detent bound, which is the thing the header test checks lands on a
   // single in-flow child.
   Platform: {
-    OS: 'ios',
+    get OS() {
+      return platform.OS;
+    },
     Version: '26.1',
-    select: (options: { ios?: unknown; android?: unknown }) => options.ios,
+    select: (options: Record<string, unknown>) => options[platform.OS] ?? options.default,
   },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
-  View: ({ children, style }: ViewMockProps) => {
+  View: ({ children, style, testID }: ViewMockProps) => {
+    if (testID === 'sheet-chrome-column') {
+      captures.columnRendered = true;
+      captures.columnStyle = style;
+    }
     captures.viewStyles.push(style);
     return createElement('div', null, children);
   },
-  KeyboardAvoidingView: ({ children, style }: ViewMockProps) => {
-    captures.kavRendered = true;
-    captures.kavStyle = style;
-    return createElement('div', { 'data-kav': 'true' }, children);
-  },
+  // The keyboard stays down here; sheet-keyboard-inset.test.tsx drives it.
+  Keyboard: { addListener: () => ({ remove: () => {} }), isVisible: () => false, metrics: () => undefined },
+  LayoutAnimation: { configureNext: () => {} },
   useWindowDimensions: () => ({ width: 390, height: 844 }),
   StyleSheet: {
     create: (styles: Record<string, unknown>) => styles,
@@ -99,7 +101,11 @@ vi.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, bottom: 34, left: 0, right: 0 }),
 }));
 
-vi.mock('../../lib/haptics', () => ({ hapticMedium: vi.fn() }));
+vi.mock('../../lib/haptics', () => ({ hapticMedium: vi.fn(), hapticSelection: vi.fn() }));
+
+vi.mock('../use-ios-sheet-background-style', () => ({
+  useIosSheetBackgroundStyle: () => iosBackground.style,
+}));
 
 // The coordinator's serialization is covered by sheet-presentation-provider.test.tsx.
 vi.mock('../../providers/sheet-presentation-provider', () => ({
@@ -122,10 +128,12 @@ vi.mock('../../providers/sheet-presentation-provider', () => ({
 // The real token factory, not a hand-rolled partial: `sheetSurface` has to be
 // the value production resolves, or the `typeof === 'string'` assertion below
 // would be testing the mock rather than the theme.
+const uiVariant = vi.hoisted(() => ({ current: 'liquidGlass' as 'liquidGlass' | 'material' }));
+
 vi.mock('../../providers/theme-provider', async () => {
   const { makeThemeMock } = await import('../../test/theme-mock');
-  const theme = makeThemeMock();
-  return { useTheme: () => theme };
+  const themes = { liquidGlass: makeThemeMock(), material: makeThemeMock({ variant: 'material' }) };
+  return { useTheme: () => themes[uiVariant.current] };
 });
 
 import { Sheet } from '../Sheet';
@@ -138,7 +146,6 @@ const theme = makeThemeMock();
 // vs ManagedSheetHandle), which is irrelevant here — none of these tests take a ref.
 type SheetLikeProps = {
   children?: ReactNode;
-  surface?: 'glass' | 'solid';
   footerSurface?: 'plate' | 'flush';
   footer?: ReactNode;
   header?: ReactNode;
@@ -158,33 +165,43 @@ function footerBarStyle(): Record<string, unknown> {
 }
 
 beforeEach(() => {
+  platform.OS = 'ios';
+  uiVariant.current = 'liquidGlass';
+  iosBackground.style = undefined;
   captures.backgroundStyle = undefined;
-  captures.kavRendered = false;
-  captures.kavStyle = undefined;
+  captures.columnRendered = false;
+  captures.columnStyle = undefined;
   captures.scrollStyle = undefined;
   captures.viewStyles = [];
 });
 
+describe('ModalSheet footer seam on Material', () => {
+  it('drops the hairline on a flush footer', () => {
+    uiVariant.current = 'material';
+    render(
+      <ModalSheet footerSurface="flush" footer={<div>save</div>}>
+        <div>body</div>
+      </ModalSheet>,
+    );
+
+    expect(footerBarStyle().borderTopWidth).toBe(0);
+  });
+
+  it('keeps the hairline on a plate footer', () => {
+    uiVariant.current = 'material';
+    render(
+      <ModalSheet footer={<div>save</div>}>
+        <div>body</div>
+      </ModalSheet>,
+    );
+
+    expect(footerBarStyle().borderTopWidth).toBe(1);
+  });
+});
+
 describe.each(sheetWrappers)('%s surface props', (_name, SheetLike) => {
-  describe('surface', () => {
-    it('paints the opaque sheetSurface as a PLAIN STRING when solid', () => {
-      // @expo/ui keeps a PlatformColor out of the native background with no
-      // error — a regression to a themed/opaque colour value would be invisible
-      // at runtime and only show up as a see-through data-entry form.
-      render(
-        <SheetLike surface="solid">
-          <div>body</div>
-        </SheetLike>,
-      );
-
-      const background = flattenStyle(captures.backgroundStyle);
-      expect(background.backgroundColor).toBe(theme.sheetSurface);
-      expect(typeof background.backgroundColor).toBe('string');
-    });
-
-    it('leaves the native glass background untouched by default', () => {
-      // Pre-change behaviour: no backgroundStyle at all, so the native material
-      // (iOS 26 glass / Material scrim) draws the ground.
+  describe('background', () => {
+    it('leaves the native Apple background untouched by default', () => {
       render(
         <SheetLike>
           <div>body</div>
@@ -194,14 +211,52 @@ describe.each(sheetWrappers)('%s surface props', (_name, SheetLike) => {
       expect(captures.backgroundStyle).toBeUndefined();
     });
 
-    it('leaves the native glass background untouched when explicitly glass', () => {
+    it('uses an opaque plain-string iOS override', () => {
+      // The real resolver selects this override for Material or Reduce
+      // Transparency. @expo/ui silently ignores non-string colours.
+      iosBackground.style = { backgroundColor: theme.sheetSurface };
+
       render(
-        <SheetLike surface="glass">
+        <SheetLike>
           <div>body</div>
         </SheetLike>,
       );
 
-      expect(captures.backgroundStyle).toBeUndefined();
+      const background = flattenStyle(captures.backgroundStyle);
+      expect(background.backgroundColor).toBe(theme.sheetSurface);
+      expect(typeof background.backgroundColor).toBe('string');
+    });
+
+    describe.each(['android', 'web'] as const)('on %s', (os) => {
+      beforeEach(() => {
+        platform.OS = os;
+      });
+
+      it('paints the opaque sheet surface', () => {
+        // Left unset, @expo/ui's Android sheet hands Compose no container
+        // colour and the sheet takes the phone wallpaper's colours.
+        render(
+          <SheetLike>
+            <div>body</div>
+          </SheetLike>,
+        );
+
+        const background = flattenStyle(captures.backgroundStyle);
+        expect(background.backgroundColor).toBe(theme.sheetSurface);
+        expect(typeof background.backgroundColor).toBe('string');
+      });
+
+      it('ignores the iOS-only override', () => {
+        iosBackground.style = { backgroundColor: '#123456' };
+
+        render(
+          <SheetLike>
+            <div>body</div>
+          </SheetLike>,
+        );
+
+        expect(flattenStyle(captures.backgroundStyle).backgroundColor).toBe(theme.sheetSurface);
+      });
     });
   });
 
@@ -220,10 +275,10 @@ describe.each(sheetWrappers)('%s surface props', (_name, SheetLike) => {
     });
 
     it('goes transparent when flush, keeping the hairline top border', () => {
-      // Flush footers sit on a `surface="solid"` sheet: the plate would read as
-      // a second ground, but the seam still needs its hairline.
+      // Flush footers sit on an opaque sheet: the plate would read as a second
+      // ground, but the seam still needs its hairline.
       render(
-        <SheetLike surface="solid" footerSurface="flush" footer={<div>save</div>}>
+        <SheetLike footerSurface="flush" footer={<div>save</div>}>
           <div>body</div>
         </SheetLike>,
       );
@@ -250,7 +305,7 @@ describe.each(sheetWrappers)('%s surface props', (_name, SheetLike) => {
       expect(header.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     });
 
-    it('takes the KeyboardAvoidingView branch, so the #3330 column bound lands on one in-flow child', () => {
+    it('takes the chrome-column branch, so the #3330 column bound lands on one in-flow child', () => {
       // A header alone (no footer) must still wrap the body: the native sheet
       // takes exactly ONE in-flow child, and that child is what carries the iOS
       // detent bound. Default snap points ['50%','90%'] at index 0 on an 844pt
@@ -262,8 +317,8 @@ describe.each(sheetWrappers)('%s surface props', (_name, SheetLike) => {
         </SheetLike>,
       );
 
-      expect(captures.kavRendered).toBe(true);
-      expect(flattenStyle(captures.kavStyle)).toEqual({ height: 390 });
+      expect(captures.columnRendered).toBe(true);
+      expect(flattenStyle(captures.columnStyle)).toEqual({ height: 390 });
       expect(flattenStyle(captures.scrollStyle)).toEqual({ flex: 1 });
     });
 
@@ -276,7 +331,7 @@ describe.each(sheetWrappers)('%s surface props', (_name, SheetLike) => {
         </SheetLike>,
       );
 
-      expect(captures.kavRendered).toBe(false);
+      expect(captures.columnRendered).toBe(false);
       expect(flattenStyle(captures.scrollStyle)).toEqual({ height: 390 });
     });
 

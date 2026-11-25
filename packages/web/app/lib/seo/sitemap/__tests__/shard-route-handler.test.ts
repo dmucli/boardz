@@ -1,11 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import type { PopularBoardConfig } from '@boardsesh/shared-schema';
+import { SUPPORTED_BOARDS } from '@boardsesh/shared-schema';
+import { APP_GUIDE_HUB_PATH, getBoardAppGuidePath } from '@/app/lib/i18n/published-locales';
 import type { SitemapItem } from '../entries';
 import { expandAllLocales } from '../entries';
 import { playlistRowsToItems } from '../playlist-entries';
 import { CLIMB_URLS_PER_SHARD, MAX_ITEMS_PER_SHARD, MAX_SHARD_BYTES, renderUrlset } from '../sitemap-xml';
 
 vi.mock('server-only', () => ({}));
+// Authorization is exercised separately in privacy-filter.test.ts.
+vi.mock('../privacy-filter', () => ({ filterPublicSitemapItems: async <Item>(items: Item[]) => items }));
 
 const FULL_CACHE_CONTROL = 'public, s-maxage=3600, stale-while-revalidate=86400';
 const DEGRADED_CACHE_CONTROL = 'public, s-maxage=60, must-revalidate';
@@ -29,7 +33,7 @@ const boardConfigs = vi.hoisted(() => ({ shouldThrow: false, empty: false, hang:
 const playlistRows = vi.hoisted(() => ({ count: 1, uuidLength: 0, shouldThrow: false, hang: false, delayMs: 0 }));
 const climbSummary = vi.hoisted(() => ({ itemCount: 25_000, shouldThrow: false, hang: false, delayMs: 0 }));
 const setterSummary = vi.hoisted(() => ({ itemCount: 12_000, shouldThrow: false, hang: false, delayMs: 0 }));
-/** `static` and `gyms` are pure builders — flags let the full index fail, or stall, at once. */
+/** Flags let the pure fixed-shard builders fail or stall along with the full index. */
 const pureBuilders = vi.hoisted(() => ({ shouldThrow: false, hang: false, delayMs: 0 }));
 
 /** Never settles: the failure mode a try/catch cannot see. */
@@ -74,12 +78,12 @@ vi.mock('../playlist-query', () => ({
 }));
 
 /**
- * The registry wraps these three in `async () => build()`, so handing back a
+ * The registry wraps these four in `async () => build()`, so handing back a
  * pending or delayed promise is what a hung/slow I/O call looks like from the
  * index's side once it awaits — the cast is the price of faking that through a
  * sync signature.
  */
-const pureBuilder = (real: () => SitemapItem[]): SitemapItem[] => {
+const pureBuilder = (real: () => SitemapItem[] | Promise<SitemapItem[]>): SitemapItem[] | Promise<SitemapItem[]> => {
   if (pureBuilders.hang) {
     return forever<SitemapItem[]>() as unknown as SitemapItem[];
   }
@@ -95,6 +99,10 @@ const pureBuilder = (real: () => SitemapItem[]): SitemapItem[] => {
 vi.mock('../static-entries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../static-entries')>();
   return { ...actual, buildStaticEntries: () => pureBuilder(actual.buildStaticEntries) };
+});
+vi.mock('../app-guide-entries', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../app-guide-entries')>();
+  return { ...actual, buildAppGuideEntries: () => pureBuilder(actual.buildAppGuideEntries) };
 });
 vi.mock('../gym-entries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../gym-entries')>();
@@ -114,6 +122,11 @@ vi.mock('../setter-query', () => ({
     return { itemCount: setterSummary.itemCount, lastModified: new Date('2026-05-04T00:00:00.000Z') };
   },
   buildSetterSitemapItems: async () => [],
+}));
+// Build plans remain empty while their pages are noindex. Routing the stub
+// through `pureBuilder` keeps them in the throw and stall scenarios too.
+vi.mock('../build-plans-entries', () => ({
+  buildBuildPlansEntries: () => pureBuilder(() => []),
 }));
 
 vi.mock('../climb-store', () => ({
@@ -264,19 +277,40 @@ describe('buildSitemapIndexXml', () => {
 
     expect(xml).toContain('<sitemapindex');
     expect(xml).toContain('https://www.boardsesh.com/sitemaps/static.xml');
+    expect(xml).toContain(
+      '<loc>https://www.boardsesh.com/sitemaps/app-guides.xml</loc>\n    <lastmod>2026-11-24T00:00:00.000Z</lastmod>',
+    );
     expect(xml).toContain('https://www.boardsesh.com/sitemaps/boards.xml');
     expect(xml).toContain('https://www.boardsesh.com/sitemaps/playlists.xml');
-    // gyms and setters are declared-empty, so they stay out of the index — but
+    // Gyms is declared-empty, so it stays out of the index — but
     // "nobody has published a gym yet" and "the gyms query regressed to []" are
     // indistinguishable from here, so the omission is logged rather than silent.
     expect(xml).not.toContain('/sitemaps/gyms.xml');
     expect(warnings.join(' ')).toContain('gyms');
     // `setters` is a paged, data-backed shard now, so it IS listed — one entry
     // per page, derived from its summary rather than hardcoded.
-    expect(xml).toContain('https://www.boardsesh.com/sitemaps/setters/1.xml');
+    expect(xml).toContain('https://www.boardsesh.com/sitemaps/setters/1.xml.gz');
+    // Build plans deliberately remain noindex, so omitting them is expected.
+    expect(xml).not.toContain('/sitemaps/build-plans.xml');
+    expect(warnings.join(' ')).not.toContain('build-plans');
     // An empty shard is not a degradation: nothing failed, so the response keeps
     // the full cache window.
     expect(degradedShards).toEqual([]);
+  });
+
+  it('keeps empty user-content warnings while quietly omitting build plans', async () => {
+    playlistRows.count = 0;
+
+    const response = await sitemapIndexRouteHandler();
+    const xml = await response.text();
+
+    expect(response.status).toBe(200);
+    expect(xml).not.toContain('/sitemaps/playlists.xml');
+    expect(xml).not.toContain('/sitemaps/build-plans.xml');
+    expect(warnings.join(' ')).toContain('playlists');
+    expect(warnings.join(' ')).not.toContain('build-plans');
+    expect(response.headers.get('cache-control')).toBe(FULL_CACHE_CONTROL);
+    expect(response.headers.get('x-sitemap-degraded')).toBeNull();
   });
 
   it('lists one climb page per CLIMB_URLS_PER_SHARD items the summary reports', async () => {
@@ -285,7 +319,7 @@ describe('buildSitemapIndexXml', () => {
     const { xml } = await buildSitemapIndexXml();
     const pages = Math.ceil(climbSummary.itemCount / CLIMB_URLS_PER_SHARD);
     for (let page = 1; page <= pages; page += 1) {
-      expect(xml).toContain(`https://www.boardsesh.com/sitemaps/climbs/${page}.xml`);
+      expect(xml).toContain(`https://www.boardsesh.com/sitemaps/climbs/${page}.xml.gz`);
     }
     expect(xml).not.toContain(`/sitemaps/climbs/${pages + 1}.xml`);
   });
@@ -387,13 +421,14 @@ describe('buildSitemapIndexXml', () => {
 
     expect(response.status).toBe(503);
     expect(response.headers.get('cache-control')).toBe('no-store');
-    expect(errors.join(' ')).toContain('6 of 6 builders failed');
+    expect(errors.join(' ')).toContain('8 of 8 builders failed');
+    expect(errors.join(' ')).toContain('shard "build-plans" failed');
   });
 
   it('serves the rest of the index when a builder never settles', async () => {
     // The case a try/catch cannot see: a builder that stalls rather than
-    // rejecting holds the request to the platform timeout, which 5xxes all six
-    // shards. `fetchPlaylistSitemapRows` has no bound of its own, so this is not
+    // rejecting holds the request to the platform timeout, which 5xxes every
+    // shard. `fetchPlaylistSitemapRows` has no bound of its own, so this is not
     // hypothetical.
     vi.useFakeTimers();
     boardConfigs.hang = true;
@@ -425,13 +460,13 @@ describe('buildSitemapIndexXml', () => {
 
     expect(response.status).toBe(200);
     expect(xml).toContain('/sitemaps/static.xml');
-    expect(xml).toContain('/sitemaps/climbs/1.xml');
+    expect(xml).toContain('/sitemaps/climbs/1.xml.gz');
     expect(xml).not.toContain('/sitemaps/setters/');
     expect(response.headers.get('x-sitemap-degraded')).toBe('setters');
     expect(errors.join(' ')).toContain(`exceeded its ${SHARD_DEADLINE_MS}ms deadline`);
   });
 
-  it('keeps every shard when all six are slow but each is inside its own deadline', async () => {
+  it('keeps every shard when they are all slow but each is inside its own deadline', async () => {
     // The walk is bounded by max(builder), not sum(builder). An earlier draft
     // sequenced the shards under a shared 8s budget, which made this exact case
     // drop `playlists` — last in the registry, so the deterministic victim —
@@ -499,6 +534,27 @@ describe('locale expansion is observable in the rendered shard', () => {
     expect(xml).toContain('<loc>');
     // The whole point of the change: no /de, /es or /fr climb-list URLs.
     expect(xml).not.toMatch(/<loc>[^<]*boardsesh\.com\/(de|es|fr)\//);
+  });
+
+  it('publishes the six English guide URLs with their editorial update dates', async () => {
+    const { GET } = await import('@/app/sitemaps/app-guides.xml/route');
+    const response = await GET();
+    const xml = await response.text();
+    const locations = [...xml.matchAll(/<loc>([^<]+)<\/loc>/g)].map(([, location]) => location);
+    // Every board's guide, minus the `#brand` sections of /apps/aurora: one URL per page.
+    const paths = [
+      ...new Set([APP_GUIDE_HUB_PATH, ...SUPPORTED_BOARDS.map((board) => getBoardAppGuidePath(board).split('#')[0])]),
+    ];
+
+    expect(response.status).toBe(200);
+    expect(paths).toHaveLength(6);
+    expect(locations.sort()).toEqual(paths.map((path) => `https://www.boardsesh.com${path}`).sort());
+    expect(xml).not.toContain('#');
+    expect(xml).not.toContain('xhtml:link');
+    expect(xml.match(/<lastmod>2026-11-24T00:00:00.000Z<\/lastmod>/g)).toHaveLength(6);
+    expect(xml).toContain(
+      '<loc>https://www.boardsesh.com/compare/spray-wall-apps</loc>\n    <lastmod>2026-11-24T00:00:00.000Z</lastmod>',
+    );
   });
 
   it('emits one URL per item with no alternates block, not one per locale', async () => {

@@ -11,6 +11,7 @@
 // role / selection assertions. Component tests that assert AppMenu internals register
 // their own vi.mock, which takes precedence over this alias.
 
+import { Fragment } from 'react';
 import { Pressable, Text, View } from 'react-native';
 // The shared props type has no native imports, so it's safe to pull into the node-env
 // stub — keeps the stub's contract from drifting from the real component.
@@ -20,32 +21,40 @@ export function AppMenu(props: AppMenuProps) {
   const { actions, onSelectIndex, accessibilityLabel, accessibilityHint } = props;
   return (
     <View>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={accessibilityLabel ?? props.label}
-        accessibilityHint={accessibilityHint}
-      >
-        {/* An icon anchor renders a glyph, so it has no visible text to mirror —
+      {props.trigger === 'longPress' ? (
+        props.children
+      ) : (
+        <Pressable
+          accessibilityRole="button"
+          accessibilityLabel={accessibilityLabel ?? props.label}
+          accessibilityHint={accessibilityHint}
+        >
+          {/* An icon anchor renders a glyph, so it has no visible text to mirror —
             its `accessibilityLabel` is the only name it has, and it is required
             for exactly that reason. Deliberately NOT echoed as text here: doing
             so would let a screen test find by text an anchor that shows none. */}
-        <Text>{props.label}</Text>
-      </Pressable>
-      {actions.map((action, index) => (
-        <Pressable
-          key={`${index}-${action.label}`}
-          accessibilityRole="button"
-          accessibilityState={{ selected: action.selected, disabled: action.disabled }}
-          // Mirrors the real component's shared guard: a disabled row keeps its
-          // position (indices address actions) but never reports a selection.
-          disabled={action.disabled}
-          onPress={() => {
-            if (action.disabled) return;
-            onSelectIndex(index);
-          }}
-        >
-          <Text>{action.label}</Text>
+          <Text>{props.label}</Text>
         </Pressable>
+      )}
+      {actions.map((action, index) => (
+        <Fragment key={`${index}-${action.label}`}>
+          {/* The real menus draw a separator here (never above the first row).
+              An `hr`, not a button, so it takes no index — same as theirs. */}
+          {action.dividerBefore && index > 0 ? <hr /> : null}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ selected: action.selected, disabled: action.disabled }}
+            // Mirrors the real component's shared guard: a disabled row keeps its
+            // position (indices address actions) but never reports a selection.
+            disabled={action.disabled}
+            onPress={() => {
+              if (action.disabled) return;
+              onSelectIndex(index);
+            }}
+          >
+            <Text>{action.label}</Text>
+          </Pressable>
+        </Fragment>
       ))}
     </View>
   );

@@ -5,6 +5,8 @@ import type { GradeDisplayFormat } from './grade-colors';
 const STORE_NAME = 'preferences';
 
 export type UserPreferenceKeyMap = {
+  /** The visitor's deliberate marketing screenshot preview choice, across document navigation. */
+  marketingPreviewPlatform: 'ios' | 'android';
   libraryTab: 'playlists' | 'logbook';
   logbookPreferences: LogbookPreferences;
   'swipeHint:climbListSeen': boolean;
@@ -41,7 +43,26 @@ export type UserPreferenceKeyMap = {
    * future visits. The owner variant of the card is not dismissible.
    */
   'homeGymCard:dismissed': boolean;
+  /**
+   * The month (`YYYY-MM`, UTC) the visitor closed the homepage's support banner
+   * in (`components/home/home-support-banner.tsx`). It stays closed for the
+   * rest of that month and comes back on the 1st of the next.
+   */
+  'supportBanner:closedMonth': string;
+  /**
+   * The visitor reached the thank-you state on `/support?thanks=1`. The
+   * homepage's support banner never shows again in this browser.
+   */
+  'supportBanner:supporter': boolean;
   lastUsedGrade: number;
+  /**
+   * A random UUID that a signed-out visitor's feature-flag requests bucket on,
+   * so a percentage rollout stays put across page loads and across the consent
+   * answer, and when it was minted (epoch ms; replaced after 13 months). Flags
+   * only; never on a captured event. A bare UUID string is what preview builds
+   * before the lifetime stored; it is replaced on read. See anonymous-flags-id.ts.
+   */
+  anonymousFlagsId: { id: string; createdAt: number } | string;
 };
 
 // Map of IDB preference keys to their legacy localStorage keys for one-time migration
@@ -171,12 +192,13 @@ export type { GradeDisplayFormat } from './grade-colors';
 // The canonical definition lives in grade-colors.ts.
 
 /**
- * Get the grade display format preference.
- * Defaults to 'v-grade' if not set.
+ * Get the grade display format the climber picked, or null when they never
+ * picked one (the caller then falls back to the locale's default).
  */
-export const getGradeDisplayFormat = async (): Promise<GradeDisplayFormat> => {
+export const getGradeDisplayFormat = async (): Promise<GradeDisplayFormat | null> => {
   const value = await getPreference<GradeDisplayFormat>('gradeDisplayFormat');
-  return value === 'font' ? 'font' : 'v-grade';
+  if (value === 'font' || value === 'v-grade') return value;
+  return null;
 };
 
 /**

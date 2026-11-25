@@ -2,6 +2,11 @@ import { defineConfig } from 'vite-plus';
 
 const shellQuote = (filePath: string) => `'${filePath.replaceAll("'", "'\\''")}'`;
 const isGeneratedFile = (filePath: string) => filePath.includes('/generated/');
+// Shipped SQLite definitions preserve their recorded bytes. Validate this file
+// without letting the staged formatter rewrite historical migration content.
+const isHistoricalMigrationSource = (filePath: string) =>
+  filePath.endsWith('/packages/shared/offline-sync/src/db/migrations.ts') ||
+  filePath === 'packages/shared/offline-sync/src/db/migrations.ts';
 // board-controller is a vendored minified bundle — re-formatting it
 // in the pre-commit hook produces noisy diffs (Prettier rewraps long
 // minified lines) every time someone stages an unrelated file
@@ -28,7 +33,7 @@ export default defineConfig({
     //
     // Markdown is not formatted at all. The formatter rewrites emphasis spans,
     // and its pairing does not follow CommonMark's intraword-underscore rule:
-    // on docs/websocket-implementation.md it paired the `_` inside the bare
+    // on docs/backend/websocket-implementation.md it paired the `_` inside the bare
     // identifier `NOT_FOUND` with a later `_signed-in_` and emitted
     // `NOT*FOUND` + `\_signed-in*`, silently corrupting an identifier in prose.
     // Reproducible on every run. Prose gains little from auto-formatting and
@@ -82,7 +87,7 @@ export default defineConfig({
       // Catch unmemoized React context values (the inline `value={{ ... }}`
       // anti-pattern that re-renders every consumer). Warn repo-wide so the
       // pre-existing web/test violations don't fail CI; promoted to `error` for
-      // the mobile + shared-react surfaces below. See docs/react-native-performance.md.
+      // the mobile + shared-react surfaces below. See docs/mobile/react-native-performance.md.
       //
       // NOTE: vite-plus's bundled linter (@oxlint/plugins) does not currently
       // *execute* these two off-by-default `react/*` rules — they show in
@@ -140,7 +145,12 @@ export default defineConfig({
     ],
   },
   test: {
+    // Preserve mock history from setup and beforeAll when upgrading from Vitest 4.
+    clearMocks: false,
+    // Keep project Vite servers separate, matching the previous runner.
+    sharedViteServer: false,
     projects: [
+      './packages/mcp/vite.config.ts',
       './packages/web/vite.config.ts',
       './packages/backend/vite.config.ts',
       './packages/backend/vite.serial.config.ts',
@@ -161,12 +171,16 @@ export default defineConfig({
       './packages/shared/spray-wall-geometry/vite.config.ts',
       './packages/shared/board-look/vite.config.ts',
       './packages/shared/board-render/vite.config.ts',
+      './packages/shared/frosted-bokeh/vite.config.ts',
       './packages/shared/velvet-tokens/vite.config.ts',
       './packages/shared/text-redaction/vite.config.ts',
       './packages/shared/pr-body/vite.config.ts',
       './packages/shared/board-react/vite.config.ts',
       './packages/shared/create-climb-react/vite.config.ts',
       './packages/shared/queue/vite.config.ts',
+      './packages/shared/led-controller/vite.config.ts',
+      './packages/shared/wled-ble-protocol/vite.config.ts',
+      './packages/shared/privacy/vite.config.ts',
       './packages/shared/offline-sync/vite.config.ts',
       './packages/shared/logbook/vite.config.ts',
       './packages/shared/queue-runtime/vite.config.ts',
@@ -176,6 +190,7 @@ export default defineConfig({
       './packages/shared/playlists-react/vite.config.ts',
       './packages/shared/party-profile/vite.config.ts',
       './packages/shared/watch-pairing/vite.config.ts',
+      './packages/shared/auth-protocol/vite.config.ts',
       './packages/shared/analytics/vite.config.ts',
       './packages/shared/climb-actions/vite.config.ts',
       './packages/shared/key-value-storage/vite.config.ts',
@@ -184,10 +199,15 @@ export default defineConfig({
       './packages/shared/profile-stats/vite.config.ts',
       './packages/shared/session-inference/vite.config.ts',
       './packages/shared/playlist-generator/vite.config.ts',
+      './packages/shared/workout-summary/vite.config.ts',
+      './packages/shared/connected-apps/vite.config.ts',
       './packages/shared/climb-filters/vite.config.ts',
       './packages/shared/gym-filters/vite.config.ts',
       './packages/shared/community-roles/vite.config.ts',
+      './packages/shared/consent/vite.config.ts',
       './packages/shared/gym-claim/vite.config.ts',
+      './packages/shared/directory-moderation/vite.config.ts',
+      './packages/shared/public-api/vite.config.ts',
       './packages/shared/kiosk/vite.config.ts',
       './packages/shared/i18n/vite.config.ts',
       './packages/shared/graphql/vite.config.ts',
@@ -204,9 +224,16 @@ export default defineConfig({
   staged: {
     '*.{ts,tsx,js,mjs,cjs}': (stagedFileNames) => {
       const lintableFileNames = stagedFileNames.filter(
-        (fileName) => !isGeneratedFile(fileName) && !isVendoredBundle(fileName),
+        (fileName) =>
+          !isGeneratedFile(fileName) && !isVendoredBundle(fileName) && !isHistoricalMigrationSource(fileName),
       );
-      return lintableFileNames.length > 0 ? `vp check --fix ${lintableFileNames.map(shellQuote).join(' ')}` : [];
+      const historicalMigrationSources = stagedFileNames.filter(isHistoricalMigrationSource);
+      return [
+        ...(lintableFileNames.length > 0 ? [`vp check --fix ${lintableFileNames.map(shellQuote).join(' ')}`] : []),
+        ...(historicalMigrationSources.length > 0
+          ? [`vp check ${historicalMigrationSources.map(shellQuote).join(' ')}`]
+          : []),
+      ];
     },
     'packages/web/app/**/*.{ts,tsx}': () => ['vp run check:i18n', 'vp run check:i18n:orphans'],
     'packages/mobile/{src,app}/**/*.{ts,tsx}': () => 'vp run check:i18n:orphans',
@@ -222,11 +249,61 @@ export default defineConfig({
     // seam crossfade, the veil buckets), and the traced-art shards are hashed
     // into the version directly — both change pixels without touching anything
     // else listed here.
-    '{packages/board-renderer/wasm/pkg/**,packages/shared/board-look/src/**,packages/shared/board-art-geometry/src/generated/**,packages/shared/board-render/src/**,packages/shared/board-config/src/**,packages/board-constants/src/**,packages/web/public/images/**}':
+    '{packages/board-renderer/wasm/pkg/**,packages/shared/board-look/src/**,packages/shared/board-art-geometry/src/generated/**,packages/shared/board-render/{src/**,assets/**},packages/shared/frosted-bokeh/{src/**,assets/**},packages/backend/src/services/spray-og-card.ts,packages/shared/board-config/src/**,packages/board-constants/src/**,packages/web/public/images/**}':
       () => 'vp run check:board-render-version',
   },
   run: {
     tasks: {
+      'auth:rehearsal': {
+        command: 'tsx scripts/auth-rehearsal/index.ts',
+        cache: false,
+      },
+      'auth:rehearsal:synthetic': {
+        command: 'tsx scripts/auth-rehearsal/index.ts synthetic',
+        cache: false,
+      },
+      'auth:revoke-sessions': {
+        command: 'tsx packages/backend/src/scripts/auth-revoke-sessions.ts',
+        cache: false,
+      },
+      'auth:import-identities': {
+        command: 'tsx packages/backend/src/scripts/auth-import-identities.ts',
+        cache: false,
+      },
+      'auth:reconcile-identities': {
+        command: 'tsx packages/backend/src/scripts/auth-reconcile-identities.ts',
+        cache: false,
+      },
+      // BA-04 web writer fence (docs/auth/better-auth-writer-fence-proof.md). `plan` is the
+      // default and read-only; `verify` is read-only; `apply` needs the plan's SHA-256.
+      'auth:fence': {
+        command: 'tsx packages/backend/src/scripts/auth-fence.ts',
+        cache: false,
+      },
+      'test:auth-identities': {
+        command: 'vp test run --config packages/backend/vite.auth-identities.config.ts --maxWorkers=2 --reporter=agent',
+        cache: false,
+      },
+      'qa:boards': {
+        command: 'tsx scripts/board-qa.ts',
+        cache: false,
+      },
+      'qa:boards:auth-drop': {
+        command: 'tsx scripts/board-qa-auth-drop.ts',
+        cache: false,
+      },
+      'qa:boards:ios-driver': {
+        command: 'tsx scripts/board-qa-ios-driver.ts',
+        cache: false,
+      },
+      'qa:boards:simulator-peer': {
+        command: 'tsx scripts/board-qa-simulator-peer.ts',
+        cache: false,
+      },
+      'qa:boards:test-usb': {
+        command: 'uv run --script scripts/board-qa/usb-serial.test.py',
+        cache: false,
+      },
       // --- Database ---
       'db:up': {
         command: 'bash scripts/dev-db-up.sh',
@@ -326,6 +403,12 @@ export default defineConfig({
       },
       'test:db': {
         command: 'pnpm --filter @boardsesh/db run test',
+      },
+      'test:db:user-reference-catalog': {
+        command: 'node --import tsx scripts/verify-user-reference-catalog.ts --run',
+        // Creates its own offline cluster; never starts or adopts the shared development DB.
+        // Explicit source/head/image/output arguments are required. A missing argument fails.
+        cache: false,
       },
       // The migration-journal node:test suite CI runs (from ci.yml's db-migrations
       // job, against its current PostgreSQL service). It builds its own throwaway
@@ -476,17 +559,19 @@ export default defineConfig({
       codegen: {
         command:
           'tsx packages/shared-schema/scripts/print-schema.ts && graphql-codegen && vp fmt packages/shared-schema/src/generated/ packages/shared/graphql/src/generated/',
-        input: [
-          'codegen.ts',
-          'packages/shared-schema/scripts/print-schema.ts',
-          'packages/shared-schema/src/schema/**/*.ts',
-          'packages/shared-schema/src/types/**/*.ts',
-          'packages/shared/graphql/src/**/*.ts',
-          '!packages/shared/graphql/src/generated/**',
-          'packages/web/app/**/*.{ts,tsx}',
-          '!packages/web/app/lib/graphql/**',
-          '!packages/web/**/*.test.{ts,tsx}',
-        ],
+        cache: {
+          input: [
+            'codegen.ts',
+            'packages/shared-schema/scripts/print-schema.ts',
+            'packages/shared-schema/src/schema/**/*.ts',
+            'packages/shared-schema/src/types/**/*.ts',
+            'packages/shared/graphql/src/**/*.ts',
+            '!packages/shared/graphql/src/generated/**',
+            'packages/web/app/**/*.{ts,tsx}',
+            '!packages/web/app/lib/graphql/**',
+            '!packages/web/**/*.test.{ts,tsx}',
+          ],
+        },
       },
 
       // --- Build (topological order via dependsOn) ---
@@ -544,7 +629,7 @@ export default defineConfig({
         // the static fallback on NODE_ENV=development — but the flag is still
         // read at request time (the Expo auth bridge in app/layout.tsx, the
         // middleware /app carve-out), so keep it in the key.
-        env: ['BOARDSESH_WEB'],
+        cache: { env: ['BOARDSESH_WEB'] },
       },
       'build:expo-web': {
         // Static Expo web export into packages/web/public/app (gitignored) —
@@ -574,6 +659,18 @@ export default defineConfig({
         command: 'tsx packages/web/scripts/check-untranslated-strings.ts',
         cache: false,
       },
+      // Writer copy for /apps and /compare/spray-wall-apps -> appGuides.json + the page registry.
+      // `vp run app-guides:import -- <copy-dir> [--allow-pending] [--check]`; see the script header.
+      'app-guides:import': {
+        command: 'tsx scripts/app-guides/import-copy.ts',
+        cache: false,
+      },
+      // The all-storefront App Store rating the app guides show; prints the JSON for
+      // BOARDSESH_APP_STORE_RATING. One public lookup per storefront, 300 ms apart.
+      'app-guides:rating': {
+        command: 'tsx scripts/app-guides/app-store-rating.ts',
+        cache: false,
+      },
       // Render design previews, publish them to dev storage, and update links.
       'design:mockups': {
         command: 'tsx packages/web/scripts/capture-design-mockups.ts',
@@ -598,9 +695,48 @@ export default defineConfig({
       // Silent screen recordings, for the gestures a still cannot teach. The raw
       // .mov files are gitignored device captures under .boardsesh/help-clips/raw;
       // this writes the committed mp4/webm pair plus a webp poster frame.
-      // Recording contract and size budget: docs/help-clips.md.
+      // Recording contract and size budget: docs/marketing/help-clips.md.
       'help:convert-clips': {
         command: 'tsx scripts/help-convert-clips.ts',
+        cache: false,
+      },
+      // Homepage showcase video. `video:record` drives the simulators and
+      // writes the footage + anchors under .boardsesh/showcase-video/work
+      // (runbook: docs/marketing/showcase-video.md); `video:render` renders
+      // marketing/showcase-video/ frame by frame in Chromium and encodes
+      // its targets: homepage + social by default, `--target all` for the store
+      // and ad cuts (see its --help). `video` runs both.
+      'video:record': {
+        command: 'tsx scripts/showcase-video-record.ts',
+        cache: false,
+      },
+      'video:tutorial': {
+        command: 'tsx scripts/instructional-video.ts',
+        cache: false,
+      },
+      'video:tutorial:publish': {
+        command: 'tsx scripts/instructional-video-publish.ts',
+        cache: false,
+      },
+      'video:render': {
+        command: 'tsx packages/web/scripts/render-showcase-video.ts',
+        cache: false,
+      },
+      video: {
+        command: 'vp run video:record && vp run video:render',
+        cache: false,
+      },
+      // The /help/spray-walls walkthrough uses current iPhone takes.
+      'video:spray-walkthrough': {
+        command: 'tsx packages/web/scripts/render-spray-walkthrough.ts',
+        cache: false,
+      },
+      'video:spray-walkthrough:landscape': {
+        command: 'tsx packages/web/scripts/render-spray-walkthrough-landscape.ts',
+        cache: false,
+      },
+      'video:spray-editor': {
+        command: 'tsx packages/web/scripts/render-spray-editor.ts',
         cache: false,
       },
       // Two-way i18n guard: catalog keys with no reference, code references with
@@ -625,11 +761,29 @@ export default defineConfig({
         command: 'tsx scripts/upload-static-assets.ts',
         cache: false,
       },
+      'upload:next-static-assets': {
+        command: 'tsx scripts/upload-next-static-assets.ts',
+        cache: false,
+      },
+      'storage:migrate-static-assets': {
+        command: 'tsx scripts/migrate-static-assets.ts',
+        cache: false,
+      },
       // One-shot migration of the Railway object-storage bucket into the two
       // Cloudflare R2 buckets. Needs both credential sets; see
-      // docs/user-media-storage.md for the runbook.
+      // docs/operations/user-media-storage.md for the runbook.
       'storage:migrate-user-media': {
         command: 'tsx scripts/migrate-user-media.ts',
+        cache: false,
+      },
+      // One-shot, no-delete copy of the live XPRem bucket from Tigris to R2.
+      // Source credentials are read from Railway; see docs/operations/mobile-ota-updates.md.
+      'storage:migrate-ota': {
+        command: 'tsx scripts/migrate-ota-storage.ts',
+        cache: false,
+      },
+      'storage:verify-snapshots': {
+        command: 'tsx scripts/verify-board-snapshots.ts',
         cache: false,
       },
       'generate:acknowledgements': {
@@ -684,6 +838,36 @@ export default defineConfig({
         command: 'node --import tsx scripts/generate-board-render-version.ts --check',
         cache: false,
       },
+      // The token tables in docs/design/ai-design-guidelines.md, generated from the real
+      // token sources between `velvet-tokens` markers. `check:` is the drift gate.
+      'docs:velvet-tokens': {
+        command: 'node --import tsx scripts/generate-velvet-token-tables.ts',
+        cache: false,
+      },
+      'check:velvet-tokens': {
+        command: 'node --import tsx scripts/generate-velvet-token-tables.ts --check',
+        cache: false,
+      },
+      'check:docs': {
+        command: 'node --import tsx scripts/check-docs.ts',
+        cache: false,
+      },
+      // The public /v1 contract as a committed document, so a contract change is
+      // a reviewable JSON diff. `check:` is the drift gate.
+      'generate:public-api-openapi': {
+        command: 'node --import tsx scripts/generate-public-api-openapi.ts',
+        cache: false,
+      },
+      'check:public-api-openapi': {
+        command: 'node --import tsx scripts/generate-public-api-openapi.ts --check',
+        cache: false,
+      },
+      // A change to that document needs a changelog entry: the newest entry names
+      // its hash, and on a PR (PR_BASE_SHA) published entries may not change.
+      'check:public-api-changelog': {
+        command: 'node --import tsx scripts/check-public-api-changelog.ts',
+        cache: false,
+      },
       'check:changelog': {
         command: 'node --import tsx scripts/generate-changelog.ts --check',
         cache: false,
@@ -735,7 +919,7 @@ export default defineConfig({
       },
       'test:service-deploy-inputs': {
         command:
-          'node --test scripts/check-service-deploy-inputs.test.mjs scripts/production-backend-smoke.test.mjs scripts/production-deploy-changes.test.mjs scripts/production-deploy-watchdog.test.mjs scripts/production-web-deploy-targets.test.mjs scripts/railway-deployment-rollback.test.mjs scripts/railway-deployment-status.test.mjs scripts/mobile-ota-schema-ready.test.mjs scripts/mobile-ota-server-ready.test.mjs',
+          'node --test scripts/check-service-deploy-inputs.test.mjs scripts/production-backend-smoke.test.mjs scripts/production-deploy-changes.test.mjs scripts/production-deploy-watchdog.test.mjs scripts/production-web-deploy-targets.test.mjs scripts/railway-deployment-rollback.test.mjs scripts/railway-deployment-status.test.mjs scripts/mobile-ota-schema-ready.test.mjs scripts/mobile-ota-server-ready.test.mjs scripts/ota-server-deploy.test.mjs scripts/mobile-ota-unlock-wait.test.mjs',
         cache: false,
       },
       'check:service-deploy-inputs': {
@@ -760,6 +944,7 @@ export default defineConfig({
       // changed to ship build tooling into production images.
       'typecheck:scripts': {
         command: 'tsc -p scripts/tsconfig.json',
+        dependsOn: ['codegen'],
       },
       'typecheck:shared': {
         command: 'pnpm --filter @boardsesh/shared-schema run typecheck',
@@ -777,20 +962,33 @@ export default defineConfig({
         command: 'pnpm --filter @boardsesh/web run typecheck',
         dependsOn: ['build:web'],
       },
+      'typecheck:auth-proofs': {
+        command: 'tsc -p packages/web/auth-proofs/tsconfig.json --noEmit',
+        // The proofs import both packages; always verify their explicit TS project.
+        cache: false,
+      },
       'typecheck:ble-protocol': {
         command: 'pnpm --filter @boardsesh/ble-protocol run typecheck',
+        dependsOn: ['codegen'],
       },
       'typecheck:queue': {
         command: 'pnpm --filter @boardsesh/queue run typecheck',
       },
+      'typecheck:privacy': {
+        command: 'pnpm --filter @boardsesh/privacy run typecheck',
+      },
       'typecheck:queue-runtime': {
         command: 'pnpm --filter @boardsesh/queue-runtime run typecheck',
+        dependsOn: ['codegen'],
       },
       'typecheck:offline-sync': {
         command: 'pnpm --filter @boardsesh/offline-sync run typecheck',
+        // The mutation whitelist drift test reads generated schema types.
+        dependsOn: ['codegen'],
       },
       'typecheck:queue-react': {
         command: 'pnpm --filter @boardsesh/queue-react run typecheck',
+        dependsOn: ['codegen'],
       },
       'typecheck:board-presence': {
         command: 'pnpm --filter @boardsesh/board-presence run typecheck',
@@ -802,18 +1000,35 @@ export default defineConfig({
       },
       'typecheck:playlists-react': {
         command: 'pnpm --filter @boardsesh/playlists-react run typecheck',
+        dependsOn: ['codegen'],
       },
       'typecheck:board-react': {
         command: 'pnpm --filter @boardsesh/board-react run typecheck',
+        dependsOn: ['codegen'],
       },
       'typecheck:create-climb-react': {
         command: 'pnpm --filter @boardsesh/create-climb-react run typecheck',
+        // This compiler follows shared-schema source while codegen rewrites it.
+        dependsOn: ['codegen'],
       },
       'typecheck:party-profile': {
         command: 'pnpm --filter @boardsesh/party-profile run typecheck',
       },
       'typecheck:watch-pairing': {
         command: 'pnpm --filter @boardsesh/watch-pairing run typecheck',
+      },
+      'typecheck:auth-protocol': {
+        command: 'pnpm --filter @boardsesh/auth-protocol run typecheck',
+      },
+      'typecheck:public-api': {
+        command: 'pnpm --filter @boardsesh/public-api run typecheck',
+      },
+      'typecheck:mcp': {
+        command: 'vp exec tsc --noEmit -p packages/mcp/tsconfig.json',
+      },
+      'package:mcp': {
+        command: 'node packages/mcp/scripts/package.mjs',
+        cache: false,
       },
       'typecheck:analytics': {
         command: 'pnpm --filter @boardsesh/analytics run typecheck',
@@ -826,12 +1041,24 @@ export default defineConfig({
       },
       'typecheck:climb-actions': {
         command: 'pnpm --filter @boardsesh/climb-actions run typecheck',
+        dependsOn: ['codegen'],
       },
       'typecheck:key-value-storage': {
         command: 'pnpm --filter @boardsesh/key-value-storage run typecheck',
       },
+      'typecheck:wled-ble-protocol': {
+        command: 'pnpm --filter @boardsesh/wled-ble-protocol run typecheck',
+        cache: false,
+      },
+      'typecheck:led-controller': {
+        command: 'pnpm --filter @boardsesh/led-controller run typecheck',
+      },
       'typecheck:board-config': {
         command: 'pnpm --filter @boardsesh/board-config run typecheck',
+        dependsOn: ['codegen'],
+      },
+      'typecheck:frosted-bokeh': {
+        command: 'pnpm --filter @boardsesh/frosted-bokeh run typecheck',
       },
       'typecheck:board-render': {
         command: 'pnpm --filter @boardsesh/board-render run typecheck',
@@ -849,6 +1076,7 @@ export default defineConfig({
       },
       'typecheck:play-view': {
         command: 'pnpm --filter @boardsesh/play-view run typecheck',
+        dependsOn: ['codegen'],
       },
       'typecheck:playback-react': {
         command: 'pnpm --filter @boardsesh/playback-react run typecheck',
@@ -861,6 +1089,12 @@ export default defineConfig({
       'typecheck:playlist-generator': {
         command: 'pnpm --filter @boardsesh/playlist-generator run typecheck',
       },
+      'typecheck:workout-summary': {
+        command: 'pnpm --filter @boardsesh/workout-summary run typecheck',
+      },
+      'typecheck:connected-apps': {
+        command: 'pnpm --filter @boardsesh/connected-apps run typecheck',
+      },
       'typecheck:climb-filters': {
         command: 'pnpm --filter @boardsesh/climb-filters run typecheck',
         dependsOn: ['codegen'],
@@ -871,6 +1105,12 @@ export default defineConfig({
       },
       'typecheck:community-roles': {
         command: 'pnpm --filter @boardsesh/community-roles run typecheck',
+      },
+      'typecheck:directory-moderation': {
+        command: 'pnpm --filter @boardsesh/directory-moderation run typecheck',
+      },
+      'typecheck:consent': {
+        command: 'pnpm --filter @boardsesh/consent run typecheck',
       },
       'typecheck:kiosk': {
         command: 'pnpm --filter @boardsesh/kiosk run typecheck',
@@ -953,14 +1193,17 @@ export default defineConfig({
       typecheck: {
         command: 'true',
         dependsOn: [
+          'typecheck:mcp',
           'typecheck:scripts',
           'typecheck:pr-body',
           'build:shared',
           'build:db',
           'build:backend',
           'typecheck:web',
+          'typecheck:auth-proofs',
           'typecheck:ble-protocol',
           'typecheck:queue',
+          'typecheck:privacy',
           'typecheck:queue-runtime',
           'typecheck:offline-sync',
           'typecheck:queue-react',
@@ -971,11 +1214,16 @@ export default defineConfig({
           'typecheck:create-climb-react',
           'typecheck:party-profile',
           'typecheck:watch-pairing',
+          'typecheck:auth-protocol',
+          'typecheck:public-api',
           'typecheck:analytics',
           'typecheck:climb-actions',
           'typecheck:key-value-storage',
+          'typecheck:led-controller',
+          'typecheck:wled-ble-protocol',
           'typecheck:board-config',
           'typecheck:board-render',
+          'typecheck:frosted-bokeh',
           'typecheck:board-art-geometry',
           'typecheck:hold-detection',
           'typecheck:hold-detector',
@@ -984,9 +1232,13 @@ export default defineConfig({
           'typecheck:playback-react',
           'typecheck:profile-stats',
           'typecheck:playlist-generator',
+          'typecheck:workout-summary',
+          'typecheck:connected-apps',
           'typecheck:climb-filters',
           'typecheck:gym-filters',
           'typecheck:community-roles',
+          'typecheck:directory-moderation',
+          'typecheck:consent',
           'typecheck:kiosk',
           'typecheck:i18n',
           'typecheck:email',
@@ -1058,6 +1310,63 @@ export default defineConfig({
         command: 'vp test run --project backend && vp test run --project backend-serial',
         cache: false,
       },
+      'test:native-contract': {
+        command: 'vp test run --config packages/backend/vite.native-contract.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:auth-mirror': {
+        command:
+          'BOARDSESH_MIRROR_PROOF_MODE=on vp test run --config packages/backend/vite.auth-mirror.config.ts --maxWorkers=2 --reporter=agent',
+        cache: false,
+      },
+      // BA-04 identity mirror boot and import preconditions, end to end on a copy
+      // of the fresh canonical proof database (docs/auth/better-auth-identity-import.md).
+      'test:identity-import-proof': {
+        command:
+          'vp test run --config packages/backend/vite.identity-import-proof.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:credential-writer': {
+        command:
+          'vp test run --config packages/backend/vite.credential-writer-proof.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:provider-credential-writer': {
+        command:
+          'vp test run --config packages/backend/vite.provider-credential-writer-proof.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:first-password-credential-writer': {
+        command:
+          'vp test run --config packages/backend/vite.first-password-proof.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:native-handoff-credential-writer': {
+        command:
+          'vp test run --config packages/backend/vite.native-handoff-proof.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:browser-renewal-credential-writer': {
+        command:
+          'vp test run --config packages/backend/vite.browser-renewal-proof.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:auth-authority': {
+        command: 'vp test run --config packages/backend/vite.auth-authority.config.ts --maxWorkers=2 --reporter=agent',
+        cache: false,
+      },
+      // The full-schema case needs AUTH_FENCE_TEST_SCHEMA_FILE and a loopback
+      // AUTH_FENCE_TEST_DATABASE_URL; without them only the unit cases run.
+      'test:auth-fence': {
+        command: 'vp test run --config packages/backend/vite.auth-fence.config.ts --maxWorkers=1 --reporter=agent',
+        cache: false,
+      },
+      'test:auth-web-credential-proof': {
+        command:
+          'vp test run --config packages/web/auth-proofs/credential-proof.vite.config.ts --maxWorkers=1 --reporter=agent',
+        dependsOn: ['typecheck:auth-proofs'],
+        cache: false,
+      },
       // The offline-sync engine suites live in their own Vitest project
       // (packages/shared/offline-sync/vite.config.ts, name: 'offline-sync').
       // Neither `test:mobile` nor the backend project pulls them in, so a
@@ -1095,6 +1404,16 @@ export default defineConfig({
         // after a release bundle exists, so it runs inside the native workflows
         // rather than in ci.yml.
         command: 'tsx scripts/mobile-embedded-commit-time-check.ts',
+        cache: false,
+      },
+      'check:mobile-android-obfuscation': {
+        // Postcondition for a minified Android release: assert R8 actually ran
+        // and actually renamed things, by reading its own mapping.txt. A grep for
+        // the gradle property passes even when the property name is wrong for the
+        // template, which is the failure that put Google Play at Obfuscation 1%
+        // in the first place. Only meaningful after a release build, so it runs
+        // inside the native workflows rather than in ci.yml.
+        command: 'tsx scripts/mobile-android-obfuscation-check.ts',
         cache: false,
       },
       'check:mobile-fingerprint-inputs': {
@@ -1152,6 +1471,10 @@ export default defineConfig({
         command: 'tsx scripts/mobile-profile-ios.ts',
         cache: false,
       },
+      'mobile:profile': {
+        command: 'tsx scripts/mobile-profile.ts',
+        cache: false,
+      },
       'mobile:screenshot': {
         command: 'bash scripts/mobile-screenshot.sh',
         cache: false,
@@ -1162,13 +1485,13 @@ export default defineConfig({
       },
       // The record/replay backend the store capture points the app at, so the
       // screenshots are a pure function of the JS bundle rather than of what
-      // PROD happened to answer. See docs/mobile-screenshot-fixtures.md.
+      // PROD happened to answer. See docs/qa/mobile-screenshot-fixtures.md.
       'mobile:screenshot-backend': {
         command: 'tsx scripts/screenshot-backend.ts',
         cache: false,
       },
       // Fold the per-shard fixture sets a recording fan-out produced into the
-      // single snapshot published to dev storage. See docs/mobile-screenshot-fixtures.md.
+      // single snapshot published to dev storage. See docs/qa/mobile-screenshot-fixtures.md.
       'mobile:screenshot-fixtures-fetch': {
         command: 'tsx scripts/screenshot-fixtures-fetch.ts',
         cache: false,
@@ -1185,7 +1508,7 @@ export default defineConfig({
       // across an already-recorded set. The recorder does this itself now; this
       // is the one-off for a set recorded before it did (and the `--check` a
       // downloaded recording artifact should pass). See
-      // docs/mobile-screenshot-fixtures.md.
+      // docs/qa/mobile-screenshot-fixtures.md.
       'mobile:screenshot-fixtures-pseudonymise': {
         command: 'tsx scripts/screenshot-fixtures-pseudonymise.ts',
         cache: false,
@@ -1222,6 +1545,10 @@ export default defineConfig({
         command: 'tsx scripts/frame-screenshots.ts',
         cache: false,
       },
+      'store:creatives': {
+        command: 'tsx scripts/app-store-creatives.ts',
+        cache: false,
+      },
       'screenshot:assert-content': {
         command: 'tsx scripts/assert-screenshot-content.ts',
         cache: false,
@@ -1244,6 +1571,12 @@ export default defineConfig({
       // iPad-only changes). See scripts/screenshot-probe-scope.ts.
       'screenshot:probe-scope': {
         command: 'tsx scripts/screenshot-probe-scope.ts',
+        cache: false,
+      },
+      // The verdict of mobile-e2e-gate.yml: reads each job's result and prints
+      // the one line and the table. See docs/qa/mobile-e2e-gate.md.
+      'mobile:e2e-gate-verdict': {
+        command: 'tsx scripts/mobile-e2e-gate-verdict.ts',
         cache: false,
       },
       'mobile:publish': {
@@ -1281,6 +1614,14 @@ export default defineConfig({
         command: 'tsx scripts/mobile-ota-surf-doctor.ts',
         cache: false,
       },
+      // Installs a release build on a booted simulator or emulator, pinned to
+      // an update branch, launches it twice and fails unless the second launch
+      // ran the update staged for the given commit. No credentials.
+      // See scripts/mobile-ota-boot-check.ts + docs/operations/mobile-ota-updates.md.
+      'mobile:ota-boot-check': {
+        command: 'tsx scripts/mobile-ota-boot-check.ts',
+        cache: false,
+      },
       'mobile:ota-rollback': {
         command: 'tsx scripts/mobile-ota-rollback.ts',
         cache: false,
@@ -1312,7 +1653,7 @@ export default defineConfig({
       // Cloudflare config-as-code for the boardsesh.com zone (DNS proxied flag,
       // the edge-cache rules and the WAF crawler rules). Dry-run by default;
       // forward `-- --apply` (and optionally `--allow-zone-ssl`) to converge.
-      // See scripts/cloudflare-apply.ts + docs/cloudflare.md.
+      // See scripts/cloudflare-apply.ts + docs/operations/cloudflare.md.
       'cf:apply': {
         command: 'tsx scripts/cloudflare-apply.ts',
         cache: false,
@@ -1322,16 +1663,58 @@ export default defineConfig({
       // settings, domains, variables and the ClickHouse retention check). Dry-run
       // by default and exits non-zero on drift; forward `-- --apply` to converge,
       // and `--allow-image-change` to let it roll a new server image.
-      // See scripts/railway-apply.ts + docs/railway.md.
+      // See scripts/railway-apply.ts + docs/operations/railway.md.
       'railway:apply': {
         command: 'tsx scripts/railway-apply.ts',
+        cache: false,
+      },
+
+      // xprem control plane as code: the production channel's branch and Branch
+      // Surfing, and the long-lived branches and their protection. Plans by
+      // default and exits non-zero on drift; forward `-- --apply` to converge.
+      // Never deletes and never touches a per-PR preview branch.
+      // See scripts/ota-apply.ts + docs/operations/mobile-ota-updates.md.
+      'ota:apply': {
+        command: 'tsx scripts/ota-apply.ts',
+        cache: false,
+      },
+
+      // Read and steer per-update rollouts on the xprem server: status, set,
+      // finish, revert, health. Needs the dashboard admin login.
+      // See scripts/mobile-ota-rollout.ts + docs/operations/mobile-ota-updates.md.
+      'ota:rollout': {
+        command: 'tsx scripts/mobile-ota-rollout.ts',
+        cache: false,
+      },
+
+      'ota:stable': {
+        command: 'tsx scripts/mobile-ota-stable.ts',
+        cache: false,
+      },
+
+      // The throwaway-branch proof for rollouts: publishes synthetic updates to
+      // the `pr-rollout-proof` scratch branch under a runtime version no binary
+      // has, runs start / set / finish / revert against the LIVE server and
+      // prints what it did. Needs the admin login and the publish token. Run it
+      // through .github/workflows/ota-rollout-proof.yml, not from a laptop.
+      // See scripts/ota-rollout-proof.ts + docs/operations/mobile-ota-updates.md.
+      'ota:rollout-proof': {
+        command: 'tsx scripts/ota-rollout-proof.ts',
+        cache: false,
+      },
+
+      // Read-only: downloads the public dashboard bundle and checks that every
+      // admin API path scripts/lib/xprem-admin.mts calls is still in it. No
+      // login. Run it after an xprem upgrade; the daily drift workflow does.
+      'ota:api-probe': {
+        command: 'tsx scripts/ota-admin-api-probe.ts',
         cache: false,
       },
 
       // Reports newer xprem releases — stable and prerelease tracked separately so
       // a beta never displaces a stable upgrade — and rewrites the repo onto one
       // with `-- --write <version>`. Drives .github/workflows/ota-image-bump.yml.
-      // See scripts/ota-image-bump.ts + docs/railway.md.
+      // See scripts/ota-image-bump.ts + docs/operations/railway.md.
       'ota:image-bump': {
         command: 'tsx scripts/ota-image-bump.ts',
         cache: false,
@@ -1340,6 +1723,12 @@ export default defineConfig({
       // --- Dev servers ---
       'dev:mobile': {
         command: 'tsx scripts/mobile-dev-start.ts',
+        cache: false,
+      },
+      // A fake WLED controller on this machine, for testing spray-wall LEDs
+      // without hardware. Pass `-- --leds 120 --port 8090` to change the strip.
+      'dev:wled-sim': {
+        command: 'tsx scripts/wled-simulator.ts',
         cache: false,
       },
       'dev:mobile:web': {
@@ -1381,6 +1770,24 @@ export default defineConfig({
       'test:e2e:setup': {
         command: 'true',
         dependsOn: ['db:up'],
+        cache: false,
+      },
+      // Partner OAuth journey (#6981 F18): starts its own backend and www with
+      // partner OAuth on, behind a local edge that answers as the production
+      // hosts, and drives register → consent → sync → disconnect in Chromium and WebKit.
+      // See docs/integrations/integration-platform.md, "End-to-end journey".
+      'test:e2e:partner-oauth': {
+        command: 'cd packages/web && vp exec playwright test --config=playwright.partner-oauth.config.ts',
+        dependsOn: ['db:up'],
+        cache: false,
+      },
+      // Browser-session harness (#7596, B7a): www and the Expo web app on two
+      // HTTPS subdomains of one parent domain, in Chromium and WebKit, against
+      // the real backend and database. See scripts/browser-session-e2e.ts and
+      // docs/auth/better-auth-browser-session.md, "Browser-session e2e harness".
+      'test:e2e:browser-session': {
+        command: 'tsx scripts/browser-session-e2e.ts',
+        dependsOn: ['db:up', 'mobile:web-runtime:install'],
         cache: false,
       },
       // Expo-web smoke: boots the full expo-web stack (backend + Next proxy +

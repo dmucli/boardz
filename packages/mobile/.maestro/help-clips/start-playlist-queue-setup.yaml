@@ -1,0 +1,19 @@
+appId: com.boardsesh.app
+name: help clip setup - playlist tap loads queue
+---
+# Run once on a fresh/default capture simulator BEFORE recording.
+# Always drive stays off. The native switch label is exposed to Maestro, but
+# tapping that label does not change the switch. Use the measured switch itself.
+# iPhone 16 Pro Max, iOS 27.0, 1320 x 2868, source 3b1d9be90c, 2026-11-02.
+# Verify the switch is ON by eye; a second run turns it off.
+- openLink: com.boardsesh.app://home
+- waitForAnimationToEnd
+- openLink: com.boardsesh.app://settings/board-look?section=lighting
+- waitForAnimationToEnd
+- swipe:
+    start: '50%,80%'
+    end: '50%,45%'
+    duration: 500
+- tapOn:
+    point: '84%,44%'
+- waitForAnimationToEnd

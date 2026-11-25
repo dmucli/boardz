@@ -16,6 +16,7 @@ import { useTheme } from '../providers/theme-provider';
 import { spacing } from '../theme/tokens';
 import { Button } from './Button';
 import { SegmentedControl } from './SegmentedControl';
+import { RadioGroup } from './RadioGroup';
 import type { FeatureFlagsFormProps } from './FeatureFlagsForm.types';
 
 export function FeatureFlagsForm({ rows, onSelect, onReset, canReset, noticeText, title }: FeatureFlagsFormProps) {
@@ -31,18 +32,27 @@ export function FeatureFlagsForm({ rows, onSelect, onReset, canReset, noticeText
       {rows.map((row) => (
         <Surface key={row.key} style={styles.card} elevation={1}>
           <Text variant="bodyLarge">{row.label}</Text>
-          <Text variant="bodySmall" style={[styles.muted, { color: systemColors.secondaryLabel as string }]}>
+          <Text variant="bodySmall" style={{ color: systemColors.secondaryLabel as string }}>
             {row.description}
           </Text>
           <View style={styles.control}>
-            <SegmentedControl
-              options={[...row.options]}
-              selectedKey={row.choice}
-              onSelect={(choice) => onSelect(row.key, choice)}
-              accessibilityLabel={row.label}
-            />
+            {/* Past three choices the segments get too narrow to read: a radio list instead. */}
+            {row.control === 'menu' ? (
+              <RadioGroup
+                options={row.options.map((option) => ({ value: option.key, label: option.label }))}
+                value={row.choice}
+                onChange={(choice) => onSelect(row.key, choice)}
+              />
+            ) : (
+              <SegmentedControl
+                options={[...row.options]}
+                selectedKey={row.choice}
+                onSelect={(choice) => onSelect(row.key, choice)}
+                accessibilityLabel={row.label}
+              />
+            )}
           </View>
-          <Text variant="labelSmall" style={[styles.muted, { color: systemColors.secondaryLabel as string }]}>
+          <Text variant="labelSmall" style={{ color: systemColors.secondaryLabel as string }}>
             {row.effectiveLabel}
           </Text>
         </Surface>
@@ -70,9 +80,6 @@ const styles = StyleSheet.create({
   },
   control: {
     marginVertical: spacing[1],
-  },
-  muted: {
-    opacity: 0.7,
   },
   fullWidth: {
     alignSelf: 'stretch',

@@ -2,7 +2,9 @@ import { memo } from 'react';
 import { View } from 'react-native';
 import type { BoardName } from '@boardsesh/shared-schema';
 import { ClimbListItemContent, type ClimbListItemClimb } from './ClimbListItemContent';
-import { climbListRowStyles } from './climb-list-row-styles';
+import { climbListRowStyles, climbRowSeparatorInsetStyle } from './climb-list-row-styles';
+import { useClimbListThumbnailSize } from './climb-list-thumbnail-metrics';
+import { useClimbRowField } from '../lib/climb-row-display-preference';
 import { useTheme } from '../providers/theme-provider';
 
 type ClimbPreviewCardProps = {
@@ -24,15 +26,17 @@ type ClimbPreviewCardProps = {
  * `ClimbListRow` itself (not left transparent): the sheet's `glass` material is
  * always opaque on iOS, but Android's sheet backing isn't guaranteed to be, so
  * the row needs its own opaque ground rather than relying on the sheet under it.
- * A hairline separator divides it from the action rows below.
+ * A hairline separator divides it from the action rows below, starting under
+ * the text column like the list row's: at the gutter when thumbnails are off.
  *
- * Memoized: its host sheets subscribe to route info (`ClimbActionsSheet` reaches
- * `useSegments` through `useCreateClimbNavigation`), so the sheet re-renders on every
- * navigation in the app. Props here are the climb plus primitives, so a shallow compare
- * keeps the board thumbnail out of that churn.
+ * Memoized: its host sheets re-render far more often than the climb changes (the
+ * player's playlist host re-renders with the whole drawer). Props here are the climb
+ * plus primitives, so a shallow compare keeps the board thumbnail out of that churn.
  */
 function ClimbPreviewCardComponent({ climb, boardName, layoutId, sizeId, setIds, angle }: ClimbPreviewCardProps) {
   const { systemColors } = useTheme();
+  const hasThumbnail = useClimbRowField('thumbnail');
+  const thumbnailSize = useClimbListThumbnailSize();
   return (
     <View style={{ backgroundColor: systemColors.background }}>
       <View style={climbListRowStyles.contentRow}>
@@ -45,7 +49,13 @@ function ClimbPreviewCardComponent({ climb, boardName, layoutId, sizeId, setIds,
           angle={angle}
         />
       </View>
-      <View style={[climbListRowStyles.separator, { backgroundColor: systemColors.separator }]} />
+      <View
+        style={[
+          climbListRowStyles.separator,
+          climbRowSeparatorInsetStyle(hasThumbnail, thumbnailSize.width),
+          { backgroundColor: systemColors.separator },
+        ]}
+      />
     </View>
   );
 }

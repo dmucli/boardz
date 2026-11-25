@@ -1,3 +1,4 @@
+import { offlineWriteFetch } from '../offline/offline-write-transport';
 // Mobile-side wiring for `@boardsesh/board-react`. Reads platform-specific
 // state (auth, queue session id) and forwards GraphQL operations through
 // mobile's HTTP / WS clients. Mounted in `app/_layout.tsx` between
@@ -10,9 +11,7 @@ import { BoardAdapterProvider, type BoardAdapter } from '@boardsesh/board-react'
 import { execute } from '@boardsesh/graphql-client';
 import {
   CLIMB_STATS_FOR_CLIMBS,
-  CLIMB_STATS_UPDATED_SUBSCRIPTION,
   type ClimbStatsForClimbsResponse,
-  type ClimbStatsUpdatedSubscriptionResponse,
   type SaveTickMutationResponse,
   type SaveTickMutationVariables,
 } from '@boardsesh/graphql/operations';
@@ -21,17 +20,26 @@ import { useOfflineDownloadsEnabled } from './feature-flags-provider';
 import { useQueueSessionId } from './queue-provider';
 import { useToast } from './toast-provider';
 import { getDatabaseHandle } from '../db';
-import { getConnectivitySnapshot, subscribeConnectivity } from '../lib/connectivity/connectivity-store';
-import { getHttpClient, getOfflineSyncHttpClient } from '../lib/graphql/client';
+import { getHttpClient } from '../lib/graphql/client';
+import { offlineAwareRequest } from '../lib/graphql/offline-request';
 import { captureAuthCredentialGeneration, isAuthCredentialGenerationCurrent } from '../lib/auth-store';
 import { reportHandledError } from '../lib/error-reporting';
 import { getWsClient } from '../lib/graphql/ws-client';
+import { subscribeClimbStatsStream } from '../lib/climb-stats/subscribe-climb-stats-stream';
 import { drainMutationQueue, isOnline, subscribeMutationDelivery, triggerSync } from '../offline/offline-sync-adapter';
+import { mirrorWrittenClimb } from '../offline/mirror-written-climb';
+import { saveClimbLocal, updateClimbLocal } from '../offline/write-climb-local';
 import { useSnapshotSource } from '../offline/use-snapshot-source';
 import { getSetting } from '../settings';
 import { notifyBootstrapMetadataChanged, notifyScopeDownloadComplete, setSyncProgress } from '../sync';
 import { enqueueTickOutboxOnly, writeTickLocal } from '../hooks/use-offline-mutations';
-import { isDatabaseLockedError, OFFLINE_LOCAL_WRITE_BUDGET_MS, type GraphQLFetch } from '@boardsesh/offline-sync';
+import {
+  getLocalUserId,
+  isDatabaseLockedError,
+  OFFLINE_LOCAL_WRITE_BUDGET_MS,
+  type GraphQLFetch,
+} from '@boardsesh/offline-sync';
+import { readTickRevisionsLocal } from '../db/queries/climb-revisions-local';
 import { SHARED_EVENTS, sanitizeErrorForAnalytics } from '@boardsesh/analytics';
 import { track } from '../lib/analytics';
 
@@ -58,6 +66,27 @@ function toSavedTickShape(
   };
 }
 
+const NO_TICK_REVISIONS: ReadonlyMap<string, number | null> = new Map();
+
+/**
+ * Which climb version each of the climber's own ticks on these climbs was
+ * logged on, from the phone's copy of the ticks (#6023). `GetTicks` cannot
+ * carry the field while the screenshot fixtures pin its text, so the shared
+ * logbook joins this map onto the server's rows by tick uuid.
+ *
+ * A tick uuid is unique across accounts, so a row a failed sign-out wipe left
+ * behind can never match a tick the server just returned for this climber.
+ * The owner predicate is kept anyway, as on every local tick read.
+ */
+async function readLocalTickRevisions(
+  boardType: string,
+  climbUuids: string[],
+): Promise<ReadonlyMap<string, number | null>> {
+  const db = getDatabaseHandle();
+  if (!db) return NO_TICK_REVISIONS;
+  return readTickRevisionsLocal(db, boardType, climbUuids, await getLocalUserId(db));
+}
+
 export function BoardAdapterWrapper({ children }: { children: ReactNode }) {
   const { isAuthenticated, isLoading } = useAuth();
   const offlineEnabled = useOfflineDownloadsEnabled();
@@ -79,7 +108,11 @@ export function BoardAdapterWrapper({ children }: { children: ReactNode }) {
   // adapter's context value stable (so subtree consumers don't re-render
   // on every locale flip) while still picking up the latest references.
   const showErrorRef = useRef<BoardAdapter['showError']>(undefined);
-  showErrorRef.current = () => {
+  showErrorRef.current = (reason) => {
+    if (reason === 'localClimbRefreshFailed') {
+      showToast(t('createClimbForm.alerts.localRefreshFailed'), 'error');
+      return;
+    }
     // Both reasons share the same fallback copy on mobile today. Switch
     // here if/when reason-specific messages are needed.
     showToast(t('createClimbForm.alerts.saveFailedFallback'), 'error');
@@ -89,8 +122,47 @@ export function BoardAdapterWrapper({ children }: { children: ReactNode }) {
     () => ({
       isAuthenticated,
       isAuthLoading: isLoading,
-      executeHttp: (query, variables) => getHttpClient().request(query, variables),
-      executeWs: ({ query, variables }) => execute(getWsClient(), { query, variables }),
+      executeHttp: (query, variables) => offlineAwareRequest(query, variables),
+      executeWs: ({ query, variables }) => execute(getWsClient, { query, variables }),
+      afterClimbWrite: mirrorWrittenClimb,
+      saveClimbOffline: !offlineEnabled
+        ? undefined
+        : async (input, { queryClient }) => {
+            const db = getDatabaseHandle();
+            if (!db) return null;
+            const saved = await saveClimbLocal(db, input);
+            if (saved) {
+              const graphqlFetch: GraphQLFetch = offlineWriteFetch;
+              triggerSync(
+                db,
+                queryClient,
+                graphqlFetch,
+                () => getSetting('syncEnabledBoards'),
+                () => drainMutationQueue(db, queryClient, graphqlFetch),
+                { snapshotSource },
+              );
+            }
+            return saved;
+          },
+      updateClimbOffline: !offlineEnabled
+        ? undefined
+        : async (input, { queryClient }) => {
+            const db = getDatabaseHandle();
+            if (!db) return null;
+            const saved = await updateClimbLocal(db, input);
+            if (saved) {
+              const graphqlFetch: GraphQLFetch = offlineWriteFetch;
+              triggerSync(
+                db,
+                queryClient,
+                graphqlFetch,
+                () => getSetting('syncEnabledBoards'),
+                () => drainMutationQueue(db, queryClient, graphqlFetch),
+                { snapshotSource },
+              );
+            }
+            return saved;
+          },
       resolveActiveSessionId: () => sessionIdRef.current,
       captureAuthEpoch: captureAuthCredentialGeneration,
       isAuthEpochCurrent: isAuthCredentialGenerationCurrent,
@@ -102,86 +174,9 @@ export function BoardAdapterWrapper({ children }: { children: ReactNode }) {
         });
         return response.climbStatsForClimbs;
       },
-      subscribeClimbStats: (boardType, layoutId, handlers) => {
-        const wsClient = getWsClient();
-        let disposed = false;
-        let retryAttempt = 0;
-        let retryTimer: ReturnType<typeof setTimeout> | null = null;
-        let unsubscribeStats: (() => void) | null = null;
-        // Live stats need a reachable backend. While the connectivity store
-        // says we're effectively offline, a (re)subscribe can only fail, and
-        // the exponential ladder below would keep waking the socket against a
-        // server we know is down (#4862). Park it on this flag instead and let
-        // the store's edge back to reachable restart it.
-        let deferredForConnectivity = false;
-
-        const scheduleRetry = () => {
-          if (disposed || retryTimer) return;
-          // Don't arm a timer during an outage — the connectivity listener
-          // below is a better wake-up than a 30s ladder that can only fail.
-          if (getConnectivitySnapshot().effectiveOffline) {
-            deferredForConnectivity = true;
-            return;
-          }
-          const delayMs = Math.min(30_000, 1_000 * 2 ** retryAttempt);
-          retryAttempt += 1;
-          retryTimer = setTimeout(() => {
-            retryTimer = null;
-            startSubscription();
-          }, delayMs);
-        };
-        const startSubscription = () => {
-          if (disposed) return;
-          if (getConnectivitySnapshot().effectiveOffline) {
-            deferredForConnectivity = true;
-            return;
-          }
-          unsubscribeStats = wsClient.subscribe<ClimbStatsUpdatedSubscriptionResponse>(
-            {
-              query: CLIMB_STATS_UPDATED_SUBSCRIPTION,
-              variables: { boardType, layoutId },
-            },
-            {
-              next: (result) => {
-                retryAttempt = 0;
-                const event = result.data?.climbStatsUpdated;
-                if (event) handlers.next(event);
-              },
-              error: (error) => {
-                unsubscribeStats = null;
-                handlers.error(error);
-                scheduleRetry();
-              },
-              complete: () => {
-                unsubscribeStats = null;
-                scheduleRetry();
-              },
-            },
-          );
-        };
-        const unsubscribeConnected = wsClient.on('connected', handlers.connected);
-        // One resubscribe per outage, on the edge back to reachable: the flag
-        // gates it, so the store's other snapshot changes can't re-enter here.
-        // `retryAttempt` resets so the first post-outage failure retries fast
-        // rather than inheriting the pre-outage ladder position.
-        const unsubscribeConnectivity = subscribeConnectivity(() => {
-          if (deferredForConnectivity && !getConnectivitySnapshot().effectiveOffline) {
-            deferredForConnectivity = false;
-            retryAttempt = 0;
-            startSubscription();
-          }
-        });
-        startSubscription();
-        return () => {
-          disposed = true;
-          if (retryTimer) clearTimeout(retryTimer);
-          retryTimer = null;
-          unsubscribeStats?.();
-          unsubscribeConnected();
-          unsubscribeConnectivity();
-        };
-      },
+      subscribeClimbStats: subscribeClimbStatsStream,
       subscribeOfflineMutationDelivery: subscribeMutationDelivery,
+      readLocalTickRevisions,
       scheduleTask: (callback, delayMs) => {
         const timer = setTimeout(callback, delayMs);
         return () => clearTimeout(timer);
@@ -206,8 +201,7 @@ export function BoardAdapterWrapper({ children }: { children: ReactNode }) {
             // row; the next cycle repairs it. snapshotSource is mandatory —
             // without it the pull paged-crawls an undownloaded scope and
             // disqualifies its snapshot path for good.
-            const syncFetch: GraphQLFetch = (query, syncVariables) =>
-              getOfflineSyncHttpClient().request(query, syncVariables);
+            const syncFetch: GraphQLFetch = offlineWriteFetch;
             const drainQueue = () => drainMutationQueue(db, queryClient, syncFetch);
             const startSyncCycle = () => {
               triggerSync(db, queryClient, syncFetch, () => getSetting('syncEnabledBoards'), drainQueue, {
@@ -305,6 +299,9 @@ export function BoardAdapterWrapper({ children }: { children: ReactNode }) {
             // staleTime Infinity and the drainer (its usual invalidator) no-ops
             // while offline — without this, an offline tick looks lost.
             void queryClient.invalidateQueries({ queryKey: ['localTicks', variables.input.climbUuid] });
+            void queryClient.invalidateQueries({ queryKey: ['localTicks', 'list'] });
+            // Home's This week card and projects shelf read the same rows; offline, nothing drains to refresh them.
+            void queryClient.invalidateQueries({ queryKey: ['localTicks', 'activity'] });
             startSyncCycle();
 
             return toSavedTickShape(variables.input, tickUuid);

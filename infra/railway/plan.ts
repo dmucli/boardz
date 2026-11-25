@@ -402,7 +402,7 @@ export function diffServiceImage(desired: ServiceDesired, live: LiveState, optio
         `Refusing: this would move the server to ${declaredVersion} while the repo publishes with ` +
         `eoas ${cliVersion}.\n` +
         `The CLI may lead the server but must never trail it — a CLI that trails can 404 on ` +
-        `app-scoped routes (docs/mobile-ota-updates.md).\n` +
+        `app-scoped routes (docs/operations/mobile-ota-updates.md).\n` +
         `Fix: bump EOAS_PACKAGE_SPEC in scripts/lib/eoas.ts first, in the same PR.`,
       blocked: true,
     };
@@ -666,6 +666,21 @@ export function diffServiceVars(desired: ServiceDesired, live: LiveState, option
       // Convergeable only when the caller actually supplied a value. Without one
       // this is a report, not a fix — the tool never invents an unmanaged value.
       blocked: !supplied,
+    });
+  }
+
+  for (const optional of desired.optionalVars ?? []) {
+    // Absent or set are both fine; only a never-filled placeholder fails at boot.
+    if (classifyVar(serviceVars[optional.name]) !== 'placeholder') continue;
+    changes.push({
+      resource: 'env-var',
+      summary: `${desired.name}: ${optional.name} is placeholder`,
+      detail:
+        `${optional.reason}\n` +
+        'The variable still holds an unfilled <placeholder> value. Set the real value in Railway or remove it; ' +
+        'this tool never writes an optional secret.',
+      target: { serviceName: desired.name, varName: optional.name },
+      blocked: true,
     });
   }
 

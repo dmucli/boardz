@@ -1,3 +1,4 @@
+import { invalidateCredentialSnapshots } from '../../lib/privacy/privacy-cache';
 // @vitest-environment jsdom
 import { act, render, waitFor } from '@testing-library/react';
 import { createElement, useEffect } from 'react';
@@ -87,12 +88,15 @@ vi.mock('../../lib/session-store', () => ({
   clearStoredCreatedSessionId: vi.fn(async () => {}),
 }));
 vi.mock('../../lib/queue-snapshot-store', () => ({
+  invalidateStoredQueueSnapshot: vi.fn(),
   getStoredQueueSnapshot: vi.fn(async () => null),
+  getQueueSnapshotGeneration: () => 0,
   setStoredQueueSnapshot: vi.fn(async () => {}),
   clearStoredQueueSnapshot: vi.fn(async () => {}),
 }));
 vi.mock('../../lib/active-board-store', () => ({ getStoredActiveBoard: activeBoard.getStoredActiveBoard }));
 vi.mock('../../lib/graphql/use-active-board', () => ({
+  getActiveBoardWriteGeneration: () => 0,
   useActiveBoard: () => ({ data: activeBoard.stored }),
   useSetActiveBoard: () => vi.fn(async () => {}),
 }));
@@ -207,6 +211,94 @@ describe('QueueProvider self-healing resolve of partially-synced climbs (#2527)'
     http.request.mockReset();
   });
 
+  it('withdraws copied queue details and keeps a current-only reference across privacy changes', async () => {
+    http.request.mockResolvedValue({ climb: null });
+    const snapshots = renderProvider();
+    await waitFor(() => expect(snapshots.at(-1)).toBeTruthy());
+    const current = makeItem('current-only', { ...makeClimb('private-current', 25, 'V8'), mirrored: true });
+    const queued = { ...makeItem('slot', makeClimb('private-queued', 25, 'V5')), addedBy: 'Private climber' };
+    act(() =>
+      snapshots
+        .at(-1)
+        ?.dispatch({ type: 'UPDATE_QUEUE', payload: { queue: [queued], currentClimbQueueItem: current } }),
+    );
+    const retained = snapshots.at(-1)!;
+    await act(async () => {
+      invalidateCredentialSnapshots();
+      // A captured callback cannot restore its old payload before React renders.
+      retained.setQueue([queued], current);
+    });
+    expect(snapshots.at(-1)?.state.queue.map(({ uuid }) => uuid)).toEqual(['slot']);
+    expect(snapshots.at(-1)?.state.queue[0].climb.name).toBe('');
+    expect(snapshots.at(-1)?.state.queue[0].addedBy).toBeUndefined();
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('current-only');
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.climb.name).toBe('');
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.climb.mirrored).toBe(true);
+  });
+
+  it('resolves a current-only reference without adding a queue slot', async () => {
+    http.request.mockResolvedValue({ climb: makeClimb('current-climb', 25, 'V5') });
+    const snapshots = renderProvider();
+    await waitFor(() => expect(snapshots.at(-1)).toBeTruthy());
+    act(() =>
+      snapshots.at(-1)?.dispatch({
+        type: 'UPDATE_QUEUE',
+        payload: {
+          queue: [],
+          currentClimbQueueItem: makeItem('current-only', { ...makeThinClimb('current-climb'), mirrored: true }),
+        },
+      }),
+    );
+    await waitFor(() => expect(snapshots.at(-1)?.state.currentClimbQueueItem?.climb.name).toBe('Climb current-climb'));
+    expect(snapshots.at(-1)?.state.queue).toEqual([]);
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.climb.mirrored).toBe(true);
+  });
+
+  it('rejects an older hydration response after synchronous revocation', async () => {
+    let resolveOld!: (response: { climb: Climb }) => void;
+    http.request.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveOld = resolve;
+        }),
+    );
+    http.request.mockResolvedValue({ climb: null });
+    const snapshots = renderProvider();
+    await waitFor(() => expect(snapshots.at(-1)).toBeTruthy());
+    act(() =>
+      snapshots
+        .at(-1)
+        ?.dispatch({ type: 'UPDATE_QUEUE', payload: { queue: [makeItem('slot', makeThinClimb('private'))] } }),
+    );
+    await waitFor(() => expect(resolveOld).toBeTruthy());
+    await act(async () => {
+      invalidateCredentialSnapshots();
+      resolveOld({ climb: makeClimb('private', 25, 'V8') });
+    });
+    expect(snapshots.at(-1)?.state.queue[0].climb.name).toBe('');
+  });
+
+  it('retains history angle and leaves cross-board references thin', async () => {
+    http.request.mockImplementation(async (_query: string, variables: { climbUuid: string; angle: number }) => ({
+      climb: makeClimb(variables.climbUuid, variables.angle, 'V5'),
+    }));
+    const snapshots = renderProvider();
+    await waitFor(() => expect(snapshots.at(-1)).toBeTruthy());
+    const history = makeItem('history', { ...makeThinClimb('past'), angle: 20 });
+    const current = makeItem('current', makeThinClimb('now'));
+    const foreign = makeItem('foreign', { ...makeThinClimb('other-board'), boardType: 'tension', layoutId: 9 });
+    act(() =>
+      snapshots.at(-1)?.dispatch({
+        type: 'UPDATE_QUEUE',
+        payload: { queue: [history, current, foreign], currentClimbQueueItem: current },
+      }),
+    );
+    await waitFor(() => expect(snapshots.at(-1)?.state.queue[0].climb.name).toBe('Climb past'));
+    expect(snapshots.at(-1)?.state.queue[0].climb.angle).toBe(20);
+    expect(snapshots.at(-1)?.state.queue[2].climb.name).toBe('');
+    expect(http.request.mock.calls.some((call) => call[1].climbUuid === 'other-board')).toBe(false);
+  });
+
   it('re-fetches an unresolved queue climb by uuid and hydrates it in place', async () => {
     http.request.mockImplementation(async (_query: string, variables: { climbUuid: string; angle: number }) => {
       if (variables.climbUuid === 'climb-thin' && variables.angle === 25) {
@@ -309,12 +401,9 @@ describe('QueueProvider self-healing resolve of partially-synced climbs (#2527)'
     expect(queueMutations.setCurrentClimb).not.toHaveBeenCalled();
   });
 
-  it('re-fetches a still-thin item when the queue changes mid-resolve (in-flight race)', async () => {
-    // The first resolve fetch is held open so the queue can churn while it's in
-    // flight. That churn cancels the run; its result is then discarded. The fix
-    // must release the run's in-flight marker on cancel so the successor run
-    // re-fetches the still-thin uuid instead of skipping it as "already resolving"
-    // — without it, the row stays "Unknown Climb" until an unrelated queue change.
+  it('retains a still-thin item read when the queue changes mid-resolve', async () => {
+    // Unrelated queue churn must retain the original read and apply it to the
+    // latest thin object in that slot, rather than repeating the request.
     let releaseFirstFetch: (() => void) | undefined;
     let fetchCount = 0;
     http.request.mockImplementation(async (_query: string, variables: { climbUuid: string; angle: number }) => {
@@ -341,7 +430,7 @@ describe('QueueProvider self-healing resolve of partially-synced climbs (#2527)'
     await waitFor(() => expect(http.request).toHaveBeenCalledTimes(1));
 
     // Queue churns while that fetch is still in flight (a second, resolved item
-    // arrives). This cancels the in-flight resolve run.
+    // arrives). The original read remains valid for the same scope.
     await act(async () => {
       snapshots.at(-1)?.dispatch({
         type: 'UPDATE_QUEUE',
@@ -351,19 +440,16 @@ describe('QueueProvider self-healing resolve of partially-synced climbs (#2527)'
       });
     });
 
-    // The successor run re-fetches the still-thin uuid and hydrates it in place.
+    expect(fetchCount).toBe(1);
+    await act(async () => {
+      releaseFirstFetch?.();
+    });
     await waitFor(() => {
       const resolved = snapshots.at(-1)?.state.queue.find((item) => item.uuid === 'q1');
       expect(resolved?.climb.name).toBe('Climb climb-thin');
       expect(resolved?.climb.frames).toBe('p1r12');
     });
-    // Proof the successor actually re-fetched rather than skipping on a stale marker.
-    expect(fetchCount).toBeGreaterThanOrEqual(2);
-
-    // Let the original (cancelled) fetch settle — its result is discarded, no crash.
-    await act(async () => {
-      releaseFirstFetch?.();
-    });
+    expect(fetchCount).toBe(1);
     expect(snapshots.at(-1)?.state.queue.find((item) => item.uuid === 'q1')?.climb.name).toBe('Climb climb-thin');
   });
 

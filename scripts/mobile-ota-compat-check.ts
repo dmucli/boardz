@@ -9,11 +9,10 @@
  * (ships OTA in minutes) while a native change (deps, plugins, entitlements,
  * config) moves it (needs a new binary first).
  *
- * Verdict = DIFF vs the PR's BASE branch (origin/main, or origin/release/next
- * for a native change joining the release train), resolved in ONE job under
- * identical env:
+ * CI compares the pinned base commit with the result of merging the PR into
+ * that same commit, in one job under identical env:
  *
- *   fingerprint(PR tree, platform) === fingerprint(base tree, platform)
+ *   fingerprint(merged tree, platform) === fingerprint(base tree, platform)
  *     → ota-compatible            (no native delta vs the base)
  *   …differ                       → native-change-required
  *   …either side unresolved       → unknown (neutral, never blocks)
@@ -30,21 +29,16 @@
  * SECONDARY, informational signal ("already on a released build"), surfaced only
  * when confidently true.
  *
- * This never fails the JOB. It does emit `check_conclusion=failure` for the one
- * case the release train exists to prevent: a fingerprint-moving PR merging into
- * `main`, which would strand the store fleet's OTA without ever building a
- * replacement binary (native builds run from `release/next`). The owner's
- * `allow-native-on-main` label turns that back into the neutral verdict. Every
- * other outcome — including a native change into `release/next` — stays neutral.
+ * This check is informational. Native store builds run from version-stamped main commits, so a native change merged into
+ * either branch reaches TestFlight and Play without a waiver.
  *
  * Usage:
  *   vp run check:mobile-ota-compat -- --write-env --base-dir <main-worktree> [--check-shipped-tags]
  *   vp run check:mobile-ota-compat -- --base-fingerprint-ios <h> --base-fingerprint-android <h>
  *
- * The CI workflow (.github/workflows/mobile-ota-check.yml) materializes the
- * baseline as a git worktree of origin/main with its own `vp install`, then
- * passes it via --base-dir. Run locally the same way:
- *   git worktree add /tmp/main-baseline origin/main
+ * To reproduce locally, check out the merged tree and give the baseline
+ * worktree the exact base SHA used in the merge:
+ *   git worktree add --detach /tmp/main-baseline <base-sha>
  *   (cd /tmp/main-baseline && vp install --frozen-lockfile)
  *   vp run check:mobile-ota-compat -- --write-env --base-dir /tmp/main-baseline
  */
@@ -70,20 +64,8 @@ const MAX_DIFF_CONFIRMATIONS = 5;
 export type Platform = 'ios' | 'android';
 export type Verdict = 'ota-compatible' | 'native-change-required' | 'unknown';
 
-/** The branch native store candidates are cut from (docs/mobile-store-release.md). */
-export const RELEASE_BRANCH = 'release/next';
-
-/** Owner escape hatch: merge a fingerprint-moving PR straight into main anyway. */
+/** Legacy waiver name retained for callers; no branch needs a waiver to reach the store builds. */
 export const ALLOW_NATIVE_ON_MAIN_LABEL = 'allow-native-on-main';
-
-/**
- * What a native-change PR into `main` is told. Native changes build from
- * `release/next`; landing one on main strands the store fleet's OTA without ever
- * producing a replacement binary, because main no longer runs the native builds.
- */
-export const NATIVE_ON_MAIN_FAILURE =
-  `Native changes ship from ${RELEASE_BRANCH} — retarget this PR ` +
-  `(gh pr edit <n> --base ${RELEASE_BRANCH}) or add the ${ALLOW_NATIVE_ON_MAIN_LABEL} label`;
 
 export type CheckConclusion = 'neutral' | 'failure';
 
@@ -95,19 +77,9 @@ export interface EnforcementInput {
   allowNativeOnMain: boolean;
 }
 
-/**
- * PURE: does this verdict block the PR?
- *
- * ONLY one case fails: a confirmed native change merging into `main` without the
- * owner's opt-out label. Everything else — a native change into the release
- * train (that is what the train is for), an `unknown` (the resolver is ~5%
- * flaky; never fail on a guess), an OTA-compatible PR — stays neutral, exactly
- * as the check behaved before the train existed.
- */
-export function deriveCheckConclusion({ overall, baseBranch, allowNativeOnMain }: EnforcementInput): CheckConclusion {
-  if (overall !== 'native-change-required') return 'neutral';
-  if (baseBranch !== 'main') return 'neutral';
-  return allowNativeOnMain ? 'neutral' : 'failure';
+/** Native changes are informational: the release train builds their replacements. */
+export function deriveCheckConclusion(_input: EnforcementInput): CheckConclusion {
+  return 'neutral';
 }
 
 export const PLATFORMS: readonly Platform[] = ['ios', 'android'];
@@ -258,40 +230,35 @@ const VERDICT_CELL: Record<Verdict, string> = {
 };
 
 const HEADLINE: Record<Verdict, string> = {
-  'ota-compatible':
-    '✅ **Ships over-the-air.** No native change versus the base branch — this lands on existing builds via OTA.',
+  'ota-compatible': '✅ **No native fingerprint change.** The PR can ship via OTA to builds matching the base branch.',
   'native-change-required':
     '⚠️ **Native change detected.** Merging starts new TestFlight/Play builds and temporarily stops the ' +
     'current store fleet receiving later production OTAs until users install the replacement binary.',
   unknown: "ℹ️ **OTA compatibility unknown.** Couldn't establish a baseline this run, so no verdict.",
 };
 
-/**
- * PURE: the extra line a native-change PR gets, which depends entirely on where
- * it is merging. Into the train it is routine; into main it is the thing the
- * train exists to prevent.
- */
+/** Explain where the replacement build comes from for native changes on either release branch. */
 export function enforcementNote(input: EnforcementInput): string | null {
   if (input.overall !== 'native-change-required') return null;
-  if (input.baseBranch === RELEASE_BRANCH) {
-    return `This is the right place for it: merging here starts the store builds from \`${RELEASE_BRANCH}\`.`;
+  if (input.baseBranch === 'main') {
+    return (
+      'Merging into `main` starts TestFlight and Play tester builds. They keep the open marketing version while it ' +
+      'is unreleased, and open the next patch only after a store release; no waiver label is needed.'
+    );
   }
-  if (input.baseBranch !== 'main') return null;
-  return input.allowNativeOnMain
-    ? `Allowed by the \`${ALLOW_NATIVE_ON_MAIN_LABEL}\` label — main will not build a replacement binary for it.`
-    : `❌ ${NATIVE_ON_MAIN_FAILURE}`;
+  return null;
 }
 
 /** A short title for the GitHub check-run. */
 export const CHECK_TITLE: Record<Verdict, string> = {
-  'ota-compatible': 'OTA-compatible — rides existing builds',
+  'ota-compatible': 'No native fingerprint change versus the base branch',
   'native-change-required': 'Native change — current fleet OTA pauses until store update',
   unknown: 'OTA compatibility unknown (no baseline)',
 };
 
-/** PURE: the check-run title, which names the blocking reason when it blocks. */
+/** PURE: the informational check-run title. */
 export function checkTitle(input: EnforcementInput): string {
-  return deriveCheckConclusion(input) === 'failure' ? NATIVE_ON_MAIN_FAILURE : CHECK_TITLE[input.overall];
+  return CHECK_TITLE[input.overall];
 }
 
 /**
@@ -343,7 +310,7 @@ export function renderComment(result: OtaCompatResult, ctx: CommentContext): str
     `Branch \`${ctx.branch}\` → \`${ctx.baseBranch}\` · commit \`${ctx.sha.slice(0, 7)}\`.`,
     '',
     '<sub>Fingerprint is resolved per platform against this PR’s base branch. Native store builds run ' +
-      `from \`${RELEASE_BRANCH}\`. See \`docs/mobile-ota-updates.md\`.</sub>`,
+      `from \`main\` after an automatic native patch bump. See \`docs/operations/mobile-ota-updates.md\`.</sub>`,
   ].join('\n');
 }
 
@@ -596,8 +563,8 @@ export function main(argv: readonly string[] = process.argv.slice(2)): number {
   console.log(`[mobile-ota-compat] overall: ${result.overall}`);
 
   const ctx: CommentContext = {
-    sha: process.env.GITHUB_SHA ?? 'local',
-    branch: process.env.GITHUB_REF_NAME ?? 'local',
+    sha: process.env.OTA_COMPAT_HEAD_SHA ?? process.env.GITHUB_SHA ?? 'local',
+    branch: process.env.OTA_COMPAT_HEAD_BRANCH ?? process.env.GITHUB_REF_NAME ?? 'local',
     baseBranch: options.baseBranch,
     allowNativeOnMain: options.allowNativeOnMain,
   };

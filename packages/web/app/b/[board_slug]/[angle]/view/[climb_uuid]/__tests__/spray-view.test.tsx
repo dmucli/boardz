@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+import { DEFAULT_LOCALE, SUPPORTED_LOCALES, type Locale } from '@/app/lib/i18n/config';
 
 /**
  * The three states a wall can be in, from the web page's side.
@@ -19,10 +20,12 @@ vi.mock('next/navigation', () => ({
   }),
 }));
 
+let servedLocale: Locale = DEFAULT_LOCALE;
+
 vi.mock('@/app/lib/i18n/server', () => ({
   getServerTranslation: vi.fn(async () => ({
     t: (key: string) => key,
-    locale: 'en-US',
+    locale: servedLocale,
   })),
 }));
 
@@ -33,13 +36,16 @@ vi.mock('@/app/lib/data/queries', () => ({
 }));
 
 const fetchSprayWallPageData = vi.fn();
+const fetchSprayWallArtChoice = vi.fn();
 vi.mock('@/app/lib/spray/spray-wall-render-data.server', async () => {
   const actual = await vi.importActual<typeof import('@/app/lib/spray/spray-wall-render-data.server')>(
     '@/app/lib/spray/spray-wall-render-data.server',
   );
   return {
     resolveSprayPhotoUrl: actual.resolveSprayPhotoUrl,
+    resolveSprayArtUrl: actual.resolveSprayArtUrl,
     fetchSprayWallPageData: (...args: unknown[]) => fetchSprayWallPageData(...args),
+    fetchSprayWallArtChoice: (...args: unknown[]) => fetchSprayWallArtChoice(...args),
   };
 });
 
@@ -115,29 +121,58 @@ const PARSED_PARAMS = {
 };
 
 beforeEach(() => {
+  servedLocale = DEFAULT_LOCALE;
   vi.clearAllMocks();
   getClimb.mockResolvedValue(CLIMB);
   fetchSprayWallPageData.mockResolvedValue(WALL_DATA);
+  fetchSprayWallArtChoice.mockResolvedValue(null);
 });
 
 describe('the spray climb page', () => {
   it('renders a public wall from the public photo copy', async () => {
-    const element = await SprayViewPage({ board: boardFor('public'), parsedParams: PARSED_PARAMS });
+    const element = await SprayViewPage({
+      board: boardFor('public'),
+      parsedParams: PARSED_PARAMS,
+      wallParam: undefined,
+    });
 
     expect(element.props.photoUrl).toBe(WALL_DATA.wall.publicPhotoUrl);
     expect(fetchSprayWallPageData).toHaveBeenCalledWith('wall-uuid-1');
+    // No generated look ready: nothing but the photo reaches the page.
+    expect(element.props.art).toBeNull();
+    expect(element.props.artUrl).toBeNull();
+  });
+
+  it('hands a ready generated look to the page through the stable redirect path, photo kept as the fallback', async () => {
+    fetchSprayWallArtChoice.mockResolvedValue({ background: 'wall-crop', width: 1200, height: 900 });
+    const element = await SprayViewPage({
+      board: boardFor('public'),
+      parsedParams: PARSED_PARAMS,
+      wallParam: undefined,
+    });
+
+    expect(fetchSprayWallArtChoice).toHaveBeenCalledWith('wall-uuid-1', WALL_DATA.versionNumber);
+    expect(element.props.art).toEqual({ background: 'wall-crop', width: 1200, height: 900 });
+    expect(element.props.artUrl).toBe('/api/v1/spray-walls/wall-uuid-1/photo?look=wall-crop');
+    expect(element.props.photoUrl).toBe(WALL_DATA.wall.publicPhotoUrl);
   });
 
   it('renders an unlisted wall for a link holder, from the presigned photo', async () => {
-    const element = await SprayViewPage({ board: boardFor('unlisted'), parsedParams: PARSED_PARAMS });
+    const element = await SprayViewPage({
+      board: boardFor('unlisted'),
+      parsedParams: PARSED_PARAMS,
+      wallParam: 'wall-uuid-1',
+    });
 
     // A stable path, never the presigned URL itself: the page is CDN-cached for
     // a day and the signature lives fifteen minutes.
     expect(element.props.photoUrl).toBe('/api/v1/spray-walls/wall-uuid-1/photo');
   });
 
-  it('404s a private wall, and never reads the wall to decide', async () => {
-    await expect(SprayViewPage({ board: boardFor('private'), parsedParams: PARSED_PARAMS })).rejects.toMatchObject({
+  it('404s a private wall even with its own uuid, and never reads the wall to decide', async () => {
+    await expect(
+      SprayViewPage({ board: boardFor('private'), parsedParams: PARSED_PARAMS, wallParam: 'wall-uuid-1' }),
+    ).rejects.toMatchObject({
       digest: NOT_FOUND_DIGEST,
     });
     expect(fetchSprayWallPageData).not.toHaveBeenCalled();
@@ -150,7 +185,9 @@ describe('the spray climb page', () => {
     // while the wall read returns null.
     fetchSprayWallPageData.mockResolvedValue(null);
 
-    await expect(SprayViewPage({ board: boardFor('public'), parsedParams: PARSED_PARAMS })).rejects.toMatchObject({
+    await expect(
+      SprayViewPage({ board: boardFor('public'), parsedParams: PARSED_PARAMS, wallParam: undefined }),
+    ).rejects.toMatchObject({
       digest: NOT_FOUND_DIGEST,
     });
   });
@@ -158,17 +195,34 @@ describe('the spray climb page', () => {
   it('404s a climb that is not on the wall', async () => {
     getClimb.mockResolvedValue(null);
 
-    await expect(SprayViewPage({ board: boardFor('public'), parsedParams: PARSED_PARAMS })).rejects.toMatchObject({
+    await expect(
+      SprayViewPage({ board: boardFor('public'), parsedParams: PARSED_PARAMS, wallParam: undefined }),
+    ).rejects.toMatchObject({
       digest: NOT_FOUND_DIGEST,
     });
+  });
+
+  it('404s an unlisted wall reached without its uuid, or with a wrong one, and reads nothing', async () => {
+    // A signed-in owner's lookup hands back their unlisted row without a uuid, and
+    // this path carries a shared `s-maxage`: rendering it on the bare URL would
+    // cache the wall for whoever asks next.
+    for (const wallParam of [undefined, 'some-other-wall', ['wall-uuid-1', 'wall-uuid-1']]) {
+      await expect(
+        SprayViewPage({ board: boardFor('unlisted'), parsedParams: PARSED_PARAMS, wallParam }),
+      ).rejects.toMatchObject({
+        digest: NOT_FOUND_DIGEST,
+      });
+    }
+    expect(fetchSprayWallPageData).not.toHaveBeenCalled();
+    expect(getClimb).not.toHaveBeenCalled();
   });
 
   it('lets a failed wall read surface as a 5xx rather than a 404', async () => {
     fetchSprayWallPageData.mockRejectedValue(new Error('backend is wedged'));
 
-    await expect(SprayViewPage({ board: boardFor('public'), parsedParams: PARSED_PARAMS })).rejects.toThrow(
-      'backend is wedged',
-    );
+    await expect(
+      SprayViewPage({ board: boardFor('public'), parsedParams: PARSED_PARAMS, wallParam: undefined }),
+    ).rejects.toThrow('backend is wedged');
   });
 });
 
@@ -178,6 +232,7 @@ describe('the spray climb page metadata', () => {
       board: boardFor('public'),
       parsedParams: PARSED_PARAMS,
       boardSlugParam: 'garage-wall',
+      wallParam: undefined,
     });
 
     expect(metadata.alternates?.canonical).toContain('/b/garage-wall/40/view/crimp-ladder-');
@@ -185,11 +240,31 @@ describe('the spray climb page metadata', () => {
     expect(buildSprayOgImageUrl).toHaveBeenCalledWith(900, CLIMB.frames);
   });
 
+  it.each(SUPPORTED_LOCALES.filter((locale) => locale !== DEFAULT_LOCALE))(
+    '%s public spray climbs noindex while keeping the English canonical and card',
+    async (locale) => {
+      const args = {
+        board: boardFor('public'),
+        parsedParams: PARSED_PARAMS,
+        boardSlugParam: 'garage-wall',
+        wallParam: undefined,
+      };
+      const english = await buildSprayViewMetadata(args);
+      servedLocale = locale;
+      const metadata = await buildSprayViewMetadata(args);
+
+      expect(metadata.robots).toEqual({ index: false, follow: true });
+      expect(metadata.alternates).toEqual({ canonical: english.alternates?.canonical });
+      expect(metadata.openGraph?.images).toEqual(english.openGraph?.images);
+    },
+  );
+
   it('noindexes an unlisted wall, with no canonical and no card', async () => {
     const metadata = await buildSprayViewMetadata({
       board: boardFor('unlisted'),
       parsedParams: PARSED_PARAMS,
       boardSlugParam: 'garage-wall',
+      wallParam: 'wall-uuid-1',
     });
 
     expect(metadata.robots).toEqual({ index: false, follow: true });
@@ -197,11 +272,25 @@ describe('the spray climb page metadata', () => {
     expect(buildSprayOgImageUrl).not.toHaveBeenCalled();
   });
 
+  it('tells nothing about an unlisted wall reached without its uuid', async () => {
+    const metadata = await buildSprayViewMetadata({
+      board: boardFor('unlisted'),
+      parsedParams: PARSED_PARAMS,
+      boardSlugParam: 'garage-wall',
+      wallParam: 'some-other-wall',
+    });
+
+    expect(metadata.robots).toEqual({ index: false, follow: true });
+    expect(metadata.alternates?.canonical).toBeUndefined();
+    expect(getClimb).not.toHaveBeenCalled();
+  });
+
   it('tells nothing about a private wall, and does not look the climb up', async () => {
     const metadata = await buildSprayViewMetadata({
       board: boardFor('private'),
       parsedParams: PARSED_PARAMS,
       boardSlugParam: 'garage-wall',
+      wallParam: undefined,
     });
 
     expect(metadata.robots).toEqual({ index: false, follow: true });
@@ -216,6 +305,7 @@ describe('the spray climb page metadata', () => {
       board: boardFor('public'),
       parsedParams: PARSED_PARAMS,
       boardSlugParam: 'garage-wall',
+      wallParam: undefined,
     });
 
     expect(metadata.robots).toEqual({ index: false, follow: true });

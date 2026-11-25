@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vite-plus/test';
 import { brandCtaSx, brandCtaOutlinedSx, type BrandCtaSize } from '../brand-cta';
 
 /**
- * These two recipes exist because the same pill was hand-written at nine call
+ * These two recipes exist because the same button was hand-written at nine call
  * sites and drifted. The drift was never in the colours — it was in the SIZE:
  * the filled store button took `px: 4` while the outlined one beside it took
  * `px: 3` and a smaller font, so a pair that was meant to read as one control
@@ -41,9 +41,11 @@ describe('the brand CTA pair shares one size ramp', () => {
     expect(brandCtaOutlinedSx({ size: 'medium' })).toHaveProperty('minHeight', 44);
   });
 
-  it('gives both recipes the same pill radius and un-shouted label', () => {
+  it('gives both recipes the same 10px corner and un-shouted label', () => {
+    // A rounded rectangle, not a pill: the round-ended version read as a capsule
+    // next to the page's 12px cards and 10px inputs.
     for (const recipe of [brandCtaSx(), brandCtaOutlinedSx()]) {
-      expect(recipe.borderRadius).toBe('9999px');
+      expect(recipe.borderRadius).toBe('10px');
       expect(recipe.textTransform).toBe('none');
     }
   });
@@ -60,22 +62,40 @@ describe('the outlined recipe reads the control-boundary token', () => {
     expect(JSON.stringify(outlined)).not.toContain('--separator');
   });
 
-  it('uses the FOREGROUND violet for its label, not the fill violet', () => {
-    // #A78BFA on the page; #7C3AED is the filled-surface violet and would be
-    // 2.5:1 as text. The filled recipe is the one that may touch the fill.
-    expect(brandCtaOutlinedSx().color).toBe('var(--color-primary)');
+  it('is the grey secondary action: label ink, transparent ground, no violet at rest or on hover', () => {
+    // A page spends its violet on the one filled action, links and text actions.
+    // The outlined pill beside the filled one is grey: #EDEDED clears 4.5:1 on every
+    // surface step (the parity test pins it). Only the filled recipe touches violet.
+    const outlined = brandCtaOutlinedSx();
+
+    expect(outlined.color).toBe('var(--neutral-900)');
+    expect(outlined.backgroundColor).toBe('transparent');
+    expect(outlined.fontWeight).toBe(600);
+    expect(outlined['&:hover']).toMatchObject({
+      color: 'var(--neutral-900)',
+      borderColor: 'var(--control-border)',
+      backgroundColor: 'var(--semantic-button-hover)',
+    });
+    const { '&:focus-visible, &.Mui-focusVisible': focusRing, ...restOfRecipe } = outlined;
+    expect(JSON.stringify(restOfRecipe)).not.toContain('--color-primary');
+    // The focus ring is the one violet it carries, shared by every control.
+    expect(focusRing).toEqual({ outline: '2px solid var(--color-primary)', outlineOffset: '2px' });
     expect(brandCtaSx().backgroundColor).toBe('var(--color-primary-fill)');
+    expect(brandCtaSx()['&:hover'].backgroundColor).toBe('var(--color-primary-fill-hover)');
   });
 
-  it('carries no glow, because the amber spark belongs to the filled pill', () => {
-    const outlined = brandCtaOutlinedSx() as Record<string, unknown>;
-
-    expect(outlined).not.toHaveProperty('boxShadow');
-    expect(JSON.stringify(outlined)).not.toContain('accent-glow');
+  it('casts no glow on either button, at rest or on hover', () => {
+    // The mint CTA glow went with the violet page; the filled violet alone marks
+    // the page's primary action now.
+    for (const recipe of [brandCtaSx({ size: 'large' }), brandCtaOutlinedSx({ size: 'large' })]) {
+      expect(recipe).not.toHaveProperty('boxShadow');
+      expect(recipe['&:hover']).not.toHaveProperty('boxShadow');
+      expect(JSON.stringify(recipe)).not.toContain('accent-glow');
+    }
   });
 
   it('cancels the global hover lift the way the filled pill does', () => {
-    // StartClimbingButton's shared override translates on hover; a brand pill
+    // StartClimbingButton's shared override translates on hover; a brand button
     // stays anchored. If one recipe cancels it and the other does not, a pair
     // wobbles apart on hover.
     for (const recipe of [brandCtaSx(), brandCtaOutlinedSx()]) {

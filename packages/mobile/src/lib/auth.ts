@@ -12,9 +12,11 @@ import {
   storeTokens,
 } from './auth-store';
 import { raceBrowserSignIn } from './auth-session-race';
-import { nativeSignInErrorCode } from './native-auth-analytics';
+import { isAppleSignInCancellation, nativeSignInErrorCode } from './native-auth-analytics';
 import { parseDeepLinkQueryParams } from './deep-link-query';
 import { BACKEND_URL, WEB_BASE_URL } from './env';
+import { clientIdentityHeaders } from './client-identity';
+import { parseVerifiedAuthResult, type VerifiedAuthResult } from './verified-auth-result';
 
 export type AuthProvider = 'google' | 'apple';
 
@@ -40,13 +42,18 @@ export function isGoogleSignInConfigured(): boolean {
 
 type ForwardedName = { firstName?: string; lastName?: string };
 
-type NativeAuthFailure = { success: false; status: number | null; error: string };
+// `networkCause` splits the two ways a request ends with error 'network':
+// our 15 s abort ('timeout', the server was slow) and a fetch that never
+// connected ('unreachable'). Only set when error is 'network'.
+export type NetworkCause = 'timeout' | 'unreachable';
+
+type NativeAuthFailure = { success: false; status: number | null; error: string; networkCause?: NetworkCause };
 
 // A native OAuth attempt resolves to one of: success, an explicit user
 // cancellation (no error shown), or a real failure carrying the server's
 // status/error (mapped to a translated message by the caller).
 export type OAuthSignInResult =
-  | { success: true }
+  | ({ success: true } & Partial<VerifiedAuthResult>)
   | { success: false; cancelled: true }
   | { success: false; redirecting: true }
   | NativeAuthFailure;
@@ -62,16 +69,22 @@ export async function oauthNativeSignIn(
   extra?: { nonce?: string; name?: ForwardedName },
 ): Promise<OAuthSignInResult> {
   let response: Response;
+  const timeoutSignal = createTimeoutSignal(15_000);
   try {
     response = await fetch(`${BACKEND_URL}/auth/native/oauth`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...clientIdentityHeaders() },
       body: JSON.stringify({ provider, identityToken, nonce: extra?.nonce, name: extra?.name }),
-      signal: createTimeoutSignal(15_000),
+      signal: timeoutSignal,
     });
   } catch {
     // Network failure / timeout. The caller maps this to a translated message.
-    return { success: false, status: null, error: 'network' };
+    return {
+      success: false,
+      status: null,
+      error: 'network',
+      networkCause: timeoutSignal.aborted ? 'timeout' : 'unreachable',
+    };
   }
 
   if (!response.ok) {
@@ -89,7 +102,7 @@ export async function oauthNativeSignIn(
 
   const data = (await response.json()) as { jwt: string; refreshToken: string; expiresAt: string };
   await storeTokens(data.jwt, data.refreshToken, data.expiresAt);
-  return { success: true };
+  return { success: true, ...parseVerifiedAuthResult(data) };
 }
 
 // CSPRNG nonce, as lowercase hex. We hand Apple SHA-256(nonce) and send the raw
@@ -99,12 +112,6 @@ export async function oauthNativeSignIn(
 function generateNonce(): string {
   const bytes = getRandomBytes(16);
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
-// expo-apple-authentication rejects with a CodedError whose `.code` is
-// `ERR_REQUEST_CANCELED` when the user dismisses the system sheet.
-function isAppleCancellation(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ERR_REQUEST_CANCELED';
 }
 
 export async function signInWithApple(): Promise<OAuthSignInResult> {
@@ -124,7 +131,11 @@ export async function signInWithApple(): Promise<OAuthSignInResult> {
       nonce: hashedNonce,
     });
   } catch (error) {
-    if (isAppleCancellation(error)) return { success: false, cancelled: true };
+    // Matches the `.code` AND Apple's cancel message, because some builds reject
+    // with the message only. Without the message arm the cancel escapes to the
+    // caller's outer catch, where iOS unconditionally runs the browser OAuth
+    // fallback — backing out of the Apple sheet then opened a web sign-in (#3088).
+    if (isAppleSignInCancellation(error)) return { success: false, cancelled: true };
     throw error;
   }
 
@@ -154,7 +165,7 @@ function configureGoogleSignin(): void {
   // in the webClientId's Google Cloud project), not by an id string — passing one
   // is ignored. EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID exists only for backend-
   // audience parity. If Android sign-in fails before any network call, the
-  // running build's SHA-1 likely isn't registered (see docs/android-sideload-build.md).
+  // running build's SHA-1 likely isn't registered (see docs/operations/android-sideload-build.md).
   GoogleSignin.configure({
     webClientId: process.env.EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID,
     iosClientId: process.env.EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID,
@@ -199,7 +210,7 @@ export async function signInWithGoogle(): Promise<OAuthSignInResult> {
           `[auth] Google sign-in failed with an unmapped error (code: ${errorCode ?? 'none'}). On Android ` +
             "this is typically a config issue — the build's signing-certificate SHA-1 isn't registered as an " +
             "Android OAuth client for com.boardsesh.app in the webClientId's Google Cloud project. Get the " +
-            'SHA-1 via `apksigner verify --print-certs <apk>` (see docs/android-sideload-build.md).',
+            'SHA-1 via `apksigner verify --print-certs <apk>` (see docs/operations/android-sideload-build.md).',
         );
     }
     throw error;
@@ -219,16 +230,22 @@ const NATIVE_OAUTH_REDIRECT = 'com.boardsesh.app://auth/callback';
  */
 async function exchangeTransferToken(transferToken: string): Promise<OAuthSignInResult> {
   let response: Response;
+  const timeoutSignal = createTimeoutSignal(15_000);
   try {
     response = await fetch(`${BACKEND_URL}/auth/native/exchange`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...clientIdentityHeaders() },
       body: JSON.stringify({ transferToken }),
-      signal: createTimeoutSignal(15_000),
+      signal: timeoutSignal,
     });
   } catch {
     // Network failure / timeout. The caller maps this to a translated message.
-    return { success: false, status: null, error: 'network' };
+    return {
+      success: false,
+      status: null,
+      error: 'network',
+      networkCause: timeoutSignal.aborted ? 'timeout' : 'unreachable',
+    };
   }
 
   if (!response.ok) {
@@ -252,7 +269,7 @@ async function exchangeTransferToken(transferToken: string): Promise<OAuthSignIn
     return { success: false, status: response.status, error: 'invalid_response' };
   }
   await storeTokens(data.jwt, data.refreshToken, data.expiresAt);
-  return { success: true };
+  return { success: true, ...parseVerifiedAuthResult(data) };
 }
 
 /**
@@ -283,7 +300,8 @@ async function exchangeTransferToken(transferToken: string): Promise<OAuthSignIn
  * failure) so the caller treats it exactly like the native path.
  */
 async function signInWithProviderWeb(provider: AuthProvider): Promise<OAuthSignInResult> {
-  const nativeCallbackUrl = `${WEB_BASE_URL}/api/auth/native/callback?next=${encodeURIComponent('/')}`;
+  const attemptId = generateNonce();
+  const nativeCallbackUrl = `${WEB_BASE_URL}/api/auth/native/callback?next=${encodeURIComponent('/')}&provider=${provider}&attemptId=${attemptId}`;
   const startUrl = `${WEB_BASE_URL}/auth/native-start?provider=${provider}&callbackUrl=${encodeURIComponent(nativeCallbackUrl)}`;
 
   // Register the Linking url-listener BEFORE opening the browser (raceBrowserSignIn
@@ -294,7 +312,16 @@ async function signInWithProviderWeb(provider: AuthProvider): Promise<OAuthSignI
       platform: Platform.OS === 'android' ? 'android' : 'ios',
       addUrlListener: (listener) => Linking.addEventListener('url', listener),
       addAppStateListener: (listener) => AppState.addEventListener('change', listener),
-      getCurrentAppState: () => AppState.currentState,
+      getCurrentAppState: () => {
+        const currentState = AppState.currentState;
+        return currentState === 'active' ||
+          currentState === 'background' ||
+          currentState === 'inactive' ||
+          currentState === 'unknown' ||
+          currentState === 'extension'
+          ? currentState
+          : null;
+      },
       openBrowser: (url) => WebBrowser.openBrowserAsync(url),
       dismissBrowser: async () => WebBrowser.dismissBrowser(),
       setTimer: (callback, delayMs) => setTimeout(callback, delayMs),
@@ -345,9 +372,9 @@ export function signInWithAppleWeb(_isRegistration = false): Promise<OAuthSignIn
   return signInWithProviderWeb('apple');
 }
 
-export type CredentialsSignInResult = { success: true } | NativeAuthFailure;
+export type CredentialsSignInResult = ({ success: true } & Partial<VerifiedAuthResult>) | NativeAuthFailure;
 export type RegistrationResult =
-  | { success: true; authenticated?: true }
+  | ({ success: true; authenticated?: true } & Partial<VerifiedAuthResult>)
   | { success: true; authenticated: false; requiresVerification: true }
   | { success: true; authenticated: false; requiresVerification: false; autoLoginUnavailable: true }
   | NativeAuthFailure;
@@ -357,7 +384,7 @@ export async function signInWithCredentials(email: string, password: string): Pr
   try {
     response = await fetch(`${BACKEND_URL}/auth/native/credentials`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...clientIdentityHeaders() },
       body: JSON.stringify({ email, password }),
       signal: createTimeoutSignal(15_000),
     });
@@ -381,7 +408,7 @@ export async function signInWithCredentials(email: string, password: string): Pr
 
   const data = (await response.json()) as { jwt: string; refreshToken: string; expiresAt: string };
   await storeTokens(data.jwt, data.refreshToken, data.expiresAt);
-  return { success: true };
+  return { success: true, ...parseVerifiedAuthResult(data) };
 }
 
 /**
@@ -400,7 +427,7 @@ export async function registerWithCredentials(
   try {
     response = await fetch(`${BACKEND_URL}/auth/native/register`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...clientIdentityHeaders() },
       body: JSON.stringify({ email, password, ...(name ? { name } : {}) }),
       signal: createTimeoutSignal(15_000),
     });
@@ -424,7 +451,7 @@ export async function registerWithCredentials(
 
   const data = (await response.json()) as { jwt: string; refreshToken: string; expiresAt: string };
   await storeTokens(data.jwt, data.refreshToken, data.expiresAt);
-  return { success: true };
+  return { success: true, ...parseVerifiedAuthResult(data) };
 }
 
 export type PasswordResetResult = { success: true } | NativeAuthFailure;
@@ -516,7 +543,7 @@ export async function signOutForGeneration(signOutGeneration: number): Promise<b
     // Best-effort server-side revocation — don't block on failure
     fetch(`${BACKEND_URL}/auth/native/revoke`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...clientIdentityHeaders() },
       body: JSON.stringify({ refreshToken }),
     }).catch(() => {});
   }

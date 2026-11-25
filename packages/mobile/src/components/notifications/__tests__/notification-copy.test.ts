@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { typeDefs, type GroupedNotification, type NotificationType } from '@boardsesh/shared-schema';
+import {
+  typeDefs,
+  type DirectoryNotice,
+  type GroupedNotification,
+  type NotificationType,
+} from '@boardsesh/shared-schema';
 import { iconMap } from '../../icon-map';
 import { actorSummary, notificationCopy, notificationIconName } from '../notification-copy';
 
@@ -48,10 +53,16 @@ describe('notificationCopy', () => {
   // Bare branches — no commentBody, no setterUsername, no gymName. Keys are the
   // exact ones web's getNotificationText returns for the same input.
   const bareCases: Array<[NotificationType, string]> = [
+    ['app_feedback_reply', 'items.bugReportReply'],
     ['new_follower', 'items.newFollower'],
+    ['follow_request', 'items.followRequest'],
     ['comment_reply', 'items.commentReply'],
     ['comment_on_tick', 'items.commentOnTick'],
-    ['comment_on_climb', 'items.commentOnClimb'],
+    ['comment_on_climb', 'items.commentOnClimbGeneric'],
+    ['comment_on_session', 'items.commentOnSession'],
+    ['comment_on_playlist', 'items.commentOnPlaylist'],
+    ['comment_on_board', 'items.commentOnBoard'],
+    ['comment_on_gym', 'items.commentOnGymGeneric'],
     ['vote_on_tick', 'items.voteOnTick'],
     ['vote_on_comment', 'items.voteOnComment'],
     ['proposal_created', 'items.proposalCreated'],
@@ -62,13 +73,40 @@ describe('notificationCopy', () => {
     ['new_climb_global', 'items.newClimb'],
     ['new_climbs_synced', 'items.newClimbsSynced'],
     ['gym_claim_approved', 'items.gymClaimApprovedGeneric'],
+    ['spray_wall_detection_completed', 'items.sprayWallReadyGeneric'],
     // Bare = no proposalType and no climbName, so the setter row lands on the
     // climb-free key rather than a string with an empty {{climb}} hole in it.
     ['proposal_on_your_climb', 'items.proposalOnYourClimbGeneric'],
+    // Report a problem and staff actions on boards: no `directoryNotice`, so
+    // nothing to name. Each says what happened without the board or gym.
+    ['board_report_opened', 'items.boardReportOpenedGeneric'],
+    ['board_report_resolved', 'items.boardReportResolvedGeneric'],
+    ['board_removed_from_gym', 'items.boardRemovedFromGymGeneric'],
+    ['board_deleted_by_staff', 'items.boardDeletedByStaffGeneric'],
+    ['board_edited_by_staff', 'items.boardEditedByStaffGeneric'],
+    ['board_setup_changed_by_climber', 'items.boardSetupChangedByClimberGeneric'],
+    ['gym_report_opened', 'items.gymReportOpenedGeneric'],
+    ['gym_report_resolved', 'items.gymReportResolvedGeneric'],
+    ['gym_claimed_with_your_board', 'items.gymClaimedWithYourBoardGeneric'],
+    ['gym_claim_denied', 'items.gymClaimDeniedGeneric'],
   ];
 
   it.each(bareCases)('maps %s to %s', (type, expectedKey) => {
     expect(notificationCopy(makeNotification({ type }), 'Alex').textI18nKey).toBe(expectedKey);
+  });
+
+  it('names the completed wall without referring to an actor', () => {
+    expect(
+      notificationCopy(
+        makeNotification({
+          type: 'spray_wall_detection_completed',
+          actorCount: 0,
+          actors: [],
+          sprayWallName: 'Garage wall',
+        }),
+        'Someone',
+      ),
+    ).toEqual({ textI18nKey: 'items.sprayWallReady', params: { wall: 'Garage wall' } });
   });
 
   it('covers every NotificationType the schema declares', () => {
@@ -166,12 +204,16 @@ describe('notificationCopy', () => {
     expect(copy).toEqual({ textI18nKey: 'items.proposalCreated', params: { actor: 'Alex' } });
   });
 
-  // The three comment types swap to a *WithBody key when the group carries a
-  // comment preview, and interpolate the body.
+  // Every comment type swaps to a *WithBody key when the group carries a
+  // comment preview, and interpolates the body.
   const withBodyCases: Array<[NotificationType, string]> = [
     ['comment_reply', 'items.commentReplyWithBody'],
     ['comment_on_tick', 'items.commentOnTickWithBody'],
     ['comment_on_climb', 'items.commentOnClimbWithBody'],
+    ['comment_on_session', 'items.commentOnSessionWithBody'],
+    ['comment_on_playlist', 'items.commentOnPlaylistWithBody'],
+    ['comment_on_board', 'items.commentOnBoardWithBody'],
+    ['comment_on_gym', 'items.commentOnGymWithBody'],
   ];
 
   it.each(withBodyCases)('maps %s with a commentBody to %s', (type, expectedKey) => {
@@ -184,6 +226,64 @@ describe('notificationCopy', () => {
     expect(copy).toEqual({ textI18nKey: 'items.newClimbsSyncedSetter', params: { setter: 'setterbot' } });
   });
 
+  it.each(['new_climb', 'new_climb_global'] as const)(
+    'names the setter of a %s with no actor by its setter name',
+    (type) => {
+      const hidden = makeNotification({ type, actors: [], actorCount: 0, setterUsername: 'wallhandle' });
+      expect(notificationCopy(hidden, 'Someone')).toEqual({
+        textI18nKey: 'items.newClimb',
+        params: { actor: 'wallhandle' },
+      });
+      // A visible account still wins over the setter name.
+      const shown = makeNotification({ type, setterUsername: 'wallhandle' });
+      expect(notificationCopy(shown, 'Alex')).toEqual({ textI18nKey: 'items.newClimb', params: { actor: 'Alex' } });
+    },
+  );
+
+  // An owner row with no comment preview (the comment was deleted) names the
+  // climb or gym when the group carries it, and stays climb-free otherwise.
+  it('names your climb on a comment_on_climb row with no preview', () => {
+    const copy = notificationCopy(makeNotification({ type: 'comment_on_climb', climbName: 'Crimp line' }), 'Alex');
+    expect(copy).toEqual({ textI18nKey: 'items.commentOnClimb', params: { actor: 'Alex', climb: 'Crimp line' } });
+  });
+
+  it('calls a spray wall a Spraywall, never a bare board', () => {
+    const spray = (commentBody: string | null) =>
+      notificationCopy(makeNotification({ type: 'comment_on_board', boardType: 'spray', commentBody }), 'Alex');
+    expect(spray('nice set')).toEqual({
+      textI18nKey: 'items.commentOnSprayWallWithBody',
+      params: { actor: 'Alex', body: 'nice set' },
+    });
+    expect(spray(null)).toEqual({ textI18nKey: 'items.commentOnSprayWall', params: { actor: 'Alex' } });
+    // Any other board, or an older backend that sends no type, stays a board.
+    expect(
+      notificationCopy(makeNotification({ type: 'comment_on_board', boardType: 'kilter' }), 'Alex').textI18nKey,
+    ).toBe('items.commentOnBoard');
+  });
+
+  it('names your gym on a comment_on_gym row with no preview', () => {
+    const copy = notificationCopy(makeNotification({ type: 'comment_on_gym', gymName: 'Boulder Barn' }), 'Alex');
+    expect(copy).toEqual({ textI18nKey: 'items.commentOnGym', params: { actor: 'Alex', gym: 'Boulder Barn' } });
+  });
+
+  it('reads an unnamed report on your climb as coming from someone', () => {
+    // A private reporter arrives with no actor; the screen resolves the actor
+    // summary to the fallback before calling notificationCopy.
+    const unnamed = makeNotification({
+      type: 'proposal_on_your_climb',
+      actors: [],
+      actorCount: 0,
+      proposalType: 'hide',
+      climbName: 'Crimp line',
+    });
+    const actor = actorSummary(unnamed, FALLBACKS);
+    expect(actor).toEqual({ kind: 'literal', text: 'Someone' });
+    expect(notificationCopy(unnamed, 'Someone')).toEqual({
+      textI18nKey: 'items.proposalOnYourClimbHide',
+      params: { actor: 'Someone', climb: 'Crimp line' },
+    });
+  });
+
   it('names the gym when gym_claim_approved carries one', () => {
     const copy = notificationCopy(makeNotification({ type: 'gym_claim_approved', gymName: 'Boulder Barn' }), 'Alex');
     expect(copy).toEqual({ textI18nKey: 'items.gymClaimApproved', params: { gym: 'Boulder Barn' } });
@@ -194,6 +294,152 @@ describe('notificationCopy', () => {
     // still render a row rather than a blank line.
     const unknown = makeNotification({ type: 'something_new' as NotificationType });
     expect(notificationCopy(unknown, 'Alex').textI18nKey).toBe('items.default');
+  });
+});
+
+describe('notificationCopy: directory notices', () => {
+  function notice(overrides: Partial<DirectoryNotice> = {}): DirectoryNotice {
+    return {
+      targetKind: 'board',
+      boardUuid: 'b1',
+      boardName: 'Crux Kilter',
+      boardType: 'kilter',
+      gymUuid: 'g1',
+      gymName: 'Crux',
+      reportUuid: 'r1',
+      reason: 'wrong_setup',
+      outcome: null,
+      resolvedByRole: null,
+      resolutionNote: null,
+      actorRole: null,
+      isReminder: false,
+      recipientIsCreator: true,
+      ...overrides,
+    };
+  }
+  function copyFor(type: NotificationType, overrides: Partial<DirectoryNotice> = {}) {
+    return notificationCopy(
+      makeNotification({ type, actorCount: 0, actors: [], directoryNotice: notice(overrides) }),
+      'Someone',
+    );
+  }
+
+  it.each([
+    ['wrong_setup', 'items.boardReportedWrongSetup'],
+    ['duplicate', 'items.boardReportedDuplicate'],
+    ['gone', 'items.boardReportedGone'],
+    ['wrong_place', 'items.boardReportedWrongPlace'],
+    ['other', 'items.boardReportedOther'],
+  ] as const)('tells the creator what a %s report says', (reason, key) => {
+    expect(copyFor('board_report_opened', { reason })).toEqual({
+      textI18nKey: key,
+      params: { board: 'Crux Kilter' },
+    });
+  });
+
+  it('tells gym staff whose board was flagged at their gym, and reminds without the reason', () => {
+    expect(copyFor('board_report_opened', { recipientIsCreator: false })).toEqual({
+      textI18nKey: 'items.gymBoardReported',
+      params: { board: 'Crux Kilter', gym: 'Crux' },
+    });
+    expect(copyFor('board_report_opened', { isReminder: true }).textI18nKey).toBe('items.boardReportReminder');
+    expect(copyFor('board_report_opened', { reason: 'relist_request', recipientIsCreator: false })).toEqual({
+      textI18nKey: 'items.boardRelistRequested',
+      params: { board: 'Crux Kilter', gym: 'Crux' },
+    });
+  });
+
+  it('words each outcome for the reporters, and who kept it as is', () => {
+    expect(copyFor('board_report_resolved', { outcome: 'fixed' }).textI18nKey).toBe('items.boardReportFixed');
+    expect(copyFor('board_report_resolved', { outcome: 'removed' })).toEqual({
+      textI18nKey: 'items.boardReportRemoved',
+      params: { board: 'Crux Kilter', gym: 'Crux' },
+    });
+    expect(copyFor('board_report_resolved', { outcome: 'deleted' }).textI18nKey).toBe('items.boardReportDeleted');
+    expect(copyFor('board_report_resolved', { outcome: 'merged' }).textI18nKey).toBe('items.boardReportMerged');
+    expect(copyFor('board_report_resolved', { outcome: 'kept', resolvedByRole: 'creator' }).textI18nKey).toBe(
+      'items.boardReportKeptByCreator',
+    );
+    expect(copyFor('board_report_resolved', { outcome: 'kept', resolvedByRole: 'gym_staff' }).textI18nKey).toBe(
+      'items.boardReportKeptByStaff',
+    );
+    expect(copyFor('board_report_resolved', { outcome: 'kept', resolvedByRole: 'admin' }).textI18nKey).toBe(
+      'items.boardReportKeptByTeam',
+    );
+    expect(copyFor('board_report_resolved', { reason: 'relist_request', outcome: 'fixed' }).textI18nKey).toBe(
+      'items.boardRelisted',
+    );
+    expect(copyFor('board_report_resolved', { reason: 'relist_request', outcome: 'kept' }).textI18nKey).toBe(
+      'items.boardRelistDeclined',
+    );
+  });
+
+  it('names staff or a moderator on the creator rows', () => {
+    expect(copyFor('board_removed_from_gym', { actorRole: 'gym_staff' })).toEqual({
+      textI18nKey: 'items.boardRemovedByStaff',
+      params: { board: 'Crux Kilter', gym: 'Crux' },
+    });
+    expect(copyFor('board_removed_from_gym', { actorRole: 'moderator' }).textI18nKey).toBe(
+      'items.boardRemovedByModerator',
+    );
+    expect(copyFor('board_deleted_by_staff', { actorRole: 'gym_staff' }).textI18nKey).toBe('items.boardDeletedByStaff');
+    expect(copyFor('board_deleted_by_staff', { actorRole: 'moderator' }).textI18nKey).toBe(
+      'items.boardDeletedByModerator',
+    );
+    expect(copyFor('board_edited_by_staff', { actorRole: 'gym_staff' }).textI18nKey).toBe('items.boardEditedByStaff');
+    expect(copyFor('board_edited_by_staff', { actorRole: 'moderator' }).textI18nKey).toBe(
+      'items.boardEditedByModerator',
+    );
+  });
+
+  it("names the board a climber's suggested setup changed", () => {
+    expect(copyFor('board_setup_changed_by_climber')).toEqual({
+      textI18nKey: 'items.boardSetupChangedByClimber',
+      params: { board: 'Crux Kilter' },
+    });
+    expect(copyFor('board_setup_changed_by_climber', { boardName: null }).textI18nKey).toBe(
+      'items.boardSetupChangedByClimberGeneric',
+    );
+  });
+
+  it("tells the gym's staff which board at their gym a climber changed, never 'your board'", () => {
+    expect(copyFor('board_setup_changed_by_climber', { recipientIsCreator: false })).toEqual({
+      textI18nKey: 'items.boardSetupChangedByClimberAtGym',
+      params: { board: 'Crux Kilter', gym: 'Crux' },
+    });
+    expect(copyFor('board_setup_changed_by_climber', { recipientIsCreator: false, gymName: null }).textI18nKey).toBe(
+      'items.boardSetupChangedByClimberStaffGeneric',
+    );
+  });
+
+  it('words the gym rows', () => {
+    expect(copyFor('gym_report_opened', { targetKind: 'gym', reason: 'wrong_details' })).toEqual({
+      textI18nKey: 'items.gymReportedWrongDetails',
+      params: { gym: 'Crux' },
+    });
+    expect(copyFor('gym_report_opened', { targetKind: 'gym', isReminder: true }).textI18nKey).toBe(
+      'items.gymReportReminder',
+    );
+    expect(
+      copyFor('gym_report_resolved', { targetKind: 'gym', outcome: 'kept', resolvedByRole: 'gym_staff' }).textI18nKey,
+    ).toBe('items.gymReportKeptByStaff');
+    expect(copyFor('gym_report_resolved', { targetKind: 'gym', outcome: 'removed' }).textI18nKey).toBe(
+      'items.gymReportRemoved',
+    );
+    expect(copyFor('gym_claimed_with_your_board')).toEqual({
+      textI18nKey: 'items.gymClaimedWithYourBoard',
+      params: { board: 'Crux Kilter', gym: 'Crux' },
+    });
+    expect(copyFor('gym_claim_denied', { targetKind: 'gym' })).toEqual({
+      textI18nKey: 'items.gymClaimDenied',
+      params: { gym: 'Crux' },
+    });
+  });
+
+  it('falls back to the generic sentence when the name it needs is gone', () => {
+    expect(copyFor('board_report_opened', { boardName: null }).textI18nKey).toBe('items.boardReportOpenedGeneric');
+    expect(copyFor('board_removed_from_gym', { gymName: null }).textI18nKey).toBe('items.boardRemovedFromGymGeneric');
+    expect(copyFor('gym_claim_denied', { gymName: null }).textI18nKey).toBe('items.gymClaimDeniedGeneric');
   });
 });
 

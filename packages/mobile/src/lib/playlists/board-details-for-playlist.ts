@@ -66,11 +66,10 @@ export function getBoardConfigForPlaylist(
  * each from its own origin, so an 8x10 climb's ids all exist on the 12x12 as
  * COMPLETELY DIFFERENT holds: the layout default (always the 12x12) doesn't fail
  * to render, it silently renders a different climb. `resolveRenderBoard` has the
- * per-board rules for this; with no tick board and no owner boards it degrades to
- * exactly `getDefaultRenderBoard` whenever the climb names no sizes, so a climb
- * without `compatibleSizeIds` keeps today's answer.
+ * per-board rules for this. Woods with no size information returns null (the
+ * caller draws a plain tile) instead of the 12x12 guess.
  *
- * See `docs/board-art-geometry.md` for the coordinate contract.
+ * See `docs/rendering/board-art-geometry.md` for the coordinate contract.
  */
 export function getBoardConfigForClimb(
   boardType: string,
@@ -91,6 +90,11 @@ export function getBoardConfigForClimb(
  * resolved (the board it was climbed on, or the closest one the climber has),
  * falling back to the layout default for payloads that don't carry one — an
  * older app talking to an older server, or a feed that doesn't resolve it.
+ *
+ * Woods is the exception: its sizes number holds from separate origins, so the
+ * layout default (the 12x12) would draw an 8x10 climb as different holds. A
+ * Woods payload with no `renderBoard` returns null (plain tile) — the backend
+ * sends null exactly when it has no size information for the climb.
  */
 export function renderBoardToPlaylistConfig(
   boardType: string,
@@ -106,5 +110,6 @@ export function renderBoardToPlaylistConfig(
       setIds: renderBoard.setIds,
     };
   }
+  if (boardName === 'woods') return null;
   return getBoardConfigForPlaylist(boardType, layoutId);
 }

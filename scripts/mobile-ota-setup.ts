@@ -3,8 +3,8 @@
 /**
  * One-time setup helper for the self-hosted production OTA — the green-field
  * expo-open-ota **V3** control-plane server at updates.boardsesh.com. Splits the
- * runbook in docs/mobile-ota-updates.md into scriptable phases so the error-prone
- * bits (the Railway env block, the S3 lifecycle rule, the GitHub secret/var checks)
+ * runbook in docs/operations/mobile-ota-updates.md into scriptable phases so the error-prone
+ * bits (the container env block, the S3 lifecycle rule, the GitHub secret/var checks)
  * aren't done by hand. Cloud actions (bucket, Postgres, Railway service, DNS) and
  * dashboard actions (create the app, export the cert, mint the eoo_ key) stay manual.
  *
@@ -17,7 +17,7 @@
  *   - Publish auth is the app-scoped EOO_TOKEN (Expo tokens are rejected).
  *
  * Phases (run in this order as infra comes online):
- *   vp run mobile:ota-setup keys            # print the V3 Railway env + cert-export steps
+ *   vp run mobile:ota-setup keys            # print the V3 container env + cert-export steps
  *   vp run mobile:ota-setup map             # map the `production` channel → branch (post first publish; `expo` alias)
  *   vp run mobile:ota-setup github --url <BASE_URL>/manifest   # set the EXPO_UPDATES_URL variable + secret checks
  *   vp run mobile:ota-setup preview         # per-PR preview infra: S3 lifecycle rule + GitHub bits
@@ -89,9 +89,10 @@ function printServerSetup(): void {
   }
 
   log('');
-  log('── Railway env for the expo-open-ota V3 service (as built) ──────────────');
+  log('── Container env for the expo-open-ota V3 service (as built) ──────────────');
   log('⚠ DB_KEYS_MASTER_KEY_B64 is the ONLY key that can unseal the app signing key.');
-  log('  Generate it ONCE: printf %s "$(openssl rand -base64 32)"  (no trailing newline,');
+  log('  Migration: preserve the EXISTING key and restore its database; never generate a replacement.');
+  log('  Green-field only, generate it ONCE: printf %s "$(openssl rand -base64 32)"  (no trailing newline,');
   log('  strict base64). Store it in 1Password + one out-of-band copy and NEVER');
   log('  regenerate it — losing it together with the Postgres backups makes the entire');
   log('  V3 fleet unsignable.');
@@ -100,7 +101,7 @@ function printServerSetup(): void {
     [
       `BASE_URL=https://updates.boardsesh.com`,
       `JWT_SECRET=<openssl rand -hex 32>`,
-      `DB_URL=<Railway Postgres internal URL, with explicit sslmode; DB must exist before first boot>`,
+      `DB_URL=<dedicated Postgres URL; homelab Compose host postgres; DB must exist before first boot>`,
       `DB_KEYS_MASTER_KEY_B64=<openssl rand -base64 32 — store safely, NEVER regenerate>`,
       `ADMIN_EMAIL=admin@boardsesh.com`,
       `ADMIN_PASSWORD=<at least 8 chars incl. upper+lower+digit+special — first boot crash-loops otherwise>`,
@@ -111,6 +112,11 @@ function printServerSetup(): void {
       `AWS_REGION=auto`,
       `AWS_ACCESS_KEY_ID=<bucket key id>`,
       `AWS_SECRET_ACCESS_KEY=<bucket secret>`,
+      // Assets redirect to the public R2 custom domain (edge cached, Brotli).
+      // Patches still come from this server: leave BUNDLE_DIFFING_CDN_REDIRECT
+      // unset unless the CDN adds the im and expo-base-update-id headers.
+      `CDN_BASE_URL=https://ota-assets.boardsesh.com`,
+      `BUNDLE_DIFFING=true`,
       // Redis, not local: local mode caches in the Go heap with no bound and
       // reached 1.7 GB (2.3M objects) after 21 days in production. xprem has no
       // default REDIS_PORT. The prefix names OTA keys in the shared Redis.
@@ -120,6 +126,10 @@ function printServerSetup(): void {
       `REDIS_PORT=\${{Redis.REDISPORT}}`,
       `REDIS_PASSWORD=\${{Redis.REDISPASSWORD}}`,
       `CACHE_KEY_PREFIX=boardsesh-ota`,
+      // Cloudflare overwrites this header from ip.src.country on the proxied
+      // updates hostname. It is aggregate telemetry only, never an auth signal.
+      `TRUST_GEOIP_HEADERS=true`,
+      `GEOIP_HEADER_COUNTRY=X-Geo-Country`,
       `PROMETHEUS_ENABLED=true`,
     ].join('\n'),
   );
@@ -133,12 +143,10 @@ function setupChannel(): void {
   log('── V3 control-plane: production channel + branch surfing ────────────────');
   log('`vp run mobile:publish -- --channel production` publishes the production branch.');
   log('');
-  log('In the dashboard, map channel `production` → branch `production` once.');
-  log('Enable Branch Surfing on `production` with pattern `pr-*` — but only AFTER native builds');
-  log('carrying @xprem/control-center and the baked xprem-branch header have reached testers, since');
-  log('a binary without that header cannot surf. The toggle is on the Channels page INSIDE the');
-  log("selected channel's detail pane, not on the channel list, and an empty pattern makes the");
-  log('switch un-toggleable. Confirm the live state any time with `vp run mobile:ota-surf-doctor`.');
+  log('The channel mapping, Branch Surfing and branch protection are declared in infra/ota/config.ts.');
+  log('`vp run ota:apply` prints what differs on the server; `vp run ota:apply -- --apply` makes it so.');
+  log('It needs OTA_ADMIN_EMAIL and OTA_ADMIN_PASSWORD. Confirm what devices are offered with');
+  log('`vp run mobile:ota-surf-doctor`.');
   log('');
   log(`Verify after mapping: vp dlx ${EOAS_PACKAGE_SPEC} doctor --channel ${CHANNEL}  (needs EOO_TOKEN)`);
 }
@@ -295,11 +303,12 @@ function printRunbook(): void {
   log('Self-hosted production OTA setup (green-field expo-open-ota V3 control-plane).');
   log('Run these phases as infra comes online:');
   log('');
-  log('  1. (cloud) create the boardsesh-ota-v3 bucket + a dedicated Railway Postgres,');
-  log('       deploy ghcr.io/mercuretechnologies/xprem:v3.2.5 on Railway,');
-  log('       point updates.boardsesh.com at it (see docs/mobile-ota-updates.md).');
+  log('  1. Use the approved Ansible OTA VM stack and existing boardsesh-ota-v3 R2 bucket,');
+  log('       deploy ghcr.io/mercuretechnologies/xprem:v3.2.6 at the declared immutable digest,');
+  log('       expose updates.boardsesh.com through its Cloudflare Tunnel (see docs/operations/ota-homelab.md).');
+  log('       Migration restores the existing app/signing identity: skip new-app/certificate/native-build steps.');
   log('  2. vp run mobile:ota-setup keys');
-  log('       → prints the V3 Railway env block + the cert-export steps.');
+  log('       → prints the V3 container env block + the cert-export steps.');
   log('         Create the app in /dashboard, export certs/certificate.pem, commit it.');
   log('  3. vp run mobile:ota-setup github --url https://updates.boardsesh.com/manifest');
   log('       → sets the EXPO_UPDATES_URL repo variable + checks EOO_TOKEN / OTA_ADMIN_*.');
@@ -309,7 +318,7 @@ function printRunbook(): void {
   log('  6. vp run mobile:ota-setup preview     (optional — per-PR preview branches)');
   log('       → prints the S3 {appId}/pr- lifecycle rule + ensures the GitHub environments/secrets.');
   log('');
-  log('Full runbook: docs/mobile-ota-updates.md');
+  log('Full runbook: docs/operations/mobile-ota-updates.md');
 }
 
 const args = process.argv.slice(2).filter((arg) => arg !== '--');

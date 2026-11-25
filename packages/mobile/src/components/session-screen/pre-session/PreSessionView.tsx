@@ -1,18 +1,23 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { StyleSheet, View } from 'react-native';
-import { FlashList } from '@shopify/flash-list';
-import { ScrollView as GestureScrollView } from 'react-native-gesture-handler';
+import { PreSessionHeaderView } from './PreSessionHeaderView';
+import { PreSessionPresentation } from './PreSessionPresentation';
+import { useQueryClient } from '@tanstack/react-query';
+import { useNativeRootHeader } from '../../../hooks/use-native-root-header';
+import { usePrivacySettings } from '../../../lib/graphql/hooks/use-privacy';
+import { AudiencePicker, SESSION_AUDIENCES } from '../../privacy/AudiencePicker';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { StyleSheet, View, type ViewInstance } from 'react-native';
+import { type FlashListRef } from '@shopify/flash-list';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
+import { useIsFocused } from 'expo-router';
 import { toBoardName } from '@boardsesh/board-config';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import type { BoardName, Climb } from '@boardsesh/shared-schema';
 import type { ClimbQueueItem } from '@boardsesh/queue';
 import { track } from '../../../lib/analytics';
-import { Card } from '../../Card';
-import { SectionHeader } from '../../SectionHeader';
-import { Text } from '../../Text';
-import { ScreenTitle } from '../../ScreenTitle';
+import { prepareWorkoutRun } from '../../../lib/workout-run-store';
+import { captureWorkoutRunClimbs } from '../../../lib/session-workout-plan';
+import { enqueueSessionWorkoutWrite } from '../../../offline/session-workout-outbox';
 import type { QueueItemRowBoard } from '../../QueueItemRow';
 import { useTheme } from '../../../providers/theme-provider';
 import { spacing } from '../../../theme/tokens';
@@ -21,53 +26,37 @@ import { useQueueActions } from '../../../providers/queue-provider';
 import { useToast } from '../../../providers/toast-provider';
 import { useDrawerHost } from '../../../providers/drawer-host-provider';
 import { useBottomChromeMetrics } from '../../../hooks/use-bottom-chrome-metrics';
+import { useScrollEdgeBackdrop } from '../../../hooks/use-scroll-edge-backdrop';
+import { useHideOnScroll } from '../../../hooks/use-hide-on-scroll';
+import { useVariantValue } from '../../../theme/variants';
 import { reportError } from '../../../lib/error-reporting';
 import { RecordTopChrome } from '../RecordTopChrome';
 import { SESSION_START_FAB_HEIGHT, SessionStartFab } from '../SessionStartFab';
-import { BoardSummaryCard } from './BoardSummaryCard';
-import { useSessionBoardNavigation } from '../use-session-board-navigation';
+import { BoardSummaryCard } from '../../boards/BoardSummaryCard';
+import { useBoardShortcutNavigation } from '../../../lib/boards/use-board-shortcut-navigation';
 import { RestTimerArmRow } from '../RestTimerArmRow';
 import { SessionVisibilityRow } from '../SessionVisibilityRow';
+import { summarizePlanFill } from '@boardsesh/playlist-generator';
+import { GeneratorPickerCard } from './GeneratorPickerCard';
 import {
-  DEFAULT_GRADE_FOCUS_OPTIONS,
-  DEFAULT_LADDER_OPTIONS,
-  DEFAULT_PYRAMID_OPTIONS,
-  DEFAULT_VOLUME_OPTIONS,
-} from '@boardsesh/playlist-generator';
-import { assertNever } from '../../../lib/assert-never';
-import { SCREENSHOT_WORKOUT } from '../../../lib/screenshot-mode';
-import { GeneratorPickerCard, type GeneratorSelection } from './GeneratorPickerCard';
-import { WorkoutPreviewRow } from './WorkoutPreviewRow';
+  NO_WORKOUT,
+  firstWorkoutType,
+  hasWorkoutBlocks,
+  selectionWorkoutTypes,
+  type GeneratorSelection,
+} from './workout-blocks';
+import { WorkoutPreviewListRow } from './WorkoutPreviewListRow';
+import { WorkoutPreviewPane } from './WorkoutPreviewPane';
+import { WorkoutPreviewSection } from './WorkoutPreviewSection';
+import { resolveWorkoutPreviewPlacement } from './workout-preview-placement';
 import { useWorkoutPreview } from './use-workout-preview';
-import type { PreviewItem } from './workout-preview-pool';
+import { usePhoneSplit } from '../../../hooks/use-phone-split';
+import { useHasPhoneSplitPaneSlot, usePhoneSplitPaneContent } from '../../navigation/phone-split-pane-slot';
+import { buildPreviewListRows, type PreviewListRow } from './workout-preview-sections';
 import { OnboardingTipBanner } from '../../onboarding/OnboardingTipBanner';
 import { hasSeenTip, markTipSeen } from '../../../lib/onboarding/onboarding-storage';
 import { ONBOARDING_TIP_CREW_KEY, ONBOARDING_TIP_WORKOUT_KEY } from '@boardsesh/key-value-storage';
-
-// Screenshot mode pre-selects a workout so the Record screen renders the
-// generator (chart + generated preview) on load. The workout shelf is a
-// react-native-gesture-handler ScrollView that Maestro can't tap, so baking the
-// initial selection is the only reliable way to capture it. Off in normal builds.
-// The DEFAULT_*_OPTIONS omit `targetGrade` (see playlist-generator types), so each
-// branch adds a mid-grade default — mirroring buildDefaultOptions in GeneratorPickerCard.
-function initialGeneratorSelection(): GeneratorSelection {
-  if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE !== '1' || !SCREENSHOT_WORKOUT) return { type: 'off' };
-  const targetGrade = 15;
-  switch (SCREENSHOT_WORKOUT) {
-    case 'volume':
-      return { type: 'on', options: { ...DEFAULT_VOLUME_OPTIONS, targetGrade } };
-    case 'pyramid':
-      return { type: 'on', options: { ...DEFAULT_PYRAMID_OPTIONS, targetGrade } };
-    case 'ladder':
-      return { type: 'on', options: { ...DEFAULT_LADDER_OPTIONS, targetGrade } };
-    case 'gradeFocus':
-      return { type: 'on', options: { ...DEFAULT_GRADE_FOCUS_OPTIONS, targetGrade } };
-    default:
-      // A new ScreenshotWorkout variant must add a case above; otherwise this
-      // turns into a compile error instead of silently returning undefined.
-      return assertNever(SCREENSHOT_WORKOUT);
-  }
-}
+import { usePendingWorkout } from '../../../lib/pending-workout-store';
 
 type PreSessionViewProps = {
   /** Render the floating glass chrome (large title + board pill). True in the
@@ -76,7 +65,7 @@ type PreSessionViewProps = {
   /** The owning screen retains this form while session state becomes live. */
   onStartingChange?: (starting: boolean) => void;
   /** The owning screen completes the tab handoff after the queue is ready. */
-  onStarted?: () => void;
+  onStarted?: (hasWorkout: boolean) => void;
   /** Keep Start disabled until the native tab has left this screen. */
   isOpeningClimbs?: boolean;
 };
@@ -87,10 +76,18 @@ type PreSessionViewProps = {
  * then tap Start. The preview is built/refreshed by `useWorkoutPreview`; Start
  * creates the session (the ONLY create path besides joining — sessions are never
  * created lazily) and queues the preview behind the live queue without moving the
- * current climb, then opens Climbs with the new session running.
+ * current climb. A workout stays here ready for Start workout; a plain session
+ * opens Climbs with the new session running.
  */
-function previewKeyExtractor(previewItem: PreviewItem): string {
-  return previewItem.item.uuid;
+// The cards-only list while the preview rows are in the split's pane.
+const NO_PREVIEW_ROWS: PreviewListRow[] = [];
+
+function previewKeyExtractor(row: PreviewListRow): string {
+  return row.key;
+}
+
+function previewItemType(row: PreviewListRow): PreviewListRow['kind'] {
+  return row.kind;
 }
 
 export function PreSessionView({
@@ -99,17 +96,28 @@ export function PreSessionView({
   onStarted,
   isOpeningClimbs = false,
 }: PreSessionViewProps) {
+  const nativeRootHeader = useNativeRootHeader();
+  const pendingPartnerWorkout = usePendingWorkout();
   const { t } = useTranslation('session');
   const { t: tCommon } = useTranslation('common');
-  const { systemColors, variant } = useTheme();
+  const { variant } = useTheme();
   const insets = useSafeAreaInsets();
   const bottomChrome = useBottomChromeMetrics();
-  const { boardQuery, hasNoBoard, browseClimbs, openBoardSwitcher, retryBoard } = useSessionBoardNavigation();
+  const { boardQuery, hasNoBoard, browseClimbs, openBoardSwitcher, retryBoard } = useBoardShortcutNavigation(
+    '/(tabs)/record',
+    pendingPartnerWorkout !== null,
+  );
   const { data: activeBoard } = boardQuery;
   const { isAuthenticated } = useAuth();
-  const { startSession, appendGeneratedSession } = useQueueActions();
+  const { startSession, appendQueueItems } = useQueueActions();
+  const queryClient = useQueryClient();
   const { openPlayDrawer } = useDrawerHost();
   const { showToast } = useToast();
+  // The phone split (iPhone Duo open in landscape) can show the workout preview in
+  // its leading pane; see resolveWorkoutPreviewPlacement.
+  const phoneSplit = usePhoneSplit();
+  const hasPaneSlot = useHasPhoneSplitPaneSlot();
+  const isFocused = useIsFocused();
 
   // Just-in-time feature tips on the Record tab, shown one at a time (never
   // stacked) once a board is active: the workout builder first, then crew
@@ -143,13 +151,31 @@ export function PreSessionView({
   // Measured chrome height (incl. the top safe-area inset) so the list pads its
   // top by it. Only used when the floating chrome renders (tab mode).
   const [chromeHeight, setChromeHeight] = useState(() => insets.top + 56);
+  // Tells the Material app bar when the preview has scrolled under it.
+  const scrollEdge = useScrollEdgeBackdrop();
+  // The Android nav bar hides as the plan scrolls down (`useHideOnScroll`).
+  const handleScroll = useHideOnScroll(scrollEdge.list?.listProps.onScroll);
+  // Material's app bar names the tab ("Session"); UIKit's header keeps the call to action.
+  const chromeTitle = useVariantValue({
+    liquidGlass: t('mobile.session.headerStart'),
+    material: t('mobile.session.recordTab'),
+  });
 
-  const [selection, setSelection] = useState<GeneratorSelection>(initialGeneratorSelection);
+  const [selection, setSelection] = useState<GeneratorSelection>(NO_WORKOUT);
   const [isStarting, setIsStarting] = useState(false);
   const isStartPending = isStarting || isOpeningClimbs;
   // "Show this session live". Public by default and not remembered between
   // sessions: every Start opens on, and turning it off is a per-session choice.
   const [isPublic, setIsPublic] = useState(true);
+  const { data: privacySettings } = usePrivacySettings();
+  const [sessionAudience, setSessionAudience] = useState<(typeof SESSION_AUDIENCES)[number] | null>(null);
+  const effectiveSessionAudience =
+    sessionAudience ??
+    (privacySettings?.defaultSessionAudience === 'invite_only'
+      ? 'invite_only'
+      : privacySettings?.defaultSessionAudience === 'followers'
+        ? 'followers'
+        : 'public');
   const handleVisibilityChange = useCallback(
     (next: boolean) => {
       // Start has already read the choice; a flip now would change nothing.
@@ -167,12 +193,34 @@ export function PreSessionView({
   const [footerHeight, setFooterHeight] = useState(SESSION_START_FAB_HEIGHT);
 
   const preview = useWorkoutPreview(selection, activeBoard ?? null, { isAuthenticated });
-  const { items: previewItems, status, refreshingUuids, plannedCount, refreshSlot, toQueueItems } = preview;
+  const {
+    items: previewItems,
+    status,
+    refreshingUuids,
+    plannedCount,
+    plannedSlots,
+    plannedStages,
+    startQueue,
+    refreshSlot,
+    shuffle,
+    toStagedQueueItems,
+  } = preview;
+  // Stage and section headings interleaved with the climbs, in the order the session runs them.
+  const previewRows = useMemo(() => buildPreviewListRows(previewItems, plannedStages), [previewItems, plannedStages]);
+  // What Start will queue: the planned slots that found a climb, across every stage.
+  const planSummary = useMemo(
+    () =>
+      summarizePlanFill(
+        plannedSlots,
+        previewItems.map((previewItem) => previewItem.slot),
+      ),
+    [plannedSlots, previewItems],
+  );
 
-  // Refreshes run one at a time, so once any row is regenerating every row's
-  // refresh button is disabled (the rows dim it). Derived as a primitive so
-  // renderItem keeps a stable, length-free dep.
+  // Refreshes run one at a time, so Shuffle waits while any row regenerates.
+  // Derived as a primitive so the list header keeps a stable, length-free dep.
   const isRefreshingAnyRow = refreshingUuids.size > 0;
+  const hasPreviewItems = previewItems.length > 0;
 
   // A rebuild (generator options changed) mints fresh queue-item uuids, so a
   // previously highlighted preview row no longer exists. Drop the stale uuid so
@@ -210,55 +258,74 @@ export function PreSessionView({
   );
 
   const renderPreviewRow = useCallback(
-    ({ item: previewItem }: { item: PreviewItem }) => {
-      if (!previewBoard) return null;
-      const isRefreshing = refreshingUuids.has(previewItem.item.uuid);
-      return (
-        <WorkoutPreviewRow
-          item={previewItem.item}
-          board={previewBoard}
-          isActive={previewItem.item.uuid === activePreviewUuid}
-          isRefreshing={isRefreshing}
-          refreshDisabled={isRefreshingAnyRow && !isRefreshing}
-          onPress={handlePreviewPress}
-          onRefresh={refreshSlot}
-        />
-      );
-    },
-    [previewBoard, activePreviewUuid, refreshingUuids, isRefreshingAnyRow, handlePreviewPress, refreshSlot],
+    ({ item: row }: { item: PreviewListRow }) => (
+      <WorkoutPreviewListRow
+        row={row}
+        board={previewBoard}
+        activeUuid={activePreviewUuid}
+        refreshingUuids={refreshingUuids}
+        onPress={handlePreviewPress}
+        onRefresh={refreshSlot}
+      />
+    ),
+    [previewBoard, activePreviewUuid, refreshingUuids, handlePreviewPress, refreshSlot],
   );
 
   const handleStart = useCallback(async () => {
-    if (!activeBoard || isStartPending) return;
-    const generatedItems = selection.type === 'on' ? toQueueItems() : [];
-    if (selection.type === 'on' && (status !== 'ready' || refreshingUuids.size > 0 || generatedItems.length === 0)) {
+    if (!activeBoard || isStartPending || pendingPartnerWorkout) return;
+    const hasWorkout = hasWorkoutBlocks(selection);
+    const { items: generatedItems, run: generatedRun } = hasWorkout ? toStagedQueueItems() : { items: [], run: null };
+    if (hasWorkout && (status !== 'ready' || refreshingUuids.size > 0 || generatedItems.length === 0)) {
       return;
     }
 
     setIsStarting(true);
     onStartingChange?.(true);
     try {
-      const newSessionId = await startSession({ isPublic });
+      const newSessionId = await startSession(
+        privacySettings?.enabled
+          ? { audience: effectiveSessionAudience, isPublic: effectiveSessionAudience === 'public' }
+          : { isPublic },
+      );
       if (!newSessionId) {
         // startSession already toasted on failure; just bail.
         return;
       }
 
-      if (selection.type === 'on') {
-        // Queue the reviewed preview behind whatever's already going, leaving
-        // the current climb alone so the wall doesn't repaint and hand-queued
-        // climbs survive. Opens on climb #1 only when nothing is current.
-        appendGeneratedSession(generatedItems);
+      if (hasWorkout) {
+        // Prepare behind the live queue without moving the wall. The explicit
+        // Start workout action selects the first surviving workout item later.
+        appendQueueItems(generatedItems);
+        // Remember which stage each queued climb belongs to, so the session
+        // screen and the player can say "Warm-up · 2 of 5". Keyed by the same
+        // queue-item uuids just appended; it never goes over the wire.
+        if (generatedRun) {
+          // Each item's climb rides with the run: the server's copy needs it,
+          // and the queue is gone by the time the session ends (#6903).
+          prepareWorkoutRun(newSessionId, generatedRun, captureWorkoutRunClimbs(generatedItems));
+          // The first copy of the workout for the session's summary, detail
+          // and feed card. Through the outbox, so it waits out a dead signal.
+          void enqueueSessionWorkoutWrite(newSessionId, { queryClient });
+        }
         track(SHARED_EVENTS.SessionQueueGenerated, {
-          workoutType: selection.options.type,
+          // The first workout block's type, so single-workout funnels keep their
+          // meaning. Never a warm-up: null if a queue ever starts with no workout block.
+          workoutType: firstWorkoutType(selection),
+          workoutTypes: selectionWorkoutTypes(selection),
           boardName: activeBoard.boardType,
           angle: activeBoard.angle,
           savedCount: generatedItems.length,
-          failedCount: plannedCount - generatedItems.length,
+          // Planned slots with no climb: one queued climb per slot.
+          failedCount: Math.max(0, plannedCount - generatedItems.length),
+          stageCount: generatedRun?.stages.length ?? 0,
+          // Start builds the workout; a block added later sends 'in_session'.
+          phase: 'pre_session',
+          // Rows that came from a nearby grade because theirs ran short.
+          substitutedCount: planSummary.substituted,
         });
       }
-      if (onStarted) onStarted();
-      else browseClimbs();
+      if (onStarted) onStarted(hasWorkout);
+      else if (!hasWorkout) browseClimbs();
     } catch (error) {
       reportError(error, { tags: { source: 'preSessionStart' } });
       showToast(t('mobile.session.preStartError'), 'error');
@@ -269,24 +336,29 @@ export function PreSessionView({
   }, [
     activeBoard,
     selection,
-    toQueueItems,
+    toStagedQueueItems,
     status,
     refreshingUuids,
     plannedCount,
     startSession,
     isPublic,
-    appendGeneratedSession,
+    privacySettings?.enabled,
+    effectiveSessionAudience,
+    appendQueueItems,
     browseClimbs,
     showToast,
     t,
     onStartingChange,
     onStarted,
     isStartPending,
+    planSummary.substituted,
+    queryClient,
+    pendingPartnerWorkout,
   ]);
 
   const generatorPreviewReady =
-    selection.type !== 'on' || (status === 'ready' && previewItems.length > 0 && refreshingUuids.size === 0);
-  const canStart = activeBoard != null && !isStartPending && generatorPreviewReady;
+    !hasWorkoutBlocks(selection) || (status === 'ready' && previewItems.length > 0 && refreshingUuids.size === 0);
+  const canStart = activeBoard != null && !isStartPending && generatorPreviewReady && pendingPartnerWorkout === null;
   // The single source of the Start capsule's bottom offset: passed to SessionStartFab
   // AND used for the list reservation, so the FAB position and the last-row clearance
   // can't drift. The Material-vs-glass arbitration lives in computeBottomChromeMetrics
@@ -298,8 +370,14 @@ export function PreSessionView({
 
   // Inline status copy shown above an empty preview (loading / no results /
   // error). When rows are already present a rebuild keeps them mounted, so these
-  // only render while the preview is empty.
-  const showPreviewSection = selection.type === 'on';
+  // only render while the preview is empty. A plan with no slots at all is only
+  // warm-ups with nothing after them: say so instead of blaming the filters.
+  const previewPlacement = resolveWorkoutPreviewPlacement({
+    hasWorkoutBlocks: hasWorkoutBlocks(selection),
+    phoneSplit,
+    hasPaneSlot,
+    isFocused,
+  });
   const previewStateMessage =
     previewItems.length > 0
       ? null
@@ -308,36 +386,81 @@ export function PreSessionView({
         : status === 'error'
           ? t('mobile.session.preWorkoutPreviewError')
           : status === 'ready'
-            ? t('mobile.session.preWorkoutPreviewEmpty')
+            ? plannedCount === 0
+              ? t('mobile.session.preWorkoutPreviewNothingPlanned')
+              : t('mobile.session.preWorkoutPreviewEmpty')
             : null;
+  const shuffleDisabled = status !== 'ready' || isRefreshingAnyRow || isStartPending;
+  const previewSection = useMemo(
+    () => (
+      <WorkoutPreviewSection
+        boardName={previewBoard?.boardName ?? null}
+        hasPreviewItems={hasPreviewItems}
+        summary={planSummary}
+        startQueue={startQueue}
+        onShuffle={shuffle}
+        shuffleDisabled={shuffleDisabled}
+        stateMessage={previewStateMessage}
+      />
+    ),
+    [previewBoard?.boardName, hasPreviewItems, planSummary, startQueue, shuffle, shuffleDisabled, previewStateMessage],
+  );
+
+  // Tab mode insets the list top by the measured floating-chrome height; the
+  // overlay host renders its own header strip above, so no inset there.
+  const listPaddingTop = showChrome ? chromeHeight : spacing[2];
+
+  // Scrolls a block card that was just added or opened until its bottom clears
+  // the Start capsule and the tab bar, without pushing its header off the top.
+  const listRef = useRef<FlashListRef<PreviewListRow>>(null);
+  const screenRef = useRef<ViewInstance>(null);
+  const revealInsetsRef = useRef({ top: 0, bottom: 0 });
+  revealInsetsRef.current = { top: listPaddingTop, bottom: footerHeight + footerBottom + spacing[4] };
+  const revealBlock = useCallback((cardView: ViewInstance) => {
+    const screen = screenRef.current;
+    if (!screen) return;
+    screen.measureInWindow((_screenX, screenY, _screenWidth, screenHeight) => {
+      cardView.measureInWindow((_cardX, cardY, _cardWidth, cardHeight) => {
+        const list = listRef.current;
+        if (!list) return;
+        const { top, bottom } = revealInsetsRef.current;
+        const hiddenBelow = cardY + cardHeight - (screenY + screenHeight - bottom);
+        const roomAbove = cardY - (screenY + top);
+        const scrollBy = Math.min(hiddenBelow, roomAbove);
+        if (scrollBy <= 0) return;
+        list.scrollToOffset({ offset: list.getAbsoluteLastScrollOffset() + scrollBy, animated: true });
+      });
+    });
+  }, []);
 
   const listHeader = useMemo(
     () => (
-      <View style={styles.header}>
-        {activeTip ? (
-          <View style={styles.cardInset}>
-            <OnboardingTipBanner
-              text={
-                activeTip === 'workout'
-                  ? tCommon('mobile.onboarding.tips.workout')
-                  : tCommon('mobile.onboarding.tips.crew')
-              }
-              dismissLabel={tCommon('actions.close')}
-              onDismiss={dismissTip}
-              icon={activeTip === 'crew' ? 'people' : 'lightbulb.fill'}
-            />
-          </View>
-        ) : null}
-
-        {/* The screen's identity in-body under the floating chrome, collapsing
-            into the centred header capsule as it scrolls up. ScreenTitle hides
-            itself on Material (the M3 app bar owns the title). */}
-        <ScreenTitle style={styles.screenTitle}>{t('mobile.session.headerStart')}</ScreenTitle>
-
-        {/* The chrome pill owns board identity but collapses on scroll, so this
-            keeps the full config (name · size · angle) persistently visible when a
-            board is set, and prompts to pick one when none is. */}
-        <View style={styles.cardInset} testID="pre-session-board-summary">
+      <PreSessionHeaderView
+        partnerStartConfig={
+          privacySettings === undefined
+            ? null
+            : privacySettings.enabled
+              ? { audience: effectiveSessionAudience, isPublic: effectiveSessionAudience === 'public' }
+              : { isPublic }
+        }
+        tip={
+          activeTip ? (
+            <View style={styles.cardInset}>
+              <OnboardingTipBanner
+                text={
+                  activeTip === 'workout'
+                    ? tCommon('mobile.onboarding.tips.workout')
+                    : tCommon('mobile.onboarding.tips.crew')
+                }
+                dismissLabel={tCommon('actions.close')}
+                onDismiss={dismissTip}
+                icon={activeTip === 'crew' ? 'people' : 'lightbulb.fill'}
+              />
+            </View>
+          ) : null
+        }
+        showTitle={showChrome && !nativeRootHeader}
+        board={
           <BoardSummaryCard
             board={activeBoard}
             hasNoBoard={hasNoBoard}
@@ -346,45 +469,35 @@ export function PreSessionView({
             onChangeBoard={openBoardSwitcher}
             onRetry={retryBoard}
           />
-        </View>
-
-        {/* Arm the rest timer for the session you're about to start (#5378). The
-            arm carries in on its own — RestTimerSessionSync binds it when the
-            session id appears. */}
-        <View style={styles.cardInset}>
-          <RestTimerArmRow />
-        </View>
-
-        {/* Whether the session you're about to start shows up live for your
-            crew and climbers on this board. Sent with Start. */}
-        <View style={styles.cardInset}>
-          <SessionVisibilityRow isPublic={isPublic} onChange={handleVisibilityChange} disabled={isStartPending} />
-        </View>
-
-        <GeneratorPickerCard
-          boardName={activeBoard ? toBoardName(activeBoard.boardType) : null}
-          layoutId={activeBoard?.layoutId ?? null}
-          sizeId={activeBoard?.sizeId ?? null}
-          angle={activeBoard?.angle ?? null}
-          selection={selection}
-          onChange={setSelection}
-        />
-
-        {showPreviewSection ? (
-          <View>
-            <SectionHeader title={t('mobile.session.preWorkoutPreviewTitle')} />
-            {previewStateMessage ? (
-              <View style={styles.cardInset}>
-                <Card>
-                  <Text variant="body" color={systemColors.secondaryLabel}>
-                    {previewStateMessage}
-                  </Text>
-                </Card>
-              </View>
-            ) : null}
-          </View>
-        ) : null}
-      </View>
+        }
+        timer={<RestTimerArmRow />}
+        visibility={
+          privacySettings?.enabled ? (
+            <AudiencePicker
+              resource
+              confirmPublic={privacySettings.isPrivate}
+              audience={effectiveSessionAudience}
+              options={SESSION_AUDIENCES}
+              onChange={setSessionAudience}
+              disabled={isStartPending}
+            />
+          ) : (
+            <SessionVisibilityRow isPublic={isPublic} onChange={handleVisibilityChange} disabled={isStartPending} />
+          )
+        }
+        generator={
+          <GeneratorPickerCard
+            boardName={activeBoard ? toBoardName(activeBoard.boardType) : null}
+            layoutId={activeBoard?.layoutId ?? null}
+            sizeId={activeBoard?.sizeId ?? null}
+            angle={activeBoard?.angle ?? null}
+            selection={selection}
+            onChange={setSelection}
+            onRevealBlock={revealBlock}
+          />
+        }
+        preview={previewPlacement === 'inline' ? previewSection : null}
+      />
     ),
     [
       activeBoard,
@@ -397,86 +510,78 @@ export function PreSessionView({
       retryBoard,
       handleVisibilityChange,
       isPublic,
+      privacySettings?.enabled,
+      privacySettings === undefined,
+      effectiveSessionAudience,
       isStartPending,
-      previewStateMessage,
       selection,
       setSelection,
-      showPreviewSection,
-      systemColors.secondaryLabel,
+      revealBlock,
+      previewPlacement,
+      previewSection,
+      showChrome,
+      nativeRootHeader,
       t,
       tCommon,
       variant,
     ],
   );
 
-  // Tab mode insets the list top by the measured floating-chrome height; the
-  // overlay host renders its own header strip above, so no inset there.
-  const listPaddingTop = showChrome ? chromeHeight : spacing[2];
+  // In the phone split the preview fills the leading pane in place of the board;
+  // the block cards and Start stay here. Same rows, same heading, same state.
+  const paneContent = useMemo(
+    () =>
+      previewPlacement === 'pane' ? (
+        <WorkoutPreviewPane
+          rows={previewRows}
+          renderRow={renderPreviewRow}
+          keyExtractor={previewKeyExtractor}
+          getItemType={previewItemType}
+          header={previewSection}
+        />
+      ) : null,
+    [previewPlacement, previewRows, renderPreviewRow, previewSection],
+  );
+  usePhoneSplitPaneContent(paneContent);
 
   return (
-    <View style={styles.container}>
-      <FlashList
-        style={styles.scroll}
-        data={previewItems}
-        renderItem={renderPreviewRow}
-        keyExtractor={previewKeyExtractor}
-        ListHeaderComponent={listHeader}
-        // Use a gesture-handler scroll host so Android nested chip rails keep their
-        // horizontal gestures while the preview rows stay virtualized.
-        renderScrollComponent={GestureScrollView}
-        // The floating chrome owns the top inset (tab mode), so pad manually by
-        // the measured chrome height; never auto-inset under the (absent) header.
-        contentInsetAdjustmentBehavior="never"
-        contentContainerStyle={{
-          paddingTop: listPaddingTop,
-          paddingBottom: footerHeight + footerBottom,
-        }}
-        scrollIndicatorInsets={{ top: showChrome ? chromeHeight : 0 }}
-        showsVerticalScrollIndicator={false}
-        nestedScrollEnabled
-        keyboardShouldPersistTaps="handled"
-      />
-
-      {showChrome ? (
-        <RecordTopChrome
-          title={t('mobile.session.headerStart')}
-          onOpenBoardSwitcher={openBoardSwitcher}
-          onHeightChange={setChromeHeight}
+    <PreSessionPresentation
+      screenRef={screenRef}
+      listRef={listRef}
+      rows={previewPlacement === 'pane' ? NO_PREVIEW_ROWS : previewRows}
+      renderItem={renderPreviewRow}
+      header={listHeader}
+      listProps={{ ...scrollEdge.list?.listProps, onScroll: handleScroll }}
+      automaticInsets={showChrome && nativeRootHeader}
+      paddingTop={listPaddingTop}
+      paddingBottom={footerHeight + footerBottom}
+      indicatorTop={showChrome ? chromeHeight : 0}
+      chrome={
+        showChrome ? (
+          <RecordTopChrome title={chromeTitle} onHeightChange={setChromeHeight} scrollEdge={scrollEdge.backdrop} />
+        ) : null
+      }
+      footer={
+        <SessionStartFab
+          testID="pre-session-footer"
+          actionTestID="session-start"
+          bottomOffset={footerBottom}
+          onHeightChange={setFooterHeight}
+          label={isStartPending ? t('mobile.session.preStarting') : t('mobile.session.preStart')}
+          icon="play.fill"
+          onPress={() => void handleStart()}
+          disabled={!canStart}
+          loading={isStartPending}
         />
-      ) : null}
-
-      <SessionStartFab
-        testID="pre-session-footer"
-        bottomOffset={footerBottom}
-        onHeightChange={setFooterHeight}
-        label={isStartPending ? t('mobile.session.preStarting') : t('mobile.session.preStart')}
-        icon="play.fill"
-        onPress={() => void handleStart()}
-        disabled={!canStart}
-        loading={isStartPending}
-      />
-    </View>
+      }
+    />
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  scroll: {
-    flex: 1,
-  },
   // No horizontal padding: the largeTitle and SectionHeaders bring their own
   // 16px inset, and the cards self-inset via `cardInset`, so the chip rails
   // inside the generator card can bleed to the card edges.
-  header: {
-    gap: spacing[3],
-  },
-  screenTitle: {
-    paddingHorizontal: spacing[4],
-    paddingTop: 0,
-    paddingBottom: spacing[2],
-  },
   // Matches the 16px screen gutter the SectionHeaders use, so cards line up.
   cardInset: {
     paddingHorizontal: spacing[4],

@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   ABOVE_FOLD_CHROME,
+  CREATE_ACTION_BAR_HEIGHT,
   MIN_BOARD_HEIGHT,
   PLAYBACK_TRANSPORT_RESERVE,
   computeBoardMaxHeight,
@@ -42,9 +43,8 @@ describe('create drawer board budget', () => {
   });
 
   it('keeps the smallest phone off the board-height floor in both states', () => {
-    // Reaching the floor means the reserves are lying about what fits: the sheet
-    // then wants a taller peek than MAX_PEEK_FRACTION allows and clamps, which
-    // drops the draft-status line and part of the Save row below the fold. A
+    // Reaching the floor means the reserves are lying about what fits, which
+    // drops the draft-status line and part of the tool rows below the fold. A
     // route on an SE did exactly that before this change (it computed 187).
     for (const showRouteTransport of [false, true]) {
       expect(computeBoardMaxHeight({ ...SE, showRouteTransport })).toBeGreaterThan(MIN_BOARD_HEIGHT);
@@ -65,5 +65,21 @@ describe('create drawer board budget', () => {
       showRouteTransport: false,
     });
     expect(withInsets).toBe(874 - 59 - 34 - ABOVE_FOLD_CHROME);
+  });
+});
+
+describe('primary editor controls', () => {
+  it('reserves actual translated and large-text controls while keeping the board floor', () => {
+    const budget = { windowHeight: 900, insetTop: 24, insetBottom: 34, showRouteTransport: false };
+    const compact = computeBoardMaxHeight(budget);
+    expect(computeBoardMaxHeight({ ...budget, actionBarHeight: CREATE_ACTION_BAR_HEIGHT })).toBe(compact);
+    expect(computeBoardMaxHeight({ ...budget, actionBarHeight: CREATE_ACTION_BAR_HEIGHT + 80 })).toBe(compact - 80);
+    expect(computeBoardMaxHeight({ ...budget, actionBarHeight: 1000 })).toBe(MIN_BOARD_HEIGHT);
+  });
+
+  it('reserves only the save-blocking missing-hold notice', () => {
+    const budget = { windowHeight: 900, insetTop: 24, insetBottom: 34, showRouteTransport: false };
+    expect(computeBoardMaxHeight({ ...budget, missingHoldsHeight: 92 })).toBe(computeBoardMaxHeight(budget) - 92);
+    expect(computeBoardMaxHeight({ ...budget, missingHoldsHeight: 180 })).toBe(computeBoardMaxHeight(budget) - 180);
   });
 });

@@ -1,16 +1,82 @@
 // @vitest-environment jsdom
-import { createElement, type ReactNode } from 'react';
-import { render } from '@testing-library/react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../PressableSurface', () => {
+  const surface =
+    (feedback: string) =>
+    ({
+      children,
+      onPress,
+      disabled,
+      accessibilityLabel,
+      style,
+    }: {
+      children?: ReactNode;
+      onPress?: () => void;
+      disabled?: boolean;
+      accessibilityLabel?: string;
+      style?: unknown;
+    }) =>
+      createElement(
+        'button',
+        {
+          disabled,
+          onClick: disabled ? undefined : onPress,
+          'aria-label': accessibilityLabel,
+          'data-feedback': feedback,
+          'data-style': JSON.stringify(Object.assign({}, ...[style].flat(10).filter(Boolean))),
+        },
+        children,
+      );
+  return { PressableSurface: surface('animated'), StaticPressableSurface: surface('static') };
+});
 import type { AscentFeedItem } from '@boardsesh/graphql/operations';
+import { act, fireEvent, render } from '@testing-library/react';
+import { createElement, type ReactNode } from 'react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { ClimbActionsTarget } from '../../../providers/drawer-host-provider';
 
 // The swipeable's props and the row's accessibility surface are captured via
 // hoisted vars so tests can drive onSwipeableWillOpen / onAccessibilityAction
 // without a native tree. deriveLogbookGradeDisplay and the other row-meta rules
 // (@boardsesh/logbook) are intentionally NOT mocked so the real display
 // decisions + the row's label formatting are exercised end-to-end.
+const tracker = vi.hoisted(() => ({
+  start: null as (() => void) | null,
+  end: null as ((event: { translationX: number }) => void) | null,
+}));
 const swipeable = vi.hoisted(() => ({ props: null as Record<string, unknown> | null }));
+const rowGestures = vi.hoisted(() => ({
+  manual: null as unknown,
+  pan: null as unknown,
+  compositions: new Map<unknown, { kind: 'exclusive' | 'simultaneous'; gestures: unknown[] }>(),
+  mounted: [] as unknown[],
+}));
+const panels = vi.hoisted(() => ({ enabled: false, language: '' }));
 const a11y = vi.hoisted(() => ({ props: null as Record<string, unknown> | null }));
+const menuState = vi.hoisted(() => ({
+  target: null as unknown,
+  actions: [{ name: 'share', label: 'Share' }],
+  emptyActions: [] as { name: string; label: string }[],
+  rows: [{ id: 'share' }],
+  emptyRows: [] as { id: string }[],
+  onAction: vi.fn(),
+}));
+vi.mock('../../climb-actions/ClimbActionsMenu', () => ({
+  useClimbMenu: (target: unknown) => {
+    menuState.target = target;
+    return {
+      rows: target ? menuState.rows : menuState.emptyRows,
+      menuKey: 'logbook-climb',
+      accessibilityActions: target ? menuState.actions : menuState.emptyActions,
+      onAccessibilityAction: menuState.onAction,
+    };
+  },
+  ClimbMenu: ({ children, rows }: { children?: ReactNode; rows: unknown[] }) =>
+    rows.length > 0 ? createElement('div', { 'data-native-menu': true }, children) : children,
+}));
+vi.mock('../../climb-actions/ClimbMenu', () => ({
+  ClimbMenu: ({ children, rows }: { children?: ReactNode; rows: unknown[] }) =>
+    rows.length > 0 ? createElement('div', { 'data-native-menu': true }, children) : children,
+}));
 // Controls the app-wide "Show Boardsesh grades" toggle for the row. Default OFF
 // so the existing consensus-fallback tests are unaffected; the Boardsesh-grade
 // block flips it per case. resolveCrowdDifficultyId (@boardsesh/logbook, via the
@@ -18,6 +84,7 @@ const a11y = vi.hoisted(() => ({ props: null as Record<string, unknown> | null }
 const boardsesh = vi.hoisted(() => ({ active: false }));
 
 vi.mock('react-native', () => ({
+  Platform: { OS: 'ios' },
   View: (props: { children?: ReactNode } & Record<string, unknown>) => {
     // The row's accessible View is the only one carrying accessibilityActions.
     if (props.accessibilityActions) a11y.props = props;
@@ -29,7 +96,8 @@ vi.mock('react-native', () => ({
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     // Interpolate counts so `mobile.logbook.tries:1` / `…row.stars:3` are assertable.
-    t: (key: string, opts?: { count?: number }) => (opts?.count != null ? `${key}:${opts.count}` : key),
+    t: (key: string, opts?: { count?: number }) =>
+      opts?.count != null ? `${key}:${opts.count}` : `${key}${panels.language}`,
     i18n: { language: 'en-US' },
   }),
 }));
@@ -50,8 +118,8 @@ vi.mock('react-native-reanimated', () => ({
 }));
 vi.mock('react-native-gesture-handler', () => {
   // Defined inside the factory because vi.mock is hoisted above module-scope vars.
-  const gestureChain = () => {
-    const builder: Record<string, () => typeof builder> = {};
+  const gestureChain = (track = false) => {
+    const builder: Record<string, (callback?: unknown) => typeof builder> = {};
     for (const method of [
       'maxDuration',
       'maxDistance',
@@ -60,21 +128,93 @@ vi.mock('react-native-gesture-handler', () => {
       'onEnd',
       'activeOffsetY',
       'failOffsetX',
+      'failOffsetY',
+      'activeOffsetX',
+      'enabled',
+      'onTouchesDown',
+      'onTouchesMove',
+      'onTouchesUp',
+      'onTouchesCancelled',
     ]) {
-      builder[method] = () => builder;
+      builder[method] = (callback?: unknown) => {
+        if (track && method === 'onEnd') tracker.end = callback as typeof tracker.end;
+        if (track && method === 'onStart') tracker.start = callback as typeof tracker.start;
+        return builder;
+      };
     }
     return builder;
   };
   return {
-    Gesture: { Tap: gestureChain, LongPress: gestureChain, Pan: gestureChain, Exclusive: (...g: unknown[]) => g[0] },
-    GestureDetector: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+    usePanGesture: (config: {
+      onActivate: () => void;
+      onDeactivate: (event: { translationX: number; canceled?: boolean }) => void;
+    }) => {
+      const builder = gestureChain(true);
+      builder.onStart(config.onActivate);
+      builder.onEnd((event: { translationX: number }, success?: boolean) =>
+        config.onDeactivate({ ...event, canceled: success === false }),
+      );
+      rowGestures.pan = builder;
+      return builder;
+    },
+    useTapGesture: gestureChain,
+    useLongPressGesture: gestureChain,
+    useManualGesture: () => {
+      rowGestures.manual = gestureChain();
+      return rowGestures.manual;
+    },
+    GestureStateManager: { fail: () => {}, deactivate: () => {} },
+    useExclusiveGestures: (...gestures: unknown[]) => {
+      const composition = {};
+      rowGestures.compositions.set(composition, { kind: 'exclusive', gestures });
+      return composition;
+    },
+    useSimultaneousGestures: (...gestures: unknown[]) => {
+      const composition = {};
+      rowGestures.compositions.set(composition, { kind: 'simultaneous', gestures });
+      return composition;
+    },
+    Gesture: {
+      Tap: gestureChain,
+      LongPress: gestureChain,
+      Pan: () => {
+        rowGestures.pan = gestureChain(true);
+        return rowGestures.pan;
+      },
+      Manual: () => {
+        rowGestures.manual = gestureChain();
+        return rowGestures.manual;
+      },
+      Simultaneous: (...gestures: unknown[]) => {
+        const composition = {};
+        rowGestures.compositions.set(composition, { kind: 'simultaneous', gestures });
+        return composition;
+      },
+      Exclusive: (...gestures: unknown[]) => {
+        const composition = {};
+        rowGestures.compositions.set(composition, { kind: 'exclusive', gestures });
+        return composition;
+      },
+    },
+    GestureDetector: ({ children, gesture }: { children?: ReactNode; gesture: unknown }) => {
+      rowGestures.mounted.push(gesture);
+      return createElement('div', null, children);
+    },
   };
 });
 // Capture the swipeable's props so tests can fire onSwipeableWillOpen directly.
 vi.mock('react-native-gesture-handler/ReanimatedSwipeable', () => ({
   default: (props: { children?: ReactNode } & Record<string, unknown>) => {
     swipeable.props = props;
-    return createElement('div', null, props.children);
+    const renderAction = (callback: unknown) =>
+      typeof callback === 'function' ? callback({ value: 0 }, { value: 0 }) : null;
+    return createElement(
+      'div',
+      null,
+      props.children,
+      panels.enabled ? renderAction(props.renderLeftActions) : null,
+      panels.enabled ? renderAction(props.renderRightActions) : null,
+    );
   },
 }));
 vi.mock('@boardsesh/profile-stats', () => ({
@@ -93,9 +233,10 @@ vi.mock('../../Text', () => ({
 vi.mock('../../Icon', () => ({
   Icon: ({ name }: { name: string }) => createElement('i', { 'data-icon': name }),
 }));
-vi.mock('../../ClimbAttributeIcons', () => ({ ClimbAttributeIcons: () => null }));
-vi.mock('../../use-swipe-arm', () => ({
-  useSwipeArm: () => ({ armedRef: { current: false }, arm: () => {}, disarm: () => {} }),
+// Renders the characteristics it was handed so a test can see what the row passed.
+vi.mock('../../ClimbAttributeIcons', () => ({
+  ClimbAttributeIcons: ({ characteristics }: { characteristics?: string[] | null }) =>
+    createElement('span', { 'data-attribute-characteristics': JSON.stringify(characteristics ?? null) }),
 }));
 vi.mock('../../../theme/colors', () => ({
   brandColors: { primary: '#6D28D9', error: '#C81E1E' },
@@ -120,7 +261,9 @@ vi.mock('../../../providers/theme-provider', () => ({
 vi.mock('../../../hooks/use-grade-format', () => ({
   useGradeFormat: () => ({
     formatGrade: (g: string | null | undefined) => g ?? null,
-    formatGradeByDifficultyId: (id: number | null | undefined) => (id != null ? `V${id}` : null),
+    // Tags a non-default board so a test can see which board the row formatted on.
+    formatGradeByDifficultyId: (id: number | null | undefined, boardName?: string | null) =>
+      id != null ? `V${id}${boardName && boardName !== 'kilter' ? ` (${boardName})` : ''}` : null,
   }),
 }));
 vi.mock('../../../hooks/use-display-grade', () => ({
@@ -172,7 +315,7 @@ type RowHandlers = {
   showBoardInMeta?: boolean;
   groupTries?: number;
   fontScale?: number;
-  onOpenActions?: (item: AscentFeedItem) => void;
+  onOpenActions?: (item: AscentFeedItem) => ClimbActionsTarget | null | undefined;
   onEdit?: (item: AscentFeedItem) => void;
   onDeleteRequest?: (item: AscentFeedItem, method: 'swipe' | 'a11y') => void;
 };
@@ -189,6 +332,63 @@ beforeEach(() => {
   swipeable.props = null;
   a11y.props = null;
   boardsesh.active = false;
+  panels.enabled = false;
+  panels.language = '';
+  rowGestures.compositions.clear();
+  rowGestures.mounted = [];
+  rowGestures.manual = null;
+  rowGestures.pan = null;
+});
+
+describe('LogbookRow swipe feedback lifetime', () => {
+  it('keeps panel layout and callbacks through first drag, close and recycling', () => {
+    panels.enabled = true;
+    const onEdit = vi.fn();
+    const onDeleteRequest = vi.fn();
+    const props = { onActivate: vi.fn(), onEdit, onDeleteRequest };
+    const item = ascent();
+    const screen = render(<LogbookRow ascent={item} {...props} />);
+    const readPanels = () =>
+      ['mobile.logbook.row.editAction', 'mobile.logbook.row.deleteAction'].map((label) => {
+        const button = screen.getByRole('button', { name: label });
+        return { label, style: button.getAttribute('data-style'), feedback: button.getAttribute('data-feedback') };
+      });
+    const idle = readPanels();
+    expect(idle.map((panel) => panel.feedback)).toEqual(['static', 'static']);
+    const startDrag = swipeable.props?.onSwipeableOpenStartDrag as () => void;
+    const closeSwipe = swipeable.props?.onSwipeableClose as () => void;
+    expect(startDrag).toBeTypeOf('function');
+    expect(closeSwipe).toBeTypeOf('function');
+    act(startDrag);
+    expect(readPanels()).toEqual(idle.map((panel) => ({ ...panel, feedback: 'animated' })));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(onDeleteRequest).not.toHaveBeenCalled();
+    act(closeSwipe);
+    expect(readPanels()).toEqual(idle);
+    act(startDrag);
+    screen.rerender(<LogbookRow ascent={{ ...item, uuid: 'tick-2' }} {...props} />);
+    expect(readPanels()).toEqual(idle);
+    fireEvent.click(screen.getByRole('button', { name: 'mobile.logbook.row.editAction' }));
+    expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({ uuid: 'tick-2' }), 'swipe');
+  });
+
+  it('keeps panel render callbacks despite new translators, then refreshes changed labels', () => {
+    panels.enabled = true;
+    const props = { onActivate: vi.fn(), onEdit: vi.fn(), onDeleteRequest: vi.fn() };
+    const item = ascent();
+    const screen = render(<LogbookRow ascent={item} {...props} />);
+    const left = swipeable.props?.renderLeftActions;
+    const right = swipeable.props?.renderRightActions;
+    screen.rerender(<LogbookRow ascent={{ ...item }} {...props} />);
+    expect(swipeable.props?.renderLeftActions).toBe(left);
+    expect(swipeable.props?.renderRightActions).toBe(right);
+    panels.language = ':fr';
+    screen.rerender(<LogbookRow ascent={{ ...item }} {...props} />);
+    expect(swipeable.props?.renderLeftActions).not.toBe(left);
+    expect(swipeable.props?.renderRightActions).not.toBe(right);
+    expect(screen.getByRole('button', { name: 'mobile.logbook.row.editAction:fr' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'mobile.logbook.row.deleteAction:fr' })).toBeTruthy();
+  });
 });
 
 describe('LogbookRow — grade column', () => {
@@ -202,6 +402,11 @@ describe('LogbookRow — grade column', () => {
     // The crowd can't disagree with a grade that was never logged.
     expect(icons).not.toContain('chevron.up');
     expect(icons).not.toContain('chevron.down');
+  });
+
+  it("formats the grade on the ascent's own board, not the board in scope", () => {
+    const { getByText } = renderRow(ascent({ boardType: 'moonboard', difficulty: 16, difficultyName: '6a/V2' }));
+    getByText('V16 (moonboard)');
   });
 
   it('renders the consensus sub-line with a down arrow when you graded softer than the crowd', () => {
@@ -383,6 +588,24 @@ describe('LogbookRow — meta line', () => {
 });
 
 describe('LogbookRow — swipe wiring', () => {
+  it('mounts the swipe lock ahead of the full-swipe tracker in the row detector', () => {
+    renderRow(ascent(), { onEdit: vi.fn(), onDeleteRequest: vi.fn(), onOpenActions: vi.fn() });
+    const lock = swipeable.props?.requireToFail;
+    const fullSwipe = swipeable.props?.simultaneousWith;
+    expect(lock).toBe(rowGestures.manual);
+    expect(fullSwipe).toBe(rowGestures.pan);
+    const mountedRow = rowGestures.mounted.find(
+      (gesture) => rowGestures.compositions.get(gesture)?.kind === 'simultaneous',
+    );
+    const rowComposition = rowGestures.compositions.get(mountedRow);
+    expect(rowComposition?.gestures).toHaveLength(2);
+    const guardedSwipe = rowGestures.compositions.get(rowComposition?.gestures[1]);
+    expect(guardedSwipe?.kind).toBe('exclusive');
+    expect(guardedSwipe?.gestures).toHaveLength(2);
+    expect(guardedSwipe?.gestures[0]).toBe(lock);
+    expect(guardedSwipe?.gestures[1]).toBe(fullSwipe);
+  });
+
   it('maps the swipe directions onto delete (right-to-left) and edit (left-to-right)', () => {
     const item = ascent();
     const onEdit = vi.fn();
@@ -390,35 +613,76 @@ describe('LogbookRow — swipe wiring', () => {
     renderRow(item, { onEdit, onDeleteRequest });
     expect(swipeable.props).not.toBeNull();
 
-    const willOpen = swipeable.props?.onSwipeableWillOpen as (direction: 'left' | 'right') => void;
-    // ReanimatedSwipeable reports the SWIPE direction: 'left' = the RIGHT
-    // actions (Delete) opened; 'right' = the LEFT actions (Edit).
-    willOpen('left');
+    tracker.start?.();
+    tracker.end?.({ translationX: -90 });
+    expect(onDeleteRequest).not.toHaveBeenCalled();
+    tracker.start?.();
+    tracker.end?.({ translationX: -210 });
     expect(onDeleteRequest).toHaveBeenCalledWith(item, 'swipe');
     expect(onEdit).not.toHaveBeenCalled();
-
-    willOpen('right');
+    tracker.start?.();
+    tracker.end?.({ translationX: 210 });
     expect(onEdit).toHaveBeenCalledWith(item, 'swipe');
     expect(onDeleteRequest).toHaveBeenCalledTimes(1);
   });
 });
 
 describe('LogbookRow — accessibility actions', () => {
-  it('exposes edit/delete/more and routes the delete action with the a11y method', () => {
+  it('keeps primary screen-reader activation separate from context-menu commands', () => {
+    const item = ascent();
+    const onActivate = vi.fn();
+    render(createElement(LogbookRow, { ascent: item, onActivate }));
+    const activate = a11y.props?.onAccessibilityTap as () => void;
+    expect(activate).toBeTypeOf('function');
+    activate();
+    expect(onActivate).toHaveBeenCalledWith(item);
+    const onAction = a11y.props?.onAccessibilityAction as (event: { nativeEvent: { actionName: string } }) => void;
+    onAction({ nativeEvent: { actionName: 'activate' } });
+    expect(onActivate).toHaveBeenCalledTimes(2);
+  });
+
+  it('exposes direct climb commands without confusing delete entry with delete climb', () => {
     const item = ascent();
     const onEdit = vi.fn();
     const onDeleteRequest = vi.fn();
-    const onOpenActions = vi.fn();
+    const target = {
+      climb: { uuid: item.climbUuid, name: item.climbName },
+      boardConfig: { boardName: 'kilter', layoutId: 1, sizeId: 1, setIds: '1', angle: 40 },
+    } as ClimbActionsTarget;
+    const onOpenActions = vi.fn(() => target);
     renderRow(item, { onEdit, onDeleteRequest, onOpenActions });
     expect(a11y.props).not.toBeNull();
 
     const actions = a11y.props?.accessibilityActions as { name: string }[];
-    expect(actions.map((action) => action.name)).toEqual(['edit', 'delete', 'more']);
+    expect(actions.map((action) => action.name)).toEqual(['editEntry', 'deleteEntry', 'share']);
 
     const onAction = a11y.props?.onAccessibilityAction as (event: { nativeEvent: { actionName: string } }) => void;
-    onAction({ nativeEvent: { actionName: 'delete' } });
+    onAction({ nativeEvent: { actionName: 'deleteEntry' } });
     expect(onDeleteRequest).toHaveBeenCalledWith(item, 'a11y');
     expect(onEdit).not.toHaveBeenCalled();
-    expect(onOpenActions).not.toHaveBeenCalled();
+    expect(onOpenActions).toHaveBeenCalledExactlyOnceWith(item);
+    expect(menuState.target).toBe(target);
+    onAction({ nativeEvent: { actionName: 'share' } });
+    expect(menuState.onAction).toHaveBeenCalledWith({ nativeEvent: { actionName: 'share' } });
+    expect(onDeleteRequest).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #5245 review: the Logbook row's attribute cluster must get characteristics,
+// or a campus / any-feet / no-kickboard climb shows no badge in the list.
+describe('LogbookRow — climb attribute badges', () => {
+  function passedCharacteristics(container: HTMLElement): unknown {
+    const attributeEl = container.querySelector('[data-attribute-characteristics]');
+    return JSON.parse(attributeEl?.getAttribute('data-attribute-characteristics') ?? '"missing"');
+  }
+
+  it('passes the ascent characteristics to ClimbAttributeIcons', () => {
+    const { container } = renderRow(ascent({ characteristics: ['campus', 'no_kickboard'] }));
+    expect(passedCharacteristics(container)).toEqual(['campus', 'no_kickboard']);
+  });
+
+  it('passes null when the ascent records no characteristics', () => {
+    const { container } = renderRow(ascent({ characteristics: null }));
+    expect(passedCharacteristics(container)).toBeNull();
   });
 });

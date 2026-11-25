@@ -7,6 +7,7 @@ import {
   fetchKilterLiveHistory,
   getStoredKilterAccessToken,
   KilterLiveError,
+  KilterApiError,
   type KilterLiveDisplay,
 } from '@boardsesh/kilter-sync/api';
 import { db } from '../db/client';
@@ -109,6 +110,7 @@ afterEach(async () => {
     `kilter-live:${boardId}:owner`,
     `kilter-live:${boardId}:next`,
     `board:${boardId}:kilter-history`,
+    `board:${boardId}:aurora-history`,
     `board:${boardId}:history`,
     `board:${boardId}:seq`,
   );
@@ -192,6 +194,7 @@ describe('Kilter history integration', () => {
       expect(await readMergedRecentHistory(boardId)).toEqual([entry]);
       expect(warn).toHaveBeenCalledWith('[BoardHistory] Invalid imported history cache; reading durable history', {
         boardId,
+        source: 'kilter',
       });
     },
   );
@@ -239,6 +242,7 @@ describe('Kilter history integration', () => {
     expect(await readMergedRecentHistory(boardId)).toEqual([entry]);
     expect(warn).toHaveBeenCalledWith('[BoardHistory] Invalid imported history cache; reading durable history', {
       boardId,
+      source: 'kilter',
     });
   });
 
@@ -384,11 +388,31 @@ describe('Kilter history integration', () => {
     expect((await readBoardHistoryPage(boardId)).entries).toHaveLength(2);
   });
 
+  it('filters Aurora before legacy pagination and preserves opted-in unknown metadata', async () => {
+    const confirmedAt = new Date().toISOString();
+    await db.insert(schema.boardClimbEvents).values([
+      { boardId, boardType: 'kilter', climbUuid, angle: 40, seq: 1, confirmedAt },
+      { boardId, boardType: 'kilter', climbUuid, angle: null, seq: 2, confirmedAt, source: 'aurora' },
+      { boardId, boardType: 'kilter', climbUuid, angle: 40, seq: 3, confirmedAt, source: 'kilter' },
+    ]);
+    const legacy = await readBoardHistoryPage(boardId, 1);
+    expect(legacy.entries.map((climb) => climb.seq)).toEqual([3]);
+    const nextLegacy = await readBoardHistoryPage(boardId, 1, legacy.nextCursor);
+    expect(nextLegacy.entries.map((climb) => climb.seq)).toEqual([1]);
+    expect(nextLegacy.nextCursor).toBeNull();
+    const capable = await readBoardHistoryPage(boardId, 3, undefined, true);
+    expect(capable.entries.map((climb) => climb.source)).toEqual(['kilter', 'aurora', 'boardsesh']);
+    expect(capable.entries[1]).toMatchObject({ angle: null, grade: null, sentByUserId: null });
+    expect((await readMergedRecentHistory(boardId)).map((climb) => climb.source)).toEqual(['kilter']);
+    expect((await readMergedRecentHistory(boardId, true)).map((climb) => climb.source)).toEqual(['kilter', 'aurora']);
+  });
+
   it('pages by display time and sequence, retaining microseconds despite late arrival', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-01-02T12:00:00Z'));
     for (const [seq, confirmedAt] of [
       [1, '2026-01-01 12:00:00.000002'],
       [2, '2026-01-01 12:00:00.000001'],
-      [3, '2025-12-01 00:00:00'],
+      [3, '2025-12-30 00:00:00'],
       [4, '2026-01-01 12:00:00.000002'],
     ] as const) {
       await db
@@ -401,6 +425,98 @@ describe('Kilter history integration', () => {
     expect(second.entries.map((climb) => climb.seq)).toEqual([2, 3]);
     expect(second.nextCursor).toBeNull();
     expect(() => parseHistoryPageCursor(first.nextCursor!, boardId + 1)).toThrow('Invalid history cursor');
+  });
+
+  it('bounds chronological pages by display time before limits, including late imports and exact cutoffs', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-24T12:00:00.123Z'));
+    for (const [seq, confirmedAt, source] of [
+      [1, '2026-11-17 12:00:00.123000', 'boardsesh'],
+      [2, '2026-11-17 12:00:00.123001', 'kilter'],
+      [3, '2026-11-18 12:00:00', 'boardsesh'],
+      [4, '2026-11-17 12:00:00.122999', 'kilter'],
+      [5, '2026-01-01 12:00:00', 'boardsesh'],
+    ] as const) {
+      await db
+        .insert(schema.boardClimbEvents)
+        .values({ boardId, boardType: 'kilter', climbUuid, angle: 40, seq, confirmedAt, source });
+    }
+    const first = await readBoardHistoryPage(boardId, 1);
+    expect(first.entries.map((entry) => entry.seq)).toEqual([3]);
+    const final = await readBoardHistoryPage(boardId, 2, first.nextCursor);
+    expect(final.entries.map((entry) => entry.seq)).toEqual([2, 1]);
+    expect(final.nextCursor).toBeNull();
+    const cursor = (timestamp: string, cursorBoard = boardId) =>
+      Buffer.from(JSON.stringify([cursorBoard, timestamp, 100])).toString('base64url');
+    expect(await readBoardHistoryPage(boardId, 2, cursor('2026-01-01 12:00:00'))).toEqual({
+      entries: [],
+      nextCursor: null,
+    });
+    expect(
+      (await readBoardHistoryPage(boardId, 100, cursor('2027-01-01 12:00:00'))).entries.map((entry) => entry.seq),
+    ).toEqual([3, 2, 1]);
+    await expect(readBoardHistoryPage(boardId, 2, cursor('2026-01-01 12:00:00', boardId + 1))).rejects.toThrow(
+      'Invalid history cursor',
+    );
+    await expect(readBoardHistoryPage(boardId, 2, 'invalid')).rejects.toThrow('Invalid history cursor');
+    clock.mockReturnValue(Date.parse('2026-11-24T12:00:00.124Z'));
+    expect(await readBoardHistoryPage(boardId, 2, first.nextCursor)).toEqual({ entries: [], nextCursor: null });
+    expect(
+      await db.select().from(schema.boardClimbEvents).where(eq(schema.boardClimbEvents.boardId, boardId)),
+    ).toHaveLength(5);
+  });
+
+  it('applies the window to opted-in Aurora pages and cached displays', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-24T12:00:00.123Z'));
+    const displays = [
+      { seq: 1, sentAt: '2026-11-17T12:00:00.122999Z' },
+      { seq: 2, sentAt: '2026-11-17T12:00:00.123000Z' },
+      { seq: 3, sentAt: '2026-11-17T12:00:00.123001Z' },
+      { seq: 4, sentAt: '2026-11-24T11:00:00Z' },
+    ];
+    await db.insert(schema.boardClimbEvents).values(
+      displays.map(({ seq, sentAt }) => ({
+        boardId,
+        boardType: 'kilter',
+        climbUuid,
+        seq,
+        confirmedAt: sentAt,
+        source: 'aurora',
+      })),
+    );
+    await publisher.set(
+      `board:${boardId}:aurora-history`,
+      JSON.stringify(displays.map((display) => ({ ...display, climbUuid, source: 'aurora' }))),
+      'EX',
+      604800,
+    );
+    expect(await readBoardHistoryPage(boardId)).toEqual({ entries: [], nextCursor: null });
+    expect(await readMergedRecentHistory(boardId)).toEqual([]);
+    const first = await readBoardHistoryPage(boardId, 1, undefined, true);
+    expect(first.entries.map((entry) => entry.seq)).toEqual([4]);
+    const final = await readBoardHistoryPage(boardId, 2, first.nextCursor, true);
+    expect(final.entries.map((entry) => entry.seq)).toEqual([3, 2]);
+    expect(final.nextCursor).toBeNull();
+    expect((await readMergedRecentHistory(boardId, true)).map((entry) => entry.seq)).toEqual([4, 3, 2]);
+    clock.mockReturnValue(Date.parse('2026-11-24T12:00:00.124Z'));
+    expect(await readBoardHistoryPage(boardId, 2, first.nextCursor, true)).toEqual({ entries: [], nextCursor: null });
+    expect((await readMergedRecentHistory(boardId, true)).map((entry) => entry.seq)).toEqual([4]);
+  });
+
+  it('rechecks native and imported Redis entries even when a newer write refreshed their key TTL', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-24T12:00:00Z'));
+    vi.spyOn(pubsub, 'isRedisConnected').mockReturnValue(true);
+    const old = { climbUuid, seq: 1, sentAt: '2026-11-01T12:00:00Z' };
+    const recent = { climbUuid, seq: 2, sentAt: '2026-11-24T11:00:00Z' };
+    await publisher.rpush(`board:${boardId}:history`, JSON.stringify(old), JSON.stringify(recent));
+    await publisher.expire(`board:${boardId}:history`, 604800);
+    await publisher.set(
+      `board:${boardId}:kilter-history`,
+      JSON.stringify([{ ...old, seq: 3, source: 'kilter' }]),
+      'EX',
+      604800,
+    );
+    expect((await readMergedRecentHistory(boardId)).map((entry) => entry.seq)).toEqual([2]);
+    expect((await pubsub.getRecentBoardClimbs(String(boardId))).map((entry) => entry.seq)).toEqual([2, 1]);
   });
 
   it('follows merged source boards and refuses changed configuration or gym identity', async () => {
@@ -463,6 +579,41 @@ describe('presence subscription lifetime', () => {
     expect(stopWatching).toHaveBeenCalledTimes(1);
   });
 
+  it.each([false, true])('filters Aurora subscription payloads unless opted in: %s', async (includeAurora) => {
+    let deliver: ((event: import('@boardsesh/shared-schema').BoardPresenceEvent) => void) | undefined;
+    vi.spyOn(pubsub, 'subscribeBoardPresence').mockImplementation(async (_key, callback) => {
+      deliver = callback;
+      return () => {};
+    });
+    vi.spyOn(kilterLiveSync, 'watch').mockReturnValue(vi.fn());
+    const iterator = boardPresenceSubscriptions.boardNowPlaying.subscribe(
+      undefined,
+      { boardId, includeAurora },
+      { connectionId: 'capability-socket', userId: linkedUser, isAuthenticated: true },
+    );
+    const pending = iterator.next();
+    await vi.waitFor(() => expect(deliver).toBeDefined());
+    const climbs: import('@boardsesh/shared-schema').BoardPresenceClimb[] = [
+      { climbUuid, source: 'aurora', seq: 20, angle: null, sentAt: new Date().toISOString() },
+      { climbUuid, source: 'kilter', seq: 19, angle: 40, sentAt: new Date().toISOString() },
+      {
+        climbUuid,
+        source: 'future-provider',
+        seq: 999,
+        sentAt: new Date().toISOString(),
+      } as unknown as import('@boardsesh/shared-schema').BoardPresenceClimb,
+    ];
+    deliver!({ __typename: 'BoardHistoryUpdated', climbs, seq: 21 });
+    const message = await pending;
+    expect(message.done).toBe(false);
+    const event: import('@boardsesh/shared-schema').BoardPresenceEvent | undefined = message.value?.boardNowPlaying;
+    expect(event?.__typename).toBe('BoardHistoryUpdated');
+    if (event?.__typename === 'BoardHistoryUpdated') {
+      expect(event.climbs.map((climb) => climb.source)).toEqual(includeAurora ? ['aurora', 'kilter'] : ['kilter']);
+    }
+    await iterator.return();
+  });
+
   it('never starts a Kilter watcher when unsubscribe precedes Redis setup completion', async () => {
     const unsubscribe = vi.fn();
     let finishSetup!: (cleanup: () => void) => void;
@@ -494,6 +645,82 @@ describe('presence subscription lifetime', () => {
 });
 
 describe('subscription-driven polling', () => {
+  it('benches a revoked Kilter grant across walls and uses a valid alternate viewer', async () => {
+    const alternateUser = 'zz-valid-kilter-viewer';
+    await db.insert(schema.users).values({ id: alternateUser, email: `${alternateUser}@test.invalid` });
+    await db.insert(schema.auroraCredentials).values({
+      userId: alternateUser,
+      boardType: 'kilter',
+      encryptedRefreshToken: 'alternate-ciphertext',
+    });
+    await db.insert(schema.userBoardMappings).values({
+      userId: alternateUser,
+      boardType: 'kilter',
+      boardUserIdText: 'alternate-upstream-user',
+    });
+    const [firstBoard] = await db.select().from(schema.userBoards).where(eq(schema.userBoards.id, boardId));
+    const secondUuid = randomUUID();
+    const [secondBoard] = await db
+      .insert(schema.userBoards)
+      .values({
+        uuid: secondUuid,
+        slug: secondUuid,
+        name: 'Second watched wall',
+        ownerId: linkedUser,
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+        gymId: firstBoard.gymId,
+      })
+      .returning();
+    await db.insert(schema.kilterWallSources).values({
+      sourceKey: `${sourceKey}:second`,
+      sourceBoardUuid: secondUuid,
+      gymUuid: boardUuid,
+      productLayoutUuid: 'layout',
+      wallUuid: 'second-wall',
+      layoutId: 1,
+      sizeId: 10,
+      setIds: '1,2',
+    });
+    vi.mocked(getStoredKilterAccessToken).mockImplementation(async (_database, userId) => {
+      if (userId === linkedUser) throw new KilterApiError('invalid_grant', 'Revoked grant', 400);
+      return 'alternate-token';
+    });
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const sync = poller();
+    try {
+      sync.watch(boardId, linkedUser, 'revoked-first-wall');
+      await vi.waitFor(() =>
+        expect(warn).toHaveBeenCalledWith(
+          '[KilterLive] Poll failed',
+          expect.objectContaining({ kind: 'invalid_grant' }),
+        ),
+      );
+      sync.watch(secondBoard.id, linkedUser, 'revoked-second-wall');
+      sync.watch(secondBoard.id, alternateUser, 'valid-second-wall');
+      await vi.waitFor(() =>
+        expect(fetchKilterLiveHistory).toHaveBeenCalledWith(
+          'alternate-token',
+          expect.any(Object),
+          expect.any(AbortSignal),
+        ),
+      );
+      expect(
+        vi.mocked(getStoredKilterAccessToken).mock.calls.filter(([, userId]) => userId === linkedUser),
+      ).toHaveLength(1);
+    } finally {
+      await sync.shutdown();
+      vi.mocked(getStoredKilterAccessToken).mockImplementation(async () => 'test-access-token');
+      await publisher.del(
+        `kilter-live:${secondBoard.id}:viewers`,
+        `kilter-live:${secondBoard.id}:owner`,
+        `kilter-live:${secondBoard.id}:next`,
+      );
+    }
+  });
+
   it('releases the board lock without importing when the in-transaction Redis read stalls', async () => {
     vi.mocked(fetchKilterLiveHistory).mockResolvedValue([display()]);
     const transactions = vi.spyOn(db, 'transaction');

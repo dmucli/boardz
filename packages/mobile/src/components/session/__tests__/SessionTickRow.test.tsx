@@ -1,8 +1,11 @@
 // @vitest-environment jsdom
+vi.mock('../../climb-actions/ClimbActionsPressable', () => import('../../../../test/climb-menu-stub'));
 import { createElement, type ReactNode } from 'react';
-import { render } from '@testing-library/react';
+import { fireEvent, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SessionDetailTick, SessionFeedParticipant } from '@boardsesh/shared-schema';
+import type { Climb, SessionDetailTick, SessionFeedParticipant } from '@boardsesh/shared-schema';
+import type { BoardConfig } from '../../../providers/drawer-host-provider';
+import { climbMenuTestState } from '../../../../test/climb-menu-stub';
 
 // Capture what ClimbListItemContent receives so we can assert primarySubtitleOverride.
 const mockClimbListItemContent = vi.hoisted(() => vi.fn());
@@ -24,8 +27,32 @@ vi.mock('../../PressableAvatar', () => ({
   PressableAvatar: () => createElement('span', { 'data-testid': 'avatar' }),
 }));
 vi.mock('../../PressableSurface', () => ({
-  PressableSurface: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
-    createElement('div', { onClick: onPress }, children),
+  PressableSurface: ({
+    children,
+    onPress,
+    onLongPress,
+    accessibilityActions,
+    onAccessibilityAction,
+  }: {
+    children?: ReactNode;
+    onPress?: () => void;
+    onLongPress?: () => void;
+    accessibilityActions?: { name: string; label: string }[];
+    onAccessibilityAction?: (event: { nativeEvent: { actionName: string } }) => void;
+  }) =>
+    createElement(
+      'div',
+      {
+        onClick: onPress,
+        'data-testid': 'tick-press',
+        'data-action-label': accessibilityActions?.map((action) => action.label).join('|'),
+        // jsdom has no long press: contextmenu is the gesture, doubleclick the screen-reader action.
+        onContextMenu: onLongPress,
+        onDoubleClick: () =>
+          onAccessibilityAction?.({ nativeEvent: { actionName: accessibilityActions?.[0]?.name ?? '' } }),
+      },
+      children,
+    ),
 }));
 // PressableSurface statically imports `react-native-reanimated` and
 // `../theme/animations`. Rolldown traverses mocked modules' import graphs, so
@@ -62,8 +89,6 @@ vi.mock('../../ClimbListItemContent', () => ({
 // Mocking ClimbListThumbnail stops Rolldown from traversing into those packages.
 vi.mock('../../ClimbListThumbnail', () => ({
   ClimbListThumbnail: () => null,
-  THUMBNAIL_WIDTH: 76,
-  THUMBNAIL_HEIGHT: 96,
 }));
 vi.mock('../../you/profile-chart-colors', () => ({ gradeBadgeColor: () => '#000' }));
 vi.mock('../../../hooks/use-grade-format', () => ({
@@ -78,6 +103,7 @@ vi.mock('../../../providers/theme-provider', () => ({
       secondaryBackground: '#fff',
       separator: '#ccc',
     },
+    chartColors: { secondaryLabel: '#5B5563' },
   }),
 }));
 vi.mock('../../../theme/colors', () => ({
@@ -112,8 +138,9 @@ vi.mock('../../../lib/session-tick-mapping', () => ({
   }),
 }));
 vi.mock('../../../lib/haptics', () => ({ hapticSelection: () => {}, hapticMedium: () => {} }));
-vi.mock('../../../providers/drawer-host-provider', () => ({ useDrawerHost: () => ({ openClimbActions: () => {} }) }));
-vi.mock('../../../lib/tick-to-climb', () => ({ tickToClimb: () => null }));
+const getClimbActions = vi.hoisted(() => vi.fn((climb: Climb, boardConfig: BoardConfig) => ({ climb, boardConfig })));
+vi.mock('../../../providers/drawer-host-provider', () => ({ useDrawerHost: () => ({ getClimbActions }) }));
+vi.mock('../../../lib/tick-to-climb', () => ({ tickToClimb: () => ({ uuid: 'climb-1' }) }));
 
 import { SessionTickRow } from '../SessionTickRow';
 
@@ -150,6 +177,9 @@ function participant(displayName: string): SessionFeedParticipant {
 }
 
 beforeEach(() => {
+  getClimbActions.mockClear();
+  climbMenuTestState.commands = [];
+  climbMenuTestState.openedRows = null;
   mockClimbListItemContent.mockClear();
 });
 
@@ -199,5 +229,39 @@ describe('SessionTickRow — primarySubtitleOverride', () => {
       }),
     );
     expect(mockClimbListItemContent).toHaveBeenCalledWith(expect.objectContaining({ primarySubtitleOverride: null }));
+  });
+});
+
+describe('SessionTickRow — native climb commands', () => {
+  it('pins the tick board and angle for native long press and direct screen-reader commands', () => {
+    const onPress = vi.fn();
+    const { container } = render(
+      createElement(SessionTickRow, {
+        tick: tick({ angle: 37 }),
+        isMultiUser: false,
+        onPress,
+      }),
+    );
+    const row = container.querySelector('[data-climb-actions-body]')!;
+    const boardConfig = { boardName: 'kilter', layoutId: 1, sizeId: 1, setIds: '1', angle: 37 };
+    expect(getClimbActions).toHaveBeenCalledExactlyOnceWith({ uuid: 'climb-1' }, boardConfig);
+    expect(row.getAttribute('data-action-label')).toBe('Share');
+    fireEvent.contextMenu(row);
+    expect(climbMenuTestState.openedRows?.map((action) => action.id)).toEqual(['share']);
+    expect(climbMenuTestState.commands).toEqual([]);
+    expect(onPress).not.toHaveBeenCalled();
+    fireEvent.doubleClick(row);
+    expect(climbMenuTestState.commands).toEqual([{ id: 'share', target: { climb: { uuid: 'climb-1' }, boardConfig } }]);
+    expect(getClimbActions).toHaveBeenCalledTimes(1);
+    expect(onPress).not.toHaveBeenCalled();
+  });
+
+  it('retains the row primary action independently of the native menu', () => {
+    const onPress = vi.fn();
+    const tickEntry = tick();
+    const { container } = render(createElement(SessionTickRow, { tick: tickEntry, isMultiUser: false, onPress }));
+    fireEvent.click(container.querySelector('[data-climb-actions-body]')!);
+    expect(onPress).toHaveBeenCalledExactlyOnceWith(tickEntry);
+    expect(climbMenuTestState.commands).toEqual([]);
   });
 });

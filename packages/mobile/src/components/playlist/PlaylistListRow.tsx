@@ -5,7 +5,6 @@ import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { PressableSurface } from '../PressableSurface';
 import { useTheme } from '../../providers/theme-provider';
-import { iosSystemColors } from '../../theme/ios-colors';
 import { spacing } from '../../theme/tokens';
 import { hapticLight } from '../../lib/haptics';
 import { PlaylistPreviewSquare } from './PlaylistPreviewSquare';
@@ -22,6 +21,16 @@ export type PlaylistListRowProps = {
   icon?: string;
   /** Index into the preview's fallback colour palette. */
   index?: number;
+  /**
+   * Replaces the climb-count line, e.g. the community byline "Marco - 12 climbs".
+   * Omitted, the row shows the count alone.
+   */
+  meta?: string;
+  /**
+   * The playlist's grade band, already formatted ("V3–V5"). Drawn as a pill
+   * before the chevron and read out after the byline. Omitted, no pill.
+   */
+  gradeLabel?: string | null;
   /**
    * Called with this row's `uuid`. Passing the uuid back (rather than a
    * per-row closure) lets the parent supply one stable callback for the whole
@@ -47,11 +56,14 @@ export const PlaylistListRow = memo(function PlaylistListRow({
   color,
   icon,
   index = 0,
+  meta,
+  gradeLabel,
   onPressUuid,
 }: PlaylistListRowProps) {
   const { t } = useTranslation('playlists');
+  const { systemColors } = useTheme();
 
-  const countLabel = t('detail.climbCount', { count: climbCount ?? 0 });
+  const metaLabel = meta ?? t('detail.climbCount', { count: climbCount ?? 0 });
 
   const handlePress = useCallback(() => {
     hapticLight();
@@ -64,19 +76,28 @@ export const PlaylistListRow = memo(function PlaylistListRow({
       feedback="opacity"
       opacityTo={0.7}
       accessibilityRole="button"
-      accessibilityLabel={`${name}, ${countLabel}`}
+      accessibilityLabel={
+        gradeLabel ? `${name}, ${metaLabel}, ${t('library.gradeBand', { band: gradeLabel })}` : `${name}, ${metaLabel}`
+      }
     >
       <View style={styles.row}>
         <PlaylistPreviewSquare color={color} icon={icon} index={index} size={THUMB_SIZE} />
         <View style={styles.info}>
-          <Text variant="body" numberOfLines={1} style={styles.name}>
+          <Text emphasized variant="body" numberOfLines={1}>
             {name}
           </Text>
-          <Text variant="subheadline" numberOfLines={1} style={styles.meta}>
-            {countLabel}
+          <Text tone="secondary" variant="subheadline" numberOfLines={1}>
+            {metaLabel}
           </Text>
         </View>
-        <Icon name="chevron.right" size={14} color={iosSystemColors.systemGray4} />
+        {gradeLabel ? (
+          <View style={[styles.gradePill, { backgroundColor: systemColors.tertiaryFill }]}>
+            <Text emphasized variant="caption1" numberOfLines={1}>
+              {gradeLabel}
+            </Text>
+          </View>
+        ) : null}
+        <Icon name="chevron.right" size={14} color={systemColors.tertiaryLabel} />
       </View>
     </PressableSurface>
   );
@@ -96,11 +117,10 @@ const styles = StyleSheet.create({
     minWidth: 0,
     gap: 2,
   },
-  name: {
-    fontWeight: '600',
-  },
-  meta: {
-    opacity: 0.6,
+  gradePill: {
+    paddingHorizontal: spacing[2],
+    paddingVertical: 2,
+    borderRadius: spacing[2],
   },
 });
 
@@ -117,6 +137,6 @@ export const PlaylistListRowSeparator = memo(function PlaylistListRowSeparator()
 const separatorStyles = StyleSheet.create({
   separator: {
     height: StyleSheet.hairlineWidth,
-    marginLeft: spacing[4] + THUMB_SIZE + spacing[3],
+    marginStart: spacing[4] + THUMB_SIZE + spacing[3],
   },
 });

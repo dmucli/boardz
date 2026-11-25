@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -6,17 +19,40 @@ import { createElement, type ReactNode } from 'react';
 const hapticSelectionMock = vi.hoisted(() => vi.fn());
 
 vi.mock('react-native', () => ({
-  StyleSheet: { create: (styles: unknown) => styles },
-  ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', { 'data-scrollview': 'true' }, children),
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+  },
+  ScrollView: ({ children, contentContainerStyle }: { children?: ReactNode; contentContainerStyle?: unknown }) =>
+    createElement(
+      'div',
+      {
+        'data-scrollview': 'true',
+        'data-content-style': JSON.stringify(Object.assign({}, ...[contentContainerStyle].flat(10).filter(Boolean))),
+      },
+      children,
+    ),
   Pressable: ({
     children,
     onPress,
     accessibilityLabel,
+    style,
   }: {
     children?: ReactNode;
     onPress?: () => void;
     accessibilityLabel?: string;
-  }) => createElement('button', { 'data-pill': 'true', 'aria-label': accessibilityLabel, onClick: onPress }, children),
+    style?: unknown;
+  }) =>
+    createElement(
+      'button',
+      {
+        'data-pill': 'true',
+        'data-style': JSON.stringify(Object.assign({}, ...[style].flat(10).filter(Boolean))),
+        'aria-label': accessibilityLabel,
+        onClick: onPress,
+      },
+      children,
+    ),
 }));
 
 vi.mock('../../Text', () => ({
@@ -25,8 +61,14 @@ vi.mock('../../Text', () => ({
 vi.mock('../../Icon', () => ({ Icon: () => createElement('i', { 'data-icon': 'close' }) }));
 vi.mock('../../../lib/haptics', () => ({ hapticSelection: hapticSelectionMock }));
 vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { systemGray: '#888' } }));
-vi.mock('../../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 3: 12, 4: 16 } }));
-vi.mock('../../../providers/theme-provider', () => ({ useTheme: () => ({ systemColors: { separator: '#333' } }) }));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: { 1: 4, 2: 8, 3: 12, 4: 16 },
+}));
+vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
+  useTheme: () => ({ systemColors: { separator: '#333', secondaryBackground: '#1C1C1E' } }),
+}));
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, opts?: { filter?: string }) => (opts?.filter ? `${key}:${opts.filter}` : key),
@@ -68,6 +110,30 @@ describe('FilterTokenRow', () => {
     expect(clearGrade).toHaveBeenCalledTimes(1);
     expect(clearSetter).not.toHaveBeenCalled();
     expect(hapticSelectionMock).toHaveBeenCalledTimes(1);
+  });
+
+  // On iOS 26 the row floats over the scrolling list (see NativeRootHeader), so a
+  // border alone would leave the label on top of whatever row is behind it.
+  it('gives each pill an opaque fill so its label reads over the list behind', () => {
+    const { container } = render(<FilterTokenRow tokens={[makeToken()]} />);
+    const pillStyle = JSON.parse(container.querySelector('[data-pill]')?.getAttribute('data-style') ?? '{}') as Record<
+      string,
+      unknown
+    >;
+    expect(pillStyle).toMatchObject({ backgroundColor: '#1C1C1E', borderColor: '#333', borderWidth: 1 });
+  });
+
+  it('pads 8dp under the pills only when asked (the Material Climbs bar)', () => {
+    const contentStyle = (bottomInset?: boolean) => {
+      const { container, unmount } = render(<FilterTokenRow tokens={[makeToken()]} bottomInset={bottomInset} />);
+      const style = JSON.parse(
+        container.querySelector('[data-scrollview]')?.getAttribute('data-content-style') ?? '{}',
+      ) as Record<string, unknown>;
+      unmount();
+      return style;
+    };
+    expect(contentStyle()).not.toHaveProperty('paddingBottom');
+    expect(contentStyle(true)).toMatchObject({ paddingTop: 8, paddingBottom: 8 });
   });
 
   it('labels each pill for removal using the token label', () => {

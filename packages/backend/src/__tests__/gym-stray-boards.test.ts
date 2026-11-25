@@ -1,6 +1,7 @@
-import { describe, it, expect, beforeEach } from 'vite-plus/test';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vite-plus/test';
 import { v4 as uuidv4 } from 'uuid';
-import { sql } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
+import * as dbSchema from '@boardsesh/db/schema';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { db } from '../db/client';
 import {
@@ -9,6 +10,7 @@ import {
   type StrayBoardResult,
 } from '../graphql/resolvers/social/gym-stray-boards';
 import { resetAllRateLimits } from '../utils/rate-limiter';
+import { lockFixedSystemOwnerTransaction } from '@boardsesh/db/fixed-system-owner-order';
 
 /**
  * Real-DB coverage for stray-board discovery + attach (the gym Boards tab's
@@ -26,6 +28,8 @@ const SYSTEM_OWNER = '00000000-0000-0000-0000-000000000000';
 const OWNER = 'stray-owner';
 const OTHER = 'stray-other';
 const ALL_USERS = [SYSTEM_OWNER, OWNER, OTHER];
+
+afterEach(() => vi.unstubAllEnvs());
 
 // Base point + latitude offsets (~111_320 m per degree of latitude).
 const BASE = { latitude: 47.0, longitude: 8.0 };
@@ -87,6 +91,7 @@ const insertBoard = async (opts: {
   longitude?: number | null;
   isPublic?: boolean;
   hideLocation?: boolean;
+  boardType?: string;
 }): Promise<{ id: number; uuid: string }> => {
   const {
     ownerId,
@@ -96,6 +101,7 @@ const insertBoard = async (opts: {
     longitude = null,
     isPublic = true,
     hideLocation = false,
+    boardType = 'kilter',
   } = opts;
   const uuid = uuidv4();
   const sizeId = 500 + boardConfigCounter++;
@@ -103,7 +109,7 @@ const insertBoard = async (opts: {
     INSERT INTO user_boards
       (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, gym_id, is_public, latitude, longitude, hide_location, created_at, updated_at)
     VALUES (
-      ${uuid}, ${uuid}, ${ownerId}, 'kilter', 1, ${sizeId}, '1,2', ${name}, ${gymId}, ${isPublic},
+      ${uuid}, ${uuid}, ${ownerId}, ${boardType}, 1, ${sizeId}, '1,2', ${name}, ${gymId}, ${isPublic},
       ${latitude}, ${longitude}, ${hideLocation}, now(), now()
     )
     RETURNING id
@@ -116,6 +122,9 @@ const insertGymMember = (gymId: number, userId: string, role: string) =>
     INSERT INTO gym_members (gym_id, user_id, role, created_at)
     VALUES (${gymId}, ${userId}, ${role}, now())
   `);
+
+const insertRole = (role: 'admin' | 'community_leader', boardType: string | null) =>
+  db.insert(dbSchema.communityRoles).values({ userId: OWNER, role, boardType });
 
 const insertGymClaim = (gymId: number, claimantUserId: string, status: string) =>
   db.execute(sql`
@@ -273,6 +282,8 @@ describe('strayBoardsForGym — nearby candidates', () => {
     expect(nearStray?.distanceMeters).toBeGreaterThan(0);
     expect(nearStray?.distanceMeters).toBeLessThanOrEqual(150);
     expect(nearStray?.currentGymUuid).toBeNull();
+    expect(nearStray?.boardType).toBe('kilter');
+    expect(typeof nearStray?.angle).toBe('number');
     expect(results.some((candidate) => candidate.uuid === far.uuid)).toBe(false);
   });
 
@@ -351,6 +362,101 @@ describe('strayBoardsForGym — nearby candidates', () => {
   });
 });
 
+describe('strayBoardsForGym — admin association of public unlinked boards', () => {
+  it.each([
+    { label: 'global admin', role: 'admin' as const, boardType: null, allowed: true },
+    { label: 'matching admin', role: 'admin' as const, boardType: 'moonboard', allowed: true },
+    { label: 'other-board admin', role: 'admin' as const, boardType: 'tension', allowed: false },
+    { label: 'global leader', role: 'community_leader' as const, boardType: null, allowed: false },
+    { label: 'matching leader', role: 'community_leader' as const, boardType: 'moonboard', allowed: false },
+  ])('$label can associate only boards authorized by their role', async ({ role, boardType, allowed }) => {
+    const target = await seedTargetGym();
+    await insertRole(role, boardType);
+    const board = await insertBoard({
+      ownerId: OTHER,
+      name: 'Public MoonBoard',
+      boardType: 'moonboard',
+      latitude: LAT_60M,
+      longitude: BASE.longitude,
+    });
+
+    const candidates = await strayBoardsForGym(target.uuid, authCtx(OWNER));
+    expect(candidates.some((candidate) => candidate.uuid === board.uuid)).toBe(allowed);
+    const association = attachBoardToGym(
+      { gymUuid: target.uuid, boardUuid: board.uuid, expectedCurrentGymUuid: null, allowSourceGymMerge: false },
+      authCtx(OWNER),
+    );
+    if (allowed) {
+      await expect(association).resolves.toBe(true);
+      expect(await boardGymId(board.uuid)).toBe(target.id);
+    } else {
+      await expect(association).rejects.toThrow();
+      expect(await boardGymId(board.uuid)).toBeNull();
+    }
+  });
+
+  it('keeps private, hidden, unlisted, distant and already-linked human boards out of admin candidates', async () => {
+    const target = await seedTargetGym();
+    await insertRole('admin', null);
+    const otherGym = await insertGym({ ownerId: OTHER, name: 'Human-managed gym' });
+    const systemGym = await insertGym({ ownerId: SYSTEM_OWNER, name: 'Synced gym' });
+    const excluded = await Promise.all([
+      insertBoard({ ownerId: OTHER, name: 'Private', isPublic: false, latitude: LAT_60M, longitude: BASE.longitude }),
+      insertBoard({ ownerId: OTHER, name: 'Hidden', hideLocation: true, latitude: LAT_60M, longitude: BASE.longitude }),
+      insertBoard({ ownerId: OTHER, name: 'Unlisted', latitude: LAT_60M, longitude: BASE.longitude }),
+      insertBoard({ ownerId: OTHER, name: 'Distant', latitude: LAT_300M, longitude: BASE.longitude }),
+      insertBoard({
+        ownerId: OTHER,
+        name: 'On another gym',
+        gymId: otherGym.id,
+        latitude: LAT_60M,
+        longitude: BASE.longitude,
+      }),
+      insertBoard({
+        ownerId: OTHER,
+        name: 'On a synced gym',
+        gymId: systemGym.id,
+        latitude: LAT_60M,
+        longitude: BASE.longitude,
+      }),
+    ]);
+    await db.update(dbSchema.userBoards).set({ isUnlisted: true }).where(eq(dbSchema.userBoards.id, excluded[2].id));
+
+    const candidates = await strayBoardsForGym(target.uuid, authCtx(OWNER));
+    expect(candidates).toEqual([]);
+    await expect(
+      attachBoardToGym({ gymUuid: target.uuid, boardUuid: excluded[4].uuid }, authCtx(OWNER)),
+    ).rejects.toThrow();
+    expect(await boardGymId(excluded[4].uuid)).toBe(otherGym.id);
+  });
+
+  it.each([
+    { audience: 'public' as const, locationAudience: 'followers' as const },
+    { audience: 'public' as const, locationAudience: 'members' as const },
+    { audience: 'followers' as const, locationAudience: 'public' as const },
+  ])('respects effective $audience/$locationAudience policy for admins', async ({ audience, locationAudience }) => {
+    const target = await seedTargetGym();
+    await insertRole('admin', null);
+    const board = await insertBoard({
+      ownerId: OTHER,
+      name: 'Restricted policy',
+      latitude: LAT_60M,
+      longitude: BASE.longitude,
+    });
+    await db.insert(dbSchema.resourcePrivacy).values({
+      kind: 'board',
+      resourceId: board.uuid,
+      ownerId: OTHER,
+      audience,
+      locationAudience,
+    });
+
+    expect(await strayBoardsForGym(target.uuid, authCtx(OWNER))).toEqual([]);
+    await expect(attachBoardToGym({ gymUuid: target.uuid, boardUuid: board.uuid }, authCtx(OWNER))).rejects.toThrow();
+    expect(await boardGymId(board.uuid)).toBeNull();
+  });
+});
+
 describe('strayBoardsForGym — exclusions', () => {
   it('never returns a board already linked to this gym', async () => {
     const target = await seedTargetGym();
@@ -390,6 +496,42 @@ describe('strayBoardsForGym — access guard', () => {
 });
 
 describe('attachBoardToGym', () => {
+  it('rejects a stale source listing before changing the board', async () => {
+    const target = await seedTargetGym();
+    const board = await insertBoard({
+      ownerId: SYSTEM_OWNER,
+      name: 'Moved since preview',
+      latitude: LAT_60M,
+      longitude: BASE.longitude,
+    });
+
+    await expect(
+      attachBoardToGym(
+        { gymUuid: target.uuid, boardUuid: board.uuid, expectedCurrentGymUuid: uuidv4() },
+        authCtx(OWNER),
+      ),
+    ).rejects.toMatchObject({ extensions: { code: 'CONFLICT' } });
+    expect(await boardGymId(board.uuid)).toBeNull();
+    expect(await boardSyncFrozen(board.uuid)).toBe(false);
+  });
+
+  it('rejects a previewed board that moved to a human-managed gym', async () => {
+    const target = await seedTargetGym();
+    const otherGym = await insertGym({ ownerId: OTHER, name: 'New source gym' });
+    const board = await insertBoard({
+      ownerId: SYSTEM_OWNER,
+      name: 'Moved elsewhere',
+      gymId: otherGym.id,
+      latitude: LAT_60M,
+      longitude: BASE.longitude,
+    });
+
+    await expect(
+      attachBoardToGym({ gymUuid: target.uuid, boardUuid: board.uuid, expectedCurrentGymUuid: null }, authCtx(OWNER)),
+    ).rejects.toMatchObject({ extensions: { code: 'CONFLICT' } });
+    expect(await boardGymId(board.uuid)).toBe(otherGym.id);
+  });
+
   it('re-points a nearby stray board to the gym', async () => {
     const target = await seedTargetGym();
     const board = await insertBoard({
@@ -484,6 +626,113 @@ describe('attachBoardToGym — retiring the emptied source listing', () => {
     }
     return { listing, boards };
   };
+
+  it('keeps the committed move when captured staging retirement is busy', async () => {
+    const target = await seedTargetGym();
+    const { listing, boards } = await seedSyncedListing(1);
+    vi.stubEnv('CURRENT_STORE_FIXED_SYSTEM_OWNER_ORDER_MODE', 'cooperative-staging');
+    await db.transaction(async (holder) => {
+      await lockFixedSystemOwnerTransaction(holder);
+      const attached = attachBoardToGym({ gymUuid: target.uuid, boardUuid: boards[0].uuid }, authCtx(OWNER));
+      vi.stubEnv('CURRENT_STORE_FIXED_SYSTEM_OWNER_ORDER_MODE', 'legacy');
+      await expect(attached).resolves.toBe(true);
+    });
+    expect(await boardGymId(boards[0].uuid)).toBe(target.id);
+    expect((await gymRetireState(listing.id)).deletedAt).toBeNull();
+    expect(await mergeAuditRows(listing.id)).toEqual([]);
+  });
+
+  it('passes captured legacy mode to retirement after the board move commits', async () => {
+    const target = await seedTargetGym();
+    const { listing, boards } = await seedSyncedListing(1);
+    vi.stubEnv('CURRENT_STORE_FIXED_SYSTEM_OWNER_ORDER_MODE', 'legacy');
+    await db.transaction(async (holder) => {
+      await lockFixedSystemOwnerTransaction(holder);
+      const attached = attachBoardToGym({ gymUuid: target.uuid, boardUuid: boards[0].uuid }, authCtx(OWNER));
+      vi.stubEnv('CURRENT_STORE_FIXED_SYSTEM_OWNER_ORDER_MODE', 'cooperative-staging');
+      await expect(attached).resolves.toBe(true);
+    });
+    expect((await gymRetireState(listing.id)).mergedIntoGymId).toBe(target.id);
+  });
+
+  it('rejects an unknown selector before the first committed board move', async () => {
+    const target = await seedTargetGym();
+    const { listing, boards } = await seedSyncedListing(1);
+    vi.stubEnv('CURRENT_STORE_FIXED_SYSTEM_OWNER_ORDER_MODE', 'unsupported');
+    await expect(
+      attachBoardToGym({ gymUuid: target.uuid, boardUuid: boards[0].uuid }, authCtx(OWNER)),
+    ).rejects.toMatchObject({ extensions: { code: 'SERVICE_UNAVAILABLE' } });
+    expect(await boardGymId(boards[0].uuid)).toBe(listing.id);
+    expect((await gymRetireState(listing.id)).deletedAt).toBeNull();
+  });
+
+  it('copies a historical fixed-owner follow into a fresh destination under staging', async () => {
+    const target = await seedTargetGym();
+    const { listing, boards } = await seedSyncedListing(1);
+    await db.execute(sql`INSERT INTO gym_follows (gym_id, user_id) VALUES (${listing.id}, ${SYSTEM_OWNER})`);
+    vi.stubEnv('CURRENT_STORE_FIXED_SYSTEM_OWNER_ORDER_MODE', 'cooperative-staging');
+    await expect(attachBoardToGym({ gymUuid: target.uuid, boardUuid: boards[0].uuid }, authCtx(OWNER))).resolves.toBe(
+      true,
+    );
+    expect((await gymRetireState(listing.id)).mergedIntoGymId).toBe(target.id);
+    const follows = await db.execute(sql`SELECT user_id FROM gym_follows WHERE gym_id = ${target.id}`);
+    expect(Array.from(follows as Iterable<{ user_id: string }>)).toEqual([{ user_id: SYSTEM_OWNER }]);
+  });
+
+  it('keeps the emptied source listing when merge consent is explicitly false', async () => {
+    const target = await seedTargetGym();
+    const { listing, boards } = await seedSyncedListing(1);
+
+    await attachBoardToGym(
+      {
+        gymUuid: target.uuid,
+        boardUuid: boards[0].uuid,
+        expectedCurrentGymUuid: listing.uuid,
+        allowSourceGymMerge: false,
+      },
+      authCtx(OWNER),
+    );
+
+    expect(await boardGymId(boards[0].uuid)).toBe(target.id);
+    expect(await gymRetireState(listing.id)).toEqual({ deletedAt: null, isPublic: true, mergedIntoGymId: null });
+    expect(await mergeAuditRows(listing.id)).toEqual([]);
+  });
+
+  it('merges the matching source listing after explicit consent', async () => {
+    const target = await seedTargetGym();
+    const { listing, boards } = await seedSyncedListing(1);
+
+    await attachBoardToGym(
+      {
+        gymUuid: target.uuid,
+        boardUuid: boards[0].uuid,
+        expectedCurrentGymUuid: listing.uuid,
+        allowSourceGymMerge: true,
+      },
+      authCtx(OWNER),
+    );
+
+    expect((await gymRetireState(listing.id)).mergedIntoGymId).toBe(target.id);
+  });
+
+  it('does not treat a previously unlinked board as consent to move it from a new source', async () => {
+    const target = await seedTargetGym();
+    const { listing, boards } = await seedSyncedListing(1);
+
+    await expect(
+      attachBoardToGym(
+        {
+          gymUuid: target.uuid,
+          boardUuid: boards[0].uuid,
+          expectedCurrentGymUuid: null,
+          allowSourceGymMerge: true,
+        },
+        authCtx(OWNER),
+      ),
+    ).rejects.toMatchObject({ extensions: { code: 'CONFLICT' } });
+    expect(await boardGymId(boards[0].uuid)).toBe(listing.id);
+    expect((await gymRetireState(listing.id)).deletedAt).toBeNull();
+  });
 
   it('folds the emptied listing into the target gym instead of leaving it live and empty', async () => {
     const target = await seedTargetGym();

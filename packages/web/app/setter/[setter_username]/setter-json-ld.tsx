@@ -4,14 +4,14 @@ import { JsonLd } from '@/app/lib/seo/json-ld';
 import { frontDoorPagePath } from '@/app/lib/seo/list-page-robots';
 import { resolveClimbDisplayName } from '@/app/lib/string-utils';
 import { buildCanonicalClimbViewUrl } from '@/app/lib/url-utils';
-import type { BoardDetails, Climb } from '@/app/lib/types';
+import type { BoardRouteIdentity, Climb } from '@/app/lib/types';
 import { SETTER_PAGE_SIZE } from '@/app/lib/seo/sitemap/setter-page-contract';
 
 type SetterJsonLdProps = {
   username: string;
   displayName: string;
   climbs: readonly Climb[];
-  boardDetailsByClimb: Record<string, BoardDetails>;
+  boardDetailsByClimb: Record<string, BoardRouteIdentity>;
   unlinkedClimbUuids: ReadonlySet<string>;
   /** 1-based `?page=N`, already clamped. */
   page: number;
@@ -69,11 +69,10 @@ export default function SetterJsonLd({
     ];
   });
 
-  // A `@graph` rather than nesting the list under the ProfilePage: `ItemList`
-  // is not a valid value for `mainEntity` (that is the Person) nor for
-  // `mainEntityOfPage` (that expects the page itself). Two sibling nodes, the
-  // list pointing back at the page through `mainEntityOfPage`, is the shape
-  // Google's own examples use.
+  // Keep the list beside the ProfilePage, linked by its document URL only.
+  // mainEntityOfPage is the inverse of mainEntity: pointing the ItemList at
+  // this page would add it as a second main entity. Google requires every
+  // ProfilePage mainEntity to be a Person or Organization, not an ItemList.
   return (
     <JsonLd
       data={{
@@ -93,7 +92,7 @@ export default function SetterJsonLd({
             ? [
                 {
                   '@type': 'ItemList',
-                  mainEntityOfPage: { '@id': pageUrl },
+                  url: pageUrl,
                   numberOfItems: listItems.length,
                   itemListElement: listItems,
                 },

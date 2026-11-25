@@ -1,5 +1,5 @@
 import React, { useCallback, useMemo } from 'react';
-import { Pressable, StyleSheet, View, useWindowDimensions } from 'react-native';
+import { StyleSheet, View, useWindowDimensions } from 'react-native';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { useTranslation } from 'react-i18next';
 import { Text } from '../Text';
@@ -103,7 +103,7 @@ export const BoardLookPreviewCard = React.memo(function BoardLookPreviewCard({
   onEnlarge,
 }: BoardLookPreviewCardProps) {
   const { t } = useTranslation('common');
-  const { systemColors, brandColors, textStyles: resolvedTextStyles } = useTheme();
+  const { systemColors, brandColors, selection, textStyles: resolvedTextStyles } = useTheme();
   const { fontScale } = useWindowDimensions();
   const reduceMotion = useReduceMotion();
   const reduceTransparency = useReduceTransparency();
@@ -147,7 +147,7 @@ export const BoardLookPreviewCard = React.memo(function BoardLookPreviewCard({
     height: layout.thumbHeight,
     borderWidth: style.borderWidth,
     backgroundColor: systemColors.tertiaryBackground,
-    borderColor: selected ? brandColors.primary : systemColors.separator,
+    borderColor: selected ? selection.checkmark : systemColors.separator,
   };
 
   // The feature this screen is selling is "lit holds glow", so the chosen card
@@ -252,7 +252,7 @@ export const BoardLookPreviewCard = React.memo(function BoardLookPreviewCard({
               holds the climber is finally big enough to compare. */}
           {selected && style.showActiveBadge ? (
             <View testID="board-look-active-badge" style={[styles.activeBadge, { backgroundColor: scrimColor }]}>
-              <Icon name="tick" size={11} color={scrimLabel} />
+              <Icon name="tick.fill" size={11} color={scrimLabel} />
               <Text
                 variant="caption2"
                 color={scrimLabel}
@@ -268,7 +268,7 @@ export const BoardLookPreviewCard = React.memo(function BoardLookPreviewCard({
               selected card only — invisible to assistive tech, a 19pt target, and
               absent from exactly the card you most want a closer look at: one you
               have not chosen yet. */}
-          <Pressable
+          <PressableSurface
             testID="board-look-expand-badge"
             accessibilityRole="button"
             accessibilityLabel={t('mobile.settings.boardLook.presets.showFullSize', { look: label })}
@@ -280,7 +280,7 @@ export const BoardLookPreviewCard = React.memo(function BoardLookPreviewCard({
             ]}
           >
             <Icon name="expand" size={style.expandIcon} color={scrimLabel} />
-          </Pressable>
+          </PressableSurface>
         </View>
 
         {/* `alignSelf: 'stretch'` is what makes the centring work: the container
@@ -303,7 +303,11 @@ export const BoardLookPreviewCard = React.memo(function BoardLookPreviewCard({
             // lineHeight by the font multiplier — a reservation computed from the
             // unscaled value silently goes inert above fontScale 1.
             style={{
-              minHeight: descriptionMinHeight(resolvedTextStyles[style.descriptionVariant].lineHeight ?? 16, fontScale),
+              minHeight: descriptionMinHeight(
+                resolvedTextStyles[style.descriptionVariant].lineHeight ?? 16,
+                fontScale,
+                style.descriptionVariant,
+              ),
             }}
           >
             {t(option.descriptionI18nKey)}

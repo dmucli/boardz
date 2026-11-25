@@ -3,10 +3,11 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 import { renderToString } from 'react-dom/server';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { SimilarClimb } from '@boardsesh/shared-schema';
+import climbsEn from '@boardsesh/i18n/locales/en-US/climbs.json';
 import { resolveServerTree } from '@/app/lib/__tests__/helpers/resolve-server-tree';
-import type { FrontDoorSection } from '@/app/lib/data/front-door-data.server';
+import type { FrontDoorSection, FrontDoorSimilarClimbs } from '@/app/lib/data/front-door-data.server';
 import type { BetaLink } from '@/app/lib/beta-video-url';
-import type { BoardDetails, Climb } from '@/app/lib/types';
+import type { BoardImageDetails, Climb } from '@/app/lib/types';
 
 /**
  * #4968: the front door has to tell "nobody filmed this" apart from "the
@@ -26,7 +27,13 @@ vi.mock('server-only', () => ({}));
 
 vi.mock('@/app/lib/i18n/server', () => ({
   getServerTranslation: vi.fn(async () => ({
-    t: (key: string) => key,
+    t: (key: string, values?: { grade: string; layout: string; angle: number }) =>
+      key === 'frontDoor.similar.nearbyHeading' && values
+        ? climbsEn.frontDoor.similar.nearbyHeading
+            .replace('{{layout}}', values.layout)
+            .replace('{{grade}}', values.grade)
+            .replace('{{angle}}', String(values.angle))
+        : key,
     locale: 'en-US',
   })),
 }));
@@ -39,11 +46,16 @@ vi.mock('react-i18next', () => ({
 // islands, posthog and the board renderer, none of which this file asserts.
 vi.mock('../front-door-breadcrumb', () => ({ default: () => null }));
 vi.mock('../climb-creative-work-json-ld', () => ({ default: () => null }));
-vi.mock('../climb-facts', () => ({ default: () => null }));
-vi.mock('../climb-handoff-cta', () => ({ default: () => null }));
-vi.mock('../angle-cross-links', () => ({ default: () => null }));
+vi.mock('../climb-hero-cta', () => ({ default: () => null }));
+// The root layout's provider, as a cold server render sees it: no answer yet.
+vi.mock('@/app/components/consent/consent-state-provider', () => ({
+  useConsent: () => ({ granted: false, snapshot: { record: null }, dialogOpen: false }),
+}));
+vi.mock('../angle-table', () => ({ default: () => null }));
+vi.mock('../about-climb', () => ({ default: () => null }));
 vi.mock('@/app/components/climb-detail/climb-view-seo-fragment', () => ({ default: () => null }));
 vi.mock('@/app/components/social/climb-social-section', () => ({ default: () => null }));
+vi.mock('../climb-app-showcase', () => ({ default: () => null }));
 
 vi.mock('@/app/components/board-renderer/util', () => ({
   buildBoardArtLayers: vi.fn(() => ({ backgroundUrls: [], overlayUrl: null })),
@@ -54,8 +66,6 @@ vi.mock('@/app/components/board-renderer/util', () => ({
 // this component does with (and without) a seed, so stubbing it out would leave
 // the assertion checking a prop rather than the rendered section.
 vi.mock('@/app/components/board-renderer/board-image-layers', () => ({ default: () => null }));
-vi.mock('@/app/components/board-renderer/board-canvas-renderer', () => ({ default: () => null }));
-vi.mock('@/app/lib/board-render-worker/worker-manager', () => ({ useCanvasRendererReady: () => false }));
 vi.mock('@/app/hooks/use-grade-format', () => ({
   useGradeFormat: () => ({ formatGrade: (grade?: string) => grade, getGradeColor: () => undefined }),
 }));
@@ -86,7 +96,7 @@ function makeClimb(): Climb {
   } as unknown as Climb;
 }
 
-function makeBoardDetails(): BoardDetails {
+function makeBoardDetails(): BoardImageDetails {
   return {
     board_name: 'kilter',
     layout_id: 1,
@@ -96,11 +106,11 @@ function makeBoardDetails(): BoardDetails {
     size_name: '12 x 12',
     size_description: 'Commercial',
     set_names: ['Bolt Ons', 'Screw Ons'],
-    images_to_holds: {},
-    holdsData: {},
+    backgroundImagePaths: [],
+
     boardWidth: 1080,
     boardHeight: 1350,
-  } as unknown as BoardDetails;
+  } as unknown as BoardImageDetails;
 }
 
 function makeBetaLink(): BetaLink {
@@ -123,7 +133,7 @@ function makeSimilarClimb(): SimilarClimb {
 }
 
 async function renderFrontDoor(sections: {
-  similarClimbs: FrontDoorSection<SimilarClimb>;
+  similarClimbs: FrontDoorSimilarClimbs;
   betaLinks: FrontDoorSection<BetaLink>;
 }): Promise<string> {
   const element = (
@@ -191,5 +201,32 @@ describe('front-door sections whose backend read timed out', () => {
     expect(html).not.toContain('frontDoor.beta.empty');
     expect(html).not.toContain('frontDoor.beta.unavailable');
     expect(html).not.toContain('frontDoor.similar.unavailable');
+  });
+
+  it('server-renders nearby-grade links under their own heading when shared holds have no matches', async () => {
+    const nearbyClimb = { ...makeSimilarClimb(), uuid: 'NEARBY0', name: 'Nearby Boulder', difficultyName: '7a/V6' };
+    const html = await renderFrontDoor({
+      similarClimbs: {
+        status: 'loaded',
+        items: [],
+        nearby: { status: 'loaded', grade: '7a+/V7', items: [nearbyClimb] },
+      },
+      betaLinks: { status: 'loaded', items: [] },
+    });
+
+    expect(html).toContain('More Kilter Board Original climbs around V7 (7a+) at 40°');
+    expect(html).toContain('href="/kilter/original/12x12-square/screw_bolt/40/view/nearby-boulder-NEARBY0"');
+    expect(html).not.toContain('frontDoor.similar.heading');
+    expect(html).not.toContain('similarClimbs.emptyOnLayout');
+  });
+
+  it('shows an unavailable fallback without claiming an empty layout', async () => {
+    const html = await renderFrontDoor({
+      similarClimbs: { status: 'loaded', items: [], nearby: { status: 'unavailable', grade: '7a+/V7' } },
+      betaLinks: { status: 'loaded', items: [] },
+    });
+
+    expect(html).toContain('frontDoor.similar.nearbyUnavailable');
+    expect(html).not.toContain('similarClimbs.emptyOnLayout');
   });
 });

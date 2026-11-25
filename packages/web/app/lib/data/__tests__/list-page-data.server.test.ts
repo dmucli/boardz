@@ -7,8 +7,9 @@ vi.mock('@/app/lib/db/queries/climbs/search-climbs', () => ({
   cachedSearchClimbs: vi.fn(),
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({ board_name: 'kilter' })),
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({ board_name: 'kilter' })),
 }));
 
 vi.mock('@/app/components/board-renderer/util', () => ({
@@ -18,6 +19,7 @@ vi.mock('@/app/components/board-renderer/util', () => ({
 }));
 
 import { cachedSearchClimbs } from '@/app/lib/db/queries/climbs/search-climbs';
+import { buildOverlayPreloadUrls } from '@/app/components/board-renderer/util';
 import { fetchFrontDoorListPage } from '../list-page-data.server';
 import type { ParsedBoardRouteParameters } from '@/app/lib/types';
 
@@ -52,5 +54,18 @@ describe('fetchFrontDoorListPage', () => {
     const result = await fetchFrontDoorListPage(parsedParams, 1);
 
     expect(result?.preloadUrls).toEqual(['/api/internal/board-render?overlay']);
+  });
+
+  it("preloads the first climb's full board render, the hero, not its row thumbnail", async () => {
+    vi.mocked(cachedSearchClimbs).mockResolvedValue({
+      climbs: [{ frames: 'p1r12' }] as never,
+      hasMore: true,
+    });
+
+    await fetchFrontDoorListPage(parsedParams, 1);
+
+    // `false` is the climb page's own render (`buildBoardArtLayers(…, false)`),
+    // so the URL is one the CDN has usually rendered already.
+    expect(vi.mocked(buildOverlayPreloadUrls)).toHaveBeenCalledWith({ board_name: 'kilter' }, 'p1r12', false);
   });
 });

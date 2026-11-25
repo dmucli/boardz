@@ -1,3 +1,4 @@
+import { setContentPrivacy, betaPrivacyEntityId, resourceAccessCondition } from '../../../services/privacy';
 import { v4 as uuidv4 } from 'uuid';
 import { eq, and, inArray, isNotNull, isNull, or, sql } from 'drizzle-orm';
 import { aliasedTable } from 'drizzle-orm/alias';
@@ -19,11 +20,14 @@ import {
   readTimestampFractionalSeconds,
 } from '../../../validation/schemas';
 import { resolveBoardFromPath } from '../social/boards';
+import { sprayWallMayAnnounceByLayout } from '../shared/spray-wall-announce';
 import { boardConfigMatchesTick, findActiveBoardById, isSharedConfigFeedBoard } from '../board-presence/shared';
+import { listableSprayWallCondition } from '../board/spray-wall-listing';
 import { queueBoardStatsPublish } from '../board-presence/stats';
 import { publishSocialEvent } from '../../../events';
 import { publishDebouncedSessionStats } from '../sessions/debounced-stats-publisher';
 import { queueClimbStatsRecompute, recomputeClimbStatsNow } from './debounced-climb-stats-publisher';
+import { lockSprayClimbAgainstDelete } from '../climbs/spray-climb-lock';
 import { getInstagramMediaId, isInstagramUrl, normalizeBetaVideoUrl } from '../../../lib/instagram-meta';
 import {
   InstagramBetaValidationError,
@@ -35,12 +39,17 @@ import { invalidateRecentBetaLinksCache } from '../beta-videos/queries';
 import { resolveClimbCatalogPresence } from '../../../db/queries/climbs';
 import { captureBackendEvent } from '../../../services/analytics/posthog';
 import { logger } from '../../../utils/logger';
+import { canAttributeTickToBoard } from '@boardsesh/board-config';
+import { findTickClimb, tickBoardFitsClimb } from './board-options';
 import { reconcileInferredSessions } from '../../../services/inferred-sessions/reconcile';
 import { parseClimbedAt } from '../../../services/inferred-sessions/timestamps';
+import { tickReportingTime } from '../../../services/reporting-time';
+import { publishSessionWallChangedByTick } from '../../../services/session-wall-refresh';
 import {
   acquireUserTickMutationLock,
   isDirectAuroraTwin,
   isRealAuroraPullRow,
+  lockBoardSerialWrite,
   notAuroraTwinDuplicate,
   resolveCanonicalClimbUuid,
 } from '@boardsesh/db/queries';
@@ -53,6 +62,8 @@ type LockedTickBoard = {
   deletedAt: Date | string | null;
   mergedIntoBoardUuid: string | null;
 };
+
+type TickMutationBoardSurfaceRow = LockedTickBoard & { serialNumber: string | null };
 
 export function buildTickBoardLockQuery(requestedBoardId: number) {
   return sql`
@@ -98,6 +109,149 @@ export function buildTickBoardLockQuery(requestedBoardId: number) {
   `;
 }
 
+function buildTickMutationBoardSurfaceQuery(boardIds: number[], lockRows: boolean) {
+  const boardIdList = sql.join(
+    [...new Set(boardIds)].sort((first, second) => first - second).map((boardId) => sql`${boardId}`),
+    sql`, `,
+  );
+  const lockClause = lockRows ? sql`FOR NO KEY UPDATE OF board` : sql``;
+
+  return sql`
+    WITH RECURSIVE anchor_boards AS (
+      SELECT id, uuid, serial_number, merged_into_board_uuid
+        FROM user_boards
+       WHERE id IN (${boardIdList})
+    ),
+    merge_chain AS (
+      SELECT id, uuid, serial_number, merged_into_board_uuid, 0 AS depth
+        FROM anchor_boards
+      UNION ALL
+      SELECT next_board.id,
+             next_board.uuid,
+             next_board.serial_number,
+             next_board.merged_into_board_uuid,
+             merge_chain.depth + 1
+        FROM merge_chain
+        JOIN user_boards next_board
+          ON next_board.uuid = merge_chain.merged_into_board_uuid
+       WHERE merge_chain.depth < 3
+    ),
+    candidate_ids AS (
+      SELECT id FROM merge_chain
+      UNION
+      SELECT active_board.id
+        FROM merge_chain cluster_board
+        JOIN user_boards active_board
+          ON active_board.serial_number = cluster_board.serial_number
+         AND active_board.serial_number IS NOT NULL
+         AND active_board.serial_number <> ''
+         AND active_board.deleted_at IS NULL
+       WHERE cluster_board.serial_number IS NOT NULL
+         AND cluster_board.serial_number <> ''
+    )
+    SELECT board.id AS "id",
+           board.uuid AS "uuid",
+           board.deleted_at AS "deletedAt",
+           board.merged_into_board_uuid AS "mergedIntoBoardUuid",
+           board.serial_number AS "serialNumber"
+      FROM user_boards board
+      JOIN candidate_ids ON candidate_ids.id = board.id
+     ORDER BY board.id
+     ${lockClause}
+  `;
+}
+
+async function readTickMutationBoardSurface(
+  transactionDb: TickBoardLockDb,
+  boardIds: number[],
+  lockRows: boolean,
+): Promise<TickMutationBoardSurfaceRow[]> {
+  if (boardIds.length === 0) return [];
+  return rowsFromResult<TickMutationBoardSurfaceRow>(
+    await transactionDb.execute(buildTickMutationBoardSurfaceQuery(boardIds, lockRows)),
+  );
+}
+
+function tickMutationBoardSurfaceFingerprint(rows: TickMutationBoardSurfaceRow[]): string {
+  return rows
+    .map((board) => [
+      Number(board.id),
+      board.uuid,
+      board.serialNumber ?? '',
+      board.deletedAt === null ? '' : String(board.deletedAt),
+      board.mergedIntoBoardUuid ?? '',
+    ])
+    .join('\n');
+}
+
+function tickMutationGroupFingerprint(ticks: dbSchema.BoardseshTick[]): string {
+  return [...ticks]
+    .sort((first, second) => first.uuid.localeCompare(second.uuid))
+    .map((tick) =>
+      [
+        tick.uuid,
+        tick.userId,
+        tick.boardType,
+        tick.climbUuid,
+        tick.boardId ?? '',
+        tick.sessionId ?? '',
+        tick.auroraType ?? '',
+        tick.auroraId ?? '',
+        tick.kilterId ?? '',
+      ].join('\u0000'),
+    )
+    .join('\n');
+}
+
+function resolveLockedTickBoardId(
+  lockedBoards: LockedTickBoard[],
+  requestedBoardId: number,
+  operation: 'saveTick' | 'updateTick',
+): number | null {
+  const requestedBoard = lockedBoards.find((board) => Number(board.id) === requestedBoardId);
+  if (!requestedBoard) return null;
+  if (requestedBoard.deletedAt === null) return Number(requestedBoard.id);
+
+  const boardsByUuid = new Map(lockedBoards.map((board) => [board.uuid, board]));
+  let nextBoardUuid = requestedBoard.mergedIntoBoardUuid;
+  for (let hop = 0; hop < 3 && nextBoardUuid; hop++) {
+    const candidate = boardsByUuid.get(nextBoardUuid);
+    if (!candidate) {
+      logger.warn(
+        `[${operation}] merged board ${requestedBoardId} points outside its locked serial cluster at ${nextBoardUuid}`,
+      );
+      return null;
+    }
+    if (candidate.deletedAt === null) return Number(candidate.id);
+    nextBoardUuid = candidate.mergedIntoBoardUuid;
+  }
+
+  if (nextBoardUuid) {
+    logger.warn(`[${operation}] merged board ${requestedBoardId} exceeded the tombstone hop limit at ${nextBoardUuid}`);
+  }
+  return null;
+}
+
+/**
+ * Whether the board uuid a caller presented is still a link to the board a
+ * merge resolved it to. A uuid is its own board's link; across a merge it stays
+ * one only when one owner holds both boards (`findReachableActiveBoardByUuid`'s
+ * rule), so another owner's survivor gets the no-link reading.
+ */
+async function presentedUuidLinksCanonicalBoard(
+  readDb: Pick<typeof db, 'select'>,
+  requestedBoard: { id: number; ownerId: string },
+  canonicalBoardId: number,
+): Promise<boolean> {
+  if (canonicalBoardId === Number(requestedBoard.id)) return true;
+  const [canonical] = await readDb
+    .select({ ownerId: dbSchema.userBoards.ownerId })
+    .from(dbSchema.userBoards)
+    .where(eq(dbSchema.userBoards.id, canonicalBoardId))
+    .limit(1);
+  return canonical?.ownerId === requestedBoard.ownerId;
+}
+
 /**
  * Pin a tick's board association against the serial-board dedupe transaction.
  *
@@ -123,29 +277,7 @@ export async function lockCanonicalTickBoardId(
   const lockedBoards = rowsFromResult<LockedTickBoard>(
     await transactionDb.execute(buildTickBoardLockQuery(requestedBoardId)),
   );
-
-  const requestedBoard = lockedBoards.find((board) => Number(board.id) === requestedBoardId);
-  if (!requestedBoard) return null;
-  if (requestedBoard.deletedAt === null) return Number(requestedBoard.id);
-
-  const boardsByUuid = new Map(lockedBoards.map((board) => [board.uuid, board]));
-  let nextBoardUuid = requestedBoard.mergedIntoBoardUuid;
-  for (let hop = 0; hop < 3 && nextBoardUuid; hop++) {
-    const candidate = boardsByUuid.get(nextBoardUuid);
-    if (!candidate) {
-      logger.warn(
-        `[saveTick] merged board ${requestedBoardId} points outside its locked serial cluster at ${nextBoardUuid}`,
-      );
-      return null;
-    }
-    if (candidate.deletedAt === null) return Number(candidate.id);
-    nextBoardUuid = candidate.mergedIntoBoardUuid;
-  }
-
-  if (nextBoardUuid) {
-    logger.warn(`[saveTick] merged board ${requestedBoardId} exceeded the tombstone hop limit at ${nextBoardUuid}`);
-  }
-  return null;
+  return resolveLockedTickBoardId(lockedBoards, requestedBoardId, 'saveTick');
 }
 
 // Beta links are only attached on successful ascents (flash / send), never
@@ -203,13 +335,13 @@ async function reportTickClimbCatalogPresence(
       `[saveTick] climb not in catalog — saving anyway (#3528): ${boardType}/${climbUuid} angle=${angle} user=${userId}`,
     );
     captureBackendEvent('Tick Climb Not In Catalog', {
-      distinctId: userId,
       // climbUuid rides along so the counter is triageable on its own. "12 hits"
       // means nothing until you know whether it's 12 climbs or one client
       // looping on one bad UUID — and that distinction is the answer #3942 needs.
-      // Not PII: a catalog identifier, and the same value the warn log carries.
+      // Count distinct climbUuid. Not PII: a catalog identifier, and the same
+      // value the warn log carries. No user id: backend events are operational
+      // telemetry and never identify a climber (docs/analytics/analytics-consent.md).
       properties: { boardType, angle, climbUuid },
-      processPersonProfile: false,
     });
   } catch (error) {
     logger.error('[saveTick] climb catalog presence check failed:', error);
@@ -434,12 +566,13 @@ const inputClimbAlias = aliasedTable(dbSchema.boardClimbAliases, 'beta_link_inpu
 export async function resolveBetaLinkTickContext(
   input: { boardType: string; climbUuid: string; angle?: number | null; tickUuid?: string | null; link?: string },
   userId: string,
+  executor: Pick<typeof db, 'select'> = db,
 ): Promise<BetaLinkTickContext> {
   if (!input.tickUuid) {
     return { tickUuid: null, boardId: null, angle: input.angle ?? null };
   }
 
-  const [tick] = await db
+  const [tick] = await executor
     .select({
       uuid: dbSchema.boardseshTicks.uuid,
       userId: dbSchema.boardseshTicks.userId,
@@ -496,7 +629,7 @@ export async function resolveBetaLinkTickContext(
     });
   }
 
-  const [existingTickBetaLink] = await db
+  const [existingTickBetaLink] = await executor
     .select({ link: dbSchema.boardBetaLinks.link })
     .from(dbSchema.boardBetaLinks)
     .where(eq(dbSchema.boardBetaLinks.tickUuid, tick.uuid))
@@ -523,6 +656,7 @@ function tickResult(tick: dbSchema.BoardseshTick): Record<string, unknown> {
     userId: tick.userId,
     boardType: tick.boardType,
     climbUuid: tick.climbUuid,
+    climbRevision: tick.climbRevision,
     angle: tick.angle,
     isMirror: tick.isMirror,
     status: tick.status,
@@ -545,6 +679,27 @@ function tickResult(tick: dbSchema.BoardseshTick): Record<string, unknown> {
 const auroraMutationTwin = aliasedTable(dbSchema.boardseshTicks, 'aurora_mutation_twin');
 
 type TickMutationTransaction = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+class TickMutationSurfaceChangedError extends Error {}
+
+async function retryTickMutationOnChangedSurface<T>(operation: () => Promise<T>): Promise<T> {
+  const maxAttempts = 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      if (!(error instanceof TickMutationSurfaceChangedError)) throw error;
+      if (attempt === maxAttempts) {
+        throw new GraphQLError('The tick or board changed while saving. Please try again.', {
+          extensions: { code: 'TICK_CHANGED_RETRY' },
+        });
+      }
+    }
+  }
+  throw new GraphQLError('The tick or board changed while saving. Please try again.', {
+    extensions: { code: 'TICK_CHANGED_RETRY' },
+  });
+}
 
 /**
  * Convert a client timestamp to the UTC wall-clock text PostgreSQL stores for
@@ -625,15 +780,160 @@ async function selectTickMutationGroupForUpdate(
     .orderBy(auroraMutationTwin.uuid)
     .for('update');
 
-  const mutationGroup = [targetResult.tick, ...directTwins.map((row) => row.tick)];
+  return tickMutationGroup(
+    targetResult.tick,
+    directTwins.map((row) => row.tick),
+  );
+}
+
+async function selectTickMutationGroupSnapshot(
+  tx: TickMutationTransaction,
+  uuid: string,
+  userId: string,
+): Promise<dbSchema.BoardseshTick[]> {
+  const [targetResult] = await tx
+    .select({
+      tick: dbSchema.boardseshTicks,
+      isVisible: sql<boolean>`${notAuroraTwinDuplicate(dbSchema.boardseshTicks)}`,
+      isRealAuroraPull: sql<boolean>`${isRealAuroraPullRow(dbSchema.boardseshTicks)}`,
+    })
+    .from(dbSchema.boardseshTicks)
+    .where(eq(dbSchema.boardseshTicks.uuid, uuid))
+    .limit(1);
+
+  if (!targetResult) {
+    throw new GraphQLError('Tick not found', { extensions: { code: 'TICK_NOT_FOUND' } });
+  }
+  if (targetResult.tick.userId !== userId) {
+    throw new GraphQLError('Not authorized to update this tick', { extensions: { code: 'FORBIDDEN' } });
+  }
+  if (!targetResult.isVisible || !targetResult.isRealAuroraPull) return [targetResult.tick];
+
+  const directTwins = await tx
+    .select({ tick: auroraMutationTwin })
+    .from(auroraMutationTwin)
+    .innerJoin(dbSchema.boardseshTicks, eq(dbSchema.boardseshTicks.uuid, uuid))
+    .where(isDirectAuroraTwin(dbSchema.boardseshTicks, auroraMutationTwin))
+    .orderBy(auroraMutationTwin.uuid);
+
+  return tickMutationGroup(
+    targetResult.tick,
+    directTwins.map((row) => row.tick),
+  );
+}
+
+function tickMutationGroup(
+  targetTick: dbSchema.BoardseshTick,
+  directTwins: dbSchema.BoardseshTick[],
+): dbSchema.BoardseshTick[] {
+  const mutationGroup = [targetTick, ...directTwins];
   const kilterIds = new Set(mutationGroup.flatMap((tick) => (tick.kilterId ? [tick.kilterId] : [])));
 
   // `isDirectAuroraTwin` intentionally permits one NULL Kilter link. That is
   // safe pairwise, but a NULL target can individually witness two different
   // real links. Do not turn that V shape into one mutable logical ascent.
-  if (kilterIds.size > 1) return [targetResult.tick];
+  if (kilterIds.size > 1) return [targetTick];
 
   return mutationGroup;
+}
+
+async function lockUpdateTickMutationSurface(
+  tx: TickMutationTransaction,
+  uuid: string,
+  userId: string,
+  boardUuid: string | null | undefined,
+): Promise<{
+  snapshotTicks: dbSchema.BoardseshTick[];
+  selectedBoard: typeof dbSchema.userBoards.$inferSelect | null;
+  /** The selection was opened by the presented uuid as a link (see presentedUuidLinksCanonicalBoard). */
+  selectedByLink: boolean;
+}> {
+  // Preserve the existing not-found contract for explicit board selections.
+  // Omitted and null selections continue through the normal owner check below.
+  if (boardUuid != null) {
+    const [ownedTick] = await tx
+      .select({ uuid: dbSchema.boardseshTicks.uuid })
+      .from(dbSchema.boardseshTicks)
+      .where(and(eq(dbSchema.boardseshTicks.uuid, uuid), eq(dbSchema.boardseshTicks.userId, userId)))
+      .limit(1);
+    if (!ownedTick) throw new GraphQLError('Tick not found', { extensions: { code: 'TICK_NOT_FOUND' } });
+  }
+
+  const snapshotTicks = await selectTickMutationGroupSnapshot(tx, uuid, userId);
+  const [requestedBoard] =
+    boardUuid == null
+      ? []
+      : await tx.select().from(dbSchema.userBoards).where(eq(dbSchema.userBoards.uuid, boardUuid)).limit(1);
+  const anchorBoardIds = [
+    ...new Set([
+      ...snapshotTicks.flatMap((tick) => (tick.boardId == null ? [] : [tick.boardId])),
+      ...(requestedBoard ? [requestedBoard.id] : []),
+    ]),
+  ];
+
+  // One sorted union is important. Locking old and requested clusters with two
+  // calls would still acquire them in caller order when their ids are reversed.
+  const lockedBoardSurface = await readTickMutationBoardSurface(tx, anchorBoardIds, true);
+  const serialNumbers = [
+    ...new Set(
+      lockedBoardSurface
+        .flatMap((board) => (board.serialNumber ? [board.serialNumber] : []))
+        .sort((first, second) => first.localeCompare(second)),
+    ),
+  ];
+  for (const serialNumber of serialNumbers) await lockBoardSerialWrite(tx, serialNumber);
+
+  // A merge or serial edit can commit while the row-lock query waits. Re-read
+  // the same union after serial locks and restart before touching tick rows if
+  // the locked cluster no longer covers the current board surface.
+  const currentBoardSurface = await readTickMutationBoardSurface(tx, anchorBoardIds, false);
+  if (
+    tickMutationBoardSurfaceFingerprint(lockedBoardSurface) !== tickMutationBoardSurfaceFingerprint(currentBoardSurface)
+  ) {
+    throw new TickMutationSurfaceChangedError();
+  }
+
+  const sessionIds = distinctTickSessions(snapshotTicks).sort((first, second) => first.localeCompare(second));
+  if (sessionIds.length > 0) {
+    await tx
+      .select({ id: sessions.id })
+      .from(sessions)
+      .where(inArray(sessions.id, sessionIds))
+      .orderBy(sessions.id)
+      .for('no key update');
+  }
+
+  const currentTicks = await selectTickMutationGroupSnapshot(tx, uuid, userId);
+  if (tickMutationGroupFingerprint(snapshotTicks) !== tickMutationGroupFingerprint(currentTicks)) {
+    throw new TickMutationSurfaceChangedError();
+  }
+
+  if (boardUuid == null) return { snapshotTicks, selectedBoard: null, selectedByLink: false };
+  if (!requestedBoard) {
+    throw new GraphQLError('Board is no longer available', { extensions: { code: 'TICK_BOARD_UNAVAILABLE' } });
+  }
+
+  const canonicalBoardId = resolveLockedTickBoardId(lockedBoardSurface, requestedBoard.id, 'updateTick');
+  const selectedByLink =
+    canonicalBoardId != null && (await presentedUuidLinksCanonicalBoard(tx, requestedBoard, canonicalBoardId));
+  const [selectedBoard] =
+    canonicalBoardId == null
+      ? []
+      : await tx
+          .select()
+          .from(dbSchema.userBoards)
+          .where(
+            and(
+              eq(dbSchema.userBoards.id, canonicalBoardId),
+              listableSprayWallCondition(userId),
+              resourceAccessCondition('board', dbSchema.userBoards.uuid, userId, { allowUnlistedLink: selectedByLink }),
+            ),
+          )
+          .limit(1);
+  if (!selectedBoard) {
+    throw new GraphQLError('Board is no longer available', { extensions: { code: 'TICK_BOARD_UNAVAILABLE' } });
+  }
+  return { snapshotTicks, selectedBoard, selectedByLink };
 }
 
 function distinctTickStatsKeys(ticks: dbSchema.BoardseshTick[]): Array<{
@@ -851,6 +1151,58 @@ export const tickMutations = {
     // updateTick needs no counterpart: UpdateTickInputSchema carries no
     // climbUuid, so an edit can never move a tick to a different climb.
     const climbUuid = await resolveCanonicalClimbUuid(db, validatedInput.boardType, validatedInput.climbUuid);
+    const catalogClimb = await findTickClimb(db, validatedInput.boardType, climbUuid);
+    const attributionConfig =
+      validatedInput.layoutId != null && validatedInput.sizeId != null && validatedInput.setIds
+        ? {
+            boardType: validatedInput.boardType,
+            layoutId: validatedInput.layoutId,
+            sizeId: validatedInput.sizeId,
+            setIds: validatedInput.setIds,
+          }
+        : null;
+    const canResolveBoard = attributionConfig != null && canAttributeTickToBoard(catalogClimb, attributionConfig);
+
+    // A spray tick must name a climb that exists AND whose wall the climber can
+    // see (#6032). The other eight board types are deliberately exempt: an Aurora
+    // tick can legitimately arrive before its climb (the catalogue syncs on its
+    // own schedule), and `boardsesh_ticks` has no FK to `board_climbs` for that
+    // reason. A spray climb is created in THIS database and can never be queued
+    // by the offline outbox either (`saveClimb` is not an outbox mutation), so a
+    // spray tick naming a missing climb is never legitimate — it is either a
+    // made-up uuid or a replay whose climb was hard-deleted in the meantime
+    // (`deleteDraftClimb`, account deletion). Rejecting those is also how the
+    // orphaned-tick rows #5981 has to mask on the read side stop being created.
+    //
+    // `boardUuid` rides along as the unlisted-wall capability, matching the read
+    // side (`sprayLayoutIsReadableWithCapability`): a share-link holder ticks the
+    // wall they can open, and everybody else gets the same "Climb not found" a
+    // missing row gives — not "forbidden", which would confirm the uuid exists.
+    //
+    // CLIMB_NOT_FOUND is on the offline drainer's permanent-rejection list, so a
+    // replayed tick whose climb is gone dead-letters on attempt one instead of
+    // burning ten retries it can never win. The check reads the PRIMARY (not the
+    // replica): a climb created moments ago must be tickable immediately.
+    if (validatedInput.boardType === 'spray') {
+      const [sprayTargetClimb] = await db
+        .select({ uuid: dbSchema.boardClimbs.uuid })
+        .from(dbSchema.boardClimbs)
+        .where(
+          and(
+            eq(dbSchema.boardClimbs.uuid, climbUuid),
+            sprayClimbVisibilityCondition(
+              { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
+              userId,
+              validatedInput.boardUuid ?? null,
+            ),
+          ),
+        )
+        .limit(1);
+
+      if (!sprayTargetClimb) {
+        throw new GraphQLError('Climb not found', { extensions: { code: 'CLIMB_NOT_FOUND' } });
+      }
+    }
 
     // A stale/unknown sessionId (session ended, or never existed on this
     // backend — e.g. an offline-replayed tick) would otherwise FK-violate the
@@ -909,11 +1261,15 @@ export const tickMutations = {
     let boardId: number | null = null;
     let sharedConfigFeedBoardId: number | null = null;
     let boardAssociationSource: 'boardUuid' | 'explicitBoardId' | 'config' | null = null;
-    if (validatedInput.boardUuid) {
+    // The board the caller presented by uuid: the link reading below follows a
+    // merge from it only to a survivor with the same owner.
+    let presentedUuidBoard: { id: number; ownerId: string } | null = null;
+    if (canResolveBoard && validatedInput.boardUuid) {
       boardAssociationSource = 'boardUuid';
       const [board] = await db
         .select({
           id: dbSchema.userBoards.id,
+          ownerId: dbSchema.userBoards.ownerId,
           boardType: dbSchema.userBoards.boardType,
           layoutId: dbSchema.userBoards.layoutId,
           sizeId: dbSchema.userBoards.sizeId,
@@ -937,6 +1293,7 @@ export const tickMutations = {
       // wasn't on (#4219).
       if (board && boardConfigMatchesTick(board, validatedInput)) {
         boardId = board.id;
+        presentedUuidBoard = board;
       } else if (board) {
         // Two different reasons to land here, and they mean different things in
         // production triage: a client that sends no config at all is a client
@@ -949,7 +1306,7 @@ export const tickMutations = {
             : `[saveTick] Ignoring tick boardUuid ${validatedInput.boardUuid} — input carries no layout/size/set to match against`,
         );
       }
-    } else if (validatedInput.boardId != null) {
+    } else if (canResolveBoard && validatedInput.boardId != null) {
       const explicitBoard = await findActiveBoardById(validatedInput.boardId);
       // Accept the explicit wall board only when its FULL config matches the
       // tick's target (type + layout + size + set). A stale presence boardId
@@ -977,6 +1334,7 @@ export const tickMutations = {
     // home and at a gym, and the config lookup below cannot see which one the
     // climber is at, while the session can.
     if (
+      canResolveBoard &&
       boardId == null &&
       !validatedInput.boardUuid &&
       sessionBoardId != null &&
@@ -998,6 +1356,7 @@ export const tickMutations = {
     // intentionally left unassociated (handled above), so it does not fall
     // through to here.
     if (
+      canResolveBoard &&
       boardId == null &&
       !validatedInput.boardUuid &&
       validatedInput.layoutId &&
@@ -1022,6 +1381,8 @@ export const tickMutations = {
       boardId = sharedConfigFeedBoardId;
       boardAssociationSource = 'explicitBoardId';
     }
+
+    const reportingTime = await tickReportingTime(validatedInput.climbedAt, validatedInput.reportingTime);
 
     // Run write-time beta-link validation before opening the transaction so a
     // bad video URL doesn't leave a half-state. Zod already validated the
@@ -1057,11 +1418,97 @@ export const tickMutations = {
     // we detect that, return the original row, and skip every side effect below.
     const [tick] = await db.transaction(
       async (tx) => {
+        // A spray climb can be hard-deleted by its setter while nobody has
+        // logged it (`deleteClimb`, #5960). The visibility check above ran
+        // outside this transaction, so it cannot stop a delete committing
+        // between it and the insert. `FOR KEY SHARE` here conflicts with the
+        // delete's `FOR UPDATE`: if the delete holds the row, this waits and
+        // then finds no row (CLIMB_NOT_FOUND, dead-lettered by the drainer); if
+        // this holds it first, the delete waits and its tick count sees this
+        // tick. Inside the transaction so the lock lasts until the insert commits.
+        if (validatedInput.boardType === 'spray') {
+          await lockSprayClimbAgainstDelete(tx, climbUuid);
+        }
+
         // Re-lock and canonicalise the association immediately before INSERT.
         // Board resolution above intentionally stays outside this transaction so
         // its network/catalog work does not lengthen the row-lock hold time.
-        const lockedBoardId = boardId === null ? null : await lockCanonicalTickBoardId(tx, boardId);
+        const canonicalBoardId = boardId === null ? null : await lockCanonicalTickBoardId(tx, boardId);
+        const presentedLink =
+          canonicalBoardId != null &&
+          presentedUuidBoard !== null &&
+          (await presentedUuidLinksCanonicalBoard(tx, presentedUuidBoard, canonicalBoardId));
+        const lockedBoard =
+          canonicalBoardId == null
+            ? null
+            : await tickBoardFitsClimb(tx, canonicalBoardId, catalogClimb, userId, {
+                allowUnlistedLink: presentedLink,
+              });
+        const lockedBoardId = lockedBoard?.id ?? null;
+        let reportingAttribution: dbSchema.BoardseshTick['reportingAttribution'] = null;
+        if (lockedBoard && !isSharedConfigFeedBoard(lockedBoard)) {
+          if (boardAssociationSource === 'boardUuid') reportingAttribution = 'uuid';
+          if (boardAssociationSource === 'explicitBoardId') reportingAttribution = 'presence';
+          if (boardAssociationSource === null && resolvedSessionId && sessionBoardId === boardId) {
+            // A supplied session id alone does not prove this climber recorded
+            // activity there. Recheck a bound wall and persisted participation.
+            const [session] = await tx
+              .select({ id: dbSchema.boardSessions.id })
+              .from(dbSchema.boardSessions)
+              .where(
+                and(
+                  eq(dbSchema.boardSessions.id, resolvedSessionId),
+                  eq(dbSchema.boardSessions.boardId, lockedBoard.id),
+                  or(
+                    eq(dbSchema.boardSessions.createdByUserId, userId),
+                    sql`EXISTS (
+                  SELECT 1 FROM board_session_participants participant
+                  WHERE participant.session_id = ${dbSchema.boardSessions.id} AND participant.user_id = ${userId}
+                )`,
+                  ),
+                ),
+              )
+              .limit(1);
+            if (session) reportingAttribution = 'session';
+          }
+        }
         const boardAssociationBecameUnavailable = boardId !== null && lockedBoardId === null;
+        // Why the association was dropped, for the warning below. A missing
+        // canonical row is a concurrent delete or a dangling tombstone chain.
+        // After a merge into another owner's board the presented uuid is no
+        // longer its link, so the survivor is either unreadable without a link
+        // or readable but no longer fits the climb; one extra read, only on this
+        // already-failing path, tells them apart.
+        let boardAssociationDropReason:
+          | 'canonical_missing'
+          | 'merged_into_unreadable_survivor'
+          | 'merged_survivor_does_not_fit'
+          | 'merged_board_unavailable'
+          | 'board_unavailable' = 'board_unavailable';
+        if (boardAssociationBecameUnavailable) {
+          if (canonicalBoardId == null) {
+            boardAssociationDropReason = 'canonical_missing';
+          } else if (canonicalBoardId !== boardId) {
+            if (presentedUuidBoard !== null && !presentedLink) {
+              const [readableSurvivor] = await tx
+                .select({ id: dbSchema.userBoards.id })
+                .from(dbSchema.userBoards)
+                .where(
+                  and(
+                    eq(dbSchema.userBoards.id, canonicalBoardId),
+                    isNull(dbSchema.userBoards.deletedAt),
+                    resourceAccessCondition('board', dbSchema.userBoards.uuid, userId, { allowUnlistedLink: false }),
+                  ),
+                )
+                .limit(1);
+              boardAssociationDropReason = readableSurvivor
+                ? 'merged_survivor_does_not_fit'
+                : 'merged_into_unreadable_survivor';
+            } else {
+              boardAssociationDropReason = 'merged_board_unavailable';
+            }
+          }
+        }
         const [createdTick] = await tx
           .insert(dbSchema.boardseshTicks)
           .values({
@@ -1082,6 +1529,11 @@ export const tickMutations = {
             updatedAt: now,
             sessionId: resolvedSessionId,
             boardId: lockedBoardId,
+            reportingAttribution,
+            reportingBoardId: reportingAttribution ? lockedBoardId : null,
+            reportingGymId: reportingAttribution ? lockedBoard?.gymId : null,
+            ...reportingTime,
+            reportingClimbedAt: reportingTime.reportingTimePrecision ? climbedAt : null,
             // Aurora sync fields are null - will be populated by periodic sync job
             auroraType: null,
             auroraId: null,
@@ -1094,18 +1546,33 @@ export const tickMutations = {
           .returning();
 
         if (!createdTick) return [];
+        if (validatedInput.privacy) {
+          await setContentPrivacy(
+            tx,
+            userId,
+            'tick',
+            createdTick.uuid,
+            validatedInput.privacy.audience,
+            validatedInput.privacy.privacyRevision,
+          );
+        }
 
         if (boardAssociationBecameUnavailable) {
-          // The board was valid when we resolved it above, but a concurrent
-          // delete or dangling tombstone chain won the canonical row lock. Keep
-          // the valid tick and deliberately leave its nullable association empty;
-          // falling back to config here could stamp it onto a different wall.
+          // The board was valid when we resolved it above, but it is no longer
+          // one this climber may attach a tick to (see boardAssociationDropReason:
+          // a concurrent delete or dangling tombstone chain, a merge into another
+          // owner's board they cannot read without a link, a merge reached by
+          // some other path, or a board the climber can no longer read or the
+          // climb no longer fits). Keep the valid tick and deliberately leave its nullable
+          // association empty; falling back to config here could stamp it onto a
+          // different wall.
           // Emit only after a new row was returned: a concurrent idempotent replay
           // that won the UUID insert must not produce this warning for our no-op.
           logger.warn('[saveTick] Board association became unavailable; saving tick without board association', {
             tickUuid: uuid,
             userId,
             requestedBoardId: boardId,
+            reason: boardAssociationDropReason,
             boardAssociationSource,
             boardType: validatedInput.boardType,
             climbUuid,
@@ -1184,6 +1651,13 @@ export const tickMutations = {
 
     const result = tickResult(tick);
 
+    // A session nothing else places is on the board of its newest tick there,
+    // so this tick can move it to another wall. Connected peers then re-project
+    // who they may name. Off the response path; it never fails the save.
+    if (tick.sessionId && tick.boardId != null && sessionBoardId == null) {
+      void publishSessionWallChangedByTick(tick.sessionId, tick.uuid);
+    }
+
     // Publish ascent.logged event for feed fan-out (only for successful ascents)
     if (tick.status === 'flash' || tick.status === 'send') {
       // Fire-and-forget with retry: don't block the response on event publishing
@@ -1257,7 +1731,7 @@ export const tickMutations = {
     // use; the two-token cost is a side effect of the gating architecture, not
     // a deliberate rate ceiling, but 15/min is still the effective limit.
     await applyRateLimit(ctx, 30, 'beta-link-validation');
-    const tickContext = await resolveBetaLinkTickContext({ ...validated, link: normalizedLink }, userId);
+    await resolveBetaLinkTickContext({ ...validated, link: normalizedLink }, userId);
 
     // Validation runs first — it's an outbound HTTP fetch we don't want to
     // hold a DB connection open for. attachBetaLink is a deliberate user
@@ -1282,25 +1756,65 @@ export const tickMutations = {
     }
 
     try {
-      await db
-        .insert(dbSchema.boardBetaLinks)
-        .values({
-          boardType: validated.boardType,
-          climbUuid: validated.climbUuid,
-          link: normalizedLink,
-          shortcode: getInstagramMediaId(normalizedLink),
-          videoIdentity: betaLinkIdentity(normalizedLink),
-          tickUuid: tickContext.tickUuid,
-          boardId: tickContext.boardId,
-          angle: tickContext.angle,
-          isListed: true,
-          thumbnail: betaPlan.thumbnail,
-          foreignUsername: betaPlan.foreignUsername,
-          createdAt: now,
-          createdByUserId: userId,
-        })
-        .onConflictDoNothing();
+      await retryTickMutationOnChangedSurface(() =>
+        db.transaction(async (tx) => {
+          // The validation fetch deliberately held no database locks. Its tick
+          // may now belong to the merge survivor, so derive the context again.
+          let tickContext = await resolveBetaLinkTickContext({ ...validated, link: normalizedLink }, userId, tx);
+          if (tickContext.tickUuid) {
+            if (tickContext.boardId !== null) {
+              // Board-before-tick matches tick edits and merge. Ordinary deleted
+              // boards retain historical beta attribution; merge tombstones do not.
+              const [board] = await tx
+                .select({ id: dbSchema.userBoards.id, mergedIntoBoardUuid: dbSchema.userBoards.mergedIntoBoardUuid })
+                .from(dbSchema.userBoards)
+                .where(eq(dbSchema.userBoards.id, tickContext.boardId))
+                .for('share')
+                .limit(1);
+              if (!board || board.mergedIntoBoardUuid) throw new TickMutationSurfaceChangedError();
+            }
+            const [lockedTick] = await tx
+              .select({ boardId: dbSchema.boardseshTicks.boardId })
+              .from(dbSchema.boardseshTicks)
+              .where(eq(dbSchema.boardseshTicks.uuid, tickContext.tickUuid))
+              .for('share')
+              .limit(1);
+            if (!lockedTick || lockedTick.boardId !== tickContext.boardId) throw new TickMutationSurfaceChangedError();
+            tickContext = await resolveBetaLinkTickContext({ ...validated, link: normalizedLink }, userId, tx);
+          }
+          const [inserted] = await tx
+            .insert(dbSchema.boardBetaLinks)
+            .values({
+              boardType: validated.boardType,
+              climbUuid: validated.climbUuid,
+              link: normalizedLink,
+              shortcode: getInstagramMediaId(normalizedLink),
+              videoIdentity: betaLinkIdentity(normalizedLink),
+              tickUuid: tickContext.tickUuid,
+              boardId: tickContext.boardId,
+              angle: tickContext.angle,
+              isListed: true,
+              thumbnail: betaPlan.thumbnail,
+              foreignUsername: betaPlan.foreignUsername,
+              createdAt: now,
+              createdByUserId: userId,
+            })
+            .onConflictDoNothing()
+            .returning({ link: dbSchema.boardBetaLinks.link });
+          if (inserted && validated.privacy) {
+            await setContentPrivacy(
+              tx,
+              userId,
+              'beta',
+              betaPrivacyEntityId(validated.boardType, validated.climbUuid, normalizedLink),
+              validated.privacy.audience,
+              validated.privacy.privacyRevision,
+            );
+          }
+        }),
+      );
     } catch (err) {
+      if (err instanceof GraphQLError) throw err;
       logger.error('[attachBetaLink] insert failed after validation passed:', err);
       throw new GraphQLError("Couldn't save the beta link. Please try again.", {
         extensions: { code: 'BETA_LINK_INSERT_FAILED' },
@@ -1331,84 +1845,176 @@ export const tickMutations = {
     const validatedInput = validateInput(UpdateTickInputSchema, input, 'input');
     const canonicalClimbedAt =
       validatedInput.climbedAt === undefined ? undefined : normalizeClimbedAt(validatedInput.climbedAt);
+    const reportingTime =
+      validatedInput.climbedAt === undefined
+        ? undefined
+        : await tickReportingTime(validatedInput.climbedAt, validatedInput.reportingTime);
 
     const changedFields = Object.keys(validatedInput);
     logger.info(`[updateTick] user=${userId} tick=${uuid} fields=[${changedFields.join(',')}]`);
 
-    const mutationResult = await db.transaction(async (tx) => {
-      await acquireUserTickMutationLock(tx, userId);
-      const existingTicks = await selectTickMutationGroupForUpdate(tx, uuid, userId, 'update');
-      const targetTick = existingTicks.find((tick) => tick.uuid === uuid)!;
-      const affectedUuids = existingTicks.map((tick) => tick.uuid);
+    const mutationResult = await retryTickMutationOnChangedSurface(() =>
+      db.transaction(async (tx) => {
+        await acquireUserTickMutationLock(tx, userId);
+        const lockContext = await lockUpdateTickMutationSurface(tx, uuid, userId, validatedInput.boardUuid);
+        const { selectedBoard, selectedByLink } = lockContext;
+        const existingTicks = await selectTickMutationGroupForUpdate(tx, uuid, userId, 'update');
+        if (tickMutationGroupFingerprint(lockContext.snapshotTicks) !== tickMutationGroupFingerprint(existingTicks)) {
+          throw new TickMutationSurfaceChangedError();
+        }
+        const targetTick = existingTicks.find((tick) => tick.uuid === uuid)!;
+        const affectedUuids = existingTicks.map((tick) => tick.uuid);
 
-      if (!isBoardAngleSupported(targetTick.boardType, validatedInput.angle)) {
-        throw new GraphQLError(BOARD_ANGLE_VALIDATION_MESSAGE, {
-          extensions: { code: 'BAD_USER_INPUT' },
-        });
-      }
+        if (selectedBoard) {
+          const climb = await findTickClimb(tx, targetTick.boardType, targetTick.climbUuid);
+          if (!canAttributeTickToBoard(climb, selectedBoard)) {
+            throw new GraphQLError('This climb does not fit that board', {
+              extensions: { code: 'TICK_BOARD_INCOMPATIBLE' },
+            });
+          }
+        }
 
-      const updates: Partial<typeof dbSchema.boardseshTicks.$inferInsert> = {
-        updatedAt: new Date().toISOString(),
-      };
-      if (validatedInput.status !== undefined) updates.status = validatedInput.status;
-      if (validatedInput.attemptCount !== undefined) updates.attemptCount = validatedInput.attemptCount;
-      if (validatedInput.quality !== undefined) updates.quality = validatedInput.quality;
-      if (validatedInput.difficulty !== undefined) updates.difficulty = validatedInput.difficulty;
-      if (validatedInput.isBenchmark !== undefined) updates.isBenchmark = validatedInput.isBenchmark;
-      if (validatedInput.comment !== undefined) updates.comment = validatedInput.comment;
-      if (canonicalClimbedAt !== undefined) updates.climbedAt = canonicalClimbedAt;
-      if (validatedInput.angle !== undefined) updates.angle = validatedInput.angle;
-
-      const finalStatus = validatedInput.status ?? targetTick.status;
-      const finalAttemptCount = validatedInput.attemptCount ?? targetTick.attemptCount;
-      if (finalStatus === 'flash') {
-        if (finalAttemptCount !== 1) {
-          logger.warn('[updateTick] Coerced flash tick attemptCount to 1', {
-            tickUuid: uuid,
-            userId,
-            previousAttemptCount: finalAttemptCount,
+        if (!isBoardAngleSupported(targetTick.boardType, validatedInput.angle)) {
+          throw new GraphQLError(BOARD_ANGLE_VALIDATION_MESSAGE, {
+            extensions: { code: 'BAD_USER_INPUT' },
           });
         }
-        // A locally edited survivor can directly hide rows whose editable
-        // payload differs. Reassert the flash invariant across every member.
-        updates.attemptCount = 1;
-      }
 
-      const updatedTicks = await tx
-        .update(dbSchema.boardseshTicks)
-        .set(updates)
-        .where(inArray(dbSchema.boardseshTicks.uuid, affectedUuids))
-        .returning();
-      const updatedTarget = updatedTicks.find((tick) => tick.uuid === uuid)!;
+        const updates: Partial<typeof dbSchema.boardseshTicks.$inferInsert> = {
+          updatedAt: new Date().toISOString(),
+        };
+        if (validatedInput.boardUuid !== undefined) {
+          updates.boardId = selectedBoard?.id ?? null;
+          if (targetTick.origin === 'native') {
+            const physicalBoard = selectedBoard && !isSharedConfigFeedBoard(selectedBoard) ? selectedBoard : null;
+            updates.reportingAttribution = physicalBoard ? 'edit' : null;
+            updates.reportingBoardId = physicalBoard?.id ?? null;
+            updates.reportingGymId = physicalBoard?.gymId ?? null;
+          }
+        }
+        if (validatedInput.status !== undefined) updates.status = validatedInput.status;
+        if (validatedInput.attemptCount !== undefined) updates.attemptCount = validatedInput.attemptCount;
+        if (validatedInput.quality !== undefined) updates.quality = validatedInput.quality;
+        if (validatedInput.difficulty !== undefined) updates.difficulty = validatedInput.difficulty;
+        if (validatedInput.isBenchmark !== undefined) updates.isBenchmark = validatedInput.isBenchmark;
+        if (validatedInput.comment !== undefined) updates.comment = validatedInput.comment;
+        if (canonicalClimbedAt !== undefined) {
+          updates.climbedAt = canonicalClimbedAt;
+          if (targetTick.origin === 'native' && reportingTime) {
+            Object.assign(updates, reportingTime, {
+              reportingClimbedAt: reportingTime.reportingTimePrecision ? canonicalClimbedAt : null,
+            });
+          }
+        }
+        if (validatedInput.angle !== undefined) updates.angle = validatedInput.angle;
 
-      // Keep linked beta videos at the angle of the edited ascent.
-      let movedBetaLinks = false;
-      if (existingTicks.some((tick) => tick.angle !== updatedTarget.angle)) {
-        const moved = await tx
-          .update(dbSchema.boardBetaLinks)
-          .set({ angle: updatedTarget.angle })
-          .where(inArray(dbSchema.boardBetaLinks.tickUuid, affectedUuids))
-          .returning({ link: dbSchema.boardBetaLinks.link });
-        movedBetaLinks = moved.length > 0;
-      }
+        const finalStatus = validatedInput.status ?? targetTick.status;
+        const finalAttemptCount = validatedInput.attemptCount ?? targetTick.attemptCount;
+        if (finalStatus === 'flash') {
+          if (finalAttemptCount !== 1) {
+            logger.warn('[updateTick] Coerced flash tick attemptCount to 1', {
+              tickUuid: uuid,
+              userId,
+              previousAttemptCount: finalAttemptCount,
+            });
+          }
+          // A locally edited survivor can directly hide rows whose editable
+          // payload differs. Reassert the flash invariant across every member.
+          updates.attemptCount = 1;
+        }
 
-      const sessionIds = distinctTickSessions(existingTicks);
-      if (sessionIds.length > 0) {
-        await tx.update(sessions).set({ lastActivity: new Date() }).where(inArray(sessions.id, sessionIds));
-      }
+        const updatedTicks = await tx
+          .update(dbSchema.boardseshTicks)
+          .set(updates)
+          .where(inArray(dbSchema.boardseshTicks.uuid, affectedUuids))
+          .returning();
+        const updatedTarget = updatedTicks.find((tick) => tick.uuid === uuid)!;
+        if (validatedInput.privacy) {
+          for (const affectedUuid of affectedUuids) {
+            await setContentPrivacy(
+              tx,
+              userId,
+              'tick',
+              affectedUuid,
+              validatedInput.privacy.audience,
+              validatedInput.privacy.privacyRevision,
+            );
+          }
+        }
 
-      // An edit can move climbed_at, which moves the tick between runs — so both the
-      // window it left and the one it joined need redrawing. Reconciling the old
-      // timestamp first leaves the tick's new home authoritative.
-      for (const climbedAt of new Set([
-        ...existingTicks.map((tick) => tick.climbedAt),
-        ...updatedTicks.map((tick) => tick.climbedAt),
-      ])) {
-        await reconcileInferredSessions(tx, userId, parseClimbedAt(climbedAt));
-      }
+        // Keep linked beta videos at the angle of the edited ascent.
+        let movedBetaLinks = false;
+        if (
+          existingTicks.some((tick) => tick.angle !== updatedTarget.angle) ||
+          validatedInput.boardUuid !== undefined
+        ) {
+          const moved = await tx
+            .update(dbSchema.boardBetaLinks)
+            .set({
+              angle: updatedTarget.angle,
+              ...(validatedInput.boardUuid !== undefined ? { boardId: updatedTarget.boardId } : {}),
+            })
+            .where(inArray(dbSchema.boardBetaLinks.tickUuid, affectedUuids))
+            .returning({ link: dbSchema.boardBetaLinks.link });
+          movedBetaLinks = moved.length > 0;
+        }
 
-      return { existingTicks, updatedTicks, updatedTarget, movedBetaLinks };
-    });
+        if (validatedInput.boardUuid !== undefined) {
+          await tx
+            .update(dbSchema.feedItems)
+            .set({
+              boardUuid: selectedBoard?.uuid ?? null,
+              metadata: sql`CASE WHEN ${dbSchema.feedItems.metadata} ? 'boardUuid'
+            THEN jsonb_set(${dbSchema.feedItems.metadata}, '{boardUuid}', ${JSON.stringify(selectedBoard?.uuid ?? null)}::jsonb)
+            ELSE ${dbSchema.feedItems.metadata} END`,
+            })
+            .where(and(eq(dbSchema.feedItems.entityType, 'tick'), inArray(dbSchema.feedItems.entityId, affectedUuids)));
+        }
+
+        const sessionIds = distinctTickSessions(existingTicks);
+        if (sessionIds.length > 0) {
+          await tx.update(sessions).set({ lastActivity: new Date() }).where(inArray(sessions.id, sessionIds));
+        }
+
+        // An edit can move climbed_at, which moves the tick between runs — so both the
+        // window it left and the one it joined need redrawing. Reconciling the old
+        // timestamp first leaves the tick's new home authoritative.
+        for (const climbedAt of new Set([
+          ...existingTicks.map((tick) => tick.climbedAt),
+          ...updatedTicks.map((tick) => tick.climbedAt),
+        ])) {
+          await reconcileInferredSessions(tx, userId, parseClimbedAt(climbedAt));
+        }
+
+        // Numeric historical attribution is not proof of a held board link.
+        // Only an explicit UUID verified for this edit as its board's link can
+        // use link access; ordinary edits keep the current owner/grant/follower
+        // policy reading.
+        const [attributedBoard] =
+          updatedTarget.boardId == null
+            ? []
+            : await tx
+                .select({ name: dbSchema.userBoards.name })
+                .from(dbSchema.userBoards)
+                .where(
+                  and(
+                    eq(dbSchema.userBoards.id, updatedTarget.boardId),
+                    resourceAccessCondition('board', dbSchema.userBoards.uuid, userId, {
+                      allowUnlistedLink: selectedByLink && selectedBoard?.id === updatedTarget.boardId,
+                    }),
+                    listableSprayWallCondition(userId),
+                  ),
+                )
+                .limit(1);
+        return {
+          existingTicks,
+          updatedTicks,
+          updatedTarget,
+          movedBetaLinks,
+          boardDisplayName: attributedBoard?.name ?? null,
+        };
+      }),
+    );
 
     // Both the key the tick left and the key it joined, so an angle edit doesn't
     // strand a stale bucket. Inline first for the same reason as saveTick: the
@@ -1427,7 +2033,10 @@ export const tickMutations = {
         logger.error('[updateTick] recent-beta-links cache invalidation failed:', err);
       });
     }
-    for (const { boardId, boardType } of distinctTickBoards(mutationResult.updatedTicks)) {
+    for (const { boardId, boardType } of distinctTickBoards([
+      ...mutationResult.existingTicks,
+      ...mutationResult.updatedTicks,
+    ])) {
       queueBoardStatsPublish(boardId, boardType);
     }
     for (const sessionId of distinctTickSessions(mutationResult.existingTicks)) {
@@ -1443,9 +2052,13 @@ export const tickMutations = {
 
     return {
       uuid: updated.uuid,
+      boardId: updated.boardId,
+      boardDisplayName: mutationResult.boardDisplayName,
       userId: updated.userId,
       boardType: updated.boardType,
       climbUuid: updated.climbUuid,
+      // Read back, never written: `updates` above has no entry for it.
+      climbRevision: updated.climbRevision,
       angle: updated.angle,
       isMirror: updated.isMirror,
       status: updated.status,
@@ -1509,24 +2122,7 @@ async function publishAscentEvent(
       //
       // Silently skipped rather than failed: the tick itself is saved and correct,
       // and there is nothing for the climber to do about the feed.
-      if (tick.boardType === 'spray' && climbData?.layoutId != null) {
-        const [wallVisibility] = await db
-          .select({ isPublic: dbSchema.userBoards.isPublic, hiddenAt: dbSchema.sprayWalls.hiddenAt })
-          .from(dbSchema.sprayWalls)
-          .innerJoin(dbSchema.userBoards, eq(dbSchema.userBoards.uuid, dbSchema.sprayWalls.boardUuid))
-          .where(
-            and(
-              eq(dbSchema.sprayWalls.layoutId, climbData.layoutId),
-              isNull(dbSchema.sprayWalls.deletedAt),
-              isNull(dbSchema.userBoards.deletedAt),
-            ),
-          )
-          .limit(1);
-        // A wall an admin hid (SW-17) is private for this purpose too. Hiding
-        // purges the feed rows that already exist; without this, the next tick
-        // would put the wall straight back into the feed it was taken out of.
-        if (!wallVisibility?.isPublic || wallVisibility.hiddenAt != null) return;
-      }
+      if (tick.boardType === 'spray' && !(await sprayWallMayAnnounceByLayout(climbData?.layoutId))) return;
 
       const [userProfile] = await db
         .select({

@@ -98,14 +98,14 @@ export const LiveActionPill = memo(function LiveActionPill({ label, colors, tone
         style,
       ]}
     >
-      <LiveActionLabel color={filled ? colors.onPrimary : colors.primary}>{label}</LiveActionLabel>
+      <LiveActionLabel color={filled ? colors.onPrimary : colors.tintInk}>{label}</LiveActionLabel>
     </View>
   );
 });
 
 export function LiveActionLabel({ color, children }: { color: string; children: ReactNode }) {
   return (
-    <Text variant="subheadline" color={color} numberOfLines={1} style={styles.semibold}>
+    <Text emphasized variant="subheadline" color={color} numberOfLines={1}>
       {children}
     </Text>
   );
@@ -113,7 +113,6 @@ export function LiveActionLabel({ color, children }: { color: string; children: 
 
 const styles = StyleSheet.create({
   bold: { fontWeight: '700' },
-  semibold: { fontWeight: '600' },
   staticDot: { flexShrink: 0 },
   gradeChip: {
     paddingHorizontal: 6,
@@ -126,8 +125,8 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: 5,
-    paddingLeft: 7,
-    paddingRight: spacing[2],
+    paddingStart: 7,
+    paddingEnd: spacing[2],
     paddingVertical: 2,
     borderRadius: borderRadius.full,
   },

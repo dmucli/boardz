@@ -31,6 +31,22 @@ const makeItem = (uuid: string, opts?: Partial<ClimbQueueItem>): ClimbQueueItem 
 });
 
 describe('mapQueueEventToAction', () => {
+  it.each(['FullSync', 'CurrentClimbChanged'] as const)('keeps server attribution through %s mapping', (eventType) => {
+    const current = makeItem('a', { addedByUser: { id: 'author', username: 'Alice' } });
+    for (const currentChangedBy of ['participant-bob', undefined]) {
+      const result = mapQueueEventToAction(
+        eventType === 'FullSync'
+          ? { __typename: eventType, state: { queue: [current], currentClimbQueueItem: current, currentChangedBy } }
+          : { __typename: eventType, currentItem: current, currentChangedBy },
+      );
+      expect(result.kind).toBe('dispatch');
+      if (result.kind !== 'dispatch') throw new Error('Expected a dispatch');
+      const reduced = queueReducer(initialState({}), result.action);
+      expect(reduced.currentChangedBy).toBe(currentChangedBy ?? null);
+      expect(reduced.currentClimbQueueItem?.addedByUser?.id).toBe('author');
+    }
+  });
+
   it('maps FullSync to INITIAL_QUEUE_DATA', () => {
     const queue = [makeItem('a'), makeItem('b')];
     const event: SyncQueueEvent = {
@@ -343,5 +359,44 @@ describe('standalone id generators', () => {
 
   it('generateCorrelationId returns a non-empty string', () => {
     expect(generateCorrelationId()).toMatch(/.+/);
+  });
+});
+
+describe('FullSync historyCount (F3)', () => {
+  it('passes the line through to INITIAL_QUEUE_DATA', () => {
+    const result = mapQueueEventToAction({
+      __typename: 'FullSync',
+      state: { queue: [], currentClimbQueueItem: null, historyCount: 3 },
+    });
+    expect(result.kind === 'dispatch' && result.action.type === 'INITIAL_QUEUE_DATA' && result.action.payload).toEqual({
+      queue: [],
+      currentClimbQueueItem: null,
+      historyCount: 3,
+      currentChangedAt: null,
+      currentChangedBy: null,
+    });
+  });
+
+  it("passes the room's currentChangedAt through for the #4979 hold clock", () => {
+    const result = mapQueueEventToAction({
+      __typename: 'FullSync',
+      state: { queue: [], currentClimbQueueItem: null, historyCount: 0, currentChangedAt: '2026-10-20T08:00:00.000Z' },
+    });
+    expect(
+      result.kind === 'dispatch' &&
+        result.action.type === 'INITIAL_QUEUE_DATA' &&
+        result.action.payload.currentChangedAt,
+    ).toBe('2026-10-20T08:00:00.000Z');
+  });
+
+  it('reads a legacy FullSync without the field as null', () => {
+    const result = mapQueueEventToAction({ __typename: 'FullSync', state: { queue: [], currentClimbQueueItem: null } });
+    expect(result.kind === 'dispatch' && result.action.type === 'INITIAL_QUEUE_DATA' && result.action.payload).toEqual({
+      queue: [],
+      currentClimbQueueItem: null,
+      historyCount: null,
+      currentChangedAt: null,
+      currentChangedBy: null,
+    });
   });
 });

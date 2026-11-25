@@ -6,13 +6,16 @@
 // gate and lost the climb they came for; the allow-set below is the exact set of
 // URL shapes the gate stands aside for. Everything here is pure — no React, no
 // `window`, no platform — so the shape rules and the open-redirect rules are
-// unit-testable on their own, and the native bundle leaves the whole file out
-// (only `anonymous-auth-gate.web.ts` imports it).
+// unit-testable on their own. The auth gate reads it on web only
+// (`anonymous-auth-gate.web.ts`); native reads the shape rules for one thing,
+// deciding which signed-out deep links to keep through sign-in
+// (`board-deep-link.ts`), and relaxes nothing with them.
 //
 // Matching is deliberately SHAPE-only: it never resolves a slug or a board
 // config against the catalogue. A well-formed URL whose board no longer exists
 // should reach that route's own not-found, not a login wall.
 
+import { hasControlCharacter, isSameOriginPath } from './same-origin-path';
 import { stripLocalePrefix } from './strip-locale-prefix';
 
 /**
@@ -31,23 +34,6 @@ const ANGLE = /^-?\d+$/;
 
 /** The two climb surfaces both URL trees share. */
 const CLIMB_SURFACES = new Set(['view', 'play']);
-
-/** Anything with a URI scheme in front of it (`https:`, `javascript:`, `JaVaScRiPt:`). */
-const SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
-
-/**
- * Control characters, space and DEL — checked by code point rather than a regex
- * literal so the source carries no invisible characters. A leading tab or
- * newline otherwise sneaks past the leading-slash rule, because the browser
- * trims it back off before navigating.
- */
-function hasControlOrSpace(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const codePoint = value.charCodeAt(index);
-    if (codePoint <= 0x20 || codePoint === 0x7f) return true;
-  }
-  return false;
-}
 
 /** The path with its query/hash tail and locale prefix removed, split into segments. */
 function pathSegments(path: string): string[] {
@@ -101,16 +87,17 @@ export function isReadOnlyAnonymousPath(path: string): boolean {
  * Is `value` an app-relative path we can hand to the router?
  *
  * This is the open-redirect contract: anything that is not unambiguously a
- * same-origin path is refused. Backslashes go too — browsers normalise `\` to
- * `/`, so `/\evil.example` is protocol-relative in practice.
+ * same-origin path is refused, at every depth of percent-decoding the router can
+ * apply on the way (see `isSameOriginPath`). Backslashes go too — browsers
+ * normalise `\` to `/`, so `/\evil.example` is protocol-relative in practice.
+ *
+ * Stricter than `isSameOriginPath` on the whole value, query included: a return
+ * path is a board URL we minted, so a space, control character or backslash
+ * anywhere in it means it is not one of ours.
  */
 export function isSafeReturnPath(value: string | null | undefined): value is string {
   if (!value) return false;
   if (value.length > MAX_RETURN_HREF_LENGTH) return false;
-  if (hasControlOrSpace(value)) return false;
-  if (SCHEME.test(value)) return false;
-  if (!value.startsWith('/')) return false;
-  if (value.startsWith('//')) return false;
-  if (value.includes('\\')) return false;
-  return true;
+  if (value.includes(' ') || value.includes('\\') || hasControlCharacter(value)) return false;
+  return isSameOriginPath(value);
 }

@@ -1,5 +1,6 @@
 'use client';
 
+import ConsentSettingsCard from '@/app/components/consent/consent-settings-card';
 import React, { useState, useEffect, useCallback } from 'react';
 import Box from '@mui/material/Box';
 import MuiDivider from '@mui/material/Divider';
@@ -16,9 +17,14 @@ import { useTranslation } from 'react-i18next';
 import Logo from '@/app/components/brand/logo';
 import ControllersSection from '@/app/components/account/controllers-section';
 import SetPasswordSection from '@/app/components/account/set-password-section';
+import SignInMethodsSection from '@/app/components/account/sign-in-methods-section';
+import ConnectedAppsSection from '@/app/components/account/connected-apps-section';
 import BackButton from '@/app/components/back-button';
 import { useSnackbar } from '@/app/components/providers/snackbar-provider';
 import { buildAppHandoffUrl } from '@/app/lib/app-handoff';
+import { guardedActionFetch, isReloadRequired, isSessionSuperseded } from '@/app/lib/auth/session-guard';
+import ReloadPageAlert from '@/app/components/account/reload-page-alert';
+import LocaleLink from '@/app/components/i18n/locale-link';
 
 /**
  * Web settings keeps only what the app can't do: register an ESP32 controller
@@ -36,18 +42,28 @@ import { buildAppHandoffUrl } from '@/app/lib/app-handoff';
 const APP_SETTINGS_URL = buildAppHandoffUrl('/settings');
 
 type UserProfile = {
+  id: string;
   email: string;
   hasPassword: boolean;
   linkedProviders: string[];
 };
 
-export default function SettingsPageContent() {
-  const { data: session, status } = useSession();
+type SettingsPageContentProps = {
+  /**
+   * Under `AUTH_BROWSER_SESSION_MODE=better-auth` (#7596 B5e2) the sign-in
+   * methods card replaces the set-password card. Off, the page is as before.
+   */
+  signInMethods?: boolean;
+};
+
+export default function SettingsPageContent({ signInMethods = false }: SettingsPageContentProps = {}) {
+  const { data: session, status, update } = useSession();
   const router = useLocaleRouter();
   const { t, i18n } = useTranslation('settings');
   const activeLocale: Locale = isSupportedLocale(i18n.language) ? i18n.language : DEFAULT_LOCALE;
   const [loading, setLoading] = useState(true);
   const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [reloadRequired, setReloadRequired] = useState(false);
   const { showMessage } = useSnackbar();
 
   // Redirect unauthenticated users to login with a return URL
@@ -60,19 +76,29 @@ export default function SettingsPageContent() {
 
   const fetchProfile = useCallback(async () => {
     try {
-      const response = await fetch('/api/internal/profile');
+      const response = await guardedActionFetch('/api/internal/profile');
       if (!response.ok) {
         throw new Error('Failed to fetch profile');
       }
       const data = await response.json();
       setProfile(data);
     } catch (error) {
+      if (isSessionSuperseded(error)) return;
+      if (isReloadRequired(error)) {
+        setReloadRequired(true);
+        return;
+      }
       console.error('Failed to fetch profile:', error);
       showMessage(t('loading.profileError'), 'error');
     } finally {
       setLoading(false);
     }
   }, [showMessage, t]);
+
+  const refreshAccount = useCallback(async () => {
+    await update();
+    await fetchProfile();
+  }, [update, fetchProfile]);
 
   // Fetch profile on mount
   useEffect(() => {
@@ -149,12 +175,32 @@ export default function SettingsPageContent() {
           width: '100%',
         }}
       >
-        <SetPasswordSection
-          hasPassword={profile?.hasPassword ?? false}
-          userEmail={profile?.email || session?.user?.email || ''}
-          linkedProviders={profile?.linkedProviders ?? []}
-          onPasswordSet={fetchProfile}
-        />
+        {reloadRequired && <ReloadPageAlert />}
+        <Button component={LocaleLink} href="/auth/signout" variant="outlined" fullWidth sx={{ mb: 2 }}>
+          {t('signOut')}
+        </Button>
+        <ConsentSettingsCard />
+        <MuiDivider sx={{ my: 2 }} />
+        <Box id="password">
+          {signInMethods ? (
+            <SignInMethodsSection />
+          ) : (
+            <SetPasswordSection
+              hasPassword={profile?.hasPassword ?? false}
+              userEmail={profile?.email || session?.user?.email || ''}
+              linkedProviders={profile?.linkedProviders ?? []}
+              expectedSession={{
+                userId: profile?.id ?? session?.user?.id ?? '',
+                authSessionId: session?.authSessionId ?? '',
+              }}
+              onAccountChanged={refreshAccount}
+              onPasswordSet={fetchProfile}
+            />
+          )}
+        </Box>
+
+        {/* Draws its own divider, and nothing at all while it has nothing to show. */}
+        <ConnectedAppsSection />
 
         <MuiDivider sx={{ my: 2 }} />
 

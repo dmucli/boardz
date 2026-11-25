@@ -1,3 +1,4 @@
+import { useProfilePrivacy } from '../../../src/lib/graphql/hooks/use-privacy';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { useLocalSearchParams, useNavigation } from 'expo-router';
@@ -10,6 +11,8 @@ import { SegmentedControl } from '../../../src/components/SegmentedControl';
 import { OfflineState } from '../../../src/components/OfflineState';
 import { useOfflineQueryState } from '../../../src/hooks/use-offline-query-state';
 import { PublicProfileHeaderBlock } from '../../../src/components/you/PublicProfileHeaderBlock';
+import { ShareIconButton } from '../../../src/components/ShareIconButton';
+import { useProfileShareOptions } from '../../../src/hooks/use-profile-share-options';
 import { ProgressTab } from '../../../src/components/you/ProgressTab';
 import { SessionsTab } from '../../../src/components/you/SessionsTab';
 import { LogbookTab } from '../../../src/components/you/LogbookTab';
@@ -23,24 +26,32 @@ type ProfileSection = 'progress' | 'sessions' | 'logbook' | 'climbs';
 export default function PublicProfileScreen() {
   const { userId } = useLocalSearchParams<{ userId: string }>();
   const { t } = useTranslation('you');
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors } = useTheme();
   const navigation = useNavigation();
 
   const { data: currentProfile } = useProfile();
   const currentUserId = currentProfile?.id;
   const isSelf = !!currentUserId && currentUserId === userId;
 
+  const { t: tSettings } = useTranslation('settings');
   const publicProfile = usePublicProfile(userId);
+  const profilePrivacy = useProfilePrivacy(userId);
   const youData = useYouProfileData(userId);
 
   const [activeSection, setActiveSection] = useState<ProfileSection>('progress');
 
-  const profile = publicProfile.data;
+  const profile = publicProfile.data ? { ...publicProfile.data, ...profilePrivacy.data } : publicProfile.data;
   const displayName = profile?.displayName || t('mobile.unknownName');
+  const profileShare = useProfileShareOptions({
+    userId: !publicProfile.isPending && !publicProfile.isError ? profile?.id : undefined,
+    displayName: profile?.displayName,
+    isPrivate: profile?.isPrivate,
+  });
 
   // Drive the native stack header (back chevron + title). Set once the name
   // resolves so a long display name folds into the compact bar on iOS.
   useEffect(() => {
+    const shareUrl = profileShare.url;
     navigation.setOptions({
       headerShown: true,
       // Opaque (not the app's translucent push header) so the in-body avatar/name
@@ -48,8 +59,11 @@ export default function PublicProfileScreen() {
       headerTransparent: false,
       headerBlurEffect: undefined,
       title: profile ? displayName : t('mobile.profile.title'),
+      headerRight: shareUrl
+        ? () => <ShareIconButton {...profileShare} url={shareUrl} appearance="nativeHeader" />
+        : undefined,
     });
-  }, [navigation, profile, displayName, t]);
+  }, [navigation, profile, displayName, t, profileShare]);
 
   // instagramUrl rides the publicProfile query once PR #2902 (backend) merges to
   // main; until then it resolves to null and the chip stays hidden. The cast is a
@@ -128,6 +142,15 @@ export default function PublicProfileScreen() {
     );
   }
 
+  if (profile.canViewActivity === false) {
+    return (
+      <View style={[styles.flex, { backgroundColor: systemColors.groupedBackground }]}>
+        <PublicProfileHeaderBlock profile={profile} instagramUrl={null} currentUserId={currentUserId} />
+        <Text style={styles.stateBody}>{tSettings('privacy.privateProfile')}</Text>
+      </View>
+    );
+  }
+
   return (
     <View style={[styles.flex, { backgroundColor: systemColors.groupedBackground }]}>
       <PublicProfileHeaderBlock profile={profile} instagramUrl={instagramUrl} currentUserId={currentUserId} />
@@ -147,7 +170,12 @@ export default function PublicProfileScreen() {
           <ProgressTab data={youData} topInset={0} userId={userId} isOwnProfile={isSelf} />
         ) : null}
         {activeSection === 'sessions' ? <SessionsTab userId={userId} topInset={0} /> : null}
-        {activeSection === 'logbook' ? <LogbookTab userId={userId} topInset={0} viewerIsOwner={isSelf} /> : null}
+        {/* Keyed on ownership: `isSelf` turns true only once your own profile
+            loads, and the Logbook saves its filters only on your own logbook,
+            so the flip remounts it rather than switching persistence mid-life. */}
+        {activeSection === 'logbook' ? (
+          <LogbookTab key={isSelf ? 'own' : 'other'} userId={userId} topInset={0} viewerIsOwner={isSelf} />
+        ) : null}
         {activeSection === 'climbs' ? <ProfileClimbsTab userId={userId} topInset={0} /> : null}
       </View>
     </View>

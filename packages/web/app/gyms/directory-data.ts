@@ -77,6 +77,7 @@ export function toSearchGymsInput(query: DirectoryQuery, offset: number, limit: 
       : {}),
     ...(query.radiusKm !== null ? { radiusKm: query.radiusKm } : {}),
     requireSlug: true,
+    requireLocation: true,
     limit,
     offset,
   };
@@ -125,12 +126,13 @@ export async function fetchDirectoryPage(
 export type FacetCounts = Record<DirectoryFacet, number>;
 export type FacetCountsResult = { ok: true; counts: FacetCounts } | { ok: false };
 
-async function fetchFacetTotal(boardTypes: string[]): Promise<number | null> {
+export async function fetchFacetTotal(boardTypes: string[]): Promise<number | null> {
   try {
     const response = await runFacetCountQuery({
       input: {
         ...(boardTypes.length > 0 ? { boardTypes } : {}),
         requireSlug: true,
+        requireLocation: true,
         // `totalCount` is what we're after; one row is the cheapest page the
         // connection will hand back. It is still a full enriched row that gets
         // thrown away — see the note on `fetchFacetCounts`.

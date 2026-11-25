@@ -2,7 +2,16 @@ import { describe, it, expect, vi } from 'vite-plus/test';
 import { render, screen } from '@testing-library/react';
 import React from 'react';
 import type { SessionFeedItem } from '@boardsesh/shared-schema';
+import { tFromCatalog } from '@/app/__test-helpers__/i18n-mock';
 import SessionFeedCard from '../session-feed-card';
+
+vi.mock('react-i18next', () => ({
+  useTranslation: (ns?: string) => ({
+    t: (key: string, options?: Record<string, unknown>) => tFromCatalog(ns, key, options),
+    i18n: { language: 'en-US' },
+  }),
+  Trans: ({ children }: { children?: React.ReactNode }) => children ?? null,
+}));
 
 // Mock dependencies
 vi.mock('next/link', () => ({
@@ -62,15 +71,20 @@ vi.mock('@/app/lib/grade-colors', () => ({
   getGradeTextColor: () => '#FFFFFF',
 }));
 
-vi.mock('@/app/hooks/use-grade-format', () => ({
-  useGradeFormat: () => ({
-    gradeFormat: 'v-grade',
-    formatGrade: (g: string | null | undefined) => g ?? null,
-    getGradeColor: vi.fn(),
-    loaded: true,
-    setGradeFormat: vi.fn(),
-  }),
-}));
+// The real formatter, so a test sees which board's scale a label is read on.
+vi.mock('@/app/hooks/use-grade-format', async () => {
+  const { formatGrade } = await import('@boardsesh/play-view');
+  return {
+    useGradeFormat: () => ({
+      gradeFormat: 'v-grade',
+      formatGrade: (difficulty: string | null | undefined, boardName?: string | null) =>
+        formatGrade(difficulty, 'v-grade', boardName),
+      getGradeColor: vi.fn(),
+      loaded: true,
+      setGradeFormat: vi.fn(),
+    }),
+  };
+});
 
 function makeSession(overrides: Partial<SessionFeedItem> = {}): SessionFeedItem {
   return {
@@ -249,5 +263,44 @@ describe('SessionFeedCard', () => {
     // 2024-01-15 is a Monday
     render(<SessionFeedCard session={makeSession({ sessionName: null, boardTypes: ['kilter'] })} />);
     expect(screen.getByText('Monday Kilter Session')).toBeTruthy();
+  });
+
+  it('shows the workout line when the session followed a workout', () => {
+    const headline = {
+      sessionId: 'session-1',
+      userId: 'user-1',
+      mainKind: 'fourByFour',
+      mainTargetGrade: '6b/V4',
+      mainTargetBoardType: 'kilter',
+      secondMainKind: null,
+      blockCount: 3,
+      extraMainBlocks: 0,
+    };
+    const { rerender } = render(<SessionFeedCard session={makeSession()} workoutHeadline={headline} />);
+    expect(screen.getByTestId('session-feed-workout').textContent).toBe('Workout · 4x4 at V4 · 3 blocks');
+
+    rerender(<SessionFeedCard session={makeSession()} />);
+    expect(screen.queryByTestId('session-feed-workout')).toBeNull();
+  });
+
+  it('reads the workout’s grade on its board’s scale, as the session page does', () => {
+    // MoonBoard's V3 holds only 6A+, so "6a+/V3" reads V3 there and V3+ elsewhere.
+    const headline = {
+      sessionId: 'session-1',
+      userId: 'user-1',
+      mainKind: 'pyramid',
+      mainTargetGrade: '6a+/V3',
+      mainTargetBoardType: 'moonboard',
+      secondMainKind: null,
+      blockCount: 1,
+      extraMainBlocks: 0,
+    };
+    const { rerender } = render(<SessionFeedCard session={makeSession()} workoutHeadline={headline} />);
+    expect(screen.getByTestId('session-feed-workout').textContent).toBe('Workout · Pyramid at V3');
+
+    rerender(
+      <SessionFeedCard session={makeSession()} workoutHeadline={{ ...headline, mainTargetBoardType: 'kilter' }} />,
+    );
+    expect(screen.getByTestId('session-feed-workout').textContent).toBe('Workout · Pyramid at V3+');
   });
 });

@@ -4,11 +4,11 @@ import { absoluteUrl } from '@/app/lib/seo/base-url';
 import { JsonLd } from '@/app/lib/seo/json-ld';
 import { resolveClimbDisplayName } from '@/app/lib/string-utils';
 import { buildCanonicalClimbViewUrl } from '@/app/lib/url-utils';
-import type { BoardDetails, Climb } from '@/app/lib/types';
+import type { BoardRouteIdentity, Climb } from '@/app/lib/types';
 
 type ClimbListJsonLdProps = {
   climbs: readonly Climb[];
-  boardDetails: BoardDetails;
+  boardDetails: BoardRouteIdentity;
   /** 1-based `?page=N`, already clamped by `parseFrontDoorPage`. */
   page: number;
 };
@@ -21,9 +21,8 @@ type ClimbListJsonLdProps = {
  *  - **`position` is global, not page-local.** Page 2 starts at 51. A list whose
  *    every page starts at 1 tells Google it is looking at the same list over and
  *    over.
- *  - **Every `url` is the string `static-climb-row` renders for the same climb**
- *    — same builder, same `resolveClimbDisplayName` fallback, and locale-FREE the
- *    same way the page's own canonical is. `/list` goes through
+ *  - **Every `url` uses the climb's canonical board configuration** with the
+ *    same `resolveClimbDisplayName` fallback as the rows. `/list` goes through
  *    `createBoardContentPageMetadata`, which pins the canonical to the
  *    default-locale URL and ships no `alternates.languages`, so a `/fr` render
  *    naming `/fr` URLs here would advertise addresses that canonical disowns.
@@ -53,6 +52,7 @@ export default function ClimbListJsonLd({ climbs, boardDetails, page }: ClimbLis
               climb.angle,
               climb.uuid,
               resolveClimbDisplayName(climb.name, boardDetails.board_name),
+              climb,
             ),
           ),
         })),

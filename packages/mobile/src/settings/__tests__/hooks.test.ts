@@ -20,7 +20,7 @@ vi.mock('react-native-mmkv', () => {
   return { createMMKV: vi.fn(() => createMockInstance()) };
 });
 
-import { getSetting, setSetting, getAllSettings, resetAllSettings, subscribeSettings } from '../hooks';
+import { getSetting, hasSetting, setSetting, getAllSettings, resetAllSettings, subscribeSettings } from '../hooks';
 import { DEFAULT_SETTINGS } from '../defaults';
 
 describe('settings', () => {
@@ -31,11 +31,19 @@ describe('settings', () => {
     resetAllSettings();
   });
 
+  it('distinguishes an absent key from an explicit null or malformed stored record', () => {
+    expect(hasSetting('playerButtonsV3')).toBe(false);
+    setSetting('playerButtonsV3', null);
+    expect(hasSetting('playerButtonsV3')).toBe(true);
+    mockStorage.set('playerButtonsV3', 'broken');
+    expect(hasSetting('playerButtonsV3')).toBe(true);
+  });
+
   describe('getSetting', () => {
     it('returns default when no value is stored', () => {
       expect(getSetting('autoConnectBle')).toBe(true);
-      expect(getSetting('autoDisconnectBle')).toBe(false);
-      expect(getSetting('autoDisconnectTimeoutSeconds')).toBe(30);
+      expect(getSetting('alwaysDrive')).toBe(false);
+      expect(getSetting('disconnectWhenDrivingEnds')).toBe(false);
       expect(getSetting('theme')).toBe('system');
       expect(getSetting('qaPromptOnLaunch')).toBe(false);
       expect(getSetting('defaultBoardUuid')).toBeNull();
@@ -45,6 +53,11 @@ describe('settings', () => {
     it('returns stored value parsed from JSON', () => {
       mockStorage.set('autoConnectBle', 'false');
       expect(getSetting('autoConnectBle')).toBe(false);
+    });
+
+    it('preserves a saved Always drive the wall opt-in', () => {
+      mockStorage.set('alwaysDrive', 'true');
+      expect(getSetting('alwaysDrive')).toBe(true);
     });
 
     it('returns stored string value parsed from JSON', () => {
@@ -109,7 +122,7 @@ describe('settings', () => {
 
       expect(settings.theme).toBe('dark');
       expect(settings.autoConnectBle).toBe(false);
-      expect(settings.keepScreenAwake).toBe(DEFAULT_SETTINGS.keepScreenAwake);
+      expect(settings.restTimerSound).toBe(DEFAULT_SETTINGS.restTimerSound);
       expect(settings.hapticFeedbackEnabled).toBe(DEFAULT_SETTINGS.hapticFeedbackEnabled);
       expect(settings.notifySessionInvites).toBe(DEFAULT_SETTINGS.notifySessionInvites);
       expect(settings.notifyClimbComments).toBe(DEFAULT_SETTINGS.notifyClimbComments);
@@ -153,7 +166,7 @@ describe('settings', () => {
     it('deletes all settings keys from storage', () => {
       mockStorage.set('theme', '"dark"');
       mockStorage.set('autoConnectBle', 'false');
-      mockStorage.set('keepScreenAwake', 'false');
+      mockStorage.set('restTimerCountdownCues', 'false');
 
       resetAllSettings();
 
@@ -194,8 +207,8 @@ describe('settings', () => {
 
   describe('setSetting then getSetting roundtrip', () => {
     it('roundtrips a boolean', () => {
-      setSetting('keepScreenAwake', false);
-      expect(getSetting('keepScreenAwake')).toBe(false);
+      setSetting('restTimerCountdownCues', false);
+      expect(getSetting('restTimerCountdownCues')).toBe(false);
     });
 
     it('roundtrips a string', () => {
@@ -242,6 +255,7 @@ describe('settings', () => {
 
       expect(listener).toHaveBeenCalledTimes(1);
       expect(getSetting('offlineMode')).toBe(true);
+      expect(listener).toHaveBeenCalledWith({ kind: 'setting', key: 'offlineMode' });
     });
 
     it('notifies after a reset-all, which is a change to every key at once', () => {
@@ -253,6 +267,7 @@ describe('settings', () => {
 
       expect(listener).toHaveBeenCalledTimes(1);
       expect(getSetting('offlineMode')).toBe(false);
+      expect(listener).toHaveBeenCalledWith({ kind: 'reset' });
     });
 
     it('stops on unsubscribe', () => {

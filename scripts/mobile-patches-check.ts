@@ -36,6 +36,10 @@
  * `UIImage(named:)`, avoiding a synchronous bundle-directory scan on every
  * reload before SDWebImage handles the file URL.
  *
+ * For expo-sqlite, async operations keep their connection alive through
+ * statement finalization. Native statements are marked finalized even when
+ * sqlite3_finalize returns an error; otherwise cleanup can reuse a freed pointer.
+ *
  * For expo-updates, the patch makes a binary's embedded `commitTime` HEAD's
  * committer date instead of the moment the build bundled, so update ordering
  * follows commit order (#5021). A dropped patch is invisible everywhere: the
@@ -47,6 +51,19 @@
  * CocoaPods compiles) and asserts the patch's sentinel symbols are present in
  * the installed source. It fails the PR on a cheap Linux runner the instant a
  * patch stops applying — no Xcode required.
+ *
+ * A patched node_modules is not a patched binary, though. Expo's precompiled
+ * modules (on by default) link a prebuilt xcframework in place of a pod's
+ * source, so an `ios/` patch on a precompiled pod applies cleanly here and
+ * never reaches the app — exactly how the #5296 Exception.swift patch first
+ * went green while ExpoModulesCore shipped as a prebuild. So every rule that
+ * edits an `ios/` file must also name a package that builds from source: listed
+ * in `expo.autolinking.buildFromSource`, or depending (through its installed
+ * spm.config.json `externalDependencies`) on one that is, which is the cascade
+ * precompiled_modules.rb applies as `dependency_unavailable`. See
+ * {@link checkIosPatchesBuildFromSource}. SDK 58 also ships prebuilt Android AARs;
+ * {@link checkExpoUiAndroidPatchesBuildFromSource} checks their Gradle project names
+ * for the Filters Expo UI patch separately, because `@expo/ui` does not match `expo-ui`.
  *
  * Usage: vp run check:mobile-patches
  */
@@ -74,7 +91,7 @@ export interface ForbiddenInMethod {
 }
 
 export interface PatchRule {
-  /** The patched package — must be a direct dependency of packages/mobile. */
+  /** The patched package — must be resolvable from the owning workspace. */
   package: string;
   /** Path, within the installed package, to the source file the patch edits. */
   file: string;
@@ -86,6 +103,8 @@ export interface PatchRule {
   patchedKey: string;
   /** Optional negative assertions scoped to a single method body. */
   forbiddenInMethod?: readonly ForbiddenInMethod[];
+  /** Source fragments that must not occur anywhere in this patched file. */
+  forbiddenSubstrings?: readonly string[];
 }
 
 /**
@@ -101,6 +120,272 @@ export interface PatchRule {
  * package that has neither a rule nor an allowlist entry.
  */
 export const RULES: readonly PatchRule[] = [
+  {
+    package: 'expo-modules-core',
+    file: 'ios/Core/AppContext.swift',
+    sentinels: [
+      'private var hasPostedAppContextDestroys = false',
+      'private func postAppContextDestroysOnce()',
+      'postAppContextDestroysOnce()\n    _runtime = nil',
+      'if isModuleRegistryInitialized {\n      for module in moduleRegistry {',
+    ],
+    orderedSentinels: [
+      'guard !hasPostedAppContextDestroys else',
+      'hasPostedAppContextDestroys = true',
+      'moduleRegistry.post(event: .appContextDestroys)',
+    ],
+    patchedKey: 'expo-modules-core@58.1.0',
+  },
+  {
+    package: 'expo-modules-core',
+    file: 'ios/Core/Functions/AsyncFunctionDefinition.swift',
+    // The existential pattern cast crashes Swift 6.4.2 SILGen when consuming
+    // FunctionCallResult. Match upstream's inferred Exception binding while
+    // preserving ownership and rejecting the same error through the promise.
+    sentinels: [
+      'switch consume result {',
+      'case .success(let value):\n          promise.resolve(value)',
+      'case .failure(let error):\n          promise.reject(error)',
+    ],
+    forbiddenSubstrings: ['case .failure(let error as any Error):'],
+    patchedKey: 'expo-modules-core@58.1.0',
+  },
+  // #7737: Expo's Android view managers drop Fabric view commands. The Aura
+  // overlay receives each wall-swap frame as a command from a UI-thread worklet.
+  {
+    package: 'expo-modules-core',
+    file: 'android/src/main/java/expo/modules/kotlin/views/ExpoViewCommandReceiver.kt',
+    sentinels: [
+      'interface ExpoViewCommandReceiver {',
+      'fun receiveViewCommand(commandId: String, args: List<Any?>): Boolean',
+    ],
+    patchedKey: 'expo-modules-core@58.1.0',
+  },
+  ...(
+    [
+      ['SimpleViewManagerWrapper.kt', 'View'],
+      ['GroupViewManagerWrapper.kt', 'ViewGroup'],
+    ] as const
+  ).map(([wrapperFile, viewType]) => ({
+    package: 'expo-modules-core',
+    file: `android/src/main/java/expo/modules/kotlin/views/${wrapperFile}`,
+    sentinels: [
+      `override fun receiveCommand(view: ${viewType}, commandId: String, args: ReadableArray?) {`,
+      'receiver.receiveViewCommand(commandId, args?.toArrayList() ?: emptyList())',
+      'super.receiveCommand(view, commandId, args)',
+    ],
+    patchedKey: 'expo-modules-core@58.1.0',
+  })),
+  // Pin the callable source and both distributed JS entrypoints: exporting a
+  // type alone cannot stop recording in a compiled native replay SDK.
+  ...(['src/index.tsx', 'lib/module/index.js', 'lib/commonjs/index.js'] as const).map((file) => ({
+    package: 'posthog-react-native-session-replay',
+    file,
+    sentinels: [
+      'return PosthogReactNativeSessionReplay.setOptOut(optedOut, projectToken);',
+      file === 'lib/commonjs/index.js' ? 'exports.setOptOut = setOptOut;' : 'export function setOptOut(',
+      file === 'lib/commonjs/index.js' ? 'exports.reset = identify;' : 'export const reset = identify;',
+    ],
+    patchedKey: 'posthog-react-native-session-replay@1.6.0',
+  })),
+  {
+    package: 'posthog-react-native-session-replay',
+    file: 'ios/PosthogReactNativeSessionReplay.mm',
+    sentinels: ['RCT_EXTERN_METHOD(setOptOut:(BOOL)optedOut', 'withProjectToken:(NSString)projectToken'],
+    patchedKey: 'posthog-react-native-session-replay@1.6.0',
+  },
+  {
+    package: 'posthog-react-native-session-replay',
+    file: 'ios/PosthogReactNativeSessionReplay.swift',
+    sentinels: [
+      'private var consentAllowed = false',
+      'private var nativeInitialized = false',
+      'self.storageToken = publicToken + "-boardsesh-replay-" + UUID().uuidString',
+      'let config = PostHogConfig(projectToken: nextTransport.storageToken, host: host)',
+      'configuration.urlSessionConfiguration = transport?.configuration()',
+      'configuration.protocolClasses = [ReplayConsentURLProtocol.self]',
+      'private var forwardingTask: URLSessionDataTask?',
+      'forwardingTask = pending',
+      'forwardingTask?.cancel()',
+      'request.url?.scheme == "https" || request.url?.scheme == "http"',
+      `guard let identifier = request.value(forHTTPHeaderField: ReplayConsentTransport.header),
+              let transport = ReplayConsentTransport.find(identifier) else {`,
+      'if request.httpMethod == "POST" { throw URLError(.cannotDecodeContentData) }',
+      'if transport.add(pending, identifier: taskId) { pending.resume() }',
+      'guard !sealed else { return false }',
+      'sealed = true',
+      'pending.forEach { $0.cancel() }',
+      `transport?.retire()
+            PostHogSDK.shared.optOut()
+            PostHogSDK.shared.stopSessionRecording()
+            PostHogSDK.shared.close()
+            nativeInitialized = false
+            config = nil`,
+      `transport?.retire()
+        PostHogSDK.shared.close()
+        nativeInitialized = false
+        self.config = nil
+        PostHogSessionManager.shared.setSessionId(sessionIdStr)
+        transport = nextTransport`,
+      `guard let storageManager = self.config?.storageManager else {
+            transport?.retire()
+            transport = nil
+            self.config = nil`,
+      `do { try purgeCache(projectToken) }
+        catch {
+            transport?.retire()
+            transport = nil`,
+      `nativeInitialized = true
+        setIdentify(storageManager, distinctId: distinctId, anonymousId: anonymousId)`,
+      'if !nativeInitialized {',
+      'guard consentAllowed, nativeInitialized else { resolve(nil); return }',
+      'if manager.fileExists(atPath: project.path) { try manager.removeItem(at: project) }',
+      'folder.lastPathComponent.hasPrefix(token + "-boardsesh-replay-") { try manager.removeItem(at: folder) }',
+      'if manager.fileExists(atPath: location.path) { try manager.removeItem(at: location) }',
+      '"posthog.queueFolder", "posthog.queue.plist"',
+      'guard consentAllowed, !(sdkOptions["optOut"] as? Bool ?? true) else',
+      'guard consentAllowed, let storageManager = config?.storageManager else',
+      'guard consentAllowed, !publicProjectToken.isEmpty else',
+    ],
+    forbiddenSubstrings: ['.isEnabled'],
+    patchedKey: 'posthog-react-native-session-replay@1.6.0',
+  },
+  {
+    package: 'posthog-react-native-session-replay',
+    file: 'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+    sentinels: [
+      '@Volatile private var consentAllowed = false',
+      'if (changed) consentGeneration.incrementAndGet()',
+      'retiredPermission?.set(false)',
+      'activeTransport?.dispatcher?.cancelAll()',
+      `UiThreadUtil.runOnUiThread(Runnable {
+      try {
+        synchronized(consentLock) {`,
+      `if (!permission.get() || !consentAllowed) throw IOException("Replay consent withdrawn")
+        chain.proceed(compressed)`,
+      '"boardsesh-consent-replay/${UUID.randomUUID()}"',
+      'config.storagePrefix = File(generationRoot, "events").absolutePath',
+      'config.replayStoragePrefix = File(generationRoot, "snapshots").absolutePath',
+      'config.addBeforeSend { event -> if (permission.get() && consentAllowed) event else null }',
+      'if (!consentAllowed || initializationGeneration != consentGeneration.get()) return@Runnable',
+      'if (!consentAllowed || recordingGeneration != consentGeneration.get()) return@Runnable',
+      'if (consentAllowed) setIdentify(savedConfig?.cachePreferences, distinctId, anonymousId)',
+      `if (!consentAllowed) return
+    cachePreferences?.let { preferences ->`,
+      'savedConfig = savedConfig?.let { copyReplayConfig(it) }',
+      'File(context.cacheDir, "boardsesh-consent-replay")',
+      'if (location.exists() && !location.deleteRecursively()) throw IOException("Replay cache purge failed")',
+      `PostHog.close()
+            nativeInitialized = false
+            purgeCache(if (apiKey.isEmpty()) savedConfig?.apiKey ?: "" else apiKey)`,
+      'context.getSharedPreferences("posthog-android-$apiKey", 0).edit().clear().commit()',
+    ],
+    patchedKey: 'posthog-react-native-session-replay@1.6.0',
+  },
+  ...(['src/SQLiteDatabase.ts', 'build/SQLiteDatabase.js'] as const).map((file) => ({
+    package: 'expo-sqlite',
+    file,
+    sentinels: [
+      'beginAsyncOperation',
+      'pendingAsyncOperations',
+      'closePromise',
+      'finalizeStatementWithErrorPreservation',
+    ],
+    patchedKey: 'expo-sqlite@58.0.18',
+  })),
+  // SDK 58 moved statements into their own native classes and fixes finalization
+  // upstream. Keep asserting finalized-before-throw so an upgrade cannot lose it.
+  {
+    package: 'expo-sqlite',
+    file: 'android/src/main/java/expo/modules/sqlite/NativeStatement.kt',
+    sentinels: [
+      'synchronized(connection.statementLifecycleLock)',
+      `val ret = ref.sqlite3_finalize()
+        val error = if (ret != NativeDatabaseBinding.SQLITE_OK) {
+          ref.getLastErrorMessage()
+        } else {
+          null
+        }
+        // SQLite destroys the statement even when returning an earlier execution error.
+        isFinalized = true
+        connection.statements.removeAll { it === this }
+        if (releasedByJavaScript) {
+          ref.close()
+        }
+        if (error != null) {
+          throw SQLiteErrorException(error)`,
+    ],
+    patchedKey: 'expo-sqlite@58.0.18',
+  },
+  {
+    package: 'expo-sqlite',
+    file: 'ios/NativeStatement.swift',
+    sentinels: [
+      'database.statementLifecycleLock.lock()',
+      `let result = sqliteResult(for: database.pointer) { exsqlite3_finalize(pointer) }
+      // SQLite destroys the statement even when returning an earlier execution error.
+      isFinalized = true
+      pointer = nil
+      database.statements.removeAll { $0 === self }
+      if let message = result.message {
+        throw SQLiteErrorException(message)`,
+    ],
+    patchedKey: 'expo-sqlite@58.0.18',
+  },
+  {
+    package: 'expo-sqlite',
+    file: 'ios/SQLiteModule.swift',
+    sentinels: [
+      'private let moduleQueue: DispatchQueue',
+      'OnAppContextDestroys {\n      closeAllDatabases()',
+      'public override func willDestroy() {\n    closeAllDatabases()',
+      'DispatchQueue.getSpecific(key: moduleQueueKey)',
+      'moduleQueue.async(flags: .barrier, execute: closeDatabases)',
+      'moduleQueue.sync(flags: .barrier, execute: closeDatabases)',
+      'UInt(bitPattern: ObjectIdentifier($0)) < UInt(bitPattern: ObjectIdentifier($1))',
+      'databases.reversed().forEach { $0.statementLifecycleLock.unlock() }',
+    ],
+    patchedKey: 'expo-sqlite@58.0.18',
+  },
+  {
+    package: 'expo-sqlite',
+    file: 'ios/NativeDatabase.swift',
+    sentinels: [
+      'private func exec(source: String) throws {\n    // Serialize connection lifetime with close;',
+      'statementLifecycleLock.lock()',
+      'defer { statementLifecycleLock.unlock() }',
+    ],
+    patchedKey: 'expo-sqlite@58.0.18',
+  },
+  {
+    package: 'expo-sqlite',
+    file: 'ios/NativeSession.swift',
+    sentinels: [
+      'private func attach(database: NativeDatabase, table: String?) throws {\n    database.statementLifecycleLock.lock()',
+      'private func close(database: NativeDatabase) throws {\n    database.statementLifecycleLock.lock()',
+      'defer { database.statementLifecycleLock.unlock() }',
+    ],
+    patchedKey: 'expo-sqlite@58.0.18',
+  },
+  {
+    package: 'react-native',
+    file: 'ReactCommon/react/renderer/scheduler/Scheduler.h',
+    sentinels: ['std::shared_ptr<std::atomic<bool>> delegateInvalidated_;'],
+    patchedKey: 'react-native@0.88.1',
+  },
+  {
+    package: 'react-native',
+    file: 'ReactCommon/react/renderer/scheduler/Scheduler.cpp',
+    sentinels: [
+      'Scheduler::~Scheduler() {\n  // Boardsesh #5293:',
+      '*delegateInvalidated_ = true;',
+      'delegateInvalidated_ = std::make_shared<std::atomic<bool>>(false);',
+      'invalidated = delegateInvalidated_',
+      'if (*invalidated) {\n              return;',
+      'if (*invalidated) {\n            return;',
+    ],
+    patchedKey: 'react-native@0.88.1',
+  },
   {
     package: 'react-native-ble-plx',
     file: 'android/src/main/java/com/bleplx/adapter/BleModule.java',
@@ -128,13 +413,13 @@ export const RULES: readonly PatchRule[] = [
     package: '@expo/fingerprint',
     file: 'build/utils/Path.js',
     sentinels: ['normalizeIsolatedStoreModulePath', 'ISOLATED_STORE_MODULE_ROOT_REGEX'],
-    patchedKey: '@expo/fingerprint@0.20.11',
+    patchedKey: '@expo/fingerprint@0.21.10',
   },
   {
     package: '@expo/fingerprint',
     file: 'build/hash/Hash.js',
     sentinels: ['normalizeIsolatedStoreModulePath'],
-    patchedKey: '@expo/fingerprint@0.20.11',
+    patchedKey: '@expo/fingerprint@0.21.10',
   },
   {
     package: 'react-native-screens',
@@ -145,7 +430,21 @@ export const RULES: readonly PatchRule[] = [
       'findContentScrollViewInManagedSubtreeFrom',
       'RNSManagedContentScrollViewSearchMaxDepth',
     ],
-    patchedKey: 'react-native-screens@4.26.2',
+    patchedKey: 'react-native-screens@4.30.1',
+  },
+  // `scrollEdgeEffects` on a native-stack screen reaches a FlashList only through
+  // this fallback: upstream walks first children, which stops at any leading
+  // sibling. Drop it and iOS 26 draws its top edge blur over full-bleed heroes
+  // again (the playlist hero band, #6525). The second sentinel keeps the search
+  // out of nested screens, so an outer screen can't overwrite an inner one.
+  {
+    package: 'react-native-screens',
+    file: 'ios/RNSScreen.mm',
+    sentinels: [
+      'scrollView = rnscreens_findOwnEdgeEffectScrollView(self, self, RNSEdgeEffectScrollViewSearchMaxDepth);',
+      'if (view != screen && [view isKindOfClass:RNSScreenView.class]) {',
+    ],
+    patchedKey: 'react-native-screens@4.30.1',
   },
   // The bottom-accessory relayout nudge. No single sentinel is enough, because
   // this hunk has TWO regressions to guard, in opposite directions.
@@ -184,7 +483,7 @@ export const RULES: readonly PatchRule[] = [
       '[_controller setBottomAccessory:nil animated:YES];',
       '[self rnscreens_scheduleBottomAccessoryRelayoutAfterVisibilityChange];',
     ],
-    patchedKey: 'react-native-screens@4.26.2',
+    patchedKey: 'react-native-screens@4.30.1',
     forbiddenInMethod: [
       {
         method: 'applyBottomAccessoryVisibility',
@@ -209,6 +508,40 @@ export const RULES: readonly PatchRule[] = [
           'the layout pass must never arm its own repeat — that turns the coalescing drain into a ' +
           'self-sustaining layout loop, the shape BOARDSESH-9K crashed on. Only an accessory-identity change in ' +
           'applyBottomAccessoryVisibility may set it.',
+      },
+    ],
+  },
+  // The MiniPlayer width cap (#7083). A dropped hunk only shows on an iPad or the
+  // open iPhone Duo: the glass fills the whole content column again instead of
+  // Music's 689 pt capsule. A portrait iPhone is always narrower than the cap, so
+  // the cap applies on every device; the forbidden idiom check stops a pad-only
+  // gate from coming back and leaving the open Duo with a full-width bar. The
+  // other forbidden reads keep the answer derived from the proposed size:
+  // answering from the view's own bounds or super's default brings back the stale
+  // width after a sidebar hide or rotation (react-native-screens #4728).
+  {
+    package: 'react-native-screens',
+    file: 'ios/tabs/bottom-accessory/RNSTabsBottomAccessoryWrapperView.mm',
+    sentinels: [
+      'static const CGFloat RNSTabsBottomAccessoryMaxWidth = 689.0;',
+      'return CGSizeMake(MIN(size.width, RNSTabsBottomAccessoryMaxWidth), size.height);',
+    ],
+    patchedKey: 'react-native-screens@4.30.1',
+    forbiddenInMethod: [
+      {
+        method: 'sizeThatFits',
+        substrings: ['self.bounds', 'self.frame', 'super sizeThatFits'],
+        why:
+          'the answer must derive from the proposed size on every query. The view keeps its old bounds after a ' +
+          'sidebar hide or rotation, so answering from them strands the accessory at a stale width ' +
+          '(react-native-screens #4728).',
+      },
+      {
+        method: 'sizeThatFits',
+        substrings: ['userInterfaceIdiom', 'return size;'],
+        why:
+          'the 689 pt cap must apply on every device. A pad-only gate, or an early full-size return, leaves the ' +
+          'open iPhone Duo with a full-width bar instead of the centred capsule (#7083).',
       },
     ],
   },
@@ -237,8 +570,191 @@ export const RULES: readonly PatchRule[] = [
       'hideSwallowingMissingNativeHandler();',
       'const close = hideSwallowingMissingNativeHandler;',
     ],
-    patchedKey: '@expo/ui@57.0.14',
+    patchedKey: '@expo/ui@58.0.29',
   },
+  // Native Android filters keep the sheet and both scroll axes in one Compose
+  // tree. Without these hooks an upgrade silently loses picker restoration,
+  // rail centering or cancellation underneath a user's finger (#7312).
+  {
+    package: '@expo/ui',
+    file: 'android/src/main/java/expo/modules/ui/LazyListScrollController.kt',
+    sentinels: [
+      'private const val LAZY_LIST_LAYOUT_TIMEOUT_MS = 2000L',
+      'request.requestId <= latestRequestId',
+      'touchGeneration != desired.touchGeneration',
+      'desiredRequest = desired',
+      'desired != null && pendingScroll == null && !touching',
+      'if (completed && desiredRequest === desired) desiredRequest = null',
+      'request.index.coerceIn(0, measured.totalItemsCount - 1)',
+      'current.scope.launch(start = CoroutineStart.LAZY)',
+      'target.offset + target.size / 2f - viewportCenter',
+      'awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)',
+      'pendingScroll?.cancel()',
+      'current?.firstVisibleItemScrollOffset?.toDouble()?.div(densityScale) ?: initialPosition?.offsetDp',
+      'request.alignment == "center" && userInteracted && !request.allowAfterInteraction',
+      'userInteracted = true',
+      'initialOffsetDp * densityScale',
+      'retainedState?.let { return it }',
+      'controller.obtainState(initialPosition, density)',
+    ],
+    patchedKey: '@expo/ui@58.0.29',
+  },
+  ...['LazyColumn', 'LazyRow'].map((kind): PatchRule => ({
+    package: '@expo/ui',
+    file: `android/src/main/java/expo/modules/ui/${kind}View.kt`,
+    sentinels: [
+      'rememberControlledLazyListState(scrollController, props.initialScrollPosition.value)',
+      'state = listState',
+      '.then(scrollController.cancelScrollOnTouch())',
+    ],
+    patchedKey: '@expo/ui@58.0.29',
+  })),
+  {
+    package: '@expo/ui',
+    file: 'android/src/main/java/expo/modules/ui/ExpoUIModule.kt',
+    sentinels: [
+      'AsyncFunction("getScrollPosition") Coroutine { view: LazyColumnView ->',
+      'AsyncFunction("getScrollPosition") Coroutine { view: LazyRowView ->',
+      'AsyncFunction("scrollToItem") Coroutine { view: LazyColumnView, request: LazyListScrollRequest ->',
+      'AsyncFunction("scrollToItem") Coroutine { view: LazyRowView, request: LazyListScrollRequest ->',
+      'OnViewDestroys { view: LazyRowView ->',
+      'OnViewDestroys { view: LazyColumnView ->',
+    ],
+    patchedKey: '@expo/ui@58.0.29',
+  },
+  {
+    package: '@expo/ui',
+    file: 'android/src/main/java/expo/modules/ui/ModifierRegistry.kt',
+    sentinels: ['val isSelected = params.selected', 'isSelected?.let { selected = it }'],
+    patchedKey: '@expo/ui@58.0.29',
+  },
+  {
+    package: '@expo/ui',
+    file: 'android/src/main/java/expo/modules/ui/SemanticsModifier.kt',
+    sentinels: ['@Field val selected: Boolean? = null'],
+    patchedKey: '@expo/ui@58.0.29',
+  },
+  // Opt in only the Filters sheet: Foundation 1.12.1 can retain its animation
+  // flag after a settled drag, which makes the parent consume every touch down.
+  // Recover changed visible settlements, or roll back a genuinely canceled
+  // active gesture. Normal UP/fling and newer interactions keep control.
+  {
+    package: '@expo/ui',
+    file: 'android/src/main/java/expo/modules/ui/ModalBottomSheetView.kt',
+    sentinels: [
+      'val recoverSettledTouches: Boolean = false',
+      'props.recoverSettledTouches && props.sheetGesturesEnabled',
+      'LaunchedEffect(sheetState, enabled)',
+      'if (!enabled) return@LaunchedEffect',
+      'RecoverSettledSheetTouches(sheetState, touchRecovery, recoverSettledTouches)',
+      'RecoverCancelledSheetGesture(sheetState, touchRecovery, recoverSettledTouches)',
+      'val touchRecovery = remember(sheetState) { SheetTouchRecoveryState() }',
+      ') : Modifier.Node(), PointerInputModifierNode',
+      `override fun onAttach() {
+    recovery.attach(this)`,
+      'attachedObserver = observer',
+      `override fun onPointerEvent(pointerEvent: PointerEvent, pass: PointerEventPass, bounds: IntSize) {
+    if (pass == PointerEventPass.Initial) {
+      recovery.pointersChanged(this, sheetState, pointerEvent.changes.any { it.pressed })`,
+      `override fun onCancelPointerInput() {
+    recovery.cancelGesture(this)`,
+      `override fun onReset() {
+    recovery.reset(this)`,
+      `override fun onDetach() {
+    recovery.reset(this, detached = true)`,
+      `private fun invalidateGesture() {
+    generation += 1
+    gesture = null
+    cancelledGesture = null`,
+      `if (pressed && !touching) {
+      invalidateGesture()`,
+      'touching = pressed',
+      `val wasTouching = touching
+    touching = false
+    gesture = null`,
+      `if (attachedObserver !== observer) return
+    invalidateGesture()
+    touching = false
+    if (detached) attachedObserver = null`,
+      'gesture = SheetGestureCapture(observer, sheetState, generation, startDetent)',
+      'if (startDetent != SheetValue.Hidden)',
+      'if (!pressed) gesture = null',
+      'if (!wasTouching || captured == null || captured.generation != generation || activeCommands != 0) return',
+      'cancelledGesture = CancelledSheetGesture(cancellationEpoch, captured)',
+      'cancelledGesture === request && request.gesture.generation == generation',
+      'request.gesture.sheetState === sheetState && attachedObserver === request.gesture.observer',
+      'request.gesture.observer.isAttached && !touching && activeCommands == 0',
+      `suspend fun runCommand(command: suspend () -> Unit) {
+    invalidateGesture()`,
+      `activeCommands += 1
+    try {
+      command()
+    } finally {
+      activeCommands -= 1`,
+      `recovering = true
+    try {
+      command()
+    } finally {
+      recovering = false`,
+      `withContext(scope.coroutineContext) {
+        touchRecovery.runCommand { sheetState.hide() }`,
+      `withContext(scope.coroutineContext) {
+        touchRecovery.runCommand { sheetState.expand() }`,
+      `withContext(scope.coroutineContext) {
+        touchRecovery.runCommand { sheetState.partialExpand() }`,
+      `if (props.initialFullyExpanded && !props.skipPartiallyExpanded) {
+      try {
+        touchRecovery.runCommand { sheetState.expand() }`,
+      'Modifier.trackSheetRecoveryPointers(touchRecovery, sheetState) else Modifier',
+      'SheetValue.Expanded -> sheetState.hasExpandedState',
+      'SheetValue.PartiallyExpanded -> sheetState.hasPartiallyExpandedState',
+      'SheetValue.Hidden -> false',
+      `when (startDetent) {
+          SheetValue.Expanded -> sheetState.expand()
+          SheetValue.PartiallyExpanded -> sheetState.partialExpand()
+          SheetValue.Hidden -> Unit`,
+      `when (settled) {
+          SheetValue.Expanded -> sheetState.expand()
+          SheetValue.PartiallyExpanded -> sheetState.partialExpand()
+          SheetValue.Hidden -> Unit`,
+    ],
+    orderedSentinels: [
+      'snapshotFlow { recovery.cancelledGesture }.collectLatest { request ->',
+      'if (request == null || request.epoch <= consumedEpoch) return@collectLatest',
+      'snapshotFlow { !recovery.touching && !recovery.recovering }.first { it }',
+      'if (!recovery.owns(request, sheetState)) return@collectLatest',
+      'if (!anchorAvailable) return@collectLatest',
+      'consumedEpoch = request.epoch',
+      'if (!sheetState.isVisible || sheetState.targetValue == SheetValue.Hidden) return@collectLatest',
+      `recovery.runRecovery {
+        when (startDetent) {`,
+      'snapshotFlow { sheetState.currentValue }.collectLatest { settled ->',
+      'previousSettled = settled',
+      'if (previous == settled || previous == SheetValue.Hidden || settled == SheetValue.Hidden)',
+      'snapshotFlow { recovery.touching }.first { touching -> !touching }',
+      'if (sheetState.currentValue != settled || sheetState.targetValue != settled ||',
+      '!sheetState.isAnimationRunning || recovery.activeCommands != 0 || recovery.recovering',
+      `recovery.runRecovery {
+        when (settled) {`,
+    ],
+    forbiddenSubstrings: [
+      'Filters7312',
+      '.consume(',
+      'delay(',
+      'Thread.sleep(',
+      'getDeclaredField(',
+      'sheetGesturesEnabled = false',
+    ],
+    patchedKey: '@expo/ui@58.0.29',
+  },
+  ...(
+    ['src/jetpack-compose/ModalBottomSheet/index.tsx', 'build/jetpack-compose/ModalBottomSheet/index.js'] as const
+  ).map((file): PatchRule => ({
+    package: '@expo/ui',
+    file,
+    sentinels: ['recoverSettledTouches: props.recoverSettledTouches ?? false'],
+    patchedKey: '@expo/ui@58.0.29',
+  })),
   // The iOS half wires the native post-animation dismiss signal through to the
   // `onFullyDismissed` prop. Drop it and the prop still TYPE-checks (the types
   // hunk lives in the same patch) but silently never fires — LogAscentSheet,
@@ -248,7 +764,31 @@ export const RULES: readonly PatchRule[] = [
     file: 'src/community/bottom-sheet/BottomSheet.ios.tsx',
     sentinels: ['onFullyDismissedRef', 'onDismiss={fireCloseCallbacks}', 'coordinator must observe index -1'],
     orderedSentinels: ['onChangeRef.current?.(-1);', 'onFullyDismissedRef.current?.();'],
-    patchedKey: '@expo/ui@57.0.14',
+    patchedKey: '@expo/ui@58.0.29',
+  },
+  // SwiftUI RNHostView owners can overlap for the same hosted React view.
+  // The shared native handler must survive until every owner releases its lease;
+  // JS typechecks and bundles cannot detect a missing native touch recognizer.
+  {
+    package: '@expo/ui',
+    file: 'ios/ExpoUITouchHandlerHelper.mm',
+    sentinels: [
+      'static char ExpoUITouchHandlerLeaseCountKey;',
+      'if (leaseCount == nil) {\n        return nil;\n      }',
+      '@(leaseCount.unsignedIntegerValue + 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);\n      return recognizer;',
+      'objc_setAssociatedObject(touchHandler, &ExpoUITouchHandlerLeaseCountKey, @1, OBJC_ASSOCIATION_RETAIN_NONATOMIC);',
+      'if (![touchHandler isKindOfClass:[RCTSurfaceTouchHandler class]] || touchHandler.view != view)',
+      'if (leaseCount == nil) {\n    return;\n  }',
+      'if (leaseCount.unsignedIntegerValue > 1)',
+      '@(leaseCount.unsignedIntegerValue - 1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);\n    return;',
+      'objc_setAssociatedObject(touchHandler, &ExpoUITouchHandlerLeaseCountKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);',
+    ],
+    orderedSentinels: [
+      'touchHandler.view != view',
+      'if (leaseCount.unsignedIntegerValue > 1)',
+      '[(RCTSurfaceTouchHandler *)touchHandler detachFromView:view];',
+    ],
+    patchedKey: '@expo/ui@58.0.29',
   },
   // ExpoModulesCore uses relative file URLs for xcasset names, so
   // `localAssetName` must keep those while rejecting absolute/hosted file URLs
@@ -266,7 +806,7 @@ export const RULES: readonly PatchRule[] = [
       'if hasFileHost || hasAbsoluteFilePath',
       'Images/MyIcon',
     ],
-    patchedKey: 'expo-image@57.0.3',
+    patchedKey: 'expo-image@58.0.18',
   },
   // The embedded bundle's commitTime. `expo-updates` launches whichever update
   // has the newest one, and upstream stamps BUILD time — so a long native build
@@ -289,7 +829,7 @@ export const RULES: readonly PatchRule[] = [
       'Math.min(committerTime, now)',
       'commitTime: resolveEmbeddedCommitTime(projectRoot),',
     ],
-    patchedKey: 'expo-updates@57.0.19',
+    patchedKey: 'expo-updates@58.0.22',
   },
 ];
 
@@ -300,19 +840,33 @@ export const RULES: readonly PatchRule[] = [
  * of quietly landing unguarded.
  */
 export const UNGUARDED_PATCHES: Readonly<Record<string, string>> = {
-  'expo-dev-launcher@57.0.16':
+  'expo-dev-launcher@58.0.21':
     'raises the iOS dev-launcher request timeout from 10s to 120s. Under an isolated linker the package is ' +
     'only reachable through expo-dev-client, so createNodeEnv cannot resolve it from packages/mobile — pnpm does ' +
     "put it in node_modules/.pnpm/node_modules, but that directory is not on packages/mobile's resolution path. " +
     'dev-client-only — it never ships in a store binary.',
 };
 
-/** Server-only patches stay outside patches/, which is a native fingerprint input.
- * Postgres is guarded by the backend's ESM/CJS disconnect regression tests.
+/**
+ * Server and web patches stay outside patches/, which is a native fingerprint input.
+ * Postgres is guarded by the backend's ESM/CJS disconnect regression tests;
+ * MUI is checked below and by the mixed-React compiler regression fixture.
+ * Next is guarded by the installed response and proxy close-lifecycle tests.
+ * Only these exact keys and paths may bypass the native patch directory.
  */
-export const SERVER_PATCHES: Readonly<Record<string, string>> = {
+export const NON_NATIVE_PATCHES: Readonly<Record<string, string>> = {
   'postgres@3.4.9': 'packages/db/patches/postgres@3.4.9.patch',
+  '@mui/material@7.3.11': 'packages/web/patches/@mui__material@7.3.11.patch',
+  'next@16.3.5': 'packages/web/patches/next@16.3.5.patch',
 };
+
+/** Resolve these files from web, whose React declarations the patch must use. */
+export const WEB_RULES: readonly PatchRule[] = ['internal/index.d.ts', 'esm/internal/index.d.ts'].map((file) => ({
+  package: '@mui/material',
+  file,
+  sentinels: ["import type * as React from 'react';"],
+  patchedKey: '@mui/material@7.3.11',
+}));
 
 /**
  * Strip `//` line comments and block comments from Objective-C++ source.
@@ -388,8 +942,8 @@ export interface PatchInventoryInput {
   patchedDependencies: Record<string, string>;
   /** Filenames present in patches/ (basenames, not paths). */
   patchFilenames: readonly string[];
-  /** Existing repo-relative server patch paths; only SERVER_PATCHES may use these. */
-  serverPatchPaths?: readonly string[];
+  /** Existing repo-relative non-native patch paths; only NON_NATIVE_PATCHES may use these. */
+  nonNativePatchPaths?: readonly string[];
   /** `patchedKey` of every entry in {@link RULES}. */
   guardedKeys: readonly string[];
   /** Keys deliberately left unguarded, mapped to the reason. */
@@ -411,12 +965,12 @@ export function checkPatchInventory(input: PatchInventoryInput): string[] {
   const guarded = new Set(input.guardedKeys);
 
   for (const [patchedKey, patchPath] of Object.entries(input.patchedDependencies)) {
-    if (Object.prototype.hasOwnProperty.call(SERVER_PATCHES, patchedKey)) {
-      const expectedPath = SERVER_PATCHES[patchedKey];
+    if (Object.prototype.hasOwnProperty.call(NON_NATIVE_PATCHES, patchedKey)) {
+      const expectedPath = NON_NATIVE_PATCHES[patchedKey];
       if (patchPath !== expectedPath) {
-        errors.push(`${patchedKey}: server patch must stay at ${expectedPath}, outside native fingerprint inputs.`);
-      } else if (!input.serverPatchPaths?.includes(patchPath)) {
-        errors.push(`${patchedKey}: server patch ${patchPath} is missing.`);
+        errors.push(`${patchedKey}: non-native patch must stay at ${expectedPath}, outside native fingerprint inputs.`);
+      } else if (!input.nonNativePatchPaths?.includes(patchPath)) {
+        errors.push(`${patchedKey}: non-native patch ${patchPath} is missing.`);
       }
       continue;
     }
@@ -448,6 +1002,159 @@ export function checkPatchInventory(input: PatchInventoryInput): string[] {
   return errors;
 }
 
+/** The slice of an installed package's spm.config.json the precompile resolver reads. */
+export interface SpmConfig {
+  products?: readonly { name?: string; externalDependencies?: readonly unknown[] }[];
+}
+
+export interface BuildFromSourceInput {
+  rules: readonly PatchRule[];
+  /** `expo.autolinking.buildFromSource` from packages/mobile/package.json. */
+  buildFromSource: readonly string[];
+  /** The installed package's spm.config.json, or null when it has none or can't be resolved. */
+  readSpmConfig(pkg: string): SpmConfig | null;
+}
+
+/**
+ * Map an spm.config.json `externalDependencies` entry to its npm package, the
+ * same split precompiled_modules.rb's `prebuilt_dependency_pods` does:
+ * `pkg/Product` and `@scope/pkg/Product`. A bare product name ("React",
+ * "RNWorklets") names no package, so it can't carry the cascade here.
+ */
+export function packageFromExternalDependency(dependency: string): string | null {
+  const parts = dependency.split('/');
+  if (parts[0].startsWith('@')) return parts.length >= 3 ? `${parts[0]}/${parts[1]}` : null;
+  return parts.length >= 2 ? parts[0] : null;
+}
+
+/**
+ * Why `pkg` builds from source, as a chain ("expo-image → expo-modules-core
+ * (buildFromSource)"), or null when nothing forces it off its prebuild.
+ *
+ * Mirrors `resolve_prebuilt_status` in expo-modules-autolinking's
+ * precompiled_modules.rb: patterns are anchored regexes (`^p$`), and a pod whose
+ * dependency builds from source falls back to source (`dependency_unavailable`).
+ * The reverse direction (`dependent_unavailable`) is deliberately not modelled —
+ * it is only ever an extra reason, so leaving it out can fail a safe config but
+ * never pass an unsafe one.
+ */
+export function sourceBuildChain(
+  pkg: string,
+  input: Pick<BuildFromSourceInput, 'buildFromSource' | 'readSpmConfig'>,
+  visiting: ReadonlySet<string> = new Set(),
+): string | null {
+  const listed = input.buildFromSource.some((pattern) => {
+    try {
+      return new RegExp(`^${pattern}$`).test(pkg);
+    } catch {
+      return pattern === pkg;
+    }
+  });
+  if (listed) return `${pkg} (buildFromSource)`;
+  if (visiting.has(pkg)) return null;
+
+  const nextVisiting = new Set(visiting).add(pkg);
+  for (const product of input.readSpmConfig(pkg)?.products ?? []) {
+    for (const dependency of product.externalDependencies ?? []) {
+      if (typeof dependency !== 'string') continue;
+      const dependencyPackage = packageFromExternalDependency(dependency);
+      if (!dependencyPackage || dependencyPackage === pkg) continue;
+      const chain = sourceBuildChain(dependencyPackage, input, nextVisiting);
+      if (chain) return `${pkg} → ${chain}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Every rule that edits an `ios/` file must name a package that builds from
+ * source, or the patch is applied to node_modules and never compiled into the
+ * app (#5296). One error per package.
+ */
+export function checkIosPatchesBuildFromSource(input: BuildFromSourceInput): string[] {
+  const errors: string[] = [];
+  const seen = new Set<string>();
+  for (const rule of input.rules) {
+    if (!rule.file.startsWith('ios/') || seen.has(rule.package)) continue;
+    seen.add(rule.package);
+    if (sourceBuildChain(rule.package, input)) continue;
+    errors.push(
+      `${rule.package}: patch edits ${rule.file}, but nothing builds ${rule.package} from source. Expo's ` +
+        `precompiled modules link its prebuilt xcframework instead, so the patch applies to node_modules and never ` +
+        `reaches the app. Add "${rule.package}" to expo.autolinking.buildFromSource in packages/mobile/package.json.`,
+    );
+  }
+  return errors;
+}
+
+/** Android project metadata consumed by Expo's Gradle publication resolver. */
+export interface AndroidModuleConfig {
+  android?: {
+    name?: string;
+    path?: string;
+    publication?: { repository?: string } | null;
+    projects?: readonly {
+      name: string;
+      path: string;
+      publication?: { repository?: string } | null;
+    }[];
+  };
+}
+
+/**
+ * SDK 58 Android matches source patterns against Gradle project names, whereas
+ * iOS matches npm package names. A scoped package can need both entries:
+ * `@expo/ui` for iOS and `expo-ui` for Android. SettingsManager.kt uses a full
+ * Regex.matches(project.name); ExpoAutolinkingPlugin.kt prints the package icon
+ * only for prebuilt AAR dependencies, which never compile a Kotlin patch.
+ * This guard is scoped to the Filters Expo UI patch (#7312); it does not audit
+ * other Android libraries or change their source selection.
+ */
+export function checkExpoUiAndroidPatchesBuildFromSource(input: {
+  rules: readonly PatchRule[];
+  buildFromSource: readonly string[];
+  readAndroidModuleConfig(pkg: string): AndroidModuleConfig | null;
+}): string[] {
+  const errors: string[] = [];
+  const checkedProjects = new Set<string>();
+  for (const rule of input.rules) {
+    if (rule.package !== '@expo/ui' || !rule.file.startsWith('android/')) continue;
+    const androidConfig = input.readAndroidModuleConfig(rule.package)?.android;
+    // Ordinary native libraries and Expo projects without publications already
+    // compile from source; no additional source-list entry is needed.
+    if (!androidConfig) continue;
+    const defaultProjectName = rule.package.replace(/^@/g, '').replace(/\W+/g, '-');
+    const projects = [
+      {
+        name: androidConfig.name ?? defaultProjectName,
+        path: androidConfig.path ?? 'android',
+        publication: androidConfig.publication,
+      },
+      ...(androidConfig.projects ?? []),
+    ];
+    for (const project of projects) {
+      if (!project.publication || !rule.file.startsWith(`${project.path}/`)) continue;
+      const projectKey = `${rule.package}:${project.name}`;
+      if (checkedProjects.has(projectKey)) continue;
+      checkedProjects.add(projectKey);
+      const buildsFromSource = input.buildFromSource.some((pattern) => {
+        try {
+          return new RegExp(`^(?:${pattern})$`).test(project.name);
+        } catch {
+          return false;
+        }
+      });
+      if (buildsFromSource) continue;
+      errors.push(
+        `${rule.package}: patch edits ${rule.file}, but Android project "${project.name}" can link a prebuilt AAR. ` +
+          `Add "${project.name}" to expo.autolinking.buildFromSource in packages/mobile/package.json; ` +
+          `Android matches Gradle project names, not npm package names.`,
+      );
+    }
+  }
+  return errors;
+}
+
 /**
  * I/O abstracted so {@link checkPatchesApplied} can be unit-tested without a
  * real node_modules tree. The real implementation is {@link createNodeEnv}.
@@ -455,9 +1162,11 @@ export function checkPatchInventory(input: PatchInventoryInput): string[] {
 export interface PatchCheckEnv {
   /** The pnpm-workspace.yaml `patchedDependencies` map. */
   patchedDependencies: Record<string, string>;
-  /** Installed `version` of `pkg` as resolved from packages/mobile. Throws if unresolvable. */
+  /** Owning workspace, used in resolution failure diagnostics; defaults to mobile. */
+  workspace?: string;
+  /** Installed `version` of `pkg` as resolved from the owning workspace. Throws if unresolvable. */
   readInstalledVersion(pkg: string): string;
-  /** Read `fileSubpath` from the installed `pkg` (resolved from packages/mobile). Throws if pkg unresolvable or file absent. */
+  /** Read `fileSubpath` from the installed `pkg` (resolved from the owning workspace). Throws if pkg unresolvable or file absent. */
   readInstalledFile(pkg: string, fileSubpath: string): string;
 }
 
@@ -484,13 +1193,14 @@ export function checkPatchesApplied(rules: readonly PatchRule[], env: PatchCheck
 
   for (const rule of rules) {
     checked += 1;
+    const patchPath = env.patchedDependencies[rule.patchedKey] ?? `patches/${rule.patchedKey}.patch`;
 
     // (1) The patch must still be configured at all.
     if (!Object.prototype.hasOwnProperty.call(env.patchedDependencies, rule.patchedKey)) {
       errors.push(
         `${rule.package}: patch no longer configured — expected key "${rule.patchedKey}" in ` +
           `pnpm-workspace.yaml "patchedDependencies". If you intentionally removed it, also delete the rule in ` +
-          `scripts/mobile-patches-check.ts and patches/${rule.patchedKey}.patch.`,
+          `scripts/mobile-patches-check.ts and its patch file.`,
       );
       continue;
     }
@@ -502,7 +1212,9 @@ export function checkPatchesApplied(rules: readonly PatchRule[], env: PatchCheck
     try {
       installedVersion = env.readInstalledVersion(rule.package);
     } catch (error) {
-      errors.push(`${rule.package}: not resolvable from packages/mobile (${(error as Error).message}).`);
+      errors.push(
+        `${rule.package}: not resolvable from ${env.workspace ?? 'packages/mobile'} (${(error as Error).message}).`,
+      );
       continue;
     }
     if (expectedVersion && installedVersion !== expectedVersion) {
@@ -510,7 +1222,7 @@ export function checkPatchesApplied(rules: readonly PatchRule[], env: PatchCheck
         `${rule.package}: version drift — installed ${installedVersion}, but "patchedDependencies" targets ` +
           `${expectedVersion}. pnpm keys patches by exact version, so this install is UNPATCHED. Regenerate the ` +
           `patch for ${installedVersion} (\`pnpm patch ${rule.package}@${installedVersion}\`, edit, then ` +
-          `\`pnpm patch-commit <dir>\`), update the key + patches/ filename, ` +
+          `\`pnpm patch-commit <dir>\`), update the key + patch filename, ` +
           `then re-run this check.`,
       );
       continue;
@@ -528,7 +1240,7 @@ export function checkPatchesApplied(rules: readonly PatchRule[], env: PatchCheck
     if (missing.length > 0) {
       errors.push(
         `${rule.package}: patch NOT applied — ${rule.file} is missing ${missing.map((s) => `"${s}"`).join(', ')}. ` +
-          `Run \`vp install\` to re-apply patches/${rule.patchedKey}.patch; if it no longer applies cleanly, ` +
+          `Run \`vp install\` to re-apply ${patchPath}; if it no longer applies cleanly, ` +
           `regenerate it with \`pnpm patch ${rule.package}\`.`,
       );
     }
@@ -558,6 +1270,13 @@ export function checkPatchesApplied(rules: readonly PatchRule[], env: PatchCheck
 
     // (5) Shape assertions: a symbol can survive a re-keyed patch while the
     //     dangerous line it replaced comes back with it.
+    const forbiddenFragments = (rule.forbiddenSubstrings ?? []).filter((fragment) => source.includes(fragment));
+    if (forbiddenFragments.length > 0) {
+      errors.push(
+        `${rule.package}: ${rule.file} contains forbidden source ${forbiddenFragments.map((fragment) => `"${fragment}"`).join(', ')}. ` +
+          `Re-verify patches/${rule.patchedKey}.patch against the installed native SDK API.`,
+      );
+    }
     for (const forbidden of rule.forbiddenInMethod ?? []) {
       const body = extractObjCMethodBody(source, forbidden.method);
       if (body === null) {
@@ -582,11 +1301,44 @@ export function checkPatchesApplied(rules: readonly PatchRule[], env: PatchCheck
 }
 
 /** Real-filesystem env used when the script runs for real. */
-export function createNodeEnv(mobilePackageJson: string, patchedDependencies: Record<string, string>): PatchCheckEnv {
-  const requireFromMobile = createRequire(mobilePackageJson);
-  const resolvePackageJson = (pkg: string) => requireFromMobile.resolve(`${pkg}/package.json`);
+export function createNodeEnv(
+  workspacePackageJson: string,
+  patchedDependencies: Record<string, string>,
+  workspace = 'packages/mobile',
+): PatchCheckEnv {
+  const requireFromWorkspace = createRequire(workspacePackageJson);
+  const packageManifests = new Map<string, string>();
+  const resolvePackageJson = (pkg: string): string => {
+    const cached = packageManifests.get(pkg);
+    if (cached) return cached;
+    let manifest: string;
+    try {
+      manifest = requireFromWorkspace.resolve(`${pkg}/package.json`);
+    } catch {
+      // Some native packages hide package.json through their exports map.
+      // Resolve the owning workspace entry, then verify the containing package
+      // name rather than guessing a workspace/store node_modules path.
+      let directory = dirname(requireFromWorkspace.resolve(pkg));
+      while (true) {
+        const candidate = resolve(directory, 'package.json');
+        if (existsSync(candidate)) {
+          const candidateManifest = JSON.parse(readFileSync(candidate, 'utf8')) as { name?: string };
+          if (candidateManifest.name === pkg) {
+            manifest = candidate;
+            break;
+          }
+        }
+        const parent = dirname(directory);
+        if (parent === directory) throw new Error(`Cannot locate package.json for resolved package '${pkg}'`);
+        directory = parent;
+      }
+    }
+    packageManifests.set(pkg, manifest);
+    return manifest;
+  };
   return {
     patchedDependencies,
+    workspace,
     readInstalledVersion(pkg) {
       const { version } = JSON.parse(readFileSync(resolvePackageJson(pkg), 'utf8')) as { version?: string };
       if (!version) throw new Error(`no "version" field in ${pkg}/package.json`);
@@ -596,6 +1348,31 @@ export function createNodeEnv(mobilePackageJson: string, patchedDependencies: Re
       return readFileSync(resolve(dirname(resolvePackageJson(pkg)), fileSubpath), 'utf8');
     },
   };
+}
+
+/** Read `pkg`'s installed spm.config.json through `env`; null when it has none or can't be resolved. */
+export function readSpmConfigFrom(env: Pick<PatchCheckEnv, 'readInstalledFile'>, pkg: string): SpmConfig | null {
+  let raw: string;
+  try {
+    raw = env.readInstalledFile(pkg, 'spm.config.json');
+  } catch {
+    return null;
+  }
+  return JSON.parse(raw) as SpmConfig;
+}
+
+/** Read only Expo module metadata; non-Expo packages need no publication check. */
+export function readAndroidModuleConfigFrom(
+  env: Pick<PatchCheckEnv, 'readInstalledFile'>,
+  pkg: string,
+): AndroidModuleConfig | null {
+  let raw: string;
+  try {
+    raw = env.readInstalledFile(pkg, 'expo-module.config.json');
+  } catch {
+    return null;
+  }
+  return JSON.parse(raw) as AndroidModuleConfig;
 }
 
 /** Wire the real filesystem and run the check. Returns the process exit code. */
@@ -624,23 +1401,57 @@ export function main(): number {
 
   const env = createNodeEnv(mobilePackageJson, patchedDependencies);
   const { checked, errors } = checkPatchesApplied(RULES, env);
+  const webEnv = createNodeEnv(resolve(repoRoot, 'packages/web/package.json'), patchedDependencies, 'packages/web');
+  const webResult = checkPatchesApplied(WEB_RULES, webEnv);
   const inventoryErrors = checkPatchInventory({
     patchedDependencies,
     patchFilenames,
-    serverPatchPaths: Object.values(SERVER_PATCHES).filter((patchPath) => existsSync(resolve(repoRoot, patchPath))),
+    nonNativePatchPaths: Object.values(NON_NATIVE_PATCHES).filter((patchPath) =>
+      existsSync(resolve(repoRoot, patchPath)),
+    ),
     guardedKeys: RULES.map((rule) => rule.patchedKey),
     allowUnguarded: UNGUARDED_PATCHES,
   });
-  const allErrors = [...errors, ...inventoryErrors];
+  let buildFromSource: string[];
+  let androidBuildFromSource: string[];
+  try {
+    const mobileManifest = JSON.parse(readFileSync(mobilePackageJson, 'utf8')) as {
+      expo?: { autolinking?: { buildFromSource?: string[]; android?: { buildFromSource?: string[] } } };
+    };
+    buildFromSource = mobileManifest.expo?.autolinking?.buildFromSource ?? [];
+    androidBuildFromSource = mobileManifest.expo?.autolinking?.android?.buildFromSource ?? buildFromSource;
+  } catch (error) {
+    console.error(`[mobile-patches] FAILED — cannot read packages/mobile/package.json: ${(error as Error).message}`);
+    return 1;
+  }
+  const buildFromSourceErrors = checkIosPatchesBuildFromSource({
+    rules: RULES,
+    buildFromSource,
+    readSpmConfig: (pkg) => readSpmConfigFrom(env, pkg),
+  });
+
+  const expoUiAndroidBuildFromSourceErrors = checkExpoUiAndroidPatchesBuildFromSource({
+    rules: RULES,
+    buildFromSource: androidBuildFromSource,
+    readAndroidModuleConfig: (pkg) => readAndroidModuleConfigFrom(env, pkg),
+  });
+
+  const allErrors = [
+    ...errors,
+    ...webResult.errors,
+    ...inventoryErrors,
+    ...buildFromSourceErrors,
+    ...expoUiAndroidBuildFromSourceErrors,
+  ];
 
   if (allErrors.length > 0) {
-    console.error('[mobile-patches] FAILED — native patch(es) not applied:');
+    console.error('[mobile-patches] FAILED — patch(es) not applied:');
     for (const error of allErrors) console.error(`  ✗ ${error}`);
     return 1;
   }
 
   console.log(
-    `[mobile-patches] OK — ${checked} native patch(es) applied, ${patchFilenames.length} patch file(s) accounted for.`,
+    `[mobile-patches] OK — ${checked} native and ${webResult.checked} web patch rule(s) applied, ${patchFilenames.length} native patch file(s) accounted for.`,
   );
   return 0;
 }

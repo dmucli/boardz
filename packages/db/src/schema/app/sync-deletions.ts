@@ -10,7 +10,7 @@ import { sql } from 'drizzle-orm';
  *
  * `record_id` holds the row's NATURAL key (not the server bigserial id), encoded
  * exactly as the mobile local PK so the client can split it back into columns —
- * see docs/sync-table-manifest.md "Del:" lines per table. Examples:
+ * see docs/data/sync-table-manifest.md "Del:" lines per table. Examples:
  *   boardsesh_ticks  -> OLD.uuid
  *   user_favorites   -> board_name:climb_uuid:angle
  *   board_climb_stats-> board_type:climb_uuid:angle
@@ -44,6 +44,10 @@ export const syncDeletions = pgTable(
     // Prune path (sync-deletions-prune.ts): DELETE WHERE deleted_at < cutoff
     // can't use the user-scoped composite or the NULL-scope partial index.
     pruneIdx: index('sync_deletions_deleted_at_idx').on(table.deletedAt),
+    // Stable offline creates must not resurrect a UUID already deleted elsewhere.
+    climbIdentityIdx: index('sync_deletions_climb_identity_idx')
+      .on(table.recordId)
+      .where(sql`${table.tableName} = 'board_climbs'`),
   }),
 );
 

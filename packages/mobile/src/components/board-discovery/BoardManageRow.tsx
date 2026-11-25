@@ -1,5 +1,7 @@
+import { PressableSurface } from '../PressableSurface';
+import { sprayImportCopy } from '../../lib/spray/spray-import-progress';
 import { memo, useEffect, useMemo, useRef } from 'react';
-import { AccessibilityInfo, Platform, Pressable, View, StyleSheet } from 'react-native';
+import { AccessibilityInfo, Platform, View, StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import { boardRowSubtitle, toBoardName } from '@boardsesh/board-config';
@@ -14,12 +16,14 @@ import { formatBytes } from '../../lib/format-bytes';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { useTheme } from '../../providers/theme-provider';
-import { spacing, borderRadius } from '../../theme/tokens';
+import { opacity, spacing, borderRadius } from '../../theme/tokens';
 
 const THUMB_SIZE = 56;
 
 type BoardManageRowProps = {
   board: UserBoard;
+  importStatusStale?: boolean;
+  onOpenImport?: (board: UserBoard) => void;
   /**
    * True when the viewer owns this board. Still needed after the edit/delete
    * affordances moved to the picker's cards: it is what decides whether the
@@ -43,13 +47,14 @@ type BoardManageRowProps = {
    */
   isBootstrapping?: boolean;
   /**
-   * Live byte/percent detail for the snapshot warm-up (issue #4311), for THIS
+   * Live byte/percent and phase detail for the whole download, for THIS
    * row only — null on every other row, so their memo holds while this one
    * re-renders. Null also covers a build where the progress flag is off or the
    * downloader emits nothing, in which case the row keeps the plain
    * "Downloading board…" caption.
    */
   downloadProgress?: BoardDownloadProgress | null;
+  keepsScreenAwake?: boolean;
   /** Durable context for a retrying snapshot or a paged-crawl fallback. */
   downloadNotice?: BoardDownloadNotice;
   /**
@@ -60,6 +65,12 @@ type BoardManageRowProps = {
   canRetryFastDownload?: boolean;
   onRetryFastDownload?: (board: UserBoard) => void;
   onToggleOffline: (board: UserBoard) => void;
+  /**
+   * True when offline storage is paused for the session (the database belongs to
+   * a newer app version, see db/schema-downgrade). The toggle and the retry stay
+   * where they are, dimmed and not tappable; the screen says why in its header.
+   */
+  offlineControlsDisabled?: boolean;
 };
 
 /**
@@ -72,19 +83,24 @@ type BoardManageRowProps = {
  */
 function BoardManageRowComponent({
   board,
+  importStatusStale = false,
+  onOpenImport,
   isOwned,
   isActive,
   downloadState,
   downloadCount,
   isBootstrapping,
   downloadProgress = null,
+  keepsScreenAwake = false,
   downloadNotice = null,
   canRetryFastDownload = false,
   onRetryFastDownload,
   onToggleOffline,
+  offlineControlsDisabled = false,
 }: BoardManageRowProps) {
   const { t, i18n } = useTranslation('boards');
-  const { systemColors, brandColors } = useTheme();
+  const importCopy = board.sprayImport ? sprayImportCopy(board.sprayImport, importStatusStale) : null;
+  const { systemColors, brandColors, selection } = useTheme();
 
   const boardName = toBoardName(board.boardType);
   // Every wall in Manage Boards, not just the active one. A non-active spray wall
@@ -125,26 +141,40 @@ function BoardManageRowComponent({
   const effectiveDownloadNotice = isBootstrapping ? null : downloadNotice;
   const showsPagedFallbackCount = effectiveDownloadNotice === 'paged-fallback' && downloadState === 'downloading';
 
+  // Keep live finishing counts in the existing caption rather than adding a
+  // text row after FlashList has measured the board.
+  const finishingRowsStatus =
+    downloadProgress?.phase === 'finishing' &&
+    downloadProgress.fraction === null &&
+    downloadProgress.rowsProcessed !== undefined
+      ? t('mobile.offline.pill.rows', { count: downloadProgress.rowsProcessed })
+      : null;
+
   // The staged bootstrap caption (issue #4311). Every byte figure comes from the
   // engine on the WIRE scale, so this renders the same number the enable-confirm
   // dialog quoted. Falls back to the plain "Downloading board…" string whenever
   // there is no frame yet — first render, flag off, or a downloader that never
   // reports.
-  const bootstrapProgressStatus =
-    isBootstrapping && downloadProgress
-      ? downloadProgress.stage === 'manifest'
-        ? t('mobile.offline.bootstrapPreparing')
-        : downloadProgress.stage === 'import'
-          ? t('mobile.offline.bootstrapImporting')
-          : downloadProgress.bytesDone !== null && downloadProgress.bytesTotal !== null
-            ? t('mobile.offline.bootstrapDownloading', {
-                done: formatBytes(downloadProgress.bytesDone, i18n.language),
-                total: formatBytes(downloadProgress.bytesTotal, i18n.language),
-              })
-            : t('mobile.offline.bootstrapDownloadingUnknown', {
-                total: formatBytes(downloadProgress.bytesTotal ?? 0, i18n.language),
-              })
-      : null;
+  const bootstrapProgressStatus = downloadProgress
+    ? downloadProgress.phase === 'grades'
+      ? t('mobile.offline.bootstrapGrades')
+      : downloadProgress.phase === 'finishing'
+        ? (finishingRowsStatus ?? t('mobile.offline.finalizing'))
+        : downloadProgress.stage === 'manifest'
+          ? t('mobile.offline.bootstrapPreparing')
+          : downloadProgress.stage === 'import'
+            ? t('mobile.offline.bootstrapImporting')
+            : downloadProgress.bytesDone !== null && downloadProgress.bytesTotal !== null
+              ? t('mobile.offline.bootstrapDownloading', {
+                  done: formatBytes(downloadProgress.bytesDone, i18n.language),
+                  total: formatBytes(downloadProgress.bytesTotal, i18n.language),
+                })
+              : downloadProgress.rowsProcessed !== undefined
+                ? t('mobile.offline.downloadingCount', { count: downloadProgress.rowsProcessed })
+                : t('mobile.offline.bootstrapDownloadingUnknown', {
+                    total: formatBytes(downloadProgress.bytesTotal ?? 0, i18n.language),
+                  })
+    : null;
 
   const offlineStatus =
     effectiveDownloadNotice === 'snapshot-retrying'
@@ -154,13 +184,14 @@ function BoardManageRowComponent({
           ? t('mobile.offline.pagedFallbackActive')
           : t('mobile.offline.pagedFallbackPending')
         : downloadState === 'downloading'
-          ? isBootstrapping
-            ? (bootstrapProgressStatus ?? t('mobile.offline.bootstrapping'))
-            : t('mobile.offline.downloadingCount', { count: downloadCount ?? 0 })
+          ? (bootstrapProgressStatus ??
+            (isBootstrapping
+              ? (bootstrapProgressStatus ?? t('mobile.offline.bootstrapping'))
+              : t('mobile.offline.downloadingCount', { count: downloadCount ?? 0 })))
           : downloadState === 'downloaded'
             ? t('mobile.offline.available')
             : downloadState === 'finalizing'
-              ? t('mobile.offline.finalizing')
+              ? (finishingRowsStatus ?? t('mobile.offline.finalizing'))
               : downloadState === 'pending'
                 ? t('mobile.offline.pending')
                 : null;
@@ -174,7 +205,7 @@ function BoardManageRowComponent({
           : t('mobile.offline.pagedFallbackPendingAria', { name: board.name })
         : undefined;
   const pagedFallbackProgress = showsPagedFallbackCount
-    ? t('mobile.offline.downloadingCount', { count: downloadCount ?? 0 })
+    ? (finishingRowsStatus ?? t('mobile.offline.downloadingCount', { count: downloadCount ?? 0 }))
     : null;
 
   // Android's polite live region handles semantic notice transitions. React
@@ -208,7 +239,7 @@ function BoardManageRowComponent({
           styles.thumb,
           {
             backgroundColor: systemColors.tertiaryBackground,
-            borderColor: isActive ? brandColors.primary : systemColors.separator,
+            borderColor: isActive ? selection.checkmark : systemColors.separator,
             borderWidth: isActive ? 2 : StyleSheet.hairlineWidth,
           },
         ]}
@@ -239,10 +270,22 @@ function BoardManageRowComponent({
         <Text variant="subheadline" color={systemColors.secondaryLabel} numberOfLines={1}>
           {subtitle}
         </Text>
-        {offlineStatus ? (
+        {importCopy ? (
+          <Text variant="caption1" color={brandColors.primary} accessibilityLiveRegion="polite">
+            {t(importCopy.textI18nKey, importCopy.params)}
+          </Text>
+        ) : null}
+        {board.sprayImport && onOpenImport ? (
+          <PressableSurface onPress={() => onOpenImport(board)} accessibilityRole="button" hitSlop={8}>
+            <Text variant="caption1" color={brandColors.primary}>
+              {board.sprayImport.stage === 'ready' ? t('sprayImport.review') : t('sprayImport.open')}
+            </Text>
+          </PressableSurface>
+        ) : null}
+        {offlineStatus && !board.sprayImport ? (
           <Text
             variant="caption1"
-            color={downloadState === 'downloaded' ? brandColors.primary : systemColors.tertiaryLabel}
+            color={downloadState === 'downloaded' ? brandColors.primary : systemColors.secondaryLabel}
             numberOfLines={effectiveDownloadNotice ? undefined : 1}
             accessibilityLabel={offlineStatusAccessibilityLabel}
             accessibilityLiveRegion={Platform.OS === 'android' && effectiveDownloadNotice ? 'polite' : undefined}
@@ -250,46 +293,56 @@ function BoardManageRowComponent({
             {offlineStatus}
           </Text>
         ) : null}
+        {keepsScreenAwake ? (
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
+            {t('mobile.offline.screenAwakeHint')}
+          </Text>
+        ) : null}
         {pagedFallbackProgress ? (
-          <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={1} accessibilityLiveRegion="none">
+          <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={1} accessibilityLiveRegion="none">
             {pagedFallbackProgress}
           </Text>
         ) : null}
         {/* Rendered unconditionally when the row can download at all, so the
             first progress frame cannot change the row's height inside the
             FlashList and jump the scroll position. */}
-        {downloadState !== undefined ? (
-          <OfflineDownloadProgressBar
-            fraction={downloadProgress && downloadProgress.stage === 'download' ? downloadProgress.fraction : undefined}
-          />
+        {downloadState !== undefined && !board.sprayImport ? (
+          <OfflineDownloadProgressBar fraction={downloadProgress?.fraction} />
         ) : null}
         {canRetryFastDownload && onRetryFastDownload ? (
-          <Pressable
+          <PressableSurface
             onPress={() => onRetryFastDownload(board)}
+            disabled={offlineControlsDisabled}
             hitSlop={8}
             accessibilityRole="button"
             accessibilityLabel={t('mobile.offline.retryFastDownloadAria', { name: board.name })}
-            style={({ pressed }) => [styles.retryFastDownload, pressed && styles.pressed]}
+            accessibilityState={{ disabled: offlineControlsDisabled }}
+            style={({ pressed }) => [
+              styles.retryFastDownload,
+              pressed && styles.pressed,
+              offlineControlsDisabled && styles.controlDisabled,
+            ]}
           >
             <Text variant="caption1" color={brandColors.primary}>
               {t('mobile.offline.retryFastDownload')}
             </Text>
-          </Pressable>
+          </PressableSurface>
         ) : null}
       </View>
 
-      {downloadState !== undefined ? (
+      {downloadState !== undefined && !board.sprayImport ? (
         <BoardOfflineToggle
           state={downloadState}
           onPress={() => onToggleOffline(board)}
           accessibilityLabel={offlineToggleAria}
+          disabled={offlineControlsDisabled}
         />
       ) : null}
 
       {isActive ? (
         <View style={styles.activeBadge}>
-          <Icon name="tick" size={14} color={brandColors.primary} />
-          <Text variant="caption1" color={brandColors.primary}>
+          <Icon name="tick.fill" size={14} color={selection.checkmark} />
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('mobile.boardDetail.alreadyActive')}
           </Text>
         </View>
@@ -311,6 +364,9 @@ const styles = StyleSheet.create({
   },
   pressed: {
     opacity: 0.5,
+  },
+  controlDisabled: {
+    opacity: opacity.disabled,
   },
   retryFastDownload: {
     alignSelf: 'flex-start',

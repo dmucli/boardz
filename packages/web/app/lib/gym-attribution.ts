@@ -3,8 +3,9 @@
 // The vocabulary — the param names, the `medium` union, the parser, and the
 // `buildGymQrHref`/`stripGymQrParams` pair — lives in `@boardsesh/analytics`'s
 // gym-funnel module and is imported here, never restated. This file adds only
-// the www-specific URLs built on top of it: what a printed code encodes, what
-// survives a redirect, and where the Play Store link points.
+// the www-specific URLs built on top of it: what a printed code encodes and what
+// survives a redirect. Where a store link points, and what it says about a scan,
+// is `store-links.ts`.
 //
 // Everything here is pure and synchronous so a server component, a client
 // island and a test all call the same function and get the same string. A QR
@@ -19,27 +20,11 @@ import {
   type GymQrMedium,
   type GymQrSearchParams,
 } from '@boardsesh/analytics';
+import { INBOUND_CAMPAIGN_PARAMS, parseInboundCampaign } from '@/app/lib/inbound-campaign';
+import { localeHref } from '@/app/lib/i18n/locale-href';
+import type { Locale } from '@/app/lib/i18n/config';
 import { absoluteUrl } from '@/app/lib/seo/base-url';
-import { ANDROID_PLAY_STORE_URL } from '@/app/lib/store-urls';
-
-/**
- * The `utm_source` every Boardsesh-owned printed or on-wall surface reports.
- * One value across all of them: the interesting split is `utm_medium`
- * (which surface) and `utm_campaign` (which gym), not who owns the link.
- */
-export const GYM_UTM_SOURCE = 'boardsesh';
-
-/**
- * `utm_medium` for the store links reached from a gym page. `qr` rather than
- * `web`, because the traffic this measures arrives by scanning a code on the
- * wall — a QR poster scan is the acquisition path #4379 exists to count.
- */
-export const GYM_UTM_MEDIUM = 'qr';
-
-/** `utm_campaign` value for one gym. `gym-` prefixed so campaigns from other surfaces stay distinguishable. */
-export function gymInstallCampaign(gymSlug: string): string {
-  return `gym-${gymSlug}`;
-}
+import { WALL_CAPABILITY_PARAM } from '@/app/lib/spray/spray-visibility';
 
 /**
  * The absolute URL a printed gym QR encodes.
@@ -55,19 +40,95 @@ export function gymQrUrl(gymSlug: string, medium: GymQrMedium = 'poster'): strin
 }
 
 /**
- * The absolute URL a per-board QR encodes — the kiosk's install code, and any
- * future code stuck to one wall.
+ * The absolute URL a per-board QR encodes — the kiosk's install code, and the
+ * printed board poster (`/poster/b/{slug}`, `medium=board`, #4415).
  *
- * IMPORTANT and deliberate: `/b/{slug}` does NOT reach the QR landing tracker,
- * which only mounts on `/gym/[gym_slug]`. A `medium=kiosk` or `medium=board`
- * scan therefore cannot fire `Gym QR Scanned` — see the module comment on
- * `GYM_QR_MEDIUMS`. The params are still carried through
- * `app/b/[board_slug]/page.tsx`'s redirect so a first-party counter (#4387) or
- * a server log can attribute the visit, and so pointing one of these codes at a
- * gym page later is a one-line change rather than a reprint.
+ * `/b/{slug}` is not a gym page, so these scans never fire `Gym QR Scanned`.
+ * `app/b/[board_slug]/page.tsx`'s redirect carries the params onto
+ * `/b/{slug}/{angle}/list`, where `QrLandingTracker` counts them as
+ * `Board QR Scanned`. See "Which code fires which event" in
+ * `docs/analytics/gym-funnel-analytics.md`.
+ *
+ * `wallUuid` is an UNLISTED spray wall's share-link capability. It goes first,
+ * `?wall=<uuid>&src=qr&medium=board`, the same param `buildSprayWallShareUrl`
+ * puts on the wall's share link (`packages/mobile/src/lib/spray/spray-share.ts`)
+ * and the one `/b/{slug}` re-emits onto its redirect. Without it an unlisted
+ * wall's code would scan to a 404. Leave it out for everything else: a public
+ * wall and every LED board open on the plain slug, and a shorter URL is a
+ * smaller code with bigger modules.
  */
-export function boardQrUrl(boardSlug: string, medium: GymQrMedium): string {
-  return absoluteUrl(buildGymQrHref(`/b/${encodeURIComponent(boardSlug)}`, medium));
+export function boardQrUrl(boardSlug: string, medium: GymQrMedium, options: { wallUuid?: string } = {}): string {
+  const boardPath = `/b/${encodeURIComponent(boardSlug)}`;
+  const path = options.wallUuid
+    ? `${boardPath}?${WALL_CAPABILITY_PARAM}=${encodeURIComponent(options.wallUuid)}`
+    : boardPath;
+  return absoluteUrl(buildGymQrHref(path, medium));
+}
+
+/**
+ * The absolute URL a climb page's code encodes: the climb page itself, in the
+ * reader's language, with `?src=qr&medium=desktop`.
+ *
+ * The code sits beside "Open in your browser" on a laptop, so a climber can
+ * carry the climb to their phone. A phone with the app opens the climb in it
+ * (the app claims climb links); one without lands on this page, where
+ * `QrLandingTracker` counts `Climb QR Scanned` and the store button is the
+ * first thing on screen.
+ *
+ * `handoffPath` is the pathname the reader is on, without a locale prefix and
+ * without a query string: on `/b/{slug}` it keeps the board the reader arrived
+ * with, like the hand-off. The page never reads the two params on the server,
+ * so the scanned URL renders the same HTML as the plain one.
+ */
+export function climbQrUrl(handoffPath: string, locale: Locale): string {
+  return desktopQrUrl(handoffPath, locale);
+}
+
+/**
+ * The absolute URL a board list's code encodes: the list itself, in the
+ * reader's language, with `?src=qr&medium=desktop`. The climb page's code
+ * pointed at the list, beside the same "Open in your browser" button.
+ *
+ * `listPath` is the list's clean pathname, the one its pagination hangs off:
+ * page 1, no locale prefix, no query string. On `/b/{slug}` it keeps the board
+ * the reader arrived with. `QrLandingTracker` with `kind="list"` counts the scan
+ * as `List QR Scanned`.
+ */
+export function listQrUrl(listPath: string, locale: Locale): string {
+  return desktopQrUrl(listPath, locale);
+}
+
+/**
+ * The absolute URL a setter page's code encodes: page 1 of the setter's page,
+ * in the reader's language, with `?src=qr&medium=desktop`. `setterPath` is
+ * `/setter/{encoded name}`, no locale prefix, no query string.
+ * `QrLandingTracker` with `kind="setter"` counts the scan as `Setter QR Scanned`.
+ */
+export function setterQrUrl(setterPath: string, locale: Locale): string {
+  return desktopQrUrl(setterPath, locale);
+}
+
+/**
+ * The absolute URL a public playlist's code encodes: `/playlists/{uuid}` in
+ * the reader's language, with `?src=qr&medium=desktop`. `QrLandingTracker`
+ * with `kind="playlist"` counts the scan as `Playlist QR Scanned`.
+ */
+export function playlistQrUrl(playlistUuid: string, locale: Locale): string {
+  return desktopQrUrl(`/playlists/${encodeURIComponent(playlistUuid)}`, locale);
+}
+
+/**
+ * The absolute URL the home page's code encodes: `/` in the reader's language,
+ * with `?src=qr&medium=desktop`. A phone lands on the home page, whose first
+ * action there is its own store badge. `QrLandingTracker` with `kind="home"`
+ * counts the scan as `Home QR Scanned`.
+ */
+export function homeQrUrl(locale: Locale): string {
+  return desktopQrUrl('/', locale);
+}
+
+function desktopQrUrl(pagePath: string, locale: Locale): string {
+  return absoluteUrl(buildGymQrHref(localeHref(pagePath, locale), 'desktop'));
 }
 
 /**
@@ -96,38 +157,38 @@ export function gymQrAttributionQuery(searchParams: GymQrSearchParams): string {
 }
 
 /**
- * The Google Play URL a gym page's Android install button points at.
+ * The query string a gym-page redirect carries to the canonical URL: the QR
+ * pair from `gymQrAttributionQuery`, then the campaign params the visit landed
+ * with (`utm_*`, `gclid`), or `''` when the request has neither (#6027).
  *
- * It sets `referrer` AND the bare `utm_*` params, and the `referrer` is the one
- * that actually does the work. Play populates the Install Referrer API from the
- * **`referrer` query parameter** of the store URL, and
- * `packages/mobile/src/lib/install-referrer.ts` reads that string back with
- * `new URLSearchParams(raw)` to pull `utm_source`, `utm_medium` and
- * `utm_campaign` out of it. So `referrer` carries a nested, percent-encoded
- * copy of the same three params — a link with only the bare `utm_*` params
- * reads fine to a human, satisfies #4379's literal wording, and produces zero
- * attributed installs, because the mobile parser never sees them.
+ * A gym's own bio link (`/gym/old-slug?utm_source=instagram&utm_medium=social`)
+ * outlives a slug change the same way a poster does. The 308 used to drop
+ * everything but the QR pair, so the visit reached the canonical page looking
+ * like direct traffic: no `utm_source` on its `$pageview`, none on `App Install
+ * Click`, and a store link that said `boardsesh` / `web`.
  *
- * The bare `utm_*` params stay because the Play web console's acquisition
- * reports read those, and they cost nothing.
- *
- * iOS is untouched: the App Store link keeps its existing URL. Apple has no
- * install-referrer equivalent here and iOS attribution is out of scope (#3402).
+ * Still an allowlist. Only the names in `INBOUND_CAMPAIGN_PARAMS` come out,
+ * each value trimmed and capped by `parseInboundCampaign` and re-encoded here,
+ * so `?next=`, `?claim=` and anything else a crafted link carries is dropped as
+ * before. Carrying the campaign params hands a crafted link nothing new: the
+ * same params on the canonical URL are read by the page with no redirect
+ * involved. A repeated param keeps its first value, as it does in the browser.
  */
-export function playStoreUrlForGym(gymSlug: string): string {
-  const campaign = gymInstallCampaign(gymSlug);
-  // The value Play hands the app verbatim; the mobile parser splits it as a
-  // query string, so it is built as one and then encoded once as a param value.
-  const referrer = new URLSearchParams({
-    utm_source: GYM_UTM_SOURCE,
-    utm_medium: GYM_UTM_MEDIUM,
-    utm_campaign: campaign,
-  });
+export function gymRedirectAttributionQuery(searchParams: GymQrSearchParams): string {
+  const requested = new URLSearchParams();
+  for (const param of INBOUND_CAMPAIGN_PARAMS) {
+    const requestedValue = searchParams[param];
+    const firstValue = Array.isArray(requestedValue) ? requestedValue[0] : requestedValue;
+    if (firstValue !== undefined) requested.set(param, firstValue);
+  }
+  const campaign = parseInboundCampaign(requested.toString());
 
-  const url = new URL(ANDROID_PLAY_STORE_URL);
-  url.searchParams.set('utm_source', GYM_UTM_SOURCE);
-  url.searchParams.set('utm_medium', GYM_UTM_MEDIUM);
-  url.searchParams.set('utm_campaign', campaign);
-  url.searchParams.set('referrer', referrer.toString());
-  return url.toString();
+  const redirectParams = new URLSearchParams(gymQrAttributionQuery(searchParams));
+  for (const param of INBOUND_CAMPAIGN_PARAMS) {
+    const campaignValue = campaign?.[param];
+    if (campaignValue) redirectParams.set(param, campaignValue);
+  }
+
+  const query = redirectParams.toString();
+  return query ? `?${query}` : '';
 }

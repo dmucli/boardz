@@ -9,11 +9,9 @@
 // won't scan (a QR needs a light quiet zone), so we render black modules on a
 // white card and keep the caption dark-on-white too.
 //
-// TARGET NOTE: /b/{slug} opens the WEB board page (which carries install CTAs)
-// everywhere, and is iOS-universal-link eligible. It does NOT yet open the
-// mobile app straight to the board — that needs a native mobile app/b/[slug]
-// route + an Android /b autoVerify intent filter (see the tracked follow-up
-// issue). The web board page is the current fallback.
+// TARGET NOTE: /b/{slug} opens the app on iOS (universal link) and Android
+// (`/b/` intent filter), via the app/b/[board_slug] route. Without the app it
+// falls back to the web board page, which carries install CTAs.
 
 import React from 'react';
 import { QRCodeSVG } from 'qrcode.react';
@@ -23,12 +21,10 @@ import styles from './board-install-qr.module.css';
 
 export default function BoardInstallQr({ slug }: { slug: string }) {
   const { t } = useTranslation('kiosk');
-  // Carries `?src=qr&medium=kiosk` (#4379). It cannot fire `Gym QR Scanned` —
-  // that tracker only mounts on `/gym/[gym_slug]` and this code points at
-  // `/b/{slug}` — but the params now survive `/b/[board_slug]`'s redirect
-  // instead of being dropped, so the scan is attributable from server logs and
-  // to the first-party counters in #4387, and re-aiming this code at a gym page
-  // later is a code change rather than a reprint.
+  // Carries `?src=qr&medium=kiosk` (#4379). The params survive `/b/[board_slug]`'s
+  // redirect, and the board list it lands on counts the scan as
+  // `Board QR Scanned` with `medium: 'kiosk'` (#4415). Not `Gym QR Scanned`:
+  // that one is the gym poster's, on `/gym/[gym_slug]`.
   const installUrl = boardQrUrl(slug, 'kiosk');
 
   return (

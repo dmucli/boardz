@@ -13,7 +13,7 @@
  * Its consumer is the seeded developer database image
  * (packages/db/docker/Dockerfile.dev-db), which used to scrape six Aurora APKs
  * at build time to get exactly this data. Geometry is also useful to anyone
- * using the public dataset (docs/board-snapshots-dataset.md) — the climb
+ * using the public dataset (docs/data/board-snapshots-dataset.md) — the climb
  * artifacts reference layout/size/set ids that only mean something with it.
  *
  * Everything here is public, non-personal catalogue data: t-nut coordinates,
@@ -42,6 +42,7 @@ import {
   CATALOG_SNAPSHOT_EXCLUDED_COLUMNS,
   CATALOG_SNAPSHOT_REDACTED_COLUMNS,
   CATALOG_SNAPSHOT_REDACTED_VALUE,
+  catalogSnapshotBoardTypeFilter,
   type CatalogSnapshotTableName,
 } from '@boardsesh/db/catalog-snapshot';
 import {
@@ -183,7 +184,41 @@ async function streamTableIntoSqlite(
         : column.name,
     )
     .join(', ');
-  const selectSql = `SELECT ${selectList} FROM ${tableName}`;
+  // Immutable public artifacts contain published manufacturer catalog data only:
+  // no beta or alias row points at a draft. Personal beta remains revocable
+  // through the authenticated API, including its URL.
+  const catalogueScope =
+    tableName === 'board_beta_links'
+      ? ` WHERE created_by_user_id IS NULL AND tick_uuid IS NULL AND board_id IS NULL
+        AND NOT EXISTS (SELECT 1 FROM content_privacy snapshot_beta_privacy
+          WHERE snapshot_beta_privacy.entity_type = 'beta'
+            AND snapshot_beta_privacy.entity_id = board_beta_links.board_type || ':' || board_beta_links.climb_uuid || ':' || board_beta_links.link)
+        AND EXISTS (SELECT 1 FROM board_climbs snapshot_beta_climb
+          WHERE snapshot_beta_climb.board_type = board_beta_links.board_type
+            AND snapshot_beta_climb.uuid = board_beta_links.climb_uuid
+            AND snapshot_beta_climb.user_id IS NULL AND NOT snapshot_beta_climb.is_boardsesh_authored
+            AND snapshot_beta_climb.is_draft IS NOT TRUE
+            AND snapshot_beta_climb.board_type <> 'spray')`
+      : tableName === 'board_climb_aliases'
+        ? ` WHERE EXISTS (SELECT 1 FROM board_climbs snapshot_alias_climb
+          WHERE snapshot_alias_climb.board_type = board_climb_aliases.board_type
+            AND snapshot_alias_climb.uuid = board_climb_aliases.canonical_uuid
+            AND snapshot_alias_climb.user_id IS NULL AND NOT snapshot_alias_climb.is_boardsesh_authored
+            AND snapshot_alias_climb.is_draft IS NOT TRUE
+            AND snapshot_alias_climb.board_type <> 'spray')`
+        : '';
+  // Spray walls are private, runtime-created catalogue rows (a wall's name, its
+  // marked holds). No table publishes them. See CATALOG_SNAPSHOT_EXCLUDED_BOARD_TYPES.
+  const boardTypeFilter = columnNames.includes('board_type')
+    ? catalogSnapshotBoardTypeFilter(`${tableName}.board_type`)
+    : null;
+  const rowScope =
+    boardTypeFilter === null
+      ? catalogueScope
+      : catalogueScope === ''
+        ? ` WHERE ${boardTypeFilter}`
+        : `${catalogueScope}\n        AND ${boardTypeFilter}`;
+  const selectSql = `SELECT ${selectList} FROM ${tableName}${rowScope}`;
   for await (const batch of tx.unsafe(selectSql).cursor(2000)) {
     for (const row of batch as RawRow[]) {
       const normalized = normalizeRow(row);
@@ -244,7 +279,7 @@ export async function buildCatalogArtifact(params: {
   return tables;
 }
 
-export type CatalogExportOptions = { dryRun: boolean; keyPrefix: string };
+export type CatalogExportOptions = { dryRun: boolean; keyPrefix: string; skipPrune?: boolean };
 
 /** The per-layout export's injection points, minus the replay observer it has no use for. The CLI passes none. */
 export type CatalogExportDependencies = Omit<SnapshotExportDependencies, 'requireAllRolesVisible'>;
@@ -253,8 +288,11 @@ export function parseArgs(argv: string[]): CatalogExportOptions {
   const options: CatalogExportOptions = { dryRun: false, keyPrefix: DEFAULT_CATALOG_KEY_PREFIX };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
+    if (arg === '--') continue;
     if (arg === '--dry-run') {
       options.dryRun = true;
+    } else if (arg === '--no-prune') {
+      options.skipPrune = true;
     } else if (arg === '--key-prefix') {
       index += 1;
       const raw = argv[index];
@@ -395,7 +433,7 @@ export async function runCatalogExportWithOptions(
       durationMs: Date.now() - startedAt,
     });
 
-    await pruneStaleArtifacts(manifest, Date.now(), options.keyPrefix, log);
+    if (!options.skipPrune) await pruneStaleArtifacts(manifest, Date.now(), options.keyPrefix, log);
   } finally {
     if (!options.dryRun) rmSync(workDir, { recursive: true, force: true });
   }

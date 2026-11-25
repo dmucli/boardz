@@ -3,7 +3,16 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { parse } from 'yaml';
+
+import buildExpoConfig, {
+  ANDROID_BOARD_LINK_PREFIXES,
+  ANDROID_LINK_LOCALE_SEGMENTS,
+  ANDROID_LOCALISED_BOARD_LINK_PREFIXES,
+} from '../packages/mobile/app.config';
+import { DEFAULT_LOCALE, SUPPORTED_LOCALES } from '../packages/shared/i18n/src/config';
+import { SUPPORTED_BOARDS } from '../packages/shared-schema/src/types/board-config';
 
 // Guards the env the three mobile workflows share, for two reasons:
 //
@@ -153,7 +162,7 @@ describe('Expo web export telemetry (app.boardsesh.com)', () => {
 
   it('pins the browser app auth origin to www, not app.boardsesh.com', () => {
     // The SPA does credentialed cross-origin auth against www.boardsesh.com
-    // (see docs/expo-web-deployment.md, "Browser authentication"). Pointing
+    // (see docs/operations/expo-web-deployment.md, "Browser authentication"). Pointing
     // this at app.boardsesh.com is a plausible-looking "fix" — the bundle IS
     // the app subdomain — that would break sign-in for every browser-app user.
     // The in-workflow post-export grep (checks the emitted JS for the
@@ -164,6 +173,15 @@ describe('Expo web export telemetry (app.boardsesh.com)', () => {
 });
 
 describe('mobile CI env parity (OTA fingerprint invariant)', () => {
+  it.each([NATIVE_IOS, NATIVE_ANDROID, OTA, OTA_CHECK, OTA_PREVIEW, OTA_BACKPORT, STORE_DRAFT])(
+    '%s downloads offline snapshots from the production R2 gzip manifest base',
+    (workflowName) => {
+      expect(workflowEnvValue(readWorkflow(workflowName), 'EXPO_PUBLIC_SNAPSHOT_BASE_URL')).toBe(
+        'https://snapshots.boardsesh.com/board-snapshots/v1-gzip',
+      );
+    },
+  );
+
   // The PR-time OTA-compat check + the per-PR preview publish resolve the same
   // fingerprint as the native builds + OTA publish, so they must share the same
   // fingerprint-affecting env.
@@ -184,6 +202,20 @@ describe('mobile CI env parity (OTA fingerprint invariant)', () => {
         `the binary); for a bundle-only var it ships an OTA pointing at the wrong backend/analytics. ` +
         `Keep all the mobile fingerprint workflows in lockstep.`,
     ).toBe(1);
+  });
+
+  it('sets GOOGLE_SERVICES_JSON on the Android build and every OTA resolve, or nowhere', () => {
+    // app.config.ts copies GOOGLE_SERVICES_JSON into android.googleServicesFile,
+    // which the fingerprint hashes. Setting it on the Android build alone would
+    // move the binary's fingerprint off every OTA's, so Android OTAs would stop
+    // landing. No workflow sets it today; the first one that does must bring the
+    // native build and every OTA workflow along.
+    const fingerprintWorkflows = [NATIVE_ANDROID, OTA, OTA_CHECK, OTA_PREVIEW, OTA_BACKPORT];
+    const setting = fingerprintWorkflows.filter((name) => /^\s*GOOGLE_SERVICES_JSON:/m.test(readWorkflow(name)));
+    expect(
+      setting.length === 0 ? fingerprintWorkflows.length : setting.length,
+      `GOOGLE_SERVICES_JSON is set only in ${setting.join(', ')}; set it in all of ${fingerprintWorkflows.join(', ')}`,
+    ).toBe(fingerprintWorkflows.length);
   });
 
   it('keeps GOOGLE_MAPS_API_KEY out of the PR OTA-compat check (it diffs vs main without the key)', () => {
@@ -249,7 +281,6 @@ describe('mobile CI env parity (OTA fingerprint invariant)', () => {
   it('keeps retired Android preview links as a compatibility ingress', () => {
     const appConfig = readFileSync(resolve(REPO_ROOT, 'packages/mobile/app.config.ts'), 'utf8');
     expect(appConfig).toContain("host: 'www.boardsesh.com', pathPrefix: '/preview'");
-    expect(appConfig).toContain("host: 'boardsesh.com', pathPrefix: '/preview'");
   });
 
   it('preserves the legacy channel env when resolving frozen release anchors', () => {
@@ -287,7 +318,7 @@ describe('mobile CI env parity (OTA fingerprint invariant)', () => {
     for (const { name, platform } of expectedWorkflowResolvers) {
       const source = readWorkflow(name);
       const resolverCalls = source.match(/vp exec expo-updates runtimeversion:resolve/g) ?? [];
-      expect(resolverCalls, `${name} must resolve each explicit fingerprint`).toHaveLength(name === OTA ? 3 : 1);
+      expect(resolverCalls, `${name} must resolve each explicit fingerprint`).toHaveLength(name === OTA ? 7 : 1);
       expect(source).toContain(
         `cd packages/mobile && vp exec expo-updates runtimeversion:resolve --platform ${platform}`,
       );
@@ -321,7 +352,10 @@ describe('mobile CI env parity (OTA fingerprint invariant)', () => {
     const automaticFingerprintWorkflows = [NATIVE_IOS, NATIVE_ANDROID, OTA, OTA_CHECK, OTA_PREVIEW, ANDROID_PR, IOS_PR];
     for (const name of automaticFingerprintWorkflows) {
       const source = readWorkflow(name);
-      if (name === OTA_PREVIEW) {
+      if (name === OTA) {
+        // Main production-deploy calls staging; direct push publication stays retired.
+        expect(parse(source).on.push).toBeUndefined();
+      } else if (name === OTA_PREVIEW) {
         // Preview runs on every PR synchronization so it can delete a stale
         // branch when the last mobile diff disappears. Its in-job classifier,
         // rather than a trigger paths filter, must retain the fingerprint inputs.
@@ -439,7 +473,7 @@ describe('mobile CI env parity (OTA fingerprint invariant)', () => {
 
   it('keys the cached screenshot app on native pnpm policy without lockfile churn', () => {
     const workflow = readWorkflow(MOBILE_SCREENSHOTS_IOS);
-    const cacheKeyStep = workflow.split('\n').find((line) => line.includes('screenshot-sim-app-v1-${{ hashFiles('));
+    const cacheKeyStep = workflow.split('\n').find((line) => line.includes('NATIVE_INPUT_HASH: ${{ hashFiles('));
 
     expect(cacheKeyStep, 'mobile screenshot workflow must retain its simulator app cache key').toBeTruthy();
     expect(cacheKeyStep).toContain("'pnpm-workspace.yaml'");
@@ -459,6 +493,9 @@ describe('mobile CI env parity (OTA fingerprint invariant)', () => {
 
       expect(cacheKeyStep, `${workflowName} must retain its CocoaPods cache key`).toBeTruthy();
       expect(cacheKeyStep).not.toContain("'packages/mobile/assets/**'");
+      expect(cacheKeyStep, `${workflowName} must invalidate Pods when autolinking overrides change`).toContain(
+        "'packages/mobile/react-native.config.js'",
+      );
       for (const nativeAppImage of nativeAppImages) {
         expect(cacheKeyStep, `${workflowName} must invalidate Pods when ${nativeAppImage} changes`).toContain(
           `'${nativeAppImage}'`,
@@ -574,12 +611,13 @@ describe('mobile OTA preview branch isolation + S3 lifecycle coupling', () => {
     expect(preview).toContain("['branch', `/api/apps/${appId}/branches/${encoded}`]");
   });
 
-  it('resets only when a revision can shrink the published platform set', () => {
+  it('resets new revisions and native changes before publishing runtime variants', () => {
     const preview = readWorkflow(OTA_PREVIEW);
 
-    // The reset takes a live preview offline for the length of a publish. It is worth
-    // that only when a platform can go native-only mid-PR, which needs a fingerprint
-    // path. A JS-only revision republishes in place.
+    // New JS-only revisions can conflict or fail on one target. The reset removes
+    // every older variant before publishing, and native changes still reset on retries.
+    expect(preview).toContain('const sameRevision = previous?.sha === pr.head.sha;');
+    expect(preview).toContain('!sameRevision');
     expect(preview).toContain('const affectsNativeFingerprint = (path) =>');
     // Every declared fingerprint input in packages/mobile/fingerprint.config.js must
     // be covered, or a native revision skips the reset and strands a stale platform.
@@ -598,11 +636,14 @@ describe('mobile OTA preview branch isolation + S3 lifecycle coupling', () => {
     ]) {
       expect(preview).toContain(nativePath);
     }
-    expect(preview).toContain('needsReset = files.some((file) => affectsNativeFingerprint(file.filename));');
+    expect(preview).toContain(
+      'const paths = files.flatMap((file) => [file.filename, file.previous_filename].filter(Boolean));',
+    );
+    expect(preview).toContain('needsReset = paths.some(affectsNativeFingerprint);');
     expect(preview).toMatch(
       /^  reset:\n\s+needs: gate\n\s+if: needs\.gate\.outputs\.action == 'publish' && needs\.gate\.outputs\.needs_reset == 'true'$/m,
     );
-    expect(preview).toContain('needs_reset: ${{ steps.decide.outputs.needs_reset }}');
+    expect(preview).toContain('needs_reset: ${{ steps.pin.outputs.needs_reset }}');
     expect(preview).toContain("core.setOutput('needs_reset', String(needsReset));");
 
     // An unresolved file list must keep the old unconditional reset: the declaration
@@ -702,46 +743,21 @@ describe('mobile OTA preview branch isolation + S3 lifecycle coupling', () => {
     expect(sweep).toMatch(/Could not list open PRs[^\n]*\n\s*exit 1/);
   });
 
-  it('carries the compat fingerprints through to the preview comment', () => {
-    // A pr-<n> branch is offered only to a binary whose runtimeVersion matches it
-    // EXACTLY. When a native change lands on main, every un-rebased PR keeps the old
-    // fingerprint, its publish is skipped, and the tester's picker silently empties.
-    // Naming both hashes on the PR is what makes that visible, so keep the chain
-    // wired: the check emits them, the job forwards them, the comment prints them.
-    const check = readFileSync(resolve(REPO_ROOT, 'scripts/mobile-ota-compat-check.ts'), 'utf8');
+  it('pins main before executing candidate code and reports per-platform runtimes', () => {
     const preview = readWorkflow(OTA_PREVIEW);
-    for (const platform of ['ios', 'android']) {
-      expect(check, `compat check must emit fingerprint_${platform}`).toContain(`\`fingerprint_${platform}=`);
-      expect(check, `compat check must emit base_fingerprint_${platform}`).toContain(`\`base_fingerprint_${platform}=`);
-      expect(preview).toContain(`fingerprint_${platform}: \${{ steps.compat.outputs.fingerprint_${platform} }}`);
-      expect(preview).toContain(
-        `FINGERPRINT_${platform.toUpperCase()}: \${{ needs.publish.outputs.fingerprint_${platform} }}`,
-      );
-    }
-    expect(preview).toContain('| Platform | Status | Fingerprint |');
-    // Two unresolved hashes compare equal; saying "matches main" there would
-    // invent a reassurance out of a failed resolve.
-    expect(preview).toContain("if (mine === '—') return '`—` (unresolved)';");
-  });
-
-  it('tells "adds native code" apart from "behind a native change on main"', () => {
-    // The two need opposite fixes — a store build vs a rebase — so the skip must not
-    // give one message. Containment is the free signal: origin/main is already
-    // fetched for the baseline worktree.
-    const preview = readWorkflow(OTA_PREVIEW);
-    expect(preview).toContain('git merge-base --is-ancestor origin/main HEAD');
-    expect(preview).toContain('behind_main: ${{ steps.behind.outputs.behind_main }}');
-    // Three-valued on purpose. --is-ancestor exits >1 on a real error, and folding
-    // that into "not contained" would tell a genuinely native PR to rebase — the
-    // opposite of what it needs. Only the literal 'true' claims the PR is behind.
-    expect(preview).toContain('*) behind=unknown');
-    expect(preview).toContain("const behindMain = process.env.BEHIND_MAIN === 'true';");
-    // Worded as "rebase, then re-check", not "rebase to fix": a PR can be behind
-    // main AND add native code of its own, and containment cannot separate those
-    // without a third fingerprint resolve. Promising a rebase is sufficient would
-    // be wrong in that overlap.
-    expect(preview).toContain('behind a native change on `main` — rebase, then re-check');
-    expect(preview).toContain('needs a TestFlight/Play build');
+    expect(preview).toContain('Pin the main preview base');
+    expect(preview).toContain("core.setOutput('source_base_sha', bases.sourceBaseSha)");
+    expect(preview).toContain("core.setOutput('main_sha', bases.mainSha)");
+    expect(preview).not.toContain('train_sha');
+    expect(preview).toContain('Rebase and compare the pinned main preview candidate');
+    expect(preview).toContain('SUMMARY: ${{ needs.publish.outputs.summary }}');
+    expect(preview).toContain('| Base | Platform | Status | Runtime |');
+    const helper = readFileSync(resolve(REPO_ROOT, 'scripts/mobile-ota-preview-candidates.ts'), 'utf8');
+    expect(helper.replace(/\s+/g, ' ')).toContain("'--pr-dir', directory, '--base-dir', baseline");
+    expect(helper).not.toContain('isReleaseTrainActive(');
+    expect(helper).toContain("export type PreviewTarget = 'main'");
+    expect(helper.replace(/\s+/g, ' ')).toContain("'commit-tree', sourceTree, '-p', mergeBase");
+    expect(helper.replace(/\s+/g, ' ')).toContain("'cherry-pick', '--allow-empty', '--keep-redundant-commits'");
   });
 
   it('lists the sweep inventory with the dashboard admin session, not the eoo_ key', () => {
@@ -758,8 +774,9 @@ describe('mobile OTA preview branch isolation + S3 lifecycle coupling', () => {
 
   it('publishes the preview to a pr-<number> branch, never production', () => {
     const preview = readWorkflow(OTA_PREVIEW);
-    expect(preview).toMatch(/--channel "\$BRANCH" --platform ios/);
-    expect(preview).toMatch(/--channel "\$BRANCH" --platform android/);
+    const helper = readFileSync(resolve(REPO_ROOT, 'scripts/mobile-ota-preview-candidates.ts'), 'utf8');
+    expect(helper).toContain("'--channel', branch, '--platform', platform");
+    expect(helper).toContain('Refusing non-preview branch.');
     expect(preview).not.toMatch(/^  map:/m);
   });
 
@@ -803,7 +820,7 @@ describe('mobile OTA preview branch isolation + S3 lifecycle coupling', () => {
     const s3Prefix = `${appId}/${branchConst}`;
     expect(s3Prefix.endsWith(branchPrefix), 'the composed S3 prefix must end with the branch-name prefix').toBe(true);
 
-    const docs = readFileSync(resolve(REPO_ROOT, 'docs/mobile-ota-updates.md'), 'utf8');
+    const docs = readFileSync(resolve(REPO_ROOT, 'docs/operations/mobile-ota-updates.md'), 'utf8');
     expect(docs.toLowerCase(), 'docs must describe the S3 lifecycle rule').toContain('lifecycle');
     expect(docs, `docs must document the appId-scoped lifecycle prefix \`${s3Prefix}\``).toContain(s3Prefix);
   });
@@ -836,16 +853,15 @@ describe('mobile OTA preview branch isolation + S3 lifecycle coupling', () => {
     expect(idFrom('scripts/lib/ota-branch-probe.ts', 'OTA_APP_ID'), 'ota-branch-probe OTA_APP_ID').toBe(shared);
   });
 
-  it('keeps the Android maps key on the Android publish step, which the surfability probe depends on', () => {
-    // GOOGLE_MAPS_API_KEY is an Android-only fingerprint input, so `mobile:publish`
-    // resolves the runtimeVersion to probe with inside the step that has it. Moving
-    // the key (or resolving the hash anywhere else — the compat step has no key)
-    // makes the probe ask about a runtimeVersion nothing was published under, which
-    // failed a healthy publish in run 34796068541.
+  it('passes maps only to Android publishers after comparing without secrets', () => {
     const preview = readWorkflow(OTA_PREVIEW);
-    const androidStep = otaStep(preview, 'Publish Android OTA');
-    expect(androidStep).toContain('GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}');
-    expect(otaStep(preview, 'Publish iOS OTA')).not.toContain('GOOGLE_MAPS_API_KEY');
+    const helper = readFileSync(resolve(REPO_ROOT, 'scripts/mobile-ota-preview-candidates.ts'), 'utf8');
+    expect(otaStep(preview, 'Rebase and compare the pinned main preview candidate')).not.toContain('secrets.');
+    expect(otaStep(preview, 'Publish compatible preview runtime variants')).toContain(
+      'GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}',
+    );
+    expect(helper).toContain("if (platform === 'ios') delete publishEnv.GOOGLE_MAPS_API_KEY;");
+    expect(helper).toContain('delete compatibilityEnv.GOOGLE_MAPS_API_KEY;');
   });
 
   it('uses pull_request (never pull_request_target) so fork jobs get no secrets', () => {
@@ -872,5 +888,107 @@ describe('mobile OTA preview branch isolation + S3 lifecycle coupling', () => {
     const preview = readWorkflow(OTA_PREVIEW);
     expect(preview).toMatch(/GOOGLE_MAPS_API_KEY:\s*\$\{\{\s*secrets\.GOOGLE_MAPS_API_KEY\s*\}\}/);
     expect((preview.match(/GOOGLE_MAPS_API_KEY:/g) ?? []).length).toBe(1);
+  });
+});
+
+describe('Android App Links (verified intent filters)', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  type LinkData = { scheme?: string; host?: string; pathPrefix?: string; pathPattern?: string; path?: string };
+
+  function verifiedLinkData(): LinkData[] {
+    // An empty TAILSCALE_HOSTS makes app.config.ts skip its `tailscale status`
+    // subprocess, so building the config here stays hermetic on a dev machine.
+    vi.stubEnv('TAILSCALE_HOSTS', '');
+    const config = buildExpoConfig({
+      config: {},
+      projectRoot: resolve(REPO_ROOT, 'packages/mobile'),
+    } as Parameters<typeof buildExpoConfig>[0]);
+    return (config.android?.intentFilters ?? [])
+      .filter((filter) => filter.autoVerify === true)
+      .flatMap((filter) => (Array.isArray(filter.data) ? filter.data : filter.data ? [filter.data] : []));
+  }
+
+  it('claims one prefix per supported board, and nothing else from that list', () => {
+    // A shared climb is https://www.boardsesh.com/{board}/.../view/{climb}. A board
+    // missing here means its share links open Chrome instead of the app, with no
+    // failing build to say so.
+    expect([...ANDROID_BOARD_LINK_PREFIXES].sort()).toEqual(SUPPORTED_BOARDS.map((board) => `/${board}/`).sort());
+  });
+
+  it.each([...SUPPORTED_BOARDS])('opens www %s climb and list links in the app', (board) => {
+    expect(verifiedLinkData()).toContainEqual({
+      scheme: 'https',
+      host: 'www.boardsesh.com',
+      pathPrefix: `/${board}/`,
+    });
+  });
+
+  it('claims one locale segment per non-default web locale', () => {
+    // Web serves the default locale at the root and every other one under its
+    // own path segment. A locale missing here means that site's climb links open
+    // Chrome on Android while the same link opens the app on iOS.
+    const prefixedLocales = SUPPORTED_LOCALES.filter((locale) => locale !== DEFAULT_LOCALE);
+    expect([...ANDROID_LINK_LOCALE_SEGMENTS].sort()).toEqual([...prefixedLocales].sort());
+    expect(ANDROID_LOCALISED_BOARD_LINK_PREFIXES).toHaveLength(prefixedLocales.length * SUPPORTED_BOARDS.length);
+  });
+
+  it('opens a locale-prefixed climb link for every board and locale', () => {
+    const linkData = verifiedLinkData();
+    for (const locale of SUPPORTED_LOCALES.filter((candidate) => candidate !== DEFAULT_LOCALE)) {
+      for (const board of SUPPORTED_BOARDS) {
+        expect(linkData).toContainEqual({
+          scheme: 'https',
+          host: 'www.boardsesh.com',
+          pathPrefix: `/${locale}/${board}/`,
+        });
+      }
+    }
+  });
+
+  it('claims nothing under a locale except board links', () => {
+    // /es/auth/..., /es/b/... and the bare /es/ landing stay in the browser: the
+    // app's locale retry drops the query string an unlisted wall link needs, and
+    // a locale-wide prefix would be a catch-all for a quarter of the site.
+    const boardSegments = new Set<string>(SUPPORTED_BOARDS);
+    const localeSegments = new Set<string>(SUPPORTED_LOCALES);
+    for (const { pathPrefix } of verifiedLinkData()) {
+      const [, firstSegment, secondSegment] = (pathPrefix ?? '').split('/');
+      if (!localeSegments.has(firstSegment ?? '')) continue;
+      expect(boardSegments.has(secondSegment ?? ''), `${pathPrefix} is not a board link`).toBe(true);
+      expect(pathPrefix?.endsWith('/')).toBe(true);
+    }
+  });
+
+  it('keeps the join, spray wall, preview and password-reset links', () => {
+    const prefixes = verifiedLinkData().map((entry) => entry.pathPrefix);
+    expect(prefixes).toEqual(expect.arrayContaining(['/join', '/b/', '/preview', '/auth/reset-password']));
+  });
+
+  it('claims www only, because the apex cannot be verified', () => {
+    // https://boardsesh.com/.well-known/assetlinks.json is a 301 to www, which
+    // Google's verifier rejects. On Android 11 and older one unverified host
+    // fails verification for every host, so an apex entry here would stop the
+    // www links opening the app on those phones.
+    const hosts = new Set(verifiedLinkData().map((entry) => entry.host));
+    expect([...hosts]).toEqual(['www.boardsesh.com']);
+  });
+
+  it('never claims a path that carries the OAuth callback', () => {
+    // #1797: a catch-all prefix pulled /api/auth/callback/google into the app and
+    // broke Google sign-in. Every entry must be a prefix, and none may be a
+    // prefix of the callback or of the native OAuth start page.
+    const browserOnlyPaths = ['/api/auth/callback/google', '/api/auth/native/callback', '/auth/native-start'];
+    for (const entry of verifiedLinkData()) {
+      expect(entry.pathPattern).toBeUndefined();
+      expect(entry.path).toBeUndefined();
+      const { pathPrefix } = entry;
+      expect(pathPrefix, 'an entry without a pathPrefix claims the whole host').toBeTruthy();
+      for (const browserOnlyPath of browserOnlyPaths) {
+        expect(browserOnlyPath.startsWith(pathPrefix ?? ''), `${pathPrefix} captures ${browserOnlyPath}`).toBe(false);
+      }
+    }
   });
 });

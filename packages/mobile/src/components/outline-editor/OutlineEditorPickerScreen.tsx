@@ -1,6 +1,7 @@
+import { PressableSurface } from '../PressableSurface';
 import React, { useCallback, useMemo, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, View } from 'react-native';
-import { useRouter } from 'expo-router';
+import { ScrollView, StyleSheet, View } from 'react-native';
+import { useScopedRouter as useRouter } from '../../lib/routing/scoped-navigation';
 import { type BoardName } from '@boardsesh/shared-schema';
 import { boardTypeLabel } from '@boardsesh/board-constants';
 import { OUTLINE_EDITOR_BOARDS, outlineEditorLayouts, outlineEditorSetIds, outlineEditorSizes } from './board-configs';
@@ -20,7 +21,7 @@ type PickerRow = { key: string; id: number; label: string; detail?: string };
  * Plain `.map()` inside a `ScrollView`, deliberately unvirtualized: the three
  * lists are 8 boards, at most ~14 layouts and at most ~10 sizes, all resolved
  * synchronously from bundled constants. A FlashList here would cost more than it
- * saves — see the list rule in docs/react-native-performance.md, which is about
+ * saves — see the list rule in docs/mobile/react-native-performance.md, which is about
  * unbounded/remote lists.
  *
  * Everything the backend's `holdOutlines` query can answer for is listed,
@@ -30,7 +31,7 @@ type PickerRow = { key: string; id: number; label: string; detail?: string };
  */
 export function OutlineEditorPickerScreen() {
   const router = useRouter();
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors, selection } = useTheme();
 
   const [boardName, setBoardName] = useState<BoardName | null>(null);
   const [layoutId, setLayoutId] = useState<number | null>(null);
@@ -100,7 +101,7 @@ export function OutlineEditorPickerScreen() {
     rows.map((row) => {
       const isSelected = selectedId === row.id;
       return (
-        <Pressable
+        <PressableSurface
           key={row.key}
           onPress={() => onSelect(row.id)}
           accessibilityRole="button"
@@ -108,8 +109,8 @@ export function OutlineEditorPickerScreen() {
           style={[
             styles.row,
             {
-              backgroundColor: systemColors.secondaryBackground,
-              borderColor: isSelected ? brandColors.primary : 'transparent',
+              backgroundColor: isSelected ? selection.fill : systemColors.secondaryBackground,
+              borderColor: isSelected ? selection.checkmark : 'transparent',
             },
           ]}
         >
@@ -119,7 +120,7 @@ export function OutlineEditorPickerScreen() {
               {row.detail}
             </Text>
           ) : null}
-        </Pressable>
+        </PressableSurface>
       );
     });
 
@@ -136,7 +137,7 @@ export function OutlineEditorPickerScreen() {
         {boardRows.map((row) => {
           const isSelected = boardName === row.detail;
           return (
-            <Pressable
+            <PressableSurface
               key={row.key}
               onPress={() => handleSelectBoard(row.key as BoardName)}
               accessibilityRole="button"
@@ -144,13 +145,13 @@ export function OutlineEditorPickerScreen() {
               style={[
                 styles.row,
                 {
-                  backgroundColor: systemColors.secondaryBackground,
-                  borderColor: isSelected ? brandColors.primary : 'transparent',
+                  backgroundColor: isSelected ? selection.fill : systemColors.secondaryBackground,
+                  borderColor: isSelected ? selection.checkmark : 'transparent',
                 },
               ]}
             >
               <Text variant="body">{row.label}</Text>
-            </Pressable>
+            </PressableSurface>
           );
         })}
       </View>

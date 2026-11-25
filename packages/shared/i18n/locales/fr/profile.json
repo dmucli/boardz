@@ -8,7 +8,14 @@
       "notFoundDescription": "Impossible de trouver ce profil de grimpe.",
       "ogAlt": "Profil de grimpe de {{name}}",
       "title": "Les sessions de grimpe de {{name}}",
-      "titleWithBoard": "Les sessions {{board}} de {{name}}"
+      "titleWithBoard": "Les sessions {{board}} de {{name}}",
+      "ogTitleSent": "{{name}} a enchaîné du {{grade}}",
+      "ogTitleNoSends": "{{name}} sur Boardsesh",
+      "ogDescriptionHardest_one": "{{climb}} est sa première croix sur {{boards}}. Ouvre le carnet.",
+      "ogDescriptionHardest_other": "{{climb}} est le plus dur de {{count}} blocs enchaînés sur {{boards}}. Ouvre le carnet.",
+      "ogDescriptionCount_one": "{{count}} bloc enchaîné sur {{boards}}. Ouvre le carnet.",
+      "ogDescriptionCount_other": "{{count}} blocs enchaînés sur {{boards}}. Ouvre le carnet.",
+      "ogDescriptionNoSends": "Aucune croix pour l'instant. Découvre le profil."
     },
     "statistics": {
       "title": "Statistiques"
@@ -20,18 +27,45 @@
       "title": "Blocs créés"
     },
     "setter": {
-      "title": "{{name}} - Ouvreur",
+      "title": "Blocs ouverts par {{name}}",
       "description": "Blocs ouverts par {{name}} sur Boardsesh",
+      "titleWithClimbs_one": "{{climbs}} bloc ouvert par {{name}} sur {{boards}}",
+      "titleWithClimbs_other": "{{climbs}} blocs ouverts par {{name}} sur {{boards}}",
+      "titlePage": "Blocs ouverts par {{name}} — Page {{page}}",
+      "titleWithClimbsPage_one": "{{climbs}} bloc ouvert par {{name}} sur {{boards}} — Page {{page}}",
+      "titleWithClimbsPage_other": "{{climbs}} blocs ouverts par {{name}} sur {{boards}} — Page {{page}}",
+      "descriptionCtaSingle": "Allume-le sur ta board avec Boardsesh.",
+      "boardSprayWall": "Spraywall",
+      "descriptionSetCount_one": "{{name}} a ouvert {{climbs}} bloc sur {{boards}}.",
+      "descriptionSetCount_other": "{{name}} a ouvert {{climbs}} blocs sur {{boards}}.",
+      "descriptionSends_one": "{{sends}} croix pour l'instant.",
+      "descriptionSends_other": "{{sends}} croix pour l'instant.",
+      "descriptionCta": "Choisis-en un et allume-le sur ta board avec Boardsesh.",
       "fallbackTitle": "Profil d'ouvreur",
       "fallbackDescription": "Profil d'ouvreur et ses blocs sur Boardsesh",
-      "ogAlt": "Profil d'ouvreur de {{name}}"
+      "ogAlt": "Profil d'ouvreur de {{name}}",
+      "ogTitleSends": "{{name}} : {{sends}} croix sur ses blocs",
+      "ogTitleSetCount_one": "{{name}} a ouvert {{climbs}} bloc",
+      "ogTitleSetCount_other": "{{name}} a ouvert {{climbs}} blocs",
+      "ogSetCount_one": "{{climbs}} bloc ouvert.",
+      "ogSetCount_other": "{{climbs}} blocs ouverts.",
+      "ogMostSent_one": "Le plus enchaîné : {{climb}}, {{sends}} croix.",
+      "ogMostSent_other": "Le plus enchaîné : {{climb}}, {{sends}} croix.",
+      "ogMostSentSoFar": "Le plus enchaîné pour l'instant : {{climb}}.",
+      "ogOnBoards": "Sur {{boards}}.",
+      "ogPickOne": "Choisis-en un et essaie-le.",
+      "ogGoGetOnIt": "À toi de jouer."
     }
   },
   "page": {
     "lastThreeMonths": "3 derniers mois",
     "activityChartLabel": "Activité des 3 derniers mois",
     "displayNameFallback": "Grimpeur",
-    "betaVideos": "Leur beta"
+    "betaVideos": "Leur beta",
+    "shareAriaLabel": "Partager le profil",
+    "shareText": "Découvre {{name}} sur Boardsesh",
+    "linkCopied": "Lien copié",
+    "shareFailed": "Impossible de partager le lien"
   },
   "nav": {
     "statistics": {
@@ -57,6 +91,13 @@
     "calendarAria": "Calendrier d'escalade : {{days}} jours actifs, {{count}} blocs",
     "calendarLess": "Moins",
     "calendarMore": "Plus",
+    "calendarToday": "Aujourd'hui",
+    "calendarTapHint": "Touche un jour pour voir ses blocs",
+    "calendarClimbs_one": "{{count}} bloc",
+    "calendarClimbs_other": "{{count}} blocs",
+    "calendarNoClimbs": "Aucun bloc",
+    "calendarWeekAria": "Semaine du {{date}} : {{days}}",
+    "calendarWeekEmptyAria": "Semaine du {{date}} : aucun bloc",
     "percentile": "Percentile",
     "topPercent": "Top {{value}} %",
     "moreSentThan": "Plus de blocs enchaînés que {{value}} % des grimpeurs",
@@ -98,7 +139,10 @@
       "rowAria": "{{name}} : {{count}} blocs distincts enchaînés depuis toujours",
       "recordAria": "Meilleure croix : {{grade}}",
       "publicTitle": "Sur toutes ses boards",
-      "publicEmpty": "Aucune croix enregistrée pour le moment."
+      "publicEmpty": "Aucune croix enregistrée pour le moment.",
+      "totalsLoading": "Chargement des totaux",
+      "totalsError": "Impossible de charger ces totaux.",
+      "totalsOffline": "Ces totaux se chargent dès que tu retrouves une connexion."
     },
     "progress": {
       "title": "Ta progression",
@@ -144,11 +188,20 @@
     "shareFailed": "Échec du partage",
     "follower_one": "abonné",
     "follower_other": "abonnés",
-    "climb_one": "bloc",
-    "climb_other": "blocs",
     "seoHeading": "Blocs ouverts par {{name}}",
-    "seoSummary_one": "{{name}} a un bloc sur Boardsesh, sur {{boards}}.",
-    "seoSummary_other": "{{name}} a {{count}} blocs sur Boardsesh, sur {{boards}}.",
+    "stats": {
+      "climbs_one": "{{climbs}} bloc sur {{boards}}",
+      "climbs_other": "{{climbs}} blocs sur {{boards}}",
+      "sends_one": "une croix",
+      "sends_other": "{{sends}} croix",
+      "joined": "{{climbs}}, {{sends}}"
+    },
+    "mostSent": {
+      "heading": "Les plus enchaînés",
+      "meta_one": "{{sends}} croix · {{angle}}°",
+      "meta_other": "{{sends}} croix · {{angle}}°",
+      "artAlt": "{{climbName}} allumé sur la board {{board}} à {{angle}}°"
+    },
     "climbsHeading": "Tous les blocs de {{name}}",
     "empty": "Aucun bloc sur cette page.",
     "browseBoard": "Voir tous les blocs de la board {{boardName}}",
@@ -158,6 +211,11 @@
       "previous": "Blocs précédents",
       "next": "Plus de blocs",
       "pageLabel": "Page {{page}}"
+    },
+    "installHelper": "Installe l’app gratuite et grimpe les blocs de {{name}} sur ta board.",
+    "qr": {
+      "title": "Scanne pour ouvrir ces blocs sur ton téléphone",
+      "imageLabel": "QR code qui ouvre les blocs de {{name}} sur ton téléphone"
     }
   }
 }

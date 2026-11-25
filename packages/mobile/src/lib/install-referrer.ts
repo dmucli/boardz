@@ -2,6 +2,7 @@ import { installReferrerNative, type NativeInstallReferrerResult } from '../../m
 import { setPersonProperties, track } from './analytics';
 import { reportError } from './error-reporting';
 import { getPreference, setPreference } from './preference-store';
+import { isAttributionPublicationGranted } from './consent-state';
 
 // Android-only: Play Install Referrer is a Play Store mechanism with no iOS
 // equivalent in this PR (an iOS equivalent — SKAdNetwork / Apple Search Ads
@@ -14,6 +15,8 @@ import { getPreference, setPreference } from './preference-store';
 export const INSTALL_ATTRIBUTED_EVENT = 'Install Attributed';
 
 const INSTALL_REFERRER_FETCHED_KEY = 'installReferrerFetched';
+const INSTALL_REFERRER_RESULT_KEY = 'installReferrerResult';
+const INSTALL_REFERRER_PUBLISHED_KEY = 'installReferrerPublished';
 
 // In-memory guard against a concurrent overlapping call — e.g. if the mount
 // effect that drives this ever re-fires (remount, fast refresh) before the
@@ -77,16 +80,29 @@ export function classifyInstallChannel(parsed: ParsedInstallReferrer): InstallCh
 
 // Fetch-once-ever, cache-the-flag, never-throw. `fetchNative` is injectable so
 // tests can supply a fake result without mocking the native module resolver.
+//
+// Nothing is read before the climber's own Allow. Reading the referrer is
+// reading information from the device for attribution, which needs consent
+// (ePrivacy Art. 5(3)), whether or not the result is published, so the region
+// default does not unlock it either. Waiting costs nothing: Play keeps an
+// install's referrer for 90 days, and InstallReferrerTracker re-runs this when
+// the answer changes to Allow.
 export async function maybeFetchAndAttachInstallReferrer(
   fetchNative: () => Promise<NativeInstallReferrerResult | null> = () =>
     installReferrerNative?.getInstallReferrer() ?? Promise.resolve(null),
 ): Promise<void> {
+  if (!isAttributionPublicationGranted()) return;
   if (fetchInFlight) return;
   fetchInFlight = true;
   try {
     const alreadyFetched = await getPreference<boolean>(INSTALL_REFERRER_FETCHED_KEY);
-    if (alreadyFetched) return;
+    if (alreadyFetched) {
+      await publishStoredInstallReferrer();
+      return;
+    }
 
+    // Consent can be withdrawn while the preference read is in flight.
+    if (!isAttributionPublicationGranted()) return;
     const result = await fetchNative();
     // Mark fetched regardless of a clean outcome (success or a resolved null,
     // e.g. FEATURE_NOT_SUPPORTED on a sideloaded install) — Play's referrer is
@@ -94,9 +110,29 @@ export async function maybeFetchAndAttachInstallReferrer(
     // every future launch has little value. A thrown exception below skips
     // this write, so a transient failure (e.g. SERVICE_UNAVAILABLE) does retry
     // on the next launch.
+    if (result) await setPreference(INSTALL_REFERRER_RESULT_KEY, result);
     await setPreference(INSTALL_REFERRER_FETCHED_KEY, true);
     if (!result) return;
+    await publishStoredInstallReferrer();
+  } catch (error) {
+    reportError(error);
+  } finally {
+    fetchInFlight = false;
+  }
+}
 
+let publicationInFlight = false;
+/**
+ * Publishes only after the climber's own Allow: install attribution is not
+ * part of the region default outside the prompt regions.
+ */
+export async function publishStoredInstallReferrer(): Promise<void> {
+  if (!isAttributionPublicationGranted() || publicationInFlight) return;
+  publicationInFlight = true;
+  try {
+    if (await getPreference<boolean>(INSTALL_REFERRER_PUBLISHED_KEY)) return;
+    const result = await getPreference<NativeInstallReferrerResult>(INSTALL_REFERRER_RESULT_KEY);
+    if (!result || !isAttributionPublicationGranted()) return;
     const parsed = parseInstallReferrer(result.installReferrer);
     const installChannel = classifyInstallChannel(parsed);
     // Person properties are written for every install, whatever its channel —
@@ -129,12 +165,13 @@ export async function maybeFetchAndAttachInstallReferrer(
         install_channel: installChannel,
       });
     }
+    await setPreference(INSTALL_REFERRER_PUBLISHED_KEY, true);
   } catch (error) {
     // Must never throw — this runs fire-and-forget at startup. Still reported
     // so a broken preference store / PostHog init doesn't fail this pipeline
     // invisibly.
     reportError(error);
   } finally {
-    fetchInFlight = false;
+    publicationInFlight = false;
   }
 }

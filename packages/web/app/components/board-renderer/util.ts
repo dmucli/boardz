@@ -1,6 +1,8 @@
 import { toFlatFrames as toFlatFramesShared } from '@boardsesh/board-constants/hold-states';
 import { BOARD_FIELD_COLORS } from '@boardsesh/board-look';
 import type { RenderMode } from '@boardsesh/board-render/render-config';
+// Leaf subpath: the dark-art naming rule the server renderer and the mobile app share.
+import { toDarkArtPath } from '@boardsesh/board-render/background';
 // Leaf subpath for the same reason as the version constant below: `validation`
 // carries zod and nothing else, while the barrel would drag the sharp pipeline
 // into the client bundle.
@@ -14,10 +16,10 @@ import {
 // bundle, and the barrel pulls in the render pipeline. The generated constant
 // has no imports at all.
 import { BOARD_RENDER_VERSION } from '@boardsesh/board-render/version';
-import type { BoardDetails, BoardName } from '@/app/lib/types';
+import type { BoardDetails, BoardImageDetails, BoardRouteIdentity, BoardName } from '@/app/lib/types';
 import { getPublicBackendHttpUrl } from '@/app/lib/backend-url';
 import { resolveStaticAssetUrl } from '@/app/lib/static-asset-url';
-import { BOARD_IMAGE_DIMENSIONS } from '../../lib/board-data';
+import { BOARD_IMAGE_DIMENSIONS } from '@boardsesh/board-config/board-image-dimensions';
 export { convertLitUpHoldsStringToMap } from './types';
 // Multi-frame playback primitives now live in the shared, renderer-agnostic
 // package so web and mobile share one engine. Re-exported here so existing
@@ -38,6 +40,8 @@ type BuildBoardRenderUrlOptions = {
   format?: 'webp' | 'png' | 'jpg' | 'jpeg';
   /** Ask for the dark art siblings. Only meaningful for boards in `BOARDS_WITH_DARK_ART`. */
   colorScheme?: 'light' | 'dark';
+  /** Aura's play field, independent of the board-art sibling. Defaults to the existing dark field. */
+  fieldColor?: string;
   /**
    * Which drawing the server should render. Defaults to `aura`, the same
    * drawing the app has shipped since 2.4 — `classic` is the marker overlay,
@@ -52,7 +56,7 @@ type BuildBoardRenderUrlOptions = {
 };
 
 /**
- * The dark play field www and the share cards render Aura against — the same
+ * The default dark play field www and the share cards render Aura against — the same
  * field the app's play view composites over, so a card in a chat and the board
  * in the app are quieted by the same wash. Sent as a query param, which is what
  * gives the Aura render its own Cloudflare entry: board-render responses are
@@ -62,14 +66,13 @@ type BuildBoardRenderUrlOptions = {
  * from the value the renderer measures the veil against. Note what changing it
  * costs, though: the colour is IN the URL, so a new value is a new cache key for
  * every board image on the site — the old ones stay valid but nothing hits them
- * again, and the renderer draws the whole catalogue afresh.
+ * again, and the renderer draws the whole catalogue afresh. A light kiosk
+ * overrides `fieldColor` per request rather than changing this shared default.
  */
 const AURA_FIELD_COLOR = BOARD_FIELD_COLORS.dark;
 
 const LEGACY_BOARD_RENDER_PATH = '/api/internal/board-render';
 const BACKEND_BOARD_RENDER_PATH = '/render/board';
-const SAME_ORIGIN_BOARD_GEOMETRY_PATH = '/api/internal/board-geometry';
-const BACKEND_BOARD_GEOMETRY_PATH = '/render/geometry';
 
 function shouldUseCompatibilityPath(): boolean {
   // The dev orchestrator advertises its Tailscale hostname to the browser even
@@ -89,23 +92,39 @@ function shouldUseCompatibilityPath(): boolean {
 }
 
 /**
- * Boards whose art has a dark-mode sibling committed under public/images.
+ * Boards whose art has dark-mode siblings committed under public/images. www is dark-only,
+ * so these boards always ask for their dark art.
  *
- * Woods is the only one on web: its art is hold sprites on an opaque white ground, which in
- * dark mode renders as a lit rectangle, so scripts/generate-woods-dark-art.ts keys that
- * ground out (issue #4753). MoonBoard has dark files too, but they were tuned against the
- * mobile app's surfaces and are not wired up here yet.
+ * - MoonBoard is drawn for a white wall: its A-K / 1-18 labels and its black set B hold
+ *   sheets measure ~1.1:1 against the dark field and vanish. scripts/generate-dark-board-art.ts
+ *   lifts only those layers (issue #3885); the mobile app has drawn them since.
+ * - Woods is hold sprites on an opaque white ground, which renders as a lit rectangle, so
+ *   scripts/generate-woods-dark-art.ts keys that ground out (issue #4753).
  *
- * This gate is what keeps the theme swap from doubling requests and server renders for every
- * other board — those would render identical bytes twice.
- *
- * Unlike mobile, which falls back when a key is absent from its bundle manifest, a missing
- * file here is a 404 — so util.test.ts walks the listed boards' image directories and fails
- * if any light `.webp` has lost its dark sibling.
+ * This gate keeps every other board on the render URL it has always had: adding
+ * `color_scheme=dark` there would re-render identical bytes under a new cache key.
+ * util.test.ts fails if a board's image directory gains a `.dark.webp` this list lacks.
  */
-export const BOARDS_WITH_DARK_ART: ReadonlySet<string> = new Set(['woods']);
+export const BOARDS_WITH_DARK_ART: ReadonlySet<string> = new Set(['moonboard', 'woods']);
+
+/**
+ * The subset of `BOARDS_WITH_DARK_ART` where EVERY light layer has a dark sibling, so the
+ * board photo can split out as static light/dark files (see `buildBoardArtLayers`).
+ *
+ * MoonBoard cannot: only its labels and set B sheets have siblings, and a browser asking for
+ * `holdseta.dark.webp` gets a 404, not a fallback. It goes through the server composite
+ * instead, whose `resolveArtPath` falls back per layer, the same rule the mobile app applies
+ * to its bundle. util.test.ts walks these boards' directories for a missing sibling.
+ */
+export const BOARDS_WITH_SPLIT_DARK_ART: ReadonlySet<string> = new Set(['woods']);
 
 export const hasDarkBoardArt = (board: BoardName) => BOARDS_WITH_DARK_ART.has(board);
+
+export const hasSplitDarkBoardArt = (board: BoardName) => BOARDS_WITH_SPLIT_DARK_ART.has(board);
+
+/** The `colorScheme` a server-composited render of this board should ask for. */
+export const boardArtColorScheme = (board: BoardName): 'dark' | undefined =>
+  hasDarkBoardArt(board) ? 'dark' : undefined;
 
 /**
  * Production and preview HTML point straight at Railway so a cache miss never
@@ -121,17 +140,6 @@ function getBoardRenderEndpoint(): string {
 }
 
 /**
- * The traced board art the browser's own WASM renderer needs, resolved the same
- * way as the image endpoint above: straight to Railway in production, the
- * same-origin rewrite in development and on a LAN host.
- */
-export function getBoardGeometryEndpoint(): string {
-  if (shouldUseCompatibilityPath()) return SAME_ORIGIN_BOARD_GEOMETRY_PATH;
-  const backendOrigin = getPublicBackendHttpUrl();
-  return backendOrigin ? `${backendOrigin}${BACKEND_BOARD_GEOMETRY_PATH}` : SAME_ORIGIN_BOARD_GEOMETRY_PATH;
-}
-
-/**
  * Build the URL for the Rust/WASM-rendered board image on the Railway backend.
  * Mirroring is handled via CSS (scaleX(-1)), not a separate render — halves cache variants.
  *
@@ -143,9 +151,17 @@ export function getBoardGeometryEndpoint(): string {
  * `scripts/generate-board-render-version.ts`.
  */
 export const buildBoardRenderUrl = (
-  boardDetails: BoardDetails,
+  boardDetails: BoardRouteIdentity,
   frames: string,
-  { thumbnail, includeBackground, variant, format, colorScheme, renderMode = 'aura' }: BuildBoardRenderUrlOptions = {},
+  {
+    thumbnail,
+    includeBackground,
+    variant,
+    format,
+    colorScheme,
+    fieldColor = AURA_FIELD_COLOR,
+    renderMode = 'aura',
+  }: BuildBoardRenderUrlOptions = {},
 ) => {
   let url =
     `${getBoardRenderEndpoint()}?board_name=${boardDetails.board_name}` +
@@ -179,7 +195,7 @@ export const buildBoardRenderUrl = (
   // asks for classic would otherwise get an aura render — and its `<img>`
   // fallback would disagree with the canvas beside it.
   if (renderMode === 'aura') {
-    url += `&render_mode=aura&field_color=${encodeURIComponent(AURA_FIELD_COLOR)}`;
+    url += `&render_mode=aura&field_color=${encodeURIComponent(fieldColor)}`;
   } else {
     url += '&render_mode=classic';
   }
@@ -216,7 +232,7 @@ export const toFlatFrames = (frames: string | null | undefined, boardName: Board
   toFlatFramesShared(frames, boardName);
 
 export const buildOverlayUrl = (
-  boardDetails: BoardDetails,
+  boardDetails: BoardRouteIdentity,
   frames: string,
   thumbnail?: boolean,
   colorScheme?: 'light' | 'dark',
@@ -236,7 +252,11 @@ export type BoardArtLayers = {
    * let the stylesheet pick.
    */
   backgroundUrls: string[];
-  /** The per-climb hold render. Includes the board photo only when `backgroundUrls` is empty. */
+  /**
+   * The per-climb hold render. Includes the board photo only when `backgroundUrls` is empty.
+   * For a board whose dark art only the server can resolve (MoonBoard) this is set even with
+   * no climb, as the bare board: the static files would show the light art.
+   */
   overlayUrl: string | null;
 };
 
@@ -253,22 +273,30 @@ export type BoardArtLayers = {
  * by every card on the page) and the overlay renders once with no background baked in.
  */
 export const buildBoardArtLayers = (
-  boardDetails: BoardDetails,
+  boardDetails: BoardImageDetails | BoardDetails,
   frames: string | null | undefined,
   thumbnail?: boolean,
   renderMode?: RenderMode,
 ): BoardArtLayers => {
-  if (!hasDarkBoardArt(boardDetails.board_name)) {
+  if (!hasSplitDarkBoardArt(boardDetails.board_name)) {
+    const colorScheme = boardArtColorScheme(boardDetails.board_name);
+    // A climb with no frames on a server-themed board still needs the composite: it is the
+    // only way to get MoonBoard's per-layer dark art (see BOARDS_WITH_SPLIT_DARK_ART).
+    const overlayFrames = frames || (colorScheme ? '' : null);
     return {
       backgroundUrls: [],
-      overlayUrl: frames ? buildOverlayUrl(boardDetails, frames, thumbnail, undefined, renderMode) : null,
+      overlayUrl:
+        overlayFrames === null
+          ? null
+          : buildOverlayUrl(boardDetails, overlayFrames, thumbnail, colorScheme, renderMode),
     };
   }
 
   return {
-    backgroundUrls: Object.keys(boardDetails.images_to_holds).map((image) =>
-      getImageUrl(image, boardDetails.board_name, thumbnail),
-    ),
+    backgroundUrls: ('backgroundImagePaths' in boardDetails
+      ? boardDetails.backgroundImagePaths
+      : Object.keys(boardDetails.images_to_holds)
+    ).map((image) => getImageUrl(image, boardDetails.board_name, thumbnail)),
     overlayUrl: frames
       ? buildBoardRenderUrl(boardDetails, toFlatFrames(frames, boardDetails.board_name), { thumbnail, renderMode })
       : null,
@@ -283,7 +311,7 @@ export const buildBoardArtLayers = (
  * light one leaves a dark-mode reader's actual LCP element unprioritised.
  */
 export const buildOverlayPreloadUrls = (
-  boardDetails: BoardDetails,
+  boardDetails: BoardImageDetails | BoardDetails,
   frames: string | null | undefined,
   thumbnail?: boolean,
   renderMode?: RenderMode,
@@ -307,12 +335,9 @@ export const buildOverlayPreloadUrls = (
  * backend origin can't be resolved (misconfigured env, some test contexts) it
  * falls back to the web board-render route unchanged.
  *
- * The backend branch deliberately carries no `v=`: mobile builds the same
- * `/og/climb` URL independently (`packages/mobile/src/hooks/use-share-climb.ts`)
- * from a shipped binary, so versioning it on this side alone would split the edge
- * entry in two instead of versioning it. `/og/climb` gets its own fix — do not
- * "helpfully" add `v` here. The fallback branch goes through
- * `buildBoardRenderUrl` and is versioned like every other web producer.
+ * Web and mobile's fallback prewarm both append the generated renderer version.
+ * A drawing change therefore gets a fresh immutable CDN entry; mobile still
+ * reads the page's advertised card to pick up newer versions and identity.
  */
 export type OgClimbCardIdentity = {
   /** Climb name as displayed. */
@@ -331,7 +356,7 @@ const toCardGrade = (grade: string | null | undefined): string | undefined => {
 };
 
 export const buildOgBoardRenderUrl = (
-  boardDetails: BoardDetails,
+  boardDetails: BoardRouteIdentity,
   frames: string,
   identity: OgClimbCardIdentity = {},
 ) => {
@@ -370,6 +395,7 @@ export const buildOgBoardRenderUrl = (
     for (const [key, value] of identityParams) {
       if (value) backendParams.set(key, value);
     }
+    backendParams.set('v', BOARD_RENDER_VERSION);
 
     return `${backendOrigin}/og/climb?${backendParams}`;
   }
@@ -390,14 +416,12 @@ const toThumbUrl = (webpUrl: string) => {
 };
 
 /**
- * Dark-mode sibling of a WebP art path: `foo.webp` -> `foo.dark.webp`.
- *
- * Same convention as `DARK_VARIANT_SUFFIX` in the mobile app's background-image-cache.ts,
- * written by scripts/generate-dark-board-art.ts and scripts/generate-woods-dark-art.ts. Only
- * Woods ships these on web today — callers are responsible for knowing a sibling exists,
- * because a missing one 404s rather than falling back the way the mobile manifest does.
+ * Dark-mode sibling of a WebP art URL: `foo.webp` -> `foo.dark.webp`, by the shared rule in
+ * `@boardsesh/board-render/background`. Only for `BOARDS_WITH_SPLIT_DARK_ART`: callers are
+ * responsible for knowing a sibling exists, because a missing one 404s rather than falling
+ * back the way the server renderer and the mobile bundle do.
  */
-export const toDarkArtUrl = (webpUrl: string) => webpUrl.replace(/\.webp$/, '.dark.webp');
+export const toDarkArtUrl = (webpUrl: string) => toDarkArtPath(webpUrl);
 
 export const getImageUrl = (imageUrl: string, board: BoardName, thumbnail?: boolean) => {
   // Absolute path (e.g. MoonBoard images already prefixed with /images/moonboard/...)
@@ -450,6 +474,7 @@ export const buildSprayOgImageUrl = (layoutId: number, frames: string): string |
     set_ids: '1',
     frames: flatFrames,
     format: 'jpeg',
+    v: BOARD_RENDER_VERSION,
   });
   return `${backendOrigin}/og/climb?${backendParams}`;
 };

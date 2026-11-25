@@ -1,8 +1,12 @@
-import { Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { PressableSurface } from '../PressableSurface';
+import { Modal, ScrollView, StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { BoardCandidate } from '@boardsesh/shared-schema';
 import { spacing, borderRadius } from '../../theme/tokens';
 import { useTheme } from '../../providers/theme-provider';
+import { useWindowBottomInset } from '../../hooks/use-window-bottom-inset';
+import { useReduceMotion } from '../../hooks/use-reduce-motion';
+import { StatusPill } from '../StatusPill';
 import { Text } from '../Text';
 
 type BoardDisambiguationSheetProps = {
@@ -21,18 +25,37 @@ type BoardDisambiguationSheetProps = {
  *
  * A plain RN `Modal` rather than a bottom-sheet so it works wherever a connect
  * happens (the provider is mounted above every screen) without a sheet host.
+ *
+ * Cancel stays at the foot of the card, action-sheet style, rather than moving
+ * to a top bar: this is a one-tap choice with no form behind it, and nothing in
+ * the card (no keyboard, no error text) can move it. The card clears the
+ * window's bottom inset (home indicator / Android navigation bar) itself.
  */
 export function BoardDisambiguationSheet({ visible, candidates, onPick, onCancel }: BoardDisambiguationSheetProps) {
   const { systemColors } = useTheme();
   const { t } = useTranslation('boards');
+  const windowInsetBottom = useWindowBottomInset();
+  // Reduce Motion swaps the slide-up for a fade (HIG "Motion").
+  const reduceMotion = useReduceMotion();
 
   return (
-    <Modal visible={visible} transparent animationType="slide" onRequestClose={onCancel}>
-      <Pressable style={styles.backdrop} onPress={onCancel}>
-        <Pressable
-          // Stop backdrop taps from closing when tapping the card itself.
-          onPress={(event) => event.stopPropagation()}
-          style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}
+    <Modal visible={visible} transparent animationType={reduceMotion ? 'fade' : 'slide'} onRequestClose={onCancel}>
+      <View style={styles.backdrop}>
+        {/* Sibling, not parent: a tappable ancestor hides the card's buttons from VoiceOver. */}
+        <PressableSurface
+          testID="disambiguation-backdrop"
+          accessible={false}
+          importantForAccessibility="no"
+          style={StyleSheet.absoluteFill}
+          onPress={onCancel}
+        />
+        <View
+          testID="disambiguation-card"
+          accessibilityViewIsModal
+          style={[
+            styles.card,
+            { backgroundColor: systemColors.secondaryBackground, paddingBottom: windowInsetBottom + spacing[4] },
+          ]}
         >
           <Text variant="title3" style={styles.heading}>
             {t('mobile.disambiguation.title')}
@@ -45,38 +68,33 @@ export function BoardDisambiguationSheet({ visible, candidates, onPick, onCancel
             {candidates.map((candidate) => {
               const location = candidate.gymName ?? candidate.locationName ?? null;
               return (
-                <Pressable
+                <PressableSurface
                   key={candidate.boardId}
+                  accessibilityRole="button"
                   onPress={() => onPick(candidate.boardId)}
                   style={[styles.row, { borderColor: systemColors.separator }]}
                 >
                   <View style={styles.rowText}>
                     <View style={styles.rowTitle}>
                       <Text variant="headline">{candidate.boardName}</Text>
-                      {candidate.isOwnedByMe ? (
-                        <View style={[styles.ownedPill, { backgroundColor: systemColors.fill }]}>
-                          <Text variant="caption2" color={systemColors.secondaryLabel}>
-                            {t('mobile.disambiguation.yourBoard')}
-                          </Text>
-                        </View>
-                      ) : null}
+                      {candidate.isOwnedByMe ? <StatusPill label={t('mobile.disambiguation.yourBoard')} /> : null}
                     </View>
                     <Text variant="subheadline" color={systemColors.secondaryLabel}>
                       {location ?? candidate.boardType}
                     </Text>
                   </View>
-                </Pressable>
+                </PressableSurface>
               );
             })}
           </ScrollView>
 
-          <Pressable onPress={onCancel} style={styles.cancel}>
+          <PressableSurface accessibilityRole="button" onPress={onCancel} style={styles.cancel}>
             <Text variant="headline" color={systemColors.secondaryLabel}>
               {t('mobile.disambiguation.cancel')}
             </Text>
-          </Pressable>
-        </Pressable>
-      </Pressable>
+          </PressableSurface>
+        </View>
+      </View>
     </Modal>
   );
 }
@@ -91,7 +109,6 @@ const styles = StyleSheet.create({
     borderTopLeftRadius: borderRadius.lg,
     borderTopRightRadius: borderRadius.lg,
     padding: spacing[4],
-    paddingBottom: spacing[8],
     maxHeight: '80%',
   },
   heading: {
@@ -122,11 +139,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: spacing[2],
-  },
-  ownedPill: {
-    paddingHorizontal: spacing[2],
-    paddingVertical: spacing[1],
-    borderRadius: borderRadius.full,
   },
   cancel: {
     marginTop: spacing[4],

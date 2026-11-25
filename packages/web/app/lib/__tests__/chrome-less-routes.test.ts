@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { isChromeLessPath } from '../chrome-less-routes';
+import { stripLocalePrefix } from '../i18n/locale-href';
 
 describe('isChromeLessPath', () => {
   it('matches kiosk routes at any depth', () => {
@@ -21,6 +22,21 @@ describe('isChromeLessPath', () => {
     expect(isChromeLessPath('/gym/boulderwelt-ost/manage')).toBe(false);
     expect(isChromeLessPath('/gym/boulderwelt-ost/poster/extra')).toBe(false);
     expect(isChromeLessPath('/gym/poster')).toBe(false);
+  });
+
+  it('matches the printable board poster, in every locale once the prefix is stripped', () => {
+    // Same reason as the gym poster: the fixed header prints over the sheet (#4415).
+    expect(isChromeLessPath('/poster/b/garage-wall')).toBe(true);
+    expect(isChromeLessPath(stripLocalePrefix('/es/poster/b/garage-wall', 'es'))).toBe(true);
+    expect(isChromeLessPath('/b/garage-wall')).toBe(false);
+    expect(isChromeLessPath('/posters')).toBe(false);
+  });
+
+  it('matches the partner app sign-in and consent pages, whose site links would drop the request', () => {
+    expect(isChromeLessPath('/oauth/sign-in')).toBe(true);
+    expect(isChromeLessPath('/oauth/consent')).toBe(true);
+    expect(isChromeLessPath(stripLocalePrefix('/fr/oauth/consent', 'fr'))).toBe(true);
+    expect(isChromeLessPath('/oauthentication')).toBe(false);
   });
 
   it('does not match lookalike prefixes', () => {

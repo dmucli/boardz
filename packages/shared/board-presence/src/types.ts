@@ -32,6 +32,13 @@ export type BoardPresenceState = {
   /** Latest accepted native clear, used to reject imports displayed before it. */
   lastClearedAt: string | null;
   /**
+   * The climb the latest accepted clear turned off: the event's `climbUuid`, else
+   * whatever was current when it landed. Kept after a later set, like
+   * `lastClearedAt`; read it through `selectClearedClimbUuid`, which only answers
+   * while the wall is still dark.
+   */
+  lastClearedClimbUuid: string | null;
+  /**
    * The board's durable stat snapshot (sends/climbers/hardest/top), pushed live
    * over the same subscription as climb events. Null until the first seed/push.
    */
@@ -51,18 +58,35 @@ export type BoardPresenceState = {
    */
   holder: BoardConnectionHolder | null;
   /**
-   * Highest connection-event `seq` applied. Connection events share the
-   * per-board seq counter with climb + stats events, so an out-of-order/duplicate
-   * connection push (seq <= this) is ignored. Separate from `lastSeq` /
-   * `lastStatsSeq` so a connection push never advances the climb-ordering or
-   * stats cursors (and vice versa).
+   * Internal wire-ordering watermark: accepted holder events and the sequence
+   * observed when an accepted holder snapshot started. History response
+   * sequences never advance this, so delayed holder events can still apply.
+   */
+  lastConnectionWireSeq: number;
+  /**
+   * Monotonic connection-observation cursor. Live holder events advance it to
+   * their sequence; catch-up advances it through the repaired history. Delayed
+   * holder events never move it backwards or invent a newer takeover. Only
+   * `lastConnectionWireSeq` decides whether a holder event or snapshot is stale.
    */
   lastConnectionSeq: number;
+  /**
+   * Sequence of the latest event that changed who holds the board: every live
+   * connection push (the server only sends one when a different emitter takes
+   * the wall, or the holder lets go), and a catch-up that reads a different
+   * holder (another account, signed in vs anonymous, held vs free). A catch-up
+   * that reads back the same holder moves `lastConnectionSeq` up to the newest
+   * sequence it repaired through but leaves this alone, so "the holder changed
+   * after sequence N" never fires on a re-read. Two anonymous holders can't be
+   * told apart, so a catch-up never counts one replacing another. Zero until the
+   * first push or changed catch-up; the initial seed keeps it there.
+   */
+  lastHolderChangeSeq: number;
 };
 
 export type BoardPresenceAction =
   | { type: 'APPLY_CLIMB_SET'; payload: BoardPresenceClimb }
-  | { type: 'APPLY_CLIMB_CLEARED'; payload: { clearedAt: string; seq: number } }
+  | { type: 'APPLY_CLIMB_CLEARED'; payload: { clearedAt: string; seq: number; climbUuid?: string | null } }
   | { type: 'BACKFILL_HISTORY'; payload: BoardPresenceClimb[] }
   | { type: 'MERGE_HISTORY'; payload: BoardPresenceClimb[] }
   // Live stats push from the subscription (the freshly recomputed snapshot).
@@ -76,8 +100,10 @@ export type BoardPresenceAction =
   | { type: 'APPLY_CONNECTION_CHANGED'; payload: { holder: BoardConnectionHolder | null; seq: number } }
   // One-time initial fetch seed; only fills the holder before any live push.
   | { type: 'SEED_CONNECTION'; payload: BoardConnectionHolder | null }
-  // Full-feed catch-up after a detected sequence gap. This is a snapshot, so it
-  // replaces stale holder state and advances the connection cursor through the
-  // repaired seq.
-  | { type: 'REFRESH_CONNECTION'; payload: { holder: BoardConnectionHolder | null; upToSeq: number } }
+  // Holder ordering uses the request-start sequence; public observation
+  // progress advances through the independently repaired history sequence.
+  | {
+      type: 'REFRESH_CONNECTION';
+      payload: { holder: BoardConnectionHolder | null; startedAtSeq: number; upToSeq: number };
+    }
   | { type: 'RESET' };

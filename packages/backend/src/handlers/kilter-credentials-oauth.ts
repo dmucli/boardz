@@ -10,7 +10,7 @@ import {
 } from '@boardsesh/kilter-sync/api';
 import { decrypt, encrypt } from '@boardsesh/crypto';
 import { applyCorsHeaders, isOriginAllowed, isSameOriginUpgrade } from './cors';
-import { validateToken } from '../middleware/auth';
+import { validateHttpAuthToken } from './auth-admission';
 import { redisClientManager } from '../redis/client';
 import {
   signBoardCredentialCompletion,
@@ -169,7 +169,9 @@ async function authenticate(req: IncomingMessage, res: ServerResponse): Promise<
     return null;
   }
 
-  const authResult = await validateToken(token);
+  const admission = await validateHttpAuthToken(token, res);
+  if (!admission.available) return null;
+  const authResult = admission.auth;
   if (!authResult) {
     sendJson(res, 401, { error: 'Invalid or expired token' });
     return null;
@@ -203,8 +205,8 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 function requestOrigin(req: IncomingMessage): string {
   const forwardedProto = req.headers['x-forwarded-proto'];
   const proto = Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto;
-  const scheme = proto || (process.env.NODE_ENV === 'production' ? 'https' : 'http');
-  return `${scheme}://${req.headers.host ?? 'localhost'}`;
+  const scheme = proto && /^https?$/.test(proto) ? proto : process.env.NODE_ENV === 'production' ? 'https' : 'http';
+  return `${scheme}://${req.headers.host || 'localhost'}`;
 }
 
 function requestAllowedOrigin(req: IncomingMessage): string | null {

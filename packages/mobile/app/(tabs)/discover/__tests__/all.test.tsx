@@ -1,6 +1,19 @@
 // @vitest-environment jsdom
+vi.mock('../../../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
+import { act, render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 
 type PlaylistItem = { uuid: string; name: string; climbCount: number; color?: string; icon?: string };
@@ -34,8 +47,14 @@ vi.mock('expo-router', () => ({
 
 // react-native primitives → DOM. FlatList renders its data (or the empty
 // component) plus the footer so the error/retry affordances are assertable.
+// ReadableColumn pads by the side safe area; a portrait phone has none.
+vi.mock('react-native-safe-area-context', () => ({
+  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+}));
+
 vi.mock('react-native', () => ({
-  View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+  View: ({ children, style }: { children?: ReactNode; style?: unknown }) =>
+    createElement('div', { 'data-native-style': JSON.stringify(style) }, children),
   Pressable: ({
     children,
     onPress,
@@ -62,36 +81,48 @@ vi.mock('react-native', () => ({
       'aria-label': accessibilityLabel,
       onChange: (event: { target: { value: string } }) => onChangeText?.(event.target.value),
     }),
+  RefreshControl: ({ refreshing, onRefresh }: { refreshing?: boolean; onRefresh?: () => void }) =>
+    createElement('button', { 'data-refresh-control': String(!!refreshing), onClick: onRefresh }, 'pull-to-refresh'),
   FlatList: ({
     data,
     renderItem,
     ListEmptyComponent,
     ListFooterComponent,
+    refreshControl,
   }: {
     data?: PlaylistItem[];
     renderItem: (info: { item: PlaylistItem; index: number }) => ReactNode;
     ListEmptyComponent?: ReactNode;
     ListFooterComponent?: ReactNode;
+    refreshControl?: ReactNode;
   }) =>
     createElement(
       'div',
       { 'data-list': 'true' },
+      refreshControl,
       data && data.length > 0
         ? data.map((item, index) => createElement('div', { key: item.uuid }, renderItem({ item, index })))
         : ListEmptyComponent,
       ListFooterComponent,
     ),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1, absoluteFill: {} },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+    absoluteFill: {},
+  },
   Platform: { OS: 'ios' },
 }));
 
 vi.mock('../../../../src/theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24, 8: 32, 10: 40, 16: 64 },
 }));
 vi.mock('../../../../src/theme/ios-colors', () => ({
   iosSystemColors: { systemGray: '#8E8E93', systemGray4: '#C7C7CC' },
 }));
 vi.mock('../../../../src/providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: { background: '#fff', fill: '#eee', label: '#000', secondaryLabel: '#666', separator: '#ddd' },
     brandColors: { primary: '#6D28D9' },
@@ -137,6 +168,17 @@ beforeEach(() => {
 });
 
 describe('AllPlaylistsScreen', () => {
+  it('lets the search field grow beyond its 40-point minimum', () => {
+    const { getByLabelText } = render(<AllPlaylistsScreen />);
+    const input = getByLabelText('library.allPlaylists.searchPlaceholder');
+    const fieldStyles = JSON.parse(input?.parentElement?.getAttribute('data-native-style') ?? '[]') as {
+      minHeight?: number;
+      height?: number;
+    }[];
+    expect(Object.assign({}, ...fieldStyles)).toMatchObject({ minHeight: 40 });
+    expect(Object.assign({}, ...fieldStyles).height).toBeUndefined();
+  });
+
   it('shows an error state with a working retry when the initial load fails', () => {
     hook.hasError = true;
     const { getByText, getByLabelText } = render(<AllPlaylistsScreen />);
@@ -181,5 +223,28 @@ describe('AllPlaylistsScreen', () => {
     // there lands here.
     focusEffect.cb?.();
     expect(hook.refetch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// HIG Refresh content controls.
+describe('AllPlaylistsScreen pull to refresh', () => {
+  it('refetches on a pull and spins until the reload finishes', async () => {
+    hook.playlists = [{ uuid: 'p-1', name: 'Projects', climbCount: 3 }];
+    // Like the real hook: a refetch flips `isLoading` at once.
+    hook.refetch.mockImplementationOnce(() => {
+      hook.isLoading = true;
+    });
+    const { container, rerender } = render(<AllPlaylistsScreen />);
+    const spinnerOn = () => container.querySelector('[data-refresh-control]')?.getAttribute('data-refresh-control');
+
+    await act(async () => {
+      fireEvent.click(container.querySelector('[data-refresh-control]') as HTMLElement);
+    });
+    expect(hook.refetch).toHaveBeenCalledTimes(1);
+    expect(spinnerOn()).toBe('true');
+
+    hook.isLoading = false;
+    rerender(<AllPlaylistsScreen />);
+    expect(spinnerOn()).toBe('false');
   });
 });

@@ -1,0 +1,221 @@
+{
+  "metadata": {
+    "profile": {
+      "description": "Il profilo di arrampicata di {{name}} su Boardsesh",
+      "fallbackTitle": "Profilo",
+      "fallbackDescription": "Guarda il profilo di arrampicata e le statistiche",
+      "notFoundTitle": "Profilo non trovato",
+      "notFoundDescription": "Impossibile trovare questo profilo di arrampicata.",
+      "ogAlt": "Il profilo di arrampicata di {{name}}",
+      "title": "Le session di arrampicata di {{name}}",
+      "titleWithBoard": "Le session di {{name}} su {{board}}",
+      "ogTitleSent": "{{name}} ha chiuso un {{grade}}",
+      "ogTitleNoSends": "{{name}} su Boardsesh",
+      "ogDescriptionHardest_one": "{{climb}} è il primo blocco chiuso su {{boards}}. Guarda il diario.",
+      "ogDescriptionHardest_other": "{{climb}} è il più duro di {{count}} blocchi chiusi su {{boards}}. Guarda il diario.",
+      "ogDescriptionCount_one": "{{count}} blocco chiuso su {{boards}}. Guarda il diario.",
+      "ogDescriptionCount_other": "{{count}} blocchi chiusi su {{boards}}. Guarda il diario.",
+      "ogDescriptionNoSends": "Ancora nessuna ripetizione registrata. Guarda il profilo."
+    },
+    "statistics": {
+      "title": "Statistiche"
+    },
+    "sessions": {
+      "title": "Session"
+    },
+    "climbs": {
+      "title": "Blocchi creati"
+    },
+    "setter": {
+      "title": "Blocchi tracciati da {{name}}",
+      "description": "Blocchi creati da {{name}} su Boardsesh",
+      "titleWithClimbs_one": "{{climbs}} blocco tracciato da {{name}} su {{boards}}",
+      "titleWithClimbs_other": "{{climbs}} blocchi tracciati da {{name}} su {{boards}}",
+      "titlePage": "Blocchi tracciati da {{name}} — Pagina {{page}}",
+      "titleWithClimbsPage_one": "{{climbs}} blocco tracciato da {{name}} su {{boards}} — Pagina {{page}}",
+      "titleWithClimbsPage_other": "{{climbs}} blocchi tracciati da {{name}} su {{boards}} — Pagina {{page}}",
+      "descriptionCtaSingle": "Illuminalo in parete con Boardsesh.",
+      "boardSprayWall": "Spraywall",
+      "descriptionSetCount_one": "{{name}} ha tracciato {{climbs}} blocco su {{boards}}.",
+      "descriptionSetCount_other": "{{name}} ha tracciato {{climbs}} blocchi su {{boards}}.",
+      "descriptionSends_one": "{{sends}} ripetizione finora.",
+      "descriptionSends_other": "{{sends}} ripetizioni finora.",
+      "descriptionCta": "Scegline uno e illuminalo in parete con Boardsesh.",
+      "fallbackTitle": "Profilo del tracciatore",
+      "fallbackDescription": "Guarda il profilo e i blocchi del tracciatore su Boardsesh",
+      "ogAlt": "Il profilo da tracciatore di {{name}}",
+      "ogTitleSends": "{{name}}: {{sends}} ripetizioni sui suoi blocchi",
+      "ogTitleSetCount_one": "{{name}} ha tracciato {{climbs}} blocco",
+      "ogTitleSetCount_other": "{{name}} ha tracciato {{climbs}} blocchi",
+      "ogSetCount_one": "{{climbs}} blocco tracciato.",
+      "ogSetCount_other": "{{climbs}} blocchi tracciati.",
+      "ogMostSent_one": "Il più ripetuto: {{climb}}, {{sends}} ripetizione.",
+      "ogMostSent_other": "Il più ripetuto: {{climb}}, {{sends}} ripetizioni.",
+      "ogMostSentSoFar": "Il più ripetuto finora: {{climb}}.",
+      "ogOnBoards": "Su {{boards}}.",
+      "ogPickOne": "Scegline uno e provalo.",
+      "ogGoGetOnIt": "Vai a provarlo."
+    }
+  },
+  "page": {
+    "lastThreeMonths": "Ultimi 3 mesi",
+    "activityChartLabel": "Attività negli ultimi 3 mesi",
+    "displayNameFallback": "Climber",
+    "betaVideos": "La sua beta",
+    "shareAriaLabel": "Condividi il profilo",
+    "shareText": "Scopri {{name}} su Boardsesh",
+    "linkCopied": "Link copiato",
+    "shareFailed": "Impossibile condividere il link"
+  },
+  "nav": {
+    "statistics": {
+      "title": "Statistiche",
+      "subtitleSent": "{{count}} blocchi chiusi",
+      "subtitleEmpty": "Gradi, progressione e altro"
+    },
+    "sessions": {
+      "title": "Session",
+      "subtitle": "Session di arrampicata e attività"
+    },
+    "createdClimbs": {
+      "title": "Blocchi creati",
+      "subtitleOwn": "I blocchi che hai creato",
+      "subtitleOther": "I blocchi che ha creato"
+    }
+  },
+  "stats": {
+    "problems": "blocchi",
+    "send": "ripetizione",
+    "flash": "flash",
+    "calendar": "Calendario",
+    "calendarAria": "Calendario di arrampicata: {{days}} giorni attivi, {{count}} blocchi",
+    "calendarLess": "Meno",
+    "calendarMore": "Più",
+    "calendarToday": "Oggi",
+    "calendarTapHint": "Tocca un giorno per vedere i blocchi",
+    "calendarClimbs_one": "{{count}} blocco",
+    "calendarClimbs_other": "{{count}} blocchi",
+    "calendarNoClimbs": "Nessun blocco",
+    "calendarWeekAria": "Settimana del {{date}}: {{days}}",
+    "calendarWeekEmptyAria": "Settimana del {{date}}: nessun blocco",
+    "percentile": "Percentile",
+    "topPercent": "Top {{value}}%",
+    "moreSentThan": "Più blocchi chiusi del {{value}}% dei climber",
+    "activity": "Attività",
+    "gradeDistribution": "Distribuzione dei gradi",
+    "flashVsRedpoint": "Flash vs Redpoint",
+    "vPoints": "V-Points",
+    "vPointsTotal": "{{value}} in totale",
+    "weekAxisLabel": "Settimana",
+    "chartTooltipTotal": "Totale",
+    "gradeDistributionAria": "Distribuzione dei gradi su tutti i pannelli",
+    "weeklyAttemptsAria": "Tentativi settimanali per difficoltà",
+    "flashRedpointAria": "Flash vs redpoint per grado",
+    "layoutTooltip": "{{name}}: {{count}} blocchi ({{percentage}}%)",
+    "periodComparison": {
+      "controlLabel": "Periodo di confronto",
+      "trailing": "Periodo precedente",
+      "yearOverYear": "Anno scorso",
+      "sends": "Ripetizioni",
+      "percentChange": "{{value}}%",
+      "vsTrailing": "rispetto al periodo precedente",
+      "vsYearOverYear": "rispetto allo stesso periodo dell'anno scorso",
+      "firstPeriod": "Primo periodo registrato",
+      "noComparisonData": "Ancora nessuna ripetizione"
+    },
+    "boardOverview": {
+      "title": "Su tutti i tuoi pannelli",
+      "allTime": "Tutti i pannelli · Da sempre",
+      "climbsLabel_one": "blocco chiuso",
+      "climbsLabel_other": "blocchi chiusi",
+      "layouts_one": "{{count}} layout di pannello",
+      "layouts_other": "{{count}} layout di pannello",
+      "climbs_one": "{{count}} blocco chiuso",
+      "climbs_other": "{{count}} blocchi chiusi",
+      "bestSend": "Il più duro chiuso",
+      "showAll": "Mostra tutti i {{count}} pannelli",
+      "showLess": "Mostra meno pannelli",
+      "empty": "La tua prima ripetizione è in arrivo. Qui trovi tutti i tuoi pannelli.",
+      "rowAria": "{{name}}: {{count}} blocchi diversi chiusi, da sempre",
+      "recordAria": "Il più duro chiuso: {{grade}}",
+      "publicTitle": "Su tutti i suoi pannelli",
+      "publicEmpty": "Ancora nessuna ripetizione registrata.",
+      "totalsLoading": "Caricamento dei totali",
+      "totalsError": "Impossibile caricare questi totali.",
+      "totalsOffline": "Questi totali si caricano appena torni online."
+    },
+    "progress": {
+      "title": "I tuoi progressi",
+      "filters": "Filtra i progressi",
+      "scope": "{{board}} · {{period}}",
+      "allTime": "Da sempre",
+      "lastYear": "Ultimo anno",
+      "lastMonth": "Ultimo mese",
+      "lastWeek": "Ultima settimana",
+      "today": "Oggi",
+      "custom": "Date personalizzate",
+      "activity": "Attività registrata",
+      "activityCaption": "Blocchi chiusi, ripetuti e tentati",
+      "lifetimeRecords": "Record di sempre · {{board}}",
+      "filteredEmpty": "Nessuna attività in questo periodo. Prova un altro intervallo.",
+      "publicTitle": "Progressi in arrampicata"
+    }
+  },
+  "empty": {
+    "userNotFound": "Utente non trovato",
+    "noAscentData": "Nessun dato sulle salite per questo periodo",
+    "noClimbingData": "Nessun dato di arrampicata per questo periodo"
+  },
+  "filter": {
+    "pageTitle": "Statistiche",
+    "drawer": {
+      "title": "Filtri",
+      "board": "Pannello",
+      "timeRange": "Intervallo di tempo",
+      "from": "Da",
+      "to": "A"
+    }
+  },
+  "mobile": {
+    "account": "Account",
+    "signOut": "Esci"
+  },
+  "setter": {
+    "shareAriaLabel": "Condividi il profilo del tracciatore",
+    "shareTitle": "{{name}} - Tracciatore",
+    "shareText": "Guarda i blocchi di {{name}} su Boardsesh",
+    "linkCopied": "Link copiato negli appunti!",
+    "shareFailed": "Condivisione non riuscita",
+    "follower_one": "follower",
+    "follower_other": "follower",
+    "seoHeading": "Blocchi tracciati da {{name}}",
+    "stats": {
+      "climbs_one": "{{climbs}} blocco su {{boards}}",
+      "climbs_other": "{{climbs}} blocchi su {{boards}}",
+      "sends_one": "una ripetizione",
+      "sends_other": "{{sends}} ripetizioni",
+      "joined": "{{climbs}}, {{sends}}"
+    },
+    "mostSent": {
+      "heading": "I più ripetuti",
+      "meta_one": "{{sends}} ripetizione · {{angle}}°",
+      "meta_other": "{{sends}} ripetizioni · {{angle}}°",
+      "artAlt": "{{climbName}} illuminato sul pannello {{board}} a {{angle}}°"
+    },
+    "climbsHeading": "Tutti i blocchi di {{name}}",
+    "empty": "Nessun blocco in questa pagina.",
+    "browseBoard": "Guarda tutti i blocchi su {{boardName}}",
+    "browsePlaylists": "Crea una playlist con questi blocchi",
+    "pagination": {
+      "aria": "Pagine dei blocchi",
+      "previous": "Blocchi precedenti",
+      "next": "Altri blocchi",
+      "pageLabel": "Pagina {{page}}"
+    },
+    "installHelper": "Scarica l’app gratuita e scala i blocchi di {{name}} sul tuo pannello.",
+    "qr": {
+      "title": "Inquadra il codice per aprire questi blocchi sul telefono",
+      "imageLabel": "Codice QR che apre i blocchi di {{name}} sul telefono"
+    }
+  }
+}

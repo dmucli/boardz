@@ -20,6 +20,7 @@ vi.mock('@sentry/react-native', () => ({
 import * as Sentry from '@sentry/react-native';
 import {
   applyBleDiagnosticsToScope,
+  applyCapturedValueNormalization,
   applyChunkLoadFingerprint,
   applyErrorContextToScope,
   applyLiveActivityIntentDiagnosticToScope,
@@ -279,6 +280,19 @@ describe('applyOtaTagsToScope', () => {
     return { setTag: vi.fn() };
   }
 
+  it.each([true, false, null])('preserves verified canary=%s and clears unknown membership', (automaticCanary) => {
+    const scope = makeScope();
+    applyOtaTagsToScope(scope, { automaticCanary, canaryCheckedAt: '2026-10-14T02:00:00.000Z' });
+    expect(scope.setTag).toHaveBeenCalledWith(
+      'ota_automatic_canary',
+      automaticCanary === null ? undefined : String(automaticCanary),
+    );
+    expect(scope.setTag).toHaveBeenCalledWith('ota_canary_checked_at', '2026-10-14T02:00:00.000Z');
+    applyOtaTagsToScope(scope, {});
+    expect(scope.setTag).toHaveBeenLastCalledWith('ota_canary_checked_at', undefined);
+    expect(scope.setTag).toHaveBeenCalledWith('ota_automatic_canary', undefined);
+  });
+
   it('sets each provided tag and stringifies the embedded boolean for filter-friendliness', () => {
     const scope = makeScope();
     applyOtaTagsToScope(scope, {
@@ -477,5 +491,29 @@ describe('applyChunkLoadFingerprint (#5611)', () => {
     const event = { exception: { values: [{ type: 'TypeError', value: 'boom' }] }, fingerprint: ['custom'] };
     expect(applyChunkLoadFingerprint(event).fingerprint).toEqual(['custom']);
     expect(applyChunkLoadFingerprint({ exception: { values: [{ type: 'Error' }] } }).fingerprint).toBeUndefined();
+  });
+});
+
+describe('applyCapturedValueNormalization', () => {
+  it('surfaces the close code of a raw close event rejected through onunhandledrejection', () => {
+    const event = { exception: { values: [{ value: 'Event `Event` (type=close) captured as promise rejection' }] } };
+    const closeEvent = { type: 'close', code: 1000, reason: 'Server shutting down', wasClean: true };
+    const result = applyCapturedValueNormalization(event, closeEvent) as typeof event & {
+      extra?: Record<string, unknown>;
+    };
+    expect(result.extra).toMatchObject({ code: 1000, reason: 'Server shutting down', wasClean: true });
+    expect(result.exception.values[0].value).toBe('WebSocket close (code 1000)');
+  });
+
+  it('leaves a non-close object with a type key untouched', () => {
+    const event = { exception: { values: [{ value: 'orig' }] } };
+    const result = applyCapturedValueNormalization(event, { type: 'click' });
+    expect(result).toEqual({ exception: { values: [{ value: 'orig' }] } });
+  });
+
+  it('leaves an event whose original exception is a real Error untouched', () => {
+    const event = { exception: { values: [{ value: 'boom' }] } };
+    const result = applyCapturedValueNormalization(event, new Error('boom'));
+    expect(result).toEqual({ exception: { values: [{ value: 'boom' }] } });
   });
 });

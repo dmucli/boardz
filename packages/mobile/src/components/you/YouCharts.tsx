@@ -1,13 +1,16 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   PixelRatio,
-  Pressable,
+  Platform,
   View,
   StyleSheet,
   type GestureResponderEvent,
   type LayoutChangeEvent,
+  type TextStyle,
 } from 'react-native';
 import { useTranslation } from 'react-i18next';
+import { textFontScale } from '../../theme/dynamic-type';
 import { BarChart, LineChart } from 'react-native-gifted-charts';
 import type { RawGroupedBar, RawVPointsTimeline } from '@boardsesh/profile-stats';
 import { Text } from '../Text';
@@ -26,9 +29,14 @@ import {
   type ChartTooltipModel,
 } from './chart-model';
 import { computeBarTopLabelLayout, longestBarValue } from '../../lib/chart/bar-top-label';
+import { buildGradeBarLabels, type GradeBarLabels } from '../../lib/chart/grade-bar-labels';
 
 const MAX_X_LABELS = 12;
 const AXIS_LABEL_SIZE = 11;
+// Axis ticks and value labels change with the data and stack in columns, so
+// they use tabular figures (HIG Typography) — the gifted-charts styles take a
+// raw TextStyle, not our Text, hence the bare fontVariant here.
+const TABULAR_FIGURES: TextStyle['fontVariant'] = ['tabular-nums'];
 const STACK_BAR_RADIUS = 3;
 const MIN_ZOOM_SCALE = 1;
 const MAX_ZOOM_SCALE = 2.75;
@@ -47,6 +55,8 @@ const CHART_LOWLIGHT_OPACITY = 0.5;
 // Mirrors `Text`'s maxFontSizeMultiplier: the count can grow by half again
 // under accessibility text sizes, and its box has to grow with it.
 const MAX_LABEL_FONT_SCALE = 1.5;
+// gifted-charts reserves this much height under the plot per x-axis line.
+const GIFTED_AXIS_LINE_HEIGHT = 18;
 
 export type ChartLegendItem = { color: string; label: string };
 
@@ -56,6 +66,43 @@ function downsampleLabel(index: number, total: number, label: string, max: numbe
   if (total <= max) return label;
   const step = Math.ceil(total / max);
   return index % step === 0 ? label : '';
+}
+
+/**
+ * A grade under its bar, whole. gifted boxes each axis label to one bar, so
+ * "V10 / 7A+" read "V1…"; the box is centred on the bar and this sizes itself
+ * to the grade and centres over it, spilling into the gaps either side. The
+ * font is pinned so the widths `buildGradeBarLabels` measured stay true.
+ */
+function GradeAxisLabel({ lines, width, color }: { lines: string[]; width: number; color: string }) {
+  return (
+    <View style={[styles.gradeAxisLabel, { width }]} pointerEvents="none">
+      {lines.map((line, lineIndex) => (
+        <Text
+          key={`${lineIndex}-${line}`}
+          variant="caption2"
+          color={color}
+          numeric
+          numberOfLines={1}
+          allowFontScaling={false}
+          style={styles.gradeAxisLabelText}
+        >
+          {line}
+        </Text>
+      ))}
+    </View>
+  );
+}
+
+/** Axis label props for bar `index`: the grade's own component, or none when the crowded-row rule skipped it. */
+function gradeAxisLabelProps(gradeLabels: GradeBarLabels, index: number, slotWidth: number, color: string) {
+  const lines = gradeLabels.linesByBar[index] ?? [];
+  return {
+    label: '',
+    labelWidth: slotWidth,
+    labelComponent:
+      lines.length > 0 ? () => <GradeAxisLabel lines={lines} width={gradeLabels.width} color={color} /> : undefined,
+  };
 }
 
 /** Bar width + spacing that fit `count` bars into `width` without scrolling. */
@@ -194,7 +241,7 @@ function ChartFrame({ height, loading, emptyLabel, isEmpty, zoomable, onWidthCha
       ) : isEmpty ? (
         <View style={styles.emptyState} accessibilityRole="image" accessibilityLabel={emptyLabel}>
           <Icon name="chart.bar" size={22} color={systemColors.tertiaryLabel} />
-          <Text variant="footnote" color={systemColors.tertiaryLabel}>
+          <Text variant="footnote" color={systemColors.secondaryLabel}>
             {emptyLabel}
           </Text>
         </View>
@@ -202,7 +249,7 @@ function ChartFrame({ height, loading, emptyLabel, isEmpty, zoomable, onWidthCha
         children(width, zoomScale, canZoom && isZoomed)
       ) : null}
       {canZoom && isZoomed ? (
-        <Pressable
+        <PressableSurface
           onPress={resetZoom}
           style={[
             styles.resetZoomButton,
@@ -217,7 +264,7 @@ function ChartFrame({ height, loading, emptyLabel, isEmpty, zoomable, onWidthCha
           hitSlop={8}
         >
           <Icon name="crop.free" size={15} color={systemColors.label} />
-        </Pressable>
+        </PressableSurface>
       ) : null}
     </View>
   );
@@ -246,7 +293,7 @@ function TooltipBubble({ model, totalLabel }: { model: ChartTooltipModel | undef
         <Text variant="caption2" color={systemColors.secondaryLabel}>
           {totalLabel}
         </Text>
-        <Text variant="caption2" style={styles.tooltipValue}>
+        <Text variant="caption2" numeric style={styles.tooltipValue}>
           {formatThousands(model.total)}
         </Text>
       </View>
@@ -256,7 +303,7 @@ function TooltipBubble({ model, totalLabel }: { model: ChartTooltipModel | undef
           <Text variant="caption2" color={systemColors.secondaryLabel} style={styles.tooltipRowLabel} numberOfLines={1}>
             {row.label}
           </Text>
-          <Text variant="caption2" style={styles.tooltipValue}>
+          <Text variant="caption2" numeric style={styles.tooltipValue}>
             {formatThousands(row.value)}
           </Text>
         </View>
@@ -285,6 +332,11 @@ type StackedBarsProps = {
    * Lower it for long labels (weekly "W23 '24") that would overlap horizontally.
    */
   maxXLabels?: number;
+  /**
+   * The x-axis labels are grades. They never get cut short: they stack V over
+   * Font, then skip bars, instead of the `maxXLabels` downsampling.
+   */
+  gradeAxis?: boolean;
   interactive?: boolean;
   zoomable?: boolean;
   fitYAxisToData?: boolean;
@@ -308,6 +360,7 @@ export const StackedBarChart = memo(function StackedBarChart({
   emptyLabel,
   legend,
   maxXLabels,
+  gradeAxis,
   interactive = true,
   zoomable = true,
   fitYAxisToData,
@@ -376,12 +429,13 @@ export const StackedBarChart = memo(function StackedBarChart({
         }));
         return {
           stacks: rounded,
-          label: downsampleLabel(index, bars!.length, bar.label, maxXLabels),
+          label: gradeAxis ? '' : downsampleLabel(index, bars!.length, bar.label, maxXLabels),
           onPress: interactive ? () => handlePress(index) : undefined,
         };
       }),
-    [bars, colorBy, colorScheme, handlePress, interactive, maxXLabels],
+    [bars, colorBy, colorScheme, gradeAxis, handlePress, interactive, maxXLabels],
   );
+  const grades = useMemo(() => (gradeAxis ? (bars ?? []).map((bar) => bar.label) : null), [bars, gradeAxis]);
   const selectedTooltip = selectedIndex == null ? undefined : tooltipModels[selectedIndex];
 
   return (
@@ -409,6 +463,7 @@ export const StackedBarChart = memo(function StackedBarChart({
             const spacing = Math.max(2, Math.round(fitted.spacing * zoomScale));
             const contentWidth =
               initialSpacing + stackData.length * barWidth + Math.max(0, stackData.length - 1) * spacing;
+            const gradeLabels = grades ? buildGradeBarLabels(grades, barWidth, barWidth + spacing) : null;
             // gifted sizes each x-axis label box to ~one bar by default, so a wide
             // week label ("W23 '24") on a 5px bar clips to "...". Give every KEPT
             // label the full downsample-step width so it renders in full; blanked
@@ -417,12 +472,19 @@ export const StackedBarChart = memo(function StackedBarChart({
             const labelStep =
               stackData.length > effectiveMaxLabels ? Math.ceil(stackData.length / effectiveMaxLabels) : 1;
             const labelBudget = labelStep * (barWidth + spacing);
-            const sizedData = stackData.map((bar) => (bar.label ? { ...bar, labelWidth: labelBudget } : bar));
+            const sizedData = stackData.map((bar, index) => {
+              if (gradeLabels) {
+                return { ...bar, ...gradeAxisLabelProps(gradeLabels, index, barWidth, chartColors.secondaryLabel) };
+              }
+              return bar.label ? { ...bar, labelWidth: labelBudget } : bar;
+            });
+            const axisLines = gradeLabels?.stacked ? 2 : 1;
             return (
               <BarChart
                 stackData={sizedData}
                 width={chartWidth}
-                height={height - 28}
+                height={height - 28 - (axisLines - 1) * GIFTED_AXIS_LINE_HEIGHT}
+                xAxisTextNumberOfLines={axisLines}
                 barWidth={barWidth}
                 spacing={spacing}
                 initialSpacing={initialSpacing}
@@ -434,8 +496,16 @@ export const StackedBarChart = memo(function StackedBarChart({
                 yAxisThickness={0}
                 xAxisThickness={StyleSheet.hairlineWidth}
                 xAxisColor={chartColors.separator}
-                xAxisLabelTextStyle={{ color: chartColors.tertiaryLabel, fontSize: AXIS_LABEL_SIZE }}
-                yAxisTextStyle={{ color: chartColors.tertiaryLabel, fontSize: AXIS_LABEL_SIZE }}
+                xAxisLabelTextStyle={{
+                  color: chartColors.secondaryLabel,
+                  fontSize: AXIS_LABEL_SIZE,
+                  fontVariant: TABULAR_FIGURES,
+                }}
+                yAxisTextStyle={{
+                  color: chartColors.secondaryLabel,
+                  fontSize: AXIS_LABEL_SIZE,
+                  fontVariant: TABULAR_FIGURES,
+                }}
                 rulesColor={chartColors.separator}
                 rulesType="solid"
                 focusBarOnPress={interactive}
@@ -503,7 +573,12 @@ export const GroupedBarChart = memo(function GroupedBarChart({
     () => longestBarValue((bars ?? []).flatMap((bar) => bar.values.map((value) => value.value))),
     [bars],
   );
-  const labelFontScale = Math.min(PixelRatio.getFontScale(), MAX_LABEL_FONT_SCALE);
+  // The bar-top count is a caption2 `Text`: on iOS it grows on the caption2 ramp.
+  const labelFontScale = Math.min(
+    textFontScale('caption2', PixelRatio.getFontScale(), Platform.OS),
+    MAX_LABEL_FONT_SCALE,
+  );
+  const grades = useMemo(() => (bars ?? []).map((bar) => bar.label), [bars]);
   const handlePress = useCallback(
     (index: number) => {
       if (!interactive) return;
@@ -550,13 +625,18 @@ export const GroupedBarChart = memo(function GroupedBarChart({
               barWidth + zoomedInnerGap,
               labelFontScale,
             );
+            // Each grade owns a flash|redpoint pair and the gap after it.
+            const pairWidth = barWidth * 2 + zoomedInnerGap;
+            const gradeLabels = buildGradeBarLabels(grades, pairWidth, pairWidth + zoomedGroupGap);
+            const axisLines = gradeLabels.stacked ? 2 : 1;
             const data = list.flatMap((bar, barIndex) =>
               bar.values.map((value, valueIndex) => ({
                 value: value.value,
                 frontColor: flashRedpointColor(value.key, colorScheme),
                 spacing: valueIndex === 0 ? zoomedInnerGap : zoomedGroupGap,
-                label: valueIndex === 0 ? bar.label : undefined,
-                labelWidth: barWidth * 2 + zoomedInnerGap,
+                ...(valueIndex === 0
+                  ? gradeAxisLabelProps(gradeLabels, barIndex, pairWidth, chartColors.secondaryLabel)
+                  : null),
                 onPress: interactive ? () => handlePress(barIndex) : undefined,
                 topLabelComponent:
                   value.value > 0
@@ -564,7 +644,11 @@ export const GroupedBarChart = memo(function GroupedBarChart({
                         <Text
                           variant="caption2"
                           color={chartColors.secondaryLabel}
+                          numeric
                           numberOfLines={1}
+                          // The same cap `labelFontScale` assumes, so the width
+                          // estimate holds at every text size.
+                          maxFontSizeMultiplier={MAX_LABEL_FONT_SCALE}
                           style={[
                             styles.barTopLabel,
                             labelLayout.rotated
@@ -582,7 +666,8 @@ export const GroupedBarChart = memo(function GroupedBarChart({
               <BarChart
                 data={data}
                 width={chartWidth}
-                height={height - 28 - labelLayout.headroom}
+                height={height - 28 - labelLayout.headroom - (axisLines - 1) * GIFTED_AXIS_LINE_HEIGHT}
+                xAxisTextNumberOfLines={axisLines}
                 barWidth={barWidth}
                 initialSpacing={initial}
                 endSpacing={0}
@@ -595,7 +680,11 @@ export const GroupedBarChart = memo(function GroupedBarChart({
                 yAxisThickness={0}
                 xAxisThickness={StyleSheet.hairlineWidth}
                 xAxisColor={chartColors.separator}
-                xAxisLabelTextStyle={{ color: chartColors.tertiaryLabel, fontSize: AXIS_LABEL_SIZE }}
+                xAxisLabelTextStyle={{
+                  color: chartColors.secondaryLabel,
+                  fontSize: AXIS_LABEL_SIZE,
+                  fontVariant: TABULAR_FIGURES,
+                }}
                 focusBarOnPress={interactive}
                 highlightedBarIndex={selectedIndex == null ? -1 : [selectedIndex * 2, selectedIndex * 2 + 1]}
                 highlightEnabled={interactive && selectedIndex != null}
@@ -685,7 +774,7 @@ export const TotalAreaChart = memo(function TotalAreaChart({
                     { backgroundColor: chartColors.elevatedSurface, borderColor: chartColors.separator },
                   ]}
                 >
-                  <Text variant="caption2" color={chartColors.label} style={styles.endValueText}>
+                  <Text variant="caption2" color={chartColors.label} numeric style={styles.endValueText}>
                     {formatThousands(latestTotal)}
                   </Text>
                 </View>
@@ -721,7 +810,8 @@ export const TotalAreaChart = memo(function TotalAreaChart({
                 labelComponent: () => (
                   <Text
                     variant="caption2"
-                    color={chartColors.tertiaryLabel}
+                    color={chartColors.secondaryLabel}
+                    numeric
                     style={[styles.lineAxisLabel, { width: labelBudget }]}
                     numberOfLines={1}
                   >
@@ -757,8 +847,16 @@ export const TotalAreaChart = memo(function TotalAreaChart({
             xAxisColor={chartColors.separator}
             rulesColor={chartColors.separator}
             rulesType="solid"
-            yAxisTextStyle={{ color: chartColors.tertiaryLabel, fontSize: AXIS_LABEL_SIZE }}
-            xAxisLabelTextStyle={{ color: chartColors.tertiaryLabel, fontSize: AXIS_LABEL_SIZE }}
+            yAxisTextStyle={{
+              color: chartColors.secondaryLabel,
+              fontSize: AXIS_LABEL_SIZE,
+              fontVariant: TABULAR_FIGURES,
+            }}
+            xAxisLabelTextStyle={{
+              color: chartColors.secondaryLabel,
+              fontSize: AXIS_LABEL_SIZE,
+              fontVariant: TABULAR_FIGURES,
+            }}
             pointerConfig={{
               pointerStripColor: chartColors.separator,
               pointerStripWidth: 1,
@@ -780,7 +878,7 @@ export const TotalAreaChart = memo(function TotalAreaChart({
                   <Text variant="caption2" color={chartColors.secondaryLabel} numberOfLines={1}>
                     {items[0]?.label}
                   </Text>
-                  <Text variant="caption1" style={styles.tooltipValue}>
+                  <Text variant="caption1" numeric style={styles.tooltipValue}>
                     {formatThousands(items[0]?.value ?? 0)}
                   </Text>
                 </View>
@@ -804,6 +902,12 @@ const styles = StyleSheet.create({
   emptyState: {
     alignItems: 'center',
     gap: spacing[2],
+  },
+  gradeAxisLabel: {
+    alignSelf: 'center',
+  },
+  gradeAxisLabelText: {
+    textAlign: 'center',
   },
   barTopLabel: {
     marginBottom: 2,

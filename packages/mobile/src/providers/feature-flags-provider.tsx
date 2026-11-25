@@ -18,11 +18,24 @@
 // rollout controls — which is when the `variants` property itself was dropped
 // from the definition type and had to be restored here.
 
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { readPosthogFeatureFlags, subscribePosthogFeatureFlags } from '../lib/analytics';
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  readPosthogFeatureFlagSnapshot,
+  readPosthogFeatureFlagsRequestId,
+  subscribePosthogFeatureFlags,
+} from '../lib/analytics';
 import { useFeatureFlagOverrides, type FeatureFlagOverrides } from '../lib/feature-flag-overrides';
 import { isDevBuild } from '../lib/is-dev-build';
+import { climbOverlayGpuApiVersion } from '../lib/board-render/gpu-native-capability';
+import { useSetting } from '../settings';
 import { isOfflineDownloadsEnabled } from './offline-downloads-enabled';
+import {
+  AURA_GPU_FLAG,
+  DEFAULT_AURA_GPU_ROLLOUT,
+  parseAuraGpuRollout,
+  auraGpuRolloutEnabled,
+  type AuraGpuRollout,
+} from '../lib/board-render/gpu-rollout';
 
 export type FeatureFlags = Record<string, boolean | string | undefined>;
 
@@ -35,6 +48,8 @@ export type FeatureFlagDefinition = {
   key: string;
   label: string;
   description: string;
+  /** Shipped boolean default, also displayed by the tester override screen. */
+  defaultEnabled?: boolean;
   /**
    * Declares this a multivariate flag: PostHog resolves it to one of these
    * strings (or nothing, when unresolved) instead of a boolean. Omit for a
@@ -53,12 +68,31 @@ export type FeatureFlagDefinition = {
    * — the layer that actually knows the region — is overruled. Marking the flag
    * here makes the override apply in `__DEV__` builds only (QA still exercises
    * the path in a dev client) and be ignored in production, where PostHog stays
-   * authoritative. See `donation-links` and docs/feature-flags.md.
+   * authoritative. See `donation-links-v2` and docs/operations/feature-flags.md.
    */
   policyControlled?: boolean;
 };
 
 export const FEATURE_FLAG_DEFINITIONS = [
+  {
+    key: 'app-workouts',
+    label: 'Partner workouts',
+    description: 'Open a planned session from a connected app and read back the results.',
+    defaultEnabled: false,
+  },
+  {
+    key: AURA_GPU_FLAG,
+    label: 'Aura GPU rendering',
+    description:
+      'Emergency switch: false uses PNG everywhere. Unresolved preserves Homewall. The versioned payload enables catalogue families individually; disabledFamilies overrides enabledFamilies.',
+    defaultEnabled: true,
+  },
+  {
+    key: 'privacy-consent-step-kill',
+    label: 'Privacy step kill switch',
+    description: 'Suppresses the privacy step and disables product analytics.',
+    defaultEnabled: false,
+  },
   {
     key: 'personal-grades',
     label: 'Personal grades',
@@ -69,11 +103,6 @@ export const FEATURE_FLAG_DEFINITIONS = [
     key: 'strava-integration',
     label: 'Strava integration',
     description: 'Share sends to Strava and the Strava connect option in Integrations.',
-  },
-  {
-    key: 'logbook-filters',
-    label: 'Logbook filters',
-    description: 'Search box and filter sheet on the logbook (shipped: 100% rollout since 2026-07-03).',
   },
   {
     key: 'board-link-onboarding-step',
@@ -95,7 +124,7 @@ export const FEATURE_FLAG_DEFINITIONS = [
     key: 'cross-angle-stats',
     label: 'Cross-angle climb stats',
     description:
-      "Show climbs whose grade and sends live at a different angle, ranked on that angle's real send count and marked with it, instead of burying them under every climb set at the angle you are browsing. Not read on Woods, which has its own Other angles switch in the climb filters, off by default. KEEP THIS AT 0%: on a large catalogue the query loses its index-ordered early exit and costs ~0.9 s on MoonBoard and ~5.6 s on Kilter, measured on production. It is here to test the behaviour on one device, not to roll out.",
+      "Show climbs whose grade and sends live at a different angle, ranked on that angle's real send count and marked with it, instead of burying them under every climb set at the angle you are browsing. Not read on Woods, which has its own Other angles switch in the climb filters, off by default. Does nothing unless the backend's CROSS_ANGLE_STATS_BOARDS env var names the board, and production leaves it unset: on a large catalogue the query loses its index-ordered early exit and costs ~0.9 s on MoonBoard and ~5.6 s on Kilter, measured on production (#5412). It is here to test the behaviour against a dev backend, not to roll out.",
   },
   {
     key: 'garmin-watch',
@@ -118,7 +147,7 @@ export const FEATURE_FLAG_DEFINITIONS = [
     key: 'observe-dispatch-enabled',
     label: 'Observe telemetry dispatch',
     description:
-      'Emergency kill switch for expo-observe. Off stops the app dispatching metrics, logs and error reports to updates.boardsesh.com; pending ones are marked sent and discarded. Manifest polling and OTA updates are unaffected.',
+      'Emergency kill switch for first-party Observe diagnostics. Off disables SDK dispatch of metrics, logs and error reports to updates.boardsesh.com. The Analytics choice does not control diagnostics. Manifest polling and OTA updates are unaffected.',
   },
   {
     key: 'observe-sample-rate',
@@ -131,7 +160,25 @@ export const FEATURE_FLAG_DEFINITIONS = [
     key: 'shared-session-browse',
     label: 'Preview-first shared sessions',
     description:
-      'In a session with 2+ climbers, swipes and climb-list taps browse instead of writing the shared queue and lighting the wall; "Put on the wall" becomes the one commit. Off = every gesture drives the wall as it always did.',
+      'In a session with 2+ climbers, swipes and climb-list taps browse instead of writing the shared queue and lighting the wall; "Put on board" becomes the one commit. Off = every gesture lights the wall as it always did.',
+  },
+  {
+    key: 'queue-now-slot',
+    label: 'Current climb outside the queue',
+    description:
+      "F3 (#6666). Opening a climb puts it on the wall without copying it into Up next; History, Now and Up next stay apart, and a History row's long-press offers Replay from here. In a session it also needs the backend to serve the Now slot fields (a probe on every connect); otherwise the phone stays on today's documents and reducer. A POSITIVE flag: off or unresolved is today's behaviour. Takes effect on the next session join or reconnect.",
+  },
+  {
+    key: 'stale-current-hold-kill',
+    label: 'Disable the stale-climb hold',
+    description:
+      'Emergency kill switch for the #4979 hold (F3, docs/product/current-climb-outside-queue.md section 6): when the climb on the wall has not changed for 4 hours, connecting a board keeps it dark and the wall button reads Put on board. With it on, connecting lights that climb as before. Unresolved reads as enabled.',
+  },
+  {
+    key: 'android-notification-bokeh-kill',
+    label: 'Disable the Android bokeh session card',
+    description:
+      'Emergency kill switch for the Android lock screen card (#7327). With it on, the app stops sending the card payload and the notification goes back to the classic layout on its next update. Unresolved reads as enabled.',
   },
   {
     key: 'moonboard-wide-angles',
@@ -152,23 +199,44 @@ export const FEATURE_FLAG_DEFINITIONS = [
       'Abort interactive GraphQL requests after 20 s so a hung server cannot pin a screen. Kill switch for marginal networks: set to false (sync keeps its own 30 s).',
   },
   {
-    key: 'spray-walls',
-    label: 'Spray walls',
-    description:
-      'The "Add a spray wall" tile on the boards picker and the /boards/spray/* routes behind it: photograph a wall, mark its corners, let the phone suggest holds, correct them, publish. A POSITIVE rollout flag — unresolved reads as off, so the tile never flickers in for the first frames of a cold open.',
-  },
-  {
-    key: 'donation-links',
+    key: 'donation-links-v2',
     label: 'Donation links',
     policyControlled: true,
     description:
-      'POLICY-CONTROLLED: an on-device override is ignored in production builds, so this row does nothing on a store binary — PostHog decides. Turn the Acknowledgements support text into a tappable link to boardsesh.com/support. A POSITIVE rollout flag — unresolved reads as off, which renders the compliant unlinked text. An external donation link is a store-policy violation outside two narrow windows, and ONLY ONE OF THEM IS ENFORCED IN THE APP: iOS additionally requires an App Store storefront of USA, read natively, so an over-broad rollout cannot reach a non-US iPhone. Android has no such client guard — Play exposes no storefront to the app — so the PostHog targeting IS the guard, and it must be exactly: platform = Android AND country = AU AND date >= 2026-09-30. Rolling this out to Android by percentage, or to any other country, ships a policy violation.',
+      'POLICY-CONTROLLED: an on-device override is ignored in production builds, so this row does nothing on a store binary — PostHog decides. Turn the Acknowledgements support text into a tappable link to boardsesh.com/support. A POSITIVE rollout flag — unresolved reads as off, which renders the compliant unlinked text. On a phone the app only ever shows the link on an iPhone whose App Store storefront is USA (read natively); Android always gets the unlinked text whatever this flag says. The Expo browser app ignores this flag and has its own, donation-links-web-kill. Rolled out to everyone with no conditions. The -v2 suffix keeps older Android bundles, which read the old donation-links key and still carried an Android branch, off: never create that old key.',
+  },
+  {
+    key: 'donation-links-web-kill',
+    label: 'Donation links kill switch (browser app)',
+    description:
+      'Emergency kill switch for support asks in the Expo browser app at /app, which no store rule covers and so ignores donation-links-v2. On hides the Support Boardsesh row in Account and turns the Acknowledgements link back into unlinked text, without a deploy. Native builds never read it. Unresolved reads as enabled.',
+  },
+  {
+    key: 'directory-reports',
+    label: 'Report a problem on boards and gyms',
+    description:
+      'Report a problem on a board or gym listing, the report review sheet for creators and gym staff, "About this board" in the Climbs menu, and the explainers on the board and gym edit screens. The same PostHog flag gates the backend (docs/product/directory-reports.md): turn it on with a plain 100% release once this build is out. A POSITIVE rollout flag: unresolved or off shows none of it.',
+    defaultEnabled: false,
+  },
+  {
+    key: 'directory-setup-suggestions',
+    label: 'Suggest the right setup on "Set up wrong"',
+    description:
+      'Layout, size, holds and angle menus on a "Set up wrong" report, the "Climb it now" step when the change applied, "Use this setup" on the report review sheet, and Undo on the climber-change notice. Sits on top of directory-reports. The same PostHog flag gates the backend (docs/product/directory-reports.md, "The directory-setup-suggestions flag"): turn it on with a plain 100% release once this build is out. A POSITIVE rollout flag: unresolved or off shows the plain note field.',
+    defaultEnabled: false,
+  },
+  {
+    key: 'add-board-wizard',
+    label: 'Add a board wizard',
+    description:
+      "The + opens one \"Add a board\" wizard: Where's the board? (at a gym, at home, a spray wall), then the gym map and the gym's boards, or the board type tiles, then the restyled Set up screen. A gym page's Set up a board opens on the gym's boards, and first run's At home opens the board type tiles. Replaces create-board-gym-first. The builder sends the server's existing-wall check whatever this flag says. A POSITIVE rollout flag, rolled out by percentage: unresolved or off keeps the + menu (Set up a board, Add a Spraywall, Find a gym) and the old builder.",
+    defaultEnabled: false,
   },
   {
     key: 'climb-moderation-kill',
     label: 'Disable climb reporting + moderation',
     description:
-      'Emergency kill switch: hides the Report climb action, the More-tab Moderation row and the community moderation status. Unresolved reads as enabled (kill switches invert the default; see docs/feature-flags.md).',
+      'Emergency kill switch: hides climb and spray-wall reporting, the Moderation entry and review surfaces, and community moderation status. Unresolved reads as enabled; spray reporting and review wait for resolution.',
   },
   {
     key: 'active-board-follow-heal-kill',
@@ -201,17 +269,66 @@ export const FEATURE_FLAG_DEFINITIONS = [
       'Emergency kill switch for the board picker the launch gate opens by itself for a new account (at most 7 days old) with no board (#5654). With it on, the gate logs would_present and opens nothing; Find my board and every other way into the picker keep working. Unresolved reads as enabled, but the gate waits for flags to resolve before it pushes.',
   },
   {
+    key: 'picker-auto-scan-kill',
+    label: 'Stop the board picker scanning by itself',
+    description:
+      "Emergency kill switch for the board picker's In range slot scanning over Bluetooth on open. With it on, the slot waits for a tap on its Scan button instead; nothing else changes, and the Bluetooth question is still only asked from a tap. Unresolved reads as enabled.",
+  },
+  {
     key: 'first-connect-cta-kill',
     label: 'Disable the connect step',
     description:
-      'Emergency kill switch for the connect-step test (#5654): the "Light climbs on" card on Climbs, the "Light it on the board" pill in the play view, and the one-time "Connected to" confirmation. With it on, no new account is enrolled and everyone already enrolled gets the plain bulb back. Unresolved reads as enabled; the gate waits for flags to resolve before it enrols anyone.',
+      'Emergency kill switch for the connect-step test (#5654): the "Light climbs on" card on Climbs and the one-time "Connected to" confirmation (the play view pill went in #7000: its Connect board button does that job for everyone). With it on, no new account is enrolled and everyone already enrolled stops seeing the card. Unresolved reads as enabled; the gate waits for flags to resolve before it enrols anyone.',
   },
   {
     key: 'first-connect-cta-arm',
     label: 'Force the connect-step arm (QA)',
     description:
-      'QA only. Puts the signed-in account in the treatment (card + pill) or control arm of the connect-step test, whatever its age, build or app version, and starts this phone from a clean slate as if it had never connected. Takes effect right away. Only the on-device choice here counts; a PostHog value for this key is ignored. Forced exposures are tagged arm_forced and left out of the analysis. Default lets the account hash decide.',
+      'QA only. Puts the signed-in account in the treatment (the Climbs card) or control arm of the connect-step test, whatever its age, build or app version, and starts this phone from a clean slate as if it had never connected. Takes effect right away. Only the on-device choice here counts; a PostHog value for this key is ignored. Forced exposures are tagged arm_forced and left out of the analysis. Default lets the account hash decide.',
     variants: ['treatment', 'control'],
+  },
+  {
+    key: 'tab-bar-hide-on-scroll-kill',
+    label: 'Keep the Android tab bar in place',
+    description:
+      'Kill switch for hide-on-scroll on Android phones: scrolling down a tab slides the tab bar away and drops the MiniPlayer card to the bottom; scrolling up brings it back. With it on, the bar sits below the screen, opaque, and never moves, exactly as before. Also the QA switch for comparing the two. Unresolved reads as enabled.',
+  },
+  {
+    key: 'player-swap-look-kill',
+    label: 'Plain climb swap on the player board',
+    description:
+      "Kill switch for the player board's swap look: dragging dims the old holds into standby rings from the edge the next climb comes from and shows the next climb as faint halos behind that front; letting go fills them in along the same sweep. With it on, the board swaps climbs exactly as before, a plain fade. Also the QA switch for comparing the two; it takes effect on the open board. Older builds, Reduce Motion and Differentiate Without Color always get the plain fade. Unresolved reads as enabled.",
+  },
+  {
+    key: 'png-wall-fade-kill',
+    label: 'Slide the player board without the GPU',
+    description:
+      "Kill switch for the player board's still wall when it draws pictures instead of the GPU board (older builds, no GPU, playback, or the GPU board switched off in Settings › Board): the wall stays put, dragging dims the climb to 40%, and letting go brings the next climb up from 40% to full. Reduce Motion gets a quick dissolve. With it on, the whole board slides from climb to climb as before. Also the QA switch for comparing the two; it takes effect on the open board. Unresolved reads as enabled.",
+  },
+  {
+    key: 'early-updates',
+    label: 'Early updates',
+    description:
+      'The "Get updates early" switch in More: a phone that turns it on gets every merge to main ahead of the daily stable release. A POSITIVE rollout flag, not a kill switch, because it has to ship hidden: with no value at all the row is hidden and nobody is moved. Turning it off in PostHog after climbers joined hides the row, moves them back to the regular track at their next online launch and keeps their choice, so they rejoin when it is turned on again.',
+  },
+  {
+    key: 'sheet-keyboard-calibration',
+    label: 'Sheet keyboard calibration (QA)',
+    description:
+      'QA only, iPhone and iPad. Draws a black box of numbers at the top of every sheet with a pinned bar or header, such as Log a tick, to show where the keyboard really sits under a sheet (#5964). Open the sheet and screenshot the box, tap a text field and screenshot it again. It only measures: buttons and padding stay exactly as they are. Off by default.',
+    defaultEnabled: false,
+  },
+  {
+    key: 'wall-swipe-to-drive',
+    label: 'Swipe the wall button to drive',
+    description:
+      "Swipe the player's wall button left to drive the wall (#7113): connect, light the climb, and light every climb picked after it, in a crew too. With it on the button shows ‹‹ chevrons, the frost peeks in once (in up to 3 sessions), the screen-reader action \"Light every climb\" appears, and the board sheet gets a Light every climb row. It also gates Put on board's timed drive (2.7) and Always drive the wall's always-on drive: off, Put on board lights one climb, nothing drives the wall, and every pick is a preview. A POSITIVE rollout flag: unresolved or off is the button with no swipe. Dev builds read it as on unless it is set to off here.",
+  },
+  {
+    key: 'wall-frost-motion',
+    label: 'Moving frost on the driving wall button',
+    description:
+      "While you drive the wall, the wall button's frost is drawn by a native GPU shader: its lights breathe slowly and slide to the next climb's holds on Next. iOS and Android 13+ builds with the native module; older Android versions, the web and older binaries keep the still frost. Reduce Motion keeps it still too. A POSITIVE rollout flag: unresolved or off is today's still frost. Dev builds read it as on unless it is set to off here.",
   },
 ] as const satisfies readonly FeatureFlagDefinition[];
 
@@ -265,6 +382,17 @@ const FeatureFlagsContext = createContext<FeatureFlags>(DEFAULT_FEATURE_FLAGS);
 const FeatureFlagsResolvedContext = createContext<boolean>(false);
 
 /**
+ * Whether PostHog has answered with a NEW response since the app opened.
+ *
+ * Stricter than "resolved", which is also reached by the timeout and by PostHog
+ * re-emitting its cached bag after a failed request. Read this before doing
+ * something to a climber on a flag being OFF that a stale bag should not be
+ * able to trigger: the cached bag may predate a rollout, or belong to a state
+ * the flag has since left.
+ */
+const FeatureFlagsFreshContext = createContext<boolean>(false);
+
+/**
  * How long a consumer waits for PostHog before treating the bag as final.
  *
  * There has to be a ceiling. PostHog may be unreachable, disabled in this build,
@@ -275,9 +403,12 @@ const FeatureFlagsResolvedContext = createContext<boolean>(false);
  */
 export const FEATURE_FLAG_RESOLUTION_TIMEOUT_MS = 2000;
 
+const AuraGpuRolloutContext = createContext<AuraGpuRollout>(DEFAULT_AURA_GPU_ROLLOUT);
+
 export function FeatureFlagsProvider({
   flags = DEFAULT_FEATURE_FLAGS,
   staticFlagsAreFinal = true,
+  payloads,
   children,
 }: {
   flags?: FeatureFlags;
@@ -289,18 +420,35 @@ export function FeatureFlagsProvider({
    * gate act before a switch flipped in PostHog could reach it.
    */
   staticFlagsAreFinal?: boolean;
+  /** Explicit local/test policy; remote policy otherwise shares flag authority. */
+  payloads?: Readonly<Record<string, unknown>>;
   children: ReactNode;
 }) {
   const [posthogFlags, setPosthogFlags] = useState<FeatureFlags>(DEFAULT_FEATURE_FLAGS);
+  const [posthogGpuRollout, setPosthogGpuRollout] = useState(DEFAULT_AURA_GPU_ROLLOUT);
   const [resolved, setResolved] = useState(false);
+  const [fresh, setFresh] = useState(false);
+  // The response the cached bag came from. Read during the first render, before
+  // the subscription below asks PostHog to reload.
+  const cachedRequestIdRef = useRef(readPosthogFeatureFlagsRequestId());
   const { overrides } = useFeatureFlagOverrides();
 
   useEffect(() => {
     let mounted = true;
     const refreshFlags = () => {
-      const nextFlags = readPosthogFeatureFlags(FEATURE_FLAG_DEFINITIONS);
+      const nextSnapshot = readPosthogFeatureFlagSnapshot(FEATURE_FLAG_DEFINITIONS, [AURA_GPU_FLAG]);
+      const nextFlags = nextSnapshot.flags;
       if (!mounted) return;
       setPosthogFlags((previousFlags) => (featureFlagsEqual(previousFlags, nextFlags) ? previousFlags : nextFlags));
+      const nextPolicy = parseAuraGpuRollout(nextSnapshot.payloads[AURA_GPU_FLAG]);
+      setPosthogGpuRollout((previousPolicy) =>
+        previousPolicy.enabledFamilies.join(',') === nextPolicy.enabledFamilies.join(',') &&
+        previousPolicy.disabledFamilies.join(',') === nextPolicy.disabledFamilies.join(',')
+          ? previousPolicy
+          : nextPolicy,
+      );
+      const requestId = readPosthogFeatureFlagsRequestId();
+      setFresh(requestId !== undefined && requestId !== cachedRequestIdRef.current);
     };
 
     refreshFlags();
@@ -328,7 +476,7 @@ export function FeatureFlagsProvider({
   const value = useMemo<FeatureFlags>(() => {
     // Policy-controlled flags lose their override outside a dev build, so this
     // has to happen BEFORE the empty check: on a store binary a lone
-    // donation-links override leaves nothing to merge at all.
+    // donation-links-v2 override leaves nothing to merge at all.
     const honouredOverrides = applyOverridePolicy(overrides);
     const hasOverrides = Object.keys(honouredOverrides).length > 0;
     if (posthogFlags === DEFAULT_FEATURE_FLAGS && flags === DEFAULT_FEATURE_FLAGS && !hasOverrides) {
@@ -336,13 +484,28 @@ export function FeatureFlagsProvider({
     }
     // Local tester overrides win over the static env override, which wins over
     // the live PostHog value.
-    return { ...posthogFlags, ...flags, ...honouredOverrides };
+    const mergedFlags = { ...posthogFlags, ...flags, ...honouredOverrides };
+    // A tester may turn GPU rendering off locally, but cannot bypass a fleet
+    // emergency disable with an old forced-on preference.
+    if (posthogFlags[AURA_GPU_FLAG] === false) mergedFlags[AURA_GPU_FLAG] = false;
+    return mergedFlags;
   }, [posthogFlags, flags, overrides]);
+
+  const gpuRollout = useMemo(() => {
+    if (!payloads || !Object.prototype.hasOwnProperty.call(payloads, AURA_GPU_FLAG)) return posthogGpuRollout;
+    const explicitPolicy = parseAuraGpuRollout(payloads[AURA_GPU_FLAG]);
+    return {
+      ...explicitPolicy,
+      disabledFamilies: [...new Set([...posthogGpuRollout.disabledFamilies, ...explicitPolicy.disabledFamilies])],
+    };
+  }, [payloads, posthogGpuRollout]);
 
   return (
     <FeatureFlagsContext.Provider value={value}>
       <FeatureFlagsResolvedContext.Provider value={resolved || hasStaticFlags}>
-        {children}
+        <FeatureFlagsFreshContext.Provider value={fresh || hasStaticFlags}>
+          <AuraGpuRolloutContext.Provider value={gpuRollout}>{children}</AuraGpuRolloutContext.Provider>
+        </FeatureFlagsFreshContext.Provider>
       </FeatureFlagsResolvedContext.Provider>
     </FeatureFlagsContext.Provider>
   );
@@ -357,6 +520,11 @@ export function FeatureFlagsProvider({
  */
 export function useFeatureFlagsResolved(): boolean {
   return useContext(FeatureFlagsResolvedContext);
+}
+
+/** Whether the flag bag comes from a response received since the app opened. */
+export function useFeatureFlagsFresh(): boolean {
+  return useContext(FeatureFlagsFreshContext);
 }
 
 export function useFeatureFlags(): FeatureFlags {
@@ -422,6 +590,40 @@ export function useClimbModerationEnabled(): boolean {
 }
 
 /**
+ * Report a problem on boards and gyms (#8043). Positive and fail-closed: off,
+ * missing or unresolved hides every entry point, because the backend refuses
+ * a report while its own copy of the same flag is off.
+ */
+export function useDirectoryReportsEnabled(): boolean {
+  return useFeatureFlag('directory-reports') === true;
+}
+
+/**
+ * Suggest the right setup on a "Set up wrong" report (docs/product/directory-reports.md,
+ * "Suggested setup"). Positive and fail-closed like `directory-reports`, which it
+ * sits on: off, missing or unresolved keeps the report's plain note field, hides
+ * "Use this setup" on the review sheet and Undo on the climber-change notice.
+ */
+export function useDirectorySetupSuggestionsEnabled(): boolean {
+  return useFeatureFlag('directory-setup-suggestions') === true;
+}
+
+/**
+ * The add-a-board wizard (docs/product/existing-wall-check.md, "The app"): the
+ * + opens `/boards/add`, and the builder is restyled. Positive and fail-closed:
+ * off, missing or unresolved keeps the + menu and the old builder. Only the
+ * screens hang on it; the builder's existing-wall check is sent either way.
+ */
+export function useAddBoardWizardEnabled(): boolean {
+  return useFeatureFlag('add-board-wizard') === true;
+}
+
+/** Kill switch for the Android lock screen card (#7327). Missing or unresolved reads as enabled. */
+export function useAndroidNotificationCardEnabled(): boolean {
+  return useFeatureFlag('android-notification-bokeh-kill') !== true;
+}
+
+/**
  * Kill switch for the active-board follow heal (#5654): the silent `followBoard`
  * the app sends at launch for a board that is bound on this phone but missing
  * from Your boards.
@@ -452,6 +654,33 @@ export function useConnectivityBannerEnabled(): boolean {
   return useFeatureFlag('connectivity-banner-kill') !== true;
 }
 
+/**
+ * Kill switch for the Android phone nav bar's hide-on-scroll (and the overlay
+ * bar it draws over tab roots). Unresolved reads as enabled; switched on, the
+ * bar goes back to sitting in flow below every screen.
+ */
+export function useTabBarHideOnScrollEnabled(): boolean {
+  return useFeatureFlag('tab-bar-hide-on-scroll-kill') !== true;
+}
+
+/**
+ * Kill switch for the player board's swap look (`play-drawer/player-swap-look.ts`).
+ * Unresolved reads as enabled; switched on, the board runs the shipped wall
+ * swap, live on an open board. Also the QA switch for comparing the two.
+ */
+export function usePlayerSwapLookEnabled(): boolean {
+  return useFeatureFlag('player-swap-look-kill') !== true;
+}
+
+/**
+ * Kill switch for the PNG player board's still wall (`play-drawer/png-swap-layers.ts`).
+ * Unresolved reads as enabled; switched on, the board slides whole from climb
+ * to climb again, live on an open board. Also the QA switch for comparing the two.
+ */
+export function usePngWallFadeEnabled(): boolean {
+  return useFeatureFlag('png-wall-fade-kill') !== true;
+}
+
 export function useQaTesterGateEnabled(): boolean {
   return useFeatureFlag('qa-tester-gate-kill') !== true;
 }
@@ -472,8 +701,18 @@ export function useFirstBoardPickerEnabled(): boolean {
 }
 
 /**
- * Kill switch for the connect-step test (#5654, PR 7): the Climbs card, the
- * play-view pill and the first-connect confirmation, plus new enrolments.
+ * Kill switch for the board picker's In range slot scanning by itself on open.
+ * With it on the slot shows its Scan button and scans on a tap only. Unresolved
+ * reads as "not killed": the scan never prompts on open whatever this says
+ * (picker-scan-phase.ts), so the first frames can scan safely.
+ */
+export function usePickerAutoScanEnabled(): boolean {
+  return useFeatureFlag('picker-auto-scan-kill') !== true;
+}
+
+/**
+ * Kill switch for the connect-step test (#5654, PR 7): the Climbs card and the
+ * first-connect confirmation, plus new enrolments.
  * Unresolved reads as "not killed". The gate waits for
  * `useFeatureFlagsResolved()` before it enrols, and the surfaces re-render when
  * the value lands, so flipping it in PostHog takes the whole test down.
@@ -551,19 +790,113 @@ export function useSharedSessionBrowseEnabled(): boolean {
   return useFeatureFlag('shared-session-browse') === true;
 }
 
+export function useAppWorkoutsFlag(): boolean {
+  const enabled = useFeatureFlag('app-workouts');
+  return process.env.EXPO_PUBLIC_APP_WORKOUTS === 'true' || enabled === true;
+}
+
 /**
- * Gate for the spray-wall front door (epic #5346, SW-09): the picker tile and
- * every `/boards/spray/*` route behind it.
- *
- * A POSITIVE rollout flag, and `=== true` is the whole contract: PostHog
- * resolves asynchronously, so anything looser (`!== false`) would show the tile
- * for the first frames of every cold open and let a deep link walk into the flow
- * on a fleet the feature is not enabled for. Unresolved, absent and explicitly
- * off all read the same — hidden — which is the only safe reading while a
- * feature is dark.
+ * Swipe the wall button left to drive the wall (#7113): the gesture, its
+ * chevrons and peek, the "Light every climb" screen-reader action and the board
+ * sheet's row. A POSITIVE rollout flag read strictly: unresolved or off is
+ * today's button, so the first frames of a cold open never offer a swipe a
+ * flag then takes back. Dev builds read it as on unless a tester turns it off
+ * on the Feature Flags screen.
  */
-export function useSprayWallsEnabled(): boolean {
-  return useFeatureFlag('spray-walls') === true;
+export function useWallSwipeToDriveEnabled(): boolean {
+  return wallSwipeToDriveOffered(useFeatureFlag('wall-swipe-to-drive'));
+}
+
+/**
+ * The driving wall button's moving frost: the GPU-drawn lights that breathe
+ * and change climbs with the board's swap. A POSITIVE rollout flag read strictly, like
+ * `wall-swipe-to-drive`: unresolved or off is today's still frost. Dev builds
+ * read it as on unless a tester turns it off.
+ */
+export function useWallFrostMotionEnabled(): boolean {
+  return wallFrostMotionOffered(useFeatureFlag('wall-frost-motion'));
+}
+
+/**
+ * The ONE place every GPU surface asks. Remote kill switch, then the climber's
+ * GPU acceleration setting (synchronous MMKV, so first render is already right
+ * and a flip reaches mounted boards at once), then the rollout.
+ */
+export function useGpuClimbOverlayEnabled(boardName?: string, layoutId?: number): boolean {
+  const [userEnabled] = useSetting('gpuAcceleration');
+  return auraGpuRolloutEnabled({
+    flag: useFeatureFlag(AURA_GPU_FLAG),
+    policy: useContext(AuraGpuRolloutContext),
+    userEnabled,
+    boardName,
+    layoutId,
+  });
+}
+
+/**
+ * Whether the GPU acceleration switch in Settings has anything to do: this
+ * binary carries the native overlay module and the remote kill switch is not off.
+ */
+export function useGpuAccelerationSettingOffered(): boolean {
+  return climbOverlayGpuApiVersion > 0 && useFeatureFlag(AURA_GPU_FLAG) !== false;
+}
+
+/** The rule behind `useWallFrostMotionEnabled`, for tests. */
+export function wallFrostMotionOffered(flag: boolean | string | undefined): boolean {
+  return __DEV__ ? flag !== false : flag === true;
+}
+
+/** The rule behind `useWallSwipeToDriveEnabled`, for tests. */
+export function wallSwipeToDriveOffered(flag: boolean | string | undefined): boolean {
+  return __DEV__ ? flag !== false : flag === true;
+}
+
+/**
+ * F3 now-slot mode (#6666, docs/product/current-climb-outside-queue.md section 8). A
+ * POSITIVE flag read `=== true`: unresolved or off is legacy mode, with today's
+ * GraphQL documents and today's reducer, so it is a kill switch for every
+ * failure the Now slot can cause. In a session it is not enough on its own: the
+ * per-connect server probe must also say the backend serves the fields.
+ */
+export function useQueueNowSlotEnabled(): boolean {
+  return useFeatureFlag('queue-now-slot') === true;
+}
+
+/**
+ * The #4979 hold (docs/product/current-climb-outside-queue.md, section 6): after 4 h
+ * with the same climb on the wall, connecting a board does not light it. A KILL
+ * switch read `!== true`, so unresolved means the hold is on: a positive flag
+ * would read off for the first frames of a cold open, which is exactly when the
+ * auto-sender lights the restored climb.
+ */
+export function useStaleCurrentHoldEnabled(): boolean {
+  return useFeatureFlag('stale-current-hold-kill') !== true;
+}
+
+/**
+ * The "Get updates early" switch (the `pr-beta` OTA branch).
+ *
+ * Three answers on purpose. A POSITIVE flag, because the feature ships hidden
+ * and a `*-kill` switch reads unresolved as on. But "off" here does more than
+ * hide a row: it moves a member back to the regular track. That must only
+ * follow a flag bag that says off, never an empty one.
+ *
+ * What each answer actually is: `on` is exactly `true`. `off` is exactly
+ * `false`, which PostHog gives for any key missing from a NON-EMPTY bag, fresh
+ * or cached, so a flag that does not exist yet reads off. `unknown` is no value
+ * at all: PostHog has never loaded flags on this install (first launch with no
+ * network, analytics unavailable). A failed request does not produce it on an
+ * install that has loaded flags before; that re-emits the cached bag.
+ */
+export type EarlyUpdatesFlagState = 'on' | 'off' | 'unknown';
+
+export function earlyUpdatesFlagState(flagValue: boolean | string | undefined): EarlyUpdatesFlagState {
+  if (flagValue === true) return 'on';
+  return flagValue === false ? 'off' : 'unknown';
+}
+
+export function useEarlyUpdatesFlagState(): EarlyUpdatesFlagState {
+  return earlyUpdatesFlagState(useFeatureFlag('early-updates'));
 }
 
 function featureFlagsEqual(leftFlags: FeatureFlags, rightFlags: FeatureFlags): boolean {

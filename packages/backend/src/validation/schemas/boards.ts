@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { normalizeLocationAudience } from '@boardsesh/privacy';
 import { AURORA_BOARDS } from '@boardsesh/shared-schema';
 import {
   UUIDSchema,
@@ -24,11 +25,20 @@ const NullableBoardSerialInputSchema = z.preprocess((value) => {
   return trimmed === '' ? null : trimmed;
 }, BoardSerialSchema.optional().nullable());
 
+/** Cap on `CreateBoardInput.acknowledgedWallUuids`; also the most candidates `existingWallCandidates` returns. */
+export const MAX_ACKNOWLEDGED_WALL_UUIDS = 40;
+
 /**
  * Create board input validation schema
  */
 export const CreateBoardInputSchema = z
   .object({
+    audience: z.enum(['public', 'unlisted', 'followers', 'invite_only', 'only_me']).optional(),
+    // `followers` is narrowed to `members` on write: see normalizeLocationAudience.
+    locationAudience: z
+      .enum(['public', 'followers', 'members', 'only_me'])
+      .transform(normalizeLocationAudience)
+      .optional(),
     boardType: BoardNameSchema,
     layoutId: z.number().int().positive('Layout ID must be positive'),
     sizeId: z.number().int().positive('Size ID must be positive'),
@@ -46,6 +56,7 @@ export const CreateBoardInputSchema = z
     angle: z.number().int().min(-5).max(70).optional(),
     isAngleAdjustable: z.boolean().optional(),
     hasLeds: z.boolean().optional(),
+    litByWallDevice: z.boolean().optional(),
     serialNumber: OptionalBoardSerialInputSchema,
     // Min 1: a paired timer is stored by its advertised BLE name; an empty string
     // is meaningless (the "no timer" sentinel is null/absent, and the mobile
@@ -59,11 +70,41 @@ export const CreateBoardInputSchema = z
     // has confirmed this really is a separate physical wall that happens to reuse
     // a serial, they pass true to skip the BOARD_SERIAL_EXISTS guard.
     allowDuplicateSerial: z.boolean().optional(),
+    // The existing-wall recheck (#8151). Absent (or null) means no check, so a
+    // client that never sends it gets exactly the old behaviour.
+    existingWallCheck: z.enum(['REJECT_IF_FOUND', 'CONFIRMED_SEPARATE']).nullish(),
+    acknowledgedWallUuids: z
+      .array(UUIDSchema)
+      .max(MAX_ACKNOWLEDGED_WALL_UUIDS, `At most ${MAX_ACKNOWLEDGED_WALL_UUIDS} acknowledged walls`)
+      .nullish(),
   })
   .refine((input) => isBoardAngleSupported(input.boardType, input.angle), {
     message: BOARD_ANGLE_VALIDATION_MESSAGE,
     path: ['angle'],
   });
+
+/**
+ * existingWallCandidates input. The draft setup is all-or-nothing: without all
+ * three of layoutId, sizeId and setIds there is nothing to classify against.
+ */
+export const ExistingWallCandidatesInputSchema = z
+  .object({
+    boardType: BoardNameSchema.refine((boardType) => boardType !== 'spray', {
+      message: 'Spray walls have their own setup',
+    }),
+    gymUuid: UUIDSchema,
+    layoutId: z.number().int().positive('Layout ID must be positive').nullish(),
+    sizeId: z.number().int().positive('Size ID must be positive').nullish(),
+    setIds: NumericCsvSchema.nullish(),
+    limit: z.number().int().min(1).max(MAX_ACKNOWLEDGED_WALL_UUIDS).nullish(),
+  })
+  .refine(
+    (input) => {
+      const draftFields = [input.layoutId, input.sizeId, input.setIds].filter((field) => field != null);
+      return draftFields.length === 0 || draftFields.length === 3;
+    },
+    { message: 'Send layoutId, sizeId and setIds together, or none of them', path: ['layoutId'] },
+  );
 
 /**
  * Update board input validation schema
@@ -85,6 +126,7 @@ export const UpdateBoardInputSchema = z.object({
   angle: z.number().int().min(-5).max(70).optional(),
   isAngleAdjustable: z.boolean().optional(),
   hasLeds: z.boolean().optional(),
+  litByWallDevice: z.boolean().optional(),
   layoutId: z.number().int().positive('Layout ID must be positive').optional(),
   sizeId: z.number().int().positive('Size ID must be positive').optional(),
   setIds: NumericCsvSchema.optional(),
@@ -113,6 +155,7 @@ export const BoardLeaderboardInputSchema = z.object({
 export const MyBoardsInputSchema = z.object({
   limit: z.number().int().min(1).max(50).optional().default(20),
   offset: z.number().int().min(0).optional().default(0),
+  includeUnfinishedSprayWalls: z.boolean().nullish(),
 });
 
 /**
@@ -145,11 +188,20 @@ export const SearchBoardsInputSchema = z.object({
   boardTypes: z.array(BoardNameSchema).max(10).optional(),
   layoutIds: z.array(z.number().int().nonnegative()).max(50).optional(),
   sizeIds: z.array(z.number().int().nonnegative()).max(50).optional(),
+  angles: z.array(z.number().int().min(-90).max(90)).max(50).optional(),
   latitude: z.number().min(-90).max(90).optional(),
   longitude: z.number().min(-180).max(180).optional(),
   radiusKm: z.number().min(0.1).max(500).optional().default(50),
   limit: z.number().int().min(1).max(50).optional().default(20),
   offset: z.number().int().min(0).optional().default(0),
+});
+
+/** The public directory always searches spray walls; catalogue selectors are ignored. */
+export const PublicSprayWallsInputSchema = SearchBoardsInputSchema.omit({
+  boardType: true,
+  boardTypes: true,
+  layoutIds: true,
+  sizeIds: true,
 });
 
 /**
@@ -195,7 +247,7 @@ export const SerialNumberLookupSchema = z.object({
  */
 export const RecordBoardSerialInputSchema = z.object({
   serialNumber: z.string().trim().min(1).max(64).transform(normalizeSerial),
-  boardName: z.enum(AURORA_BOARDS),
+  boardName: z.enum([...AURORA_BOARDS, 'moonboard']),
   layoutId: z.number().int().nonnegative(),
   sizeId: z.number().int().nonnegative(),
   // Comma-separated positive integers only — no whitespace, no empties.

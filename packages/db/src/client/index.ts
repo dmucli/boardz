@@ -1,6 +1,13 @@
 export {
   createDb,
   createPool,
+  createDedicatedPool,
+  createDedicatedPoolFromUrl,
+  createDbOnPool,
+  resolvePoolMax,
+  applyRequestPoolDefaults,
+  applyWebDatabaseUrl,
+  REQUEST_POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   closePool,
   createReadDb,
   createReadPool,
@@ -12,7 +19,7 @@ export {
   commandCountFromResult,
   executeCommandCount,
 } from './postgres';
-export type { DbInstance, PoolInstance } from './postgres';
+export type { DbInstance, DedicatedPoolOverrides, PoolInstance } from './postgres';
 export { getConnectionConfig, isLocalDevelopment } from './config';
 export type { ConnectionConfig } from './config';
 export {

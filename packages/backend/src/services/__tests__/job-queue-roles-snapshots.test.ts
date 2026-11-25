@@ -151,7 +151,7 @@ describe('export-board-snapshots under the batch login', () => {
       ).rejects.toThrow(/Export failed for 1 layout/);
       expect(uploadedKeys().filter((key) => key !== LIVE_MANIFEST_KEY)).toEqual([]);
 
-      // The admin's provisioning step (docs/background-workers.md).
+      // The admin's provisioning step (docs/backend/background-workers.md).
       await owner.unsafe(`GRANT pg_read_all_stats TO "${login}"`);
 
       // A writer on another role holds a transaction open: the boundary must
@@ -297,11 +297,11 @@ describe('export-board-snapshots under the batch login', () => {
         await owner`DELETE FROM background_job_runs WHERE id IN ${owner([running.id, waitingScan.id, staleRetry.id])}`;
       }
 
-      // Nothing beyond the list: no account links, no catalogue writes.
-      await expect(restricted`SELECT created_by_user_id FROM board_beta_links LIMIT 1`).rejects.toThrow(
-        'permission denied',
-      );
-      await expect(restricted`SELECT tick_uuid FROM board_beta_links LIMIT 1`).rejects.toThrow('permission denied');
+      // Origin reads enforce public-only output; catalogue writes remain denied.
+      // Origin columns are needed to exclude personal beta from public artifacts.
+      await expect(
+        restricted`SELECT created_by_user_id, tick_uuid, board_id FROM board_beta_links LIMIT 1`,
+      ).resolves.toBeDefined();
       await expect(restricted`UPDATE board_layouts SET name = name WHERE false`).rejects.toThrow('permission denied');
       await expect(restricted`DELETE FROM board_climb_stats WHERE false`).rejects.toThrow('permission denied');
     } finally {

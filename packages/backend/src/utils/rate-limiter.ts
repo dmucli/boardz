@@ -36,23 +36,22 @@ const DEFAULT_MAX_REQUESTS = 60; // 60 requests per minute per connection
  * @param connectionId - The unique connection identifier
  * @param maxRequests - Maximum requests allowed in the time window
  * @param windowMs - Time window in milliseconds
+ * @returns The window's count after this request and when it resets
  * @throws Error if rate limit exceeded
  */
 export function checkRateLimit(
   connectionId: string,
   maxRequests: number = DEFAULT_MAX_REQUESTS,
   windowMs: number = DEFAULT_WINDOW_MS,
-): void {
+): RateLimitEntry {
   const now = Date.now();
   const entry = rateLimitMap.get(connectionId);
 
   // If no entry or window expired, create new entry
   if (!entry || now > entry.resetAt) {
-    rateLimitMap.set(connectionId, {
-      count: 1,
-      resetAt: now + windowMs,
-    });
-    return;
+    const created = { count: 1, resetAt: now + windowMs };
+    rateLimitMap.set(connectionId, created);
+    return created;
   }
 
   // Check if limit exceeded
@@ -63,6 +62,26 @@ export function checkRateLimit(
 
   // Increment counter
   entry.count++;
+  return entry;
+}
+
+/** The current window's count, without counting this call. Null when no window is open. */
+export function peekRateLimit(connectionId: string): RateLimitEntry | null {
+  const entry = rateLimitMap.get(connectionId);
+  return !entry || Date.now() > entry.resetAt ? null : entry;
+}
+
+/** Adds one to a window without checking it, for a limit charged only after the work succeeds. */
+export function incrementRateLimit(connectionId: string, windowMs: number): RateLimitEntry {
+  const now = Date.now();
+  const entry = rateLimitMap.get(connectionId);
+  if (!entry || now > entry.resetAt) {
+    const created = { count: 1, resetAt: now + windowMs };
+    rateLimitMap.set(connectionId, created);
+    return created;
+  }
+  entry.count++;
+  return entry;
 }
 
 /**
@@ -102,8 +121,9 @@ export function resetAllRateLimits(): void {
   rateLimitMap.clear();
 }
 
-// Periodically clean up expired entries to prevent memory leaks
-setInterval(() => {
+// Periodically clean up expired entries to prevent memory leaks. Unref'd so a
+// script that imports a resolver can still exit once its own work is done.
+const rateLimitCleanup = setInterval(() => {
   const now = Date.now();
   for (const [connectionId, entry] of rateLimitMap) {
     if (now > entry.resetAt) {
@@ -111,3 +131,4 @@ setInterval(() => {
     }
   }
 }, 60_000); // Clean up every minute
+rateLimitCleanup.unref();

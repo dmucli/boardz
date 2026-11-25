@@ -1,10 +1,12 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import type { ClimbSearchInput } from '@boardsesh/shared-schema';
 import { runMigrations } from '@boardsesh/offline-sync';
-import { ensureMutationQueueTable, stampLocalUserId } from '@boardsesh/offline-sync';
+import { clearLocalUserId, ensureMutationQueueTable, stampLocalUserId } from '@boardsesh/offline-sync';
 import type { OfflineDatabase, SqlExecutor, SqlRunResult, SqlValue } from '@boardsesh/offline-sync';
 import { createTestDatabase, type TestSqliteDb } from '@boardsesh/offline-sync/testing';
 import { canAddClimbToBoard, type BoardCompatibilityTarget } from '@boardsesh/board-config';
+import { getGradeLabel } from '../../../lib/grade-label';
+import { getClimbLocal } from '../get-climb-local';
 import {
   searchClimbsLocal,
   countClimbsLocal,
@@ -785,6 +787,46 @@ describe('searchClimbsLocal: tall/wide (Kilter Homewall size grid)', () => {
   });
 });
 
+// The server's onlyBenchmarks rule (#6232): a real number above zero. SQLite
+// turns a bound NaN into NULL, so the leak to guard here is TEXT, which SQLite
+// ranks above every number.
+describe('searchClimbsLocal: Benchmarks only', () => {
+  let db: TestSqliteDb;
+
+  beforeEach(async () => {
+    db = createTestDatabase();
+    await ensureMutationQueueTable(db);
+    await runMigrations(db);
+    const benchmarks: Array<[string, number | null]> = [
+      ['real', 22],
+      ['zero', 0],
+      ['none', null],
+      ['nan', Number.NaN],
+    ];
+    for (const [uuid, benchmarkDifficulty] of benchmarks) {
+      await insertClimb(db, { uuid });
+      await insertStat(db, { climbUuid: uuid, displayDifficulty: 20, ascensionistCount: 10, benchmarkDifficulty });
+    }
+    await insertClimb(db, { uuid: 'text' });
+    await db.runAsync(
+      `INSERT INTO board_climb_stats (board_type, climb_uuid, angle, display_difficulty, ascensionist_count, benchmark_difficulty, updated_at)
+       VALUES ('kilter', 'text', 40, 20, 10, 'NaN', '2026-01-01T00:00:00Z')`,
+    );
+  });
+
+  it('keeps only the climb with a real benchmark difficulty, and counts the same', async () => {
+    const input = makeInput({ onlyBenchmarks: true });
+    const result = await searchClimbsLocal(db, input);
+    expect(uuids(result)).toEqual(['real']);
+    expect(result.climbs[0].benchmark_difficulty).toBe('22');
+    expect(await countClimbsLocal(db, input)).toBe(1);
+  });
+
+  it('keeps every climb with the switch off', async () => {
+    expect(uuids(await searchClimbsLocal(db, makeInput())).sort()).toEqual(['nan', 'none', 'real', 'text', 'zero']);
+  });
+});
+
 describe('isOfflineSearchSupported', () => {
   it('supports the core filters', () => {
     expect(isOfflineSearchSupported(makeInput({ minGrade: 16, name: 'x', boulders: true }))).toBe(true);
@@ -796,6 +838,8 @@ describe('isOfflineSearchSupported', () => {
     // `uuid` — so the local SQL implements the same latest-graded-tick rule the
     // server does and this search may be answered on-device (#4828).
     expect(isOfflineSearchSupported(makeInput({ useMyGrades: true, minGrade: 26, maxGrade: 28 }))).toBe(true);
+    // Liked climbs read the synced user_favorites (#6002).
+    expect(isOfflineSearchSupported(makeInput({ onlyFavorited: true }))).toBe(true);
   });
 
   it('falls back for filters that need un-synced tables or the drafts path', () => {
@@ -807,83 +851,75 @@ describe('isOfflineSearchSupported', () => {
     expect(isOfflineSearchSupported(makeInput({ holdsFilter: { hold_5: { STARTING: 'include' } } }))).toBe(false);
   });
 
-  // Deleted on purpose, which is what SW-13's pin asked for. That test asserted
-  // `isOfflineSearchSupported` DECLINES a spray-wall hold-integrity search,
-  // because the device had no `missing_hold_count` to answer from. SW-15 (#5448)
-  // is what changes that: the column lands at on-device migration v7 and
-  // `buildJoinAndWhere` carries the server's own `COALESCE(...) = 0` predicate,
-  // so answering locally is now the faithful mirror rather than a shortcut.
-  //
-  // The three cases it pinned are covered in the "spray-wall hold integrity"
-  // block below against real rows — INTACT, BROKEN and the NULL rule, which is
-  // the half a support flag could never express.
-
   // Random needs no un-synced tables, so it stays offline-supported.
   it('supports the random sort offline', () => {
     expect(isOfflineSearchSupported(makeInput({ sortBy: 'random', sortSeed: '42' }))).toBe(true);
   });
 });
 
-describe('searchClimbsLocal: spray-wall hold integrity', () => {
+// A spray climb that lost a hold is listed like any other, with its count on
+// the row for the badge. Only a climb a full in-place reset retired leaves the
+// default list, as on the server (`retiredByResetCondition`). A downloaded wall
+// reads here even while online, so the two must agree.
+describe('searchClimbsLocal: spray climbs that lost a hold', () => {
   let db: TestSqliteDb;
+  const sprayInput = (overrides: Partial<ClimbSearchInput> = {}) =>
+    makeInput({ boardName: 'spray', layoutId: 7, sizeId: 5, ...overrides } as Partial<ClimbSearchInput>);
 
-  // Three states the column can be in, and the NULL is the one that matters:
-  // every climb on the eight catalogue boards carries it, as does any row pulled
-  // before migration v7. The server's `holdIntegrityCondition` COALESCEs it to 0
-  // — "presumed whole until a reset says otherwise" — and this mirror has to
-  // reach the same answer or a downloaded board disagrees with the network.
   beforeEach(async () => {
     db = createTestDatabase();
     await ensureMutationQueueTable(db);
     await runMigrations(db);
     await stampLocalUserId(db, LOCAL_OWNER);
-    await insertClimb(db, { uuid: 'intact', missingHoldCount: 0 });
-    await insertClimb(db, { uuid: 'broken', missingHoldCount: 2 });
-    await insertClimb(db, { uuid: 'unknown' });
-    for (const uuid of ['intact', 'broken', 'unknown']) {
-      await insertStat(db, { climbUuid: uuid, ascensionistCount: 3 });
+    await insertClimb(db, { uuid: 'whole', boardType: 'spray', layoutId: 7, missingHoldCount: 0 });
+    await insertClimb(db, { uuid: 'lost', name: 'Old blue', boardType: 'spray', layoutId: 7, missingHoldCount: 2 });
+    await insertClimb(db, { uuid: 'retired', name: 'Gone line', boardType: 'spray', layoutId: 7, missingHoldCount: 5 });
+    await db.runAsync("UPDATE board_climbs SET retired_by_reset = 1 WHERE uuid = 'retired'");
+    // NULL: a spray climb written before the server kept the count, or a row
+    // pulled before migration v7. Read as whole.
+    await insertClimb(db, { uuid: 'unknown', boardType: 'spray', layoutId: 7 });
+    for (const uuid of ['whole', 'lost', 'retired', 'unknown']) {
+      await insertStat(db, { climbUuid: uuid, boardType: 'spray', ascensionistCount: 3 });
     }
   });
 
-  const names = async (holdIntegrity?: 'ANY' | 'INTACT' | 'BROKEN') => {
-    const result = await searchClimbsLocal(db, makeInput({ holdIntegrity }));
+  const names = async (overrides: Partial<ClimbSearchInput> = {}) => {
+    const result = await searchClimbsLocal(db, sprayInput(overrides));
     return result.climbs.map((climb) => climb.uuid).sort();
   };
 
-  it('answers the filter locally instead of declining it', () => {
-    expect(isOfflineSearchSupported(makeInput({ holdIntegrity: 'INTACT' }))).toBe(true);
-    expect(isOfflineSearchSupported(makeInput({ holdIntegrity: 'BROKEN' }))).toBe(true);
+  it('lists a climb that lost a hold, and leaves out only a retired one', async () => {
+    expect(await names()).toEqual(['lost', 'unknown', 'whole']);
+    expect(await countClimbsLocal(db, sprayInput())).toBe(3);
   });
 
-  it('INTACT keeps a zero count AND an unknown one', async () => {
-    expect(await names('INTACT')).toEqual(['intact', 'unknown']);
+  it('finds both on a name search, as the server does', async () => {
+    expect(await names({ name: 'Old blue' })).toEqual(['lost']);
+    expect(await names({ name: 'Gone line' })).toEqual(['retired']);
   });
 
-  it('BROKEN keeps only a climb that has actually lost holds', async () => {
-    // The NULL row must NOT be here. Reversed, one un-backfilled row would badge
-    // every Kilter climb on the device as broken.
-    expect(await names('BROKEN')).toEqual(['broken']);
+  it('ignores a hold-integrity value an older caller still sends', async () => {
+    expect(await names({ holdIntegrity: 'INTACT' })).toEqual(['lost', 'unknown', 'whole']);
+    expect(await names({ holdIntegrity: 'BROKEN' })).toEqual(['lost', 'unknown', 'whole']);
   });
 
-  it('ANY and an absent filter carry no predicate at all', async () => {
-    expect(await names('ANY')).toEqual(['broken', 'intact', 'unknown']);
-    expect(await names()).toEqual(['broken', 'intact', 'unknown']);
+  it('serves the spray drafts list offline', () => {
+    expect(isOfflineSearchSupported(sprayInput({ onlyDrafts: true }))).toBe(true);
   });
 
-  it('counts agree with the list, so the header is not a different search', async () => {
-    expect(await countClimbsLocal(db, makeInput({ holdIntegrity: 'INTACT' }))).toBe(2);
-    expect(await countClimbsLocal(db, makeInput({ holdIntegrity: 'BROKEN' }))).toBe(1);
-  });
-
-  it('surfaces the count on the row, leaving an unknown one null', async () => {
-    const result = await searchClimbsLocal(db, makeInput());
+  it('carries the count on the rows it lists, for the badge', async () => {
+    const result = await searchClimbsLocal(db, sprayInput());
     const byUuid = new Map(result.climbs.map((climb) => [climb.uuid, climb.missingHoldCount]));
-    expect(byUuid.get('broken')).toBe(2);
-    expect(byUuid.get('intact')).toBe(0);
-    // Not 0: "no reset has touched this" and "this is not a spray climb" are
-    // different statements, and the server's Climb.missingHoldCount is nullable
-    // for exactly the same rows.
+    expect(byUuid.get('lost')).toBe(2);
+    expect(byUuid.get('whole')).toBe(0);
     expect(byUuid.get('unknown')).toBeNull();
+  });
+
+  it('leaves a catalogue board alone', async () => {
+    await insertClimb(db, { uuid: 'kilter-climb', missingHoldCount: 3 });
+    await insertStat(db, { climbUuid: 'kilter-climb', ascensionistCount: 3 });
+    const result = await searchClimbsLocal(db, makeInput());
+    expect(result.climbs.map((climb) => climb.uuid)).toEqual(['kilter-climb']);
   });
 });
 
@@ -1613,5 +1649,387 @@ describe('browsed-angle restriction (default on Woods)', () => {
       expect(climbs.map((climb) => climb.uuid)).toContain('kilter-set-50');
       expect(await countClimbsLocal(db, input)).toBe(1);
     }
+  });
+});
+
+// #6023: a tick counts toward "sent / tried / rated" only when it was logged on
+// the holds the climb has now. The server states the rule in
+// packages/db/src/queries/climb-stats/holds-epoch.ts; this is the on-device
+// copy, where BOTH columns can be NULL (rows pulled before migration v11).
+describe('searchClimbsLocal: ticks on the climb’s current holds (#6023)', () => {
+  let db: TestSqliteDb;
+
+  async function setClimbRevisions(uuid: string, revisionNumber: number | null, holdsRevisionNumber: number | null) {
+    await db.runAsync('UPDATE board_climbs SET revision_number = ?, holds_revision_number = ? WHERE uuid = ?', [
+      revisionNumber,
+      holdsRevisionNumber,
+      uuid,
+    ]);
+  }
+
+  async function setTickRevision(uuid: string, climbRevision: number | null) {
+    await db.runAsync('UPDATE boardsesh_ticks SET climb_revision = ? WHERE uuid = ?', [climbRevision, uuid]);
+  }
+
+  const find = (result: Awaited<ReturnType<typeof searchClimbsLocal>>, uuid: string) =>
+    result.climbs.find((climb) => climb.uuid === uuid);
+
+  beforeEach(async () => {
+    db = createTestDatabase();
+    await ensureMutationQueueTable(db);
+    await runMigrations(db);
+    await stampLocalUserId(db, LOCAL_OWNER);
+  });
+
+  it('reads a send on old holds as not sent, and a send on the current holds as sent', async () => {
+    // Holds last moved at version 3. One climb was sent before that, one after.
+    await insertClimb(db, { uuid: 'sent-before-move' });
+    await insertClimb(db, { uuid: 'sent-after-move' });
+    await setClimbRevisions('sent-before-move', 4, 3);
+    await setClimbRevisions('sent-after-move', 4, 3);
+    await insertTick(db, { uuid: 't-old', climbUuid: 'sent-before-move', status: 'send' });
+    await insertTick(db, { uuid: 't-new', climbUuid: 'sent-after-move', status: 'send' });
+    await setTickRevision('t-old', 2);
+    await setTickRevision('t-new', 3);
+
+    const all = await searchClimbsLocal(db, makeInput());
+    expect(find(all, 'sent-before-move')?.userAscents).toBe(0);
+    expect(find(all, 'sent-after-move')?.userAscents).toBe(1);
+
+    expect(uuids(await searchClimbsLocal(db, makeInput({ showOnlyCompleted: true })))).toEqual(['sent-after-move']);
+    expect(uuids(await searchClimbsLocal(db, makeInput({ hideCompleted: true })))).toEqual(['sent-before-move']);
+    expect(await countClimbsLocal(db, makeInput({ showOnlyCompleted: true }))).toBe(1);
+    expect(await countClimbsLocal(db, makeInput({ hideCompleted: true }))).toBe(1);
+  });
+
+  it('applies the same rule to attempts', async () => {
+    await insertClimb(db, { uuid: 'tried-before-move' });
+    await insertClimb(db, { uuid: 'tried-after-move' });
+    await setClimbRevisions('tried-before-move', 2, 2);
+    await setClimbRevisions('tried-after-move', 2, 2);
+    await insertTick(db, { uuid: 'a-old', climbUuid: 'tried-before-move', status: 'attempt' });
+    await insertTick(db, { uuid: 'a-new', climbUuid: 'tried-after-move', status: 'attempt' });
+    await setTickRevision('a-old', 1);
+    await setTickRevision('a-new', 2);
+
+    const all = await searchClimbsLocal(db, makeInput());
+    expect(find(all, 'tried-before-move')?.userAttempts).toBe(0);
+    expect(find(all, 'tried-after-move')?.userAttempts).toBe(1);
+    expect(uuids(await searchClimbsLocal(db, makeInput({ showOnlyAttempted: true })))).toEqual(['tried-after-move']);
+    expect(uuids(await searchClimbsLocal(db, makeInput({ hideAttempted: true })))).toEqual(['tried-before-move']);
+  });
+
+  it('reads a tick with no version as version 1', async () => {
+    // NULL is an import or a tick older than the column. It counts on a climb
+    // whose holds never moved and does not on one whose holds moved at 2.
+    await insertClimb(db, { uuid: 'never-edited' });
+    await insertClimb(db, { uuid: 'holds-moved' });
+    await setClimbRevisions('never-edited', 1, 1);
+    await setClimbRevisions('holds-moved', 2, 2);
+    await insertTick(db, { uuid: 'n-1', climbUuid: 'never-edited', status: 'send' });
+    await insertTick(db, { uuid: 'n-2', climbUuid: 'holds-moved', status: 'send' });
+
+    expect(uuids(await searchClimbsLocal(db, makeInput({ showOnlyCompleted: true })))).toEqual(['never-edited']);
+  });
+
+  it('reads a climb with no holds version as version 1, so every tick on it counts', async () => {
+    // A board_climbs row pulled before migration v11: both columns NULL. A bare
+    // `>=` against NULL would drop every tick on the climb.
+    await insertClimb(db, { uuid: 'pre-v11' });
+    await insertTick(db, { uuid: 'p-null', climbUuid: 'pre-v11', status: 'send' });
+    await insertTick(db, { uuid: 'p-stamped', climbUuid: 'pre-v11', status: 'attempt' });
+    await setTickRevision('p-stamped', 5);
+
+    const result = await searchClimbsLocal(db, makeInput());
+    expect(find(result, 'pre-v11')?.userAscents).toBe(1);
+    expect(find(result, 'pre-v11')?.userAttempts).toBe(1);
+    expect(find(result, 'pre-v11')?.holdsRevisionNumber).toBeNull();
+    expect(uuids(await searchClimbsLocal(db, makeInput({ showOnlyCompleted: true })))).toEqual(['pre-v11']);
+  });
+
+  it('leaves a rename alone: the version moves, the holds version does not', async () => {
+    await insertClimb(db, { uuid: 'renamed' });
+    await setClimbRevisions('renamed', 6, 1);
+    await insertTick(db, { uuid: 'r-1', climbUuid: 'renamed', status: 'send' });
+    await setTickRevision('r-1', 1);
+
+    expect(uuids(await searchClimbsLocal(db, makeInput({ showOnlyCompleted: true })))).toEqual(['renamed']);
+  });
+
+  it('ignores a rating given before the holds moved', async () => {
+    await insertClimb(db, { uuid: 'rated-on-old-holds' });
+    await insertClimb(db, { uuid: 'rated-on-current-holds' });
+    await setClimbRevisions('rated-on-old-holds', 3, 3);
+    await setClimbRevisions('rated-on-current-holds', 3, 3);
+    await insertTick(db, { uuid: 'q-old', climbUuid: 'rated-on-old-holds', status: 'send', quality: 1 });
+    await insertTick(db, { uuid: 'q-new', climbUuid: 'rated-on-current-holds', status: 'send', quality: 1 });
+    await setTickRevision('q-old', 2);
+    await setTickRevision('q-new', 3);
+
+    expect(uuids(await searchClimbsLocal(db, makeInput({ onlyRatedByMe: true })))).toEqual(['rated-on-current-holds']);
+    // A 1-star rating of the old holds no longer hides the climb from "4 stars
+    // and up": that climb is unrated now. The current-holds rating still does.
+    expect(uuids(await searchClimbsLocal(db, makeInput({ minUserRating: 4 })))).toEqual(['rated-on-old-holds']);
+  });
+
+  it('picks the latest rating among ticks on the current holds only', async () => {
+    // The newest rating overall is a 1 from before the holds moved. On the
+    // current holds the only rating is a 5, so the climb passes "4 and up".
+    await insertClimb(db, { uuid: 'rerated' });
+    await setClimbRevisions('rerated', 3, 2);
+    await insertTick(db, {
+      uuid: 'low-newer-old-holds',
+      climbUuid: 'rerated',
+      status: 'send',
+      quality: 1,
+      climbedAt: '2026-03-01T00:00:00Z',
+    });
+    await insertTick(db, {
+      uuid: 'high-older-current-holds',
+      climbUuid: 'rerated',
+      status: 'send',
+      quality: 5,
+      climbedAt: '2026-02-01T00:00:00Z',
+    });
+    await setTickRevision('low-newer-old-holds', 1);
+    await setTickRevision('high-older-current-holds', 2);
+
+    expect(uuids(await searchClimbsLocal(db, makeInput({ minUserRating: 4 })))).toEqual(['rerated']);
+  });
+
+  it('does not filter the personal grade: a grade given to an older version still counts', async () => {
+    await insertClimb(db, { uuid: 'graded-on-old-holds' });
+    await setClimbRevisions('graded-on-old-holds', 2, 2);
+    await insertTick(db, { uuid: 'g-old', climbUuid: 'graded-on-old-holds', status: 'send', difficulty: 20 });
+    await setTickRevision('g-old', 1);
+
+    const result = await searchClimbsLocal(db, makeInput({ useMyGrades: true }));
+    expect(find(result, 'graded-on-old-holds')?.myDifficulty).toBe(20);
+    // The send itself no longer counts.
+    expect(find(result, 'graded-on-old-holds')?.userAscents).toBe(0);
+  });
+
+  it('puts the climb’s holds version on the row', async () => {
+    await insertClimb(db, { uuid: 'versioned' });
+    await setClimbRevisions('versioned', 5, 3);
+
+    const result = await searchClimbsLocal(db, makeInput());
+    expect(find(result, 'versioned')?.holdsRevisionNumber).toBe(3);
+  });
+});
+
+// Climbs → Collection → Liked (#6002), mirroring `onlyFavorited` in
+// packages/db/src/queries/climbs/create-climb-filters.ts.
+describe('searchClimbsLocal: liked climbs', () => {
+  let db: TestSqliteDb;
+
+  beforeEach(async () => {
+    db = createTestDatabase();
+    await ensureMutationQueueTable(db);
+    await runMigrations(db);
+    await stampLocalUserId(db, LOCAL_OWNER);
+  });
+
+  async function insertFavorite(opts: {
+    climbUuid: string;
+    boardName?: string;
+    angle?: number;
+    userId?: string | null;
+  }): Promise<void> {
+    await db.runAsync(
+      'INSERT INTO user_favorites (board_name, climb_uuid, angle, user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [
+        opts.boardName ?? 'kilter',
+        opts.climbUuid,
+        opts.angle ?? 40,
+        opts.userId === undefined ? LOCAL_OWNER : opts.userId,
+        '2026-10-01T00:00:00Z',
+        '2026-10-01T00:00:00Z',
+      ],
+    );
+  }
+
+  const liked = makeInput({ onlyFavorited: true });
+
+  it('lists only the hearted climbs on a downloaded board, not the whole catalogue', async () => {
+    await insertClimb(db, { uuid: 'hearted' });
+    await insertClimb(db, { uuid: 'not-hearted' });
+    await insertClimb(db, { uuid: 'also-not-hearted' });
+    await insertFavorite({ climbUuid: 'hearted' });
+
+    expect(uuids(await searchClimbsLocal(db, liked))).toEqual(['hearted']);
+    expect(await countClimbsLocal(db, liked)).toBe(1);
+    // Without the flag the same board answers every climb.
+    expect(await countClimbsLocal(db, makeInput())).toBe(3);
+  });
+
+  it('ignores the angle the heart was given at, as the server does', async () => {
+    await insertClimb(db, { uuid: 'hearted-at-25' });
+    await insertFavorite({ climbUuid: 'hearted-at-25', angle: 25 });
+
+    expect(uuids(await searchClimbsLocal(db, liked))).toEqual(['hearted-at-25']);
+  });
+
+  it('does not match a heart on another board with the same climb uuid', async () => {
+    await insertClimb(db, { uuid: 'shared-uuid' });
+    await insertFavorite({ climbUuid: 'shared-uuid', boardName: 'tension' });
+
+    expect(uuids(await searchClimbsLocal(db, liked))).toEqual([]);
+  });
+
+  it("keeps this device's own unsynced hearts and drops another account's leftovers", async () => {
+    await insertClimb(db, { uuid: 'mine' });
+    await insertClimb(db, { uuid: 'queued' });
+    await insertClimb(db, { uuid: 'theirs' });
+    await insertFavorite({ climbUuid: 'mine' });
+    await insertFavorite({ climbUuid: 'queued', userId: null });
+    await insertFavorite({ climbUuid: 'theirs', userId: 'someone-else' });
+
+    expect(
+      uuids(await searchClimbsLocal(db, makeInput({ onlyFavorited: true, sortBy: 'name', sortOrder: 'asc' }))),
+    ).toEqual(['mine', 'queued']);
+  });
+
+  it('drops hearted climbs that are hidden, unlisted or drafts, like the server search', async () => {
+    await insertClimb(db, { uuid: 'visible' });
+    await insertClimb(db, { uuid: 'hidden', isHidden: 1 });
+    await insertClimb(db, { uuid: 'unlisted', isListed: 0 });
+    await insertClimb(db, { uuid: 'draft', isDraft: 1 });
+    for (const climbUuid of ['visible', 'hidden', 'unlisted', 'draft']) await insertFavorite({ climbUuid });
+
+    expect(uuids(await searchClimbsLocal(db, liked))).toEqual(['visible']);
+  });
+
+  it('matches nothing with no signed-in owner', async () => {
+    await insertClimb(db, { uuid: 'hearted' });
+    await insertFavorite({ climbUuid: 'hearted', userId: null });
+    await clearLocalUserId(db);
+
+    expect(uuids(await searchClimbsLocal(db, liked))).toEqual([]);
+    expect(await countClimbsLocal(db, liked)).toBe(0);
+  });
+});
+
+describe('spray first-ascent grades before pagination', () => {
+  let db: TestSqliteDb;
+  const search = (overrides: Partial<ClimbSearchInput> = {}) =>
+    makeInput({
+      boardName: 'spray',
+      layoutId: 7,
+      sizeId: 5,
+      sortBy: 'difficulty',
+      ...overrides,
+    });
+  const addClimb = (uuid: string) => insertClimb(db, { uuid, boardType: 'spray', layoutId: 7, angle: 40 });
+  const addSend = (climbUuid: string, difficulty: number) =>
+    insertTick(db, {
+      uuid: `${climbUuid}-tick`,
+      climbUuid,
+      boardType: 'spray',
+      status: 'send',
+      difficulty,
+    });
+
+  beforeEach(async () => {
+    db = createTestDatabase();
+    await ensureMutationQueueTable(db);
+    await runMigrations(db);
+    await stampLocalUserId(db, LOCAL_OWNER);
+  });
+
+  it('filters, counts, sorts and paginates new climbs by their first local ascent', async () => {
+    for (const [uuid, grade] of [
+      ['low', 16],
+      ['middle', 20],
+      ['high', 24],
+    ] as const) {
+      await addClimb(uuid);
+      await addSend(uuid, grade);
+    }
+    await insertTick(db, {
+      uuid: 'later',
+      climbUuid: 'middle',
+      boardType: 'spray',
+      status: 'flash',
+      difficulty: 30,
+      climbedAt: '2026-03-01T00:00:00Z',
+    });
+    const input = search({ minGrade: 16, maxGrade: 24, pageSize: 1 });
+    expect(await countClimbsLocal(db, input)).toBe(3);
+    for (const [page, uuid, grade] of [
+      [0, 'high', 24],
+      [1, 'middle', 20],
+      [2, 'low', 16],
+    ] as const) {
+      const result = await searchClimbsLocal(db, { ...input, page });
+      expect(uuids(result)).toEqual([uuid]);
+      expect(result.hasMore).toBe(page < 2);
+      expect(result.climbs[0].difficulty).toBe(getGradeLabel(grade, 'spray'));
+    }
+    expect(uuids(await searchClimbsLocal(db, search({ sortOrder: 'asc' })))).toEqual(['low', 'middle', 'high']);
+    expect(await countClimbsLocal(db, search({ minGrade: 30 }))).toBe(0);
+  });
+
+  it('preserves canonical stats and Boardsesh grade precedence in search, count and detail', async () => {
+    await addClimb('stats');
+    await addSend('stats', 30);
+    await insertStat(db, { climbUuid: 'stats', boardType: 'spray', displayDifficulty: 16 });
+    await insertGrade(db, { climbUuid: 'stats', boardType: 'spray', universalGrade: 24 });
+    await addClimb('estimate');
+    await addSend('estimate', 30);
+    await insertGrade(db, { climbUuid: 'estimate', boardType: 'spray', localGrade: 18, universalGrade: 22 });
+    expect(uuids(await searchClimbsLocal(db, search({ minGrade: 16, maxGrade: 16 })))).toEqual(['stats']);
+    expect(uuids(await searchClimbsLocal(db, search({ minGrade: 22, maxGrade: 22 })))).toEqual(['estimate']);
+    expect(await countClimbsLocal(db, search({ minGrade: 30 }))).toBe(0);
+    expect(await countClimbsLocal(db, search({ gradeSource: 'BOARDSESH', minGrade: 24, maxGrade: 24 }))).toBe(1);
+    expect(uuids(await searchClimbsLocal(db, search()))).toEqual(['estimate', 'stats']);
+    expect(uuids(await searchClimbsLocal(db, search({ gradeSource: 'BOARDSESH' })))).toEqual(['stats', 'estimate']);
+    const detail = await getClimbLocal(db, {
+      boardName: 'spray',
+      layoutId: 7,
+      angle: 40,
+      climbUuid: 'estimate',
+      viewerId: LOCAL_OWNER,
+    });
+    expect(detail?.boardseshDifficulty).toBe(22);
+    expect(detail?.difficulty).not.toBe(getGradeLabel(30, 'spray'));
+  });
+
+  it('ignores attempts, other accounts, anonymous ticks, other angles and other boards', async () => {
+    await addClimb('ungraded');
+    for (const tick of [
+      { uuid: 'attempt', status: 'attempt' },
+      { uuid: 'other-user', status: 'send', userId: 'someone-else' },
+      { uuid: 'anonymous', status: 'send', userId: null },
+      { uuid: 'other-angle', status: 'send', angle: 35 },
+      { uuid: 'other-board', status: 'send', boardType: 'kilter' },
+    ])
+      await insertTick(db, { climbUuid: 'ungraded', boardType: 'spray', difficulty: 20, ...tick });
+    expect(await countClimbsLocal(db, search({ minGrade: 20, maxGrade: 20 }))).toBe(0);
+    expect(uuids(await searchClimbsLocal(db, search({ minGrade: 20, maxGrade: 20 })))).toEqual([]);
+    await insertTick(db, {
+      uuid: 'first-flash',
+      climbUuid: 'ungraded',
+      boardType: 'spray',
+      status: 'flash',
+      difficulty: 20,
+    });
+    expect(await countClimbsLocal(db, search({ minGrade: 20, maxGrade: 20 }))).toBe(1);
+    await clearLocalUserId(db);
+    expect(await countClimbsLocal(db, search({ minGrade: 20, maxGrade: 20 }))).toBe(0);
+  });
+
+  it('uses the same fallback on the indexed ascent-ranking path', async () => {
+    for (const uuid of ['popular-a', 'popular-b', 'popular-c']) {
+      await addClimb(uuid);
+      await addSend(uuid, 20);
+      await insertStat(db, { climbUuid: uuid, boardType: 'spray', ascensionistCount: 10 });
+    }
+    const input = search({ sortBy: 'ascents', minGrade: 20, maxGrade: 20, pageSize: 1 });
+    expect(await countClimbsLocal(db, input)).toBe(3);
+    const result = await searchClimbsLocal(db, input);
+    expect(uuids(result)).toEqual(['popular-c']);
+    expect(result.hasMore).toBe(true);
+    expect(result.climbs[0].difficulty).toBe(getGradeLabel(20, 'spray'));
   });
 });

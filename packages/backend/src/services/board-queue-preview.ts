@@ -1,5 +1,8 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { canReadClimbContent } from './board-session-privacy';
+import { canAccessResourceWithoutLink } from './privacy';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import type { BoardQueuePreview, BoardQueuePreviewItem, ClimbQueueItem, QueueState } from '@boardsesh/shared-schema';
+import { upNextStart } from '@boardsesh/queue';
 import { db } from '../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { pubsub, type QueueEventHook } from '../pubsub';
@@ -9,6 +12,8 @@ import {
   buildEmptyBoardQueuePreview,
   isPublicActiveSession,
   readBoardSessionPreviewGate,
+  readAttestedMergedPreviewSources,
+  resolveMergedSessionPreviewBoardId,
 } from './board-queue-preview-tombstone';
 import { logger } from '../utils/logger';
 
@@ -32,8 +37,11 @@ export {
  * for every surface — the query resolver, the subscription seed, and the live
  * producer all route through it:
  *
- * 1. The board must be anonymously readable (public, or a system-owned shared
- *    per-config board) — `isBoardAnonReadable`.
+ * 1. The board must be readable by a signed-out holder of its link (Public or
+ *    Unlisted, or a system-owned shared per-config board) —
+ *    `isBoardAnonReadable`. Who may SUBSCRIBE is the resolver gate's call: the
+ *    board id alone takes the no-link reading, so an Unlisted board's preview
+ *    reaches only a caller who also presents its uuid.
  * 2. The bound session must be `board_sessions.is_public = true` AND still
  *    `status = 'active'`. This deliberately widens `is_public`'s meaning from
  *    "appears in discovery" to "queue observable on public displays"
@@ -75,15 +83,16 @@ export function toBoardQueuePreviewItem(item: ClimbQueueItem): BoardQueuePreview
 /**
  * Build the redacted preview snapshot from a session's queue state. Pure —
  * gates must already have been applied by the caller. `upNext` is the items
- * strictly after the current one (or the head of the queue when no current
- * item is present in it), capped at BOARD_QUEUE_PREVIEW_UP_NEXT_CAP;
- * `queueLength` is the uncapped total.
+ * strictly after the current one, or from the History / Up next line on when
+ * no current item is present in it (F3: `upNextStart` from `@boardsesh/queue`,
+ * so History stays out of the kiosk's Up next after the current climb is
+ * removed), capped at BOARD_QUEUE_PREVIEW_UP_NEXT_CAP; `queueLength` is the
+ * uncapped total.
  */
 export function buildBoardQueuePreview(boardId: number, queueState: QueueState): BoardQueuePreview {
-  const { queue, currentClimbQueueItem } = queueState;
-  const currentIndex = currentClimbQueueItem ? queue.findIndex((item) => item.uuid === currentClimbQueueItem.uuid) : -1;
-  const upNextStart = currentIndex === -1 ? 0 : currentIndex + 1;
-  const upNext = queue.slice(upNextStart, upNextStart + BOARD_QUEUE_PREVIEW_UP_NEXT_CAP).map(toBoardQueuePreviewItem);
+  const { queue, currentClimbQueueItem, historyCount } = queueState;
+  const firstUpNext = upNextStart(queue, currentClimbQueueItem, historyCount);
+  const upNext = queue.slice(firstUpNext, firstUpNext + BOARD_QUEUE_PREVIEW_UP_NEXT_CAP).map(toBoardQueuePreviewItem);
   return {
     boardId,
     current: currentClimbQueueItem ? toBoardQueuePreviewItem(currentClimbQueueItem) : null,
@@ -113,8 +122,8 @@ export function buildBoardQueuePreview(boardId: number, queueState: QueueState):
  *
  * `options.anonReadableVerified` skips the gate-1 board query when the
  * caller has ALREADY verified `isBoardAnonReadable(boardId) === true` for
- * this request (the anonymous resolver path, whose `requireAnonReadableBoard`
- * ran the identical query) — never pass it on any other basis.
+ * this request (the anonymous resolver path, where passing
+ * `requireReadablePresenceBoard` implies it) — never pass it on any other basis.
  */
 export async function resolvePublicPreviewSessionForBoard(
   boardId: number,
@@ -131,6 +140,31 @@ export async function resolvePublicPreviewSessionForBoard(
     // Ended/deleted bound session → stale binding; fall through (see above).
   }
 
+  // A public-only admin merge can leave a config-path session bound solely
+  // to the former board in Redis. Read those attested bindings without moving
+  // them; the canonical live binding above always keeps precedence.
+  const inheritedIds: string[] = [];
+  for (const source of await readAttestedMergedPreviewSources(boardId)) {
+    const sessionId = await pubsub.getBoardSession(String(source.id));
+    if (sessionId && (await pubsub.getSessionBoard(sessionId)) === String(source.id)) inheritedIds.push(sessionId);
+  }
+  if (inheritedIds.length) {
+    const sessions = await db
+      .select({ id: dbSchema.boardSessions.id, boardId: dbSchema.boardSessions.boardId })
+      .from(dbSchema.boardSessions)
+      .where(and(inArray(dbSchema.boardSessions.id, inheritedIds), eq(dbSchema.boardSessions.status, 'active')))
+      .orderBy(desc(dbSchema.boardSessions.lastActivity), desc(dbSchema.boardSessions.id));
+    let publicSessionId: string | null = null;
+    for (const session of sessions) {
+      if (session.boardId !== null && session.boardId !== boardId) continue;
+      const gate = await readBoardSessionPreviewGate(session.id);
+      if (!gate || gate.status !== 'active') continue;
+      if (!gate.isPublic) return null;
+      publicSessionId ??= session.id;
+    }
+    if (publicSessionId) return publicSessionId;
+  }
+
   // Durable fallback: newest active public session linked to this board.
   const [row] = await db
     .select({ id: dbSchema.boardSessions.id })
@@ -144,7 +178,7 @@ export async function resolvePublicPreviewSessionForBoard(
     )
     .orderBy(desc(dbSchema.boardSessions.lastActivity))
     .limit(1);
-  return row?.id ?? null;
+  return row?.id && (await canAccessResourceWithoutLink('session', row.id, null)) ? row.id : null;
 }
 
 /**
@@ -152,15 +186,36 @@ export async function resolvePublicPreviewSessionForBoard(
  * previewable session is bound. Shared by the `boardQueuePreview` query and
  * the subscription's seed yield. `options` is forwarded to
  * `resolvePublicPreviewSessionForBoard` (see its gate-1 skip contract).
+ * A resolver may supply its already-verified matching boardUuid so public
+ * climb details on that Unlisted spray layout remain visible to its holder.
+ * Producers omit it; their copied payload only wakes authorized subscribers.
  */
 export async function getBoardQueuePreviewSnapshot(
   boardId: number,
-  options: { anonReadableVerified?: boolean } = {},
+  options: { anonReadableVerified?: boolean; boardUuid?: string | null } = {},
 ): Promise<BoardQueuePreview | null> {
   const sessionId = await resolvePublicPreviewSessionForBoard(boardId, options);
   if (!sessionId) return null;
   const queueState = await roomManager.getQueueState(sessionId);
-  return buildBoardQueuePreview(boardId, queueState);
+  const preview = buildBoardQueuePreview(boardId, queueState);
+  const redact = async (item: BoardQueuePreviewItem): Promise<BoardQueuePreviewItem> =>
+    (await canReadClimbContent(item.climbUuid, null, options.boardUuid))
+      ? item
+      : {
+          queueItemUuid: item.queueItemUuid,
+          climbUuid: item.climbUuid,
+          name: null,
+          frames: null,
+          setter: null,
+          grade: null,
+          gradeColor: null,
+          angle: null,
+        };
+  return {
+    ...preview,
+    current: preview.current ? await redact(preview.current) : null,
+    upNext: await Promise.all(preview.upNext.map(redact)),
+  };
 }
 
 /**
@@ -217,11 +272,20 @@ export async function publishBoardQueuePreviewForSession(sessionId: string): Pro
   const boundSessionId = await pubsub.getBoardSession(boardId);
   if (boundSessionId !== sessionId) return;
 
-  if (!(await isBoardAnonReadable(Number(boardId)))) return;
+  if (!(await isBoardAnonReadable(Number(boardId)))) {
+    const canonicalBoardId = await resolveMergedSessionPreviewBoardId(sessionId, Number(boardId));
+    if (canonicalBoardId === null || !(await isPublicActiveSession(sessionId))) return;
+    // A merge cannot take the wall from an existing public or private incumbent.
+    if ((await resolvePublicPreviewSessionForBoard(canonicalBoardId)) !== sessionId) return;
+    await republishBoardQueuePreviewForBoard(canonicalBoardId);
+    return;
+  }
   if (!(await isPublicActiveSession(sessionId))) return;
 
-  const queueState = await roomManager.getQueueState(sessionId);
-  pubsub.publishBoardQueuePreview(boardId, buildBoardQueuePreview(Number(boardId), queueState));
+  // Queue copies can outlive an item's audience. Use the same current climb
+  // authorization as the initial query instead of publishing copied metadata.
+  const snapshot = await getBoardQueuePreviewSnapshot(Number(boardId));
+  if (snapshot) pubsub.publishBoardQueuePreview(boardId, snapshot);
 }
 
 /**

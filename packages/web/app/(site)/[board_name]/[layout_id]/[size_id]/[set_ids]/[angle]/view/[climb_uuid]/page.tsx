@@ -1,0 +1,329 @@
+import { climbBoardForSearch, climbGradeForSearch } from '@/app/lib/seo/climb-display';
+import { buildClimbSearchDescription } from '@/app/lib/seo/search-description';
+import { boardTypeLabel } from '@boardsesh/board-constants';
+import React from 'react';
+import { notFound, permanentRedirect, redirect } from 'next/navigation';
+import type { BoardRouteParametersWithUuid, Climb, ParsedBoardRouteParametersWithUuid } from '@/app/lib/types';
+import { getClimb, getClimbStatsForAllAngles } from '@/app/lib/data/queries';
+import { getFrontDoorBetaLinks, getFrontDoorSimilarClimbs } from '@/app/lib/data/front-door-data.server';
+import { resolveRenderBoard, type RenderBoardConfig } from '@boardsesh/board-config';
+import { getBoardImageDetailsForBoard } from '@/app/lib/board-image-details';
+import {
+  buildCanonicalClimbViewUrl,
+  isUuidOnly,
+  constructClimbViewUrlWithSlugs,
+  tryConstructSlugViewUrl,
+} from '@/app/lib/url-utils';
+import { parseRouteParams } from '@/app/lib/url-utils.server';
+
+import type { Metadata } from 'next';
+import ClimbFrontDoor from '@/app/components/climb-front-door/climb-front-door';
+import { buildOgBoardRenderUrl, buildOverlayPreloadUrls } from '@/app/components/board-renderer/util';
+import { scheduleOgImageWarming } from '@/app/lib/warm-overlay-cache';
+import { getServerTranslation } from '@/app/lib/i18n/server';
+import { DEFAULT_LOCALE } from '@/app/lib/i18n/config';
+import { getLocale } from '@/app/lib/i18n/get-locale';
+import { localeHref } from '@/app/lib/i18n/locale-href';
+import { createBoardContentPageMetadata } from '@/app/lib/seo/metadata';
+import { resolveClimbDisplayName } from '@/app/lib/string-utils';
+import { selectCanonicalClimbAngle } from '@/app/lib/seo/canonical-climb-angle';
+import { buildOgClimbCardIdentity } from '@/app/lib/seo/og-climb-identity';
+
+/**
+ * Woods' two sizes number holds from different origins, and the 8x10 ids are a
+ * numeric subset of the 12x12 ids, so a climb drawn on a size it does not fit
+ * renders the wrong holds without failing. Returns the board it should be drawn
+ * on instead, `'none'` when no Woods size fits it, and `null` when the URL's
+ * size is fine (or the board is not Woods).
+ */
+function woodsSizeRedirectTarget(
+  parsedParams: ParsedBoardRouteParametersWithUuid,
+  climb: Climb,
+): RenderBoardConfig | 'none' | null {
+  const { compatibleSizeIds } = climb;
+  if (
+    parsedParams.board_name !== 'woods' ||
+    !compatibleSizeIds ||
+    compatibleSizeIds.length === 0 ||
+    compatibleSizeIds.includes(parsedParams.size_id)
+  ) {
+    return null;
+  }
+  const target = resolveRenderBoard({ boardType: 'woods', climbLayoutId: climb.layoutId, compatibleSizeIds });
+  if (!target || !compatibleSizeIds.includes(target.sizeId)) return 'none';
+  return target;
+}
+
+export async function generateMetadata(props: { params: Promise<BoardRouteParametersWithUuid> }): Promise<Metadata> {
+  const params = await props.params;
+  const { t, locale } = await getServerTranslation('climbs');
+
+  try {
+    const { parsedParams } = await parseRouteParams(params);
+    // Sequential on purpose: the angle table is keyed on the uuid the climb
+    // resolved to, not the URL's (an alias URL names a husk). It costs no page
+    // latency, because the body renders concurrently and already waits on the
+    // same two React-cached reads in this order.
+    const currentClimb = await getClimb(parsedParams);
+    if (!currentClimb) {
+      return createBoardContentPageMetadata({
+        title: t('metadata.view.fallbackTitle'),
+        description: t('metadata.view.fallbackDescription'),
+        locale,
+        robots: { index: false, follow: true },
+      });
+    }
+    const angleStats = await getClimbStatsForAllAngles(parsedParams.board_name, currentClimb.uuid);
+    // The body redirects a Woods climb off a size it does not fit; describe the
+    // board it lands on, so the card never draws its holds on the wrong size.
+    const woodsTarget = woodsSizeRedirectTarget(parsedParams, currentClimb);
+    const boardDetails = getBoardImageDetailsForBoard(
+      woodsTarget && woodsTarget !== 'none'
+        ? {
+            ...parsedParams,
+            layout_id: woodsTarget.layoutId,
+            size_id: woodsTarget.sizeId,
+            set_ids: woodsTarget.setIds,
+          }
+        : parsedParams,
+    );
+
+    const climbName = resolveClimbDisplayName(currentClimb.name, boardDetails.board_name);
+    const climbGrade = climbGradeForSearch(currentClimb.difficulty || '');
+    // ONE builder, shared with `/b/{slug}/{angle}/view` — that is what makes
+    // the two trees' canonicals provably identical (A1).
+    const canonicalAngle = selectCanonicalClimbAngle({
+      boardName: parsedParams.board_name,
+      catalogAngle: currentClimb.catalogAngle,
+      angleStats,
+    });
+    // Keep a hidden climb's noindex metadata on its own board configuration.
+    const isHiddenClimb = currentClimb.is_hidden === true;
+    const climbUrl = buildCanonicalClimbViewUrl(
+      boardDetails,
+      canonicalAngle,
+      currentClimb.uuid,
+      climbName,
+      isHiddenClimb ? undefined : currentClimb,
+    );
+
+    // The same name, grade and setter the title and description already use, so
+    // the card and the snippet can never disagree about the climb they describe.
+    // The canonical angle, not the requested one: the card is cached for a year
+    // under its own URL, and every angle of a climb should share one card.
+    const ogImagePath = buildOgBoardRenderUrl(
+      boardDetails,
+      currentClimb.frames,
+      buildOgClimbCardIdentity(currentClimb, boardDetails.board_name, canonicalAngle, angleStats),
+    );
+
+    return createBoardContentPageMetadata({
+      title: t(climbGrade ? 'metadata.view.title' : 'metadata.view.titleUngraded', {
+        climbName,
+        grade: climbGrade,
+        boardName: boardTypeLabel(boardDetails.board_name),
+        angle: parsedParams.angle,
+      }),
+      description: buildClimbSearchDescription({
+        t,
+        locale,
+        climbName,
+        grade: climbGrade,
+        layoutName: climbBoardForSearch(boardDetails.board_name, boardDetails.layout_name),
+        angle: parsedParams.angle,
+        setter: currentClimb.setter_username,
+        ascents: currentClimb.ascensionist_count,
+        angleStats: angleStats.find((stats) => stats.angle === parsedParams.angle),
+      }),
+      path: climbUrl,
+      locale,
+      imagePath: ogImagePath,
+      imageAlt: t(climbGrade ? 'metadata.view.imageAlt' : 'metadata.view.imageAltUngraded', {
+        climbName,
+        grade: climbGrade,
+        boardName: boardDetails.board_name,
+      }),
+      // Translated views stay shareable; only the English climb belongs in search.
+      robots: isHiddenClimb || locale !== DEFAULT_LOCALE ? { index: false, follow: true } : undefined,
+    });
+  } catch {
+    return createBoardContentPageMetadata({
+      title: t('metadata.view.fallbackTitle'),
+      description: t('metadata.view.fallbackDescription'),
+      locale,
+      robots: { index: false, follow: true },
+    });
+  }
+}
+
+export default async function ClimbViewPage(props: { params: Promise<BoardRouteParametersWithUuid> }) {
+  const params = await props.params;
+
+  try {
+    const { parsedParams, isNumericFormat } = await parseRouteParams(params);
+
+    // Fetch the climb once. On the redirect path we use its name to build the
+    // slug URL; on the normal path we pass it through to the SEO fragment and
+    // the drawer.
+    const currentClimb = await getClimb(parsedParams);
+    if (!currentClimb) notFound();
+    const needsSlugRedirect =
+      isNumericFormat || isUuidOnly(params.climb_uuid) || currentClimb.uuid !== parsedParams.climb_uuid;
+
+    // Send a Woods climb on a size it does not fit to one it does. 307, not
+    // 308: the target comes from climb data, which a re-measure can change.
+    const woodsTarget = woodsSizeRedirectTarget(parsedParams, currentClimb);
+    if (woodsTarget === 'none') notFound();
+    if (woodsTarget) {
+      const target = woodsTarget;
+      const targetUrl = tryConstructSlugViewUrl(
+        'woods',
+        target.layoutId,
+        target.sizeId,
+        target.setIds,
+        parsedParams.angle,
+        currentClimb.uuid,
+        currentClimb.name,
+      );
+      if (!targetUrl) notFound();
+      redirect(localeHref(targetUrl, await getLocale()));
+    }
+
+    if (needsSlugRedirect) {
+      const queries = await import('@/app/lib/data/queries');
+      const [layouts, sizes, sets] = await Promise.all([
+        Promise.resolve(queries.getLayouts(parsedParams.board_name)),
+        Promise.resolve(queries.getSizes(parsedParams.board_name, parsedParams.layout_id)),
+        Promise.resolve(queries.getSets(parsedParams.board_name, parsedParams.layout_id, parsedParams.size_id)),
+      ]);
+
+      const layout = layouts.find((l) => l.id === parsedParams.layout_id);
+      const size = sizes.find((s) => s.id === parsedParams.size_id);
+      const selectedSets = sets.filter((s) => parsedParams.set_ids.includes(s.id));
+
+      if (!layout || !size || selectedSets.length === 0) {
+        // A numeric/uuid-only URL whose layout/size/sets can't be resolved
+        // doesn't correspond to a real climb on this board configuration —
+        // 404 rather than silently falling through to render an empty list.
+        notFound();
+      }
+      // Id-aware, and it has to be: a 308 is cached by the browser forever, so
+      // the bare size slug the name-based builder emits would permanently pin
+      // /kilter/1/27/... to size 10 — a different physical board — and disagree
+      // with the canonical `generateMetadata` above builds from the same ids.
+      // The name-based builder stays as the fallback for a board the static
+      // tables don't carry but the queries above resolved.
+      const newUrl =
+        tryConstructSlugViewUrl(
+          parsedParams.board_name,
+          parsedParams.layout_id,
+          parsedParams.size_id,
+          parsedParams.set_ids,
+          parsedParams.angle,
+          currentClimb.uuid,
+          currentClimb.name,
+        ) ??
+        constructClimbViewUrlWithSlugs(
+          parsedParams.board_name,
+          layout.name,
+          size.name,
+          size.description,
+          selectedSets.map((s) => s.name),
+          parsedParams.angle,
+          currentClimb.uuid,
+          currentClimb.name,
+        );
+      // `generateSlugFromText` (shared/play-view) is ASCII-only (`\w` doesn't
+      // match Cyrillic/CJK/emoji), so a climb whose name is entirely
+      // non-Latin slugs to '' and both builders above fall back to the bare
+      // uuid — the same value this route may already have been requested
+      // with. Compare against the RAW request path (not `parsedParams`, which
+      // normalises slugs/ids and would never match) so we only redirect when
+      // the target actually differs; otherwise `permanentRedirect(newUrl)`
+      // would 308 the page to itself forever.
+      const requestedPath = `/${params.board_name}/${params.layout_id}/${params.size_id}/${params.set_ids}/${params.angle}/view/${params.climb_uuid}`;
+      if (newUrl !== requestedPath) {
+        permanentRedirect(localeHref(newUrl, await getLocale()));
+      }
+    }
+
+    const boardDetails = getBoardImageDetailsForBoard(parsedParams);
+
+    const [angleStats, similarClimbs, betaLinks] = await Promise.all([
+      // Keyed on the climb the URL resolved to: for an alias URL the requested
+      // uuid names a husk with no stats, similar climbs or beta of its own.
+      getClimbStatsForAllAngles(parsedParams.board_name, currentClimb.uuid),
+      getFrontDoorSimilarClimbs({
+        boardType: parsedParams.board_name,
+        layoutId: parsedParams.layout_id,
+        climbUuid: currentClimb.uuid,
+        angle: parsedParams.angle,
+        fallback: currentClimb.is_hidden
+          ? undefined
+          : { sizeId: parsedParams.size_id, setIds: parsedParams.set_ids, difficulty: currentClimb.difficulty },
+      }),
+      getFrontDoorBetaLinks({ boardType: parsedParams.board_name, climbUuid: currentClimb.uuid }),
+    ]);
+
+    const preloadUrls = buildOverlayPreloadUrls(boardDetails, currentClimb.frames, false);
+    // Same name fallback `generateMetadata` used. An unnamed climb would
+    // otherwise get the `-{board} Climb-` slug in its canonical and the bare
+    // uuid form in the CTA — the hand-off would leave the page's own URL.
+    const handoffPath = buildCanonicalClimbViewUrl(
+      boardDetails,
+      parsedParams.angle,
+      currentClimb.uuid,
+      resolveClimbDisplayName(currentClimb.name, boardDetails.board_name),
+    );
+    const canonicalAngle = selectCanonicalClimbAngle({
+      boardName: parsedParams.board_name,
+      catalogAngle: currentClimb.catalogAngle,
+      angleStats,
+    });
+
+    // The board overlay is preloaded below and fetched directly from Railway.
+    // Keep only the single OG warm so a later share-card unfurl is a byte hit.
+    scheduleOgImageWarming({
+      boardDetails,
+      climb: currentClimb,
+      identity: buildOgClimbCardIdentity(currentClimb, boardDetails.board_name, canonicalAngle, angleStats),
+    });
+
+    return (
+      <>
+        {preloadUrls.map((preloadUrl) => (
+          <link key={preloadUrl} rel="preload" as="image" href={preloadUrl} fetchPriority="high" />
+        ))}
+        <ClimbFrontDoor
+          climb={currentClimb}
+          boardDetails={boardDetails}
+          angle={parsedParams.angle}
+          canonicalAngle={canonicalAngle}
+          angleStats={angleStats}
+          similarClimbs={similarClimbs}
+          betaLinks={betaLinks}
+          handoffPath={handoffPath}
+          tree="config-tuple"
+        />
+      </>
+    );
+  } catch (error) {
+    // Everything reaches the error boundary, which is a 500. Next.js internals
+    // (permanentRedirect, notFound) carry a digest and get their own handling;
+    // a read failure is genuinely a 5xx and must say so. This used to end in
+    // `notFound()`, which meant a saturated pool or a dead database emitted a
+    // 404 on an indexed climb URL — at sitemap scale, an instruction to
+    // deindex. Google retries a 5xx and keeps the URL; that is the property
+    // that matters here. `notFound()` above still fires for a climb that really
+    // is not there.
+    //
+    // A digest is control flow, not a failure: `needsSlugRedirect` fires a 308
+    // on every legacy/uuid-only URL and `notFound()` fires on every stale
+    // sitemap entry, both routine and both high-volume on the crawl path.
+    // Logging them would bury the brownout signal this catch exists to surface.
+    if (!(error !== null && typeof error === 'object' && 'digest' in error)) {
+      console.error('Error fetching results or climb:', error);
+    }
+    throw error;
+  }
+}

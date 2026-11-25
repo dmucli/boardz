@@ -3,6 +3,7 @@ import * as Sentry from '@sentry/react-native';
 import { installGlobalErrorCapture } from './global-error-capture';
 import { resolveAppEnvironment } from './app-environment';
 import type { InterruptedLiveActivityIntentDiagnostic } from './live-activity/live-activity-plugin';
+import { scrubPasswordRecoveryEvent } from '@boardsesh/text-redaction';
 
 /**
  * Triage context attached to a reported error. Defined here (not in
@@ -43,7 +44,7 @@ export const isSentryEnabled = !!sentryDsn && !__DEV__;
 // binaries before the next native build ships. Match the view name + method (never a bare
 // `partialExpand` substring) so no unrelated error is ever dropped; cover `expand` too —
 // same mechanism, even though only `partialExpand` rejects on today's fleet. See
-// docs/mobile-ota-updates.md: JS-only, so it keeps the same fingerprint and rides the OTA.
+// docs/operations/mobile-ota-updates.md: JS-only, so it keeps the same fingerprint and rides the OTA.
 const EXPO_UI_SHEET_NO_HANDLER =
   /Call to function 'ModalBottomSheetView\.(?:partialExpand|expand)' has been rejected|No handler registered for AsyncFunction '(?:partialExpand|expand)' on view 'ModalBottomSheetView'/;
 
@@ -97,22 +98,70 @@ export function applyChunkLoadFingerprint<T extends FingerprintableEvent>(
   return event;
 }
 
+type NormalizableEvent = {
+  extra?: Record<string, unknown> | undefined;
+  exception?: { values?: Array<{ value?: string | undefined }> };
+};
+
+/**
+ * `captureToSentry` normalizes an opaque close/error event before sending, but a
+ * rejection that reaches the SDK through its global onunhandledrejection hook skips
+ * that path and arrives as `Event captured as promise rejection`. Apply the same
+ * normalization in `beforeSend`: when the original exception is not an `Error`, put
+ * the close code/reason into `extra` and replace the exception message. It edits the event in place and is
+ * ungated so it is unit-testable. Raw close events that used to group under the SDK's
+ * `Event captured as promise rejection` title will regroup under the new message.
+ */
+export function applyCapturedValueNormalization<T extends NormalizableEvent>(event: T, originalException?: unknown): T {
+  if (originalException instanceof Error) return event;
+  // Only close-event shapes (a numeric code or a socket target). Any other object
+  // with a `type` key keeps the SDK's own grouping.
+  if (typeof originalException !== 'object' || originalException === null) return event;
+  if (typeof (originalException as { code?: unknown }).code !== 'number' && !('target' in originalException)) {
+    return event;
+  }
+  const { error, extra } = normalizeCapturedValueForSentry(originalException);
+  if (!extra) return event;
+  event.extra = { ...event.extra, ...extra };
+  const firstValue = event.exception?.values?.[0];
+  if (firstValue) firstValue.value = error.message;
+  return event;
+}
+
 if (isSentryEnabled) {
   Sentry.init({
     dsn: sentryDsn,
+    // App startup installs native privacy callbacks through the SDK's public
+    // native start APIs. Reinitializing here would replace them.
+    // Requires the next native binary; this change is not an old-binary OTA.
+    autoInitializeNativeSdk: false,
     // production for store/TestFlight bundles; 'preview' for pr-* OTA bundles so
     // their crashes are filterable out of the prod view. See resolveAppEnvironment
     // (shared with PostHog — app-environment.ts).
     environment: resolveAppEnvironment(),
     tracesSampleRate: 0.1,
+    sendDefaultPii: false,
     // Drop the benign @expo/ui Android sheet "No handler registered" unhandled rejection
     // (partialExpand/expand on a binary whose native layer predates the method). Scoped
     // to that exact signature so every other rejection still reports. See
     // isExpoUiSheetNoHandlerRejection above.
     beforeSend(event, hint) {
       if (isExpoUiSheetNoHandlerRejection(event, hint?.originalException)) return null;
-      return applyChunkLoadFingerprint(event, hint?.originalException);
+      delete event.user;
+      if (event.contexts?.device) delete event.contexts.device.id;
+      return scrubPasswordRecoveryEvent(
+        applyChunkLoadFingerprint(
+          applyCapturedValueNormalization(event, hint?.originalException),
+          hint?.originalException,
+        ),
+      );
     },
+    beforeSendTransaction(event) {
+      delete event.user;
+      if (event.contexts?.device) delete event.contexts.device.id;
+      return scrubPasswordRecoveryEvent(event);
+    },
+    beforeSendSpan: (span) => scrubPasswordRecoveryEvent(span),
     // Explicit so a future option change can't silently turn either off. Native
     // crash handling persists SIGABRT / native exceptions across the crash and
     // uploads them on the next launch — the coverage gap PostHog (JS-only)
@@ -140,6 +189,10 @@ if (isSentryEnabled) {
     // Hardcoding release here (e.g. "2.0.0" without dist) would mismatch the
     // uploaded artifacts and break symbolication.
   });
+  // Native options no longer receive this bundle's init options. Synchronize
+  // the environment through the supported scope bridge so preview OTAs keep
+  // their native errors out of production; pre-JS errors use the build value.
+  Sentry.setTag('boardsesh_environment', resolveAppEnvironment());
 }
 
 // Sentry tags must be primitives; coerce non-scalar values to a readable string
@@ -464,6 +517,8 @@ export type OtaTagFields = {
   updateId?: string | null;
   runtimeVersion?: string | null;
   isEmbeddedLaunch?: boolean;
+  automaticCanary?: boolean | null;
+  canaryCheckedAt?: string | null;
 };
 
 /**
@@ -482,6 +537,8 @@ export function applyOtaTagsToScope(scope: TagScope, fields: OtaTagFields): void
   scope.setTag('ota_update_id', fields.updateId || undefined);
   scope.setTag('ota_runtime_version', fields.runtimeVersion || undefined);
   scope.setTag('ota_is_embedded', fields.isEmbeddedLaunch === undefined ? undefined : String(fields.isEmbeddedLaunch));
+  scope.setTag('ota_automatic_canary', fields.automaticCanary == null ? undefined : String(fields.automaticCanary));
+  scope.setTag('ota_canary_checked_at', fields.canaryCheckedAt || undefined);
 }
 
 /**

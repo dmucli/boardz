@@ -2,10 +2,17 @@ import 'server-only';
 import { and, desc, eq, sql, type SQL } from 'drizzle-orm';
 import { alias } from 'drizzle-orm/pg-core';
 import { getClimbStars, getGradeLabel, withSerialPlan, type SerialPlanDb } from '@boardsesh/db/queries';
-import { dbzRead, executeRows } from '@/app/lib/db/db';
+import { dbz, executeRows } from '@/app/lib/db/db';
+import { withReadDeadline } from '@/app/lib/db/read-deadline';
+import { remainingReadBudgetMs } from '@/app/lib/db/request-read-budget';
 import { boardClimbs, boardClimbStats } from '@/app/lib/db/schema';
 import { publishableAngleWhere, publishedAngleOrderBy } from '@/app/lib/seo/sitemap/published-angle';
 import { SETTER_PAGE_SIZE } from '@/app/lib/seo/sitemap/setter-page-contract';
+import {
+  SETTER_IDENTITY_ORDER,
+  setterIdentityCandidates,
+  visibleSetterClimbsWhere,
+} from '@/app/lib/seo/sitemap/setter-identity';
 import type { Climb } from '@/app/lib/types';
 
 /**
@@ -36,7 +43,7 @@ export type SetterClimbRow = Climb & {
   layoutId: number;
   boardType: string;
   compatibleSizeIds: number[];
-  requiredSetIds: number[];
+  requiredSetIds: number[] | null;
   updatedAt: Date;
 };
 
@@ -44,6 +51,7 @@ export type SetterPageData = {
   username: string;
   displayName: string;
   avatarUrl: string | null;
+  /** The boards the visible climbs are on, the board with the most of them first. */
   boardTypes: string[];
   /** Publicly visible climbs only — the same count the page 404s on when it is 0. */
   climbCount: number;
@@ -51,33 +59,6 @@ export type SetterPageData = {
   climbs: SetterClimbRow[];
   hasMore: boolean;
 };
-
-/**
- * The single visibility predicate. Both builders below call it, so the count
- * that decides "does this page exist" and the list that decides "what does it
- * show" can never describe different sets of climbs — a divergence that would
- * render a 200 with an empty list, or 404 a setter whose climbs are right there.
- *
- * `server-setter-data.test.ts` byte-compares the two rendered WHERE clauses
- * rather than trusting this comment.
- */
-function visibleSetterClimbsWhere(username: string): SQL | undefined {
-  // `SQL | undefined` rather than a cast: drizzle types `and()` that way for the
-  // zero-argument case, `.where()` accepts it, and asserting it away would only
-  // silence the compiler about a shape it is describing correctly.
-  //
-  // `is_hidden` belongs here for the same reason as the sitemap's copy: this is
-  // an indexable page publishing crawlable links, and a climb the community
-  // voted out of browse must not come back through a setter's front door — nor
-  // count towards the number that decides the page exists at all. The setter's
-  // own "My climbs" list is the surface that deliberately keeps showing it.
-  return and(
-    eq(boardClimbs.setterUsername, username),
-    eq(boardClimbs.isListed, true),
-    eq(boardClimbs.isDraft, false),
-    eq(boardClimbs.isHidden, false),
-  );
-}
 
 /**
  * Board types and visible-climb count for one setter.
@@ -95,6 +76,22 @@ export function buildSetterProfileQuery(db: SerialPlanDb, username: string) {
     .from(boardClimbs)
     .where(visibleSetterClimbsWhere(username))
     .groupBy(boardClimbs.boardType);
+}
+
+/**
+ * The setter's boards, most visible climbs first, so "41 Kilter and Tension
+ * climbs" leads with the board they mostly set on. Ties read alphabetically.
+ */
+export function orderSetterBoardTypes(
+  rows: readonly { boardType: string | null; climbCount: number | string }[],
+): string[] {
+  return rows
+    .filter((row): row is { boardType: string; climbCount: number | string } => Boolean(row.boardType))
+    .toSorted(
+      (left, right) =>
+        Number(right.climbCount) - Number(left.climbCount) || left.boardType.localeCompare(right.boardType),
+    )
+    .map((row) => row.boardType);
 }
 
 /** The stats rows this climb could be linked at, aliased away from the outer join. */
@@ -195,20 +192,25 @@ type SetterIdentity = { displayName: string; avatarUrl: string | null; followerC
 /**
  * Display name, avatar and follower count for the hero.
  *
- * Raw `sql` rather than Drizzle builders because `user_board_mappings` →
- * `users` → `user_profiles` is a three-table lookup for at most one row and the
- * follower count is a scalar subquery; expressing it as a join chain buys
- * nothing. Falls back to the raw username, which is what the setter is called
- * on every climb row anyway.
+ * The account is the first of `setterIdentityCandidates` in
+ * `SETTER_IDENTITY_ORDER`: the account that set this page's climbs, else a
+ * public account linked to the name by a Kilter or Tension login on one of its
+ * board types. The setters shard dates `<lastmod>` from the same candidate.
+ * Exported for its test.
+ *
+ * Raw `sql` because the follower count is a scalar subquery beside a lookup for
+ * at most one row. Falls back to the raw username, which is what the setter is
+ * called on every climb row anyway.
  */
-async function fetchSetterIdentity(username: string): Promise<SetterIdentity> {
+export async function fetchSetterIdentity(username: string): Promise<SetterIdentity> {
   const rows = await executeRows<{
     name: string | null;
     display_name: string | null;
     avatar_url: string | null;
     follower_count: number | string | null;
   }>(
-    dbzRead,
+    // The primary, like the rest of this page's reads (see `getSetterPageData`).
+    dbz,
     sql`
     SELECT
       profile.name,
@@ -218,15 +220,10 @@ async function fetchSetterIdentity(username: string): Promise<SetterIdentity> {
     FROM (SELECT 1) AS seed
     LEFT JOIN (
       SELECT u.name, p.display_name, p.avatar_url
-      FROM user_board_mappings ubm
-      JOIN users u ON u.id = ubm.user_id
-      LEFT JOIN user_profiles p ON p.user_id = ubm.user_id
-      WHERE ubm.board_username = ${username}
-      -- Deterministic, and the setters shard sorts identically. The unique
-      -- index is (user_id, board_type), so two different users can share a
-      -- setter name; a bare LIMIT 1 renders whichever the planner happened to
-      -- reach, and the shard's <lastmod> could describe the other one.
-      ORDER BY p.user_id IS NULL, ubm.user_id
+      FROM (${setterIdentityCandidates(username)}) AS candidate
+      JOIN users u ON u.id = candidate.user_id
+      LEFT JOIN user_profiles p ON p.user_id = candidate.user_id
+      ORDER BY ${SETTER_IDENTITY_ORDER}
       LIMIT 1
     ) AS profile ON true
   `,
@@ -262,7 +259,7 @@ function toClimbRow(row: Awaited<ReturnType<typeof buildSetterClimbsQuery>>[numb
       row.benchmarkDifficulty && row.benchmarkDifficulty > 0 ? row.benchmarkDifficulty.toString() : null,
     created_at: row.createdAt ?? null,
     compatibleSizeIds: row.compatibleSizeIds ?? [],
-    requiredSetIds: row.requiredSetIds ?? [],
+    requiredSetIds: row.requiredSetIds,
     updatedAt: row.updatedAt,
   };
 }
@@ -274,22 +271,34 @@ function toClimbRow(row: Awaited<ReturnType<typeof buildSetterClimbsQuery>>[numb
  * Rethrows on query failure rather than degrading to an empty page, the rule
  * `fetchFrontDoorListPage` records: a 200 with no climbs on an indexable URL
  * reads to Google as legitimate thin content and the page gets dropped, where a
- * 5xx makes it retry and keep the URL.
+ * 5xx makes it retry and keep the URL. A blown read deadline is the same: it
+ * throws `DbReadTimeoutError`, never `null`. The two reads share the request's
+ * read budget. A drizzle transaction cannot be cancelled, so a timed-out plan
+ * fails the caller fast and finishes in the background.
  */
 export async function getSetterPageData(username: string, page: number): Promise<SetterPageData | null> {
   const offset = Math.max(0, page - 1) * SETTER_PAGE_SIZE;
 
-  const [boardTypeRows, climbRows] = await withSerialPlan(dbzRead, async (tx) => [
-    await buildSetterProfileQuery(tx, username),
-    await buildSetterClimbsQuery(tx, username, offset, SETTER_PAGE_SIZE),
-  ]);
+  // The primary, not the replica. The setter's climbs span every board type,
+  // spray walls included, and the spray predicate in `visibleSetterClimbsWhere`
+  // is a wall rule its owner (or an admin hide) can withdraw at any moment. A
+  // replica with no replay barrier could still see the wall as public and hand
+  // a stranger its climbs. Same rule as every other spray read: on the primary.
+  const [boardTypeRows, climbRows] = await withReadDeadline(
+    'setter-climbs',
+    withSerialPlan(dbz, async (tx) => [
+      await buildSetterProfileQuery(tx, username),
+      await buildSetterClimbsQuery(tx, username, offset, SETTER_PAGE_SIZE),
+    ]),
+    remainingReadBudgetMs(),
+  );
 
   const climbCount = boardTypeRows.reduce((total, row) => total + Number(row.climbCount), 0);
   if (climbCount === 0) {
     return null;
   }
 
-  const identity = await fetchSetterIdentity(username);
+  const identity = await withReadDeadline('setter-identity', fetchSetterIdentity(username), remainingReadBudgetMs());
   const hasMore = climbRows.length > SETTER_PAGE_SIZE;
 
   return {
@@ -297,10 +306,7 @@ export async function getSetterPageData(username: string, page: number): Promise
     displayName: identity.displayName,
     avatarUrl: identity.avatarUrl,
     followerCount: identity.followerCount,
-    boardTypes: boardTypeRows
-      .map((row) => row.boardType)
-      .filter((boardType): boardType is string => Boolean(boardType))
-      .sort(),
+    boardTypes: orderSetterBoardTypes(boardTypeRows),
     climbCount,
     climbs: (hasMore ? climbRows.slice(0, SETTER_PAGE_SIZE) : climbRows).map(toClimbRow),
     hasMore,

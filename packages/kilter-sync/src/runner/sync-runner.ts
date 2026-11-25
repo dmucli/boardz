@@ -25,6 +25,7 @@ import {
   type SharedSyncClaimToken,
   type SyncBatchRunner,
 } from '@boardsesh/db/queries';
+import { resolvePoolMax } from '@boardsesh/db/client';
 import {
   DEFAULT_DAEMON_OPTIONS,
   DaemonLease,
@@ -208,9 +209,11 @@ export class SyncRunner {
       // prepare: false matches aurora-sync — Railway's pooled URL uses
       // PgBouncer in transaction mode, which is incompatible with prepared
       // statements. Direct (non-pooled) URLs work either way, so this is
-      // the safe default for both.
+      // the safe default for both. `DB_POOL_MAX` caps it the way it caps
+      // `createDb()`: 5 when unset, never below 2. See docs/operations/db-connectivity.md,
+      // "Pool budgets".
       const client = postgres(connectionString, {
-        max: 5,
+        max: resolvePoolMax(),
         idle_timeout: 30,
         connect_timeout: 30,
         prepare: false,
@@ -614,10 +617,8 @@ export class SyncRunner {
    *    or a permanent Kilter failure (the marker is backdated by the run's
    *    length), five minutes from the end otherwise so the retry runs.
    *
-   * The writes go straight to the database, as the daemon's do: the claim is
-   * the single-writer guarantee, and the catalog interleaves provider requests
-   * with its writes too finely to put each behind an attempt fence. The signal
-   * stops it between layout groups.
+   * The worker fences every write batch through `options.transaction`;
+   * provider requests run between batches and honour the abort signal.
    */
   async runCatalogSyncJob(options: CatalogSyncJobOptions = {}): Promise<CatalogSyncJobResult> {
     const { db } = this.getClient();
@@ -661,24 +662,33 @@ export class SyncRunner {
     const fromStart = () => Math.max(0, cooldownMs - (Date.now() - startedAt));
     let nextCooldownMs = cooldownMs;
     let providerHoldMs: number | undefined;
+    const runPhase = async (phase: 'catalog' | 'stats-repair' | 'history', work: () => Promise<unknown>) => {
+      signal?.throwIfAborted();
+      const phaseStartedAt = Date.now();
+      this.config.onCatalogPhase?.({ phase, status: 'started', elapsedMs: 0 });
+      await work();
+      signal?.throwIfAborted();
+      this.config.onCatalogPhase?.({ phase, status: 'finished', elapsedMs: Date.now() - phaseStartedAt });
+    };
     try {
       this.log(`[kilter-catalog] scheduled catalog sync (${tokenSource} token)`);
-      await syncKilterCatalog({
-        db,
-        tokenProvider,
-        log: (message) => this.log(message),
-        applyDeletions: this.config.applyCatalogDeletions ?? true,
-        deleteBatchLimit: this.config.deleteBatchLimit,
-        signal,
-        transaction,
-        // Keys the run's setter notifications, so a retry of this run does not
-        // notify anyone twice.
-        runKey: options.runId,
-      });
-      signal?.throwIfAborted();
-      await this.maybeRepairKilterStats(db, tokenProvider, { transaction, signal });
-      signal?.throwIfAborted();
-      await this.maybeSnapshotHistory(db, { transaction, signal });
+      await runPhase('catalog', () =>
+        syncKilterCatalog({
+          db,
+          tokenProvider,
+          log: (message) => this.log(message),
+          onStepError: (error) => this.handleError(error instanceof Error ? error : new Error(String(error)), {}),
+          applyDeletions: this.config.applyCatalogDeletions ?? true,
+          deleteBatchLimit: this.config.deleteBatchLimit,
+          signal,
+          transaction,
+          // Keys the run's setter notifications, so a retry of this run does not
+          // notify anyone twice.
+          runKey: options.runId,
+        }),
+      );
+      await runPhase('stats-repair', () => this.maybeRepairKilterStats(db, tokenProvider, { transaction, signal }));
+      await runPhase('history', () => this.maybeSnapshotHistory(db, { transaction, signal }));
       nextCooldownMs = fromStart();
       return { status: 'synced', tokenSource };
     } catch (error) {
@@ -933,7 +943,7 @@ export class SyncRunner {
 
   async runDaemon(options: DaemonOptions = {}): Promise<void> {
     // The worker families own routine syncs once this is set; see
-    // docs/kilter-sync.md. Checked before the lease or the pool is touched.
+    // docs/data/kilter-sync.md. Checked before the lease or the pool is touched.
     if (isSyncDaemonDisabled(process.env)) {
       this.log(`[KilterSyncRunner] ${SYNC_DAEMON_DISABLED_MESSAGE}`);
       return;

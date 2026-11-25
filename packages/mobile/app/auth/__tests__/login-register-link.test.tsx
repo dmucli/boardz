@@ -1,4 +1,18 @@
 // @vitest-environment jsdom
+vi.mock('../../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('expo-router/react-navigation', () => ({ useHeaderHeight: () => 0 }));
+vi.mock('../../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 //
 // The two hops the rest of the W-06 suites can't see: login forwarding `next` to
 // the sign-up screen, and register handing it back. `AuthProvider` is what
@@ -26,12 +40,27 @@ vi.mock('react-native', () => ({
   },
   KeyboardAvoidingView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  View: ({ children, accessibilityRole }: { children?: ReactNode; accessibilityRole?: string }) =>
-    createElement('div', { role: accessibilityRole }, children),
+  View: ({
+    children,
+    accessibilityRole,
+    style,
+  }: {
+    children?: ReactNode;
+    accessibilityRole?: string;
+    style?: unknown;
+  }) =>
+    createElement(
+      'div',
+      { role: accessibilityRole, 'data-flex-wrap': (style as { flexWrap?: string } | undefined)?.flexWrap },
+      children,
+    ),
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
   Pressable: ({ onPress, children }: { onPress?: () => void; children?: ReactNode }) =>
     createElement('button', { onClick: onPress }, children),
-  StyleSheet: { create: (styles: unknown) => styles },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+  },
 }));
 
 vi.mock('expo-image', () => ({ Image: () => createElement('img', null) }));
@@ -69,6 +98,13 @@ vi.mock('../../../src/lib/routing/anonymous-auth-gate', () => ({
 
 const LoginScreen = (await import('../login')).default;
 const RegisterScreen = (await import('../register')).default;
+
+/** The row holding a footer link (the link's Pressable sits directly in it). */
+function footerRowOf(link: HTMLElement): HTMLElement {
+  const row = link.parentElement;
+  if (!row) throw new Error('footer link has no row');
+  return row;
+}
 
 /** A footer link, found by its translation key (the `t` stub is identity). */
 function linkByKey(container: HTMLElement, key: string): HTMLElement {
@@ -133,5 +169,22 @@ describe('RegisterScreen sign-in link', () => {
     fireEvent.click(linkByKey(container, 'login.submit.signIn'));
 
     expect(router.replace).toHaveBeenCalledWith('/auth/login');
+  });
+});
+
+// HIG Localization: "Noch kein Konto? Registrieren" is wider than a phone, so
+// the prompt and its link sit in a row that wraps instead of running off-screen.
+describe('auth footers wrap long translations', () => {
+  it('wraps the login sign-up and Discord rows', () => {
+    const { container } = render(<LoginScreen />);
+
+    expect(footerRowOf(linkByKey(container, 'login.submit.signUp')).getAttribute('data-flex-wrap')).toBe('wrap');
+    expect(footerRowOf(linkByKey(container, 'login.links.discord')).getAttribute('data-flex-wrap')).toBe('wrap');
+  });
+
+  it('wraps the register sign-in row', () => {
+    const { container } = render(<RegisterScreen />);
+
+    expect(footerRowOf(linkByKey(container, 'login.submit.signIn')).getAttribute('data-flex-wrap')).toBe('wrap');
   });
 });

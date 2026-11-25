@@ -79,10 +79,10 @@ export function resolveExpoWebDevOrigin(rawOrigin) {
  *
  * `redirects()` runs before `middleware.ts`, and its sources are matched
  * literally: `/logbook` never matches `/es/logbook`. Every rule therefore ships
- * with its three locale twins (standing rule 4 of the web reposition), built by
+ * with its locale twins (standing rule 4 of the web reposition), built by
  * `expandLocaleRedirects` below so a hand-written rule can't forget them.
  */
-const PATH_LOCALE_PREFIXES = ['/es', '/fr', '/de'];
+const PATH_LOCALE_PREFIXES = ['/es', '/fr', '/de', '/it'];
 
 /**
  * Origin of the Expo-web app. Mirrors `DEFAULT_APP_ORIGIN` in
@@ -113,6 +113,39 @@ export const APP_ORIGIN = process.env.NEXT_PUBLIC_APP_URL ?? DEFAULT_CONFIG_APP_
  * has to come before the `/:board/…` catch-all that would otherwise swallow it.
  */
 const BASE_REDIRECTS = [
+  // The five Aurora-built board apps are one app, so their guides merged into
+  // /apps/aurora. Each old page lands on its brand's section; browsers keep the
+  // destination's `#` through the redirect.
+  ...['tension', 'decoy', 'touchstone', 'grasshopper', 'so-ill'].map((brand) => ({
+    source: `/apps/${brand}`,
+    destination: `/apps/aurora#${brand}`,
+    permanent: true,
+  })),
+  // Only /compare/spray-wall-apps lives under /compare; a reader who trims the
+  // URL gets the guides hub instead of a 404.
+  { source: '/compare', destination: '/apps', permanent: true },
+  {
+    source: '/aurora-migration',
+    destination: '/bring-your-logbook#old-kilter-app',
+    permanent: true,
+  },
+  // Help pages folded into their parent guides. The destination's own `#`
+  // survives the redirect; the old pages had no ids to carry over.
+  {
+    source: '/help/climb-actions',
+    destination: '/help/finding-climbs#climb-menu',
+    permanent: true,
+  },
+  {
+    source: '/help/playlists',
+    destination: '/help/finding-climbs#playlists',
+    permanent: true,
+  },
+  {
+    source: '/help/beta-videos',
+    destination: '/help/logbook#beta-videos',
+    permanent: true,
+  },
   // Legacy library / profile paths.
   {
     source: '/my-library',
@@ -164,32 +197,22 @@ const BASE_REDIRECTS = [
     permanent: false,
   },
 
-  // The MoonBoard bulk importer stays on Next, re-homed to a board-agnostic
-  // route. Layout, hold sets and angle ride along so a bookmarked import URL
-  // opens the wall it named; anything unresolvable lands on the picker.
+  // Importing and climb authoring belong in the app. Keep old bookmarks useful
+  // without retaining the Next screenshot importer or its hold editor.
   {
-    source: '/moonboard/:layout/:size/:set/:angle/import',
-    destination: '/moonboard-import?layout=:layout&sets=:set&angle=:angle',
-    permanent: true,
+    source: '/moonboard-import',
+    destination: `${APP_ORIGIN}/settings/integrations`,
+    permanent: false,
   },
-  // Bulk import is MoonBoard-only — the deleted page sent a Kilter or Tension
-  // import URL to that board's own list instead of rendering the importer. This
-  // rule keeps that, and it has to exist: `MOONBOARD_LAYOUTS` ids run 1–7 and
-  // collide with Aurora layout ids, so without it `/kilter/1/…/import` would
-  // resolve to MoonBoard 2010 and render the importer for the wrong board.
   {
     source: '/:board/:layout/:size/:set/:angle/import',
-    destination: '/:board/:layout/:size/:set/:angle/list',
-    permanent: true,
+    destination: `${APP_ORIGIN}/settings/integrations`,
+    permanent: false,
   },
-  // The `/b` tree can't make that split: the slug names a board row, and only a
-  // DB lookup says whether it's a MoonBoard. It goes to the importer because
-  // that is the only reason to open `/import` at all; a non-MoonBoard slug lands
-  // on the picker, which is a noindex utility page with a way back.
   {
     source: '/b/:board_slug/:angle/import',
-    destination: '/moonboard-import?angle=:angle',
-    permanent: true,
+    destination: `${APP_ORIGIN}/settings/integrations`,
+    permanent: false,
   },
 
   // Liked climbs live in the app; the board's own front door is the closest
@@ -314,9 +337,32 @@ export function expandLocaleRedirects(rules) {
   ]);
 }
 
+/** Production can retain hashed build assets independently of the web image. */
+export function resolveNextAssetPrefix(rawBaseUrl, runtimeEnvironment = process.env.NODE_ENV) {
+  if (runtimeEnvironment !== 'production' || !rawBaseUrl?.trim()) return undefined;
+  const prefix = new URL(rawBaseUrl.trim());
+  if (
+    prefix.protocol !== 'https:' ||
+    prefix.username ||
+    prefix.password ||
+    prefix.pathname !== '/' ||
+    prefix.search ||
+    prefix.hash
+  ) {
+    throw new Error(
+      'NEXT_PUBLIC_NEXT_ASSET_BASE_URL must be an HTTPS origin without credentials, path, query or fragment',
+    );
+  }
+  return prefix.origin;
+}
+
+const nextAssetPrefix = resolveNextAssetPrefix(process.env.NEXT_PUBLIC_NEXT_ASSET_BASE_URL);
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   output: 'standalone',
+  assetPrefix: nextAssetPrefix,
+  crossOrigin: nextAssetPrefix ? 'anonymous' : undefined,
   // Pin this explicitly. Next otherwise discovers the tracing root by walking
   // for a lockfile, but the isolated Expo web runtime has its own nested
   // pnpm-lock.yaml. Trace paths and the standalone layout must stay rooted at
@@ -328,6 +374,11 @@ const nextConfig = {
         protocol: 'https',
         hostname: 'assets.boardsesh.com',
         pathname: '/static/v1/**',
+      },
+      {
+        protocol: 'https',
+        hostname: 'assets.boardsesh.com',
+        pathname: '/_next/static/media/**',
       },
     ],
   },
@@ -345,12 +396,13 @@ const nextConfig = {
   // Transpile internal monorepo packages from TypeScript source
   // This eliminates the need to pre-build packages before running the web app
   transpilePackages: [
+    '@boardsesh/auth-protocol',
+    '@boardsesh/text-redaction',
     '@boardsesh/board-constants',
     '@boardsesh/aurora-sync',
     '@boardsesh/shared-schema',
     '@boardsesh/static-assets',
     '@boardsesh/db',
-    '@boardsesh/moonboard-ocr',
     '@boardsesh/board-config',
     '@boardsesh/board-look',
     '@boardsesh/board-render',
@@ -364,10 +416,14 @@ const nextConfig = {
     '@boardsesh/play-view',
     '@boardsesh/playback-react',
     '@boardsesh/climb-filters',
+    '@boardsesh/community-roles',
     '@boardsesh/i18n',
     '@boardsesh/velvet-tokens',
     '@boardsesh/logbook',
     '@boardsesh/email',
+    '@boardsesh/workout-summary',
+    '@boardsesh/connected-apps',
+    '@boardsesh/directory-moderation',
   ],
   // `postgres` (postgres.js, used by @boardsesh/db via drizzle-orm/postgres-js)
   // must stay OUT of the server bundle. Sentry's postgresJsIntegration patches
@@ -381,6 +437,9 @@ const nextConfig = {
   // Empty turbopack config to silence warning about webpack config
   turbopack: {},
   experimental: {
+    globalNotFound: true,
+    // Reduce unrelated route CSS shipped to small marketing pages.
+    cssChunking: { type: 'graph', requestCost: 20000, weightDistribution: 0.1 },
     // Size the page-data workers from availableParallelism, not Next's
     // default. Next derives its worker count from `os.cpus().length`, which
     // reports every CPU on the machine and ignores cgroup/cpuset limits --
@@ -478,6 +537,76 @@ const nextConfig = {
           { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
         ],
       },
+      // Matching config headers can override a route handler's response. Keep
+      // credential URLs after the site-wide default, including locale rewrites.
+      ...[
+        '/api/auth/signin/:path*',
+        '/api/auth/callback/:path*',
+        '/:locale/api/auth/signin/:path*',
+        '/:locale/api/auth/callback/:path*',
+      ].map((source) => ({
+        source,
+        headers: [
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+          { key: 'Cache-Control', value: 'private, no-store, max-age=0, must-revalidate' },
+          { key: 'CDN-Cache-Control', value: 'no-store' },
+          { key: 'Vercel-CDN-Cache-Control', value: 'no-store' },
+          { key: 'X-Robots-Tag', value: 'noindex, follow' },
+        ],
+      })),
+      ...['/api/auth/verify-email', '/:locale/api/auth/verify-email'].map((source) => ({
+        source,
+        headers: [{ key: 'Referrer-Policy', value: 'no-referrer' }],
+      })),
+      ...[
+        '/auth/reset-password',
+        '/:locale/auth/reset-password',
+        '/api/auth/forgot-password',
+        '/:locale/api/auth/forgot-password',
+        '/api/auth/reset-password',
+        '/:locale/api/auth/reset-password',
+      ].map((source) => ({
+        source,
+        headers: [
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+          { key: 'Cache-Control', value: 'private, no-store, max-age=0, must-revalidate' },
+          { key: 'CDN-Cache-Control', value: 'no-store' },
+          { key: 'Vercel-CDN-Cache-Control', value: 'no-store' },
+          { key: 'X-Robots-Tag', value: 'noindex, follow' },
+        ],
+      })),
+      // The developer console (#6981, F15). It shows a client secret once after
+      // create or rotate, and its Delete and New secret buttons end climbers'
+      // connections, so it never renders inside another site's frame and its
+      // HTML is never cached.
+      ...['/developers/apps', '/:locale/developers/apps'].map((source) => ({
+        source,
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+          { key: 'Cache-Control', value: 'private, no-store, max-age=0, must-revalidate' },
+          { key: 'CDN-Cache-Control', value: 'no-store' },
+          { key: 'Vercel-CDN-Cache-Control', value: 'no-store' },
+          { key: 'X-Robots-Tag', value: 'noindex, follow' },
+        ],
+      })),
+      // A partner app's sign-in and consent (#6981). The query is the app's
+      // signed request, so it never leaves in a Referer, never sits in a cache,
+      // and the page never renders inside another site's frame, where a
+      // clickjacker could line Allow up under a click.
+      ...['/oauth/:path*', '/:locale/oauth/:path*'].map((source) => ({
+        source,
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
+          { key: 'Referrer-Policy', value: 'no-referrer' },
+          { key: 'Cache-Control', value: 'private, no-store, max-age=0, must-revalidate' },
+          { key: 'CDN-Cache-Control', value: 'no-store' },
+          { key: 'Vercel-CDN-Cache-Control', value: 'no-store' },
+          { key: 'X-Robots-Tag', value: 'noindex, follow' },
+        ],
+      })),
     ];
   },
   async rewrites() {
@@ -614,7 +743,7 @@ export default withSentryConfig(nextConfig, {
   webpack: {
     // Off since #4654: cron monitors now come from packages/scheduler
     // (Sentry.withMonitor per job), and vercel.json declares no crons for
-    // this to instrument. See docs/scheduler.md.
+    // this to instrument. See docs/backend/scheduler.md.
     automaticVercelMonitors: false,
 
     // Tree-shaking options for reducing bundle size

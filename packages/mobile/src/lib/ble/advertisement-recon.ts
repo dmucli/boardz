@@ -5,7 +5,7 @@
 // generation (in manufacturer data or service data) now that they've dropped the
 // `#serial@apiLevel` name suffix. Parses nothing itself — capture only.
 //
-// Uses the ble-plx `bleManager` directly (scanning needs no native module and
+// Uses the ble-plx `getBleManager()` directly (scanning needs no native module and
 // works on both platforms), scans UNFILTERED so bare-name and MoonBoard boxes
 // surface, and only emits for peripherals that look like a board (by advertised
 // service UUID or name) so unrelated BLE devices never reach analytics.
@@ -13,7 +13,8 @@
 import { parseApiLevel, parseSerialNumber } from '@boardsesh/ble-protocol';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { track } from '../analytics';
-import { bleManager } from './ble-manager';
+import { getBleManager } from './ble-manager';
+import { claimBleScan, releaseBleScan } from './ble-scan-slot';
 import { waitForBlePoweredOn } from './availability';
 import { requestBleRuntimePermissions } from './use-ble-permissions';
 import { isLikelyBoardDevice } from './board-device-filter';
@@ -54,6 +55,8 @@ export async function runBleAdvertisementRecon(reconCorrelationId: string): Prom
     rssi?: number;
   };
   const entries = new Map<string, ReconEntry>();
+  const scanToken = Symbol('board-advertisement-recon');
+  if (!claimBleScan(scanToken)) return 0;
 
   return new Promise<number>((resolve) => {
     let settled = false;
@@ -62,7 +65,7 @@ export async function runBleAdvertisementRecon(reconCorrelationId: string): Prom
       if (settled) return;
       settled = true;
       if (timeoutId) clearTimeout(timeoutId);
-      void bleManager.stopDeviceScan();
+      if (releaseBleScan(scanToken)) void getBleManager().stopDeviceScan();
       for (const entry of entries.values()) {
         track(SHARED_EVENTS.BleAdvertisementRecon, {
           reconCorrelationId,
@@ -81,7 +84,7 @@ export async function runBleAdvertisementRecon(reconCorrelationId: string): Prom
       resolve(entries.size);
     };
 
-    void bleManager.startDeviceScan(null, null, (error, device) => {
+    void getBleManager().startDeviceScan(null, null, (error, device) => {
       if (error || settled) {
         finish();
         return;

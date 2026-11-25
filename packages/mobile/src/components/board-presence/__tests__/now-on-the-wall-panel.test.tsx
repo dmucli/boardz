@@ -1,9 +1,23 @@
 // @vitest-environment jsdom
+vi.mock('../../../hooks/use-aurora-presence-grades', () => ({ useAuroraPresenceGrades: () => new Map() }));
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { act, fireEvent, render, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { BoardPresenceClimb, BoardPresenceStats, Climb } from '@boardsesh/shared-schema';
-import type { NowOnTheWallPanelProps } from '../NowOnTheWallPanel';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { BoardPresenceClimb, BoardPresenceStats, Climb, UserBoard } from '@boardsesh/shared-schema';
+import type { BoardSheetClimbAction, NowOnTheWallPanelProps } from '../NowOnTheWallPanel';
 import type { DismissAndWaitResult } from '../../../providers/sheet-presentation-provider';
 
 const presence = vi.hoisted(() => ({
@@ -36,6 +50,8 @@ const historyPagination = vi.hoisted(() => ({
   capturedOnPageLoaded: null as ((info: { pageSize: number; returnedCount: number }) => void) | null,
 }));
 
+const cardSurface = vi.hoisted(() => ({ background: '#f2f2f7' }));
+
 type ViewMockProps = { children?: ReactNode; style?: unknown };
 type PressableMockProps = ViewMockProps & {
   onPress?: () => void;
@@ -43,6 +59,7 @@ type PressableMockProps = ViewMockProps & {
 };
 type ListMockProps = {
   data: BoardPresenceClimb[];
+  contentContainerStyle?: { paddingBottom?: number };
   renderItem: (info: { item: BoardPresenceClimb }) => ReactNode;
   ListHeaderComponent?: ReactNode;
   ListEmptyComponent?: ReactNode;
@@ -63,8 +80,10 @@ type ClimbListRowMockProps = {
     setIds?: string;
     angle?: number;
   }) => ReactNode;
+  contentRowStyle?: unknown;
+  liftedMenu?: boolean;
   onPress?: () => void;
-  onAddToQueue?: () => void;
+  onPlayNext?: () => void;
   onOpenPlaylist?: () => void;
   onOpenActions?: () => void;
 };
@@ -78,6 +97,7 @@ vi.mock('../../../lib/graphql/hooks/use-gym-boards', () => ({
 // Self-subscribing (React Query, Reanimated, expo-router); its own suite covers
 // what it draws. Here: where it mounts and what the panel hands it.
 const liveSessionsBlock = vi.hoisted(() => ({ props: [] as Array<Record<string, unknown>> }));
+vi.mock('../WallDisplayEntry', () => ({ WallDisplayEntry: () => null }));
 vi.mock('../../live-sessions/BoardLiveSessionsBlock', () => ({
   BoardLiveSessionsBlock: (props: Record<string, unknown>) => {
     liveSessionsBlock.props.push(props);
@@ -110,8 +130,13 @@ vi.mock('react-native', () => {
     );
 
   return {
-    StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
-    View: ({ children }: ViewMockProps) => createElement('div', null, children),
+    StyleSheet: {
+      flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+      create: (styles: Record<string, unknown>) => styles,
+      hairlineWidth: 1,
+    },
+    View: ({ children, style }: ViewMockProps) =>
+      createElement('div', { 'data-background': flattenStyle(style).backgroundColor }, children),
     Pressable: ({ children, onPress, accessibilityLabel, style }: PressableMockProps) => {
       const flatStyle = flattenStyle(style);
       return createElement(
@@ -137,7 +162,7 @@ vi.mock('@expo/ui/community/bottom-sheet', () => ({
   BottomSheetFlatList: (props: ListMockProps & { refreshControl?: ReactNode }) =>
     createElement(
       'div',
-      { 'data-bottom-sheet-list': 'true' },
+      { 'data-bottom-sheet-list': 'true', 'data-padding-bottom': props.contentContainerStyle?.paddingBottom },
       props.refreshControl,
       props.ListHeaderComponent,
       props.data.length === 0
@@ -153,6 +178,7 @@ vi.mock('react-native-safe-area-context', () => ({
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, opts?: Record<string, unknown>) => (opts ? `${key}:${Object.values(opts).join(',')}` : key),
+    i18n: { resolvedLanguage: 'en-US', language: 'en-US' },
   }),
 }));
 
@@ -233,9 +259,13 @@ vi.mock('../../ClimbListRow', () => ({
     const climbUuid = props.climb?.uuid ?? 'unknown';
     return createElement(
       'div',
-      { 'data-climb-row': climbUuid },
+      {
+        'data-climb-row': climbUuid,
+        'data-background': Object.assign({}, ...[props.contentRowStyle].flat(10).filter(Boolean)).backgroundColor,
+        'data-lifted-menu': String(props.liftedMenu ?? false),
+      },
       createElement('button', { 'aria-label': `press ${climbUuid}`, onClick: props.onPress }, content),
-      createElement('button', { 'aria-label': `queue ${climbUuid}`, onClick: props.onAddToQueue }, 'queue'),
+      createElement('button', { 'aria-label': `queue ${climbUuid}`, onClick: props.onPlayNext }, 'queue'),
       createElement('button', { 'aria-label': `playlist ${climbUuid}`, onClick: props.onOpenPlaylist }, 'playlist'),
       createElement('button', { 'aria-label': `actions ${climbUuid}`, onClick: props.onOpenActions }, 'actions'),
     );
@@ -245,12 +275,13 @@ vi.mock('../../queue-control/AccessoryClimbThumbnail', () => ({
   AccessoryClimbThumbnail: () => createElement('div', { 'data-thumb': 'true' }),
 }));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: {
       label: '#000',
       secondaryLabel: '#666',
       tertiaryLabel: '#999',
-      secondaryBackground: '#f2f2f7',
+      secondaryBackground: cardSurface.background,
       separator: '#ccc',
     },
     brandColors: { warning: '#B45309', primary: '#6D28D9' },
@@ -266,11 +297,45 @@ vi.mock('../../../theme/colors', () => ({
   withAlpha: (color: string, alpha: number) => `${color}|${alpha}`,
 }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 2: 8, 3: 12, 4: 16, 6: 24, 8: 32 },
   borderRadius: { md: 8, lg: 12 },
 }));
 
+// The archived notice's "Switch to the new wall" reads the board over the
+// network and binds it; here it is only asked to exist.
+const openSprayWall = vi.hoisted(() => vi.fn());
+vi.mock('../../../lib/spray/use-open-spray-wall', () => ({ useOpenSprayWall: () => openSprayWall }));
+vi.mock('../../../lib/graphql/use-active-board', () => ({ useSetActiveBoard: () => vi.fn() }));
+vi.mock('../../Button', () => ({
+  Button: ({ title, onPress }: { title: string; onPress?: () => void }) =>
+    createElement('button', { onClick: onPress }, title),
+}));
 import { NowOnTheWallPanel } from '../NowOnTheWallPanel';
+import { publishWindowInsetBottom, resetWindowInsetForTests } from '../../../lib/window-inset-store';
+import {
+  clearSprayWallRegistry,
+  LIVE_SPRAY_WALL_ARCHIVE_STATE,
+  registerSprayWall,
+  type SprayWallArchiveState,
+} from '../../../lib/spray/spray-wall-registry';
+
+/** Register a spray wall in the real registry, so the sheet knows whether it is archived. */
+function registerSprayWallFixture(layoutId: number, wallUuid: string, archive: Partial<SprayWallArchiveState> = {}) {
+  registerSprayWall(layoutId, {
+    wallUuid,
+    angle: 40,
+    version: 1,
+    versionId: 1,
+    photoWidth: 100,
+    photoHeight: 100,
+    photoUrl: 'https://example.invalid/wall.jpg',
+    photoThumbUrl: null,
+    photoExpiresAt: '2099-01-01T00:00:00.000Z',
+    holds: [],
+    archive: { ...LIVE_SPRAY_WALL_ARCHIVE_STATE, ...archive },
+  });
+}
 
 const noop = () => {};
 const boardConfig = { boardName: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2', angle: 40 };
@@ -330,17 +395,165 @@ function panelElement(overrides: Partial<NowOnTheWallPanelProps> = {}) {
 
 describe('NowOnTheWallPanel', () => {
   beforeEach(() => {
+    cardSurface.background = '#f2f2f7';
     presence.currentClimb = null;
     presence.holder = null;
     presence.history = [];
     presence.stats = null;
     safeArea.insets = { top: 0, bottom: 0, left: 0, right: 0 };
+    resetWindowInsetForTests();
     graphql.request.mockReset();
     toast.showToast.mockClear();
     pressableAvatar.mockClear();
     presence.refresh.mockClear();
     // mockReset, not mockClear: the tap-ordering test installs an implementation.
     analytics.track.mockReset();
+  });
+
+  it.each([
+    ['sheet', '#f2f2f7'],
+    ['sheet', '#2c2c2e'],
+    ['column', '#f2f2f7'],
+    ['column', '#2c2c2e'],
+  ] as const)('matches the %s current-climb card to the stat tiles on %s', (variant, background) => {
+    cardSurface.background = background;
+    presence.currentClimb = makeClimb('hero', 3);
+    presence.stats = { climbsSentCount: 7, distinctClimbersCount: 2 };
+    const { getByText, container, rerender } = render(panelElement({ variant }));
+    const tileBackground = () => getByText('7').closest('[data-background]')?.getAttribute('data-background');
+    expect(tileBackground()).toBe(background);
+    expect(getByText('Climb hero').closest('[data-background]')?.getAttribute('data-background')).toBe(
+      tileBackground(),
+    );
+
+    rerender(panelElement({ variant, onClimbPress: vi.fn() }));
+    const interactiveHero = container.querySelector('[data-climb-row="hero"]');
+    expect(interactiveHero?.getAttribute('data-background')).toBe(tileBackground());
+    expect(interactiveHero?.getAttribute('data-lifted-menu')).toBe('true');
+  });
+
+  const sprayWall: UserBoard = {
+    uuid: 'spray-wall-1',
+    slug: 'garage',
+    name: 'Garage',
+    ownerId: 'owner-1',
+    boardType: 'spray',
+    layoutId: 12,
+    sizeId: 12,
+    setIds: '12',
+    angle: 30,
+    canEdit: true,
+    isPublic: true,
+    isUnlisted: false,
+    isOwned: true,
+    isFollowedByMe: true,
+    hideLocation: false,
+    isAngleAdjustable: false,
+    createdAt: '2026-01-01',
+    totalAscents: 0,
+    uniqueClimbers: 0,
+    followerCount: 0,
+    commentCount: 0,
+  };
+
+  it('mounts all wall actions in the live sheet and forwards the active wall identity', () => {
+    clearSprayWallRegistry();
+    registerSprayWallFixture(sprayWall.layoutId, sprayWall.uuid);
+    const onOpenSprayMaintenance = vi.fn();
+    const onShareSprayWall = vi.fn();
+    const { getByLabelText } = render(
+      panelElement({ activeBoard: sprayWall, onOpenSprayMaintenance, onShareSprayWall, viewerUserId: 'owner-1' }),
+    );
+    fireEvent.click(getByLabelText('mobile.boardDetail.spray.editHolds'));
+    fireEvent.click(getByLabelText('mobile.boardDetail.spray.resetWall'));
+    fireEvent.click(getByLabelText('mobile.boardDetail.spray.shareLink'));
+    expect(onOpenSprayMaintenance.mock.calls).toEqual([
+      [sprayWall.uuid, 'editHolds'],
+      [sprayWall.uuid, 'resetWall'],
+    ]);
+    expect(onShareSprayWall).toHaveBeenCalledExactlyOnceWith(sprayWall.uuid);
+  });
+
+  it('keeps public sharing for viewers and hides maintenance on the kiosk and catalogue boards', () => {
+    clearSprayWallRegistry();
+    registerSprayWallFixture(sprayWall.layoutId, sprayWall.uuid);
+    const callbacks = { onOpenSprayMaintenance: vi.fn(), onShareSprayWall: vi.fn() };
+    const { queryByLabelText, rerender } = render(
+      panelElement({ activeBoard: { ...sprayWall, canEdit: false }, viewerUserId: 'someone', ...callbacks }),
+    );
+    expect(queryByLabelText('mobile.boardDetail.spray.editHolds')).toBeNull();
+    expect(queryByLabelText('mobile.boardDetail.spray.resetWall')).toBeNull();
+    expect(queryByLabelText('mobile.boardDetail.spray.shareLink')).not.toBeNull();
+    rerender(panelElement({ activeBoard: sprayWall, variant: 'column', viewerUserId: 'owner-1', ...callbacks }));
+    expect(queryByLabelText('mobile.boardDetail.spray.shareLink')).toBeNull();
+    expect(queryByLabelText('mobile.boardDetail.spray.editHolds')).toBeNull();
+    rerender(
+      panelElement({ activeBoard: { ...sprayWall, boardType: 'kilter' }, viewerUserId: 'owner-1', ...callbacks }),
+    );
+    expect(queryByLabelText('mobile.boardDetail.spray.shareLink')).toBeNull();
+    expect(queryByLabelText('mobile.boardDetail.spray.resetWall')).toBeNull();
+  });
+
+  // Holds stay editable on a live wall, published climbs or not: the owner
+  // gets Edit holds and Reset, an editor who is not the owner Edit holds alone.
+  it('keeps Edit holds on a live wall for the owner and for an editor', () => {
+    clearSprayWallRegistry();
+    registerSprayWallFixture(sprayWall.layoutId, sprayWall.uuid, {});
+    const onOpenSprayMaintenance = vi.fn();
+    const { getByLabelText, queryByLabelText, rerender } = render(
+      panelElement({ activeBoard: sprayWall, onOpenSprayMaintenance, viewerUserId: 'owner-1' }),
+    );
+    fireEvent.click(getByLabelText('mobile.boardDetail.spray.editHolds'));
+    expect(onOpenSprayMaintenance).toHaveBeenCalledExactlyOnceWith(sprayWall.uuid, 'editHolds');
+    expect(getByLabelText('mobile.boardDetail.spray.resetWall')).toBeTruthy();
+
+    rerender(panelElement({ activeBoard: sprayWall, onOpenSprayMaintenance, viewerUserId: 'gym-admin' }));
+    expect(getByLabelText('mobile.boardDetail.spray.editHolds')).toBeTruthy();
+    expect(queryByLabelText('mobile.boardDetail.spray.resetWall')).toBeNull();
+  });
+
+  // Only the owner can still see a wall an admin hid after a report; a wall
+  // that quietly vanished for everyone else would read as data loss.
+  it('tells the owner, and only the owner, that their wall is hidden', () => {
+    clearSprayWallRegistry();
+    registerSprayWall(sprayWall.layoutId, {
+      wallUuid: sprayWall.uuid,
+      angle: 40,
+      version: 1,
+      versionId: 1,
+      photoWidth: 100,
+      photoHeight: 100,
+      photoUrl: 'https://example.invalid/wall.jpg',
+      photoThumbUrl: null,
+      photoExpiresAt: '2099-01-01T00:00:00.000Z',
+      holds: [],
+      hiddenAt: '2026-10-02T09:00:00.000Z',
+    });
+    const { getByText, queryByText, rerender } = render(
+      panelElement({ activeBoard: sprayWall, onOpenSprayMaintenance: vi.fn(), viewerUserId: 'owner-1' }),
+    );
+    expect(getByText('sprayHidden.title')).toBeTruthy();
+    expect(getByText('sprayHidden.body')).toBeTruthy();
+    rerender(panelElement({ activeBoard: sprayWall, onOpenSprayMaintenance: vi.fn(), viewerUserId: 'gym-admin' }));
+    expect(queryByText('sprayHidden.title')).toBeNull();
+  });
+
+  // An archived wall keeps its climbs: the sheet says so, offers the wall that
+  // replaced it, and drops every maintenance row.
+  it('shows the archived notice and no maintenance on an archived wall', () => {
+    clearSprayWallRegistry();
+    registerSprayWallFixture(sprayWall.layoutId, sprayWall.uuid, {
+      archivedAt: '2026-10-01T09:00:00.000Z',
+      replacedByWallUuid: 'new-wall',
+    });
+    const { getByText, queryByLabelText } = render(
+      panelElement({ activeBoard: sprayWall, onOpenSprayMaintenance: vi.fn(), viewerUserId: 'owner-1' }),
+    );
+    expect(getByText(/^sprayArchive\.banner:/)).toBeTruthy();
+    fireEvent.click(getByText('sprayArchive.switchToNew'));
+    expect(openSprayWall).toHaveBeenCalledExactlyOnceWith('new-wall');
+    expect(queryByLabelText('mobile.boardDetail.spray.editHolds')).toBeNull();
+    expect(queryByLabelText('mobile.boardDetail.spray.resetWall')).toBeNull();
   });
 
   it('mounts the live-sessions block in the sheet with the board id and whoever holds the board now', () => {
@@ -386,19 +599,31 @@ describe('NowOnTheWallPanel', () => {
     expect(container.querySelector('[data-live-sessions-block]')).toBeNull();
   });
 
-  it('adds the bottom safe-area inset to the switch-board footer in both sheet and inline variants', () => {
-    // The native sheet does not pad its content for the Android edge-to-edge
-    // navigation bar, so the footer adds insets.bottom (34) + spacing[3] (12)
-    // itself in every variant — otherwise the switch-board button sits under the
-    // 3-button nav bar (the reported bug).
+  it('gives the sheet footer space to history while retaining the inline switch-board action', () => {
     safeArea.insets = { top: 0, bottom: 34, left: 0, right: 0 };
-    const { getByLabelText, rerender } = render(panelElement({ variant: 'sheet' }));
+    const { queryByLabelText, getByLabelText, rerender } = render(panelElement({ variant: 'sheet' }));
 
-    expect(getByLabelText('mobile.boardPresence.switchBoardAria').getAttribute('data-padding-bottom')).toBe('46');
+    expect(queryByLabelText('mobile.boardPresence.switchBoardAria')).toBeNull();
 
     rerender(panelElement({ variant: 'column' }));
 
     expect(getByLabelText('mobile.boardPresence.switchBoardAria').getAttribute('data-padding-bottom')).toBe('46');
+  });
+
+  it('pads the history list by the WINDOW inset without adding the tab bar (#3776)', () => {
+    // Mounted inside a NativeTabs tab, the local inset is 139 (34 home indicator
+    // + 49 bar + 56 accessory, DEVICE_VERIFIED iPhone 17 Pro). The sheet covers
+    // that chrome, so the last history row clears only the window's 34 + spacing[4].
+    safeArea.insets = { top: 0, bottom: 139, left: 0, right: 0 };
+    act(() => publishWindowInsetBottom(34));
+    const { container, getByLabelText, rerender } = render(panelElement({ variant: 'sheet' }));
+
+    expect(container.querySelector('[data-bottom-sheet-list]')?.getAttribute('data-padding-bottom')).toBe('50');
+
+    // The inline column is not a sheet: it keeps the inset of the surface it sits in.
+    rerender(panelElement({ variant: 'column' }));
+
+    expect(getByLabelText('mobile.boardPresence.switchBoardAria').getAttribute('data-padding-bottom')).toBe('151');
   });
 
   // The point of this event is to be provable evidence that the tap reached JS.
@@ -410,11 +635,54 @@ describe('NowOnTheWallPanel', () => {
     analytics.track.mockImplementation((event: string) => callOrder.push(`track:${event}`));
     const onSwitchBoard = vi.fn(() => callOrder.push('onSwitchBoard'));
 
-    const { getByLabelText } = render(panelElement({ onSwitchBoard }));
+    const { getByLabelText } = render(panelElement({ variant: 'column', onSwitchBoard }));
     fireEvent.click(getByLabelText('mobile.boardPresence.switchBoardAria'));
 
     expect(callOrder).toEqual(['track:Board Swap Tapped', 'onSwitchBoard']);
     expect(analytics.track).toHaveBeenCalledWith('Board Swap Tapped', expect.objectContaining({ historyCount: 2 }));
+  });
+
+  it('drops an Aurora action when the physical wall changes with identical geometry', async () => {
+    presence.currentClimb = makeClimb('aurora-climb', 3, { source: 'aurora', angle: null, grade: null });
+    const onPlayNext = vi.fn();
+    const climbRequest = createDeferred<{ climb: Climb | null }>();
+    graphql.request.mockReturnValueOnce(climbRequest.promise);
+    presenceControls.boardId = 123;
+    const { getByLabelText, rerender } = render(panelElement({ onPlayNext }));
+    fireEvent.click(getByLabelText('queue aurora-climb'));
+    presenceControls.boardId = 456;
+    rerender(panelElement({ onPlayNext, boardLabel: 'Other physical wall' }));
+    await act(async () => {
+      climbRequest.resolve({ climb: makeFullClimb('aurora-climb') });
+      await climbRequest.promise;
+    });
+    expect(onPlayNext).not.toHaveBeenCalled();
+    presenceControls.boardId = 123;
+  });
+
+  it('reads the imported climb’s own queue orientation on each action, including cached actions', async () => {
+    const imported = makeClimb('aurora-climb', 3, { source: 'aurora', angle: null, grade: null, mirrored: null });
+    presence.currentClimb = imported;
+    const catalog = makeFullClimb('aurora-climb', { mirrored: false });
+    graphql.request.mockResolvedValue({ climb: catalog });
+    const onPlayNext = vi.fn();
+    const mirroredClimbs = new Set(['aurora-climb', 'different-climb']);
+    const { getByLabelText } = render(panelElement({ onPlayNext, getClimbMirror: (uuid) => mirroredClimbs.has(uuid) }));
+    fireEvent.click(getByLabelText('queue aurora-climb'));
+    await waitFor(() =>
+      expect(onPlayNext).toHaveBeenLastCalledWith(
+        expect.objectContaining({ climb: expect.objectContaining({ mirrored: true }) }),
+      ),
+    );
+    mirroredClimbs.delete('aurora-climb');
+    fireEvent.click(getByLabelText('queue aurora-climb'));
+    await waitFor(() =>
+      expect(onPlayNext).toHaveBeenLastCalledWith(
+        expect.objectContaining({ climb: expect.objectContaining({ mirrored: false }) }),
+      ),
+    );
+    expect(catalog.mirrored).toBe(false);
+    expect(imported).toMatchObject({ angle: null, mirrored: null, grade: null });
   });
 
   it('drops in-flight action results and clears loading when the board config changes', async () => {
@@ -444,15 +712,15 @@ describe('NowOnTheWallPanel', () => {
     presence.currentClimb = makeClimb('hero-climb', 3, { queueItemUuid: 'queue-hero' });
     const onClose = vi.fn();
     const onClimbPress = vi.fn();
-    const onAddToQueue = vi.fn();
+    const onPlayNext = vi.fn();
     const heroDetail = makeFullClimb('hero-climb', { name: 'Hydrated Hero' });
     graphql.request.mockResolvedValueOnce({ climb: heroDetail });
 
-    const { getByLabelText } = render(panelElement({ onClose, onClimbPress, onAddToQueue }));
+    const { getByLabelText } = render(panelElement({ onClose, onClimbPress, onPlayNext }));
 
     fireEvent.click(getByLabelText('queue hero-climb'));
     await waitFor(() =>
-      expect(onAddToQueue).toHaveBeenCalledWith({
+      expect(onPlayNext).toHaveBeenCalledWith({
         climb: heroDetail,
         queueItemUuid: 'queue-hero',
         boardConfig,
@@ -462,14 +730,57 @@ describe('NowOnTheWallPanel', () => {
 
     fireEvent.click(getByLabelText('press hero-climb'));
     await waitFor(() =>
-      expect(onClimbPress).toHaveBeenCalledWith({
-        climb: heroDetail,
-        queueItemUuid: 'queue-hero',
-        boardConfig,
-      }),
+      expect(onClimbPress).toHaveBeenCalledWith(
+        expect.objectContaining({
+          climb: heroDetail,
+          queueItemUuid: 'queue-hero',
+          boardConfig,
+        }),
+      ),
     );
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(graphql.request).toHaveBeenCalledTimes(1);
+  });
+
+  // Issue #6665: a wall-history row plays from the wall's history.
+  it("hands a row tap the wall's history as its track, the wall's climb first", async () => {
+    presence.currentClimb = makeClimb('hero-climb', 3, { queueItemUuid: 'queue-hero', frames: 'p1r12' });
+    presence.history = [
+      makeClimb('older-a', 2, { frames: 'p2r12', angle: 35 }),
+      makeClimb('hero-climb', 1, { frames: 'p1r12' }),
+      makeClimb('no-frames', 0),
+    ];
+    const onClimbPress = vi.fn();
+    graphql.request.mockResolvedValue({ climb: makeFullClimb('older-a') });
+
+    const { getByLabelText } = render(panelElement({ onClimbPress }));
+    fireEvent.click(getByLabelText('press older-a'));
+
+    await waitFor(() => expect(onClimbPress).toHaveBeenCalledTimes(1));
+    const action = onClimbPress.mock.calls[0][0] as BoardSheetClimbAction;
+    expect(action.isWallClimb).toBe(false);
+    expect(action.track).toMatchObject({
+      activatedClimbUuid: 'older-a',
+      boardKey: 'kilter:1:10:1,2',
+      label: 'playView.track.wallHistory',
+    });
+    // One entry per climb, nothing without frames, each at the angle it was lit.
+    expect(action.track?.climbs.map(({ uuid, angle }) => [uuid, angle])).toEqual([
+      ['hero-climb', 40],
+      ['older-a', 35],
+    ]);
+  });
+
+  it("marks a tap on the wall's own climb as the lit one", async () => {
+    presence.currentClimb = makeClimb('hero-climb', 3, { queueItemUuid: 'queue-hero', frames: 'p1r12' });
+    const onClimbPress = vi.fn();
+    graphql.request.mockResolvedValueOnce({ climb: makeFullClimb('hero-climb') });
+
+    const { getByLabelText } = render(panelElement({ onClimbPress }));
+    fireEvent.click(getByLabelText('press hero-climb'));
+
+    await waitFor(() => expect(onClimbPress).toHaveBeenCalledTimes(1));
+    expect(onClimbPress.mock.calls[0][0]).toMatchObject({ isWallClimb: true });
   });
 
   it('keeps the hardest-send avatar linked to the climber profile', () => {
@@ -501,6 +812,74 @@ describe('NowOnTheWallPanel', () => {
         size: 34,
       }),
     );
+  });
+
+  // A large slice of the durable wall log was sent by accounts with no
+  // `users.name` and no profile (Apple private-relay signups), which used to
+  // drop the whole avatar-plus-name block and made those rows look empty.
+  it('still attributes a history row whose climber has no display name', () => {
+    presence.history = [makeClimb('nameless-1', 4, { sentByUserId: 'user-nameless', sentByDisplayName: null })];
+
+    const { container } = render(panelElement());
+
+    expect(container.textContent).toContain('mobile.boardPresence.unnamedClimber');
+  });
+
+  it('shows nothing where there is no climber at all', () => {
+    presence.history = [makeClimb('anon-1', 5, { sentByUserId: null, sentByDisplayName: null })];
+
+    const { container } = render(panelElement());
+
+    expect(container.textContent).not.toContain('mobile.boardPresence.unnamedClimber');
+  });
+});
+
+// Kilter imports only land while a linked viewer has the app open, so the
+// history is a set of snapshots with gaps. Each row says when it was on the
+// wall, once, so "on the wall now" reads apart from "displayed last night" (#6012).
+describe('NowOnTheWallPanel history row times', () => {
+  beforeEach(() => {
+    // Date only: the panel's promises and waitFor keep their real timers.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-08T08:40:00.000Z'));
+    presence.currentClimb = null;
+    presence.holder = null;
+    presence.stats = null;
+    presence.history = [
+      makeClimb('kilter-import', 3, {
+        source: 'kilter',
+        sentAt: '2026-10-07T21:40:00.000Z',
+        sentByDisplayName: 'siqo mode',
+      }),
+      makeClimb('native-sent', 2, { sentAt: '2026-10-08T08:38:00.000Z', sentByDisplayName: 'Marco' }),
+      makeClimb('no-sender', 1, { sentAt: '2026-10-06T08:40:00.000Z', sentByDisplayName: null }),
+    ];
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function spanTexts(container: HTMLElement): string[] {
+    return Array.from(container.querySelectorAll('span'), (span) => span.textContent ?? '');
+  }
+
+  it.each([
+    ['plain rows', {}],
+    ['interactive rows', { onClimbPress: noop }],
+  ])('puts the time on the first caption line of each row (%s)', (_label, overrides) => {
+    const { container } = render(panelElement(overrides));
+    const texts = spanTexts(container);
+
+    // Kilter import: on the source line, not again beside the sender.
+    expect(texts).toContain('mobile.boardPresence.kilterHistorySource · 11 hours ago');
+    expect(texts).toContain('siqo mode');
+    expect(texts.filter((text) => text.includes('11 hours ago'))).toHaveLength(1);
+    // Native send: beside the sender, in its own span so the name truncates first.
+    expect(texts).toContain('Marco');
+    expect(texts).toContain('· 2 minutes ago');
+    // Nobody attributed: the time stands on its own line.
+    expect(texts).toContain('2 days ago');
   });
 });
 

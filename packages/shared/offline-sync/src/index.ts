@@ -9,7 +9,7 @@
 // onCycleError). Apps bind these once in an adapter — mobile's lives at
 // packages/mobile/src/offline/offline-sync-adapter.ts.
 //
-// The client half of docs/sync-table-manifest.md lives here: the SQLite DDL
+// The client half of docs/data/sync-table-manifest.md lives here: the SQLite DDL
 // (db/schema.ts), the per-table sync config (sync/table-config.ts), and the
 // pull client that enforces them must agree with the backend resolvers to the
 // character.
@@ -21,14 +21,33 @@
 // requests.
 
 // --- Seams -------------------------------------------------------------------
+export type {
+  ScopeDownloadContext,
+  ScopeDownloadLifecycleEvent,
+  ScopeDownloadLifecycleReporter,
+} from './sync/download-lifecycle';
+export {
+  SnapshotTransferError,
+  classifySnapshotTransferFailure,
+  isSnapshotBackgroundDecodeError,
+} from './sync/snapshot-transfer-failure';
+export type { SnapshotTransferFailure, SnapshotTransferFailureReason } from './sync/snapshot-transfer-failure';
 export type { SqlValue, SqlRunResult, SqlExecutor, OfflineDatabase, QueryInvalidator } from './database';
 export type { SyncCursorInput, SyncCursor, SyncResult, SyncDeletionRecord, SyncDeletionsResult } from './types';
 
 // --- Mutation outbox (offline writes) ------------------------------------------
 export {
   enqueue,
+  climbMutationEntityKey,
+  getLatestClimbMutationKey,
+  hasPendingClimbWritesForScope,
   peekPending,
   getPendingCount,
+  hasPendingTickForClimb,
+  hasPendingTicksForSession,
+  countPendingSessionWrites,
+  supersedePendingSessionWorkouts,
+  isMutationPending,
   getDeadLetterCount,
   getDeadLetters,
   getOutboxSummary,
@@ -36,7 +55,13 @@ export {
   discardDeadLetter,
   clearAll,
 } from './mutation-queue/queue';
-export type { PendingMutation, EnqueueResult, EnqueueOptions, OutboxSummary } from './mutation-queue/queue';
+export type {
+  PendingMutation,
+  PendingSessionWrites,
+  EnqueueResult,
+  EnqueueOptions,
+  OutboxSummary,
+} from './mutation-queue/queue';
 export { parseQueueTimestamp, queueTimestampAgeDays } from './mutation-queue/queue-timestamps';
 export {
   drainMutationQueue,
@@ -58,6 +83,7 @@ export {
 export type {
   PurgeToken,
   DrainOptions,
+  OutboxOwnerRefusal,
   MutationDeliveryEvent,
   MutationStatusListenerFailure,
   MutationDeadLetterInfo,
@@ -113,6 +139,8 @@ export type {
   ScopeDownloadCompleteReporter,
   ScopeDownloadStartInfo,
   ScopeDownloadStartReporter,
+  ScopeDownloadObservedInfo,
+  ScopeDownloadObservedReporter,
   ScopeDownloadPhaseBreakdown,
   CoverageResetInfo,
   CoverageResetReporter,
@@ -134,12 +162,14 @@ export type {
 export {
   ensureHoldIndex,
   isHoldIndexBehind,
+  readHoldIndexGeneration,
   holdIndexKey,
   HOLD_INDEX_KEY_PREFIX,
   HOLD_INDEX_CHUNK_CLIMBS,
   HOLD_INDEX_INITIAL_CHUNK_CLIMBS,
   HOLD_INDEX_GENERATION_PREFIX,
   clearBoardTypeHoldIndex,
+  clearLayoutHoldIndex,
 } from './holds-index/hold-index';
 export type { HoldRow, HoldRowParser, EnsureHoldIndexOptions, EnsureHoldIndexResult } from './holds-index/hold-index';
 export {
@@ -149,6 +179,7 @@ export {
   holdStateToRole,
   encodeHoldSet,
   decodeHoldSet,
+  decodeSqliteBlobHex,
   decodeHoldSetIds,
   holdSetSize,
   encodePostings,
@@ -189,6 +220,7 @@ export type {
   SnapshotSource,
   SnapshotArtifactHandle,
   SnapshotDownloadOptions,
+  DownloadRequestCorrelation,
   SnapshotDownloadProgress,
   SnapshotBootstrapResult,
   SnapshotImportBatchProgress,
@@ -196,6 +228,8 @@ export type {
   SnapshotBootstrapErrorReporter,
   BootstrapScopeMetadata,
 } from './sync/snapshot-bootstrap';
+export { createScopeDownloadProgress, DOWNLOAD_PHASE_WEIGHTS } from './sync/download-progress';
+export type { ScopeDownloadPhase, ScopeDownloadProgress } from './sync/download-progress';
 export { classifySnapshotBootstrapFailure } from './sync/bootstrap-failure-reason';
 export type { SnapshotBootstrapFailureReason } from './sync/bootstrap-failure-reason';
 
@@ -259,6 +293,7 @@ export {
   stampLocalUserId,
   clearLocalUserId,
   assertLocalUserDataOwner,
+  isLocalDataStampedFor,
   markUserDataComplete,
   isUserDataComplete,
   canServeLocalUserData,
@@ -320,9 +355,12 @@ export {
   ARTIFACT_SCHEMA_VERSION,
   ARTIFACT_TABLES,
   artifactSchemaVersion,
+  classifySchemaVersion,
+  readSchemaCompatibility,
+  SchemaNewerThanAppError,
 } from './db/migrations';
 export { SnapshotSchemaCompatibilityError, type SchemaDriftReport } from './sync/schema-compatibility';
-export type { Migration } from './db/migrations';
+export type { Migration, SchemaCompatibility } from './db/migrations';
 export {
   OFFLINE_DB_BUSY_TIMEOUT_MS,
   OFFLINE_DB_FOREGROUND_WRITE_TIMEOUT_MS,
@@ -338,8 +376,19 @@ export {
 // Silent when the first attempt succeeds, so `onSettled` fires only on a
 // contended write; a terminal failure rethrows the ORIGINAL error object, which
 // keeps Sentry grouping and lock classification unchanged.
-export { runLocalWriteWithRetry, OFFLINE_LOCAL_WRITE_BUDGET_MS } from './db/write-retry';
+export {
+  runLocalWriteWithRetry,
+  OFFLINE_LOCAL_WRITE_BUDGET_MS,
+  OFFLINE_BACKGROUND_WRITE_MAX_ATTEMPTS,
+  OFFLINE_BACKGROUND_WRITE_RETRY_DELAY_MS,
+  OFFLINE_BACKGROUND_WRITE_BUDGET_MS,
+} from './db/write-retry';
 export type { LocalWriteRetryOptions, LocalWriteRetryOutcome } from './db/write-retry';
+// The background ladder's telemetry (issue #5851): the platform registers one
+// sink for contended background writes, and reads the losing write's site off a
+// lock error that escaped a sync cycle.
+export { setPullWriteSettledReporter, getSqliteWriteSite } from './sync/pull-write';
+export type { PullWriteOutcome, PullWriteSettledReport, PullWriteSizing } from './sync/pull-write';
 // One predicate for "was this write-lock contention?", so reporting (#4329) and
 // the sqlite-init retry loop (#4314) can never disagree about which failures
 // count. `classifySqliteLockError` is the same verdict plus the SQLite result
@@ -360,6 +409,16 @@ export type { SqliteHandleFailure } from './db/handle-errors';
 // runtime deps and never imports an analytics client — mobile binds it in
 // packages/mobile/src/offline/offline-usage-signal.ts.
 export { createOfflineUsageSignal } from './telemetry/offline-usage-signal';
+export { createDownloadRequestTracker } from './telemetry/download-request-tracker';
+export type {
+  DownloadRequestContext,
+  DownloadRequestEvent,
+  DownloadRequestLedger,
+  DownloadRequestOutcome,
+  DownloadRequestState,
+  DownloadRequestTracker,
+  DownloadRequestTrackerOptions,
+} from './telemetry/download-request-tracker';
 export type {
   OfflineConnectivityReason,
   OfflineReadLane,
@@ -380,3 +439,22 @@ export {
   purgeNamespaceForScopeKey,
 } from './offline-board-key';
 export type { OfflineBoardScope, OfflineBoardLike } from './offline-board-key';
+
+export { mirrorSavedClimb } from './sync/saved-climb-mirror';
+export { removeDeletedClimbLocally } from './sync/deleted-climb-local';
+
+// --- Durable write-delivery evidence (private first-party receipts) ------------
+export {
+  ensureOfflineWriteDeliveryJournal,
+  readOfflineWriteObservations,
+  acknowledgeOfflineWriteObservations,
+  touchOfflineWriteObservations,
+  readOfflineWriteReconciliationCandidates,
+  reconcileOfflineWrite,
+  observeOfflineWriteServerResponse,
+  markOfflineWritesSuperseded,
+} from './mutation-queue/delivery-journal';
+export type {
+  OfflineWriteEnqueueContext,
+  OfflineWriteReconciliationCandidate,
+} from './mutation-queue/delivery-journal';

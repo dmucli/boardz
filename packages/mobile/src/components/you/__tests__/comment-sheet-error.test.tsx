@@ -1,4 +1,22 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleBottomSheetTextInput', async () => {
+  const { BottomSheetTextInput } = await import('@expo/ui/community/bottom-sheet');
+  return { AccessibleBottomSheetTextInput: BottomSheetTextInput };
+});
+vi.mock('../../../lib/announce-queued', () => ({ announceQueued: vi.fn() }));
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -22,6 +40,7 @@ vi.mock('../../../lib/graphql/hooks', () => ({
 }));
 vi.mock('../../../providers/toast-provider', () => ({ useToast: () => toast }));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: { fill: '#eee', label: '#000', tertiaryLabel: '#999' },
     brandColors: { primary: '#6D28D9' },
@@ -35,17 +54,28 @@ vi.mock('@boardsesh/profile-stats', () => ({ formatTickRelativeTime: () => 'now'
 
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   Pressable: ({ children, onPress, disabled }: { children?: ReactNode; onPress?: () => void; disabled?: boolean }) =>
     createElement('button', { onClick: onPress, disabled, 'data-testid': 'send' }, children),
-  StyleSheet: { create: (styles: unknown) => styles },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+  },
 }));
 
-// Sheet renders its children + footer so the composer is interactable.
+// Sheet renders its children + footer so the composer is interactable, and a
+// close control standing in for the swipe-down.
 vi.mock('../../Sheet', () => ({
-  Sheet: ({ children, footer }: { children?: ReactNode; footer?: ReactNode }) =>
-    createElement('div', null, children, footer),
+  Sheet: ({ children, footer, onClose }: { children?: ReactNode; footer?: ReactNode; onClose?: () => void }) =>
+    createElement(
+      'div',
+      null,
+      children,
+      footer,
+      createElement('button', { 'data-testid': 'close-sheet', onClick: onClose }),
+    ),
 }));
 vi.mock('@expo/ui/community/bottom-sheet', () => ({
   BottomSheetTextInput: ({
@@ -78,6 +108,28 @@ function renderSheet() {
   return render(<CommentSheet sheetRef={sheetRef} entityId="entity-1" entityType="session" onClose={() => {}} />);
 }
 
+describe('CommentSheet draft across close and reopen', () => {
+  // SessionsTab clears the comment target on close and sets it again on reopen;
+  // the sheet stays mounted, so a half-typed comment is still there (#7596 A4,
+  // the revert of #7554, which dropped it on every close).
+  it('keeps a typed draft when the sheet closes and reopens on the same session', () => {
+    const sheetRef = { current: null };
+    const onClose = vi.fn();
+    const sheetFor = (entityId: string | null) => (
+      <CommentSheet sheetRef={sheetRef} entityId={entityId} entityType="session" onClose={onClose} />
+    );
+    const { getByTestId, rerender } = render(sheetFor('entity-1'));
+    fireEvent.change(getByTestId('comment-input'), { target: { value: 'half a thought' } });
+
+    fireEvent.click(getByTestId('close-sheet'));
+    expect(onClose).toHaveBeenCalledOnce();
+    rerender(sheetFor(null));
+    rerender(sheetFor('entity-1'));
+
+    expect((getByTestId('comment-input') as HTMLInputElement).value).toBe('half a thought');
+  });
+});
+
 describe('CommentSheet submit error handling', () => {
   beforeEach(() => {
     addComment.mutate.mockReset();
@@ -100,7 +152,7 @@ describe('CommentSheet submit error handling', () => {
     expect(toast.showToast).not.toHaveBeenCalled();
   });
 
-  it('keeps the draft and shows an error toast when posting fails', () => {
+  it('keeps the draft and shows a persistent inline error when posting fails', () => {
     addComment.mutate.mockImplementation((_input: unknown, options: MutateOptions) => {
       options.onError?.(new Error('network down'));
     });
@@ -113,6 +165,37 @@ describe('CommentSheet submit error handling', () => {
     expect(addComment.mutate).toHaveBeenCalledOnce();
     // Draft must survive so the user's text isn't silently lost.
     expect(input.value).toBe('nice send');
-    expect(toast.showToast).toHaveBeenCalledWith('mobile.comments.sendError', 'error');
+    expect(document.body.textContent).toContain('mobile.comments.sendError');
+    expect(toast.showToast).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: 'nice send again' } });
+    expect(document.body.textContent).not.toContain('mobile.comments.sendError');
   });
 });
+
+// This suite exercises the existing flow before the server privacy rollout.
+vi.mock('../../../lib/graphql/hooks/use-privacy', () => ({ usePrivacySettings: () => ({ data: undefined }) }));
+vi.mock('../../privacy/PublicationAudiencePicker', () => ({
+  PublicationAudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/ContentAudienceControl', () => ({
+  ContentAudienceControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/ResourcePrivacyControl', () => ({
+  ResourcePrivacyControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/AudiencePicker', () => ({
+  AudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/use-publication-audience', () => ({
+  usePublicationAudience: () => ({
+    enabled: false,
+    isPrivate: false,
+    audience: 'public',
+    publication: undefined,
+    chooseAudience: () => {},
+  }),
+}));

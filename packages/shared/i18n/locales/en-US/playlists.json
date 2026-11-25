@@ -11,7 +11,15 @@
       "privateDescription": "This playlist is private.",
       "generatedDescription_one": "{{count}} {{board}} climb in {{name}}. Open the playlist in Boardsesh and climb it.",
       "generatedDescription_other": "{{count}} {{board}} climbs in {{name}}. Open the playlist in Boardsesh and climb them.",
-      "ogAlt": "The {{name}} playlist on Boardsesh"
+      "ogAlt": "The {{name}} playlist on Boardsesh",
+      "ogTitle": "{{name}} · {{board}} list",
+      "ogTitleWithBand": "{{name}} · {{band}} {{board}} list",
+      "ogDescriptionRange_one": "{{count}} {{board}} climb from {{low}} to {{high}}. Get on the wall.",
+      "ogDescriptionRange_other": "{{count}} {{board}} climbs from {{low}} to {{high}}. Pick one and get on the wall.",
+      "ogDescriptionOneGrade_one": "{{count}} {{board}} climb at {{grade}}. Get on the wall.",
+      "ogDescriptionOneGrade_other": "{{count}} {{board}} climbs at {{grade}}. Pick one and get on the wall.",
+      "ogDescriptionNoBand_one": "{{count}} {{board}} climb. Get on the wall.",
+      "ogDescriptionNoBand_other": "{{count}} {{board}} climbs. Pick one and get on the wall."
     }
   },
   "library": {
@@ -26,6 +34,7 @@
       "community": "Community Playlists"
     },
     "communityByline": "{{creatorName}} - {{climbCount}}",
+    "gradeBand": "Grades {{band}}",
     "allPlaylists": {
       "title": "My Playlists",
       "seeAll": "See all",
@@ -33,6 +42,55 @@
       "clearSearch": "Clear search",
       "loadMoreError": "Couldn't load all your playlists.",
       "noResults": "No playlists match \"{{query}}\""
+    },
+    "community": {
+      "searchPlaceholder": "Search playlists",
+      "madeByLabel": "Made by",
+      "madeBy": {
+        "everyone": "Everyone",
+        "mine": "Mine",
+        "following": "Following"
+      },
+      "sortLabel": "Sort",
+      "sort": {
+        "popular": "Popular",
+        "recent": "New"
+      },
+      "sizeLabel": "Size",
+      "size": {
+        "any": "Any size",
+        "short": "Short",
+        "session": "Session",
+        "big": "Big"
+      },
+      "gradeLabel": "Grade",
+      "gradeAny": "Any grade",
+      "gradeA11y": "Grade range: {{band}}",
+      "sizeBand": {
+        "upTo": "Up to {{max}} climbs",
+        "range": "{{min}}–{{max}} climbs",
+        "atLeast": "{{min}}+ climbs"
+      },
+      "resultCount_one": "{{count}} playlist",
+      "resultCount_other": "{{count}} playlists",
+      "loadMoreError": "Couldn't load more playlists.",
+      "errors": {
+        "loadTitle": "Couldn't load playlists",
+        "loadDescription": "Check your connection and give it another go."
+      },
+      "empty": {
+        "title": "No playlists here yet",
+        "description": "Make one of yours public and it shows up for the crew."
+      },
+      "emptyFollowing": {
+        "title": "No playlists from your crew yet",
+        "description": "Climbers you follow haven't made a public playlist on this board."
+      },
+      "noMatches": {
+        "title": "Nothing fits those filters",
+        "description": "Loosen a filter or two to see more.",
+        "clearFilters": "Clear filters"
+      }
     },
     "pin": {
       "pin": "Pin",
@@ -83,7 +141,15 @@
         "title": "Smart playlist not found",
         "description": "This smart playlist doesn't exist."
       },
-      "empty": "No climbs in this smart playlist yet."
+      "empty": "No climbs in this smart playlist yet.",
+      "createdClimbs": {
+        "title": "My climbs",
+        "description": "Your published climbs, across all boards.",
+        "empty": {
+          "title": "No published climbs yet",
+          "supporting": "Publish a climb to find it here. Your drafts stay in the editor."
+        }
+      }
     },
     "empty": {
       "title": "No playlists yet",
@@ -102,7 +168,21 @@
   "detail": {
     "share": "Share playlist",
     "actions": "Playlist actions",
-    "activateAll": "Queue every climb",
+    "activateAll": "Play",
+    "addToQueue": {
+      "action": "Play last",
+      "actionCount_one": "Play {{count}} last",
+      "actionCount_other": "Play {{count}} last",
+      "subtitle": "Plays after the rest of your queue",
+      "playNextAction": "Play next",
+      "playNextActionCount_one": "Play {{count}} next",
+      "playNextActionCount_other": "Play {{count}} next",
+      "playNextSubtitle": "Plays before the rest of your queue",
+      "queueFull": "Your queue is full at {{max}} climbs",
+      "nothingToAdd": "Nothing here for your board yet",
+      "alreadyAdding": "Already adding this playlist",
+      "failed": "Couldn't add to the queue. Try again."
+    },
     "boardMismatch": {
       "title": "Switch to {{board}} to climb this playlist",
       "subtitle": "These are {{board}} climbs. Switch boards to queue them.",
@@ -133,7 +213,10 @@
       "message_other": "Plays the playlist in order from here. The {{count}} climbs queued after your current one drop out.",
       "cancel": "Cancel",
       "confirm": "Start playlist",
-      "loadFailed": "Couldn't start playlist. Try again."
+      "loadFailed": "Couldn't start playlist. Try again.",
+      "trimmed": "Loaded {{loaded}} of {{total}} climbs. Your queue holds {{max}}.",
+      "trimmedUnknownTotal": "Loaded {{loaded}} climbs. Your queue holds {{max}}.",
+      "addInstead": "Play last"
     },
     "deleteConfirm": {
       "title": "Delete playlist?",
@@ -143,9 +226,37 @@
     },
     "discussion": "Discussion",
     "empty": "No climbs in this playlist yet",
+    "view": {
+      "status_one": "{{shown}} of {{count}} climb",
+      "status_other": "{{shown}} of {{count}} climbs",
+      "clearFilters": "Clear filters",
+      "editNote": "Showing playlist order while you edit",
+      "namePlaceholder": "Climb name",
+      "empty": {
+        "noMatch": "Nothing here fits those filters.",
+        "allSent": "You've sent everything on this list. Nice.",
+        "noName": "No climb called “{{name}}” in this playlist.",
+        "noBoardFit": "None of these fit your board."
+      }
+    },
     "climbCount_one": "{{count}} climb",
     "climbCount_other": "{{count}} climbs",
-    "openInApp": "Climb this in the app",
+    "cta": {
+      "getAppHelper": "Light these climbs on your board, one after another.",
+      "openInBrowser": "Open in your browser",
+      "openInBrowserMobile": "Or open the playlist in your browser"
+    },
+    "qr": {
+      "title": "Scan to open this playlist on your phone",
+      "imageLabel": "QR code that opens {{name}} on your phone"
+    },
+    "subline": {
+      "boardPlaylist": "{{board}} playlist",
+      "sprayWallPlaylist": "Spraywall playlist",
+      "sprayWall": "Spraywall",
+      "multiBoardPlaylist": "{{boards}} playlist",
+      "gradeBand": "{{low}} to {{high}}"
+    },
     "followerCount_one": "{{count}} follower",
     "followerCount_other": "{{count}} followers",
     "followFailed": "Failed to update follow status",
@@ -155,7 +266,12 @@
       "loadTitle": "Unable to Load Playlist",
       "loadDescription": "There was an error loading this playlist. Please try again.",
       "tryAgain": "Try Again"
-    }
+    },
+    "setterPicker": {
+      "showClimbs": "Show climbs",
+      "error": "Couldn't load this list's setters."
+    },
+    "installHelper": "No app yet? Get it free and climb this list on your board."
   },
   "editClimbs": {
     "done": "Done",
@@ -185,8 +301,7 @@
       "privateHint": "Private playlists are only visible to you"
     },
     "actions": {
-      "save": "Save",
-      "saving": "Saving..."
+      "save": "Save"
     },
     "validation": {
       "nameRequired": "Please enter a playlist name",
@@ -201,7 +316,6 @@
   "create": {
     "drawerTitle": "Create Playlist",
     "submit": "Create",
-    "submitting": "Creating...",
     "fields": {
       "name": "Name",
       "namePlaceholder": "e.g., Hard Crimps",

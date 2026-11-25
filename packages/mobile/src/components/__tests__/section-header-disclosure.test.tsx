@@ -7,6 +7,7 @@ vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   StyleSheet: { create: (styles: unknown) => styles },
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
 }));
 vi.mock('../Text', () => ({ Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children) }));
@@ -43,6 +44,7 @@ vi.mock('../../providers/theme-provider', () => ({
   useTheme: () => ({
     variant: 'material' as const,
     brandColors: { primary: '#6D28D9' },
+    systemColors: { secondaryLabel: '#3C3C43' },
     m3: { onSurfaceVariant: '#49454F' },
     sectionCaption: { uppercase: false, opacity: 1, letterSpacing: 0 },
   }),

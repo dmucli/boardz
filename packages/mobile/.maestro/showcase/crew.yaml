@@ -1,0 +1,130 @@
+appId: com.boardsesh.app
+name: showcase take - a friend adds a climb
+---
+# Take: crew -> .boardsesh/showcase-video/work/footage/crew/ (homepage showcase, scene "crew")
+#
+# Records, on the PRIMARY phone: the invite QR for a private live session, then
+# the play view's queue sheet as the second phone (crew-secondary.yaml) adds a
+# climb and its row lands with the adder's avatar, then a long press on that row
+# so the reaction menu shows "Play next". Callouts on this take: invite-qr,
+# queue-row-avatar, play-next.
+#
+# Before recording, the recorder has started a hidden session (session-private.yaml,
+# crew-start.yaml), left the invite sheet open, and sent the second phone into
+# the session. After recording it ends the session (session-end.yaml), also on an
+# abort.
+#
+# The two phones meet through the recorder's signal server: this flow raises
+# `crew-add` once the queue sheet is open, and crew-secondary.yaml, which has
+# been polling for it since before recording started, swipes a climb into the
+# queue. Two separate Maestro processes each need 4-7 s to attach, so a timed
+# wait could never line them up.
+#
+# `queue-row-avatar` only logs for a row added by another account, and
+# `play-next` only for a climb that is not the one playing, which is why the
+# long press lands on the new row, not the current one.
+#
+# Marks (work/marks/crew.json): invite-closed, queue-open, crew-added (the
+# second phone's swipe), row-landed (the row's anchor first logged), play-next-menu.
+#
+# Coordinates (iPhone 16 Pro Max portrait):
+#   (the invite sheet closes by its existing localized Close label)
+#   40%,88%             the now-playing bar above the tab bar -> play view
+#   10%,84%             observed Kilter queue first-slot fallback, only when
+#                       the native drawer exposes no Queue accessibility label
+#                       and the recorder verifies board slot 0 is actually Kilter
+#   91%,90%           observed Tension Queue in the lower-right utility row,
+#                       only for verified iOS Tension layout 10 in slot 1; not Mirror
+#   (other mirror boards retain the label path; no unmeasured coordinate target)
+#   50%,78%             observed Kilter or Tension layout 10 first-upcoming row,
+#                       after its genuine peer avatar logs and board verifies
+#   50%,7%              the backdrop above the reaction menu
+
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/flow-start')}
+
+# The QR.
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 1800
+    optional: true
+
+- tapOn: '${SHOWCASE_CLOSE_LABEL}'
+- waitForAnimationToEnd
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/invite-closed')}
+
+- tapOn:
+    point: '40%,88%'
+- waitForAnimationToEnd
+
+# The recorded native drawer can render without exposing its app controls to
+# XCTest. Prefer its label; use a measured family-specific point only when verified.
+- evalScript: ${output.queueOpened = false}
+- runFlow:
+    when:
+      visible: '${SHOWCASE_QUEUE_LABEL}'
+    commands:
+      - tapOn: '${SHOWCASE_QUEUE_LABEL}'
+      - evalScript: ${output.queueOpened = true}
+- runFlow:
+    when:
+      true: ${!output.queueOpened && SHOWCASE_CREW_QUEUE_FALLBACK_POINT !== ''}
+    commands:
+      - tapOn:
+          point: '${SHOWCASE_CREW_QUEUE_FALLBACK_POINT}'
+      - evalScript: ${output.queueOpened = true}
+- assertTrue: ${output.queueOpened}
+
+- waitForAnimationToEnd
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/queue-open')}
+
+# Queue sheet is up: tell the second phone to add its climb, and watch it land.
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/set/crew-add')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 5000
+    optional: true
+
+# Require the genuine friend's avatar before selecting their row. Native sheet
+# anchors are local coordinates; the old fixed 322pt offset hit the header.
+- evalScript: ${output.peerAvatarY = ''}
+- repeat:
+    times: 40
+    while:
+      true: ${output.peerAvatarY === ''}
+    commands:
+      - evalScript: ${output.peerAvatarY = http.get(SHOWCASE_SIGNAL_URL + '/value/anchor-queue-row-avatar-cy').body.trim()}
+      - extendedWaitUntil:
+          visible: 'zzz-showcase-pause'
+          timeout: 200
+          optional: true
+- assertTrue: ${output.peerAvatarY !== '' && !isNaN(Number(output.peerAvatarY))}
+
+# Prefer the attributed row's localized accessibility label. If XCTest omits
+# sheet controls, use the verified observed first-upcoming row's text, never ≡.
+- evalScript: ${output.peerRowPressed = false}
+- runFlow:
+    when:
+      visible: '${SHOWCASE_CREW_PEER_ROW_LABEL}'
+    commands:
+      - longPressOn: '${SHOWCASE_CREW_PEER_ROW_LABEL}'
+      - evalScript: ${output.peerRowPressed = true}
+- runFlow:
+    when:
+      true: ${!output.peerRowPressed && SHOWCASE_CREW_PEER_ROW_FALLBACK_POINT !== ''}
+    commands:
+      - longPressOn:
+          point: '${SHOWCASE_CREW_PEER_ROW_FALLBACK_POINT}'
+      - evalScript: ${output.peerRowPressed = true}
+- assertTrue: ${output.peerRowPressed}
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/play-next-menu')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 2000
+    optional: true
+
+- tapOn:
+    point: '50%,7%'
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 800
+    optional: true

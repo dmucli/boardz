@@ -98,6 +98,57 @@ export const JOIN_SESSION = `
   }
 `;
 
+// F3 (#6666, docs/product/current-climb-outside-queue.md section 2): the same join with
+// the seed's History / Up next line, selecting the two new QueueState fields.
+//
+// The `_NOW_SLOT` documents sit BESIDE today's and are never folded into them:
+// an unknown argument, field or variable type is a document-level validation
+// error against a backend without F3, whatever the variable's value (the same
+// reason as SET_QUEUE_WITH_BASELINE below). A phone sends them only in now-slot
+// mode, when the `queue-now-slot` flag is on and the per-connect probe
+// (QUEUE_STATE_FIELDS_PROBE) found the fields. Deleted with the legacy set in
+// the F3 cleanup PR.
+export const JOIN_SESSION_NOW_SLOT = `
+  mutation JoinSessionNowSlot($sessionId: ID!, $boardPath: String!, $username: String, $avatarUrl: String, $participantId: ID, $initialQueue: [ClimbQueueItemInput!], $initialCurrentClimb: ClimbQueueItemInput, $sessionName: String, $initialHistoryCount: Int) {
+    joinSession(sessionId: $sessionId, boardPath: $boardPath, username: $username, avatarUrl: $avatarUrl, participantId: $participantId, initialQueue: $initialQueue, initialCurrentClimb: $initialCurrentClimb, sessionName: $sessionName, initialHistoryCount: $initialHistoryCount) {
+      id
+      name
+      boardPath
+      clientId
+      participantId
+      isLeader
+      lastConnectedBoardSerial
+      goal
+      isPublic
+      startedAt
+      endedAt
+      isPermanent
+      color
+      users {
+        id
+        username
+        isLeader
+        avatarUrl
+        userId
+        connectionState
+      }
+      queueState {
+        sequence
+        stateHash
+        stateHashOrdered
+        historyCount
+        currentChangedAt
+        queue {
+          ${QUEUE_ITEM_FIELDS}
+        }
+        currentClimbQueueItem {
+          ${QUEUE_ITEM_FIELDS}
+        }
+      }
+    }
+  }
+`;
+
 export const LEAVE_SESSION = `
   mutation LeaveSession {
     leaveSession
@@ -167,6 +218,17 @@ export const REORDER_QUEUE_ITEM = `
 export const SET_CURRENT_CLIMB = `
   mutation SetCurrentClimb($item: ClimbQueueItemInput, $shouldAddToQueue: Boolean, $correlationId: ID) {
     setCurrentClimb(item: $item, shouldAddToQueue: $shouldAddToQueue, correlationId: $correlationId) {
+      ${QUEUE_ITEM_FIELDS}
+    }
+  }
+`;
+
+// F3: setCurrentClimb with `placement` (NOW for an open, STEP for Previous on
+// the queue walk and Replay from here). A request with placement sends
+// `shouldAddToQueue: false`; the server ignores it under placement anyway.
+export const SET_CURRENT_CLIMB_NOW_SLOT = `
+  mutation SetCurrentClimbNowSlot($item: ClimbQueueItemInput, $shouldAddToQueue: Boolean, $correlationId: ID, $placement: CurrentClimbPlacement) {
+    setCurrentClimb(item: $item, shouldAddToQueue: $shouldAddToQueue, correlationId: $correlationId, placement: $placement) {
       ${QUEUE_ITEM_FIELDS}
     }
   }
@@ -251,6 +313,49 @@ export const SET_SESSION_BOARD_PATH = `
   }
 `;
 
+// The crew rest clock (#5382). One selection for the mutation payload and the
+// sessionUpdates arm, so a client adopts both through the same mapper. The
+// clock nests under `restCadence` because its field names (mode, source,
+// isRunning...) would otherwise collide with sibling SessionEvent arms.
+const REST_CADENCE_CHANGE_FIELDS = `
+  restCadence {
+    mode
+    targetSeconds
+    autoAdvance
+    autoAdvanceOnce
+    advanceOn
+    source
+    isRunning
+    anchorAt
+    pausedElapsedSeconds
+    lastFiredBeatAt
+    lastTickQueueItemUuid
+    lastTickStatus
+    tickAcceptedAt
+    tickAcceptanceId
+    setByParticipantId
+  }
+  revision
+  serverNow
+  isSnapshot
+  action
+`;
+
+// Change the crew rest clock. FIRE carries expectedRevision (compare-and-set);
+// `applied: false` means the change did not land and the wall must not move.
+// Sent by the mobile app through @boardsesh/queue-react's createQueueMutations,
+// and by the backend's headless test client.
+export const SET_SESSION_REST_CADENCE = `
+  mutation SetSessionRestCadence($input: SessionRestCadenceInput!) {
+    setSessionRestCadence(input: $input) {
+      applied
+      change {
+        ${REST_CADENCE_CHANGE_FIELDS}
+      }
+    }
+  }
+`;
+
 export const SET_QUEUE = `
   mutation SetQueue($queue: [ClimbQueueItemInput!]!, $currentClimbQueueItem: ClimbQueueItemInput) {
     setQueue(queue: $queue, currentClimbQueueItem: $currentClimbQueueItem) {
@@ -293,6 +398,139 @@ export const SET_QUEUE_WITH_BASELINE = `
     }
   }
 `;
+
+// F3: setQueue with the payload's History / Up next line. Without it the server
+// derives the line from the stored History, which is what a legacy phone gets.
+export const SET_QUEUE_NOW_SLOT = `
+  mutation SetQueueNowSlot($queue: [ClimbQueueItemInput!]!, $currentClimbQueueItem: ClimbQueueItemInput, $historyCount: Int) {
+    setQueue(queue: $queue, currentClimbQueueItem: $currentClimbQueueItem, historyCount: $historyCount) {
+      sequence
+      stateHash
+      stateHashOrdered
+      historyCount
+      currentChangedAt
+      queue {
+        ${QUEUE_ITEM_FIELDS}
+      }
+      currentClimbQueueItem {
+        ${QUEUE_ITEM_FIELDS}
+      }
+    }
+  }
+`;
+
+// F3: SET_QUEUE_WITH_BASELINE plus the line.
+export const SET_QUEUE_WITH_BASELINE_NOW_SLOT = `
+  mutation SetQueueWithBaselineNowSlot($queue: [ClimbQueueItemInput!]!, $currentClimbQueueItem: ClimbQueueItemInput, $baselineSequence: Int, $historyCount: Int) {
+    setQueue(queue: $queue, currentClimbQueueItem: $currentClimbQueueItem, baselineSequence: $baselineSequence, historyCount: $historyCount) {
+      sequence
+      stateHash
+      stateHashOrdered
+      historyCount
+      currentChangedAt
+      queue {
+        ${QUEUE_ITEM_FIELDS}
+      }
+      currentClimbQueueItem {
+        ${QUEUE_ITEM_FIELDS}
+      }
+    }
+  }
+`;
+
+// F3: does the connected backend serve the Now slot fields? Run once per
+// socket connect, before the join; a deploy or a rollback drops the socket, so
+// the reconnect asks again. The backend has no introspection-blocking rule.
+// `__type` is valid against any schema, so this document itself never fails
+// validation on an old backend: it just lists fewer fields.
+export const QUEUE_STATE_FIELDS_PROBE = `
+  query QueueStateFieldsProbe {
+    __type(name: "QueueState") {
+      fields {
+        name
+      }
+    }
+  }
+`;
+
+/** Independent capabilities: attribution also works when Now slot mode is off. */
+export const QUEUE_CAPABILITIES_PROBE = `
+  query QueueCapabilitiesProbe {
+    queueState: __type(name: "QueueState") { fields { name } }
+    currentClimbChanged: __type(name: "CurrentClimbChanged") { fields { name } }
+  }
+`;
+
+export type QueueReadCapabilities = {
+  nowSlot: boolean;
+  attribution: boolean;
+};
+
+/**
+ * Mobile queue reads share one selection set. Callers enable each additive
+ * field only after probing that capability; legacy/native exports stay intact.
+ */
+export function buildQueueUpdatesSubscription({ nowSlot, attribution }: QueueReadCapabilities): string {
+  return `
+    subscription QueueUpdates${nowSlot ? 'NowSlot' : ''}${attribution ? 'Attributed' : ''}($sessionId: ID!) {
+      queueUpdates(sessionId: $sessionId) {
+        __typename
+        ... on FullSync {
+          sequence
+          state {
+            sequence
+            stateHash
+            stateHashOrdered
+            ${nowSlot ? 'historyCount currentChangedAt' : ''}
+            ${attribution ? 'currentChangedBy' : ''}
+            queue { ${QUEUE_ITEM_FIELDS} }
+            currentClimbQueueItem { ${QUEUE_ITEM_FIELDS} }
+          }
+        }
+        ... on QueueItemAdded {
+          sequence stateHash stateHashOrdered
+          addedItem: item { ${QUEUE_ITEM_FIELDS} }
+          position clientId
+        }
+        ... on QueueItemRemoved {
+          sequence stateHash stateHashOrdered uuid clientId
+        }
+        ... on QueueReordered {
+          sequence stateHash stateHashOrdered uuid oldIndex newIndex
+        }
+        ... on CurrentClimbChanged {
+          sequence stateHash stateHashOrdered
+          currentItem: item { ${QUEUE_ITEM_FIELDS} }
+          clientId correlationId
+          ${attribution ? 'currentChangedBy' : ''}
+        }
+        ... on ClimbMirrored {
+          sequence stateHash stateHashOrdered mirroredUuid: uuid mirrored
+        }
+        ... on PlaybackStateChanged {
+          sequence climbUuid frameIndex frameCount isPlaying speed paceMs anchorTimestamp clientId
+        }
+      }
+    }
+  `;
+}
+
+/** The HTTP resync may reach a different replica, so its caller also handles validation fallback. */
+export function buildSessionQueueStateQuery({ nowSlot, attribution }: QueueReadCapabilities): string {
+  return `
+    query GetSessionQueueState${nowSlot ? 'NowSlot' : ''}${attribution ? 'Attributed' : ''}($sessionId: ID!) {
+      session(sessionId: $sessionId) {
+        queueState {
+          sequence stateHash stateHashOrdered
+          ${nowSlot ? 'historyCount currentChangedAt' : ''}
+          ${attribution ? 'currentChangedBy' : ''}
+          queue { ${QUEUE_ITEM_FIELDS} }
+          currentClimbQueueItem { ${QUEUE_ITEM_FIELDS} }
+        }
+      }
+    }
+  `;
+}
 
 export const CREATE_SESSION = `
   mutation CreateSession($input: CreateSessionInput!) {
@@ -395,6 +633,9 @@ export const SESSION_UPDATES = `
       ... on SessionEnded {
         reason
         newPath
+      }
+      ... on SessionRestCadenceChanged {
+        ${REST_CADENCE_CHANGE_FIELDS}
       }
       ... on SessionStatsUpdated {
         sessionId
@@ -605,7 +846,13 @@ export const QUEUE_UPDATES = `
 
 // Mirrors the native iOS subscription in SessionWebSocketManager.swift. Keeping
 // a copy here lets the schema-validation test catch drift in fields that native
-// decodes manually, including climb.mirrored for widget-triggered BLE updates.
+// decodes manually, including climb.mirrored for widget-triggered BLE updates,
+// and state.historyCount (F3, #6666), which the native reducer reads to land on
+// the head of Up next when nothing is current. A server without that field
+// rejects this whole document; native then resubscribes once without the
+// historyCount line (QueueSubscriptionDocument in SessionQueueState.swift).
+// That fallback covers historyCount only, so any other new field still needs
+// its backend live before a binary ships it.
 export const NATIVE_IOS_QUEUE_UPDATES = `
   subscription QueueUpdates($sessionId: ID!) {
     queueUpdates(sessionId: $sessionId) {
@@ -615,6 +862,7 @@ export const NATIVE_IOS_QUEUE_UPDATES = `
         state {
           sequence
           stateHash
+          historyCount
           queue {
             uuid
             climb { uuid setter_username name frames framesCount framesPace angle ascensionist_count difficulty quality_average stars difficulty_error mirrored benchmark_difficulty }

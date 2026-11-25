@@ -1,9 +1,14 @@
+import { CredentialAuthorityUnavailable } from '@/app/lib/auth/credential-admission.server';
 import 'server-only';
+import { getServerAuthToken } from '@/app/lib/auth/server-auth';
+import { executeAuthenticatedGraphQL } from './server-graphql';
 import { unstable_cache } from 'next/cache';
 import { type RequestDocument, type Variables, GraphQLClient } from 'graphql-request';
 import { sortObjectKeys } from '@/app/lib/cache-utils';
 import { compactErrorMessage } from '@/app/lib/observability/compact-error';
 import { getGraphQLHttpUrl } from './client';
+import { SSR_BACKEND_FETCH_TIMEOUT_MS } from '@/app/lib/ssr-fetch-deadline';
+import { webClientIdentityHeaders } from '@/app/lib/client-identity';
 import type { DiscoverablePlaylist, DiscoverPlaylistsQueryResponse } from '@boardsesh/graphql/operations/playlists';
 import type { GetCommunityStatsQueryResponse } from '@boardsesh/graphql/operations';
 import type {
@@ -21,7 +26,8 @@ export const USER_CLIMB_PERCENTILE_CACHE_TAG = 'user-climb-percentile';
 
 /**
  * Execute a GraphQL query via HTTP (non-cached version for internal use).
- * Pass `signal` to enforce a deadline via `AbortController`.
+ * Without a `signal` the call is bounded by SSR_BACKEND_FETCH_TIMEOUT_MS; an
+ * explicit signal replaces that default.
  */
 export async function executeGraphQLInternal<T = unknown, V extends Variables = Variables>(
   document: RequestDocument,
@@ -32,8 +38,9 @@ export async function executeGraphQLInternal<T = unknown, V extends Variables = 
   const client = new GraphQLClient(url, {
     headers: {
       'Content-Type': 'application/json',
+      ...webClientIdentityHeaders(),
     },
-    signal,
+    signal: signal ?? AbortSignal.timeout(SSR_BACKEND_FETCH_TIMEOUT_MS),
   });
 
   return client.request<T>(document, variables);
@@ -61,9 +68,9 @@ function createCacheKeyFromVariables(variables: Variables | undefined): string[]
  * @param variables - Query variables
  * @param cacheTag - Tag for cache invalidation (e.g., 'climb-search')
  * @param revalidate - Cache duration in seconds
- * @param timeoutMs - Optional wall-clock ceiling. Without one a wedged backend
- *   hangs the caller indefinitely; `graphql-request` honours the signal, so the
- *   call rejects with an abort error the caller can degrade on.
+ * @param timeoutMs - Optional wall-clock ceiling override. Defaults to
+ *   SSR_BACKEND_FETCH_TIMEOUT_MS; `graphql-request` honours the signal, so a
+ *   wedged backend rejects with an abort error the caller can degrade on.
  */
 export function createCachedGraphQLQuery<T = unknown, V extends Variables = Variables>(
   document: RequestDocument,
@@ -72,6 +79,9 @@ export function createCachedGraphQLQuery<T = unknown, V extends Variables = Vari
   timeoutMs?: number,
 ) {
   return async (variables?: V): Promise<T> => {
+    if (cacheTag.startsWith('discover-playlists')) {
+      return executeGraphQLInternal<T, V>(document, variables);
+    }
     const cachedFn = unstable_cache(
       async () => {
         try {
@@ -206,17 +216,7 @@ export async function cachedCommunityPlaylists(viewerId?: string | null): Promis
 export async function cachedUserProfileStats(
   userId: string,
 ): Promise<GetUserProfileStatsQueryResponse['userProfileStats'] | null> {
-  const { GET_USER_PROFILE_STATS } = await import('@boardsesh/graphql/operations/ticks');
-  type Response = GetUserProfileStatsQueryResponse;
-
-  try {
-    const tag = `user-profile-stats-${userId}`;
-    const query = createCachedGraphQLQuery<Response>(GET_USER_PROFILE_STATS, tag, 300);
-    const result = await query({ userId });
-    return result.userProfileStats;
-  } catch {
-    return null;
-  }
+  return serverUserProfileStats(userId);
 }
 
 /**
@@ -229,9 +229,14 @@ export async function serverUserProfileStats(
 ): Promise<GetUserProfileStatsQueryResponse['userProfileStats'] | null> {
   const { GET_USER_PROFILE_STATS } = await import('@boardsesh/graphql/operations/ticks');
   try {
-    const result = await executeGraphQLInternal<GetUserProfileStatsQueryResponse>(GET_USER_PROFILE_STATS, { userId });
+    const result = await executeAuthenticatedGraphQL<GetUserProfileStatsQueryResponse>(
+      GET_USER_PROFILE_STATS,
+      { userId },
+      await getServerAuthToken(),
+    );
     return result.userProfileStats;
-  } catch {
+  } catch (error) {
+    if (error instanceof CredentialAuthorityUnavailable) throw error;
     return null;
   }
 }
@@ -243,17 +248,15 @@ export async function cachedUserClimbPercentile(
   userId: string,
 ): Promise<GetUserClimbPercentileQueryResponse['userClimbPercentile'] | null> {
   const { GET_USER_CLIMB_PERCENTILE } = await import('@boardsesh/graphql/operations/ticks');
-  type Response = GetUserClimbPercentileQueryResponse;
-
   try {
-    const query = createCachedGraphQLQuery<Response>(
+    const result = await executeAuthenticatedGraphQL<GetUserClimbPercentileQueryResponse>(
       GET_USER_CLIMB_PERCENTILE,
-      USER_CLIMB_PERCENTILE_CACHE_TAG,
-      604800,
+      { userId },
+      await getServerAuthToken(),
     );
-    const result = await query({ userId });
     return result.userClimbPercentile;
-  } catch {
+  } catch (error) {
+    if (error instanceof CredentialAuthorityUnavailable) throw error;
     return null;
   }
 }
@@ -265,17 +268,7 @@ export async function cachedUserTicks(
   userId: string,
   boardType: string,
 ): Promise<GetUserTicksQueryResponse['userTicks'] | null> {
-  const { GET_USER_TICKS } = await import('@boardsesh/graphql/operations/ticks');
-  type Response = GetUserTicksQueryResponse;
-
-  try {
-    const tag = `user-ticks-${userId}-${boardType}`;
-    const query = createCachedGraphQLQuery<Response>(GET_USER_TICKS, tag, 300);
-    const result = await query({ userId, boardType });
-    return result.userTicks;
-  } catch {
-    return null;
-  }
+  return serverUserTicks(userId, boardType);
 }
 
 /**
@@ -288,9 +281,14 @@ export async function serverUserTicks(
 ): Promise<GetUserTicksQueryResponse['userTicks'] | null> {
   const { GET_USER_TICKS } = await import('@boardsesh/graphql/operations/ticks');
   try {
-    const result = await executeGraphQLInternal<GetUserTicksQueryResponse>(GET_USER_TICKS, { userId, boardType });
+    const result = await executeAuthenticatedGraphQL<GetUserTicksQueryResponse>(
+      GET_USER_TICKS,
+      { userId, boardType },
+      await getServerAuthToken(),
+    );
     return result.userTicks;
-  } catch {
+  } catch (error) {
+    if (error instanceof CredentialAuthorityUnavailable) throw error;
     return null;
   }
 }

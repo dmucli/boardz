@@ -14,12 +14,18 @@ const analytics = vi.hoisted(() => ({
   trackBoardLookStepResolved: vi.fn(),
 }));
 const applyBoardLookOption = vi.hoisted(() => vi.fn(async () => {}));
+const renderSettingsMock = vi.hoisted(() => ({
+  current: null as import('../../../lib/board-render-settings').BoardRenderSettings | null,
+}));
 const markTipSeenMock = vi.hoisted(() => vi.fn(async () => {}));
-const carouselCtrl = vi.hoisted(() => ({
+const sliderCtrl = vi.hoisted(() => ({
   onSelect: null as ((id: string) => void) | null,
   onCardSeen: null as ((id: string) => void) | null,
   optionIds: [] as string[],
-  showDescriptions: undefined as boolean | undefined,
+  showDescription: undefined as boolean | undefined,
+  disabled: false,
+  saveLoading: false,
+  saveDisabled: false,
 }));
 
 vi.mock('react-native', () => ({
@@ -33,6 +39,7 @@ vi.mock('react-native', () => ({
   useWindowDimensions: () => ({ width: 402, height: 874, scale: 3, fontScale: 1 }),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1, absoluteFill: {} },
   Platform: { OS: 'ios', select: (spec: Record<string, unknown>) => spec.ios },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (color: string) => color,
   // The step swallows Android back (useBlockBack); here it only has to exist.
   BackHandler: { addEventListener: () => ({ remove: () => {} }) },
@@ -58,28 +65,53 @@ vi.mock('../../../theme/variants', () => ({
 vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
-vi.mock('../../GlassSurface', () => ({
-  GlassSurface: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+vi.mock('../../SheetTopBar', () => ({
+  // The top bar stub: its leading and trailing actions as clickable buttons.
+  SheetTopBar: ({
+    leading,
+    trailing,
+  }: {
+    leading?: { label?: string; onPress: () => void };
+    trailing?: { label: string; onPress: () => void; loading?: boolean; disabled?: boolean };
+  }) => {
+    sliderCtrl.saveLoading = !!trailing?.loading;
+    sliderCtrl.saveDisabled = !!trailing?.disabled;
+    return createElement(
+      'div',
+      null,
+      leading
+        ? createElement('button', { 'data-button': leading.label, onClick: leading.onPress }, leading.label)
+        : null,
+      trailing
+        ? createElement('button', { 'data-button': trailing.label, onClick: trailing.onPress }, trailing.label)
+        : null,
+    );
+  },
 }));
-vi.mock('../../Button', () => ({
-  Button: ({ title, onPress }: { title: string; onPress: () => void }) =>
-    createElement('button', { onClick: onPress }, title),
-}));
-vi.mock('../BoardLookCarousel', () => ({
-  BoardLookCarousel: (props: {
+vi.mock('../BoardLookSlider', () => ({
+  BoardLookSlider: (props: {
     options: { id: string }[];
     onSelect: (id: string) => void;
     onCardSeen?: (id: string) => void;
-    showDescriptions?: boolean;
+    showDescription?: boolean;
+    disabled?: boolean;
   }) => {
-    carouselCtrl.onSelect = props.onSelect;
-    carouselCtrl.onCardSeen = props.onCardSeen ?? null;
-    carouselCtrl.optionIds = props.options.map((option) => option.id);
-    carouselCtrl.showDescriptions = props.showDescriptions;
-    return createElement('div', { 'data-testid': 'carousel' });
+    sliderCtrl.onSelect = props.onSelect;
+    sliderCtrl.onCardSeen = props.onCardSeen ?? null;
+    sliderCtrl.optionIds = props.options.map((option) => option.id);
+    sliderCtrl.showDescription = props.showDescription;
+    sliderCtrl.disabled = !!props.disabled;
+    return createElement('div', { 'data-testid': 'slider' });
   },
 }));
 vi.mock('../../../hooks/use-native-climb-render', () => ({ useBoardRenderFlags: () => ({}) }));
+vi.mock('../../../lib/board-render-settings', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../../lib/board-render-settings')>();
+  return {
+    ...actual,
+    useBoardRenderSettings: () => ({ settings: renderSettingsMock.current ?? actual.DEFAULT_BOARD_RENDER_SETTINGS }),
+  };
+});
 // The step marks itself seen on an answer; the real module reaches AsyncStorage.
 vi.mock('../../../lib/board-render/board-look-step-seen', () => ({ markBoardLookStepSeen: markTipSeenMock }));
 vi.mock('../../../lib/error-reporting', () => ({ reportError: vi.fn() }));
@@ -103,7 +135,6 @@ const PREVIEW = {
 
 function renderStep(overrides: Partial<Parameters<typeof BoardLookStep>[0]> = {}) {
   const props = {
-    accentColor: '#6D28D9',
     bodyColor: '#888888',
     backgroundColor: '#ffffff',
     preview: PREVIEW,
@@ -117,8 +148,9 @@ function renderStep(overrides: Partial<Parameters<typeof BoardLookStep>[0]> = {}
 
 beforeEach(() => {
   vi.clearAllMocks();
-  carouselCtrl.onSelect = null;
-  carouselCtrl.onCardSeen = null;
+  renderSettingsMock.current = null;
+  sliderCtrl.onSelect = null;
+  sliderCtrl.onCardSeen = null;
 });
 
 afterEach(() => {
@@ -126,10 +158,51 @@ afterEach(() => {
 });
 
 describe('BoardLookStep', () => {
+  it('previews slider choices without writing settings or the seen flag', () => {
+    const { getByText } = renderStep();
+    act(() => sliderCtrl.onSelect?.('classic'));
+    expect(getByText('mobile.settings.boardLook.intro.saveNamed')).toBeTruthy();
+    expect(applyBoardLookOption).not.toHaveBeenCalled();
+    expect(markTipSeenMock).not.toHaveBeenCalled();
+    expect(analytics.trackBoardLookStepResolved).not.toHaveBeenCalled();
+  });
+
+  it('freezes the slider and saves the latest choice once while storage is pending', async () => {
+    let finishWrite: (() => void) | undefined;
+    applyBoardLookOption.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishWrite = resolve;
+        }),
+    );
+    const { getByText, props } = renderStep();
+    act(() => sliderCtrl.onSelect?.('classic'));
+    const save = getByText('mobile.settings.boardLook.intro.saveNamed');
+    fireEvent.click(save);
+    fireEvent.click(save);
+    expect(sliderCtrl.disabled).toBe(true);
+    expect(sliderCtrl.saveDisabled).toBe(true);
+    expect(sliderCtrl.saveLoading).toBe(true);
+    expect(applyBoardLookOption).toHaveBeenCalledExactlyOnceWith('classic');
+    expect(markTipSeenMock).toHaveBeenCalledOnce();
+    await act(async () => finishWrite?.());
+    expect(props.onSaved).toHaveBeenCalledOnce();
+    expect(analytics.trackBoardLookStepResolved).toHaveBeenCalledOnce();
+  });
+
+  it('normalizes settings-only stored presets to an offered and savable look', async () => {
+    const { BOARD_RENDER_PRESETS } = await import('../../../lib/board-render-presets');
+    renderSettingsMock.current = BOARD_RENDER_PRESETS.find((preset) => preset.id === 'aura-bold')!.values;
+    const { getByText, props } = renderStep();
+    fireEvent.click(getByText('mobile.settings.boardLook.intro.saveNamed'));
+    await vi.waitFor(() => expect(props.onSaved).toHaveBeenCalled());
+    expect(applyBoardLookOption).toHaveBeenCalledExactlyOnceWith('aura');
+  });
+
   it('reports the step as shown, with how many looks were offered', () => {
     renderStep();
     expect(analytics.trackBoardLookStepShown).toHaveBeenCalledOnce();
-    expect(analytics.trackBoardLookStepShown.mock.calls[0][2]).toBe(carouselCtrl.optionIds.length);
+    expect(analytics.trackBoardLookStepShown.mock.calls[0][2]).toBe(sliderCtrl.optionIds.length);
   });
 
   describe('the one-shot "seen" flag', () => {
@@ -162,7 +235,7 @@ describe('BoardLookStep', () => {
     it('is written when they choose Custom', async () => {
       const { props, getByText } = renderStep();
 
-      act(() => carouselCtrl.onSelect?.('custom'));
+      act(() => sliderCtrl.onSelect?.('custom'));
       fireEvent.click(getByText('mobile.settings.boardLook.intro.customCta'));
       await vi.waitFor(() => expect(props.onCustomize).toHaveBeenCalled());
 
@@ -182,24 +255,25 @@ describe('BoardLookStep', () => {
     });
   });
 
-  it('offers six looks and no per-card sentences', () => {
-    // The order the product asks for, and the reason there is room for six: the
-    // caption under each board is its name, nothing more.
+  it('offers seven looks and no per-card sentences', () => {
+    // The order the product asks for, and the reason there is room for seven:
+    // the caption under each board is its name, nothing more.
     renderStep();
-    expect(carouselCtrl.optionIds).toEqual([
+    expect(sliderCtrl.optionIds).toEqual([
       'aura',
       'aura-subtle',
+      'aura-outline',
       'modern-classic',
       'classic',
       'max-contrast',
       'custom',
     ]);
-    expect(carouselCtrl.showDescriptions).toBe(false);
+    expect(sliderCtrl.showDescription).toBe(false);
   });
 
   it('leads with the climber’s current look — the plain Aura card by default', () => {
     renderStep();
-    expect(carouselCtrl.optionIds[0]).toBe('aura');
+    expect(sliderCtrl.optionIds[0]).toBe('aura');
   });
 
   describe('resolves exactly once', () => {
@@ -242,7 +316,7 @@ describe('BoardLookStep', () => {
     it('switches the primary button to the set-up call to action', () => {
       const { getByText, queryByText } = renderStep();
 
-      act(() => carouselCtrl.onSelect?.('custom'));
+      act(() => sliderCtrl.onSelect?.('custom'));
 
       expect(queryByText('mobile.settings.boardLook.intro.saveNamed')).toBeNull();
       expect(getByText('mobile.settings.boardLook.intro.customCta')).toBeTruthy();
@@ -251,7 +325,7 @@ describe('BoardLookStep', () => {
     it('applies the plain Aura bundle and hands off to Board look', async () => {
       const { props, getByText } = renderStep();
 
-      act(() => carouselCtrl.onSelect?.('custom'));
+      act(() => sliderCtrl.onSelect?.('custom'));
       fireEvent.click(getByText('mobile.settings.boardLook.intro.customCta'));
       await vi.waitFor(() => expect(props.onCustomize).toHaveBeenCalled());
 
@@ -265,7 +339,7 @@ describe('BoardLookStep', () => {
     it('reports the bundle it actually wrote, not the one its card previews', async () => {
       const { props, getByText } = renderStep();
 
-      act(() => carouselCtrl.onSelect?.('custom'));
+      act(() => sliderCtrl.onSelect?.('custom'));
       fireEvent.click(getByText('mobile.settings.boardLook.intro.customCta'));
       await vi.waitFor(() => expect(props.onCustomize).toHaveBeenCalled());
 
@@ -283,9 +357,9 @@ describe('BoardLookStep', () => {
   it('counts the distinct cards that actually came into view', async () => {
     const { props, getByText } = renderStep();
 
-    carouselCtrl.onCardSeen?.('aura');
-    carouselCtrl.onCardSeen?.('aura-subtle');
-    carouselCtrl.onCardSeen?.('aura');
+    sliderCtrl.onCardSeen?.('aura');
+    sliderCtrl.onCardSeen?.('aura-subtle');
+    sliderCtrl.onCardSeen?.('aura');
     fireEvent.click(getByText('mobile.settings.boardLook.intro.saveNamed'));
     await vi.waitFor(() => expect(props.onSaved).toHaveBeenCalled());
 

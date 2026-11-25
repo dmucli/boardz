@@ -6,7 +6,9 @@ import { EventEmitter } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
-import { SignJWT } from 'jose';
+import { decodeJwt, SignJWT } from 'jose';
+import { notificationDevices } from '@boardsesh/db/schema/app';
+import { mobileRefreshTokens, authSessionDenials, authEmailProjection } from '@boardsesh/db/schema/auth';
 
 // ---------------------------------------------------------------------------
 // Test secret — must match what verifyTransferToken reads from env
@@ -27,9 +29,56 @@ const mockDbUpdateReturning = vi.fn(async () => []);
 const mockDbDeleteWhere = vi.fn();
 const mockDbDeleteReturning = vi.fn(async () => []);
 
+// These handler tests assume an active account. Admission has its own suites
+// (deletion-credential-admission and admission-read-coalescer).
+vi.mock('../auth/admission-read-coalescer', () => ({
+  // An active account with no cutoff row: generation 0, native generation 0.
+  createAdmissionCoalescer: () => async () => ({ generation: 0, nativeGeneration: 0, deniedSessionKeys: new Set() }),
+}));
+
 vi.mock('../db/client', () => {
+  function selectChain(projection?: Record<string, unknown>) {
+    let rows =
+      projection && 'deletedAt' in projection
+        ? [{ id: 'unit-subject', deletedAt: null }]
+        : [
+            {
+              userId: 'user-abc',
+              expiresAt: new Date(Date.now() + 86400000),
+              subjectGeneration: null,
+              nativeGeneration: null,
+              authenticatedAt: null,
+            },
+          ];
+    const selection = {
+      from: (table: unknown) => {
+        if (table === authSessionDenials || table === authEmailProjection) rows = [];
+        return selection;
+      },
+      leftJoin: () => selection,
+      where: () => selection,
+      limit: () => Object.assign(Promise.resolve(rows), { for: () => Promise.resolve(rows) }),
+      for: () => Promise.resolve([{ id: 'unit-subject' }]),
+      // oxlint-disable-next-line unicorn/no-thenable -- Model Drizzle's awaitable query builder.
+      then: (resolve: (result: unknown[]) => unknown) => Promise.resolve(rows).then(resolve),
+    };
+    return selection;
+  }
   const insertChain = {
-    values: (...args: unknown[]) => mockDbInsertValues(...args),
+    values: (...args: unknown[]) =>
+      Object.assign(mockDbInsertValues(...args), {
+        onConflictDoUpdate: () => ({
+          returning: async () => [
+            {
+              userId: 'user-abc',
+              generation: 0,
+              nativeGeneration: 1,
+              revokedThrough: new Date(),
+              lastOperationId: crypto.randomUUID(),
+            },
+          ],
+        }),
+      }),
   };
   const updateChain = {
     set: (...args: unknown[]) => {
@@ -51,11 +100,14 @@ vi.mock('../db/client', () => {
   };
   return {
     db: {
+      select: vi.fn(selectChain),
       insert: vi.fn(() => insertChain),
       update: vi.fn(() => updateChain),
       delete: vi.fn(() => deleteChain),
       transaction: vi.fn(async (fn: (tx: unknown) => unknown) => {
         const tx = {
+          execute: async () => [{ transaction_isolation: 'read committed' }],
+          select: vi.fn(selectChain),
           insert: vi.fn(() => insertChain),
           update: vi.fn(() => updateChain),
           delete: vi.fn(() => deleteChain),
@@ -85,9 +137,19 @@ const {
   __resetNativeAuthStateForTests,
   __fillConsumedTokenMapForTests,
   __fillRateLimitMapForTests,
+  __fillRefreshRateLimitMapForTests,
+  __fillInvalidRefreshRateLimitMapForTests,
 } = await import('../handlers/native-auth');
 
 const { validateMobileJwt, validateToken } = await import('../middleware/auth');
+const { db } = await import('../db/client');
+const { logger } = await import('../utils/logger');
+const mockedDatabase = db as unknown as {
+  select: ReturnType<typeof vi.fn>;
+  insert: ReturnType<typeof vi.fn>;
+  update: ReturnType<typeof vi.fn>;
+  transaction: ReturnType<typeof vi.fn>;
+};
 
 // ---------------------------------------------------------------------------
 // Transfer token generation helper (mirrors the web-side HMAC signing)
@@ -95,14 +157,14 @@ const { validateMobileJwt, validateToken } = await import('../middleware/auth');
 
 function createTransferToken(
   userId: string,
-  opts?: { expiresInSeconds?: number; secret?: string; issuedAt?: number },
+  opts?: { expiresInSeconds?: number; secret?: string; issuedAt?: number; creationProof?: Record<string, unknown> },
 ): string {
   const secret = opts?.secret ?? TEST_SECRET;
   const now = Math.floor(Date.now() / 1000);
   const iat = opts?.issuedAt ?? now;
   const exp = iat + (opts?.expiresInSeconds ?? 120);
 
-  const payload = { userId, nextPath: '/app', iat, exp };
+  const payload = { userId, nextPath: '/app', iat, exp, ...opts?.creationProof };
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const signature = crypto.createHmac('sha256', secret).update(encodedPayload).digest('base64url');
 
@@ -202,8 +264,63 @@ describe('handleNativeAuthExchange', () => {
     expect(body.refreshToken).toBeDefined();
     expect(typeof body.refreshToken).toBe('string');
     expect(body.expiresAt).toBeDefined();
+    expect(body.userId).toBe('user-abc');
+    expect(body.accountCreation).toBeUndefined();
   });
 
+  it.each(['valid', 'foreign-user', 'foreign-provider', 'missing-attempt'] as const)(
+    'preserves only signed bound browser creation proof: %s',
+    async (scenario) => {
+      const userId = '602c83bf-e090-4c90-9f7e-08ca0b6b5dad';
+      const accountCreation = {
+        userId: scenario === 'foreign-user' ? '45642f07-423c-49e1-854e-814beaa0df64' : userId,
+        accountCreated: true,
+        provider: 'apple',
+        createdAt: '2026-10-10T00:00:00.000Z',
+      };
+      const creationProof = {
+        accountCreation,
+        authSessionId: 'login-1',
+        provider: scenario === 'foreign-provider' ? 'google' : 'apple',
+        ...(scenario === 'missing-attempt' ? {} : { attemptId: 'a'.repeat(32) }),
+      };
+      const transferToken = createTransferToken(userId, { creationProof });
+      const req = makeRequest({ method: 'POST', body: { transferToken } });
+      const res = makeResponse();
+      await handleNativeAuthExchange(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+      expect(res.statusCode).toBe(200);
+      expect(parseBody(res).userId).toBe(userId);
+      expect(parseBody(res).accountCreation).toEqual(scenario === 'valid' ? accountCreation : undefined);
+    },
+  );
+
+  it('never upgrades a source transfer generation to the current database generation', async () => {
+    const transferToken = createTransferToken('user-abc', { creationProof: { gen: 1, authSessionId: 'source-login' } });
+    const req = makeRequest({ method: 'POST', body: { transferToken } });
+    const res = makeResponse();
+    await handleNativeAuthExchange(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+    expect(res.statusCode).toBe(401);
+    expect(mockDbInsertValues).not.toHaveBeenCalled();
+  });
+  it.each([false, true])('inherits only guarded source proof age (guarded=%s)', async (guarded) => {
+    const authenticationTime = Math.floor(Date.now() / 1000) - 120;
+    const transferToken = createTransferToken('user-abc', {
+      creationProof: {
+        gen: 0,
+        authSessionId: 'source-login',
+        auth_time: authenticationTime,
+        ...(guarded ? { link_guarded: true } : {}),
+      },
+    });
+    const req = makeRequest({ method: 'POST', body: { transferToken } });
+    const res = makeResponse();
+    await handleNativeAuthExchange(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+    expect(res.statusCode).toBe(200);
+    const payload = decodeJwt(parseBody(res).jwt as string);
+    expect(payload.gen).toBe(0);
+    expect(payload.auth_time).toBe(guarded ? authenticationTime : undefined);
+    expect(payload.sid).not.toBe('source-login');
+  });
   it('returns 401 for an expired transfer token', async () => {
     // Token expired 60 seconds ago
     const transferToken = createTransferToken('user-abc', { expiresInSeconds: -60 });
@@ -246,6 +363,82 @@ describe('handleNativeAuthExchange', () => {
     expect(res2.statusCode).toBe(409);
     const body = parseBody(res2);
     expect(body.error).toBe('Transfer token has already been used');
+  });
+
+  it.each([
+    ['one trailing NUL', (signature: string) => `${signature}\u0000`],
+    ['two trailing NULs', (signature: string) => `${signature}\u0000\u0000`],
+    ['base64 padding', (signature: string) => `${signature}=`],
+    ['a trailing space', (signature: string) => `${signature} `],
+    ['a trailing newline', (signature: string) => `${signature}\n`],
+    ['a leading space', (signature: string) => ` ${signature}`],
+    ['the standard base64 alphabet', (signature: string) => Buffer.from(signature, 'base64url').toString('base64')],
+  ])('refuses a signature respelled with %s, before and after the real token is spent', async (_label, respell) => {
+    const transferToken = createTransferToken('user-abc');
+    const [encodedPayload, signature] = transferToken.split('.');
+    const respelled = `${encodedPayload}.${respell(signature)}`;
+    expect(respelled).not.toBe(transferToken);
+
+    const exchange = async (token: string) => {
+      const res = makeResponse();
+      await handleNativeAuthExchange(
+        makeRequest({ method: 'POST', body: { transferToken: token } }) as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+      );
+      return res.statusCode;
+    };
+
+    expect(await exchange(respelled)).toBe(401);
+    expect(await exchange(transferToken)).toBe(200);
+    expect(await exchange(respelled)).toBe(401);
+    expect(await exchange(transferToken)).toBe(409);
+  });
+
+  it('refuses a spent token whose segments are respelled', async () => {
+    const transferToken = createTransferToken('user-abc');
+    const exchange = async (token: string) => {
+      const res = makeResponse();
+      await handleNativeAuthExchange(
+        makeRequest({ method: 'POST', body: { transferToken: token } }) as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+      );
+      return res.statusCode;
+    };
+    expect(await exchange(transferToken)).toBe(200);
+
+    const [encodedPayload, signature] = transferToken.split('.');
+    for (const variant of [
+      `${transferToken}.`,
+      `${encodedPayload}..${signature}`,
+      `${encodedPayload}=.${signature}`,
+      ` ${transferToken}`,
+      `${transferToken}\n`,
+    ]) {
+      expect(await exchange(variant)).toBe(401);
+    }
+    expect(await exchange(transferToken)).toBe(409);
+  });
+
+  it('keeps answering 409 for a spent token after it expires', async () => {
+    const transferToken = createTransferToken('user-abc');
+    const firstRes = makeResponse();
+    await handleNativeAuthExchange(
+      makeRequest({ method: 'POST', body: { transferToken } }) as unknown as IncomingMessage,
+      firstRes as unknown as ServerResponse,
+    );
+    expect(firstRes.statusCode).toBe(200);
+
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() + 130_000 });
+    try {
+      const replayRes = makeResponse();
+      await handleNativeAuthExchange(
+        makeRequest({ method: 'POST', body: { transferToken } }) as unknown as IncomingMessage,
+        replayRes as unknown as ServerResponse,
+      );
+      expect(replayRes.statusCode).toBe(409);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('returns 400 for missing transferToken field', async () => {
@@ -417,7 +610,7 @@ describe('handleNativeAuthRefresh', () => {
     expect(res.statusCode).toBe(405);
   });
 
-  it('returns 500 when NEXTAUTH_SECRET is unset during token generation', async () => {
+  it('returns retryable 503 when NEXTAUTH_SECRET is unset during token generation', async () => {
     // Set up valid refresh token revocation
     mockDbUpdateReturning.mockResolvedValueOnce([
       {
@@ -438,15 +631,115 @@ describe('handleNativeAuthRefresh', () => {
       const req = makeRequest({ method: 'POST', body: { refreshToken } });
       const res = makeResponse();
       await handleNativeAuthRefresh(req as unknown as IncomingMessage, res as unknown as ServerResponse);
-      expect(res.statusCode).toBe(500);
-      expect(parseBody(res).error).toBe('Internal server error');
+      expect(res.statusCode).toBe(503);
+      expect(parseBody(res).error).toBe('Authentication is temporarily unavailable');
     } finally {
       process.env.NEXTAUTH_SECRET = savedSecret;
+    }
+  });
+
+  it.each(['hint', 'transaction', 'commit'])(
+    'returns 503 for an unavailable %s without logging private errors',
+    async (phase) => {
+      let transactionCompletedSuccessfully = false;
+      const failure = Object.assign(new Error('private fixture payload must not reach logs'), { code: 'ECONNRESET' });
+      const warn = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const error = vi.spyOn(logger, 'error').mockImplementation(() => logger);
+      if (phase === 'hint') {
+        mockedDatabase.select.mockImplementationOnce(() => {
+          throw failure;
+        });
+      } else if (phase === 'commit') {
+        mockDbUpdateReturning.mockResolvedValueOnce([
+          { userId: 'unit-subject', expiresAt: new Date(Date.now() + 90_000) },
+        ]);
+        mockedDatabase.transaction.mockImplementationOnce(async (operation) => {
+          const committedResult = await operation({
+            execute: async () => [{ transaction_isolation: 'read committed' }],
+            select: mockedDatabase.select,
+            update: mockedDatabase.update,
+            insert: mockedDatabase.insert,
+          });
+          transactionCompletedSuccessfully = committedResult.status === 200;
+          throw failure;
+        });
+      } else {
+        mockedDatabase.transaction.mockRejectedValueOnce(failure);
+      }
+      try {
+        const res = makeResponse();
+        await handleNativeAuthRefresh(
+          makeRequest({ method: 'POST', body: { refreshToken: crypto.randomUUID() } }) as unknown as IncomingMessage,
+          res as unknown as ServerResponse,
+        );
+        expect(res.statusCode).toBe(503);
+        expect(parseBody(res)).toEqual({ error: 'Token refresh is temporarily unavailable' });
+        expect(warn.mock.calls).toEqual([['[NativeAuth] Token refresh unavailable']]);
+        expect(error).not.toHaveBeenCalled();
+        if (phase === 'commit') {
+          expect(transactionCompletedSuccessfully).toBe(true);
+          expect(mockDbInsertValues).toHaveBeenCalledTimes(1);
+        }
+      } finally {
+        warn.mockRestore();
+        error.mockRestore();
+      }
+    },
+  );
+
+  it('does not turn failed success publication after commit into a retryable refusal', async () => {
+    mockDbUpdateReturning.mockResolvedValueOnce([
+      {
+        id: 'publication-row',
+        userId: 'unit-subject',
+        expiresAt: new Date(Date.now() + 90_000),
+      },
+    ]);
+    const res = makeResponse();
+    res.end = () => {
+      throw new Error('fixture socket closed');
+    };
+    const successLog = vi.spyOn(logger, 'info').mockImplementation(() => logger);
+    try {
+      await expect(
+        handleNativeAuthRefresh(
+          makeRequest({ method: 'POST', body: { refreshToken: crypto.randomUUID() } }) as unknown as IncomingMessage,
+          res as unknown as ServerResponse,
+        ),
+      ).rejects.toThrow('fixture socket closed');
+      expect(res.statusCode).toBe(200);
+      expect(successLog.mock.calls).toEqual([['[NativeAuth] Token refresh successful']]);
+    } finally {
+      successLog.mockRestore();
     }
   });
 });
 
 describe('Rate limiting', () => {
+  it('stores only a namespaced SHA-256 digest for the presented refresh secret', async () => {
+    const refreshToken = 'synthetic-secret-never-retained-in-quota-key';
+    const expectedKey = `refresh:${crypto.createHash('sha256').update(refreshToken).digest('hex')}`;
+    const observedKeys: string[] = [];
+    const actualSet = Object.getOwnPropertyDescriptor(Map.prototype, 'set')?.value as typeof Map.prototype.set;
+    if (typeof actualSet !== 'function') throw new Error('Map intrinsic unavailable');
+    const set = vi.spyOn(Map.prototype, 'set').mockImplementation(function (key, entry) {
+      if (typeof key === 'string' && key.startsWith('refresh:')) observedKeys.push(key);
+      return actualSet.call(this, key, entry);
+    });
+    try {
+      const res = makeResponse();
+      await handleNativeAuthRefresh(
+        makeRequest({ method: 'POST', body: { refreshToken } }) as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+      );
+      expect(res.statusCode).toBe(401);
+    } finally {
+      set.mockRestore();
+    }
+    expect(observedKeys).toContain(expectedKey);
+    expect(observedKeys.some((key) => key.includes(refreshToken))).toBe(false);
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     __resetNativeAuthStateForTests();
@@ -482,28 +775,219 @@ describe('Rate limiting', () => {
     expect(body.error).toContain('Rate limit exceeded');
   });
 
-  it('rate limits the refresh endpoint independently per IP', async () => {
-    // 10 requests from the same IP
-    for (let requestIndex = 0; requestIndex < 10; requestIndex++) {
+  it('admits distinct refresh secrets sharing one proxy address', async () => {
+    for (let requestIndex = 0; requestIndex < 30; requestIndex++) {
       const req = makeRequest({
         method: 'POST',
-        body: { refreshToken: `token-${requestIndex}` },
+        body: { refreshToken: `different-token-${requestIndex}` },
         remoteAddress: '10.0.0.50',
       });
       const res = makeResponse();
       await handleNativeAuthRefresh(req as unknown as IncomingMessage, res as unknown as ServerResponse);
-      expect(res.statusCode).not.toBe(429);
+      expect(res.statusCode).toBe(401);
     }
+  });
 
-    // 11th request from same IP
-    const req = makeRequest({
-      method: 'POST',
-      body: { refreshToken: 'token-overflow' },
-      remoteAddress: '10.0.0.50',
-    });
+  it('limits the same refresh secret across addresses and returns Retry-After', async () => {
+    for (let requestIndex = 0; requestIndex <= 10; requestIndex++) {
+      const req = makeRequest({
+        method: 'POST',
+        body: { refreshToken: 'one-repeated-refresh-secret' },
+        remoteAddress: `10.0.0.${requestIndex}`,
+      });
+      const res = makeResponse();
+      await handleNativeAuthRefresh(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+      expect(res.statusCode).toBe(requestIndex < 10 ? 401 : 429);
+      if (requestIndex === 10) {
+        expect(Number(res.headers['Retry-After'])).toBeGreaterThan(0);
+        expect(Number(res.headers['Retry-After'])).toBeLessThanOrEqual(60);
+      }
+    }
+  });
+
+  it('starts a fresh refresh window exactly at the previous deadline', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(2_000_000);
+    try {
+      for (let requestIndex = 0; requestIndex < 11; requestIndex++) {
+        const req = makeRequest({ method: 'POST', body: { refreshToken: 'window-secret' } });
+        const res = makeResponse();
+        await handleNativeAuthRefresh(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+        expect(res.statusCode).toBe(requestIndex < 10 ? 401 : 429);
+      }
+      now.mockReturnValue(2_060_000);
+      const res = makeResponse();
+      await handleNativeAuthRefresh(
+        makeRequest({ method: 'POST', body: { refreshToken: 'window-secret' } }) as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+      );
+      expect(res.statusCode).toBe(401);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('refuses existing-client capacity after lookup without consuming the token', async () => {
+    __fillRefreshRateLimitMapForTests(50_000);
     const res = makeResponse();
-    await handleNativeAuthRefresh(req as unknown as IncomingMessage, res as unknown as ServerResponse);
-    expect(res.statusCode).toBe(429);
+    await handleNativeAuthRefresh(
+      makeRequest({ method: 'POST', body: { refreshToken: 'capacity-secret' } }) as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+    );
+    expect(res.statusCode).toBe(503);
+    expect(parseBody(res)).toEqual({ error: 'Service temporarily overloaded' });
+    expect(mockedDatabase.select).toHaveBeenCalledTimes(1);
+    expect(mockedDatabase.transaction).not.toHaveBeenCalled();
+  });
+
+  it('keeps missing-token admission separate from full existing-client capacity', async () => {
+    __fillRefreshRateLimitMapForTests(50_000);
+    mockedDatabase.select.mockImplementationOnce(() => ({
+      from: () => ({ where: () => ({ limit: async () => [] }) }),
+    }));
+    const res = makeResponse();
+    await handleNativeAuthRefresh(
+      makeRequest({ method: 'POST', body: { refreshToken: 'missing-secret' } }) as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+    );
+    expect(res.statusCode).toBe(401);
+    expect(parseBody(res)).toEqual({ error: 'Invalid refresh token' });
+    expect(mockedDatabase.transaction).not.toHaveBeenCalled();
+  });
+
+  it('rotates an unseen existing secret while invalid-secret capacity is exhausted', async () => {
+    __fillInvalidRefreshRateLimitMapForTests(49_999);
+    for (const refreshToken of ['last-invalid-space', 'invalid-capacity-overflow']) {
+      mockedDatabase.select.mockImplementationOnce(() => ({
+        from: () => ({ where: () => ({ limit: async () => [] }) }),
+      }));
+      const res = makeResponse();
+      await handleNativeAuthRefresh(
+        makeRequest({ method: 'POST', body: { refreshToken } }) as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+      );
+      expect(res.statusCode).toBe(refreshToken === 'last-invalid-space' ? 401 : 503);
+    }
+    expect(mockedDatabase.transaction).not.toHaveBeenCalled();
+
+    mockDbUpdateReturning.mockResolvedValueOnce([
+      {
+        id: 'existing-refresh-row',
+        userId: 'user-abc',
+        expiresAt: new Date(Date.now() + 90_000),
+        createdAt: new Date(),
+      },
+    ]);
+    const res = makeResponse();
+    await handleNativeAuthRefresh(
+      makeRequest({
+        method: 'POST',
+        body: { refreshToken: 'previously-unseen-valid-secret' },
+      }) as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+    );
+    expect(res.statusCode).toBe(200);
+    expect(typeof parseBody(res).refreshToken).toBe('string');
+    expect(mockedDatabase.transaction).toHaveBeenCalledTimes(1);
+    expect(mockDbInsertValues).toHaveBeenCalledTimes(1);
+  });
+
+  it('throttles repeated missing secrets before lookup even when client capacity is full', async () => {
+    __fillRefreshRateLimitMapForTests(50_000);
+    for (let requestIndex = 0; requestIndex <= 10; requestIndex++) {
+      if (requestIndex < 10) {
+        mockedDatabase.select.mockImplementationOnce(() => ({
+          from: () => ({ where: () => ({ limit: async () => [] }) }),
+        }));
+      }
+      const res = makeResponse();
+      await handleNativeAuthRefresh(
+        makeRequest({
+          method: 'POST',
+          body: { refreshToken: 'repeated-missing-secret' },
+          remoteAddress: `10.0.0.${requestIndex}`,
+        }) as unknown as IncomingMessage,
+        res as unknown as ServerResponse,
+      );
+      expect(res.statusCode).toBe(requestIndex < 10 ? 401 : 429);
+      if (requestIndex === 10) expect(Number(res.headers['Retry-After'])).toBeGreaterThan(0);
+    }
+    expect(mockedDatabase.select).toHaveBeenCalledTimes(10);
+    expect(mockedDatabase.transaction).not.toHaveBeenCalled();
+  });
+
+  it('bounds invalid-capacity eviction scans and admits missing secrets again after expiry', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(4_000_000);
+    __fillInvalidRefreshRateLimitMapForTests(50_000);
+    const actualIterator = Map.prototype[Symbol.iterator];
+    let invalidCapacityScans = 0;
+    const iterator = vi.spyOn(Map.prototype, Symbol.iterator).mockImplementation(function () {
+      if (this.has('refresh:invalid-test-0')) invalidCapacityScans++;
+      return actualIterator.call(this);
+    });
+    try {
+      for (let requestIndex = 0; requestIndex < 5; requestIndex++) {
+        now.mockReturnValue(4_000_000 + requestIndex * 250);
+        mockedDatabase.select.mockImplementationOnce(() => ({
+          from: () => ({ where: () => ({ limit: async () => [] }) }),
+        }));
+        const res = makeResponse();
+        await handleNativeAuthRefresh(
+          makeRequest({
+            method: 'POST',
+            body: { refreshToken: `overflow-${requestIndex}` },
+          }) as unknown as IncomingMessage,
+          res as unknown as ServerResponse,
+        );
+        expect(res.statusCode).toBe(503);
+        expect(invalidCapacityScans).toBe(requestIndex === 4 ? 2 : 1);
+      }
+      now.mockReturnValue(4_060_000);
+      mockedDatabase.select.mockImplementationOnce(() => ({
+        from: () => ({ where: () => ({ limit: async () => [] }) }),
+      }));
+      const recovered = makeResponse();
+      await handleNativeAuthRefresh(
+        makeRequest({ method: 'POST', body: { refreshToken: 'after-invalid-expiry' } }) as unknown as IncomingMessage,
+        recovered as unknown as ServerResponse,
+      );
+      expect(recovered.statusCode).toBe(401);
+      expect(invalidCapacityScans).toBe(3);
+    } finally {
+      iterator.mockRestore();
+      now.mockRestore();
+    }
+  });
+
+  it('evicts expired refresh capacity and leaves sign-in capacity independent', async () => {
+    const now = vi.spyOn(Date, 'now').mockReturnValue(3_000_000);
+    try {
+      __fillRefreshRateLimitMapForTests(50_000);
+      const exchangeResponse = makeResponse();
+      await handleNativeAuthExchange(
+        makeRequest({ method: 'POST', body: { transferToken: 'invalid.signature' } }) as unknown as IncomingMessage,
+        exchangeResponse as unknown as ServerResponse,
+      );
+      expect(exchangeResponse.statusCode).toBe(401);
+      now.mockReturnValue(3_060_000);
+      const refreshResponse = makeResponse();
+      await handleNativeAuthRefresh(
+        makeRequest({ method: 'POST', body: { refreshToken: 'new-after-expiry' } }) as unknown as IncomingMessage,
+        refreshResponse as unknown as ServerResponse,
+      );
+      expect(refreshResponse.statusCode).toBe(401);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('keeps refresh independent of exhausted sign-in buckets and capacity', async () => {
+    __fillRateLimitMapForTests(50_000);
+    const res = makeResponse();
+    await handleNativeAuthRefresh(
+      makeRequest({ method: 'POST', body: { refreshToken: 'independent-secret' } }) as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+    );
+    expect(res.statusCode).toBe(401);
   });
 
   it('does not rate limit requests from a different IP', async () => {
@@ -609,6 +1093,9 @@ describe('handleNativeAuthRevoke', () => {
     expect(res.statusCode).toBe(401);
     const body = parseBody(res);
     expect(body.error).toBe('Invalid refresh token');
+    // A consumed secret cannot disable devices registered by a newer login.
+    expect(mockDbUpdateSet).toHaveBeenCalledTimes(1);
+    expect(mockDbUpdateSet).not.toHaveBeenCalledWith(expect.objectContaining({ active: false }));
   });
 
   it('revokes ALL tokens for the user, not just the submitted one', async () => {
@@ -628,12 +1115,15 @@ describe('handleNativeAuthRevoke', () => {
 
     expect(res.statusCode).toBe(200);
 
-    // The handler calls db.update() twice:
+    // All account cleanup uses the same transaction:
     // 1. Revoke the submitted token (with returning() to get userId)
     // 2. Revoke ALL remaining tokens for that user (by userId)
-    // mockDbUpdateSet is called for both updates
-    expect(mockDbUpdateSet).toHaveBeenCalledTimes(2);
-    expect(mockDbUpdateWhere).toHaveBeenCalledTimes(2);
+    // 3. Disable account push registrations.
+    expect(mockDbUpdateSet).toHaveBeenCalledTimes(3);
+    expect(mockDbUpdateWhere).toHaveBeenCalledTimes(3);
+    expect(mockDbUpdateSet).toHaveBeenLastCalledWith({ active: false, updatedAt: expect.any(Date) });
+    expect(mockedDatabase.update).not.toHaveBeenCalled();
+    expect(mockedDatabase.transaction).toHaveBeenCalledOnce();
   });
 
   it('is not rate limited (exempt from shared auth rate limiter)', async () => {
@@ -680,13 +1170,11 @@ describe('handleNativeAuthRevoke', () => {
     expect(parseBody(res).error).toBe('refreshToken is required');
   });
 
-  it('revokes an expired-but-unrevoked token and cleans up the user session', async () => {
+  it('revokes a live refresh token without requiring a live bearer', async () => {
     const rawRefreshToken = crypto.randomUUID();
 
-    // The token exists in the DB and hasn't been revoked, but it IS expired.
-    // The revoke handler checks `revoked_at IS NULL` but not expiry — this is
-    // intentional: an expired token that was never revoked should still allow
-    // the client to trigger a full sign-out (revoking all of that user's tokens).
+    // JWT expiry does not end the longer-lived refresh proof. A still-live
+    // refresh secret can sign out the native account without a valid bearer.
     mockDbUpdateReturning.mockResolvedValueOnce([
       {
         userId: 'user-expired',
@@ -702,9 +1190,87 @@ describe('handleNativeAuthRevoke', () => {
     const body = parseBody(res);
     expect(body.revoked).toBe(true);
 
-    // Both update calls happened: one for the submitted token, one for all user tokens
-    expect(mockDbUpdateSet).toHaveBeenCalledTimes(2);
-    expect(mockDbUpdateWhere).toHaveBeenCalledTimes(2);
+    // Bearer expiry does not prevent push cleanup with a live refresh secret.
+    expect(mockDbUpdateSet).toHaveBeenCalledTimes(3);
+    expect(mockDbUpdateWhere).toHaveBeenCalledTimes(3);
+    expect(mockDbUpdateSet).toHaveBeenLastCalledWith({ active: false, updatedAt: expect.any(Date) });
+  });
+
+  it('cleans up push devices with the refresh secret after the bearer expires', async () => {
+    const expiredBearer = await new SignJWT({})
+      .setProtectedHeader({ alg: 'HS256' })
+      .setSubject('user-expired-bearer')
+      .setIssuer('boardsesh')
+      .setAudience('boardsesh-mobile')
+      .setExpirationTime(Math.floor(Date.now() / 1000) - 120)
+      .sign(new TextEncoder().encode(TEST_SECRET));
+    expect(await validateMobileJwt(expiredBearer)).toBeNull();
+    mockDbUpdateReturning.mockResolvedValueOnce([{ userId: 'user-expired-bearer' }]);
+    const req = makeRequest({ method: 'POST', body: { refreshToken: crypto.randomUUID() } });
+    req.headers.authorization = `Bearer ${expiredBearer}`;
+    const res = makeResponse();
+    await handleNativeAuthRevoke(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+    expect(res.statusCode).toBe(200);
+    expect(mockDbUpdateSet).toHaveBeenLastCalledWith({ active: false, updatedAt: expect.any(Date) });
+  });
+
+  it('rolls back the claimed refresh secret when device cleanup fails', async () => {
+    let committedTokenRevocation = false;
+    const updatedTables: unknown[] = [];
+    mockedDatabase.transaction.mockImplementationOnce(async (operation) => {
+      let stagedTokenRevocation = false;
+      const selection = {
+        from: () => selection,
+        where: () => selection,
+        for: async () => [{ id: 'user-rollback' }],
+        // oxlint-disable-next-line unicorn/no-thenable -- Model Drizzle's awaitable query builder.
+        then: (resolve: (result: unknown[]) => unknown) =>
+          Promise.resolve([{ userId: 'user-rollback', expiresAt: new Date(Date.now() + 86400000) }]).then(resolve),
+      };
+      const transaction = {
+        execute: async () => [{ transaction_isolation: 'read committed' }],
+        delete: () => ({ where: async () => [] }),
+        select: () => selection,
+        insert: () => ({
+          values: () => ({
+            onConflictDoUpdate: () => ({
+              returning: async () => [
+                {
+                  userId: 'user-abc',
+                  generation: 0,
+                  nativeGeneration: 1,
+                  revokedThrough: new Date(),
+                  lastOperationId: crypto.randomUUID(),
+                },
+              ],
+            }),
+          }),
+        }),
+        update: (table: unknown) => {
+          updatedTables.push(table);
+          return {
+            set: () => ({
+              where: () => {
+                if (table === notificationDevices) throw new Error('device write unavailable');
+                stagedTokenRevocation = true;
+                return { returning: async () => [{ userId: 'user-rollback' }] };
+              },
+            }),
+          };
+        },
+      };
+      // Mimic the database transaction contract: only a fulfilled callback commits.
+      const result = await operation(transaction);
+      committedTokenRevocation = stagedTokenRevocation;
+      return result;
+    });
+    const req = makeRequest({ method: 'POST', body: { refreshToken: crypto.randomUUID() } });
+    const res = makeResponse();
+    await handleNativeAuthRevoke(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+    expect(res.statusCode).toBe(500);
+    expect(updatedTables).toEqual([mobileRefreshTokens, mobileRefreshTokens, notificationDevices]);
+    expect(committedTokenRevocation).toBe(false);
+    expect(mockedDatabase.update).not.toHaveBeenCalled();
   });
 });
 
@@ -741,6 +1307,7 @@ describe('validateMobileJwt', () => {
     expect(result).not.toBeNull();
     expect(result?.userId).toBe('test-user');
     expect(result?.isAuthenticated).toBe(true);
+    expect(result?.credentialExpiresAt).toBe(Number(decodeJwt(token).exp) * 1000);
   });
 
   it('returns null for a JWT with wrong issuer', async () => {
@@ -788,6 +1355,8 @@ describe('validateToken', () => {
     expect(result).not.toBeNull();
     expect(result?.userId).toBe('test-user');
     expect(result?.isAuthenticated).toBe(true);
+    expect(result?.credentialExpiresAt).toBe(Number(decodeJwt(token).exp) * 1000);
+    expect(await validateToken(token)).toEqual(result);
   });
 
   it('returns null for a token with 2 segments', async () => {
@@ -849,4 +1418,88 @@ describe('WebSocket auth path', () => {
     expect(result?.userId).toBe('ws-test-user');
     expect(result?.isAuthenticated).toBe(true);
   });
+});
+it('retains distributed transfer replay evidence through maximum signed lifetime and both clock tolerances', async () => {
+  __resetNativeAuthStateForTests();
+  const { redisClientManager } = await import('../redis/client');
+  const publisher = { exists: vi.fn(async () => 0), set: vi.fn(async () => 'OK') };
+  vi.mocked(redisClientManager.isRedisConnected).mockReturnValue(true);
+  vi.mocked(redisClientManager.getClients).mockReturnValue({ publisher });
+  const milliseconds = Math.floor(Date.now() / 1000) * 1000;
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(milliseconds);
+  vi.stubEnv('AUTH_LEGACY_BRIDGE_MODE', 'on');
+  try {
+    const transferToken = createTransferToken('user-abc', { issuedAt: milliseconds / 1000 + 5, expiresInSeconds: 125 });
+    const req = makeRequest({ method: 'POST', body: { transferToken } });
+    const res = makeResponse();
+    await handleNativeAuthExchange(req as unknown as IncomingMessage, res as unknown as ServerResponse);
+    expect(res.statusCode).toBe(200);
+    expect(publisher.set.mock.calls[0][3]).toBeGreaterThan(125 + 5 + 5);
+  } finally {
+    clock.mockRestore();
+    vi.unstubAllEnvs();
+    vi.mocked(redisClientManager.isRedisConnected).mockReturnValue(false);
+  }
+});
+it('preserves a consumed transfer across separate consumer clocks and independent Redis wall time', async () => {
+  __resetNativeAuthStateForTests();
+  const { redisClientManager } = await import('../redis/client');
+  const base = Math.floor(Date.now() / 1000) * 1000;
+  let redisWall = base;
+  const entries = new Map<string, number>();
+  const publisher = {
+    exists: vi.fn(async (key: string) => ((entries.get(key) ?? 0) > redisWall ? 1 : 0)),
+    set: vi.fn(async (key: string, _contents: string, _expiry: string, seconds: number) => {
+      if ((entries.get(key) ?? 0) > redisWall) return null;
+      entries.set(key, redisWall + seconds * 1000);
+      return 'OK';
+    }),
+  };
+  vi.mocked(redisClientManager.isRedisConnected).mockReturnValue(true);
+  vi.mocked(redisClientManager.getClients).mockReturnValue({ publisher });
+  const clock = vi.spyOn(Date, 'now').mockReturnValue(base + 60000);
+  vi.stubEnv('AUTH_LEGACY_BRIDGE_MODE', 'on');
+  try {
+    const transferToken = createTransferToken('user-abc', { issuedAt: base / 1000 + 65, expiresInSeconds: 125 });
+    const first = makeResponse();
+    await handleNativeAuthExchange(
+      makeRequest({ method: 'POST', body: { transferToken } }) as unknown as IncomingMessage,
+      first as unknown as ServerResponse,
+    );
+    expect(first.statusCode).toBe(200);
+    redisWall = base + 255000;
+    clock.mockReturnValue(base + 195000);
+    const replay = makeResponse();
+    await handleNativeAuthExchange(
+      makeRequest({
+        method: 'POST',
+        body: { transferToken },
+        remoteAddress: '127.0.0.2',
+      }) as unknown as IncomingMessage,
+      replay as unknown as ServerResponse,
+    );
+    expect(replay.statusCode).toBe(409);
+    expect(publisher.set).toHaveBeenCalledTimes(1);
+  } finally {
+    clock.mockRestore();
+    vi.unstubAllEnvs();
+    vi.mocked(redisClientManager.isRedisConnected).mockReturnValue(false);
+  }
+});
+it('refuses transfer exchange when distributed replay protection is unavailable in bridge-on mode', async () => {
+  __resetNativeAuthStateForTests();
+  const { redisClientManager } = await import('../redis/client');
+  vi.mocked(redisClientManager.isRedisConnected).mockReturnValue(false);
+  vi.stubEnv('AUTH_LEGACY_BRIDGE_MODE', 'on');
+  try {
+    const transferToken = createTransferToken('user-abc');
+    const res = makeResponse();
+    await handleNativeAuthExchange(
+      makeRequest({ method: 'POST', body: { transferToken } }) as unknown as IncomingMessage,
+      res as unknown as ServerResponse,
+    );
+    expect(res.statusCode).toBe(503);
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });

@@ -1,14 +1,14 @@
 /// <reference types="node" />
 
 /**
- * Resolve a ready Android dev-client APK for the local emulator screenshot flow.
+ * Resolve a ready Android dev-client APK for local emulators or physical phones.
  *
  * Order of preference:
  *   1. --app-path <apk>           (bring your own)
  *   2. cached/downloaded universal CI dev-client APK from the latest
  *      rn-android-dev-* release (no Java/Gradle needed), guarded so an arm64-only
- *      APK never gets installed on the x86_64 emulator
- *   3. local Gradle build (BOARDSESH_APP_VARIANT=dev, x86_64), cached by a hash of
+ *      APK never gets installed on an incompatible target
+ *   3. local Gradle build (BOARDSESH_APP_VARIANT=dev, selected ABI), cached by a hash of
  *      the native inputs — the offline / native-deps-changed fallback
  *
  * The APK has no bundled JS: it boots expo-dev-client and loads JS from Metro, so
@@ -19,6 +19,7 @@
  *   vp run mobile:android-apk -- --build-local    # force a local Gradle build
  *   vp run mobile:android-apk -- --apk-tag rn-android-dev-42
  *   vp run mobile:android-apk -- --require-fresh  # build locally rather than use a stale release
+ *   vp run mobile:android-apk -- --require-fresh --abi arm64-v8a # physical phone
  *
  * On GitHub Actions --require-fresh is the default: a downloaded release APK is
  * only used when its native tree provably matches HEAD's — either the release
@@ -35,6 +36,7 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { commandExists, runCapture, runInherit } from './lib/exec';
 import { ensureAndroidSdk } from './lib/android-sdk';
+import { compareDevNativeInputs, DEV_NATIVE_INPUT_PATHS, latestPublishedDevApk } from './lib/android-dev-native';
 
 const LOG = '[mobile:android-apk]';
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -42,10 +44,41 @@ const ANDROID_CACHE = join(homedir(), '.cache', 'boardsesh', 'android');
 const DOWNLOAD_DIR = join(ANDROID_CACHE, 'downloaded');
 const LOCAL_BUILD_DIR = join(ANDROID_CACHE, 'local-build');
 const APK_ASSET = 'boardsesh-dev-android.apk';
-// The emulator is x86_64 (the KVM fast path); the APK must carry that ABI.
-const REQUIRED_ABI = 'x86_64';
+export type AndroidApkAbi = 'x86_64' | 'arm64-v8a';
+// Keep the existing emulator/CI default; physical phones opt into arm64-v8a.
+const DEFAULT_ABI: AndroidApkAbi = 'x86_64';
+
+export function androidApkAbi(candidate: unknown = DEFAULT_ABI): AndroidApkAbi {
+  if (candidate !== 'x86_64' && candidate !== 'arm64-v8a') throw new Error('--abi must be x86_64 or arm64-v8a');
+  return candidate;
+}
+
+export function parseApkAbi(args: readonly string[]): AndroidApkAbi {
+  const index = args.findIndex((argument) => argument === '--abi' || argument.startsWith('--abi='));
+  if (index < 0) return DEFAULT_ABI;
+  const argument = args[index];
+  const abi = argument === '--abi' ? args[index + 1] : argument.slice('--abi='.length);
+  if (!abi || abi.startsWith('--')) throw new Error('--abi requires x86_64 or arm64-v8a');
+  return androidApkAbi(abi);
+}
+
+export function localApkCacheKey(nativeHash: string, abi: AndroidApkAbi): string {
+  return `${nativeHash}-${abi}`;
+}
+
+export function androidGradleArguments(abi: AndroidApkAbi): string[] {
+  return [
+    'assembleDebug',
+    `-PreactNativeArchitectures=${abi}`,
+    `-PboardseshAbiFilters=${abi}`,
+    '--build-cache',
+    '--no-daemon',
+    '--console=plain',
+  ];
+}
 
 export interface EnsureApkOptions {
+  abi?: AndroidApkAbi;
   buildLocal?: boolean;
   apkTag?: string;
   appPath?: string;
@@ -76,6 +109,8 @@ export interface ResolvedAndroidApk {
 export const NATIVE_INPUT_PATHS: { readonly files: readonly string[]; readonly dirs: readonly string[] } = {
   files: [
     'packages/mobile/app.config.ts',
+    'packages/mobile/fingerprint.config.js',
+    'packages/mobile/eas.json',
     'packages/mobile/package.json',
     'package.json',
     'pnpm-lock.yaml',
@@ -83,25 +118,26 @@ export const NATIVE_INPUT_PATHS: { readonly files: readonly string[]; readonly d
     'pnpm-workspace.yaml',
   ],
   // dev-assets: the dev variant's icon / adaptive icon / splash (app.config.ts).
-  dirs: ['packages/mobile/plugins', 'packages/mobile/modules', 'packages/mobile/dev-assets', 'patches'],
+  dirs: [
+    'packages/mobile/plugins',
+    'packages/mobile/modules',
+    'packages/mobile/dev-assets',
+    'packages/mobile/assets',
+    'packages/mobile/locales',
+    'packages/mobile/targets',
+    'patches',
+  ],
 };
 
 /**
  * Paths `git diff` compares between a release APK's commit and HEAD to decide
  * whether the prebuilt APK still matches this checkout.
  *
- * The native inputs minus `pnpm-lock.yaml`, plus the workflow that produces the
- * APK. The lockfile is left out on purpose: the producer workflow's `paths:`
- * filter ignores it too, so a lockfile-only change never yields a new release
- * and treating it as staleness would rebuild locally (~30 min) on every
- * dependency bump. The iOS `.app` cache key makes the same trade — a
- * transitive-only native bump is an accepted blind spot.
+ * The same candidate paths as the published native gate. A candidate diff is
+ * resolved through Expo before rejecting the APK: a version bump or unrelated
+ * lockfile edit may leave its native fingerprint unchanged.
  */
-export const DEV_APK_FRESHNESS_PATHS: readonly string[] = [
-  ...NATIVE_INPUT_PATHS.files.filter((path) => path !== 'pnpm-lock.yaml'),
-  ...NATIVE_INPUT_PATHS.dirs,
-  '.github/workflows/android-apk-dev-client.yml',
-];
+export const DEV_APK_FRESHNESS_PATHS: readonly string[] = DEV_NATIVE_INPUT_PATHS;
 
 /** Minimal `git` surface devApkFreshness needs, injected so tests never spawn git. */
 export type GitRunner = (args: string[]) => { status: number; stdout: string };
@@ -113,25 +149,29 @@ const defaultGitRunner: GitRunner = (args) => {
 
 export type DevApkFreshness =
   | { fresh: true; reason?: 'newer-release-same-native-inputs' }
-  | { fresh: false; reason: 'not-an-ancestor' | 'native-inputs-changed' | 'unknown' };
+  | { fresh: false; reason: 'native-inputs-changed' | 'unknown' };
 
-/** Latest rn-android-dev-N tag by build number (not list order). Null if none/unreachable. */
+/** Latest successfully published rn-android-dev-N APK. Null if none/unreachable. */
 export function resolveLatestDevTag(): string | null {
-  const result = runCapture('gh', ['release', 'list', '--limit', '50']);
-  if (result.status !== 0) return null;
-  const tags = result.stdout
-    .split(/\r?\n/)
-    .flatMap((line) => line.split(/\s+/))
-    .filter((token) => /^rn-android-dev-\d+$/.test(token))
-    .sort((a, b) => Number(a.replace(/\D/g, '')) - Number(b.replace(/\D/g, '')));
-  return tags[tags.length - 1] ?? null;
+  try {
+    return latestPublishedDevApk(ROOT_DIR)?.tag ?? null;
+  } catch (error) {
+    console.warn(`${LOG} published APK lookup failed: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  }
 }
 
 /** True if the APK ships native libs for `abi` (lib/<abi>/...). */
-function apkHasAbi(apkPath: string, abi: string): boolean {
-  const listing = runCapture('unzip', ['-l', apkPath]);
-  if (listing.status !== 0) return false;
-  return listing.stdout.includes(`lib/${abi}/`);
+export function apkListingHasAbi(listing: string, abi: AndroidApkAbi): boolean {
+  const nativeLibrary = new RegExp(`^lib/${abi}/[^/]+\\.so$`);
+  return listing.split(/\r?\n/).some((filename) => nativeLibrary.test(filename.trim()));
+}
+
+function apkHasAbi(apkPath: string, abi: AndroidApkAbi): boolean {
+  const listing = runCapture('unzip', ['-Z1', apkPath]);
+  if (listing.status !== 0)
+    throw new Error(`Cannot list APK archive ${apkPath}; verify unzip is on PATH and the APK is readable`);
+  return apkListingHasAbi(listing.stdout, abi);
 }
 
 function downloadDevApk(tag: string): string {
@@ -183,11 +223,11 @@ function nativeInputHash(): string {
   return hash.digest('hex').slice(0, 16);
 }
 
-function buildDevApkLocally(): string {
-  const hash = nativeInputHash();
+function buildDevApkLocally(abi: AndroidApkAbi): string {
+  const hash = localApkCacheKey(nativeInputHash(), abi);
   const outDir = join(LOCAL_BUILD_DIR, hash);
   const cachedApk = join(outDir, 'app-debug.apk');
-  if (existsSync(cachedApk)) {
+  if (existsSync(cachedApk) && apkHasAbi(cachedApk, abi)) {
     console.log(`${LOG} Using cached local build (${hash}): ${cachedApk}`);
     return cachedApk;
   }
@@ -223,17 +263,8 @@ function buildDevApkLocally(): string {
 
   const androidDir = join(mobileDir, 'android');
   const gradlew = join(androidDir, 'gradlew');
-  const gradleArgs = [
-    'assembleDebug',
-    `-PreactNativeArchitectures=${REQUIRED_ABI}`,
-    `-PboardseshAbiFilters=${REQUIRED_ABI}`,
-    // Reuse task outputs from ~/.gradle/caches across runs (CI restores it via
-    // actions/cache; see mobile-screenshots-android.yml).
-    '--build-cache',
-    '--no-daemon',
-    '--console=plain',
-  ];
-  console.log(`${LOG} gradlew assembleDebug (${REQUIRED_ABI}); first build is slow (NDK + Hermes)...`);
+  const gradleArgs = androidGradleArguments(abi);
+  console.log(`${LOG} gradlew assembleDebug (${abi}); first build is slow (NDK + Hermes)...`);
   let status = runInherit(gradlew, gradleArgs, { env: buildEnv, cwd: androidDir });
   if (status !== 0) {
     // A cold New-Architecture codegen race can fail the first build; retry once.
@@ -244,6 +275,7 @@ function buildDevApkLocally(): string {
 
   const built = join(androidDir, 'app', 'build', 'outputs', 'apk', 'debug', 'app-debug.apk');
   if (!existsSync(built)) throw new Error(`gradle reported success but ${built} is missing`);
+  if (!apkHasAbi(built, abi)) throw new Error(`Gradle APK has no ${abi} native libraries; refusing to cache it`);
   mkdirSync(outDir, { recursive: true });
   copyFileSync(built, cachedApk);
   console.log(`${LOG} Cached local build: ${cachedApk}`);
@@ -273,25 +305,15 @@ export function resolveDevTagCommit(tag: string): string | null {
 }
 
 /**
- * Does the release APK built at `tagCommit` still match `headSha`'s native tree?
- *
- * Pure over an injected git runner. The common case is `tagCommit` an ancestor of
- * `headSha` (this checkout is ahead of the release): fresh iff the native inputs
- * are unchanged since. When `tagCommit` is instead a DESCENDANT of `headSha` —
- * every native deploy to main publishes a fresh rn-android-dev-* release, so a
- * workflow checked out at an older pinned commit (e.g. a `workflow_run.head_sha`
- * from 30-50 minutes earlier) often sees a newer release by the time it runs —
- * the check flips direction: fresh (`newer-release-same-native-inputs`) iff the
- * native inputs are unchanged between the two commits, since the APK's native
- * tree is identical either way. `not-an-ancestor` means neither commit contains
- * the other (a PR branched off before the release, or a different line of
- * history) — the diff would then be two-way and unreadable, so it's reported
- * rather than measured.
+ * Compare native trees regardless of ancestry. Candidate edits require matching
+ * Expo dev fingerprints; newer compatible releases are useful to pinned captures.
  */
 export function devApkFreshness(
   headSha: string,
   tagCommit: string,
   runGit: GitRunner = defaultGitRunner,
+  compareFingerprints: (headCommit: string, baseCommit: string) => boolean = (headCommit, baseCommit) =>
+    compareDevNativeInputs(ROOT_DIR, headCommit, baseCommit).compatible,
 ): DevApkFreshness {
   const haveCommit = (commit: string): boolean => runGit(['cat-file', '-e', `${commit}^{commit}`]).status === 0;
   if (!haveCommit(tagCommit)) {
@@ -303,16 +325,31 @@ export function devApkFreshness(
   if (runGit(['merge-base', '--is-ancestor', tagCommit, headSha]).status === 0) {
     const diff = runGit(['diff', '--quiet', tagCommit, headSha, '--', ...DEV_APK_FRESHNESS_PATHS]);
     if (diff.status === 0) return { fresh: true };
-    if (diff.status === 1) return { fresh: false, reason: 'native-inputs-changed' };
+    if (diff.status === 1) {
+      return compareFingerprints(headSha, tagCommit)
+        ? { fresh: true }
+        : { fresh: false, reason: 'native-inputs-changed' };
+    }
     return { fresh: false, reason: 'unknown' };
   }
   if (runGit(['merge-base', '--is-ancestor', headSha, tagCommit]).status === 0) {
     const diff = runGit(['diff', '--quiet', headSha, tagCommit, '--', ...DEV_APK_FRESHNESS_PATHS]);
     if (diff.status === 0) return { fresh: true, reason: 'newer-release-same-native-inputs' };
-    if (diff.status === 1) return { fresh: false, reason: 'native-inputs-changed' };
+    if (diff.status === 1) {
+      return compareFingerprints(headSha, tagCommit)
+        ? { fresh: true, reason: 'newer-release-same-native-inputs' }
+        : { fresh: false, reason: 'native-inputs-changed' };
+    }
     return { fresh: false, reason: 'unknown' };
   }
-  return { fresh: false, reason: 'not-an-ancestor' };
+  const diff = runGit(['diff', '--quiet', tagCommit, headSha, '--', ...DEV_APK_FRESHNESS_PATHS]);
+  if (diff.status === 0) return { fresh: true };
+  if (diff.status === 1) {
+    return compareFingerprints(headSha, tagCommit)
+      ? { fresh: true }
+      : { fresh: false, reason: 'native-inputs-changed' };
+  }
+  return { fresh: false, reason: 'unknown' };
 }
 
 function resolveHeadSha(): string {
@@ -357,30 +394,30 @@ function downloadedApkIsUsable(tag: string, options: EnsureApkOptions, requireFr
 
 /** Resolve a ready APK per the preference order above, with where it came from. */
 export function resolveAndroidApk(options: EnsureApkOptions = {}): ResolvedAndroidApk {
+  const abi = androidApkAbi(options.abi);
   if (options.appPath) {
     if (!existsSync(options.appPath)) throw new Error(`--app-path not found: ${options.appPath}`);
+    if (!apkHasAbi(options.appPath, abi)) throw new Error(`--app-path APK has no ${abi} native libraries`);
     return { apkPath: options.appPath, source: 'app-path' };
   }
-  if (options.buildLocal) return { apkPath: buildDevApkLocally(), source: 'local-build' };
+  if (options.buildLocal) return { apkPath: buildDevApkLocally(abi), source: 'local-build' };
 
   const requireFresh = options.requireFresh ?? process.env.GITHUB_ACTIONS === 'true';
   try {
     const tag = options.apkTag ?? resolveLatestDevTag();
     if (!tag) throw new Error('no rn-android-dev-* release found');
     const apk = downloadDevApk(tag);
-    if (apkHasAbi(apk, REQUIRED_ABI)) {
+    if (apkHasAbi(apk, abi)) {
       if (downloadedApkIsUsable(tag, options, requireFresh)) return { apkPath: apk, source: `release:${tag}` };
     } else {
-      console.warn(
-        `${LOG} ${tag} APK has no ${REQUIRED_ABI} ABI (the CI dev-client build is not universal yet). Building locally instead.`,
-      );
+      console.warn(`${LOG} ${tag} APK has no ${abi} native libraries. Building locally instead.`);
     }
   } catch (error) {
     console.warn(
       `${LOG} download path unavailable (${error instanceof Error ? error.message : String(error)}); building locally instead.`,
     );
   }
-  return { apkPath: buildDevApkLocally(), source: 'local-build' };
+  return { apkPath: buildDevApkLocally(abi), source: 'local-build' };
 }
 
 /** Resolve a ready APK path per the preference order above. */
@@ -402,7 +439,7 @@ export function main(argv: readonly string[] = process.argv.slice(2)): number {
   const appPath = pathIndex >= 0 ? resolve(args[pathIndex + 1]) : undefined;
   const requireFresh = args.includes('--require-fresh') ? true : undefined;
   try {
-    const resolved = resolveAndroidApk({ buildLocal, apkTag, appPath, requireFresh });
+    const resolved = resolveAndroidApk({ buildLocal, apkTag, appPath, requireFresh, abi: parseApkAbi(args) });
     const apk = resolve(resolved.apkPath);
     console.log(`${LOG} APK ready: ${apk}`);
     // The screenshot workflow installs the APK this resolved, so hand it back as

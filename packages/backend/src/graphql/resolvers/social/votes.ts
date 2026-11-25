@@ -1,10 +1,15 @@
-import { eq, and, inArray } from 'drizzle-orm';
+import { canReadSocialEntity, socialEntityPrivacyCondition } from '../shared/activity-privacy';
+import { eq, and, inArray, isNull, sql } from 'drizzle-orm';
+import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 import type { ConnectionContext, SocialEntityType } from '@boardsesh/shared-schema';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
 import { VoteInputSchema, BulkVoteSummaryInputSchema, SocialEntityTypeSchema } from '../../../validation/schemas';
 import { validateEntityExists } from './entity-validation';
+import { lockReferencedClimb } from '../climbs/spray-climb-lock';
+import { lockActiveBoardForWrite } from '../../../services/board-reference-lock';
+import { readableSocialEntityIds } from './entity-read-access';
 import { publishSocialEvent } from '../../../events/index';
 import { logger } from '../../../utils/logger';
 
@@ -13,6 +18,11 @@ async function getVoteSummary(
   entityId: string,
   authenticatedUserId: string | null | undefined,
 ) {
+  if (!(await canReadSocialEntity(entityType, entityId, authenticatedUserId)))
+    return { entityType, entityId, upvotes: 0, downvotes: 0, voteScore: 0, userVote: 0 };
+  if (!(await readableSocialEntityIds(entityType, [entityId], authenticatedUserId)).has(entityId)) {
+    return { entityType, entityId, upvotes: 0, downvotes: 0, voteScore: 0, userVote: 0 };
+  }
   // Single query to vote_counts table instead of 3 separate COUNT queries
   const [counts] = await db
     .select({
@@ -71,6 +81,18 @@ export const socialVoteQueries = {
     const authenticatedUserId = ctx.isAuthenticated ? ctx.userId : null;
 
     if (entityIds.length === 0) return [];
+    const readableIds = await readableSocialEntityIds(entityType, entityIds, authenticatedUserId);
+    const visibleEntityIds = entityIds.filter((entityId) => readableIds.has(entityId));
+    if (visibleEntityIds.length === 0) {
+      return entityIds.map((entityId) => ({
+        entityType,
+        entityId,
+        upvotes: 0,
+        downvotes: 0,
+        voteScore: 0,
+        userVote: 0,
+      }));
+    }
 
     // Single query to vote_counts instead of separate upvote/downvote GROUP BY queries
     const countResults = await db
@@ -80,7 +102,18 @@ export const socialVoteQueries = {
         downvotes: dbSchema.voteCounts.downvotes,
       })
       .from(dbSchema.voteCounts)
-      .where(and(eq(dbSchema.voteCounts.entityType, entityType), inArray(dbSchema.voteCounts.entityId, entityIds)));
+      .where(
+        and(
+          eq(dbSchema.voteCounts.entityType, entityType),
+          inArray(dbSchema.voteCounts.entityId, visibleEntityIds),
+          socialEntityPrivacyCondition(
+            sql`${entityType}`,
+            dbSchema.voteCounts.entityId,
+            authenticatedUserId,
+            'by-reference',
+          ),
+        ),
+      );
 
     const votesMap = new Map<string, { upvotes: number; downvotes: number }>();
     for (const row of countResults) {
@@ -102,7 +135,13 @@ export const socialVoteQueries = {
         .where(
           and(
             eq(dbSchema.votes.entityType, entityType),
-            inArray(dbSchema.votes.entityId, entityIds),
+            inArray(dbSchema.votes.entityId, visibleEntityIds),
+            socialEntityPrivacyCondition(
+              sql`${entityType}`,
+              dbSchema.votes.entityId,
+              authenticatedUserId,
+              'by-reference',
+            ),
             eq(dbSchema.votes.userId, authenticatedUserId),
           ),
         );
@@ -126,6 +165,9 @@ export const socialVoteQueries = {
   },
 };
 
+/** The `db` singleton or a transaction's `tx`. */
+type VoteExecutor = PgDatabase<PgQueryResultHKT, Record<string, unknown>>;
+
 export const socialVoteMutations = {
   vote: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
     requireAuthenticated(ctx);
@@ -137,39 +179,77 @@ export const socialVoteMutations = {
 
     await validateEntityExists(entityType as SocialEntityType, entityId, userId);
 
-    // Check for existing vote
-    const [existing] = await db
-      .select({ id: dbSchema.votes.id, value: dbSchema.votes.value })
-      .from(dbSchema.votes)
-      .where(
-        and(
-          eq(dbSchema.votes.userId, userId),
-          eq(dbSchema.votes.entityType, entityType as SocialEntityType),
-          eq(dbSchema.votes.entityId, entityId),
-        ),
-      )
-      .limit(1);
+    const writeVote = async (executor: VoteExecutor): Promise<boolean> => {
+      // Check for existing vote
+      const [existing] = await executor
+        .select({ id: dbSchema.votes.id, value: dbSchema.votes.value })
+        .from(dbSchema.votes)
+        .where(
+          and(
+            eq(dbSchema.votes.userId, userId),
+            eq(dbSchema.votes.entityType, entityType as SocialEntityType),
+            eq(dbSchema.votes.entityId, entityId),
+          ),
+        )
+        .limit(1);
 
-    let isFirstVote = false;
-
-    if (existing) {
-      if (existing.value === value) {
-        // Same value — toggle off (remove vote)
-        await db.delete(dbSchema.votes).where(eq(dbSchema.votes.id, existing.id));
+      let isFirstVote = false;
+      if (existing) {
+        if (existing.value === value) {
+          // Same value — toggle off (remove vote)
+          await executor.delete(dbSchema.votes).where(eq(dbSchema.votes.id, existing.id));
+        } else {
+          // Different value — update (direction change, not a new vote)
+          await executor.update(dbSchema.votes).set({ value }).where(eq(dbSchema.votes.id, existing.id));
+        }
       } else {
-        // Different value — update (direction change, not a new vote)
-        await db.update(dbSchema.votes).set({ value }).where(eq(dbSchema.votes.id, existing.id));
+        // No existing vote — insert
+        await executor.insert(dbSchema.votes).values({
+          userId,
+          entityType: entityType as SocialEntityType,
+          entityId,
+          value,
+        });
+        isFirstVote = true;
       }
-    } else {
-      // No existing vote — insert
-      await db.insert(dbSchema.votes).values({
-        userId,
-        entityType: entityType as SocialEntityType,
-        entityId,
-        value,
-      });
-      isFirstVote = true;
-    }
+      return isFirstVote;
+    };
+
+    // The existence check above runs outside any transaction, and a spray climb
+    // can be hard-deleted by its setter (`deleteClimb`, #5960). Holding the climb
+    // until the vote commits stops a vote landing after the delete's sweep.
+    const isFirstVote =
+      entityType === 'climb' || entityType === 'board' || entityType === 'gym'
+        ? await db.transaction(async (tx) => {
+            if (entityType === 'climb') await lockReferencedClimb(tx, entityId);
+            else if (entityType === 'board') {
+              if (!(await lockActiveBoardForWrite(tx, { uuid: entityId }))) throw new Error('Content not available');
+            } else {
+              const [gym] = await tx
+                .select({ id: dbSchema.gyms.id })
+                .from(dbSchema.gyms)
+                .where(
+                  and(
+                    eq(dbSchema.gyms.uuid, entityId),
+                    isNull(dbSchema.gyms.deletedAt),
+                    isNull(dbSchema.gyms.mergedIntoGymId),
+                  ),
+                )
+                .for('share')
+                .limit(1);
+              if (!gym) throw new Error('Content not available');
+            }
+            if (entityType !== 'climb') {
+              const [visibility] = await tx
+                .select({
+                  allowed: socialEntityPrivacyCondition(sql`${entityType}`, sql`${entityId}`, userId, 'by-reference'),
+                })
+                .from(sql`(SELECT 1) privacy_check`);
+              if (visibility?.allowed !== true) throw new Error('Content not available');
+            }
+            return writeVote(tx);
+          })
+        : await writeVote(db);
 
     // Only notify on first vote, not on direction changes or toggle-off
     if (isFirstVote) {

@@ -22,6 +22,7 @@ function makeInput(overrides: Partial<CustomLookModelInput> = {}): CustomLookMod
     },
     preview: null,
     previewHeight: 268,
+    onResetBoardLook: vi.fn(),
     ...overrides,
     // `boardsesh` is spread above from the override, so re-pin it after the spread.
     ...(overrides.boardsesh ? { boardsesh } : {}),
@@ -69,6 +70,27 @@ describe('buildCustomLookModel — the other conditional sliders', () => {
       );
     }
   });
+
+  it('relabels the strength slider as the outline’s under the outline mark', () => {
+    // Same `fillOpacity` field — it is the stroke's alpha under `outline` — so
+    // the row key stays put and only the label tells the climber what it moves.
+    const outline = makeInput({ boardsesh: { ...DEFAULT_BOARDSESH_RENDER_SETTINGS, markStyle: 'outline' } });
+    const row = findRow(outline, 'fillOpacity') as MoreSliderRow | undefined;
+    expect(row?.label).toBe('mobile.settings.boardLook.marks.outlineOpacity.title');
+
+    const fill = makeInput({ boardsesh: { ...DEFAULT_BOARDSESH_RENDER_SETTINGS, markStyle: 'fill' } });
+    expect((findRow(fill, 'fillOpacity') as MoreSliderRow | undefined)?.label).toBe(
+      'mobile.settings.boardLook.marks.fillOpacity.title',
+    );
+  });
+
+  it('offers Outline as a mark style', () => {
+    const row = findRow(makeInput(), 'markStyle') as MoreSegmentedRow | undefined;
+    expect(row?.options.map((option) => option.key)).toContain('outline');
+    expect(row?.options.find((option) => option.key === 'outline')?.label).toBe(
+      'mobile.settings.boardLook.marks.style.options.outline',
+    );
+  });
 });
 
 describe('buildCustomLookModel — the drag/commit split', () => {
@@ -112,7 +134,7 @@ describe('buildCustomLookModel — the board you are tuning', () => {
   it('leads with the preview, above the knobs that change it', () => {
     const model = buildCustomLookModel(makeInput({ preview: 'PREVIEW' }));
     expect(model.sections[0].key).toBe('preview');
-    expect(model.sections.map((section) => section.key)).toEqual(['preview', 'mode', 'glowVeil', 'marks']);
+    expect(model.sections.map((section) => section.key)).toEqual(['preview', 'mode', 'glowVeil', 'marks', 'reset']);
   });
 
   it('hosts it full-bleed at the height it was given', () => {
@@ -128,6 +150,25 @@ describe('buildCustomLookModel — the board you are tuning', () => {
       'mode',
       'glowVeil',
       'marks',
+      'reset',
     ]);
+  });
+});
+
+describe('buildCustomLookModel — the reset', () => {
+  it('ends the page, with the note promising hold colours are left alone', () => {
+    const reset = buildCustomLookModel(makeInput()).sections.at(-1);
+    expect(reset?.key).toBe('reset');
+    expect(reset?.footer).toBe('mobile.settings.boardLook.resetAllNote');
+  });
+
+  it('is the quiet button, and fires only the board-look reset', () => {
+    const onResetBoardLook = vi.fn();
+    const row = findRow(makeInput({ onResetBoardLook }), 'resetBoardLook');
+    if (row?.kind !== 'button') throw new Error('no reset button');
+    expect(row.label).toBe('mobile.settings.boardLook.resetAll');
+    expect(row.emphasis).toBe('subtle');
+    row.onPress();
+    expect(onResetBoardLook).toHaveBeenCalledTimes(1);
   });
 });

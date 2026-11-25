@@ -3,20 +3,23 @@ import { randomBytes, randomUUID } from 'crypto';
 import Busboy from 'busboy';
 import sharp from 'sharp';
 import { and, eq, isNull } from 'drizzle-orm';
+import { SPRAY_WALL_PHOTO_MAX_PIXELS, sprayWallPhotoMaxLongSide } from '@boardsesh/spray-wall-geometry';
+import { SPRAY_WALL_ARCHIVED_CODE, SPRAY_WALL_ARCHIVED_MESSAGE } from '../services/spray-wall-archive';
 import * as dbSchema from '@boardsesh/db/schema';
 import { applyCorsHeaders } from './cors';
 import { guardUploadFileStream } from './http-utils';
 import {
-  detectImageMimeType,
   extractAuthTokenFromHeader,
   formatByteCapForMessage,
   validateGymUuid as isWellFormedUuid,
 } from './gym-image-upload';
-import { validateToken } from '../middleware/auth';
-import { isS3Configured, uploadToS3 } from '../storage/s3';
+import { detectImageMimeType } from '../lib/image-mime';
+import { validateHttpAuthToken } from './auth-admission';
+import { deleteFromS3, isS3Configured, uploadToS3 } from '../storage/s3';
 import { writeImageVariants } from '../lib/image-resize';
 import { db } from '../db/client';
 import { logger } from '../utils/logger';
+import { markDeletedSprayWallPhotoRetry } from '../services/spray-photo-erasure-retry';
 
 /**
  * POST /api/spray-wall-photos — the one way a photograph of somebody's wall
@@ -27,7 +30,7 @@ import { logger } from '../utils/logger';
  * picture of the inside of someone's home**:
  *
  *  1. **The `private` bucket, never `media`.** `media` is world-readable under
- *     guessable keys (`docs/user-media-storage.md`), so a wall photo there is
+ *     guessable keys (`docs/operations/user-media-storage.md`), so a wall photo there is
  *     public the moment anyone guesses a uuid. Reads go through 15-minute
  *     presigned URLs instead (`presignGetObject`).
  *  2. **No local-dev disk fallback.** The gym handlers write to `./gym-photos`
@@ -45,19 +48,47 @@ import { logger } from '../utils/logger';
  *  - `photo`: the image
  *  - `wallUuid`: the wall (the `user_boards` uuid) the photo belongs to
  *
+ * Two sizes are stored (#5911). The BASE is at most
+ * {@link SPRAY_WALL_PHOTO_BASE_MAX_DIMENSION} px on its long side: it is what the
+ * canonical frame, the hold detector and the climb view read, and its size is
+ * the one the response and the object metadata carry. A source larger than that
+ * also gets a FULL copy (`sprayWallFullPhotoKey`) that only the hold editor
+ * loads once it zooms past the base's resolution. Its size follows the rule the
+ * app uploads by (`sprayWallPhotoMaxLongSide` in `@boardsesh/spray-wall-geometry`):
+ * at most 5712 px on the long side (`SPRAY_WALL_PHOTO_MAX_LONG_SIDE`), a 24 MP
+ * phone photo, and at most 24.5 MP, so a square photo stops at 4946 px and a
+ * decoded copy stays under the 100 MiB Android will draw.
+ *
  * Returns `{ success, photoId, width, height }`. The photo sits in the bucket
  * unreferenced until `createSprayWallVersion(wallUuid, photoId)` adopts it as a
  * draft version — an abandoned upload is a stray object the SW-17 cleanup job
  * sweeps, not a row anybody can see.
  */
 
-/** 10MB. A phone photo of a wall is 2-5MB; the cap bounds what one POST can cost. */
-export const SPRAY_WALL_PHOTO_MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+/**
+ * 25MB. The app sends up to a 24 MP photo (5712 x 4284) at JPEG 0.92. Twenty
+ * indoor-wall photos from Wikimedia Commons, resized the way the app does, came
+ * to 1.2-4.0MB at libjpeg quality 92, and at most 12.3MB (scaled to the full
+ * 24.5 MP) at quality 97 with full-resolution colour, the most an iPhone's
+ * encoder could plausibly write. A dim, noisy gym photo compresses worse than
+ * those, and pure noise at quality 92 is 20.4MB, so 15MB (the cap at 4096 px)
+ * left too little room. Stored copies are re-encoded below, so the cap bounds
+ * one POST's transfer and buffer, not what the bucket keeps.
+ */
+export const SPRAY_WALL_PHOTO_MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Long-side cap for the BASE photo. The canonical frame, the detector and every
+ * renderer except the zoomed hold editor read this one, and its size is what the
+ * object metadata records — so every wall keeps the pixel scale it had before
+ * full-resolution copies existed.
+ */
+export const SPRAY_WALL_PHOTO_BASE_MAX_DIMENSION = 2048;
 
 // Per-user upload budget, copied from `handlers/feedback-screenshots.ts` and for
 // the same reason: every POST here mints a NEW object (the key carries a fresh
 // uuid), so without a budget one authenticated account can fill the private
-// bucket with 10MB objects, and an abandoned upload is never referenced by a row
+// bucket with objects, and an abandoned upload is never referenced by a row
 // so nothing else bounds it either. `MAX_VERSIONS_PER_WALL` does not help — it
 // caps the rows, not the uploads that never become one.
 //
@@ -159,6 +190,37 @@ export function sprayWallPhotoKey(wallUuid: string, photoId: string): string {
   return `spray-walls/${wallUuid}/${photoId}.${STORED_EXTENSION}`;
 }
 
+const FULL_PHOTO_SUFFIX = `-full.${STORED_EXTENSION}`;
+
+/**
+ * The key of a photo's full-resolution copy, derived from the base key.
+ *
+ * Derived rather than stored: the version row names only the base
+ * (`photo_key`), so every path that already follows the base — a
+ * `sourceVersionId` copy reuses the same key, the purge deletes the wall's whole
+ * prefix — follows the full copy with no new column. It sits under the same
+ * `spray-walls/<wallUuid>/` prefix for exactly that reason.
+ */
+export function sprayWallFullPhotoKey(basePhotoKey: string): string {
+  const extension = `.${STORED_EXTENSION}`;
+  const stem = basePhotoKey.endsWith(extension) ? basePhotoKey.slice(0, -extension.length) : basePhotoKey;
+  return `${stem}${FULL_PHOTO_SUFFIX}`;
+}
+
+/**
+ * Whether a stored base of this size can have a full copy beside it.
+ *
+ * A full copy is only written when the source was larger than the base cap, and
+ * then the base is resized to EXACTLY the cap on its long side. So any other
+ * base size proves there is no full copy without asking storage. The converse
+ * does not hold: a source that was already exactly the cap (every photo the app
+ * compressed to 2048 px before #5911) has a base of that size and no full copy.
+ */
+export function sprayWallPhotoMayHaveFullCopy(width: number | null, height: number | null): boolean {
+  if (width == null || height == null) return false;
+  return Math.max(width, height) === SPRAY_WALL_PHOTO_BASE_MAX_DIMENSION;
+}
+
 /**
  * The key a PUBLIC wall's photo copy is stored under in the `media` bucket.
  *
@@ -185,19 +247,56 @@ function respondJson(res: ServerResponse, status: number, body: Record<string, u
   res.end(JSON.stringify(body));
 }
 
+type EncodedWallPhoto = { body: Buffer; width: number; height: number };
+
+/**
+ * The most pixels an uploaded photo may decode to, four times the stored cap.
+ * The app never sends more than `SPRAY_WALL_PHOTO_MAX_PIXELS`, so this only
+ * turns away crafted files: 25 MB of PNG can hold ~250 MP, which would decode
+ * to ~750 MB on a 4 GB box. sharp's own default (268 MP) is far too high here.
+ */
+export const SPRAY_WALL_PHOTO_MAX_INPUT_PIXELS = 4 * SPRAY_WALL_PHOTO_MAX_PIXELS;
+
+/** Orient, shrink to fit `maxDimension` (never enlarge) and re-encode one stored size. */
+async function encodeWallPhoto(input: Buffer, maxDimension: number): Promise<EncodedWallPhoto> {
+  const pipeline = sharp(input, { limitInputPixels: SPRAY_WALL_PHOTO_MAX_INPUT_PIXELS })
+    .rotate()
+    .resize({ width: maxDimension, height: maxDimension, fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: STORED_JPEG_QUALITY });
+  const { data, info } = await pipeline.toBuffer({ resolveWithObject: true });
+  return { body: data, width: info.width, height: info.height };
+}
+
 /**
  * Normalise an uploaded photo: apply the EXIF orientation, then re-encode as
- * JPEG so no metadata block survives.
+ * JPEG so no metadata block survives — for the base and, when the source is
+ * larger than the base cap, for the full copy too.
  *
  * Returns the bytes and the dimensions AFTER the rotate, which is the only
  * orientation any later consumer will ever see — anchors are tapped on these
  * pixels, so a width/height read before the rotate would transpose the whole
  * canonical frame on any portrait phone photo.
+ *
+ * Both sizes are resized from the SOURCE, not the base from the full copy, so the
+ * base the detector reads takes one JPEG generation, as it always has.
  */
-async function normaliseWallPhoto(input: Buffer): Promise<{ body: Buffer; width: number; height: number }> {
-  const pipeline = sharp(input).rotate().jpeg({ quality: STORED_JPEG_QUALITY });
-  const { data, info } = await pipeline.toBuffer({ resolveWithObject: true });
-  return { body: data, width: info.width, height: info.height };
+async function normaliseWallPhoto(input: Buffer): Promise<{ base: EncodedWallPhoto; full: EncodedWallPhoto | null }> {
+  // The pixel cap depends only on the shape, so the pre-rotation header size is
+  // enough: a quarter turn swaps the sides but not the ratio.
+  const { width, height } = await sharp(input).metadata();
+  // Refuse an oversized photo from its header, before any pixel is decoded. The
+  // caller turns the throw into the same 400 as an unreadable file.
+  if ((width ?? 0) * (height ?? 0) > SPRAY_WALL_PHOTO_MAX_INPUT_PIXELS) {
+    throw new Error(`Spray wall photo is ${width}x${height}, over the input pixel cap`);
+  }
+  const full = await encodeWallPhoto(input, sprayWallPhotoMaxLongSide(width ?? 0, height ?? 0));
+  if (Math.max(full.width, full.height) <= SPRAY_WALL_PHOTO_BASE_MAX_DIMENSION) {
+    // Already within the base cap, so the one encode IS the base. No full copy:
+    // it would be the same pixels stored twice.
+    return { base: full, full: null };
+  }
+  const base = await encodeWallPhoto(input, SPRAY_WALL_PHOTO_BASE_MAX_DIMENSION);
+  return { base, full };
 }
 
 /**
@@ -207,13 +306,18 @@ async function normaliseWallPhoto(input: Buffer): Promise<{ body: Buffer; width:
  * 2026-09-14: users own a wall and that ownership is what grants editing), so
  * this is deliberately NOT `requireBoardEditAccess` — no gym admin and no
  * community role uploads a photograph of a stranger's living room.
+ *
+ * An ARCHIVED wall takes no photo: `createSprayWallVersion` would refuse the
+ * version, and the upload would be a stray object nothing names. A reset's
+ * clone is a separate wall and is never archived, so its wizard uploads as any
+ * new wall's does.
  */
 async function loadOwnedWall(
   wallUuid: string,
   userId: string,
-): Promise<{ outcome: 'ok' } | { outcome: 'not-found' } | { outcome: 'forbidden' }> {
+): Promise<{ outcome: 'ok' } | { outcome: 'not-found' } | { outcome: 'forbidden' } | { outcome: 'archived' }> {
   const [row] = await db
-    .select({ ownerId: dbSchema.userBoards.ownerId })
+    .select({ ownerId: dbSchema.userBoards.ownerId, archivedAt: dbSchema.sprayWalls.archivedAt })
     .from(dbSchema.sprayWalls)
     .innerJoin(dbSchema.userBoards, eq(dbSchema.userBoards.uuid, dbSchema.sprayWalls.boardUuid))
     .where(
@@ -227,6 +331,7 @@ async function loadOwnedWall(
 
   if (!row) return { outcome: 'not-found' };
   if (row.ownerId !== userId) return { outcome: 'forbidden' };
+  if (row.archivedAt != null) return { outcome: 'archived' };
   return { outcome: 'ok' };
 }
 
@@ -239,7 +344,9 @@ export async function handleSprayWallPhotoUpload(req: IncomingMessage, res: Serv
     return;
   }
 
-  const authResult = await validateToken(token);
+  const admission = await validateHttpAuthToken(token, res);
+  if (!admission.available) return;
+  const authResult = admission.auth;
   if (!authResult) {
     respondJson(res, 401, { error: 'Invalid or expired token' });
     return;
@@ -379,8 +486,13 @@ export async function handleSprayWallPhotoUpload(req: IncomingMessage, res: Serv
           resolve();
           return;
         }
+        if (wall.outcome === 'archived') {
+          respondJson(res, 409, { error: SPRAY_WALL_ARCHIVED_MESSAGE, code: SPRAY_WALL_ARCHIVED_CODE });
+          resolve();
+          return;
+        }
 
-        let normalised: { body: Buffer; width: number; height: number };
+        let normalised: { base: EncodedWallPhoto; full: EncodedWallPhoto | null };
         try {
           normalised = await normaliseWallPhoto(fileBuffer);
         } catch (decodeError) {
@@ -394,26 +506,74 @@ export async function handleSprayWallPhotoUpload(req: IncomingMessage, res: Serv
         }
 
         const photoId = randomUUID();
+        const uploadedWallUuid = wallUuid;
         const key = sprayWallPhotoKey(wallUuid, photoId);
+        const writtenKeys: string[] = [];
+
+        // A request may have passed ownership before account deletion committed.
+        // Erase its own objects on withdrawal; retain a durable retry if storage
+        // is unavailable. The purge's updated_at fence protects this retry from
+        // an older prefix listing that had not seen our late upload.
+        //
+        // The retry only acts on a DELETED wall. When the withdrawal is an
+        // archive and the erase fails, the object is left behind on purpose: it
+        // is in the private bucket under a random key nothing names, and the
+        // retention purge sweeps the wall's whole prefix, this object included,
+        // if the archived wall is ever deleted.
+        const eraseUpload = async () => {
+          const erased = await Promise.allSettled(writtenKeys.map((writtenKey) => deleteFromS3('private', writtenKey)));
+          if (erased.every((result) => result.status === 'fulfilled')) return;
+          try {
+            await markDeletedSprayWallPhotoRetry(uploadedWallUuid);
+          } catch (retryError) {
+            // Cleanup is best effort; a second SQL failure must not prevent
+            // sending the upload's original error response.
+            logger.error(
+              'Failed to record withdrawn spray photo cleanup retry',
+              { wallUuid: uploadedWallUuid },
+              retryError,
+            );
+          }
+        };
+
+        const { base: basePhoto, full: fullPhoto } = normalised;
 
         try {
           // Variants first, then the base — the avatars.ts ordering, so a reader
-          // that can see the photo can always see its thumbnail. Only the
-          // largest allowed size is written: these feed list rows and the reset
-          // compare view, and every other size would be an object per wall per
-          // version for nobody.
+          // that can see the photo can always see its thumbnail (and its full
+          // copy). Only the largest allowed size is written: these feed list rows
+          // and the reset compare view, and every other size would be an object
+          // per wall per version for nobody. The thumbnail is cut from the base,
+          // the smaller decode.
           await writeImageVariants(
-            normalised.body,
+            basePhoto.body,
             key,
-            (variantKey, body, contentType) =>
-              uploadToS3('private', body, variantKey, contentType, {
+            (variantKey, body, contentType) => {
+              writtenKeys.push(variantKey);
+              return uploadToS3('private', body, variantKey, contentType, {
                 acl: null,
                 cacheControl: PRIVATE_PHOTO_CACHE_CONTROL,
-              }),
+              });
+            },
             [280],
             STORED_CONTENT_TYPE,
           );
-          await uploadToS3('private', normalised.body, key, STORED_CONTENT_TYPE, {
+          if (fullPhoto) {
+            const fullKey = sprayWallFullPhotoKey(key);
+            writtenKeys.push(fullKey);
+            await uploadToS3('private', fullPhoto.body, fullKey, STORED_CONTENT_TYPE, {
+              acl: null,
+              cacheControl: PRIVATE_PHOTO_CACHE_CONTROL,
+              // Informational only. Nothing reads geometry off the full copy:
+              // holds live in the canonical frame, which the BASE defines.
+              metadata: {
+                [SPRAY_PHOTO_WIDTH_METADATA_KEY]: String(fullPhoto.width),
+                [SPRAY_PHOTO_HEIGHT_METADATA_KEY]: String(fullPhoto.height),
+              },
+            });
+          }
+          writtenKeys.push(key);
+          await uploadToS3('private', basePhoto.body, key, STORED_CONTENT_TYPE, {
             acl: null,
             cacheControl: PRIVATE_PHOTO_CACHE_CONTROL,
             // The dimensions ride WITH the object so `createSprayWallVersion`
@@ -421,11 +581,27 @@ export async function handleSprayWallPhotoUpload(req: IncomingMessage, res: Serv
             // they define the canonical frame, and a lie about them would put
             // every hold on the wall at the wrong place.
             metadata: {
-              [SPRAY_PHOTO_WIDTH_METADATA_KEY]: String(normalised.width),
-              [SPRAY_PHOTO_HEIGHT_METADATA_KEY]: String(normalised.height),
+              [SPRAY_PHOTO_WIDTH_METADATA_KEY]: String(basePhoto.width),
+              [SPRAY_PHOTO_HEIGHT_METADATA_KEY]: String(basePhoto.height),
             },
           });
+          // Re-checked after the bytes land: a delete or an archive may have
+          // committed while they were uploading.
+          const wallAfterSave = await loadOwnedWall(wallUuid, authenticatedUserId);
+          if (wallAfterSave.outcome === 'archived') {
+            await eraseUpload();
+            respondJson(res, 409, { error: SPRAY_WALL_ARCHIVED_MESSAGE, code: SPRAY_WALL_ARCHIVED_CODE });
+            resolve();
+            return;
+          }
+          if (wallAfterSave.outcome !== 'ok') {
+            await eraseUpload();
+            respondJson(res, 404, { error: 'Spray wall not found' });
+            resolve();
+            return;
+          }
         } catch (saveError) {
+          await eraseUpload();
           logger.error('Failed to save spray wall photo:', saveError);
           respondJson(res, 500, { error: 'Failed to save the wall photo' });
           resolve();
@@ -435,8 +611,8 @@ export async function handleSprayWallPhotoUpload(req: IncomingMessage, res: Serv
         respondJson(res, 200, {
           success: true,
           photoId,
-          width: normalised.width,
-          height: normalised.height,
+          width: basePhoto.width,
+          height: basePhoto.height,
         });
         resolve();
       } catch (unexpected) {

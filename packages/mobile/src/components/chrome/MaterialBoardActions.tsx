@@ -6,11 +6,14 @@
 // / `LightbulbToolbarAction` islands — each reads its own state and renders
 // nothing when it doesn't apply (no adjustable board / no bluetooth).
 //
-// The Climbs angle lives as the first chip in the native filter chip row
-// (`FilterChipRow.android`), not here — the app bar keeps only the create action.
-// `MaterialAngleAction` remains for Discover's `CollapsingTopChrome`.
+// Angle sits beside the avatar on Climbs and uses the shared board picker.
 
-import { useCallback } from 'react';
+import { useCallback, useMemo } from 'react';
+import {
+  LONG_PRESS_ACTION_NAME,
+  namedAccessibilityActions,
+  onNamedAccessibilityAction,
+} from '../../lib/named-accessibility-action';
 import { StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { Appbar } from 'react-native-paper';
@@ -19,58 +22,108 @@ import { hapticLight } from '../../lib/haptics';
 import { useLightbulbControl } from '../ble/use-lightbulb-control';
 import { getBleLightbulbLabelKind } from '../ble/ble-lightbulb-button-state';
 import { useBleControlSheet } from '../../providers/ble-control-sheet-provider';
+import { useBulbDriveTap } from '../queue-control/bar-bulb-tap';
+import { phoneDrivesTheWall } from '../queue-control/bulb-drive-cue';
 import { Text } from '../Text';
+import { LargeContentViewer } from '../LargeContentViewer';
+import { CHROME_LABEL_MAX_FONT_SCALE } from '../../theme/typography';
 import { iconMap } from '../icon-map';
-import { AngleSelectorSheet } from '../play-drawer/AngleSelectorSheet';
-import { useMaterialAngleControl } from './use-material-angle-control';
+import { BoardAnglePicker } from './BoardAnglePicker';
+import { useActiveBoard } from '../../lib/graphql/use-active-board';
+import { canAdjustBoardAngle } from '../../lib/boards/can-adjust-board-angle';
 
 export function MaterialAngleAction() {
   const { systemColors } = useTheme();
   const { t: tSession } = useTranslation('session');
-  const { activeBoard, canAdjust, visible, open, close, change } = useMaterialAngleControl();
+  const { data: activeBoard } = useActiveBoard();
 
   const angleIcon = useCallback(
     () => (
-      <Text variant="caption1" style={[styles.materialAngleText, { color: systemColors.label }]}>
+      <Text
+        variant="title3"
+        numeric
+        numberOfLines={1}
+        maxFontSizeMultiplier={CHROME_LABEL_MAX_FONT_SCALE}
+        style={[styles.materialAngleText, { color: systemColors.label }]}
+      >
         {activeBoard?.angle}°
       </Text>
     ),
     [activeBoard?.angle, systemColors.label],
   );
 
-  if (!activeBoard || !canAdjust) return null;
+  if (!canAdjustBoardAngle(activeBoard)) return null;
+  const spokenLabel = tSession('mobile.angleSelector.buttonAria', { angle: activeBoard.angle });
 
   return (
-    <>
-      <Appbar.Action icon={angleIcon} onPress={open} accessibilityLabel={tSession('mobile.angleSelector.title')} />
-      <AngleSelectorSheet
-        visible={visible}
-        onClose={close}
-        boardName={activeBoard.boardType}
-        layoutId={activeBoard.layoutId}
-        currentAngle={activeBoard.angle}
-        onAngleChange={change}
-      />
-    </>
+    <BoardAnglePicker>
+      {(open) => (
+        <LargeContentViewer title={spokenLabel} onActivate={open}>
+          <Appbar.Action
+            icon={angleIcon}
+            // Paper's animated icon wrapper fixes custom content to 24dp;
+            // the degree label needs the action's full width.
+            animated={false}
+            onPress={open}
+            accessibilityLabel={spokenLabel}
+          />
+        </LargeContentViewer>
+      )}
+    </BoardAnglePicker>
   );
 }
 
+/**
+ * The Android app bar's bulb. While this phone drives the wall a tap stops
+ * driving and keeps the link, as every bulb does (owner, 2026-11-03;
+ * `useBulbDriveTap`), and the bulb says "Stop driving". With no drive it
+ * connects or hangs up, as before.
+ */
 export function MaterialLightbulbAction() {
   const { systemColors, brandColors } = useTheme();
   const { t: tCommon } = useTranslation('common');
   const { t: tSettings } = useTranslation('settings');
   const { open: openControls } = useBleControlSheet();
-  const { bluetooth, lit, localConnected, onPress, onLongPress, pressAction, holderIsAuthoritative } =
-    useLightbulbControl({
-      surface: 'app_bar',
-      onOpenControls: openControls,
-    });
+  const {
+    bluetooth,
+    lit,
+    localConnected,
+    ledless,
+    inAppBoardConnection,
+    onPress,
+    onLongPress,
+    pressAction,
+    holderIsAuthoritative,
+  } = useLightbulbControl({
+    surface: 'app_bar',
+    onOpenControls: openControls,
+  });
   const labelKind = getBleLightbulbLabelKind(pressAction, holderIsAuthoritative);
+  const { driving, takeTap } = useBulbDriveTap({
+    drivesTheWall: phoneDrivesTheWall({ inAppBoardConnection, localConnected, ledless }),
+    linked: localConnected,
+    control: 'app_bar',
+  });
 
   const handlePress = useCallback(() => {
+    // A stop buzzes on its own; a dropped tap (just after a stop) does nothing.
+    if (takeTap()) return;
     hapticLight();
     onPress();
-  }, [onPress]);
+  }, [takeTap, onPress]);
+
+  // Offered only where the long press itself is wired (connected, handler present).
+  const canOpenControls = localConnected && !!onLongPress;
+  const longPressActions = useMemo(
+    () =>
+      canOpenControls ? namedAccessibilityActions(LONG_PRESS_ACTION_NAME, tSettings('ble.boardControls')) : undefined,
+    [canOpenControls, tSettings],
+  );
+  const onLongPressAction = useMemo(
+    () =>
+      canOpenControls && onLongPress ? onNamedAccessibilityAction(LONG_PRESS_ACTION_NAME, onLongPress) : undefined,
+    [canOpenControls, onLongPress],
+  );
 
   if (!bluetooth) return null;
 
@@ -80,7 +133,9 @@ export function MaterialLightbulbAction() {
   // On a wall with no light kit there is no Bluetooth link to describe, so the
   // label names the two states that DO exist there: holding the wall or not.
   let accessibilityLabel: string;
-  if (labelKind === 'releaseWall') {
+  if (driving) {
+    accessibilityLabel = tSettings('ble.barControl.stopDrivingLabel');
+  } else if (labelKind === 'releaseWall') {
     accessibilityLabel = tSettings('ble.releaseWall');
   } else if (labelKind === 'takeWall') {
     accessibilityLabel = tSettings('ble.takeWall');
@@ -101,11 +156,15 @@ export function MaterialLightbulbAction() {
       // Short press connects/disconnects; long press (connected) opens the
       // controls sheet — same as the drawer + accessory-bar lightbulbs.
       onLongPress={localConnected ? onLongPress : undefined}
+      accessibilityActions={longPressActions}
+      onAccessibilityAction={onLongPressAction}
       // The label reflects what tapping ACTUALLY does, not the fill — the bulb
       // can read lit because a session peer holds the wall. While a peer drives
       // the board there is no connect to promise, and this surface has no
-      // displayed climb to relay, so the tap settles instead.
+      // displayed climb to relay, so the tap settles instead. While this phone
+      // drives the wall it says "Stop driving", and the hint what follows.
       accessibilityLabel={accessibilityLabel}
+      accessibilityHint={driving ? tSettings('ble.barControl.stopDrivingHint') : undefined}
     />
   );
 }

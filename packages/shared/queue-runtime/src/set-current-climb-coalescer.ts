@@ -22,7 +22,7 @@
 // client coupling. Callers wire `sendArgs` / `sendDeferredQueueAdd` to
 // their platform-specific transport.
 
-import type { ClimbQueueItem } from '@boardsesh/queue';
+import type { ClimbQueueItem, CurrentClimbPlacement } from '@boardsesh/queue';
 
 // `TItem` is the queue-item type the caller deals in. It defaults to the shared
 // `ClimbQueueItem`, so existing callers (and the queue-runtime tests) need no
@@ -32,6 +32,15 @@ export type SetCurrentClimbArgs<TItem = ClimbQueueItem> = {
   item: TItem | null;
   shouldAddToQueue?: boolean;
   correlationId?: string;
+  /**
+   * F3 now-slot mode: how the server puts the climb on the wall. A request
+   * that carries it never fires a deferred queue-add: the climb goes on the
+   * wall at the Now slot and is History once you move on, so a superseded or
+   * lost open loses nothing worth keeping (the peek never reached the wall),
+   * and re-sending it as an add would put every fast swipe's middle peek into
+   * the crew's Up next.
+   */
+  placement?: CurrentClimbPlacement;
 };
 
 export type SetCurrentClimbCoalescerOptions<TContext = void, TItem = ClimbQueueItem> = {
@@ -54,8 +63,14 @@ export type SetCurrentClimbCoalescerOptions<TContext = void, TItem = ClimbQueueI
    *  captured into the pending entry and threaded through to sendArgs /
    *  sendDeferredQueueAdd. Defaults to `() => undefined`. */
   getContext?: () => TContext;
-  /** Errors during the drain loop are swallowed — this is the sink. */
-  onDrainError?: (error: unknown) => void;
+  /** Errors during the drain loop are swallowed — this is the sink. It also
+   *  receives the drained call's args: its caller's promise resolved the moment
+   *  it superseded an earlier call, so this is the only place that learns the
+   *  move never landed (and which move, by its `correlationId`). Return `true`
+   *  when the sink re-sends a lost `shouldAddToQueue` slot itself (mobile holds
+   *  it back while it waits to re-send the move); the coalescer then skips its
+   *  own deferred queue-add. A sink that throws claims nothing. */
+  onDrainError?: (error: unknown, args: SetCurrentClimbArgs<TItem>) => boolean | void;
   /** Sink for errors when the fire-and-forget deferred ADD_QUEUE_ITEM
    *  rejects (or throws synchronously). */
   onDeferredQueueAddError?: (error: unknown) => void;
@@ -95,8 +110,10 @@ export function createSetCurrentClimbCoalescer<TContext = void, TItem = ClimbQue
   // the drain loop would hold `inFlight` true, parking later activations as
   // pending and manufacturing more supersedes.
   function fireDeferredQueueAdd(lost: Pending): void {
-    const { item, shouldAddToQueue } = lost.args;
-    if (!shouldAddToQueue || item === null || options.sendDeferredQueueAdd === undefined) return;
+    const { item, shouldAddToQueue, placement } = lost.args;
+    if (!shouldAddToQueue || placement !== undefined || item === null || options.sendDeferredQueueAdd === undefined) {
+      return;
+    }
     try {
       options.sendDeferredQueueAdd(item, lost.context).catch(onDeferredQueueAddError);
     } catch (error) {
@@ -137,11 +154,19 @@ export function createSetCurrentClimbCoalescer<TContext = void, TItem = ClimbQue
           } catch (error) {
             // This drained activation's SET_CURRENT_CLIMB never landed, so its
             // queue slot exists on this device and nowhere else. Recover the
-            // content half exactly like the superseded branch does (#3936).
-            // Before onDrainError, so a caller sink that throws can't swallow
-            // the recovery.
-            fireDeferredQueueAdd(next);
-            onDrainError(error);
+            // content half exactly like the superseded branch does (#3936),
+            // unless the sink takes that over. A throw out of the sink would
+            // escape the enclosing `finally` and leave `inFlight` true for good,
+            // parking every later activation as pending and never sending it,
+            // so contain it; a sink that throws claims nothing and the recovery
+            // still runs.
+            let sinkClaimedQueueAdd = false;
+            try {
+              sinkClaimedQueueAdd = onDrainError(error, next.args) === true;
+            } catch (sinkError) {
+              console.error('setCurrentClimb drain-error sink threw:', sinkError);
+            }
+            if (!sinkClaimedQueueAdd) fireDeferredQueueAdd(next);
           }
         }
         state.inFlight = false;

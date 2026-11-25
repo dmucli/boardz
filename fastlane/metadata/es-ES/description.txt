@@ -1,30 +1,29 @@
-Busca una vía y mira cómo se enciende tu muro. Menos tiempo en el móvil, más tiempo en el muro.
+Una app para tus plafones. Ilumina bloques, comparte cola con tu equipo y guarda tus encadenes en un solo logbook.
 
-UNA APP PARA CADA PLAFÓN QUE ESCALAS
-Kilter, Tension y MoonBoard traen cada uno su propia app para su propio plafón. Boardsesh funciona con todos ellos, más Woods, Decoy, Touchstone, Grasshopper y So iLL, en un solo sitio. Todo tu historial de escalada en cada plafón vive aquí.
+Compatible con Kilter, Tension, MoonBoard, Woods, Decoy, Touchstone, Grasshopper y So iLL, además de tu Spraywall. Conecta controladores compatibles por Bluetooth para iluminar las presas.
 
-HISTORIAL DEL MURO, SIEMPRE ACTIVO
-Si compartes muro, enseguida pierdes la cuenta de la última vía, y siempre hay alguien que la borra sin querer.
-En Boardsesh cada plafón al que te conectas tiene un feed en directo de lo que hay encendido en ese muro ahora mismo: el nombre de la vía, quién la encendió, quién la montó, el grado y el ángulo, y los encadenes recientes. Se actualiza según cambia el muro, así que siempre sabes qué hay puesto.
+ESCALA CON TU EQUIPO
+Inicia una sesión, invita a tu equipo y comparte una cola que todo el equipo puede controlar. El historial del plafón muestra los bloques iluminados con Boardsesh y los encadenes recientes en ese plafón físico. Al terminar la sesión, recibe un resumen de tu escalada.
 
-SESIONES CON TU EQUIPO
-Abre una sesión y tú y tu equipo compartís una cola que cualquiera puede llevar. Cualquiera enciende la siguiente vía en el muro. Al terminar te llevas un resumen y el seguimiento: encadenes e intentos, reparto de grados, tu vía más dura y el progreso a lo largo del tiempo.
+ENTRENA A TU MANERA
+Combina calentamientos con Volumen, Pirámide, Escalera, Grado fijo, 4x4, Al límite o Al minuto. Previsualiza bloques y descansos, y luego ilumínalos de uno en uno. Las pirámides pueden bajar por los mismos bloques.
 
-LLÉVALO DESDE LA PANTALLA DE BLOQUEO (iOS 17+)
-Las Live Activities te dicen qué vía hay puesta desde la pantalla de bloqueo, y te dejan cambiarla sin salir de ella.
+Abre en Boardsesh entrenamientos de apps compatibles y permite que las apps lean tu logbook con tu autorización. Información para desarrolladores: https://www.boardsesh.com/developers/
 
-MÓNTATE UN ENTRENAMIENTO
-Elige Volumen, Pirámide, Escalera o Foco en grado, fija un grado objetivo y el calentamiento, previsualiza las vías y mándalas al muro de una en una.
+Tu Spraywall, también
+Fotografía tu Spraywall, comprueba las presas sugeridas y crea bloques en la foto. Compártelo con tu equipo, añade bloques a la cola y registra encadenes. No hacen falta LED. Resetea el Spraywall con una nueva foto y conserva archivados los bloques y encadenes anteriores.
 
-REGISTRA TU ESCALADA
-Apunta encadenes, flashes e intentos, recibe un resumen con la duración, el reparto de grados y tu vía más dura, y mira cómo suben tus encadenes y grados en la pestaña Progreso.
+Con WLED y LED, sitúa las luces en tu foto y guarda la configuración para tu equipo. Busca controladores por Wi-Fi, ajusta el brillo y elige el apagado automático por Wi-Fi. Los controladores compatibles con soporte Bluetooth de Boardsesh también iluminan bloques por Bluetooth; instalar ese soporte es una beta opcional para controladores compatibles.
 
-LLÉVATE TU HISTORIAL CONTIGO
-Guarda tu sesión en Apple Health e importa tu logbook antiguo de Kilter y Tension desde Aurora Climbing.
+CONTROLA DESDE LA PANTALLA DE BLOQUEO (iOS 17+)
+Ve el bloque actual y avanza por la cola con Live Activities. Elige las vibraciones de la cuenta atrás y el descanso en la pantalla de bloqueo en Ajustes > Temporizadores. El renderizado del plafón acelerado por GPU ofrece transiciones más fluidas en plafones y dispositivos compatibles.
 
-ENCUENTRA MÁS PARA ESCALAR
-Sigue a tu equipo y a los aperturistas, busca escaladores y fija playlists desde Discover.
+ENCUENTRA TU PRÓXIMO BLOQUE
+Inicio muestra tu semana, bloques de tu nivel y proyectos para reintentar. Elige las secciones que ves. Encuentra plafones cercanos con la ubicación activada, filtra los bloques Verificados de Kilter y busca tus propios bloques en Descubrir.
 
-Plafones compatibles: Kilter, Tension, MoonBoard (2010, 2016, 2024, Masters 2017, Masters 2019), Woods (12x12, 8x10), Decoy, Touchstone, Grasshopper y So iLL.
+SIGUE TU PROGRESO
+Registra encadenes, flashes e intentos, sigue tu progreso entre plafones e importa tu historial de Kilter y Tension desde Aurora Climbing. Guarda sesiones en Apple Health con tu permiso.
 
-Boardsesh es un proyecto comunitario que funciona con estos plafones y no está afiliado ni respaldado por ningún fabricante de plafones.
+Gratis, sin anuncios y de código abierto.
+
+Boardsesh es un proyecto comunitario compatible con estos plafones. No está afiliado ni respaldado por ningún fabricante.

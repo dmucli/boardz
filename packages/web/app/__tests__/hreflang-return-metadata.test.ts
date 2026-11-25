@@ -22,12 +22,13 @@ vi.mock('next/headers', () => ({
 vi.mock('@/app/lib/db/db', () => ({ dbz: {}, dbzRead: {}, sql: {}, executeRows: async () => [] }));
 
 vi.mock('@/app/lib/seo/dynamic-og-data', () => ({
-  getSetterOgSummary: async () => ({ displayName: 'Marco', avatarUrl: null, version: 'v1' }),
+  getSetterOgSummary: async () => ({ displayName: 'Marco', totalAscents: 0, version: 'v1' }),
   getProfileOgSummary: async () => ({
     displayName: 'Marco',
-    avatarUrl: null,
-    fallbackImageUrl: null,
     topBoardType: 'kilter',
+    hardestSend: null,
+    sentClimbCount: 0,
+    sentBoardTypes: [],
     version: 'v1',
   }),
   getPlaylistOgSummary: async () => ({
@@ -38,6 +39,7 @@ vi.mock('@/app/lib/seo/dynamic-og-data', () => ({
     isPublic: true,
     boardType: 'kilter',
     climbCount: 12,
+    gradeSummary: null,
     version: 'v1',
   }),
   getSessionOgSummary: async () => ({
@@ -53,6 +55,16 @@ vi.mock('@/app/lib/seo/dynamic-og-data', () => ({
     boardPreviewPath: null,
     version: 'v1',
     found: true,
+    isLive: false,
+    inviteName: null,
+    liveBoard: null,
+    tickCount: 3,
+    totalFlashes: 0,
+    durationMinutes: null,
+    recapParticipants: [{ name: 'Marco' }],
+    boardTypes: ['kilter'],
+    hardestSend: null,
+    hardestAttempt: null,
   }),
 }));
 
@@ -61,8 +73,8 @@ vi.mock('@/app/components/providers/i18n-provider', () => ({
 }));
 vi.mock('../session/[sessionId]/session-detail-content', () => ({ default: () => null }));
 
-const setterPage = await import('../setter/[setter_username]/page');
-const sessionPage = await import('../session/[sessionId]/page');
+const setterPage = await import('@/app/(site)/setter/[setter_username]/page');
+const sessionPage = await import('@/app/(site)/session/[sessionId]/page');
 const { generatePlaylistMetadata } = await import('../lib/seo/playlist-metadata');
 
 type MetadataCase = {
@@ -96,12 +108,14 @@ const cases: MetadataCase[] = [
 
 describe('hreflang returns for every sitemapped surface', () => {
   for (const testCase of cases) {
-    it(`${testCase.name} canonicalises per locale and advertises all five alternates`, async () => {
+    it(`${testCase.name} canonicalises per locale and advertises all locale alternates`, async () => {
       const expectedLanguages = {
         'en-US': testCase.basePath,
         es: `/es${testCase.basePath}`,
         fr: `/fr${testCase.basePath}`,
         de: `/de${testCase.basePath}`,
+        it: `/it${testCase.basePath}`,
+        'zh-CN': `/zh-CN${testCase.basePath}`,
         'x-default': testCase.basePath,
       };
 

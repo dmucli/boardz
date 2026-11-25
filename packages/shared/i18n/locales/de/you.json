@@ -9,7 +9,8 @@
     "sessions": "Sessions",
     "logbook": "Routenbuch",
     "social": "Social",
-    "climbs": "Boulder"
+    "climbs": "Boulder",
+    "created": "Erstellt"
   },
   "mobile": {
     "unknownName": "Kletterer*in",
@@ -35,6 +36,7 @@
       "following": "Folge ich",
       "newFollowers": "Neue Follower",
       "findFriends": "Suchen",
+      "searchTitle": "Kletterer*innen finden",
       "searchPlaceholder": "Kletterer*innen suchen",
       "clearSearch": "Suche löschen",
       "you": "Du",
@@ -87,43 +89,29 @@
       "all": "Alle",
       "year": "Jahr",
       "month": "Monat",
-      "week": "Woche",
-      "done": "Fertig"
+      "week": "Woche"
     },
     "logbook": {
       "empty": "Dein Routenbuch ist leer — trag deine erste Begehung ein.",
-      "emptyFiltered": "Keine Boulder passen zu diesen Filtern.",
+      "emptyFiltered": "Nichts passt zu diesen Filtern. Lockere einen oder setz alle zurück.",
       "errorTitle": "Dein Routenbuch konnte nicht geladen werden",
       "errorBody": "Prüf deine Verbindung und versuch es erneut.",
       "retry": "Erneut versuchen",
-      "searchPlaceholder": "Deine Boulder durchsuchen",
-      "filter": "Filtern",
-      "sort": "Sortieren",
-      "refine": "Verfeinern",
-      "advanced": "Erweitert",
-      "preset": {
-        "latest": "Neueste",
-        "hardest": "Schwerste"
-      },
-      "flashOnly": "Nur Flash",
       "grade": "Grad",
       "angle": "Winkel",
-      "show": "Anzeigen",
-      "angleMin": "Min. Winkel",
-      "angleMax": "Max. Winkel",
-      "dateRange": "Zeitraum",
       "dateFrom": "Von",
       "dateTo": "Bis",
       "dateAny": "Alle",
       "dateSince": "Seit {{date}}",
       "dateUntil": "Bis {{date}}",
-      "benchmarksOnly": "Nur Benchmarks",
       "reset": "Zurücksetzen",
       "editTitle": "Begehung bearbeiten",
-      "statusLabel": "Status",
       "delete": "Löschen",
+      "deleteAll": "Alle löschen",
       "deleteTitle": "Begehung löschen",
+      "deleteAllTitle": "{{count}} Einträge löschen",
       "deleteConfirm": "Das entfernt die eingetragene Begehung und lässt sich nicht rückgängig machen.",
+      "deleteAllConfirm": "Das entfernt alle {{count}} Einträge dieses Tages und lässt sich nicht rückgängig machen.",
       "saveError": "Deine Änderungen konnten nicht gespeichert werden. Versuch es erneut.",
       "deleteError": "Die Begehung konnte nicht gelöscht werden. Versuch es erneut.",
       "tries_one": "{{count}} Versuch",
@@ -134,7 +122,8 @@
         "attempt": "Versuch",
         "sends": "Begehungen",
         "attempts": "Versuche",
-        "both": "Beides"
+        "all": "Alle",
+        "flashes": "Flashes"
       },
       "row": {
         "project": "Projekt",
@@ -148,8 +137,7 @@
         "a11yHasBetaVideo": "hat Beta-Video",
         "a11yMirrored": "gespiegelt",
         "editAction": "Eintrag bearbeiten",
-        "deleteAction": "Eintrag löschen",
-        "moreActions": "Weitere Aktionen"
+        "deleteAction": "Eintrag löschen"
       },
       "day": {
         "today": "Heute",
@@ -162,7 +150,112 @@
       },
       "chooser": {
         "editTitle": "Welchen Eintrag bearbeiten?",
-        "deleteTitle": "Welchen Eintrag löschen?"
+        "deleteTitle": "Welchen Eintrag löschen?",
+        "deleteAll": "Alle {{count}} löschen"
+      },
+      "boardLabel": "Board",
+      "boardNone": "Keines",
+      "boardPickerLabel": "Board auswählen",
+      "boardBack": "Zurück zur Bearbeitung",
+      "boardRetry": "Boards konnten nicht geladen werden. Tippe zum Wiederholen.",
+      "boardEmpty": "Kein gespeichertes oder kürzlich genutztes Board passt zu diesem Boulder.",
+      "emptyOther": "Hier ist noch nichts eingetragen.",
+      "clearFilters": "Filter zurücksetzen",
+      "capsules": {
+        "filters": "Filter",
+        "filtersWithCount": "Filter · {{count}}",
+        "status": "Status",
+        "stars": "Sterne",
+        "anyStars": "Beliebige Sterne",
+        "starsAtLeast": "{{count}}★+",
+        "when": "Wann",
+        "customDates": "Eigener Zeitraum…",
+        "board": "Board",
+        "boardLayouts_one": "{{board}} · {{count}} Layout",
+        "boardLayouts_other": "{{board}} · {{count}} Layouts",
+        "setter": "Routenbauer*in",
+        "setterAria": "Routenbauer*innen auswählen",
+        "setterPickedAria": "Routenbauer*in: {{setters}}, Routenbauer*innen auswählen",
+        "setters_one": "{{count}} Routenbauer*in",
+        "setters_other": "{{count}} Routenbauer*innen",
+        "benchmarks": "Benchmarks",
+        "verified": "Verifiziert",
+        "gradeOpenHint": "Zeigt die Gradzeile",
+        "gradeCloseHint": "Blendet die Gradzeile aus",
+        "angleOpenHint": "Zeigt die Winkelzeile",
+        "angleCloseHint": "Blendet die Winkelzeile aus",
+        "nameToken": "„{{name}}“"
+      },
+      "dateWindow": {
+        "any": "Jederzeit",
+        "last7": "Letzte 7 Tage",
+        "month": "Dieser Monat",
+        "last3months": "Letzte 3 Monate",
+        "year": "Dieses Jahr",
+        "custom": "Eigener Zeitraum"
+      },
+      "sortLabel": {
+        "latest": "Neueste",
+        "oldest": "Älteste",
+        "hardest": "Schwerste",
+        "easiest": "Leichteste",
+        "yourHardest": "Deine schwersten",
+        "yourEasiest": "Deine leichtesten",
+        "theirHardest": "Schwerste (eingetragen)",
+        "theirEasiest": "Leichteste (eingetragen)",
+        "nameAsc": "Name A–Z",
+        "nameDesc": "Name Z–A",
+        "mostTries": "Meiste Versuche",
+        "fewestTries": "Wenigste Versuche"
+      },
+      "filterSheet": {
+        "title": "Filter",
+        "close": "Filter schließen",
+        "entryCount_one": "{{count}} Eintrag",
+        "entryCount_other": "{{count}} Einträge",
+        "sectionName": "Boulder-Name",
+        "namePlaceholder": "Boulder und Notizen durchsuchen",
+        "sectionDifficulty": "Schwierigkeit",
+        "gradeRange": "Gradbereich",
+        "sectionYourAscents": "Deine Begehungen",
+        "sectionTheirAscents": "Begehungen",
+        "status": "Status",
+        "yourStars": "Deine Sterne",
+        "theirStars": "Sterne",
+        "anyStars": "Beliebig",
+        "when": "Wann",
+        "sectionTheClimb": "Der Boulder",
+        "board": "Board",
+        "layout": "Layout",
+        "allLayouts": "Alle Layouts",
+        "setter": "Routenbauer*in",
+        "setterAny": "Beliebig",
+        "benchmarks": "Benchmarks",
+        "onlyBenchmarks": "Nur Benchmark-Boulder",
+        "verified": "Verifiziert",
+        "onlyVerified": "Nur verifizierte Boulder",
+        "sectionSort": "Sortierung",
+        "sortBy": "Sortieren nach",
+        "order": "Reihenfolge",
+        "descending": "Absteigend",
+        "ascending": "Aufsteigend",
+        "sortKey": {
+          "date": "Datum",
+          "grade": "Grad",
+          "yourGrade": "Dein Grad",
+          "theirGrade": "Eingetragener Grad",
+          "name": "Name",
+          "attempts": "Versuche"
+        }
+      },
+      "setterPicker": {
+        "title": "Routenbauer*innen",
+        "showResults": "Boulder zeigen",
+        "tickCount_one": "{{count}} Eintrag",
+        "tickCount_other": "{{count}} Einträge",
+        "empty": "In diesem Routenbuch gibt es noch keine Routenbauer*innen.",
+        "error": "Routenbauer*innen konnten nicht geladen werden.",
+        "limit": "Wähle bis zu {{count}} Routenbauer*innen."
       }
     },
     "boardLink": {
@@ -176,6 +269,10 @@
       "moonboardBody": "Fordere deine Daten bei MoonBoard an und importier die Datei hier, um dein Routenbuch zu übertragen.",
       "moonboardCta": "Mein MoonBoard-Routenbuch importieren",
       "dismiss": "Jetzt nicht"
+    },
+    "loadError": {
+      "sessions": "Deine Sessions konnten nicht geladen werden",
+      "progress": "Dein Fortschritt konnte nicht geladen werden"
     }
   }
 }

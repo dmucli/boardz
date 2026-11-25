@@ -1,5 +1,21 @@
+import { GraphQLError } from 'graphql';
 import { v4 as uuidv4 } from 'uuid';
-import { eq, ne, and, count, isNull, isNotNull, notExists, sql, ilike, or, desc, inArray, type SQL } from 'drizzle-orm';
+import {
+  eq,
+  ne,
+  and,
+  count,
+  exists,
+  isNull,
+  isNotNull,
+  notExists,
+  sql,
+  ilike,
+  or,
+  desc,
+  inArray,
+  type SQL,
+} from 'drizzle-orm';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { rowsFromResult } from '@boardsesh/db/client';
 import { db } from '../../../db/client';
@@ -7,6 +23,7 @@ import * as dbSchema from '@boardsesh/db/schema';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
 import { getUserCommunityRoles, rolesGrantAdminOrLeader } from './roles';
 import { createGymManageAccessNotification } from './gym-notifications';
+import { assertNoGymClaimProbation } from './gym-claim-guardrails';
 import {
   CreateGymInputSchema,
   UpdateGymInputSchema,
@@ -20,12 +37,37 @@ import {
   GrantGymWriteAccessInputSchema,
   RevokeGymWriteAccessInputSchema,
   UUIDSchema,
+  MAX_ACKNOWLEDGED_GYM_UUIDS,
 } from '../../../validation/schemas';
 import { distanceMeters } from '@boardsesh/db/queries';
+import { computeCanClaimByDomain } from '@boardsesh/gym-claim';
 import { logger } from '../../../utils/logger';
-import { PROXIMITY_MATCH_RADIUS_METERS } from './gym-matching';
+import { parsePostgresUtcTimestamp } from '../../../utils/postgres-timestamps';
+import {
+  findSimilarGymCandidates,
+  MAX_SIMILAR_GYMS,
+  PROXIMITY_MATCH_RADIUS_METERS,
+  toSimilarGymResults,
+} from './gym-matching';
+import { assertGymCapNotReached, blockingSimilarGyms, lockGymCreate, similarGymsExistError } from './gym-create-guards';
 import { syncLocationGeography } from './location-geography';
 import { SYSTEM_BOARD_OWNER_ID } from '../board-presence/shared';
+import { boardIsNotArchivedSprayWall } from '../board/spray-wall-listing';
+import { gymLocationFilter } from './gym-discovery-filters';
+import { publicGymSitemap } from './gym-sitemap';
+import type { GymListingState } from '@boardsesh/shared-schema';
+import type { BoardModerationActorRole } from '@boardsesh/db/schema';
+import {
+  boardHeldOffGymError,
+  isBoardHeldOffGym,
+  recordOwnerGymLinkChange,
+  resolveGymEditActorRole,
+  viewerGymManagerRole,
+} from './board-moderation-events';
+import { onGymDetailsEdited, REPORT_FIXING_GYM_FIELDS } from './directory-reports/lifecycle';
+import { afterCommit, transactionWithAfterCommit } from '../../../db/after-commit';
+import { managedGymImageKey, removeManagedGymImage } from '../../../services/gym-image-storage';
+import { getPostgresErrorCode, isUniqueViolation } from '../../../utils/postgres-errors';
 
 // ============================================
 // Helpers
@@ -34,8 +76,11 @@ import { SYSTEM_BOARD_OWNER_ID } from '../board-presence/shared';
 /**
  * Generate a unique slug from a gym name.
  * Exported for reuse in board auto-gym creation.
+ *
+ * `executor` reads on a connection the caller already holds, e.g. createGym's
+ * transaction, so the read sees what the create's locks serialized.
  */
-export async function generateUniqueGymSlug(name: string): Promise<string> {
+export async function generateUniqueGymSlug(name: string, executor: Pick<typeof db, 'select'> = db): Promise<string> {
   const baseSlug =
     name
       .toLowerCase()
@@ -44,13 +89,15 @@ export async function generateUniqueGymSlug(name: string): Promise<string> {
       .slice(0, 100) || 'gym';
 
   // Find all existing slugs matching this base in a single query
-  const existing = await db
+  const existing = await executor
     .select({ slug: dbSchema.gyms.slug })
     .from(dbSchema.gyms)
     .where(
       and(
         or(eq(dbSchema.gyms.slug, baseSlug), ilike(dbSchema.gyms.slug, `${baseSlug.replace(/[%_\\]/g, '\\$&')}-%`)),
-        isNull(dbSchema.gyms.deletedAt),
+        // A merge tombstone still owns its old URL; reusing it would shadow
+        // the survivor's redirect, including URLs exchanged by an admin repair.
+        or(isNull(dbSchema.gyms.deletedAt), isNotNull(dbSchema.gyms.mergedIntoGymId)),
       ),
     );
 
@@ -68,6 +115,13 @@ export async function generateUniqueGymSlug(name: string): Promise<string> {
   }
 
   return `${baseSlug}-${uuidv4().slice(0, 8)}`;
+}
+
+// Non-string, non-Date inputs map to null on purpose: the driver only returns
+// offset-less strings (or Date) for these columns.
+function rawUtcTimestamp(value: unknown): Date | null {
+  const iso = parsePostgresUtcTimestamp(value instanceof Date || typeof value === 'string' ? value : null);
+  return iso ? new Date(iso) : null;
 }
 
 /**
@@ -95,31 +149,33 @@ export function mapRawGymRow(row: Record<string, unknown>): typeof dbSchema.gyms
     latitude: row.latitude != null ? Number(row.latitude) : null,
     longitude: row.longitude != null ? Number(row.longitude) : null,
     isPublic: row.is_public as boolean,
+    isListed: row.is_listed !== false,
     description: (row.description as string | null) ?? null,
     // Snake_case, like every other key here — `row.hoursUpdatedAt` would compile
     // and then hand the proximity path a permanent null "Confirmed" date while
     // the Drizzle text-search path renders it correctly (same class of bug as
     // website_vouched_by_owner above).
+    reportingTimeZone: (row.reporting_time_zone as string | null) ?? null,
     hours: (row.hours as string | null) ?? null,
-    hoursUpdatedAt: row.hours_updated_at != null ? new Date(row.hours_updated_at as string) : null,
+    hoursUpdatedAt: rawUtcTimestamp(row.hours_updated_at),
     imageUrl: (row.image_url as string | null) ?? null,
     logoUrl: (row.logo_url as string | null) ?? null,
     brandPrimaryColor: (row.brand_primary_color as string | null) ?? null,
     brandAccentColor: (row.brand_accent_color as string | null) ?? null,
     brandBackgroundColor: (row.brand_background_color as string | null) ?? null,
     mergedIntoGymId: row.merged_into_gym_id != null ? Number(row.merged_into_gym_id) : null,
-    // Raw `db.execute` returns timestamps as strings (the Drizzle query builder
-    // hydrates them to Date). Coerce here so downstream `.toISOString()` works
-    // regardless of which path produced the row. `new Date(Date)` is a no-op, so
-    // this is safe even if the driver ever returns Date objects.
-    createdAt: row.created_at != null ? new Date(row.created_at as string) : (null as unknown as Date),
-    updatedAt: row.updated_at != null ? new Date(row.updated_at as string) : (null as unknown as Date),
-    deletedAt: row.deleted_at != null ? new Date(row.deleted_at as string) : null,
-    syncFrozenAt: row.sync_frozen_at != null ? new Date(row.sync_frozen_at as string) : null,
+    // Raw `db.execute` returns timestamps as offset-less strings (the Drizzle
+    // query builder hydrates them to Date, reading them as UTC). Parse them as
+    // UTC here too, so both paths agree on any host TZ (#4588).
+    createdAt: rawUtcTimestamp(row.created_at) ?? (null as unknown as Date),
+    updatedAt: rawUtcTimestamp(row.updated_at) ?? (null as unknown as Date),
+    deletedAt: rawUtcTimestamp(row.deleted_at),
+    syncFrozenAt: rawUtcTimestamp(row.sync_frozen_at),
   };
 }
 
 type GymRow = typeof dbSchema.gyms.$inferSelect;
+type GymAccessExecutor = NonNullable<Parameters<typeof getUserCommunityRoles>[1]>;
 
 // A real merge chain is 1–2 hops; the cap is a safety net against a corrupt or
 // cyclic pointer in prod data so the resolver can never spin.
@@ -138,7 +194,7 @@ const MAX_MERGE_HOPS = 10;
  * Bounded to MAX_MERGE_HOPS with a visited-id cycle guard, so a corrupt loop in
  * the data resolves to null instead of hanging.
  */
-export async function resolveCanonicalGym(startGym: GymRow): Promise<GymRow | null> {
+export async function resolveCanonicalGym(startGym: GymRow, executor: GymAccessExecutor = db): Promise<GymRow | null> {
   let current = startGym;
   const visited = new Set<number>([current.id]);
 
@@ -151,7 +207,7 @@ export async function resolveCanonicalGym(startGym: GymRow): Promise<GymRow | nu
       return null;
     }
     visited.add(nextId);
-    const [parent] = await db.select().from(dbSchema.gyms).where(eq(dbSchema.gyms.id, nextId)).limit(1);
+    const [parent] = await executor.select().from(dbSchema.gyms).where(eq(dbSchema.gyms.id, nextId)).limit(1);
     if (!parent) {
       return null;
     }
@@ -165,12 +221,15 @@ export async function resolveCanonicalGym(startGym: GymRow): Promise<GymRow | nu
  * canonical live row. Used by every by-uuid read/write lookup so a deduped gym's
  * old uuid resolves to the survivor instead of 404ing.
  */
-export async function resolveCanonicalGymByUuid(gymUuid: string): Promise<GymRow | null> {
-  const [gym] = await db.select().from(dbSchema.gyms).where(eq(dbSchema.gyms.uuid, gymUuid)).limit(1);
+export async function resolveCanonicalGymByUuid(
+  gymUuid: string,
+  executor: GymAccessExecutor = db,
+): Promise<GymRow | null> {
+  const [gym] = await executor.select().from(dbSchema.gyms).where(eq(dbSchema.gyms.uuid, gymUuid)).limit(1);
   if (!gym) {
     return null;
   }
-  return resolveCanonicalGym(gym);
+  return resolveCanonicalGym(gym, executor);
 }
 
 /**
@@ -224,6 +283,49 @@ export async function resolveCanonicalGymBySlug(slug: string): Promise<GymRow | 
 export const GYM_BOARD_SUMMARY_ANGLES_PER_TYPE = 6;
 
 /**
+ * Who runs a gym listing, for every viewer alike (docs/product/gym-board-governance.md,
+ * decision 4):
+ * - UNCLAIMED: the SYSTEM import account owns it; nobody has claimed it.
+ * - RUN_BY_GYM: its owner got it through an approved claim or an admin handover.
+ * - CLIMBER_LISTED: a climber owns it some other way, usually by naming a gym
+ *   while setting up their board.
+ */
+export function gymListingState(ownerId: string, ownerHoldsClaimOrHandover: boolean): GymListingState {
+  if (ownerId === SYSTEM_BOARD_OWNER_ID) return 'UNCLAIMED';
+  return ownerHoldsClaimOrHandover ? 'RUN_BY_GYM' : 'CLIMBER_LISTED';
+}
+
+/**
+ * Whether the gym's current owner holds an approved claim on it or received it
+ * through an admin reassignment: two EXISTS probes, folded into enrichGym's
+ * owner query so the directory pays no extra round trip per gym. Its correlated
+ * twin, for a query over many gyms, is `ownerHoldsClaimOrHandoverColumn` in
+ * gym-run-by-staff.ts. Change both together.
+ */
+function ownerHoldsClaimOrHandoverSql(gym: Pick<typeof dbSchema.gyms.$inferSelect, 'id' | 'uuid' | 'ownerId'>) {
+  const approvedClaim = db
+    .select({ one: sql`1` })
+    .from(dbSchema.gymClaims)
+    .where(
+      and(
+        eq(dbSchema.gymClaims.gymId, gym.id),
+        eq(dbSchema.gymClaims.claimantUserId, gym.ownerId),
+        eq(dbSchema.gymClaims.status, 'approved'),
+      ),
+    );
+  const adminHandover = db
+    .select({ one: sql`1` })
+    .from(dbSchema.gymOwnerReassignments)
+    .where(
+      and(
+        eq(dbSchema.gymOwnerReassignments.gymUuid, gym.uuid),
+        eq(dbSchema.gymOwnerReassignments.newOwnerId, gym.ownerId),
+      ),
+    );
+  return sql<boolean>`(${exists(approvedClaim)} OR ${exists(adminHandover)})`;
+}
+
+/**
  * Enrich a gym row with computed fields (counts, follow status, membership).
  * Exported so the kiosk resolvers can attach the same branding-carrying `Gym`
  * payload (logo + colours) to a public kiosk without duplicating the enrichment.
@@ -240,24 +342,32 @@ export async function enrichGym(gym: typeof dbSchema.gyms.$inferSelect, authenti
     memberCheckResult,
     viewerRolesResult,
   ] = await Promise.all([
-    // Get owner profile
+    // Get owner profile, and whether they run the gym (listingState)
     db
       .select({
         name: dbSchema.users.name,
         image: dbSchema.users.image,
         displayName: dbSchema.userProfiles.displayName,
         avatarUrl: dbSchema.userProfiles.avatarUrl,
+        holdsClaimOrHandover: ownerHoldsClaimOrHandoverSql(gym),
       })
       .from(dbSchema.users)
       .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
       .where(eq(dbSchema.users.id, gym.ownerId))
       .limit(1),
 
-    // Count linked boards
+    // Count linked boards. Not a spray wall a reset archived: its successor is
+    // the same physical wall, and counting both would grow the gym by one per reset.
     db
       .select({ count: count() })
       .from(dbSchema.userBoards)
-      .where(and(eq(dbSchema.userBoards.gymId, gym.id), isNull(dbSchema.userBoards.deletedAt))),
+      .where(
+        and(
+          eq(dbSchema.userBoards.gymId, gym.id),
+          isNull(dbSchema.userBoards.deletedAt),
+          boardIsNotArchivedSprayWall(),
+        ),
+      ),
 
     // Distinct (board type, angle) pairs at this gym. ONE query feeds both
     // `boardTypes` (filtering + badges) and `boardSummaries` (directory board
@@ -355,12 +465,17 @@ export async function enrichGym(gym: typeof dbSchema.gyms.$inferSelect, authenti
   // Grantable (write-access grants) by owner/gym-admin or a covering community
   // admin/leader — NOT plain editors. Mirrors requireGymGrantAccess.
   const canGrantAccess = isOwner || memberRow?.role === 'admin' || hasCommunityAccess;
+  // Viewer-independent like isClaimed, so anonymous SSR can show it too.
+  const listingState = gymListingState(gym.ownerId, ownerInfo?.holdsClaimOrHandover === true);
+
   // A signed-in viewer who has no edit access can start a claim. Owners, gym
   // admins/editors, and covering community leaders are excluded — they can
   // already edit the gym, so the self-service claim path isn't for them (and the
-  // domain path would reject them anyway).
+  // domain path would reject them anyway). Nobody can claim a gym its staff run:
+  // a dispute goes through Report a problem, and requestGymClaim refuses it.
   const canClaim =
     !!authenticatedUserId &&
+    listingState !== 'RUN_BY_GYM' &&
     !isOwner &&
     memberRow?.role !== 'admin' &&
     memberRow?.role !== 'editor' &&
@@ -375,6 +490,11 @@ export async function enrichGym(gym: typeof dbSchema.gyms.$inferSelect, authenti
   // entire audience, so a card gated on `canClaim` would render nothing for them
   // while looking correct in a logged-in dev session.
   const isClaimed = gym.ownerId !== SYSTEM_BOARD_OWNER_ID;
+
+  // Viewer-independent listing capability for choosing the claim form, including
+  // anonymous SSR. requestGymClaim still enforces the same website conditions
+  // and separately checks the viewer's access before accepting any claim.
+  const canClaimByDomain = computeCanClaimByDomain(gym);
 
   return {
     uuid: gym.uuid,
@@ -393,6 +513,7 @@ export async function enrichGym(gym: typeof dbSchema.gyms.$inferSelect, authenti
     latitude: gym.latitude,
     longitude: gym.longitude,
     isPublic: gym.isPublic,
+    isListed: gym.isListed !== false,
     imageUrl: gym.imageUrl,
     logoUrl: gym.logoUrl,
     brandPrimaryColor: gym.brandPrimaryColor,
@@ -412,6 +533,8 @@ export async function enrichGym(gym: typeof dbSchema.gyms.$inferSelect, authenti
     canGrantAccess,
     canClaim,
     isClaimed,
+    canClaimByDomain,
+    listingState,
   };
 }
 
@@ -437,6 +560,14 @@ export function slugPresentFilter(requireSlug: boolean | undefined, slugColumn: 
 
 type GymMemberRole = 'admin' | 'editor' | 'member';
 
+/** Callers locking evidence must already hold the canonical gym row in their transaction. */
+export interface GymAccessOptions {
+  lock?: boolean;
+}
+
+const GYM_EDIT_MEMBER_ROLES = ['admin', 'editor'] as const;
+type GymAccessLevel = 'view' | 'edit' | 'grant' | 'admin';
+
 /**
  * Load a gym and the caller's per-gym role (null if not owner/member). Shared
  * building block for the gym gates below.
@@ -444,21 +575,22 @@ type GymMemberRole = 'admin' | 'editor' | 'member';
 async function loadGymWithMemberRole(
   gymUuid: string,
   userId: string,
+  executor: GymAccessExecutor = db,
 ): Promise<{ gym: typeof dbSchema.gyms.$inferSelect; isOwner: boolean; memberRole: GymMemberRole | null }> {
   // Resolve merged twins to the canonical survivor so every write-access gate
   // (edit / grant / owner-or-admin) runs against the live row a stale uuid now
   // points at, never the soft-deleted twin.
-  const gym = await resolveCanonicalGymByUuid(gymUuid);
+  const gym = await resolveCanonicalGymByUuid(gymUuid, executor);
 
   if (!gym) {
-    throw new Error('Gym not found');
+    throw new GraphQLError('Gym not found', { extensions: { code: 'NOT_FOUND' } });
   }
 
   if (gym.ownerId === userId) {
     return { gym, isOwner: true, memberRole: null };
   }
 
-  const [member] = await db
+  const [member] = await executor
     .select({ role: dbSchema.gymMembers.role })
     .from(dbSchema.gymMembers)
     .where(and(eq(dbSchema.gymMembers.gymId, gym.id), eq(dbSchema.gymMembers.userId, userId)))
@@ -472,18 +604,67 @@ async function loadGymWithMemberRole(
  * global (boardType null) or scoped to one of the gym's board types. Shared by
  * the edit + grant gates and mirrored read-side in enrichGym.
  */
-async function hasGymCommunityAccess(gym: typeof dbSchema.gyms.$inferSelect, userId: string): Promise<boolean> {
-  const [roles, gymBoardTypeRows] = await Promise.all([
-    getUserCommunityRoles(userId),
-    db
-      .selectDistinct({ boardType: dbSchema.userBoards.boardType })
-      .from(dbSchema.userBoards)
-      .where(and(eq(dbSchema.userBoards.gymId, gym.id), isNull(dbSchema.userBoards.deletedAt))),
-  ]);
-  const gymBoardTypes = gymBoardTypeRows.map((row) => row.boardType);
-  return (
-    rolesGrantAdminOrLeader(roles, null) || gymBoardTypes.some((boardType) => rolesGrantAdminOrLeader(roles, boardType))
-  );
+async function hasGymCommunityAccess(
+  gym: GymRow,
+  userId: string,
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+  knownRoles?: Awaited<ReturnType<typeof getUserCommunityRoles>>,
+): Promise<boolean> {
+  const roles = knownRoles ?? (await getUserCommunityRoles(userId, executor, options));
+  if (rolesGrantAdminOrLeader(roles, null)) return true;
+  const coveredTypes = [
+    ...new Set(
+      roles.flatMap((role) =>
+        role.boardType !== null && rolesGrantAdminOrLeader([role], role.boardType) ? [role.boardType] : [],
+      ),
+    ),
+  ];
+  if (coveredTypes.length === 0) return false;
+  const witness = executor
+    .select({ id: dbSchema.userBoards.id })
+    .from(dbSchema.userBoards)
+    .where(
+      and(
+        eq(dbSchema.userBoards.gymId, gym.id),
+        isNull(dbSchema.userBoards.deletedAt),
+        inArray(dbSchema.userBoards.boardType, coveredTypes),
+      ),
+    )
+    .orderBy(dbSchema.userBoards.id)
+    .limit(1);
+  try {
+    return (options.lock ? await witness.for('share', { noWait: true }) : await witness).length > 0;
+  } catch (error) {
+    if (getPostgresErrorCode(error) !== '55P03') throw error;
+    throw new GraphQLError('This board is changing. Retry the same action in a moment.', {
+      extensions: { code: 'CONFLICT' },
+    });
+  }
+}
+
+/** Website and delegated writes share the verdict; locking changes only the lifetime of its evidence. */
+async function userHasGymAccess(
+  gym: GymRow,
+  userId: string,
+  level: GymAccessLevel,
+  executor: GymAccessExecutor,
+  options: GymAccessOptions,
+): Promise<boolean> {
+  if (!options.lock && (gym.ownerId === userId || (level === 'view' && gym.isPublic))) return true;
+  const members = executor
+    .select({ role: dbSchema.gymMembers.role })
+    .from(dbSchema.gymMembers)
+    .where(and(eq(dbSchema.gymMembers.gymId, gym.id), eq(dbSchema.gymMembers.userId, userId)))
+    .limit(1);
+  const [member] = options.lock ? await members.for('share') : await members;
+  // Child-board actions may use a different role from the gym edit permission.
+  // Pin all existing role rows even when a membership already permits editing.
+  const roles = options.lock ? await getUserCommunityRoles(userId, executor, options) : undefined;
+  if (gym.ownerId === userId || (level === 'view' && gym.isPublic)) return true;
+  if (member?.role === 'admin' || ((level === 'edit' || level === 'view') && member?.role === 'editor')) return true;
+  if (level === 'admin') return false;
+  return hasGymCommunityAccess(gym, userId, executor, options, roles);
 }
 
 /**
@@ -492,16 +673,68 @@ async function hasGymCommunityAccess(gym: typeof dbSchema.gyms.$inferSelect, use
  * refuse the self-service domain path to anyone who can already edit the gym's
  * `website` — otherwise they could rewrite it and self-verify into ownership.
  */
-export async function userCanEditGym(gym: typeof dbSchema.gyms.$inferSelect, userId: string): Promise<boolean> {
-  if (gym.ownerId === userId) return true;
-  const [member] = await db
-    .select({ role: dbSchema.gymMembers.role })
+export async function userCanEditGym(
+  gym: typeof dbSchema.gyms.$inferSelect,
+  userId: string,
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+): Promise<boolean> {
+  return userHasGymAccess(gym, userId, 'edit', executor, options);
+}
+
+export async function userCanGrantGymAccess(
+  gym: GymRow,
+  userId: string,
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+): Promise<boolean> {
+  return userHasGymAccess(gym, userId, 'grant', executor, options);
+}
+
+export async function userCanAdminGym(
+  gym: GymRow,
+  userId: string,
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+): Promise<boolean> {
+  return userHasGymAccess(gym, userId, 'admin', executor, options);
+}
+
+/** SQL twin of userCanEditGym, applied before pagination. Keep its parity regression with this rule. */
+export function managedGymPredicate(userId: string, executor: GymAccessExecutor = db) {
+  const staff = executor
+    .select({ gymId: dbSchema.gymMembers.gymId })
     .from(dbSchema.gymMembers)
-    .where(and(eq(dbSchema.gymMembers.gymId, gym.id), eq(dbSchema.gymMembers.userId, userId)))
-    .limit(1);
-  const role = member?.role as GymMemberRole | undefined;
-  if (role === 'admin' || role === 'editor') return true;
-  return hasGymCommunityAccess(gym, userId);
+    .where(and(eq(dbSchema.gymMembers.userId, userId), inArray(dbSchema.gymMembers.role, GYM_EDIT_MEMBER_ROLES)));
+  const coveringRole = executor
+    .select({ userId: dbSchema.communityRoles.userId })
+    .from(dbSchema.communityRoles)
+    .where(
+      and(
+        eq(dbSchema.communityRoles.userId, userId),
+        inArray(dbSchema.communityRoles.role, ['admin', 'community_leader']),
+        or(
+          isNull(dbSchema.communityRoles.boardType),
+          exists(
+            executor
+              .select({ id: dbSchema.userBoards.id })
+              .from(dbSchema.userBoards)
+              .where(
+                and(
+                  eq(dbSchema.userBoards.gymId, dbSchema.gyms.id),
+                  isNull(dbSchema.userBoards.deletedAt),
+                  eq(dbSchema.userBoards.boardType, dbSchema.communityRoles.boardType),
+                ),
+              ),
+          ),
+        ),
+      ),
+    );
+  return and(
+    isNull(dbSchema.gyms.deletedAt),
+    isNull(dbSchema.gyms.mergedIntoGymId),
+    or(eq(dbSchema.gyms.ownerId, userId), inArray(dbSchema.gyms.id, staff), exists(coveringRole)),
+  );
 }
 
 /**
@@ -510,10 +743,16 @@ export async function userCanEditGym(gym: typeof dbSchema.gyms.$inferSelect, use
  * a board-type-scoped role could self-promote to a persistent gym admin (a
  * gym_members row that outlives the community role) or evict other admins.
  */
-async function requireGymOwnerOrAdmin(gymUuid: string, userId: string): Promise<typeof dbSchema.gyms.$inferSelect> {
-  const { gym, isOwner, memberRole } = await loadGymWithMemberRole(gymUuid, userId);
-  if (!isOwner && memberRole !== 'admin') {
-    throw new Error('Not authorized: must be gym owner or admin');
+export async function requireGymOwnerOrAdmin(
+  gymUuid: string,
+  userId: string,
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+): Promise<GymRow> {
+  const gym = await resolveCanonicalGymByUuid(gymUuid, executor);
+  if (!gym) throw new GraphQLError('Gym not found', { extensions: { code: 'NOT_FOUND' } });
+  if (!(await userCanAdminGym(gym, userId, executor, options))) {
+    throw new GraphQLError('Not authorized: must be gym owner or admin', { extensions: { code: 'FORBIDDEN' } });
   }
   return gym;
 }
@@ -543,8 +782,8 @@ export const MAX_FOREIGN_GYM_LINKS = 20;
 export const MAX_BOARDS_PER_FOREIGN_GYM = 5;
 
 /**
- * Gate for attaching a board the caller OWNS to a gym: owner/admin of the gym as
- * before, plus a self-service path so a climber can put their board on the gym
+ * Gate for attaching a board to a gym: owner/admin of the gym as before, plus
+ * an owner-only self-service path so a climber can put their board on the gym
  * they actually climb at without being staff there. Before #4166 this was
  * owner-or-admin only, which made the common case — "there's a MoonBoard at this
  * gym someone else listed, let me add it" — impossible.
@@ -557,15 +796,23 @@ export const MAX_BOARDS_PER_FOREIGN_GYM = 5;
  *
  * Note a real consequence to surface in the UI: linking hands the gym's admins
  * edit rights over the board (see `viewerCanAdminGym` → `requireBoardEditAccess`).
+ *
+ * An existing board (`boardId`) that the gym's staff took off their listing is
+ * held off it: its creator cannot self-link it back until staff relink it
+ * (`isBoardHeldOffGym`). The staff path above is how they do that.
  */
 export async function requireBoardGymLinkAccess(opts: {
   ctx: ConnectionContext;
   gymUuid: string;
   userId: string;
+  // Stored board owner, or the authenticated creator when inserting a board.
+  boardOwnerId: string;
+  // The board being linked; omitted while inserting one, which has no history.
+  boardId?: number;
   boardLatitude: number | null;
   boardLongitude: number | null;
 }): Promise<typeof dbSchema.gyms.$inferSelect> {
-  const { ctx, gymUuid, userId, boardLatitude, boardLongitude } = opts;
+  const { ctx, gymUuid, userId, boardOwnerId, boardId, boardLatitude, boardLongitude } = opts;
   const { gym, isOwner, memberRole } = await loadGymWithMemberRole(gymUuid, userId);
 
   // Staff keep the unconditional path — including for gyms or boards that have
@@ -582,6 +829,15 @@ export async function requireBoardGymLinkAccess(opts: {
   // public gym — "rate limit exceeded" means the uuid is a live private gym,
   // "not authorized" means it doesn't exist.
   if (!gym.isPublic) throw new Error('Gym not found');
+
+  // Editing a wall through its current gym or a community role is not consent
+  // to give another gym's staff edit rights. Only its owner can self-link it.
+  if (boardOwnerId !== userId) throw new Error('Not authorized to link board to this gym');
+
+  // Staff took this board off this gym. Said plainly, before the rate limit and
+  // the proximity rules, so the creator learns who to ask rather than why a
+  // distance check failed.
+  if (boardId != null && (await isBoardHeldOffGym(boardId, gym.id))) throw boardHeldOffGymError();
 
   // The tight bucket belongs to the self-service path only. Charged here rather
   // than at the call site so a gym owner adding several boards to their OWN gym
@@ -674,15 +930,13 @@ export async function requireBoardGymLinkAccess(opts: {
 export async function requireGymEditAccess(
   gymUuid: string,
   userId: string,
-): Promise<typeof dbSchema.gyms.$inferSelect> {
-  const { gym, isOwner, memberRole } = await loadGymWithMemberRole(gymUuid, userId);
-  if (isOwner || memberRole === 'admin' || memberRole === 'editor') {
-    return gym;
-  }
-  if (await hasGymCommunityAccess(gym, userId)) {
-    return gym;
-  }
-  throw new Error('Not authorized to edit this gym');
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+): Promise<GymRow> {
+  const gym = await resolveCanonicalGymByUuid(gymUuid, executor);
+  if (!gym) throw new GraphQLError('Gym not found', { extensions: { code: 'NOT_FOUND' } });
+  if (await userCanEditGym(gym, userId, executor, options)) return gym;
+  throw new GraphQLError('Not authorized to edit this gym', { extensions: { code: 'FORBIDDEN' } });
 }
 
 /**
@@ -690,15 +944,55 @@ export async function requireGymEditAccess(
  * gym admin member, or a community admin/leader covering the gym. Editors are
  * intentionally NOT grantors — write access can't spread itself.
  */
-async function requireGymGrantAccess(gymUuid: string, userId: string): Promise<typeof dbSchema.gyms.$inferSelect> {
-  const { gym, isOwner, memberRole } = await loadGymWithMemberRole(gymUuid, userId);
-  if (isOwner || memberRole === 'admin') {
-    return gym;
-  }
-  if (await hasGymCommunityAccess(gym, userId)) {
-    return gym;
-  }
+export async function requireGymGrantAccess(
+  gymUuid: string,
+  userId: string,
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+): Promise<typeof dbSchema.gyms.$inferSelect> {
+  const gym = await resolveCanonicalGymByUuid(gymUuid, executor);
+  if (!gym) throw new GraphQLError('Gym not found', { extensions: { code: 'NOT_FOUND' } });
+  if (await userCanGrantGymAccess(gym, userId, executor, options)) return gym;
   throw new Error('Not authorized to grant write access for this gym');
+}
+
+/**
+ * Add someone to a gym's staff under the gym's row lock, after reading the
+ * caller's authority again under it: the owner, a gym admin, or (when
+ * `allowCommunityAccess`) a community admin/leader covering the gym.
+ *
+ * `revertGymClaim` takes the same lock, gym row first, before it removes the
+ * members added since the claim. Without it, a claimant who passed the gate
+ * just before a revert could insert a member just after the revert's delete,
+ * and that member would outlive the revert. Under it, their insert either lands
+ * first and the revert removes it, or waits and is refused.
+ */
+async function withGymStaffLock<T>(
+  gym: typeof dbSchema.gyms.$inferSelect,
+  userId: string,
+  { allowCommunityAccess, unauthorizedMessage }: { allowCommunityAccess: boolean; unauthorizedMessage: string },
+  work: (tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => Promise<T>,
+): Promise<T> {
+  return db.transaction(async (tx) => {
+    const [locked] = await tx
+      .select({ ownerId: dbSchema.gyms.ownerId })
+      .from(dbSchema.gyms)
+      .where(and(eq(dbSchema.gyms.id, gym.id), isNull(dbSchema.gyms.deletedAt)))
+      .limit(1)
+      .for('update');
+    if (!locked) throw new Error('Gym not found');
+    if (
+      !(await userHasGymAccess(
+        { ...gym, ownerId: locked.ownerId },
+        userId,
+        allowCommunityAccess ? 'grant' : 'admin',
+        tx,
+        {},
+      ))
+    )
+      throw new Error(unauthorizedMessage);
+    return work(tx);
+  });
 }
 
 // ============================================
@@ -706,17 +1000,34 @@ async function requireGymGrantAccess(gymUuid: string, userId: string): Promise<t
 // ============================================
 
 /**
- * Visibility gate shared by the `gym`/`gymBySlug` entity reads: a private gym is
- * enriched only for a viewer who can edit it, and reads as `null` — the exact
- * same response as a gym that doesn't exist — for everyone else, so holding a
- * uuid or slug can't confirm a private gym exists or disclose its name, address,
- * or contact details.
+ * Whether this viewer may see the gym at all: a public gym is visible to
+ * everyone, a private one only to a viewer who can edit it.
  *
- * Same `userCanEditGym` rule as `gymBoards` and `gymKiosk`, so all four gym
- * reads agree. Unlike the board reads this masks AUTHENTICATED non-editors too,
- * matching those two. `null` rather than a thrown NOT_FOUND because these fields
- * are nullable in the SDL — `null` already means "no such gym" here, so it is the
- * genuinely indistinguishable answer (see #3648).
+ * Same `userCanEditGym` rule as `gymBoards` and `gymKiosk`, so every gym read
+ * agrees. Its SQL twin, `gymVisibleCondition`, gates the gym's comment thread,
+ * votes and feeds; change both together. Unlike the board reads this masks
+ * AUTHENTICATED non-editors too.
+ */
+export async function viewerCanSeeGym(
+  gym: typeof dbSchema.gyms.$inferSelect,
+  viewerId: string | null | undefined,
+  executor: GymAccessExecutor = db,
+  options: GymAccessOptions = {},
+): Promise<boolean> {
+  if (!viewerId) return gym.isPublic;
+  return userHasGymAccess(gym, viewerId, 'view', executor, options);
+}
+
+/**
+ * Visibility gate shared by the `gym`/`gymBySlug` entity reads: a private gym is
+ * enriched only for a viewer who can see it (`viewerCanSeeGym`), and reads as
+ * `null` — the exact same response as a gym that doesn't exist — for everyone
+ * else, so holding a uuid or slug can't confirm a private gym exists or disclose
+ * its name, address, or contact details.
+ *
+ * `null` rather than a thrown NOT_FOUND because these fields are nullable in the
+ * SDL — `null` already means "no such gym" here, so it is the genuinely
+ * indistinguishable answer (see #3648).
  *
  * Runs AFTER canonical resolution: privacy belongs to the surviving gym, not the
  * stale alias row a merged twin's uuid/slug points at.
@@ -727,14 +1038,12 @@ async function resolveViewableGym(
 ): Promise<Awaited<ReturnType<typeof enrichGym>> | null> {
   if (!gym) return null;
   const viewerId = ctx.isAuthenticated ? ctx.userId : undefined;
-  if (!gym.isPublic) {
-    const viewerCanEdit = viewerId ? await userCanEditGym(gym, viewerId) : false;
-    if (!viewerCanEdit) return null;
-  }
+  if (!(await viewerCanSeeGym(gym, viewerId))) return null;
   return enrichGym(gym, viewerId);
 }
 
 export const socialGymQueries = {
+  publicGymSitemap,
   gym: async (_: unknown, { gymUuid }: { gymUuid: string }, ctx: ConnectionContext) => {
     validateInput(UUIDSchema, gymUuid, 'gymUuid');
 
@@ -763,6 +1072,7 @@ export const socialGymQueries = {
     const limit = validatedInput.limit ?? 20;
     const offset = validatedInput.offset ?? 0;
     const includeFollowed = validatedInput.includeFollowed ?? false;
+    const includeManaged = validatedInput.includeManaged ?? false;
 
     // Gyms the viewer holds a gym_members row on (admin/editor/member) as a
     // correlated subquery — no extra round trip, no shipping an id array back to
@@ -794,6 +1104,33 @@ export const socialGymQueries = {
     const followedCondition = followedGymIds.length > 0 ? inArray(dbSchema.gyms.id, followedGymIds) : undefined;
     const matchConditions: SQL[] = [ownerCondition, memberCondition];
     if (followedCondition) matchConditions.push(followedCondition);
+    if (includeManaged) {
+      const coveringRole = db
+        .select({ userId: dbSchema.communityRoles.userId })
+        .from(dbSchema.communityRoles)
+        .where(
+          and(
+            eq(dbSchema.communityRoles.userId, userId),
+            inArray(dbSchema.communityRoles.role, ['admin', 'community_leader']),
+            or(
+              isNull(dbSchema.communityRoles.boardType),
+              exists(
+                db
+                  .select({ boardId: dbSchema.userBoards.id })
+                  .from(dbSchema.userBoards)
+                  .where(
+                    and(
+                      eq(dbSchema.userBoards.gymId, dbSchema.gyms.id),
+                      isNull(dbSchema.userBoards.deletedAt),
+                      eq(dbSchema.userBoards.boardType, dbSchema.communityRoles.boardType),
+                    ),
+                  ),
+              ),
+            ),
+          ),
+        );
+      matchConditions.push(exists(coveringRole));
+    }
     const matchCondition = or(...matchConditions)!;
     const whereClause = and(matchCondition, isNull(dbSchema.gyms.deletedAt));
 
@@ -805,7 +1142,12 @@ export const socialGymQueries = {
       .select()
       .from(dbSchema.gyms)
       .where(whereClause)
-      .orderBy(desc(dbSchema.gyms.createdAt))
+      // id breaks created_at ties (bulk sync imports share one) so OFFSET pages stay a total order.
+      .orderBy(
+        ...(includeManaged ? [desc(sql<boolean>`${or(ownerCondition, memberCondition)}`)] : []),
+        desc(dbSchema.gyms.createdAt),
+        dbSchema.gyms.id,
+      )
       .limit(limit)
       .offset(offset);
 
@@ -828,6 +1170,7 @@ export const socialGymQueries = {
       angles,
       multiBoardTypeOnly,
       requireSlug,
+      requireLocation,
       prioritizeClaimed,
       latitude,
       longitude,
@@ -911,6 +1254,7 @@ export const socialGymQueries = {
         // `proximityFilterClause`, so they can never disagree about which gyms
         // are in the result set.
         slugPresentFilter(requireSlug, sql`gyms.slug`),
+        gymLocationFilter(requireLocation, sql`gyms.latitude`, sql`gyms.longitude`),
       ].filter((clause): clause is SQL => clause !== null);
       const proximityFilterClause =
         proximityFilters.length > 0 ? sql` AND ${sql.join(proximityFilters, sql` AND `)}` : sql.empty();
@@ -928,8 +1272,8 @@ export const socialGymQueries = {
 
       const countRows = await db.execute(
         likePattern
-          ? sql`SELECT count(*)::int as count FROM gyms WHERE is_public = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters}) AND (name ILIKE ${likePattern} OR address ILIKE ${likePattern})${proximityFilterClause}`
-          : sql`SELECT count(*)::int as count FROM gyms WHERE is_public = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters})${proximityFilterClause}`,
+          ? sql`SELECT count(*)::int as count FROM gyms WHERE is_public = true AND is_listed = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters}) AND (name ILIKE ${likePattern} OR address ILIKE ${likePattern})${proximityFilterClause}`
+          : sql`SELECT count(*)::int as count FROM gyms WHERE is_public = true AND is_listed = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters})${proximityFilterClause}`,
       );
       const totalCount = Number(rowsFromResult<Record<string, unknown>>(countRows)[0]?.count || 0);
 
@@ -940,8 +1284,8 @@ export const socialGymQueries = {
       // page, duplicating one row and skipping another across the boundary.
       const gymRows = await db.execute(
         likePattern
-          ? sql`SELECT *, ST_Distance(location, ST_MakePoint(${lon}, ${lat})::geography) as distance_meters FROM gyms WHERE is_public = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters}) AND (name ILIKE ${likePattern} OR address ILIKE ${likePattern})${proximityFilterClause} ORDER BY ${proximityOrder} LIMIT ${limit} OFFSET ${offset}`
-          : sql`SELECT *, ST_Distance(location, ST_MakePoint(${lon}, ${lat})::geography) as distance_meters FROM gyms WHERE is_public = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters})${proximityFilterClause} ORDER BY ${proximityOrder} LIMIT ${limit} OFFSET ${offset}`,
+          ? sql`SELECT *, ST_Distance(location, ST_MakePoint(${lon}, ${lat})::geography) as distance_meters FROM gyms WHERE is_public = true AND is_listed = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters}) AND (name ILIKE ${likePattern} OR address ILIKE ${likePattern})${proximityFilterClause} ORDER BY ${proximityOrder} LIMIT ${limit} OFFSET ${offset}`
+          : sql`SELECT *, ST_Distance(location, ST_MakePoint(${lon}, ${lat})::geography) as distance_meters FROM gyms WHERE is_public = true AND is_listed = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint(${lon}, ${lat})::geography, ${radiusMeters})${proximityFilterClause} ORDER BY ${proximityOrder} LIMIT ${limit} OFFSET ${offset}`,
       );
       const rows = rowsFromResult<Record<string, unknown>>(gymRows);
 
@@ -959,7 +1303,11 @@ export const socialGymQueries = {
     }
 
     // Text-only search path
-    const conditions = [eq(dbSchema.gyms.isPublic, true), isNull(dbSchema.gyms.deletedAt)];
+    const conditions = [
+      eq(dbSchema.gyms.isPublic, true),
+      eq(dbSchema.gyms.isListed, true),
+      isNull(dbSchema.gyms.deletedAt),
+    ];
 
     if (query) {
       const escapedQuery = query.replace(/[%_\\]/g, '\\$&');
@@ -976,6 +1324,12 @@ export const socialGymQueries = {
     // below both derive from the same `whereClause`.
     const textSlugPresent = slugPresentFilter(requireSlug, sql`${dbSchema.gyms.slug}`);
     if (textSlugPresent) conditions.push(textSlugPresent);
+    const textLocation = gymLocationFilter(
+      requireLocation,
+      sql`${dbSchema.gyms.latitude}`,
+      sql`${dbSchema.gyms.longitude}`,
+    );
+    if (textLocation) conditions.push(textLocation);
 
     const whereClause = and(...conditions);
 
@@ -1010,20 +1364,22 @@ export const socialGymQueries = {
     };
   },
 
-  gymMembers: async (_: unknown, { input }: { input: unknown }, _ctx: ConnectionContext) => {
+  gymMembers: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
     const validatedInput = validateInput(GymMembersInputSchema, input, 'input');
     const { gymUuid } = validatedInput;
     const limit = validatedInput.limit ?? 20;
     const offset = validatedInput.offset ?? 0;
 
-    // Verify gym exists
     const [gym] = await db
-      .select({ id: dbSchema.gyms.id, ownerId: dbSchema.gyms.ownerId })
+      .select()
       .from(dbSchema.gyms)
       .where(and(eq(dbSchema.gyms.uuid, gymUuid), isNull(dbSchema.gyms.deletedAt)))
       .limit(1);
 
-    if (!gym) {
+    // A private gym's staff list is the gym's own content: a viewer who cannot
+    // see the gym gets the answer a missing gym gets, so the uuid confirms nothing.
+    const viewerId = ctx.isAuthenticated ? ctx.userId : undefined;
+    if (!gym || !(await viewerCanSeeGym(gym, viewerId))) {
       throw new Error('Gym not found');
     }
 
@@ -1048,7 +1404,7 @@ export const socialGymQueries = {
       .leftJoin(dbSchema.users, eq(dbSchema.gymMembers.userId, dbSchema.users.id))
       .leftJoin(dbSchema.userProfiles, eq(dbSchema.gymMembers.userId, dbSchema.userProfiles.userId))
       .where(eq(dbSchema.gymMembers.gymId, gym.id))
-      .orderBy(desc(dbSchema.gymMembers.createdAt))
+      .orderBy(desc(dbSchema.gymMembers.createdAt), dbSchema.gymMembers.id)
       .limit(limit)
       .offset(offset);
 
@@ -1079,33 +1435,95 @@ export const socialGymMutations = {
 
     const validatedInput = validateInput(CreateGymInputSchema, input, 'input');
     const userId = ctx.userId!;
+    // Absent means REJECT_IF_FOUND: every create is checked, old clients too.
+    const duplicateCheckMode = validatedInput.duplicateCheck?.mode ?? 'REJECT_IF_FOUND';
+    const acknowledgedGymUuids = validatedInput.duplicateCheck?.acknowledgedGymUuids ?? [];
 
     const uuid = uuidv4();
-    const slug = await generateUniqueGymSlug(validatedInput.name);
+    const hours = validatedInput.hours?.trim() || null;
 
-    const [gym] = await db
-      .insert(dbSchema.gyms)
-      .values({
-        uuid,
-        slug,
-        ownerId: userId,
-        name: validatedInput.name,
-        description: validatedInput.description ?? null,
-        address: validatedInput.address ?? null,
-        website: validatedInput.website ?? null,
-        // The creator IS the owner, so a website supplied at creation is
-        // owner-vouched and may drive the self-service domain claim (#3431).
-        // Written explicitly rather than leaning on the DB default so the intent
-        // reads here, next to the website it describes.
-        websiteVouchedByOwner: validatedInput.website != null,
-        contactEmail: validatedInput.contactEmail ?? null,
-        contactPhone: validatedInput.contactPhone ?? null,
-        latitude: validatedInput.latitude ?? null,
-        longitude: validatedInput.longitude ?? null,
-        isPublic: validatedInput.isPublic ?? true,
-        imageUrl: validatedInput.imageUrl ?? null,
-      })
-      .returning();
+    // The cap, the similar-gym read, the slug and the insert share one
+    // transaction under the create locks (owner, then normalized name), so a
+    // double-tapped Save or two climbers adding one gym by name can't both
+    // pass. Every read in here runs on the transaction's own connection.
+    const createInTransaction = () =>
+      transactionWithAfterCommit(async (tx) => {
+        await lockGymCreate(tx, userId, validatedInput.name);
+        await assertGymCapNotReached(tx, userId);
+
+        // Reads past the five the form shows, so gyms after the first five a
+        // climber acknowledged get their turn in the next refusal.
+        const similarGyms = await findSimilarGymCandidates({
+          name: validatedInput.name,
+          latitude: validatedInput.latitude,
+          longitude: validatedInput.longitude,
+          viewerUserId: userId,
+          limit: MAX_ACKNOWLEDGED_GYM_UUIDS,
+          executor: tx,
+        });
+        const blocking = blockingSimilarGyms(similarGyms, duplicateCheckMode, acknowledgedGymUuids);
+        if (blocking.length > 0) return { kind: 'refused' as const, blocking };
+
+        if (similarGyms.length > 0) {
+          // The one path that lists a gym beside ones the climber saw. Leave a
+          // trail, as the board checks do, so a script confirming every call shows.
+          logger.info('createGym: similar gyms acknowledged as separate', {
+            userId,
+            similarCount: similarGyms.length,
+            acknowledgedCount: acknowledgedGymUuids.length,
+          });
+        }
+
+        // Read after the locks, on the transaction. Two different names can
+        // still share a slug ("Rock Hall", "Rock-Hall!") and hold different name
+        // locks; the unique index catches that and the create is retried below.
+        const slug = await generateUniqueGymSlug(validatedInput.name, tx);
+        const [createdGym] = await tx
+          .insert(dbSchema.gyms)
+          .values({
+            uuid,
+            slug,
+            ownerId: userId,
+            name: validatedInput.name,
+            description: validatedInput.description ?? null,
+            hours,
+            hoursUpdatedAt: hours === null ? null : new Date(),
+            address: validatedInput.address ?? null,
+            website: validatedInput.website ?? null,
+            // The creator IS the owner, so a website supplied at creation is
+            // owner-vouched and may drive the self-service domain claim (#3431).
+            // Written explicitly rather than leaning on the DB default so the intent
+            // reads here, next to the website it describes.
+            websiteVouchedByOwner: validatedInput.website != null,
+            contactEmail: validatedInput.contactEmail ?? null,
+            contactPhone: validatedInput.contactPhone ?? null,
+            latitude: validatedInput.latitude ?? null,
+            longitude: validatedInput.longitude ?? null,
+            isPublic: validatedInput.isPublic ?? true,
+            isListed: validatedInput.isListed ?? true,
+            imageUrl: validatedInput.imageUrl ?? null,
+          })
+          .returning();
+        return { kind: 'created' as const, gym: createdGym };
+      });
+
+    let outcome: Awaited<ReturnType<typeof createInTransaction>>;
+    try {
+      outcome = await createInTransaction();
+    } catch (error) {
+      // Another create took the slug between this one's read and its insert.
+      // The failed insert aborted the transaction, so run the whole create
+      // again: it re-checks under the locks and picks the next free slug. Once:
+      // a second collision in a row is not a race worth hiding.
+      if (!isUniqueViolation(error, 'gyms_unique_slug')) throw error;
+      logger.info('createGym: slug taken by a concurrent create, retrying', { userId });
+      outcome = await createInTransaction();
+    }
+
+    if (outcome.kind === 'refused') {
+      throw similarGymsExistError(await toSimilarGymResults(outcome.blocking.slice(0, MAX_SIMILAR_GYMS), userId));
+    }
+    const { gym } = outcome;
 
     // Populate PostGIS location column if lat/lon provided (guarded — see syncLocationGeography)
     if (validatedInput.latitude != null && validatedInput.longitude != null) {
@@ -1127,7 +1545,30 @@ export const socialGymMutations = {
         .limit(1);
 
       if (board && board.ownerId === userId) {
-        await db.update(dbSchema.userBoards).set({ gymId: gym.id }).where(eq(dbSchema.userBoards.id, board.id));
+        await transactionWithAfterCommit(async (tx) => {
+          const [lockedBoard] = await tx
+            .select({ gymId: dbSchema.userBoards.gymId })
+            .from(dbSchema.userBoards)
+            .where(
+              and(
+                eq(dbSchema.userBoards.id, board.id),
+                eq(dbSchema.userBoards.ownerId, userId),
+                isNull(dbSchema.userBoards.deletedAt),
+              ),
+            )
+            .limit(1)
+            .for('update');
+          if (!lockedBoard) return;
+          await tx.update(dbSchema.userBoards).set({ gymId: gym.id }).where(eq(dbSchema.userBoards.id, board.id));
+          // The creator moving their own board, on the record for a staff re-list.
+          await recordOwnerGymLinkChange(tx, {
+            boardId: board.id,
+            actorUserId: userId,
+            fromGymId: lockedBoard.gymId,
+            toGymId: gym.id,
+            mutation: 'createGym',
+          });
+        });
       }
     }
 
@@ -1199,6 +1640,7 @@ export const socialGymMutations = {
     if (validatedInput.latitude !== undefined) updateValues.latitude = validatedInput.latitude;
     if (validatedInput.longitude !== undefined) updateValues.longitude = validatedInput.longitude;
     if (validatedInput.isPublic !== undefined) updateValues.isPublic = validatedInput.isPublic;
+    if (validatedInput.isListed !== undefined) updateValues.isListed = validatedInput.isListed;
     if (validatedInput.imageUrl !== undefined) updateValues.imageUrl = validatedInput.imageUrl;
     // Branding: an explicit null clears the column (reset-to-default in the manage
     // UI); `undefined` (field omitted) leaves it untouched.
@@ -1209,27 +1651,65 @@ export const socialGymMutations = {
     if (validatedInput.brandBackgroundColor !== undefined)
       updateValues.brandBackgroundColor = validatedInput.brandBackgroundColor;
 
-    // Handle slug update
-    if (validatedInput.slug !== undefined) {
-      const [slugConflict] = await db
-        .select({ id: dbSchema.gyms.id })
-        .from(dbSchema.gyms)
-        .where(
-          and(
-            eq(dbSchema.gyms.slug, validatedInput.slug),
-            isNull(dbSchema.gyms.deletedAt),
-            sql`${dbSchema.gyms.id} != ${gym.id}`,
-          ),
-        )
-        .limit(1);
-
-      if (slugConflict) {
-        throw new Error('Slug is already taken');
+    // A change to the name, address, coordinates, website, phone or hours
+    // closes the gym's "wrong address or details" reports as fixed, in this
+    // transaction (docs/product/directory-reports.md). The manage form posts
+    // every field on every save, so only a value that actually changed counts:
+    // the row is read under its lock first and compared with what the update
+    // wrote.
+    const touchesReportedDetails = [...REPORT_FIXING_GYM_FIELDS].some(
+      (field) => validatedInput[field as keyof typeof validatedInput] !== undefined,
+    );
+    const touchesMedia = validatedInput.imageUrl !== undefined || validatedInput.logoUrl !== undefined;
+    const touchesSlug = validatedInput.slug !== undefined;
+    const updated = await transactionWithAfterCommit(async (tx) => {
+      const [before] =
+        touchesReportedDetails || touchesMedia || touchesSlug
+          ? await tx.select().from(dbSchema.gyms).where(eq(dbSchema.gyms.id, gym.id)).limit(1).for('update')
+          : [];
+      if (touchesSlug && (!before || before.deletedAt || before.mergedIntoGymId !== null)) {
+        throw new GraphQLError('The gym changed. Read the current gym before changing its URL.', {
+          extensions: { code: 'CONFLICT' },
+        });
       }
-      updateValues.slug = validatedInput.slug;
-    }
-
-    const [updated] = await db.update(dbSchema.gyms).set(updateValues).where(eq(dbSchema.gyms.id, gym.id)).returning();
+      // Compare with the locked current row: a stale form's old no-op slug
+      // must not undo a concurrent canonical URL repair. An actual no-op is
+      // allowed even when a same-gym merge tombstone carries the current slug.
+      if (validatedInput.slug !== undefined && validatedInput.slug !== before?.slug) {
+        const [slugConflict] = await tx
+          .select({ id: dbSchema.gyms.id })
+          .from(dbSchema.gyms)
+          .where(
+            and(
+              eq(dbSchema.gyms.slug, validatedInput.slug),
+              or(isNull(dbSchema.gyms.deletedAt), isNotNull(dbSchema.gyms.mergedIntoGymId)),
+              ne(dbSchema.gyms.id, gym.id),
+            ),
+          )
+          .limit(1);
+        if (slugConflict) throw new Error('Slug is already taken');
+        updateValues.slug = validatedInput.slug;
+      }
+      const [row] = await tx.update(dbSchema.gyms).set(updateValues).where(eq(dbSchema.gyms.id, gym.id)).returning();
+      if (before && row) {
+        const previous: Record<string, unknown> = before;
+        const next: Record<string, unknown> = row;
+        const changedFields = [...REPORT_FIXING_GYM_FIELDS].filter((field) => previous[field] !== next[field]);
+        const actorRole = changedFields.length > 0 ? await resolveGymEditActorRole(gym, userId, tx) : null;
+        if (actorRole) await onGymDetailsEdited(tx, { gymId: gym.id, actorUserId: userId, actorRole, changedFields });
+        if (
+          managedGymImageKey(gym.uuid, 'photo', before.imageUrl) !== managedGymImageKey(gym.uuid, 'photo', row.imageUrl)
+        ) {
+          afterCommit(tx, () => removeManagedGymImage(gym.uuid, 'photo', before.imageUrl));
+        }
+        if (
+          managedGymImageKey(gym.uuid, 'logo', before.logoUrl) !== managedGymImageKey(gym.uuid, 'logo', row.logoUrl)
+        ) {
+          afterCommit(tx, () => removeManagedGymImage(gym.uuid, 'logo', before.logoUrl));
+        }
+      }
+      return row;
+    });
 
     // Update PostGIS location column (guarded — see syncLocationGeography)
     if (validatedInput.latitude !== undefined || validatedInput.longitude !== undefined) {
@@ -1266,15 +1746,31 @@ export const socialGymMutations = {
       throw new Error('Not authorized to delete this gym');
     }
 
-    // Soft-delete the gym. Freeze it too, so a later sync can't resurrect the
-    // listing the owner deliberately removed (the sync clears deletedAt).
-    await db
-      .update(dbSchema.gyms)
-      .set({ deletedAt: new Date(), syncFrozenAt: new Date() })
-      .where(eq(dbSchema.gyms.id, gym.id));
+    // Under the gym's row lock, taken first as `revertGymClaim` and the staff
+    // changes take it, the owner and probation are read again: a revert that
+    // commits after the read above hands the gym to SYSTEM, and its former
+    // claimant must not delete it.
+    await db.transaction(async (tx) => {
+      const [locked] = await tx
+        .select({ ownerId: dbSchema.gyms.ownerId })
+        .from(dbSchema.gyms)
+        .where(and(eq(dbSchema.gyms.id, gym.id), isNull(dbSchema.gyms.deletedAt)))
+        .limit(1)
+        .for('update');
+      if (!locked) throw new Error('Gym not found');
+      if (locked.ownerId !== userId) throw new Error('Not authorized to delete this gym');
+      // Not in the 14 days after the gym's claim approved itself
+      // (docs/product/gym-claims.md, "Probation").
+      await assertNoGymClaimProbation(gym.id, userId, tx);
 
-    // Unlink all boards
-    await db.update(dbSchema.userBoards).set({ gymId: null }).where(eq(dbSchema.userBoards.gymId, gym.id));
+      // Soft-delete the gym. Freeze it too, so a later sync can't resurrect the
+      // listing the owner deliberately removed (the sync clears deletedAt).
+      const now = new Date();
+      await tx.update(dbSchema.gyms).set({ deletedAt: now, syncFrozenAt: now }).where(eq(dbSchema.gyms.id, gym.id));
+
+      // Unlink all boards
+      await tx.update(dbSchema.userBoards).set({ gymId: null }).where(eq(dbSchema.userBoards.gymId, gym.id));
+    });
 
     return true;
   },
@@ -1299,15 +1795,26 @@ export const socialGymMutations = {
       throw new Error('User not found');
     }
 
-    const inserted = await db
-      .insert(dbSchema.gymMembers)
-      .values({
-        gymId: gym.id,
-        userId: validatedInput.userId,
-        role: validatedInput.role,
-      })
-      .onConflictDoNothing()
-      .returning({ userId: dbSchema.gymMembers.userId });
+    const unauthorizedMessage = 'Not authorized: must be gym owner or admin';
+    const inserted = await withGymStaffLock(
+      gym,
+      userId,
+      { allowCommunityAccess: false, unauthorizedMessage },
+      async (tx) => {
+        // A new admin is held during probation: a second account would get round
+        // every other probation rule (docs/product/gym-claims.md).
+        if (validatedInput.role === 'admin') await assertNoGymClaimProbation(gym.id, userId, tx);
+        return tx
+          .insert(dbSchema.gymMembers)
+          .values({
+            gymId: gym.id,
+            userId: validatedInput.userId,
+            role: validatedInput.role,
+          })
+          .onConflictDoNothing()
+          .returning({ userId: dbSchema.gymMembers.userId });
+      },
+    );
 
     // A fresh admin member gets the same "you now manage this gym" heads-up as a
     // granted editor — admins manage staff, so they're being handed the keys too.
@@ -1334,6 +1841,7 @@ export const socialGymMutations = {
     if (validatedInput.userId === gym.ownerId) {
       throw new Error('Cannot remove the gym owner');
     }
+    await assertNoGymClaimProbation(gym.id, userId);
 
     await db
       .delete(dbSchema.gymMembers)
@@ -1375,19 +1883,22 @@ export const socialGymMutations = {
     // insert or a member→editor promotion, and empty on a no-op re-grant of an
     // existing editor/admin — so we don't re-ping someone who already manages the
     // gym.
-    const granted = await db
-      .insert(dbSchema.gymMembers)
-      .values({
-        gymId: gym.id,
-        userId: validatedInput.userId,
-        role: 'editor',
-      })
-      .onConflictDoUpdate({
-        target: [dbSchema.gymMembers.gymId, dbSchema.gymMembers.userId],
-        set: { role: 'editor' },
-        setWhere: sql`${dbSchema.gymMembers.role} = 'member'`,
-      })
-      .returning({ userId: dbSchema.gymMembers.userId });
+    const unauthorizedMessage = 'Not authorized to grant write access for this gym';
+    const granted = await withGymStaffLock(gym, userId, { allowCommunityAccess: true, unauthorizedMessage }, (tx) =>
+      tx
+        .insert(dbSchema.gymMembers)
+        .values({
+          gymId: gym.id,
+          userId: validatedInput.userId,
+          role: 'editor',
+        })
+        .onConflictDoUpdate({
+          target: [dbSchema.gymMembers.gymId, dbSchema.gymMembers.userId],
+          set: { role: 'editor' },
+          setWhere: sql`${dbSchema.gymMembers.role} = 'member'`,
+        })
+        .returning({ userId: dbSchema.gymMembers.userId }),
+    );
 
     // Tell the new editor they can manage the gym now (best-effort; the helper
     // swallows its own errors so a notification hiccup never fails the grant).
@@ -1406,6 +1917,9 @@ export const socialGymMutations = {
     const userId = ctx.userId!;
 
     const gym = await requireGymGrantAccess(validatedInput.gymUuid, userId);
+    // Taking an editor's access away removes staff, like removeGymMember, so
+    // it waits out the probation too (docs/product/gym-claims.md).
+    await assertNoGymClaimProbation(gym.id, userId);
 
     // Only remove editor rows — never a gym admin or plain member.
     await db
@@ -1494,6 +2008,7 @@ export const socialGymMutations = {
       .select({
         id: dbSchema.userBoards.id,
         ownerId: dbSchema.userBoards.ownerId,
+        gymId: dbSchema.userBoards.gymId,
         latitude: dbSchema.userBoards.latitude,
         longitude: dbSchema.userBoards.longitude,
       })
@@ -1509,20 +2024,53 @@ export const socialGymMutations = {
       throw new Error('Not authorized to modify this board');
     }
 
-    if (validatedInput.gymUuid) {
-      const gym = await requireBoardGymLinkAccess({
-        ctx,
-        gymUuid: validatedInput.gymUuid,
-        userId,
-        boardLatitude: board.latitude,
-        boardLongitude: board.longitude,
-      });
+    // The gate runs first, outside the lock, for its plain errors and rate
+    // limits. Unlinking is always the board owner's own call and has none.
+    const gym = validatedInput.gymUuid
+      ? await requireBoardGymLinkAccess({
+          ctx,
+          gymUuid: validatedInput.gymUuid,
+          userId,
+          boardOwnerId: board.ownerId,
+          boardId: board.id,
+          boardLatitude: board.latitude,
+          boardLongitude: board.longitude,
+        })
+      : null;
+    const nextGymId = gym?.id ?? null;
 
-      await db.update(dbSchema.userBoards).set({ gymId: gym.id }).where(eq(dbSchema.userBoards.id, board.id));
-    } else {
-      // Unlink from gym — always the board owner's own call.
-      await db.update(dbSchema.userBoards).set({ gymId: null }).where(eq(dbSchema.userBoards.id, board.id));
-    }
+    await transactionWithAfterCommit(async (tx) => {
+      // Decided again under the board's row lock, which `detachBoardFromGym`
+      // also takes. A staff removal committing between the gate and this write
+      // would otherwise be overwritten, hold and all.
+      const [lockedBoard] = await tx
+        .select({ ownerId: dbSchema.userBoards.ownerId, gymId: dbSchema.userBoards.gymId })
+        .from(dbSchema.userBoards)
+        .where(and(eq(dbSchema.userBoards.id, board.id), isNull(dbSchema.userBoards.deletedAt)))
+        .limit(1)
+        .for('update');
+      if (!lockedBoard) throw new Error('Board not found');
+      if (lockedBoard.ownerId !== userId) throw new Error('Not authorized to modify this board');
+      if (lockedBoard.gymId === nextGymId) return;
+
+      // A held board only gets past the gate on the gym's own staff path, so
+      // this link is staff putting it back: it lifts the hold, on the record.
+      let linkActorRole: BoardModerationActorRole | undefined;
+      if (nextGymId != null && (await isBoardHeldOffGym(board.id, nextGymId, tx))) {
+        const managerRole = await viewerGymManagerRole(nextGymId, userId, tx);
+        if (!managerRole) throw boardHeldOffGymError();
+        linkActorRole = managerRole;
+      }
+      await tx.update(dbSchema.userBoards).set({ gymId: nextGymId }).where(eq(dbSchema.userBoards.id, board.id));
+      await recordOwnerGymLinkChange(tx, {
+        boardId: board.id,
+        actorUserId: userId,
+        fromGymId: lockedBoard.gymId,
+        toGymId: nextGymId,
+        mutation: 'linkBoardToGym',
+        linkActorRole,
+      });
+    });
 
     return true;
   },

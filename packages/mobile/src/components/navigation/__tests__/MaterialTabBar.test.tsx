@@ -5,6 +5,10 @@ import { createElement, type ReactNode } from 'react';
 
 const ctrl = vi.hoisted(() => ({
   os: 'ios' as string,
+  // The Android phone bar over a tab root (hide-on-scroll), and whether it is hidden.
+  overlay: false,
+  hidden: false,
+  colorScheme: 'dark' as 'light' | 'dark',
 }));
 
 // Shared with the theme-provider mock below, so the assertion can't drift from it.
@@ -43,16 +47,43 @@ vi.mock('react-native', () => ({
         ...Object.fromEntries(
           Object.entries(props).filter(([k]) => k.startsWith('data-') || k === 'accessibilityRole'),
         ),
+        ...(props.pointerEvents ? { 'data-pointer-events': props.pointerEvents } : {}),
+        ...(props.importantForAccessibility ? { 'data-a11y': props.importantForAccessibility } : {}),
       },
       children,
     ),
 }));
 
-vi.mock('react-native-reanimated', () => ({
-  default: { createAnimatedComponent: (component: unknown) => component },
-  useAnimatedStyle: () => ({}),
-  useSharedValue: (value: number) => ({ value }),
-  withSpring: (value: number) => value,
+vi.mock('react-native-reanimated', async () => {
+  const { View } = await import('react-native');
+  return {
+    default: { createAnimatedComponent: (component: unknown) => component, View },
+    useAnimatedStyle: () => ({}),
+    useSharedValue: (value: number) => ({ value }),
+    withSpring: (value: number) => value,
+  };
+});
+
+vi.mock('expo-linear-gradient', () => ({
+  LinearGradient: ({ colors, pointerEvents, style }: { colors: string[]; pointerEvents?: string; style?: unknown }) =>
+    createElement('div', {
+      'data-testid': 'fade',
+      'data-colors': JSON.stringify(colors),
+      'data-pointer-events': pointerEvents,
+      'data-style': JSON.stringify(style),
+    }),
+}));
+
+vi.mock('../../../hooks/use-bottom-chrome-metrics', () => ({
+  useBottomChromeMetrics: () => ({ jsBarOverlaysContent: ctrl.overlay }),
+}));
+
+vi.mock('../../../lib/tab-bar-hide-progress', () => ({ tabBarHiddenProgress: { value: 0 } }));
+
+vi.mock('../../../lib/tab-bar-visibility-store', () => ({ useTabBarHidden: () => ctrl.hidden }));
+
+vi.mock('../../../providers/tab-bar-height-provider', () => ({
+  useSetMeasuredTabBarHeight: () => () => {},
 }));
 
 vi.mock('../../PressableSurface', () => ({
@@ -89,8 +120,11 @@ vi.mock('../../PressableSurface', () => ({
 }));
 
 vi.mock('../../Text', () => ({
-  Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+  Text: ({ children, maxFontSizeMultiplier }: { children?: ReactNode; maxFontSizeMultiplier?: number }) =>
+    createElement('span', { 'data-max-font-scale': maxFontSizeMultiplier }, children),
 }));
+
+vi.mock('../../../theme/typography', () => ({ CHROME_LABEL_MAX_FONT_SCALE: 1.2 }));
 
 vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({
@@ -99,17 +133,19 @@ vi.mock('../../../providers/theme-provider', () => ({
       separator: '#3A3A3C',
       secondaryLabel: '#8E8E93',
     },
-    // Scheme-aware brand from the theme — MaterialTabBar uses it for the press
-    // ripple. Seeded with the DARK-scheme values so the badge assertions below
+    // Seeded with the DARK-scheme brand values so the badge assertions below
     // prove the dot fill comes from the static (light) brand instead.
     brandColors: { primary: '#A78BFA', success: '#34D399', live: '#FBBF24' },
+    // Picks the overlay bar's alpha.
+    colorScheme: ctrl.colorScheme,
     // M3 navigation-bar roles: active icon on a secondaryContainer pill, active
-    // label onSurface, inactive icon+label onSurfaceVariant.
+    // label secondary, inactive icon+label onSurfaceVariant.
     m3: {
       onSecondaryContainer: '#E8DEF8',
-      onSurface: '#E6E1E5',
+      secondary: '#CCC2DC',
       onSurfaceVariant: '#CAC4D0',
       secondaryContainer: FOCUSED_INDICATOR_COLOR,
+      surface: '#141218',
     },
   }),
 }));
@@ -118,21 +154,23 @@ vi.mock('../../../providers/theme-provider', () => ({
 // badge dot is a FILL, so it stays on these in both schemes.
 vi.mock('../../../theme/colors', () => ({
   brandColors: { primary: '#6D28D9', success: '#047857', live: '#B45309' },
+  withAlpha: (color: string, alpha: number) => `${color}@${alpha}`,
 }));
 
 vi.mock('../../../theme/tokens', () => ({
   material: {
     navBar: {
       surfaceElevation: 2,
-      activeIndicatorWidth: 40,
-      activeIndicatorHeight: 40,
-      activeIndicatorRadius: 20,
+      overlaySurfaceAlpha: { light: 0.85, dark: 0.94 },
+      activeIndicatorWidth: 56,
+      activeIndicatorHeight: 32,
+      activeIndicatorRadius: 16,
     },
   },
 }));
 
 vi.mock('../../../theme/layout', () => ({
-  MATERIAL_TAB_BAR_HEIGHT: 80,
+  MATERIAL_TAB_BAR_HEIGHT: 64,
 }));
 
 import { MaterialTabBar } from '../MaterialTabBar';
@@ -185,13 +223,17 @@ function makeProps(overrides: {
       index: activeIndex,
     },
     descriptors,
-    navigation,
+    emitter: navigation,
+    navigateToTab: navigation.navigate,
     insets: { bottom: 0, top: 0, left: 0, right: 0 },
   };
 }
 
 beforeEach(() => {
   ctrl.os = 'ios';
+  ctrl.overlay = false;
+  ctrl.hidden = false;
+  ctrl.colorScheme = 'dark';
 });
 
 describe('MaterialTabBar', () => {
@@ -290,12 +332,12 @@ describe('MaterialTabBar', () => {
       const tabs = getAllByRole('tab');
       // Press the second tab (index 1, inactive)
       fireEvent.click(tabs[1]);
-      expect(props.navigation.emit).toHaveBeenCalledWith({
+      expect(props.emitter.emit).toHaveBeenCalledWith({
         type: 'tabPress',
         target: 'route-b',
         canPreventDefault: true,
       });
-      expect(props.navigation.navigate).toHaveBeenCalledWith('profile');
+      expect(props.navigateToTab).toHaveBeenCalledWith('route-b');
     });
 
     it('does not navigate when the already-focused tab is pressed', () => {
@@ -306,12 +348,12 @@ describe('MaterialTabBar', () => {
       const tabs = getAllByRole('tab');
       // Press the first tab (already focused)
       fireEvent.click(tabs[0]);
-      expect(props.navigation.emit).toHaveBeenCalledWith({
+      expect(props.emitter.emit).toHaveBeenCalledWith({
         type: 'tabPress',
         target: 'route-a',
         canPreventDefault: true,
       });
-      expect(props.navigation.navigate).not.toHaveBeenCalled();
+      expect(props.navigateToTab).not.toHaveBeenCalled();
     });
 
     it('emits tabLongPress on long press', () => {
@@ -321,7 +363,7 @@ describe('MaterialTabBar', () => {
       );
       const tabs = getAllByRole('tab');
       fireEvent.contextMenu(tabs[1]);
-      expect(props.navigation.emit).toHaveBeenCalledWith({
+      expect(props.emitter.emit).toHaveBeenCalledWith({
         type: 'tabLongPress',
         target: 'route-b',
       });
@@ -345,10 +387,8 @@ describe('MaterialTabBar', () => {
           wall: { options: { title: 'On the Wall', tabBarItemStyle: { display: 'none' } } },
           b: { options: { title: 'Profile' } },
         },
-        navigation: {
-          emit: vi.fn(() => ({ defaultPrevented: false })),
-          navigate: vi.fn(),
-        },
+        emitter: { emit: vi.fn(() => ({ defaultPrevented: false })) },
+        navigateToTab: vi.fn(),
         insets: { bottom: 0, top: 0, left: 0, right: 0 },
       };
       const { getAllByRole, queryByLabelText } = render(
@@ -389,6 +429,20 @@ describe('MaterialTabBar', () => {
       expect(tabs[0].getAttribute('aria-label')).toBe('Home');
     });
 
+    // The bar is a fixed 64dp, so the visible label caps at the chrome scale;
+    // the full label still reaches screen readers through accessibilityLabel.
+    it('caps the visible label at the chrome font scale and keeps it in the a11y label', () => {
+      const props = makeProps({ activeIndex: 0, title: 'Climbs' });
+      const { getAllByRole } = render(
+        <MaterialTabBar {...(props as unknown as Parameters<typeof MaterialTabBar>[0])} />,
+      );
+      const tab = getAllByRole('tab')[0];
+      expect(tab.getAttribute('aria-label')).toBe('Climbs');
+      const label = tab.querySelector('span[data-max-font-scale]');
+      expect(label?.getAttribute('data-max-font-scale')).toBe('1.2');
+      expect(label?.textContent).toBe('Climbs');
+    });
+
     it('falls back to route name when no title is provided', () => {
       const routes = [{ key: 'route-a', name: 'boards' }];
       const props = {
@@ -396,14 +450,71 @@ describe('MaterialTabBar', () => {
         descriptors: {
           'route-a': { options: {} },
         },
-        navigation: {
-          emit: vi.fn(() => ({ defaultPrevented: false })),
-          navigate: vi.fn(),
-        },
+        emitter: { emit: vi.fn(() => ({ defaultPrevented: false })) },
+        navigateToTab: vi.fn(),
         insets: { bottom: 0, top: 0, left: 0, right: 0 },
       };
       const { getByRole } = render(<MaterialTabBar {...(props as unknown as Parameters<typeof MaterialTabBar>[0])} />);
       expect(getByRole('tab').getAttribute('aria-label')).toBe('boards');
+    });
+  });
+
+  describe('hide on scroll (Android phone tab roots)', () => {
+    const renderBar = () =>
+      render(<MaterialTabBar {...(makeProps({}) as unknown as Parameters<typeof MaterialTabBar>[0])} />);
+    const barOf = (container: HTMLElement) => container.firstElementChild as HTMLElement;
+
+    it('stays an opaque in-flow bar when it does not overlay content', () => {
+      const { container, queryByTestId } = renderBar();
+      expect(queryByTestId('fade')).toBeNull();
+      const style = barOf(container).getAttribute('data-style') ?? '';
+      expect(style).toContain('"backgroundColor":"#2C2C2E"');
+      expect(style).not.toContain('"position":"absolute"');
+    });
+
+    it('draws over the tab root on a mostly opaque surface, no hairline, no elevated fill', () => {
+      ctrl.overlay = true;
+      const { container } = renderBar();
+      const style = barOf(container).getAttribute('data-style') ?? '';
+      expect(style).toContain('"position":"absolute"');
+      expect(style).toContain('"borderTopWidth":0');
+      // Dark covers more (0.94) so the violet active label clears 4.5:1 over white content.
+      expect(style).toContain('"backgroundColor":"#141218@0.94"');
+      expect(style).not.toContain('#2C2C2E');
+    });
+
+    it('keeps the lighter 0.85 overlay surface in light mode', () => {
+      ctrl.overlay = true;
+      ctrl.colorScheme = 'light';
+      const { container, getByTestId } = renderBar();
+      expect(barOf(container).getAttribute('data-style') ?? '').toContain('"backgroundColor":"#141218@0.85"');
+      expect(getByTestId('fade').getAttribute('data-colors')).toBe(JSON.stringify(['#141218@0', '#141218@0.85']));
+    });
+
+    it('fades 24dp above its top edge into the surface, without taking touches', () => {
+      ctrl.overlay = true;
+      const { getByTestId } = renderBar();
+      const fade = getByTestId('fade');
+      expect(fade.getAttribute('data-colors')).toBe(JSON.stringify(['#141218@0', '#141218@0.94']));
+      expect(fade.getAttribute('data-pointer-events')).toBe('none');
+      const fadeStyle = fade.getAttribute('data-style') ?? '';
+      expect(fadeStyle).toContain('"top":-24');
+      expect(fadeStyle).toContain('"height":24');
+    });
+
+    it('takes a hidden bar out of touch and the TalkBack order', () => {
+      ctrl.overlay = true;
+      ctrl.hidden = true;
+      const { container } = renderBar();
+      expect(barOf(container).getAttribute('data-pointer-events')).toBe('none');
+      expect(barOf(container).getAttribute('data-a11y')).toBe('no-hide-descendants');
+    });
+
+    it('keeps a shown bar reachable', () => {
+      ctrl.overlay = true;
+      const { container } = renderBar();
+      expect(barOf(container).getAttribute('data-pointer-events')).toBe('auto');
+      expect(barOf(container).getAttribute('data-a11y')).toBe('auto');
     });
   });
 });

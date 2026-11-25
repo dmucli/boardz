@@ -13,8 +13,9 @@ vi.mock('server-only', () => ({}));
 vi.mock('@/app/lib/graphql/client', () => ({
   getGraphQLHttpUrl: () => 'http://backend.test/graphql',
 }));
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: () => ({ board_name: 'kilter' }),
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: () => ({ board_name: 'kilter' }),
 }));
 vi.mock('../../board-renderer/util', () => ({
   buildBoardRenderUrl: () => 'http://render.test/board.png',
@@ -60,6 +61,10 @@ describe('buildBoardSlotData — the recent-climbs seed is deadlined', () => {
     const [, requestInit] = mockFetch.mock.calls[0] as [string, RequestInit];
     expect(requestInit.signal).toBe(timeoutSpy.mock.results[0].value);
     expect(requestInit.cache).toBe('no-store');
+    if (typeof requestInit.body !== 'string') throw new Error('Expected a JSON request body');
+    expect(JSON.parse(requestInit.body)).toMatchObject({
+      variables: { boardId: 42, boardUuid: board.boardUuid },
+    });
   });
 
   it('degrades to an empty seed when the deadline fires', async () => {

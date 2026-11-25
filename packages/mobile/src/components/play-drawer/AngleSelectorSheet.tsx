@@ -1,10 +1,14 @@
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, Pressable, StyleSheet } from 'react-native';
-import { BottomSheetModal, BottomSheetView } from '@expo/ui/community/bottom-sheet';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { View, StyleSheet } from 'react-native';
+import { BottomSheetModal, BottomSheetView } from '../sheet-presentation';
 import { useTranslation } from 'react-i18next';
 import type { BoardName } from '@boardsesh/shared-schema';
+import { MOONBOARD_ANGLES } from '@boardsesh/board-config';
 import { Text } from '../Text';
+import { SheetTopBar } from '../SheetTopBar';
+import { useWindowBottomInset } from '../../hooks/use-window-bottom-inset';
 import { useBoardAngleOptions } from '../../hooks/use-board-angle-options';
 import { androidSafeSnapPoints } from '../sheet-snap-points';
 import { useClimbStatsHistory } from '../../lib/graphql/hooks';
@@ -13,10 +17,10 @@ import { buildAngleStatsMap, type AngleStats } from './community-utils';
 import { AngleBoardDiagram } from './AngleBoardDiagram';
 import { AngleSlider } from './AngleSlider';
 import { iosSystemColors } from '../../theme/ios-colors';
-import { brandColors } from '../../theme/colors';
 import { spacing, sheetStyles } from '../../theme/tokens';
 import { useTheme } from '../../providers/theme-provider';
 import { useManagedSheet } from '../../providers/sheet-presentation-provider';
+import { useSheetBackgroundStyle } from '../use-sheet-background-style';
 
 type AngleSelectorSheetProps = {
   visible: boolean;
@@ -37,15 +41,18 @@ export const AngleSelectorSheet = memo(function AngleSelectorSheet({
   currentAngle,
   onAngleChange,
 }: AngleSelectorSheetProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('session');
   const { t: tCommon } = useTranslation('common');
-  const { systemColors } = useTheme();
-  const insets = useSafeAreaInsets();
+  const { systemColors, selection } = useTheme();
+  const sheetBackgroundStyle = useSheetBackgroundStyle();
+  // The window's inset, not the mount point's: a sheet covers the tab bar (#3776).
+  const windowInsetBottom = useWindowBottomInset();
   const { gradeFormat } = useGradeFormat();
   const sheetRef = useRef<BottomSheetModal>(null);
 
   // Single large snap point so the sheet always opens at full "big" size with
-  // room for the diagram, stats, slider and Done button above the home indicator.
+  // room for the diagram, stats and slider above the home indicator.
   // (androidSafeSnapPoints leaves a >= 75% detent as-is, so Android keeps this big.)
   const snapPoints = useMemo(() => androidSafeSnapPoints(['90%']), []);
 
@@ -53,6 +60,16 @@ export const AngleSelectorSheet = memo(function AngleSelectorSheet({
   // and offline, unlike a per-board query. MoonBoard swaps in the full
   // Kilter/Tension-style range when the moonboard-wide-angles flag is on.
   const angles = useBoardAngleOptions(boardName as BoardName);
+  // Moon grades every problem at 25° and 40°, so on the wide MoonBoard range
+  // those two get one-tap buttons. Without the wide range the slider already
+  // has only those two stops.
+  const snapAngles = useMemo(
+    () =>
+      boardName === 'moonboard' && angles.length > MOONBOARD_ANGLES.length
+        ? MOONBOARD_ANGLES.filter((angle) => angles.includes(angle))
+        : [],
+    [boardName, angles],
+  );
 
   // Live preview angle. Applied to the board only when "Done" is pressed; the
   // diagram, grade, stars and sends all reflect this as the user slides.
@@ -65,7 +82,10 @@ export const AngleSelectorSheet = memo(function AngleSelectorSheet({
   // (mirrors the QueueList active-gate). React Query's 5-min staleTime keeps stats
   // warm across re-opens and still dedupes with CommunitySection's below-fold query.
   const { data: statsHistory } = useClimbStatsHistory(boardName, visible ? (climbUuid ?? null) : null);
-  const statsByAngle = useMemo(() => buildAngleStatsMap(statsHistory, gradeFormat), [statsHistory, gradeFormat]);
+  const statsByAngle = useMemo(
+    () => buildAngleStatsMap(statsHistory, gradeFormat, boardName),
+    [statsHistory, gradeFormat, boardName],
+  );
   const stats: AngleStats | undefined = statsByAngle.get(selectedAngle);
   const quality = stats?.quality ?? 0;
 
@@ -97,120 +117,143 @@ export const AngleSelectorSheet = memo(function AngleSelectorSheet({
       onChange={managed.onChange}
       onFullyDismissed={managed.onFullyDismissed}
       handleIndicatorStyle={sheetStyles.indicator}
+      backgroundStyle={sheetBackgroundStyle}
     >
-      <BottomSheetView style={[styles.container, { paddingBottom: insets.bottom + spacing[4] }]}>
-        <Text variant="headline" style={styles.title}>
-          {t('mobile.angleSelector.title')}
-        </Text>
-
-        <AngleBoardDiagram
-          angle={selectedAngle}
-          size={150}
-          accessibilityLabel={t('mobile.angleSelector.diagramAria', { angle: selectedAngle })}
+      {/* The sheet's single child: the top bar and the body share it. */}
+      <BottomSheetView style={{ paddingBottom: windowInsetBottom + spacing[4] }}>
+        <SheetTopBar
+          title={t('mobile.angleSelector.title')}
+          leading={{ kind: 'close', onPress: onClose }}
+          trailing={{ kind: 'confirm', label: tCommon('actions.done'), onPress: handleDone, prominent: true }}
         />
+        <View style={styles.container}>
+          <AngleBoardDiagram
+            angle={selectedAngle}
+            size={150}
+            accessibilityLabel={t('mobile.angleSelector.diagramAria', { angle: selectedAngle })}
+          />
 
-        <Text variant="largeTitle" style={[styles.angleValue, { color: systemColors.label }]}>
-          {selectedAngle}°
-        </Text>
-
-        {stats?.gradeName ? (
-          <Text variant="headline" style={[styles.grade, { color: stats.color }]}>
-            {stats.gradeName}
+          <Text emphasized variant="largeTitle" numeric style={[styles.angleValue, { color: systemColors.label }]}>
+            {selectedAngle}°
           </Text>
-        ) : null}
 
-        {quality > 0 ? (
-          <View style={styles.stars} accessibilityLabel={`★ ${quality.toFixed(1)}`}>
-            {[1, 2, 3, 4, 5].map((n) => (
-              <Text
-                key={n}
-                variant="body"
-                style={[styles.star, { color: quality >= n ? iosSystemColors.starGold : systemColors.secondaryLabel }]}
-              >
-                {quality >= n ? '★' : '☆'}
-              </Text>
-            ))}
+          {stats?.gradeName ? (
+            <Text variant="headline" style={[styles.grade, { color: stats.color }]}>
+              {stats.gradeName}
+            </Text>
+          ) : null}
+
+          {quality > 0 ? (
+            <View style={styles.stars} accessibilityLabel={`★ ${quality.toFixed(1)}`}>
+              {[1, 2, 3, 4, 5].map((n) => (
+                <Text
+                  key={n}
+                  variant="body"
+                  style={[
+                    styles.star,
+                    { color: quality >= n ? iosSystemColors.starGold : systemColors.secondaryLabel },
+                  ]}
+                >
+                  {quality >= n ? '★' : '☆'}
+                </Text>
+              ))}
+            </View>
+          ) : null}
+
+          {stats && stats.sends > 0 ? (
+            <Text variant="caption1" style={[styles.ascents, { color: systemColors.secondaryLabel }]}>
+              {t('mobile.community.ascensionists', { count: stats.sends })}
+            </Text>
+          ) : null}
+
+          <Text variant="caption2" style={[styles.hint, { color: systemColors.secondaryLabel }]}>
+            {t('mobile.angleSelector.fromVerticalHint')}
+          </Text>
+
+          {snapAngles.length > 0 ? (
+            <View style={styles.snapRow}>
+              {snapAngles.map((angle) => {
+                const isSelected = angle === selectedAngle;
+                return (
+                  <PressableSurface
+                    key={angle}
+                    onPress={() => setSelectedAngle(angle)}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: isSelected }}
+                    accessibilityLabel={t('mobile.angleSelector.snapToAngle', { angle })}
+                    style={({ pressed }) => [
+                      styles.snapButton,
+                      {
+                        backgroundColor: isSelected ? selection.fill : systemColors.fill,
+                        borderColor: isSelected ? selection.checkmark : 'transparent',
+                      },
+                      pressed && styles.snapButtonPressed,
+                    ]}
+                  >
+                    <Text variant="headline" emphasized color={selection.text}>
+                      {angle}°
+                    </Text>
+                  </PressableSurface>
+                );
+              })}
+            </View>
+          ) : null}
+
+          <View style={styles.sliderWrap}>
+            <AngleSlider angles={angles} value={selectedAngle} onChange={setSelectedAngle} />
           </View>
-        ) : null}
-
-        {stats && stats.sends > 0 ? (
-          <Text variant="caption1" style={[styles.ascents, { color: systemColors.secondaryLabel }]}>
-            {t('mobile.community.ascensionists', { count: stats.sends })}
-          </Text>
-        ) : null}
-
-        <Text variant="caption2" style={[styles.hint, { color: systemColors.tertiaryLabel }]}>
-          {t('mobile.angleSelector.fromVerticalHint')}
-        </Text>
-
-        <View style={styles.sliderWrap}>
-          <AngleSlider angles={angles} value={selectedAngle} onChange={setSelectedAngle} />
         </View>
-
-        <Pressable
-          onPress={handleDone}
-          accessibilityRole="button"
-          accessibilityLabel={tCommon('actions.done')}
-          style={({ pressed }) => [styles.doneButton, pressed && styles.doneButtonPressed]}
-        >
-          <Text variant="headline" style={styles.doneText}>
-            {tCommon('actions.done')}
-          </Text>
-        </Pressable>
       </BottomSheetView>
     </BottomSheetModal>
   );
 });
 
-const styles = StyleSheet.create({
-  container: {
-    paddingHorizontal: spacing[5],
-    paddingTop: spacing[2],
-    alignItems: 'center',
-  },
-  title: {
-    alignSelf: 'flex-start',
-    marginBottom: spacing[2],
-  },
-  angleValue: {
-    fontWeight: '700',
-    marginTop: spacing[2],
-  },
-  grade: {
-    marginTop: spacing[1],
-  },
-  stars: {
-    flexDirection: 'row',
-    gap: spacing[1],
-    marginTop: spacing[1],
-  },
-  star: {
-    fontSize: 18,
-  },
-  ascents: {
-    marginTop: spacing[1],
-  },
-  hint: {
-    marginTop: spacing[1],
-  },
-  sliderWrap: {
-    width: '100%',
-    marginTop: spacing[4],
-    marginBottom: spacing[4],
-  },
-  doneButton: {
-    width: '100%',
-    height: 52,
-    borderRadius: 14,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: brandColors.primary,
-  },
-  doneButtonPressed: {
-    opacity: 0.85,
-  },
-  doneText: {
-    color: iosSystemColors.white,
-    fontWeight: '600',
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    container: {
+      paddingHorizontal: spacing[5],
+      paddingTop: spacing[4],
+      alignItems: 'center',
+    },
+    angleValue: {
+      marginTop: spacing[2],
+    },
+    grade: {
+      marginTop: spacing[1],
+    },
+    stars: {
+      flexDirection: 'row',
+      gap: spacing[1],
+      marginTop: spacing[1],
+    },
+    star: {
+      fontSize: textStyles.body.fontSize,
+    },
+    ascents: {
+      marginTop: spacing[1],
+    },
+    hint: {
+      marginTop: spacing[1],
+    },
+    snapRow: {
+      flexDirection: 'row',
+      gap: spacing[3],
+      marginTop: spacing[4],
+    },
+    snapButton: {
+      minWidth: 88,
+      height: 44,
+      paddingHorizontal: spacing[4],
+      borderRadius: 22,
+      borderWidth: 2,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    snapButtonPressed: {
+      opacity: 0.85,
+    },
+    sliderWrap: {
+      width: '100%',
+      marginTop: spacing[4],
+    },
+  });

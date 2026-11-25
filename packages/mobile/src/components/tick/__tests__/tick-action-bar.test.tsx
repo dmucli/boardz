@@ -12,6 +12,7 @@ const screen = vi.hoisted(() => ({ fontScale: 1 }));
 
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
   View: ({
     children,
@@ -65,7 +66,12 @@ vi.mock('../../../providers/theme-provider', async () => {
 });
 
 import { TickActionBar } from '../TickActionBar';
-import { TICK_ACTION_HEIGHT, TICK_ERROR_SLOT_HEIGHT, tickActionHeight } from '../tick-sheet-metrics';
+import {
+  TICK_ACTION_HEIGHT,
+  TICK_ACTION_MAX_FONT_SCALE,
+  TICK_ERROR_SLOT_HEIGHT,
+  tickActionHeight,
+} from '../tick-sheet-metrics';
 import { brandColors } from '../../../theme/colors';
 
 function renderBar(props: Partial<Parameters<typeof TickActionBar>[0]> = {}) {
@@ -137,6 +143,15 @@ describe('TickActionBar', () => {
     expect(row.minHeight).toBe(TICK_ACTION_HEIGHT);
   });
 
+  it('keeps an optional full-width note before the reserved error and terminal actions', () => {
+    const { container } = renderBar({ note: createElement('textarea', { 'aria-label': 'Comment' }) });
+    const note = container.querySelector('[data-testid="tick-action-note"]');
+    expect(note?.querySelector('textarea')).not.toBeNull();
+    expect(note?.nextElementSibling?.getAttribute('data-testid')).toBe('tick-action-error-slot');
+    expect(note?.nextElementSibling?.nextElementSibling?.getAttribute('data-testid')).toBe('tick-action-row');
+    expect(styleOf(container, 'tick-action-note')).toMatchObject({ flexDirection: 'row', flexShrink: 0 });
+  });
+
   it('pins both buttons to one height, so the tonal and filled pills cannot measure apart', () => {
     renderBar({ secondary: { title: 'Attempt', onPress: vi.fn() } });
 
@@ -161,6 +176,15 @@ describe('TickActionBar', () => {
     // The flex split is not what the text scale moves.
     expect(buttonStyle('Attempt').flex).toBe(1);
     expect(buttonStyle('Send').flex).toBe(2);
+  });
+
+  it('is 48pt tall, and caps both labels at 1.3x Dynamic Type so they fit it', () => {
+    renderBar({ secondary: { title: 'Attempt', onPress: vi.fn() } });
+    expect(buttonStyle('Send').height).toBe(48);
+    const capOf = (title: string) => buttonCalls.props.find((props) => props.title === title)?.maxFontSizeMultiplier;
+    expect(capOf('Attempt')).toBe(TICK_ACTION_MAX_FONT_SCALE);
+    expect(capOf('Send')).toBe(TICK_ACTION_MAX_FONT_SCALE);
+    expect(TICK_ACTION_MAX_FONT_SCALE).toBe(1.3);
   });
 
   it('announces a failure: these used to go through showToast, which announced', () => {

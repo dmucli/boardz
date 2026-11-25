@@ -1,11 +1,13 @@
-import { type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
-import { View, Pressable, StyleSheet, type LayoutChangeEvent } from 'react-native';
+import { PressableSurface } from './PressableSurface';
+import { type ReactElement, type ReactNode, useCallback, useContext, useEffect, useRef, useState } from 'react';
+import { View, StyleSheet, type LayoutChangeEvent } from 'react-native';
 import Animated, { useAnimatedStyle, useSharedValue, withTiming } from 'react-native-reanimated';
+import { CollapsibleSummaryStyleContext } from './collapsible-summary-style';
 import { Text } from './Text';
 import { Icon } from './Icon';
 import { hapticSelection } from '../lib/haptics';
 import { getSectionExpandedSync, setSectionExpanded, useSectionExpanded } from '../lib/section-expand-store';
-import { iosSystemColors } from '../theme/ios-colors';
+import { useTheme } from '../providers/theme-provider';
 import { spacing, borderRadius } from '../theme/tokens';
 import { timing } from '../theme/animations';
 
@@ -18,8 +20,26 @@ type CollapsibleSectionProps = {
    * (e.g. Beta Videos) where users should always see the content.
    */
   keepExpanded?: boolean;
-  /** Short text shown next to the title when the section is collapsed (e.g. active filter values). */
-  summary?: string | null;
+  /**
+   * One line shown next to the title while the section is collapsed (e.g. active
+   * filter values). Text is drawn as a dimmed, right-aligned footnote. Anything
+   * else (a row of coloured markers, say) is drawn as given in the same slot, which
+   * clips it to the title's row; it brings its own colours and one-line layout.
+   */
+  summary?: string | ReactElement | null;
+  /**
+   * What a screen reader says for the summary while the section is collapsed,
+   * after the title. Text summaries are not read out today; a section whose
+   * line carries information (a list of holds, say) passes its words here.
+   */
+  summaryAccessibilityLabel?: string;
+  /**
+   * While collapsed with a summary, draw the summary in the title's place and
+   * across the whole row, and the title only once the section is open. For a
+   * section whose collapsed line says more than its name (Active holds).
+   * Screen readers still hear the title first.
+   */
+  hideTitleWhenCollapsed?: boolean;
   /** When this value changes, expanded state resets to `defaultExpanded` without remounting the tree. */
   resetKey?: number;
   /** Optional trailing action rendered in the header (e.g. an Attach button). */
@@ -46,6 +66,8 @@ export function CollapsibleSection({
   defaultExpanded = false,
   keepExpanded = false,
   summary,
+  summaryAccessibilityLabel,
+  hideTitleWhenCollapsed = false,
   resetKey,
   headerAction,
   onHeaderLayout,
@@ -54,6 +76,7 @@ export function CollapsibleSection({
   persistKey,
   children,
 }: CollapsibleSectionProps) {
+  const { systemColors } = useTheme();
   const handleHeaderLayout = useCallback(
     (event: LayoutChangeEvent) => {
       onHeaderLayout?.(event.nativeEvent.layout.height);
@@ -63,7 +86,7 @@ export function CollapsibleSection({
 
   if (keepExpanded) {
     return (
-      <View style={styles.container}>
+      <View style={[styles.container, { backgroundColor: systemColors.tertiaryFill }]}>
         <View style={styles.header} onLayout={onHeaderLayout ? handleHeaderLayout : undefined}>
           <Text variant="headline" style={styles.title}>
             {title}
@@ -80,6 +103,8 @@ export function CollapsibleSection({
       title={title}
       defaultExpanded={defaultExpanded}
       summary={summary}
+      summaryAccessibilityLabel={summaryAccessibilityLabel}
+      hideTitleWhenCollapsed={hideTitleWhenCollapsed}
       resetKey={resetKey}
       headerAction={headerAction}
       onHeaderLayoutEvent={onHeaderLayout ? handleHeaderLayout : undefined}
@@ -96,6 +121,8 @@ function CollapsibleSectionInternal({
   title,
   defaultExpanded,
   summary,
+  summaryAccessibilityLabel,
+  hideTitleWhenCollapsed,
   resetKey,
   headerAction,
   onHeaderLayoutEvent,
@@ -106,7 +133,9 @@ function CollapsibleSectionInternal({
 }: {
   title: string;
   defaultExpanded: boolean;
-  summary?: string | null;
+  summary?: string | ReactElement | null;
+  summaryAccessibilityLabel?: string;
+  hideTitleWhenCollapsed: boolean;
   resetKey?: number;
   headerAction?: ReactNode;
   // Internal prop takes the raw LayoutChangeEvent; the public `onHeaderLayout`
@@ -118,6 +147,8 @@ function CollapsibleSectionInternal({
   persistKey?: string;
   children: ReactNode;
 }) {
+  const { systemColors } = useTheme();
+  const summaryStyle = useContext(CollapsibleSummaryStyleContext);
   // Seed from the persisted store synchronously when warm (no flash on the next
   // climb); fall back to `defaultExpanded` for a cold store or no persistKey.
   const initialExpanded = persistKey ? (getSectionExpandedSync(persistKey) ?? defaultExpanded) : defaultExpanded;
@@ -169,36 +200,54 @@ function CollapsibleSectionInternal({
     onToggle?.(next);
   }, [expanded, chevronRotation, persistKey, onToggle]);
 
+  // A summary that draws itself may stand in for the title while collapsed.
+  const summaryReplacesTitle = hideTitleWhenCollapsed && !expanded && summary != null && typeof summary !== 'string';
+  const summarySlotStyle = summaryReplacesTitle ? styles.summaryRow : styles.summarySlot;
+
   const chevronStyle = useAnimatedStyle(() => ({
     transform: [{ rotate: `${chevronRotation.value * 180}deg` }],
   }));
 
   return (
-    <View style={styles.container}>
+    <View style={[styles.container, { backgroundColor: systemColors.tertiaryFill }]}>
       {/* `headerAction` sits BETWEEN two toggle targets rather than inside one.
           Nesting it in the header pressable would leave its taps arbitrated by
           the responder system; as a sibling it simply owns them, so the Beta
           Videos "+" can never fold the section by accident. Visual order (title
           … action, chevron) is unchanged. */}
       <View style={styles.header} onLayout={onHeaderLayoutEvent}>
-        <Pressable
+        <PressableSurface
           onPress={toggleExpanded}
           accessibilityRole="button"
-          accessibilityLabel={title}
+          accessibilityLabel={!expanded && summaryAccessibilityLabel ? `${title}. ${summaryAccessibilityLabel}` : title}
           accessibilityState={{ expanded }}
           style={styles.headerPress}
         >
-          <Text variant="headline" style={styles.title}>
-            {title}
-          </Text>
-          {!expanded && summary ? (
-            <Text variant="footnote" style={styles.summary} numberOfLines={1}>
-              {summary}
+          {summaryReplacesTitle ? null : (
+            <Text variant="headline" style={styles.title}>
+              {title}
             </Text>
-          ) : null}
-        </Pressable>
+          )}
+          {expanded || !summary ? null : typeof summary === 'string' ? (
+            summaryStyle ? (
+              <Animated.View style={[styles.summaryTextSlot, summaryStyle]}>
+                <Text tone="secondary" variant="footnote" style={styles.summaryText} numberOfLines={1}>
+                  {summary}
+                </Text>
+              </Animated.View>
+            ) : (
+              <Text tone="secondary" variant="footnote" style={styles.summary} numberOfLines={1}>
+                {summary}
+              </Text>
+            )
+          ) : summaryStyle ? (
+            <Animated.View style={[summarySlotStyle, summaryStyle]}>{summary}</Animated.View>
+          ) : (
+            <View style={summarySlotStyle}>{summary}</View>
+          )}
+        </PressableSurface>
         {headerAction}
-        <Pressable
+        <PressableSurface
           onPress={toggleExpanded}
           // The title pressable above already announces the section and its
           // expanded state; a second identical button would just be noise.
@@ -210,9 +259,9 @@ function CollapsibleSectionInternal({
           hitSlop={8}
         >
           <Animated.View style={chevronStyle}>
-            <Icon name="chevron.down" size={16} color={iosSystemColors.systemGray} />
+            <Icon name="chevron.down" size={16} color={systemColors.tertiaryLabel} />
           </Animated.View>
-        </Pressable>
+        </PressableSurface>
       </View>
 
       {/* Plain View, not a FadeIn/FadeOut Animated.View: inside a FlashList header
@@ -225,7 +274,6 @@ function CollapsibleSectionInternal({
 const styles = StyleSheet.create({
   container: {
     borderRadius: borderRadius.lg,
-    backgroundColor: `${iosSystemColors.systemGray}14`,
     overflow: 'hidden',
   },
   header: {
@@ -251,13 +299,43 @@ const styles = StyleSheet.create({
   // Basis 0, so the summary ellipsizes into the spare width instead of
   // squeezing the title. Right-aligned against the chevron, as before.
   summary: {
-    opacity: 0.55,
     flexGrow: 1,
     flexBasis: 0,
     flexShrink: 1,
     textAlign: 'right',
-    marginLeft: spacing[2],
-    marginRight: spacing[2],
+    marginStart: spacing[2],
+    marginEnd: spacing[2],
+  },
+  // `summary`'s share of the row, for a text summary that fades: the slot takes
+  // the flex, the text inside right-aligns and ellipsizes into it.
+  summaryTextSlot: {
+    flexGrow: 1,
+    flexBasis: 0,
+    flexShrink: 1,
+    marginStart: spacing[2],
+    marginEnd: spacing[2],
+  },
+  summaryText: {
+    textAlign: 'right',
+  },
+  // The same share of the row as a text summary, for a summary that draws itself.
+  summarySlot: {
+    flexGrow: 1,
+    flexBasis: 0,
+    flexShrink: 1,
+    alignItems: 'flex-end',
+    overflow: 'hidden',
+    marginStart: spacing[2],
+    marginEnd: spacing[2],
+  },
+  // In the title's place: the whole row up to the chevron, from the start.
+  summaryRow: {
+    flexGrow: 1,
+    flexBasis: 0,
+    flexShrink: 1,
+    alignItems: 'flex-start',
+    overflow: 'hidden',
+    marginEnd: spacing[2],
   },
   content: {
     paddingHorizontal: spacing[4],

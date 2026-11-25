@@ -2,6 +2,8 @@
 import { appendFileSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { isAppAffecting } from './lib/expo-web-inputs.mjs';
+import { isNativeAppAffecting } from './lib/app-build-inputs.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
 const ZERO_SHA = '0000000000000000000000000000000000000000';
@@ -30,22 +32,34 @@ function asWorkflowRuns(payload) {
   return payload.workflow_runs;
 }
 
+// The newest successful main run by run id, never the first one listed. The
+// workflow reads the plain workflow listing, because the search-backed filters
+// (`status=`, `branch=`) twice handed back a months-old success ahead of the
+// newer ones (runs 41618818054 and 41650355602, 2026-11-03). That stale base
+// marked every target changed and sent the critical-OTA walk paging back
+// months until it tripped on a duplicate run.
 function selectLatestSuccessfulPriorRun(payload, { currentRunId = '' } = {}) {
   const workflowRuns = asWorkflowRuns(payload);
   if (!workflowRuns) return null;
 
-  return (
-    workflowRuns.find((run) => {
-      const headSha = typeof run?.head_sha === 'string' ? run.head_sha.trim() : '';
-      return (
-        run?.status === 'completed' &&
-        run?.conclusion === 'success' &&
-        FULL_COMMIT_SHA_PATTERN.test(headSha) &&
-        headSha !== ZERO_SHA &&
-        (currentRunId === '' || String(run?.id ?? '') !== String(currentRunId))
-      );
-    }) ?? null
-  );
+  let latest = null;
+  for (const run of workflowRuns) {
+    const headSha = typeof run?.head_sha === 'string' ? run.head_sha.trim() : '';
+    const runId = run?.id;
+    if (
+      run?.status === 'completed' &&
+      run?.conclusion === 'success' &&
+      run?.head_branch === 'main' &&
+      Number.isSafeInteger(runId) &&
+      runId > 0 &&
+      FULL_COMMIT_SHA_PATTERN.test(headSha) &&
+      headSha !== ZERO_SHA &&
+      (currentRunId === '' || String(runId) !== String(currentRunId)) &&
+      (latest === null || runId > latest.id)
+    )
+      latest = run;
+  }
+  return latest;
 }
 
 function isProductionDeployControlFile(filePath) {
@@ -65,8 +79,9 @@ function isProductionDeployWatchdogFile(filePath) {
 
 function isProductionDeployTestFile(filePath) {
   return (
-    filePath === 'scripts/__tests__/docker-build-release-stamp.test.ts' ||
-    filePath === 'scripts/__tests__/production-deploy-serial-plan.test.ts' ||
+    // Direct Vitest suites in this directory are CI inputs, including new ones.
+    // Keep runtime scripts and nested fixtures subject to normal classification.
+    /^scripts\/__tests__\/[^/]+\.test\.ts$/.test(filePath) ||
     filePath === 'scripts/production-backend-smoke.test.mjs' ||
     filePath === 'scripts/production-deploy-changes.test.mjs' ||
     filePath === 'scripts/production-web-deploy-targets.test.mjs' ||
@@ -74,6 +89,7 @@ function isProductionDeployTestFile(filePath) {
     filePath === 'scripts/railway-deployment-status.test.mjs' ||
     filePath === 'scripts/production-smoke.test.ts' ||
     filePath === 'scripts/mobile-ota-promote.test.ts' ||
+    filePath === 'scripts/mobile-ota-unreleased-native.test.ts' ||
     filePath === 'scripts/mobile-ota-schema-ready.test.mjs' ||
     filePath === 'scripts/mobile-ota-server-ready.test.mjs' ||
     filePath === 'scripts/mobile-ota-stage-verify.test.ts'
@@ -87,6 +103,8 @@ function isProductionDeployTestFile(filePath) {
 function isCloudflareAffecting(filePath) {
   return (
     filePath.startsWith('infra/cloudflare/') ||
+    filePath === 'infra/ota/hosting.json' ||
+    filePath === 'infra/ota/server.ts' ||
     filePath === 'packages/web/app/lib/crawler-policy.ts' ||
     filePath === 'scripts/cloudflare-apply.ts' ||
     filePath === 'scripts/cloudflare-apply.test.ts'
@@ -111,7 +129,9 @@ function isStaticAssetsAffecting(filePath) {
 
 function isBackendAffecting(filePath) {
   return (
-    filePath.startsWith('packages/') ||
+    // The [skip ci] changelog push lands in the next run's range after every OTA;
+    // only the app reads the file, so it must not rebuild and redeploy the backend.
+    (filePath.startsWith('packages/') && filePath !== 'packages/mobile/src/data/changelog.generated.json') ||
     filePath === 'Dockerfile.backend' ||
     filePath === 'scripts/create-service-docker-context.mjs' ||
     filePath === 'scripts/production-backend-smoke.mjs' ||
@@ -143,59 +163,11 @@ function isWebAffecting(filePath) {
   );
 }
 
-function isAppAffecting(filePath) {
-  return (
-    filePath.startsWith('packages/mobile/') ||
-    filePath.startsWith('packages/shared/') ||
-    filePath.startsWith('packages/shared-schema/') ||
-    // deploy-app-web installs the root graph before exporting Expo web. The
-    // workspace manifest owns linker policy, overrides and patch mappings, so
-    // these root inputs can change the shipped browser bundle even when no
-    // packages/mobile source file changed.
-    filePath === 'pnpm-lock.yaml' ||
-    filePath === 'pnpm-workspace.yaml' ||
-    filePath === 'package.json' ||
-    filePath.startsWith('patches/') ||
-    filePath === 'scripts/build-expo-web-export.sh' ||
-    // The export recipe shells out to this: it rewrites the shipped shell's
-    // manifest href and the manifest's start_url/scope from the export's
-    // baseUrl (W-24, #4438). A patcher-only change alters the artifact
-    // app.boardsesh.com serves, so it has to redeploy the subdomain — and run
-    // the post-deploy manifest smoke that would catch a bad patch.
-    filePath === 'scripts/lib/patch-expo-web-pwa-manifest.mjs' ||
-    // Everything deploy-app-web ships to the Pages project. Listed file by file
-    // rather than as a `deploy/app-subdomain/` prefix because the rest of that
-    // directory — README, tsconfig, vite config, __tests__ — is not deployed,
-    // and a README edit should not redeploy the subdomain.
-    filePath === 'deploy/app-subdomain/_headers' ||
-    filePath === 'deploy/app-subdomain/_redirects' ||
-    filePath === 'deploy/app-subdomain/_routes.json' ||
-    filePath.startsWith('deploy/app-subdomain/functions/')
-  );
-}
-
-// Keep this in step with the main-push paths formerly owned by
-// mobile-ota-production.yml. Cumulative detection also recovers an OTA push
-// whose earlier production-deploy run was superseded while pending.
+// OTA and browser builds use the same app-input policy. The generated changelog
+// is written by promotion itself, so it must not queue another OTA.
 function isOtaAffecting(filePath) {
   return (
-    (filePath.startsWith('packages/mobile/') && filePath !== 'packages/mobile/src/data/changelog.generated.json') ||
-    filePath.startsWith('packages/shared/') ||
-    filePath.startsWith('packages/board-constants/') ||
-    filePath.startsWith('packages/shared-schema/') ||
-    filePath === 'package.json' ||
-    filePath === 'pnpm-lock.yaml' ||
-    filePath === 'pnpm-workspace.yaml' ||
-    filePath.startsWith('patches/') ||
-    filePath === 'scripts/mobile-publish.ts' ||
-    filePath === 'scripts/lib/mobile-publish-retry.ts' ||
-    filePath === 'scripts/lib/ota-branch-probe.ts' ||
-    filePath === 'scripts/lib/eoas.ts' ||
-    filePath === 'scripts/mobile-ota-promote.ts' ||
-    filePath === 'scripts/mobile-ota-schema-ready.mjs' ||
-    filePath === 'scripts/mobile-ota-server-ready.mjs' ||
-    filePath === 'scripts/mobile-ota-stage-verify.ts' ||
-    filePath === '.github/workflows/mobile-ota-production.yml'
+    filePath !== 'packages/mobile/src/data/changelog.generated.json' && isNativeAppAffecting(filePath, 'production')
   );
 }
 
@@ -242,17 +214,18 @@ function createCliGit({ cwd = process.cwd() } = {}) {
       }
     },
     changedFiles(baseSha, headSha) {
-      const output = runGit(['diff', '--name-only', baseSha, headSha]);
+      // Treat a move as deletion + addition so moving app code outside its
+      // roots still rebuilds the app that lost that code.
+      const output = runGit(['diff', '--no-renames', '--name-only', baseSha, headSha]);
       return output === '' ? [] : output.split('\n').filter(Boolean);
     },
   };
 }
 
 function determineProductionDeployChanges({ eventName, headSha, currentRunId = '', runsPayload, git }) {
-  if (eventName === 'workflow_dispatch') return fullDeploy('workflow_dispatch');
-
   const priorRun = selectLatestSuccessfulPriorRun(runsPayload, { currentRunId });
-  if (!priorRun) return fullDeploy('missing-successful-baseline');
+  if (!priorRun)
+    return fullDeploy(eventName === 'workflow_dispatch' ? 'workflow_dispatch' : 'missing-successful-baseline');
 
   const deploymentBaseSha = priorRun.head_sha.trim();
   const normalizedHeadSha = typeof headSha === 'string' ? headSha.trim() : '';
@@ -267,6 +240,10 @@ function determineProductionDeployChanges({ eventName, headSha, currentRunId = '
     if (!git.isAncestor(deploymentBaseSha, normalizedHeadSha)) {
       return fullDeploy('baseline-is-not-an-ancestor');
     }
+
+    // Manual recovery still builds everything, but critical OTA detection needs
+    // the same validated merge range so a superseded urgent PR is not lost.
+    if (eventName === 'workflow_dispatch') return { ...fullDeploy('workflow_dispatch'), deploymentBaseSha };
 
     const changedFiles = git.changedFiles(deploymentBaseSha, normalizedHeadSha);
     const targets = classifyChangedFiles(changedFiles);
@@ -378,6 +355,12 @@ function runCli(argv) {
   if (result.changedFiles.length > 0) {
     console.error(`Changed files since deployment baseline:\n${result.changedFiles.join('\n')}`);
   }
+  console.error(
+    `Native OTA: ${result.ota ? 'build' : 'skip'}; qualifying paths: ${result.changedFiles.filter(isOtaAffecting).join(', ') || '(none)'}`,
+  );
+  console.error(
+    `Browser app: ${result.app ? 'build' : 'skip'}; qualifying paths: ${result.changedFiles.filter(isAppAffecting).join(', ') || '(none)'}`,
+  );
   return result;
 }
 

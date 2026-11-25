@@ -1,3 +1,4 @@
+import { parseFramesSegments } from '@boardsesh/board-constants/hold-states';
 import { type useRouter } from 'expo-router';
 import type { SessionDetailTick } from '@boardsesh/shared-schema';
 import type { ClimbListItemClimb } from '../components/ClimbListItemContent';
@@ -34,6 +35,7 @@ export function sessionTickToClimb(tick: SessionDetailTick): ClimbListItemClimb 
     uuid: tick.climbUuid,
     name: tick.climbName ?? '',
     frames: tick.frames,
+    framesCount: parseFramesSegments(tick.frames).length,
     difficulty: tick.difficultyName ?? '',
     ascensionist_count: 0,
     quality_average: '0',
@@ -41,6 +43,9 @@ export function sessionTickToClimb(tick: SessionDetailTick): ClimbListItemClimb 
     benchmark_difficulty: tick.isBenchmark ? (tick.difficultyName ?? null) : null,
     mirrored: tick.isMirror,
     is_no_match: tick.isNoMatch,
+    // Carries campus / any-feet / no-kickboard badges onto the row; when
+    // non-null ClimbAttributeIcons derives ⊘ from it (same rule as the server).
+    characteristics: tick.characteristics ?? null,
     ...(isUngraded
       ? { boardseshDifficulty: tick.boardseshDifficulty, boardseshConfidence: tick.boardseshConfidence }
       : {}),

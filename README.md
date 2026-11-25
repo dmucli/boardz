@@ -6,6 +6,8 @@ A centralized hub for all your LED climbing board training.
 
 Try it out at [boardsesh.com](https://www.boardsesh.com/) | [Join us on Discord](https://discord.gg/YXA8GsXfQK) | [Sponsor us](https://github.com/sponsors/boardsesh)
 
+[Test flight](https://testflight.apple.com/join/3jXquEtV)
+
 ## Our Vision
 
 LED climbing boards like Kilter, Tension, MoonBoard, Decoy, and Grasshopper have revolutionized indoor training. We believe the climbing community deserves a centralized platform that brings all these boards together—making it easier to track progress, train with friends, and get the most out of your board.
@@ -22,13 +24,15 @@ Boardsesh is a unified experience that works across different board types, helpi
 
 ## Open Source
 
-Boardsesh is completely open source under the Apache license. You can view the code, contribute features, report bugs, or fork it entirely to run your own instance.
+Boardsesh is completely open source under the Apache license. You can view the code, contribute features, report bugs, or fork it entirely to run your own instance, backend included.
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup instructions and [ROADMAP.md](./ROADMAP.md) for what's coming next.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup instructions, [docs/mobile/contributing-to-screens.md](docs/mobile/contributing-to-screens.md) for improving existing screens, and [ROADMAP.md](./ROADMAP.md) for what's coming next.
+
+Browse [the documentation by topic](docs/README.md) for architecture, operations, design, and testing guides.
 
 ## API Documentation
 
-Building something cool with climbing data? We provide a public API that developers can use to access climb information and build their own integrations. [Explore the API Documentation →](https://www.boardsesh.com/docs)
+Building something cool with climbing data? We provide a public API that developers can use to access climb information and build their own integrations. [Explore the API Documentation →](https://www.boardsesh.com/docs) The API is for integrations, not for publishing another client against our hosted backend. See [LEGAL.md](./LEGAL.md#hosted-service--api-access).
 
 ## Support Boardsesh
 

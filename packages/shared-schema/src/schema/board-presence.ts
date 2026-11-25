@@ -13,7 +13,7 @@ export const boardPresenceTypeDefs = /* GraphQL */ `
   the ESP32 LedUpdate payload) plus server-derived attribution and ordering.
   """
   type BoardPresenceClimb {
-    "Origin of the display: boardsesh or kilter. Missing means boardsesh."
+    "Origin of the display: boardsesh, kilter, or aurora. Missing means boardsesh."
     source: String
     "UUID of the climb lit on the wall"
     climbUuid: String!
@@ -29,6 +29,8 @@ export const boardPresenceTypeDefs = /* GraphQL */ `
     frames: String
     "Board angle in degrees. Null means unspecified (0 is a valid angle)."
     angle: Int
+    "Whether the climb was lit mirrored. Null means unknown (an older reporter, or a durable-history row)."
+    mirrored: Boolean
     "Catalog route setter display name (who set the climb)"
     setter: String
     "Display name of the Boardsesh user who lit it. Server-derived from the caller; never client-supplied."
@@ -49,7 +51,7 @@ export const boardPresenceTypeDefs = /* GraphQL */ `
   """
   type BoardClimbRecentSender {
     "Boardsesh user id, for linking the avatar to their profile"
-    userId: ID!
+    userId: ID
     "Profile display name, falling back to the auth-account name"
     displayName: String
     "Profile avatar URL, falling back to the auth-account image"
@@ -67,14 +69,18 @@ export const boardPresenceTypeDefs = /* GraphQL */ `
   }
 
   """
-  Event: the wall was cleared (best-effort — only emitted on a deliberate
-  disconnect; an involuntary BLE drop leaves the last climb sticky).
+  Event: the wall was cleared. Emitted when the phone driving the wall turns
+  off all its lights (\`reportBoardClear\`), and replayed to a new subscriber
+  while that clear is still the wall's latest state. A disconnect, deliberate
+  or not, leaves the last climb sticky: the board keeps its lights.
   """
   type BoardClimbCleared {
     "ISO 8601 timestamp when the wall was cleared"
     clearedAt: String!
     "Monotonic per-board sequence number"
     seq: Int!
+    "UUID of the climb that was on the wall when it was cleared, when known"
+    climbUuid: String
   }
 
   """
@@ -126,8 +132,19 @@ export const boardPresenceTypeDefs = /* GraphQL */ `
     seq: Int!
   }
 
+  "Public catalog grades for a wall at the viewer's selected angle."
+  type BoardPresenceClimbGrade {
+    "The requested climb UUID, retaining an alias when one was supplied."
+    uuid: String!
+    difficulty: String
+    boardseshDifficulty: Float
+    boardseshConfidence: String
+  }
+
   type BoardHistoryPage {
+    "Displays within the rolling seven-day window, newest display time first."
     entries: [BoardPresenceClimb!]!
+    "Null when no more entries remain within the window."
     nextCursor: String
   }
 
@@ -149,7 +166,7 @@ export const boardPresenceTypeDefs = /* GraphQL */ `
     "Grade name (e.g. V6 / 7A+)"
     grade: String!
     "Boardsesh user id of the climber"
-    sentByUserId: String!
+    sentByUserId: String
     "Display name of the climber"
     sentByDisplayName: String
     "Avatar URL of the climber"

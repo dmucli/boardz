@@ -1,9 +1,15 @@
 import { SUPPORTED_BOARDS } from '@/app/lib/board-data';
 import { USER_SPECIFIC_SEARCH_PARAMS } from '@boardsesh/shared-schema';
 import type { SearchRequestPagination } from '@/app/lib/types';
+import { WALL_CAPABILITY_PARAM } from '@/app/lib/spray/spray-visibility';
+import { isBoardInviteRequest } from '@/app/lib/board-invite';
+import { hasLiveSearchData, LIVE_SEARCH_DATA_TTL_SECONDS } from '@/app/lib/live-search-data-boards';
 
 // List data tolerates a full day of staleness (a new/edited climb showing up a
-// little late in a list is harmless), so list pages cache for 24h.
+// little late in a list is harmless), so list pages cache for 24h. MoonBoard
+// and Woods lists (and every `/b/{slug}` list, whose board middleware cannot
+// tell without a backend call) use the 15 minute live-data TTL instead, to
+// match their Next data cache (#6803).
 const LIST_PAGE_CACHE_TTL_SECONDS = 86400;
 
 // A climb view page is fully determined by its URL and reads no server-side
@@ -18,6 +24,9 @@ const LIST_PAGE_CACHE_TTL_SECONDS = 86400;
 // for the CDN-cacheable self-redirect loop on non-Latin climb names must stay
 // in place — a cacheable redirect loop at this TTL would pin for a full day.
 const CLIMB_VIEW_PAGE_CACHE_TTL_SECONDS = 86400;
+
+/** The printable board poster, `/poster/b/{slug}` (#4415). Never cached; see `isBoardPosterRequest`. */
+const BOARD_POSTER_PATH_PREFIX = '/poster/b';
 
 /**
  * Checks whether search params contain any user-specific filters.
@@ -50,6 +59,41 @@ function hasUserSpecificQueryParams(searchParams: URLSearchParams): boolean {
 }
 
 /**
+ * True for a `/b/...` request carrying a spray wall's share-link capability
+ * (`?wall=<uuid>`). Takes the LOCALE-STRIPPED pathname, like the TTL helpers.
+ *
+ * Such a response must never enter a shared cache, for two reasons:
+ *
+ *  - privacy: an unlisted wall's page answers 200 only while the wall stays
+ *    unlisted and unhidden. A cached copy would keep serving it at the edge for
+ *    a day (plus 7 days of stale-while-revalidate) after an admin hides it or
+ *    its owner makes it private;
+ *  - correctness: while www is ahead of the backend, the same URL answers 404,
+ *    and a cached 404 would outlive the backend deploy that fixes it.
+ *
+ * The cost is small: these URLs are noindex and only reach people the owner sent
+ * the link to, so they are not part of the crawl surface the cache exists for.
+ */
+export function isSprayWallCapabilityRequest(pathname: string, searchParams: URLSearchParams): boolean {
+  return (pathname === '/b' || pathname.startsWith('/b/')) && searchParams.has(WALL_CAPABILITY_PARAM);
+}
+
+/**
+ * True for every printable board poster, `/poster/b/{slug}` (#4415), with or
+ * without a `?wall=`. Takes the LOCALE-STRIPPED pathname.
+ *
+ * Never cached, by any shared cache: the poster prints the board's visibility as
+ * of this request (a board switched to private must stop printing on the next
+ * request, not the next day), an unlisted wall's poster URL carries its
+ * capability, and the wall's photo is a fifteen-minute signed URL that must not
+ * outlive the page. Nobody but the owner prints a poster, so it costs the cache
+ * nothing.
+ */
+export function isBoardPosterRequest(pathname: string): boolean {
+  return pathname.startsWith(`${BOARD_POSTER_PATH_PREFIX}/`);
+}
+
+/**
  * Checks whether a request is a cacheable list page and returns the CDN cache
  * duration in seconds, or null if the request should not be CDN-cached.
  *
@@ -74,8 +118,16 @@ export function getListPageCacheTTL(pathname: string, searchParams: URLSearchPar
     return null;
   }
 
-  if (hasUserSpecificQueryParams(searchParams)) {
+  if (
+    hasUserSpecificQueryParams(searchParams) ||
+    isSprayWallCapabilityRequest(pathname, searchParams) ||
+    isBoardInviteRequest(pathname, searchParams)
+  ) {
     return null;
+  }
+
+  if (isSlugFormat || hasLiveSearchData(pathParts[0])) {
+    return LIVE_SEARCH_DATA_TTL_SECONDS;
   }
 
   return LIST_PAGE_CACHE_TTL_SECONDS;
@@ -106,7 +158,11 @@ export function getClimbViewPageCacheTTL(pathname: string, searchParams: URLSear
     return null;
   }
 
-  if (hasUserSpecificQueryParams(searchParams)) {
+  if (
+    hasUserSpecificQueryParams(searchParams) ||
+    isSprayWallCapabilityRequest(pathname, searchParams) ||
+    isBoardInviteRequest(pathname, searchParams)
+  ) {
     return null;
   }
 

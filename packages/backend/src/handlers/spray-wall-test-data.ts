@@ -3,8 +3,9 @@ import Busboy from 'busboy';
 import { v4 as uuidv4 } from 'uuid';
 import { applyCorsHeaders } from './cors';
 import { guardUploadFileStream } from './http-utils';
-import { detectImageMimeType, extractAuthTokenFromHeader, formatByteCapForMessage } from './gym-image-upload';
-import { validateToken } from '../middleware/auth';
+import { extractAuthTokenFromHeader, formatByteCapForMessage } from './gym-image-upload';
+import { detectImageMimeType } from '../lib/image-mime';
+import { validateHttpAuthToken } from './auth-admission';
 import { isS3Configured, uploadToS3 } from '../storage/s3';
 import { logger } from '../utils/logger';
 
@@ -89,14 +90,6 @@ function generateFolderName(): string {
 export async function handleSprayWallTestDataUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (!applyCorsHeaders(req, res)) return;
 
-  // Check if S3 is configured - if not, skip silently
-  if (!isS3Configured('private')) {
-    logger.info('[Spray Wall Test Data] S3 not configured, skipping upload');
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ success: true, skipped: true, reason: 'S3 not configured' }));
-    return;
-  }
-
   // Validate authentication
   const token = extractAuthTokenFromHeader(req);
   if (!token) {
@@ -105,10 +98,20 @@ export async function handleSprayWallTestDataUpload(req: IncomingMessage, res: S
     return;
   }
 
-  const authResult = await validateToken(token);
+  const admission = await validateHttpAuthToken(token, res);
+  if (!admission.available) return;
+  const authResult = admission.auth;
   if (!authResult) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid or expired token' }));
+    return;
+  }
+
+  // Check if S3 is configured - if not, skip silently
+  if (!isS3Configured('private')) {
+    logger.info('[Spray Wall Test Data] S3 not configured, skipping upload');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ success: true, skipped: true, reason: 'S3 not configured' }));
     return;
   }
 

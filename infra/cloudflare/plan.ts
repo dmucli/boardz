@@ -8,8 +8,10 @@
 
 import {
   CACHE_RULE_PHASE,
+  COMPRESSION_RULE_PHASE,
   DYNAMIC_REDIRECT_RULE_PHASE,
   RATE_LIMIT_RULE_PHASE,
+  REQUEST_HEADER_RULE_PHASE,
   RESPONSE_HEADER_RULE_PHASE,
   SSL_MODE_STRENGTH,
   WAF_RULE_PHASE,
@@ -17,11 +19,14 @@ import {
 } from './config';
 import type {
   CacheRuleDesired,
+  CompressionRuleDesired,
   DnsRecordDesired,
   R2BucketDesired,
   R2Cors,
+  R2LifecycleRule,
   RateLimitRuleDesired,
   RedirectRuleDesired,
+  RequestHeaderRuleDesired,
   ResponseHeaderRuleDesired,
   SslDesired,
   SslMode,
@@ -34,7 +39,9 @@ export type ManagedRuleDesired =
   | WafRuleDesired
   | RateLimitRuleDesired
   | RedirectRuleDesired
-  | ResponseHeaderRuleDesired;
+  | RequestHeaderRuleDesired
+  | ResponseHeaderRuleDesired
+  | CompressionRuleDesired;
 
 /** A DNS record as Cloudflare returns it. Which fields are owned depends on the desired record's management mode. */
 export interface LiveDnsRecord {
@@ -109,7 +116,9 @@ export type ManagedRuleResource =
   | 'waf-rule'
   | 'rate-limit-rule'
   | 'redirect-rule'
-  | 'response-header-rule';
+  | 'request-header-rule'
+  | 'response-header-rule'
+  | 'compression-rule';
 
 /**
  * Every ruleset phase this tool owns, in one place.
@@ -149,7 +158,9 @@ export interface DesiredRuleSets {
   wafRules: WafRuleDesired[];
   rateLimitRules: RateLimitRuleDesired[];
   redirectRules: RedirectRuleDesired[];
+  requestHeaderRules: RequestHeaderRuleDesired[];
   responseHeaderRules: ResponseHeaderRuleDesired[];
+  compressionRules: CompressionRuleDesired[];
 }
 
 export const MANAGED_RULE_PHASES = [
@@ -190,14 +201,36 @@ export const MANAGED_RULE_PHASES = [
     optional: false,
   },
   {
+    resource: 'request-header-rule',
+    phase: REQUEST_HEADER_RULE_PHASE,
+    label: 'Request header rule',
+    selectLive: (live) => live.rules['request-header-rule'],
+    selectDesired: (desired) => desired.requestHeaderRules,
+    // Observe country attribution depends on this rule. Missing scope must fail
+    // loudly rather than silently deploying an origin that records no country.
+    optional: false,
+  },
+  {
     resource: 'response-header-rule',
     phase: RESPONSE_HEADER_RULE_PHASE,
     label: 'Response header rule',
     selectLive: (live) => live.rules['response-header-rule'],
     selectDesired: (desired) => desired.responseHeaderRules,
-    // Remove once Zone.Transform Rules Edit is confirmed on the production
-    // token. Until then this phase must not be able to fail a deploy.
-    optional: true,
+    // Confirmed alongside the request-header transform: both phases use the
+    // production token's Zone.Transform Rules Edit scope.
+    optional: false,
+  },
+  {
+    resource: 'compression-rule',
+    phase: COMPRESSION_RULE_PHASE,
+    label: 'Compression rule',
+    selectLive: (live) => live.rules['compression-rule'],
+    selectDesired: (desired) => desired.compressionRules,
+    // The production token's Zone.Response Compression Edit scope was
+    // confirmed by the apply that wrote this rule on 2026-10-05. Without the
+    // rule every OTA bundle goes out uncompressed, so losing the scope must
+    // fail loudly.
+    optional: false,
   },
 ] as const satisfies readonly ManagedRulePhase[];
 
@@ -417,7 +450,9 @@ export function diffDnsRecord(desired: DnsRecordDesired, liveRecord: LiveDnsReco
 
   const driftedFields: string[] = [];
   if (liveRecord.type !== desired.type) driftedFields.push(`type ${liveRecord.type} → ${desired.type}`);
-  if (liveRecord.content !== desired.content) driftedFields.push(`content ${liveRecord.content} → ${desired.content}`);
+  // Cloudflare returns TXT content wrapped in double quotes; the config holds the bare value.
+  const liveContent = desired.type === 'TXT' ? liveRecord.content.replace(/^"(.*)"$/, '$1') : liveRecord.content;
+  if (liveContent !== desired.content) driftedFields.push(`content ${liveContent} → ${desired.content}`);
   if (liveRecord.ttl !== desired.ttl) {
     driftedFields.push(`ttl ${describeDnsTtl(liveRecord.ttl)} → ${describeDnsTtl(desired.ttl)}`);
   }
@@ -554,6 +589,58 @@ export interface LiveR2Bucket {
    * delete the rest. See diffR2Bucket.
    */
   corsRuleCount?: number;
+  /** Null/absent means unreadable, never permission to replace the policy. */
+  lifecycleRules?: R2LifecycleRule[] | null;
+}
+
+/** A policy read/ownership block must not prevent unrelated bucket security changes. */
+export class R2LifecyclePolicyBlockedError extends Error {
+  override readonly name = 'R2LifecyclePolicyBlockedError';
+}
+
+/** Merge one owned ID, preserving foreign rules that cannot shorten export retention. */
+export function mergeR2LifecycleRule(
+  existing: readonly R2LifecycleRule[],
+  desired: R2LifecycleRule,
+): R2LifecycleRule[] {
+  const matching = existing.filter((rule) => rule.id === desired.id);
+  if (matching.length > 1 || matching.some((rule) => rule.conditions.prefix !== desired.conditions.prefix)) {
+    throw new R2LifecyclePolicyBlockedError(`Lifecycle rule ${desired.id} has conflicting ownership`);
+  }
+  if (desired.enabled && desired.deleteObjectsTransition) {
+    const conflicting = existing.find(
+      (rule) =>
+        rule.id !== desired.id &&
+        rule.enabled &&
+        rule.deleteObjectsTransition &&
+        (rule.conditions.prefix.startsWith(desired.conditions.prefix) ||
+          desired.conditions.prefix.startsWith(rule.conditions.prefix)),
+    );
+    if (conflicting) {
+      throw new R2LifecyclePolicyBlockedError(
+        `Lifecycle deletion rule ${conflicting.id} overlaps the prefix owned by ${desired.id}`,
+      );
+    }
+  }
+  if (!matching.length) return [...existing, desired];
+  return existing.map((rule) => (rule.id === desired.id ? desired : rule));
+}
+
+export function r2LifecycleRuleMatches(existing: readonly R2LifecycleRule[], desired: R2LifecycleRule): boolean {
+  const matching = existing.filter((rule) => rule.id === desired.id);
+  return matching.length === 1 && jsonEqual(matching[0], desired);
+}
+
+/** What a managed rule does, for the plan line: read from the rule so it cannot name another bucket's. */
+function describeR2LifecycleRule(rule: R2LifecycleRule): string {
+  const maxAgeSeconds = rule.deleteObjectsTransition?.condition?.maxAge;
+  const scope = rule.conditions.prefix ? `objects under ${rule.conditions.prefix}` : 'every object';
+  // Whole days read as days. Anything else is printed in seconds, exactly as
+  // declared, so the plan never shows a rounded or fractional age.
+  const age = (seconds: number): string =>
+    seconds % 86_400 === 0 ? `${String(seconds / 86_400)} days` : `${String(seconds)} seconds`;
+  const expiry = typeof maxAgeSeconds === 'number' ? `after ${age(maxAgeSeconds)}` : 'on its own schedule';
+  return `Delete ${scope} ${expiry}; preserve other lifecycle rules.`;
 }
 
 /**
@@ -636,6 +723,28 @@ export function diffR2Bucket(desired: R2BucketDesired, live: LiveR2Bucket | null
       summary: `R2 ${desired.name}: will disable public r2.dev URL`,
       detail: 'The managed development URL bypasses the custom-domain cache and access rules.',
     });
+  }
+
+  if (desired.lifecycleRule) {
+    let conflict: string | undefined;
+    if (!live.lifecycleRules) {
+      conflict = 'Lifecycle policy could not be read; existing rules must be preserved.';
+    } else {
+      try {
+        mergeR2LifecycleRule(live.lifecycleRules, desired.lifecycleRule);
+      } catch (error) {
+        conflict = error instanceof Error ? error.message : 'Conflicting lifecycle rule ownership';
+      }
+    }
+    if (conflict || !r2LifecycleRuleMatches(live.lifecycleRules ?? [], desired.lifecycleRule)) {
+      changes.push({
+        resource: 'r2-bucket',
+        r2BucketName: desired.name,
+        summary: `R2 ${desired.name}: ${conflict ? 'cannot update' : 'will set'} lifecycle rule ${desired.lifecycleRule.id}`,
+        detail: conflict ?? describeR2LifecycleRule(desired.lifecycleRule),
+        blocked: Boolean(conflict),
+      });
+    }
   }
 
   if (desired.customDomain === null) {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deriveDraftStatusView, type DraftStatusState } from '../draft-status-view';
+import { deriveDraftStatusView, draftStatusWithHoldEditorFailure, type DraftStatusState } from '../draft-status-view';
 
 // The line answers "is my work safe, and where is it?" — the question the create
 // drawer had no answer to at all. One case per branch, plus the two orderings
@@ -17,13 +17,57 @@ const base: DraftStatusState = {
 };
 
 describe('deriveDraftStatusView', () => {
+  it('distinguishes a durable queued save from the account copy', () => {
+    expect(deriveDraftStatusView({ ...base, hasSavedClimb: true, waitingToSync: true }, identity)).toEqual({
+      text: 'mobile.create.autosave.waitingToSync',
+      savedReassurance: true,
+      tone: 'muted',
+      announce: true,
+    });
+  });
   it('says nothing about an empty editor', () => {
     expect(deriveDraftStatusView({ ...base, hasContent: false }, identity)).toBeNull();
+  });
+
+  it('asks for a first hold while the editor is empty, since Save is disabled', () => {
+    expect(deriveDraftStatusView({ ...base, hasContent: false, noHolds: true }, identity)).toEqual({
+      text: 'mobile.create.save.needsHold',
+      tone: 'muted',
+      announce: false,
+    });
+  });
+
+  it('asks for a first hold when only a name is typed', () => {
+    expect(deriveDraftStatusView({ ...base, noHolds: true }, identity)?.text).toBe('mobile.create.save.needsHold');
+  });
+
+  it('says Save goes to sign-in while signed out, empty or not', () => {
+    for (const hasContent of [false, true]) {
+      expect(
+        deriveDraftStatusView({ ...base, hasContent, signedOut: true, noHolds: !hasContent }, identity)?.text,
+      ).toBe('mobile.create.save.login');
+    }
+  });
+
+  it('lets the sign-in note give its line to the heatmap, empty or not', () => {
+    for (const hasContent of [false, true]) {
+      expect(deriveDraftStatusView({ ...base, hasContent, signedOut: true }, identity)?.yieldsToHeatmap).toBe(true);
+    }
+  });
+
+  it('keeps storage truth and failures ahead of the sign-in note', () => {
+    expect(deriveDraftStatusView({ ...base, signedOut: true, localPersistenceAvailable: false }, identity)?.text).toBe(
+      'mobile.create.autosave.notStored',
+    );
+    expect(deriveDraftStatusView({ ...base, signedOut: true, publishBlocked: true }, identity)?.text).toBe(
+      'mobile.create.publish.blocked',
+    );
   });
 
   it('reports the on-device copy for a never-saved climb', () => {
     expect(deriveDraftStatusView(base, identity)).toEqual({
       text: 'mobile.create.autosave.onDevice',
+      savedReassurance: true,
       tone: 'muted',
       announce: false,
     });
@@ -32,6 +76,7 @@ describe('deriveDraftStatusView', () => {
   it('reports the account copy once a row exists', () => {
     expect(deriveDraftStatusView({ ...base, hasSavedClimb: true }, identity)).toEqual({
       text: 'mobile.create.autosave.inAccount',
+      savedReassurance: true,
       tone: 'muted',
       announce: true,
     });
@@ -40,6 +85,7 @@ describe('deriveDraftStatusView', () => {
   it('says the newest edits are local-only after a save', () => {
     expect(deriveDraftStatusView({ ...base, hasSavedClimb: true, hasUnsavedEdits: true }, identity)).toEqual({
       text: 'mobile.create.autosave.unsyncedEdits',
+      savedReassurance: true,
       tone: 'muted',
       announce: false,
     });
@@ -73,7 +119,44 @@ describe('deriveDraftStatusView', () => {
       text: 'mobile.create.publish.blocked',
       tone: 'warning',
       announce: true,
+      yieldsToHeatmap: true,
     });
+  });
+
+  it('does not call the work a draft while Save is set to publish', () => {
+    // A spray wall opens with the draft switch off, so "Draft saved…" was the
+    // first thing the line said about a climb that was never going to be one.
+    expect(deriveDraftStatusView({ ...base, isDraft: false }, identity)).toEqual({
+      text: 'mobile.create.autosave.onDevicePublish',
+      savedReassurance: true,
+      tone: 'muted',
+      announce: false,
+    });
+    expect(deriveDraftStatusView({ ...base, isDraft: false, hasSavedClimb: true }, identity)).toEqual({
+      text: 'mobile.create.autosave.inAccountPublish',
+      savedReassurance: true,
+      tone: 'muted',
+      announce: true,
+    });
+  });
+
+  it('keeps the draft wording while the switch is on, and when a caller does not say', () => {
+    expect(deriveDraftStatusView({ ...base, isDraft: true }, identity)?.text).toBe('mobile.create.autosave.onDevice');
+    expect(deriveDraftStatusView({ ...base, isDraft: true, hasSavedClimb: true }, identity)?.text).toBe(
+      'mobile.create.autosave.inAccount',
+    );
+    expect(deriveDraftStatusView(base, identity)?.text).toBe('mobile.create.autosave.onDevice');
+  });
+
+  it('lets only the publish hint give its line to the heatmap', () => {
+    // "What a publish still needs" is ordinary work in progress. A failed save
+    // and "nothing is being stored" are not, and keep the line.
+    const yields = (state: DraftStatusState) => deriveDraftStatusView(state, identity)?.yieldsToHeatmap === true;
+    expect(yields({ ...base, publishBlocked: true })).toBe(true);
+    expect(yields({ ...base, saveFailed: true })).toBe(false);
+    expect(yields({ ...base, localPersistenceAvailable: false })).toBe(false);
+    // A failed save still outranks a publish hint that is also true.
+    expect(yields({ ...base, saveFailed: true, publishBlocked: true })).toBe(false);
   });
 
   it('has no "saving" state — the button already says that', () => {
@@ -89,4 +172,32 @@ describe('deriveDraftStatusView', () => {
     ].map((state) => deriveDraftStatusView(state, identity)?.text);
     expect(everyText).not.toContain('mobile.create.save.saving');
   });
+});
+
+describe('hold editor failure status', () => {
+  it('hides stale saved reassurance until a failed local checkpoint is retried', () => {
+    const saved = deriveDraftStatusView(base, identity);
+    expect(saved?.tone).toBe('muted');
+    expect(draftStatusWithHoldEditorFailure(saved, true)).toBeNull();
+    expect(draftStatusWithHoldEditorFailure(saved, false)).toBe(saved);
+  });
+  it.each([{ saveFailed: true }, { localPersistenceAvailable: false }])(
+    'retains urgent status alongside hold-editor failure %j',
+    (failure) => {
+      const status = deriveDraftStatusView({ ...base, ...failure }, identity);
+      expect(draftStatusWithHoldEditorFailure(status, true)).toBe(status);
+      expect(draftStatusWithHoldEditorFailure(null, true)).toBeNull();
+    },
+  );
+});
+
+describe('requirements beside a hold editor failure', () => {
+  it.each([{ hasContent: false, noHolds: true }, { noHolds: true }, { signedOut: true }])(
+    'keeps the muted instruction %j',
+    (requirements) => {
+      const status = deriveDraftStatusView({ ...base, ...requirements }, identity);
+      expect(status?.tone).toBe('muted');
+      expect(draftStatusWithHoldEditorFailure(status, true)).toBe(status);
+    },
+  );
 });

@@ -11,10 +11,11 @@ import { useBottomChromeMetrics } from '../src/hooks/use-bottom-chrome-metrics';
 import { useStackScreenOptions } from '../src/hooks/use-stack-screen-options';
 import { contributors, sponsors, privateSponsorCount, friends, dogName, XPREM_URL } from '../src/lib/acknowledgements';
 import { openDiscordInvite } from '../src/lib/discord';
-import { SUPPORT_URL, SUPPORT_URL_DISPLAY, useDonationLinksAllowed } from '../src/lib/donation-links';
+import { SUPPORT_URL_DISPLAY, supportUrlFor, useDonationLinksAllowed } from '../src/lib/donation-links';
+import { trackSupportLinkTapped } from '../src/lib/analytics-support-link';
 import { openExternalUrl } from '../src/lib/open-url';
 import { useTheme } from '../src/providers/theme-provider';
-import { borderRadius, spacing } from '../src/theme/tokens';
+import { borderRadius, cardCorners, spacing } from '../src/theme/tokens';
 import type { IconName } from '../src/components/icon-map';
 
 function Chip({ label, icon, onPress }: { label: string; icon?: IconName; onPress: () => void }) {
@@ -91,11 +92,12 @@ export default function AcknowledgementsScreen() {
   // else the same message goes out as plain, unlinked text. See donation-links.ts.
   const donationLinksAllowed = useDonationLinksAllowed();
 
-  const handleOpenProfile = useCallback((url: string) => {
+  const handleOpenCreditLink = useCallback((url: string) => {
     void openExternalUrl(url, 'acknowledgements');
   }, []);
   const handleSupport = useCallback(() => {
-    void openExternalUrl(SUPPORT_URL, 'acknowledgements-sponsor');
+    trackSupportLinkTapped('acknowledgements');
+    void openExternalUrl(supportUrlFor('acknowledgements'), 'acknowledgements-sponsor');
   }, []);
   const handleJoinDiscord = useCallback(() => {
     void openDiscordInvite('acknowledgements');
@@ -110,8 +112,8 @@ export default function AcknowledgementsScreen() {
     router.push('/licenses');
   }, [router]);
 
-  // Variant-aware header from the shared hook: a transparent blur header on Liquid
-  // Glass (iOS), an opaque M3 app bar on Material — including the forced-Material-
+  // Variant-aware header from the shared hook: a transparent header on Liquid Glass
+  // (iOS), an opaque M3 app bar on Material — including the forced-Material-
   // on-iOS / Android paths where a transparent header would slide content under the
   // status bar.
   const screenOptions = useStackScreenOptions();
@@ -123,7 +125,7 @@ export default function AcknowledgementsScreen() {
     <Button
       title={t('mobile.acknowledgements.becomeSponsor')}
       icon="favorite"
-      size="large"
+      size="medium"
       variant="outlined"
       onPress={handleSupport}
       style={styles.sponsorButton}
@@ -153,6 +155,25 @@ export default function AcknowledgementsScreen() {
         </View>
 
         <View style={styles.section}>
+          <SectionHeader title={t('mobile.acknowledgements.openSourceRootsTitle')} />
+          <View style={[styles.groupCard, { backgroundColor: systemColors.secondaryBackground }]}>
+            <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.sectionBody}>
+              {t('mobile.acknowledgements.openSourceRootsBody')}
+            </Text>
+            <View style={styles.chips}>
+              <Chip
+                label="Climbdex"
+                onPress={() => handleOpenCreditLink('https://github.com/lemeryfertitta/Climbdex')}
+              />
+              <Chip
+                label="BoardLib"
+                onPress={() => handleOpenCreditLink('https://github.com/lemeryfertitta/BoardLib')}
+              />
+            </View>
+          </View>
+        </View>
+
+        <View style={styles.section}>
           <SectionHeader title={t('mobile.acknowledgements.contributorsTitle')} />
           <View style={[styles.groupCard, { backgroundColor: systemColors.secondaryBackground }]}>
             <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.sectionBody}>
@@ -163,7 +184,7 @@ export default function AcknowledgementsScreen() {
                 <Chip
                   key={contributor.login}
                   label={contributor.name ?? contributor.login}
-                  onPress={() => handleOpenProfile(contributor.htmlUrl)}
+                  onPress={() => handleOpenCreditLink(contributor.htmlUrl)}
                 />
               ))}
             </View>
@@ -183,7 +204,7 @@ export default function AcknowledgementsScreen() {
                     key={sponsor.login}
                     icon="favorite.fill"
                     label={sponsor.name ?? sponsor.login}
-                    onPress={() => handleOpenProfile(sponsor.url)}
+                    onPress={() => handleOpenCreditLink(sponsor.url)}
                   />
                 ))}
               </View>
@@ -275,9 +296,10 @@ const styles = StyleSheet.create({
     paddingTop: spacing[4],
     gap: spacing[6],
   },
+  // Same corner as the cards below it (one card radius per screen).
   hero: {
     alignItems: 'center',
-    borderRadius: borderRadius.xl,
+    ...cardCorners,
     paddingHorizontal: spacing[5],
     paddingVertical: spacing[6],
   },
@@ -327,7 +349,7 @@ const styles = StyleSheet.create({
   card: {
     flexDirection: 'row',
     alignItems: 'flex-start',
-    borderRadius: borderRadius.lg,
+    ...cardCorners,
     padding: spacing[4],
     gap: spacing[3],
   },

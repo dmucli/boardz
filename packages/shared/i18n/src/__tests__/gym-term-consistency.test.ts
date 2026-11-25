@@ -9,7 +9,7 @@ const SPANISH_DIR = join(LOCALES_DIR, 'es');
 // Spanish has one word for the place the wall lives: `rocódromo`. `gimnasio` is
 // the generic fitness gym and read wrong to climbers, so every catalog was swept
 // in one pass — this test is what stops the split coming back one string at a
-// time. See docs/i18n-spanish-glossary.md.
+// time. See docs/i18n/i18n-spanish-glossary.md.
 //
 // The regex is deliberately the bare stem `gimnasi`, which also catches
 // `gimnasia` (gymnastics). That is safe today: `gimnasia` appears nowhere in the
@@ -86,7 +86,7 @@ describe('Spanish gym terminology', () => {
         ? ''
         : [
             `${offenders.length} Spanish string(s) still say "gimnasio". Boardsesh gyms are climbing gyms:`,
-            'use "rocódromo" (masculine, plural "rocódromos"). See docs/i18n-spanish-glossary.md.',
+            'use "rocódromo" (masculine, plural "rocódromos"). See docs/i18n/i18n-spanish-glossary.md.',
             ...offenders.map((offender) => `  - ${offender}`),
           ].join('\n'),
     ).toEqual([]);
@@ -129,6 +129,7 @@ describe('Spanish gym terminology', () => {
     const byPath = new Map(spanishStrings.map((entry) => [`${entry.file}:${entry.keyPath}`, entry.value]));
 
     expect(byPath.get('boards.json:gymEntity.follow.entityLabel')).toBe('rocódromo');
-    expect(byPath.get('kiosk.json:gymPage.claimTitle')).toBe('¿Es tuyo este rocódromo?');
+    // "Run this gym?" since the claim prompts became one question (#8043).
+    expect(byPath.get('kiosk.json:gymPage.claimTitle')).toBe('¿Gestionas este rocódromo?');
   });
 });

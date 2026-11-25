@@ -10,7 +10,7 @@
  *      sync daemon snapshots.
  *
  * Callers: the CLI `packages/db/scripts/refresh-recommendations.ts` and the
- * batch worker's `refresh-recommendations` family (docs/background-workers.md).
+ * batch worker's `refresh-recommendations` family (docs/backend/background-workers.md).
  * Reads go through `db`; every write batch goes through `transact`; the PostHog
  * request goes through neither, so no transaction is ever held open across it.
  *
@@ -18,7 +18,7 @@
  * deterministic `generated_recommendation` key and have their climbs replaced.
  */
 import { randomUUID } from 'node:crypto';
-import { eq, inArray } from 'drizzle-orm';
+import { eq, inArray, sql } from 'drizzle-orm';
 import { getSizeFullnessTiers } from '@boardsesh/board-constants/size-comparison';
 import { getProductSize, getSetsForLayoutAndSize, getLayout } from '@boardsesh/board-constants/product-sizes';
 import type { BoardName } from '@boardsesh/shared-schema';
@@ -33,11 +33,12 @@ import {
 } from '../queries/recommendations';
 import { rowsOf } from '../queries/util/rows';
 import { snapshotClimbStatsHistoryIfDue } from '../queries/climb-stats';
-import { ensureSystemUser } from './system-user';
+import { refreshPlaylistGradeSummariesFor } from '../queries/playlists/grade-summaries';
+import { ensureJobSystemUser } from './system-user';
+import { RECOMMENDATIONS_USER_ID } from '../queries/system-accounts';
 import { defaultTransact, type JobDatabase, type JobLogger, type JobRunOptions, type JobTransact } from './types';
 
-const SYSTEM_USER_ID = 'system-recommendations';
-const SYSTEM_USER_EMAIL = 'recommendations@boardsesh.com';
+const SYSTEM_USER_ID = RECOMMENDATIONS_USER_ID;
 const COHORT_SIZE = 50;
 const FRESH_WINDOW_DAYS = 365;
 /** A hung PostHog query must not eat the job's lease. */
@@ -279,11 +280,65 @@ function cohortPlaylistName(variantLabel: string, cohort: Cohort): string {
   return `${variantLabel} · ${base} ${sizeName} @ ${cohort.angle}°`;
 }
 
+/**
+ * A bounded description of a failed band recompute: the error's class (the
+ * driver's, under drizzle's wrapper) and its SQLSTATE. Drizzle puts the whole
+ * statement and its parameters in `message`, which a job log must never carry
+ * (`JobLogger`), so the message is never read.
+ */
+export function describeBandFailure(error: unknown): string {
+  const cause: unknown = error instanceof Error && error.cause !== undefined ? error.cause : error;
+  const name =
+    cause instanceof Error ? cause.constructor.name : error instanceof Error ? error.constructor.name : 'unknown error';
+  const code =
+    typeof cause === 'object' && cause !== null && 'code' in cause && typeof cause.code === 'string'
+      ? cause.code
+      : 'none';
+  return `${name}, SQLSTATE ${code}`;
+}
+
+/** How long a cohort band recompute waits for its playlist's lock before leaving the band to the daily job. */
+const BAND_LOCK_TIMEOUT = '5s';
+
+/**
+ * Recompute a rewritten cohort playlist's grade band inside its climb-swap
+ * transaction, so it never shows yesterday's band or misses a grade filter
+ * until the daily grade-summary job runs.
+ *
+ * Runs in its own savepoint with a bounded lock wait (the fenced transaction
+ * also holds the run's ledger row, which the heartbeat needs). If anything in
+ * it fails, the savepoint rolls back alone, taking the lock_timeout with it,
+ * the swap still commits, and the daily job repairs the band. A band must
+ * never cost the playlists.
+ */
+export async function refreshCohortPlaylistBand(
+  transaction: JobDatabase,
+  playlistId: bigint,
+  name: string,
+  log: JobLogger,
+): Promise<void> {
+  try {
+    await transaction.transaction(async (savepoint) => {
+      await savepoint.execute(sql.raw(`SET LOCAL lock_timeout = '${BAND_LOCK_TIMEOUT}'`));
+      await refreshPlaylistGradeSummariesFor(savepoint, [playlistId]);
+      // A released savepoint keeps a SET LOCAL until commit; put it back so
+      // nothing after this step inherits the bounded wait.
+      await savepoint.execute(sql`SET LOCAL lock_timeout TO DEFAULT`);
+    });
+  } catch (error) {
+    log.warn(
+      `[recs]   grade band for ${name} not refreshed (${describeBandFailure(error)}); the daily grade-summary job will repair it`,
+      { title: 'grade band skipped' },
+    );
+  }
+}
+
 async function upsertCohortPlaylist(
   db: JobDatabase,
   transact: JobTransact,
   cohort: Cohort,
   variant: (typeof PUBLIC_VARIANTS)[number],
+  log: JobLogger,
 ): Promise<{ name: string; count: number; skipped: boolean }> {
   const target = cohortTarget(cohort);
   const tiers = getSizeFullnessTiers(cohort.boardType, cohort.sizeId);
@@ -354,6 +409,8 @@ async function upsertCohortPlaylist(
         position: index,
       })),
     );
+
+    await refreshCohortPlaylistBand(transaction, playlistId, name, log);
   });
 
   return { name, count: refs.length, skipped: false };
@@ -366,9 +423,8 @@ export async function runRefreshRecommendations(
   const transact = options.transact ?? defaultTransact(db);
 
   signal.throwIfAborted();
-  await transact((transaction) =>
-    ensureSystemUser(transaction, { id: SYSTEM_USER_ID, name: 'Boardsesh', email: SYSTEM_USER_EMAIL }),
-  );
+  await ensureJobSystemUser(transact, 'recommendations', options.systemUserAuthority);
+  signal.throwIfAborted();
 
   log.info('[recs] recomputing setter stats…');
   await transact(async (transaction) => {
@@ -383,7 +439,7 @@ export async function runRefreshRecommendations(
   for (const cohort of COHORTS) {
     for (const variant of PUBLIC_VARIANTS) {
       signal.throwIfAborted();
-      const result = await upsertCohortPlaylist(db, transact, cohort, variant);
+      const result = await upsertCohortPlaylist(db, transact, cohort, variant, log);
       playlistResults.push(result);
       log.info(
         `[recs]   ${result.name} → ${result.skipped ? 'SKIPPED (0 climbs, kept previous)' : `${result.count} climbs`}`,

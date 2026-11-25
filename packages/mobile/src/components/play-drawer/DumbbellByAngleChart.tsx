@@ -1,5 +1,6 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useMemo, useState, type ReactNode } from 'react';
-import { StyleSheet, View, Pressable, type LayoutChangeEvent } from 'react-native';
+import { StyleSheet, View, type LayoutChangeEvent } from 'react-native';
 import { LineChart } from 'react-native-gifted-charts';
 import type { GradeDisplayFormat } from '@boardsesh/play-view';
 import { Text } from '../Text';
@@ -20,6 +21,8 @@ type DumbbellByAngleChartProps = {
   headlineGrade: number | null;
   /** The viewer's grade-format preference, for the tap caption's dash fallback. */
   gradeFormat: GradeDisplayFormat;
+  /** The climb's board, so axis labels read on that board's scale (MoonBoard's 6A is V2). */
+  boardName?: string | null;
   /** Screen-reader summary of the chart (built by the parent section). */
   accessibilityLabel: string;
 };
@@ -77,6 +80,7 @@ export const DumbbellByAngleChart = memo(function DumbbellByAngleChart({
   rows,
   headlineGrade,
   gradeFormat,
+  boardName,
   accessibilityLabel,
 }: DumbbellByAngleChartProps) {
   const { chartColors } = useTheme();
@@ -84,7 +88,7 @@ export const DumbbellByAngleChart = memo(function DumbbellByAngleChart({
   const [width, setWidth] = useState(0);
   const [focusedAngle, setFocusedAngle] = useState<number | null>(null);
 
-  const axis = useMemo(() => buildDumbbellAxis(rows, gradeFormat), [rows, gradeFormat]);
+  const axis = useMemo(() => buildDumbbellAxis(rows, gradeFormat, boardName), [rows, gradeFormat, boardName]);
   const anyDiamond = useMemo(() => hasAnyBoardseshDiamond(rows), [rows]);
   const anyEstimate = useMemo(() => rows.some((row) => row.estimated), [rows]);
 
@@ -137,7 +141,7 @@ export const DumbbellByAngleChart = memo(function DumbbellByAngleChart({
           });
 
       return (
-        <Pressable
+        <PressableSurface
           style={[styles.column, { width: slotWidth, height: CHART_HEIGHT }]}
           onPress={() => setFocusedAngle((current) => (current === row.angle ? null : row.angle))}
           accessibilityRole="button"
@@ -232,7 +236,7 @@ export const DumbbellByAngleChart = memo(function DumbbellByAngleChart({
               ]}
             />
           ) : null}
-        </Pressable>
+        </PressableSurface>
       );
     },
     [focusedAngle, slotWidth, localY, neutralStroke, diamondEdge, chartColors.tertiaryLabel, chartColors.separator, t],
@@ -382,7 +386,7 @@ export const DumbbellByAngleChart = memo(function DumbbellByAngleChart({
           </View>
         ) : null}
       </View>
-      <Text variant="caption2" color={chartColors.tertiaryLabel} allowFontScaling={false}>
+      <Text variant="caption2" color={chartColors.secondaryLabel} allowFontScaling={false}>
         {t('boardseshGrade.dumbbell.legendSize')}
       </Text>
     </View>

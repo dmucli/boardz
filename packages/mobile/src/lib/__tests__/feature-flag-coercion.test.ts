@@ -4,7 +4,24 @@ const posthogClientMocks = vi.hoisted(() => ({ getPostHogClient: vi.fn() }));
 
 vi.mock('../posthog-client', () => ({ getPostHogClient: posthogClientMocks.getPostHogClient }));
 
-import { readPosthogFeatureFlags, registerRenderSuperProperties } from '../analytics';
+import {
+  readPosthogFeatureFlags,
+  readPosthogFeatureFlagSnapshot,
+  readPosthogFeatureFlagsRequestId,
+  registerRenderSuperProperties,
+} from '../analytics';
+import {
+  getPosthogFlagAuthority,
+  rememberPosthogFlagResponse,
+  setPosthogFlagAuthority,
+} from '../posthog-flag-authority';
+import { grantAnalyticsForTest } from '../../../test/consent-fixture';
+import { updateConsentState } from '../consent-state';
+
+beforeEach(() => {
+  grantAnalyticsForTest();
+  setPosthogFlagAuthority(null);
+});
 
 // readPosthogFeatureFlags is the only exported surface over
 // coerceFeatureFlagValue, so these tests exercise the coercion through it:
@@ -22,7 +39,11 @@ describe('readPosthogFeatureFlags', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     getFeatureFlag = vi.fn();
-    posthogClientMocks.getPostHogClient.mockReturnValue({ getFeatureFlag });
+    rememberPosthogFlagResponse(getPosthogFlagAuthority(), { requestId: 'coercion-response' });
+    posthogClientMocks.getPostHogClient.mockReturnValue({
+      getFeatureFlag,
+      getFeatureFlagDetails: () => ({ requestId: 'coercion-response' }),
+    });
   });
 
   it('returns an empty bag when analytics is disabled (null client)', () => {
@@ -139,5 +160,109 @@ describe('registerRenderSuperProperties', () => {
         glowFalloffSource: 'default',
       }),
     ).not.toThrow();
+  });
+});
+
+describe('atomic flag and payload snapshot', () => {
+  const definitions = [{ key: 'aura-gpu-enabled' }];
+  const payload = { version: 1, enabledFamilies: ['tension'], disabledFamilies: [] };
+
+  it('reads the policy and switch from one authorized response without exposure events', () => {
+    rememberPosthogFlagResponse(getPosthogFlagAuthority(), { requestId: 'gpu-response' });
+    const getFeatureFlag = vi.fn(() => false);
+    const getFeatureFlagPayload = vi.fn(() => payload);
+    posthogClientMocks.getPostHogClient.mockReturnValue({
+      getFeatureFlag,
+      getFeatureFlagPayload,
+      getFeatureFlagDetails: () => ({ requestId: 'gpu-response' }),
+    });
+    expect(readPosthogFeatureFlagSnapshot(definitions, ['aura-gpu-enabled'])).toEqual({
+      flags: { 'aura-gpu-enabled': false },
+      payloads: { 'aura-gpu-enabled': payload },
+    });
+    expect(getFeatureFlag).toHaveBeenCalledWith('aura-gpu-enabled', { sendEvent: false });
+    expect(getFeatureFlagPayload).toHaveBeenCalledWith('aura-gpu-enabled');
+  });
+
+  it('discards both answers when account authority changes during the read', () => {
+    rememberPosthogFlagResponse(getPosthogFlagAuthority(), { requestId: 'gpu-response' });
+    posthogClientMocks.getPostHogClient.mockReturnValue({
+      getFeatureFlag: () => true,
+      getFeatureFlagPayload: () => {
+        setPosthogFlagAuthority('replacement-account');
+        return payload;
+      },
+      getFeatureFlagDetails: () => ({ requestId: 'gpu-response' }),
+    });
+    expect(readPosthogFeatureFlagSnapshot(definitions, ['aura-gpu-enabled'])).toEqual({ flags: {}, payloads: {} });
+  });
+
+  it('keeps an explicit kill when only payload decoding fails', () => {
+    rememberPosthogFlagResponse(getPosthogFlagAuthority(), { requestId: 'gpu-response' });
+    posthogClientMocks.getPostHogClient.mockReturnValue({
+      getFeatureFlag: () => false,
+      getFeatureFlagPayload: () => {
+        throw new Error('bad payload');
+      },
+      getFeatureFlagDetails: () => ({ requestId: 'gpu-response' }),
+    });
+    expect(readPosthogFeatureFlagSnapshot(definitions, ['aura-gpu-enabled'])).toEqual({
+      flags: { 'aura-gpu-enabled': false },
+      payloads: {},
+    });
+  });
+});
+
+// What tells a fresh flag response from the cached bag (useFeatureFlagsFresh).
+// The method and the field are PostHogCore's own: `getFeatureFlagDetails()` in
+// posthog-core.d.ts, `requestId` stored from each /flags response.
+describe('readPosthogFeatureFlagsRequestId', () => {
+  it('keeps a cached same-account flag bag available offline without fresh evidence', () => {
+    grantAnalyticsForTest();
+    updateConsentState({ authSettled: true, accountId: 'account-a' });
+    posthogClientMocks.getPostHogClient.mockReturnValue({
+      getFeatureFlagDetails: () => ({ flags: {}, requestId: 'previous-launch' }),
+      getPersistedProperty: () => ({ boardseshFlagAccountId: 'account-a', requestId: 'previous-launch', flags: {} }),
+      getFeatureFlag: () => false,
+    });
+    expect(readPosthogFeatureFlagsRequestId()).toBeUndefined();
+    expect(readPosthogFeatureFlags([{ key: 'early-updates' }])).toEqual({ 'early-updates': false });
+    updateConsentState({ accountId: 'account-b' });
+    expect(readPosthogFeatureFlags([{ key: 'early-updates' }])).toEqual({});
+  });
+  it('reads the request id of the response the flag bag came from', () => {
+    rememberPosthogFlagResponse(getPosthogFlagAuthority(), { requestId: 'response-1' });
+    posthogClientMocks.getPostHogClient.mockReturnValue({
+      getFeatureFlagDetails: () => ({ flags: {}, requestId: 'response-1' }),
+    });
+    expect(readPosthogFeatureFlagsRequestId()).toBe('response-1');
+  });
+  it('does not treat a persisted request id as a response for this account', () => {
+    posthogClientMocks.getPostHogClient.mockReturnValue({
+      getFeatureFlagDetails: () => ({ flags: {}, requestId: 'persisted-old-response' }),
+      getFeatureFlag: () => false,
+    });
+    expect(readPosthogFeatureFlagsRequestId()).toBeUndefined();
+    expect(readPosthogFeatureFlags([{ key: 'early-updates' }])).toEqual({});
+  });
+
+  it('is undefined with no flags loaded yet', () => {
+    posthogClientMocks.getPostHogClient.mockReturnValue({ getFeatureFlagDetails: () => undefined });
+    expect(readPosthogFeatureFlagsRequestId()).toBeUndefined();
+  });
+
+  it('is undefined on a client without the method, so nothing ever counts as fresh', () => {
+    // The documented fallback, and the safe direction: a member is never moved
+    // off their track on a flag answer that cannot be dated.
+    posthogClientMocks.getPostHogClient.mockReturnValue({ getFeatureFlag: () => false });
+    expect(readPosthogFeatureFlagsRequestId()).toBeUndefined();
+  });
+
+  it('is undefined for a request id that is not a string, and with analytics disabled', () => {
+    posthogClientMocks.getPostHogClient.mockReturnValue({ getFeatureFlagDetails: () => ({ requestId: 42 }) });
+    expect(readPosthogFeatureFlagsRequestId()).toBeUndefined();
+
+    posthogClientMocks.getPostHogClient.mockReturnValue(null);
+    expect(readPosthogFeatureFlagsRequestId()).toBeUndefined();
   });
 });

@@ -1,0 +1,150 @@
+import { useMemo } from 'react';
+import { StyleSheet, View } from 'react-native';
+import { useTranslation } from 'react-i18next';
+import type { BoardName } from '@boardsesh/shared-schema';
+import type { PlanFillSummary } from '@boardsesh/playlist-generator';
+import { Card } from '../../Card';
+import { Icon } from '../../Icon';
+import { PressableSurface } from '../../PressableSurface';
+import { Text } from '../../Text';
+import { useGradeFormat } from '../../../hooks/use-grade-format';
+import { hapticSelection } from '../../../lib/haptics';
+import { useTheme } from '../../../providers/theme-provider';
+import { spacing } from '../../../theme/tokens';
+import type { StartQueueSummary } from './workout-start-queue';
+
+/**
+ * Points taken off each note line's height. React Native draws a paragraph into
+ * a text box exactly its frame's size, and deep in a long scroll view Yoga's
+ * float rounding can leave that frame a hair short of its lines (35.9999 for two
+ * 18 pt lines). TextKit then drops the last line and clips the one above it at
+ * the card edge, leaving an empty line under it. With each line a little
+ * shorter, the measured height still rounds up to the same pixels and the lines
+ * fit inside it.
+ */
+const NOTE_LINE_HEIGHT_SLACK = 0.02;
+
+type WorkoutPreviewSummaryProps = {
+  summary: PlanFillSummary;
+  boardName: BoardName;
+  onShuffle: () => void;
+  /** While the preview rebuilds, a row regenerates, or Start is pending. */
+  shuffleDisabled: boolean;
+  /**
+   * The queue Start hands over (`useWorkoutPreview().startQueue`): its climb
+   * count and about how long it takes. Without it the line counts the rows and
+   * gives no time.
+   */
+  startQueue?: StartQueueSummary;
+};
+
+/**
+ * The line above the preview rows that says what Start will queue: how many
+ * climbs (a 4x4 queues one per set, so 4), over which grades, and for a timed
+ * workout about how long it takes, every rep of a 4x4 included, plus a Shuffle
+ * that re-picks every climb at the same grades. When a thin catalogue left
+ * slots empty, a note says how many of the planned climbs were found: Start
+ * queues only those, each once.
+ */
+export function WorkoutPreviewSummary({
+  summary,
+  boardName,
+  onShuffle,
+  shuffleDisabled,
+  startQueue,
+}: WorkoutPreviewSummaryProps) {
+  const { t } = useTranslation('session');
+  const { systemColors, opacity, textStyles } = useTheme();
+  const { formatGradeByDifficultyId } = useGradeFormat();
+  const footnoteLineHeight = textStyles.footnote.lineHeight;
+  const noteLineStyle = useMemo(
+    () => (footnoteLineHeight === undefined ? null : { lineHeight: footnoteLineHeight - NOTE_LINE_HEIGHT_SLACK }),
+    [footnoteLineHeight],
+  );
+
+  if (summary.filled === 0) return null;
+
+  const lowest = formatGradeByDifficultyId(summary.lowestGrade, boardName) ?? String(summary.lowestGrade);
+  const highest = formatGradeByDifficultyId(summary.highestGrade, boardName) ?? String(summary.highestGrade);
+  const grades = lowest === highest ? lowest : t('mobile.session.preWorkoutPreviewGradeSpan', { lowest, highest });
+  const count = startQueue && startQueue.climbCount > 0 ? startQueue.climbCount : summary.filled;
+  const minutes = startQueue?.estimatedMinutes ?? null;
+
+  return (
+    <View style={styles.container}>
+      <View style={styles.summaryRow}>
+        <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.summaryText}>
+          {minutes === null
+            ? t('mobile.session.preWorkoutPreviewSummary', { count, grades })
+            : t('mobile.session.preWorkoutPreviewSummaryTimed', { count, grades, minutes })}
+        </Text>
+        <PressableSurface
+          onPress={() => {
+            hapticSelection();
+            onShuffle();
+          }}
+          disabled={shuffleDisabled}
+          feedback="opacity"
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel={t('mobile.session.preWorkoutPreviewShuffleAccessibilityLabel')}
+          accessibilityState={{ disabled: shuffleDisabled }}
+          style={[styles.shuffle, shuffleDisabled ? { opacity: opacity.disabled } : null]}
+        >
+          <Icon name="shuffle" size={15} color={systemColors.accent} />
+          <Text variant="footnote" color={systemColors.accent} style={styles.shuffleText}>
+            {t('mobile.session.preWorkoutPreviewShuffle')}
+          </Text>
+        </PressableSurface>
+      </View>
+
+      {/* Why some rows are not at the planned grade, and what is still missing. */}
+      {summary.substituted > 0 || summary.missing > 0 ? (
+        <Card>
+          {summary.substituted > 0 ? (
+            <Text variant="footnote" color={systemColors.secondaryLabel} style={noteLineStyle}>
+              {t('mobile.session.preWorkoutPreviewSubstituted', { count: summary.substituted })}
+            </Text>
+          ) : null}
+          {summary.missing > 0 ? (
+            <Text
+              variant="footnote"
+              color={systemColors.secondaryLabel}
+              style={[noteLineStyle, summary.substituted > 0 ? styles.secondNoteLine : null]}
+            >
+              {t('mobile.session.preWorkoutPreviewShortfall', { filled: summary.filled, planned: summary.planned })}
+            </Text>
+          ) : null}
+        </Card>
+      ) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    gap: spacing[2],
+    paddingHorizontal: spacing[4],
+  },
+  summaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing[3],
+  },
+  // Shrinks before the Shuffle button does, so large text wraps the summary.
+  summaryText: {
+    flex: 1,
+  },
+  shuffle: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing[1],
+    minHeight: 44,
+  },
+  shuffleText: {
+    fontWeight: '600',
+  },
+  secondNoteLine: {
+    marginTop: spacing[2],
+  },
+});

@@ -2,10 +2,12 @@ import { useCallback, useSyncExternalStore } from 'react';
 import { createMMKV } from 'react-native-mmkv';
 import type { AppSettings, SettingsKey } from './types';
 import { DEFAULT_SETTINGS } from './defaults';
+import { migrateAutoDisconnect, migrateLightAutomatically } from './migrations';
 
 const storage = createMMKV({ id: 'boardsesh-settings' });
 
-const listeners = new Set<() => void>();
+export type SettingsChange = { kind: 'setting'; key: SettingsKey } | { kind: 'reset' };
+const listeners = new Set<(change: SettingsChange) => void>();
 let cachedSettings: AppSettings | null = null;
 // Per-key snapshot cache for useSyncExternalStore. getSnapshot must return a
 // REFERENCE-STABLE value between writes: re-parsing JSON per call hands React a
@@ -15,15 +17,15 @@ let cachedSettings: AppSettings | null = null;
 // emitChange keeps this coherent.
 const snapshotCache = new Map<SettingsKey, unknown>();
 
-function emitChange() {
+function emitChange(change: SettingsChange) {
   cachedSettings = null;
   snapshotCache.clear();
   for (const listener of listeners) {
-    listener();
+    listener(change);
   }
 }
 
-function subscribe(callback: () => void): () => void {
+function subscribe(callback: (change: SettingsChange) => void): () => void {
   listeners.add(callback);
   return () => listeners.delete(callback);
 }
@@ -33,12 +35,11 @@ function subscribe(callback: () => void): () => void {
  * component — the connectivity store's binding, which has to notice an offline
  * mode written from anywhere and cannot see a hook.
  *
- * Fires after every `setSetting` and after `resetAllSettings`, with NO argument:
- * one listener set covers every key, so a subscriber re-reads the key it cares
- * about and compares. That is deliberate — the alternative is a per-key registry
- * for a store whose writes are a handful per session.
+ * Fires after every `setSetting` and after `resetAllSettings`. A reset is explicit
+ * even when the storage was already empty, so stores retaining an unsaved choice
+ * in memory can distinguish it from an unrelated setting write.
  */
-export function subscribeSettings(listener: () => void): () => void {
+export function subscribeSettings(listener: (change: SettingsChange) => void): () => void {
   return subscribe(listener);
 }
 
@@ -62,15 +63,26 @@ function readSettingSnapshot<K extends SettingsKey>(key: K): AppSettings[K] {
 
 function writeSetting<K extends SettingsKey>(key: K, value: AppSettings[K]): void {
   storage.set(key, JSON.stringify(value));
-  emitChange();
+  emitChange({ kind: 'setting', key });
 }
 
 export function getSetting<K extends SettingsKey>(key: K): AppSettings[K] {
   return readSetting(key);
 }
 
+/** Presence is distinct from a stored default such as `null`, including during migrations. */
+export function hasSetting(key: SettingsKey): boolean {
+  return storage.getString(key) !== undefined;
+}
+
 export function setSetting<K extends SettingsKey>(key: K, value: AppSettings[K]): void {
   writeSetting(key, value);
+}
+
+/** Restore one preference to its default without persisting today's default. */
+export function resetSetting(key: SettingsKey): void {
+  storage.remove(key);
+  emitChange({ kind: 'setting', key });
 }
 
 export function getAllSettings(): AppSettings {
@@ -86,7 +98,7 @@ export function getAllSettings(): AppSettings {
 
 export function resetAllSettings(): void {
   storage.clearAll();
-  emitChange();
+  emitChange({ kind: 'reset' });
 }
 
 export function useSetting<K extends SettingsKey>(key: K): [AppSettings[K], (value: AppSettings[K]) => void] {
@@ -108,4 +120,28 @@ export function useSetting<K extends SettingsKey>(key: K): [AppSettings[K], (val
 
 export function useSettings(): AppSettings {
   return useSyncExternalStore(subscribe, getAllSettings, () => DEFAULT_SETTINGS);
+}
+
+/** A stored key's parsed value, retired keys included, or undefined when absent or unreadable. */
+function readStoredValue(key: string): unknown {
+  const raw = storage.getString(key);
+  if (raw === undefined) return undefined;
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+// One-time carries from retired settings, before any screen reads a setting.
+// A store that can't be read or written leaves the defaults in place.
+try {
+  migrateAutoDisconnect({ read: readStoredValue, has: hasSetting, set: writeSetting });
+} catch {
+  // The new defaults stay usable if the old keys can't be read.
+}
+try {
+  migrateLightAutomatically({ read: readStoredValue, has: hasSetting, set: writeSetting });
+} catch {
+  // Always drive the wall stays off if the old switches can't be read.
 }

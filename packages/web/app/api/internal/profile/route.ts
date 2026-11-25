@@ -1,9 +1,11 @@
-import { getServerSession } from 'next-auth/next';
-import { NextResponse } from 'next/server';
+import { CredentialAuthorityUnavailable } from '@/app/lib/auth/credential-admission.server';
+import { unavailableCredentialResponse } from '@/app/lib/auth/credential-admission-response.server';
+import { getAdmittedServerSession } from '@/app/lib/auth/admitted-session.server';
+import { requireExpectedViewer } from '@/app/lib/auth/expected-viewer.server';
+import { type NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/app/lib/db/db';
 import * as schema from '@/app/lib/db/schema';
 import { eq } from 'drizzle-orm';
-import { authOptions } from '@/app/lib/auth/auth-options';
 
 // GET only. The PUT that used to live here had zero callers anywhere in the
 // repo — `/settings` reads this route and writes through GraphQL
@@ -11,10 +13,16 @@ import { authOptions } from '@/app/lib/auth/auth-options';
 // document either, so no third party could have been told it existed. What
 // the document DID advertise on this path was a POST the route has never
 // exported (#4662).
+//
+// The published OpenAPI document lists this GET for any session holder, so a
+// request without the expected-viewer header is still answered. One that names
+// another account than the cookie gets 409 before anything is read.
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
+    const session = await getAdmittedServerSession();
+    const viewerChanged = requireExpectedViewer(request, session, { route: '/api/internal/profile', missing: 'allow' });
+    if (viewerChanged) return viewerChanged;
 
     if (!session?.user?.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -60,6 +68,7 @@ export async function GET() {
         : null,
     });
   } catch (error) {
+    if (error instanceof CredentialAuthorityUnavailable) return unavailableCredentialResponse();
     console.error('Failed to get profile:', error);
     return NextResponse.json({ error: 'Failed to get profile' }, { status: 500 });
   }

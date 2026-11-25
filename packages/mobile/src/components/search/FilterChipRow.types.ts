@@ -1,17 +1,17 @@
-// Shared props for the persistent filter-chip row. The implementation is
-// platform-split: FilterChipRow.ios.tsx renders native @expo/ui SwiftUI menus,
-// FilterChipRow.android.tsx renders native @expo/ui Jetpack Compose FilterChips +
-// DropdownMenus. The split keeps each platform's @expo/ui import (swift-ui /
-// jetpack-compose) — whose components resolve native views at module load — off the
-// other platform's bundle path.
+// Props for the climbs list's persistent filter row (FilterChipRow.tsx). The row
+// builds capsule descriptors from them (climb-capsules.ts) and hands them to the
+// shared, platform-split CapsuleRow (filter-capsules/), so these props carry no
+// native types.
 
+import type { ReactElement } from 'react';
 import type { ProgressFilter, SortOption, GradeAccuracyValue } from '@boardsesh/climb-filters';
 import type { RecentFilter } from '../../lib/recent-filter-store';
-import type { PinnableChipKind } from '../../lib/pinnable-chips';
+import type { FilterChipKind } from '../../lib/pinnable-chips';
 import type { CollectionFilter } from '../../lib/collection-filter';
 import type { ClimbTypeFilter } from './FilterChipRow.logic';
 import type { ClimbFilters } from '../ClimbFilterSheet';
 import type { DimensionChip } from '../../lib/dimension-chips';
+import type { CapsuleOption } from '../filter-capsules/CapsuleRow.types';
 
 // Board-shape toggle chips (Tall / Wide), present only on the sizes where they
 // apply (a shorter or narrower size exists in the same product family; the caller
@@ -20,33 +20,51 @@ import type { DimensionChip } from '../../lib/dimension-chips';
 // taps to toggle; only the iOS row offers the long-press Lock / Unlock.
 export type { DimensionChip } from '../../lib/dimension-chips';
 
+/**
+ * A Sort capsule with the list's own keys and labels, in place of the Climbs
+ * `SORT_OPTIONS` one (a playlist's "Playlist order", "Recently added"). The
+ * caller owns what each key means; the row only shows the menu.
+ */
+export type FilterChipSortControl = {
+  /** The capsule's text: the resting name, or the picked sort ("Easiest first"). */
+  label: string;
+  active: boolean;
+  options: readonly CapsuleOption[];
+  selected: string;
+  onSelect: (value: string) => void;
+};
+
 export type FilterChipRowProps = {
   /**
-   * The filter chips the user has pinned, in render order (see
-   * lib/pinnable-chips.ts). Each pinnable chip renders only when its kind is
-   * present; the fixed chrome (Filters button, Recent, Android Angle) always
-   * renders. Defaults reproduce today's row.
+   * The chips the user has pinned, in render order: the order the pin store
+   * saved (Settings › Climbs & grades › Quick filters; see lib/pinnable-chips.ts).
+   * Each pinnable chip, Recent included, renders only when its kind is present;
+   * the Filters button always renders first. Defaults reproduce today's row.
    */
-  pinnedChips: readonly PinnableChipKind[];
+  pinnedChips: readonly FilterChipKind[];
 
   /** Total active filters → the Filters · N badge; tapping opens the sheet. */
   activeFilterCount: number;
   onOpenFilters: () => void;
 
-  recentFilters: RecentFilter[];
+  /** Saved searches for the Recent menu. A list without saved searches (a playlist) leaves these out. */
+  recentFilters?: RecentFilter[];
   /** Current committed filters + name, to mark the active recent. */
-  currentFilters: ClimbFilters;
-  currentSearchText: string;
-  onApplyRecent: (filters: ClimbFilters, searchText: string) => void;
-  onClearRecent: () => void;
+  currentFilters?: ClimbFilters;
+  currentSearchText?: string;
+  onApplyRecent?: (filters: ClimbFilters, searchText: string) => void;
+  onClearRecent?: () => void;
 
   /** Localised grade-bound label ("V4–V6") or the resting "Grade" placeholder. */
   gradeLabel: string;
   gradeActive: boolean;
   onOpenGrade: () => void;
-  /** Whether the grade range rail is currently shown — the chip toggles it. */
+  /** Whether the grade range rail is currently shown — the chip toggles it. The
+   *  rail is hidden until the chip opens it, then stays until the chip hides it. */
   gradeRailOpen: boolean;
   onCloseGrade: () => void;
+  /** Regular-width iPad places the range picker at its native chip anchor. */
+  gradePopoverContent?: ReactElement;
 
   /**
    * Tall/Wide chips the current board size supports (empty otherwise). Each one
@@ -65,19 +83,25 @@ export type FilterChipRowProps = {
   onChangeProgress: (value: ProgressFilter) => void;
   /** The progress selector is auth-gated (its chip hides), matching the sheet. */
   canFilterProgress: boolean;
-  /** Current "Collection" single-select (Any / Benchmarks / My drafts). */
+  /** Current "Collection" single-select (Any / My drafts / Liked). */
   collection: CollectionFilter;
   onChangeCollection: (value: CollectionFilter) => void;
-  /** My drafts is auth-only; the option is dropped from the chip menu when signed out. */
-  canFilterDrafts: boolean;
+  /** My drafts and Liked are auth-only; their options are dropped from the chip menu when signed out. */
+  canFilterPersonalCollections: boolean;
+  /** A spray wall has no benchmarks, so the Benchmarks chip hides there unless it is already on. */
+  isSprayWall: boolean;
+  /** Names the benchmarks chip: Verified on Kilter, Benchmarks elsewhere. */
+  boardName?: string | null;
 
   // --- Tier-2 (opt-in) chips: sheet-only controls a user can pin. ---
 
-  /** Current sort key; the Sort chip menu switches it (direction stays sheet-only). */
-  sortBy: SortOption;
+  /** Current sort key; the Sort chip menu switches it (direction stays sheet-only). Unused with `sortControl`. */
+  sortBy?: SortOption;
   /** Whether sort differs from the default (key or direction) — lights the chip. */
-  sortActive: boolean;
-  onChangeSort: (value: SortOption) => void;
+  sortActive?: boolean;
+  onChangeSort?: (value: SortOption) => void;
+  /** A list with sorts of its own passes its Sort capsule here; it replaces the Climbs one. */
+  sortControl?: FilterChipSortControl;
 
   /** Grade-accuracy bucket; 'off' is the neutral value. The chip menu switches it. */
   accuracyValue: GradeAccuracyValue | 'off';
@@ -86,8 +110,26 @@ export type FilterChipRowProps = {
   /** Climb-type single-select derived from the boulders/routes flags. */
   climbType: ClimbTypeFilter;
   onChangeClimbType: (value: ClimbTypeFilter) => void;
+  /**
+   * The list's own climb type at rest, which leaves the chip unlit and labelled
+   * "Climb type". Boulders on the Climbs list (the default); both on a playlist.
+   */
+  defaultClimbType?: ClimbTypeFilter;
 
   /** Beta-videos filter — a plain on/off toggle chip. */
   betaActive: boolean;
   onToggleBeta: () => void;
+
+  /** Benchmarks only (Verified only on Kilter) — a plain on/off toggle chip. */
+  benchmarksActive: boolean;
+  onToggleBenchmarks: () => void;
+
+  /** "Fits my board": a toggle chip before Sort, shown while pinned. Playlist-only; absent without an active board. */
+  boardFit?: { active: boolean; onToggle: () => void };
+
+  /**
+   * The Climbs bar's 48dp row: no vertical padding around the Compose chips
+   * (CapsuleRow `dense`). Only the Android row honours it.
+   */
+  dense?: boolean;
 };

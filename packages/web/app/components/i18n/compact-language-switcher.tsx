@@ -4,39 +4,39 @@ import React, { Suspense, useState } from 'react';
 import { usePathname, useSearchParams } from 'next/navigation';
 import { useTranslation } from 'react-i18next';
 import Box from '@mui/material/Box';
-import IconButton from '@mui/material/IconButton';
+import Button from '@mui/material/Button';
 import Tooltip from '@mui/material/Tooltip';
 import Menu from '@mui/material/Menu';
 import MenuItem from '@mui/material/MenuItem';
 import ListItemIcon from '@mui/material/ListItemIcon';
 import ListItemText from '@mui/material/ListItemText';
-import {
-  DEFAULT_LOCALE,
-  LOCALE_COOKIE,
-  LOCALE_LABELS,
-  SUPPORTED_LOCALES,
-  isSupportedLocale,
-  type Locale,
-} from '@/app/lib/i18n/config';
+import { DEFAULT_LOCALE, LOCALE_COOKIE, LOCALE_LABELS, isSupportedLocale, type Locale } from '@/app/lib/i18n/config';
 import { localeHref, stripLocalePrefix } from '@/app/lib/i18n/locale-href';
+import { getPublishedLocales } from '@/app/lib/i18n/published-locales';
+import SelectedCheck from '@/app/components/ui/selected-check';
 
-const FLAGS: Record<Locale, string> = {
-  'en-US': '🇺🇸',
-  es: '🇪🇸',
-  fr: '🇫🇷',
-  de: '🇩🇪',
-};
 const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
-const flagSx = { fontSize: 20, lineHeight: 1 };
-const menuFlagSx = { fontSize: 18, lineHeight: 1, minWidth: 24 };
+const languageNameSx = { fontSize: 14, lineHeight: 1 };
+const triggerSx = { minWidth: 44, minHeight: 44 };
+// MUI already gives phone menu rows 48px; desktop rows need a 44px floor.
+const menuItemSx = { minHeight: { sm: 44 } };
+// The check takes the selected item's ink rather than ListItemIcon's grey.
+const currentLocaleIconSx = { color: 'inherit' };
 
 type LabelProps = {
   ariaLabel: string;
-  flag: string;
+  label: string;
 };
 
-function CompactLanguageSwitcherInner({ ariaLabelTemplate }: { ariaLabelTemplate: (label: string) => string }) {
-  const pathname = usePathname() ?? '/';
+function CompactLanguageSwitcherInner({
+  pathname,
+  publishedLocales,
+  ariaLabelTemplate,
+}: {
+  pathname: string;
+  publishedLocales: readonly Locale[];
+  ariaLabelTemplate: (label: string) => string;
+}) {
   const searchParams = useSearchParams();
   const { i18n } = useTranslation('common');
   const current: Locale = isSupportedLocale(i18n.language) ? i18n.language : DEFAULT_LOCALE;
@@ -66,27 +66,41 @@ function CompactLanguageSwitcherInner({ ariaLabelTemplate }: { ariaLabelTemplate
   return (
     <>
       <Tooltip title={LOCALE_LABELS[current]}>
-        <IconButton
+        <Button
           onClick={handleOpen}
           aria-label={ariaLabelTemplate(LOCALE_LABELS[current])}
           aria-haspopup="menu"
           aria-expanded={open ? true : undefined}
           size="small"
+          sx={triggerSx}
         >
-          <Box component="span" sx={flagSx} aria-hidden>
-            {FLAGS[current]}
+          <Box component="span" sx={languageNameSx}>
+            {LOCALE_LABELS[current]}
           </Box>
-        </IconButton>
+        </Button>
       </Tooltip>
       <Menu anchorEl={anchorEl} open={open} onClose={handleClose}>
-        {SUPPORTED_LOCALES.map((locale) => (
-          <MenuItem key={locale} selected={locale === current} onClick={() => handleSelect(locale)}>
-            <ListItemIcon>
-              <Box component="span" sx={menuFlagSx} aria-hidden>
-                {FLAGS[locale]}
-              </Box>
-            </ListItemIcon>
-            <ListItemText>{LOCALE_LABELS[locale]}</ListItemText>
+        {/* The current locale is announced with aria-current and shown on the
+            tonal container with a leading check; the others inset their label
+            so every name lines up. */}
+        {publishedLocales.map((locale) => (
+          <MenuItem
+            key={locale}
+            selected={locale === current}
+            aria-current={locale === current ? 'true' : undefined}
+            onClick={() => handleSelect(locale)}
+            sx={menuItemSx}
+          >
+            {locale === current ? (
+              <>
+                <ListItemIcon sx={currentLocaleIconSx}>
+                  <SelectedCheck />
+                </ListItemIcon>
+                <ListItemText>{LOCALE_LABELS[locale]}</ListItemText>
+              </>
+            ) : (
+              <ListItemText inset>{LOCALE_LABELS[locale]}</ListItemText>
+            )}
           </MenuItem>
         ))}
       </Menu>
@@ -94,18 +108,22 @@ function CompactLanguageSwitcherInner({ ariaLabelTemplate }: { ariaLabelTemplate
   );
 }
 
-function CompactLanguageSwitcherFallback({ ariaLabel, flag }: LabelProps) {
+function CompactLanguageSwitcherFallback({ ariaLabel, label }: LabelProps) {
   return (
-    <IconButton disabled size="small" aria-label={ariaLabel}>
-      <Box component="span" sx={flagSx} aria-hidden>
-        {flag}
+    <Button disabled size="small" aria-label={ariaLabel} sx={triggerSx}>
+      <Box component="span" sx={languageNameSx}>
+        {label}
       </Box>
-    </IconButton>
+    </Button>
   );
 }
 
 export default function CompactLanguageSwitcher() {
+  const pathname = usePathname() ?? '/';
   const { i18n, t } = useTranslation('common');
+  const publishedLocales = getPublishedLocales(pathname);
+  if (publishedLocales.length < 2) return null;
+
   const fallbackLocale: Locale = isSupportedLocale(i18n.language) ? i18n.language : DEFAULT_LOCALE;
   const ariaLabelTemplate = (label: string) => t('languageSwitcher.ariaLabelWithCurrent', { language: label });
 
@@ -114,11 +132,15 @@ export default function CompactLanguageSwitcher() {
       fallback={
         <CompactLanguageSwitcherFallback
           ariaLabel={ariaLabelTemplate(LOCALE_LABELS[fallbackLocale])}
-          flag={FLAGS[fallbackLocale]}
+          label={LOCALE_LABELS[fallbackLocale]}
         />
       }
     >
-      <CompactLanguageSwitcherInner ariaLabelTemplate={ariaLabelTemplate} />
+      <CompactLanguageSwitcherInner
+        pathname={pathname}
+        publishedLocales={publishedLocales}
+        ariaLabelTemplate={ariaLabelTemplate}
+      />
     </Suspense>
   );
 }

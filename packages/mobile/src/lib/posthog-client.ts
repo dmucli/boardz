@@ -1,7 +1,43 @@
-import { PostHog, type PostHogOptions } from 'posthog-react-native';
-import { getAnalyticsBootstrapId } from './analytics-bootstrap-id';
+import { PostHog, PostHogPersistedProperty, type PostHogOptions } from 'posthog-react-native';
+import { notifySuperPropertiesCleared } from './analytics-super-properties-cleared';
 import { resolveAnalyticsUserAgent } from './analytics-user-agent';
 import { resolveAppEnvironment } from './app-environment';
+import {
+  getConsentSnapshot,
+  isProductAnalyticsGranted,
+  isConsentAuthorityGranted,
+  subscribeConsent,
+  updateConsentState,
+} from './consent-state';
+import { createConsentPosthogStorage } from './consent-posthog-storage';
+import { posthogStorageBackend } from './posthog-storage-backend';
+import { BACKEND_URL } from './env';
+import {
+  ANALYTICS_CONSENT_HEADER,
+  ANALYTICS_CONSENT_HEADER_GRANTED,
+  isAnalyticsCaptureUrl,
+  isAnalyticsGranted,
+} from '@boardsesh/consent';
+import { notifyAnalyticsIdentityChanged } from './analytics-identity-events';
+import { getFlagsInstallDistinctId } from './anonymous-install-id';
+import { applySessionReplayConsent } from './session-replay-consent';
+import { applyNativeReplayPrivacy } from './replay-privacy';
+import { isDevBuild } from './is-dev-build';
+import {
+  hasAuthAnalyticsHandoff,
+  retainAuthAnalyticsIdentity,
+  subscribeAuthAnalyticsHandoff,
+} from './auth-analytics-handoff';
+import { reregisterOtaSuperProperties } from './analytics-ota-context';
+import { registerConnectivitySuperProperty } from './analytics-connectivity';
+import {
+  functionalFlagProperties,
+  getPosthogFlagAuthority,
+  isPosthogFlagAuthorityCurrent,
+  rememberPosthogFlagResponse,
+  setPosthogFlagAuthority,
+  ownedPosthogFlagDetails,
+} from './posthog-flag-authority';
 
 // Registers the User-Agent as a super property on every event: the static,
 // non-bot app constant on native, the real browser UA in the Expo browser app
@@ -51,6 +87,7 @@ export function registerAppEnvironment(client: Pick<PostHog, 'register'>): void 
 export function registerAppSuperProperties(client: Pick<PostHog, 'register'>): void {
   registerMobileUserAgent(client);
   registerAppEnvironment(client);
+  reregisterOtaSuperProperties(client);
 }
 
 // PostHog project token. Intentionally the SAME project as web so a signed-in
@@ -58,28 +95,178 @@ export function registerAppSuperProperties(client: Pick<PostHog, 'register'>): v
 // inlined into the JS bundle at build time, so this must be set when the bundle
 // (OTA or native) is built, not merely present at runtime.
 const apiKey = process.env.EXPO_PUBLIC_POSTHOG_KEY;
-// Native apps have no ad-blocker / first-party-cookie concern, so we talk to
-// PostHog cloud directly rather than the backend reverse proxy the web app uses.
-const host = process.env.EXPO_PUBLIC_POSTHOG_HOST ?? 'https://us.i.posthog.com';
+// The first-party proxy strips network identity headers for both native and web.
+// Capture sent with a current Allow carries ANALYTICS_CONSENT_HEADER, and only
+// then does the proxy forward the visitor IP for GeoIP.
+const host = `${BACKEND_URL}/api/posthog`;
+const captureRequests = new Set<AbortController>();
+let initializingIdentity = false;
+
+subscribeConsent(() => {
+  if (isProductAnalyticsGranted()) return;
+  for (const request of captureRequests) request.abort();
+  captureRequests.clear();
+});
+
+export class ConsentPostHog extends PostHog {
+  override setPersistedProperty<T>(key: PostHogPersistedProperty, property: T | null): void {
+    if (
+      key === PostHogPersistedProperty.FeatureFlagDetails &&
+      property &&
+      typeof property === 'object' &&
+      !Array.isArray(property)
+    ) {
+      const details = ownedPosthogFlagDetails(
+        property as Record<string, unknown>,
+        super.getPersistedProperty<Record<string, unknown>>(key),
+      );
+      if (details) super.setPersistedProperty(key, details);
+      return;
+    }
+    super.setPersistedProperty(key, property);
+  }
+
+  override async fetch(url: string, options: Parameters<PostHog['fetch']>[1]): ReturnType<PostHog['fetch']> {
+    const operational = /\/flags\//.test(url) || /\/array\/[^/]+\/config\/?(?:\?|$)/.test(url);
+    if (operational) {
+      const authority = getPosthogFlagAuthority();
+      const flagsRequest = /\/flags\//.test(url);
+      // Flags can target an account without changing the product identity that
+      // the later anonymous-to-account identify event must reconcile.
+      if (/\/flags\//.test(url) && typeof options.body === 'string') {
+        const payload: unknown = JSON.parse(options.body);
+        if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+          const granted = isProductAnalyticsGranted();
+          const flagsIdentity = authority.accountId;
+          // Signed out, flags bucket on one id per install whatever the
+          // consent answer, so a percentage rollout neither re-rolls every
+          // launch nor flips on Allow (anonymous-install-id.ts). Signed in,
+          // the account id: consented, the SDK has identified with it.
+          const distinctId = flagsIdentity
+            ? granted && 'distinct_id' in payload
+              ? payload.distinct_id
+              : flagsIdentity
+            : await getFlagsInstallDistinctId();
+          // No secure id: fail closed. Flags keep their cached or shipped
+          // defaults rather than bucketing on something guessable.
+          if (distinctId === null) throw new Error('No secure random source for the flags id');
+          options = {
+            ...options,
+            body: JSON.stringify({
+              ...payload,
+              distinct_id: distinctId,
+              // Signed out, the SDK's anonymous and device ids never ride
+              // beside the install's flags id, consented or not: the anonymous
+              // id merges into the account at sign-in, so sending both would
+              // tie the flags id to the account one step removed. Bucketing
+              // uses distinct_id only.
+              ...(!granted || !flagsIdentity ? { $device_id: undefined, $anon_distinct_id: undefined } : {}),
+              ...(!granted
+                ? {
+                    person_properties:
+                      'person_properties' in payload ? functionalFlagProperties(payload.person_properties) : {},
+                    group_properties: {},
+                    groups: {},
+                  }
+                : {}),
+            }),
+          };
+        }
+      }
+      const response = await super.fetch(url, { ...options, credentials: 'omit' });
+      if (!flagsRequest) return response;
+      return {
+        status: response.status,
+        text: () => response.text(),
+        json: async () => {
+          const payload: unknown = await response.json();
+          if (!isPosthogFlagAuthorityCurrent(authority)) {
+            // The SDK coalesces reloads; retry after its current request settles.
+            setTimeout(() => client?.reloadFeatureFlags(), 0);
+            throw new Error('Feature flag response belongs to a superseded account');
+          }
+          rememberPosthogFlagResponse(authority, payload);
+          return payload;
+        },
+      };
+    }
+    if (!isProductAnalyticsGranted()) return { status: 200, text: async () => '', json: async () => ({}) };
+    const controller = new AbortController();
+    const epoch = getConsentSnapshot().authEpoch;
+    const abort = () => controller.abort();
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) controller.abort();
+    captureRequests.add(controller);
+    try {
+      if (!isProductAnalyticsGranted() || epoch !== getConsentSnapshot().authEpoch) controller.abort();
+      return await super.fetch(url, {
+        ...options,
+        headers: isAnalyticsCaptureUrl(url, host)
+          ? { ...options.headers, [ANALYTICS_CONSENT_HEADER]: ANALYTICS_CONSENT_HEADER_GRANTED }
+          : options.headers,
+        credentials: 'omit',
+        signal: controller.signal,
+      });
+    } finally {
+      captureRequests.delete(controller);
+      options.signal?.removeEventListener('abort', abort);
+    }
+  }
+}
 
 // Live only in non-dev builds with a key configured. Preview (TestFlight /
 // internal) and production builds are both `!__DEV__`, so telemetry flows from
 // them; local Metro dev never sends.
-export const isAnalyticsEnabled = !!apiKey && !__DEV__;
+export const isAnalyticsEnabled = !!apiKey && !isDevBuild();
 
 let client: PostHog | null = null;
 let initAttempted = false;
+let persistence: ReturnType<typeof createConsentPosthogStorage> | null = null;
+const initializedListeners = new Set<() => void>();
 
-// Pure so the bootstrap wiring is unit-testable without constructing a real
-// PostHog client (isAnalyticsEnabled is always false in the test env).
-// `bootstrapDistinctId` is the party-profile UUID resolved synchronously by the
-// caller, or null if that read/create failed — in which case bootstrap is
-// omitted entirely and the SDK falls back to its own anonymous id, exactly as
-// before this option existed.
-export function buildPostHogOptions(postHogHost: string, bootstrapDistinctId: string | null): PostHogOptions {
+export function subscribePosthogInitialized(listener: () => void): () => void {
+  initializedListeners.add(listener);
+  return () => initializedListeners.delete(listener);
+}
+
+/** Flags may target signed-in accounts without emitting an identify event or writing device storage. */
+export function setPosthogFlagIdentity(accountId: string | null): void {
+  setPosthogFlagAuthority(accountId);
+  client?.reloadFeatureFlags();
+}
+
+// Pure so the options are unit-testable without constructing a real PostHog
+// client (isAnalyticsEnabled is always false in the test env).
+//
+// There is no `bootstrap` on purpose. The SDK mints and persists its own
+// anonymous id, and that id is the only anonymous identity the app has: see the
+// header of packages/shared/analytics/src/reconcile-identity.ts. The option
+// used to carry the party-profile UUID, but the slot it read was still empty
+// when this module was evaluated (expo-router loads `app/(tabs)/_layout.tsx`,
+// which reaches this file, before the root layout that filled the slot), so it
+// never took effect on a device.
+export function buildPostHogOptions(postHogHost: string): PostHogOptions {
   return {
     host: postHogHost,
-    bootstrap: bootstrapDistinctId ? { distinctId: bootstrapDistinctId, isIdentifiedId: false } : undefined,
+    defaultOptIn: false,
+    persistence: 'file',
+    capturePushNotificationOpened: false,
+    capturePushNotificationSubscriptions: false,
+    disableSurveys: true,
+    before_send: (event) =>
+      isProductAnalyticsGranted() ||
+      (initializingIdentity && event?.event === '$identify' && isConsentAuthorityGranted())
+        ? event
+        : null,
+    // Every event builds a person, signed out included. The SDK default,
+    // `identified_only`, sends signed-out events personless until something
+    // identifies or sets a person property. The app never ran that way: its old
+    // signed-out identify() switched person processing on at every launch. That
+    // call is gone (reconcile-identity.ts, rule 2), so this keeps what it did for
+    // person counts and `person.properties` breakdowns on signed-out traffic.
+    // It does not mark anyone identified: an anonymous person made this way
+    // still merges into an account on sign-in.
+    personProfiles: 'always',
     // The app already emits explicit $screen events plus reviewed product
     // events. SDK lifecycle autocapture adds high-volume foreground/background
     // noise and does not help answer product or BLE reliability questions.
@@ -100,20 +287,144 @@ export function buildPostHogOptions(postHogHost: string, bootstrapDistinctId: st
 // analytics only — error/crash reporting goes to Sentry (src/lib/sentry.ts).
 export function getPostHogClient(): PostHog | null {
   if (!isAnalyticsEnabled || !apiKey) return null;
-  if (client) return client;
-  if (initAttempted) return null;
-  initAttempted = true;
-  // getAnalyticsBootstrapId() reads a slot that analytics-bootstrap.ts (wired
-  // up in app/_layout.tsx, ahead of anything that imports this module)
-  // resolves synchronously via expo-secure-store's JSI sync API. We still pass
-  // it as `bootstrap` so the SDK's anonymous id is stable before explicit
-  // screen/action events start flowing.
-  const bootstrapDistinctId = getAnalyticsBootstrapId();
-  client = new PostHog(apiKey, buildPostHogOptions(host, bootstrapDistinctId));
-  registerAppSuperProperties(client);
   return client;
 }
 
-if (isAnalyticsEnabled) {
-  getPostHogClient();
+/** Retain consented identity during account resolution, excluding every queued signal. */
+export function sanitizeRememberedPosthogFile(payload: string): string | null {
+  try {
+    const stored: unknown = JSON.parse(payload);
+    if (
+      !stored ||
+      typeof stored !== 'object' ||
+      Array.isArray(stored) ||
+      !('content' in stored) ||
+      !stored.content ||
+      typeof stored.content !== 'object' ||
+      Array.isArray(stored.content)
+    )
+      return null;
+    return JSON.stringify({
+      ...stored,
+      content: {
+        ...stored.content,
+        [PostHogPersistedProperty.OptedOut]: true,
+        [PostHogPersistedProperty.Queue]: [],
+        [PostHogPersistedProperty.AiQueue]: [],
+        [PostHogPersistedProperty.AiCaptureQueue]: [],
+        [PostHogPersistedProperty.LogsQueue]: [],
+      },
+    });
+  } catch {
+    return null;
+  }
 }
+
+export async function initializePosthogClient(): Promise<void> {
+  if (!getConsentSnapshot().loaded) return;
+  if (!isAnalyticsEnabled || !apiKey) {
+    updateConsentState({ sdkReady: true });
+    return;
+  }
+  if (initAttempted) return;
+  initAttempted = true;
+  const granted = isConsentAuthorityGranted();
+  const retainedGrant = isAnalyticsGranted(getConsentSnapshot().record) || hasAuthAnalyticsHandoff();
+  const remembered = new Map<string, string>();
+  if (retainedGrant && !granted) {
+    // Retain a previously consented identity locally during auth resolution.
+    // Queues and opt-in are excluded; flags get a separate functional identity.
+    const payload = await posthogStorageBackend.getItem('.posthog-rn.json').catch(() => null);
+    if (payload) {
+      const sanitized = sanitizeRememberedPosthogFile(payload);
+      if (sanitized) remembered.set('.posthog-rn.json', sanitized);
+    }
+  }
+  persistence = createConsentPosthogStorage(posthogStorageBackend, granted, remembered);
+  if (!retainedGrant) await persistence.setGranted(false);
+  await applyNativeReplayPrivacy(granted, apiKey);
+  if (!isAnalyticsGranted(getConsentSnapshot().record) && !hasAuthAnalyticsHandoff())
+    await persistence.setGranted(false);
+  client = new ConsentPostHog(apiKey, { ...buildPostHogOptions(host), customStorage: persistence.storage });
+  await client.ready();
+  await applyPosthogConsent();
+  registerAppSuperProperties(client);
+  registerConnectivitySuperProperty(client);
+  for (const listener of initializedListeners) listener();
+}
+
+export function clearPosthogQueues(posthog: PostHog): void {
+  for (const key of [
+    PostHogPersistedProperty.Queue,
+    PostHogPersistedProperty.AiQueue,
+    PostHogPersistedProperty.AiCaptureQueue,
+    PostHogPersistedProperty.LogsQueue,
+  ]) {
+    posthog.setPersistedProperty(key, []);
+  }
+}
+
+export async function applyPosthogConsent(): Promise<void> {
+  const granted = isConsentAuthorityGranted();
+  const epoch = getConsentSnapshot().authEpoch;
+  const nativePrivacy = apiKey ? applyNativeReplayPrivacy(granted, apiKey) : Promise.resolve();
+  const retainsGrant =
+    isAnalyticsGranted(getConsentSnapshot().record) ||
+    (client !== null && retainAuthAnalyticsIdentity(client.getDistinctId(), client.getAnonymousId()));
+  if (client && !granted) updateConsentState({ sdkReady: false });
+  if (!granted && retainsGrant) {
+    // Auth and account synchronization suspend capture; they are not a withdrawal.
+    persistence?.suspend();
+    if (client) {
+      void client.optOut();
+      void applySessionReplayConsent(client, false);
+    }
+    return;
+  }
+  // The storage adapter disables disk writes synchronously before it awaits deletion.
+  const storageUpdate = persistence?.setGranted(granted);
+  if (client) {
+    if (granted) {
+      await client.ready();
+      if (epoch !== getConsentSnapshot().authEpoch || !isConsentAuthorityGranted()) return;
+      const accountId = getConsentSnapshot().accountId;
+      const distinctId = client.getDistinctId();
+      if (distinctId !== (accountId ?? client.getAnonymousId()) && distinctId !== client.getAnonymousId()) {
+        client.reset([]);
+        clearPosthogQueues(client);
+        registerAppSuperProperties(client);
+        registerConnectivitySuperProperty(client);
+        notifySuperPropertiesCleared(client);
+      }
+      await client.optIn();
+      await nativePrivacy;
+      if (epoch !== getConsentSnapshot().authEpoch || !isConsentAuthorityGranted()) return;
+      if (accountId) {
+        initializingIdentity = true;
+        try {
+          client.identify(accountId);
+          notifyAnalyticsIdentityChanged();
+        } finally {
+          initializingIdentity = false;
+        }
+      }
+      updateConsentState({ sdkReady: true });
+    } else {
+      updateConsentState({ sdkReady: false });
+      void client.optOut();
+      void applySessionReplayConsent(client, false);
+      client.reset([]);
+      clearPosthogQueues(client);
+      void client.optOut();
+      registerAppSuperProperties(client);
+      registerConnectivitySuperProperty(client);
+      notifySuperPropertiesCleared(client);
+    }
+  }
+  await storageUpdate;
+}
+
+// Expiry/credential cancellation can happen without another consent decision.
+subscribeAuthAnalyticsHandoff(() => {
+  if (!isConsentAuthorityGranted()) void applyPosthogConsent().catch(() => {});
+});

@@ -1,16 +1,20 @@
+import { useHeaderHeight } from 'expo-router/react-navigation';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ScrollView, StyleSheet, View } from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 'react-native';
 import { useRouter } from 'expo-router';
 import { useTranslation } from 'react-i18next';
 import * as ImagePicker from 'expo-image-picker';
 import type { UpdateProfileInput } from '@boardsesh/shared-schema';
 import { useTheme } from '../providers/theme-provider';
 import { useToast } from '../providers/toast-provider';
+import { useHeaderActions } from '../hooks/use-header-actions';
+import { useKeyboardHeight } from '../hooks/use-keyboard-height';
+import { useBottomChromeMetrics } from '../hooks/use-bottom-chrome-metrics';
 import { useProfile, useUpdateProfile } from '../lib/graphql/hooks';
 import { uploadAvatar, type AvatarUploadFile } from '../lib/avatar-upload';
 import { compressPickedImage } from '../lib/image-compression';
 import { reportError } from '../lib/error-reporting';
-import { spacing } from '../theme/tokens';
+import { borderRadius, spacing } from '../theme/tokens';
 import { Avatar } from './Avatar';
 import { AuthTextInput } from './AuthTextInput';
 import { Button } from './Button';
@@ -28,6 +32,9 @@ export function EditProfileScreen() {
   const { systemColors } = useTheme();
   const { showToast } = useToast();
   const router = useRouter();
+  const { scrollBottomPadding } = useBottomChromeMetrics();
+  const headerHeight = useHeaderHeight();
+  const keyboardHeight = useKeyboardHeight(Platform.OS === 'android');
 
   const { data: profile } = useProfile();
   const updateProfile = useUpdateProfile();
@@ -58,16 +65,15 @@ export function EditProfileScreen() {
   const nameTooLong = trimmedName.length > DISPLAY_NAME_MAX;
   const previewUri = pickedAvatar?.uri ?? profile?.avatarUrl;
   const avatarName = trimmedName || profile?.email || null;
-  const hasChanges = pickedAvatar != null || trimmedName.length > 0;
+  // Dirty means different from what is saved: a name typed back to the saved one
+  // has nothing to save, and the ✓ stays grey.
+  const savedName = (profile?.displayName ?? '').trim();
+  const hasChanges = pickedAvatar != null || (trimmedName.length > 0 && trimmedName !== savedName);
   const canSave = !isSaving && !nameTooLong && hasChanges && !!profile?.id;
 
   const handlePickAvatar = async () => {
     try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        showToast(t('profile.avatar.permissionDenied'), 'warning');
-        return;
-      }
+      // No library permission request: the system picker needs none (#5957).
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ['images'],
         allowsEditing: true,
@@ -99,30 +105,33 @@ export function EditProfileScreen() {
     savingRef.current = true;
     setIsSaving(true);
     try {
+      // Only what the climber changed. A form reopened before an earlier save
+      // landed still shows the old name, and sending it would undo that save.
       const input: UpdateProfileInput = {};
-      if (trimmedName.length > 0) {
+      if (trimmedName.length > 0 && trimmedName !== savedName) {
         input.displayName = trimmedName;
       }
 
+      let avatarUploadFailed = false;
       if (pickedAvatar) {
         try {
           input.avatarUrl = await uploadAvatar(pickedAvatar, profile.id);
         } catch (error) {
-          // Match web: a failed avatar upload warns but still saves the name, so
-          // the user doesn't lose a name edit to an image hiccup.
+          // Keep the name edit, but leave the selected photo here for retry.
+          avatarUploadFailed = true;
           reportError(error);
           showToast(t('profile.avatarUploadFailed'), 'warning');
         }
       }
 
-      // Nothing left to persist — e.g. an avatar-only save whose upload failed.
-      // Stay on the screen (no router.back) so the user can retry; the warning
-      // toast already fired, and `finally` still resets the saving state.
+      // With no profile fields to persist, keep the form open for another try.
+      // `finally` still resets the saving state.
       if (input.displayName === undefined && input.avatarUrl === undefined) {
         return;
       }
 
       await updateProfile.mutateAsync(input);
+      if (avatarUploadFailed) return;
       // showToast fires the success/error haptic itself based on the variant.
       showToast(t('profile.saved'), 'success');
       router.back();
@@ -135,96 +144,98 @@ export function EditProfileScreen() {
     }
   };
 
+  // Save is the top-bar ✓, never a button at the foot of the form: back is cancel.
+  useHeaderActions({
+    trailing: {
+      kind: 'confirm',
+      label: t('profile.save'),
+      onPress: () => {
+        void handleSave();
+      },
+      disabled: !canSave,
+      loading: isSaving,
+      prominent: true,
+    },
+    clearOnUnmount: true,
+  });
+
   return (
-    <ScrollView
-      contentInsetAdjustmentBehavior="automatic"
-      contentContainerStyle={styles.container}
-      keyboardShouldPersistTaps="handled"
+    <KeyboardAvoidingView
+      keyboardVerticalOffset={headerHeight}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      style={styles.flex}
     >
-      <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.subtitle}>
-        {t('profile.subtitle')}
-      </Text>
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        style={{ backgroundColor: systemColors.groupedBackground }}
+        contentContainerStyle={[styles.container, { paddingBottom: scrollBottomPadding + spacing[4] + keyboardHeight }]}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View style={styles.avatarBlock}>
+          <Avatar uri={previewUri} name={avatarName} size={96} />
+          <Button
+            title={previewUri ? t('profile.avatar.change') : t('profile.avatar.upload')}
+            variant="outlined"
+            icon="camera"
+            onPress={() => {
+              void handlePickAvatar();
+            }}
+            disabled={isSaving}
+          />
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.avatarHint}>
+            {t('profile.avatar.hintMobile')}
+          </Text>
+        </View>
 
-      <View style={styles.avatarBlock}>
-        <Avatar uri={previewUri} name={avatarName} size={96} />
-        <Button
-          title={previewUri ? t('profile.avatar.change') : t('profile.avatar.upload')}
-          variant="outlined"
-          icon="camera"
-          onPress={() => {
-            void handlePickAvatar();
-          }}
-          disabled={isSaving}
-        />
-        <Text variant="footnote" color={systemColors.tertiaryLabel} style={styles.avatarHint}>
-          {t('profile.avatar.hintMobile')}
-        </Text>
-      </View>
+        <View style={[styles.card, { backgroundColor: systemColors.secondaryGroupedBackground }]}>
+          <AuthTextInput
+            label={t('profile.displayName.label')}
+            value={displayName}
+            onChangeText={handleChangeName}
+            placeholder={t('profile.displayName.placeholder')}
+            error={nameTooLong ? t('profile.validation.displayNameTooLong') : undefined}
+            editable={!isSaving}
+            autoCapitalize="words"
+            autoCorrect={false}
+            returnKeyType="done"
+          />
 
-      <View style={styles.form}>
-        <AuthTextInput
-          label={t('profile.displayName.label')}
-          value={displayName}
-          onChangeText={handleChangeName}
-          placeholder={t('profile.displayName.placeholder')}
-          error={nameTooLong ? t('profile.validation.displayNameTooLong') : undefined}
-          editable={!isSaving}
-          autoCapitalize="words"
-          autoCorrect={false}
-          returnKeyType="done"
-        />
-
-        <AuthTextInput
-          label={t('profile.email.label')}
-          value={profile?.email ?? ''}
-          onChangeText={() => undefined}
-          editable={false}
-          hint={t('profile.email.help')}
-          autoCapitalize="none"
-        />
-      </View>
-
-      <View style={styles.actions}>
-        <Button
-          title={t('profile.save')}
-          variant="filled"
-          onPress={() => {
-            void handleSave();
-          }}
-          disabled={!canSave}
-          loading={isSaving}
-        />
-      </View>
-    </ScrollView>
+          <AuthTextInput
+            label={t('profile.email.label')}
+            value={profile?.email ?? ''}
+            onChangeText={() => undefined}
+            editable={false}
+            hint={t('profile.email.help')}
+            autoCapitalize="none"
+          />
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
+  flex: { flex: 1 },
   container: {
+    width: '100%',
+    maxWidth: 672,
+    alignSelf: 'center',
     flexGrow: 1,
     paddingTop: spacing[4],
-    paddingBottom: spacing[8],
-  },
-  subtitle: {
-    paddingHorizontal: spacing[4],
-    textAlign: 'center',
   },
   avatarBlock: {
     alignItems: 'center',
     gap: spacing[3],
-    marginTop: spacing[5],
     paddingHorizontal: spacing[4],
   },
   avatarHint: {
     textAlign: 'center',
   },
-  form: {
+  card: {
     marginTop: spacing[6],
-    paddingHorizontal: spacing[4],
+    marginHorizontal: spacing[4],
+    padding: spacing[4],
     gap: spacing[4],
-  },
-  actions: {
-    marginTop: spacing[6],
-    paddingHorizontal: spacing[4],
+    borderRadius: borderRadius.lg,
   },
 });

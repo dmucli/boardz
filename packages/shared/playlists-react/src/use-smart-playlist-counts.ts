@@ -18,6 +18,9 @@ export type UseSmartPlaylistCountsOptions = {
   executeGraphQL?: ExecutePlaylistsGraphQL;
 };
 
+/** The first part of the counts' query key, for a caller that refreshes them without rendering the query. */
+export const SMART_PLAYLIST_COUNTS_QUERY_KEY = 'mySmartPlaylistCounts';
+
 /**
  * Smart-playlist counts for the signed-in user, used to decide which
  * auto-generated smart-playlist cards to show. react-query handles caching
@@ -35,7 +38,7 @@ export function useSmartPlaylistCounts({
   const executeGraphQL = executeGraphQLOverride ?? adapter.executeGraphQL;
 
   return useQuery({
-    queryKey: ['mySmartPlaylistCounts', token ?? null],
+    queryKey: [SMART_PLAYLIST_COUNTS_QUERY_KEY, token ?? null],
     queryFn: async () => {
       const res = await executeGraphQL<GetMySmartPlaylistCountsQueryResponse, Record<string, never>>(
         GET_MY_SMART_PLAYLIST_COUNTS,

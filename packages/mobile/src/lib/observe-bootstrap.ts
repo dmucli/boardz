@@ -6,8 +6,7 @@
 // `isInitialized()` when a screen's provider mounts and throws if that value
 // ever changes afterwards ("Router integration was toggled during a screen's
 // lifecycle"), so configure cannot move into a hook, an effect, or a provider —
-// it has to have already happened by the time the first screen renders. Same
-// reason `analytics-bootstrap.ts` next to it is an import rather than a call.
+// it has to have already happened by the time the first screen renders.
 //
 // This is also the ONLY module that imports `expo-observe` directly. Everything
 // else reaches the SDK through the dependency-free slot in
@@ -19,12 +18,25 @@
 // hooks/use-observe-runtime-config.ts); that is safe precisely because
 // buildObserveConfig hands the same OBSERVE_INTEGRATIONS constant back.
 import { Observe } from 'expo-observe';
-import { buildObserveConfig, type ObserveRuntimeOverrides } from './observe-config';
+import Constants from 'expo-constants';
+import {
+  buildObserveConfig,
+  isFirstPartyObserveEndpointConfigured,
+  type ObserveRuntimeOverrides,
+} from './observe-config';
 import { setObserveRuntime } from './observe-runtime';
 
+// Without this explicit embedded endpoint, the native SDK falls back to o.expo.dev.
+const firstPartyConfigured = isFirstPartyObserveEndpointConfigured(
+  Constants.expoConfig?.extra?.eas?.observe?.endpointUrl,
+);
 setObserveRuntime({
-  configure: (overrides: ObserveRuntimeOverrides) => Observe.configure(buildObserveConfig(overrides)),
-  reportError: (error: unknown) => Observe.reportError(error),
+  configure: (overrides: ObserveRuntimeOverrides) =>
+    Observe.configure(buildObserveConfig(firstPartyConfigured ? overrides : { dispatchingEnabled: false })),
+  dispatchEvents: () => (firstPartyConfigured ? Observe.dispatchEvents() : Promise.resolve()),
+  reportError: (error: unknown) => {
+    if (firstPartyConfigured) Observe.reportError(error);
+  },
 });
 
 Observe.configure(buildObserveConfig());

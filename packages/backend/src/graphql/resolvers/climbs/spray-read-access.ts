@@ -1,9 +1,14 @@
 import { GraphQLError } from 'graphql';
-import { and, eq, isNull, sql } from 'drizzle-orm';
-import * as dbSchema from '@boardsesh/db/schema';
-import { sprayLayoutVisibilitySql, sprayReferenceVisibilityCondition } from '@boardsesh/db/queries';
+import { and, eq, sql } from 'drizzle-orm';
+import {
+  sprayLayoutVisibilitySql,
+  sprayReferenceClimbExistsCondition,
+  sprayReferenceVisibilityCondition,
+} from '@boardsesh/db/queries';
 import { rowsFromResult } from '@boardsesh/db/client';
-import { dbRead } from '../../../db/client';
+import type { ConnectionContext } from '@boardsesh/shared-schema';
+import { esp32Controllers } from '@boardsesh/db/schema';
+import { db, dbRead } from '../../../db/client';
 
 /**
  * Read-side visibility for the climbs on a spray wall.
@@ -29,6 +34,87 @@ import { dbRead } from '../../../db/client';
  * `is_unlisted` is NOT an exemption: unlisted means reachable by uuid, and a layout
  * id is not a uuid.
  */
+
+/**
+ * How long a wall device's controller registration is trusted before it is read
+ * again. Deleting a controller in Settings therefore cuts an open socket's
+ * owner reads within this window, without a database read per pushed event.
+ */
+export const CONTROLLER_RECHECK_MS = 30_000;
+const CONTROLLER_CHECK_CACHE_MAX = 5_000;
+const controllerOwnerChecks = new Map<string, { ownerId: string | null; checkedAt: number }>();
+
+/** Forget every cached controller check. Tests only. */
+export function resetControllerOwnerChecksForTests(): void {
+  controllerOwnerChecks.clear();
+}
+
+/**
+ * The owner the connection's controller key belongs to RIGHT NOW: the owner
+ * stamped at connect, but only while the same registration (id + key) still
+ * exists and still names that owner. Cached per controller for
+ * {@link CONTROLLER_RECHECK_MS}.
+ */
+async function currentControllerOwner(
+  ctx: Pick<ConnectionContext, 'controllerId' | 'controllerApiKey' | 'controllerOwnerUserId'>,
+): Promise<string | undefined> {
+  const { controllerId, controllerApiKey, controllerOwnerUserId } = ctx;
+  if (!controllerId || !controllerApiKey || !controllerOwnerUserId) return undefined;
+  const now = Date.now();
+  const cached = controllerOwnerChecks.get(controllerId);
+  let ownerId: string | null;
+  if (cached && now - cached.checkedAt < CONTROLLER_RECHECK_MS) {
+    ownerId = cached.ownerId;
+  } else {
+    // The primary, not the replica: a deletion must be seen as soon as it lands.
+    const [registration] = await db
+      .select({ userId: esp32Controllers.userId })
+      .from(esp32Controllers)
+      .where(and(eq(esp32Controllers.id, controllerId), eq(esp32Controllers.apiKey, controllerApiKey)))
+      .limit(1);
+    ownerId = registration?.userId ?? null;
+    if (controllerOwnerChecks.size >= CONTROLLER_CHECK_CACHE_MAX) {
+      const oldest = controllerOwnerChecks.keys().next().value;
+      if (oldest !== undefined) controllerOwnerChecks.delete(oldest);
+    }
+    controllerOwnerChecks.delete(controllerId);
+    controllerOwnerChecks.set(controllerId, { ownerId, checkedAt: now });
+  }
+  return ownerId === controllerOwnerUserId ? ownerId : undefined;
+}
+
+/**
+ * The user whose READ access this connection carries for ONE board: the
+ * signed-in user; or, for a socket that presented a controller API key, the
+ * key's owner, but only on a board that owner OWNS and only while the
+ * registration still exists. Anything else reads as signed out.
+ *
+ * Exists for wall devices. An ESP32 controller or an external projector
+ * (`docs/boards/wall-devices.md`) connects with `connectionParams.controllerApiKey`
+ * instead of a user token, and has to see the climbs on its owner's private
+ * spray wall. Setting `ctx.userId` for it would also hand the key every mutation,
+ * the queue, the account and anything else keyed on a signed-in user, so the
+ * owner travels in its own field (`controllerOwnerUserId`). Ownership is the
+ * whole grant: a board the owner merely follows, was invited to, or sees as a
+ * gym member stays at the signed-out reading, so a key opens exactly the
+ * boards `controllerBoards` lists.
+ *
+ * Honoured only by the `boardNowPlaying` access gates and the climb-content half
+ * of its redaction, its backfill reads (`boardRecentClimbs`,
+ * `boardRecentHistory`), and the `sprayWall` / `sprayWallRenderData` visibility
+ * check. Use it ONLY for "may this caller read this board's climbs and holds".
+ * Anything that writes, stamps membership, names other climbers, projects
+ * owner-only fields, starts work on the owner's behalf, or picks a rate-limit
+ * bucket keeps reading `ctx.userId`.
+ */
+export async function readViewerIdForBoard(
+  ctx: Pick<ConnectionContext, 'userId' | 'controllerId' | 'controllerApiKey' | 'controllerOwnerUserId'>,
+  board: { ownerId: string } | null | undefined,
+): Promise<string | undefined> {
+  if (ctx.userId) return ctx.userId;
+  if (!board || !ctx.controllerOwnerUserId || board.ownerId !== ctx.controllerOwnerUserId) return undefined;
+  return currentControllerOwner(ctx);
+}
 
 /**
  * True only for spray. Exported because call sites **must** short-circuit on it:
@@ -87,9 +173,14 @@ export async function sprayLayoutIsReadable(
 export async function assertSprayBoardIsReadable(
   board: { boardType: string; layoutId: number | string },
   viewerUserId: string | null | undefined,
+  wallUuid?: string | null,
+  executor: Pick<typeof dbRead, 'execute'> = dbRead,
 ): Promise<void> {
   if (!isSprayBoardType(board.boardType)) return;
-  if (await sprayLayoutIsReadable(board.boardType, Number(board.layoutId), viewerUserId)) return;
+  if (
+    await sprayLayoutIsReadableWithCapability(board.boardType, Number(board.layoutId), viewerUserId, wallUuid, executor)
+  )
+    return;
   throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
 }
 
@@ -104,10 +195,9 @@ export async function assertSprayBoardIsReadable(
  * their own climb did not come back from `searchClimbs`, and there was no way in
  * the API to see what was on the wall.
  *
- * The uuid has to name THIS layout, and the unlisted exemption is
- * `sprayBoardRowIsReadable`'s `'capability'` half rather than a second copy of the
- * rule — a PRIVATE wall still does not open for a uuid, which is the difference
- * between unlisted and private.
+ * The uuid has to name THIS layout. The shared SQL visibility predicate reads
+ * the current resource policy and wall state, so a PRIVATE or admin-hidden wall
+ * does not open merely because a caller still holds its UUID.
  *
  * Falls through to the plain by-layout answer whenever no uuid is presented, so a
  * caller can pass the field through unconditionally.
@@ -117,36 +207,18 @@ export async function sprayLayoutIsReadableWithCapability(
   layoutId: number | null | undefined,
   userId: string | null | undefined,
   wallUuid: string | null | undefined,
+  executor: Pick<typeof dbRead, 'execute'> = dbRead,
 ): Promise<boolean> {
   if (!isSprayBoardType(boardType)) return true;
-  if (await sprayLayoutIsReadable(boardType, layoutId, userId)) return true;
-  if (!wallUuid) return false;
+  if (layoutId == null || !Number.isFinite(layoutId)) return false;
 
-  const [row] = await dbRead
-    .select({
-      boardType: dbSchema.userBoards.boardType,
-      layoutId: dbSchema.sprayWalls.layoutId,
-      isUnlisted: dbSchema.userBoards.isUnlisted,
-    })
-    .from(dbSchema.sprayWalls)
-    .innerJoin(dbSchema.userBoards, eq(dbSchema.userBoards.uuid, dbSchema.sprayWalls.boardUuid))
-    .where(
-      and(
-        eq(dbSchema.userBoards.uuid, wallUuid),
-        isNull(dbSchema.sprayWalls.deletedAt),
-        isNull(dbSchema.userBoards.deletedAt),
-      ),
-    )
-    .limit(1);
-
-  // A uuid naming a different wall than the layout under search is not a
-  // capability for this one.
-  if (!row || Number(row.layoutId) !== Number(layoutId)) return false;
-  return sprayBoardRowIsReadable(
-    { boardType: row.boardType, layoutId: Number(row.layoutId), isUnlisted: row.isUnlisted },
-    userId,
-    'capability',
+  // One current-policy query binds a presented UUID to this layout and still
+  // checks hidden/deleted walls, revoked grants, and modern Unlisted settings.
+  // Numeric layout IDs and absent UUIDs retain the no-link reading.
+  const rows = rowsFromResult<{ visible: boolean }>(
+    await executor.execute(sprayLayoutVisibilitySql(Number(layoutId), userId ?? null, wallUuid)),
   );
+  return rows[0]?.visible === true;
 }
 
 /**
@@ -173,9 +245,11 @@ export function sprayStreamGate(
   boardType: string | null | undefined,
   layoutId: number | null | undefined,
   userId: string | null | undefined,
+  wallUuid?: string | null,
+  executor: Pick<typeof dbRead, 'execute'> = dbRead,
 ): (() => Promise<boolean>) | null {
   if (!isSprayBoardType(boardType)) return null;
-  return () => sprayLayoutIsReadable(boardType, layoutId, userId);
+  return () => sprayLayoutIsReadableWithCapability(boardType, layoutId, userId, wallUuid, executor);
 }
 
 /**
@@ -203,14 +277,33 @@ export function sprayStreamGate(
  * A refused wall must be reported as the caller's "not found", never as an
  * error of its own — otherwise the response is an oracle.
  */
+type SprayBoardRow = { boardType: string; layoutId: number | null };
+/** The `'capability'` reading presents the row's own uuid, so the row must carry it. */
 export async function sprayBoardRowIsReadable(
-  board: { boardType: string; layoutId: number | null; isUnlisted?: boolean | null },
+  board: SprayBoardRow & { uuid: string },
   viewerUserId: string | null | undefined,
   lookupKey: 'capability' | 'enumerable',
+  executor?: Pick<typeof dbRead, 'execute'>,
+): Promise<boolean>;
+export async function sprayBoardRowIsReadable(
+  board: SprayBoardRow,
+  viewerUserId: string | null | undefined,
+  lookupKey: 'enumerable',
+  executor?: Pick<typeof dbRead, 'execute'>,
+): Promise<boolean>;
+export async function sprayBoardRowIsReadable(
+  board: SprayBoardRow & { uuid?: string },
+  viewerUserId: string | null | undefined,
+  lookupKey: 'capability' | 'enumerable',
+  executor: Pick<typeof dbRead, 'execute'> = dbRead,
 ): Promise<boolean> {
-  if (!isSprayBoardType(board.boardType)) return true;
-  if (lookupKey === 'capability' && board.isUnlisted === true) return true;
-  return sprayLayoutIsReadable(board.boardType, board.layoutId, viewerUserId);
+  return sprayLayoutIsReadableWithCapability(
+    board.boardType,
+    board.layoutId,
+    viewerUserId,
+    lookupKey === 'capability' ? board.uuid : null,
+    executor,
+  );
 }
 
 /**
@@ -224,13 +317,20 @@ export async function sprayBoardRowIsReadable(
  * survives. Answers true for every non-spray climb, so a call site needs no
  * board-type branch — and the caller must answer an unreadable climb with its
  * own EMPTY PAGE, never an error.
+ *
+ * `executor` defaults to the read replica. A caller that has just read the climb
+ * row from the PRIMARY must pass the primary here too. The rule answers "visible"
+ * when there is no climb row, so a climb the primary has and the replica does not
+ * have yet (created inside the replication lag) would otherwise pass for a
+ * reference to nothing and open up whatever the caller reads next.
  */
 export async function sprayClimbUuidIsReadable(
   climbUuid: string,
   viewerUserId: string | null | undefined,
+  executor: Pick<typeof dbRead, 'execute'> = dbRead,
 ): Promise<boolean> {
   const rows = rowsFromResult<{ visible: boolean }>(
-    await dbRead.execute(
+    await executor.execute(
       sql`SELECT ${sprayReferenceVisibilityCondition(
         { boardType: sql`'spray'`, climbUuid: sql`${climbUuid}` },
         viewerUserId ?? null,
@@ -250,7 +350,9 @@ export async function sprayClimbUuidIsReadable(
  * wall's rule reaches it one hop away.
  *
  * True for a proposal that does not exist and for one on any other board type,
- * so the caller needs no branch beyond the entity type.
+ * so the caller needs no branch beyond the entity type. False for a spray
+ * proposal whose climb row has been hard-deleted: the proposal carries its own
+ * board type, so this fails closed without guessing (#5981).
  */
 export async function sprayProposalUuidIsReadable(
   proposalUuid: string,
@@ -262,12 +364,41 @@ export async function sprayProposalUuidIsReadable(
         SELECT 1
         FROM climb_proposals cp
         WHERE cp.uuid = ${proposalUuid}
-          AND NOT (${sprayReferenceVisibilityCondition(
-            { boardType: sql`cp.board_type`, climbUuid: sql`cp.climb_uuid` },
-            viewerUserId ?? null,
-          )})
+          AND NOT (
+            ${sprayReferenceVisibilityCondition(
+              { boardType: sql`cp.board_type`, climbUuid: sql`cp.climb_uuid` },
+              viewerUserId ?? null,
+            )}
+            AND ${sprayReferenceClimbExistsCondition({ boardType: sql`cp.board_type`, climbUuid: sql`cp.climb_uuid` })}
+          )
       ) AS visible`,
     ),
   );
   return rows[0]?.visible === true;
+}
+
+/**
+ * Whether a spray climb's `board_climbs` row still exists, for a caller that
+ * already KNOWS the board type is spray.
+ *
+ * {@link sprayClimbUuidIsReadable} answers true when there is no climb row, and
+ * a spray climb row does go: `deleteDraftClimb` and account deletion hard-delete
+ * a draft and leave the proposals that named it. With no climb there is no wall
+ * to check, so the caller answers its empty page (#5981).
+ *
+ * A separate function rather than an option on `sprayClimbUuidIsReadable`, so
+ * that function's signature stays as it is. Reads the replica, like its
+ * neighbours: a climb created inside the replication lag answers false here,
+ * so its proposals read as empty until the replica has the row.
+ *
+ * Never call it for a climb whose board type is unknown (a comment thread):
+ * every thread on a catalogue board's missing climb would go empty.
+ */
+export async function sprayClimbRowExists(climbUuid: string): Promise<boolean> {
+  const rows = rowsFromResult<{ present: boolean }>(
+    await dbRead.execute(
+      sql`SELECT ${sprayReferenceClimbExistsCondition({ boardType: sql`'spray'`, climbUuid: sql`${climbUuid}` })} AS present`,
+    ),
+  );
+  return rows[0]?.present === true;
 }

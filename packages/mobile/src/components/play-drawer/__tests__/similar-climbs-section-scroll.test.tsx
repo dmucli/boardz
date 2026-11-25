@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { createElement, type ReactNode } from 'react';
 import { act, fireEvent, render } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -10,10 +23,15 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // assert the strip's scroller came from the gesture-handler module.
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  Pressable: ({ children }: { children?: ReactNode }) => createElement('button', null, children),
+  Pressable: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
+    createElement('button', { onClick: onPress }, children),
   ScrollView: ({ children }: { children?: ReactNode }) =>
     createElement('div', { 'data-testid': 'rn-scroll' }, children),
-  StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 vi.mock('react-native-gesture-handler', () => ({
@@ -49,14 +67,15 @@ vi.mock('../../Text', () => ({
 }));
 vi.mock('../../Icon', () => ({ Icon: () => null }));
 vi.mock('../../ClimbListThumbnail', () => ({ ClimbListThumbnail: () => null }));
+const ranked = vi.hoisted(() => ({
+  climbs: [] as {
+    climb: { uuid: string; name: string; difficultyName: string; frames: string; layoutId: number };
+    compatible: boolean;
+  }[],
+}));
 vi.mock('../similar-climbs-utils', () => ({
-  rankBySizeCompatibility: () => [
-    {
-      climb: { uuid: 'sc-1', name: 'Test Similar', difficultyName: 'V4', frames: '', layoutId: 1 },
-      compatible: true,
-    },
-  ],
-  buildClimbStub: () => ({ uuid: 'sc-1' }),
+  rankBySizeCompatibility: () => ranked.climbs,
+  buildClimbStub: (similarClimb: { uuid: string }) => ({ uuid: similarClimb.uuid }),
   formatByline: () => '',
 }));
 vi.mock('../../../lib/graphql/hooks', () => ({
@@ -112,9 +131,16 @@ vi.mock('../../offline/OfflineNudgeCard', () => ({
 vi.mock('../../../hooks/use-display-grade', () => ({
   useDisplayGrade: () => ({ resolveGrade: () => ({ label: 'V4', color: '#333' }) }),
 }));
-vi.mock('../../../providers/theme-provider', () => ({ useTheme: () => ({ brandColors: { primary: '#000' } }) }));
-vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { systemGray: '#888', white: '#fff' } }));
+vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
+  useTheme: () => ({
+    brandColors: { primary: '#000' },
+    systemColors: { secondaryLabel: '#3C3C4399', fill: '#7878801F' },
+  }),
+}));
+vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { white: '#fff' } }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 16: 64 },
   borderRadius: { md: 8, full: 999 },
 }));
@@ -132,8 +158,13 @@ const props = {
 };
 const garage = { boardType: 'kilter', layoutId: 1, sizeId: 10, name: 'Garage' };
 
+function rankedClimb(uuid: string, name: string, compatible: boolean) {
+  return { climb: { uuid, name, difficultyName: 'V4', frames: '', layoutId: 1 }, compatible };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  ranked.climbs = [rankedClimb('sc-1', 'Test Similar', true)];
   similar.data = [{ uuid: 'sc-1' }];
   similar.isLoading = false;
   similar.isError = false;
@@ -248,5 +279,30 @@ describe('SimilarClimbsSection — source states', () => {
     offer.enabledScopeKeys = ['kilter:1:10'];
     const { getByText } = render(createElement(SimilarClimbsSection, props));
     expect(getByText('mobile.similarClimbs.waitingForDownload')).toBeTruthy();
+  });
+});
+
+// Issue #6665: a similar climb plays from the strip.
+describe('SimilarClimbsSection taps', () => {
+  it('hands the tapped climb and the strip, the climbs this wall fits, in order', () => {
+    ranked.climbs = [
+      rankedClimb('sc-1', 'Fits One', true),
+      rankedClimb('sc-2', 'Fits Two', true),
+      rankedClimb('sc-3', 'Too Big', false),
+      rankedClimb('sc-4', 'Too Big Too', false),
+    ];
+    const onClimbPress = vi.fn();
+    const { getByText } = render(createElement(SimilarClimbsSection, { ...props, onClimbPress }));
+
+    fireEvent.click(getByText('Fits Two'));
+    expect(onClimbPress).toHaveBeenLastCalledWith({ uuid: 'sc-2' }, [{ uuid: 'sc-1' }, { uuid: 'sc-2' }]);
+
+    // A dimmed card still opens, and keeps its place in the strip.
+    fireEvent.click(getByText('Too Big'));
+    expect(onClimbPress).toHaveBeenLastCalledWith({ uuid: 'sc-3' }, [
+      { uuid: 'sc-1' },
+      { uuid: 'sc-2' },
+      { uuid: 'sc-3' },
+    ]);
   });
 });

@@ -36,23 +36,29 @@ export const iconMap = {
   'boards.fill': { ios: 'square.grid.2x2.fill', android: 'view-dashboard' },
   search: { ios: 'magnifyingglass', android: 'magnify' },
   queue: { ios: 'list.bullet', android: 'playlist-play' },
-  // Apple Music's own "Play Next" glyph.
+  // Apple Music's own "Play Next" and "Play Last" glyphs.
   'queue.next': { ios: 'text.insert', android: 'playlist-play' },
+  'queue.last': { ios: 'text.append', android: 'playlist-plus' },
   profile: { ios: 'person.crop.circle', android: 'account-circle-outline' },
   'profile.fill': { ios: 'person.crop.circle.fill', android: 'account-circle' },
   more: { ios: 'ellipsis', android: 'dots-horizontal' },
+  accessibility: { ios: 'accessibility', android: 'human' },
   settings: { ios: 'gearshape', android: 'cog-outline' },
   'settings.fill': { ios: 'gearshape.fill', android: 'cog' },
   server: { ios: 'server.rack', android: 'server-network' },
   logout: { ios: 'rectangle.portrait.and.arrow.right', android: 'logout' },
 
   // Navigation
-  'chevron.right': { ios: 'chevron.right', android: 'chevron-right' },
-  'chevron.left': { ios: 'chevron.left', android: 'chevron-left' },
+  'chevron.right': { ios: 'chevron.forward', android: 'chevron-right' },
+  'chevron.left': { ios: 'chevron.backward', android: 'chevron-left' },
+  // The wall button's swipe to drive, as a board sheet row (#7113).
+  'chevron.left.2': { ios: 'chevron.backward.2', android: 'chevron-double-left' },
   'chevron.down': { ios: 'chevron.down', android: 'chevron-down' },
   'chevron.up': { ios: 'chevron.up', android: 'chevron-up' },
   close: { ios: 'xmark', android: 'close' },
-  back: { ios: 'chevron.left', android: 'arrow-left' },
+  // A search field's clear control: the system's filled circle glyph (no hand-drawn disc).
+  'search.clear': { ios: 'xmark.circle.fill', android: 'close-circle' },
+  back: { ios: 'chevron.backward', android: 'arrow-left' },
 
   // Actions
   favorite: { ios: 'heart', android: 'heart-outline' },
@@ -60,6 +66,9 @@ export const iconMap = {
   add: { ios: 'plus.circle', android: 'plus-circle-outline' },
   'add.fill': { ios: 'plus.circle.fill', android: 'plus-circle' },
   share: { ios: 'square.and.arrow.up', android: 'share-variant-outline' },
+  // The player's "View options": what shows below the board. Not the eye, which
+  // already means Preview in the same menu, and not a gear, which reads as Settings.
+  'view.options': { ios: 'slider.horizontal.3', android: 'tune-variant' },
   comment: { ios: 'bubble.left', android: 'comment-outline' },
   'comment.fill': { ios: 'bubble.left.fill', android: 'comment' },
   // The "someone liked this" cue on notification rows — a thumbs-up, matching
@@ -74,13 +83,14 @@ export const iconMap = {
   // ellipsis, so iOS reuses the horizontal one and the call site rotates it 90°.
   'more.vertical': { ios: 'ellipsis', android: 'dots-vertical' },
   copy: { ios: 'doc.on.doc', android: 'content-copy' },
+  print: { ios: 'printer', android: 'printer-outline' },
   'doc.text': { ios: 'doc.text', android: 'file-document-outline' },
   mail: { ios: 'envelope', android: 'email-outline' },
   paw: { ios: 'pawprint.fill', android: 'paw' },
   flag: { ios: 'flag', android: 'flag-outline' },
   link: { ios: 'link', android: 'link-variant' },
   github: { ios: 'chevron.left.forwardslash.chevron.right', android: 'github' },
-  upload: { ios: 'square.and.arrow.up', android: 'upload-outline' },
+  upload: { ios: 'arrow.up.to.line', android: 'upload-outline' },
   delete: { ios: 'trash', android: 'delete-outline' },
   'delete.fill': { ios: 'trash.fill', android: 'delete' },
   edit: { ios: 'pencil', android: 'pencil-outline' },
@@ -91,7 +101,11 @@ export const iconMap = {
   // `checkmark` draws entirely above the baseline but reserves descender space
   // below it, so the box centres ~9% of its point size higher than the ink does.
   'check.small': { ios: 'checkmark', android: 'check', iosOpticalCenterRatio: 0.09 },
-  flash: { ios: 'bolt.fill', android: 'flash' },
+  // The iOS 26 top-bar confirm: a ✓ in a brand circle (SheetTopBar, the native
+  // header). Same optical correction as `check.small`.
+  confirm: { ios: 'checkmark', android: 'check', iosOpticalCenterRatio: 0.09 },
+  flash: { ios: 'bolt', android: 'lightning-bolt-outline' },
+  'flash.fill': { ios: 'bolt.fill', android: 'flash' },
   // What's New / changelog. Mirrors the More tab's native changelog glyph
   // (sparkles on iOS) so the same feature reads consistently across surfaces.
   changelog: { ios: 'sparkles', android: 'star-four-points' },
@@ -105,7 +119,8 @@ export const iconMap = {
   'lightbulb.fill': { ios: 'lightbulb.fill', android: 'lightbulb-on' },
   'lightbulb.slash': { ios: 'lightbulb.slash', android: 'lightbulb-off' },
   angle: { ios: 'angle', android: 'angle-acute' },
-  tick: { ios: 'checkmark.circle.fill', android: 'check-circle' },
+  tick: { ios: 'checkmark.circle', android: 'check-circle-outline' },
+  'tick.fill': { ios: 'checkmark.circle.fill', android: 'check-circle' },
   // Opens something at a size you can actually judge — the hint on a board
   // preview card that tapping it enlarges rather than re-picks.
   expand: { ios: 'arrow.up.left.and.arrow.down.right', android: 'arrow-expand' },
@@ -116,16 +131,19 @@ export const iconMap = {
   'ascent.attempt': { ios: 'xmark.circle', android: 'close-circle-outline' },
   // Remove-one-frame in the create-climb route editor — a circled X, distinct
   // from the trash-can `delete` glyph the Clear-all-holds action already uses.
+  // Stable stack glyphs distinguish routes from single-frame boulders.
+  frames: { ios: 'rectangle.stack', android: 'card-multiple-outline' },
   'frame.remove': { ios: 'xmark.circle', android: 'close-circle-outline' },
   // Intrinsic climb-attribute glyphs shown after the name (web parity:
   // climb-card/climb-icons.tsx © benchmark + ⊘ no-match).
   'no.match': { ios: 'hand.raised.slash', android: 'hand-back-right-off-outline' },
-  benchmark: { ios: 'c.circle', android: 'copyright' },
+  benchmark: { ios: 'rosette', android: 'seal-variant' },
   bluetooth: { ios: 'antenna.radiowaves.left.and.right', android: 'bluetooth' },
   'bluetooth.connected': { ios: 'antenna.radiowaves.left.and.right', android: 'bluetooth-connect' },
   'bluetooth.off': { ios: 'antenna.radiowaves.left.and.right.slash', android: 'bluetooth-off' },
   playlist: { ios: 'folder.badge.plus', android: 'folder-plus-outline' },
-  send: { ios: 'paperplane.fill', android: 'send' },
+  send: { ios: 'paperplane', android: 'send-outline' },
+  'send.fill': { ios: 'paperplane.fill', android: 'send' },
 
   // Create climb
   flame: { ios: 'flame', android: 'fire' },
@@ -139,12 +157,15 @@ export const iconMap = {
   eraser: { ios: 'eraser', android: 'eraser' },
   'hand.raised': { ios: 'hand.raised', android: 'hand-back-right-outline' },
   undo: { ios: 'arrow.uturn.backward', android: 'undo' },
+  move: { ios: 'arrow.up.and.down.and.arrow.left.and.right', android: 'cursor-move' },
   redo: { ios: 'arrow.uturn.forward', android: 'redo' },
 
   // Status
   info: { ios: 'info.circle', android: 'information-outline' },
+  // The spray editor's replay-the-hints button.
+  help: { ios: 'questionmark.circle', android: 'help' },
   warning: { ios: 'exclamationmark.triangle', android: 'alert-outline' },
-  error: { ios: 'xmark.circle', android: 'alert-circle-outline' },
+  error: { ios: 'exclamationmark.circle', android: 'alert-circle-outline' },
   success: { ios: 'checkmark.circle', android: 'check-circle-outline' },
 
   // Offline / downloads
@@ -184,7 +205,13 @@ export const iconMap = {
   'leave.session': { ios: 'rectangle.portrait.and.arrow.right', android: 'exit-to-app' },
   'skip.previous': { ios: 'backward.end', android: 'skip-previous' },
   'skip.next': { ios: 'forward.end', android: 'skip-next' },
+  // The iPad MiniPlayer's transport, drawn filled as Music's is.
+  'skip.previous.fill': { ios: 'backward.end.fill', android: 'skip-previous' },
+  'skip.next.fill': { ios: 'forward.end.fill', android: 'skip-next' },
   'drag.handle': { ios: 'line.3.horizontal', android: 'drag-horizontal-variant' },
+  // Move a row one place up or down a list the climber orders.
+  'arrow.up': { ios: 'arrow.up', android: 'arrow-up' },
+  'arrow.down': { ios: 'arrow.down', android: 'arrow-down' },
 
   // Math
   minus: { ios: 'minus', android: 'minus' },
@@ -199,9 +226,12 @@ export const iconMap = {
   // Misc
   // A gym / climbing venue — the glyph on a "you now manage this gym" row.
   gym: { ios: 'building.2', android: 'office-building' },
+  // The community moderation feed: vote on reported climbs and grade changes.
+  moderation: { ios: 'checkmark.shield', android: 'shield-check-outline' },
   star: { ios: 'star', android: 'star-outline' },
   'star.fill': { ios: 'star.fill', android: 'star' },
-  crown: { ios: 'crown.fill', android: 'crown' },
+  crown: { ios: 'crown', android: 'crown-outline' },
+  'crown.fill': { ios: 'crown.fill', android: 'crown' },
   location: { ios: 'location', android: 'map-marker-outline' },
   'location.fill': { ios: 'location.fill', android: 'map-marker' },
   calendar: { ios: 'calendar', android: 'calendar-outline' },
@@ -210,6 +240,18 @@ export const iconMap = {
   sort: { ios: 'arrow.up.arrow.down', android: 'sort-variant' },
   refresh: { ios: 'arrow.clockwise', android: 'refresh' },
   'crop.free': { ios: 'viewfinder', android: 'crop-free' },
+  // The spray editor's iPad tool rail: the resting pick-and-switch tool, the
+  // Pencil only toggle, and fit-the-wall (the zoom reset).
+  'hand.tap': { ios: 'hand.tap', android: 'gesture-tap' },
+  'pencil.tip': { ios: 'pencil.tip', android: 'draw-pen' },
+  'fit.screen': { ios: 'arrow.down.right.and.arrow.up.left', android: 'arrow-collapse' },
+  // The spray editor's Trace and Refine modes: redraw a hold's outline in one
+  // loop, or brush it bigger and smaller.
+  lasso: { ios: 'lasso', android: 'lasso' },
+  paintbrush: { ios: 'paintbrush.pointed', android: 'brush' },
+  // The two ways to outline a missed hold, on the Apple Pencil squeeze palette.
+  'shape.draw': { ios: 'scribble', android: 'gesture' },
+  'shape.corners': { ios: 'pentagon', android: 'vector-polygon' },
   photo: { ios: 'photo', android: 'image-outline' },
   camera: { ios: 'camera', android: 'camera-outline' },
   video: { ios: 'video', android: 'video-outline' },

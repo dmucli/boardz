@@ -1,178 +1,180 @@
 import 'server-only';
-
 import { cache } from 'react';
-import { sql as drizzleSql } from 'drizzle-orm';
-import { buildBoardRenderUrl } from '@/app/components/board-renderer/util';
-import { boardToRouteParams, resolveBoardBySlug } from '@/app/lib/board-slug-utils';
-import { getBoardDetailsForBoard } from '@/app/lib/board-utils';
-// All queries in this module are reads driving public OG image generation.
-// Route them through the replica seam — falls back to primary when
-// READ_REPLICA_URL is unset, so this is safe before a replica exists.
-import { dbzRead as dbz, executeRows, getReadPool, rowsFromResult } from '@/app/lib/db/db';
+import { parseBoardPath, parseNamedBoardPath } from '@boardsesh/board-config';
+import { getBoulderGradesForBoard } from '@boardsesh/board-constants/boulder-grade-mapping';
+import { BOULDER_GRADES } from '@/app/lib/board-data';
+import { executeGraphQLInternal } from '@/app/lib/graphql/server-cached-client';
 import { formatBoardDisplayName } from '@/app/lib/string-utils';
-import type { BoardDetails, BoardName, ParsedBoardRouteParameters } from '@/app/lib/types';
-import { parseBoardRouteParamsWithSlugs } from '@/app/lib/url-utils.server';
 import { buildOgVersionToken } from './og';
+import { buildOgContentVersion } from './og-family';
+
+// Public previews use the same anonymous backend authorization as public reads,
+// and the same documents the backend's share cards read, so a page's words and
+// the card it advertises describe the same data. React cache deduplicates only
+// within this request; no authorization survives it.
+
+/** A grade as the cards print it (`7b/V8`), or null when this board has no such grade. */
+export function formatCardGrade(boardType: string, difficulty: number | null | undefined): string | null {
+  if (difficulty === null || difficulty === undefined) return null;
+  const grade = getBoulderGradesForBoard(boardType).find((candidate) => candidate.difficulty_id === difficulty);
+  return grade ? `${grade.font_grade}/${grade.v_grade}` : null;
+}
 
 export type ProfileOgSummary = {
-  displayName: string;
-  avatarUrl: string | null;
-  fallbackImageUrl: string | null;
+  /** Null when the climber has no display name; the page supplies its own fallback. */
+  displayName: string | null;
   /**
-   * Board this climber has logged the most ticks on, or null when they have
-   * none. Drives the search-first page title ("Marco's Kilter Sessions") — a
-   * bare "Marco | Boardsesh" matches nothing anyone types into Google.
+   * Board this climber has sent the most distinct climbs on, or null when they
+   * have none. Drives the search-first page title ("Marco's Kilter Sessions").
    */
   topBoardType: string | null;
+  /** The hardest send a stranger may see, or null when there is none to name. */
+  hardestSend: { climbName: string; grade: string | null } | null;
+  /** Distinct climbs sent, hidden climbs included, as the public profile counts them. */
+  sentClimbCount: number;
+  /** Boards with at least one send, most sends first. */
+  sentBoardTypes: string[];
   version: string;
 };
 
+type ProfileStatsRead = {
+  totalDistinctClimbs: number;
+  layoutStats: Array<{
+    boardType: string;
+    distinctClimbCount: number;
+    gradeCounts: Array<{ grade: string; count: number }>;
+  }>;
+};
+
+type HardestSendRead = {
+  climbUuid: string;
+  climbName: string;
+  boardType: string;
+  difficulty: number | null;
+  consensusDifficulty: number | null;
+};
+
 export const getProfileOgSummary = cache(async (userId: string): Promise<ProfileOgSummary | null> => {
-  const rawSql = getReadPool();
-  const rows = rowsFromResult<{
-    name: string | null;
-    image: string | null;
-    display_name: string | null;
-    avatar_url: string | null;
-    top_board_type: string | null;
-    version_at: string | Date | null;
+  const { publicProfile } = await executeGraphQLInternal<{
+    publicProfile: {
+      displayName: string | null;
+      avatarUrl: string | null;
+      isPrivate: boolean;
+    } | null;
   }>(
-    await rawSql`
-    SELECT
-      u.name,
-      u.image,
-      p.display_name,
-      p.avatar_url,
-      (
-        SELECT bt.board_type
-        FROM boardsesh_ticks bt
-        WHERE bt.user_id = ${userId}
-        GROUP BY bt.board_type
-        ORDER BY COUNT(*) DESC, bt.board_type
-        LIMIT 1
-      ) AS top_board_type,
-      GREATEST(
-        COALESCE(u.updated_at, to_timestamp(0)),
-        COALESCE(p.updated_at, to_timestamp(0)),
-        COALESCE((SELECT MAX(bt.updated_at) FROM boardsesh_ticks bt WHERE bt.user_id = ${userId}), to_timestamp(0))
-      ) AS version_at
-    FROM users u
-    LEFT JOIN user_profiles p ON p.user_id = u.id
-    WHERE u.id = ${userId}
-    LIMIT 1
-  `,
+    `query ProfilePreview($userId: ID!) {
+    publicProfile(userId: $userId) { displayName avatarUrl isPrivate }
+  }`,
+    { userId },
+  );
+  // A private account stops here, before any activity is read.
+  if (!publicProfile || publicProfile.isPrivate) return null;
+
+  // The card's own reads: `userProfileStats` takes a tick's grade from the
+  // consensus when the climber logged none, and `userAscentsFeed` applies tick
+  // privacy, spray visibility and the community-hidden filter.
+  const { userProfileStats, userAscentsFeed } = await executeGraphQLInternal<{
+    userProfileStats: ProfileStatsRead;
+    userAscentsFeed: { items: HardestSendRead[] };
+  }>(
+    `query ProfilePreviewActivity($userId: ID!, $input: AscentFeedInput) {
+    userProfileStats(userId: $userId) {
+      totalDistinctClimbs
+      layoutStats { boardType distinctClimbCount gradeCounts { grade count } }
+    }
+    userAscentsFeed(userId: $userId, input: $input) {
+      items { climbUuid climbName boardType difficulty consensusDifficulty }
+    }
+  }`,
+    { userId, input: { limit: 1, sortBy: 'hardest', statusMode: 'send', excludeHiddenClimbs: true } },
   );
 
-  const row = rows[0];
-  if (!row) {
-    return null;
+  const sendsByBoard = new Map<string, number>();
+  for (const layout of userProfileStats.layoutStats) {
+    if (layout.distinctClimbCount <= 0) continue;
+    sendsByBoard.set(layout.boardType, (sendsByBoard.get(layout.boardType) ?? 0) + layout.distinctClimbCount);
+  }
+  const sentBoardTypes = [...sendsByBoard].sort((first, second) => second[1] - first[1]).map(([board]) => board);
+
+  const hardest = userAscentsFeed.items[0] ?? null;
+  // The logged grade, falling back to consensus only when nothing was logged:
+  // the same rule the card's hero uses.
+  let hardestDifficulty: number | null = null;
+  if (hardest) {
+    hardestDifficulty =
+      hardest.difficulty ?? (hardest.consensusDifficulty === null ? null : Math.round(hardest.consensusDifficulty));
   }
 
   return {
-    displayName: row.display_name || row.name || 'Crusher',
-    avatarUrl: row.avatar_url || null,
-    fallbackImageUrl: row.image || null,
-    topBoardType: row.top_board_type || null,
-    version: buildOgVersionToken(row.version_at),
+    displayName: publicProfile.displayName?.trim() || null,
+    topBoardType: sentBoardTypes[0] ?? null,
+    hardestSend: hardest
+      ? { climbName: hardest.climbName, grade: formatCardGrade(hardest.boardType, hardestDifficulty) }
+      : null,
+    sentClimbCount: userProfileStats.totalDistinctClimbs,
+    sentBoardTypes,
+    version: buildOgContentVersion(
+      publicProfile.displayName,
+      publicProfile.avatarUrl,
+      userProfileStats,
+      hardest?.climbUuid ?? null,
+      hardestDifficulty,
+    ),
   };
 });
 
 export type SetterOgSummary = {
   displayName: string;
-  avatarUrl: string | null;
+  /** Sends across the setter's listable climbs, each at its most-sent angle. */
+  totalAscents: number;
+  /** Seed for the card URL's token; the page adds the climb it names. */
   version: string;
 };
 
-/**
- * The setter's OG/metadata summary, or `null` when nobody has a publicly
- * visible climb under that name.
- *
- * The null is the whole point. This query LEFT JOINs the profile onto
- * `(SELECT 1) AS seed`, so it always returns exactly one row — which is why
- * `/setter/{anything}` used to answer 200 with an indexable title and no
- * `<meta name="robots">` at all. One `EXISTS` over the setter's visible climbs
- * turns that soft-404 farm into a real 404, and because both the HTML page and
- * `/api/og/setter` read this one function, the two surfaces cannot disagree
- * about whether a setter exists.
- *
- * `is_listed AND NOT is_draft` and not merely "has a row": a setter whose whole
- * catalogue is drafts or unlisted has nothing to show a crawler, and rendering
- * their drafts on an indexable page would publish work they never published.
- */
 export const getSetterOgSummary = cache(async (username: string): Promise<SetterOgSummary | null> => {
-  const result = await executeRows<{
-    has_visible_climb: boolean | null;
-    name: string | null;
-    display_name: string | null;
-    avatar_url: string | null;
-    version_at: string | Date | null;
+  const { setterProfile } = await executeGraphQLInternal<{
+    setterProfile: {
+      climbCount: number;
+      totalAscents: number;
+      linkedUserDisplayName: string | null;
+      linkedUserAvatarUrl: string | null;
+    } | null;
   }>(
-    dbz,
-    drizzleSql`
-    SELECT
-      EXISTS (
-        SELECT 1
-        FROM board_climbs vc
-        WHERE vc.setter_username = ${username}
-          AND vc.is_listed = true
-          AND vc.is_draft = false
-      ) AS has_visible_climb,
-      profile.name,
-      profile.display_name,
-      profile.avatar_url,
-      GREATEST(
-        COALESCE(profile.user_updated_at, to_timestamp(0)),
-        COALESCE(profile.profile_updated_at, to_timestamp(0)),
-        COALESCE(
-          (
-            SELECT MAX(bt.updated_at)
-            FROM boardsesh_ticks bt
-            JOIN board_climbs bc ON bc.uuid = bt.climb_uuid AND bc.board_type = bt.board_type
-            WHERE bc.setter_username = ${username}
-          ),
-          to_timestamp(0)
-        ),
-        COALESCE(
-          (
-            SELECT MAX(c.created_at::timestamp)
-            FROM board_climbs c
-            WHERE c.setter_username = ${username}
-          ),
-          to_timestamp(0)
-        )
-      ) AS version_at
-    FROM (SELECT 1) AS seed
-    LEFT JOIN (
-      SELECT
-        u.name,
-        u.updated_at AS user_updated_at,
-        p.display_name,
-        p.avatar_url,
-        p.updated_at AS profile_updated_at
-      FROM user_board_mappings ubm
-      JOIN users u ON u.id = ubm.user_id
-      LEFT JOIN user_profiles p ON p.user_id = ubm.user_id
-      WHERE ubm.board_username = ${username}
-      LIMIT 1
-    ) AS profile ON true
-  `,
+    `query SetterPreview($input: SetterProfileInput!) {
+    setterProfile(input: $input) { climbCount totalAscents linkedUserDisplayName linkedUserAvatarUrl }
+  }`,
+    { input: { username } },
   );
-
-  const row = result[0];
-  if (!row?.has_visible_climb) {
-    return null;
-  }
-
+  if (!setterProfile?.climbCount) return null;
   return {
-    displayName: row.display_name || row.name || username,
-    avatarUrl: row.avatar_url || null,
-    version: buildOgVersionToken(row.version_at),
+    displayName: setterProfile.linkedUserDisplayName || username,
+    totalAscents: setterProfile.totalAscents,
+    // The token used to be a constant, so a setter card could stay stale in a
+    // chat app's cache forever. These are the numbers the card prints.
+    version: buildOgContentVersion(
+      setterProfile.climbCount,
+      setterProfile.totalAscents,
+      setterProfile.linkedUserDisplayName,
+      setterProfile.linkedUserAvatarUrl,
+    ),
   };
 });
 
 export type SessionOgGradeRow = {
   difficulty: number;
   count: number;
+};
+
+/**
+ * The hardest tick of a kind a stranger may see. No climb name: the backend card
+ * never features a community-hidden climb, and the anonymous `sessionDetail`
+ * ticks carry no hidden flag to tell one apart, so the share copy names grades,
+ * never climbs.
+ */
+export type SessionOgHighlight = {
+  grade: string;
+  angle: number;
+  flashed: boolean;
 };
 
 export type SessionOgSummary = {
@@ -188,298 +190,163 @@ export type SessionOgSummary = {
   boardPreviewPath: string | null;
   version: string;
   found: boolean;
+  /** True while `session()` answers: the session is live and a stranger may see it. */
+  isLive: boolean;
+  /** Who an invite names: the leader, else the first climber who may be named. */
+  inviteName: string | null;
+  /** The live session's board type and angle, from its `boardPath`, when a stranger may see it. */
+  liveBoard: { boardType: string; angle: number | null } | null;
+  /** Ticks a stranger may see. Zero means there is no recap card to advertise. */
+  tickCount: number;
+  totalFlashes: number;
+  durationMinutes: number | null;
+  /** Climbers a stranger can see logging; `name` is null for one they may not name. */
+  recapParticipants: Array<{ name: string | null }>;
+  boardTypes: string[];
+  hardestSend: SessionOgHighlight | null;
+  hardestAttempt: SessionOgHighlight | null;
 };
 
-type SessionBoardSeed = {
-  boardPath: string | null;
-  boardSlug: string | null;
-  boardAngle: number | null;
-  boardType: string | null;
-  layoutId: number | null;
-  sizeId: number | null;
-  setIds: string | null;
+type SessionTickRead = {
+  boardType: string;
+  angle: number;
+  status: string;
+  difficulty: number | null;
+  difficultyName: string | null;
 };
 
-function extractPathname(value: string): string {
-  if (/^https?:\/\//i.test(value)) {
-    try {
-      return new URL(value).pathname;
-    } catch {
-      return value;
-    }
-  }
+const SEND_STATUSES = new Set(['send', 'flash']);
 
-  return value;
+function pickHardestTick(ticks: readonly SessionTickRead[]): SessionOgHighlight | null {
+  let picked: SessionTickRead | null = null;
+  for (const tick of ticks) {
+    if (tick.difficulty === null) continue;
+    if (!picked || tick.difficulty > (picked.difficulty ?? -1)) picked = tick;
+  }
+  if (!picked) return null;
+  const grade = formatCardGrade(picked.boardType, picked.difficulty) ?? picked.difficultyName;
+  if (!grade) return null;
+  return { grade, angle: picked.angle, flashed: picked.status === 'flash' };
 }
 
-function parseSetIdString(value: string | null): number[] {
-  return (value ?? '')
-    .split(',')
-    .map((part) => Number(part.trim()))
-    .filter((part) => !Number.isNaN(part));
-}
-
-function formatBoardLabel(boardDetails: BoardDetails): string {
-  const parts: string[] = [formatBoardDisplayName(boardDetails.board_name)];
-
-  if (boardDetails.layout_name) {
-    const layoutName = boardDetails.layout_name
-      .replace(new RegExp(`^${boardDetails.board_name}\\s*(board)?\\s*`, 'i'), '')
-      .trim();
-
-    if (layoutName) {
-      parts.push(layoutName);
-    }
+/**
+ * The board a live session is on. The anonymous projection returns `/b/<slug>`
+ * only when a stranger may name the board, and the geometry path otherwise, so
+ * both forms are read. A slug costs one anonymous `boardBySlug`, which selects
+ * the board's type and angle and never its name or location.
+ */
+async function resolveLiveBoard(boardPath: string | null): Promise<SessionOgSummary['liveBoard']> {
+  if (!boardPath) return null;
+  const named = parseNamedBoardPath(boardPath);
+  if (named) {
+    const { boardBySlug } = await executeGraphQLInternal<{
+      boardBySlug: { boardType: string; angle: number } | null;
+    }>(`query SessionPreviewBoard($slug: String!) { boardBySlug(slug: $slug) { boardType angle } }`, {
+      slug: named.slug,
+    });
+    return boardBySlug ? { boardType: boardBySlug.boardType, angle: named.angle ?? boardBySlug.angle } : null;
   }
-
-  if (boardDetails.size_name) {
-    const sizeMatch = boardDetails.size_name.match(/(\d+)\s*x\s*(\d+)/i);
-    if (sizeMatch) {
-      parts.push(`${sizeMatch[1]}x${sizeMatch[2]}`);
-    } else {
-      parts.push(boardDetails.size_name);
-    }
-  } else if (boardDetails.size_description) {
-    parts.push(boardDetails.size_description);
-  }
-
-  return parts.join(' ');
-}
-
-async function resolveSessionBoardInfo(seed: SessionBoardSeed): Promise<{
-  boardLabel: string;
-  boardAngle: number | null;
-  boardPreviewPath: string;
-} | null> {
-  const rawBoardPath = seed.boardPath?.trim();
-  if (!rawBoardPath) {
-    return null;
-  }
-
-  try {
-    let parsedParams: ParsedBoardRouteParameters | null = null;
-    let boardAngle = seed.boardAngle != null ? Number(seed.boardAngle) : null;
-
-    if (seed.boardType && seed.layoutId != null && seed.sizeId != null) {
-      const parsedSetIds = parseSetIdString(seed.setIds);
-      if (parsedSetIds.length > 0) {
-        parsedParams = {
-          board_name: seed.boardType as BoardName,
-          layout_id: Number(seed.layoutId),
-          size_id: Number(seed.sizeId),
-          set_ids: parsedSetIds,
-          angle: boardAngle ?? 0,
-        };
-      }
-    }
-
-    const pathname = extractPathname(rawBoardPath);
-
-    if (!parsedParams && pathname.startsWith('/b/')) {
-      const parts = pathname.split('/').filter(Boolean);
-      const boardSlug = seed.boardSlug?.trim() || parts[1] || '';
-      const pathAngle = parts[2] ? Number(parts[2]) : Number.NaN;
-
-      if (!Number.isNaN(pathAngle)) {
-        boardAngle = pathAngle;
-      }
-
-      if (boardSlug) {
-        const board = await resolveBoardBySlug(boardSlug);
-        if (board) {
-          if (boardAngle == null || Number.isNaN(boardAngle)) {
-            boardAngle = board.angle;
-          }
-          parsedParams = boardToRouteParams(board, boardAngle ?? board.angle);
-        }
-      }
-    }
-
-    if (!parsedParams) {
-      const parts = pathname.split('/').filter(Boolean);
-      if (parts.length >= 4) {
-        const maybeAngle = parts[4] ? Number(parts[4]) : Number.NaN;
-        if (!Number.isNaN(maybeAngle)) {
-          boardAngle = maybeAngle;
-        }
-
-        parsedParams = await parseBoardRouteParamsWithSlugs({
-          board_name: parts[0],
-          layout_id: parts[1],
-          size_id: parts[2],
-          set_ids: parts[3],
-          angle: String(boardAngle ?? 0),
-        });
-      }
-    }
-
-    if (!parsedParams) {
-      return null;
-    }
-
-    const boardDetails = getBoardDetailsForBoard(parsedParams);
-    return {
-      boardLabel: formatBoardLabel(boardDetails),
-      boardAngle: boardAngle != null && !Number.isNaN(boardAngle) ? boardAngle : null,
-      boardPreviewPath: buildBoardRenderUrl(boardDetails, '', {
-        thumbnail: true,
-        includeBackground: true,
-        format: 'png',
-      }),
-    };
-  } catch {
-    return null;
-  }
+  const parsed = parseBoardPath(boardPath);
+  return parsed ? { boardType: parsed.boardName, angle: parsed.angle } : null;
 }
 
 export const getSessionOgSummary = cache(async (sessionId: string): Promise<SessionOgSummary> => {
-  const partySessionResult = await executeRows<{
-    name: string | null;
-    leader_name: string | null;
-    version_at: string | Date | null;
-    board_path: string | null;
-    board_slug: string | null;
-    board_angle: number | null;
-    board_type: string | null;
-    layout_id: number | null;
-    size_id: number | null;
-    set_ids: string | null;
+  const empty: SessionOgSummary = {
+    sessionType: null,
+    sessionName: 'Climbing Session',
+    leaderName: null,
+    participantNames: [],
+    participantCount: 0,
+    totalSends: 0,
+    gradeRows: [],
+    boardLabel: null,
+    boardAngle: null,
+    boardPreviewPath: null,
+    version: buildOgVersionToken(null),
+    found: false,
+    isLive: false,
+    inviteName: null,
+    liveBoard: null,
+    tickCount: 0,
+    totalFlashes: 0,
+    durationMinutes: null,
+    recapParticipants: [],
+    boardTypes: [],
+    hardestSend: null,
+    hardestAttempt: null,
+  };
+  const { sessionDetail, session } = await executeGraphQLInternal<{
+    sessionDetail: {
+      sessionName: string | null;
+      totalSends: number;
+      totalFlashes: number;
+      durationMinutes: number | null;
+      lastTickAt: string;
+      boardTypes: string[];
+      gradeDistribution: Array<{ grade: string; flash: number; send: number }>;
+      participants: Array<{ displayName: string | null }>;
+      ticks: SessionTickRead[];
+    } | null;
+    session: {
+      name: string | null;
+      startedAt: string | null;
+      boardPath: string | null;
+      users: Array<{ userId: string | null; username: string; isLeader: boolean }>;
+    } | null;
   }>(
-    dbz,
-    drizzleSql`
-    SELECT
-      bs.name,
-      COALESCE(
-        NULLIF(TRIM(creator_profile.display_name), ''),
-        NULLIF(TRIM(creator_user.name), '')
-      ) AS leader_name,
-      bs.board_path,
-      ub.slug AS board_slug,
-      ub.angle AS board_angle,
-      ub.board_type,
-      ub.layout_id,
-      ub.size_id,
-      ub.set_ids,
-      GREATEST(
-        COALESCE(bs.last_activity, to_timestamp(0)),
-        COALESCE((SELECT MAX(bt.updated_at) FROM boardsesh_ticks bt WHERE bt.session_id = ${sessionId}), to_timestamp(0))
-      ) AS version_at
-    FROM board_sessions bs
-    LEFT JOIN users creator_user ON creator_user.id = bs.created_by_user_id
-    LEFT JOIN user_profiles creator_profile ON creator_profile.user_id = bs.created_by_user_id
-    LEFT JOIN user_boards ub ON ub.id = bs.board_id
-    WHERE bs.id = ${sessionId}
-    LIMIT 1
-  `,
+    `query SessionPreview($sessionId: ID!) {
+    sessionDetail(sessionId: $sessionId) {
+      sessionName totalSends totalFlashes durationMinutes lastTickAt boardTypes
+      gradeDistribution { grade flash send }
+      participants { displayName }
+      ticks { boardType angle status difficulty difficultyName }
+    }
+    session(sessionId: $sessionId) { name startedAt boardPath users { userId username isLeader } }
+  }`,
+    { sessionId },
   );
-
-  const sessionRow = partySessionResult[0];
-
-  if (!sessionRow) {
-    return {
-      sessionType: null,
-      sessionName: 'Climbing Session',
-      leaderName: null,
-      participantNames: [],
-      participantCount: 0,
-      totalSends: 0,
-      gradeRows: [],
-      boardLabel: null,
-      boardAngle: null,
-      boardPreviewPath: null,
-      version: buildOgVersionToken(null),
-      found: false,
-    };
-  }
-
-  const tickWhereClause = drizzleSql`bt.session_id = ${sessionId}`;
-
-  const [participantCountResult, participantResult, totalSendsResult, gradeResult, boardInfo] = await Promise.all([
-    executeRows<{
-      participant_count: number;
-    }>(
-      dbz,
-      drizzleSql`
-      SELECT COUNT(DISTINCT bt.user_id)::int as participant_count
-      FROM boardsesh_ticks bt
-      WHERE ${tickWhereClause}
-    `,
-    ),
-    executeRows<{
-      display_name: string;
-    }>(
-      dbz,
-      drizzleSql`
-      SELECT DISTINCT
-        COALESCE(up.display_name, u.name, 'Climber') as display_name
-      FROM boardsesh_ticks bt
-      JOIN users u ON u.id = bt.user_id
-      LEFT JOIN user_profiles up ON up.user_id = bt.user_id
-      WHERE ${tickWhereClause}
-      LIMIT 6
-    `,
-    ),
-    executeRows<{
-      total_sends: number;
-    }>(
-      dbz,
-      drizzleSql`
-      SELECT COUNT(*)::int as total_sends
-      FROM boardsesh_ticks bt
-      WHERE ${tickWhereClause}
-        AND bt.status IN ('flash', 'send')
-    `,
-    ),
-    executeRows<{
-      difficulty: number;
-      cnt: number;
-    }>(
-      dbz,
-      drizzleSql`
-      SELECT
-        COALESCE(bt.difficulty, ROUND(bcs.display_difficulty)::int) as difficulty,
-        COUNT(*) as cnt
-      FROM boardsesh_ticks bt
-      LEFT JOIN board_climb_stats bcs
-        ON bcs.climb_uuid = bt.climb_uuid
-        AND bcs.board_type = bt.board_type
-        AND bcs.angle = bt.angle
-      WHERE ${tickWhereClause}
-        AND bt.status IN ('flash', 'send')
-        AND COALESCE(bt.difficulty, ROUND(bcs.display_difficulty)::int) IS NOT NULL
-      GROUP BY COALESCE(bt.difficulty, ROUND(bcs.display_difficulty)::int)
-      ORDER BY COALESCE(bt.difficulty, ROUND(bcs.display_difficulty)::int)
-    `,
-    ),
-    resolveSessionBoardInfo({
-      boardPath: sessionRow.board_path,
-      boardSlug: sessionRow.board_slug,
-      boardAngle: sessionRow.board_angle != null ? Number(sessionRow.board_angle) : null,
-      boardType: sessionRow.board_type,
-      layoutId: sessionRow.layout_id != null ? Number(sessionRow.layout_id) : null,
-      sizeId: sessionRow.size_id != null ? Number(sessionRow.size_id) : null,
-      setIds: sessionRow.set_ids,
-    }),
-  ]);
-
-  const gradeRows = gradeResult.map((row) => ({
-    difficulty: Number(row.difficulty),
-    count: Number(row.cnt),
-  }));
-
+  if (!sessionDetail && !session) return empty;
+  const participantNames = sessionDetail
+    ? sessionDetail.participants.flatMap((participant) => (participant.displayName ? [participant.displayName] : []))
+    : (session?.users ?? []).flatMap((participant) => (participant.userId ? [participant.username] : []));
+  const gradeRows = (sessionDetail?.gradeDistribution ?? []).flatMap((row) => {
+    const grade = BOULDER_GRADES.find(
+      (candidate) =>
+        candidate.difficulty_name.toLowerCase() === row.grade.toLowerCase() ||
+        candidate.font_grade.toLowerCase() === row.grade.split('/')[0].toLowerCase(),
+    );
+    return grade && row.flash + row.send > 0 ? [{ difficulty: grade.difficulty_id, count: row.flash + row.send }] : [];
+  });
+  // The anonymous projection blanks `userId` for a climber who stays unnamed.
+  const nameableUsers = (session?.users ?? []).filter((user) => user.userId && user.username.trim());
+  const ticks = sessionDetail?.ticks ?? [];
+  // The board is a nicety on the invite's words. A failed lookup costs the board,
+  // never the session: it must not turn a real session into "not found".
+  const liveBoard = session ? await resolveLiveBoard(session.boardPath).catch(() => null) : null;
   return {
+    ...empty,
     sessionType: 'party',
-    sessionName: sessionRow.name || 'Climbing Session',
-    leaderName: sessionRow.leader_name || null,
-    participantNames: participantResult.map((row) => row.display_name),
-    participantCount: Number(participantCountResult[0]?.participant_count || 0),
-    totalSends: Number(totalSendsResult[0]?.total_sends || 0),
-    gradeRows,
-    boardLabel: boardInfo?.boardLabel || null,
-    boardAngle: boardInfo?.boardAngle ?? null,
-    boardPreviewPath: boardInfo?.boardPreviewPath || null,
-    version: buildOgVersionToken(sessionRow.version_at),
     found: true,
+    sessionName: sessionDetail?.sessionName || session?.name || empty.sessionName,
+    leaderName: session?.users.find((participant) => participant.userId && participant.isLeader)?.username ?? null,
+    participantNames,
+    participantCount: Math.max(sessionDetail?.participants.length ?? 0, session?.users.length ?? 0),
+    totalSends: sessionDetail?.totalSends ?? 0,
+    gradeRows,
+    boardLabel: sessionDetail?.boardTypes.map(formatBoardDisplayName).join(', ') || null,
+    version: buildOgVersionToken(sessionDetail?.lastTickAt ?? session?.startedAt ?? null),
+    isLive: !!session,
+    inviteName: (nameableUsers.find((user) => user.isLeader) ?? nameableUsers[0])?.username.trim() ?? null,
+    liveBoard,
+    tickCount: ticks.length,
+    totalFlashes: sessionDetail?.totalFlashes ?? 0,
+    durationMinutes: sessionDetail?.durationMinutes ?? null,
+    recapParticipants: (sessionDetail?.participants ?? []).map((participant) => ({
+      name: participant.displayName?.trim() || null,
+    })),
+    boardTypes: sessionDetail?.boardTypes ?? [],
+    hardestSend: pickHardestTick(ticks.filter((tick) => SEND_STATUSES.has(tick.status))),
+    hardestAttempt: pickHardestTick(ticks),
   };
 });
 
@@ -490,51 +357,51 @@ export type PlaylistOgSummary = {
   icon: string | null;
   isPublic: boolean;
   boardType: string;
+  /**
+   * For a public list, the climbs a stranger can open (`playlistClimbs.totalCount`):
+   * the number the card prints. `Playlist.climbCount` also counts drafts and
+   * hidden spray climbs, and is what a private list carries.
+   */
   climbCount: number;
+  /** The 10th and 90th percentile grades, or null when too few climbs carry one. */
+  gradeSummary: { p10Difficulty: number; p90Difficulty: number } | null;
   version: string;
 };
 
 export const getPlaylistOgSummary = cache(async (playlistUuid: string): Promise<PlaylistOgSummary | null> => {
-  const rawSql = getReadPool();
-  const rows = rowsFromResult<{
-    name: string | null;
-    description: string | null;
-    color: string | null;
-    icon: string | null;
-    is_public: boolean;
-    board_type: string;
-    climb_count: number;
-    version_at: string | Date | null;
+  const { playlist } = await executeGraphQLInternal<{
+    playlist:
+      | (Omit<PlaylistOgSummary, 'version' | 'gradeSummary'> & {
+          updatedAt: string;
+          gradeSummary: { p10Difficulty: number; p90Difficulty: number } | null;
+        })
+      | null;
   }>(
-    await rawSql`
-    SELECT
-      p.name,
-      p.description,
-      p.color,
-      p.icon,
-      p.is_public,
-      p.board_type,
-      p.updated_at AS version_at,
-      COALESCE((SELECT COUNT(*)::int FROM playlist_climbs pc WHERE pc.playlist_id = p.id), 0) as climb_count
-    FROM playlists p
-    WHERE p.uuid = ${playlistUuid}
-    LIMIT 1
-  `,
+    `
+    query PlaylistPreview($playlistId: ID!) {
+      playlist(playlistId: $playlistId) {
+        name description color icon isPublic boardType climbCount updatedAt
+        gradeSummary { p10Difficulty p90Difficulty }
+      }
+    }`,
+    { playlistId: playlistUuid },
   );
+  if (!playlist) return null;
+  const { updatedAt, gradeSummary, ...rest } = playlist;
+  // A private list is never advertised, so its climbs are not read at all.
+  if (!playlist.isPublic) return { ...rest, gradeSummary: null, version: buildOgVersionToken(updatedAt) };
 
-  const row = rows[0];
-  if (!row) {
-    return null;
-  }
-
+  const { playlistClimbs } = await executeGraphQLInternal<{ playlistClimbs: { totalCount: number } }>(
+    `query PlaylistPreviewCount($input: GetPlaylistClimbsInput!) {
+      playlistClimbs(input: $input) { totalCount }
+    }`,
+    { input: { playlistId: playlistUuid, page: 0, pageSize: 1 } },
+  );
   return {
-    name: row.name || 'Playlist',
-    description: row.description,
-    color: row.color,
-    icon: row.icon,
-    isPublic: row.is_public,
-    boardType: row.board_type,
-    climbCount: Number(row.climb_count),
-    version: buildOgVersionToken(row.version_at),
+    ...rest,
+    climbCount: playlistClimbs.totalCount,
+    gradeSummary,
+    // The band's daily refresh does not touch `updatedAt`, so it is in the token.
+    version: buildOgContentVersion(updatedAt, gradeSummary, playlistClimbs.totalCount),
   };
 });

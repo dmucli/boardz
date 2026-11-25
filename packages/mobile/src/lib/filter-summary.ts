@@ -3,14 +3,38 @@ import type { Grade } from '@boardsesh/shared-schema';
 import { getBaseFilterParts, formatFilterSummary } from '@boardsesh/climb-filters';
 import { DEFAULT_FILTERS, type ClimbFilters } from './climb-filter-types';
 import { buildFilterLabels, buildSortLabel, formatSettersLabel } from './filter-labels';
+import { gradeBoundLabels, type NamedGradeStop } from './grade-stops';
 
 export function getFilterSummary(
   filters: ClimbFilters,
   searchText: string,
   grades: Grade[] | undefined,
   t: TFunction<'climbs'>,
+  /**
+   * The range rail's stops (`buildGradeRailStops`). Given, the grade bound is
+   * named as the rail's chips name it (`gradeBoundLabels`): a pick of a grouped
+   * stop reads "V0" and not "4a/V0–4c/V0", and a bound that covers only part of
+   * a group names its grade precisely. Without them a grade keeps its raw scale
+   * name.
+   */
+  gradeStops?: readonly NamedGradeStop[],
 ): string {
   const baseLabels = buildFilterLabels(t);
+  // `getBaseFilterParts` names a bound end by looking its grade up by id, so
+  // the two ends' grades are renamed here. With both ends on one id the two rail
+  // labels are the same by construction.
+  const railLabels =
+    grades && gradeStops
+      ? gradeBoundLabels(gradeStops, { minGradeId: filters.minGrade, maxGradeId: filters.maxGrade })
+      : undefined;
+  const namedGrades =
+    grades && railLabels
+      ? grades.map((grade) => {
+          if (grade.difficultyId === filters.minGrade && railLabels.min) return { ...grade, name: railLabels.min };
+          if (grade.difficultyId === filters.maxGrade && railLabels.max) return { ...grade, name: railLabels.max };
+          return grade;
+        })
+      : grades;
   const labels = {
     ...baseLabels,
     setters: (count: number) =>
@@ -46,8 +70,9 @@ export function getFilterSummary(
       // minimums become indistinguishable pills.
       minUserRating: filters.minUserRating,
       onlyRatedByMe: filters.onlyRatedByMe,
+      onlyFavorited: filters.onlyFavorited,
     },
-    grades ?? [],
+    namedGrades ?? [],
     labels,
     buildSortLabel(t),
   );

@@ -1,3 +1,4 @@
+import { offlineWriteFetch } from '../../../offline/offline-write-transport';
 import { useQuery, useMutation, useQueryClient, keepPreviousData, onlineManager } from '@tanstack/react-query';
 import type {
   BoardName,
@@ -31,13 +32,11 @@ import {
   type UpdateSessionVariables,
   type UpdateSessionResponse,
 } from '@boardsesh/graphql/operations';
-import {
-  GET_FAVORITES,
-  type FavoritesQueryVariables,
-  type FavoritesQueryResponse,
-} from '@boardsesh/graphql/operations/favorites';
+import { retireGymReportingReceiptsForGym } from '@boardsesh/graphql';
+import { GET_FAVORITES, type FavoritesQueryResponse } from '@boardsesh/graphql/operations/favorites';
 import { getGradesForBoard, toBoardName } from '@boardsesh/board-config';
 import { useBoardAdapter } from '@boardsesh/board-react';
+import { getSprayWall } from '../../spray/spray-wall-registry';
 import {
   myBoardsQueryKey,
   GYM_BOARDS_QUERY_KEY,
@@ -45,20 +44,25 @@ import {
   SEARCH_CLIMBS_QUERY_KEY,
   INFINITE_SEARCH_CLIMBS_QUERY_KEY,
   SEARCH_CLIMBS_COUNT_QUERY_KEY,
+  sessionSummaryQueryKey,
 } from '../query-keys';
 import { getDatabaseHandle } from '../../../db';
 import { offlineAwareRequest } from '../offline-request';
+import { searchClimbsCountQueryKey } from './search-climbs-count-query';
 import { useOfflineDownloadsEnabled } from '../../../providers/feature-flags-provider';
 import { favoritesStore } from '@boardsesh/climb-actions';
-import { favoriteToggleOrder, ownsFavoriteWrite } from './favorite-toggle-order';
+import { FavoriteToggleOrder, favoriteToggleOrder, ownsFavoriteWrite } from './favorite-toggle-order';
+import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { track } from '../../analytics';
 import { addFavoriteLocal, removeFavoriteLocal } from '../../../hooks/use-offline-mutations';
 import type { GraphQLFetch } from '@boardsesh/offline-sync';
-import { drainMutationQueue } from '../../../offline/offline-sync-adapter';
 import {
-  DELETE_DRAFT_CLIMB_MUTATION,
-  type DeleteDraftClimbMutationVariables,
-  type DeleteDraftClimbMutationResponse,
-} from '@boardsesh/graphql/operations/new-climb-feed';
+  LIKED_LIST_QUERY_KEY_PREFIX,
+  SMART_PLAYLIST_COUNTS_QUERY_KEY,
+  removeClimbFromLikedList,
+  restoreClimbToLikedList,
+} from '@boardsesh/playlists-react';
+import { drainMutationQueue } from '../../../offline/offline-sync-adapter';
 import {
   SEARCH_GYMS,
   GET_GYM,
@@ -69,11 +73,13 @@ import {
   REVOKE_GYM_WRITE_ACCESS,
   REQUEST_GYM_CLAIM,
   LINK_BOARD_TO_GYM,
+  DETACH_BOARD_FROM_GYM,
   type SearchGymsQueryResponse,
   type GetGymQueryResponse,
   type GetMyGymsQueryResponse,
   type UpdateGymMutationResponse,
   type LinkBoardToGymMutationResponse,
+  type DetachBoardFromGymMutationResponse,
   type GetGymMembersQueryResponse,
   type GrantGymWriteAccessMutationResponse,
   type RevokeGymWriteAccessMutationResponse,
@@ -100,20 +106,18 @@ import {
 import { UPDATE_SPRAY_WALL } from '@boardsesh/graphql/operations/spray-walls';
 import type { SprayWall, UpdateSprayWallInput } from '@boardsesh/graphql/generated/graphql';
 import { getHttpClient } from '../client';
+import { invalidateSprayWallRenderData } from '../../spray/spray-wall-loader';
+import { requestSearchBoards, shouldRetryBoardSearch, boardSearchRetryDelay } from '../search-boards-request';
 import { useStoredUserId } from '../../../hooks/use-current-user-id';
 import { withHoldOutlineOverride, withoutHoldOutlineOverride } from './hold-outline-cache';
 import { useGradeSourceSearchInput } from './search-grade-source';
-import {
-  matchesAdvertisedType,
-  sharedAdvertisedBoardType,
-  type AdvertisedBoardTypes,
-} from '../../ble/advertised-board-type';
+import type { AdvertisedBoardTypes } from '../../ble/advertised-board-type';
+import { fetchBoardsForObservedSerials } from '../../ble/observed-board-matches';
 import {
   GET_PROFILE,
   UPDATE_PROFILE,
   GET_MY_BOARDS,
   GET_BOARD,
-  SEARCH_BOARDS,
   GET_BOARDS_BY_SERIAL_NUMBERS,
   GET_POPULAR_BOARD_CONFIGS,
   CREATE_BOARD,
@@ -123,6 +127,7 @@ import {
   SEARCH_CLIMBS,
   SEARCH_CLIMBS_COUNT,
   GET_CLIMB,
+  GET_SPRAY_CLIMB,
   type SearchClimbsQueryResponse,
   type SearchClimbsCountQueryResponse,
   type GetClimbQueryResponse,
@@ -134,7 +139,6 @@ import {
   type UpdateProfileMutationResponse,
   type GetMyBoardsQueryResponse,
   type GetBoardQueryResponse,
-  type SearchBoardsQueryResponse,
   type GetBoardsBySerialNumbersQueryResponse,
   type GetPopularBoardConfigsQueryResponse,
   type CreateBoardMutationResponse,
@@ -158,12 +162,101 @@ import {
   type DeleteHoldOutlineOverrideMutationResponse,
 } from '../operations';
 
-type ToggleFavoriteVariables = ToggleFavoriteMutationVariables & {
-  currentlyFavorited?: boolean;
+/** What a heart's FavoriteToggle event says beside the climb and the direction. */
+export type FavoriteToggleTracking = {
+  analyticsContext?: import('@boardsesh/analytics').AnalyticsEventProperties;
+  source: string;
+  layoutId: number;
+  /** This phone holds the board's link. */
+  connected: boolean;
 };
 
+type ToggleFavoriteVariables = ToggleFavoriteMutationVariables & {
+  currentlyFavorited?: boolean;
+  /**
+   * Track the tap as FavoriteToggle. The toggle tracks it, not the caller, so
+   * the event names the direction the toggle really went (see
+   * `withCurrentFavorite`).
+   */
+  tracking?: FavoriteToggleTracking;
+};
+
+/** The per-climb heart's cache key: the backend keys a favourite on (board, climb, angle). */
+function favoriteStatusQueryKey(input: ToggleFavoriteVariables['input']) {
+  return ['favoriteStatus', input.boardName, input.climbUuid, input.angle] as const;
+}
+
+/**
+ * The newest toggle per heart cache entry: the climb at one board and angle.
+ * Separate from `favoriteToggleOrder`, which orders the per-climb list store: a
+ * toggle at 25° must not lose the 40° heart's rollback, nor take it over.
+ */
+const favoriteStatusToggleOrder = new FavoriteToggleOrder();
+
+function favoriteStatusOrderKey(input: ToggleFavoriteVariables['input']): string {
+  return JSON.stringify(favoriteStatusQueryKey(input));
+}
+
+/**
+ * Each toggle's place in `favoriteStatusToggleOrder`, for the one step that
+ * runs without the `onMutate` context: the local write in `mutationFn`. React
+ * Query hands both the same variables object.
+ */
+const favoriteStatusTokens = new WeakMap<ToggleFavoriteVariables, number>();
+
+/**
+ * How many toggles on each heart are still out. Only the newest one writes the
+ * server's answer, but answers can come back in either order: when the older
+ * tap lands last, the newest answer is stale. So the heart re-reads the server
+ * once the last toggle on it settles, whichever that was.
+ */
+const favoriteStatusTogglesInFlight = new Map<string, number>();
+
+function noteFavoriteStatusToggleStarted(orderKey: string): void {
+  favoriteStatusTogglesInFlight.set(orderKey, (favoriteStatusTogglesInFlight.get(orderKey) ?? 0) + 1);
+}
+
+/** True when this was the last toggle still out on the heart. */
+function noteFavoriteStatusToggleSettled(orderKey: string): boolean {
+  const remaining = (favoriteStatusTogglesInFlight.get(orderKey) ?? 1) - 1;
+  if (remaining > 0) {
+    favoriteStatusTogglesInFlight.set(orderKey, remaining);
+    return false;
+  }
+  favoriteStatusTogglesInFlight.delete(orderKey);
+  return true;
+}
+
+function isNewestFavoriteStatusToggle(variables: ToggleFavoriteVariables, token: number | undefined): boolean {
+  return token !== undefined && favoriteStatusToggleOrder.isLatest(favoriteStatusOrderKey(variables.input), token);
+}
+
+/**
+ * What the climb's heart shows right now, read straight from its cache entry:
+ * every toggle writes the entry the moment it is tapped, so this is already a
+ * second tap's truth while the screens are still drawing the first. `undefined`
+ * while nothing has read or written it.
+ */
+function readFavoriteStatusCache(
+  queryClient: ReturnType<typeof useQueryClient>,
+  input: ToggleFavoriteVariables['input'],
+): boolean | undefined {
+  return queryClient
+    .getQueryData<FavoritesQueryResponse>(favoriteStatusQueryKey(input))
+    ?.favorites.includes(input.climbUuid);
+}
+
+/** Pins the per-climb heart. The cached shape is the RAW GET_FAVORITES response (select runs on read). */
+function setFavoriteStatusCache(
+  queryClient: ReturnType<typeof useQueryClient>,
+  input: ToggleFavoriteVariables['input'],
+  favorited: boolean,
+) {
+  queryClient.setQueryData(favoriteStatusQueryKey(input), { favorites: favorited ? [input.climbUuid] : [] });
+}
+
 function graphqlFetchFromClient(): GraphQLFetch {
-  return (query, variables) => getHttpClient().request(query, variables);
+  return offlineWriteFetch;
 }
 
 function scheduleDrain(
@@ -239,12 +332,18 @@ export function useMyBoards(input?: MyBoardsInput, options?: { enabled?: boolean
   });
 }
 
-export function useBoard(boardUuid: string | null) {
+/**
+ * One board by uuid. `staleTime: 0` makes this read refetch on arrival even
+ * when the cache holds a fresh copy: a deep link must not act on a board a
+ * staff removal changed a minute ago.
+ */
+export function useBoard(boardUuid: string | null, options?: { staleTime?: number }) {
   return useQuery({
     queryKey: ['board', boardUuid],
     queryFn: () => getHttpClient().request<GetBoardQueryResponse>(GET_BOARD, { boardUuid }),
     select: (data) => data.board,
     enabled: !!boardUuid,
+    ...(options?.staleTime !== undefined ? { staleTime: options.staleTime } : {}),
   });
 }
 
@@ -257,10 +356,8 @@ export function useBoard(boardUuid: string | null) {
  * merged-away uuid resolves to the surviving canonical board (a *different*
  * uuid) while a plain-deleted board resolves to `null`.
  */
-export async function fetchBoardByUuid(boardUuid: string): Promise<UserBoard | null> {
-  const data = await getHttpClient().request<GetBoardQueryResponse>(GET_BOARD, { boardUuid });
-  return data.board;
-}
+export { useManagedMyGyms } from './use-managed-my-gyms';
+export { fetchBoardByUuid } from './fetch-board-by-uuid';
 
 // `fetchAllMyBoards` — the paginated companion to `fetchBoardByUuid` — lives in
 // its own module rather than here: the walk needs a unit test, and this barrel
@@ -272,6 +369,11 @@ export { fetchAllMyBoards } from './fetch-all-my-boards';
 // `useGymBoards` is split out for that same reason — it has its own suite —
 // and re-exported here so gym callers keep one import path.
 export { useGymBoards } from './use-gym-boards';
+export {
+  useExistingWallCandidates,
+  fetchExistingWallCandidates,
+  EXISTING_WALL_CANDIDATES_QUERY_KEY,
+} from './use-existing-wall-candidates';
 
 /**
  * A single gym by uuid, including the viewer's `canEdit` flag. Backs the
@@ -331,7 +433,9 @@ export function useBoardBySlug(slug: string | null, options?: { enabled?: boolea
 export function useSearchBoards(input: SearchBoardsInput, enabled = true) {
   return useQuery({
     queryKey: ['searchBoards', input],
-    queryFn: () => getHttpClient().request<SearchBoardsQueryResponse>(SEARCH_BOARDS, { input }),
+    queryFn: ({ signal }) => requestSearchBoards(input, signal),
+    retry: shouldRetryBoardSearch,
+    retryDelay: boardSearchRetryDelay,
     select: (data) => data.searchBoards,
     enabled,
   });
@@ -357,9 +461,8 @@ export function fetchBoardsBySerialNumbers(serialNumbers: string[]): Promise<Use
  * carries the number — which is how an in-range Tension controller could be
  * offered as a stranger's Kilter board, and made active.
  *
- * The `boardType` argument only narrows the request (and a mixed scan can't use
- * it at all); the per-serial `matchesAdvertisedType` filter below is what
- * actually enforces the rule.
+ * Correlate typed BLE observations through a batch wrapper because stored
+ * serial fields are owner-only. Untyped form lookups retain the legacy query.
  */
 export function useBoardsBySerialNumbers(serialNumbers: string[], advertisedTypes: AdvertisedBoardTypes = new Map()) {
   // Sorted entries, not the map, so the key hashes stably across renders while
@@ -371,25 +474,9 @@ export function useBoardsBySerialNumbers(serialNumbers: string[], advertisedType
     () => [...advertisedTypes].sort(([first], [second]) => first.localeCompare(second)),
     [advertisedTypes],
   );
-  const boardType = useMemo(() => sharedAdvertisedBoardType(advertisedTypes), [advertisedTypes]);
   return useQuery({
     queryKey: ['boardsBySerialNumbers', serialNumbers, advertisedTypeEntries],
-    queryFn: () =>
-      getHttpClient().request<GetBoardsBySerialNumbersQueryResponse>(GET_BOARDS_BY_SERIAL_NUMBERS, {
-        serialNumbers,
-        boardType,
-      }),
-    // Memoized on `advertisedTypes` so the dependency is explicit: `select`
-    // re-runs when its own reference changes, so an unmemoized closure would
-    // re-filter the cached response whenever a caller handed over a new Map with
-    // the same contents.
-    select: useCallback(
-      (data: GetBoardsBySerialNumbersQueryResponse) =>
-        data.boardsBySerialNumbers.filter((board) =>
-          board.serialNumber ? matchesAdvertisedType(board.serialNumber, board.boardType, advertisedTypes) : true,
-        ),
-      [advertisedTypes],
-    ),
+    queryFn: () => fetchBoardsForObservedSerials(serialNumbers, advertisedTypes),
     enabled: serialNumbers.length > 0,
   });
 }
@@ -443,9 +530,9 @@ export function useNearbyBoards(
       layoutFilter ?? null,
       sizeFilter ?? null,
     ],
-    queryFn: () =>
-      getHttpClient().request<SearchBoardsQueryResponse>(SEARCH_BOARDS, {
-        input: {
+    queryFn: ({ signal }) =>
+      requestSearchBoards(
+        {
           latitude: coords?.latitude,
           longitude: coords?.longitude,
           radiusKm,
@@ -455,7 +542,10 @@ export function useNearbyBoards(
           layoutIds: layoutFilter,
           sizeIds: sizeFilter,
         },
-      }),
+        signal,
+      ),
+    retry: shouldRetryBoardSearch,
+    retryDelay: boardSearchRetryDelay,
     select: (data) => data.searchBoards,
     enabled: coords !== null,
     // Keep the previous boards visible while a new center/filter loads so the
@@ -497,18 +587,22 @@ export function useNearbyGyms(
       sizeFilter ?? null,
       multiBoardTypeFilter ?? null,
     ],
-    queryFn: () =>
-      getHttpClient().request<SearchGymsQueryResponse>(SEARCH_GYMS, {
-        input: {
-          latitude: coords?.latitude,
-          longitude: coords?.longitude,
-          radiusKm,
-          limit: 50,
-          query: nameFilter,
-          boardTypes: typeFilter,
-          layoutIds: layoutFilter,
-          sizeIds: sizeFilter,
-          multiBoardTypeOnly: multiBoardTypeFilter,
+    queryFn: ({ signal }) =>
+      getHttpClient().request<SearchGymsQueryResponse>({
+        document: SEARCH_GYMS,
+        signal,
+        variables: {
+          input: {
+            latitude: coords?.latitude,
+            longitude: coords?.longitude,
+            radiusKm,
+            limit: 50,
+            query: nameFilter,
+            boardTypes: typeFilter,
+            layoutIds: layoutFilter,
+            sizeIds: sizeFilter,
+            multiBoardTypeOnly: multiBoardTypeFilter,
+          },
         },
       }),
     select: (data) => data.searchGyms,
@@ -530,8 +624,10 @@ export function useCreateBoard() {
       return response.createBoard;
     },
     onSuccess: () => {
-      // A freshly created board should appear in the user's board list.
+      // A freshly created board should appear in the user's board list, and in
+      // its gym's wall list the next time someone looks for it there.
       void queryClient.invalidateQueries({ queryKey: ['myBoards'] });
+      void queryClient.invalidateQueries({ queryKey: ['existingWallCandidates'] });
     },
   });
 }
@@ -558,6 +654,7 @@ export function useUpdateBoard() {
       void queryClient.invalidateQueries({ queryKey: ['board', updated.uuid] });
       void queryClient.invalidateQueries({ queryKey: ['nearbyBoards'] });
       void queryClient.invalidateQueries({ queryKey: ['searchBoards'] });
+      void queryClient.invalidateQueries({ queryKey: GYM_BOARDS_QUERY_KEY });
     },
   });
 }
@@ -590,8 +687,13 @@ export function useUpdateSprayWall() {
       void queryClient.invalidateQueries({ queryKey: ['board', updated.uuid] });
       void queryClient.invalidateQueries({ queryKey: ['nearbyBoards'] });
       void queryClient.invalidateQueries({ queryKey: ['searchBoards'] });
-      void queryClient.invalidateQueries({ queryKey: ['sprayWall', updated.uuid] });
+      void queryClient.invalidateQueries({ queryKey: GYM_BOARDS_QUERY_KEY });
       void queryClient.invalidateQueries({ queryKey: ['sprayWallByLayout', updated.layoutId] });
+      // The registered wall carries the slug and visibility Share reads
+      // (`RegisteredSprayWall.share`), filled from the render payload. Without
+      // this a public -> private flip kept handing out the public link and
+      // warming its card until the registry's 10-minute revalidation.
+      void invalidateSprayWallRenderData(queryClient, updated.uuid, updated.layoutId).catch(() => {});
     },
   });
 }
@@ -613,6 +715,7 @@ export function useUpdateGym() {
     },
     onSuccess: (updated) => {
       void queryClient.invalidateQueries({ queryKey: ['gym', updated.uuid] });
+      void queryClient.invalidateQueries({ queryKey: ['gymBySlug'] });
       void queryClient.invalidateQueries({ queryKey: ['nearbyGyms'] });
       void queryClient.invalidateQueries({ queryKey: ['nearbyBoards'] });
       void queryClient.invalidateQueries({ queryKey: ['myBoards'] });
@@ -639,6 +742,34 @@ export function useLinkBoardToGym() {
       void queryClient.invalidateQueries({ queryKey: ['myBoards'] });
       void queryClient.invalidateQueries({ queryKey: ['nearbyBoards'] });
       void queryClient.invalidateQueries({ queryKey: ['nearbyGyms'] });
+      void queryClient.invalidateQueries({ queryKey: GYM_BOARDS_QUERY_KEY });
+    },
+  });
+}
+
+/**
+ * Gym staff taking a board someone else added off their gym's listing. The
+ * board stays with its creator; the server also holds it off this gym, so the
+ * creator can't link it straight back. The board's own creator removes it with
+ * `useLinkBoardToGym` and a null gym instead. A synced board is refused with
+ * `SYSTEM_BOARD_DELETE_INSTEAD` (see `isSystemBoardDeleteInsteadError`).
+ */
+export function useDetachBoardFromGym() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (input: { boardUuid: string; gymUuid: string }) => {
+      const response = await getHttpClient().request<DetachBoardFromGymMutationResponse>(DETACH_BOARD_FROM_GYM, {
+        input,
+      });
+      return response.detachBoardFromGym;
+    },
+    onSuccess: (removed, variables) => {
+      if (removed) void retireGymReportingReceiptsForGym(queryClient, variables.gymUuid);
+      void queryClient.invalidateQueries({ queryKey: ['board', variables.boardUuid] });
+      void queryClient.invalidateQueries({ queryKey: ['myBoards'] });
+      void queryClient.invalidateQueries({ queryKey: ['nearbyBoards'] });
+      void queryClient.invalidateQueries({ queryKey: ['nearbyGyms'] });
+      void queryClient.invalidateQueries({ queryKey: ['gym', variables.gymUuid] });
       void queryClient.invalidateQueries({ queryKey: GYM_BOARDS_QUERY_KEY });
     },
   });
@@ -723,6 +854,9 @@ export function useRequestGymClaim() {
       if (result.status !== 'approved') return;
       void queryClient.invalidateQueries({ queryKey: ['gym', input.gymUuid] });
       void queryClient.invalidateQueries({ queryKey: ['gymMembers', input.gymUuid] });
+      // The new owner's board roster carries staff-only actions the cached
+      // 5-minute copy was read without.
+      void queryClient.invalidateQueries({ queryKey: GYM_BOARDS_QUERY_KEY });
       void queryClient.invalidateQueries({ queryKey: ['myGyms'] });
       void queryClient.invalidateQueries({ queryKey: ['nearbyGyms'] });
     },
@@ -780,6 +914,8 @@ export function useFollowBoard(options?: {
     },
     onSuccess: (_followed, board) => {
       void queryClient.invalidateQueries({ queryKey: ['myBoards'] });
+      // A gym's wall list badges the walls the climber follows.
+      void queryClient.invalidateQueries({ queryKey: ['existingWallCandidates'] });
       options?.onFollowed?.(board);
     },
     // Config-level (survives unmount, like onSuccess). A rejected follow otherwise
@@ -949,7 +1085,8 @@ export function useSearchClimbs(
     queryFn: () => offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input }),
     select: (data) => data.searchClimbs,
     enabled: enabled && (!input.onlyFollowedAuthors || !!userId),
-    networkMode: input.onlyFollowedAuthors ? 'always' : undefined,
+    // Preserve the provider's offlineFirst default for downloaded-board reads.
+    ...(input.onlyFollowedAuthors ? { networkMode: 'always' as const } : {}),
     // undefined → React Query's defaults.
     staleTime: options?.staleTime,
     gcTime: options?.gcTime,
@@ -961,11 +1098,12 @@ export function useSearchClimbsCount(requestedInput: ClimbSearchInput, enabled =
   const input = useGradeSourceSearchInput(requestedInput);
   const { userId } = useStoredUserId(!!input.onlyFollowedAuthors);
   return useQuery({
-    queryKey: [...SEARCH_CLIMBS_COUNT_QUERY_KEY, input, ...(input.onlyFollowedAuthors ? [userId] : [])],
+    queryKey: searchClimbsCountQueryKey(input, userId),
     queryFn: () => offlineAwareRequest<SearchClimbsCountQueryResponse>(SEARCH_CLIMBS_COUNT, { input }),
     select: (data) => data.searchClimbs.totalCount,
     enabled: enabled && (!input.onlyFollowedAuthors || !!userId),
-    networkMode: input.onlyFollowedAuthors ? 'always' : undefined,
+    // Preserve the provider's offlineFirst default for downloaded-board reads.
+    ...(input.onlyFollowedAuthors ? { networkMode: 'always' as const } : {}),
     // Hold the last count while a new filter set is in flight so the bar /
     // "Show N" button doesn't flicker to blank on every filter change.
     placeholderData: input.onlyFollowedAuthors ? undefined : (previous) => previous,
@@ -979,15 +1117,24 @@ export function useSetterStats(input: SetterStatsInput, enabled = true) {
     queryFn: () => offlineAwareRequest<GetSetterStatsQueryResponse>(GET_SETTER_STATS, { input }),
     select: (data) => data.setterStats,
     enabled: enabled && (!input.onlyFollowedAuthors || !!userId),
-    networkMode: input.onlyFollowedAuthors ? 'always' : undefined,
+    // Preserve the provider's offlineFirst default for downloaded-board reads.
+    ...(input.onlyFollowedAuthors ? { networkMode: 'always' as const } : {}),
     staleTime: 5 * 60 * 1000,
   });
 }
 
 export function useClimb(variables: GetClimbQueryVariables | null) {
+  const scopedVariables =
+    variables?.boardName === 'spray'
+      ? { ...variables, sprayWallUuid: variables.sprayWallUuid ?? getSprayWall(variables.layoutId)?.wallUuid }
+      : variables;
   return useQuery({
-    queryKey: [...CLIMB_QUERY_KEY, variables],
-    queryFn: () => offlineAwareRequest<GetClimbQueryResponse>(GET_CLIMB, variables!),
+    queryKey: [...CLIMB_QUERY_KEY, scopedVariables],
+    queryFn: () =>
+      offlineAwareRequest<GetClimbQueryResponse>(
+        scopedVariables?.boardName === 'spray' ? GET_SPRAY_CLIMB : GET_CLIMB,
+        scopedVariables!,
+      ),
     select: (data) => data.climb,
     enabled: !!variables,
   });
@@ -999,23 +1146,7 @@ export function useClimb(variables: GetClimbQueryVariables | null) {
  * deleted draft disappears from the drafts list (and any climb list) without a
  * manual reload.
  */
-export function useDeleteDraftClimb() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async (variables: DeleteDraftClimbMutationVariables) => {
-      const response = await getHttpClient().request<DeleteDraftClimbMutationResponse>(
-        DELETE_DRAFT_CLIMB_MUTATION,
-        variables,
-      );
-      return response.deleteDraftClimb;
-    },
-    onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: SEARCH_CLIMBS_QUERY_KEY });
-      void queryClient.invalidateQueries({ queryKey: INFINITE_SEARCH_CLIMBS_QUERY_KEY });
-      void queryClient.invalidateQueries({ queryKey: SEARCH_CLIMBS_COUNT_QUERY_KEY });
-    },
-  });
-}
+export { useDeleteDraftClimb } from './use-delete-draft-climb';
 
 // ============================================
 // Session Queries
@@ -1023,7 +1154,7 @@ export function useDeleteDraftClimb() {
 
 export function useSessionSummary(sessionId: string | null) {
   return useQuery({
-    queryKey: ['sessionSummary', sessionId],
+    queryKey: sessionSummaryQueryKey(sessionId),
     queryFn: () =>
       getHttpClient().request<GetSessionSummaryQueryResponse>(GET_SESSION_SUMMARY, {
         sessionId,
@@ -1078,7 +1209,7 @@ export function useUpdateSession() {
     },
     onSuccess: (updated) => {
       void queryClient.invalidateQueries({ queryKey: ['sessionDetail', updated.sessionId] });
-      void queryClient.invalidateQueries({ queryKey: ['sessionSummary', updated.sessionId] });
+      void queryClient.invalidateQueries({ queryKey: sessionSummaryQueryKey(updated.sessionId) });
       void queryClient.invalidateQueries({ queryKey: ['sessionGroupedFeed'] });
       void queryClient.invalidateQueries({ queryKey: ['activityFeed'] });
     },
@@ -1093,7 +1224,7 @@ export function useToggleFavorite() {
   const queryClient = useQueryClient();
   const offlineEnabled = useOfflineDownloadsEnabled();
 
-  return useMutation({
+  const mutation = useMutation({
     mutationFn: async (variables: ToggleFavoriteVariables) => {
       const db = getDatabaseHandle();
       // Local-first only with the offline flag on; otherwise the plain network
@@ -1106,16 +1237,16 @@ export function useToggleFavorite() {
         }
 
         const favorited = !variables.currentlyFavorited;
-        // Pin the per-climb heart optimistically instead of refetching: a
-        // network refetch here races the queued mutation and can cache the
-        // PRE-toggle state for 5 minutes. The drainer invalidates
-        // ['favoriteStatus'] once the queued write actually lands. The cached
-        // shape is the RAW GET_FAVORITES response (select runs on read).
-        queryClient.setQueryData(
-          ['favoriteStatus', variables.input.boardName, variables.input.climbUuid, variables.input.angle],
-          { favorites: favorited ? [variables.input.climbUuid] : [] },
-        );
-
+        // Pin the heart again now the local write is in: an ['favoriteStatus']
+        // invalidation that landed during it (the offline read recovery) would
+        // have read the PRE-toggle row. Only the newest tap on this heart pins
+        // it, so a slow first tap can't land over a second. No network refetch:
+        // it would race the queued mutation. The drainer invalidates
+        // ['favoriteStatus'] once the queued write actually lands.
+        if (isNewestFavoriteStatusToggle(variables, favoriteStatusTokens.get(variables))) {
+          void queryClient.cancelQueries({ queryKey: favoriteStatusQueryKey(variables.input) });
+          setFavoriteStatusCache(queryClient, variables.input, favorited);
+        }
         scheduleDrain(db, queryClient);
 
         return { toggleFavorite: { favorited }, viaLocalQueue: true as const };
@@ -1135,22 +1266,81 @@ export function useToggleFavorite() {
     // heart, whether it succeeded or failed.
     onMutate: (variables) => {
       const token = favoriteToggleOrder.begin(variables.input.climbUuid);
+      const statusToken = favoriteStatusToggleOrder.begin(favoriteStatusOrderKey(variables.input));
+      favoriteStatusTokens.set(variables, statusToken);
+      noteFavoriteStatusToggleStarted(favoriteStatusOrderKey(variables.input));
+      if (variables.tracking && typeof variables.currentlyFavorited === 'boolean') {
+        track(SHARED_EVENTS.FavoriteToggle, {
+          ...variables.tracking.analyticsContext,
+          action: variables.currentlyFavorited ? 'removed' : 'added',
+          climbUuid: variables.input.climbUuid,
+          boardName: variables.input.boardName,
+          layoutId: variables.tracking.layoutId,
+          source: variables.tracking.source,
+          connected: variables.tracking.connected,
+        });
+      }
       // The store is a singleton scoped to one board+angle+user at a time. Note
       // which scope this toggle belongs to so a slow response can't write a 40°
       // result into a store the user has since re-scoped to 25°.
       const contextEpoch = favoritesStore.getContextEpoch();
       if (typeof variables.currentlyFavorited === 'boolean') {
         favoritesStore.setIsFavorited(variables.input.climbUuid, !variables.currentlyFavorited);
+        // Every heart on this climb reads the same cache entry (the player's,
+        // the MiniPlayer's, #6940), so they flip together. A fetch already in
+        // flight would land the pre-toggle state over it.
+        void queryClient.cancelQueries({ queryKey: favoriteStatusQueryKey(variables.input) });
+        setFavoriteStatusCache(queryClient, variables.input, !variables.currentlyFavorited);
       }
-      return { token, contextEpoch };
+      // Un-liking drops the climb from the cached Liked list now, on both the
+      // queued and the online path (#5304). Liking it again puts back the row an
+      // earlier un-like took out, so a re-like from the play drawer shows on the
+      // Liked list underneath without a refetch (or a signal).
+      if (variables.currentlyFavorited === true) {
+        removeClimbFromLikedList(queryClient, variables.input.climbUuid);
+      } else if (variables.currentlyFavorited === false) {
+        restoreClimbToLikedList(queryClient, variables.input.climbUuid);
+      }
+      return { token, contextEpoch, statusToken };
     },
     onError: (_error, variables, context) => {
       if (typeof variables.currentlyFavorited !== 'boolean') return;
-      if (!context || !ownsFavoriteWrite(variables.input.climbUuid, context)) return;
-      favoritesStore.setIsFavorited(variables.input.climbUuid, variables.currentlyFavorited);
+      // The heart's cache entry goes back unless a newer tap on it has moved it since.
+      if (context && isNewestFavoriteStatusToggle(variables, context.statusToken)) {
+        setFavoriteStatusCache(queryClient, variables.input, variables.currentlyFavorited);
+      }
+      // A newer toggle for this climb owns both the list store and the Liked rows.
+      if (!context || !favoriteToggleOrder.isLatest(variables.input.climbUuid, context.token)) return;
+      // The heart store is scoped to one board+angle+user, so only roll it back
+      // while it is still scoped to where this toggle started.
+      if (ownsFavoriteWrite(variables.input.climbUuid, context)) {
+        favoritesStore.setIsFavorited(variables.input.climbUuid, variables.currentlyFavorited);
+      }
+      // Undo onMutate's Liked-list edit from the cache, since a refetch can fail
+      // for the same lost connection that failed the toggle (#5304). A failed
+      // un-like puts the row back; a failed like takes out the row onMutate put
+      // back, and keeps it so a later like can restore it again. This runs even
+      // after a board or angle change: onMutate edited every cached Liked view,
+      // the board-independent one included, so the heart's scope doesn't decide it.
+      if (variables.currentlyFavorited) {
+        restoreClimbToLikedList(queryClient, variables.input.climbUuid);
+      } else {
+        removeClimbFromLikedList(queryClient, variables.input.climbUuid);
+      }
     },
-    onSettled: (_data, _error, variables, context) => {
-      if (context) favoriteToggleOrder.settle(variables.input.climbUuid, context.token);
+    onSettled: (data, _error, variables, context) => {
+      if (!context) return;
+      favoriteToggleOrder.settle(variables.input.climbUuid, context.token);
+      const orderKey = favoriteStatusOrderKey(variables.input);
+      favoriteStatusToggleOrder.settle(orderKey, context.statusToken);
+      // The last toggle out re-reads the heart from the server, so answers that
+      // came back out of order can't leave it wrong for the 5-minute staleTime.
+      // Not on the local-queue path: the server doesn't know about that toggle
+      // yet, and the drainer invalidates once it lands.
+      const lastOut = noteFavoriteStatusToggleSettled(orderKey);
+      if (lastOut && !(data && 'viaLocalQueue' in data)) {
+        void queryClient.invalidateQueries({ queryKey: favoriteStatusQueryKey(variables.input) });
+      }
     },
     onSuccess: (data, variables, context) => {
       // Same ownership test as the rollback above, written the same way round:
@@ -1162,18 +1352,67 @@ export function useToggleFavorite() {
       }
       void queryClient.invalidateQueries({ queryKey: SEARCH_CLIMBS_QUERY_KEY });
       void queryClient.invalidateQueries({ queryKey: INFINITE_SEARCH_CLIMBS_QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: SEARCH_CLIMBS_COUNT_QUERY_KEY });
       // Bust the per-climb favorite-status cache so a re-open reflects the new
       // state from the server, not a stale 5-min-cached value. Skipped on the
       // local-queue path, where the server does not know about the toggle yet —
       // the optimistic setQueryData above holds until the drainer's
       // post-landing invalidation.
       if (!('viaLocalQueue' in data)) {
+        // Only the newest tap on this heart settles it. An older one landing
+        // between two taps would flip it back for a moment, then forward again.
+        // The re-read from the server waits for the last toggle out (onSettled).
+        if (context && isNewestFavoriteStatusToggle(variables, context.statusToken)) {
+          setFavoriteStatusCache(queryClient, variables.input, data.toggleFavorite.favorited);
+        }
+        // The Liked smart list (and its library count) would otherwise keep an
+        // un-liked climb on screen for its 5-minute staleTime (#5304).
+        // When the server confirms an un-like, the cached pages already lost the
+        // climb in onMutate, so the list only needs marking stale (no refetch of
+        // every loaded page, which would eat the shared smartPlaylist rate limit
+        // Play's drain uses). A like adds a climb the cache may never have held,
+        // so an on-screen Liked list refetches to show it.
+        const unlikeConfirmed = variables.currentlyFavorited === true && !data.toggleFavorite.favorited;
         void queryClient.invalidateQueries({
-          queryKey: ['favoriteStatus', variables.input.boardName, variables.input.climbUuid, variables.input.angle],
+          queryKey: LIKED_LIST_QUERY_KEY_PREFIX,
+          refetchType: unlikeConfirmed ? 'none' : 'active',
         });
+        void queryClient.invalidateQueries({ queryKey: [SMART_PLAYLIST_COUNTS_QUERY_KEY] });
       }
     },
   });
+
+  // A caller says which way it is toggling from what it last drew, which can be
+  // a tap behind: the heart's cache entry moves at the tap, but screens redraw
+  // from it a moment later. A second tap in that moment would send the first
+  // tap's starting value and toggle the same way twice. So the entry decides
+  // whenever it has an answer, for every caller (the player's heart, its ⋯ row,
+  // the MiniPlayer's heart). A caller that says nothing keeps the plain server
+  // toggle. `onMutate` runs synchronously inside `mutate` and writes the flip,
+  // so the very next call already reads it.
+  const withCurrentFavorite = useCallback(
+    (variables: ToggleFavoriteVariables): ToggleFavoriteVariables => {
+      if (typeof variables.currentlyFavorited !== 'boolean') return variables;
+      const cached = readFavoriteStatusCache(queryClient, variables.input);
+      return cached === undefined || cached === variables.currentlyFavorited
+        ? variables
+        : { ...variables, currentlyFavorited: cached };
+    },
+    [queryClient],
+  );
+  const { mutate, mutateAsync } = mutation;
+  const mutateFromCurrent = useCallback<typeof mutate>(
+    (variables, options) => mutate(withCurrentFavorite(variables), options),
+    [mutate, withCurrentFavorite],
+  );
+  const mutateAsyncFromCurrent = useCallback<typeof mutateAsync>(
+    (variables, options) => mutateAsync(withCurrentFavorite(variables), options),
+    [mutateAsync, withCurrentFavorite],
+  );
+  return useMemo(
+    () => ({ ...mutation, mutate: mutateFromCurrent, mutateAsync: mutateAsyncFromCurrent }),
+    [mutation, mutateFromCurrent, mutateAsyncFromCurrent],
+  );
 }
 
 /**
@@ -1207,7 +1446,7 @@ export function useFavoriteStatus(
   return useQuery({
     queryKey: ['favoriteStatus', boardName, climbUuid, angle],
     queryFn: () =>
-      getHttpClient().request<FavoritesQueryResponse, FavoritesQueryVariables>(GET_FAVORITES, {
+      offlineAwareRequest<FavoritesQueryResponse>(GET_FAVORITES, {
         boardName,
         climbUuids: [climbUuid!],
         angle,
@@ -1224,37 +1463,23 @@ export function useFavoriteStatus(
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  GET_BETA_LINKS,
   GET_USER_BETA_LINKS,
   ATTACH_BETA_LINK,
-  type GetBetaLinksQueryResponse,
-  type GetBetaLinksQueryVariables,
   type GetUserBetaLinksQueryResponse,
   type GetUserBetaLinksQueryVariables,
   type RecentBetaLinkGqlRow,
   type AttachBetaLinkMutationVariables,
   type AttachBetaLinkMutationResponse,
 } from '@boardsesh/graphql/operations/beta-links';
-import { betaLinkIdentity, dedupeBetaLinks, isBetaVideoUrl, type BetaLink } from '@boardsesh/shared-schema';
-import { mapBetaLink, mapBetaLinks } from '../../beta-video-url';
+import { betaLinkIdentity, isBetaVideoUrl, type BetaLink } from '@boardsesh/shared-schema';
+import { mapBetaLink } from '../../beta-video-url';
 
 export type RecentBetaVideo = Omit<RecentBetaLinkGqlRow, 'betaLink'> & {
   betaLink: BetaLink;
 };
 
-export function useBetaLinks(boardType: string, climbUuid: string, enabled = true) {
-  return useQuery({
-    queryKey: ['betaLinks', boardType, climbUuid],
-    queryFn: () =>
-      getHttpClient().request<GetBetaLinksQueryResponse, GetBetaLinksQueryVariables>(GET_BETA_LINKS, {
-        boardType,
-        climbUuid,
-      }),
-    select: (data) => dedupeBetaLinks(mapBetaLinks(data.betaLinks)),
-    enabled,
-    staleTime: 5 * 60 * 1000,
-  });
-}
+export { useBetaLinks } from './use-beta-links';
+export { selectRecentBetaVideos, useRecentBetaLinks } from './use-recent-beta-links';
 
 const USER_BETA_LINKS_PAGE_SIZE = 20;
 
@@ -1397,6 +1622,8 @@ export function useUserBetaLinks(
 // Own module: it pulls in the offline source hook (expo-sqlite), which the
 // barrel's unit tests mock out the same way as the other submodules.
 export { useSimilarClimbs } from './use-similar-climbs';
+export { useFollowingClimbLogs, useClimbDwell } from './use-following-climb-logs';
+export { useClimbLogs, useClimbLogsPreview, flattenClimbLogPages } from './use-climb-logs';
 
 /**
  * Per-angle stats for a climb (grade, stars, sends). Every consumer keeps the
@@ -1407,7 +1634,12 @@ export { useSimilarClimbs } from './use-similar-climbs';
  * layout is downloaded (offline, and local-first while online), with the server
  * as the fallback; a completed stats sync invalidates ['climbStatsHistory'].
  */
-export function useClimbStatsHistory(boardName: string, climbUuid: string | null) {
+export function useClimbStatsHistory(
+  boardName: string,
+  climbUuid: string | null,
+  // `enabled: false` still hands back a cached answer, without asking for one.
+  options?: { enabled?: boolean },
+) {
   return useQuery({
     queryKey: ['climbStatsHistory', boardName, climbUuid],
     queryFn: () =>
@@ -1416,7 +1648,7 @@ export function useClimbStatsHistory(boardName: string, climbUuid: string | null
         climbUuid: climbUuid!,
       }),
     select: (data) => data.climbStatsHistory,
-    enabled: !!climbUuid,
+    enabled: !!climbUuid && (options?.enabled ?? true),
     staleTime: 5 * 60 * 1000,
   });
 }
@@ -1462,7 +1694,7 @@ export function useBoardseshGradesForAngles(
 ) {
   return useQuery({
     // Local-first via offlineAwareRequest (reads all synced angles from
-    // board_climb_grades when the board type is downloaded).
+    // board_climb_grades when the climb's own layout is downloaded).
     queryKey: ['boardseshGradesForAngles', boardName, climbUuid],
     queryFn: () =>
       offlineAwareRequest<BoardseshGradesForAnglesResponse>(BOARDSESH_GRADES_FOR_ANGLES, {

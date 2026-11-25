@@ -2,6 +2,7 @@ import type {
   QueueEvent,
   SessionEvent,
   NotificationEvent,
+  AppBugReportChangedEvent,
   CommentEvent,
   NewClimbCreatedEvent,
   BoardPresenceEvent,
@@ -18,17 +19,26 @@ import {
   type BoardReportGate,
   type CommitBoardClimbInput,
   type CommitBoardClimbResult,
+  type StoredBoardClear,
 } from './board-presence-store';
 import { logger } from '../utils/logger';
+import { queueDatabaseEffect } from '../db/client';
 
 // Board-presence gate/commit types live with their implementation in
 // board-presence-store.ts; re-exported here so consumers keep importing them
 // from the pubsub entry point.
-export type { BoardReportGate, CommitBoardClimbInput, CommitBoardClimbResult } from './board-presence-store';
+export type {
+  BoardReportGate,
+  CommitBoardClimbInput,
+  CommitBoardClimbResult,
+  StoredBoardClear,
+} from './board-presence-store';
+export { boardReportDedupMarker } from './board-presence-store';
 
 type QueueSubscriber = ChannelSubscriber<QueueEvent>;
 type SessionSubscriber = ChannelSubscriber<SessionEvent>;
 type NotificationSubscriber = ChannelSubscriber<NotificationEvent>;
+type AppBugReportSubscriber = ChannelSubscriber<AppBugReportChangedEvent>;
 type CommentSubscriber = ChannelSubscriber<CommentEvent>;
 type NewClimbSubscriber = ChannelSubscriber<NewClimbCreatedEvent>;
 type BoardPresenceSubscriber = ChannelSubscriber<BoardPresenceEvent>;
@@ -54,7 +64,7 @@ const EVENT_BUFFER_TTL = 300; // 5 minutes
  * - Events are only dispatched to local subscribers
  * - Used when REDIS_URL is not configured
  *
- * The eight domains below (queue, session, notification, comment, new-climb,
+ * The nine domains below (queue, session, notification, app-bug-report, comment, new-climb,
  * climb-stats, board-presence, board-queue) all share the exact same subscribe/publish/fan-in mechanics
  * — that generic behavior lives in `PubSubChannel` (./channel.ts). Each
  * `redisSubscribe`/`redisUnsubscribe`/`redisPublish` closure below resolves to
@@ -89,6 +99,14 @@ class PubSub {
     redisSubscribe: (userId) => this.redisAdapter?.subscribeNotificationChannel(userId) ?? Promise.resolve(),
     redisUnsubscribe: (userId) => this.redisAdapter?.unsubscribeNotificationChannel(userId) ?? Promise.resolve(),
     redisPublish: (userId, event) => this.redisAdapter?.publishNotificationEvent(userId, event) ?? Promise.resolve(),
+    isRedisRequired: () => this.redisRequired,
+    logger,
+  });
+  private readonly appBugReportChannel = new PubSubChannel<AppBugReportChangedEvent>({
+    label: 'app bug report',
+    redisSubscribe: (userId) => this.redisAdapter?.subscribeAppBugReportChannel(userId) ?? Promise.resolve(),
+    redisUnsubscribe: (userId) => this.redisAdapter?.unsubscribeAppBugReportChannel(userId) ?? Promise.resolve(),
+    redisPublish: (userId, event) => this.redisAdapter?.publishAppBugReportChanged(userId, event) ?? Promise.resolve(),
     isRedisRequired: () => this.redisRequired,
     logger,
   });
@@ -211,6 +229,7 @@ class PubSub {
       queue: this.queueChannel.getRuntimeStats(),
       session: this.sessionChannel.getRuntimeStats(),
       notification: this.notificationChannel.getRuntimeStats(),
+      appBugReport: this.appBugReportChannel.getRuntimeStats(),
       comment: this.commentChannel.getRuntimeStats(),
       newClimb: this.newClimbChannel.getRuntimeStats(),
       climbStats: this.climbStatsChannel.getRuntimeStats(),
@@ -265,6 +284,10 @@ class PubSub {
 
     this.redisAdapter.onNotificationMessage((userId, event) => {
       this.notificationChannel.dispatchLocal(userId, event);
+    });
+
+    this.redisAdapter.onAppBugReportMessage((userId, event) => {
+      this.appBugReportChannel.dispatchLocal(userId, event);
     });
 
     this.redisAdapter.onCommentMessage((entityKey, event) => {
@@ -399,11 +422,18 @@ class PubSub {
    * non-monotonic/duplicate sequences. See `publishPlaybackState` in
    * `graphql/resolvers/queue/mutations.ts`.
    *
+   * `options.buffer: false` keeps an event out of the replay buffer as well.
+   * The F3 trailing `CurrentClimbChanged` (docs/product/current-climb-outside-queue.md,
+   * section 2) uses it: it shares its `FullSync`'s sequence and carries
+   * nothing the `FullSync` lacks, so buffering it would only halve how far back
+   * the 100-entry buffer reaches for the #3933 merge, and a replay sorted by
+   * sequence could put it before its own `FullSync`. The hooks still run.
+   *
    * Note: Redis publish errors are logged but not thrown to avoid blocking
    * the local dispatch. In Redis mode, events may not reach other instances
    * if Redis publish fails.
    */
-  publishQueueEvent(sessionId: string, event: QueueEvent): void {
+  publishQueueEvent(sessionId: string, event: QueueEvent, options: { buffer?: boolean } = {}): void {
     // Always dispatch to local subscribers first (low latency). Deliberately
     // NOT `queueChannel.publish()`: the queue domain must interleave the
     // replay-buffer write between local dispatch and the Redis publish (see
@@ -417,7 +447,7 @@ class PubSub {
     // dispatch an event that a reconnecting client's `getEventsSince` replay
     // can't yet see. Both commands go through the same Redis connection, so
     // call order here fixes wire order.
-    if (event.__typename !== 'PlaybackStateChanged') {
+    if (event.__typename !== 'PlaybackStateChanged' && options.buffer !== false) {
       this.storeEventInBuffer(sessionId, event).catch((error) => {
         logger.error(`[PubSub] Failed to buffer event for session ${sessionId}:`, error);
         // Non-fatal: clients will fall back to full sync if delta sync fails
@@ -467,7 +497,18 @@ class PubSub {
    * Dispatches locally first, then publishes to Redis for other instances.
    */
   publishNotificationEvent(userId: string, event: NotificationEvent): void {
+    if (queueDatabaseEffect(() => this.publishNotificationEvent(userId, event))) return;
     this.notificationChannel.publish(userId, event);
+  }
+
+  /** Owner-scoped cache changes are separate from persisted inbox notifications. */
+  async subscribeAppBugReportChanges(userId: string, callback: AppBugReportSubscriber): Promise<() => void> {
+    this.ensureRedisIfRequired();
+    return this.appBugReportChannel.subscribe(userId, callback);
+  }
+
+  publishAppBugReportChanged(userId: string, event: AppBugReportChangedEvent): void {
+    this.appBugReportChannel.publish(userId, event);
   }
 
   /**
@@ -485,6 +526,7 @@ class PubSub {
    * Dispatches locally first, then publishes to Redis for other instances.
    */
   publishCommentEvent(entityKey: string, event: CommentEvent): void {
+    if (queueDatabaseEffect(() => this.publishCommentEvent(entityKey, event))) return;
     this.commentChannel.publish(entityKey, event);
   }
 
@@ -549,6 +591,7 @@ class PubSub {
    * readable board + isPublic session) — the channel itself is gate-free.
    */
   publishBoardQueuePreview(boardId: string, preview: BoardQueuePreview): void {
+    if (queueDatabaseEffect(() => this.publishBoardQueuePreview(boardId, preview))) return;
     this.boardQueueChannel.publish(boardId, preview);
   }
 
@@ -621,6 +664,14 @@ class PubSub {
   }
 
   /** Clear the board's holder only if `emitterId` still holds it (atomic compare-and-delete). */
+  async commitBoardClear(boardId: string, clear: StoredBoardClear): Promise<boolean> {
+    return this.boardPresenceStore.commitBoardClear(boardId, clear);
+  }
+
+  async getActiveBoardClear(boardId: string): Promise<StoredBoardClear | null> {
+    return this.boardPresenceStore.getActiveBoardClear(boardId);
+  }
+
   async clearBoardWriterIf(boardId: string, emitterId: string): Promise<boolean> {
     return this.boardPresenceStore.clearBoardWriterIf(boardId, emitterId);
   }

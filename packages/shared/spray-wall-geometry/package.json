@@ -14,9 +14,12 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@boardsesh/board-art-geometry": "workspace:*"
+  },
   "devDependencies": {
     "@types/node": "^25.9.5",
     "typescript": "~7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "5.1.0"
   }
 }

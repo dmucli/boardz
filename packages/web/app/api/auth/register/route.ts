@@ -3,10 +3,19 @@ import * as Sentry from '@sentry/nextjs';
 import { getDb } from '@/app/lib/db/db';
 import * as schema from '@/app/lib/db/schema';
 import { hash } from 'bcryptjs';
-import { eq } from 'drizzle-orm';
+import { PASSWORD_HASH_COST } from '@boardsesh/auth-protocol/password-hash';
+import { normalizeAccountEmail } from '@boardsesh/auth-protocol/account-email';
+import { findAccountsByEmail } from '@boardsesh/db/queries/account-email';
 import { z } from 'zod';
 import { sendVerificationEmail } from '@boardsesh/email';
 import { checkRateLimit, getClientIp } from '@/app/lib/auth/rate-limiter';
+import { AuthBackendUnavailableError, webPasswordMode } from '@/app/lib/auth/password-command-client.server';
+import {
+  passwordCommandUnavailableResponse,
+  registerWithPasswordCommand,
+} from '@/app/lib/auth/register-password-command.server';
+import { stagedPasswordClientKey } from '@/app/lib/auth/trusted-client-ip.server';
+import { LEGACY_EMAIL_VERIFICATION_LIFETIME_MS } from '@/app/lib/auth/legacy-link-account';
 
 const emailVerificationEnabled = process.env.EMAIL_VERIFICATION_ENABLED === 'true';
 
@@ -21,8 +30,9 @@ const registerSchema = z.object({
 
 export async function POST(request: NextRequest) {
   try {
-    // Rate limiting - 10 requests per minute per IP for registration
-    const clientIp = getClientIp(request);
+    // Rate limiting - 10 requests per minute per IP for registration. The staged
+    // budget is shared by every caller, so its key must not be forgeable.
+    const clientIp = stagedPasswordClientKey(request) ?? getClientIp(request);
     const rateLimitResult = checkRateLimit(`register:${clientIp}`, 10, 60_000);
 
     if (rateLimitResult.limited) {
@@ -37,6 +47,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (webPasswordMode() === 'backend-staging') return registerWithPasswordCommand(request);
+
     const body = await request.json();
 
     // Validate input
@@ -45,13 +57,18 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: validationResult.error.issues[0].message }, { status: 400 });
     }
 
-    const { email, password, name } = validationResult.data;
+    const { password, name } = validationResult.data;
+    const typedEmail = validationResult.data.email;
+    // Stored in the one normalized form, so the planned unique index on
+    // lower(email) holds and any capitalisation signs in.
+    const email = normalizeAccountEmail(typedEmail);
     const db = getDb();
 
-    // Check if user already exists
-    const existingUser = await db.select().from(schema.users).where(eq(schema.users.email, email)).limit(1);
+    // Taken in any capitalisation, including by several accounts at once:
+    // never add another account for the same address.
+    const existingUser = await findAccountsByEmail(db, typedEmail);
 
-    if (existingUser.length > 0) {
+    if (existingUser.kind !== 'none') {
       // An account with this email already exists
       // Do not allow registering again - user should use their existing authentication method
       // This prevents account takeover attacks where someone registers with an OAuth user's email
@@ -65,9 +82,9 @@ export async function POST(request: NextRequest) {
 
     // Create new user
     const userId = crypto.randomUUID();
-    const passwordHash = await hash(password, 12);
+    const passwordHash = await hash(password, PASSWORD_HASH_COST);
     const verificationToken = emailVerificationEnabled ? crypto.randomUUID() : null;
-    const tokenExpires = emailVerificationEnabled ? new Date(Date.now() + 24 * 60 * 60 * 1000) : null; // 24 hours
+    const tokenExpires = emailVerificationEnabled ? new Date(Date.now() + LEGACY_EMAIL_VERIFICATION_LIFETIME_MS) : null;
 
     // Use transaction to ensure user, credentials, profile, and token are created atomically
     // If any insert fails, all changes are rolled back
@@ -77,7 +94,7 @@ export async function POST(request: NextRequest) {
         await tx.insert(schema.users).values({
           id: userId,
           email,
-          name: name || email.split('@')[0],
+          name: name || typedEmail.split('@')[0],
           emailVerified: emailVerificationEnabled ? null : new Date(),
         });
 
@@ -87,10 +104,9 @@ export async function POST(request: NextRequest) {
           passwordHash,
         });
 
-        // Create empty profile (user can customize later)
-        await tx.insert(schema.userProfiles).values({
-          userId,
-        });
+        // Create empty profile (user can customize later). New accounts start
+        // public (the column defaults); Private is opt-in.
+        await tx.insert(schema.userProfiles).values({ userId });
 
         // Insert verification token if email verification is enabled
         if (emailVerificationEnabled && verificationToken && tokenExpires) {
@@ -150,6 +166,7 @@ export async function POST(request: NextRequest) {
       { status: 201 },
     );
   } catch (error) {
+    if (error instanceof AuthBackendUnavailableError) return passwordCommandUnavailableResponse();
     console.error('Registration error:', error);
     return NextResponse.json({ error: 'An error occurred during registration' }, { status: 500 });
   }

@@ -1,21 +1,50 @@
 // @vitest-environment jsdom
 import { act, render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ClimbQueueItem } from '@boardsesh/queue';
+import { DEFAULT_VOLUME_OPTIONS } from '@boardsesh/playlist-generator';
+import type { GeneratorSelection } from '../GeneratorPickerCard';
+import { singleBlockSelection } from '../workout-blocks';
 
 // The preview hook is mocked; the test mutates `preview.result.items` /
 // `refreshingUuids` and rerenders to drive the view's row props.
+const header = vi.hoisted(() => ({ native: false, inBodyLargeTitle: false }));
+const partnerPrivacy = vi.hoisted(() => ({
+  settings: undefined as
+    | { enabled: boolean; defaultSessionAudience: 'public' | 'followers' | 'invite_only'; isPrivate: boolean }
+    | undefined,
+  startConfig: null as { audience?: string; isPublic?: boolean } | null,
+  onVisibilityChange: null as ((isPublic: boolean) => void) | null,
+  onAudienceChange: null as ((audience: 'public' | 'followers' | 'invite_only') => void) | null,
+}));
+vi.mock('../../PartnerWorkoutEntry', () => ({
+  PartnerWorkoutEntry: ({ startConfig }: { startConfig: typeof partnerPrivacy.startConfig }) => {
+    partnerPrivacy.startConfig = startConfig;
+    return null;
+  },
+}));
+// #6903: the workout's server copy, queued at Start / Add a block.
+const workoutOutbox = vi.hoisted(() => ({ enqueueSessionWorkoutWrite: vi.fn(async () => 'queued') }));
+vi.mock('../../../../offline/session-workout-outbox', () => workoutOutbox);
+vi.mock('@tanstack/react-query', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tanstack/react-query')>()),
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+vi.mock('../../../../hooks/use-native-root-header', () => ({ useNativeRootHeader: () => header.native }));
+
 const preview = vi.hoisted(() => ({
   result: {
     items: [] as unknown[],
     status: 'ready' as 'idle' | 'loading' | 'ready' | 'error',
     refreshingUuids: new Set<string>(),
     plannedCount: 0,
-    plannedSlots: [],
+    plannedSlots: [] as unknown[],
+    plannedStages: [] as unknown[],
     regenerate: vi.fn(),
+    shuffle: vi.fn(),
     refreshSlot: vi.fn(),
-    toQueueItems: () => [] as ClimbQueueItem[],
+    toStagedQueueItems: () => ({ items: [] as ClimbQueueItem[], run: null }),
   },
 }));
 
@@ -26,6 +55,24 @@ const rows = vi.hoisted(() => ({
   onPress: null as ((item: ClimbQueueItem) => void) | null,
 }));
 
+// The latest props PreSessionView handed the summary line (count, shortfall, Shuffle).
+const summaryLine = vi.hoisted(() => ({
+  props: null as null | {
+    summary: { planned: number; filled: number; missing: number; sections: unknown[] };
+    onShuffle: () => void;
+    shuffleDisabled: boolean;
+  },
+}));
+
+// Surfaces GeneratorPickerCard's onChange so a test can turn the generator on.
+const picker = vi.hoisted(() => ({ onChange: null as ((selection: GeneratorSelection) => void) | null }));
+
+// Every section heading row the list rendered, in order.
+const headings = vi.hoisted(() => ({ rendered: [] as Array<{ section: string; count: number }> }));
+// Every stage heading row, in order, interleaved into `headings.order` with the section ones.
+const stageHeadings = vi.hoisted(() => ({ rendered: [] as Array<{ stageKind: string; count: number }> }));
+const headingOrder = vi.hoisted(() => ({ labels: [] as string[] }));
+
 const list = vi.hoisted(() => ({
   props: [] as Array<{
     nestedScrollEnabled?: boolean;
@@ -34,6 +81,7 @@ const list = vi.hoisted(() => ({
     hasGestureScrollComponent: boolean;
     hasHeaderComponent: boolean;
     paddingBottom?: unknown;
+    contentInsetAdjustmentBehavior?: string;
   }>,
 }));
 
@@ -58,8 +106,16 @@ const bottomChrome = vi.hoisted(() => ({
 }));
 
 vi.mock('../../RestTimerArmRow', () => ({ RestTimerArmRow: () => null }));
-vi.mock('../../SessionVisibilityRow', () => ({ SessionVisibilityRow: () => null }));
+vi.mock('../../../../lib/rest-timer-effective', () => ({ armRestTimerForWorkout: () => false }));
+vi.mock('../../SessionVisibilityRow', () => ({
+  SessionVisibilityRow: ({ onChange }: { onChange: (isPublic: boolean) => void }) => {
+    partnerPrivacy.onVisibilityChange = onChange;
+    return null;
+  },
+}));
 vi.mock('react-native', () => ({
+  // This suite exercises the JS chrome fallback; native headers have their own navigation tests.
+  Platform: { OS: 'android' },
   View: ({ children, testID }: { children?: ReactNode; testID?: string }) =>
     createElement('div', testID ? { 'data-testid': testID } : null, children),
   StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
@@ -77,7 +133,10 @@ vi.mock('react-native-reanimated', () => ({
   useSharedValue: (value: number) => ({ value }),
 }));
 
-vi.mock('expo-router', () => ({ useRouter: () => ({ push: vi.fn() }) }));
+vi.mock('expo-router', () => ({ useRouter: () => ({ push: vi.fn() }), useIsFocused: () => true }));
+// The phone split (iPhone Duo open in landscape); off except in its own test.
+const split = vi.hoisted(() => ({ on: false }));
+vi.mock('../../../../hooks/use-phone-split', () => ({ usePhoneSplit: () => split.on }));
 
 vi.mock('@shopify/flash-list', () => ({
   FlashList: ({
@@ -88,6 +147,7 @@ vi.mock('@shopify/flash-list', () => ({
     nestedScrollEnabled,
     keyboardShouldPersistTaps,
     contentContainerStyle,
+    contentInsetAdjustmentBehavior,
   }: {
     data?: unknown[];
     renderItem?: (info: { item: unknown; index: number }) => ReactNode;
@@ -96,6 +156,7 @@ vi.mock('@shopify/flash-list', () => ({
     nestedScrollEnabled?: boolean;
     keyboardShouldPersistTaps?: unknown;
     contentContainerStyle?: { paddingBottom?: unknown };
+    contentInsetAdjustmentBehavior?: string;
   }) => {
     list.props.push({
       nestedScrollEnabled,
@@ -104,6 +165,7 @@ vi.mock('@shopify/flash-list', () => ({
       hasGestureScrollComponent: renderScrollComponent != null,
       hasHeaderComponent: ListHeaderComponent != null,
       paddingBottom: contentContainerStyle?.paddingBottom,
+      contentInsetAdjustmentBehavior,
     });
     return createElement(
       'div',
@@ -144,7 +206,10 @@ vi.mock('../../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
 vi.mock('../../../../providers/theme-provider', () => ({
-  useTheme: () => ({ systemColors: {}, features: { inBodyLargeTitle: false, filtersInTopChrome: false } }),
+  useTheme: () => ({
+    systemColors: {},
+    features: { inBodyLargeTitle: header.inBodyLargeTitle, filtersInTopChrome: false },
+  }),
 }));
 vi.mock('../../../../lib/graphql/use-active-board', () => ({
   useActiveBoard: () => ({ data: { boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2', angle: 40 } }),
@@ -160,9 +225,34 @@ vi.mock('../../../../hooks/use-bottom-chrome-metrics', () => ({
   useBottomChromeMetrics: () => bottomChrome.metrics,
 }));
 vi.mock('../../../../theme/tokens', () => ({ spacing: { 2: 8, 3: 12, 4: 16 }, borderRadius: { lg: 16 } }));
-vi.mock('../BoardSummaryCard', () => ({ BoardSummaryCard: () => null }));
-vi.mock('../GeneratorPickerCard', () => ({ GeneratorPickerCard: () => null }));
+vi.mock('../../../boards/BoardSummaryCard', () => ({ BoardSummaryCard: () => null }));
+vi.mock('../GeneratorPickerCard', () => ({
+  GeneratorPickerCard: ({ onChange }: { onChange: (selection: GeneratorSelection) => void }) => {
+    picker.onChange = onChange;
+    return null;
+  },
+}));
 vi.mock('../use-workout-preview', () => ({ useWorkoutPreview: () => preview.result }));
+vi.mock('../WorkoutPreviewSummary', () => ({
+  WorkoutPreviewSummary: (props: NonNullable<typeof summaryLine.props>) => {
+    summaryLine.props = props;
+    return null;
+  },
+}));
+vi.mock('../WorkoutPreviewSectionHeading', () => ({
+  WorkoutPreviewSectionHeading: ({ section, count }: { section: string; count: number }) => {
+    headings.rendered.push({ section, count });
+    headingOrder.labels.push(`${section}:${count}`);
+    return null;
+  },
+}));
+vi.mock('../WorkoutPreviewStageHeading', () => ({
+  WorkoutPreviewStageHeading: ({ stageKind, count }: { stageKind: string; count: number }) => {
+    stageHeadings.rendered.push({ stageKind, count });
+    headingOrder.labels.push(`STAGE ${stageKind}:${count}`);
+    return null;
+  },
+}));
 vi.mock('../WorkoutPreviewRow', () => ({
   WorkoutPreviewRow: ({
     item,
@@ -193,18 +283,35 @@ vi.mock('../../../../lib/onboarding/onboarding-storage', () => ({
 }));
 
 import { PreSessionView } from '../PreSessionView';
+import { PhoneSplitPaneSlotContext } from '../../../navigation/phone-split-pane-slot';
 
-function makeRow(uuid: string) {
+/** Render the view with a volume workout selected, so the preview section shows. */
+function renderWithWorkout() {
+  const view = render(createElement(PreSessionView));
+  act(() => {
+    picker.onChange?.(singleBlockSelection({ ...DEFAULT_VOLUME_OPTIONS, targetGrade: 10 }, 'block-volume'));
+  });
+  return view;
+}
+
+function makeRow(uuid: string, section = 'main', index = 0, stageId?: string) {
   return {
     item: { uuid, climb: { uuid: `${uuid}-climb`, name: uuid } },
-    slot: { grade: 10, section: 'main', index: 0 },
+    slot: { grade: 10, section, index, ...(stageId === undefined ? {} : { stageId }) },
   };
 }
 
 beforeEach(() => {
+  header.native = false;
+  header.inBodyLargeTitle = false;
   rows.rendered = [];
   rows.onPress = null;
   list.props = [];
+  summaryLine.props = null;
+  headings.rendered = [];
+  stageHeadings.rendered = [];
+  headingOrder.labels = [];
+  preview.result.plannedStages = [];
   bottomChrome.metrics = {
     insideTabs: true,
     scrollBottomPadding: 200,
@@ -214,12 +321,30 @@ beforeEach(() => {
     preSessionFooterBottom: 100,
   };
   preview.result.items = [makeRow('a'), makeRow('b')] as unknown[];
+  preview.result.plannedSlots = (preview.result.items as Array<ReturnType<typeof makeRow>>).map((row) => row.slot);
+  preview.result.status = 'ready';
   preview.result.refreshingUuids = new Set<string>();
   fab.onHeightChange = null;
   fab.bottomOffset = null;
 });
 
 describe('PreSessionView preview rows', () => {
+  it.each([
+    [true, true, true, false],
+    [true, false, true, true],
+    [true, false, false, false],
+    [false, false, true, false],
+  ] as const)(
+    'shows one body title only for floating glass tabs (chrome %s, native %s, large title %s)',
+    (showChrome, native, inBodyLargeTitle, hasBodyTitle) => {
+      header.native = native;
+      header.inBodyLargeTitle = inBodyLargeTitle;
+      const { queryAllByText } = render(createElement(PreSessionView, { showChrome }));
+      expect(queryAllByText('mobile.session.headerStart')).toHaveLength(hasBodyTitle ? 1 : 0);
+      expect(list.props.at(-1)?.contentInsetAdjustmentBehavior).toBe(showChrome && native ? 'automatic' : 'never');
+    },
+  );
+
   it('clears the active highlight once a regeneration replaces the rows', () => {
     const view = render(createElement(PreSessionView));
 
@@ -276,6 +401,88 @@ describe('PreSessionView preview rows', () => {
     expect(rows.rendered).toEqual([]);
   });
 
+  it('heads each section of a multi-section plan, in workout order', () => {
+    preview.result.items = [
+      makeRow('w1', 'warmUp', 0),
+      makeRow('w2', 'warmUp', 1),
+      makeRow('m1', 'main', 2),
+    ] as unknown[];
+
+    render(createElement(PreSessionView));
+
+    expect(list.props.at(-1)?.dataLength).toBe(5);
+    expect(headings.rendered).toEqual([
+      { section: 'warmUp', count: 2 },
+      { section: 'main', count: 1 },
+    ]);
+    expect(rows.rendered.map((row) => row.uuid)).toEqual(['w1', 'w2', 'm1']);
+  });
+
+  it('heads each block of a multi-block workout above its own sections', () => {
+    preview.result.items = [
+      makeRow('w1', 'warmUp', 0, 'warm'),
+      makeRow('u1', 'increasing', 1, 'pyramid'),
+      makeRow('p1', 'peak', 2, 'pyramid'),
+      makeRow('v1', 'main', 3, 'volume'),
+      makeRow('v2', 'main', 4, 'volume'),
+    ] as unknown[];
+    preview.result.plannedSlots = (preview.result.items as Array<ReturnType<typeof makeRow>>).map((row) => row.slot);
+    preview.result.plannedStages = [
+      { id: 'warm', kind: 'warmUp', warmUpType: 'standard' },
+      { id: 'pyramid', kind: 'pyramid', options: { ...DEFAULT_VOLUME_OPTIONS, type: 'pyramid' } },
+      { id: 'volume', kind: 'volume', options: DEFAULT_VOLUME_OPTIONS },
+    ];
+
+    render(createElement(PreSessionView));
+
+    expect(headingOrder.labels).toEqual([
+      'STAGE warmUp:1',
+      'STAGE pyramid:2',
+      'increasing:1',
+      'peak:1',
+      'STAGE volume:2',
+    ]);
+    expect(rows.rendered.map((row) => row.uuid)).toEqual(['w1', 'u1', 'p1', 'v1', 'v2']);
+
+    // The summary line counts every block's climbs.
+    act(() => {
+      picker.onChange?.(singleBlockSelection({ ...DEFAULT_VOLUME_OPTIONS, targetGrade: 10 }, 'block-volume'));
+    });
+    expect(summaryLine.props?.summary).toMatchObject({ planned: 5, filled: 5, missing: 0 });
+  });
+
+  it('tells the summary how many planned climbs the preview could not fill', () => {
+    preview.result.plannedSlots = [
+      { grade: 10, section: 'main', index: 0 },
+      { grade: 10, section: 'main', index: 1 },
+      { grade: 11, section: 'main', index: 2 },
+    ];
+
+    renderWithWorkout();
+
+    expect(summaryLine.props?.summary).toMatchObject({ planned: 3, filled: 2, missing: 1 });
+  });
+
+  it('wires Shuffle to the preview and blocks it while a row regenerates', () => {
+    const view = renderWithWorkout();
+    expect(summaryLine.props?.onShuffle).toBe(preview.result.shuffle);
+    expect(summaryLine.props?.shuffleDisabled).toBe(false);
+
+    preview.result.refreshingUuids = new Set<string>(['a']);
+    act(() => {
+      view.rerender(createElement(PreSessionView));
+    });
+    expect(summaryLine.props?.shuffleDisabled).toBe(true);
+  });
+
+  it('hides the summary line while the preview is empty', () => {
+    preview.result.items = [];
+
+    renderWithWorkout();
+
+    expect(summaryLine.props).toBeNull();
+  });
+
   it('reserves the Start FAB height + bottom offset as the list bottom padding', () => {
     render(createElement(PreSessionView));
 
@@ -290,3 +497,111 @@ describe('PreSessionView preview rows', () => {
     expect(list.props.at(-1)?.paddingBottom).toBe(150);
   });
 });
+
+describe('PreSessionView in the phone split (iPhone Duo open in landscape)', () => {
+  function renderInSessionTab(setPaneContent: (content: ReactNode | null) => void) {
+    const view = render(
+      createElement(PhoneSplitPaneSlotContext.Provider, { value: setPaneContent }, createElement(PreSessionView)),
+    );
+    act(() => {
+      picker.onChange?.(singleBlockSelection({ ...DEFAULT_VOLUME_OPTIONS, targetGrade: 10 }, 'block-volume'));
+    });
+    return view;
+  }
+
+  beforeEach(() => {
+    split.on = false;
+  });
+
+  it('moves the preview into the pane and keeps only the block cards and Start here', () => {
+    split.on = true;
+    const setPaneContent = vi.fn();
+    const view = renderInSessionTab(setPaneContent);
+
+    expect(setPaneContent).toHaveBeenLastCalledWith(expect.objectContaining({ props: expect.any(Object) }));
+    expect(list.props.at(-1)).toMatchObject({ dataLength: 0, hasHeaderComponent: true });
+    expect(summaryLine.props).toBeNull();
+    expect(view.getByTestId('pre-session-footer')).toBeTruthy();
+  });
+
+  it('keeps the stacked preview off the split, and hands the pane back to the board', () => {
+    const setPaneContent = vi.fn();
+    renderInSessionTab(setPaneContent);
+
+    expect(setPaneContent).not.toHaveBeenCalledWith(expect.objectContaining({ props: expect.any(Object) }));
+    expect(list.props.at(-1)).toMatchObject({ dataLength: 2 });
+    expect(summaryLine.props).not.toBeNull();
+  });
+});
+
+// This suite exercises the existing flow before the server privacy rollout.
+vi.mock('../../../../lib/graphql/hooks/use-privacy', () => ({
+  usePrivacySettings: () => ({ data: partnerPrivacy.settings }),
+}));
+vi.mock('../../../privacy/PublicationAudiencePicker', () => ({
+  PublicationAudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../../privacy/ContentAudienceControl', () => ({
+  ContentAudienceControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../../privacy/ResourcePrivacyControl', () => ({
+  ResourcePrivacyControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../../privacy/AudiencePicker', () => ({
+  AudiencePicker: ({ onChange }: { onChange: (audience: 'public' | 'followers' | 'invite_only') => void }) => {
+    partnerPrivacy.onAudienceChange = onChange;
+    return null;
+  },
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+
+describe('partner workout start privacy', () => {
+  afterEach(() => {
+    partnerPrivacy.settings = undefined;
+    partnerPrivacy.startConfig = null;
+    partnerPrivacy.onAudienceChange = null;
+    partnerPrivacy.onVisibilityChange = null;
+  });
+
+  it('does not provide start credentials while session privacy is loading', () => {
+    partnerPrivacy.settings = undefined;
+    render(createElement(PreSessionView));
+    expect(partnerPrivacy.startConfig).toBeNull();
+  });
+
+  it.each(['followers', 'invite_only'] as const)('preserves the %s default for partner sessions', (audience) => {
+    partnerPrivacy.settings = { enabled: true, defaultSessionAudience: audience, isPrivate: true };
+    render(createElement(PreSessionView));
+    expect(partnerPrivacy.startConfig).toEqual({ audience, isPublic: false });
+  });
+
+  it('preserves an explicit visibility-off choice when audience controls are disabled', () => {
+    partnerPrivacy.settings = { enabled: false, defaultSessionAudience: 'public', isPrivate: false };
+    render(createElement(PreSessionView));
+    act(() => {
+      partnerPrivacy.onVisibilityChange?.(false);
+    });
+    expect(partnerPrivacy.startConfig).toEqual({ isPublic: false });
+  });
+
+  it('uses the audience selected in the existing pre-session controls', () => {
+    partnerPrivacy.settings = { enabled: true, defaultSessionAudience: 'public', isPrivate: false };
+    render(createElement(PreSessionView));
+    act(() => {
+      partnerPrivacy.onAudienceChange?.('invite_only');
+    });
+    expect(partnerPrivacy.startConfig).toEqual({ audience: 'invite_only', isPublic: false });
+  });
+});
+vi.mock('../../../privacy/use-publication-audience', () => ({
+  usePublicationAudience: () => ({
+    enabled: false,
+    isPrivate: false,
+    audience: 'public',
+    publication: undefined,
+    chooseAudience: () => {},
+  }),
+}));

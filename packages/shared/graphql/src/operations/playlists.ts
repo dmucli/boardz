@@ -1,3 +1,4 @@
+import type { PlaylistClimbViewInput, PrivacyPublicationInput } from '@boardsesh/shared-schema';
 import { gql } from 'graphql-request';
 
 // Fragment for playlist fields
@@ -182,6 +183,7 @@ export const GET_PLAYLIST_CLIMBS = gql`
         is_no_match
       }
       totalCount
+      unfilteredCount
       hasMore
     }
   }
@@ -318,6 +320,7 @@ export type GetPlaylistsForClimbsQueryResponse = {
 };
 
 export type CreatePlaylistInput = {
+  privacy?: PrivacyPublicationInput;
   uuid?: string;
   boardType: string;
   layoutId: number;
@@ -336,6 +339,7 @@ export type CreatePlaylistMutationResponse = {
 };
 
 export type UpdatePlaylistInput = {
+  privacy?: PrivacyPublicationInput;
   playlistId: string;
   name?: string;
   description?: string;
@@ -422,6 +426,15 @@ export type GetPlaylistClimbsInput = {
   // selected angle instead of the added-at / most-ascents fallback.
   activeBoardName?: string;
   activeAngle?: number;
+  // All-boards mode only: the rest of the active board, read by the view's
+  // active-board filters. Each needs activeBoardName.
+  activeLayoutId?: number;
+  activeSizeId?: number;
+  activeSetIds?: string;
+  // Sort and filters. Omit for the playlist's own order; `toPlaylistClimbViewInput`
+  // (@boardsesh/climb-filters) returns undefined for a fresh playlist so the
+  // default request stays as it was.
+  view?: PlaylistClimbViewInput;
   page?: number;
   pageSize?: number;
 };
@@ -455,11 +468,46 @@ export type PlaylistClimbsResult = {
     is_no_match?: boolean | null;
   }>;
   totalCount: number;
+  // The playlist's count with no view filter applied (null unless the view
+  // filters): the "12 of 117 climbs" line. GET_PLAYLIST_CLIMBS selects it, so a
+  // client sending it needs a backend that has the field (#6651, PR 1).
+  unfilteredCount?: number | null;
   hasMore: boolean;
 };
 
 export type GetPlaylistClimbsQueryResponse = {
   playlistClimbs: PlaylistClimbsResult;
+};
+
+// The setter picker in a playlist's filter sheet (#6651). A user playlist by
+// playlistId, or a logbook smart list by smartType + userId.
+export const GET_PLAYLIST_SETTERS = gql`
+  query GetPlaylistSetters($input: PlaylistSettersInput!) {
+    playlistSetters(input: $input) {
+      username
+      climbCount
+    }
+  }
+`;
+
+export type PlaylistSettersInput = {
+  playlistId?: string;
+  smartType?: SmartPlaylistType;
+  userId?: string;
+  boardName?: string;
+  layoutId?: number;
+  sizeId?: number;
+  setIds?: string;
+  search?: string;
+};
+
+export type PlaylistSetter = {
+  username: string;
+  climbCount: number;
+};
+
+export type GetPlaylistSettersQueryResponse = {
+  playlistSetters: PlaylistSetter[];
 };
 
 // ============================================
@@ -489,6 +537,18 @@ export type DiscoverablePlaylist = {
   creatorId: string;
   creatorName: string;
   isGeneratedRecommendation: boolean;
+  /**
+   * The playlist's grade band. Only `DISCOVER_PLAYLISTS` selects it, so a row
+   * from another query leaves it undefined; null means no climb has a grade.
+   */
+  gradeSummary?: PlaylistGradeSummary | null;
+};
+
+/** Difficulty ids on the playlist board's grade scale (10th..90th percentile band). */
+export type PlaylistGradeSummary = {
+  gradedClimbCount: number;
+  p10Difficulty: number;
+  p90Difficulty: number;
 };
 
 export type DiscoverPlaylistsInput = {
@@ -498,7 +558,19 @@ export type DiscoverPlaylistsInput = {
   angle?: number | null;
   name?: string;
   creatorIds?: string[];
+  /** Leave these creators out — the viewer's own, on a discovery surface. */
+  excludeCreatorIds?: string[];
+  /** Inclusive climb-count floor. */
+  minClimbs?: number;
+  /** Inclusive climb-count ceiling. */
+  maxClimbs?: number;
   generatedRecommendation?: boolean | null;
+  /** Lowest difficulty id the band may start at (the playlist's 10th-percentile grade). */
+  minGrade?: number | null;
+  /** Highest difficulty id the band may end at (the playlist's 90th-percentile grade). */
+  maxGrade?: number | null;
+  /** Only playlists by climbers the signed-in viewer follows. Empty when signed out. */
+  followedOnly?: boolean | null;
   sortBy?: 'recent' | 'popular';
   page?: number;
   pageSize?: number;
@@ -551,6 +623,11 @@ export const DISCOVER_PLAYLISTS = gql`
         creatorId
         creatorName
         isGeneratedRecommendation
+        gradeSummary {
+          gradedClimbCount
+          p10Difficulty
+          p90Difficulty
+        }
       }
       totalCount
       hasMore
@@ -674,6 +751,7 @@ export type SmartPlaylistType =
   | 'MOST_REPEATED'
   | 'PROJECTS'
   | 'LIKED_CLIMBS'
+  | 'CREATED_CLIMBS'
   | 'RECOMMENDED_CROWD_FAVORITES'
   | 'RECOMMENDED_HIDDEN_GEMS'
   | 'RECOMMENDED_AT_LEVEL'
@@ -691,6 +769,10 @@ export type SmartPlaylistResult = {
   meta: SmartPlaylistMeta;
   climbs: PlaylistClimbsResult['climbs'];
   totalCount: number;
+  // The list's count with no view filter applied (null unless the view filters):
+  // the "12 of 117 climbs" line. GET_SMART_PLAYLIST selects it, so a client
+  // sending it needs a backend that has the field (#6651, PR 3a).
+  unfilteredCount?: number | null;
   hasMore: boolean;
 };
 
@@ -704,6 +786,18 @@ export type GetSmartPlaylistInput = {
   sizeId?: number;
   /** Recommendation board-angle override. */
   angle?: number;
+  // The active board, read only by a view's active-board filters (progress,
+  // ratings, holds, "fits my board"). activeBoardName and activeAngle go
+  // together; the rest each need activeBoardName.
+  activeBoardName?: string;
+  activeAngle?: number;
+  activeLayoutId?: number;
+  activeSizeId?: number;
+  activeSetIds?: string;
+  // Sort and filters, on the logbook lists only (Liked, Five Stars, Projects,
+  // Most repeated); a recommendation rejects one. Omit for the list's own order
+  // with no filter, so the default request stays as it was.
+  view?: PlaylistClimbViewInput;
   page?: number;
   pageSize?: number;
 };
@@ -759,6 +853,7 @@ export const GET_SMART_PLAYLIST = gql`
         is_no_match
       }
       totalCount
+      unfilteredCount
       hasMore
     }
   }

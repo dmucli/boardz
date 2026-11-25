@@ -1,7 +1,17 @@
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
-import type { Gym } from '@boardsesh/shared-schema';
+import type { Gym, UserBoard } from '@boardsesh/shared-schema';
+import { createInstance } from 'i18next';
+import { getServerTranslation } from '@/app/lib/i18n/server';
+import { SUPPORTED_LOCALES, type Locale } from '@/app/lib/i18n/config';
+import enKiosk from '@boardsesh/i18n/locales/en-US/kiosk.json';
+import esKiosk from '@boardsesh/i18n/locales/es/kiosk.json';
+import frKiosk from '@boardsesh/i18n/locales/fr/kiosk.json';
+import deKiosk from '@boardsesh/i18n/locales/de/kiosk.json';
+import itKiosk from '@boardsesh/i18n/locales/it/kiosk.json';
+import zhKiosk from '@boardsesh/i18n/locales/zh-CN/kiosk.json';
 
 vi.mock('server-only', () => ({}));
+vi.mock('@/app/lib/server-board-discovery', () => ({ getBoardDiscovery: vi.fn(async () => []) }));
 
 vi.mock('next/navigation', () => ({
   notFound: vi.fn(),
@@ -15,8 +25,9 @@ vi.mock('@/app/lib/i18n/server', () => ({
   })),
 }));
 
+const viewer = vi.hoisted(() => ({ token: undefined as string | undefined }));
 vi.mock('@/app/lib/auth/server-auth', () => ({
-  getServerAuthToken: vi.fn(async () => undefined),
+  getServerAuthToken: vi.fn(async () => viewer.token),
 }));
 
 const executeAuthenticatedGraphQL = vi.hoisted(() => vi.fn());
@@ -26,7 +37,7 @@ vi.mock('@/app/lib/backend-url', () => ({
   getPublicBackendHttpUrl: () => 'https://ws.boardsesh.com',
 }));
 
-const { generateMetadata } = await import('../page');
+const { generateMetadata } = await import('@/app/(site)/gym/[gym_slug]/page');
 
 // The base fixture is a GEOCODED commercial gym, because that is the only kind
 // of gym this page still offers to the index. A pin-less row is a climber's home
@@ -57,6 +68,7 @@ const metadataFor = (slug: string, params: Record<string, string | string[] | un
 
 beforeEach(() => {
   executeAuthenticatedGraphQL.mockReset();
+  viewer.token = undefined;
 });
 
 describe('gym page metadata', () => {
@@ -116,6 +128,15 @@ describe('gym page metadata', () => {
     expect(metadata.alternates?.canonical).toBe('/gym/geocoded-gym');
   });
 
+  it('keeps an unlisted gym link readable without indexing it', async () => {
+    executeAuthenticatedGraphQL.mockResolvedValue({
+      gymBySlug: gym('qa-gym', { isPublic: true, isListed: false }),
+    });
+    const metadata = await metadataFor('qa-gym', {});
+    expect(metadata.robots).toEqual({ index: false, follow: true });
+    expect(metadata.alternates).toBeUndefined();
+  });
+
   // A public gym with no coordinates is a climber's personal home wall: the
   // Aurora sync geocodes every commercial gym it writes, and 1,053 of these
   // names begin with the owner's own display name.
@@ -155,48 +176,236 @@ describe('gym page metadata', () => {
   });
 });
 
-const PHOTO_PATH = '/static/gym-photos/11111111-2222-4333-8444-555555555555.jpg?v=abc';
-
 type OgImage = { url: string; width?: number; height?: number };
 
 function ogImages(metadata: Awaited<ReturnType<typeof generateMetadata>>): OgImage[] {
   return (metadata.openGraph?.images ?? []) as OgImage[];
 }
 
+/** Answers the gym read and, for the boards a stranger sees, `boards`. */
+function serveGym(gymRow: Gym, boards: Array<{ boardType: string; angle: number }> = []) {
+  executeAuthenticatedGraphQL.mockImplementation(async (document: unknown) =>
+    String(document).includes('gymBoards') ? { gymBoards: boards } : { gymBySlug: gymRow },
+  );
+}
+
+const CARD_URL = (slug: string) =>
+  new RegExp(`^https://ws\\.boardsesh\\.com/og/place\\?kind=gym&slug=${slug}&v=[0-9a-f]{12}-[0-9a-z]+$`);
+
 describe('gym page share card', () => {
-  it('uses the owner-uploaded photo, resolved absolute and with no claimed dimensions', async () => {
-    executeAuthenticatedGraphQL.mockResolvedValue({ gymBySlug: gym('with-photo', { imageUrl: PHOTO_PATH }) });
+  it('points a public gym at the backend place card, which draws its photo itself', async () => {
+    serveGym(gym('with-photo', { imageUrl: '/static/gym-photos/a.jpg' }), [{ boardType: 'kilter', angle: 40 }]);
 
     const metadata = await metadataFor('with-photo', {});
 
     const [image] = ogImages(metadata);
-    expect(image.url).toBe(`https://ws.boardsesh.com${PHOTO_PATH}`);
-    // A user photo's aspect ratio is unknown; claiming 1200×630 makes scrapers crop.
-    expect(image.width).toBeUndefined();
-    expect(image.height).toBeUndefined();
-    expect(metadata.twitter?.images).toEqual([`https://ws.boardsesh.com${PHOTO_PATH}`]);
-  });
-
-  it('falls back to the generic card when the gym has no photo', async () => {
-    executeAuthenticatedGraphQL.mockResolvedValue({ gymBySlug: gym('no-photo') });
-
-    const metadata = await metadataFor('no-photo', {});
-
-    const [image] = ogImages(metadata);
-    expect(image.url).toBe('/opengraph-image');
+    expect(image.url).toMatch(CARD_URL('with-photo'));
     expect(image.width).toBe(1200);
+    expect(metadata.twitter?.images).toEqual([image.url]);
   });
 
-  it('refuses a legacy javascript: row and falls back to the generic card', async () => {
-    // gyms.image_url was validated with a bare z.string().url() until this
-    // feature landed, and that accepted javascript:/data: URLs.
-    executeAuthenticatedGraphQL.mockResolvedValue({
-      gymBySlug: gym('hostile-photo', { imageUrl: 'javascript:alert(1)' }),
+  it('uses the canonical slug when a merged twin was requested', async () => {
+    serveGym(gym('survivor'));
+
+    const metadata = await metadataFor('old-twin', {});
+
+    expect(ogImages(metadata)[0].url).toMatch(CARD_URL('survivor'));
+    expect(metadata.alternates?.canonical).toBe('/gym/survivor');
+    expect(metadata.alternates?.languages).toMatchObject({ fr: '/fr/gym/survivor' });
+  });
+
+  it('keeps the generic card for a private gym, which the backend card refuses', async () => {
+    serveGym(gym('private-card', { isPublic: false, canEdit: true, imageUrl: '/static/gym-photos/a.jpg' }));
+
+    const metadata = await metadataFor('private-card', {});
+
+    expect(ogImages(metadata)[0].url).toBe('/opengraph-image');
+    expect(metadata.openGraph?.title).toBe('gymPage.metaTitleName:Boulderwelt | Boardsesh');
+  });
+
+  it("titles the preview with the gym's own name and the boards a stranger sees", async () => {
+    serveGym(gym('copy-boards', { description: null }), [
+      { boardType: 'kilter', angle: 40 },
+      { boardType: 'tension', angle: 40 },
+    ]);
+
+    const metadata = await metadataFor('copy-boards', {});
+
+    // The mocked `t` prints the key and the gym name.
+    expect(metadata.openGraph?.title).toBe('gymPage.ogTitle:Boulderwelt');
+    expect(metadata.openGraph?.description).toBe('gymPage.ogDescriptionManyTypes:Boulderwelt');
+  });
+
+  it("prefers the gym's own description, and a gym with no boards keeps just its name", async () => {
+    serveGym(gym('copy-none'));
+
+    const metadata = await metadataFor('copy-none', {});
+
+    expect(metadata.openGraph?.title).toBe('Boulderwelt');
+    expect(metadata.openGraph?.description).toBe('A big gym');
+  });
+
+  it("reads the boards a stranger sees, never a signed-in member's view", async () => {
+    // A member can see the gym's Only-me boards; the card and its words cannot.
+    viewer.token = 'member-token';
+    serveGym(gym('member-view'), [{ boardType: 'kilter', angle: 40 }]);
+
+    await metadataFor('member-view', {});
+
+    const boardReads = executeAuthenticatedGraphQL.mock.calls.filter(([document]) =>
+      String(document).includes('gymBoards'),
+    );
+    expect(boardReads.length).toBeGreaterThan(0);
+    for (const [, , token] of boardReads) expect(token).toBeUndefined();
+    const gymRead = executeAuthenticatedGraphQL.mock.calls.find(
+      ([document]) => !String(document).includes('gymBoards'),
+    );
+    expect(gymRead?.[2]).toBe('member-token');
+  });
+
+  it('changes the token when the boards a stranger sees change', async () => {
+    serveGym(gym('token-a'), [{ boardType: 'kilter', angle: 40 }]);
+    const first = ogImages(await metadataFor('token-a', {}))[0].url;
+    serveGym(gym('token-b', { slug: 'token-a' }), [
+      { boardType: 'kilter', angle: 40 },
+      { boardType: 'tension', angle: 40 },
+    ]);
+    const second = ogImages(await metadataFor('token-b', {}))[0].url;
+
+    expect(second).not.toBe(first);
+  });
+});
+
+const catalogs = { 'en-US': enKiosk, es: esKiosk, fr: frKiosk, de: deKiosk, it: itKiosk, 'zh-CN': zhKiosk };
+
+async function useCatalog(locale: Locale) {
+  const instance = createInstance();
+  await instance.init({
+    lng: locale,
+    fallbackLng: false,
+    ns: ['kiosk'],
+    defaultNS: 'kiosk',
+    resources: { [locale]: { kiosk: catalogs[locale] } },
+    interpolation: { escapeValue: false },
+    returnNull: false,
+  });
+  vi.mocked(getServerTranslation).mockResolvedValueOnce({ t: instance.t, i18n: instance, locale });
+}
+
+function publicBoard(overrides: Partial<UserBoard> = {}): UserBoard {
+  return { boardType: 'kilter', angle: 40, isAngleAdjustable: false, ...overrides } as UserBoard;
+}
+
+// Exercise the actual route and shipped translations: mocked keys cannot catch
+// doubled words, untranslated placeholders, or incorrect locale list joining.
+describe.each(SUPPORTED_LOCALES)('gym search copy (%s)', (locale) => {
+  it('names the stored location and confirmed boards, even with an owner description', async () => {
+    const slug = `search-known-${locale}`;
+    serveGym(gym(slug, { name: 'Foundation Climbing', address: 'Richmond', boardTypes: ['decoy'] }), [
+      publicBoard(),
+      publicBoard(),
+      publicBoard({ boardType: 'moonboard', angle: 0 }),
+      publicBoard({ boardType: 'tension', angle: 50, isAngleAdjustable: true }),
+    ]);
+    await useCatalog(locale);
+
+    const metadata = await metadataFor(slug, { src: 'qr' });
+    const title = (metadata.title as { absolute: string }).absolute;
+    expect(title).toContain('Foundation Climbing');
+    expect(title).toContain('Richmond');
+    expect(title).toContain('Kilter Board');
+    expect(title).toContain('MoonBoard');
+    expect(title).toContain('Tension Board');
+    expect(title).not.toMatch(/climbing climbing/i);
+    expect(title.match(/Kilter Board/g)).toHaveLength(1);
+    expect(metadata.description).toContain('Richmond');
+    expect(metadata.description).toContain('40°');
+    expect(metadata.description).toContain('MoonBoard');
+    expect(metadata.description).not.toMatch(/(?<!\d)0°|50°|Decoy|A big gym/);
+    expect(metadata.description?.match(/Kilter Board/g)).toHaveLength(1);
+    expect(`${title} ${metadata.description}`).not.toMatch(/gymPage\.|{{/);
+    expect(metadata.alternates?.canonical).toBe(`${locale === 'en-US' ? '' : `/${locale}`}/gym/${slug}`);
+    if (locale === 'en-US') {
+      expect(title).toBe('Foundation Climbing, Richmond: Kilter Board, MoonBoard, and Tension Board | Boardsesh');
+      expect(metadata.description).toBe(
+        'Foundation Climbing, Richmond has Kilter Board at 40°, MoonBoard, and Tension Board. See what is lit on the wall and open the climbs in Boardsesh.',
+      );
+    }
+  });
+
+  it.each(['AKIRA Climbing', 'Boulderwelt', 'CLIMB Central'])(
+    'avoids an extra climbing label for %s without a location',
+    async (name) => {
+      const slug = `search-name-${locale}-${name}`;
+      serveGym(gym(slug, { name, address: '  ', description: null }));
+      await useCatalog(locale);
+      const metadata = await metadataFor(slug, {});
+      expect(metadata.title).toEqual({ absolute: `${name} | Boardsesh` });
+      expect(metadata.description).toContain(name);
+      expect(metadata.description).not.toMatch(/undefined|null|{{/);
+    },
+  );
+
+  it('keeps a readable fallback without guessing boards or a town from a pin', async () => {
+    const slug = `search-unknown-${locale}`;
+    serveGym(gym(slug, { name: 'The Hangar', address: null, description: null, boardTypes: ['moonboard'] }));
+    await useCatalog(locale);
+    const metadata = await metadataFor(slug, {});
+    expect(metadata.title).toEqual({
+      absolute: `${catalogs[locale].gymPage.metaTitle.replace('{{gymName}}', 'The Hangar')} | Boardsesh`,
     });
+    expect(metadata.description).toContain('The Hangar');
+    expect(JSON.stringify(metadata)).not.toContain('MoonBoard');
+  });
 
-    const metadata = await metadataFor('hostile-photo', {});
+  it('keeps the whole stored address and omits non-catalogue walls', async () => {
+    const slug = `search-address-${locale}`;
+    serveGym(gym(slug, { address: '  123 Main Street, Richmond, VA 23220  ' }), [publicBoard({ boardType: 'spray' })]);
+    await useCatalog(locale);
+    const metadata = await metadataFor(slug, {});
+    expect((metadata.title as { absolute: string }).absolute).toContain('123 Main Street, Richmond, VA 23220');
+    expect(metadata.description).toContain('123 Main Street, Richmond, VA 23220');
+    expect(metadata.description).not.toContain('40°');
+  });
+});
 
-    const [image] = ogImages(metadata);
-    expect(image.url).toBe('/opengraph-image');
+describe('gym search metadata evidence', () => {
+  it('names confirmed boards even when no address is available', async () => {
+    serveGym(gym('search-board-only', { name: 'AKIRA Climbing', address: null }), [publicBoard()]);
+    await useCatalog('en-US');
+    const metadata = await metadataFor('search-board-only', {});
+    expect(metadata.title).toEqual({ absolute: 'AKIRA Climbing: Kilter Board | Boardsesh' });
+    expect(metadata.description).toContain('Kilter Board at 40°');
+  });
+
+  it('keeps distinct fixed configurations and omits missing or invalid angles', async () => {
+    serveGym(gym('search-angles'), [
+      publicBoard(),
+      publicBoard({ angle: 50 }),
+      publicBoard({ boardType: 'moonboard', angle: Number.NaN }),
+      publicBoard({ boardType: 'tension', isAngleAdjustable: undefined }),
+    ]);
+    await useCatalog('en-US');
+    const metadata = await metadataFor('search-angles', {});
+    expect(metadata.description).toContain('Kilter Board at 40°');
+    expect(metadata.description).toContain('Kilter Board at 50°');
+    expect(metadata.description).not.toMatch(/NaN|Tension Board at/);
+  });
+
+  it('falls back safely if the anonymous board lookup fails', async () => {
+    executeAuthenticatedGraphQL.mockImplementation(async (document: unknown) => {
+      if (String(document).includes('gymBoards')) throw new Error('board lookup unavailable');
+      return { gymBySlug: gym('search-failed', { address: 'Richmond', boardTypes: ['moonboard'] }) };
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      await useCatalog('en-US');
+      const metadata = await metadataFor('search-failed', {});
+      expect(metadata.title).toEqual({ absolute: 'Boulderwelt, Richmond | Boardsesh' });
+      expect(metadata.description).toContain('Richmond');
+      expect(JSON.stringify(metadata)).not.toContain('MoonBoard');
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });

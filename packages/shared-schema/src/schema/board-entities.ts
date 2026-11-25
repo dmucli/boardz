@@ -1,5 +1,14 @@
 export const boardEntitiesTypeDefs = /* GraphQL */ `
-  "A redacted snapshot of the last confirmed climb while its sender still holds the board."
+  input ObservedBoardSerialInput {
+    boardType: String!
+    observedSerialNumber: String!
+  }
+  type ObservedBoardSerialMatch {
+    boardType: String!
+    observedSerialNumber: String!
+    candidates: [UserBoard!]!
+  }
+  "A public climb preview without sender identity. See each field for its presence or logbook source."
   type BoardDiscoveryClimb {
     uuid: ID!
     name: String
@@ -42,6 +51,8 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     uniqueClimbers: Int!
     "Null when there is no verified live holder, including unavailable Redis. Not a live subscription."
     currentClimb: BoardDiscoveryClimb
+    "Most publicly logged climb on this physical board, at its most-logged angle. Gym-scoped reads only; null without eligible records."
+    popularClimb: BoardDiscoveryClimb
   }
 
   input BoardDiscoveryInput {
@@ -58,12 +69,13 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
   A named physical board installation (board type + layout + size + hold sets).
   """
   type UserBoard {
+    sprayImport: SprayWallImportProgress
     "Unique identifier"
     uuid: ID!
     "URL slug for this board"
     slug: String!
     "Owner user ID"
-    ownerId: ID!
+    ownerId: ID
     "Owner display name"
     ownerDisplayName: String
     "Owner avatar URL"
@@ -100,6 +112,12 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     isAngleAdjustable: Boolean!
     "Whether this wall has an LED light kit"
     hasLeds: Boolean!
+    """
+    Whether an internet-connected wall device (a laser projector, an LED
+    controller) lights this wall from the board feed. Climbers take the wall
+    with no Bluetooth link.
+    """
+    litByWallDevice: Boolean!
     "When created"
     createdAt: String!
     "Human-readable layout name"
@@ -122,12 +140,14 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     isFollowedByMe: Boolean!
     "Gym ID if linked to a gym"
     gymId: Int
-    "Numeric board-presence channel id (userBoards.id); null unless the board is public or the viewer can edit it. Feeds boardNowPlaying(boardId) for kiosk/embed surfaces."
+    "Numeric board-presence channel id (userBoards.id); set whenever the viewer may read the board. Feeds boardNowPlaying(boardId); the id alone is the no-link reading, so an Unlisted board's presence also needs boardUuid."
     boardId: Int
     "Gym UUID if linked to a gym"
     gymUuid: String
     "Gym name if linked to a gym"
     gymName: String
+    "Whether the linked gym participates in discovery; null when no gym is linked."
+    gymIsListed: Boolean
     "Distance in meters from search origin (only set for proximity queries)"
     distanceMeters: Float
     "Controller box serial number"
@@ -136,6 +156,18 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     timerName: String
     "Whether the current viewer may edit this board (owner, community admin/leader for its board type, or owner/admin of its linked gym)"
     canEdit: Boolean!
+    "Whether the current viewer may delete this board with deleteBoard: its owner; the owner or an admin of its linked gym, on a synced (system-owned) board only; or a global admin. False for a deleted board and when signed out."
+    canDelete: Boolean!
+    """
+    Whether the current viewer may take this board off its gym's listing. True when
+    the board is linked to a gym and the viewer is its owner (call linkBoardToGym
+    with gymUuid null) or can edit that gym: its owner, a gym admin or editor, or a
+    community admin/leader covering it (call detachBoardFromGym). Gym staff use this
+    instead of deleting a climber's board. A synced (system-owned) board is deleted,
+    not removed: false for it unless the viewer is a global admin. False when
+    signed out.
+    """
+    canRemoveFromGym: Boolean!
     "Whether the current viewer has pinned this board to the front of their board list (false when unauthenticated)"
     isPinnedByMe: Boolean!
   }
@@ -183,7 +215,7 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
   """
   type BoardLeaderboardEntry {
     "User ID"
-    userId: ID!
+    userId: ID
     "Display name"
     userDisplayName: String
     "Avatar URL"
@@ -222,6 +254,8 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
   Input for creating a board.
   """
   input CreateBoardInput {
+    audience: PrivacyResourceAudience
+    locationAudience: PrivacyLocationAudience
     "Board type"
     boardType: String!
     "Layout ID"
@@ -256,6 +290,8 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     isAngleAdjustable: Boolean
     "Whether this wall has an LED light kit (default true)"
     hasLeds: Boolean
+    "Whether a wall device lights this wall from the board feed (default false)"
+    litByWallDevice: Boolean
     "Controller box serial number"
     serialNumber: String
     "Paired Rogue Fitness timer's advertised BLE name"
@@ -268,6 +304,103 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     allowDuplicateConfig: Boolean
     "Create even when the serial is already registered to another user's board with the same configuration (default false — such creates fail with BOARD_SERIAL_EXISTS so clients can route the user to the existing board)"
     allowDuplicateSerial: Boolean
+    """
+    Opt in to the existing-wall recheck (#8151). Absent: no check, exactly the
+    behaviour before it existed. Set: when the board has no serial and lands on a
+    gym (named, auto-attached or minted), the server looks for walls the caller
+    can see at that gym, its merged listings and public listings within 150 m,
+    and refuses with BOARD_EXISTING_WALLS per the mode.
+    """
+    existingWallCheck: ExistingWallCheck
+    """
+    With CONFIRMED_SEPARATE: the walls the climber was shown and said are
+    different from theirs. At most 40.
+    """
+    acknowledgedWallUuids: [ID!]
+  }
+
+  """
+  How createBoard treats walls that already exist where the new board lands.
+  """
+  enum ExistingWallCheck {
+    "Refuse when a wall with the same layout and size exists (same sets or not)."
+    REJECT_IF_FOUND
+    """
+    The climber confirmed theirs is a separate wall. Refuse only for a
+    same-setup wall missing from acknowledgedWallUuids. With an empty list, only
+    honoured when the server finds no same-layout wall at all.
+    """
+    CONFIRMED_SEPARATE
+  }
+
+  """
+  How an existing wall compares with the setup the climber is entering. Angle is
+  never compared.
+  """
+  enum WallMatchKind {
+    "Same layout, size and hold sets."
+    EXACT
+    "Same layout and size, different hold sets."
+    SETS_DIFFER
+    "Same board type, another layout or size. Advisory only; never blocks a create."
+    LAYOUT_OR_SIZE_DIFFERS
+  }
+
+  """
+  Where an existing wall was found relative to the chosen gym.
+  """
+  enum WallCandidateSource {
+    "Linked to the chosen gym."
+    SELECTED_GYM
+    "Linked to a listing an admin merged into the chosen gym."
+    MERGED_LISTING
+    "Linked to another public, listed gym within 150 m."
+    NEARBY_LISTING
+  }
+
+  """
+  Input for existingWallCandidates.
+  """
+  input ExistingWallCandidatesInput {
+    "Board type. Spray walls are not supported."
+    boardType: String!
+    "The chosen gym. A merged listing's uuid resolves to the gym it merged into."
+    gymUuid: ID!
+    "The draft's layout. Send layoutId, sizeId and setIds together, or none of them."
+    layoutId: Int
+    "The draft's size."
+    sizeId: Int
+    "The draft's comma-separated hold sets."
+    setIds: String
+    "Most candidates to return (default 20, max 40)."
+    limit: Int
+  }
+
+  """
+  A wall the climber can see that may be the one they are about to add.
+  """
+  type ExistingWallCandidate {
+    board: UserBoard!
+    "How it compares with the draft; null when no draft setup was sent."
+    matchKind: WallMatchKind
+    "Hold sets the draft has and the wall lacks (SETS_DIFFER only)."
+    missingSetIds: [Int!]!
+    "Hold sets the wall has and the draft lacks (SETS_DIFFER only)."
+    extraSetIds: [Int!]!
+    source: WallCandidateSource!
+    "Name of the gym the wall is linked to."
+    gymName: String!
+    "Metres from the chosen gym to a nearby listing; null for the chosen gym and merged listings."
+    gymDistanceMeters: Float
+  }
+
+  """
+  Existing walls at a gym, best match first.
+  """
+  type ExistingWallCandidates {
+    candidates: [ExistingWallCandidate!]!
+    "True when more walls matched than were returned."
+    truncated: Boolean!
   }
 
   """
@@ -302,6 +435,8 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     isAngleAdjustable: Boolean
     "New LED light kit flag"
     hasLeds: Boolean
+    "New wall device flag"
+    litByWallDevice: Boolean
     "New layout ID (authorized editors only; existing ticks are preserved untouched)"
     layoutId: Int
     "New size ID (authorized editors only; existing ticks are preserved untouched)"
@@ -343,6 +478,13 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     limit: Int
     "Offset for pagination"
     offset: Int
+    """
+    Also list the viewer's OWN spray walls that have never been published, so
+    My Boards and Manage can show their import progress. Off by default: board
+    pickers must only offer walls that can be climbed on. Other people's
+    unfinished walls and archived walls are never listed.
+    """
+    includeUnfinishedSprayWalls: Boolean = false
   }
 
   """
@@ -383,6 +525,8 @@ export const boardEntitiesTypeDefs = /* GraphQL */ `
     layoutIds: [Int!]
     "Filter by size id (OR)"
     sizeIds: [Int!]
+    "Filter by the board's recorded angle (OR), including adjustable boards"
+    angles: [Int!]
     "Latitude for proximity search"
     latitude: Float
     "Longitude for proximity search"

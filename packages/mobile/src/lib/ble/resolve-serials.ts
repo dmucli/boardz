@@ -2,10 +2,8 @@ import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { parseSerialNumber } from '@boardsesh/ble-protocol';
 import {
-  GET_BOARDS_BY_SERIAL_NUMBERS,
   GET_MY_BOARD_SERIAL_CONFIGS,
   type BoardSerialConfig,
-  type GetBoardsBySerialNumbersQueryResponse,
   type GetMyBoardSerialConfigsQueryResponse,
 } from '@boardsesh/graphql/operations';
 import type { UserBoard } from '@boardsesh/shared-schema';
@@ -16,9 +14,10 @@ import type { DiscoveredDevice } from './types';
 import {
   advertisedBoardTypesBySerial,
   matchesAdvertisedType,
-  sharedAdvertisedBoardType,
   type AdvertisedBoardTypes,
 } from './advertised-board-type';
+import { selectBleBoardCandidates } from './select-board-candidates';
+import { fetchBoardsForObservedSerials } from './observed-board-matches';
 
 export { advertisedBoardTypesBySerial } from './advertised-board-type';
 
@@ -57,27 +56,15 @@ export async function resolveBleSerialNumbers(
         .catch(() => ({ myBoardSerialConfigs: [] as BoardSerialConfig[] }))
     : Promise.resolve({ myBoardSerialConfigs: [] as BoardSerialConfig[] });
 
-  const [savedResult, recordedResult] = await Promise.all([
-    client
-      .request<GetBoardsBySerialNumbersQueryResponse>(GET_BOARDS_BY_SERIAL_NUMBERS, {
-        serialNumbers: uniqueSerialNumbers,
-        // Narrows the query when the whole scan advertises one type, which is
-        // the usual case. It only reduces what comes back — the per-serial
-        // filter below is what actually enforces the rule, so a mixed scan (or
-        // an older backend that ignores the argument) is still correct.
-        boardType: sharedAdvertisedBoardType(advertisedTypes),
-      })
-      .catch(() => ({ boardsBySerialNumbers: [] as UserBoard[] })),
+  const [savedBoards, recordedResult] = await Promise.all([
+    fetchBoardsForObservedSerials(uniqueSerialNumbers, advertisedTypes).catch(() => [] as UserBoard[]),
     recordedRequest,
   ]);
 
   const resolvedBoards = new Map<string, ResolvedBoardEntry>();
-  for (const board of savedResult.boardsBySerialNumbers) {
+  const selectedBoards = selectBleBoardCandidates(savedBoards, recordedResult.myBoardSerialConfigs, advertisedTypes);
+  for (const board of selectedBoards) {
     if (!board.serialNumber) continue;
-    // A board of another type shares nothing but the number with the controller
-    // that just advertised. Letting it in is what made a Tension box at
-    // Benchmark Climbing render — and behave — as a stranger's Kilter board.
-    if (!matchesAdvertisedType(board.serialNumber, board.boardType, advertisedTypes)) continue;
     resolvedBoards.set(board.serialNumber, { kind: 'saved', board });
   }
   for (const config of recordedResult.myBoardSerialConfigs) {

@@ -1,9 +1,13 @@
+import { useHeaderHeight } from 'expo-router/react-navigation';
+import { Text } from '../../src/components/Text';
+import { useTypographyStyles, type TypographyScale } from '../../src/hooks/use-typography-styles';
+import { PressableSurface } from '../../src/components/PressableSurface';
 import { useState } from 'react';
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 'react-native';
 import { Image } from 'expo-image';
 import { useRouter } from 'expo-router';
 import { useTranslation } from 'react-i18next';
-import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { SHARED_EVENTS, loginProviderProperties } from '@boardsesh/analytics';
 import { classifyNativeAuthFailureReason } from '../../src/lib/native-auth-analytics';
 import { EMAIL_REGEX } from '../../src/lib/auth-validation';
 import { useAuth } from '../../src/providers/auth-provider';
@@ -11,6 +15,7 @@ import { useTheme } from '../../src/providers/theme-provider';
 import { useNativeOAuthSignIn } from '../../src/hooks/use-native-oauth-sign-in';
 import { AuthFieldset } from '../../src/components/AuthFieldset';
 import { Button } from '../../src/components/Button';
+import { AppStorePrompt } from '../../src/components/AppStorePrompt';
 import { track } from '../../src/lib/analytics';
 import { useTrackLoginSucceeded } from '../../src/lib/login-analytics';
 import { reportError } from '../../src/lib/error-reporting';
@@ -20,6 +25,8 @@ import { OAuthProviderButtons, useOAuthProviders } from '../../src/components/au
 import { readPostLoginReturnHref } from '../../src/lib/routing/anonymous-auth-gate';
 
 export default function LoginScreen() {
+  const headerHeight = useHeaderHeight();
+  const styles = useTypographyStyles(createStyles);
   const { signInWithCredentials } = useAuth();
   const { t } = useTranslation('auth');
   const theme = useTheme();
@@ -61,13 +68,13 @@ export default function LoginScreen() {
 
     setError(null);
     setSubmitting(true);
-    track(SHARED_EVENTS.LoginAttempted, { auth_method: 'credentials', flow: 'native' });
+    track(SHARED_EVENTS.LoginAttempted, { ...loginProviderProperties('credentials'), flow: 'native' });
     try {
       const result = await signInWithCredentials(trimmedEmail, password);
       if (!result.success) {
         const credentialsFailureReason = classifyNativeAuthFailureReason(result, 'credentials');
         track(SHARED_EVENTS.LoginFailed, {
-          auth_method: 'credentials',
+          ...loginProviderProperties('credentials'),
           failure_reason: credentialsFailureReason,
           failure_detail: result.error,
         });
@@ -99,13 +106,13 @@ export default function LoginScreen() {
           // still rides along to Sentry above as `server_error`.
           setError(t('login.toasts.authFailed'));
         }
-      } else {
-        trackLoginSucceeded({ auth_method: 'credentials', flow: 'native', screen: 'login' });
+      } else if (Platform.OS === 'web') {
+        trackLoginSucceeded({ ...loginProviderProperties('credentials'), flow: 'web', screen: 'login' });
       }
       // On success, AuthProvider flips isAuthenticated and the redirect handles navigation.
     } catch (signInError) {
       track(SHARED_EVENTS.LoginFailed, {
-        auth_method: 'credentials',
+        ...loginProviderProperties('credentials'),
         failure_reason: 'exception',
       });
       throw signInError;
@@ -119,7 +126,11 @@ export default function LoginScreen() {
     oauthProviders.loading || oauthProviders.error || oauthProviders.apple || oauthProviders.google;
 
   return (
-    <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <KeyboardAvoidingView
+      keyboardVerticalOffset={headerHeight}
+      style={{ flex: 1 }}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
       <ScrollView
         contentContainerStyle={styles.container}
         keyboardShouldPersistTaps="handled"
@@ -133,7 +144,7 @@ export default function LoginScreen() {
             accessible={false}
           />
           <Text style={[styles.title, { color: theme.brandColors.primary }]}>Boardsesh</Text>
-          <Text style={[styles.tagline, { color: theme.systemColors.label }]} accessibilityRole="header">
+          <Text emphasized style={[styles.tagline, { color: theme.systemColors.label }]} accessibilityRole="header">
             {t('nativeStart.tagline')}
           </Text>
           <Text style={[styles.subtitle, { color: theme.systemColors.secondaryLabel }]}>
@@ -226,7 +237,7 @@ export default function LoginScreen() {
               {error}
             </Text>
           ) : null}
-          <Pressable
+          <PressableSurface
             onPress={() => {
               hapticLight();
               track(SHARED_EVENTS.AuthOptionTapped, { option: 'forgot_password', screen: 'login' });
@@ -239,14 +250,14 @@ export default function LoginScreen() {
             <Text style={[styles.forgotPasswordLink, { color: theme.systemColors.secondaryLabel }]}>
               {t('login.links.forgotPassword')}
             </Text>
-          </Pressable>
+          </PressableSurface>
         </View>
 
         <View style={styles.footer}>
           <Text style={[styles.footerText, { color: theme.systemColors.secondaryLabel }]}>
             {t('login.links.noAccount')}{' '}
           </Text>
-          <Pressable
+          <PressableSurface
             onPress={() => {
               hapticLight();
               track(SHARED_EVENTS.AuthOptionTapped, { option: 'create_account', screen: 'login' });
@@ -256,8 +267,10 @@ export default function LoginScreen() {
             style={styles.footerLinkHit}
             accessibilityRole="link"
           >
-            <Text style={[styles.footerLink, { color: theme.systemColors.accent }]}>{t('login.submit.signUp')}</Text>
-          </Pressable>
+            <Text emphasized style={[styles.footerLink, { color: theme.systemColors.accent }]}>
+              {t('login.submit.signUp')}
+            </Text>
+          </PressableSurface>
         </View>
 
         {/* Last-resort help for someone stuck at the gate: opens our Discord in the
@@ -266,7 +279,7 @@ export default function LoginScreen() {
           <Text style={[styles.footerText, { color: theme.systemColors.secondaryLabel }]}>
             {t('login.links.troubleSigningIn')}{' '}
           </Text>
-          <Pressable
+          <PressableSurface
             onPress={() => {
               hapticLight();
               void openDiscordInvite('login');
@@ -275,67 +288,94 @@ export default function LoginScreen() {
             style={styles.footerLinkHit}
             accessibilityRole="link"
           >
-            <Text style={[styles.footerLink, { color: theme.systemColors.accent }]}>{t('login.links.discord')}</Text>
-          </Pressable>
+            <Text emphasized style={[styles.footerLink, { color: theme.systemColors.accent }]}>
+              {t('login.links.discord')}
+            </Text>
+          </PressableSurface>
         </View>
+
+        {/* Browser app on a phone only; nothing on native or on a desktop. Last
+            on the screen so it never pushes the sign-in buttons down. */}
+        <AppStorePrompt surface="login" />
       </ScrollView>
     </KeyboardAvoidingView>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flexGrow: 1, justifyContent: 'center', padding: 24 },
-  header: { alignItems: 'center', marginBottom: 32 },
-  logo: { width: 96, height: 96, marginBottom: 16 },
-  title: { fontSize: 34, fontWeight: '700', marginBottom: 8 },
-  tagline: { fontSize: 20, fontWeight: '600', textAlign: 'center' },
-  subtitle: { fontSize: 15, lineHeight: 20, textAlign: 'center', marginTop: 6 },
-  form: { gap: 12 },
-  submitButton: { alignSelf: 'stretch', marginTop: 4 },
-  errorText: {
-    color: '#FF3B30',
-    fontSize: 15,
-    marginTop: 4,
-  },
-  oauthErrorText: { marginTop: 12 },
-  dividerRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginVertical: 24,
-    gap: 12,
-  },
-  dividerLine: {
-    flex: 1,
-    height: StyleSheet.hairlineWidth,
-  },
-  // No extra opacity: secondaryLabel is already the dimmed system colour, and
-  // dimming it again drops "or use email" below AA contrast in light mode.
-  dividerLabel: {
-    fontSize: 13,
-  },
-  forgotPasswordHit: {
-    alignSelf: 'center',
-    marginTop: 4,
-    minHeight: 44,
-    justifyContent: 'center',
-  },
-  forgotPasswordLink: {
-    fontSize: 15,
-  },
-  footer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginTop: 24,
-  },
-  troubleRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginTop: 8,
-  },
-  footerText: { fontSize: 15 },
-  footerLink: { fontSize: 15, fontWeight: '600' },
-  // Keeps the tappable area at the 44pt/48dp minimum.
-  footerLinkHit: { minHeight: 44, justifyContent: 'center' },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    container: {
+      width: '100%',
+      maxWidth: 672,
+      alignSelf: 'center',
+      flexGrow: 1,
+      justifyContent: 'center',
+      padding: 24,
+    },
+    header: { alignItems: 'center', marginBottom: 32 },
+    logo: { width: 96, height: 96, marginBottom: 16 },
+    title: { fontSize: textStyles.largeTitle.fontSize, fontWeight: '700', marginBottom: 8 },
+    tagline: { fontSize: textStyles.title3.fontSize, textAlign: 'center' },
+    subtitle: {
+      fontSize: textStyles.subheadline.fontSize,
+      lineHeight: textStyles.subheadline.lineHeight,
+      textAlign: 'center',
+      marginTop: 6,
+    },
+    form: { gap: 12 },
+    submitButton: { alignSelf: 'stretch', marginTop: 4 },
+    errorText: {
+      color: '#FF3B30',
+      fontSize: textStyles.subheadline.fontSize,
+      marginTop: 4,
+    },
+    oauthErrorText: { marginTop: 12 },
+    dividerRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginVertical: 24,
+      gap: 12,
+    },
+    dividerLine: {
+      flex: 1,
+      height: StyleSheet.hairlineWidth,
+    },
+    // No extra opacity: secondaryLabel is already the dimmed system colour, and
+    // dimming it again drops "or use email" below AA contrast in light mode.
+    dividerLabel: {
+      fontSize: textStyles.footnote.fontSize,
+    },
+    forgotPasswordHit: {
+      alignSelf: 'center',
+      marginTop: 4,
+      minHeight: 44,
+      justifyContent: 'center',
+    },
+    forgotPasswordLink: {
+      fontSize: textStyles.subheadline.fontSize,
+    },
+    footer: {
+      flexDirection: 'row',
+      // A long translation ("Noch kein Konto? Registrieren") drops the link onto
+      // its own line instead of running off the screen (HIG Localization: leave
+      // room for text that grows).
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginTop: 24,
+    },
+    troubleRow: {
+      flexDirection: 'row',
+      // A long translation ("Noch kein Konto? Registrieren") drops the link onto
+      // its own line instead of running off the screen (HIG Localization: leave
+      // room for text that grows).
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginTop: 8,
+    },
+    footerText: { fontSize: textStyles.subheadline.fontSize, textAlign: 'center' },
+    footerLink: { fontSize: textStyles.subheadline.fontSize },
+    // Keeps the tappable area at the 44pt/48dp minimum.
+    footerLinkHit: { minHeight: 44, justifyContent: 'center' },
+  });

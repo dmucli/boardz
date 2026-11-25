@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
+import { canAccessResourceWithoutLink, canViewResourceLocation } from '../services/privacy';
 import { socialBoardQueries, socialBoardMutations } from '../graphql/resolvers/social/boards';
+import { boardSessionPrivacyResolvers } from '../graphql/resolvers/shared/board-session-privacy';
 
 // Mock db + dependencies before importing resolver.
 // `vi.mock` is hoisted to the top of the file at parse time, so even though
@@ -36,6 +40,21 @@ vi.mock('../utils/redis-rate-limiter', () => ({
 vi.mock('../events/index', () => ({
   publishSocialEvent: vi.fn().mockResolvedValue(undefined),
 }));
+
+// Exercise hardware lookup independently from the policy database adapter.
+// Authenticated strangers receive no private metadata; owners retain details.
+vi.mock('../services/privacy', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../services/privacy')>();
+  return {
+    ...actual,
+    canAccessResource: vi.fn(async (_kind: string, _id: string, viewerId?: string) => viewerId === 'owner-123'),
+    canAccessResourceWithoutLink: vi.fn(
+      async (_kind: string, _id: string, viewerId?: string) => viewerId === 'owner-123',
+    ),
+    canViewResourceLocation: vi.fn(async (_id: string, viewerId?: string) => viewerId === 'owner-123'),
+    canViewActivityIdentity: vi.fn(async (ownerId: string, viewerId?: string) => ownerId === viewerId),
+  };
+});
 
 // Minimal DB row matching the userBoards schema shape
 function makeDbBoard(overrides: Record<string, unknown> = {}) {
@@ -179,6 +198,8 @@ describe('boardsBySerialNumbers privacy', () => {
     });
 
     it('includes name, description, and locationName for public boards', async () => {
+      vi.mocked(canAccessResourceWithoutLink).mockResolvedValueOnce(true);
+      vi.mocked(canViewResourceLocation).mockResolvedValueOnce(true);
       const publicBoard = makeDbBoard({
         isPublic: true,
         name: 'Gym Wall',
@@ -198,6 +219,23 @@ describe('boardsBySerialNumbers privacy', () => {
       expect(board.name).toBe('Gym Wall');
       expect(board.description).toBe('Open to all');
       expect(board.locationName).toBe('Downtown Gym');
+    });
+
+    it('uses current policy to hide capability and UGC despite legacy public flags', async () => {
+      setupDbSelect([makeDbBoard({ isPublic: true, isUnlisted: false })]);
+      const [board] = await socialBoardQueries.boardsBySerialNumbers(
+        null,
+        { serialNumbers: ['SERIAL001'] },
+        makeUnauthCtx(),
+      );
+      expect(board).toMatchObject({
+        uuid: '',
+        slug: '',
+        boardId: null,
+        name: 'kilter',
+        description: null,
+        ownerId: '',
+      });
     });
 
     it('always strips GPS, owner identity, and stats', async () => {
@@ -239,8 +277,9 @@ describe('boardsBySerialNumbers privacy', () => {
       );
 
       const result = results[0];
-      expect(result.uuid).toBe('board-uuid-1');
-      expect(result.slug).toBe('my-board');
+      expect(result.uuid).toBe('');
+      expect(result.boardId).toBeNull();
+      expect(result.slug).toBe('');
       expect(result.boardType).toBe('kilter');
       expect(result.layoutId).toBe(1);
       expect(result.sizeId).toBe(10);
@@ -297,7 +336,20 @@ describe('boardsBySerialNumbers privacy', () => {
   });
 
   describe('authenticated callers', () => {
-    it('returns full board data including owner and stats', async () => {
+    it('keeps controller and timer configuration for an authorized non-editor', async () => {
+      vi.mocked(canAccessResourceWithoutLink).mockResolvedValueOnce(true);
+      setupDbSelectSequence([[makeDbBoard({ isPublic: true, timerName: 'Rogue Gym Timer' })]]);
+      const results = await socialBoardQueries.boardsBySerialNumbers(
+        null,
+        { serialNumbers: ['SERIAL001'] },
+        makeAuthCtx('gym-climber'),
+      );
+      expect(results).toHaveLength(1);
+      expect(results[0]).toMatchObject({ canEdit: false, serialNumber: 'SERIAL001', timerName: 'Rogue Gym Timer' });
+      expect(results[0].ownerId).toBeNull();
+    });
+
+    it('returns full board data including owner and stats to the owner', async () => {
       const board = makeDbBoard({
         isPublic: false,
         name: 'Secret Wall',
@@ -321,7 +373,7 @@ describe('boardsBySerialNumbers privacy', () => {
       const results = await socialBoardQueries.boardsBySerialNumbers(
         null,
         { serialNumbers: ['SERIAL001'] },
-        makeAuthCtx('user-1'),
+        makeAuthCtx('owner-123'),
       );
 
       expect(results).toHaveLength(1);
@@ -486,17 +538,14 @@ describe('myBoardSerialConfigs privacy', () => {
     expect(results[0].boardSlug).toBeNull();
   });
 
-  it('returns boardSlug=null when the linked board is soft-deleted (leftJoin excludes it)', async () => {
-    // The resolver's leftJoin filters by `isNull(userBoards.deletedAt)`. When
-    // the linked board has been soft-deleted, the join condition fails and
-    // userBoards.slug comes back as null, even though the recording row still
-    // carries its original boardUuid pointer. The recording stays usable as a
-    // fallback (config is intact), it just loses the saved-board linkage.
-    const orphanedRecording = makeRecording({
-      boardUuid: 'deleted-board-uuid',
-      boardSlug: null,
-    });
-    setupDbLeftJoin([orphanedRecording]);
+  it('returns no board link when the linked board is soft-deleted (leftJoin excludes it)', async () => {
+    // The resolver's leftJoin filters by `isNull(userBoards.deletedAt)`, and the
+    // uuid/slug columns are CASE-gated on that joined board being readable to
+    // the caller without its link. A soft-deleted board fails both, so the
+    // recording keeps its configuration as a fallback and loses the saved-board
+    // linkage. (The no-link gate itself is covered against a real database in
+    // unlisted-board-link.test.ts.)
+    setupDbLeftJoin([makeRecording({ boardUuid: null, boardSlug: null })]);
 
     const results = await socialBoardQueries.myBoardSerialConfigs(
       null,
@@ -504,8 +553,7 @@ describe('myBoardSerialConfigs privacy', () => {
       makeAuthCtx('user-1'),
     );
 
-    expect(results[0].boardUuid).toBe('deleted-board-uuid');
-    expect(results[0].boardSlug).toBeNull();
+    expect(results[0]).toMatchObject({ serialNumber: 'SERIAL001', layoutId: 1, boardUuid: null, boardSlug: null });
   });
 });
 
@@ -634,13 +682,67 @@ describe('recordBoardSerial', () => {
     const onConflictDoUpdate = vi.fn().mockResolvedValue(undefined);
     const values = vi.fn().mockReturnValue({ onConflictDoUpdate });
     mockDb.insert.mockReturnValue({ values });
-    return { values };
+    return { values, onConflictDoUpdate };
   }
 
   // Saved-board uuids are RFC 4122 (the input schema validates strictly), so the
   // ownership tests use real UUIDs rather than placeholder strings.
   const FORGED_UUID = '11111111-1111-4111-8111-111111111111';
   const OWNED_UUID = '22222222-2222-4222-8222-222222222222';
+
+  function conflictSetOf(onConflictDoUpdate: ReturnType<typeof vi.fn>): Record<string, unknown> {
+    const [config] = onConflictDoUpdate.mock.calls[0] as [{ set: Record<string, unknown> }];
+    return config.set;
+  }
+
+  it('leaves an existing board link alone when this connect resolved no board', async () => {
+    const { onConflictDoUpdate } = setupRecord({ savedMatch: [], recordingRow: recordingRow() });
+
+    await socialBoardMutations.recordBoardSerial(
+      null,
+      { input: { serialNumber: 'SN42', boardName: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2', apiLevel: 3 } },
+      makeAuthCtx('user-1'),
+    );
+
+    // The board-presence resolver writes this same column on the same BLE
+    // connect (rememberBoardForSerial). Setting `boardUuid: null` here would
+    // wipe the link it just established and send the next connect back to
+    // serial matching — the race behind the wrong-board bug.
+    expect(conflictSetOf(onConflictDoUpdate)).not.toHaveProperty('boardUuid');
+  });
+
+  it('fills the board link only when the stored one is still null', async () => {
+    const { onConflictDoUpdate } = setupRecordSeq([
+      [],
+      [{ uuid: OWNED_UUID }],
+      [{ uuid: OWNED_UUID }],
+      [recordingRow({ boardUuid: OWNED_UUID, boardSlug: 'my-board' })],
+    ]);
+
+    await socialBoardMutations.recordBoardSerial(
+      null,
+      {
+        input: {
+          serialNumber: 'SN42',
+          boardName: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          apiLevel: 3,
+          boardUuid: OWNED_UUID,
+        },
+      },
+      makeAuthCtx('user-1'),
+    );
+
+    // This mutation knows only which board the route was showing; the presence
+    // resolver knows which wall the climber is on and writes the same column on
+    // the same connect. COALESCE against the stored row is what stops the
+    // recording overwriting it, whichever of the two lands second.
+    const rendered = new PgDialect().sqlToQuery(conflictSetOf(onConflictDoUpdate).boardUuid as SQL);
+    expect(rendered.sql.toLowerCase().replace(/\s+/g, ' ')).toContain('coalesce("user_board_serials"."board_uuid"');
+    expect(rendered.params).toContain(OWNED_UUID);
+  });
 
   it('drops a forged boardUuid (not owned by the caller and not public) to null', async () => {
     // saved lookup: no match → proceeds to write
@@ -703,5 +805,99 @@ describe('recordBoardSerial', () => {
     expect(values).toHaveBeenCalledWith(expect.objectContaining({ boardUuid: OWNED_UUID }));
     expect(result?.boardUuid).toBe(OWNED_UUID);
     expect(result?.boardSlug).toBe('my-board');
+  });
+});
+
+describe('observedBoardSerialMatches', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('correlates an observed serial for a stranger without releasing the owner-only serial field', async () => {
+    const board = makeDbBoard({
+      isPublic: true,
+      name: 'QA MoonBoard',
+      boardType: 'moonboard',
+      serialNumber: 'QA-MOON-01',
+    });
+    setupDbSelectSequence([[board], [], [], [], []]);
+    vi.mocked(canAccessResourceWithoutLink).mockResolvedValueOnce(true);
+    const matches = await socialBoardQueries.observedBoardSerialMatches(
+      null,
+      {
+        input: [{ boardType: 'moonboard', observedSerialNumber: ' qa-moon-01 ' }],
+      },
+      makeUnauthCtx(),
+    );
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toMatchObject({
+      boardType: 'moonboard',
+      observedSerialNumber: 'QA-MOON-01',
+      candidates: [{ uuid: board.uuid, name: 'QA MoonBoard', boardType: 'moonboard' }],
+    });
+    expect(
+      boardSessionPrivacyResolvers.UserBoard.serialNumber(
+        { ...matches[0].candidates[0], ownerDisplayName: undefined, ownerAvatarUrl: undefined },
+        null,
+        makeUnauthCtx(),
+      ),
+    ).toBeNull();
+  });
+
+  it.each([false, true])('preserves the legacy hidden-board geometry fallback when signed in: %s', async (signedIn) => {
+    const board = makeDbBoard({ isPublic: false, isUnlisted: true, serialNumber: 'QA-HIDDEN' });
+    setupDbSelect([board]);
+    const [legacyProjection] = await socialBoardQueries.boardsBySerialNumbers(
+      null,
+      { serialNumbers: ['QA-HIDDEN'], boardType: 'kilter' },
+      makeUnauthCtx(),
+    );
+    const context = signedIn ? makeAuthCtx('stranger') : makeUnauthCtx();
+    const matches = await socialBoardQueries.observedBoardSerialMatches(
+      null,
+      {
+        input: [{ boardType: 'kilter', observedSerialNumber: 'QA-HIDDEN' }],
+      },
+      context,
+    );
+    expect(matches[0].candidates).toEqual([legacyProjection]);
+    expect(matches[0].candidates[0]).toMatchObject({
+      uuid: '',
+      slug: '',
+      boardId: null,
+      name: 'kilter',
+      description: null,
+      ownerId: '',
+      locationName: null,
+      latitude: null,
+      longitude: null,
+      gymId: null,
+      gymUuid: null,
+      gymName: null,
+      layoutId: board.layoutId,
+      sizeId: board.sizeId,
+      setIds: board.setIds,
+    });
+    expect(
+      boardSessionPrivacyResolvers.UserBoard.serialNumber(
+        { ...matches[0].candidates[0], ownerDisplayName: undefined, ownerAvatarUrl: undefined },
+        null,
+        context,
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a scan exceeding twenty observations before querying', async () => {
+    await expect(
+      socialBoardQueries.observedBoardSerialMatches(
+        null,
+        {
+          input: Array.from({ length: 21 }, (_, index) => ({
+            boardType: 'kilter',
+            observedSerialNumber: `QA-${index}`,
+          })),
+        },
+        makeUnauthCtx(),
+      ),
+    ).rejects.toThrow();
+    expect(mockDb.select).not.toHaveBeenCalled();
   });
 });

@@ -1,3 +1,4 @@
+import { REQUEST_FOLLOW, type PrivacyRelationship, type PrivacySettings } from '@boardsesh/graphql/operations/privacy';
 import { useMemo } from 'react';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
@@ -32,7 +33,6 @@ import { getHttpClient } from '../client';
 import { NOTIFICATION_ACTORS_QUERY_KEY } from '../notification-actors-key';
 import { useToggleAuthorFollow } from './use-followed-authors';
 import { updateUserFollowCaches } from './user-follow-cache';
-import { screenshotModeNextPageParam } from '../../screenshot-mode';
 
 const SOCIAL_PAGE_SIZE = 30;
 
@@ -70,10 +70,7 @@ export function useFollowers(userId: string | undefined, enabled = true) {
       return response.followers;
     },
     getNextPageParam: (lastPage, allPages) =>
-      screenshotModeNextPageParam(
-        lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.users.length, 0) : undefined,
-        allPages.length,
-      ),
+      lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.users.length, 0) : undefined,
     enabled: enabled && !!userId,
   });
 }
@@ -95,10 +92,7 @@ export function useFollowing(userId: string | undefined, enabled = true) {
       return response.following;
     },
     getNextPageParam: (lastPage, allPages) =>
-      screenshotModeNextPageParam(
-        lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.users.length, 0) : undefined,
-        allPages.length,
-      ),
+      lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.users.length, 0) : undefined,
     enabled: enabled && !!userId,
   });
 }
@@ -122,10 +116,7 @@ export function useSearchUsers(query: string, enabled = true) {
       return response.searchUsers;
     },
     getNextPageParam: (lastPage, allPages) =>
-      screenshotModeNextPageParam(
-        lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.results.length, 0) : undefined,
-        allPages.length,
-      ),
+      lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.results.length, 0) : undefined,
     enabled: enabled && trimmedQuery.length >= 2,
   });
 }
@@ -137,12 +128,23 @@ export function useToggleUserFollow(currentUserId: string | undefined) {
   return useMutation({
     networkMode: 'always',
     mutationFn: async ({ userId, isFollowedByMe }: { userId: string; isFollowedByMe: boolean }) => {
-      return authorFollow.mutateAsync({ kind: 'user', identifier: userId, follow: !isFollowedByMe });
+      const privacy = queryClient.getQueryData<PrivacySettings>(['privacySettings', currentUserId]);
+      if (privacy?.enabled && !isFollowedByMe) {
+        const response = await getHttpClient().request<{ requestFollow: PrivacyRelationship }>(REQUEST_FOLLOW, {
+          userId,
+        });
+        return { queued: false, viewerId: currentUserId, approved: response.requestFollow.isFollowing };
+      }
+      return {
+        ...(await authorFollow.mutateAsync({ kind: 'user', identifier: userId, follow: !isFollowedByMe })),
+        approved: !isFollowedByMe,
+      };
     },
-    onSuccess: async ({ queued, viewerId }, variables) => {
+    onSuccess: async ({ queued, viewerId, approved }, variables) => {
       const { readLocalUserId } = await import('../../local-user-id');
-      if ((await readLocalUserId()) !== viewerId) return;
-      updateUserFollowCaches(queryClient, variables.userId, !variables.isFollowedByMe, viewerId);
+      if (!viewerId || (await readLocalUserId()) !== viewerId) return;
+      updateUserFollowCaches(queryClient, variables.userId, approved, viewerId);
+      void queryClient.invalidateQueries({ queryKey: ['privacyRelationship'] });
       if (queued) return;
       void queryClient.invalidateQueries({ queryKey: ['publicProfile', variables.userId] });
       if (currentUserId) void queryClient.invalidateQueries({ queryKey: ['publicProfile', currentUserId] });
@@ -173,10 +175,7 @@ export function useUserClimbs(userId: string | undefined, enabled = true) {
       return response.userClimbs;
     },
     getNextPageParam: (lastPage, allPages) =>
-      screenshotModeNextPageParam(
-        lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.climbs.length, 0) : undefined,
-        allPages.length,
-      ),
+      lastPage.hasMore ? allPages.reduce((sum, page) => sum + page.climbs.length, 0) : undefined,
     enabled: enabled && !!userId,
   });
 }

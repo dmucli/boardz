@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vite-plus/test';
 import OgImage, { alt, size, contentType } from '../opengraph-image';
+import { contentType as twitterContentType } from '../twitter-image';
 
 describe('opengraph-image', () => {
   it('exports correct size (1200x630)', () => {
@@ -8,6 +9,7 @@ describe('opengraph-image', () => {
 
   it('exports png content type', () => {
     expect(contentType).toBe('image/png');
+    expect(twitterContentType).toBe('image/png');
   });
 
   it('exports descriptive alt text', () => {

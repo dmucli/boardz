@@ -29,9 +29,17 @@ const {
   BOARD_LOOK_ONBOARDING_OPTIONS,
   BOARD_LOOK_SETTINGS_OPTIONS,
   CLASSIC_PREVIEW_SETTINGS,
+  DEFAULT_SPRAY_WALL_LOOK_OPTION_ID,
+  SPRAY_WALL_DIM_RANGE,
+  SPRAY_WALL_LOOK_OPTIONS,
   applyBoardLookOption,
+  boardLookOptionWallDefault,
+  sprayWallDimLevel,
+  withSprayWallDim,
   buildBoardLookPreviewSettings,
+  drawableBoardLookOptions,
   matchingBoardLookOptionId,
+  renderedBoardLookOption,
 } = await import('../board-look-options');
 
 beforeEach(() => {
@@ -48,10 +56,12 @@ describe('the option lists', () => {
   it('offers the onboarding step the product order, with the two circle looks adjacent', () => {
     // Modern Classic sits immediately before Classic: a climber who came for
     // the circles they already know meets the veiled version of them first, and
-    // the pair can be compared with one swipe.
+    // the pair can be compared with one swipe. Aura Outline leads that
+    // stroke-forward group rather than sitting with the soft Aura variants.
     expect(BOARD_LOOK_ONBOARDING_OPTIONS.map((option) => option.id)).toEqual([
       'aura',
       'aura-subtle',
+      'aura-outline',
       'modern-classic',
       'classic',
       'max-contrast',
@@ -64,11 +74,30 @@ describe('the option lists', () => {
       'aura',
       'aura-subtle',
       'aura-bold',
+      'aura-outline',
       'modern-classic',
       'classic',
       'max-contrast',
       'custom',
     ]);
+  });
+
+  it('names Aura Outline as the spray-wall default, and it is a real card in both rails', () => {
+    // The spray-wall creation step reads this as its default selection: an id
+    // that is not offered would open that step with nothing selected.
+    expect(DEFAULT_SPRAY_WALL_LOOK_OPTION_ID).toBe('aura-outline');
+    for (const options of [BOARD_LOOK_ONBOARDING_OPTIONS, BOARD_LOOK_SETTINGS_OPTIONS]) {
+      const option = options.find((entry) => entry.id === DEFAULT_SPRAY_WALL_LOOK_OPTION_ID);
+      expect(option).toBeDefined();
+      expect(option?.previewSettings?.boardsesh.markStyle).toBe('outline');
+      expect(option?.requiresBoardseshRenderer).toBe(true);
+    }
+  });
+
+  it('gives Aura Outline its own label and description keys', () => {
+    const outline = BOARD_LOOK_SETTINGS_OPTIONS.find((option) => option.id === 'aura-outline')!;
+    expect(outline.labelI18nKey).toBe('mobile.settings.boardLook.presets.auraOutline');
+    expect(outline.descriptionI18nKey).toBe('mobile.settings.boardLook.presets.descriptions.auraOutline');
   });
 
   it('previews Custom as the Aura Bold bundle under a question mark in onboarding', () => {
@@ -87,6 +116,46 @@ describe('the option lists', () => {
   it('marks only Classic as drawable without the Boardsesh renderer', () => {
     const independent = BOARD_LOOK_ONBOARDING_OPTIONS.filter((option) => !option.requiresBoardseshRenderer);
     expect(independent.map((option) => option.id)).toEqual(['classic']);
+  });
+});
+
+describe('the spray-wall look step', () => {
+  it('offers the onboarding looks without Custom, with the wall default among them', () => {
+    expect(SPRAY_WALL_LOOK_OPTIONS.map((option) => option.id)).toEqual([
+      'aura',
+      'aura-subtle',
+      'aura-outline',
+      'modern-classic',
+      'classic',
+      'max-contrast',
+    ]);
+    expect(SPRAY_WALL_LOOK_OPTIONS.some((option) => option.id === DEFAULT_SPRAY_WALL_LOOK_OPTION_ID)).toBe(true);
+  });
+
+  it('stores every card as a concrete mode and the card’s own bundle', () => {
+    for (const option of SPRAY_WALL_LOOK_OPTIONS) {
+      const stored = boardLookOptionWallDefault(option.id);
+      expect(stored).not.toBeNull();
+      expect(['classic', 'aura']).toContain(stored?.mode);
+      expect(stored?.boardsesh).toEqual(option.previewSettings?.boardsesh);
+    }
+    expect(boardLookOptionWallDefault('classic')?.mode).toBe('classic');
+    expect(boardLookOptionWallDefault(DEFAULT_SPRAY_WALL_LOOK_OPTION_ID)).toEqual({
+      mode: 'aura',
+      boardsesh: expect.objectContaining({ markStyle: 'outline', holdShape: 'silhouette' }),
+    });
+  });
+
+  it('has nothing to store for Custom', () => {
+    expect(boardLookOptionWallDefault('custom')).toBeNull();
+    expect(boardLookOptionWallDefault('custom', BOARD_LOOK_SETTINGS_OPTIONS)).toBeNull();
+  });
+
+  it('does not bake the creator’s own role glyphs into the wall look', async () => {
+    // Viewers get THEIR accessibility floor raised onto a wall look when it is
+    // resolved; the stored bundle stays the card's own.
+    await setBoardseshRenderFieldPreference('roleGlyphs', true);
+    expect(boardLookOptionWallDefault(DEFAULT_SPRAY_WALL_LOOK_OPTION_ID)?.boardsesh.roleGlyphs).toBe(false);
   });
 });
 
@@ -162,6 +231,55 @@ describe('matchingBoardLookOptionId', () => {
   });
 });
 
+describe('drawableBoardLookOptions', () => {
+  it('keeps only the cards a build without the Boardsesh renderer can draw', () => {
+    const ids = drawableBoardLookOptions(BOARD_LOOK_SETTINGS_OPTIONS, false).map((option) => option.id);
+    expect(ids).toEqual(['classic', 'custom']);
+  });
+
+  it('keeps every card when the renderer can draw them, or has not been probed yet', () => {
+    expect(drawableBoardLookOptions(BOARD_LOOK_SETTINGS_OPTIONS, true)).toBe(BOARD_LOOK_SETTINGS_OPTIONS);
+    expect(drawableBoardLookOptions(BOARD_LOOK_SETTINGS_OPTIONS, null)).toBe(BOARD_LOOK_SETTINGS_OPTIONS);
+  });
+});
+
+describe('renderedBoardLookOption', () => {
+  const aura = { ...DEFAULT_BOARD_RENDER_SETTINGS, mode: 'aura' } as const;
+  const handTuned = {
+    mode: 'aura',
+    boardsesh: { ...DEFAULT_BOARDSESH_RENDER_SETTINGS, glowReach: 1.77 },
+  } as const;
+
+  it('names the card the climber is on where this build draws it', () => {
+    expect(renderedBoardLookOption(aura, true)?.id).toBe('aura');
+    expect(renderedBoardLookOption(handTuned, true)?.id).toBe('custom');
+    expect(renderedBoardLookOption({ ...aura, mode: 'classic' }, true)?.id).toBe('classic');
+  });
+
+  it('names the matching card before the renderer has been probed, as the Board look rail does', () => {
+    expect(renderedBoardLookOption(aura, null)?.id).toBe('aura');
+  });
+
+  it('says Classic on a build that cannot draw the Boardsesh look, since Classic is what renders', () => {
+    // The picked look would be a lie here: resolveEffectiveRenderSettings draws
+    // classic whatever the climber chose.
+    expect(resolveEffectiveRenderSettings(aura, false).mode).toBe('classic');
+    expect(renderedBoardLookOption(aura, false)?.id).toBe('classic');
+    expect(renderedBoardLookOption(DEFAULT_BOARD_RENDER_SETTINGS, false)?.id).toBe('classic');
+    expect(renderedBoardLookOption(handTuned, false)?.id).toBe('classic');
+    expect(renderedBoardLookOption(aura, false)?.labelI18nKey).toBe('mobile.settings.boardLook.mode.options.classic');
+  });
+
+  it('only ever names a card the Board look page itself offers on that build', () => {
+    for (const available of [true, false, null] as const) {
+      for (const settings of [aura, handTuned, DEFAULT_BOARD_RENDER_SETTINGS]) {
+        const option = renderedBoardLookOption(settings, available);
+        expect(drawableBoardLookOptions(BOARD_LOOK_SETTINGS_OPTIONS, available)).toContain(option);
+      }
+    }
+  });
+});
+
 describe('applyBoardLookOption', () => {
   it('writes only the mode for Classic, keeping every Boardsesh knob', async () => {
     await setBoardseshRenderFieldPreference('glowReach', 1.4);
@@ -189,6 +307,16 @@ describe('applyBoardLookOption', () => {
     expect(settings.mode).toBe('aura');
     expect(settings.boardsesh.glowReach).toBe(0.8);
     expect(matchingBoardLookOptionId(settings)).toBe('aura-subtle');
+  });
+
+  it('applies Aura Outline and reads it back as the Outline card', async () => {
+    await applyBoardLookOption('aura-outline');
+
+    const settings = await loadBoardRenderSettings();
+    expect(settings.mode).toBe('aura');
+    expect(settings.boardsesh.markStyle).toBe('outline');
+    expect(settings.boardsesh.holdShape).toBe('silhouette');
+    expect(matchingBoardLookOptionId(settings)).toBe('aura-outline');
   });
 });
 
@@ -227,5 +355,54 @@ describe('every option signs differently, so no two cards share a PNG', () => {
 
     // The card is a promise: what it drew is what the climber now has.
     expect(applied).toBe(previewed);
+  });
+});
+
+describe('the spray look step dimming slider', () => {
+  const option = (id: string) => {
+    const found = SPRAY_WALL_LOOK_OPTIONS.find((candidate) => candidate.id === id);
+    if (!found) throw new Error(`no spray look option ${id}`);
+    return found;
+  };
+
+  it("starts at each look's own dimming, and has none for Classic", () => {
+    // `auto` has no measured brightness to size itself from on a photo, so it is 0.
+    expect(sprayWallDimLevel(option('aura-outline'))).toBe(0);
+    expect(sprayWallDimLevel(option('aura-subtle'))).toBe(0.3);
+    expect(sprayWallDimLevel(option('max-contrast'))).toBe(0.7);
+    expect(sprayWallDimLevel(option('classic'))).toBeNull();
+  });
+
+  it('leaves every card alone until the creator touches the slider', () => {
+    expect(withSprayWallDim(SPRAY_WALL_LOOK_OPTIONS, null)).toBe(SPRAY_WALL_LOOK_OPTIONS);
+  });
+
+  it('applies a touched value to every look with a veil, and to what the wall stores', () => {
+    const dimmed = withSprayWallDim(SPRAY_WALL_LOOK_OPTIONS, 0.45);
+    for (const candidate of dimmed) {
+      if (candidate.id === 'classic') continue;
+      expect(sprayWallDimLevel(candidate)).toBe(0.45);
+    }
+    const stored = boardLookOptionWallDefault('aura-outline', dimmed);
+    expect(stored?.boardsesh.veil).toBe('custom');
+    expect(stored?.boardsesh.veilOpacity).toBe(0.45);
+    // The rest of the look is untouched.
+    expect(stored?.boardsesh.markStyle).toBe('outline');
+    // Classic has no veil, so it is handed back as it was.
+    expect(dimmed.find((candidate) => candidate.id === 'classic')).toBe(option('classic'));
+  });
+
+  it('stores an explicit off at zero, even over a look with its own strong veil', () => {
+    const stored = boardLookOptionWallDefault('max-contrast', withSprayWallDim(SPRAY_WALL_LOOK_OPTIONS, 0));
+    expect(stored?.boardsesh.veil).toBe('off');
+  });
+
+  it('stays inside the bounds the backend validates against', () => {
+    expect(SPRAY_WALL_DIM_RANGE.min).toBe(0);
+    const stored = boardLookOptionWallDefault(
+      'aura-outline',
+      withSprayWallDim(SPRAY_WALL_LOOK_OPTIONS, SPRAY_WALL_DIM_RANGE.max),
+    );
+    expect(stored?.boardsesh.veilOpacity).toBeLessThanOrEqual(SPRAY_WALL_DIM_RANGE.max);
   });
 });

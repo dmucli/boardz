@@ -1,5 +1,6 @@
 import {
   pgTable,
+  check,
   bigserial,
   bigint,
   text,
@@ -42,6 +43,11 @@ export const userBoards = pgTable(
     angle: bigint('angle', { mode: 'number' }).notNull().default(40),
     isAngleAdjustable: boolean('is_angle_adjustable').notNull().default(true),
     hasLeds: boolean('has_leds').notNull().default(true),
+    // An internet-connected wall device (a laser projector, an LED controller)
+    // lights this wall from the board feed (`boardNowPlaying`). Every climber
+    // takes the wall with no Bluetooth link, and their climbs reach the device
+    // through `reportBoardClimb`.
+    litByWallDevice: boolean('lit_by_wall_device').notNull().default(false),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
     serialNumber: text('serial_number'),
@@ -54,9 +60,10 @@ export const userBoards = pgTable(
     presenceSeq: bigint('presence_seq', { mode: 'number' }).default(0).notNull(),
     deletedAt: timestamp('deleted_at'),
     // Human-curation marker. Non-null means someone with edit access changed this
-    // row (edited, claimed, or soft-deleted it), so the location sync must never
-    // overwrite its metadata again — the sync engine skips its ON CONFLICT SET
-    // when this is set. Sync still keeps the board→gym link current.
+    // row (edited, attached, removed from a gym, or soft-deleted it), so the
+    // location sync must never overwrite it again: the board upsert's ON CONFLICT
+    // SET is skipped entirely for a frozen row, the gym link included. The one
+    // write a frozen row still gets is a missing serial number filled in.
     syncFrozenAt: timestamp('sync_frozen_at'),
     // Merge tombstone: when the serial-board dedupe consolidates duplicate
     // rows for the same physical wall, losers are soft-deleted with this set
@@ -147,9 +154,42 @@ export const userBoards = pgTable(
     // boardBySlug's merge-tombstone fallback looks up soft-deleted losers by
     // slug — those rows are excluded from the active-only unique slug index,
     // so give the fallback its own small partial index.
+    mergedBoardIdx: index('user_boards_merged_board_idx')
+      .on(table.mergedIntoBoardUuid)
+      .where(sql`${table.mergedIntoBoardUuid} IS NOT NULL`),
     mergedSlugIdx: index('user_boards_merged_slug_idx')
       .on(table.slug)
       .where(sql`${table.mergedIntoBoardUuid} IS NOT NULL`),
+  }),
+);
+
+/** A staff-attested relationship between configurations of one physical board. */
+export const gymReportingBoardAliases = pgTable(
+  'gym_reporting_board_aliases',
+  {
+    id: bigserial('id', { mode: 'number' }).primaryKey(),
+    gymId: bigint('gym_id', { mode: 'number' })
+      .notNull()
+      .references(() => gyms.id, { onDelete: 'cascade' }),
+    boardId: bigint('board_id', { mode: 'number' })
+      .notNull()
+      .references(() => userBoards.id, { onDelete: 'cascade' }),
+    rootBoardId: bigint('root_board_id', { mode: 'number' })
+      .notNull()
+      .references(() => userBoards.id, { onDelete: 'cascade' }),
+    verifiedBy: text('verified_by').references(() => users.id, { onDelete: 'set null' }),
+    verifiedAt: timestamp('verified_at', { withTimezone: true }).defaultNow().notNull(),
+    revokedBy: text('revoked_by').references(() => users.id, { onDelete: 'set null' }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+  },
+  (table) => ({
+    activeBoard: uniqueIndex('gym_reporting_alias_active_board_idx')
+      .on(table.boardId)
+      .where(sql`${table.revokedAt} IS NULL`),
+    activeRoot: index('gym_reporting_alias_active_root_idx')
+      .on(table.rootBoardId)
+      .where(sql`${table.revokedAt} IS NULL`),
+    differentBoards: check('gym_reporting_alias_different_boards', sql`${table.boardId} <> ${table.rootBoardId}`),
   }),
 );
 

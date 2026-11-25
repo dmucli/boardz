@@ -137,12 +137,18 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     isBenchmark: Boolean!
     "Whether matching is disallowed on this climb"
     isNoMatch: Boolean!
+    "Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod)."
+    characteristics: [String!]
     "Comment"
     comment: String!
     "When climbed (ISO 8601)"
     climbedAt: String!
     "Encoded hold frames for thumbnail display"
     frames: String
+    "The climb revision this was logged against. 1 on a climb nobody has edited; null when it is not known (imports, and logs older than the field)."
+    climbRevision: Int
+    "Always null. Revision history was retired, so no log is marked as made on an earlier version."
+    climbCurrentRevision: Int @deprecated(reason: "Climb revision history was retired. Always null.")
   }
 
   """
@@ -188,6 +194,8 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     isBenchmark: Boolean!
     "Whether matching is disallowed on this climb"
     isNoMatch: Boolean!
+    "Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod)."
+    characteristics: [String!]
     "Date of the attempts (YYYY-MM-DD)"
     date: String!
     "Number of flash sends"
@@ -214,6 +222,30 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     totalCount: Int!
     "Whether more groups are available"
     hasMore: Boolean!
+  }
+
+  """
+  Narrows userLoggedSetters to the same board scope as the logbook.
+  """
+  input UserLoggedSettersInput {
+    "Optional board type filter for multiple board types"
+    boardTypes: [String!]
+    "Optional layout filters within the selected board type"
+    layoutIds: [Int!]
+    "Optional case-insensitive partial match on the setter username"
+    search: String
+    "Maximum number of setters to return (default 50, max 200)"
+    limit: Int
+  }
+
+  """
+  A setter of climbs the user has logged.
+  """
+  type LoggedSetter {
+    "Setter username, as on the climb"
+    setterUsername: String!
+    "How many of the user's logged ascents are on this setter's climbs"
+    tickCount: Int!
   }
 
   """
@@ -248,6 +280,12 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     maxAngle: Int
     "When true, only include benchmark climbs"
     benchmarkOnly: Boolean
+    "Only include ascents the climber rated at least this many stars (1-5): the tick's own stars, else their synced rating, as the logbook row shows"
+    minQuality: Int
+    "Only include climbs by these setters (exact setter usernames)"
+    setterUsernames: [String!]
+    "Leave out ascents of climbs the community has hidden. For surfaces that headline one ascent; the logbook itself keeps them."
+    excludeHiddenClimbs: Boolean
     "Primary sort field"
     sortBy: String
     "Primary sort order: desc (default) or asc"
@@ -256,9 +294,9 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     secondarySortBy: String
     "Optional secondary sort order"
     secondarySortOrder: String
-    "Optional start date filter (ISO date string, inclusive)"
+    "Optional start of the date range, inclusive. Either a calendar day (YYYY-MM-DD, from that UTC day's midnight) or an ISO 8601 instant with Z or an offset (from exactly that instant)."
     fromDate: String
-    "Optional end date filter (ISO date string, inclusive)"
+    "Optional end of the date range. Either a calendar day (YYYY-MM-DD, through the end of that UTC day, inclusive) or an ISO 8601 instant with Z or an offset (EXCLUSIVE: send the start of the day after the last local day you want)."
     toDate: String
   }
 
@@ -294,6 +332,8 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     attemptCount: Int!
     "Quality rating"
     quality: Int
+    "Raw quality, or the climber's synced star rating for this climb and angle when the tick has none. Sends and flashes only. Null if the resolver doesn't compute it."
+    effectiveQuality: Int
     "Difficulty rating"
     difficulty: Int
     "Human-readable difficulty name"
@@ -319,6 +359,10 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     downvotes: Int
     "Number of (non-deleted) comments on this tick. Null if the resolver doesn't compute it."
     commentCount: Int
+    "The climb revision this was logged against. 1 on a climb nobody has edited; null when it is not known (imports, and logs older than the field). Populated by followingClimbAscents; null on the paginated feeds."
+    climbRevision: Int
+    "Always null. Revision history was retired, so no log is marked as made on an earlier version."
+    climbCurrentRevision: Int @deprecated(reason: "Climb revision history was retired. Always null.")
   }
 
   """
@@ -347,18 +391,123 @@ export const activityFeedTypeDefs = /* GraphQL */ `
   Input for fetching followed users' ticks on a specific climb.
   """
   input FollowingClimbAscentsInput {
-    "Board type (kilter, tension, moonboard)"
+    "Board type (kilter, tension, moonboard, spray, ...)"
     boardType: String!
     "Climb UUID"
     climbUuid: String!
   }
 
   """
-  Unpaginated result: all ticks from followed users for a given climb.
+  How many followed climbers logged a climb at one angle.
+  """
+  type FollowingClimbAscentsAngleCount {
+    "Board angle"
+    angle: Int!
+    "Followed climbers with at least one log at this angle, any status"
+    climberCount: Int!
+    "Followed climbers with at least one flash or send at this angle"
+    senderCount: Int!
+  }
+
+  """
+  Counts over every log from followed climbers on a climb. Not bound by the
+  100-row cap on the list.
+  """
+  type FollowingClimbAscentsSummary {
+    "Followed climbers with at least one log, any angle, any status"
+    climberCount: Int!
+    "Followed climbers with at least one flash or send, any angle"
+    senderCount: Int!
+    "One entry per angle that has a log, ascending. Angles with none are absent."
+    byAngle: [FollowingClimbAscentsAngleCount!]!
+  }
+
+  """
+  The 100 most recent logs, plus counts that cover all of them
   """
   type FollowingClimbAscentsResult {
-    "List of feed items"
+    "Newest first, one row per log, every angle, attempts included. At most 100."
     items: [FollowingAscentFeedItem!]!
+    "Whether more than 100 logs exist. There is no way to page to them."
+    hasMore: Boolean!
+    "Counts across all logs, including the ones past the cap"
+    summary: FollowingClimbAscentsSummary!
+  }
+
+  """
+  Input for one page of everyone's logs on a climb.
+  """
+  input ClimbLogsInput {
+    "Board type (kilter, tension, moonboard, spray, ...)"
+    boardType: String!
+    "Climb UUID"
+    climbUuid: String!
+    "Only logs at this angle. Omit for every angle."
+    angle: Int
+    "Only logs with a non-empty note."
+    withNotes: Boolean
+    "Only flashes and sends."
+    sendsOnly: Boolean
+    "Signed-in callers only: drop the caller's own logs and logs by people they follow. Ignored when anonymous."
+    excludeFollowed: Boolean
+    "One row per climber: their newest log that passes the filters above."
+    latestPerClimber: Boolean
+    "1 to 50, default 20"
+    limit: Int
+    "Opaque keyset cursor from the previous page"
+    cursor: String
+  }
+
+  """
+  One climber's log on a climb, as the public per-climb list returns it.
+  """
+  type ClimbLogItem {
+    "Tick UUID"
+    uuid: ID!
+    "User who logged it"
+    userId: ID!
+    "Display name of the user"
+    userDisplayName: String
+    "Avatar URL of the user"
+    userAvatarUrl: String
+    "UUID of the climb the log is stored under"
+    climbUuid: String!
+    "Board type"
+    boardType: String!
+    "Board angle"
+    angle: Int!
+    "Whether the climb was mirrored"
+    isMirror: Boolean!
+    "flash, send or attempt"
+    status: String!
+    "Number of tries"
+    attemptCount: Int!
+    "Star rating given on the log itself"
+    quality: Int
+    "Raw quality, or the climber's synced star rating for this climb and angle when the log has none. Sends and flashes only."
+    effectiveQuality: Int
+    "Personal grade id, null when none was given"
+    difficulty: Int
+    "The climber's note, empty when there is none"
+    comment: String!
+    "When the climb was logged"
+    climbedAt: String!
+    "The climb revision this was logged against. 1 on a climb nobody has edited; null when it is not known (imports, and logs older than the field)."
+    climbRevision: Int
+    "Always null. Revision history was retired, so no log is marked as made on an earlier version."
+    climbCurrentRevision: Int @deprecated(reason: "Climb revision history was retired. Always null.")
+  }
+
+  """
+  One page of logs on a climb, newest first.
+  """
+  type ClimbLogsResult {
+    "Newest first (climbed at, then id)"
+    items: [ClimbLogItem!]!
+    "Pass back as input.cursor for the next page. Null on the last page."
+    cursor: String
+    "Whether another page exists"
+    hasMore: Boolean!
   }
 
   # ============================================
@@ -473,7 +622,7 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     userId: String
     "Restrict results to users followed by the authenticated viewer"
     followingOnly: Boolean
-    "Include one daily hardest-send card for followed/user-filtered days without explicit sessions"
+    "Include daily activity cards for user, followed-user, or board scopes, covering readable logs outside listed sessions"
     includeDailyHighlights: Boolean
   }
 
@@ -540,6 +689,8 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     isMirror: Boolean!
     isBenchmark: Boolean!
     isNoMatch: Boolean!
+    "Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod)."
+    characteristics: [String!]
     comment: String
     frames: String
     setterUsername: String
@@ -619,6 +770,8 @@ export const activityFeedTypeDefs = /* GraphQL */ `
     isMirror: Boolean!
     isBenchmark: Boolean!
     isNoMatch: Boolean!
+    "Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod)."
+    characteristics: [String!]
     comment: String
     frames: String
     setterUsername: String

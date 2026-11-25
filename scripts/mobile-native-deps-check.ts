@@ -18,7 +18,7 @@
  * check fails the PR the moment that invariant is broken, on a cheap Linux
  * runner — no Xcode required.
  *
- * It enforces two invariants per rule:
+ * For legacy scripts it enforces two invariants per rule:
  *   1. Resolvable — the tool resolves from packages/mobile (the exact thing the
  *      bundle phase does). This is what broke the TestFlight archive.
  *   2. Version-aligned — the copy packages/mobile resolves is the SAME install
@@ -27,6 +27,10 @@
  *      bumped; this catches that so the bundle phase and the JS runtime never
  *      use mismatched CLI versions.
  *
+ * Sentry 8.24, 8.32, 8.33 and 8.35 resolve their CLI from the SDK's own dependency
+ * graph instead. Check that installed dependency for these audited versions;
+ * its CLI need not match the direct CLI used by our standalone dSYM uploader.
+ *
  * Usage: vp run check:mobile-native-deps
  */
 
@@ -34,12 +38,15 @@ import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { checkInstalledSentryAndroidSdk } from './mobile-sentry-native-check';
 
 export interface NativeDepRule {
   /** A direct dependency of packages/mobile whose Expo config plugin injects an iOS build-phase script. */
   trigger: string;
-  /** Bare module specifiers that build-phase script resolves via Node from packages/mobile. */
+  /** Bare module specifiers that the build-phase script resolves via Node. */
   tools: readonly string[];
+  /** Audited installed trigger versions whose scripts resolve tools from their own dependency graph. */
+  triggerToolResolutionVersions?: readonly string[];
 }
 
 /**
@@ -50,7 +57,13 @@ export interface NativeDepRule {
  * add a rule here — otherwise that tool's drift won't be caught until the next
  * push-to-main archive. Today only @sentry/react-native does this.
  */
-export const RULES: readonly NativeDepRule[] = [{ trigger: '@sentry/react-native', tools: ['@sentry/cli'] }];
+export const RULES: readonly NativeDepRule[] = [
+  {
+    trigger: '@sentry/react-native',
+    tools: ['@sentry/cli'],
+    triggerToolResolutionVersions: ['8.24.0', '8.32.0', '8.33.0', '8.35.0'],
+  },
+];
 
 /**
  * Resolution + version reads, abstracted so {@link checkNativeBuildPhaseDeps}
@@ -84,10 +97,24 @@ export function checkNativeBuildPhaseDeps(
   const errors: string[] = [];
   let checked = 0;
 
-  for (const { trigger, tools } of rules) {
+  for (const { trigger, tools, triggerToolResolutionVersions } of rules) {
     if (!mobileDeps[trigger]) continue;
     for (const tool of tools) {
       checked += 1;
+
+      if (triggerToolResolutionVersions) {
+        try {
+          const triggerPackageJson = resolver.resolve(mobilePackageJsonPath, `${trigger}/package.json`);
+          if (triggerToolResolutionVersions.includes(resolver.readVersion(triggerPackageJson))) {
+            const toolFromTrigger = resolver.resolve(triggerPackageJson, `${tool}/package.json`);
+            resolver.readVersion(toolFromTrigger);
+            continue;
+          }
+        } catch (error) {
+          errors.push(`could not verify ${tool} resolution from ${trigger}: ${(error as Error).message}`);
+          continue;
+        }
+      }
 
       // (1) Resolvability from packages/mobile — exactly what the iOS bundle
       //     phase does, and the failure that broke the TestFlight archive.
@@ -175,14 +202,17 @@ export function main(): number {
   }
 
   const { checked, errors } = checkNativeBuildPhaseDeps(mobilePackageJson, mobileDeps, RULES, nodeResolver);
+  errors.push(...checkInstalledSentryAndroidSdk(mobilePackageJson));
 
   if (errors.length > 0) {
-    console.error('[mobile-native-deps] FAILED — native build-phase deps not OK:');
+    console.error('[mobile-native-deps] FAILED — native deps not OK:');
     for (const error of errors) console.error(`  ✗ ${error}`);
     return 1;
   }
 
-  console.log(`[mobile-native-deps] OK — ${checked} native build-phase dep(s) resolvable and version-aligned.`);
+  console.log(
+    `[mobile-native-deps] OK — ${checked} native build-phase dep(s) resolve from the required dependency scope.`,
+  );
   return 0;
 }
 

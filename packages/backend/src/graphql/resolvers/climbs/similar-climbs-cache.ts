@@ -31,7 +31,7 @@ import { findSimilarClimbs, type SimilarClimbResult } from './climb-similarity';
  * ## Why single-flight, separately from the cache
  *
  * The cache changes how OFTEN the statement runs. `singleFlight` changes how
- * many copies run AT ONCE, and per `docs/db-connectivity.md` that is the
+ * many copies run AT ONCE, and per `docs/operations/db-connectivity.md` that is the
  * property that keeps a cold window from emptying the pool: "the Redis hit rate
  * is not the safety property; the concurrency of the miss is." A crawler
  * arriving on one climb's several URLs in the same second is exactly the shape
@@ -55,7 +55,8 @@ import { findSimilarClimbs, type SimilarClimbResult } from './climb-similarity';
  */
 
 /** Bump when a code change alters what this query RETURNS for an existing key. */
-const CACHE_VERSION = 'v1';
+// v2: cached similarity rows carry nullable, frame-derived requiredSetIds.
+const CACHE_VERSION = 'v2';
 
 /**
  * One hour, matching the web front door's own `revalidate`. The rows behind it

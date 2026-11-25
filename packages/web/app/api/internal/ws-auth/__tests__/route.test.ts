@@ -1,6 +1,12 @@
+vi.mock('server-only', () => ({}));
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
 
+const admissionMock = vi.fn();
+vi.mock('@/app/lib/auth/credential-admission.server', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/app/lib/auth/credential-admission.server')>()),
+  admitPresentedWebCredential: (...args: unknown[]) => admissionMock(...args),
+}));
 const getTokenMock = vi.fn();
 const decodeMock = vi.fn();
 vi.mock('next-auth/jwt', () => ({
@@ -10,7 +16,8 @@ vi.mock('next-auth/jwt', () => ({
 
 // Real names, stubbed predicate: the route's job here is to try BOTH, and a
 // stub that invented names would not prove that.
-vi.mock('@/app/lib/auth/secure-cookies', () => ({
+vi.mock('@/app/lib/auth/secure-cookies', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/app/lib/auth/secure-cookies')>()),
   isSecureCookieContext: () => true,
   sessionCookieNameCandidates: () => ['__Secure-next-auth.session-token', 'next-auth.session-token'],
 }));
@@ -45,6 +52,7 @@ describe('GET /api/internal/ws-auth', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.NEXTAUTH_SECRET = 'test-secret';
+    admissionMock.mockResolvedValue('user-1');
   });
 
   afterEach(() => {
@@ -140,25 +148,22 @@ describe('GET /api/internal/ws-auth', () => {
     expect(response.headers.get('Cache-Control')).toBe('private, no-store');
   });
 
-  it('fails closed to anonymous and warns when NEXTAUTH_SECRET is missing', async () => {
+  it('returns retryable unavailability without clearing cookies when the secret is missing', async () => {
     delete process.env.NEXTAUTH_SECRET;
     getTokenMock.mockResolvedValue('encrypted-session-token');
-    const stderr = captureStderr();
+    const response = await GET(request());
+    expect(response.status).toBe(503);
+    expect(response.headers.getSetCookie()).toEqual([]);
+    expect(decodeMock).not.toHaveBeenCalled();
+  });
 
-    try {
-      const response = await GET(request());
-
-      expect(response.status).toBe(200);
-      await expect(response.json()).resolves.toEqual({ token: null, authenticated: false });
-      // On stderr, at warn level, with the route bound as its own attribute.
-      expect(stderr.lines.join('')).toContain('NEXTAUTH_SECRET');
-      expect(stderr.lines.join('')).toContain('[warn]');
-      expect(stderr.lines.join('')).toContain('/api/internal/ws-auth');
-      // Never attempt to decode without the secret.
-      expect(decodeMock).not.toHaveBeenCalled();
-    } finally {
-      stderr.restore();
-    }
+  it('denies a deleted principal without exposing its raw credential', async () => {
+    getTokenMock.mockResolvedValue('encrypted-session-token');
+    decodeMock.mockResolvedValue({ sub: 'user-1' });
+    admissionMock.mockResolvedValue(null);
+    const response = await GET(request());
+    expect(await response.json()).toEqual({ token: null, authenticated: false });
+    expect(response.headers.getSetCookie()).toEqual([]);
   });
 
   it('keeps a valid pre-deploy cookie usable while its login identity is backfilled', async () => {
@@ -171,6 +176,20 @@ describe('GET /api/internal/ws-auth', () => {
       token: 'legacy-encrypted-session-token',
       authenticated: true,
       userId: 'user-1',
+    });
+  });
+
+  it('names a pre-claim cookie’s login by its jti, as the jwt callback does on every session read', async () => {
+    getTokenMock.mockResolvedValue('legacy-encrypted-session-token');
+    decodeMock.mockResolvedValue({ sub: 'user-1', jti: 'jti-of-this-cookie' });
+
+    const response = await GET(request());
+
+    await expect(response.json()).resolves.toEqual({
+      token: 'legacy-encrypted-session-token',
+      authenticated: true,
+      userId: 'user-1',
+      authSessionId: 'jti-of-this-cookie',
     });
   });
 
@@ -192,6 +211,19 @@ describe('GET /api/internal/ws-auth', () => {
       expect(stderr.lines.join('')).toContain('cookie read failed');
     } finally {
       stderr.restore();
+    }
+  });
+
+  it('answers 503 for an unknown mode value, and reads no cookie and writes none (#7596)', async () => {
+    vi.stubEnv('AUTH_BROWSER_SESSION_MODE', 'Better-Auth');
+    try {
+      const response = await GET(request());
+      expect(response.status).toBe(503);
+      expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+      expect(response.headers.getSetCookie()).toEqual([]);
+      expect(getTokenMock).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
     }
   });
 });

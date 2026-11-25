@@ -1,7 +1,7 @@
 import type { ClimbQueueItem } from '@boardsesh/queue';
 
 /** Which sub-drawer is currently open inside the play view. */
-export type ActiveSubDrawer = 'none' | 'queue' | 'actions' | 'playlist' | 'lightControl' | 'angleSelector';
+export type ActiveSubDrawer = 'none' | 'queue' | 'playlist' | 'lightControl' | 'angleSelector';
 
 /** Core state for the play view drawer. */
 export type PlayDrawerState = {
@@ -48,4 +48,11 @@ export type NavigationState = {
    * plain remaining count they always had.
    */
   remainingCount: number;
+  /**
+   * True when Next has nothing to go to because the climb on screen is the last
+   * one on the list the player is walking (issue #6664). Tells "end of the list"
+   * apart from "nothing to walk": the player offers its end card for the first
+   * and nothing for the second.
+   */
+  atTrackEnd: boolean;
 };

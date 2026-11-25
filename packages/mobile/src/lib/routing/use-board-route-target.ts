@@ -14,7 +14,7 @@
 // `parseBoardPath` deliberately doesn't parse.
 //
 // Resolution is local-first, then server, and never reactive. Every lookup here
-// is imperative (`fetchAllMyBoards`, `fetchBoardBySlug`) because React Query
+// is imperative (`fetchAllMyOwnedBoards`, `fetchBoardBySlug`) because React Query
 // runs `networkMode: 'offlineFirst'`: an awaited `refetch()` on a cold offline
 // open pauses its retryer and never settles, so the route would spin forever
 // over a climb that is sitting in the downloaded snapshot. A bare request
@@ -28,17 +28,18 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'expo-router';
-import { onlineManager } from '@tanstack/react-query';
+import { onlineManager, useQueryClient } from '@tanstack/react-query';
 import { isNetworkError } from '@boardsesh/offline-sync/error-classification';
-import type { Climb, CreateBoardInput, UserBoard } from '@boardsesh/shared-schema';
+import type { Climb, UserBoard } from '@boardsesh/shared-schema';
 import { toBoardPath, type BoardRouteTarget } from './board-route-target';
 // The platform switch is this constant, not `Platform.OS` — the hook then needs
 // no `react-native` import, whose RN 0.86 Flow entry the vitest node env cannot
 // parse (see the config's `hooks-dual-write` exclusion note).
 import { RELAXES_ANONYMOUS_ROUTES } from './anonymous-auth-gate';
 import { useClimb } from '../graphql/hooks';
-import { fetchAllMyBoards, fetchBoardBySlug, fetchBoardByUuid, useCreateBoard } from '../graphql/hooks';
-import { readDuplicateBoardError } from '../graphql/extract-error-message';
+import { fetchBoardBySlug, useCreateBoard } from '../graphql/hooks';
+import { fetchAllMyOwnedBoards } from '../graphql/hooks/fetch-all-my-owned-boards';
+import { createBoardOrAdoptDuplicate } from '../graphql/create-board-or-adopt-duplicate';
 import { useSetActiveBoard } from '../graphql/use-active-board';
 import { getStoredActiveBoard } from '../active-board-store';
 import { getOfflineBoards } from '../../settings/offline-boards';
@@ -51,6 +52,9 @@ import {
 } from '../board-path-to-user-board';
 import { openClimbInPlayDrawer } from '../open-climb-in-play-drawer';
 import { consumeClimbHandoffIntent } from './climb-handoff-intent';
+import { useLaunchHoldReleased } from '../launch-hold';
+import { isWallUuidParam } from '../spray/use-spray-wall-link';
+import { isBoardInviteToken } from '../board-share/board-share-link';
 
 /**
  * What the entry route should draw.
@@ -104,6 +108,9 @@ export type BoardRouteResult = {
  *   redirector pops back where it came from.
  */
 export type BoardRouteMode = 'deep-link' | 'in-app';
+
+/** What a hand-off reports: the type of the board the URL opened (`kilter`, `spray`, …). */
+export type BoardRouteHandedOff = { boardType: string | null };
 
 const CLIMBS_TAB = '/(tabs)/climbs' as const;
 
@@ -178,40 +185,6 @@ async function resolveBoardSlugLocalFirst(slug: string): Promise<UserBoard | nul
 }
 
 /**
- * `createBoard`, with the server's duplicate rejection recovered into the board
- * it names.
- *
- * Walking the owned list first closes the common case but not the race: a board
- * with this config created on another device between that walk and this create
- * still comes back as BOARD_DUPLICATE_CONFIG. The rejection carries the existing
- * board's uuid precisely so a client needn't search a paginated list for it — so
- * a URL that would otherwise dead-end as not-found adopts the board the user
- * already has. The angle comes off the create input, which is the URL's.
- */
-async function createBoardOrAdoptDuplicate(
-  input: CreateBoardInput,
-  createBoard: (input: CreateBoardInput) => Promise<UserBoard>,
-): Promise<UserBoard> {
-  try {
-    return await createBoard(input);
-  } catch (createError) {
-    const duplicate = readDuplicateBoardError(createError);
-    if (!duplicate) throw createError;
-    // A duplicate naming a board we then can't read is a dead end, not a
-    // fallback — and the create rejection is the failure that describes what
-    // happened, so the lookup's own rejection is swallowed rather than replacing
-    // it. Hence `.catch(() => null)`: a rejected lookup and a null board are the
-    // same outcome here.
-    const existing = await fetchBoardByUuid(duplicate.boardUuid).catch(() => null);
-    if (!existing) throw createError;
-    // `CreateBoardInput.angle` is optional on the wire; `buildCreateBoardInput`
-    // always fills it from the URL, and the board's own angle is the fallback.
-    const angle = input.angle ?? existing.angle;
-    return existing.angle === angle ? existing : { ...existing, angle };
-  }
-}
-
-/**
  * A finished resolve, tagged with the path it finished for. `board: null` means
  * that path is unresolvable.
  *
@@ -236,10 +209,14 @@ type AdoptedBoardState = { path: string; board: UserBoard | null };
 function useAdoptedBoard(
   target: BoardRouteTarget | null,
   enabled: boolean,
+  wallUuid?: string,
+  inviteToken?: string,
+  confirmBoardJoin?: (boardName: string) => Promise<boolean>,
 ): { board: UserBoard | null; error: boolean } {
   const { isAuthenticated, isLoading: authIsLoading } = useAuth();
   const createBoard = useCreateBoard();
   const setActiveBoard = useSetActiveBoard();
+  const queryClient = useQueryClient();
 
   const [adopted, setAdopted] = useState<AdoptedBoardState | null>(null);
   // Bumped by the reconnect watcher below to re-enter the resolve effect for a
@@ -258,23 +235,26 @@ function useAdoptedBoard(
   // but that's the provider's invariant, not this hook's, and a cold deep-link
   // open is exactly where it would bite. The `/b/{slug}` form needs no session
   // at all (public `boardBySlug`, local `setActiveBoard`), so it stays eager.
-  const waitingForAuth = needsOwnedBoards && authIsLoading;
+  const waitingForAuth = (needsOwnedBoards || !!wallUuid || !!inviteToken) && authIsLoading;
   // Key the effect on the resolved path rather than the target object so a
   // re-render with an equivalent target doesn't re-run board creation.
   const boardPath = enabled && target && !waitingForAuth ? toBoardPath(target) : null;
+  // Capability changes on the same slug are separate resolutions. A denied or
+  // pending earlier link must not keep the next link's answer out of the route.
+  const resolutionKey = boardPath ? JSON.stringify([boardPath, wallUuid ?? null, inviteToken ?? null]) : null;
   const resolvedPathRef = useRef<string | null>(null);
 
   // Only a resolve that finished for THIS path may be read; see AdoptedBoardState.
-  const settled = adopted && adopted.path === boardPath ? adopted : null;
+  const settled = adopted && adopted.path === resolutionKey ? adopted : null;
   const board = settled?.board ?? null;
   const error = settled?.board === null;
 
   // The resolve effect deliberately runs once per path, so it must not close
   // over the first render's values — the session is exactly the one that lands
   // late on a cold deep-link open.
-  const queriesRef = useRef({ createBoard, isAuthenticated });
+  const queriesRef = useRef({ createBoard, isAuthenticated, confirmBoardJoin });
   useEffect(() => {
-    queriesRef.current = { createBoard, isAuthenticated };
+    queriesRef.current = { createBoard, isAuthenticated, confirmBoardJoin };
   });
 
   // Same trick for the reconnect watcher, which subscribes once and must not
@@ -308,16 +288,28 @@ function useAdoptedBoard(
   }, []);
 
   useEffect(() => {
-    if (!boardPath || resolvedPathRef.current === boardPath) return;
+    if (!boardPath || !resolutionKey || resolvedPathRef.current === resolutionKey) return;
     // The marker claims the path for the duration of the run so re-renders don't
     // re-enter it. A run that never finishes gives the claim back in the cleanup
     // below — nothing else does, and a stale claim is unrecoverable.
-    resolvedPathRef.current = boardPath;
+    resolvedPathRef.current = resolutionKey;
 
     let cancelled = false;
     let settledThisRun = false;
     void (async () => {
       try {
+        // Ordinary board routes do not need the spray renderer or native auth
+        // storage. Load these dependencies only when redeeming a capability.
+        const capabilityModules = wallUuid
+          ? await Promise.all([import('../spray/spray-wall-link-board'), import('../auth-store')])
+          : null;
+        // A board share link (`?invite=`) asks to Join, and joins before resolving the board only if confirmed.
+        const shareLinkModule =
+          inviteToken && !wallUuid ? await import('../board-share/redeem-board-share-link') : null;
+        const inviteAuthStore = inviteToken && !wallUuid ? await import('../auth-store') : null;
+        if (cancelled) return;
+        const credentialStore = capabilityModules?.[1] ?? inviteAuthStore;
+        const credentialGeneration = credentialStore?.captureAuthCredentialGeneration() ?? null;
         const { createBoard: createBoardMutation, isAuthenticated: signedIn } = queriesRef.current;
         // Local first, before anything can wait on the network. The deep-linked
         // board is nearly always the board this device is already on, and on a
@@ -325,7 +317,7 @@ function useAdoptedBoard(
         // itself already serves from the downloaded snapshot.
         let localBoard = needsOwnedBoards ? await findLocalBoardForPath(boardPath, !onlineManager.isOnline()) : null;
 
-        let ownedBoards: UserBoard[] = [];
+        let ownedBoardSnapshot: Awaited<ReturnType<typeof fetchAllMyOwnedBoards>> | null = null;
         if (needsOwnedBoards && !localBoard) {
           // Offline with nothing local is unresolvable and has to say so rather
           // than wait: every remaining step (the owned-list walk, CREATE_BOARD)
@@ -335,24 +327,20 @@ function useAdoptedBoard(
           if (!onlineManager.isOnline()) {
             throw new Error(`No downloaded board matches ${boardPath} while offline`);
           }
-          // Same cold-start guard the join screen uses: an empty owned-board list
-          // makes resolveBoardForSession mint a board the user already has, which
-          // the backend rejects. Fetch the *whole* list — `myBoards` pages at 50,
-          // and a board on page two reads as no board at all — and let a rejected
-          // walk fail the resolve, since "no boards" and "we don't know your
-          // boards" mint the same duplicate otherwise. Signed out is legitimately
-          // empty: there the create fails, and that rejection is the not-found.
+          // A signed-out native route is not reachable in the app, and the web
+          // route gate skips adoption for signed-out visitors. Keep this check
+          // as defense in depth; the resolver's loader still rejects if a tuple
+          // resolve reaches it without an owner snapshot.
           if (signedIn) {
             try {
-              ownedBoards = await fetchAllMyBoards();
+              ownedBoardSnapshot = await fetchAllMyOwnedBoards();
             } catch (listError) {
               // `onlineManager` said online and the walk still never reached the
               // server, so it was lying (captive portal, dead uplink, lost
               // cold-start seed race). Take the downloaded cards' second look
               // before giving up, exactly as `offlineAwareRequest` does — but
-              // only for a transport failure. A rejection carrying a server
-              // status is a verdict, and adopting a stale card over it would
-              // hand back a board the backend has disowned.
+              // only for a transport failure. An identity/owner failure or server
+              // rejection is authoritative and must not fall back to stale rows.
               if (!isNetworkError(listError)) throw listError;
               localBoard = await findLocalBoardForPath(boardPath, true);
               if (!localBoard) throw listError;
@@ -363,24 +351,53 @@ function useAdoptedBoard(
         const resolved =
           localBoard ??
           (await resolveBoardForSession(boardPath, {
-            ownedBoards,
+            // The account-verified snapshot is already collected above, so the
+            // resolver can re-check ownerId without starting a second walk.
+            loadOwnedBoards: async () => {
+              if (!ownedBoardSnapshot) {
+                throw new Error('Cannot resolve a board without a verified account owner');
+              }
+              return ownedBoardSnapshot;
+            },
             createBoard: (input) =>
               createBoardOrAdoptDuplicate(input, (createInput) => createBoardMutation.mutateAsync(createInput)),
             // Local first here too, so a named board already on the device opens
             // offline. The named-path angle rule (URL angle, else the board's
             // own) stays inside `resolveBoardForSession` for both branches.
-            fetchBoardBySlug: resolveBoardSlugLocalFirst,
+            fetchBoardBySlug:
+              wallUuid && capabilityModules
+                ? (slug) => capabilityModules[0].fetchSprayWallBoardFromLink(queryClient, wallUuid, slug)
+                : inviteToken && shareLinkModule
+                  ? (slug) =>
+                      shareLinkModule.fetchBoardFromShareLink(
+                        inviteToken,
+                        slug,
+                        resolveBoardSlugLocalFirst,
+                        queriesRef.current.confirmBoardJoin,
+                        () => !cancelled,
+                      )
+                  : resolveBoardSlugLocalFirst,
           }));
         if (cancelled) return;
-        await setActiveBoard(resolved);
-        if (cancelled) return;
+        if (credentialGeneration !== null && !credentialStore?.isAuthCredentialGenerationCurrent(credentialGeneration))
+          return;
+        const adoptionIsCurrent = () =>
+          !cancelled &&
+          (credentialGeneration === null || !!credentialStore?.isAuthCredentialGenerationCurrent(credentialGeneration));
+        // The storage write can queue behind another board choice. Its own
+        // guard must retain this credential scope until persistence commits.
+        const adoptedBoard =
+          credentialGeneration === null
+            ? await setActiveBoard(resolved)
+            : await setActiveBoard(resolved, adoptionIsCurrent);
+        if (!adoptionIsCurrent() || (credentialGeneration !== null && !adoptedBoard)) return;
         settledThisRun = true;
-        setAdopted({ path: boardPath, board: resolved });
+        setAdopted({ path: resolutionKey, board: resolved });
       } catch (resolveError) {
         if (__DEV__) console.warn('[board-route] could not resolve board from URL', boardPath, resolveError);
         if (cancelled) return;
         settledThisRun = true;
-        setAdopted({ path: boardPath, board: null });
+        setAdopted({ path: resolutionKey, board: null });
       }
     })();
 
@@ -393,11 +410,11 @@ function useAdoptedBoard(
       // same, and `authIsLoading` flipping true mid-resolve blanks `boardPath`
       // and restores it — all three land here. A replayed run can double-fire
       // CREATE_BOARD in a narrow race, which the duplicate recovery absorbs.
-      if (!settledThisRun && resolvedPathRef.current === boardPath) resolvedPathRef.current = null;
+      if (!settledThisRun && resolvedPathRef.current === resolutionKey) resolvedPathRef.current = null;
     };
     // `retryNonce` is a dep purely so a reconnect re-enters this effect; nothing
     // in the body reads it.
-  }, [boardPath, needsOwnedBoards, retryNonce, setActiveBoard]);
+  }, [boardPath, inviteToken, needsOwnedBoards, queryClient, resolutionKey, retryNonce, setActiveBoard, wallUuid]);
 
   return { board, error };
 }
@@ -501,7 +518,11 @@ export function useBoardRouteTarget(
   options?: {
     mode?: BoardRouteMode;
     activationIntent?: string | string[];
-    onHandedOff?: () => void;
+    wallUuid?: string | string[];
+    /** A home board share link's token (`?invite=`); redeemed before board adoption. */
+    inviteToken?: string | string[];
+    confirmBoardJoin?: (boardName: string) => Promise<boolean>;
+    onHandedOff?: (handedOff: BoardRouteHandedOff) => void;
     anonymousClimbEnabled?: boolean;
   },
 ): BoardRouteResult {
@@ -551,7 +572,24 @@ export function useBoardRouteTarget(
   // Neither signed-out branch adopts. Adoption's first act is a CREATE_BOARD the
   // backend refuses without a session, and it is not a render input for either
   // one — so it is skipped rather than gated on the outcome.
-  const { board: adoptedBoard, error: boardError } = useAdoptedBoard(target, adoptsBoard && !signedOutOnWeb);
+  const wallParam = Array.isArray(options?.wallUuid) ? options.wallUuid[0] : options?.wallUuid;
+  const wallUuid =
+    (target?.kind === 'slug-list' || target?.kind === 'slug-climb') && isWallUuidParam(wallParam)
+      ? wallParam.toLowerCase()
+      : undefined;
+  const inviteParam = Array.isArray(options?.inviteToken) ? options.inviteToken[0] : options?.inviteToken;
+  // Only a board link carries one, and only a well-formed token is read at all.
+  const inviteToken = target?.kind === 'slug-list' && isBoardInviteToken(inviteParam) ? inviteParam : undefined;
+  // A native Join dialog must wait for the launch update gate: a cold-open
+  // update could otherwise reload after the climber approved the invite.
+  const launchHoldReleased = useLaunchHoldReleased();
+  const { board: adoptedBoard, error: boardError } = useAdoptedBoard(
+    target,
+    adoptsBoard && !signedOutOnWeb && (!inviteToken || launchHoldReleased),
+    wallUuid,
+    inviteToken,
+    options?.confirmBoardJoin,
+  );
   const anonymousBoard = anonymousSlugBoard.state === 'resolved' ? anonymousSlugBoard.board : null;
   const board = adoptedBoard ?? anonymousBoard;
 
@@ -609,7 +647,12 @@ export function useBoardRouteTarget(
   useEffect(() => {
     onHandedOffRef.current = options?.onHandedOff;
   });
+  // The hand-off ends in `router.navigate('/play')`, a root modal that iOS
+  // presents above the launch update placeholder. Wait for launch to be ready,
+  // so a cold-start climb link does not open a usable player the gate may then
+  // reload out from under (#6006). This screen's own spinner covers the wait.
   useEffect(() => {
+    if (!launchHoldReleased) return;
     if (!target || !targetKey || handedOffRef.current === targetKey) return;
     if (authRequired) return;
     // The anonymous climb renders where it stands. Handing off would navigate to
@@ -644,16 +687,20 @@ export function useBoardRouteTarget(
       router.replace(CLIMBS_TAB);
     };
 
+    // The config's board name is the board type: the URL's own for a tuple
+    // link, the adopted board's for a `/b/{slug}` one.
+    const handedOff: BoardRouteHandedOff = { boardType: boardConfig?.boardName ?? null };
+
     if (!wantsClimb) {
       handedOffRef.current = targetKey;
-      onHandedOffRef.current?.();
+      onHandedOffRef.current?.(handedOff);
       leave();
       return;
     }
 
     if (!climb || !boardConfig) return;
     handedOffRef.current = targetKey;
-    onHandedOffRef.current?.();
+    onHandedOffRef.current?.(handedOff);
     // Public URLs preview. Only the internal tick's one-use target-bound intent activates.
     const activate = !adoptsBoard && consumeClimbHandoffIntent(activationIntent, target);
     const openDrawer = () =>
@@ -668,6 +715,11 @@ export function useBoardRouteTarget(
     // appeared, leaving this redirector on screen with `handedOffRef` already
     // claimed, so the effect could never retry and the spinner never ended.
     //
+    // This order holds only because the open goes through the same router
+    // queue as the leave. A direct navigator dispatch for `/play` would run
+    // ahead of the queued pop and be popped by it (#7069); the drawer host's
+    // tests model exactly this hand-off.
+    //
     // Leaving first is safe for the pop as well: `/play` is a root
     // `transparentModal` (see `app/_layout.tsx`), not a child of the stack this
     // screen sits in, so popping this screen cannot take the drawer with it.
@@ -680,6 +732,7 @@ export function useBoardRouteTarget(
     board,
     boardConfig,
     climb,
+    launchHoldReleased,
     openPlayDrawer,
     activationIntent,
     router,

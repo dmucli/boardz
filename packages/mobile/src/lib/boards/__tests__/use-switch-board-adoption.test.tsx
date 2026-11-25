@@ -14,14 +14,17 @@ const cfg = vi.hoisted(() => ({
 }));
 
 const spies = vi.hoisted(() => ({
-  setActiveBoard: vi.fn((): Promise<void> => Promise.resolve()),
+  setActiveBoard: vi.fn((): Promise<boolean> => Promise.resolve(true)),
   followMutate: vi.fn(),
   enableBoardsOffline: vi.fn(),
   confirm: vi.fn((): Promise<boolean> => Promise.resolve(true)),
   showToast: vi.fn(),
 }));
 
-vi.mock('../../graphql/use-active-board', () => ({ useSetActiveBoard: () => spies.setActiveBoard }));
+vi.mock('../../graphql/use-active-board', () => ({
+  useSetActiveBoard: () => spies.setActiveBoard,
+  getActiveBoardWriteGeneration: () => 0,
+}));
 vi.mock('../../graphql/hooks', () => ({
   useFollowBoard: () => ({ mutate: spies.followMutate }),
   useProfile: () => ({ data: { id: 'viewer-1' } }),
@@ -92,7 +95,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   cfg.offlineEnabled = true;
   cfg.autoOffline = false;
-  spies.setActiveBoard.mockImplementation(() => Promise.resolve());
+  spies.setActiveBoard.mockImplementation(() => Promise.resolve(true));
 });
 
 describe('useSwitchBoard adoption', () => {

@@ -6,6 +6,10 @@ import { getWorkerDatabaseUrl, setupWorkerDatabase } from './worker-db';
 // stability window (rows younger than N seconds are deferred to the next pull)
 // would hide every fixture. Must be set before sync/queries.ts is imported.
 process.env.SYNC_STABILITY_WINDOW_SECONDS = '0';
+// Stable test-only key for opaque authenticated session participant IDs.
+process.env.NEXTAUTH_SECRET ??= 'boardsesh-test-session-identity-secret';
+// Stable test-only HMAC key for a staged deleted account's address digest.
+process.env.CURRENT_STORE_DELETED_EMAIL_KEY ??= 'boardsesh-test-deleted-email-digest-key';
 import { beforeAll, beforeEach, afterAll } from 'vite-plus/test';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
@@ -44,10 +48,18 @@ const TABLES_TO_RESET = [
   'integration_credentials',
   'integration_exports',
   'sync_deletions',
+  'logbook_changes',
+  'logbook_session_changes',
+  'logbook_snapshot_session_chunks',
+  'logbook_snapshot_chunks',
+  'logbook_snapshots',
   'climb_classic_status',
   'climb_community_status',
   'proposal_votes',
   'climb_proposals',
+  'cnc_art_assets',
+  'cnc_stripe_events',
+  'cnc_orders',
   'users',
 ];
 

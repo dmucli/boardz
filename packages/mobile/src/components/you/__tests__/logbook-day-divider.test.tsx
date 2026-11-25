@@ -13,6 +13,7 @@ import type { LogbookDayStats } from '@boardsesh/logbook';
 vi.mock('react-native', () => ({
   View: ({ children, ...props }: { children?: ReactNode }) => createElement('div', props, children),
   StyleSheet: { create: (styles: unknown) => styles },
+  AppState: { addEventListener: () => ({ remove: () => {} }) },
 }));
 vi.mock('expo-router', () => ({ useFocusEffect: () => {} }));
 vi.mock('react-i18next', () => ({
@@ -23,7 +24,8 @@ vi.mock('react-i18next', () => ({
   }),
 }));
 vi.mock('../../Text', () => ({
-  Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+  Text: ({ children, color }: { children?: ReactNode; color?: string }) =>
+    createElement('span', { 'data-color': color }, children),
 }));
 vi.mock('../../../theme/colors', () => ({ withAlpha: (color: string) => color }));
 vi.mock('../../../theme/tokens', () => ({
@@ -33,7 +35,7 @@ vi.mock('../../../theme/tokens', () => ({
 vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({
     variant: 'liquidGlass',
-    brandColors: { primary: '#6D28D9' },
+    brandColors: { primary: '#TINT', primaryFill: '#FILL', primaryStrong: '#STRONG' },
     systemColors: { secondaryLabel: '#666' },
   }),
 }));
@@ -51,7 +53,12 @@ const startOfToday = () => {
   day.setHours(0, 0, 0, 0);
   return day.getTime();
 };
-const DAY_MS = 24 * 60 * 60 * 1000;
+const startOfYesterday = () => {
+  const day = new Date();
+  day.setDate(day.getDate() - 1);
+  day.setHours(0, 0, 0, 0);
+  return day.getTime();
+};
 
 const stats = (overrides: Partial<LogbookDayStats> = {}): LogbookDayStats => ({
   climbCount: 6,
@@ -67,7 +74,7 @@ describe('LogbookDayDivider', () => {
     expect(today.textContent).toContain('mobile.logbook.day.today');
 
     const { container: yesterday } = render(
-      createElement(LogbookDayDivider, { dayStartMs: startOfToday() - DAY_MS, stats: null }),
+      createElement(LogbookDayDivider, { dayStartMs: startOfYesterday(), stats: null }),
     );
     expect(yesterday.textContent).toContain('mobile.logbook.day.yesterday');
   });
@@ -105,6 +112,13 @@ describe('LogbookDayDivider', () => {
     expect(container.querySelector('[accessibilityRole="header"]')?.getAttribute('accessibilityLabel')).toContain(
       'mobile.logbook.day.today · Kilter 40°',
     );
+  });
+
+  it('draws the wall line on the violet chip in primaryStrong, not the tint (AA on the wash)', () => {
+    const { getByText } = render(
+      createElement(LogbookDayDivider, { dayStartMs: startOfToday(), stats: stats(), wallLabel: 'Kilter 40°' }),
+    );
+    expect(getByText('Kilter 40°').getAttribute('data-color')).toBe('#STRONG');
   });
 
   it('marks the anchor as a header for the screen-reader rotor', () => {

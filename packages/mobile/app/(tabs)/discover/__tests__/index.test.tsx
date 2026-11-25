@@ -1,9 +1,24 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent, act, waitFor } from '@testing-library/react';
-import { createElement, type ReactNode } from 'react';
+vi.mock('../../../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
+import { variantFeatures } from '../../../../src/theme/variants/variant-features';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { act, fireEvent, render as renderDom, waitFor } from '@testing-library/react';
+import { assertNativeTextChildren, renderWithNativeTextCheck as render } from '../../../../test/native-text-contract';
 import { router } from 'expo-router';
+import { createElement, type ReactNode } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type PlaylistItem = {
   uuid: string;
@@ -14,6 +29,8 @@ type PlaylistItem = {
   color?: string;
   icon?: string;
   isPinnedByMe?: boolean;
+  boardType?: string;
+  gradeSummary?: { gradedClimbCount: number; p10Difficulty: number; p90Difficulty: number } | null;
 };
 
 type SmartCountItem = {
@@ -22,6 +39,7 @@ type SmartCountItem = {
 };
 
 type DiscoverOptions = {
+  enabled?: boolean;
   generatedRecommendation?: boolean;
   boardType?: string;
   layoutId?: number;
@@ -65,7 +83,9 @@ const setterStats = vi.hoisted(() =>
 );
 const authState = vi.hoisted(() => ({ isAuthenticated: true, isLoading: false }));
 const connectivityState = vi.hoisted(() => ({ effectiveOffline: false, reason: null as string | null }));
-const focusState = vi.hoisted(() => ({ callback: undefined as (() => void) | undefined }));
+const focusState = vi.hoisted(() => ({ active: true, callback: undefined as (() => void) | undefined }));
+const rootHeaderState = vi.hoisted(() => ({ native: false }));
+vi.mock('../../../../src/hooks/use-native-root-header', () => ({ useNativeRootHeader: () => rootHeaderState.native }));
 const activeBoardState = vi.hoisted(() => ({
   data: { boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2', angle: 40 } as {
     boardType: string;
@@ -74,6 +94,7 @@ const activeBoardState = vi.hoisted(() => ({
     setIds: string;
     angle: number;
   } | null,
+  isLoading: false,
 }));
 const communityHook = vi.hoisted(() => ({
   popular: [] as PlaylistItem[],
@@ -92,7 +113,15 @@ const createPlaylist = vi.hoisted(() => vi.fn());
 const pinPlaylist = vi.hoisted(() => vi.fn());
 const unpinPlaylist = vi.hoisted(() => vi.fn());
 const toast = vi.hoisted(() => ({ showToast: vi.fn() }));
+// Theme variant + bottom-chrome metrics, so the Material create FAB's offset can
+// be asserted. Defaults keep every other test on the variant-less glass path.
+const chromeState = vi.hoisted(() => ({
+  variant: undefined as 'material' | 'liquidGlass' | undefined,
+  metrics: { scrollBottomPadding: 0, fixedFooterBottom: 0, floatingControlBottom: 0 },
+}));
 const discoverOptions = vi.hoisted(() => [] as DiscoverOptions[]);
+type UserPlaylistsOptions = { token: string | null; boardType?: string; layoutId?: number };
+const userPlaylistsOptions = vi.hoisted(() => [] as UserPlaylistsOptions[]);
 const asyncStorage = vi.hoisted(() => ({
   storage: new Map<string, string>(),
   getItem: vi.fn(async (key: string) => asyncStorage.storage.get(key) ?? null),
@@ -102,7 +131,10 @@ const asyncStorage = vi.hoisted(() => ({
 }));
 
 vi.mock('@boardsesh/playlists-react', () => ({
-  useUserPlaylists: () => userHook,
+  useUserPlaylists: (options: UserPlaylistsOptions) => {
+    userPlaylistsOptions.push(options);
+    return userHook;
+  },
   useDiscoverPlaylists: (options: DiscoverOptions) => {
     discoverOptions.push(options);
     return options.generatedRecommendation ? exactForYouHook : communityHook;
@@ -125,14 +157,15 @@ vi.mock('@react-native-async-storage/async-storage', () => ({
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('expo-router', () => ({
+  useIsFocused: () => focusState.active,
   router: { push: vi.fn() },
   useFocusEffect: (callback: () => void) => {
     focusState.callback = callback;
   },
 }));
 vi.mock('../../../../src/lib/connectivity/use-connectivity', () => ({ useConnectivity: () => connectivityState }));
-vi.mock('../../../../src/components/OfflineState', () => ({
-  OfflineState: () => createElement('div', { 'data-offline-state': true }),
+vi.mock('../../../../src/components/OfflineStateView', () => ({
+  OfflineStateView: () => createElement('div', { 'data-offline-state': true }),
 }));
 vi.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, bottom: 0 }),
@@ -150,8 +183,29 @@ vi.mock('react-native-reanimated', () => ({
 }));
 
 vi.mock('react-native', () => ({
-  View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+  View: ({ children }: { children?: ReactNode }) => createElement('div', { 'data-native-view': true }, children),
+  ScrollView: ({
+    children,
+    refreshControl,
+    contentInsetAdjustmentBehavior,
+    contentContainerStyle,
+  }: {
+    children?: ReactNode;
+    refreshControl?: ReactNode;
+    contentInsetAdjustmentBehavior?: string;
+    contentContainerStyle?: { paddingTop?: number };
+  }) =>
+    createElement(
+      'div',
+      {
+        'data-scroll-inset': contentInsetAdjustmentBehavior,
+        'data-scroll-padding-top': contentContainerStyle?.paddingTop,
+      },
+      refreshControl,
+      children,
+    ),
+  RefreshControl: ({ refreshing, onRefresh }: { refreshing?: boolean; onRefresh?: () => void }) =>
+    createElement('button', { 'data-refresh-control': String(!!refreshing), onClick: onRefresh }, 'pull-to-refresh'),
   Pressable: ({
     children,
     onPress,
@@ -162,6 +216,7 @@ vi.mock('react-native', () => ({
     accessibilityLabel?: string;
   }) => createElement('button', { onClick: onPress, 'aria-label': accessibilityLabel }, children),
   StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
     create: (styles: Record<string, unknown>) => styles,
     hairlineWidth: 1,
     absoluteFill: {},
@@ -170,13 +225,32 @@ vi.mock('react-native', () => ({
 }));
 
 vi.mock('../../../../src/theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24, 8: 32, 10: 40, 16: 64 },
 }));
 vi.mock('../../../../src/theme/ios-colors', () => ({
   iosSystemColors: { systemGray: '#8E8E93', systemGray4: '#C7C7CC', separator: '#ddd' },
 }));
 vi.mock('../../../../src/providers/theme-provider', () => ({
-  useTheme: () => ({ brandColors: { primary: '#6D28D9' } }),
+  useOptionalTheme: () => null,
+  useTheme: () => ({
+    brandColors: { primary: '#6D28D9' },
+    variant: chromeState.variant ?? 'liquidGlass',
+    features: variantFeatures[chromeState.variant ?? 'liquidGlass'],
+    systemColors: {
+      separator: 'theme-separator',
+      secondaryLabel: 'theme-secondary-label',
+      tertiaryLabel: 'theme-tertiary-label',
+    },
+  }),
+}));
+vi.mock('react-native-paper', () => ({
+  FAB: ({ style, accessibilityLabel }: { style?: unknown; accessibilityLabel?: string }) =>
+    createElement('div', {
+      'data-create-fab': 'true',
+      'aria-label': accessibilityLabel,
+      'data-style': JSON.stringify(style),
+    }),
 }));
 vi.mock('../../../../src/providers/auth-provider', () => ({
   useAuth: () => authState,
@@ -195,11 +269,22 @@ vi.mock('../../../../src/lib/graphql/use-active-board', () => ({
   useActiveBoard: () => activeBoardState,
 }));
 vi.mock('../../../../src/hooks/use-bottom-chrome-metrics', () => ({
-  useBottomChromeMetrics: () => ({ scrollBottomPadding: 0 }),
+  useBottomChromeMetrics: () => chromeState.metrics,
 }));
 vi.mock('../../../../src/lib/smart-playlists', () => ({
   DEFAULT_PINNED_SMART_PLAYLIST_TYPES: ['LIKED_CLIMBS', 'FIVE_STARS'],
+  smartPlaylistHref: (type: string, source: string) => ({
+    pathname: '/(tabs)/discover/smart/[type]',
+    params: { type, source },
+  }),
   SMART_PLAYLISTS: [
+    {
+      type: 'CREATED_CLIMBS',
+      slug: 'created-climbs',
+      icon: '🛠️',
+      color: '#9C27B0',
+      titleI18nKey: 'library.smart.createdClimbs.title',
+    },
     {
       type: 'RECOMMENDED_CROWD_FAVORITES',
       slug: 'crowd-favorites',
@@ -289,9 +374,11 @@ vi.mock('../../../../src/components/playlist/PlaylistCard', () => ({
     onTogglePin,
     onPress,
     climbCount,
+    gradeLabel,
   }: {
     name: string;
     metaLabel?: string;
+    gradeLabel?: string | null;
     isPinned?: boolean;
     onTogglePin?: () => void;
     onPress?: () => void;
@@ -299,7 +386,12 @@ vi.mock('../../../../src/components/playlist/PlaylistCard', () => ({
   }) =>
     createElement(
       'div',
-      { 'data-card': name, 'data-pinned': isPinned ? 'true' : 'false', 'data-count': climbCount },
+      {
+        'data-card': name,
+        'data-pinned': isPinned ? 'true' : 'false',
+        'data-count': climbCount,
+        'data-grade': gradeLabel ?? '',
+      },
       createElement('span', null, metaLabel ? `${name} ${metaLabel}` : name),
       createElement('button', { 'aria-label': `open-${name}`, onClick: onPress }, 'open'),
       onTogglePin ? createElement('button', { 'aria-label': `pin-${name}`, onClick: onTogglePin }, 'pin') : null,
@@ -339,6 +431,8 @@ vi.mock('../../../../src/components/playlist/PlaylistShelf', () => ({
     keyExtractor,
     loading,
     isLoadingMore,
+    actionLabel,
+    onActionPress,
   }: {
     items: PlaylistItem[];
     renderItem: (entry: { item: PlaylistItem; index: number }) => ReactNode;
@@ -346,11 +440,16 @@ vi.mock('../../../../src/components/playlist/PlaylistShelf', () => ({
     keyExtractor: (item: PlaylistItem, index: number) => string;
     loading?: boolean;
     isLoadingMore?: boolean;
+    actionLabel?: string;
+    onActionPress?: () => void;
   }) =>
     createElement(
       'section',
       { 'data-scroll-section': title, 'data-loading': loading, 'data-loading-more': isLoadingMore },
       createElement('h2', null, title),
+      actionLabel && onActionPress
+        ? createElement('button', { 'aria-label': `${title} ${actionLabel}`, onClick: onActionPress }, actionLabel)
+        : null,
       items.map((item, index) => createElement('div', { key: keyExtractor(item, index) }, renderItem({ item, index }))),
     ),
 }));
@@ -361,6 +460,42 @@ vi.mock('../../../../src/components/chrome', () => ({
 }));
 
 import DiscoverLibrary from '../index';
+import { View } from 'react-native';
+import { Text } from '../../../../src/components/Text';
+
+describe('native text host contract', () => {
+  it.each([' ', 'unwrapped text', 0])('rejects raw %j inside nested fragments', (rawText) => {
+    const { container } = renderDom(
+      <View>
+        <>
+          <>{rawText}</>
+        </>
+      </View>,
+    );
+    expect(() => assertNativeTextChildren(container)).toThrow('Text strings must be rendered within a <Text>');
+  });
+
+  it('accepts text inside Text through fragments', () => {
+    const { getByText } = render(
+      <View>
+        <>
+          <Text>Pinned climbs</Text>
+        </>
+      </View>,
+    );
+    expect(getByText('Pinned climbs')).toBeTruthy();
+  });
+
+  it('rejects raw text beside a route root through fragments', () => {
+    const { container } = renderDom(
+      <>
+        <View />
+        <> </>
+      </>,
+    );
+    expect(() => assertNativeTextChildren(container)).toThrow('Text strings must be rendered within a <Text>');
+  });
+});
 
 // The hub calls useQueryClient(); give it a real client so cache writes/reads
 // behave. Surface the client so the create test can read ['userPlaylists'].
@@ -375,6 +510,9 @@ function renderHub() {
 }
 
 beforeEach(() => {
+  rootHeaderState.native = false;
+  chromeState.variant = undefined;
+  chromeState.metrics = { scrollBottomPadding: 0, fixedFooterBottom: 0, floatingControlBottom: 0 };
   followedSettersHook.data = [];
   followedSettersHook.isLoading = false;
   followedSettersHook.isError = false;
@@ -383,8 +521,11 @@ beforeEach(() => {
   authState.isAuthenticated = true;
   connectivityState.effectiveOffline = false;
   connectivityState.reason = null;
+  focusState.active = true;
   focusState.callback = undefined;
   activeBoardState.data = { boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2', angle: 40 };
+  activeBoardState.isLoading = false;
+  userPlaylistsOptions.length = 0;
   userHook.playlists = [];
   userHook.isLoading = false;
   userHook.hasError = false;
@@ -395,6 +536,7 @@ beforeEach(() => {
   exactForYouHook.hasError = false;
   exactForYouHook.refetch.mockClear();
   smartCountsHook.data = [
+    { type: 'CREATED_CLIMBS', count: 4 },
     { type: 'RECOMMENDED_CROWD_FAVORITES', count: 748 },
     { type: 'RECOMMENDED_HIDDEN_GEMS', count: 1178 },
     { type: 'RECOMMENDED_AT_LEVEL', count: 719 },
@@ -424,6 +566,51 @@ beforeEach(() => {
   discoverOptions.length = 0;
 });
 
+describe('DiscoverLibrary first focus', () => {
+  it('lets UIKit own the title and top inset from the first render', () => {
+    rootHeaderState.native = true;
+    const { container, queryByText } = renderHub();
+
+    expect(queryByText('bottomTabBar.discover')).toBeNull();
+    expect(container.querySelector('[data-scroll-inset="automatic"]')?.getAttribute('data-scroll-padding-top')).toBe(
+      '0',
+    );
+  });
+
+  it('keeps the body title and measured chrome padding without a native header', () => {
+    const { container, getByText } = renderHub();
+
+    expect(getByText('bottomTabBar.discover')).toBeTruthy();
+    expect(container.querySelector('[data-scroll-inset="never"]')?.getAttribute('data-scroll-padding-top')).toBe('56');
+  });
+
+  it('holds reads before first focus and keeps them enabled after blur', () => {
+    focusState.active = false;
+    const { rerender, queryClient } = renderHub();
+    expect(userPlaylistsOptions.at(-1)?.token).toBeNull();
+    expect(setterStats.mock.calls.at(-1)?.[1]).toBe(false);
+    expect(discoverOptions.at(-1)?.enabled).toBe(false);
+    focusState.active = true;
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <DiscoverLibrary />
+      </QueryClientProvider>,
+    );
+    expect(userPlaylistsOptions.at(-1)?.token).toBe('token');
+    expect(setterStats.mock.calls.at(-1)?.[1]).toBe(true);
+    expect(discoverOptions.at(-1)?.enabled).toBe(true);
+    focusState.active = false;
+    rerender(
+      <QueryClientProvider client={queryClient}>
+        <DiscoverLibrary />
+      </QueryClientProvider>,
+    );
+    expect(userPlaylistsOptions.at(-1)?.token).toBe('token');
+    expect(setterStats.mock.calls.at(-1)?.[1]).toBe(true);
+    expect(discoverOptions.at(-1)?.enabled).toBe(true);
+  });
+});
+
 describe('DiscoverLibrary followed setter playlists', () => {
   it('queries the complete active board and appends setters after personal smart playlists', () => {
     followedSettersHook.data = [
@@ -448,8 +635,9 @@ describe('DiscoverLibrary followed setter playlists', () => {
     expect(queryByText('Empty setter')).toBeNull();
     expect(container.querySelector('[aria-label="pin-Setter / One"]')).toBeNull();
     fireEvent.click(getByLabelText('open-Setter / One'));
+    // Pushed inside Discover, never into the Climbs tab, so Back stays in Discover.
     expect(router.push).toHaveBeenLastCalledWith({
-      pathname: '/(tabs)/climbs/setter/[username]',
+      pathname: '/(tabs)/discover/setter/[username]',
       params: { username: 'Setter / One' },
     });
   });
@@ -565,6 +753,63 @@ describe('DiscoverLibrary followed setter playlists', () => {
   });
 });
 
+describe('DiscoverLibrary owned playlists and the active board', () => {
+  it('holds the owned-playlists query until the stored active board has been read', () => {
+    // A cold start reads the board from storage. Asking before it lands sends
+    // an unfiltered page that is dropped the moment the board filter arrives.
+    activeBoardState.data = null;
+    activeBoardState.isLoading = true;
+
+    renderHub();
+
+    expect(userPlaylistsOptions.length).toBeGreaterThan(0);
+    for (const options of userPlaylistsOptions) expect(options.token).toBeNull();
+  });
+
+  it('asks for the active board\u2019s playlists once the board has resolved', () => {
+    renderHub();
+
+    expect(userPlaylistsOptions.at(-1)).toMatchObject({ token: 'token', boardType: 'kilter', layoutId: 1 });
+  });
+
+  it('asks for every board\u2019s playlists when the read settles with no active board', () => {
+    activeBoardState.data = null;
+
+    renderHub();
+
+    const options = userPlaylistsOptions.at(-1);
+    expect(options?.token).toBe('token');
+    expect(options?.boardType).toBeUndefined();
+    expect(options?.layoutId).toBeUndefined();
+  });
+});
+
+describe('DiscoverLibrary owned playlists in a screenshot capture', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('uses the ordinary unscoped query when no board is selected', () => {
+    // A capture boots with no stored board and binds one a moment later. The
+    // recorded fixture set holds only board-filtered pages.
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    activeBoardState.data = null;
+
+    renderHub();
+
+    expect(userPlaylistsOptions.length).toBeGreaterThan(0);
+    for (const options of userPlaylistsOptions) expect(options.token).toBe('token');
+  });
+
+  it('asks for the bound board\u2019s playlists once the capture has one', () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+
+    renderHub();
+
+    expect(userPlaylistsOptions.at(-1)).toMatchObject({ token: 'token', boardType: 'kilter', layoutId: 1 });
+  });
+});
+
 describe('DiscoverLibrary error handling', () => {
   it('shows a load-error state with a retry (not the empty state) when a section fails and the hub is empty', () => {
     smartCountsHook.data = undefined;
@@ -631,6 +876,57 @@ describe('DiscoverLibrary error handling', () => {
     expect(getByText('library.smart.projects.title')).toBeTruthy();
     expect(getByText('library.smart.likedClimbs.title')).toBeTruthy();
     expect(getByText('Setter picks library.communityByline')).toBeTruthy();
+  });
+
+  it("opens the full community list from the shelf's See all", () => {
+    communityHook.popular = [
+      {
+        uuid: 'community',
+        name: 'Setter picks',
+        climbCount: 7,
+        creatorId: 'creator-2',
+        creatorName: 'Jess',
+      },
+    ];
+
+    const { getByLabelText } = renderHub();
+    fireEvent.click(getByLabelText('library.sections.community library.allPlaylists.seeAll'));
+    expect(router.push).toHaveBeenLastCalledWith('/(tabs)/discover/community');
+  });
+
+  it('hides the community See all while the shelf is still loading', () => {
+    communityHook.isLoading = true;
+    const { container, queryByLabelText } = renderHub();
+    expect(container.querySelector('[data-scroll-section="library.sections.community"]')).not.toBeNull();
+    expect(queryByLabelText('library.sections.community library.allPlaylists.seeAll')).toBeNull();
+  });
+
+  it('shows each community playlist\u2019s grade band, and none for a playlist without graded climbs', () => {
+    communityHook.popular = [
+      {
+        uuid: 'graded',
+        name: 'Graded picks',
+        climbCount: 12,
+        creatorId: 'creator-2',
+        creatorName: 'Jess',
+        boardType: 'kilter',
+        gradeSummary: { gradedClimbCount: 12, p10Difficulty: 16, p90Difficulty: 20 },
+      },
+      {
+        uuid: 'ungraded',
+        name: 'Fresh sets',
+        climbCount: 3,
+        creatorId: 'creator-3',
+        creatorName: 'Sam',
+        boardType: 'kilter',
+        gradeSummary: null,
+      },
+    ];
+
+    const { container } = renderHub();
+
+    expect(container.querySelector('[data-card="Graded picks"]')?.getAttribute('data-grade')).toBe('V3\u2013V5');
+    expect(container.querySelector('[data-card="Fresh sets"]')?.getAttribute('data-grade')).toBe('');
   });
 
   it('orders for-you smart cards in the mobile product order', () => {
@@ -843,6 +1139,76 @@ describe('DiscoverLibrary error handling', () => {
   });
 });
 
+describe('DiscoverLibrary generated authored climbs', () => {
+  it.each([false, true])('opens My climbs without changing boards (no active board: %s)', async (withoutBoard) => {
+    if (withoutBoard) activeBoardState.data = null;
+    const boardBeforeOpen = activeBoardState.data;
+    const { getByLabelText, container } = renderHub();
+    await act(async () => {});
+    const shelf = container.querySelector('[data-scroll-section="library.sections.forYou"]');
+    expect(shelf?.querySelector('[data-card="library.smart.createdClimbs.title"]')?.getAttribute('data-count')).toBe(
+      '4',
+    );
+
+    vi.mocked(router.push).mockClear();
+    fireEvent.click(getByLabelText('open-library.smart.createdClimbs.title'));
+
+    expect(router.push).toHaveBeenCalledExactlyOnceWith({
+      pathname: '/(tabs)/discover/smart/[type]',
+      params: { type: 'CREATED_CLIMBS', source: 'discover' },
+    });
+    expect(activeBoardState.data).toBe(boardBeforeOpen);
+  });
+
+  it('keeps My climbs discoverable before the first published climb', async () => {
+    smartCountsHook.data = [{ type: 'CREATED_CLIMBS', count: 0 }];
+    const { container } = renderHub();
+    await act(async () => {});
+    expect(container.querySelector('[data-card="library.smart.createdClimbs.title"]')?.getAttribute('data-count')).toBe(
+      '0',
+    );
+  });
+
+  it('hides the personal generated list when signed out', async () => {
+    authState.isAuthenticated = false;
+    const { queryByLabelText } = renderHub();
+    await act(async () => {});
+    expect(queryByLabelText('open-library.smart.createdClimbs.title')).toBeNull();
+  });
+
+  it('pins My climbs locally and restores the pin on the next visit', async () => {
+    const firstVisit = renderHub();
+    fireEvent.click(await firstVisit.findByLabelText('pin-library.smart.createdClimbs.title'));
+    await waitFor(() =>
+      expect(asyncStorage.setItem).toHaveBeenCalledWith(
+        'boardsesh_pinned_smart_playlists_v1_me',
+        JSON.stringify(['CREATED_CLIMBS']),
+      ),
+    );
+    expect(
+      firstVisit.container
+        .querySelector('[data-card="library.smart.createdClimbs.title"]')
+        ?.getAttribute('data-pinned'),
+    ).toBe('true');
+    expect(
+      firstVisit.container.querySelector('[data-scroll-section="library.sections.forYou"]')?.textContent,
+    ).not.toContain('library.smart.createdClimbs.title');
+    firstVisit.unmount();
+
+    const nextVisit = renderHub();
+    await waitFor(() =>
+      expect(
+        nextVisit.container
+          .querySelector('[data-card="library.smart.createdClimbs.title"]')
+          ?.getAttribute('data-pinned'),
+      ).toBe('true'),
+    );
+    expect(nextVisit.container.querySelectorAll('[data-card="library.smart.createdClimbs.title"]')).toHaveLength(1);
+    expect(pinPlaylist).not.toHaveBeenCalled();
+    expect(unpinPlaylist).not.toHaveBeenCalled();
+  });
+});
+
 describe('DiscoverLibrary create flow', () => {
   it('prepends a created playlist to the ["userPlaylists"] cache the picker reads', async () => {
     const created = {
@@ -913,5 +1279,86 @@ describe('DiscoverLibrary create flow', () => {
     fireEvent.click(getByLabelText('open-create'));
     // Reopened with a clean slate — no stale error from the previous attempt.
     expect(container.querySelector('[data-create-error="true"]')).toBeNull();
+  });
+});
+
+// HIG Refresh content controls: a pull refetches every shelf on the hub.
+describe('DiscoverLibrary pull to refresh', () => {
+  function pull(container: HTMLElement) {
+    fireEvent.click(container.querySelector('[data-refresh-control]') as HTMLElement);
+  }
+  function spinnerOn(container: HTMLElement) {
+    return container.querySelector('[data-refresh-control]')?.getAttribute('data-refresh-control');
+  }
+  function hub() {
+    return (
+      <QueryClientProvider client={new QueryClient()}>
+        <DiscoverLibrary />
+      </QueryClientProvider>
+    );
+  }
+
+  it('refetches owned, pinned, community, smart and setter shelves on a pull', async () => {
+    followedSettersHook.data = [{ setterUsername: 'setter', climbCount: 3 }];
+    const { container } = renderHub();
+
+    await act(async () => pull(container));
+
+    expect(userHook.refetch).toHaveBeenCalledTimes(1);
+    expect(pinnedHook.refetch).toHaveBeenCalledTimes(1);
+    expect(communityHook.refetch).toHaveBeenCalledTimes(1);
+    expect(smartCountsHook.refetch).toHaveBeenCalledTimes(1);
+    expect(followedSettersHook.refetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the spinner until the playlist shelves finish loading', async () => {
+    // Like the real hook: a refetch flips the shelf's loading flag at once.
+    userHook.refetch.mockImplementationOnce(() => {
+      userHook.isLoading = true;
+    });
+    const { container, rerender } = render(hub());
+
+    await act(async () => pull(container));
+    expect(spinnerOn(container)).toBe('true');
+
+    userHook.isLoading = false;
+    rerender(hub());
+    expect(spinnerOn(container)).toBe('false');
+  });
+});
+
+describe('DiscoverLibrary Material create FAB', () => {
+  function readFabBottom(container: HTMLElement): number {
+    const style = container.querySelector('[data-create-fab]')?.getAttribute('data-style') ?? '';
+    const match = /"bottom":(-?\d+(?:\.\d+)?)/.exec(style);
+    if (!match) throw new Error(`no bottom in FAB style: ${style}`);
+    return Number(match[1]);
+  }
+
+  it('sits 16dp above the fixed-footer offset, which already carries the queue bar and rest pill', () => {
+    chromeState.variant = 'material';
+    // Material, climb on the wall, rest timer armed: 48dp queue bar + 54dp pill.
+    // floatingControlBottom also carries the 64dp in-flow tab bar plus the inset,
+    // which this screen already sits above, so the FAB must not read it.
+    chromeState.metrics = {
+      scrollBottomPadding: 0,
+      fixedFooterBottom: 48 + 54,
+      floatingControlBottom: 24 + 64 + 48 + 54,
+    };
+    const { container } = renderHub();
+    expect(readFabBottom(container)).toBe(48 + 54 + 16);
+  });
+
+  it('drops to 16dp when nothing is docked', () => {
+    chromeState.variant = 'material';
+    chromeState.metrics = { scrollBottomPadding: 0, fixedFooterBottom: 0, floatingControlBottom: 24 + 80 };
+    const { container } = renderHub();
+    expect(readFabBottom(container)).toBe(16);
+  });
+
+  it('does not render on Liquid Glass, where create lives in the top chrome', () => {
+    chromeState.variant = 'liquidGlass';
+    const { container } = renderHub();
+    expect(container.querySelector('[data-create-fab]')).toBeNull();
   });
 });

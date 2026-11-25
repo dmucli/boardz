@@ -2,6 +2,7 @@ import type {
   QueueEvent,
   SessionEvent,
   NotificationEvent,
+  AppBugReportChangedEvent,
   CommentEvent,
   NewClimbCreatedEvent,
   BoardPresenceEvent,
@@ -16,6 +17,7 @@ import { logger } from '../utils/logger';
 const QUEUE_CHANNEL_PREFIX = 'boardsesh:queue:';
 const SESSION_CHANNEL_PREFIX = 'boardsesh:session:';
 const NOTIFICATION_CHANNEL_PREFIX = 'boardsesh:notifications:';
+const APP_BUG_REPORT_CHANNEL_PREFIX = 'boardsesh:app-bug-reports:';
 const COMMENT_CHANNEL_PREFIX = 'boardsesh:comments:';
 const NEW_CLIMB_CHANNEL_PREFIX = 'boardsesh:new-climbs:';
 const BOARD_PRESENCE_CHANNEL_PREFIX = 'boardsesh:board:';
@@ -28,6 +30,7 @@ const EVENT_CHANNEL_PREFIXES = [
   QUEUE_CHANNEL_PREFIX,
   SESSION_CHANNEL_PREFIX,
   NOTIFICATION_CHANNEL_PREFIX,
+  APP_BUG_REPORT_CHANNEL_PREFIX,
   COMMENT_CHANNEL_PREFIX,
   NEW_CLIMB_CHANNEL_PREFIX,
   BOARD_PRESENCE_CHANNEL_PREFIX,
@@ -41,6 +44,7 @@ type RedisMessage = {
     | QueueEvent
     | SessionEvent
     | NotificationEvent
+    | AppBugReportChangedEvent
     | CommentEvent
     | NewClimbCreatedEvent
     | BoardPresenceEvent
@@ -64,7 +68,10 @@ function isHighFrequencySessionEvent(event: unknown): boolean {
   if (typeof event !== 'object' || event === null) return false;
   const eventType = (event as { __typename?: unknown }).__typename;
   return (
-    eventType === 'WallConfirmedClimb' || eventType === 'WallDisconnected' || eventType === 'SessionBoardSerialChanged'
+    eventType === 'WallConfirmedClimb' ||
+    eventType === 'WallDisconnected' ||
+    eventType === 'SessionBoardSerialChanged' ||
+    eventType === 'SessionRestCadenceChanged'
   );
 }
 
@@ -72,6 +79,7 @@ export type RedisPubSubAdapter = {
   publishQueueEvent(sessionId: string, event: QueueEvent): Promise<void>;
   publishSessionEvent(sessionId: string, event: SessionEvent): Promise<void>;
   publishNotificationEvent(userId: string, event: NotificationEvent): Promise<void>;
+  publishAppBugReportChanged(userId: string, event: AppBugReportChangedEvent): Promise<void>;
   publishCommentEvent(entityKey: string, event: CommentEvent): Promise<void>;
   publishNewClimbEvent(channelKey: string, event: NewClimbCreatedEvent): Promise<void>;
   publishBoardPresenceEvent(boardId: string, event: BoardPresenceEvent): Promise<void>;
@@ -80,6 +88,7 @@ export type RedisPubSubAdapter = {
   subscribeQueueChannel(sessionId: string): Promise<void>;
   subscribeSessionChannel(sessionId: string): Promise<void>;
   subscribeNotificationChannel(userId: string): Promise<void>;
+  subscribeAppBugReportChannel(userId: string): Promise<void>;
   subscribeCommentChannel(entityKey: string): Promise<void>;
   subscribeNewClimbChannel(channelKey: string): Promise<void>;
   subscribeBoardPresenceChannel(boardId: string): Promise<void>;
@@ -88,6 +97,7 @@ export type RedisPubSubAdapter = {
   unsubscribeQueueChannel(sessionId: string): Promise<void>;
   unsubscribeSessionChannel(sessionId: string): Promise<void>;
   unsubscribeNotificationChannel(userId: string): Promise<void>;
+  unsubscribeAppBugReportChannel(userId: string): Promise<void>;
   unsubscribeCommentChannel(entityKey: string): Promise<void>;
   unsubscribeNewClimbChannel(channelKey: string): Promise<void>;
   unsubscribeBoardPresenceChannel(boardId: string): Promise<void>;
@@ -96,6 +106,7 @@ export type RedisPubSubAdapter = {
   onQueueMessage(callback: (sessionId: string, event: QueueEvent) => void): void;
   onSessionMessage(callback: (sessionId: string, event: SessionEvent) => void): void;
   onNotificationMessage(callback: (userId: string, event: NotificationEvent) => void): void;
+  onAppBugReportMessage(callback: (userId: string, event: AppBugReportChangedEvent) => void): void;
   onCommentMessage(callback: (entityKey: string, event: CommentEvent) => void): void;
   onNewClimbMessage(callback: (channelKey: string, event: NewClimbCreatedEvent) => void): void;
   onBoardPresenceMessage(callback: (boardId: string, event: BoardPresenceEvent) => void): void;
@@ -110,6 +121,7 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
   const subscribedQueueChannels = new Set<string>();
   const subscribedSessionChannels = new Set<string>();
   const subscribedNotificationChannels = new Set<string>();
+  const subscribedAppBugReportChannels = new Set<string>();
   const subscribedCommentChannels = new Set<string>();
   const subscribedNewClimbChannels = new Set<string>();
   const subscribedBoardPresenceChannels = new Set<string>();
@@ -119,6 +131,7 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
   let queueMessageCallback: ((sessionId: string, event: QueueEvent) => void) | null = null;
   let sessionMessageCallback: ((sessionId: string, event: SessionEvent) => void) | null = null;
   let notificationMessageCallback: ((userId: string, event: NotificationEvent) => void) | null = null;
+  let appBugReportMessageCallback: ((userId: string, event: AppBugReportChangedEvent) => void) | null = null;
   let commentMessageCallback: ((entityKey: string, event: CommentEvent) => void) | null = null;
   let newClimbMessageCallback: ((channelKey: string, event: NewClimbCreatedEvent) => void) | null = null;
   let boardPresenceMessageCallback: ((boardId: string, event: BoardPresenceEvent) => void) | null = null;
@@ -172,6 +185,17 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
         if (notificationMessageCallback) {
           notificationMessageCallback(userId, parsed.event as NotificationEvent);
         }
+      } else if (channel.startsWith(APP_BUG_REPORT_CHANNEL_PREFIX)) {
+        const event = parsed.event as Partial<AppBugReportChangedEvent>;
+        if (
+          typeof event.reportId !== 'string' ||
+          !/^[1-9]\d{0,18}$/.test(event.reportId) ||
+          BigInt(event.reportId) > 9223372036854775807n
+        )
+          return;
+        appBugReportMessageCallback?.(channel.slice(APP_BUG_REPORT_CHANNEL_PREFIX.length), {
+          reportId: event.reportId,
+        });
       } else if (channel.startsWith(COMMENT_CHANNEL_PREFIX)) {
         const entityKey = channel.slice(COMMENT_CHANNEL_PREFIX.length);
         if (commentMessageCallback) {
@@ -242,9 +266,10 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
       };
       // Drop high-frequency wall events to debug to keep INFO useful.
       // `WallConfirmedClimb` fires on every BLE confirm, `WallDisconnected` on
-      // every wall drop, and `SessionBoardSerialChanged` on every reconnect —
-      // all noisy. Membership-level events stay at INFO since they're rare and
-      // useful for triage.
+      // every wall drop, `SessionBoardSerialChanged` on every reconnect and
+      // `SessionRestCadenceChanged` on every crew tick and rest — all noisy.
+      // Membership-level events stay at INFO since they're rare and useful for
+      // triage.
       const logMessage = `[Redis] Publishing session event to channel: ${sessionId} (type: ${event.__typename})`;
       if (isHighFrequencySessionEvent(event)) {
         logger.debug(logMessage);
@@ -256,6 +281,16 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
 
     async publishNotificationEvent(userId: string, event: NotificationEvent): Promise<void> {
       const channel = `${NOTIFICATION_CHANNEL_PREFIX}${userId}`;
+      const message: RedisMessage = {
+        instanceId,
+        event,
+        timestamp: Date.now(),
+      };
+      await publisher.publish(channel, JSON.stringify(message));
+    },
+
+    async publishAppBugReportChanged(userId: string, event: AppBugReportChangedEvent): Promise<void> {
+      const channel = `${APP_BUG_REPORT_CHANNEL_PREFIX}${userId}`;
       const message: RedisMessage = {
         instanceId,
         event,
@@ -359,6 +394,15 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
       subscribedNotificationChannels.add(channel);
     },
 
+    async subscribeAppBugReportChannel(userId: string): Promise<void> {
+      const channel = `${APP_BUG_REPORT_CHANNEL_PREFIX}${userId}`;
+      if (subscribedAppBugReportChannels.has(channel)) {
+        return;
+      }
+      await subscriber.subscribe(channel);
+      subscribedAppBugReportChannels.add(channel);
+    },
+
     async subscribeCommentChannel(entityKey: string): Promise<void> {
       const channel = `${COMMENT_CHANNEL_PREFIX}${entityKey}`;
       if (subscribedCommentChannels.has(channel)) {
@@ -413,6 +457,15 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
       }
       await subscriber.unsubscribe(channel);
       subscribedNotificationChannels.delete(channel);
+    },
+
+    async unsubscribeAppBugReportChannel(userId: string): Promise<void> {
+      const channel = `${APP_BUG_REPORT_CHANNEL_PREFIX}${userId}`;
+      if (!subscribedAppBugReportChannels.has(channel)) {
+        return;
+      }
+      await subscriber.unsubscribe(channel);
+      subscribedAppBugReportChannels.delete(channel);
     },
 
     async unsubscribeCommentChannel(entityKey: string): Promise<void> {
@@ -472,6 +525,10 @@ export function createRedisPubSubAdapter(publisher: Redis, subscriber: Redis): R
 
     onNotificationMessage(callback: (userId: string, event: NotificationEvent) => void): void {
       notificationMessageCallback = callback;
+    },
+
+    onAppBugReportMessage(callback: (userId: string, event: AppBugReportChangedEvent) => void): void {
+      appBugReportMessageCallback = callback;
     },
 
     onCommentMessage(callback: (entityKey: string, event: CommentEvent) => void): void {

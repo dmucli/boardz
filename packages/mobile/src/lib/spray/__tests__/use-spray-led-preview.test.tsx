@@ -1,0 +1,223 @@
+// @vitest-environment jsdom
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  settings: { enabled: true, controller: { type: 'wled' as 'wled' | 'wled-ble', url: 'http://wall.local' } },
+  show: vi.fn(),
+  lightAll: vi.fn(),
+  stop: vi.fn(),
+  close: vi.fn(),
+  isOwner: vi.fn(),
+  setLighting: vi.fn(),
+  create: vi.fn(),
+  loadDriver: vi.fn(),
+  detach: vi.fn(),
+  credential: 0,
+  background: null as ((next: string) => void) | null,
+}));
+vi.mock('../spray-led-driver', () => ({ loadSprayLedDriver: mocks.loadDriver }));
+vi.mock('../../privacy/privacy-cache', () => ({
+  getCredentialGeneration: () => mocks.credential,
+  subscribeToCredentialChanges: () => () => undefined,
+}));
+vi.mock('react-native', () => ({
+  AppState: {
+    addEventListener: (_event: string, callback: (next: string) => void) => {
+      mocks.background = callback;
+      return { remove: vi.fn() };
+    },
+  },
+}));
+vi.mock('../use-spray-wall-led-settings', () => ({
+  useSprayWallLedSettings: () => ({ settings: mocks.settings, loading: false }),
+}));
+vi.mock('@boardsesh/led-controller', async (original) => ({
+  ...(await original<object>()),
+  getLedControllerDriver: () => ({}),
+  createLedPreviewSession: mocks.create,
+}));
+
+import { useSprayLedPreview } from '../use-spray-led-preview';
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.credential = 0;
+  mocks.detach.mockResolvedValue(undefined);
+  mocks.loadDriver.mockResolvedValue({});
+  mocks.settings = { enabled: true, controller: { type: 'wled', url: 'http://wall.local' } };
+  for (const mock of [mocks.show, mocks.lightAll, mocks.stop, mocks.close]) mock.mockResolvedValue(true);
+  mocks.isOwner.mockReturnValue(true);
+  mocks.create.mockReturnValue({
+    show: mocks.show,
+    detach: mocks.detach,
+    lightAll: mocks.lightAll,
+    stop: mocks.stop,
+    close: mocks.close,
+    isOwner: mocks.isOwner,
+    setLighting: mocks.setLighting,
+  });
+});
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
+
+describe('spray LED preview lifecycle', () => {
+  it('never attaches old settings when credentials change during driver loading', async () => {
+    let finishLoading!: (driver: object) => void;
+    mocks.loadDriver.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishLoading = resolve;
+      }),
+    );
+    mocks.settings = { enabled: true, controller: { type: 'wled-ble', url: 'wled-ble:wled-aabbccddeeff' } };
+    const { result } = renderHook(() => useSprayLedPreview('wall'));
+    expect(mocks.loadDriver).toHaveBeenCalled();
+    mocks.credential++;
+    await act(async () => {
+      finishLoading({});
+    });
+    expect(result.current.available).toBe(false);
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['wled', 'http://wall.local'],
+    ['wled-ble', 'wled-ble:wled-aabbccddeeff'],
+  ] as const)('gives the %s session the wall’s brightness and auto-off', async (type, url) => {
+    mocks.settings = {
+      enabled: true,
+      controller: { type, url },
+      brightness: 200,
+      autoOffMinutes: 30,
+    } as typeof mocks.settings;
+    renderHook(() => useSprayLedPreview('wall'));
+    await waitFor(() => expect(mocks.create).toHaveBeenCalled());
+    expect(mocks.create).toHaveBeenLastCalledWith({}, url, { brightness: 200, autoOffMinutes: 30 });
+  });
+
+  it('applies a new brightness to the open session and relights a wall lit with Light all, never closing it', async () => {
+    mocks.settings = { ...mocks.settings, brightness: 64, autoOffMinutes: 0 } as typeof mocks.settings;
+    const { result, rerender } = renderHook(() => useSprayLedPreview('wall'));
+    await act(() => result.current.lightAll());
+    expect(mocks.lightAll).toHaveBeenCalledTimes(1);
+    mocks.settings = { ...mocks.settings, brightness: 200 } as typeof mocks.settings;
+    await act(async () => rerender());
+    expect(mocks.close).not.toHaveBeenCalled();
+    expect(mocks.create).toHaveBeenCalledTimes(1);
+    expect(mocks.setLighting).toHaveBeenLastCalledWith({ brightness: 200, autoOffMinutes: 0 });
+    // The wall shows the new brightness at once.
+    expect(mocks.lightAll).toHaveBeenCalledTimes(2);
+    expect(result.current.allLit).toBe(true);
+    // Lit by a selection instead, the next one carries it: nothing is sent now.
+    await act(() => result.current.show([3]));
+    mocks.settings = { ...mocks.settings, autoOffMinutes: 30 } as typeof mocks.settings;
+    await act(async () => rerender());
+    expect(mocks.setLighting).toHaveBeenLastCalledWith({ brightness: 200, autoOffMinutes: 30 });
+    expect(mocks.lightAll).toHaveBeenCalledTimes(2);
+    expect(mocks.close).not.toHaveBeenCalled();
+  });
+
+  it('waits for interaction and keeps callbacks stable through state changes', async () => {
+    const { result, rerender, unmount } = renderHook(() => useSprayLedPreview('wall'));
+    expect(result.current.available).toBe(true);
+    expect(mocks.show).not.toHaveBeenCalled();
+    expect(mocks.stop).not.toHaveBeenCalled();
+    const show = result.current.show;
+    await act(() => show([4, 8]));
+    expect(result.current.state).toBe('lit');
+    rerender();
+    expect(result.current.show).toBe(show);
+    unmount();
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes the old session on disable and controller changes', async () => {
+    const { result, rerender } = renderHook(() => useSprayLedPreview('wall'));
+    await act(() => result.current.show([2]));
+    mocks.settings = { ...mocks.settings, enabled: false };
+    rerender();
+    expect(mocks.close).toHaveBeenCalledTimes(1);
+    expect(result.current.available).toBe(false);
+    await act(() => result.current.show([3]));
+    expect(mocks.show).toHaveBeenCalledTimes(1);
+    mocks.settings = { enabled: true, controller: { type: 'wled', url: 'http://new.local' } };
+    rerender();
+    expect(mocks.create).toHaveBeenLastCalledWith({}, 'http://new.local', expect.any(Object));
+  });
+
+  it('chases in supplied order, at 100ms intervals, then clears', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useSprayLedPreview('wall'));
+    let completion!: Promise<boolean>;
+    await act(async () => {
+      completion = result.current.chase([7, 2, 9]);
+    });
+    expect(result.current.state).toBe('chasing');
+    expect(mocks.show.mock.calls).toEqual([[[7]]]);
+    expect(result.current.chaseIndex).toBe(7);
+    await act(() => vi.advanceTimersByTimeAsync(100));
+    expect(result.current.chaseIndex).toBe(2);
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    expect(await completion).toBe(true);
+    expect(mocks.show.mock.calls).toEqual([[[7]], [[2]], [[9]]]);
+    expect(mocks.stop).toHaveBeenCalledTimes(1);
+    expect(result.current.state).toBe('idle');
+    expect(result.current.chaseIndex).toBeNull();
+  });
+
+  it('remembers that every LED is lit until another command replaces it', async () => {
+    const { result } = renderHook(() => useSprayLedPreview('wall'));
+    expect(result.current.allLit).toBe(false);
+    await act(() => result.current.lightAll());
+    expect(result.current.allLit).toBe(true);
+    await act(() => result.current.stop());
+    expect(result.current.allLit).toBe(false);
+    await act(() => result.current.lightAll());
+    await act(() => result.current.show([1]));
+    expect(result.current.allLit).toBe(false);
+  });
+
+  it('stop cancels the chase without advancing another LED', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useSprayLedPreview('wall'));
+    await act(async () => {
+      void result.current.chase([7, 2, 9]);
+    });
+    await act(() => result.current.stop());
+    await act(() => vi.advanceTimersByTimeAsync(300));
+    expect(mocks.show).toHaveBeenCalledTimes(1);
+    expect(result.current.state).toBe('idle');
+  });
+
+  it('another preview owner interrupts a chase without stealing control back', async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() => useSprayLedPreview('wall'));
+    await act(async () => {
+      void result.current.chase([7, 2]);
+    });
+    mocks.isOwner.mockReturnValue(false);
+    await act(() => vi.advanceTimersByTimeAsync(200));
+    expect(mocks.show).toHaveBeenCalledTimes(1);
+    expect(mocks.stop).not.toHaveBeenCalled();
+    expect(result.current.state).toBe('idle');
+    expect(result.current.chaseIndex).toBeNull();
+  });
+
+  it('backgrounding clears owned illumination and cancels future chase ticks', async () => {
+    const { result } = renderHook(() => useSprayLedPreview('wall'));
+    await act(() => result.current.lightAll());
+    await act(async () => mocks.background?.('background'));
+    expect(mocks.stop).toHaveBeenCalledTimes(1);
+    expect(result.current.state).toBe('idle');
+  });
+
+  it('reports command failures without an unhandled rejection', async () => {
+    mocks.show.mockRejectedValueOnce(new Error('offline'));
+    const { result } = renderHook(() => useSprayLedPreview('wall'));
+    await act(() => result.current.show([1]));
+    await waitFor(() => expect(result.current.error).toBe('unavailable'));
+    expect(result.current.state).toBe('idle');
+  });
+});

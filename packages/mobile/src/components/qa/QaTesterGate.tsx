@@ -1,5 +1,7 @@
+import { getConsentSnapshot } from '../../lib/consent-state';
+import { useConsentSettled } from '../../lib/consent-hooks';
 import { useEffect, useRef } from 'react';
-import { InteractionManager } from 'react-native';
+import { scheduleIdleTask } from '../../lib/schedule-idle-task';
 import { router, useSegments } from 'expo-router';
 import * as Linking from 'expo-linking';
 import * as Updates from 'expo-updates';
@@ -10,7 +12,8 @@ import { getSetting, setSetting, useSetting } from '../../settings';
 import { track } from '../../lib/analytics';
 import { reportHandledError } from '../../lib/error-reporting';
 import { decideQaGate, type QaGateInput } from '../../lib/qa/qa-gate-decision';
-import { listPrBranches, readRunningOtaBranch, readRunningPrNumber, STAGING_OTA_BRANCH } from '../../lib/qa/qa-surf';
+import { fetchQaBranches, readRunningOtaBranch, readRunningPrNumber, STAGING_OTA_BRANCH } from '../../lib/qa/qa-surf';
+import { noteBranchSurfingOff } from '../../lib/qa/early-updates';
 import { qaSessionKey } from '../../lib/qa/qa-keys';
 import { prBranchName } from '../../lib/qa/pr-branch';
 import { LAUNCH_ORIGIN, QA_BRIEF_SHOWN_EVENT, QA_PREVIEW_PROMPTED_EVENT } from '../../lib/qa/qa-analytics';
@@ -28,7 +31,7 @@ export function resetQaGateSessionForTests(): void {
 }
 
 /**
- * Launch-time gate for crowdsourced QA (see `docs/crowdsourced-qa-mobile.md`).
+ * Launch-time gate for crowdsourced QA (see `docs/qa/crowdsourced-qa-mobile.md`).
  * Renders nothing.
  *
  * On a store / TestFlight build that can surf OTA branches, an opted-in tester
@@ -58,7 +61,8 @@ export function QaTesterGate() {
   // deferred work that has not navigated yet.
   const promptEnabledAtLaunchRef = useRef(qaPromptOnLaunch);
   const promptEnabledForSession = promptEnabledAtLaunchRef.current && qaPromptOnLaunch;
-  const ready = launchReady && flagsResolved;
+  const consentSettled = useConsentSettled();
+  const ready = launchReady && flagsResolved && consentSettled;
   const segments = useSegments();
   // Latest top-level segment for the async re-check, without re-running the
   // effect on every navigation — the gate decides once per launch.
@@ -111,7 +115,6 @@ export function QaTesterGate() {
       userId,
       surfingBuild,
       surfingReady,
-      screenshotMode: process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1',
       topSegment: topSegmentRef.current,
       runningPrNumber,
       briefSeenKey: getSetting('qaBriefSeenKey'),
@@ -134,7 +137,7 @@ export function QaTesterGate() {
     if (preflight === 'none') return;
 
     let cancelled = false;
-    const interaction = InteractionManager.runAfterInteractions(() => {
+    const interaction = scheduleIdleTask(() => {
       void (async () => {
         // A custom-scheme deep link that resolves INTO a tab lands with
         // segments[0] === '(tabs)', so the segment guard alone misses it. The
@@ -146,10 +149,10 @@ export function QaTesterGate() {
         } catch {
           launchUrl = null;
         }
-        if (cancelled) return;
+        if (cancelled || !getConsentSnapshot().settled) return;
 
         const onboardingSeen = await hasSeenOnboarding();
-        if (cancelled) return;
+        if (cancelled || !getConsentSnapshot().settled) return;
 
         // Only production needs the branch list; on a preview the brief is about
         // the branch already running.
@@ -157,7 +160,12 @@ export function QaTesterGate() {
         let prNumbers: number[] = [];
         if (runningPrNumber === null) {
           try {
-            const branches = await listPrBranches();
+            const answer = await fetchQaBranches();
+            // The server switched surfing off, which asks a pinned device to
+            // unpin. This is the one request a tester's launch makes without
+            // opening the picker, so it is where that has to be heard.
+            if (answer.kind === 'surfing-off') void noteBranchSurfingOff();
+            const branches = answer.kind === 'listed' ? answer.list.previews : null;
             prBranchCount = branches === null ? null : branches.length;
             prNumbers = branches?.map((branch) => branch.prNumber) ?? [];
           } catch (error) {
@@ -166,7 +174,7 @@ export function QaTesterGate() {
             reportHandledError(error, { tags: { source: 'qa', op: 'list-branches' } });
             return;
           }
-          if (cancelled) return;
+          if (cancelled || !getConsentSnapshot().settled) return;
         }
 
         // Re-decide against the CURRENT route: a deep link may have arrived

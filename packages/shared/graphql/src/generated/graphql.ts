@@ -18,6 +18,30 @@ export type Scalars = {
   JSON: { input: unknown; output: unknown };
 };
 
+/** Daily first-party active-user counts for one platform. */
+export type ActiveUsersPlatformCount = {
+  __typename?: 'ActiveUsersPlatformCount';
+  dailyActiveUsers: Scalars['Int']['output'];
+  monthlyActiveUsers: Scalars['Int']['output'];
+  /** web, ios, android or unknown. */
+  platform: Scalars['String']['output'];
+  weeklyActiveUsers: Scalars['Int']['output'];
+};
+
+/** What one cron-authenticated active-users snapshot counted and sent. */
+export type ActiveUsersSnapshotResult = {
+  __typename?: 'ActiveUsersSnapshotResult';
+  /** False when PostHog is not configured for this runtime, so nothing was sent. */
+  captured: Scalars['Boolean']['output'];
+  dailyActiveUsers: Scalars['Int']['output'];
+  /** The UTC day the daily count covers (YYYY-MM-DD): the day before the run. */
+  day: Scalars['String']['output'];
+  durationMs: Scalars['Int']['output'];
+  monthlyActiveUsers: Scalars['Int']['output'];
+  platforms: Array<ActiveUsersPlatformCount>;
+  weeklyActiveUsers: Scalars['Int']['output'];
+};
+
 /** Input for activity feed queries. */
 export type ActivityFeedInput = {
   /** Filter by board UUID */
@@ -26,7 +50,7 @@ export type ActivityFeedInput = {
   cursor?: InputMaybe<Scalars['String']['input']>;
   /** Restrict results to users followed by the authenticated viewer */
   followingOnly?: InputMaybe<Scalars['Boolean']['input']>;
-  /** Include one daily hardest-send card for followed/user-filtered days without explicit sessions */
+  /** Include daily activity cards for user, followed-user, or board scopes, covering readable logs outside listed sessions */
   includeDailyHighlights?: InputMaybe<Scalars['Boolean']['input']>;
   /** Maximum number of items to return */
   limit?: InputMaybe<Scalars['Int']['input']>;
@@ -140,6 +164,7 @@ export type AddCommentInput = {
   entityType: SocialEntityType;
   /** Parent comment UUID for replies */
   parentCommentUuid?: InputMaybe<Scalars['String']['input']>;
+  privacy?: InputMaybe<PrivacyPublicationInput>;
 };
 
 /** Input for adding a climb to favorites (idempotent, sync-safe). */
@@ -168,8 +193,10 @@ export type AddGymMemberInput = {
  */
 export type AdminAppFeedbackInput = {
   limit?: InputMaybe<Scalars['Int']['input']>;
+  needsReply?: InputMaybe<Scalars['Boolean']['input']>;
   offset?: InputMaybe<Scalars['Int']['input']>;
   platform?: InputMaybe<Scalars['String']['input']>;
+  reporterId?: InputMaybe<Scalars['ID']['input']>;
   search?: InputMaybe<Scalars['String']['input']>;
   status?: InputMaybe<AppFeedbackStatus>;
   type?: InputMaybe<AppFeedbackTypeFilter>;
@@ -184,6 +211,90 @@ export type AdminAppFeedbackResult = {
   totalCount: Scalars['Int']['output'];
 };
 
+/** Stored board metadata for global admins; separate from public UserBoard projections. */
+export type AdminBoard = {
+  __typename?: 'AdminBoard';
+  angle: Scalars['Int']['output'];
+  boardType: Scalars['String']['output'];
+  canEdit: Scalars['Boolean']['output'];
+  createdAt: Scalars['String']['output'];
+  description?: Maybe<Scalars['String']['output']>;
+  gymName?: Maybe<Scalars['String']['output']>;
+  gymSlug?: Maybe<Scalars['String']['output']>;
+  gymUuid?: Maybe<Scalars['ID']['output']>;
+  hasLeds: Scalars['Boolean']['output'];
+  hideLocation: Scalars['Boolean']['output'];
+  isAngleAdjustable: Scalars['Boolean']['output'];
+  isOwned: Scalars['Boolean']['output'];
+  isPublic: Scalars['Boolean']['output'];
+  isUnlisted: Scalars['Boolean']['output'];
+  latitude?: Maybe<Scalars['Float']['output']>;
+  layoutId: Scalars['Int']['output'];
+  litByWallDevice: Scalars['Boolean']['output'];
+  locationName?: Maybe<Scalars['String']['output']>;
+  longitude?: Maybe<Scalars['Float']['output']>;
+  name: Scalars['String']['output'];
+  ownerDisplayName?: Maybe<Scalars['String']['output']>;
+  ownerId?: Maybe<Scalars['ID']['output']>;
+  /** Owner-only, including in the admin registry. */
+  serialNumber?: Maybe<Scalars['String']['output']>;
+  setIds: Scalars['String']['output'];
+  sizeId: Scalars['Int']['output'];
+  slug: Scalars['String']['output'];
+  /** Owner-only, including in the admin registry. */
+  timerName?: Maybe<Scalars['String']['output']>;
+  updatedAt: Scalars['String']['output'];
+  uuid: Scalars['ID']['output'];
+};
+
+export type AdminBoardConnection = {
+  __typename?: 'AdminBoardConnection';
+  boards: Array<AdminBoard>;
+  hasMore: Scalars['Boolean']['output'];
+  totalCount: Scalars['Int']['output'];
+};
+
+export type AdminBoardsInput = {
+  boardType?: InputMaybe<Scalars['String']['input']>;
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  offset?: InputMaybe<Scalars['Int']['input']>;
+  /** Case-insensitive board name, UUID, slug, gym name, or gym slug search. */
+  query?: InputMaybe<Scalars['String']['input']>;
+};
+
+/** Global-admin app directory. Never contains client credentials or connected climber identities. */
+export type AdminPartnerApp = {
+  __typename?: 'AdminPartnerApp';
+  activeConnections: Scalars['Int']['output'];
+  clientId: Scalars['ID']['output'];
+  createdAt: Scalars['String']['output'];
+  disabled: Scalars['Boolean']['output'];
+  homepageUrl?: Maybe<Scalars['String']['output']>;
+  maxActiveConnections: Scalars['Int']['output'];
+  maxNewConnectionsPerDay: Scalars['Int']['output'];
+  name?: Maybe<Scalars['String']['output']>;
+  newConnectionsLast24Hours: Scalars['Int']['output'];
+  ownerEmail?: Maybe<Scalars['String']['output']>;
+  ownerName?: Maybe<Scalars['String']['output']>;
+  ownerUserId: Scalars['ID']['output'];
+  publisherName?: Maybe<Scalars['String']['output']>;
+  suspendedAt?: Maybe<Scalars['String']['output']>;
+  suspensionReason?: Maybe<Scalars['String']['output']>;
+};
+
+export type AdminPartnerAppConnection = {
+  __typename?: 'AdminPartnerAppConnection';
+  apps: Array<AdminPartnerApp>;
+  hasMore: Scalars['Boolean']['output'];
+  totalCount: Scalars['Int']['output'];
+};
+
+export type AdminPartnerAppsInput = {
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  offset?: InputMaybe<Scalars['Int']['input']>;
+  query?: InputMaybe<Scalars['String']['input']>;
+};
+
 /** Result of fetching the authenticated user's playlists, paginated. */
 export type AllUserPlaylistsResult = {
   __typename?: 'AllUserPlaylistsResult';
@@ -195,11 +306,82 @@ export type AllUserPlaylistsResult = {
   totalCount: Scalars['Int']['output'];
 };
 
+/** The signed-in climber's analytics consent answer, as the account stores it. See docs/analytics/analytics-consent.md. */
+export type AnalyticsConsent = {
+  __typename?: 'AnalyticsConsent';
+  /** granted or denied. */
+  analytics: Scalars['String']['output'];
+  /** ISO 8601, stamped by the server's clock. */
+  decidedAt: Scalars['String']['output'];
+  /** web, ios or android: where the answer was given. */
+  source: Scalars['String']['output'];
+  /** The CONSENT_VERSION the answer was given under. */
+  version: Scalars['Int']['output'];
+};
+
 /** A supported board angle. */
 export type Angle = {
   __typename?: 'Angle';
   /** Angle in degrees */
   angle: Scalars['Int']['output'];
+};
+
+export type AppBugReport = {
+  __typename?: 'AppBugReport';
+  canReply: Scalars['Boolean']['output'];
+  comment?: Maybe<Scalars['String']['output']>;
+  createdAt: Scalars['String']['output'];
+  githubIssueNumber?: Maybe<Scalars['Int']['output']>;
+  githubIssueUrl?: Maybe<Scalars['String']['output']>;
+  id: Scalars['ID']['output'];
+  lastMessageAt?: Maybe<Scalars['String']['output']>;
+  lastMessagePreview?: Maybe<Scalars['String']['output']>;
+  screenshotUrls: Array<Scalars['String']['output']>;
+  status: AppFeedbackStatus;
+};
+
+export type AppBugReportChangedEvent = {
+  __typename?: 'AppBugReportChangedEvent';
+  reportId: Scalars['ID']['output'];
+};
+
+export type AppBugReportConnection = {
+  __typename?: 'AppBugReportConnection';
+  endCursor?: Maybe<Scalars['ID']['output']>;
+  hasMore: Scalars['Boolean']['output'];
+  reports: Array<AppBugReport>;
+};
+
+export type AppBugReportMessage = {
+  __typename?: 'AppBugReportMessage';
+  authorRole: AppBugReportMessageAuthorRole;
+  body: Scalars['String']['output'];
+  createdAt: Scalars['String']['output'];
+  deliveryStatus: AppBugReportMessageDeliveryStatus;
+  id: Scalars['ID']['output'];
+  reportId: Scalars['ID']['output'];
+};
+
+export type AppBugReportMessageAuthorRole = 'reporter' | 'staff';
+
+export type AppBugReportMessageConnection = {
+  __typename?: 'AppBugReportMessageConnection';
+  endCursor?: Maybe<Scalars['ID']['output']>;
+  hasMore: Scalars['Boolean']['output'];
+  messages: Array<AppBugReportMessage>;
+};
+
+export type AppBugReportMessageDeliveryStatus = 'failed' | 'pending' | 'sent';
+
+export type AppBugReportMessagesInput = {
+  before?: InputMaybe<Scalars['ID']['input']>;
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  reportId: Scalars['ID']['input'];
+};
+
+export type AppBugReportsInput = {
+  after?: InputMaybe<Scalars['ID']['input']>;
+  limit?: InputMaybe<Scalars['Int']['input']>;
 };
 
 /** Debug context captured with a feedback row (the jsonb `context` column). */
@@ -230,8 +412,12 @@ export type AppFeedbackReport = {
   githubIssueNumber?: Maybe<Scalars['Int']['output']>;
   githubIssueUrl?: Maybe<Scalars['String']['output']>;
   id: Scalars['ID']['output'];
+  lastMessageAt?: Maybe<Scalars['String']['output']>;
+  lastMessagePreview?: Maybe<Scalars['String']['output']>;
+  needsReply: Scalars['Boolean']['output'];
   platform: Scalars['String']['output'];
   rating?: Maybe<Scalars['Int']['output']>;
+  releaseContext?: Maybe<ReleaseContext>;
   reporter?: Maybe<AppFeedbackReporter>;
   resolvedAt?: Maybe<Scalars['String']['output']>;
   resolvedBy?: Maybe<Scalars['String']['output']>;
@@ -280,6 +466,69 @@ export type AppFeedbackStatusCounts = {
  */
 export type AppFeedbackTypeFilter = 'all' | 'bugs' | 'ratings';
 
+/** A partner workout delivered to the signed-in climber. Its session identifier never leaves the partner API. */
+export type AppWorkout = {
+  __typename?: 'AppWorkout';
+  blocks: Scalars['JSON']['output'];
+  clientId: Scalars['ID']['output'];
+  expiresAt: Scalars['String']['output'];
+  id: Scalars['ID']['output'];
+  notes?: Maybe<Scalars['String']['output']>;
+  openedByMismatch: Scalars['Boolean']['output'];
+  scheduledFor?: Maybe<Scalars['String']['output']>;
+  sessionId?: Maybe<Scalars['ID']['output']>;
+  sessionPlan?: Maybe<Scalars['JSON']['output']>;
+  sourceAppName: Scalars['String']['output'];
+  spec: Scalars['JSON']['output'];
+  status: Scalars['String']['output'];
+  title: Scalars['String']['output'];
+};
+
+export type AppWorkoutLaunch = {
+  __typename?: 'AppWorkoutLaunch';
+  sourceAppName: Scalars['String']['output'];
+};
+
+/** Campaign identifiers verified against Apple's AdServices API, never its raw response. */
+export type AppleAdsAttribution = {
+  __typename?: 'AppleAdsAttribution';
+  adGroupId: Scalars['String']['output'];
+  adId?: Maybe<Scalars['String']['output']>;
+  campaignId: Scalars['String']['output'];
+  claimType?: Maybe<Scalars['String']['output']>;
+  conversionType: Scalars['String']['output'];
+  countryOrRegion?: Maybe<Scalars['String']['output']>;
+  keywordId?: Maybe<Scalars['String']['output']>;
+  orgId: Scalars['String']['output'];
+  supplyPlacement?: Maybe<Scalars['String']['output']>;
+};
+
+export type AppleAdsAttributionResult = {
+  __typename?: 'AppleAdsAttributionResult';
+  attribution?: Maybe<AppleAdsAttribution>;
+  retryAfterSeconds?: Maybe<Scalars['Int']['output']>;
+  /** not_ready, unavailable or rate_limited; null for terminal outcomes. */
+  retryReason?: Maybe<Scalars['String']['output']>;
+  status: AppleAdsAttributionStatus;
+};
+
+export type AppleAdsAttributionStatus =
+  | 'ATTRIBUTED'
+  | 'CONSENT_REQUIRED'
+  | 'INVALID_TOKEN'
+  | 'RETRYABLE'
+  | 'TEST'
+  | 'UNATTRIBUTED';
+
+export type AppleAdsConsentInput = {
+  analytics: Scalars['String']['input'];
+  /** explicit for the climber's own answer. Anything else (the region default) is refused; absent means explicit. */
+  basis?: InputMaybe<Scalars['String']['input']>;
+  decidedAt: Scalars['String']['input'];
+  source: Scalars['String']['input'];
+  version: Scalars['Int']['input'];
+};
+
 /** Pagination input for ascent feeds. */
 export type AscentFeedInput = {
   /** When true, only include benchmark climbs */
@@ -290,9 +539,11 @@ export type AscentFeedInput = {
   boardTypes?: InputMaybe<Array<Scalars['String']['input']>>;
   /** Optional climb name search (case-insensitive partial match) */
   climbName?: InputMaybe<Scalars['String']['input']>;
+  /** Leave out ascents of climbs the community has hidden. For surfaces that headline one ascent; the logbook itself keeps them. */
+  excludeHiddenClimbs?: InputMaybe<Scalars['Boolean']['input']>;
   /** When true, only include flashes within the selected status mode */
   flashOnly?: InputMaybe<Scalars['Boolean']['input']>;
-  /** Optional start date filter (ISO date string, inclusive) */
+  /** Optional start of the date range, inclusive. Either a calendar day (YYYY-MM-DD, from that UTC day's midnight) or an ISO 8601 instant with Z or an offset (from exactly that instant). */
   fromDate?: InputMaybe<Scalars['String']['input']>;
   /** Optional layout filters within the selected board type */
   layoutIds?: InputMaybe<Array<Scalars['Int']['input']>>;
@@ -306,12 +557,16 @@ export type AscentFeedInput = {
   minAngle?: InputMaybe<Scalars['Int']['input']>;
   /** Optional minimum difficulty filter (difficulty_id) */
   minDifficulty?: InputMaybe<Scalars['Int']['input']>;
+  /** Only include ascents the climber rated at least this many stars (1-5): the tick's own stars, else their synced rating, as the logbook row shows */
+  minQuality?: InputMaybe<Scalars['Int']['input']>;
   /** Number of items to skip */
   offset?: InputMaybe<Scalars['Int']['input']>;
   /** Optional secondary sort field */
   secondarySortBy?: InputMaybe<Scalars['String']['input']>;
   /** Optional secondary sort order */
   secondarySortOrder?: InputMaybe<Scalars['String']['input']>;
+  /** Only include climbs by these setters (exact setter usernames) */
+  setterUsernames?: InputMaybe<Array<Scalars['String']['input']>>;
   /** Primary sort field */
   sortBy?: InputMaybe<Scalars['String']['input']>;
   /** Primary sort order: desc (default) or asc */
@@ -320,7 +575,7 @@ export type AscentFeedInput = {
   status?: InputMaybe<Scalars['String']['input']>;
   /** Status mode filter: both, send, attempt */
   statusMode?: InputMaybe<Scalars['String']['input']>;
-  /** Optional end date filter (ISO date string, inclusive) */
+  /** Optional end of the date range. Either a calendar day (YYYY-MM-DD, through the end of that UTC day, inclusive) or an ISO 8601 instant with Z or an offset (EXCLUSIVE: send the start of the day after the last local day you want). */
   toDate?: InputMaybe<Scalars['String']['input']>;
 };
 
@@ -341,8 +596,17 @@ export type AscentFeedItem = {
   boardseshConfidence?: Maybe<Scalars['String']['output']>;
   /** Boardsesh grade on the shared difficulty scale (COALESCE of the cross-board universal grade and the within-board local grade) for this ascent's climb at its angle. Null when no grade row exists. Use boardseshConfidence to distinguish trusted, setter-only, and projected values. */
   boardseshDifficulty?: Maybe<Scalars['Float']['output']>;
+  /** Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod). */
+  characteristics?: Maybe<Array<Scalars['String']['output']>>;
+  /**
+   * Always null. Revision history was retired, so no log is marked as made on an earlier version.
+   * @deprecated Climb revision history was retired. Always null.
+   */
+  climbCurrentRevision?: Maybe<Scalars['Int']['output']>;
   /** Name of the climb */
   climbName: Scalars['String']['output'];
+  /** The climb revision this was logged against. 1 on a climb nobody has edited; null when it is not known (imports, and logs older than the field). */
+  climbRevision?: Maybe<Scalars['Int']['output']>;
   /** UUID of the climb */
   climbUuid: Scalars['String']['output'];
   /** When climbed (ISO 8601) */
@@ -412,6 +676,7 @@ export type AttachBetaLinkInput = {
   climbUuid: Scalars['String']['input'];
   /** Instagram or TikTok video URL */
   link: Scalars['String']['input'];
+  privacy?: InputMaybe<PrivacyPublicationInput>;
   /** Optional tick UUID this beta video belongs to */
   tickUuid?: InputMaybe<Scalars['ID']['input']>;
 };
@@ -422,8 +687,12 @@ export type AttachBetaLinkInput = {
  * the target gym plus the board actually being a stray candidate for it.
  */
 export type AttachBoardToGymInput = {
+  /** False prevents merging an emptied source gym. Omitted preserves legacy behavior. */
+  allowSourceGymMerge?: InputMaybe<Scalars['Boolean']['input']>;
   /** Stray board UUID to attach */
   boardUuid: Scalars['ID']['input'];
+  /** The source gym the user saw; null means unlinked. A changed source rejects the move. */
+  expectedCurrentGymUuid?: InputMaybe<Scalars['ID']['input']>;
   /** Gym UUID to attach the board to */
   gymUuid: Scalars['ID']['input'];
 };
@@ -464,6 +733,16 @@ export type AuroraCredentialStatus = {
   userId?: Maybe<Scalars['Int']['output']>;
   /** Aurora account username */
   username: Scalars['String']['output'];
+};
+
+/** Input for listing claims that approved themselves (admin only). */
+export type AutoApprovedGymClaimsInput = {
+  /** Only this claim, for the daily digest's revert link. A claim that didn't approve itself comes back as an empty list. */
+  claimId?: InputMaybe<Scalars['ID']['input']>;
+  /** Max claims to return */
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  /** Offset for pagination */
+  offset?: InputMaybe<Scalars['Int']['input']>;
 };
 
 /**
@@ -532,13 +811,17 @@ export type BoardCandidate = {
 };
 
 /**
- * Event: the wall was cleared (best-effort — only emitted on a deliberate
- * disconnect; an involuntary BLE drop leaves the last climb sticky).
+ * Event: the wall was cleared. Emitted when the phone driving the wall turns
+ * off all its lights (`reportBoardClear`), and replayed to a new subscriber
+ * while that clear is still the wall's latest state. A disconnect, deliberate
+ * or not, leaves the last climb sticky: the board keeps its lights.
  */
 export type BoardClimbCleared = {
   __typename?: 'BoardClimbCleared';
   /** ISO 8601 timestamp when the wall was cleared */
   clearedAt: Scalars['String']['output'];
+  /** UUID of the climb that was on the wall when it was cleared, when known */
+  climbUuid?: Maybe<Scalars['String']['output']>;
   /** Monotonic per-board sequence number */
   seq: Scalars['Int']['output'];
 };
@@ -556,7 +839,7 @@ export type BoardClimbRecentSender = {
   /** ISO 8601 timestamp of this climber's latest successful tick for the climb */
   lastSentAt: Scalars['String']['output'];
   /** Boardsesh user id, for linking the avatar to their profile */
-  userId: Scalars['ID']['output'];
+  userId?: Maybe<Scalars['ID']['output']>;
 };
 
 /** Event: a climb was set (lit) on the wall. */
@@ -610,6 +893,8 @@ export type BoardDiscoveryBoard = {
   layoutId: Scalars['Int']['output'];
   locationName?: Maybe<Scalars['String']['output']>;
   name: Scalars['String']['output'];
+  /** Most publicly logged climb on this physical board, at its most-logged angle. Gym-scoped reads only; null without eligible records. */
+  popularClimb?: Maybe<BoardDiscoveryClimb>;
   setIds: Scalars['String']['output'];
   sizeId: Scalars['Int']['output'];
   slug: Scalars['String']['output'];
@@ -618,7 +903,7 @@ export type BoardDiscoveryBoard = {
   uuid: Scalars['ID']['output'];
 };
 
-/** A redacted snapshot of the last confirmed climb while its sender still holds the board. */
+/** A public climb preview without sender identity. See each field for its presence or logbook source. */
 export type BoardDiscoveryClimb = {
   __typename?: 'BoardDiscoveryClimb';
   angle: Scalars['Int']['output'];
@@ -635,7 +920,9 @@ export type BoardDiscoveryInput = {
 
 export type BoardHistoryPage = {
   __typename?: 'BoardHistoryPage';
+  /** Displays within the rolling seven-day window, newest display time first. */
   entries: Array<BoardPresenceClimb>;
+  /** Null when no more entries remain within the window. */
   nextCursor?: Maybe<Scalars['String']['output']>;
 };
 
@@ -701,7 +988,7 @@ export type BoardLeaderboardEntry = {
   /** Display name */
   userDisplayName?: Maybe<Scalars['String']['output']>;
   /** User ID */
-  userId: Scalars['ID']['output'];
+  userId?: Maybe<Scalars['ID']['output']>;
 };
 
 /** Input for board leaderboard query. */
@@ -732,6 +1019,8 @@ export type BoardPresenceClimb = {
   grade?: Maybe<Scalars['String']['output']>;
   /** Grade colour as a hex string */
   gradeColor?: Maybe<Scalars['String']['output']>;
+  /** Whether the climb was lit mirrored. Null means unknown (an older reporter, or a durable-history row). */
+  mirrored?: Maybe<Scalars['Boolean']['output']>;
   /** Climb name */
   name?: Maybe<Scalars['String']['output']>;
   /** Queue item UUID that triggered the send, if any (disambiguates duplicates) */
@@ -748,8 +1037,18 @@ export type BoardPresenceClimb = {
   seq: Scalars['Int']['output'];
   /** Catalog route setter display name (who set the climb) */
   setter?: Maybe<Scalars['String']['output']>;
-  /** Origin of the display: boardsesh or kilter. Missing means boardsesh. */
+  /** Origin of the display: boardsesh, kilter, or aurora. Missing means boardsesh. */
   source?: Maybe<Scalars['String']['output']>;
+};
+
+/** Public catalog grades for a wall at the viewer's selected angle. */
+export type BoardPresenceClimbGrade = {
+  __typename?: 'BoardPresenceClimbGrade';
+  boardseshConfidence?: Maybe<Scalars['String']['output']>;
+  boardseshDifficulty?: Maybe<Scalars['Float']['output']>;
+  difficulty?: Maybe<Scalars['String']['output']>;
+  /** The requested climb UUID, retaining an alias when one was supplied. */
+  uuid: Scalars['String']['output'];
 };
 
 export type BoardPresenceEvent =
@@ -775,7 +1074,7 @@ export type BoardPresenceHardestSend = {
   /** Display name of the climber */
   sentByDisplayName?: Maybe<Scalars['String']['output']>;
   /** Boardsesh user id of the climber */
-  sentByUserId: Scalars['String']['output'];
+  sentByUserId?: Maybe<Scalars['String']['output']>;
 };
 
 /**
@@ -864,6 +1163,9 @@ export type BoardQueuePreviewItem = {
   setter?: Maybe<Scalars['String']['output']>;
 };
 
+/** Why a climber reported a board. relist_request is filed only by the board's creator, after gym staff removed it. */
+export type BoardReportReason = 'duplicate' | 'gone' | 'other' | 'relist_request' | 'wrong_place' | 'wrong_setup';
+
 /**
  * Auto-recorded board configuration that the current user was on the last time
  * they connected to a controller with the given serial. Acts as a fallback for
@@ -889,6 +1191,134 @@ export type BoardSerialConfig = {
   sizeId: Scalars['Int']['output'];
   /** When the recording was last updated */
   updatedAt: Scalars['String']['output'];
+};
+
+/** A board's setup, as a suggestion or a recorded change carries it. */
+export type BoardSetup = {
+  __typename?: 'BoardSetup';
+  /** Set only when the angle is part of the setup (a board that doesn't tilt). */
+  angle?: Maybe<Scalars['Int']['output']>;
+  layoutId: Scalars['Int']['output'];
+  /** Hold set ids, comma-separated, in ascending order. */
+  setIds: Scalars['String']['output'];
+  sizeId: Scalars['Int']['output'];
+};
+
+/** One climber's change to a board's setup, made by a suggestion on a report. */
+export type BoardSetupChange = {
+  __typename?: 'BoardSetupChange';
+  after: BoardSetup;
+  before: BoardSetup;
+  board: BoardSetupChangeBoard;
+  /** The climber who suggested it. Null once their account is deleted. */
+  climberDisplayName?: Maybe<Scalars['String']['output']>;
+  /** When the change was made. */
+  createdAt: Scalars['String']['output'];
+  /** Pass to undoBoardSetupChange. */
+  eventId: Scalars['ID']['output'];
+  /** Null when the gym has been deleted since. */
+  gym?: Maybe<BoardSetupChangeGym>;
+  state: BoardSetupChangeState;
+};
+
+/** The board a climber changed, in the admin list of setup changes. */
+export type BoardSetupChangeBoard = {
+  __typename?: 'BoardSetupChangeBoard';
+  boardType: Scalars['String']['output'];
+  name: Scalars['String']['output'];
+  slug: Scalars['String']['output'];
+  uuid: Scalars['ID']['output'];
+};
+
+export type BoardSetupChangeConnection = {
+  __typename?: 'BoardSetupChangeConnection';
+  /** Newest first. */
+  changes: Array<BoardSetupChange>;
+  /** Pass as after for the next page; null on the last page. */
+  nextCursor?: Maybe<Scalars['String']['output']>;
+};
+
+/** The gym a board was at when a climber changed it. */
+export type BoardSetupChangeGym = {
+  __typename?: 'BoardSetupChangeGym';
+  name: Scalars['String']['output'];
+  slug?: Maybe<Scalars['String']['output']>;
+  uuid: Scalars['ID']['output'];
+};
+
+/**
+ * Where a climber's setup change stands. LIVE: the board still has it.
+ * UNDONE: someone put the old setup back. CHANGED_SINCE: the board changed
+ * again since, so it can't be undone.
+ */
+export type BoardSetupChangeState = 'CHANGED_SINCE' | 'LIVE' | 'UNDONE';
+
+/**
+ * A board's setup within its own board type: what a "Set up wrong" report can
+ * suggest. There is no board type: it is always the board's own.
+ */
+export type BoardSetupInput = {
+  /**
+   * Only for a board that doesn't tilt (isAngleAdjustable false). Leave it out to
+   * keep the angle. An angle other than the board's own must be one the board
+   * type's Angle row offers (the MoonBoard wide range included).
+   */
+  angle?: InputMaybe<Scalars['Int']['input']>;
+  /** A layout of the board's type. */
+  layoutId: Scalars['Int']['input'];
+  /** Hold set ids of that layout and size, comma-separated. At least one. */
+  setIds: Scalars['String']['input'];
+  /** A size of that layout. */
+  sizeId: Scalars['Int']['input'];
+};
+
+/** What a suggested setup did. */
+export type BoardSetupOutcome =
+  /** The board changed for everyone straight away. */
+  | 'APPLIED'
+  /** The suggestion waits on the report for someone who can change the board. */
+  | 'SENT_FOR_REVIEW';
+
+/** Why a suggested setup went to review instead of changing the board. */
+export type BoardSetupReviewReason =
+  /** The gym is run by the gym. Its staff check suggestions first. */
+  | 'CLAIMED_GYM'
+  /** The change would make this board a copy of another board with the same owner, or clash with a serial number. */
+  | 'CLASHES'
+  /** The reporter already changed 3 boards in the last 24 hours. */
+  | 'DAILY_LIMIT'
+  /** The board has no gym. Whoever added it checks suggestions first. */
+  | 'NO_GYM'
+  /** A climber's change to this board was undone, or put back by hand, in the last 90 days. */
+  | 'RECENTLY_UNDONE'
+  /** A climber changed this board's setup in the last 24 hours. */
+  | 'RECENT_CHANGE';
+
+/**
+ * A home board's share link. A signed-in climber who opens it and chooses Join
+ * becomes an approved member of the board; opening it alone grants nothing.
+ */
+export type BoardShareLink = {
+  __typename?: 'BoardShareLink';
+  boardUuid: Scalars['ID']['output'];
+  createdAt: Scalars['String']['output'];
+  /** The path on the web host: /b/{slug}?invite={token} */
+  path: Scalars['String']['output'];
+  /** The link's capability. Treat it like a password: never log it. */
+  token: Scalars['String']['output'];
+};
+
+/** What a signed-out visitor holding a share link may see: the board's name only. */
+export type BoardShareLinkPreview = {
+  __typename?: 'BoardShareLinkPreview';
+  name: Scalars['String']['output'];
+};
+
+/** Where a redeemed share link points, so the client can open the board. */
+export type BoardShareLinkRedemption = {
+  __typename?: 'BoardShareLinkRedemption';
+  boardUuid: Scalars['ID']['output'];
+  slug: Scalars['String']['output'];
 };
 
 /**
@@ -1067,6 +1497,11 @@ export type Climb = {
   framesCount?: Maybe<Scalars['Int']['output']>;
   /** Animation pace between frames, in Aurora's native unit (treated as milliseconds). 0 when not set. */
   framesPace?: Maybe<Scalars['Int']['output']>;
+  /**
+   * The revision at which this climb's holds last changed, as stored. Edits no
+   * longer move it and the server no longer compares ticks against it.
+   */
+  holdsRevisionNumber?: Maybe<Scalars['Int']['output']>;
   /** Whether this climb is a draft (unpublished) */
   is_draft?: Maybe<Scalars['Boolean']['output']>;
   /** Hidden by community moderation (still openable directly) */
@@ -1078,12 +1513,11 @@ export type Climb = {
   /**
    * The holds this climb was set on that are no longer on the wall, carrying the
    * geometry they had while they were — so a client can draw ghost rings where
-   * they used to be and the climber can see what the reset took.
+   * they used to be and the climber can see what came off.
    *
    * Spray walls only: null on every catalogue board, where holds do not come off,
-   * and null on a climb that has lost nothing, so the common case costs no query.
-   * An empty list means the climb's holds are all still there but the server did
-   * look.
+   * and null when the climb's count is unknown. An empty list for a climb that has
+   * lost nothing (no query), or for a wall the viewer may not see.
    *
    * Coordinates are the wall's canonical frame — the same frame
    * `SprayWallRenderData.holds` uses — so the two sets draw on one photo without
@@ -1099,10 +1533,11 @@ export type Climb = {
    * How many of this climb's holds are no longer on the wall.
    *
    * Spray walls only — null on every catalogue board, where holds do not come off.
-   * 0 is an intact climb; anything higher is a climb that survived a reset minus
-   * some holds, which stays findable, gets a badge and can be remixed. Materialised
-   * on `board_climbs` rather than joined, because the offline mirror has no
-   * `board_climb_holds` table to join through.
+   * 0 is an intact climb; anything higher is a climb that lost holds when the
+   * owner edited the wall's holds (or to an old in-place reset). It stays listed,
+   * gets a badge and can be remixed, with `lostHolds` drawing the missing holds.
+   * Materialised on `board_climbs` rather than joined, because the offline mirror
+   * has no `board_climb_holds` table to join through.
    */
   missingHoldCount?: Maybe<Scalars['Int']['output']>;
   /** The signed-in climber's OWN grade for this climb at this angle: the difficulty of their latest tick that carries one, clamped to the boulder scale. Populated only when the search asked for useMyGrades — that search's filter and difficulty sort key off exactly this value (falling back to the crowd's grade where it is null), so a row can never disagree with its own position in the list. Never round-tripped through the party queue: it is one climber's private opinion, not a property of the climb. */
@@ -1115,6 +1550,15 @@ export type Climb = {
   quality_average: Scalars['String']['output'];
   /** Board configuration to draw this climb on, resolved against its setter's boards. Populated by userClimbs; null wherever the board is already known from the route. */
   renderBoard?: Maybe<RenderBoardConfig>;
+  /** Hold-set IDs required by the climb, derived from its frame placements. Null means unknown; an empty list requires no sets. */
+  requiredSetIds?: Maybe<Array<Scalars['Int']['output']>>;
+  /**
+   * The climb's stored revision number. Edits no longer move it, so it is 1 for
+   * almost every climb and frozen at its last value for the few edited before
+   * revision history was retired. The server no longer uses it. Null on a fetch
+   * path that does not project the column.
+   */
+  revisionNumber?: Maybe<Scalars['Int']['output']>;
   /** Username of the person who created this climb */
   setter_username: Scalars['String']['output'];
   /** Star rating (0-5), rounded from quality_average */
@@ -1202,6 +1646,10 @@ export type ClimbInput = {
   /** ISO timestamp of when this climb was first published. */
   published_at?: InputMaybe<Scalars['String']['input']>;
   quality_average: Scalars['String']['input'];
+  /** Hold-set IDs required by the climb, derived from its frame placements. Null means unknown; an empty list requires no sets. */
+  requiredSetIds?: InputMaybe<Array<Scalars['Int']['input']>>;
+  /** The climb's revision as the queueing client read it (`Climb.revisionNumber`). Round-tripped through the queue so whoever logs a queued climb can say which revision was on the wall without a refetch. Null from a client that predates the field. */
+  revisionNumber?: InputMaybe<Scalars['Int']['input']>;
   setter_username: Scalars['String']['input'];
   stars: Scalars['Float']['input'];
   userAscents?: InputMaybe<Scalars['Int']['input']>;
@@ -1209,6 +1657,81 @@ export type ClimbInput = {
   /** Boardsesh user ID of the climb owner (null for Aurora-synced climbs). */
   userId?: InputMaybe<Scalars['ID']['input']>;
   uuid: Scalars['ID']['input'];
+};
+
+/** One climber's log on a climb, as the public per-climb list returns it. */
+export type ClimbLogItem = {
+  __typename?: 'ClimbLogItem';
+  /** Board angle */
+  angle: Scalars['Int']['output'];
+  /** Number of tries */
+  attemptCount: Scalars['Int']['output'];
+  /** Board type */
+  boardType: Scalars['String']['output'];
+  /**
+   * Always null. Revision history was retired, so no log is marked as made on an earlier version.
+   * @deprecated Climb revision history was retired. Always null.
+   */
+  climbCurrentRevision?: Maybe<Scalars['Int']['output']>;
+  /** The climb revision this was logged against. 1 on a climb nobody has edited; null when it is not known (imports, and logs older than the field). */
+  climbRevision?: Maybe<Scalars['Int']['output']>;
+  /** UUID of the climb the log is stored under */
+  climbUuid: Scalars['String']['output'];
+  /** When the climb was logged */
+  climbedAt: Scalars['String']['output'];
+  /** The climber's note, empty when there is none */
+  comment: Scalars['String']['output'];
+  /** Personal grade id, null when none was given */
+  difficulty?: Maybe<Scalars['Int']['output']>;
+  /** Raw quality, or the climber's synced star rating for this climb and angle when the log has none. Sends and flashes only. */
+  effectiveQuality?: Maybe<Scalars['Int']['output']>;
+  /** Whether the climb was mirrored */
+  isMirror: Scalars['Boolean']['output'];
+  /** Star rating given on the log itself */
+  quality?: Maybe<Scalars['Int']['output']>;
+  /** flash, send or attempt */
+  status: Scalars['String']['output'];
+  /** Avatar URL of the user */
+  userAvatarUrl?: Maybe<Scalars['String']['output']>;
+  /** Display name of the user */
+  userDisplayName?: Maybe<Scalars['String']['output']>;
+  /** User who logged it */
+  userId: Scalars['ID']['output'];
+  /** Tick UUID */
+  uuid: Scalars['ID']['output'];
+};
+
+/** Input for one page of everyone's logs on a climb. */
+export type ClimbLogsInput = {
+  /** Only logs at this angle. Omit for every angle. */
+  angle?: InputMaybe<Scalars['Int']['input']>;
+  /** Board type (kilter, tension, moonboard, spray, ...) */
+  boardType: Scalars['String']['input'];
+  /** Climb UUID */
+  climbUuid: Scalars['String']['input'];
+  /** Opaque keyset cursor from the previous page */
+  cursor?: InputMaybe<Scalars['String']['input']>;
+  /** Signed-in callers only: drop the caller's own logs and logs by people they follow. Ignored when anonymous. */
+  excludeFollowed?: InputMaybe<Scalars['Boolean']['input']>;
+  /** One row per climber: their newest log that passes the filters above. */
+  latestPerClimber?: InputMaybe<Scalars['Boolean']['input']>;
+  /** 1 to 50, default 20 */
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  /** Only flashes and sends. */
+  sendsOnly?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only logs with a non-empty note. */
+  withNotes?: InputMaybe<Scalars['Boolean']['input']>;
+};
+
+/** One page of logs on a climb, newest first. */
+export type ClimbLogsResult = {
+  __typename?: 'ClimbLogsResult';
+  /** Pass back as input.cursor for the next page. Null on the last page. */
+  cursor?: Maybe<Scalars['String']['output']>;
+  /** Whether another page exists */
+  hasMore: Scalars['Boolean']['output'];
+  /** Newest first (climbed at, then id) */
+  items: Array<ClimbLogItem>;
 };
 
 export type ClimbMatchResult = {
@@ -1270,6 +1793,54 @@ export type ClimbQueueItemInput = {
 };
 
 /**
+ * One state a published climb has been in: the climb as it stood after an edit.
+ *
+ * The highest-numbered revision is always the climb as it is now. Revision 1 is
+ * the climb as it was first published. A climb nobody has edited has no
+ * revisions at all. Numbers are not always consecutive: past 50 revisions the
+ * oldest edits are dropped (revision 1 is always kept).
+ *
+ * Read-only. A revision cannot be restored, queued or lit up.
+ */
+export type ClimbRevision = {
+  __typename?: 'ClimbRevision';
+  angle?: Maybe<Scalars['Int']['output']>;
+  /**
+   * What this revision changed against the one before it: any of name,
+   * description, holds, grade, angle, rules. Empty for revision 1.
+   */
+  changes: Array<Scalars['String']['output']>;
+  /** When the edit was made. For revision 1, when the climb was published. */
+  createdAt: Scalars['String']['output'];
+  description?: Maybe<Scalars['String']['output']>;
+  /** The setter grade at this revision. Spray walls only; null on every other board. */
+  difficultyId?: Maybe<Scalars['Int']['output']>;
+  /** True when the editor is the climb's setter, false for a spray wall's editor. */
+  editedBySetter: Scalars['Boolean']['output'];
+  /** Who made the edit. Null when that account has since been deleted. */
+  editor?: Maybe<ClimbRevisionEditor>;
+  frames?: Maybe<Scalars['String']['output']>;
+  /** True for the newest revision, which matches the live climb. */
+  isCurrent: Scalars['Boolean']['output'];
+  name?: Maybe<Scalars['String']['output']>;
+  revisionNumber: Scalars['Int']['output'];
+  /**
+   * Spray walls only: the wall version (photo) this revision was drawn on, to pass
+   * as sprayWallRenderData's version. Null on every other board, and on a first
+   * revision whose version could not be worked out.
+   */
+  sprayWallVersionNumber?: Maybe<Scalars['Int']['output']>;
+};
+
+/** Who made an edit to a climb. */
+export type ClimbRevisionEditor = {
+  __typename?: 'ClimbRevisionEditor';
+  avatarUrl?: Maybe<Scalars['String']['output']>;
+  displayName?: Maybe<Scalars['String']['output']>;
+  id: Scalars['ID']['output'];
+};
+
+/**
  * Input parameters for searching climbs.
  * Supports filtering, sorting, and pagination.
  */
@@ -1282,6 +1853,8 @@ export type ClimbSearchInput = {
   boulders?: InputMaybe<Scalars['Boolean']['input']>;
   /** Resolve each climb's grade and ascents through its own set angle when the browsed angle has no stats row, instead of ranking it below every climb that does have one (issue #5405). Opt-in on every board; omitted means off. On Woods, whose climbs are bound to the angle they were set at, off also narrows the list to the climbs for the browsed angle: set there, with no set angle recorded, or with stats there (issue #5642). A name search on Woods resolves across angles either way, so a climb is findable by name at any angle. */
   crossAngleStats?: InputMaybe<Scalars['Boolean']['input']>;
+  /** OWN lists personal drafts; WALL lists all drafts on an accessible spray wall. */
+  draftScope?: InputMaybe<DraftScope>;
   /** Grade accuracy filter ('tight', 'moderate', 'loose') */
   gradeAccuracy?: InputMaybe<Scalars['String']['input']>;
   /** Which grade minGrade and maxGrade are compared against. Omitted means UPSTREAM, the grade older app builds filter on. Send BOARDSESH when the list shows Boardsesh grades, so the filter matches the labels. */
@@ -1312,6 +1885,8 @@ export type ClimbSearchInput = {
   onlyBenchmarks?: InputMaybe<Scalars['Boolean']['input']>;
   /** Show only the user's draft climbs (requires auth) */
   onlyDrafts?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Show only climbs the user has hearted on this board. A heart belongs to the climb, not to an angle, so it matches at every angle. Signed out returns no climbs. (requires auth) */
+  onlyFavorited?: InputMaybe<Scalars['Boolean']['input']>;
   /** Only climbs by followed setters or followed users, including linked board accounts. Requires authentication. */
   onlyFollowedAuthors?: InputMaybe<Scalars['Boolean']['input']>;
   /** Only show climbs the user has rated at this angle (requires auth) */
@@ -1467,6 +2042,402 @@ export type ClimbStatsHistoryEntry = {
   qualityAverage?: Maybe<Scalars['Float']['output']>;
 };
 
+/**
+ * One order as an administrator sees it: the buyer's own view, plus the three
+ * fields that view deliberately withholds.
+ *
+ * A wrapper rather than a flattened copy of `CncOrder`. The buyer's shape is
+ * built by exactly one mapper, and re-listing its twenty-odd fields here is how
+ * a field redacted on one path ends up published on the other. Nesting keeps
+ * this type down to what is genuinely admin-only.
+ */
+export type CncAdminOrder = {
+  __typename?: 'CncAdminOrder';
+  /** Generation attempts spent. Three is the budget; a `failed` row sitting at three has run out of them. */
+  attempts: Scalars['Int']['output'];
+  /** The generator's real error, verbatim. The buyer only ever sees a fixed public message. */
+  lastError?: Maybe<Scalars['String']['output']>;
+  /**
+   * Where the licence and the download link were sent.
+   *
+   * Buyer-typed free text rather than the account email — a pack is often bought
+   * for a client or a teammate — so this is the address support has to reply to,
+   * and it is a large part of why this query exists at all.
+   */
+  licenseeEmail?: Maybe<Scalars['String']['output']>;
+  /** Exactly what the buyer sees, from the same mapper, so the two cannot drift. */
+  order: CncOrder;
+};
+
+/**
+ * One piece of custom artwork. Exactly one of `assetId` (an uploaded SVG) or
+ * `text` (a routed label) must be set.
+ */
+export type CncArtworkInput = {
+  /** An uploaded SVG asset. Mutually exclusive with `text`; at most 128 characters. */
+  assetId?: InputMaybe<Scalars['ID']['input']>;
+  /**
+   * Which bundled typeface to outline `text` with, from `CncCatalog.artworkFonts`.
+   *
+   * Null takes the generator's own default. A face that is not bundled is
+   * rejected, never substituted — a substituted font would quietly change the
+   * shape the buyer approved. Meaningless for an `assetId` item, which carries
+   * its own geometry.
+   */
+  font?: InputMaybe<Scalars['String']['input']>;
+  mode: CncArtworkMode;
+  placement: CncPlacementInput;
+  /** A routed label, at most 40 characters — past that it stops fitting on a panel at a legible height. Trimmed, and it may not be empty. Mutually exclusive with `assetId`. */
+  text?: InputMaybe<Scalars['String']['input']>;
+};
+
+/**
+ * What a piece of artwork IS. `text` is a routed label, `svg` an uploaded
+ * drawing, `png` an uploaded raster the generator has to trace first.
+ *
+ * Which of them a buyer may actually use is
+ * `CncArtworkRules.allowedKinds`, not this list: the enum is the vocabulary,
+ * the rules field is today's menu. `png` uploads are accepted by
+ * `POST /api/cnc/art` while tracing is still v2, so an asset can exist in a
+ * kind checkout refuses.
+ */
+export type CncArtworkKind = 'png' | 'svg' | 'text';
+
+/**
+ * How a piece of custom artwork is cut. `engrave` scores the surface,
+ * `pocket` clears it to a depth, `cut_through` goes all the way and is held
+ * to a wider keep-out because it weakens the panel.
+ */
+export type CncArtworkMode = 'cut_through' | 'engrave' | 'pocket';
+
+/**
+ * The limits every piece of artwork is held to, so a configurator can enforce
+ * them before a round trip rather than discovering them from a rejection.
+ *
+ * Advisory to a client and binding on the server: the same numbers gate
+ * checkout, and a client that ignores them gets a `CNC_INVALID_CONFIG`.
+ */
+export type CncArtworkRules = {
+  __typename?: 'CncArtworkRules';
+  /**
+   * The artwork kinds checkout will accept today, in the order a picker should
+   * offer them.
+   *
+   * Separate from the `CncArtworkKind` enum because the menu shrinks and grows
+   * without the vocabulary changing: the upload route takes a PNG so the whole
+   * storage and cleanup path stays exercised, while the generator's tracer is
+   * still v2 — so `png` is absent here and an order naming a PNG asset is
+   * refused with `CNC_INVALID_CONFIG`. A client hides what is not listed.
+   */
+  allowedKinds: Array<CncArtworkKind>;
+  /** The most artwork items one pack may carry. */
+  maxItems: Scalars['Int']['output'];
+  /** Longest a routed text label may be. Past this it stops fitting on a panel at a legible height. */
+  maxTextChars: Scalars['Int']['output'];
+  /** Widest an item may be, in mm. Just under the widest panel the sheet stock can produce. */
+  maxWidthMm: Scalars['Float']['output'];
+  /** Narrowest an item may be, in mm. Below this a router bit stops resolving the shape. */
+  minWidthMm: Scalars['Float']['output'];
+};
+
+/**
+ * Verdict on a configuration's artwork, from the generator itself rather than
+ * the browser's live-feedback maths. `collisions` carries one entry per
+ * offending item with the panel and the reason.
+ */
+export type CncArtworkValidation = {
+  __typename?: 'CncArtworkValidation';
+  collisions: Scalars['JSON']['output'];
+  ok: Scalars['Boolean']['output'];
+};
+
+/**
+ * A board tuple plus the manufacturing choices made against it. The same input
+ * drives the layout preview, artwork validation and checkout, so a preview can
+ * never disagree with what is bought.
+ */
+export type CncBoardConfigInput = {
+  /** At most 4 items. Every item costs a rotated-bbox check against every hole on its panel, and four is already more than a wall has room for at the 40 mm minimum width. */
+  artwork?: InputMaybe<Array<CncArtworkInput>>;
+  boardName: Scalars['String']['input'];
+  layoutId: Scalars['Int']['input'];
+  /** Manufacturing options keyed by `CncManufacturingOption.key`. Missing keys take their default. */
+  options: Scalars['JSON']['input'];
+  /** Comma-joined set ids, same shape as the `[set_ids]` URL segment. */
+  setIds: Scalars['String']['input'];
+  sizeId: Scalars['Int']['input'];
+};
+
+/**
+ * Everything on sale, plus the catalogue version it was read at. Every order
+ * stores that version so a regenerate months later rebuilds the pack the buyer
+ * paid for rather than today's defaults.
+ */
+export type CncCatalog = {
+  __typename?: 'CncCatalog';
+  /**
+   * Typeface keys a text label may be routed in, first one being the default.
+   *
+   * Only faces the generator actually bundles: every character is outlined
+   * against a real font file, and an unknown font is rejected rather than
+   * substituted, so the shape approved in the editor is the shape that gets cut.
+   */
+  artworkFonts: Array<Scalars['String']['output']>;
+  artworkRules: CncArtworkRules;
+  entries: Array<CncCatalogEntry>;
+  version: Scalars['String']['output'];
+};
+
+/**
+ * One sellable board tuple. A board/size that is not listed here cannot be
+ * configured, priced or generated.
+ *
+ * The LED-kit size aliases that resolve onto `sizeId` are deliberately not
+ * exposed: a client picks the canonical size, and alias resolution happens
+ * server-side so the catalogue never has to explain Aurora's kit numbering.
+ */
+export type CncCatalogEntry = {
+  __typename?: 'CncCatalogEntry';
+  boardName: Scalars['String']['output'];
+  /** True when this size has kicker sets the buyer can include or leave off. */
+  kickerOptional: Scalars['Boolean']['output'];
+  /** Human label for the wall, e.g. "10x12". */
+  label: Scalars['String']['output'];
+  layoutId: Scalars['Int']['output'];
+  manufacturingOptions: Array<CncManufacturingOption>;
+  /** Comma-joined set ids, same shape as the `[set_ids]` URL segment. */
+  setIds: Scalars['String']['output'];
+  /** The canonical size id. Aliases resolve to this one before anything runs. */
+  sizeId: Scalars['Int']['output'];
+  tiers: Array<CncTierPrice>;
+};
+
+/**
+ * An opened Stripe Checkout Session and the order it will pay for.
+ *
+ * The order already exists in `pending_payment` by the time this comes back —
+ * creating a session is not a payment, and nothing is queued for generation
+ * until the Stripe webhook confirms the charge. Send the buyer to
+ * `checkoutUrl`; they land back on the order page either way.
+ */
+export type CncCheckoutSession = {
+  __typename?: 'CncCheckoutSession';
+  /** Stripe's hosted checkout page. Expires 31 minutes after it is created. */
+  checkoutUrl: Scalars['String']['output'];
+  /** The licence this order will carry, reserved now so the order page works before payment lands. */
+  licenceId: Scalars['String']['output'];
+  orderId: Scalars['ID']['output'];
+};
+
+/** A queued CNC layout/artwork computation. Only its owner may read private results. */
+export type CncComputation = {
+  __typename?: 'CncComputation';
+  errorCode?: Maybe<Scalars['String']['output']>;
+  id: Scalars['ID']['output'];
+  result?: Maybe<Scalars['JSON']['output']>;
+  status: Scalars['String']['output'];
+};
+
+/**
+ * A short-lived link to one pack or preview.
+ *
+ * It exists because a browser navigation cannot carry an Authorization header,
+ * and a session token in a URL would land in history, in a referrer and in every
+ * proxy log. So the grant is the weakest thing that works: one order, one user,
+ * five minutes, no revocation — and the download route re-checks ownership and
+ * refund status when it is redeemed anyway. Treat it as a click target, not as a
+ * credential to store.
+ */
+export type CncDownloadGrant = {
+  __typename?: 'CncDownloadGrant';
+  /** ISO 8601. Ask for another one after this; nothing is lost by doing so. */
+  expiresAt: Scalars['String']['output'];
+  /** Fetch or navigate to this. Streams the zip as an attachment. */
+  url: Scalars['String']['output'];
+};
+
+/**
+ * Which artifact a download link is for.
+ *
+ * `PREVIEW` is the free watermarked, rasterised pack — available from
+ * `preview_ready` onward, including after the order is bought. `FULL` is the
+ * licensed pack with the DXFs and is only ever available at `ready`.
+ */
+export type CncDownloadKind = 'FULL' | 'PREVIEW';
+
+/**
+ * What the buyer is allowed to build with a pack.
+ * `personal` is one wall for their own non-commercial use; `commercial_single`
+ * is one identified customer installation, which is why those orders also carry
+ * a site name.
+ */
+export type CncLicenceTier = 'commercial_single' | 'personal';
+
+/**
+ * One manufacturing choice the buyer may make, with its complete allowed set.
+ *
+ * Values are carried as strings with a `valueType` tag rather than as a JSON
+ * blob: the catalogue mixes strings ("2440x1220"), numbers (12.5) and booleans
+ * in one list, and a typed field is what lets a client build the select and
+ * round-trip the answer without guessing. Coerce with `valueType` before
+ * comparing — the backend matches submitted values by their string form and
+ * stores the catalogue's own typed value.
+ */
+export type CncManufacturingOption = {
+  __typename?: 'CncManufacturingOption';
+  /** The value applied when the buyer does not choose. Always a member of `values`. */
+  defaultValue: Scalars['String']['output'];
+  /** Camel-case option key, e.g. `sheetStock` or `tnutHoleDiameterMm`. */
+  key: Scalars['String']['output'];
+  /** True when this option only matters on a wall that is building a kicker. A kickerless wall (or one where the buyer left the kicker off) can hide it. */
+  kickerOnly: Scalars['Boolean']['output'];
+  /** How to read `values` and `defaultValue`: string, number or boolean. */
+  valueType: Scalars['String']['output'];
+  /** The complete allowed set. Anything outside it is rejected, not clamped. */
+  values: Array<Scalars['String']['output']>;
+};
+
+export type CncOrder = {
+  __typename?: 'CncOrder';
+  amountCents?: Maybe<Scalars['Int']['output']>;
+  /** Artwork placements carried through to the generator. Empty list when there is none. */
+  artwork: Scalars['JSON']['output'];
+  boardName: Scalars['String']['output'];
+  /**
+   * sha256 of the configuration this order previewed and will build.
+   *
+   * Two uses: telling whether the configuration on screen still matches the
+   * preview being shown (if it does not, the buyer needs a new preview), and
+   * letting the server hand back an existing preview instead of generating the
+   * same one twice.
+   */
+  configHash: Scalars['String']['output'];
+  createdAt: Scalars['String']['output'];
+  currency?: Maybe<Scalars['String']['output']>;
+  /** Set only for commercial_single orders: the installation the licence names. */
+  customerSiteName?: Maybe<Scalars['String']['output']>;
+  downloadCount: Scalars['Int']['output'];
+  /** A fixed public message when the order failed, null otherwise. Never generator internals. */
+  errorMessage?: Maybe<Scalars['String']['output']>;
+  generatedAt?: Maybe<Scalars['String']['output']>;
+  /** True once the free preview has been generated. Stays true after the pack is bought. */
+  hasPreview: Scalars['Boolean']['output'];
+  id: Scalars['ID']['output'];
+  lastDownloadedAt?: Maybe<Scalars['String']['output']>;
+  layoutId: Scalars['Int']['output'];
+  /** The licence printed on every file in the pack. The id support and leak investigations start from. */
+  licenceId: Scalars['String']['output'];
+  licenseeName?: Maybe<Scalars['String']['output']>;
+  /** The normalised manufacturing options this pack was priced and built with. */
+  options: Scalars['JSON']['output'];
+  paidAt?: Maybe<Scalars['String']['output']>;
+  previewGeneratedAt?: Maybe<Scalars['String']['output']>;
+  /**
+   * The watermarked sheets, in sheet order. Empty until `preview_ready`.
+   *
+   * Each URL carries its own one-hour grant, so they are usable straight from an
+   * `<img>` and worthless to anyone the order does not belong to.
+   */
+  previewImages: Array<CncPreviewImage>;
+  setIds: Scalars['String']['output'];
+  sizeId: Scalars['Int']['output'];
+  status: CncOrderStatus;
+  /** Null until the order is finalised: a preview is not a sale, so nothing has been licensed yet. */
+  tier?: Maybe<CncLicenceTier>;
+  zipSizeBytes?: Maybe<Scalars['Int']['output']>;
+};
+
+/**
+ * A page of orders for the admin list, newest first.
+ *
+ * Keyset paginated rather than offset paginated: orders arrive at the front of
+ * this list while an administrator is reading it, and an offset would show a row
+ * twice or skip one.
+ */
+export type CncOrderConnection = {
+  __typename?: 'CncOrderConnection';
+  /** Opaque cursor for the next page, or null at the end of the list. */
+  cursor?: Maybe<Scalars['String']['output']>;
+  /** True when there is another page. Pass `cursor` to fetch it. */
+  hasMore: Scalars['Boolean']['output'];
+  orders: Array<CncAdminOrder>;
+};
+
+/**
+ * Lifecycle of one order.
+ *
+ * An order starts as a FREE PREVIEW: `preview_queued -> preview_generating ->
+ * preview_ready`, repeatable and never charged. Finalising it moves it to
+ * `pending_payment`, and everything after that is driven by a Stripe webhook or
+ * by the pack generator. `refunded` is terminal for downloads and is
+ * deliberately distinct from `cancelled`, which only ever means the checkout
+ * session expired before payment.
+ *
+ * A `preview_failed` order can be previewed again; so can a `preview_ready` one
+ * whose configuration changed — both write a NEW order, because a preview is an
+ * immutable snapshot of one configuration.
+ */
+export type CncOrderStatus =
+  | 'cancelled'
+  | 'failed'
+  | 'generating'
+  | 'pending_payment'
+  | 'preview_failed'
+  | 'preview_generating'
+  | 'preview_queued'
+  | 'preview_ready'
+  | 'queued'
+  | 'ready'
+  | 'refunded';
+
+/**
+ * Where one piece of artwork sits, in wall millimetres.
+ *
+ * `xMm`/`yMm` are the centre of the item, not a corner, so a rotation is
+ * about the item's own middle and a resize keeps it put.
+ */
+export type CncPlacementInput = {
+  /** Index of the panel the item is routed on, from the layout response. Zero or greater. */
+  panelIndex: Scalars['Int']['input'];
+  /** Rotation in degrees, -180 to 180, counter-clockwise. Signed rather than 0..360 so the value comes back the way the editor's rotate handle produced it. Out of range is rejected, not normalised. */
+  rotationDeg: Scalars['Float']['input'];
+  /** Item width in mm; height follows from the aspect ratio. 40 to 1200 — the floor is what a router bit still resolves, the ceiling is just under the widest panel the sheet stock can produce. Out of range is rejected, not clamped. */
+  widthMm: Scalars['Float']['input'];
+  /** Centre X in wall millimetres. Must be finite; the generator does the panel-bounds check itself. */
+  xMm: Scalars['Float']['input'];
+  /** Centre Y in wall millimetres. Must be finite; the generator does the panel-bounds check itself. */
+  yMm: Scalars['Float']['input'];
+};
+
+/**
+ * One order as its buyer may see it.
+ *
+ * The fingerprint manifest, the worker's claim token and the raw generator
+ * error never appear here — a failed order reports a fixed public message
+ * instead.
+ */
+export type CncPreviewImage = {
+  __typename?: 'CncPreviewImage';
+  /** Filename of the watermarked sheet, e.g. `panel1.png` or `assembly.png`. Stable for one order. */
+  name: Scalars['String']['output'];
+  /**
+   * A ready-to-use `<img src>`: the backend preview route with a one-hour grant
+   * token already on it. Re-read the order for fresh URLs rather than caching
+   * these; nothing is lost by asking again.
+   */
+  url: Scalars['String']['output'];
+};
+
+/** One purchasable licence tier and its price, in the smallest currency unit. */
+export type CncTierPrice = {
+  __typename?: 'CncTierPrice';
+  /** Price in cents. Prices live in Stripe; this is the display copy of them. */
+  amountCents: Scalars['Int']['output'];
+  /** ISO 4217 code. AUD for every v1 tier. */
+  currency: Scalars['String']['output'];
+  tier: CncLicenceTier;
+};
+
 /** A comment on a social entity (climb, tick, playlist_climb, etc). */
 export type Comment = {
   __typename?: 'Comment';
@@ -1564,16 +2535,24 @@ export type CommentsInput = {
 };
 
 /**
- * The reviewed outcome of a reset. Re-validated against the wall's current state
- * inside the commit transaction — a proposal computed ten minutes ago against a
- * generation that has since been published is rejected, not applied.
+ * Publish a wall's FIRST version. The in-place reset this input was built for is
+ * retired: a draft with a new photo on a published wall is refused with
+ * SPRAY_WALL_RESET_RETIRED. The decision lists are still required by the shape,
+ * so older apps' documents validate, and are ignored.
  */
 export type CommitSprayWallVersionInput = {
+  /** Ignored. Retired with the in-place reset. */
   added: Array<SprayWallAddedDecisionInput>;
+  /**
+   * Ignored. Partial and full resets were retired with the in-place reset.
+   * @deprecated Retired with the in-place reset. Ignored.
+   */
+  fullReset?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Ignored. Retired with the in-place reset. */
   kept: Array<SprayWallKeptDecisionInput>;
-  /** Hold ids that came off the wall. */
+  /** Ignored. Retired with the in-place reset. */
   removed: Array<Scalars['Int']['input']>;
-  /** The DRAFT version this reset lands as. It must carry anchors (see ProposeSprayWallResetInput). */
+  /** The DRAFT version to publish. */
   versionId: Scalars['ID']['input'];
   wallUuid: Scalars['ID']['input'];
 };
@@ -1625,7 +2604,105 @@ export type CommunityStats = {
   litLast30Days: Scalars['Int']['output'];
 };
 
+/** An app the signed-in climber connected to their account (docs/integrations/integration-platform.md, Connected apps). */
+export type ConnectedApp = {
+  __typename?: 'ConnectedApp';
+  /** ISO 8601. When the app first used its access, or first used it again after a reconnect. */
+  connectedAt: Scalars['String']['output'];
+  /** Pass to disconnectApp. */
+  connectionId: Scalars['ID']['output'];
+  /** ISO 8601. The app's latest call to the API, to within an hour. Null until it makes one. */
+  lastUsedAt?: Maybe<Scalars['String']['output']>;
+  /** The app's registered name. Null when it has none. */
+  name?: Maybe<Scalars['String']['output']>;
+  /**
+   * Who makes the app, as its developer registered it. Null until apps carry a
+   * publisher name, and never the developer account's own name.
+   */
+  publisherName?: Maybe<Scalars['String']['output']>;
+  /**
+   * What the climber allowed, as OAuth scope strings (profile:read, logbook:read,
+   * offline_access, or one added later). Clients word them in the climber's language.
+   */
+  scopes: Array<Scalars['String']['output']>;
+  /** True while Boardsesh has suspended the app. It reads nothing until it is restored. */
+  suspended: Scalars['Boolean']['output'];
+};
+
+export type ConnectedApps = {
+  __typename?: 'ConnectedApps';
+  /** Live connections, the most recently connected first. */
+  apps: Array<ConnectedApp>;
+  /**
+   * False while partner apps are switched off (PARTNER_OAUTH_MODE off): no app can
+   * connect, though connections made before still list here and can be disconnected.
+   * A hold is a short pause and counts as on.
+   */
+  partnerAppsEnabled: Scalars['Boolean']['output'];
+};
+
+/**
+ * Whether this visitor is asked before analytics runs, from the Cloudflare
+ * country of the request. See docs/analytics/analytics-consent.md.
+ */
+export type ConsentRegion = {
+  __typename?: 'ConsentRegion';
+  /** The ISO 3166-1 country the edge reported, or null when it is unknown or untrusted. */
+  countryCode?: Maybe<Scalars['String']['output']>;
+  /** True when the request carried Sec-GPC: 1 (Global Privacy Control). The website treats it as a no outside the prompt regions. */
+  globalPrivacyControl: Scalars['Boolean']['output'];
+  /** True in the EU, EEA, UK, Switzerland and the other prompt regions, and whenever the country is unknown. */
+  promptRequired: Scalars['Boolean']['output'];
+};
+
+/**
+ * One board owned by the account a controller API key belongs to, for a wall
+ * device's setup screen (`controllerBoards`). Read-only identity and config.
+ */
+export type ControllerBoard = {
+  __typename?: 'ControllerBoard';
+  /** Board angle in degrees */
+  angle: Scalars['Int']['output'];
+  /** Numeric board-presence channel id (userBoards.id). Feeds boardNowPlaying(boardId). */
+  boardId: Scalars['Int']['output'];
+  /** kilter, tension, moonboard, spray, ... */
+  boardType: Scalars['String']['output'];
+  /** False for a board with no lights (every spray wall) */
+  hasLeds: Scalars['Boolean']['output'];
+  layoutId: Scalars['Int']['output'];
+  /** What the owner calls the board */
+  name: Scalars['String']['output'];
+  /** Comma-separated hold set ids */
+  setIds: Scalars['String']['output'];
+  sizeId: Scalars['Int']['output'];
+  /** The board's uuid. A spray wall's uuid is also its sprayWall(uuid) key. */
+  uuid: Scalars['ID']['output'];
+};
+
 export type ControllerEvent = ControllerPing | ControllerQueueSync | LedUpdate;
+
+export type ControllerGymBoard = {
+  __typename?: 'ControllerGymBoard';
+  advertisedName: Scalars['String']['output'];
+  angle: Scalars['Int']['output'];
+  boardType: Scalars['String']['output'];
+  layoutId: Scalars['Int']['output'];
+  name: Scalars['String']['output'];
+  preview: ControllerPreviewDescriptor;
+  serialNumber: Scalars['String']['output'];
+  setIds: Scalars['String']['output'];
+  sizeId: Scalars['Int']['output'];
+  uuid: Scalars['ID']['output'];
+};
+
+export type ControllerGymManifest = {
+  __typename?: 'ControllerGymManifest';
+  boards: Array<ControllerGymBoard>;
+  gymUuid: Scalars['ID']['output'];
+  name: Scalars['String']['output'];
+  slug: Scalars['String']['output'];
+  version: Scalars['Int']['output'];
+};
 
 export type ControllerInfo = {
   __typename?: 'ControllerInfo';
@@ -1643,6 +2720,19 @@ export type ControllerInfo = {
 export type ControllerPing = {
   __typename?: 'ControllerPing';
   timestamp: Scalars['String']['output'];
+};
+
+export type ControllerPreviewDescriptor = {
+  __typename?: 'ControllerPreviewDescriptor';
+  geometryBytes: Scalars['Int']['output'];
+  geometrySha256: Scalars['String']['output'];
+  geometryUrl: Scalars['String']['output'];
+  height: Scalars['Int']['output'];
+  imageBytes: Scalars['Int']['output'];
+  imageSha256: Scalars['String']['output'];
+  imageUrl: Scalars['String']['output'];
+  positionCount: Scalars['Int']['output'];
+  width: Scalars['Int']['output'];
 };
 
 export type ControllerQueueItem = {
@@ -1676,6 +2766,11 @@ export type ControllerRegistration = {
 /** Input for creating a board. */
 export type CreateBoardInput = {
   /**
+   * With CONFIRMED_SEPARATE: the walls the climber was shown and said are
+   * different from theirs. At most 40.
+   */
+  acknowledgedWallUuids?: InputMaybe<Array<Scalars['ID']['input']>>;
+  /**
    * Create this board even though the caller already owns one with the same
    * configuration at the same place. Set only after the user has confirmed it is
    * a physically different wall (another gym, another room) — never by default.
@@ -1685,10 +2780,19 @@ export type CreateBoardInput = {
   allowDuplicateSerial?: InputMaybe<Scalars['Boolean']['input']>;
   /** Default angle for this board (default 40) */
   angle?: InputMaybe<Scalars['Int']['input']>;
+  audience?: InputMaybe<PrivacyResourceAudience>;
   /** Board type */
   boardType: Scalars['String']['input'];
   /** Optional description */
   description?: InputMaybe<Scalars['String']['input']>;
+  /**
+   * Opt in to the existing-wall recheck (#8151). Absent: no check, exactly the
+   * behaviour before it existed. Set: when the board has no serial and lands on a
+   * gym (named, auto-attached or minted), the server looks for walls the caller
+   * can see at that gym, its merged listings and public listings within 150 m,
+   * and refuses with BOARD_EXISTING_WALLS per the mode.
+   */
+  existingWallCheck?: InputMaybe<ExistingWallCheck>;
   /** Optional gym UUID to link board to */
   gymUuid?: InputMaybe<Scalars['String']['input']>;
   /** Whether this wall has an LED light kit (default true) */
@@ -1707,6 +2811,9 @@ export type CreateBoardInput = {
   latitude?: InputMaybe<Scalars['Float']['input']>;
   /** Layout ID */
   layoutId: Scalars['Int']['input'];
+  /** Whether a wall device lights this wall from the board feed (default false) */
+  litByWallDevice?: InputMaybe<Scalars['Boolean']['input']>;
+  locationAudience?: InputMaybe<PrivacyLocationAudience>;
   /** Location name */
   locationName?: InputMaybe<Scalars['String']['input']>;
   /** GPS longitude */
@@ -1735,8 +2842,18 @@ export type CreateGymInput = {
   contactPhone?: InputMaybe<Scalars['String']['input']>;
   /** Optional description */
   description?: InputMaybe<Scalars['String']['input']>;
+  /**
+   * How createGym treats similar gyms that are already listed (the same ones
+   * findSimilarGyms returns). Absent means REJECT_IF_FOUND: the create is refused
+   * with GYM_SIMILAR_EXISTS, whose extensions.candidates are SimilarGym objects.
+   */
+  duplicateCheck?: InputMaybe<GymDuplicateCheckInput>;
+  /** Opening hours; nonblank hours receive a confirmation timestamp. */
+  hours?: InputMaybe<Scalars['String']['input']>;
   /** Image URL */
   imageUrl?: InputMaybe<Scalars['String']['input']>;
+  /** Whether listed in discovery (default true) */
+  isListed?: InputMaybe<Scalars['Boolean']['input']>;
   /** Whether publicly visible (default true) */
   isPublic?: InputMaybe<Scalars['Boolean']['input']>;
   /** GPS latitude */
@@ -1764,6 +2881,23 @@ export type CreateGymKioskInput = {
   slug?: InputMaybe<Scalars['String']['input']>;
 };
 
+export type CreateOAuthClientInput = {
+  /** The developer terms version the developer accepted. Must equal the current version, or registration is refused. */
+  acceptedTermsVersion: Scalars['String']['input'];
+  applicationType: OAuthClientApplicationType;
+  /** https:// only. */
+  homepageUrl?: InputMaybe<Scalars['String']['input']>;
+  /** 3 to 50 characters. Names of Boardsesh, Aurora and board brands are refused. */
+  name: Scalars['String']['input'];
+  /** https:// only. */
+  privacyPolicyUrl: Scalars['String']['input'];
+  /** The person or company that makes the app. Same rules as name. */
+  publisherName: Scalars['String']['input'];
+  /** 1 to 10. */
+  redirectUris: Array<Scalars['String']['input']>;
+  tokenEndpointAuthMethod: OAuthClientAuthMethod;
+};
+
 /** Input for creating a playlist. */
 export type CreatePlaylistInput = {
   /** Board type */
@@ -1778,6 +2912,7 @@ export type CreatePlaylistInput = {
   layoutId: Scalars['Int']['input'];
   /** Playlist name */
   name: Scalars['String']['input'];
+  privacy?: InputMaybe<PrivacyPublicationInput>;
   /** Optional client-generated UUID for offline idempotent replay */
   uuid?: InputMaybe<Scalars['ID']['input']>;
 };
@@ -1793,6 +2928,11 @@ export type CreateProposalInput = {
 
 /** Input for creating a new climbing session. */
 export type CreateSessionInput = {
+  /** Partner workout to start atomically with this climber's session. */
+  appWorkoutId?: InputMaybe<Scalars['ID']['input']>;
+  /** Initial queue and generated stage plan, committed with the new partner workout session. */
+  appWorkoutSeed?: InputMaybe<Scalars['JSON']['input']>;
+  audience?: InputMaybe<PrivacyResourceAudience>;
   /** Board entity IDs for multi-board sessions */
   boardIds?: InputMaybe<Array<Scalars['Int']['input']>>;
   /** Board configuration path (e.g., 'kilter/1/1/1,2/40') */
@@ -1818,6 +2958,11 @@ export type CreateSessionInput = {
 export type CreateSprayWallInput = {
   /** Fixed for the wall's life: stats are keyed by angle and a spray wall does not adjust. */
   angle: Scalars['Int']['input'];
+  /**
+   * Accepted and ignored. Only a climb's setter edits it.
+   * @deprecated Retired. Accepted and ignored.
+   */
+  climbEditPolicy?: InputMaybe<SprayClimbEditPolicy>;
   description?: InputMaybe<Scalars['String']['input']>;
   /** Attach the wall to a gym the caller may link boards to. */
   gymUuid?: InputMaybe<Scalars['ID']['input']>;
@@ -1830,14 +2975,23 @@ export type CreateSprayWallInput = {
   longitude?: InputMaybe<Scalars['Float']['input']>;
   /** What the climber calls the wall. Becomes the board name, the catalogue row names and the slug. */
   name: Scalars['String']['input'];
+  /**
+   * Let this wall's photo and marked holds help train hold finding. The server
+   * stores a yes only for true; omitted and false both store a no. The app's
+   * add-a-wall switch is on when the wizard opens, and the app sends whatever
+   * the owner leaves it at.
+   */
+  trainingConsent?: InputMaybe<Scalars['Boolean']['input']>;
 };
 
 export type CreateSprayWallVersionInput = {
-  /** The wall's four corners in this photo's pixels, TL/TR/BR/BL, as [[x, y], ...]. Omit to use the photo frame. */
+  /** The wall's four corners in an uploaded photo's pixels, TL/TR/BR/BL, as [[x, y], ...]. When sourceVersionId is supplied, omit this field entirely; explicit null is rejected. */
   anchors?: InputMaybe<Scalars['JSON']['input']>;
   notes?: InputMaybe<Scalars['String']['input']>;
-  /** photoId from POST /api/spray-wall-photos. */
-  photoId: Scalars['ID']['input'];
+  /** photoId from POST /api/spray-wall-photos. Supply exactly one of photoId and sourceVersionId. */
+  photoId?: InputMaybe<Scalars['ID']['input']>;
+  /** Reuse this wall's current published photo and its saved geometry for hold editing. Supply exactly one of photoId and sourceVersionId. */
+  sourceVersionId?: InputMaybe<Scalars['ID']['input']>;
   wallUuid: Scalars['ID']['input'];
 };
 
@@ -1908,6 +3062,8 @@ export type CurrentClimbChanged = {
   clientId?: Maybe<Scalars['ID']['output']>;
   /** Correlation ID for request tracking */
   correlationId?: Maybe<Scalars['ID']['output']>;
+  /** Session participant who last changed the current queue item. Null when unknown. */
+  currentChangedBy?: Maybe<Scalars['ID']['output']>;
   /** Raw Aurora frames for an unknown BLE climb when no database match exists */
   frames?: Maybe<Scalars['String']['output']>;
   /** New current climb (null to clear) */
@@ -1919,6 +3075,14 @@ export type CurrentClimbChanged = {
   /** Order-sensitive queue state hash (v2) after this event is applied. Optional during the dual-hash rollout; see QueueState.stateHashOrdered. */
   stateHashOrdered?: Maybe<Scalars['String']['output']>;
 };
+
+/**
+ * How setCurrentClimb puts a climb on the wall (docs/product/current-climb-outside-queue.md, section 1).
+ * NOW: a new client opening a climb; an entry already in the queue moves into the Now slot.
+ * STEP: Previous on the queue walk; the pointer steps back into History.
+ * Omitted by shipped clients, the native socket and the LED path.
+ */
+export type CurrentClimbPlacement = 'NOW' | 'STEP';
 
 /** Information needed before account deletion. */
 export type DeleteAccountInfo = {
@@ -1966,6 +3130,179 @@ export type DeviceLogEntry = {
   ts: Scalars['Float']['input'];
 };
 
+/**
+ * What a directory notification is about. Set on the board_report_*,
+ * gym_report_*, board_removed_from_gym, board_deleted_by_staff,
+ * board_edited_by_staff and board_setup_changed_by_climber types.
+ */
+export type DirectoryNotice = {
+  __typename?: 'DirectoryNotice';
+  /** board_removed_from_gym / board_deleted_by_staff / board_edited_by_staff: who did it. */
+  actorRole?: Maybe<DirectoryNoticeActorRole>;
+  boardName?: Maybe<Scalars['String']['output']>;
+  /** Spray walls are worded apart from boards. */
+  boardType?: Maybe<Scalars['String']['output']>;
+  boardUuid?: Maybe<Scalars['ID']['output']>;
+  gymName?: Maybe<Scalars['String']['output']>;
+  /** The gym concerned: the board's gym at report time, or the gym staff removed it from. */
+  gymUuid?: Maybe<Scalars['ID']['output']>;
+  /** board_report_opened / gym_report_opened: the seven-day reminder rather than the first notice. */
+  isReminder: Scalars['Boolean']['output'];
+  /** Resolved notices: how the report was closed. */
+  outcome?: Maybe<DirectoryReportOutcome>;
+  reason?: Maybe<DirectoryReportReason>;
+  /** The recipient created the board (wording: 'your board' rather than '{{board}} at {{gym}}'). */
+  recipientIsCreator: Scalars['Boolean']['output'];
+  reportUuid?: Maybe<Scalars['ID']['output']>;
+  /** Resolved as kept: what the person who closed it said. */
+  resolutionNote?: Maybe<Scalars['String']['output']>;
+  resolvedByRole?: Maybe<DirectoryReportResolverRole>;
+  /** board_setup_changed_by_climber: the setup the climber changed it to. */
+  setupAfter?: Maybe<BoardSetup>;
+  /** board_setup_changed_by_climber: the setup before the change. */
+  setupBefore?: Maybe<BoardSetup>;
+  /** board_setup_changed_by_climber: the change, to pass to undoBoardSetupChange. */
+  setupChangeEventId?: Maybe<Scalars['ID']['output']>;
+  /** board_setup_changed_by_climber: where the change stands now. Offer Undo only while it is LIVE. */
+  setupChangeState?: Maybe<BoardSetupChangeState>;
+  targetKind: DirectoryReportTargetKind;
+};
+
+/** Who acted on a board in a staff action notice: the gym's staff, or a Boardsesh moderator (a community leader or admin). */
+export type DirectoryNoticeActorRole = 'gym_staff' | 'moderator';
+
+export type DirectoryReport = {
+  __typename?: 'DirectoryReport';
+  boardName?: Maybe<Scalars['String']['output']>;
+  boardType?: Maybe<Scalars['String']['output']>;
+  /** Board reports: the board. */
+  boardUuid?: Maybe<Scalars['ID']['output']>;
+  createdAt: Scalars['String']['output'];
+  duplicateOfBoardName?: Maybe<Scalars['String']['output']>;
+  /** Listed twice: the other board, when the viewer can read it. */
+  duplicateOfBoardUuid?: Maybe<Scalars['ID']['output']>;
+  duplicateOfGymName?: Maybe<Scalars['String']['output']>;
+  /** Listed twice: the other gym listing. */
+  duplicateOfGymUuid?: Maybe<Scalars['ID']['output']>;
+  escalatedAt?: Maybe<Scalars['String']['output']>;
+  /** When a waiting report goes to the admin queue (14 days after it opened). */
+  escalatesAt: Scalars['String']['output'];
+  gymName?: Maybe<Scalars['String']['output']>;
+  /** Board reports: the gym the board was at when reported (for relist_request, the gym that removed it). Gym reports: the gym. */
+  gymUuid?: Maybe<Scalars['ID']['output']>;
+  /** What reporters said, oldest first. Reporters with neither a note nor a suggested setup are counted but not listed. */
+  notes: Array<DirectoryReportNote>;
+  reason: DirectoryReportReason;
+  remindedAt?: Maybe<Scalars['String']['output']>;
+  /** How many climbers are on the report. */
+  reporterCount: Scalars['Int']['output'];
+  resolutionNote?: Maybe<Scalars['String']['output']>;
+  resolvedAt?: Maybe<Scalars['String']['output']>;
+  resolvedByRole?: Maybe<DirectoryReportResolverRole>;
+  routedTo: Array<DirectoryReportRecipient>;
+  status: DirectoryReportStatus;
+  targetKind: DirectoryReportTargetKind;
+  uuid: Scalars['ID']['output'];
+  /** The viewer may close it as kept (and, as a global admin, with the other outcomes). */
+  viewerCanResolve: Scalars['Boolean']['output'];
+  /** The viewer is one of the reporters. */
+  viewerIsReporter: Scalars['Boolean']['output'];
+  /** Why the viewer can read this report. */
+  viewerRole: DirectoryReportViewerRole;
+};
+
+export type DirectoryReportConnection = {
+  __typename?: 'DirectoryReportConnection';
+  /** Pass as after for the next page; null on the last page. */
+  nextCursor?: Maybe<Scalars['String']['output']>;
+  reports: Array<DirectoryReport>;
+};
+
+/** One reporter's note. reporter is null for everyone but global admins: reporters stay anonymous. */
+export type DirectoryReportNote = {
+  __typename?: 'DirectoryReportNote';
+  createdAt: Scalars['String']['output'];
+  /** What the reporter wrote. Empty when they suggested a setup and wrote nothing. */
+  note: Scalars['String']['output'];
+  reporter?: Maybe<DirectoryReportReporter>;
+  /** The setup this reporter suggested on a wrong_setup report, if any. */
+  suggestedSetup?: Maybe<BoardSetup>;
+};
+
+/** How a report was closed. */
+export type DirectoryReportOutcome = 'deleted' | 'fixed' | 'kept' | 'merged' | 'removed';
+
+/** Every board and gym report reason. */
+export type DirectoryReportReason =
+  | 'closed'
+  | 'duplicate'
+  | 'gone'
+  | 'not_a_gym'
+  | 'other'
+  | 'relist_request'
+  | 'wrong_details'
+  | 'wrong_place'
+  | 'wrong_setup';
+
+/** Who a report goes to. gym_staff is the gym's owner and admins. */
+export type DirectoryReportRecipient = 'admin' | 'creator' | 'gym_staff';
+
+/** A reporter, shown to global admins only. */
+export type DirectoryReportReporter = {
+  __typename?: 'DirectoryReportReporter';
+  avatarUrl?: Maybe<Scalars['String']['output']>;
+  displayName?: Maybe<Scalars['String']['output']>;
+  userId: Scalars['ID']['output'];
+};
+
+/**
+ * Who closed a report. auto is the system (the merge tool, or a sweep that found
+ * the board or gym gone). climber is a climber whose suggested setup changed the
+ * board at a gym nobody runs.
+ */
+export type DirectoryReportResolverRole = 'admin' | 'auto' | 'climber' | 'creator' | 'gym_staff';
+
+/**
+ * Where a report stands. open and escalated are still waiting (escalated: in the
+ * Boardsesh admin queue); the rest are outcomes and never change.
+ */
+export type DirectoryReportStatus = 'deleted' | 'escalated' | 'fixed' | 'kept' | 'merged' | 'open' | 'removed';
+
+export type DirectoryReportSubmitResult = {
+  __typename?: 'DirectoryReportSubmitResult';
+  /**
+   * The board with its new setup, for 'Climb it now'. Set only when setupOutcome
+   * is APPLIED, and even then it can be null: the change has committed but the
+   * board could not be read back. Then refetch the board by its uuid; the
+   * change still applied.
+   */
+  board?: Maybe<UserBoard>;
+  /** How many other climbers are on the same report, for 'N other climbers flagged this too'. */
+  otherReporterCount: Scalars['Int']['output'];
+  reportUuid: Scalars['ID']['output'];
+  /** Who the report goes to, as the report sheet's routing line said. */
+  routedTo: Array<DirectoryReportRecipient>;
+  /** What the suggested setup did. Null when the report carried none (and always for reportGym). */
+  setupOutcome?: Maybe<BoardSetupOutcome>;
+  /**
+   * Why the suggested setup went to review. Null when it applied, and when no
+   * suggestion can apply right now (the directory-setup-suggestions flag is off).
+   */
+  setupReviewReason?: Maybe<BoardSetupReviewReason>;
+  status: DirectoryReportSubmitStatus;
+};
+
+/**
+ * What a report call did: opened a new report, added the reporter to the open
+ * report on the same target and reason, or found they had already reported it.
+ */
+export type DirectoryReportSubmitStatus = 'added' | 'already_reported' | 'created';
+
+export type DirectoryReportTargetKind = 'board' | 'gym';
+
+/** Why the viewer can read a report. */
+export type DirectoryReportViewerRole = 'admin' | 'creator' | 'gym_staff';
+
 /** Input for discovering public playlists. */
 export type DiscoverPlaylistsInput = {
   /** Board angle for generated recommendation filters */
@@ -1976,14 +3313,31 @@ export type DiscoverPlaylistsInput = {
   creatorIds?: InputMaybe<Array<Scalars['ID']['input']>>;
   /** Exclude these creators. The viewer's own playlists, for a discovery surface. */
   excludeCreatorIds?: InputMaybe<Array<Scalars['ID']['input']>>;
+  /**
+   * Only playlists by climbers the signed-in viewer follows. Resolved on the server
+   * from the viewer's follows. Signed out, the result is empty.
+   */
+  followedOnly?: InputMaybe<Scalars['Boolean']['input']>;
   /** Filter by generated recommendation status */
   generatedRecommendation?: InputMaybe<Scalars['Boolean']['input']>;
   /** Layout ID (optional — omit to discover across all layouts) */
   layoutId?: InputMaybe<Scalars['Int']['input']>;
   /** Only playlists with at most this many climbs. A 600-climb list is an export, not a playlist. */
   maxClimbs?: InputMaybe<Scalars['Int']['input']>;
+  /**
+   * Only playlists whose grade band ends at or below this difficulty id: the
+   * 90th-percentile grade is <= maxGrade, so one outlier V10 does not keep a V3
+   * list out of a V3-V5 search.
+   */
+  maxGrade?: InputMaybe<Scalars['Int']['input']>;
   /** Only playlists with at least this many climbs */
   minClimbs?: InputMaybe<Scalars['Int']['input']>;
+  /**
+   * Only playlists whose grade band starts at or above this difficulty id: the
+   * 10th-percentile grade is >= minGrade, so one easy warm-up does not let a hard
+   * list in. A playlist with no graded climb is left out whenever a grade bound is set.
+   */
+  minGrade?: InputMaybe<Scalars['Int']['input']>;
   /** Filter by name (partial match) */
   name?: InputMaybe<Scalars['String']['input']>;
   /** Page number */
@@ -2024,6 +3378,8 @@ export type DiscoverablePlaylist = {
   creatorName: Scalars['String']['output'];
   /** Description */
   description?: Maybe<Scalars['String']['output']>;
+  /** Grade spread of the playlist's climbs. Null when none of its climbs has a grade yet. */
+  gradeSummary?: Maybe<PlaylistGradeSummary>;
   /** Display icon */
   icon?: Maybe<Scalars['String']['output']>;
   /** Database ID */
@@ -2080,6 +3436,8 @@ export type DismissGymClusterInput = {
   /** All member gym UUIDs of the cluster (order-independent; used to compute the signature). */
   gymUuids: Array<Scalars['ID']['input']>;
 };
+
+export type DraftScope = 'OWN' | 'WALL';
 
 /**
  * DEPRECATED. Sessions are always-live; there is no wall driver. This type and its
@@ -2201,6 +3559,58 @@ export type EventsReplayResponse = {
   events: Array<QueueEvent>;
 };
 
+/** A wall the climber can see that may be the one they are about to add. */
+export type ExistingWallCandidate = {
+  __typename?: 'ExistingWallCandidate';
+  board: UserBoard;
+  /** Hold sets the wall has and the draft lacks (SETS_DIFFER only). */
+  extraSetIds: Array<Scalars['Int']['output']>;
+  /** Metres from the chosen gym to a nearby listing; null for the chosen gym and merged listings. */
+  gymDistanceMeters?: Maybe<Scalars['Float']['output']>;
+  /** Name of the gym the wall is linked to. */
+  gymName: Scalars['String']['output'];
+  /** How it compares with the draft; null when no draft setup was sent. */
+  matchKind?: Maybe<WallMatchKind>;
+  /** Hold sets the draft has and the wall lacks (SETS_DIFFER only). */
+  missingSetIds: Array<Scalars['Int']['output']>;
+  source: WallCandidateSource;
+};
+
+/** Existing walls at a gym, best match first. */
+export type ExistingWallCandidates = {
+  __typename?: 'ExistingWallCandidates';
+  candidates: Array<ExistingWallCandidate>;
+  /** True when more walls matched than were returned. */
+  truncated: Scalars['Boolean']['output'];
+};
+
+/** Input for existingWallCandidates. */
+export type ExistingWallCandidatesInput = {
+  /** Board type. Spray walls are not supported. */
+  boardType: Scalars['String']['input'];
+  /** The chosen gym. A merged listing's uuid resolves to the gym it merged into. */
+  gymUuid: Scalars['ID']['input'];
+  /** The draft's layout. Send layoutId, sizeId and setIds together, or none of them. */
+  layoutId?: InputMaybe<Scalars['Int']['input']>;
+  /** Most candidates to return (default 20, max 40). */
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  /** The draft's comma-separated hold sets. */
+  setIds?: InputMaybe<Scalars['String']['input']>;
+  /** The draft's size. */
+  sizeId?: InputMaybe<Scalars['Int']['input']>;
+};
+
+/** How createBoard treats walls that already exist where the new board lands. */
+export type ExistingWallCheck =
+  /**
+   * The climber confirmed theirs is a separate wall. Refuse only for a
+   * same-setup wall missing from acknowledgedWallUuids. With an empty list, only
+   * honoured when the server finds no same-layout wall at all.
+   */
+  | 'CONFIRMED_SEPARATE'
+  /** Refuse when a wall with the same layout and size exists (same sets or not). */
+  | 'REJECT_IF_FOUND';
+
 /** Count of favorited climbs per board. */
 export type FavoritesCount = {
   __typename?: 'FavoritesCount';
@@ -2223,6 +3633,30 @@ export type FeedbackContextInput = {
   sessionName?: InputMaybe<Scalars['String']['input']>;
   url?: InputMaybe<Scalars['String']['input']>;
   userAgent?: InputMaybe<Scalars['String']['input']>;
+};
+
+/**
+ * Everything buying a previewed order needs: who the licence names, how to reach
+ * them, and their acceptance of it.
+ *
+ * No configuration. The order already carries the exact wall the buyer
+ * previewed and approved — re-submitting it here would let a client buy
+ * something other than what it was shown.
+ *
+ * `acceptLicence` must be `true`. The licence is the product, so there is no
+ * such thing as a checkout that proceeds without it.
+ */
+export type FinaliseCncOrderInput = {
+  acceptLicence: Scalars['Boolean']['input'];
+  /** The installation the licence names. Required for `commercial_single`, rejected for `personal`. */
+  customerSiteName?: InputMaybe<Scalars['String']['input']>;
+  /** Where the licence and the download link are sent. Not taken from the account. */
+  licenseeEmail: Scalars['String']['input'];
+  /** The name printed on every file in the pack. */
+  licenseeName: Scalars['String']['input'];
+  /** The preview order being bought. It must be the caller's own and it must be `preview_ready`. */
+  orderId: Scalars['ID']['input'];
+  tier: CncLicenceTier;
 };
 
 /**
@@ -2318,8 +3752,15 @@ export type FollowingAscentFeedItem = {
   attemptCount: Scalars['Int']['output'];
   /** Board type */
   boardType: Scalars['String']['output'];
+  /**
+   * Always null. Revision history was retired, so no log is marked as made on an earlier version.
+   * @deprecated Climb revision history was retired. Always null.
+   */
+  climbCurrentRevision?: Maybe<Scalars['Int']['output']>;
   /** Name of the climb */
   climbName: Scalars['String']['output'];
+  /** The climb revision this was logged against. 1 on a climb nobody has edited; null when it is not known (imports, and logs older than the field). Populated by followingClimbAscents; null on the paginated feeds. */
+  climbRevision?: Maybe<Scalars['Int']['output']>;
   /** UUID of the climb */
   climbUuid: Scalars['String']['output'];
   /** When climbed (ISO 8601) */
@@ -2334,6 +3775,8 @@ export type FollowingAscentFeedItem = {
   difficultyName?: Maybe<Scalars['String']['output']>;
   /** Number of downvotes on this tick. Null if the resolver doesn't compute it. */
   downvotes?: Maybe<Scalars['Int']['output']>;
+  /** Raw quality, or the climber's synced star rating for this climb and angle when the tick has none. Sends and flashes only. Null if the resolver doesn't compute it. */
+  effectiveQuality?: Maybe<Scalars['Int']['output']>;
   /** Encoded hold frames for thumbnail display */
   frames?: Maybe<Scalars['String']['output']>;
   /** Whether this is a benchmark climb */
@@ -2381,19 +3824,48 @@ export type FollowingAscentsFeedResult = {
   totalCount: Scalars['Int']['output'];
 };
 
+/** How many followed climbers logged a climb at one angle. */
+export type FollowingClimbAscentsAngleCount = {
+  __typename?: 'FollowingClimbAscentsAngleCount';
+  /** Board angle */
+  angle: Scalars['Int']['output'];
+  /** Followed climbers with at least one log at this angle, any status */
+  climberCount: Scalars['Int']['output'];
+  /** Followed climbers with at least one flash or send at this angle */
+  senderCount: Scalars['Int']['output'];
+};
+
 /** Input for fetching followed users' ticks on a specific climb. */
 export type FollowingClimbAscentsInput = {
-  /** Board type (kilter, tension, moonboard) */
+  /** Board type (kilter, tension, moonboard, spray, ...) */
   boardType: Scalars['String']['input'];
   /** Climb UUID */
   climbUuid: Scalars['String']['input'];
 };
 
-/** Unpaginated result: all ticks from followed users for a given climb. */
+/** The 100 most recent logs, plus counts that cover all of them */
 export type FollowingClimbAscentsResult = {
   __typename?: 'FollowingClimbAscentsResult';
-  /** List of feed items */
+  /** Whether more than 100 logs exist. There is no way to page to them. */
+  hasMore: Scalars['Boolean']['output'];
+  /** Newest first, one row per log, every angle, attempts included. At most 100. */
   items: Array<FollowingAscentFeedItem>;
+  /** Counts across all logs, including the ones past the cap */
+  summary: FollowingClimbAscentsSummary;
+};
+
+/**
+ * Counts over every log from followed climbers on a climb. Not bound by the
+ * 100-row cap on the list.
+ */
+export type FollowingClimbAscentsSummary = {
+  __typename?: 'FollowingClimbAscentsSummary';
+  /** One entry per angle that has a log, ascending. Angles with none are absent. */
+  byAngle: Array<FollowingClimbAscentsAngleCount>;
+  /** Followed climbers with at least one log, any angle, any status */
+  climberCount: Scalars['Int']['output'];
+  /** Followed climbers with at least one flash or send, any angle */
+  senderCount: Scalars['Int']['output'];
 };
 
 export type FreezeClimbInput = {
@@ -2484,6 +3956,12 @@ export type GetPlaylistClimbsInput = {
   activeAngle?: InputMaybe<Scalars['Int']['input']>;
   /** Active board type for grade rendering in all-boards mode (omit in specific-board mode). On-board climbs render their grade at activeAngle. */
   activeBoardName?: InputMaybe<Scalars['String']['input']>;
+  /** Active board layout in all-boards mode. Needs activeBoardName. Used by the view's active-board filters. */
+  activeLayoutId?: InputMaybe<Scalars['Int']['input']>;
+  /** Active board's comma-separated set IDs in all-boards mode. Needs activeBoardName. Used by the view's active-board filters. */
+  activeSetIds?: InputMaybe<Scalars['String']['input']>;
+  /** Active board size in all-boards mode. Needs activeBoardName. Used by the view's active-board filters. */
+  activeSizeId?: InputMaybe<Scalars['Int']['input']>;
   /** Board angle */
   angle?: InputMaybe<Scalars['Int']['input']>;
   /** Board name for climb lookup (omit for all-boards mode) */
@@ -2500,6 +3978,8 @@ export type GetPlaylistClimbsInput = {
   setIds?: InputMaybe<Scalars['String']['input']>;
   /** Size ID */
   sizeId?: InputMaybe<Scalars['Int']['input']>;
+  /** Sort and filters. Omitted means the playlist's own order with no filter. */
+  view?: InputMaybe<PlaylistClimbViewInput>;
 };
 
 /** Input for getting playlist creators. */
@@ -2534,6 +4014,16 @@ export type GetPlaylistsForClimbsInput = {
 
 /** Input for fetching a smart playlist. */
 export type GetSmartPlaylistInput = {
+  /** Active board's wall angle, for the view's active-board filters. Needs activeBoardName. */
+  activeAngle?: InputMaybe<Scalars['Int']['input']>;
+  /** Active board type, for the view's active-board filters. Needs activeAngle. */
+  activeBoardName?: InputMaybe<Scalars['String']['input']>;
+  /** Active board layout, for the view's active-board filters. Needs activeBoardName. */
+  activeLayoutId?: InputMaybe<Scalars['Int']['input']>;
+  /** Active board's comma-separated set IDs, for the view's active-board filters. Needs activeBoardName. */
+  activeSetIds?: InputMaybe<Scalars['String']['input']>;
+  /** Active board size, for the view's active-board filters. Needs activeBoardName. */
+  activeSizeId?: InputMaybe<Scalars['Int']['input']>;
   /** Recommendation board-angle override */
   angle?: InputMaybe<Scalars['Int']['input']>;
   /** Filter to a board type (optional) */
@@ -2550,6 +4040,18 @@ export type GetSmartPlaylistInput = {
   type: SmartPlaylistType;
   /** User whose logbook (or board) to compute from */
   userId: Scalars['ID']['input'];
+  /**
+   * Sort and filters, on the logbook lists only (FIVE_STARS, MOST_REPEATED,
+   * PROJECTS, LIKED_CLIMBS). The RECOMMENDED_* lists are already ranked for the
+   * climber and reject a view with BAD_USER_INPUT. Omitted means the list's own
+   * order with no filter. The position sort is the list's own order: latest
+   * five-star climb first, most attempts first, or most recently liked first.
+   * added is when the climb entered the list where the list records it (the like,
+   * on LIKED_CLIMBS), and the list's own order elsewhere. Grades and stats read
+   * the angle each row displays: activeAngle on activeBoardName's board type,
+   * else the most-ascended angle (the lower angle on a tie).
+   */
+  view?: InputMaybe<PlaylistClimbViewInput>;
 };
 
 /** Input for fetching user's ticks. */
@@ -2642,6 +4144,8 @@ export type GroupedAscentFeedItem = {
   bestQuality?: Maybe<Scalars['Int']['output']>;
   /** Board type */
   boardType: Scalars['String']['output'];
+  /** Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod). */
+  characteristics?: Maybe<Array<Scalars['String']['output']>>;
   /** Name of the climb */
   climbName: Scalars['String']['output'];
   /** UUID of the climb */
@@ -2702,6 +4206,13 @@ export type GroupedNotification = {
    */
   climbAngle?: Maybe<Scalars['Int']['output']>;
   /**
+   * Structured climb characteristics (e.g. 'no_match', 'method_footless').
+   * Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod).
+   * Drives the Woods matching/feet rules line and the no-match glyph elsewhere
+   * when a notification opens the play drawer directly, without a climb refetch.
+   */
+  climbCharacteristics?: Maybe<Array<Scalars['String']['output']>>;
+  /**
    * Sizes the climb fits. Boards whose sizes number holds independently (Woods)
    * render a COMPLETELY different climb on the layout's default size, so a client
    * drawing the art needs this to pick the right one.
@@ -2726,6 +4237,7 @@ export type GroupedNotification = {
   commentBody?: Maybe<Scalars['String']['output']>;
   /** When the most recent notification was created */
   createdAt: Scalars['String']['output'];
+  directoryNotice?: Maybe<DirectoryNotice>;
   /** Entity ID */
   entityId?: Maybe<Scalars['String']['output']>;
   /** Entity type */
@@ -2742,6 +4254,11 @@ export type GroupedNotification = {
   proposalValue?: Maybe<Scalars['String']['output']>;
   /** Setter username (for new_climbs_synced notifications) */
   setterUsername?: Maybe<Scalars['String']['output']>;
+  /** The wall the imported reset clone replaces; null for a plain new wall. */
+  sprayResetOfWallUuid?: Maybe<Scalars['String']['output']>;
+  sprayVersionId?: Maybe<Scalars['ID']['output']>;
+  sprayWallName?: Maybe<Scalars['String']['output']>;
+  sprayWallUuid?: Maybe<Scalars['String']['output']>;
   /** ID of the entity named by threadEntityType. */
   threadEntityId?: Maybe<Scalars['String']['output']>;
   /**
@@ -2800,6 +4317,14 @@ export type Gym = {
   brandPrimaryColor?: Maybe<Scalars['String']['output']>;
   /** Whether the current viewer may start an ownership claim for this gym (signed-in and not already the owner/gym admin) */
   canClaim: Scalars['Boolean']['output'];
+  /**
+   * Whether this gym's website can drive the self-service email claim: a real
+   * (non-free-provider) domain that the gym's OWNER put on the listing. Mirrors
+   * the two refusals in requestGymClaim, so a claim UI can open the form that
+   * can actually succeed instead of dead-ending on submit. Viewer-independent —
+   * unlike canClaim, this says nothing about who is asking.
+   */
+  canClaimByDomain: Scalars['Boolean']['output'];
   /** Whether the current viewer may edit this gym (owner, gym admin, gym editor, or community admin/leader for one of its board types) */
   canEdit: Scalars['Boolean']['output'];
   /** Whether the current viewer may grant/revoke write access to other users (owner, gym admin, or community admin/leader for one of its board types) */
@@ -2816,7 +4341,7 @@ export type Gym = {
   description?: Maybe<Scalars['String']['output']>;
   /** Number of followers */
   followerCount: Scalars['Int']['output'];
-  /** Opening hours as one free-text line the gym maintains itself (no structured per-day model). */
+  /** Opening hours as free text the gym maintains itself, line breaks kept (no structured per-day model). */
   hours?: Maybe<Scalars['String']['output']>;
   /** ISO timestamp of the last time someone with edit access confirmed the hours. Shown publicly so a stale schedule reads as stale. */
   hoursUpdatedAt?: Maybe<Scalars['String']['output']>;
@@ -2826,12 +4351,16 @@ export type Gym = {
   isClaimed: Scalars['Boolean']['output'];
   /** Whether the current user follows this gym */
   isFollowedByMe: Scalars['Boolean']['output'];
+  /** Whether this gym appears in discovery. False keeps direct links readable. */
+  isListed: Scalars['Boolean']['output'];
   /** Whether the current user is a member */
   isMember: Scalars['Boolean']['output'];
   /** Whether publicly visible */
   isPublic: Scalars['Boolean']['output'];
   /** GPS latitude */
   latitude?: Maybe<Scalars['Float']['output']>;
+  /** Who runs this listing: not claimed yet, added by a climber, or run by the gym. Viewer-independent. */
+  listingState: GymListingState;
   /** Square gym logo (transparent brand mark) for the kiosk and embeds — distinct from imageUrl, which is the gym photo. */
   logoUrl?: Maybe<Scalars['String']['output']>;
   /** GPS longitude */
@@ -2880,6 +4409,48 @@ export type GymActivityStatsRefreshResult = {
   writeDurationMs: Scalars['Float']['output'];
 };
 
+/** Coordinates from an explicit authenticated address search; null when no unambiguous match is available. */
+export type GymAddressCoordinates = {
+  __typename?: 'GymAddressCoordinates';
+  latitude: Scalars['Float']['output'];
+  longitude: Scalars['Float']['output'];
+};
+
+export type GymAngleActivityCounts = {
+  __typename?: 'GymAngleActivityCounts';
+  /** Confirmed Boardsesh displays. */
+  displayCount: Scalars['Int']['output'];
+  /** Canonical native flashes and sends. */
+  sendCount: Scalars['Int']['output'];
+  /** Qualifying native ticks, including attempts. */
+  tickCount: Scalars['Int']['output'];
+};
+
+export type GymAngleUsageRow = {
+  __typename?: 'GymAngleUsageRow';
+  angle: Scalars['Int']['output'];
+  /** Distinct identified climber and definitely known gym-local date pairs. */
+  climberDayCount: Scalars['Int']['output'];
+  displayCount: Scalars['Int']['output'];
+  distinctClimberCount: Scalars['Int']['output'];
+  sendCount: Scalars['Int']['output'];
+  tickCount: Scalars['Int']['output'];
+  /** Identified ticks in the period without a provable gym-local date. */
+  unresolvedLocalDateTickCount: Scalars['Int']['output'];
+};
+
+export type GymBoardAngleUsage = {
+  __typename?: 'GymBoardAngleUsage';
+  /** Recorded compatible angles, ordered by degrees. */
+  angles: Array<GymAngleUsageRow>;
+  /** An independently authorized physical LED board in the selected scope. */
+  boardUuid: Scalars['ID']['output'];
+  /** Distinct identified climbers across all known angles on this physical board. */
+  knownAngleClimberCount: Scalars['Int']['output'];
+  /** Activity with missing or unsupported recorded angles, excluded from ranking. */
+  unknownAngle: GymAngleActivityCounts;
+};
+
 /**
  * One board-type + angle pair present at a gym, for the directory's board chips.
  * Deliberately minimal: a card renders "Kilter 40°", nothing else. Distinct pairs
@@ -2893,15 +4464,74 @@ export type GymBoardSummary = {
   boardType: Scalars['String']['output'];
 };
 
+export type GymBusyHour = {
+  __typename?: 'GymBusyHour';
+  /** ISO weekday, Monday 1 through Sunday 7. */
+  dayOfWeek: Scalars['Int']['output'];
+  /** Completed covered dates on which this local hour existed. */
+  eligibleDates: Scalars['Int']['output'];
+  /** Civil hour from 0 to 23 in the gym time zone. */
+  hour: Scalars['Int']['output'];
+  /** Sum of distinct identified climbers per eligible date and civil hour. */
+  recordedClimbers: Scalars['Int']['output'];
+};
+
+export type GymBusyTimes = {
+  __typename?: 'GymBusyTimes';
+  coveredDates: Scalars['Int']['output'];
+  /** Eligible identified date-only ticks that could have occurred in a covered date. */
+  dateOnlyRecords: Scalars['Int']['output'];
+  /** Last nominal local date of the fixed 90-day interval. */
+  endDate?: Maybe<Scalars['String']['output']>;
+  firstCoveredDate?: Maybe<Scalars['String']['output']>;
+  /** At least one in-scope identified tick has no provable occurrence date, regardless of its saved timestamp. */
+  hasUnboundedUnknownTime: Scalars['Boolean']['output'];
+  /** 168 weekday and civil-hour cells in ISO weekday then hour order. */
+  hours: Array<GymBusyHour>;
+  /** Identified confirmed display records with a trustworthy occurrence instant in covered dates. */
+  instantDisplays: Scalars['Int']['output'];
+  /** Identified eligible ticks with a trustworthy occurrence instant in covered dates. */
+  instantTicks: Scalars['Int']['output'];
+  /** First nominal local date of the fixed 90-day interval. */
+  startDate?: Maybe<Scalars['String']['output']>;
+  status: GymBusyTimesStatus;
+  /** Identified candidates with unproved time in the bounded source scan. */
+  unknownTimeRecords: Scalars['Int']['output'];
+  /** Date-only ticks with no definite assignment to a covered date. */
+  unplacedDateOnlyRecords: Scalars['Int']['output'];
+  /** Seven weekday cells in ISO order. */
+  weekdays: Array<GymBusyWeekday>;
+};
+
+export type GymBusyTimesStatus = 'calendarUnavailable' | 'historyUnavailable' | 'ready' | 'zoneRequired';
+
+export type GymBusyWeekday = {
+  __typename?: 'GymBusyWeekday';
+  /** ISO weekday, Monday 1 through Sunday 7. */
+  dayOfWeek: Scalars['Int']['output'];
+  /** Completed covered dates of this weekday. */
+  eligibleDates: Scalars['Int']['output'];
+  /** Sum of distinct identified climbers per eligible date. */
+  recordedClimbers: Scalars['Int']['output'];
+};
+
 /** A pending or resolved gym ownership claim (admin queue). */
 export type GymClaim = {
   __typename?: 'GymClaim';
+  /** Auto-approved list only: when the claim took the gym. */
+  approvedAt?: Maybe<Scalars['String']['output']>;
   /** Email address (domain path) */
   claimEmail?: Maybe<Scalars['String']['output']>;
+  /** Admin queue only: days since the claimant's account was created. */
+  claimantAccountAgeDays?: Maybe<Scalars['Int']['output']>;
   /** Claimant avatar URL */
   claimantAvatarUrl?: Maybe<Scalars['String']['output']>;
   /** Claimant display name */
   claimantDisplayName?: Maybe<Scalars['String']['output']>;
+  /** Admin queue only: how many other live gyms the claimant owns or is an admin of. */
+  claimantGymsHeld?: Maybe<Scalars['Int']['output']>;
+  /** Admin queue only: how many climbs the claimant has logged. */
+  claimantTickCount?: Maybe<Scalars['Int']['output']>;
   /** Claimant user ID */
   claimantUserId: Scalars['ID']['output'];
   /** When the claim was created */
@@ -2949,7 +4579,14 @@ export type GymClaimRequestStatus =
   /** A verification email was sent to the claimant's work address. */
   | 'email_sent';
 
-export type GymClaimStatus = 'approved' | 'denied' | 'expired' | 'pending';
+export type GymClaimStatus =
+  | 'approved'
+  | 'denied'
+  /** An admin-review claim nobody decided within 30 days, or a domain link that went unused. */
+  | 'expired'
+  | 'pending'
+  /** An approved claim a Boardsesh admin took back (revertGymClaim). The gym is unclaimed again. */
+  | 'revoked';
 
 /** The strongest ownership-claim state on a gym row. */
 export type GymClusterClaimStatus =
@@ -2989,6 +4626,94 @@ export type GymDayActivity = {
   /** Day of week (UTC), 0 = Sunday … 6 = Saturday. */
   dayOfWeek: Scalars['Int']['output'];
 };
+
+/** createGym's duplicate check. */
+export type GymDuplicateCheckInput = {
+  /**
+   * With CONFIRMED_SEPARATE: the gyms the climber was shown and said are not
+   * theirs. At most 50 (the server refuses more); a client that showed more
+   * keeps the most recent 50.
+   */
+  acknowledgedGymUuids?: InputMaybe<Array<Scalars['ID']['input']>>;
+  /** What to do when similar gyms exist. */
+  mode: GymDuplicateCheckMode;
+};
+
+/** How createGym treats similar gyms that already exist. */
+export type GymDuplicateCheckMode =
+  /**
+   * The climber saw the similar gyms and said theirs is a different one. Refuse
+   * only for a similar gym missing from acknowledgedGymUuids.
+   */
+  | 'CONFIRMED_SEPARATE'
+  /** Refuse when any similar gym is listed. */
+  | 'REJECT_IF_FOUND';
+
+export type GymGradeCollectionOption = {
+  __typename?: 'GymGradeCollectionOption';
+  name: Scalars['String']['output'];
+  uuid: Scalars['ID']['output'];
+};
+
+export type GymGradeCollectionOptionsInput = {
+  boardUuid: Scalars['ID']['input'];
+  cursor?: InputMaybe<Scalars['String']['input']>;
+  gymUuid: Scalars['ID']['input'];
+  search?: InputMaybe<Scalars['String']['input']>;
+};
+
+export type GymGradeCollectionPage = {
+  __typename?: 'GymGradeCollectionPage';
+  collections: Array<GymGradeCollectionOption>;
+  nextCursor?: Maybe<Scalars['String']['output']>;
+};
+
+export type GymGradeComparison = {
+  __typename?: 'GymGradeComparison';
+  asOf: Scalars['String']['output'];
+  availableCount: Scalars['Int']['output'];
+  boards: Array<GymGradeInventoryBoard>;
+  grades: Array<GymGradeComparisonBucket>;
+  gymUuid: Scalars['ID']['output'];
+  sendCount: Scalars['Int']['output'];
+  startAt: Scalars['String']['output'];
+  timeZone: Scalars['String']['output'];
+};
+
+export type GymGradeComparisonBucket = {
+  __typename?: 'GymGradeComparisonBucket';
+  availableCount: Scalars['Int']['output'];
+  boardType: Scalars['String']['output'];
+  difficultyId?: Maybe<Scalars['Int']['output']>;
+  sendCount: Scalars['Int']['output'];
+};
+
+export type GymGradeInventoryBoard = {
+  __typename?: 'GymGradeInventoryBoard';
+  boardName: Scalars['String']['output'];
+  boardUuid: Scalars['ID']['output'];
+  collectionName?: Maybe<Scalars['String']['output']>;
+  included: Scalars['Boolean']['output'];
+  kind: GymGradeInventoryKind;
+  physicalBoardUuid: Scalars['ID']['output'];
+  status: GymGradeInventoryStatus;
+  variantCount: Scalars['Int']['output'];
+};
+
+/**
+ * Input for the gym Insights query. `period` sets the window length: `week`
+ * (7 days, the default) or `month` (30 days). The comparison window is always the
+ * equally-long span immediately before it.
+ */
+export type GymGradeInventoryKind = 'LED_COLLECTION' | 'SPRAY_WALL';
+
+export type GymGradeInventoryStatus =
+  | 'CHOOSE_COLLECTION'
+  | 'COLLECTION_EMPTY'
+  | 'COLLECTION_UNAVAILABLE'
+  | 'OWNER_ONLY'
+  | 'READY'
+  | 'WALL_UNAVAILABLE';
 
 /**
  * A gym kiosk: a preset-based smart-TV wall dashboard, addressed publicly as
@@ -3062,6 +4787,15 @@ export type GymKioskBoard = {
   /** Public URL slug (userBoards.slug) — the kiosk's per-board install QR deep-links to /b/{slug}. */
   slug: Scalars['String']['output'];
 };
+
+/** Who runs a gym listing. The same for every viewer. */
+export type GymListingState =
+  /** Owned by a climber who did not claim it, usually by naming the gym while setting up a board. */
+  | 'CLIMBER_LISTED'
+  /** Owned through an approved claim or an admin handover: the gym runs it. */
+  | 'RUN_BY_GYM'
+  /** Synced from an upstream board provider; nobody has claimed it yet. */
+  | 'UNCLAIMED';
 
 /** A member of a gym. */
 export type GymMember = {
@@ -3182,6 +4916,71 @@ export type GymOwnershipUserSummary = {
   userId: Scalars['ID']['output'];
 };
 
+export type GymReachCount = {
+  __typename?: 'GymReachCount';
+  /** Count of available eligible records or people. Consult coverage before displaying zero. */
+  count: Scalars['Int']['output'];
+  coverage: GymReachCoverage;
+};
+
+export type GymReachCoverage = 'complete' | 'partial' | 'unavailable';
+
+export type GymReachOverview = {
+  __typename?: 'GymReachOverview';
+  /** UTC start of the interval immediately before the previous period. */
+  baselineStartAt: Scalars['String']['output'];
+  cameBack: GymReachReturn;
+  current: GymReachWindow;
+  /** UTC start of the forward observation contract for every accepted gym. */
+  observationStartedAt?: Maybe<Scalars['String']['output']>;
+  previous: GymReachWindow;
+  previousCameBack: GymReachReturn;
+  /** Twelve gym-local Monday-start weeks, including the week in progress. */
+  weeklyTrend: Array<GymReachWeek>;
+};
+
+export type GymReachReturn = {
+  __typename?: 'GymReachReturn';
+  /** A return rate can be displayed only with complete coverage and a positive denominator. */
+  coverage: GymReachCoverage;
+  previousClimbers: Scalars['Int']['output'];
+  returning: Scalars['Int']['output'];
+};
+
+export type GymReachWeek = {
+  __typename?: 'GymReachWeek';
+  climbers: GymReachCount;
+  /** Gym-local Sunday date in YYYY-MM-DD format. */
+  endDate: Scalars['String']['output'];
+  inProgress: Scalars['Boolean']['output'];
+  sends: GymReachCount;
+  /** Gym-local Monday date in YYYY-MM-DD format. */
+  startDate: Scalars['String']['output'];
+};
+
+export type GymReachWindow = {
+  __typename?: 'GymReachWindow';
+  climbers: GymReachCount;
+  /** First recorded here in available eligible records. It may change when older history arrives. */
+  firstRecorded: GymReachCount;
+  sendLoggers: Scalars['Int']['output'];
+  sends: GymReachCount;
+  /** Distinct identified climber and gym-local date with a send. */
+  sessions: GymReachCount;
+  uncertainFirstRecorded: Scalars['Int']['output'];
+};
+
+/** Why a climber reported a gym listing. */
+export type GymReportReason = 'closed' | 'duplicate' | 'not_a_gym' | 'other' | 'wrong_details';
+
+export type GymReportingBoard = {
+  __typename?: 'GymReportingBoard';
+  boardType: Scalars['String']['output'];
+  configurations: Array<GymReportingBoardConfig>;
+  name: Scalars['String']['output'];
+  uuid: Scalars['ID']['output'];
+};
+
 /**
  * A gym owner's activity snapshot for the current window and the window
  * immediately before it (same length), for week-over-week deltas. Every
@@ -3189,31 +4988,73 @@ export type GymOwnershipUserSummary = {
  * unbounded tick scans. `topClimbs` and `busiestDays` cover the CURRENT window
  * only (that's all the dashboard renders). Requires gym edit access.
  */
+export type GymReportingBoardConfig = {
+  __typename?: 'GymReportingBoardConfig';
+  name: Scalars['String']['output'];
+  uuid: Scalars['ID']['output'];
+};
+
+export type GymReportingCoverage = {
+  __typename?: 'GymReportingCoverage';
+  /** Date-only records whose possible occurrence crosses a window boundary. */
+  boundaryUncertainCount: Scalars['Int']['output'];
+  /** Eligible records with an attested date and no trustworthy hour. */
+  dateOnlyCount: Scalars['Int']['output'];
+  /** Earliest eligible observed display in the checked interval, when known. */
+  firstDisplayAt?: Maybe<Scalars['String']['output']>;
+  /** Earliest eligible observed tick with an exact timestamp in the checked interval. */
+  firstTickAt?: Maybe<Scalars['String']['output']>;
+  /** The report includes activity scoped to boards currently linked to the gym. */
+  includesCurrentBoardHistory: Scalars['Boolean']['output'];
+  /** Recorded sources cover only activity which meets their reporting rules. */
+  isPartial: Scalars['Boolean']['output'];
+  /** Inclusive UTC start of the 365-day descriptive observation interval, ending exclusively at asOf. */
+  observedSince: Scalars['String']['output'];
+  /** Attributed ticks with no trustworthy occurrence time in the candidate scan. */
+  unknownTimeCount: Scalars['Int']['output'];
+};
+
+/** A public canonical venue URL and its last content update, without private gym fields. */
+export type GymSitemapEntry = {
+  __typename?: 'GymSitemapEntry';
+  slug: Scalars['String']['output'];
+  updatedAt: Scalars['String']['output'];
+};
+
 export type GymStats = {
   __typename?: 'GymStats';
+  /** Recorded angle usage on eligible physical LED boards in the current window. */
+  angleUsage: Array<GymBoardAngleUsage>;
+  asOf: Scalars['String']['output'];
+  boardUuid?: Maybe<Scalars['ID']['output']>;
+  boards: Array<GymReportingBoard>;
   /** Ascents per day of week in the current window (only non-empty days). */
   busiestDays: Array<GymDayActivity>;
+  busyTimes?: Maybe<GymBusyTimes>;
+  canManageBoardAliases: Scalars['Boolean']['output'];
+  coverage: GymReportingCoverage;
   /** Counts for the current window (last `periodDays` days). */
   current: GymStatsWindow;
+  gymName: Scalars['String']['output'];
   /** The gym these stats are for. */
   gymUuid: Scalars['ID']['output'];
   /** Window length in days (7 for the default week). */
   periodDays: Scalars['Int']['output'];
   /** Counts for the window immediately before the current one (same length). */
   previous: GymStatsWindow;
+  reachOverview?: Maybe<GymReachOverview>;
+  timeZone: Scalars['String']['output'];
+  timeZoneConfigured: Scalars['Boolean']['output'];
   /** Top 10 climbs by ascents in the current window. */
   topClimbs: Array<GymTopClimb>;
 };
 
-/**
- * Input for the gym Insights query. `period` sets the window length: `week`
- * (7 days, the default) or `month` (30 days). The comparison window is always the
- * equally-long span immediately before it.
- */
 export type GymStatsInput = {
+  /** An authorized physical board in the requested gym. Omit for all boards. */
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
   /** The gym to report on. The caller must have gym edit access. */
   gymUuid: Scalars['ID']['input'];
-  /** Window length: week (7 days, default) or month (30 days). */
+  /** Window length: week (7 days, default), month (30 days) or quarter (90 days). */
   period?: InputMaybe<GymStatsPeriod>;
 };
 
@@ -3221,6 +5062,8 @@ export type GymStatsInput = {
 export type GymStatsPeriod =
   /** Rolling last 30 days. */
   | 'month'
+  /** Rolling last 90 days. */
+  | 'quarter'
   /** Rolling last 7 days. */
   | 'week';
 
@@ -3233,7 +5076,15 @@ export type GymStatsWindow = {
   __typename?: 'GymStatsWindow';
   /** Total ascents (flash + send) on the gym's boards in this window. */
   ascentCount: Scalars['Int']['output'];
-  /** Distinct climbers with a flash/send on the gym's boards in this window. */
+  /** Confirmed Boardsesh display events, including anonymous displays. */
+  displayCount: Scalars['Int']['output'];
+  /** Exclusive UTC boundary. */
+  endAt: Scalars['String']['output'];
+  /** Inclusive UTC boundary. */
+  startAt: Scalars['String']['output'];
+  /** Eligible Boardsesh ticks, including attempts. */
+  tickCount: Scalars['Int']['output'];
+  /** Distinct identified accounts from qualifying displays and ticks. */
   uniqueClimbers: Scalars['Int']['output'];
 };
 
@@ -3266,8 +5117,8 @@ export type GymTopClimb = {
  *
  * ANY is the default and adds no filter at all. INTACT keeps climbs that have lost
  * nothing; BROKEN keeps only the ones that have. Meaningful on spray walls, where a
- * reset takes holds off the wall; on a catalogue board every climb is INTACT, so
- * BROKEN there is an empty result rather than an error.
+ * hold edit (or an old reset) takes holds off the wall; on a catalogue board every
+ * climb is INTACT, so BROKEN there is an empty result rather than an error.
  */
 export type HoldIntegrityFilter = 'ANY' | 'BROKEN' | 'INTACT';
 
@@ -3638,6 +5489,15 @@ export type LiveSessionUser = {
 
 export type LocationSyncEntityType = 'BOARD' | 'GYM';
 
+/** A setter of climbs the user has logged. */
+export type LoggedSetter = {
+  __typename?: 'LoggedSetter';
+  /** Setter username, as on the climb */
+  setterUsername: Scalars['String']['output'];
+  /** How many of the user's logged ascents are on this setter's climbs */
+  tickCount: Scalars['Int']['output'];
+};
+
 /** Input for merging duplicate gyms into a canonical survivor (admin only). */
 export type MergeGymsInput = {
   /** Explicit acknowledgement required to keep a SYSTEM listing as the survivor over a user-owned or claim-approved duplicate. Rejected without it. */
@@ -3655,6 +5515,15 @@ export type MergeGymsResult = {
   canonicalGymUuid: Scalars['ID']['output'];
   /** Per-duplicate outcomes. */
   results: Array<GymMergeDuplicateResult>;
+};
+
+export type MobileReleaseStatusInput = {
+  branch?: InputMaybe<Scalars['String']['input']>;
+  channel?: InputMaybe<Scalars['String']['input']>;
+  isEmbeddedLaunch?: InputMaybe<Scalars['Boolean']['input']>;
+  platform: Scalars['String']['input'];
+  runtimeVersion?: InputMaybe<Scalars['String']['input']>;
+  updateId?: InputMaybe<Scalars['String']['input']>;
 };
 
 export type MoonBoardClimbDuplicateCandidateInput = {
@@ -3708,6 +5577,11 @@ export type Mutation = {
    * Optional position parameter for inserting at specific index.
    */
   addQueueItem: ClimbQueueItem;
+  /** Edit active board metadata as a global admin; privacy and credentials remain owner-only. */
+  adminUpdateBoard: AdminBoard;
+  approveFollowRequest: Scalars['Boolean']['output'];
+  approveResourceAccess: Scalars['Boolean']['output'];
+  attachAppWorkout: Scalars['Boolean']['output'];
   /**
    * Attach an Instagram or TikTok video as beta for a climb. Idempotent on
    * (boardType, climbUuid, link).
@@ -3717,10 +5591,12 @@ export type Mutation = {
    * Attach a stray board (surfaced by strayBoardsForGym) to a gym in one tap.
    * Re-points the board's gym_id to this gym. The caller need not own the board;
    * the gate is edit access to the target gym, and the board must be a genuine
-   * stray candidate for it (a merged-twin board or a nearby unlinked/SYSTEM one).
+   * stray candidate for it (a merged-twin board or a nearby unlinked/SYSTEM one),
+   * or a still-unlinked board this gym's staff removed, which this puts back.
    */
   attachBoardToGym: Scalars['Boolean']['output'];
   authorizeControllerForSession: Scalars['Boolean']['output'];
+  cancelFollowRequest: Scalars['Boolean']['output'];
   /**
    * Confirm which board a (non-unique) serial routes to after the user picks
    * from a disambiguation prompt. Remembers the choice per user so the prompt
@@ -3745,6 +5621,7 @@ export type Mutation = {
    * The previous generation is superseded and every climb on the wall has its
    * `missingHoldCount` re-materialised, which is what makes the badge, the
    * Intact / Lost holds filter and the remix prompt agree. Owner only.
+   * @deprecated Only a wall's first publish still works here. Use publishSprayWallVersion.
    */
   commitSprayWallVersion: SprayWallResetResult;
   /**
@@ -3759,9 +5636,39 @@ export type Mutation = {
    * no `sessionId` argument is required.
    */
   confirmClimbOnWall: Session;
+  confirmPartnerDeveloperEmail: Scalars['Boolean']['output'];
   controllerHeartbeat: Scalars['Boolean']['output'];
   /** Create a new board. */
   createBoard: UserBoard;
+  /**
+   * Mint a five-minute link to your own build pack, or to its free preview.
+   *
+   * Throws `NOT_FOUND` for a licence that does not exist and for one belonging
+   * to someone else, identically — a licence id identifies an order, it never
+   * grants access to one. Throws `CNC_PACK_NOT_DOWNLOADABLE` when that
+   * deliverable is not available yet or the order was refunded: `FULL` needs
+   * `ready`, `PREVIEW` needs `preview_ready` or anything after it.
+   *
+   * Requires authentication.
+   */
+  createCncDownloadGrant: CncDownloadGrant;
+  /**
+   * Generate a free, watermarked preview of a configuration.
+   *
+   * Nothing is charged and nothing is licensed: the order comes back in
+   * `preview_queued`, and its `previewImages` fill in once the generator is
+   * done. Asking again for a configuration this buyer has already previewed
+   * returns THAT order rather than queueing a second job — the configuration's
+   * `configHash` is the identity. Change anything and this writes a new order;
+   * a preview is an immutable snapshot of one configuration.
+   *
+   * Four previews per hour per buyer. Throws `RATE_LIMITED` past that, and
+   * `CNC_INVALID_CONFIG` for a wall that is not on sale, an option out of
+   * range or artwork that will not fit.
+   *
+   * Requires authentication.
+   */
+  createCncPreview: CncOrder;
   /** Create a new gym. */
   createGym: Gym;
   /**
@@ -3778,6 +5685,8 @@ export type Mutation = {
    * history. Requires authentication.
    */
   createIntegrationOAuthHandoff: Scalars['String']['output'];
+  /** Register an app. Returns its client ID and, for a confidential app, a secret shown once. */
+  createOAuthClient: OAuthClientCredentials;
   /** Create a new playlist. */
   createPlaylist: Playlist;
   /** Create a proposal for a climb grade/classic/benchmark change. */
@@ -3804,6 +5713,7 @@ export type Mutation = {
    * anchors were tapped. There are no user-entered wall dimensions. Owner only.
    */
   createSprayWallVersion: SprayWallVersion;
+  declineFollowRequest: Scalars['Boolean']['output'];
   /**
    * Delete the current user's account.
    * Deletes draft climbs, optionally removes setter name from published climbs,
@@ -3813,8 +5723,22 @@ export type Mutation = {
   deleteAccount: Scalars['Boolean']['output'];
   /** Delete stored Aurora credentials for a board type. */
   deleteAuroraCredential: Scalars['Boolean']['output'];
-  /** Soft-delete a board. */
+  /**
+   * Soft-delete a board. Allowed for its owner; for the owner or an admin of its
+   * linked gym on a synced (system-owned) board only; and for a global admin. A
+   * non-owner must also be able to read the board. Gym staff take a climber's
+   * board off their listing with detachBoardFromGym instead. See UserBoard.canDelete.
+   */
   deleteBoard: Scalars['Boolean']['output'];
+  /**
+   * Delete one of the current user's spray wall climbs, published or not, while
+   * nobody (the setter included) has logged it. Refused with CLIMB_HAS_TICKS once
+   * a tick exists, CLIMB_NOT_FOUND for a climb that is missing or not the
+   * caller's, CLIMB_DELETE_NOT_ALLOWED off spray, and SPRAY_WALL_ARCHIVED on an
+   * archived wall. Removes the climb's comments, proposals, votes, feed rows and
+   * notifications, and other climbers' favourites and playlist entries.
+   */
+  deleteClimb: Scalars['Boolean']['output'];
   /** Delete a comment (soft-delete if it has replies). */
   deleteComment: Scalars['Boolean']['output'];
   deleteController: Scalars['Boolean']['output'];
@@ -3833,6 +5757,8 @@ export type Mutation = {
    * nothing to remove.
    */
   deleteHoldOutlineOverride: Scalars['Boolean']['output'];
+  /** Delete the signed-in developer's app and end every climber connection to it. False when there was no such app. */
+  deleteOAuthClient: Scalars['Boolean']['output'];
   /** Delete a playlist (owner only). */
   deletePlaylist: Scalars['Boolean']['output'];
   /** Delete an accepted proposal and revert its effects (admin/leader only). */
@@ -3840,15 +5766,20 @@ export type Mutation = {
   /**
    * Soft-delete a wall. The catalogue rows and every climb ever set on it stay
    * behind — a deleted wall stops being reachable, it does not un-set the climbs.
-   * Owner only.
+   * The same gate as deleteBoard: the wall's owner, the owner or an admin of its
+   * gym on a system-owned wall, or a global admin, who must be able to read it.
    */
   deleteSprayWall: Scalars['Boolean']['output'];
   /** Delete a tick (climb attempt record). Only the owner can delete. */
   deleteTick: Scalars['Boolean']['output'];
   /**
    * Remove a board from this gym's listing. Gated on edit access to the gym, and
-   * the board must currently be listed at it. Lets gym staff undo an unwanted
-   * self-link; clears gym_id only, leaving the board with its owner.
+   * the board must currently be listed at it. Gym staff's tool for a climber's
+   * board: clears gym_id and freezes the board against the location sync,
+   * leaving the board with its owner. A removal by staff stops the owner
+   * self-linking it back to this gym. A synced (system-owned) board is refused
+   * with SYSTEM_BOARD_DELETE_INSTEAD unless the caller is a global admin: the
+   * gym's owner or admin deletes it instead. See UserBoard.canRemoveFromGym.
    */
   detachBoardFromGym: Scalars['Boolean']['output'];
   /**
@@ -3861,6 +5792,15 @@ export type Mutation = {
    * reference its work. Owner only.
    */
   discardSprayWallVersion: Scalars['Boolean']['output'];
+  /**
+   * End the signed-in climber's connection to an app, with the same effect as the
+   * app calling DELETE /v1/connection: every token and the remembered consent go,
+   * and connecting again needs a fresh approval. Works in every PARTNER_OAUTH_MODE,
+   * so a climber can always end a connection. True once the connection is ended,
+   * also when it already was. NOT_FOUND when the id is not one of the climber's
+   * connections.
+   */
+  disconnectApp: Scalars['Boolean']['output'];
   /**
    * Unlink an external platform integration. Revokes the token on the
    * provider's side (best-effort) and deletes the stored credentials.
@@ -3878,6 +5818,35 @@ export type Mutation = {
    * the returned SessionSummary.
    */
   endSession?: Maybe<SessionSummary>;
+  /**
+   * Exchange an opaque iOS AdServices token only while analytics consent is
+   * granted. Anonymous HTTP callers supply their device answer; signed-in
+   * callers also respect the account's current answer. Nothing is persisted
+   * or published by this mutation. UNATTRIBUTED means Apple found no matching
+   * ad record, not that the install is organic.
+   */
+  exchangeAppleAdsAttribution: AppleAdsAttributionResult;
+  /**
+   * Retire stale exports and write a new one of every approved, eligible version
+   * to the private bucket. Cron-authenticated; the scheduler's
+   * `export-spray-training` job is the only caller.
+   */
+  exportSprayTrainingDataset: SprayTrainingExportResult;
+  /**
+   * Buy a previewed order: attach the licence and open Stripe Checkout for it.
+   *
+   * The order must be the caller's own and in `preview_ready` — this is the
+   * only way a build pack is ever paid for, so nothing can be bought that was
+   * not previewed first. It takes the tier, the licensee and the acceptance,
+   * moves to `pending_payment` and returns the hosted page to send the buyer
+   * to; nothing is queued for generation until Stripe confirms the charge. If
+   * Stripe will not open a session the order goes back to `preview_ready` and
+   * this throws `CNC_CHECKOUT_UNAVAILABLE`. The returned session expires 31
+   * minutes after it is created.
+   *
+   * Requires authentication.
+   */
+  finaliseCncOrder: CncCheckoutSession;
   /** Follow a board. */
   followBoard: Scalars['Boolean']['output'];
   /** Follow a gym. */
@@ -3886,7 +5855,11 @@ export type Mutation = {
   followPlaylist: Scalars['Boolean']['output'];
   /** Follow a setter by username. Idempotent. */
   followSetter: Scalars['Boolean']['output'];
-  /** Follow a user. Idempotent (no error if already following). */
+  /**
+   * Follow a user. Idempotent (no error if already following). Returns true when
+   * the caller now follows the user, false when the account is private and only
+   * a follow request was left for its owner to approve.
+   */
   followUser: Scalars['Boolean']['output'];
   /** Freeze or unfreeze a climb from receiving proposals (admin/leader only). */
   freezeClimb: Scalars['Boolean']['output'];
@@ -3898,6 +5871,7 @@ export type Mutation = {
   grantGymWriteAccess: Scalars['Boolean']['output'];
   /** Grant a community role to a user (admin only). */
   grantRole: CommunityRoleAssignment;
+  inviteResourceMember: Scalars['Boolean']['output'];
   /**
    * Join an existing session or create it if it doesn't exist.
    * Returns the session with current state.
@@ -3917,7 +5891,9 @@ export type Mutation = {
    * Link or unlink a board you own to/from a gym. Unlinking is always yours to
    * do. Linking needs either owner/admin rights on the gym, or — so a climber can
    * list their board at the gym they actually climb at — a public gym within
-   * 150 m of the board's coordinates, subject to a per-caller cap.
+   * 150 m of the board's coordinates, subject to a per-caller cap. A board the
+   * gym's staff took off their listing can't be self-linked back to that gym
+   * (error code BOARD_REMOVED_BY_GYM) until the gym's staff put it back.
    */
   linkBoardToGym: Scalars['Boolean']['output'];
   /** Mark all notifications as read. */
@@ -3974,6 +5950,8 @@ export type Mutation = {
    * behind, because other people's ticks point at them.
    */
   purgeDeletedSprayWallPhotos: SprayWallPhotoPurgeResult;
+  /** HTTP cron credentials only. Deletes user_activity_days rows older than 60 days. */
+  purgeExpiredUserActivity: UserActivityPurgeResult;
   /**
    * Move a gym's ownership to another account (global admin only) — a sold gym,
    * a departed committee member, a claim approved to the wrong person. The
@@ -3982,6 +5960,7 @@ export type Mutation = {
    * audit trail. No self-serve entry point exists.
    */
   reassignGymOwner: ReassignGymOwnerResult;
+  recordAppWorkoutPlan: Scalars['Boolean']['output'];
   /**
    * Record that the viewer opened this board, which is what orders "Your boards"
    * by recency. Never moves the stored timestamp backwards, so an out-of-order
@@ -3994,8 +5973,32 @@ export type Mutation = {
    * Returns null when a saved board already matches the connect (nothing to record).
    */
   recordBoardSerial?: Maybe<BoardSerialConfig>;
+  /** Private account-scoped delivery evidence, independent of product analytics consent. */
+  recordOfflineWriteObservations: RecordOfflineWriteObservationsResult;
+  /**
+   * Store the caller's workout for a session. Written only when revision is
+   * higher than the stored one; an equal or lower revision is a no-op that still
+   * returns true, so outbox replays are idempotent. The caller must have created
+   * or joined the session. Tick-map entries naming another climber's tick, the
+   * caller's tick in another session, or a queue item the plan doesn't hold are
+   * dropped; an entry naming a tick the server doesn't have yet is kept (up to
+   * 500, the newest), so a tick that arrives later lands on its block.
+   */
+  recordSessionWorkout: Scalars['Boolean']['output'];
+  /** Join the board a share link names as an approved member. NOT_FOUND for a revoked or unknown link. */
+  redeemBoardShareLink: BoardShareLinkRedemption;
   /** HTTP cron credentials only. Refused refreshes report HTTP 409 and a CONFLICT error. */
   refreshGymActivityStats: GymActivityStatsRefreshResult;
+  /** HTTP cron credentials only. Force bypasses freshness, never validation or locking. */
+  refreshSetterSitemapSummary: SetterSitemapSummaryRefreshResult;
+  /**
+   * Rebuild a pack from scratch: back to `queued` with the generation counter
+   * bumped, the same licence id and the same output key, so the new zip replaces
+   * the old one instead of issuing a second licensed copy.
+   *
+   * Allowed from `ready` and `failed` only. Requires an admin.
+   */
+  regenerateCncPack: CncOrder;
   /**
    * Register an APNs device token for Live Activity push updates in a session.
    * Caller must be authenticated and be a participant in the session.
@@ -4003,6 +6006,11 @@ export type Mutation = {
    */
   registerActivityPushToken: Scalars['Boolean']['output'];
   registerController: ControllerRegistration;
+  /**
+   * Register this installation's Expo push token for the signed-in account. The
+   * registration lasts until the credential expires (24 hours at most).
+   */
+  registerNotificationDevice: Scalars['Boolean']['output'];
   /** Remove a climb from a playlist. */
   removeClimbFromPlaylist: Scalars['Boolean']['output'];
   /**
@@ -4010,6 +6018,7 @@ export type Mutation = {
    * no-op) so the offline mutation queue can safely retry. Always returns true.
    */
   removeFavorite: Scalars['Boolean']['output'];
+  removeFollower: Scalars['Boolean']['output'];
   /** Remove a member from a gym. */
   removeGymMember: Scalars['Boolean']['output'];
   /** Remove a climb from the queue by its queue item UUID. */
@@ -4028,6 +6037,21 @@ export type Mutation = {
   reorderQueueItem: Scalars['Boolean']['output'];
   /** Replace a queue item with a new one (same UUID). */
   replaceQueueItem: ClimbQueueItem;
+  /**
+   * Report a problem with a board. Signed in, 5 per minute, and the board must be
+   * readable by the reporter. Joins the waiting report on the same board and
+   * reason when there is one. Refused while the directory-reports flag is off.
+   */
+  reportBoard: DirectoryReportSubmitResult;
+  /**
+   * Report that this client turned off every light on `boardId` while keeping its
+   * BLE link (the "Turn off all lights" action). Publishes `BoardClimbCleared` so
+   * every viewer stops showing the cleared climb as lit, and keeps the clear for a
+   * week so a late subscriber sees it too. Requires board membership, and is refused
+   * when another emitter holds the board. History is untouched. Auth-optional.
+   * Returns whether the clear was accepted.
+   */
+  reportBoardClear: Scalars['Boolean']['output'];
   /**
    * Report the climb a connected phone just lit on the wall to the board's live
    * "now on the wall" feed. Auth-optional — anyone connected to the board emits
@@ -4050,6 +6074,8 @@ export type Mutation = {
    * (one vote + one comment per user) or opens one.
    */
   reportClimb: ReportClimbResult;
+  /** Report a problem with a gym listing. Same rules as reportBoard. */
+  reportGym: DirectoryReportSubmitResult;
   /**
    * Report that two gym listings are the same gym (any signed-in user). Surfaces the
    * pair to admins for review in the merge queue. Rate-limited and de-duplicated per
@@ -4074,6 +6100,9 @@ export type Mutation = {
    * context — no `sessionId` argument is required.
    */
   reportWallDisconnect: Session;
+  requestCncArtworkValidation: CncComputation;
+  requestCncLayout: CncComputation;
+  requestFollow: PrivacyRelationship;
   /**
    * Request ownership of a gym. With a matching work email at the gym's website
    * domain, a verification email is sent and clicking it transfers ownership.
@@ -4081,13 +6110,31 @@ export type Mutation = {
    * notified). Requires authentication.
    */
   requestGymClaim: RequestGymClaimResult;
+  requestPartnerDeveloperEmail: Scalars['Boolean']['output'];
   /**
    * Pull the latest logbook from a linked board account now.
    * Joins a sync that is already waiting instead of queueing a second one.
    * Rate limited to 5 requests a minute.
    */
   requestProviderSync: ProviderSyncRequest;
+  requestResourceAccess: Scalars['Boolean']['output'];
   requestSprayWallDetection: SprayWallDetection;
+  /** Prepare a weekly climbing archive and, where supported, its Aurora companion. */
+  requestUserDataExport: UserDataExportStatus;
+  /** Revoke the board's share link and mint a new one. Owner only; null when the board has no share link. */
+  resetBoardShareLink?: Maybe<BoardShareLink>;
+  /**
+   * Start a reset of a wall by cloning it. The clone copies the wall's settings
+   * (name, description, angle, gym, location, look, climb edit policy and
+   * visibility) and nothing else: the owner takes a new photo and marks the holds
+   * from scratch, and the clone's first publish archives the old wall. Calling it
+   * again before that publish returns the same unfinished clone.
+   *
+   * The wall's owner only. Refused on a wall with nothing published, and on an
+   * archived wall. Capped at `MAX_ARCHIVED_SPRAY_WALLS_PER_USER` archived walls
+   * per owner; the clone does not count toward `MAX_SPRAY_WALLS_PER_USER`.
+   */
+  resetSprayWall: SprayWall;
   /**
    * Resolve a BLE serial for clients that can disambiguate. Returns a single
    * `board` when the serial is unambiguous (remembered choice, only one match,
@@ -4101,6 +6148,12 @@ export type Mutation = {
    * board app, so the same serial exists on controllers of different types; pass
    * it and only boards of that type are candidates. Optional — clients shipped
    * before this existed keep the old type-blind resolution.
+   * Pass `selectedBoardUuid` when the caller already has a board selected (map
+   * finder / board picker). A selection whose config matches the connected
+   * controller wins over serial matching, so a Bluetooth connect never silently
+   * moves you off the wall you picked. If that board carries no serial yet, the
+   * connect claims this one for it, which is how a synced gym board becomes
+   * discoverable by serial for everyone after you.
    */
   resolveBoardCandidatesForSerial: ResolveBoardResult;
   /**
@@ -4122,6 +6175,9 @@ export type Mutation = {
    * board app, so the same serial exists on controllers of different types; pass
    * it and only boards of that type are candidates. Optional — clients shipped
    * before this existed keep the old type-blind resolution.
+   * `selectedBoardUuid` is the board the caller already has selected (map
+   * finder / board picker); when it matches the connected config it wins over
+   * serial matching — see `resolveBoardCandidatesForSerial`.
    */
   resolveBoardForSerial: ResolvedBoard;
   /**
@@ -4130,9 +6186,27 @@ export type Mutation = {
    * connects and stay aligned with board-scoped ticks.
    */
   resolveBoardForUuid: ResolvedBoard;
+  /** Close a report. See ResolveDirectoryReportInput.outcome for who may close it how. */
+  resolveDirectoryReport: DirectoryReport;
   /** Resolve a proposal (admin/leader only). */
   resolveProposal: Proposal;
+  /**
+   * Update the triage status of a feedback row from the admin dashboard. Admin
+   * only. Moving to `resolved`/`wont_fix` stamps the resolver + timestamp;
+   * moving back to `new`/`in_progress` clears them. Returns the updated row.
+   */
+  retryAppBugReportMessage: AppBugReportMessage;
   retrySprayWallDetection: SprayWallDetection;
+  /**
+   * Take back an approved gym claim (global admin only): the gym goes back to
+   * the SYSTEM account, every approved claim on it becomes `revoked`, the sync
+   * freeze set at approval is cleared so the location sync curates the listing
+   * again, and the claimant plus every gym member or editor added since the
+   * claim lose their membership. Only for a claim that took the gym from the
+   * SYSTEM account when nobody has moved it since; anything else is refused, and
+   * reassignGymOwner is the tool for it.
+   */
+  revertGymClaim: RevertGymClaimResult;
   /**
    * Approve or deny a pending gym claim (admin only). Approving transfers
    * ownership to the claimant.
@@ -4143,8 +6217,12 @@ export type Mutation = {
    * never a gym admin or plain member. Same authorization as grantGymWriteAccess.
    */
   revokeGymWriteAccess: Scalars['Boolean']['output'];
+  revokeResourceAccess: Scalars['Boolean']['output'];
   /** Revoke a community role from a user (admin only). */
   revokeRole: Scalars['Boolean']['output'];
+  /** Replace a confidential app's secret. The old secret stops working at once. */
+  rotateOAuthClientSecret: OAuthClientCredentials;
+  rotatePartnerWebhookSecret: PartnerWebhookCredentials;
   /**
    * Save Aurora climbing credentials.
    * Validates with Aurora API before saving.
@@ -4154,17 +6232,37 @@ export type Mutation = {
   saveClimb: SaveClimbResult;
   /** Save a new MoonBoard climb. */
   saveMoonBoardClimb: SaveClimbResult;
+  /**
+   * Save part of a spray wall's LED setup. Owner only: this value reaches every
+   * climber's phone at the wall. Refuses an address that is not on a local network
+   * and a layout outside the shared caps.
+   */
+  saveSprayWallLedSetup: SprayWallLedSetup;
   /** Save a new tick (climb attempt record). */
   saveTick: Tick;
+  sendAppBugReportMessage: AppBugReportMessage;
   sendDeviceLogs: SendDeviceLogsResponse;
+  /** Record the signed-in climber's analytics consent answer and return the account's current answer. */
+  setAnalyticsConsent: AnalyticsConsent;
+  /**
+   * Stay anonymous on boards you don't own. A plain preference: available
+   * whether or not account privacy controls are enabled.
+   */
+  setAnonymousOnForeignBoards: PrivacySettings;
   setClimbFromLedPositions: ClimbMatchResult;
   /** Set a community setting (admin/leader only). */
   setCommunitySettings: CommunitySetting;
+  setContentAudience: Scalars['Boolean']['output'];
   /**
    * Set the currently displayed climb.
    * Optionally adds it to the queue if not already present.
+   * `placement` (F3) marks a client that puts the climb in the Now slot instead of copying it;
+   * omit it for the shipped behaviour.
    */
   setCurrentClimb?: Maybe<ClimbQueueItem>;
+  setGymGradeCollection: Scalars['Boolean']['output'];
+  setGymReportingBoardAlias: Scalars['Boolean']['output'];
+  setGymReportingTimeZone: Scalars['Boolean']['output'];
   /**
    * Toggle automatic upload of finished sessions for a connected integration.
    * Requires authentication.
@@ -4179,6 +6277,10 @@ export type Mutation = {
    * that point and re-appends any climb a peer added inside the window instead of
    * silently overwriting it (issue #3933). Omit it for the historical wholesale
    * overwrite — old clients send nothing here.
+   *
+   * `historyCount` (F3) is the number of `queue` entries before Up next when no climb is
+   * current in `queue`. Ignored when the current climb is in `queue`. Omit it to have the
+   * server derive the line from the stored History.
    */
   setQueue: QueueState;
   /**
@@ -4211,6 +6313,21 @@ export type Mutation = {
    */
   setSessionHealthKitWorkoutId: Scalars['Boolean']['output'];
   /**
+   * Change the session's shared rest clock (#5382). Any session participant may
+   * call. The server stamps every instant, records the caller as
+   * `setByParticipantId` on ARM and CONFIGURE, and publishes
+   * `SessionRestCadenceChanged` to every member only when the call applied.
+   * FIRE is compare-and-set on `expectedRevision`, so exactly one phone can
+   * claim each beat. Session identity is resolved from the WebSocket connection
+   * context — no `sessionId` argument is required.
+   */
+  setSessionRestCadence: SetSessionRestCadencePayload;
+  /**
+   * Approve, reject or clear the verdict on one version. Community admins only
+   * (`spray`-scoped or global). Refused for a version that is not eligible.
+   */
+  setSprayTrainingReview: SprayTrainingReviewResult;
+  /**
    * Hide or unhide a wall. Community admins only (`spray`-scoped or global).
    *
    * A hidden wall reads exactly like a PRIVATE one for everybody but its owner,
@@ -4218,8 +6335,21 @@ export type Mutation = {
    * photographs, the holds and every climb set on the wall stay where they are.
    */
   setSprayWallHidden: SprayWallModerationResult;
+  /**
+   * Store the wall's default look — the one a climber who has never picked a
+   * render mode sees — or clear it with `renderSettings: null`. Same edit gate as
+   * `updateSprayWall`: the owner, a gym owner/admin, or a community leader on a
+   * public wall. The blob is validated against the board-look knob set; `mode`
+   * must be `classic` or `aura`.
+   */
+  setSprayWallRenderSettings: SprayWall;
   /** Setter override: directly set community status for your own climb. */
   setterOverrideCommunityStatus: ClimbCommunityStatus;
+  /**
+   * HTTP cron credentials only. Counts one UTC day's DAU and the trailing WAU and MAU, and sends one aggregate PostHog event.
+   * day (YYYY-MM-DD) re-runs a missed day, from yesterday back to 30 days ago; without it, yesterday.
+   */
+  snapshotActiveUsers: ActiveUsersSnapshotResult;
   /**
    * Submit in-app rating + optional comment. Public — unauthenticated testers
    * can still rate. If the request has a valid auth token, the feedback row is
@@ -4242,11 +6372,25 @@ export type Mutation = {
    * Caller must be a participant of the session. Requires authentication.
    */
   syncSessionToIntegration: IntegrationExportResult;
+  testPartnerWebhook: Scalars['ID']['output'];
   /**
    * Toggle favorite status for a climb.
    * Returns new favorite state.
    */
   toggleFavorite: ToggleFavoriteResult;
+  /**
+   * Put back the setup a climber's change replaced. For global admins, the
+   * board's creator (not for a synced board) and the owner and admins of the
+   * board's gym. Only while the board still has the climber's setup: a change
+   * someone undid first is refused with BOARD_SETUP_ALREADY_UNDONE
+   * (isBoardSetupAlreadyUndoneError; the old setup is back already), and one the
+   * board changed again since with BOARD_SETUP_CHANGED_SINCE
+   * (isBoardSetupChangedSinceError). Returns the board with its old setup back,
+   * and the sync freeze the change replaced while nobody edited the board since.
+   * The report the change closed stays closed, and for 90 days the board's
+   * suggestions go to review.
+   */
+  undoBoardSetupChange: UserBoard;
   /** Unfollow a board. */
   unfollowBoard: Scalars['Boolean']['output'];
   /** Unfollow a gym. */
@@ -4268,13 +6412,10 @@ export type Mutation = {
    * be used to clear another session's registration.
    */
   unregisterActivityPushToken: Scalars['Boolean']['output'];
+  /** Stop pushes to this installation for the signed-in account. */
+  unregisterNotificationDevice: Scalars['Boolean']['output'];
   /** Unsubscribe from new climbs for a board type and layout. */
   unsubscribeNewClimbs: Scalars['Boolean']['output'];
-  /**
-   * Update the triage status of a feedback row from the admin dashboard. Admin
-   * only. Moving to `resolved`/`wont_fix` stamps the resolver + timestamp;
-   * moving back to `new`/`in_progress` clears them. Returns the updated row.
-   */
   updateAppFeedbackStatus: AppFeedbackReport;
   /** Update a board's metadata. */
   updateBoard: UserBoard;
@@ -4296,15 +6437,21 @@ export type Mutation = {
    * and linked to this kiosk's gym.
    */
   updateGymKiosk: GymKiosk;
+  /** Edit the signed-in developer's app. */
+  updateOAuthClient: OAuthClient;
+  updatePartnerAppLimits: AdminPartnerApp;
+  updatePartnerWebhook: PartnerWebhookCredentials;
   /** Update playlist metadata. */
   updatePlaylist: Playlist;
   /** Update only lastAccessedAt for a playlist (does not update updatedAt). */
   updatePlaylistLastAccessed: Scalars['Boolean']['output'];
+  updatePrivacySettings: PrivacySettings;
   /**
    * Update current user's profile.
    * Requires authentication.
    */
   updateProfile: UserProfile;
+  updateResourcePrivacy: ResourcePrivacySettings;
   /**
    * Update a session's title and/or recap notes. Creator only. Works on both
    * active and ended sessions. Publishes SessionNameChanged to live
@@ -4336,6 +6483,15 @@ export type Mutation = {
    * version. Owner only, and never on a published version.
    */
   upsertSprayWallHolds: Array<SprayWallHold>;
+  /**
+   * Ask the pack generator whether a configuration's artwork actually fits:
+   * inside its panel, clear of every hole keep-out, not crossing a seam.
+   *
+   * A mutation rather than a query because it is the authoritative verdict the
+   * placement editor debounces against while the buyer drags — it is a call
+   * out to the generator, not a cacheable read. Requires authentication.
+   */
+  validateCncArtwork: CncArtworkValidation;
   /** Vote on an entity. Same value toggles (removes vote). */
   vote: VoteSummary;
   /** Vote on an open proposal. */
@@ -4369,6 +6525,29 @@ export type MutationAddQueueItemArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationAdminUpdateBoardArgs = {
+  input: UpdateBoardInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationApproveFollowRequestArgs = {
+  userId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationApproveResourceAccessArgs = {
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+  userId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationAttachAppWorkoutArgs = {
+  sessionId: Scalars['ID']['input'];
+  workoutId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationAttachBetaLinkArgs = {
   input: AttachBetaLinkInput;
 };
@@ -4382,6 +6561,11 @@ export type MutationAttachBoardToGymArgs = {
 export type MutationAuthorizeControllerForSessionArgs = {
   controllerId: Scalars['ID']['input'];
   sessionId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationCancelFollowRequestArgs = {
+  userId: Scalars['ID']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4407,6 +6591,11 @@ export type MutationConfirmClimbOnWallArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationConfirmPartnerDeveloperEmailArgs = {
+  token: Scalars['String']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationControllerHeartbeatArgs = {
   sessionId: Scalars['ID']['input'];
 };
@@ -4414,6 +6603,17 @@ export type MutationControllerHeartbeatArgs = {
 /** Root mutation type for all write operations. */
 export type MutationCreateBoardArgs = {
   input: CreateBoardInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationCreateCncDownloadGrantArgs = {
+  kind?: InputMaybe<CncDownloadKind>;
+  licenceId: Scalars['String']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationCreateCncPreviewArgs = {
+  config: CncBoardConfigInput;
 };
 
 /** Root mutation type for all write operations. */
@@ -4429,6 +6629,11 @@ export type MutationCreateGymKioskArgs = {
 /** Root mutation type for all write operations. */
 export type MutationCreateIntegrationOAuthHandoffArgs = {
   provider: IntegrationProvider;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationCreateOAuthClientArgs = {
+  input: CreateOAuthClientInput;
 };
 
 /** Root mutation type for all write operations. */
@@ -4457,6 +6662,11 @@ export type MutationCreateSprayWallVersionArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationDeclineFollowRequestArgs = {
+  userId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationDeleteAccountArgs = {
   input: DeleteAccountInput;
 };
@@ -4469,6 +6679,12 @@ export type MutationDeleteAuroraCredentialArgs = {
 /** Root mutation type for all write operations. */
 export type MutationDeleteBoardArgs = {
   boardUuid: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationDeleteClimbArgs = {
+  boardType: Scalars['String']['input'];
+  uuid: Scalars['ID']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4503,6 +6719,11 @@ export type MutationDeleteHoldOutlineOverrideArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationDeleteOAuthClientArgs = {
+  clientId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationDeletePlaylistArgs = {
   playlistId: Scalars['ID']['input'];
 };
@@ -4533,6 +6754,11 @@ export type MutationDiscardSprayWallVersionArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationDisconnectAppArgs = {
+  connectionId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationDisconnectIntegrationArgs = {
   provider: IntegrationProvider;
 };
@@ -4547,6 +6773,17 @@ export type MutationEndSessionArgs = {
   notes?: InputMaybe<Scalars['String']['input']>;
   sessionId: Scalars['ID']['input'];
   timezone?: InputMaybe<Scalars['String']['input']>;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationExchangeAppleAdsAttributionArgs = {
+  consent: AppleAdsConsentInput;
+  token: Scalars['String']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationFinaliseCncOrderArgs = {
+  input: FinaliseCncOrderInput;
 };
 
 /** Root mutation type for all write operations. */
@@ -4590,10 +6827,18 @@ export type MutationGrantRoleArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationInviteResourceMemberArgs = {
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+  userId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationJoinSessionArgs = {
   avatarUrl?: InputMaybe<Scalars['String']['input']>;
   boardPath: Scalars['String']['input'];
   initialCurrentClimb?: InputMaybe<ClimbQueueItemInput>;
+  initialHistoryCount?: InputMaybe<Scalars['Int']['input']>;
   initialQueue?: InputMaybe<Array<ClimbQueueItemInput>>;
   participantId?: InputMaybe<Scalars['ID']['input']>;
   sessionId: Scalars['ID']['input'];
@@ -4673,6 +6918,12 @@ export type MutationReassignGymOwnerArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationRecordAppWorkoutPlanArgs = {
+  plan: Scalars['JSON']['input'];
+  workoutId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationRecordBoardOpenedArgs = {
   input: RecordBoardOpenedInput;
 };
@@ -4683,8 +6934,33 @@ export type MutationRecordBoardSerialArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationRecordOfflineWriteObservationsArgs = {
+  input: RecordOfflineWriteObservationsInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRecordSessionWorkoutArgs = {
+  input: RecordSessionWorkoutInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRedeemBoardShareLinkArgs = {
+  token: Scalars['String']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationRefreshGymActivityStatsArgs = {
   force?: InputMaybe<Scalars['Boolean']['input']>;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRefreshSetterSitemapSummaryArgs = {
+  force?: InputMaybe<Scalars['Boolean']['input']>;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRegenerateCncPackArgs = {
+  licenceId: Scalars['String']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4699,6 +6975,11 @@ export type MutationRegisterControllerArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationRegisterNotificationDeviceArgs = {
+  input: RegisterNotificationDeviceInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationRemoveClimbFromPlaylistArgs = {
   input: RemoveClimbFromPlaylistInput;
 };
@@ -4706,6 +6987,11 @@ export type MutationRemoveClimbFromPlaylistArgs = {
 /** Root mutation type for all write operations. */
 export type MutationRemoveFavoriteArgs = {
   input: RemoveFavoriteInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRemoveFollowerArgs = {
+  userId: Scalars['ID']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4742,6 +7028,16 @@ export type MutationReplaceQueueItemArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationReportBoardArgs = {
+  input: ReportBoardInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationReportBoardClearArgs = {
+  boardId: Scalars['Int']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationReportBoardClimbArgs = {
   angle?: InputMaybe<Scalars['Int']['input']>;
   boardId: Scalars['Int']['input'];
@@ -4759,6 +7055,11 @@ export type MutationReportClimbArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationReportGymArgs = {
+  input: ReportGymInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationReportGymDuplicateArgs = {
   input: ReportGymDuplicateInput;
 };
@@ -4766,6 +7067,22 @@ export type MutationReportGymDuplicateArgs = {
 /** Root mutation type for all write operations. */
 export type MutationReportSprayWallArgs = {
   input: ReportSprayWallInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRequestCncArtworkValidationArgs = {
+  config: CncBoardConfigInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRequestCncLayoutArgs = {
+  config: CncBoardConfigInput;
+  includeHoles?: InputMaybe<Scalars['Boolean']['input']>;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRequestFollowArgs = {
+  userId: Scalars['ID']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4779,8 +7096,29 @@ export type MutationRequestProviderSyncArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationRequestResourceAccessArgs = {
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationRequestSprayWallDetectionArgs = {
   input: RequestSprayWallDetectionInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRequestUserDataExportArgs = {
+  boardType: Scalars['String']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationResetBoardShareLinkArgs = {
+  boardUuid: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationResetSprayWallArgs = {
+  input: ResetSprayWallInput;
 };
 
 /** Root mutation type for all write operations. */
@@ -4788,6 +7126,7 @@ export type MutationResolveBoardCandidatesForSerialArgs = {
   advertisedBoardType?: InputMaybe<Scalars['String']['input']>;
   boardType: Scalars['String']['input'];
   layoutId: Scalars['Int']['input'];
+  selectedBoardUuid?: InputMaybe<Scalars['ID']['input']>;
   serial: Scalars['String']['input'];
   setIds: Scalars['String']['input'];
   sizeId: Scalars['Int']['input'];
@@ -4806,6 +7145,7 @@ export type MutationResolveBoardForSerialArgs = {
   advertisedBoardType?: InputMaybe<Scalars['String']['input']>;
   boardType: Scalars['String']['input'];
   layoutId: Scalars['Int']['input'];
+  selectedBoardUuid?: InputMaybe<Scalars['ID']['input']>;
   serial: Scalars['String']['input'];
   setIds: Scalars['String']['input'];
   sizeId: Scalars['Int']['input'];
@@ -4817,13 +7157,28 @@ export type MutationResolveBoardForUuidArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationResolveDirectoryReportArgs = {
+  input: ResolveDirectoryReportInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationResolveProposalArgs = {
   input: ResolveProposalInput;
 };
 
 /** Root mutation type for all write operations. */
+export type MutationRetryAppBugReportMessageArgs = {
+  id: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationRetrySprayWallDetectionArgs = {
   id: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRevertGymClaimArgs = {
+  input: RevertGymClaimInput;
 };
 
 /** Root mutation type for all write operations. */
@@ -4837,8 +7192,25 @@ export type MutationRevokeGymWriteAccessArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationRevokeResourceAccessArgs = {
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+  userId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationRevokeRoleArgs = {
   input: RevokeRoleInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRotateOAuthClientSecretArgs = {
+  clientId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
+export type MutationRotatePartnerWebhookSecretArgs = {
+  clientId: Scalars['ID']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4857,13 +7229,33 @@ export type MutationSaveMoonBoardClimbArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationSaveSprayWallLedSetupArgs = {
+  input: SaveSprayWallLedSetupInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationSaveTickArgs = {
   input: SaveTickInput;
 };
 
 /** Root mutation type for all write operations. */
+export type MutationSendAppBugReportMessageArgs = {
+  input: SendAppBugReportMessageInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationSendDeviceLogsArgs = {
   input: SendDeviceLogsInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationSetAnalyticsConsentArgs = {
+  input: SetAnalyticsConsentInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationSetAnonymousOnForeignBoardsArgs = {
+  enabled: Scalars['Boolean']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4879,10 +7271,31 @@ export type MutationSetCommunitySettingsArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationSetContentAudienceArgs = {
+  input: SetContentAudienceInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationSetCurrentClimbArgs = {
   correlationId?: InputMaybe<Scalars['ID']['input']>;
   item?: InputMaybe<ClimbQueueItemInput>;
+  placement?: InputMaybe<CurrentClimbPlacement>;
   shouldAddToQueue?: InputMaybe<Scalars['Boolean']['input']>;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationSetGymGradeCollectionArgs = {
+  input: SetGymGradeCollectionInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationSetGymReportingBoardAliasArgs = {
+  input: SetGymReportingBoardAliasInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationSetGymReportingTimeZoneArgs = {
+  input: SetGymReportingTimeZoneInput;
 };
 
 /** Root mutation type for all write operations. */
@@ -4895,6 +7308,7 @@ export type MutationSetIntegrationAutoSyncArgs = {
 export type MutationSetQueueArgs = {
   baselineSequence?: InputMaybe<Scalars['Int']['input']>;
   currentClimbQueueItem?: InputMaybe<ClimbQueueItemInput>;
+  historyCount?: InputMaybe<Scalars['Int']['input']>;
   queue: Array<ClimbQueueItemInput>;
 };
 
@@ -4915,13 +7329,33 @@ export type MutationSetSessionHealthKitWorkoutIdArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationSetSessionRestCadenceArgs = {
+  input: SessionRestCadenceInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationSetSprayTrainingReviewArgs = {
+  input: SetSprayTrainingReviewInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationSetSprayWallHiddenArgs = {
   input: SetSprayWallHiddenInput;
 };
 
 /** Root mutation type for all write operations. */
+export type MutationSetSprayWallRenderSettingsArgs = {
+  input: SetSprayWallRenderSettingsInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationSetterOverrideCommunityStatusArgs = {
   input: SetterOverrideInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationSnapshotActiveUsersArgs = {
+  day?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Root mutation type for all write operations. */
@@ -4946,8 +7380,18 @@ export type MutationSyncSessionToIntegrationArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationTestPartnerWebhookArgs = {
+  clientId: Scalars['ID']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationToggleFavoriteArgs = {
   input: ToggleFavoriteInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationUndoBoardSetupChangeArgs = {
+  eventId: Scalars['ID']['input'];
 };
 
 /** Root mutation type for all write operations. */
@@ -4992,6 +7436,11 @@ export type MutationUnregisterActivityPushTokenArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationUnregisterNotificationDeviceArgs = {
+  installationId: Scalars['String']['input'];
+};
+
+/** Root mutation type for all write operations. */
 export type MutationUnsubscribeNewClimbsArgs = {
   input: NewClimbSubscriptionInput;
 };
@@ -5027,6 +7476,21 @@ export type MutationUpdateGymKioskArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationUpdateOAuthClientArgs = {
+  input: UpdateOAuthClientInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationUpdatePartnerAppLimitsArgs = {
+  input: UpdatePartnerAppLimitsInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationUpdatePartnerWebhookArgs = {
+  input: UpdatePartnerWebhookInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationUpdatePlaylistArgs = {
   input: UpdatePlaylistInput;
 };
@@ -5037,8 +7501,18 @@ export type MutationUpdatePlaylistLastAccessedArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationUpdatePrivacySettingsArgs = {
+  input: UpdatePrivacySettingsInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationUpdateProfileArgs = {
   input: UpdateProfileInput;
+};
+
+/** Root mutation type for all write operations. */
+export type MutationUpdateResourcePrivacyArgs = {
+  input: UpdateResourcePrivacyInput;
 };
 
 /** Root mutation type for all write operations. */
@@ -5074,6 +7548,11 @@ export type MutationUpsertSprayWallHoldsArgs = {
 };
 
 /** Root mutation type for all write operations. */
+export type MutationValidateCncArtworkArgs = {
+  config: CncBoardConfigInput;
+};
+
+/** Root mutation type for all write operations. */
 export type MutationVoteArgs = {
   input: VoteInput;
 };
@@ -5085,6 +7564,13 @@ export type MutationVoteOnProposalArgs = {
 
 /** Input for listing user's boards. */
 export type MyBoardsInput = {
+  /**
+   * Also list the viewer's OWN spray walls that have never been published, so
+   * My Boards and Manage can show their import progress. Off by default: board
+   * pickers must only offer walls that can be climbed on. Other people's
+   * unfinished walls and archived walls are never listed.
+   */
+  includeUnfinishedSprayWalls?: InputMaybe<Scalars['Boolean']['input']>;
   /** Max boards to return */
   limit?: InputMaybe<Scalars['Int']['input']>;
   /** Offset for pagination */
@@ -5109,6 +7595,8 @@ export type MyGymClaim = {
 export type MyGymsInput = {
   /** Include gyms the user follows */
   includeFollowed?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Include gyms covered by the viewer’s community admin or leader role. */
+  includeManaged?: InputMaybe<Scalars['Boolean']['input']>;
   /** Max gyms to return */
   limit?: InputMaybe<Scalars['Int']['input']>;
   /** Offset for pagination */
@@ -5182,6 +7670,7 @@ export type Notification = {
   commentBody?: Maybe<Scalars['String']['output']>;
   /** When the notification was created (ISO 8601) */
   createdAt: Scalars['String']['output'];
+  directoryNotice?: Maybe<DirectoryNotice>;
   /** Entity ID this notification relates to */
   entityId?: Maybe<Scalars['String']['output']>;
   /** Entity type this notification relates to */
@@ -5196,6 +7685,11 @@ export type Notification = {
   proposalUuid?: Maybe<Scalars['String']['output']>;
   /** The proposal's proposedValue, e.g. 'true'/'false' for hide */
   proposalValue?: Maybe<Scalars['String']['output']>;
+  /** The wall the imported reset clone replaces; null for a plain new wall. */
+  sprayResetOfWallUuid?: Maybe<Scalars['String']['output']>;
+  sprayVersionId?: Maybe<Scalars['ID']['output']>;
+  sprayWallName?: Maybe<Scalars['String']['output']>;
+  sprayWallUuid?: Maybe<Scalars['String']['output']>;
   /** Type of notification */
   type: NotificationType;
   /** Public unique identifier */
@@ -5242,10 +7736,26 @@ export type NotificationEvent = {
 };
 
 export type NotificationType =
+  | 'app_feedback_reply'
+  | 'board_deleted_by_staff'
+  | 'board_edited_by_staff'
+  | 'board_removed_from_gym'
+  | 'board_report_opened'
+  | 'board_report_resolved'
+  | 'board_setup_changed_by_climber'
+  | 'comment_on_board'
   | 'comment_on_climb'
+  | 'comment_on_gym'
+  | 'comment_on_playlist'
+  | 'comment_on_session'
   | 'comment_on_tick'
   | 'comment_reply'
+  | 'follow_request'
   | 'gym_claim_approved'
+  | 'gym_claim_denied'
+  | 'gym_claimed_with_your_board'
+  | 'gym_report_opened'
+  | 'gym_report_resolved'
   | 'new_climb'
   | 'new_climb_global'
   | 'new_climbs_synced'
@@ -5255,8 +7765,107 @@ export type NotificationType =
   | 'proposal_on_your_climb'
   | 'proposal_rejected'
   | 'proposal_vote'
+  | 'spray_wall_detection_completed'
   | 'vote_on_comment'
   | 'vote_on_tick';
+
+/** An app a developer registered for the Boardsesh API. Never carries its secret. */
+export type OAuthClient = {
+  __typename?: 'OAuthClient';
+  /** Climbers connected now. Deleting the app disconnects every one of them. */
+  activeConnections: Scalars['Int']['output'];
+  applicationType: OAuthClientApplicationType;
+  clientId: Scalars['ID']['output'];
+  /** ISO 8601. */
+  createdAt: Scalars['String']['output'];
+  homepageUrl?: Maybe<Scalars['String']['output']>;
+  /** Most climbers connected at once. */
+  maxActiveConnections: Scalars['Int']['output'];
+  /** Most new climber connections per day. */
+  maxNewConnectionsPerDay: Scalars['Int']['output'];
+  /** Shown on the consent screen. */
+  name: Scalars['String']['output'];
+  privacyPolicyUrl: Scalars['String']['output'];
+  /** Who makes the app: the consent screen's Made by line. Null only for an app registered before publishers were recorded. */
+  publisherName?: Maybe<Scalars['String']['output']>;
+  /** Matched as exact strings, except the port of a loopback redirect. */
+  redirectUris: Array<Scalars['String']['output']>;
+  /** ISO 8601 when Boardsesh suspended the app, otherwise null. A suspended app gets no tokens. */
+  suspendedAt?: Maybe<Scalars['String']['output']>;
+  /** Why the app was suspended, written for the developer. */
+  suspensionReason?: Maybe<Scalars['String']['output']>;
+  tokenEndpointAuthMethod: OAuthClientAuthMethod;
+};
+
+/**
+ * Where an app's OAuth redirect lands. WEB apps use https:// redirect URIs only;
+ * NATIVE apps may also use http://127.0.0.1 or http://[::1] and private-use
+ * schemes such as com.example.app:/oauth/boardsesh. See docs/integrations/partner-api.md.
+ */
+export type OAuthClientApplicationType = 'NATIVE' | 'WEB';
+
+/**
+ * How an app authenticates at the token endpoint. NONE is a public app (no
+ * secret, PKCE protects the code); the other two are confidential apps that send
+ * a client secret by HTTP Basic or in the form body.
+ */
+export type OAuthClientAuthMethod = 'CLIENT_SECRET_BASIC' | 'CLIENT_SECRET_POST' | 'NONE';
+
+/** An app with a secret that is shown this once and can never be read again. */
+export type OAuthClientCredentials = {
+  __typename?: 'OAuthClientCredentials';
+  client: OAuthClient;
+  /** Null for a public app. */
+  clientSecret?: Maybe<Scalars['String']['output']>;
+};
+
+export type ObservedBoardSerialInput = {
+  boardType: Scalars['String']['input'];
+  observedSerialNumber: Scalars['String']['input'];
+};
+
+export type ObservedBoardSerialMatch = {
+  __typename?: 'ObservedBoardSerialMatch';
+  boardType: Scalars['String']['output'];
+  candidates: Array<UserBoard>;
+  observedSerialNumber: Scalars['String']['output'];
+};
+
+export type OfflineWriteDeliveryReceipt = {
+  __typename?: 'OfflineWriteDeliveryReceipt';
+  deliveryId: Scalars['ID']['output'];
+  revision: Scalars['Int']['output'];
+  serverAcceptedAt?: Maybe<Scalars['String']['output']>;
+  serverRejectedAt?: Maybe<Scalars['String']['output']>;
+};
+
+export type OfflineWriteObservationInput = {
+  connectivityReason: Scalars['String']['input'];
+  deliveryId: Scalars['ID']['input'];
+  firstDeadLetterAt?: InputMaybe<Scalars['String']['input']>;
+  lastDeadLetterAt?: InputMaybe<Scalars['String']['input']>;
+  observedAt: Scalars['String']['input'];
+  observedRelease?: InputMaybe<OfflineWriteReleaseInput>;
+  operation: Scalars['String']['input'];
+  originRelease: OfflineWriteReleaseInput;
+  queuedAt: Scalars['String']['input'];
+  reconciledAt?: InputMaybe<Scalars['String']['input']>;
+  recovered: Scalars['Boolean']['input'];
+  revision: Scalars['Int']['input'];
+  serverResponseAt?: InputMaybe<Scalars['String']['input']>;
+  state: Scalars['String']['input'];
+  tableName: Scalars['String']['input'];
+};
+
+export type OfflineWriteReleaseInput = {
+  appVersion?: InputMaybe<Scalars['String']['input']>;
+  applicationId?: InputMaybe<Scalars['String']['input']>;
+  branch?: InputMaybe<Scalars['String']['input']>;
+  isEmbedded?: InputMaybe<Scalars['Boolean']['input']>;
+  platform: Scalars['String']['input'];
+  runtimeVersion?: InputMaybe<Scalars['String']['input']>;
+  updateId?: InputMaybe<Scalars['String']['input']>;
+};
 
 /** An alias-less, system-owned live gym with no location-sync source — an orphan for the audit list. */
 export type OrphanGym = {
@@ -5308,6 +7917,40 @@ export type OutlierAnalysis = {
   isOutlier: Scalars['Boolean']['output'];
   neighborAverage: Scalars['Float']['output'];
   neighborCount: Scalars['Int']['output'];
+};
+
+export type PartnerDeveloperEmailStatus = {
+  __typename?: 'PartnerDeveloperEmailStatus';
+  email: Scalars['String']['output'];
+  verified: Scalars['Boolean']['output'];
+};
+
+export type PartnerWebhookCredentials = {
+  __typename?: 'PartnerWebhookCredentials';
+  secret?: Maybe<Scalars['String']['output']>;
+  settings: PartnerWebhookSettings;
+};
+
+export type PartnerWebhookDelivery = {
+  __typename?: 'PartnerWebhookDelivery';
+  attempts: Scalars['Int']['output'];
+  createdAt: Scalars['String']['output'];
+  deliveredAt?: Maybe<Scalars['String']['output']>;
+  event: Scalars['String']['output'];
+  id: Scalars['ID']['output'];
+  lastError?: Maybe<Scalars['String']['output']>;
+  lastStatusCode?: Maybe<Scalars['Int']['output']>;
+  status: Scalars['String']['output'];
+};
+
+export type PartnerWebhookSettings = {
+  __typename?: 'PartnerWebhookSettings';
+  clientId: Scalars['ID']['output'];
+  disabledReason?: Maybe<Scalars['String']['output']>;
+  enabled: Scalars['Boolean']['output'];
+  events: Array<Scalars['String']['output']>;
+  previousSecretExpiresAt?: Maybe<Scalars['String']['output']>;
+  url: Scalars['String']['output'];
 };
 
 /** Input for listing pending gym claims (admin only). */
@@ -5432,6 +8075,8 @@ export type Playlist = {
   description?: Maybe<Scalars['String']['output']>;
   /** Number of users following this playlist */
   followerCount: Scalars['Int']['output'];
+  /** Grade spread of the playlist's climbs. Null when none of its climbs has a grade yet. */
+  gradeSummary?: Maybe<PlaylistGradeSummary>;
   /** Display icon */
   icon?: Maybe<Scalars['String']['output']>;
   /** Database ID */
@@ -5480,6 +8125,97 @@ export type PlaylistClimb = {
   wasAlreadyInPlaylist?: Maybe<Scalars['Boolean']['output']>;
 };
 
+/**
+ * How a playlist's climbs are ordered.
+ * position is the playlist's own order (the default), added is when each climb
+ * was added to the playlist. On the FIVE_STARS, PROJECTS and MOST_REPEATED smart
+ * lists, which record no time a climb entered them, added is the list's own
+ * order, the same as position. The others rank on the grade, quality and ascents
+ * each row displays, or shuffle with a seed.
+ */
+export type PlaylistClimbSort = 'added' | 'ascents' | 'difficulty' | 'name' | 'position' | 'quality' | 'random';
+
+/**
+ * Sort and filters for a playlist's climbs: the Climbs list's filters, applied to
+ * the playlist's own climbs. Every filter narrows the playlist and never adds a
+ * climb to it.
+ *
+ * Grade, quality, ascents and benchmark filters (and the matching sorts) read
+ * each row's stats at the angle the row displays: on the active board's type the
+ * wall angle, elsewhere the angle the climb was added at, and in both cases the
+ * most-ascended angle when the climb has no stats at that one.
+ *
+ * The personal and board-shaped filters (progress, your rating, liked, followed
+ * authors, beta videos, tall, wide, holds, zone and onlyActiveBoard) only pass
+ * climbs on the active board: the specific board in specific-board mode, the
+ * active* fields in all-boards mode. They need its board type, layout and angle;
+ * without them they match nothing.
+ */
+export type PlaylistClimbViewInput = {
+  /** Include single-frame climbs (boulders). Omitting both boulders and routes matches all climb types. */
+  boulders?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Grade accuracy filter (maximum gap between the displayed grade and the average grade) */
+  gradeAccuracy?: InputMaybe<Scalars['String']['input']>;
+  /** Which grade minGrade and maxGrade (and the difficulty sort) read. Omitted means UPSTREAM. */
+  gradeSource?: InputMaybe<ClimbGradeSource>;
+  /** Hide climbs the user has attempted on the active board (requires auth) */
+  hideAttempted?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Hide climbs the user has completed on the active board (requires auth) */
+  hideCompleted?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Hold filter object: { holdId: { STATE: 'include' | 'exclude' } }, matched on the active board */
+  holdsFilter?: InputMaybe<Scalars['JSON']['input']>;
+  /** Maximum difficulty grade ID */
+  maxGrade?: InputMaybe<Scalars['Int']['input']>;
+  /** Minimum number of ascents */
+  minAscents?: InputMaybe<Scalars['Int']['input']>;
+  /** Minimum difficulty grade ID */
+  minGrade?: InputMaybe<Scalars['Int']['input']>;
+  /** Minimum quality rating */
+  minRating?: InputMaybe<Scalars['Float']['input']>;
+  /** Hide climbs whose latest rating from the user, at the active angle, is below this many stars. 0 means no minimum. (requires auth) */
+  minUserRating?: InputMaybe<Scalars['Int']['input']>;
+  /** Filter by climb name (partial match) */
+  name?: InputMaybe<Scalars['String']['input']>;
+  /** Only climbs that fit the active board: its board type, layout, size and hold sets */
+  onlyActiveBoard?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only show benchmark climbs */
+  onlyBenchmarks?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs the user has hearted on the active board (requires auth) */
+  onlyFavorited?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs by followed setters or followed users, on the active board. (requires auth) */
+  onlyFollowedAuthors?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs the user has rated at the active angle (requires auth) */
+  onlyRatedByMe?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs on the active board that need its full height */
+  onlyTallClimbs?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs on the active board that need its full width */
+  onlyWideClimbs?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs on the active board that have a beta video */
+  onlyWithBetaVideos?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs with no ascents at the displayed angle */
+  projectsOnly?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Include multi-frame climbs (routes). Omitting both boulders and routes matches all climb types. */
+  routes?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Filter by setter usernames */
+  setter?: InputMaybe<Array<Scalars['String']['input']>>;
+  /** Only climbs the user has attempted on the active board (requires auth) */
+  showOnlyAttempted?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Only climbs the user has completed on the active board (requires auth) */
+  showOnlyCompleted?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Order of the climbs. Omitted means position (the playlist's own order). */
+  sortBy?: InputMaybe<PlaylistClimbSort>;
+  /** Sort direction ('asc' or 'desc'). Omitted means the sort's natural direction: asc for position, difficulty and name, desc for added, quality and ascents. */
+  sortOrder?: InputMaybe<Scalars['String']['input']>;
+  /** Seed for the 'random' sort; keeps OFFSET pagination stable across pages for one shuffle */
+  sortSeed?: InputMaybe<Scalars['String']['input']>;
+  /** Key the grade filter and the difficulty sort off the climber's own grade on the active board, falling back to the crowd's grade elsewhere. (requires auth) */
+  useMyGrades?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Restrict to climbs on the active board inside this drawn zone */
+  zoneBox?: InputMaybe<ZoneBoxInput>;
+  /** How the zone should match climb holds. Defaults to allHolds when omitted. */
+  zoneMode?: InputMaybe<ZoneMatchMode>;
+};
+
 /** Result of fetching playlist climbs. */
 export type PlaylistClimbsResult = {
   __typename?: 'PlaylistClimbsResult';
@@ -5487,8 +8223,10 @@ export type PlaylistClimbsResult = {
   climbs: Array<Climb>;
   /** Whether more are available */
   hasMore: Scalars['Boolean']['output'];
-  /** Total number of climbs matching the supplied board, layout, size, and hold-set filters before pagination */
+  /** Total number of climbs matching the supplied board, layout, size, and hold-set scope and the view's filters, before pagination */
   totalCount: Scalars['Int']['output'];
+  /** Climbs the playlist shows in this board scope with no view filter applied. Set on page 0 of a view that carries a filter; null otherwise (a sort alone, and later pages). */
+  unfilteredCount?: Maybe<Scalars['Int']['output']>;
 };
 
 /** A user who has created public playlists. */
@@ -5500,6 +8238,65 @@ export type PlaylistCreator = {
   playlistCount: Scalars['Int']['output'];
   /** User ID */
   userId: Scalars['ID']['output'];
+};
+
+/**
+ * The grade spread of a playlist's climbs. Every value is a difficulty id on the
+ * playlist board's grade scale (the same ids SearchClimbs' minGrade/maxGrade take),
+ * from ROUND(display_difficulty) at each climb's playlist angle. A climb saved
+ * without an angle (synced circuits) is graded at its most-repeated angle.
+ * Refreshed when climbs are added or removed, and daily for grade drift.
+ */
+export type PlaylistGradeSummary = {
+  __typename?: 'PlaylistGradeSummary';
+  /** Climbs that have a grade; the values below cover only these */
+  gradedClimbCount: Scalars['Int']['output'];
+  /** Hardest graded climb */
+  maxDifficulty: Scalars['Int']['output'];
+  /** Median grade */
+  medianDifficulty: Scalars['Int']['output'];
+  /** Easiest graded climb */
+  minDifficulty: Scalars['Int']['output'];
+  /** 10th percentile: the low end of the band cards show and the grade filter checks */
+  p10Difficulty: Scalars['Int']['output'];
+  /** 90th percentile: the high end of the band cards show and the grade filter checks */
+  p90Difficulty: Scalars['Int']['output'];
+};
+
+/**
+ * A setter of the climbs in a playlist, with how many of them they set.
+ * playlistSetters returns at most 200, those with the most climbs, and says
+ * nothing when it cut the list: search by username prefix reaches the rest.
+ */
+export type PlaylistSetter = {
+  __typename?: 'PlaylistSetter';
+  /** How many of the playlist's climbs the viewer can see were set by them */
+  climbCount: Scalars['Int']['output'];
+  /** Setter username, exactly as a view's setter filter matches it */
+  username: Scalars['String']['output'];
+};
+
+/**
+ * Input for the setters of a playlist's climbs. Name a user playlist with
+ * playlistId, or a logbook smart list with smartType and userId.
+ */
+export type PlaylistSettersInput = {
+  /** Board name. On a user playlist, the specific-board mode of playlistClimbs (omit for all boards); on a smart list, its board-type filter. */
+  boardName?: InputMaybe<Scalars['String']['input']>;
+  /** Layout ID (user playlists only) */
+  layoutId?: InputMaybe<Scalars['Int']['input']>;
+  /** User playlist ID. Omit for a smart list. */
+  playlistId?: InputMaybe<Scalars['ID']['input']>;
+  /** Only setters whose username starts with this, ignoring case */
+  search?: InputMaybe<Scalars['String']['input']>;
+  /** Set IDs (user playlists only) */
+  setIds?: InputMaybe<Scalars['String']['input']>;
+  /** Size ID (user playlists only) */
+  sizeId?: InputMaybe<Scalars['Int']['input']>;
+  /** Smart list type, with userId: FIVE_STARS, MOST_REPEATED, PROJECTS or LIKED_CLIMBS. A recommendation is rejected. */
+  smartType?: InputMaybe<SmartPlaylistType>;
+  /** Whose smart list, with smartType */
+  userId?: InputMaybe<Scalars['ID']['input']>;
 };
 
 /**
@@ -5555,6 +8352,81 @@ export type PopularBoardConfigsInput = {
   offset?: InputMaybe<Scalars['Int']['input']>;
 };
 
+export type PrivacyAudience = 'followers' | 'only_me' | 'public';
+
+export type PrivacyContentAudience = {
+  __typename?: 'PrivacyContentAudience';
+  audience: PrivacyAudience;
+  canEdit: Scalars['Boolean']['output'];
+  isExplicit: Scalars['Boolean']['output'];
+};
+
+export type PrivacyContentType =
+  | 'beta'
+  /** Retired: climbs have no audience. contentAudience answers public; setContentAudience rejects it. */
+  | 'climb'
+  | 'comment'
+  | 'playlist'
+  | 'session'
+  | 'tick';
+
+export type PrivacyFollowRequest = {
+  __typename?: 'PrivacyFollowRequest';
+  avatarUrl?: Maybe<Scalars['String']['output']>;
+  createdAt: Scalars['String']['output'];
+  displayName?: Maybe<Scalars['String']['output']>;
+  recipientId: Scalars['ID']['output'];
+  requesterId: Scalars['ID']['output'];
+};
+
+export type PrivacyGrantStatus = 'approved' | 'pending' | 'revoked';
+
+export type PrivacyLocationAudience = 'followers' | 'members' | 'only_me' | 'public';
+
+export type PrivacyPublicationInput = {
+  audience: PrivacyAudience;
+  privacyRevision: Scalars['Int']['input'];
+};
+
+export type PrivacyRelationship = {
+  __typename?: 'PrivacyRelationship';
+  isFollowing: Scalars['Boolean']['output'];
+  isPrivate: Scalars['Boolean']['output'];
+  requestPending: Scalars['Boolean']['output'];
+  userId: Scalars['ID']['output'];
+};
+
+export type PrivacyResourceAudience = 'followers' | 'invite_only' | 'only_me' | 'public' | 'unlisted';
+
+export type PrivacyResourceGrant = {
+  __typename?: 'PrivacyResourceGrant';
+  avatarUrl?: Maybe<Scalars['String']['output']>;
+  displayName?: Maybe<Scalars['String']['output']>;
+  invitedBy?: Maybe<Scalars['ID']['output']>;
+  status: PrivacyGrantStatus;
+  userId: Scalars['ID']['output'];
+};
+
+export type PrivacyResourceKind = 'board' | 'session';
+
+export type PrivacySettings = {
+  __typename?: 'PrivacySettings';
+  /**
+   * Show as an anonymous climber on board feeds, leaderboards and live rosters
+   * of boards this climber doesn't own. Their sends still count.
+   */
+  anonymousOnForeignBoards: Scalars['Boolean']['output'];
+  defaultSessionAudience: PrivacyResourceAudience;
+  enabled: Scalars['Boolean']['output'];
+  isPrivate: Scalars['Boolean']['output'];
+  /**
+   * Always 1. Apps that still ship the retired setup screen open it below 1.
+   * @deprecated Retired with the privacy setup screen. Always 1.
+   */
+  privacyOnboardingVersion: Scalars['Int']['output'];
+  privacyRevision: Scalars['Int']['output'];
+};
+
 /** Aggregated profile statistics across all boards. */
 export type ProfileStats = {
   __typename?: 'ProfileStats';
@@ -5590,7 +8462,7 @@ export type Proposal = {
   proposedValue: Scalars['String']['output'];
   proposerAvatarUrl?: Maybe<Scalars['String']['output']>;
   proposerDisplayName?: Maybe<Scalars['String']['output']>;
-  proposerId: Scalars['ID']['output'];
+  proposerId?: Maybe<Scalars['ID']['output']>;
   reason?: Maybe<Scalars['String']['output']>;
   requiredUpvotes: Scalars['Int']['output'];
   resolvedAt?: Maybe<Scalars['String']['output']>;
@@ -5611,6 +8483,13 @@ export type ProposalConnection = {
   hasMore: Scalars['Boolean']['output'];
   proposals: Array<Proposal>;
   totalCount: Scalars['Int']['output'];
+};
+
+/** Release diagnostics attached to a report reason, visible only to scoped admins. */
+export type ProposalReportReleaseContext = {
+  __typename?: 'ProposalReportReleaseContext';
+  commentUuid: Scalars['ID']['output'];
+  releaseContext: ReleaseContext;
 };
 
 export type ProposalStatus = 'approved' | 'open' | 'rejected' | 'superseded';
@@ -5656,6 +8535,7 @@ export type PublicUserProfile = {
   __typename?: 'PublicUserProfile';
   /** Avatar URL */
   avatarUrl?: Maybe<Scalars['String']['output']>;
+  canViewActivity: Scalars['Boolean']['output'];
   /** Display name */
   displayName?: Maybe<Scalars['String']['output']>;
   /** Number of followers */
@@ -5668,9 +8548,12 @@ export type PublicUserProfile = {
   instagramUrl?: Maybe<Scalars['String']['output']>;
   /** Whether the current user follows this user */
   isFollowedByMe: Scalars['Boolean']['output'];
+  isPrivate: Scalars['Boolean']['output'];
 };
 
 export type PublishSprayWallVersionInput = {
+  /** Require a writer that preserves climb links when existing holds are refined. Omit for older clients; when supplied, must be true. */
+  preserveClimbLinks?: InputMaybe<Scalars['Boolean']['input']>;
   versionId: Scalars['ID']['input'];
 };
 
@@ -5750,7 +8633,7 @@ export type QaVerdict = {
 
 /**
  * A tester's verdict on a pull-request preview (crowdsourced QA; see
- * docs/crowdsourced-qa.md).
+ * docs/qa/crowdsourced-qa.md).
  */
 export type QaVerdictKind = 'approved' | 'declined';
 
@@ -5762,13 +8645,30 @@ export type Query = {
    * Requires authentication.
    */
   activityFeed: ActivityFeedResult;
-  /**
-   * List submitted app feedback (bug reports + ratings) for the admin feedback
-   * dashboard, enriched with the reporter's identity and triage state. Admin
-   * only. Supports filtering by type/status/platform and free-text search over
-   * the comment, with offset pagination.
-   */
   adminAppFeedback: AdminAppFeedbackResult;
+  /** Stored editable metadata for one active board. Global admins only. */
+  adminBoard?: Maybe<AdminBoard>;
+  /**
+   * Every change a climber's suggested setup made to a board, newest first, with
+   * where each one stands. Global admins only. first defaults to 50 (at most 100).
+   */
+  adminBoardSetupChanges: BoardSetupChangeConnection;
+  /** Search all active registered boards, including private boards. Global admins only. */
+  adminBoards: AdminBoardConnection;
+  /**
+   * Every buyer's orders, newest first — the list behind `/admin/build-plans`.
+   * Admin only.
+   *
+   * Carries the three fields `CncOrder` withholds (licensee email, attempts,
+   * the generator's real error), because those are what an operator needs to
+   * answer "whose pack is this, why did it fail, and who do I write to". Filter
+   * with `status` to work one bucket at a time; `limit` defaults to 25 and
+   * is capped at 100, and `cursor` comes from the previous page.
+   */
+  adminCncOrders: CncOrderConnection;
+  /** The admin queue. Global admins only. status defaults to escalated. */
+  adminDirectoryReports: DirectoryReportConnection;
+  adminPartnerApps: AdminPartnerAppConnection;
   /**
    * Get all current user's playlists across boards/layouts, paginated.
    * Optional boardType/layoutId filter. Requires authentication.
@@ -5776,6 +8676,9 @@ export type Query = {
   allUserPlaylists: AllUserPlaylistsResult;
   /** Get available angles for a board layout. */
   angles: Array<Angle>;
+  appBugReport?: Maybe<AppBugReport>;
+  appBugReportMessages: AppBugReportMessageConnection;
+  appWorkout: AppWorkout;
   /**
    * Get Aurora credential for a specific board type.
    * Includes token if available. Requires authentication.
@@ -5786,6 +8689,17 @@ export type Query = {
    * Requires authentication.
    */
   auroraCredentials: Array<AuroraCredentialStatus>;
+  /**
+   * Immutable identity admitted from this request's presented credential.
+   * Returns UNAUTHENTICATED when the credential cannot authorize the request.
+   * Authority failures return SERVICE_UNAVAILABLE instead of an identity.
+   */
+  authenticatedUserId: Scalars['ID']['output'];
+  /**
+   * Claims that approved themselves (admin only), newest first: approved ones
+   * an admin can revert with revertGymClaim, and ones already reverted.
+   */
+  autoApprovedGymClaims: GymClaimConnection;
   /**
    * Live preview metadata for a shared Instagram/TikTok URL, before it's
    * attached. Powers the mobile share flow: shows the post thumbnail/caption and
@@ -5801,13 +8715,20 @@ export type Query = {
   betaLinks: Array<BetaLink>;
   /** Get a board by UUID. */
   board?: Maybe<UserBoard>;
-  /** Get a board by slug (for URL routing). */
+  /**
+   * Get a board by slug (for URL routing).
+   *
+   * wallUuid is a spray wall's share-link capability (the ?wall= param). When it
+   * matches the uuid of the wall the slug resolved to, an UNLISTED wall opens for
+   * any caller, the same as sprayWall(uuid). It never opens a private or
+   * admin-hidden wall, a mismatch is ignored, and it does nothing on other boards.
+   */
   boardBySlug?: Maybe<UserBoard>;
   /**
    * The five most recent distinct climbers to send or flash a climb at the
    * displayed angle on this physical board, newest sender first. Canonical and
-   * aliased climb UUIDs share one sender list. Anonymous access is allowed for
-   * public and system-shared boards; private boards are masked as NOT_FOUND.
+   * aliased climb UUIDs share one sender list. Same board access rule as
+   * `boardHistory`; a board the caller may not read is masked as NOT_FOUND.
    */
   boardClimbRecentSenders: Array<BoardClimbRecentSender>;
   /**
@@ -5821,19 +8742,18 @@ export type Query = {
   /** Public physical boards ranked by distinct climbers before limiting; optionally within one public gym. */
   boardDiscovery: Array<BoardDiscoveryBoard>;
   /**
-   * Durable history of what was pushed to a board (survives past the 1 week
-   * Redis window (BOARD_HISTORY_TTL)), newest-first by `seq`. For keyset
+   * Last seven days of native displays pushed to a board, newest-first by `seq`. For keyset
    * paging pass the `seq` of the last item from the previous page as
    * `before` (not `sentAt`) — `seq` is unique and monotonic per board, so
    * paging never repeats or skips even when several sends share a `sentAt`
    * second. A non-integer `before` is rejected with BAD_USER_INPUT. `limit`
-   * is capped at 100. This is the lasting "what was on the wall" record;
-   * `boardRecentClimbs` is the hot 1 week cache. Anonymous access is allowed
-   * for public and system-shared boards; private boards are masked as
-   * NOT_FOUND for anonymous callers.
+   * is capped at 100. The rolling server-time window applies before pagination;
+   * older rows remain stored but cannot be paged through here. Access follows the board's
+   * policy: the board id alone is the no-link reading, `boardUuid` adds the
+   * link. A board the caller may not read is masked as NOT_FOUND.
    */
   boardHistory: Array<BoardPresenceClimb>;
-  /** Chronological durable history with an opaque, board-scoped pagination cursor. */
+  /** Last seven days of chronological display history with an opaque, board-scoped cursor. Expired cursors return an empty final page. */
   boardHistoryPage: BoardHistoryPage;
   /**
    * Get leaderboard for a board. Anonymous access is allowed for public and
@@ -5845,26 +8765,30 @@ export type Query = {
   boardLeaderboard: BoardLeaderboard;
   /**
    * Sessions climbing right now on one board. Same access rule as
-   * `boardHistory`: anonymous callers only reach public and system-shared
-   * boards and only see public sessions; followed-climber reasons need
-   * authentication.
+   * `boardHistory`. The board id alone is the no-link reading (ids can be
+   * counted); pass `boardUuid` to open an Unlisted board and to have it named
+   * on its sessions. Anonymous callers only see public sessions;
+   * followed-climber reasons need authentication.
    */
   boardLiveSessions: Array<LiveSession>;
+  /** Public catalog grades for up to 50 climbs on this wall, at the viewer's selected angle. */
+  boardPresenceClimbGrades: Array<BoardPresenceClimbGrade>;
   /**
    * Lightweight stats for a board's wall feed — durable counts derived from
    * `boardsesh_ticks` stamped with this board_id, plus the live window.
-   * Anonymous access is allowed for public and system-shared boards; private
-   * boards are masked as NOT_FOUND for anonymous callers.
+   * Same board access rule as `boardHistory`; a board the caller may not
+   * read is masked as NOT_FOUND.
    */
   boardPresenceStats: BoardPresenceStats;
   /**
    * Redacted "Up next" snapshot of the party-session queue bound to a shared
-   * board, for anonymous public displays (gym kiosks). Auth-optional; for
-   * anonymous viewers a private board reads as NOT_FOUND (same existence
-   * hiding as `boardNowPlaying`).
+   * board, for anonymous public displays (gym kiosks). Auth-optional; a board
+   * the caller may not read is NOT_FOUND (same existence hiding as
+   * `boardNowPlaying`, including the `boardUuid` rule).
    *
    * Double privacy gate — returns null unless BOTH hold:
-   * 1. the board is anonymously readable (public / system-shared), and
+   * 1. the board is readable by a signed-out holder of its link (Public or
+   *    Unlisted, or system-shared), and
    * 2. the bound session is `isPublic: true` and still active.
    *
    * Gate 2 deliberately widens `board_sessions.is_public` from "appears in
@@ -5881,12 +8805,25 @@ export type Query = {
   boardQueuePreview?: Maybe<BoardQueuePreview>;
   /**
    * Backfill the recent "now on the wall" history for a board (last ~50, 1
-   * week window (BOARD_HISTORY_TTL)) from the Redis FIFO. Used by late joiners
+   * week window, checked against server time) from the Redis FIFO. Used by late joiners
    * before the live `boardNowPlaying` subscription takes over.
    */
   boardRecentClimbs: Array<BoardPresenceClimb>;
-  /** Merged native and imported recent displays, used to infer the current climb by display time. */
+  /** Merged native and imported displays from the last seven days, used to infer the current climb by display time. */
   boardRecentHistory: Array<BoardPresenceClimb>;
+  /**
+   * Reports about one board, waiting and closed in the last 30 days, newest
+   * first. For its creator, the staff of the gym a report went to, and global
+   * admins; an empty list for anyone else.
+   */
+  boardReports: Array<DirectoryReport>;
+  /**
+   * The owner's share link for a Followers or Invite-only home board, minted on
+   * first read. Null for a Public, Unlisted or Only-me board, and for a spray wall.
+   */
+  boardShareLink?: Maybe<BoardShareLink>;
+  /** The board name behind an active share link, for a signed-out visitor. Null when the link does not open anything. */
+  boardShareLinkPreview?: Maybe<BoardShareLinkPreview>;
   /**
    * Look up boards by controller serial numbers.
    * Searches all boards (including unlisted/non-public).
@@ -5936,8 +8873,19 @@ export type Query = {
   climbClassicStatus: ClimbClassicStatus;
   /** Get community status for a specific climb at an angle. */
   climbCommunityStatus: ClimbCommunityStatus;
+  /**
+   * Everyone's logs on a specific climb, one page at a time. Public. Newest
+   * first. A spray climb the caller cannot see answers like a climb nobody
+   * logged.
+   */
+  climbLogs: ClimbLogsResult;
   /** Get proposals for a specific climb. */
   climbProposals: ProposalConnection;
+  /**
+   * Retired: climb edits are no longer recorded as revisions. Always empty.
+   * @deprecated Climb revision history was retired. Always empty.
+   */
+  climbRevisions: Array<ClimbRevision>;
   /**
    * Get current per-angle statistics for a climb from the live stats table.
    * Returns one entry for each angle the climb has been logged at.
@@ -5953,6 +8901,31 @@ export type Query = {
    * Despite the name this is no longer a time series; prefer climbStatsForAngles.
    */
   climbStatsHistory: Array<ClimbStatsHistoryEntry>;
+  /**
+   * Everything Boardsesh sells a CNC build pack for, with prices and the
+   * manufacturing choices each wall allows. Public: the configurator renders
+   * this before anyone signs in.
+   */
+  cncCatalog: CncCatalog;
+  cncComputation?: Maybe<CncComputation>;
+  /**
+   * Panel layout for a configuration: panels, seams, keep-outs and a BOM
+   * preview, straight from the pack generator. Public, rate-limited, and
+   * validated against the catalogue before the generator is touched.
+   *
+   * Set `includeHoles` to draw the drill pattern; it adds roughly 40 KB of
+   * hole positions and is left off for a plain panel outline. Requesting the
+   * hole list requires a signed-in user and is held to a tighter rate limit
+   * than the hole-free preview. Hold ids and set-screw angles are never
+   * returned.
+   */
+  cncLayout: Scalars['JSON']['output'];
+  /**
+   * One order by its licence id. Returns null for a licence that does not
+   * exist and for one belonging to someone else — a licence id identifies an
+   * order, it never grants access to it. Requires authentication.
+   */
+  cncOrder?: Maybe<CncOrder>;
   /** Get comments for an entity. */
   comments: CommentConnection;
   /** Get all community role assignments. */
@@ -5961,6 +8934,18 @@ export type Query = {
   communitySettings: Array<CommunitySetting>;
   /** Headline usage numbers for the marketing site. Public, cached, no auth. */
   communityStats: CommunityStats;
+  /** Whether this request comes from a region where the analytics prompt is shown. No sign-in needed. */
+  consentRegion: ConsentRegion;
+  contentAudience: PrivacyContentAudience;
+  /**
+   * The boards the controller API key's owner owns (home boards and spray walls,
+   * deleted and archived ones left out), so a wall device can let its owner pick
+   * one. Requires a WebSocket connected with `connectionParams.controllerApiKey`;
+   * without one it fails UNAUTHENTICATED, signed in or not.
+   */
+  controllerBoards: Array<ControllerBoard>;
+  /** Read a gym's device configuration using a registered gym owner/admin's controller API key. */
+  controllerGymManifest: ControllerGymManifest;
   /** Sessions and the last 30 days of published climbs from followed authors. */
   crewFeed: CrewFeedResult;
   /**
@@ -5986,6 +8971,15 @@ export type Query = {
    * Used to catch up after reconnection without full state transfer.
    */
   eventsReplay: EventsReplayResponse;
+  /**
+   * Walls that may already be the one a climber is about to add at a gym (#8151):
+   * boards of the given type on the gym, on listings merged into it, and on
+   * public, listed gyms within 150 m (at most 10). Only walls the caller can see
+   * are returned or counted: their own, and public listed boards. A private gym
+   * the caller can't edit throws NOT_FOUND. Auth-optional and rate-limited. A
+   * failed lookup throws; it never answers with an empty list.
+   */
+  existingWallCandidates: ExistingWallCandidates;
   /**
    * Check which climbs from a list are favorited by the current user.
    * Returns array of favorited climb UUIDs.
@@ -6022,8 +9016,9 @@ export type Query = {
    */
   followingAscentsFeed: FollowingAscentsFeedResult;
   /**
-   * Get ticks from followed users for a specific climb.
-   * Requires authentication.
+   * Logs from followed users on a specific climb: the 100 newest, plus
+   * counts that cover all of them. A spray climb the caller cannot see
+   * answers like a climb nobody logged. Requires authentication.
    */
   followingClimbAscents: FollowingClimbAscentsResult;
   /**
@@ -6067,6 +9062,9 @@ export type Query = {
   gymBoards: Array<UserBoard>;
   /** Get a gym by slug (for URL routing). */
   gymBySlug?: Maybe<Gym>;
+  gymGradeCollectionOptions: GymGradeCollectionPage;
+  /** Compare current inventory and attributable sends. Requires live gym staff access. */
+  gymGradeComparison: GymGradeComparison;
   /**
    * A gym's public kiosk (smart-TV wall dashboard) by gym slug, with an optional
    * kiosk slug. Public read, rate-limited, no login: a public gym's kiosks are
@@ -6120,6 +9118,7 @@ export type Query = {
    * board). Read-only; the editor renders both and offers a revert.
    */
   holdOutlines: BoardHoldOutlines;
+  incomingFollowRequests: Array<PrivacyFollowRequest>;
   /**
    * Resolve scraped Instagram posts against Boardsesh: which beta videos are
    * missing, already linked, ambiguous, or unmatched. Read-only — the client
@@ -6137,6 +9136,19 @@ export type Query = {
    * Requires authentication.
    */
   isFollowing: Scalars['Boolean']['output'];
+  /** Explicit address search for a map pin. Authentication required; 5–500 characters; no autocomplete. */
+  lookupGymAddressCoordinates?: Maybe<GymAddressCoordinates>;
+  /** Current release context. Available without signing in. */
+  mobileReleaseStatus: ReleaseContext;
+  /** The signed-in climber's current analytics consent, or null when they have never answered. */
+  myAnalyticsConsent?: Maybe<AnalyticsConsent>;
+  /**
+   * List submitted app feedback (bug reports + ratings) for the admin feedback
+   * dashboard, enriched with the reporter's identity and triage state. Admin
+   * only. Supports filtering by type/status/platform and free-text search over
+   * the comment, with offset pagination.
+   */
+  myAppBugReports: AppBugReportConnection;
   /**
    * Recorded board configurations for the current user keyed by controller serial.
    * Used as a fallback when boardsBySerialNumbers returns nothing for a serial,
@@ -6148,7 +9160,17 @@ export type Query = {
    * Requires authentication.
    */
   myBoards: UserBoardConnection;
+  /** The signed-in buyer's own orders, newest first. Requires authentication. */
+  myCncOrders: Array<CncOrder>;
+  /** The signed-in climber's connected apps, in every PARTNER_OAUTH_MODE. */
+  myConnectedApps: ConnectedApps;
   myControllers: Array<ControllerInfo>;
+  /**
+   * Reports the viewer can act on: about boards they created, and routed to the
+   * staff of gyms they own, administer or edit. Waiting reports first (oldest
+   * first), then those closed in the last 30 days when includeResolved is true.
+   */
+  myDirectoryReportsToReview: Array<DirectoryReport>;
   /**
    * Get current user's gyms (owned + optionally followed).
    * Requires authentication.
@@ -6159,6 +9181,11 @@ export type Query = {
    * Requires authentication.
    */
   myNewClimbSubscriptions: Array<NewClimbSubscription>;
+  /**
+   * The signed-in developer's apps. Developer apps answer NOT_FOUND while partner
+   * OAuth is off, and only allowlisted developers may use them.
+   */
+  myOAuthClients: Array<OAuthClient>;
   /**
    * Get the authenticated user's pinned playlists, ordered by most recently pinned.
    * Capped server-side (small grid surface). Requires authentication.
@@ -6197,11 +9224,22 @@ export type Query = {
   notificationActors: FollowConnection;
   /** Get notifications for the current user. */
   notifications: NotificationConnection;
+  /** Correlate radio-observed serials with readable candidates without exposing stored owner-only serial fields. */
+  observedBoardSerialMatches: Array<ObservedBoardSerialMatch>;
   /**
    * Alias-less, system-owned live gyms with no location-sync source — the orphan
    * audit list (admin only). List-only; no bulk action.
    */
   orphanGyms: OrphanGymConnection;
+  /**
+   * Whether partner apps are switched on (any PARTNER_OAUTH_MODE but off), the same
+   * value as ConnectedApps.partnerAppsEnabled. Screens that only need to know whether
+   * to mention connected apps read this. It changes only with a deploy.
+   */
+  partnerAppsEnabled: Scalars['Boolean']['output'];
+  partnerDeveloperEmailStatus: PartnerDeveloperEmailStatus;
+  partnerWebhookDeliveries: Array<PartnerWebhookDelivery>;
+  partnerWebhookSettings?: Maybe<PartnerWebhookSettings>;
   /** List pending gym ownership claims for the admin review queue (admin only). */
   pendingGymClaims: GymClaimConnection;
   /**
@@ -6213,17 +9251,29 @@ export type Query = {
   playlistClimbs: PlaylistClimbsResult;
   /** Get playlist creators for autocomplete suggestions. */
   playlistCreators: Array<PlaylistCreator>;
+  /**
+   * Setters of the climbs in a playlist, or a logbook smart list, that the viewer
+   * can see: the same climbs as playlistClimbs or smartPlaylist without a view.
+   * Most climbs first, then by username. Capped at the 200 with the most climbs,
+   * with no sign that the list was cut; search by username prefix reaches the
+   * rest. Powers the setter picker in a playlist's filter sheet.
+   */
+  playlistSetters: Array<PlaylistSetter>;
   /** Get IDs of playlists that contain a specific climb. */
   playlistsForClimb: Array<Scalars['ID']['output']>;
   /** Get playlist memberships for multiple climbs in a single request. */
   playlistsForClimbs: Array<ClimbPlaylistMembership>;
   /** Get popular board configurations ranked by climb count. */
   popularBoardConfigs: PopularBoardConfigConnection;
+  privacyRelationship: PrivacyRelationship;
+  privacySettings: PrivacySettings;
   /**
    * Get the currently authenticated user's profile.
    * Returns null if not authenticated.
    */
   profile?: Maybe<UserProfile>;
+  /** Stored report release diagnostics; empty for callers without an admin role on this board. */
+  proposalReportReleaseContexts: Array<ProposalReportReleaseContext>;
   /**
    * What a reset WOULD do: match the detections from a new photo against the
    * holds on the wall today and report kept / removed / added.
@@ -6233,10 +9283,21 @@ export type Query = {
    * frame, i.e. already mapped through the draft version's own homography, which
    * is the only reason two photographs taken from different spots can be compared
    * at all. Editor only, since a proposal describes an unpublished draft.
+   * @deprecated In-place resets were retired. Always refuses with SPRAY_WALL_RESET_RETIRED; use resetSprayWall.
    */
   proposeSprayWallReset?: Maybe<SprayWallResetProposal>;
+  /** Only the registered app's public name; never the workout title, notes or blocks. */
+  publicAppWorkoutLaunch?: Maybe<AppWorkoutLaunch>;
+  /** Canonical public venues for sitemap publication. Fails rather than truncating when the sitemap budget is exceeded. */
+  publicGymSitemap: Array<GymSitemapEntry>;
   /** Get a public user profile by ID. */
   publicProfile?: Maybe<PublicUserProfile>;
+  /**
+   * Find published, listed public spray walls using anonymous visibility, including for signed-in callers.
+   * Supports text, exact angles, proximity and pagination; catalogue selectors are ignored.
+   * Limited to 50 results per request and 300 requests per minute per caller.
+   */
+  publicSprayWalls: UserBoardConnection;
   /**
    * Crowdsourced QA: the open pull requests among `prNumbers` (the tester's
    * loadable `pr-<n>` OTA branches), each with its title, `## Test plan`
@@ -6268,8 +9329,23 @@ export type Query = {
    *
    * The PARENT is shown even when it is no longer climbable (epic decision
    * 2026-09-14): a climb that lost three holds is exactly the one worth remixing.
+   * @deprecated Remix after a reset was retired. Always null.
    */
   remixClimb?: Maybe<SprayRemixSeed>;
+  /**
+   * Resolve a partner export reference to a read-only completed session detail
+   * for its authenticated creator or a durable participant. This is a
+   * first-party history link, never an invitation or a join operation.
+   */
+  resolvePartnerSessionHistory?: Maybe<Scalars['ID']['output']>;
+  /**
+   * The people with a grant on a board or session the viewer owns. Without
+   * userIds: pending requests first, then members, newest first, 100 from
+   * offset; removed people are left out. With userIds (up to 100): those
+   * people's grants, whatever their status.
+   */
+  resourceAccessRequests: Array<PrivacyResourceGrant>;
+  resourcePrivacy?: Maybe<ResourcePrivacySettings>;
   /** Search public boards. */
   searchBoards: UserBoardConnection;
   /**
@@ -6320,6 +9396,20 @@ export type Query = {
    * Available for ended sessions or active sessions with ticks.
    */
   sessionSummary?: Maybe<SessionSummary>;
+  /**
+   * Feed-card headlines for up to 50 sessions, under the sessionWorkouts rule
+   * for who appears. Sessions the viewer may not open, or with no workout, are
+   * left out.
+   */
+  sessionWorkoutHeadlines: Array<SessionWorkoutHeadline>;
+  /**
+   * The workouts followed in a session, one per climber, with what each block
+   * came to. Follows sessionDetail: the session must open for the viewer, the
+   * climber must be someone its own surfaces name to them, and at least one of
+   * the climber's ticks in it must be visible to them. Climbs the viewer may not
+   * see are left out along with their ticks.
+   */
+  sessionWorkouts: Array<SessionWorkout>;
   /** Get climbs created by a setter. */
   setterClimbs: SetterClimbsConnection;
   /**
@@ -6346,7 +9436,7 @@ export type Query = {
    * matching separately — see findExactDuplicateMatch.
    * Admins get the live query. Everyone else reads the nightly precomputed
    * index (top 25 per climb at 0.5 and above), and a frames-only lookup
-   * (no climbUuid) is admin-only. See docs/similar-climbs.md.
+   * (no climbUuid) is admin-only. See docs/data/similar-climbs.md.
    */
   similarClimbs: Array<SimilarClimb>;
   /**
@@ -6354,6 +9444,13 @@ export type Query = {
    * Public — no authentication required.
    */
   smartPlaylist: SmartPlaylistResult;
+  /**
+   * Wall versions eligible as training data, by review status. UNREVIEWED
+   * lists the oldest version first, so the queue drains in arrival order;
+   * APPROVED and REJECTED list the newest verdict first. Community admins only
+   * (`spray`-scoped or global). At most 25 per page.
+   */
+  sprayTrainingQueue: SprayTrainingQueue;
   /**
    * One spray wall by uuid (the `user_boards` uuid it is keyed on).
    *
@@ -6365,12 +9462,40 @@ export type Query = {
    */
   sprayWall?: Maybe<SprayWall>;
   /**
+   * The generated wall looks of one version (`wall-crop`, `hold-cutouts`) and
+   * its photo-quality verdict. Omit `version` for the published one. Same
+   * visibility rules as `sprayWallRenderData`; null where that is null.
+   */
+  sprayWallArt?: Maybe<SprayWallArt>;
+  /**
    * The spray wall occupying a catalogue layout id, for a client holding only a
    * board config. Same visibility rules as `sprayWall`.
    */
   sprayWallByLayout?: Maybe<SprayWall>;
   sprayWallDetection?: Maybe<SprayWallDetection>;
   sprayWallDetectionForVersion?: Maybe<SprayWallDetection>;
+  /**
+   * How many climbs set on this wall use each of the given holds, for the hold
+   * editor to ask before it removes (or moves) one that published climbs use.
+   * One row per distinct requested hold, zeros included. Hidden climbs and
+   * climbs a full reset retired are not counted. Same gate as editing the
+   * wall's holds; refused on an archived wall. At most 500 holds per call.
+   */
+  sprayWallHoldUsage: Array<SprayWallHoldUsage>;
+  /**
+   * Distinct published and draft climbs that use any of the given holds. A climb
+   * using several requested holds counts once. Same editing and archive gates
+   * as sprayWallHoldUsage. Accepts up to the wall's 1500 holds in one call.
+   */
+  sprayWallHoldUsageSummary: SprayWallHoldUsageSummary;
+  sprayWallImportProgress: Array<SprayWallImportProgress>;
+  /**
+   * A spray wall's LED setup, for lighting it from this phone. Anyone who can read
+   * the wall gets it, with the same rules as `sprayWall`; null when the wall does
+   * not exist, is deleted, or this viewer may not see it. `setup` is null when the
+   * wall has no saved setup yet.
+   */
+  sprayWallLedSetup?: Maybe<SprayWallLedSetupView>;
   /**
    * Everything needed to render a wall at one version: the photo, the homography
    * and the holds alive at that version. Omit `version` for the published one.
@@ -6393,6 +9518,8 @@ export type Query = {
    * the same spot. Merged-twin candidates first, then nearest. Capped at 25.
    */
   strayBoardsForGym: Array<StrayBoard>;
+  /** Read a saved climb immediately: own drafts or published spray climbs on accessible walls. */
+  syncClimbDocuments?: Maybe<SyncClimbDocuments>;
   /**
    * Pull Boardsesh grades for a board type, changed since the cursor (reference data).
    * Optional layoutId/sizeId scope grades to the climbs of that layout/size via board_climbs.
@@ -6441,6 +9568,8 @@ export type Query = {
   syncTicks: SyncResult;
   /** Pull the authenticated user's user-follows changed since the cursor. */
   syncUserFollows: SyncResult;
+  /** Compatible saved and recent physical boards for a tick owned by the viewer. */
+  tickBoardOptions: TickBoardOptions;
   /**
    * Get current user's ticks (recorded climb attempts).
    * Requires authentication.
@@ -6483,6 +9612,10 @@ export type Query = {
    * Includes both directly created climbs and Aurora-imported climbs linked via board credentials.
    */
   userClimbs: PlaylistClimbsResult;
+  /** The signed-in climber's recent cached export; defaults to this UTC ISO week. */
+  userDataExport: UserDataExportStatus;
+  /** A five-minute private browser download; no user ID is accepted. */
+  userDataExportDownload: UserDataExportDownloadLink;
   /**
    * Get user's favorite climbs with full climb data.
    * Requires authentication.
@@ -6498,6 +9631,11 @@ export type Query = {
    * Useful for summary displays.
    */
   userGroupedAscentsFeed: GroupedAscentFeedResult;
+  /**
+   * Setters of the climbs a user has logged, most-logged first. Uses the same
+   * visibility rules as userAscentsFeed. Powers the logbook setter filter.
+   */
+  userLoggedSetters: Array<LoggedSetter>;
   /**
    * Get current user's playlists for a board+layout.
    * Requires authentication.
@@ -6528,6 +9666,42 @@ export type QueryAdminAppFeedbackArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryAdminBoardArgs = {
+  boardUuid: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryAdminBoardSetupChangesArgs = {
+  after?: InputMaybe<Scalars['String']['input']>;
+  first?: InputMaybe<Scalars['Int']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QueryAdminBoardsArgs = {
+  input: AdminBoardsInput;
+};
+
+/** Root query type for all read operations. */
+export type QueryAdminCncOrdersArgs = {
+  cursor?: InputMaybe<Scalars['String']['input']>;
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  status?: InputMaybe<CncOrderStatus>;
+};
+
+/** Root query type for all read operations. */
+export type QueryAdminDirectoryReportsArgs = {
+  after?: InputMaybe<Scalars['String']['input']>;
+  first?: InputMaybe<Scalars['Int']['input']>;
+  status?: InputMaybe<DirectoryReportStatus>;
+  targetKind?: InputMaybe<DirectoryReportTargetKind>;
+};
+
+/** Root query type for all read operations. */
+export type QueryAdminPartnerAppsArgs = {
+  input?: InputMaybe<AdminPartnerAppsInput>;
+};
+
+/** Root query type for all read operations. */
 export type QueryAllUserPlaylistsArgs = {
   input: GetAllUserPlaylistsInput;
 };
@@ -6539,8 +9713,28 @@ export type QueryAnglesArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryAppBugReportArgs = {
+  id: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryAppBugReportMessagesArgs = {
+  input: AppBugReportMessagesInput;
+};
+
+/** Root query type for all read operations. */
+export type QueryAppWorkoutArgs = {
+  id: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
 export type QueryAuroraCredentialArgs = {
   boardType: Scalars['String']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryAutoApprovedGymClaimsArgs = {
+  input?: InputMaybe<AutoApprovedGymClaimsInput>;
 };
 
 /** Root query type for all read operations. */
@@ -6562,18 +9756,21 @@ export type QueryBoardArgs = {
 /** Root query type for all read operations. */
 export type QueryBoardBySlugArgs = {
   slug: Scalars['String']['input'];
+  wallUuid?: InputMaybe<Scalars['ID']['input']>;
 };
 
 /** Root query type for all read operations. */
 export type QueryBoardClimbRecentSendersArgs = {
   angle: Scalars['Int']['input'];
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
   climbUuid: Scalars['String']['input'];
 };
 
 /** Root query type for all read operations. */
 export type QueryBoardConnectionArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
 };
 
 /** Root query type for all read operations. */
@@ -6585,6 +9782,7 @@ export type QueryBoardDiscoveryArgs = {
 export type QueryBoardHistoryArgs = {
   before?: InputMaybe<Scalars['String']['input']>;
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
   limit?: InputMaybe<Scalars['Int']['input']>;
 };
 
@@ -6592,6 +9790,8 @@ export type QueryBoardHistoryArgs = {
 export type QueryBoardHistoryPageArgs = {
   before?: InputMaybe<Scalars['String']['input']>;
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
+  includeAurora?: InputMaybe<Scalars['Boolean']['input']>;
   limit?: InputMaybe<Scalars['Int']['input']>;
 };
 
@@ -6603,26 +9803,55 @@ export type QueryBoardLeaderboardArgs = {
 /** Root query type for all read operations. */
 export type QueryBoardLiveSessionsArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QueryBoardPresenceClimbGradesArgs = {
+  angle: Scalars['Int']['input'];
+  boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
+  climbUuids: Array<Scalars['ID']['input']>;
 };
 
 /** Root query type for all read operations. */
 export type QueryBoardPresenceStatsArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
 };
 
 /** Root query type for all read operations. */
 export type QueryBoardQueuePreviewArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
 };
 
 /** Root query type for all read operations. */
 export type QueryBoardRecentClimbsArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
 };
 
 /** Root query type for all read operations. */
 export type QueryBoardRecentHistoryArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
+  includeAurora?: InputMaybe<Scalars['Boolean']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QueryBoardReportsArgs = {
+  boardUuid: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryBoardShareLinkArgs = {
+  boardUuid: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryBoardShareLinkPreviewArgs = {
+  token: Scalars['String']['input'];
 };
 
 /** Root query type for all read operations. */
@@ -6674,6 +9903,7 @@ export type QueryClimbArgs = {
   layoutId: Scalars['Int']['input'];
   setIds: Scalars['String']['input'];
   sizeId: Scalars['Int']['input'];
+  sprayWallUuid?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Root query type for all read operations. */
@@ -6690,8 +9920,19 @@ export type QueryClimbCommunityStatusArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryClimbLogsArgs = {
+  input: ClimbLogsInput;
+};
+
+/** Root query type for all read operations. */
 export type QueryClimbProposalsArgs = {
   input: GetClimbProposalsInput;
+};
+
+/** Root query type for all read operations. */
+export type QueryClimbRevisionsArgs = {
+  boardType: Scalars['String']['input'];
+  climbUuid: Scalars['String']['input'];
 };
 
 /** Root query type for all read operations. */
@@ -6713,6 +9954,22 @@ export type QueryClimbStatsHistoryArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryCncComputationArgs = {
+  id: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryCncLayoutArgs = {
+  config: CncBoardConfigInput;
+  includeHoles?: InputMaybe<Scalars['Boolean']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QueryCncOrderArgs = {
+  licenceId: Scalars['String']['input'];
+};
+
+/** Root query type for all read operations. */
 export type QueryCommentsArgs = {
   input: CommentsInput;
 };
@@ -6726,6 +9983,17 @@ export type QueryCommunityRolesArgs = {
 export type QueryCommunitySettingsArgs = {
   scope: Scalars['String']['input'];
   scopeKey: Scalars['String']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryContentAudienceArgs = {
+  entityId: Scalars['ID']['input'];
+  entityType: PrivacyContentType;
+};
+
+/** Root query type for all read operations. */
+export type QueryControllerGymManifestArgs = {
+  gymRef: Scalars['String']['input'];
 };
 
 /** Root query type for all read operations. */
@@ -6747,6 +10015,11 @@ export type QueryDuplicateGymClustersArgs = {
 export type QueryEventsReplayArgs = {
   sessionId: Scalars['ID']['input'];
   sinceSequence: Scalars['Int']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryExistingWallCandidatesArgs = {
+  input: ExistingWallCandidatesInput;
 };
 
 /** Root query type for all read operations. */
@@ -6829,6 +10102,16 @@ export type QueryGymBySlugArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryGymGradeCollectionOptionsArgs = {
+  input: GymGradeCollectionOptionsInput;
+};
+
+/** Root query type for all read operations. */
+export type QueryGymGradeComparisonArgs = {
+  input: GymStatsInput;
+};
+
+/** Root query type for all read operations. */
 export type QueryGymKioskArgs = {
   gymSlug: Scalars['String']['input'];
   kioskSlug?: InputMaybe<Scalars['String']['input']>;
@@ -6880,6 +10163,21 @@ export type QueryIsFollowingArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryLookupGymAddressCoordinatesArgs = {
+  address: Scalars['String']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryMobileReleaseStatusArgs = {
+  input: MobileReleaseStatusInput;
+};
+
+/** Root query type for all read operations. */
+export type QueryMyAppBugReportsArgs = {
+  input?: InputMaybe<AppBugReportsInput>;
+};
+
+/** Root query type for all read operations. */
 export type QueryMyBoardSerialConfigsArgs = {
   serialNumbers: Array<Scalars['String']['input']>;
 };
@@ -6887,6 +10185,12 @@ export type QueryMyBoardSerialConfigsArgs = {
 /** Root query type for all read operations. */
 export type QueryMyBoardsArgs = {
   input?: InputMaybe<MyBoardsInput>;
+};
+
+/** Root query type for all read operations. */
+export type QueryMyDirectoryReportsToReviewArgs = {
+  first?: InputMaybe<Scalars['Int']['input']>;
+  includeResolved?: InputMaybe<Scalars['Boolean']['input']>;
 };
 
 /** Root query type for all read operations. */
@@ -6924,8 +10228,23 @@ export type QueryNotificationsArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryObservedBoardSerialMatchesArgs = {
+  input: Array<ObservedBoardSerialInput>;
+};
+
+/** Root query type for all read operations. */
 export type QueryOrphanGymsArgs = {
   input?: InputMaybe<OrphanGymsInput>;
+};
+
+/** Root query type for all read operations. */
+export type QueryPartnerWebhookDeliveriesArgs = {
+  clientId: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryPartnerWebhookSettingsArgs = {
+  clientId: Scalars['ID']['input'];
 };
 
 /** Root query type for all read operations. */
@@ -6949,6 +10268,11 @@ export type QueryPlaylistCreatorsArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryPlaylistSettersArgs = {
+  input: PlaylistSettersInput;
+};
+
+/** Root query type for all read operations. */
 export type QueryPlaylistsForClimbArgs = {
   input: GetPlaylistsForClimbInput;
 };
@@ -6964,13 +10288,33 @@ export type QueryPopularBoardConfigsArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryPrivacyRelationshipArgs = {
+  userId: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryProposalReportReleaseContextsArgs = {
+  proposalUuid: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
 export type QueryProposeSprayWallResetArgs = {
   input: ProposeSprayWallResetInput;
 };
 
 /** Root query type for all read operations. */
+export type QueryPublicAppWorkoutLaunchArgs = {
+  id: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
 export type QueryPublicProfileArgs = {
   userId: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryPublicSprayWallsArgs = {
+  input: SearchBoardsInput;
 };
 
 /** Root query type for all read operations. */
@@ -6990,6 +10334,25 @@ export type QueryRecentBetaLinksArgs = {
 export type QueryRemixClimbArgs = {
   parentUuid: Scalars['ID']['input'];
   sprayWallUuid?: InputMaybe<Scalars['ID']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QueryResolvePartnerSessionHistoryArgs = {
+  exportId: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryResourceAccessRequestsArgs = {
+  kind: PrivacyResourceKind;
+  offset?: InputMaybe<Scalars['Int']['input']>;
+  resourceId: Scalars['ID']['input'];
+  userIds?: InputMaybe<Array<Scalars['ID']['input']>>;
+};
+
+/** Root query type for all read operations. */
+export type QueryResourcePrivacyArgs = {
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
 };
 
 /** Root query type for all read operations. */
@@ -7058,6 +10421,16 @@ export type QuerySessionSummaryArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QuerySessionWorkoutHeadlinesArgs = {
+  sessionIds: Array<Scalars['ID']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QuerySessionWorkoutsArgs = {
+  sessionId: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
 export type QuerySetterClimbsArgs = {
   input: SetterClimbsInput;
 };
@@ -7088,13 +10461,27 @@ export type QuerySmartPlaylistArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QuerySprayTrainingQueueArgs = {
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  offset?: InputMaybe<Scalars['Int']['input']>;
+  status: SprayTrainingReviewStatus;
+};
+
+/** Root query type for all read operations. */
 export type QuerySprayWallArgs = {
   uuid: Scalars['ID']['input'];
 };
 
 /** Root query type for all read operations. */
+export type QuerySprayWallArtArgs = {
+  uuid: Scalars['ID']['input'];
+  version?: InputMaybe<Scalars['Int']['input']>;
+};
+
+/** Root query type for all read operations. */
 export type QuerySprayWallByLayoutArgs = {
   layoutId: Scalars['Int']['input'];
+  sprayWallUuid?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Root query type for all read operations. */
@@ -7106,6 +10493,28 @@ export type QuerySprayWallDetectionArgs = {
 export type QuerySprayWallDetectionForVersionArgs = {
   versionId: Scalars['ID']['input'];
   wallUuid: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QuerySprayWallHoldUsageArgs = {
+  holdIds: Array<Scalars['Int']['input']>;
+  wallUuid: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QuerySprayWallHoldUsageSummaryArgs = {
+  holdIds: Array<Scalars['Int']['input']>;
+  wallUuid: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QuerySprayWallImportProgressArgs = {
+  wallUuids: Array<Scalars['ID']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QuerySprayWallLedSetupArgs = {
+  boardUuid: Scalars['ID']['input'];
 };
 
 /** Root query type for all read operations. */
@@ -7125,30 +10534,47 @@ export type QueryStrayBoardsForGymArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QuerySyncClimbDocumentsArgs = {
+  boardType: Scalars['String']['input'];
+  climbUuid: Scalars['ID']['input'];
+  layoutId: Scalars['Int']['input'];
+  sprayWallUuid?: InputMaybe<Scalars['ID']['input']>;
+};
+
+/** Root query type for all read operations. */
 export type QuerySyncClimbGradesArgs = {
+  audience?: InputMaybe<SyncAudience>;
   boardType: Scalars['String']['input'];
   cursor?: InputMaybe<SyncCursorInput>;
   layoutId?: InputMaybe<Scalars['Int']['input']>;
   limit?: Scalars['Int']['input'];
   sizeId?: InputMaybe<Scalars['Int']['input']>;
+  snapshotClimbWatermark?: InputMaybe<SyncCursorInput>;
+  sprayWallUuid?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Root query type for all read operations. */
 export type QuerySyncClimbStatsArgs = {
+  audience?: InputMaybe<SyncAudience>;
   boardType: Scalars['String']['input'];
   cursor?: InputMaybe<SyncCursorInput>;
   layoutId?: InputMaybe<Scalars['Int']['input']>;
   limit?: Scalars['Int']['input'];
   sizeId?: InputMaybe<Scalars['Int']['input']>;
+  snapshotClimbWatermark?: InputMaybe<SyncCursorInput>;
+  sprayWallUuid?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Root query type for all read operations. */
 export type QuerySyncClimbsArgs = {
+  audience?: InputMaybe<SyncAudience>;
   boardType: Scalars['String']['input'];
   cursor?: InputMaybe<SyncCursorInput>;
   layoutId?: InputMaybe<Scalars['Int']['input']>;
   limit?: Scalars['Int']['input'];
   sizeId?: InputMaybe<Scalars['Int']['input']>;
+  snapshotClimbWatermark?: InputMaybe<SyncCursorInput>;
+  sprayWallUuid?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Root query type for all read operations. */
@@ -7194,6 +10620,7 @@ export type QuerySyncSprayWallsArgs = {
   layoutId?: InputMaybe<Scalars['Int']['input']>;
   limit?: Scalars['Int']['input'];
   sizeId?: InputMaybe<Scalars['Int']['input']>;
+  sprayWallUuid?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Root query type for all read operations. */
@@ -7206,6 +10633,13 @@ export type QuerySyncTicksArgs = {
 export type QuerySyncUserFollowsArgs = {
   cursor?: InputMaybe<SyncCursorInput>;
   limit?: Scalars['Int']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryTickBoardOptionsArgs = {
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  offset?: InputMaybe<Scalars['Int']['input']>;
+  tickUuid: Scalars['ID']['input'];
 };
 
 /** Root query type for all read operations. */
@@ -7248,6 +10682,19 @@ export type QueryUserClimbsArgs = {
 };
 
 /** Root query type for all read operations. */
+export type QueryUserDataExportArgs = {
+  boardType: Scalars['String']['input'];
+  period?: InputMaybe<Scalars['String']['input']>;
+};
+
+/** Root query type for all read operations. */
+export type QueryUserDataExportDownloadArgs = {
+  boardType: Scalars['String']['input'];
+  format: UserDataExportFormat;
+  period: Scalars['String']['input'];
+};
+
+/** Root query type for all read operations. */
 export type QueryUserFavoriteClimbsArgs = {
   input: GetUserFavoriteClimbsInput;
 };
@@ -7255,6 +10702,12 @@ export type QueryUserFavoriteClimbsArgs = {
 /** Root query type for all read operations. */
 export type QueryUserGroupedAscentsFeedArgs = {
   input?: InputMaybe<AscentFeedInput>;
+  userId: Scalars['ID']['input'];
+};
+
+/** Root query type for all read operations. */
+export type QueryUserLoggedSettersArgs = {
+  input?: InputMaybe<UserLoggedSettersInput>;
   userId: Scalars['ID']['input'];
 };
 
@@ -7387,8 +10840,14 @@ export type QueueReordered = {
  */
 export type QueueState = {
   __typename?: 'QueueState';
+  /** When the room's current climb last changed to a different climb (ISO 8601). Null from a pre-F3 server. */
+  currentChangedAt?: Maybe<Scalars['String']['output']>;
+  /** Session participant who last changed the current queue item. Null when unknown. */
+  currentChangedBy?: Maybe<Scalars['ID']['output']>;
   /** The climb currently being attempted */
   currentClimbQueueItem?: Maybe<ClimbQueueItem>;
+  /** Entries before Up next. Equals the current index when a climb is current. Null from a pre-F3 server. */
+  historyCount?: Maybe<Scalars['Int']['output']>;
   /** List of climbs in the queue */
   queue: Array<ClimbQueueItem>;
   /** Monotonically increasing sequence number for ordering events */
@@ -7457,12 +10916,59 @@ export type RecordBoardSerialInput = {
   sizeId: Scalars['Int']['input'];
 };
 
+export type RecordOfflineWriteObservationsInput = {
+  observations: Array<OfflineWriteObservationInput>;
+  ownerUserId: Scalars['ID']['input'];
+};
+
+export type RecordOfflineWriteObservationsResult = {
+  __typename?: 'RecordOfflineWriteObservationsResult';
+  receipts: Array<OfflineWriteDeliveryReceipt>;
+};
+
+export type RecordSessionWorkoutInput = {
+  /** The phone's per-session write counter. Only a higher revision than the stored one is written. */
+  revision: Scalars['Int']['input'];
+  sessionId: Scalars['ID']['input'];
+  stages: Array<SessionWorkoutStageInput>;
+  ticks: Array<SessionWorkoutTickInput>;
+};
+
 export type RegisterControllerInput = {
   boardName: Scalars['String']['input'];
   layoutId: Scalars['Int']['input'];
   name?: InputMaybe<Scalars['String']['input']>;
   setIds: Scalars['String']['input'];
   sizeId: Scalars['Int']['input'];
+};
+
+export type RegisterNotificationDeviceInput = {
+  installationId: Scalars['String']['input'];
+  locale: Scalars['String']['input'];
+  platform: Scalars['String']['input'];
+  token: Scalars['String']['input'];
+};
+
+/** Running identity with backend-verified current automatic canary membership. */
+export type ReleaseContext = {
+  __typename?: 'ReleaseContext';
+  /** Null when current rollout membership could not be checked. */
+  automaticCanary?: Maybe<Scalars['Boolean']['output']>;
+  branch?: Maybe<Scalars['String']['output']>;
+  canaryCheckedAt?: Maybe<Scalars['String']['output']>;
+  channel?: Maybe<Scalars['String']['output']>;
+  isEmbeddedLaunch?: Maybe<Scalars['Boolean']['output']>;
+  runtimeVersion?: Maybe<Scalars['String']['output']>;
+  updateId?: Maybe<Scalars['String']['output']>;
+};
+
+/** Identity of the running bundle; excludes a pending download or requested track. */
+export type ReleaseContextInput = {
+  branch?: InputMaybe<Scalars['String']['input']>;
+  channel?: InputMaybe<Scalars['String']['input']>;
+  isEmbeddedLaunch?: InputMaybe<Scalars['Boolean']['input']>;
+  runtimeVersion?: InputMaybe<Scalars['String']['input']>;
+  updateId?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Input for removing a climb from a playlist. */
@@ -7493,6 +10999,8 @@ export type RemoveGymMemberInput = {
 
 export type RemoveSprayWallHoldsInput = {
   holdIds: Array<Scalars['Int']['input']>;
+  /** Require a writer that preserves climb links when existing holds are refined. Omit for older clients; when supplied, must be true. */
+  preserveClimbLinks?: InputMaybe<Scalars['Boolean']['input']>;
   versionId: Scalars['ID']['input'];
   wallUuid: Scalars['ID']['input'];
 };
@@ -7526,6 +11034,27 @@ export type ReorderPlaylistClimbInput = {
   playlistId: Scalars['ID']['input'];
 };
 
+export type ReportBoardInput = {
+  boardUuid: Scalars['ID']['input'];
+  /** For duplicate: the other board at the same gym that is the same wall. */
+  duplicateOfBoardUuid?: InputMaybe<Scalars['ID']['input']>;
+  /** Optional, trimmed, at most 500 characters. Required (10 or more characters) for other. */
+  note?: InputMaybe<Scalars['String']['input']>;
+  reason: BoardReportReason;
+  /**
+   * The setup the reporter says is right. Only with wrong_setup, and never on a
+   * spray wall. It must be a real setup of the board's type (a known layout,
+   * size and sets, and an angle the board type offers) and differ from the
+   * board's setup now; otherwise the report is refused with BAD_USER_INPUT and
+   * nothing is filed. The setup the board has now is refused with
+   * extensions.reason SETUP_UNCHANGED (isBoardSetupUnchangedError): the board
+   * may have been fixed since the client read it, so read it again. At a gym
+   * nobody runs (not RUN_BY_GYM) it changes the board for everyone straight away
+   * unless a limit sends it to review; see setupOutcome on the result.
+   */
+  suggestedSetup?: InputMaybe<BoardSetupInput>;
+};
+
 export type ReportClimbInput = {
   /** Required for grade reports; ignored for hide */
   angle?: InputMaybe<Scalars['Int']['input']>;
@@ -7536,6 +11065,7 @@ export type ReportClimbInput = {
   proposedGrade?: InputMaybe<Scalars['String']['input']>;
   /** Why you are reporting (10..500 chars) */
   reason: Scalars['String']['input'];
+  releaseContext?: InputMaybe<ReleaseContextInput>;
 };
 
 /** What a report asks for: hide the climb outright, or change its grade. */
@@ -7572,8 +11102,18 @@ export type ReportGymDuplicateResult = {
 
 export type ReportGymDuplicateStatus = 'already_reported' | 'reported';
 
+export type ReportGymInput = {
+  /** For duplicate: the other listing that is the same gym. */
+  duplicateOfGymUuid?: InputMaybe<Scalars['ID']['input']>;
+  gymUuid: Scalars['ID']['input'];
+  /** Optional, trimmed, at most 500 characters. Required (10 or more characters) for other. */
+  note?: InputMaybe<Scalars['String']['input']>;
+  reason: GymReportReason;
+};
+
 export type ReportSprayWallInput = {
   reason: SprayWallReportReason;
+  releaseContext?: InputMaybe<ReleaseContextInput>;
   wallUuid: Scalars['ID']['input'];
 };
 
@@ -7601,6 +11141,11 @@ export type RequestSprayWallDetectionInput = {
   wallUuid: Scalars['ID']['input'];
 };
 
+export type ResetSprayWallInput = {
+  /** The published, live wall to replace. */
+  wallUuid: Scalars['ID']['input'];
+};
+
 /**
  * Result of resolving a BLE serial that may map to several boards. Exactly one
  * of `board` / `candidates` is set: `board` when the serial is unambiguous
@@ -7613,6 +11158,19 @@ export type ResolveBoardResult = {
   board?: Maybe<ResolvedBoard>;
   /** Set when several boards share the serial and the user must choose */
   candidates?: Maybe<Array<BoardCandidate>>;
+};
+
+export type ResolveDirectoryReportInput = {
+  /** Passed on to the reporters. Optional, trimmed, at most 500 characters. */
+  note?: InputMaybe<Scalars['String']['input']>;
+  /**
+   * kept: the creator or gym staff (owner, admins) looked and it is right as it
+   * is. Global admins may also close a report as fixed, removed, deleted or
+   * merged once they have taken that action with the existing mutations;
+   * removed and deleted are checked against the board or gym.
+   */
+  outcome: DirectoryReportOutcome;
+  reportUuid: Scalars['ID']['input'];
 };
 
 export type ResolveProposalInput = {
@@ -7639,6 +11197,38 @@ export type ResolvedBoard = {
   setIds: Scalars['String']['output'];
   /** Size id */
   sizeId: Scalars['Int']['output'];
+};
+
+export type ResourcePrivacySettings = {
+  __typename?: 'ResourcePrivacySettings';
+  audience: PrivacyResourceAudience;
+  inheritFollowers: Scalars['Boolean']['output'];
+  kind: PrivacyResourceKind;
+  locationAudience: PrivacyLocationAudience;
+  ownerId?: Maybe<Scalars['ID']['output']>;
+  resourceId: Scalars['ID']['output'];
+  revision: Scalars['Int']['output'];
+};
+
+/** Input for taking back an approved gym claim (global admin only). */
+export type RevertGymClaimInput = {
+  /** The approved claim to take back (the id the admin queue and the daily digest use) */
+  claimId: Scalars['ID']['input'];
+  /** Why, for the ownership audit trail. Optional. */
+  reason?: InputMaybe<Scalars['String']['input']>;
+};
+
+/** What revertGymClaim did. */
+export type RevertGymClaimResult = {
+  __typename?: 'RevertGymClaimResult';
+  /** The reverted claim */
+  claimId: Scalars['ID']['output'];
+  /** The gym's name */
+  gymName: Scalars['String']['output'];
+  /** The gym, now unclaimed */
+  gymUuid: Scalars['ID']['output'];
+  /** Gym members and editors removed: the claimant's own row and everyone added since the claim */
+  removedMemberCount: Scalars['Int']['output'];
 };
 
 /** Input for an admin reviewing a pending gym claim. */
@@ -7690,13 +11280,13 @@ export type SaveClimbInput = {
   /** Matching disallowed. Wins over the legacy 'No match' description prefix; null or omitted falls back to that prefix and otherwise means false. */
   noMatch?: InputMaybe<Scalars['Boolean']['input']>;
   /**
-   * The spray wall climb this one was remixed from.
-   *
-   * Writes a `spray_climb_lineage` row alongside the child, which is what the
-   * child's screen reads to link back to the parent's ticks and grade history.
-   * Only meaningful for `boardType: "spray"`, and the parent has to be a climb
-   * on the SAME wall. The parent is kept even when it is no longer climbable —
-   * that is usually why it was remixed.
+   * Ignored. A published climb is public to everyone, so a climb has no audience. Kept so installed app builds that still send it are not rejected.
+   * @deprecated Climbs have no audience: a published climb is public to everyone. Ignored.
+   */
+  privacy?: InputMaybe<PrivacyPublicationInput>;
+  /**
+   * Accepted and ignored. Remix after a reset was retired, and no lineage is written.
+   * @deprecated Remix after a reset was retired. Accepted and ignored.
    */
   remixOfClimbUuid?: InputMaybe<Scalars['ID']['input']>;
   /** Physical board size the climb is set on. Required on Woods (1 = 8x10, 2 = 12x12), where the two walls number their holds from their own origins. Ignored on boards that derive size compatibility from the hold bounding box. */
@@ -7716,6 +11306,8 @@ export type SaveClimbInput = {
   sprayWallUuid?: InputMaybe<Scalars['String']['input']>;
   /** The setter's own grade, seeded into board_climb_stats.display_difficulty. REQUIRED to publish on a spray wall, which has no crowd grade to fall back on; ignored elsewhere, where the grade comes from ticks or the Aurora sync. */
   userGrade?: InputMaybe<Scalars['String']['input']>;
+  /** Optional stable client-generated climb UUID for idempotent offline replay. */
+  uuid?: InputMaybe<Scalars['ID']['input']>;
 };
 
 export type SaveClimbResult = {
@@ -7724,6 +11316,8 @@ export type SaveClimbResult = {
   createdAt?: Maybe<Scalars['String']['output']>;
   /** ISO timestamp of when the row was first published (null while still a draft) */
   publishedAt?: Maybe<Scalars['String']['output']>;
+  /** True when the UUID already existed and no fields were changed. */
+  replayed?: Maybe<Scalars['Boolean']['output']>;
   synced: Scalars['Boolean']['output'];
   uuid: Scalars['ID']['output'];
 };
@@ -7739,11 +11333,33 @@ export type SaveMoonBoardClimbInput = {
   /** MoonBoard method as a characteristic token. Omit for the 'feet follow hands' default. */
   method?: InputMaybe<MoonBoardMethod>;
   name: Scalars['String']['input'];
+  /**
+   * Ignored. A published climb is public to everyone, so a climb has no audience. Kept so installed app builds that still send it are not rejected.
+   * @deprecated Climbs have no audience: a published climb is public to everyone. Ignored.
+   */
+  privacy?: InputMaybe<PrivacyPublicationInput>;
   setter?: InputMaybe<Scalars['String']['input']>;
   userGrade?: InputMaybe<Scalars['String']['input']>;
 };
 
-/** Input for recording a climb attempt. */
+/**
+ * Save part of a wall's LED setup. A field left out (or null) keeps its stored
+ * value, so the settings and the layout save from separate code paths without
+ * overwriting each other.
+ */
+export type SaveSprayWallLedSetupInput = {
+  /** 0–255 minutes; 0 turns auto-off off. */
+  autoOffMinutes?: InputMaybe<Scalars['Int']['input']>;
+  boardUuid: Scalars['ID']['input'];
+  /** 1–255. */
+  brightness?: InputMaybe<Scalars['Int']['input']>;
+  controllerType?: InputMaybe<Scalars['String']['input']>;
+  /** Local HTTP address or stable WLED Bluetooth target matching controllerType. */
+  controllerUrl?: InputMaybe<Scalars['String']['input']>;
+  enabled?: InputMaybe<Scalars['Boolean']['input']>;
+  layout?: InputMaybe<Scalars['JSON']['input']>;
+};
+
 export type SaveTickInput = {
   /** Board angle */
   angle: Scalars['Int']['input'];
@@ -7755,6 +11371,8 @@ export type SaveTickInput = {
   boardType: Scalars['String']['input'];
   /** Specific board entity this tick is on, by uuid. When provided, takes precedence over (layoutId, sizeId, setIds) resolution and lets ticks attach to a board the climber doesn't own (e.g. a seeded gym board). */
   boardUuid?: InputMaybe<Scalars['String']['input']>;
+  /** Accepted and ignored: climb revisions were retired and a new tick stores none. Kept so a tick sent by an older app, or already queued offline, is not refused. No integer sent here fails the tick. */
+  climbRevision?: InputMaybe<Scalars['Int']['input']>;
   /** Climb UUID */
   climbUuid: Scalars['String']['input'];
   /** When the climb was attempted (ISO 8601) */
@@ -7769,8 +11387,10 @@ export type SaveTickInput = {
   isMirror: Scalars['Boolean']['input'];
   /** Layout ID for board resolution */
   layoutId?: InputMaybe<Scalars['Int']['input']>;
+  privacy?: InputMaybe<PrivacyPublicationInput>;
   /** Quality rating (1-5) */
   quality?: InputMaybe<Scalars['Int']['input']>;
+  reportingTime?: InputMaybe<TickReportingTimeInput>;
   /** Session ID if in a session */
   sessionId?: InputMaybe<Scalars['String']['input']>;
   /** Set IDs for board resolution */
@@ -7787,6 +11407,8 @@ export type SaveTickInput = {
 
 /** Input for searching boards. */
 export type SearchBoardsInput = {
+  /** Filter by the board's recorded angle (OR), including adjustable boards */
+  angles?: InputMaybe<Array<Scalars['Int']['input']>>;
   /** Filter by board type */
   boardType?: InputMaybe<Scalars['String']['input']>;
   /** Filter by board type (OR) — multi-select; composes with boardType if both are set */
@@ -7833,6 +11455,8 @@ export type SearchGymsInput = {
   query?: InputMaybe<Scalars['String']['input']>;
   /** Radius in km for proximity search (default 50) */
   radiusKm?: InputMaybe<Scalars['Float']['input']>;
+  /** Only gyms with valid geographic coordinates. Opt-in; excludes personal walls without a location. */
+  requireLocation?: InputMaybe<Scalars['Boolean']['input']>;
   /** Only gyms that have a URL slug, i.e. that can be linked to at /gym/[slug]. Opt-in: omitting it leaves the emitted SQL untouched for existing callers. */
   requireSlug?: InputMaybe<Scalars['Boolean']['input']>;
   /** Filter to gyms that have a board with one of these size ids (OR). Combined with boardTypes/layoutIds, all must match the same board. */
@@ -7872,6 +11496,12 @@ export type SearchUsersInput = {
   offset?: InputMaybe<Scalars['Int']['input']>;
   /** Search query (min 2 characters) */
   query: Scalars['String']['input'];
+};
+
+export type SendAppBugReportMessageInput = {
+  body: Scalars['String']['input'];
+  clientMutationId: Scalars['String']['input'];
+  reportId: Scalars['ID']['input'];
 };
 
 export type SendDeviceLogsInput = {
@@ -8000,6 +11630,8 @@ export type SessionDetailTick = {
   boardseshConfidence?: Maybe<Scalars['String']['output']>;
   /** Boardsesh grade on the shared difficulty scale for this tick's climb at its angle. Null when no grade row exists. Use boardseshConfidence to distinguish trusted, setter-only, and projected values. */
   boardseshDifficulty?: Maybe<Scalars['Float']['output']>;
+  /** Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod). */
+  characteristics?: Maybe<Array<Scalars['String']['output']>>;
   climbName?: Maybe<Scalars['String']['output']>;
   climbUuid: Scalars['String']['output'];
   climbedAt: Scalars['String']['output'];
@@ -8040,6 +11672,7 @@ export type SessionEvent =
   | SessionBoardSerialChanged
   | SessionEnded
   | SessionNameChanged
+  | SessionRestCadenceChanged
   | SessionRosterSnapshot
   | SessionStatsUpdated
   | UserJoined
@@ -8114,6 +11747,8 @@ export type SessionFeedTickHighlight = {
   boardseshConfidence?: Maybe<Scalars['String']['output']>;
   /** Boardsesh grade on the shared difficulty scale for this tick's climb at its angle. Null when no grade row exists. Use boardseshConfidence to distinguish trusted, setter-only, and projected values. */
   boardseshDifficulty?: Maybe<Scalars['Float']['output']>;
+  /** Structured climb characteristics (e.g. 'no_match', 'method_footless'). Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod). */
+  characteristics?: Maybe<Array<Scalars['String']['output']>>;
   climbName?: Maybe<Scalars['String']['output']>;
   climbUuid: Scalars['String']['output'];
   climbedAt: Scalars['String']['output'];
@@ -8262,7 +11897,176 @@ export type SessionParticipant = {
   /** Total sends (flash + send) */
   sends: Scalars['Int']['output'];
   /** User ID */
-  userId: Scalars['String']['output'];
+  userId?: Maybe<Scalars['String']['output']>;
+};
+
+/**
+ * The session's shared rest clock (#5382): one cadence every crew member's
+ * rest timer follows, so the phone holding the board can advance the wall for
+ * everyone. All instants are server epoch milliseconds as decimal strings,
+ * stamped by the backend; clients convert them with the offset they derive
+ * from `SessionRestCadenceChanged.serverNow`.
+ *
+ * `mode` and `advanceOn` are open strings: a client that does not recognise
+ * a value must treat the clock as unsupported and never fire on it.
+ */
+export type SessionRestCadence = {
+  __typename?: 'SessionRestCadence';
+  /** 'deadline' (advance when the rest runs out), 'tick' (only after a tick on the current climb) or 'send' (only after a flash or send on it) */
+  advanceOn: Scalars['String']['output'];
+  /** Server epoch ms the current cycle counts from, or null while the clock waits for a tick */
+  anchorAt?: Maybe<Scalars['String']['output']>;
+  /** Whether the board holder advances the wall when the rest runs out */
+  autoAdvance: Scalars['Boolean']['output'];
+  /**
+   * True while the clock may advance the wall one more time only: the FIRE that
+   * applies turns autoAdvance off and this back to false in the same write, so
+   * the wall waits until a CONFIGURE turns auto-advance on again. This backend
+   * always sends true or false; treat null (an event from an older instance) as
+   * false.
+   */
+  autoAdvanceOnce?: Maybe<Scalars['Boolean']['output']>;
+  /** False while paused */
+  isRunning: Scalars['Boolean']['output'];
+  /** Server epoch ms of the last beat an auto-advance fired on, so no beat fires twice */
+  lastFiredBeatAt?: Maybe<Scalars['String']['output']>;
+  /** Queue item the last tick was logged against, or null when it was not the current queue item */
+  lastTickQueueItemUuid?: Maybe<Scalars['ID']['output']>;
+  /** 'flash', 'send' or 'attempt' for the last tick, or null when there is none since the last advance */
+  lastTickStatus?: Maybe<Scalars['String']['output']>;
+  /** 'afterTick' (count from the last tick) or 'onTheMinute' (a fixed beat) */
+  mode: Scalars['String']['output'];
+  /** Frozen elapsed seconds while paused; 0 while running */
+  pausedElapsedSeconds: Scalars['Int']['output'];
+  /** Session participant id (the same id as SessionUser.id) of the member who last armed or configured the clock */
+  setByParticipantId?: Maybe<Scalars['ID']['output']>;
+  /** 'settings' (someone's rest timer settings) or 'stage' (a workout stage's pacing) */
+  source: Scalars['String']['output'];
+  /** Rest length in seconds, or null when the length is Off (count up). afterTick 0..3600, onTheMinute 15..3600. */
+  targetSeconds?: Maybe<Scalars['Int']['output']>;
+  /** Opaque correlation for a tick acceptance, if supplied by the sender. */
+  tickAcceptanceId?: Maybe<Scalars['String']['output']>;
+  /** When a qualifying workout tick was accepted, server epoch milliseconds. */
+  tickAcceptedAt?: Maybe<Scalars['String']['output']>;
+};
+
+/** What a `setSessionRestCadence` call does to the session's shared rest clock. */
+export type SessionRestCadenceAction =
+  /** Turn the crew clock on with a config. Replaces any clock already there. */
+  | 'ARM'
+  /** Replace the config of an armed clock (a settings edit, or a workout stage boundary). */
+  | 'CONFIGURE'
+  /** Turn the crew clock off. The stored state becomes null. */
+  | 'DISARM'
+  /**
+   * The board holder's auto-advance fired. Compare-and-set: expectedRevision is
+   * required. Applies once per beat: only when the stored clock's latest due
+   * beat (counted from 2 s before it) is later than lastFiredBeatAt. On a
+   * clock with autoAdvanceOnce, the FIRE that applies also turns autoAdvance
+   * off.
+   */
+  | 'FIRE'
+  /** Freeze the clock at pausedElapsedSeconds. */
+  | 'PAUSE'
+  /** Back to zero: a running clock restarts now, a paused one waits for a tick. */
+  | 'RESET'
+  /** Restart a paused clock from its frozen elapsed. */
+  | 'RESUME'
+  /** A climber logged a tick: records it, and re-anchors an afterTick clock. */
+  | 'TICK';
+
+/** Where a CONFIGURE puts the clock's anchor. */
+export type SessionRestCadenceAnchor =
+  /** Clear the anchor, so the clock waits for the next tick (a tick/send stage boundary). */
+  | 'CLEAR'
+  /** Leave the anchor where it is (the default). */
+  | 'KEEP'
+  /** Anchor at server now minus elapsedMs (an onTheMinute stage boundary). */
+  | 'NOW';
+
+/**
+ * The session's shared rest clock changed, or the subscribe seed. Yielded once
+ * right after `SessionRosterSnapshot` on every `sessionUpdates` subscribe
+ * (`isSnapshot: true`, even when the clock is off), then on every applied
+ * `setSessionRestCadence` call. Clients drop an event whose `revision` is at
+ * or below the one they hold, except a snapshot, which replaces their state
+ * and resets that floor.
+ *
+ * Additive: a client whose `sessionUpdates` document lacks the
+ * `... on SessionRestCadenceChanged` fragment receives only the
+ * `__typename` and drops it.
+ */
+export type SessionRestCadenceChanged = {
+  __typename?: 'SessionRestCadenceChanged';
+  /** The action that produced this revision, or null on the seed and on a call that did not apply */
+  action?: Maybe<SessionRestCadenceAction>;
+  /** True only on the subscribe seed: replace local state and reset the revision floor */
+  isSnapshot: Scalars['Boolean']['output'];
+  /** The clock, or null when it is off */
+  restCadence?: Maybe<SessionRestCadence>;
+  /** Monotonic per session. 0 means the clock was never set (or its state expired). */
+  revision: Scalars['Int']['output'];
+  /** Server epoch ms when the delivering backend instance sent this event */
+  serverNow: Scalars['String']['output'];
+};
+
+/** A rest clock config: everything a client's effective rest pacing resolves to. */
+export type SessionRestCadenceConfigInput = {
+  /** 'deadline', 'tick' or 'send' */
+  advanceOn: Scalars['String']['input'];
+  autoAdvance: Scalars['Boolean']['input'];
+  /**
+   * True: advance the wall once, then switch auto-advance off until a
+   * CONFIGURE turns it back on (a 4x4 set's rest after its last rep). Omitted
+   * or null means false: auto-advance stays on after every advance. ARM and
+   * CONFIGURE store it as sent, so a CONFIGURE without it clears it.
+   */
+  autoAdvanceOnce?: InputMaybe<Scalars['Boolean']['input']>;
+  /** 'afterTick' or 'onTheMinute' */
+  mode: Scalars['String']['input'];
+  /** 'settings' or 'stage' */
+  source: Scalars['String']['input'];
+  /** Rest length in seconds, or null for Off. afterTick 0..3600, onTheMinute 15..3600. */
+  targetSeconds?: InputMaybe<Scalars['Int']['input']>;
+};
+
+/**
+ * Input for `setSessionRestCadence`. Each action reads only the fields it
+ * needs and ignores the rest; see SessionRestCadenceAction.
+ */
+export type SessionRestCadenceInput = {
+  action: SessionRestCadenceAction;
+  /** CONFIGURE only. Defaults to KEEP. */
+  anchor?: InputMaybe<SessionRestCadenceAnchor>;
+  /** Required for ARM and CONFIGURE, ignored otherwise */
+  config?: InputMaybe<SessionRestCadenceConfigInput>;
+  /**
+   * Milliseconds already elapsed in the cycle when the client sent the call,
+   * 0..14400000. ARM and CONFIGURE with anchor NOW anchor at server now minus
+   * this. On TICK it is the tick's own age, from its climbedAt, capped at
+   * 14400000 by the client: over 60000 the tick is history and never earns an
+   * advance. Omitted means 0, except on ARM, where an omitted value leaves the
+   * clock waiting for a tick.
+   */
+  elapsedMs?: InputMaybe<Scalars['Int']['input']>;
+  /**
+   * Compare-and-set. When present, the call applies only if the stored
+   * revision still equals it. FIRE requires it, so two phones can never both
+   * advance the wall on one beat.
+   */
+  expectedRevision?: InputMaybe<Scalars['Int']['input']>;
+  /** FIRE only, and ignored: the server takes the beat from the stored clock and its own time. */
+  firedBeatAgoMs?: InputMaybe<Scalars['Int']['input']>;
+  /** RESET only: restart running (true) or wait paused for a tick (false). Defaults to the stored state. */
+  isRunning?: InputMaybe<Scalars['Boolean']['input']>;
+  /** PAUSE only: the frozen elapsed, 0..14400. Defaults to the elapsed the server computes from its anchor. */
+  pausedElapsedSeconds?: InputMaybe<Scalars['Int']['input']>;
+  tickAcceptanceId?: InputMaybe<Scalars['String']['input']>;
+  /** TICK only: the queue item the tick was logged against, when it was the current queue item. Without one the tick keeps the last tick. */
+  tickAgeAtLogMs?: InputMaybe<Scalars['Int']['input']>;
+  tickQueueItemUuid?: InputMaybe<Scalars['ID']['input']>;
+  /** TICK only (required): 'flash', 'send' or 'attempt' */
+  tickStatus?: InputMaybe<Scalars['String']['input']>;
 };
 
 /**
@@ -8381,6 +12185,156 @@ export type SessionUser = {
   username: Scalars['String']['output'];
 };
 
+export type SessionWorkout = {
+  __typename?: 'SessionWorkout';
+  avatarUrl?: Maybe<Scalars['String']['output']>;
+  displayName?: Maybe<Scalars['String']['output']>;
+  /** The climber's ticks in the session that match no climb of the workout. */
+  offPlan: Scalars['Int']['output'];
+  /** The climber's ticks behind offPlan that the viewer may see. */
+  offPlanTickUuids: Array<Scalars['ID']['output']>;
+  stages: Array<SessionWorkoutStage>;
+  updatedAt: Scalars['String']['output'];
+  userId: Scalars['ID']['output'];
+};
+
+export type SessionWorkoutClimb = {
+  __typename?: 'SessionWorkoutClimb';
+  angle: Scalars['Int']['output'];
+  boardType?: Maybe<Scalars['String']['output']>;
+  climbUuid: Scalars['String']['output'];
+  frames?: Maybe<Scalars['String']['output']>;
+  /** Display grade: the climber's own when they logged it, else the consensus at this angle. */
+  grade?: Maybe<Scalars['String']['output']>;
+  isMirror?: Maybe<Scalars['Boolean']['output']>;
+  layoutId?: Maybe<Scalars['Int']['output']>;
+  name?: Maybe<Scalars['String']['output']>;
+  queueItemUuid: Scalars['ID']['output'];
+  renderBoard?: Maybe<RenderBoardConfig>;
+  /** One per tick on this climb, in tick order. */
+  reps: Array<SessionWorkoutRepOutcome>;
+  /** True when the climber logged nothing on it. */
+  skipped: Scalars['Boolean']['output'];
+  /** The ticks behind reps, same order: only ticks the viewer may see, so a client can group the session's ticks by block. */
+  tickUuids: Array<Scalars['ID']['output']>;
+};
+
+/** One line for a feed card: the main block, the second for 'A + B', how many more. */
+export type SessionWorkoutHeadline = {
+  __typename?: 'SessionWorkoutHeadline';
+  /** Every block, warm-ups and cool-downs included. */
+  blockCount: Scalars['Int']['output'];
+  /** Main blocks after the first. */
+  extraMainBlocks: Scalars['Int']['output'];
+  mainKind?: Maybe<Scalars['String']['output']>;
+  /** Board whose grade scale mainTargetGrade is on. Null exactly when mainTargetGrade is. */
+  mainTargetBoardType?: Maybe<Scalars['String']['output']>;
+  /** Display grade name of the main block's target grade. */
+  mainTargetGrade?: Maybe<Scalars['String']['output']>;
+  secondMainKind?: Maybe<Scalars['String']['output']>;
+  sessionId: Scalars['ID']['output'];
+  userId: Scalars['ID']['output'];
+};
+
+/** One queued climb of a workout block, captured when the run is written. */
+export type SessionWorkoutItemInput = {
+  angle: Scalars['Int']['input'];
+  climbUuid: Scalars['String']['input'];
+  isMirror?: InputMaybe<Scalars['Boolean']['input']>;
+  position?: InputMaybe<Scalars['Int']['input']>;
+  queueItemUuid: Scalars['ID']['input'];
+};
+
+/** A timed block's pacing. 4x4 adds repsPerSet and restBetweenSetsSeconds. */
+export type SessionWorkoutPacingInput = {
+  advanceOn?: InputMaybe<Scalars['String']['input']>;
+  climbsPerRound?: InputMaybe<Scalars['Int']['input']>;
+  /** onTheMinute or afterTick. */
+  mode: Scalars['String']['input'];
+  repsPerSet?: InputMaybe<Scalars['Int']['input']>;
+  restBetweenRoundsSeconds?: InputMaybe<Scalars['Int']['input']>;
+  restBetweenSetsSeconds?: InputMaybe<Scalars['Int']['input']>;
+  restSeconds: Scalars['Int']['input'];
+  roundCount?: InputMaybe<Scalars['Int']['input']>;
+};
+
+/** How one rep or climb of a workout ended. */
+export type SessionWorkoutRepOutcome = 'ATTEMPT' | 'FLASH' | 'SEND';
+
+export type SessionWorkoutStage = {
+  __typename?: 'SessionWorkoutStage';
+  climbs: Array<SessionWorkoutClimb>;
+  id: Scalars['ID']['output'];
+  /** On the minute: the interval. */
+  intervalSeconds?: Maybe<Scalars['Int']['output']>;
+  isCoolDown: Scalars['Boolean']['output'];
+  kind: Scalars['String']['output'];
+  /** A 4x4: reps per climb. */
+  repsPerSet?: Maybe<Scalars['Int']['output']>;
+  /** A paced block's rest after each tick (a 4x4: between reps). */
+  restSeconds?: Maybe<Scalars['Int']['output']>;
+  /** A 4x4: one set per climb. */
+  sets?: Maybe<Scalars['Int']['output']>;
+  tally: SessionWorkoutTally;
+  /** Display grade name of the block's target grade. */
+  targetGrade?: Maybe<Scalars['String']['output']>;
+};
+
+export type SessionWorkoutStageInput = {
+  coolDown?: InputMaybe<Scalars['Boolean']['input']>;
+  /** The run stage's id (a uuid). */
+  id: Scalars['ID']['input'];
+  items: Array<SessionWorkoutItemInput>;
+  /** A workout stage kind (warmUp, volume, fourByFour, ...). Any string, so a newer kind survives. */
+  kind: Scalars['String']['input'];
+  pacing?: InputMaybe<SessionWorkoutPacingInput>;
+  /** Difficulty id the block was built around. */
+  targetGrade?: InputMaybe<Scalars['Int']['input']>;
+};
+
+/** Counts in ticks, the unit the session totals use. */
+export type SessionWorkoutTally = {
+  __typename?: 'SessionWorkoutTally';
+  /** Attempt ticks. */
+  attempts: Scalars['Int']['output'];
+  /** Climbs in the block. */
+  climbs: Scalars['Int']['output'];
+  /** Flash and send ticks. */
+  sent: Scalars['Int']['output'];
+  /** Climbs of the block with no tick. */
+  skipped: Scalars['Int']['output'];
+};
+
+/** Which queue item a tick was logged on. */
+export type SessionWorkoutTickInput = {
+  queueItemUuid: Scalars['ID']['input'];
+  tickUuid: Scalars['ID']['input'];
+};
+
+export type SetAnalyticsConsentInput = {
+  /** granted or denied. */
+  analytics: Scalars['String']['input'];
+  /**
+   * The decidedAt of the account answer this client last saw, or null when it saw
+   * none. A grant must echo the exact current server stamp; a different stamp
+   * returns the current answer without writing. With null, an existing grant
+   * may be recorded again but an existing denial wins. A denial is always written
+   * unless conditional is true.
+   */
+  basedOnDecidedAt?: InputMaybe<Scalars['String']['input']>;
+  /**
+   * True for a write the client recovered rather than one the climber just made:
+   * it is written, grant or denial, only while the account still holds exactly
+   * basedOnDecidedAt (no answer when null); otherwise the current answer comes
+   * back and nothing is written. Omitted or false keeps a denial unconditional.
+   */
+  conditional?: InputMaybe<Scalars['Boolean']['input']>;
+  /** web, ios or android. */
+  source: Scalars['String']['input'];
+  /** The CONSENT_VERSION the client asked under. A positive integer. */
+  version: Scalars['Int']['input'];
+};
+
 export type SetCommunitySettingInput = {
   key: Scalars['String']['input'];
   scope: Scalars['String']['input'];
@@ -8388,8 +12342,71 @@ export type SetCommunitySettingInput = {
   value: Scalars['String']['input'];
 };
 
+export type SetContentAudienceInput = {
+  audience: PrivacyAudience;
+  entityId: Scalars['ID']['input'];
+  entityType: PrivacyContentType;
+  privacyRevision: Scalars['Int']['input'];
+};
+
+export type SetGymGradeCollectionInput = {
+  boardUuid: Scalars['ID']['input'];
+  gymUuid: Scalars['ID']['input'];
+  playlistUuid?: InputMaybe<Scalars['ID']['input']>;
+};
+
+export type SetGymReportingBoardAliasInput = {
+  boardUuid: Scalars['ID']['input'];
+  gymUuid: Scalars['ID']['input'];
+  /** The verified physical board root. Null removes the existing relationship. */
+  rootBoardUuid?: InputMaybe<Scalars['ID']['input']>;
+};
+
+export type SetGymReportingTimeZoneInput = {
+  gymUuid: Scalars['ID']['input'];
+  /** A valid IANA zone, or null to clear the setting. */
+  timeZone?: InputMaybe<Scalars['String']['input']>;
+};
+
+/** Result of `setSessionRestCadence`. */
+export type SetSessionRestCadencePayload = {
+  __typename?: 'SetSessionRestCadencePayload';
+  /**
+   * True when this call wrote a new revision (and every member was sent it).
+   * False when the revision check failed, the action did not apply to the
+   * stored state (for example PAUSE on a paused clock), or nothing changed.
+   * A FIRE that comes back false must not advance the wall.
+   */
+  applied: Scalars['Boolean']['output'];
+  /** The stored clock after this call: adopt it whether or not the call applied */
+  change: SessionRestCadenceChanged;
+};
+
+export type SetSprayTrainingReviewInput = {
+  /** At most 500 characters. */
+  notes?: InputMaybe<Scalars['String']['input']>;
+  /** Required with REJECTED, refused otherwise. */
+  reason?: InputMaybe<SprayTrainingRejectReason>;
+  /** UNREVIEWED clears the verdict. */
+  status: SprayTrainingReviewStatus;
+  versionId: Scalars['ID']['input'];
+};
+
 export type SetSprayWallHiddenInput = {
   hidden: Scalars['Boolean']['input'];
+  uuid: Scalars['ID']['input'];
+};
+
+export type SetSprayWallRenderSettingsInput = {
+  /**
+   * Required: always send the key. A { mode, boardsesh } blob sets the wall's
+   * stored default; an explicit null clears it. Omitting the key is rejected
+   * rather than read as "leave it alone" — this mutation only ever sets or clears.
+   *
+   * Declared nullable (not JSON!) because a non-null scalar could not carry the
+   * null that clears it.
+   */
+  renderSettings?: InputMaybe<Scalars['JSON']['input']>;
   uuid: Scalars['ID']['input'];
 };
 
@@ -8493,6 +12510,8 @@ export type SetterProfile = {
   linkedUserDisplayName?: Maybe<Scalars['String']['output']>;
   /** Linked Boardsesh user ID (if setter has a Boardsesh account) */
   linkedUserId?: Maybe<Scalars['ID']['output']>;
+  /** Sends across this setter's listable climbs, summing each climb's best angle so a climber who sent it at two angles counts once. Includes imported Aurora ascents. */
+  totalAscents: Scalars['Int']['output'];
   /** The setter's Aurora username */
   username: Scalars['String']['output'];
 };
@@ -8514,6 +12533,17 @@ export type SetterSearchResult = {
   isFollowedByMe: Scalars['Boolean']['output'];
   /** The setter's Aurora username */
   username: Scalars['String']['output'];
+};
+
+/** The persisted setters sitemap summary, or the previous summary when skipped. */
+export type SetterSitemapSummaryRefreshResult = {
+  __typename?: 'SetterSitemapSummaryRefreshResult';
+  computedAt?: Maybe<Scalars['String']['output']>;
+  itemCount?: Maybe<Scalars['Int']['output']>;
+  lastModified?: Maybe<Scalars['String']['output']>;
+  refreshed: Scalars['Boolean']['output'];
+  /** fresh or locked; null when the summary was refreshed. */
+  skipped?: Maybe<Scalars['String']['output']>;
 };
 
 /**
@@ -8583,6 +12613,8 @@ export type SimilarClimb = {
   name?: Maybe<Scalars['String']['output']>;
   /** Average quality at this angle on the canonical 1-5 scale (board_climb_stats.quality_average). */
   qualityAverage?: Maybe<Scalars['Float']['output']>;
+  /** Hold-set IDs required by the climb, derived from its frame placements. Null means unknown; an empty list requires no sets. */
+  requiredSetIds?: Maybe<Array<Scalars['Int']['output']>>;
   setterUsername?: Maybe<Scalars['String']['output']>;
   /** Number of hold positions present in both climbs. */
   sharedHoldCount: Scalars['Int']['output'];
@@ -8638,6 +12670,13 @@ export type SimilarGym = {
   __typename?: 'SimilarGym';
   /** Physical address */
   address?: Maybe<Scalars['String']['output']>;
+  /**
+   * Whether this gym's website can drive the self-service email claim: a real
+   * (non-free-provider) domain that the gym's OWNER put on the listing. Mirrors
+   * the two refusals in requestGymClaim. Answers a different question from
+   * isClaimable, which is about the viewer's standing, not the website.
+   */
+  canClaimByDomain: Scalars['Boolean']['output'];
   /** Distance in metres from the supplied coordinates; null when no coordinates were given. */
   distanceMeters?: Maybe<Scalars['Float']['output']>;
   /** Whether the current viewer can start an ownership claim for this gym. */
@@ -8668,7 +12707,7 @@ export type SmartPlaylistCount = {
 /** Metadata about a smart playlist (the user it belongs to + counts). */
 export type SmartPlaylistMeta = {
   __typename?: 'SmartPlaylistMeta';
-  /** Total number of climbs in the playlist */
+  /** Total number of climbs in the playlist. Under a view, read it from page 0: there it is the climbs the list shows with no view filter applied; a later page of a filtering view carries the filtered count. */
   climbCount: Scalars['Int']['output'];
   /** Smart playlist type */
   type: SmartPlaylistType;
@@ -8689,13 +12728,18 @@ export type SmartPlaylistResult = {
   hasMore: Scalars['Boolean']['output'];
   /** Playlist metadata */
   meta: SmartPlaylistMeta;
-  /** Total number of climbs (matches meta.climbCount) */
+  /** Total number of climbs. Under a view, the climbs that match its filters. */
   totalCount: Scalars['Int']['output'];
+  /** Climbs the playlist shows with no view filter applied. Set on page 0 of a view that carries a filter; null otherwise (a sort alone, and later pages). */
+  unfilteredCount?: Maybe<Scalars['Int']['output']>;
 };
 
 /**
  * A computed playlist generated from a user's logbook or favourites, or a
  * recommendation computed from the catalog for the user's board.
+ * CREATED_CLIMBS is the owner's published work, including linked setter
+ * accounts, and is private to that owner. It supports board geometry scoping
+ * for playback but does not accept a sort/filter view.
  *
  * Logbook-derived:
  * - FIVE_STARS: climbs the user has rated 5/5
@@ -8711,6 +12755,7 @@ export type SmartPlaylistResult = {
  * - RECOMMENDED_FRESH: recently set climbs, weighted toward popular setters
  */
 export type SmartPlaylistType =
+  | 'CREATED_CLIMBS'
   | 'FIVE_STARS'
   | 'LIKED_CLIMBS'
   | 'MOST_REPEATED'
@@ -8732,6 +12777,12 @@ export type SocialEntityType =
 
 export type SortMode = 'controversial' | 'hot' | 'new' | 'top';
 
+/**
+ * Retired. A published spray climb follows the rule every board follows: only
+ * its setter edits it, within 24 hours of first publish. Every wall reads SETTER.
+ */
+export type SprayClimbEditPolicy = 'COLLABORATORS' | 'SETTER';
+
 export type SprayDetectionCandidate = {
   __typename?: 'SprayDetectionCandidate';
   confidence: Scalars['Float']['output'];
@@ -8748,16 +12799,24 @@ export type SprayDetectionResult = {
   width: Scalars['Int']['output'];
 };
 
+/**
+ * What the climber did with a detector suggestion before saving it as an AUTO
+ * hold. Ranked ACCEPTED < CONFIRMED < EDITED; a hold never moves down.
+ */
+export type SprayHoldAutoReview =
+  /** Kept as found, through accept-defaults or keep-maybes. */
+  | 'ACCEPTED'
+  /** A maybe the climber switched on by itself. */
+  | 'CONFIRMED'
+  /** Its shape changed after the detector drew it. The server also sets this whenever an AUTO hold's geometry moves. */
+  | 'EDITED';
+
 /** Where a hold's geometry came from: a detector run, or a human's hand. */
 export type SprayHoldSource = 'AUTO' | 'MANUAL';
 
 /**
- * A remix starting point: the parent climb with every hold it has since lost
- * stripped out of its frames.
- *
- * Nothing is written by asking for one. Pass `parentUuid` back as
- * `SaveClimbInput.remixOfClimbUuid` and the lineage row is written with the
- * child.
+ * A remix starting point. Retired with `remixClimb`, which now always returns
+ * null; kept so older apps' documents still validate.
  */
 export type SprayRemixSeed = {
   __typename?: 'SprayRemixSeed';
@@ -8790,13 +12849,201 @@ export type SprayRemixSeed = {
 };
 
 /**
+ * One suggestion, in photo pixels, from the detector run the version is judged
+ * against: the finished run on its photo that the most of its holds point back
+ * at, or the newest finished run on that photo when no hold points at any.
+ */
+export type SprayTrainingCandidate = {
+  __typename?: 'SprayTrainingCandidate';
+  confidence: Scalars['Float']['output'];
+  cx: Scalars['Float']['output'];
+  cy: Scalars['Float']['output'];
+  fate: SprayTrainingCandidateFate;
+  /** Index into the run's result.candidates. */
+  index: Scalars['Int']['output'];
+  /** Flat ring in units of r relative to the centre, as the detector sent it. */
+  outline?: Maybe<Array<Scalars['Float']['output']>>;
+  r: Scalars['Float']['output'];
+};
+
+/**
+ * What happened to one detector suggestion.
+ *
+ * KEPT: a saved hold came from it and its shape was not changed. EDITED: a saved
+ * hold came from it and the climber changed its shape. DELETED: the editor
+ * showed it and no saved hold came from it. NOT_SHOWN: it scored below the
+ * editor's floor, so the climber never saw it. UNKNOWN: no hold on the version
+ * records where it came from (it was saved by an app that predates provenance),
+ * so kept and deleted cannot be told apart.
+ */
+export type SprayTrainingCandidateFate = 'DELETED' | 'EDITED' | 'KEPT' | 'NOT_SHOWN' | 'UNKNOWN';
+
+/** What one export run did. */
+export type SprayTrainingExportResult = {
+  __typename?: 'SprayTrainingExportResult';
+  durationMs: Scalars['Int']['output'];
+  /** The export written on this run, or null when nothing changed or nothing is approved. */
+  exportId?: Maybe<Scalars['String']['output']>;
+  /**
+   * Stored exports deleted on this run: any holding a version that is no longer
+   * eligible and approved, any whose manifest is missing (a run that died
+   * before writing it) or cannot be parsed, and any that fell out of the newest
+   * two.
+   */
+  exportsRetired: Scalars['Int']['output'];
+  imagesWritten: Scalars['Int']['output'];
+  /** True when nothing was written; skippedReason says why. */
+  skipped: Scalars['Boolean']['output'];
+  skippedReason?: Maybe<SprayTrainingExportSkipReason>;
+  /** Approved, eligible versions left out of this export: holds that do not project onto the photo, no holds, or an unreadable photo. */
+  versionsSkipped: Scalars['Int']['output'];
+};
+
+/** Why an export run wrote nothing. */
+export type SprayTrainingExportSkipReason =
+  /** Another run holds the export lease. The scheduler job reports this as a failure. */
+  | 'LOCKED'
+  /** Nothing is approved and eligible, or nothing approved could be exported. */
+  | 'NOTHING_TO_EXPORT'
+  /** The approved, eligible set matches the newest export. */
+  | 'UNCHANGED';
+
+/** One saved hold, projected into the version's PHOTO pixels. */
+export type SprayTrainingHold = {
+  __typename?: 'SprayTrainingHold';
+  autoReview?: Maybe<SprayHoldAutoReview>;
+  confidence?: Maybe<Scalars['Float']['output']>;
+  cx: Scalars['Float']['output'];
+  cy: Scalars['Float']['output'];
+  id: Scalars['Int']['output'];
+  /** Flat implicitly-closed ring in units of THIS (projected) radius, relative to the centre. Null draws the circle. */
+  outline?: Maybe<Array<Scalars['Float']['output']>>;
+  r: Scalars['Float']['output'];
+  source: SprayHoldSource;
+};
+
+export type SprayTrainingQueue = {
+  __typename?: 'SprayTrainingQueue';
+  hasMore: Scalars['Boolean']['output'];
+  items: Array<SprayTrainingQueueItem>;
+  /** Eligible versions per status, over the whole queue rather than this page. */
+  totals: SprayTrainingTotals;
+};
+
+/**
+ * One wall version in the vetting queue. Carries no owner name and no wall name:
+ * the reviewer judges the photo and the holds, not the person.
+ */
+export type SprayTrainingQueueItem = {
+  __typename?: 'SprayTrainingQueueItem';
+  candidates: Array<SprayTrainingCandidate>;
+  createdAt: Scalars['String']['output'];
+  /** Model version of the detector run candidates come from, or null when the version has none. */
+  detectionModelVersion?: Maybe<Scalars['String']['output']>;
+  /** Alive holds of this version in photo pixels. */
+  holds: Array<SprayTrainingHold>;
+  /** Admin-only presigned photo; re-query after photo.expiresAt. Null when it cannot be signed. */
+  photo?: Maybe<SprayWallPhoto>;
+  photoHeight?: Maybe<Scalars['Int']['output']>;
+  photoWidth?: Maybe<Scalars['Int']['output']>;
+  publishedAt?: Maybe<Scalars['String']['output']>;
+  review: SprayTrainingReview;
+  stats: SprayTrainingStats;
+  /**
+   * Holds whose canonical position does not project onto the photo, so they are
+   * not in holds. A version with any is left out of the export even when
+   * approved: a real hold missing from the labels would be learned as background.
+   */
+  unmappableHoldCount: Scalars['Int']['output'];
+  versionId: Scalars['ID']['output'];
+  versionNumber: Scalars['Int']['output'];
+  visibility: SprayTrainingWallVisibility;
+  wallUuid: Scalars['ID']['output'];
+};
+
+/** Why a version was kept out of the training set. A closed set; notes carry anything else. */
+export type SprayTrainingRejectReason =
+  /** Holds are drawn in the wrong place or the wrong shape. */
+  | 'BAD_HOLDS'
+  /** The same wall and photo is already in the set. */
+  | 'DUPLICATE'
+  /** Real holds on the wall were never marked. */
+  | 'MISSING_HOLDS'
+  /** Not a climbing wall. */
+  | 'NOT_A_WALL'
+  | 'OTHER'
+  /** A person, a face, an address or documents are in the frame. */
+  | 'PEOPLE_OR_PERSONAL_INFO'
+  /** Blurred, dark, cropped or too angled to learn from. */
+  | 'PHOTO_QUALITY';
+
+export type SprayTrainingReview = {
+  __typename?: 'SprayTrainingReview';
+  notes?: Maybe<Scalars['String']['output']>;
+  reason?: Maybe<SprayTrainingRejectReason>;
+  reviewedAt?: Maybe<Scalars['String']['output']>;
+  status: SprayTrainingReviewStatus;
+};
+
+export type SprayTrainingReviewResult = {
+  __typename?: 'SprayTrainingReviewResult';
+  review: SprayTrainingReview;
+  versionId: Scalars['ID']['output'];
+};
+
+/** An admin's verdict on one wall version as training data. UNREVIEWED is the absence of one. */
+export type SprayTrainingReviewStatus = 'APPROVED' | 'REJECTED' | 'UNREVIEWED';
+
+export type SprayTrainingStats = {
+  __typename?: 'SprayTrainingStats';
+  /** AUTO holds kept as found (accept-defaults or keep-maybes). */
+  acceptedHoldCount: Scalars['Int']['output'];
+  autoHoldCount: Scalars['Int']['output'];
+  candidateCount: Scalars['Int']['output'];
+  /** AUTO holds the climber switched on one at a time. */
+  confirmedHoldCount: Scalars['Int']['output'];
+  deletedCandidateCount: Scalars['Int']['output'];
+  editedCandidateCount: Scalars['Int']['output'];
+  /** AUTO holds whose shape the climber changed. */
+  editedHoldCount: Scalars['Int']['output'];
+  holdCount: Scalars['Int']['output'];
+  keptCandidateCount: Scalars['Int']['output'];
+  manualHoldCount: Scalars['Int']['output'];
+  notShownCandidateCount: Scalars['Int']['output'];
+};
+
+export type SprayTrainingTotals = {
+  __typename?: 'SprayTrainingTotals';
+  approved: Scalars['Int']['output'];
+  rejected: Scalars['Int']['output'];
+  unreviewed: Scalars['Int']['output'];
+};
+
+/** Who can see the wall a version belongs to. */
+export type SprayTrainingWallVisibility = 'PRIVATE' | 'PUBLIC' | 'UNLISTED';
+
+/**
  * A climber's own wall: one runtime-created catalogue layout under the `spray`
  * board type. Its owner, name, angle, visibility and gym live on the
  * `user_boards` row `board` returns — nothing about a wall is stored twice.
  */
 export type SprayWall = {
   __typename?: 'SprayWall';
+  /**
+   * When this wall was archived, ISO 8601, or null for a live wall.
+   *
+   * A wall is archived when a reset clone of it (`resetSprayWall`) reaches its
+   * first publish. An archived wall is read-only: its climbs, ticks, playlists
+   * and share links keep working, it leaves every board picker and listing, and
+   * nobody can set a new climb, edit a climb or change its holds on it.
+   */
+  archivedAt?: Maybe<Scalars['String']['output']>;
   board: UserBoard;
+  /**
+   * Always SETTER: only a climb's setter edits it, within 24 hours of first publish.
+   * @deprecated Retired. Only a climb's setter edits it, within 24 hours of first publish.
+   */
+  climbEditPolicy: SprayClimbEditPolicy;
   /** The published version climbers see. Null until the first publish. */
   currentVersion?: Maybe<SprayWallVersion>;
   /**
@@ -8814,6 +13061,16 @@ export type SprayWall = {
   /** The wall's board_layouts id. Also its board_product_sizes id: a wall has exactly one size, itself. */
   layoutId: Scalars['Int']['output'];
   /**
+   * The visibility waiting for this wall's first publish, or null.
+   *
+   * Only for the wall's OWNER, only while the wall has never been published, and
+   * only when something other than private is waiting: createSprayWall and
+   * updateSprayWall hold a requested public or unlisted wall private until the
+   * first publish applies it. A reset clone's pair is the old wall's audience,
+   * and its publish may narrow it to what the old wall has by then.
+   */
+  pendingVisibility?: Maybe<SprayWallVisibility>;
+  /**
    * A stable, unsigned URL for the wall photo — public walls only, null for every
    * other wall.
    *
@@ -8828,8 +13085,47 @@ export type SprayWall = {
   referenceHeight?: Maybe<Scalars['Int']['output']>;
   /** The canonical frame in pixels, derived from the version-1 photo. Null until the first photo lands. */
   referenceWidth?: Maybe<Scalars['Int']['output']>;
+  /**
+   * The wall's own stored default look, or null when its creator never set one
+   * (including every wall created before this field existed). A
+   * `{ mode: 'classic' | 'aura', boardsesh: {...} }` blob, opaque to the schema
+   * and validated server-side — kept as JSON rather than a parallel GraphQL type
+   * because the underlying knob set still changes independently. A viewer's own
+   * EXPLICIT render-mode choice always overrides this; it only supplies the look
+   * for a viewer who has never chosen one.
+   *
+   * May also carry `background: 'photo' | 'wall-crop' | 'hold-cutouts'` — what
+   * the wall is drawn on. Missing means 'photo'. The generated backgrounds are
+   * read through `sprayWallArt`; a client falls back to the photo whenever that
+   * art is not READY.
+   */
+  renderSettings?: Maybe<Scalars['JSON']['output']>;
+  /**
+   * The published wall that replaced this one through `resetSprayWall`, when the
+   * viewer may see it: its owner, a member of its gym, anyone when it is public,
+   * or anyone holding this wall's share link when this wall is unlisted and not
+   * public and the replacement is unlisted too. Null while the replacement is
+   * unfinished.
+   */
+  replacedByWallUuid?: Maybe<Scalars['ID']['output']>;
+  /**
+   * The wall this one was cloned from by `resetSprayWall`. Only for a viewer who
+   * can see that wall without its uuid: its owner, a member of its gym, or anyone
+   * when it is public.
+   */
+  resetOfWallUuid?: Maybe<Scalars['ID']['output']>;
   /** Always equal to layoutId. Returned so a client never has to know the equality. */
   sizeId: Scalars['Int']['output'];
+  /**
+   * Whether this wall's photo and marked holds may help train hold finding. The
+   * server stores a yes only when a client sends trainingConsent: true. The
+   * app's add-a-wall switch is on when the wizard opens, and the app sends
+   * whatever the owner leaves it at. A wall that existed before the switch, or
+   * was created by an app without it, is off until its owner turns it on. A
+   * Boardsesh admin checks a version before it is used. Only ever non-null for
+   * the wall's OWNER.
+   */
+  trainingConsent?: Maybe<Scalars['Boolean']['output']>;
   uuid: Scalars['ID']['output'];
   /** Every version, newest first. Drafts are only visible to the owner. */
   versions: Array<SprayWallVersion>;
@@ -8842,6 +13138,12 @@ export type SprayWall = {
    * them: they can edit the gym's page and not a wall's holds.
    */
   viewerCanEdit: Scalars['Boolean']['output'];
+  /**
+   * Always false. Editing someone else's published climb on a wall was retired;
+   * the setter's own edit rights come from the climb, not the wall.
+   * @deprecated Retired. Only a climb's setter edits it, within 24 hours of first publish.
+   */
+  viewerCanEditClimbs: Scalars['Boolean']['output'];
 };
 
 /** Put this detection on the wall as a new hold, with a new catalogue id. */
@@ -8858,6 +13160,41 @@ export type SprayWallAddedDecisionInput = {
   movedFromHoldId?: InputMaybe<Scalars['Int']['input']>;
 };
 
+/**
+ * One version's generated wall looks, drawn in the canonical frame (the frame
+ * hold coordinates live in), scaled to `width` x `height`. Draw holds over it
+ * with no homography: multiply canonical coordinates by width / boardWidth.
+ *
+ * Read in its own query (`sprayWallArt`), never in a shared fragment.
+ */
+export type SprayWallArt = {
+  __typename?: 'SprayWallArt';
+  /** Wall only: the photo flattened into the canonical frame. JPEG. Null unless READY. */
+  crop?: Maybe<SprayWallPhoto>;
+  /** Holds only: the same pixels, transparent everywhere but the holds. WebP with alpha; draw the field colour behind it. Null unless READY. */
+  cutout?: Maybe<SprayWallPhoto>;
+  height?: Maybe<Scalars['Int']['output']>;
+  quality: SprayWallPhotoQuality;
+  /** The rendering recipe the server runs. Art made by another recipe reads as NONE. */
+  recipe: Scalars['Int']['output'];
+  status: SprayWallArtStatus;
+  versionNumber: Scalars['Int']['output'];
+  width?: Maybe<Scalars['Int']['output']>;
+};
+
+/** Where a version's generated wall looks are. */
+export type SprayWallArtStatus =
+  /** The last job failed. Choosing a generated background again re-queues it. */
+  | 'FAILED'
+  /** Never asked for, or made by an older recipe. */
+  | 'NONE'
+  /** A job is queued or running. */
+  | 'PENDING'
+  /** Both images are ready. */
+  | 'READY'
+  /** The photo failed the quality gate, so nothing will be rendered for it. */
+  | 'REFUSED';
+
 export type SprayWallDetection = {
   __typename?: 'SprayWallDetection';
   createdAt: Scalars['String']['output'];
@@ -8865,7 +13202,9 @@ export type SprayWallDetection = {
   finishedAt?: Maybe<Scalars['String']['output']>;
   id: Scalars['ID']['output'];
   modelVersion: Scalars['String']['output'];
+  queuePosition?: Maybe<Scalars['Int']['output']>;
   result?: Maybe<SprayDetectionResult>;
+  retryAt?: Maybe<Scalars['String']['output']>;
   status: Scalars['String']['output'];
   versionId: Scalars['ID']['output'];
   wallUuid: Scalars['ID']['output'];
@@ -8907,6 +13246,8 @@ export type SprayWallDetectionInput = {
  */
 export type SprayWallHold = {
   __typename?: 'SprayWallHold';
+  /** What the climber did with the suggestion. Null for MANUAL holds and for AUTO holds saved without provenance. */
+  autoReview?: Maybe<SprayHoldAutoReview>;
   /** Detector confidence 0-1 for AUTO holds; null when a human drew it. */
   confidence?: Maybe<Scalars['Float']['output']>;
   cx: Scalars['Int']['output'];
@@ -8917,6 +13258,10 @@ export type SprayWallHold = {
   installedVersion: Scalars['Int']['output'];
   /** The hold this one replaced, when a reset review linked a move. */
   movedFromHoldId?: Maybe<Scalars['Int']['output']>;
+  /** Index of the suggestion in that run's result.candidates. */
+  originCandidateIndex?: Maybe<Scalars['Int']['output']>;
+  /** The detection run the suggestion came from. Null for MANUAL holds. */
+  originDetectionId?: Maybe<Scalars['ID']['output']>;
   /** Flat implicitly-closed ring [x0, y0, x1, y1, ...] in units of this hold's own radius, relative to its centre. Null falls back to the circle (cx, cy, r) describes. */
   outline?: Maybe<Array<Scalars['Float']['output']>>;
   r: Scalars['Int']['output'];
@@ -8934,15 +13279,59 @@ export type SprayWallHold = {
  * re-runs detection: it is the owner's wall.
  */
 export type SprayWallHoldInput = {
+  /**
+   * What the climber did with the suggestion. AUTO holds only; ignored on MANUAL.
+   * The server keeps the highest of this, the stored value and EDITED when the
+   * geometry changed (against the stored hold, or the movedFromHoldId one), so
+   * an omitted value never clears one. An explicit null does clear it.
+   */
+  autoReview?: InputMaybe<SprayHoldAutoReview>;
   confidence?: InputMaybe<Scalars['Float']['input']>;
   cx: Scalars['Int']['input'];
   cy: Scalars['Int']['input'];
   id?: InputMaybe<Scalars['Int']['input']>;
   movedFromHoldId?: InputMaybe<Scalars['Int']['input']>;
+  originCandidateIndex?: InputMaybe<Scalars['Int']['input']>;
+  /**
+   * The detection run the suggestion came from, with originCandidateIndex. AUTO
+   * holds only. A run of another wall, an unfinished run or an index out of range
+   * is stored as null rather than failing the save. Omit both to keep what the
+   * hold already records; send originDetectionId: null to clear it.
+   */
+  originDetectionId?: InputMaybe<Scalars['ID']['input']>;
   /** Flat implicitly-closed ring in radius units, 3-150 points, every coordinate within 4 radii. */
   outline?: InputMaybe<Array<Scalars['Float']['input']>>;
   r: Scalars['Int']['input'];
   source?: InputMaybe<SprayHoldSource>;
+};
+
+/** How many climbs on a wall use one hold. See `sprayWallHoldUsage`. */
+export type SprayWallHoldUsage = {
+  __typename?: 'SprayWallHoldUsage';
+  /** Draft climbs that use the hold. */
+  draftClimbCount: Scalars['Int']['output'];
+  holdId: Scalars['Int']['output'];
+  /** Published climbs that use the hold. Removing it gives each of them a lost hold. */
+  publishedClimbCount: Scalars['Int']['output'];
+};
+
+/** Distinct climbs on a wall that use any of the requested holds. */
+export type SprayWallHoldUsageSummary = {
+  __typename?: 'SprayWallHoldUsageSummary';
+  draftClimbCount: Scalars['Int']['output'];
+  publishedClimbCount: Scalars['Int']['output'];
+};
+
+export type SprayWallImportProgress = {
+  __typename?: 'SprayWallImportProgress';
+  detectionId?: Maybe<Scalars['ID']['output']>;
+  queuePosition?: Maybe<Scalars['Int']['output']>;
+  /** The wall this unpublished reset clone replaces; null for a plain new wall. */
+  resetOfWallUuid?: Maybe<Scalars['String']['output']>;
+  retryAt?: Maybe<Scalars['String']['output']>;
+  stage: Scalars['String']['output'];
+  versionId?: Maybe<Scalars['ID']['output']>;
+  wallUuid: Scalars['ID']['output'];
 };
 
 /** Keep this hold, optionally refreshing its silhouette from the new photo. */
@@ -8958,6 +13347,44 @@ export type SprayWallKeptDecisionInput = {
    */
   detection?: InputMaybe<SprayWallDetectionInput>;
   holdId: Scalars['Int']['input'];
+};
+
+/**
+ * The LED setup of one spray wall: which controller drives it, whether it is on,
+ * and the hole, LED and cable layout that maps holds to physical LEDs.
+ *
+ * Lives on the board, so every climber at the wall can light it from their own
+ * phone. The phone talks to the controller directly over the local network; the
+ * server only stores the setup and never contacts the address.
+ */
+export type SprayWallLedSetup = {
+  __typename?: 'SprayWallLedSetup';
+  /** Minutes after the wall was last lit before the controller turns it off; 0 never does. */
+  autoOffMinutes: Scalars['Int']['output'];
+  boardUuid: Scalars['ID']['output'];
+  /** WLED master brightness, 1–255, the same on every phone that lights the wall. */
+  brightness: Scalars['Int']['output'];
+  /** The driver for this controller. `wled` (local HTTP) or `wled-ble` (stable Bluetooth controller ID). */
+  controllerType: Scalars['String']['output'];
+  /** A local HTTP base address or wled-ble:wled-<hardware ID>; empty until selected. */
+  controllerUrl: Scalars['String']['output'];
+  enabled: Scalars['Boolean']['output'];
+  /** A saved T-nut layout. Null until the setup screen has saved one. */
+  layout?: Maybe<Scalars['JSON']['output']>;
+  /** When this setup last changed, ISO 8601. */
+  updatedAt: Scalars['String']['output'];
+};
+
+/**
+ * A wall's LED setup as this viewer may use it. Null at the query, not here, when
+ * the viewer cannot read the wall: the same answer `sprayWall(uuid)` gives.
+ */
+export type SprayWallLedSetupView = {
+  __typename?: 'SprayWallLedSetupView';
+  /** Null when nobody has saved a setup for this wall yet. */
+  setup?: Maybe<SprayWallLedSetup>;
+  /** Whether this viewer may save changes: the wall's owner, on a wall still in use. */
+  viewerCanEdit: Scalars['Boolean']['output'];
 };
 
 /** The outcome of the admin switch, thin on purpose: a moderation tool, not a wall read. */
@@ -8989,7 +13416,7 @@ export type SprayWallMoveSuggestion = {
  *
  * Spray-wall photos live in the PRIVATE bucket, never the public `media` one:
  * the photograph is of somebody's home, and `media` is world-readable under
- * guessable keys (`docs/user-media-storage.md`). So there is no stable URL to
+ * guessable keys (`docs/operations/user-media-storage.md`). So there is no stable URL to
  * store on a row — every read mints a fresh signature, and `expiresAt` is when
  * the one in hand stops working.
  */
@@ -9016,11 +13443,31 @@ export type SprayWallPhotoPurgeResult = {
   wallsPurged: Scalars['Int']['output'];
 };
 
+/** How straight-on a version's photo is. Same numbers on the server and in the app. */
+export type SprayWallPhotoQuality = {
+  __typename?: 'SprayWallPhotoQuality';
+  /** The canonical frame's short edge, in pixels. */
+  frameShortEdge: Scalars['Int']['output'];
+  /** ok, no-pins, keystone, small-frame or singular. */
+  reason: Scalars['String']['output'];
+  /** sqrt(max / min) of the area scale across the frame. 1 is a perfectly front-on photo. Null when unmeasurable. */
+  stretch?: Maybe<Scalars['Float']['output']>;
+  verdict: SprayWallPhotoVerdict;
+};
+
+export type SprayWallPhotoVerdict =
+  /** Too angled, too small, or no corner pins: the generated looks are not offered. */
+  | 'FAIL'
+  /** Front-on enough to flatten cleanly. */
+  | 'GOOD'
+  /** Usable, but the far side will look stretched; suggest a front-on retake. */
+  | 'SOFT';
+
 /**
  * Everything a renderer needs for one wall at one version: the photo, the
  * geometry that maps it, and the holds alive at that version.
  *
- * No image is ever warped — the client maps holds through the INVERSE of
+ * The stored photo is never warped — the client maps holds through the INVERSE of
  * `homography` at draw time.
  */
 export type SprayWallRenderData = {
@@ -9032,6 +13479,13 @@ export type SprayWallRenderData = {
   holds: Array<SprayWallHold>;
   homography: Array<Scalars['Float']['output']>;
   photo: SprayWallPhoto;
+  /**
+   * Presigned GET for the photo at up to 5712 px on its long side, or null when
+   * this version has no copy larger than `photo` (#5911). Same pixels and frame
+   * as `photo`, just more of them: the hold editor swaps it in once it zooms past
+   * the base photo's resolution. Expires with `photo.expiresAt`.
+   */
+  photoFullUrl?: Maybe<Scalars['String']['output']>;
   versionNumber: Scalars['Int']['output'];
   wall: SprayWall;
 };
@@ -9044,7 +13498,11 @@ export type SprayWallReport = {
   hidden: Scalars['Boolean']['output'];
   id: Scalars['ID']['output'];
   layoutId: Scalars['Int']['output'];
+  /** Admin-only preview, including private and hidden walls; null when unavailable. */
+  photo?: Maybe<SprayWallPhoto>;
   reason: SprayWallReportReason;
+  releaseContext?: Maybe<ReleaseContext>;
+  wallName: Scalars['String']['output'];
   wallUuid: Scalars['ID']['output'];
 };
 
@@ -9084,9 +13542,8 @@ export type SprayWallResetKeptHold = {
 };
 
 /**
- * What a reset would do, computed and thrown away. `proposeSprayWallReset`
- * writes nothing at all — the owner reviews this and `commitSprayWallVersion`
- * is what lands it.
+ * What an in-place reset would have done. Retired with `proposeSprayWallReset`,
+ * which now always refuses; kept so older apps' documents still validate.
  */
 export type SprayWallResetProposal = {
   __typename?: 'SprayWallResetProposal';
@@ -9119,7 +13576,7 @@ export type SprayWallResetResult = {
   __typename?: 'SprayWallResetResult';
   /** Holds this commit put on the wall. */
   addedCount: Scalars['Int']['output'];
-  /** Climbs whose `missingHoldCount` moved as a result. */
+  /** Climbs whose `missingHoldCount` moved as a result. 0 on a first publish. */
   climbsChanged: Scalars['Int']['output'];
   /**
    * Holds still on the wall from the previous generation.
@@ -9183,13 +13640,26 @@ export type SprayWallVersion = {
  */
 export type SprayWallVersionStatus = 'DRAFT' | 'PUBLISHED' | 'SUPERSEDED';
 
+/** A wall's visibility pair, as the board row carries it. */
+export type SprayWallVisibility = {
+  __typename?: 'SprayWallVisibility';
+  isPublic: Scalars['Boolean']['output'];
+  isUnlisted: Scalars['Boolean']['output'];
+};
+
 /**
  * A board that probably belongs to a gym but isn't linked to it yet — either it
  * followed a listing that got merged into this gym, or it sits at the gym's
- * coordinates while unlinked or attached to a synced (SYSTEM) listing.
+ * coordinates while unlinked or attached to a synced (SYSTEM) listing. Public,
+ * unlinked boards owned by another person are candidates only for an in-scope
+ * platform admin who can read their location.
  */
 export type StrayBoard = {
   __typename?: 'StrayBoard';
+  /** Board angle in degrees. */
+  angle: Scalars['Int']['output'];
+  /** Board type (kilter, tension, moonboard, ...). */
+  boardType: Scalars['String']['output'];
   /** Name of the gym this board is currently linked to; null when unlinked. */
   currentGymName?: Maybe<Scalars['String']['output']>;
   /** The gym this board is currently linked to (a merged twin or a synced listing); null when unlinked. */
@@ -9242,6 +13712,7 @@ export type SubmitAppFeedbackInput = {
   platform: Scalars['String']['input'];
   /** 1–5 star rating. Null for bug reports. */
   rating?: InputMaybe<Scalars['Int']['input']>;
+  releaseContext?: InputMaybe<ReleaseContextInput>;
   /**
    * Object keys returned by `POST /api/feedback-screenshots`, at most
    * FEEDBACK_SCREENSHOT_MAX_COUNT of them. Bug reports only — they become
@@ -9280,6 +13751,7 @@ export type SubmitQaVerdictInput = {
   /** 'ios' | 'android' | 'web'. */
   platform: Scalars['String']['input'];
   prNumber: Scalars['Int']['input'];
+  releaseContext?: InputMaybe<ReleaseContextInput>;
   runtimeVersion?: InputMaybe<Scalars['String']['input']>;
   /**
    * Object keys returned by `POST /api/feedback-screenshots`, at most
@@ -9296,9 +13768,15 @@ export type SubmitQaVerdictInput = {
 export type Subscription = {
   __typename?: 'Subscription';
   /**
+   * Changes to the signed-in reporter's bug reports, including edits, withdrawals
+   * and GitHub issue status. Ownership is rechecked before every event.
+   */
+  appBugReportChanged: AppBugReportChangedEvent;
+  /**
    * Subscribe to the live "now on the wall" feed for a shared board (board_id
-   * resolved from the BLE serial). Membership-free: any authenticated user who
-   * has connected to the board can watch. Sessions are not involved.
+   * resolved from the BLE serial). Membership-free; the board's policy decides.
+   * The board id alone is the no-link reading (ids can be counted); pass
+   * `boardUuid` to open an Unlisted board. Sessions are not involved.
    */
   boardNowPlaying: BoardPresenceEvent;
   /**
@@ -9335,6 +13813,7 @@ export type Subscription = {
    * Requires authentication.
    */
   notificationReceived: NotificationEvent;
+  privacyChanged: Scalars['Boolean']['output'];
   /** Subscribe to queue changes (items added/removed/reordered, current climb changes). */
   queueUpdates: QueueEvent;
   /** Subscribe to real-time session events (membership, lifecycle, and live stats). */
@@ -9344,11 +13823,14 @@ export type Subscription = {
 /** Root subscription type for real-time updates. */
 export type SubscriptionBoardNowPlayingArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
+  includeAurora?: InputMaybe<Scalars['Boolean']['input']>;
 };
 
 /** Root subscription type for real-time updates. */
 export type SubscriptionBoardQueuePreviewArgs = {
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
 };
 
 /** Root subscription type for real-time updates. */
@@ -9384,6 +13866,18 @@ export type SubscriptionSessionUpdatesArgs = {
   sessionId: Scalars['ID']['input'];
 };
 
+/** Rows needed by ordinary sync or to complete an imported public snapshot. */
+export type SyncAudience = 'ALL' | 'SNAPSHOT_SUPPLEMENTAL';
+
+/** Canonical saved-climb documents from one snapshot, without changing a pull cursor. */
+export type SyncClimbDocuments = {
+  __typename?: 'SyncClimbDocuments';
+  climb: Scalars['JSON']['output'];
+  stats: Array<Scalars['JSON']['output']>;
+  /** Authenticated account owning the client mirror, independent of the setter. */
+  viewerId: Scalars['ID']['output'];
+};
+
 /**
  * Composite sync cursor returned by a pull. Feed it back as SyncCursorInput on
  * the next page.
@@ -9413,7 +13907,7 @@ export type SyncDeletion = {
   __typename?: 'SyncDeletion';
   /** When the row was deleted (ISO 8601). */
   deletedAt: Scalars['String']['output'];
-  /** Natural-key encoding of the deleted row (see docs/sync-table-manifest.md). */
+  /** Natural-key encoding of the deleted row (see docs/data/sync-table-manifest.md). */
   recordId: Scalars['String']['output'];
   /** Postgres table the row was deleted from. */
   tableName: Scalars['String']['output'];
@@ -9457,6 +13951,8 @@ export type Tick = {
   auroraSyncedAt?: Maybe<Scalars['String']['output']>;
   /** Type of Aurora sync ('bid' or 'ascent') */
   auroraType?: Maybe<Scalars['String']['output']>;
+  /** Physical board name, populated by updateTick for immediate editor refresh. */
+  boardDisplayName?: Maybe<Scalars['String']['output']>;
   /** Board entity ID if tick was associated with a board */
   boardId?: Maybe<Scalars['Int']['output']>;
   /** Board type */
@@ -9465,6 +13961,8 @@ export type Tick = {
   boardseshConfidence?: Maybe<Scalars['String']['output']>;
   /** Boardsesh grade on the shared difficulty scale (COALESCE of the cross-board universal grade and the within-board local grade), for this climb at the tick's angle. Null when no grade row exists. Fills the gap only for ungraded ascents: the user's own tick grade always wins, and the UI keeps the legacy consensus when this is null or 'setter_only'. */
   boardseshDifficulty?: Maybe<Scalars['Float']['output']>;
+  /** Retired with climb revisions. The stored value: null on every imported tick and on every tick saved since the server stopped recording it; a number only on ticks saved while it did. */
+  climbRevision?: Maybe<Scalars['Int']['output']>;
   /** UUID of the climb attempted */
   climbUuid: Scalars['String']['output'];
   /** When the climb was attempted (ISO 8601) */
@@ -9475,7 +13973,7 @@ export type Tick = {
   commentCount?: Maybe<Scalars['Int']['output']>;
   /** When this record was created (ISO 8601) */
   createdAt: Scalars['String']['output'];
-  /** User's personal grade override as a difficulty_id. Null means the user did not attach a personal grade — read `effectiveDifficulty` for the value to display (it falls back to the climb's consensus). See docs/ascents-and-attempts.md. */
+  /** User's personal grade override as a difficulty_id. Null means the user did not attach a personal grade — read `effectiveDifficulty` for the value to display (it falls back to the climb's consensus). See docs/data/ascents-and-attempts.md. */
   difficulty?: Maybe<Scalars['Int']['output']>;
   /** Number of downvotes on this tick. Null unless populated by a read query. */
   downvotes?: Maybe<Scalars['Int']['output']>;
@@ -9504,6 +14002,35 @@ export type Tick = {
   /** Unique identifier for this tick */
   uuid: Scalars['ID']['output'];
 };
+
+export type TickBoardOption = {
+  __typename?: 'TickBoardOption';
+  boardType: Scalars['String']['output'];
+  layoutId: Scalars['Int']['output'];
+  name: Scalars['String']['output'];
+  setIds: Scalars['String']['output'];
+  sizeId: Scalars['Int']['output'];
+  uuid: Scalars['ID']['output'];
+};
+
+export type TickBoardOptions = {
+  __typename?: 'TickBoardOptions';
+  boards: Array<TickBoardOption>;
+  currentBoard?: Maybe<TickBoardOption>;
+  hasMore: Scalars['Boolean']['output'];
+  totalCount: Scalars['Int']['output'];
+};
+
+export type TickReportingTimeInput = {
+  /** The chosen calendar date, in YYYY-MM-DD form, for a day-only tick. */
+  date?: InputMaybe<Scalars['String']['input']>;
+  precision: TickReportingTimePrecision;
+  /** IANA zone of the author’s chosen calendar date. */
+  timeZone?: InputMaybe<Scalars['String']['input']>;
+};
+
+/** Input for recording a climb attempt. */
+export type TickReportingTimePrecision = 'day' | 'instant';
 
 /** Status of a climb attempt. */
 export type TickStatus =
@@ -9600,6 +14127,8 @@ export type UpdateBoardInput = {
   latitude?: InputMaybe<Scalars['Float']['input']>;
   /** New layout ID (authorized editors only; existing ticks are preserved untouched) */
   layoutId?: InputMaybe<Scalars['Int']['input']>;
+  /** New wall device flag */
+  litByWallDevice?: InputMaybe<Scalars['Boolean']['input']>;
   /** New location name */
   locationName?: InputMaybe<Scalars['String']['input']>;
   /** New GPS longitude */
@@ -9619,9 +14148,11 @@ export type UpdateBoardInput = {
 };
 
 /**
- * Input for updating an existing climb. Only the climb's owner can update
- * the row, and only while it is still a draft OR within 24 hours of its
- * first publish.
+ * Input for updating an existing climb.
+ *
+ * A draft can be updated by its setter at any time. A published climb can be
+ * updated by its setter within 24 hours of its first publish, on every board,
+ * spray walls included. The edit is made in place; no revision is recorded.
  */
 export type UpdateClimbInput = {
   angle?: InputMaybe<Scalars['Int']['input']>;
@@ -9630,6 +14161,8 @@ export type UpdateClimbInput = {
   boardType: Scalars['String']['input'];
   /** Freely-toggleable characteristics: the full desired boolean state of CLIMB_CHARACTERISTICS.NO_KICKBOARD / .CAMPUS. Any other characteristic already on the row (no_match, any_feet, MoonBoard method) is left untouched. */
   characteristics?: InputMaybe<Array<Scalars['String']['input']>>;
+  /** Stable UUID for one edit; retries acknowledge the original committed edit. */
+  clientMutationId?: InputMaybe<Scalars['ID']['input']>;
   description?: InputMaybe<Scalars['String']['input']>;
   frames?: InputMaybe<Scalars['String']['input']>;
   framesCount?: InputMaybe<Scalars['Int']['input']>;
@@ -9639,6 +14172,11 @@ export type UpdateClimbInput = {
   name?: InputMaybe<Scalars['String']['input']>;
   /** Matching disallowed. Null or omitted preserves the stored value, so an old client cannot clear it. When set it wins over the legacy 'No match' description prefix in the same call. */
   noMatch?: InputMaybe<Scalars['Boolean']['input']>;
+  /**
+   * Ignored. A published climb is public to everyone, so a climb has no audience. Kept so installed app builds that still send it are not rejected.
+   * @deprecated Climbs have no audience: a published climb is public to everyone. Ignored.
+   */
+  privacy?: InputMaybe<PrivacyPublicationInput>;
   /** Physical board size, where it is part of the climb's identity (Woods). Immutable — a size that differs from the stored one is rejected. Null or omitted keeps the stored size. */
   sizeId?: InputMaybe<Scalars['Int']['input']>;
   /**
@@ -9669,8 +14207,12 @@ export type UpdateClimbInput = {
 export type UpdateClimbResult = {
   __typename?: 'UpdateClimbResult';
   createdAt?: Maybe<Scalars['String']['output']>;
+  /** The stored `Climb.holdsRevisionNumber`. A save no longer moves it. */
+  holdsRevisionNumber?: Maybe<Scalars['Int']['output']>;
   isDraft: Scalars['Boolean']['output'];
   publishedAt?: Maybe<Scalars['String']['output']>;
+  /** The climb's stored revision (`Climb.revisionNumber`). A save no longer moves it. */
+  revisionNumber?: Maybe<Scalars['Int']['output']>;
   uuid: Scalars['ID']['output'];
 };
 
@@ -9680,6 +14222,7 @@ export type UpdateCommentInput = {
   body: Scalars['String']['input'];
   /** UUID of the comment to update */
   commentUuid: Scalars['ID']['input'];
+  privacy?: InputMaybe<PrivacyPublicationInput>;
 };
 
 /** Input for updating a gym. */
@@ -9704,6 +14247,8 @@ export type UpdateGymInput = {
   hours?: InputMaybe<Scalars['String']['input']>;
   /** New image URL */
   imageUrl?: InputMaybe<Scalars['String']['input']>;
+  /** Whether listed in discovery */
+  isListed?: InputMaybe<Scalars['Boolean']['input']>;
   /** New visibility */
   isPublic?: InputMaybe<Scalars['Boolean']['input']>;
   /** New GPS latitude */
@@ -9737,6 +14282,29 @@ export type UpdateGymKioskInput = {
   slug?: InputMaybe<Scalars['String']['input']>;
 };
 
+/** Fields left out keep their value. A null homepageUrl removes it; publisherName can change but never be removed. The app type and auth method never change. */
+export type UpdateOAuthClientInput = {
+  clientId: Scalars['ID']['input'];
+  homepageUrl?: InputMaybe<Scalars['String']['input']>;
+  name?: InputMaybe<Scalars['String']['input']>;
+  privacyPolicyUrl?: InputMaybe<Scalars['String']['input']>;
+  publisherName?: InputMaybe<Scalars['String']['input']>;
+  redirectUris?: InputMaybe<Array<Scalars['String']['input']>>;
+};
+
+export type UpdatePartnerAppLimitsInput = {
+  clientId: Scalars['ID']['input'];
+  maxActiveConnections: Scalars['Int']['input'];
+  maxNewConnectionsPerDay: Scalars['Int']['input'];
+};
+
+export type UpdatePartnerWebhookInput = {
+  clientId: Scalars['ID']['input'];
+  enabled: Scalars['Boolean']['input'];
+  events: Array<Scalars['String']['input']>;
+  url: Scalars['String']['input'];
+};
+
 /** Input for updating a playlist. */
 export type UpdatePlaylistInput = {
   /** New color */
@@ -9751,6 +14319,17 @@ export type UpdatePlaylistInput = {
   name?: InputMaybe<Scalars['String']['input']>;
   /** Playlist ID to update */
   playlistId: Scalars['ID']['input'];
+  privacy?: InputMaybe<PrivacyPublicationInput>;
+};
+
+export type UpdatePrivacySettingsInput = {
+  defaultSessionAudience?: InputMaybe<PrivacyResourceAudience>;
+  isPrivate?: InputMaybe<Scalars['Boolean']['input']>;
+  /**
+   * Accepted and ignored.
+   * @deprecated Retired with the privacy setup screen. Accepted and ignored.
+   */
+  privacyOnboardingVersion?: InputMaybe<Scalars['Int']['input']>;
 };
 
 /** Input for updating user profile. */
@@ -9759,6 +14338,14 @@ export type UpdateProfileInput = {
   avatarUrl?: InputMaybe<Scalars['String']['input']>;
   /** New display name */
   displayName?: InputMaybe<Scalars['String']['input']>;
+};
+
+export type UpdateResourcePrivacyInput = {
+  audience: PrivacyResourceAudience;
+  inheritFollowers?: InputMaybe<Scalars['Boolean']['input']>;
+  kind: PrivacyResourceKind;
+  locationAudience?: InputMaybe<PrivacyLocationAudience>;
+  resourceId: Scalars['ID']['input'];
 };
 
 /**
@@ -9799,17 +14386,46 @@ export type UpdateSprayWallInput = {
    * rather than cascaded.
    */
   angle?: InputMaybe<Scalars['Int']['input']>;
+  /**
+   * Accepted and ignored. Only a climb's setter edits it.
+   * @deprecated Retired. Accepted and ignored.
+   */
+  climbEditPolicy?: InputMaybe<SprayClimbEditPolicy>;
   description?: InputMaybe<Scalars['String']['input']>;
-  /** Attach the wall to a gym the caller may link boards to, or pass null to detach. */
+  /**
+   * Attach the wall to a gym the caller may link boards to, or pass null to detach.
+   * A nearby public gym is checked against the coordinates this same call sets,
+   * when it sets them.
+   */
   gymUuid?: InputMaybe<Scalars['ID']['input']>;
+  /** Owner only. Hides the wall's location from everyone else. */
+  hideLocation?: InputMaybe<Scalars['Boolean']['input']>;
   /**
    * Make the wall world-readable. This is the switch that turns a private wall into
    * a shared one, so it is also what starts publishing its climbs to feeds.
+   *
+   * Owner only, like isUnlisted. On a wall that has never been published (and is
+   * not a reset clone) the choice is held until the first publish, which applies
+   * it: the wall stays private until there is something to see, and
+   * SprayWall.pendingVisibility reports what is waiting. A flag left out keeps
+   * the half already waiting.
    */
   isPublic?: InputMaybe<Scalars['Boolean']['input']>;
-  /** Reachable by uuid — the share link — and listed nowhere. */
+  /** Reachable by uuid — the share link — and listed nowhere. Held until the first publish, like isPublic. */
   isUnlisted?: InputMaybe<Scalars['Boolean']['input']>;
+  /** Pass together with longitude: both, or neither. Null clears the point. */
+  latitude?: InputMaybe<Scalars['Float']['input']>;
+  locationName?: InputMaybe<Scalars['String']['input']>;
+  longitude?: InputMaybe<Scalars['Float']['input']>;
   name?: InputMaybe<Scalars['String']['input']>;
+  /**
+   * Let this wall's photo and marked holds help train hold finding. Owner only,
+   * like visibility. false switches it off for the whole physical wall: this
+   * wall, every wall it was reset from and every reset clone made from any of
+   * them. They leave the next training export, and stored exports that held one
+   * of them are retired within 24 hours. true switches it on for this wall only.
+   */
+  trainingConsent?: InputMaybe<Scalars['Boolean']['input']>;
   uuid: Scalars['ID']['input'];
 };
 
@@ -9822,6 +14438,8 @@ export type UpdateTickInput = {
   angle?: InputMaybe<Scalars['Int']['input']>;
   /** Number of attempts */
   attemptCount?: InputMaybe<Scalars['Int']['input']>;
+  /** Omit to preserve attribution; null clears it; a UUID selects a compatible physical board. */
+  boardUuid?: InputMaybe<Scalars['String']['input']>;
   /** When the climb was attempted (ISO 8601) */
   climbedAt?: InputMaybe<Scalars['String']['input']>;
   /** User comment */
@@ -9830,8 +14448,10 @@ export type UpdateTickInput = {
   difficulty?: InputMaybe<Scalars['Int']['input']>;
   /** Whether this is a benchmark ascent */
   isBenchmark?: InputMaybe<Scalars['Boolean']['input']>;
+  privacy?: InputMaybe<PrivacyPublicationInput>;
   /** User's quality rating (1-5) */
   quality?: InputMaybe<Scalars['Int']['input']>;
+  reportingTime?: InputMaybe<TickReportingTimeInput>;
   /** Result of the attempt */
   status?: InputMaybe<TickStatus>;
 };
@@ -9850,9 +14470,20 @@ export type UpsertHoldOutlineOverrideInput = {
 
 export type UpsertSprayWallHoldsInput = {
   holds: Array<SprayWallHoldInput>;
+  /** Require a writer that preserves climb links when existing holds are refined. Omit for older clients; when supplied, must be true. */
+  preserveClimbLinks?: InputMaybe<Scalars['Boolean']['input']>;
   /** The DRAFT version being edited. Published versions are immutable. */
   versionId: Scalars['ID']['input'];
   wallUuid: Scalars['ID']['input'];
+};
+
+/** What one cron-authenticated user-activity retention run deleted. */
+export type UserActivityPurgeResult = {
+  __typename?: 'UserActivityPurgeResult';
+  /** Rows dated before this UTC day (YYYY-MM-DD) were deleted. */
+  cutoffDay: Scalars['String']['output'];
+  durationMs: Scalars['Int']['output'];
+  rowsDeleted: Scalars['Int']['output'];
 };
 
 /** A named physical board installation (board type + layout + size + hold sets). */
@@ -9860,12 +14491,24 @@ export type UserBoard = {
   __typename?: 'UserBoard';
   /** Default angle for this board */
   angle: Scalars['Int']['output'];
-  /** Numeric board-presence channel id (userBoards.id); null unless the board is public or the viewer can edit it. Feeds boardNowPlaying(boardId) for kiosk/embed surfaces. */
+  /** Numeric board-presence channel id (userBoards.id); set whenever the viewer may read the board. Feeds boardNowPlaying(boardId); the id alone is the no-link reading, so an Unlisted board's presence also needs boardUuid. */
   boardId?: Maybe<Scalars['Int']['output']>;
   /** Board type (kilter, tension, moonboard) */
   boardType: Scalars['String']['output'];
+  /** Whether the current viewer may delete this board with deleteBoard: its owner; the owner or an admin of its linked gym, on a synced (system-owned) board only; or a global admin. False for a deleted board and when signed out. */
+  canDelete: Scalars['Boolean']['output'];
   /** Whether the current viewer may edit this board (owner, community admin/leader for its board type, or owner/admin of its linked gym) */
   canEdit: Scalars['Boolean']['output'];
+  /**
+   * Whether the current viewer may take this board off its gym's listing. True when
+   * the board is linked to a gym and the viewer is its owner (call linkBoardToGym
+   * with gymUuid null) or can edit that gym: its owner, a gym admin or editor, or a
+   * community admin/leader covering it (call detachBoardFromGym). Gym staff use this
+   * instead of deleting a climber's board. A synced (system-owned) board is deleted,
+   * not removed: false for it unless the viewer is a global admin. False when
+   * signed out.
+   */
+  canRemoveFromGym: Scalars['Boolean']['output'];
   /** Number of comments */
   commentCount: Scalars['Int']['output'];
   /** When created */
@@ -9878,6 +14521,8 @@ export type UserBoard = {
   followerCount: Scalars['Int']['output'];
   /** Gym ID if linked to a gym */
   gymId?: Maybe<Scalars['Int']['output']>;
+  /** Whether the linked gym participates in discovery; null when no gym is linked. */
+  gymIsListed?: Maybe<Scalars['Boolean']['output']>;
   /** Gym name if linked to a gym */
   gymName?: Maybe<Scalars['String']['output']>;
   /** Gym UUID if linked to a gym */
@@ -9904,18 +14549,30 @@ export type UserBoard = {
   layoutId: Scalars['Int']['output'];
   /** Human-readable layout name */
   layoutName?: Maybe<Scalars['String']['output']>;
+  /**
+   * Whether an internet-connected wall device (a laser projector, an LED
+   * controller) lights this wall from the board feed. Climbers take the wall
+   * with no Bluetooth link.
+   */
+  litByWallDevice: Scalars['Boolean']['output'];
   /** Location name */
   locationName?: Maybe<Scalars['String']['output']>;
   /** GPS longitude */
   longitude?: Maybe<Scalars['Float']['output']>;
   /** Board name */
   name: Scalars['String']['output'];
+  /**
+   * Waiting reports the viewer can act on: all of them for the board's creator
+   * (but their own relist requests) and global admins, the ones routed to gym
+   * staff for the gym's owner, admins and editors. Null for anyone else.
+   */
+  openReportCount?: Maybe<Scalars['Int']['output']>;
   /** Owner avatar URL */
   ownerAvatarUrl?: Maybe<Scalars['String']['output']>;
   /** Owner display name */
   ownerDisplayName?: Maybe<Scalars['String']['output']>;
   /** Owner user ID */
-  ownerId: Scalars['ID']['output'];
+  ownerId?: Maybe<Scalars['ID']['output']>;
   /** Controller box serial number */
   serialNumber?: Maybe<Scalars['String']['output']>;
   /** Comma-separated set IDs */
@@ -9930,6 +14587,7 @@ export type UserBoard = {
   sizeName?: Maybe<Scalars['String']['output']>;
   /** URL slug for this board */
   slug: Scalars['String']['output'];
+  sprayImport?: Maybe<SprayWallImportProgress>;
   /** Paired Rogue Fitness timer's advertised BLE name */
   timerName?: Maybe<Scalars['String']['output']>;
   /** Total ascents on this board */
@@ -9938,6 +14596,8 @@ export type UserBoard = {
   uniqueClimbers: Scalars['Int']['output'];
   /** Unique identifier */
   uuid: Scalars['ID']['output'];
+  /** The viewer is a reporter on a waiting report about this board. Null when signed out. */
+  viewerHasOpenReport?: Maybe<Scalars['Boolean']['output']>;
 };
 
 /** Paginated list of boards. */
@@ -9977,6 +14637,41 @@ export type UserClimbsInput = {
   userId: Scalars['ID']['input'];
 };
 
+export type UserDataExportDownloadLink = {
+  __typename?: 'UserDataExportDownloadLink';
+  expiresAt: Scalars['String']['output'];
+  filename: Scalars['String']['output'];
+  url: Scalars['String']['output'];
+};
+
+export type UserDataExportFile = {
+  __typename?: 'UserDataExportFile';
+  expiresAt: Scalars['String']['output'];
+  exportedAt: Scalars['String']['output'];
+  fileSize?: Maybe<Scalars['Float']['output']>;
+  filename: Scalars['String']['output'];
+  format: UserDataExportFormat;
+};
+
+export type UserDataExportFormat = 'aurora' | 'boardsesh';
+
+export type UserDataExportState = 'failed' | 'generating' | 'not_requested' | 'ready' | 'unavailable';
+
+export type UserDataExportStatus = {
+  __typename?: 'UserDataExportStatus';
+  boardType: Scalars['String']['output'];
+  completedAt?: Maybe<Scalars['String']['output']>;
+  error?: Maybe<Scalars['String']['output']>;
+  /** A stable failure code for localized client guidance, when available. */
+  errorCode?: Maybe<Scalars['String']['output']>;
+  files: Array<UserDataExportFile>;
+  period: Scalars['String']['output'];
+  refreshAt: Scalars['String']['output'];
+  requestedAt?: Maybe<Scalars['String']['output']>;
+  retryAt?: Maybe<Scalars['String']['output']>;
+  status: UserDataExportState;
+};
+
 /** Event when a user joins the session. */
 export type UserJoined = {
   __typename?: 'UserJoined';
@@ -9989,6 +14684,18 @@ export type UserLeft = {
   __typename?: 'UserLeft';
   /** ID of the user who left */
   userId: Scalars['ID']['output'];
+};
+
+/** Narrows userLoggedSetters to the same board scope as the logbook. */
+export type UserLoggedSettersInput = {
+  /** Optional board type filter for multiple board types */
+  boardTypes?: InputMaybe<Array<Scalars['String']['input']>>;
+  /** Optional layout filters within the selected board type */
+  layoutIds?: InputMaybe<Array<Scalars['Int']['input']>>;
+  /** Maximum number of setters to return (default 50, max 200) */
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  /** Optional case-insensitive partial match on the setter username */
+  search?: InputMaybe<Scalars['String']['input']>;
 };
 
 /** Event when a participant's realtime presence state changes. */
@@ -10073,6 +14780,15 @@ export type VoteSummary = {
   voteScore: Scalars['Int']['output'];
 };
 
+/** Where an existing wall was found relative to the chosen gym. */
+export type WallCandidateSource =
+  /** Linked to a listing an admin merged into the chosen gym. */
+  | 'MERGED_LISTING'
+  /** Linked to another public, listed gym within 150 m. */
+  | 'NEARBY_LISTING'
+  /** Linked to the chosen gym. */
+  | 'SELECTED_GYM';
+
 /**
  * Event broadcast when a participant's phone successfully relays a climb to the
  * wall over BLE. Other clients use this confirmation to flip the queue-control-bar
@@ -10107,6 +14823,18 @@ export type WallDisconnected = {
 };
 
 /**
+ * How an existing wall compares with the setup the climber is entering. Angle is
+ * never compared.
+ */
+export type WallMatchKind =
+  /** Same layout, size and hold sets. */
+  | 'EXACT'
+  /** Same board type, another layout or size. Advisory only; never blocks a create. */
+  | 'LAYOUT_OR_SIZE_DIFFERS'
+  /** Same layout and size, different hold sets. */
+  | 'SETS_DIFFER';
+
+/**
  * Bounding box defining a board region for filtering climbs.
  * Coordinates are in the same grid space as board placements
  * (board_holes.x/y) and board_climbs edge columns.
@@ -10128,6 +14856,10 @@ export type ZoneBoxInput = {
  * anyHold matches climbs that use at least one hold inside the box.
  */
 export type ZoneMatchMode = 'allHolds' | 'anyHold';
+
+export type GetAuthenticatedUserIdQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetAuthenticatedUserIdQuery = { __typename?: 'Query'; authenticatedUserId: string };
 
 export type GetDeleteAccountInfoQueryVariables = Exact<{ [key: string]: never }>;
 
@@ -10244,6 +14976,7 @@ export type SessionFeedItemFieldsFragment = {
     isMirror: boolean;
     isBenchmark: boolean;
     isNoMatch: boolean;
+    characteristics?: Array<string> | null;
     comment?: string | null;
     frames?: string | null;
     setterUsername?: string | null;
@@ -10271,6 +15004,7 @@ export type SessionFeedItemFieldsFragment = {
       isMirror: boolean;
       isBenchmark: boolean;
       isNoMatch: boolean;
+      characteristics?: Array<string> | null;
       comment?: string | null;
       frames?: string | null;
       setterUsername?: string | null;
@@ -10365,6 +15099,7 @@ export type GetSessionGroupedFeedQuery = {
         isMirror: boolean;
         isBenchmark: boolean;
         isNoMatch: boolean;
+        characteristics?: Array<string> | null;
         comment?: string | null;
         frames?: string | null;
         setterUsername?: string | null;
@@ -10397,6 +15132,7 @@ export type GetSessionGroupedFeedQuery = {
           isMirror: boolean;
           isBenchmark: boolean;
           isNoMatch: boolean;
+          characteristics?: Array<string> | null;
           comment?: string | null;
           frames?: string | null;
           setterUsername?: string | null;
@@ -10598,6 +15334,7 @@ export type GetCrewFeedQuery = {
               isMirror: boolean;
               isBenchmark: boolean;
               isNoMatch: boolean;
+              characteristics?: Array<string> | null;
               comment?: string | null;
               frames?: string | null;
               setterUsername?: string | null;
@@ -10630,6 +15367,7 @@ export type GetCrewFeedQuery = {
                 isMirror: boolean;
                 isBenchmark: boolean;
                 isNoMatch: boolean;
+                characteristics?: Array<string> | null;
                 comment?: string | null;
                 frames?: string | null;
                 setterUsername?: string | null;
@@ -10723,6 +15461,7 @@ export type GetSessionDetailQuery = {
       isMirror: boolean;
       isBenchmark: boolean;
       isNoMatch: boolean;
+      characteristics?: Array<string> | null;
       comment?: string | null;
       frames?: string | null;
       setterUsername?: string | null;
@@ -10757,6 +15496,116 @@ export type SetSessionHealthKitWorkoutIdMutationVariables = Exact<{
 }>;
 
 export type SetSessionHealthKitWorkoutIdMutation = { __typename?: 'Mutation'; setSessionHealthKitWorkoutId: boolean };
+
+export type AnalyticsConsentFieldsFragment = {
+  __typename?: 'AnalyticsConsent';
+  analytics: string;
+  version: number;
+  source: string;
+  decidedAt: string;
+};
+
+export type GetMyAnalyticsConsentQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetMyAnalyticsConsentQuery = {
+  __typename?: 'Query';
+  myAnalyticsConsent?: {
+    __typename?: 'AnalyticsConsent';
+    analytics: string;
+    version: number;
+    source: string;
+    decidedAt: string;
+  } | null;
+};
+
+export type SetAnalyticsConsentMutationVariables = Exact<{
+  input: SetAnalyticsConsentInput;
+}>;
+
+export type SetAnalyticsConsentMutation = {
+  __typename?: 'Mutation';
+  setAnalyticsConsent: {
+    __typename?: 'AnalyticsConsent';
+    analytics: string;
+    version: number;
+    source: string;
+    decidedAt: string;
+  };
+};
+
+export type GetConsentRegionQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetConsentRegionQuery = {
+  __typename?: 'Query';
+  consentRegion: {
+    __typename?: 'ConsentRegion';
+    countryCode?: string | null;
+    promptRequired: boolean;
+    globalPrivacyControl: boolean;
+  };
+};
+
+export type AppWorkoutQueryVariables = Exact<{
+  id: Scalars['ID']['input'];
+}>;
+
+export type AppWorkoutQuery = {
+  __typename?: 'Query';
+  appWorkout: {
+    __typename?: 'AppWorkout';
+    id: string;
+    clientId: string;
+    status: string;
+    title: string;
+    sourceAppName: string;
+    notes?: string | null;
+    spec: unknown;
+    expiresAt: string;
+    sessionId?: string | null;
+    sessionPlan?: unknown | null;
+  };
+};
+
+export type AttachAppWorkoutMutationVariables = Exact<{
+  workoutId: Scalars['ID']['input'];
+  sessionId: Scalars['ID']['input'];
+}>;
+
+export type AttachAppWorkoutMutation = { __typename?: 'Mutation'; attachAppWorkout: boolean };
+
+export type RecordAppWorkoutPlanMutationVariables = Exact<{
+  workoutId: Scalars['ID']['input'];
+  plan: Scalars['JSON']['input'];
+}>;
+
+export type RecordAppWorkoutPlanMutation = { __typename?: 'Mutation'; recordAppWorkoutPlan: boolean };
+
+export type ExchangeAppleAdsAttributionMutationVariables = Exact<{
+  token: Scalars['String']['input'];
+  consent: AppleAdsConsentInput;
+}>;
+
+export type ExchangeAppleAdsAttributionMutation = {
+  __typename?: 'Mutation';
+  exchangeAppleAdsAttribution: {
+    __typename?: 'AppleAdsAttributionResult';
+    status: AppleAdsAttributionStatus;
+    retryAfterSeconds?: number | null;
+    retryReason?: string | null;
+    attribution?: {
+      __typename?: 'AppleAdsAttribution';
+      orgId: string;
+      campaignId: string;
+      adGroupId: string;
+      keywordId?: string | null;
+      adId?: string | null;
+      conversionType: string;
+      claimType?: string | null;
+      countryOrRegion?: string | null;
+      supplyPlacement?: string | null;
+    } | null;
+  };
+};
 
 export type GetBetaLinksQueryVariables = Exact<{
   boardType: Scalars['String']['input'];
@@ -11215,6 +16064,36 @@ export type VoteMutation = {
   };
 };
 
+export type GetMyConnectedAppsQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetMyConnectedAppsQuery = {
+  __typename?: 'Query';
+  myConnectedApps: {
+    __typename?: 'ConnectedApps';
+    partnerAppsEnabled: boolean;
+    apps: Array<{
+      __typename?: 'ConnectedApp';
+      connectionId: string;
+      name?: string | null;
+      publisherName?: string | null;
+      scopes: Array<string>;
+      connectedAt: string;
+      lastUsedAt?: string | null;
+      suspended: boolean;
+    }>;
+  };
+};
+
+export type GetPartnerAppsEnabledQueryVariables = Exact<{ [key: string]: never }>;
+
+export type GetPartnerAppsEnabledQuery = { __typename?: 'Query'; partnerAppsEnabled: boolean };
+
+export type DisconnectAppMutationVariables = Exact<{
+  connectionId: Scalars['ID']['input'];
+}>;
+
+export type DisconnectAppMutation = { __typename?: 'Mutation'; disconnectApp: boolean };
+
 export type CreateSessionMutationVariables = Exact<{
   input: CreateSessionInput;
 }>;
@@ -11326,12 +16205,25 @@ export type AdminAppFeedbackQuery = {
       angle?: number | null;
       contactConsent?: boolean | null;
       createdAt: string;
+      lastMessageAt?: string | null;
+      lastMessagePreview?: string | null;
+      needsReply: boolean;
       status: AppFeedbackStatus;
       resolvedAt?: string | null;
       resolvedBy?: string | null;
       githubIssueNumber?: number | null;
       githubIssueUrl?: string | null;
       screenshotUrls: Array<string>;
+      releaseContext?: {
+        __typename?: 'ReleaseContext';
+        channel?: string | null;
+        branch?: string | null;
+        updateId?: string | null;
+        runtimeVersion?: string | null;
+        isEmbeddedLaunch?: boolean | null;
+        automaticCanary?: boolean | null;
+        canaryCheckedAt?: string | null;
+      } | null;
       reporter?: {
         __typename?: 'AppFeedbackReporter';
         userId?: string | null;
@@ -11377,11 +16269,24 @@ export type UpdateAppFeedbackStatusMutation = {
     angle?: number | null;
     contactConsent?: boolean | null;
     createdAt: string;
+    lastMessageAt?: string | null;
+    lastMessagePreview?: string | null;
+    needsReply: boolean;
     status: AppFeedbackStatus;
     resolvedAt?: string | null;
     resolvedBy?: string | null;
     githubIssueNumber?: number | null;
     githubIssueUrl?: string | null;
+    releaseContext?: {
+      __typename?: 'ReleaseContext';
+      channel?: string | null;
+      branch?: string | null;
+      updateId?: string | null;
+      runtimeVersion?: string | null;
+      isEmbeddedLaunch?: boolean | null;
+      automaticCanary?: boolean | null;
+      canaryCheckedAt?: string | null;
+    } | null;
     reporter?: {
       __typename?: 'AppFeedbackReporter';
       userId?: string | null;
@@ -11399,6 +16304,116 @@ export type UpdateAppFeedbackStatusMutation = {
       userAgent?: string | null;
     } | null;
   };
+};
+
+export type MyAppBugReportsQueryVariables = Exact<{
+  input?: InputMaybe<AppBugReportsInput>;
+}>;
+
+export type MyAppBugReportsQuery = {
+  __typename?: 'Query';
+  myAppBugReports: {
+    __typename?: 'AppBugReportConnection';
+    hasMore: boolean;
+    endCursor?: string | null;
+    reports: Array<{
+      __typename?: 'AppBugReport';
+      id: string;
+      comment?: string | null;
+      createdAt: string;
+      status: AppFeedbackStatus;
+      screenshotUrls: Array<string>;
+      githubIssueNumber?: number | null;
+      githubIssueUrl?: string | null;
+      canReply: boolean;
+      lastMessageAt?: string | null;
+      lastMessagePreview?: string | null;
+    }>;
+  };
+};
+
+export type AppBugReportQueryVariables = Exact<{
+  id: Scalars['ID']['input'];
+}>;
+
+export type AppBugReportQuery = {
+  __typename?: 'Query';
+  appBugReport?: {
+    __typename?: 'AppBugReport';
+    id: string;
+    comment?: string | null;
+    createdAt: string;
+    status: AppFeedbackStatus;
+    screenshotUrls: Array<string>;
+    githubIssueNumber?: number | null;
+    githubIssueUrl?: string | null;
+    canReply: boolean;
+    lastMessageAt?: string | null;
+    lastMessagePreview?: string | null;
+  } | null;
+};
+
+export type AppBugReportMessagesQueryVariables = Exact<{
+  input: AppBugReportMessagesInput;
+}>;
+
+export type AppBugReportMessagesQuery = {
+  __typename?: 'Query';
+  appBugReportMessages: {
+    __typename?: 'AppBugReportMessageConnection';
+    hasMore: boolean;
+    endCursor?: string | null;
+    messages: Array<{
+      __typename?: 'AppBugReportMessage';
+      id: string;
+      reportId: string;
+      body: string;
+      authorRole: AppBugReportMessageAuthorRole;
+      deliveryStatus: AppBugReportMessageDeliveryStatus;
+      createdAt: string;
+    }>;
+  };
+};
+
+export type SendAppBugReportMessageMutationVariables = Exact<{
+  input: SendAppBugReportMessageInput;
+}>;
+
+export type SendAppBugReportMessageMutation = {
+  __typename?: 'Mutation';
+  sendAppBugReportMessage: {
+    __typename?: 'AppBugReportMessage';
+    id: string;
+    reportId: string;
+    body: string;
+    authorRole: AppBugReportMessageAuthorRole;
+    deliveryStatus: AppBugReportMessageDeliveryStatus;
+    createdAt: string;
+  };
+};
+
+export type RetryAppBugReportMessageMutationVariables = Exact<{
+  id: Scalars['ID']['input'];
+}>;
+
+export type RetryAppBugReportMessageMutation = {
+  __typename?: 'Mutation';
+  retryAppBugReportMessage: {
+    __typename?: 'AppBugReportMessage';
+    id: string;
+    reportId: string;
+    body: string;
+    authorRole: AppBugReportMessageAuthorRole;
+    deliveryStatus: AppBugReportMessageDeliveryStatus;
+    createdAt: string;
+  };
+};
+
+export type AppBugReportChangedSubscriptionVariables = Exact<{ [key: string]: never }>;
+
+export type AppBugReportChangedSubscription = {
+  __typename?: 'Subscription';
+  appBugReportChanged: { __typename?: 'AppBugReportChangedEvent'; reportId: string };
 };
 
 export type GymOwnershipLookupQueryVariables = Exact<{
@@ -11552,6 +16567,7 @@ export type FollowedLiveSessionsQuery = {
 
 export type BoardLiveSessionsQueryVariables = Exact<{
   boardId: Scalars['Int']['input'];
+  boardUuid?: InputMaybe<Scalars['ID']['input']>;
 }>;
 
 export type BoardLiveSessionsQuery = {
@@ -11768,6 +16784,7 @@ export type SaveClimbMutation = {
   saveClimb: {
     __typename?: 'SaveClimbResult';
     uuid: string;
+    replayed?: boolean | null;
     synced: boolean;
     createdAt?: string | null;
     publishedAt?: string | null;
@@ -11811,6 +16828,13 @@ export type DeleteDraftClimbMutationVariables = Exact<{
 
 export type DeleteDraftClimbMutation = { __typename?: 'Mutation'; deleteDraftClimb: boolean };
 
+export type DeleteClimbMutationVariables = Exact<{
+  uuid: Scalars['ID']['input'];
+  boardType: Scalars['String']['input'];
+}>;
+
+export type DeleteClimbMutation = { __typename?: 'Mutation'; deleteClimb: boolean };
+
 export type GetNotificationsQueryVariables = Exact<{
   unreadOnly?: InputMaybe<Scalars['Boolean']['input']>;
   limit?: InputMaybe<Scalars['Int']['input']>;
@@ -11840,6 +16864,10 @@ export type GetNotificationsQuery = {
       proposalUuid?: string | null;
       proposalType?: ProposalType | null;
       proposalValue?: string | null;
+      sprayWallName?: string | null;
+      sprayWallUuid?: string | null;
+      sprayVersionId?: string | null;
+      sprayResetOfWallUuid?: string | null;
       isRead: boolean;
       createdAt: string;
     }>;
@@ -11873,6 +16901,7 @@ export type GetGroupedNotificationsQuery = {
       climbAngle?: number | null;
       climbFrames?: string | null;
       climbCompatibleSizeIds?: Array<number> | null;
+      climbCharacteristics?: Array<string> | null;
       threadEntityType?: SocialEntityType | null;
       threadEntityId?: string | null;
       proposalUuid?: string | null;
@@ -11880,6 +16909,10 @@ export type GetGroupedNotificationsQuery = {
       proposalValue?: string | null;
       setterUsername?: string | null;
       gymName?: string | null;
+      sprayWallName?: string | null;
+      sprayWallUuid?: string | null;
+      sprayVersionId?: string | null;
+      sprayResetOfWallUuid?: string | null;
       isRead: boolean;
       createdAt: string;
       actors: Array<{
@@ -11935,6 +16968,30 @@ export type MarkGroupNotificationsReadMutation = { __typename?: 'Mutation'; mark
 export type MarkAllNotificationsReadMutationVariables = Exact<{ [key: string]: never }>;
 
 export type MarkAllNotificationsReadMutation = { __typename?: 'Mutation'; markAllNotificationsRead: boolean };
+
+export type RecordOfflineWriteObservationsMutationVariables = Exact<{
+  input: RecordOfflineWriteObservationsInput;
+}>;
+
+export type RecordOfflineWriteObservationsMutation = {
+  __typename?: 'Mutation';
+  recordOfflineWriteObservations: {
+    __typename?: 'RecordOfflineWriteObservationsResult';
+    receipts: Array<{
+      __typename?: 'OfflineWriteDeliveryReceipt';
+      deliveryId: string;
+      revision: number;
+      serverAcceptedAt?: string | null;
+      serverRejectedAt?: string | null;
+    }>;
+  };
+};
+
+export type ResolvePartnerSessionHistoryQueryVariables = Exact<{
+  exportId: Scalars['ID']['input'];
+}>;
+
+export type ResolvePartnerSessionHistoryQuery = { __typename?: 'Query'; resolvePartnerSessionHistory?: string | null };
 
 export type SearchPlacesQueryVariables = Exact<{
   query: Scalars['String']['input'];
@@ -12224,6 +17281,7 @@ export type GetPlaylistClimbsQuery = {
   playlistClimbs: {
     __typename?: 'PlaylistClimbsResult';
     totalCount: number;
+    unfilteredCount?: number | null;
     hasMore: boolean;
     climbs: Array<{
       __typename?: 'Climb';
@@ -12252,6 +17310,15 @@ export type GetPlaylistClimbsQuery = {
   };
 };
 
+export type GetPlaylistSettersQueryVariables = Exact<{
+  input: PlaylistSettersInput;
+}>;
+
+export type GetPlaylistSettersQuery = {
+  __typename?: 'Query';
+  playlistSetters: Array<{ __typename?: 'PlaylistSetter'; username: string; climbCount: number }>;
+};
+
 export type DiscoverPlaylistsQueryVariables = Exact<{
   input: DiscoverPlaylistsInput;
 }>;
@@ -12278,6 +17345,12 @@ export type DiscoverPlaylistsQuery = {
       creatorId: string;
       creatorName: string;
       isGeneratedRecommendation: boolean;
+      gradeSummary?: {
+        __typename?: 'PlaylistGradeSummary';
+        gradedClimbCount: number;
+        p10Difficulty: number;
+        p90Difficulty: number;
+      } | null;
     }>;
   };
 };
@@ -12352,6 +17425,7 @@ export type GetSmartPlaylistQuery = {
   smartPlaylist: {
     __typename?: 'SmartPlaylistResult';
     totalCount: number;
+    unfilteredCount?: number | null;
     hasMore: boolean;
     meta: {
       __typename?: 'SmartPlaylistMeta';
@@ -12395,6 +17469,285 @@ export type GetMySmartPlaylistCountsQuery = {
   mySmartPlaylistCounts: Array<{ __typename?: 'SmartPlaylistCount'; type: SmartPlaylistType; count: number }>;
 };
 
+export type PrivacySettingsQueryVariables = Exact<{ [key: string]: never }>;
+
+export type PrivacySettingsQuery = {
+  __typename?: 'Query';
+  privacySettings: {
+    __typename?: 'PrivacySettings';
+    isPrivate: boolean;
+    privacyRevision: number;
+    defaultSessionAudience: PrivacyResourceAudience;
+    anonymousOnForeignBoards: boolean;
+    enabled: boolean;
+  };
+};
+
+export type UpdatePrivacySettingsMutationVariables = Exact<{
+  input: UpdatePrivacySettingsInput;
+}>;
+
+export type UpdatePrivacySettingsMutation = {
+  __typename?: 'Mutation';
+  updatePrivacySettings: {
+    __typename?: 'PrivacySettings';
+    isPrivate: boolean;
+    privacyRevision: number;
+    defaultSessionAudience: PrivacyResourceAudience;
+    anonymousOnForeignBoards: boolean;
+    enabled: boolean;
+  };
+};
+
+export type SetAnonymousOnForeignBoardsMutationVariables = Exact<{
+  enabled: Scalars['Boolean']['input'];
+}>;
+
+export type SetAnonymousOnForeignBoardsMutation = {
+  __typename?: 'Mutation';
+  setAnonymousOnForeignBoards: {
+    __typename?: 'PrivacySettings';
+    isPrivate: boolean;
+    privacyRevision: number;
+    defaultSessionAudience: PrivacyResourceAudience;
+    anonymousOnForeignBoards: boolean;
+    enabled: boolean;
+  };
+};
+
+export type IncomingFollowRequestsQueryVariables = Exact<{ [key: string]: never }>;
+
+export type IncomingFollowRequestsQuery = {
+  __typename?: 'Query';
+  incomingFollowRequests: Array<{
+    __typename?: 'PrivacyFollowRequest';
+    requesterId: string;
+    recipientId: string;
+    createdAt: string;
+    displayName?: string | null;
+    avatarUrl?: string | null;
+  }>;
+};
+
+export type PrivacyRelationshipQueryVariables = Exact<{
+  userId: Scalars['ID']['input'];
+}>;
+
+export type PrivacyRelationshipQuery = {
+  __typename?: 'Query';
+  privacyRelationship: {
+    __typename?: 'PrivacyRelationship';
+    userId: string;
+    isPrivate: boolean;
+    isFollowing: boolean;
+    requestPending: boolean;
+  };
+};
+
+export type RequestFollowMutationVariables = Exact<{
+  userId: Scalars['ID']['input'];
+}>;
+
+export type RequestFollowMutation = {
+  __typename?: 'Mutation';
+  requestFollow: {
+    __typename?: 'PrivacyRelationship';
+    userId: string;
+    isPrivate: boolean;
+    isFollowing: boolean;
+    requestPending: boolean;
+  };
+};
+
+export type CancelFollowRequestMutationVariables = Exact<{
+  userId: Scalars['ID']['input'];
+}>;
+
+export type CancelFollowRequestMutation = { __typename?: 'Mutation'; cancelFollowRequest: boolean };
+
+export type ApproveFollowRequestMutationVariables = Exact<{
+  userId: Scalars['ID']['input'];
+}>;
+
+export type ApproveFollowRequestMutation = { __typename?: 'Mutation'; approveFollowRequest: boolean };
+
+export type DeclineFollowRequestMutationVariables = Exact<{
+  userId: Scalars['ID']['input'];
+}>;
+
+export type DeclineFollowRequestMutation = { __typename?: 'Mutation'; declineFollowRequest: boolean };
+
+export type RemoveFollowerMutationVariables = Exact<{
+  userId: Scalars['ID']['input'];
+}>;
+
+export type RemoveFollowerMutation = { __typename?: 'Mutation'; removeFollower: boolean };
+
+export type SetContentAudienceMutationVariables = Exact<{
+  input: SetContentAudienceInput;
+}>;
+
+export type SetContentAudienceMutation = { __typename?: 'Mutation'; setContentAudience: boolean };
+
+export type ContentAudienceQueryVariables = Exact<{
+  entityType: PrivacyContentType;
+  entityId: Scalars['ID']['input'];
+}>;
+
+export type ContentAudienceQuery = {
+  __typename?: 'Query';
+  contentAudience: {
+    __typename?: 'PrivacyContentAudience';
+    audience: PrivacyAudience;
+    isExplicit: boolean;
+    canEdit: boolean;
+  };
+};
+
+export type ResourcePrivacyQueryVariables = Exact<{
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+}>;
+
+export type ResourcePrivacyQuery = {
+  __typename?: 'Query';
+  resourcePrivacy?: {
+    __typename?: 'ResourcePrivacySettings';
+    kind: PrivacyResourceKind;
+    resourceId: string;
+    ownerId?: string | null;
+    audience: PrivacyResourceAudience;
+    locationAudience: PrivacyLocationAudience;
+    inheritFollowers: boolean;
+    revision: number;
+  } | null;
+};
+
+export type UpdateResourcePrivacyMutationVariables = Exact<{
+  input: UpdateResourcePrivacyInput;
+}>;
+
+export type UpdateResourcePrivacyMutation = {
+  __typename?: 'Mutation';
+  updateResourcePrivacy: {
+    __typename?: 'ResourcePrivacySettings';
+    kind: PrivacyResourceKind;
+    resourceId: string;
+    ownerId?: string | null;
+    audience: PrivacyResourceAudience;
+    locationAudience: PrivacyLocationAudience;
+    inheritFollowers: boolean;
+    revision: number;
+  };
+};
+
+export type ResourceAccessRequestsQueryVariables = Exact<{
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+  offset?: InputMaybe<Scalars['Int']['input']>;
+  userIds?: InputMaybe<Array<Scalars['ID']['input']> | Scalars['ID']['input']>;
+}>;
+
+export type ResourceAccessRequestsQuery = {
+  __typename?: 'Query';
+  resourceAccessRequests: Array<{
+    __typename?: 'PrivacyResourceGrant';
+    userId: string;
+    status: PrivacyGrantStatus;
+    invitedBy?: string | null;
+    displayName?: string | null;
+    avatarUrl?: string | null;
+  }>;
+};
+
+export type ApproveResourceAccessMutationVariables = Exact<{
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+  userId: Scalars['ID']['input'];
+}>;
+
+export type ApproveResourceAccessMutation = { __typename?: 'Mutation'; approveResourceAccess: boolean };
+
+export type RevokeResourceAccessMutationVariables = Exact<{
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+  userId: Scalars['ID']['input'];
+}>;
+
+export type RevokeResourceAccessMutation = { __typename?: 'Mutation'; revokeResourceAccess: boolean };
+
+export type RequestResourceAccessMutationVariables = Exact<{
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+}>;
+
+export type RequestResourceAccessMutation = { __typename?: 'Mutation'; requestResourceAccess: boolean };
+
+export type InviteResourceMemberMutationVariables = Exact<{
+  kind: PrivacyResourceKind;
+  resourceId: Scalars['ID']['input'];
+  userId: Scalars['ID']['input'];
+}>;
+
+export type InviteResourceMemberMutation = { __typename?: 'Mutation'; inviteResourceMember: boolean };
+
+export type ProfilePrivacyQueryVariables = Exact<{
+  userId: Scalars['ID']['input'];
+}>;
+
+export type ProfilePrivacyQuery = {
+  __typename?: 'Query';
+  publicProfile?: { __typename?: 'PublicUserProfile'; isPrivate: boolean; canViewActivity: boolean } | null;
+};
+
+export type BoardShareLinkQueryVariables = Exact<{
+  boardUuid: Scalars['ID']['input'];
+}>;
+
+export type BoardShareLinkQuery = {
+  __typename?: 'Query';
+  boardShareLink?: {
+    __typename?: 'BoardShareLink';
+    boardUuid: string;
+    token: string;
+    path: string;
+    createdAt: string;
+  } | null;
+};
+
+export type ResetBoardShareLinkMutationVariables = Exact<{
+  boardUuid: Scalars['ID']['input'];
+}>;
+
+export type ResetBoardShareLinkMutation = {
+  __typename?: 'Mutation';
+  resetBoardShareLink?: {
+    __typename?: 'BoardShareLink';
+    boardUuid: string;
+    token: string;
+    path: string;
+    createdAt: string;
+  } | null;
+};
+
+export type RedeemBoardShareLinkMutationVariables = Exact<{
+  token: Scalars['String']['input'];
+}>;
+
+export type RedeemBoardShareLinkMutation = {
+  __typename?: 'Mutation';
+  redeemBoardShareLink: { __typename?: 'BoardShareLinkRedemption'; boardUuid: string; slug: string };
+};
+
+export type BoardShareLinkPreviewQueryVariables = Exact<{
+  token: Scalars['String']['input'];
+}>;
+
+export type BoardShareLinkPreviewQuery = {
+  __typename?: 'Query';
+  boardShareLinkPreview?: { __typename?: 'BoardShareLinkPreview'; name: string } | null;
+};
+
 export type GetClimbProposalsQueryVariables = Exact<{
   input: GetClimbProposalsInput;
 }>;
@@ -12411,7 +17764,7 @@ export type GetClimbProposalsQuery = {
       climbUuid: string;
       boardType: string;
       angle?: number | null;
-      proposerId: string;
+      proposerId?: string | null;
       proposerDisplayName?: string | null;
       proposerAvatarUrl?: string | null;
       type: ProposalType;
@@ -12513,7 +17866,7 @@ export type BrowseProposalsQuery = {
       climbUuid: string;
       boardType: string;
       angle?: number | null;
-      proposerId: string;
+      proposerId?: string | null;
       proposerDisplayName?: string | null;
       proposerAvatarUrl?: string | null;
       type: ProposalType;
@@ -12573,7 +17926,7 @@ export type CreateProposalMutation = {
     climbUuid: string;
     boardType: string;
     angle?: number | null;
-    proposerId: string;
+    proposerId?: string | null;
     proposerDisplayName?: string | null;
     proposerAvatarUrl?: string | null;
     type: ProposalType;
@@ -12614,7 +17967,7 @@ export type VoteOnProposalMutation = {
     climbUuid: string;
     boardType: string;
     angle?: number | null;
-    proposerId: string;
+    proposerId?: string | null;
     proposerDisplayName?: string | null;
     proposerAvatarUrl?: string | null;
     type: ProposalType;
@@ -12698,7 +18051,7 @@ export type ReportClimbMutation = {
       climbUuid: string;
       boardType: string;
       angle?: number | null;
-      proposerId: string;
+      proposerId?: string | null;
       proposerDisplayName?: string | null;
       proposerAvatarUrl?: string | null;
       type: ProposalType;
@@ -12866,7 +18219,7 @@ export type ResolveProposalFeedMutation = {
     climbUuid: string;
     boardType: string;
     angle?: number | null;
-    proposerId: string;
+    proposerId?: string | null;
     proposerDisplayName?: string | null;
     proposerAvatarUrl?: string | null;
     type: ProposalType;
@@ -12954,6 +18307,132 @@ export type SubmitQaVerdictMutation = {
   };
 };
 
+export type MobileReleaseStatusQueryVariables = Exact<{
+  input: MobileReleaseStatusInput;
+}>;
+
+export type MobileReleaseStatusQuery = {
+  __typename?: 'Query';
+  mobileReleaseStatus: {
+    __typename?: 'ReleaseContext';
+    channel?: string | null;
+    branch?: string | null;
+    updateId?: string | null;
+    runtimeVersion?: string | null;
+    isEmbeddedLaunch?: boolean | null;
+    automaticCanary?: boolean | null;
+    canaryCheckedAt?: string | null;
+  };
+};
+
+export type ProposalReportReleaseContextsQueryVariables = Exact<{
+  proposalUuid: Scalars['ID']['input'];
+}>;
+
+export type ProposalReportReleaseContextsQuery = {
+  __typename?: 'Query';
+  proposalReportReleaseContexts: Array<{
+    __typename?: 'ProposalReportReleaseContext';
+    commentUuid: string;
+    releaseContext: {
+      __typename?: 'ReleaseContext';
+      channel?: string | null;
+      branch?: string | null;
+      updateId?: string | null;
+      runtimeVersion?: string | null;
+      isEmbeddedLaunch?: boolean | null;
+      automaticCanary?: boolean | null;
+      canaryCheckedAt?: string | null;
+    };
+  }>;
+};
+
+export type SavedClimbDocumentsQueryVariables = Exact<{
+  boardType: Scalars['String']['input'];
+  layoutId: Scalars['Int']['input'];
+  climbUuid: Scalars['ID']['input'];
+  sprayWallUuid?: InputMaybe<Scalars['ID']['input']>;
+}>;
+
+export type SavedClimbDocumentsQuery = {
+  __typename?: 'Query';
+  syncClimbDocuments?: {
+    __typename?: 'SyncClimbDocuments';
+    viewerId: string;
+    climb: unknown;
+    stats: Array<unknown>;
+  } | null;
+};
+
+export type GetSessionWorkoutsQueryVariables = Exact<{
+  sessionId: Scalars['ID']['input'];
+}>;
+
+export type GetSessionWorkoutsQuery = {
+  __typename?: 'Query';
+  sessionWorkouts: Array<{
+    __typename?: 'SessionWorkout';
+    userId: string;
+    displayName?: string | null;
+    avatarUrl?: string | null;
+    offPlan: number;
+    offPlanTickUuids: Array<string>;
+    updatedAt: string;
+    stages: Array<{
+      __typename?: 'SessionWorkoutStage';
+      id: string;
+      kind: string;
+      isCoolDown: boolean;
+      targetGrade?: string | null;
+      repsPerSet?: number | null;
+      sets?: number | null;
+      intervalSeconds?: number | null;
+      restSeconds?: number | null;
+      tally: { __typename?: 'SessionWorkoutTally'; sent: number; attempts: number; skipped: number; climbs: number };
+      climbs: Array<{
+        __typename?: 'SessionWorkoutClimb';
+        queueItemUuid: string;
+        climbUuid: string;
+        angle: number;
+        isMirror?: boolean | null;
+        name?: string | null;
+        grade?: string | null;
+        boardType?: string | null;
+        layoutId?: number | null;
+        frames?: string | null;
+        reps: Array<SessionWorkoutRepOutcome>;
+        tickUuids: Array<string>;
+        skipped: boolean;
+        renderBoard?: {
+          __typename?: 'RenderBoardConfig';
+          layoutId: number;
+          sizeId: number;
+          setIds: Array<number>;
+        } | null;
+      }>;
+    }>;
+  }>;
+};
+
+export type GetSessionWorkoutHeadlinesQueryVariables = Exact<{
+  sessionIds: Array<Scalars['ID']['input']> | Scalars['ID']['input'];
+}>;
+
+export type GetSessionWorkoutHeadlinesQuery = {
+  __typename?: 'Query';
+  sessionWorkoutHeadlines: Array<{
+    __typename?: 'SessionWorkoutHeadline';
+    sessionId: string;
+    userId: string;
+    mainKind?: string | null;
+    mainTargetGrade?: string | null;
+    mainTargetBoardType?: string | null;
+    secondMainKind?: string | null;
+    blockCount: number;
+    extraMainBlocks: number;
+  }>;
+};
+
 export type SessionSummaryFieldsFragment = {
   __typename?: 'SessionSummary';
   sessionId: string;
@@ -12984,7 +18463,7 @@ export type SessionSummaryFieldsFragment = {
   } | null;
   participants: Array<{
     __typename?: 'SessionParticipant';
-    userId: string;
+    userId?: string | null;
     displayName?: string | null;
     avatarUrl?: string | null;
     sends: number;
@@ -13031,7 +18510,7 @@ export type EndSessionMutation = {
     } | null;
     participants: Array<{
       __typename?: 'SessionParticipant';
-      userId: string;
+      userId?: string | null;
       displayName?: string | null;
       avatarUrl?: string | null;
       sends: number;
@@ -13092,7 +18571,7 @@ export type GetSessionSummaryQuery = {
     } | null;
     participants: Array<{
       __typename?: 'SessionParticipant';
-      userId: string;
+      userId?: string | null;
       displayName?: string | null;
       avatarUrl?: string | null;
       sends: number;
@@ -13291,6 +18770,7 @@ export type GetFollowingClimbAscentsQuery = {
   __typename?: 'Query';
   followingClimbAscents: {
     __typename?: 'FollowingClimbAscentsResult';
+    hasMore: boolean;
     items: Array<{
       __typename?: 'FollowingAscentFeedItem';
       uuid: string;
@@ -13303,11 +18783,54 @@ export type GetFollowingClimbAscentsQuery = {
       status: string;
       attemptCount: number;
       quality?: number | null;
+      effectiveQuality?: number | null;
+      difficulty?: number | null;
       comment: string;
       climbedAt: string;
       upvotes?: number | null;
       downvotes?: number | null;
       commentCount?: number | null;
+    }>;
+    summary: {
+      __typename?: 'FollowingClimbAscentsSummary';
+      climberCount: number;
+      senderCount: number;
+      byAngle: Array<{
+        __typename?: 'FollowingClimbAscentsAngleCount';
+        angle: number;
+        climberCount: number;
+        senderCount: number;
+      }>;
+    };
+  };
+};
+
+export type GetClimbLogsQueryVariables = Exact<{
+  input: ClimbLogsInput;
+}>;
+
+export type GetClimbLogsQuery = {
+  __typename?: 'Query';
+  climbLogs: {
+    __typename?: 'ClimbLogsResult';
+    cursor?: string | null;
+    hasMore: boolean;
+    items: Array<{
+      __typename?: 'ClimbLogItem';
+      uuid: string;
+      userId: string;
+      userDisplayName?: string | null;
+      userAvatarUrl?: string | null;
+      climbUuid: string;
+      angle: number;
+      isMirror: boolean;
+      status: string;
+      attemptCount: number;
+      quality?: number | null;
+      effectiveQuality?: number | null;
+      difficulty?: number | null;
+      comment: string;
+      climbedAt: string;
     }>;
   };
 };
@@ -13481,6 +19004,8 @@ export type SprayDetectionFieldsFragment = {
   modelVersion: string;
   error?: string | null;
   createdAt: string;
+  queuePosition?: number | null;
+  retryAt?: string | null;
   finishedAt?: string | null;
   result?: {
     __typename?: 'SprayDetectionResult';
@@ -13513,6 +19038,8 @@ export type SprayDetectionQuery = {
     modelVersion: string;
     error?: string | null;
     createdAt: string;
+    queuePosition?: number | null;
+    retryAt?: string | null;
     finishedAt?: string | null;
     result?: {
       __typename?: 'SprayDetectionResult';
@@ -13545,6 +19072,8 @@ export type RequestSprayDetectionMutation = {
     modelVersion: string;
     error?: string | null;
     createdAt: string;
+    queuePosition?: number | null;
+    retryAt?: string | null;
     finishedAt?: string | null;
     result?: {
       __typename?: 'SprayDetectionResult';
@@ -13577,6 +19106,8 @@ export type RetrySprayDetectionMutation = {
     modelVersion: string;
     error?: string | null;
     createdAt: string;
+    queuePosition?: number | null;
+    retryAt?: string | null;
     finishedAt?: string | null;
     result?: {
       __typename?: 'SprayDetectionResult';
@@ -13592,6 +19123,24 @@ export type RetrySprayDetectionMutation = {
       }>;
     } | null;
   };
+};
+
+export type SprayWallImportProgressQueryVariables = Exact<{
+  wallUuids: Array<Scalars['ID']['input']> | Scalars['ID']['input'];
+}>;
+
+export type SprayWallImportProgressQuery = {
+  __typename?: 'Query';
+  sprayWallImportProgress: Array<{
+    __typename?: 'SprayWallImportProgress';
+    wallUuid: string;
+    versionId?: string | null;
+    detectionId?: string | null;
+    stage: string;
+    queuePosition?: number | null;
+    retryAt?: string | null;
+    resetOfWallUuid?: string | null;
+  }>;
 };
 
 export type GetTicksQueryVariables = Exact<{
@@ -13716,6 +19265,7 @@ export type GetUserAscentsFeedQuery = {
       qualityAverage?: number | null;
       isBenchmark: boolean;
       isNoMatch: boolean;
+      characteristics?: Array<string> | null;
       comment: string;
       climbedAt: string;
       frames?: string | null;
@@ -13728,6 +19278,16 @@ export type GetUserAscentsFeedQuery = {
       } | null;
     }>;
   };
+};
+
+export type GetUserLoggedSettersQueryVariables = Exact<{
+  userId: Scalars['ID']['input'];
+  input?: InputMaybe<UserLoggedSettersInput>;
+}>;
+
+export type GetUserLoggedSettersQuery = {
+  __typename?: 'Query';
+  userLoggedSetters: Array<{ __typename?: 'LoggedSetter'; setterUsername: string; tickCount: number }>;
 };
 
 export type GetUserAscentCaptionMatchesQueryVariables = Exact<{
@@ -13762,6 +19322,7 @@ export type GetUserAscentCaptionMatchesQuery = {
     qualityAverage?: number | null;
     isBenchmark: boolean;
     isNoMatch: boolean;
+    characteristics?: Array<string> | null;
     comment: string;
     climbedAt: string;
     frames?: string | null;
@@ -13794,6 +19355,7 @@ export type GetUserGroupedAscentsFeedQuery = {
       difficultyName?: string | null;
       isBenchmark: boolean;
       isNoMatch: boolean;
+      characteristics?: Array<string> | null;
       date: string;
       flashCount: number;
       sendCount: number;
@@ -13831,6 +19393,7 @@ export type GetUserGroupedAscentsFeedQuery = {
         qualityAverage?: number | null;
         isBenchmark: boolean;
         isNoMatch: boolean;
+        characteristics?: Array<string> | null;
         comment: string;
         climbedAt: string;
         frames?: string | null;
@@ -13890,6 +19453,8 @@ export type UpdateTickMutation = {
   updateTick: {
     __typename?: 'Tick';
     uuid: string;
+    boardId?: number | null;
+    boardDisplayName?: string | null;
     status: TickStatus;
     attemptCount: number;
     quality?: number | null;
@@ -13899,6 +19464,164 @@ export type UpdateTickMutation = {
     climbedAt: string;
     angle: number;
     updatedAt: string;
+  };
+};
+
+export type TickBoardOptionsQueryVariables = Exact<{
+  tickUuid: Scalars['ID']['input'];
+  limit?: InputMaybe<Scalars['Int']['input']>;
+  offset?: InputMaybe<Scalars['Int']['input']>;
+}>;
+
+export type TickBoardOptionsQuery = {
+  __typename?: 'Query';
+  tickBoardOptions: {
+    __typename?: 'TickBoardOptions';
+    totalCount: number;
+    hasMore: boolean;
+    currentBoard?: {
+      __typename?: 'TickBoardOption';
+      uuid: string;
+      name: string;
+      boardType: string;
+      layoutId: number;
+      sizeId: number;
+      setIds: string;
+    } | null;
+    boards: Array<{
+      __typename?: 'TickBoardOption';
+      uuid: string;
+      name: string;
+      boardType: string;
+      layoutId: number;
+      sizeId: number;
+      setIds: string;
+    }>;
+  };
+};
+
+export type UserDataExportStatusFieldsFragment = {
+  __typename?: 'UserDataExportStatus';
+  boardType: string;
+  period: string;
+  status: UserDataExportState;
+  refreshAt: string;
+  requestedAt?: string | null;
+  completedAt?: string | null;
+  retryAt?: string | null;
+  error?: string | null;
+  errorCode?: string | null;
+  files: Array<{
+    __typename?: 'UserDataExportFile';
+    format: UserDataExportFormat;
+    filename: string;
+    fileSize?: number | null;
+    exportedAt: string;
+    expiresAt: string;
+  }>;
+};
+
+export type GetUserDataExportQueryVariables = Exact<{
+  boardType: Scalars['String']['input'];
+  period?: InputMaybe<Scalars['String']['input']>;
+}>;
+
+export type GetUserDataExportQuery = {
+  __typename?: 'Query';
+  userDataExport: {
+    __typename?: 'UserDataExportStatus';
+    boardType: string;
+    period: string;
+    status: UserDataExportState;
+    refreshAt: string;
+    requestedAt?: string | null;
+    completedAt?: string | null;
+    retryAt?: string | null;
+    error?: string | null;
+    errorCode?: string | null;
+    files: Array<{
+      __typename?: 'UserDataExportFile';
+      format: UserDataExportFormat;
+      filename: string;
+      fileSize?: number | null;
+      exportedAt: string;
+      expiresAt: string;
+    }>;
+  };
+};
+
+export type RequestUserDataExportMutationVariables = Exact<{
+  boardType: Scalars['String']['input'];
+}>;
+
+export type RequestUserDataExportMutation = {
+  __typename?: 'Mutation';
+  requestUserDataExport: {
+    __typename?: 'UserDataExportStatus';
+    boardType: string;
+    period: string;
+    status: UserDataExportState;
+    refreshAt: string;
+    requestedAt?: string | null;
+    completedAt?: string | null;
+    retryAt?: string | null;
+    error?: string | null;
+    errorCode?: string | null;
+    files: Array<{
+      __typename?: 'UserDataExportFile';
+      format: UserDataExportFormat;
+      filename: string;
+      fileSize?: number | null;
+      exportedAt: string;
+      expiresAt: string;
+    }>;
+  };
+};
+
+export type GetUserDataExportDownloadQueryVariables = Exact<{
+  boardType: Scalars['String']['input'];
+  period: Scalars['String']['input'];
+  format: UserDataExportFormat;
+}>;
+
+export type GetUserDataExportDownloadQuery = {
+  __typename?: 'Query';
+  userDataExportDownload: {
+    __typename?: 'UserDataExportDownloadLink';
+    url: string;
+    expiresAt: string;
+    filename: string;
+  };
+};
+
+export type JoinRedirectSessionBoardPathQueryVariables = Exact<{
+  sessionId: Scalars['ID']['input'];
+}>;
+
+export type JoinRedirectSessionBoardPathQuery = {
+  __typename?: 'Query';
+  session?: { __typename?: 'Session'; boardPath: string } | null;
+};
+
+export type FrontDoorNearbyClimbsQueryVariables = Exact<{
+  input: ClimbSearchInput;
+}>;
+
+export type FrontDoorNearbyClimbsQuery = {
+  __typename?: 'Query';
+  searchClimbs: {
+    __typename?: 'ClimbSearchResult';
+    climbs: Array<{
+      __typename?: 'Climb';
+      uuid: string;
+      name: string;
+      setter_username: string;
+      frames: string;
+      difficulty: string;
+      quality_average: string;
+      ascensionist_count: number;
+      compatibleSizeIds?: Array<number> | null;
+    }>;
   };
 };
 
@@ -13994,6 +19717,7 @@ export const SessionFeedItemFieldsFragmentDoc = {
                 { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
@@ -14042,6 +19766,7 @@ export const SessionFeedItemFieldsFragmentDoc = {
                       { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
@@ -14126,6 +19851,25 @@ export const CrewClimbFieldsFragmentDoc = {
     },
   ],
 } as unknown as DocumentNode<CrewClimbFieldsFragment, unknown>;
+export const AnalyticsConsentFieldsFragmentDoc = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'FragmentDefinition',
+      name: { kind: 'Name', value: 'AnalyticsConsentFields' },
+      typeCondition: { kind: 'NamedType', name: { kind: 'Name', value: 'AnalyticsConsent' } },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          { kind: 'Field', name: { kind: 'Name', value: 'analytics' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'version' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'source' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'decidedAt' } },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<AnalyticsConsentFieldsFragment, unknown>;
 export const LiveSessionFieldsFragmentDoc = {
   kind: 'Document',
   definitions: [
@@ -14323,6 +20067,8 @@ export const SprayDetectionFieldsFragmentDoc = {
           { kind: 'Field', name: { kind: 'Name', value: 'modelVersion' } },
           { kind: 'Field', name: { kind: 'Name', value: 'error' } },
           { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'queuePosition' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
           { kind: 'Field', name: { kind: 'Name', value: 'finishedAt' } },
           {
             kind: 'Field',
@@ -14354,6 +20100,58 @@ export const SprayDetectionFieldsFragmentDoc = {
     },
   ],
 } as unknown as DocumentNode<SprayDetectionFieldsFragment, unknown>;
+export const UserDataExportStatusFieldsFragmentDoc = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'FragmentDefinition',
+      name: { kind: 'Name', value: 'UserDataExportStatusFields' },
+      typeCondition: { kind: 'NamedType', name: { kind: 'Name', value: 'UserDataExportStatus' } },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          { kind: 'Field', name: { kind: 'Name', value: 'boardType' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'period' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'refreshAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'requestedAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'completedAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'error' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'errorCode' } },
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'files' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'format' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'filename' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'fileSize' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'exportedAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'expiresAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<UserDataExportStatusFieldsFragment, unknown>;
+export const GetAuthenticatedUserIdDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetAuthenticatedUserId' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [{ kind: 'Field', name: { kind: 'Name', value: 'authenticatedUserId' } }],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetAuthenticatedUserIdQuery, GetAuthenticatedUserIdQueryVariables>;
 export const GetDeleteAccountInfoDocument = {
   kind: 'Document',
   definitions: [
@@ -14625,6 +20423,7 @@ export const GetSessionGroupedFeedDocument = {
                 { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
@@ -14673,6 +20472,7 @@ export const GetSessionGroupedFeedDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
@@ -14909,6 +20709,7 @@ export const GetCrewFeedDocument = {
                 { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
@@ -14957,6 +20758,7 @@ export const GetCrewFeedDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
@@ -15149,6 +20951,7 @@ export const GetSessionDetailDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
@@ -15227,6 +21030,330 @@ export const SetSessionHealthKitWorkoutIdDocument = {
     },
   ],
 } as unknown as DocumentNode<SetSessionHealthKitWorkoutIdMutation, SetSessionHealthKitWorkoutIdMutationVariables>;
+export const GetMyAnalyticsConsentDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetMyAnalyticsConsent' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'myAnalyticsConsent' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [{ kind: 'FragmentSpread', name: { kind: 'Name', value: 'AnalyticsConsentFields' } }],
+            },
+          },
+        ],
+      },
+    },
+    {
+      kind: 'FragmentDefinition',
+      name: { kind: 'Name', value: 'AnalyticsConsentFields' },
+      typeCondition: { kind: 'NamedType', name: { kind: 'Name', value: 'AnalyticsConsent' } },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          { kind: 'Field', name: { kind: 'Name', value: 'analytics' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'version' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'source' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'decidedAt' } },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetMyAnalyticsConsentQuery, GetMyAnalyticsConsentQueryVariables>;
+export const SetAnalyticsConsentDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'SetAnalyticsConsent' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'SetAnalyticsConsentInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'setAnalyticsConsent' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [{ kind: 'FragmentSpread', name: { kind: 'Name', value: 'AnalyticsConsentFields' } }],
+            },
+          },
+        ],
+      },
+    },
+    {
+      kind: 'FragmentDefinition',
+      name: { kind: 'Name', value: 'AnalyticsConsentFields' },
+      typeCondition: { kind: 'NamedType', name: { kind: 'Name', value: 'AnalyticsConsent' } },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          { kind: 'Field', name: { kind: 'Name', value: 'analytics' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'version' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'source' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'decidedAt' } },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<SetAnalyticsConsentMutation, SetAnalyticsConsentMutationVariables>;
+export const GetConsentRegionDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetConsentRegion' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'consentRegion' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'countryCode' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'promptRequired' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'globalPrivacyControl' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetConsentRegionQuery, GetConsentRegionQueryVariables>;
+export const AppWorkoutDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'AppWorkout' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'id' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'appWorkout' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'id' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'id' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'id' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'clientId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'title' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'sourceAppName' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'notes' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'spec' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'expiresAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'sessionId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'sessionPlan' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<AppWorkoutQuery, AppWorkoutQueryVariables>;
+export const AttachAppWorkoutDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'AttachAppWorkout' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'workoutId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'sessionId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'attachAppWorkout' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'workoutId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'workoutId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'sessionId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'sessionId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<AttachAppWorkoutMutation, AttachAppWorkoutMutationVariables>;
+export const RecordAppWorkoutPlanDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RecordAppWorkoutPlan' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'workoutId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'plan' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'JSON' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'recordAppWorkoutPlan' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'workoutId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'workoutId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'plan' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'plan' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RecordAppWorkoutPlanMutation, RecordAppWorkoutPlanMutationVariables>;
+export const ExchangeAppleAdsAttributionDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'ExchangeAppleAdsAttribution' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'token' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'consent' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'AppleAdsConsentInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'exchangeAppleAdsAttribution' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'token' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'token' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'consent' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'consent' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'retryAfterSeconds' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'retryReason' } },
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'attribution' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'orgId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'campaignId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'adGroupId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'keywordId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'adId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'conversionType' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'claimType' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'countryOrRegion' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'supplyPlacement' } },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ExchangeAppleAdsAttributionMutation, ExchangeAppleAdsAttributionMutationVariables>;
 export const GetBetaLinksDocument = {
   kind: 'Document',
   definitions: [
@@ -16413,6 +22540,94 @@ export const VoteDocument = {
     },
   ],
 } as unknown as DocumentNode<VoteMutation, VoteMutationVariables>;
+export const GetMyConnectedAppsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetMyConnectedApps' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'myConnectedApps' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'apps' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'connectionId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'name' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'publisherName' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'scopes' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'connectedAt' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'lastUsedAt' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'suspended' } },
+                    ],
+                  },
+                },
+                { kind: 'Field', name: { kind: 'Name', value: 'partnerAppsEnabled' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetMyConnectedAppsQuery, GetMyConnectedAppsQueryVariables>;
+export const GetPartnerAppsEnabledDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetPartnerAppsEnabled' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [{ kind: 'Field', name: { kind: 'Name', value: 'partnerAppsEnabled' } }],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetPartnerAppsEnabledQuery, GetPartnerAppsEnabledQueryVariables>;
+export const DisconnectAppDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'DisconnectApp' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'connectionId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'disconnectApp' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'connectionId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'connectionId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<DisconnectAppMutation, DisconnectAppMutationVariables>;
 export const CreateSessionDocument = {
   kind: 'Document',
   definitions: [
@@ -16755,11 +22970,30 @@ export const AdminAppFeedbackDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'angle' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'contactConsent' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'lastMessageAt' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'lastMessagePreview' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'needsReply' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'status' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'resolvedAt' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'resolvedBy' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'githubIssueNumber' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'githubIssueUrl' } },
+                      {
+                        kind: 'Field',
+                        name: { kind: 'Name', value: 'releaseContext' },
+                        selectionSet: {
+                          kind: 'SelectionSet',
+                          selections: [
+                            { kind: 'Field', name: { kind: 'Name', value: 'channel' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'branch' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'updateId' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'runtimeVersion' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'isEmbeddedLaunch' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'automaticCanary' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'canaryCheckedAt' } },
+                          ],
+                        },
+                      },
                       {
                         kind: 'Field',
                         name: { kind: 'Name', value: 'reporter' },
@@ -16858,11 +23092,30 @@ export const UpdateAppFeedbackStatusDocument = {
                 { kind: 'Field', name: { kind: 'Name', value: 'angle' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'contactConsent' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'lastMessageAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'lastMessagePreview' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'needsReply' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'status' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'resolvedAt' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'resolvedBy' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'githubIssueNumber' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'githubIssueUrl' } },
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'releaseContext' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'channel' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'branch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'updateId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'runtimeVersion' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'isEmbeddedLaunch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'automaticCanary' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'canaryCheckedAt' } },
+                    ],
+                  },
+                },
                 {
                   kind: 'Field',
                   name: { kind: 'Name', value: 'reporter' },
@@ -16899,6 +23152,285 @@ export const UpdateAppFeedbackStatusDocument = {
     },
   ],
 } as unknown as DocumentNode<UpdateAppFeedbackStatusMutation, UpdateAppFeedbackStatusMutationVariables>;
+export const MyAppBugReportsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'MyAppBugReports' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'AppBugReportsInput' } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'myAppBugReports' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'reports' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'id' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'screenshotUrls' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'githubIssueNumber' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'githubIssueUrl' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'canReply' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'lastMessageAt' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'lastMessagePreview' } },
+                    ],
+                  },
+                },
+                { kind: 'Field', name: { kind: 'Name', value: 'hasMore' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'endCursor' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<MyAppBugReportsQuery, MyAppBugReportsQueryVariables>;
+export const AppBugReportDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'AppBugReport' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'id' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'appBugReport' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'id' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'id' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'id' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'screenshotUrls' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'githubIssueNumber' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'githubIssueUrl' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'canReply' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'lastMessageAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'lastMessagePreview' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<AppBugReportQuery, AppBugReportQueryVariables>;
+export const AppBugReportMessagesDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'AppBugReportMessages' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'AppBugReportMessagesInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'appBugReportMessages' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'messages' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'id' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'reportId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'body' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'authorRole' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'deliveryStatus' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+                    ],
+                  },
+                },
+                { kind: 'Field', name: { kind: 'Name', value: 'hasMore' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'endCursor' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<AppBugReportMessagesQuery, AppBugReportMessagesQueryVariables>;
+export const SendAppBugReportMessageDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'SendAppBugReportMessage' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'SendAppBugReportMessageInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'sendAppBugReportMessage' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'id' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'reportId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'body' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'authorRole' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'deliveryStatus' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<SendAppBugReportMessageMutation, SendAppBugReportMessageMutationVariables>;
+export const RetryAppBugReportMessageDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RetryAppBugReportMessage' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'id' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'retryAppBugReportMessage' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'id' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'id' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'id' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'reportId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'body' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'authorRole' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'deliveryStatus' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RetryAppBugReportMessageMutation, RetryAppBugReportMessageMutationVariables>;
+export const AppBugReportChangedDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'subscription',
+      name: { kind: 'Name', value: 'AppBugReportChanged' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'appBugReportChanged' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [{ kind: 'Field', name: { kind: 'Name', value: 'reportId' } }],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<AppBugReportChangedSubscription, AppBugReportChangedSubscriptionVariables>;
 export const GymOwnershipLookupDocument = {
   kind: 'Document',
   definitions: [
@@ -17197,6 +23729,11 @@ export const BoardLiveSessionsDocument = {
           variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardId' } },
           type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'Int' } } },
         },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardUuid' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } },
+        },
       ],
       selectionSet: {
         kind: 'SelectionSet',
@@ -17209,6 +23746,11 @@ export const BoardLiveSessionsDocument = {
                 kind: 'Argument',
                 name: { kind: 'Name', value: 'boardId' },
                 value: { kind: 'Variable', name: { kind: 'Name', value: 'boardId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardUuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardUuid' } },
               },
             ],
             selectionSet: {
@@ -17767,6 +24309,7 @@ export const SaveClimbDocument = {
               kind: 'SelectionSet',
               selections: [
                 { kind: 'Field', name: { kind: 'Name', value: 'uuid' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'replayed' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'synced' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'publishedAt' } },
@@ -17908,6 +24451,49 @@ export const DeleteDraftClimbDocument = {
     },
   ],
 } as unknown as DocumentNode<DeleteDraftClimbMutation, DeleteDraftClimbMutationVariables>;
+export const DeleteClimbDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'DeleteClimb' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'uuid' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'deleteClimb' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'uuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'uuid' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardType' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<DeleteClimbMutation, DeleteClimbMutationVariables>;
 export const GetNotificationsDocument = {
   kind: 'Document',
   definitions: [
@@ -17978,6 +24564,10 @@ export const GetNotificationsDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'proposalUuid' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'proposalType' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'proposalValue' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayWallName' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayWallUuid' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayVersionId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayResetOfWallUuid' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isRead' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
                     ],
@@ -18065,6 +24655,7 @@ export const GetGroupedNotificationsDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'climbAngle' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'climbFrames' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'climbCompatibleSizeIds' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'climbCharacteristics' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'threadEntityType' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'threadEntityId' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'proposalUuid' } },
@@ -18072,6 +24663,10 @@ export const GetGroupedNotificationsDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'proposalValue' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'gymName' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayWallName' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayWallUuid' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayVersionId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sprayResetOfWallUuid' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isRead' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
                     ],
@@ -18260,6 +24855,93 @@ export const MarkAllNotificationsReadDocument = {
     },
   ],
 } as unknown as DocumentNode<MarkAllNotificationsReadMutation, MarkAllNotificationsReadMutationVariables>;
+export const RecordOfflineWriteObservationsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RecordOfflineWriteObservations' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'RecordOfflineWriteObservationsInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'recordOfflineWriteObservations' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'receipts' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'deliveryId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'revision' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'serverAcceptedAt' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'serverRejectedAt' } },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RecordOfflineWriteObservationsMutation, RecordOfflineWriteObservationsMutationVariables>;
+export const ResolvePartnerSessionHistoryDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'ResolvePartnerSessionHistory' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'exportId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'resolvePartnerSessionHistory' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'exportId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'exportId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ResolvePartnerSessionHistoryQuery, ResolvePartnerSessionHistoryQueryVariables>;
 export const SearchPlacesDocument = {
   kind: 'Document',
   definitions: [
@@ -19077,6 +25759,7 @@ export const GetPlaylistClimbsDocument = {
                   },
                 },
                 { kind: 'Field', name: { kind: 'Name', value: 'totalCount' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'unfilteredCount' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'hasMore' } },
               ],
             },
@@ -19086,6 +25769,49 @@ export const GetPlaylistClimbsDocument = {
     },
   ],
 } as unknown as DocumentNode<GetPlaylistClimbsQuery, GetPlaylistClimbsQueryVariables>;
+export const GetPlaylistSettersDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetPlaylistSetters' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PlaylistSettersInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'playlistSetters' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'username' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'climbCount' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetPlaylistSettersQuery, GetPlaylistSettersQueryVariables>;
 export const DiscoverPlaylistsDocument = {
   kind: 'Document',
   definitions: [
@@ -19139,6 +25865,18 @@ export const DiscoverPlaylistsDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'creatorId' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'creatorName' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isGeneratedRecommendation' } },
+                      {
+                        kind: 'Field',
+                        name: { kind: 'Name', value: 'gradeSummary' },
+                        selectionSet: {
+                          kind: 'SelectionSet',
+                          selections: [
+                            { kind: 'Field', name: { kind: 'Name', value: 'gradedClimbCount' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'p10Difficulty' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'p90Difficulty' } },
+                          ],
+                        },
+                      },
                     ],
                   },
                 },
@@ -19444,6 +26182,7 @@ export const GetSmartPlaylistDocument = {
                   },
                 },
                 { kind: 'Field', name: { kind: 'Name', value: 'totalCount' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'unfilteredCount' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'hasMore' } },
               ],
             },
@@ -19479,6 +26218,1059 @@ export const GetMySmartPlaylistCountsDocument = {
     },
   ],
 } as unknown as DocumentNode<GetMySmartPlaylistCountsQuery, GetMySmartPlaylistCountsQueryVariables>;
+export const PrivacySettingsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'PrivacySettings' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'privacySettings' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'isPrivate' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'privacyRevision' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'defaultSessionAudience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'anonymousOnForeignBoards' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'enabled' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<PrivacySettingsQuery, PrivacySettingsQueryVariables>;
+export const UpdatePrivacySettingsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'UpdatePrivacySettings' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'UpdatePrivacySettingsInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'updatePrivacySettings' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'isPrivate' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'privacyRevision' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'defaultSessionAudience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'anonymousOnForeignBoards' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'enabled' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<UpdatePrivacySettingsMutation, UpdatePrivacySettingsMutationVariables>;
+export const SetAnonymousOnForeignBoardsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'SetAnonymousOnForeignBoards' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'enabled' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'Boolean' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'setAnonymousOnForeignBoards' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'enabled' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'enabled' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'isPrivate' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'privacyRevision' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'defaultSessionAudience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'anonymousOnForeignBoards' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'enabled' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<SetAnonymousOnForeignBoardsMutation, SetAnonymousOnForeignBoardsMutationVariables>;
+export const IncomingFollowRequestsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'IncomingFollowRequests' },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'incomingFollowRequests' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'requesterId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'recipientId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'displayName' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'avatarUrl' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<IncomingFollowRequestsQuery, IncomingFollowRequestsQueryVariables>;
+export const PrivacyRelationshipDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'PrivacyRelationship' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'privacyRelationship' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'userId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'isPrivate' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'isFollowing' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'requestPending' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<PrivacyRelationshipQuery, PrivacyRelationshipQueryVariables>;
+export const RequestFollowDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RequestFollow' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'requestFollow' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'userId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'isPrivate' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'isFollowing' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'requestPending' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RequestFollowMutation, RequestFollowMutationVariables>;
+export const CancelFollowRequestDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'CancelFollowRequest' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'cancelFollowRequest' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<CancelFollowRequestMutation, CancelFollowRequestMutationVariables>;
+export const ApproveFollowRequestDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'ApproveFollowRequest' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'approveFollowRequest' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ApproveFollowRequestMutation, ApproveFollowRequestMutationVariables>;
+export const DeclineFollowRequestDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'DeclineFollowRequest' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'declineFollowRequest' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<DeclineFollowRequestMutation, DeclineFollowRequestMutationVariables>;
+export const RemoveFollowerDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RemoveFollower' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'removeFollower' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RemoveFollowerMutation, RemoveFollowerMutationVariables>;
+export const SetContentAudienceDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'SetContentAudience' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'SetContentAudienceInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'setContentAudience' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<SetContentAudienceMutation, SetContentAudienceMutationVariables>;
+export const ContentAudienceDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'ContentAudience' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'entityType' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PrivacyContentType' } },
+          },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'entityId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'contentAudience' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'entityType' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'entityType' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'entityId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'entityId' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'audience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'isExplicit' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'canEdit' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ContentAudienceQuery, ContentAudienceQueryVariables>;
+export const ResourcePrivacyDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'ResourcePrivacy' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PrivacyResourceKind' } },
+          },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'resourcePrivacy' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'kind' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'resourceId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'kind' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'resourceId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'ownerId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'audience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'locationAudience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'inheritFollowers' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'revision' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ResourcePrivacyQuery, ResourcePrivacyQueryVariables>;
+export const UpdateResourcePrivacyDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'UpdateResourcePrivacy' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'UpdateResourcePrivacyInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'updateResourcePrivacy' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'kind' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'resourceId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'ownerId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'audience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'locationAudience' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'inheritFollowers' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'revision' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<UpdateResourcePrivacyMutation, UpdateResourcePrivacyMutationVariables>;
+export const ResourceAccessRequestsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'ResourceAccessRequests' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PrivacyResourceKind' } },
+          },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'offset' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'Int' } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userIds' } },
+          type: {
+            kind: 'ListType',
+            type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'resourceAccessRequests' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'kind' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'resourceId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'offset' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'offset' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userIds' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userIds' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'userId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'invitedBy' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'displayName' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'avatarUrl' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ResourceAccessRequestsQuery, ResourceAccessRequestsQueryVariables>;
+export const ApproveResourceAccessDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'ApproveResourceAccess' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PrivacyResourceKind' } },
+          },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'approveResourceAccess' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'kind' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'resourceId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ApproveResourceAccessMutation, ApproveResourceAccessMutationVariables>;
+export const RevokeResourceAccessDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RevokeResourceAccess' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PrivacyResourceKind' } },
+          },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'revokeResourceAccess' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'kind' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'resourceId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RevokeResourceAccessMutation, RevokeResourceAccessMutationVariables>;
+export const RequestResourceAccessDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RequestResourceAccess' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PrivacyResourceKind' } },
+          },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'requestResourceAccess' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'kind' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'resourceId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RequestResourceAccessMutation, RequestResourceAccessMutationVariables>;
+export const InviteResourceMemberDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'InviteResourceMember' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'PrivacyResourceKind' } },
+          },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'inviteResourceMember' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'kind' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'kind' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'resourceId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'resourceId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<InviteResourceMemberMutation, InviteResourceMemberMutationVariables>;
+export const ProfilePrivacyDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'ProfilePrivacy' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'publicProfile' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'isPrivate' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'canViewActivity' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ProfilePrivacyQuery, ProfilePrivacyQueryVariables>;
+export const BoardShareLinkDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'BoardShareLink' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardUuid' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'boardShareLink' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardUuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardUuid' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'boardUuid' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'token' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'path' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<BoardShareLinkQuery, BoardShareLinkQueryVariables>;
+export const ResetBoardShareLinkDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'ResetBoardShareLink' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardUuid' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'resetBoardShareLink' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardUuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardUuid' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'boardUuid' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'token' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'path' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ResetBoardShareLinkMutation, ResetBoardShareLinkMutationVariables>;
+export const RedeemBoardShareLinkDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RedeemBoardShareLink' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'token' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'redeemBoardShareLink' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'token' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'token' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'boardUuid' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'slug' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RedeemBoardShareLinkMutation, RedeemBoardShareLinkMutationVariables>;
+export const BoardShareLinkPreviewDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'BoardShareLinkPreview' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'token' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'boardShareLinkPreview' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'token' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'token' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [{ kind: 'Field', name: { kind: 'Name', value: 'name' } }],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<BoardShareLinkPreviewQuery, BoardShareLinkPreviewQueryVariables>;
 export const GetClimbProposalsDocument = {
   kind: 'Document',
   definitions: [
@@ -20738,6 +28530,339 @@ export const SubmitQaVerdictDocument = {
     },
   ],
 } as unknown as DocumentNode<SubmitQaVerdictMutation, SubmitQaVerdictMutationVariables>;
+export const MobileReleaseStatusDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'MobileReleaseStatus' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'MobileReleaseStatusInput' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'mobileReleaseStatus' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'channel' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'branch' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'updateId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'runtimeVersion' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'isEmbeddedLaunch' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'automaticCanary' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'canaryCheckedAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<MobileReleaseStatusQuery, MobileReleaseStatusQueryVariables>;
+export const ProposalReportReleaseContextsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'ProposalReportReleaseContexts' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'proposalUuid' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'proposalReportReleaseContexts' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'proposalUuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'proposalUuid' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'commentUuid' } },
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'releaseContext' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'channel' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'branch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'updateId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'runtimeVersion' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'isEmbeddedLaunch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'automaticCanary' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'canaryCheckedAt' } },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<ProposalReportReleaseContextsQuery, ProposalReportReleaseContextsQueryVariables>;
+export const SavedClimbDocumentsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'SavedClimbDocuments' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'layoutId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'Int' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'climbUuid' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'sprayWallUuid' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'syncClimbDocuments' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardType' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'layoutId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'layoutId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'climbUuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'climbUuid' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'sprayWallUuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'sprayWallUuid' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'viewerId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'climb' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'stats' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<SavedClimbDocumentsQuery, SavedClimbDocumentsQueryVariables>;
+export const GetSessionWorkoutsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetSessionWorkouts' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'sessionId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'sessionWorkouts' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'sessionId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'sessionId' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'userId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'displayName' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'avatarUrl' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'offPlan' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'offPlanTickUuids' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'updatedAt' } },
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'stages' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'id' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'kind' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'isCoolDown' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'targetGrade' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'repsPerSet' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sets' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'intervalSeconds' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'restSeconds' } },
+                      {
+                        kind: 'Field',
+                        name: { kind: 'Name', value: 'tally' },
+                        selectionSet: {
+                          kind: 'SelectionSet',
+                          selections: [
+                            { kind: 'Field', name: { kind: 'Name', value: 'sent' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'attempts' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'skipped' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'climbs' } },
+                          ],
+                        },
+                      },
+                      {
+                        kind: 'Field',
+                        name: { kind: 'Name', value: 'climbs' },
+                        selectionSet: {
+                          kind: 'SelectionSet',
+                          selections: [
+                            { kind: 'Field', name: { kind: 'Name', value: 'queueItemUuid' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'climbUuid' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'angle' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'name' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'grade' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'boardType' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'layoutId' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
+                            {
+                              kind: 'Field',
+                              name: { kind: 'Name', value: 'renderBoard' },
+                              selectionSet: {
+                                kind: 'SelectionSet',
+                                selections: [
+                                  { kind: 'Field', name: { kind: 'Name', value: 'layoutId' } },
+                                  { kind: 'Field', name: { kind: 'Name', value: 'sizeId' } },
+                                  { kind: 'Field', name: { kind: 'Name', value: 'setIds' } },
+                                ],
+                              },
+                            },
+                            { kind: 'Field', name: { kind: 'Name', value: 'reps' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'tickUuids' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'skipped' } },
+                          ],
+                        },
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetSessionWorkoutsQuery, GetSessionWorkoutsQueryVariables>;
+export const GetSessionWorkoutHeadlinesDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetSessionWorkoutHeadlines' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'sessionIds' } },
+          type: {
+            kind: 'NonNullType',
+            type: {
+              kind: 'ListType',
+              type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+            },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'sessionWorkoutHeadlines' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'sessionIds' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'sessionIds' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'sessionId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'userId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'mainKind' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'mainTargetGrade' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'mainTargetBoardType' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'secondMainKind' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'blockCount' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'extraMainBlocks' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetSessionWorkoutHeadlinesQuery, GetSessionWorkoutHeadlinesQueryVariables>;
 export const EndSessionDocument = {
   kind: 'Document',
   definitions: [
@@ -21512,11 +29637,37 @@ export const GetFollowingClimbAscentsDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'status' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'attemptCount' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'quality' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'effectiveQuality' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'difficulty' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'climbedAt' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'upvotes' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'downvotes' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'commentCount' } },
+                    ],
+                  },
+                },
+                { kind: 'Field', name: { kind: 'Name', value: 'hasMore' } },
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'summary' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'climberCount' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'senderCount' } },
+                      {
+                        kind: 'Field',
+                        name: { kind: 'Name', value: 'byAngle' },
+                        selectionSet: {
+                          kind: 'SelectionSet',
+                          selections: [
+                            { kind: 'Field', name: { kind: 'Name', value: 'angle' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'climberCount' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'senderCount' } },
+                          ],
+                        },
+                      },
                     ],
                   },
                 },
@@ -21528,6 +29679,69 @@ export const GetFollowingClimbAscentsDocument = {
     },
   ],
 } as unknown as DocumentNode<GetFollowingClimbAscentsQuery, GetFollowingClimbAscentsQueryVariables>;
+export const GetClimbLogsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetClimbLogs' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ClimbLogsInput' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'climbLogs' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'items' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'uuid' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'userId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'userDisplayName' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'userAvatarUrl' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'climbUuid' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'angle' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'isMirror' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'attemptCount' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'quality' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'effectiveQuality' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'difficulty' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'climbedAt' } },
+                    ],
+                  },
+                },
+                { kind: 'Field', name: { kind: 'Name', value: 'cursor' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'hasMore' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetClimbLogsQuery, GetClimbLogsQueryVariables>;
 export const FollowSetterDocument = {
   kind: 'Document',
   definitions: [
@@ -21988,6 +30202,8 @@ export const SprayDetectionDocument = {
           { kind: 'Field', name: { kind: 'Name', value: 'modelVersion' } },
           { kind: 'Field', name: { kind: 'Name', value: 'error' } },
           { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'queuePosition' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
           { kind: 'Field', name: { kind: 'Name', value: 'finishedAt' } },
           {
             kind: 'Field',
@@ -22071,6 +30287,8 @@ export const RequestSprayDetectionDocument = {
           { kind: 'Field', name: { kind: 'Name', value: 'modelVersion' } },
           { kind: 'Field', name: { kind: 'Name', value: 'error' } },
           { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'queuePosition' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
           { kind: 'Field', name: { kind: 'Name', value: 'finishedAt' } },
           {
             kind: 'Field',
@@ -22151,6 +30369,8 @@ export const RetrySprayDetectionDocument = {
           { kind: 'Field', name: { kind: 'Name', value: 'modelVersion' } },
           { kind: 'Field', name: { kind: 'Name', value: 'error' } },
           { kind: 'Field', name: { kind: 'Name', value: 'createdAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'queuePosition' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
           { kind: 'Field', name: { kind: 'Name', value: 'finishedAt' } },
           {
             kind: 'Field',
@@ -22182,6 +30402,57 @@ export const RetrySprayDetectionDocument = {
     },
   ],
 } as unknown as DocumentNode<RetrySprayDetectionMutation, RetrySprayDetectionMutationVariables>;
+export const SprayWallImportProgressDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'SprayWallImportProgress' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'wallUuids' } },
+          type: {
+            kind: 'NonNullType',
+            type: {
+              kind: 'ListType',
+              type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+            },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'sprayWallImportProgress' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'wallUuids' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'wallUuids' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'wallUuid' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'versionId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'detectionId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'stage' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'queuePosition' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'resetOfWallUuid' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<SprayWallImportProgressQuery, SprayWallImportProgressQueryVariables>;
 export const GetTicksDocument = {
   kind: 'Document',
   definitions: [
@@ -22497,6 +30768,7 @@ export const GetUserAscentsFeedDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'qualityAverage' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'climbedAt' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
@@ -22514,6 +30786,56 @@ export const GetUserAscentsFeedDocument = {
     },
   ],
 } as unknown as DocumentNode<GetUserAscentsFeedQuery, GetUserAscentsFeedQueryVariables>;
+export const GetUserLoggedSettersDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetUserLoggedSetters' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'UserLoggedSettersInput' } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'userLoggedSetters' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'userId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'userId' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'setterUsername' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'tickCount' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetUserLoggedSettersQuery, GetUserLoggedSettersQueryVariables>;
 export const GetUserAscentCaptionMatchesDocument = {
   kind: 'Document',
   definitions: [
@@ -22577,6 +30899,7 @@ export const GetUserAscentCaptionMatchesDocument = {
                 { kind: 'Field', name: { kind: 'Name', value: 'qualityAverage' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'climbedAt' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
@@ -22659,6 +30982,7 @@ export const GetUserGroupedAscentsFeedDocument = {
                       { kind: 'Field', name: { kind: 'Name', value: 'difficultyName' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'date' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'flashCount' } },
                       { kind: 'Field', name: { kind: 'Name', value: 'sendCount' } },
@@ -22706,6 +31030,7 @@ export const GetUserGroupedAscentsFeedDocument = {
                             { kind: 'Field', name: { kind: 'Name', value: 'qualityAverage' } },
                             { kind: 'Field', name: { kind: 'Name', value: 'isBenchmark' } },
                             { kind: 'Field', name: { kind: 'Name', value: 'isNoMatch' } },
+                            { kind: 'Field', name: { kind: 'Name', value: 'characteristics' } },
                             { kind: 'Field', name: { kind: 'Name', value: 'comment' } },
                             { kind: 'Field', name: { kind: 'Name', value: 'climbedAt' } },
                             { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
@@ -22871,6 +31196,8 @@ export const UpdateTickDocument = {
               kind: 'SelectionSet',
               selections: [
                 { kind: 'Field', name: { kind: 'Name', value: 'uuid' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'boardId' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'boardDisplayName' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'status' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'attemptCount' } },
                 { kind: 'Field', name: { kind: 'Name', value: 'quality' } },
@@ -22888,3 +31215,399 @@ export const UpdateTickDocument = {
     },
   ],
 } as unknown as DocumentNode<UpdateTickMutation, UpdateTickMutationVariables>;
+export const TickBoardOptionsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'TickBoardOptions' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'tickUuid' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'limit' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'Int' } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'offset' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'Int' } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'tickBoardOptions' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'tickUuid' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'tickUuid' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'limit' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'limit' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'offset' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'offset' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'currentBoard' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'uuid' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'name' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'boardType' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'layoutId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sizeId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'setIds' } },
+                    ],
+                  },
+                },
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'boards' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'uuid' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'name' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'boardType' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'layoutId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'sizeId' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'setIds' } },
+                    ],
+                  },
+                },
+                { kind: 'Field', name: { kind: 'Name', value: 'totalCount' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'hasMore' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<TickBoardOptionsQuery, TickBoardOptionsQueryVariables>;
+export const GetUserDataExportDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetUserDataExport' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'period' } },
+          type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'userDataExport' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardType' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'period' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'period' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [{ kind: 'FragmentSpread', name: { kind: 'Name', value: 'UserDataExportStatusFields' } }],
+            },
+          },
+        ],
+      },
+    },
+    {
+      kind: 'FragmentDefinition',
+      name: { kind: 'Name', value: 'UserDataExportStatusFields' },
+      typeCondition: { kind: 'NamedType', name: { kind: 'Name', value: 'UserDataExportStatus' } },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          { kind: 'Field', name: { kind: 'Name', value: 'boardType' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'period' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'refreshAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'requestedAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'completedAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'error' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'errorCode' } },
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'files' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'format' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'filename' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'fileSize' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'exportedAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'expiresAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetUserDataExportQuery, GetUserDataExportQueryVariables>;
+export const RequestUserDataExportDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'mutation',
+      name: { kind: 'Name', value: 'RequestUserDataExport' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'requestUserDataExport' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardType' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [{ kind: 'FragmentSpread', name: { kind: 'Name', value: 'UserDataExportStatusFields' } }],
+            },
+          },
+        ],
+      },
+    },
+    {
+      kind: 'FragmentDefinition',
+      name: { kind: 'Name', value: 'UserDataExportStatusFields' },
+      typeCondition: { kind: 'NamedType', name: { kind: 'Name', value: 'UserDataExportStatus' } },
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          { kind: 'Field', name: { kind: 'Name', value: 'boardType' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'period' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'status' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'refreshAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'requestedAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'completedAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'retryAt' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'error' } },
+          { kind: 'Field', name: { kind: 'Name', value: 'errorCode' } },
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'files' },
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'format' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'filename' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'fileSize' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'exportedAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'expiresAt' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<RequestUserDataExportMutation, RequestUserDataExportMutationVariables>;
+export const GetUserDataExportDownloadDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'GetUserDataExportDownload' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'period' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'String' } } },
+        },
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'format' } },
+          type: {
+            kind: 'NonNullType',
+            type: { kind: 'NamedType', name: { kind: 'Name', value: 'UserDataExportFormat' } },
+          },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'userDataExportDownload' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'boardType' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'boardType' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'period' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'period' } },
+              },
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'format' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'format' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                { kind: 'Field', name: { kind: 'Name', value: 'url' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'expiresAt' } },
+                { kind: 'Field', name: { kind: 'Name', value: 'filename' } },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<GetUserDataExportDownloadQuery, GetUserDataExportDownloadQueryVariables>;
+export const JoinRedirectSessionBoardPathDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'JoinRedirectSessionBoardPath' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'sessionId' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ID' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'session' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'sessionId' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'sessionId' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [{ kind: 'Field', name: { kind: 'Name', value: 'boardPath' } }],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<JoinRedirectSessionBoardPathQuery, JoinRedirectSessionBoardPathQueryVariables>;
+export const FrontDoorNearbyClimbsDocument = {
+  kind: 'Document',
+  definitions: [
+    {
+      kind: 'OperationDefinition',
+      operation: 'query',
+      name: { kind: 'Name', value: 'FrontDoorNearbyClimbs' },
+      variableDefinitions: [
+        {
+          kind: 'VariableDefinition',
+          variable: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+          type: { kind: 'NonNullType', type: { kind: 'NamedType', name: { kind: 'Name', value: 'ClimbSearchInput' } } },
+        },
+      ],
+      selectionSet: {
+        kind: 'SelectionSet',
+        selections: [
+          {
+            kind: 'Field',
+            name: { kind: 'Name', value: 'searchClimbs' },
+            arguments: [
+              {
+                kind: 'Argument',
+                name: { kind: 'Name', value: 'input' },
+                value: { kind: 'Variable', name: { kind: 'Name', value: 'input' } },
+              },
+            ],
+            selectionSet: {
+              kind: 'SelectionSet',
+              selections: [
+                {
+                  kind: 'Field',
+                  name: { kind: 'Name', value: 'climbs' },
+                  selectionSet: {
+                    kind: 'SelectionSet',
+                    selections: [
+                      { kind: 'Field', name: { kind: 'Name', value: 'uuid' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'name' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'setter_username' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'frames' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'difficulty' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'quality_average' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'ascensionist_count' } },
+                      { kind: 'Field', name: { kind: 'Name', value: 'compatibleSizeIds' } },
+                    ],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  ],
+} as unknown as DocumentNode<FrontDoorNearbyClimbsQuery, FrontDoorNearbyClimbsQueryVariables>;

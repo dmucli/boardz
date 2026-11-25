@@ -3,11 +3,14 @@ import * as Updates from 'expo-updates';
 import { registerSuperProperties, track } from '../../lib/analytics';
 import {
   OTA_UPDATE_DOWNLOADED_EVENT,
-  OTA_UPDATE_STATUS_EVENT,
+  buildOtaCanaryProperties,
   buildOtaStatusProperties,
   readOtaBranch,
 } from '../../lib/ota-telemetry';
 import { setOtaSentryTags } from '../../lib/sentry';
+import { reportAnonymousOtaStatus } from '../../lib/anonymous-ota-health';
+import { rememberOtaSuperProperties } from '../../lib/analytics-ota-context';
+import { useMobileReleaseStatus } from '../../lib/use-mobile-release-status';
 
 // Emits OTA-adoption telemetry so a JS-only rollout is measurable (we previously
 // had no way to tell how many installs pulled an OTA — issue #3098). On mount it
@@ -15,7 +18,7 @@ import { setOtaSentryTags } from '../../lib/sentry';
 // event as super properties; while mounted it reports a freshly-downloaded
 // bundle (the "fetched, applies next launch" step of the funnel). Renders
 // nothing — mounted once near the app root beside AnalyticsScreenTracker. See
-// docs/mobile-ota-updates.md.
+// docs/operations/mobile-ota-updates.md.
 
 // Module-scoped so the launch status fires at most once per JS runtime (= once
 // per launch) even if this subtree is ever torn down and recreated. The tracker
@@ -51,7 +54,10 @@ stampOtaLaunchSentryTags();
 
 export function OtaUpdateTracker(): null {
   const { isUpdatePending, downloadedUpdate } = Updates.useUpdates();
+  const { releaseContext } = useMobileReleaseStatus();
   const reportedDownloadIdRef = useRef<string | null>(null);
+  const automaticCanary = releaseContext?.automaticCanary ?? null;
+  const canaryCheckedAt = releaseContext?.canaryCheckedAt ?? null;
 
   // Report the running bundle once. track() no-ops when analytics is disabled
   // (dev / no key) but still logs via its __DEV__ debug hook, so this is
@@ -72,8 +78,8 @@ export function OtaUpdateTracker(): null {
       isEmergencyLaunch: Updates.isEmergencyLaunch,
       emergencyLaunchReason: Updates.emergencyLaunchReason,
     });
-    track(OTA_UPDATE_STATUS_EVENT, properties);
-    registerSuperProperties({
+    void reportAnonymousOtaStatus(properties);
+    const superProperties = {
       ota_update_id: properties.updateId,
       ota_is_embedded: properties.isEmbeddedLaunch,
       ota_runtime_version: properties.runtimeVersion,
@@ -86,8 +92,27 @@ export function OtaUpdateTracker(): null {
       // no such window, and prod-vs-preview is the filter that matters.
       ota_channel: properties.channel,
       ota_branch: properties.branch,
-    });
+    };
+    rememberOtaSuperProperties(superProperties);
+    registerSuperProperties(superProperties);
   }, []);
+
+  // The same cached status powers What's new. Unknown clears a previous known
+  // canary tag; remembering the properties also preserves consent-late startup.
+  useEffect(() => {
+    setOtaSentryTags({
+      channel: Updates.channel,
+      branch: readOtaBranch(Updates.manifest),
+      updateId: Updates.updateId,
+      runtimeVersion: Updates.runtimeVersion,
+      isEmbeddedLaunch: Updates.isEmbeddedLaunch,
+      automaticCanary,
+      canaryCheckedAt,
+    });
+    const canaryProperties = buildOtaCanaryProperties({ automaticCanary, canaryCheckedAt });
+    rememberOtaSuperProperties(canaryProperties);
+    registerSuperProperties(canaryProperties);
+  }, [automaticCanary, canaryCheckedAt]);
 
   // A newer bundle finished downloading this session; it applies on the next
   // launch (whose OTA Update Status event records the switch to isEmbeddedLaunch

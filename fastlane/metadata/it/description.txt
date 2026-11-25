@@ -1,0 +1,29 @@
+Un’app per i tuoi pannelli. Illumina blocchi, condividi la coda con la crew e conserva le tue ripetizioni in un solo diario.
+
+Compatibile con Kilter, Tension, MoonBoard, Woods, Decoy, Touchstone, Grasshopper e So iLL, oltre alla tua Spraywall. Collega controller compatibili via Bluetooth per illuminare le prese.
+
+Scala con la crew
+Avvia una session, invita la crew e condividi una coda che tutti possono controllare. La cronologia mostra i blocchi illuminati tramite Boardsesh e le ripetizioni recenti sul pannello fisico. Termina la session per ritrovare il riepilogo.
+
+Allenati a modo tuo
+Combina riscaldamenti con Volume, Piramide, Scala, Grado fisso, 4x4, Al limite o Al minuto. Guarda l’anteprima di blocchi e recuperi, poi illumina un blocco alla volta. Le piramidi possono scendere sugli stessi blocchi.
+
+Apri in Boardsesh allenamenti da app compatibili e autorizza le app a leggere il tuo diario. Dettagli per chi sviluppa: https://www.boardsesh.com/developers/
+
+Anche la tua Spraywall
+Fotografa la tua Spraywall, controlla le prese suggerite e crea blocchi sulla foto. Condividila con la crew, aggiungi blocchi alla coda e registra ripetizioni. Non servono LED. Reimposta la Spraywall con una nuova foto, mantenendo archiviati i blocchi e le ripetizioni precedenti.
+
+Con WLED e LED, posiziona le luci sulla foto e salva la configurazione per la crew. Trova i controller via Wi-Fi, regola la luminosità e scegli lo spegnimento automatico via Wi-Fi. I controller compatibili con il supporto Bluetooth di Boardsesh possono illuminare blocchi anche via Bluetooth; installare questo supporto resta una beta facoltativa per controller compatibili.
+
+Controlla dalla schermata di blocco (iOS 17+)
+Guarda il blocco attuale e avanza nella coda con le Attività live. Scegli vibrazioni del conto alla rovescia e recuperi sulla schermata di blocco in Impostazioni > Timer. Il rendering del pannello accelerato dalla GPU rende più fluide le transizioni su pannelli e dispositivi supportati.
+
+Trova il prossimo blocco
+Home mostra la tua settimana, blocchi al tuo livello e progetti da riprovare. Scegli le sezioni da vedere. Trova pannelli vicini con la posizione attiva, filtra i blocchi Verificati di Kilter e cerca i tuoi blocchi in Scopri.
+
+Segui i tuoi progressi
+Registra ripetizioni, flash e tentativi, segui i progressi sui diversi pannelli e importa la tua storia Kilter e Tension da Aurora Climbing. Salva le session in Apple Salute con il tuo consenso.
+
+Gratis, senza pubblicità, open source.
+
+Boardsesh è un progetto della community compatibile con questi pannelli. Non è affiliato né approvato da alcun produttore.

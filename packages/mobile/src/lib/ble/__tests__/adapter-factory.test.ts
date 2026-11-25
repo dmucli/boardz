@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // All mock state lives inside vi.hoisted so it's initialized before the
 // vi.mock factories run (vi.mock is hoisted above regular top-level code).
@@ -18,6 +18,8 @@ const harness = vi.hoisted(() => ({
   // tested in native-ble-supports-board.test.ts; here it's a switch for the
   // factory's routing decision.
   nativeBleSupportsBoard: vi.fn(() => true),
+  nativeBleSupportsPreparedConnections: vi.fn(() => false),
+  nativeBleSupportsConnectionAdoption: vi.fn(() => false),
 }));
 
 vi.mock('react-native', () => ({
@@ -29,8 +31,9 @@ vi.mock('react-native', () => ({
 vi.mock('../adapter', () => ({ RNBleAdapter: harness.RNBleAdapter }));
 vi.mock('../native-ios-adapter', () => ({
   NativeIosBleAdapter: harness.NativeIosBleAdapter,
-  nativeBleSupportsConnectionAdoption: vi.fn(() => false),
+  nativeBleSupportsConnectionAdoption: harness.nativeBleSupportsConnectionAdoption,
   nativeBleSupportsBoard: harness.nativeBleSupportsBoard,
+  nativeBleSupportsPreparedConnections: harness.nativeBleSupportsPreparedConnections,
 }));
 vi.mock('../../../../modules/live-activity/src/index', () => ({
   get boardBleNative() {
@@ -42,7 +45,14 @@ const platformMock = harness.platform;
 const RNBleAdapter = harness.RNBleAdapter;
 const NativeIosBleAdapter = harness.NativeIosBleAdapter;
 
-import { createBluetoothAdapter, isNativeIosBleAdapter } from '../adapter-factory';
+import {
+  createBluetoothAdapter,
+  forgetNativeKeptBoard,
+  getNativeBleConnectedDevice,
+  isNativeIosBleAdapter,
+  nativeBleSupportsPreparedConnections,
+  subscribeNativeBleConnected,
+} from '../adapter-factory';
 
 const noopPicker = () => Promise.resolve('');
 
@@ -51,6 +61,8 @@ beforeEach(() => {
   NativeIosBleAdapter.mockClear();
   harness.nativeBleSupportsBoard.mockReset();
   harness.nativeBleSupportsBoard.mockReturnValue(true);
+  harness.nativeBleSupportsConnectionAdoption.mockReset();
+  harness.nativeBleSupportsConnectionAdoption.mockReturnValue(false);
 });
 
 describe('createBluetoothAdapter', () => {
@@ -67,6 +79,7 @@ describe('createBluetoothAdapter', () => {
     harness.module.boardBleNative = null;
     createBluetoothAdapter(noopPicker, 'aurora');
     expect(RNBleAdapter).toHaveBeenCalledTimes(1);
+    expect(RNBleAdapter).toHaveBeenCalledWith(noopPicker, 'aurora', { enableAndroidConnectRetry: false });
     expect(NativeIosBleAdapter).not.toHaveBeenCalled();
   });
 
@@ -75,6 +88,7 @@ describe('createBluetoothAdapter', () => {
     harness.module.boardBleNative = { _placeholder: true };
     createBluetoothAdapter(noopPicker, 'aurora');
     expect(RNBleAdapter).toHaveBeenCalledTimes(1);
+    expect(RNBleAdapter).toHaveBeenCalledWith(noopPicker, 'aurora', { enableAndroidConnectRetry: true });
     expect(NativeIosBleAdapter).not.toHaveBeenCalled();
   });
 
@@ -91,7 +105,10 @@ describe('createBluetoothAdapter', () => {
     createBluetoothAdapter(noopPicker, 'moonboard', options);
     expect(harness.nativeBleSupportsBoard).toHaveBeenCalledWith('woods');
     expect(RNBleAdapter).toHaveBeenCalledTimes(1);
-    expect(RNBleAdapter).toHaveBeenCalledWith(noopPicker, 'moonboard', options);
+    expect(RNBleAdapter).toHaveBeenCalledWith(noopPicker, 'moonboard', {
+      ...options,
+      enableAndroidConnectRetry: false,
+    });
     expect(NativeIosBleAdapter).not.toHaveBeenCalled();
   });
 
@@ -136,5 +153,113 @@ describe('isNativeIosBleAdapter', () => {
     // unused here — we're only checking the branching logic.)
     expect(isNativeIosBleAdapter(nativeInstance)).toBe(true);
     expect(isNativeIosBleAdapter(rnInstance)).toBe(false);
+  });
+});
+
+it('exports the running binary prepared-connection capability', () => {
+  harness.nativeBleSupportsPreparedConnections.mockReturnValueOnce(true);
+  expect(nativeBleSupportsPreparedConnections()).toBe(true);
+  expect(nativeBleSupportsPreparedConnections()).toBe(false);
+});
+
+// A hang-up keeps the iOS native pairing for 10 minutes; once JS forgets the
+// board, this forgets the pairing so the Live Activity bulb can't reach it.
+describe('forgetNativeKeptBoard', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  const nativeThatKeepsBoards = () => ({
+    disconnect: vi.fn(async () => {}),
+    disconnectKeepingBoard: vi.fn(async () => {}),
+  });
+
+  it('forgets the pairing with the plain native disconnect on iOS', async () => {
+    platformMock.OS = 'ios';
+    const native = nativeThatKeepsBoards();
+    harness.module.boardBleNative = native;
+    // True: the caller redraws the Live Activity card off the forgotten pairing.
+    await expect(forgetNativeKeptBoard()).resolves.toBe(true);
+    expect(native.disconnect).toHaveBeenCalledOnce();
+    expect(native.disconnectKeepingBoard).not.toHaveBeenCalled();
+  });
+
+  it('does nothing on a binary that never keeps a board or on Android', async () => {
+    const oldBinary = { disconnect: vi.fn(async () => {}) };
+    platformMock.OS = 'ios';
+    harness.module.boardBleNative = oldBinary;
+    await expect(forgetNativeKeptBoard()).resolves.toBe(false);
+    expect(oldBinary.disconnect).not.toHaveBeenCalled();
+
+    const native = nativeThatKeepsBoards();
+    harness.module.boardBleNative = native;
+    platformMock.OS = 'android';
+    await expect(forgetNativeKeptBoard()).resolves.toBe(false);
+    expect(native.disconnect).not.toHaveBeenCalled();
+  });
+
+  it('swallows a native rejection', async () => {
+    platformMock.OS = 'ios';
+    const native = nativeThatKeepsBoards();
+    native.disconnect.mockRejectedValue(new Error('BLE_DISCONNECT_FAILED'));
+    harness.module.boardBleNative = native;
+    await expect(forgetNativeKeptBoard()).resolves.toBe(false);
+  });
+});
+
+describe('retired screenshot flags do not alter real Bluetooth', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    ['neither flag', undefined, undefined],
+    ['screenshot mode alone', '1', undefined],
+    ['fake BLE without screenshot mode', undefined, '1'],
+    ['a fake-BLE value other than 1', '1', 'true'],
+    ['both retired flags', '1', '1'],
+  ])('returns the real adapters with %s', (_label, screenshotMode, fakeBle) => {
+    if (screenshotMode !== undefined) vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', screenshotMode);
+    if (fakeBle !== undefined) vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_FAKE_BLE', fakeBle);
+    platformMock.OS = 'ios';
+    harness.module.boardBleNative = { _placeholder: true };
+    const iosAdapter = createBluetoothAdapter(noopPicker, 'aurora');
+    platformMock.OS = 'android';
+    const androidAdapter = createBluetoothAdapter(noopPicker, 'aurora');
+
+    expect(isNativeIosBleAdapter(iosAdapter)).toBe(true);
+    expect(isNativeIosBleAdapter(androidAdapter)).toBe(false);
+    expect(NativeIosBleAdapter).toHaveBeenCalledTimes(1);
+    expect(RNBleAdapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves native connection adoption when both retired flags are set', async () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_FAKE_BLE', '1');
+    const subscription = { remove: vi.fn() };
+    const native = {
+      addListener: vi.fn(() => subscription),
+      getConnectedDevice: vi.fn(async () => ({ deviceId: 'real-board', name: 'Kilter Board#1@3' })),
+    };
+    harness.module.boardBleNative = native;
+    harness.nativeBleSupportsConnectionAdoption.mockReturnValue(true);
+    const listener = vi.fn();
+
+    expect(subscribeNativeBleConnected(listener)).toBe(subscription);
+    expect(native.addListener).toHaveBeenCalledWith('connected', listener);
+    expect(await getNativeBleConnectedDevice()).toEqual({ deviceId: 'real-board', name: 'Kilter Board#1@3' });
+    expect(native.getConnectedDevice).toHaveBeenCalledOnce();
+  });
+
+  it('forgets the native pairing when both retired flags are set', async () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_FAKE_BLE', '1');
+    platformMock.OS = 'ios';
+    const native = { disconnect: vi.fn(async () => {}), disconnectKeepingBoard: vi.fn(async () => {}) };
+    harness.module.boardBleNative = native;
+
+    await expect(forgetNativeKeptBoard()).resolves.toBe(true);
+    expect(native.disconnect).toHaveBeenCalledOnce();
+    expect(native.disconnectKeepingBoard).not.toHaveBeenCalled();
   });
 });

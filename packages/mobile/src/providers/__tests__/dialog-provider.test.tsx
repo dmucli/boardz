@@ -5,16 +5,28 @@ import { createElement, type ReactNode } from 'react';
 
 const ctrl = vi.hoisted(() => ({
   variant: 'material' as 'material' | 'liquidGlass',
-  os: 'android' as 'ios' | 'android',
+  os: 'android' as 'ios' | 'android' | 'web',
 }));
 type AlertButton = { text: string; style?: string; onPress?: () => void };
+type ActionSheetCall = {
+  options: {
+    title?: string;
+    message?: string;
+    options: string[];
+    destructiveButtonIndex?: number;
+    cancelButtonIndex?: number;
+    anchor?: number;
+  };
+  callback: (buttonIndex: number) => void;
+};
+const actionSheetMock = vi.hoisted(() => ({ calls: [] as ActionSheetCall[] }));
 const alertMock = vi.hoisted(() => ({
   calls: [] as Array<{ title: string; message?: string; buttons: AlertButton[]; onDismiss?: () => void }>,
 }));
+const nativeModalMock = vi.hoisted(() => ({ onRequestClose: undefined as (() => void) | undefined }));
 
 // The provider needs Alert + Platform + StyleSheet from react-native; mock them
-// (Platform.OS is controllable because the Paper dialog is Android-Material-only
-// — iOS uses Alert).
+// (Platform.OS controls the Android/web modal host and iOS Alert).
 vi.mock('react-native', () => ({
   Platform: {
     get OS() {
@@ -22,6 +34,27 @@ vi.mock('react-native', () => ({
     },
   },
   StyleSheet: { create: (sheet: Record<string, unknown>) => sheet },
+  Modal: ({
+    children,
+    visible,
+    transparent,
+    onRequestClose,
+  }: {
+    children?: ReactNode;
+    visible?: boolean;
+    transparent?: boolean;
+    onRequestClose?: () => void;
+  }) => {
+    nativeModalMock.onRequestClose = onRequestClose;
+    return visible
+      ? createElement('div', { 'data-native-modal': 'true', 'data-transparent': String(transparent) }, children)
+      : null;
+  },
+  ActionSheetIOS: {
+    showActionSheetWithOptions: (options: ActionSheetCall['options'], callback: ActionSheetCall['callback']) => {
+      actionSheetMock.calls.push({ options, callback });
+    },
+  },
   Alert: {
     alert: (
       title: string,
@@ -34,15 +67,15 @@ vi.mock('react-native', () => ({
   },
 }));
 
-// Lightweight Paper stubs: Dialog renders its children inline (Portal is a
-// pass-through), Buttons are real <button>s so we can click them.
+// Mark the two possible hosts separately: a root Portal cannot draw above an
+// Android native sheet window. Buttons remain clickable for queue behavior.
 vi.mock('react-native-paper', () => {
   const Dialog = ({ children }: { children?: ReactNode }) => createElement('div', { 'data-dialog': 'true' }, children);
   Dialog.Title = ({ children }: { children?: ReactNode }) => createElement('div', null, children);
   Dialog.Content = ({ children }: { children?: ReactNode }) => createElement('div', null, children);
   Dialog.Actions = ({ children }: { children?: ReactNode }) => createElement('div', null, children);
   return {
-    Portal: ({ children }: { children?: ReactNode }) => children,
+    Portal: ({ children }: { children?: ReactNode }) => createElement('div', { 'data-paper-portal': 'true' }, children),
     Dialog,
     Button: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
       createElement('button', { onClick: onPress }, children),
@@ -92,9 +125,45 @@ beforeEach(() => {
   ctrl.variant = 'material';
   ctrl.os = 'android';
   alertMock.calls = [];
+  actionSheetMock.calls = [];
+  nativeModalMock.onRequestClose = undefined;
 });
 
 describe('useConfirm — Android Material (Paper Dialog)', () => {
+  it('hosts the Paper dialog directly in a transparent native window above sheets', () => {
+    const { container } = setup();
+    act(() => {
+      void confirmFn(OPTS);
+    });
+    const host = container.querySelector('[data-native-modal]');
+    expect(host).not.toBeNull();
+    expect(host?.getAttribute('data-transparent')).toBe('true');
+    expect(host?.querySelector('[data-dialog]')).not.toBeNull();
+    expect(container.querySelector('[data-paper-portal]')).toBeNull();
+    expect(alertMock.calls).toHaveLength(0);
+  });
+
+  it('cancels only the current prompt on Android back and presents the next', async () => {
+    const { container } = setup();
+    let first!: Promise<boolean>;
+    let second!: Promise<boolean>;
+    act(() => {
+      first = confirmFn({ ...OPTS, confirmLabel: 'First' });
+      second = confirmFn({ ...OPTS, confirmLabel: 'Second' });
+    });
+    const dismissFirst = nativeModalMock.onRequestClose;
+    expect(dismissFirst).toBeDefined();
+    act(() => {
+      dismissFirst?.();
+      dismissFirst?.();
+    });
+    await expect(first).resolves.toBe(false);
+    expect(container.querySelector('[data-native-modal] [data-dialog]')).not.toBeNull();
+    act(() => materialButton(container, 'Second').click());
+    await expect(second).resolves.toBe(true);
+    expect(container.querySelector('[data-native-modal]')).toBeNull();
+  });
+
   it('resolves true when the confirm action is pressed', async () => {
     const { container } = setup();
     let promise!: Promise<boolean>;
@@ -151,6 +220,21 @@ describe('useConfirm — Android Material (Paper Dialog)', () => {
     // The second confirm survived and still resolves on its own.
     act(() => materialButton(container, 'Second').click());
     await expect(second).resolves.toBe(true);
+  });
+});
+
+describe('useConfirm — web Material', () => {
+  it('keeps web confirmations above sheets in the browser modal stack', async () => {
+    ctrl.os = 'web';
+    const { container } = setup();
+    let promise!: Promise<boolean>;
+    act(() => {
+      promise = confirmFn(OPTS);
+    });
+    expect(container.querySelector('[data-native-modal] [data-dialog]')).not.toBeNull();
+    expect(container.querySelector('[data-paper-portal]')).toBeNull();
+    act(() => materialButton(container, 'Delete').click());
+    await expect(promise).resolves.toBe(true);
   });
 });
 
@@ -294,4 +378,81 @@ describe('useChoose — three actions on the native Alert', () => {
     act(() => alertMock.calls[0].onDismiss?.());
     await expect(promise).resolves.toBe('cancel');
   });
+});
+
+describe('useConfirm — destructive confirms on iOS are a confirmation dialog (action sheet)', () => {
+  beforeEach(() => {
+    ctrl.os = 'ios';
+  });
+
+  it.each(['liquidGlass', 'material'] as const)('uses an action sheet, not an Alert, on %s', async (variant) => {
+    ctrl.variant = variant;
+    setup();
+    let promise!: Promise<boolean>;
+    act(() => {
+      promise = confirmFn({ ...OPTS, destructive: true });
+    });
+    expect(alertMock.calls).toHaveLength(0);
+    expect(actionSheetMock.calls).toHaveLength(1);
+    const [{ options, callback }] = actionSheetMock.calls;
+    expect(options.title).toBe('Delete?');
+    expect(options.message).toBe('This cannot be undone.');
+    expect(options.options[options.destructiveButtonIndex ?? -1]).toBe('Delete');
+    expect(options.options[options.cancelButtonIndex ?? -1]).toBe('Cancel');
+    expect(options).not.toHaveProperty('anchor');
+    act(() => callback(options.destructiveButtonIndex ?? -1));
+    await expect(promise).resolves.toBe(true);
+  });
+
+  it('resolves false on Cancel (also what a tap outside the sheet reports)', async () => {
+    setup();
+    let promise!: Promise<boolean>;
+    act(() => {
+      promise = confirmFn({ ...OPTS, destructive: true });
+    });
+    const [{ options, callback }] = actionSheetMock.calls;
+    act(() => callback(options.cancelButtonIndex ?? -1));
+    await expect(promise).resolves.toBe(false);
+  });
+
+  it('points the iPad popover at the source control when the caller knows it', () => {
+    setup();
+    act(() => {
+      void confirmFn({ ...OPTS, destructive: true, anchor: 42 });
+    });
+    expect(actionSheetMock.calls[0].options.anchor).toBe(42);
+  });
+
+  it('keeps a non-destructive confirm as an Alert', () => {
+    setup();
+    act(() => {
+      void confirmFn(OPTS);
+    });
+    expect(actionSheetMock.calls).toHaveLength(0);
+    expect(alertMock.calls).toHaveLength(1);
+  });
+
+  it('keeps the M3 dialog for a destructive confirm on Android', () => {
+    ctrl.os = 'android';
+    const { container } = setup();
+    act(() => {
+      void confirmFn({ ...OPTS, destructive: true });
+    });
+    expect(actionSheetMock.calls).toHaveLength(0);
+    expect(container.querySelector('[data-dialog]')).not.toBeNull();
+  });
+});
+
+it('uses the browser modal stack for confirmations with the glass appearance', async () => {
+  ctrl.os = 'web';
+  ctrl.variant = 'liquidGlass';
+  const { container } = setup();
+  let confirmation!: Promise<boolean>;
+  act(() => {
+    confirmation = confirmFn(OPTS);
+  });
+  expect(container.querySelector('[data-native-modal] [data-dialog]')).not.toBeNull();
+  expect(alertMock.calls).toHaveLength(0);
+  act(() => nativeModalMock.onRequestClose?.());
+  await expect(confirmation).resolves.toBe(false);
 });

@@ -1,12 +1,16 @@
+import { AccessibleBottomSheetTextInput as BottomSheetTextInput } from '../AccessibleBottomSheetTextInput';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { MEDIUM_LARGE_SNAP_POINTS } from '../sheet-snap-points';
+import { ResourcePrivacyControl } from '../privacy/ResourcePrivacyControl';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { View, StyleSheet } from 'react-native';
-import { BottomSheetTextInput } from '@expo/ui/community/bottom-sheet';
+
 import { useTranslation } from 'react-i18next';
 import { SESSION_NAME_MAX_LENGTH, SESSION_NOTES_MAX_LENGTH } from '@boardsesh/shared-schema';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { Sheet } from '../Sheet';
 import { Text } from '../Text';
-import { Button } from '../Button';
+import { SheetTopBar } from '../SheetTopBar';
 import { useTheme } from '../../providers/theme-provider';
 import { useUpdateSession } from '../../lib/graphql/hooks';
 import { track } from '../../lib/analytics';
@@ -45,6 +49,7 @@ function normalize(value: string): string | null {
  * session's detail + feeds, so the screen refreshes on its own.
  */
 export function SessionEditSheet({ visible, sessionId, currentName, currentNotes, onClose }: SessionEditSheetProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('session');
   const { systemColors, brandColors } = useTheme();
   const updateSession = useUpdateSession();
@@ -132,14 +137,25 @@ export function SessionEditSheet({ visible, sessionId, currentName, currentNotes
     );
   }, [sessionId, name, recap, currentName, currentNotes, updateSession, onClose, clearCloseTimer]);
 
-  // Buttons live in the BODY, not the Sheet footer slot: on Android's M3 sheet
-  // the pinned footer lays out against the expanded height and lands off-screen
-  // below the partial sheet (emulator-verified; see SessionTitleSheet).
-  return (
-    <Sheet visible={visible} snapPoints={['70%']} scrollable onClose={onClose}>
-      <View style={styles.body}>
-        <Text variant="title2">{t('detail.editSession')}</Text>
+  const header = (
+    <SheetTopBar
+      title={t('detail.editSession')}
+      leading={{ kind: 'cancel', onPress: onClose, accessibilityLabel: t('detail.editCancel') }}
+      trailing={{
+        kind: 'confirm',
+        label: t('detail.editSave'),
+        onPress: handleSave,
+        loading: updateSession.isPending,
+        disabled: !sessionId || justSaved,
+        prominent: true,
+      }}
+    />
+  );
 
+  return (
+    <Sheet visible={visible} snapPoints={MEDIUM_LARGE_SNAP_POINTS} scrollable onClose={onClose} header={header}>
+      <View style={styles.body}>
+        {sessionId ? <ResourcePrivacyControl kind="session" resourceId={sessionId} /> : null}
         <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.label}>
           {t('detail.editNameLabel')}
         </Text>
@@ -165,7 +181,7 @@ export function SessionEditSheet({ visible, sessionId, currentName, currentNotes
           multiline
           style={[styles.input, styles.multiline, { backgroundColor: systemColors.fill, color: systemColors.label }]}
         />
-        <Text variant="caption2" color={systemColors.tertiaryLabel} style={styles.counter}>
+        <Text variant="caption2" color={systemColors.secondaryLabel} style={styles.counter}>
           {t('summary.commentHelper', { count: recap.length, max: SESSION_NOTES_MAX_LENGTH })}
         </Text>
 
@@ -178,54 +194,38 @@ export function SessionEditSheet({ visible, sessionId, currentName, currentNotes
             {t('detail.editSaveFailed')}
           </Text>
         ) : null}
-
-        <View style={styles.actions}>
-          <Button title={t('detail.editCancel')} variant="text" onPress={onClose} />
-          <Button
-            title={t('detail.editSave')}
-            variant="filled"
-            loading={updateSession.isPending}
-            disabled={!sessionId || justSaved}
-            onPress={handleSave}
-          />
-        </View>
       </View>
     </Sheet>
   );
 }
 
-const styles = StyleSheet.create({
-  body: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[2],
-    paddingBottom: spacing[4],
-    gap: spacing[2],
-  },
-  label: {
-    fontWeight: '600',
-    marginTop: spacing[2],
-  },
-  input: {
-    borderRadius: borderRadius.lg,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    fontSize: 16,
-  },
-  multiline: {
-    minHeight: 96,
-    textAlignVertical: 'top',
-  },
-  counter: {
-    textAlign: 'right',
-    marginTop: -spacing[1],
-  },
-  feedback: {
-    marginTop: spacing[2],
-  },
-  actions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-    gap: spacing[2],
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    body: {
+      paddingHorizontal: spacing[4],
+      paddingTop: spacing[2],
+      paddingBottom: spacing[4],
+      gap: spacing[2],
+    },
+    label: {
+      fontWeight: '600',
+      marginTop: spacing[2],
+    },
+    input: {
+      borderRadius: borderRadius.lg,
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      fontSize: textStyles.callout.fontSize,
+    },
+    multiline: {
+      minHeight: 96,
+      textAlignVertical: 'top',
+    },
+    counter: {
+      textAlign: 'right',
+      marginTop: -spacing[1],
+    },
+    feedback: {
+      marginTop: spacing[2],
+    },
+  });

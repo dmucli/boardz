@@ -11,7 +11,7 @@ import { IDENTITY_HOMOGRAPHY, invert, mapPoint, mapRadius, type Homography } fro
  * stored on the version rather than by a baked-in coordinate system. So this
  * module does the mapping itself and the page draws plain SVG over an `<img>`.
  *
- * The photo is never warped (`docs/spray-walls.md`, "Canonical coordinates"):
+ * The photo is never warped (`docs/product/spray-walls.md`, "Canonical coordinates"):
  * hold coordinates are canonical-frame pixels and the STORED matrix maps
  * photo -> canonical, so drawing means inverting it once and pushing every
  * centre, radius and silhouette point back into photo pixels.
@@ -178,4 +178,82 @@ export function resolveSprayPhotoFrame({
     return { width: photoWidth, height: photoHeight };
   }
   return { width: boardWidth, height: boardHeight };
+}
+
+/**
+ * A wall's generated look, as the page needs it: which one the owner chose,
+ * and the pixel size the backend rendered it at. Only ever built from art the
+ * backend reports READY for the version the page is drawing.
+ */
+export type SprayWallArtChoice = {
+  background: 'wall-crop' | 'hold-cutouts';
+  width: number;
+  height: number;
+};
+
+/** Everything `SprayBoardArt` needs: the image, its pixel box, and how holds map onto it. */
+export type SprayWallDrawing = {
+  imageUrl: string;
+  frame: { width: number; height: number };
+  /** Photo -> canonical for the IMAGE above, which `buildSprayLitHoldMarks` inverts. */
+  homography: readonly number[] | null;
+  /** The field drawn behind a transparent image, or null for an opaque one. */
+  fieldColor: string | null;
+};
+
+/**
+ * The photo -> canonical matrix of an image that IS the canonical frame,
+ * scaled by `scale`. Generated art is drawn in canonical coordinates, so the
+ * only map between a hold and its pixel is that scale.
+ */
+export function canonicalArtHomography(scale: number): number[] {
+  return [1 / scale, 0, 0, 0, 1 / scale, 0, 0, 0, 1];
+}
+
+/**
+ * Which picture the page draws and how holds land on it.
+ *
+ * The owner's generated look when the backend has it ready, otherwise the
+ * photograph exactly as before. Generated art is drawn in canonical mode:
+ * frame = the art's own size, holds scaled from the canonical frame with no
+ * homography. A cutout is transparent away from the holds, so it gets the Aura
+ * field colour behind it; www has one colour scheme (dark), so that is the
+ * dark field.
+ */
+export function resolveSprayWallDrawing({
+  photoUrl,
+  artUrl,
+  art,
+  photoWidth,
+  photoHeight,
+  boardWidth,
+  boardHeight,
+  homography,
+  darkFieldColor,
+}: {
+  photoUrl: string | null;
+  artUrl: string | null;
+  art: SprayWallArtChoice | null;
+  photoWidth: number | null | undefined;
+  photoHeight: number | null | undefined;
+  boardWidth: number;
+  boardHeight: number;
+  homography: readonly number[] | null;
+  darkFieldColor: string;
+}): SprayWallDrawing | null {
+  if (art && artUrl && art.width > 0 && art.height > 0 && boardWidth > 0) {
+    return {
+      imageUrl: artUrl,
+      frame: { width: art.width, height: art.height },
+      homography: canonicalArtHomography(art.width / boardWidth),
+      fieldColor: art.background === 'hold-cutouts' ? darkFieldColor : null,
+    };
+  }
+  if (!photoUrl) return null;
+  return {
+    imageUrl: photoUrl,
+    frame: resolveSprayPhotoFrame({ photoWidth, photoHeight, boardWidth, boardHeight }),
+    homography,
+    fieldColor: null,
+  };
 }

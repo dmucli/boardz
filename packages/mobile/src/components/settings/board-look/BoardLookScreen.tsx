@@ -1,14 +1,19 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Platform, useWindowDimensions } from 'react-native';
-import { router } from 'expo-router';
+import { scopedRouter as router } from '../../../lib/routing/scoped-navigation';
 import { useTranslation } from 'react-i18next';
 import { MoreForm } from '../../MoreForm';
+import { MoreFormRN } from '../../MoreForm.rn';
 import { BoardLookCarousel } from '../../board-look/BoardLookCarousel';
 import { boardLookCardHeight } from '../../board-look/board-look-card-metrics';
 import { useBoardPreviewClimb } from '../../../hooks/use-board-preview-climb';
 import { useBoardLookSettings } from '../../../lib/board-render/use-board-look-settings';
 import { countHoldMarkerOverrides, useHoldColorOverrides } from '../../../lib/hold-color-overrides';
-import { BOARD_LOOK_SETTINGS_OPTIONS, type BoardLookOptionId } from '../../../lib/board-render/board-look-options';
+import {
+  BOARD_LOOK_SETTINGS_OPTIONS,
+  drawableBoardLookOptions,
+  type BoardLookOptionId,
+} from '../../../lib/board-render/board-look-options';
 import { useOsAccessibilitySignals } from '../../../hooks/use-os-accessibility-signals';
 import {
   applyBoardLookSuggestion,
@@ -22,36 +27,90 @@ import {
   type BoardLookSuggestionDismissals,
 } from '../../../lib/board-render/board-look-suggestion-dismissals';
 import { buildBoardLookModel } from './board-look-model';
+import { useSprayWallsUseOwnLookSetting } from '../../../lib/spray-wall-look-preference';
+import { hapticSelection } from '../../../lib/haptics';
+import { withSettingTracking } from '../../../lib/settings-analytics';
+import { useBoardLightingSections } from '../board-lighting/use-board-lighting-sections';
+import { useActiveBoardIsMoonboard } from '../../../hooks/use-active-board-is-moonboard';
+import { useSetting } from '../../../settings';
+import { useGpuAccelerationSettingOffered } from '../../../providers/feature-flags-provider';
 
 /**
- * "Board look" — the parent. Pick a look from a rail of renders of your own
- * board, or step into one of the two things behind it.
+ * "Board" — the parent. Pick a look from a rail of renders of your own board,
+ * or step into one of the two things behind it; below that, what lights the
+ * board and when the phone lets go of it.
  *
  * The Custom CARD and the "Custom look" ROW are deliberately different actions.
  * The card is a look change: it brings back the bundle you last tuned, the same
  * way every other card applies its own look. The row is navigation only and
  * writes nothing — its subtitle says which look you are currently on, so it
  * reads as "go and tune what you have".
+ *
+ * `leadWithLighting` puts the lighting group first, for a climber sent here for
+ * it (the route's `?section=lighting`).
  */
-export function BoardLookScreen() {
+export function BoardLookScreen({ leadWithLighting = false }: { leadWithLighting?: boolean } = {}) {
   const { t } = useTranslation('common');
-  const {
-    settings,
-    matchingOptionId,
-    boardseshRendererAvailable,
-    requestedMode,
-    applyPreset,
-    restoreCustomLook,
-    resetBoardLook,
-  } = useBoardLookSettings();
+  const { settings, matchingOptionId, boardseshRendererAvailable, requestedMode, applyPreset, restoreCustomLook } =
+    useBoardLookSettings();
   const { preview } = useBoardPreviewClimb();
   // The rail's row is pinned in POINTS by a native host (SwiftUI `frame`, Compose
   // `height`) before React Native lays anything out, so the height has to account
   // for the climber's text size — React Native scales lineHeight by the font
   // multiplier, and the old constant under-reported by 26pt at the largest sizes.
   const { fontScale } = useWindowDimensions();
-  const { overrides, shapes, brushThickness, shapeSize } = useHoldColorOverrides();
+  // The climber's own choices: shapes the OS fills in for Differentiate Without
+  // Color are not something they customised.
+  const { markerOverrides } = useHoldColorOverrides();
   const signals = useOsAccessibilitySignals();
+  const { useOwnLook, setUseOwnLook } = useSprayWallsUseOwnLookSetting();
+  const lightingSections = useBoardLightingSections();
+  const sprayWalls = useMemo(
+    () => ({
+      useOwnLook,
+      onUseOwnLookChange: (next: boolean) => {
+        hapticSelection();
+        setUseOwnLook(next);
+      },
+    }),
+    [useOwnLook, setUseOwnLook],
+  );
+  // Only when the climber's active board is a MoonBoard. (The MoonBoard lighting
+  // switch further down this page gates on the connected Bluetooth board
+  // instead; the labels are about the board on screen, not the one on the wall.)
+  const showMoonboardGridLabels = useActiveBoardIsMoonboard();
+  const [moonboardGridLabelsEnabled, setMoonboardGridLabelsEnabled] = useSetting('moonboardGridLabels');
+  const moonboardGridLabels = useMemo(
+    () =>
+      showMoonboardGridLabels
+        ? {
+            enabled: moonboardGridLabelsEnabled,
+            onChange: (enabled: boolean) => {
+              hapticSelection();
+              setMoonboardGridLabelsEnabled(enabled);
+            },
+          }
+        : null,
+    [showMoonboardGridLabels, moonboardGridLabelsEnabled, setMoonboardGridLabelsEnabled],
+  );
+
+  // Hidden where the switch would do nothing: no native overlay module in this
+  // binary, or the remote kill switch is off.
+  const gpuAccelerationOffered = useGpuAccelerationSettingOffered();
+  const [gpuAccelerationEnabled, setGpuAccelerationEnabled] = useSetting('gpuAcceleration');
+  const gpuAcceleration = useMemo(
+    () =>
+      gpuAccelerationOffered
+        ? {
+            enabled: gpuAccelerationEnabled,
+            onChange: (enabled: boolean) => {
+              hapticSelection();
+              setGpuAccelerationEnabled(enabled);
+            },
+          }
+        : null,
+    [gpuAccelerationOffered, gpuAccelerationEnabled, setGpuAccelerationEnabled],
+  );
 
   // Start fully dismissed, so a banner can never flash in during hydration and
   // then vanish. Only a real read can un-dismiss.
@@ -93,10 +152,7 @@ export function BoardLookScreen() {
   // A build that cannot draw the Boardsesh look makes every Boardsesh card a
   // lie, so the rail collapses to the looks this build can actually render.
   const options = useMemo(
-    () =>
-      boardseshRendererAvailable === false
-        ? BOARD_LOOK_SETTINGS_OPTIONS.filter((option) => !option.requiresBoardseshRenderer)
-        : BOARD_LOOK_SETTINGS_OPTIONS,
+    () => drawableBoardLookOptions(BOARD_LOOK_SETTINGS_OPTIONS, boardseshRendererAvailable),
     [boardseshRendererAvailable],
   );
 
@@ -119,10 +175,7 @@ export function BoardLookScreen() {
     return option ? t(option.labelI18nKey) : '';
   }, [matchingOptionId, t]);
 
-  const overriddenCount = useMemo(
-    () => countHoldMarkerOverrides({ colors: overrides, shapes, brushThickness, shapeSize }),
-    [overrides, shapes, brushThickness, shapeSize],
-  );
+  const overriddenCount = useMemo(() => countHoldMarkerOverrides(markerOverrides), [markerOverrides]);
 
   const carousel = useMemo(
     () =>
@@ -140,22 +193,29 @@ export function BoardLookScreen() {
 
   const model = useMemo(
     () =>
-      buildBoardLookModel({
-        carousel,
-        carouselHeight: boardLookCardHeight(fontScale),
-        matchingOptionId,
-        currentLookLabel,
-        overriddenCount,
-        boardseshRendererAvailable,
-        requestedMode,
-        t,
-        onOpenCustomLook: () => router.push('/settings/board-look/custom'),
-        onOpenAccessibility: () => router.push('/settings/board-look/accessibility'),
-        onResetBoardLook: resetBoardLook,
-        suggestion,
-        onApplySuggestion: () => suggestion && settleSuggestion(suggestion.id, true),
-        onDismissSuggestion: () => suggestion && settleSuggestion(suggestion.id, false),
-      }),
+      withSettingTracking(
+        buildBoardLookModel({
+          carousel,
+          carouselHeight: boardLookCardHeight(fontScale),
+          matchingOptionId,
+          currentLookLabel,
+          overriddenCount,
+          boardseshRendererAvailable,
+          requestedMode,
+          t,
+          onOpenCustomLook: () => router.push('/settings/board-look/custom'),
+          onOpenAccessibility: () => router.push('/settings/board-look/accessibility'),
+          suggestion,
+          onApplySuggestion: () => suggestion && settleSuggestion(suggestion.id, true),
+          onDismissSuggestion: () => suggestion && settleSuggestion(suggestion.id, false),
+          sprayWalls,
+          moonboardGridLabels,
+          gpuAcceleration,
+          lightingSections,
+          leadWithLighting,
+        }),
+        'board',
+      ),
     [
       carousel,
       matchingOptionId,
@@ -165,11 +225,17 @@ export function BoardLookScreen() {
       requestedMode,
       fontScale,
       t,
-      resetBoardLook,
       suggestion,
       settleSuggestion,
+      sprayWalls,
+      moonboardGridLabels,
+      gpuAcceleration,
+      lightingSections,
+      leadWithLighting,
     ],
   );
 
-  return <MoreForm model={model} />;
+  // Compose RNHostView custom rows can measure correctly without drawing.
+  // Keep preview content in the RN tree on Android.
+  return Platform.OS === 'android' ? <MoreFormRN model={model} /> : <MoreForm model={model} />;
 }

@@ -10,6 +10,7 @@
  */
 export type BleFailureCategory =
   | 'unavailable' // Bluetooth off / unsupported / unauthorized
+  | 'permission_denied' // browser or policy blocked Bluetooth access
   | 'user_cancelled' // user dismissed the picker — no message
   | 'board_not_found' // scan found nothing / target serial never appeared
   | 'connect_failed' // GATT connect failed or timed out
@@ -57,13 +58,27 @@ function errorMessage(error: unknown): string {
   return String(error);
 }
 
-// The three numeric codes `react-native-ble-plx` puts on every thrown `BleError`.
+// The only wording we accept as "the climber dismissed the picker". Deliberately
+// narrow: a bare `cancel` would also match genuine technical failures such as
+// CoreBluetooth's "operation cancelled" and ble-plx's "Connection cancelled by
+// peer", which would then show the climber nothing at all.
+//
+// One constant on purpose. Both classifyBleFailure and
+// isRetryableAndroidConnectError need the same answer, and broadening it in only
+// one of them would let a cancelled connect burn the 500ms backoff plus a doomed
+// second connect (or, the other way round, silently swallow a real failure).
+// No `g` flag, so `.test` carries no lastIndex state and this instance is safe
+// to share across call sites.
+const USER_CANCEL_MESSAGE_PATTERN = /user cancell?ed|Device selection cancelled/i;
+
+// The numeric codes `react-native-ble-plx` puts on a thrown `BleError`.
 // Read structurally (this package is platform-agnostic pure TS and must not depend
 // on react-native-ble-plx) after gating on the error name below.
 type BlePlxErrorShape = {
   errorCode?: unknown;
   androidErrorCode?: unknown;
   iosErrorCode?: unknown;
+  attErrorCode?: unknown;
 };
 
 // ble-plx's `BleError extends Error` sets `name = 'BleError'` — the reliable
@@ -73,6 +88,44 @@ const BLE_PLX_ERROR_NAME = 'BleError';
 
 function isBlePlxError(error: unknown): error is BlePlxErrorShape {
   return errorName(error) === BLE_PLX_ERROR_NAME;
+}
+
+// Only these ble-plx connect errors can represent Android's transient GATT
+// handshake failure. Keep this narrower than BLE_PLX_CODE_TO_CATEGORY below:
+// timeout, MTU, discovery and lookup errors are terminal and must not replay the
+// selected-device connect.
+// 200 (DeviceConnectionFailed) is ble-plx's named connect-failure code, but the
+// installed 3.5.1 Android sources never construct it, which matches the zero
+// events we saw for it. It stays in the set so a ble-plx upgrade that starts
+// emitting it keeps the same retry, still bounded by the GATT status check below.
+const RETRYABLE_ANDROID_CONNECT_ERROR_CODES = new Set([200, 201, 205]);
+const RETRYABLE_ANDROID_GATT_STATUSES = new Set([133, 147]);
+
+/**
+ * True only for the small set of Android GATT connect failures which are known
+ * to recover after closing the stale GATT handle and trying the same peripheral
+ * once more. This is structural so the shared package stays pure TypeScript.
+ *
+ * The outer ble-plx code establishes that the failure came from the connection
+ * step. When Android also supplied its lower-level GATT status, that status is
+ * authoritative: only 133 (generic GATT error) and 147 may retry. A missing
+ * Android status is allowed because some devices/OS versions omit it entirely.
+ */
+export function isRetryableAndroidConnectError(error: unknown): boolean {
+  if (!isBlePlxError(error) || typeof error.errorCode !== 'number') return false;
+  if (!RETRYABLE_ANDROID_CONNECT_ERROR_CODES.has(error.errorCode)) return false;
+  // A chooser dismissal is never a failed GATT handshake, so it must never
+  // replay the connect. Same pattern classifyBleFailure uses, by construction.
+  if (USER_CANCEL_MESSAGE_PATTERN.test(errorMessage(error))) return false;
+  // ble-plx always carries both platform fields and uses null for the inactive
+  // platform. Reject a populated iOS field so this Android-only predicate stays
+  // safe even when called independently of the platform-gated adapter factory.
+  if (error.iosErrorCode !== undefined && error.iosErrorCode !== null) return false;
+  // On Android, ble-plx represents an omitted native GATT status as null. Keep
+  // accepting an actually-absent property too for structurally equivalent test
+  // doubles and older library shapes.
+  if (error.androidErrorCode === undefined || error.androidErrorCode === null) return true;
+  return typeof error.androidErrorCode === 'number' && RETRYABLE_ANDROID_GATT_STATUSES.has(error.androidErrorCode);
 }
 
 /**
@@ -138,11 +191,25 @@ export function classifyBleFailure(error: unknown, pairingStage?: string): BleFa
     if (codeCategory) return codeCategory;
   }
 
-  // User dismissed the picker. Match only explicit user-cancel signals — a bare
-  // "cancel" would also swallow real failures like CoreBluetooth's
-  // "operation cancelled" / "Connection cancelled by peer", silently showing
-  // the user nothing. NotFoundError is the Web Bluetooth chooser-dismissed name.
-  if (name === 'NotFoundError' || /user cancell?ed|Device selection cancelled/i.test(message)) {
+  // Chromium also uses NotFoundError when the chooser cannot open because
+  // Bluetooth is disabled or scan permission was denied (including Brave).
+  // Those failures must surface even though no device was selected.
+  if (
+    name === 'NotAllowedError' ||
+    (name === 'SecurityError' && /permissions?[ -]policy|Bluetooth.*(?:blocked|disallowed|denied)/i.test(message)) ||
+    /Web Bluetooth API globally disabled|disabled Web Bluetooth|Bluetooth permission has been blocked|denied.*permission.*(?:Bluetooth|scan)/i.test(
+      message,
+    )
+  ) {
+    return 'permission_denied';
+  }
+
+  // Only explicit chooser cancellation is silent; the exception name alone
+  // also covers missing adapters, services and browser restrictions.
+  if (
+    USER_CANCEL_MESSAGE_PATTERN.test(message) ||
+    (name === 'NotFoundError' && /^No device chosen\.?$/i.test(message))
+  ) {
     return 'user_cancelled';
   }
 
@@ -152,7 +219,9 @@ export function classifyBleFailure(error: unknown, pairingStage?: string): BleFa
   // the web adapter's "Failed to get UART characteristic" and the Swift
   // "UART service was not found" / "Write characteristic was not found".
   if (
-    /UART (service|characteristic)|write characteristic|characteristic.*not found|service.*not found/i.test(message)
+    /UART (service|characteristic)|write characteristic|characteristic.*not found|service.*not found|No (?:services|characteristics).*found in/i.test(
+      message,
+    )
   ) {
     return 'service_missing';
   }
@@ -178,34 +247,57 @@ export function classifyBleFailure(error: unknown, pairingStage?: string): BleFa
     return 'connect_failed';
   }
 
-  if (/not available|unavailable|powered ?off|poweredOff/i.test(message)) {
+  if (/not available|unavailable|powered ?off|poweredOff|Bluetooth is not supported/i.test(message)) {
     return 'unavailable';
   }
 
   return 'unknown';
 }
 
-/** Raw ble-plx numeric codes, attached to a connect-failure analytics event. */
+/** Raw ble-plx codes, kept separate by native error domain for analytics. */
 export type BlePlxErrorCodes = {
   bleErrorCode?: number; // react-native-ble-plx BleErrorCode enum value
   androidErrorCode?: number; // low-level Android GATT status (e.g. 133 / 8 / 19)
   iosErrorCode?: number; // iOS CBError code (present only on the ble-plx iOS path)
+  attErrorCode?: number; // ATT operation status; NOT an Android link-disconnect status
 };
+
+/**
+ * A failed write on a confirmed dead link must retain the disconnect signature
+ * used by the send path, without discarding the original native error codes.
+ * Keep only numbers: native error messages can contain peripheral identifiers.
+ */
+export class BleWriteDisconnectedError extends Error {
+  readonly bleErrorCodes: Readonly<BlePlxErrorCodes>;
+
+  constructor(writeError: unknown) {
+    super('Device disconnected during write');
+    this.name = 'BleWriteDisconnectedError';
+    this.bleErrorCodes = Object.freeze(blePlxErrorCodes(writeError));
+  }
+}
 
 /**
  * Pull the raw numeric codes off a thrown ble-plx `BleError` for analytics, so a
  * connect failure's real cause — the `BleErrorCode` and the low-level Android GATT
  * status — is visible in PostHog and the Android connect-failure distribution can
  * be re-measured (#3608). Returns `{}` for any non-ble-plx error (web / native
- * iOS), and omits any platform code that isn't a number. Mirrors the field-reading
+ * iOS), and omits any platform code that isn't a finite number. A normalized
+ * dead-link write retains this numeric snapshot, including the separate ATT
+ * domain; it never promotes an ATT status into androidErrorCode. Mirrors the field-reading
  * `RNBleAdapter` already does on its disconnect path (`bleErrorToDisconnectInfo`).
  */
 export function blePlxErrorCodes(error: unknown): BlePlxErrorCodes {
+  if (error instanceof BleWriteDisconnectedError) return { ...error.bleErrorCodes };
   if (!isBlePlxError(error)) return {};
   const codes: BlePlxErrorCodes = {};
-  if (typeof error.errorCode === 'number') codes.bleErrorCode = error.errorCode;
-  if (typeof error.androidErrorCode === 'number') codes.androidErrorCode = error.androidErrorCode;
-  if (typeof error.iosErrorCode === 'number') codes.iosErrorCode = error.iosErrorCode;
+  if (typeof error.errorCode === 'number' && Number.isFinite(error.errorCode)) codes.bleErrorCode = error.errorCode;
+  if (typeof error.androidErrorCode === 'number' && Number.isFinite(error.androidErrorCode))
+    codes.androidErrorCode = error.androidErrorCode;
+  if (typeof error.iosErrorCode === 'number' && Number.isFinite(error.iosErrorCode))
+    codes.iosErrorCode = error.iosErrorCode;
+  if (typeof error.attErrorCode === 'number' && Number.isFinite(error.attErrorCode))
+    codes.attErrorCode = error.attErrorCode;
   return codes;
 }
 

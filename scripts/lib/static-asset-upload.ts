@@ -1,5 +1,6 @@
 /// <reference types="node" />
 
+import { createHash } from 'node:crypto';
 import type { StaticAssetManifest, StaticAssetRecord } from '../../packages/shared/static-assets/src/types';
 
 export type RemoteStaticAsset = Readonly<{ key: string; bytes: number | undefined }>;
@@ -65,25 +66,43 @@ export function calculatePublicValidationDelay(failedAttempt: number, random: ()
   return Math.floor(minimumDelayMilliseconds + random() * minimumDelayMilliseconds);
 }
 
-export async function readResponseBodyWithinLimit(response: Response, maximumBytes: number): Promise<Uint8Array> {
+export async function readResponseBodyWithinLimit(
+  response: Response,
+  maximumBytes: number,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
     throw new Error('maximumBytes must be a non-negative safe integer');
   }
 
+  signal?.throwIfAborted();
   const reader = response.body?.getReader();
   if (!reader) return new Uint8Array();
 
+  const cancelOnAbort = (): void => {
+    void reader.cancel(signal?.reason).catch(() => {});
+  };
+  signal?.addEventListener('abort', cancelOnAbort, { once: true });
+
   const chunks: Uint8Array[] = [];
   let receivedBytes = 0;
-  while (true) {
-    const { done, value: chunk } = await reader.read();
-    if (done) break;
-    receivedBytes += chunk.byteLength;
-    if (receivedBytes > maximumBytes) {
-      await reader.cancel();
-      throw new Error(`Public asset body exceeds the expected ${maximumBytes} bytes`);
+  try {
+    while (true) {
+      const { done, value: chunk } = await reader.read();
+      // Cancelling a stalled reader resolves its pending read as done. Check
+      // abort first so cancellation cannot masquerade as a complete download.
+      signal?.throwIfAborted();
+      if (done) break;
+      receivedBytes += chunk.byteLength;
+      if (receivedBytes > maximumBytes) {
+        await reader.cancel();
+        throw new Error(`Asset body exceeds the expected ${maximumBytes} bytes`);
+      }
+      chunks.push(chunk);
     }
-    chunks.push(chunk);
+  } finally {
+    signal?.removeEventListener('abort', cancelOnAbort);
+    reader.releaseLock();
   }
 
   const contents = new Uint8Array(receivedBytes);
@@ -131,7 +150,11 @@ export function uniqueStaticAssets(manifest: StaticAssetManifest): readonly Stat
   return [...assetsByObjectKey.values()];
 }
 
-export function assertRemoteStaticAssetMetadata(asset: StaticAssetRecord, metadata: RemoteStaticAssetMetadata): void {
+export function assertRemoteStaticAssetMetadata(
+  asset: StaticAssetRecord,
+  metadata: RemoteStaticAssetMetadata,
+  downloadedContents?: Uint8Array,
+): void {
   if (metadata.bytes !== asset.bytes) {
     throw new Error(`S3 HEAD size mismatch for ${asset.logicalPath}: ${metadata.bytes ?? 'missing'}`);
   }
@@ -141,11 +164,23 @@ export function assertRemoteStaticAssetMetadata(asset: StaticAssetRecord, metada
   if (metadata.cacheControl !== STATIC_ASSET_CACHE_CONTROL) {
     throw new Error(`S3 HEAD Cache-Control mismatch for ${asset.logicalPath}: ${metadata.cacheControl ?? 'missing'}`);
   }
-  if (!metadata.checksumSha256) {
+  // Older objects can lack the optional S3 checksum even when their bytes are
+  // correct. Only a complete signed GET can supply the missing hash evidence.
+  const expectedChecksum = Buffer.from(asset.sha256, 'hex').toString('base64');
+  let downloadedChecksum: string | undefined;
+  if (downloadedContents) {
+    if (downloadedContents.byteLength !== asset.bytes) {
+      throw new Error(`S3 GET size mismatch for ${asset.logicalPath}: ${downloadedContents.byteLength}`);
+    }
+    downloadedChecksum = createHash('sha256').update(downloadedContents).digest('base64');
+    if (downloadedChecksum !== expectedChecksum) {
+      throw new Error(`S3 GET checksum mismatch for ${asset.logicalPath}`);
+    }
+  }
+  if (!metadata.checksumSha256 && !downloadedChecksum) {
     throw new Error(`S3 HEAD checksum missing for ${asset.logicalPath}`);
   }
-  const expectedChecksum = Buffer.from(asset.sha256, 'hex').toString('base64');
-  if (metadata.checksumSha256 !== expectedChecksum) {
+  if (metadata.checksumSha256 && metadata.checksumSha256 !== expectedChecksum) {
     throw new Error(`S3 HEAD checksum mismatch for ${asset.logicalPath}`);
   }
 }
@@ -229,9 +264,15 @@ export function assertPublicStaticAssetHeaders(
     throw new Error(`Public asset ${asset.logicalPath} has Content-Type ${contentType ?? '(missing)'}`);
   }
   const contentLength = headers.get('content-length');
-  if (contentLength !== String(asset.bytes)) {
+  const contentEncoding = headers.get('content-encoding')?.trim().toLowerCase();
+  const encodedBody = Boolean(contentEncoding && contentEncoding !== 'identity');
+  // HTTP/2 and chunked CDN responses can omit this header. The publisher still
+  // bounds the streamed body, checks its exact byte count and verifies SHA-256.
+  // fetch() also decodes gzip/Brotli responses while retaining their headers:
+  // Content-Length describes encoded wire bytes, not the decoded catalog bytes.
+  if (contentLength !== null && !encodedBody && contentLength !== String(asset.bytes)) {
     throw new Error(
-      `Public asset ${asset.logicalPath} has Content-Length ${contentLength ?? '(missing)'}; expected ${asset.bytes}`,
+      `Public asset ${asset.logicalPath} has Content-Length ${JSON.stringify(contentLength)}; expected ${asset.bytes}`,
     );
   }
   const cacheControl = headers.get('cache-control') ?? '';

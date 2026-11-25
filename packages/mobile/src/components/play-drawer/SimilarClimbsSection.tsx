@@ -1,9 +1,10 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useMemo } from 'react';
-import { View, Pressable, StyleSheet } from 'react-native';
+import { View, StyleSheet } from 'react-native';
 // RNGH ScrollView (not react-native's): the play drawer's outer scroll is an RNGH
 // ScrollView, so this nested horizontal strip must join the same gesture tree or
 // Android's outer scroll swallows its horizontal pans and it never scrolls. Same
-// pattern as WorkoutTypeShelf / BetaVideosSection.
+// pattern as BetaVideosSection.
 import { ScrollView } from 'react-native-gesture-handler';
 import { useTranslation } from 'react-i18next';
 import type { Climb, BoardName, SimilarClimb } from '@boardsesh/shared-schema';
@@ -32,7 +33,11 @@ type SimilarClimbsSectionProps = {
   sizeId: number;
   setIds: string;
   angle: number;
-  onClimbPress: (climb: Climb) => void;
+  /**
+   * A card was tapped. `similarClimbs` is the strip in its order, the climbs
+   * this wall fits plus the tapped one, for the player to play from (#6665).
+   */
+  onClimbPress: (climb: Climb, similarClimbs: Climb[]) => void;
 };
 
 const SKELETON_COUNT = 3;
@@ -49,7 +54,7 @@ export const SimilarClimbsSection = memo(function SimilarClimbsSection({
 }: SimilarClimbsSectionProps) {
   const { t } = useTranslation('session');
   const { t: tClimbs } = useTranslation('climbs');
-  const { brandColors } = useTheme();
+  const { systemColors } = useTheme();
   const { resolveGrade } = useDisplayGrade();
   const scope = useMemo(() => ({ boardName, layoutId, sizeId }), [boardName, layoutId, sizeId]);
   const {
@@ -64,12 +69,26 @@ export const SimilarClimbsSection = memo(function SimilarClimbsSection({
   // Wall-compatible climbs rank first; incompatible ones are dimmed and last.
   const ranked = useMemo(() => rankBySizeCompatibility(climbs ?? [], sizeId), [climbs, sizeId]);
 
+  // The strip as climbs, built once per result rather than per tap.
+  const rankedStubs = useMemo(
+    () => ranked.map(({ climb: similar, compatible }) => ({ stub: buildClimbStub(similar, boardName), compatible })),
+    [ranked, boardName],
+  );
+
   const handlePress = useCallback(
     (similar: SimilarClimb) => {
       void Haptics.selectionAsync();
-      onClimbPress(buildClimbStub(similar, boardName));
+      // Dimmed cards don't fit this wall, so swipes skip them; the tapped one
+      // stays where it is in the strip.
+      const similarClimbs: Climb[] = [];
+      let tapped: Climb | null = null;
+      for (const { stub, compatible } of rankedStubs) {
+        if (stub.uuid === similar.uuid) tapped = stub;
+        if (compatible || stub.uuid === similar.uuid) similarClimbs.push(stub);
+      }
+      onClimbPress(tapped ?? buildClimbStub(similar, boardName), similarClimbs);
     },
-    [onClimbPress, boardName],
+    [onClimbPress, boardName, rankedStubs],
   );
 
   const handleRetry = useCallback(() => {
@@ -87,13 +106,16 @@ export const SimilarClimbsSection = memo(function SimilarClimbsSection({
           contentContainerStyle={styles.scroller}
         >
           {Array.from({ length: SKELETON_COUNT }, (_, index) => (
-            <View key={index} style={[styles.card, styles.skeletonCard]} />
+            <View
+              key={index}
+              style={[styles.card, styles.skeletonCard, { backgroundColor: systemColors.tertiaryFill }]}
+            />
           ))}
         </ScrollView>
         {/* The first read of a downloaded board builds its holds index, which
             can take a few seconds on a big catalogue. Say so. */}
         {source === 'local' ? (
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('mobile.similarClimbs.preparing')}
           </Text>
         ) : null}
@@ -110,17 +132,17 @@ export const SimilarClimbsSection = memo(function SimilarClimbsSection({
 
   if (isError) {
     return (
-      <Pressable
+      <PressableSurface
         onPress={handleRetry}
         style={styles.emptyContainer}
         accessibilityRole="button"
         accessibilityLabel={t('mobile.similarClimbs.retry')}
       >
-        <Icon name="refresh" size={20} color={brandColors.primary} />
-        <Text variant="subheadline" color={brandColors.primary}>
+        <Icon name="refresh" size={20} color={systemColors.accent} />
+        <Text variant="subheadline" color={systemColors.accent}>
           {t('mobile.similarClimbs.retry')}
         </Text>
-      </Pressable>
+      </PressableSurface>
     );
   }
 
@@ -136,10 +158,13 @@ export const SimilarClimbsSection = memo(function SimilarClimbsSection({
       {ranked.map(({ climb: similar, compatible }) => {
         // SimilarClimb carries no Boardsesh grade today, so `resolveGrade` falls
         // back to the legacy label + colour — lights up once the backend stamps them.
-        const { label: formattedGrade, color: gradeColor } = resolveGrade({ difficulty: similar.difficultyName });
+        const { label: formattedGrade, color: gradeColor } = resolveGrade(
+          { difficulty: similar.difficultyName },
+          boardName,
+        );
         const byline = formatByline(similar, tClimbs);
         return (
-          <Pressable
+          <PressableSurface
             key={similar.uuid}
             onPress={() => handlePress(similar)}
             style={({ pressed }) => [styles.card, !compatible && styles.cardDimmed, pressed && styles.cardPressed]}
@@ -164,11 +189,11 @@ export const SimilarClimbsSection = memo(function SimilarClimbsSection({
               </View>
             ) : null}
             {byline ? (
-              <Text variant="caption2" color={iosSystemColors.systemGray} numberOfLines={1} style={styles.byline}>
+              <Text variant="caption2" color={systemColors.secondaryLabel} numberOfLines={1} style={styles.byline}>
                 {byline}
               </Text>
             ) : null}
-          </Pressable>
+          </PressableSurface>
         );
       })}
     </ScrollView>
@@ -176,10 +201,11 @@ export const SimilarClimbsSection = memo(function SimilarClimbsSection({
 });
 
 function SimilarClimbsEmpty({ message }: { message: string }) {
+  const { systemColors } = useTheme();
   return (
     <View style={styles.emptyContainer}>
-      <Icon name="search" size={20} color={iosSystemColors.systemGray} />
-      <Text variant="subheadline" color={iosSystemColors.systemGray}>
+      <Icon name="search" size={20} color={systemColors.secondaryLabel} />
+      <Text variant="subheadline" color={systemColors.secondaryLabel}>
         {message}
       </Text>
     </View>
@@ -282,7 +308,6 @@ const styles = StyleSheet.create({
   skeletonCard: {
     height: spacing[16],
     borderRadius: borderRadius.md,
-    backgroundColor: `${iosSystemColors.systemGray}14`,
   },
   name: {
     marginTop: spacing[1],

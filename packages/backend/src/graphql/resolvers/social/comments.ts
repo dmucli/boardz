@@ -1,6 +1,7 @@
+import { setContentPrivacy } from '../../../services/privacy';
 import { eq, and, isNull, count, sql } from 'drizzle-orm';
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
-import type { ConnectionContext, SocialEntityType } from '@boardsesh/shared-schema';
+import type { ConnectionContext, SocialEntityType, ReleaseContext } from '@boardsesh/shared-schema';
 import { executeRows } from '@boardsesh/db/client';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
@@ -14,11 +15,15 @@ import {
 import { logger } from '../../../utils/logger';
 import { encodeOffsetCursor, decodeOffsetCursor } from '../../../utils/feed-cursor';
 import { sprayClimbVisibilityCondition, sprayReferenceVisibilityCondition } from '@boardsesh/db/queries';
-import { sprayClimbUuidIsReadable, sprayProposalUuidIsReadable } from '../climbs/spray-read-access';
+import { readableSocialEntityIds } from './entity-read-access';
+import { GraphQLError } from 'graphql';
 import { validateEntityExists } from './entity-validation';
+import { lockReferencedClimb } from '../climbs/spray-climb-lock';
+import { lockActiveBoardForWrite } from '../../../services/board-reference-lock';
 import { publishSocialEvent } from '../../../events/index';
 import { pubsub } from '../../../pubsub/index';
 import crypto from 'crypto';
+import { canReadSocialEntity, socialEntityPrivacyCondition, commentPrivacyCondition } from '../shared/activity-privacy';
 
 type CommentRow = {
   id: number;
@@ -41,6 +46,12 @@ type CommentRow = {
   downvotes: number;
   userVote: number | null;
 };
+
+/** Author-only edits and removals, including receipt reauthorization, share this rule. */
+export function requireCommentAuthor(comment: { userId: string }, userId: string, action: 'edit' | 'delete'): void {
+  if (comment.userId !== userId)
+    throw new GraphQLError(`You can only ${action} your own comments`, { extensions: { code: 'FORBIDDEN' } });
+}
 
 function mapCommentRow(row: CommentRow) {
   const isDeleted = row.deletedAt !== null;
@@ -90,18 +101,17 @@ export const socialCommentQueries = {
 
     const authenticatedUserId = ctx.isAuthenticated ? ctx.userId : null;
 
-    // A climb comment thread is keyed on the climb uuid alone, so holding the
-    // uuid was the whole of the claim. On a spray wall it is not: the wall
-    // decides. The empty page, never an error — a different shape would say
-    // which uuids are climbs on a private wall.
-    if (entityType === 'climb' && !(await sprayClimbUuidIsReadable(entityId, authenticatedUserId))) {
+    if (!(await canReadSocialEntity(entityType, entityId, authenticatedUserId))) {
       return { comments: [], totalCount: 0, hasMore: false };
     }
-    // And a PROPOSAL thread is prose about a climb: a `hide` proposal stores its
-    // reason as a comment on itself. One hop further out, same answer.
-    if (entityType === 'proposal' && !(await sprayProposalUuidIsReadable(entityId, authenticatedUserId))) {
+    // Holding a thread UUID does not grant access to the wall behind it.
+    if (!(await readableSocialEntityIds(entityType, [entityId], authenticatedUserId)).has(entityId)) {
       return { comments: [], totalCount: 0, hasMore: false };
     }
+
+    // Every statement below reads comments on this one item, so the reply-author
+    // walk starts from the viewer's comments on it alone.
+    const item = { entityType, entityId };
 
     // If parentCommentUuid is provided, resolve to internal ID for filtering replies
     let parentCommentFilter: ReturnType<typeof sql>;
@@ -110,7 +120,12 @@ export const socialCommentQueries = {
       const [parentComment] = await db
         .select({ id: dbSchema.comments.id })
         .from(dbSchema.comments)
-        .where(eq(dbSchema.comments.uuid, parentCommentUuid))
+        .where(
+          and(
+            eq(dbSchema.comments.uuid, parentCommentUuid),
+            commentPrivacyCondition(ctx?.userId, dbSchema.comments, item),
+          ),
+        )
         .limit(1);
 
       if (!parentComment) {
@@ -155,6 +170,7 @@ export const socialCommentQueries = {
         and(
           eq(dbSchema.comments.entityType, entityType),
           eq(dbSchema.comments.entityId, entityId),
+          commentPrivacyCondition(authenticatedUserId, dbSchema.comments, item),
           resolvedParentId !== null
             ? eq(dbSchema.comments.parentCommentId, resolvedParentId)
             : isNull(dbSchema.comments.parentCommentId),
@@ -194,6 +210,7 @@ export const socialCommentQueries = {
         SELECT r."parent_comment_id", COUNT(*) as cnt
         FROM "comments" r
         WHERE r."parent_comment_id" IS NOT NULL AND r."deleted_at" IS NULL
+          AND ${commentPrivacyCondition(authenticatedUserId, { uuid: sql`r."uuid"`, userId: sql`r."user_id"`, parentCommentId: sql`r."parent_comment_id"`, entityType: sql`r."entity_type"`, entityId: sql`r."entity_id"` }, item)}
           AND r."entity_type" = ${entityType} AND r."entity_id" = ${entityId}
         GROUP BY r."parent_comment_id"
       ) reply_cnt ON reply_cnt."parent_comment_id" = c."id"
@@ -206,6 +223,7 @@ export const socialCommentQueries = {
       WHERE c."entity_type" = ${entityType}
         AND c."entity_id" = ${entityId}
         AND ${parentCommentFilter}
+        AND ${commentPrivacyCondition(authenticatedUserId, { uuid: sql`c."uuid"`, userId: sql`c."user_id"`, parentCommentId: sql`c."parent_comment_id"`, entityType: sql`c."entity_type"`, entityId: sql`c."entity_id"` }, item)}
       ORDER BY ${orderByClause}
       LIMIT ${limit}
       OFFSET ${offset}
@@ -279,11 +297,25 @@ export const socialCommentQueries = {
     // The feed spans every entity type and joins `board_climbs` only for the
     // board filter, so a comment on a private wall's climb reached an anonymous
     // caller carrying the climb uuid in `entityId`. The reference form of the
-    // wall rule, applied to the climb rows only — NULL-safe, so a comment whose
-    // climb row has gone survives.
+    // wall rule, applied to the climb rows only.
+    //
+    // The reference form passes a comment whose climb row has gone, and a climb
+    // row does go: `deleteDraftClimb` and account deletion hard-delete a draft
+    // and leave its comments. On a private wall that put the setter's note, and
+    // the climb uuid with it, in front of everybody (#5981). A comment row
+    // carries no board type, so there is no "spray only" version of this rule:
+    // a climb comment is listed only while its climb still exists, on EVERY
+    // board. No alias arm: a deduplicated climb keeps its `board_climbs` row
+    // (the MoonBoard merges delist the loser, they do not delete it) and those
+    // merges repoint comments at the survivor, so no comment sits under a uuid
+    // that has an alias and no row. It also matches the board-filtered path
+    // above, which already requires the row.
     const sprayCommentVisibility = sql`AND (
       c."entity_type" <> 'climb'
-      OR ${sprayReferenceVisibilityCondition({ boardType: sql`'spray'`, climbUuid: sql`c."entity_id"` }, authenticatedUserId)}
+      OR (
+        ${sprayReferenceVisibilityCondition({ boardType: sql`'spray'`, climbUuid: sql`c."entity_id"` }, authenticatedUserId)}
+        AND EXISTS (SELECT 1 FROM "board_climbs" commented_climb WHERE commented_climb."uuid" = c."entity_id")
+      )
     )`;
 
     // `proposal` was the hole the climb arm left open: a `hide` proposal persists
@@ -294,11 +326,18 @@ export const socialCommentQueries = {
     // WHERE, because the join is right here.
     //
     // Both joins are LEFT and both are one-to-one (`climb_proposals.uuid` is
-    // unique, `board_climbs` is keyed on board type + uuid), so no comment can be
+    // unique, `board_climbs` is keyed on its uuid alone), so no comment can be
     // duplicated by them. `IS DISTINCT FROM` does the rest: a comment that is not
     // on a proposal, a proposal on one of the eight catalogue boards, and a
     // proposal whose climb row has gone all leave `bc_vis.board_type` NULL or
-    // non-spray, and all survive.
+    // non-spray, and all pass the column form.
+    //
+    // The last of those is wrong for spray: with the climb hard-deleted there is
+    // no wall to check, and the thread is prose about a private wall's climb
+    // (#5981). The proposal carries its own board type, so the second condition
+    // drops exactly that case. `IS DISTINCT FROM`, not `NOT (… = 'spray' AND …)`:
+    // `cp_vis` is NULL for every comment that is not on a proposal, and a NULL
+    // there would drop the whole feed.
     const sprayProposalJoin = sql`
       LEFT JOIN "climb_proposals" cp_vis
         ON c."entity_type" = 'proposal' AND cp_vis."uuid" = c."entity_id"
@@ -308,11 +347,18 @@ export const socialCommentQueries = {
     const sprayProposalCommentVisibility = sql`AND ${sprayClimbVisibilityCondition(
       { boardType: sql`bc_vis."board_type"`, layoutId: sql`bc_vis."layout_id"` },
       authenticatedUserId,
-    )}`;
+    )}
+      AND (cp_vis."board_type" IS DISTINCT FROM 'spray' OR bc_vis."uuid" IS NOT NULL)`;
 
-    const rawRows = await executeRows<CommentRow>(
-      db,
-      sql`
+    // A dynamic feed authorizes several entity kinds in one statement. On
+    // PostgreSQL's default JIT settings, compiling those predicates took 10.9s
+    // for a three-row fixture; executing them took 4ms. Keep this transaction's
+    // bounded page read interpreted, without changing the connection's defaults.
+    const rawRows = await db.transaction(async (tx) => {
+      await tx.execute(sql`SET LOCAL jit = off`);
+      return executeRows<CommentRow>(
+        tx,
+        sql`
       SELECT ${distinctClause}
         c."id",
         c."uuid",
@@ -340,10 +386,11 @@ export const socialCommentQueries = {
       LEFT JOIN (
         -- Global feed spans all entities, so reply counts are computed globally.
         -- The join naturally scopes to only matching parent IDs.
-        SELECT "parent_comment_id", COUNT(*) as cnt
-        FROM "comments"
-        WHERE "parent_comment_id" IS NOT NULL AND "deleted_at" IS NULL
-        GROUP BY "parent_comment_id"
+        SELECT r."parent_comment_id", COUNT(*) as cnt
+        FROM "comments" r
+        WHERE r."parent_comment_id" IS NOT NULL AND r."deleted_at" IS NULL
+          AND ${commentPrivacyCondition(authenticatedUserId, { uuid: sql`r.uuid`, userId: sql`r.user_id`, parentCommentId: sql`r.parent_comment_id`, entityType: sql`r.entity_type`, entityId: sql`r.entity_id` })}
+        GROUP BY r."parent_comment_id"
       ) reply_cnt ON reply_cnt."parent_comment_id" = c."id"
       LEFT JOIN "vote_counts" vc ON vc."entity_type" = 'comment' AND vc."entity_id" = c."uuid"
       ${
@@ -354,6 +401,8 @@ export const socialCommentQueries = {
       ${boardFilterJoin}
       ${sprayProposalJoin}
       WHERE c."deleted_at" IS NULL
+        AND ${commentPrivacyCondition(authenticatedUserId, { uuid: sql`c."uuid"`, userId: sql`c."user_id"`, parentCommentId: sql`c."parent_comment_id"`, entityType: sql`c."entity_type"`, entityId: sql`c."entity_id"` })}
+        AND ${socialEntityPrivacyCondition(sql`c."entity_type"`, sql`c."entity_id"`, authenticatedUserId, { discovery: true })}
         ${boardFilterWhere}
         ${sprayCommentVisibility}
         ${sprayProposalCommentVisibility}
@@ -361,7 +410,8 @@ export const socialCommentQueries = {
       LIMIT ${limit + 1}
       OFFSET ${offset}
     `,
-    );
+      );
+    });
 
     const hasMore = rawRows.length > limit;
     const resultRows = hasMore ? rawRows.slice(0, limit) : rawRows;
@@ -404,6 +454,7 @@ export async function insertComment(params: {
   parentCommentId?: number | null;
   parentCommentUuid?: string | null;
   executor?: CommentExecutor;
+  releaseContext?: ReleaseContext | null;
 }) {
   const {
     userId,
@@ -424,6 +475,7 @@ export async function insertComment(params: {
       entityId,
       parentCommentId,
       body,
+      releaseContext: params.releaseContext ?? null,
     })
     .returning();
 
@@ -487,6 +539,7 @@ export const socialCommentMutations = {
     const userId = ctx.userId!;
 
     await validateEntityExists(entityType, entityId, userId);
+    if (!(await canReadSocialEntity(entityType, entityId, userId))) throw new Error('Content not available');
 
     let parentCommentId: number | null = null;
     if (parentCommentUuid) {
@@ -498,7 +551,12 @@ export const socialCommentMutations = {
           deletedAt: dbSchema.comments.deletedAt,
         })
         .from(dbSchema.comments)
-        .where(eq(dbSchema.comments.uuid, parentCommentUuid))
+        .where(
+          and(
+            eq(dbSchema.comments.uuid, parentCommentUuid),
+            commentPrivacyCondition(ctx?.userId, dbSchema.comments, { entityType, entityId }),
+          ),
+        )
         .limit(1);
 
       if (!parent) {
@@ -513,13 +571,69 @@ export const socialCommentMutations = {
       parentCommentId = parent.id;
     }
 
-    const commentResult = await insertComment({
-      userId,
-      entityType,
-      entityId,
-      body,
-      parentCommentId,
-      parentCommentUuid,
+    const commentParams = { userId, entityType, entityId, body, parentCommentId, parentCommentUuid };
+    // The existence check above runs outside any transaction, and a spray climb
+    // can be hard-deleted by its setter (`deleteClimb`, #5960). Holding the climb
+    // until the insert commits stops a comment landing after the delete's sweep,
+    // where it would be orphaned and could notify about a climb that is gone.
+    const commentResult = await db.transaction(async (tx) => {
+      if (entityType === 'climb') await lockReferencedClimb(tx, entityId);
+      if (entityType === 'board') {
+        if (!(await lockActiveBoardForWrite(tx, { uuid: entityId }))) throw new Error('Content not available');
+      } else if (entityType === 'gym') {
+        const [gym] = await tx
+          .select({ id: dbSchema.gyms.id })
+          .from(dbSchema.gyms)
+          .where(
+            and(
+              eq(dbSchema.gyms.uuid, entityId),
+              isNull(dbSchema.gyms.deletedAt),
+              isNull(dbSchema.gyms.mergedIntoGymId),
+            ),
+          )
+          .for('share')
+          .limit(1);
+        if (!gym) throw new Error('Content not available');
+      }
+      if (entityType === 'board' || entityType === 'gym') {
+        // A merge either waits for this insert or wins first and refuses the
+        // stale identity. Recheck visibility after acquiring its shared lock.
+        const [visibility] = await tx
+          .select({
+            allowed: socialEntityPrivacyCondition(sql`${entityType}`, sql`${entityId}`, userId, 'by-reference'),
+          })
+          .from(sql`(SELECT 1) privacy_check`);
+        if (visibility?.allowed !== true) throw new Error('Content not available');
+        if (parentCommentUuid) {
+          const [parent] = await tx
+            .select({ id: dbSchema.comments.id })
+            .from(dbSchema.comments)
+            .where(
+              and(
+                eq(dbSchema.comments.uuid, parentCommentUuid),
+                eq(dbSchema.comments.entityType, entityType),
+                eq(dbSchema.comments.entityId, entityId),
+                isNull(dbSchema.comments.deletedAt),
+                commentPrivacyCondition(userId, dbSchema.comments, { entityType, entityId }),
+              ),
+            )
+            .for('share')
+            .limit(1);
+          if (!parent) throw new Error('Parent comment not found');
+        }
+      }
+      const inserted = await insertComment({ ...commentParams, executor: tx });
+      if (validated.privacy) {
+        await setContentPrivacy(
+          tx,
+          userId,
+          'comment',
+          inserted.uuid,
+          validated.privacy.audience,
+          validated.privacy.privacyRevision,
+        );
+      }
+      return inserted;
     });
 
     // Live comment update via PubSub (synchronous for real-time)
@@ -554,19 +668,30 @@ export const socialCommentMutations = {
     if (!comment) {
       throw new Error('Comment not found');
     }
-    if (comment.userId !== userId) {
-      throw new Error('You can only edit your own comments');
-    }
+    requireCommentAuthor(comment, userId, 'edit');
     if (comment.deletedAt) {
       throw new Error('Cannot edit a deleted comment');
     }
 
     const now = new Date();
-    const [updated] = await db
-      .update(dbSchema.comments)
-      .set({ body, updatedAt: now })
-      .where(eq(dbSchema.comments.uuid, commentUuid))
-      .returning();
+    const [updated] = await db.transaction(async (tx) => {
+      const updatedComments = await tx
+        .update(dbSchema.comments)
+        .set({ body, updatedAt: now })
+        .where(eq(dbSchema.comments.uuid, commentUuid))
+        .returning();
+      if (validated.privacy) {
+        await setContentPrivacy(
+          tx,
+          userId,
+          'comment',
+          commentUuid,
+          validated.privacy.audience,
+          validated.privacy.privacyRevision,
+        );
+      }
+      return updatedComments;
+    });
 
     // Fetch enriched data for the response
     const [user] = await db
@@ -588,7 +713,16 @@ export const socialCommentMutations = {
     const replyResult = await db
       .select({ count: count() })
       .from(dbSchema.comments)
-      .where(and(eq(dbSchema.comments.parentCommentId, comment.id), isNull(dbSchema.comments.deletedAt)));
+      .where(
+        and(
+          eq(dbSchema.comments.parentCommentId, comment.id),
+          isNull(dbSchema.comments.deletedAt),
+          commentPrivacyCondition(userId, dbSchema.comments, {
+            entityType: comment.entityType,
+            entityId: comment.entityId,
+          }),
+        ),
+      );
     const replyCount = Number(replyResult[0]?.count || 0);
 
     // User's own vote
@@ -657,9 +791,7 @@ export const socialCommentMutations = {
     if (!comment) {
       throw new Error('Comment not found');
     }
-    if (comment.userId !== userId) {
-      throw new Error('You can only delete your own comments');
-    }
+    requireCommentAuthor(comment, userId, 'delete');
     if (comment.deletedAt) {
       return true; // Already deleted
     }
@@ -689,6 +821,8 @@ export const socialCommentMutations = {
     const entityKey = `${comment.entityType}:${comment.entityId}`;
     pubsub.publishCommentEvent(entityKey, {
       __typename: 'CommentDeleted',
+      authorUserId: userId,
+      parentCommentId: comment.parentCommentId,
       commentUuid,
       entityType: comment.entityType,
       entityId: comment.entityId,

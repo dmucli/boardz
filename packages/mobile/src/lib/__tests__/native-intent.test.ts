@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { grantAnalyticsForTest } from '../../../test/consent-fixture';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const getShareExtensionKeyMock = vi.fn();
 vi.mock('expo-share-intent', () => ({
@@ -6,6 +7,9 @@ vi.mock('expo-share-intent', () => ({
 }));
 
 import { redirectSystemPath } from '../../../app/+native-intent';
+import { setSetting } from '../../settings/hooks';
+import { updateConsentState } from '../consent-state';
+import { consumeConsentDestination } from '../consent-navigation';
 
 const JOIN_LINK = '/join/123e4567-e89b-12d3-a456-426614174000';
 
@@ -30,6 +34,31 @@ describe('redirectSystemPath', () => {
   it('leaves ordinary deep links untouched', () => {
     getShareExtensionKeyMock.mockReturnValue('SHAREKEY');
     expect(redirectSystemPath({ path: JOIN_LINK, initial: true })).toBe(JOIN_LINK);
+  });
+
+  // #6289: the start-up tab is for a plain launch. A link opens where it
+  // points, cold or warm, and never detours through the launcher route.
+  it.each([true, false])('keeps a deep link on its own route with Home chosen to start (initial=%s)', (initial) => {
+    getShareExtensionKeyMock.mockReturnValue('SHAREKEY');
+    const climbLink = 'https://boardsesh.com/b/the-gym/40/view/crimpy-thing-0A1B2C3D4E5F60718293A4B5C6D7E8F9';
+    setSetting('startupScreen', 'home');
+    try {
+      expect(redirectSystemPath({ path: JOIN_LINK, initial })).toBe(JOIN_LINK);
+      expect(redirectSystemPath({ path: climbLink, initial })).toBe(climbLink);
+    } finally {
+      setSetting('startupScreen', 'climbs');
+    }
+  });
+
+  it.each([
+    ['https://boardsesh.com', true],
+    ['https://boardsesh.com', false],
+    ['https://www.boardsesh.com', true],
+    ['https://www.boardsesh.com', false],
+  ])('preserves an unlisted wall share query from %s (initial=%s)', (origin, initial) => {
+    getShareExtensionKeyMock.mockReturnValue('SHAREKEY');
+    const shareUrl = `${origin}/b/my-wall/40/list?wall=123e4567-e89b-12d3-a456-426614174000`;
+    expect(redirectSystemPath({ path: shareUrl, initial })).toBe(shareUrl);
   });
 
   it('falls through to the original path (never reroutes) when getShareExtensionKey throws', () => {
@@ -103,10 +132,71 @@ describe('redirectSystemPath', () => {
     expect(redirectSystemPath({ path: '/preview/production', initial: true })).toBe('/preview/production');
   });
 
+  // The iPad "On the Wall" tab became the full-screen Wall display.
+  it.each([
+    'com.boardsesh.app://wall',
+    'com.boardsesh.app:///wall',
+    'com.boardsesh.app://wall/',
+    'com.boardsesh.app://wall?screenshotCppScene=kiosk',
+    '/wall',
+    '/(tabs)/wall',
+  ])('opens the Wall display for the old wall tab link: %s', (path) => {
+    getShareExtensionKeyMock.mockReturnValue('SHAREKEY');
+    expect(redirectSystemPath({ path, initial: false })).toBe('/wall-display');
+  });
+
+  it.each(['com.boardsesh.app://wall-display', '/walls', 'https://boardsesh.com/b/my-wall/40/list?wall=abc'])(
+    'leaves a link that only mentions a wall alone: %s',
+    (path) => {
+      getShareExtensionKeyMock.mockReturnValue('SHAREKEY');
+      expect(redirectSystemPath({ path, initial: false })).toBe(path);
+    },
+  );
+
   it('does not treat a non-callback deep link on the same scheme as the callback', () => {
     getShareExtensionKeyMock.mockReturnValue('SHAREKEY');
     expect(redirectSystemPath({ path: 'com.boardsesh.app://join/some-session', initial: true })).toBe(
       'com.boardsesh.app://join/some-session',
     );
+  });
+});
+
+beforeEach(() => grantAnalyticsForTest());
+
+describe('isolated story deep links before consent', () => {
+  beforeEach(() => {
+    updateConsentState({ settled: false });
+    consumeConsentDestination();
+    vi.stubGlobal('__DEV__', true);
+  });
+  afterEach(() => {
+    consumeConsentDestination();
+    vi.unstubAllGlobals();
+  });
+
+  it.each([true, false])('opens stories without the application consent provider (initial=%s)', (initial) => {
+    for (const path of [
+      'com.boardsesh.app://dev/stories/player--tension?theme=dark&shot=123',
+      'com.boardsesh.app:///dev/stories/player--kilter',
+      '/dev/stories',
+      '/dev/story-tabs/climbs?storyId=climbs--default',
+    ]) {
+      expect(redirectSystemPath({ path, initial })).toBe(path);
+      expect(consumeConsentDestination()).toBeNull();
+    }
+  });
+
+  it('still defers application routes and similarly named paths', () => {
+    for (const path of ['/join/session', '/dev/stories-other', '/dev/story-tabs-other']) {
+      expect(redirectSystemPath({ path, initial: false })).toBe('');
+      expect(consumeConsentDestination()).toBe(path);
+    }
+  });
+
+  it('does not bypass consent in production', () => {
+    vi.stubGlobal('__DEV__', false);
+    const path = '/dev/stories/player--kilter';
+    expect(redirectSystemPath({ path, initial: true })).toBe('/');
+    expect(consumeConsentDestination()).toBe(path);
   });
 });

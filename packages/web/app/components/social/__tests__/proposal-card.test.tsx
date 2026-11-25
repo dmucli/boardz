@@ -16,6 +16,7 @@ vi.mock('react-i18next', () => ({
 // --- Mocks ---
 
 const mockRequest = vi.fn();
+const authState = vi.hoisted(() => ({ token: 'test-token' as string | null }));
 vi.mock('@/app/lib/graphql/client', () => ({
   createGraphQLHttpClient: () => ({ request: mockRequest }),
 }));
@@ -26,7 +27,7 @@ vi.mock('next/navigation', () => ({
 
 vi.mock('@/app/hooks/use-ws-auth-token', () => ({
   useWsAuthToken: () => ({
-    token: 'test-token',
+    token: authState.token,
     isLoading: false,
     isAuthenticated: true,
     error: null,
@@ -63,8 +64,9 @@ vi.mock('@/app/components/board-renderer/util', () => ({
   convertLitUpHoldsStringToMap: () => [{ 123: { state: 1 } }],
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: (params: { board_name: string }) => ({
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: (params: { board_name: string }) => ({
     board_name: params.board_name,
     layout_id: 1,
     size_id: 1,
@@ -168,6 +170,16 @@ describe('ProposalCard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRequest.mockReset();
+    authState.token = 'test-token';
+  });
+
+  it('keeps public proposal text and vote totals without signed-out vote controls', () => {
+    authState.token = null;
+    render(<ProposalCard proposal={makeProposal({ reason: 'This grade feels right' })} />);
+    expect(screen.getByText(/This grade feels right/)).toBeTruthy();
+    expect(screen.getByTestId('proposal-vote-bar')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /support/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /oppose/i })).toBeNull();
   });
 
   describe('StaticClimbRow integration', () => {

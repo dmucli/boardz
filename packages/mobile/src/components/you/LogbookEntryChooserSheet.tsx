@@ -1,12 +1,13 @@
+import { PressableSurface } from '../PressableSurface';
 import { useCallback, useMemo, useRef, type ComponentRef } from 'react';
-import { View, Pressable, StyleSheet } from 'react-native';
-import { BottomSheetModal, BottomSheetFlatList } from '@expo/ui/community/bottom-sheet';
+import { View, Platform, StyleSheet } from 'react-native';
+import { BottomSheetModal, BottomSheetFlatList } from '../sheet-presentation';
 import { useWindowBottomInset } from '../../hooks/use-window-bottom-inset';
 import { useTranslation } from 'react-i18next';
 import type { AscentFeedItem } from '@boardsesh/graphql/operations';
 import { parseTickTime } from '@boardsesh/profile-stats';
 import { displayedAttemptCount, normalizeLogbookQuality } from '@boardsesh/logbook';
-import { androidSafeSnapPoints } from '../sheet-snap-points';
+import { MEDIUM_SNAP_POINTS, androidSafeSnapPoints } from '../sheet-snap-points';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { type IconName } from '../icon-map';
@@ -15,6 +16,7 @@ import { useTheme } from '../../providers/theme-provider';
 import { iosSystemColors } from '../../theme/ios-colors';
 import { spacing, borderRadius } from '../../theme/tokens';
 import { hapticSelection } from '../../lib/haptics';
+import { useIosSheetBackgroundStyle } from '../use-ios-sheet-background-style';
 
 type LogbookEntryChooserSheetProps = {
   /** The grouped day's entries, newest first. Opens with length > 1 (a
@@ -25,6 +27,8 @@ type LogbookEntryChooserSheetProps = {
    *  tapping an entry will do. */
   intent: 'edit' | 'delete';
   onPick: (entry: AscentFeedItem) => void;
+  /** Delete intent only: shown under the list while it holds two or more entries. */
+  onDeleteAll?: () => void;
   onDismiss: () => void;
 };
 
@@ -42,17 +46,23 @@ const STATUS_ICON: Record<AscentFeedItem['status'], IconName> = {
 /**
  * Day-entries chooser for a grouped logbook row: swipe-edit or swipe-delete on
  * a row that collapses several same-day entries must act on ONE tick, so the
- * climber picks which. There is deliberately no act-on-all option — DELETE is
- * a real server-side, Aurora-synced mutation and never fans out from one
- * gesture (PR #3350 thread).
+ * climber picks which. Delete also offers "Delete all" under the list; it
+ * goes through its own confirm dialog and one Undo restores every entry.
  */
-export function LogbookEntryChooserSheet({ entries, intent, onPick, onDismiss }: LogbookEntryChooserSheetProps) {
+export function LogbookEntryChooserSheet({
+  entries,
+  intent,
+  onPick,
+  onDeleteAll,
+  onDismiss,
+}: LogbookEntryChooserSheetProps) {
   const { t, i18n } = useTranslation('you');
   const { systemColors, brandColors } = useTheme();
+  const iosBackgroundStyle = useIosSheetBackgroundStyle();
   const windowInsetBottom = useWindowBottomInset();
   const sheetRef = useRef<ComponentRef<typeof BottomSheetModal>>(null);
   const managed = useManagedSheet({ open: true, sheetRef, onClose: onDismiss });
-  const snapPoints = useMemo(() => androidSafeSnapPoints(['45%']), []);
+  const snapPoints = useMemo(() => androidSafeSnapPoints(MEDIUM_SNAP_POINTS), []);
 
   const handlePick = useCallback(
     (entry: AscentFeedItem) => {
@@ -82,7 +92,7 @@ export function LogbookEntryChooserSheet({ entries, intent, onPick, onDismiss }:
         .filter(Boolean)
         .join(' · ');
       return (
-        <Pressable
+        <PressableSurface
           onPress={() => handlePick(entry)}
           accessibilityRole="button"
           accessibilityLabel={`${timeLabel}, ${meta}`}
@@ -106,14 +116,41 @@ export function LogbookEntryChooserSheet({ entries, intent, onPick, onDismiss }:
             size={18}
             color={intent === 'delete' ? brandColors.error : systemColors.secondaryLabel}
           />
-        </Pressable>
+        </PressableSurface>
       );
     },
     [brandColors, systemColors, i18n.language, t, intent, handlePick],
   );
 
+  const showDeleteAll = intent === 'delete' && onDeleteAll != null && entries.length > 1;
+  const deleteAllFooter = showDeleteAll ? (
+    <PressableSurface
+      onPress={() => {
+        hapticSelection();
+        onDeleteAll();
+      }}
+      accessibilityRole="button"
+      style={({ pressed }) => [
+        styles.entryRow,
+        styles.deleteAllRow,
+        { backgroundColor: systemColors.secondaryBackground },
+        pressed && styles.entryRowPressed,
+      ]}
+    >
+      <Icon name="delete" size={18} color={brandColors.error} />
+      <Text variant="body" color={brandColors.error} style={styles.entryTime}>
+        {t('mobile.logbook.chooser.deleteAll', { count: entries.length })}
+      </Text>
+    </PressableSurface>
+  ) : null;
+
   return (
     <BottomSheetModal
+      surfaceSize="list"
+      accessibilityLabel={
+        intent === 'delete' ? t('mobile.logbook.chooser.deleteTitle') : t('mobile.logbook.chooser.editTitle')
+      }
+      onRequestClose={managed.handle.dismiss}
       ref={sheetRef}
       index={0}
       snapPoints={snapPoints}
@@ -121,7 +158,7 @@ export function LogbookEntryChooserSheet({ entries, intent, onPick, onDismiss }:
       enablePanDownToClose
       onChange={managed.onChange}
       handleIndicatorStyle={{ backgroundColor: systemColors.tertiaryLabel }}
-      backgroundStyle={{ backgroundColor: systemColors.background }}
+      backgroundStyle={Platform.OS === 'ios' ? iosBackgroundStyle : { backgroundColor: systemColors.background }}
     >
       <BottomSheetFlatList
         data={entries}
@@ -133,16 +170,14 @@ export function LogbookEntryChooserSheet({ entries, intent, onPick, onDismiss }:
           </Text>
         }
         renderItem={renderEntry}
+        ListFooterComponent={deleteAllFooter ?? undefined}
       />
     </BottomSheetModal>
   );
 }
 
 const styles = StyleSheet.create({
-  content: {
-    paddingHorizontal: spacing[4],
-    gap: spacing[2],
-  },
+  content: { width: '100%', maxWidth: 672, alignSelf: 'center', paddingHorizontal: spacing[4], gap: spacing[2] },
   title: {
     marginBottom: spacing[2],
   },
@@ -156,6 +191,11 @@ const styles = StyleSheet.create({
     minHeight: 44,
   },
   entryRowPressed: { opacity: 0.7 },
+  deleteAllRow: {
+    justifyContent: 'center',
+    gap: spacing[2],
+    marginTop: spacing[2],
+  },
   entryText: {
     flex: 1,
     minWidth: 0,

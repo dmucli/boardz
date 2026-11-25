@@ -22,7 +22,8 @@
  *
  * Pure and synchronous — the backend resolves it per feed row against the ascent
  * owner's boards (so it is correct for every viewer, not just for yourself), and
- * the clients call the rung-4 wrapper when a payload carries no resolved config.
+ * the clients call the rung-4 wrapper when a payload carries no resolved config
+ * (except for Woods, where a null result means "no size known": plain tile).
  */
 import {
   getSizesForLayoutId,
@@ -31,14 +32,14 @@ import {
   getLayout,
   getProductSize,
   ORPHANED_KILTER_LAYOUT_DEFAULTS,
-} from '@boardsesh/board-constants/product-sizes';
+} from '@boardsesh/board-constants/catalog-metadata';
 import { getSizeRank } from '@boardsesh/board-constants/size-comparison';
 import type { ProductSizeData } from '@boardsesh/board-constants';
 import type { BoardName, RenderBoardConfig } from '@boardsesh/shared-schema';
 
 import { toBoardName } from './board-name';
-import { MOONBOARD_LAYOUTS, MOONBOARD_SETS, MOONBOARD_SIZE, type MoonBoardLayoutKey } from './moonboard-config';
-import { WOODS_LAYOUTS, WOODS_SETS, WOODS_SIZES } from './woods-config';
+import { MOONBOARD_LAYOUTS, MOONBOARD_SETS, MOONBOARD_SIZE, type MoonBoardLayoutKey } from './moonboard-metadata';
+import { WOODS_LAYOUTS, WOODS_SETS, WOODS_SIZES } from './woods-metadata';
 import { SPRAY_SET_IDS, spraySizeIdForLayout } from './spray-config';
 
 /** Woods' one synthetic hold set — every Woods board and climb carries it. */
@@ -257,14 +258,17 @@ function resolveWoodsRenderBoard({
     return { layoutId, sizeId: firstCompatibleSizeId, setIds: [...WOODS_SET_IDS] };
   }
 
-  // 4. Nothing known about the climb's size either — the 12x12 default.
-  return getDefaultRenderBoard('woods', climbLayoutId);
+  // 4. Nothing known about the climb's size. Guessing the 12x12 would draw an
+  //    8x10 climb as different holds, so return null and let the caller draw a
+  //    plain tile instead (#5241).
+  return null;
 }
 
 /**
  * Resolve the board configuration a logged climb should be drawn on. See the
  * module comment for the ladder. Returns null only when the board type or layout
- * can't be resolved at all, which callers render as a plain tile.
+ * can't be resolved at all (or a Woods climb has no size information), which
+ * callers render as a plain tile.
  */
 export function resolveRenderBoard(args: ResolveRenderBoardArgs): RenderBoardConfig | null {
   const { boardType, climbLayoutId, compatibleSizeIds, requiredSetIds, tickBoard, ownerBoards } = args;

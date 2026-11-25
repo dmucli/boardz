@@ -1,3 +1,4 @@
+import type { PrivacyResourceAudience, PrivacyLocationAudience } from '@boardsesh/graphql/operations/privacy';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BoardName, CreateBoardInput, UpdateBoardInput } from '@boardsesh/shared-schema';
 import {
@@ -7,7 +8,9 @@ import {
   getBoardLayouts,
   getBoardSizesForLayoutId,
   getBoardSetsForLayoutAndSize,
-  getDefaultBoardSizeForLayout,
+  selectSetupLayout,
+  selectSetupSize,
+  toggleSetupSet,
 } from '@boardsesh/board-config';
 import { defaultAngle } from '../../lib/boards/default-angle';
 import type { BoardConfigPreset } from '../../lib/boards/board-config-preset';
@@ -36,6 +39,7 @@ export type BoardBuilderSeed = {
   hideLocation?: boolean;
   isAngleAdjustable?: boolean;
   hasLeds?: boolean;
+  litByWallDevice?: boolean;
   locationName?: string;
   latitude?: number | null;
   longitude?: number | null;
@@ -52,6 +56,8 @@ function parseSetIds(setIds: string): number[] {
 }
 
 export type BoardBuilderOptions = {
+  /** Submit the audience shown by the server-enabled privacy controls. */
+  privacyEnabled?: boolean;
   /**
    * The setup to preselect for a board type, when the builder should open with
    * one chosen instead of waiting for a layout tap (#5654, "My own board"). It
@@ -65,6 +71,21 @@ export type BoardBuilderOptions = {
    * climber has picked something, a new identity changes nothing.
    */
   preset?: (boardName: BoardName) => BoardConfigPreset | null;
+  /**
+   * The board type to open on when there is no `seed`, instead of the first
+   * supported board. The picker's In range slot passes the type it heard, so a
+   * climber at a MoonBoard lands on MoonBoard chips (and its preset), not
+   * Kilter's.
+   */
+  initialBoardName?: BoardName;
+  /**
+   * The serial to open with when there is no `seed`: the one unsaved box of
+   * `initialBoardName` the picker's In range slot heard (`builderSerialForRow`).
+   * The builder's serial checks run on it like a typed one. It is said out
+   * loud (`heardSerial`) while it stands, and goes when the board type moves
+   * off the one it was heard as.
+   */
+  initialSerialNumber?: string;
 };
 
 function sameSetup(preset: BoardConfigPreset, layoutId: number | null, sizeId: number | null, setIds: number[]) {
@@ -81,7 +102,7 @@ function sameSetup(preset: BoardConfigPreset, layoutId: number | null, sizeId: n
  * stay hidden behind Advanced for the 99% case.
  */
 export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardBuilderOptions) {
-  const initialBoard = seed?.boardName ?? SUPPORTED_BOARDS[0];
+  const initialBoard = seed?.boardName ?? options?.initialBoardName ?? SUPPORTED_BOARDS[0];
   // A seed is the climber's own choice (a Popular card, the board being
   // edited), so it always wins over a preset.
   const [initialPreset] = useState(() => (seed ? null : (options?.preset?.(initialBoard) ?? null)));
@@ -104,22 +125,42 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
   // can't clobber edits. Create / Popular omit them, so the home-board defaults apply.
   const [name, setName] = useState(seed?.name ?? '');
 
-  // "More options" / advanced. Owned + public default to the home-board case.
+  // New home boards start public with their exact location hidden: climbers
+  // can find the wall, and the address stays private until the owner shares it.
   const [isOwned, setIsOwned] = useState(seed?.isOwned ?? true);
   const [isPublic, setIsPublic] = useState(seed?.isPublic ?? true);
   const [isUnlisted, setIsUnlisted] = useState(seed?.isUnlisted ?? false);
-  const [hideLocation, setHideLocation] = useState(seed?.hideLocation ?? false);
+  const [hideLocation, setHideLocation] = useState(seed?.hideLocation ?? true);
+  const [selectedPrivacyAudience, setPrivacyAudience] = useState<PrivacyResourceAudience | undefined>();
+  const privacyAudience = selectedPrivacyAudience ?? (options?.privacyEnabled ? 'public' : undefined);
+  const [privacyLocationAudience, setPrivacyLocationAudience] = useState<PrivacyLocationAudience | undefined>();
   // Most home boards with a kicker tilt are adjustable; default on.
   const [isAngleAdjustable, setIsAngleAdjustable] = useState(seed?.isAngleAdjustable ?? true);
   // Nearly every Kilter/Tension wall ships with a light kit; default on so the
   // common case needs no thought. Turning it off is what unlocks the no-LED
   // "active climb" flow (#4585).
   const [hasLeds, setHasLeds] = useState(seed?.hasLeds ?? true);
+  // An internet-connected wall device (a laser projector, an LED controller)
+  // lights the wall from the board feed, so climbers take the wall with no
+  // Bluetooth. Off by default: nearly every wall is driven over Bluetooth.
+  const [litByWallDevice, setLitByWallDevice] = useState(seed?.litByWallDevice ?? false);
+  // The form shows the switch under LED lights on a catalogue board, and on its
+  // own on a spray wall. While it is hidden the input leaves the field out, so a
+  // value set elsewhere (the API, the web) is never reset by a save from here.
+  const litByWallDeviceShown = boardName === 'spray' || hasLeds;
+  const savedLitByWallDevice = litByWallDeviceShown ? litByWallDevice : undefined;
   const [locationName, setLocationName] = useState(seed?.locationName ?? '');
   const [coords, setCoords] = useState<{ latitude: number; longitude: number } | null>(
     seed?.latitude != null && seed?.longitude != null ? { latitude: seed.latitude, longitude: seed.longitude } : null,
   );
-  const [serialNumber, setSerialNumber] = useState(seed?.serialNumber ?? '');
+  // The serial the In range slot heard, and the board type it was heard as.
+  const [heardSerialOffer] = useState(() =>
+    !seed && options?.initialSerialNumber ? { serial: options.initialSerialNumber, boardName: initialBoard } : null,
+  );
+  const heardSerialOfferRef = useRef(heardSerialOffer);
+  const [serialNumber, setSerialNumber] = useState(seed?.serialNumber ?? heardSerialOffer?.serial ?? '');
+  // Shown above the fold while the field still holds it untouched.
+  const heardSerial = heardSerialOffer !== null && serialNumber === heardSerialOffer.serial ? serialNumber : null;
   const [timerName, setTimerName] = useState(seed?.timerName ?? '');
   // The gym this board sits in. Picking one is what gets the board onto the map
   // under a gym rather than as a lone pin (#4166).
@@ -154,6 +195,12 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
   // nothing to add when the type changes.
   const boardNameRef = useRef(boardName);
   boardNameRef.current = boardName;
+  // The current layout and size, for the selects below to tell a re-pick of
+  // the ticked value (a no-op) from a change, without new callback identities.
+  const layoutIdRef = useRef(layoutId);
+  layoutIdRef.current = layoutId;
+  const sizeIdRef = useRef(sizeId);
+  sizeIdRef.current = sizeId;
   const appliedPresetRef = useRef(appliedPreset);
   appliedPresetRef.current = appliedPreset;
   const presetOption = options?.preset;
@@ -180,11 +227,18 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
   const rawLayoutName = layouts.find((layout) => layout.id === layoutId)?.name ?? boardName;
 
   // Each level resets everything below it so the cascade stays consistent.
+  // The reset rules are `@boardsesh/board-config`'s setup selection, the same
+  // ones the "Set up wrong" report fields use, so the two never drift.
   // Stable across renders (deps are only the levels above) so memoised chip
   // rows don't re-render when an unrelated field — e.g. the dragged angle —
   // changes. With a preset, "resets" means "moves to that type's preset", so a
   // climber switching from Kilter to Tension still has a working Save.
+  //
+  // Picking the value already picked changes nothing: a menu or a chip row
+  // hands back its ticked option too, and resetting the levels below on that
+  // would throw away the setup under the climber's thumb.
   const selectBoard = useCallback((next: BoardName) => {
+    if (next === boardNameRef.current) return;
     const preset = presetRef.current?.(next) ?? null;
     setupTouchedRef.current = false;
     setBoardName(next);
@@ -193,16 +247,23 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
     setSetIds(preset?.setIds ?? []);
     setAppliedPreset(preset);
     setAngle(defaultAngle(next));
+    // A heard serial belongs to the box's own board type: another type is
+    // another box. One the climber typed over stays.
+    const offer = heardSerialOfferRef.current;
+    if (offer && next !== offer.boardName) {
+      setSerialNumber((current) => (current === offer.serial ? '' : current));
+    }
   }, []);
   const selectLayout = useCallback(
     (next: number) => {
+      if (next === layoutIdRef.current) return;
       setupTouchedRef.current = true;
-      setLayoutId(next);
-      const defaultSize = getDefaultBoardSizeForLayout(boardName, next);
-      setSizeId(defaultSize);
-      setSetIds(
-        defaultSize != null ? getBoardSetsForLayoutAndSize(boardName, next, defaultSize).map((set) => set.id) : [],
-      );
+      // The layout's default size and every set of it come with it. The rule
+      // replaces every level below the board type, so none is passed in.
+      const selected = selectSetupLayout({ boardName, layoutId: null, sizeId: null, setIds: [] }, next);
+      setLayoutId(selected.layoutId);
+      setSizeId(selected.sizeId);
+      setSetIds(selected.setIds);
     },
     [boardName],
   );
@@ -210,16 +271,22 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
     (next: number) => {
       // Pre-select every set for the size — the common case (a "Full Ride" owner
       // has them all), and why the set toggles live behind Advanced.
+      if (next === sizeIdRef.current) return;
       setupTouchedRef.current = true;
-      setSizeId(next);
-      setSetIds(layoutId != null ? getBoardSetsForLayoutAndSize(boardName, layoutId, next).map((set) => set.id) : []);
+      const selected = selectSetupSize({ boardName, layoutId, sizeId: null, setIds: [] }, next);
+      setSizeId(selected.sizeId);
+      setSetIds(selected.setIds);
     },
     [boardName, layoutId],
   );
-  const toggleSet = useCallback((id: number) => {
-    setupTouchedRef.current = true;
-    setSetIds((prev) => (prev.includes(id) ? prev.filter((set) => set !== id) : [...prev, id]));
-  }, []);
+  const toggleSet = useCallback(
+    (id: number) => {
+      setupTouchedRef.current = true;
+      // A toggle reads only the sets, so the levels between are left out.
+      setSetIds((prev) => toggleSetupSet({ boardName, layoutId: null, sizeId: null, setIds: prev }, id).setIds);
+    },
+    [boardName],
+  );
 
   const canCreate = layoutId != null && sizeId != null && setIds.length > 0;
   // The selection is exactly the preset the builder chose for this board type:
@@ -273,11 +340,14 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
       name: name.trim() || fallbackName?.trim() || cleanLayoutName(rawLayoutName, boardName),
       angle,
       isOwned,
+      ...(privacyAudience ? { audience: privacyAudience } : {}),
+      ...(privacyLocationAudience ? { locationAudience: privacyLocationAudience } : {}),
       isPublic,
       isUnlisted,
       hideLocation,
       isAngleAdjustable,
       hasLeds,
+      litByWallDevice: savedLitByWallDevice,
       serialNumber: serialNumber.trim() || undefined,
       timerName: timerName.trim() || undefined,
       locationName: locationName.trim() || undefined,
@@ -323,6 +393,7 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
       hideLocation,
       isAngleAdjustable,
       hasLeds,
+      litByWallDevice: savedLitByWallDevice,
       // null (not undefined) so emptying a previously-set field clears it on the
       // server — undefined would leave the old value in place (see UpdateBoardInput).
       serialNumber: serialNumber.trim() || null,
@@ -353,6 +424,10 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
     sizeId,
     setIds,
     angle,
+    privacyAudience,
+    setPrivacyAudience,
+    privacyLocationAudience,
+    setPrivacyLocationAudience,
     // meta
     name,
     isOwned,
@@ -361,12 +436,15 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
     hideLocation,
     isAngleAdjustable,
     hasLeds,
+    litByWallDevice,
+    litByWallDeviceShown,
     locationName,
     coords,
     serialNumber,
     timerName,
     selectedGym,
     // derived
+    heardSerial,
     layouts,
     sizes,
     sets,
@@ -387,6 +465,7 @@ export function useBoardBuilder(seed?: BoardBuilderSeed | null, options?: BoardB
     setHideLocation,
     setIsAngleAdjustable,
     setHasLeds,
+    setLitByWallDevice,
     setLocationName,
     setCoords,
     setSerialNumber,

@@ -25,18 +25,22 @@ const gradesState = vi.hoisted(() => ({
   current: [] as Array<{ difficultyId: number; name: string }>,
 }));
 
-// Stable save mock so a test can assert on the input passed to saveTick.mutate.
-// Invokes onSuccess by default (so the TickLogged track call and the
+// Stable save mock so a test can assert on the input passed to
+// saveTick.mutateAsync. Succeeds by default (so the TickLogged track call and the
 // savedRef/onDismiss wiring fire the way the real mutation would); flip
-// `failure` to drive the onError path instead.
+// `failure` to drive the failure path instead. It settles before it returns:
+// `then` runs its handler at once, so the save's side effects are done by then.
 const saveMock = vi.hoisted(() => {
   const state = { failure: null as Error | null };
   return {
     state,
-    mutate: vi.fn((_input: unknown, callbacks?: { onSuccess?: () => void; onError?: (error: unknown) => void }) => {
-      if (state.failure) callbacks?.onError?.(state.failure);
-      else callbacks?.onSuccess?.();
-    }),
+    mutateAsync: vi.fn((_input: unknown) => ({
+      // oxlint-disable-next-line unicorn/no-thenable -- a save double that settles before it returns
+      then: (onSaved: (result: unknown) => void, onFailed: (error: unknown) => void) => {
+        if (state.failure) onFailed(state.failure);
+        else onSaved(undefined);
+      },
+    })),
   };
 });
 
@@ -55,12 +59,17 @@ vi.mock('@boardsesh/board-config', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@boardsesh/board-config')>();
   return { ...actual, toBoardName: (name: string) => name };
 });
-vi.mock('@boardsesh/analytics', () => ({
-  SHARED_EVENTS: {
-    QuickTickFailed: 'Quick Tick Failed',
-    TickLogged: 'Tick Logged',
-  },
-}));
+vi.mock('@boardsesh/analytics', async (importOriginal) => {
+  // The real `boardTypeProperty`: its closed set is part of what Tick Logged sends.
+  const { boardTypeProperty } = await importOriginal<typeof import('@boardsesh/analytics')>();
+  return {
+    boardTypeProperty,
+    SHARED_EVENTS: {
+      QuickTickFailed: 'Quick Tick Failed',
+      TickLogged: 'Tick Logged',
+    },
+  };
+});
 vi.mock('../../../providers/toast-provider', () => ({ useToast: () => toastMock }));
 // The hook reads board-presence flags; mock the provider so the test doesn't
 // pull in its ws-client → expo-secure-store chain (un-mockable native module).
@@ -86,11 +95,6 @@ const activeBoardState = vi.hoisted(() => ({
 vi.mock('../../../lib/graphql/use-active-board', () => ({
   useActiveBoard: () => ({ data: activeBoardState.current }),
 }));
-// Mock the Rogue-timer provider so the test doesn't pull its rogue-timer-ble →
-// react-native-ble-plx chain (Flow source Rolldown can't parse) into the graph.
-vi.mock('../../../providers/rogue-timer-provider', () => ({
-  useOptionalRogueTimer: () => null,
-}));
 vi.mock('../../../hooks/use-local-ticks', () => ({ useLocalPendingTicks: () => ({ data: 0 }) }));
 // Connectivity drives which save-failure message the form shows (issue #4315).
 const connectivityState = vi.hoisted(() => ({ isOffline: false }));
@@ -109,7 +113,7 @@ vi.mock('@boardsesh/board-react', async (importOriginal) => {
     ...actual,
     useOptionalBoardActions: () => boardState.current,
     useOptionalBoardLogbook: () => boardState.current,
-    useSaveTick: () => ({ mutate: saveMock.mutate, isPending: false }),
+    useSaveTick: () => ({ mutateAsync: saveMock.mutateAsync, isPending: false }),
   };
 });
 
@@ -146,9 +150,17 @@ function Harness(props: QuickTickFormInput) {
       'data-testid': 'climbedat-date',
       onClick: () => form.onClimbedAtChange(new Date('2025-03-15T12:00:00.000Z')),
     }),
+    createElement('span', { 'data-testid': 'climbed-at-edited' }, String(form.climbedAtEdited)),
     createElement('button', { 'data-testid': 'future-adjusted', onClick: form.onFutureAdjusted }),
     createElement('span', { 'data-testid': 'ascent-type' }, form.ascentType),
     createElement('span', { 'data-testid': 'last-error' }, form.lastError ?? ''),
+    createElement('span', { 'data-testid': 'first-ascent' }, String(form.firstAscent)),
+    createElement('span', { 'data-testid': 'save-blocked' }, String(form.saveBlockedByGrade)),
+    createElement('span', { 'data-testid': 'consensus-id' }, String(form.consensusDifficultyId ?? '')),
+    createElement('span', { 'data-testid': 'angle' }, String(form.angle)),
+    createElement('span', { 'data-testid': 'opening-angle' }, String(form.openingAngle)),
+    createElement('button', { 'data-testid': 'angle-45', onClick: () => form.onAngleSelect(45) }),
+    createElement('button', { 'data-testid': 'angle-40', onClick: () => form.onAngleSelect(ANGLE) }),
   );
 }
 
@@ -210,7 +222,7 @@ function boardWithUnfetchedLogbook() {
 }
 
 beforeEach(() => {
-  saveMock.mutate.mockClear();
+  saveMock.mutateAsync.mockClear();
   saveMock.state.failure = null;
   toastMock.showToast.mockClear();
   gradesState.current = [];
@@ -233,7 +245,7 @@ describe('useQuickTickForm hasPriorHistory', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ baseAscensionistCount: 37 });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ baseAscensionistCount: 37 });
   });
 
   it('reads the logbookByClimbAngle index, not the raw logbook array', () => {
@@ -278,7 +290,7 @@ describe('useQuickTickForm hasPriorHistory', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ status: 'send' });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ status: 'send' });
   });
 
   it('offers Flash once the fetch lands and confirms no history', () => {
@@ -290,6 +302,28 @@ describe('useQuickTickForm hasPriorHistory', () => {
 });
 
 describe('useQuickTickForm climbedAt', () => {
+  it('reports an edited date in render, and forgets it on a new climb', () => {
+    boardState.current = null;
+    const { getByTestId, rerender } = renderForm();
+    expect(getByTestId('climbed-at-edited').textContent).toBe('false');
+
+    fireEvent.click(getByTestId('climbedat-date'));
+    expect(getByTestId('climbed-at-edited').textContent).toBe('true');
+
+    rerender(
+      createElement(Harness, {
+        climbUuid: 'another-climb',
+        boardName: 'kilter',
+        angle: ANGLE,
+        isMirror: false,
+        isBenchmark: false,
+        baseAscensionistCount: 37,
+        onDismiss: vi.fn(),
+      }),
+    );
+    expect(getByTestId('climbed-at-edited').textContent).toBe('false');
+  });
+
   it('threads the picked climb date into saveTick instead of always sending now', () => {
     boardState.current = null;
     const { getByTestId } = renderForm();
@@ -297,8 +331,8 @@ describe('useQuickTickForm climbedAt', () => {
     fireEvent.click(getByTestId('climbedat-date'));
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate).toHaveBeenCalledTimes(1);
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({
+    expect(saveMock.mutateAsync).toHaveBeenCalledTimes(1);
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({
       climbedAt: '2025-03-15T12:00:00.000Z',
     });
   });
@@ -316,8 +350,8 @@ describe('useQuickTickForm climbedAt', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate).toHaveBeenCalledTimes(1);
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({
+    expect(saveMock.mutateAsync).toHaveBeenCalledTimes(1);
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({
       climbedAt: '2025-03-15T12:10:00.000Z',
     });
   });
@@ -354,6 +388,173 @@ describe('useQuickTickForm grade value on Tick Logged', () => {
     fireEvent.click(getByTestId('save'));
 
     expect(track).toHaveBeenCalledWith('Tick Logged', expect.objectContaining({ grade: null, difficulty: null }));
+  });
+});
+
+describe('useQuickTickForm first ascent of a spray climb (#5971)', () => {
+  const FIRST_ASCENT = { boardName: 'spray', baseAscensionistCount: 0, consensusGradeName: 'V5' } as const;
+
+  it('needs a grade for a send, and saves once one is picked', () => {
+    boardState.current = null;
+    gradesState.current = [{ difficultyId: 5, name: 'V5' }];
+    const { getByTestId } = renderForm(FIRST_ASCENT);
+
+    expect(getByTestId('first-ascent').textContent).toBe('true');
+    expect(getByTestId('save-blocked').textContent).toBe('true');
+    fireEvent.click(getByTestId('save'));
+    expect(saveMock.mutateAsync).not.toHaveBeenCalled();
+
+    fireEvent.click(getByTestId('grade-select'));
+    expect(getByTestId('save-blocked').textContent).toBe('false');
+    fireEvent.click(getByTestId('save'));
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ difficulty: 5 });
+  });
+
+  it('offers no default grade: the climb\u2019s grade is not outlined as a consensus', () => {
+    gradesState.current = [{ difficultyId: 5, name: 'V5' }];
+    const { getByTestId } = renderForm(FIRST_ASCENT);
+    expect(getByTestId('consensus-id').textContent).toBe('');
+  });
+
+  it('lets an attempt through without a grade', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm(FIRST_ASCENT);
+    fireEvent.click(getByTestId('attempt'));
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ status: 'attempt', difficulty: null });
+  });
+
+  it('is not a first ascent once somebody has sent it, nor on another board', () => {
+    boardState.current = null;
+    gradesState.current = [{ difficultyId: 5, name: 'V5' }];
+    for (const overrides of [
+      { boardName: 'spray', baseAscensionistCount: 1, consensusGradeName: 'V5' },
+      { boardName: 'kilter', baseAscensionistCount: 0, consensusGradeName: 'V5' },
+    ]) {
+      const { getByTestId, unmount } = renderForm(overrides);
+      expect(getByTestId('first-ascent').textContent).toBe('false');
+      expect(getByTestId('save-blocked').textContent).toBe('false');
+      expect(getByTestId('consensus-id').textContent).toBe('5');
+      unmount();
+    }
+  });
+});
+
+// #6615: the angle row. The climber's angle is what gets saved; the climb's
+// opening stats (consensus grade, send count) belong to the opening angle only.
+describe('useQuickTickForm angle', () => {
+  function formProps(overrides: Partial<QuickTickFormInput> = {}): QuickTickFormInput {
+    return {
+      climbUuid: CLIMB_UUID,
+      boardName: 'kilter',
+      angle: ANGLE,
+      isMirror: false,
+      isBenchmark: false,
+      baseAscensionistCount: 37,
+      onDismiss: vi.fn(),
+      ...overrides,
+    };
+  }
+
+  it('opens at the board angle and saves the angle the climber picks', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm();
+    expect(getByTestId('angle').textContent).toBe(String(ANGLE));
+
+    fireEvent.click(getByTestId('angle-45'));
+    expect(getByTestId('angle').textContent).toBe('45');
+    expect(getByTestId('opening-angle').textContent).toBe(String(ANGLE));
+    fireEvent.click(getByTestId('save'));
+
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ angle: 45 });
+  });
+
+  it('drops the consensus outline at another angle and brings it back at the opening one', () => {
+    gradesState.current = [{ difficultyId: 5, name: 'V5' }];
+    const { getByTestId } = renderForm({ consensusGradeName: 'V5' });
+    expect(getByTestId('consensus-id').textContent).toBe('5');
+
+    fireEvent.click(getByTestId('angle-45'));
+    expect(getByTestId('consensus-id').textContent).toBe('');
+
+    fireEvent.click(getByTestId('angle-40'));
+    expect(getByTestId('consensus-id').textContent).toBe('5');
+  });
+
+  it('asks Flash vs Send about the picked angle, not the opening one', () => {
+    // History at 40° only: Send there, Flash at 45°.
+    boardState.current = boardWithHistory();
+    const { container, getByTestId } = renderForm();
+    expect(saveLabel(container)).toBe('playView.tickBar.sendSaveLabel');
+
+    fireEvent.click(getByTestId('angle-45'));
+    expect(saveLabel(container)).toBe('playView.tickBar.flashSaveLabel');
+  });
+
+  it('is not a first ascent at another angle: the zero send count is the opening angle\u2019s', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm({ boardName: 'spray', baseAscensionistCount: 0 });
+    expect(getByTestId('first-ascent').textContent).toBe('true');
+
+    fireEvent.click(getByTestId('angle-45'));
+    expect(getByTestId('first-ascent').textContent).toBe('false');
+  });
+
+  it('goes back to the opening angle when the next climb loads', () => {
+    boardState.current = null;
+    const { getByTestId, rerender } = render(createElement(Harness, formProps()));
+    fireEvent.click(getByTestId('angle-45'));
+
+    rerender(createElement(Harness, formProps({ climbUuid: 'climb-2' })));
+    expect(getByTestId('angle').textContent).toBe(String(ANGLE));
+  });
+
+  it('keeps the picked angle when the same climb is presented again, like the other fields', () => {
+    boardState.current = null;
+    const { getByTestId, rerender } = render(createElement(Harness, formProps({ visible: true })));
+    fireEvent.click(getByTestId('angle-45'));
+    fireEvent.click(getByTestId('tries-increment'));
+
+    // An accidental pan-down, then the climber reopens the same climb.
+    rerender(createElement(Harness, formProps({ visible: false })));
+    rerender(createElement(Harness, formProps({ visible: true })));
+    expect(getByTestId('tries-value').textContent).toBe(String(MIN_ATTEMPT_COUNT + 1));
+    expect(getByTestId('angle').textContent).toBe('45');
+  });
+
+  it('sends the opening angle\u2019s sender count only with a tick at that angle', () => {
+    // At 40° the 37 senders are this angle's, so the optimistic count may
+    // floor on them. At 45° they are not, and the count must wait for the server.
+    boardState.current = null;
+    const { getByTestId } = renderForm({ baseAscensionistCount: 37 });
+    fireEvent.click(getByTestId('save'));
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ angle: ANGLE, baseAscensionistCount: 37 });
+
+    fireEvent.click(getByTestId('angle-45'));
+    fireEvent.click(getByTestId('save'));
+    const pickedAnglePayload = saveMock.mutateAsync.mock.calls[1][0] as {
+      angle: number;
+      baseAscensionistCount?: number;
+    };
+    expect(pickedAnglePayload.angle).toBe(45);
+    expect(pickedAnglePayload.baseAscensionistCount).toBeUndefined();
+  });
+
+  it('follows a new opening angle', () => {
+    boardState.current = null;
+    const { getByTestId, rerender } = render(createElement(Harness, formProps()));
+    fireEvent.click(getByTestId('angle-45'));
+
+    rerender(createElement(Harness, formProps({ angle: 30 })));
+    expect(getByTestId('angle').textContent).toBe('30');
+  });
+
+  it('goes back to the opening angle after a save', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm();
+    fireEvent.click(getByTestId('angle-45'));
+    fireEvent.click(getByTestId('save'));
+
+    expect(getByTestId('angle').textContent).toBe(String(ANGLE));
   });
 });
 
@@ -402,6 +603,21 @@ describe('useQuickTickForm dismiss-analytics plumbing (savedRef / fieldSnapshotR
 });
 
 describe('useQuickTickForm analytics', () => {
+  // A spray wall's layout id is minted per wall, so `layoutId` cannot say
+  // "spray" in PostHog. Without `boardType` a spray-first climber's ticks are
+  // indistinguishable from Kilter ticks and no spray activation can be measured.
+  it('says which board the tick was logged on, so a spray wall is not a Kilter', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm({ boardName: 'spray', layoutId: 90_412 });
+
+    fireEvent.click(getByTestId('save'));
+
+    expect(track).toHaveBeenCalledWith(
+      SHARED_EVENTS.TickLogged,
+      expect.objectContaining({ boardType: 'spray', layoutId: 90_412 }),
+    );
+  });
+
   it('fires exactly one event per committed tick — the canonical TickLogged', () => {
     boardState.current = null;
     const { getByTestId } = renderForm();
@@ -410,11 +626,82 @@ describe('useQuickTickForm analytics', () => {
 
     expect(track).toHaveBeenCalledWith(
       SHARED_EVENTS.TickLogged,
-      expect.objectContaining({ climbUuid: CLIMB_UUID, platform: 'mobile', surface: 'mobile_quick_tick' }),
+      expect.objectContaining({
+        climbUuid: CLIMB_UUID,
+        boardType: 'kilter',
+        platform: 'mobile',
+        surface: 'mobile_quick_tick',
+      }),
     );
     // The old Tick Button Clicked (save-intent) and Quick Tick Saved
     // (same onSuccess as TickLogged) companions are gone.
     expect(vi.mocked(track).mock.calls.map(([eventName]) => eventName)).toEqual(['Tick Logged']);
+  });
+
+  // #7343: a baseline for how often climbers touch the Angle and Date rows.
+  it('sends angleChanged and dateChanged as false when the form is untouched', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm();
+
+    fireEvent.click(getByTestId('save'));
+
+    expect(track).toHaveBeenCalledWith(
+      SHARED_EVENTS.TickLogged,
+      expect.objectContaining({ angleChanged: false, dateChanged: false }),
+    );
+  });
+
+  it('sends angleChanged true when the picked angle differs from the opening one', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm();
+
+    fireEvent.click(getByTestId('angle-45'));
+    fireEvent.click(getByTestId('save'));
+
+    expect(track).toHaveBeenCalledWith(
+      SHARED_EVENTS.TickLogged,
+      expect.objectContaining({ angleChanged: true, dateChanged: false }),
+    );
+  });
+
+  it('sends dateChanged true when the climber edits the timestamp', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm();
+
+    fireEvent.click(getByTestId('climbedat-date'));
+    fireEvent.click(getByTestId('save'));
+
+    expect(track).toHaveBeenCalledWith(
+      SHARED_EVENTS.TickLogged,
+      expect.objectContaining({ angleChanged: false, dateChanged: true }),
+    );
+  });
+
+  it('carries angleChanged and dateChanged on an Attempt too', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm();
+
+    fireEvent.click(getByTestId('angle-45'));
+    fireEvent.click(getByTestId('climbedat-date'));
+    fireEvent.click(getByTestId('attempt'));
+
+    expect(track).toHaveBeenCalledWith(
+      SHARED_EVENTS.TickLogged,
+      expect.objectContaining({ status: 'attempt', angleChanged: true, dateChanged: true }),
+    );
+  });
+});
+
+// #6023: the server picks which version of the climb a tick is on, so the
+// form never names one.
+describe('useQuickTickForm climb version', () => {
+  it('never sends climbRevision', () => {
+    boardState.current = null;
+    const { getByTestId } = renderForm();
+
+    fireEvent.click(getByTestId('save'));
+
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('climbRevision');
   });
 });
 
@@ -446,7 +733,7 @@ describe('useQuickTickForm board attribution', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ boardId: 4242 });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ boardId: 4242 });
   });
 
   it('keeps the bound wall off a tick for a climb that belongs to another wall', () => {
@@ -458,9 +745,23 @@ describe('useQuickTickForm board attribution', () => {
 
     // No boardId at all rather than the wrong one: the Homewall's own id is not
     // knowable from a render board, and guessing costs other climbers' data.
-    // The server still resolves the board from the layout/size/sets below.
-    expect(saveMock.mutate.mock.calls[0][0]).not.toHaveProperty('boardId');
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ layoutId: 8, sizeId: 17, setIds: '20' });
+    // No full config: the server must not guess another physical wall.
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('boardId');
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ layoutId: 8 });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('sizeId');
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('setIds');
+  });
+
+  it('ignores a queue button configuration when the climb belongs to Homewall', () => {
+    bindWall(942);
+    const { getByTestId } = renderForm({
+      ...ACTIVE_BOARD_FIELDS,
+      climb: { boardType: 'kilter', layoutId: 8, compatibleSizeIds: [17] },
+    });
+    fireEvent.click(getByTestId('save'));
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ layoutId: 8 });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('boardId');
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('sizeId');
   });
 
   it('sends no board id while no wall is bound', () => {
@@ -470,7 +771,31 @@ describe('useQuickTickForm board attribution', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).not.toHaveProperty('boardId');
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('boardId');
+  });
+  it('keeps the opening board after presence and active board change', () => {
+    bindWall(4242);
+    activeBoardState.current = { ...ACTIVE_BOARD, uuid: 'opening-wall' };
+    const props: QuickTickFormInput = {
+      ...ACTIVE_BOARD_FIELDS,
+      climbUuid: CLIMB_UUID,
+      angle: ANGLE,
+      isMirror: false,
+      isBenchmark: false,
+      baseAscensionistCount: 37,
+      onDismiss: vi.fn(),
+    };
+    const { rerender, getByTestId } = render(createElement(Harness, props));
+    presenceState.boardId = 777;
+    activeBoardState.current = { ...ACTIVE_BOARD, uuid: 'next-wall', layoutId: 8, sizeId: 17, setIds: '26,27' };
+    rerender(createElement(Harness, props));
+    fireEvent.click(getByTestId('save'));
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({
+      boardId: 4242,
+      boardUuid: 'opening-wall',
+      layoutId: 1,
+      sizeId: 10,
+    });
   });
 });
 
@@ -528,6 +853,21 @@ describe('useQuickTickForm save errors', () => {
 
     expect(container.querySelector('[data-testid="last-error"]')?.textContent).toBe('Climb not found');
   });
+
+  // #5960: a setter can delete their unticked spray climb, so a send logged on
+  // a copy the phone still shows comes back CLIMB_NOT_FOUND. Say it plainly.
+  it('says the climb was deleted when the server answers CLIMB_NOT_FOUND', () => {
+    boardState.current = null;
+    connectivityState.isOffline = false;
+    saveMock.state.failure = Object.assign(new Error('Climb not found'), { extensions: { code: 'CLIMB_NOT_FOUND' } });
+    const { container, getByTestId } = renderForm();
+
+    fireEvent.click(getByTestId('save'));
+
+    expect(container.querySelector('[data-testid="last-error"]')?.textContent).toBe(
+      'mobile.logAscent.climbDeletedMessage',
+    );
+  });
 });
 
 // Issue #2888. The tries control and the save path must always agree: the
@@ -549,12 +889,12 @@ describe('useQuickTickForm tries count', () => {
 
     // Read the shown count BEFORE the click — a successful save resets the
     // form, so the control is back at its default by the time this runs.
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({
       status: 'send',
       attemptCount: shownTries,
     });
     // The try the climber never made. Before the fix this stored 2.
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ attemptCount: 1 });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ attemptCount: 1 });
   });
 
   it('reports the shown count to analytics, not a rewritten one', () => {
@@ -581,7 +921,7 @@ describe('useQuickTickForm tries count', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ attemptCount: shownTries });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ attemptCount: shownTries });
   });
 
   it('saves the shown count when the climber logs an attempt instead of an ascent', () => {
@@ -595,7 +935,7 @@ describe('useQuickTickForm tries count', () => {
 
     fireEvent.click(getByTestId('attempt'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({
       status: 'attempt',
       attemptCount: shownTries,
     });
@@ -624,12 +964,12 @@ describe('useQuickTickForm tries count', () => {
     expect(saveLabel(container)).toBe('playView.tickBar.flashSaveLabel');
 
     fireEvent.click(getByTestId('save'));
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ status: 'flash', attemptCount: 1 });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ status: 'flash', attemptCount: 1 });
   });
 });
 
 // The rest timer (#5378) anchors on the tick from this hook's per-call
-// onSuccess, beside the shipped Rogue-stopwatch kick. There is deliberately no
+// onSuccess, beside the session timer's tick. There is deliberately no
 // branch on delivery in the production code: React Query runs onSuccess for the
 // acknowledged AND the offline-queued save, and a rest timer is about when YOU
 // logged the send. Two tests dressed up as "two deliveries" would assert the
@@ -643,7 +983,7 @@ describe('useQuickTickForm rest timer anchor', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    const sentClimbedAt = (saveMock.mutate.mock.calls[0][0] as { climbedAt: string }).climbedAt;
+    const sentClimbedAt = (saveMock.mutateAsync.mock.calls[0][0] as { climbedAt: string }).climbedAt;
     expect(getRestTimerState().lastTickAt).toBe(sentClimbedAt);
     expect(getRestTimerState().anchorMs).toBe(Date.parse(sentClimbedAt));
   });
@@ -656,7 +996,7 @@ describe('useQuickTickForm rest timer anchor', () => {
     fireEvent.click(getByTestId('climbedat-date'));
     fireEvent.click(getByTestId('save'));
 
-    const sentClimbedAt = (saveMock.mutate.mock.calls[0][0] as { climbedAt: string }).climbedAt;
+    const sentClimbedAt = (saveMock.mutateAsync.mock.calls[0][0] as { climbedAt: string }).climbedAt;
     expect(getRestTimerState().lastTickAt).toBe(sentClimbedAt);
   });
 
@@ -708,7 +1048,7 @@ describe('useQuickTickForm selected-board attribution', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).toMatchObject({ boardUuid: SELECTED_BOARD.uuid });
+    expect(saveMock.mutateAsync.mock.calls[0][0]).toMatchObject({ boardUuid: SELECTED_BOARD.uuid });
   });
 
   it('omits the uuid when the drawer resolved a different board to render', () => {
@@ -722,7 +1062,7 @@ describe('useQuickTickForm selected-board attribution', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).not.toHaveProperty('boardUuid');
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('boardUuid');
   });
 
   it('omits the uuid when no board is selected', () => {
@@ -732,7 +1072,7 @@ describe('useQuickTickForm selected-board attribution', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).not.toHaveProperty('boardUuid');
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('boardUuid');
   });
 
   it('omits the uuid when the drawer sent no config to check it against', () => {
@@ -742,6 +1082,34 @@ describe('useQuickTickForm selected-board attribution', () => {
 
     fireEvent.click(getByTestId('save'));
 
-    expect(saveMock.mutate.mock.calls[0][0]).not.toHaveProperty('boardUuid');
+    expect(saveMock.mutateAsync.mock.calls[0][0]).not.toHaveProperty('boardUuid');
   });
 });
+
+// This suite exercises the existing flow before the server privacy rollout.
+vi.mock('../../../lib/graphql/hooks/use-privacy', () => ({ usePrivacySettings: () => ({ data: undefined }) }));
+vi.mock('../../privacy/PublicationAudiencePicker', () => ({
+  PublicationAudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/ContentAudienceControl', () => ({
+  ContentAudienceControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/ResourcePrivacyControl', () => ({
+  ResourcePrivacyControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/AudiencePicker', () => ({
+  AudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../privacy/use-publication-audience', () => ({
+  usePublicationAudience: () => ({
+    enabled: false,
+    isPrivate: false,
+    audience: 'public',
+    publication: undefined,
+    chooseAudience: () => {},
+  }),
+}));

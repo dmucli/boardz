@@ -1,0 +1,648 @@
+/// <reference types="node" />
+
+/** Publish metadata for an Android binary already accepted by Play. Never uploads a binary to Play. */
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { createAuditAccessToken, readProductionReleaseSummaries } from './mobile-store-android-audit';
+import { trackSummaries } from './lib/google-play-tracks';
+import { formatBuildTag } from './lib/release-tags';
+import { readGeneratedPlayApk } from './lib/android-recovery-store-apk';
+
+const PACKAGE = 'com.boardsesh.app';
+const APK_NAME = 'boardsesh-android-beta-arm64-v8a.apk';
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/** Read binary manifest metadata directly; decoded XML can contain unescaped Expo signing JSON. */
+export function parseApkBadging(badging: string): { applicationId: string; versionCode: string; version: string } {
+  const lines = badging.split(/\r?\n/);
+  const packageLine = lines[0];
+  if (!packageLine?.startsWith('package: ') || lines.filter((line) => line.startsWith('package:')).length !== 1)
+    throw new Error('APK badging must contain one package identity.');
+  const attributes = new Map<string, string>();
+  let remainder = packageLine.slice('package: '.length);
+  while (remainder) {
+    const attribute = /^([A-Za-z][A-Za-z0-9]*)='([^'\r\n]*)'(?: |$)/.exec(remainder);
+    if (!attribute || attributes.has(attribute[1]!)) throw new Error('APK package badging is malformed or ambiguous.');
+    attributes.set(attribute[1]!, attribute[2]!);
+    remainder = remainder.slice(attribute[0].length);
+  }
+  const applicationId = attributes.get('name');
+  const versionCode = attributes.get('versionCode');
+  const version = attributes.get('versionName');
+  if (!applicationId || !versionCode || !version) throw new Error('APK package badging is missing identity fields.');
+  return { applicationId, versionCode, version };
+}
+
+function record(input: unknown): Record<string, unknown> {
+  if (typeof input !== 'object' || input === null || Array.isArray(input))
+    throw new Error('Invalid recovery evidence.');
+  return input as Record<string, unknown>;
+}
+
+export function validateRecoveryRun(
+  input: unknown,
+  jobs: unknown,
+  repository: string,
+  runId: string,
+  sourceSha: string,
+  allowUnconfirmedUpload = false,
+) {
+  const run = record(input);
+  if (
+    !/^[1-9]\d*$/.test(runId) ||
+    !FULL_SHA.test(sourceSha) ||
+    String(run.id) !== runId ||
+    run.path !== '.github/workflows/android-apk-rn.yml' ||
+    run.head_branch !== 'main' ||
+    record(run.head_repository).full_name !== repository ||
+    run.head_sha !== sourceSha ||
+    run.display_title !== `android:${sourceSha}` ||
+    !['push', 'workflow_dispatch'].includes(String(run.event)) ||
+    run.status !== 'completed' ||
+    !Number.isSafeInteger(run.run_number) ||
+    Number(run.run_number) < 1
+  )
+    throw new Error('Recovery requires the exact completed Android main run and its source SHA.');
+  if (!Array.isArray(jobs)) throw new Error('Missing Android upload jobs.');
+  const uploadJobs = jobs.map(record).filter((job) => job.name === 'build-and-release');
+  // Never combine evidence from different attempts of the same native run.
+  const uploadConfirmed = uploadJobs.some(
+    (job) =>
+      job.conclusion === 'success' &&
+      Array.isArray(job.steps) &&
+      job.steps
+        .map(record)
+        .some(
+          (step) => step.name === 'Upload AAB to Play internal and open beta tracks' && step.conclusion === 'success',
+        ),
+  );
+  const unconfirmedUpload =
+    allowUnconfirmedUpload &&
+    uploadJobs.some((job) => {
+      if (job.conclusion !== 'failure' || !Array.isArray(job.steps)) return false;
+      const steps = job.steps.map(record);
+      const uploads = steps.filter((step) => step.name === 'Upload AAB to Play internal and open beta tracks');
+      if (uploads.length !== 1 || uploads[0]!.conclusion !== 'failure') return false;
+      const uploadIndex = steps.indexOf(uploads[0]!);
+      let previousIndex = -1;
+      return [
+        'Build signed arm64 release APK',
+        'Check embedded commitTime',
+        'Check Android obfuscation (R8 mapping)',
+        'Verify APK signature',
+        'Upload APK as artifact',
+        'Build signed release AAB',
+        'Verify 16 KB native-library alignment (APK + AAB)',
+        'Verify the AAB carries the same R8 mapping',
+        'Upload AAB as artifact',
+        'Require the live backend schema before tester upload',
+      ].every((name) => {
+        const matches = steps.filter((step) => step.name === name);
+        const index = matches.length === 1 ? steps.indexOf(matches[0]!) : -1;
+        const succeeded = index > previousIndex && index < uploadIndex && matches[0]?.conclusion === 'success';
+        previousIndex = index;
+        return succeeded;
+      });
+    });
+  if (!uploadConfirmed && !unconfirmedUpload)
+    throw new Error('The original Android build and Play upload must have succeeded.');
+  return {
+    sourceRunId: runId,
+    sourceSha,
+    runNumber: String(run.run_number),
+    artifactName: `boardsesh-rn-android-${String(run.run_number)}`,
+    uploadConfirmed,
+  };
+}
+
+export function validateApkIdentity(
+  input: { applicationId: string; versionCode: string; version: string; runtime: string },
+  expectedCode: string,
+) {
+  const identity = Object.fromEntries(
+    Object.entries(input).map(([key, contents]) => [key, contents.trim().replace(/^"|"$/g, '')]),
+  ) as typeof input;
+  if (
+    identity.applicationId !== PACKAGE ||
+    !/^[1-9]\d*$/.test(expectedCode) ||
+    !Number.isSafeInteger(Number(expectedCode)) ||
+    identity.versionCode !== expectedCode ||
+    !/^\d+\.\d+\.\d+$/.test(identity.version) ||
+    !FULL_SHA.test(identity.runtime)
+  )
+    throw new Error('The retained APK package, versionCode, marketing version or full runtime is invalid.');
+  return identity;
+}
+
+export function validateStoreApkEvidence(
+  originalManifest: string,
+  storeManifest: string,
+  originalIdentity: ReturnType<typeof validateApkIdentity>,
+  storeIdentity: ReturnType<typeof validateApkIdentity>,
+): void {
+  if (
+    !originalManifest ||
+    originalManifest !== storeManifest ||
+    Object.keys(originalIdentity).some(
+      (key) =>
+        originalIdentity[key as keyof typeof originalIdentity] !== storeIdentity[key as keyof typeof storeIdentity],
+    )
+  )
+    throw new Error('Generated Play APK does not match the original AAB and native runtime.');
+}
+
+export function validateRecoveryGateLog(log: string, sourceSha: string): string {
+  const sources = [...log.matchAll(/^\S+ source_sha=([0-9a-f]{40})\r?$/gm)].map((match) => match[1]);
+  const runtimes = [...log.matchAll(/^\S+ fingerprint=([0-9a-f]{40})\r?$/gm)].map((match) => match[1]);
+  if (
+    !sources.length ||
+    sources.some((source) => source !== sourceSha) ||
+    runtimes.length !== 1 ||
+    !/^\S+ should_build=true\r?$/m.test(log)
+  )
+    throw new Error('Original native gate does not confirm this exact source and runtime.');
+  return runtimes[0]!;
+}
+
+export function requireReviewedPlayBuild(
+  input: unknown,
+  track: 'internal' | 'beta' | 'production',
+  versionCode: string,
+): void {
+  const matches = trackSummaries(input, track).filter((release) =>
+    release.activeArtifacts.some((artifact) => String(artifact.versionCode) === versionCode),
+  );
+  const accepted =
+    track === 'beta'
+      ? [
+          'RELEASE_LIFECYCLE_STATE_IN_REVIEW',
+          'RELEASE_LIFECYCLE_STATE_APPROVED_NOT_PUBLISHED',
+          'RELEASE_LIFECYCLE_STATE_PUBLISHED',
+        ]
+      : ['RELEASE_LIFECYCLE_STATE_PUBLISHED'];
+  if (matches.length !== 1 || !accepted.includes(matches[0]!.releaseLifecycleState))
+    throw new Error(`Play ${track} does not confirm this exact submitted build.`);
+}
+
+export function missingRecoveryTags(
+  tags: Readonly<Record<string, string | null>>,
+  sourceSha: string,
+  fingerprintTag?: string,
+): string[] {
+  if (fingerprintTag !== undefined && !/^fingerprint-android-[0-9a-f]{40}$/.test(fingerprintTag))
+    throw new Error('Invalid immutable fingerprint tag.');
+  for (const [tag, target] of Object.entries(tags))
+    if (target !== null && (!FULL_SHA.test(target) || (tag !== fingerprintTag && target !== sourceSha)))
+      throw new Error('An existing immutable recovery tag points to another source; refusing overwrite.');
+  return Object.keys(tags).filter((tag) => tags[tag] === null);
+}
+
+const GATE_LOG_MAX_BYTES = 32 * 1024 * 1024;
+const GATE_LOG_TIMEOUT_MS = 120_000;
+
+/** GitHub authenticates only the redirect lookup; signed log storage receives no repository credentials. */
+export async function readOriginalNativeGateLog(options: {
+  jobId: string;
+  token: string;
+  fetchImpl?: typeof fetch;
+  maxBytes?: number;
+  timeoutMs?: number;
+}): Promise<string> {
+  const { jobId, token, fetchImpl = fetch, maxBytes = GATE_LOG_MAX_BYTES, timeoutMs = GATE_LOG_TIMEOUT_MS } = options;
+  if (!/^[1-9]\d*$/.test(jobId) || !Number.isSafeInteger(Number(jobId)) || !token.trim())
+    throw new Error('Original native gate logs require a valid job ID and repository token.');
+  if (
+    !Number.isSafeInteger(maxBytes) ||
+    maxBytes < 1 ||
+    maxBytes > GATE_LOG_MAX_BYTES ||
+    !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < 1 ||
+    timeoutMs > GATE_LOG_TIMEOUT_MS
+  )
+    throw new Error('Original native gate log bounds are invalid.');
+  const signal = AbortSignal.timeout(timeoutMs);
+  const discard = async (response: Response) => {
+    try {
+      await response.body?.cancel();
+    } catch {
+      /* Response errors may contain signed URLs; cleanup must not expose them. */
+    }
+  };
+  const request = async (url: string | URL, init: RequestInit, phase: 'API' | 'storage') => {
+    try {
+      return await fetchImpl(url, { ...init, signal });
+    } catch {
+      throw new Error(`Original native gate log ${phase} ${signal.aborted ? 'timed out' : 'network request failed'}.`);
+    }
+  };
+  const api = await request(
+    `https://api.github.com/repos/boardsesh/boardsesh/actions/jobs/${jobId}/logs`,
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'User-Agent': 'boardsesh-native-recovery',
+      },
+      redirect: 'manual',
+    },
+    'API',
+  );
+  if (api.status !== 302) {
+    await discard(api);
+    throw new Error(`Original native gate log API returned HTTP ${api.status}; expected a signed redirect.`);
+  }
+  const location = api.headers.get('location');
+  await discard(api);
+  if (!location) throw new Error('Original native gate log API redirect has no location.');
+  let destination: URL;
+  try {
+    destination = new URL(location);
+  } catch {
+    throw new Error('Original native gate log API redirect is unsafe.');
+  }
+  if (destination.protocol !== 'https:' || destination.username !== '' || destination.password !== '')
+    throw new Error('Original native gate log API redirect is unsafe.');
+  const storage = await request(destination, { redirect: 'error' }, 'storage');
+  if (storage.status !== 200) {
+    await discard(storage);
+    throw new Error(`Original native gate log storage returned HTTP ${storage.status}.`);
+  }
+  const declaredLength = storage.headers.get('content-length');
+  if (declaredLength !== null && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maxBytes)) {
+    await discard(storage);
+    throw new Error('Original native gate log exceeds its size bound.');
+  }
+  if (!storage.body) throw new Error('Original native gate log storage returned no body.');
+  const reader = storage.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      try {
+        chunk = await reader.read();
+      } catch {
+        throw new Error(`Original native gate log body ${signal.aborted ? 'timed out' : 'read failed'}.`);
+      }
+      if (chunk.done) break;
+      total += chunk.value.byteLength;
+      if (total > maxBytes) throw new Error('Original native gate log exceeds its size bound.');
+      chunks.push(chunk.value);
+    }
+    if (total === 0) throw new Error('Original native gate log storage returned an empty body.');
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, total));
+    } catch {
+      throw new Error('Original native gate log body is not valid UTF-8.');
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      /* Never copy storage URL or response errors into logs. */
+    }
+  }
+}
+
+export function recoveryCommandFailure(operation: string, error: unknown): Error {
+  const details: string[] = [];
+  if (typeof error === 'object' && error !== null) {
+    const failure = error as Record<string, unknown>;
+    if (
+      typeof failure.status === 'number' &&
+      Number.isInteger(failure.status) &&
+      failure.status >= 0 &&
+      failure.status <= 255
+    )
+      details.push(`exit ${failure.status}`);
+    const stderr =
+      typeof failure.stderr === 'string'
+        ? failure.stderr
+        : Buffer.isBuffer(failure.stderr)
+          ? failure.stderr.toString('utf8')
+          : '';
+    const http = stderr.match(/\bHTTP[ :]+([1-5]\d{2})\b/i)?.[1];
+    if (http) details.push(`HTTP ${http}`);
+    if (/^gh:\s*(?:API rate limit exceeded|You have exceeded a secondary rate limit)\b/im.test(stderr))
+      details.push('reason rate-limit');
+    else if (/^gh:\s*Resource not accessible by (?:integration|personal access token)\b/im.test(stderr))
+      details.push('reason access-denied');
+    else if (/^gh:\s*Not Found\b/im.test(stderr)) details.push('reason not-found');
+    else if (/^(?:unknown flag:|the `--slurp` option is not supported\b)/im.test(stderr))
+      details.push('reason unsupported-option');
+    if (
+      typeof failure.code === 'string' &&
+      ['ENOENT', 'ENOBUFS', 'ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'EPIPE'].includes(failure.code)
+    )
+      details.push(failure.code);
+    if (typeof failure.signal === 'string' && ['SIGTERM', 'SIGKILL', 'SIGABRT'].includes(failure.signal))
+      details.push(failure.signal);
+  }
+  return new Error(`Android recovery command failed (${operation}${details.length ? `; ${details.join('; ')}` : ''}).`);
+}
+
+function execute(
+  binary: string,
+  args: string[],
+  environment = process.env,
+  operation = `${binary} ${args[0]}`,
+): string {
+  try {
+    return execFileSync(binary, args, {
+      encoding: 'utf8',
+      env: environment,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 120_000,
+      maxBuffer: 32 * 1024 * 1024,
+    }).trim();
+  } catch (error: unknown) {
+    throw recoveryCommandFailure(operation, error);
+  }
+}
+const required = (name: string) => {
+  const configured = process.env[name];
+  if (!configured?.trim()) throw new Error(`Missing recovery input: ${name}.`);
+  return configured;
+};
+const json = (path: string): unknown => JSON.parse(readFileSync(path, 'utf8'));
+const save = (path: string, contents: unknown) => writeFileSync(path, `${JSON.stringify(contents, null, 2)}\n`);
+function output(fields: Record<string, string>): void {
+  const rendered = Object.entries(fields)
+    .map(([key, contents]) => `${key}=${contents}`)
+    .join('\n');
+  console.log(rendered);
+  if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, `${rendered}\n`);
+}
+
+async function main(): Promise<void> {
+  if (process.env.GITHUB_REF !== 'refs/heads/main') throw new Error('Android candidate recovery runs on main only.');
+  const repository = required('GITHUB_REPOSITORY');
+  if (repository !== 'boardsesh/boardsesh') throw new Error('Recovery requires the Boardsesh repository.');
+  const receiptPath = join(required('RUNNER_TEMP'), 'android-candidate-recovery.json');
+  const [phase] = process.argv.slice(2);
+  if (phase === 'resolve') {
+    const runId = required('SOURCE_RUN_ID');
+    const sourceSha = required('EXPECTED_SOURCE_SHA');
+    if (!/^[1-9]\d*$/.test(runId) || !FULL_SHA.test(sourceSha)) throw new Error('Invalid recovery run or source SHA.');
+    const run = JSON.parse(
+      execute('gh', ['api', `repos/${repository}/actions/runs/${runId}`], process.env, 'read original native run'),
+    ) as unknown;
+    const pages = JSON.parse(
+      execute(
+        'gh',
+        ['api', '--paginate', '--slurp', `repos/${repository}/actions/runs/${runId}/jobs?filter=all&per_page=100`],
+        process.env,
+        'read original native jobs',
+      ),
+    ) as Array<{ jobs: unknown[] }>;
+    const source = validateRecoveryRun(
+      run,
+      pages.flatMap((page) => page.jobs),
+      repository,
+      runId,
+      sourceSha,
+      process.env.ALLOW_UNCONFIRMED_UPLOAD === 'true',
+    );
+    const gate = pages
+      .flatMap((page) => page.jobs)
+      .map(record)
+      .find((job) => job.name === 'gate' && job.conclusion === 'success');
+    if (!gate || !Number.isSafeInteger(gate.id)) throw new Error('Missing original successful native gate.');
+    const expectedRuntime = validateRecoveryGateLog(
+      await readOriginalNativeGateLog({ jobId: String(gate.id), token: required('GH_TOKEN') }),
+      sourceSha,
+    );
+    execute('git', ['fetch', '--quiet', '--no-tags', 'origin', 'main:refs/remotes/origin/main']);
+    execute('git', ['merge-base', '--is-ancestor', sourceSha, 'refs/remotes/origin/main']);
+    save(receiptPath, { ...source, expectedRuntime });
+    output({ artifact_name: source.artifactName, aab_artifact_name: `boardsesh-rn-android-aab-${source.runNumber}` });
+    return;
+  }
+  const source = record(json(receiptPath));
+  const apk = join(required('RUNNER_TEMP'), 'android-recovery-apk', APK_NAME);
+  if (phase === 'verify') {
+    const analyzer = required('APK_ANALYZER_PATH');
+    const manifestIdentity = parseApkBadging(
+      execute(required('AAPT2_PATH'), ['dump', 'badging', apk], process.env, 'read APK binary manifest identity'),
+    );
+    const identity = validateApkIdentity(
+      {
+        ...manifestIdentity,
+        runtime: execute(
+          analyzer,
+          [
+            'resources',
+            'value',
+            '--config',
+            'default',
+            '--name',
+            'expo_runtime_version',
+            '--type',
+            'string',
+            '--package',
+            PACKAGE,
+            apk,
+          ],
+          process.env,
+          'read APK runtime version',
+        ),
+      },
+      required('EXPECTED_VERSION_CODE'),
+    );
+    if (identity.runtime !== source.expectedRuntime)
+      throw new Error('APK runtime differs from its original native gate.');
+    const token = await createAuditAccessToken(required('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON'));
+    const states: Record<string, unknown> = {};
+    // Public binaries may no longer appear in either tester track. A lost
+    // upload response requires public publication and independent APK bytes;
+    // ordinary candidate recovery retains its original two-track admission.
+    const tracks = source.uploadConfirmed === false ? (['production'] as const) : (['internal', 'beta'] as const);
+    for (const track of tracks) {
+      const evidence = await readProductionReleaseSummaries(token, track);
+      requireReviewedPlayBuild(evidence, track, identity.versionCode);
+      states[track] = trackSummaries(evidence, track);
+    }
+    let storeApkSha256: string | undefined;
+    if (source.uploadConfirmed === false) {
+      const aabDirectory = join(required('RUNNER_TEMP'), 'android-recovery-aab');
+      const bundles = readdirSync(aabDirectory).filter((name) => name.endsWith('.aab'));
+      if (bundles.length !== 1) throw new Error('Recovery requires one retained original AAB.');
+      const aab = join(aabDirectory, bundles[0]!);
+      const storeApk = join(required('RUNNER_TEMP'), 'android-recovery-play.apk');
+      const downloaded = await readGeneratedPlayApk(token, identity.versionCode);
+      writeFileSync(storeApk, downloaded);
+      const storeIdentity = validateApkIdentity(
+        {
+          ...parseApkBadging(execute(required('AAPT2_PATH'), ['dump', 'badging', storeApk])),
+          runtime: execute(analyzer, [
+            'resources',
+            'value',
+            '--config',
+            'default',
+            '--name',
+            'expo_runtime_version',
+            '--type',
+            'string',
+            '--package',
+            PACKAGE,
+            storeApk,
+          ]),
+        },
+        identity.versionCode,
+      );
+      const originalManifest = execute('unzip', ['-p', aab, 'base/assets/app.manifest']);
+      const storeManifest = execute('unzip', ['-p', storeApk, 'assets/app.manifest']);
+      validateStoreApkEvidence(originalManifest, storeManifest, identity, storeIdentity);
+      storeApkSha256 = createHash('sha256').update(downloaded).digest('hex');
+    }
+    const apkSha256 = createHash('sha256').update(readFileSync(apk)).digest('hex');
+    const buildTag = formatBuildTag(
+      'android',
+      identity.version,
+      Number(identity.versionCode),
+      identity.runtime.slice(0, 12),
+    );
+    save(receiptPath, {
+      ...source,
+      ...identity,
+      apkSha256,
+      buildTag,
+      checkedAt: new Date().toISOString(),
+      play: states,
+      ...(storeApkSha256 ? { storeApkSha256 } : {}),
+    });
+    output({
+      version_code: identity.versionCode,
+      version: identity.version,
+      runtime: identity.runtime,
+      build_tag: buildTag,
+    });
+    return;
+  }
+  if (phase !== 'publish') throw new Error('Recovery phase must be resolve, verify or publish.');
+  const { sourceSha, buildTag, runtime, apkSha256, version, versionCode } = source;
+  if (
+    typeof source.uploadConfirmed !== 'boolean' ||
+    (source.uploadConfirmed === false &&
+      (typeof source.storeApkSha256 !== 'string' ||
+        createHash('sha256')
+          .update(readFileSync(join(required('RUNNER_TEMP'), 'android-recovery-play.apk')))
+          .digest('hex') !== source.storeApkSha256)) ||
+    typeof sourceSha !== 'string' ||
+    !FULL_SHA.test(sourceSha) ||
+    typeof runtime !== 'string' ||
+    !FULL_SHA.test(runtime) ||
+    typeof buildTag !== 'string' ||
+    typeof version !== 'string' ||
+    typeof versionCode !== 'string' ||
+    buildTag !== formatBuildTag('android', version, Number(versionCode), runtime.slice(0, 12)) ||
+    createHash('sha256').update(readFileSync(apk)).digest('hex') !== apkSha256
+  )
+    throw new Error('Verified recovery receipt no longer matches its retained APK.');
+  const tags = [buildTag, `fingerprint-android-${runtime}`];
+  const remote = `https://github.com/${repository}.git`;
+  const readTags = () =>
+    Object.fromEntries(
+      tags.map((tag) => {
+        const target = execute('git', ['ls-remote', '--refs', remote, `refs/tags/${tag}`]);
+        return [tag, target ? target.split(/\s/)[0]! : null];
+      }),
+    );
+  const fingerprintTag = `fingerprint-android-${runtime}`;
+  const missing = missingRecoveryTags(readTags(), sourceSha, fingerprintTag);
+  if (missing.length) {
+    for (const tag of missing) execute('git', ['tag', tag, sourceSha]);
+    const environment = {
+      ...process.env,
+      GIT_CONFIG_COUNT: '2',
+      GIT_CONFIG_KEY_0: 'http.https://github.com/.extraheader',
+      GIT_CONFIG_VALUE_0: '',
+      GIT_CONFIG_KEY_1: 'http.https://github.com/.extraheader',
+      GIT_CONFIG_VALUE_1: `AUTHORIZATION: basic ${Buffer.from(`x-access-token:${required('GH_APP_TOKEN')}`).toString('base64')}`,
+    };
+    try {
+      execute('git', ['push', '--atomic', remote, ...missing.map((tag) => `refs/tags/${tag}`)], environment);
+    } catch {
+      if (missingRecoveryTags(readTags(), sourceSha, fingerprintTag).length)
+        throw new Error('Recovery tags were not published; no store upload was attempted.');
+    }
+  }
+  if (missingRecoveryTags(readTags(), sourceSha, fingerprintTag).length)
+    throw new Error('Recovery tag readback failed.');
+  const releaseEnvironment = { ...process.env, GH_TOKEN: required('GH_APP_TOKEN') };
+  let release: { isDraft: boolean; assets: Array<{ name: string }> } | null = null;
+  try {
+    release = JSON.parse(
+      execute(
+        'gh',
+        ['release', 'view', buildTag, '--repo', repository, '--json', 'isDraft,assets'],
+        releaseEnvironment,
+      ),
+    );
+  } catch {
+    /* Missing release is created as a draft below. */
+  }
+  if (!release)
+    execute(
+      'gh',
+      [
+        'release',
+        'create',
+        buildTag,
+        apk,
+        '--repo',
+        repository,
+        '--verify-tag',
+        '--draft',
+        '--prerelease',
+        '--title',
+        `Boardsesh Android Beta v${version} (${versionCode})`,
+        '--notes',
+        `Recovered the existing Play-uploaded APK from native run ${String(source.sourceRunId)}. No rebuild or Play upload. Source: ${sourceSha}; SHA-256: ${apkSha256}.`,
+      ],
+      releaseEnvironment,
+    );
+  else if (!release.assets.some((asset) => asset.name === APK_NAME)) {
+    if (!release.isDraft) throw new Error('Existing public release is missing its APK; refusing to alter it.');
+    execute('gh', ['release', 'upload', buildTag, apk, '--repo', repository], releaseEnvironment);
+  }
+  const readback = join(required('RUNNER_TEMP'), 'android-recovery-readback');
+  mkdirSync(readback, { recursive: true });
+  const publishedApk = join(readback, APK_NAME);
+  if (existsSync(publishedApk)) throw new Error('Recovery download directory was already used.');
+  execute(
+    'gh',
+    ['release', 'download', buildTag, '--repo', repository, '--pattern', APK_NAME, '--dir', readback],
+    releaseEnvironment,
+  );
+  if (createHash('sha256').update(readFileSync(publishedApk)).digest('hex') !== apkSha256)
+    throw new Error('Recovered release APK readback differs; leaving draft unchanged.');
+  if (!release || release.isDraft)
+    execute(
+      'gh',
+      ['release', 'edit', buildTag, '--repo', repository, '--draft=false', '--prerelease'],
+      releaseEnvironment,
+    );
+  save(join(required('RUNNER_TEMP'), 'native-build-source.json'), {
+    schemaVersion: 1,
+    platform: 'android',
+    sourceSha,
+    workflowSha: required('GITHUB_SHA'),
+    sourceRunId: required('GITHUB_RUN_ID'),
+    originalSourceRunId: source.sourceRunId,
+    version,
+    buildNumber: versionCode,
+    buildTag,
+  });
+  console.log(`Recovered Android ${version} (${versionCode}); existing Play submission retained.`);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href)
+  void main().catch((error: unknown) => {
+    console.error(error instanceof Error ? error.message : 'Android candidate recovery failed.');
+    process.exitCode = 1;
+  });

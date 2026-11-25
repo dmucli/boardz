@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
+import { cleanup, render, fireEvent } from '@testing-library/react';
 import { createElement, forwardRef, type ReactNode, type Ref } from 'react';
 import type { Gym, UserBoard } from '@boardsesh/shared-schema';
 import type { GymListRow } from '../gym-list-rows';
@@ -14,22 +14,25 @@ const ensureVisible = vi.fn();
 const snapTo = vi.fn();
 const scrollToIndex = vi.fn();
 vi.mock('../use-gym-panel-gesture', () => ({
-  useGymPanelGesture: () => ({
-    gesture: {},
-    nativeGesture: {},
-    panelAnimatedStyle: {},
-    panelHeight: 600,
-    scrollEnabled: false,
-    settledDetent: 'medium',
-    onListScroll: () => {},
-    onHeaderLayout: () => {},
-    snapTo,
-    ensureVisible,
-  }),
+  useGymPanelGesture: () => {
+    return {
+      gesture: {},
+      nativeGesture: {},
+      panelAnimatedStyle: {},
+      panelHeight: 600,
+      scrollEnabled: false,
+      settledDetent: 'medium',
+      onListScroll: () => {},
+      onHeaderLayout: () => {},
+      snapTo,
+      ensureVisible,
+    };
+  },
 }));
 
 vi.mock('react-native', () => ({
   View: ({ children }: Children) => createElement('div', null, children),
+  Pressable: ({ children, onPress }: PressProps) => createElement('span', { onClick: onPress }, children),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
 }));
 
@@ -68,12 +71,42 @@ vi.mock('react-native-safe-area-context', () => ({
 
 vi.mock('../../Text', () => ({ Text: ({ children }: Children) => createElement('span', null, children) }));
 vi.mock('../../Icon', () => ({ Icon: () => createElement('i', null) }));
+vi.mock('../../StatusPill', () => ({
+  StatusPill: ({ label, testID }: { label: string; testID?: string }) =>
+    createElement('span', { 'data-testid': testID }, label),
+}));
 vi.mock('../../ActivityIndicator', () => ({
   ActivityIndicator: () => createElement('div', { 'data-testid': 'spinner' }),
 }));
+vi.mock('../../ShareIconButton', () => ({
+  ShareIconButton: ({ accessibilityLabel }: { accessibilityLabel: string }) =>
+    createElement('button', { 'aria-label': accessibilityLabel }),
+}));
 vi.mock('../../PressableSurface', () => ({
-  PressableSurface: ({ children, onPress }: PressProps) =>
-    createElement('button', { onClick: onPress, type: 'button' }, children),
+  PressableSurface: ({
+    children,
+    onPress,
+    accessibilityActions,
+    onAccessibilityAction,
+    testID,
+  }: PressProps & {
+    accessibilityActions?: { name: string; label: string }[];
+    onAccessibilityAction?: (event: { nativeEvent: { actionName: string } }) => void;
+    testID?: string;
+  }) =>
+    createElement(
+      'button',
+      {
+        onClick: onPress,
+        type: 'button',
+        'data-testid': testID,
+        // Screen-reader custom actions, surfaced as a clickable marker the test can drive.
+        'data-a11y-actions': accessibilityActions?.map((action) => action.label).join('|'),
+        onDoubleClick: () =>
+          onAccessibilityAction?.({ nativeEvent: { actionName: accessibilityActions?.[0]?.name ?? '' } }),
+      },
+      children,
+    ),
 }));
 
 vi.mock('../../../theme/variants/variant-tokens', () => ({
@@ -88,6 +121,7 @@ vi.mock('../../../theme/tokens', () => ({
 
 vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({
+    selection: { text: '#111111', checkmark: '#00AA55', fill: 'rgba(0, 170, 85, 0.18)' },
     systemColors: {
       secondaryBackground: '#fff',
       separator: '#ccc',
@@ -98,7 +132,9 @@ vi.mock('../../../providers/theme-provider', () => ({
     },
     brandColors: { primary: '#6D28D9' },
     sheet: { handleStyle: {}, corners: null },
-    sectionCaption: { uppercase: true, opacity: 0.6, letterSpacing: 0.5 },
+    sectionCaption: { uppercase: false, opacity: 1, letterSpacing: 0 },
+    variant: 'liquidGlass',
+    m3: { onSurfaceVariant: '#49454F' },
   }),
 }));
 
@@ -122,7 +158,16 @@ const gym = {
 function makeData(): GymListRow[] {
   return [
     { kind: 'sectionHeader', key: 'sh:gyms', label: 'GYMS' },
-    { kind: 'gym', key: 'gym:g1', gym, subtitle: '1 Crag St', expanded: false, selected: false, boards: [] },
+    {
+      kind: 'gym',
+      key: 'gym:g1',
+      gym,
+      subtitle: '1 Crag St',
+      expanded: false,
+      selected: false,
+      boards: [],
+      boardsPending: false,
+    },
   ];
 }
 
@@ -145,6 +190,7 @@ function makeExpandedClaimData(): GymListRow[] {
       expanded: true,
       selected: false,
       boards: [],
+      boardsPending: false,
     },
   ];
 }
@@ -156,6 +202,31 @@ beforeEach(() => {
 });
 
 describe('GymListPanel', () => {
+  it('shows Share only in an expanded public gym without nesting it in the expand button', () => {
+    const publicGym = { ...gym, isPublic: true, slug: 'movement' };
+    const onPressGym = vi.fn();
+    const entries = makeData().map((row) => (row.kind === 'gym' ? { ...row, gym: publicGym } : row));
+    const panel = (expanded: boolean) => (
+      <GymListPanel
+        data={entries.map((row) => (row.kind === 'gym' ? { ...row, expanded } : row))}
+        mapAvailable
+        onPressGym={onPressGym}
+        onActivateBoard={vi.fn()}
+        onEditGym={vi.fn()}
+        onEditBoard={vi.fn()}
+        noBoardsLabel="No boards yet"
+        searchSlot={<div>search</div>}
+      />
+    );
+    const view = render(panel(false));
+    expect(view.queryByRole('button', { name: 'mobile.gyms.shareAriaLabel' })).toBeNull();
+    view.rerender(panel(true));
+    const share = view.getByRole('button', { name: 'mobile.gyms.shareAriaLabel' });
+    expect(share.parentElement?.closest('button')).toBeNull();
+    fireEvent.click(share);
+    expect(onPressGym).not.toHaveBeenCalled();
+  });
+
   it('renders the pinned search slot and the gym rows', () => {
     const { getByTestId, getByText } = render(
       <GymListPanel
@@ -174,6 +245,25 @@ describe('GymListPanel', () => {
     expect(getByText('1 Crag St')).toBeTruthy();
     // Board-type badges render from Gym.boardTypes.
     expect(getByText('Kilter · Tension')).toBeTruthy();
+  });
+
+  it('says who runs each gym on its row', () => {
+    const data = makeData().map((row) =>
+      row.kind === 'gym' ? { ...row, gym: { ...row.gym, listingState: 'CLIMBER_LISTED' } as Gym } : row,
+    );
+    const { getByTestId } = render(
+      <GymListPanel
+        data={data}
+        mapAvailable
+        onPressGym={vi.fn()}
+        onActivateBoard={vi.fn()}
+        onEditGym={vi.fn()}
+        onEditBoard={vi.fn()}
+        noBoardsLabel="No boards yet"
+        searchSlot={null}
+      />,
+    );
+    expect(getByTestId('gym-list-listing-pill').textContent).toBe('runBy.pillClimberListed');
   });
 
   it('invokes onPressGym with the gym when its row is tapped', () => {
@@ -216,6 +306,55 @@ describe('GymListPanel', () => {
     expect(buttons).toHaveLength(2);
     fireEvent.click(buttons[1]);
     expect(onClaimGym).toHaveBeenCalledWith(claimableGym);
+  });
+
+  it("offers See gym inside an expanded row, before the claim, and opens that gym's page", () => {
+    const onOpenGym = vi.fn();
+    const onClaimGym = vi.fn();
+    const { getAllByRole, getByText } = render(
+      <GymListPanel
+        data={makeExpandedClaimData()}
+        mapAvailable
+        onPressGym={vi.fn()}
+        onActivateBoard={vi.fn()}
+        onEditGym={vi.fn()}
+        onEditBoard={vi.fn()}
+        onClaimGym={onClaimGym}
+        onOpenGym={onOpenGym}
+        noBoardsLabel="No boards yet"
+        searchSlot={<div>search</div>}
+      />,
+    );
+    // The gym header, See gym, then the claim action.
+    const buttons = getAllByRole('button');
+    expect(buttons).toHaveLength(3);
+    expect(getByText('mobile.gyms.seeGym')).toBeTruthy();
+    fireEvent.click(buttons[1]);
+    expect(onOpenGym).toHaveBeenCalledWith(claimableGym);
+    expect(onClaimGym).not.toHaveBeenCalled();
+  });
+
+  it('offers no claim on a gym its staff run, even with a stale canClaim', () => {
+    const onClaimGym = vi.fn();
+    const runByStaff = makeExpandedClaimData().map((row) =>
+      row.kind === 'gym' ? { ...row, gym: { ...row.gym, listingState: 'RUN_BY_GYM' } as Gym } : row,
+    );
+    const { getAllByRole, queryByText } = render(
+      <GymListPanel
+        data={runByStaff}
+        mapAvailable
+        onPressGym={vi.fn()}
+        onActivateBoard={vi.fn()}
+        onEditGym={vi.fn()}
+        onEditBoard={vi.fn()}
+        onClaimGym={onClaimGym}
+        noBoardsLabel="No boards yet"
+        searchSlot={<div>search</div>}
+      />,
+    );
+    // Only the gym header row: no claim action.
+    expect(getAllByRole('button')).toHaveLength(1);
+    expect(queryByText('mobile.gymClaim.claimAction')).toBeNull();
   });
 
   it('does not render a claim action when no onClaimGym handler is supplied', () => {
@@ -270,7 +409,16 @@ describe('GymListPanel board rows', () => {
 
   function makeExpandedGymData(board: UserBoard): GymListRow[] {
     return [
-      { kind: 'gym', key: 'gym:g1', gym, subtitle: '1 Crag St', expanded: true, selected: false, boards: [board] },
+      {
+        kind: 'gym',
+        key: 'gym:g1',
+        gym,
+        subtitle: '1 Crag St',
+        expanded: true,
+        selected: false,
+        boards: [board],
+        boardsPending: false,
+      },
     ];
   }
 
@@ -289,6 +437,36 @@ describe('GymListPanel board rows', () => {
     );
   }
 
+  it('shows the no-boards caption only once an empty roster has settled', () => {
+    const render1 = (boardsPending: boolean) =>
+      render(
+        <GymListPanel
+          data={[
+            {
+              kind: 'gym',
+              key: 'gym:g1',
+              gym,
+              subtitle: '1 Crag St',
+              expanded: true,
+              selected: false,
+              boards: [],
+              boardsPending,
+            },
+          ]}
+          mapAvailable
+          onPressGym={vi.fn()}
+          onActivateBoard={vi.fn()}
+          onEditGym={vi.fn()}
+          onEditBoard={vi.fn()}
+          noBoardsLabel="No boards yet"
+          searchSlot={<div>search</div>}
+        />,
+      );
+    expect(render1(true).queryByText('No boards yet')).toBeNull();
+    cleanup();
+    expect(render1(false).getByText('No boards yet')).toBeTruthy();
+  });
+
   it('captions a board with its config, not the raw board type', () => {
     const { getByText, queryByText } = renderExpanded(gymBoard);
     expect(getByText('Comp wall')).toBeTruthy();
@@ -300,5 +478,54 @@ describe('GymListPanel board rows', () => {
     const { getByText, queryByText } = renderExpanded({ ...gymBoard, layoutId: 99999, sizeId: 99999 } as UserBoard);
     expect(getByText('Kilter')).toBeTruthy();
     expect(queryByText('kilter')).toBeNull();
+  });
+
+  it('publishes Edit as a custom action on an editable gym row and runs the same handler', () => {
+    const onEditGym = vi.fn();
+    const editableGym = { ...gym, canEdit: true } as unknown as Gym;
+    const data: GymListRow[] = [
+      {
+        kind: 'gym',
+        key: 'gym:g1',
+        gym: editableGym,
+        subtitle: '1 Crag St',
+        expanded: false,
+        selected: false,
+        boards: [],
+        boardsPending: false,
+      },
+    ];
+    const { container } = render(
+      <GymListPanel
+        data={data}
+        mapAvailable
+        onPressGym={vi.fn()}
+        onActivateBoard={vi.fn()}
+        onEditGym={onEditGym}
+        onEditBoard={vi.fn()}
+        noBoardsLabel="No boards yet"
+        searchSlot={<div>search</div>}
+      />,
+    );
+    const row = container.querySelector('[data-a11y-actions="mobile.gyms.editGym"]') as HTMLElement;
+    expect(row).not.toBeNull();
+    fireEvent.doubleClick(row);
+    expect(onEditGym).toHaveBeenCalledWith(editableGym);
+  });
+
+  it('adds no custom action to a gym the viewer cannot edit', () => {
+    const { container } = render(
+      <GymListPanel
+        data={makeData()}
+        mapAvailable
+        onPressGym={vi.fn()}
+        onActivateBoard={vi.fn()}
+        onEditGym={vi.fn()}
+        onEditBoard={vi.fn()}
+        noBoardsLabel="No boards yet"
+        searchSlot={<div>search</div>}
+      />,
+    );
+    expect(container.querySelector('[data-a11y-actions]')).toBeNull();
   });
 });

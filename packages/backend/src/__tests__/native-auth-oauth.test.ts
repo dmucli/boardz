@@ -5,7 +5,7 @@ import { EventEmitter } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Socket } from 'node:net';
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
-import { users, accounts, userProfiles, mobileRefreshTokens } from '@boardsesh/db/schema/auth';
+import { users, accounts, authEmailProjection, userProfiles, mobileRefreshTokens } from '@boardsesh/db/schema/auth';
 
 // ---------------------------------------------------------------------------
 // Env — generateTokenPair signs with NEXTAUTH_SECRET; the Google verifier
@@ -36,19 +36,38 @@ function makeAwaitableInsert(): Promise<unknown[]> & { onConflictDoNothing: () =
 }
 
 function makeChain() {
+  let admissionProjection = false;
+  let selectedTable: unknown;
   const chain = {
-    select() {
+    execute: async () => [{ transaction_isolation: 'read committed' }],
+    select(projection?: Record<string, unknown>) {
+      // Model a live subject for these legacy issuer unit tests. The separate
+      // admission integration suite exercises actual primary rows and denial.
+      admissionProjection = Boolean(projection && 'deletedAt' in projection);
       return chain;
     },
-    from() {
+    leftJoin() {
+      return chain;
+    },
+    from(table: unknown) {
+      selectedTable = table;
+      return chain;
+    },
+    innerJoin() {
       return chain;
     },
     where() {
+      // Legacy deployment has no selected-authority manifest. Keep its gate
+      // read separate from the queued identity/admission query responses.
+      if (selectedTable === authEmailProjection) return Promise.resolve([]);
+      return chain;
+    },
+    orderBy() {
       return chain;
     },
     limit() {
-      const rows = mockDbSelectQueue.shift() ?? [];
-      return Promise.resolve(rows);
+      const rows = admissionProjection ? [{ id: 'unit-subject', deletedAt: null }] : (mockDbSelectQueue.shift() ?? []);
+      return Object.assign(Promise.resolve(rows), { for: () => Promise.resolve(rows) });
     },
     insert(table: unknown) {
       return {
@@ -206,6 +225,25 @@ describe('handleNativeAuthOAuth', () => {
     updateCalls.length = 0;
   });
 
+  it.each(['0', '1'])('creates a public OAuth account with controls enabled=%s', async (flag) => {
+    vi.stubEnv('BOARDSESH_PRIVACY_ENABLED', flag);
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: 'rollout-google', email: 'rollout@example.com', email_verified: true },
+    });
+    queueSelect([]);
+    queueSelect([]);
+    const res = makeResponse();
+    try {
+      await callHandler(makeRequest({ method: 'POST', body: { provider: 'google', identityToken: 'tok' } }), res);
+      expect(res.statusCode).toBe(200);
+      // Only the user id: the column defaults make the account public.
+      const profileValues = insertsFor(userProfiles)[0].values as Record<string, unknown>;
+      expect(Object.keys(profileValues)).toEqual(['userId']);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('creates a new user (+ profile + account link) for an unknown Google identity', async () => {
     jwtVerify.mockResolvedValueOnce({
       payload: { sub: 'google-sub-1', email: 'new@example.com', email_verified: true, name: 'New Person' },
@@ -232,6 +270,13 @@ describe('handleNativeAuthOAuth', () => {
     expect(userValues.email).toBe('new@example.com');
     expect(userValues.name).toBe('New Person');
     expect(userValues.emailVerified).toBeInstanceOf(Date);
+    expect(body.userId).toBe(userValues.id);
+    expect(body.accountCreation).toEqual({
+      userId: userValues.id,
+      accountCreated: true,
+      provider: 'google',
+      createdAt: (userValues.createdAt as Date).toISOString(),
+    });
     const accountValues = insertsFor(accounts)[0].values as Record<string, unknown>;
     expect(accountValues).toMatchObject({ provider: 'google', providerAccountId: 'google-sub-1', type: 'oauth' });
   });
@@ -240,13 +285,20 @@ describe('handleNativeAuthOAuth', () => {
     jwtVerify.mockResolvedValueOnce({
       payload: { sub: 'google-sub-2', email: 'someone@example.com', email_verified: true },
     });
-    queueSelect([{ userId: 'existing-user' }]); // account link found by (provider, sub)
+    const createdAt = new Date('2025-01-01T00:00:00.000Z');
+    queueSelect([{ userId: 'existing-user', createdAt }]); // account link found by (provider, sub)
 
     const req = makeRequest({ method: 'POST', body: { provider: 'google', identityToken: 'tok' } });
     const res = makeResponse();
     await callHandler(req, res);
 
     expect(res.statusCode).toBe(200);
+    expect(parseBody(res).accountCreation).toEqual({
+      userId: 'existing-user',
+      provider: 'google',
+      accountCreated: false,
+      createdAt: createdAt.toISOString(),
+    });
     // Resolved via the sub link — no user/profile/account writes, only the
     // refresh-token insert from generateTokenPair.
     expect(insertsFor(users)).toHaveLength(0);
@@ -255,12 +307,41 @@ describe('handleNativeAuthOAuth', () => {
     expect(insertsFor(mobileRefreshTokens)).toHaveLength(1);
   });
 
+  it('stamps a provider sign-in with the second its token verified and a new session', async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: 'google-sub-stamped', email: 'stamped@example.com', email_verified: true },
+    });
+    queueSelect([{ userId: 'existing-user', createdAt: new Date('2025-01-01T00:00:00.000Z') }]);
+    const verifiedFrom = Date.now();
+
+    const res = makeResponse();
+    await callHandler(makeRequest({ method: 'POST', body: { provider: 'google', identityToken: 'tok' } }), res);
+    const verifiedBy = Date.now();
+
+    expect(res.statusCode).toBe(200);
+    const refreshValues = insertsFor(mobileRefreshTokens)[0].values as Record<string, unknown>;
+    const authenticatedAt = refreshValues.authenticatedAt as Date;
+    expect(authenticatedAt.getTime()).toBeGreaterThanOrEqual(verifiedFrom);
+    expect(authenticatedAt.getTime()).toBeLessThanOrEqual(verifiedBy);
+    expect(refreshValues).toMatchObject({ subjectGeneration: 0, nativeGeneration: 0 });
+    expect(refreshValues.sessionId).toMatch(/^[0-9a-f-]{36}$/);
+    const { decodeJwt } = await vi.importActual<typeof import('jose')>('jose');
+    expect(decodeJwt(parseBody(res).jwt as string)).toMatchObject({
+      sub: 'existing-user',
+      gen: 0,
+      ngen: 0,
+      auth_time: Math.floor(authenticatedAt.getTime() / 1000),
+    });
+  });
+
   it('links a native sign-in to an existing web user by email (no duplicate users row)', async () => {
     jwtVerify.mockResolvedValueOnce({
       payload: { sub: 'apple-sub-1', email: 'web-user@example.com', email_verified: true },
     });
     queueSelect([]); // no account link by sub
-    queueSelect([{ id: 'web-user', emailVerified: null }]); // matched by email
+    const createdAt = new Date('2025-01-01T00:00:00.000Z');
+    queueSelect([{ id: 'web-user', email: 'web-user@example.com', emailVerified: null, createdAt }]); // matched by email
+    queueSelect([{ userId: 'web-user' }]); // the persisted link owner, read back after the insert
 
     const req = makeRequest({
       method: 'POST',
@@ -270,6 +351,12 @@ describe('handleNativeAuthOAuth', () => {
     await callHandler(req, res);
 
     expect(res.statusCode).toBe(200);
+    expect(parseBody(res).accountCreation).toEqual({
+      userId: 'web-user',
+      provider: 'apple',
+      accountCreated: false,
+      createdAt: createdAt.toISOString(),
+    });
     // No new user — link the existing one.
     expect(insertsFor(users)).toHaveLength(0);
     expect(insertsFor(accounts)).toHaveLength(1);
@@ -284,7 +371,15 @@ describe('handleNativeAuthOAuth', () => {
       payload: { sub: 'apple-sub-9', email: 'verified@example.com', email_verified: true },
     });
     queueSelect([]); // no account link
-    queueSelect([{ id: 'verified-user', emailVerified: new Date('2024-01-01') }]);
+    queueSelect([
+      {
+        id: 'verified-user',
+        email: 'verified@example.com',
+        emailVerified: new Date('2024-01-01'),
+        createdAt: new Date(),
+      },
+    ]);
+    queueSelect([{ userId: 'verified-user' }]);
 
     const req = makeRequest({ method: 'POST', body: { provider: 'apple', identityToken: 'tok' } });
     const res = makeResponse();
@@ -297,23 +392,75 @@ describe('handleNativeAuthOAuth', () => {
   it('does NOT link to an existing account when the provider email is unverified', async () => {
     // Security: auto-linking an unverified provider email would let an attacker
     // who can mint a token for a victim's email claim take over that account.
-    // The unverified identity must create its own user, anchored on its sub.
+    // BA-02: nor may it create a second account for an address already held.
     jwtVerify.mockResolvedValueOnce({
-      payload: { sub: 'google-sub-unverified', email: 'victim@example.com', email_verified: false },
+      payload: { sub: 'google-sub-unverified', email: 'Victim@Example.com', email_verified: false },
     });
-    queueSelect([]); // no account link by sub; the email-link path is skipped (unverified)
+    queueSelect([]); // no account link by sub
+    queueSelect([{ id: 'victim', email: 'victim@example.com', emailVerified: null, createdAt: new Date() }]);
 
     const req = makeRequest({ method: 'POST', body: { provider: 'google', identityToken: 'tok' } });
     const res = makeResponse();
     await callHandler(req, res);
 
-    expect(res.statusCode).toBe(200);
-    // A fresh user is created (not linked) and owns the new account row.
-    expect(insertsFor(users)).toHaveLength(1);
-    expect(insertsFor(accounts)).toHaveLength(1);
-    const newUserId = (insertsFor(users)[0].values as Record<string, unknown>).id;
-    expect((insertsFor(accounts)[0].values as Record<string, unknown>).userId).toBe(newUserId);
+    expect(res.statusCode).toBe(409);
+    expect(insertsFor(users)).toHaveLength(0);
+    expect(insertsFor(accounts)).toHaveLength(0);
+    expect(insertsFor(mobileRefreshTokens)).toHaveLength(0);
     // No existing user's email was promoted to verified.
+    expect(updateCalls.filter((call) => call.table === users)).toHaveLength(0);
+  });
+
+  it('creates its own user, anchored on the sub, for an unverified email nobody holds', async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: 'google-sub-unverified-free', email: 'Free@Example.com', email_verified: false },
+    });
+    queueSelect([]); // no account link by sub
+    queueSelect([]); // nobody holds the address
+
+    const res = makeResponse();
+    await callHandler(makeRequest({ method: 'POST', body: { provider: 'google', identityToken: 'tok' } }), res);
+
+    expect(res.statusCode).toBe(200);
+    expect(insertsFor(users)).toHaveLength(1);
+    const created = insertsFor(users)[0].values as Record<string, unknown>;
+    expect(created.email).toBe('free@example.com');
+    expect(created.emailVerified).toBeNull();
+    expect((insertsFor(accounts)[0].values as Record<string, unknown>).userId).toBe(created.id);
+  });
+
+  it('refuses an address several accounts share in other capitals: no link, no user, no token', async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: 'apple-sub-shared', email: 'shared@example.com', email_verified: true },
+    });
+    queueSelect([]);
+    queueSelect([
+      { id: 'title', email: 'Shared@example.com', emailVerified: null, createdAt: new Date() },
+      { id: 'upper', email: 'SHARED@example.com', emailVerified: null, createdAt: new Date() },
+    ]);
+
+    const res = makeResponse();
+    await callHandler(makeRequest({ method: 'POST', body: { provider: 'apple', identityToken: 'tok' } }), res);
+
+    expect(res.statusCode).toBe(409);
+    expect(insertsFor(users)).toHaveLength(0);
+    expect(insertsFor(accounts)).toHaveLength(0);
+    expect(insertsFor(mobileRefreshTokens)).toHaveLength(0);
+  });
+
+  it('mints nothing when the persisted link belongs to another account after its insert', async () => {
+    jwtVerify.mockResolvedValueOnce({
+      payload: { sub: 'apple-sub-raced', email: 'raced@example.com', email_verified: true },
+    });
+    queueSelect([]);
+    queueSelect([{ id: 'matched', email: 'Raced@example.com', emailVerified: null, createdAt: new Date() }]);
+    queueSelect([{ userId: 'someone-else' }]); // a concurrent sign-in linked the subject first
+
+    const res = makeResponse();
+    await callHandler(makeRequest({ method: 'POST', body: { provider: 'apple', identityToken: 'tok' } }), res);
+
+    expect(res.statusCode).toBe(409);
+    expect(insertsFor(mobileRefreshTokens)).toHaveLength(0);
     expect(updateCalls.filter((call) => call.table === users)).toHaveLength(0);
   });
 

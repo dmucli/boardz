@@ -1,165 +1,202 @@
 'use client';
 
+import { spraywallPathClicked } from '@boardsesh/analytics';
+import { trackWebsiteJourneyEvent } from '@/app/lib/website-journey-analytics';
 import React from 'react';
+import Image from 'next/image';
 import Box from '@mui/material/Box';
 import Button from '@mui/material/Button';
 import Typography from '@mui/material/Typography';
 import MuiLink from '@mui/material/Link';
 import { useTranslation } from 'react-i18next';
 import LocaleLink from '@/app/components/i18n/locale-link';
-import MarketingInstallLinks from '@/app/components/marketing/marketing-install-links';
-import { brandCtaSx } from '@/app/components/ui/brand-cta';
-import { PageShell, PageSection, PageCard, Prose, ProseList } from '@/app/components/ui/page-shell';
+import type { DeveloperDocsState } from '@/app/lib/developer-apps/docs-access';
+import { brandCtaOutlinedSx, brandCtaSx } from '@/app/components/ui/brand-cta';
+import { resolveStaticAssetUrl } from '@/app/lib/static-asset-url';
+import { helpScreenshot, type HelpShot } from '@/app/lib/help-screenshots';
+import HelpPageShell from './help-page-shell';
+import HelpBand from './help-band';
+import HelpInstallSection from './help-install-section';
+import { HelpScreenshot } from './help-screenshot';
 import styles from './help.module.css';
 
 const DISCORD_INVITE_URL = 'https://discord.gg/YXA8GsXfQK';
 const GITHUB_ISSUES_URL = 'https://github.com/boardsesh/boardsesh/issues';
-// Anchor for /help#climb-counts, linked from docs/kilter-sync.md.
+// Anchor for /help#climb-counts, linked from docs/data/kilter-sync.md.
 const CLIMB_COUNTS_SECTION_ID = 'climb-counts';
 
 const CTA_SX = brandCtaSx();
+const OUTLINED_CTA_SX = brandCtaOutlinedSx();
 
-/** One card per guide page. Card copy lives under `help.guides.<key>`. */
-const TOPICS = [
-  { key: 'playlists', href: '/help/playlists' },
-  { key: 'climbActions', href: '/help/climb-actions' },
-  { key: 'sessions', href: '/help/sessions' },
-  { key: 'findingClimbs', href: '/help/finding-climbs' },
-  { key: 'logbook', href: '/help/logbook' },
-  { key: 'betaVideos', href: '/help/beta-videos' },
-  { key: 'bluetooth', href: '/help/board-and-bluetooth' },
-] as const;
+/**
+ * One tile per guide. Copy lives under `help.hub.guides.<key>`. Each tile shows
+ * that guide's own screen rising from its bottom edge; `peekY` slides the
+ * capture up inside the window so the useful part shows (the lit board art for
+ * the board guide, the hold rings for Spraywalls). The capture is decorative:
+ * the title is the tile's only accessible name.
+ *
+ * The first two tiles are the most-read guides, so they get the wide slots.
+ */
+const GUIDES: ReadonlyArray<{ key: string; href: string; shot: HelpShot; peekY: string; wide: boolean }> = [
+  { key: 'start', href: '/help/board-and-bluetooth', shot: 'drive-timed', peekY: '-30%', wide: true },
+  { key: 'browse', href: '/help/finding-climbs', shot: 'discover', peekY: '-6%', wide: true },
+  { key: 'crew', href: '/help/sessions', shot: 'live-sessions', peekY: '-6%', wide: false },
+  { key: 'logbook', href: '/help/logbook', shot: 'logbook', peekY: '-6%', wide: false },
+  { key: 'spray', href: '/help/spray-walls', shot: 'spray-editor-select', peekY: '-20%', wide: false },
+];
 
 /**
  * /help, the front door of the help site.
  *
  * Five things a reader should be able to settle in a few seconds: which guide
- * they want (the cards), what this site does vs the app, how to link a Kilter or
+ * they want (the tiles), what this site does vs the app, how to link a Kilter or
  * Tension account, why Kilter's app shows more climbs, and where to ask. The
- * section ids are stable: `climb-counts` is linked from docs/kilter-sync.md.
- *
- * The Aurora linking steps are checked against the mobile app: avatar → user
- * drawer → Settings → the More screen → Connected apps → Board Accounts, where
- * the Tension card says "Link" and the Kilter card says "Sign in to Kilter".
+ * section ids are stable: `climb-counts` is linked from docs/data/kilter-sync.md.
  */
-export default function HelpContent() {
+export default function HelpContent({
+  developerDocsState = 'unavailable',
+}: {
+  developerDocsState?: DeveloperDocsState;
+}) {
   const { t } = useTranslation('marketing');
 
   return (
-    <PageShell title={t('help.hero.title')} lead={t('help.hero.subtitle')} width="wide">
-      <Box className={styles.layout}>
-        <Box component="nav" aria-label={t('help.topics.label')} className={styles.topics}>
-          <MuiLink href="#guides">{t('help.topics.guides')}</MuiLink>
-          <MuiLink href="#using-boardsesh">{t('help.topics.using')}</MuiLink>
-          <MuiLink href="#bring-your-logbook">{t('help.topics.logbook')}</MuiLink>
-          <MuiLink href="#climb-counts">{t('help.topics.counts')}</MuiLink>
-          <MuiLink href="#get-help">{t('help.topics.ask')}</MuiLink>
-        </Box>
-        <Box className={styles.content}>
-          <PageSection id="guides" title={t('help.guides.title')} lead={t('help.guides.intro')}>
-            <Box component="ul" className={styles.cards}>
-              {TOPICS.map((topic) => (
-                <PageCard component="li" key={topic.key} padding="lg" radius="xl" className={styles.card}>
-                  <Typography component="h3" className={styles.cardTitle}>
-                    <MuiLink component={LocaleLink} href={topic.href} underline="hover">
-                      {t(`help.guides.${topic.key}.title`)}
+    <HelpPageShell
+      title={t('help.hub.hero.title')}
+      lead={t('help.hub.hero.subtitle')}
+      jumpLabel={t('help.nav.jump')}
+      jumpLinks={[
+        { id: 'guides', label: t('help.hub.topics.guides') },
+        { id: 'get-the-app', label: t('help.hub.topics.app') },
+        { id: 'bring-your-logbook', label: t('help.hub.topics.logbook') },
+        { id: CLIMB_COUNTS_SECTION_ID, label: t('help.hub.topics.counts') },
+        { id: 'get-help', label: t('help.hub.topics.ask') },
+      ]}
+    >
+      <HelpBand id="guides" wide title={t('help.hub.guides.title')} lead={t('help.hub.guides.lead')}>
+        {/* The title's link stretches over the tile with ::after, so each tile
+            is one link named by its title alone. */}
+        <Box component="ul" className={styles.tiles}>
+          {GUIDES.map(({ key, href, shot, peekY, wide }) => {
+            const capture = helpScreenshot(shot);
+            return (
+              <Box component="li" key={key} className={wide ? `${styles.tile} ${styles.tileWide}` : styles.tile}>
+                <Box className={styles.tileText}>
+                  <Typography component="h3" className={styles.tileTitle}>
+                    <MuiLink
+                      component={LocaleLink}
+                      href={href}
+                      underline="none"
+                      onClick={() => {
+                        if (key === 'spray') trackWebsiteJourneyEvent(spraywallPathClicked('help'));
+                      }}
+                      className={styles.tileLink}
+                    >
+                      {t(`help.hub.guides.${key}.title`)}
                     </MuiLink>
                   </Typography>
-                  <Typography component="p" className={styles.cardBody}>
-                    {t(`help.guides.${topic.key}.body`)}
+                  <Typography component="p" className={styles.tileBody}>
+                    {t(`help.hub.guides.${key}.body`)}
                   </Typography>
-                </PageCard>
-              ))}
-            </Box>
-          </PageSection>
-
-          <Box id="using-boardsesh" className={styles.using}>
-            <PageSection title={t('help.web.title')} lead={t('help.web.intro')}>
-              <ProseList>
-                <li>{t('help.web.item1')}</li>
-                <li>{t('help.web.item2')}</li>
-                <li>{t('help.web.item3')}</li>
-                <li>{t('help.web.item4')}</li>
-              </ProseList>
-              <Prose>
-                <MuiLink component={LocaleLink} href="/playlists">
-                  {t('help.web.playlistsLink')}
-                </MuiLink>
-                {' · '}
-                <MuiLink component={LocaleLink} href="/about">
-                  {t('help.web.aboutLink')}
-                </MuiLink>
-              </Prose>
-            </PageSection>
-
-            <PageSection title={t('help.app.title')} lead={t('help.app.intro')}>
-              <ProseList>
-                <li>{t('help.app.item1')}</li>
-                <li>{t('help.app.item2')}</li>
-                <li>{t('help.app.item3')}</li>
-                <li>{t('help.app.item4')}</li>
-              </ProseList>
-              {/* Store links, not the web app: Bluetooth only works from the native app. */}
-              <Box sx={{ mt: 2 }}>
-                <MarketingInstallLinks />
+                  <Box component="span" aria-hidden="true" className={styles.tileGo}>
+                    {t('help.hub.guides.read')}
+                  </Box>
+                </Box>
+                <Box className={styles.peek} sx={{ '--peek-y': peekY }}>
+                  <Image
+                    src={resolveStaticAssetUrl(capture.src)}
+                    alt=""
+                    width={capture.width}
+                    height={capture.height}
+                    sizes="250px"
+                    className={styles.peekImage}
+                  />
+                </Box>
               </Box>
-            </PageSection>
-          </Box>
-          <PageSection id="bring-your-logbook" title={t('help.aurora.title')} lead={t('help.aurora.intro')}>
-            <ProseList>
-              <li>{t('help.aurora.item1')}</li>
-              <li>{t('help.aurora.item2')}</li>
-              {/* Sync direction. The app's "pending sync" label gets read as a push
-                  back to Kilter; there is none (kilter-sync push-back is stubbed). */}
-              <li>{t('help.aurora.item3')}</li>
-            </ProseList>
-            <Prose>
-              <MuiLink component={LocaleLink} href="/aurora-migration">
-                {t('help.aurora.link')}
-              </MuiLink>
-            </Prose>
-          </PageSection>
-
-          <PageSection
-            id={CLIMB_COUNTS_SECTION_ID}
-            title={t('help.climbCounts.title')}
-            lead={t('help.climbCounts.intro')}
-          >
-            <ProseList>
-              <li>{t('help.climbCounts.item1')}</li>
-              <li>{t('help.climbCounts.item2')}</li>
-              <li>{t('help.climbCounts.item3')}</li>
-            </ProseList>
-          </PageSection>
-
-          {/* Discord is the primary CTA; GitHub and the API docs are secondary links. */}
-          <PageSection id="get-help" title={t('help.ask.title')} lead={t('help.ask.intro')}>
-            <Box sx={{ mt: 1 }}>
-              <Button
-                variant="contained"
-                sx={CTA_SX}
-                href={DISCORD_INVITE_URL}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                {t('help.ask.discord')}
-              </Button>
-            </Box>
-            <Prose>
-              {t('help.ask.bugLead')}{' '}
-              <MuiLink href={GITHUB_ISSUES_URL} target="_blank" rel="noopener noreferrer">
-                {t('help.ask.github')}
-              </MuiLink>
-            </Prose>
-            <Prose>
-              {t('help.ask.devLead')}{' '}
-              <MuiLink component={LocaleLink} href="/docs">
-                {t('help.ask.docs')}
-              </MuiLink>
-            </Prose>
-          </PageSection>
+            );
+          })}
         </Box>
-      </Box>
-    </PageShell>
+      </HelpBand>
+
+      <HelpInstallSection media={<HelpScreenshot shot="climb-actions" alt="" cropped />} />
+
+      <HelpBand
+        id="bring-your-logbook"
+        flip
+        title={t('help.hub.bring.title')}
+        lead={t('help.hub.bring.lead')}
+        media={<HelpScreenshot shot="logbook" alt="" cropped />}
+      >
+        <Button variant="outlined" component={LocaleLink} href="/help/logbook#bring-your-logbook" sx={OUTLINED_CTA_SX}>
+          {t('help.hub.bring.link')}
+        </Button>
+      </HelpBand>
+
+      <HelpBand id={CLIMB_COUNTS_SECTION_ID} wide title={t('help.hub.counts.title')} lead={t('help.hub.counts.lead')}>
+        <Box className={styles.counts}>
+          <Box className={styles.count}>
+            <Typography component="p" className={styles.countNumber}>
+              {t('help.hub.counts.boardseshCount')}
+            </Typography>
+            <Typography component="p" className={styles.countLabel}>
+              {t('help.hub.counts.boardseshLabel')}
+            </Typography>
+          </Box>
+          <Box className={styles.count}>
+            <Typography component="p" className={`${styles.countNumber} ${styles.countNumberMuted}`}>
+              {t('help.hub.counts.kilterCount')}
+            </Typography>
+            <Typography component="p" className={styles.countLabel}>
+              {t('help.hub.counts.kilterLabel')}
+            </Typography>
+          </Box>
+        </Box>
+      </HelpBand>
+
+      {/* Discord is the primary CTA; GitHub and the API docs are secondary links. */}
+      <HelpBand id="get-help" wide title={t('help.hub.ask.title')} lead={t('help.hub.ask.lead')}>
+        <Box component="ul" className={styles.askCards}>
+          <Box component="li" className={styles.askCard}>
+            <Typography component="h3" className={styles.askTitle}>
+              {t('help.hub.ask.discordTitle')}
+            </Typography>
+            <Typography component="p" className={styles.askBody}>
+              {t('help.hub.ask.discordBody')}
+            </Typography>
+            <Button variant="contained" sx={CTA_SX} href={DISCORD_INVITE_URL} target="_blank" rel="noopener noreferrer">
+              {t('help.hub.ask.discord')}
+            </Button>
+          </Box>
+          <Box component="li" className={styles.askCard}>
+            <Typography component="h3" className={styles.askTitle}>
+              {t('help.hub.ask.bugLead')}
+            </Typography>
+            <Typography component="p" className={styles.askBody}>
+              {t('help.hub.ask.bugBody')}
+            </Typography>
+            <MuiLink href={GITHUB_ISSUES_URL} target="_blank" rel="noopener noreferrer" className={styles.askLink}>
+              {t('help.hub.ask.github')}
+            </MuiLink>
+          </Box>
+          <Box component="li" className={styles.askCard}>
+            <Typography component="h3" className={styles.askTitle}>
+              {t('help.hub.ask.devLead')}
+            </Typography>
+            <Typography component="p" className={styles.askBody}>
+              {t('help.hub.ask.devBody')}
+            </Typography>
+            {developerDocsState === 'unavailable' ? (
+              <MuiLink href="mailto:support@boardsesh.com" className={styles.askLink}>
+                {t('help.hub.ask.contact')}
+              </MuiLink>
+            ) : (
+              <MuiLink component={LocaleLink} href="/developers" className={styles.askLink}>
+                {t('help.hub.ask.docs')}
+              </MuiLink>
+            )}
+          </Box>
+        </Box>
+      </HelpBand>
+    </HelpPageShell>
   );
 }

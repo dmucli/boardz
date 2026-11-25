@@ -6,16 +6,29 @@
 // screen, so a climber's own created climbs never appeared here even though
 // they showed up fine when viewing someone else's profile. This test fails
 // on a revert of that wiring.
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
-import { createElement, type ReactNode } from 'react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, fireEvent, act } from '@testing-library/react';
+import { createElement, useSyncExternalStore, type ReactNode } from 'react';
+
+import type { ScrollEdgeBackdrop } from '../../../../src/hooks/use-scroll-edge-backdrop';
 
 const ctrl = vi.hoisted(() => ({
   profileId: 'user-own-123' as string | undefined,
+  tab: undefined as string | string[] | undefined,
+  paramListeners: new Set<() => void>(),
+  measureProfile: undefined as ((height: number) => void) | undefined,
+  measureLogbook: undefined as ((height: number) => void) | undefined,
+  logbookHeightChange: vi.fn(),
+  filterSheetAvailable: true,
+  snapToIndex: vi.fn(),
+  // The scroll-edge store the mounted top chrome was handed, and the one each
+  // mounted sub-tab's list was handed.
+  chromeScrollEdge: undefined as ScrollEdgeBackdrop | undefined,
+  listScrollEdge: {} as Record<string, ScrollEdgeBackdrop | undefined>,
 }));
 
 const rendered = vi.hoisted(() => ({
-  progress: [] as Array<{ userId: string | undefined }>,
+  progress: [] as Array<{ userId: string | undefined; topInset: number }>,
   sessions: [] as Array<{ userId: string | undefined }>,
   logbook: [] as Array<{ userId: string | undefined }>,
   climbs: [] as Array<{ userId: string | undefined }>,
@@ -23,6 +36,7 @@ const rendered = vi.hoisted(() => ({
 }));
 
 vi.mock('react-native', () => ({
+  Platform: { OS: 'ios' },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles },
 }));
@@ -30,7 +44,23 @@ vi.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
 }));
 vi.mock('expo-router', () => ({
-  useLocalSearchParams: () => ({ screenshotTab: undefined }),
+  router: {
+    setParams: ({ tab }: { tab: string }) => {
+      ctrl.tab = tab;
+      for (const listener of ctrl.paramListeners) listener();
+    },
+  },
+  useLocalSearchParams: () => ({
+    tab: useSyncExternalStore(
+      (listener) => {
+        ctrl.paramListeners.add(listener);
+        return () => {
+          ctrl.paramListeners.delete(listener);
+        };
+      },
+      () => ctrl.tab,
+    ),
+  }),
 }));
 vi.mock('../../../../src/lib/graphql/hooks', () => ({
   useProfile: () => ({ data: ctrl.profileId ? { id: ctrl.profileId } : undefined }),
@@ -49,44 +79,93 @@ vi.mock('../../../../src/providers/theme-provider', () => ({
 // drive tab selection the same way a real tap would, without pulling in the
 // real chrome's native segmented control / app bar machinery.
 vi.mock('../../../../src/components/you/ProfileTopChrome', () => ({
-  ProfileTopChrome: ({ activeTab, onSelectTab }: { activeTab: string; onSelectTab: (key: string) => void }) =>
-    createElement(
+  ProfileTopChrome: ({
+    activeTab,
+    onSelectTab,
+    onHeightChange,
+    children,
+    opaqueControls,
+    scrollEdge,
+  }: {
+    activeTab: string;
+    onSelectTab: (key: string) => void;
+    onHeightChange: (height: number) => void;
+    children?: ReactNode;
+    opaqueControls?: boolean;
+    scrollEdge?: ScrollEdgeBackdrop;
+  }) => {
+    ctrl.chromeScrollEdge = scrollEdge;
+    if (activeTab === 'logbook') ctrl.measureLogbook = onHeightChange;
+    else ctrl.measureProfile = onHeightChange;
+    return createElement(
       'div',
-      { 'data-chrome': 'true', 'data-active-tab': activeTab },
+      { 'data-chrome': 'true', 'data-active-tab': activeTab, 'data-opaque-controls': String(opaqueControls === true) },
       ['progress', 'sessions', 'logbook', 'climbs', 'social'].map((key) =>
         createElement('button', { key, 'data-select-tab': key, onClick: () => onSelectTab(key) }, key),
       ),
-    ),
+      children,
+    );
+  },
 }));
 vi.mock('../../../../src/components/you/YouFilterSheet', () => ({
-  YouFilterSheet: () => createElement('div', { 'data-filter-sheet': 'true' }),
+  YouFilterSheet: ({ sheetRef }: { sheetRef: { current: { snapToIndex: (index: number) => void } | null } }) => {
+    sheetRef.current = ctrl.filterSheetAvailable ? { snapToIndex: ctrl.snapToIndex } : null;
+    return createElement('div', { 'data-filter-sheet': 'true' });
+  },
 }));
 vi.mock('../../../../src/components/you/ProgressTab', () => ({
-  ProgressTab: ({ userId }: { userId: string | undefined }) => {
-    rendered.progress.push({ userId });
-    return createElement('div', { 'data-tab': 'progress' });
+  ProgressTab: ({
+    userId,
+    topInset,
+    scrollEdge,
+    onOpenFilters,
+  }: {
+    userId: string | undefined;
+    topInset: number;
+    scrollEdge?: ScrollEdgeBackdrop;
+    onOpenFilters: () => void;
+  }) => {
+    ctrl.listScrollEdge.progress = scrollEdge;
+    rendered.progress.push({ userId, topInset });
+    return createElement('button', { 'data-tab': 'progress', onClick: onOpenFilters });
   },
 }));
 vi.mock('../../../../src/components/you/SessionsTab', () => ({
-  SessionsTab: ({ userId }: { userId: string | undefined }) => {
+  SessionsTab: ({ userId, scrollEdge }: { userId: string | undefined; scrollEdge?: ScrollEdgeBackdrop }) => {
+    ctrl.listScrollEdge.sessions = scrollEdge;
     rendered.sessions.push({ userId });
     return createElement('div', { 'data-tab': 'sessions' });
   },
 }));
 vi.mock('../../../../src/components/you/LogbookTab', () => ({
-  LogbookTab: ({ userId }: { userId: string | undefined }) => {
+  LogbookTab: ({
+    userId,
+    renderHeader,
+    scrollEdge,
+  }: {
+    userId: string | undefined;
+    renderHeader?: (controls: ReactNode, onHeightChange: (height: number) => void) => ReactNode;
+    scrollEdge?: ScrollEdgeBackdrop;
+  }) => {
+    ctrl.listScrollEdge.logbook = scrollEdge;
     rendered.logbook.push({ userId });
-    return createElement('div', { 'data-tab': 'logbook' });
+    return createElement(
+      'div',
+      { 'data-tab': 'logbook' },
+      renderHeader?.(createElement('div', { 'data-logbook-controls': 'true' }), ctrl.logbookHeightChange),
+    );
   },
 }));
 vi.mock('../../../../src/components/you/ProfileClimbsTab', () => ({
-  ProfileClimbsTab: ({ userId }: { userId: string | undefined }) => {
+  ProfileClimbsTab: ({ userId, scrollEdge }: { userId: string | undefined; scrollEdge?: ScrollEdgeBackdrop }) => {
+    ctrl.listScrollEdge.climbs = scrollEdge;
     rendered.climbs.push({ userId });
     return createElement('div', { 'data-tab': 'climbs' });
   },
 }));
 vi.mock('../../../../src/components/you/SocialTab', () => ({
-  SocialTab: ({ userId }: { userId: string | undefined }) => {
+  SocialTab: ({ userId, scrollEdge }: { userId: string | undefined; scrollEdge?: ScrollEdgeBackdrop }) => {
+    ctrl.listScrollEdge.social = scrollEdge;
     rendered.social.push({ userId });
     return createElement('div', { 'data-tab': 'social' });
   },
@@ -97,11 +176,65 @@ import YouScreen from '../index';
 describe('YouScreen (own profile)', () => {
   beforeEach(() => {
     ctrl.profileId = 'user-own-123';
+    ctrl.tab = undefined;
+    ctrl.measureProfile = undefined;
+    ctrl.measureLogbook = undefined;
+    ctrl.logbookHeightChange.mockClear();
+    ctrl.filterSheetAvailable = true;
+    ctrl.snapToIndex.mockClear();
+    ctrl.chromeScrollEdge = undefined;
+    ctrl.listScrollEdge = {};
     rendered.progress = [];
     rendered.sessions = [];
     rendered.logbook = [];
     rendered.climbs = [];
     rendered.social = [];
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  });
+
+  it('opens filters without telemetry outside screenshot mode', () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '0');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const { container } = render(<YouScreen />);
+    fireEvent.click(container.querySelector('[data-tab="progress"]')!);
+    expect(ctrl.snapToIndex).toHaveBeenCalledExactlyOnceWith(0);
+    expect(log).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('opens filters when available without capture telemetry (ref=%s)', (available) => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    ctrl.filterSheetAvailable = available;
+    const { container } = render(<YouScreen />);
+    fireEvent.click(container.querySelector('[data-tab="progress"]')!);
+    expect(log).not.toHaveBeenCalled();
+    expect(ctrl.snapToIndex).toHaveBeenCalledTimes(available ? 1 : 0);
+    if (available) expect(ctrl.snapToIndex).toHaveBeenCalledWith(0);
+  });
+
+  it('opens the shortcut directly on created climbs, including after another subtab', () => {
+    ctrl.tab = 'climbs';
+    const { container } = render(<YouScreen />);
+    expect(container.querySelector('[data-tab="climbs"]')).not.toBeNull();
+    expect(container.querySelector('[data-tab="progress"]')).toBeNull();
+    fireEvent.click(container.querySelector('[data-select-tab="logbook"]')!);
+    expect(ctrl.tab).toBe('logbook');
+    act(() => {
+      ctrl.tab = 'climbs';
+      for (const listener of ctrl.paramListeners) listener();
+    });
+    expect(container.querySelector('[data-tab="climbs"]')).not.toBeNull();
+    expect(rendered.climbs.at(-1)?.userId).toBe('user-own-123');
+  });
+
+  it.each(['unknown', ['climbs']])('defaults unsupported tab parameters to progress: %s', (tab) => {
+    ctrl.tab = tab;
+    const { container } = render(<YouScreen />);
+    expect(container.querySelector('[data-tab="progress"]')).not.toBeNull();
   });
 
   it('offers a Climbs tab alongside progress/sessions/logbook/social', () => {
@@ -122,5 +255,102 @@ describe('YouScreen (own profile)', () => {
 
     expect(container.querySelector('[data-tab="climbs"]')).not.toBeNull();
     expect(rendered.climbs).toEqual([{ userId: 'user-own-123' }]);
+  });
+
+  it('composes one Logbook chrome and preserves the profile inset when switching back', () => {
+    const { container } = render(<YouScreen />);
+    act(() => ctrl.measureProfile?.(72));
+    expect(rendered.progress.at(-1)?.topInset).toBe(72);
+
+    fireEvent.click(container.querySelector('[data-select-tab="logbook"]')!);
+    expect(container.querySelectorAll('[data-chrome]')).toHaveLength(1);
+    const logbookChrome = container.querySelector('[data-chrome][data-active-tab="logbook"]')!;
+    expect(logbookChrome.querySelector('[data-logbook-controls]')).not.toBeNull();
+
+    act(() => ctrl.measureLogbook?.(240));
+    expect(ctrl.logbookHeightChange).toHaveBeenLastCalledWith(240);
+    fireEvent.click(logbookChrome.querySelector('[data-select-tab="progress"]')!);
+
+    expect(container.querySelectorAll('[data-chrome]')).toHaveLength(1);
+    expect(container.querySelector('[data-logbook-controls]')).toBeNull();
+    expect(container.querySelector('[data-tab="logbook"]')).toBeNull();
+    expect(rendered.progress.at(-1)?.topInset).toBe(72);
+  });
+
+  it('lets every sub-tab header float, including Logbook filters', () => {
+    const { container } = render(<YouScreen />);
+    const opaqueControls = () => container.querySelector('[data-chrome]')?.getAttribute('data-opaque-controls');
+
+    for (const floatingTab of ['progress', 'sessions', 'logbook', 'climbs', 'social']) {
+      fireEvent.click(container.querySelector(`[data-select-tab="${floatingTab}"]`)!);
+      expect(opaqueControls()).toBe('false');
+    }
+  });
+
+  // The blur behind the floating segmented control shows only while the visible
+  // sub-tab's list is scrolled under it. The lists write that to a store the
+  // screen holds, and the blur (inside the top chrome) reads it.
+  describe('the scroll-edge store', () => {
+    const SUB_TABS_WITH_FLOATING_HEADER = ['progress', 'sessions', 'logbook', 'climbs', 'social'];
+    const selectTab = (container: HTMLElement, tab: string) =>
+      fireEvent.click(container.querySelector(`[data-select-tab="${tab}"]`)!);
+    const scrollEvent = (offsetY: number) =>
+      ({ nativeEvent: { contentOffset: { x: 0, y: offsetY } } }) as Parameters<
+        ScrollEdgeBackdrop['listProps']['onScroll']
+      >[0];
+
+    it('hands the floating chrome one store for the life of the screen', () => {
+      const { container } = render(<YouScreen />);
+      const store = ctrl.chromeScrollEdge;
+      expect(store).toBeDefined();
+
+      for (const tab of SUB_TABS_WITH_FLOATING_HEADER) {
+        selectTab(container, tab);
+        expect(ctrl.chromeScrollEdge).toBe(store);
+      }
+    });
+
+    // Material, Android, the web, iOS before 26, Reduce Transparency: the header
+    // is opaque, no blur mounts, and the lists carry no scroll listeners.
+    it('gives the lists nothing until a blur is mounted to hear them', () => {
+      const { container } = render(<YouScreen />);
+
+      for (const tab of SUB_TABS_WITH_FLOATING_HEADER) {
+        selectTab(container, tab);
+        expect(tab in ctrl.listScrollEdge).toBe(true);
+        expect(ctrl.listScrollEdge[tab]).toBeUndefined();
+      }
+    });
+
+    it.each(SUB_TABS_WITH_FLOATING_HEADER)('wires the %s list to the store once a blur is listening', (tab) => {
+      const { container } = render(<YouScreen />);
+      act(() => {
+        ctrl.chromeScrollEdge?.attachBackdrop();
+      });
+
+      selectTab(container, tab);
+
+      expect(ctrl.listScrollEdge[tab]).toBe(ctrl.chromeScrollEdge);
+    });
+
+    // The screen holds the sub-tab and its list. Re-rendering it for each frame
+    // of a scroll, or for each height a collapsing title reports, re-renders
+    // every row with it.
+    it('does not re-render the screen for a scroll, a flip, or the bar changing height', () => {
+      render(<YouScreen />);
+      const store = ctrl.chromeScrollEdge!;
+      act(() => {
+        store.attachBackdrop();
+      });
+      const rendersWired = rendered.progress.length;
+
+      act(() => {
+        for (const topOffset of [-158, -146, -120, -106]) store.setTopOffset(topOffset);
+        for (const offsetY of [-106, 40, 600, -106, 900]) store.listProps.onScroll(scrollEvent(offsetY));
+      });
+
+      expect(store.isScrolledUnder()).toBe(true);
+      expect(rendered.progress).toHaveLength(rendersWired);
+    });
   });
 });

@@ -1,10 +1,16 @@
 // @vitest-environment jsdom
 import { act, renderHook } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_LOGBOOK_FILTERS, DEFAULT_LOGBOOK_SORT, type LogbookFilterState } from '@boardsesh/logbook';
+import {
+  DEFAULT_LOGBOOK_FILTERS,
+  DEFAULT_LOGBOOK_SORT,
+  filtersForStatusSegment,
+  logbookSortFor,
+  type LogbookFilterState,
+} from '@boardsesh/logbook';
 
 // Hydration + persistence go through the prefs store; mock it so the reducer's
-// hydrate/save behaviour (including the apply-before-hydrate race) is unit-testable.
+// hydrate/save behaviour (including the change-before-hydrate race) is unit-testable.
 vi.mock('../../../lib/logbook-prefs-store', () => ({
   loadLogbookPrefs: vi.fn(() => Promise.resolve(null)),
   saveLogbookPrefs: vi.fn(() => Promise.resolve()),
@@ -35,12 +41,15 @@ describe('countActiveLogbookFilters', () => {
     expect(countActiveLogbookFilters(withFilters({ includeSends: false }))).toBe(1);
   });
 
-  it('counts flash-only as one (the flash+no-sends edge still counts via status)', () => {
+  it('counts Flashes as ONE status, however it is stored', () => {
+    // The segment's own shape: sends only + flash only.
+    expect(countActiveLogbookFilters(withFilters({ includeAttempts: false, flashOnly: true }))).toBe(1);
+    // An older stored "both + flash only" also reads as Flashes.
     expect(countActiveLogbookFilters(withFilters({ flashOnly: true }))).toBe(1);
-    // Sends excluded + flashOnly: status off the default (1) + flash (1).
+    // A stray flashOnly under attempts-only is just Attempts.
     expect(
       countActiveLogbookFilters(withFilters({ includeSends: false, includeAttempts: true, flashOnly: true })),
-    ).toBe(2);
+    ).toBe(1);
   });
 
   it('counts a grade bound (min and/or max) as one', () => {
@@ -48,8 +57,28 @@ describe('countActiveLogbookFilters', () => {
     expect(countActiveLogbookFilters(withFilters({ minGrade: 12, maxGrade: 20 }))).toBe(1);
   });
 
-  it('counts a date bound as one', () => {
-    expect(countActiveLogbookFilters(withFilters({ fromDate: '2026-01-01' }))).toBe(1);
+  it('counts a date window as one', () => {
+    expect(countActiveLogbookFilters(withFilters({ dateWindow: 'month' }))).toBe(1);
+    expect(countActiveLogbookFilters(withFilters({ dateWindow: 'last7' }))).toBe(1);
+    expect(
+      countActiveLogbookFilters(withFilters({ dateWindow: 'custom', fromDate: '2026-01-01', toDate: '2026-02-01' })),
+    ).toBe(1);
+  });
+
+  it('does not count Any time, or a Custom window with no date picked', () => {
+    // A leftover range under Any time narrows nothing.
+    expect(countActiveLogbookFilters(withFilters({ dateWindow: 'any', fromDate: '2026-01-01' }))).toBe(0);
+    expect(countActiveLogbookFilters(withFilters({ dateWindow: 'custom' }))).toBe(0);
+  });
+
+  it('counts a board as one, with or without layouts', () => {
+    expect(countActiveLogbookFilters(withFilters({ boardType: 'kilter' }))).toBe(1);
+    expect(countActiveLogbookFilters(withFilters({ boardType: 'kilter', layoutIds: [1, 8] }))).toBe(1);
+  });
+
+  it('counts stars and setters as one each', () => {
+    expect(countActiveLogbookFilters(withFilters({ minQuality: 3 }))).toBe(1);
+    expect(countActiveLogbookFilters(withFilters({ setterUsernames: ['jwebb', 'alex'] }))).toBe(1);
   });
 
   it('counts the angle range as ONE even when both bounds are narrowed', () => {
@@ -62,12 +91,27 @@ describe('countActiveLogbookFilters', () => {
   });
 
   it('sums independent active filters', () => {
-    // status (sends-only) + flash + grade + angle = 4
+    // status (Flashes) + grade + angle = 3
     expect(
       countActiveLogbookFilters(
         withFilters({ includeAttempts: false, flashOnly: true, minGrade: 12, angleRange: [20, 50] }),
       ),
-    ).toBe(4);
+    ).toBe(3);
+    // Every dimension at once = 8.
+    expect(
+      countActiveLogbookFilters(
+        withFilters({
+          includeSends: false,
+          minGrade: 12,
+          angleRange: [20, 50],
+          dateWindow: 'year',
+          boardType: 'tension',
+          minQuality: 4,
+          setterUsernames: ['alex'],
+          benchmarkOnly: true,
+        }),
+      ),
+    ).toBe(8);
   });
 });
 
@@ -104,7 +148,7 @@ describe('useLogbookSearch', () => {
     vi.mocked(saveLogbookPrefs).mockClear();
 
     await act(async () => {
-      result.current.setPreset('hardest');
+      result.current.setSort(logbookSortFor('grade', 'desc'));
     });
 
     expect(saveLogbookPrefs).toHaveBeenCalledWith(
@@ -118,7 +162,7 @@ describe('useLogbookSearch', () => {
     // A name + a preset are in place before the partial filter patch.
     await act(async () => {
       result.current.setName('crimps');
-      result.current.setPreset('hardest');
+      result.current.setSort(logbookSortFor('grade', 'desc'));
     });
     vi.mocked(saveLogbookPrefs).mockClear();
 
@@ -135,10 +179,59 @@ describe('useLogbookSearch', () => {
     expect(result.current.sort.mode).toBe('preset');
     expect(result.current.sort.preset).toBe('hardest');
     expect(result.current.name).toBe('crimps');
-    // The patch persisted (same path as apply).
+    // The patch persisted.
     expect(saveLogbookPrefs).toHaveBeenCalledWith(
       expect.objectContaining({ filters: expect.objectContaining({ minGrade: 12, maxGrade: 20 }) }),
     );
+  });
+
+  it('setSort commits a Sort by + Order choice and persists it, leaving filters and name alone', async () => {
+    const { result } = renderHook(() => useLogbookSearch());
+    await flushHydration();
+    await act(async () => {
+      result.current.setName('crimps');
+      result.current.setFilters({ minGrade: 12 });
+    });
+    vi.mocked(saveLogbookPrefs).mockClear();
+
+    const nameAsc = logbookSortFor('climbName', 'asc');
+    await act(async () => {
+      result.current.setSort(nameAsc);
+    });
+
+    expect(result.current.sort).toEqual(nameAsc);
+    expect(result.current.filters.minGrade).toBe(12);
+    expect(result.current.name).toBe('crimps');
+    expect(saveLogbookPrefs).toHaveBeenCalledWith(expect.objectContaining({ sort: nameAsc }));
+  });
+
+  it('setFilters carries the new dimensions (status segment, window, board, stars, setters)', async () => {
+    const { result } = renderHook(() => useLogbookSearch());
+    await flushHydration();
+
+    await act(async () => {
+      result.current.setFilters({
+        ...filtersForStatusSegment('flashes'),
+        dateWindow: 'last3months',
+        boardType: 'kilter',
+        layoutIds: [1],
+        minQuality: 4,
+        setterUsernames: ['jwebb'],
+      });
+    });
+
+    expect(result.current.filters).toEqual({
+      ...DEFAULT_LOGBOOK_FILTERS,
+      includeSends: true,
+      includeAttempts: false,
+      flashOnly: true,
+      dateWindow: 'last3months',
+      boardType: 'kilter',
+      layoutIds: [1],
+      minQuality: 4,
+      setterUsernames: ['jwebb'],
+    });
+    expect(countActiveLogbookFilters(result.current.filters)).toBe(5);
   });
 
   it('keeps a change applied before hydration resolves (no clobber)', async () => {
@@ -152,10 +245,7 @@ describe('useLogbookSearch', () => {
 
     // User applies attempts-only before persisted prefs finish loading.
     await act(async () => {
-      result.current.apply(
-        { ...DEFAULT_LOGBOOK_FILTERS, includeSends: false, includeAttempts: true },
-        DEFAULT_LOGBOOK_SORT,
-      );
+      result.current.setFilters({ includeSends: false, includeAttempts: true });
     });
     expect(result.current.hydrated).toBe(false);
 
@@ -211,5 +301,61 @@ describe('useLogbookSearch', () => {
 
     expect(result.current.filters).toEqual(DEFAULT_LOGBOOK_FILTERS);
     expect(result.current.hydrated).toBe(true);
+  });
+});
+
+describe("useLogbookSearch on someone else's logbook (persist: false)", () => {
+  beforeEach(() => {
+    vi.mocked(loadLogbookPrefs)
+      .mockReset()
+      .mockResolvedValue({
+        filters: { ...DEFAULT_LOGBOOK_FILTERS, benchmarkOnly: true },
+        sort: DEFAULT_LOGBOOK_SORT,
+      });
+    vi.mocked(saveLogbookPrefs).mockReset().mockResolvedValue(undefined);
+  });
+
+  it('opens at once on defaults, never reads your saved filters, and never writes its own', async () => {
+    const { result } = renderHook(() => useLogbookSearch({ persist: false }));
+    expect(result.current.hydrated).toBe(true);
+    await flushHydration();
+    expect(loadLogbookPrefs).not.toHaveBeenCalled();
+    expect(result.current.filters).toEqual(DEFAULT_LOGBOOK_FILTERS);
+
+    await act(async () => {
+      result.current.setFilters({ boardType: 'kilter', setterUsernames: ['alex'] });
+      result.current.setSort(logbookSortFor('grade', 'desc'));
+    });
+    await act(async () => {
+      result.current.reset();
+    });
+    expect(saveLogbookPrefs).not.toHaveBeenCalled();
+  });
+
+  it('reads persistence once at mount, so a later flip cannot save defaults over your prefs', async () => {
+    const { result, rerender } = renderHook(({ persist }) => useLogbookSearch({ persist }), {
+      initialProps: { persist: false },
+    });
+    await act(async () => {
+      result.current.setFilters({ minQuality: 3 });
+    });
+    rerender({ persist: true });
+    await flushHydration();
+    expect(loadLogbookPrefs).not.toHaveBeenCalled();
+    expect(saveLogbookPrefs).not.toHaveBeenCalled();
+  });
+
+  it('still hydrates and saves your own logbook', async () => {
+    const { result } = renderHook(() => useLogbookSearch({ persist: true }));
+    expect(result.current.hydrated).toBe(false);
+    await flushHydration();
+    expect(result.current.filters.benchmarkOnly).toBe(true);
+    vi.mocked(saveLogbookPrefs).mockClear();
+    await act(async () => {
+      result.current.setFilters({ minQuality: 3 });
+    });
+    expect(saveLogbookPrefs).toHaveBeenCalledWith(
+      expect.objectContaining({ filters: expect.objectContaining({ minQuality: 3, benchmarkOnly: true }) }),
+    );
   });
 });

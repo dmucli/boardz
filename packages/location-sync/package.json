@@ -20,6 +20,7 @@
     "lint-fix": "vp lint --fix"
   },
   "dependencies": {
+    "@boardsesh/auth-protocol": "workspace:*",
     "@boardsesh/board-config": "workspace:*",
     "@boardsesh/board-constants": "workspace:*",
     "@boardsesh/db": "workspace:*",
@@ -29,6 +30,6 @@
   "devDependencies": {
     "@types/node": "^25.9.5",
     "typescript": "~7.0.2",
-    "vitest": "^4.1.10"
+    "vitest": "5.1.0"
   }
 }

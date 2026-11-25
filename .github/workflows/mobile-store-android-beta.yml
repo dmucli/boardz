@@ -1,0 +1,60 @@
+name: Android Open Beta Promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'Exact published internal versionCode to promote to open beta'
+        required: true
+        type: string
+      apply:
+        description: 'Submit beta for review; otherwise inspect the plan only'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# Serialize with native uploads across both release branches.
+concurrency:
+  group: android-apk-rn
+  cancel-in-progress: false
+  # Queue behind native tester builds instead of being replaced by the next
+  # one; android-apk-rn.yml explains why the shared group queues.
+  queue: max
+
+jobs:
+  promote:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: Production
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: false
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Test beta promotion guards
+        run: vp test run scripts/__tests__/mobile-store-android-beta.test.ts --reporter=agent
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          working-directory: fastlane
+      - name: Install fastlane gems
+        working-directory: fastlane
+        run: |
+          bundle config set --local path "$PWD/vendor/bundle"
+          bundle config set --local deployment true
+          bundle install --jobs 4
+      - name: Plan or submit the exact beta build
+        working-directory: fastlane
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          VERSION_CODE: ${{ inputs.version_code }}
+          APPLY: ${{ inputs.apply }}
+        run: bundle exec fastlane android beta version_code:"$VERSION_CODE" apply:"$APPLY"

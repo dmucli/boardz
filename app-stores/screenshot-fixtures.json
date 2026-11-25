@@ -3,5 +3,11 @@
   "url": "https://pub-ce4091dbd55b4b71b1c59a2461a28360.r2.dev/screenshot-fixtures/03ddb626f41d3627f587f3bff1686e2d0cc098630973d14a730f348dfe546ed1.json.gz",
   "sha256": "03ddb626f41d3627f587f3bff1686e2d0cc098630973d14a730f348dfe546ed1",
   "bytes": 1663568,
-  "files": 346
+  "files": 346,
+  "overlay": {
+    "path": "app-stores/screenshot-fixture-overlays/b7aca45e261b60953b3d3e79159ba9db86e5da102ffc7ae4bbbf0d61417148b4.json.gz",
+    "sha256": "b7aca45e261b60953b3d3e79159ba9db86e5da102ffc7ae4bbbf0d61417148b4",
+    "bytes": 1540051,
+    "files": 371
+  }
 }

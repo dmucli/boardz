@@ -1,7 +1,19 @@
 import { z } from 'zod';
+import { OptionalReleaseContextInputSchema } from './release-context';
 import { MAX_RING_NUMBERS, MIN_RING_NUMBERS, isValidOutlineRing } from '@boardsesh/board-art-geometry/ring';
 import { MAX_HOLDS_PER_WALL, SPRAY_ANGLES } from '@boardsesh/board-config';
-import { isSolvableAnchorQuad } from '@boardsesh/spray-wall-geometry';
+import { BOARD_RENDER_SETTING_BOUNDS, type BoardseshRenderSettings } from '@boardsesh/board-look';
+import {
+  LedControllerError,
+  normalizeLocalControllerUrl,
+  SPRAY_WALL_LED_AUTO_OFF_CHOICES,
+} from '@boardsesh/led-controller';
+import {
+  MAX_TNUT_LAYOUT_BYTES,
+  SPRAY_WALL_BACKGROUNDS,
+  isSolvableAnchorQuad,
+  readTnutLayout,
+} from '@boardsesh/spray-wall-geometry';
 import { UUIDSchema } from './primitives';
 
 /**
@@ -53,12 +65,40 @@ const SprayHoldSourceSchema = z
   .nullish()
   .transform((wireName) => SPRAY_HOLD_SOURCE_BY_WIRE_NAME[wireName ?? 'MANUAL']);
 
+/** GraphQL `SprayHoldAutoReview` → the `spray_hold_auto_review` pgEnum. */
+export const SPRAY_HOLD_AUTO_REVIEW_BY_WIRE_NAME = {
+  ACCEPTED: 'accepted',
+  CONFIRMED: 'confirmed',
+  EDITED: 'edited',
+} as const;
+
+/** The pgEnum value back as its GraphQL name. */
+export const SPRAY_HOLD_AUTO_REVIEW_WIRE_NAME = {
+  accepted: 'ACCEPTED',
+  confirmed: 'CONFIRMED',
+  edited: 'EDITED',
+} as const;
+
+// Omitted (undefined) and an explicit null mean different things: omitted keeps
+// what the hold records, null clears it. Both survive the transform.
+const SprayHoldAutoReviewSchema = z
+  .enum(['ACCEPTED', 'CONFIRMED', 'EDITED'])
+  .nullish()
+  .transform((wireName) => (wireName == null ? wireName : SPRAY_HOLD_AUTO_REVIEW_BY_WIRE_NAME[wireName]));
+
 /** Wire name ↔ stored value for a version's lifecycle, mirroring the pgEnum. */
 export const SPRAY_VERSION_STATUS_WIRE_NAME = {
   draft: 'DRAFT',
   published: 'PUBLISHED',
   superseded: 'SUPERSEDED',
 } as const;
+
+/**
+ * The retired climb-edit policy (#6025). Older apps still send it, so it is
+ * accepted on create and update and then ignored: only a climb's setter edits
+ * it, within 24 hours of first publish (docs/product/spray-walls.md, "Editing a climb").
+ */
+const RetiredSprayClimbEditPolicySchema = z.enum(['SETTER', 'COLLABORATORS']);
 
 /**
  * The four wall corners as tapped in one photo, TL/TR/BR/BL.
@@ -109,23 +149,57 @@ export const CreateSprayWallInputSchema = z.object({
   isPublic: z.boolean().optional(),
   isUnlisted: z.boolean().optional(),
   gymUuid: UUIDSchema.optional().nullable(),
-  locationName: z.string().max(200).optional().nullable(),
+  locationName: z.string().trim().max(200).optional().nullable(),
   latitude: z.number().min(-90).max(90).optional().nullable(),
   longitude: z.number().min(-180).max(180).optional().nullable(),
   hideLocation: z.boolean().optional(),
+  climbEditPolicy: RetiredSprayClimbEditPolicySchema.optional(),
+  // "Help train hold finding" (SW-20, #5471). Off when omitted, because only a
+  // client that showed the owner the switch can say yes: `createSprayWall`
+  // stamps `training_consent_at` for an explicit `true` and stores NULL for
+  // `false` and for a client that never sends the field.
+  trainingConsent: z.boolean().optional(),
   // `hasLeds` is deliberately ABSENT and must stay absent. A spray wall has no
   // firmware to encode for, and BLE suppression today is the per-row
   // `has_leds` data rather than the board type (`scanFamilyForBoard('spray')`
   // still answers 'aurora'), so the column is written false by the resolver and
-  // never taken from a client. See docs/spray-walls.md.
+  // never taken from a client. See docs/product/spray-walls.md.
 });
 
-export const CreateSprayWallVersionInputSchema = z.object({
+/** Most holds one `sprayWallHoldUsage` call may ask about: a hold editor removes a few at a time. */
+export const MAX_HOLD_USAGE_HOLD_IDS = 500;
+
+/** `sprayWallHoldUsage`'s two arguments, validated together. */
+export const SprayWallHoldUsageArgsSchema = z.object({
   wallUuid: UUIDSchema,
-  photoId: UUIDSchema,
-  anchors: SprayAnchorsSchema.optional().nullable(),
-  notes: z.string().max(1000).optional().nullable(),
+  holdIds: z.array(z.number().int().positive()).max(MAX_HOLD_USAGE_HOLD_IDS),
 });
+
+/** Count the whole save together so a climb spanning multiple holds counts once. */
+export const SprayWallHoldUsageSummaryArgsSchema = SprayWallHoldUsageArgsSchema.extend({
+  holdIds: z.array(z.number().int().positive()).max(MAX_HOLDS_PER_WALL),
+});
+
+/** `resetSprayWall`: the wall to clone. Everything else is copied from it server-side. */
+export const ResetSprayWallInputSchema = z.object({
+  wallUuid: UUIDSchema,
+});
+
+export const CreateSprayWallVersionInputSchema = z
+  .object({
+    wallUuid: UUIDSchema,
+    photoId: UUIDSchema.optional().nullable(),
+    sourceVersionId: BigIntIdSchema.optional().nullable(),
+    anchors: SprayAnchorsSchema.optional().nullable(),
+    notes: z.string().max(1000).optional().nullable(),
+  })
+  .refine((input) => (input.photoId != null) !== (input.sourceVersionId != null), {
+    message: 'Choose either an uploaded photo or the current published version',
+  })
+  .refine((input) => input.sourceVersionId == null || input.anchors === undefined, {
+    message: 'A reused photo keeps its saved corners; omit anchors',
+    path: ['anchors'],
+  });
 
 export const SprayWallHoldInputSchema = z.object({
   // Present = correct an existing hold's geometry; absent = allocate a new
@@ -138,9 +212,18 @@ export const SprayWallHoldInputSchema = z.object({
   source: SprayHoldSourceSchema,
   confidence: z.number().min(0).max(1).optional().nullable(),
   movedFromHoldId: z.number().int().positive().optional().nullable(),
+  // Provenance (SW-20, #5471). Shape only here: whether the detection belongs to
+  // this wall and the index is in range needs the database, and a bad pair is
+  // stored as NULL by the resolver rather than failing the save.
+  autoReview: SprayHoldAutoReviewSchema,
+  // Detection ids are opaque text keys; the cap only keeps a hostile string out.
+  originDetectionId: z.string().min(1).max(200).optional().nullable(),
+  originCandidateIndex: z.number().int().min(0).max(100_000).optional().nullable(),
 });
 
 export const UpsertSprayWallHoldsInputSchema = z.object({
+  // An old GraphQL schema rejects this capability requirement before writing.
+  preserveClimbLinks: z.literal(true).optional(),
   wallUuid: UUIDSchema,
   versionId: BigIntIdSchema,
   // The batch cap is the per-wall cap: a client may legitimately send a whole
@@ -163,6 +246,8 @@ export const UpsertSprayWallHoldsInputSchema = z.object({
 });
 
 export const RemoveSprayWallHoldsInputSchema = z.object({
+  // An old GraphQL schema rejects this capability requirement before writing.
+  preserveClimbLinks: z.literal(true).optional(),
   wallUuid: UUIDSchema,
   versionId: BigIntIdSchema,
   holdIds: z
@@ -176,113 +261,25 @@ export const RemoveSprayWallHoldsInputSchema = z.object({
 });
 
 export const PublishSprayWallVersionInputSchema = z.object({
+  // An old GraphQL schema rejects this capability requirement before writing.
+  preserveClimbLinks: z.literal(true).optional(),
   versionId: BigIntIdSchema,
 });
 
 /**
- * One hold found in the new photo, already mapped into the wall's canonical
- * frame by the client through the draft version's homography.
- *
- * Shape only, like every other schema here — the server never re-runs detection
- * (epic decision 2026-09-14). What it adds over `SprayWallHoldInputSchema` is
- * `colour`, which is accepted and never reaches a column — and, until SW-12b
- * (#5485) gives a STORED hold a descriptor too, never reaches the matcher's
- * tie-breaker either, because that term needs both sides.
+ * `commitSprayWallVersion`, which older apps use to publish. Only the wall and the
+ * draft are read. The reset decisions are shape-checked by GraphQL and bounded
+ * here so a hostile payload is not parsed into memory, then ignored: the
+ * in-place reset they described is retired (docs/product/spray-walls.md).
  */
-export const SprayWallDetectionInputSchema = z.object({
-  cx: CanonicalPixelSchema,
-  cy: CanonicalPixelSchema,
-  r: z.number().int().min(1).max(10_000),
-  outline: SprayOutlineRingSchema.optional().nullable(),
-  /**
-   * A Lab triple, or Lab plus a small hue histogram. Bounded at 16 numbers
-   * because a descriptor is a handful of axes and anything longer is a client
-   * sending the wrong array; `colourDistance` refuses mismatched lengths anyway,
-   * so a hostile one degrades to "no colour term" rather than to a wrong match —
-   * which is what every value degrades to today, the stored holds having none.
-   */
-  colour: z.array(z.number().finite()).min(1).max(16).optional().nullable(),
-  source: SprayHoldSourceSchema,
-  confidence: z.number().min(0).max(1).optional().nullable(),
-});
-
-export const ProposeSprayWallResetInputSchema = z.object({
+export const CommitSprayWallVersionInputSchema = z.object({
   wallUuid: UUIDSchema,
   versionId: BigIntIdSchema,
-  // A full reset of a capped wall is the worst case and it is legitimate, so the
-  // bound is the per-wall cap. Empty is legitimate too: a photo in which the
-  // client found nothing proposes removing everything, which is exactly what the
-  // owner needs to see before they commit it.
-  detections: z.array(SprayWallDetectionInputSchema).max(MAX_HOLDS_PER_WALL),
+  kept: z.array(z.unknown()).max(MAX_HOLDS_PER_WALL),
+  removed: z.array(z.unknown()).max(MAX_HOLDS_PER_WALL),
+  added: z.array(z.unknown()).max(MAX_HOLDS_PER_WALL),
+  fullReset: z.boolean().nullish(),
 });
-
-const SprayWallKeptDecisionSchema = z.object({
-  holdId: z.number().int().positive(),
-  detection: SprayWallDetectionInputSchema.optional().nullable(),
-});
-
-const SprayWallAddedDecisionSchema = z.object({
-  detection: SprayWallDetectionInputSchema,
-  movedFromHoldId: z.number().int().positive().optional().nullable(),
-});
-
-/**
- * The reviewed reset.
- *
- * The three lists are disjoint by construction and the schema says so: a hold
- * cannot be both kept and removed, and a batch repeating an id would apply one
- * decision twice — which for a removal is harmless and for a keep is a second
- * outline write racing the first. Rejected rather than de-duplicated, because
- * there is no reading under which sending a hold twice is meaningful.
- *
- * The caps are the per-wall cap on each list rather than on the total: the
- * resolver counts what the wall would actually hold afterwards, which is the
- * number that matters, and a bound here only exists to keep a hostile payload
- * from being parsed into memory.
- */
-export const CommitSprayWallVersionInputSchema = z
-  .object({
-    wallUuid: UUIDSchema,
-    versionId: BigIntIdSchema,
-    kept: z.array(SprayWallKeptDecisionSchema).max(MAX_HOLDS_PER_WALL),
-    removed: z.array(z.number().int().positive()).max(MAX_HOLDS_PER_WALL),
-    added: z.array(SprayWallAddedDecisionSchema).max(MAX_HOLDS_PER_WALL),
-  })
-  .refine((input) => {
-    const keptIds = input.kept.map((decision) => decision.holdId);
-    return new Set(keptIds).size === keptIds.length;
-  }, 'The same hold is kept twice — send each hold once')
-  .refine(
-    (input) => new Set(input.removed).size === input.removed.length,
-    'The same hold is removed twice — send each hold once',
-  )
-  .refine((input) => {
-    const removed = new Set(input.removed);
-    return input.kept.every((decision) => !removed.has(decision.holdId));
-  }, 'A hold cannot be both kept and removed')
-  // One predecessor has at most one successor. Two additions naming the same
-  // `movedFromHoldId` would both get a `moved_from_hold_id` row pointing at it, and
-  // `remixClimb` walks that column the other way — so a climber remixing a problem
-  // that lost the hold would be offered two successors for it with nothing to say
-  // which is the one that replaced it.
-  .refine((input) => {
-    const predecessors = input.added
-      .map((decision) => decision.movedFromHoldId)
-      .filter((holdId): holdId is number => holdId != null);
-    return new Set(predecessors).size === predecessors.length;
-  }, 'Two new holds claim to have moved from the same hold — a hold has one successor')
-  // Two additions at the same centre and radius are the same hold twice. They would
-  // both land, with different catalogue ids and no DB conflict to notice, leaving
-  // the wall carrying an invisible duplicate that every hold read returns and the
-  // editor cannot tell apart. There is no reading under which it is meaningful.
-  .refine((input) => {
-    const positions = input.added.map(({ detection }) => `${detection.cx},${detection.cy},${detection.r}`);
-    return new Set(positions).size === positions.length;
-  }, 'Two new holds sit at the same place — send each hold once');
-
-export type SprayWallDetectionInput = z.infer<typeof SprayWallDetectionInputSchema>;
-export type ProposeSprayWallResetInput = z.infer<typeof ProposeSprayWallResetInputSchema>;
-export type CommitSprayWallVersionInput = z.infer<typeof CommitSprayWallVersionInputSchema>;
 
 export const UpdateSprayWallInputSchema = z
   .object({
@@ -302,18 +299,211 @@ export const UpdateSprayWallInputSchema = z
         `A spray wall's angle must be one of ${SPRAY_ANGLES.join(', ')}`,
       )
       .optional(),
+    // The same location fields `createSprayWall` takes, so the wizard's last
+    // step can place the wall and link a nearby gym in one call. Null clears.
+    locationName: z.string().trim().max(200).optional().nullable(),
+    latitude: z.number().min(-90).max(90).optional().nullable(),
+    longitude: z.number().min(-180).max(180).optional().nullable(),
+    hideLocation: z.boolean().optional(),
+    // Accepted and ignored. Kept in the "something to update" count below, so an
+    // older app flipping the retired toggle gets its wall back, not an error.
+    climbEditPolicy: RetiredSprayClimbEditPolicySchema.optional(),
+    // Owner only, checked in the resolver beside visibility. Counts as a change
+    // in the refine below like every other field.
+    trainingConsent: z.boolean().optional(),
   })
   // An update that changes nothing is a client bug, and answering it with a
   // success teaches the client that its no-op worked.
   .refine(
     (input) => Object.keys(input).some((key) => key !== 'uuid'),
     'Nothing to update — pass at least one field besides the wall uuid',
+  )
+  // A point is both halves. One without the other would leave the wall at a
+  // latitude from one place and a longitude from another, and the gym-link
+  // proximity check reads exactly that pair.
+  .refine(
+    (input) =>
+      (input.latitude === undefined) === (input.longitude === undefined) &&
+      (input.latitude === null) === (input.longitude === null),
+    'latitude and longitude go together — pass both, or neither',
+  );
+
+// `validateInput` reports messages, not paths, so every message names its field:
+// "Too big: expected number to be <=2" alone does not say which knob was wrong.
+function boundedSetting(name: string, bounds: { readonly min: number; readonly max: number }) {
+  const range = `${name} must be between ${bounds.min} and ${bounds.max}`;
+  return z
+    .number({ error: `${name} must be a number` })
+    .min(bounds.min, range)
+    .max(bounds.max, range);
+}
+
+/**
+ * An option NAME, not one of the options this backend was built with.
+ *
+ * The app ships on its own train, so it can offer an option (a new mark style)
+ * before the copy of `@boardsesh/board-look` deployed here knows it, and
+ * refusing it would refuse the app's own default look. Nothing on the server
+ * reads these values; the app sanitises the stored look when it reads it, and a
+ * name it does not know draws as that knob's default.
+ */
+const OPTION_NAME = /^[a-z][a-z0-9-]{0,31}$/;
+
+function optionSetting(name: string) {
+  const message = `${name} must be an option name`;
+  return z.string({ error: message }).regex(OPTION_NAME, message);
+}
+
+function flagSetting(name: string) {
+  return z.boolean({ error: `${name} must be true or false` });
+}
+
+/**
+ * The full Aura knob bundle, every field required.
+ *
+ * Numbers are held to `@boardsesh/board-look`'s own slider bounds; option knobs
+ * only to a well-formed name (see `optionSetting`). A knob added there fails the
+ * `satisfies` below until it is added here too. Strict, because a key this does
+ * not know would be stored and handed back to every client that reads the wall.
+ */
+const BoardseshRenderSettingsSchema = z
+  .object({
+    glowFalloff: optionSetting('glowFalloff'),
+    glowReach: boundedSetting('glowReach', BOARD_RENDER_SETTING_BOUNDS.glowReach),
+    plateauShare: boundedSetting('plateauShare', BOARD_RENDER_SETTING_BOUNDS.plateauShare),
+    veil: optionSetting('veil'),
+    veilOpacity: boundedSetting('veilOpacity', BOARD_RENDER_SETTING_BOUNDS.veilOpacity),
+    markStyle: optionSetting('markStyle'),
+    fillOpacity: boundedSetting('fillOpacity', BOARD_RENDER_SETTING_BOUNDS.fillOpacity),
+    softDisc: flagSetting('softDisc'),
+    smallHoldBoost: flagSetting('smallHoldBoost'),
+    ledDots: flagSetting('ledDots'),
+    roleGlyphs: flagSetting('roleGlyphs'),
+    thumbnailStyle: optionSetting('thumbnailStyle'),
+    holdShape: optionSetting('holdShape'),
+  })
+  .strict() satisfies z.ZodType<Record<keyof BoardseshRenderSettings, unknown>>;
+
+/**
+ * A wall's stored default look, or null to clear it.
+ *
+ * `mode` is `classic` or `aura` only. Mobile's per-climber preference also has
+ * `default`, which means "use whatever the default is" — and a wall default IS
+ * that default, so storing `default` there would point at itself.
+ */
+export const SprayWallRenderSettingsSchema = z
+  .object({
+    mode: z.enum(['classic', 'aura'], { error: "mode must be 'classic' or 'aura'" }),
+    boardsesh: BoardseshRenderSettingsSchema,
+    // What the wall is drawn on. Optional, so every client that predates it
+    // keeps sending a valid look; missing means 'photo'. A generated background
+    // is also refused by the resolver when the wall's photo fails the quality
+    // gate, so an old or hand-rolled client cannot store one it cannot show.
+    background: z
+      .enum(SPRAY_WALL_BACKGROUNDS, { error: "background must be 'photo', 'wall-crop' or 'hold-cutouts'" })
+      .optional(),
+  })
+  .strict()
+  .nullable();
+
+export const SetSprayWallRenderSettingsInputSchema = z
+  .object({
+    uuid: UUIDSchema,
+    // Required, not optional: null is the explicit "clear the wall default", and
+    // a missing key would be a client that forgot to say which it meant.
+    renderSettings: SprayWallRenderSettingsSchema,
+  })
+  .strict();
+
+/**
+ * The LED setup of one wall. A value here reaches other climbers' phones, so the
+ * address is held to the same local-network rule the phone applies before it
+ * contacts anything, and the layout is rebuilt through `readTnutLayout` so the
+ * stored JSON holds only the fields the app reads.
+ */
+const SprayWallLedControllerUrlSchema = z
+  .string()
+  .max(2048, 'controllerUrl is too long')
+  .transform((url, context) => {
+    // Clearing the address is allowed; the owner may not have one yet.
+    if (url.trim() === '') return '';
+    if (/^wled-ble:wled-[a-f0-9]{12}$/i.test(url)) return url.toLowerCase();
+    try {
+      return normalizeLocalControllerUrl(url);
+    } catch (urlError) {
+      context.addIssue({
+        code: 'custom',
+        message:
+          urlError instanceof LedControllerError && urlError.code === 'not-local'
+            ? 'controllerUrl must be a local network address'
+            : 'controllerUrl is not a valid controller address',
+      });
+      return z.NEVER;
+    }
+  });
+
+const SprayWallLedLayoutSchema = z.unknown().transform((layout, context) => {
+  if (Buffer.byteLength(JSON.stringify(layout) ?? '') > MAX_TNUT_LAYOUT_BYTES) {
+    context.addIssue({ code: 'custom', message: 'layout is too large' });
+    return z.NEVER;
+  }
+  const readLayout = readTnutLayout(layout);
+  if (!readLayout) {
+    context.addIssue({ code: 'custom', message: 'layout is not a valid T-nut layout' });
+    return z.NEVER;
+  }
+  return readLayout;
+});
+
+export const SaveSprayWallLedSetupInputSchema = z
+  .object({
+    boardUuid: UUIDSchema,
+    controllerType: z.enum(['wled', 'wled-ble'], { error: 'Unsupported LED controller type' }).nullish(),
+    controllerUrl: SprayWallLedControllerUrlSchema.nullish(),
+    enabled: z.boolean().nullish(),
+    brightness: z.number().int().min(1).max(255).nullish(),
+    // Exactly the app's choices, so every saved value shows as one of them.
+    autoOffMinutes: z
+      .number()
+      .refine((minutes) => (SPRAY_WALL_LED_AUTO_OFF_CHOICES as readonly number[]).includes(minutes), {
+        message: `Auto-off is one of ${SPRAY_WALL_LED_AUTO_OFF_CHOICES.join(', ')} minutes`,
+      })
+      .nullish(),
+    layout: SprayWallLedLayoutSchema.nullish(),
+  })
+  .strict()
+  .superRefine(({ controllerType, controllerUrl }, context) => {
+    if (controllerType != null && controllerUrl == null) {
+      context.addIssue({ code: 'custom', message: 'Send controllerUrl with controllerType' });
+    }
+    if (controllerType == null && controllerUrl?.startsWith('wled-ble:')) {
+      context.addIssue({ code: 'custom', message: 'Send wled-ble controllerType with controllerUrl' });
+    }
+    if (
+      controllerType != null &&
+      controllerUrl != null &&
+      controllerUrl !== '' &&
+      (controllerType === 'wled-ble') !== controllerUrl.startsWith('wled-ble:')
+    ) {
+      context.addIssue({ code: 'custom', message: 'Controller type and address do not match' });
+    }
+  })
+  .refine(
+    ({ controllerType, controllerUrl, enabled, brightness, autoOffMinutes, layout }) =>
+      controllerType != null ||
+      controllerUrl != null ||
+      enabled != null ||
+      brightness != null ||
+      autoOffMinutes != null ||
+      layout != null,
+    'Nothing to save: send at least one field',
   );
 
 export type CreateSprayWallInput = z.infer<typeof CreateSprayWallInputSchema>;
 export type CreateSprayWallVersionInput = z.infer<typeof CreateSprayWallVersionInputSchema>;
 export type SprayWallHoldInput = z.infer<typeof SprayWallHoldInputSchema>;
 export type UpsertSprayWallHoldsInput = z.infer<typeof UpsertSprayWallHoldsInputSchema>;
+export type SetSprayWallRenderSettingsInput = z.infer<typeof SetSprayWallRenderSettingsInputSchema>;
 export type RemoveSprayWallHoldsInput = z.infer<typeof RemoveSprayWallHoldsInputSchema>;
 
 /**
@@ -327,6 +517,7 @@ export type RemoveSprayWallHoldsInput = z.infer<typeof RemoveSprayWallHoldsInput
 export const SPRAY_WALL_REPORT_REASONS = ['INAPPROPRIATE', 'NOT_A_WALL', 'PERSONAL_INFO', 'OTHER'] as const;
 
 export const ReportSprayWallInputSchema = z.object({
+  releaseContext: OptionalReleaseContextInputSchema,
   wallUuid: UUIDSchema,
   reason: z.enum(SPRAY_WALL_REPORT_REASONS),
 });
@@ -338,3 +529,49 @@ export const SetSprayWallHiddenInputSchema = z.object({
 
 export type ReportSprayWallInput = z.infer<typeof ReportSprayWallInputSchema>;
 export type SetSprayWallHiddenInput = z.infer<typeof SetSprayWallHiddenInputSchema>;
+
+/** The vetting queue's tabs (SW-20, #5471). */
+export const SPRAY_TRAINING_REVIEW_STATUSES = ['UNREVIEWED', 'APPROVED', 'REJECTED'] as const;
+export type SprayTrainingReviewStatusWireName = (typeof SPRAY_TRAINING_REVIEW_STATUSES)[number];
+
+/** GraphQL `SprayTrainingRejectReason` → the `spray_training_reject_reason` pgEnum. */
+export const SPRAY_TRAINING_REJECT_REASON_BY_WIRE_NAME = {
+  BAD_HOLDS: 'bad_holds',
+  MISSING_HOLDS: 'missing_holds',
+  PHOTO_QUALITY: 'photo_quality',
+  NOT_A_WALL: 'not_a_wall',
+  PEOPLE_OR_PERSONAL_INFO: 'people_or_personal_info',
+  DUPLICATE: 'duplicate',
+  OTHER: 'other',
+} as const;
+export type SprayTrainingRejectReasonWireName = keyof typeof SPRAY_TRAINING_REJECT_REASON_BY_WIRE_NAME;
+
+/** One page of the queue. 25 is the ceiling: each item mints a presigned photo. */
+export const MAX_SPRAY_TRAINING_QUEUE_PAGE = 25;
+
+export const SprayTrainingQueueArgsSchema = z.object({
+  status: z.enum(SPRAY_TRAINING_REVIEW_STATUSES),
+  limit: z.number().int().min(1).max(MAX_SPRAY_TRAINING_QUEUE_PAGE).nullish(),
+  offset: z.number().int().min(0).max(1_000_000).nullish(),
+});
+
+export const SetSprayTrainingReviewInputSchema = z
+  .object({
+    versionId: BigIntIdSchema,
+    status: z.enum(SPRAY_TRAINING_REVIEW_STATUSES),
+    reason: z
+      .enum(
+        Object.keys(SPRAY_TRAINING_REJECT_REASON_BY_WIRE_NAME) as [
+          SprayTrainingRejectReasonWireName,
+          ...SprayTrainingRejectReasonWireName[],
+        ],
+      )
+      .nullish(),
+    notes: z.string().trim().max(500, 'Notes may be at most 500 characters').nullish(),
+  })
+  // Mirrors the table's CHECK: a rejection always says why, and nothing else
+  // carries a reason. Refused here so the admin gets a message, not a 500.
+  .refine((input) => (input.status === 'REJECTED') === (input.reason != null), {
+    message: 'A rejection needs a reason, and only a rejection takes one',
+    path: ['reason'],
+  });

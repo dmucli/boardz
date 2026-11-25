@@ -1,4 +1,18 @@
 // @vitest-environment jsdom
+vi.mock('../../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('expo-router/react-navigation', () => ({ useHeaderHeight: () => 0 }));
+vi.mock('../../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 //
 // #5654: Apple and Google first, email kept open below an "or use email"
 // divider, a tagline that says what the climber gets, and one `Auth Option
@@ -16,6 +30,7 @@ const oauth = vi.hoisted(() => ({
   setError: null as ((message: string | null) => void) | null,
 }));
 const providers = vi.hoisted(() => ({ apple: true, google: true }));
+const platform = vi.hoisted(() => ({ os: 'ios' as 'ios' | 'web' }));
 const form = vi.hoisted(() => ({
   setters: {} as Record<string, (text: string) => void>,
   submit: null as (() => void) | null,
@@ -49,6 +64,7 @@ vi.mock('../../../src/lib/routing/anonymous-auth-gate', () => ({ readPostLoginRe
 vi.mock('../../../src/lib/discord', () => ({ openDiscordInvite: vi.fn() }));
 vi.mock('../../../src/lib/haptics', () => ({ hapticLight: vi.fn() }));
 vi.mock('../../../src/providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({ colorScheme: 'light', systemColors: {}, brandColors: {} }),
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -56,11 +72,18 @@ vi.mock('expo-router', () => ({ Stack: { Screen: () => null }, useRouter: () => 
 vi.mock('expo-image', () => ({ Image: () => null }));
 vi.mock('react-native', () => ({
   KeyboardAvoidingView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  Platform: { OS: 'ios' },
+  Platform: {
+    get OS() {
+      return platform.os;
+    },
+  },
   Pressable: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
     createElement('button', { onClick: onPress }, children),
   ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  StyleSheet: { create: (styles: unknown) => styles },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+  },
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
 }));
@@ -98,6 +121,7 @@ function authOptionTaps(): unknown[] {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  platform.os = 'ios';
   providers.apple = true;
   providers.google = true;
   oauth.setError = null;
@@ -175,7 +199,7 @@ describe('LoginScreen Auth Option Tapped', () => {
     expect(router.push).toHaveBeenCalledWith('/auth/forgot-password');
   });
 
-  it('reports an email sign-in and hands Login Succeeded to the account-age tracker', async () => {
+  it('delegates native email sign-in without duplicating provider-owned success', async () => {
     auth.signInWithCredentials.mockResolvedValue({ success: true });
     render(createElement(LoginScreen));
 
@@ -188,12 +212,31 @@ describe('LoginScreen Auth Option Tapped', () => {
     });
 
     expect(authOptionTaps()).toEqual([{ option: 'email_sign_in', screen: 'login' }]);
+    expect(auth.signInWithCredentials).toHaveBeenCalledOnce();
+    expect(auth.signInWithCredentials).toHaveBeenCalledWith('climber@example.com', 'supersecure1');
+    expect(analytics.trackLoginSucceeded).not.toHaveBeenCalled();
+    expect(analytics.track).not.toHaveBeenCalledWith(SHARED_EVENTS.LoginSucceeded, expect.anything());
+  });
+
+  it('keeps browser email-success tracking on the screen', async () => {
+    platform.os = 'web';
+    auth.signInWithCredentials.mockResolvedValue({ success: true });
+    render(createElement(LoginScreen));
+    await act(async () => {
+      form.setters.email?.('climber@example.com');
+      form.setters.password?.('supersecure1');
+    });
+    await act(async () => {
+      form.submit?.();
+    });
+    expect(auth.signInWithCredentials).toHaveBeenCalledWith('climber@example.com', 'supersecure1');
+    expect(analytics.trackLoginSucceeded).toHaveBeenCalledOnce();
     expect(analytics.trackLoginSucceeded).toHaveBeenCalledWith({
       auth_method: 'credentials',
-      flow: 'native',
+      provider: 'email',
+      flow: 'web',
       screen: 'login',
     });
-    expect(analytics.track).not.toHaveBeenCalledWith(SHARED_EVENTS.LoginSucceeded, expect.anything());
   });
 
   it('does not report an email sign-in while the form is still empty', async () => {

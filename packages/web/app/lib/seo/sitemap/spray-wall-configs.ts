@@ -17,7 +17,7 @@ import { withTimeout } from './with-timeout';
  * read. The reason differs, though. MoonBoard is missing because nothing writes
  * it a `board_product_sizes_layouts_sets` row; a spray wall IS written one, and
  * that row is deliberately `is_listed = false` (see "Every per-wall catalogue row
- * is `is_listed = false`" in `docs/spray-walls.md`). Both sources are additive,
+ * is `is_listed = false`" in `docs/product/spray-walls.md`). Both sources are additive,
  * neither narrows the listed configs, and the privacy flag on the catalogue rows
  * stays exactly as it is.
  *
@@ -37,7 +37,7 @@ const SPRAY_REVALIDATE_SECONDS = 3_600;
 /**
  * Wall-clock bound on the wall query, matching `MOONBOARD_COUNT_TIMEOUT_MS` for
  * the same reason: `dbzRead`'s pool sets no `statement_timeout` (PgBouncer
- * rejects it as a startup parameter, see `docs/db-connectivity.md`), so an
+ * rejects it as a startup parameter, see `docs/operations/db-connectivity.md`), so an
  * unbounded read here would hold the climbs shard for the whole platform timeout
  * and the single-flight below would make every later caller join the stall.
  *
@@ -74,6 +74,8 @@ export type SitemapSprayWallConfig = PopularBoardConfig & { sprayWallSlug: strin
  *    there is nothing behind the URL — the rule SW-14 wrote for the app, applied
  *    to the crawler.
  *  - both soft-delete columns, because a deleted wall's rows stay in the table.
+ *  - `archived_at IS NULL`: a wall a reset replaced leaves every listing, and a
+ *    sitemap is a listing.
  *  - a slug, because `constructBoardSlugViewUrl` has nothing to build from
  *    without one. The column is `NOT NULL` today; the predicate is what keeps
  *    this source honest if that ever relaxes, and it costs nothing.
@@ -121,6 +123,12 @@ export function buildPublicSprayWallQuery(db: typeof dbzRead) {
         isNull(userBoards.deletedAt),
         isNull(sprayWalls.deletedAt),
         isNotNull(sprayWalls.currentVersionId),
+        // An admin-hidden wall reads as private to everybody but its owner, and a
+        // crawler is never the owner (SW-17).
+        isNull(sprayWalls.hiddenAt),
+        // A wall replaced by a reset is read-only and out of every listing; its
+        // successor is the page worth crawling.
+        isNull(sprayWalls.archivedAt),
       ),
     )
     .groupBy(sprayWalls.layoutId, userBoards.slug, userBoards.name, userBoards.angle);

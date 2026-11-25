@@ -3,18 +3,22 @@ name: Mobile Store Metadata
 # Pushes the source-controlled store listing assets to App Store Connect / Google
 # Play for the React Native app (packages/mobile). iOS uses deliver
 # (fastlane/metadata/en-US/) and pushes listing text only — no binary, no
-# screenshots, no review submission. Android uses supply and pushes the full
-# committed listing: text (fastlane/metadata/android/en-US/*.txt), images
+# screenshots, no review submission. Android pushes the full committed listing:
+# text (fastlane/metadata/android/<locale>/*.txt), images
 # (.../images/icon.png + featureGraphic.png), AND phone screenshots
 # (app-stores/google/screenshots/pixel-2/*.png). No binary, no staged rollout.
 #
-# Android review: supply commits with changes_not_sent_for_review: false (it
-# sends the changes for review). With managed publishing OFF, Google auto-
-# publishes once review passes. The lanes set rescue_changes_not_sent_for_review:
-# false so a "can't auto-send for review" rejection fails LOUDLY here instead of
-# being silently committed-but-never-submitted (the old false-green that left the
-# live listing stale). iOS deliver still lands text on the editable version
-# without submitting (submit_for_review: false).
+# Android review: each lane commits one edit of its own (fastlane/lib/play_listing.rb)
+# with changesNotSentForReview=false (it sends the changes for review) and
+# changesInReviewBehavior=ERROR_IF_IN_REVIEW. With managed publishing OFF, Google
+# auto-publishes once review passes. While a release is in review (after a
+# merge-back, mobile-store-submit.yml sends one), Play refuses the commit and the
+# job fails; it never cancels that review the way supply's commit did. Rerun once
+# the review ends. A "can't auto-send for review" rejection also fails LOUDLY
+# instead of being silently committed-but-never-submitted (the old false-green that
+# left the live listing stale). iOS deliver still lands text on the editable
+# version without submitting (submit_for_review: false), and skips a version that
+# is waiting for review.
 #
 # iOS and Android run as SEPARATE jobs, in parallel. They own independent store
 # listings and share no state, so a failure on one must never block the other.
@@ -30,9 +34,10 @@ name: Mobile Store Metadata
 # creates the App Store version for a release, because the automatic run below
 # skips iOS whenever no version is editable yet (see the ios metadata lane).
 #
-# Runs automatically when the committed listing assets change on main or
-# release/next (fastlane/metadata/**, fastlane/Fastfile, or
-# app-stores/google/screenshots/**), pushing to both stores. The Android screenshot set is refreshed by
+# Runs automatically when the committed listing assets change on main
+# (fastlane/metadata/**, fastlane/Fastfile, or app-stores/google/screenshots/**),
+# pushing to both stores. Exact-source listing text also lands through the draft. The
+# Android screenshot set is refreshed by
 # mobile-screenshots-android.yml, which captures fresh shots and commits them
 # back to main — that commit re-triggers this workflow, which uploads them. Also
 # dispatchable by hand to push a single store on demand. A push build always
@@ -45,10 +50,10 @@ name: Mobile Store Metadata
 
 on:
   push:
-    # Both lines: from main the lane targets main's version, from release/next the
-    # train's — the version comes from app.config.ts on the ref it checks out, and
-    # deliver/supply skip cleanly when no editable version exists for it.
-    branches: [main, release/next]
+    # main only. deliver writes onto whichever App Store version is editable, so a
+    # main push also refreshes the train's draft; the train's own edits reach it
+    # through mobile-store-draft.yml's dispatch against main.
+    branches: [main]
     paths:
       - 'fastlane/metadata/**'
       - 'fastlane/Fastfile'
@@ -84,6 +89,16 @@ jobs:
     # App Store Connect credentials (same secrets as the screenshot upload job in
     # mobile-screenshots-ios.yml).
     environment: Production
+    # Inside the store-draft lock, queued like its other members, so a listing
+    # push can never land between the merge-back submission's plan and its submit
+    # (that run's snapshot covers the text). No deadlock: mobile-store-submit.yml
+    # runs the metadata lane in its own job and never starts this workflow, and
+    # mobile-store-draft.yml dispatches it without waiting, so this job simply
+    # queues until that draft run ends.
+    concurrency:
+      group: mobile-store-draft
+      cancel-in-progress: false
+      queue: max
 
     steps:
       - name: Checkout repository
@@ -93,8 +108,13 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
-          bundler-cache: true
           working-directory: fastlane
+      - name: Install fastlane gems
+        working-directory: fastlane
+        run: |
+          bundle config set --local path "$PWD/vendor/bundle"
+          bundle config set --local deployment true
+          bundle install --jobs 4
 
       - name: Decode App Store Connect API key
         env:
@@ -135,6 +155,12 @@ jobs:
     # Google Play credentials (same secret as the screenshot upload job in
     # mobile-screenshots-android.yml).
     environment: Production
+    # One Play production writer at a time: shared with Android Production
+    # Release, the store draft and the merge-back submission, queued.
+    concurrency:
+      group: play-production-track
+      cancel-in-progress: false
+      queue: max
 
     steps:
       - name: Checkout repository
@@ -144,8 +170,13 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
-          bundler-cache: true
           working-directory: fastlane
+      - name: Install fastlane gems
+        working-directory: fastlane
+        run: |
+          bundle config set --local path "$PWD/vendor/bundle"
+          bundle config set --local deployment true
+          bundle install --jobs 4
 
       - name: Upload Play Store listing text
         working-directory: fastlane
@@ -171,9 +202,9 @@ jobs:
 
       # Uploads the committed phone screenshots (source of truth:
       # app-stores/google/screenshots/pixel-2/), refreshed by
-      # mobile-screenshots-android.yml's commit-back. sync_image_upload: true in
-      # the lane means an unchanged set is a sha256 no-op, so re-running on a
-      # text-only change doesn't re-submit screenshots for review. Skips cleanly
+      # mobile-screenshots-android.yml's commit-back. The lane syncs by SHA-256
+      # (as supply's sync_image_upload did), so an unchanged set uploads nothing
+      # and a text-only change doesn't re-submit screenshots for review. Skips cleanly
       # if no screenshots are committed yet (the lane requires >= 2), so this
       # never blocks a text/icon push.
       - name: Upload Play Store screenshots

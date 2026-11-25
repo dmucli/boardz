@@ -16,6 +16,8 @@ import {
 } from '@boardsesh/shared-schema';
 import { getHttpClient } from '../graphql/client';
 import { getMobilePlatform, getNativeAppVersion } from '../feedback/use-submit-app-feedback';
+import { readMobileReleaseContext } from '../release-context';
+import { requestReport } from '../graphql/request-report';
 
 export const QA_PREVIEWS_QUERY_KEY = 'qaPreviews';
 
@@ -99,9 +101,15 @@ export function useSubmitQaVerdict() {
           updateId: Updates.updateId ?? null,
           runtimeVersion: Updates.runtimeVersion ?? null,
           bundleCreatedAt: Updates.createdAt?.toISOString() ?? null,
+          releaseContext: readMobileReleaseContext(),
         },
       };
-      const response = await getHttpClient().request<SubmitQaVerdictMutationResponse>(SUBMIT_QA_VERDICT, variables);
+      const response = await requestReport(
+        (requestVariables: SubmitQaVerdictMutationVariables) =>
+          getHttpClient().request<SubmitQaVerdictMutationResponse>(SUBMIT_QA_VERDICT, requestVariables),
+        variables,
+        'SubmitQaVerdictInput',
+      );
       return response.submitQaVerdict;
     },
     onSuccess: () => {

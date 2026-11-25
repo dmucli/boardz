@@ -13,6 +13,8 @@ import type {
   PopularBoardConfigsInput,
   BoardDiscoveryBoard,
   BoardDiscoveryInput,
+  ExistingWallCandidates,
+  ExistingWallCandidatesInput,
 } from '@boardsesh/shared-schema';
 
 // ============================================
@@ -41,6 +43,12 @@ export const GET_BOARD_DISCOVERY = gql`
         frames
         angle
       }
+      popularClimb {
+        uuid
+        name
+        frames
+        angle
+      }
     }
   }
 `;
@@ -48,7 +56,25 @@ export const GET_BOARD_DISCOVERY = gql`
 export type GetBoardDiscoveryQueryResponse = { boardDiscovery: BoardDiscoveryBoard[] };
 export type GetBoardDiscoveryQueryVariables = { input?: BoardDiscoveryInput };
 
-const BOARD_FIELDS = `
+/**
+ * The one board selection. Every document that returns a `UserBoard` selects
+ * this, so a board read through any of them carries the same fields.
+ *
+ * The field ORDER is load-bearing: `GetBoard` is replayed from recorded
+ * fixtures keyed on the query text (docs/qa/mobile-screenshot-fixtures.md), and
+ * that set cannot be re-recorded. Append a field at the end and the screenshot
+ * drift test tells you the recorded `GetBoard` no longer matches.
+ */
+export const BOARD_FIELDS = `
+  sprayImport {
+    wallUuid
+    versionId
+    detectionId
+    stage
+    queuePosition
+    retryAt
+    resetOfWallUuid
+  }
   uuid
   slug
   ownerId
@@ -70,6 +96,7 @@ const BOARD_FIELDS = `
   angle
   isAngleAdjustable
   hasLeds
+  litByWallDevice
   createdAt
   layoutName
   sizeName
@@ -85,8 +112,21 @@ const BOARD_FIELDS = `
   gymName
   distanceMeters
   serialNumber
+  timerName
   canEdit
-  boardId
+  isPinnedByMe
+  canDelete
+  canRemoveFromGym
+  openReportCount
+  viewerHasOpenReport
+`;
+
+/**
+ * `BOARD_FIELDS` plus the numeric `boardId` the wall-presence feed is keyed on.
+ * Kept out of `BOARD_FIELDS` itself only because the recorded `GetBoard` text
+ * does not select it.
+ */
+const BOARD_FIELDS_WITH_BOARD_ID = `${BOARD_FIELDS}  boardId
 `;
 
 export const GET_BOARD = gql`
@@ -97,10 +137,24 @@ export const GET_BOARD = gql`
   }
 `;
 
+/**
+ * The board behind a gym-website embed. Its own operation because the embed
+ * subscribes to wall presence and needs `boardId`, which `GetBoard` cannot
+ * select without changing its recorded text.
+ */
+export const GET_EMBED_BOARD = gql`
+  query GetEmbedBoard($boardUuid: ID!) {
+    board(boardUuid: $boardUuid) {
+      ${BOARD_FIELDS_WITH_BOARD_ID}
+    }
+  }
+`;
+
 export const GET_BOARD_BY_SLUG = gql`
   query GetBoardBySlug($slug: String!) {
     boardBySlug(slug: $slug) {
-      ${BOARD_FIELDS}
+      ${BOARD_FIELDS_WITH_BOARD_ID}
+      gymIsListed
     }
   }
 `;
@@ -109,7 +163,7 @@ export const GET_MY_BOARDS = gql`
   query GetMyBoards($input: MyBoardsInput) {
     myBoards(input: $input) {
       boards {
-        ${BOARD_FIELDS}
+        ${BOARD_FIELDS_WITH_BOARD_ID}
       }
       totalCount
       hasMore
@@ -120,7 +174,7 @@ export const GET_MY_BOARDS = gql`
 export const GET_DEFAULT_BOARD = gql`
   query GetDefaultBoard {
     defaultBoard {
-      ${BOARD_FIELDS}
+      ${BOARD_FIELDS_WITH_BOARD_ID}
     }
   }
 `;
@@ -129,7 +183,28 @@ export const SEARCH_BOARDS = gql`
   query SearchBoards($input: SearchBoardsInput!) {
     searchBoards(input: $input) {
       boards {
-        ${BOARD_FIELDS}
+        ${BOARD_FIELDS_WITH_BOARD_ID}
+      }
+      totalCount
+      hasMore
+    }
+  }
+`;
+
+/** Public directory projection; the resolver fixes spray and anonymous visibility. */
+export const SEARCH_SPRAY_WALLS_DIRECTORY = gql`
+  query SearchSprayWallsDirectory($input: SearchBoardsInput!) {
+    searchBoards: publicSprayWalls(input: $input) {
+      boards {
+        uuid
+        slug
+        name
+        angle
+        locationName
+        latitude
+        longitude
+        distanceMeters
+        gymName
       }
       totalCount
       hasMore
@@ -155,6 +230,32 @@ export const GET_BOARD_LEADERBOARD = gql`
       totalCount
       hasMore
       periodLabel
+    }
+  }
+`;
+
+/**
+ * The walls a gym already has, of one board type, that a climber may be about
+ * to add again (#8151): the gym, listings merged into it and public listings
+ * within 150 m. Send the draft's layout, size and sets to get a `matchKind` per
+ * wall; without them the list is just the gym's walls. A failed lookup throws,
+ * it never answers with an empty list. See docs/product/existing-wall-check.md.
+ */
+export const EXISTING_WALL_CANDIDATES = gql`
+  query ExistingWallCandidates($input: ExistingWallCandidatesInput!) {
+    existingWallCandidates(input: $input) {
+      candidates {
+        board {
+          ${BOARD_FIELDS}
+        }
+        matchKind
+        missingSetIds
+        extraSetIds
+        source
+        gymName
+        gymDistanceMeters
+      }
+      truncated
     }
   }
 `;
@@ -185,7 +286,19 @@ export const GET_POPULAR_BOARD_CONFIGS = gql`
 export const GET_BOARDS_BY_SERIAL_NUMBERS = gql`
   query GetBoardsBySerialNumbers($serialNumbers: [String!]!, $boardType: String) {
     boardsBySerialNumbers(serialNumbers: $serialNumbers, boardType: $boardType) {
-      ${BOARD_FIELDS}
+      ${BOARD_FIELDS_WITH_BOARD_ID}
+    }
+  }
+`;
+
+export const GET_OBSERVED_BOARD_SERIAL_MATCHES = gql`
+  query GetObservedBoardSerialMatches($input: [ObservedBoardSerialInput!]!) {
+    observedBoardSerialMatches(input: $input) {
+      boardType
+      observedSerialNumber
+      candidates {
+        ${BOARD_FIELDS_WITH_BOARD_ID}
+      }
     }
   }
 `;
@@ -213,7 +326,7 @@ export const GET_MY_BOARD_SERIAL_CONFIGS = gql`
 export const CREATE_BOARD = gql`
   mutation CreateBoard($input: CreateBoardInput!) {
     createBoard(input: $input) {
-      ${BOARD_FIELDS}
+      ${BOARD_FIELDS_WITH_BOARD_ID}
     }
   }
 `;
@@ -221,7 +334,7 @@ export const CREATE_BOARD = gql`
 export const UPDATE_BOARD = gql`
   mutation UpdateBoard($input: UpdateBoardInput!) {
     updateBoard(input: $input) {
-      ${BOARD_FIELDS}
+      ${BOARD_FIELDS_WITH_BOARD_ID}
     }
   }
 `;
@@ -318,6 +431,28 @@ export type SearchBoardsQueryResponse = {
   searchBoards: UserBoardConnection;
 };
 
+export type SprayWallDirectoryEntry = {
+  uuid: string;
+  slug: string;
+  name: string;
+  angle: number;
+  locationName: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  distanceMeters: number | null;
+  gymName: string | null;
+};
+
+export type SearchSprayWallsDirectoryQueryVariables = { input: SearchBoardsInput };
+
+export type SearchSprayWallsDirectoryQueryResponse = {
+  searchBoards: {
+    boards: SprayWallDirectoryEntry[];
+    totalCount: number;
+    hasMore: boolean;
+  };
+};
+
 export type GetBoardLeaderboardQueryVariables = {
   input: BoardLeaderboardInput;
 };
@@ -409,6 +544,14 @@ export type GetPopularBoardConfigsQueryResponse = {
   popularBoardConfigs: PopularBoardConfigConnection;
 };
 
+export type ExistingWallCandidatesQueryVariables = {
+  input: ExistingWallCandidatesInput;
+};
+
+export type ExistingWallCandidatesQueryResponse = {
+  existingWallCandidates: ExistingWallCandidates;
+};
+
 export type GetBoardsBySerialNumbersQueryVariables = {
   serialNumbers: string[];
   // The board type advertised in the BLE device name. Sent only when every
@@ -419,6 +562,12 @@ export type GetBoardsBySerialNumbersQueryVariables = {
 
 export type GetBoardsBySerialNumbersQueryResponse = {
   boardsBySerialNumbers: UserBoard[];
+};
+
+export type ObservedBoardSerialInput = { boardType: string; observedSerialNumber: string };
+export type ObservedBoardSerialMatch = ObservedBoardSerialInput & { candidates: UserBoard[] };
+export type GetObservedBoardSerialMatchesQueryResponse = {
+  observedBoardSerialMatches: ObservedBoardSerialMatch[];
 };
 
 export type BoardSerialConfig = {

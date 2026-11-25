@@ -9,7 +9,6 @@ import { PressableAvatar } from '../../PressableAvatar';
 import { SectionHeader } from '../../SectionHeader';
 import { useTheme } from '../../../providers/theme-provider';
 import { withAlpha } from '../../../theme/colors';
-import { iosSystemColors } from '../../../theme/ios-colors';
 import { spacing, borderRadius } from '../../../theme/tokens';
 
 type SessionLeaderboardProps = {
@@ -24,7 +23,7 @@ type SessionLeaderboardProps = {
  */
 export function SessionLeaderboard({ participants, selfUserId }: SessionLeaderboardProps) {
   const { t } = useTranslation('session');
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors, brandColors, chartColors, selection } = useTheme();
 
   const ranked = useMemo(
     () => [...participants].sort((a, b) => b.sends - a.sends || b.flashes - a.flashes),
@@ -50,10 +49,10 @@ export function SessionLeaderboard({ participants, selfUserId }: SessionLeaderbo
               style={[
                 styles.row,
                 index > 0 ? { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: systemColors.separator } : null,
-                isSelf ? { backgroundColor: withAlpha(brandColors.primary, 0.1) } : null,
+                isSelf ? { backgroundColor: selection.fill } : null,
               ]}
             >
-              <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.rank}>
+              <Text variant="subheadline" color={systemColors.secondaryLabel} numeric style={styles.rank}>
                 {index + 1}
               </Text>
               <PressableAvatar
@@ -63,7 +62,7 @@ export function SessionLeaderboard({ participants, selfUserId }: SessionLeaderbo
                 size={32}
               />
               <View style={styles.nameColumn}>
-                <Text variant="subheadline" style={styles.name} numberOfLines={1}>
+                <Text emphasized variant="subheadline" numberOfLines={1}>
                   {participant.displayName ?? t('mobile.session.inLeaderboardClimber')}
                 </Text>
               </View>
@@ -75,7 +74,7 @@ export function SessionLeaderboard({ participants, selfUserId }: SessionLeaderbo
                   <Chip icon="flash" label={`${participant.flashes}`} tint={brandColors.warning} />
                 ) : null}
                 {participant.attempts > 0 ? (
-                  <Chip icon="circle" label={`${participant.attempts}`} tint={iosSystemColors.systemGray} />
+                  <Chip icon="circle" label={`${participant.attempts}`} tint={chartColors.secondaryLabel} />
                 ) : null}
               </View>
             </View>
@@ -90,7 +89,7 @@ function Chip({ icon, label, tint }: { icon: IconName; label: string; tint: stri
   return (
     <View style={[styles.chip, { backgroundColor: withAlpha(tint, 0.15) }]}>
       <Icon name={icon} size={12} color={tint} />
-      <Text variant="caption1" color={tint} style={styles.chipLabel}>
+      <Text emphasized variant="caption1" color={tint} numeric>
         {label}
       </Text>
     </View>
@@ -121,9 +120,6 @@ const styles = StyleSheet.create({
     flex: 1,
     gap: 2,
   },
-  name: {
-    fontWeight: '600',
-  },
   chips: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -136,8 +132,5 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing[2],
     paddingVertical: 3,
     borderRadius: borderRadius.full,
-  },
-  chipLabel: {
-    fontWeight: '600',
   },
 });

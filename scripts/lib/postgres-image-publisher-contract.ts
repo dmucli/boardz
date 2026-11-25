@@ -222,7 +222,7 @@ const PRIVILEGED_RUN_SHA256: Record<string, Record<string, string>> = {
 const PRIVILEGED_JOB_SHA256: Record<string, string> = {
   'authorize-current-main': '012c58011b4370b349d5f7dcfe89171bcfdf3e0653b459ab9fcbd865d3fc54c7',
   'validate-main': '4ce118c69113ecc6b61980e8452c11478a1ec000f8fa82bbf4b734d5154f4569',
-  'publish-images': '7230e1b43868539815cd52a82a3fa651647cd7b75a2d4f53ed976d75afa18002',
+  'publish-images': '438d8f661f5d64515b72d8b9b49361cc6e79638a7d0a773d4d17f7625117d88e',
   'verify-published-images': '05f165fb989b0c7c920b470b19bf4f14b5f3dd1f0c2880bd79e3f2b79228e1c8',
   'smoke-portable': '9c2da7fd8294d98b009b0e36a94618ab8b9b10f3048355cc3d280a6b1747a879',
   'smoke-seeded': '330d067442a0e8bf100230b2c57d8d2d6874e2e0c1d7c5e729802f9a2b5a9e9b',
@@ -238,7 +238,7 @@ const CONTRACT_PATHS = [
   'scripts/lib/postgres-image-publisher-contract.ts',
   'scripts/postgres-image-publisher-contract.test.ts',
   'scripts/vite.config.ts',
-  'docs/postgres-image-publishing.md',
+  'docs/operations/postgres-image-publishing.md',
   'package.json',
   'pnpm-lock.yaml',
   'pnpm-workspace.yaml',
@@ -251,7 +251,7 @@ const CONTRACT_STEPS: ExpectedStep[] = [
   { name: 'Verify publisher authority and artifact contracts' },
 ];
 
-const CONTRACT_WORKFLOW_METADATA_SHA256 = '9f53ade79a7ae06ae71c8938bb4476c2ad6905667ef34f8150c16caed55374af';
+const CONTRACT_WORKFLOW_METADATA_SHA256 = 'fcf5f2979e0c104a1125a68d69315e2fbcc24fc81d9262a54f3b48d59ac75620';
 const CONTRACT_JOB_METADATA_SHA256 = '9e0f951e6bceb41814be7e67f5cfe5cf5d808315af99a39bc312cbce1c7f0cfb';
 const CONTRACT_STEP_SHA256: Record<string, string> = {
   'Checkout repository without persisted credentials':

@@ -1,8 +1,15 @@
 import type { PendingMutation } from './queue';
+import { graphqlErrorRejectsUnknownInputField } from './error-classification';
 
-export type GraphQLFetch = <T>(query: string, variables?: Record<string, unknown>) => Promise<T>;
+export type GraphQLFetch = <T>(
+  query: string,
+  variables?: Record<string, unknown>,
+  options?: { offlineWriteDeliveryId?: string },
+) => Promise<T>;
 
 const MUTATIONS: Record<string, string> = {
+  SaveClimb: `mutation SaveClimb($input: SaveClimbInput!) { saveClimb(input: $input) { uuid } }`,
+  UpdateClimb: `mutation UpdateClimb($input: UpdateClimbInput!) { updateClimb(input: $input) { uuid } }`,
   SaveTick: `mutation SaveTick($input: SaveTickInput!) { saveTick(input: $input) { uuid } }`,
   UpdateTick: `mutation UpdateTick($uuid: ID!, $input: UpdateTickInput!) { updateTick(uuid: $uuid, input: $input) { uuid } }`,
   DeleteTick: `mutation DeleteTick($uuid: ID!) { deleteTick(uuid: $uuid) }`,
@@ -21,6 +28,7 @@ const MUTATIONS: Record<string, string> = {
   UnfollowPlaylist: `mutation UnfollowPlaylist($input: FollowPlaylistInput!) { unfollowPlaylist(input: $input) }`,
   PinPlaylist: `mutation PinPlaylist($input: PinPlaylistInput!) { pinPlaylist(input: $input) }`,
   UnpinPlaylist: `mutation UnpinPlaylist($input: PinPlaylistInput!) { unpinPlaylist(input: $input) }`,
+  RecordSessionWorkout: `mutation RecordSessionWorkout($input: RecordSessionWorkoutInput!) { recordSessionWorkout(input: $input) }`,
 };
 
 type MutationDispatch = {
@@ -34,6 +42,8 @@ type MutationDispatch = {
 // (this runtime package deliberately has no dependencies, so the type-only
 // check lives with the tests).
 export const UPDATE_TICK_INPUT_FIELDS = [
+  'privacy',
+  'boardUuid',
   'status',
   'attemptCount',
   'quality',
@@ -41,8 +51,51 @@ export const UPDATE_TICK_INPUT_FIELDS = [
   'isBenchmark',
   'comment',
   'climbedAt',
+  'reportingTime',
   'angle',
 ] as const;
+
+/**
+ * Input fields a queued mutation may carry that the server can do without.
+ *
+ * A queued write can outlive the backend it was written for in one direction
+ * only: the app updates over the air, and a rollback or a slow deploy can put
+ * it in front of a backend that does not know a field yet. GraphQL rejects an
+ * unknown input field outright, the rejection is permanent, and the write
+ * dead-letters. For a tick that means a lost send.
+ *
+ * A field belongs here only when leaving it out gives a correct write:
+ * `SaveTickInput.climbRevision` is optional, and without it the server stores
+ * the version that was live when the climb was climbed (#6023). The app no
+ * longer sends it, but a tick queued by an earlier bundle still carries it in
+ * its stored payload and is replayed as stored, so the entry stays until no
+ * such outbox row can be left. Reporting time certifies optional analytics
+ * precision; the original climbedAt still saves correctly on an older server.
+ */
+const DROPPABLE_INPUT_FIELDS: Record<string, readonly string[]> = {
+  SaveTick: ['climbRevision', 'reportingTime'],
+  UpdateTick: ['reportingTime'],
+};
+
+/**
+ * The same variables without the droppable fields this rejection names, or
+ * null when the rejection is about something else (or nothing was dropped), in
+ * which case the original error stands.
+ */
+function withoutRejectedInputFields(
+  mutationName: string,
+  variables: Record<string, unknown>,
+  error: unknown,
+): Record<string, unknown> | null {
+  const droppable = DROPPABLE_INPUT_FIELDS[mutationName];
+  const input = variables.input;
+  if (!droppable || input === null || typeof input !== 'object') return null;
+  const rejected = droppable.filter((field) => field in input && graphqlErrorRejectsUnknownInputField(error, field));
+  if (rejected.length === 0) return null;
+  const trimmedInput: Record<string, unknown> = { ...(input as Record<string, unknown>) };
+  for (const field of rejected) delete trimmedInput[field];
+  return { ...variables, input: trimmedInput };
+}
 
 function buildDispatch(mutation: PendingMutation): MutationDispatch {
   let payload: Record<string, unknown>;
@@ -58,6 +111,20 @@ function buildDispatch(mutation: PendingMutation): MutationDispatch {
   }
 
   switch (mutation.table_name) {
+    case 'board_climbs':
+      switch (mutation.operation) {
+        case 'create':
+          return { mutationName: 'SaveClimb', variables: { input: payload } };
+        case 'update':
+          return {
+            mutationName: 'UpdateClimb',
+            variables: {
+              input: { ...payload, clientMutationId: mutation.idempotency_key.replace(/^climb:update:/, '') },
+            },
+          };
+        default:
+          throw new Error(`Unknown operation "${mutation.operation}" for table "${mutation.table_name}"`);
+      }
     case 'boardsesh_ticks':
       switch (mutation.operation) {
         case 'create':
@@ -208,6 +275,30 @@ function buildDispatch(mutation: PendingMutation): MutationDispatch {
           throw new Error(`Unknown operation "${mutation.operation}" for table "${mutation.table_name}"`);
       }
 
+    // The workout a climber followed in a session (#6903). The payload is the
+    // whole RecordSessionWorkoutInput; the server writes it only when its
+    // revision beats the stored one, so a replay is a no-op.
+    //
+    // A bundle from before this table (only after an OTA rollback across it,
+    // with a write still queued) throws `Unknown table` here: a plain Error, so
+    // retryable. The row sits at the head of the outbox, and every write
+    // behind it (ticks included) waits while it spends its 10 retries (about
+    // two drain cycles: one cycle tries up to 7 times within a minute or so);
+    // then it dead-letters and shows in Sync issues, and sign-out counts it as
+    // unsent until then. An older bundle cannot be taught to skip the row. A
+    // smaller budget would shorten that wait, but on this bundle it would
+    // dead-letter the End write on one bad minute of resolver errors.
+    case 'session_workouts':
+      switch (mutation.operation) {
+        case 'create':
+          return {
+            mutationName: 'RecordSessionWorkout',
+            variables: { input: payload },
+          };
+        default:
+          throw new Error(`Unknown operation "${mutation.operation}" for table "${mutation.table_name}"`);
+      }
+
     default:
       throw new Error(`Unknown table "${mutation.table_name}"`);
   }
@@ -219,5 +310,17 @@ export async function processMutation(mutation: PendingMutation, graphqlFetch: G
   if (!query) {
     throw new Error(`No GraphQL mutation defined for "${mutationName}"`);
   }
-  await graphqlFetch(query, variables);
+  const requestOptions = mutation.delivery_id ? { offlineWriteDeliveryId: mutation.delivery_id } : undefined;
+  try {
+    if (requestOptions) await graphqlFetch(query, variables, requestOptions);
+    else await graphqlFetch(query, variables);
+  } catch (error) {
+    // One retry, without the optional field the server said it does not know.
+    // Any other failure, and a failure of the retry, is thrown as it came so
+    // the drainer classifies it the way it always has.
+    const trimmedVariables = withoutRejectedInputFields(mutationName, variables, error);
+    if (!trimmedVariables) throw error;
+    if (requestOptions) await graphqlFetch(query, trimmedVariables, requestOptions);
+    else await graphqlFetch(query, trimmedVariables);
+  }
 }

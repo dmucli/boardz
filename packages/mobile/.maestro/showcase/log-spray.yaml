@@ -1,0 +1,43 @@
+appId: com.boardsesh.app
+name: showcase take - all-board progress
+---
+# Spray is included in global progress but is not offered by the native board
+# filter. Show the genuine All boards calendar without inventing a Spray row.
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/flow-start')}
+- scrollUntilVisible:
+    element:
+      id: 'profile-progress-filter'
+    direction: DOWN
+    timeout: 30000
+    centerElement: true
+# Retry only the idempotent open; a completed native tap can miss activation.
+- retry:
+    maxRetries: 1
+    commands:
+      - waitForAnimationToEnd
+      - runFlow:
+          when:
+            notVisible: '${SHOWCASE_ALL_BOARDS_LABEL}'
+          commands:
+            - tapOn:
+                id: 'profile-progress-filter'
+      - extendedWaitUntil:
+          visible: '${SHOWCASE_ALL_BOARDS_LABEL}'
+          timeout: 30000
+- tapOn: '${SHOWCASE_ALL_BOARDS_LABEL}'
+- tapOn: '${SHOWCASE_CLOSE_LABEL}'
+- waitForAnimationToEnd
+# The native chart's image accessibility label is not exposed by this Fabric
+# build. Its localized section heading is visible; the recorder still requires
+# the genuine activity-calendar anchor, and native visual review checks the grid.
+- scrollUntilVisible:
+    element: '${SHOWCASE_CALENDAR_LABEL}'
+    direction: DOWN
+    timeout: 30000
+    centerElement: true
+- assertVisible: '${SHOWCASE_CALENDAR_LABEL}'
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/scrolled')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 10000
+    optional: true

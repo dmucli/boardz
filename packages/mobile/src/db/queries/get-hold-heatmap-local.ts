@@ -1,15 +1,31 @@
-import { aggregateHoldUsage, ensureHoldIndex, getLocalUserId, type OfflineDatabase } from '@boardsesh/offline-sync';
+import {
+  aggregateHoldUsage,
+  decodeSqliteBlobHex,
+  ensureHoldIndex,
+  getLocalUserId,
+  isScopeDownloadComplete,
+  offlineBoardKey,
+  readHoldIndexGeneration,
+  type OfflineDatabase,
+} from '@boardsesh/offline-sync';
 import type { ClimbSearchInput, HoldStat } from '@boardsesh/shared-schema';
 import { parseHoldRows } from '../../offline/hold-index-parser';
 import { followedAuthorsLocalCondition } from './followed-authors-local';
 import {
   buildJoinAndWhere,
   effectiveStatsSql,
+  effectiveDisplayDifficultySql,
   isCrossAngleStats,
   isOfflineSearchSupported,
 } from './search-climbs-local';
 
-type HoldSetRow = { holds: unknown; ascensionist_count?: number | null; display_difficulty?: number | null };
+const HOLD_HEATMAP_PAGE_CLIMBS = 1000;
+type HoldSetRow = {
+  climb_id: number;
+  holds_hex: string;
+  ascensionist_count?: number | null;
+  display_difficulty?: number | null;
+};
 
 /**
  * On-device twin of the server's `holdHeatmap` (packages/db/src/queries/climbs/
@@ -18,7 +34,7 @@ type HoldSetRow = { holds: unknown; ascensionist_count?: number | null; display_
  * The climb set is the climbs list's own — `buildJoinAndWhere` from
  * search-climbs-local.ts, with the same owner stamp and followed-authors
  * condition the list passes, so the personal-progress filters obey the
- * auth-scoping contract in docs/offline-reads.md — joined to the packed hold sets
+ * auth-scoping contract in docs/data/offline-reads.md — joined to the packed hold sets
  * of the device-derived holds index. The rows are folded in JS by
  * `aggregateHoldUsage` instead of a GROUP BY over per-hold rows (the index has
  * none; see holds-index/query.ts in @boardsesh/offline-sync).
@@ -63,52 +79,96 @@ export async function getHoldHeatmapLocalWithCount(
 ): Promise<HoldHeatmapLocalResult> {
   if (!isOfflineSearchSupported(input)) return { holdStats: [], climbCount: 0 };
 
-  const build = await ensureHoldIndex(
-    db,
-    { boardType: input.boardName, layoutId: input.layoutId, sizeId: input.sizeId },
-    { parseHoldRows },
-  );
+  const scope = { boardType: input.boardName, layoutId: input.layoutId, sizeId: input.sizeId };
+  const scopeKey = offlineBoardKey(scope);
+  const ownerUserId = await getLocalUserId(db);
+  const generation = await readHoldIndexGeneration(db, input.boardName, input.layoutId);
+  const build = await ensureHoldIndex(db, scope, { parseHoldRows });
   // A partial index would undercount every hold. Throw so React Query retries
   // rather than caching a heatmap built from half the board.
   if (build.status === 'aborted') throw new Error('Hold heatmap: holds index build was interrupted');
 
-  const ownerUserId = await getLocalUserId(db);
+  if (build.status === 'not-downloaded') throw new Error('Hold heatmap: scope is no longer downloaded');
+
+  const assertReadCurrent = async () => {
+    if (
+      (await getLocalUserId(db)) !== ownerUserId ||
+      (await readHoldIndexGeneration(db, input.boardName, input.layoutId)) !== generation ||
+      !(await isScopeDownloadComplete(db, scopeKey))
+    ) {
+      throw new Error('Hold heatmap: account or downloaded scope changed during read');
+    }
+  };
   const followedCondition = input.onlyFollowedAuthors ? await followedAuthorsLocalCondition(db) : undefined;
   const { joinSql, whereSql, joinBinds, whereBinds } = buildJoinAndWhere(input, ownerUserId, followedCondition);
   const crossAngle = isCrossAngleStats(input);
   const statsColumns = withStats
     ? `,
        ${effectiveStatsSql('ascensionist_count', crossAngle)} AS ascensionist_count,
-       ${effectiveStatsSql('display_difficulty', crossAngle)} AS display_difficulty`
+       ${effectiveDisplayDifficultySql(input.boardName, crossAngle)} AS display_difficulty`
     : '';
 
-  const rows = await db.getAllAsync<HoldSetRow>(
-    `SELECT hs.holds${statsColumns}
-     FROM board_climbs c
-     JOIN holds_index_climbs hic ON hic.uuid = c.uuid
-     JOIN board_climb_hold_sets hs ON hs.climb_id = hic.id
-     ${joinSql}
-     WHERE ${whereSql}`,
-    [...joinBinds, ...whereBinds],
-  );
-
+  // Let SQLite choose the board/filter index once, rather than scanning every
+  // downloaded board for each page. Only numeric IDs survive this query; fixing
+  // the candidate set also prevents concurrent imports from extending the read.
+  const readCandidateIds = async (): Promise<number[]> => {
+    const candidates = await db.getAllAsync<{ climb_id: number }>(
+      `SELECT hs.climb_id
+       FROM board_climbs c
+       JOIN holds_index_climbs hic ON hic.uuid = c.uuid
+       JOIN board_climb_hold_sets hs ON hs.climb_id = hic.id
+       ${joinSql}
+       WHERE ${whereSql}`,
+      [...joinBinds, ...whereBinds],
+    );
+    return candidates.map((candidate) => candidate.climb_id);
+  };
+  await assertReadCurrent();
+  const candidateIds = await readCandidateIds();
+  const usage = aggregateHoldUsage([]);
   let climbCount = 0;
-  const holdStats = holdUsageToStats(
+
+  const foldPage = async (pageIds: number[]): Promise<void> => {
+    // CROSS JOIN keeps these bounded primary-key lookups first, including when
+    // filters stop matching during sync. Stats joins are 0/1 rows.
+    // Text crosses Expo's bridge without one JNI global reference per BLOB.
+    const rows = await db.getAllAsync<HoldSetRow>(
+      `SELECT hs.climb_id, hex(hs.holds) AS holds_hex${statsColumns}
+       FROM board_climb_hold_sets hs
+       CROSS JOIN holds_index_climbs hic ON hic.id = hs.climb_id
+       CROSS JOIN board_climbs c ON c.uuid = hic.uuid
+       ${joinSql}
+       WHERE (${whereSql}) AND hs.climb_id IN (${pageIds.map(() => '?').join(',')})`,
+      [...joinBinds, ...whereBinds, ...pageIds],
+    );
     aggregateHoldUsage(
       (function* decodeRows() {
         for (const row of rows) {
-          if (!(row.holds instanceof Uint8Array)) continue;
+          const holds = decodeSqliteBlobHex(row.holds_hex);
+          if (!holds) throw new Error('Hold heatmap: invalid encoded hold set');
           climbCount++;
           yield {
-            holds: row.holds,
+            holds,
             ascents: row.ascensionist_count ?? null,
             difficulty: row.display_difficulty ?? null,
           };
         }
       })(),
-    ),
-  );
-  return { holdStats, climbCount };
+      usage,
+    );
+  };
+
+  await assertReadCurrent();
+  for (let offset = 0; offset < candidateIds.length; offset += HOLD_HEATMAP_PAGE_CLIMBS) {
+    await foldPage(candidateIds.slice(offset, offset + HOLD_HEATMAP_PAGE_CLIMBS));
+    await assertReadCurrent();
+    if (offset + HOLD_HEATMAP_PAGE_CLIMBS >= candidateIds.length) break;
+    // Only numeric candidate IDs and aggregates survive this yield.
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    // Other async database work can run during the yield, including teardown.
+    await assertReadCurrent();
+  }
+  return { holdStats: holdUsageToStats(usage), climbCount };
 }
 
 /** The aggregate in the GraphQL `HoldStat` shape, ordered by hold id. */

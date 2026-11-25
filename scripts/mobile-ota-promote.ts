@@ -3,7 +3,7 @@
 /**
  * Promote the archived, already-exported main OTA to the existing production branch.
  * xprem cannot republish across branches. This speaks the same upload/finalize
- * protocol as eoas@3.2.4, but never runs Expo export again. That protocol changed
+ * protocol as eoas@3.2.6, but never runs Expo export again. That protocol changed
  * at 3.2.0: requestUploadUrl takes a `files` list (path, content hash, md5 cache
  * key and role) instead of `fileNames`, and a server on either side of that line
  * rejects the other shape, so this file moves with EOAS_PACKAGE_SPEC. The pipeline must first
@@ -11,15 +11,59 @@
  *
  * vp exec tsx scripts/mobile-ota-promote.ts --receipt ota-stage/receipt.json \
  *   --ios-export ota-stage/ios --android-export ota-stage/android
+ *
+ * `--branch <name>` (default `production`) promotes to another branch of the same
+ * channel, and `--capture-baseline` takes the same flag. The channel is always
+ * `production`: it is baked into every binary, and a device reaches another
+ * branch only through the `xprem-branch` header.
+ *
+ * `--rollout-percentage <1-99> --rollout-receipt <path>` starts the update as a
+ * rollout to that share of devices. A rollout cannot be confirmed through the
+ * anonymous manifest, which serves one device's view, so this mode reads the
+ * rollout itself and needs the admin login (`OTA_ADMIN_EMAIL`,
+ * `OTA_ADMIN_PASSWORD`) next to `EOO_TOKEN`. For the same reason it does NOT run
+ * the served-bytes check the default mode ends with: it confirms that the leased
+ * update is rolling out, and the bytes are covered only by the content hashes
+ * the server validated at upload.
+ *
+ * It is safe to re-run. The update ids it was leased are written to the rollout
+ * receipt, and a platform whose live rollout carries its recorded id (and its
+ * commit) counts as done. Any other live rollout is refused.
  */
 
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, lstatSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
-import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
+import {
+  DEFAULT_BRANCH,
+  UPDATE_ID,
+  UUID,
+  buildSourcemapUpload,
+  buildUploadFiles,
+  finalizeUpload,
+  object,
+  parseServedManifest,
+  parseUploadLease,
+  requestManifest,
+  requestUploadLease,
+  requireSuccess,
+  sentenceLabel,
+  sleep,
+  string,
+  uploadLeaseFiles,
+  uploadServerBase,
+  validateExport,
+} from './lib/ota-publish-protocol.ts';
+import type { OtaPlatform, PublishTarget, UploadLease, ValidatedExport } from './lib/ota-publish-protocol.ts';
+import { adminClientFromEnvironment, sameId } from './lib/xprem-admin.mts';
+import type { XpremAdminClient, XpremId } from './lib/xprem-admin.mts';
 
-export type OtaPlatform = 'ios' | 'android';
+import { validateUnlockReceipt } from './lib/ota-unlock-receipt.ts';
+import type { UnlockProof } from './lib/ota-unlock-receipt.ts';
+
+export { validateExport };
 
 export interface StageReceipt {
   commitHash: string;
@@ -28,66 +72,33 @@ export interface StageReceipt {
   baselineProductionUpdateIds: Record<OtaPlatform, string | null>;
 }
 
-interface ExportFile {
-  relativePath: string;
-  absolutePath: string;
-}
-
-interface ValidatedExport {
-  platform: OtaPlatform;
-  appId: string;
-  files: Map<string, ExportFile>;
-  bundlePath: string;
-  assetPaths: string[];
-  assetExtensions: Map<string, string>;
-  expoConfig: Record<string, unknown>;
-}
-
-interface UploadRequest {
-  requestUploadUrl: string;
-  fileName: string;
-  filePath: string;
-  headers?: Record<string, string>;
-}
-
-interface UploadLease {
-  updateId: string;
-  uploadRequests: UploadRequest[];
-}
-
-/** What a published file is to the update, as the server reads it (eoas 3.2.4 FileRole). */
-export type UploadFileRole = 'launch' | 'asset' | 'config';
-
-/** One entry of the requestUploadUrl `files` list (eoas 3.2.4 FileUploadItem). */
-export interface UploadFileItem {
-  path: string;
-  /** SHA-256, base64url without padding: the manifest hash and the object key under {appId}/cas/. */
-  hash: string;
-  /** MD5 hex: the on-device cache key expo-updates uses. Absent for config files. */
-  key?: string;
-  ext?: string;
-  role: UploadFileRole;
-}
-
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-// xprem derives update IDs from content hashes, so they have the 8-4-4-4-12 shape
-// without RFC 4122 version and variant digits: production served
-// `a96bbffc-e084-91c9-61ee-0107f5b6857b` on 2026-09-26. App IDs stay strict.
-const UPDATE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256 = /^[0-9a-f]{64}$/i;
-const COMMIT_SHA = /^[0-9a-f]{40}$/i;
+const BRANCH_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-function object(input: unknown, label: string): Record<string, unknown> {
-  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
-    throw new Error(`${label} must be an object.`);
-  }
-  return input as Record<string, unknown>;
-}
-
-function string(input: unknown, label: string): string {
-  if (typeof input !== 'string') throw new Error(`${label} must be a string.`);
+function branchName(input: string): string {
+  if (!BRANCH_NAME.test(input)) throw new Error(`Invalid branch name: ${JSON.stringify(input)}.`);
   return input;
 }
+
+/** What rollout mode reads from the admin API. */
+export type RolloutReader = Pick<XpremAdminClient, 'getUpdateRollout' | 'getUpdateDetails'>;
+/** Only trusted main jobs may supply an authenticated reader for empty-branch bootstrap. */
+export type EmptyBranchReader = Pick<XpremAdminClient, 'getBranches' | 'getChannels' | 'getRuntimeVersions'>;
+
+export async function connectEmptyBranchReader(manifestUrl: string, appId: string): Promise<EmptyBranchReader> {
+  if (process.env.GITHUB_REF !== 'refs/heads/main') {
+    throw new Error('Authenticated empty-target verification only runs from main.');
+  }
+  return adminClientFromEnvironment({
+    appId,
+    defaultBaseUrl: manifestUrl,
+    environment: {
+      OTA_ADMIN_EMAIL: process.env.OTA_ADMIN_EMAIL,
+      OTA_ADMIN_PASSWORD: process.env.OTA_ADMIN_PASSWORD,
+    },
+  });
+}
+const COMMIT_SHA = /^[0-9a-f]{40}$/i;
 
 export function parseStageReceipt(input: unknown): StageReceipt {
   const raw = object(input, 'Stage receipt');
@@ -117,158 +128,51 @@ export function parseStageReceipt(input: unknown): StageReceipt {
   return { commitHash, message, platforms: parsedPlatforms, baselineProductionUpdateIds };
 }
 
-function normalizedPath(input: string): string {
-  if (!input || input.includes('\0') || input.includes('\\') || isAbsolute(input) || /^[a-z]:[/\\]/i.test(input)) {
-    throw new Error(`Unsafe Expo export path: ${JSON.stringify(input)}.`);
-  }
-  const segments = input.split('/');
-  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
-    throw new Error(`Expo export path is not normalized: ${input}.`);
-  }
-  return input;
-}
-
-function regularExportFile(root: string, declaredPath: string): ExportFile {
-  const relativePath = normalizedPath(declaredPath);
-  let current = root;
-  for (const segment of relativePath.split('/')) {
-    current = join(current, segment);
-    if (!existsSync(current)) throw new Error(`Expo export file is missing: ${relativePath}.`);
-    if (lstatSync(current).isSymbolicLink())
-      throw new Error(`Expo export path contains a symbolic link: ${relativePath}.`);
-  }
-  if (!statSync(current).isFile()) throw new Error(`Expo export path is not a regular file: ${relativePath}.`);
-  const relativeRealPath = relative(root, realpathSync(current));
-  if (relativeRealPath === '..' || relativeRealPath.startsWith(`..${sep}`) || isAbsolute(relativeRealPath)) {
-    throw new Error(`Expo export path escapes archive: ${relativePath}.`);
-  }
-  return { relativePath, absolutePath: current };
-}
-
-export function validateExport(
-  exportDir: string,
-  platform: OtaPlatform,
-  expectedBundleSha256: string,
-): ValidatedExport {
-  const absoluteRoot = resolve(exportDir);
-  if (!existsSync(absoluteRoot) || !statSync(absoluteRoot).isDirectory() || lstatSync(absoluteRoot).isSymbolicLink()) {
-    throw new Error(`${platform} export directory is missing or symbolic.`);
-  }
-  const root = realpathSync(absoluteRoot);
-  const metadataFile = regularExportFile(root, 'metadata.json');
-  const expoConfigFile = regularExportFile(root, 'expoConfig.json');
-  const metadata = object(JSON.parse(readFileSync(metadataFile.absolutePath, 'utf8')) as unknown, 'metadata.json');
-  if (metadata.version !== 0 || metadata.bundler !== 'metro') throw new Error('Expo metadata must be Metro version 0.');
-  const fileMetadata = object(metadata.fileMetadata, 'metadata.json fileMetadata');
-  if (Object.keys(fileMetadata).length !== 1 || !(platform in fileMetadata)) {
-    throw new Error(`${platform} export must contain exactly one platform's metadata.`);
-  }
-  const platformMetadata = object(fileMetadata[platform], `${platform} metadata`);
-  const bundlePath = string(platformMetadata.bundle, `${platform} bundle`);
-  if (!/\.(?:js|hbc)$/.test(bundlePath)) throw new Error(`${platform} bundle must be JavaScript or Hermes bytecode.`);
-  if (!Array.isArray(platformMetadata.assets)) throw new Error(`${platform} metadata assets must be an array.`);
-
-  const files = new Map<string, ExportFile>();
-  const assetPaths: string[] = [];
-  const assetExtensions = new Map<string, string>();
-  const addFile = (declaredPath: string): void => {
-    const file = regularExportFile(root, declaredPath);
-    if (files.has(file.relativePath)) throw new Error(`Duplicate Expo export path: ${file.relativePath}.`);
-    files.set(file.relativePath, file);
-  };
-  addFile('metadata.json');
-  addFile('expoConfig.json');
-  addFile(bundlePath);
-  for (const [index, assetInput] of platformMetadata.assets.entries()) {
-    const asset = object(assetInput, `${platform} asset ${index}`);
-    const assetPath = string(asset.path, `${platform} asset ${index} path`);
-    const extension = string(asset.ext, `${platform} asset ${index} ext`);
-    // `expo export` writes assets under their content hash with no extension
-    // (`assets/0a328cd9…`) and records the type in `ext`. Accept that shape, or a
-    // path whose own extension agrees with `ext`; reject anything else.
-    const assetName = assetPath.split('/').pop() ?? '';
-    const dot = assetName.lastIndexOf('.');
-    const shapeMatches = dot === -1 ? /^[0-9a-f]{32}$/i.test(assetName) : assetName.slice(dot + 1) === extension;
-    if (!/^[a-z0-9]+$/i.test(extension) || !shapeMatches)
-      throw new Error(`${platform} asset extension mismatch: ${assetPath}.`);
-    addFile(assetPath);
-    assetPaths.push(assetPath);
-    assetExtensions.set(assetPath, extension);
-  }
-
-  const bundle = files.get(bundlePath);
-  if (!bundle || statSync(bundle.absolutePath).size === 0) throw new Error(`${platform} bundle is empty.`);
-  const actualHash = createHash('sha256').update(readFileSync(bundle.absolutePath)).digest('hex');
-  if (actualHash !== expectedBundleSha256.toLowerCase())
-    throw new Error(`${platform} bundle SHA-256 differs from stage receipt.`);
-
-  const expoConfig = object(
-    JSON.parse(readFileSync(expoConfigFile.absolutePath, 'utf8')) as unknown,
-    'expoConfig.json',
-  );
-  const updates = object(expoConfig.updates, 'expoConfig.json updates');
-  const requestHeaders = object(updates.requestHeaders, 'expoConfig.json updates.requestHeaders');
-  const appId = string(requestHeaders['expo-app-id'], 'expo-app-id');
-  if (!UUID.test(appId)) throw new Error('expo-app-id must be a UUID.');
-  return { platform, appId, files, bundlePath, assetPaths, assetExtensions, expoConfig };
-}
-
-function fileDigest(absolutePath: string): { hash: string; key: string } {
-  const bytes = readFileSync(absolutePath);
-  return {
-    hash: createHash('sha256').update(bytes).digest('base64url'),
-    key: createHash('md5').update(bytes).digest('hex'),
-  };
-}
-
-/**
- * The `files` list eoas 3.2.4 sends for one platform (buildUploadFiles +
- * computeFilesRequests): the two config files, the launch bundle and each asset,
- * each with its digest and role. The server validates every entry and refuses a
- * publish without exactly one launch asset.
- */
-export function buildUploadFiles(exportFiles: ValidatedExport): UploadFileItem[] {
-  const fileAt = (relativePath: string): ExportFile => {
-    const file = exportFiles.files.get(relativePath);
-    if (!file) throw new Error(`${exportFiles.platform} export file disappeared: ${relativePath}.`);
-    return file;
-  };
-  const configFiles = ['metadata.json', 'expoConfig.json'].map((relativePath): UploadFileItem => ({
-    path: relativePath,
-    hash: fileDigest(fileAt(relativePath).absolutePath).hash,
-    role: 'config',
-  }));
-  const launchAsset: UploadFileItem = {
-    path: exportFiles.bundlePath,
-    ...fileDigest(fileAt(exportFiles.bundlePath).absolutePath),
-    // eoas stamps every launch bundle `hbc`, whatever its path says.
-    ext: 'hbc',
-    role: 'launch',
-  };
-  const assets = exportFiles.assetPaths.map((assetPath): UploadFileItem => ({
-    path: assetPath,
-    ...fileDigest(fileAt(assetPath).absolutePath),
-    ext: exportFiles.assetExtensions.get(assetPath),
-    role: 'asset',
-  }));
-  return [...configFiles, launchAsset, ...assets];
-}
-
-export function parsePromoteArgs(argv: string[]): { receipt: string; iosExport: string; androidExport: string } {
+export function parsePromoteArgs(argv: string[]): {
+  receipt: string;
+  iosExport: string;
+  androidExport: string;
+  branch: string;
+  rolloutPercentage: number | null;
+  rolloutReceipt: string | null;
+  verifyEmptyTarget: boolean;
+} {
+  const pathFlags = ['--receipt', '--ios-export', '--android-export', '--rollout-receipt'];
   const args: Record<string, string> = {};
   for (let index = 0; index < argv.length; index++) {
     const flag = argv[index];
     if (flag === '--') continue;
-    if (!['--receipt', '--ios-export', '--android-export'].includes(flag))
+    if (flag === '--verify-empty-target') continue;
+    if (![...pathFlags, '--branch', '--rollout-percentage'].includes(flag))
       throw new Error(`Unknown argument: ${flag}.`);
     const argument = argv[++index];
-    if (!argument || argument.startsWith('--')) throw new Error(`${flag} needs a path.`);
+    if (!argument || argument.startsWith('--'))
+      throw new Error(`${flag} needs a ${pathFlags.includes(flag) ? 'path' : 'value'}.`);
     args[flag] = argument;
   }
   if (!args['--receipt'] || !args['--ios-export'] || !args['--android-export']) {
     throw new Error('Provide --receipt, --ios-export, and --android-export.');
   }
-  return { receipt: args['--receipt'], iosExport: args['--ios-export'], androidExport: args['--android-export'] };
+  let rolloutPercentage: number | null = null;
+  if (args['--rollout-percentage'] !== undefined) {
+    rolloutPercentage = Number(args['--rollout-percentage']);
+    if (!Number.isInteger(rolloutPercentage) || rolloutPercentage < 1 || rolloutPercentage > 99) {
+      throw new Error('--rollout-percentage must be a whole number from 1 to 99.');
+    }
+  }
+  const rolloutReceipt = args['--rollout-receipt'] ?? null;
+  if ((rolloutPercentage === null) !== (rolloutReceipt === null)) {
+    throw new Error('--rollout-percentage and --rollout-receipt go together.');
+  }
+  return {
+    receipt: args['--receipt'],
+    iosExport: args['--ios-export'],
+    androidExport: args['--android-export'],
+    branch: branchName(args['--branch'] ?? DEFAULT_BRANCH),
+    rolloutPercentage,
+    rolloutReceipt,
+    verifyEmptyTarget: argv.includes('--verify-empty-target'),
+  };
 }
 
 export function parseCaptureArgs(argv: string[]): {
@@ -276,12 +180,15 @@ export function parseCaptureArgs(argv: string[]): {
   iosRuntime: string;
   androidRuntime: string;
   out: string;
+  branch: string;
+  verifyEmptyTarget: boolean;
 } {
   const args: Record<string, string> = {};
   for (let index = 0; index < argv.length; index++) {
     const flag = argv[index];
     if (flag === '--capture-baseline') continue;
-    if (!['--app-id', '--ios-runtime', '--android-runtime', '--out'].includes(flag)) {
+    if (flag === '--verify-empty-target') continue;
+    if (!['--app-id', '--ios-runtime', '--android-runtime', '--out', '--branch'].includes(flag)) {
       throw new Error(`Unknown capture argument: ${flag}.`);
     }
     const argument = argv[++index];
@@ -297,233 +204,79 @@ export function parseCaptureArgs(argv: string[]): {
   if (!androidRuntime || !/^[0-9a-f]{40}$/i.test(androidRuntime))
     throw new Error('--android-runtime must be a fingerprint SHA.');
   if (!out) throw new Error('--out is required.');
-  return { appId, iosRuntime, androidRuntime, out };
+  return {
+    appId,
+    iosRuntime,
+    androidRuntime,
+    out,
+    branch: branchName(args['--branch'] ?? DEFAULT_BRANCH),
+    verifyEmptyTarget: argv.includes('--verify-empty-target'),
+  };
 }
 
-export function uploadServerBase(manifestUrl: string): URL {
-  const parsed = new URL(manifestUrl);
-  if (
-    parsed.protocol !== 'https:' &&
-    !(parsed.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(parsed.hostname))
-  ) {
-    throw new Error('EXPO_UPDATES_URL must be HTTPS (HTTP is allowed only for localhost).');
-  }
-  if (!parsed.pathname.endsWith('/manifest') || parsed.search || parsed.hash) {
-    throw new Error('EXPO_UPDATES_URL must end in /manifest without a query or fragment.');
-  }
-  parsed.pathname = parsed.pathname.slice(0, -'/manifest'.length);
-  return parsed;
-}
-
-function controlUrl(base: URL, appId: string, action: string): URL {
-  return new URL(`${base.toString().replace(/\/$/, '')}/${appId}/${action}/production`);
-}
-
-function isLocalUpload(target: URL, base: URL, appId: string): boolean {
-  return (
-    target.origin === base.origin && target.pathname === `${base.pathname.replace(/\/$/, '')}/${appId}/uploadLocalFile`
-  );
-}
-
-function parseUploadLease(input: unknown, exportFiles: Map<string, ExportFile>, base: URL, appId: string): UploadLease {
-  const lease = object(input, 'Upload lease');
-  const updateIdRaw = lease.updateId;
-  const updateId =
-    typeof updateIdRaw === 'number' && Number.isSafeInteger(updateIdRaw)
-      ? String(updateIdRaw)
-      : typeof updateIdRaw === 'string' && /^\d+$/.test(updateIdRaw)
-        ? updateIdRaw
-        : null;
-  if (!updateId) throw new Error('Upload lease has no valid updateId.');
-  if (!Array.isArray(lease.uploadRequests)) throw new Error('Upload lease has no uploadRequests array.');
-  const seen = new Set<string>();
-  const uploadRequests = lease.uploadRequests.map((itemInput, index): UploadRequest => {
-    const item = object(itemInput, `Upload request ${index}`);
-    const filePath = string(item.filePath, `Upload request ${index} filePath`);
-    const fileName = string(item.fileName, `Upload request ${index} fileName`);
-    if (!exportFiles.has(filePath) || normalizedPath(filePath) !== filePath || fileName !== basename(filePath)) {
-      throw new Error(`Upload request ${index} is not an exported file: ${filePath}.`);
-    }
-    if (seen.has(filePath)) throw new Error(`Duplicate upload request for ${filePath}.`);
-    seen.add(filePath);
-    const requestUploadUrl = string(item.requestUploadUrl, `Upload request ${index} URL`);
-    const target = new URL(requestUploadUrl);
-    if (target.protocol !== 'https:' && !(target.protocol === 'http:' && isLocalUpload(target, base, appId))) {
-      throw new Error(`Upload request ${index} uses an unsafe URL.`);
-    }
-    if (target.username || target.password || target.hash)
-      throw new Error(`Upload request ${index} URL has unsafe components.`);
-    let headers: Record<string, string> | undefined;
-    if (item.headers !== undefined) {
-      const rawHeaders = object(item.headers, `Upload request ${index} headers`);
-      headers = {};
-      for (const [key, header] of Object.entries(rawHeaders)) {
-        if (!/^[A-Za-z0-9-]+$/.test(key) || typeof header !== 'string' || /[\r\n]/.test(header)) {
-          throw new Error(`Upload request ${index} has an invalid header.`);
-        }
-        headers[key] = header;
-      }
-    }
-    return { requestUploadUrl, fileName, filePath, headers };
-  });
-  // xprem stores files by content hash and skips any it already holds, so
-  // uploadRequests can legitimately be only a subset of requested files.
-  return { updateId, uploadRequests };
-}
-
-function contentType(filePath: string, assetExtension?: string): string {
-  const extension = (assetExtension ?? filePath.split('.').pop())?.toLowerCase();
-  if (extension === 'json' || extension === 'map') return 'application/json';
-  if (extension === 'xml') return 'application/xml';
-  if (extension === 'js') return 'application/javascript';
-  if (extension === 'png') return 'image/png';
-  if (extension === 'jpg' || extension === 'jpeg') return 'image/jpeg';
-  if (extension === 'webp') return 'image/webp';
-  if (extension === 'svg') return 'image/svg+xml';
-  if (extension === 'ttf') return 'font/ttf';
-  if (extension === 'otf') return 'font/otf';
-  return 'application/octet-stream';
-}
-
-async function requireSuccess(response: Response, action: string): Promise<void> {
-  if (!response.ok) throw new Error(`${action} failed (${response.status}): ${(await response.text()).slice(0, 300)}.`);
-}
-
-const sleep = (delayMs: number): Promise<void> => new Promise((done) => setTimeout(done, delayMs));
-
-async function fetchWithRetry(
-  fetchImpl: typeof fetch,
-  input: RequestInfo | URL,
-  init: RequestInit | (() => RequestInit),
-  beforeAttempt?: () => Promise<void>,
-): Promise<Response> {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      await beforeAttempt?.();
-      // Multipart bodies are streams. Rebuild them for each local-bucket retry.
-      const response = await fetchImpl(input, typeof init === 'function' ? init() : init);
-      if (response.status !== 429 && response.status < 500) return response;
-      if (attempt === 3) return response;
-      await response.body?.cancel();
-      const retryAfterSeconds = Number(response.headers.get('Retry-After'));
-      const delayMs =
-        Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-          ? Math.min(retryAfterSeconds * 1_000, 10_000)
-          : 1_000 * 2 ** attempt;
-      await sleep(delayMs);
-    } catch (error) {
-      if (attempt === 3) throw error;
-      await sleep(1_000 * 2 ** attempt);
-    }
-  }
-  throw new Error('OTA request retry loop exhausted.');
-}
-
-async function uploadLeaseFiles(
-  lease: UploadLease,
-  exportFiles: ValidatedExport,
-  base: URL,
-  appId: string,
-  token: string,
-  fetchImpl: typeof fetch,
-  paceUpload: () => Promise<void>,
+async function assertEmptyTargetRuntime(
+  reader: EmptyBranchReader,
+  branch: string,
+  runtimeVersion: string,
 ): Promise<void> {
-  for (const request of lease.uploadRequests) {
-    const file = exportFiles.files.get(request.filePath);
-    if (!file) throw new Error(`Unvalidated upload file: ${request.filePath}.`);
-    const bytes = readFileSync(file.absolutePath);
-    if (isLocalUpload(new URL(request.requestUploadUrl), base, appId)) {
-      await requireSuccess(
-        await fetchWithRetry(
-          fetchImpl,
-          request.requestUploadUrl,
-          () => {
-            const form = new FormData();
-            form.append(request.fileName, new Blob([bytes]), request.fileName);
-            return {
-              method: 'PUT',
-              // Since 3.2.0 the local-bucket upload token travels in a header the
-              // lease names, alongside the publish credential.
-              headers: { ...request.headers, Authorization: `Bearer ${token}` },
-              body: form,
-              redirect: 'error',
-            };
-          },
-          paceUpload,
-        ),
-        `Local upload ${request.filePath}`,
-      );
-    } else {
-      await requireSuccess(
-        await fetchWithRetry(
-          fetchImpl,
-          request.requestUploadUrl,
-          {
-            method: 'PUT',
-            headers: {
-              'Content-Type': contentType(request.filePath, exportFiles.assetExtensions.get(request.filePath)),
-              'Cache-Control': 'max-age=31556926',
-              ...request.headers,
-            },
-            body: bytes,
-            redirect: 'error',
-          },
-          paceUpload,
-        ),
-        `Asset upload ${request.filePath}`,
-      );
-    }
+  const target = (await reader.getBranches()).find((entry) => entry.branchName === branch);
+  if (!target?.protected || target.branchId === null) throw new Error(`${branch} is not an existing protected branch.`);
+  const channel = (await reader.getChannels()).find((entry) => entry.releaseChannelName === DEFAULT_BRANCH);
+  if (
+    channel?.branchName !== DEFAULT_BRANCH ||
+    channel.rollout !== null ||
+    !channel.branchSurfing?.enabled ||
+    channel.branchSurfing.pattern !== 'pr-*' ||
+    !branch.startsWith('pr-')
+  ) {
+    throw new Error(`${branch} empty baseline cannot be verified under the current production channel configuration.`);
+  }
+  // Runtime absence is authoritative across both platforms. A picker omission or
+  // a single page of update history cannot establish that no target head exists.
+  if ((await reader.getRuntimeVersions(branch)).includes(runtimeVersion)) {
+    throw new Error(`${branch} already has runtime ${runtimeVersion}; refusing a production fallback baseline.`);
   }
 }
 
-function parseServedManifest(responseText: string): Record<string, unknown> | null {
-  // xprem serves multipart/mixed for signed manifests, plain JSON for others.
-  // A recognized noUpdateAvailable directive is the only evidence of absence.
-  let noUpdateAvailable = false;
-  for (const part of responseText.split(/\r?\n--[^\r\n]+/)) {
-    const body = part.includes('\r\n\r\n') ? part.slice(part.indexOf('\r\n\r\n') + 4).trim() : part.trim();
-    let candidate: Record<string, unknown>;
-    try {
-      candidate = object(JSON.parse(body) as unknown, 'Manifest');
-    } catch {
-      // Multipart signature and metadata parts are not update manifests.
-      continue;
-    }
-    if (candidate.launchAsset !== undefined) return candidate;
-    if (candidate.type === 'noUpdateAvailable') noUpdateAvailable = true;
-    if (candidate.type === 'rollBackToEmbedded') throw new Error('Production is serving a rollback directive.');
-  }
-  if (noUpdateAvailable) return null;
-  throw new Error('Production did not serve an Expo update manifest.');
-}
-
-async function readProductionManifest(
+export async function readProductionManifest(
   manifestUrl: string,
   platform: OtaPlatform,
   runtimeVersion: string,
   appId: string,
   fetchImpl: typeof fetch,
+  branch: string,
+  emptyBranchReader?: EmptyBranchReader,
 ): Promise<Record<string, unknown> | null> {
-  const response = await fetchWithRetry(fetchImpl, manifestUrl, {
-    method: 'GET',
-    headers: {
-      'expo-protocol-version': '1',
-      'expo-platform': platform,
-      'expo-runtime-version': runtimeVersion,
-      'expo-channel-name': 'production',
-      'expo-app-id': appId,
-      'xprem-branch': '',
-      Accept: 'multipart/mixed',
-    },
-    redirect: 'error',
-  });
-  await requireSuccess(response, `${platform} production manifest probe`);
-  const manifest = parseServedManifest(await response.text());
-  if (manifest === null) return null;
+  const response = await requestManifest({ manifestUrl, platform, runtimeVersion, appId, branch, fetchImpl });
+  await requireSuccess(response, `${platform} ${branch} manifest probe`);
+  const manifest = parseServedManifest(await response.text(), branch);
+  if (manifest === null) {
+    if (branch !== DEFAULT_BRANCH && emptyBranchReader) {
+      await assertEmptyTargetRuntime(emptyBranchReader, branch, runtimeVersion);
+    }
+    return null;
+  }
   if (manifest.runtimeVersion !== runtimeVersion)
-    throw new Error(`${platform} production runtimeVersion differs from staged runtime.`);
-  const extra = object(manifest.extra, 'Production manifest extra');
-  if (extra.branch !== 'production') throw new Error(`${platform} manifest is not from the production branch.`);
+    throw new Error(`${platform} ${branch} runtimeVersion differs from staged runtime.`);
+  const extra = object(manifest.extra, `${sentenceLabel(branch)} manifest extra`);
+  if (extra.branch !== branch) {
+    if (branch !== DEFAULT_BRANCH && extra.branch === DEFAULT_BRANCH && emptyBranchReader) {
+      const expoConfig = object(extra.expoClient, `${platform} fallback Expo config`);
+      const updates = object(expoConfig.updates, `${platform} fallback updates config`);
+      const headers = object(updates.requestHeaders, `${platform} fallback request headers`);
+      if (
+        headers['expo-app-id'] !== appId ||
+        headers['expo-channel-name'] !== DEFAULT_BRANCH ||
+        typeof manifest.id !== 'string' ||
+        !UPDATE_ID.test(manifest.id)
+      ) {
+        throw new Error(`${platform} production fallback manifest has invalid app, channel or update identity.`);
+      }
+      await assertEmptyTargetRuntime(emptyBranchReader, branch, runtimeVersion);
+      return null;
+    }
+    throw new Error(`${platform} manifest is not from the ${branch} branch.`);
+  }
   return manifest;
 }
 
@@ -533,11 +286,21 @@ async function productionUpdateId(
   runtimeVersion: string,
   appId: string,
   fetchImpl: typeof fetch,
+  branch: string,
+  emptyBranchReader?: EmptyBranchReader,
 ): Promise<string | null> {
-  const manifest = await readProductionManifest(manifestUrl, platform, runtimeVersion, appId, fetchImpl);
+  const manifest = await readProductionManifest(
+    manifestUrl,
+    platform,
+    runtimeVersion,
+    appId,
+    fetchImpl,
+    branch,
+    emptyBranchReader,
+  );
   if (manifest === null) return null;
-  const id = string(manifest.id, `${platform} production update ID`);
-  if (!UPDATE_ID.test(id)) throw new Error(`${platform} production update ID must be a UUID-shaped ID.`);
+  const id = string(manifest.id, `${platform} ${branch} update ID`);
+  if (!UPDATE_ID.test(id)) throw new Error(`${platform} ${branch} update ID must be a UUID-shaped ID.`);
   return id;
 }
 
@@ -545,11 +308,15 @@ export async function captureProductionBaseline(options: {
   manifestUrl: string;
   appId: string;
   runtimeVersions: Record<OtaPlatform, string>;
+  /** The branch whose served update is the baseline. Defaults to `production`. */
+  branch?: string;
+  emptyBranchReader?: EmptyBranchReader;
   fetchImpl?: typeof fetch;
 }): Promise<Record<OtaPlatform, string | null>> {
   if (!UUID.test(options.appId)) throw new Error('Capture app ID must be a UUID.');
   uploadServerBase(options.manifestUrl);
   const fetchImpl = options.fetchImpl ?? fetch;
+  const branch = branchName(options.branch ?? DEFAULT_BRANCH);
   const baseline = {} as Record<OtaPlatform, string | null>;
   for (const platform of ['ios', 'android'] as const) {
     const runtimeVersion = options.runtimeVersions[platform];
@@ -560,39 +327,49 @@ export async function captureProductionBaseline(options: {
       runtimeVersion,
       options.appId,
       fetchImpl,
+      branch,
+      options.emptyBranchReader,
     );
   }
   return baseline;
 }
 
-async function verifyServedExport(
+export async function verifyServedExport(
   manifestUrl: string,
   exportFiles: ValidatedExport,
   runtimeVersion: string,
   fetchImpl: typeof fetch,
-): Promise<void> {
+  branch: string,
+  expectedUUID?: string,
+): Promise<string> {
   const manifest = await readProductionManifest(
     manifestUrl,
     exportFiles.platform,
     runtimeVersion,
     exportFiles.appId,
     fetchImpl,
+    branch,
   );
-  if (manifest === null) throw new Error(`${exportFiles.platform} production has no update after promotion.`);
-  const extra = object(manifest.extra, 'Production manifest extra');
+  if (manifest === null) throw new Error(`${exportFiles.platform} ${branch} has no update after promotion.`);
+  const uuid = string(manifest.id, `${exportFiles.platform} ${branch} update ID`);
+  if (!UPDATE_ID.test(uuid)) throw new Error('Served update ID must be a UUID.');
+  if (expectedUUID !== undefined && uuid !== expectedUUID)
+    throw new Error(`${exportFiles.platform} ${branch} unchanged baseline UUID differs from stage.`);
+  const extra = object(manifest.extra, `${sentenceLabel(branch)} manifest extra`);
   if (!isDeepStrictEqual(extra.expoClient, exportFiles.expoConfig)) {
-    throw new Error(`${exportFiles.platform} production Expo config differs from stage.`);
+    throw new Error(`${exportFiles.platform} ${branch} Expo config differs from stage.`);
   }
-  const launchAsset = object(manifest.launchAsset, 'Production launchAsset');
+  const launchAsset = object(manifest.launchAsset, `${sentenceLabel(branch)} launchAsset`);
   const bundleFile = exportFiles.files.get(exportFiles.bundlePath);
   if (!bundleFile) throw new Error(`${exportFiles.platform} export bundle disappeared.`);
   const bundleHash = createHash('sha256').update(readFileSync(bundleFile.absolutePath)).digest('base64url');
   if (launchAsset.hash !== bundleHash)
-    throw new Error(`${exportFiles.platform} production bundle hash differs from stage.`);
-  if (!Array.isArray(manifest.assets))
-    throw new Error(`${exportFiles.platform} production manifest has no asset list.`);
+    throw new Error(`${exportFiles.platform} ${branch} bundle hash differs from stage.`);
+  if (!Array.isArray(manifest.assets)) throw new Error(`${exportFiles.platform} ${branch} manifest has no asset list.`);
   const servedHashes = manifest.assets
-    .map((assetInput: unknown) => string(object(assetInput, 'Production asset').hash, 'Production asset hash'))
+    .map((assetInput: unknown) =>
+      string(object(assetInput, `${sentenceLabel(branch)} asset`).hash, `${sentenceLabel(branch)} asset hash`),
+    )
     .sort();
   const stagedHashes = exportFiles.assetPaths
     .map((assetPath) => {
@@ -602,7 +379,39 @@ async function verifyServedExport(
     })
     .sort();
   if (JSON.stringify(servedHashes) !== JSON.stringify(stagedHashes)) {
-    throw new Error(`${exportFiles.platform} production asset hashes differ from stage.`);
+    throw new Error(`${exportFiles.platform} ${branch} asset hashes differ from stage.`);
+  }
+  return uuid;
+}
+
+/** Recheck unchanged platforms from one coherent manifest per platform, including its UUID and all staged bytes. */
+export async function verifyUnchangedPlatforms(options: {
+  receipt: StageReceipt;
+  iosExport: string;
+  androidExport: string;
+  manifestUrl: string;
+  unchangedPlatforms: Partial<Record<OtaPlatform, string>>;
+  branch?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<void> {
+  for (const platform of ['ios', 'android'] as const) {
+    const uuid = options.unchangedPlatforms[platform];
+    if (uuid === undefined) continue;
+    if (uuid !== options.receipt.baselineProductionUpdateIds[platform] || !UPDATE_ID.test(uuid))
+      throw new Error(`${platform} unchanged UUID is not the captured baseline.`);
+    const exportFiles = validateExport(
+      platform === 'ios' ? options.iosExport : options.androidExport,
+      platform,
+      options.receipt.platforms[platform].bundleSha256,
+    );
+    await verifyServedExport(
+      options.manifestUrl,
+      exportFiles,
+      options.receipt.platforms[platform].runtimeVersion,
+      options.fetchImpl ?? fetch,
+      branchName(options.branch ?? DEFAULT_BRANCH),
+      uuid,
+    );
   }
 }
 
@@ -612,17 +421,72 @@ async function verifyServedExportWithRetry(
   runtimeVersion: string,
   fetchImpl: typeof fetch,
   delaysMs: readonly number[],
+  branch: string,
 ): Promise<void> {
   for (let attempt = 0; attempt <= delaysMs.length; attempt++) {
     try {
-      await verifyServedExport(manifestUrl, exportFiles, runtimeVersion, fetchImpl);
+      await verifyServedExport(manifestUrl, exportFiles, runtimeVersion, fetchImpl, branch);
       return;
     } catch (error) {
       if (attempt === delaysMs.length) throw error;
-      console.warn(`[ota-promote] ${exportFiles.platform}: production manifest not yet confirmed; retrying.`);
+      console.warn(`[ota-promote] ${exportFiles.platform}: ${branch} manifest not yet confirmed; retrying.`);
       await sleep(delaysMs[attempt]);
     }
   }
+}
+
+/** What an earlier run of this promotion left in its rollout receipt. */
+interface RolloutRecord {
+  /** The numeric update id the server leased, per platform. */
+  updateIds: Partial<Record<OtaPlatform, string>>;
+  unchangedPlatforms: Partial<Record<OtaPlatform, string>>;
+  /**
+   * The update each platform's rollout replaced: the staged baseline at the
+   * moment the lease was taken, as a manifest id (the update UUID), or null when
+   * the runtime version had no update yet. This is the rollout's control.
+   */
+  baselineUpdateIds: Partial<Record<OtaPlatform, string | null>>;
+}
+
+/**
+ * The rollout receipt of an earlier run. Empty when there is no file yet, or
+ * when the file belongs to another commit or branch: ids from a different
+ * promotion prove nothing about this one.
+ */
+export function readRolloutReceipt(path: string, branch: string, receipt: StageReceipt): RolloutRecord {
+  const record: RolloutRecord = { updateIds: {}, baselineUpdateIds: {}, unchangedPlatforms: {} };
+  if (!existsSync(path)) return record;
+  const receiptJson = object(JSON.parse(readFileSync(path, 'utf8')) as unknown, 'Rollout receipt');
+  if (receiptJson.branch !== branch || receiptJson.commitHash !== receipt.commitHash) return record;
+  const updateIds = object(receiptJson.updateIds, 'Rollout receipt updateIds');
+  const baselineUpdateIds = object(receiptJson.baselineUpdateIds, 'Rollout receipt baselineUpdateIds');
+  const unchanged = object(
+    receiptJson.unchangedPlatforms === undefined ? {} : receiptJson.unchangedPlatforms,
+    'Unchanged platform UUIDs',
+  );
+  if (Object.keys(unchanged).some((platform) => platform !== 'ios' && platform !== 'android'))
+    throw new Error('Unknown unchanged platform.');
+  for (const platform of ['ios', 'android'] as const) {
+    if (unchanged[platform] !== undefined) {
+      const uuid = string(unchanged[platform], 'Unchanged platform UUID');
+      if (!UPDATE_ID.test(uuid) || uuid !== receipt.baselineProductionUpdateIds[platform])
+        throw new Error(`${platform} unchanged UUID is not the captured baseline.`);
+      if (updateIds[platform] !== undefined) throw new Error(`${platform} cannot be both unchanged and leased.`);
+      record.unchangedPlatforms[platform] = uuid;
+    }
+    const updateId = updateIds[platform];
+    if (updateId === undefined) continue;
+    if (typeof updateId !== 'string' || !/^\d+$/.test(updateId)) {
+      throw new Error(`Rollout receipt ${platform} update id is not a numeric id.`);
+    }
+    const baselineUpdateId = baselineUpdateIds[platform];
+    if (baselineUpdateId !== null && (typeof baselineUpdateId !== 'string' || !UPDATE_ID.test(baselineUpdateId))) {
+      throw new Error(`Rollout receipt ${platform} baseline update id must be a UUID-shaped ID or null.`);
+    }
+    record.updateIds[platform] = updateId;
+    record.baselineUpdateIds[platform] = baselineUpdateId;
+  }
+  return record;
 }
 
 export async function promoteArchivedOta(options: {
@@ -631,11 +495,41 @@ export async function promoteArchivedOta(options: {
   androidExport: string;
   manifestUrl: string;
   token: string;
+  /** Only the trusted staged-unlock waiter supplies this proof; never a rollout. */
+  unlockAuthorization?: { receipt: unknown; proof: UnlockProof };
+  /** The branch to promote to. Defaults to `production`. */
+  branch?: string;
+  emptyBranchReader?: EmptyBranchReader;
+  /**
+   * Start the update as a rollout to this share of devices instead of publishing
+   * it to everyone. `connect` opens the admin API for the app the exports name,
+   * which is how the rollout is confirmed. `receiptPath` is a small JSON file
+   * this writes the leased update ids to, and reads on a re-run to recognise its
+   * own rollout; keep it with the stage receipt between attempts.
+   */
+  rollout?: {
+    percentage: number;
+    receiptPath: string;
+    connect: (appId: string) => Promise<RolloutReader>;
+    /** Synchronously persist controller ownership before any upload/finalize can begin. */
+    onRecord?: (record: Readonly<RolloutRecord>) => void;
+  };
   fetchImpl?: typeof fetch;
   verificationDelaysMs?: readonly number[];
 }): Promise<void> {
   if (!options.token) throw new Error('EOO_TOKEN is required.');
-  const receipt = parseStageReceipt(JSON.parse(readFileSync(options.receiptPath, 'utf8')) as unknown);
+  const branch = branchName(options.branch ?? DEFAULT_BRANCH);
+  if (options.unlockAuthorization && (branch !== DEFAULT_BRANCH || options.rollout || options.emptyBranchReader))
+    throw new Error('Unlock authorization is only valid for immediate production promotion.');
+  const rolloutPercentage = options.rollout?.percentage ?? null;
+  if (
+    rolloutPercentage !== null &&
+    (!Number.isInteger(rolloutPercentage) || rolloutPercentage < 1 || rolloutPercentage > 99)
+  ) {
+    throw new Error('A rollout percentage must be a whole number from 1 to 99.');
+  }
+  const stagedReceipt = parseStageReceipt(JSON.parse(readFileSync(options.receiptPath, 'utf8')) as unknown);
+  let receipt = stagedReceipt;
   const exports = {
     ios: validateExport(options.iosExport, 'ios', receipt.platforms.ios.bundleSha256),
     android: validateExport(options.androidExport, 'android', receipt.platforms.android.bundleSha256),
@@ -643,11 +537,38 @@ export async function promoteArchivedOta(options: {
   if (exports.ios.appId !== exports.android.appId)
     throw new Error('iOS and Android exports have different expo-app-id values.');
   const appId = exports.ios.appId;
+  if (options.unlockAuthorization) {
+    const authorization = validateUnlockReceipt(
+      options.unlockAuthorization.receipt,
+      options.unlockAuthorization.proof,
+      {
+        appId,
+        runtimes: {
+          ios: stagedReceipt.platforms.ios.runtimeVersion,
+          android: stagedReceipt.platforms.android.runtimeVersion,
+        },
+        baselines: stagedReceipt.baselineProductionUpdateIds,
+      },
+    );
+    // Keep the archived stage immutable. Every baseline/no-change check below
+    // uses this one effective view of the attested replacement heads.
+    receipt = {
+      ...stagedReceipt,
+      baselineProductionUpdateIds: {
+        ios: authorization.platforms.ios.restoredUpdateId,
+        android: authorization.platforms.android.restoredUpdateId,
+      },
+    };
+  }
   const base = uploadServerBase(options.manifestUrl);
   const fetchImpl = options.fetchImpl ?? fetch;
+  const target: PublishTarget = { base, appId, branch, token: options.token, fetchImpl };
+  const verificationDelaysMs = options.verificationDelaysMs ?? [1_000, 2_000, 4_000, 8_000];
+  const rolloutReader = options.rollout ? await options.rollout.connect(appId) : null;
   const publishGroup = randomUUID();
-  // null: the server answered 406, so production already serves exactly these files.
-  const leases = {} as Record<OtaPlatform, UploadLease | null>;
+  // null: the server answered 406, so the branch already serves exactly these files.
+  // 'rolling': rollout mode found this platform's own rollout already live.
+  const leases = {} as Record<OtaPlatform, UploadLease | null | 'rolling'>;
   let lastUploadStart = 0;
   const paceUpload = async (): Promise<void> => {
     // Match this repo's eoas --upload-rate 5 setting, including retry attempts.
@@ -664,77 +585,279 @@ export async function promoteArchivedOta(options: {
       receipt.platforms[platform].runtimeVersion,
       appId,
       fetchImpl,
+      branch,
+      options.emptyBranchReader,
     );
     if (current !== expected) {
       throw new Error(
-        `${platform} production update changed since staging began ` +
+        `${platform} ${branch} update changed since staging began ` +
           `(baseline ${expected ?? 'none'}, current ${current ?? 'none'}); refusing stale OTA promotion.`,
       );
     }
   };
 
+  // What an earlier run of the same commit to the same branch was leased, and
+  // which update each of its rollouts replaced.
+  const rolloutRecord: RolloutRecord = options.rollout
+    ? readRolloutReceipt(options.rollout.receiptPath, branch, receipt)
+    : { updateIds: {}, baselineUpdateIds: {}, unchangedPlatforms: {} };
+  const saveRolloutRecord = (): void => {
+    if (options.rollout) {
+      writeFileSync(
+        options.rollout.receiptPath,
+        `${JSON.stringify({ branch, commitHash: receipt.commitHash, ...rolloutRecord })}\n`,
+      );
+      options.rollout.onRecord?.(rolloutRecord);
+    }
+  };
+  const recordLease = (platform: OtaPlatform, updateId: string): void => {
+    if (!options.rollout) return;
+    // The common lease parser also accepts safe integer numbers. Negative IDs
+    // cannot be controller ownership; reject before poisoning its durable receipt.
+    if (!/^\d+$/.test(updateId)) throw new Error('Rollout lease update ID must be a numeric id.');
+    rolloutRecord.updateIds[platform] = updateId;
+    // The lease is only requested after the baseline was confirmed unchanged, so
+    // the staged baseline is the update this rollout is about to replace.
+    rolloutRecord.baselineUpdateIds[platform] = receipt.baselineProductionUpdateIds[platform];
+    saveRolloutRecord();
+  };
+
+  /**
+   * A re-run cannot ask "is the branch unchanged since staging?" about a
+   * platform whose own rollout is live: this promotion changed it, and the
+   * anonymous manifest shows one device's side of the rollout. The question that
+   * replaces it is "did my rollout replace the update I staged against?". The
+   * server names the update a rollout replaced (its control), and the receipt
+   * recorded the baseline when the lease was taken, so the two must be the same
+   * update. If they are not, something else was published in between and this
+   * rollout is not the one that was staged and tested.
+   */
+  const assertRolloutReplacedBaseline = async (
+    reader: RolloutReader,
+    platform: OtaPlatform,
+    live: { updateId: XpremId; controlUpdateId: XpremId | null },
+  ): Promise<void> => {
+    const runtimeVersion = receipt.platforms[platform].runtimeVersion;
+    const recordedBaseline = rolloutRecord.baselineUpdateIds[platform] ?? null;
+    const controlUpdateUUID =
+      live.controlUpdateId === null
+        ? null
+        : (await reader.getUpdateDetails(branch, runtimeVersion, live.controlUpdateId)).updateUUID;
+    if (live.controlUpdateId !== null && controlUpdateUUID === null) {
+      throw new Error(
+        `${platform} ${branch} rollout ${live.updateId} replaced update ${live.controlUpdateId}, which the server ` +
+          'cannot identify; refusing to treat the rollout as the staged one.',
+      );
+    }
+    if ((controlUpdateUUID ?? '').toLowerCase() !== (recordedBaseline ?? '').toLowerCase()) {
+      throw new Error(
+        `${platform} ${branch} rollout ${live.updateId} replaced ${controlUpdateUUID ?? 'no update'}, not the staged ` +
+          `baseline ${recordedBaseline ?? 'none'}; refusing to treat the rollout as the staged one.`,
+      );
+    }
+  };
+
+  /**
+   * Rollout mode's answer to "is the rollout that is live on this platform mine?".
+   * False when none is live. Throws when one is live and cannot be shown to be
+   * this promotion's, because nothing can be published over it.
+   *
+   * "Mine" needs the numeric update id the server leased to this promotion: the
+   * lease in hand, or on a re-run the id an earlier run wrote to the rollout
+   * receipt. A re-run additionally checks the commit the live update was built
+   * from, and that the rollout replaced the staged baseline. The commit alone is
+   * never enough: the update details expose no content hash, and two different
+   * exports can share a commit.
+   */
+  const ownRolloutIsLive = async (
+    reader: RolloutReader,
+    platform: OtaPlatform,
+    leaseUpdateId: string | null,
+  ): Promise<boolean> => {
+    const runtimeVersion = receipt.platforms[platform].runtimeVersion;
+    const rollout = await reader.getUpdateRollout(branch, runtimeVersion);
+    const live = rollout.active ? rollout.updates.find((update) => update.platform === platform) : undefined;
+    if (!live) return false;
+    const expectedUpdateId = leaseUpdateId ?? rolloutRecord.updateIds[platform] ?? null;
+    let own = expectedUpdateId !== null && sameId(live.updateId, expectedUpdateId);
+    if (own && leaseUpdateId === null) {
+      const details = await reader.getUpdateDetails(branch, runtimeVersion, live.updateId);
+      own = details.commitHash?.toLowerCase() === receipt.commitHash.toLowerCase();
+    }
+    if (!own) {
+      throw new Error(
+        `${platform} ${branch} has an active rollout of another update (${live.updateId}); promotion was refused.`,
+      );
+    }
+    // With a lease in hand the baseline was checked against the manifest moments
+    // ago, before the first upload. Without one this is the only baseline check.
+    if (leaseUpdateId === null) await assertRolloutReplacedBaseline(reader, platform, live);
+    console.log(
+      `[ota-promote] ${platform}: update ${live.updateId} is rolling out to ${live.percentage}% on ${branch}.`,
+    );
+    return true;
+  };
+
+  const confirmRolloutStarted = async (
+    reader: RolloutReader,
+    platform: OtaPlatform,
+    leaseUpdateId: string,
+  ): Promise<void> => {
+    for (let attempt = 0; attempt <= verificationDelaysMs.length; attempt++) {
+      if (await ownRolloutIsLive(reader, platform, leaseUpdateId)) return;
+      if (attempt === verificationDelaysMs.length) {
+        throw new Error(`${platform} ${branch} shows no rollout for update ${leaseUpdateId} after promotion.`);
+      }
+      console.warn(`[ota-promote] ${platform}: ${branch} rollout not yet confirmed; retrying.`);
+      await sleep(verificationDelaysMs[attempt]);
+    }
+  };
+
+  // Rollout mode first asks whether a platform's own rollout is already live: a
+  // re-run after a partial failure must not publish the same bytes a second time.
+  // Such a platform skips the manifest baseline check below on purpose, and gets
+  // assertRolloutReplacedBaseline in its place: see there for why.
+  for (const platform of ['ios', 'android'] as const) {
+    if (rolloutReader && (await ownRolloutIsLive(rolloutReader, platform, null))) leases[platform] = 'rolling';
+    else if (rolloutRecord.unchangedPlatforms[platform]) {
+      await verifyServedExport(
+        options.manifestUrl,
+        exports[platform],
+        receipt.platforms[platform].runtimeVersion,
+        fetchImpl,
+        branch,
+        rolloutRecord.unchangedPlatforms[platform],
+      );
+      leases[platform] = null;
+    }
+  }
+
   // Both platforms must still match their pre-stage baseline before creating
   // either production upload lease. A no-update directive is an explicit null;
   // malformed responses and rollback directives are never treated as null.
-  await assertBaselineUnchanged('ios');
-  await assertBaselineUnchanged('android');
+  if (leases.ios !== 'rolling') await assertBaselineUnchanged('ios');
+  if (leases.android !== 'rolling') await assertBaselineUnchanged('android');
 
   // Validate both server responses before sending any archived bytes.
   for (const platform of ['ios', 'android'] as const) {
-    const requestUrl = controlUrl(base, appId, 'requestUploadUrl');
-    requestUrl.searchParams.set('runtimeVersion', receipt.platforms[platform].runtimeVersion);
-    requestUrl.searchParams.set('platform', platform);
-    requestUrl.searchParams.set('commitHash', receipt.commitHash);
-    requestUrl.searchParams.set('publishGroup', publishGroup);
-    const response = await fetchWithRetry(fetchImpl, requestUrl, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${options.token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        files: buildUploadFiles(exports[platform]),
-        ...(receipt.message ? { message: receipt.message } : {}),
-      }),
-      redirect: 'error',
+    if (leases[platform] === 'rolling' || rolloutRecord.unchangedPlatforms[platform]) continue;
+    // The staged export carries the Hermes map eoas dumped next to the bundle.
+    // Without it the promoted update still ships; xprem just cannot symbolicate
+    // its errors, so say so and carry on.
+    const sourcemap = buildSourcemapUpload(exports[platform]);
+    if (!sourcemap) {
+      console.warn(`[ota-promote] ${platform}: staged export has no source map; ${branch} errors stay unsymbolicated.`);
+    }
+    const response = await requestUploadLease(target, {
+      platform,
+      runtimeVersion: receipt.platforms[platform].runtimeVersion,
+      commitHash: receipt.commitHash,
+      publishGroup,
+      rolloutPercentage,
+      files: buildUploadFiles(exports[platform]),
+      sourcemap,
+      message: receipt.message,
     });
-    if (response.status === 409)
-      throw new Error(`${platform} production has an active rollout; promotion was refused.`);
+    if (response.status === 409) {
+      // A rollout started between the check above and this request. Mine is
+      // success; anyone else's throws inside ownRolloutIsLive.
+      if (rolloutReader && (await ownRolloutIsLive(rolloutReader, platform, null))) {
+        await response.body?.cancel();
+        leases[platform] = 'rolling';
+        continue;
+      }
+      throw new Error(`${platform} ${branch} has an active rollout; promotion was refused.`);
+    }
     if (response.status === 406) {
+      await response.body?.cancel();
+      if (rolloutReader || options.unlockAuthorization) {
+        const uuid = receipt.baselineProductionUpdateIds[platform];
+        if (uuid === null) throw new Error(`${platform} unchanged platform has no stable baseline.`);
+        if (rolloutRecord.updateIds[platform]) throw new Error(`${platform} leased update cannot become unchanged.`);
+        await verifyServedExport(
+          options.manifestUrl,
+          exports[platform],
+          receipt.platforms[platform].runtimeVersion,
+          fetchImpl,
+          branch,
+          uuid,
+        );
+        // An unowned rollout starting after the first read must never be classified as unchanged.
+        if (rolloutReader) await ownRolloutIsLive(rolloutReader, platform, null);
+        rolloutRecord.unchangedPlatforms[platform] = uuid;
+        saveRolloutRecord();
+      }
       // Since 3.2.0 "no changes" is answered here, before any upload. The served
       // manifest is still verified below, so this cannot hide a wrong update.
-      await response.body?.cancel();
       leases[platform] = null;
       continue;
     }
     await requireSuccess(response, `${platform} upload request`);
-    leases[platform] = parseUploadLease((await response.json()) as unknown, exports[platform].files, base, appId);
+    const leaseInput = (await response.json()) as unknown;
+    // An old server ignores unknown query parameters, so a lease that does not
+    // echo the percentage means finalizing it would publish to every device.
+    // Stop before a byte is uploaded (eoas 3.2.5 makes the same check).
+    if (rolloutPercentage !== null && object(leaseInput, 'Upload lease').rolloutPercentage === undefined) {
+      throw new Error(`${platform} upload lease ignored the rollout percentage; refusing a full publish.`);
+    }
+    const lease = parseUploadLease(leaseInput, exports[platform].files, base, appId);
+    // Written before a byte is uploaded: if this run dies after finalize, the
+    // next one still knows which update id was its own.
+    recordLease(platform, lease.updateId);
+    leases[platform] = lease;
   }
 
   for (const platform of ['ios', 'android'] as const) {
+    if (rolloutReader || options.unlockAuthorization) {
+      // Revalidate every unchanged side before either platform's upload/finalize.
+      await verifyUnchangedPlatforms({
+        receipt,
+        iosExport: options.iosExport,
+        androidExport: options.androidExport,
+        manifestUrl: options.manifestUrl,
+        unchangedPlatforms: rolloutRecord.unchangedPlatforms,
+        branch,
+        fetchImpl,
+      });
+    }
     const lease = leases[platform];
+    if (lease === 'rolling') continue;
     if (lease === null) {
-      console.log(`[ota-promote] ${platform}: production already serves these files; verifying only.`);
+      console.log(`[ota-promote] ${platform}: ${branch} already serves these files; verifying only.`);
     } else {
       // Recheck immediately before each platform's first production PUT.
       await assertBaselineUnchanged(platform);
-      await uploadLeaseFiles(lease, exports[platform], base, appId, options.token, fetchImpl, paceUpload);
-      const finalizeUrl = controlUrl(base, appId, 'markUpdateAsUploaded');
-      finalizeUrl.searchParams.set('platform', platform);
-      finalizeUrl.searchParams.set('updateId', lease.updateId);
-      finalizeUrl.searchParams.set('runtimeVersion', receipt.platforms[platform].runtimeVersion);
-      const response = await fetchWithRetry(fetchImpl, finalizeUrl, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${options.token}`, 'Content-Type': 'application/json' },
-        redirect: 'error',
+      await uploadLeaseFiles(lease, exports[platform], target, paceUpload);
+      const response = await finalizeUpload(target, {
+        platform,
+        runtimeVersion: receipt.platforms[platform].runtimeVersion,
+        updateId: lease.updateId,
       });
-      if (response.status === 409)
-        throw new Error(`${platform} production has an active rollout; promotion was refused.`);
-      if (response.status !== 406) await requireSuccess(response, `${platform} production finalize`);
+      if (response.status === 409) {
+        // In rollout mode a retried finalize can meet the rollout its own first
+        // attempt started. The lease id says exactly whose it is.
+        if (!rolloutReader || !(await ownRolloutIsLive(rolloutReader, platform, lease.updateId))) {
+          throw new Error(`${platform} ${branch} has an active rollout; promotion was refused.`);
+        }
+      } else if (response.status !== 406) {
+        await requireSuccess(response, `${platform} ${branch} finalize`);
+      }
+    }
+    if (rolloutReader && lease !== null) {
+      await confirmRolloutStarted(rolloutReader, platform, lease.updateId);
+      console.log(
+        `[ota-promote] ${platform}: archived bundle ${receipt.platforms[platform].bundleSha256} ` +
+          `rolling out to ${rolloutPercentage}% on ${branch}.`,
+      );
+      continue;
     }
     await verifyServedExportWithRetry(
       options.manifestUrl,
       exports[platform],
       receipt.platforms[platform].runtimeVersion,
       fetchImpl,
-      options.verificationDelaysMs ?? [1_000, 2_000, 4_000, 8_000],
+      verificationDelaysMs,
+      branch,
     );
     console.log(`[ota-promote] ${platform}: archived bundle ${receipt.platforms[platform].bundleSha256} promoted.`);
   }
@@ -743,22 +866,81 @@ export async function promoteArchivedOta(options: {
 async function main(): Promise<void> {
   if (process.argv.includes('--capture-baseline')) {
     const args = parseCaptureArgs(process.argv.slice(2));
+    const manifestUrl = process.env.EXPO_UPDATES_URL ?? '';
+    if (args.verifyEmptyTarget && !args.branch.startsWith('pr-')) {
+      throw new Error('--verify-empty-target requires an explicit pr- branch.');
+    }
     const baseline = await captureProductionBaseline({
-      manifestUrl: process.env.EXPO_UPDATES_URL ?? '',
+      manifestUrl,
       appId: args.appId,
       runtimeVersions: { ios: args.iosRuntime, android: args.androidRuntime },
+      branch: args.branch,
+      ...(args.verifyEmptyTarget ? { emptyBranchReader: await connectEmptyBranchReader(manifestUrl, args.appId) } : {}),
     });
     writeFileSync(args.out, `${JSON.stringify(baseline)}\n`, { flag: 'wx' });
-    console.log(`[ota-promote] Captured production baseline: ${args.out}`);
+    console.log(`[ota-promote] Captured ${args.branch} baseline: ${args.out}`);
     return;
   }
   const args = parsePromoteArgs(process.argv.slice(2));
+  const manifestUrl = process.env.EXPO_UPDATES_URL ?? '';
+  const { rolloutPercentage, rolloutReceipt } = args;
+  if (args.verifyEmptyTarget && !args.branch.startsWith('pr-')) {
+    throw new Error('--verify-empty-target requires an explicit pr- branch.');
+  }
+  const receipt = args.verifyEmptyTarget
+    ? parseStageReceipt(JSON.parse(readFileSync(args.receipt, 'utf8')) as unknown)
+    : null;
+  const emptyBranchReader = receipt
+    ? await connectEmptyBranchReader(
+        manifestUrl,
+        validateExport(args.iosExport, 'ios', receipt.platforms.ios.bundleSha256).appId,
+      )
+    : undefined;
+  const unlockPath = process.env.OTA_UNLOCK_RECEIPT;
+  if (unlockPath && process.env.GITHUB_REF !== 'refs/heads/main')
+    throw new Error('Unlock receipt publication requires the trusted main workflow.');
   await promoteArchivedOta({
+    ...(unlockPath
+      ? {
+          unlockAuthorization: {
+            receipt: JSON.parse(readFileSync(unlockPath, 'utf8')) as unknown,
+            proof: {
+              repository: process.env.GITHUB_REPOSITORY ?? '',
+              requestId: process.env.OTA_UNLOCK_REQUEST_ID ?? '',
+              runId: Number(process.env.OTA_UNLOCK_RUN_ID),
+              headSha: process.env.OTA_UNLOCK_HEAD_SHA ?? '',
+            },
+          },
+        }
+      : {}),
     receiptPath: args.receipt,
     iosExport: args.iosExport,
     androidExport: args.androidExport,
-    manifestUrl: process.env.EXPO_UPDATES_URL ?? '',
+    manifestUrl,
     token: process.env.EOO_TOKEN ?? '',
+    branch: args.branch,
+    ...(emptyBranchReader ? { emptyBranchReader } : {}),
+    ...(rolloutPercentage === null || rolloutReceipt === null
+      ? {}
+      : {
+          rollout: {
+            percentage: rolloutPercentage,
+            receiptPath: rolloutReceipt,
+            // Only the login comes from the environment. The server is the one
+            // EXPO_UPDATES_URL names, exactly as for the publish calls: an admin
+            // read against any other host would confirm a rollout on a server
+            // the bytes were never sent to.
+            connect: (appId: string) =>
+              adminClientFromEnvironment({
+                appId,
+                defaultBaseUrl: manifestUrl,
+                environment: {
+                  OTA_ADMIN_EMAIL: process.env.OTA_ADMIN_EMAIL,
+                  OTA_ADMIN_PASSWORD: process.env.OTA_ADMIN_PASSWORD,
+                },
+              }),
+          },
+        }),
   });
 }
 

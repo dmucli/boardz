@@ -1,6 +1,19 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, fireEvent, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import type { Climb } from '@boardsesh/shared-schema';
 import type { Playlist } from '@boardsesh/graphql/operations/playlists';
@@ -21,6 +34,14 @@ const queryClientMock = vi.hoisted(() => ({
 }));
 const membershipStore = vi.hoisted(() => ({ setMembershipForClimb: vi.fn() }));
 const showToast = vi.hoisted(() => vi.fn());
+const layoutCapture = vi.hoisted(() => ({
+  onHeaderLayout: undefined as ((event: { nativeEvent: { layout: { height: number } } }) => void) | undefined,
+}));
+
+function serializeStyle(style: unknown): string {
+  return JSON.stringify(Object.assign({}, ...[style].flat(10).filter(Boolean)));
+}
+
 const reportHandledError = vi.hoisted(() => vi.fn());
 
 vi.mock('react-native', () => ({
@@ -34,24 +55,38 @@ vi.mock('react-native', () => ({
     onPress?: () => void;
     accessibilityLabel?: string;
   }) => createElement('button', { onClick: onPress, 'aria-label': accessibilityLabel }, children),
-  View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+  View: ({
+    children,
+    style,
+    onLayout,
+  }: {
+    children?: ReactNode;
+    style?: unknown;
+    onLayout?: typeof layoutCapture.onHeaderLayout;
+  }) => {
+    if (onLayout) layoutCapture.onHeaderLayout = onLayout;
+    return createElement('div', { 'data-style': serializeStyle(style) }, children);
+  },
+  ScrollView: ({ children, style }: { children?: ReactNode; style?: unknown }) =>
+    createElement('div', { 'data-scroll-view': 'true', 'data-style': serializeStyle(style) }, children),
   FlatList: ({
     data,
     renderItem,
     keyExtractor,
     ListHeaderComponent,
     ListEmptyComponent,
+    style,
   }: {
     data?: readonly Playlist[];
     renderItem?: (info: { item: Playlist; index: number }) => ReactNode;
     keyExtractor?: (item: Playlist, index: number) => string;
     ListHeaderComponent?: ReactNode;
     ListEmptyComponent?: ReactNode;
+    style?: unknown;
   }) =>
     createElement(
       'div',
-      null,
+      { 'data-flat-list': 'true', 'data-style': serializeStyle(style) },
       ListHeaderComponent,
       data && data.length > 0
         ? data.map((item, index) =>
@@ -63,7 +98,11 @@ vi.mock('react-native', () => ({
           )
         : ListEmptyComponent,
     ),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 // Interpolating values into the key keeps the named-toast copy assertable without
@@ -71,18 +110,24 @@ vi.mock('react-native', () => ({
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, values?: Record<string, unknown>) =>
-      values ? `${key}:${Object.entries(values).map(([name, value]) => `${name}=${String(value)}`)}` : key,
+      values
+        ? `${key}:${Object.entries(values)
+            .map(([name, value]) => `${name}=${String(value)}`)
+            .join(',')}`
+        : key,
   }),
 }));
 
 vi.mock('../../../providers/toast-provider', () => ({ useToast: () => ({ showToast }) }));
 vi.mock('../../../lib/error-reporting', () => ({ reportHandledError }));
 
-vi.mock('@tanstack/react-query', () => ({
+vi.mock('@tanstack/react-query', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tanstack/react-query')>()),
   useQuery: () => ({ data: qstate.data, isLoading: qstate.loading }),
   useQueryClient: () => queryClientMock,
 }));
 
+vi.mock('../../../lib/graphql/offline-request', () => ({ offlineAwareRequest: vi.fn() }));
 vi.mock('@boardsesh/graphql/operations/playlists', () => ({ GET_PLAYLISTS_FOR_CLIMB: 'GET_PLAYLISTS_FOR_CLIMB' }));
 vi.mock('@boardsesh/climb-actions', () => ({ playlistMembershipStore: membershipStore }));
 // The store-seed hook — the picker uses it as an instant fallback for checkmarks.
@@ -96,6 +141,7 @@ vi.mock('../../../providers/playlists-provider', () => ({
 }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     brandColors: { primary: '#6D28D9' },
     systemColors: {
@@ -105,6 +151,7 @@ vi.mock('../../../providers/theme-provider', () => ({
       secondaryLabel: '#555',
       tertiaryLabel: '#999',
       separator: '#ccc',
+      error: '#f00',
     },
   }),
 }));
@@ -114,12 +161,44 @@ vi.mock('../../../theme/ios-colors', () => ({
 }));
 
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   borderRadius: { full: 9999, md: 8 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24, 8: 32, 10: 40 },
 }));
 
 vi.mock('../../Icon', () => ({
   Icon: ({ name }: { name: string }) => createElement('span', { 'data-icon': name }),
+}));
+
+// The native Button is a platform-split @expo/ui tree; render its contract
+// (variant, loading, disabled) so the create form's button choice is assertable.
+vi.mock('../../Button', () => ({
+  Button: ({
+    title,
+    onPress,
+    accessibilityLabel,
+    variant,
+    loading,
+    disabled,
+  }: {
+    title: string;
+    onPress: () => void;
+    accessibilityLabel?: string;
+    variant?: string;
+    loading?: boolean;
+    disabled?: boolean;
+  }) =>
+    createElement(
+      'button',
+      {
+        onClick: onPress,
+        'aria-label': accessibilityLabel ?? title,
+        'data-variant': variant ?? 'filled',
+        'data-loading': loading ? 'true' : 'false',
+        disabled,
+      },
+      title,
+    ),
 }));
 
 vi.mock('../../Text', () => ({
@@ -367,6 +446,33 @@ describe('InlinePlaylistPicker', () => {
       expect(membershipStore.setMembershipForClimb).toHaveBeenLastCalledWith('climb-1', []);
     });
 
+    it('toasts a pending failure when the native host stays mounted after closing', async () => {
+      const { pending, rejection } = setupDeferredAdd();
+      playlistContext.addToPlaylist.mockReset().mockReturnValueOnce(rejection);
+      const { getByLabelText, rerender, queryByText } = renderPicker();
+      fireEvent.click(getByLabelText('Minimoon circuit'));
+      await waitFor(() => expect(playlistContext.addToPlaylist).toHaveBeenCalled());
+      rerender(
+        <InlinePlaylistPicker
+          climb={climb}
+          angle={40}
+          boardName="kilter"
+          layoutId={1}
+          TextInputComponent={NameInput as never}
+          active={false}
+        />,
+      );
+      pending.resolve();
+      await waitFor(() =>
+        expect(showToast).toHaveBeenCalledWith(
+          'actions.playlist.toast.addFailedNamed:playlist=Minimoon circuit',
+          'error',
+        ),
+      );
+      expect(queryByText('actions.playlist.toast.addFailed')).toBeNull();
+      expect(membershipStore.setMembershipForClimb).toHaveBeenLastCalledWith('climb-1', []);
+    });
+
     it('keeps the failure inline and does NOT toast while the picker is still mounted', async () => {
       const { pending, rejection } = setupDeferredAdd();
       playlistContext.addToPlaylist.mockReset().mockReturnValueOnce(rejection);
@@ -448,6 +554,26 @@ describe('InlinePlaylistPicker', () => {
       });
       expect(reportHandledError).toHaveBeenCalledTimes(1);
     });
+  });
+
+  it('submits through the native filled Button, which shows its own spinner while creating', async () => {
+    const pending = deferred<Playlist>();
+    playlistContext.createPlaylist.mockReturnValueOnce(pending.promise);
+    const { getByLabelText } = renderPicker();
+
+    fireEvent.click(getByLabelText('actions.playlist.popover.createNew'));
+    fireEvent.change(getByLabelText('name-input'), { target: { value: 'Projects' } });
+    const submit = getByLabelText('actions.playlist.create.submit');
+    // A filled native button, not a hand-rolled white-on-brand pill (2.7:1 in dark).
+    expect(submit.getAttribute('data-variant')).toBe('filled');
+    expect(submit.getAttribute('data-loading')).toBe('false');
+
+    fireEvent.click(submit);
+    await waitFor(() => {
+      expect(getByLabelText('actions.playlist.create.submit').getAttribute('data-loading')).toBe('true');
+    });
+    expect(getByLabelText('actions.cancel').hasAttribute('disabled')).toBe(true);
+    pending.resolve(makePlaylist('p-new', 'Projects'));
   });
 
   it('creates a playlist inline and adds the climb to it', async () => {
@@ -600,6 +726,29 @@ describe('InlinePlaylistPicker', () => {
     addDeferred.resolve();
   });
 
+  it('stops a create continuation after closing a retained native host and unlocks the draft', async () => {
+    const pending = deferred<Playlist>();
+    playlistContext.createPlaylist.mockReturnValueOnce(pending.promise);
+    const { getByLabelText, rerender } = renderPicker();
+    fireEvent.click(getByLabelText('actions.playlist.popover.createNew'));
+    fireEvent.change(getByLabelText('name-input'), { target: { value: 'Projects' } });
+    fireEvent.click(getByLabelText('actions.playlist.create.submit'));
+    await waitFor(() => expect(playlistContext.createPlaylist).toHaveBeenCalled());
+    const pickerProps = {
+      climb,
+      angle: 40,
+      boardName: 'kilter' as const,
+      layoutId: 1,
+      TextInputComponent: NameInput as never,
+    };
+    rerender(<InlinePlaylistPicker {...pickerProps} active={false} />);
+    await act(async () => pending.resolve(makePlaylist('p-new', 'Projects')));
+    expect(playlistContext.addToPlaylist).not.toHaveBeenCalled();
+    rerender(<InlinePlaylistPicker {...pickerProps} />);
+    expect(getByLabelText('actions.playlist.create.submit').getAttribute('data-loading')).toBe('false');
+    expect((getByLabelText('name-input') as HTMLInputElement).value).toBe('Projects');
+  });
+
   it('aborts the create continuation when the picker unmounts mid-create', async () => {
     const createDeferred = deferred<Playlist>();
     playlistContext.createPlaylist.mockReturnValueOnce(createDeferred.promise);
@@ -618,5 +767,74 @@ describe('InlinePlaylistPicker', () => {
     await Promise.resolve();
 
     expect(playlistContext.addToPlaylist).not.toHaveBeenCalled();
+  });
+});
+
+describe('InlinePlaylistPicker bounded layout', () => {
+  beforeEach(() => {
+    playlistContext.isAuthenticated = true;
+    playlistContext.isLoading = false;
+    playlistContext.playlists = [];
+    layoutCapture.onHeaderLayout = undefined;
+  });
+  const pickerProps = {
+    climb,
+    angle: 40,
+    boardName: 'kilter' as const,
+    layoutId: 1,
+    TextInputComponent: NameInput,
+  };
+
+  it('fills the native sheet body and gives list and create form a shrinkable viewport', () => {
+    playlistContext.isAuthenticated = true;
+    const { container, getByLabelText } = render(<InlinePlaylistPicker {...pickerProps} layout="fill" />);
+    expect(JSON.parse(container.firstElementChild?.getAttribute('data-style') ?? '{}')).toMatchObject({
+      flex: 1,
+      minHeight: 0,
+    });
+    expect(JSON.parse(container.querySelector('[data-flat-list]')?.getAttribute('data-style') ?? '{}')).toMatchObject({
+      flex: 1,
+      minHeight: 0,
+    });
+    fireEvent.click(getByLabelText('actions.playlist.popover.createNew'));
+    expect(JSON.parse(container.querySelector('[data-scroll-view]')?.getAttribute('data-style') ?? '{}')).toMatchObject(
+      { flex: 1, minHeight: 0 },
+    );
+  });
+
+  it('remeasures the content-host viewport below large headers without a minimum floor', () => {
+    playlistContext.isAuthenticated = true;
+    const { container, getByLabelText, rerender } = render(<InlinePlaylistPicker {...pickerProps} maxHeight={200} />);
+    const listStyle = () => JSON.parse(container.querySelector('[data-flat-list]')?.getAttribute('data-style') ?? '{}');
+    act(() => layoutCapture.onHeaderLayout?.({ nativeEvent: { layout: { height: 150 } } }));
+    expect(listStyle()).toEqual({ maxHeight: 50 });
+    act(() => layoutCapture.onHeaderLayout?.({ nativeEvent: { layout: { height: 230 } } }));
+    expect(listStyle()).toEqual({ maxHeight: 0 });
+    rerender(<InlinePlaylistPicker {...pickerProps} maxHeight={320} />);
+    expect(listStyle()).toEqual({ maxHeight: 90 });
+    fireEvent.click(getByLabelText('actions.playlist.popover.createNew'));
+    expect(JSON.parse(container.querySelector('[data-scroll-view]')?.getAttribute('data-style') ?? '{}')).toEqual({
+      maxHeight: 90,
+    });
+  });
+
+  it('keeps enlarged signed-out copy scrollable within native fill and measured overlay bounds', () => {
+    playlistContext.isAuthenticated = false;
+    const { container, getByText, rerender } = render(<InlinePlaylistPicker {...pickerProps} layout="fill" />);
+    const scrollStyle = () =>
+      JSON.parse(container.querySelector('[data-scroll-view]')?.getAttribute('data-style') ?? '{}');
+    expect(scrollStyle()).toMatchObject({ flex: 1, minHeight: 0 });
+    expect(getByText('actions.playlist.popover.signInBlurb').closest('[data-scroll-view]')).not.toBeNull();
+    rerender(<InlinePlaylistPicker {...pickerProps} maxHeight={200} />);
+    act(() => layoutCapture.onHeaderLayout?.({ nativeEvent: { layout: { height: 150 } } }));
+    expect(scrollStyle()).toEqual({ maxHeight: 50 });
+    act(() => layoutCapture.onHeaderLayout?.({ nativeEvent: { layout: { height: 230 } } }));
+    expect(scrollStyle()).toEqual({ maxHeight: 0 });
+  });
+
+  it('keeps unconstrained content hosts content-sized', () => {
+    const { container } = render(<InlinePlaylistPicker {...pickerProps} />);
+    expect(JSON.parse(container.firstElementChild?.getAttribute('data-style') ?? '{}')).not.toHaveProperty('flex');
+    expect(JSON.parse(container.querySelector('[data-flat-list]')?.getAttribute('data-style') ?? '{}')).toEqual({});
   });
 });

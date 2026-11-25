@@ -1,8 +1,11 @@
 import {
+  type FourByFourOptions,
   type GeneratorGradeScale,
   type GeneratorOptions,
   type GradeFocusOptions,
   type LadderOptions,
+  type LimitBoulderingOptions,
+  type OnTheMinuteOptions,
   type PlannedClimbSlot,
   type PyramidOptions,
   type VolumeOptions,
@@ -30,7 +33,7 @@ const getPyramidGrade = (targetGrade: number, distanceFromPeak: number, grades: 
   return grades[gradeIndex].difficulty_id;
 };
 
-const generateWarmUp = (
+export const generateWarmUp = (
   targetGrade: number,
   warmUpType: WarmUpType,
   grades: GeneratorGradeScale,
@@ -47,15 +50,21 @@ const generateWarmUp = (
   // future boards may skip values entirely). Walking the array keeps the
   // warm-up grounded in the real grade table.
   const targetIndex = grades.findIndex((grade) => grade.difficulty_id >= targetGrade);
-  if (targetIndex <= 0) return [];
+  if (targetIndex < 0) return [];
 
   const startIndex = Math.max(0, targetIndex - config.grades);
+  const warmUpGrades = targetIndex === 0 ? [{ difficulty_id: targetGrade }] : grades.slice(startIndex, targetIndex);
+  const totalClimbs = config.grades * config.climbsPerGrade;
+  const climbsPerGrade = Math.floor(totalClimbs / warmUpGrades.length);
+  const remainder = totalClimbs % warmUpGrades.length;
   let slotIndex = 0;
 
-  for (let i = startIndex; i < targetIndex; i++) {
-    for (let copy = 0; copy < config.climbsPerGrade; copy++) {
+  for (let i = 0; i < warmUpGrades.length; i++) {
+    // Assign remainder climbs to easier grades first, preserving ascending order.
+    const climbCount = climbsPerGrade + (i < remainder ? 1 : 0);
+    for (let copy = 0; copy < climbCount; copy++) {
       slots.push({
-        grade: grades[i].difficulty_id,
+        grade: warmUpGrades[i].difficulty_id,
         section: 'warmUp',
         index: slotIndex++,
       });
@@ -100,19 +109,27 @@ export const generatePyramidPlan = (options: PyramidOptions, grades: GeneratorGr
   const stepCount = Math.max(0, options.numberOfSteps);
   const climbsPerStep = Math.max(0, options.climbsPerStep);
   const center = (stepCount - 1) / 2;
+  const repeatOnWayDown = options.repeatOnWayDown === true;
+  const firstIndexOfStep: number[] = [];
   let currentIndex = slots.length;
 
   for (let step = 0; step < stepCount; step++) {
     const distanceFromPeak = Math.floor(Math.abs(step - center));
     const grade = getPyramidGrade(options.targetGrade, distanceFromPeak, grades);
     const section = distanceFromPeak === 0 ? 'peak' : step < center ? 'increasing' : 'decreasing';
+    firstIndexOfStep.push(currentIndex);
 
     for (let climb = 0; climb < climbsPerStep; climb++) {
-      slots.push({
-        grade,
-        section,
-        index: currentIndex++,
-      });
+      const slot: PlannedClimbSlot = { grade, section, index: currentIndex++ };
+      // The way down retraces the way up in exact reverse: step `stepCount - 1 -
+      // step` is its twin at the same grade, and within the step the last climb
+      // up is the first one down (B2 B1 A2 A1). Only `decreasing` steps repeat:
+      // an even step count plans two peak steps, and mirroring them would put one
+      // climb on two pages in a row.
+      if (repeatOnWayDown && section === 'decreasing') {
+        slot.repeatOfIndex = firstIndexOfStep[stepCount - 1 - step] + (climbsPerStep - 1 - climb);
+      }
+      slots.push(slot);
     }
   }
 
@@ -131,7 +148,11 @@ export const generateLadderPlan = (options: LadderOptions, grades: GeneratorGrad
   const startIndex = targetIndex >= 0 ? Math.max(0, targetIndex - stepCount + 1) : -1;
   let currentIndex = slots.length;
 
-  for (let step = 0; step < stepCount; step++) {
+  const descending = options.descending === true;
+
+  for (let position = 0; position < stepCount; position++) {
+    // Steps are built easiest first; a descending ladder walks them in reverse.
+    const step = descending ? stepCount - 1 - position : position;
     const grade =
       step === stepCount - 1
         ? options.targetGrade
@@ -142,7 +163,7 @@ export const generateLadderPlan = (options: LadderOptions, grades: GeneratorGrad
     for (let climb = 0; climb < climbsPerStep; climb++) {
       slots.push({
         grade,
-        section: step === stepCount - 1 ? 'peak' : 'increasing',
+        section: step === stepCount - 1 ? 'peak' : descending ? 'decreasing' : 'increasing',
         index: currentIndex++,
       });
     }
@@ -151,16 +172,22 @@ export const generateLadderPlan = (options: LadderOptions, grades: GeneratorGrad
   return slots;
 };
 
-export const generateGradeFocusPlan = (options: GradeFocusOptions, grades: GeneratorGradeScale): PlannedClimbSlot[] => {
+// The warm-up, then `climbCount` main-set slots all at the target grade.
+const generateFlatPlan = (
+  targetGrade: number,
+  warmUp: WarmUpType,
+  climbCount: number,
+  grades: GeneratorGradeScale,
+): PlannedClimbSlot[] => {
   const slots: PlannedClimbSlot[] = [];
 
-  slots.push(...generateWarmUp(options.targetGrade, options.warmUp, grades));
+  slots.push(...generateWarmUp(targetGrade, warmUp, grades));
 
   const mainStartIndex = slots.length;
 
-  for (let i = 0; i < options.numberOfClimbs; i++) {
+  for (let i = 0; i < climbCount; i++) {
     slots.push({
-      grade: options.targetGrade,
+      grade: targetGrade,
       section: 'main',
       index: mainStartIndex + i,
     });
@@ -168,6 +195,26 @@ export const generateGradeFocusPlan = (options: GradeFocusOptions, grades: Gener
 
   return slots;
 };
+
+export const generateGradeFocusPlan = (options: GradeFocusOptions, grades: GeneratorGradeScale): PlannedClimbSlot[] =>
+  generateFlatPlan(options.targetGrade, options.warmUp, options.numberOfClimbs, grades);
+
+/** One slot per climb at the target grade. The interval is pacing, not a slot (pacing.ts). */
+export const generateOnTheMinutePlan = (options: OnTheMinuteOptions, grades: GeneratorGradeScale): PlannedClimbSlot[] =>
+  generateFlatPlan(options.targetGrade, options.warmUp, options.numberOfClimbs, grades);
+
+/**
+ * One slot per set at the target grade: a set is one climb. Reps are not slots
+ * either: they are the ticks logged on that climb's one queue item.
+ */
+export const generateFourByFourPlan = (options: FourByFourOptions, grades: GeneratorGradeScale): PlannedClimbSlot[] =>
+  generateFlatPlan(options.targetGrade, options.warmUp, options.sets, grades);
+
+/** One slot per climb at the target grade. Attempts stay on one queued climb, so they are not slots either. */
+export const generateLimitBoulderingPlan = (
+  options: LimitBoulderingOptions,
+  grades: GeneratorGradeScale,
+): PlannedClimbSlot[] => generateFlatPlan(options.targetGrade, options.warmUp, options.numberOfClimbs, grades);
 
 export const generateWorkoutPlan = (options: GeneratorOptions, grades: GeneratorGradeScale): PlannedClimbSlot[] => {
   switch (options.type) {
@@ -179,6 +226,12 @@ export const generateWorkoutPlan = (options: GeneratorOptions, grades: Generator
       return generateLadderPlan(options, grades);
     case 'gradeFocus':
       return generateGradeFocusPlan(options, grades);
+    case 'onTheMinute':
+      return generateOnTheMinutePlan(options, grades);
+    case 'fourByFour':
+      return generateFourByFourPlan(options, grades);
+    case 'limitBouldering':
+      return generateLimitBoulderingPlan(options, grades);
     default: {
       // Exhaustiveness check — a new WorkoutType variant fails to compile
       // here rather than silently emitting an empty plan.

@@ -1,9 +1,12 @@
 import type { HoldsFilter, ZoneBoxInput, ZoneMatchMode } from '@boardsesh/shared-schema';
+import { createAddressedHandoff } from './addressed-handoff';
 
 /**
  * Hands the edited board-region (zone) filter back from the route-based board
- * sub-screen. The climb filter sheet suspends and pushes that route, then merges
- * the result into its draft when the route hands it back on pop.
+ * sub-screen to the filter sheet that pushed it. The sheet suspends and pushes
+ * that route with its `handoffId` (lib/filter-picker-handoff-id.ts), then merges
+ * the result into its draft when the route hands it back to that id on pop
+ * (lib/addressed-handoff.ts).
  *
  * The zone screen can also prune out-of-zone hold filters (the `allHolds`
  * backend filter discards a climb if any hold is outside the box), so it hands
@@ -16,19 +19,21 @@ export type ZoneFilterSelection = {
   holdsFilter?: HoldsFilter;
 };
 
-type ZoneFilterListener = (selection: ZoneFilterSelection) => void;
+export type AddressedZoneFilterSelection = ZoneFilterSelection & {
+  /** The sheet the zone goes back to. Empty for a route opened without one: nobody gets it. */
+  handoffId: string;
+};
 
-const zoneFilterListeners = new Set<ZoneFilterListener>();
+const zoneHandoff = createAddressedHandoff<ZoneFilterSelection>();
 
-export function emitZoneFilterSelection(selection: ZoneFilterSelection): void {
-  for (const listener of zoneFilterListeners) {
-    listener(selection);
-  }
+export function emitZoneFilterSelection({ handoffId, ...selection }: AddressedZoneFilterSelection): void {
+  zoneHandoff.emit(handoffId, selection);
 }
 
-export function subscribeToZoneFilterSelection(listener: ZoneFilterListener): () => void {
-  zoneFilterListeners.add(listener);
-  return () => {
-    zoneFilterListeners.delete(listener);
-  };
+/** Listens for the zone handed back to `handoffId` only. */
+export function subscribeToZoneFilterSelection(
+  handoffId: string,
+  listener: (selection: ZoneFilterSelection) => void,
+): () => void {
+  return zoneHandoff.subscribe(handoffId, listener);
 }

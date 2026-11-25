@@ -1,14 +1,30 @@
+import { offlineWriteFetch } from '../offline/offline-write-transport';
+import { setPartnerWorkoutOwner } from '../lib/pending-workout-store';
+import { deactivateNotificationDevice } from '../notifications/device-registration';
 import { markStartup } from '../lib/profiling/startup-profile';
+import { invalidateConsentAccount } from '../lib/consent-state';
+import { createConsentBoundAnalyticsRunner } from '../lib/consent-bound-analytics';
+import { commitVerifiedAuthResult, type VerifiedAuthResult } from '../lib/verified-auth-result';
+import { publishSignupConversion } from '../lib/signup-conversion';
+import {
+  cancelAuthAnalyticsHandoffs,
+  createAuthAnalyticsHandoff,
+  type AuthAnalyticsHandoff,
+} from '../lib/auth-analytics-handoff';
+import { trackLoginSucceeded, type LoginSucceededProperties } from '../lib/login-analytics';
 import { createContext, useContext, useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react';
 import { AppState, Platform } from 'react-native';
 import { useSegments, Redirect } from 'expo-router';
 import { onlineManager, useQueryClient } from '@tanstack/react-query';
-import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { SHARED_EVENTS, loginProviderProperties } from '@boardsesh/analytics';
 import { AppLoadingSplash } from '../components/AppLoadingSplash';
 import { resolveAuthSession, type AuthSessionResult } from '../lib/auth-session';
-import { captureAuthCredentialGeneration, isAuthCredentialGenerationCurrent } from '../lib/auth-store';
+import { captureAuthCredentialGeneration, getAuthToken, isAuthCredentialGenerationCurrent } from '../lib/auth-store';
+import { isAccountDeletionIntentCurrent, type SignOutRequest } from '../lib/account-deletion-intent';
+import { userIdFromJwt } from '../lib/jwt-user-id';
 import { subscribeAuthTokenChanges } from '../lib/auth-token-events';
 import { bumpAuthTransportRevision } from '../lib/auth-transport-revision';
+import { isBrowserPageRetired, reloadRetiredBrowserPage } from '../lib/browser-page-retirement';
 import {
   signInWithApple as authSignInWithApple,
   signInWithGoogle as authSignInWithGoogle,
@@ -21,19 +37,25 @@ import {
   type OAuthSignInResult,
   type RegistrationResult,
 } from '../lib/auth';
-import { SCREENSHOT_USER_EMAIL, SCREENSHOT_USER_PASSWORD } from '../lib/screenshot-mode';
-import { reset as resetAnalytics, track } from '../lib/analytics';
+import { getAnalyticsIdentity, isAnalyticsPinnedToAPerson, reset as resetAnalytics, track } from '../lib/analytics';
 import { resetOfflineUsageSignal } from '../offline/offline-usage-signal';
+import { clearDownloadRequestAttribution } from '../offline/download-request-telemetry';
+import { clearRelayReceipt } from '../lib/relay-receipt';
+import { forgetRememberedBoardsOnSignOut } from '../lib/ble/remembered-boards-sign-out';
 import { reportError, reportHandledError } from '../lib/error-reporting';
 import { setOnForcedSignOut } from '../lib/auth-interceptor';
-import { getHttpClient, resetHttpClient } from '../lib/graphql/client';
+import { resetHttpClient } from '../lib/graphql/client';
 import { disposeWsClient } from '../lib/graphql/ws-client';
 import { setOfflineMode } from '../lib/connectivity/connectivity-store';
 import { clearStoredSessionId } from '../lib/session-store';
+import { clearUserDataExportDownloads } from '../lib/user-data-export-download';
 import { clearStoredQueueSnapshot } from '../lib/queue-snapshot-store';
 import { clearFirstBoardPickerShowCount } from '../lib/onboarding/first-board-picker-store';
 import { clearAllCreateClimbDrafts } from '../lib/create-climb-draft-store';
 import { clearSessionCommentDraft } from '../lib/session-comment-draft-store';
+import { clearWorkoutRun } from '../lib/workout-run-store';
+import { clearEndedWorkouts } from '../lib/ended-workout-store';
+import { eraseAllSprayWallLedCaches } from '../lib/spray/spray-wall-led-cache';
 import { setCurrentUserStorageOwner, type UserStorageOwner } from '../lib/user-storage-owner';
 import { ACTIVE_BOARD_QUERY_KEY, clearStoredActiveBoardCoordinated } from '../lib/graphql/use-active-board';
 import { getAppEntryHref } from '../lib/app-entry-route';
@@ -44,9 +66,13 @@ import {
   suspendLinkEmptyDismissalWrites,
 } from '../lib/onboarding/onboarding-storage';
 import { clearUserData, purgeLocalDataForSignOut, getDatabaseHandle } from '../db';
+import { STORED_USER_ID_QUERY_KEY } from '../hooks/use-current-user-id';
 import { clearStoredSprayPhotos } from '../lib/spray/spray-photo-store';
-import { resetSyncStatus } from '../sync/sync-status';
-import { setSetting, clearOfflineBoards } from '../settings';
+import { clearSprayWallPrivateCaches } from '../lib/spray/spray-privacy-cleanup';
+import { dropSprayWallViewerAccess, refreshSprayWallViewerAccess } from '../lib/spray/spray-wall-loader';
+import { resetOfflineAccountSettings } from '../offline/account-boundary';
+import { getDownloadRequests, transitionDownload, setDownloadLifecycleOwner } from '../offline/download-lifecycle';
+import { clearSprayWallArchives, clearOwnedSprayWallPins } from '../settings';
 import { getOutboxSummary, setSigningOut } from '@boardsesh/offline-sync';
 import { drainMutationQueue, reportScopeDownloadAbandonedOnSignOut } from '../offline/offline-sync-adapter';
 import { reportAbandonedDownloadsOnSignOut } from '../offline/abandoned-download-terminals';
@@ -67,7 +93,7 @@ type AuthState = {
   signInWithAppleWeb: (isRegistration?: boolean) => Promise<OAuthSignInResult>;
   signInWithCredentials: (email: string, password: string) => Promise<CredentialsSignInResult>;
   register: (email: string, password: string, name?: string) => Promise<RegistrationResult>;
-  signOut: (method?: 'manual' | 'account_deleted') => Promise<void>;
+  signOut: (...request: SignOutRequest) => Promise<void>;
   refreshAuthState: () => Promise<void>;
 };
 
@@ -109,7 +135,11 @@ function sameStorageOwner(left: UserStorageOwner, right: UserStorageOwner): bool
 }
 
 export function AuthProvider({ children, onReady }: AuthProviderProps) {
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isAuthenticated, setAuthenticated] = useState(false);
+  const setIsAuthenticated = useCallback((authenticated: boolean) => {
+    invalidateConsentAccount();
+    setAuthenticated(authenticated);
+  }, []);
   const [isLoading, setIsLoading] = useState(true);
   const [isSessionUnavailable, setIsSessionUnavailable] = useState(false);
   const [isNativeSessionDegraded, setIsNativeSessionDegraded] = useState(false);
@@ -117,11 +147,45 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
   const queryClient = useQueryClient();
   const authStateRef = useRef({ isAuthenticated: false, isLoading: true });
   authStateRef.current = { isAuthenticated, isLoading };
+  // Whether a spray wall may be edited is an answer about one account, kept in
+  // a module-level registry that outlives every sign-out. It is disowned HERE,
+  // on any change of the resolved auth state, because this provider is the one
+  // component that stays mounted across it: everything below is swapped for a
+  // redirect or the splash, so a hook down there never sees a "before" (which
+  // is exactly how the first version of this, in the drawer host, never fired).
+  // The first resolved value is the launch session, not a change.
+  //
+  // The two edges are not symmetric. Signing IN re-reads every wall, under the
+  // new token. Going signed-OUT only drops the answer and fetches nothing: not
+  // every such flip is a sign-out (a native keychain that fails for a moment
+  // flips here with no cleanup), and a request sent then carries no token, so a
+  // private wall would resolve null and be withdrawn from the live player. A
+  // real sign-out's re-read is the cleanup's (`runSignedOutCleanup`), after the
+  // client is reset. When that cleanup already ran for this flip, the drop here
+  // is skipped, so the read it started is not disowned and sent twice.
+  const resolvedAuthForSprayRef = useRef<boolean | null>(null);
+  const sprayAccessResetByCleanupRef = useRef(false);
+  useEffect(() => {
+    if (isLoading) return;
+    const previous = resolvedAuthForSprayRef.current;
+    resolvedAuthForSprayRef.current = isAuthenticated;
+    // Consumed on every resolved pass, changed or not, so a cleanup that was
+    // not followed by a flip (one account replacing another on web) cannot
+    // leave the flag up to swallow a later, unrelated drop.
+    const cleanupAlreadyReset = sprayAccessResetByCleanupRef.current;
+    sprayAccessResetByCleanupRef.current = false;
+    if (previous === null || previous === isAuthenticated) return;
+    if (isAuthenticated) refreshSprayWallViewerAccess();
+    else if (!cleanupAlreadyReset) dropSprayWallViewerAccess();
+  }, [isAuthenticated, isLoading]);
   const authTransitionEpochRef = useRef(0);
   const authTransitionQueueRef = useRef<Promise<void>>(Promise.resolve());
   const anonymousSessionIsolatedRef = useRef(false);
   const authenticatedStorageOwnerRef = useRef<UserStorageOwner | null>(null);
   const pendingAuthTransportRestartRef = useRef(false);
+  // The server closes a deleted account's socket within a second, which can force
+  // a sign-out while this device is still running its own deletion cleanup.
+  const accountDeletionSignOutInFlightRef = useRef(false);
   const remoteInvalidationVersionRef = useRef(0);
   const remoteRevalidationRef = useRef<Promise<void> | null>(null);
   const nativeSessionDegradedRef = useRef(false);
@@ -172,16 +236,33 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
     return result;
   }, []);
 
+  // The signed-out path that is NOT a sign-out: a checkAuth that finds no
+  // session, which is every cold start of a signed-out install. Two of those
+  // can resolve in one launch while `isLoading` is still true (the mount check
+  // and the AppState `active` check are separate calls and native does not
+  // queue them), and each used to reset. A reset on an SDK that is already
+  // anonymous throws its anonymous id away and mints another, so the id that
+  // carried the pre-login events was gone before the sign-in that should have
+  // merged it. Reset only when the SDK is pinned to a person — a session that
+  // died while the app was closed — which is what this call is for. If the SDK
+  // has not loaded its storage yet this reads false, and the identity effect in
+  // party-profile-provider.tsx does the same reset once it has.
+  //
+  // Only `isLoading` is tested: this is reached when the session was not
+  // authenticated (an authenticated one takes runSignedOutCleanup), so the one
+  // open question is whether this is the launch's first answer. A later
+  // signed-out check on a settled, signed-out app has nothing to do here.
   const resetAnalyticsForSignedOutTransition = useCallback(() => {
-    const authState = authStateRef.current;
-    if (authState.isLoading || authState.isAuthenticated) {
-      resetAnalytics();
-      // The offline-usage rollup's suppression map is in-memory and not keyed by
-      // user, so a same-day account switch would otherwise inherit the previous
-      // user's counters and the new user's first offline day would never fire
-      // (#4317).
-      resetOfflineUsageSignal();
-    }
+    if (!authStateRef.current.isLoading) return;
+    if (!isAnalyticsPinnedToAPerson()) return;
+    resetAnalytics();
+    // The offline-usage rollup's suppression map is in-memory and not keyed by
+    // user, so a same-day account switch would otherwise inherit the previous
+    // user's counters and the new user's first offline day would never fire
+    // (#4317). It goes with the analytics reset and only with it: both mark an
+    // account boundary, and a signed-out cold start with no account to leave
+    // has none.
+    resetOfflineUsageSignal();
   }, []);
 
   // Persisted (SecureStore/AsyncStorage-backed) per-user state that outlives a
@@ -189,33 +270,50 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
   // These are the only sign-out leftovers that can carry a previous user across
   // a cold start on a shared device, so a signed-out checkAuth clears them even
   // when there's no live in-session cache to wipe (see handleSignedOutTransition).
-  const clearPersistedUserStores = useCallback((owner?: UserStorageOwner | null) => {
-    // This is the shared confirmed account boundary for manual/forced sign-out,
-    // expiry, remote sign-out, and authenticated identity changes. Invalidate
-    // cached tombstone checks before the coordinated clear synchronously bumps
-    // the active-board write generation, so neither validation nor storage
-    // state can leak into the next account.
-    resetActiveBoardSelfHealValidationCache();
-    // Stop an account A dismissal click from writing after this account boundary
-    // has removed the shared key. The clear is queued behind any pre-existing
-    // write and is awaited before account B is published.
-    suspendLinkEmptyDismissalWrites();
-    return Promise.allSettled([
-      clearStoredSessionId(owner),
-      clearStoredActiveBoardCoordinated(owner),
-      clearStoredQueueSnapshot(owner),
-      // How many times the launch gate opened the first-board picker (#5654).
-      // Keyed by account already; cleared here too so a shared phone never
-      // carries one climber's first-run state into the next session.
-      clearFirstBoardPickerShowCount(),
-      clearLinkEmptyPromptDismissal(),
-      // Create-climb and session-recap drafts are wiped for account
-      // isolation only on web (the new surface). Native sign-out keeps its
-      // origin behavior and leaves these drafts intact, so shipping this via
-      // OTA doesn't change what a native sign-out touches.
-      ...(Platform.OS === 'web' ? [clearAllCreateClimbDrafts(owner), clearSessionCommentDraft(owner)] : []),
-    ]);
-  }, []);
+  const clearPersistedUserStores = useCallback(
+    (owner: UserStorageOwner | null | undefined, exportCredentialGeneration: number) => {
+      // This is the shared confirmed account boundary for manual/forced sign-out,
+      // expiry, remote sign-out, and authenticated identity changes. Invalidate
+      // cached tombstone checks before the coordinated clear synchronously bumps
+      // the active-board write generation, so neither validation nor storage
+      // state can leak into the next account.
+      resetActiveBoardSelfHealValidationCache();
+      // Stop an account A dismissal click from writing after this account boundary
+      // has removed the shared key. The clear is queued behind any pre-existing
+      // write and is awaited before account B is published.
+      suspendLinkEmptyDismissalWrites();
+      // What the server last said about which walls are archived (the offline
+      // loader's copy). Some of it is per account: who replaced a wall is only
+      // shown to a viewer who may see the replacement.
+      clearSprayWallArchives();
+      clearDownloadRequestAttribution();
+      return Promise.allSettled([
+        clearUserDataExportDownloads(exportCredentialGeneration),
+        clearStoredSessionId(owner),
+        clearStoredActiveBoardCoordinated(owner),
+        clearStoredQueueSnapshot(owner),
+        // How many times the launch gate opened the first-board picker (#5654).
+        // Keyed by account already; cleared here too so a shared phone never
+        // carries one climber's first-run state into the next session.
+        clearFirstBoardPickerShowCount(),
+        clearLinkEmptyPromptDismissal(),
+        // Create-climb and session-recap drafts are wiped for account
+        // isolation only on web (the new surface). Native sign-out keeps its
+        // origin behavior and leaves these drafts intact, so shipping this via
+        // OTA doesn't change what a native sign-out touches.
+        ...(Platform.OS === 'web' ? [clearAllCreateClimbDrafts(owner), clearSessionCommentDraft(owner)] : []),
+        // Which workout stage each queued climb belongs to. New with #5379, so
+        // there is no older native behaviour to keep: cleared on every platform.
+        clearWorkoutRun(),
+        // The recaps of ended workouts (#6903), kept for their session summaries.
+        clearEndedWorkouts(),
+        // Every Spraywall's LED copy. Kept per wall and account-blind on disk; the
+        // next climber on this phone reads what the server says they may see.
+        eraseAllSprayWallLedCaches(),
+      ]);
+    },
+    [],
+  );
 
   const drainLocalMutationQueueBestEffort = useCallback(async () => {
     const localDb = getDatabaseHandle();
@@ -239,8 +337,7 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       const { pendingCount, deadLetterCount } = await getOutboxSummary(localDb);
       if (pendingCount + deadLetterCount === 0) return;
 
-      const graphqlFetch = (query: string, variables?: Record<string, unknown>) =>
-        getHttpClient().request(query, variables);
+      const graphqlFetch = offlineWriteFetch;
       await Promise.race([
         drainMutationQueue(localDb, queryClient, graphqlFetch),
         new Promise<void>((resolve) => setTimeout(resolve, SIGN_OUT_DRAIN_TIMEOUT_MS)),
@@ -258,8 +355,15 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
   // a 271MB Kilter download (issue #3621). setSigningOut bumps the wipe epoch around
   // either wipe, so in-flight pulls bail before the DELETEs land.
   const clearLocalOfflineUserData = useCallback(async (purgeOfflineBoards: boolean) => {
+    clearSprayWallPrivateCaches();
     const localDb = getDatabaseHandle();
-    if (!localDb) return;
+    if (!localDb) {
+      // No database to clean (init failed, or the file belongs to a newer bundle
+      // and is refused), but the wall photographs are plain files and need none:
+      // see the `finally` below for why they must not outlive a sign-out.
+      clearStoredSprayPhotos();
+      return;
+    }
 
     setSigningOut(true);
     try {
@@ -310,7 +414,10 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
     async (
       transitionEpoch: number,
       storageOwner?: UserStorageOwner | null,
-      { purgeOfflineBoards = false }: { purgeOfflineBoards?: boolean } = {},
+      {
+        purgeOfflineBoards = false,
+        wasAuthenticated = false,
+      }: { purgeOfflineBoards?: boolean; wasAuthenticated?: boolean } = {},
     ): Promise<boolean> => {
       if (!isAuthTransitionCurrent(transitionEpoch)) return false;
       // What the wipe below is about to delete. clearUserData DELETEs
@@ -322,14 +429,23 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       // longer be joined to the account that lost the writes. Sitting in
       // runSignedOutCleanup rather than in the manual signOut covers all three
       // paths — manual, forced 401, and proactive expiry.
+      const exportCredentialGeneration = captureAuthCredentialGeneration();
       const localDb = getDatabaseHandle();
       if (localDb) await reportOutboxDiscardedOnSignOut(localDb);
       resetOfflineUsageSignal();
+      // #7014: a pending relay timing belongs to the account that is leaving.
+      clearRelayReceipt();
+      // The boards this phone remembers (a hang-up keeps one for 10 minutes, a
+      // drop keeps it longer): the next account's first bulb tap opens the
+      // board list instead of silently taking the box this one held. Not on a
+      // signed-out cold start: an anonymous climber's board stays remembered.
+      void forgetRememberedBoardsOnSignOut();
+      await deactivateNotificationDevice();
       const stopTokenCleanup = stopTokenManagement(async () => {});
       if (Platform.OS === 'web') await waitForCleanupPhase(stopTokenCleanup);
       else await stopTokenCleanup;
       if (!isAuthTransitionCurrent(transitionEpoch)) return false;
-      const persistedStoreCleanup = clearPersistedUserStores(storageOwner);
+      const persistedStoreCleanup = clearPersistedUserStores(storageOwner, exportCredentialGeneration);
       if (Platform.OS === 'web') await waitForCleanupPhase(persistedStoreCleanup);
       else await persistedStoreCleanup;
       if (!isAuthTransitionCurrent(transitionEpoch)) return false;
@@ -340,10 +456,15 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       // #4452). The SELECTIVE branch only: the explicit wipe already reported
       // through purgeLocalDataForSignOut's seam and its markers are gone, while
       // this branch keeps every marker and every row — and still ends the
-      // download for good, because `setSetting('syncEnabledBoards', [])` below
-      // runs on all three sign-out paths and pullSync only ever visits enabled
-      // scopes.
+      // download for good, because `resetOfflineAccountSettings()` below empties
+      // `syncEnabledBoards` on all three sign-out paths and pullSync only ever
+      // visits enabled scopes.
       if (localDb && !purgeOfflineBoards) await reportAbandonedDownloadsOnSignOut(localDb);
+      if (!isAuthTransitionCurrent(transitionEpoch)) return false;
+      // Includes requests that never reached SQLite and therefore have no Started marker.
+      for (const request of getDownloadRequests()) {
+        transitionDownload(request, 'abandoned', { reason: 'signed-out' });
+      }
       // Only NOW. Every sign-out event above — the discarded outbox, the wipe's
       // own `Offline Data Wiped On Sign Out`, and the abandonment terminals —
       // has to land on the account that is leaving; after the reset they arrive
@@ -361,21 +482,24 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       // a login screen whose own sign-in request is blocked — the climber would
       // be locked out of the app by a setting they cannot reach from there.
       setOfflineMode(false, 'sign_out');
-      resetAnalytics();
+      // A session that was live, or an SDK still pinned to a person, has an
+      // identity to forget. A second forced sign-out in one launch (two 401s, or
+      // a remote sign-out after a forced one) has neither: the first one already
+      // reset, and resetting again would throw away the anonymous id the next
+      // sign-in merges on. `wasAuthenticated` keeps the case the pinned test
+      // alone would miss: a sign-out while the user id was still loading, when
+      // the SDK is anonymous but its events belong to the account that is
+      // leaving and must not merge into the next one.
+      if (wasAuthenticated || isAnalyticsPinnedToAPerson()) resetAnalytics();
       if (!isAuthTransitionCurrent(transitionEpoch)) return false;
-      // Reset the per-user "downloaded boards" list so the next account on a shared
-      // device doesn't inherit the previous user's offline selection. After a
+      // The "downloaded boards" list, the sync status and the board names the
+      // offline picker replays, so the next account on a shared device inherits
+      // none of them. The owner-stamp recovery runs the same reset (#6563). After a
       // selective wipe the cached board rows + checkpoints survive, so if the next
       // user enables the same board the download resumes instantly; after a purge
       // the rows those keys point at are gone, so leaving the list populated would
       // advertise boards as available offline over an empty catalog.
-      setSetting('syncEnabledBoards', []);
-      // "Last synced 5 minutes ago" belonged to the account that just left.
-      resetSyncStatus();
-      // ...and the board snapshots the offline picker replays. These carry the
-      // previous account's board NAMES, so on a shared device a missed clear would
-      // show one user's walls in the next user's picker.
-      clearOfflineBoards();
+      resetOfflineAccountSettings();
       // Drop the in-memory active-board cache too. It's `staleTime: Infinity`, so
       // without this the next user to sign in on a shared device would inherit the
       // previous user's board until a manual switch.
@@ -388,6 +512,28 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       // would otherwise paper over the cross-user leak. Doing this at the auth
       // boundary keeps the rest of the hooks simple.
       queryClient.clear();
+      // Which owned spray walls were pinned offline, and for whom. Here, after
+      // the roster cache is gone, and not with the persisted stores above: the
+      // pin (`OwnedSprayWallsOfflinePin`) stays mounted with this account's
+      // cached roster until `isAuthenticated` flips, and a record cleared
+      // earlier would be rewritten by the next settings write, re-pinning into
+      // the wipe and leaving nothing to pin on the next sign-in.
+      clearOwnedSprayWallPins();
+      // A browser page holds one account (#7596). Once it has seen its account
+      // replaced or signed out, the old owner's cleanup above is its last act:
+      // reload from the root instead of publishing anyone else in this page.
+      if (Platform.OS === 'web' && isBrowserPageRetired()) {
+        reloadRetiredBrowserPage();
+        return false;
+      }
+      // The spray registry is module state, so `clear()` does not reach it, and
+      // it holds one per-account answer: whether the viewer can edit each wall.
+      // After the client reset above, so the re-read is the next viewer's.
+      // Flagged while the effect below has not yet seen the signed-out flip, so
+      // that when it does it will not disown this read; when the flip came
+      // first there is nothing left for the effect to skip.
+      if (resolvedAuthForSprayRef.current === true) sprayAccessResetByCleanupRef.current = true;
+      refreshSprayWallViewerAccess();
       return true;
     },
     [clearPersistedUserStores, clearLocalOfflineUserData, isAuthTransitionCurrent, queryClient],
@@ -407,18 +553,27 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       { purgeOfflineBoards = false }: { purgeOfflineBoards?: boolean } = {},
     ): Promise<boolean> => {
       if (!isAuthTransitionCurrent(transitionEpoch)) return false;
+      commitVerifiedAuthResult(null);
       updateNativeSessionDegraded(false);
+      const exportCredentialGeneration = captureAuthCredentialGeneration();
       const previousStorageOwner = Platform.OS === 'web' ? authenticatedStorageOwnerRef.current : undefined;
       if (Platform.OS === 'web' && !forceFullCleanup && anonymousSessionIsolatedRef.current) {
         authStateRef.current = { ...authStateRef.current, isAuthenticated: false };
         setIsAuthenticated(false);
+        // The old owner was already cleaned up when this page went signed out.
+        if (isBrowserPageRetired()) {
+          reloadRetiredBrowserPage();
+          return false;
+        }
         return true;
       }
 
-      const needsFullCleanup =
-        forceFullCleanup ||
-        authStateRef.current.isAuthenticated ||
-        (Platform.OS === 'web' && previousStorageOwner !== null);
+      // Read before the web branch below publishes the signed-out state. Web
+      // callers may already have flipped the flag, so the storage owner, which
+      // is cleared only when a cleanup completes, answers there.
+      const wasAuthenticated =
+        authStateRef.current.isAuthenticated || (Platform.OS === 'web' && previousStorageOwner !== null);
+      const needsFullCleanup = forceFullCleanup || wasAuthenticated;
       // On web, publish the confirmed anonymous state before any storage await.
       // This unmounts authenticated consumers promptly, while epoch checks stop
       // this transition from writing after a newer login. Native keeps its
@@ -431,11 +586,17 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
 
       let completed: boolean;
       if (needsFullCleanup) {
-        completed = await runSignedOutCleanup(transitionEpoch, previousStorageOwner, { purgeOfflineBoards });
+        completed = await runSignedOutCleanup(transitionEpoch, previousStorageOwner, {
+          purgeOfflineBoards,
+          wasAuthenticated,
+        });
       } else {
         if (!isAuthTransitionCurrent(transitionEpoch)) return false;
         resetAnalyticsForSignedOutTransition();
-        const persistedStoreCleanup = clearPersistedUserStores(previousStorageOwner);
+        // A signed-out cold start has no live roster to race, so the pin record
+        // goes with the persisted stores here.
+        clearOwnedSprayWallPins();
+        const persistedStoreCleanup = clearPersistedUserStores(previousStorageOwner, exportCredentialGeneration);
         if (Platform.OS === 'web') await waitForCleanupPhase(persistedStoreCleanup);
         else await persistedStoreCleanup;
         completed = isAuthTransitionCurrent(transitionEpoch);
@@ -477,8 +638,16 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
           setCurrentUserStorageOwner(null);
           authStateRef.current = { ...authStateRef.current, isLoading: true };
           setIsLoading(true);
-          const cleanedPreviousUser = await runSignedOutCleanup(transitionEpoch, previousStorageOwner);
+          const cleanedPreviousUser = await runSignedOutCleanup(transitionEpoch, previousStorageOwner, {
+            wasAuthenticated: true,
+          });
           if (!cleanedPreviousUser || !isAuthTransitionCurrent(transitionEpoch)) return false;
+        }
+        // Never mount a second account in a page that already had one; its
+        // cleanup ran when it went signed out, so only the reload is left.
+        if (isBrowserPageRetired()) {
+          reloadRetiredBrowserPage();
+          return false;
         }
         setCurrentUserStorageOwner(nextStorageOwner);
         authenticatedStorageOwnerRef.current = nextStorageOwner;
@@ -495,23 +664,46 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       // climbers who had just signed up). Invalidating before the tree swaps
       // puts the refetch in flight, and the remounted readers wait on it.
       if (!wasAuthenticated) void queryClient.invalidateQueries({ queryKey: ['profile'], exact: true });
+      // The same, and worse, for the user id decoded from the stored token
+      // (#6824). That query never goes stale, and the offline bridge observes it
+      // on the login screen too, so it would keep what it read there for the
+      // whole session: nothing on a fresh install or after a sign-out, or the
+      // previous account's id from the token a lapsed session left behind. Reset,
+      // not invalidate: every mounted reader drops the old answer at once and
+      // the active ones read the new token.
+      if (!wasAuthenticated || authenticatedIdentityChanged) {
+        void queryClient.resetQueries({ queryKey: STORED_USER_ID_QUERY_KEY, exact: true });
+      }
       authStateRef.current = { ...authStateRef.current, isAuthenticated: true };
       setIsSessionUnavailable(false);
-      setIsAuthenticated(true);
+      // Rechecking the same credentials preserves pending account conversions.
+      // Credential mutations invalidate consent independently, before storage awaits.
+      if (!wasAuthenticated || authenticatedIdentityChanged) setIsAuthenticated(true);
+      else setAuthenticated(true);
       if (Platform.OS === 'web' && (pendingAuthTransportRestartRef.current || authenticatedIdentityChanged)) {
         pendingAuthTransportRestartRef.current = false;
         bumpAuthTransportRevision();
       }
       const returnedOAuth = Platform.OS === 'web' && !wasAuthenticated ? consumeWebOAuthReturn() : null;
       if (returnedOAuth && returnedOAuth.error === null) {
+        const signedInAt = new Date();
+        const captureWhenReady = createConsentBoundAnalyticsRunner();
         void consumeFreshOAuthPending(returnedOAuth.attemptId).then((marker) => {
           if (!marker || marker.provider !== returnedOAuth.provider) return;
-          track(SHARED_EVENTS.LoginSucceeded, {
-            auth_method: marker.provider,
-            flow: 'web',
-            screen: marker.isRegistration ? 'register' : 'login',
-            ...(marker.isRegistration ? { is_registration: true } : {}),
-          });
+          // Tracked directly, not through `trackLoginSucceeded`: this path sends
+          // no account-age props, no `account_age_read` and no follow-up event.
+          captureWhenReady(() =>
+            track(
+              SHARED_EVENTS.LoginSucceeded,
+              {
+                ...loginProviderProperties(marker.provider),
+                flow: 'web',
+                screen: marker.isRegistration ? 'register' : 'login',
+                ...(marker.isRegistration ? { is_registration: true } : {}),
+              },
+              { timestamp: signedInAt },
+            ),
+          );
         });
       }
       return true;
@@ -543,6 +735,8 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
         updateNativeSessionDegraded(degradation !== undefined);
       }
 
+      setPartnerWorkoutOwner(authSession.userId ?? userIdFromJwt(authSession.token) ?? null);
+      setDownloadLifecycleOwner(authSession.userId ?? userIdFromJwt(authSession.token) ?? null);
       return handleAuthenticatedTransition(transitionEpoch, authSession);
     },
     [handleAuthenticatedTransition, updateNativeSessionDegraded],
@@ -591,7 +785,7 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
               setIsAuthenticated(false);
               setIsLoading(true);
               const cleanedPreviousUser = previousStorageOwner
-                ? await runSignedOutCleanup(transitionEpoch, previousStorageOwner)
+                ? await runSignedOutCleanup(transitionEpoch, previousStorageOwner, { wasAuthenticated: true })
                 : isAuthTransitionCurrent(transitionEpoch);
               if (!cleanedPreviousUser || !isAuthTransitionCurrent(transitionEpoch)) return;
               authenticatedStorageOwnerRef.current = null;
@@ -609,72 +803,6 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
           updateNativeSessionDegraded(false);
           pendingAuthTransportRestartRef.current = false;
           setIsSessionUnavailable(false);
-          // Screenshot build: sign in programmatically here, before the loading gate
-          // clears, so the app renders straight into /home — the login screen never
-          // mounts. No form is shown, so there's no Maestro timing race and no iOS
-          // "Save Password?" dialog. Inert in normal builds (dead-strips when
-          // EXPO_PUBLIC_SCREENSHOT_MODE is unset — the comparison stays inlined here so the
-          // release minifier folds it in place rather than across a module boundary).
-          if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') {
-            // Diagnostics land in Metro's stdout (which the capture orchestrator tees to
-            // a log it polls), so a silent sign-in failure is no longer invisible in CI.
-            if (SCREENSHOT_USER_EMAIL && SCREENSHOT_USER_PASSWORD) {
-              // Retried in-app because a transient network failure here (seen in CI as
-              // `status=null error=network`) otherwise burns one of the orchestrator's
-              // full 120-second relaunch cycles just to attempt the same call again.
-              for (let attempt = 1; attempt <= 3; attempt += 1) {
-                const screenshotSignIn = await authSignInWithCredentials(
-                  SCREENSHOT_USER_EMAIL,
-                  SCREENSHOT_USER_PASSWORD,
-                );
-                if (!isAuthTransitionCurrent(transitionEpoch)) return;
-                if (screenshotSignIn.success) {
-                  const screenshotSession = await resolveAuthSession();
-                  if (!isAuthTransitionCurrent(transitionEpoch)) return;
-                  if (screenshotSession.status === 'authenticated') {
-                    if (Platform.OS !== 'web' && !isAuthCredentialGenerationCurrent(screenshotSession.generation)) {
-                      return;
-                    }
-                    console.info('[screenshot] auto sign-in succeeded; rendering straight into home');
-                    await handleResolvedAuthenticatedTransition(transitionEpoch, screenshotSession);
-                  } else if (screenshotSession.status === 'unavailable') {
-                    if (Platform.OS === 'web') {
-                      reportError(screenshotSession.error);
-                      setIsSessionUnavailable(true);
-                    } else if (isAuthCredentialGenerationCurrent(screenshotSession.generation)) {
-                      // Match the ordinary native token-read policy even in the
-                      // screenshot harness: a keychain failure is not a confirmed
-                      // logout and must not run cleanup or use the web-only retry
-                      // route.
-                      reportHandledError(screenshotSession.error, {
-                        tags: { source: 'auth-session', auth_stage: screenshotSession.stage },
-                      });
-                      updateNativeSessionDegraded(false);
-                      setIsAuthenticated(false);
-                      setIsSessionUnavailable(false);
-                    }
-                  }
-                  return;
-                }
-                console.warn(
-                  `[screenshot] auto sign-in FAILED (attempt ${attempt}/3) — ` +
-                    `status=${screenshotSignIn.status ?? 'null'} error=${screenshotSignIn.error}` +
-                    ` (emailLen=${SCREENSHOT_USER_EMAIL.length} passwordLen=${SCREENSHOT_USER_PASSWORD.length})`,
-                );
-                // Bad credentials (4xx) will not get better; only retry what can
-                // heal — network failures (status null) and transient 5xx.
-                if (screenshotSignIn.status !== null && screenshotSignIn.status < 500) break;
-                if (attempt < 3) {
-                  await new Promise((resolveDelay) => setTimeout(resolveDelay, attempt * 2000));
-                }
-              }
-            } else {
-              console.warn(
-                `[screenshot] auto sign-in SKIPPED — credentials not inlined into the bundle` +
-                  ` (emailSet=${Boolean(SCREENSHOT_USER_EMAIL)} passwordSet=${Boolean(SCREENSHOT_USER_PASSWORD)})`,
-              );
-            }
-          }
           await handleSignedOutTransition(transitionEpoch);
           return;
         }
@@ -772,24 +900,103 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
     });
   }, [checkAuth, isNativeSessionDegraded]);
 
+  const commitSuccessfulAuthMetadata = useCallback(
+    async (
+      result: Partial<VerifiedAuthResult>,
+      credentialGeneration: number,
+      handoff: AuthAnalyticsHandoff,
+      loginProperties: LoginSucceededProperties,
+    ): Promise<boolean> => {
+      if (!isAuthCredentialGenerationCurrent(credentialGeneration) || !authStateRef.current.isAuthenticated)
+        return false;
+      // A superseded SecureStore write can return success after another login.
+      // The server receipt proves creation; this decode only compares its owner
+      // against the credential actually committed on this device.
+      let currentToken: string | null;
+      try {
+        currentToken = await getAuthToken();
+      } catch {
+        return false;
+      }
+      const credentialOwner = userIdFromJwt(currentToken);
+      if (
+        !isAuthCredentialGenerationCurrent(credentialGeneration) ||
+        !authStateRef.current.isAuthenticated ||
+        !credentialOwner ||
+        (result.userId !== undefined && credentialOwner !== result.userId) ||
+        (result.accountCreation !== undefined && result.accountCreation.userId !== credentialOwner)
+      )
+        return false;
+      const verifiedResult: VerifiedAuthResult = {
+        userId: credentialOwner,
+        ...(result.accountCreation ? { accountCreation: result.accountCreation } : {}),
+      };
+      handoff.bindAccount(credentialOwner);
+      commitVerifiedAuthResult(verifiedResult);
+      if (verifiedResult.accountCreation) publishSignupConversion(verifiedResult.accountCreation, handoff);
+      if (Platform.OS !== 'web') trackLoginSucceeded(queryClient, loginProperties, handoff);
+      return true;
+    },
+    [queryClient],
+  );
+
+  const resolveSuccessfulAuth = useCallback(
+    async (
+      result: Partial<VerifiedAuthResult>,
+      resolveSession: () => Promise<void>,
+      loginProperties: LoginSucceededProperties,
+    ): Promise<void> => {
+      const credentialGeneration = captureAuthCredentialGeneration();
+      const handoff = createAuthAnalyticsHandoff({
+        credentialCurrent: () => isAuthCredentialGenerationCurrent(credentialGeneration),
+        identity: getAnalyticsIdentity(),
+      });
+      let committed = false;
+      try {
+        await resolveSession();
+        committed = await commitSuccessfulAuthMetadata(result, credentialGeneration, handoff, loginProperties);
+      } finally {
+        // Queued publications retain the lease until delivery/expiry, not the screen's lifetime.
+        if (!committed) handoff.dispose();
+      }
+    },
+    [commitSuccessfulAuthMetadata],
+  );
+
   // Both native OAuth flows run their provider sheet, exchange the identity
   // token for our JWT pair, and — on success — re-run checkAuth so the provider
   // flips to the authenticated UI (matching signInWithCredentials).
-  const signInWithApple = useCallback(async (): Promise<OAuthSignInResult> => {
-    const result = await authSignInWithApple();
-    if (result.success) {
-      await checkAuth();
-    }
-    return result;
-  }, [checkAuth]);
+  const signInWithApple = useCallback(
+    async (_webAttemptId?: string, isRegistration = false): Promise<OAuthSignInResult> => {
+      const result = await authSignInWithApple();
+      if (result.success) {
+        await resolveSuccessfulAuth(result, checkAuth, {
+          ...loginProviderProperties('apple'),
+          flow: 'native',
+          screen: isRegistration ? 'register' : 'login',
+          ...(isRegistration ? { is_registration: true } : {}),
+        });
+      }
+      return result;
+    },
+    [checkAuth, resolveSuccessfulAuth],
+  );
 
-  const signInWithGoogle = useCallback(async (): Promise<OAuthSignInResult> => {
-    const result = await authSignInWithGoogle();
-    if (result.success) {
-      await checkAuth();
-    }
-    return result;
-  }, [checkAuth]);
+  const signInWithGoogle = useCallback(
+    async (_webAttemptId?: string, isRegistration = false): Promise<OAuthSignInResult> => {
+      const result = await authSignInWithGoogle();
+      if (result.success) {
+        await resolveSuccessfulAuth(result, checkAuth, {
+          ...loginProviderProperties('google'),
+          flow: 'native',
+          screen: isRegistration ? 'register' : 'login',
+          ...(isRegistration ? { is_registration: true } : {}),
+        });
+      }
+      return result;
+    },
+    [checkAuth, resolveSuccessfulAuth],
+  );
 
   // Browser-based Google fallback for supported iOS presentation and Android
   // config failures. Same success contract as the native flow: re-run checkAuth
@@ -800,14 +1007,20 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       try {
         const result = await authSignInWithGoogleWeb(isRegistration);
         if (result.success) {
-          await checkAuthAfterSuccessfulBrowserFallback();
+          await resolveSuccessfulAuth(result, checkAuthAfterSuccessfulBrowserFallback, {
+            ...loginProviderProperties('google'),
+            flow: 'web_fallback',
+            fallback_mechanism: 'browser_deeplink',
+            screen: isRegistration ? 'register' : 'login',
+            ...(isRegistration ? { is_registration: true } : {}),
+          });
         }
         return result;
       } finally {
         await releaseBrowserFallbackAuthCheckSuppression();
       }
     },
-    [checkAuthAfterSuccessfulBrowserFallback, releaseBrowserFallbackAuthCheckSuppression],
+    [checkAuthAfterSuccessfulBrowserFallback, resolveSuccessfulAuth, releaseBrowserFallbackAuthCheckSuppression],
   );
 
   // Browser-based Apple fallback (native Sign in with Apple threw a non-cancel
@@ -819,25 +1032,35 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       try {
         const result = await authSignInWithAppleWeb(isRegistration);
         if (result.success) {
-          await checkAuthAfterSuccessfulBrowserFallback();
+          await resolveSuccessfulAuth(result, checkAuthAfterSuccessfulBrowserFallback, {
+            ...loginProviderProperties('apple'),
+            flow: 'web_fallback',
+            fallback_mechanism: 'browser_deeplink',
+            screen: isRegistration ? 'register' : 'login',
+            ...(isRegistration ? { is_registration: true } : {}),
+          });
         }
         return result;
       } finally {
         await releaseBrowserFallbackAuthCheckSuppression();
       }
     },
-    [checkAuthAfterSuccessfulBrowserFallback, releaseBrowserFallbackAuthCheckSuppression],
+    [checkAuthAfterSuccessfulBrowserFallback, resolveSuccessfulAuth, releaseBrowserFallbackAuthCheckSuppression],
   );
 
   const signInWithCredentials = useCallback(
     async (email: string, password: string): Promise<CredentialsSignInResult> => {
       const result = await authSignInWithCredentials(email, password);
       if (result.success) {
-        await checkAuth();
+        await resolveSuccessfulAuth(result, checkAuth, {
+          ...loginProviderProperties('credentials'),
+          flow: 'native',
+          screen: 'login',
+        });
       }
       return result;
     },
-    [checkAuth],
+    [checkAuth, resolveSuccessfulAuth],
   );
 
   // Native registration auto-logs-in. Web registration may instead create the
@@ -847,23 +1070,40 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
     async (email: string, password: string, name?: string): Promise<RegistrationResult> => {
       const result = await authRegisterWithCredentials(email, password, name);
       if (result.success && result.authenticated !== false) {
-        await checkAuth();
+        await resolveSuccessfulAuth(result, checkAuth, {
+          ...loginProviderProperties('credentials'),
+          flow: 'native',
+          screen: 'register',
+          is_registration: true,
+        });
       }
       return result;
     },
-    [checkAuth],
+    [checkAuth, resolveSuccessfulAuth],
   );
 
   // `method` distinguishes a plain Sign Out ('manual') from an account deletion
   // ('account_deleted') in analytics, matching web. The cleanup is identical:
   // server revocation is best-effort, while durable credential cleanup failures
   // remain visible to callers after local account isolation has completed.
-  const signOut = useCallback(
-    async (method: 'manual' | 'account_deleted' = 'manual') => {
-      const credentialGeneration = captureAuthCredentialGeneration();
+  const performSignOut = useCallback(
+    async (...request: SignOutRequest) => {
+      const [method = 'manual', deletionIntent] = request;
+      if (method === 'account_deleted') {
+        if (!deletionIntent || !(await isAccountDeletionIntentCurrent(deletionIntent))) return;
+        // The owner can change in the microtask between the awaited ownership
+        // check and this continuation. No cleanup side effect precedes this.
+        if (!isAuthCredentialGenerationCurrent(deletionIntent.credentialGeneration)) return;
+      }
+      cancelAuthAnalyticsHandoffs();
+      const credentialGeneration =
+        method === 'account_deleted' && deletionIntent
+          ? deletionIntent.credentialGeneration
+          : captureAuthCredentialGeneration();
       const transitionEpoch = beginAuthTransition();
       updateNativeSessionDegraded(false);
       track(SHARED_EVENTS.Logout, { method });
+      commitVerifiedAuthResult(null);
       // BEFORE the drain, not just in `runSignedOutCleanup` further down. The
       // store holds `onlineManager` false while offline mode is on, so the
       // drainer's `if (!options.isOnline()) return;` would bail in microseconds
@@ -880,6 +1120,9 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
       if (!isAuthCredentialGenerationCurrent(credentialGeneration) || !isAuthTransitionCurrent(transitionEpoch)) {
         return;
       }
+
+      await deactivateNotificationDevice();
+      if (!isAuthCredentialGenerationCurrent(credentialGeneration) || !isAuthTransitionCurrent(transitionEpoch)) return;
 
       // Hide the browser's authenticated tree before the two NextAuth network
       // phases. authSignOutForGeneration synchronously clears the exposed JWE
@@ -945,13 +1188,32 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
     ],
   );
 
+  const signOut = useCallback(
+    async (...request: SignOutRequest) => {
+      if (request[0] !== 'account_deleted') return performSignOut(...request);
+      accountDeletionSignOutInFlightRef.current = true;
+      try {
+        return await performSignOut(...request);
+      } finally {
+        accountDeletionSignOutInFlightRef.current = false;
+      }
+    },
+    [performSignOut],
+  );
+
   const handleForcedSignOut = useCallback(() => {
-    track(SHARED_EVENTS.Logout, { method: 'forced' });
+    // A forced sign-out during account deletion takes over that sign-out, so it
+    // must run the same full wipe and not report a second Logout.
+    const purgeOfflineBoards = accountDeletionSignOutInFlightRef.current;
+    if (!purgeOfflineBoards) track(SHARED_EVENTS.Logout, { method: 'forced' });
+    commitVerifiedAuthResult(null);
     const transitionEpoch = beginAuthTransition();
     // The interceptor already confirmed this credential owner is anonymous.
     // Serialize its cleanup with session checks so a later login cannot be
     // erased by the tail of an older asynchronous cleanup.
-    enqueueAuthTransition(() => handleSignedOutTransition(transitionEpoch, true)).catch(reportError);
+    enqueueAuthTransition(() => handleSignedOutTransition(transitionEpoch, true, { purgeOfflineBoards })).catch(
+      reportError,
+    );
   }, [beginAuthTransition, enqueueAuthTransition, handleSignedOutTransition]);
 
   const handleRemoteConfirmedSignOut = useCallback(() => {
@@ -1119,7 +1381,15 @@ export function AuthProvider({ children, onReady }: AuthProviderProps) {
   // `readPostLoginReturnHref()` a constant `null` — so both branches below are
   // exactly what ships today on the store fleet. Asserted by test, because this
   // change auto-OTAs to every installed binary.
-  if (!isAuthenticated && !inAuthGroup && !isAnonymousReadOnlyLocation()) {
+  // The workout route owns its public flag-off fallback and timestamped login
+  // handoff. Its private query remains disabled until authentication and consent.
+  if (
+    !isAuthenticated &&
+    !inAuthGroup &&
+    segments[0] !== 'privacy-consent' &&
+    segments[0] !== 'w' &&
+    !isAnonymousReadOnlyLocation()
+  ) {
     return <Redirect href="/auth/login" />;
   }
   if (isAuthenticated && inAuthGroup) {

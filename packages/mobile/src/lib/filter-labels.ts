@@ -44,7 +44,10 @@ export function progressFilterLabel(value: ProgressFilter, t: TFunction<'climbs'
 
 export function buildFilterLabels(t: TFunction<'climbs'>): ClimbFilterLabels {
   return {
-    gradeRange: (min, max) => t('mobile.search.gradeRange', { min, max }),
+    // Both ends reading the same is one grade, not a range: a rail chip can
+    // cover several grade ids ("V0" is 4a to 4c under V grades), so a bound with
+    // two different ids can still be a single "V0".
+    gradeRange: (min, max) => (min === max ? min : t('mobile.search.gradeRange', { min, max })),
     gradeMin: (grade) => t('mobile.search.gradeMin', { grade }),
     gradeMax: (grade) => t('mobile.search.gradeMax', { grade }),
     ascents: (count) => t('mobile.search.ascents', { count }),
@@ -53,6 +56,8 @@ export function buildFilterLabels(t: TFunction<'climbs'>): ClimbFilterLabels {
     // rating filters can't be read as two community thresholds.
     myRating: (count) => t('mobile.search.myRating', { count }),
     onlyRatedByMe: () => t('mobile.filter.ratedByMeShort'),
+    // The Liked collection: one word, shared by the chip, the summary and the token.
+    liked: () => t('mobile.filter.collection.liked'),
     onlyFollowedAuthors: () => t('authors.followingClimbs'),
     more: (count) => t('mobile.search.more', { count }),
     // i18n-keep mobile.search.settersCount

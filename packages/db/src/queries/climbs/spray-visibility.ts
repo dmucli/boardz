@@ -1,5 +1,62 @@
 import { sql, type SQL } from 'drizzle-orm';
 
+/** The board alias is `ub` at every spray read. Explicit resource settings
+ * replace legacy gym access, and revocation applies even to existing viewers.
+ *
+ * Every caller puts this inside the WHERE of an EXISTS, where NULL and false
+ * both drop the row. */
+function sprayResourceVisibility(viewer: string | null, wallUuid?: string | null): SQL {
+  const capability = wallUuid == null ? sql`false` : sql`ub.uuid = ${wallUuid}::text`;
+  if (viewer === null) {
+    // A signed-out reader. Every other branch compares a row with the viewer,
+    // and a NULL viewer matches nothing: not the owner, no revoked or approved
+    // grant, no follow, no gym membership. Leaving those branches out returns
+    // exactly the same walls and keeps their tables out of the statement, so a
+    // reader with no viewer needs no privilege on the follow graph, grants or
+    // memberships (the batch worker's community recap, job-queue-schema.ts).
+    // The backend's spray-visibility-null-viewer.test.ts pins the equivalence.
+    return sql`(
+      EXISTS (SELECT 1 FROM resource_privacy privacy
+        WHERE privacy.kind = 'board' AND privacy.resource_id = ub.uuid AND (
+          privacy.audience = 'public'
+          OR (privacy.audience = 'unlisted' AND ${capability})
+        ))
+      OR (NOT EXISTS (SELECT 1 FROM resource_privacy privacy
+            WHERE privacy.kind = 'board' AND privacy.resource_id = ub.uuid)
+        AND ((ub.is_public AND NOT ub.is_unlisted)
+          OR (ub.is_unlisted AND ${capability})))
+    )`;
+  }
+  return sql`(
+    ub.owner_id = ${viewer}::text OR (
+      NOT EXISTS (SELECT 1 FROM resource_grants revoked
+        WHERE revoked.kind = 'board' AND revoked.resource_id = ub.uuid
+          AND revoked.user_id = ${viewer}::text AND revoked.status = 'revoked')
+      AND (
+        EXISTS (SELECT 1 FROM resource_privacy privacy
+          WHERE privacy.kind = 'board' AND privacy.resource_id = ub.uuid AND (
+            privacy.audience = 'public'
+            OR (privacy.audience = 'unlisted' AND ${capability})
+            OR (privacy.audience <> 'only_me' AND (
+              EXISTS (SELECT 1 FROM resource_grants granted
+                WHERE granted.kind = 'board' AND granted.resource_id = ub.uuid
+                  AND granted.user_id = ${viewer}::text AND granted.status = 'approved')
+              OR ((privacy.audience = 'followers' OR privacy.inherit_followers)
+                AND EXISTS (SELECT 1 FROM user_follows followed
+                  WHERE followed.follower_id = ${viewer}::text AND followed.following_id = ub.owner_id))
+            ))
+          ))
+        OR (NOT EXISTS (SELECT 1 FROM resource_privacy privacy
+              WHERE privacy.kind = 'board' AND privacy.resource_id = ub.uuid)
+          AND ((ub.is_public AND NOT ub.is_unlisted)
+            OR (ub.is_unlisted AND ${capability})
+            OR EXISTS (SELECT 1 FROM gym_members gm
+              WHERE gm.gym_id = ub.gym_id AND gm.user_id = ${viewer}::text)))
+      )
+    )
+  )`;
+}
+
 /**
  * The one predicate that keeps a private spray wall's climbs out of every read.
  *
@@ -8,7 +65,7 @@ import { sql, type SQL } from 'drizzle-orm';
  * A spray climb is stored as an ordinary `board_climbs` row —
  * `board_type = 'spray'`, `is_listed = true`, `is_draft = false` — because that is
  * what makes queue, play, ticks, stats, playlists, search and the duplicate gate
- * work on a wall unchanged (`docs/spray-walls.md`). The cost of that decision is
+ * work on a wall unchanged (`docs/product/spray-walls.md`). The cost of that decision is
  * that **every existing predicate in the codebase reads a spray climb as public**:
  * `is_listed` was the visibility rule for eight catalogue boards, and it is not the
  * visibility rule for a photograph of somebody's living room.
@@ -73,13 +130,19 @@ export type SprayVisibilityColumns = {
 
 /**
  * `true` for every non-spray climb, and for a spray climb whose wall the viewer
- * may see by layout id.
+ * may see by layout id. An optional wall UUID grants the existing unlisted
+ * capability; callers without that capability retain the by-layout rule.
  *
- * Pass `userId` as null for an anonymous reader — then only public walls pass.
+ * Pass `userId` as null for an anonymous reader — then only public walls pass
+ * unless the caller explicitly supplies an unlisted wall capability.
  * Anything the caller can reach without signing in has to pass null, not a
  * hopeful value.
  */
-export function sprayClimbVisibilityCondition(columns: SprayVisibilityColumns, userId: string | null | undefined): SQL {
+export function sprayClimbVisibilityCondition(
+  columns: SprayVisibilityColumns,
+  userId: string | null | undefined,
+  wallUuid?: string | null,
+): SQL {
   const viewer = userId ?? null;
   return sql`(
     ${columns.boardType} IS DISTINCT FROM 'spray'
@@ -91,19 +154,7 @@ export function sprayClimbVisibilityCondition(columns: SprayVisibilityColumns, u
         AND sw.deleted_at IS NULL
         AND ub.deleted_at IS NULL
         AND (sw.hidden_at IS NULL OR (${viewer}::text IS NOT NULL AND ub.owner_id = ${viewer}::text))
-        AND (
-          ub.is_public
-          OR (
-            ${viewer}::text IS NOT NULL
-            AND (
-              ub.owner_id = ${viewer}::text
-              OR EXISTS (
-                SELECT 1 FROM gym_members gm
-                WHERE gm.gym_id = ub.gym_id AND gm.user_id = ${viewer}::text
-              )
-            )
-          )
-        )
+        AND ${sprayResourceVisibility(viewer, wallUuid)}
     )
   )`;
 }
@@ -138,20 +189,51 @@ export function sprayReferenceVisibilityCondition(
           AND sw.deleted_at IS NULL
           AND ub.deleted_at IS NULL
           AND (sw.hidden_at IS NULL OR (${viewer}::text IS NOT NULL AND ub.owner_id = ${viewer}::text))
-          AND (
-            ub.is_public
-            OR (
-              ${viewer}::text IS NOT NULL
-              AND (
-                ub.owner_id = ${viewer}::text
-                OR EXISTS (
-                  SELECT 1 FROM gym_members gm
-                  WHERE gm.gym_id = ub.gym_id AND gm.user_id = ${viewer}::text
-                )
-              )
-            )
-          )
+          AND ${sprayResourceVisibility(viewer)}
       )
+  )`;
+}
+
+/**
+ * The fail-closed half the reference form leaves open: `true` for every
+ * non-spray reference, and for a spray reference whose `board_climbs` row still
+ * exists.
+ *
+ * {@link sprayReferenceVisibilityCondition} passes a reference whose climb row
+ * is missing, for every viewer. That is right for an Aurora tick, which can
+ * arrive before its climb. It is wrong for spray: a wall delete is soft and
+ * keeps its climbs, but `deleteDraftClimb` and account deletion hard-delete a
+ * climb row and leave the ticks and proposals that named it. With the climb
+ * gone there is no layout id, so no wall to check, and the reference would
+ * reach everybody. AND this next to the reference form; it does not replace it.
+ *
+ * Needs a board type ON the referencing row (a tick, a proposal). A comment has
+ * none, so `globalCommentFeed` carries its own rule.
+ *
+ * `authorExemption` keeps the row for the person who wrote it: their own log on
+ * a climb they deleted is theirs to see, and a profile total that dropped it
+ * would disagree with their own logbook. Pass the referencing row's author
+ * column and the viewer (null for an anonymous caller, never a hopeful id).
+ * Leave it out for a reader that lists OTHER people's rows, like the per-climb
+ * logs, where nobody is exempt.
+ */
+export function sprayReferenceClimbExistsCondition(
+  columns: { boardType: SQL | unknown; climbUuid: SQL | unknown },
+  authorExemption?: { authorId: SQL | unknown; viewerUserId: string | null | undefined },
+): SQL {
+  const viewer = authorExemption?.viewerUserId ?? null;
+  const ownRow = authorExemption
+    ? sql`OR (${viewer}::text IS NOT NULL AND ${authorExemption.authorId} = ${viewer}::text)`
+    : sql``;
+  return sql`(
+    ${columns.boardType} IS DISTINCT FROM 'spray'
+    OR EXISTS (
+      SELECT 1
+      FROM board_climbs existing_climb
+      WHERE existing_climb.uuid = ${columns.climbUuid}
+        AND existing_climb.board_type = 'spray'
+    )
+    ${ownRow}
   )`;
 }
 
@@ -166,7 +248,11 @@ export function sprayReferenceVisibilityCondition(
  * behaviour: **not an error, and not a different shape**, so a private wall's
  * existence is not observable.
  */
-export function sprayLayoutVisibilitySql(layoutId: number, userId: string | null | undefined): SQL {
+export function sprayLayoutVisibilitySql(
+  layoutId: number,
+  userId: string | null | undefined,
+  wallUuid?: string | null,
+): SQL {
   const viewer = userId ?? null;
   return sql`SELECT EXISTS (
     SELECT 1
@@ -176,18 +262,6 @@ export function sprayLayoutVisibilitySql(layoutId: number, userId: string | null
       AND sw.deleted_at IS NULL
       AND ub.deleted_at IS NULL
       AND (sw.hidden_at IS NULL OR (${viewer}::text IS NOT NULL AND ub.owner_id = ${viewer}::text))
-      AND (
-        ub.is_public
-        OR (
-          ${viewer}::text IS NOT NULL
-          AND (
-            ub.owner_id = ${viewer}::text
-            OR EXISTS (
-              SELECT 1 FROM gym_members gm
-              WHERE gm.gym_id = ub.gym_id AND gm.user_id = ${viewer}::text
-            )
-          )
-        )
-      )
+      AND ${sprayResourceVisibility(viewer, wallUuid)}
   ) AS visible`;
 }

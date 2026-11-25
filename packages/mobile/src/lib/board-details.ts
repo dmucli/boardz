@@ -4,11 +4,12 @@ import {
   MOONBOARD_SIZE,
   WOODS_LAYOUTS,
   getMoonBoardDetails,
+  getMoonBoardGeometryByLayoutId,
   getWoodsBoardDetails,
 } from '@boardsesh/board-config';
 import type { BoardName } from '@boardsesh/shared-schema';
 import type { HoldPlacement } from '../components/board-renderer/types';
-import { getSprayWall, sprayCacheToken } from './spray/spray-wall-registry';
+import { activeSprayArt, getSprayWall, sprayCacheToken } from './spray/spray-wall-registry';
 import { sprayBackgroundKey } from './spray/spray-photo-keys';
 
 type BoardRenderData = {
@@ -136,6 +137,20 @@ function computeBoardRenderData(params: {
   return { boardWidth, boardHeight, edgeLeft, edgeRight, edgeBottom, edgeTop, backgroundImageKeys, holdsData };
 }
 
+/**
+ * Bundled manifest key of a MoonBoard layout's A-K / 1-18 label art
+ * (`moonboard/moonboard-bg.webp`, or the Mini's `minimoonboard-bg.webp`).
+ *
+ * The art holds the labels and nothing else, so it is drawn ABOVE the holds
+ * overlay by `MoonBoardGridLabels` rather than in the background stack: in dark
+ * mode the overlay's veil washes everything under it, and the labels fell to
+ * 2.25:1 on the boards with the strong veil (issue #6234).
+ */
+export function moonBoardGridLabelsImageKey(layoutId: number): string {
+  const { backgroundImage } = getMoonBoardGeometryByLayoutId(layoutId);
+  return `moonboard/${backgroundImage}`.replace(/\.png$/, '.webp');
+}
+
 function getMoonBoardRenderData(params: {
   layoutId: number;
   sizeId: number;
@@ -146,9 +161,12 @@ function getMoonBoardRenderData(params: {
 
   try {
     const details = getMoonBoardDetails({ layout_id: layoutId, set_ids: setIds });
-    const backgroundImageKeys = Object.keys(details.images_to_holds).map((filename) =>
-      `moonboard/${filename}`.replace(/\.png$/, '.webp'),
-    );
+    // The label art leaves the stack: surfaces that want the labels draw them
+    // above the overlay (see `moonBoardGridLabelsImageKey`); small ones go without.
+    const gridLabelsImageKey = moonBoardGridLabelsImageKey(layoutId);
+    const backgroundImageKeys = Object.keys(details.images_to_holds)
+      .map((filename) => `moonboard/${filename}`.replace(/\.png$/, '.webp'))
+      .filter((backgroundImageKey) => backgroundImageKey !== gridLabelsImageKey);
     const holdsData: HoldPlacement[] = details.holdsData.map((hold) => ({
       id: hold.id,
       mirroredHoldId: hold.mirroredHoldId,
@@ -260,11 +278,16 @@ function getSprayRenderData(params: { layoutId: number; sizeId: number }): Board
   const wall = getSprayWall(layoutId);
   if (!wall) return null;
 
-  const boardWidth = wall.photoWidth;
-  const boardHeight = wall.photoHeight;
+  // A generated look (`activeSprayArt`) is drawn in the canonical frame, so its
+  // size and its holds come as one: the art's pixels and holds scaled into
+  // them. Without one, the photo and the holds mapped into it. Never a mix.
+  const art = activeSprayArt(wall);
+  const boardWidth = art ? art.width : wall.photoWidth;
+  const boardHeight = art ? art.height : wall.photoHeight;
   if (!(boardWidth > 0) || !(boardHeight > 0)) return null;
+  const holds = art ? art.holds : wall.holds;
 
-  const holdsData: HoldPlacement[] = wall.holds.map((hold) => ({
+  const holdsData: HoldPlacement[] = holds.map((hold) => ({
     id: hold.id,
     // A wall is one photograph of one physical wall: there is no mirror geometry
     // to reflect a hold onto, so every placement is unmirrored.
@@ -281,7 +304,11 @@ function getSprayRenderData(params: { layoutId: number; sizeId: number }): Board
     edgeRight: boardWidth,
     edgeBottom: 0,
     edgeTop: boardHeight,
-    backgroundImageKeys: [sprayBackgroundKey(layoutId, wall.version)],
+    backgroundImageKeys: [
+      // The art's own version id: a local mirror of the same published version
+      // has a `local-…` id, and its art is still the server version's file.
+      art ? sprayBackgroundKey(layoutId, art.versionId, art.variant) : sprayBackgroundKey(layoutId, wall.versionId),
+    ],
     holdsData,
   };
 }

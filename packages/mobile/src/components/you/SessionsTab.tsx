@@ -1,42 +1,50 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, RefreshControl, StyleSheet } from 'react-native';
+import type { SessionFeedItem, SessionFeedTickHighlight, SocialEntityType } from '@boardsesh/shared-schema';
+import type { BottomSheet } from '../sheet-presentation';
 import { FlashList } from '@shopify/flash-list';
-import { useRouter, useFocusEffect } from 'expo-router';
+import { useFocusEffect, useRouter } from 'expo-router';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import type { BottomSheet } from '@expo/ui/community/bottom-sheet';
-import type { SessionFeedItem, SocialEntityType } from '@boardsesh/shared-schema';
-import { Text } from '../Text';
-import { Icon } from '../Icon';
-import { Button } from '../Button';
-import { Card } from '../Card';
+import { RefreshControl, StyleSheet, View } from 'react-native';
+import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
+import { useHideOnScroll } from '../../hooks/use-hide-on-scroll';
+import { useNativeRootHeader } from '../../hooks/use-native-root-header';
+import { useOfflineQueryState } from '../../hooks/use-offline-query-state';
+import { ScrollEdgeListReset, type ScrollEdgeBackdrop } from '../../hooks/use-scroll-edge-backdrop';
+import { nowMs } from '../../lib/clock';
+import { bucketSessionsByRecency, dedupeSessionsById, type FeedRecencyBucket } from '../../lib/feed-time-buckets';
+import { useBulkVoteSummaries, useSessionGroupedFeed } from '../../lib/graphql/hooks';
+import { useTickListActivation } from '../../lib/playlists/use-tick-list-activation';
+import { navigateToSessionFeedItem } from '../../lib/session-feed-navigation';
+import { useTheme } from '../../providers/theme-provider';
+import { borderRadius, spacing } from '../../theme/tokens';
 import { ActivityIndicator } from '../ActivityIndicator';
+import { Button } from '../Button';
+import { EmptyState } from '../EmptyState';
+import { Card } from '../Card';
 import { OfflineState } from '../OfflineState';
+import { useSessionWorkoutHeadlines } from '../session/workout/use-session-workout-view';
+import { CommentSheet } from './CommentSheet';
+import { FeedSectionLabel } from './FeedSectionLabel';
 import { SessionFeedCard } from './SessionFeedCard';
 import { SessionsFeedHeader } from './SessionsFeedHeader';
-import { FeedSectionLabel } from './FeedSectionLabel';
-import { CommentSheet } from './CommentSheet';
-import { bucketSessionsByRecency, dedupeSessionsById, type FeedRecencyBucket } from '../../lib/feed-time-buckets';
-import { useSessionGroupedFeed, useBulkVoteSummaries } from '../../lib/graphql/hooks';
-import { navigateToSessionFeedItem } from '../../lib/session-feed-navigation';
-import { openClimbInPlayDrawer } from '../../lib/open-climb-in-play-drawer';
-import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
-import { useOfflineQueryState } from '../../hooks/use-offline-query-state';
-import { useDrawerHost } from '../../providers/drawer-host-provider';
-import { spacing, borderRadius } from '../../theme/tokens';
-import { useTheme } from '../../providers/theme-provider';
-import { nowMs } from '../../lib/clock';
 
 type FeedRow = { type: 'header'; bucket: FeedRecencyBucket } | { type: 'session'; item: SessionFeedItem };
 type CommentTarget = { entityId: string; entityType: SocialEntityType };
 
 type TFunc = (key: string) => string;
 const PENDING_SKELETON_KEYS = ['session-skeleton-1', 'session-skeleton-2'];
+// A session card shows one climb, so it plays from a list of just that one.
+const NO_TICKS: SessionFeedTickHighlight[] = [];
+const NO_SESSION_ID_PAGES: readonly (readonly string[])[] = [];
 
 type SessionsTabProps = {
   userId: string | undefined;
   /** Measured chrome height — the list insets its top by this so the first row
    *  rests below the floating chrome and the rest scroll under it. */
   topInset?: number;
+  /** The Profile tab's `useScrollEdgeBackdrop().list`: tells the floating header
+   *  when this tab's list is scrolled under it. Undefined under an opaque header. */
+  scrollEdge?: ScrollEdgeBackdrop;
 };
 
 // String-literal `t(...)` per call so the catalog keys stay statically greppable.
@@ -89,11 +97,22 @@ function SessionCardSkeleton() {
   );
 }
 
-export function SessionsTab({ userId, topInset = 0 }: SessionsTabProps) {
+export function SessionsTab({ userId, topInset = 0, scrollEdge }: SessionsTabProps) {
+  const nativeRootHeader = useNativeRootHeader();
+  // On the Profile tab the Android nav bar hides as this list scrolls down; each
+  // sub-tab is its own scroll source, so switching sub-tabs never reads as a jump.
+  const handleScroll = useHideOnScroll(scrollEdge?.listProps.onScroll);
   const { t } = useTranslation('you');
-  const { systemColors, brandColors } = useTheme();
+  const { t: tSession } = useTranslation('session');
+  const { brandColors } = useTheme();
   const router = useRouter();
-  const { openPlayDrawer } = useDrawerHost();
+  // A session card's hardest send opens like a row of any list (issue #6665),
+  // playing from a one-climb list of its own.
+  const handleOpenClimb = useTickListActivation<SessionFeedTickHighlight>({
+    sourceId: 'profile-session-cards',
+    label: tSession('playView.track.hardestSend'),
+    rows: NO_TICKS,
+  });
   const bottomChrome = useBottomChromeMetrics();
   const paddingBottom = bottomChrome.scrollBottomPadding + spacing[4];
 
@@ -167,6 +186,15 @@ export function SessionsTab({ userId, topInset = 0 }: SessionsTabProps) {
     return map;
   }, [sessionVoteSummaries.data, tickVoteSummaries.data]);
 
+  // Each card's workout line (#6903): one headline request per feed page.
+  const sessionIdPages = useMemo(
+    () =>
+      feed.data?.pages.map((page) => page.sessionGroupedFeed.sessions.map((session) => session.sessionId)) ??
+      NO_SESSION_ID_PAGES,
+    [feed.data],
+  );
+  const workoutHeadlines = useSessionWorkoutHeadlines(sessionIdPages);
+
   const handleOpenComments = useCallback((entityId: string, entityType: SocialEntityType) => {
     setCommentTarget({ entityId, entityType });
     commentSheetRef.current?.snapToIndex(0);
@@ -178,19 +206,6 @@ export function SessionsTab({ userId, topInset = 0 }: SessionsTabProps) {
     },
     [router],
   );
-
-  // Screenshot mode: open the most recent session's detail once the feed lands,
-  // so the session-detail shot is deterministic (Maestro can't tap a session card
-  // on this iOS build). This tab only mounts via the `screenshotTab=sessions`
-  // deep-link param, so it never disturbs the default profile shot. Fires once.
-  const screenshotSessionOpenedRef = useRef(false);
-  useEffect(() => {
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE !== '1' || screenshotSessionOpenedRef.current) return;
-    const firstSession = sessions[0];
-    if (!firstSession) return;
-    screenshotSessionOpenedRef.current = true;
-    handleOpenSession(firstSession);
-  }, [sessions, handleOpenSession]);
 
   const handleEndReached = useCallback(() => {
     if (feed.hasNextPage && !feed.isFetchingNextPage) void feed.fetchNextPage();
@@ -207,11 +222,12 @@ export function SessionsTab({ userId, topInset = 0 }: SessionsTabProps) {
           voteSummary={summaryMap.get(`${row.item.socialEntityType}:${row.item.socialEntityId}`)}
           onOpenComments={handleOpenComments}
           onPress={handleOpenSession}
-          onOpenClimb={(tick) => openClimbInPlayDrawer({ kind: 'tick', tick }, { openPlayDrawer, router })}
+          onOpenClimb={handleOpenClimb}
+          workoutHeadline={workoutHeadlines.get(row.item.sessionId)}
         />
       );
     },
-    [handleOpenComments, handleOpenSession, summaryMap, t, openPlayDrawer, router],
+    [handleOpenComments, handleOpenSession, summaryMap, t, handleOpenClimb, workoutHeadlines],
   );
 
   // The feed rollup, shown when there are sessions. Memoized so FlashList doesn't
@@ -233,7 +249,11 @@ export function SessionsTab({ userId, topInset = 0 }: SessionsTabProps) {
   if (offline.isBlocked && offline.reason) {
     return (
       <View style={[styles.centered, { paddingTop: topInset }]}>
-        <OfflineState reason={offline.reason} onRetry={() => void feed.refetch()} />
+        <OfflineState
+          reason={offline.reason}
+          errorTitle={t('mobile.loadError.sessions')}
+          onRetry={() => void feed.refetch()}
+        />
       </View>
     );
   }
@@ -244,13 +264,17 @@ export function SessionsTab({ userId, topInset = 0 }: SessionsTabProps) {
 
   return (
     <View style={styles.flex}>
+      {/* The loading, offline and signed-out branches above unmount the list. */}
+      <ScrollEdgeListReset edge={scrollEdge} />
       <FlashList
         data={rows}
         extraData={summaryMap}
         renderItem={renderItem}
         getItemType={(row) => row.type}
         keyExtractor={(row) => (row.type === 'header' ? `header-${row.bucket}` : row.item.sessionId)}
-        contentInsetAdjustmentBehavior="never"
+        {...scrollEdge?.listProps}
+        onScroll={handleScroll}
+        contentInsetAdjustmentBehavior={nativeRootHeader ? 'automatic' : 'never'}
         onEndReached={handleEndReached}
         onEndReachedThreshold={0.5}
         contentContainerStyle={{ paddingTop: topInset, paddingBottom }}
@@ -274,20 +298,18 @@ export function SessionsTab({ userId, topInset = 0 }: SessionsTabProps) {
           ) : null
         }
         ListEmptyComponent={
-          <View style={styles.empty}>
-            <Icon name="history" size={48} color={systemColors.tertiaryLabel} />
-            <Text variant="headline" style={styles.emptyTitle}>
-              {t('mobile.sessions.emptyTitle')}
-            </Text>
-            <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.emptyBody}>
-              {t('mobile.sessions.emptyBody')}
-            </Text>
-            <View style={styles.emptyCta}>
-              {/* The Record tab hosts the session screen inline, so the CTA just
-                  navigates there. */}
+          <EmptyState
+            size="section"
+            style={{ paddingTop: 120 }}
+            icon="history"
+            title={t('mobile.sessions.emptyTitle')}
+            body={t('mobile.sessions.emptyBody')}
+            actions={
+              // The Record tab hosts the session screen inline, so the CTA just
+              // navigates there.
               <Button title={t('mobile.sessions.emptyCta')} onPress={() => router.navigate('/(tabs)/record')} />
-            </View>
-          </View>
+            }
+          />
         }
       />
       <CommentSheet
@@ -384,14 +406,4 @@ const styles = StyleSheet.create({
     borderRadius: borderRadius.full,
     opacity: 0.32,
   },
-  empty: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingTop: 120,
-    paddingHorizontal: spacing[8],
-    gap: spacing[2],
-  },
-  emptyTitle: { marginTop: spacing[3], textAlign: 'center' },
-  emptyBody: { textAlign: 'center' },
-  emptyCta: { marginTop: spacing[4] },
 });

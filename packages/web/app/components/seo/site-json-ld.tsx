@@ -1,5 +1,6 @@
 import React from 'react';
-import { getServerTranslation } from '@/app/lib/i18n/server';
+import { getServerTranslation, getServerTranslationForLocale } from '@/app/lib/i18n/server';
+import type { Locale } from '@/app/lib/i18n/config';
 import { absoluteUrl } from '@/app/lib/seo/base-url';
 import { JsonLd } from '@/app/lib/seo/json-ld';
 import { SITE_NAME } from '@/app/lib/seo/metadata';
@@ -11,7 +12,15 @@ import { resolveShellStaticAssetUrl } from '@/app/lib/shell-static-asset-url';
  * and `/help`. `sameAs` is a claim of identity, so nothing goes in here that a
  * reader cannot already find on the site.
  */
-const SAME_AS = ['https://github.com/marcodejongh/boardsesh', 'https://discord.gg/YXA8GsXfQK'];
+export const SAME_AS = ['https://github.com/marcodejongh/boardsesh', 'https://discord.gg/YXA8GsXfQK'];
+
+/**
+ * One Organization and one WebSite for the whole site: the homepage defines
+ * them and every other graph (the app guides) points at the same `@id`s, so
+ * Google reads one entity instead of a new one per page.
+ */
+export const ORGANIZATION_ID = absoluteUrl('/#organization');
+export const WEBSITE_ID = absoluteUrl('/#website');
 
 /**
  * `Organization` + `WebSite` for the homepage, as one `@graph`.
@@ -21,8 +30,10 @@ const SAME_AS = ['https://github.com/marcodejongh/boardsesh', 'https://discord.g
  * not exist is a fabricated capability — Google follows it, gets a 404, and
  * learns the markup is unreliable. Pinned by a deep-scan test.
  */
-export default async function SiteJsonLd() {
-  const { t, locale } = await getServerTranslation('marketing');
+export default async function SiteJsonLd({ locale: explicitLocale }: { locale?: Locale } = {}) {
+  const { t, locale } = explicitLocale
+    ? await getServerTranslationForLocale(explicitLocale, 'marketing')
+    : await getServerTranslation('marketing');
 
   const siteUrl = absoluteUrl('/');
   const logoUrl = resolveShellStaticAssetUrl('/brand/boardsesh-mark.webp');
@@ -34,6 +45,7 @@ export default async function SiteJsonLd() {
         '@graph': [
           {
             '@type': 'Organization',
+            '@id': ORGANIZATION_ID,
             // Brand name — not translated, per the trademark rules.
             name: SITE_NAME,
             url: siteUrl,
@@ -45,6 +57,7 @@ export default async function SiteJsonLd() {
           },
           {
             '@type': 'WebSite',
+            '@id': WEBSITE_ID,
             name: SITE_NAME,
             url: siteUrl,
             inLanguage: locale,

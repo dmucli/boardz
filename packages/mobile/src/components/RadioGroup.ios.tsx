@@ -19,7 +19,7 @@ import { Picker, Text } from '@expo/ui/swift-ui';
 import { pickerStyle, tint, tag } from '@expo/ui/swift-ui/modifiers';
 import { StyleSheet } from 'react-native';
 import { useTheme } from '../providers/theme-provider';
-import { brandAccentColor } from '../theme/expo-ui-modifiers';
+import { brandControlTint } from '../theme/expo-ui-modifiers';
 import { makeRadioSelectHandler } from './RadioGroup.logic';
 import type { RadioGroupProps } from './RadioGroup.types';
 
@@ -48,7 +48,7 @@ export function RadioGroup<T extends string>({ options, value, onChange }: Radio
       ]}
     >
       <Picker
-        selection={value}
+        selection={value ?? undefined}
         onSelectionChange={(selected) => {
           // @expo/ui types the selection as the untyped Picker tag; our tags are
           // always the string option values, so guard rather than blind-cast.
@@ -59,7 +59,7 @@ export function RadioGroup<T extends string>({ options, value, onChange }: Radio
         modifiers={[
           pickerStyle('inline'),
           // Brand checkmark on the selected row, sourced once via the theming bridge.
-          tint(brandAccentColor(brandColors)),
+          tint(brandControlTint(brandColors)),
         ]}
       >
         {options.map((option) => (

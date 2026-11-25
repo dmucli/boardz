@@ -5,16 +5,16 @@ name: Refresh Climb Neighbors
 # resolver serves to every non-admin caller (the web climb pages included).
 # Watermark-driven per board (board_climb_neighbor_runs), so a normal night only
 # re-scores new and edited climbs plus the lists they land in. Spray walls are
-# never materialised. Design + runbook: docs/similar-climbs.md.
+# never materialised. Design + runbook: docs/data/similar-climbs.md.
 #
 # One job per board, so the small catalogues finish in minutes while Kilter
 # (about 295k eligible climbs in one layout) runs on its own. A full build is
 # resumable: a job cut off by the timeout leaves its finished groups and lists
 # recorded, and the next run carries on from there. The board list must match
 # CLIMB_NEIGHBOR_BOARDS (pinned by climb-neighbors-workflow.test.ts).
+# Scheduled runs moved to the homelab batch worker (pg-boss family, #5800);
+# this workflow is manual-only for backfills and dry runs.
 on:
-  schedule:
-    - cron: '45 6 * * *' # 06:45 UTC daily, after the grade refresh
   workflow_dispatch:
     inputs:
       board:
@@ -64,7 +64,7 @@ jobs:
         if: env.SELECTED == 'true'
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       - name: Install dependencies
         if: env.SELECTED == 'true'

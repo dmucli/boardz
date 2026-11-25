@@ -1,5 +1,6 @@
+import { PressableSurface } from '../PressableSurface';
 import { useEffect, useState } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { PublicUserProfile, UserSearchResult } from '@boardsesh/shared-schema';
 import { Text } from '../Text';
@@ -120,7 +121,7 @@ export function ClimberSearchEmptyState({ query }: { query: string }) {
   return (
     <View style={styles.stateBlock}>
       <Icon name="search" size={48} color={systemColors.tertiaryLabel} />
-      <Text variant="headline" style={styles.stateTitle}>
+      <Text tone="secondary" variant="headline" style={styles.stateTitle}>
         {title}
       </Text>
       {query.length >= 2 ? (
@@ -139,10 +140,10 @@ export function ClimberSearchErrorState({ onRetry }: { onRetry: () => void }) {
   return (
     <View style={styles.stateBlock}>
       <Icon name="error" size={48} color={systemColors.tertiaryLabel} />
-      <Text variant="headline" style={styles.stateTitle}>
+      <Text tone="secondary" variant="headline" style={styles.stateTitle}>
         {t('mobile.social.loadError')}
       </Text>
-      <Pressable
+      <PressableSurface
         onPress={onRetry}
         accessibilityRole="button"
         accessibilityLabel={t('mobile.social.retry')}
@@ -152,10 +153,10 @@ export function ClimberSearchErrorState({ onRetry }: { onRetry: () => void }) {
           pressed && { backgroundColor: `${brandColors.primary}1A` },
         ]}
       >
-        <Text variant="footnote" color={brandColors.primary}>
+        <Text variant="footnote" color={systemColors.accent}>
           {t('mobile.social.retry')}
         </Text>
-      </Pressable>
+      </PressableSurface>
     </View>
   );
 }
@@ -174,7 +175,6 @@ const styles = StyleSheet.create({
   },
   stateTitle: {
     marginTop: spacing[3],
-    opacity: 0.65,
     textAlign: 'center',
   },
   stateSubtitle: {

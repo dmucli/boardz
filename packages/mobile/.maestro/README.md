@@ -1,4 +1,26 @@
+# Capture entrypoints
+
+Use `vp run mobile:screenshots -- --flow app-store|app-store-campaign|help|onboarding`
+for visual captures. It boots the isolated story root, supplies fixture props,
+waits for view/asset readiness, then takes native screenshots. The old visual
+YAML files below are retained only as the established filename inventory; their
+live-route commands are deprecated and must not be executed directly. Ad-hoc
+`mobile:ios-shots` / `mobile:android-shots --flow` rejects those files; use
+`--story <id>` for one view instead. See `docs/mobile/mobile-stories.md`.
+
+`smoke.yaml` and `smoke-android.yaml` still navigate the real application and are
+run through `vp run mobile:screenshots -- --flow smoke`. A separate dev bootstrap
+signs in against recorded responses and the content observer reports actual
+rendered content. No screenshot data or route parameters enter production views.
+
+The remaining sections describe the historical capture inventories and platform
+constraints. Their screenshot-mode navigation commands no longer run visual captures.
+
 # Maestro screenshot flows
+
+For real USB-connected phones and the ESP32 fixture, see the separate
+[local board QA runbook](../../../docs/qa/local-board-qa.md). Its hardware suite is
+local-only and uses normal app Bluetooth; these screenshot flows use their own setup.
 
 Native App Store / onboarding screenshot capture for the Boardsesh mobile app.
 Driven by [Maestro](https://maestro.mobile.dev). Don't run these by hand — the
@@ -62,6 +84,11 @@ directly into its shots — no Maestro element races a transient auth screen.
   zone filters, setters, Logbook, the share-beta matcher, the beta shelf, the
   board sheet, board view, the climb-actions menu and the preview drawer. Raw
   uncaptioned PNGs — only `--flow app-store` goes through `screenshot:frame`.
+
+- `smoke.yaml` / `smoke-android.yaml` — not a capture. The mobile E2E gate's navigation smoke
+  (`--flow smoke`): home, profile, climbs and the first climb's play drawer, no screenshots.
+  Android asserts testIDs; iOS only navigates, and the app's own content pings are the
+  assertion. See `docs/qa/mobile-e2e-gate.md`.
 
 ## Required env
 

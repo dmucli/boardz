@@ -19,6 +19,8 @@ import {
   foreignPlaylistOwnerGuard,
   myPlaylistOwnerEdge,
   selectUpstreamPlaylistOwners,
+  selectDeletedUpstreamPlaylistIds,
+  acquireUpstreamPlaylistLock,
   acquireUserTickMutationLock,
   isSyncFenceError,
   DeferredClimbStatsRecompute,
@@ -343,12 +345,29 @@ export async function syncKilterUserData({
     // next flush would skip those climb/angle keys as already claimed, silently
     // leaving no rating at all. That is reachable today: a failing flush is
     // caught by runPhase and the sync continues to the next one.
-    const committedClaims = await runBatch((tx) =>
-      applyClimbRatings(tx, userId, batch, aliasCache, log, claimedRatingKeys),
-    );
+    let committedClaims: RatingClaims;
+    if (!deferredStats) {
+      committedClaims = await runBatch((tx) =>
+        applyClimbRatings(tx, userId, batch, aliasCache, log, claimedRatingKeys),
+      );
+    } else {
+      // Same deferral as flushLogs: the grade copy onto ticks owes a stats
+      // recompute, run after commit in bounded batches of its own.
+      try {
+        committedClaims = await runBatch((tx) => {
+          deferredStats.begin();
+          return applyClimbRatings(tx, userId, batch, aliasCache, log, claimedRatingKeys, deferredStats.collect);
+        });
+      } catch (error) {
+        deferredStats.rollback();
+        throw error;
+      }
+      deferredStats.commit();
+    }
     for (const [naturalKey, claim] of committedClaims) {
       claimedRatingKeys.set(naturalKey, claim);
     }
+    if (deferredStats) await deferredStats.flush(runBatch);
   }
 
   // Phase isolation. A throw from one phase must not cancel the others. Before
@@ -1160,7 +1179,90 @@ export async function applyLogs(
   // kilter_id) wrote nothing, so its key has nothing to recompute. PowerSync
   // redelivers whole logbooks, so most of a typical flush is identical re-syncs.
   for (const n of inserts) addTouchedKey(n.canonical, n.raw.angle);
+  // A log carries no grade; the climber's grade arrived with their rating,
+  // possibly in an earlier sync. Copy it onto the rows this flush wrote.
+  await applyRatingGradesToTicks(tx, userId, [...touchedKeys.values()]);
   await recompute(tx, [...touchedKeys.values()]);
+}
+
+/**
+ * Copy the climber's own Kilter grade onto their Kilter-linked ticks (#6182).
+ *
+ * A Kilter `logs` row has no grade column. The grade the climber picked when
+ * they logged the send lives on their `climb_ratings` row for the same
+ * (climb, angle) — `difficulty_grade_id`, on the same difficulty-id scale as
+ * `boardsesh_ticks.difficulty` — which applyClimbRatings stores in
+ * board_climb_ratings. Without this copy a pulled tick keeps `difficulty`
+ * NULL, and every surface (logbook, feeds, sessions, the offline SQLite
+ * mirror) falls back to the climb's consensus grade.
+ *
+ * Logs and ratings flush in separate transactions in either order, so both
+ * phases call this for the keys they wrote. A tick is written only when:
+ *   - it is a send or flash (attempts never carry a grade —
+ *     docs/data/ascents-and-attempts.md);
+ *   - it is linked to Kilter (`kilter_id` set) and carries no local edit
+ *     newer than its last sync (`updated_at <= kilter_synced_at`, the same
+ *     guard applyLogs uses) — a Boardsesh-side grade edit is never stomped;
+ *   - it has no grade yet, or it came from a Kilter pull, so a grade changed
+ *     on Kilter follows while a native tick's own grade stays;
+ *   - the rating is live (not detached) and carries a grade (> 1, the same
+ *     placeholder rule as catalog-sync). A NULL grade never clears one.
+ *
+ * kilter_synced_at is restamped with max(this host's clock, the DB's NOW()),
+ * so it stays >= the updated_at the set_updated_at trigger writes (NOW()).
+ * Otherwise the copy itself would read as a local edit.
+ *
+ * Returns the (climb, angle) keys whose ticks changed, for the caller's
+ * board_climb_stats recompute.
+ */
+export async function applyRatingGradesToTicks(
+  tx: DrizzleDb,
+  userId: string,
+  keys: ReadonlyArray<Pick<ClimbStatsKey, 'climbUuid' | 'angle'>>,
+): Promise<ClimbStatsKey[]> {
+  if (keys.length === 0) return [];
+  const syncedAt = new Date().toISOString();
+  const payload = JSON.stringify(keys.map((key) => ({ climb_uuid: key.climbUuid, angle: key.angle })));
+  // UPDATE … FROM a join can't be expressed with the query builder; raw sql
+  // is the sanctioned fallback (same as the bulk log UPDATE above).
+  const result = await tx.execute(sql`
+    UPDATE boardsesh_ticks AS t SET
+      difficulty = r.difficulty_grade_id,
+      -- GREATEST with the DB clock: the trigger stamps updated_at from NOW(),
+      -- so a DB clock running ahead of this host must not make the copy read
+      -- as a local edit.
+      kilter_synced_at = GREATEST(${syncedAt}::timestamp, now()::timestamp),
+      updated_at = ${syncedAt}::timestamp
+    FROM board_climb_ratings AS r,
+      jsonb_to_recordset(${payload}::jsonb) AS k(climb_uuid text, angle integer)
+    WHERE t.user_id = ${userId}
+      AND t.board_type = ${KILTER_BOARD_TYPE}
+      AND t.climb_uuid = k.climb_uuid
+      AND t.angle = k.angle
+      AND t.status IN ('flash', 'send')
+      AND t.kilter_id IS NOT NULL
+      AND t.kilter_synced_at IS NOT NULL
+      AND t.updated_at <= t.kilter_synced_at
+      AND (t.difficulty IS NULL OR t.origin = 'kilter_pull')
+      AND t.difficulty IS DISTINCT FROM r.difficulty_grade_id
+      AND r.user_id = t.user_id
+      AND r.board_type = t.board_type
+      AND r.climb_uuid = t.climb_uuid
+      AND r.angle = t.angle
+      AND r.kilter_detached_at IS NULL
+      -- Same "no grade" rule as catalog-sync's guardDifficulty: Grips sends 0
+      -- or 1 as a placeholder (id 1 doesn't exist). Not an EXISTS on
+      -- board_difficulty_grades: the provider-sync worker roles can't read it.
+      AND r.difficulty_grade_id > 1
+    RETURNING t.climb_uuid, t.angle
+  `);
+  const rows = (Array.isArray(result) ? result : []) as Array<{ climb_uuid: string; angle: number }>;
+  const changed = new Map<string, ClimbStatsKey>();
+  for (const row of rows) {
+    const angle = Number(row.angle);
+    changed.set(`${row.climb_uuid} ${angle}`, { boardType: KILTER_BOARD_TYPE, climbUuid: row.climb_uuid, angle });
+  }
+  return [...changed.values()];
 }
 
 /**
@@ -1254,6 +1356,9 @@ export async function applyClimbRatings(
    * its old single-flush semantics.
    */
   claimedNaturalKeys: RatingClaims = new Map(),
+  // Ratings now write tick grades (applyRatingGradesToTicks), which feed
+  // board_climb_stats. Same deferral seam as applyLogs.
+  recompute: ClimbStatsRecompute = recomputeClimbStatsBulk,
 ): Promise<RatingClaims> {
   if (ops.length === 0) return new Map();
 
@@ -1681,6 +1786,17 @@ export async function applyClimbRatings(
     }
   }
 
+  // Every key in the batch, not only ratings that changed: PowerSync
+  // redelivers the full snapshot each cycle, which is what backfills ticks
+  // pulled before the grade copy existed. The helper's own guards make an
+  // unchanged key a no-op.
+  const gradedKeys = await applyRatingGradesToTicks(
+    tx,
+    userId,
+    survivors.map((entry) => ({ climbUuid: entry.canonical, angle: entry.angle })),
+  );
+  await recompute(tx, gradedKeys);
+
   return stagedClaims;
 }
 
@@ -1938,6 +2054,13 @@ export type ApplyCircuitsResult = {
   skippedForeignCircuits: number;
 };
 
+/** The circuit uuid a PUT op carries in its payload, if any. */
+function putCircuitUuid(op: PowerSyncOp): string | undefined {
+  if (op.op === 'REMOVE') return undefined;
+  const raw = op.data as RawCircuit | undefined;
+  return raw?.circuit_uuid || undefined;
+}
+
 /** Every circuit uuid this batch references, PUT (payload) or REMOVE (object_id). */
 function collectCircuitUuids(circuitOps: PowerSyncOp[]): string[] {
   const uuids = new Set<string>();
@@ -1955,11 +2078,40 @@ function collectCircuitUuids(circuitOps: PowerSyncOp[]): string[] {
 export async function applyCircuits(
   tx: DrizzleDb,
   userId: string,
-  circuitOps: PowerSyncOp[],
+  snapshotCircuitOps: PowerSyncOp[],
   circuitClimbOps: PowerSyncOp[],
   aliasCache: Map<string, string>,
   log: (message: string) => void = (msg) => console.warn(msg),
 ): Promise<ApplyCircuitsResult> {
+  // ---- Circuits the climber deleted in Boardsesh (#7240) -------------------
+  //
+  // PowerSync re-sends every circuit every cycle, so a playlist deleted in
+  // Boardsesh used to come straight back: no row carried its kilter_id, so the
+  // upsert below inserted a fresh one. deletePlaylist now records the circuit
+  // uuid, and its PUTs are dropped here, before the owner lookup and the
+  // adoption step, so the circuit is neither inserted nor adopted onto a
+  // same-named legacy playlist. The circuit stays on Kilter.
+  //
+  // The lock comes first: a delete committing between this read and the
+  // upsert would otherwise be re-inserted by this very batch. It is held to
+  // the end of the phase transaction. REMOVEs (upstream deleted the circuit)
+  // pass through unchanged.
+  const snapshotPutUuids = Array.from(
+    new Set(snapshotCircuitOps.map(putCircuitUuid).filter((uuid): uuid is string => uuid !== undefined)),
+  );
+  let deletedCircuitUuids = new Set<string>();
+  if (snapshotPutUuids.length > 0) {
+    await acquireUpstreamPlaylistLock(tx, userId);
+    deletedCircuitUuids = await selectDeletedUpstreamPlaylistIds(tx, userId, 'kilter', snapshotPutUuids);
+  }
+  const circuitOps =
+    deletedCircuitUuids.size === 0
+      ? snapshotCircuitOps
+      : snapshotCircuitOps.filter((op) => {
+          const circuitUuid = putCircuitUuid(op);
+          return circuitUuid === undefined || !deletedCircuitUuids.has(circuitUuid);
+        });
+
   // Group circuit_climbs by their parent circuit_uuid so we can diff
   // against the current playlist contents. REMOVE ops on circuit_climbs
   // are ignored — the full-snapshot diff below replaces the

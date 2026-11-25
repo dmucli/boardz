@@ -72,6 +72,11 @@ export const newClimbFeedTypeDefs = /* GraphQL */ `
   }
 
   input SaveClimbInput {
+    "Optional stable client-generated climb UUID for idempotent offline replay."
+    uuid: ID
+    "Ignored. A published climb is public to everyone, so a climb has no audience. Kept so installed app builds that still send it are not rejected."
+    privacy: PrivacyPublicationInput
+      @deprecated(reason: "Climbs have no audience: a published climb is public to everyone. Ignored.")
     boardType: String!
     layoutId: Int!
     name: String!
@@ -104,16 +109,8 @@ export const newClimbFeedTypeDefs = /* GraphQL */ `
     caller is a principal.
     """
     sprayWallUuid: String
-    """
-    The spray wall climb this one was remixed from.
-
-    Writes a \`spray_climb_lineage\` row alongside the child, which is what the
-    child's screen reads to link back to the parent's ticks and grade history.
-    Only meaningful for \`boardType: "spray"\`, and the parent has to be a climb
-    on the SAME wall. The parent is kept even when it is no longer climbable —
-    that is usually why it was remixed.
-    """
-    remixOfClimbUuid: ID
+    "Accepted and ignored. Remix after a reset was retired, and no lineage is written."
+    remixOfClimbUuid: ID @deprecated(reason: "Remix after a reset was retired. Accepted and ignored.")
   }
 
   """
@@ -131,6 +128,9 @@ export const newClimbFeedTypeDefs = /* GraphQL */ `
   }
 
   input SaveMoonBoardClimbInput {
+    "Ignored. A published climb is public to everyone, so a climb has no audience. Kept so installed app builds that still send it are not rejected."
+    privacy: PrivacyPublicationInput
+      @deprecated(reason: "Climbs have no audience: a published climb is public to everyone. Ignored.")
     boardType: String!
     layoutId: Int!
     name: String!
@@ -146,6 +146,8 @@ export const newClimbFeedTypeDefs = /* GraphQL */ `
   }
 
   type SaveClimbResult {
+    "True when the UUID already existed and no fields were changed."
+    replayed: Boolean
     uuid: ID!
     synced: Boolean!
     "ISO timestamp of when the row was created"
@@ -155,11 +157,18 @@ export const newClimbFeedTypeDefs = /* GraphQL */ `
   }
 
   """
-  Input for updating an existing climb. Only the climb's owner can update
-  the row, and only while it is still a draft OR within 24 hours of its
-  first publish.
+  Input for updating an existing climb.
+
+  A draft can be updated by its setter at any time. A published climb can be
+  updated by its setter within 24 hours of its first publish, on every board,
+  spray walls included. The edit is made in place; no revision is recorded.
   """
   input UpdateClimbInput {
+    "Stable UUID for one edit; retries acknowledge the original committed edit."
+    clientMutationId: ID
+    "Ignored. A published climb is public to everyone, so a climb has no audience. Kept so installed app builds that still send it are not rejected."
+    privacy: PrivacyPublicationInput
+      @deprecated(reason: "Climbs have no audience: a published climb is public to everyone. Ignored.")
     uuid: ID!
     boardType: String!
     name: String
@@ -207,6 +216,10 @@ export const newClimbFeedTypeDefs = /* GraphQL */ `
     createdAt: String
     publishedAt: String
     isDraft: Boolean!
+    "The climb's stored revision (\`Climb.revisionNumber\`). A save no longer moves it."
+    revisionNumber: Int
+    "The stored \`Climb.holdsRevisionNumber\`. A save no longer moves it."
+    holdsRevisionNumber: Int
   }
 
   """
@@ -284,6 +297,8 @@ export const newClimbFeedTypeDefs = /* GraphQL */ `
     server has no compatibility data for this climb (legacy row).
     """
     compatibleSizeIds: [Int!]!
+    "Hold-set IDs required by the climb, derived from its frame placements. Null means unknown; an empty list requires no sets."
+    requiredSetIds: [Int!]
     """
     Structured climb rules ('no_match', 'any_feet', 'campus', 'no_kickboard',
     method_*). Nullable, unlike compatibleSizeIds above: null means the server

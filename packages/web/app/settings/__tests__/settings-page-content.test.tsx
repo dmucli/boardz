@@ -47,7 +47,7 @@ vi.mock('next-auth/react', () => ({
   }),
 }));
 
-// The two kept sections are stubbed so this file asserts what the page renders,
+// The kept sections are stubbed so this file asserts what the page renders,
 // not what they render. Both carry their own render coverage —
 // `components/account/__tests__/set-password-section.test.tsx` and
 // `components/account/__tests__/controllers-section.test.tsx`.
@@ -59,15 +59,26 @@ vi.mock('@/app/components/account/set-password-section', () => ({
   default: () => <div data-testid="set-password-section" />,
 }));
 
+vi.mock('@/app/components/account/sign-in-methods-section', () => ({
+  default: () => <div data-testid="sign-in-methods-section" />,
+}));
+
+// Connected apps fetches its own list; its render coverage is in
+// `components/account/__tests__/connected-apps-section.test.tsx`.
+vi.mock('@/app/components/account/connected-apps-section', () => ({
+  default: () => <div data-testid="connected-apps-section" />,
+}));
+
 import SettingsPageContent from '../settings-page-content';
 
 beforeEach(() => {
   vi.clearAllMocks();
   window.history.replaceState({}, '', '/settings');
-  global.fetch = vi.fn().mockResolvedValue({
-    ok: true,
-    json: async () => ({ email: 'climber@example.com', hasPassword: false, linkedProviders: ['google'] }),
-  }) as unknown as typeof fetch;
+  global.fetch = vi
+    .fn()
+    .mockImplementation(async () =>
+      Response.json({ email: 'climber@example.com', hasPassword: false, linkedProviders: ['google'] }),
+    ) as unknown as typeof fetch;
 });
 
 async function renderSettings() {
@@ -84,12 +95,32 @@ describe('SettingsPageContent', () => {
 
     expect(screen.getByTestId('set-password-section')).toBeTruthy();
     expect(screen.getByTestId('controllers-section')).toBeTruthy();
+    expect(screen.getByTestId('connected-apps-section')).toBeTruthy();
+  });
+
+  it('shows no sign-in methods card unless the browser session mode is on (#7596 B5e2)', async () => {
+    await renderSettings();
+    expect(screen.queryByTestId('sign-in-methods-section')).toBeNull();
+  });
+
+  it('under the browser session mode, shows the sign-in methods card instead of set-password', async () => {
+    render(<SettingsPageContent signInMethods />);
+    expect(await screen.findByTestId('sign-in-methods-section')).toBeTruthy();
+    expect(screen.queryByTestId('set-password-section')).toBeNull();
   });
 
   it('renders the page title', async () => {
     await renderSettings();
 
     expect(screen.getByText(tFromCatalog('settings', 'title'))).toBeTruthy();
+  });
+
+  it('offers a visible sign-out link to the guarded sign-out flow', async () => {
+    await renderSettings();
+
+    expect(screen.getByRole('link', { name: tFromCatalog('settings', 'signOut') }).getAttribute('href')).toBe(
+      '/auth/signout',
+    );
   });
 
   it('renders no profile form fields', async () => {
@@ -146,7 +177,7 @@ describe('SettingsPageContent', () => {
     },
   );
 
-  it('links to the app profile screen, and links nowhere else', async () => {
+  it('links to the sign-out flow and app profile screen, and links nowhere else', async () => {
     // The destination is named explicitly rather than mirrored from this
     // pathname: the SPA has no /settings route, so the same-path form would be
     // a 404.
@@ -159,15 +190,21 @@ describe('SettingsPageContent', () => {
     const { container } = await renderSettings();
 
     const hrefs = Array.from(container.querySelectorAll('main a')).map((anchor) => anchor.getAttribute('href'));
-    expect(hrefs).toEqual([EXPECTED_HANDOFF_HREF]);
+    expect(hrefs).toEqual(['/auth/signout', EXPECTED_HANDOFF_HREF]);
     expect(screen.getByText(tFromCatalog('settings', 'appHandoff.cta'))).toBeTruthy();
   });
 
   it('surfaces a profile fetch failure instead of spinning forever', async () => {
-    global.fetch = vi.fn().mockResolvedValue({ ok: false, json: async () => ({}) }) as unknown as typeof fetch;
+    global.fetch = vi
+      .fn()
+      .mockImplementation(async () => Response.json({}, { status: 500 })) as unknown as typeof fetch;
 
     await renderSettings();
 
     expect(mockShowMessage).toHaveBeenCalledWith(tFromCatalog('settings', 'loading.profileError'), 'error');
   });
 });
+
+vi.mock('@/app/components/consent/consent-state-provider', () => ({
+  useConsent: () => ({ granted: true, openChoices: vi.fn(), snapshot: { record: null } }),
+}));

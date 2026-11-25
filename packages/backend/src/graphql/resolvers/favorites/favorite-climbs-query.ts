@@ -82,11 +82,14 @@ export const favoriteClimbsQuery = {
         frames_count: tables.climbs.framesCount,
         frames_pace: tables.climbs.framesPace,
         compatible_size_ids: tables.climbs.compatibleSizeIds,
+        required_set_ids: tables.climbs.requiredSetIds,
         // How many of the climb's holds have come off the wall. Spray walls only —
         // NULL on every catalogue board, where holds do not come off — and the badge,
         // the Intact / Lost holds filter and the remix prompt all read it, so a
         // projection without it tells a climber that a climb they cannot do is fine.
         missing_hold_count: tables.climbs.missingHoldCount,
+        revision_number: tables.climbs.revisionNumber,
+        holds_revision_number: tables.climbs.holdsRevisionNumber,
         // The structured climb rules. Omitting them here does not just blank a
         // badge: the derived `Climb.is_no_match` resolver falls back to the Aurora
         // description convention when the array is absent, and the play drawer
@@ -162,7 +165,10 @@ export const favoriteClimbsQuery = {
       framesCount: result.frames_count ?? null,
       framesPace: result.frames_pace ?? null,
       compatibleSizeIds: result.compatible_size_ids ?? null,
+      requiredSetIds: result.required_set_ids ?? null,
       missingHoldCount: result.missing_hold_count ?? null,
+      revisionNumber: result.revision_number ?? null,
+      holdsRevisionNumber: result.holds_revision_number ?? null,
       characteristics: result.characteristics ?? null,
       // Every row is scoped to this board by the join; carrying it keeps
       // is_no_match from applying Aurora's description convention to a
@@ -171,7 +177,7 @@ export const favoriteClimbsQuery = {
       angle: input.angle,
       statsAngle: result.statsAngle ?? null,
       ascensionist_count: Number(result.ascensionist_count || 0),
-      difficulty: getGradeLabel(result.difficulty_id),
+      difficulty: getGradeLabel(result.difficulty_id, boardName),
       quality_average: result.quality_average?.toString() || '0',
       stars: getClimbStars(result.quality_average),
       difficulty_error: result.difficulty_error?.toString() || '0',

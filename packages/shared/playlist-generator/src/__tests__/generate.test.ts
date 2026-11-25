@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import {
+  DEFAULT_FOUR_BY_FOUR_OPTIONS,
   DEFAULT_GRADE_FOCUS_OPTIONS,
   DEFAULT_LADDER_OPTIONS,
+  DEFAULT_LIMIT_BOULDERING_OPTIONS,
+  DEFAULT_ON_THE_MINUTE_OPTIONS,
   DEFAULT_PYRAMID_OPTIONS,
   DEFAULT_VOLUME_OPTIONS,
   type GeneratorGradeScale,
+  generateFourByFourPlan,
   generateGradeFocusPlan,
   generateLadderPlan,
+  generateLimitBoulderingPlan,
+  generateOnTheMinutePlan,
   generatePyramidPlan,
   generateVolumePlan,
   generateWorkoutPlan,
@@ -108,6 +114,92 @@ describe('generatePyramidPlan', () => {
   });
 });
 
+describe('generatePyramidPlan coming back down on the same climbs', () => {
+  const pyramid = (numberOfSteps: number, climbsPerStep: number, repeatOnWayDown?: boolean) =>
+    generatePyramidPlan(
+      { ...DEFAULT_PYRAMID_OPTIONS, warmUp: 'none', numberOfSteps, climbsPerStep, targetGrade: 20, repeatOnWayDown },
+      GRADES,
+    );
+  // One letter per climb: a slot that repeats reads its twin's letter, so the
+  // plan reads the way the climber walks it.
+  const climbLetters = (slots: ReturnType<typeof pyramid>) => {
+    const letters: string[] = [];
+    let nextLetter = 0;
+    for (const slot of slots) {
+      const twin =
+        slot.repeatOfIndex === undefined ? -1 : slots.findIndex((other) => other.index === slot.repeatOfIndex);
+      letters.push(twin >= 0 ? letters[twin] : String.fromCharCode(65 + nextLetter++));
+    }
+    return letters.join(' ');
+  };
+
+  it('repeats nothing when off or absent, so existing pyramids plan as before', () => {
+    expect(pyramid(7, 1).some((slot) => 'repeatOfIndex' in slot)).toBe(false);
+    expect(pyramid(7, 1, false).some((slot) => 'repeatOfIndex' in slot)).toBe(false);
+    expect(climbLetters(pyramid(7, 1))).toBe('A B C D E F G');
+  });
+
+  it('climbs a 7-step pyramid A B C D C B A', () => {
+    const slots = pyramid(7, 1, true);
+    expect(climbLetters(slots)).toBe('A B C D C B A');
+    expect(slots.map((slot) => slot.repeatOfIndex)).toEqual([undefined, undefined, undefined, undefined, 2, 1, 0]);
+    expect(slots.map((slot) => slot.grade)).toEqual([17, 18, 19, 20, 19, 18, 17]);
+  });
+
+  it('keeps both peaks of an even pyramid different climbs, never A B B A', () => {
+    const slots = pyramid(6, 1, true);
+    expect(climbLetters(slots)).toBe('A B C D B A');
+    expect(slots.filter((slot) => slot.section === 'peak').every((slot) => slot.repeatOfIndex === undefined)).toBe(
+      true,
+    );
+  });
+
+  it('comes down a step of several climbs in exact reverse', () => {
+    expect(climbLetters(pyramid(5, 2, true))).toBe('A B C D E F D C B A');
+    expect(climbLetters(pyramid(4, 2, true))).toBe('A B C D E F B A');
+  });
+
+  it('repeats only way-down slots, each at its twin grade, never right after it', () => {
+    for (let numberOfSteps = 3; numberOfSteps <= 15; numberOfSteps++) {
+      for (let climbsPerStep = 1; climbsPerStep <= 5; climbsPerStep++) {
+        const slots = pyramid(numberOfSteps, climbsPerStep, true);
+        slots.forEach((slot) => {
+          if (slot.section !== 'decreasing') {
+            expect(slot.repeatOfIndex).toBeUndefined();
+            return;
+          }
+          const twin = slots.find((other) => other.index === slot.repeatOfIndex);
+          expect(twin?.section).toBe('increasing');
+          expect(twin?.grade).toBe(slot.grade);
+        });
+        const letters = climbLetters(slots).split(' ');
+        letters.forEach((letter, position) => expect(letters[position - 1]).not.toBe(letter));
+        // Every way-up climb comes back exactly once.
+        const repeated = slots.flatMap((slot) => (slot.repeatOfIndex === undefined ? [] : [slot.repeatOfIndex]));
+        expect(new Set(repeated).size).toBe(repeated.length);
+        expect(repeated.length).toBe(slots.filter((slot) => slot.section === 'increasing').length);
+      }
+    }
+  });
+
+  it('points past a warm-up at the right twin', () => {
+    const slots = generatePyramidPlan(
+      {
+        ...DEFAULT_PYRAMID_OPTIONS,
+        warmUp: 'standard',
+        numberOfSteps: 3,
+        climbsPerStep: 1,
+        targetGrade: 20,
+        repeatOnWayDown: true,
+      },
+      GRADES,
+    );
+    const lastSlot = slots[slots.length - 1];
+    const firstStep = slots.find((slot) => slot.section === 'increasing');
+    expect(lastSlot.repeatOfIndex).toBe(firstStep?.index);
+  });
+});
+
 describe('generateLadderPlan', () => {
   it('only produces an increasing phase capped at the target', () => {
     const slots = generateLadderPlan(
@@ -130,6 +222,55 @@ describe('generateLadderPlan', () => {
     const mainSlots = slots.filter((slot) => slot.section !== 'warmUp');
     expect(mainSlots.map((slot) => slot.grade)).toEqual([18, 19, 20, 21, 22]);
     expect(Math.max(...mainSlots.map((slot) => slot.grade))).toBe(22);
+  });
+});
+
+describe('generateLadderPlan descending', () => {
+  const descendingOptions = { ...DEFAULT_LADDER_OPTIONS, descending: true, targetGrade: 18 };
+
+  it('runs hardest first: t, t, t-1, t-1, ...', () => {
+    const slots = generateLadderPlan(
+      { ...descendingOptions, warmUp: 'none', numberOfSteps: 4, climbsPerStep: 2 },
+      GRADES,
+    );
+
+    expect(slots.map((slot) => slot.grade)).toEqual([18, 18, 17, 17, 16, 16, 15, 15]);
+    expect(slots.map((slot) => slot.section)).toEqual(['peak', 'peak', ...Array<string>(6).fill('decreasing')]);
+    expect(slots.map((slot) => slot.index)).toEqual([0, 1, 2, 3, 4, 5, 6, 7]);
+  });
+
+  it('keeps indices continuous after the warm-up', () => {
+    const slots = generateLadderPlan(
+      { ...descendingOptions, warmUp: 'standard', numberOfSteps: 3, climbsPerStep: 1 },
+      GRADES,
+    );
+
+    expect(slots.map((slot) => slot.index)).toEqual(slots.map((_, position) => position));
+    const mainSlots = slots.filter((slot) => slot.section !== 'warmUp');
+    expect(mainSlots.map((slot) => slot.grade)).toEqual([18, 17, 16]);
+  });
+
+  it('steps through the ids a sparse scale has', () => {
+    const moonboardGrades: GeneratorGradeScale = [13, 17, 21, 25].map((difficulty_id) => ({ difficulty_id }));
+    const slots = generateLadderPlan(
+      { ...descendingOptions, warmUp: 'none', targetGrade: 25, numberOfSteps: 3, climbsPerStep: 1 },
+      moonboardGrades,
+    );
+
+    expect(slots.map((slot) => slot.grade)).toEqual([25, 21, 17]);
+  });
+
+  it('matches the ascending plan reversed by step', () => {
+    const ascending = generateLadderPlan(
+      { ...DEFAULT_LADDER_OPTIONS, warmUp: 'none', targetGrade: 18, numberOfSteps: 4, climbsPerStep: 1 },
+      GRADES,
+    );
+    const descending = generateLadderPlan(
+      { ...descendingOptions, warmUp: 'none', numberOfSteps: 4, climbsPerStep: 1 },
+      GRADES,
+    );
+
+    expect(descending.map((slot) => slot.grade)).toEqual(ascending.map((slot) => slot.grade).reverse());
   });
 });
 
@@ -184,13 +325,13 @@ describe('warm-up against sparse / mid-range grade pools', () => {
     expect(warmUpSlots.every((slot) => slot.grade < 15)).toBe(true);
   });
 
-  it('returns no warm-up slots when target is at the pool minimum', () => {
+  it('keeps the standard warm-up at the target when it is the pool minimum', () => {
     const slots = generateGradeFocusPlan(
       { ...DEFAULT_GRADE_FOCUS_OPTIONS, warmUp: 'standard', numberOfClimbs: 3, targetGrade: 13 },
       MOONBOARD_LIKE_GRADES,
     );
     const warmUpSlots = slots.filter((slot) => slot.section === 'warmUp');
-    expect(warmUpSlots).toHaveLength(0);
+    expect(warmUpSlots.map((slot) => slot.grade)).toEqual([13, 13, 13, 13]);
   });
 
   it('handles an empty grade scale by emitting no warm-up slots', () => {
@@ -199,6 +340,60 @@ describe('warm-up against sparse / mid-range grade pools', () => {
       [],
     );
     expect(slots).toEqual([]);
+  });
+});
+
+describe('configured warm-up length', () => {
+  it.each([DEFAULT_VOLUME_OPTIONS, DEFAULT_PYRAMID_OPTIONS, DEFAULT_LADDER_OPTIONS, DEFAULT_GRADE_FOCUS_OPTIONS])(
+    'keeps the lowest-grade warm-up before a $type workout',
+    (options) => {
+      const slots = generateWorkoutPlan({ ...options, warmUp: 'standard', targetGrade: 13 }, [
+        { difficulty_id: 13 },
+        { difficulty_id: 17 },
+      ]);
+      expect(slots.slice(0, 4)).toEqual(
+        Array.from({ length: 4 }, (_, index) => ({ grade: 13, section: 'warmUp', index })),
+      );
+      expect(slots.slice(4).every((slot) => slot.section !== 'warmUp')).toBe(true);
+      expect(slots.map((slot) => slot.index)).toEqual(Array.from({ length: slots.length }, (_, index) => index));
+    },
+  );
+
+  it.each([
+    { warmUp: 'standard' as const, targetGrade: 1, grades: GRADES, expected: [1, 1, 1, 1] },
+    { warmUp: 'extended' as const, targetGrade: 1, grades: GRADES, expected: Array(12).fill(1) },
+    { warmUp: 'standard' as const, targetGrade: 2, grades: GRADES, expected: [1, 1, 1, 1] },
+    { warmUp: 'extended' as const, targetGrade: 2, grades: GRADES, expected: Array(12).fill(1) },
+    { warmUp: 'standard' as const, targetGrade: 7, grades: GRADES, expected: [3, 4, 5, 6] },
+    { warmUp: 'extended' as const, targetGrade: 7, grades: GRADES, expected: [1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6] },
+    {
+      warmUp: 'standard' as const,
+      targetGrade: 14,
+      grades: [{ difficulty_id: 13 }, { difficulty_id: 14 }, { difficulty_id: 17 }],
+      expected: [13, 13, 13, 13],
+    },
+    {
+      warmUp: 'standard' as const,
+      targetGrade: 25,
+      grades: [13, 17, 21, 25].map((difficulty_id) => ({ difficulty_id })),
+      expected: [13, 13, 17, 21],
+    },
+    {
+      warmUp: 'extended' as const,
+      targetGrade: 6,
+      grades: GRADES,
+      expected: [1, 1, 1, 2, 2, 2, 3, 3, 4, 4, 5, 5],
+    },
+  ])('preserves $warmUp length at target $targetGrade', ({ warmUp, targetGrade, grades, expected }) => {
+    const slots = generateGradeFocusPlan(
+      { ...DEFAULT_GRADE_FOCUS_OPTIONS, warmUp, numberOfClimbs: 2, targetGrade },
+      grades,
+    );
+    const warmUpSlots = slots.filter((slot) => slot.section === 'warmUp');
+    expect(warmUpSlots).toHaveLength(warmUp === 'standard' ? 4 : 12);
+    expect(warmUpSlots.map((slot) => slot.grade)).toEqual(expected);
+    expect(slots.map((slot) => slot.index)).toEqual(Array.from({ length: expected.length + 2 }, (_, i) => i));
+    expect(slots.slice(expected.length).map((slot) => slot.grade)).toEqual([targetGrade, targetGrade]);
   });
 });
 
@@ -233,5 +428,91 @@ describe('groupSlotsBySection', () => {
 
   it('returns an empty array for empty input', () => {
     expect(groupSlotsBySection([])).toEqual([]);
+  });
+});
+
+describe('timed workout plans', () => {
+  it('plans one on-the-minute slot per climb, all at the target grade', () => {
+    const slots = generateOnTheMinutePlan(
+      { ...DEFAULT_ON_THE_MINUTE_OPTIONS, numberOfClimbs: 12, intervalSeconds: 45, targetGrade: 15 },
+      GRADES,
+    );
+
+    expect(slots).toEqual(Array.from({ length: 12 }, (_, index) => ({ grade: 15, section: 'main', index })));
+  });
+
+  it('plans one 4x4 slot per set, whatever the reps per set', () => {
+    for (const repsPerSet of [2, 4, 10]) {
+      const slots = generateFourByFourPlan(
+        { ...DEFAULT_FOUR_BY_FOUR_OPTIONS, sets: 4, repsPerSet, targetGrade: 20 },
+        GRADES,
+      );
+      expect(slots).toEqual(Array.from({ length: 4 }, (_, index) => ({ grade: 20, section: 'main', index })));
+    }
+    expect(generateFourByFourPlan({ ...DEFAULT_FOUR_BY_FOUR_OPTIONS, sets: 1, targetGrade: 20 }, GRADES)).toEqual([
+      { grade: 20, section: 'main', index: 0 },
+    ]);
+  });
+
+  it('plans one limit-bouldering slot per climb at the target grade', () => {
+    const slots = generateLimitBoulderingPlan({ ...DEFAULT_LIMIT_BOULDERING_OPTIONS, targetGrade: 24 }, GRADES);
+
+    expect(slots).toEqual([0, 1, 2].map((index) => ({ grade: 24, section: 'main', index })));
+  });
+
+  it('puts a warm-up in front, the way grade focus does', () => {
+    const warmUp = generateGradeFocusPlan(
+      { ...DEFAULT_GRADE_FOCUS_OPTIONS, warmUp: 'standard', numberOfClimbs: 0, targetGrade: 20 },
+      GRADES,
+    );
+    const slots = generateFourByFourPlan(
+      { ...DEFAULT_FOUR_BY_FOUR_OPTIONS, warmUp: 'standard', sets: 2, targetGrade: 20 },
+      GRADES,
+    );
+
+    expect(slots.slice(0, warmUp.length)).toEqual(warmUp);
+    expect(slots.slice(warmUp.length).map((slot) => [slot.grade, slot.section, slot.index])).toEqual([
+      [20, 'main', warmUp.length],
+      [20, 'main', warmUp.length + 1],
+    ]);
+  });
+
+  it('generateWorkoutPlan dispatches each timed type to its own plan', () => {
+    const onTheMinute = { ...DEFAULT_ON_THE_MINUTE_OPTIONS, targetGrade: 15 };
+    const fourByFour = { ...DEFAULT_FOUR_BY_FOUR_OPTIONS, targetGrade: 15 };
+    const limitBouldering = { ...DEFAULT_LIMIT_BOULDERING_OPTIONS, targetGrade: 15 };
+
+    expect(generateWorkoutPlan(onTheMinute, GRADES)).toEqual(generateOnTheMinutePlan(onTheMinute, GRADES));
+    expect(generateWorkoutPlan(fourByFour, GRADES)).toEqual(generateFourByFourPlan(fourByFour, GRADES));
+    expect(generateWorkoutPlan(limitBouldering, GRADES)).toEqual(generateLimitBoulderingPlan(limitBouldering, GRADES));
+    expect(generateWorkoutPlan(fourByFour, GRADES)).toHaveLength(4);
+  });
+
+  it('copies the default climb filters from volume', () => {
+    for (const defaults of [
+      DEFAULT_ON_THE_MINUTE_OPTIONS,
+      DEFAULT_FOUR_BY_FOUR_OPTIONS,
+      DEFAULT_LIMIT_BOULDERING_OPTIONS,
+    ]) {
+      expect(defaults).toMatchObject({
+        warmUp: 'none',
+        climbBias: DEFAULT_VOLUME_OPTIONS.climbBias,
+        minAscents: DEFAULT_VOLUME_OPTIONS.minAscents,
+        minRating: DEFAULT_VOLUME_OPTIONS.minRating,
+        onlyTallClimbs: DEFAULT_VOLUME_OPTIONS.onlyTallClimbs,
+        onlyWideClimbs: DEFAULT_VOLUME_OPTIONS.onlyWideClimbs,
+      });
+    }
+  });
+
+  it('defaults to 10 climbs every minute, 4 sets of 4 reps and 3 limit climbs with 3-minute rests', () => {
+    expect(DEFAULT_ON_THE_MINUTE_OPTIONS).toMatchObject({ numberOfClimbs: 10, intervalSeconds: 60 });
+    expect(DEFAULT_FOUR_BY_FOUR_OPTIONS).toMatchObject({
+      sets: 4,
+      repsPerSet: 4,
+      restBetweenRepsSeconds: 0,
+      restBetweenSetsSeconds: 180,
+    });
+    expect(DEFAULT_LIMIT_BOULDERING_OPTIONS).toMatchObject({ numberOfClimbs: 3, restSeconds: 180 });
   });
 });

@@ -1,5 +1,9 @@
 import { getBackendHttpUrl } from '@/app/lib/backend-url';
+import { getWebClientIdentity } from '@/app/lib/client-identity';
+import { CLIENT_IDENTITY_HEADER } from '@boardsesh/shared-schema/client-identity';
 import type { AuroraBoardName } from '@boardsesh/shared-schema';
+import type { CircuitPlaylistSyncErrorReason } from '@boardsesh/shared-schema/sync-error-codes';
+import { guardedFetch } from '@/app/lib/auth/session-guard';
 
 export type AuroraCredentialStatus = {
   boardType: string;
@@ -8,6 +12,7 @@ export type AuroraCredentialStatus = {
   lastSyncAt: string | null;
   syncStatus: string;
   syncError: string | null;
+  syncErrorReason?: CircuitPlaylistSyncErrorReason;
   createdAt: string;
 };
 
@@ -51,6 +56,7 @@ function endpoint(transport: AuroraBackendTransport, path: string): string {
 function buildRequestHeaders(headers: RequestInit['headers'], authToken: string, hasJsonBody: boolean): Headers {
   const mergedHeaders = new Headers(headers);
   mergedHeaders.set('Authorization', `Bearer ${authToken}`);
+  mergedHeaders.set(CLIENT_IDENTITY_HEADER, getWebClientIdentity());
   if (hasJsonBody) {
     mergedHeaders.set('Content-Type', 'application/json');
   }
@@ -71,7 +77,7 @@ async function requestBackendJson<T>(
   path: string,
   init: RequestInit = {},
 ): Promise<T> {
-  const response = await fetch(endpoint(transport, path), {
+  const response = await guardedFetch(endpoint(transport, path), {
     ...init,
     headers: buildRequestHeaders(init.headers, transport.authToken, Boolean(init.body)),
   });

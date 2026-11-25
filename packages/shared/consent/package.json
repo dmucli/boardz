@@ -1,0 +1,36 @@
+{
+  "name": "@boardsesh/consent",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts",
+      "default": "./src/index.ts"
+    },
+    "./edge-country": {
+      "types": "./src/edge-country.ts",
+      "import": "./src/edge-country.ts",
+      "default": "./src/edge-country.ts"
+    },
+    "./origin-proof": {
+      "types": "./src/origin-proof.ts",
+      "import": "./src/origin-proof.ts",
+      "default": "./src/origin-proof.ts"
+    },
+    "./origin-proof-server": {
+      "types": "./src/origin-proof-server.ts",
+      "import": "./src/origin-proof-server.ts",
+      "default": "./src/origin-proof-server.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.5",
+    "typescript": "~7.0.2"
+  }
+}

@@ -1,0 +1,597 @@
+/* The board poster's three sheets (#4415). The paper margin (`@page`), the
+ * screen wrapper and the screen-only bar come from
+ * `components/poster/poster-sheet.module.css`.
+ *
+ * HARDCODED COLOURS AND MILLIMETRES ARE THE DOCUMENTED PRINT EXCEPTION (the
+ * theme-token rule says colours come from theme-config). These sheets are
+ * ALWAYS black on white, light theme or dark, screen or paper: the reader is a
+ * phone camera pointed at a page taped to a wall. The gym poster
+ * (`gym-poster.module.css`) and the kiosk's install tile make the same call.
+ *
+ * ONE PAGE ON A4 AND ON US LETTER. Every sheet is 186 × 248 mm: A4 is the
+ * narrower paper (210 mm) and Letter the shorter (279.4 mm), so at the 12 mm
+ * @page margin the box both can print is 186 × 255.4 mm. The 7 mm left over is
+ * slack for Safari, whose printed headers and footers eat into the page on
+ * Letter. Nothing sits outside the 186 mm width either — Firefox's "fit to
+ * page width" shrinks the whole sheet to fit anything that sticks out. The
+ * height is fixed, and clipped, so no block can ever start a second sheet; every
+ * block that can grow is bounded instead (the name by `PosterFitText`'s clamp,
+ * the rest by the flexible gaps between them), and the worst cases — a
+ * 200-character name, an unlisted wall, an LED board's legal lines, German —
+ * are checked against real renders before this changes.
+ *
+ * COLOUR ONLY AS SVG FILLS, <img> OR TEXT. Browsers drop CSS backgrounds when
+ * printing unless the reader ticks "background graphics", which is off by
+ * default. The violet step badges and the code are SVG; the photo and the mark
+ * are images; rules and the photo frame are borders. */
+
+.paper {
+  /* Screen only: a sheet of A4 at its print margin, so the preview IS the page. */
+  box-sizing: content-box;
+  width: 186mm;
+  padding: 12mm;
+  background: #ffffff;
+  color: #111111;
+  border-radius: var(--border-radius-lg);
+  box-shadow: 0 2px 16px var(--overlay-dark);
+}
+
+/* A phone shows the whole sheet, scaled down, instead of a sideways scroll.
+ * `zoom` scales layout uniformly, so the name fitter measures the same line
+ * breaks it would print. */
+@media screen and (max-width: 860px) {
+  .paper {
+    zoom: 0.6;
+  }
+}
+
+@media screen and (max-width: 520px) {
+  .paper {
+    zoom: 0.4;
+  }
+}
+
+@media screen and (max-width: 360px) {
+  .paper {
+    zoom: 0.34;
+  }
+}
+
+.sheet {
+  box-sizing: border-box;
+  position: relative;
+  width: 186mm;
+  height: 248mm;
+  overflow: clip;
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+  color: #111111;
+  /* `system-ui` right after `-apple-system`: Chrome ignores `-apple-system` and
+   * would print Helvetica on a Mac. System fonts only, so nothing is fetched. */
+  font-family: -apple-system, system-ui, 'SF Pro Display', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-kerning: normal;
+  text-rendering: geometricPrecision;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Zero specificity, so each block's own margin below wins without a fight. */
+:where(.sheet) :where(p, ol, h1, h2) {
+  margin: 0;
+  padding: 0;
+}
+
+:where(.sheet) b {
+  font-weight: 700;
+}
+
+.qrSvg {
+  display: block;
+  flex: none;
+  width: var(--poster-qr-box);
+  height: var(--poster-qr-box);
+}
+
+.separator {
+  padding: 0 0.45em;
+}
+
+.gap {
+  flex: 1 1 0;
+}
+
+.rule {
+  flex: none;
+  height: 0;
+  border-top: 0.3mm solid #111111;
+}
+
+/* A name clamped to its last line keeps its descenders: the clamp cuts at the
+ * padding edge, so a little padding below the last line holds the tails of
+ * "g", "y" and "p" that a line-height of ~1 pushes outside the line box. */
+.plainName,
+.photoName,
+.cardName {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: break-word;
+  text-wrap: balance;
+  padding-bottom: 0.12em;
+  font-weight: 700;
+}
+
+.typedLabel {
+  line-height: 1.2;
+}
+
+.typedUrl {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.typedHost {
+  white-space: nowrap;
+}
+
+.typedSlug {
+  display: inline-block;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+
+/* ─── Plain poster ("Tag") ─────────────────────────────────────────────── */
+
+.plainKicker {
+  font-size: 5mm;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.plainName {
+  font-size: 16mm;
+  line-height: 1.02;
+  letter-spacing: -0.025em;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.plainName[data-fit-step='1'] {
+  font-size: 12mm;
+  line-height: 1.04;
+  letter-spacing: -0.02em;
+}
+
+.plainName[data-fit-step='2'] {
+  font-size: 9mm;
+  line-height: 1.12;
+  letter-spacing: -0.012em;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+.plainFacts {
+  margin-top: 5mm;
+  font-size: 6mm;
+  line-height: 1.2;
+  letter-spacing: -0.005em;
+}
+
+.plainGapKicker {
+  flex-grow: 1.1;
+  min-height: 9mm;
+}
+
+.plainGapAbove {
+  flex-grow: 2.1;
+  min-height: 7mm;
+}
+
+.plainGapBelow {
+  flex-grow: 1.3;
+  min-height: 3mm;
+}
+
+.plainGapFoot {
+  flex-grow: 2.1;
+  min-height: 6mm;
+}
+
+.plainScan {
+  flex: none;
+  display: flex;
+  margin-top: 3mm;
+}
+
+.plainStepsColumn {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  /* No left padding: the code's own white quiet zone is the gap. The top and
+   * bottom padding line the first step and the note up with its dark modules. */
+  padding: var(--poster-qr-quiet) 0;
+}
+
+.plainSteps {
+  list-style: none;
+  display: contents;
+}
+
+.plainSteps li {
+  display: grid;
+  grid-template-columns: 8mm 1fr;
+  align-items: baseline;
+  font-size: 4.5mm;
+  line-height: 1.3;
+  text-wrap: pretty;
+}
+
+.plainStepNumber {
+  font-weight: 700;
+  font-size: 7mm;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.plainNote {
+  padding-left: 8mm;
+  font-size: 3.6mm;
+  line-height: 1.35;
+  color: #444444;
+  text-wrap: pretty;
+}
+
+.plainTyped .typedLabel {
+  font-size: 4mm;
+}
+
+.plainTyped .typedUrl {
+  margin-top: 1.6mm;
+  font-size: 5mm;
+  line-height: 1.2;
+}
+
+.plainLegal {
+  margin-bottom: 3mm;
+  font-size: 3mm;
+  line-height: 1.35;
+  color: #444444;
+}
+
+.plainFoot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 6mm;
+}
+
+.plainWordmark {
+  font-size: 6mm;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+
+.plainMeta {
+  font-size: 3mm;
+  line-height: 1.3;
+  color: #444444;
+  text-align: right;
+}
+
+/* ─── Photo poster ("Wall Portrait") ───────────────────────────────────── */
+
+.photoSheet {
+  justify-content: center;
+}
+
+.mast {
+  flex: none;
+  height: 10mm;
+  display: flex;
+  align-items: center;
+}
+
+.mastHeadline {
+  display: flex;
+  align-items: center;
+  font-size: 7mm;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+  white-space: nowrap;
+}
+
+.mastLead {
+  font-weight: 500;
+}
+
+.mastMark {
+  display: block;
+  width: 10.4mm;
+  height: 10.4mm;
+  margin: 0 0.2mm 0 1.3mm;
+}
+
+.mastWordmark {
+  font-weight: 800;
+  letter-spacing: -0.04em;
+}
+
+.photo {
+  flex: none;
+  display: block;
+  box-sizing: border-box;
+  width: 186mm;
+  height: 100mm;
+  margin-top: 4mm;
+  object-fit: cover;
+  /* Keep the top of the wall, lose the floor and the mats. */
+  object-position: 50% 20%;
+  border: 0.3mm solid #111111;
+}
+
+.photoRow {
+  flex: none;
+  position: relative;
+  display: flex;
+  min-height: var(--poster-qr-box);
+  /* The text column stops 4 mm short of the code's white quiet zone. */
+  padding: var(--poster-qr-quiet) calc(var(--poster-qr-box) + 4mm) var(--poster-qr-quiet) 0;
+  margin-top: 3mm;
+}
+
+/* Flush with the photo's right edge, quiet zone included: the white margin
+ * stays inside the sheet. */
+.photoQr {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+
+.photoInfo {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 4mm;
+}
+
+.photoName {
+  font-size: 12mm;
+  line-height: 1;
+  letter-spacing: -0.035em;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.photoName[data-fit-step='1'] {
+  font-size: 9.5mm;
+  line-height: 1.06;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+.photoName[data-fit-step='2'] {
+  font-size: 7.5mm;
+  line-height: 1.14;
+  letter-spacing: -0.025em;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+.photoFacts {
+  margin-top: 4.2mm;
+  font-size: 5.4mm;
+  font-weight: 500;
+  line-height: 1.1;
+}
+
+.photoFacts b {
+  font-weight: 800;
+}
+
+.photoFacts .separator {
+  padding: 0 1.6mm;
+  /* Text colour, not a background: it prints. The light-scheme brand violet. */
+  color: #5b22f2;
+  font-weight: 800;
+}
+
+.badgeSteps {
+  list-style: none;
+}
+
+.badgeSteps li {
+  display: flex;
+  align-items: center;
+  gap: 2.8mm;
+  font-size: 4.4mm;
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+.badgeSteps li + li {
+  margin-top: 2.4mm;
+}
+
+.badge {
+  flex: none;
+  display: block;
+  width: 6.4mm;
+  height: 6.4mm;
+}
+
+.photoNote {
+  margin-top: 3.6mm;
+  font-size: 3.3mm;
+  line-height: 1.2;
+  color: #444444;
+}
+
+.photoTyped {
+  flex: none;
+  margin-top: 4mm;
+}
+
+.photoTyped .typedLabel {
+  font-size: 3.4mm;
+  color: #444444;
+}
+
+.photoTyped .typedUrl {
+  margin-top: 0.8mm;
+  font-size: 5mm;
+  line-height: 1.2;
+}
+
+.photoFoot {
+  flex: none;
+  display: flex;
+  justify-content: space-between;
+  gap: 6mm;
+  margin-top: 5mm;
+  padding-top: 2.2mm;
+  border-top: 0.25mm solid #111111;
+  font-size: 3mm;
+  line-height: 1.2;
+  color: #444444;
+}
+
+/* ─── Card sheet ───────────────────────────────────────────────────────── */
+
+.cardSheet {
+  display: grid;
+  grid-template-columns: 93mm 93mm;
+  grid-template-rows: 124mm 124mm;
+}
+
+.cutLines {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 186mm;
+  height: 248mm;
+  pointer-events: none;
+}
+
+.card {
+  box-sizing: border-box;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 6mm 7.5mm 5mm;
+  overflow: clip;
+}
+
+.cardKicker {
+  font-size: 2.5mm;
+  line-height: 1;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.cardName {
+  font-size: 7mm;
+  line-height: 1.04;
+  letter-spacing: -0.02em;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+}
+
+.cardName[data-fit-step='1'] {
+  font-size: 5.5mm;
+  line-height: 1.06;
+  letter-spacing: -0.015em;
+}
+
+.cardName[data-fit-step='2'] {
+  font-size: 4.5mm;
+  line-height: 1.14;
+  letter-spacing: -0.01em;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+}
+
+.cardFacts {
+  margin-top: 1.4mm;
+  font-size: 3.4mm;
+  line-height: 1.2;
+}
+
+.cardGapKicker {
+  flex-grow: 1;
+  min-height: 1.5mm;
+}
+
+.cardGapAbove {
+  flex-grow: 0.4;
+  min-height: 0;
+}
+
+.cardGapBelow {
+  flex-grow: 0.6;
+  min-height: 0;
+}
+
+.cardGapFoot {
+  flex-grow: 1.6;
+  min-height: 1.5mm;
+}
+
+.cardQr {
+  margin-left: calc(-1 * var(--poster-qr-quiet));
+}
+
+.cardTyped .typedLabel {
+  font-size: 2.6mm;
+}
+
+.cardTyped .typedUrl {
+  margin-top: 0.8mm;
+  font-size: 3.5mm;
+  line-height: 1.22;
+}
+
+.cardFoot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.cardWordmark {
+  font-size: 4.6mm;
+  font-weight: 800;
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+
+.cardMeta {
+  font-size: 2.3mm;
+  line-height: 1.2;
+  color: #444444;
+}
+
+.cardLegal {
+  margin-top: 1.6mm;
+  font-size: 1.9mm;
+  line-height: 1.3;
+  color: #444444;
+}
+
+@media print {
+  .paper {
+    margin: 0 auto;
+    padding: 0;
+    border-radius: 0;
+    box-shadow: none;
+    zoom: 1;
+    /* Force the ink even where the browser would inherit a dark theme. */
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

@@ -1,3 +1,4 @@
+import { sprayClimbVisibilityCondition } from '../climbs/spray-visibility';
 import { sql, type SQL } from 'drizzle-orm';
 import type { RecommendationQueryParams, RecommendationType } from './types';
 
@@ -85,13 +86,15 @@ export function recommendationStatsConditions(bounds: RecommendationStatsBounds,
 
 /**
  * The `board_climbs` half of the filter, shared by every shape: base listing
- * rules, size and sets, and FRESH's publication window. Nothing here reads
- * `board_climb_stats` or the viewer.
+ * rules, size and sets, and FRESH's publication window. A published, listed
+ * climb is public to everyone, so nothing here reads `board_climb_stats` or the
+ * viewer, except a spray wall's visibility, which is a wall rule.
  */
 function catalogConditions(params: RecommendationQueryParams): SQL[] {
   const { type, target, freshWindowDays } = params;
   const { boardType, layoutId, sizeId, setIds } = target;
 
+  const viewerId = params.viewerUserId === undefined ? params.excludeUserId : params.viewerUserId;
   const conditions: SQL[] = [
     sql`bc.board_type = ${boardType}`,
     sql`bc.layout_id = ${layoutId}`,
@@ -103,6 +106,13 @@ function catalogConditions(params: RecommendationQueryParams): SQL[] {
     // `@>` (rather than `= ANY`) so the GIN index on compatible_size_ids applies.
     sql`bc.compatible_size_ids @> ${intArray([sizeId])}`,
   ];
+  // board_type is constrained above; catalogue-only batch jobs should not need
+  // private wall membership grants just to rank a Kilter or Tension cohort.
+  if (boardType === 'spray') {
+    conditions.push(
+      sprayClimbVisibilityCondition({ boardType: sql`bc.board_type`, layoutId: sql`bc.layout_id` }, viewerId),
+    );
+  }
 
   // Only recommend climbs the owner can actually build with their sets.
   if (setIds && setIds.length > 0) {
@@ -268,7 +278,8 @@ export function buildRecommendationCountSql(params: RecommendationQueryParams): 
  *
  * It is driven from the viewer's own ticks, so it costs a few primary-key probes
  * per distinct sent climb instead of a scan of the layout. That is what lets the
- * viewer-free half be cached across users (`rec-count` in the backend).
+ * viewer-free half be cached across users (`rec-count` in the backend), on every
+ * board but a spray wall, whose visibility depends on the viewer.
  *
  * FRESH has no stats bounds, so it skips the stats join entirely: a LEFT JOIN on
  * the stats primary key reads no column and cannot change the count.

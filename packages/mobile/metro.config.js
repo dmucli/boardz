@@ -9,11 +9,18 @@ const path = require('path');
 const { configureWatchman } = require('./metro-watchman.cjs');
 const { applyExpoWebResponseHeaders } = require('./expo-web-response-headers.cjs');
 const { resolveWebRuntimeModulePath } = require('./metro-web-runtime-resolution.cjs');
+const { filterWebStartupModules } = require('./metro-web-startup-modules.cjs');
 
 const projectRoot = __dirname;
 const monorepoRoot = path.resolve(projectRoot, '../..');
 
-const config = getSentryExpoConfig(projectRoot);
+// Browser replay runs through PostHog and feedback through Boardsesh's own
+// sheet. Avoid shipping Sentry's unused browser widgets/replay alongside them;
+// native builds retain the SDK's existing defaults and integrations.
+const config = getSentryExpoConfig(
+  projectRoot,
+  process.env.BOARDSESH_WEB === '1' ? { includeWebReplay: false, includeWebFeedback: false } : undefined,
+);
 
 config.watchFolders = [monorepoRoot];
 
@@ -26,6 +33,8 @@ config.watchFolders = [monorepoRoot];
 // does put cacheVersion into every transform cache key, so fold both files'
 // contents in there: editing the wrapper or upgrading Expo's worker misses.
 if (process.env.BOARDSESH_WEB === '1') {
+  const getStartupModules = config.serializer.getModulesRunBeforeMainModule;
+  config.serializer.getModulesRunBeforeMainModule = (...args) => filterWebStartupModules(getStartupModules(...args));
   const webTransformerPath = require.resolve('./metro-web-deterministic-transform-worker.cjs');
   const workerDigest = crypto.createHash('sha1');
   for (const workerPath of [webTransformerPath, config.transformerPath]) {
@@ -64,7 +73,7 @@ function ignoredRootPattern(filePath) {
 const ignoredRoots = ['.agents', '.claude', '.codex', '.local-work', '.boardsesh'].map((name) =>
   ignoredRootPattern(path.join(monorepoRoot, name)),
 );
-// The recorded screenshot fixture set (docs/mobile-screenshot-fixtures.md) lives
+// The recorded screenshot fixture set (docs/qa/mobile-screenshot-fixtures.md) lives
 // inside this package but is data, never imported: hundreds of JSON bodies and
 // static assets that a record run rewrites while Metro is watching. Crawling it
 // costs startup time and hands the file watcher churn for nothing.
@@ -115,6 +124,7 @@ const webReactDomRoot = path.resolve(projectRoot, 'web-runtime/node_modules/reac
 // Native resolution never enters these tables, preserving the existing
 // iOS/Android module graph and OTA fingerprint.
 const WEB_SHIM_MODULES = {
+  'react-native-gesture-handler/ReanimatedSwipeable': path.resolve(projectRoot, 'src/web-shims/reanimated-swipeable'),
   '@expo/ui/community/bottom-sheet': path.resolve(projectRoot, 'src/web-shims/bottom-sheet'),
   '@react-native-google-signin/google-signin': path.resolve(projectRoot, 'src/web-shims/google-signin'),
   '@react-native-async-storage/async-storage': path.resolve(projectRoot, 'src/web-shims/async-storage'),
@@ -125,6 +135,9 @@ const WEB_SHIM_MODULES = {
 };
 const WEB_RUNTIME_MODULES = {
   '@gorhom/bottom-sheet': path.resolve(projectRoot, 'web-runtime/node_modules/@gorhom/bottom-sheet'),
+  // Expo aliases ESM imports, but an optional CommonJS require (Sentry's
+  // deep-link integration) can otherwise pull the native renderer into web.
+  'react-native': path.resolve(projectRoot, 'web-runtime/node_modules/react-native-web'),
   'react-native-web': path.resolve(projectRoot, 'web-runtime/node_modules/react-native-web'),
 };
 const WEB_SHIMS_DIR = path.resolve(projectRoot, 'src/web-shims');

@@ -2,10 +2,14 @@
 //
 // Native @expo/ui controls read system colours automatically — iOS via
 // PlatformColor / SwiftUI semantic styles, Android via the Compose Material
-// theme — so only the BRAND ACCENT needs bridging from our theme tokens. This
-// module is the single place that maps `useTheme().brandColors` onto the plain
-// colour values the native modifiers / props want, so the brand colour is
-// sourced once and every primitive tints identically.
+// theme. On Android that theme is Material You: unseeded, every Compose control
+// takes the phone wallpaper's palette for each colour we don't set (#6919). So
+// every Android Host is seeded from the brand (`composeSeedColor`, applied by
+// `ComposeHost.android.tsx`), and each control's colour set below names every
+// state a climber sees from `useTheme().brandColors` / `useTheme().m3`. This
+// module is the single place that maps those onto the plain colour values the
+// native modifiers / props want, so the brand colour is sourced once and every
+// primitive tints identically.
 //
 // WHY THIS FILE IMPORTS NOTHING FROM @expo/ui
 // It is shared by both `*.ios.tsx` and `*.android.tsx` component files, and the
@@ -16,14 +20,22 @@
 // brand-colour values and return plain colour strings / plain config objects.
 // Each platform component file imports its OWN native modifier factories
 // (`tint`, `disabled`, the `SwitchColors` shape, …) and feeds them these values,
-// e.g. `tint(brandAccentColor(brandColors))` on iOS, or
-// `colors={switchBrandColors(brandColors)}` on Android.
+// e.g. `tint(brandControlTint(brandColors))` on iOS, or
+// `colors={switchControlColors(brandColors, m3, colorScheme)}` on Android.
 //
-// The surface generalises to the other primitives this migration covers:
-// `brandAccentColor` is the one source of the on-fill accent every control tints
-// with (Toggle, Switch, Picker / SegmentedControl, Slider, Button). Add
-// control-specific Android colour mappers (`sliderBrandColors`, …) here as more
-// primitives land — each reading `brandAccentColor` so they can't drift.
+// Two brand colours, two jobs:
+// - `brandAccentColor` (the theme's `primaryFill`) is for a surface that carries
+//   WHITE text or a white glyph: a filled button, a selected segment, a badge.
+// - `brandControlTint` (the theme's `primary`) is for a control's on-state drawn
+//   straight on a card: a Toggle / Switch track, a Slider, a menu Picker's value,
+//   a plain text button. In dark mode `primaryFill` #7855FF is 3.01:1 on the iOS
+//   grouped card #2C2C2E, a hair over the 3:1 a control needs and well under the
+//   4.5:1 a text button's label does; `primary` #9784FF is 4.69:1 there. Light
+//   mode is the same violet (#5B22F2) either way.
+// Add control-specific Android colour mappers here as more primitives land, each
+// reading one of those two so they can't drift.
+
+import { withAlpha } from '@boardsesh/velvet-tokens';
 
 /**
  * The subset of resolved brand colours the native-control bridge reads. The
@@ -32,8 +44,13 @@
  */
 export type BrandControlColors = {
   /**
+   * Brand colour for FOREGROUND use: text, icons, and a control's on-state drawn
+   * on a card. Scheme-aware (`#5B22F2` light, lighter `#9784FF` dark).
+   */
+  primary: string;
+  /**
    * Brand colour for a FILLED surface — the on-track / selected-fill accent.
-   * Scheme-aware (`#6D28D9` light, brighter `#7C3AED` dark) so white thumbs and
+   * Scheme-aware (`#5B22F2` light, brighter `#7855FF` dark) so white thumbs and
    * labels sitting on top clear WCAG AA.
    */
   primaryFill: string;
@@ -42,23 +59,232 @@ export type BrandControlColors = {
 };
 
 /**
- * The brand accent every native control tints with (on-track, selected fill,
- * thumb). Sourced once here so a Toggle, Switch, Picker, Slider, and Button all
- * read the same scheme-aware brand colour. Feed it to the platform's accent
- * input: iOS `tint(...)`, Android Switch `checkedTrackColor`, Slider `color`, …
+ * The Velvet Material roles the Android colour sets read for a control's
+ * neutral states. `useTheme().m3` (built by `buildPaperTheme`) satisfies this
+ * structurally, so the Compose controls match their Paper / RN neighbours.
+ */
+export type MaterialControlRoles = {
+  /** Component boundary: 4.83:1 on the dark card #1E1E1E, 4.29:1 on white. */
+  outline: string;
+  /** Neutral toned container (an unchecked Switch track). */
+  surfaceVariant: string;
+  /** Muted foreground on a surface (an unselected chip's label). */
+  onSurfaceVariant: string;
+  /** Tonal button fill: opaque brand-violet container (#DEDDFC / #34276B). */
+  secondaryContainer: string;
+  /** Ink on `secondaryContainer`. */
+  onSecondaryContainer: string;
+};
+
+/**
+ * The seed for every Android Compose `Host`. A seeded Host generates its
+ * Material 3 scheme from this colour (`SchemeTonalSpot`) instead of the
+ * wallpaper, so any Compose colour we don't set explicitly is still violet.
+ */
+export function composeSeedColor(brandColors: BrandControlColors): string {
+  return brandColors.primaryFill;
+}
+
+/**
+ * The Material roles the Compose surface overrides read. `useTheme().m3` (built
+ * by `buildPaperTheme`) satisfies this structurally.
+ */
+export type MaterialSurfaceRoles = {
+  background: string;
+  onBackground: string;
+  surface: string;
+  onSurface: string;
+  surfaceVariant: string;
+  onSurfaceVariant: string;
+  outline: string;
+  outlineVariant: string;
+};
+
+/**
+ * The Graphite container steps (`useTheme().m3SurfaceContainers`) the Compose
+ * `surfaceContainer*` roles map onto.
+ */
+export type MaterialContainerTones = {
+  lowest: string;
+  low: string;
+  base: string;
+  high: string;
+  level4: string;
+  highest: string;
+};
+
+/** A Compose palette colour: `#RRGGBBAA`, the form `@expo/ui`'s `MaterialColors` uses. */
+export type ComposeRgbaHex = `#${string}`;
+
+/** The Compose colour roles `composeSurfaceColorOverrides` sets. */
+export type ComposeSurfaceRole =
+  | 'background'
+  | 'onBackground'
+  | 'surface'
+  | 'surfaceDim'
+  | 'surfaceBright'
+  | 'surfaceContainerLowest'
+  | 'surfaceContainerLow'
+  | 'surfaceContainer'
+  | 'surfaceContainerHigh'
+  | 'surfaceContainerHighest'
+  | 'surfaceVariant'
+  | 'onSurface'
+  | 'onSurfaceVariant'
+  | 'outline'
+  | 'outlineVariant'
+  | 'surfaceTint';
+
+const SIX_DIGIT_HEX = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i;
+const THREE_DIGIT_HEX = /^#([0-9a-f])([0-9a-f])([0-9a-f])$/i;
+const RGBA_FUNCTION = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)$/i;
+
+function toHexByte(channel: number): string {
+  return Math.round(Math.min(255, Math.max(0, channel)))
+    .toString(16)
+    .padStart(2, '0')
+    .toUpperCase();
+}
+
+/**
+ * Convert a theme colour (`#RGB`, `#RRGGBB`, `#RRGGBBAA` or `rgb[a]()`) to the
+ * `#RRGGBBAA` form Compose's palette uses, keeping its alpha. Returns `null` for
+ * anything else (a PlatformColor, a named colour), so that role keeps its seeded
+ * palette value rather than taking a wrong one.
+ */
+export function toComposeRgbaHex(color: string): ComposeRgbaHex | null {
+  const shortHex = THREE_DIGIT_HEX.exec(color);
+  if (shortHex) {
+    const [, red, green, blue] = shortHex;
+    return `#${`${red}${red}${green}${green}${blue}${blue}`.toUpperCase()}FF`;
+  }
+  const longHex = SIX_DIGIT_HEX.exec(color);
+  if (longHex) {
+    const [, rgb, alpha] = longHex;
+    return `#${`${rgb}${alpha ?? 'FF'}`.toUpperCase()}`;
+  }
+  const rgbaFunction = RGBA_FUNCTION.exec(color);
+  if (rgbaFunction) {
+    const [, red, green, blue, alpha] = rgbaFunction;
+    const alphaByte = toHexByte((alpha === undefined ? 1 : Math.min(1, Number(alpha))) * 255);
+    return `#${toHexByte(Number(red))}${toHexByte(Number(green))}${toHexByte(Number(blue))}${alphaByte}`;
+  }
+  return null;
+}
+
+/**
+ * The neutral surface roles every Compose Host takes from our theme instead of
+ * the seeded palette. The seed (`composeSeedColor`) still drives the accent
+ * roles, but a seeded `SchemeTonalSpot` palette tints every surface lilac, so
+ * Compose menus, dialogs and text fields would sit violet on our grey Graphite
+ * screens. These overrides pin them to the same ladder the RN surfaces use.
+ *
+ * In dark the container roles step up from the card (see the inline note);
+ * in light they follow the RN ladder. `surfaceTint` is the surface itself, so Compose's tonal elevation (which lays
+ * `surfaceTint` over `surface`) adds no colour. `surfaceDim` / `surfaceBright`
+ * are the darker and lighter ends of the ladder for the scheme. A role whose
+ * theme value is not a hex or `rgba()` string is left out, so it keeps its
+ * palette value.
+ */
+export function composeSurfaceColorOverrides(
+  m3: MaterialSurfaceRoles,
+  containers: MaterialContainerTones,
+  colorScheme: 'light' | 'dark',
+): Partial<Record<ComposeSurfaceRole, ComposeRgbaHex>> {
+  const isDark = colorScheme === 'dark';
+  const themeColors: Record<ComposeSurfaceRole, string> = {
+    background: m3.background,
+    onBackground: m3.onBackground,
+    surface: m3.surface,
+    surfaceDim: isDark ? m3.background : containers.highest,
+    surfaceBright: isDark ? containers.highest : m3.surface,
+    surfaceContainerLowest: containers.lowest,
+    // Dark: Compose floats menus on `surfaceContainer` and dialogs on
+    // `surfaceContainerHigh` over our cards (`surface`, #1E1E1E), so those roles
+    // step UP from the card as M3's dark baseline does. Mapped straight onto the
+    // RN ladder they sat below it (a #1A1A1A menu on a #1E1E1E card, 1.04:1).
+    // Light keeps the RN ladder: containers darken below the white card there.
+    surfaceContainerLow: isDark ? m3.surface : containers.low,
+    surfaceContainer: isDark ? containers.high : containers.base,
+    surfaceContainerHigh: isDark ? containers.level4 : containers.high,
+    surfaceContainerHighest: containers.highest,
+    surfaceVariant: m3.surfaceVariant,
+    onSurface: m3.onSurface,
+    onSurfaceVariant: m3.onSurfaceVariant,
+    outline: m3.outline,
+    outlineVariant: m3.outlineVariant,
+    surfaceTint: m3.surface,
+  };
+  const overrides: Partial<Record<ComposeSurfaceRole, ComposeRgbaHex>> = {};
+  for (const [role, color] of Object.entries(themeColors) as [ComposeSurfaceRole, string][]) {
+    const composeColor = toComposeRgbaHex(color);
+    if (composeColor) overrides[role] = composeColor;
+  }
+  return overrides;
+}
+
+/**
+ * The brand FILL: the colour of a surface that carries white text or a white
+ * glyph (a filled button, a selected segment, a badge). White on it is 7.10:1
+ * light and 5.70:1 dark. Not for a control drawn straight on a card; that is
+ * `brandControlTint`.
  */
 export function brandAccentColor(brandColors: BrandControlColors): string {
   return brandColors.primaryFill;
 }
 
 /**
- * Plain Compose `SwitchColors` bridging the brand on-track colour for a native
- * Android `Switch`. Returned as a minimal object — every `SwitchColors` field is
- * optional — so this shared file needs no `@expo/ui/jetpack-compose` import; the
- * `.android.tsx` file passes it straight to the Switch's `colors` prop.
+ * The tint for a native control's on-state drawn straight on a card: iOS
+ * `tint(...)` on a Toggle, menu Picker, Slider or plain Button, the Android
+ * Switch track and Slider. `#9784FF` in dark is 4.69:1 on the iOS grouped card
+ * (#2C2C2E) and 5.72:1 on #1C1C1E; `#5B22F2` in light is 7.10:1 on white.
  */
-export function switchBrandColors(brandColors: BrandControlColors): { checkedTrackColor: string } {
-  return { checkedTrackColor: brandAccentColor(brandColors) };
+export function brandControlTint(brandColors: BrandControlColors): string {
+  return brandColors.primary;
+}
+
+/**
+ * Ink for a dark-mode Switch's CHECKED thumb. On the lighter dark-mode track
+ * (#9784FF) a white thumb blurs into it; this dark ink is 6.23:1 against it, the
+ * M3 pattern of a dark `onPrimary` over a light primary. Same value as the
+ * Velvet dark ink, `brandColors.onAccent`.
+ */
+const DARK_SCHEME_CHECKED_THUMB = '#16111F';
+
+/**
+ * Plain Compose `SwitchColors` for a native Android `Switch` drawn on a settings
+ * card. Checked: the track is `brandControlTint`; in dark mode that track is the
+ * light #9784FF, so the thumb is a dark ink to stay visible, and in light mode
+ * it is white on #5B22F2. Unchecked follows the M3 switch: a neutral track whose
+ * `outline` border and thumb carry the boundary (3:1 or better on the card).
+ */
+export function switchControlColors(
+  brandColors: BrandControlColors,
+  m3: MaterialControlRoles,
+  colorScheme: 'light' | 'dark',
+): {
+  checkedTrackColor: string;
+  checkedThumbColor: string;
+  uncheckedTrackColor: string;
+  uncheckedThumbColor: string;
+  uncheckedBorderColor: string;
+} {
+  return {
+    checkedTrackColor: brandControlTint(brandColors),
+    checkedThumbColor: colorScheme === 'dark' ? DARK_SCHEME_CHECKED_THUMB : brandColors.onPrimary,
+    uncheckedTrackColor: m3.surfaceVariant,
+    uncheckedThumbColor: m3.outline,
+    uncheckedBorderColor: m3.outline,
+  };
+}
+
+/**
+ * Plain Compose `ButtonColors` for a native Android `FilledTonalButton`: the same
+ * `secondaryContainer` / `onSecondaryContainer` pair Paper's `contained-tonal`
+ * reads, so a tonal button matches its Paper neighbours.
+ */
+export function tonalButtonColors(m3: MaterialControlRoles): { containerColor: string; contentColor: string } {
+  return { containerColor: m3.secondaryContainer, contentColor: m3.onSecondaryContainer };
 }
 
 /**
@@ -80,21 +306,17 @@ export function segmentedBrandColors(brandColors: BrandControlColors): {
 }
 
 /**
- * Plain Compose `SliderColors` bridging the brand fill for a native Android
- * `Slider` — the thumb and the active (filled) portion of the track. Every other
- * slider element (inactive track, ticks) reads the Compose Material theme.
- * Returned as a minimal object — every `SliderColors` field is optional — so this
- * shared file needs no `@expo/ui/jetpack-compose` import; the `.android.tsx` file
- * passes it straight to the Slider's `colors` prop. Both fields read
- * `brandAccentColor` so they can't drift from the other primitives.
+ * Plain Compose `SliderColors` for a native Android `Slider` on a settings card:
+ * the thumb and the filled track take `brandControlTint`, like the iOS Slider's
+ * `tint`, so the filled part clears 3:1 on a dark card.
  */
-export function sliderBrandColors(brandColors: BrandControlColors): {
+export function sliderControlColors(brandColors: BrandControlColors): {
   thumbColor: string;
   activeTrackColor: string;
 } {
   return {
-    thumbColor: brandAccentColor(brandColors),
-    activeTrackColor: brandAccentColor(brandColors),
+    thumbColor: brandControlTint(brandColors),
+    activeTrackColor: brandControlTint(brandColors),
   };
 }
 
@@ -104,8 +326,9 @@ export function sliderBrandColors(brandColors: BrandControlColors): {
  * (unfocused outline, error red, label, supporting text) reads the Compose
  * Material theme. Returned as a minimal object — every `TextFieldColors` field is
  * optional — so this shared file needs no `@expo/ui/jetpack-compose` import; the
- * `.android.tsx` file passes it straight to the field's `colors` prop. Both fields
- * read `brandAccentColor` so they can't drift from the other primitives.
+ * `.android.tsx` file passes it straight to the field's `colors` prop. The outline
+ * reads `brandAccentColor`; the cursor reads `brandControlTint` because a caret is
+ * foreground drawn on a card (primaryFill is 2.45:1 on the dark card).
  */
 export function textFieldBrandColors(brandColors: BrandControlColors): {
   focusedIndicatorColor: string;
@@ -113,30 +336,86 @@ export function textFieldBrandColors(brandColors: BrandControlColors): {
 } {
   return {
     focusedIndicatorColor: brandAccentColor(brandColors),
-    cursorColor: brandAccentColor(brandColors),
+    cursorColor: brandControlTint(brandColors),
   };
 }
 
 /**
- * Plain Compose `FilterChipColors` bridging the brand fill for a native Android
- * Material 3 `FilterChip` — only the SELECTED (active facet) state is branded: the
- * container takes the brand fill and the label + leading icon take the on-fill
- * colour. Every unselected state reads the Compose Material theme. This is the
- * Compose equivalent of the iOS chip's `glassProminent` + `tint(brandColors.primary)`
- * active style. Returned as a minimal object — every `FilterChipColors` field is
- * optional — so this shared file needs no `@expo/ui/jetpack-compose` import; the
- * `.android.tsx` file passes it straight to each chip's `colors` prop. All branded
- * fields read `brandAccentColor` / `onPrimary` so they can't drift from the other
- * primitives.
+ * Brand cursor / selection props for a React Native `TextInput`.
+ *
+ * Android: RN falls back `cursorColor` and `selectionHandleColor` to
+ * `selectionColor`, but `selectionColor` is also the text highlight, which RN
+ * (ReactTextInputManager.kt) applies exactly as given. An opaque value would hide
+ * the selected text, while a translucent value alone would give a translucent
+ * caret (cursor and handles are drawn with SRC_IN, which keeps the alpha). So the
+ * caret and handles get the opaque tint and the highlight gets a translucent one.
+ *
+ * Other platforms: on iOS `selectionColor` is the caret and highlight tint, and
+ * iOS draws its own translucent highlight, so it stays opaque.
  */
-export function filterChipBrandColors(brandColors: BrandControlColors): {
+export function textInputBrandColors(
+  brandColors: BrandControlColors,
+  platform: string,
+): { cursorColor?: string; selectionColor: string; selectionHandleColor?: string } {
+  const tint = brandControlTint(brandColors);
+  if (platform === 'android') {
+    return { cursorColor: tint, selectionHandleColor: tint, selectionColor: withAlpha(tint, 0.4) };
+  }
+  return { selectionColor: tint };
+}
+
+/**
+ * Plain Compose `FilterChipColors` for a native Android Material 3 `FilterChip`.
+ * SELECTED (active facet): the container takes the brand fill and the label +
+ * leading icon take the on-fill colour, the Compose equivalent of the iOS chip's
+ * `glassProminent` + `tint(brandColors.primary)` active style. UNSELECTED: the
+ * leading icon is `brandControlTint` (6.11:1 on the dark card) and the label is
+ * `onSurfaceVariant`, as M3 draws them. Returned as a plain object so this shared
+ * file needs no `@expo/ui/jetpack-compose` import; the `.android.tsx` file passes
+ * it straight to each chip's `colors` prop.
+ */
+export function filterChipBrandColors(
+  brandColors: BrandControlColors,
+  m3: MaterialControlRoles,
+): {
+  labelColor: string;
+  iconColor: string;
   selectedContainerColor: string;
   selectedLabelColor: string;
   selectedLeadingIconColor: string;
 } {
   return {
+    labelColor: m3.onSurfaceVariant,
+    iconColor: brandControlTint(brandColors),
     selectedContainerColor: brandAccentColor(brandColors),
     selectedLabelColor: brandColors.onPrimary,
     selectedLeadingIconColor: brandColors.onPrimary,
   };
+}
+
+/**
+ * Plain Compose `ChipBorder`s for a `FilterChip`, one per selection state. Idle:
+ * 1dp of `outline`, 4.08:1 on the dark card where the wallpaper-derived default
+ * was 1.77:1. Selected: no visible border, M3's plain brand fill. A Compose chip
+ * draws a custom border in every state, so the caller picks one per chip, and
+ * the selected one is explicit rather than an omitted prop so a chip toggled on
+ * clears its outline.
+ */
+export function filterChipBorders(m3: MaterialControlRoles): {
+  idle: { width: number; color: string };
+  selected: { width: number; color: string };
+} {
+  return { idle: { width: 1, color: m3.outline }, selected: { width: 0, color: 'transparent' } };
+}
+
+/**
+ * Plain Compose `RadioButtonColors` for a native Android `RadioButton` on a
+ * settings card: the selected dot takes `brandControlTint`, like the Switch track
+ * beside it, and the empty ring takes `onSurfaceVariant`, as M3 draws it.
+ */
+export function radioControlColors(
+  brandColors: BrandControlColors,
+  m3: MaterialControlRoles,
+): { selectedColor: string; unselectedColor: string } {
+  return { selectedColor: brandControlTint(brandColors), unselectedColor: m3.onSurfaceVariant };
 }

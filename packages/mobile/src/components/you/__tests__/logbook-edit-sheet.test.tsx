@@ -1,9 +1,34 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleBottomSheetTextInput', async () => {
+  const { BottomSheetTextInput } = await import('@expo/ui/community/bottom-sheet');
+  return { AccessibleBottomSheetTextInput: BottomSheetTextInput };
+});
 import { fireEvent, render, screen } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AscentFeedItem, UpdateTickInput } from '@boardsesh/graphql/operations';
 import { formatTickAbsoluteTime } from '@boardsesh/profile-stats';
+
+vi.mock('../TickBoardPicker', () => ({
+  TickBoardPicker: ({
+    onSelect,
+    onBack,
+  }: {
+    onSelect: (board: { uuid: string; name: string } | null) => void;
+    onBack: () => void;
+  }) =>
+    createElement(
+      'div',
+      null,
+      createElement('button', { onClick: () => onSelect(null) }, 'Choose None'),
+      createElement(
+        'button',
+        { onClick: () => onSelect({ uuid: 'homewall-uuid', name: 'Homewall' }) },
+        'Choose Homewall',
+      ),
+      createElement('button', { onClick: onBack }, 'Back to edit'),
+    ),
+}));
 
 const mutations = vi.hoisted(() => ({
   updateMutate: vi.fn(),
@@ -120,6 +145,7 @@ vi.mock('../../Sheet', () => ({
     return createElement('div', null, header, children, footer);
   },
 }));
+vi.mock('../../SheetTopBar', async () => (await import('../../../test/sheet-top-bar-stub')).sheetTopBarModule);
 vi.mock('../../Button', () => ({
   Button: ({ title, onPress, disabled }: { title: string; onPress: () => void; disabled?: boolean }) =>
     createElement('button', { disabled, onClick: onPress }, title),
@@ -191,6 +217,9 @@ vi.mock('../../play-drawer/AngleSlider', () => ({
       ),
     ),
 }));
+// The angle row's wall glyph is an animated SVG (react-native-svg + reanimated),
+// neither of which runs in jsdom. Decoration only: it carries no state to assert.
+vi.mock('../../tick/AngleGlyph', () => ({ AngleGlyph: () => null }));
 vi.mock('../../../lib/graphql/hooks', () => ({ useGrades: () => ({ data: [] }) }));
 vi.mock('../../../lib/haptics', () => ({
   hapticSuccess: vi.fn(),
@@ -200,6 +229,8 @@ vi.mock('../../../lib/haptics', () => ({
 vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({
     colorScheme: 'light',
+    variant: 'liquidGlass',
+    m3: { outline: '#ddd' },
     systemColors: {
       fill: '#eee',
       label: '#111',
@@ -309,6 +340,41 @@ afterEach(() => {
 });
 
 describe('LogbookEditSheet', () => {
+  it('keeps an untouched board out of the mutation', () => {
+    renderSheet(makeAscent({ boardId: 942, boardDisplayName: 'Original' }));
+    expect(screen.getByText('Original')).toBeTruthy();
+    expect(screen.queryByText('Choose Homewall')).toBeNull();
+    expect(screen.queryByText('Choose None')).toBeNull();
+    save();
+    expect(firstUpdateVariables().input).not.toHaveProperty('boardUuid');
+  });
+
+  it('stages None locally and clears attribution only on Save', () => {
+    renderSheet(makeAscent({ boardId: 942, boardDisplayName: 'Original' }));
+    fireEvent.click(screen.getByLabelText('mobile.logbook.boardPickerLabel'));
+    fireEvent.click(screen.getByText('Choose None'));
+    expect(mutations.updateMutate).not.toHaveBeenCalled();
+    expect(screen.getByText('mobile.logbook.boardNone')).toBeTruthy();
+    save();
+    expect(firstUpdateVariables().input.boardUuid).toBeNull();
+  });
+
+  it('saves a selected compatible board without changing the angle', () => {
+    renderSheet(makeAscent({ angle: 35 }));
+    fireEvent.click(screen.getByLabelText('mobile.logbook.boardPickerLabel'));
+    fireEvent.click(screen.getByText('Choose Homewall'));
+    save();
+    expect(firstUpdateVariables().input).toMatchObject({ boardUuid: 'homewall-uuid', angle: 35 });
+  });
+
+  it('returning without choosing preserves the existing attribution', () => {
+    renderSheet(makeAscent({ boardId: 942, boardDisplayName: 'Original' }));
+    fireEvent.click(screen.getByLabelText('mobile.logbook.boardPickerLabel'));
+    fireEvent.click(screen.getByText('Back to edit'));
+    save();
+    expect(firstUpdateVariables().input).not.toHaveProperty('boardUuid');
+  });
+
   it('opts the sheet into Android content-fitting so the form is not lost in a full-screen sheet (#4720)', () => {
     renderSheet();
     expect(sheetProps.androidContentSized).toBe(true);
@@ -538,7 +604,23 @@ describe('LogbookEditSheet', () => {
     expect(firstUpdateVariables().input.angle).toBe(25);
   });
 
-  it('prints a failed save in the action bar instead of a toast the sheet covers', () => {
+  it('shows the angle row on a board with angles to pick', () => {
+    renderSheet(makeAscent({ boardType: 'kilter' }));
+
+    expect(screen.getByTestId('tick-row-angle')).toBeTruthy();
+  });
+
+  it('has no angle row on a spray wall, whose angle the wall fixes', () => {
+    renderSheet(makeAscent({ boardType: 'spray', angle: 40 }));
+
+    expect(screen.queryByTestId('tick-row-angle')).toBeNull();
+    expect(screen.queryByText('mobile.tick.angleLabel')).toBeNull();
+    // The saved angle is left alone.
+    save();
+    expect(firstUpdateVariables().input.angle).toBe(40);
+  });
+
+  it('prints a failed save in the top bar instead of a toast the sheet covers', () => {
     mutations.updateMutate.mockImplementation((_variables: unknown, handlers: { onError: () => void }) =>
       handlers.onError(),
     );
@@ -561,3 +643,5 @@ describe('LogbookEditSheet', () => {
     expect(toast.showToast).not.toHaveBeenCalled();
   });
 });
+
+vi.mock('../../privacy/ContentAudienceControl', () => ({ ContentAudienceControl: () => null }));

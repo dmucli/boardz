@@ -2,6 +2,7 @@ import { useMemo } from 'react';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import { offlineBoardKey, offlineBoardKeyForBoard, type OfflineBoardScope } from '@boardsesh/offline-sync';
 import { getSetting, setSetting, useSetting } from './hooks';
+import type { OwnedSprayWallPinLedger, RememberedSprayWallArchive } from './types';
 import { isOfflineBoardCard, readOfflineBoardCards } from '../lib/boards/offline-board-card';
 
 /**
@@ -106,10 +107,16 @@ export function forgetOfflineBoard(uuid: string): void {
  * the backend no longer knows into `active-board-store`, which is exactly the
  * board-presence poisoning this feature refuses to risk with synthetic uuids.
  */
-export function pruneOfflineBoards(knownUuids: readonly string[]): void {
+export function pruneOfflineBoards(
+  knownUuids: readonly string[],
+  { keepBoardType }: { keepBoardType?: string } = {},
+): void {
   const known = new Set(knownUuids);
   const current = getOfflineBoards();
-  const next = current.filter((card) => known.has(card.uuid));
+  // `keepBoardType` spares cards of one type the caller cannot vouch for: an
+  // archived spray wall is not in `myBoards`, and without the archived list to
+  // name it, its card must not be taken for a deleted board's.
+  const next = current.filter((card) => known.has(card.uuid) || card.boardType === keepBoardType);
   if (next.length === current.length) return;
   setSetting(SETTING_KEY, next);
 }
@@ -164,6 +171,7 @@ export type OfflineDownloadTrigger =
   | 'onboarding'
   | 'similar_climbs'
   | 'hold_heatmap'
+  | 'owned-wall'
   | 'unknown';
 
 const KNOWN_TRIGGERS: readonly OfflineDownloadTrigger[] = [
@@ -176,6 +184,7 @@ const KNOWN_TRIGGERS: readonly OfflineDownloadTrigger[] = [
   'onboarding',
   'similar_climbs',
   'hold_heatmap',
+  'owned-wall',
   'unknown',
 ];
 
@@ -253,4 +262,177 @@ export function takeDownloadAllTap(): boolean {
 export function forgetDownloadAllTap(): void {
   if (getSetting(DOWNLOAD_ALL_TAP_SETTING_KEY) !== true) return;
   setSetting(DOWNLOAD_ALL_TAP_SETTING_KEY, false);
+}
+
+// --- Downloads a person started (issue #4310) -----------------------------------
+
+const USER_STARTED_SETTING_KEY = 'offlineUserStartedDownloads';
+
+/**
+ * Scope keys of the downloads a person started that have not finished. A value
+ * written by a build with a different shape reads as empty, so it can never
+ * hold the screen awake for a board nobody asked for.
+ */
+export function getUserStartedDownloads(): string[] {
+  const stored: unknown = getSetting(USER_STARTED_SETTING_KEY);
+  if (!Array.isArray(stored)) return [];
+  return stored.filter((scopeKey): scopeKey is string => typeof scopeKey === 'string');
+}
+
+/** Record that a person started or retried `scopeKey`'s download. Writes only on a change. */
+export function rememberUserStartedDownload(scopeKey: string): void {
+  const current = getUserStartedDownloads();
+  if (current.includes(scopeKey)) return;
+  setSetting(USER_STARTED_SETTING_KEY, [...current, scopeKey]);
+}
+
+/** Drop `scopeKey`: its download finished, or its board is no longer downloaded. */
+export function forgetUserStartedDownload(scopeKey: string): void {
+  const current = getUserStartedDownloads();
+  if (!current.includes(scopeKey)) return;
+  setSetting(
+    USER_STARTED_SETTING_KEY,
+    current.filter((storedScopeKey) => storedScopeKey !== scopeKey),
+  );
+}
+
+// --- Spray wall archive state for offline walls ---------------------------------
+
+const SPRAY_ARCHIVE_SETTING_KEY = 'offlineSprayWallArchiveV1';
+
+/**
+ * Archived walls only. A climber who resets a wall once a month for four years
+ * archives fifty (`MAX_ARCHIVED_SPRAY_WALLS_PER_USER`), and a few more come from
+ * walls they follow. Locked-but-live walls are not kept: offline nobody can edit
+ * holds anyway, and a gym's worth of walls with one climb each would push out
+ * the archived ones this exists for.
+ */
+const MAX_REMEMBERED_SPRAY_WALL_ARCHIVES = 64;
+
+function isRememberedSprayWallArchive(value: unknown): value is RememberedSprayWallArchive {
+  if (value === null || typeof value !== 'object') return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.archivedAt === 'string' &&
+    (entry.replacedByWallUuid === null || typeof entry.replacedByWallUuid === 'string')
+  );
+}
+
+function readSprayWallArchives(): Record<string, RememberedSprayWallArchive> {
+  const stored: unknown = getSetting(SPRAY_ARCHIVE_SETTING_KEY);
+  if (stored === null || typeof stored !== 'object' || Array.isArray(stored)) return {};
+  const valid: Record<string, RememberedSprayWallArchive> = {};
+  for (const [wallUuid, entry] of Object.entries(stored as Record<string, unknown>)) {
+    if (isRememberedSprayWallArchive(entry)) valid[wallUuid] = entry;
+  }
+  return valid;
+}
+
+/** The last archive state the server reported for a wall, or `null` for a wall not known to be archived. */
+export function getRememberedSprayWallArchive(wallUuid: string): RememberedSprayWallArchive | null {
+  return readSprayWallArchives()[wallUuid] ?? null;
+}
+
+/**
+ * Over the cap, which entries go first: walls this phone has no download card
+ * for (the offline loader can never draw them anyway), then the least recently
+ * written. Insertion order is write order, so the front of the list is oldest.
+ */
+function trimToCap(entries: [string, RememberedSprayWallArchive][]): [string, RememberedSprayWallArchive][] {
+  const excess = entries.length - MAX_REMEMBERED_SPRAY_WALL_ARCHIVES;
+  if (excess <= 0) return entries;
+  const downloaded = new Set(getOfflineBoards().map((card) => card.uuid));
+  const evicted = new Set<string>();
+  for (const [wallUuid] of entries) {
+    if (evicted.size === excess) break;
+    if (!downloaded.has(wallUuid)) evicted.add(wallUuid);
+  }
+  for (const [wallUuid] of entries) {
+    if (evicted.size === excess) break;
+    evicted.add(wallUuid);
+  }
+  return entries.filter(([wallUuid]) => !evicted.has(wallUuid));
+}
+
+/**
+ * Keep what the server just said about a wall, for the next time it is opened
+ * offline. Only an archived wall is stored; a wall the server says is not
+ * archived is removed. Writes only on a change: every settings write re-renders
+ * every `useSetting` reader, and this runs on each ten-minute revalidation.
+ */
+export function rememberSprayWallArchive(
+  wallUuid: string,
+  state: { archivedAt: string | null; replacedByWallUuid: string | null },
+): void {
+  const current = readSprayWallArchives();
+  const previous = current[wallUuid];
+  if (state.archivedAt === null) {
+    if (!previous) return;
+    forgetSprayWallArchive(wallUuid);
+    return;
+  }
+  if (previous && previous.archivedAt === state.archivedAt && previous.replacedByWallUuid === state.replacedByWallUuid)
+    return;
+  const { [wallUuid]: _replaced, ...others } = current;
+  const next = trimToCap([
+    ...Object.entries(others),
+    [wallUuid, { archivedAt: state.archivedAt, replacedByWallUuid: state.replacedByWallUuid }],
+  ]);
+  setSetting(SPRAY_ARCHIVE_SETTING_KEY, Object.fromEntries(next));
+}
+
+/** Forget one wall: it was deleted. */
+export function forgetSprayWallArchive(wallUuid: string): void {
+  const current = readSprayWallArchives();
+  if (!current[wallUuid]) return;
+  const { [wallUuid]: _forgotten, ...rest } = current;
+  setSetting(SPRAY_ARCHIVE_SETTING_KEY, rest);
+}
+
+/** Drop every remembered wall, at the account boundary (`clearPersistedUserStores`). */
+export function clearSprayWallArchives(): void {
+  const stored = getSetting(SPRAY_ARCHIVE_SETTING_KEY);
+  if (stored !== null && typeof stored === 'object' && Object.keys(stored).length === 0) return;
+  setSetting(SPRAY_ARCHIVE_SETTING_KEY, {});
+}
+
+// --- Spray walls pinned offline because the climber owns them --------------------
+
+const OWNED_WALL_PINS_SETTING_KEY = 'offlineOwnedSprayWallsV1';
+
+function isOwnedSprayWallPinLedger(value: unknown): value is OwnedSprayWallPinLedger {
+  if (value === null || typeof value !== 'object') return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.userId === 'string' &&
+    Array.isArray(entry.wallUuids) &&
+    entry.wallUuids.every((wallUuid) => typeof wallUuid === 'string')
+  );
+}
+
+/** Which owned walls were already pinned, and for whom; `null` when nothing valid is stored. */
+export function getOwnedSprayWallPins(): OwnedSprayWallPinLedger | null {
+  const stored: unknown = getSetting(OWNED_WALL_PINS_SETTING_KEY);
+  return isOwnedSprayWallPinLedger(stored) ? stored : null;
+}
+
+export function setOwnedSprayWallPins(ledger: OwnedSprayWallPinLedger): void {
+  setSetting(OWNED_WALL_PINS_SETTING_KEY, ledger);
+}
+
+/** Forget one wall's pin: it was deleted. */
+export function forgetOwnedSprayWallPin(wallUuid: string): void {
+  const ledger = getOwnedSprayWallPins();
+  if (!ledger || !ledger.wallUuids.includes(wallUuid)) return;
+  setSetting(OWNED_WALL_PINS_SETTING_KEY, {
+    ...ledger,
+    wallUuids: ledger.wallUuids.filter((pinned) => pinned !== wallUuid),
+  });
+}
+
+/** Drop the pins at the account boundary (`clearPersistedUserStores`). */
+export function clearOwnedSprayWallPins(): void {
+  if (getSetting('offlineOpenedSprayWallsV1') !== null) setSetting('offlineOpenedSprayWallsV1', null);
+  if (getSetting(OWNED_WALL_PINS_SETTING_KEY) === null) return;
+  setSetting(OWNED_WALL_PINS_SETTING_KEY, null);
 }

@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { ANGLES, getBoardAngleOptions, getRoutableBoardAngles, parseBoardAngleSegment } from '../board-data';
+import {
+  ANGLES,
+  getBoardAngleOptions,
+  getRecordedLedBoardAngles,
+  getRoutableBoardAngles,
+  parseBoardAngleSegment,
+} from '../board-data';
 
 describe('board angles', () => {
   it('adds -5 only to the Grasshopper picker angles', () => {
@@ -16,6 +22,16 @@ describe('board angles', () => {
     expect(getRoutableBoardAngles('kilter')).toEqual(expect.arrayContaining([0, 41, 90]));
   });
 
+  it('preserves valid recorded LED angles outside the picker rail', () => {
+    expect(getRecordedLedBoardAngles('woods')).toContain(41);
+    expect(getRecordedLedBoardAngles('woods')).not.toContain(-5);
+    expect(getRecordedLedBoardAngles('kilter')).not.toContain(91);
+    expect(getRecordedLedBoardAngles('grasshopper')).toContain(-5);
+    expect(getRecordedLedBoardAngles('moonboard')).toContain(45);
+    expect(getRecordedLedBoardAngles('spray')).toBeNull();
+    expect(getRecordedLedBoardAngles('unknown')).toBeNull();
+  });
+
   it('parses only exact canonical route segments supported by that board', () => {
     expect(parseBoardAngleSegment('grasshopper', '-5')).toBe(-5);
     expect(parseBoardAngleSegment('kilter', '-5')).toBeNull();
@@ -27,6 +43,16 @@ describe('board angles', () => {
 
     for (const alias of ['040', '40.0', '+40', '4e1', ' 40', '40 ', '-0', '91', '999']) {
       expect(parseBoardAngleSegment('kilter', alias)).toBeNull();
+    }
+  });
+
+  // #5488: the app shares a wall climb as `/b/{slug}/{angle}/view/...`, and www
+  // runs the angle segment through this parser before it renders anything. Every
+  // integer angle a wall can be set at has to route, not just the picker's
+  // 5-degree steps, or a shared link 404s.
+  it('routes every integer angle a spray wall can carry', () => {
+    for (let angle = 0; angle <= 70; angle += 1) {
+      expect(parseBoardAngleSegment('spray', String(angle))).toBe(angle);
     }
   });
 });

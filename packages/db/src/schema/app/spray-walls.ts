@@ -6,6 +6,7 @@ import {
   integer,
   bigint,
   bigserial,
+  boolean,
   real,
   jsonb,
   timestamp,
@@ -13,10 +14,12 @@ import {
   uniqueIndex,
   primaryKey,
   foreignKey,
+  check,
   type AnyPgColumn,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
-import type { SprayDetectionResult } from '@boardsesh/shared-schema';
+import type { SprayDetectionResult, ReleaseContext } from '@boardsesh/shared-schema';
+import type { BoardseshRenderSettings } from '@boardsesh/board-look';
 import { users } from '../auth/users';
 import { userBoards } from './boards';
 import { boardClimbs } from '../boards/unified';
@@ -24,7 +27,7 @@ import { boardClimbs } from '../boards/unified';
 /**
  * Spray walls — the per-wall state that does NOT belong on the catalogue rows.
  *
- * A spray wall is a runtime-created catalogue layout (SW-03, `docs/spray-walls.md`):
+ * A spray wall is a runtime-created catalogue layout (SW-03, `docs/product/spray-walls.md`):
  * one `board_layouts` row plus one `board_product_sizes` row carrying the same
  * id, and one `board_holes` + `board_placements` pair per hold, again sharing an
  * id. That mapping is what makes queue, play, ticks, stats, playlists, feed,
@@ -81,6 +84,24 @@ export const sprayWallVersionStatusEnum = pgEnum('spray_wall_version_status', ['
 /** Where a hold's geometry came from: a detector run, or a human's hand. */
 export const sprayHoldSourceEnum = pgEnum('spray_hold_source', ['manual', 'auto']);
 
+/**
+ * What the climber did with a detector suggestion before it was saved as an
+ * `auto` hold (SW-20, #5471). The training export reads it as the label's
+ * provenance, and the correction ratio in `docs/product/spray-recognition-rollout.md`
+ * comes straight from it.
+ *
+ *  - `accepted`: kept as found, via accept-defaults or keep-maybes.
+ *  - `confirmed`: a maybe the climber switched on by itself.
+ *  - `edited`: its geometry changed after the detector drew it. The server sets
+ *    this on its own whenever an auto hold's centre, radius or outline moves, so
+ *    an app that predates the field still records the correction.
+ *
+ * Ranked `accepted` < `confirmed` < `edited`, and a hold never moves down the
+ * ladder: a confirmed maybe that is later nudged is `edited`, and saving it again
+ * untouched keeps it `edited`.
+ */
+export const sprayHoldAutoReviewEnum = pgEnum('spray_hold_auto_review', ['accepted', 'confirmed', 'edited']);
+
 export const sprayDetectionStatusEnum = pgEnum('spray_detection_status', [
   'pending',
   'running',
@@ -88,6 +109,68 @@ export const sprayDetectionStatusEnum = pgEnum('spray_detection_status', [
   'failed',
   'cancelled',
 ]);
+
+/**
+ * Who may edit published climbs on this wall (#6025):
+ * - 'setter': only the climb's setter + the wall editors (owner, gym admin, community leader on public wall)
+ * - 'collaborators': anyone who can set climbs on the wall (gym members, share-link crew, anyone on a public wall)
+ */
+export const sprayClimbEditPolicyEnum = pgEnum('spray_climb_edit_policy', ['setter', 'collaborators']);
+export type SprayClimbEditPolicy = (typeof sprayClimbEditPolicyEnum.enumValues)[number];
+
+/**
+ * A wall's stored default look: the `BoardRenderSettings` shape mobile keeps
+ * per climber, minus its `'default'` mode — a wall default of "use the default"
+ * would be circular, so only an explicit `classic` or `aura` is ever stored.
+ *
+ * Option knobs are typed `string`, not this build's option unions: the app can
+ * store an option (a new mark style) before the `@boardsesh/board-look` this was
+ * built with knows it, and the app sanitises whatever it reads back.
+ */
+export type SprayWallRenderSettingsValue = {
+  mode: 'classic' | 'aura';
+  boardsesh: { [Knob in keyof BoardseshRenderSettings]: WidenOption<BoardseshRenderSettings[Knob]> };
+  /**
+   * What the wall is drawn on: the raw photo, the photo flattened into the
+   * canonical frame (`wall-crop`), or only the holds on a plain field
+   * (`hold-cutouts`). Missing means `photo`. The list is
+   * `SPRAY_WALL_BACKGROUNDS` in `@boardsesh/spray-wall-geometry`.
+   */
+  background?: 'photo' | 'wall-crop' | 'hold-cutouts';
+};
+
+/**
+ * The generated wall looks of one version (`spray_wall_versions.art`), written
+ * by the `spray-wall-art` job (`docs/product/spray-walls.md`, "Generated wall looks").
+ *
+ * - `pending`: a job is queued or running;
+ * - `ready`: both images are in the private bucket at `cropKey` / `cutoutKey`;
+ * - `failed`: the job hit an error (`error` is its bounded code); choosing a
+ *   generated background again re-queues it;
+ * - `refused`: the photo failed the quality gate, so nothing was rendered.
+ *
+ * `recipe` is the `ART_RECIPE` the images were (or will be) made with. A row
+ * whose recipe is older than the running code's is treated as missing.
+ */
+export type SprayWallVersionArt = {
+  recipe: number;
+  status: 'pending' | 'ready' | 'failed' | 'refused';
+  /** Pixel size of both images; the canonical frame scaled to a 2048 px long edge. */
+  width: number | null;
+  height: number | null;
+  cropKey: string | null;
+  cutoutKey: string | null;
+  quality: { stretch: number | null; verdict: 'good' | 'soft' | 'fail' } | null;
+  error: string | null;
+  /**
+   * ISO time the job was last queued; carried onto a `failed` row. A crash or
+   * an expired lease writes no final state, so a `pending` row older than the
+   * job's deadline is read as failed and re-queued.
+   */
+  requestedAt?: string | null;
+};
+
+type WidenOption<Value> = Value extends string ? string : Value;
 
 /**
  * One physical wall. Its catalogue identity is `layout_id`; its owner, name,
@@ -153,11 +236,71 @@ export const sprayWalls = pgTable(
      *
      * The key is RANDOM rather than derived — `spray-walls/<wall uuid>/<128 random
      * bits>.jpg`. `media` is world-readable under guessable keys
-     * (`docs/user-media-storage.md`), so a key derived from the wall uuid would
+     * (`docs/operations/user-media-storage.md`), so a key derived from the wall uuid would
      * stay fetchable to anyone who had ever seen the wall, and "made it private
      * again" would mean nothing. Each promotion mints a fresh key.
      */
     publicPhotoKey: text('public_photo_key'),
+    /**
+     * The visibility the owner asked for when they created the wall, held here
+     * until the wall's first publish (#5513).
+     *
+     * A wall is private until it has something to see: `createSprayWall` writes
+     * `user_boards.is_public` / `is_unlisted` false whatever the input says, and
+     * parks the requested pair in these two columns instead. The first publish
+     * copies them onto the board row and nulls them, so the choice survives the
+     * climber closing the app mid-wizard and resuming later — where it used to
+     * live only in React state and was lost. An explicit visibility change through
+     * `updateSprayWall` before that also nulls them: the later choice wins.
+     *
+     * Both NULL means nothing is pending, which is every published wall and every
+     * wall created private. Always written as a pair.
+     */
+    pendingIsPublic: boolean('pending_is_public'),
+    pendingIsUnlisted: boolean('pending_is_unlisted'),
+    /**
+     * The wall's own stored default look — a `BoardRenderSettings`-shaped blob
+     * (`{ mode: 'classic' | 'aura', boardsesh: {...} }`) the creator picked in the
+     * add-wall wizard's look step. NULL for a wall created before this shipped, or
+     * one whose creator left it unset — both read as "no wall default", which the
+     * mobile render-settings resolver falls back from to the global default
+     * exactly as it does today.
+     *
+     * Current-state config, not append-only history: unlike `anchors` /
+     * `homography` on `spray_wall_versions`, this has no version-specific meaning —
+     * a reset does not need a new look, so it stays on `spray_walls` beside
+     * `reference_width/height` rather than migrating onto `spray_wall_versions`.
+     */
+    renderSettings: jsonb('render_settings').$type<SprayWallRenderSettingsValue>(),
+    /**
+     * Who may edit published climbs on this wall (#6025).
+     * Defaults to 'setter', keeping existing behavior for all existing walls.
+     */
+    climbEditPolicy: sprayClimbEditPolicyEnum('climb_edit_policy').default('setter').notNull(),
+    /**
+     * When the owner let this wall's photo and holds be used to train hold
+     * finding, or NULL when they have not (SW-20, #5471).
+     *
+     * NULL unless a client said yes. No column default and no backfill, on
+     * purpose: consent can only come from a client that showed the owner the
+     * switch. `createSprayWall` stamps `now()` only for `trainingConsent: true`
+     * (omitted and `false` both store NULL), and every wall that existed before
+     * this column did keeps NULL. Those walls were photographed under the
+     * promise that the photo stays in the owner's account.
+     *
+     * `updateSprayWall { trainingConsent: true }` stamps a fresh `now()` on the
+     * one wall it names, so the column always says when the CURRENT consent was
+     * given. `false` nulls it on that wall and on every wall of its reset family
+     * (the walls it was cloned from and every clone made from them): to the
+     * owner that is one physical wall. A reset clone starts with its source's
+     * choice. Only the owner can change it, through the same gate as visibility.
+     *
+     * Read by `trainingEligibleCondition()` in
+     * `packages/backend/src/graphql/resolvers/board/spray-training.ts`: a wall with
+     * NULL here never reaches the admin queue or an export, whatever review rows
+     * it has, and the next export run retires any stored export that held it.
+     */
+    trainingConsentAt: timestamp('training_consent_at', { withTimezone: true }),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
     /**
@@ -215,9 +358,39 @@ export const sprayWalls = pgTable(
      * again.
      */
     photosPurgedAt: timestamp('photos_purged_at'),
+    /**
+     * When this wall was archived: replaced by a reset clone that reached its
+     * first publish (`docs/product/spray-walls.md`, "Archive and reset").
+     *
+     * An archived wall is read-only. Its climbs, ticks, playlists and share links
+     * keep working, it leaves every picker and listing, and nobody can set or
+     * edit a climb or change its holds. Not a soft delete: nothing is tombstoned
+     * and every climb read keeps resolving, because the spray climb visibility
+     * predicates test `deleted_at`, never this.
+     */
+    archivedAt: timestamp('archived_at'),
+    /**
+     * The wall this one was cloned from by `resetSprayWall`. The clone copies the
+     * source's settings only; the owner takes a new photo and marks holds from
+     * scratch. Its first publish archives the source.
+     *
+     * `set null` on delete, matching how every other wall reference treats a row
+     * that should never be hard-deleted: the clone is a wall in its own right.
+     */
+    resetFromWallId: bigint('reset_from_wall_id', { mode: 'number' }).references((): AnyPgColumn => sprayWalls.id, {
+      onDelete: 'set null',
+    }),
   },
   (table) => ({
     currentVersionIdx: index('spray_walls_current_version_idx').on(table.currentVersionId),
+    /**
+     * Finds a wall's reset clone (the unfinished one `resetSprayWall` returns
+     * again, and the successor `replacedByWallUuid` resolves). Partial because
+     * almost every wall was never reset.
+     */
+    resetFromWallIdx: index('spray_walls_reset_from_wall_idx')
+      .on(table.resetFromWallId)
+      .where(sql`${table.resetFromWallId} IS NOT NULL`),
     /**
      * The retention purge's candidate read (SW-17): the oldest soft-deleted walls
      * whose objects have not been swept yet. Partial on BOTH conditions, so the
@@ -249,7 +422,7 @@ export const sprayWallReportReasonEnum = pgEnum('spray_wall_report_reason', [
 /**
  * One climber's report of one wall.
  *
- * Deliberately NOT the `climb_proposals` vote machinery (`docs/climb-moderation.md`):
+ * Deliberately NOT the `climb_proposals` vote machinery (`docs/product/climb-moderation.md`):
  * that is a weighted approval threshold over a change to a CLIMB — its holds, its
  * name, its grade — where the community is the right judge and the outcome is a
  * catalogue edit. A wall photograph is somebody's home, the question is a safety
@@ -270,6 +443,7 @@ export const sprayWallReports = pgTable(
       .references(() => sprayWalls.id, { onDelete: 'cascade' }),
     reporterId: text('reporter_id').references(() => users.id, { onDelete: 'set null' }),
     reason: sprayWallReportReasonEnum('reason').notNull(),
+    releaseContext: jsonb('release_context').$type<ReleaseContext>(),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     /** Stamped when an admin acts — whether they hid the wall or decided not to. */
     reviewedAt: timestamp('reviewed_at'),
@@ -302,7 +476,7 @@ export const sprayWallReports = pgTable(
 /**
  * One photograph of the wall. Version 1 is the wall's first photo; every reset
  * adds another. A version NEVER creates a new layout or a new size — see
- * `docs/spray-walls.md` "What the version is not".
+ * `docs/product/spray-walls.md` "What the version is not".
  */
 export const sprayWallVersions = pgTable(
   'spray_wall_versions',
@@ -327,12 +501,30 @@ export const sprayWallVersions = pgTable(
     anchors: jsonb('anchors').$type<[number, number][]>(),
     /**
      * Row-major 3x3 photo→canonical homography, nine floats. The identity matrix
-     * when the version has no anchors. No image is ever warped in v1: holds are
-     * mapped through the INVERSE of this at render time.
+     * when the version has no anchors. The stored photo is never warped: holds
+     * are mapped through the INVERSE of this at render time. The generated looks
+     * in `art` are the one place a warped copy exists.
      */
     homography: jsonb('homography').$type<number[]>(),
     /** What changed in this reset, in the wall owner's own words. */
     notes: text('notes'),
+    /**
+     * The owner marked this reset as a FULL reset: the old set is coming down.
+     * Every climb that lost a hold in it is retired
+     * (`board_climbs.retired_by_reset`) and drops out of the wall's default climb
+     * list (#6024). A fact about the reset, kept here so a later recompute can
+     * re-derive which climbs it retired. False for a partial reset and for every
+     * version that is not a reset.
+     */
+    isFullReset: boolean('is_full_reset').default(false).notNull(),
+    /**
+     * The generated wall looks of this version, or NULL when none was ever
+     * asked for. Derived from the photo, the homography and the holds, so it can
+     * always be regenerated; the images live in the private bucket under
+     * `spray-walls/<wall uuid>/art/`, which the retention purge's prefix delete
+     * already covers. See `SprayWallVersionArt`.
+     */
+    art: jsonb('art').$type<SprayWallVersionArt>(),
     createdBy: text('created_by').references(() => users.id, { onDelete: 'set null' }),
     publishedAt: timestamp('published_at'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
@@ -413,7 +605,11 @@ export const sprayWallHolds = pgTable(
       .notNull()
       .references(() => sprayWallVersions.id, { onDelete: 'cascade' }),
     /**
-     * NULL = still on the wall. Set by the reset that took the hold off.
+     * NULL = still on the wall. Set to the draft version that took the hold off:
+     * `removeSprayWallHolds`, the supersede step in `upsertSprayWallHolds` when a
+     * hold is moved (a move is a removal plus an addition), or a reset's
+     * `commitSprayWallVersion`. `discardSprayWallVersion` clears it again for
+     * the draft it throws away. The removal is real once that version publishes.
      *
      * `RESTRICT`: NULL here means "alive", so nulling this on a version delete
      * would resurrect every hold that version removed — silently making lost
@@ -425,14 +621,58 @@ export const sprayWallHolds = pgTable(
     }),
     /** The hold this one replaced, when the reset review linked a move. */
     movedFromHoldId: integer('moved_from_hold_id'),
+    /**
+     * This successor corrects the drawing of the same physical hold. Published
+     * climbs follow it when its version publishes. Explicit remove/add moves
+     * keep false: a physically moved hold changes the climb.
+     */
+    isRefinement: boolean('is_refinement').default(false).notNull(),
     source: sprayHoldSourceEnum('source').default('manual').notNull(),
     /** Detector confidence 0-1 for `source = 'auto'`; NULL when a human drew it. */
     confidence: real('confidence'),
+    /**
+     * What the climber did with the suggestion (see `sprayHoldAutoReviewEnum`).
+     * NULL for a manual hold, and for an auto hold saved by an app that predates
+     * the field and never touched it.
+     */
+    autoReview: sprayHoldAutoReviewEnum('auto_review'),
+    /**
+     * The detection run this hold's suggestion came from, with
+     * `origin_candidate_index` naming the candidate in its `result.candidates`.
+     * Together they let the training export say which suggestions were kept and
+     * which were deleted, without a table of deletions: a candidate no alive hold
+     * points back at was dropped.
+     *
+     * Validated on write (same wall, run `done`, index in range); an invalid pair
+     * is stored as NULL rather than failing the save. `SET NULL` on delete because
+     * a hold must never depend on a detection row outliving it.
+     */
+    originDetectionId: text('origin_detection_id').references(() => sprayWallDetections.id, {
+      onDelete: 'set null',
+    }),
+    originCandidateIndex: integer('origin_candidate_index'),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
   },
   (table) => ({
     pk: primaryKey({ columns: [table.wallId, table.holdId] }),
+    // The training read's "which holds came from this run?" Partial because
+    // every manual hold, and every hold saved before provenance, has none.
+    originDetectionIdx: index('spray_wall_holds_origin_detection_idx')
+      .on(table.originDetectionId)
+      .where(sql`${table.originDetectionId} IS NOT NULL`),
+    // Provenance is a fact about a detector suggestion; a hand-drawn hold has
+    // none. `origin_candidate_index` is left out on purpose: a detection delete
+    // nulls `origin_detection_id` alone, and that must not violate this.
+    //
+    // ⚠️ drizzle-kit 0.31 does not reliably diff object-form check(): a future
+    // `generate` may emit a spurious DROP CONSTRAINT for this. Strip it from the
+    // generated SQL and hand-patch the snapshot, as for
+    // `boardsesh_ticks_quality_range` (migration 0155).
+    provenanceIsAutoOnly: check(
+      'spray_wall_holds_provenance_auto_only',
+      sql`${table.source} = 'auto' OR (${table.autoReview} IS NULL AND ${table.originDetectionId} IS NULL)`,
+    ),
     // The alive-holds read: every render, every create-climb session and the
     // integrity recompute filter `wall_id = ? AND removed_version_id IS NULL`.
     aliveIdx: index('spray_wall_holds_alive_idx').on(table.wallId, table.removedVersionId),
@@ -441,6 +681,62 @@ export const sprayWallHolds = pgTable(
     movedFromIdx: index('spray_wall_holds_moved_from_idx')
       .on(table.movedFromHoldId)
       .where(sql`${table.movedFromHoldId} IS NOT NULL`),
+  }),
+);
+
+/** An admin's verdict on one version as training data (SW-20, #5471). */
+export const sprayTrainingReviewStatusEnum = pgEnum('spray_training_review_status', ['approved', 'rejected']);
+
+/**
+ * Why an admin kept a version out of the training set. A closed set, like
+ * `spray_wall_report_reason`; `notes` carries anything the list does not.
+ */
+export const sprayTrainingRejectReasonEnum = pgEnum('spray_training_reject_reason', [
+  'bad_holds',
+  'missing_holds',
+  'photo_quality',
+  'not_a_wall',
+  'people_or_personal_info',
+  'duplicate',
+  'other',
+]);
+
+/**
+ * The admin vetting record for one wall version as training data.
+ *
+ * Per VERSION, not per wall: a published version's hold set never changes
+ * (`aliveHolds`), so a verdict on it stays true, while a reset or a hold edit
+ * makes a new version that has to be looked at again. A version with no row is
+ * unreviewed; setting it back to unreviewed deletes the row.
+ *
+ * A row is necessary and never sufficient for export: the wall's consent and the
+ * rest of `trainingEligibleCondition()` are re-checked on every read, so an
+ * approval outlives a consent switch-off without ever acting on it.
+ */
+export const sprayWallTrainingReviews = pgTable(
+  'spray_wall_training_reviews',
+  {
+    versionId: bigint('version_id', { mode: 'number' })
+      .primaryKey()
+      .references(() => sprayWallVersions.id, { onDelete: 'cascade' }),
+    status: sprayTrainingReviewStatusEnum('status').notNull(),
+    rejectReason: sprayTrainingRejectReasonEnum('reject_reason'),
+    /** At most 500 characters, enforced by the resolver's Zod schema. */
+    notes: text('notes'),
+    reviewedBy: text('reviewed_by').references(() => users.id, { onDelete: 'set null' }),
+    reviewedAt: timestamp('reviewed_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    // The admin queue's tab read: one status, newest verdict first.
+    statusReviewedIdx: index('spray_wall_training_reviews_status_idx').on(table.status, table.reviewedAt.desc()),
+    // A rejection always says why, and an approval never carries a reason.
+    //
+    // ⚠️ drizzle-kit 0.31 does not reliably diff object-form check(): see the
+    // note on `spray_wall_holds_provenance_auto_only`.
+    rejectReasonCheck: check(
+      'spray_wall_training_reviews_reason_check',
+      sql`(${table.status} = 'rejected') = (${table.rejectReason} IS NOT NULL)`,
+    ),
   }),
 );
 
@@ -484,6 +780,35 @@ export const sprayClimbLineage = pgTable(
   }),
 );
 
+/**
+ * The LED setup of one spray wall: which controller drives it, whether it is
+ * switched on, and the hole, LED and cable layout. One row per wall, on the
+ * board's numeric id, so a soft-deleted board keeps its row and a removed board
+ * takes it along.
+ *
+ * Nothing here names a user. The wall's owner is `user_boards.owner_id`, which is
+ * the only thing the write path checks, so this table stays out of the account
+ * deletion and user-reference catalogs. It holds only a local-network address
+ * (`normalizeLocalControllerUrl` on the server and again on the phone), and it is
+ * not part of the public board snapshot export.
+ */
+export const sprayWallLedSetups = pgTable('spray_wall_led_setups', {
+  boardId: bigint('board_id', { mode: 'number' })
+    .primaryKey()
+    .references(() => userBoards.id, { onDelete: 'cascade' }),
+  controllerType: text('controller_type').notNull().default('wled'),
+  /** Empty until an address is confirmed: the row can start from a layout-only save. */
+  controllerUrl: text('controller_url').notNull().default(''),
+  enabled: boolean('enabled').notNull().default(false),
+  /** WLED master brightness, 1–255, shared by every phone that lights the wall. */
+  brightness: integer('brightness').notNull().default(64),
+  /** Minutes after the last lighting before the controller turns the wall off; 0 never does. */
+  autoOffMinutes: integer('auto_off_minutes').notNull().default(0),
+  /** A `TnutLayout`, always written through `readTnutLayout`. Null until the setup screen saves one. */
+  layout: jsonb('layout').$type<Record<string, unknown>>(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+});
+
 export type SprayWallVersionStatus = (typeof sprayWallVersionStatusEnum.enumValues)[number];
 export type SprayHoldSource = (typeof sprayHoldSourceEnum.enumValues)[number];
 
@@ -497,4 +822,9 @@ export type SprayClimbLineage = typeof sprayClimbLineage.$inferSelect;
 export type NewSprayClimbLineage = typeof sprayClimbLineage.$inferInsert;
 export type SprayWallReportReason = (typeof sprayWallReportReasonEnum.enumValues)[number];
 export type SprayWallReport = typeof sprayWallReports.$inferSelect;
+export type SprayHoldAutoReview = (typeof sprayHoldAutoReviewEnum.enumValues)[number];
+export type SprayTrainingReviewStatus = (typeof sprayTrainingReviewStatusEnum.enumValues)[number];
+export type SprayTrainingRejectReason = (typeof sprayTrainingRejectReasonEnum.enumValues)[number];
 export type NewSprayWallReport = typeof sprayWallReports.$inferInsert;
+export type SprayWallLedSetup = typeof sprayWallLedSetups.$inferSelect;
+export type NewSprayWallLedSetup = typeof sprayWallLedSetups.$inferInsert;

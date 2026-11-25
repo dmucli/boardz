@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useSyncExternalStore } from 'react';
-import { DEFAULT_GRADE_DISPLAY_FORMAT, type GradeDisplayFormat } from '@boardsesh/play-view';
+import {
+  DEFAULT_GRADE_DISPLAY_FORMAT,
+  defaultGradeDisplayFormatForLocale,
+  type GradeDisplayFormat,
+} from '@boardsesh/play-view';
 import { getPreference, setPreference } from './preference-store';
 
 export const GRADE_DISPLAY_FORMATS = ['v-grade', 'font', 'both'] as const satisfies readonly GradeDisplayFormat[];
@@ -14,6 +18,11 @@ type GradeFormatSnapshot = { gradeFormat: GradeDisplayFormat; loaded: boolean };
 // `getSnapshot` returns a referentially-stable object across renders — required
 // by `useSyncExternalStore` to avoid an infinite render loop. A SINGLE
 // subscription per consumer keeps per-row overhead to one listener.
+// `chosen` is the climber's explicit pick (null until they make one);
+// `localeDefault` follows the app language (Font for Spanish, French, German and Italian), so a
+// climber who never opened the setting sees the scale their language reads.
+let chosen: GradeDisplayFormat | null = null;
+let localeDefault: GradeDisplayFormat = DEFAULT_GRADE_DISPLAY_FORMAT;
 let current: GradeDisplayFormat = DEFAULT_GRADE_DISPLAY_FORMAT;
 let hasLoaded = false;
 let snapshot: GradeFormatSnapshot = { gradeFormat: current, loaded: hasLoaded };
@@ -28,6 +37,7 @@ function isGradeDisplayFormat(value: unknown): value is GradeDisplayFormat {
 }
 
 function notify(): void {
+  current = chosen ?? localeDefault;
   // Rebuild the cached snapshot once per actual change, then wake every consumer.
   snapshot = { gradeFormat: current, loaded: hasLoaded };
   for (const listener of listeners) listener();
@@ -41,14 +51,27 @@ export async function loadGradeDisplayFormat(): Promise<GradeDisplayFormat> {
   // storage; honour the user's choice rather than clobbering it with the
   // (now stale) persisted value.
   if (hasLoaded) return current;
-  current = isGradeDisplayFormat(stored) ? stored : DEFAULT_GRADE_DISPLAY_FORMAT;
+  chosen = isGradeDisplayFormat(stored) ? stored : null;
   hasLoaded = true;
   notify();
   return current;
 }
 
+/**
+ * Point the default at the app's language. Called by the I18nProvider whenever
+ * the resolved language changes; an explicit pick always wins over it.
+ */
+export function setGradeFormatLocale(language: string | null | undefined): void {
+  const next = defaultGradeDisplayFormatForLocale(language);
+  if (next === localeDefault) return;
+  localeDefault = next;
+  // Before the stored pick loads, keep the snapshot as is: `loaded: false`
+  // consumers render a placeholder, and the load's notify() picks this up.
+  if (hasLoaded) notify();
+}
+
 export async function setGradeDisplayFormatPreference(format: GradeDisplayFormat): Promise<void> {
-  current = format;
+  chosen = format;
   hasLoaded = true;
   notify();
   await setPreference(STORAGE_KEY, format);
@@ -92,20 +115,25 @@ function getServerSnapshot(): GradeFormatSnapshot {
   return SERVER_SNAPSHOT;
 }
 
-export function useGradeDisplayFormatPreference(): {
+const subscribeDisabled = () => () => {};
+export function useGradeDisplayFormatPreference(enabled = true): {
   gradeFormat: GradeDisplayFormat;
   loaded: boolean;
   setGradeFormat: (format: GradeDisplayFormat) => void;
 } {
-  const { gradeFormat, loaded } = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
+  const { gradeFormat, loaded } = useSyncExternalStore(
+    enabled ? subscribe : subscribeDisabled,
+    enabled ? getSnapshot : getServerSnapshot,
+    getServerSnapshot,
+  );
 
   // Kick the one-time AsyncStorage load from an effect (not render/subscribe).
   // The promise singleton makes this idempotent across every mounted row.
   useEffect(() => {
     // Swallow load failures here — ensureGradeFormatLoaded already clears its
     // cached promise so a later mount retries; nothing to do at this call site.
-    ensureGradeFormatLoaded().catch(() => {});
-  }, []);
+    if (enabled) ensureGradeFormatLoaded().catch(() => {});
+  }, [enabled]);
 
   const setGradeFormat = useCallback((next: GradeDisplayFormat) => {
     void setGradeDisplayFormatPreference(next);

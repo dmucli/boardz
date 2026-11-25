@@ -19,6 +19,7 @@ const BOARD_PRESENCE_CLIMB_FIELDS = `
   gradeColor
   frames
   angle
+  mirrored
   setter
   sentByDisplayName
   sentByAvatarUrl
@@ -49,14 +50,16 @@ const BOARD_PRESENCE_STATS_FIELDS = `
 
 // Subscription — the live "now on the wall" feed for a board. Emits a
 // BoardPresenceEvent union discriminated by __typename: a BoardClimbSet carries
-// the full climb, a BoardClimbCleared carries only the clear timestamp + seq,
+// the full climb, a BoardClimbCleared carries the clear timestamp + seq and the
+// climb that went dark (#7015; selected only from release/next, after the backend
+// that serves the field was deployed from main),
 // a BoardStatsUpdated carries the recomputed stat tiles (pushed when a tick
 // lands on the wall) so the tiles update live instead of re-fetching, and a
 // BoardConnectionChanged carries the current connection holder (or null when the
 // board goes free) so consumers can show held-vs-free distinct from the lit climb.
 export const BOARD_NOW_PLAYING = `
-  subscription BoardNowPlaying($boardId: Int!) {
-    boardNowPlaying(boardId: $boardId) {
+  subscription BoardNowPlaying($boardId: Int!, $boardUuid: ID, $includeAurora: Boolean) {
+    boardNowPlaying(boardId: $boardId, boardUuid: $boardUuid, includeAurora: $includeAurora) {
       __typename
       ... on BoardHistoryUpdated {
         seq
@@ -70,6 +73,7 @@ export const BOARD_NOW_PLAYING = `
       ... on BoardClimbCleared {
         clearedAt
         seq
+        climbUuid
       }
       ... on BoardStatsUpdated {
         stats {
@@ -91,14 +95,14 @@ export const BOARD_NOW_PLAYING = `
 `;
 
 export const BOARD_RECENT_HISTORY = `
-  query BoardRecentHistory($boardId: Int!) {
-    boardRecentHistory(boardId: $boardId) { ${BOARD_PRESENCE_CLIMB_FIELDS} }
+  query BoardRecentHistory($boardId: Int!, $boardUuid: ID, $includeAurora: Boolean) {
+    boardRecentHistory(boardId: $boardId, boardUuid: $boardUuid, includeAurora: $includeAurora) { ${BOARD_PRESENCE_CLIMB_FIELDS} }
   }
 `;
 
 export const BOARD_HISTORY_PAGE = `
-  query BoardHistoryPage($boardId: Int!, $limit: Int, $before: String) {
-    boardHistoryPage(boardId: $boardId, limit: $limit, before: $before) {
+  query BoardHistoryPage($boardId: Int!, $boardUuid: ID, $limit: Int, $before: String, $includeAurora: Boolean) {
+    boardHistoryPage(boardId: $boardId, boardUuid: $boardUuid, limit: $limit, before: $before, includeAurora: $includeAurora) {
       entries { ${BOARD_PRESENCE_CLIMB_FIELDS} }
       nextCursor
     }
@@ -116,7 +120,10 @@ export const REPORT_BOARD_CLIMB = `
 
 // Mutation — resolve (and bind) the shared board for a BLE serial. Called once
 // on BLE connect; the board-config args are used only to create the board the
-// first time a serial is seen. Returns the one board everyone at this wall shares.
+// first time a serial is seen. `selectedBoardUuid` is the board the user
+// already had picked (map finder / board picker) — when its config matches the
+// controller it wins, so connecting never moves them off the wall they chose.
+// Returns the one board everyone at this wall shares.
 export const RESOLVE_BOARD_FOR_SERIAL = `
   mutation ResolveBoardForSerial(
     $serial: String!
@@ -125,6 +132,7 @@ export const RESOLVE_BOARD_FOR_SERIAL = `
     $sizeId: Int!
     $setIds: String!
     $advertisedBoardType: String
+    $selectedBoardUuid: ID
   ) {
     resolveBoardForSerial(
       serial: $serial
@@ -133,6 +141,7 @@ export const RESOLVE_BOARD_FOR_SERIAL = `
       sizeId: $sizeId
       setIds: $setIds
       advertisedBoardType: $advertisedBoardType
+      selectedBoardUuid: $selectedBoardUuid
     ) {
       boardId
       boardName
@@ -156,6 +165,7 @@ export const RESOLVE_BOARD_CANDIDATES_FOR_SERIAL = `
     $sizeId: Int!
     $setIds: String!
     $advertisedBoardType: String
+    $selectedBoardUuid: ID
   ) {
     resolveBoardCandidatesForSerial(
       serial: $serial
@@ -164,6 +174,7 @@ export const RESOLVE_BOARD_CANDIDATES_FOR_SERIAL = `
       sizeId: $sizeId
       setIds: $setIds
       advertisedBoardType: $advertisedBoardType
+      selectedBoardUuid: $selectedBoardUuid
     ) {
       board {
         boardId
@@ -251,22 +262,21 @@ export const RESOLVE_BOARD_FOR_CONFIG = `
 // Query — newest-first recent climbs for a board, used by a late joiner to
 // backfill history before following the live subscription.
 export const BOARD_RECENT_CLIMBS = `
-  query BoardRecentClimbs($boardId: Int!) {
-    boardRecentClimbs(boardId: $boardId) {
+  query BoardRecentClimbs($boardId: Int!, $boardUuid: ID) {
+    boardRecentClimbs(boardId: $boardId, boardUuid: $boardUuid) {
       ${BOARD_PRESENCE_CLIMB_FIELDS}
     }
   }
 `;
 
-// Query — durable, keyset-paged history of what was lit on a board, from
-// `board_climb_events` (survives past the 1-week Redis window (BOARD_HISTORY_TTL)
-// that backs BOARD_RECENT_CLIMBS). Newest-first; `before` is an opaque cursor equal to the
+// Query — last seven days of native displays from `board_climb_events`.
+// Newest sequence first; `before` is an opaque cursor equal to the
 // `seq` of the previous page's last row, and `limit` is server-capped 1–100
 // (default 50). Reuses the same climb fields as the live feed so every wall
 // surface decodes one shape.
 export const BOARD_HISTORY = `
-  query BoardHistory($boardId: Int!, $limit: Int, $before: String) {
-    boardHistory(boardId: $boardId, limit: $limit, before: $before) {
+  query BoardHistory($boardId: Int!, $boardUuid: ID, $limit: Int, $before: String) {
+    boardHistory(boardId: $boardId, boardUuid: $boardUuid, limit: $limit, before: $before) {
       ${BOARD_PRESENCE_CLIMB_FIELDS}
     }
   }
@@ -276,8 +286,8 @@ export const BOARD_HISTORY = `
 // climb at the displayed angle on this physical board. The backend resolves
 // canonical + alias UUIDs before reading ticks.
 export const BOARD_CLIMB_RECENT_SENDERS = `
-  query BoardClimbRecentSenders($boardId: Int!, $climbUuid: String!, $angle: Int!) {
-    boardClimbRecentSenders(boardId: $boardId, climbUuid: $climbUuid, angle: $angle) {
+  query BoardClimbRecentSenders($boardId: Int!, $boardUuid: ID, $climbUuid: String!, $angle: Int!) {
+    boardClimbRecentSenders(boardId: $boardId, boardUuid: $boardUuid, climbUuid: $climbUuid, angle: $angle) {
       userId
       displayName
       avatarUrl
@@ -288,8 +298,8 @@ export const BOARD_CLIMB_RECENT_SENDERS = `
 
 // Query — durable + live stats for a board's wall feed.
 export const BOARD_PRESENCE_STATS = `
-  query BoardPresenceStats($boardId: Int!) {
-    boardPresenceStats(boardId: $boardId) {
+  query BoardPresenceStats($boardId: Int!, $boardUuid: ID) {
+    boardPresenceStats(boardId: $boardId, boardUuid: $boardUuid) {
       ${BOARD_PRESENCE_STATS_FIELDS}
     }
   }
@@ -298,11 +308,16 @@ export const BOARD_PRESENCE_STATS = `
 // Query — the current connection holder for a board, used by a late joiner to
 // seed held-vs-free before the live BoardConnectionChanged subscription pushes.
 // Resolves null when the board is free.
-export const BOARD_CONNECTION = `query BoardConnection($boardId: Int!) { boardConnection(boardId: $boardId) { userId displayName avatarUrl lastSentAt } }`;
+export const BOARD_CONNECTION = `query BoardConnection($boardId: Int!, $boardUuid: ID) { boardConnection(boardId: $boardId, boardUuid: $boardUuid) { userId displayName avatarUrl lastSentAt } }`;
 
 // Mutation — release this client's hold on a board (e.g. on BLE disconnect).
 // Returns Boolean! (accepted).
 export const REPORT_BOARD_DISCONNECT = `mutation ReportBoardDisconnect($boardId: Int!) { reportBoardDisconnect(boardId: $boardId) }`;
+
+// Mutation — this client turned off all the wall's lights but kept its link
+// (#7015). Publishes BoardClimbCleared to every viewer. Returns Boolean!
+// (accepted; false when another emitter holds the board).
+export const REPORT_BOARD_CLEAR = `mutation ReportBoardClear($boardId: Int!) { reportBoardClear(boardId: $boardId) }`;
 
 // All fields of a redacted BoardQueuePreview (gym-kiosk "Up next"). Items
 // deliberately carry ONLY climb-catalog display fields — never who added or
@@ -339,8 +354,8 @@ const BOARD_QUEUE_PREVIEW_FIELDS = `
 // AND isPublic active session). Used by kiosks for initial paint before the
 // live subscription takes over.
 export const BOARD_QUEUE_PREVIEW = `
-  query BoardQueuePreview($boardId: Int!) {
-    boardQueuePreview(boardId: $boardId) {
+  query BoardQueuePreview($boardId: Int!, $boardUuid: ID) {
+    boardQueuePreview(boardId: $boardId, boardUuid: $boardUuid) {
       ${BOARD_QUEUE_PREVIEW_FIELDS}
     }
   }
@@ -351,9 +366,21 @@ export const BOARD_QUEUE_PREVIEW = `
 // snapshot when one exists, so late-joining kiosks paint without a separate
 // query round-trip.
 export const BOARD_QUEUE_PREVIEW_SUBSCRIPTION = `
-  subscription BoardQueuePreviewUpdates($boardId: Int!) {
-    boardQueuePreview(boardId: $boardId) {
+  subscription BoardQueuePreviewUpdates($boardId: Int!, $boardUuid: ID) {
+    boardQueuePreview(boardId: $boardId, boardUuid: $boardUuid) {
       ${BOARD_QUEUE_PREVIEW_FIELDS}
+    }
+  }
+`;
+
+/** Set-based grade projection behind the same physical-wall read gate as history. */
+export const BOARD_PRESENCE_CLIMB_GRADES = `
+  query BoardPresenceClimbGrades($boardId: Int!, $boardUuid: ID, $angle: Int!, $climbUuids: [ID!]!) {
+    boardPresenceClimbGrades(boardId: $boardId, boardUuid: $boardUuid, angle: $angle, climbUuids: $climbUuids) {
+      uuid
+      difficulty
+      boardseshDifficulty
+      boardseshConfidence
     }
   }
 `;

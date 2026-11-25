@@ -1,8 +1,11 @@
 import { z } from 'zod';
-import { CONFIDENCE, MAX_SEARCH_PAGE } from '@boardsesh/db/queries';
+import { CONFIDENCE, MAX_SEARCH_PAGE } from '@boardsesh/db/queries/constants';
+
 import { CLIMB_CHARACTERISTICS, TOGGLEABLE_CLIMB_CHARACTERISTICS } from '@boardsesh/shared-schema';
 import { ClimbUuidSchema, ExternalUUIDSchema, BoardNameSchema, UUIDSchema } from './primitives';
 import { BOARD_ANGLE_VALIDATION_MESSAGE, isBoardAngleSupported } from './board-angles';
+
+type ConfidenceTier = (typeof CONFIDENCE)[keyof typeof CONFIDENCE];
 
 // Cap holdsFilter entries: each ANY entry becomes a LIKE scan over board_climbs.frames
 // (no trigram index there), so an unbounded record is a cheap amplification vector on
@@ -83,8 +86,9 @@ export const ClimbInputSchema = z.object({
     .transform((v) => v ?? ''),
   mirrored: z.boolean().nullish(),
   benchmark_difficulty: z.string().max(50).nullish(),
-  // `is_no_match` / `characteristics` must be declared here even though nothing
-  // server-side reads them: `z.object()` STRIPS undeclared keys, and `setQueue`
+  // `is_no_match` / `characteristics` must be declared here (`Climb.is_no_match`
+  // reads `is_no_match` back when a queued stub has neither characteristics nor
+  // description, #6681): `z.object()` STRIPS undeclared keys, and `setQueue`
   // / `joinSession` persist the PARSED item (unlike the single-item mutations,
   // which discard the parse result and store the GraphQL-coerced input). Both
   // fields ride every client's selection set already, so omitting them here made
@@ -101,7 +105,8 @@ export const ClimbInputSchema = z.object({
   // the queue so peers can gate the Edit affordance locally.
   is_draft: z.boolean().nullish(),
   // ISO timestamp of first publish; used by clients to enforce the 24h
-  // post-publish edit window without a second round-trip.
+  // post-publish edit window without a second round-trip (catalogue boards
+  // only; a spray climb has no window).
   published_at: z.string().max(100).nullish(),
   userAscents: z.number().min(0).nullish(),
   userAttempts: z.number().min(0).nullish(),
@@ -114,25 +119,27 @@ export const ClimbInputSchema = z.object({
   boardseshDifficulty: z.number().nullish(),
   // Source of truth for the tier set: CONFIDENCE / ConfidenceTier in
   // packages/db/src/queries/grade-model/constants.ts.
-  boardseshConfidence: z
-    .enum([
-      CONFIDENCE.confirmed,
-      CONFIDENCE.provisional,
-      CONFIDENCE.setterOnly,
-      CONFIDENCE.crossAngleEstimate,
-      CONFIDENCE.moonboardAngleEstimate,
-    ])
-    .nullish(),
+  boardseshConfidence: z.enum(Object.values(CONFIDENCE) as [ConfidenceTier, ...ConfidenceTier[]]).nullish(),
   // The sizes the climb fits on, round-tripped through the queue so a peer on a
   // different-sized wall keeps the one signal that separates Woods' two boards
   // (their hold ids overlap as different holds). Bounded: a board type has a
   // handful of product sizes, never dozens.
   compatibleSizeIds: z.array(z.number().int()).max(50).nullish(),
+  // Additive server-first field; old queue items omit it. Preserve known-empty
+  // separately from unknown while bounding client-supplied metadata.
+  requiredSetIds: z.array(z.number().int()).max(50).nullish(),
   // How many of this climb's holds a spray-wall reset has taken off. Round-trips
   // through the queue because a broken climb is still queueable and still
   // playable, and the peer showing it has to be able to say why the board is
   // drawing fewer holds than the setter painted. Null on every catalogue board.
   missingHoldCount: z.number().int().min(0).nullish(),
+  // `board_climbs.revision_number` as the queueing client read it (#6023).
+  // Round-trips through the queue so the peer who logs a queued climb can say
+  // which revision was on the wall, without a refetch. Null from a client that
+  // predates the field. `.catch(null)`: `parseArrayTolerant` drops the whole
+  // queue slot on a schema failure, and a bad revision is no reason to lose a
+  // climb from everyone's queue.
+  revisionNumber: z.number().int().positive().nullish().catch(null),
 });
 
 /**
@@ -169,110 +176,119 @@ export const ClimbQueueItemSchema = z.object({
 /**
  * Climb search input validation schema
  */
-export const ClimbSearchInputSchema = z.object({
-  onlyFollowedAuthors: z.boolean().optional(),
-  boardName: BoardNameSchema,
-  layoutId: z.number().int().positive('Layout ID must be positive'),
-  sizeId: z.number().int().positive('Size ID must be positive'),
-  setIds: z.string().min(1, 'Set IDs cannot be empty'),
-  angle: z.number().int(),
-  // Spray only, and a CAPABILITY rather than a filter: it never reaches the search
-  // predicate, only the read gate (`sprayLayoutIsReadableWithCapability`).
-  sprayWallUuid: UUIDSchema.optional(),
-  page: z.number().int().min(0).max(MAX_SEARCH_PAGE, 'Page number too large').optional(),
-  pageSize: z.number().int().min(1).max(100, 'Page size cannot exceed 100').optional(),
-  gradeAccuracy: z.string().optional(),
-  minGrade: z.number().int().optional(),
-  maxGrade: z.number().int().optional(),
-  minAscents: z.number().int().min(0).optional(),
-  minRating: z.number().min(0).max(5).optional(),
-  sortBy: z.string().optional(),
-  sortOrder: z.enum(['asc', 'desc']).optional(),
-  // Seed for the 'random' sort. Digits only (newSortSeed emits an integer string)
-  // and bounded, so it can't bloat the md5 salt or carry anything unexpected.
-  sortSeed: z.string().max(32).regex(/^\d+$/).optional(),
-  name: z.string().max(200).optional(),
-  setter: z.array(z.string().max(100)).optional(),
-  setterId: z.number().int().optional(),
-  onlyBenchmarks: z.boolean().optional(),
-  onlyTallClimbs: z.boolean().optional(),
-  onlyWideClimbs: z.boolean().optional(),
-  onlyWithBetaVideos: z.boolean().optional(),
-  // Per-hold map of type→mode filters. Each hold can carry filters for
-  // multiple types (e.g. STARTING:include + FOOT:exclude). ANY means "hold
-  // present in any state" (the wildcard, was the legacy `ANY`/`NOT` value).
-  // Uses an explicit z.object instead of nested z.record because Zod 4's
-  // two-arg z.record(keyEnum, valueEnum) emits one "expected include|exclude"
-  // error per outer key when the inner record uses an enum key — the explicit
-  // object form sidesteps that and is clearer about which keys are allowed.
-  holdsFilter: z
-    .record(
-      z.string(),
-      z
-        .object({
-          STARTING: z.enum(['include', 'exclude']).optional(),
-          HAND: z.enum(['include', 'exclude']).optional(),
-          FINISH: z.enum(['include', 'exclude']).optional(),
-          FOOT: z.enum(['include', 'exclude']).optional(),
-          ANY: z.enum(['include', 'exclude']).optional(),
-        })
-        .strict(),
-    )
-    .refine((holds) => Object.keys(holds).length <= MAX_HOLD_FILTER_ENTRIES, {
-      message: 'Too many hold filters',
-    })
-    .optional(),
-  hideAttempted: z.boolean().optional(),
-  hideCompleted: z.boolean().optional(),
-  showOnlyAttempted: z.boolean().optional(),
-  showOnlyCompleted: z.boolean().optional(),
-  // 1-5 matches the boardsesh_ticks_quality_range CHECK. 0 is accepted and
-  // means "no minimum" (mapSearchInputToParams collapses it), mirroring the
-  // community minRating whose default is 0 — a client sending the default
-  // must not 400 the whole search.
-  minUserRating: z.number().int().min(0).max(5).optional(),
-  onlyRatedByMe: z.boolean().optional(),
-  // Personal grades (#4828). Auth-gated the same way the other personal filters
-  // are — USER_SPECIFIC_SEARCH_PARAMS lists it, so an anonymous caller sending
-  // it gets no userId and the search falls back to the crowd's grade rather
-  // than erroring.
-  useMyGrades: z.boolean().optional(),
-  onlyDrafts: z.boolean().optional(),
-  projectsOnly: z.boolean().optional(),
-  // Spray-wall hold integrity. No `.default()` — ANY and an omitted value are the
-  // same thing (no predicate), and a default here would apply for real, since
-  // searchClimbs uses this schema's parsed return.
-  holdIntegrity: z.enum(['ANY', 'INTACT', 'BROKEN']).optional(),
-  crossAngleStats: z.boolean().optional(),
-  // No default: omitted means UPSTREAM, and mapSearchInputToParams collapses an
-  // explicit UPSTREAM to undefined so the search-cache key does not change.
-  gradeSource: z.enum(['UPSTREAM', 'BOARDSESH']).optional(),
-  // No default here on purpose: omitted means "no climb-type constraint"
-  // (both boulders and routes match), not "boulders-only". searchClimbs (see
-  // packages/backend/src/graphql/resolvers/climbs/queries.ts) now uses the
-  // parsed/defaulted return of validateInput(ClimbSearchInputSchema, ...),
-  // so a `.default()` here would actually apply — a boulders-only default
-  // would silently narrow every caller that omits these fields, and
-  // @boardsesh/climb-filters' toClimbSearchInput relies on the both-off case
-  // staying undefined (hardened by #2636, which closed #3975's original
-  // symptom by always sending explicit values for the "All" case). If a
-  // future change wants a real default, audit every caller of
-  // toClimbSearchInput first, not just the web client.
-  boulders: z.boolean().optional(),
-  routes: z.boolean().optional(),
-  zoneBox: z
-    .object({
-      edgeLeft: z.number().int(),
-      edgeRight: z.number().int(),
-      edgeBottom: z.number().int(),
-      edgeTop: z.number().int(),
-    })
-    .refine((box) => box.edgeRight > box.edgeLeft && box.edgeTop > box.edgeBottom, {
-      message: 'zoneBox edges must form a non-empty box (right > left, top > bottom)',
-    })
-    .optional(),
-  zoneMode: z.enum(['allHolds', 'anyHold']).optional(),
-});
+export const ClimbSearchInputSchema = z
+  .object({
+    onlyFollowedAuthors: z.boolean().optional(),
+    boardName: BoardNameSchema,
+    layoutId: z.number().int().positive('Layout ID must be positive'),
+    sizeId: z.number().int().positive('Size ID must be positive'),
+    setIds: z.string().min(1, 'Set IDs cannot be empty'),
+    angle: z.number().int(),
+    // Spray only, and a CAPABILITY rather than a filter: it never reaches the search
+    // predicate, only the read gate (`sprayLayoutIsReadableWithCapability`).
+    sprayWallUuid: UUIDSchema.optional(),
+    page: z.number().int().min(0).max(MAX_SEARCH_PAGE, 'Page number too large').optional(),
+    pageSize: z.number().int().min(1).max(100, 'Page size cannot exceed 100').optional(),
+    gradeAccuracy: z.string().optional(),
+    minGrade: z.number().int().optional(),
+    maxGrade: z.number().int().optional(),
+    minAscents: z.number().int().min(0).optional(),
+    minRating: z.number().min(0).max(5).optional(),
+    sortBy: z.string().optional(),
+    sortOrder: z.enum(['asc', 'desc']).optional(),
+    // Seed for the 'random' sort. Digits only (newSortSeed emits an integer string)
+    // and bounded, so it can't bloat the md5 salt or carry anything unexpected.
+    sortSeed: z.string().max(32).regex(/^\d+$/).optional(),
+    name: z.string().max(200).optional(),
+    setter: z.array(z.string().max(100)).optional(),
+    setterId: z.number().int().optional(),
+    onlyBenchmarks: z.boolean().optional(),
+    onlyTallClimbs: z.boolean().optional(),
+    onlyWideClimbs: z.boolean().optional(),
+    onlyWithBetaVideos: z.boolean().optional(),
+    // Per-hold map of type→mode filters. Each hold can carry filters for
+    // multiple types (e.g. STARTING:include + FOOT:exclude). ANY means "hold
+    // present in any state" (the wildcard, was the legacy `ANY`/`NOT` value).
+    // Uses an explicit z.object instead of nested z.record because Zod 4's
+    // two-arg z.record(keyEnum, valueEnum) emits one "expected include|exclude"
+    // error per outer key when the inner record uses an enum key — the explicit
+    // object form sidesteps that and is clearer about which keys are allowed.
+    holdsFilter: z
+      .record(
+        z.string(),
+        z
+          .object({
+            STARTING: z.enum(['include', 'exclude']).optional(),
+            HAND: z.enum(['include', 'exclude']).optional(),
+            FINISH: z.enum(['include', 'exclude']).optional(),
+            FOOT: z.enum(['include', 'exclude']).optional(),
+            ANY: z.enum(['include', 'exclude']).optional(),
+          })
+          .strict(),
+      )
+      .refine((holds) => Object.keys(holds).length <= MAX_HOLD_FILTER_ENTRIES, {
+        message: 'Too many hold filters',
+      })
+      .optional(),
+    hideAttempted: z.boolean().optional(),
+    hideCompleted: z.boolean().optional(),
+    showOnlyAttempted: z.boolean().optional(),
+    showOnlyCompleted: z.boolean().optional(),
+    // 1-5 matches the boardsesh_ticks_quality_range CHECK. 0 is accepted and
+    // means "no minimum" (mapSearchInputToParams collapses it), mirroring the
+    // community minRating whose default is 0 — a client sending the default
+    // must not 400 the whole search.
+    minUserRating: z.number().int().min(0).max(5).optional(),
+    onlyRatedByMe: z.boolean().optional(),
+    // Personal grades (#4828). Auth-gated the same way the other personal filters
+    // are — USER_SPECIFIC_SEARCH_PARAMS lists it, so an anonymous caller sending
+    // it gets no userId and the search falls back to the crowd's grade rather
+    // than erroring.
+    useMyGrades: z.boolean().optional(),
+    onlyDrafts: z.boolean().optional(),
+    draftScope: z.enum(['OWN', 'WALL']).optional(),
+    // Only climbs the caller has hearted on this board, at any angle. Signed out,
+    // the resolver returns an empty page rather than the unfiltered list.
+    onlyFavorited: z.boolean().optional(),
+    projectsOnly: z.boolean().optional(),
+    // Spray-wall hold integrity. No `.default()` — ANY and an omitted value are the
+    // same thing (no predicate), and a default here would apply for real, since
+    // searchClimbs uses this schema's parsed return.
+    holdIntegrity: z.enum(['ANY', 'INTACT', 'BROKEN']).optional(),
+    crossAngleStats: z.boolean().optional(),
+    // No default: omitted means UPSTREAM, and mapSearchInputToParams collapses an
+    // explicit UPSTREAM to undefined so the search-cache key does not change.
+    gradeSource: z.enum(['UPSTREAM', 'BOARDSESH']).optional(),
+    // No default here on purpose: omitted means "no climb-type constraint"
+    // (both boulders and routes match), not "boulders-only". searchClimbs (see
+    // packages/backend/src/graphql/resolvers/climbs/queries.ts) now uses the
+    // parsed/defaulted return of validateInput(ClimbSearchInputSchema, ...),
+    // so a `.default()` here would actually apply — a boulders-only default
+    // would silently narrow every caller that omits these fields, and
+    // @boardsesh/climb-filters' toClimbSearchInput relies on the both-off case
+    // staying undefined (hardened by #2636, which closed #3975's original
+    // symptom by always sending explicit values for the "All" case). If a
+    // future change wants a real default, audit every caller of
+    // toClimbSearchInput first, not just the web client.
+    boulders: z.boolean().optional(),
+    routes: z.boolean().optional(),
+    zoneBox: z
+      .object({
+        edgeLeft: z.number().int(),
+        edgeRight: z.number().int(),
+        edgeBottom: z.number().int(),
+        edgeTop: z.number().int(),
+      })
+      .refine((box) => box.edgeRight > box.edgeLeft && box.edgeTop > box.edgeBottom, {
+        message: 'zoneBox edges must form a non-empty box (right > left, top > bottom)',
+      })
+      .optional(),
+    zoneMode: z.enum(['allHolds', 'anyHold']).optional(),
+  })
+  .refine((input) => input.draftScope !== 'WALL' || input.boardName === 'spray', {
+    message: 'Wall draft scope is only supported for spray walls',
+    path: ['draftScope'],
+  });
 
 // Only the freely-toggleable characteristics (no_kickboard, campus) are settable
 // through the SaveClimbInput/UpdateClimbInput `characteristics` field — no_match
@@ -307,8 +323,26 @@ const RuleFlagSchema = z.boolean().optional().nullable();
 // question, not a shape question.
 const ClimbSizeIdSchema = z.number().int().positive('Size ID must be positive').optional().nullable();
 
+// Deprecated: a climb has no audience, and the GraphQL field is kept, ignored,
+// only so installed builds that still send it are not rejected. Read here for
+// one thing. A climber on such a build, or with a publish queued offline before
+// the update, picked "Only me" or "Followers" a moment ago; publishing that
+// climb to everyone would silently widen what they chose. The nearest thing
+// that still exists is a draft (owner-only), so a restricted audience saves the
+// climb as a draft, and they publish it from the new app when they are ready.
+// The field is dropped from the parsed input either way.
+const DeprecatedClimbPrivacySchema = z.object({ audience: z.string() }).loose().optional().nullable();
+
+function asksForRestrictedAudience(privacy: { audience: string } | null | undefined): boolean {
+  return privacy?.audience === 'only_me' || privacy?.audience === 'followers';
+}
+
 export const SaveClimbInputSchema = z
   .object({
+    uuid: z
+      .string()
+      .regex(/^[0-9A-F]{32}$/, 'Client climb UUID must be 32 uppercase hexadecimal characters')
+      .nullish(),
     boardType: BoardNameSchema,
     layoutId: z.number().int().positive('Layout ID must be positive'),
     name: z.string().min(1).max(200),
@@ -327,12 +361,10 @@ export const SaveClimbInputSchema = z
     noMatch: RuleFlagSchema,
     anyFeet: RuleFlagSchema,
     sizeId: ClimbSizeIdSchema,
-    // The setter's own grade, mirroring SaveMoonBoardClimbInputSchema. REQUIRED to
-    // publish on a spray wall — that board has `crowdGrade: false`, so nothing will
-    // ever converge on a consensus difficulty and this is the only grade the climb
-    // will have. Ignored on every other board, where the grade comes from ticks or
-    // the Aurora sync; the RESOLVER decides that, not this schema, because the
-    // requirement depends on the wall rather than on the shape of the input.
+    // The setter's own grade, mirroring SaveMoonBoardClimbInputSchema. Older apps
+    // send it on a spray wall, where it seeds a provisional grade the first graded
+    // send replaces (#5971); current apps leave it out. Ignored on every other
+    // board, where the grade comes from ticks or the Aurora sync.
     userGrade: z.string().max(20).optional(),
     // The spray wall's uuid, as an unlisted wall's share link carries it. Only
     // consulted for `boardType: 'spray'`, and only for a caller who is neither the
@@ -347,14 +379,17 @@ export const SaveClimbInputSchema = z
     // `ClimbUuidSchema`, not `UUIDSchema`: a climb uuid is Aurora's 32-hex form,
     // not an RFC-4122 one, and every Boardsesh-authored climb follows it.
     remixOfClimbUuid: ClimbUuidSchema.optional(),
+    privacy: DeprecatedClimbPrivacySchema,
   })
   .refine((input) => isBoardAngleSupported(input.boardType, input.angle), {
     message: BOARD_ANGLE_VALIDATION_MESSAGE,
     path: ['angle'],
-  });
+  })
+  .transform(({ privacy, ...climb }) => ({ ...climb, isDraft: climb.isDraft || asksForRestrictedAudience(privacy) }));
 
 export const UpdateClimbInputSchema = z
   .object({
+    clientMutationId: UUIDSchema.nullish(),
     uuid: z.string().min(1).max(100),
     boardType: BoardNameSchema,
     name: z.string().min(1).max(200).optional(),
@@ -381,11 +416,16 @@ export const UpdateClimbInputSchema = z
     // wall. An edit needs it for the same reason a create does — the wall is
     // resolved from the stored climb's `layoutId`, which is not a secret.
     sprayWallUuid: UUIDSchema.optional(),
+    privacy: DeprecatedClimbPrivacySchema,
   })
   .refine((input) => isBoardAngleSupported(input.boardType, input.angle), {
     message: BOARD_ANGLE_VALIDATION_MESSAGE,
     path: ['angle'],
-  });
+  })
+  // On an edit, "stay a draft": a draft is not published with a restricted
+  // audience. A climb that is already published stays published (updateClimb
+  // never turns one back into a draft); its audience was already gone.
+  .transform(({ privacy, ...climb }) => (asksForRestrictedAudience(privacy) ? { ...climb, isDraft: true } : climb));
 
 export const MoonBoardHoldsInputSchema = z.object({
   start: z.array(z.string()).default([]),
@@ -393,28 +433,31 @@ export const MoonBoardHoldsInputSchema = z.object({
   finish: z.array(z.string()).default([]),
 });
 
-export const SaveMoonBoardClimbInputSchema = z.object({
-  boardType: z.literal('moonboard'),
-  layoutId: z.number().int().positive('Layout ID must be positive'),
-  name: z.string().min(1).max(200),
-  description: z.string().max(2000).optional().default(''),
-  holds: MoonBoardHoldsInputSchema,
-  angle: z.number().int().min(0).max(90),
-  isDraft: z.boolean().optional(),
-  userGrade: z.string().max(20).optional(),
-  isBenchmark: z.boolean().optional(),
-  // MoonBoard problem "method" as a characteristic token (mutually exclusive).
-  // Omitted = the "feet follow hands" default. Source of truth for the token set:
-  // CLIMB_CHARACTERISTICS in @boardsesh/shared-schema.
-  method: z
-    .enum([
-      CLIMB_CHARACTERISTICS.METHOD_FOOTLESS,
-      CLIMB_CHARACTERISTICS.METHOD_FOOTLESS_KICKBOARD,
-      CLIMB_CHARACTERISTICS.METHOD_NO_KICKBOARD,
-    ])
-    .optional(),
-  setter: z.string().max(100).optional(),
-});
+export const SaveMoonBoardClimbInputSchema = z
+  .object({
+    boardType: z.literal('moonboard'),
+    layoutId: z.number().int().positive('Layout ID must be positive'),
+    name: z.string().min(1).max(200),
+    description: z.string().max(2000).optional().default(''),
+    holds: MoonBoardHoldsInputSchema,
+    angle: z.number().int().min(0).max(90),
+    isDraft: z.boolean().optional(),
+    userGrade: z.string().max(20).optional(),
+    isBenchmark: z.boolean().optional(),
+    // MoonBoard problem "method" as a characteristic token (mutually exclusive).
+    // Omitted = the "feet follow hands" default. Source of truth for the token set:
+    // CLIMB_CHARACTERISTICS in @boardsesh/shared-schema.
+    method: z
+      .enum([
+        CLIMB_CHARACTERISTICS.METHOD_FOOTLESS,
+        CLIMB_CHARACTERISTICS.METHOD_FOOTLESS_KICKBOARD,
+        CLIMB_CHARACTERISTICS.METHOD_NO_KICKBOARD,
+      ])
+      .optional(),
+    setter: z.string().max(100).optional(),
+    privacy: DeprecatedClimbPrivacySchema,
+  })
+  .transform(({ privacy, ...climb }) => (asksForRestrictedAudience(privacy) ? { ...climb, isDraft: true } : climb));
 
 export const CheckMoonBoardClimbDuplicatesInputSchema = z.object({
   layoutId: z.number().int().positive('Layout ID must be positive'),

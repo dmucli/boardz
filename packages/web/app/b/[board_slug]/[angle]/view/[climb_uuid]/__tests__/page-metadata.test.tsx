@@ -1,7 +1,13 @@
+import { createInstance } from 'i18next';
+import enClimbs from '@boardsesh/i18n/locales/en-US/climbs.json';
+import { getServerTranslation } from '@/app/lib/i18n/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
+import { getClimb } from '@/app/lib/data/queries';
+import type { ClimbStatsForAngle } from '@/app/lib/data/queries';
 
 vi.mock('next/navigation', () => ({
   notFound: vi.fn(),
+  permanentRedirect: vi.fn(),
 }));
 
 // `page.tsx` uses `getServerTranslation` which imports `server-only`. Stub the i18n
@@ -27,9 +33,10 @@ type ResolvedBoard = {
   setIds: string;
   isPublic: boolean;
   isUnlisted: boolean;
+  gymIsListed?: boolean;
 };
 
-const resolveBoardBySlug = vi.fn<(slug: string) => Promise<ResolvedBoard | null>>(async () => ({
+const resolveBoardBySlug = vi.fn<(slug: string, wallUuid?: string) => Promise<ResolvedBoard | null>>(async () => ({
   slug: 'my-board',
   boardType: 'kilter',
   layoutId: 1,
@@ -57,8 +64,9 @@ vi.mock('@/app/lib/board-slug-utils', () => ({
   })),
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({
     board_name: 'kilter',
     layout_id: 1,
     size_id: 7,
@@ -75,10 +83,16 @@ vi.mock('@/app/lib/board-utils', () => ({
 }));
 
 vi.mock('server-only', () => ({}));
+vi.mock('@/app/lib/i18n/get-locale', () => ({ getLocale: async () => 'en-US' }));
+vi.mock('../spray-view', () => ({
+  default: () => null,
+  buildSprayViewMetadata: vi.fn(async () => ({ robots: { index: false, follow: true } })),
+}));
 
 vi.mock('@/app/lib/data/queries', () => ({
   getClimbStatsForAllAngles: vi.fn(async () => []),
   getClimb: vi.fn(async () => ({
+    uuid: 'test-climb',
     name: 'Test Climb',
     difficulty: 'V5',
     setter_username: 'setter',
@@ -94,6 +108,7 @@ vi.mock('@/app/lib/warm-overlay-cache', () => ({
 
 vi.mock('@/app/lib/url-utils', () => ({
   extractUuidFromSlug: vi.fn((value: string) => value),
+  constructBoardSlugViewUrl: vi.fn(() => '/b/my-board/40/view/test-climb'),
   // A1: the page now builds its canonical with the config-tuple builder rather
   // than interpolating a `/b/…` literal.
   buildCanonicalClimbViewUrl: vi.fn(
@@ -120,7 +135,7 @@ vi.mock('@/app/components/climb-front-door/climb-front-door', () => ({
   default: () => null,
 }));
 
-const pageModule = await import('../page');
+const pageModule = await import('@/app/(site)/b/[board_slug]/[angle]/view/[climb_uuid]/page');
 
 function getOpenGraphImageUrl(image: string | URL | { url: string | URL } | undefined) {
   if (!image) {
@@ -139,6 +154,51 @@ function getOpenGraphImageUrl(image: string | URL | { url: string | URL } | unde
 }
 
 describe('board slug climb metadata', () => {
+  it('keeps a public spray climb crawlable on its only canonical /b route', async () => {
+    const { buildSprayViewMetadata } = await import('../spray-view');
+    vi.mocked(buildSprayViewMetadata).mockResolvedValueOnce({ robots: { index: true, follow: true } });
+    resolveBoardBySlug.mockResolvedValueOnce({
+      slug: 'public-wall',
+      boardType: 'spray',
+      layoutId: 900,
+      sizeId: 1,
+      setIds: '',
+      isPublic: true,
+      isUnlisted: false,
+    });
+
+    const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
+      params: Promise.resolve({ board_slug: 'public-wall', angle: '40', climb_uuid: 'test-climb' }),
+    });
+
+    expect(metadata.robots).toEqual({ index: true, follow: true });
+    expect(buildSprayViewMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({
+        board: expect.objectContaining({ boardType: 'spray' }),
+      }),
+    );
+  });
+
+  it('inherits noindex from the unlisted parent gym', async () => {
+    resolveBoardBySlug.mockResolvedValueOnce({
+      slug: 'qa-board',
+      boardType: 'kilter',
+      layoutId: 1,
+      sizeId: 7,
+      setIds: '1,20',
+      isPublic: true,
+      isUnlisted: false,
+      gymIsListed: false,
+    });
+    const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
+      params: Promise.resolve({ board_slug: 'qa-board', angle: '40', climb_uuid: 'test-climb' }),
+    });
+    expect(metadata.robots).toEqual({ index: false, follow: true });
+    expect(metadata.alternates).toBeUndefined();
+  });
+
   it('keys the angle stats on the uuid the climb resolved to, not the alias in the URL', async () => {
     const { getClimb, getClimbStatsForAllAngles } = await import('@/app/lib/data/queries');
     vi.mocked(getClimb).mockResolvedValueOnce({
@@ -153,18 +213,23 @@ describe('board slug climb metadata', () => {
     vi.mocked(getClimbStatsForAllAngles).mockClear();
 
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({ board_slug: 'my-board', angle: '40', climb_uuid: 'alias-climb' }),
     });
 
-    // Not the noindex fallback: a throw inside generateMetadata would land
-    // there and could leave the stats call unmade for the wrong reason.
-    expect(metadata.robots).toBeUndefined();
+    // The canonical below distinguishes real metadata from the noindex fallback.
+    expect(metadata.robots).toEqual({ index: false, follow: true });
     expect(vi.mocked(getClimbStatsForAllAngles)).toHaveBeenCalledTimes(1);
     expect(vi.mocked(getClimbStatsForAllAngles)).toHaveBeenCalledWith('kilter', 'canonical-climb');
+    const expectedCanonical = '/kilter/kilter-board-original/12x12/bolt-ons/40/view/canonical-climb';
+    expect(metadata.alternates?.canonical).toBe(expectedCanonical);
+    expect(metadata.openGraph?.url).toBe(expectedCanonical);
+    expect(metadata.alternates?.languages).toBeUndefined();
   });
 
   it('uses the absolute backend OG image URL for social images', async () => {
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'my-board',
         angle: '40',
@@ -183,6 +248,7 @@ describe('board slug climb metadata', () => {
 
   it('emits explicit width and height on the OG image', async () => {
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'my-board',
         angle: '40',
@@ -194,10 +260,26 @@ describe('board slug climb metadata', () => {
     expect(image).toMatchObject({ width: 1200, height: 630 });
   });
 
+  it("presents a spray wall's ?wall= capability to the board lookup, from metadata and page alike", async () => {
+    // An unlisted wall has no row for an anonymous caller on the slug alone; the
+    // share link's uuid is what opens it, so it has to reach `boardBySlug`.
+    resolveBoardBySlug.mockClear();
+    const props = {
+      searchParams: Promise.resolve({ wall: 'wall-uuid-1' }),
+      params: Promise.resolve({ board_slug: 'my-board', angle: '40', climb_uuid: 'test-climb' }),
+    };
+    await pageModule.generateMetadata(props);
+    await pageModule.default(props).catch(() => undefined);
+
+    expect(resolveBoardBySlug).toHaveBeenNthCalledWith(1, 'my-board', 'wall-uuid-1');
+    expect(resolveBoardBySlug).toHaveBeenNthCalledWith(2, 'my-board', 'wall-uuid-1');
+  });
+
   it('marks the fallback metadata as noindex when board lookup fails', async () => {
     resolveBoardBySlug.mockResolvedValueOnce(null);
 
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'unknown',
         angle: '40',
@@ -224,6 +306,7 @@ describe('board slug climb metadata', () => {
     });
 
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'my-board',
         angle: '40',
@@ -233,7 +316,7 @@ describe('board slug climb metadata', () => {
 
     expect(metadata.robots).toEqual({ index: false, follow: true });
     expect(metadata.description).toContain('Test Climb');
-    // No canonical at all on a noindex page — see the A1 case below.
+    // Private boards omit the canonical; public aliases retain it below.
     expect(metadata.alternates).toBeUndefined();
   });
 
@@ -249,6 +332,7 @@ describe('board slug climb metadata', () => {
     });
 
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'my-board',
         angle: '40',
@@ -261,8 +345,9 @@ describe('board slug climb metadata', () => {
     expect(metadata.alternates).toBeUndefined();
   });
 
-  it('canonicalises a public, listed board INTO the config-tuple tree (A1)', async () => {
+  it('noindexes a public catalogue climb alias while keeping its catalogue canonical', async () => {
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'my-board',
         angle: '40',
@@ -275,7 +360,7 @@ describe('board slug climb metadata', () => {
       typeof canonical === 'object' && canonical && 'url' in canonical ? String(canonical.url) : String(canonical);
     expect(canonicalUrl).not.toContain('/b/my-board');
     expect(canonicalUrl).toContain('/40/view/test-climb');
-    expect(metadata.robots).toBeUndefined();
+    expect(metadata.robots).toEqual({ index: false, follow: true });
   });
 
   it('advertises no locale alternates, so the twins are not four indexable pages', async () => {
@@ -288,6 +373,7 @@ describe('board slug climb metadata', () => {
     // `app/__tests__/board-content-metadata-guard.test.ts`; this pins the
     // rendered output.
     const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'my-board',
         angle: '40',
@@ -300,5 +386,163 @@ describe('board slug climb metadata', () => {
     const canonicalUrl =
       typeof canonical === 'object' && canonical && 'url' in canonical ? String(canonical.url) : String(canonical);
     expect(canonicalUrl).not.toMatch(/^\/(es|fr|de)\//);
+  });
+});
+
+describe('climb search description', () => {
+  const METADATA_PROPS = {
+    searchParams: Promise.resolve({}),
+    params: Promise.resolve({ board_slug: 'my-board', angle: '40', climb_uuid: 'test-climb' }),
+  };
+  const LEAD = 'metadata.view.descriptionLead(climbName=Test Climb,grade=V5,layoutName=Kilter,angle=40,setter=setter)';
+  const CTA = 'metadata.view.descriptionCta';
+
+  function stats(overrides: Partial<ClimbStatsForAngle> = {}): ClimbStatsForAngle {
+    return {
+      angle: 40,
+      ascensionist_count: '12',
+      quality_average: '4.20',
+      difficulty_average: 20,
+      display_difficulty: 20,
+      fa_username: null,
+      fa_at: null,
+      difficulty: 'V5',
+      quality_normalized: true,
+      rating_count: '9',
+      ...overrides,
+    };
+  }
+
+  async function describeClimb(climbOverrides: Record<string, unknown>, angleStats: ClimbStatsForAngle[]) {
+    const { getClimb, getClimbStatsForAllAngles } = await import('@/app/lib/data/queries');
+    vi.mocked(getClimb).mockResolvedValueOnce({
+      uuid: 'test-climb',
+      name: 'Test Climb',
+      difficulty: 'V5',
+      setter_username: 'setter',
+      quality_average: 4,
+      ascensionist_count: 12,
+      frames: 'p1r12,p2r13',
+      ...climbOverrides,
+    } as unknown as Awaited<ReturnType<typeof getClimb>>);
+    vi.mocked(getClimbStatsForAllAngles).mockResolvedValueOnce(angleStats);
+    return (await pageModule.generateMetadata(METADATA_PROPS)).description;
+  }
+
+  it('states the rating only from the viewed angle when it is normalised', async () => {
+    expect(await describeClimb({}, [stats()])).toBe(
+      `${LEAD} metadata.view.descriptionSendsRated(count=12,ascents=12,quality=4.2) ${CTA}`,
+    );
+  });
+
+  it('never rates an unrated climb, even when the climb row carries a quality', async () => {
+    const description = await describeClimb({}, [stats({ quality_average: null, rating_count: '0' })]);
+    expect(description).toBe(`${LEAD} metadata.view.descriptionSends(count=12,ascents=12) ${CTA}`);
+  });
+
+  it('drops a rating still on the 1-3 scale', async () => {
+    const description = await describeClimb({}, [stats({ quality_average: '2.40', quality_normalized: false })]);
+    expect(description).toBe(`${LEAD} metadata.view.descriptionSends(count=12,ascents=12) ${CTA}`);
+  });
+
+  it('takes the rating from the viewed angle, not from another angle', async () => {
+    const description = await describeClimb({}, [stats({ angle: 25 })]);
+    expect(description).not.toContain('quality=');
+  });
+
+  it('drops the sends when there are none', async () => {
+    expect(await describeClimb({ ascensionist_count: 0 }, [])).toBe(`${LEAD} ${CTA}`);
+  });
+
+  it('drops the setter clause rather than crediting "Unknown Setter"', async () => {
+    const description = await describeClimb({ setter_username: '' }, []);
+    expect(description).toBe(
+      `metadata.view.descriptionLeadNoSetter(climbName=Test Climb,grade=V5,layoutName=Kilter,angle=40) metadata.view.descriptionSends(count=12,ascents=12) ${CTA}`,
+    );
+    expect(description).not.toContain('Unknown Setter');
+  });
+});
+
+describe('alias metadata visibility boundaries', () => {
+  it.each([
+    { isPublic: false, isUnlisted: false },
+    { isPublic: true, isUnlisted: true },
+  ])('keeps hidden saved-board metadata without canonical or OG URL: %j', async (visibility) => {
+    resolveBoardBySlug.mockResolvedValueOnce({
+      slug: 'private-board',
+      boardType: 'kilter',
+      layoutId: 1,
+      sizeId: 7,
+      setIds: '1,20',
+      ...visibility,
+    });
+    const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
+      params: Promise.resolve({ board_slug: 'private-board', angle: '40', climb_uuid: 'alias-climb' }),
+    });
+    expect(metadata.robots).toEqual({ index: false, follow: true });
+    expect(metadata.alternates).toBeUndefined();
+    expect(metadata.openGraph?.url).toBeUndefined();
+  });
+
+  it('keeps spray capability metadata on its separate branch', async () => {
+    const { getClimb } = await import('@/app/lib/data/queries');
+    const { buildSprayViewMetadata } = await import('../spray-view');
+    vi.mocked(getClimb).mockClear();
+    resolveBoardBySlug.mockResolvedValueOnce({
+      slug: 'spray-wall',
+      boardType: 'spray',
+      layoutId: 1,
+      sizeId: 7,
+      setIds: '',
+      isPublic: false,
+      isUnlisted: true,
+    });
+    await pageModule.generateMetadata({
+      searchParams: Promise.resolve({ wall: 'wall-capability' }),
+      params: Promise.resolve({ board_slug: 'spray-wall', angle: '40', climb_uuid: 'alias-climb' }),
+    });
+    expect(getClimb).not.toHaveBeenCalled();
+    expect(buildSprayViewMetadata).toHaveBeenCalledWith(
+      expect.objectContaining({
+        boardSlugParam: 'spray-wall',
+        wallParam: 'wall-capability',
+      }),
+    );
+  });
+});
+
+describe('climb titles and image descriptions', () => {
+  it.each([
+    ['', 'Campus crusher 1, Kilter climb at 40° | Boardsesh', 'Campus crusher 1 on kilter board'],
+    [null, 'Campus crusher 1, Kilter climb at 40° | Boardsesh', 'Campus crusher 1 on kilter board'],
+    [undefined, 'Campus crusher 1, Kilter climb at 40° | Boardsesh', 'Campus crusher 1 on kilter board'],
+    ['V5', 'Campus crusher 1, V5 Kilter climb at 40° | Boardsesh', 'Campus crusher 1 - V5 on kilter board'],
+  ])('renders clean page and social metadata for grade %s', async (difficulty, expectedTitle, expectedAlt) => {
+    const instance = createInstance();
+    await instance.init({
+      lng: 'en-US',
+      fallbackLng: false,
+      ns: ['climbs'],
+      defaultNS: 'climbs',
+      resources: { 'en-US': { climbs: enClimbs } },
+      interpolation: { escapeValue: false },
+    });
+    vi.mocked(getServerTranslation).mockResolvedValueOnce({ t: instance.t, i18n: instance, locale: 'en-US' });
+    const currentClimb = await getClimb({} as Parameters<typeof getClimb>[0]);
+    vi.mocked(getClimb).mockResolvedValueOnce({
+      ...currentClimb,
+      name: 'Campus crusher 1',
+      difficulty,
+    } as unknown as Awaited<ReturnType<typeof getClimb>>);
+    const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
+      params: Promise.resolve({ board_slug: 'my-board', angle: '40', climb_uuid: 'test-climb' }),
+    });
+
+    expect(metadata.title).toEqual({ absolute: expectedTitle });
+    expect(metadata.openGraph?.title).toBe(expectedTitle);
+    expect(metadata.twitter?.title).toBe(expectedTitle);
+    expect(metadata.openGraph?.images).toEqual([expect.objectContaining({ alt: expectedAlt })]);
   });
 });

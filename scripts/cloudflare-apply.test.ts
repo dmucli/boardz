@@ -4,8 +4,13 @@ import { readFileSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { diffR2Bucket, r2CorsHasUnmanagedRules } from '../infra/cloudflare/plan';
+import { API_HOSTNAME as BACKEND_API_HOSTNAME } from '../packages/backend/src/handlers/api-host';
 import { CloudflareApiRequestError, isAuthorizationError } from './cloudflare-apply';
 import {
+  API_HOSTNAME,
+  API_RAILWAY_CNAME_TARGET,
+  API_RAILWAY_VERIFY_HOSTNAME,
+  API_RAILWAY_VERIFY_VALUE,
   APEX_HOSTNAME,
   APEX_ORIGINLESS_ADDRESS,
   APEX_REDIRECT_RULE_DESCRIPTION,
@@ -13,6 +18,12 @@ import {
   ASSETS_HOSTNAME,
   ASSETS_STAGING_HOSTNAME,
   SNAPSHOTS_HOSTNAME,
+  OTA_ASSETS_HOSTNAME,
+  OTA_ASSETS_CACHE_RULE_DESCRIPTION,
+  OTA_ASSETS_COMPRESSION_RULE_DESCRIPTION,
+  COMPRESSION_RULE_PHASE,
+  CACHE_RULE_PHASE,
+  USER_EXPORT_LIFECYCLE_RULE,
   desiredR2Buckets,
   BACKEND_BOARD_RENDER_CACHE_RULE_DESCRIPTION,
   BOARD_CONTENT_CHALLENGE_RULE_DESCRIPTION,
@@ -20,6 +31,7 @@ import {
   AUTOMATION_DEFAULT_DENY_RULE_DESCRIPTION,
   CACHE_RULE_DESCRIPTION,
   CRAWLER_ALLOW_RULE_DESCRIPTION,
+  PERPLEXITY_PUBLIC_GUIDES_RULE_DESCRIPTION,
   CRAWLER_ALLOW_TOKENS,
   CRAWLER_BLOCK_RULE_DESCRIPTION,
   CRAWLER_BLOCK_TOKENS,
@@ -29,17 +41,29 @@ import {
   DR_PRIMARY_HOSTNAME,
   DYNAMIC_REDIRECT_RULE_PHASE,
   LIST_PAGE_PATH_SUFFIX,
+  OBSERVE_COUNTRY_HEADER_EXPRESSION,
+  OBSERVE_COUNTRY_HEADER_NAME,
+  OBSERVE_COUNTRY_HEADER_RULE_DESCRIPTION,
   RATE_LIMIT_RULE_PHASE,
+  REQUEST_HEADER_RULE_PHASE,
   RSC_QUERY_PARAM,
   RSC_REQUEST_HEADER_NAME,
   SESSION_COOKIE_NAME_SUBSTRING,
+  FIRST_PARTY_SESSION_COOKIE_NAME_SUBSTRINGS,
+  WWW_API_PATH_PREFIX,
+  BOARD_RENDER_CACHE_EXPRESSION,
+  SPRAY_WALL_CAPABILITY_QUERY,
+  BOARD_INVITE_QUERY,
   WWW_HOSTNAME,
   WWW_HTML_CACHE_EXCLUDED_BOARDS,
   WWW_HTML_CACHE_LOCALE_PREFIXES,
   WWW_HTML_CACHE_ROOT_SEGMENTS,
   WWW_HTML_CACHE_RULE_DESCRIPTION,
+  WWW_MARKETING_HTML_CACHE_RULE_DESCRIPTION,
+  WWW_MARKETING_HTML_CACHE_EXPRESSION,
   WWW_RAILWAY_CNAME_TARGET,
   WS_HOSTNAME,
+  UPDATES_HOSTNAME,
   buildWwwHtmlCachePathPrefixes,
   desiredCloudflareState,
 } from '../infra/cloudflare/config';
@@ -49,6 +73,7 @@ import type {
   FullyManagedDnsRecordDesired,
   R2BucketDesired,
   R2Cors,
+  R2LifecycleRule,
 } from '../infra/cloudflare/config';
 import {
   MANAGED_RULE_PHASES,
@@ -62,7 +87,7 @@ import {
   resolveRulePhase,
   upsertCacheRule,
 } from '../infra/cloudflare/plan';
-import type { LiveDnsRecord, LiveState, RulesetRule } from '../infra/cloudflare/plan';
+import type { LiveDnsRecord, LiveState, ManagedRulePhase, RulesetRule } from '../infra/cloudflare/plan';
 import {
   MANAGED_DNS_RECORD_TYPES,
   SHARED_TOKEN_SCOPES,
@@ -88,9 +113,20 @@ function requiredFullyManagedDnsRecord(name: string): FullyManagedDnsRecordDesir
 }
 
 const wsDnsRecord = requiredDnsRecord(WS_HOSTNAME);
-const assetsDnsRecord = requiredFullyManagedDnsRecord(ASSETS_HOSTNAME);
+// Historical Tigris fixture still exercises generic DNS convergence.
+const assetsDnsRecord: FullyManagedDnsRecordDesired = {
+  management: 'full',
+  name: ASSETS_HOSTNAME,
+  type: 'CNAME',
+  content: ASSETS_CNAME_TARGET,
+  ttl: 1,
+  proxied: false,
+  settings: { flatten_cname: false },
+};
 const wwwDnsRecord = requiredFullyManagedDnsRecord(WWW_HOSTNAME);
 const apexDnsRecord = requiredFullyManagedDnsRecord(APEX_HOSTNAME);
+const apiDnsRecord = requiredFullyManagedDnsRecord(API_HOSTNAME);
+const apiVerifyDnsRecord = requiredFullyManagedDnsRecord(API_RAILWAY_VERIFY_HOSTNAME);
 const drPrimaryDnsRecord = requiredFullyManagedDnsRecord(DR_PRIMARY_HOSTNAME);
 /** The og cache rule — the one the pre-existing cases in this file were written against. */
 const ogCacheRule = desired.cacheRules[0];
@@ -116,6 +152,31 @@ function liveWwwDnsRecord(overrides: Partial<LiveDnsRecord> = {}): LiveDnsRecord
     content: wwwDnsRecord.content,
     ttl: wwwDnsRecord.ttl,
     proxied: wwwDnsRecord.proxied,
+    ...overrides,
+  };
+}
+
+/** Railway's ownership proof as Cloudflare returns it: the value wrapped in double quotes. */
+function liveApiVerifyDnsRecord(overrides: Partial<LiveDnsRecord> = {}): LiveDnsRecord {
+  return {
+    id: 'api-verify-dns-record-id',
+    name: API_RAILWAY_VERIFY_HOSTNAME,
+    type: 'TXT',
+    content: `"${API_RAILWAY_VERIFY_VALUE}"`,
+    ttl: 1,
+    proxied: false,
+    ...overrides,
+  };
+}
+
+function liveApiDnsRecord(overrides: Partial<LiveDnsRecord> = {}): LiveDnsRecord {
+  return {
+    id: 'api-dns-record-id',
+    name: API_HOSTNAME,
+    type: apiDnsRecord.type,
+    content: apiDnsRecord.content,
+    ttl: apiDnsRecord.ttl,
+    proxied: apiDnsRecord.proxied,
     ...overrides,
   };
 }
@@ -251,6 +312,8 @@ function inSyncDnsRecords(): LiveState['dnsRecords'] {
     [wsDnsRecord.name]: liveDnsRecord(),
     [assetsDnsRecord.name]: liveAssetsDnsRecord(),
     [wwwDnsRecord.name]: liveWwwDnsRecord(),
+    [apiDnsRecord.name]: liveApiDnsRecord(),
+    [apiVerifyDnsRecord.name]: liveApiVerifyDnsRecord(),
     [apexDnsRecord.name]: liveApexDnsRecord(),
     [drPrimaryDnsRecord.name]: liveDrPrimaryDnsRecord(),
   };
@@ -522,16 +585,16 @@ describe('buildPlan', () => {
       dnsRecords: {
         ...inSyncDnsRecords(),
         [wsDnsRecord.name]: liveDnsRecord({ proxied: false }),
-        [assetsDnsRecord.name]: null,
+        [drPrimaryDnsRecord.name]: null,
       },
       sslMode: 'full',
     };
     const changes = buildPlan(desired, drifted, { allowZoneSsl: false });
     const dnsChanges = changes.filter((change) => change.resource === 'dns');
 
-    expect(dnsChanges.map((change) => change.dnsName)).toEqual([WS_HOSTNAME, ASSETS_HOSTNAME]);
+    expect(dnsChanges.map((change) => change.dnsName)).toEqual([WS_HOSTNAME, DR_PRIMARY_HOSTNAME]);
     expect(dnsChanges.find((change) => change.dnsName === WS_HOSTNAME)?.blocked).toBe(true);
-    expect(dnsChanges.find((change) => change.dnsName === ASSETS_HOSTNAME)?.blocked).toBeUndefined();
+    expect(dnsChanges.find((change) => change.dnsName === DR_PRIMARY_HOSTNAME)?.blocked).toBeUndefined();
   });
 
   it('fails closed when zone-wide flattening would hide the Tigris verification CNAME', () => {
@@ -557,8 +620,23 @@ describe('pgdr.boardsesh.com desired state', () => {
   });
 });
 
-describe('assets.boardsesh.com desired state', () => {
-  it('declares the exact DNS-only Tigris CNAME with automatic TTL', () => {
+describe('assets.boardsesh.com routing and historical generic DNS fixture', () => {
+  it('leaves live asset DNS to R2 even if the legacy record drifts', () => {
+    expect(desired.dnsRecords.some((record) => record.name === ASSETS_HOSTNAME)).toBe(false);
+    const drifted = {
+      ...inSyncLiveState(),
+      dnsRecords: {
+        ...inSyncDnsRecords(),
+        [ASSETS_HOSTNAME]: liveAssetsDnsRecord({ content: 'old.example.com', proxied: false }),
+      },
+    };
+    expect(
+      buildPlan(desired, drifted, { allowZoneSsl: false }).some(
+        (change) => change.resource === 'dns' && change.dnsName === ASSETS_HOSTNAME,
+      ),
+    ).toBe(false);
+  });
+  it('retains the DNS-only Tigris generic convergence fixture with automatic TTL', () => {
     expect(assetsDnsRecord).toEqual({
       management: 'full',
       name: 'assets.boardsesh.com',
@@ -597,6 +675,7 @@ describe('assets.boardsesh.com desired state', () => {
     // starts resolving to R2.
     const assetsRule = desired.cacheRules.find((rule) => rule.expression.includes(ASSETS_HOSTNAME));
     expect(assetsRule?.action_parameters.cache).toBe(true);
+    expect(assetsRule?.expression).toContain('starts_with(http.request.uri.path, "/_next/static/")');
     expect(assetsRule?.action_parameters.edge_ttl?.mode).toBe('bypass_by_default');
     expect(assetsRule?.action_parameters.browser_ttl?.mode).toBe('respect_origin');
   });
@@ -616,6 +695,94 @@ describe('assets.boardsesh.com desired state', () => {
       value: '*',
     });
     expect(corsRule?.enabled).toBe(true);
+  });
+});
+
+describe('api.boardsesh.com (#6981)', () => {
+  it('names the host the backend filter guards', () => {
+    expect(API_HOSTNAME).toBe('api.boardsesh.com');
+    expect(API_HOSTNAME).toBe(BACKEND_API_HOSTNAME);
+  });
+
+  it('is a fully managed proxied CNAME to the Railway backend service', () => {
+    expect(apiDnsRecord).toEqual({
+      management: 'full',
+      name: API_HOSTNAME,
+      type: 'CNAME',
+      content: API_RAILWAY_CNAME_TARGET,
+      ttl: 1,
+      proxied: true,
+    });
+    expect(apiDnsRecord.content).toMatch(/\.up\.railway\.app$/);
+    expect('settings' in fullyManagedDnsBody(apiDnsRecord)).toBe(false);
+  });
+
+  it('is created when absent and is zero drift once live matches', () => {
+    const { [API_HOSTNAME]: _absent, ...withoutApi } = inSyncDnsRecords();
+    const plan = buildPlan(desired, { ...inSyncLiveState(), dnsRecords: withoutApi }, { allowZoneSsl: false });
+    expect(plan.map((change) => change.dnsName)).toEqual([API_HOSTNAME]);
+
+    expect(diffDnsRecord(apiDnsRecord, liveApiDnsRecord())).toBeNull();
+  });
+
+  it('declares the Railway ownership proof as a DNS-only TXT record, ahead of the CNAME', () => {
+    expect(apiVerifyDnsRecord).toEqual({
+      management: 'full',
+      name: '_railway-verify.api.boardsesh.com',
+      type: 'TXT',
+      content: API_RAILWAY_VERIFY_VALUE,
+      ttl: 1,
+      proxied: false,
+    });
+    const names = desired.dnsRecords.map((record) => record.name);
+    expect(names.indexOf(API_RAILWAY_VERIFY_HOSTNAME)).toBeLessThan(names.indexOf(API_HOSTNAME));
+  });
+
+  it('sends the proof quoted, and reads the quoted live value as in sync', () => {
+    expect(fullyManagedDnsBody(apiVerifyDnsRecord).content).toBe(`"${API_RAILWAY_VERIFY_VALUE}"`);
+    // A record added by hand in the dashboard comes back quoted; a bare one must match too.
+    expect(diffDnsRecord(apiVerifyDnsRecord, liveApiVerifyDnsRecord())).toBeNull();
+    expect(diffDnsRecord(apiVerifyDnsRecord, liveApiVerifyDnsRecord({ content: API_RAILWAY_VERIFY_VALUE }))).toBeNull();
+    expect(
+      diffDnsRecord(apiVerifyDnsRecord, liveApiVerifyDnsRecord({ content: '"railway-verify=stale"' }))?.detail,
+    ).toContain('content railway-verify=stale');
+  });
+
+  it('is not named by any managed rule', () => {
+    const phases: readonly ManagedRulePhase[] = MANAGED_RULE_PHASES;
+    const managedRules = phases.flatMap((phase) => phase.selectDesired(desired));
+    expect(managedRules.filter((rule) => rule.expression.includes(API_HOSTNAME))).toEqual([]);
+  });
+
+  it('is not a bucket domain', () => {
+    expect(desiredR2Buckets.filter((bucket) => bucket.customDomain === API_HOSTNAME)).toEqual([]);
+  });
+});
+
+describe('Observe country request header', () => {
+  const countryRule = desired.requestHeaderRules.find(
+    (rule) => rule.description === OBSERVE_COUNTRY_HEADER_RULE_DESCRIPTION,
+  );
+
+  it('sets the origin header from Cloudflare country data only on the OTA host', () => {
+    expect(countryRule).toEqual({
+      description: OBSERVE_COUNTRY_HEADER_RULE_DESCRIPTION,
+      expression: OBSERVE_COUNTRY_HEADER_EXPRESSION,
+      action: 'rewrite',
+      action_parameters: {
+        headers: {
+          [OBSERVE_COUNTRY_HEADER_NAME]: { operation: 'set', expression: 'ip.src.country' },
+        },
+      },
+      enabled: true,
+    });
+    expect(countryRule?.expression).toBe(`http.host eq "${UPDATES_HOSTNAME}"`);
+  });
+
+  it('uses the Cloudflare request-header transform phase', () => {
+    expect(MANAGED_RULE_PHASES.find((phase) => phase.resource === 'request-header-rule')?.phase).toBe(
+      REQUEST_HEADER_RULE_PHASE,
+    );
   });
 });
 
@@ -699,7 +866,9 @@ describe('www.boardsesh.com under Cloudflare management (#4655)', () => {
       wafRules: [],
       rateLimitRules: [],
       redirectRules: [],
+      requestHeaderRules: [],
       responseHeaderRules: [],
+      compressionRules: [],
       ssl: desired.ssl,
     };
     const flattenedZone: LiveState = {
@@ -743,6 +912,15 @@ describe('selectManagedDnsRecord', () => {
     expect(() =>
       selectManagedDnsRecord([recordAt('A', '203.0.113.1'), recordAt('AAAA', '2001:db8::1')], WWW_HOSTNAME),
     ).toThrow('ambiguous');
+  });
+
+  it('matches only TXT records for a desired TXT, and refuses two of them', () => {
+    const records = [recordAt('TXT', '"railway-verify=abc"'), recordAt('CNAME', 'cname.vercel-dns.com')];
+    expect(selectManagedDnsRecord(records, WWW_HOSTNAME, 'TXT')?.type).toBe('TXT');
+    expect(selectManagedDnsRecord([recordAt('CNAME', 'cname.vercel-dns.com')], WWW_HOSTNAME, 'TXT')).toBeNull();
+    expect(() => selectManagedDnsRecord([recordAt('TXT', '"a"'), recordAt('TXT', '"b"')], WWW_HOSTNAME, 'TXT')).toThrow(
+      'ambiguous',
+    );
   });
 
   it('ignores a different name, and reports absence as null', () => {
@@ -873,10 +1051,9 @@ describe('www cost-control rules (#4650)', () => {
   it('matches the scrapers it is meant to block', () => {
     const blockedUserAgents = [
       'Mozilla/5.0 (compatible; GPTBot/1.4; +https://openai.com/gptbot)',
-      'Mozilla/5.0 (compatible; Claude-SearchBot/1.0; +searchbot@anthropic.com)',
-      'Mozilla/5.0 (compatible; Amzn-SearchBot/0.1)',
-      'OAI-SearchBot/1.0',
-      'PerplexityBot/1.0',
+      'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)',
+      'Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)',
+      'CCBot/2.0 (https://commoncrawl.org/faq/)',
       'Mozilla/5.0 (compatible; AhrefsBot/7.0; +http://ahrefs.com/robot/)',
       'Mozilla/5.0 (compatible; SemrushBot/7~bl; +http://www.semrush.com/bot.html)',
       'Mozilla/5.0 (compatible; DataForSeoBot/1.0; +https://dataforseo.com/dataforseo-bot)',
@@ -1096,6 +1273,17 @@ describe('automation default-deny (allow-list model)', () => {
       'Mozilla/5.0 (Phone; OpenHarmony 5.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36 ArkWeb/4.1.6.1 Mobile HuaweiBrowser/5.0.4.300',
     ],
     ['Samsung Pass', 'SamsungPass (Android; Samsung Electronics)'],
+    // AI search crawlers, allowed since 2026-11-24: they cite pages with a link.
+    [
+      'OAI-SearchBot',
+      'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot',
+    ],
+    ['Claude-SearchBot', 'Mozilla/5.0 (compatible; Claude-SearchBot/1.0; +searchbot@anthropic.com)'],
+    [
+      'PerplexityBot',
+      'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)',
+    ],
+    ['Amzn-SearchBot', 'Mozilla/5.0 (compatible; Amzn-SearchBot/0.1)'],
     // In-app and OEM browsers whose UAs carry app or device tokens a bare
     // `bot` or `python` could collide with. None of these do today.
     [
@@ -1132,6 +1320,7 @@ describe('automation default-deny (allow-list model)', () => {
     ['empty UA', ''],
     ['production smoke', 'boardsesh-production-smoke/1.0'],
     ['ESP32 board controller (thumbnail fetch)', 'ESP32HTTPClient'],
+    ['LZRvision laser projector (websocket upgrade)', 'lzrvision-projector/1.0 Python/3.12 websockets/13.1'],
     [
       'Snapchat unfurler',
       'Mozilla/5.0 (compatible; Snap URL Preview Service; bot; snapchat; https://developers.snap.com/robots)',
@@ -1231,11 +1420,32 @@ describe('automation default-deny (allow-list model)', () => {
   it('leaves health, .well-known and the API surfaces alone', () => {
     // mobile-ota-production.yml polls ws /health with bare curl while it waits
     // for the backend; a 403 there would stall every OTA publish.
-    for (const path of ['/health', '/health/db', '/api/health', '/robots.txt']) {
+    const localeSegments = ['es', 'fr', 'de', 'it'];
+    for (const path of [
+      '/health',
+      '/health/db',
+      '/api/health',
+      '/robots.txt',
+      '/developers',
+      ...localeSegments.map((localeSegment) => `/${localeSegment}/developers`),
+    ]) {
       expect(defaultDenyRule.expression).toContain(`http.request.uri.path eq "${path}"`);
       expect(isBlockedCrawler('curl/8.9.1', { method: 'GET', pathname: path })).toBe(false);
     }
-    for (const prefix of ['/.well-known/', '/api/v1/', '/v1/partner/']) {
+    for (const prefix of [
+      '/.well-known/',
+      '/api/v1/',
+      '/v1/',
+      '/api/auth/oauth2/',
+      '/oauth/',
+      '/developers/',
+      '/auth/login',
+      ...localeSegments.flatMap((localeSegment) => [
+        `/${localeSegment}/oauth/`,
+        `/${localeSegment}/developers/`,
+        `/${localeSegment}/auth/login`,
+      ]),
+    ]) {
       expect(defaultDenyRule.expression).toContain(`starts_with(http.request.uri.path, "${prefix}")`);
       expect(isBlockedCrawler('Go-http-client/1.1', { method: 'GET', pathname: `${prefix}x` })).toBe(false);
     }
@@ -1256,6 +1466,10 @@ describe('automation default-deny (allow-list model)', () => {
     expect(rules.indexOf(challengeRule)).toBe(rules.length - 1);
   });
 
+  it('stays inside the 4096-character ruleset expression limit', () => {
+    expect(defaultDenyRule.expression.length).toBeLessThan(4096);
+  });
+
   it('balances its parentheses', () => {
     const opens = defaultDenyRule.expression.split('(').length - 1;
     const closes = defaultDenyRule.expression.split(')').length - 1;
@@ -1273,6 +1487,70 @@ describe('automation default-deny (allow-list model)', () => {
         expect(appUserAgent.toLowerCase()).not.toContain(token);
       }
     }
+  });
+});
+
+describe('Perplexity public-guide bot exception (#8122)', () => {
+  const exception = desired.wafRules.find((rule) => rule.description === PERPLEXITY_PUBLIC_GUIDES_RULE_DESCRIPTION)!;
+  // Parse only the shipped expression's deliberately small grammar, rather than
+  // trusting a second copy of the config's path list to decide what matches.
+  const expressionParts = exception.expression.match(
+    /^\(http\.request\.method eq "([^"]+)" and http\.host eq "([^"]+)" and lower\(http\.user_agent\) contains "([^"]+)" and http\.request\.uri\.path in \{((?:"[^"]+" ?)+)\}\)$/,
+  );
+  if (!expressionParts) throw new Error('Unexpected public-guide exception grammar');
+  const [, allowedMethod, allowedHost, agentToken, pathSet] = expressionParts;
+  const allowedPaths = [...pathSet.matchAll(/"([^"]+)"/g)].map(([, path]) => path);
+  const matches = (path: string, method = 'GET', host = 'www.boardsesh.com', agent = 'PerplexityBot') =>
+    method === allowedMethod &&
+    host === allowedHost &&
+    agent.toLowerCase().includes(agentToken) &&
+    allowedPaths.includes(path);
+
+  it.each([
+    '/',
+    '/boards',
+    '/apps',
+    '/apps/kilter',
+    '/apps/aurora',
+    '/apps/moonboard',
+    '/apps/woods',
+    '/compare/spray-wall-apps',
+    '/sitemap.xml',
+    '/sitemaps/app-guides.xml',
+    '/robots.txt',
+  ])('exempts the public rollout document %s', (path) => {
+    expect(matches(path)).toBe(true);
+    expect(matches(path, 'GET', 'www.boardsesh.com', 'Mozilla/5.0 (compatible; perplexitybot/1.0)')).toBe(true);
+  });
+
+  it.each([
+    '/api/auth/session',
+    '/auth/login',
+    '/settings',
+    '/apps/kilter/private',
+    '/apps/other',
+    '/sitemaps/climbs/1.xml.gz',
+    '/b/kilter/40/view/climb-id',
+  ])('retains bot protection outside the rollout document %s', (path) => {
+    expect(matches(path)).toBe(false);
+  });
+
+  it('does not exempt writes, backend hosts, other crawlers or ordinary browsers', () => {
+    expect(matches('/apps/kilter', 'POST')).toBe(false);
+    expect(matches('/apps/kilter', 'HEAD')).toBe(false);
+    expect(matches('/apps/kilter', 'GET', 'ws.boardsesh.com')).toBe(false);
+    for (const agent of ['GPTBot', 'ClaudeBot', 'Amzn-SearchBot', 'Mozilla/5.0']) {
+      expect(matches('/apps/kilter', 'GET', 'www.boardsesh.com', agent)).toBe(false);
+    }
+  });
+
+  it('skips only bot protections before the general allow rule can bypass it', () => {
+    expect(exception.action).toBe('skip');
+    expect(exception.action_parameters).toEqual({ phases: ['http_request_sbfm'] });
+    expect(exception.enabled).toBe(true);
+    const allowIndex = desired.wafRules.findIndex((rule) => rule.description === CRAWLER_ALLOW_RULE_DESCRIPTION);
+    expect(desired.wafRules.indexOf(exception)).toBeLessThan(allowIndex);
+    expect(desired.wafRules.length).toBeLessThanOrEqual(5);
   });
 });
 
@@ -1296,6 +1574,7 @@ describe('managed rule ordering and foreign-rule safety', () => {
 
     expect(changed).toBe(true);
     expect(rules.map((rule) => rule.description)).toEqual([
+      PERPLEXITY_PUBLIC_GUIDES_RULE_DESCRIPTION,
       CRAWLER_ALLOW_RULE_DESCRIPTION,
       CRAWLER_BLOCK_RULE_DESCRIPTION,
       AUTOMATION_DEFAULT_DENY_RULE_DESCRIPTION,
@@ -1305,7 +1584,7 @@ describe('managed rule ordering and foreign-rule safety', () => {
     ]);
     // The pre-existing rule keeps its Cloudflare-assigned id rather than being
     // recreated, so its analytics and history survive.
-    expect(rules[1].id).toBe(`${CRAWLER_BLOCK_RULE_DESCRIPTION}-id`);
+    expect(rules[2].id).toBe(`${CRAWLER_BLOCK_RULE_DESCRIPTION}-id`);
   });
 
   it('reports an out-of-order group as drift even when each rule matches', () => {
@@ -1431,15 +1710,16 @@ describe('token scope guidance', () => {
   // reading the same Production-environment CLOUDFLARE_API_TOKEN.
   it('names every zone permission the tool calls', () => {
     // One entry per request, reads included: a token missing a read scope fails
-    // just as hard as one missing a write. Zone.WAF Edit went missing from this
+    // just as hard as one missing a write. Zone.Zone WAF Edit went missing from this
     // list once while the crawler rules depended on it, so a partially-converged
     // zone was the failure mode rather than a clean error.
     const printed = TOKEN_SCOPES.join('\n');
     expect(printed).toContain('Zone.Zone Read'); // GET /zones?name= (resolve the zone id)
-    expect(printed).toContain('Zone.DNS Edit'); // PATCH ws; create/update the assets CNAME
+    expect(printed).toContain('Zone.DNS Edit'); // PATCH ws; manage apex and DR records
     expect(printed).toContain('Zone.Cache Rules Edit'); // PUT the cache-settings phase
-    expect(printed).toContain('Zone.WAF Edit'); // PUT the firewall-custom phase
-    expect(printed).toContain('Zone.Rate Limit Edit'); // PUT the http_ratelimit phase
+    expect(printed).toContain('Zone.Zone WAF Edit'); // PUT firewall-custom and http_ratelimit phases
+    expect(printed).toContain('http_request_firewall_custom and http_ratelimit phases');
+    expect(printed).not.toContain('Zone.Rate Limit Edit');
     expect(printed).toContain('Zone.Zone Settings Read'); // GET /settings/ssl
     expect(printed).toContain('Zone.Zone Settings Edit'); // PATCH /settings/ssl
   });
@@ -1760,7 +2040,8 @@ describe('apex → www redirect (#4655)', () => {
   it('names the Cloudflare permission the phase needs', () => {
     // Without it, deploy-cloudflare 403s on THIS phase only: the cache, WAF and
     // rate-limit phases apply and the zone is left half-converged.
-    expect(TOKEN_SCOPES.join('\n')).toContain('Zone.Dynamic Redirect Edit');
+    expect(TOKEN_SCOPES.join('\n')).toContain('Zone.Single Redirect Edit');
+    expect(TOKEN_SCOPES.join('\n')).not.toContain('Zone.Dynamic Redirect Edit');
   });
 });
 
@@ -1792,6 +2073,8 @@ describe('the apply loop, driven end to end against a stubbed Cloudflare API', (
       [WS_HOSTNAME]: [liveDnsRecord()],
       [ASSETS_HOSTNAME]: [liveAssetsDnsRecord()],
       [WWW_HOSTNAME]: [liveWwwDnsRecord()],
+      [API_HOSTNAME]: [liveApiDnsRecord()],
+      [API_RAILWAY_VERIFY_HOSTNAME]: [liveApiVerifyDnsRecord()],
       [DR_PRIMARY_HOSTNAME]: [liveDrPrimaryDnsRecord()],
       // The apex carries the mail and verification records every zone has.
       // Cloudflare returns them from the same by-name lookup, and they must not
@@ -1806,7 +2089,11 @@ describe('the apply loop, driven end to end against a stubbed Cloudflare API', (
   }
 
   /** Stub the API with every managed phase EMPTY, so all of them are drift. */
-  function stubCloudflareApi(dnsByName: Record<string, LiveDnsRecord[]>): RecordedRequest[] {
+  function stubCloudflareApi(
+    dnsByName: Record<string, LiveDnsRecord[]>,
+    readLifecycleRules: (bucketName: string) => unknown = () => [],
+    readCustomDomains: (bucketName: string) => { domain: string; enabled: boolean }[] = () => [],
+  ): RecordedRequest[] {
     const requests: RecordedRequest[] = [];
     const envelope = (result: unknown) =>
       new Response(JSON.stringify({ success: true, errors: [], messages: [], result }), { status: 200 });
@@ -1832,7 +2119,10 @@ describe('the apply loop, driven end to end against a stubbed Cloudflare API', (
       if (url.pathname.endsWith('/r2/buckets')) {
         return envelope({ buckets: desiredR2Buckets.map((bucket) => ({ name: bucket.name })) });
       }
-      if (url.pathname.endsWith('/domains/custom')) return envelope({ domains: [] });
+      if (url.pathname.endsWith('/domains/custom')) {
+        const bucketName = decodeURIComponent(url.pathname.split('/').at(-3)!);
+        return envelope({ domains: method === 'GET' ? readCustomDomains(bucketName) : [] });
+      }
       if (url.pathname.endsWith('/domains/managed')) {
         if (method === 'GET') return envelope({ bucketId: 'bucket-id', domain: 'example.r2.dev', enabled: true });
         return envelope({ bucketId: 'bucket-id', domain: 'example.r2.dev', enabled: false });
@@ -1845,6 +2135,10 @@ describe('the apply loop, driven end to end against a stubbed Cloudflare API', (
           });
         }
         return envelope({});
+      }
+      if (url.pathname.endsWith('/lifecycle')) {
+        const bucketName = decodeURIComponent(url.pathname.split('/').at(-2)!);
+        return envelope({ rules: method === 'GET' ? readLifecycleRules(bucketName) : [] });
       }
       throw new Error(`Unstubbed Cloudflare request: ${method} ${url.pathname}`);
     });
@@ -1877,6 +2171,31 @@ describe('the apply loop, driven end to end against a stubbed Cloudflare API', (
     expect(written).toHaveLength(MANAGED_RULE_PHASES.length);
   });
 
+  it.each([
+    ['the compression phase', COMPRESSION_RULE_PHASE],
+    ['a long-standing phase', CACHE_RULE_PHASE],
+  ])('fails the run when %s refuses its write', async (_label, refusedPhase) => {
+    // No phase is optional any more, so a refused write is a lost scope and must
+    // stop the deploy. The skip-and-warn path in the apply loop only applies to
+    // a phase the registry marks optional while its scope is being rolled out.
+    stubCloudflareApi(dnsResponses(liveApexDnsRecord()));
+    const stubbedFetch = globalThis.fetch as unknown as (
+      input: string,
+      init?: { method?: string; body?: string },
+    ) => Response;
+    vi.stubGlobal('fetch', (input: string, init?: { method?: string; body?: string }) => {
+      if (init?.method === 'PUT' && new URL(input).pathname === phaseEntrypoint(refusedPhase)) {
+        return new Response(
+          JSON.stringify({ success: false, errors: [{ code: 10_000, message: 'Authentication error' }] }),
+          { status: 403 },
+        );
+      }
+      return stubbedFetch(input, init);
+    });
+
+    await expect(runCloudflareApply(['--apply'])).rejects.toThrow();
+  });
+
   it('converges each R2 bucket once, however many attributes drifted', async () => {
     const requests = stubCloudflareApi(dnsResponses(liveApexDnsRecord()));
     vi.stubEnv('CLOUDFLARE_ACCOUNT_ID', 'account-1');
@@ -1888,7 +2207,7 @@ describe('the apply loop, driven end to end against a stubbed Cloudflare API', (
     );
     const assetsAttaches = attaches.filter((request) => request.pathname.includes('/boardsesh-static-assets/'));
     expect(assetsAttaches).toHaveLength(1);
-    expect(assetsAttaches[0].body).toMatchObject({ domain: ASSETS_STAGING_HOSTNAME });
+    expect(assetsAttaches[0].body).toMatchObject({ domain: ASSETS_HOSTNAME });
     const publicBuckets = desiredR2Buckets.filter((bucket) => bucket.customDomain !== null);
     expect(attaches).toHaveLength(publicBuckets.length);
 
@@ -1908,6 +2227,104 @@ describe('the apply loop, driven end to end against a stubbed Cloudflare API', (
     expect(assetChangeLogs.filter((message) => message.startsWith('[cf-apply] applied:'))).toHaveLength(1);
     expect(assetChangeLogs.filter((message) => message.startsWith('[cf-apply] skipped:'))).toHaveLength(2);
   });
+
+  it('attaches live assets while retaining the existing staging custom domain', async () => {
+    const requests = stubCloudflareApi(
+      dnsResponses(liveApexDnsRecord()),
+      () => [],
+      (bucketName) =>
+        bucketName === 'boardsesh-static-assets' ? [{ domain: ASSETS_STAGING_HOSTNAME, enabled: true }] : [],
+    );
+    vi.stubEnv('CLOUDFLARE_ACCOUNT_ID', 'account-1');
+
+    expect(await runCloudflareApply(['--apply'])).toBe(0);
+
+    const assetsCustomDomainPath = '/client/v4/accounts/account-1/r2/buckets/boardsesh-static-assets/domains/custom';
+    const domainMutations = requests.filter(
+      (request) => request.pathname.startsWith(assetsCustomDomainPath) && request.method !== 'GET',
+    );
+    expect(domainMutations).toEqual([
+      {
+        method: 'POST',
+        pathname: assetsCustomDomainPath,
+        body: { domain: ASSETS_HOSTNAME, zoneId: 'zone-1', enabled: true },
+      },
+    ]);
+  });
+
+  it.each([
+    { ...USER_EXPORT_LIFECYCLE_RULE, conditions: { prefix: 'spray-walls/' } },
+    {
+      id: 'foreign-export-expiry',
+      enabled: true,
+      conditions: { prefix: '' },
+      deleteObjectsTransition: { condition: { type: 'Age', maxAge: 86_400 } },
+    },
+  ] satisfies R2LifecycleRule[])(
+    'keeps applying security changes while lifecycle ownership is blocked by $id',
+    async (conflictingRule) => {
+      const requests = stubCloudflareApi(dnsResponses(liveApexDnsRecord()), (bucketName) =>
+        bucketName === 'boardsesh-user-private' ? [conflictingRule] : [],
+      );
+      vi.stubEnv('CLOUDFLARE_ACCOUNT_ID', 'account-1');
+
+      expect(await runCloudflareApply(['--apply'])).toBe(1);
+
+      const privateBucketPath = '/client/v4/accounts/account-1/r2/buckets/boardsesh-user-private';
+      expect(requests).toContainEqual({
+        method: 'PUT',
+        pathname: `${privateBucketPath}/domains/managed`,
+        body: { enabled: false },
+      });
+      // Only the blocked bucket is held back: another bucket's own rule still converges.
+      const lifecyclePuts = requests
+        .filter((request) => request.method === 'PUT' && request.pathname.endsWith('/lifecycle'))
+        .map((request) => request.pathname.split('/').at(-2));
+      expect(lifecyclePuts).toEqual(['boardsesh-ota-backups', 'boardsesh-store-creatives', 'boardsesh-ota-sourcemaps']);
+      expect(
+        requests.some((request) => request.method === 'POST' && request.pathname.endsWith('/domains/custom')),
+      ).toBe(true);
+      expect(requests.some((request) => request.method === 'PUT' && request.pathname.endsWith('/cors'))).toBe(true);
+    },
+  );
+
+  it.each(['overlap', 'unreadable'])(
+    'continues security changes and exits nonzero when a fresh lifecycle read becomes %s',
+    async (freshRead) => {
+      let privateReads = 0;
+      const requests = stubCloudflareApi(dnsResponses(liveApexDnsRecord()), (bucketName) => {
+        if (bucketName !== 'boardsesh-user-private') return [];
+        privateReads += 1;
+        if (privateReads === 1) return [USER_EXPORT_LIFECYCLE_RULE];
+        return freshRead === 'unreadable'
+          ? null
+          : [
+              USER_EXPORT_LIFECYCLE_RULE,
+              {
+                id: 'added-during-apply',
+                enabled: true,
+                conditions: { prefix: 'user-data-exports/climber/' },
+                deleteObjectsTransition: { condition: { type: 'Age', maxAge: 86_400 } },
+              },
+            ];
+      });
+      vi.stubEnv('CLOUDFLARE_ACCOUNT_ID', 'account-1');
+
+      expect(await runCloudflareApply(['--apply'])).toBe(1);
+
+      expect(privateReads).toBe(2);
+      expect(requests).toContainEqual({
+        method: 'PUT',
+        pathname: '/client/v4/accounts/account-1/r2/buckets/boardsesh-user-private/domains/managed',
+        body: { enabled: false },
+      });
+      // Only the blocked bucket is held back: another bucket's own rule still converges.
+      const lifecyclePuts = requests
+        .filter((request) => request.method === 'PUT' && request.pathname.endsWith('/lifecycle'))
+        .map((request) => request.pathname.split('/').at(-2));
+      expect(lifecyclePuts).toEqual(['boardsesh-ota-backups', 'boardsesh-store-creatives', 'boardsesh-ota-sourcemaps']);
+    },
+  );
 
   it('sends the apex redirect rule verbatim in the dynamic-redirect PUT', async () => {
     const requests = stubCloudflareApi(dnsResponses(liveApexDnsRecord()));
@@ -2091,6 +2508,35 @@ describe('www list + climb-view HTML cache rule (#4652)', () => {
     }
   });
 
+  it('bypasses a signed-in request on both first-party session cookie names, secure and plain (#7596)', () => {
+    // Under better-auth the legacy cookie stops sliding and ends 30 days after
+    // its last write, while the first-party cookie lives on: without these
+    // clauses a signed-in response could fill the shared anonymous entry.
+    expect(expression).toContain('not (http.cookie contains "boardsesh.session_token")');
+    expect(expression).toContain('not (http.cookie contains "boardsesh.bridged_session_token")');
+    const codec = readFileSync('packages/shared/auth-protocol/src/browser-session-cookie.ts', 'utf8');
+    const baseNames = [codec.match(/login: '([^']+)'/)?.[1], codec.match(/bridged: '([^']+)'/)?.[1]];
+    expect(baseNames).toEqual(['boardsesh.session_token', 'boardsesh.bridged_session_token']);
+    for (const baseName of baseNames)
+      for (const cookieName of [`__Secure-${baseName}`, `${baseName}`])
+        expect(FIRST_PARTY_SESSION_COOKIE_NAME_SUBSTRINGS.some((substring) => cookieName.includes(substring))).toBe(
+          true,
+        );
+    // Each name is matched by its own substring: neither covers the other.
+    expect('__Secure-boardsesh.bridged_session_token').not.toContain('boardsesh.session_token');
+  });
+
+  it('never caches the www auth and token endpoints, whatever they answer (#7596)', () => {
+    expect(WWW_API_PATH_PREFIX).toBe('/api/');
+    expect(expression).toContain('not starts_with(http.request.uri.path, "/api/")');
+    for (const path of ['/api/auth/session', '/api/auth/csrf', '/api/internal/ws-auth'])
+      expect(path.startsWith(WWW_API_PATH_PREFIX)).toBe(true);
+    // The only other www cache rule is the board render's own prefix.
+    expect(BOARD_RENDER_CACHE_EXPRESSION).toBe(
+      '(http.host eq "www.boardsesh.com" and starts_with(http.request.uri.path, "/api/internal/board-render"))',
+    );
+  });
+
   it('bypasses RSC requests on BOTH the header and the ?_rsc query', () => {
     // The trap. `RSC: 1` on a list page returns a 307 to `?_rsc` carrying
     // `CDN-Cache-Control: s-maxage=86400` and no Cache-Control, and Cloudflare
@@ -2109,6 +2555,20 @@ describe('www list + climb-view HTML cache rule (#4652)', () => {
     expect(expression).not.toContain(`http.request.headers["${RSC_REQUEST_HEADER_NAME}"][*] == "1"`);
   });
 
+  it("bypasses a spray wall's ?wall= share link, whatever the origin header says", () => {
+    // An unlisted wall's page stops answering 200 the moment it is hidden or made
+    // private; an edge copy would keep serving it for a day plus SWR.
+    expect(expression).toContain(`not (http.request.uri.query contains "${SPRAY_WALL_CAPABILITY_QUERY}")`);
+    expect(expression).toContain('not (http.request.uri.query contains "wall=")');
+  });
+
+  it("bypasses a home board's ?invite= share link, whatever the origin header says", () => {
+    // The token lets whoever holds it join; a reset must bite on the next
+    // request, and no edge entry may be keyed on one.
+    expect(expression).toContain(`not (http.request.uri.query contains "${BOARD_INVITE_QUERY}")`);
+    expect(expression).toContain('not (http.request.uri.query contains "invite=")');
+  });
+
   it('reads the RSC header through the map accessor, not the field the plan rejects', () => {
     // `http.request.headers.names` is the field production rejected in the
     // http_ratelimit phase: `not entitled: the use of field
@@ -2124,11 +2584,12 @@ describe('www list + climb-view HTML cache rule (#4652)', () => {
   it('stays well inside the 4096-character ruleset expression limit', () => {
     // Cloudflare caps a rule expression at 4096 characters and the locale ×
     // board prefix set is a cross product, so it grows multiplicatively. Failing
-    // at 3072 leaves room to compact the prefix set deliberately (e.g. down to
-    // `contains "/{root}/"`) instead of discovering a 400 during a production
-    // apply.
+    // The six-locale prefix set is 3323 characters. Reserve at least 512
+    // characters below the real limit, while keeping exact starts_with paths
+    // rather than broadening the rule to nested occurrences of board names.
+    // Another locale will require deliberate compaction before production apply.
     expect(expression.length).toBeGreaterThan(0);
-    expect(expression.length).toBeLessThan(3072);
+    expect(expression.length).toBeLessThan(3584);
   });
 
   it('is planned as a create against a zone that only has the three older rules', () => {
@@ -2184,11 +2645,12 @@ describe('a rule phase this token cannot read', () => {
     expect(changes.some((change) => change.resource === 'cache-rule')).toBe(true);
   });
 
-  it('marks only the newly-added phase optional', () => {
-    // A phase that predates the scope it needs must still fail loudly when the
-    // scope is lost; only the one being rolled out is allowed to degrade.
+  it('has no optional rule phases after every scope was confirmed', () => {
+    // Each phase's scope has been confirmed against the production token by an
+    // apply that wrote it, so losing one must fail loudly instead of degrading
+    // a rule.
     const optional = MANAGED_RULE_PHASES.filter((phase) => phase.optional).map((phase) => phase.resource);
-    expect(optional).toEqual(['response-header-rule']);
+    expect(optional).toEqual([]);
   });
 });
 
@@ -2382,13 +2844,10 @@ describe('desiredR2Buckets', () => {
     expect(byName.get('boardsesh-user-media')?.customDomain).toBe('media.boardsesh.com');
   });
 
-  it('keeps the static-assets bucket on its staging hostname until the flip', () => {
-    // assets.boardsesh.com is still the Tigris CNAME. Declaring it here before
-    // the publisher has proved R2 would attach the live hostname to an empty
-    // bucket and 404 every board image.
+  it('attaches the verified static-assets bucket to the unchanged public hostname', () => {
     const assets = desiredR2Buckets.find((bucket) => bucket.name === 'boardsesh-static-assets');
-    expect(assets?.customDomain).toBe(ASSETS_STAGING_HOSTNAME);
-    expect(assets?.customDomain).not.toBe(ASSETS_HOSTNAME);
+    expect(assets?.customDomain).toBe(ASSETS_HOSTNAME);
+    expect(assets?.customDomain).not.toBe(ASSETS_STAGING_HOSTNAME);
   });
 
   it('declares CORS on the bucket the board workers fetch from', () => {
@@ -2403,7 +2862,7 @@ describe('desiredR2Buckets', () => {
     expect(assets?.cors?.allowedOrigins).toEqual(['*']);
   });
 
-  it('prepares public snapshots and keeps OTA objects private', () => {
+  it('prepares public snapshots and serves OTA objects from their own host', () => {
     const snapshots = desiredR2Buckets.find((bucket) => bucket.name === 'boardsesh-board-snapshots');
     const ota = desiredR2Buckets.find((bucket) => bucket.name === 'boardsesh-ota-v3');
 
@@ -2413,7 +2872,53 @@ describe('desiredR2Buckets', () => {
       allowedMethods: ['GET', 'HEAD'],
       maxAgeSeconds: 86_400,
     });
-    expect(ota?.customDomain).toBeNull();
+    expect(ota?.customDomain).toBe(OTA_ASSETS_HOSTNAME);
+    // r2.dev stays off: the custom domain is the only public path, so the
+    // cache and compression rules below apply to every public read.
+    expect(ota?.r2DevDomainEnabled).toBe(false);
+  });
+
+  it('edge-caches and compresses the whole OTA assets host', () => {
+    // `cas/<sha256>` keys have no file extension and are stored as
+    // application/octet-stream, so neither Cloudflare default applies: without
+    // these two rules every bundle is an uncached, uncompressed 20.9 MB read.
+    const cacheRule = desired.cacheRules.find((rule) => rule.description === OTA_ASSETS_CACHE_RULE_DESCRIPTION);
+    const compressionRule = desired.compressionRules.find(
+      (rule) => rule.description === OTA_ASSETS_COMPRESSION_RULE_DESCRIPTION,
+    );
+
+    expect(cacheRule?.expression).toBe(`http.host eq "${OTA_ASSETS_HOSTNAME}"`);
+    expect(cacheRule?.action_parameters).toEqual({
+      cache: true,
+      edge_ttl: { mode: 'bypass_by_default' },
+      browser_ttl: { mode: 'respect_origin' },
+    });
+    expect(compressionRule).toEqual({
+      description: OTA_ASSETS_COMPRESSION_RULE_DESCRIPTION,
+      expression: `http.host eq "${OTA_ASSETS_HOSTNAME}"`,
+      action: 'compress_response',
+      action_parameters: { algorithms: [{ name: 'brotli' }, { name: 'gzip' }] },
+      enabled: true,
+    });
+  });
+
+  it('plans the compression rule in its own phase and re-plans a changed algorithm list', () => {
+    expect(MANAGED_RULE_PHASES.find((phase) => phase.resource === 'compression-rule')?.phase).toBe(
+      COMPRESSION_RULE_PHASE,
+    );
+
+    const missing = diffManagedRules([], desired.compressionRules, 'compression-rule');
+    expect(missing).toHaveLength(1);
+    expect(missing[0].summary).toContain('missing — will create');
+
+    const gzipOnly = matchingLiveRules(desired.compressionRules).map((rule) => ({
+      ...rule,
+      action_parameters: { algorithms: [{ name: 'gzip' }] },
+    }));
+    expect(diffManagedRules(gzipOnly, desired.compressionRules, 'compression-rule')).toHaveLength(1);
+    expect(
+      diffManagedRules(matchingLiveRules(desired.compressionRules), desired.compressionRules, 'compression-rule'),
+    ).toEqual([]);
   });
 
   it('caches snapshot paths and sets CORS independently of request headers', () => {
@@ -2452,5 +2957,57 @@ describe('isAuthorizationError', () => {
     expect(isAuthorizationError(new FakeCfError(403))).toBe(false);
     expect(isAuthorizationError(new Error('403'))).toBe(false);
     expect(isAuthorizationError(null)).toBe(false);
+  });
+});
+
+describe('anonymous marketing HTML cache rule (#8140)', () => {
+  const rule = desired.cacheRules.find(
+    (candidate) => candidate.description === WWW_MARKETING_HTML_CACHE_RULE_DESCRIPTION,
+  );
+  const expression = WWW_MARKETING_HTML_CACHE_EXPRESSION;
+
+  it('uses a separate bounded rule and honors origin cache headers', () => {
+    expect(rule?.enabled).toBe(true);
+    expect(rule?.expression).toBe(expression);
+    expect(rule?.action_parameters).toEqual({
+      cache: true,
+      edge_ttl: { mode: 'bypass_by_default' },
+      browser_ttl: { mode: 'respect_origin' },
+    });
+    expect(expression.length).toBeLessThan(3584);
+    expect(desired.cacheRules.length).toBeLessThanOrEqual(10);
+  });
+  it('admits only the exact published unprefixed documents', () => {
+    const paths = [...expression.matchAll(/http.request.uri.path in \{([^}]+)\}/g)].flatMap((match) =>
+      [...match[1].matchAll(/"([^"]+)"/g)].map((quoted) => quoted[1]),
+    );
+    expect(paths).toEqual([
+      '/',
+      '/apps',
+      '/apps/kilter',
+      '/apps/aurora',
+      '/apps/moonboard',
+      '/apps/woods',
+      '/compare/spray-wall-apps',
+    ]);
+    expect(expression).toContain('http.host eq "www.boardsesh.com"');
+    expect(expression).toContain('http.request.method in {"GET" "HEAD"}');
+    expect(expression).toContain('http.request.uri.query eq ""');
+    expect(expression).not.toContain('starts_with');
+  });
+  it('bypasses credentials and router variants before looking up the document cache', () => {
+    for (const cookie of [SESSION_COOKIE_NAME_SUBSTRING, ...FIRST_PARTY_SESSION_COOKIE_NAME_SUBSTRINGS]) {
+      expect(expression).toContain(`not (http.cookie contains "${cookie}")`);
+    }
+    for (const header of [
+      'authorization',
+      'rsc',
+      'next-router-state-tree',
+      'next-router-prefetch',
+      'next-router-segment-prefetch',
+    ]) {
+      expect(expression).toContain(`not (any(http.request.headers["${header}"][*] != ""))`);
+    }
+    expect(expression).toContain('not (http.request.uri.path eq "/" and http.cookie contains "boardsesh-locale")');
   });
 });

@@ -42,6 +42,7 @@ describe('parseHealthCheckArgs', () => {
       hours: 24,
       minSamples: 30,
       threshold: 0.1,
+      gate: 'launches',
       outFile: null,
       json: false,
     });
@@ -59,6 +60,8 @@ describe('parseHealthCheckArgs', () => {
       '0.2',
       '--out',
       'x.md',
+      '--gate',
+      'installs',
       '--json',
     ]);
     expect(spaced).toEqual({
@@ -66,12 +69,24 @@ describe('parseHealthCheckArgs', () => {
       hours: 6,
       minSamples: 50,
       threshold: 0.2,
+      gate: 'installs',
       outFile: 'x.md',
       json: true,
     });
 
-    const equals = parseHealthCheckArgs(['--update-id=abc-123', '--hours=6', '--threshold=0.2', '--out=x.md']);
-    expect(equals).toMatchObject({ updateId: 'abc-123', hours: 6, threshold: 0.2, outFile: 'x.md' });
+    const equals = parseHealthCheckArgs([
+      '--update-id=abc-123',
+      '--hours=6',
+      '--threshold=0.2',
+      '--out=x.md',
+      '--gate=installs',
+    ]);
+    expect(equals).toMatchObject({ updateId: 'abc-123', hours: 6, threshold: 0.2, outFile: 'x.md', gate: 'installs' });
+  });
+
+  it('keeps the launches gate for an unknown --gate value', () => {
+    expect(parseHealthCheckArgs(['--gate', 'phones']).gate).toBe('launches');
+    expect(parseHealthCheckArgs(['--gate']).gate).toBe('launches');
   });
 
   it('clamps out-of-range numbers', () => {
@@ -106,9 +121,18 @@ describe('buildHealthQuery / buildLatestUpdateQuery', () => {
     const query = buildHealthQuery({ hours: 6, updateId: 'abc-123' });
     expect(query).toContain("properties.updateId = 'abc-123'");
     expect(query).toContain('target_update_installs');
+    // Per install: an install is one distinct_id (anonymous-install-id.ts).
+    expect(query).toContain('uniqExact(distinct_id) AS installs');
+    expect(query).toContain(
+      "uniqExactIf(distinct_id, toString(properties.isEmergencyLaunch) = 'true') AS emergency_installs",
+    );
     expect(query).toContain("event = 'OTA Update Status'");
     expect(query).toContain("properties.channel = 'production'");
     expect(query).toContain('INTERVAL 6 HOUR');
+    // Every launch still on a per-launch id, healthy ones included, tells when
+    // the installs gate can take over: emergencies alone read 0 on a healthy week.
+    expect(query).toContain("countIf(startsWith(distinct_id, 'ota-launch:')) AS legacy_launches");
+    expect(query).not.toMatch(/ota-launch:'\)\s+AND/);
   });
 
   it('emits a constant 0 adoption column when no id is given', () => {
@@ -129,75 +153,199 @@ describe('buildHealthQuery / buildLatestUpdateQuery', () => {
 });
 
 describe('evaluateOtaHealth', () => {
-  const metrics = (launches: number, emergencyLaunches: number): HealthMetrics => ({
-    launches,
-    emergencyLaunches,
-    installs: launches,
-    emergencyInstalls: emergencyLaunches,
+  const installs = { minSamples: 30, threshold: 0.1, gate: 'installs' } as const;
+  const launches = { minSamples: 30, threshold: 0.1, gate: 'launches' } as const;
+  const metrics = (installCount: number, emergencyInstalls: number): HealthMetrics => ({
+    installs: installCount,
+    emergencyInstalls,
+    launches: installCount * 3,
+    emergencyLaunches: emergencyInstalls * 5,
+    legacyLaunches: 0,
     targetUpdateInstalls: null,
     updateId: null,
   });
 
+  it('gates on launches by default: emergency launches / launches', () => {
+    const verdict = evaluateOtaHealth(
+      {
+        installs: 100,
+        emergencyInstalls: 1,
+        launches: 140,
+        emergencyLaunches: 40,
+        legacyLaunches: 0,
+        targetUpdateInstalls: null,
+        updateId: null,
+      },
+      launches,
+    );
+    expect(verdict.gate).toBe('launches');
+    expect(verdict.emergencyRate).toBeCloseTo(40 / 140);
+    expect(verdict.unhealthy).toBe(true);
+  });
+
+  it('with --gate installs, rates installs: one install crash-looping is one emergency', () => {
+    const verdict = evaluateOtaHealth(
+      {
+        installs: 100,
+        emergencyInstalls: 1,
+        launches: 140,
+        emergencyLaunches: 40,
+        legacyLaunches: 0,
+        targetUpdateInstalls: null,
+        updateId: null,
+      },
+      installs,
+    );
+    expect(verdict.emergencyRate).toBeCloseTo(0.01);
+    expect(verdict.unhealthy).toBe(false);
+  });
+
+  // The fleet today: healthy launches on OTA'd JS dedupe to one `ota-install:`
+  // id per phone, while emergencies run the embedded JS of an older store
+  // binary and send a new `ota-launch:` id per launch, each its own "install".
+  const mixedFleet: HealthMetrics = {
+    // 100 phones x 4 healthy launches on `ota-install:`, plus 12 emergency
+    // launches on 12 `ota-launch:` ids.
+    installs: 100 + 12,
+    emergencyInstalls: 12,
+    launches: 400 + 12,
+    emergencyLaunches: 12,
+    legacyLaunches: 12,
+    targetUpdateInstalls: null,
+    updateId: null,
+  };
+
+  it('does not trip on a mixed ota-launch / ota-install fleet under the launches gate', () => {
+    const verdict = evaluateOtaHealth(mixedFleet, launches);
+    expect(verdict.emergencyRate).toBeCloseTo(12 / 412);
+    expect(verdict).toMatchObject({ unhealthy: false, exitCode: 0 });
+  });
+
+  it('would trip on the same fleet under the installs gate, which is why it is not the default yet', () => {
+    const verdict = evaluateOtaHealth(mixedFleet, installs);
+    expect(verdict.emergencyRate).toBeCloseTo(12 / 112);
+    expect(verdict).toMatchObject({ unhealthy: true, exitCode: 1 });
+  });
+
+  it('needs enough of the gated unit, however many of the other there are', () => {
+    const fewInstalls: HealthMetrics = {
+      installs: 10,
+      emergencyInstalls: 8,
+      launches: 400,
+      emergencyLaunches: 300,
+      legacyLaunches: 0,
+      targetUpdateInstalls: null,
+      updateId: null,
+    };
+    expect(evaluateOtaHealth(fewInstalls, installs)).toMatchObject({ sufficientSample: false, unhealthy: false });
+    expect(evaluateOtaHealth({ ...fewInstalls, launches: 20, emergencyLaunches: 15 }, launches)).toMatchObject({
+      sufficientSample: false,
+      unhealthy: false,
+    });
+  });
+
   it('flags unhealthy only when rate beats threshold AND sample is sufficient', () => {
-    const verdict = evaluateOtaHealth(metrics(100, 20), { minSamples: 30, threshold: 0.1 });
+    const verdict = evaluateOtaHealth(metrics(100, 20), installs);
     expect(verdict).toMatchObject({ unhealthy: true, sufficientSample: true, exitCode: 1 });
     expect(verdict.emergencyRate).toBeCloseTo(0.2);
   });
 
   it('does NOT flag a high rate on a tiny sample', () => {
-    const verdict = evaluateOtaHealth(metrics(10, 8), { minSamples: 30, threshold: 0.1 });
+    const verdict = evaluateOtaHealth(metrics(10, 8), installs);
     expect(verdict).toMatchObject({ unhealthy: false, sufficientSample: false, exitCode: 0 });
   });
 
   it('does NOT flag a healthy fleet with plenty of data', () => {
-    const verdict = evaluateOtaHealth(metrics(500, 5), { minSamples: 30, threshold: 0.1 });
-    expect(verdict).toMatchObject({ unhealthy: false, sufficientSample: true, exitCode: 0 });
+    expect(evaluateOtaHealth(metrics(500, 5), installs)).toMatchObject({ unhealthy: false, exitCode: 0 });
+    expect(evaluateOtaHealth(metrics(500, 5), launches)).toMatchObject({ unhealthy: false, exitCode: 0 });
   });
 
   it('does NOT trip exactly at the threshold (strict greater-than)', () => {
-    expect(evaluateOtaHealth(metrics(100, 10), { minSamples: 30, threshold: 0.1 })).toMatchObject({ unhealthy: false });
+    expect(evaluateOtaHealth(metrics(100, 10), installs)).toMatchObject({ unhealthy: false });
   });
 
-  it('treats zero launches as a 0 rate (no divide-by-zero)', () => {
-    expect(evaluateOtaHealth(metrics(0, 0), { minSamples: 30, threshold: 0.1 })).toMatchObject({
-      emergencyRate: 0,
-      unhealthy: false,
-      exitCode: 0,
-    });
+  it('treats zero reports as a 0 rate (no divide-by-zero)', () => {
+    for (const options of [installs, launches]) {
+      expect(evaluateOtaHealth(metrics(0, 0), options)).toMatchObject({
+        emergencyRate: 0,
+        unhealthy: false,
+        exitCode: 0,
+      });
+    }
   });
 });
 
 describe('summarizeVerdict', () => {
   const args = parseHealthCheckArgs(['--hours', '6']);
+  const evaluate = (metrics: HealthMetrics, gateArgs: HealthCheckArgs = args) =>
+    evaluateOtaHealth(metrics, { minSamples: gateArgs.minSamples, threshold: gateArgs.threshold, gate: gateArgs.gate });
 
-  it('renders an unhealthy verdict with the adoption line', () => {
+  it('renders an unhealthy verdict with the gate, both rates, the legacy count and the adoption line', () => {
     const metrics: HealthMetrics = {
-      launches: 100,
-      emergencyLaunches: 20,
-      installs: 80,
-      emergencyInstalls: 18,
+      installs: 100,
+      emergencyInstalls: 20,
+      launches: 150,
+      emergencyLaunches: 35,
+      legacyLaunches: 30,
       targetUpdateInstalls: 60,
       updateId: 'abc-123',
     };
-    const verdict = evaluateOtaHealth(metrics, { minSamples: args.minSamples, threshold: args.threshold });
-    const lines = summarizeVerdict(metrics, verdict, args);
+    const lines = summarizeVerdict(metrics, evaluate(metrics), args);
+    const text = lines.join('\n');
     expect(lines[0]).toContain('UNHEALTHY');
-    expect(lines.join('\n')).toContain('abc-123');
-    expect(lines.join('\n')).toContain('60 install(s)');
+    expect(text).toContain('gate: launches, rate 23.3%');
+    expect(text).toContain('launches: 150, emergency launches: 35');
+    expect(text).toContain('installs: 100, with an emergency launch: 20 → 20.0%');
+    expect(text).toContain('legacy launches (per-launch id, pre-change JS; healthy and emergency): 30');
+    expect(text).toContain('abc-123');
+    expect(text).toContain('60 install(s)');
+  });
+
+  it('reports legacy launches on a healthy fleet, so zero emergencies never reads as "switch now"', () => {
+    // A week with no emergency at all, on a fleet where old binaries still
+    // run their embedded pre-change JS on some launches.
+    const healthyOldFleet: HealthMetrics = {
+      installs: 200,
+      emergencyInstalls: 0,
+      launches: 900,
+      emergencyLaunches: 0,
+      legacyLaunches: 140,
+      targetUpdateInstalls: null,
+      updateId: null,
+    };
+    const text = summarizeVerdict(healthyOldFleet, evaluate(healthyOldFleet), args).join('\n');
+    expect(text).toContain('healthy');
+    expect(text).toContain('legacy launches (per-launch id, pre-change JS; healthy and emergency): 140');
+  });
+
+  it('names the installs gate when it is chosen', () => {
+    const installArgs = parseHealthCheckArgs(['--gate', 'installs']);
+    const metrics: HealthMetrics = {
+      installs: 100,
+      emergencyInstalls: 2,
+      launches: 300,
+      emergencyLaunches: 9,
+      legacyLaunches: 0,
+      targetUpdateInstalls: null,
+      updateId: null,
+    };
+    expect(summarizeVerdict(metrics, evaluate(metrics, installArgs), installArgs).join('\n')).toContain(
+      'gate: installs, rate 2.0%',
+    );
   });
 
   it('marks a low-sample result inconclusive and omits the adoption line without an id', () => {
     const metrics: HealthMetrics = {
-      launches: 4,
-      emergencyLaunches: 2,
       installs: 4,
       emergencyInstalls: 2,
+      launches: 9,
+      emergencyLaunches: 6,
+      legacyLaunches: 6,
       targetUpdateInstalls: null,
       updateId: null,
     };
-    const verdict = evaluateOtaHealth(metrics, { minSamples: args.minSamples, threshold: args.threshold });
-    const text = summarizeVerdict(metrics, verdict, args).join('\n');
-    expect(text).toContain('inconclusive');
+    const text = summarizeVerdict(metrics, evaluate(metrics), args).join('\n');
+    expect(text).toContain('inconclusive (too few launches)');
     expect(text).not.toContain('running it');
   });
 });
@@ -209,6 +357,7 @@ describe('runHealthCheck (networked path)', () => {
     hours: 6,
     minSamples: 30,
     threshold: 0.1,
+    gate: 'launches',
     outFile: null,
     json: false,
     ...overrides,
@@ -238,10 +387,10 @@ describe('runHealthCheck (networked path)', () => {
 
   it('exits 1 and writes an UNHEALTHY summary when the emergency rate clears the gate', async () => {
     vi.stubEnv('POSTHOG_PERSONAL_API_KEY', 'phx_test');
-    // [launches, emergency_launches, installs, emergency_installs, target_update_installs]
+    // [installs, emergency_installs, launches, emergency_launches, target_update_installs, legacy_launches]
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => ({ ok: true, json: async () => ({ results: [[100, 20, 80, 18, 60]] }) })),
+      vi.fn(async () => ({ ok: true, json: async () => ({ results: [[100, 20, 180, 45, 60, 40]] }) })),
     );
     const out = outPath();
 
@@ -253,9 +402,20 @@ describe('runHealthCheck (networked path)', () => {
     vi.stubEnv('POSTHOG_PERSONAL_API_KEY', 'phx_test');
     vi.stubGlobal(
       'fetch',
-      vi.fn(async () => ({ ok: true, json: async () => ({ results: [[500, 5, 400, 5, 300]] }) })),
+      vi.fn(async () => ({ ok: true, json: async () => ({ results: [[500, 5, 900, 12, 300, 12]] }) })),
     );
     await expect(runHealthCheck(baseArgs())).resolves.toBe(0);
+  });
+
+  it('gates per install with --gate installs', async () => {
+    vi.stubEnv('POSTHOG_PERSONAL_API_KEY', 'phx_test');
+    // 3% of launches but 12% of installs had an emergency.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({ ok: true, json: async () => ({ results: [[100, 12, 400, 12, 50, 0]] }) })),
+    );
+    await expect(runHealthCheck(baseArgs())).resolves.toBe(0);
+    await expect(runHealthCheck(baseArgs({ gate: 'installs' }))).resolves.toBe(1);
   });
 
   it('exits 0 (operational error never reads as unhealthy) when PostHog returns an error', async () => {

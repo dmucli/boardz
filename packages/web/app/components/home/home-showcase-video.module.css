@@ -1,0 +1,145 @@
+/* The hero video card, 9:16. Mobile-first: the phone layout is the default.
+   The footage was cut on the old violet stage (#110a20), so it sits in a card:
+   the 16px radius, the clip and the 1px capture frame make that stage read as
+   footage inside a frame rather than a patch of the wrong page colour. The card
+   ground (--semantic-surface) shows only until the poster paints. */
+.figure {
+  position: relative;
+  isolation: isolate;
+  width: 100%;
+  aspect-ratio: 9 / 16;
+  margin: 0 auto;
+  overflow: hidden;
+  border: 1px solid var(--capture-frame);
+  border-radius: var(--border-radius-xl);
+  background: var(--semantic-surface);
+}
+
+/* The poster and the video share one box, so the video can never be larger than
+   the poster. The video is invisible until its first frame is playing: a video
+   with no frame yet paints black in some Safari versions. */
+.poster,
+.video {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.video {
+  opacity: 0;
+}
+
+.video[data-active='true'] {
+  opacity: 1;
+}
+
+/* Both toggles are doubled with .figure: MUI's own button styles (position:
+   relative, transparent background) are injected after this stylesheet and win
+   a single-class tie, which pushed the button to the top-left as a faint notch.
+   The fixed dark scrim (--overlay-dark) plus a white icon stays legible over the
+   dark and the lavender scenes alike, in either colour mode. */
+.figure .toggle,
+.figure .toggleCentered {
+  position: absolute;
+  z-index: 1;
+  min-width: 44px;
+  min-height: 44px;
+  color: var(--color-on-primary);
+  background: var(--overlay-dark);
+}
+
+.figure .toggle:hover,
+.figure .toggleCentered:hover {
+  background: var(--overlay-dark);
+}
+
+.figure .toggle:focus-visible,
+.figure .toggleCentered:focus-visible {
+  outline: 3px solid var(--color-on-primary);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 7px var(--overlay-dark);
+}
+
+.figure .toggle {
+  right: var(--spacing-3);
+  bottom: var(--spacing-3);
+}
+
+/* Poster with nothing playing (data saver, reduced motion): the play button is
+   the call to action, so it is larger and centered on desktop. */
+.figure .toggleCentered {
+  top: 50%;
+  left: 50%;
+  min-width: 64px;
+  min-height: 64px;
+  transform: translate(-50%, -50%);
+}
+
+.sceneList {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.sceneList ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Desktop (761px and up, the complement of the phone breakpoint): the card sits
+   beside the hero copy, vertically centred against it, as wide as fits without
+   outgrowing the viewport height (header and 120px of breathing room). Below
+   that the phone layout above holds: the copy comes first and the card sits
+   directly below at full content width, without cropping the portrait
+   composition.
+
+   The card is also capped by HEIGHT, set against the copy beside it so the two
+   balance: a card much taller than the copy leaves an empty band above the
+   title. The copy is about 310px tall from 900px (355px at 761-899) and about
+   450px from 1100px, where the home hero adds the QR code card
+   (`home-page-content.module.css`). Each cap leaves the copy's top at most
+   about 80px below the card's. Still 9:16 by width, so nothing is cropped. */
+@media (min-width: 761px) {
+  .figure {
+    width: min(calc(470px * 9 / 16), calc((100dvh - var(--global-header-height) - 120px) * 9 / 16));
+    margin: 0;
+  }
+
+  /* Layout centering survives the global reduced-motion hover transform reset. */
+  .figure .toggleCentered {
+    inset: 0;
+    width: 64px;
+    height: 64px;
+    margin: auto;
+    transform: none;
+  }
+}
+
+@media (min-width: 1100px) {
+  .figure {
+    width: min(calc(600px * 9 / 16), calc((100dvh - var(--global-header-height) - 120px) * 9 / 16));
+  }
+}
+
+/* Keep the manual play affordance visible when the phone poster first enters
+   the viewport, even before its middle reaches the fold. */
+@media (max-width: 760px) {
+  .figure .toggleCentered {
+    top: var(--spacing-3);
+    right: var(--spacing-3);
+    left: auto;
+    min-width: 48px;
+    min-height: 48px;
+    transform: none;
+  }
+}

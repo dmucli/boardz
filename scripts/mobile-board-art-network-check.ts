@@ -65,7 +65,8 @@ const RULES: readonly Rule[] = [
   },
   {
     name: 'image-prefetch',
-    message: 'Do not prefetch board art with React Native Image.prefetch; resolve bundled assets instead.',
+    message:
+      'Do not prefetch board art with Image.prefetch; resolve bundled assets instead. To decode a file already on the phone, use warmBoardArtMemory.',
     test: (lineText) => lineText.includes('Image.prefetch'),
   },
   {
@@ -79,6 +80,76 @@ const RULES: readonly Rule[] = [
   // on-device bundled-art compositing never rendered correctly in production.
   // Re-adding offline board art (and this guard) is tracked in issue #2982.
 ] as const;
+
+/**
+ * The one place a react-native-svg `Image` is allowed: the spray wall look
+ * picker's Android mesh (`docs/product/spray-walls.md`, "Previewing a look on the
+ * phone"), which has to draw the owner's photo under an affine transform a
+ * React Native view cannot apply on Android. It is not board art, and it is
+ * never a network image. react-native-svg disk-caches network images, so a
+ * remote href here would also leak a private photo into a cache nothing
+ * clears. Read with comments stripped, the file must:
+ *
+ * - carry the exact runtime guard `if (!isLocalFileUri(photoUri)) return null;`
+ *   as a statement of its own (text in a comment does not count);
+ * - give every `href=` exactly `{photoUri}`, the value that guard checks;
+ * - contain no http(s) literal.
+ */
+const SVG_IMAGE_LOCAL_FILE_EXEMPTIONS: ReadonlySet<string> = new Set([
+  'packages/mobile/src/components/spray-wall/FlattenedSprayPhoto.tsx',
+]);
+const LOCAL_FILE_GUARD_STATEMENT = /^[ \t]*if \(!isLocalFileUri\(photoUri\)\) return null;[ \t]*$/m;
+
+/**
+ * The one place `Image.prefetch` is allowed: decoding board art that is already
+ * a file on the phone into expo-image's memory cache, so a list row or the play
+ * board paints its holds on the frame it mounts (`docs/mobile/react-native-performance.md`,
+ * rule 6). It is never a download. Read with comments stripped, the file must:
+ *
+ * - narrow its input with the exact statement
+ *   `const localUris = uris.filter(isLocalFileUri);`
+ * - define that predicate as exactly `return uri.startsWith('file://');`
+ * - make every `Image.prefetch(` call exactly `Image.prefetch(localUris, 'memory')`:
+ *   the filtered list, decoded into memory, never written to a disk cache;
+ * - never add to `localUris` after the filter (no `push`, `unshift`, `splice`,
+ *   index write or reassignment);
+ * - contain no http(s) literal.
+ */
+const IMAGE_PREFETCH_LOCAL_FILE_EXEMPTIONS: ReadonlySet<string> = new Set([
+  'packages/mobile/src/lib/board-render/warm-board-art-memory.ts',
+]);
+const LOCAL_URI_FILTER_STATEMENT = /^[ \t]*const localUris = uris\.filter\(isLocalFileUri\);[ \t]*$/m;
+const LOCAL_URI_PREDICATE_STATEMENT = /^[ \t]*return uri\.startsWith\('file:\/\/'\);[ \t]*$/m;
+
+function isExemptLocalImagePrefetchFile(sourceFile: SourceFile): boolean {
+  if (!IMAGE_PREFETCH_LOCAL_FILE_EXEMPTIONS.has(sourceFile.path)) return false;
+  const code = stripComments(sourceFile.text);
+  if (!LOCAL_URI_FILTER_STATEMENT.test(code) || !LOCAL_URI_PREDICATE_STATEMENT.test(code)) return false;
+  if (/https?:\/\//.test(code)) return false;
+  if (
+    /\blocalUris\s*(\.\s*(push|unshift|splice|fill|copyWithin)\b|\[|=(?!=))/.test(
+      code.replace(LOCAL_URI_FILTER_STATEMENT, ''),
+    )
+  ) {
+    return false;
+  }
+  const prefetchCalls = code.match(/Image\.prefetch\([^)]*\)?/g) ?? [];
+  return prefetchCalls.length > 0 && prefetchCalls.every((call) => call === "Image.prefetch(localUris, 'memory')");
+}
+
+/** Source with block and line comments removed (`://` in a string is kept). */
+function stripComments(text: string): string {
+  return text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|[^:])\/\/.*$/gm, '$1');
+}
+
+function isExemptLocalSvgImageFile(sourceFile: SourceFile): boolean {
+  if (!SVG_IMAGE_LOCAL_FILE_EXEMPTIONS.has(sourceFile.path)) return false;
+  const code = stripComments(sourceFile.text);
+  if (!LOCAL_FILE_GUARD_STATEMENT.test(code)) return false;
+  if (/https?:\/\//.test(code)) return false;
+  const hrefs = code.match(/\bhref=\S*/g) ?? [];
+  return hrefs.length > 0 && hrefs.every((href) => href === 'href={photoUri}');
+}
 
 function shouldScanPath(filePath: string): boolean {
   const normalized = filePath.replaceAll('\\', '/');
@@ -128,9 +199,13 @@ export function findMobileBoardArtNetworkViolations(sourceFiles: readonly Source
 
   for (const sourceFile of sourceFiles) {
     const lines = sourceFile.text.split(/\r?\n/);
+    const localSvgImageFile = isExemptLocalSvgImageFile(sourceFile);
+    const localImagePrefetchFile = isExemptLocalImagePrefetchFile(sourceFile);
     lines.forEach((lineText, lineIndex) => {
       for (const rule of RULES) {
         if (!rule.test(lineText)) continue;
+        if (rule.name === 'svg-image-background' && localSvgImageFile) continue;
+        if (rule.name === 'image-prefetch' && localImagePrefetchFile) continue;
         violations.push({
           path: sourceFile.path,
           line: lineIndex + 1,

@@ -1,9 +1,10 @@
 {
   "metadata": {
     "home": {
-      "title": "Climbing app compatible with Kilter, Tension & MoonBoard",
-      "description": "Share a live queue with your crew and track your sends across boards. Works with Kilter, Tension, MoonBoard and more.",
-      "ogDescription": "Share a live queue with your crew and track your sends across boards. Works with Kilter, Tension, MoonBoard and more."
+      "title": "Climbing App That Works with Kilter, Tension & MoonBoard",
+      "description": "Pick a climb, light it on the wall and share one queue with your crew. Free to use. Works with boards including Kilter, Tension and MoonBoard.",
+      "ogDescription": "Pick a climb, light it on the wall and share one queue with your crew.",
+      "ogTitle": "Switch boards, not apps"
     },
     "about": {
       "title": "Built by climbers, open to everyone",
@@ -18,8 +19,8 @@
       "description": "Short guides for the Boardsesh app, how to bring your Kilter or Tension logbook across, and where to ask a question."
     },
     "docs": {
-      "title": "API Documentation",
-      "description": "REST and WebSocket API documentation for Boardsesh - interactive climbing training board integration"
+      "title": "Public climb API reference",
+      "description": "Read public climb, grade and board configuration data. Connect an app to a climber’s logbook through the separate OAuth developer API."
     },
     "legal": {
       "title": "Legal & Intellectual Property Policy",
@@ -29,75 +30,50 @@
       "title": "Privacy Policy",
       "description": "Boardsesh privacy policy - how we handle your data."
     },
-    "helpPlaylists": {
-      "title": "Make a board playlist and climb it in order",
-      "description": "Create a playlist for your Kilter, Tension or MoonBoard, add and remove climbs, load it into your queue, and use the eight lists Boardsesh builds."
-    },
     "helpSessions": {
-      "title": "Start or join a live session and share one queue",
-      "description": "Start a session on the Session tab, invite your crew by QR code or link, and share one queue and one board without lighting each other's climbs."
+      "title": "Start or join a live session with your crew",
+      "description": "Start a session on the Session tab, invite your crew by QR code or link, and share one board without lighting each other's climbs."
     },
     "helpFindingClimbs": {
-      "title": "Filter climbs by hold, wall region and setter",
-      "description": "Grade range, hold types, board region, setters you follow, swipe actions on a climb row and pinned filters in the Boardsesh app."
+      "title": "Find climbs, press and hold for actions, make playlists",
+      "description": "Filter Kilter, Tension and MoonBoard climbs by grade, hold, region and setter, swipe through a list, press and hold a climb for its menu, and build playlists in the Boardsesh app."
     },
     "helpLogbook": {
-      "title": "Log, edit and delete sends in your logbook",
-      "description": "Log a tick from the board in the Boardsesh app, change the grade, stars, tries or status later, delete an entry, and find an old send."
+      "title": "Log, edit and delete sends, and attach beta videos",
+      "description": "Log a send or attempt in the Boardsesh app, edit it later, bring your Kilter or Tension logbook across, and attach a beta video to a climb."
     },
     "helpBoardAndBluetooth": {
-      "title": "Connect to your board over Bluetooth",
-      "description": "Connect Boardsesh to a Kilter, Tension or MoonBoard controller, fix a failed connection, and drive it from the lock screen with Live Activity."
+      "title": "Put a climb on your board: Bluetooth and driving the wall",
+      "description": "Connect Boardsesh to a Kilter, Tension or MoonBoard, learn what driving the wall means, swipe the wall button to keep climbs lighting, and fix a board that won't connect."
     },
-    "helpClimbActions": {
-      "title": "Preview, log a tick or add to a playlist from any climb row",
-      "description": "The press-and-hold menu on a climb row in the Boardsesh app, from previewing without lighting the board to logging a tick or adding to a playlist."
-    },
-    "helpBetaVideos": {
-      "title": "Share a reel from Instagram or TikTok as beta",
-      "description": "Share an Instagram reel or TikTok into Boardsesh from its share sheet, attach it to a climb, film new beta, and find the beta others posted."
+    "helpSprayWalls": {
+      "title": "How to photograph and set up your spray wall",
+      "description": "Shoot your spray wall square on and in portrait, add it to Boardsesh, fix the holds it finds, and edit them later or after a reset."
     }
   },
   "home": {
     "hero": {
-      "title": "Your boards. One app.",
-      "eyebrow": "Works with Kilter, Tension, MoonBoard & More",
-      "playShotAlt": "A climb open in Boardsesh with its holds lit on the board",
-      "subtitle": "Switch boards without switching apps.",
-      "startClimbingAria": "Start climbing in the app",
-      "startClimbingWeb": "Start climbing on the web →",
-      "ctaInstallIos": "Install from App Store",
+      "title": "Switch boards, not apps",
+      "eyebrow": "Free to use. Works with boards including Kilter, Tension and MoonBoard.",
+      "subtitle": "Pick a climb, light it on the wall and share one queue with your crew.",
+      "compareApps": "Compare Boardsesh with your board's app",
+      "ctaInstallIos": "Download on the App Store",
       "ctaInstallAndroid": "Get it on Google Play",
       "ctaUpdate": "Update the app",
+      "qrTitle": "Scan to get the app on your phone",
+      "qrBody": "Free on iPhone and Android.",
+      "qrImageLabel": "QR code that opens Boardsesh on your phone",
+      "proof": "In the last 30 days, about {{formattedClimbers}} climbers used Boardsesh to light a climb on their board {{formattedClimbs}} times.",
       "tensionShotAlt": "A climb on a Tension board in Boardsesh",
       "moonboardShotAlt": "A climb on a MoonBoard in Boardsesh",
-      "proof": "{{formattedClimbers}} climbers lit {{formattedClimbs}} climbs on real boards in the last 30 days.",
-      "proofNoCount": "Free, open source, and paid for by the climbers who use it."
+      "playShotAlt": "A climb open in Boardsesh with its holds lit on the board"
     },
-    "onboardingHeader": "Make it yours",
-    "cards": {
-      "auroraTitle": "Coming from Kilter?",
-      "auroraDescription": "Bring your logbook and history over in one step",
-      "playlistTitle": "Build a playlist",
-      "playlistDescription": "Line up your climbs before you get to the gym",
-      "bluetoothTitle": "Connect your board",
-      "bluetoothDescription": "Pair via Bluetooth and light up your next climb",
-      "gymTitle": "Find a gym near you",
-      "gymDescription": "See which walls run a Kilter, Tension or MoonBoard"
-    },
-    "gymCard": {
-      "ownerSubtitle": "Your crew's gym, one tap away",
-      "manage": "Manage",
-      "viewPage": "View page"
-    },
+    "cards": {},
     "gymSearch": {
-      "eyebrow": "Gym directory",
       "title": "Find a board near you",
-      "lead_one": "{{formattedCount}} gym, club wall or garage already has a board listed. Search by name or town, or let your browser find you.",
-      "lead_other": "{{formattedCount}} gyms, club walls and garages already have a board listed. Search by name or town, or let your browser find you.",
-      "leadNoCount": "Gyms, club walls and garages with a board on the wall are already listed. Search by name or town, or let your browser find you.",
-      "geoHint": "Location off? Type a town instead — same results, no permission prompt.",
-      "browseAll": "Browse the full gym directory"
+      "lead_one": "{{formattedCount}} gyms, club walls and home walls are listed in the board directory.",
+      "lead_other": "{{formattedCount}} gyms, club walls and home walls are listed in the board directory.",
+      "leadNoCount": "Gyms, club walls and garages with a board on the wall are already listed. Search by name or town, or let your browser find you."
     },
     "boards": {
       "title": "Popular boards",
@@ -108,13 +84,30 @@
       "preview": "Board preview: {{board}}",
       "typeAngle": "{{board}} · {{angle}}°",
       "selectedClimb": "Selected climb: {{climb}}",
-      "open": "Open this board"
+      "open": "Climb on this board"
     },
     "recentBeta": {
-      "title": "Fresh beta"
+      "title": "Fresh beta",
+      "lead": "See the climb and its beta: videos climbers have just linked."
+    },
+    "showcase": {
+      "videoLabel": "Demo: every board in one app, including a spray wall, then a crew queue, a workout plan and a logged send.",
+      "scenes": {
+        "boards": "Every board. One app.",
+        "spray": "Your spray wall, too.",
+        "wall": "See what's on the wall.",
+        "crew": "Your crew. One queue.",
+        "workouts": "Plan a workout, then climb it.",
+        "island": "Next climb, straight from your lock screen.",
+        "log": "Remember every send.",
+        "outro": "Less phone. More wall."
+      },
+      "unsupported": "Your browser can't play this video.",
+      "pause": "Pause demo",
+      "play": "Play demo"
     },
     "features": {
-      "title": "Board night, sorted",
+      "title": "What a session looks like",
       "lead": "From the first climb to the last send, keep the whole session together.",
       "queue": {
         "title": "Your crew. One live queue.",
@@ -130,16 +123,20 @@
         "title": "All your boards. One profile.",
         "body": "See your sends and progress across every board.",
         "shotAlt": "Your sends and progress across boards in the Boardsesh profile"
-      }
+      },
+      "spray": {}
     },
     "support": {
       "eyebrow": "Free, and staying that way",
       "title": "Boardsesh runs on climbers chipping in",
-      "p1": "No ads, no locked screens, no second tier. Every part of Boardsesh stays open to everyone, sponsor or not — self-hosting included.",
-      "p2": "Hosting, the database and the bills behind them are paid by the people who use it.",
       "chipIn": "Chip in",
       "source": "Read the source",
       "otherWays": "Not got money spare?"
+    },
+    "supportBanner": {
+      "text": "Boardsesh stays free and ad free thanks to the climbers that chip in. All contributions help, either once off or monthly.",
+      "cta": "Support us",
+      "close": "Close"
     }
   },
   "about": {
@@ -149,53 +146,58 @@
     },
     "openSource": {
       "title": "Open Source",
-      "body": "Boardsesh is open source under the Apache license. Browse the code, send a PR, file a bug, or fork the whole project.",
+      "body": "The code is public under the Apache 2.0 licence, so you can run your own copy. CONTRIBUTING.md is the starting point today; a maintained self-hosting guide is still to come.",
       "cta": "View on GitHub →"
     },
     "api": {
       "title": "API Documentation",
-      "body": "Want to build on climbing data? The API is public. Have at it.",
-      "cta": "Explore the API Documentation →"
+      "body": "The climb and grade read API is public. An app can read a climber’s logbook with their permission through the separate OAuth API; its current access rules are in the developer guide.",
+      "cta": "Explore the API Documentation →",
+      "status": {
+        "open": "App registration is open.",
+        "invitation": "App registration is invite only while we test it.",
+        "unavailable": "App connections are not available right now."
+      }
     },
     "community": {
       "title": "Join the Community",
       "body": "Whether you write code, set problems, or just want to tell us what's broken, we'd like to hear from you.",
       "discord": "Join the crew on Discord",
-      "support": "Support Boardsesh"
+      "support": "Chip in"
     },
     "legalLink": "Legal & Intellectual Property Policy",
     "footer": "Made by climbers. Open to everyone.",
-    "profile": {
-      "title": "All your boards. One profile.",
-      "shotAlt": "Your sends and progress across boards in the Boardsesh profile"
-    },
     "story": {
       "title": "Why this exists",
       "p1": "Every board comes with its own app, its own login and its own logbook. Climb a Kilter at your gym and a MoonBoard on holiday and you have two histories that never meet.",
-      "p2": "Then one of those apps vanished overnight and climbers lost their logbooks with it. That is what happens when one company owns the only way into hardware you already paid for.",
+      "p2": "When the old Kilter app stopped working in March 2026, some climbers lost access to their history. Boardsesh makes your logbook downloadable today: open Settings → Account → Export climbing data and choose a board. The code is public under Apache 2.0.",
       "link": "What happened, and how to get your data out"
     },
     "who": {
       "title": "Who builds it",
-      "body": "It started in 2024 with one climber and a repo, and it is still the kind of project people work on in the evenings. Bugs get found by someone standing at the wall, not by a QA team.",
+      "body": "Boardsesh is run by Marco de Jongh, a board climber based in Sydney, Australia, with code, translations and bug reports from other climbers. Reach him at support@boardsesh.com.",
       "cta": "See who has committed"
     },
     "next": {
       "title": "What's next",
-      "body": "More boards, better offline, and getting your data out as easily as it went in. The roadmap is public and the arguments about it happen on Discord.",
+      "body": "More boards, better offline climbing and history import from more apps. Follow the roadmap and join the discussion on Discord.",
       "cta": "Read the roadmap"
+    },
+    "profile": {
+      "title": "All your boards. One profile.",
+      "shotAlt": "Your sends and progress across boards in the Boardsesh profile"
     }
   },
   "support": {
     "hero": {
       "title": "Keep Boardsesh running",
-      "subtitle": "Free, open source, and paid for by climbers"
+      "ctaMonthly": "Support us"
     },
-    "promise": "No locked screens, no second tier, no ads. Chipping in pays the bill, nothing else.",
+    "promise": "Every climber gets the same app, whether they chip in or not. No ads in the app.",
     "why": {
       "title": "Why this page exists",
-      "p1": "Boardsesh is free and open source, and it always will be. Running it costs real money: hosting, the database, and infrastructure bills add up as more climbers join.",
-      "p2": "We promise not to enshittify Boardsesh, and self-hosting will always be an option. If you get something out of it and can spare it, chipping in keeps the lights on."
+      "p1": "Keeping Boardsesh running means paying for hosting, the database and the time spent building it.",
+      "p2": "The code is public under the Apache 2.0 licence, so you can run your own copy. If you can spare it, chipping in helps keep the work going."
     },
     "rails": {
       "title": "Ways to chip in"
@@ -210,6 +212,18 @@
       "body": "Pay by card, Apple Pay, or Google Pay in your browser. No account needed.",
       "cta": "Give once"
     },
+    "chooser": {
+      "cadenceLabel": "How often",
+      "monthly": "Monthly",
+      "once": "Give once",
+      "currencyLabel": "Currency",
+      "aud": "AUD",
+      "usd": "USD",
+      "perMonth": "{{amount}}/month",
+      "monthlyBody": "Monthly support pays for the time it takes to build Boardsesh. Pay by card, Apple Pay or Google Pay in your browser. No account needed.",
+      "publicName": "If you give a name at checkout, it may be shown publicly when we thank supporters. Leave it blank to give anonymously.",
+      "manage": "Already giving monthly? Change or stop it in Stripe →"
+    },
     "otherWays": {
       "title": "Other ways to help",
       "body": "Money is the slowest of these. Any of the four moves the app along.",
@@ -220,11 +234,11 @@
       },
       "translate": {
         "title": "Translate a screen",
-        "body": "The Spanish, French and German catalogs live in the repo. Fix a phrase or add a language.",
+        "body": "The Spanish, French, German and Italian catalogs live in the repo. Fix a phrase or add a language.",
         "cta": "Browse the locale catalogs →"
       },
       "patch": {
-        "title": "Send a patch",
+        "title": "Fix something in the code",
         "body": "The whole app is public: web, mobile, backend, and the board data behind them.",
         "cta": "See how it is built →"
       },
@@ -236,21 +250,27 @@
     },
     "honesty": {
       "title": "The small print",
-      "p1": "Donations are not tax-deductible. Boardsesh is not a charity, just climbers paying the server bill.",
-      "p2": "Your money goes to hosting, the database, and infrastructure. It buys nothing extra in the app: every part of Boardsesh stays open to everyone, sponsor or not."
+      "p1": "Donations are not tax-deductible. Boardsesh is not a charity.",
+      "p2": "Support pays for servers and development time. It buys nothing extra in the app."
     },
     "thanks": {
       "title": "Thanks",
       "body": "To everyone already sponsoring Boardsesh, reporting bugs, sending patches, or translating a screen: thank you. You keep this thing moving."
     },
+    "thanksState": {
+      "title": "Thank you",
+      "body": "Your support went through. It goes straight into building Boardsesh."
+    },
     "aboutLink": "Read more about the project →",
-    "docsLink": "See how it is built in the developer docs →",
-    "footer": "Free for everyone, funded by whoever can chip in."
+    "docsLink": "Read the source on GitHub",
+    "footer": "Free for everyone, funded by whoever can chip in.",
+    "legalLink": "Read the legal policy",
+    "privacyLink": "Read the privacy policy"
   },
   "legal": {
     "intro": {
       "title": "Legal & Intellectual Property Policy",
-      "p1": "Boardsesh is a free, open-source, community-built alternative for browsing and interacting with standardised LED climbing training boards (Kilter Board, Tension Board, MoonBoard, and others). It is non-commercial and maintained entirely by volunteers.",
+      "p1": "Boardsesh is a free, open-source, community-built app for browsing climbs and using compatible climbing boards, including Kilter, Tension and MoonBoard.",
       "p2": "We believe climbers should have the freedom to choose how they interact with hardware they've purchased, and that community-created data should remain accessible to the community."
     },
     "climbData": {
@@ -295,6 +315,18 @@
         "p2": "Our controller is designed to be interoperable with both this project's software and, at the user's discretion, official manufacturer apps. Any such interoperability is initiated by the end user on their own hardware."
       }
     },
+    "hostedService": {
+      "title": "Hosted service and API access",
+      "p1": "Boardsesh's code is open source under the Apache 2.0 licence. That licence covers the code. It does not cover the hosted service: the accounts, climb database, logbook sync and real-time servers that the Boardsesh apps and website connect to. We run and pay for those.",
+      "p2Start": "The public API documented on the",
+      "p2Link": "API docs page",
+      "p2End": "is for integrations: tools that read climb data, or act on behalf of a signed-in climber from their own account, within the rate limits the service applies.",
+      "p3": "The hosted service is not a backend for other apps. A publicly distributed app or fork whose accounts, climbing, board control or sessions run on Boardsesh's servers needs our written permission, and we do not currently grant it. Connecting a climber's Boardsesh account to your app with their permission is different: done through the OAuth API, within the scopes in the developer docs and under the developer terms you accept when you register the app, it is an integration and needs no further permission from us. If you fork Boardsesh, run your own backend too. The code is there for exactly that. The development setup in CONTRIBUTING.md is the starting point today; official self-hosting docs are still to come.",
+      "p4Start": "You do not have to start from an empty database either. The",
+      "p4Link": "nightly board snapshots",
+      "p4End": "are public SQLite files of the climb catalogs, cheap for us to serve, and you are welcome to use them. We are also happy to talk about syncing non-user data such as climbs and grades to an alternative service.",
+      "contact": "Questions about this policy:"
+    },
     "trademark": {
       "title": "Trademark Usage",
       "body": "We use board and product names (e.g. \"Kilter Board\", \"MoonBoard\", \"Tension Board\") solely to describe hardware compatibility and interoperability. These names are trademarks of their respective owners. This project is not affiliated with, endorsed by, or sponsored by Aurora Climbing, Moon Climbing, or any board manufacturer."
@@ -326,382 +358,127 @@
       "licenseLink": "CC BY 4.0",
       "copyright": ". Copyright 2024 Fonticons, Inc."
     },
-    "footer": "This document is provided for informational purposes and does not constitute legal advice. Last updated: 08-02-2026"
+    "footer": "This document is provided for informational purposes and does not constitute legal advice. Last updated: 10-08-2026"
   },
   "help": {
     "clip": {
       "unsupported": "Your browser can't play this clip.",
       "playHint": "Press play to watch the gesture."
     },
-    "hero": {
-      "title": "Help",
-      "subtitle": "Guides for the app, bringing your Kilter or Tension logbook across, and where to ask."
-    },
-    "web": {
-      "title": "On this site",
-      "intro": "Everything on boardsesh.com works in a browser, signed out.",
-      "item1": "Look up a climb's grade, setter, ascents and beta videos.",
-      "item2": "Browse a board's catalog by layout, size and angle.",
-      "item3": "Share a climb, playlist or profile as a link.",
-      "item4": "Find gyms with boards near you.",
-      "playlistsLink": "Browse playlists",
-      "aboutLink": "About Boardsesh"
-    },
-    "app": {
-      "title": "In the app",
-      "intro": "Anything that touches the wall or your logbook happens in the app.",
-      "item1": "Build a queue and work through it with your crew.",
-      "item2": "Run a live session so every phone drives one queue.",
-      "item3": "Light holds over Bluetooth on Kilter, Tension and MoonBoard walls.",
-      "item4": "Log sends and attempts, and attach beta videos."
-    },
-    "aurora": {
-      "title": "Bring your Kilter or Tension logbook",
-      "intro": "Link your board account once and your sends come across.",
-      "item1": "Tap your avatar, then Settings, then Connected apps. Under Board Accounts, tap Link on the Tension card or Sign in to Kilter on the Kilter card, and enter that board's username and password.",
-      "item2": "Used the old Kilter app? The Kilter (Aurora) card takes a JSON export instead.",
-      "link": "Read the migration guide",
-      "item3": "Sync runs one way, from their apps into Boardsesh, about every 12 hours. Nothing goes back."
-    },
-    "climbCounts": {
-      "title": "Why does Kilter's app show more climbs?",
-      "intro": "Both apps have the same climbs and count them differently.",
-      "item1": "Boardsesh counts each climb once.",
-      "item2": "Kilter's app appears to count a climb once per angle it has been climbed at.",
-      "item3": "On an 8x12 Kilter home wall that is about 18,000 climbs in Boardsesh and about 36,000 in Kilter's app."
-    },
-    "ask": {
-      "title": "Ask a question",
-      "intro": "Discord is the fastest place to get an answer.",
-      "discord": "Ask on Discord",
-      "github": "Open an issue on GitHub",
-      "docs": "Read the developer docs",
-      "bugLead": "Found a bug?",
-      "devLead": "Building on the API?"
-    },
     "nav": {
       "label": "Breadcrumb",
       "home": "Home",
-      "help": "Help"
+      "help": "Help",
+      "jump": "On this page"
     },
-    "guides": {
-      "title": "Guides",
-      "intro": "Seven short pages with app screenshots.",
-      "playlists": {
-        "title": "Playlists",
-        "body": "Make a playlist, take a climb back out, queue the whole list, and use the eight built-in lists."
-      },
-      "climbActions": {
-        "title": "Climb actions",
-        "body": "Hold a climb to preview it without lighting the wall, log a tick or add to a playlist."
-      },
-      "sessions": {
-        "title": "Live sessions",
-        "body": "Start a session, invite your crew by QR code or link, and browse without moving the wall."
-      },
-      "findingClimbs": {
-        "title": "Finding climbs",
-        "body": "Filter climbs by grade, hold, part of the wall or setter, and pin the filters you use."
-      },
-      "logbook": {
-        "title": "Your logbook",
-        "body": "Log a send at the board, then change its grade, stars, tries or status later."
-      },
-      "bluetooth": {
-        "title": "Board and Bluetooth",
-        "body": "Connect to the board, fix a failed connection, and control it from the lock screen with Live Activity."
-      },
-      "betaVideos": {
-        "title": "Beta videos",
-        "body": "Share a reel from Instagram or TikTok into Boardsesh, attach it to a climb, and find others' beta."
-      }
+    "install": {
+      "title": "Get the app",
+      "intro": "Lighting the wall, logging sends and crew sessions all happen in the app."
     },
-    "playlists": {
-      "breadcrumb": "Playlists",
-      "hero": {
-        "title": "Make a playlist and climb it in order",
-        "subtitle": "Save climbs for later and load the list into your queue."
-      },
-      "build": {
-        "title": "Make a playlist",
-        "intro": "Each playlist belongs to one board.",
-        "step1": "Open Discover. Check the board pill at the top.",
-        "step2": "Tap the plus. Name it, pick a color, tap Create.",
-        "step3": "It appears under My Playlists.",
-        "p1": "To add a climb, swipe its row left, or press and hold it and tap Add to Playlist.",
-        "p2": "The picker only shows playlists for the climb's board and layout.",
-        "clipAlt": "Swiping a climb row left to add it to a playlist",
-        "clipCaption": "Swipe left to file it in a playlist. Swipe right to queue it.",
-        "shotAlt": "The Discover tab",
-        "shotCaption": "Pinned, then My Playlists, then For You.",
-        "playlistShotAlt": "Your own playlist",
-        "playlistShotCaption": "Pin, edit, reorder or remove."
-      },
-      "remove": {
-        "title": "Take a climb back out",
-        "p1": "From the climb, open Add to Playlist and tap the ticked playlist.",
-        "p2": "From the playlist, tap the pencil, or choose Reorder & remove climbs from the ⋯ menu. Tap the red minus and confirm. Drag the handle to reorder.",
-        "p3": "For You lists have no edit mode. Un-heart a climb or log the send instead.",
-        "clipAlt": "Unticking a playlist",
-        "clipCaption": "Tap a ticked playlist and the climb comes back out."
-      },
-      "queue": {
-        "title": "Climb the whole list",
-        "intro": "Tap a climb in a playlist and your queue becomes that playlist.",
-        "p1": "It loads in order from the climb you tapped. If climbs were queued after your current one, Start playlist? asks first. The header's play button starts from the top.",
-        "p2": "In a session, tapping only opens the climb for you. The shared queue stays put.",
-        "sessionsLink": "How a session shares one queue",
-        "clipAlt": "The Start playlist? sheet",
-        "clipCaption": "With climbs already queued, Start playlist? asks first."
-      },
-      "smart": {
-        "title": "The eight lists Boardsesh builds for you",
-        "crowdFavorites": "Crowd Favorites. Well-rated, well-sent climbs you haven't done.",
-        "hiddenGems": "Hidden Gems. Rated 4.5 stars or better, sent by few.",
-        "atYourLevel": "At Your Level. Popular climbs around your sending grade.",
-        "fresh": "Fresh. New on your board, followed setters first.",
-        "fiveStars": "Five Stars. Climbs you rated five stars.",
-        "mostRepeated": "Most Repeated. Climbs with more than one logged attempt.",
-        "projects": "Projects. Climbs you've logged but never sent.",
-        "likedClimbs": "Liked Climbs. Every climb you've hearted.",
-        "p1": "They sit under For You on Discover. The first four read your board at your angle and skip your sends. The last four come from your ticks and hearts.",
-        "p2": "Tap a card's pin to move it into Pinned. Pinned For You lists stay on this phone."
-      },
-      "tags": {
-        "title": "See which playlists a climb is in",
-        "p1": "Under Settings, then Display, turn on Show playlist tags. Rows in a playlist grow chips. Tapping a chip doesn't open the playlist."
-      },
-      "next": {
-        "title": "Keep going",
-        "climbActions": "What a long press can do",
-        "browse": "Browse public playlists on the web",
-        "hub": "All help topics"
-      }
-    },
-    "sessions": {
-      "breadcrumb": "Live sessions",
-      "hero": {
-        "title": "Live sessions with your crew",
-        "subtitle": "Start a session, share the link, and every phone works one queue."
-      },
-      "start": {
-        "title": "Start a session",
-        "intro": "Every session starts from the Session tab.",
-        "step1": "Open the Session tab. Check the board at the top.",
-        "step2": "Show this session live lets your crew see and join it. Off, only your invite link works.",
-        "step3": "Tap Start, then Invite climbers for a QR code, Copy link and Share.",
-        "shotAlt": "A live session",
-        "shotCaption": "Who has joined, what's queued and what's lit.",
-        "liveShotAlt": "The Climbing now rail",
-        "liveShotCaption": "Climbing now on the Home tab lists sessions you can join."
-      },
-      "join": {
-        "title": "Join a session",
-        "way1": "Scan the host's QR code or open their link.",
-        "way2": "On the Home tab, look under Climbing now.",
-        "way3": "Tap the board at the top of the Climbs tab, then Climbing here now.",
-        "p1": "Each opens a Join Sam's session? card. Tap Join session."
-      },
-      "queue": {
-        "title": "One queue, every phone",
-        "p1": "Anyone in the session can add, reorder or remove climbs. Your avatar marks your rows.",
-        "p2": "Only the climber who started the session can end it. Everyone else taps Leave session."
-      },
-      "wall": {
-        "title": "Who lights the wall",
-        "p1": "A board takes one Bluetooth connection at a time. On every other phone, preview a climb and tap the lightbulb, and the connected phone lights it for you.",
-        "p2": "On a wall with no lights the bulb says Take the wall.",
-        "bluetoothLink": "Connecting to a board"
-      },
-      "crowd": {
-        "title": "Browsing without moving the wall",
-        "p1": "With someone else in your session, swiping stops lighting the board and a Browsing pill appears. Tap Put on the wall when you want it.",
-        "p2": "Climbing alone? Hold the lightbulb and turn off Light problems on swipe and Light problems when tapping the list.",
-        "previewLink": "Preview a climb from any list"
-      },
-      "history": {
-        "title": "Sessions on your profile",
-        "p1": "Your profile's Sessions tab lists every session with its climbs and sends.",
-        "p2": "The end-of-session summary has Save to Apple Health and Share to Strava. Connected apps in Settings automates it."
-      },
-      "next": {
-        "title": "Keep going",
-        "playlists": "Load a playlist into the queue",
-        "hub": "All help topics"
-      }
-    },
-    "findingClimbs": {
-      "breadcrumb": "Finding climbs",
-      "hero": {
-        "title": "Find climbs by hold, region or setter",
-        "subtitle": "Where each filter on the Climbs tab lives."
-      },
-      "start": {
-        "title": "Grade and angle first",
-        "p1": "Tap the Grade pill next to search. Tap a grade to show only that grade, a second grade within three seconds for a range, and the selected grade again to clear.",
-        "p2": "Every grade and send count is read at the board's angle. Tap the degrees chip to change it.",
-        "p3": "Signed in, the Progress chips filter by your history. Unsent hides your sends, Projects keeps climbs tried but not sent, Not tried keeps climbs never logged.",
-        "clipAlt": "Building a grade range",
-        "clipCaption": "Two quick taps build a range. Tap the same grade again to clear it."
-      },
-      "holds": {
-        "title": "Filter by hold",
-        "intro": "Open Filters, scroll to The climb and tap Hold types.",
-        "step1": "Pick Include or Exclude.",
-        "step2": "Pick a hold type.",
-        "step3": "Pinch to zoom, then tap holds. Tap again with the same brush to clear a mark.",
-        "p2": "A hold can carry more than one mark. Clear all wipes the board.",
-        "p3": "MoonBoard has no Foot brush.",
-        "clipAlt": "Marking holds",
-        "clipCaption": "Pick a brush first, then tap holds."
-      },
-      "zone": {
-        "title": "Box off part of the wall",
-        "intro": "Open Filters, scroll to The climb and tap Board region.",
-        "p1": "Tap Add a region. Drag the middle to move the box, a corner to resize it. All holds keeps climbs entirely inside it, Any hold keeps climbs that reach in.",
-        "p2": "Clear region removes the box. Hold and region filters need a connection.",
-        "clipAlt": "Moving and resizing the region",
-        "clipCaption": "Drag the middle to move the box, a corner to resize it."
-      },
-      "setters": {
-        "title": "Follow setters, then search only them",
-        "p1": "Follow sits on a setter's page and on the Setters screen, under Filters. Then turn on Climbs by people I follow, just below Setters.",
-        "p2": "The Setters screen is also a picker. Check a box to filter, or tap a name to browse their climbs.",
-        "shotAlt": "The Setters screen",
-        "shotCaption": "Check a box to filter. Tap a name to browse."
-      },
-      "rows": {
-        "title": "What a climb row can do",
-        "p1": "Swipe right to queue the climb. Swipe left for the playlist picker. Neither lights the board.",
-        "p2": "The small glyph is your history. A bolt means flashed, a circled tick sent, a circled cross tried, a circled C benchmark.",
-        "actionsLink": "Everything in the long-press menu",
-        "p3": "Press and hold a row for the full action menu.",
-        "clipAlt": "Swiping a row both ways",
-        "clipCaption": "Right queues it, left opens the playlist picker."
-      },
-      "keep": {
-        "title": "Keep the filters you use",
-        "p1": "Most filters have a pin next to their name. Tap it and the filter becomes a chip above the list.",
-        "p2": "The button at the bottom shows how many climbs match. Reset clears everything."
-      },
-      "next": {
-        "title": "Keep going",
-        "climbActions": "What a long press gets you",
-        "playlists": "Save finds into a playlist",
-        "hub": "All help topics"
-      }
-    },
-    "logbook": {
-      "breadcrumb": "Your logbook",
-      "hero": {
-        "title": "Log a send, then change it later",
-        "subtitle": "Tick a climb from the board in two taps, and change it any time."
-      },
-      "log": {
-        "title": "Log it at the wall",
-        "p1": "Tap the big tick in the play drawer, or Log ascent on the queue bar. Date and Time are filled in as now, the rest is optional.",
-        "p2": "Attempt logs a go that didn't stick. The other button reads Flash on your first logged go at this angle, otherwise Send.",
-        "shotAlt": "The tick button",
-        "shotCaption": "The tick opens the log sheet.",
-        "logbookShotAlt": "The logbook",
-        "logbookShotCaption": "Swipe right to edit, left to delete."
-      },
-      "edit": {
-        "title": "Change an entry you already logged",
-        "p1": "Open the Profile tab, then Logbook. Swipe a row right, or press and hold it and pick Edit logbook entry.",
-        "field1": "Status. Flash, Send or Attempt.",
-        "field2": "Angle and Tries. Date and time stay as logged.",
-        "field3": "Grade, Stars and Note.",
-        "p2": "If one row bundles several goes from one day, the app asks Which entry to edit?",
-        "p3": "Edits need a connection. A new tick saves offline and syncs later.",
-        "clipAlt": "Swiping a logbook row",
-        "clipCaption": "A short swipe shows the pencil or the bin. A full swipe left asks before deleting."
-      },
-      "delete": {
-        "title": "Delete an entry",
-        "p1": "Swipe the row left, or tap Delete this ascent at the bottom of the edit sheet. Both ask to confirm. There is no undo.",
-        "p2": "Deleting removes the ascent's comments and votes and recounts your stats."
-      },
-      "repeats": {
-        "title": "Attempts, sends and repeats",
-        "p1": "One row per climb, per day, per angle. Four goes tonight are one row with tries added up and the best result showing. Mirrored goes get their own row.",
-        "p2": "Next week's goes are a new row."
-      },
-      "find": {
-        "title": "Find an old entry",
-        "p1": "Search matches climb names. Filter sorts by Latest or Hardest and narrows by status, Flash only, grade, angle, date and Benchmarks only. There is no board filter.",
-        "p2": "Sends from a linked Kilter or Tension account come across too. Tap your avatar, then Settings, then Connected apps.",
-        "auroraLink": "Read the migration guide"
-      },
-      "next": {
-        "title": "Keep going",
-        "climbActions": "Log a tick from any list",
-        "findingClimbs": "Find the climb again",
-        "hub": "All help topics",
-        "betaVideos": "Attach a beta video"
-      }
-    },
-    "bluetooth": {
+    "board": {
       "breadcrumb": "Board and Bluetooth",
       "hero": {
-        "title": "Connect your phone to the board",
-        "subtitle": "Tap the lightbulb, pick your board, and your climb lights up."
+        "title": "Put a climb on your board",
+        "subtitle": "A tap previews a climb. Put on board lights it, and the wall follows your picks for a while."
       },
       "connect": {
-        "title": "Connect",
-        "p1": "Tap the lightbulb in the play drawer or the top bar, then tap your board in Select Board. The list runs strongest signal first, each row with its serial.",
-        "p2": "The first time, iOS asks for Bluetooth. Android asks for nearby devices, or Location on Android 11 and older.",
-        "shotAlt": "The Select Board sheet",
-        "shotCaption": "Strongest signal first, with serials.",
-        "litShotAlt": "A lit climb",
-        "litShotCaption": "A filled bulb means the wall is lit.",
-        "p3": "At a different wall? Change board is the first row behind your avatar."
+        "title": "Put a climb on the wall",
+        "lead": "A tap shows you the climb. Put on board connects if needed and lights it.",
+        "clipAlt": "Tapping Put on board starts a timed drive, shown by a clock and shrinking frost",
+        "clipCaption": "Tap Put on board. The clock starts, and each new climb you pick refills it.",
+        "step1": "In a climb, tap the large Put on board button.",
+        "step2": "First time only, pick your board from the list. Don't see it? Tap Search for any board.",
+        "step3": "Allow Bluetooth when asked. Android asks for Nearby devices, or Location on Android 11 and older.",
+        "otherBoard": "A climb from another board at your gym shows Put on Tension, or that board's name. Tap it to move there and light the climb.",
+        "changeBoard": "At a different wall? Change board is the first row behind your avatar."
       },
-      "hidden": {
-        "title": "Hold the lightbulb",
-        "p1": "While connected, press and hold the lightbulb for these controls, top to bottom.",
-        "row1": "Auto-disconnect. Frees the board after 30 seconds idle. Change the time under Settings.",
-        "row2": "Light the hold above. MoonBoard only.",
-        "row3": "Light problems on swipe.",
-        "row4": "Light problems when tapping the list. Turn both off and browsing stops changing the wall.",
-        "row5": "Re-light board. Sends the climb to the LEDs again.",
-        "row6": "Turn off all lights. Your phone stays connected.",
-        "row7": "Disconnect board. Use it when you connected to the wrong wall.",
-        "p2": "A short tap reconnects to the last board you used."
+      "driving": {
+        "title": "Driving the wall",
+        "lead": "When you are driving the wall, every climb you pick lights at once.",
+        "looking": "Otherwise a tap opens a preview, and the wall keeps its climb.",
+        "waysIntro": "Three ways to start driving:",
+        "way1": "Put on board lights the climb, then drives for a set time: 45 seconds unless you change it. Each pick restarts the clock.",
+        "way2": "Swipe the wall button left until it reads Let go to light every climb, then let go. Or, once connected, hold it and pick Light every climb. You drive until you tap You are driving the wall.",
+        "way3": "Turn on Always drive the wall in Settings, then Board. Whenever your phone holds the board, you drive. A tap pauses it until the board disconnects or you tap Put on board.",
+        "tell": "A frosted wall button reading You are driving the wall means you are driving.",
+        "tellClock": "A clock beside the label means a timed drive, and the frost shrinks as time runs out. No clock means it lasts until you tap. On the mini player, the bulb turns amber while you drive.",
+        "clipAlt": "Swiping the wall button left to start driving, then tapping it to stop",
+        "clipCaption": "Swipe left and let go to light every climb. Tap You are driving the wall to stop.",
+        "end1": "You tap You are driving the wall.",
+        "end2": "The clock runs out. Timed drives only.",
+        "end3": "A crewmate puts a climb up. Timed drives only.",
+        "end4": "You tap Turn off all lights, the connection drops, or you switch boards or sessions.",
+        "after": "After a drive, your next pick opens as a preview again.",
+        "states": {
+          "lookingAlt": "Player showing a preview: the top bar reads Preview · not on the wall and the button reads Put on board",
+          "timedAlt": "Player while driving with a clock: the button reads You are driving the wall · 0:28",
+          "openAlt": "Player while driving with no clock: the button reads You are driving the wall",
+          "lookingLabel": "Looking",
+          "lookingTitle": "Put on board",
+          "lookingBody": "Nothing lights until you tap it.",
+          "timedLabel": "Timed drive",
+          "timedTitle": "Clock counts down",
+          "timedBody": "The clock counts down after Put on board.",
+          "openLabel": "Swipe to drive",
+          "openTitle": "No clock",
+          "openBody": "It lights until you tap."
+        },
+        "statesEyebrow": "Read the wall button",
+        "statesTitle": "Three states of the wall button",
+        "endsTitle": "A drive ends when",
+        "stop": "Tap <label>{{drivingLabel}}</label> to stop driving."
+      },
+      "history": {
+        "title": "What's on the wall now",
+        "lead": "Board history lists every climb this wall has lit, whoever lit it, newest first.",
+        "p1": "Tap the clock in the Climbs header to open it. Tap a climb to preview it. Your queue's History is a separate list.",
+        "p2": "The Climbs header capsule shows the wall's climb while a connected phone has it lit, or for an hour after it went up. You can hide it until a different climb goes up."
+      },
+      "controls": {
+        "title": "Board controls and settings",
+        "lead": "While connected, hold the wall button to open Board controls.",
+        "shotAlt": "Board controls for a connected board",
+        "shotCaption": "Re-light, turn off all lights or disconnect.",
+        "lightingShotAlt": "Board lighting settings with drive duration and automatic lighting controls",
+        "lightingShotCaption": "Settings, then Board: when driving stops.",
+        "row1": "Stop driving after. Change the drive time, or pick Right away.",
+        "row2": "Re-light board. Sends the climb to the LEDs again.",
+        "row3": "Turn off all lights. This also stops driving.",
+        "row4": "Disconnect board. Use it when you connected to the wrong wall.",
+        "row5": "Light the hold above. MoonBoard only.",
+        "settingsIntro": "Settings, then Board holds the rest:",
+        "setting1": "Stop driving after: Right away, 30 seconds up to 5 minutes, or Until I stop.",
+        "setting2": "Always drive the wall: off by default.",
+        "setting3": "Disconnect Bluetooth when driving ends: off by default. It frees the board for the next climber.",
+        "setting4": "In a session too: on by default. It lets you drive in a crew.",
+        "bulb": "Prefer a lightbulb? Set Board control to Lightbulb under ⋯, View options, Buttons."
+      },
+      "control": {
+        "title": "When another phone has the board",
+        "lead": "A Kilter or Tension board talks to one phone at a time, and a new connection drops the old one.",
+        "p1": "MoonBoard V3+ takes several phones. The original MoonBoard box keeps the first phone, and may need a controller restart.",
+        "p2": "In a crew, only the phone holding the board connects. Your Put on board goes through that phone, and its face shows on your wall button.",
+        "sessionsLink": "More on sharing a wall"
+      },
+      "liveActivity": {
+        "title": "Lock screen and Dynamic Island",
+        "lead": "Start a session, alone is fine, and your lock screen gets board controls.",
+        "p1": "On iPhone, a Live Activity shows the climb on the wall and its grade. While your phone holds the board it adds Previous, Next and a lightbulb that re-lights the wall.",
+        "p2": "Next steps your queue, not the list you were swiping, and lights that climb at once. Like Put on board, it starts or extends a drive.",
+        "p3": "Android shows the same controls in a notification. Locking the screen never disconnects the board."
       },
       "failed": {
-        "title": "When it won't connect",
-        "intro": "The Couldn't connect alert names the problem.",
+        "title": "Board won’t light up?",
+        "lead": "The Couldn't connect alert names the problem.",
         "fix1": "Couldn't find your board. Check it's on and you're near it. If another phone is connected, disconnect there first.",
         "fix2": "Couldn't connect. Move closer and try again.",
         "fix3": "Connected, but the board didn't respond. Turn the board off and on.",
         "fix4": "Bluetooth is off. Turn it on.",
-        "fix5": "Couldn't connect to your board. Try again. If it keeps happening, turn Bluetooth off and on.",
-        "p1": "On Android, if nothing is found, tap Allow Location or Turn on Location at the bottom of the sheet."
-      },
-      "twoBoards": {
-        "title": "Two boards in range",
-        "p1": "Read the serial before you tap. The signal bars don't update while you stand there.",
-        "p2": "A Board configuration doesn't match alert means the controller belongs to a different board setup. Pick Cancel, Connect anyway or Switch board setup."
-      },
-      "duplicate": {
-        "title": "The same board listed twice",
-        "p1": "Two rows with different serials are two controllers. A row that reads only Kilter Board, with no serial, is a newer manufacturer-built LED box. Two of those in one gym show as two rows. The one with more signal bars is usually the wall you're standing at. If the wrong wall lights, hold the lightbulb, tap Disconnect board and try again.",
-        "p2": "There is no forget-this-device list. The app only remembers your last board.",
-        "p3": "A board showing twice under Your boards is different. Tap Edit next to Your boards, then Delete or Unfollow."
-      },
-      "control": {
-        "title": "When someone else has the board",
-        "p1": "In a session, one phone holds the board. On the others, preview a climb and tap the lightbulb, and the holder's phone lights it.",
-        "p2": "On walls with no lights the button reads Take the wall.",
-        "sessionsLink": "More on sharing a wall"
-      },
-      "liveActivity": {
-        "title": "Control the board from the lock screen (Live Activity)",
-        "intro": "Start or join a session first. A solo queue doesn't get one.",
-        "p1": "On iPhone, a session puts a Live Activity on the lock screen and in the Dynamic Island with the climb, its grade and your place in the queue. While your phone holds the board it also has Previous, Next, a lightbulb that re-lights the wall, and Mirror climb where supported.",
-        "p2": "Android shows the same controls in an ongoing notification called Active climbing session.",
-        "p3": "Locking the screen doesn't disconnect the board."
+        "fix5": "On Android, if nothing is found, tap Allow Location or Turn on Location at the bottom of the sheet.",
+        "twoBoards": "Two boards in range? Yours is listed first. Read the serial before you tap. A Board configuration doesn't match alert means the controller has a different setup. Pick Cancel, Connect anyway or Switch board setup.",
+        "duplicate": "Same board listed twice? Two serials are two controllers. A row reading only Kilter Board is a newer LED box, and more signal bars usually means your wall. If the wrong wall lights, tap Disconnect board in Board controls.",
+        "duplicateYourBoards": "A board twice under Your boards is different. Tap Edit, then Delete or Unfollow.",
+        "compareApps": "Kilter or MoonBoard app not working? Compare the apps for <kilter>Kilter</kilter> and <moonboard>MoonBoard</moonboard>."
       },
       "next": {
         "title": "Keep going",
@@ -709,188 +486,420 @@
         "hub": "All help topics"
       }
     },
-    "climbActions": {
-      "breadcrumb": "Climb actions",
+    "climbs": {
+      "breadcrumb": "Find, play and save climbs",
       "hero": {
+        "title": "Find, play and save climbs",
+        "subtitle": "Filter the list, swipe through it, press and hold for more, and save climbs to playlists."
+      },
+      "player": {
+        "title": "Swipe through a list",
+        "lead": "A tap previews a climb, and swiping walks the list you tapped it from.",
+        "p1": "The top bar says Preview · not on the wall and names the list, like Search results · 4 of 23. The wall, your queue and everyone else's phone stay as they were.",
+        "p2": "From the climb on the wall, swipes go to Up next first. Then they carry on into the list that climb came from, which the queue sheet shows under Then from and the list's name. The end of the list shows an end card.",
+        "p3": "The back chip takes you to the climb on the wall. The mini player is your last look: tap it to reopen that preview with its list.",
+        "p4": "In a crew, the top bar says Only you see this, and each phone walks its own list.",
+        "callout": "Put on board makes a previewed climb the wall's climb. While you are driving the wall there is no preview: every pick lights at once.",
+        "drivingLink": "How driving works",
+        "clipAlt": "Swiping through a list in the player",
+        "clipCaption": "Swipe through the list. The wall keeps its climb."
+      },
+      "menu": {
         "title": "Press and hold a climb",
-        "subtitle": "Every action on a climb sits behind a long press on its row."
-      },
-      "open": {
-        "title": "Open the menu",
-        "p1": "Press and hold a climb row. It lifts into a card with Log a tick, Add to Playlist and Share on top and the rest below.",
-        "p2": "Prefer a tap? Under Settings, then Display, turn on Show quick-actions button for a ⋮ on every Climbs row.",
-        "shotAlt": "The climb actions card",
-        "shotCaption": "Three quick buttons on top, the full list below.",
-        "clipAlt": "Holding a climb row",
-        "clipCaption": "Hold the row and the card lifts on its own."
-      },
-      "preview": {
-        "title": "Preview a climb without lighting the board",
-        "intro": "Preview is the first item in the list.",
-        "p1": "It opens the climb in the play drawer without touching your queue. Your next swipe returns to your queue.",
-        "p2": "In a session, or with Light problems on swipe off, a Browsing pill appears. Tap Set active or Put on the wall when you want the climb.",
-        "sessionsLink": "How a session keeps browsing off the wall",
-        "clipAlt": "The Browsing pill",
-        "clipCaption": "The pill arrives after the swipe. The wall stays as it was."
-      },
-      "quick": {
-        "title": "The three buttons across the top",
-        "tick": "Log a tick opens the ascent sheet.",
-        "playlist": "Add to Playlist is a checklist. Tick to add, untick to remove.",
-        "share": "Share hands a link to your phone's share sheet.",
-        "p1": "The card closes when an action fires, except Add to Playlist."
-      },
-      "rest": {
-        "title": "The rest of the list",
-        "queue": "Add to queue puts the climb after your current one.",
-        "favorite": "Toggle favorite is the heart. Hearted climbs fill Liked Climbs.",
-        "editEntry": "Edit logbook entry, when you came from your logbook.",
-        "betaVideo": "Add beta video, when signed in.",
-        "edit": "Edit climb, for your own climbs as a draft or within 24 hours of publishing.",
+        "lead": "Press and hold a climb row for every action on that climb.",
+        "p1": "Tap an action, or tap outside to close. Log a tick, Add to Playlist and Share are the ones you will use most.",
+        "playNext": "Play next puts the climb at the top of Up next. Play last puts it at the bottom.",
+        "favorite": "Toggle favorite saves the climb to Liked Climbs. Once it's there, the row reads Remove favorite.",
         "remix": "Remix this climb starts a new climb from these holds.",
-        "openInAurora": "Open in Aurora app, for Tension and other Aurora boards. Kilter has none.",
-        "report": "Report climb, when signed in and moderation is on."
+        "edit": "Edit climb works on your own climbs, as a draft or within 24 hours of publishing.",
+        "others": "Add beta video, Edit logbook entry, Open in Aurora app and Report climb show up when they apply.",
+        "p2": "Prefer a tap? Turn on Show quick-actions button under Settings, then Climbs & grades, then Climb list. Every row gets a ⋮ that opens the same menu.",
+        "betaLink": "Attach a beta video",
+        "clipAlt": "Holding a climb row",
+        "clipCaption": "Hold the row and the menu opens on its own."
       },
-      "next": {
-        "title": "Keep going",
-        "logbook": "Edit what you logged",
-        "playlists": "Playlists",
-        "hub": "All help topics",
-        "betaVideos": "Beta videos"
+      "filters": {
+        "title": "Filter by grade, hold, region or setter",
+        "lead": "Open Filters on the Climbs tab. A pin next to a filter's name turns it into a chip above the list.",
+        "grade": "Tap Grade, then a grade. Tap a second grade within three seconds for a range, or the selected grade again to clear.",
+        "angle": "Grades and send counts use the board's angle. Tap the degrees chip to change it.",
+        "progress": "Signed in, the Progress chips use your history. Unsent hides your sends, Projects keeps climbs tried but not sent, and Not tried keeps climbs never logged.",
+        "gradeClipAlt": "Building a grade range",
+        "gradeClipCaption": "Two quick taps build a range.",
+        "holdsIntro": "To filter by hold, scroll to The climb in Filters and tap Hold types.",
+        "holdStep1": "Pick Include or Exclude.",
+        "holdStep2": "Pick a hold type.",
+        "holdStep3": "Pinch to zoom, then tap holds. Tap again with the same brush to clear a mark.",
+        "holdNote": "Clear all wipes the board. MoonBoard has no Foot brush.",
+        "holdClipAlt": "Marking holds",
+        "holdClipCaption": "Pick a brush first, then tap holds.",
+        "region": "To box off part of the wall, tap Board region, then Add a region. Drag the middle to move the box and a corner to resize it.",
+        "regionModes": "All holds keeps climbs entirely inside the box. Any hold keeps climbs that reach into it.",
+        "regionClipAlt": "Moving and resizing the region",
+        "regionClipCaption": "Drag the middle to move the box, a corner to resize it.",
+        "setters": "Tap Follow on a setter's page or on the Setters screen. Then turn on Climbs by people I follow, just below Setters.",
+        "settersPicker": "On the Setters screen, check a box to filter or tap a name to browse their climbs.",
+        "shotAlt": "The Setters screen",
+        "shotCaption": "Check a box to filter. Tap a name to browse.",
+        "count": "The button at the bottom shows how many climbs match. Reset clears every filter."
+      },
+      "rows": {
+        "title": "Swipe a climb row",
+        "lead": "Swipe right to play a climb next, or left to add it to a playlist.",
+        "p1": "Neither swipe lights the board.",
+        "p2": "The small glyph is your history: a bolt for flashed, a circled tick for sent, a circled cross for tried, a circled C for benchmark.",
+        "clipAlt": "Swiping a row both ways",
+        "clipCaption": "Right plays it next. Left opens the playlist picker."
+      },
+      "playlists": {
+        "title": "Playlists",
+        "lead": "A playlist is a saved list of climbs for one board, and you walk it with swipes.",
+        "step1": "Open Discover and check the board pill at the top.",
+        "step2": "Tap the plus, name it, pick a color and tap Create.",
+        "step3": "Add climbs: swipe a row left, or press and hold it and tap Add to Playlist.",
+        "p1": "Your playlist appears under My Playlists. The picker only shows playlists for the climb's board and layout.",
+        "play": "To play a playlist, tap a climb in it and swipe. The play button in the header starts from the first climb.",
+        "remove": "To take a climb out, open Add to Playlist on it and tap the ticked playlist. Or tap the pencil on the playlist, tap the red minus and confirm.",
+        "reorder": "Drag the handle to reorder. For You lists have no edit mode, so un-heart a climb or log the send instead.",
+        "removeClipAlt": "Unticking a playlist",
+        "removeClipCaption": "Tap a ticked playlist and the climb comes back out.",
+        "forYou": "Discover builds eight For You lists: Crowd Favorites, Hidden Gems, At Your Level, Fresh, Five Stars, Most Repeated, Projects and Liked Climbs.",
+        "forYouHow": "The first four read your board at your angle and skip your sends. The last four come from your ticks and hearts.",
+        "tags": "To see which playlists a climb is in, turn on Show playlist tags under Settings, then Climbs & grades, then Climb list.",
+        "browse": "Browse public playlists on the web",
+        "discoverShotAlt": "The Discover tab",
+        "discoverShotCaption": "Pinned, then My Playlists, then For You.",
+        "detailShotAlt": "Your own playlist",
+        "detailShotCaption": "Pin, edit, reorder or remove."
+      },
+      "diagram": {
+        "description": "Where a swipe goes in the player. Open a climb from a list and swiping shows the climb before or after it in that list, without lighting anything. Put on board lights a preview. From the climb on the wall, swiping goes to Up next first, then the list it came from, then an end card.",
+        "listCaption": "Tap a climb in a list: swipes walk that list. Nothing lights.",
+        "listName": "Search results",
+        "listCurrent": "{{list}} · 4 of 23",
+        "listPrevious": "Climb 3",
+        "listNext": "Climb 5",
+        "wallCaption": "From the climb on the wall: Up next first, then the list it came from.",
+        "preview": "Preview · not on the wall",
+        "putOnBoard": "Put on board",
+        "onWall": "On the wall",
+        "upNext": "Up next",
+        "thenFrom": "Then from {{list}}",
+        "endCard": "End of the list"
       }
     },
-    "betaVideos": {
-      "breadcrumb": "Beta videos",
+    "hub": {
       "hero": {
-        "title": "Attach a beta video to a climb",
-        "subtitle": "Boardsesh links Instagram reels and TikToks to climbs."
+        "title": "Help",
+        "subtitle": "Short guides for the app, how to bring your Kilter or Tension logbook across, and where to ask."
       },
-      "share": {
-        "title": "Share a reel from Instagram or TikTok",
-        "step1": "On your reel or TikTok, tap Share. Pick Boardsesh. In Instagram it can hide under More.",
-        "step2": "Boardsesh opens Attach your beta, with the post on top and your logged climbs below.",
-        "step3": "Tap the climb the video shows. A Beta video attached message confirms it.",
-        "p1": "There is no confirm step and no way to remove a video once attached, so check the climb name first.",
-        "p2": "You need an account, and the climb must be in your logbook as a send or an attempt. Signed out? Sign in and the link is waiting. Only public Instagram and TikTok links work."
+      "guides": {
+        "title": "Guides",
+        "lead": "Pick the guide that matches what you're doing.",
+        "start": {
+          "title": "Board and Bluetooth",
+          "body": "Put a climb on the wall, drive it, and fix a board that won't connect."
+        },
+        "browse": {
+          "title": "Find, play and save climbs",
+          "body": "Swipe through lists, filter by grade or hold, and build playlists."
+        },
+        "crew": {
+          "title": "Climb with your crew",
+          "body": "Start a session and invite your crew with a QR code."
+        },
+        "logbook": {
+          "title": "Your logbook",
+          "body": "Log and edit sends, and attach beta videos."
+        },
+        "spray": {
+          "title": "Spray walls",
+          "body": "Photograph your spray wall and fix the holds Boardsesh finds."
+        },
+        "read": "Read the guide"
       },
-      "find": {
-        "title": "Find the beta on a climb",
-        "p1": "Open a climb and scroll down to Beta Videos. Tap a card and it opens in Instagram or TikTok.",
-        "p2": "Signed in, the plus in the section header opens Share your beta, described below.",
-        "p3": "To list only climbs with beta, open Filters and turn on Beta videos only.",
-        "filtersLink": "More about filters"
+      "bring": {
+        "title": "Bring your Kilter or Tension logbook",
+        "lead": "Link your board account once and your sends come across.",
+        "link": "See the steps"
       },
-      "add": {
-        "title": "Film new beta from a climb",
-        "step1": "Press and hold a climb and choose Add beta video, or tap the plus in its Beta Videos section.",
-        "step2": "Tap Copy caption. It carries the climb name, angle and board.",
-        "step3": "Tap Open Instagram and post your video with that caption.",
-        "step4": "Share the posted reel to Boardsesh as above, or paste its link under Already have a link? and tap Attach.",
-        "p1": "Keep the quoted climb name in the caption. It's how Boardsesh matches the reel. MoonBoard captions have no quotes, so pick the climb yourself."
+      "counts": {
+        "title": "Why does Kilter's app show more climbs?",
+        "lead": "Both apps have the same climbs and count them differently.",
+        "boardseshCount": "18,000",
+        "boardseshLabel": "About this many in Boardsesh on an 8x12 Kilter home wall. Each climb counted once.",
+        "kilterCount": "36,000",
+        "kilterLabel": "About this many in Kilter's app, same wall. It appears to count a climb once per angle it has been climbed at."
       },
-      "shelf": {
-        "title": "Your beta on your profile",
-        "p1": "Open the Profile tab and scroll to the bottom of Progress. The Beta videos shelf shows your latest, and See all opens the full set.",
-        "p2": "Anyone can watch. A climb link shows its beta on boardsesh.com without signing in."
+      "ask": {
+        "title": "Ask a question",
+        "lead": "Discord is the fastest place to get an answer.",
+        "discord": "Ask on Discord",
+        "bugLead": "Found a bug?",
+        "github": "Have a GitHub account? Open an issue",
+        "devLead": "Building on the API?",
+        "docs": "Read the developer docs",
+        "discordTitle": "Discord",
+        "discordBody": "Marco and other climbers on Discord can help. Say which board you use, what you tapped and what you saw.",
+        "bugBody": "In the app, tap your avatar, then Report a bug. Say what happened and on which phone.",
+        "devBody": "Building a logbook tool? Read a climber’s history with their permission. Check the developer guide for current access.",
+        "contact": "Ask about developer access"
+      },
+      "topics": {
+        "guides": "Guides",
+        "app": "Get the app",
+        "logbook": "Bring your logbook",
+        "counts": "Climb counts",
+        "ask": "Get help"
+      }
+    },
+    "log": {
+      "breadcrumb": "Your logbook",
+      "hero": {
+        "title": "Your logbook and beta videos",
+        "subtitle": "Tick a climb at the wall, fix it later, and attach your beta video."
+      },
+      "log": {
+        "title": "Log it at the wall",
+        "lead": "Tap the tick, fill in what you want, and save.",
+        "shotAlt": "The tick button",
+        "shotCaption": "The tick opens the log sheet.",
+        "logbookShotAlt": "The logbook",
+        "p1": "Tap the big tick in the play drawer, or ✓ on the bar at the bottom. Date and Time are filled in, and the rest is optional.",
+        "p2": "Attempt logs a go that didn't stick. The other button reads Flash on your first go at this angle, otherwise Send. Ticks save offline and sync later."
+      },
+      "edit": {
+        "title": "Edit or delete an entry",
+        "lead": "Swipe a logbook row right to edit it, or left to delete it.",
+        "clipAlt": "Swiping a logbook row",
+        "clipCaption": "A short swipe shows the pencil or the bin.",
+        "p1": "Open the Profile tab, then Logbook. Pressing and holding a row offers Edit logbook entry too.",
+        "p2": "You can change Status, Angle, Tries, Grade, Stars and Note. Edits need a connection.",
+        "p3": "To delete, swipe the row left, or tap Delete this ascent in the edit sheet. It asks first, and there is no undo. Comments and votes on that ascent go too."
+      },
+      "repeats": {
+        "title": "One row per climb, day and angle",
+        "lead": "Your logbook keeps one row per climb, per day, per angle.",
+        "p1": "Four goes tonight are one row, with tries added up and your best result showing. Mirrored goes get their own row.",
+        "p2": "Filter sorts by Latest or Hardest and narrows by status, grade, angle, date and Benchmarks only."
+      },
+      "bring": {
+        "title": "Bring your Kilter or Tension logbook",
+        "lead": "Link your board account once and your sends come across.",
+        "step1": "Tap your avatar, then Settings, then Connected apps.",
+        "step2": "Under Board accounts, tap Link on the Tension card or Sign in to Kilter on the Kilter card.",
+        "step3": "For Kilter, enter your login in Connected apps. For Tension, enter your Tension username and password.",
+        "p1": "Used the old Kilter app? The Kilter (Aurora) card takes a JSON export.",
+        "p2": "After you link your account, Boardsesh checks for new sends in the background. Timing varies. Imports run one way into Boardsesh; nothing you log here goes back to their apps.",
+        "link": "Bring your logbook",
+        "credentials": "For Kilter, enter your login in Connected apps. Boardsesh exchanges it for an encrypted sign-in token and does not save your Kilter password. For Tension and other Aurora board accounts, we save your username and password encrypted to fetch new sends. Unlink removes the saved credential and stops future imports."
+      },
+      "beta": {
+        "title": "Attach a beta video",
+        "lead": "Boardsesh links Instagram reels and TikToks to climbs.",
+        "step1": "On your reel or TikTok, tap Share and pick Boardsesh. In Instagram it can hide under More.",
+        "step2": "Boardsesh opens Attach your beta, with your logged climbs below the post.",
+        "step3": "Tap the climb the video shows.",
+        "callout": "There is no confirm step and no way to remove a video, so check the climb name first.",
+        "p1": "The climb must be in your logbook as a send or an attempt. Only public Instagram and TikTok links work.",
+        "p2": "To film new beta, press and hold a climb and choose Add beta video. Tap Copy caption, then Open Instagram, and post with that caption.",
+        "p3": "Keep the quoted climb name in it, since that matches the reel. MoonBoard captions have no quotes, so pick the climb yourself."
+      },
+      "findBeta": {
+        "title": "Watch others' beta",
+        "lead": "Open a climb and scroll down to Beta Videos.",
+        "p1": "Tap a card to open it in Instagram or TikTok. To list only climbs with beta, turn on Beta videos only in Filters.",
+        "filtersLink": "More about filters",
+        "p2": "Your own beta sits at the bottom of Progress on the Profile tab."
       },
       "next": {
         "title": "Keep going",
-        "climbActions": "Everything else behind press and hold",
-        "logbook": "Log the climb first",
+        "climbMenu": "Log a tick from any list"
+      }
+    },
+    "crew": {
+      "breadcrumb": "Live sessions",
+      "hero": {
+        "title": "Climb with your crew",
+        "subtitle": "Start a session, share the link, and climb on one board together."
+      },
+      "start": {
+        "title": "Start a session",
+        "lead": "Every session starts from the Session tab.",
+        "step1": "Open the Session tab. Check the board at the top.",
+        "step2": "Show this session live lets your crew find and join it. Off, only your invite link works.",
+        "step3": "Tap Start, then Invite climbers for a QR code, Copy link and Share.",
+        "shotAlt": "A live session",
+        "shotCaption": "Who has joined and what's lit.",
+        "liveShotAlt": "The Climbing now rail",
+        "liveShotCaption": "Climbing now on the Home tab lists sessions you can join."
+      },
+      "join": {
+        "title": "Join a session",
+        "lead": "Scan the host's code, or find a session nearby.",
+        "way1": "Scan the host's QR code or open their link.",
+        "way2": "On the Home tab, look under Climbing now.",
+        "way3": "Tap the board at the top of the Climbs tab, then Climbing here now.",
+        "p1": "Each opens a Join Sam's session? card. Tap Join session."
+      },
+      "wall": {
+        "title": "Who lights the wall",
+        "lead": "One phone holds the board, and everyone else lights climbs through it.",
+        "p1": "Tap Put on board. The holder's phone lights it, and their face shows on your wall button.",
+        "busy": "If a crewmate put a climb up while you were looking, Put on board asks first. Keep theirs leaves it lit. Put mine up replaces it.",
+        "queue": "Anyone can add, reorder or remove queued climbs. Only the climber who started the session can end it. Everyone else taps Leave session."
+      },
+      "browsing": {
+        "title": "Browse without moving the wall",
+        "lead": "In a crew every tap is a preview that only you see.",
+        "p1": "Swipes walk your own list and never move the wall. The back chip, with the face of whoever lit the wall, returns you to its climb.",
+        "drivingLink": "Only the phone holding the board can drive it. See how driving works."
+      },
+      "history": {
+        "title": "After the session",
+        "lead": "Your profile's Sessions tab lists every session with its climbs and sends.",
+        "p1": "The end-of-session summary has Save to Apple Health and Share to Strava. Connected apps in Settings automates it."
+      },
+      "next": {
+        "title": "Keep going",
+        "playlists": "Play a playlist",
         "hub": "All help topics"
       }
     },
-    "topics": {
-      "label": "Help topics",
-      "guides": "Guides",
-      "using": "Using Boardsesh",
-      "logbook": "Bring your logbook",
-      "counts": "Climb counts",
-      "ask": "Get help"
+    "spray": {
+      "breadcrumb": "Spray walls",
+      "hero": {
+        "title": "Set up your spray wall",
+        "subtitle": "Every hold and climb is set on one photo of your spray wall, so the shot matters."
+      },
+      "watch": {
+        "title": "Watch the walkthrough",
+        "lead": "Boardsesh finds the holds in your photo, so a good shot means fewer to fix.",
+        "videoAlt": "Adding a spray wall and editing its holds in the Boardsesh app"
+      },
+      "photo": {
+        "title": "Taking the photo",
+        "lead": "Five habits give the hold finder a clean photo.",
+        "square": "Stand square on, in line with the spray wall's middle. From the side, far holds shrink.",
+        "portrait": "Hold the phone in portrait and shoot at 1x. Landscape shrinks holds to a strip.",
+        "tilt": "Tilt the phone to match the spray wall's angle, parallel to its face.",
+        "frame": "Get the whole spray wall in frame. If it doesn't fit, step back instead of using the wide lens.",
+        "lighting": "Use bright, even light so the holds stand out.",
+        "exampleAlt": "An indoor spray wall photographed square on, with every hold in frame",
+        "exampleCaption": "Whole spray wall in frame, shot square on."
+      },
+      "add": {
+        "title": "Add the spray wall",
+        "lead": "Take a photo, let Boardsesh scan for holds, then name it.",
+        "step1": "Open Boards and tap Spraywall.",
+        "step2": "Take or choose a photo. Use Crop or rotate to tidy its edges.",
+        "step3": "Pin the four corners to unlock other backgrounds, or skip to keep the photo.",
+        "step4": "Let Boardsesh scan the photo, then review the hold rings.",
+        "step5": "Swipe to pick a background and how holds light up. Without corner pins, Photo is the only background.",
+        "p1": "Last, name the spray wall and set its angle, then publish. The angle is fixed once you publish."
+      },
+      "fix": {
+        "title": "Fix holds before you publish",
+        "lead": "Boardsesh shows the holds it found as rings. Check them before anyone climbs.",
+        "select": "Select: tap a hold to move, resize or switch it off.",
+        "add": "Add: mark a missed hold with Draw or Corners.",
+        "trace": "Trace: redraw the selected hold's outline in one loop.",
+        "refine": "Refine: brush along the outline to grow or shrink it.",
+        "join": "Join: select a hold, then tap another to merge their outlines.",
+        "imageAlt": "Spray wall editor with a selected hold and the five tools",
+        "imageCaption": "Select a ring to see its controls.",
+        "maybe": "Dashed rings are uncertain. Tap one, then tap Keep.",
+        "toggle": "Tap a ring to select it, and tap again to switch it off. You can switch it back on or delete it.",
+        "longPress": "Press and hold a ring to move it, or bare spray wall to place a new hold.",
+        "gestures": "Pan with two fingers and pinch to zoom. Undo and Redo step through your edits.",
+        "missedTitle": "Hold with no ring?",
+        "videoAlt": "Adding missed holds, correcting outlines and publishing hold changes",
+        "missed1": "Pinch to zoom in on the missed hold.",
+        "missed2": "Choose Add, then Draw. Draw a closed outline around the hold, or tap for a circle.",
+        "missed3": "Repeat for other missed holds. Undo if you slip.",
+        "corners": "For straight edges, choose Add, then Corners. Tap at least three points around the hold, then tap Finish.",
+        "drawAlt": "Add tool in Draw mode with an outlined hold",
+        "drawCaption": "Add, Draw: outline one missed hold.",
+        "cornersAlt": "Add tool in Corners mode with points around a hold",
+        "cornersCaption": "Add, Corners: three or more points, then Finish."
+      },
+      "edit": {
+        "title": "Edit holds later",
+        "lead": "You can add or fix holds any time. Adding holds leaves existing climbs unchanged.",
+        "p1": "While setting a climb, tap Add holds below the spray wall. Add the missing holds, then tap Publish and return. Your climb’s name, description and selected holds stay put. You can also open Edit holds from the spray wall name at the top of the Climbs tab.",
+        "p2": "If your edits remove a hold that published climbs use, Boardsesh asks you to confirm. Keep holds cancels. Remove anyway publishes.",
+        "p3": "Those climbs stay, with a missing-hold warning, and so do their logged ascents. Moving, resizing, reshaping or joining a hold does the same.",
+        "p4": "Tap Remix on an affected climb to set an updated copy. It does not repair the original.",
+        "p5": "If the holds changed across the spray wall, tap Reset this spray wall in the same sheet and start from a new photo. Publishing archives the old spray wall with its climbs.",
+        "p6": "Unfinished hold edits are saved on this device. You can leave, lock the screen or restart the app and continue later. Publish holds makes those changes available on the wall."
+      },
+      "pencil": {
+        "title": "Apple Pencil on iPad",
+        "lead": "In the full-width iPad editor, Apple Pencil draws and toggles holds.",
+        "p1": "Draw around an unmarked hold to add its outline, or tap an unmarked spot for a circle. Tap a marked hold to switch it on or off.",
+        "p2": "Pencil turns on when it first touches or hovers over the editor, unless you chose a setting. With Pencil only on, fingers still select, move and pan."
+      },
+      "next": {
+        "title": "Keep going",
+        "logbook": "Log your sends",
+        "sessions": "Climb it with your crew"
+      },
+      "visibility": {
+        "title": "Who sees your spray wall",
+        "body": "Choose Private, Link only or Public when you publish. Help train hold finding starts on for new spray walls; switch it off if you prefer. We use those photos only to improve hold finding and never share the training collection. Change both choices under Edit board."
+      },
+      "installHelper": "Spray walls are set up in the app. It’s free.",
+      "tools": {
+        "tool": "Tool",
+        "action": "What it does"
+      }
     }
   },
   "docs": {
-    "loading": "Loading documentation...",
-    "headerTitle": "API Documentation",
-    "headerSubtitle": "Complete reference for the Boardsesh REST and WebSocket APIs",
+    "headerTitle": "Public climb API reference",
+    "headerSubtitle": "Read climb data without a Boardsesh account. Apps connecting to a climber’s logbook use the separate developer API.",
     "tabs": {
       "overview": "Overview",
-      "rest": "REST API",
-      "graphql": "GraphQL Schema",
-      "websocket": "WebSocket Guide"
+      "rest": "Public REST reference",
+      "graphql": "Internal GraphQL schema"
     },
-    "overview": {
-      "title": "Boardsesh API Overview",
-      "intro": "Boardsesh provides two complementary APIs for interacting with interactive climbing training boards (Kilter, Tension):",
-      "rest": {
-        "title": "REST API",
-        "intro": "Use the REST API for stateless operations like searching climbs, fetching board configuration, and user authentication. The REST API is ideal for:",
-        "feature1": "Fetching climb data and statistics",
-        "feature2": "User registration and authentication",
-        "feature3": "Profile management",
-        "feature4": "Resolving URL slugs to numeric IDs",
-        "baseUrlLabel": "Base URL:"
-      },
-      "ws": {
-        "title": "WebSocket GraphQL API",
-        "intro": "Use the WebSocket API for real-time features like party sessions and queue synchronization. The GraphQL API provides:",
-        "feature1": "Real-time queue updates via subscriptions",
-        "feature2": "Session management (create, join, leave)",
-        "feature3": "Multi-user collaboration",
-        "feature4": "All REST API functionality via queries/mutations",
-        "endpointLabel": "Endpoint:",
-        "endpointSuffix": "(via graphql-ws protocol)"
-      },
-      "auth": {
-        "title": "Authentication",
-        "restLabel": "REST API:",
-        "restBody": "Uses NextAuth session cookies. Authenticate via",
-        "restBodyEnd": "endpoints.",
-        "wsLabel": "WebSocket API:",
-        "wsBody": "Obtain a JWT token from",
-        "wsBodyEnd": "and include it in the connection parameters:"
-      },
-      "rateLimit": {
-        "title": "Rate Limiting",
-        "body": "Authentication endpoints are rate-limited to prevent abuse. Rate limit headers are included in responses. Public read endpoints have generous limits."
-      }
+    "public": {
+      "title": "Public read API · Live",
+      "body": "Use /api/v1/ for public climb, grade, board configuration and slug lookups. These read endpoints do not use sign-in cookies and do not register users or change profiles."
     },
-    "ws": {
-      "title": "WebSocket Connection Guide",
-      "introStart": "The Boardsesh WebSocket API uses the",
-      "introEnd": "protocol for real-time GraphQL subscriptions.",
-      "connection": {
-        "title": "Connection Setup"
-      },
-      "session": {
-        "title": "Session Management",
-        "body": "Sessions are the core collaboration unit. Users join sessions to share a climb queue."
-      },
-      "delta": {
-        "title": "Delta Synchronization",
-        "body": "When reconnecting, use delta sync to catch up without full state transfer:"
-      },
-      "connectionHandling": {
-        "title": "Connection Handling",
-        "body": "The WebSocket connection may be interrupted by network changes. Implement reconnection logic with the graphql-ws retry options and use delta sync to maintain state consistency."
-      }
-    }
+    "partners": {
+      "title": "Connected apps",
+      "body": "Use OAuth, a climber’s approval and the scopes they grant for their personal logbook. Registration may be invite only; the developer guide shows current access. Workouts and webhooks are not offered as generally available on this page.",
+      "link": "Read the developer guide",
+      "contact": "Ask about developer access"
+    },
+    "internal": {
+      "title": "Internal protocol · Contributor reference",
+      "body": "GraphQL and session protocols power the Boardsesh apps. They are internal interfaces, not a supported API for another app’s backend. Forks run their own service. See the contributor reference and hosted-service policy.",
+      "link": "Read the internal protocol reference"
+    },
+    "policyLink": "Read the hosted-service policy",
+    "loading": "Loading reference…"
   },
   "privacy": {
     "title": "Privacy Policy",
-    "lastUpdatedProductAnalytics": "Last updated: May 2026",
+    "lastUpdated": "Last updated: November 18, 2026",
     "intro1": "Boardsesh is an open-source app for controlling climbing training boards (Kilter, Tension, MoonBoard) over Bluetooth. This policy explains what data we collect, why, and what we do with it.",
-    "intro2ProductAnalytics": "The short version: we collect only what we need to make the app work. We do not sell your data, we do not run ads, and we do not share data with third-party marketers or data brokers.",
+    "intro2ProductAnalytics": "The short version: we collect only what we need to make the app work. We do not sell your data, there are no ads in Boardsesh, and we do not share data with data brokers. We do advertise Boardsesh on Reddit and Instagram, and on our website analytics includes measuring those ads with Meta and Reddit, as described below.",
     "collect": {
       "title": "What we collect",
       "accountLabel": "Account information.",
-      "accountBody": "When you create an account, we store your email address and username. Your email is used for authentication. Your username is displayed on your profile and visible to other users in Party Mode sessions and social features.",
+      "accountBody": "When you create an account, we store your email address and username. Your email is used for authentication. Your username is displayed on your profile and visible to other users in sessions and social features.",
       "activityLabel": "Climb activity.",
       "activityBody": "When you log a send or attempt, we store the climb details, grade, date, and any notes you add. This powers your logbook and progression tracking.",
       "locationLabel": "Location.",
-      "locationBody": "If you grant location permission, we use your approximate location to help you discover nearby Party Mode sessions. We do not track your location in the background or store location history.",
+      "locationBody": "If you grant location permission, we use your approximate location to help you discover nearby sessions. We do not track your location in the background or store location history.",
       "productAnalyticsLabel": "Product analytics.",
-      "productAnalyticsBody": "We use PostHog and Vercel Analytics to understand feature usage, page views, performance, and where the app is slow. Some signed-in product events are linked to your Boardsesh account so we can understand which features are useful. We do not use this data for ads."
+      "productAnalyticsBody": "We use PostHog for feature usage, page views, performance and optional session replay in the app. In the EU, the EEA, the UK, Switzerland, Gibraltar, Jersey, Guernsey, the Isle of Man, China, South Korea, Andorra, Monaco, San Marino, Vatican City, the Faroe Islands and Quebec, and whenever we cannot tell where you are, we ask first and PostHog runs only after you allow analytics. Elsewhere analytics is on by default, under our legitimate interest in improving Boardsesh, and you can turn it off anytime in Settings or Privacy choices; if your browser sends a Global Privacy Control signal, we treat it as a no. We decide this from the country and, in Canada, province Cloudflare reports for your connection, which we do not store. Signed-in analytics can be linked to your Boardsesh account. Install attribution needs your own Allow everywhere; the default does not turn it on. With your Allow, Android install attribution may include the Play Store install referrer and campaign information, and on iOS we use Apple AdServices through our own backend to measure which Apple Ads campaigns lead to signups and climbing activity. We share validated campaign identifiers and download status with PostHog, never the attribution token. We do not use these data to show you ads.",
+      "adMeasurementLabel": "Ad measurement on our website.",
+      "adMeasurementBody": "We advertise Boardsesh on Reddit and Instagram. When analytics is on for our website, we load the Meta Pixel and the Reddit Pixel so Meta and Reddit can tell us which ads bring visitors and app store taps. They receive the pages you visit on boardsesh.com, your taps on our app store buttons (which store, and where the button was) and what their pixels read from your browser: your IP address, browser details and their own cookies. We never send them your email, your account or any other contact details. In the regions where we ask first, this needs an Allow given after our banner started naming Meta and Reddit. Elsewhere it follows the analytics default and stops when you say no in Privacy choices or your browser sends a Global Privacy Control signal. It never runs in the app, on kiosk displays, in embedded widgets or on sign-in pages.",
+      "serviceStatsLabel": "First-party service statistics.",
+      "serviceStatsBody": "We record a signed-in account’s active day and platform in our own database, regardless of analytics consent, under legitimate interest to understand service use. These rows are kept for 13 months. Only aggregate daily, weekly and monthly counts are sent to PostHog. Signed-out visitors are not included in these account-based active-user counts."
     },
     "bluetooth": {
       "title": "Bluetooth",
@@ -898,41 +907,70 @@
     },
     "location": {
       "title": "Location data",
-      "body1": "Location access is optional. When granted, it is used for one purpose: making your Party Mode session discoverable to nearby climbers. Your location is shared with the server only while a Party Mode session is active. We do not store your location history, build a location profile, or share location data with anyone outside of the party session discovery feature.",
+      "body1": "Location access is optional. When granted, it is used for one purpose: making your session discoverable to nearby climbers. Your location is shared with the server only while a session is active. We do not store your location history, build a location profile, or share location data with anyone outside of the session discovery feature.",
       "body2": "You can revoke location permission at any time in your device settings. The app works fully without it."
+    },
+    "sprayPhotos": {
+      "title": "Spray wall photos",
+      "body1": "When you add a spray wall, we keep its photo and the holds you mark. Who can see the photo follows the spray wall's visibility setting: private, link-only or public. Members of a gym can also see the spray walls attached to that gym.",
+      "body2": "Each spray wall has a “Help train hold finding” switch. While it is on, we use the spray wall's photo and the holds you mark to train the hold finder, the part of the app that spots holds in a new spray wall photo. A Boardsesh admin checks them first to make sure they are good to learn from. That applies at every visibility, private spray walls included. The copy we use for training is kept in private storage and is never shared or published outside Boardsesh.",
+      "body3": "The switch is on when you add a spray wall, and you can change it then or any time later under Edit board. spray walls added before the switch existed, or with a version of the app that does not show it, start with it off. We train on a spray wall whose switch is on under legitimate interest to improve hold finding; switching it off is how you object, and it takes effect as described below.",
+      "body4": "Switching it off, deleting the spray wall, or deleting your account takes the spray wall out of our stored training set within 24 hours. A copy already downloaded for a training run can be used for up to 7 more days, and is deleted the next time we fetch the set. Models we already trained keep what they learned, but they hold no copy of your photo.",
+      "body5": "If a spray wall is reported, a Boardsesh admin can see its photo to review the report, whatever the switch says. When you delete a spray wall, we delete its photo after 30 days. When you delete your account, your spray wall photos are deleted with it; a training copy leaves on the timing above. Resetting a spray wall keeps the old one, photo included, as an archived spray wall until you delete it too. Turning the switch off on either spray wall covers both."
+    },
+    "connectedApps": {
+      "title": "Apps you connect",
+      "intro": "You can connect another app to your Boardsesh account, such as a training planner. Before anything is shared, Boardsesh shows you the app, who makes it, a link to its privacy policy and what it asks to see. Nothing is shared until you choose Allow.",
+      "whatItGets": "Depending on what you allow, the app can see your display name and profile photo, and every tick in your logbook, including ticks you keep to “Only me”. Each tick comes with the climb it is on: its name, grade, board and layout. That includes a climb someone else set that is still a draft or unlisted, because the tick is part of your logbook. On someone else’s spray wall that isn’t public, the app gets your tick but not the climb’s name or the spray wall’s name.",
+      "afterSharing": "Once the app has your data, the app’s own privacy policy covers what it does with it.",
+      "disconnect": "You can disconnect an app at any time in your Boardsesh settings. Any change to your password, including resetting it or setting one for the first time, disconnects every app. After that the app can’t read anything new. Disconnecting, or deleting your Boardsesh account, does not delete what the app already copied: ask the app to delete it."
     },
     "thirdParty": {
       "title": "Third-party services",
-      "vercelLabel": "Vercel.",
-      "vercelBody": "We use Vercel for hosting and analytics. Vercel processes requests to serve the app and collects anonymous usage metrics. See ",
-      "vercelLink": "Vercel's privacy policy",
       "posthogLabel": "PostHog.",
-      "posthogBody": "We use PostHog for product analytics, including server-side events for native app features like iOS Live Activities. See ",
+      "posthogBody": "PostHog processes optional product analytics and app session replay in the United States. We also send minimal operational events without account identifiers for service stability, kiosk displays and update health, plus aggregate active-user counts. See ",
       "posthogLink": "PostHog's privacy policy",
-      "auroraLabel": "Aurora Climbing API.",
-      "auroraBody": "If you link your Aurora Climbing account (used by Kilter and Tension boards), we sync your climb data with Aurora's servers so your logbook stays consistent across apps. This sync only happens when you initiate it. See ",
-      "auroraLink": "Aurora Climbing",
-      "auroraBodyEnd": " for their data practices."
+      "adPixelsLabel": "Meta and Reddit.",
+      "adPixelsBody": "Meta Platforms and Reddit receive ad-measurement data from our website while analytics is on (see What we collect). They also use it under their own privacy policies, which can include processing in the United States. See ",
+      "metaLink": "Meta's privacy policy",
+      "adPixelsJoin": " and ",
+      "redditLink": "Reddit's privacy policy",
+      "adPixelsBodyEnd": ".",
+      "hostingLabel": "Railway and Cloudflare.",
+      "hostingLink": "Railway’s privacy policy",
+      "cloudflareLink": "Cloudflare’s privacy policy",
+      "sentryLabel": "Sentry.",
+      "sentryLink": "Sentry’s privacy policy",
+      "expoLabel": "Expo EAS Observe.",
+      "expoLink": "Expo Observe documentation",
+      "hostingBody": "We use Railway for application and database hosting, and Cloudflare for content delivery, browser-app hosting and media storage. These providers process requests needed to deliver Boardsesh. See ",
+      "sentryBody": "We use Sentry for error monitoring under legitimate interest to keep Boardsesh working. Default personal-information collection is disabled; error reports are limited and sensitive fields are removed. This service remains on when analytics is declined. See ",
+      "expoBody": "We use Expo Observe for performance timings, device/build information and error diagnostics on our own server, under legitimate interest to keep Boardsesh working. Diagnostics remain on when analytics is declined. SDK installation and session identifiers support update health; we assign no Boardsesh account identity to Observe. See ",
+      "stripeLabel": "Stripe.",
+      "stripeBody": "If you give through our support page, Stripe handles the payment. Stripe receives your card or wallet details, your email address, your billing country and any name or address you enter at checkout. Boardsesh never sees your full card number. We see your email, any name you enter, the amount, your billing country (plus postcode or address when checkout asks for one), your card brand, its last 4 digits and expiry, and a short tag for the page you came from. We use this to carry out the payment you asked for, send receipts and answer questions, and we keep it because tax law requires payment records. The legal basis is performing the payment you asked for and our legal duty to keep those records. A name you enter may be shown when we thank supporters; leave it blank to stay anonymous. See ",
+      "stripeLink": "Stripe's privacy policy"
     },
     "sharing": {
       "title": "Data sharing",
-      "body1ProductAnalytics": "We do not sell your data. We do not run ads. We do not share your information with third-party marketers or data brokers. The only data shared externally is what is described above (Vercel hosting/analytics, PostHog product analytics, Aurora Climbing sync when you opt in).",
-      "body2": "Other Boardsesh users can see your username, profile, and logged climbs if you participate in social features like Party Mode. This is visible in the app and is part of how the product works."
+      "body1ProductAnalytics": "We do not sell your data, show ads in Boardsesh or share information with data brokers. The providers described above process data for hosting, storage, payments, service reliability and optional analytics, which on our website includes ad measurement with Meta and Reddit. Aurora Climbing synchronization runs when you enable it.",
+      "body2": "Other Boardsesh users can see your username, profile, and logged climbs if you participate in social features like sessions. This is visible in the app and is part of how the product works.",
+      "body3SprayPhotos": "We do not give spray wall photos or the holds you mark to anyone else to train on. The only model trained on them is our own hold finder. Other people see a spray wall's photo as its visibility setting allows, and members of a gym see the spray walls attached to that gym, private ones included. A public spray wall's photo is on the open web."
     },
     "retention": {
       "title": "Data retention",
-      "body": "We keep your account data and climb history for as long as your account is active. If you stop using Boardsesh, your data stays until you delete your account."
+      "body": "We keep your account data and climb history for as long as your account is active. If you stop using Boardsesh, your data stays until you delete your account.",
+      "donations": "If you have donated, payment records remain with the payment provider and in our accounts for as long as tax law requires. They are separate from your Boardsesh account. Questions about a donation record? Email us."
     },
     "deletion": {
       "title": "Account deletion",
       "intro": "You can delete your account and all associated data at any time. There are two ways to do it:",
       "inApp": "In the app:",
-      "inAppBody": " Tap your avatar, open Settings, scroll to the bottom, and tap Delete Account. You will be asked to confirm before anything is removed.",
+      "inAppBody": " Tap your avatar, open Settings, then Account, and tap Delete account. You will be asked to confirm before anything is removed.",
       "onWeb": "On the web:",
       "onWebBody": " Log in at ",
       "onWebLink": "app.boardsesh.com",
-      "onWebBodyEnd": " and open Settings from your avatar menu to find the same Delete Account button.",
-      "permanent": "Deletion is immediate and permanent. Once confirmed, we remove your email address, username, logbook entries, queue data, and party session history from our servers. This cannot be undone."
+      "onWebBodyEnd": " and open Settings, then Account, from your avatar menu to find the same Delete account button.",
+      "permanent": "Deletion is immediate and permanent. Once confirmed, we remove your email address, username, logbook entries, queue data, and session history from our servers. This cannot be undone."
     },
     "children": {
       "title": "Children",
@@ -950,11 +988,67 @@
       "body2Start": "Boardsesh is open source. You can see exactly what data the app collects and how it is processed by reading the source code on ",
       "body2Link": "GitHub",
       "body2End": "."
+    },
+    "choices": {
+      "title": "Cookies and privacy choices",
+      "storageBody": "Required storage includes NextAuth login and sign-in-flow cookies, your language preference (boardsesh-locale), device preferences and the boardsesh-consent cookie. The consent cookie lasts one year and is shared between boardsesh.com and app.boardsesh.com. Outside the regions where we ask, the website sets it to the analytics default on your first visit. When analytics is on (your Allow, or the default outside the regions where we ask), PostHog stores identifiers and events (ph_* on the website and SDK storage in the app). Declining or withdrawing clears analytics identifiers and stops optional analytics, replay and install-attribution events. Basic crash and first-party performance diagnostics remain on. Feature flags still use an in-memory client; signed-in flags can use your account ID.",
+      "adCookiesBody": "While ad measurement is on, the Meta Pixel sets _fbp (and _fbc after you arrive from a Meta ad) and the Reddit Pixel sets _rdt_uuid (and _rdt_cid after you arrive from a Reddit ad), each for up to 90 days. Saying no in Privacy choices stops both pixels straight away and deletes these cookies.",
+      "changeBody": "Use Privacy choices in the website footer or Analytics in Settings → Privacy to change your answer. We save your decision on the device and, when signed in, on your account. Where analytics is on by default, that default stays on the device and is never saved to your account as consent. An account denial overrides device grants; an account grant fills devices that have not answered. We retain decision history as evidence of consent until account deletion. Anonymous, short-lived update-health and kiosk events remain enabled for service reliability."
+    },
+    "operator": "Boardsesh is run by Marco de Jongh, who is responsible for the data described in this policy. Contact support@boardsesh.com about your data.",
+    "boardAccounts": {
+      "title": "Linked board accounts",
+      "sync": "After you link your account, Boardsesh checks for new sends in the background. Timing varies. Imports run one way into Boardsesh; nothing you log here goes back to their apps. Unlink the account in Settings → Connected apps to stop future imports.",
+      "credentials": "For Kilter, Boardsesh saves an encrypted sign-in token, not your Kilter password. For Tension and other Aurora board accounts (Decoy, Touchstone, Grasshopper and So iLL), we save your username and password encrypted so we can fetch new sends. We use these credentials only for the account connection you request. Unlink removes the saved credential; it does not remove climbs already imported.",
+      "legalBasis": "We process these credentials to provide the account connection you ask for. The legal basis is performing that service. Kilter token revocation may also be requested after unlinking; local removal does not depend on Kilter replying."
     }
   },
   "preview": {
     "label": "App preview",
     "ios": "iOS",
     "android": "Android"
+  },
+  "funding": {
+    "title": "Who pays for it",
+    "body": "Boardsesh is free. Every feature, for everyone. Climbers who can spare it chip in, and that pays for the servers and the hours it takes to build. Giving buys nothing extra in the app."
+  },
+  "trust": {
+    "title": "Questions climbers ask first",
+    "legal": "Read the compatibility and legal policy",
+    "import": "Bring your logbook",
+    "privacy": "Read the privacy policy",
+    "questions": {
+      "operator": {
+        "question": "Who runs Boardsesh?",
+        "answer": "Marco de Jongh, a board climber based in Sydney, Australia, runs Boardsesh with contributions from other climbers. Contact support@boardsesh.com."
+      },
+      "funding": {
+        "question": "How is it free?"
+      },
+      "compatibility": {
+        "question": "Can I use it with my Kilter, Tension or MoonBoard?",
+        "answer": "Boardsesh is independent software for compatible boards. It is not made or endorsed by Aurora Climbing, Kilter or Moon Climbing. Our legal policy explains the compatibility and hosted-service rules."
+      },
+      "import": {
+        "question": "Can I bring my Kilter or Tension history?",
+        "answer": "Yes. Link your account in Settings → Connected apps. Imports run one way into Boardsesh; nothing you log here goes back. The logbook guide also covers old Aurora exports."
+      },
+      "password": {
+        "question": "What happens to my board password?",
+        "answer": "For Kilter, enter your login in Connected apps. Boardsesh exchanges it for an encrypted token and does not save your Kilter password. For Tension and other Aurora board accounts, your username and password are saved encrypted to fetch your history. Unlink removes the saved credential and stops future imports."
+      },
+      "shutdown": {
+        "question": "What if Boardsesh shuts down?",
+        "answer": "You can download your logbook now, one board at a time, from Settings → Account → Export climbing data. The code and nightly climb-catalog downloads are public, so you can keep a copy outside Boardsesh."
+      },
+      "tracking": {
+        "question": "Does Boardsesh track me?",
+        "answer": "Privacy choices on the website and Analytics in Settings → Privacy control optional product analytics. Basic crash and performance diagnostics keep the service working. The privacy policy explains what each provider receives."
+      },
+      "sprayPrivacy": {
+        "question": "Can my spray wall photo stay private?",
+        "answer": "Choose a private spray wall rather than a public one. Members of a gym can see private spray walls attached to that gym. Public spray wall photos are on the open web."
+      }
+    }
   }
 }

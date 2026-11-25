@@ -13,31 +13,38 @@ import {
   type ReportClimbVariables,
 } from '@boardsesh/graphql/operations/proposals';
 import { getHttpClient } from '../client';
+import { readMobileReleaseContext } from '../../release-context';
+import { PROPOSALS_QUERY_KEY } from '../query-keys';
+import { requestReport } from '../request-report';
 
-/**
- * Root key for every proposal list — the moderation feed and the per-climb
- * proposal queries all key under it, so invalidating the prefix refreshes each
- * of them after a report lands. Exported so those hooks import the same array
- * rather than re-typing the string.
- */
-export const PROPOSALS_QUERY_KEY = ['proposals'] as const;
+export { PROPOSALS_QUERY_KEY } from '../query-keys';
 
 /** Key `useClimb` writes under; a report can flip `is_hidden` on the climb. */
 const CLIMB_QUERY_KEY = ['climb'] as const;
+
+/** The climb lists a changed grade has to reach: the same keys a create-climb save refreshes. */
+const CLIMB_LIST_QUERY_KEYS = [['searchClimbs'], ['infiniteSearchClimbs'], ['searchClimbsCount']] as const;
 
 export function useReportClimb() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (variables: ReportClimbVariables) => {
-      const response = await getHttpClient().request<ReportClimbResponse, ReportClimbVariables>(
-        REPORT_CLIMB,
-        variables,
+      const response = await requestReport(
+        (requestVariables: ReportClimbVariables) =>
+          getHttpClient().request<ReportClimbResponse, ReportClimbVariables>(REPORT_CLIMB, requestVariables),
+        { ...variables, input: { ...variables.input, releaseContext: readMobileReleaseContext() } },
+        'ReportClimbInput',
       );
       return response.reportClimb;
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       void queryClient.invalidateQueries({ queryKey: PROPOSALS_QUERY_KEY });
       void queryClient.invalidateQueries({ queryKey: CLIMB_QUERY_KEY });
+      // An approved grade (a spray wall owner's, #5971) changed the climb's grade
+      // on the server, so the lists showing the old one refetch.
+      if (result.proposal.status === 'approved' && result.proposal.type === 'grade') {
+        for (const queryKey of CLIMB_LIST_QUERY_KEYS) void queryClient.invalidateQueries({ queryKey });
+      }
     },
   });
 }

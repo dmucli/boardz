@@ -47,15 +47,20 @@ pub enum BoardRenderMode {
 ///
 /// `glow` is the outward glow off the silhouette edge (the play view's mark),
 /// `glow-fill` adds the lightness-normalised role fill under it (the treatment
-/// measured for thumbnails), `fill` is the fill without the glow, `none` draws
-/// only the veil, LED covers and glyphs. Unset: `glow-fill` when `thumbnail`,
-/// `glow` otherwise.
+/// measured for thumbnails), `fill` is the fill without the glow, `outline` is
+/// the glow plus a solid role-colour stroke along the silhouette edge with the
+/// hold's own art left visible inside it, `none` draws only the veil, LED
+/// covers and glyphs. Unset: `glow-fill` when `thumbnail`, `glow` otherwise.
+///
+/// `outline` and `none` are different things: `none` draws no mark at all,
+/// `outline` draws a mark that happens to be hollow.
 #[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum MarkStyle {
     Glow,
     GlowFill,
     Fill,
+    Outline,
     #[serde(rename = "none")]
     NoMark,
     #[serde(other)]
@@ -376,6 +381,9 @@ fn default_shape_size_multiplier() -> f32 {
 
 #[derive(Deserialize)]
 pub struct RenderConfig {
+    /// Acceleration-cache retention scope; never changes rendered pixels.
+    #[serde(default)]
+    pub geometry_cache_scope: Option<String>,
     pub board_width: f32,
     pub board_height: f32,
     pub output_width: u32,
@@ -419,7 +427,7 @@ pub struct RenderConfig {
 #[derive(Deserialize, Clone, Default)]
 pub struct HoldData {
     pub id: u32,
-    #[serde(rename = "mirroredHoldId")]
+    #[serde(rename = "mirroredHoldId", alias = "mirrored_hold_id")]
     pub mirrored_hold_id: Option<u32>,
     pub cx: f32,
     pub cy: f32,

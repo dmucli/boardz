@@ -4,6 +4,8 @@ import {
   type BackgroundWorkerRole,
 } from '@boardsesh/db/background-jobs';
 import type { BackgroundJobFamilyModule } from './types';
+import { cncComputationFamily } from './cnc-computation';
+import { cncGenerationFamily } from './cnc-generation';
 import { exportBoardSnapshotsFamily } from './export-board-snapshots';
 import { refreshClimbGradesFamily } from './refresh-climb-grades';
 import { refreshClimbNeighborsFamily } from './refresh-climb-neighbors';
@@ -19,6 +21,12 @@ import { auroraSharedSyncFamily } from './aurora-shared-sync';
 import { kilterCatalogSyncFamily } from './kilter-catalog-sync';
 import { moonBoardLocationsSyncFamily } from './moonboard-locations-sync';
 import { climbStatsSelfHealFamily } from './climb-stats-self-heal';
+import { userDataExportFamily } from './user-data-export';
+import { sprayWallArtFamily } from './spray-wall-art';
+import { sprayWallHealthFamily } from './spray-wall-health';
+import { communityMonthlyStatsFamily } from './community-monthly-stats';
+import { reclaimLogbookSnapshotsFamily } from './reclaim-logbook-snapshots';
+import { pruneLogbookChangesFamily } from './prune-logbook-changes';
 
 export { BackgroundJobError, InvalidJobPayloadError } from './types';
 export type { BackgroundJobContext, BackgroundJobFamilyModule, BackgroundJobFamilyOptions } from './types';
@@ -26,6 +34,8 @@ export type { BackgroundJobContext, BackgroundJobFamilyModule, BackgroundJobFami
 /** Every family, keyed by name. The `satisfies` fails the build when a name has no module. */
 const FAMILY_MODULES = {
   'worker-probe': workerProbeFamily,
+  'cnc-computation': cncComputationFamily,
+  'cnc-generation': cncGenerationFamily,
   'refresh-recommendations': refreshRecommendationsFamily,
   'refresh-hold-features': refreshHoldFeaturesFamily,
   'refresh-climb-grades': refreshClimbGradesFamily,
@@ -40,6 +50,12 @@ const FAMILY_MODULES = {
   'kilter-catalog-sync': kilterCatalogSyncFamily,
   'moonboard-locations-sync': moonBoardLocationsSyncFamily,
   'climb-stats-self-heal': climbStatsSelfHealFamily,
+  'user-data-export': userDataExportFamily,
+  'spray-wall-art': sprayWallArtFamily,
+  'spray-wall-health': sprayWallHealthFamily,
+  'community-monthly-stats': communityMonthlyStatsFamily,
+  'reclaim-logbook-snapshots': reclaimLogbookSnapshotsFamily,
+  'prune-logbook-changes': pruneLogbookChangesFamily,
 } satisfies Record<BackgroundJobFamily, BackgroundJobFamilyModule>;
 
 const registry: ReadonlyMap<string, BackgroundJobFamilyModule> = new Map(

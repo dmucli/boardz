@@ -12,6 +12,7 @@ import {
   type WebAuthIdentity,
 } from './auth-store.web';
 import { withAuthCookieLock } from './auth-cookie-lock.web';
+import { retireBrowserPageForSignOut } from './browser-page-retirement.web';
 import { WEB_BASE_URL, webApiUrl } from './env';
 import {
   createWebOAuthAttemptId,
@@ -341,6 +342,9 @@ async function resolveCookieOwnership(departingIdentity: WebAuthIdentity | null)
   } catch (error) {
     throw new Error('Could not verify the browser session to sign out', { cause: error });
   }
+  // During an outage the session read answers 503. Carry on to the POST: its
+  // expected identity still binds the sign-out to the departing login.
+  if (response.status === 503) return departingIdentity === null ? 'changed' : 'owned';
   if (!response.ok) throw new Error(`Could not verify the browser session to sign out: HTTP ${response.status}`);
 
   let responseBody: Record<string, unknown>;
@@ -490,6 +494,8 @@ export async function signOutForGeneration(signOutGeneration: number): Promise<b
   // gone. Peer tabs treat this as an authoritative logout instead of a login
   // rotation hint, so they can hide private state even if revalidation is down.
   broadcastConfirmedSignOut(departingIdentity);
+  // This page's account is gone: the provider's cleanup reloads it from the root.
+  retireBrowserPageForSignOut();
   return true;
 }
 

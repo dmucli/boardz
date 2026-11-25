@@ -1,1 +1,1 @@
-Download a board and climb with no signal. Plus the Boardsesh grade: one number that reads the same on Kilter, Tension and MoonBoard, built from real sends.
+Train with 4x4s, return to your projects and light your Spraywall with WLED. One logbook across your boards, one shared queue with your crew.

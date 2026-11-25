@@ -24,15 +24,23 @@ inputs:
   base-ref:
     description: >
       Branch the change will merge into, diffed against. Callers pass
-      github.base_ref so a PR into release/next is compared with the train it is
-      joining, not with main — otherwise every train PR reads as a native change
-      merely because the train already carries one.
+      github.base_ref to compare the candidate with its actual target branch.
     required: false
     default: main
+  comparison-mode:
+    description: >
+      base-branch preserves the PR gate. published-dev-client compares against
+      the latest successfully published Android dev APK, including manual runs.
+      API or fingerprint errors fail rather than starting an unneeded build.
+    required: false
+    default: base-branch
 outputs:
   should_build:
     description: 'true when the native build must run; false to skip it.'
-    value: ${{ steps.decide.outputs.should_build }}
+    value: ${{ steps.dev_decide.outputs.should_build || steps.decide.outputs.should_build }}
+  reused_release_url:
+    description: 'Compatible published dev APK when no rebuild is needed.'
+    value: ${{ steps.dev_decide.outputs.reused_release_url }}
 runs:
   using: composite
   steps:
@@ -49,8 +57,20 @@ runs:
         # internet. Measured on a bs-ci runner: 148s of a 210s job.
         cache: ${{ runner.environment == 'github-hosted' }}
 
+    - name: Compare with the published Android dev-client
+      id: dev_decide
+      if: inputs.comparison-mode == 'published-dev-client'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        vp install --frozen-lockfile
+        vp exec tsx scripts/mobile-android-dev-gate.ts
+
     - name: Decide whether to build
       id: decide
+      if: inputs.comparison-mode != 'published-dev-client'
       shell: bash
       env:
         PLATFORM: ${{ inputs.platform }}
@@ -83,6 +103,31 @@ runs:
               .github/workflows/android-pr-rn.yml .github/workflows/ios-rn-ci.yml \
               .github/actions/android-rn-setup .github/actions/mobile-native-gate)" ]; then
           build "CI plumbing changed"
+        fi
+
+        # Shader-checker changes must exercise the checker even when the
+        # native renderer itself, and therefore its fingerprint, is unchanged.
+        if [ "$PLATFORM" = android ] && [ -n "$(changed scripts/check-android-gpu-shaders.ts)" ]; then
+          build "Android GPU shader checker changed"
+        fi
+
+        # The Release launch guard is CI plumbing too. Exercise changes to its
+        # implementation even though they do not move the app's fingerprint.
+        if [ "$PLATFORM" = ios ] && [ -n "$(changed \
+              scripts/ios-release-launch-smoke.ts \
+              'scripts/__tests__/ios-release-launch-smoke*.test.ts' \
+              scripts/lib/ios-capture-diagnostics.ts scripts/lib/ios-simulator-lease.ts \
+              scripts/screenshot-sim.entitlements)" ]; then
+          build "iOS Release launch plumbing changed"
+        fi
+
+        # The Swift unit tests sit outside the generated ios/ project and the
+        # fingerprint, so a test-only change would compare equal below and skip
+        # the only job that runs them (prepare-rn-ios-tests.mjs + xcodebuild
+        # test-without-building). Build whenever the tests or their harness move.
+        if [ "$PLATFORM" = ios ] && [ -n "$(changed \
+              packages/mobile/ios-tests scripts/prepare-rn-ios-tests.mjs)" ]; then
+          build "iOS Swift tests changed"
         fi
 
         # Path screen: nothing in the canonical native-input set (mirrors the
@@ -121,6 +166,7 @@ runs:
         EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID=$EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID
         EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID=$EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID
         EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID=$EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID
+        EXPO_PUBLIC_SENTRY_DSN=${EXPO_PUBLIC_SENTRY_DSN:-}
         EOF
         }
 

@@ -32,6 +32,20 @@ export const borderRadius = {
   full: 9999,
 } as const;
 
+/**
+ * The one card corner: 12pt, drawn as a continuous (squircle) curve on iOS, the
+ * way UIKit and SwiftUI draw every rounded rect since iOS 13 and what iOS 26's
+ * concentric shapes assume (HIG Layout). `borderCurve` is iOS-only; Android
+ * ignores it and keeps the M3 medium-shape 12dp circular corner. Spread it into
+ * every card-shaped container so a screen never mixes 12 and 16pt cards.
+ * Never use it on a circle or capsule: a continuous curve at half the height
+ * squares the ends off.
+ */
+export const cardCorners = {
+  borderRadius: borderRadius.lg,
+  borderCurve: 'continuous',
+} as const;
+
 export const shadowColor = '#000' as const;
 
 export const shadows = {
@@ -108,6 +122,18 @@ export const opacity = {
 export const overlays = {
   scrim: 'rgba(0, 0, 0, 0.6)',
   onScrim: '#FFFFFF',
+  /**
+   * A light dim laid over a photograph, under whatever is drawn on top of it
+   * (the spray editor's rings), so a busy multicoloured wall recedes and the
+   * marks read. `photoDimFocused` is the same dim doubled, for while one mark
+   * is picked out.
+   */
+  photoDim: 'rgba(0, 0, 0, 0.15)',
+  photoDimFocused: 'rgba(0, 0, 0, 0.3)',
+  /** The heavier dim under the spray scan band, while the photo waits on the detector. */
+  photoDimScan: 'rgba(0, 0, 0, 0.4)',
+  /** Behind the spray loupe's magnified photo, showing where it runs past the photo's edge. */
+  loupeBackdrop: '#000000',
 } as const;
 
 /** Shared bottom-sheet handle and background styles used by QueueSheet, AngleSelectorSheet, and PlayDrawer. */
@@ -134,17 +160,25 @@ export const material = {
   /** M3 pressed state-layer opacity, used to tint ripples (and the iOS-on-Material
    *  pressed overlay, where there is no `android_ripple`). */
   pressedStateLayer: 0.12,
+  /** Alpha of the default neutral ripple: the theme's `onSurface` at 10%, the M3
+   *  pressed state layer on a grey surface (`neutralRipple`). */
+  neutralRippleOpacity: 0.1,
   /** M3 disabled opacities: content (text/icon) at 38%, container fill at 12% —
    *  replaces the single Liquid-Glass `opacity.disabled` (0.5) on Material. */
   disabledContentOpacity: 0.38,
   disabledContainerOpacity: 0.12,
   navBar: {
-    /** Tonal circle behind the focused tab's icon (40×40, 20px radius). */
-    activeIndicatorWidth: 40,
-    activeIndicatorHeight: 40,
-    activeIndicatorRadius: 20,
+    /** Tonal pill behind the focused tab's icon (M3 Expressive short navigation
+     *  bar: 56×32, fully rounded — the same pill the navigation rail uses). */
+    activeIndicatorWidth: 56,
+    activeIndicatorHeight: 32,
+    activeIndicatorRadius: 16,
     /** Resting elevation of the solid Android nav surface (M3 nav bar = level 2). */
     surfaceElevation: 2,
+    /** How opaque the bar's surface is when it is drawn over the tab root. Dark
+     *  needs more cover: the #9784FF active label is 4.44:1 over white content
+     *  at 0.92 and 4.70:1 at 0.94. Light keeps 0.85 (5.03:1 over black). */
+    overlaySurfaceAlpha: { light: 0.85, dark: 0.94 },
   },
   navRail: {
     /** Tonal pill behind the focused rail item's icon (M3 navigation-rail spec:
@@ -175,6 +209,14 @@ export const material = {
  */
 export function androidRipple(color: string, borderless = false): { color: string; borderless: boolean } {
   return { color: withAlpha(color, material.pressedStateLayer), borderless };
+}
+
+/**
+ * The default ripple on a neutral surface: `onSurface` (from the theme) at 10%,
+ * a grey state layer rather than a brand-violet one.
+ */
+export function neutralRipple(onSurface: string, borderless = false): { color: string; borderless: boolean } {
+  return { color: withAlpha(onSurface, material.neutralRippleOpacity), borderless };
 }
 
 /**

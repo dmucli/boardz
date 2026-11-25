@@ -462,7 +462,7 @@ describe('boardBySlug tombstone following', () => {
     expect(board?.uuid).toBe(REUSED_ACTIVE_UUID);
   });
 
-  it('keeps private canonical boards masked from anonymous callers after raw lookup extraction', async () => {
+  it('keeps private canonical boards restricted after raw lookup extraction', async () => {
     const privateUuid = uuidv4();
     const mergedSlug = `${PREFIX}-public-merged-into-private`;
     await insertBoard({
@@ -481,9 +481,63 @@ describe('boardBySlug tombstone following', () => {
 
     expect((await resolveBoardBySlug(mergedSlug))?.uuid).toBe(privateUuid);
     expect(await boardBySlug(mergedSlug)).toBeNull();
-    const authenticated = await socialBoardQueries.boardBySlug(null, { slug: mergedSlug }, authCtx(OWNER_B));
-    expect(authenticated?.uuid).toBe(privateUuid);
-    expect(authenticated?.boardId).toBeNull();
+    expect(await socialBoardQueries.boardBySlug(null, { slug: mergedSlug }, authCtx(OWNER_B))).toBeNull();
+    const ownerBoard = await socialBoardQueries.boardBySlug(null, { slug: mergedSlug }, authCtx(OWNER_SURVIVOR));
+    expect(ownerBoard?.uuid).toBe(privateUuid);
+    expect(ownerBoard?.boardId).toBeTypeOf('number');
+  });
+});
+
+describe('an old link that reaches an Unlisted survivor through a merge tombstone', () => {
+  /** An Unlisted survivor, saved the way the current audience control saves it. */
+  async function insertUnlistedSurvivor(ownerId: string, layoutId: number): Promise<{ uuid: string; slug: string }> {
+    const uuid = uuidv4();
+    const slug = `${PREFIX}-unlisted-survivor-${layoutId}`;
+    await insertBoard({ uuid, slug, ownerId, isPublic: false, layoutId, sizeId: 20 });
+    await db.execute(sql`UPDATE user_boards SET is_unlisted = true WHERE uuid = ${uuid}`);
+    await db.execute(sql`
+      INSERT INTO resource_privacy (kind, resource_id, owner_id, audience, location_audience)
+      VALUES ('board', ${uuid}, ${ownerId}, 'unlisted', 'only_me')
+    `);
+    return { uuid, slug };
+  }
+
+  async function insertMergedLoser(ownerId: string, survivorUuid: string, layoutId: number) {
+    const uuid = uuidv4();
+    const slug = `${PREFIX}-reused-into-unlisted-${layoutId}`;
+    await insertBoard({ uuid, slug, ownerId, deleted: true, mergedInto: survivorUuid, layoutId, sizeId: 21 });
+    return { uuid, slug };
+  }
+
+  it("never opens another owner's Unlisted board through a reused slug or a stale uuid", async () => {
+    const survivor = await insertUnlistedSurvivor(OWNER_B, 30);
+    const loser = await insertMergedLoser(OWNER_A, survivor.uuid, 31);
+
+    // The survivor's own link opens it for anyone.
+    expect((await boardBySlug(survivor.slug))?.uuid).toBe(survivor.uuid);
+    expect((await boardByUuid(survivor.uuid))?.uuid).toBe(survivor.uuid);
+
+    // The loser's slug and uuid were OWNER_A's links, not OWNER_B's.
+    expect(await boardBySlug(loser.slug)).toBeNull();
+    expect(await boardByUuid(loser.uuid)).toBeNull();
+    expect(await socialBoardQueries.boardBySlug(null, { slug: loser.slug }, authCtx(OWNER_C))).toBeNull();
+    await expect(
+      boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid: loser.uuid }, anonCtx),
+    ).rejects.toThrow('Board not found');
+
+    // The survivor's owner holds it already, so the redirect still lands for them.
+    const forOwner = await socialBoardQueries.boardBySlug(null, { slug: loser.slug }, authCtx(OWNER_B));
+    expect(forOwner?.uuid).toBe(survivor.uuid);
+  });
+
+  it('keeps an old link working when one owner merged their own boards', async () => {
+    const survivor = await insertUnlistedSurvivor(OWNER_C, 32);
+    const loser = await insertMergedLoser(OWNER_C, survivor.uuid, 33);
+
+    expect((await boardBySlug(loser.slug))?.uuid).toBe(survivor.uuid);
+    expect((await boardByUuid(loser.uuid))?.uuid).toBe(survivor.uuid);
+    const resolved = await boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid: loser.uuid }, anonCtx);
+    expect(resolved.boardName).toBe(`Board ${survivor.uuid}`);
   });
 });
 

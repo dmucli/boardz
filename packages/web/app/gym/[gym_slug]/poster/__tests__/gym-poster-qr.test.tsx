@@ -4,20 +4,10 @@ import React from 'react';
 import { SITE_URL } from '@/app/lib/seo/base-url';
 import GymPosterQr from '../gym-poster-qr';
 
-// Capture the QRCodeSVG props so the encoded target and the print-critical
-// colour/quiet-zone settings are assertable without decoding the matrix — the
-// same trick the kiosk's install-QR test uses.
+// Capture the QRCodeSVG props so the encoded target is assertable without
+// decoding the matrix — the same trick the kiosk's install-QR test uses.
 vi.mock('qrcode.react', () => ({
-  QRCodeSVG: (props: { value: string; fgColor?: string; bgColor?: string; marginSize?: number; level?: string }) => (
-    <svg
-      data-testid="qr"
-      data-value={props.value}
-      data-fg={props.fgColor}
-      data-bg={props.bgColor}
-      data-margin={String(props.marginSize)}
-      data-level={props.level}
-    />
-  ),
+  QRCodeSVG: (props: { value: string }) => <svg data-testid="qr" data-value={props.value} />,
 }));
 
 describe('GymPosterQr', () => {
@@ -38,18 +28,6 @@ describe('GymPosterQr', () => {
     );
   });
 
-  it('sets black-on-white as SVG props, not CSS', () => {
-    // Browsers drop background graphics when printing by default, so a CSS
-    // quiet zone prints away and a dark-mode page yields a dark-on-dark code.
-    // As props they are page content and always print.
-    render(<GymPosterQr gymSlug="boulderwelt-ost" />);
-    const qr = screen.getByTestId('qr');
-    expect(qr.getAttribute('data-fg')).toBe('#000000');
-    expect(qr.getAttribute('data-bg')).toBe('#ffffff');
-  });
-
-  it('uses the spec 4-module quiet zone, not the kiosk margin', () => {
-    render(<GymPosterQr gymSlug="boulderwelt-ost" />);
-    expect(screen.getByTestId('qr').getAttribute('data-margin')).toBe('4');
-  });
+  // Black-on-white fills, level Q and the 4-module quiet zone are `PosterQr`'s
+  // contract and are pinned in `components/poster/__tests__/poster-qr.test.tsx`.
 });

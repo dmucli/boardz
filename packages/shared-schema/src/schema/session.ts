@@ -122,6 +122,11 @@ export const sessionTypeDefs = /* GraphQL */ `
   Input for creating a new climbing session.
   """
   input CreateSessionInput {
+    "Partner workout to start atomically with this climber's session."
+    appWorkoutId: ID
+    "Initial queue and generated stage plan, committed with the new partner workout session."
+    appWorkoutSeed: JSON
+    audience: PrivacyResourceAudience
     "Board configuration path (e.g., 'kilter/1/1/1,2/40')"
     boardPath: String!
     "GPS latitude for session discovery"
@@ -194,7 +199,7 @@ export const sessionTypeDefs = /* GraphQL */ `
   """
   type SessionParticipant {
     "User ID"
-    userId: String!
+    userId: String
     "Display name"
     displayName: String
     "Avatar URL"

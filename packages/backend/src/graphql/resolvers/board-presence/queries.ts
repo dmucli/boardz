@@ -1,4 +1,11 @@
-import { and, asc, desc, eq, inArray, lt, max, or } from 'drizzle-orm';
+import { getGradeColor } from '@boardsesh/board-constants';
+import { isAuroraBoardName } from '@boardsesh/aurora-sync/api';
+import { BOARD_HISTORY_WINDOW_MS, filterRecentBoardHistory, isNativeBoardClimb } from '@boardsesh/board-presence';
+import { withRecentSenderBoardContext } from '../shared/board-session-privacy';
+import { tickPrivacyCondition } from '../shared/activity-privacy';
+import { redactBoardClimbs, redactBoardStats, redactBoardHolder } from '../../../services/board-session-privacy';
+import { visibleActivityUserIds } from '../../../services/privacy';
+import { and, asc, desc, eq, gte, inArray, lt, max, or } from 'drizzle-orm';
 import { GraphQLError } from 'graphql';
 import type {
   BoardClimbRecentSender,
@@ -13,35 +20,92 @@ import * as dbSchema from '@boardsesh/db/schema';
 import { pubsub } from '../../../pubsub/index';
 import { readBoardHistoryPage, readMergedRecentHistory } from '../../../services/board-history';
 import { applyRateLimit, validateInput } from '../shared/helpers';
-import { BoardClimbRecentSendersArgsSchema } from '../../../validation/schemas';
+import { BoardClimbRecentSendersArgsSchema, BoardPresenceClimbGradesArgsSchema } from '../../../validation/schemas';
+import { readBoardPresenceClimbGrades } from '../../../services/board-presence-climb-grades';
 import { RECENT_CLIMB_SENDERS_FETCH_LIMIT, toRecentSenders } from './recent-senders';
 import {
   assertAnonReadableBoard,
   requireActiveBoardWithVisibilityById,
-  requireAnonReadableBoard,
+  requireReadablePresenceBoard,
   resolveBoardHolder,
 } from './shared';
-import { assertSprayBoardIsReadable } from '../climbs/spray-read-access';
+import { assertSprayBoardIsReadable, readViewerIdForBoard } from '../climbs/spray-read-access';
 import { computeBoardPresenceStats, getCachedBoardPresenceStats, setCachedBoardPresenceStats } from './stats';
 
 export const boardPresenceQueries = {
-  boardRecentHistory: async (_: unknown, { boardId }: { boardId: number }, ctx: ConnectionContext) => {
+  boardPresenceClimbGrades: async (
+    _: unknown,
+    {
+      boardId,
+      boardUuid,
+      angle,
+      climbUuids,
+    }: { boardId: number; boardUuid?: string | null; angle: number; climbUuids: string[] },
+    ctx: ConnectionContext,
+  ) => {
+    await applyRateLimit(ctx, 60, 'boardPresenceClimbGrades');
+    const board = await requireActiveBoardWithVisibilityById(boardId);
+    const readerId = await readViewerIdForBoard(ctx, board);
+    await assertAnonReadableBoard(board, readerId, boardUuid);
+    await assertSprayBoardIsReadable(board, readerId, boardUuid, db);
+    const validated = validateInput(
+      BoardPresenceClimbGradesArgsSchema,
+      { boardType: board.boardType, angle, climbUuids },
+      'boardPresenceClimbGrades',
+    );
+    return readBoardPresenceClimbGrades(board, validated.angle, validated.climbUuids);
+  },
+  boardRecentHistory: async (
+    _: unknown,
+    {
+      boardId,
+      boardUuid,
+      includeAurora,
+    }: { boardId: number; boardUuid?: string | null; includeAurora?: boolean | null },
+    ctx: ConnectionContext,
+  ) => {
     await applyRateLimit(ctx, 60, 'boardRecentHistory');
     const board = await requireActiveBoardWithVisibilityById(boardId);
-    assertAnonReadableBoard(board, ctx.userId);
-    await assertSprayBoardIsReadable(board, ctx.userId);
-    return readMergedRecentHistory(boardId);
+    // The backfill half of boardNowPlaying, so it reads the same way: a wall
+    // device's key reads as its owner on the owner's own board, names stay as a
+    // signed-out viewer sees them.
+    const readerId = await readViewerIdForBoard(ctx, board);
+    await assertAnonReadableBoard(board, readerId, boardUuid);
+    await assertSprayBoardIsReadable(board, readerId, boardUuid, db);
+    return redactBoardClimbs(
+      await readMergedRecentHistory(
+        boardId,
+        includeAurora === true && board.boardType !== 'kilter' && isAuroraBoardName(board.boardType),
+      ),
+      ctx.userId,
+      boardId,
+      boardUuid,
+      readerId,
+    );
   },
   boardHistoryPage: async (
     _: unknown,
-    { boardId, limit, before }: { boardId: number; limit?: number | null; before?: string | null },
+    {
+      boardId,
+      boardUuid,
+      limit,
+      before,
+      includeAurora,
+    }: {
+      boardId: number;
+      boardUuid?: string | null;
+      limit?: number | null;
+      before?: string | null;
+      includeAurora?: boolean | null;
+    },
     ctx: ConnectionContext,
   ) => {
     await applyRateLimit(ctx, 60, 'boardHistoryPage');
     const board = await requireActiveBoardWithVisibilityById(boardId);
-    assertAnonReadableBoard(board, ctx.userId);
-    await assertSprayBoardIsReadable(board, ctx.userId);
-    return readBoardHistoryPage(boardId, limit ?? 50, before);
+    await assertAnonReadableBoard(board, ctx.userId, boardUuid);
+    await assertSprayBoardIsReadable(board, ctx.userId, boardUuid, db);
+    const page = await readBoardHistoryPage(boardId, limit ?? 50, before, includeAurora === true);
+    return { ...page, entries: await redactBoardClimbs(page.entries, ctx.userId, boardId, boardUuid) };
   },
   /**
    * Backfill the recent "now on the wall" history for a board from the Redis
@@ -55,25 +119,37 @@ export const boardPresenceQueries = {
    */
   boardRecentClimbs: async (
     _: unknown,
-    { boardId }: { boardId: number },
+    { boardId, boardUuid }: { boardId: number; boardUuid?: string | null },
     ctx: ConnectionContext,
   ): Promise<BoardPresenceClimb[]> => {
     await applyRateLimit(ctx, 60, 'boardRecentClimbs');
-    // One by-id lookup covers both the existence check and the isPublic/ownerId
-    // fields the anon gate below needs (anonymous viewers only backfill
-    // public / system-shared boards), instead of two round-trips for the same
-    // row on every anonymous request.
+    // One by-id lookup covers both the existence check and the uuid the board
+    // gate below reads the policy by. The id alone is the no-link reading; an
+    // Unlisted board's backfill needs its uuid as well (`boardUuid`).
     const visibilityBoard = await requireActiveBoardWithVisibilityById(boardId);
-    assertAnonReadableBoard(visibilityBoard, ctx.userId);
+    // A wall device's key reads as its owner on the owner's own board
+    // (readViewerIdForBoard), so a device on a private wall gets the current climb
+    // on connect. Names stay on ctx.userId.
+    const readerId = await readViewerIdForBoard(ctx, visibilityBoard);
+    await assertAnonReadableBoard(visibilityBoard, readerId, boardUuid);
     // The anon gate above waves every authenticated caller through; a spray wall is
     // somebody's home and needs the wall's own rule. See assertSprayBoardIsReadable.
-    await assertSprayBoardIsReadable(visibilityBoard, ctx.userId);
-    return pubsub.getRecentBoardClimbs(String(boardId));
+    await assertSprayBoardIsReadable(visibilityBoard, readerId, boardUuid, db);
+    return redactBoardClimbs(
+      filterRecentBoardHistory(
+        (await pubsub.getRecentBoardClimbs(String(boardId))).filter(isNativeBoardClimb),
+        Date.now(),
+      ),
+      ctx.userId,
+      boardId,
+      boardUuid,
+      readerId,
+    );
   },
 
   /**
-   * Durable history of what was pushed to a board, from `board_climb_events`
-   * (survives past the 1-week Redis window). Newest-first, keyset-paged via
+   * Last seven days of what was pushed to a board, from `board_climb_events`.
+   * Newest sequence first, keyset-paged via
    * `before`: an opaque cursor that is the `seq` of the last row of the
    * previous page.
    *
@@ -95,19 +171,23 @@ export const boardPresenceQueries = {
    */
   boardHistory: async (
     _: unknown,
-    { boardId, limit, before }: { boardId: number; limit?: number | null; before?: string | null },
+    {
+      boardId,
+      boardUuid,
+      limit,
+      before,
+    }: { boardId: number; boardUuid?: string | null; limit?: number | null; before?: string | null },
     ctx: ConnectionContext,
   ): Promise<BoardPresenceClimb[]> => {
     await applyRateLimit(ctx, 60, 'boardHistory');
-    // One by-id lookup covers both the existence check and the isPublic/ownerId
-    // fields the anon gate below needs (anonymous viewers only read public /
-    // system-shared boards' history), instead of two round-trips for the same
-    // row on every anonymous request.
+    // One by-id lookup covers both the existence check and the uuid the board
+    // gate below reads the policy by. The id alone is the no-link reading; an
+    // Unlisted board's history needs its uuid as well (`boardUuid`).
     const visibilityBoard = await requireActiveBoardWithVisibilityById(boardId);
-    assertAnonReadableBoard(visibilityBoard, ctx.userId);
+    await assertAnonReadableBoard(visibilityBoard, ctx.userId, boardUuid);
     // The anon gate above waves every authenticated caller through; a spray wall is
     // somebody's home and needs the wall's own rule. See assertSprayBoardIsReadable.
-    await assertSprayBoardIsReadable(visibilityBoard, ctx.userId);
+    await assertSprayBoardIsReadable(visibilityBoard, ctx.userId, boardUuid, db);
 
     // Parse + validate the cursor before it reaches SQL, so a malformed value
     // returns a clean error instead of a leaked Postgres parse error. Trim
@@ -127,6 +207,7 @@ export const boardPresenceQueries = {
     const boardMatch = and(
       eq(dbSchema.boardClimbEvents.boardId, boardId),
       eq(dbSchema.boardClimbEvents.source, 'boardsesh'),
+      gte(dbSchema.boardClimbEvents.confirmedAt, new Date(Date.now() - BOARD_HISTORY_WINDOW_MS).toISOString()),
     );
     // Join the sender (nullable — a user can be deleted, leaving userId null) so
     // history rows carry the same display identity + profile link as the live
@@ -155,21 +236,26 @@ export const boardPresenceQueries = {
       .orderBy(desc(dbSchema.boardClimbEvents.seq))
       .limit(cappedLimit);
 
-    return rows.map((row) => ({
-      climbUuid: row.climbUuid,
-      queueItemUuid: null,
-      name: row.name,
-      grade: row.grade,
-      gradeColor: null,
-      frames: row.frames,
-      angle: row.angle,
-      setter: row.setter,
-      sentByDisplayName: row.profileDisplayName ?? row.senderName ?? null,
-      sentByAvatarUrl: row.profileAvatarUrl ?? row.senderImage ?? null,
-      sentByUserId: row.sentByUserId ?? null,
-      sentAt: row.confirmedAt,
-      seq: Number(row.seq),
-    }));
+    return redactBoardClimbs(
+      rows.map((row) => ({
+        climbUuid: row.climbUuid,
+        queueItemUuid: null,
+        name: row.name,
+        grade: row.grade,
+        gradeColor: getGradeColor(row.grade) ?? null,
+        frames: row.frames,
+        angle: row.angle,
+        setter: row.setter,
+        sentByDisplayName: row.profileDisplayName ?? row.senderName ?? null,
+        sentByAvatarUrl: row.profileAvatarUrl ?? row.senderImage ?? null,
+        sentByUserId: row.sentByUserId ?? null,
+        sentAt: row.confirmedAt,
+        seq: Number(row.seq),
+      })),
+      ctx.userId,
+      boardId,
+      boardUuid,
+    );
   },
 
   /**
@@ -180,18 +266,24 @@ export const boardPresenceQueries = {
    *
    * Ticks can retain an Aurora/Kilter alias UUID after catalog deduplication,
    * so resolve the requested climb to its canonical UUID and include every
-   * known alias. Angle is exact; mirror is intentionally not filtered because
-   * BoardPresenceClimb does not currently carry mirror state.
+   * known alias. Angle is exact; mirror is intentionally not filtered: the
+   * sender list is per climb and angle, so a send on either orientation
+   * counts, and the query takes no mirror argument.
    */
   boardClimbRecentSenders: async (
     _: unknown,
-    { boardId, climbUuid, angle }: { boardId: number; climbUuid: string; angle: number },
+    {
+      boardId,
+      boardUuid,
+      climbUuid,
+      angle,
+    }: { boardId: number; boardUuid?: string | null; climbUuid: string; angle: number },
     ctx: ConnectionContext,
   ): Promise<BoardClimbRecentSender[]> => {
     await applyRateLimit(ctx, 60, 'boardClimbRecentSenders');
     const board = await requireActiveBoardWithVisibilityById(boardId);
-    assertAnonReadableBoard(board, ctx.userId);
-    await assertSprayBoardIsReadable(board, ctx.userId);
+    await assertAnonReadableBoard(board, ctx.userId, boardUuid);
+    await assertSprayBoardIsReadable(board, ctx.userId, boardUuid, db);
     // `boardType` comes from the bound board row, not the client: whether a
     // negative tilt exists at all is a property of the hardware, so the angle
     // bound cannot be checked without it.
@@ -215,7 +307,6 @@ export const boardPresenceQueries = {
         ),
       );
     const latestSentAt = max(dbSchema.boardseshTicks.climbedAt);
-
     const rows = await db
       .select({
         userId: dbSchema.boardseshTicks.userId,
@@ -238,6 +329,7 @@ export const boardPresenceQueries = {
           ),
           eq(dbSchema.boardseshTicks.angle, validated.angle),
           inArray(dbSchema.boardseshTicks.status, ['flash', 'send']),
+          tickPrivacyCondition(ctx.userId),
         ),
       )
       .groupBy(
@@ -250,7 +342,22 @@ export const boardPresenceQueries = {
       .orderBy(desc(latestSentAt), asc(dbSchema.boardseshTicks.userId))
       .limit(RECENT_CLIMB_SENDERS_FETCH_LIMIT);
 
-    return toRecentSenders(rows);
+    // Each sender is named by their account, and not when they stay anonymous
+    // on boards they don't own and this one is not theirs. One query.
+    const senders = toRecentSenders(rows);
+    const visibleSenders = await visibleActivityUserIds(
+      senders.map((sender) => sender.userId),
+      ctx.userId,
+      { boardId },
+    );
+    return senders.map((sender) =>
+      withRecentSenderBoardContext(
+        !sender.userId || visibleSenders.has(sender.userId)
+          ? sender
+          : { ...sender, userId: null, displayName: null, avatarUrl: null },
+        boardId,
+      ),
+    );
   },
 
   /**
@@ -274,22 +381,21 @@ export const boardPresenceQueries = {
    */
   boardPresenceStats: async (
     _: unknown,
-    { boardId }: { boardId: number },
+    { boardId, boardUuid }: { boardId: number; boardUuid?: string | null },
     ctx: ConnectionContext,
   ): Promise<BoardPresenceStats> => {
     // Multiple gym TVs can sit behind one NAT and reconnect together after a
     // network blip, so this anon-tolerant read gets the higher 60/min budget.
     await applyRateLimit(ctx, 60, 'boardPresenceStats');
-    // One by-id lookup covers both the existence check and the isPublic/ownerId
-    // fields the anon gate below needs, instead of two round-trips for the
-    // same row on every anonymous request.
+    // One by-id lookup covers both the existence check and the uuid the board
+    // gate below reads the policy by.
     const board = await requireActiveBoardWithVisibilityById(boardId);
-    // Anonymous viewers only read public / system-shared boards' stats.
-    assertAnonReadableBoard(board, ctx.userId);
-    await assertSprayBoardIsReadable(board, ctx.userId);
+    // The id alone is the no-link reading; an Unlisted board's stats need its uuid.
+    await assertAnonReadableBoard(board, ctx.userId, boardUuid);
+    await assertSprayBoardIsReadable(board, ctx.userId, boardUuid, db);
 
     const cached = await getCachedBoardPresenceStats(boardId);
-    if (cached) return cached;
+    if (cached) return redactBoardStats(cached, ctx.userId, boardId, boardUuid);
 
     const stats = await computeBoardPresenceStats(boardId, board.boardType);
     // NX (only-if-absent): this fire-and-forget write races the debounced
@@ -297,7 +403,7 @@ export const boardPresenceQueries = {
     // and this SET — NX keeps that one instead of rolling the cache back;
     // on a true miss it populates the key as before.
     setCachedBoardPresenceStats(boardId, stats, { onlyIfAbsent: true });
-    return stats;
+    return redactBoardStats(stats, ctx.userId, boardId, boardUuid);
   },
 
   /**
@@ -310,15 +416,17 @@ export const boardPresenceQueries = {
    */
   boardConnection: async (
     _: unknown,
-    { boardId }: { boardId: number },
+    { boardId, boardUuid }: { boardId: number; boardUuid?: string | null },
     ctx: ConnectionContext,
   ): Promise<BoardConnectionHolder | null> => {
     // Multiple gym TVs can sit behind one NAT and reconnect together after a
     // network blip, so this anon-tolerant read gets the higher 60/min budget.
     await applyRateLimit(ctx, 60, 'boardConnection');
-    // Validates the id and, for anonymous viewers, restricts to public /
-    // system-shared boards.
-    await requireAnonReadableBoard(boardId, ctx.userId);
-    return resolveBoardHolder(boardId);
+    // Validates the id and applies the board gate: the no-link reading for the
+    // id alone, the link reading when `boardUuid` is this board's own.
+    // A spray wall's holder is its climbers' identity, so it also takes the
+    // wall's own rule, like every other presence read here (hidden = owner only).
+    await requireReadablePresenceBoard(boardId, ctx.userId, boardUuid);
+    return redactBoardHolder(await resolveBoardHolder(boardId), ctx.userId, boardId);
   },
 };

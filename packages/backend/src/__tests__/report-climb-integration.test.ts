@@ -45,6 +45,8 @@ vi.mock('../utils/redis-rate-limiter', () => ({
 }));
 
 import { socialProposalMutations } from '../graphql/resolvers/social/proposals/mutations';
+import { proposalReportReleaseContextQueries } from '../graphql/resolvers/social/proposals/report-release-contexts';
+import { socialCommentQueries } from '../graphql/resolvers/social/comments';
 import { activityFeedQueries } from '../graphql/resolvers/social/activity-feed';
 
 const BOARD_TYPE = 'kilter';
@@ -242,6 +244,83 @@ describe('reportClimb', () => {
     const publishedEventTypes = mockPublishSocialEvent.mock.calls.map((call) => (call[0] as { type: string }).type);
     expect(publishedEventTypes).toContain('proposal.created');
     expect(publishedEventTypes).not.toContain('comment.created');
+  });
+
+  it('keeps each reporter release identity on their reason without publishing it', async () => {
+    const releaseContext = {
+      channel: 'production',
+      branch: 'pr-beta',
+      updateId: 'beta-update',
+      runtimeVersion: 'fingerprint',
+      isEmbeddedLaunch: false,
+    };
+    const first = await reportHide(REPORTER_A, { releaseContext });
+    await reportHide(REPORTER_B, { releaseContext: { ...releaseContext, branch: 'pr-123' } });
+    const comments = await readComments(first.proposal.uuid);
+    expect(comments[0].releaseContext).toMatchObject({ ...releaseContext, automaticCanary: false });
+    expect(comments[1].releaseContext?.branch).toBe('pr-123');
+    expect(JSON.stringify(mockPublishCommentEvent.mock.calls)).not.toContain('releaseContext');
+  });
+
+  it('exposes report diagnostics only to admins for the proposal actual board', async () => {
+    const releaseContext = {
+      channel: 'production',
+      branch: 'pr-beta',
+      updateId: 'beta-update',
+      runtimeVersion: 'fingerprint',
+      isEmbeddedLaunch: false,
+    };
+    const report = await reportHide(REPORTER_A, { releaseContext });
+    const args = { proposalUuid: report.proposal.uuid };
+    const readDiagnostics = (ctx: ConnectionContext) =>
+      proposalReportReleaseContextQueries.proposalReportReleaseContexts(null, args, ctx);
+    expect(await readDiagnostics({ connectionId: 'anonymous', isAuthenticated: false })).toEqual([]);
+    expect(await readDiagnostics(authCtx(REPORTER_A))).toEqual([]);
+    await db
+      .insert(dbSchema.communityRoles)
+      .values({ userId: REPORTER_B, role: 'community_leader', boardType: BOARD_TYPE });
+    expect(await readDiagnostics(authCtx(REPORTER_B))).toEqual([]);
+    await db.insert(dbSchema.communityRoles).values({ userId: REPORTER_C, role: 'admin', boardType: 'tension' });
+    expect(await readDiagnostics(authCtx(REPORTER_C))).toEqual([]);
+    await db.insert(dbSchema.communityRoles).values({ userId: ADMIN, role: 'admin', boardType: BOARD_TYPE });
+    const authorized = await readDiagnostics(authCtx(ADMIN));
+    expect(authorized).toHaveLength(1);
+    expect(authorized[0].releaseContext).toMatchObject({ ...releaseContext, automaticCanary: false });
+    const publicComments = await socialCommentQueries.comments(
+      null,
+      { input: { entityType: 'proposal', entityId: report.proposal.uuid } },
+      authCtx(REPORTER_A),
+    );
+    expect(JSON.stringify(publicComments)).not.toContain('releaseContext');
+    await db.delete(dbSchema.communityRoles).where(eq(dbSchema.communityRoles.userId, ADMIN));
+    expect(await readDiagnostics(authCtx(ADMIN))).toEqual([]);
+  });
+
+  it('keeps old and deleted report diagnostics out of the admin query', async () => {
+    const report = await reportHide(REPORTER_A);
+    await grantAdmin(ADMIN);
+    const args = { proposalUuid: report.proposal.uuid };
+    expect(await proposalReportReleaseContextQueries.proposalReportReleaseContexts(null, args, authCtx(ADMIN))).toEqual(
+      [],
+    );
+    await db
+      .update(dbSchema.comments)
+      .set({
+        deletedAt: new Date(),
+        releaseContext: {
+          channel: 'production',
+          branch: 'pr-beta',
+          updateId: 'old-update',
+          runtimeVersion: 'fingerprint',
+          isEmbeddedLaunch: false,
+          automaticCanary: false,
+          canaryCheckedAt: null,
+        },
+      })
+      .where(eq(dbSchema.comments.entityId, report.proposal.uuid));
+    expect(await proposalReportReleaseContextQueries.proposalReportReleaseContexts(null, args, authCtx(ADMIN))).toEqual(
+      [],
+    );
   });
 
   it('joins the second reporter onto the open proposal instead of opening a rival', async () => {
@@ -740,6 +819,27 @@ describe('activityFeed hides fanned-out rows for hidden climbs', () => {
   beforeEach(async () => {
     await resetFixtures();
 
+    // Materialized rows must have live parent entities for current authorization.
+    await db.insert(dbSchema.boardSessions).values({
+      id: SESSION_WITHOUT_CLIMB,
+      boardPath: 'kilter/1/1/1/40',
+      createdByUserId: FEED_ACTOR,
+      isPublic: true,
+    });
+    await db.insert(dbSchema.boardseshTicks).values(
+      [
+        { uuid: TICK_ON_REPORTED_CLIMB, climbUuid: CLIMB_UUID },
+        { uuid: TICK_ON_MISSING_CLIMB, climbUuid: 'rc-feed-climb-that-does-not-exist' },
+      ].map((tick) => ({
+        ...tick,
+        userId: FEED_ACTOR,
+        boardType: BOARD_TYPE,
+        angle: ANGLE,
+        status: 'send' as const,
+        climbedAt: '2026-03-01T10:00:00Z',
+      })),
+    );
+
     await insertFeedItem({
       entityId: TICK_ON_REPORTED_CLIMB,
       entityType: 'tick',
@@ -764,21 +864,20 @@ describe('activityFeed hides fanned-out rows for hidden climbs', () => {
   });
 
   it('drops the row while the climb is hidden and brings it back on unhide', async () => {
-    expect(await readFeedEntityIds()).toEqual([SESSION_WITHOUT_CLIMB, TICK_ON_MISSING_CLIMB, TICK_ON_REPORTED_CLIMB]);
+    expect(await readFeedEntityIds()).toEqual([SESSION_WITHOUT_CLIMB, TICK_ON_REPORTED_CLIMB]);
 
     await setReportedClimbHidden(true);
 
-    // Only the hidden climb's row goes. A row whose climbUuid matches no climb
-    // and a row with no climbUuid at all both still read through — `->>` on a
-    // missing key is NULL, which must not swallow the whole feed.
-    expect(await readFeedEntityIds()).toEqual([SESSION_WITHOUT_CLIMB, TICK_ON_MISSING_CLIMB]);
+    // A missing climb cannot authorize its denormalized name/frames. Sessions
+    // without climb metadata remain visible when their own audience allows it.
+    expect(await readFeedEntityIds()).toEqual([SESSION_WITHOUT_CLIMB]);
 
     // Filtered, not purged: the row is still on disk waiting for the unhide.
     expect(await countStoredFeedRows()).toBe(3);
 
     await setReportedClimbHidden(false);
 
-    expect(await readFeedEntityIds()).toEqual([SESSION_WITHOUT_CLIMB, TICK_ON_MISSING_CLIMB, TICK_ON_REPORTED_CLIMB]);
+    expect(await readFeedEntityIds()).toEqual([SESSION_WITHOUT_CLIMB, TICK_ON_REPORTED_CLIMB]);
     expect(await countStoredFeedRows()).toBe(3);
   });
 });

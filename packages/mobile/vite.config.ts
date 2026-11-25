@@ -17,14 +17,34 @@ export default defineConfig({
   // forces the same singletons via SINGLETON_MODULES, so the app has never shipped
   // two Reacts. Two bundlers, one decision — change both.
   resolve: {
-    dedupe: ['react', 'react-dom'],
+    // Shared hooks and mobile must also use the same React Query context and
+    // React peer, just as Metro's SINGLETON_MODULES requires in production.
+    dedupe: ['react', 'react-dom', '@tanstack/react-query'],
   },
   test: {
+    // Preserve mock history from setup and beforeAll when upgrading from Vitest 4.
+    clearMocks: false,
     name: 'mobile',
     globalSetup: [fileURLToPath(new URL('./test/screenshot-fixture-setup.ts', import.meta.url))],
     globals: true,
     environment: 'node',
     alias: [
+      // Binary-scoped GPU failure storage reads these native APIs. Node tests
+      // use a real SHA implementation and override identity explicitly as needed.
+      {
+        find: 'expo-application',
+        replacement: fileURLToPath(new URL('./test/expo-application-stub.ts', import.meta.url)),
+      },
+      {
+        find: 'expo-crypto',
+        replacement: fileURLToPath(new URL('./test/expo-crypto-stub.ts', import.meta.url)),
+      },
+      // The GPU failure latch is also scoped to the running OTA update. The real
+      // package loads react-native's Flow entry, which Node cannot parse.
+      {
+        find: 'expo-updates',
+        replacement: fileURLToPath(new URL('./test/expo-updates-stub.ts', import.meta.url)),
+      },
       // Gorhom is installed only in web-runtime so it stays outside the native
       // fingerprint graph. This resolver target lets adapter tests install a
       // hoisted module mock without making the real package visible to Vitest.
@@ -40,6 +60,10 @@ export default defineConfig({
       {
         find: 'posthog-react-native',
         replacement: fileURLToPath(new URL('./test/posthog-react-native-stub.ts', import.meta.url)),
+      },
+      {
+        find: 'posthog-react-native-session-replay',
+        replacement: fileURLToPath(new URL('./test/posthog-replay-stub.ts', import.meta.url)),
       },
       // react-native-paper's real entry throws a SyntaxError under vitest's node
       // env (untransformed RN-native source + react-native-vector-icons). Stub it
@@ -117,8 +141,16 @@ export default defineConfig({
       // expo-haptics' `main` is src/Haptics.ts (TS source), throwing the same
       // node-env SyntaxError as expo-image/expo-file-system. A no-op stub keeps
       // any suite that transitively imports src/lib/haptics (e.g. via the climbs
-      // screen → FilterTokenRow / RecentFilterPills) from crashing.
+      // screen → FilterTokenRow) from crashing.
       { find: 'expo-haptics', replacement: fileURLToPath(new URL('./test/expo-haptics-stub.ts', import.meta.url)) },
+      // modules/accessibility-ui touches expo-modules-core's native globals at
+      // import, which don't exist here. The stub is the module as Android and
+      // older binaries see it: absent. Anchored on `…/src/index`, so
+      // accessibility-ui-module.test.ts can still reach the real file as `…/src`.
+      {
+        find: /^(.*\/)?modules\/accessibility-ui\/src\/index$/,
+        replacement: fileURLToPath(new URL('./test/accessibility-ui-stub.ts', import.meta.url)),
+      },
       // src/theme/animations.ts has `export type SpringPreset = keyof typeof springs`
       // and `export type TimingPreset = keyof typeof timing`. In CI's Rolldown worker
       // (Node.js 24), Rolldown's static analysis traverses into this file even when
@@ -133,23 +165,35 @@ export default defineConfig({
         find: /^(.*\/)?theme\/animations$/,
         replacement: fileURLToPath(new URL('./test/theme-animations-stub.ts', import.meta.url)),
       },
-      // Static image imports (.png/.jpg/.webp/...) resolve to a Metro asset id (a
-      // number) at runtime. Vitest has no Metro asset pipeline and Rolldown's
-      // static analysis chokes parsing the binary as a module, so redirect every
-      // asset import to a dummy. Like the theme/animations alias, the regex must
-      // match the WHOLE specifier (vite replaces only the matched part).
+      // Static image and sound imports (.png/.jpg/.webp/.wav/...) resolve to a
+      // Metro asset id (a number) at runtime. Vitest has no Metro asset pipeline
+      // and Rolldown's static analysis chokes parsing the binary as a module, so
+      // redirect every asset import to a dummy. Like the theme/animations alias,
+      // the regex must match the WHOLE specifier (vite replaces only the matched
+      // part).
       {
-        find: /^.*\.(png|jpe?g|gif|webp|svg)$/,
+        find: /^.*\.(png|jpe?g|gif|webp|svg|wav)$/,
         replacement: fileURLToPath(new URL('./test/asset-stub.ts', import.meta.url)),
       },
-      // FilterChipRow is platform-split (FilterChipRow.ios.tsx renders native
-      // @expo/ui SwiftUI menus; FilterChipRow.android.tsx is a placeholder).
-      // Vitest doesn't resolve `.ios`/`.android` extensions and can't mount the
-      // SwiftUI host, so redirect the extensionless import to a null stub. Suites
-      // that assert chip behaviour register their own vi.mock (takes precedence).
+      // FilterChipRow (the climbs filter row) renders the native CapsuleRow and
+      // reads the active board for its Android angle chip, so screen suites that
+      // import it get a null stub instead. Suites that assert the climbs capsules
+      // test buildClimbCapsules (search/climb-capsules.ts) or register their own
+      // vi.mock (takes precedence).
       {
         find: /^(.*\/)?search\/FilterChipRow$/,
         replacement: fileURLToPath(new URL('./test/filter-chip-row-stub.tsx', import.meta.url)),
+      },
+      // CapsuleRow is platform-split (CapsuleRow.ios.tsx renders native @expo/ui
+      // SwiftUI glass buttons + menus; CapsuleRow.android.tsx Compose FilterChips;
+      // CapsuleRow.web.tsx Paper chips). Vitest doesn't resolve `.ios`/`.android`
+      // extensions and can't mount either native tree, so redirect the
+      // extensionless import to a null stub. Suites that assert the row import a
+      // platform file explicitly (filter-capsules/__tests__) or register their
+      // own vi.mock (takes precedence).
+      {
+        find: /^(.*\/)?filter-capsules\/CapsuleRow$/,
+        replacement: fileURLToPath(new URL('./test/capsule-row-stub.tsx', import.meta.url)),
       },
       // SwitchRow is platform-split (SwitchRow.ios.tsx renders a native @expo/ui
       // SwiftUI Toggle; SwitchRow.android.tsx a native Compose Switch). Vitest
@@ -253,21 +297,11 @@ export default defineConfig({
         find: /^(.*\/)?MoreForm$/,
         replacement: fileURLToPath(new URL('./test/more-form-stub.tsx', import.meta.url)),
       },
-      // LogbookChipRow is platform-split the same way as FilterChipRow
-      // (LogbookChipRow.ios.tsx renders native @expo/ui SwiftUI glass chips;
-      // LogbookChipRow.android.tsx is a placeholder). Vitest doesn't resolve
-      // `.ios`/`.android` extensions and can't mount the SwiftUI host, so redirect
-      // the extensionless import to a null stub. Suites that assert chip behaviour
-      // register their own vi.mock (takes precedence).
-      {
-        find: /^(.*\/)?LogbookChipRow$/,
-        replacement: fileURLToPath(new URL('./test/logbook-chip-row-stub.tsx', import.meta.url)),
-      },
-      // LogbookFacetRail is the iOS-glass chip row's inline rail (rendered below
-      // the chips when a grade/angle/date facet is open). It pulls in Reanimated +
-      // the native date picker, which can't mount under Vitest's react-native mock,
-      // so redirect the extensionless import to a null stub. Suites that assert the
-      // rail (logbook-tab-chips) register their own vi.mock (takes precedence).
+      // LogbookFacetRail is the Logbook capsule row's inline Grade / Angle rail.
+      // It pulls in Reanimated through the range rails, which can't mount under
+      // Vitest's react-native mock, so redirect the extensionless import to a
+      // null stub. Suites that assert the rail register their own vi.mock (takes
+      // precedence).
       {
         find: /^(.*\/)?LogbookFacetRail$/,
         replacement: fileURLToPath(new URL('./test/logbook-facet-rail-stub.tsx', import.meta.url)),

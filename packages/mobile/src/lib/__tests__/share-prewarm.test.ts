@@ -1,5 +1,31 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PAGE_READ_TIMEOUT_MS, extractOgImageUrl, prewarmShareCaches } from '../share-prewarm';
+import { BOARD_RENDER_VERSION } from '@boardsesh/board-render/version';
+import { BACKEND_URL } from '../env';
+import {
+  PAGE_READ_TIMEOUT_MS,
+  buildOgImageUrl,
+  buildPlaylistOgImageUrl,
+  buildPlaceOgImageUrl,
+  buildProfileOgImageUrl,
+  buildSessionRecapOgImageUrl,
+  buildSessionInviteOgImageUrl,
+  buildSetterOgImageUrl,
+  extractOgImageUrl,
+  prewarmShareCaches,
+} from '../share-prewarm';
+
+describe('profile, place and recap card URLs', () => {
+  it('encodes public identities and slugs', () => {
+    expect(buildProfileOgImageUrl('u/1')).toBe(`${BACKEND_URL}/og/profile?user_id=u%2F1`);
+    expect(buildPlaceOgImageUrl('gym', 'the crag')).toBe(`${BACKEND_URL}/og/place?kind=gym&slug=the%20crag`);
+    expect(buildPlaceOgImageUrl('board', 'garage')).toBe(`${BACKEND_URL}/og/place?kind=board&slug=garage`);
+    expect(buildSessionRecapOgImageUrl('s/1')).toBe(`${BACKEND_URL}/og/session?sessionId=s%2F1`);
+  });
+
+  it('does not warm the backend session card for daily feed groups', () => {
+    expect(buildSessionRecapOgImageUrl('daily:u1:2026-11-20')).toBeNull();
+  });
+});
 
 /**
  * The app cannot compute the card URL www advertises — that angle comes from
@@ -87,6 +113,29 @@ describe('extractOgImageUrl', () => {
         `<head><meta property="og:image" content="https://ws.boardsesh.com.evil.example/og/climb"/></head>`,
       ),
     ).toBeNull();
+  });
+
+  it.each([
+    'https://ws.boardsesh.com/og/playlist?uuid=pl-1&v=abc',
+    'https://ws.boardsesh.com/og/profile?user_id=u1&v=abc',
+    'https://ws.boardsesh.com/og/setter?username=Jimmy+Webb&v=abc',
+    'https://ws.boardsesh.com/og/session?sessionId=s1&variant=join&v=abc',
+    'https://ws.boardsesh.com/og/place?kind=gym&slug=kaserne&v=abc',
+  ])('reads a family card on our backend: %s', (card) => {
+    expect(extractOgImageUrl(`<head><meta property="og:image" content="${card}"/></head>`)).toBe(card);
+  });
+
+  it('follows only the card endpoints, not anything else our backend answers', () => {
+    for (const content of [
+      'https://ws.boardsesh.com/graphql?query=x',
+      'https://ws.boardsesh.com/og/playlists?uuid=x',
+      'https://ws.boardsesh.com/og/playlist',
+      'https://ws.boardsesh.com/og/../graphql?x=1',
+      'https://evil.example.com/og/playlist?uuid=x',
+      'https://ws.boardsesh.com.evil.example/og/playlist?uuid=x',
+    ]) {
+      expect(extractOgImageUrl(`<head><meta property="og:image" content="${content}"/></head>`)).toBeNull();
+    }
   });
 
   it('returns null rather than throwing when there is no card', () => {
@@ -241,13 +290,106 @@ describe('prewarmShareCaches', () => {
     await expect(prewarmShareCaches(PAGE, FALLBACK)).resolves.toBeUndefined();
   });
 
+  it('warms a card once when the page advertises the fallback itself', async () => {
+    // A public spray wall: the app builds the very URL www advertises, so the
+    // page read finds a request already in flight.
+    const fetched = stubFetch((url) => (url === PAGE ? htmlAdvertising(FALLBACK) : ({ ok: true } as Response)));
+
+    await prewarmShareCaches(PAGE, FALLBACK);
+
+    expect(fetched.filter((url) => url === FALLBACK)).toHaveLength(1);
+  });
+
   it('does nothing further when there is no card to warm at all', async () => {
-    // Spray walls: the renderer cannot draw one, so buildOgImageUrl returns
-    // null and there is nothing to fall back to.
+    // An unlisted or private spray wall: www advertises no card for it and
+    // buildOgImageUrl returns null, so there is nothing to fall back to.
     const fetched = stubFetch(() => ({ ok: true, text: async () => '<head></head>' }) as Response);
 
     await prewarmShareCaches(PAGE, null);
 
     expect(fetched).toEqual([PAGE]);
+  });
+});
+
+describe('family card URLs', () => {
+  it('build the token-free card for a playlist, a setter and an invite', () => {
+    expect(buildPlaylistOgImageUrl('pl-1')).toBe(`${BACKEND_URL}/og/playlist?uuid=pl-1`);
+    expect(buildSetterOgImageUrl('Jimmy Webb/2')).toBe(`${BACKEND_URL}/og/setter?username=Jimmy%20Webb%2F2`);
+    expect(buildSessionInviteOgImageUrl('s 1')).toBe(`${BACKEND_URL}/og/session?sessionId=s%201&variant=join`);
+  });
+
+  it('warms a family card once when the page advertises it with its data token', async () => {
+    // The backend keys the card on its drawn data, so the token-free fallback and
+    // www's tokened URL are the same render: a second fetch would only queue.
+    const page = 'https://www.boardsesh.com/playlists/pl-1';
+    const fallback = buildPlaylistOgImageUrl('pl-1');
+    const fetched: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string) => {
+        fetched.push(url);
+        return url === page
+          ? ({
+              ok: true,
+              text: async () => `<head><meta property="og:image" content="${fallback}&amp;v=k3x9"/></head>`,
+            } as Response)
+          : ({ ok: true } as Response);
+      }),
+    );
+
+    await prewarmShareCaches(page, fallback);
+    vi.unstubAllGlobals();
+
+    expect(fetched).toEqual([fallback, page]);
+  });
+});
+
+describe('buildOgImageUrl for a catalogue board', () => {
+  it('warms a versioned Aura card without guessing the canonical climb identity', () => {
+    const builtUrl = buildOgImageUrl({
+      boardName: 'kilter',
+      layoutId: 1,
+      sizeId: 7,
+      setIds: '20,1',
+      frames: 'p1145r15p1146r12',
+    });
+    expect(builtUrl).toBe(
+      `${BACKEND_URL}/og/climb?board_name=kilter&layout_id=1&size_id=7&set_ids=1%2C20&frames=p1145r15p1146r12&format=jpeg&render_mode=aura&field_color=%23181225&v=${BOARD_RENDER_VERSION}`,
+    );
+  });
+});
+
+describe('buildOgImageUrl for a spray wall', () => {
+  const SPRAY = { boardName: 'spray', layoutId: 4321, sizeId: 4321, setIds: '1', frames: 'p12r42p19r43' } as const;
+
+  // What www's `buildSprayOgImageUrl` puts in a public wall's og:image. Rebuilt
+  // here with URLSearchParams, as web builds it, so a drift in either the order
+  // or the encoding fails this test instead of quietly warming a second entry.
+  function webSprayCardUrl(layoutId: number, frames: string): string {
+    const params = new URLSearchParams({
+      board_name: 'spray',
+      layout_id: String(layoutId),
+      size_id: String(layoutId),
+      set_ids: '1',
+      frames,
+      format: 'jpeg',
+      v: BOARD_RENDER_VERSION,
+    });
+    return `${BACKEND_URL}/og/climb?${params}`;
+  }
+
+  it('builds exactly the card www advertises for a public wall', () => {
+    expect(buildOgImageUrl({ ...SPRAY, sprayVisibility: 'public' })).toBe(webSprayCardUrl(4321, 'p12r42p19r43'));
+  });
+
+  it('warms nothing for an unlisted, private or unknown wall', () => {
+    // `/og/climb` answers 404 for anything but a public wall, by design.
+    expect(buildOgImageUrl({ ...SPRAY, sprayVisibility: 'unlisted' })).toBeNull();
+    expect(buildOgImageUrl({ ...SPRAY, sprayVisibility: 'private' })).toBeNull();
+    expect(buildOgImageUrl({ ...SPRAY })).toBeNull();
+  });
+
+  it('warms nothing for a climb without frames', () => {
+    expect(buildOgImageUrl({ ...SPRAY, frames: null, sprayVisibility: 'public' })).toBeNull();
   });
 });

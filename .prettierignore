@@ -8,6 +8,11 @@
 # the file size for data nobody reads by eye. Nested dir, so the `**/generated/**` glob in
 # vite.config.ts fmt.ignore is not enough on its own.
 packages/shared/board-art-geometry/src/generated/
+# The committed public API contract. `scripts/generate-public-api-openapi.ts` writes it with
+# JSON.stringify and `--check` byte-compares, so a formatting pass would red the drift gate.
+packages/shared/public-api/src/generated/
+# Immutable asset maps are emitted and byte-compared by generate-static-assets.
+packages/shared/static-assets/src/generated/
 
 # Local-only board-data exports (gitignored, see .gitignore). If an operator drops an
 # export here to run an importer, don't let `vp check` try to reformat the raw data.
@@ -21,8 +26,8 @@ CHANGELOG.md
 # .clang-format; its JS build scripts and Markdown aren't held to the web/mobile Prettier
 # config (the CI PR-lint already skips `embedded/`).
 embedded/
-docs/embedded-architecture.md
-# Recorded screenshot fixtures (docs/mobile-screenshot-fixtures.md). The record
+docs/boards/embedded-architecture.md
+# Recorded screenshot fixtures (docs/qa/mobile-screenshot-fixtures.md). The record
 # backend writes these files and `vp run mobile:screenshot-fixtures-merge`
 # rewrites the manifest; a formatting pass would put both permanently at odds
 # with what the next recording emits.
@@ -34,12 +39,12 @@ packages/mobile/screenshot-fixtures/
 packages/mobile/.maestro/
 
 # Markdown is not formatted. The formatter's emphasis pairing does not follow
-# CommonMark's intraword-underscore rule: on docs/websocket-implementation.md it
+# CommonMark's intraword-underscore rule: on docs/backend/websocket-implementation.md it
 # paired the `_` inside the bare identifier NOT_FOUND with a later `_signed-in_`
 # and emitted NOT*FOUND + \_signed-in*, corrupting an identifier in prose on
 # every run. Prose gains little from auto-formatting and has content the
 # formatter can get wrong. Mirrored in vite.config.ts fmt.ignore.
-# The CHANGELOG.md and docs/embedded-architecture.md entries above are now
+# The CHANGELOG.md and docs/boards/embedded-architecture.md entries above are now
 # subsumed by this, but stay: they document why those two must never be
 # formatted even if markdown formatting is ever reinstated.
 *.md
@@ -66,3 +71,5 @@ packages/shared/hold-detection/src/__tests__/fixtures/*.json
 packages/boardz/designsystem/
 # Icon Composer rewrites icon.json in its own style on every save.
 packages/boardz/assets/*.icon/
+# Exact published migration evidence; retain the original journal bytes.
+packages/backend/src/auth/authority/__tests__/fixtures/historical-private-browser-v1/_journal.json

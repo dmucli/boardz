@@ -1,22 +1,31 @@
 import { GraphQLError } from 'graphql';
-import { and, asc, eq, isNotNull, isNull, lt, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, or, sql } from 'drizzle-orm';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { SPRAY_WALL_PHOTO_RETENTION_DAYS } from '@boardsesh/board-config';
 import * as dbSchema from '@boardsesh/db/schema';
 import { db } from '../../../db/client';
 import { logger } from '../../../utils/logger';
+import { enrichReleaseContext } from '../../../services/mobile-release-status';
 import { applyRateLimit, requireAuthenticated, validateInput } from '../shared/helpers';
 import { requireAdmin } from '../social/roles';
 import { ReportSprayWallInputSchema, SetSprayWallHiddenInputSchema, UUIDSchema } from '../../../validation/schemas';
 import { deleteFromS3, isS3Configured, listS3Objects } from '../../../storage/s3';
-import { purgeSprayWallFeedItems, SPRAY_WALL_CODES, viewerCanSeeSprayWall } from './spray-walls';
+import { SYSTEM_BOARD_OWNER_ID } from '../board-presence/shared';
+import {
+  presignVersionPhoto,
+  purgeSprayWallFeedItems,
+  refreshPublicWallPhoto,
+  SPRAY_WALL_CODES,
+  viewerCanSeeSprayWall,
+  lockWallForWrite,
+} from './spray-walls';
 
 /**
  * Moderation and retention for spray walls (SW-17, epic #5346).
  *
  * ## Why this is not the climb-proposal machinery
  *
- * `docs/climb-moderation.md` describes a weighted approval threshold over a
+ * `docs/product/climb-moderation.md` describes a weighted approval threshold over a
  * proposed CHANGE to a climb: several climbers vote, their roles weight the
  * votes, and the outcome is a catalogue edit. That is the right shape when the
  * community knows better than any one person whether a climb's holds are wrong.
@@ -130,9 +139,10 @@ export const sprayWallModerationMutations = {
     if (!loaded || !(await viewerCanReport(loaded.wall, loaded.board, ctx.userId!))) throw notFoundError();
 
     const reason = REPORT_REASON_BY_WIRE_NAME[validated.reason];
+    const releaseContext = await enrichReleaseContext(validated.releaseContext, ctx.clientIdentity?.platform);
     const inserted = await db
       .insert(dbSchema.sprayWallReports)
-      .values({ wallId: loaded.wall.id, reporterId: ctx.userId!, reason })
+      .values({ wallId: loaded.wall.id, reporterId: ctx.userId!, reason, releaseContext })
       // The `where` is not optional here: `spray_wall_reports_wall_reporter_idx` is
       // PARTIAL (`reporter_id IS NOT NULL`), and Postgres refuses to infer a
       // partial index from a bare column list — `ON CONFLICT (wall_id,
@@ -209,6 +219,32 @@ export const sprayWallModerationMutations = {
       adminId: ctx.userId,
     });
 
+    // An unhidden PUBLIC wall with no public photo copy gets one now. While a wall
+    // is hidden, every path that copies its photo into the world-readable bucket
+    // refuses (#5797) — but the owner can still publish it or make it public, so
+    // it can come back public with nothing for the gym page, the share card or
+    // `publicPhotoUrl` to show, and nothing else would ever copy it. Read fresh
+    // after the commit rather than from `loaded`; `refreshPublicWallPhoto`
+    // re-checks public / unhidden / still-this-version under the row lock, and
+    // never throws.
+    if (!validated.hidden) {
+      const [unhidden] = await db
+        .select({
+          isPublic: dbSchema.userBoards.isPublic,
+          publicPhotoKey: dbSchema.sprayWalls.publicPhotoKey,
+          currentVersionId: dbSchema.sprayWalls.currentVersionId,
+          photoKey: dbSchema.sprayWallVersions.photoKey,
+        })
+        .from(dbSchema.sprayWalls)
+        .innerJoin(dbSchema.userBoards, eq(dbSchema.userBoards.uuid, dbSchema.sprayWalls.boardUuid))
+        .innerJoin(dbSchema.sprayWallVersions, eq(dbSchema.sprayWallVersions.id, dbSchema.sprayWalls.currentVersionId))
+        .where(eq(dbSchema.sprayWalls.id, loaded.wall.id))
+        .limit(1);
+      if (unhidden?.isPublic && unhidden.publicPhotoKey == null && unhidden.currentVersionId != null) {
+        await refreshPublicWallPhoto(loaded.wall.id, loaded.board.uuid, unhidden.photoKey, unhidden.currentVersionId);
+      }
+    }
+
     // Read back rather than echoing the write: under the guard above, a second
     // concurrent hide changes nothing, and reporting its own `now` would tell the
     // admin a timestamp the database does not hold.
@@ -262,6 +298,8 @@ export type PurgeDeletedSprayWallPhotosOptions = {
   /** Injected so a test can drive the threshold instead of waiting 30 days. */
   now?: Date;
   batchSize?: number;
+  /** Internal post-account-delete attempt; never accepts a caller's arbitrary prefix. */
+  wallIds?: readonly number[];
 };
 
 /**
@@ -280,8 +318,12 @@ export type PurgeDeletedSprayWallPhotosOptions = {
 export async function purgeDeletedSprayWallPhotos({
   now = new Date(),
   batchSize = DEFAULT_PURGE_BATCH_SIZE,
+  wallIds,
 }: PurgeDeletedSprayWallPhotosOptions = {}): Promise<SprayWallPhotoPurgeResult> {
   const startedAt = Date.now();
+  if (wallIds?.length === 0) {
+    return { wallsPurged: 0, objectsDeleted: 0, wallsConsidered: 0, durationMs: 0 };
+  }
   const cutoff = new Date(now.getTime() - SPRAY_WALL_PHOTO_RETENTION_DAYS * 24 * 60 * 60 * 1000);
 
   // `lt`, not `lte`: a wall deleted exactly at the cutoff is inside the window by
@@ -297,17 +339,23 @@ export async function purgeDeletedSprayWallPhotos({
   // to do". Pushed into the WHERE, the batch is always real work, and
   // `spray_walls_deleted_at_idx` is partial on exactly this pair.
   const work = await db
-    .select({ id: dbSchema.sprayWalls.id, boardUuid: dbSchema.sprayWalls.boardUuid })
+    .select({
+      id: dbSchema.sprayWalls.id,
+      boardUuid: dbSchema.sprayWalls.boardUuid,
+      updatedAtToken: sql<string>`${dbSchema.sprayWalls.updatedAt}::text`,
+    })
     .from(dbSchema.sprayWalls)
+    .innerJoin(dbSchema.userBoards, eq(dbSchema.userBoards.uuid, dbSchema.sprayWalls.boardUuid))
     .where(
       and(
         isNotNull(dbSchema.sprayWalls.deletedAt),
-        lt(dbSchema.sprayWalls.deletedAt, cutoff),
+        or(lt(dbSchema.sprayWalls.deletedAt, cutoff), eq(dbSchema.userBoards.ownerId, SYSTEM_BOARD_OWNER_ID)),
         isNull(dbSchema.sprayWalls.photosPurgedAt),
+        wallIds ? inArray(dbSchema.sprayWalls.id, [...wallIds]) : undefined,
       ),
     )
     .orderBy(asc(dbSchema.sprayWalls.deletedAt))
-    .limit(batchSize);
+    .limit(wallIds?.length ?? batchSize);
 
   if (work.length === 0) {
     return { wallsPurged: 0, objectsDeleted: 0, wallsConsidered: 0, durationMs: Date.now() - startedAt };
@@ -331,15 +379,29 @@ export async function purgeDeletedSprayWallPhotos({
       // thing the next run would have produced. The other order would leave a key
       // nulled and the object orphaned in the bucket forever, with nothing left
       // that names it.
-      await db
-        .update(dbSchema.sprayWallVersions)
-        .set({ photoKey: null, updatedAt: now })
-        .where(eq(dbSchema.sprayWallVersions.wallId, candidate.id));
-      await db
-        .update(dbSchema.sprayWalls)
-        .set({ photosPurgedAt: now, updatedAt: now })
-        .where(eq(dbSchema.sprayWalls.id, candidate.id));
-      wallsPurged += 1;
+      const recorded = await db.transaction(async (tx) => {
+        await lockWallForWrite(tx, candidate.id);
+        const [wallNow] = await tx
+          .select({ updatedAtToken: sql<string>`${dbSchema.sprayWalls.updatedAt}::text` })
+          .from(dbSchema.sprayWalls)
+          .where(eq(dbSchema.sprayWalls.id, candidate.id))
+          .limit(1);
+        // A late uploader that could not erase its bytes marks retry under this
+        // same lock. Never stamp success over a listing older than that marker.
+        // Text preserves DB microseconds; JavaScript Date would lose them.
+        if (!wallNow || wallNow.updatedAtToken !== candidate.updatedAtToken) return false;
+        await tx
+          .update(dbSchema.sprayWallVersions)
+          // `art` names objects under the same prefix (the generated wall looks).
+          .set({ photoKey: null, art: null, updatedAt: now })
+          .where(eq(dbSchema.sprayWallVersions.wallId, candidate.id));
+        await tx
+          .update(dbSchema.sprayWalls)
+          .set({ photosPurgedAt: now, updatedAt: now })
+          .where(eq(dbSchema.sprayWalls.id, candidate.id));
+        return true;
+      });
+      if (recorded) wallsPurged += 1;
     } catch (error) {
       // One wall's storage failure must not stop the batch, and it must not stamp
       // `photos_purged_at`: nothing was cleared, so the next run takes the wall
@@ -402,7 +464,11 @@ export const sprayWallModerationQueries = {
     // A pending report on a wall the owner has since deleted is not work: no
     // surface shows the wall, and hiding it would change nothing. It stays in the
     // table as the record of why, and out of the queue.
-    const conditions = [isNull(dbSchema.sprayWallReports.reviewedAt), isNull(dbSchema.sprayWalls.deletedAt)];
+    const conditions = [
+      isNull(dbSchema.sprayWallReports.reviewedAt),
+      isNull(dbSchema.sprayWalls.deletedAt),
+      isNull(dbSchema.userBoards.deletedAt),
+    ];
     if (uuid !== undefined && uuid !== null) {
       const validatedUuid = validateInput(UUIDSchema, uuid, 'uuid');
       conditions.push(eq(dbSchema.sprayWalls.boardUuid, validatedUuid));
@@ -412,22 +478,87 @@ export const sprayWallModerationQueries = {
       .select({
         id: dbSchema.sprayWallReports.id,
         reason: dbSchema.sprayWallReports.reason,
+        releaseContext: dbSchema.sprayWallReports.releaseContext,
         createdAt: dbSchema.sprayWallReports.createdAt,
         wallUuid: dbSchema.sprayWalls.boardUuid,
+        wallName: dbSchema.userBoards.name,
+        wallId: dbSchema.sprayWalls.id,
+        currentVersionId: dbSchema.sprayWalls.currentVersionId,
         layoutId: dbSchema.sprayWalls.layoutId,
         hiddenAt: dbSchema.sprayWalls.hiddenAt,
       })
       .from(dbSchema.sprayWallReports)
       .innerJoin(dbSchema.sprayWalls, eq(dbSchema.sprayWalls.id, dbSchema.sprayWallReports.wallId))
+      .innerJoin(dbSchema.userBoards, eq(dbSchema.userBoards.uuid, dbSchema.sprayWalls.boardUuid))
       .where(and(...conditions))
       .orderBy(sql`${dbSchema.sprayWallReports.createdAt} DESC`)
       .limit(200);
 
+    if (rows.length === 0) return [];
+
+    // This read is intentionally admin-only rather than a normal wall read:
+    // private and hidden photographs are precisely what the queue must review.
+    // Several reports can share a wall. Their joined wall fields are identical,
+    // so deduplicate by wallId before selecting and signing each preview once.
+    const walls = new Map(rows.map((row) => [row.wallId, row]));
+    const currentVersionIds = [...walls.values()].flatMap((wall) =>
+      wall.currentVersionId == null ? [] : [wall.currentVersionId],
+    );
+    const unpublishedWallIds = [...walls.values()].flatMap((wall) =>
+      wall.currentVersionId == null ? [wall.wallId] : [],
+    );
+    const versions = await db
+      .select()
+      .from(dbSchema.sprayWallVersions)
+      .where(
+        and(
+          inArray(dbSchema.sprayWallVersions.wallId, [...walls.keys()]),
+          or(
+            unpublishedWallIds.length > 0
+              ? and(
+                  inArray(dbSchema.sprayWallVersions.wallId, unpublishedWallIds),
+                  eq(dbSchema.sprayWallVersions.status, 'draft'),
+                )
+              : undefined,
+            currentVersionIds.length > 0 ? inArray(dbSchema.sprayWallVersions.id, currentVersionIds) : undefined,
+          ),
+        ),
+      )
+      .orderBy(desc(dbSchema.sprayWallVersions.versionNumber));
+
+    const selectedVersions = new Map<number, (typeof versions)[number]>();
+    for (const version of versions) {
+      const wall = walls.get(version.wallId)!;
+      if (
+        version.id === wall.currentVersionId ||
+        (wall.currentVersionId == null && version.status === 'draft' && !selectedVersions.has(version.wallId))
+      ) {
+        selectedVersions.set(version.wallId, version);
+      }
+    }
+
+    // One pair of signatures per wall, even if several climbers reported it.
+    const photos = new Map(
+      await Promise.all(
+        [...selectedVersions].map(async ([wallId, version]) => {
+          try {
+            return [wallId, await presignVersionPhoto(version)] as const;
+          } catch (error) {
+            logger.warn('Failed to presign a spray wall moderation preview', { wallId, versionId: version.id }, error);
+            return [wallId, null] as const;
+          }
+        }),
+      ),
+    );
+
     return rows.map((row) => ({
       id: String(row.id),
       wallUuid: row.wallUuid,
+      wallName: row.wallName,
+      photo: photos.get(row.wallId) ?? null,
       layoutId: row.layoutId,
       reason: reportReasonWireName(row.reason),
+      releaseContext: row.releaseContext,
       hidden: row.hiddenAt != null,
       createdAt: row.createdAt.toISOString(),
     }));

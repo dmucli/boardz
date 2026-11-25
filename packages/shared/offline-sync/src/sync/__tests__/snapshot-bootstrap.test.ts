@@ -12,7 +12,20 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { QueryInvalidator } from '../../database';
+
+// Keep LATEST_SCHEMA_VERSION one above ARTIFACT_SCHEMA_VERSION for every importer
+// in this file, the code under test included. The real two are equal whenever
+// the newest migration changed an artifact table (v11 did), and then "an
+// artifact below LATEST but at the artifact floor" cannot be built, so nothing
+// would notice the bootstrap comparing against LATEST. Same technique as
+// snapshot-forward-compatibility.test.ts. `runMigrations` reads its own
+// module-local constant, so the database is still migrated to the real latest.
+vi.mock('../../db/migrations', async (importOriginal) => {
+  const original = await importOriginal<typeof import('../../db/migrations')>();
+  return { ...original, LATEST_SCHEMA_VERSION: original.ARTIFACT_SCHEMA_VERSION + 1 };
+});
+
+import type { OfflineDatabase, QueryInvalidator } from '../../database';
 import {
   pullSync,
   emptyScopeDownloadPhases,
@@ -20,6 +33,7 @@ import {
   type ScopeDownloadPhaseBreakdown,
 } from '../pull-client';
 import type { SnapshotBootstrapProgress } from '../snapshot-progress';
+import { SnapshotTransferError } from '../snapshot-transfer-failure';
 import {
   bootstrapScopeFromSnapshot,
   bootstrapScopeGradesFromSnapshot,
@@ -31,12 +45,15 @@ import {
   SnapshotPermanentMissError,
   SnapshotBackgroundTransferInterruptedError,
   SnapshotSchemaStaleError,
+  SnapshotWipedError,
   type SnapshotSource,
 } from '../snapshot-bootstrap';
 import {
   getBootstrapAttempts,
   readBootstrapRetryState,
+  writeBootstrapRetryRows,
   restoreBootstrapRetryBudget,
+  type BootstrapRetryState,
   EMPTY_BOOTSTRAP_RETRY_STATE,
   MAX_BOOTSTRAP_ATTEMPTS,
   MAX_FREE_BACKGROUND_PAUSES,
@@ -55,6 +72,19 @@ import {
   __resetDrainerStateForTests,
 } from '../../mutation-queue/drainer';
 import { createTestDatabase, type TestSqliteDb } from '../../testing/sqlite-test-db';
+import { openSharedMainConnection } from '../../testing/shared-main-connection';
+import { runPullWrite } from '../pull-write';
+
+/** A retry state committed the way the engine commits one (#5851): rows in their own write transaction. */
+function writeRetryState(
+  database: OfflineDatabase,
+  scopeKey: string,
+  retryState: BootstrapRetryState,
+): Promise<BootstrapRetryState> {
+  return runPullWrite(database, (transaction) => writeBootstrapRetryRows(transaction, scopeKey, retryState), {
+    site: 'test-seed',
+  });
+}
 import type { OfflineBoardScope } from '../../offline-board-key';
 import {
   SNAPSHOT_MANIFEST_FORMAT_VERSION,
@@ -161,7 +191,7 @@ function buildArtifact(spec: ArtifactSpec): void {
         (table_name, watermark_updated_at, watermark_sync_seq, row_count, built_at, schema_version, format_version)
        VALUES (?, ?, ?, ?, ?, ?, ?)`,
     );
-    const formatVersion = spec.formatVersion ?? 1;
+    const formatVersion = spec.formatVersion ?? SNAPSHOT_MANIFEST_FORMAT_VERSION;
     const schemaVersion = spec.schemaVersion ?? LATEST_SCHEMA_VERSION;
     const builtAt = spec.builtAt ?? '2026-06-01T00:00:00.000Z';
     meta.run(
@@ -211,7 +241,7 @@ function makeEntry(overrides: Partial<SnapshotManifestEntry> = {}): SnapshotMani
 }
 
 function makeManifest(entries: SnapshotManifestEntry[]): SnapshotManifest {
-  return { formatVersion: 1, generatedAt: '2026-06-01T00:00:00.000Z', entries };
+  return { formatVersion: 2, generatedAt: '2026-06-01T00:00:00.000Z', entries };
 }
 
 /** A recording fake of the injected snapshot I/O. */
@@ -493,6 +523,28 @@ describe('getBootstrapMetadataByScope', () => {
 // ---------------------------------------------------------------------------
 
 describe('bootstrapScopeFromSnapshot', () => {
+  it('replays authenticated rows omitted by privacy-safe public artifacts from epoch', async () => {
+    const filePath = join(workDir, 'privacy-artifact.db');
+    buildArtifact({
+      filePath,
+      climbs: [{ uuid: 'public-catalog', compatibleSizeIds: [5] }],
+      stats: [{ climbUuid: 'public-catalog', angle: 40 }],
+      climbsWatermark: CLIMBS_WATERMARK,
+      statsWatermark: STATS_WATERMARK,
+    });
+    await bootstrapScopeFromSnapshot({
+      db,
+      scope: SCOPE_KILTER_5,
+      scopeKey: 'kilter:1:5',
+      filePath,
+      replayFromEpoch: true,
+    });
+    const epoch = { updatedAt: '1970-01-01T00:00:00.000Z', syncSeq: '0' };
+    expect(await countRows('board_climbs')).toBe(1);
+    expect(await getCheckpoint(db, 'checkpoint:board_climbs:kilter:1:5')).toEqual(epoch);
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_stats:kilter:1:5')).toEqual(epoch);
+  });
+
   it('imports the size-matched climbs + their stats and stamps both checkpoints at the watermarks', async () => {
     const filePath = join(workDir, 'artifact.db');
     buildArtifact({
@@ -930,6 +982,181 @@ describe('bootstrapScopeFromSnapshot', () => {
 // ---------------------------------------------------------------------------
 
 describe('pullSync snapshot bootstrap', () => {
+  it('correlates a failed physical transfer and its failure with the first scope request', async () => {
+    const firstRequest = { requestId: 'first-request', batchId: 'first-batch' };
+    const source = makeSnapshotSource({ manifest: makeManifest([makeEntry()]), downloadThrows: true });
+    const onSnapshotBootstrapError = vi.fn();
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5', 'kilter:1:6'],
+      getDownloadRequestContext: (scopeKey) =>
+        scopeKey === 'kilter:1:5' ? firstRequest : { requestId: 'second-request', batchId: 'second-batch' },
+      snapshotSource: source,
+      onSnapshotBootstrapError,
+    });
+    expect(source.downloadArtifact).toHaveBeenCalledOnce();
+    expect(source.downloadArtifact).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        downloadRequest: firstRequest,
+      }),
+    );
+    expect(onSnapshotBootstrapError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopeKey: 'kilter:1:5',
+        downloadRequest: firstRequest,
+      }),
+    );
+    expect(onSnapshotBootstrapError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopeKey: 'kilter:1:6',
+        downloadRequest: { requestId: 'second-request', batchId: 'second-batch' },
+      }),
+    );
+  });
+
+  it('correlates a separately downloaded grades artifact without duplicating the layout transfer', async () => {
+    const request = { requestId: 'grades-request', batchId: 'grades-batch' };
+    const grades: SnapshotGradesArtifact = {
+      key: 'grades',
+      url: 'https://example.test/grades.db',
+      bytes: 1024,
+      contentEncoding: 'identity',
+      builtAt: '2026-06-01T00:00:00.000Z',
+      schemaVersion: LATEST_SCHEMA_VERSION,
+      tables: {
+        board_climb_grades: { watermarkUpdatedAt: '2026-05-01T00:00:00Z', watermarkSyncSeq: '10', rowCount: 0 },
+      },
+    };
+    const filePath = join(workDir, 'correlated-layout.db');
+    buildArtifact({
+      filePath,
+      climbs: [{ uuid: 'c1', compatibleSizeIds: [5, 6] }],
+      stats: [{ climbUuid: 'c1', angle: 40 }],
+      climbsWatermark: CLIMBS_WATERMARK,
+      statsWatermark: STATS_WATERMARK,
+    });
+    const source = {
+      ...makeSnapshotSource({ manifest: makeManifest([makeEntry({ grades })]), fileForEntry: () => filePath }),
+      downloadGradesArtifact: vi.fn(async () => null),
+    };
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5', 'kilter:1:6'],
+      getDownloadRequestContext: () => request,
+      snapshotSource: source,
+    });
+    expect(source.downloadGradesArtifact).toHaveBeenCalledOnce();
+    expect(source.downloadGradesArtifact).toHaveBeenCalledWith(
+      grades,
+      expect.objectContaining({ downloadRequest: request }),
+    );
+    expect(source.downloadArtifact).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['cleared cursors', null, true],
+    ['cleared cursors and a retained lock cooldown', BASE_NOW + 60_000, true],
+    ['authorization withheld after revalidation', BASE_NOW + 60_000, false],
+  ] as const)('replays a retained successful snapshot with %s', async (_label, retryAfter, authorized) => {
+    const scopeKey = 'kilter:1:5';
+    const filePath = join(workDir, 'revalidated-artifact.db');
+    buildArtifact({
+      filePath,
+      climbs: [{ uuid: 'withdrawn-climb', compatibleSizeIds: [5] }],
+      stats: [{ climbUuid: 'withdrawn-climb', angle: 40 }],
+      climbsWatermark: CLIMBS_WATERMARK,
+      statsWatermark: STATS_WATERMARK,
+    });
+    const source = makeSnapshotSource({
+      manifest: makeManifest([makeEntry({ privacyVersion: 1 })]),
+      fileForEntry: () => filePath,
+    });
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: [scopeKey],
+      snapshotSource: source,
+      now: () => BASE_NOW,
+    });
+    expect(
+      await db.getFirstAsync('SELECT key FROM sync_meta WHERE key = ?', [`bootstrap-done:${scopeKey}`]),
+    ).not.toBeNull();
+
+    // Privacy revalidation withdraws visible rows and all board cursors/completion,
+    // while preserving the successful artifact marker so an old file cannot restore them.
+    await db.withExclusiveTransactionAsync(async (transaction) => {
+      for (const table of ['board_climb_stats', 'board_climb_grades'])
+        await transaction.runAsync(`DELETE FROM ${table} WHERE climb_uuid = ?`, ['withdrawn-climb']);
+      await transaction.runAsync('DELETE FROM board_climbs WHERE uuid = ?', ['withdrawn-climb']);
+      for (const table of ['board_climbs', 'board_climb_stats', 'board_climb_grades'])
+        await transaction.runAsync('DELETE FROM sync_meta WHERE key = ?', [`checkpoint:${table}:${scopeKey}`]);
+      await transaction.runAsync('DELETE FROM sync_meta WHERE key = ?', [`scope-complete:${scopeKey}`]);
+    });
+    await writeRetryState(db, scopeKey, {
+      ...EMPTY_BOOTSTRAP_RETRY_STATE,
+      ...(retryAfter === null
+        ? {}
+        : { lockFailures: 1, lastFailureKind: 'database-locked' as const, hasPriorSnapshotFailure: true }),
+      retryAfter,
+    });
+    const replay = makeGraphqlFetch({
+      climbServerRows: [
+        {
+          doc: {
+            uuid: 'authorized-climb',
+            board_type: 'kilter',
+            layout_id: 1,
+            name: 'Authorized climb',
+            compatible_size_ids: '[5]',
+          },
+          cursor: CLIMBS_WATERMARK,
+        },
+      ],
+      gradeServerRows: [
+        {
+          doc: {
+            board_type: 'kilter',
+            climb_uuid: 'authorized-climb',
+            angle: 40,
+            local_grade: 20,
+            computed_at: CLIMBS_WATERMARK.updatedAt,
+            sync_seq: 20,
+          },
+          cursor: CLIMBS_WATERMARK,
+        },
+      ],
+    });
+    const fetch = async <Result>(query: string, variables?: Record<string, unknown>): Promise<Result> => {
+      if (!authorized && query.includes('syncClimbs')) throw new Error('Catalogue authorization withheld');
+      return replay.fetch<Result>(query, variables);
+    };
+    const result = pullSync(db, noopQueryClient(), fetch, {
+      enabledBoards: [scopeKey],
+      snapshotSource: source,
+      now: () => BASE_NOW,
+    });
+    if (authorized) {
+      await result;
+      expect(replay.capturedClimbCursors).toEqual([undefined]);
+      expect(replay.capturedStatsCursors).toEqual([undefined]);
+      expect(replay.capturedGradeCursors).toEqual([undefined]);
+      expect(
+        await db.getFirstAsync('SELECT uuid FROM board_climbs WHERE uuid = ?', ['authorized-climb']),
+      ).not.toBeNull();
+      expect(
+        await db.getFirstAsync('SELECT climb_uuid FROM board_climb_grades WHERE climb_uuid = ?', ['authorized-climb']),
+      ).not.toBeNull();
+      expect(
+        await db.getFirstAsync('SELECT key FROM sync_meta WHERE key = ?', [`scope-complete:${scopeKey}`]),
+      ).not.toBeNull();
+    } else {
+      await expect(result).rejects.toThrow('Catalogue authorization withheld');
+      expect(
+        await db.getFirstAsync('SELECT key FROM sync_meta WHERE key = ?', [`scope-complete:${scopeKey}`]),
+      ).toBeNull();
+      expect(await countRows('board_climbs')).toBe(0);
+    }
+    expect(source.downloadArtifact).toHaveBeenCalledOnce();
+    expect(await db.getFirstAsync('SELECT uuid FROM board_climbs WHERE uuid = ?', ['withdrawn-climb'])).toBeNull();
+  });
+
   it('warms a fresh scope, then the paged pull resumes from the watermark and marks the scope complete', async () => {
     await db.runAsync('INSERT INTO sync_meta (key, value) VALUES (?, ?)', ['bootstrap-paged-fallback:kilter:1:5', '1']);
     const filePath = join(workDir, 'happy.db');
@@ -1119,9 +1346,12 @@ describe('pullSync snapshot bootstrap', () => {
   });
 
   it('imports an artifact stamped below LATEST_SCHEMA_VERSION but at ARTIFACT_SCHEMA_VERSION or above', async () => {
-    // v10 added only device-side tables, so a v9 artifact carries every column
-    // this client has. Rejecting it would send every download to the paged crawl
-    // until the export republished.
+    // A device-only migration raises LATEST and leaves the artifact floor where
+    // it was, so an artifact one version behind carries every column this client
+    // has. Rejecting it would send every download to the paged crawl until the
+    // export republished. LATEST is mocked one above the real floor (see the
+    // top of this file) so the two numbers differ whatever the newest real
+    // migration touched.
     expect(ARTIFACT_SCHEMA_VERSION).toBeLessThan(LATEST_SCHEMA_VERSION);
     const filePath = join(workDir, 'older-device-schema.db');
     buildArtifact({
@@ -1171,20 +1401,43 @@ describe('pullSync snapshot bootstrap', () => {
     });
     const source = makeSnapshotSource({ manifest: makeManifest([makeEntry()]), fileForEntry: () => filePath });
     const { fetch } = makeGraphqlFetch(); // delta returns zero documents everywhere
-    const invalidated: unknown[] = [];
-    const queryClient = {
-      invalidateQueries: vi.fn((filter: { queryKey: unknown }) => {
-        invalidated.push(filter.queryKey);
+    type Filters = Parameters<QueryInvalidator['invalidateQueries']>[0];
+    let phase = 'idle';
+    const invalidated: { head: unknown; phase: string; filters: Filters }[] = [];
+    const queryClient: QueryInvalidator = {
+      invalidateQueries: vi.fn((filters: Filters) => {
+        invalidated.push({ head: filters.queryKey[0], phase, filters });
       }),
-    } as unknown as QueryInvalidator;
+    };
 
-    await pullSync(db, queryClient, fetch, { enabledBoards: ['kilter:1:5'], snapshotSource: source });
+    await pullSync(db, queryClient, fetch, {
+      enabledBoards: ['kilter:1:5'],
+      snapshotSource: source,
+      onProgress: (progress) => {
+        phase = progress.phase;
+      },
+    });
 
     // syncTable's arrivals-only invalidation never fires (0 delta documents), so
-    // the bootstrap itself must have busted the board-table caches.
-    expect(invalidated.length).toBeGreaterThan(0);
-    const flattened = JSON.stringify(invalidated);
-    expect(flattened).toContain('climb');
+    // the bootstrap itself must have busted the board-table caches: before the
+    // tombstone and table phases, not only when the scope completes after them.
+    const duringImport = invalidated.filter((entry) => entry.phase === 'bootstrap');
+    expect(duringImport.map((entry) => entry.head)).toContain('climb');
+    expect(duringImport.map((entry) => entry.head)).toContain('infiniteSearchClimbs');
+    // And once more when the completion marker opens the scope to local reads.
+    expect(invalidated.filter((entry) => entry.phase !== 'bootstrap').map((entry) => entry.head)).toContain(
+      'infiniteSearchClimbs',
+    );
+    // Every climb-list refresh of the cycle is for this board alone (#6302).
+    const searchRefreshes = invalidated.filter((entry) => entry.head === 'infiniteSearchClimbs');
+    for (const { filters } of searchRefreshes) {
+      expect(filters.predicate?.({ queryKey: ['infiniteSearchClimbs', { boardName: 'kilter', layoutId: 1 }] })).toBe(
+        true,
+      );
+      expect(filters.predicate?.({ queryKey: ['infiniteSearchClimbs', { boardName: 'tension', layoutId: 1 }] })).toBe(
+        false,
+      );
+    }
   });
 
   it('downloads one artifact for two sizes of the same layout', async () => {
@@ -1213,6 +1466,82 @@ describe('pullSync snapshot bootstrap', () => {
     // Each size imported its own compatible climb.
     expect(await db.getFirstAsync('SELECT uuid FROM board_climbs WHERE uuid = ?', ['c5'])).not.toBeNull();
     expect(await db.getFirstAsync('SELECT uuid FROM board_climbs WHERE uuid = ?', ['c6'])).not.toBeNull();
+  });
+
+  it('keeps ordinary deltas silent after a completed download', async () => {
+    await markScopeDownloadComplete(db, 'kilter:1:5');
+    const progress: SyncProgress[] = [];
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5'],
+      onProgress: (frame) => progress.push(frame),
+    });
+    expect(progress.some((frame) => frame.download !== undefined)).toBe(false);
+  });
+
+  it('uses request order for queued boards at each scheduling opportunity', async () => {
+    let requestedScopes: string[] = [];
+    const started: string[] = [];
+    const fetch = makeGraphqlFetch().fetch;
+    await pullSync(db, noopQueryClient(), fetch, {
+      enabledBoards: ['kilter:1:5', 'kilter:1:6', 'tension:2:10'],
+      getPriorityBoards: () => requestedScopes,
+      onScopeDownloadStart: ({ scopeKey }) => {
+        started.push(scopeKey);
+        if (started.length === 1) requestedScopes = ['tension:2:10', 'kilter:1:6'];
+      },
+    });
+    expect(started).toEqual(['kilter:1:5', 'tension:2:10', 'kilter:1:6']);
+  });
+
+  it('does not emit download completion before the durable marker exists', async () => {
+    const completedScopes: string[] = [];
+    const completionMarkers: unknown[] = [];
+    const observer = new DatabaseSync(join(workDir, 'client.db'));
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5'],
+      onProgress: (frame) => {
+        if (frame.download?.fraction === 1) {
+          completedScopes.push(frame.download.scopeKey);
+          completionMarkers.push(
+            observer
+              .prepare('SELECT value FROM sync_meta WHERE key = ?')
+              .get(`scope-complete:${frame.download.scopeKey}`),
+          );
+        }
+      },
+      onScopeDownloadComplete: ({ scopeKey }) => {
+        expect(completedScopes).toContain(scopeKey);
+      },
+    });
+    observer.close();
+    expect(completionMarkers).toHaveLength(1);
+    expect(completionMarkers[0]).toBeDefined();
+    expect(completedScopes).toEqual(['kilter:1:5']);
+    expect(
+      await db.getFirstAsync('SELECT value FROM sync_meta WHERE key = ?', ['scope-complete:kilter:1:5']),
+    ).not.toBeNull();
+  });
+
+  it('reports a manual board tap added during the current download on the next frame', async () => {
+    let requestedScopes: string[] = [];
+    const downloads: SyncProgress[] = [];
+    const source: SnapshotSource = {
+      fetchManifest: vi.fn(async () => makeManifest([makeEntry()])),
+      downloadArtifact: vi.fn(async () => null),
+      deleteArtifact: vi.fn(async () => {}),
+    };
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5'],
+      getPriorityBoards: () => requestedScopes,
+      snapshotSource: source,
+      onProgress: (progress) => {
+        if (!progress.download) return;
+        downloads.push(progress);
+        if (downloads.length === 1) requestedScopes = ['tension:2:10'];
+      },
+    });
+    expect(downloads[0].download?.queuedScopes).toBe(0);
+    expect(downloads.slice(1).some((progress) => progress.download?.queuedScopes === 1)).toBe(true);
   });
 
   it('settles scope A metadata before scope B finishes its bootstrap download', async () => {
@@ -1249,7 +1578,8 @@ describe('pullSync snapshot bootstrap', () => {
       enabledBoards: ['kilter:1:5', 'tension:2:10'],
       snapshotSource: source,
       onProgress: (progress) => {
-        if (progress.phase === 'bootstrap' && progress.currentTable) pushEvent(`progress:${progress.currentTable}`);
+        if (progress.phase === 'bootstrap' && progress.currentTable && progress.download?.phase !== 'finishing')
+          pushEvent(`progress:${progress.currentTable}`);
       },
       onBootstrapMetadataChanged: ({ scopeKey }) => pushEvent(`settled:${scopeKey}`),
     });
@@ -1263,7 +1593,9 @@ describe('pullSync snapshot bootstrap', () => {
     secondDownload.resolve(null);
     await syncPromise;
 
-    expect(events).toEqual([
+    // Whole-download frames continue through fallback and finishing after both
+    // metadata callbacks; the warm-up order remains the first four events.
+    expect(events.slice(0, 4)).toEqual([
       'progress:kilter:1:5',
       'settled:kilter:1:5',
       'progress:tension:2:10',
@@ -1413,7 +1745,7 @@ describe('pullSync snapshot bootstrap', () => {
       statsWatermark: STATS_WATERMARK,
     });
     const source = makeSnapshotSource({ manifest: makeManifest([makeEntry()]), fileForEntry: () => filePath });
-    source.fetchManifest.mockResolvedValueOnce({ formatVersion: 1, generatedAt: 'not-a-date', entries: [] });
+    source.fetchManifest.mockResolvedValueOnce({ formatVersion: 2, generatedAt: 'not-a-date', entries: [] });
     const firstRun = makeGraphqlFetch();
     const onBootstrapRetryDue = vi.fn();
 
@@ -1695,6 +2027,7 @@ describe('pullSync bootstrap: transport failures never spend the structural budg
       // report site (issue #4314).
       reason: 'network',
       aborted: false,
+      transferCompleted: false,
     });
     // Nothing was persisted, so there is no settled decision to re-read.
     expect(onBootstrapMetadataChanged).not.toHaveBeenCalled();
@@ -1874,6 +2207,46 @@ describe('pullSync bootstrap: transport failures never spend the structural budg
     expect(await getBootstrapAttempts(db, 'kilter:1:5')).toBe(MAX_BOOTSTRAP_ATTEMPTS);
   });
 
+  it.each([
+    { cause: new Error('Unable to download a file: Connection reset'), reason: 'network', expected: true },
+    {
+      cause: new SnapshotBackgroundTransferInterruptedError('无法解码原始数据'),
+      reason: 'background-transfer-decode',
+      expected: true,
+    },
+    {
+      cause: new SnapshotTransferError('http-range', 'server returned HTTP 416', { cause: new Error('HTTP 416') }),
+      reason: 'http-range',
+      expected: false,
+    },
+  ])('finishes through paging after bounded $reason transfer failures', async ({ cause, reason, expected }) => {
+    const source = makeSnapshotSource({ manifest: makeManifest([makeEntry()]), downloadError: cause });
+    const onSnapshotBootstrapError = vi.fn();
+    const onScopeDownloadComplete = vi.fn();
+
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+        enabledBoards: ['kilter:1:5'],
+        snapshotSource: source,
+        onSnapshotBootstrapError,
+        onScopeDownloadComplete,
+        now: () => BASE_NOW + cycle * 25 * HOUR_MS,
+        random: () => 0,
+      });
+    }
+
+    expect(source.downloadArtifact).toHaveBeenCalledTimes(MAX_TRANSPORT_DOWNLOAD_FAILURES);
+    expect(onScopeDownloadComplete).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ scopeKey: 'kilter:1:5', method: 'paged' }),
+    );
+    expect(onSnapshotBootstrapError).toHaveBeenCalledWith(
+      expect.objectContaining({ reason, expected, aborted: false }),
+    );
+    const { state } = await readBootstrapRetryState(db, 'kilter:1:5', { now: BASE_NOW, random: () => 0 }, true);
+    expect(state.transportFailures).toBe(MAX_TRANSPORT_DOWNLOAD_FAILURES);
+    expect(state.structuralFailures).toBe(0);
+  });
+
   it('gives a broken ARTIFACT exactly one extra round when a new build lands, then stops', async () => {
     const filePath = join(workDir, 'corrupt-forever.db');
     writeFileSync(filePath, 'not a database');
@@ -1999,6 +2372,39 @@ describe('pullSync bootstrap: healing a scope stranded mid-crawl', () => {
       random: () => 0,
     });
 
+    expect(onScopeDownloadComplete).toHaveBeenCalledWith(
+      expect.objectContaining({ scopeKey: 'kilter:1:5', method: 'snapshot', bootstrapHealed: true }),
+    );
+  });
+
+  it('attributes the once-ever Completed event from the lock, not a main read older than the import (#5851)', async () => {
+    await seedStrandedMidCrawl();
+    const filePath = join(workDir, 'shared-main-heal.db');
+    buildHealArtifact(filePath);
+    const source = makeSnapshotSource({ manifest: makeManifest([makeEntry()]), fileForEntry: () => filePath });
+    const onScopeDownloadComplete = vi.fn();
+    const shared = openSharedMainConnection(join(workDir, 'client.db'), db);
+    try {
+      // A local read opens its snapshot on the main connection before the import
+      // commits `bootstrap-done:` on its own connection, and is still open when
+      // the scope completes. Read there, the marker is not down yet.
+      shared.holdStaleSnapshot(
+        (_sql, params) => params.includes('checkpoint:board_climbs:kilter:1:5'),
+        () => {},
+      );
+      await pullSync(shared.db, noopQueryClient(), makeGraphqlFetch().fetch, {
+        enabledBoards: ['kilter:1:5'],
+        snapshotSource: source,
+        onScopeDownloadComplete,
+        now: () => BASE_NOW,
+        random: () => 0,
+      });
+    } finally {
+      shared.close();
+    }
+    // Fires once per scope, ever: a wrong `method` here skews the snapshot-vs-paged
+    // comparison for good.
+    expect(onScopeDownloadComplete).toHaveBeenCalledTimes(1);
     expect(onScopeDownloadComplete).toHaveBeenCalledWith(
       expect.objectContaining({ scopeKey: 'kilter:1:5', method: 'snapshot', bootstrapHealed: true }),
     );
@@ -4198,6 +4604,7 @@ function buildGradesArtifact(spec: {
       }
     }
     artifactDb.exec(GRADES_META_DDL);
+    artifactDb.exec('BEGIN');
     for (const grade of spec.grades) {
       artifactDb
         .prepare(
@@ -4227,8 +4634,9 @@ function buildGradesArtifact(spec: {
         spec.rowCountOverride ?? spec.grades.length,
         '2026-06-01T00:00:00.000Z',
         spec.schemaVersion ?? LATEST_SCHEMA_VERSION,
-        1,
+        SNAPSHOT_MANIFEST_FORMAT_VERSION,
       );
+    artifactDb.exec('COMMIT');
   } finally {
     artifactDb.close();
   }
@@ -4278,6 +4686,136 @@ async function seedScopeClimb(uuid: string): Promise<void> {
 
 describe('bootstrapScopeGradesFromSnapshot', () => {
   const SCOPE: OfflineBoardScope = { boardType: 'kilter', layoutId: 1, sizeId: 5 };
+
+  it('releases each grades batch before progress and stamps only after all rows', async () => {
+    await seedScopeClimb('c1');
+    const gradesPath = join(workDir, 'grades-batches.db');
+    buildGradesArtifact({
+      filePath: gradesPath,
+      grades: [40, 45, 50].map((angle) => ({ climbUuid: 'c1', angle })),
+      watermark: { updatedAt: '2026-05-01T00:00:00Z', syncSeq: '10' },
+    });
+    const batchCounts: number[] = [];
+    const visibleCounts: number[] = [];
+    const checkpointRows: unknown[] = [];
+    const lockErrors: unknown[] = [];
+    const writer = new DatabaseSync(join(workDir, 'client.db'));
+    writer.exec('PRAGMA busy_timeout = 0');
+    await bootstrapScopeGradesFromSnapshot({
+      db,
+      scope: SCOPE,
+      scopeKey: 'kilter:1:5',
+      filePath: gradesPath,
+      batchRows: 1,
+      onBatch: ({ rowsImported }) => {
+        batchCounts.push(rowsImported);
+        try {
+          writer.prepare('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)').run('batch-probe', '1');
+          const count = writer.prepare('SELECT COUNT(*) AS count FROM board_climb_grades').get() as { count: number };
+          visibleCounts.push(count.count);
+          checkpointRows.push(
+            writer.prepare('SELECT value FROM sync_meta WHERE key = ?').get('checkpoint:board_climb_grades:kilter:1:5'),
+          );
+        } catch (error) {
+          lockErrors.push(error);
+        }
+      },
+    });
+    writer.close();
+    expect(lockErrors).toEqual([]);
+    expect(visibleCounts).toEqual([1, 2, 3]);
+    expect(checkpointRows).toEqual([undefined, undefined, undefined]);
+    expect(batchCounts).toEqual([1, 2, 3]);
+    expect(await countRows('board_climb_grades')).toBe(3);
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).not.toBeNull();
+  });
+
+  it('leaves no grades checkpoint when a purge lands between batches', async () => {
+    await seedScopeClimb('c1');
+    const gradesPath = join(workDir, 'grades-batch-purge.db');
+    buildGradesArtifact({
+      filePath: gradesPath,
+      grades: [40, 45].map((angle) => ({ climbUuid: 'c1', angle })),
+      watermark: { updatedAt: '2026-05-01T00:00:00Z', syncSeq: '10' },
+    });
+    await expect(
+      bootstrapScopeGradesFromSnapshot({
+        db,
+        scope: SCOPE,
+        scopeKey: 'kilter:1:5',
+        filePath: gradesPath,
+        batchRows: 1,
+        onBatch: () => {
+          beginScopePurge('kilter:1');
+        },
+      }),
+    ).rejects.toThrow(SnapshotWipedError);
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).toBeNull();
+    expect(await countRows('board_climb_grades')).toBe(1);
+  });
+
+  it('limits default grades batches to 5000 primary-key rows', async () => {
+    await seedScopeClimb('c1');
+    const gradesPath = join(workDir, 'grades-default-batches.db');
+    buildGradesArtifact({
+      filePath: gradesPath,
+      grades: Array.from({ length: 10_001 }, (_, angle) => ({ climbUuid: 'c1', angle })),
+      watermark: { updatedAt: '2026-05-01T00:00:00Z', syncSeq: '10' },
+    });
+    const batchCounts: number[] = [];
+    await bootstrapScopeGradesFromSnapshot({
+      db,
+      scope: SCOPE,
+      scopeKey: 'kilter:1:5',
+      filePath: gradesPath,
+      onBatch: ({ rowsImported }) => batchCounts.push(rowsImported),
+    });
+    expect(batchCounts).toEqual([5000, 10_000, 10_001]);
+    expect(await countRows('board_climb_grades')).toBe(10_001);
+  });
+
+  it('replays committed partial grade batches safely before stamping epoch compatibility', async () => {
+    await seedScopeClimb('c1');
+    const gradesPath = join(workDir, 'grades-replay-batches.db');
+    buildGradesArtifact({
+      filePath: gradesPath,
+      grades: [40, 45, 50].map((angle) => ({ climbUuid: 'c1', angle })),
+      watermark: { updatedAt: '2026-05-01T00:00:00Z', syncSeq: '10' },
+    });
+    await expect(
+      bootstrapScopeGradesFromSnapshot({
+        db,
+        scope: SCOPE,
+        scopeKey: 'kilter:1:5',
+        filePath: gradesPath,
+        batchRows: 1,
+        onBatch: () => {
+          beginScopePurge('kilter:1');
+        },
+      }),
+    ).rejects.toThrow(SnapshotWipedError);
+    expect(await countRows('board_climb_grades')).toBe(1);
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).toBeNull();
+    expect(
+      await db.getFirstAsync('SELECT value FROM sync_meta WHERE key = ?', [
+        'schema-refresh:board_climb_grades:kilter:1:5',
+      ]),
+    ).toBeNull();
+    __resetDrainerStateForTests();
+    await bootstrapScopeGradesFromSnapshot({
+      db,
+      scope: SCOPE,
+      scopeKey: 'kilter:1:5',
+      filePath: gradesPath,
+      batchRows: 1,
+      replayFromEpoch: true,
+    });
+    expect(await countRows('board_climb_grades')).toBe(3);
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).toEqual({
+      updatedAt: '1970-01-01T00:00:00.000Z',
+      syncSeq: '0',
+    });
+  });
 
   it('imports the scope’s grades and stamps the checkpoint at their computed_at watermark', async () => {
     await seedScopeClimb('c1');
@@ -4451,6 +4989,245 @@ describe('bootstrapScopeGradesFromSnapshot', () => {
 });
 
 describe('pullSync grades bootstrap', () => {
+  it.each([
+    {
+      cause: new SnapshotBackgroundTransferInterruptedError('无法解码原始数据'),
+      reason: 'background-transfer-decode',
+      expected: true,
+    },
+    {
+      cause: new SnapshotTransferError('http-range', 'server returned HTTP 416', { cause: new Error('HTTP 416') }),
+      reason: 'http-range',
+      expected: false,
+    },
+    { cause: new Error('Unable to download a file: Connection reset'), reason: 'network', expected: true },
+  ])('reports consistent reason and severity for grades $reason', async ({ cause, reason, expected }) => {
+    await seedScopeClimb('c1');
+    await markBootstrapDone(db, 'kilter:1:5');
+    const source: SnapshotSource = {
+      fetchManifest: async () => makeManifest([makeEntry({ grades: gradesArtifactBlock() })]),
+      downloadArtifact: async () => null,
+      downloadGradesArtifact: async () => {
+        throw cause;
+      },
+      deleteArtifact: async () => {},
+    };
+    const onSnapshotBootstrapError = vi.fn();
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5'],
+      snapshotSource: source,
+      onSnapshotBootstrapError,
+    });
+    expect(onSnapshotBootstrapError).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'grades-download', reason, expected, aborted: false }),
+    );
+    expect(await getGradesBootstrapAttempts(db, 'kilter:1:5')).toBe(1);
+  });
+
+  it.each([
+    ['HTTP failure', new Error('HTTP 500'), false],
+    ['disk failure', new Error('No space left on device'), false],
+    ['programming failure', new TypeError('invalid download state'), false],
+    ['network after foreground bytes', new Error('The network connection was lost.'), true],
+  ])('charges grades retry after a background transition: %s', async (_label, cause, foregroundBytes) => {
+    await seedScopeClimb('c1');
+    await markBootstrapDone(db, 'kilter:1:5');
+    const source: SnapshotSource = {
+      fetchManifest: async () => makeManifest([makeEntry({ grades: gradesArtifactBlock() })]),
+      downloadArtifact: async () => null,
+      downloadGradesArtifact: async (_artifact, options) => {
+        setBackgrounded(true);
+        setBackgrounded(false);
+        if (foregroundBytes) options?.onProgress?.({ bytesWritten: 100, totalBytes: 1000 });
+        throw cause;
+      },
+      deleteArtifact: async () => {},
+    };
+    const onSnapshotBootstrapError = vi.fn();
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5'],
+      snapshotSource: source,
+      onSnapshotBootstrapError,
+    });
+    expect(await getGradesBootstrapAttempts(db, 'kilter:1:5')).toBe(1);
+    expect(onSnapshotBootstrapError).toHaveBeenCalledWith(
+      expect.objectContaining({ stage: 'grades-download', attempt: 1, cause, aborted: false }),
+    );
+  });
+
+  it('shares one grades transfer between sizes and imports only after each layout', async () => {
+    const climbsPath = join(workDir, 'shared-grade-climbs.db');
+    buildArtifact({
+      filePath: climbsPath,
+      climbs: [{ uuid: 'c1', compatibleSizeIds: [5, 6] }],
+      stats: [],
+      climbsWatermark: CLIMBS_WATERMARK,
+      statsWatermark: STATS_WATERMARK,
+    });
+    const gradesPath = join(workDir, 'shared-grade-grades.db');
+    buildGradesArtifact({
+      filePath: gradesPath,
+      grades: [{ climbUuid: 'c1' }],
+      watermark: { updatedAt: '2026-05-01T00:00:00Z', syncSeq: '10' },
+    });
+    const { source, gradesDownloads } = makeGradesSource({
+      manifest: makeManifest([makeEntry({ grades: gradesArtifactBlock() })]),
+      climbsFile: climbsPath,
+      gradesFile: gradesPath,
+    });
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5', 'kilter:1:6'],
+      snapshotSource: source,
+    });
+    expect(gradesDownloads).toHaveLength(1);
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).not.toBeNull();
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:6')).not.toBeNull();
+    expect(await countRows('board_climb_grades')).toBe(1);
+  });
+
+  it.each(['layout failure', 'layout failure with sibling size', 'sign-out', 'scope purge'])(
+    'aborts grades prefetch and cleans its file on %s',
+    async (interruption) => {
+      const climbsPath = join(workDir, 'cancel-grade-climbs.db');
+      if (interruption.startsWith('layout failure')) writeFileSync(climbsPath, 'not sqlite');
+      else
+        buildArtifact({
+          filePath: climbsPath,
+          climbs: [{ uuid: 'c1', compatibleSizeIds: [5] }],
+          stats: [],
+          climbsWatermark: CLIMBS_WATERMARK,
+          statsWatermark: STATS_WATERMARK,
+        });
+      const gradesPath = join(workDir, 'cancel-grade-grades.db');
+      let gradesSignal: AbortSignal | undefined;
+      let gradeTransfers = 0;
+      const source: SnapshotSource = {
+        fetchManifest: async () => makeManifest([makeEntry({ grades: gradesArtifactBlock() })]),
+        downloadArtifact: async () => ({ filePath: climbsPath }),
+        downloadGradesArtifact: async (_artifact, options) => {
+          gradeTransfers += 1;
+          gradesSignal = options?.signal;
+          return new Promise((resolve) => {
+            gradesSignal?.addEventListener('abort', () => resolve({ filePath: gradesPath }), { once: true });
+            if (interruption === 'sign-out') setSigningOut(true);
+            if (interruption === 'scope purge') beginScopePurge('kilter:1');
+          });
+        },
+        deleteArtifact: vi.fn(async () => {}),
+      };
+      try {
+        await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+          enabledBoards:
+            interruption === 'layout failure with sibling size' ? ['kilter:1:5', 'kilter:1:6'] : ['kilter:1:5'],
+          snapshotSource: source,
+        });
+        expect(gradeTransfers).toBe(1);
+        expect(gradesSignal?.aborted).toBe(true);
+        expect(source.deleteArtifact).toHaveBeenCalledWith(gradesPath);
+        expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).toBeNull();
+        expect(await getGradesBootstrapAttempts(db, 'kilter:1:5')).toBe(0);
+      } finally {
+        setSigningOut(false);
+      }
+    },
+  );
+
+  it('starts grades before layout rows land and overlaps an unresolved transfer with import', async () => {
+    const climbsPath = join(workDir, 'overlap-climbs.db');
+    buildArtifact({
+      filePath: climbsPath,
+      climbs: [{ uuid: 'c1', compatibleSizeIds: [5] }],
+      stats: [{ climbUuid: 'c1', angle: 40 }],
+      climbsWatermark: CLIMBS_WATERMARK,
+      statsWatermark: STATS_WATERMARK,
+    });
+    const gradesPath = join(workDir, 'overlap-grades.db');
+    buildGradesArtifact({
+      filePath: gradesPath,
+      grades: [{ climbUuid: 'c1' }],
+      watermark: { updatedAt: '2026-05-01T00:00:00Z', syncSeq: '10' },
+    });
+    const { source } = makeGradesSource({
+      manifest: makeManifest([makeEntry({ grades: gradesArtifactBlock() })]),
+      climbsFile: climbsPath,
+      gradesFile: gradesPath,
+    });
+    let resolveGrades: ((file: { filePath: string }) => void) | undefined;
+    let climbsAtGradesStart = -1;
+    source.downloadGradesArtifact = async () => {
+      climbsAtGradesStart = await countRows('board_climbs');
+      return new Promise((resolve) => {
+        resolveGrades = resolve;
+      });
+    };
+    const downloads: SyncProgress[] = [];
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5'],
+      snapshotSource: source,
+      onProgress: (progress) => {
+        downloads.push(progress);
+        if (progress.snapshot?.stage === 'import' && progress.snapshot.fraction === 1)
+          resolveGrades?.({ filePath: gradesPath });
+      },
+    });
+    expect(climbsAtGradesStart).toBe(0);
+    expect(await countRows('board_climb_grades')).toBe(1);
+    expect(downloads.some((progress) => progress.download?.phase === 'grades')).toBe(true);
+    expect(downloads.filter((progress) => progress.download).at(-1)?.download?.fraction).toBe(1);
+  });
+
+  it('imports delayed foreground grades after layout commits and the app backgrounds', async () => {
+    const climbsPath = join(workDir, 'background-overlap-climbs.db');
+    buildArtifact({
+      filePath: climbsPath,
+      climbs: [{ uuid: 'c1', compatibleSizeIds: [5] }],
+      stats: [{ climbUuid: 'c1', angle: 40 }],
+      climbsWatermark: CLIMBS_WATERMARK,
+      statsWatermark: STATS_WATERMARK,
+    });
+    const gradesPath = join(workDir, 'background-overlap-grades.db');
+    buildGradesArtifact({
+      filePath: gradesPath,
+      grades: [{ climbUuid: 'c1' }],
+      watermark: { updatedAt: '2026-05-01T00:00:00Z', syncSeq: '10' },
+    });
+    const { source } = makeGradesSource({
+      manifest: makeManifest([makeEntry({ grades: gradesArtifactBlock() })]),
+      climbsFile: climbsPath,
+      gradesFile: gradesPath,
+    });
+    let resolveGrades: ((file: { filePath: string }) => void) | undefined;
+    let climbsAtGradesStart = -1;
+    source.downloadGradesArtifact = async () => {
+      climbsAtGradesStart = await countRows('board_climbs');
+      return new Promise((resolve) => {
+        resolveGrades = resolve;
+      });
+    };
+    const downloads: SyncProgress[] = [];
+    try {
+      await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+        enabledBoards: ['kilter:1:5'],
+        snapshotSource: source,
+        onProgress: (progress) => {
+          downloads.push(progress);
+          if (progress.snapshot?.stage === 'import' && progress.snapshot.fraction === 1) {
+            setBackgrounded(true);
+            resolveGrades?.({ filePath: gradesPath });
+          }
+        },
+      });
+    } finally {
+      setBackgrounded(false);
+    }
+    expect(climbsAtGradesStart).toBe(0);
+    expect(await countRows('board_climb_grades')).toBe(1);
+    expect(downloads.some((progress) => progress.download?.phase === 'grades')).toBe(true);
+    expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).not.toBeNull();
+    expect(await getGradesBootstrapAttempts(db, 'kilter:1:5')).toBe(0);
+    expect(downloads.at(-1)).toMatchObject({ phase: 'idle', interrupted: true });
+  });
+
   it('imports grades right after the whole-layout import and skips the crawl', async () => {
     const climbsPath = join(workDir, 'grades-flow-climbs.db');
     buildArtifact({
@@ -4804,7 +5581,10 @@ describe('pullSync grades bootstrap', () => {
       snapshotSource: source,
     });
 
-    expect(gradesDownloads).toEqual([]);
+    // Prefetch overlaps the attempted layout heal, but its failure cancels
+    // grades before they can stamp a cursor over the partial catalog.
+    expect(gradesDownloads).toHaveLength(1);
+    expect(source.deleteArtifact).toHaveBeenCalledWith(gradesPath);
     // No artifact rows, and no artifact watermark stamped over the crawl.
     expect(await countRows('board_climb_grades')).toBe(0);
     expect(await getCheckpoint(db, 'checkpoint:board_climb_grades:kilter:1:5')).not.toEqual({
@@ -5372,6 +6152,42 @@ describe('pullSync bootstrap funnel invariant', () => {
     ).toBe(false);
   });
 
+  it.each([
+    { cause: new Error('Unable to download a file: Connection reset'), paused: true },
+    {
+      cause: new SnapshotTransferError('http-range', 'server returned HTTP 416', { cause: new Error('HTTP 416') }),
+      paused: false,
+    },
+  ])('distinguishes background interruption from an HTTP verdict: $paused', async ({ cause, paused }) => {
+    const source: SnapshotSource = {
+      fetchManifest: async () => makeManifest([makeEntry()]),
+      downloadArtifact: async () => {
+        setBackgrounded(true);
+        setBackgrounded(false);
+        throw cause;
+      },
+      deleteArtifact: async () => {},
+    };
+    const onSnapshotBootstrapError = vi.fn();
+    await pullSync(db, noopQueryClient(), makeGraphqlFetch().fetch, {
+      enabledBoards: ['kilter:1:5'],
+      snapshotSource: source,
+      onSnapshotBootstrapError,
+      now: () => BASE_NOW,
+      random: () => 0,
+    });
+    const { state } = await readBootstrapRetryState(db, 'kilter:1:5', { now: BASE_NOW, random: () => 0 }, false);
+    expect(state.backgroundPauses).toBe(paused ? 1 : 0);
+    expect(state.transportFailures).toBe(paused ? 0 : 1);
+    expect(onSnapshotBootstrapError).toHaveBeenCalledWith(
+      expect.objectContaining({
+        reason: paused ? 'aborted-background' : 'http-range',
+        aborted: paused,
+        expected: paused,
+      }),
+    );
+  });
+
   it('charges a typed background-task marker to transport when AppState is active', async () => {
     const marker = new SnapshotBackgroundTransferInterruptedError('cannot decode raw data');
     const source: SnapshotSource = {
@@ -5689,11 +6505,9 @@ describe('pullSync bootstrap purge scoping', () => {
     expect(await getGradesBootstrapAttempts(db, KILTER_KEY)).toBe(0);
   });
 
-  // Term-count regression guard for the whole rewrite: every guard is
-  // `isSigningOut() || <purge> || isBackgrounded()`, and only the middle term
-  // changed. Dropping isBackgrounded() in front of the grades import would
-  // reopen the BOARDSESH-AN class of bug.
-  it('still bails the grades import when the app backgrounds and nothing was purged', async () => {
+  // A foreground-started native grades transfer may finish while backgrounded.
+  // The remaining ordinary tails wait for foreground without burning a retry.
+  it('imports foreground-started grades when backgrounded before layout import', async () => {
     const climbsFile = join(workDir, 'grades-bg-climbs.db');
     const gradesFile = join(workDir, 'grades-bg-grades.db');
     buildArtifact({
@@ -5735,11 +6549,9 @@ describe('pullSync bootstrap purge scoping', () => {
     }
 
     expect(await countRows('board_climbs')).toBe(1);
-    expect(await getCheckpoint(db, `checkpoint:board_climb_grades:${KILTER_KEY}`)).toBeNull();
+    expect(await getCheckpoint(db, `checkpoint:board_climb_grades:${KILTER_KEY}`)).not.toBeNull();
     expect(await getGradesBootstrapAttempts(db, KILTER_KEY)).toBe(0);
-    expect(onSnapshotBootstrapError).toHaveBeenCalledWith(
-      expect.objectContaining({ stage: 'grades-download', attempt: 0, aborted: true, reason: 'aborted-background' }),
-    );
+    expect(onSnapshotBootstrapError).not.toHaveBeenCalled();
     expect(
       fetch.mock.calls.some(([query]) =>
         ['syncDeletions', 'syncClimbs', 'syncClimbStats', 'syncClimbGrades'].some((field) =>
@@ -5803,5 +6615,72 @@ describe('pullSync bootstrap purge scoping', () => {
     for (const scopeKey of started) {
       expect(terminals.filter((key) => key === scopeKey)).toHaveLength(1);
     }
+  });
+});
+
+// #5851: the bootstrap phase's metadata writes against a main connection that
+// behaves like the phone's (testing/shared-main-connection.ts). About twenty of
+// them were autocommit writes on that connection, where SQLite fails a write at
+// once rather than wait whenever it has to upgrade a local read's transaction.
+describe('bootstrap metadata writes stay off the main connection (#5851)', () => {
+  it('imports a fresh scope while local reads hold the main connection, writing nothing through it', async () => {
+    const filePath = join(workDir, 'shared-main-import.db');
+    buildArtifact({
+      filePath,
+      climbs: [{ uuid: 'c1', compatibleSizeIds: [5] }],
+      stats: [{ climbUuid: 'c1', angle: 40 }],
+      climbsWatermark: CLIMBS_WATERMARK,
+      statsWatermark: STATS_WATERMARK,
+    });
+    const source = makeSnapshotSource({ manifest: makeManifest([makeEntry()]), fileForEntry: () => filePath });
+    const shared = openSharedMainConnection(join(workDir, 'client.db'), db);
+    try {
+      shared.setReadsInFlight(true);
+      await pullSync(shared.db, noopQueryClient(), makeGraphqlFetch().fetch, {
+        enabledBoards: ['kilter:1:5'],
+        snapshotSource: source,
+      });
+      expect(shared.mainWrites).toEqual([]);
+    } finally {
+      shared.close();
+    }
+    expect(
+      await db.getFirstAsync('SELECT key FROM sync_meta WHERE key = ?', ['bootstrap-done:kilter:1:5']),
+    ).not.toBeNull();
+    expect(await countRows('board_climbs')).toBe(1);
+  });
+
+  it('counts a grades attempt from the latest value, not a stale main-connection read', async () => {
+    await seedScopeClimb('c1');
+    await markBootstrapDone(db, 'kilter:1:5');
+    const source: SnapshotSource = {
+      fetchManifest: async () => makeManifest([makeEntry({ grades: gradesArtifactBlock() })]),
+      downloadArtifact: async () => null,
+      downloadGradesArtifact: async () => {
+        throw new Error('HTTP 500');
+      },
+      deleteArtifact: async () => {},
+    };
+    const shared = openSharedMainConnection(join(workDir, 'client.db'), db);
+    try {
+      // Another writer spends an attempt after a local read opened its snapshot
+      // on the main connection. Read there, the count is one behind the truth.
+      shared.holdStaleSnapshot(
+        (_sql, params) => params.includes('grades-bootstrap-attempts:kilter:1:5'),
+        (side) =>
+          side
+            .prepare('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)')
+            .run('grades-bootstrap-attempts:kilter:1:5', '1'),
+      );
+      await pullSync(shared.db, noopQueryClient(), makeGraphqlFetch().fetch, {
+        enabledBoards: ['kilter:1:5'],
+        snapshotSource: source,
+      });
+      expect(shared.mainWrites).toEqual([]);
+    } finally {
+      shared.close();
+    }
+    // The concurrent attempt plus this cycle's. A lost update reads 1.
+    expect(await getGradesBootstrapAttempts(db, 'kilter:1:5')).toBe(2);
   });
 });

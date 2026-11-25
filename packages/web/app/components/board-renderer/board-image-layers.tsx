@@ -1,7 +1,7 @@
 import React, { useCallback, useMemo } from 'react';
 import type { RenderMode } from '@boardsesh/board-render/render-config';
-import type { BoardDetails } from '@/app/lib/types';
-import { buildBoardArtLayers, getImageUrl, hasDarkBoardArt, toDarkArtUrl } from './util';
+import type { BoardImageDetails } from '@/app/lib/types';
+import { buildBoardArtLayers, getImageUrl, hasSplitDarkBoardArt, toDarkArtUrl } from './util';
 import styles from './board-art-theme.module.css';
 import { THUMBNAIL_WIDTH } from './types';
 import { trackRenderError, type RenderContext } from '@/app/lib/rendering-metrics';
@@ -35,7 +35,7 @@ const pairedLayerContainStyle: React.CSSProperties = {
 };
 
 export type BoardImageLayersProps = {
-  boardDetails: BoardDetails;
+  boardDetails: BoardImageDetails;
   frames?: string;
   mirrored: boolean;
   thumbnail?: boolean;
@@ -65,32 +65,37 @@ const BoardImageLayers = React.memo(function BoardImageLayers({
   fetchPriority,
   renderMode,
 }: BoardImageLayersProps) {
-  // Boards with dark art split the board photo back out as a static layer and keep ONE
-  // per-climb overlay render — see buildBoardArtLayers for why a themed composite would cost
-  // a second WASM + sharp job per card. Everything else keeps the single baked composite.
-  const darkArt = hasDarkBoardArt(boardDetails.board_name);
+  // Boards whose every layer has dark art split the board photo back out as a static layer and
+  // keep ONE per-climb overlay render — see buildBoardArtLayers for why a themed composite would
+  // cost a second WASM + sharp job per card. Everything else keeps the single baked composite.
+  const darkArt = hasSplitDarkBoardArt(boardDetails.board_name);
   const { backgroundUrls: artBackgroundUrls, overlayUrl } = useMemo(
     () => buildBoardArtLayers(boardDetails, frames, thumbnail, renderMode),
     [boardDetails, frames, thumbnail, renderMode],
   );
   const bareBackgroundUrls = useMemo(
-    () => Object.keys(boardDetails.images_to_holds).map((img) => getImageUrl(img, boardDetails.board_name, thumbnail)),
-    [boardDetails.images_to_holds, boardDetails.board_name, thumbnail],
+    () => boardDetails.backgroundImagePaths.map((img) => getImageUrl(img, boardDetails.board_name, thumbnail)),
+    [boardDetails.backgroundImagePaths, boardDetails.board_name, thumbnail],
   );
-  // With no climb to overlay, the photo layers are all there is to draw.
+  // With no climb to overlay, the photo layers are all there is to draw. MoonBoard never gets
+  // here: its bare board comes back as a dark composite overlay, see buildBoardArtLayers.
   const backgroundUrls = overlayUrl ? artBackgroundUrls : bareBackgroundUrls;
+  const useContain = contain || thumbnail;
 
   const containerStyle = useMemo<React.CSSProperties>(
     () => ({
       display: 'grid',
       overflow: 'hidden',
+      // Fixed kiosk slots and square thumbnails must size tracks from their
+      // available box, not the image's intrinsic height. Otherwise the implicit
+      // auto track overflows and clips the board before object-fit can contain it.
+      ...(useContain ? { gridTemplateRows: 'minmax(0, 1fr)', gridTemplateColumns: 'minmax(0, 1fr)' } : {}),
       ...style,
       transform: mirrored ? 'scaleX(-1)' : style?.transform,
     }),
-    [style, mirrored],
+    [style, mirrored, useContain],
   );
 
-  const useContain = contain || thumbnail;
   let imgStyle = useContain ? layerContainStyle : layerStyle;
   if (darkArt) imgStyle = useContain ? pairedLayerContainStyle : pairedLayerStyle;
 

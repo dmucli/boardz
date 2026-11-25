@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
 import type { Gym } from '@boardsesh/shared-schema';
 
 vi.mock('server-only', () => ({}));
+vi.mock('@/app/lib/server-board-discovery', () => ({ getBoardDiscovery: vi.fn(async () => []) }));
 
 // Next's real `permanentRedirect` throws NEXT_REDIRECT and nothing after it
 // runs. A plain spy would let the page fall through into rendering, so the
@@ -37,7 +38,8 @@ vi.mock('@/app/lib/auth/server-auth', () => ({
 const executeAuthenticatedGraphQL = vi.hoisted(() => vi.fn());
 vi.mock('@/app/lib/graphql/server-graphql', () => ({ executeAuthenticatedGraphQL }));
 
-const GymPage = (await import('../page')).default;
+const { getLocale } = await import('@/app/lib/i18n/get-locale');
+const GymPage = (await import('@/app/(site)/gym/[gym_slug]/page')).default;
 
 function mergedGym(canonicalSlug: string): Gym {
   return {
@@ -69,9 +71,16 @@ async function redirectTargetFor(
 
 beforeEach(() => {
   executeAuthenticatedGraphQL.mockReset();
+  vi.mocked(getLocale).mockResolvedValue('en-US');
 });
 
 describe('merged-gym 308 redirect', () => {
+  it('preserves the locale when a crawler follows a merged listing', async () => {
+    vi.mocked(getLocale).mockResolvedValue('fr');
+    executeAuthenticatedGraphQL.mockResolvedValue({ gymBySlug: mergedGym('canonical-fr') });
+    await expect(redirectTargetFor('old-fr', {})).resolves.toBe('/fr/gym/canonical-fr');
+  });
+
   it('keeps a printed poster attributable after the gym is merged into another listing', async () => {
     // #4379's headline acceptance criterion. The poster is laminated and on a
     // wall; the gym it names gets merged a year later. Before this change the
@@ -122,10 +131,29 @@ describe('merged-gym 308 redirect', () => {
       redirectTargetFor('old-city', {
         src: 'qr',
         medium: 'poster',
-        utm_campaign: 'someone-elses',
         next: 'https://evil.example.com',
         claim: '1',
+        tab: 'members',
       }),
     ).resolves.toBe('/gym/boulderwelt-city?src=qr&medium=poster');
+  });
+
+  it("keeps a gym's tagged bio link tagged after its slug changes", async () => {
+    // #6027. Without this the visit reached the canonical page as direct
+    // traffic: no `utm_source` on its pageview, and a store link that said
+    // `boardsesh` / `web`.
+    executeAuthenticatedGraphQL.mockResolvedValue({ gymBySlug: mergedGym('boulderwelt-neu') });
+
+    await expect(
+      redirectTargetFor('old-neu', { utm_source: 'instagram', utm_medium: 'social', next: 'https://evil.example.com' }),
+    ).resolves.toBe('/gym/boulderwelt-neu?utm_source=instagram&utm_medium=social');
+  });
+
+  it('carries a scan and its campaign params together', async () => {
+    executeAuthenticatedGraphQL.mockResolvedValue({ gymBySlug: mergedGym('boulderwelt-alt') });
+
+    await expect(
+      redirectTargetFor('old-alt', { src: 'qr', medium: 'poster', utm_campaign: 'spring-open-day' }),
+    ).resolves.toBe('/gym/boulderwelt-alt?src=qr&medium=poster&utm_campaign=spring-open-day');
   });
 });

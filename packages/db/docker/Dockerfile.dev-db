@@ -6,7 +6,7 @@
 # migrations applied. Developers just pull & run.
 #
 # The catalogue comes from the nightly board snapshots we already publish for
-# offline mode (docs/board-snapshots.md) — not from scraping Aurora APKs and
+# offline mode (docs/data/board-snapshots.md) — not from scraping Aurora APKs and
 # running pgloader, which is what this image used to do (issue #4508). The
 # snapshots are built from production, so the image ships last night's catalogue
 # instead of whatever an APK mirror happened to serve, and dropping pgloader
@@ -28,11 +28,33 @@
 FROM postgres:18.6-bookworm@sha256:1c59e2c3c818eaa0f0628f695b36e7c9e362d6b219b36a54a32df645cbd7e1af AS postgres-postgis
 
 ARG POSTGIS_PACKAGE_VERSION=3.6.4+dfsg-2.pgdg12+1
-ARG HYPOPG_PACKAGE_VERSION=1.4.3-1.pgdg12+1
+ARG HYPOPG_PACKAGE_VERSION=1.4.3-1.pgdg12+2
 
 # The digest pins the exact base artifact. Assert the upstream server version
 # separately; the exact PostGIS/HypoPG Debian packages are pinned below.
-RUN apt-get update && \
+# PGDG moves older extension builds out of its live repository. Trust the same
+# upstream key, and permit only HypoPG from the official historical archive.
+RUN test -r /usr/local/share/keyrings/postgres.gpg.asc && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
+    printf '%s\n' \
+      'deb [signed-by=/usr/local/share/keyrings/postgres.gpg.asc] https://apt-archive.postgresql.org/pub/repos/apt bookworm-pgdg-archive main' \
+      > /etc/apt/sources.list.d/boardsesh-hypopg-archive.list && \
+    printf '%s\n' \
+      'Package: postgresql-18-hypopg' \
+      'Pin: origin apt-archive.postgresql.org' \
+      'Pin-Priority: 500' \
+      '' \
+      'Package: *' \
+      'Pin: origin apt-archive.postgresql.org' \
+      'Pin-Priority: -1' \
+      > /etc/apt/preferences.d/boardsesh-hypopg-archive && \
+    apt-get update && \
+    # Exercise APT policy during both architecture builds: archived dependencies
+    # stay forbidden, while the exact HypoPG version remains installable.
+    apt-cache policy postgresql-18 postgresql-18-postgis-3 | \
+      awk '/apt-archive[.]postgresql[.]org/ { if ($1 != -1) exit 1; found = 1 } END { if (!found) exit 1 }' && \
+    test "$(apt-cache policy postgresql-18-hypopg | awk -v expected="$HYPOPG_PACKAGE_VERSION" '$1 == expected { print $2 }')" = 500 && \
     apt-get install -y --no-install-recommends \
       "postgresql-18-postgis-3=${POSTGIS_PACKAGE_VERSION}" \
       "postgresql-18-postgis-3-scripts=${POSTGIS_PACKAGE_VERSION}" \
@@ -65,7 +87,7 @@ ENV PGDATA=/opt/boardsesh/dev-db-seed/18/docker
 
 # Where the loader resolves the manifests from. Overridable so a build can be
 # pointed at a staging bucket; the default is the public snapshot host.
-ARG SNAPSHOT_BASE_URL=https://boardsesh-board-snapshots.t3.tigrisfiles.io
+ARG SNAPSHOT_BASE_URL=https://snapshots.boardsesh.com
 ENV SNAPSHOT_BASE_URL=${SNAPSHOT_BASE_URL}
 # Full-URL override for the catalogue manifest alone, so a build can be pointed
 # at a locally served artifact while the climb artifacts still come from the
@@ -109,9 +131,12 @@ COPY packages/db/tsconfig.json /app/tsconfig.json
 #   @boardsesh/climb-filters    the climb-name LIKE pattern, read only by the
 #                               search query builder (create-climb-filters)
 #   @boardsesh/kiosk            type-only import for gym_kiosks.layout
+#   @boardsesh/board-look       type-only import for spray_walls.render_settings
+#   @boardsesh/auth-protocol    batch CLI mode guards, not loaded by image seeds
+#   @boardsesh/play-view        canonical URL helpers used only by sitemap queries
 #   sharp                       native; only the cell-set generator uses it
 RUN cd /app && \
-    sed -i -e '/"@boardsesh\/shared-schema"/d' -e '/"@boardsesh\/board-config"/d' -e '/"@boardsesh\/climb-filters"/d' -e '/"@boardsesh\/board-constants"/d' -e '/"@boardsesh\/kiosk"/d' -e '/"@boardsesh\/sync-runtime"/d' -e '/"sharp"/d' package.json && \
+    sed -i -e '/"@boardsesh\/shared-schema"/d' -e '/"@boardsesh\/board-config"/d' -e '/"@boardsesh\/climb-filters"/d' -e '/"@boardsesh\/board-constants"/d' -e '/"@boardsesh\/kiosk"/d' -e '/"@boardsesh\/playlist-generator"/d' -e '/"@boardsesh\/board-look"/d' -e '/"@boardsesh\/sync-runtime"/d' -e '/"@boardsesh\/auth-protocol"/d' -e '/"@boardsesh\/play-view"/d' -e '/"sharp"/d' package.json && \
     npm install --global --no-fund --no-audit pnpm@11.22.0 && \
     pnpm install --ignore-workspace --ignore-scripts --no-frozen-lockfile
 COPY packages/shared-schema/ /app/node_modules/@boardsesh/shared-schema/
@@ -153,6 +178,10 @@ RUN set -e && \
     gosu postgres psql -X -v ON_ERROR_STOP=1 -h /var/run/postgresql -d main \
       -v boardsesh_dev_role_bootstrap=true \
       -f /db/bootstrap-pg18-development-roles.sql && \
+    cd /app && \
+    SYNC_CUTOFF_ADMIN_DATABASE_URL=postgresql://postgres:password@localhost:5432/main \
+      SYNC_CUTOFF_DEVELOPMENT_BOOTSTRAP=true \
+      node --import tsx scripts/bootstrap-sync-deletions-cutoff-development.ts --apply && \
     PGHOST=/var/run/postgresql PGDATABASE=main \
       gosu postgres boardsesh-apply-drizzle-migrations && \
     migration_count=$(jq '.entries | length' /drizzle/meta/_journal.json) && \

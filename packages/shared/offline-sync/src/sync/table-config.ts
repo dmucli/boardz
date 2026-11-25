@@ -41,6 +41,15 @@ export type TableSyncConfig = {
   captureOnDelete?: readonly string[];
   /** Bump when existing reference rows need newly synced fields backfilled. */
   refreshRevision?: number;
+  /**
+   * A higher refresh revision for one board type only, so a field that only
+   * one board ever writes can be backfilled without re-crawling every other
+   * board's downloaded catalogue. The effective revision for a scope is the
+   * larger of this and `refreshRevision` (`refreshRevisionFor`).
+   */
+  refreshRevisionByBoardType?: Readonly<Partial<Record<string, number>>>;
+  /** Extra `refreshColumns` for one board type's scopes, merged by `refreshColumnsFor`. */
+  refreshColumnsByBoardType?: Readonly<Partial<Record<string, readonly string[]>>>;
   /** Cumulative fields that must be present before coverage can be stamped. */
   refreshColumns?: readonly string[];
   /**
@@ -76,6 +85,9 @@ const TABLE_SYNC_DEFINITIONS: Record<string, TableSyncDefinition> = {
       'user_id',
       'board_type',
       'climb_uuid',
+      // The climb revision the tick was logged against (#6023). NULL on a tick
+      // pulled before schema v11 and on every import; both mean unknown.
+      'climb_revision',
       'angle',
       'is_mirror',
       'status',
@@ -152,7 +164,20 @@ const TABLE_SYNC_DEFINITIONS: Record<string, TableSyncDefinition> = {
   },
   board_climbs: {
     refreshRevision: 1,
+    // Spray scopes replay once more for `retired_by_reset` (#6024). A full reset
+    // stamps `updated_at` on every climb it retires, but a phone on an older
+    // bundle took those rows through the ordinary cursor and dropped the field,
+    // so they would stay NULL (not retired) here for good. Spray only: no
+    // catalogue board ever sets the flag, and bumping `refreshRevision` would
+    // re-crawl every downloaded Kilter and Tension catalogue to write NULLs.
+    // Shared drafts were previously filtered out for every other wall viewer;
+    // their existing cursors must replay old rows now made readable.
+    refreshRevisionByBoardType: { spray: 3 },
     refreshColumns: ['is_hidden'],
+    // Required on spray pages only. A page from a server that predates the
+    // column must not complete the spray replay above, but making it required
+    // everywhere would let one such page reopen coverage on every catalogue.
+    refreshColumnsByBoardType: { spray: ['retired_by_reset'] },
     queryName: 'syncClimbs',
     cursorColumn: UPDATED_AT_CURSOR,
     operationKey: 'SYNC_CLIMBS',
@@ -186,26 +211,56 @@ const TABLE_SYNC_DEFINITIONS: Record<string, TableSyncDefinition> = {
       'characteristics',
       'hold_fingerprint',
       // Spray-wall hold integrity (SW-15, #5448): how many of this climb's holds
-      // have since come off the wall, so `search-climbs-local.ts` can answer the
-      // Intact / Lost-holds filter instead of declining it.
+      // have since come off the wall, so `search-climbs-local.ts` can keep a
+      // published climb that lost a hold out of the listings, as the server does.
       //
       // ADDED WITHOUT BUMPING `refreshRevision` / `refreshColumns`, on purpose.
       // A bump means "every already-downloaded scope must re-crawl to backfill
       // this field" — that is every enabled Kilter and Tension catalogue, tens of
       // thousands of rows each, to fill in a column that is NULL on all of them
-      // (holds do not come off a catalogue board; only a spray reset writes it).
+      // (holds do not come off a catalogue board; only a spray hold edit writes it).
       // Spray scopes are new in this release, so no checkpoint predating this
-      // column can exist for one, and the local predicate is NULL-safe
-      // (`COALESCE(missing_hold_count, 0)`) for every row pulled before it — the
-      // same "unknown reads as intact" rule the server's `holdIntegrityCondition`
+      // column can exist for one, and every local reader is NULL-safe (NULL reads
+      // as no hold lost, so no badge) for every row pulled before it — the same
+      // "unknown reads as intact" rule the server's `holdIntegrityCondition`
       // applies. The two conditions a bump exists to protect are therefore both
       // already met, and paying for it would be a catalogue replay for nothing.
       'missing_hold_count',
+      // The climb's current revision and the revision at which its holds last
+      // changed (#6023).
+      //
+      // ALSO ADDED WITHOUT BUMPING `refreshRevision` / `refreshColumns`. The
+      // server default is 1 and only an edit moves it, and an edit bumps the
+      // row's `sync_seq`, so every climb whose number is not 1 is re-delivered
+      // by the ordinary cursor. A row that is never re-delivered is a climb
+      // nobody has edited, and its NULL here is safe: a tick logged from it
+      // sends no revision and the server stores 1. A bump would re-crawl every
+      // downloaded catalogue to write a 1 beside each climb.
+      //
+      // One gap, which is why a local reader must take NULL as unknown and not
+      // as 1: a climb edited while this phone ran an older bundle was
+      // re-delivered to code that dropped the two fields, and stays NULL until
+      // its next edit. The server's by-date fallback still stamps that tick
+      // correctly.
+      'revision_number',
+      'holds_revision_number',
+      // Spray climbs retired by a full reset (#6024), so the local search can
+      // hide them from a wall's default list the way the server does.
+      //
+      // No table-wide `refreshRevision` / `refreshColumns` bump: only a full
+      // reset sets it, the recompute that sets it stamps `updated_at`, and so
+      // the ordinary cursor re-delivers every row it touches. NULL reads as not
+      // retired, which is right for every catalogue climb. Spray scopes DO get
+      // a bump (`refreshRevisionByBoardType` / `refreshColumnsByBoardType`
+      // above), so a spray row re-delivered to an older bundle that dropped the
+      // field is backfilled by that one replay.
+      'retired_by_reset',
       'updated_at',
       'sync_seq',
     ],
   },
   board_climb_stats: {
+    refreshRevisionByBoardType: { spray: 1 },
     queryName: 'syncClimbStats',
     cursorColumn: UPDATED_AT_CURSOR,
     operationKey: 'SYNC_CLIMB_STATS',
@@ -220,6 +275,11 @@ const TABLE_SYNC_DEFINITIONS: Record<string, TableSyncDefinition> = {
       'ascensionist_count',
       'difficulty_average',
       'quality_average',
+      // Per viewer on climbs set on Boardsesh: the server sends the first
+      // ascensionist the signed-in account may see, so these hold what that
+      // account was shown. `clearUserData` blanks them for climbs with a
+      // Boardsesh owner at the account boundary; manufacturer credits are the
+      // same for everyone. Read them locally only for that same account.
       'fa_username',
       'fa_at',
       'updated_at',
@@ -227,6 +287,7 @@ const TABLE_SYNC_DEFINITIONS: Record<string, TableSyncDefinition> = {
     ],
   },
   board_climb_grades: {
+    refreshRevisionByBoardType: { spray: 1 },
     queryName: 'syncClimbGrades',
     // The one table that does NOT cursor on updated_at — it has no such column.
     // Matches `updatedAtColumn: sql`board_climb_grades.computed_at`` in the
@@ -286,7 +347,7 @@ const TABLE_SYNC_DEFINITIONS: Record<string, TableSyncDefinition> = {
     transientColumns: ['photo_url'],
     // A wall tombstone has to take the photograph with it; the row is the only
     // thing that names the file.
-    captureOnDelete: ['layout_id', 'photo_key'],
+    captureOnDelete: ['layout_id', 'board_uuid', 'photo_key'],
   },
 };
 
@@ -301,6 +362,27 @@ export const TABLE_CONFIGS: Record<string, TableSyncConfig> = Object.fromEntries
     { ...definition, invalidateKeys: TABLE_INVALIDATE_KEYS[tableName] ?? [] },
   ]),
 );
+
+/**
+ * The refresh revision a board scope of `tableName` must reach: the table-wide
+ * `refreshRevision`, raised by `refreshRevisionByBoardType` for that board.
+ * Undefined when the table has neither, which means "never replay".
+ */
+export function refreshRevisionFor(tableName: string, boardType: string | undefined): number | undefined {
+  const config = TABLE_CONFIGS[tableName];
+  if (!config) return undefined;
+  const boardRevision = boardType ? config.refreshRevisionByBoardType?.[boardType] : undefined;
+  const revision = Math.max(config.refreshRevision ?? 0, boardRevision ?? 0);
+  return revision > 0 ? revision : undefined;
+}
+
+/** The refresh columns a board scope of `tableName` requires: the table's, plus that board's. */
+export function refreshColumnsFor(tableName: string, boardType: string | undefined): readonly string[] {
+  const config = TABLE_CONFIGS[tableName];
+  if (!config) return [];
+  const boardColumns = boardType ? (config.refreshColumnsByBoardType?.[boardType] ?? []) : [];
+  return [...(config.refreshColumns ?? []), ...boardColumns];
+}
 
 export const USER_DATA_TABLES = Object.entries(TABLE_CONFIGS)
   .filter(([, config]) => !config.isPerBoard)

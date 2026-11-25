@@ -61,7 +61,7 @@ function SidebarItem({
   const active = focused || isHovered || isFocused;
   // Neutral chrome glyphs, matching NativeTabs / MaterialTabBar (the systemFill
   // pill is the sole active affordance, not a brand tint). See
-  // docs/ai-design-guidelines.md — chrome carries state with fills, not colour.
+  // docs/design/ai-design-guidelines.md — chrome carries state with fills, not colour.
   const tint = active ? systemColors.label : systemColors.secondaryLabel;
   const handlePress = useCallback(() => onPress(destination), [onPress, destination]);
   const handleHoverIn = useCallback(() => setIsHovered(true), []);
@@ -115,12 +115,10 @@ function IpadSidebarComponent({ showWallCell = true }: { showWallCell?: boolean 
   const primary = useMemo<SidebarDestination[]>(
     () => [
       { segment: 'home', href: '/home', icon: 'home', label: t('mobile.nav.home') },
-      { segment: 'climbs', href: '/climbs', icon: 'search', label: t('mobile.nav.climbs') },
       { segment: 'record', href: '/record', icon: 'record', label: tSession('mobile.session.recordTab') },
-      // The "On the Wall" destination sits with Record — the two "I'm at the
-      // board" activities. iPad-only: it's a rail row here, never a phone tab.
-      { segment: 'wall', href: '/wall', icon: 'lightbulb', label: t('mobile.nav.wall') },
       { segment: 'discover', href: '/discover', icon: 'discover', label: tPlaylists('bottomTabBar.discover') },
+      // Climbs is the last primary row, as it is the rightmost phone tab.
+      { segment: 'climbs', href: '/climbs', icon: 'search', label: t('mobile.nav.climbs') },
     ],
     [t, tSession, tPlaylists],
   );

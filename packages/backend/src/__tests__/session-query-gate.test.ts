@@ -43,6 +43,25 @@ vi.mock('../pubsub/index', () => ({
   pubsub: { getEventsSince: (...args: unknown[]) => eventsSinceMock(...args) },
 }));
 
+const privacyAccess = vi.hoisted(() => ({ allowed: true }));
+vi.mock('../services/privacy', () => ({
+  canAccessResource: async () => privacyAccess.allowed,
+  canViewActivityIdentity: async () => true,
+  visibleActivityUserIds: async (userIds: readonly (string | null | undefined)[]) =>
+    new Set(userIds.filter((userId): userId is string => !!userId)),
+  requireResourceAccess: async () => {
+    if (!privacyAccess.allowed) throw new Error('Not found');
+  },
+}));
+
+// The setup file loads board-session-privacy before these mocks exist, so it
+// keeps the real privacy reads. Identity is not under test here: name everyone.
+vi.mock('../services/board-session-privacy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/board-session-privacy')>()),
+  sessionVisibleUserIds: async (userIds: readonly (string | null | undefined)[]) =>
+    new Set(userIds.filter((userId): userId is string => !!userId)),
+}));
+
 // Local, same-instance WS connection tracking (module-level `connections` map
 // in graphql/context.ts). Tests populate this directly to simulate a
 // same-instance WS connection whose context already has `sessionId` set.
@@ -120,6 +139,7 @@ const sampleQueueState = {
 };
 
 beforeEach(() => {
+  privacyAccess.allowed = true;
   vi.clearAllMocks();
   localContexts.clear();
   distributedState.enabled = false;
@@ -145,6 +165,9 @@ describe('session query — membership gate compat matrix', () => {
       stateHashOrdered: 'hash-5-ordered',
       queue: [],
       currentClimbQueueItem: null,
+      historyCount: null,
+      currentChangedAt: null,
+      currentChangedBy: null,
     });
     expect(result!.users).toEqual(sampleUsers);
     expect(result!.lastConnectedBoardSerial).toBe('SERIAL-123');
@@ -431,5 +454,18 @@ describe('eventsReplay membership check is unaffected by the query gate', () => 
     await assertion;
 
     expect(eventsSinceMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('session invite approval boundary', () => {
+  it('hides roster and metadata from a pending or revoked invite holder', async () => {
+    privacyAccess.allowed = false;
+    const result = await sessionQueries.session(
+      undefined,
+      { sessionId: 'session-1' },
+      makeCtx({ userId: 'pending-user', isAuthenticated: true }),
+    );
+    expect(result).toBeNull();
+    expect(getSessionUsersMock).not.toHaveBeenCalled();
   });
 });

@@ -17,24 +17,28 @@
 export const TAB_BAR_HEIGHT = 49;
 
 /** M3 navigation-bar content height (excludes the safe-area inset). The Material
- *  variant's JS tab bar is taller than the iOS 49 — M3 spec is an 80dp bar that
- *  fits the active-indicator pill, icon and label with room to breathe. Only the
- *  Material variant reads this (in MaterialTabBar and the bottom-chrome metrics);
- *  Liquid Glass stays on TAB_BAR_HEIGHT. */
-export const MATERIAL_TAB_BAR_HEIGHT = 80;
+ *  variant's JS tab bar follows the M3 Expressive short navigation bar: 64dp,
+ *  fitting the 32dp active-indicator pill, a 4dp gap and the label (capped at
+ *  1.2× font scale). Only the Material variant reads this (in MaterialTabBar and
+ *  the bottom-chrome metrics); Liquid Glass stays on TAB_BAR_HEIGHT. */
+export const MATERIAL_TAB_BAR_HEIGHT = 64;
 
 /**
  * One height ladder for every glass FAB / capsule / pill, so the floating chrome
  * reads as a single, deliberately-sized system rather than a pile of ad-hoc
  * diameters. Liquid Glass earns expressiveness from a single hero bump plus a
  * 4pt capsule offset — not from many sizes — so the ladder is capped and every
- * interactive tier stays at or above the 44pt touch floor.
+ * interactive tier we draw ourselves stays at or above the 44pt touch floor.
  *
  *   hero          one defining action per floating surface (log-ascent, create)
  *   standard      default floating FAB
  *   capsule       standalone floating capsule — 4pt under its sibling FABs
  *   inlinePrimary primary action inside a sheet (PlayDrawer)
  *   inline        standard inline control + touch-target floor
+ *   bar           UIKit grouped bar-item slot in the native navigation bar;
+ *                 UIKit's own grouped minimum is 36. UIKit owns the bar's
+ *                 hit testing; a GlassToolbarAction adds a 4pt hit slop, while
+ *                 a native ⋯ menu anchor fills exactly its slot.
  *   mini          label-only pill (angle); carries 44pt hit-slop when tappable
  *
  * Guardrail: the hero bump and the capsule offset are for STANDALONE glass
@@ -46,6 +50,7 @@ export const glassSize = {
   capsule: 44,
   inlinePrimary: 48,
   inline: 44,
+  bar: 38,
   mini: 32,
 } as const;
 
@@ -66,9 +71,6 @@ export const TOOLBAR_SIDE_MARGIN = 16;
 /** Gap between the toolbar's floating elements. */
 export const TOOLBAR_GAP = 8;
 
-/** Max readable width for UIKit's iOS 26 bottom accessory content. */
-export const NATIVE_BOTTOM_ACCESSORY_MAX_WIDTH = 420;
-
 /** Height UIKit's iOS 26 bottom accessory adds to the tab content's safe-area
  *  inset (DEVICE_VERIFIED: 139 − 83 on an iPhone 17 Pro). Numerically equal to
  *  `glassSize.hero` today, but that is a coincidence between UIKit's platter and
@@ -76,9 +78,6 @@ export const NATIVE_BOTTOM_ACCESSORY_MAX_WIDTH = 420;
  *  UIKit-owned chrome, so it keys off this constant, which a ladder retune must
  *  not move. */
 export const NATIVE_BOTTOM_ACCESSORY_HEIGHT = 56;
-
-/** Total horizontal screen gutter reserved around UIKit's iOS 26 bottom accessory. */
-export const NATIVE_BOTTOM_ACCESSORY_SCREEN_GUTTER = 32;
 
 /** Lift between the floating toolbar and the tab bar below it, so the islands
  *  read as floating (the old opaque queue bar sat flush against the tab bar). */
@@ -127,15 +126,18 @@ export const REST_TIMER_RESERVE = REST_TIMER_PILL_HEIGHT + TOOLBAR_GAP_ABOVE_TAB
 export const floatingContextBarBottom = (tabBarBottom: number, gapAboveTabBar = TOOLBAR_GAP_ABOVE_TABBAR) =>
   tabBarBottom + gapAboveTabBar;
 
-/** Height of the Material active-context bar docked directly above the tab bar. */
-export const MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT = glassSize.standard;
+/** Height of the Material MiniPlayer card (`FloatingMiniPlayerCard`): the iPhone
+ *  accessory platter's 48, so the shared row lays out with the same geometry and
+ *  holds the same controls. */
+export const MATERIAL_MINI_PLAYER_CARD_HEIGHT = glassSize.standard;
 
-/** One logical px the docked Material bar tucks under the tab bar's top hairline.
- *  Because the bar now docks against the tab bar's *measured* height (not the
- *  `TAB_BAR_HEIGHT` constant), this only has to cover the hairline border / sub-pixel
- *  rounding — not absorb a constant-vs-reality mismatch — so it stays a fixed hairline
- *  instead of a hand-tuned per-device offset. */
-export const TABBAR_SEAM_OVERLAP = 1;
+/** Gap between the Material MiniPlayer card and the top of the tab bar below it:
+ *  none, the card sits straight on the bar (and on the gesture inset when the
+ *  bar hides on scroll). */
+export const MATERIAL_MINI_PLAYER_CARD_GAP = 0;
+
+/** Bottom room the Material MiniPlayer card takes above the tab bar: its height plus its gap. */
+export const MATERIAL_MINI_PLAYER_CARD_RESERVE = MATERIAL_MINI_PLAYER_CARD_HEIGHT + MATERIAL_MINI_PLAYER_CARD_GAP;
 
 /** Width of the iPad adaptive-shell sidebar rail (the glass left rail that
  *  replaces the bottom tab bar at `regular` width — see `size-class.ts`). An

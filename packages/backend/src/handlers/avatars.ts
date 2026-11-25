@@ -5,22 +5,22 @@ import { randomUUID } from 'crypto';
 import { mkdir, writeFile, unlink } from 'fs/promises';
 import { applyCorsHeaders } from './cors';
 import { guardUploadFileStream } from './http-utils';
-import { validateToken } from '../middleware/auth';
+import { validateHttpAuthToken } from './auth-admission';
 import { isS3Configured, uploadToS3, deleteUserAvatarsFromS3 } from '../storage/s3';
 import { logger } from '../utils/logger';
 import { buildStaticAvatarUrl } from '../lib/avatar-url';
-import { MUTABLE_IMAGE_CACHE_CONTROL, writeImageVariants } from '../lib/image-resize';
+import { detectImageMimeType, MIME_TO_EXT } from '../lib/image-mime';
+import {
+  MUTABLE_IMAGE_CACHE_CONTROL,
+  UndecodableImageError,
+  reencodeUploadedImage,
+  writeImageVariants,
+} from '../lib/image-resize';
 
 // Avatar upload configuration
 const AVATARS_DIR = './avatars';
 const MAX_FILE_SIZE = 2 * 1024 * 1024; // 2MB
 const ALLOWED_MIME_TYPES = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
-const MIME_TO_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/gif': 'gif',
-  'image/webp': 'webp',
-};
 
 // UUID validation regex for path traversal prevention
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -125,7 +125,9 @@ export async function handleAvatarUpload(req: IncomingMessage, res: ServerRespon
     return;
   }
 
-  const authResult = await validateToken(token);
+  const admission = await validateHttpAuthToken(token, res);
+  if (!admission.available) return;
+  const authResult = admission.auth;
   if (!authResult) {
     res.writeHead(401, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Invalid or expired token' }));
@@ -269,6 +271,17 @@ export async function handleAvatarUpload(req: IncomingMessage, res: ServerRespon
         return;
       }
 
+      // The declared Content-Type is the client's word; the BYTES decide what
+      // we store. Without this any 2MB payload labelled image/jpeg lands at
+      // avatars/{userId}.jpg and is re-served from our origin as a JPEG.
+      // Checked before the per-user lock so the existing avatar is untouched.
+      if (detectImageMimeType(fileBuffer) !== mimeType) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'File contents do not match the declared image type' }));
+        resolve();
+        return;
+      }
+
       // Capture the narrowed values so the serialized closure below keeps
       // their non-null types.
       const uploadBuffer = fileBuffer;
@@ -281,6 +294,11 @@ export async function handleAvatarUpload(req: IncomingMessage, res: ServerRespon
       let avatarUrl: string;
 
       try {
+        // Store sharp's re-encode, never the raw upload: a real JPEG with a
+        // payload appended after its end marker passes the magic-byte check
+        // AND decodes, so only re-encoding keeps that payload off our origin.
+        // Runs before the per-user lock, so a rejection writes nothing.
+        const storedBuffer = await reencodeUploadedImage(uploadBuffer, uploadMimeType);
         // Write-first, clean-after: the new avatar must be saved before any
         // stale file is deleted, so a failed upload can never destroy the
         // avatar the user's stored avatarUrl still points at.
@@ -291,18 +309,22 @@ export async function handleAvatarUpload(req: IncomingMessage, res: ServerRespon
             // avatar can always see its sizes. Direct-from-bucket serving has
             // no resizer, so a size that does not exist is a 404.
             await writeImageVariants(
-              uploadBuffer,
+              storedBuffer,
               s3Key,
               (key, body, contentType) =>
                 uploadToS3('media', body, key, contentType, { cacheControl: MUTABLE_IMAGE_CACHE_CONTROL }),
               undefined,
               uploadMimeType,
+              // Defence in depth: storedBuffer is already sharp's re-encode, so
+              // this should never fire. If a resize still fails, refuse rather
+              // than fall back to storing the base bytes at every variant key.
+              { rejectUndecodable: true },
             );
-            await uploadToS3('media', uploadBuffer, s3Key, uploadMimeType);
+            await uploadToS3('media', storedBuffer, s3Key, uploadMimeType);
             await deleteUserAvatarsFromS3(uploadUserId, ext);
           } else {
             const filePath = path.join(AVATARS_DIR, avatarFileName);
-            await writeFile(filePath, uploadBuffer);
+            await writeFile(filePath, storedBuffer);
             await deleteExistingAvatars(uploadUserId, ext);
           }
           // Backend-relative URL instead of a direct S3 URL, so the backend
@@ -310,6 +332,15 @@ export async function handleAvatarUpload(req: IncomingMessage, res: ServerRespon
           return buildStaticAvatarUrl(avatarFileName, randomUUID());
         });
       } catch (saveErr) {
+        if (saveErr instanceof UndecodableImageError) {
+          // Also covers sharp's pixel limit and other libvips errors: log the
+          // cause so a real device format that starts failing shows up.
+          logger.warn(`Rejected avatar upload for user ${uploadUserId}: sharp could not decode it:`, saveErr.cause);
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'File is not a readable image' }));
+          resolve();
+          return;
+        }
         logger.error('Failed to save avatar:', saveErr);
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Failed to save avatar' }));

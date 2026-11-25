@@ -27,11 +27,11 @@
 
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
-import { join, sep } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vitest';
-import { buildSchema, parse, validate, type DocumentNode, type GraphQLSchema } from 'graphql';
+import { Kind, buildSchema, parse, validate, type DocumentNode, type GraphQLSchema } from 'graphql';
 import { typeDefs } from '@boardsesh/shared-schema';
 import { listSyncPullDocuments } from '@boardsesh/offline-sync';
 
@@ -40,7 +40,9 @@ import * as sharedOperations from '@boardsesh/graphql/operations';
 import * as sharedTicks from '@boardsesh/graphql/operations/ticks';
 import * as sharedSprayWalls from '@boardsesh/graphql/operations/spray-walls';
 import * as sharedSprayDetection from '@boardsesh/graphql/operations/spray-detection';
+import * as sharedSprayTraining from '@boardsesh/graphql/operations/spray-training';
 import * as sharedAccount from '@boardsesh/graphql/operations/account';
+import * as sharedUserDataExport from '@boardsesh/graphql/operations/user-data-export';
 import * as sharedActivityFeed from '@boardsesh/graphql/operations/activity-feed';
 import * as sharedBetaLinks from '@boardsesh/graphql/operations/beta-links';
 import * as sharedBoardPresence from '@boardsesh/graphql/operations/board-presence';
@@ -48,29 +50,43 @@ import * as sharedBoards from '@boardsesh/graphql/operations/boards';
 import * as sharedFavorites from '@boardsesh/graphql/operations/favorites';
 import * as sharedGyms from '@boardsesh/graphql/operations/gyms';
 import * as sharedIntegrations from '@boardsesh/graphql/operations/integrations';
+import * as sharedConnectedApps from '@boardsesh/graphql/operations/connected-apps';
 import * as sharedLiveSessions from '@boardsesh/graphql/operations/live-sessions';
 import * as sharedNewClimbFeed from '@boardsesh/graphql/operations/new-climb-feed';
 import * as sharedPlaylists from '@boardsesh/graphql/operations/playlists';
 import * as sharedProposals from '@boardsesh/graphql/operations/proposals';
 import * as sharedQa from '@boardsesh/graphql/operations/qa';
 import * as sharedQueueSession from '@boardsesh/graphql/operations/queue-session';
+import * as sharedSessionWorkouts from '@boardsesh/graphql/operations/session-workouts';
+import * as sharedAppWorkouts from '@boardsesh/graphql/operations/app-workouts';
+import * as sharedPartnerSessionHistory from '@boardsesh/graphql/operations/partner-session-history';
+import * as sharedPrivacy from '@boardsesh/graphql/operations/privacy';
+import * as sharedNotifications from '@boardsesh/graphql/operations/notifications';
+import * as sharedAnalyticsConsent from '@boardsesh/graphql/operations/analytics-consent';
+import * as sharedAppleAdsAttribution from '@boardsesh/graphql/operations/apple-ads-attribution';
+import * as sharedOfflineWriteDelivery from '@boardsesh/graphql/operations/offline-write-delivery';
+import * as sharedDirectoryReports from '@boardsesh/graphql/operations/directory-reports';
 
 import {
   BATCHED_OPERATIONS,
+  REPLAY_DEFAULT_RESPONSES,
   RE_RECORD_COMMAND,
   batchRequestIds,
   canonicalJson,
   indexBatchItemsById,
   normalizeDocument,
+  replayCompatibleFixtureResponse,
   resolveOperationName,
   stripIgnoredVariablePaths,
   findUnpseudonymisedPersonFields,
   validateScreenshotFixtureManifest,
   type GraphqlFixtureFile,
+  type ReplayCompatibilityEvidence,
   type ScreenshotFixtureManifest,
 } from '../../../../../../scripts/lib/screenshot-fixtures';
 import { fixtureSnapshotDirectory } from '../../../../../../scripts/lib/screenshot-fixture-snapshot';
 import { checkSelectionCoverage } from './fixture-selection-coverage';
+import { QUERIES_NO_CAPTURE_SENDS } from './screenshot-unsent-queries';
 
 const MOBILE_OPERATIONS_PATH = 'packages/mobile/src/lib/graphql/operations.ts';
 const MOBILE_ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -146,14 +162,22 @@ const REQUIRED_STORE_FLOW_OPERATIONS = [
  * change which silently emptied one of the three sources fails here instead of
  * turning the checks below into no-ops.
  */
-const MINIMUM_REGISTRY_DOCUMENTS = 54;
+const MINIMUM_REGISTRY_DOCUMENTS = 55;
 
 const SHARED_OPERATION_MODULES: Record<string, Record<string, unknown>> = {
+  '@boardsesh/graphql/operations/offline-write-delivery': sharedOfflineWriteDelivery,
+  '@boardsesh/graphql/operations/directory-reports': sharedDirectoryReports,
+  '@boardsesh/graphql/operations/apple-ads-attribution': sharedAppleAdsAttribution,
+  '@boardsesh/graphql/operations/privacy': sharedPrivacy,
+  '@boardsesh/graphql/operations/analytics-consent': sharedAnalyticsConsent,
+  '@boardsesh/graphql/operations/notifications': sharedNotifications,
   '@boardsesh/graphql/operations': sharedOperations,
   '@boardsesh/graphql/operations/ticks': sharedTicks,
   '@boardsesh/graphql/operations/spray-walls': sharedSprayWalls,
   '@boardsesh/graphql/operations/spray-detection': sharedSprayDetection,
+  '@boardsesh/graphql/operations/spray-training': sharedSprayTraining,
   '@boardsesh/graphql/operations/account': sharedAccount,
+  '@boardsesh/graphql/operations/user-data-export': sharedUserDataExport,
   '@boardsesh/graphql/operations/activity-feed': sharedActivityFeed,
   '@boardsesh/graphql/operations/beta-links': sharedBetaLinks,
   '@boardsesh/graphql/operations/board-presence': sharedBoardPresence,
@@ -161,12 +185,16 @@ const SHARED_OPERATION_MODULES: Record<string, Record<string, unknown>> = {
   '@boardsesh/graphql/operations/favorites': sharedFavorites,
   '@boardsesh/graphql/operations/gyms': sharedGyms,
   '@boardsesh/graphql/operations/integrations': sharedIntegrations,
+  '@boardsesh/graphql/operations/connected-apps': sharedConnectedApps,
   '@boardsesh/graphql/operations/live-sessions': sharedLiveSessions,
   '@boardsesh/graphql/operations/new-climb-feed': sharedNewClimbFeed,
   '@boardsesh/graphql/operations/playlists': sharedPlaylists,
   '@boardsesh/graphql/operations/proposals': sharedProposals,
   '@boardsesh/graphql/operations/qa': sharedQa,
   '@boardsesh/graphql/operations/queue-session': sharedQueueSession,
+  '@boardsesh/graphql/operations/session-workouts': sharedSessionWorkouts,
+  '@boardsesh/graphql/operations/app-workouts': sharedAppWorkouts,
+  '@boardsesh/graphql/operations/partner-session-history': sharedPartnerSessionHistory,
 };
 
 // Build the schema inside this test's own `graphql` instance. Importing a
@@ -376,6 +404,12 @@ function readFixture(file: string): GraphqlFixtureFile {
   return JSON.parse(readFileSync(join(FIXTURES_DIR, file), 'utf8')) as GraphqlFixtureFile;
 }
 
+/** The same evidence the replay server hands the compatibility adapters: this set's JoinSession recordings. */
+const compatibilityEvidence: ReplayCompatibilityEvidence = {
+  joinSessionFixtures: () =>
+    manifest.graphql.filter((entry) => entry.operationName === 'JoinSession').map((entry) => readFixture(entry.file)),
+};
+
 // ---------------------------------------------------------------------------
 // (a) Every document the app sends is a valid operation
 // ---------------------------------------------------------------------------
@@ -406,6 +440,54 @@ describe('the operations mobile sends', () => {
     }
     expect(failures).toEqual([]);
   });
+
+  // Train tester builds and train OTAs query the production backend, which
+  // deploys from `main`, not from `release/next`. A train PR that adds a field
+  // and the query that selects it therefore ships a query production rejects
+  // with GRAPHQL_VALIDATION_FAILED (#6111, the train version of #5370). The
+  // `train-schema-on-main` guard step of ci.yml sets PRODUCTION_SCHEMA_SDL to
+  // origin/main's committed schema.graphql; unset, this check does not run.
+  // Validating the operations, not diffing the two schemas, means a schema
+  // addition no client uses stays green, and a `main` that is ahead of the
+  // train stays green too.
+  it.runIf(process.env.PRODUCTION_SCHEMA_SDL)('validates every document against the production (main) schema', () => {
+    const productionSchema = buildSchema(readFileSync(process.env.PRODUCTION_SCHEMA_SDL as string, 'utf8'));
+    const failures: string[] = [];
+    for (const registered of registeredDocuments) {
+      const errors = validate(productionSchema, parse(registered.document));
+      if (errors.length === 0) continue;
+      failures.push(
+        `Mobile operation ${registered.operationName} (${registered.source}) is rejected by origin/main's schema:\n` +
+          errors.map((error, index) => `  ${index + 1}. ${error.message}`).join('\n'),
+      );
+    }
+    expect(
+      failures,
+      'Production deploys from main, so tester builds of this branch would get GRAPHQL_VALIDATION_FAILED. ' +
+        'Land the server half on main first, then merge main into the train.',
+    ).toEqual([]);
+  });
+
+  // The native Live Activity socket (SessionWebSocketManager.swift) sends its
+  // own subscription, which the registry above never sees because no JS call
+  // site sends it. A train binary that selects a field main's schema lacks
+  // gets a subscription error on every connect and stops updating the lock
+  // screen. Only QueueState.historyCount (F3) has a native fallback (it
+  // resubscribes without that line), and that fallback costs the F3 behaviour,
+  // so this still holds the train to main's schema. NATIVE_IOS_QUEUE_UPDATES is
+  // pinned to the Swift text by the backend's native drift guard.
+  it.runIf(process.env.PRODUCTION_SCHEMA_SDL)(
+    'validates the native Live Activity subscription against the production (main) schema',
+    () => {
+      const productionSchema = buildSchema(readFileSync(process.env.PRODUCTION_SCHEMA_SDL as string, 'utf8'));
+      const errors = validate(productionSchema, parse(sharedQueueSession.NATIVE_IOS_QUEUE_UPDATES));
+      expect(
+        errors.map((error) => error.message),
+        'Production deploys from main, so this train binary would lose its Live Activity socket. ' +
+          'Land the server half on main first, then merge main into the train.',
+      ).toEqual([]);
+    },
+  );
 
   it('carries every operation the store flow depends on', () => {
     const missing = REQUIRED_STORE_FLOW_OPERATIONS.filter((operationName) => !registry.has(operationName));
@@ -440,12 +522,52 @@ describe('the recorded screenshot fixtures', () => {
         continue;
       }
       if (documents.some((candidate) => candidate.documentHash === entry.documentHash)) continue;
+      if (
+        documents.some((candidate) =>
+          replayCompatibleFixtureResponse(candidate.document, readFixture(entry.file), compatibilityEvidence),
+        )
+      )
+        continue;
       failures.push(
         `Fixture ${entry.file} was recorded from a ${entry.operationName} document the app no longer sends ` +
           `(recorded ${entry.documentHash.slice(0, 12)}, current ${documents
             .map((candidate) => candidate.documentHash.slice(0, 12))
             .join(', ')}). Re-record: ${RE_RECORD_COMMAND}`,
       );
+    }
+    expect(failures).toEqual([]);
+  });
+
+  it('holds a recording of every document the app sends under a recorded operation name', () => {
+    // Two documents may share an operation name (mobile's GetBoard and the
+    // shared package's select different fields). The check above passes as
+    // long as ONE of them matches, so a screen that switches to the other one
+    // replays as `document-changed` with every PR check green — #6076 did
+    // exactly that to GetBoard.
+    const recordedHashes = new Map<string, Set<string>>();
+    for (const entry of entries) {
+      const hashes = recordedHashes.get(entry.operationName) ?? new Set<string>();
+      hashes.add(entry.documentHash);
+      recordedHashes.set(entry.operationName, hashes);
+    }
+    const failures: string[] = [];
+    for (const [operationName, hashes] of recordedHashes) {
+      for (const registered of registry.get(operationName) ?? []) {
+        if (hashes.has(registered.documentHash)) continue;
+        if (
+          entries.some(
+            (entry) =>
+              entry.operationName === operationName &&
+              replayCompatibleFixtureResponse(registered.document, readFixture(entry.file), compatibilityEvidence),
+          )
+        )
+          continue;
+        failures.push(
+          `${operationName} is recorded, but the app can also send a different ${operationName} document from ` +
+            `${registered.source} (${registered.documentHash.slice(0, 12)}) that no fixture holds. Send the recorded ` +
+            `document from that call site, or re-record: ${RE_RECORD_COMMAND}`,
+        );
+      }
     }
     expect(failures).toEqual([]);
   });
@@ -483,10 +605,17 @@ describe('the recorded screenshot fixtures', () => {
     const failures: string[] = [];
     for (const entry of entries) {
       const documents = registry.get(entry.operationName);
-      const current = documents?.find((candidate) => candidate.documentHash === entry.documentHash);
-      if (!current) continue; // already reported by the document-drift check above
       const fixture = readFixture(entry.file);
-      const response = fixture.response as { data?: unknown } | null;
+      const current = documents?.find(
+        (candidate) =>
+          candidate.documentHash === entry.documentHash ||
+          replayCompatibleFixtureResponse(candidate.document, fixture, compatibilityEvidence),
+      );
+      if (!current) continue; // already reported by the document-drift check above
+      const response = (replayCompatibleFixtureResponse(current.document, fixture, compatibilityEvidence)?.response ??
+        fixture.response) as {
+        data?: unknown;
+      } | null;
       if (!response || typeof response !== 'object' || response.data === undefined) continue;
       const variables = (fixture.variables ?? {}) as Record<string, unknown>;
       for (const path of checkSelectionCoverage(schema, parse(current.document), response.data, variables)) {
@@ -548,6 +677,59 @@ describe('the recorded screenshot fixtures', () => {
   });
 });
 
+describe('native smoke request coverage', () => {
+  it('bundles every recorded smoke spray photo without expiring credentials', () => {
+    const operations = new Set(['GetSprayWallByLayout', 'GetSprayWallRenderData', 'GetSprayWallArt']);
+    const assetOrigin = 'https://screenshot-fixtures.boardsesh.invalid';
+    const references: string[] = [];
+    function inspect(node: unknown): void {
+      if (typeof node === 'string') {
+        expect(node).not.toMatch(/X-Amz-(?:Signature|Credential)|X-Goog-(?:Signature|Credential)/i);
+        if (node.startsWith(assetOrigin)) references.push(new URL(node).pathname);
+      } else if (Array.isArray(node)) node.forEach(inspect);
+      else if (node && typeof node === 'object') Object.values(node).forEach(inspect);
+    }
+    for (const entry of manifest.graphql.filter((entry) => operations.has(entry.operationName))) {
+      inspect(readFixture(entry.file).response);
+    }
+    expect(references.length).toBeGreaterThan(0);
+    for (const path of references) {
+      const asset = manifest.static.find((entry) => entry.path === path && entry.query === '');
+      expect(asset, `Missing bundled spray image ${path}`).toBeDefined();
+      expect(readFileSync(join(FIXTURES_DIR, asset!.file)).byteLength).toBe(asset!.bytes);
+    }
+  });
+
+  const requests: Array<[string, Record<string, unknown>]> = [
+    ['GetUserAscentsFeed', { userId: manifest.accountUserId, input: { statusMode: 'attempt', limit: 50, offset: 0 } }],
+    ['ResolveBoardForUuid', { boardUuid: 'dcb443be-aaea-4637-8bf8-b20cbe031192' }],
+    ['RecordBoardOpened', { input: { boardUuid: 'dcb443be-aaea-4637-8bf8-b20cbe031192' } }],
+    ['GetSprayWallByLayout', { layoutId: 62 }],
+    ...['BoardConnection', 'BoardRecentClimbs', 'BoardPresenceStats', 'BoardRecentHistory'].map(
+      (operationName): [string, Record<string, unknown>] => [
+        operationName,
+        { boardId: 4, boardUuid: 'dcb443be-aaea-4637-8bf8-b20cbe031192' },
+      ],
+    ),
+    ...['GetSprayWallArchive', 'GetSprayWallLook', 'GetSprayWallRenderData'].map(
+      (operationName): [string, Record<string, unknown>] => [
+        operationName,
+        { uuid: 'edce28e6-9f7b-4af0-8f62-6dbd78cdd1de' },
+      ],
+    ),
+    ['GetSprayWallArt', { uuid: 'edce28e6-9f7b-4af0-8f62-6dbd78cdd1de', version: 3 }],
+    ['GetFollowingClimbAscents', { input: { boardType: 'kilter', climbUuid: 'A6E04278AE294E03AD9DD2A8E0CDE31F' } }],
+  ];
+  it.each(requests)('records the exact %s request made by the default navigation flow', (operationName, variables) => {
+    expect(
+      manifest.graphql.some((entry) => {
+        if (entry.operationName !== operationName) return false;
+        return canonicalJson(readFixture(entry.file).variables) === canonicalJson(variables);
+      }),
+    ).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // (d) The batched-replay table still describes the committed fixtures
 // ---------------------------------------------------------------------------
@@ -568,7 +750,7 @@ describe('BATCHED_OPERATIONS', () => {
   it.each(batchedEntries)('%s resolves its id list and item ids in every recorded fixture', (operationName, spec) => {
     const entries = manifest.graphql.filter((entry) => entry.operationName === operationName);
     // Not a precondition to skip on: an empty list would make this vacuous, and
-    // both operations are recorded many times over by the store flow.
+    // every batched operation is recorded many times over by the store flow.
     expect(entries.length).toBeGreaterThan(0);
     let fixturesThatDecomposedSomething = 0;
     for (const entry of entries) {
@@ -615,44 +797,171 @@ describe('BATCHED_OPERATIONS', () => {
 });
 
 // ---------------------------------------------------------------------------
-// (e) Every infinite list is capped to one page in screenshot mode
+// (d2) A recorded runtime id list is keyed by membership
 // ---------------------------------------------------------------------------
 
-/**
- * Hooks whose `useInfiniteQuery` is deliberately NOT wrapped, because their
- * pager is capped at the consumer instead.
- *
- * Both live in `@boardsesh/playlists-react`, which web also consumes and which
- * must not read a mobile build flag; `PlaylistDetailView` wraps its own
- * `onEndReached` in `screenshotModeLoadMore` for both.
- */
-const UNCAPPED_INFINITE_QUERY_ALLOWLIST = ['use-playlist-climbs.ts', 'use-smart-playlist.ts'];
+/** Every dot path in `variables` holding a non-empty list of strings, with that list. */
+function collectStringListPaths(value: unknown, path: string, found: Map<string, string[]>): void {
+  if (Array.isArray(value)) {
+    if (value.length > 0 && value.every((element): element is string => typeof element === 'string')) {
+      found.set(path, value);
+    }
+    return;
+  }
+  if (typeof value !== 'object' || value === null) return;
+  for (const [key, child] of Object.entries(value)) {
+    collectStringListPaths(child, path ? `${path}.${key}` : key, found);
+  }
+}
 
-describe('infinite lists in screenshot mode', () => {
-  it('caps every useInfiniteQuery with screenshotModeNextPageParam', () => {
-    const offenders: string[] = [];
-    let scanned = 0;
-    for (const root of SCAN_ROOTS) {
-      for (const file of listSourceFiles(root)) {
-        // A test's own mock of the hook is not a list that pages.
-        if (file.includes(`${sep}__tests__${sep}`)) continue;
-        const source = readFileSync(file, 'utf8');
-        if (!source.includes('useInfiniteQuery(')) continue;
-        scanned += 1;
-        if (source.includes('screenshotModeNextPageParam')) continue;
-        if (UNCAPPED_INFINITE_QUERY_ALLOWLIST.some((allowed) => file.endsWith(allowed))) continue;
-        offenders.push(file);
+/**
+ * Operations legitimately recorded with different lists in one variable, as
+ * `operationName -> variable path -> why`.
+ *
+ * The check below cannot tell an id list assembled from mounted rows from a
+ * FILTER the screen sets on purpose (board types, grades, tags). A filter
+ * shapes the whole response, so composing by membership would be wrong for it
+ * and its exact key is the right one. Name the operation and the path here,
+ * with the reason, when the check flags one. Empty today.
+ */
+const EXACT_KEYED_LIST_VARIABLES: Readonly<Record<string, Readonly<Record<string, string>>>> = {};
+
+describe('recorded id lists', () => {
+  /**
+   * The variables shape that breaks replay without any document changing: a
+   * list of ids the app assembles from whatever rows are mounted. Its exact
+   * contents depend on flush timing, so an exact-variables key matches on one
+   * run and misses on the next (`GetTicks` did, on every iPhone capture from
+   * 2026-09-19). The recorded set shows the shape directly — one operation,
+   * the same list variable, different lists — so it is checked here, on the PR
+   * that pins the set, instead of by the capture that misses.
+   */
+  it('keys every operation recorded with varying string lists by membership', () => {
+    const listsByOperationAndPath = new Map<string, Set<string>>();
+    for (const entry of manifest.graphql) {
+      if (Object.hasOwn(BATCHED_OPERATIONS, entry.operationName)) continue;
+      const found = new Map<string, string[]>();
+      collectStringListPaths(readFixture(entry.file).variables, '', found);
+      for (const [path, list] of found) {
+        if (EXACT_KEYED_LIST_VARIABLES[entry.operationName]?.[path] !== undefined) continue;
+        const key = `${entry.operationName} variables.${path}`;
+        const seen = listsByOperationAndPath.get(key) ?? new Set<string>();
+        seen.add(canonicalJson(list));
+        listsByOperationAndPath.set(key, seen);
       }
     }
-    // A resolution change that emptied SCAN_ROOTS would turn this into a no-op.
-    expect(scanned).toBeGreaterThan(0);
+    const failures = [...listsByOperationAndPath.entries()]
+      .filter(([, lists]) => lists.size > 1)
+      .map(
+        ([key, lists]) =>
+          `${key} was recorded with ${lists.size} different lists but is keyed by its exact variables. ` +
+          'If the app builds that list from mounted rows, replay will ask for a list nobody recorded: add the ' +
+          'operation to BATCHED_OPERATIONS in scripts/lib/screenshot-fixtures.ts. If the list is a filter the ' +
+          'screen sets on purpose, name it in EXACT_KEYED_LIST_VARIABLES in this file, with the reason.',
+      );
+    expect(failures).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// (d3) Every query is recorded, answered by a default, or declared unsent
+// ---------------------------------------------------------------------------
+
+/** `query`, `mutation` or `subscription`, read off the parsed document. */
+function operationKind(document: string): string {
+  const definition = parse(document).definitions.find((candidate) => candidate.kind === Kind.OPERATION_DEFINITION);
+  if (!definition || definition.kind !== Kind.OPERATION_DEFINITION) {
+    throw new Error('A registered document holds no operation definition.');
+  }
+  return definition.operation;
+}
+
+const registeredQueryNames = [...registry.entries()]
+  .filter(([, documents]) => documents.some((registered) => operationKind(registered.document) === 'query'))
+  .map(([operationName]) => operationName);
+
+/**
+ * The PR-time half of the replay miss gate.
+ *
+ * A replay capture fails on any query the pinned set cannot answer, but it runs
+ * on a simulator after a native deploy — days after the PR that added the
+ * query. Nothing static knows which screen sends which query (a hook three
+ * imports away from a visited route is as live as one inside it), so this does
+ * the cheapest sound thing instead: every query the app can send has to be in
+ * exactly one of three places, and adding a query is what forces the choice.
+ *
+ *  - RECORDED: the pinned set holds a fixture for it.
+ *  - DEFAULTED: `REPLAY_DEFAULT_RESPONSES` declares its answer.
+ *  - UNSENT: `QUERIES_NO_CAPTURE_SENDS` says no captured screen sends it.
+ *
+ * Mutations and subscriptions are out of scope: a capture taps almost nothing,
+ * and passive subscriptions have their own rule in the replay backend.
+ */
+describe('queries the capture flows can reach', () => {
+  const recorded = new Set(manifest.graphql.map((entry) => entry.operationName));
+  const defaulted = new Set(Object.keys(REPLAY_DEFAULT_RESPONSES));
+  const declaredUnsent = new Set<string>(QUERIES_NO_CAPTURE_SENDS);
+
+  it('keeps Aurora grade reads unsent only while recorded wall feeds contain no Aurora displays', () => {
+    const wallFeeds = new Set([
+      'BoardRecentHistory',
+      'BoardRecentClimbs',
+      'BoardNowPlaying',
+      'BoardHistory',
+      'BoardHistoryPage',
+    ]);
+    const recordedWallFeeds = manifest.graphql.filter((entry) => wallFeeds.has(entry.operationName));
+    expect(recordedWallFeeds.length).toBeGreaterThan(0);
+    const containsAuroraDisplay = (input: unknown): boolean => {
+      if (Array.isArray(input)) return input.some(containsAuroraDisplay);
+      if (!input || typeof input !== 'object') return false;
+      const record = input as Record<string, unknown>;
+      return record.source === 'aurora' || Object.values(record).some(containsAuroraDisplay);
+    };
+    expect(recordedWallFeeds.filter((entry) => containsAuroraDisplay(readFixture(entry.file).response))).toEqual([]);
+  });
+
+  it('places every query the app can send', () => {
+    const unplaced = registeredQueryNames
+      .filter((name) => !recorded.has(name) && !defaulted.has(name) && !declaredUnsent.has(name))
+      .sort();
     expect(
-      offenders,
-      `these call useInfiniteQuery( without screenshotModeNextPageParam, so a replay capture pages further than ` +
-        `the recording did: ${offenders.join(', ')}. Wrap getNextPageParam, or cap the pager at the consumer and ` +
-        `add the file to UNCAPPED_INFINITE_QUERY_ALLOWLIST.`,
+      unplaced,
+      'These queries are new to the screenshot capture. For each one, decide: does a screen the capture flows visit ' +
+        '(packages/mobile/.maestro) send it? If NOT, add it to QUERIES_NO_CAPTURE_SENDS in ' +
+        'screenshot-unsent-queries.ts. If it DOES and its answer for the screenshots account never depends on ' +
+        'recorded data, add it to REPLAY_DEFAULT_RESPONSES in scripts/lib/screenshot-fixtures.ts. Otherwise the set ' +
+        'needs it recorded — see "When to re-record" in docs/qa/mobile-screenshot-fixtures.md.',
     ).toEqual([]);
   });
+
+  it('keeps the unsent list to queries that are still unrecorded and still sent by the app', () => {
+    const stale = QUERIES_NO_CAPTURE_SENDS.filter(
+      (name) => !registeredQueryNames.includes(name) || recorded.has(name) || defaulted.has(name),
+    );
+    expect(
+      stale,
+      'Remove these from QUERIES_NO_CAPTURE_SENDS: the app no longer sends them as a query, or they are now recorded or defaulted.',
+    ).toEqual([]);
+    expect([...QUERIES_NO_CAPTURE_SENDS]).toEqual([...declaredUnsent].sort());
+  });
+
+  it.each(Object.entries(REPLAY_DEFAULT_RESPONSES))(
+    'the replay default for %s answers the current document and no fixture shadows it',
+    (operationName, replayDefault) => {
+      const documents = registry.get(operationName) ?? [];
+      expect(documents.length, `${operationName} is not an operation the app sends`).toBeGreaterThan(0);
+      // The backend only falls back to a default when the set holds nothing for
+      // the operation, so a recorded one makes the entry dead.
+      expect(recorded.has(operationName), `${operationName} is recorded; delete its replay default`).toBe(false);
+      for (const registered of documents) {
+        expect(operationKind(registered.document)).toBe('query');
+        const response = replayDefault.response as { data?: unknown };
+        expect(response.data).toBeDefined();
+        expect(checkSelectionCoverage(schema, parse(registered.document), response.data, {})).toEqual([]);
+      }
+    },
+  );
 });
 
 // ---------------------------------------------------------------------------

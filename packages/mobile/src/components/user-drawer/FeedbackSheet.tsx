@@ -1,8 +1,15 @@
-import { memo, useEffect, useMemo, useRef, useState, type RefObject } from 'react';
+import { MEDIUM_LARGE_SNAP_POINTS } from '../sheet-snap-points';
+import { useScopedSheetError } from '../../hooks/use-scoped-sheet-error';
+import { InlineSheetError } from '../InlineSheetError';
+import { useUnsavedSheetGuard } from '../../hooks/use-unsaved-sheet-guard';
+import { memo, useCallback, useEffect, useRef, useState, type RefObject } from 'react';
+import { AccessibleBottomSheetTextInput as BottomSheetTextInput } from '../AccessibleBottomSheetTextInput';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
 import { StyleSheet, View } from 'react-native';
-import { BottomSheetTextInput } from '@expo/ui/community/bottom-sheet';
+
 import { useTranslation } from 'react-i18next';
 import { ModalSheet } from '../ModalSheet';
+import { SheetTopBar } from '../SheetTopBar';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { Button } from '../Button';
@@ -47,6 +54,7 @@ export const FeedbackSheet = memo(function FeedbackSheet({
   onClose,
   showDiscordLink = false,
 }: FeedbackSheetProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('settings');
   // The screenshot strings live in `common`, shared with the QA verdict sheet.
   const { t: tCommon } = useTranslation('common');
@@ -75,25 +83,36 @@ export const FeedbackSheet = memo(function FeedbackSheet({
   const submitLabel = isBugReport ? t('feedbackDialog.submitBug') : t('feedbackDialog.submitRating');
   const inputPlaceholder = isBugReport ? t('feedbackForm.bugPlaceholder') : t('feedbackForm.ratingPlaceholder');
 
-  useEffect(() => {
+  const { submitError, setSubmitError, clearError } = useScopedSheetError(mode, visible);
+  const resetForm = useCallback(() => {
     setSelectedRating(null);
     setComment('');
     setCaptureBleDiag(false);
     setContactConsent(true);
     setScreenshotUris([]);
+    clearError();
     reset();
-  }, [mode, reset]);
+  }, [reset, clearError]);
+  useEffect(resetForm, [mode, resetForm]);
 
-  const snapPoints = useMemo(() => (isBugReport ? ['62%', '88%'] : ['44%', '72%']), [isBugReport]);
+  const dirty =
+    selectedRating !== null || comment.length > 0 || captureBleDiag || !contactConsent || screenshotUris.length > 0;
+  const guard = useUnsavedSheetGuard({
+    visible,
+    dirty,
+    busy: isSubmitting || isPending || isUploading,
+    onClose,
+    onDiscard: resetForm,
+    scope: mode,
+  });
 
-  const handleDismiss = () => {
-    onClose();
-  };
+  const snapPoints = MEDIUM_LARGE_SNAP_POINTS;
 
   const handleSubmit = async () => {
     if (!canSubmit || submittingRef.current) return;
     submittingRef.current = true;
     setIsSubmitting(true);
+    setSubmitError(null);
     try {
       // Uploaded before the report so it carries keys the backend can resolve. A
       // failed upload leaves the typed report and the picked shots untouched.
@@ -103,7 +122,7 @@ export const FeedbackSheet = memo(function FeedbackSheet({
         try {
           screenshotKeys = await uploadFeedbackScreenshots(screenshotUris);
         } catch {
-          showToast(tCommon('screenshots.uploadFailed'), 'error');
+          setSubmitError(tCommon('screenshots.uploadFailed'));
           return;
         } finally {
           setIsUploading(false);
@@ -130,7 +149,14 @@ export const FeedbackSheet = memo(function FeedbackSheet({
           screenshotKeys: screenshotKeys.length > 0 ? screenshotKeys : null,
         });
         onClose();
-        showToast(isBugReport ? t('feedbackDialog.successBug') : t('feedbackDialog.successRating'), 'success');
+        showToast(
+          isBugReport
+            ? isAuthenticated
+              ? t('feedbackDialog.successBugSignedIn')
+              : t('feedbackDialog.successBug')
+            : t('feedbackDialog.successRating'),
+          'success',
+        );
         setSelectedRating(null);
         setComment('');
         setContactConsent(true);
@@ -139,7 +165,7 @@ export const FeedbackSheet = memo(function FeedbackSheet({
         // one must upload its own rather than reuse these.
         clearScreenshotUploadCache();
       } catch {
-        showToast(t('feedbackDialog.errorRating'), 'error');
+        setSubmitError(t('feedbackDialog.errorRating'));
       }
     } finally {
       submittingRef.current = false;
@@ -153,27 +179,32 @@ export const FeedbackSheet = memo(function FeedbackSheet({
       <ModalSheet
         ref={sheetRef}
         visible={visible}
-        onClose={onClose}
+        onDisplaced={onClose}
+        onClose={guard.requestClose}
+        onRequestClose={guard.requestClose}
+        enablePanDownToClose={guard.enablePanDownToClose}
         snapPoints={snapPoints}
         scrollable
+        androidContentSized
         contentContainerStyle={styles.content}
+        header={
+          <SheetTopBar
+            title={title}
+            leading={{ kind: 'close', onPress: guard.requestClose }}
+            trailing={{
+              kind: 'confirm',
+              label: submitLabel,
+              onPress: () => {
+                void handleSubmit();
+              },
+              disabled: !canSubmit || isSubmitting || isPending || isUploading,
+              loading: isSubmitting || isPending || isUploading,
+              prominent: true,
+            }}
+          />
+        }
       >
-        <View style={styles.headerRow}>
-          <Text variant="title3" style={styles.title}>
-            {title}
-          </Text>
-          <PressableSurface
-            onPress={handleDismiss}
-            feedback="opacity"
-            hitSlop={8}
-            accessibilityRole="button"
-            accessibilityLabel={t('feedbackDialog.closeAria')}
-            style={styles.closeButton}
-          >
-            <Icon name="close" size={20} color={systemColors.secondaryLabel} />
-          </PressableSurface>
-        </View>
-
+        <InlineSheetError message={submitError} visible={visible} scope={mode} />
         {!isBugReport ? (
           <View style={styles.starRow}>
             {STAR_RATING_VALUES.map((starRating) => {
@@ -222,9 +253,11 @@ export const FeedbackSheet = memo(function FeedbackSheet({
 
         {isBugReport ? (
           <View style={[styles.recordingCard, { backgroundColor: systemColors.secondaryBackground }]}>
+            {/* The same switch, words and all, as Settings → Privacy, so the
+                note to turn it off again reads the same in both places. */}
             <SessionRecordingSwitchRow
-              label={t('feedbackForm.sessionRecordingLabel')}
-              description={t('feedbackForm.sessionRecordingDescription')}
+              label={tCommon('mobile.settings.diagnostics.recording')}
+              description={tCommon('mobile.settings.diagnostics.recordingDescription')}
             />
             <SwitchRow
               label={t('feedbackForm.bluetoothBugLabel')}
@@ -247,20 +280,11 @@ export const FeedbackSheet = memo(function FeedbackSheet({
               value={contactConsent}
               onValueChange={setContactConsent}
             />
+            <Text variant="footnote" tone="secondary">
+              {t('feedbackForm.inAppRepliesDescription')}
+            </Text>
           </View>
         ) : null}
-
-        <Button
-          title={submitLabel}
-          onPress={() => {
-            void handleSubmit();
-          }}
-          variant="filled"
-          size="large"
-          disabled={!canSubmit || isUploading}
-          loading={isPending || isUploading}
-          style={styles.submitButton}
-        />
 
         {showDiscordLink ? (
           <Button
@@ -269,7 +293,6 @@ export const FeedbackSheet = memo(function FeedbackSheet({
               void openDiscordInvite('login');
             }}
             variant="text"
-            size="large"
             icon="open.external"
             tintColor={brandColors.primary}
           />
@@ -279,56 +302,39 @@ export const FeedbackSheet = memo(function FeedbackSheet({
   );
 });
 
-const styles = StyleSheet.create({
-  content: {
-    paddingHorizontal: spacing[4],
-    paddingBottom: spacing[6],
-    gap: spacing[4],
-  },
-  headerRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: spacing[3],
-  },
-  title: {
-    flex: 1,
-    fontWeight: '700',
-  },
-  closeButton: {
-    width: 36,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  starRow: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    gap: spacing[2],
-  },
-  starButton: {
-    width: 44,
-    height: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  input: {
-    minHeight: 116,
-    maxHeight: 220,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: borderRadius.lg,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    fontSize: 16,
-  },
-  helperText: {
-    marginTop: -spacing[2],
-  },
-  recordingCard: {
-    overflow: 'hidden',
-    borderRadius: borderRadius.lg,
-  },
-  submitButton: {
-    marginTop: spacing[1],
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    content: {
+      paddingHorizontal: spacing[4],
+      paddingTop: spacing[4],
+      paddingBottom: spacing[6],
+      gap: spacing[4],
+    },
+    starRow: {
+      flexDirection: 'row',
+      justifyContent: 'center',
+      gap: spacing[2],
+    },
+    starButton: {
+      width: 44,
+      height: 44,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    input: {
+      minHeight: 116,
+      maxHeight: 220,
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: borderRadius.lg,
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      fontSize: textStyles.callout.fontSize,
+    },
+    helperText: {
+      marginTop: -spacing[2],
+    },
+    recordingCard: {
+      overflow: 'hidden',
+      borderRadius: borderRadius.lg,
+    },
+  });

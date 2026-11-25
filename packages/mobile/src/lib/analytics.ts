@@ -6,7 +6,20 @@ import { registerConnectivitySuperProperty } from './analytics-connectivity';
 import { reregisterOfflineEngineState } from './analytics-offline-engine-state';
 import { reregisterActiveGym } from './analytics-gym';
 import { reregisterLowPowerMode } from './analytics-low-power-mode';
+import { reregisterThemeProperties } from './analytics-theme';
 import { reregisterConnectStepArm } from './analytics-connect-step-arm';
+import { subscribeSuperPropertiesCleared } from './analytics-super-properties-cleared';
+import { isProductAnalyticsGranted } from './consent-state';
+import { notifyAnalyticsIdentityChanged } from './analytics-identity-events';
+import { applyPosthogConsent, subscribePosthogInitialized, clearPosthogQueues } from './posthog-client';
+import { applySessionReplayConsent } from './session-replay-consent';
+import {
+  isPosthogFlagResponseCurrent,
+  isPosthogFlagBagCurrent,
+  subscribePosthogFlagAuthority,
+  getPosthogFlagAuthority,
+  isPosthogFlagAuthorityCurrent,
+} from './posthog-flag-authority';
 
 // `sendEvent: false` suppresses the SDK's `$feature_flag_called` capture. Verified
 // in @posthog/core 1.46.1 (shared by posthog-react-native and posthog-js-lite):
@@ -18,6 +31,8 @@ type PosthogFeatureFlagClient = {
   isFeatureEnabled?: (key: string, options?: FeatureFlagReadOptions) => unknown;
   reloadFeatureFlags?: () => unknown;
   onFeatureFlags?: (callback: () => void) => unknown;
+  getFeatureFlagDetails?: () => { requestId?: unknown } | undefined;
+  getFeatureFlagPayload?: (key: string) => unknown;
 };
 
 // Lazily construct a single PostHog client. Returns null in dev / when unkeyed,
@@ -37,17 +52,73 @@ function getClient(): PostHog | null {
 export function setSessionRecordingEnabled(enabled: boolean): void {
   const client = getClient();
   if (!client) return;
-  if (enabled) {
-    void client.startSessionRecording();
-  } else {
-    void client.stopSessionRecording();
-  }
+  void applySessionReplayConsent(client, enabled).catch(() => {});
 }
 
 // Exposed so AnalyticsProvider can hand the same instance to PostHogProvider for
 // touch autocapture — one client drives both manual events and autocapture.
 export function getAnalyticsClient(): PostHog | null {
   return getClient();
+}
+
+// Who the SDK says this device is, read from its persisted state. Null when
+// there is no client (dev / no key) or the SDK has not loaded its storage yet:
+// both ids come back empty until then, and an empty id answers nothing.
+//
+// Reading the anonymous id mints and persists one when there is none. That is
+// the SDK's own lazy behaviour and it would happen on the next capture anyway.
+export function getAnalyticsIdentity(): { distinctId: string; anonymousId: string } | null {
+  const client = getClient();
+  if (!client) return null;
+  const distinctId = client.getDistinctId();
+  const anonymousId = client.getAnonymousId();
+  if (!distinctId || !anonymousId) return null;
+  return { distinctId, anonymousId };
+}
+
+// True when the SDK is pinned to a person: `identify()` moved its distinct id
+// off its anonymous id. False when it is anonymous, and false when it cannot
+// say yet. Callers use this to decide whether a reset() has anything to forget,
+// so "cannot say" must not read as "reset": a reset on an anonymous SDK throws
+// away the anonymous id a later sign-in needs to merge on. The identity effect
+// in party-profile-provider.tsx waits for the SDK and covers that case.
+export function isAnalyticsPinnedToAPerson(): boolean {
+  const identity = getAnalyticsIdentity();
+  return identity !== null && identity.distinctId !== identity.anonymousId;
+}
+
+// Runs `callback` once the SDK has loaded its persisted state, which is when
+// getAnalyticsIdentity() starts answering. Never runs it when analytics is
+// disabled. Returns a cancel function for effect cleanup.
+//
+// Synchronous when the SDK is already loaded, which is every call after the
+// first few hundred milliseconds of a launch. Callers depend on that: two
+// effects in one commit run in declaration order only if neither is deferred,
+// and party-profile-provider.tsx needs its identify() on the wire before the
+// person properties that belong to the identified user.
+//
+// `ready()` is marked @internal in the SDK typings. It only awaits the storage
+// preload. posthog-sdk-contract.test.ts pins that the shipped SDK build still
+// has it, so an SDK bump that drops the method fails a test, not a launch.
+export function onAnalyticsReady(callback: () => void): () => void {
+  const client = getClient();
+  if (!client) return () => {};
+  if (getAnalyticsIdentity() !== null) {
+    callback();
+    return () => {};
+  }
+  let cancelled = false;
+  void client
+    .ready()
+    .then(() => {
+      if (!cancelled) callback();
+    })
+    .catch((error: unknown) => {
+      if (__DEV__) console.warn('[analytics] SDK did not become ready', error);
+    });
+  return () => {
+    cancelled = true;
+  };
 }
 
 // Register PostHog super properties — values stamped onto every subsequent event
@@ -125,6 +196,7 @@ export function readPosthogFeatureFlags(
 ): Record<string, boolean | string> {
   const posthog = getClient();
   if (!posthog) return {};
+  if (readPosthogFeatureFlagsRequestId() === undefined && !isPosthogFlagBagCurrent(posthog)) return {};
   const featureFlagClient = asFeatureFlagClient(posthog);
   const flags: Record<string, boolean | string> = {};
 
@@ -144,9 +216,77 @@ export function readPosthogFeatureFlags(
   return flags;
 }
 
-export function subscribePosthogFeatureFlags(onChange: () => void): () => void {
+/** Values and payloads must belong to the same account and flags response. */
+export function readPosthogFeatureFlagSnapshot(
+  definitions: readonly FeatureFlagDefinitionLike[],
+  payloadKeys: readonly string[],
+): { flags: Record<string, boolean | string>; payloads: Record<string, unknown> } {
+  const empty = { flags: {}, payloads: {} };
+  const authority = getPosthogFlagAuthority();
   const posthog = getClient();
-  if (!posthog) return () => {};
+  if (!posthog) return empty;
+  const requestId = readPosthogFeatureFlagsRequestId();
+  if (requestId === undefined && !isPosthogFlagBagCurrent(posthog)) return empty;
+  const flags = readPosthogFeatureFlags(definitions);
+  const featureFlagClient = asFeatureFlagClient(posthog);
+  const payloads: Record<string, unknown> = {};
+  for (const key of payloadKeys) {
+    try {
+      // The installed PostHog core explicitly suppresses exposure events here.
+      payloads[key] = featureFlagClient.getFeatureFlagPayload?.(key);
+    } catch {
+      // A bad payload must not hide an already resolved global kill switch.
+    }
+  }
+  if (
+    !isPosthogFlagAuthorityCurrent(authority) ||
+    readPosthogFeatureFlagsRequestId() !== requestId ||
+    (requestId === undefined && !isPosthogFlagBagCurrent(posthog))
+  )
+    return empty;
+  return { flags, payloads };
+}
+
+/**
+ * The id of the `/flags` response the current flag bag came from, or undefined
+ * when there is none (no client, no flags ever loaded). PostHog persists it
+ * with the bag, so on a cold start it names the CACHED response until a new
+ * one lands. A change in it is the only way to tell a fresh answer from the
+ * cached bag being re-emitted after a failed request.
+ *
+ * `getFeatureFlagDetails()` is public on PostHogCore (posthog-core.d.ts:
+ * `getFeatureFlagDetails(): PostHogFeatureFlagDetails | undefined`), which
+ * stores `requestId` from every `/flags` response alongside the flags. On a
+ * client without it this reads undefined forever, flags never count as fresh,
+ * and the one thing gated on that (moving an early-updates member off their
+ * track because the flag says off) never happens. That is the safe direction:
+ * the row still hides, and nobody is moved on evidence that cannot be dated.
+ */
+export function readPosthogFeatureFlagsRequestId(): string | undefined {
+  const posthog = getClient();
+  if (!posthog) return undefined;
+  const featureFlagClient = asFeatureFlagClient(posthog);
+  if (typeof featureFlagClient.getFeatureFlagDetails !== 'function') return undefined;
+  const requestId = featureFlagClient.getFeatureFlagDetails()?.requestId;
+  return typeof requestId === 'string' && isPosthogFlagResponseCurrent(requestId) ? requestId : undefined;
+}
+
+export function subscribePosthogFeatureFlags(onChange: () => void): () => void {
+  const unsubscribeAuthority = subscribePosthogFlagAuthority(onChange);
+  const posthog = getClient();
+  if (!posthog) {
+    let unbind = () => {};
+    const unsubscribeInitialized = subscribePosthogInitialized(() => {
+      unbind();
+      unbind = subscribePosthogFeatureFlags(onChange);
+      onChange();
+    });
+    return () => {
+      unsubscribeAuthority();
+      unsubscribeInitialized();
+      unbind();
+    };
+  }
   const featureFlagClient = asFeatureFlagClient(posthog);
 
   const reloadResult =
@@ -158,21 +298,29 @@ export function subscribePosthogFeatureFlags(onChange: () => void): () => void {
   }
 
   if (typeof featureFlagClient.onFeatureFlags !== 'function') {
-    return () => {};
+    return unsubscribeAuthority;
   }
 
   const unsubscribe = featureFlagClient.onFeatureFlags(onChange);
   if (typeof unsubscribe === 'function') {
-    return unsubscribe as () => void;
+    return () => {
+      unsubscribeAuthority();
+      unsubscribe();
+    };
   }
-  return () => {};
+  return unsubscribeAuthority;
 }
 
-const analytics = createAnalytics(getClient, {
+const analytics = createAnalytics(() => (isProductAnalyticsGranted() ? getClient() : null), {
   onDebug: __DEV__ ? (name, properties) => console.info('[analytics]', name, properties ?? {}) : undefined,
 });
 
-export const { track, identify, setPersonProperties, alias } = analytics;
+export const { track, capture, setPersonProperties } = analytics;
+export const identify: typeof analytics.identify = (distinctId, properties) => {
+  const forwarded = analytics.identify(distinctId, properties);
+  if (forwarded) notifyAnalyticsIdentityChanged();
+  return forwarded;
+};
 
 /**
  * Stamp the board-render A/B state (issue #2202) as PostHog super properties,
@@ -200,6 +348,19 @@ export function registerRenderSuperProperties(effective: {
     glow_falloff_source: effective.glowFalloffSource,
   });
 }
+
+/** Puts back the launch-scoped super properties a `client.reset([])` wiped. */
+function reregisterLaunchSuperProperties(client: PostHog): void {
+  reregisterOfflineEngineState(client);
+  reregisterActiveGym(client);
+  reregisterLowPowerMode(client);
+  reregisterThemeProperties(client);
+  reregisterConnectStepArm(client);
+}
+
+// The consent path in posthog-client.ts resets the client too (a withdrawal, or
+// a granted client still on a stale identity); restore the same list there.
+subscribeSuperPropertiesCleared(reregisterLaunchSuperProperties);
 
 // PostHog's reset() clears the distinct id AND every registered super property,
 // but getPostHogClient() caches the singleton, so the registrations it does at
@@ -232,21 +393,24 @@ export function registerRenderSuperProperties(effective: {
 // would put it back before the next account's enrolment is read, so the
 // sign-out events of an enrolled climber would lose their arm.
 export function reset(): boolean {
-  const didReset = analytics.reset();
+  const client = getClient();
+  if (client) {
+    client.reset([]);
+    clearPosthogQueues(client);
+    notifyAnalyticsIdentityChanged();
+  }
+  const didReset = client !== null;
+  void applyPosthogConsent().catch(() => {});
   // Clear the screen gate here rather than at each sign-out call site, so a new
   // "forget this person" path cannot forget it. analytics.reset() nulls the
   // SDK's persisted SessionId, which would re-arm the gate on the next
   // getSessionId() anyway — this just makes that explicit instead of a side
   // effect a reader has to know about.
   resetScreenSessionGate();
-  const client = getClient();
   if (client) {
     registerAppSuperProperties(client);
     registerConnectivitySuperProperty(client);
-    reregisterOfflineEngineState(client);
-    reregisterActiveGym(client);
-    reregisterLowPowerMode(client);
-    reregisterConnectStepArm(client);
+    reregisterLaunchSuperProperties(client);
   }
   return didReset;
 }
@@ -265,6 +429,7 @@ export function reset(): boolean {
 // the drift would worsen the longer a session ran. It is redundant on the
 // emitting path and load-bearing on the suppressed one; keep it unconditional.
 export function trackScreen(path: string): void {
+  if (!isProductAnalyticsGranted()) return;
   if (__DEV__) console.info('[analytics] $screen', path);
   const client = getClient();
   if (!client) return;

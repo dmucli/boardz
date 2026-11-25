@@ -1,53 +1,78 @@
 import 'server-only';
 import { getDb } from '@/app/lib/db/db';
 import * as schema from '@/app/lib/db/schema';
-import { eq, and, count } from 'drizzle-orm';
+import { eq } from 'drizzle-orm';
 import { getUserBoardMappings } from '@/app/lib/auth/user-board-mappings';
+import { getServerAuthToken } from '@/app/lib/auth/server-auth';
+import { executeAuthenticatedGraphQL } from '@/app/lib/graphql/server-graphql';
 import type { UserProfile } from './utils/profile-constants';
 
-export async function getProfileData(userId: string, viewerUserId?: string): Promise<UserProfile | null> {
-  const db = getDb();
+type ProfileResponse = {
+  publicProfile: {
+    id: string;
+    displayName: string | null;
+    avatarUrl: string | null;
+    instagramUrl: string | null;
+    followerCount: number;
+    followingCount: number;
+    isFollowedByMe: boolean;
+    isPrivate: boolean;
+    canViewActivity: boolean;
+  } | null;
+};
 
-  const [users, profiles, mappings, followerCountResult, followingCountResult, followCheck] = await Promise.all([
-    db.select().from(schema.users).where(eq(schema.users.id, userId)).limit(1),
-    db.select().from(schema.userProfiles).where(eq(schema.userProfiles.userId, userId)).limit(1),
-    getUserBoardMappings(userId),
-    db.select({ count: count() }).from(schema.userFollows).where(eq(schema.userFollows.followingId, userId)),
-    db.select({ count: count() }).from(schema.userFollows).where(eq(schema.userFollows.followerId, userId)),
-    viewerUserId && viewerUserId !== userId
-      ? db
-          .select({ count: count() })
-          .from(schema.userFollows)
-          .where(and(eq(schema.userFollows.followerId, viewerUserId), eq(schema.userFollows.followingId, userId)))
-      : Promise.resolve([{ count: 0 }]),
+export type ServerProfileDataOptions = {
+  /** A supplied undefined explicitly selects an anonymous backend request. */
+  readonly authToken?: string;
+  /** Public server props never include local mappings or an owner's email. */
+  readonly publicOnly?: boolean;
+};
+
+export async function getProfileData(
+  userId: string,
+  viewerUserId?: string,
+  options: ServerProfileDataOptions = {},
+): Promise<UserProfile | null> {
+  const publicOnly = options.publicOnly === true;
+  const suppliedToken = options.authToken;
+  const authToken = publicOnly
+    ? undefined
+    : Object.hasOwn(options, 'authToken')
+      ? suppliedToken
+      : await getServerAuthToken();
+  const { publicProfile: profile } = await executeAuthenticatedGraphQL<ProfileResponse>(
+    `
+    query WebProfile($userId: ID!) {
+      publicProfile(userId: $userId) {
+        id displayName avatarUrl instagramUrl followerCount followingCount
+        isFollowedByMe isPrivate canViewActivity
+      }
+    }`,
+    { userId },
+    authToken,
+  );
+  if (!profile) return null;
+  const isOwnProfile = !publicOnly && viewerUserId === userId;
+  const [mappings, users] = await Promise.all([
+    !publicOnly && profile.canViewActivity ? getUserBoardMappings(userId) : Promise.resolve([]),
+    isOwnProfile
+      ? getDb().select({ email: schema.users.email }).from(schema.users).where(eq(schema.users.id, userId)).limit(1)
+      : Promise.resolve([]),
   ]);
-
-  if (users.length === 0) return null;
-
-  const user = users[0];
-  const profile = profiles[0] ?? null;
-  const isOwnProfile = viewerUserId === userId;
-
-  const credentials = mappings.map((m) => ({
-    boardType: m.boardType,
-    auroraUsername: m.boardUsername || '',
-  }));
-
   return {
-    id: user.id,
-    email: isOwnProfile ? (user.email ?? '') : undefined,
-    name: user.name,
-    image: user.image,
-    profile: profile
-      ? {
-          displayName: profile.displayName,
-          avatarUrl: profile.avatarUrl,
-          instagramUrl: profile.instagramUrl,
-        }
-      : null,
-    credentials,
-    followerCount: Number(followerCountResult[0]?.count || 0),
-    followingCount: Number(followingCountResult[0]?.count || 0),
-    isFollowedByMe: Number(followCheck[0]?.count || 0) > 0,
+    id: profile.id,
+    email: isOwnProfile ? (users[0]?.email ?? '') : undefined,
+    name: profile.displayName,
+    image: profile.avatarUrl,
+    profile: { displayName: profile.displayName, avatarUrl: profile.avatarUrl, instagramUrl: profile.instagramUrl },
+    credentials: mappings.map((mapping) => ({
+      boardType: mapping.boardType,
+      auroraUsername: mapping.boardUsername || '',
+    })),
+    followerCount: profile.followerCount,
+    followingCount: profile.followingCount,
+    isFollowedByMe: profile.isFollowedByMe,
+    isPrivate: profile.isPrivate,
+    canViewActivity: profile.canViewActivity,
   };
 }

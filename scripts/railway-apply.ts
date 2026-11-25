@@ -62,13 +62,14 @@
  * The disk assertion needs no extra config: it reads the volume through Railway's
  * API, which CI can reach even though ClickHouse's private DSN host it cannot.
  *
- * See docs/railway.md and infra/railway/config.ts.
+ * See docs/operations/railway.md and infra/railway/config.ts.
  */
 
 import { pathToFileURL } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   CLICKHOUSE_DATABASE,
+  CLICKHOUSE_SERVICE_NAME,
   CLICKHOUSE_VOLUME_NAME,
   OTA_SERVER_VERSION,
   desiredRailwayState,
@@ -487,6 +488,7 @@ async function fetchVariables(
     const hasVariableAssertions =
       declared.requiredVars.length > 0 ||
       (declared.forbiddenVars?.length ?? 0) > 0 ||
+      (declared.optionalVars?.length ?? 0) > 0 ||
       (declared.optionalConstrainedVars?.length ?? 0) > 0 ||
       (declared.requiredConstrainedVars?.length ?? 0) > 0 ||
       (declared.requiredOneOfVars?.length ?? 0) > 0;
@@ -1100,8 +1102,29 @@ interface AppliedDeployment {
 }
 
 export interface MainDependencies {
+  desired?: RailwayDesiredState;
   rollbackDeployment?: RollbackDeployment;
   sleep?: (milliseconds: number) => Promise<void>;
+  /** Resolves to null when the URL answers, or to the reason it did not. */
+  probePreflightUrl?: (url: string) => Promise<string | null>;
+}
+
+/**
+ * Any answer below 500 proves the host exists and serves; the status itself is
+ * not the point. A 404 passes on purpose: that is what an attached R2 custom
+ * domain answers at its root. So this catches a host that is not there, and
+ * nothing subtler. A host attached to the wrong bucket, or one that neither
+ * caches nor compresses, still passes; the curl gate in
+ * docs/operations/mobile-ota-updates.md is what covers those.
+ */
+async function defaultProbePreflightUrl(url: string): Promise<string | null> {
+  try {
+    const response = await fetch(url, { method: 'HEAD', signal: AbortSignal.timeout(15_000) });
+    await response.body?.cancel();
+    return response.status < 500 ? null : `HTTP ${response.status}`;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 /** Roll back the newest applied service first, preserving stack order. */
@@ -1204,7 +1227,7 @@ export async function main(
     return 1;
   }
 
-  const desired = desiredRailwayState;
+  const desired = dependencies.desired ?? desiredRailwayState;
   const rollbackDeployment = dependencies.rollbackDeployment ?? defaultRollbackDeployment;
   const deploymentSleep = dependencies.sleep ?? ((milliseconds: number) => delay(milliseconds));
   const supplied = collectSuppliedVars(process.env);
@@ -1219,14 +1242,23 @@ export async function main(
   }
   console.log('');
 
-  const clickhouseTtl = await fetchClickHouseTtl(process.env.CLICKHOUSE_URL?.trim(), CLICKHOUSE_DATABASE);
-  if (clickhouseTtl === null) {
+  const ownsClickHouse = desired.services.some(
+    (service) => service.name === CLICKHOUSE_SERVICE_NAME && service.management === 'managed',
+  );
+  const clickhouseTtl = ownsClickHouse
+    ? await fetchClickHouseTtl(process.env.CLICKHOUSE_URL?.trim(), CLICKHOUSE_DATABASE)
+    : null;
+  if (ownsClickHouse && clickhouseTtl === null) {
     console.log('[railway-apply] Retention check skipped: no CLICKHOUSE_URL in this environment.');
   }
 
   // Railway's API answers this even from CI, unlike ClickHouse itself.
   const volumes = await fetchVolumes(token, projectId, project.environmentId, CLICKHOUSE_VOLUME_NAME);
-  if (volumes.clickhouse === null) {
+  if (!ownsClickHouse) {
+    // Continue reading mounts for the remaining services, but ignore retained OTA
+    // disks completely: their checks now belong to the homelab deployment.
+    volumes.clickhouse = null;
+  } else if (volumes.clickhouse === null) {
     console.log(`[railway-apply] Disk check skipped: no volume named "${CLICKHOUSE_VOLUME_NAME}".`);
   } else {
     const usedPercent = (volumes.clickhouse.usedMb / volumes.clickhouse.capacityMb) * 100;
@@ -1364,6 +1396,25 @@ export async function main(
           `Refusing a multi-service apply without rollback targets for: ${withoutRollbackTarget.join(', ')}.`,
         );
       }
+    }
+  }
+
+  // Before the first write. A variable that redirects clients to another host
+  // must not be set while that host is unreachable: the post-deploy probe asks
+  // only whether the service is healthy, and it would be.
+  const probePreflightUrl = dependencies.probePreflightUrl ?? defaultProbePreflightUrl;
+  for (const change of changes) {
+    if (change.blocked || change.resource !== 'env-var' || !change.target) continue;
+    const declared = desired.services
+      .find((candidate) => candidate.name === change.target?.serviceName)
+      ?.requiredVars.find((candidate) => candidate.name === change.target?.varName);
+    if (!declared?.preflightUrl) continue;
+    const failure = await probePreflightUrl(declared.preflightUrl);
+    if (failure !== null) {
+      throw new Error(
+        `Refusing to set ${declared.name}: ${declared.preflightUrl} did not answer (${failure}). ` +
+          'Nothing was written. Bring that host up first, then re-run.',
+      );
     }
   }
 

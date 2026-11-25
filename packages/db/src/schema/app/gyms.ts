@@ -7,6 +7,8 @@ import {
   timestamp,
   doublePrecision,
   index,
+  integer,
+  primaryKey,
   uniqueIndex,
   pgEnum,
   type AnyPgColumn,
@@ -18,7 +20,11 @@ export const gymMemberRoleEnum = pgEnum('gym_member_role', ['admin', 'editor', '
 
 export const gymClaimMethodEnum = pgEnum('gym_claim_method', ['domain', 'admin']);
 
-export const gymClaimStatusEnum = pgEnum('gym_claim_status', ['pending', 'approved', 'denied', 'expired']);
+// `revoked`: an approved claim a global admin took back (`revertGymClaim`). The
+// gym went back to the SYSTEM account and the location sync curates it again;
+// readers of "an approved claim exists" (listing state, the sync's
+// owner-curated test) stop seeing it, which is the point.
+export const gymClaimStatusEnum = pgEnum('gym_claim_status', ['pending', 'approved', 'denied', 'expired', 'revoked']);
 
 /**
  * Gyms table — represents a physical gym location that can contain multiple boards.
@@ -54,11 +60,14 @@ export const gyms = pgTable(
     latitude: doublePrecision('latitude'),
     longitude: doublePrecision('longitude'),
     isPublic: boolean('is_public').default(true).notNull(),
+    // Link-accessible gyms can opt out of directory, map and feed discovery.
+    isListed: boolean('is_listed').default(true).notNull(),
     description: text('description'),
     // Opening hours as one free-text line the gym writes itself ("Mon–Fri 7–22,
     // Sat–Sun 9–20"), deliberately unstructured: a structured per-day model would
     // need a second copy kept in sync with whatever the gym already publishes, and
     // nothing syncs hours. Length is capped server-side (GymHoursSchema), not here.
+    reportingTimeZone: text('reporting_time_zone'),
     hours: text('hours'),
     // When someone with edit access last wrote `hours`. Rendered publicly as
     // "Confirmed <date>" so a schedule nobody has touched in a year reads as stale
@@ -111,6 +120,21 @@ export const gyms = pgTable(
       .on(table.mergedIntoGymId)
       .where(sql`${table.mergedIntoGymId} IS NOT NULL`),
   }),
+);
+
+/** Immutable forward observation start for the stored-record reporting contract. */
+export const gymReportingObservations = pgTable(
+  'gym_reporting_observations',
+  {
+    gymId: bigint('gym_id', { mode: 'number' })
+      .notNull()
+      .references(() => gyms.id, { onDelete: 'cascade' }),
+    contractVersion: integer('contract_version').notNull(),
+    startedAt: timestamp('started_at', { mode: 'string', withTimezone: true })
+      .notNull()
+      .default(sql`clock_timestamp()`),
+  },
+  (table) => [primaryKey({ columns: [table.gymId, table.contractVersion] })],
 );
 
 /**
@@ -203,6 +227,41 @@ export const gymClaims = pgTable(
   }),
 );
 
+/**
+ * Immutable ownership outcome for an approved claim created after this table
+ * exists. `didTransfer = false` records an approval that merely closed a claim
+ * already filed by the current owner; it is not an ownership event. Missing
+ * rows are legacy/unknown history and are intentionally not backfilled from
+ * `gym_claims.updated_at`, which cannot distinguish a transfer from a no-op.
+ *
+ * `gymUuid` is the gym identity at decision time, with no FK and no merge-time
+ * rewrite. This keeps a transfer on a duplicate from becoming a transfer on the
+ * canonical gym when claim rows are moved during a merge.
+ *
+ * `previousOwnerId` is who owned the gym just before the approval: the SYSTEM
+ * import user for an unclaimed listing. A claim admins may revert must have
+ * taken the gym from SYSTEM (docs/product/gym-claims.md, "Revert"). Null on rows
+ * written before it was recorded, which reads as unknown. Not a FK: an audit
+ * snapshot that outlives an account deletion, like `gym_owner_reassignments`.
+ */
+export const gymClaimOwnershipDecisions = pgTable(
+  'gym_claim_ownership_decisions',
+  {
+    claimId: bigint('claim_id', { mode: 'number' })
+      .primaryKey()
+      .references(() => gymClaims.id, { onDelete: 'cascade' }),
+    gymUuid: text('gym_uuid').notNull(),
+    didTransfer: boolean('did_transfer').notNull(),
+    decidedAt: timestamp('decided_at').notNull(),
+    previousOwnerId: text('previous_owner_id'),
+  },
+  (table) => ({
+    transferredHistoryIdx: index('gym_claim_ownership_decisions_transfer_history_idx')
+      .on(table.gymUuid, table.decidedAt)
+      .where(sql`${table.didTransfer}`),
+  }),
+);
+
 // Type exports
 export type Gym = typeof gyms.$inferSelect;
 export type NewGym = typeof gyms.$inferInsert;
@@ -212,3 +271,4 @@ export type GymFollow = typeof gymFollows.$inferSelect;
 export type NewGymFollow = typeof gymFollows.$inferInsert;
 export type GymClaim = typeof gymClaims.$inferSelect;
 export type NewGymClaim = typeof gymClaims.$inferInsert;
+export type GymClaimOwnershipDecision = typeof gymClaimOwnershipDecisions.$inferSelect;

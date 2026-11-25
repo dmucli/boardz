@@ -3,6 +3,7 @@ import { act, render, waitFor } from '@testing-library/react';
 import { createElement, useEffect } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { UserBoard } from '@boardsesh/shared-schema';
+import { MAX_SYNCED_QUEUE_ITEMS } from '@boardsesh/queue';
 import type { ClimbQueueItem, PlaylistSuggestionSource } from '@boardsesh/queue';
 
 // Self-contained QueueProvider harness for the LOCAL solo queue model: no
@@ -48,9 +49,9 @@ const activeBoard = vi.hoisted(() => ({
 }));
 
 const queueMutations = vi.hoisted(() => ({
-  addQueueItem: vi.fn(async () => {}),
-  removeQueueItem: vi.fn(async () => {}),
-  reorderQueueItem: vi.fn(async () => {}),
+  addQueueItem: vi.fn(async (_item: ClimbQueueItem, _position?: number) => {}),
+  removeQueueItem: vi.fn(async (_uuid: string) => {}),
+  reorderQueueItem: vi.fn(async (_uuid: string, _oldIndex: number, _newIndex: number) => {}),
   setCurrentClimb: vi.fn(async () => {}),
   mirrorCurrentClimb: vi.fn(async () => {}),
   publishPlaybackState: vi.fn(async () => {}),
@@ -66,6 +67,15 @@ const queueMutations = vi.hoisted(() => ({
   // the climber" — but the member has to exist or the provider's recovery path
   // would call undefined.
   wasUuidExplicitlyRemoved: vi.fn((_uuid: string) => false),
+}));
+const partyProfileState = vi.hoisted(() => ({
+  current: {
+    username: undefined as string | undefined,
+    avatarUrl: undefined as string | undefined,
+    authenticatedUserId: null as string | null,
+    isAuthenticated: false,
+    transportToken: 'initial-token',
+  },
 }));
 
 // Capture the deps mobile passes into the shared useQueueMutations so the
@@ -95,7 +105,10 @@ type StoredSnapshot = {
 };
 const queueSnapshotStore = vi.hoisted(() => ({
   getStoredQueueSnapshot: vi.fn(async (): Promise<StoredSnapshot | null> => null),
-  setStoredQueueSnapshot: vi.fn(async () => {}),
+  getQueueSnapshotGeneration: () => 0,
+  setStoredQueueSnapshot: vi.fn(
+    async (_snapshot: Omit<StoredSnapshot, 'savedAt'>, _owner?: unknown, _generation?: number) => {},
+  ),
   clearStoredQueueSnapshot: vi.fn(async () => {}),
 }));
 
@@ -116,7 +129,13 @@ vi.mock('react-native', () => ({
 vi.mock('expo-crypto', () => ({ randomUUID: () => 'test-correlation-id' }));
 vi.mock('@boardsesh/graphql-client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@boardsesh/graphql-client')>()),
-  execute: graph.execute,
+  // Keep capability reads separate from the JOIN mock and its sequencing assertions.
+  execute: (...args: Parameters<typeof import('@boardsesh/graphql-client').execute>) => {
+    if (args[1].query.includes('query QueueCapabilitiesProbe')) {
+      return Promise.resolve({ queueState: { fields: [] }, currentClimbChanged: { fields: [] } });
+    }
+    return graph.execute(...args);
+  },
 }));
 vi.mock('@boardsesh/queue-react', () => ({
   useQueueMutations: (deps: CapturedMutationDeps) => {
@@ -133,8 +152,9 @@ vi.mock('../../lib/session-store', () => sessionStore);
 vi.mock('../../lib/queue-snapshot-store', () => queueSnapshotStore);
 vi.mock('../../lib/active-board-store', () => ({ getStoredActiveBoard: activeBoard.getStoredActiveBoard }));
 vi.mock('../../lib/graphql/use-active-board', () => ({
+  getActiveBoardWriteGeneration: () => 0,
   useActiveBoard: () => ({ data: activeBoard.stored }),
-  useSetActiveBoard: () => vi.fn(async () => {}),
+  useSetActiveBoard: () => vi.fn(async () => true),
 }));
 vi.mock('../../lib/graphql/client', () => ({ getHttpClient: () => ({ request: http.request }) }));
 vi.mock('../../lib/analytics', () => ({ track: vi.fn(), registerRenderSuperProperties: vi.fn() }));
@@ -151,7 +171,7 @@ vi.mock('../queue/use-cross-board-add-gate', () => ({
   useCrossBoardAddGate: () => async () => ({ outcome: 'add' }),
 }));
 vi.mock('../party-profile-provider', () => ({
-  usePartyProfile: () => ({ username: undefined, avatarUrl: undefined }),
+  usePartyProfile: () => partyProfileState.current,
 }));
 
 // The board continuation feed (the re-anchor after a board switch) is a React
@@ -167,42 +187,85 @@ vi.mock('../queue/use-reachable-board-keys', () => ({
   useReachableBoardKeys: () => new Set<string>(),
 }));
 
-import { QueueProvider, usePlaylistSuggestionSource, useQueue } from '../queue-provider';
+import { QueueProvider, usePlaylistSuggestionSource, useQueue, useQueueSessionId } from '../queue-provider';
+import { track } from '../../lib/analytics';
+import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { restTimerControlGeneration } from '../../lib/rest-timer-foreground-state';
 
 type Snapshot = {
   state: ReturnType<typeof useQueue>['state'];
+  dispatch: ReturnType<typeof useQueue>['dispatch'];
   sessionId: string | null;
   playlistSuggestionSource: PlaylistSuggestionSource | null;
   addToQueue: ReturnType<typeof useQueue>['addToQueue'];
   setCurrentClimb: ReturnType<typeof useQueue>['setCurrentClimb'];
-  appendGeneratedSession: ReturnType<typeof useQueue>['appendGeneratedSession'];
+  nextClimb: ReturnType<typeof useQueue>['nextClimb'];
+  previousClimb: ReturnType<typeof useQueue>['previousClimb'];
+  appendQueueItems: ReturnType<typeof useQueue>['appendQueueItems'];
+  clearQueue: ReturnType<typeof useQueue>['clearQueue'];
+  removeQueueItems: ReturnType<typeof useQueue>['removeQueueItems'];
+  restoreQueueItems: ReturnType<typeof useQueue>['restoreQueueItems'];
+  undoScope: string;
+  setQueue: ReturnType<typeof useQueue>['setQueue'];
+  removeFromQueue: ReturnType<typeof useQueue>['removeFromQueue'];
+  playNext: ReturnType<typeof useQueue>['playNext'];
   startSession: ReturnType<typeof useQueue>['startSession'];
   joinSession: ReturnType<typeof useQueue>['joinSession'];
+  lastCurrentChange: ReturnType<typeof useQueue>['lastCurrentChange'];
+  mirrorCurrentClimb: ReturnType<typeof useQueue>['mirrorCurrentClimb'];
+  getQueueSnapshot: ReturnType<typeof useQueue>['getQueueSnapshot'];
 };
 
 function Probe({ onSnapshot }: { onSnapshot: (snapshot: Snapshot) => void }) {
   const queue = useQueue();
+  const { undoScope } = useQueueSessionId();
   const playlistSuggestionSource = usePlaylistSuggestionSource();
   useEffect(() => {
     onSnapshot({
       state: queue.state,
+      dispatch: queue.dispatch,
       sessionId: queue.sessionId,
       playlistSuggestionSource,
       addToQueue: queue.addToQueue,
       setCurrentClimb: queue.setCurrentClimb,
-      appendGeneratedSession: queue.appendGeneratedSession,
+      nextClimb: queue.nextClimb,
+      previousClimb: queue.previousClimb,
+      appendQueueItems: queue.appendQueueItems,
+      clearQueue: queue.clearQueue,
+      removeQueueItems: queue.removeQueueItems,
+      restoreQueueItems: queue.restoreQueueItems,
+      undoScope,
+      setQueue: queue.setQueue,
+      removeFromQueue: queue.removeFromQueue,
+      playNext: queue.playNext,
       startSession: queue.startSession,
       joinSession: queue.joinSession,
+      lastCurrentChange: queue.lastCurrentChange,
+      mirrorCurrentClimb: queue.mirrorCurrentClimb,
+      getQueueSnapshot: queue.getQueueSnapshot,
     });
   }, [
     queue.state,
+    queue.dispatch,
     queue.sessionId,
     playlistSuggestionSource,
     queue.addToQueue,
     queue.setCurrentClimb,
-    queue.appendGeneratedSession,
+    queue.nextClimb,
+    queue.previousClimb,
+    queue.appendQueueItems,
+    queue.clearQueue,
+    queue.removeQueueItems,
+    queue.restoreQueueItems,
+    undoScope,
+    queue.setQueue,
+    queue.removeFromQueue,
+    queue.playNext,
     queue.startSession,
     queue.joinSession,
+    queue.lastCurrentChange,
+    queue.mirrorCurrentClimb,
+    queue.getQueueSnapshot,
     onSnapshot,
   ]);
   return null;
@@ -239,8 +302,52 @@ const storedSnapshot = (items: ClimbQueueItem[], current: ClimbQueueItem | null)
   savedAt: '2026-06-10T00:00:00.000Z',
 });
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function queueStateResponse(queue: ClimbQueueItem[], sequence: number, stateHash: string) {
+  return {
+    session: {
+      queueState: {
+        queue,
+        currentClimbQueueItem: null,
+        sequence,
+        stateHash,
+        stateHashOrdered: null,
+      },
+    },
+  };
+}
+
+async function renderRestoredSession(snapshots: Snapshot[]) {
+  sessionStore.getStoredSessionId.mockResolvedValue('session-1');
+  http.request.mockImplementation((operation: string) =>
+    operation.includes('SessionStatus')
+      ? Promise.resolve({ sessionStatus: 'active' })
+      : Promise.resolve({ createSession: { id: 'session-new' } }),
+  );
+  queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(null);
+  const rendered = renderProvider((snapshot) => snapshots.push(snapshot));
+  await waitFor(() => expect(snapshots.at(-1)?.sessionId).toBe('session-1'));
+  return rendered;
+}
+
 describe('QueueProvider local solo queue', () => {
   beforeEach(() => {
+    partyProfileState.current = {
+      username: undefined,
+      avatarUrl: undefined,
+      authenticatedUserId: null,
+      isAuthenticated: false,
+      transportToken: 'initial-token',
+    };
     ws.client.on.mockClear();
     ws.client.subscribe.mockClear();
     capturedMutationDeps.current = null;
@@ -278,6 +385,105 @@ describe('QueueProvider local solo queue', () => {
     });
     http.request.mockReset();
     http.request.mockResolvedValue({ createSession: { id: 'session-new' } });
+  });
+
+  it('invalidates pending timer work on manual navigation but preserves automatic advancement', async () => {
+    const first = makeQueueItem('timer-first');
+    const second = makeQueueItem('timer-second');
+    const third = makeQueueItem('timer-third');
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([first, second, third], first));
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(first.uuid));
+    const beforeManual = restTimerControlGeneration();
+    act(() => snapshots.at(-1)?.nextClimb());
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(second.uuid);
+    expect(restTimerControlGeneration()).not.toBe(beforeManual);
+    const beforeAutomatic = restTimerControlGeneration();
+    act(() => snapshots.at(-1)?.nextClimb('rest_timer'));
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(third.uuid);
+    expect(restTimerControlGeneration()).toBe(beforeAutomatic);
+    act(() => snapshots.at(-1)?.previousClimb());
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(second.uuid);
+    expect(restTimerControlGeneration()).not.toBe(beforeAutomatic);
+    const beforeSelection = restTimerControlGeneration();
+    act(() => snapshots.at(-1)?.setCurrentClimb(first));
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(first.uuid);
+    expect(restTimerControlGeneration()).not.toBe(beforeSelection);
+  });
+
+  it('saves solo flips per occurrence before navigation, including explicit false', async () => {
+    const original = makeQueueItem('first-occurrence', 'same-climb');
+    const repeat = makeQueueItem('second-occurrence', 'same-climb');
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([original, repeat], original));
+    const snapshots: Snapshot[] = [];
+    const rendered = renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(original.uuid));
+    const controls = snapshots.at(-1)!;
+    act(() => {
+      void controls.mirrorCurrentClimb(true, original.uuid);
+      expect(controls.getQueueSnapshot().currentClimbQueueItem?.climb.mirrored).toBe(true);
+      controls.setCurrentClimb(repeat);
+    });
+    await waitFor(() => expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(repeat.uuid));
+    expect(snapshots.at(-1)?.state.queue.find((item) => item.uuid === original.uuid)?.climb.mirrored).toBe(true);
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.climb.mirrored).not.toBe(true);
+    let rejected: boolean | undefined;
+    await act(async () => {
+      rejected = await controls.mirrorCurrentClimb(false, original.uuid);
+    });
+    expect(rejected).toBe(false);
+    act(() =>
+      snapshots.at(-1)?.setCurrentClimb(snapshots.at(-1)!.state.queue.find((item) => item.uuid === original.uuid)!),
+    );
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.climb.mirrored).toBe(true);
+    await act(async () => {
+      await controls.mirrorCurrentClimb(false, original.uuid);
+    });
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.climb.mirrored).toBe(false);
+    await waitFor(() =>
+      expect(queueSnapshotStore.setStoredQueueSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({
+          queue: expect.arrayContaining([
+            expect.objectContaining({ uuid: original.uuid, climb: expect.objectContaining({ mirrored: false }) }),
+          ]),
+        }),
+        null,
+        expect.any(Number),
+      ),
+    );
+    expect(queueMutations.mirrorCurrentClimb).not.toHaveBeenCalled();
+    const saved = queueSnapshotStore.setStoredQueueSnapshot.mock.calls.at(-1)?.[0];
+    if (!saved) throw new Error('Solo queue was not persisted');
+    rendered.unmount();
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue({ ...saved, savedAt: new Date().toISOString() });
+    const restored: Snapshot[] = [];
+    renderProvider((snapshot) => restored.push(snapshot));
+    await waitFor(() => expect(restored.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(original.uuid));
+    expect(restored.at(-1)?.state.currentClimbQueueItem?.climb.mirrored).toBe(false);
+    expect(restored.at(-1)?.state.queue.find((item) => item.uuid === repeat.uuid)?.climb.mirrored).not.toBe(true);
+  });
+
+  it('keeps a current-only solo flip when now-slot navigation files it into history', async () => {
+    const current = makeQueueItem('current-only', 'current-climb');
+    const next = makeQueueItem('next-slot', 'next-climb');
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([], current));
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(current.uuid));
+    act(() => snapshots.at(-1)?.dispatch({ type: 'SET_NOW_SLOT_MODE', payload: true }));
+    expect(snapshots.at(-1)?.state.nowSlotMode).toBe(true);
+    const controls = snapshots.at(-1)!;
+    act(() => {
+      void controls.mirrorCurrentClimb(true, current.uuid);
+      controls.dispatch({
+        type: 'DELTA_UPDATE_CURRENT_CLIMB',
+        payload: { item: next, shouldAddToQueue: true, placement: 'NOW' },
+      });
+    });
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe(next.uuid);
+    const historical = snapshots.at(-1)?.state.queue.find((item) => item.uuid === current.uuid);
+    expect(historical?.climb.mirrored).toBe(true);
   });
 
   it('hydrates the stored solo queue snapshot when no session restores', async () => {
@@ -344,6 +550,34 @@ describe('QueueProvider local solo queue', () => {
     });
     expect(snapshots.at(-1)?.sessionId).toBeNull();
     expect(http.request).not.toHaveBeenCalled();
+  });
+
+  // #4979: opening the climb already current is the climber asking for it, so
+  // it restarts the hold's clock even though the current uuid does not move.
+  it('restarts the hold clock when the current climb is opened again, and only then', async () => {
+    const itemA = makeQueueItem('item-a');
+    const itemB = makeQueueItem('item-b');
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA, itemB], itemA));
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    // An older snapshot without the field seeds from `savedAt`, months ago.
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.lastCurrentChange).toEqual({
+        queueItemUuid: 'item-a',
+        changedAt: Date.parse('2026-06-10T00:00:00.000Z'),
+      });
+    });
+
+    const beforeOpen = Date.now();
+    act(() => {
+      snapshots.at(-1)?.setCurrentClimb(itemA);
+    });
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.lastCurrentChange.queueItemUuid).toBe('item-a');
+      expect(snapshots.at(-1)?.lastCurrentChange.changedAt).toBeGreaterThanOrEqual(beforeOpen);
+    });
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('item-a');
   });
 
   it('inserts an activated new climb right after the current climb, not at the end (issue #2217)', async () => {
@@ -567,7 +801,7 @@ describe('QueueProvider local solo queue', () => {
     expect(queueSnapshotStore.clearStoredQueueSnapshot).toHaveBeenCalled();
   });
 
-  it('appendGeneratedSession keeps the current climb and the hand-queued climbs around it', async () => {
+  it('appendQueueItems keeps the current climb and the hand-queued climbs around it', async () => {
     // Mid-project: working "item-b", with "item-c" queued up next by hand.
     const itemA = makeQueueItem('item-a');
     const itemB = makeQueueItem('item-b');
@@ -581,7 +815,7 @@ describe('QueueProvider local solo queue', () => {
     });
 
     act(() => {
-      snapshots.at(-1)?.appendGeneratedSession([makeQueueItem('gen-1'), makeQueueItem('gen-2')]);
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2')]);
     });
 
     await waitFor(() => {
@@ -600,7 +834,31 @@ describe('QueueProvider local solo queue', () => {
     expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toContain('item-c');
   });
 
-  it('appendGeneratedSession opens on the first generated climb when nothing is current', async () => {
+  it('appendQueueItems leaves the current pointer null by default when nothing is current', async () => {
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.length).toBeGreaterThan(0);
+    });
+
+    queueMutations.setQueue.mockClear();
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2')]);
+    });
+
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['gen-1', 'gen-2']);
+    });
+    // Default is "don't take the wall": the playlist "Add to queue" row lands
+    // here, and an add must never activate a climb the climber didn't tap.
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem).toBeNull();
+    // And it must not reach the wire as a whole-queue replace — an absent
+    // currentClimbQueueItem is how the resolver is told to CLEAR the session's
+    // current climb, which would blank every peer's wall.
+    expect(queueMutations.setQueue).not.toHaveBeenCalled();
+  });
+
+  it('appendQueueItems with activateFirstWhenIdle opens on the first item when nothing is current', async () => {
     const snapshots: Snapshot[] = [];
     renderProvider((snapshot) => snapshots.push(snapshot));
     await waitFor(() => {
@@ -608,19 +866,22 @@ describe('QueueProvider local solo queue', () => {
     });
 
     act(() => {
-      snapshots.at(-1)?.appendGeneratedSession([makeQueueItem('gen-1'), makeQueueItem('gen-2')]);
+      snapshots
+        .at(-1)
+        ?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2')], { activateFirstWhenIdle: true });
     });
 
     await waitFor(() => {
       expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['gen-1', 'gen-2']);
     });
+    // The workout generator's contract, unchanged: starting a generated session
+    // opens on its first climb.
     expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('gen-1');
   });
 
-  it('appendGeneratedSession opens on the first generated climb when the queue has items but none is current', async () => {
-    // Browsed climbs into the queue without activating any of them. There's no
-    // wall to protect, so the session opens on its own first climb rather than
-    // silently activating something the user only ever queued.
+  it('appendQueueItems leaves the pointer null when the queue has items but none is current', async () => {
+    // Browsed climbs into the queue without activating any of them. An append
+    // adds behind them and still activates nothing.
     const itemA = makeQueueItem('item-a');
     queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA], null));
 
@@ -632,16 +893,1432 @@ describe('QueueProvider local solo queue', () => {
     expect(snapshots.at(-1)?.state.currentClimbQueueItem).toBeNull();
 
     act(() => {
-      snapshots.at(-1)?.appendGeneratedSession([makeQueueItem('gen-1'), makeQueueItem('gen-2')]);
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2')]);
     });
 
     await waitFor(() => {
       expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['item-a', 'gen-1', 'gen-2']);
     });
-    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('gen-1');
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem).toBeNull();
   });
 
-  it('appendGeneratedSession leaves an empty generated list alone', async () => {
+  it('appendQueueItems with activateFirstWhenIdle opens on the first item when the queue has items but none is current', async () => {
+    const itemA = makeQueueItem('item-a');
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA], null));
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['item-a']);
+    });
+
+    act(() => {
+      snapshots
+        .at(-1)
+        ?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2')], { activateFirstWhenIdle: true });
+    });
+
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('gen-1');
+    });
+    expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['item-a', 'gen-1', 'gen-2']);
+  });
+
+  it('appendQueueItems broadcasts per-item adds (never a pointer-clearing setQueue) when nothing is current', async () => {
+    // The whole reason the no-pointer branch exists: `Mutation.setQueue` reads an
+    // absent currentClimbQueueItem as "clear it" and writes null into shared
+    // session state, so an ADDITIVE action would wipe the crew's current climb.
+    // ADD_QUEUE_ITEM carries no pointer at all.
+    sessionStore.getStoredSessionId.mockResolvedValue('session-1');
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('SessionStatus')
+        ? Promise.resolve({ sessionStatus: 'active' })
+        : Promise.resolve({ createSession: { id: 'session-new' } }),
+    );
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(null);
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.sessionId).toBe('session-1');
+    });
+
+    queueMutations.setQueue.mockClear();
+    queueMutations.addQueueItem.mockClear();
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2')]);
+    });
+
+    await waitFor(() => {
+      expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(2);
+    });
+    expect(queueMutations.setQueue).not.toHaveBeenCalled();
+    expect(queueMutations.addQueueItem.mock.calls.map(([item]) => item.uuid)).toEqual(['gen-1', 'gen-2']);
+  });
+
+  it('appendQueueItems drains the per-item adds sequentially and in playlist order', async () => {
+    // The backend wraps every addQueueItem in withQueueVersionRetry around a
+    // single-key Redis CAS — 3 attempts, no backoff, no jitter. Firing them
+    // concurrently means most of a batch exhausts its retries: peers get a
+    // fraction of the playlist, in CAS-resolution order rather than playlist
+    // order (no `position` is sent), and the ordered-hash watchdog then collapses
+    // THIS device's queue to whatever landed. The mock below fails the test if a
+    // second send starts before the first resolves, so the concurrent form cannot
+    // pass this.
+    sessionStore.getStoredSessionId.mockResolvedValue('session-1');
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('SessionStatus')
+        ? Promise.resolve({ sessionStatus: 'active' })
+        : Promise.resolve({ createSession: { id: 'session-new' } }),
+    );
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(null);
+
+    let inFlight = 0;
+    let sawOverlap = false;
+    const releases: Array<() => void> = [];
+    queueMutations.addQueueItem.mockImplementation(async () => {
+      if (inFlight > 0) sawOverlap = true;
+      inFlight += 1;
+      await new Promise<void>((resolve) => releases.push(resolve));
+      inFlight -= 1;
+    });
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.sessionId).toBe('session-1');
+    });
+
+    queueMutations.addQueueItem.mockClear();
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2'), makeQueueItem('gen-3')]);
+    });
+
+    // Only the first send may be open; the rest wait their turn.
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    for (let step = 0; step < 3; step += 1) {
+      await act(async () => {
+        releases.shift()?.();
+      });
+    }
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(3));
+    expect(sawOverlap).toBe(false);
+    // Sequential sends also fix the order: the server appends, so the wire order
+    // IS the playlist order.
+    expect(queueMutations.addQueueItem.mock.calls.map(([item]) => item.uuid)).toEqual(['gen-1', 'gen-2', 'gen-3']);
+    // Locally the whole batch was already there from the first frame.
+    expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['gen-1', 'gen-2', 'gen-3']);
+  });
+
+  it('keeps separate append batches in tap order on one serialized lane', async () => {
+    const snapshots: Snapshot[] = [];
+    await renderRestoredSession(snapshots);
+
+    const firstSend = deferred<void>();
+    const secondSend = deferred<void>();
+    const thirdSend = deferred<void>();
+    const gates = new Map([
+      ['batch-a-1', firstSend],
+      ['batch-a-2', secondSend],
+      ['batch-b-1', thirdSend],
+    ]);
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      const gate = gates.get(item.uuid);
+      if (gate) await gate.promise;
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('batch-a-1'), makeQueueItem('batch-a-2')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('batch-b-1'), makeQueueItem('batch-b-2')]));
+
+    await act(async () => firstSend.resolve());
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(2));
+    await act(async () => secondSend.resolve());
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(3));
+    await act(async () => thirdSend.resolve());
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(4));
+
+    expect(queueMutations.addQueueItem.mock.calls.map(([item]) => item.uuid)).toEqual([
+      'batch-a-1',
+      'batch-a-2',
+      'batch-b-1',
+      'batch-b-2',
+    ]);
+  });
+
+  it('honors an explicit removal before sending a queued append item', async () => {
+    const snapshots: Snapshot[] = [];
+    await renderRestoredSession(snapshots);
+
+    const firstSend = deferred<void>();
+    const explicitlyRemoved = new Set<string>();
+    queueMutations.wasUuidExplicitlyRemoved.mockImplementation((uuid) => explicitlyRemoved.has(uuid));
+    queueMutations.removeQueueItem.mockImplementation(async (uuid) => {
+      explicitlyRemoved.add(uuid);
+    });
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      if (item.uuid === 'keep-sending') await firstSend.promise;
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('keep-sending'), makeQueueItem('remove-before-send')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    act(() => snapshots.at(-1)?.removeFromQueue('remove-before-send'));
+    await act(async () => firstSend.resolve());
+
+    await waitFor(() => expect(queueMutations.removeQueueItem).toHaveBeenCalledWith('remove-before-send'));
+    expect(queueMutations.addQueueItem.mock.calls.map(([item]) => item.uuid)).toEqual(['keep-sending']);
+  });
+
+  it('keeps an append alive when a FullSync alone removes it from the local snapshot', async () => {
+    const snapshots: Snapshot[] = [];
+    await renderRestoredSession(snapshots);
+    const firstSend = deferred<void>();
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      if (item.uuid === 'snapshot-first') await firstSend.promise;
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('snapshot-first'), makeQueueItem('snapshot-second')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    act(() => {
+      snapshots.at(-1)?.dispatch({
+        type: 'INITIAL_QUEUE_DATA',
+        payload: { queue: [], currentClimbQueueItem: null },
+      });
+    });
+    await act(async () => firstSend.resolve());
+
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(2));
+    expect(queueMutations.addQueueItem.mock.calls.map(([item]) => item.uuid)).toEqual([
+      'snapshot-first',
+      'snapshot-second',
+    ]);
+    expect(queueMutations.wasUuidExplicitlyRemoved).toHaveBeenCalledWith('snapshot-second');
+  });
+
+  it.each(['clear', 'bulk', 'coalesced bulk', 'first profile resolution bulk'] as const)(
+    'ignores a delayed pre-Undo snapshot after partially failed %s removal',
+    async (removal) => {
+      const snapshots: Snapshot[] = [];
+      let rendered: ReturnType<typeof renderProvider>;
+      if (removal === 'first profile resolution bulk') {
+        partyProfileState.current = { ...partyProfileState.current, isAuthenticated: true };
+        rendered = renderProvider((snapshot) => snapshots.push(snapshot));
+        // Persisted sessions wait for a known storage owner. An explicit join
+        // can still finish while the profile loads, leaving the failed removal
+        // below with the null-identity origin this regression exercises.
+        await act(async () => {
+          await snapshots.at(-1)?.joinSession('session-1', {
+            boardPath: '/kilter/1/10/1,2/40/list',
+            userBoard: activeBoard.stored,
+          });
+        });
+        expect(snapshots.at(-1)?.sessionId).toBe('session-1');
+        expect(partyProfileState.current.authenticatedUserId).toBeNull();
+      } else {
+        rendered = await renderRestoredSession(snapshots);
+      }
+      const first = makeQueueItem('first');
+      const second = makeQueueItem('second');
+      const kept = makeQueueItem('kept');
+      const peer = makeQueueItem('peer-added');
+      const removedProbe = makeQueueItem('earlier-failed-removal');
+      act(() =>
+        snapshots.at(-1)?.dispatch({
+          type: 'INITIAL_QUEUE_DATA',
+          payload: {
+            queue:
+              removal !== 'clear' && removal !== 'bulk' ? [removedProbe, first, second, kept] : [first, second, kept],
+            currentClimbQueueItem: null,
+          },
+        }),
+      );
+      const before = { queue: [first, second, kept], currentClimbQueueItem: null };
+      const heldSnapshot = deferred<unknown>();
+      http.request.mockImplementation((operation: string) =>
+        operation.includes('GetSessionQueueState')
+          ? heldSnapshot.promise
+          : Promise.resolve({ sessionStatus: 'active' }),
+      );
+      queueMutations.removeQueueItem.mockImplementation(async (uuid) => {
+        if (uuid === second.uuid || uuid === removedProbe.uuid) throw new Error('partial removal failed');
+      });
+      if (removal !== 'clear' && removal !== 'bulk') {
+        act(() => snapshots.at(-1)?.removeFromQueue(removedProbe.uuid));
+        await waitFor(() =>
+          expect(
+            http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState')),
+          ).toBe(true),
+        );
+      }
+      if (removal === 'first profile resolution bulk') {
+        partyProfileState.current = { ...partyProfileState.current, authenticatedUserId: 'account-a' };
+        rendered.rerender(
+          createElement(
+            QueueProvider,
+            null,
+            createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) }),
+          ),
+        );
+      }
+      act(() => {
+        const current = snapshots.at(-1)!;
+        if (removal === 'clear') current.clearQueue();
+        else current.removeQueueItems([first.uuid, second.uuid]);
+      });
+      await waitFor(() =>
+        expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+          true,
+        ),
+      );
+      act(() => snapshots.at(-1)?.dispatch({ type: 'DELTA_ADD_QUEUE_ITEM', payload: { item: peer } }));
+      const removedUuids = new Set(
+        removal === 'clear' ? [first.uuid, second.uuid, kept.uuid] : [first.uuid, second.uuid],
+      );
+      act(() => {
+        const current = snapshots.at(-1)!;
+        current.restoreQueueItems(before, removedUuids, current.undoScope);
+      });
+      await waitFor(() => expect(queueMutations.setQueue).toHaveBeenCalledOnce());
+      expect(queueMutations.setQueue.mock.calls[0][0].map((item) => item.uuid)).toEqual([
+        'first',
+        'second',
+        'kept',
+        'peer-added',
+      ]);
+      // This HTTP snapshot was captured before Undo; it must not overwrite the
+      // restored queue or the crew's added climb when it arrives afterwards.
+      await act(async () =>
+        heldSnapshot.resolve(
+          queueStateResponse(removal === 'clear' ? [second] : [second, kept], 101, 'pre-undo-partial-removal'),
+        ),
+      );
+      expect(snapshots.at(-1)?.state.queue.map((item) => item.uuid)).toEqual(['first', 'second', 'kept', 'peer-added']);
+      expect(queueMutations.setQueue).toHaveBeenCalledOnce();
+      expect(toast.showToast).not.toHaveBeenCalledWith('mobile.queue.outOfSyncRefreshed', 'error');
+      // Coalesced failures must not restart a trailing stale read after Undo.
+      expect(
+        http.request.mock.calls.filter(([operation]) => String(operation).includes('GetSessionQueueState')),
+      ).toHaveLength(removal === 'first profile resolution bulk' ? 2 : 1);
+    },
+  );
+
+  it('serializes clear behind the active send and cancels the unsent tail', async () => {
+    const snapshots: Snapshot[] = [];
+    await renderRestoredSession(snapshots);
+    const firstSend = deferred<void>();
+    const events: string[] = [];
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      events.push(`add:${item.uuid}`);
+      if (item.uuid === 'clear-first') await firstSend.promise;
+    });
+    queueMutations.removeQueueItem.mockImplementation(async (uuid) => {
+      events.push(`remove:${uuid}`);
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('clear-first'), makeQueueItem('clear-tail')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(snapshots.at(-1)?.state.queue).toHaveLength(2));
+    act(() => snapshots.at(-1)?.clearQueue());
+    await act(async () => firstSend.resolve());
+
+    await waitFor(() => expect(queueMutations.removeQueueItem).toHaveBeenCalledTimes(2));
+    expect(events).toEqual(['add:clear-first', 'remove:clear-first', 'remove:clear-tail']);
+    expect(queueMutations.addQueueItem.mock.calls.map(([item]) => item.uuid)).toEqual(['clear-first']);
+  });
+
+  // The queue sheet clears from two controls: the edit mode's Clear and the
+  // header's ⋯ → Clear queue. Both run the same clear; only the event says which.
+  it.each([
+    { options: undefined, source: 'edit' },
+    { options: { source: 'edit' as const }, source: 'edit' },
+    { options: { source: 'menu' as const }, source: 'menu' },
+  ])('tags Queue Cleared with source $source and clears the same way', async ({ options, source }) => {
+    const itemA = makeQueueItem('tag-a');
+    const itemB = makeQueueItem('tag-b');
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA, itemB], itemA));
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => expect(snapshots.at(-1)?.state.queue).toHaveLength(2));
+
+    vi.mocked(track).mockClear();
+    act(() => snapshots.at(-1)?.clearQueue(options));
+
+    const cleared = vi.mocked(track).mock.calls.filter(([event]) => event === SHARED_EVENTS.QueueCleared);
+    expect(cleared).toEqual([[SHARED_EVENTS.QueueCleared, expect.objectContaining({ totalCount: 2, source })]]);
+    // The reducer's clear takes the current climb with it, from either control.
+    expect(snapshots.at(-1)?.state.queue).toEqual([]);
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem).toBeNull();
+  });
+
+  it('serializes replacement behind an active send and cancels the unsent tail', async () => {
+    const snapshots: Snapshot[] = [];
+    await renderRestoredSession(snapshots);
+    const firstSend = deferred<void>();
+    const events: string[] = [];
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      events.push(`add:${item.uuid}`);
+      if (item.uuid === 'replace-first') await firstSend.promise;
+    });
+    queueMutations.setQueue.mockImplementation(async (queue) => {
+      events.push(`set:${queue.map((item) => item.uuid).join(',')}`);
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('replace-first'), makeQueueItem('replace-tail')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    const replacement = makeQueueItem('replacement');
+    act(() => snapshots.at(-1)?.setQueue([replacement], replacement));
+    await act(async () => firstSend.resolve());
+
+    await waitFor(() => expect(queueMutations.setQueue).toHaveBeenCalledTimes(1));
+    expect(events).toEqual(['add:replace-first', 'set:replacement']);
+    expect(queueMutations.addQueueItem.mock.calls.map(([item]) => item.uuid)).toEqual(['replace-first']);
+    expect(snapshots.at(-1)?.state.queue.map((item) => item.uuid)).toEqual(['replacement']);
+  });
+
+  it('starts new-room work without waiting for the old send and ignores its stale error', async () => {
+    const snapshots: Snapshot[] = [];
+    await renderRestoredSession(snapshots);
+    const oldSend = deferred<void>();
+    const calls: string[] = [];
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      calls.push(item.uuid);
+      if (item.uuid === 'old-room-first') await oldSend.promise;
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('old-room-first'), makeQueueItem('old-room-tail')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await snapshots.at(-1)?.joinSession('session-2', {
+        boardPath: '/kilter/1/10/1,2/40/list',
+        userBoard: activeBoard.stored,
+      });
+    });
+    await waitFor(() => expect(snapshots.at(-1)?.sessionId).toBe('session-2'));
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('new-room-first')]));
+    await waitFor(() => expect(calls).toContain('new-room-first'));
+    http.request.mockClear();
+
+    await act(async () => oldSend.reject(new Error('old session transport failed')));
+    await waitFor(() =>
+      expect(snapshots.at(-1)?.state.queue.some((item) => item.uuid === 'new-room-first')).toBe(true),
+    );
+    expect(calls).toEqual(['old-room-first', 'new-room-first']);
+    expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+      false,
+    );
+  });
+
+  it('keeps valid tail items on a same-account profile refresh and uses the live transport', async () => {
+    partyProfileState.current = {
+      username: undefined,
+      avatarUrl: undefined,
+      authenticatedUserId: 'account-a',
+      isAuthenticated: true,
+      transportToken: 'token-before-refresh',
+    };
+    const snapshots: Snapshot[] = [];
+    const rendered = await renderRestoredSession(snapshots);
+    const firstSend = deferred<void>();
+    const calls: Array<{ uuid: string; token: string }> = [];
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      calls.push({ uuid: item.uuid, token: partyProfileState.current.transportToken });
+      if (item.uuid === 'refresh-first') await firstSend.promise;
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('refresh-first'), makeQueueItem('refresh-tail')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      transportToken: 'token-after-refresh',
+    };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: null,
+      transportToken: 'token-during-profile-reload',
+    };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: 'account-a',
+      transportToken: 'token-after-profile-reload',
+    };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    await act(async () => firstSend.resolve());
+
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(2));
+    expect(calls).toEqual([
+      { uuid: 'refresh-first', token: 'token-before-refresh' },
+      { uuid: 'refresh-tail', token: 'token-after-profile-reload' },
+    ]);
+  });
+
+  it('resets account-bound queued work when the stable authenticated user changes', async () => {
+    partyProfileState.current = {
+      username: undefined,
+      avatarUrl: undefined,
+      authenticatedUserId: 'account-a',
+      isAuthenticated: true,
+      transportToken: 'account-a-token',
+    };
+    const snapshots: Snapshot[] = [];
+    const rendered = await renderRestoredSession(snapshots);
+    const oldSend = deferred<void>();
+    const calls: string[] = [];
+    queueMutations.addQueueItem.mockImplementation(async (item) => {
+      calls.push(`${partyProfileState.current.authenticatedUserId}:${item.uuid}`);
+      if (item.uuid === 'account-a-first') await oldSend.promise;
+    });
+
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-a-first'), makeQueueItem('account-a-tail')]));
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: 'account-b',
+      transportToken: 'account-b-token',
+    };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    act(() => snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-b-first')]));
+    await waitFor(() => expect(calls).toContain('account-b:account-b-first'));
+
+    await act(async () => oldSend.resolve());
+    expect(calls).toEqual(['account-a:account-a-first', 'account-b:account-b-first']);
+  });
+
+  it('does not apply account A failure reconciliation after account B appends in the same room', async () => {
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: 'account-a',
+      isAuthenticated: true,
+    };
+    const snapshots: Snapshot[] = [];
+    const rendered = await renderRestoredSession(snapshots);
+    const heldSnapshot = deferred<unknown>();
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('GetSessionQueueState') ? heldSnapshot.promise : Promise.resolve({ sessionStatus: 'active' }),
+    );
+    queueMutations.addQueueItem.mockRejectedValueOnce(new Error('account A send failed'));
+
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-a-failed')]);
+    });
+    await waitFor(() =>
+      expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+        true,
+      ),
+    );
+
+    partyProfileState.current = { ...partyProfileState.current, authenticatedUserId: 'account-b' };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-b-fresh')]);
+    });
+    await waitFor(() =>
+      expect(snapshots.at(-1)?.state.queue.some((item) => item.uuid === 'account-b-fresh')).toBe(true),
+    );
+
+    await act(async () =>
+      heldSnapshot.resolve({
+        session: {
+          queueState: {
+            queue: [],
+            currentClimbQueueItem: null,
+            sequence: 100,
+            stateHash: 'account-a-empty-snapshot',
+            stateHashOrdered: null,
+          },
+        },
+      }),
+    );
+
+    expect(snapshots.at(-1)?.state.queue.some((item) => item.uuid === 'account-b-fresh')).toBe(true);
+    expect(toast.showToast).not.toHaveBeenCalledWith('mobile.queue.outOfSyncRefreshed', 'error');
+  });
+
+  it('cancels a held failure reconciliation across an account A to B to A transition', async () => {
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: 'account-a',
+      isAuthenticated: true,
+    };
+    const snapshots: Snapshot[] = [];
+    const rendered = await renderRestoredSession(snapshots);
+    const heldSnapshot = deferred<unknown>();
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('GetSessionQueueState') ? heldSnapshot.promise : Promise.resolve({ sessionStatus: 'active' }),
+    );
+    queueMutations.addQueueItem.mockRejectedValueOnce(new Error('account A send failed'));
+
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-a-pending')]);
+    });
+    await waitFor(() =>
+      expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+        true,
+      ),
+    );
+
+    for (const authenticatedUserId of ['account-b', 'account-a']) {
+      partyProfileState.current = { ...partyProfileState.current, authenticatedUserId };
+      rendered.rerender(
+        createElement(
+          QueueProvider,
+          null,
+          createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) }),
+        ),
+      );
+    }
+    await act(async () => heldSnapshot.resolve(queueStateResponse([], 101, 'stale-account-a')));
+
+    expect(snapshots.at(-1)?.state.queue.map((item) => item.uuid)).toContain('account-a-pending');
+    expect(toast.showToast).not.toHaveBeenCalledWith('mobile.queue.outOfSyncRefreshed', 'error');
+  });
+
+  it('ignores a held authenticated reconciliation after signout', async () => {
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: 'signed-in-account',
+      isAuthenticated: true,
+    };
+    const snapshots: Snapshot[] = [];
+    const rendered = await renderRestoredSession(snapshots);
+    const heldSnapshot = deferred<unknown>();
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('GetSessionQueueState') ? heldSnapshot.promise : Promise.resolve({ sessionStatus: 'active' }),
+    );
+    queueMutations.addQueueItem.mockRejectedValueOnce(new Error('authenticated send failed'));
+
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('signed-in-pending')]);
+    });
+    await waitFor(() =>
+      expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+        true,
+      ),
+    );
+
+    partyProfileState.current = { ...partyProfileState.current, authenticatedUserId: null, isAuthenticated: false };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    await act(async () => heldSnapshot.resolve(queueStateResponse([], 101, 'signed-out-stale')));
+
+    expect(snapshots.at(-1)?.state.queue.map((item) => item.uuid)).toContain('signed-in-pending');
+    expect(toast.showToast).not.toHaveBeenCalled();
+  });
+
+  it('ignores a held reconciliation after the active room changes', async () => {
+    const snapshots: Snapshot[] = [];
+    await renderRestoredSession(snapshots);
+    const heldSnapshot = deferred<unknown>();
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('GetSessionQueueState') ? heldSnapshot.promise : Promise.resolve({ sessionStatus: 'active' }),
+    );
+    queueMutations.addQueueItem.mockRejectedValueOnce(new Error('old room send failed'));
+    const oldRoomItem = makeQueueItem('old-room-pending');
+
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([oldRoomItem]);
+    });
+    await waitFor(() =>
+      expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+        true,
+      ),
+    );
+    await act(async () =>
+      snapshots.at(-1)?.joinSession('session-2', {
+        boardPath: '/kilter/1/10/1,2/40/list',
+        userBoard: activeBoard.stored,
+      }),
+    );
+    const newRoomItem = makeQueueItem('new-room-current');
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([newRoomItem]);
+    });
+    await waitFor(() =>
+      expect(snapshots.at(-1)?.state.queue.some((item) => item.uuid === 'new-room-current')).toBe(true),
+    );
+
+    await act(async () => heldSnapshot.resolve(queueStateResponse([oldRoomItem], 101, 'old-room-stale')));
+
+    expect(snapshots.at(-1)?.sessionId).toBe('session-2');
+    expect(snapshots.at(-1)?.state.queue.map((item) => item.uuid)).toContain('new-room-current');
+    expect(toast.showToast).not.toHaveBeenCalledWith('mobile.queue.outOfSyncRefreshed', 'error');
+  });
+
+  it.each([
+    ['clear', (snapshot: Snapshot, _item: ClimbQueueItem) => snapshot.clearQueue(), ''],
+    ['replace', (snapshot: Snapshot, item: ClimbQueueItem) => snapshot.setQueue([item], item), 'replacement'],
+  ])(
+    'does not revive a queue superseded by %s while reconciliation is held',
+    async (intent, supersede, expectedUuid) => {
+      const snapshots: Snapshot[] = [];
+      await renderRestoredSession(snapshots);
+      const heldSnapshot = deferred<unknown>();
+      http.request.mockImplementation((operation: string) =>
+        operation.includes('GetSessionQueueState')
+          ? heldSnapshot.promise
+          : Promise.resolve({ sessionStatus: 'active' }),
+      );
+      queueMutations.addQueueItem.mockRejectedValueOnce(new Error('old queue send failed'));
+      const oldItem = makeQueueItem('old-queue-item');
+
+      act(() => {
+        snapshots.at(-1)?.appendQueueItems([oldItem]);
+      });
+      await waitFor(() =>
+        expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+          true,
+        ),
+      );
+      const replacement = makeQueueItem('replacement');
+      act(() => supersede(snapshots.at(-1)!, replacement));
+
+      await act(async () => heldSnapshot.resolve(queueStateResponse([oldItem], 101, `${intent}-stale`)));
+
+      expect(snapshots.at(-1)?.state.queue.map((item) => item.uuid)).toEqual(expectedUuid ? [expectedUuid] : []);
+      expect(toast.showToast).not.toHaveBeenCalledWith('mobile.queue.outOfSyncRefreshed', 'error');
+    },
+  );
+
+  it('keeps a new account reconciliation flight independent while the old account request hangs', async () => {
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: 'account-a',
+      isAuthenticated: true,
+    };
+    const snapshots: Snapshot[] = [];
+    const rendered = await renderRestoredSession(snapshots);
+    const accountARead = deferred<unknown>();
+    const accountBRead = deferred<unknown>();
+    const accountBTrailingRead = deferred<unknown>();
+    const queueReads = [accountARead, accountBRead, accountBTrailingRead];
+    let queueReadIndex = 0;
+    http.request.mockImplementation((operation: string) => {
+      if (operation.includes('GetSessionQueueState')) return queueReads[queueReadIndex++].promise;
+      return Promise.resolve({ sessionStatus: 'active' });
+    });
+    queueMutations.addQueueItem
+      .mockRejectedValueOnce(new Error('account A send failed'))
+      .mockRejectedValueOnce(new Error('account B first send failed'))
+      .mockRejectedValueOnce(new Error('account B second send failed'))
+      .mockRejectedValueOnce(new Error('account B third send failed'));
+
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-a-failed')]);
+    });
+    await waitFor(() => expect(queueReadIndex).toBe(1));
+
+    partyProfileState.current = { ...partyProfileState.current, authenticatedUserId: 'account-b' };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-b-first-failed')]);
+    });
+    await waitFor(() => expect(queueReadIndex).toBe(2));
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-b-second-failed')]);
+    });
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(3));
+
+    await act(async () => accountARead.resolve(queueStateResponse([], 101, 'old-account-a')));
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('account-b-third-failed')]);
+    });
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(4));
+    expect(queueReadIndex).toBe(2);
+
+    await act(async () => accountBRead.resolve(queueStateResponse([], 102, 'account-b-first-read')));
+    await waitFor(() => expect(queueReadIndex).toBe(3));
+    await act(async () => accountBTrailingRead.resolve(queueStateResponse([], 103, 'account-b-trailing-read')));
+
+    expect(queueReadIndex).toBe(3);
+    expect(toast.showToast).toHaveBeenCalledWith('mobile.queue.outOfSyncRefreshed', 'error');
+  });
+
+  it('heals a current-origin failure across a same-account profile reload', async () => {
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: 'stable-account',
+      isAuthenticated: true,
+    };
+    const snapshots: Snapshot[] = [];
+    const rendered = await renderRestoredSession(snapshots);
+    const heldSnapshot = deferred<unknown>();
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('GetSessionQueueState') ? heldSnapshot.promise : Promise.resolve({ sessionStatus: 'active' }),
+    );
+    queueMutations.addQueueItem.mockRejectedValueOnce(new Error('current-origin send failed'));
+
+    act(() => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('current-origin-pending')]);
+    });
+    await waitFor(() =>
+      expect(http.request.mock.calls.some(([operation]) => String(operation).includes('GetSessionQueueState'))).toBe(
+        true,
+      ),
+    );
+    partyProfileState.current = {
+      ...partyProfileState.current,
+      authenticatedUserId: null,
+      transportToken: 'refreshed-token',
+    };
+    rendered.rerender(
+      createElement(QueueProvider, null, createElement(Probe, { onSnapshot: (snapshot) => snapshots.push(snapshot) })),
+    );
+    await act(async () =>
+      heldSnapshot.resolve(queueStateResponse([makeQueueItem('server-authoritative')], 101, 'current-origin')),
+    );
+
+    expect(snapshots.at(-1)?.state.queue.map((item) => item.uuid)).toEqual(['server-authoritative']);
+    expect(toast.showToast).toHaveBeenCalledWith('mobile.queue.outOfSyncRefreshed', 'error');
+  });
+
+  it('appendQueueItems reconciles ONCE for a batch of failed adds, preferring the throttled reason', async () => {
+    // Each reconcile can toast and kick a resync, so a per-item reconcile would
+    // make 3 failed adds 3 toasts and 3 resyncs.
+    sessionStore.getStoredSessionId.mockResolvedValue('session-1');
+    http.request.mockImplementation((operation: string) =>
+      operation.includes('SessionStatus')
+        ? Promise.resolve({ sessionStatus: 'active' })
+        : Promise.resolve({ createSession: { id: 'session-new' } }),
+    );
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(null);
+
+    const rateLimited = {
+      response: {
+        status: 200,
+        errors: [
+          {
+            message: 'Rate limit exceeded. Try again in 7 seconds.',
+            extensions: { code: 'RATE_LIMITED', operation: 'addQueueItem', retryAfterSeconds: 7 },
+          },
+        ],
+      },
+    };
+    queueMutations.addQueueItem
+      .mockRejectedValueOnce(new Error('transport'))
+      .mockRejectedValueOnce(rateLimited)
+      .mockRejectedValueOnce(new Error('transport'));
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.sessionId).toBe('session-1');
+    });
+
+    toast.showToast.mockClear();
+    await act(async () => {
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('gen-1'), makeQueueItem('gen-2'), makeQueueItem('gen-3')]);
+    });
+    await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(3));
+
+    // One toast for the batch, and it is the pacing hint — not the unrelated
+    // transport error that happened to fail first.
+    await waitFor(() => {
+      expect(toast.showToast).toHaveBeenCalledWith('mobile.queue.rateLimited', 'error');
+    });
+    expect(toast.showToast.mock.calls.filter(([message]) => message === 'mobile.queue.rateLimited')).toHaveLength(1);
+    // The local queue keeps every climb — the sync is best-effort, the local
+    // state is the source of truth.
+    expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['gen-1', 'gen-2', 'gen-3']);
+  });
+
+  // #6772: a playlist's Play next puts the whole list at the top of Up next, in
+  // list order, through the same batch as the append.
+  describe("appendQueueItems with placement 'next'", () => {
+    it('slots the batch, in order, right behind the current climb and keeps the climbs after it', async () => {
+      const itemA = makeQueueItem('item-a');
+      const itemB = makeQueueItem('item-b');
+      const itemC = makeQueueItem('item-c');
+      queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA, itemB, itemC], itemB));
+
+      const snapshots: Snapshot[] = [];
+      renderProvider((snapshot) => snapshots.push(snapshot));
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('item-b');
+      });
+
+      let landedCount = -1;
+      act(() => {
+        landedCount =
+          snapshots
+            .at(-1)
+            ?.appendQueueItems([makeQueueItem('list-1'), makeQueueItem('list-2')], { placement: 'next' }) ?? -1;
+      });
+
+      expect(landedCount).toBe(2);
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual([
+          'item-a',
+          'item-b',
+          'list-1',
+          'list-2',
+          'item-c',
+        ]);
+      });
+      expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('item-b');
+    });
+
+    it('starts at the head when nothing is current, and still activates nothing', async () => {
+      const itemA = makeQueueItem('item-a');
+      queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA], null));
+
+      const snapshots: Snapshot[] = [];
+      renderProvider((snapshot) => snapshots.push(snapshot));
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['item-a']);
+      });
+
+      queueMutations.setQueue.mockClear();
+      act(() => {
+        snapshots.at(-1)?.appendQueueItems([makeQueueItem('list-1'), makeQueueItem('list-2')], { placement: 'next' });
+      });
+
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual(['list-1', 'list-2', 'item-a']);
+      });
+      expect(snapshots.at(-1)?.state.currentClimbQueueItem).toBeNull();
+      expect(queueMutations.setQueue).not.toHaveBeenCalled();
+    });
+
+    it('sends per-item adds at consecutive positions, in list order, when nothing is current', async () => {
+      // No pointer: the batch goes out as ADD_QUEUE_ITEMs (never a pointer-
+      // clearing setQueue), each with the position it took locally, so peers
+      // see the list at the head in the same order.
+      sessionStore.getStoredSessionId.mockResolvedValue('session-1');
+      http.request.mockImplementation((operation: string) =>
+        operation.includes('SessionStatus')
+          ? Promise.resolve({ sessionStatus: 'active' })
+          : Promise.resolve({ createSession: { id: 'session-new' } }),
+      );
+      queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(null);
+
+      const snapshots: Snapshot[] = [];
+      renderProvider((snapshot) => snapshots.push(snapshot));
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.sessionId).toBe('session-1');
+      });
+
+      queueMutations.setQueue.mockClear();
+      queueMutations.addQueueItem.mockClear();
+      act(() => {
+        snapshots
+          .at(-1)
+          ?.appendQueueItems([makeQueueItem('list-1'), makeQueueItem('list-2'), makeQueueItem('list-3')], {
+            placement: 'next',
+          });
+      });
+
+      await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(3));
+      expect(queueMutations.setQueue).not.toHaveBeenCalled();
+      expect(queueMutations.addQueueItem.mock.calls.map(([item, position]) => [item.uuid, position])).toEqual([
+        ['list-1', 0],
+        ['list-2', 1],
+        ['list-3', 2],
+      ]);
+    });
+
+    async function renderInSessionWithNothingCurrent() {
+      sessionStore.getStoredSessionId.mockResolvedValue('session-1');
+      http.request.mockImplementation((operation: string) =>
+        operation.includes('SessionStatus')
+          ? Promise.resolve({ sessionStatus: 'active' })
+          : Promise.resolve({ createSession: { id: 'session-new' } }),
+      );
+      queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(null);
+
+      const snapshots: Snapshot[] = [];
+      renderProvider((snapshot) => snapshots.push(snapshot));
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.sessionId).toBe('session-1');
+      });
+      queueMutations.setQueue.mockClear();
+      queueMutations.addQueueItem.mockClear();
+      return snapshots;
+    }
+
+    const sentPositions = () => queueMutations.addQueueItem.mock.calls.map(([item, position]) => [item.uuid, position]);
+
+    it('gives a climb removed before it is sent no slot, so the next climb takes it', async () => {
+      const snapshots = await renderInSessionWithNothingCurrent();
+      queueMutations.wasUuidExplicitlyRemoved.mockImplementation((uuid: string) => uuid === 'list-2');
+
+      act(() => {
+        snapshots
+          .at(-1)
+          ?.appendQueueItems([makeQueueItem('list-1'), makeQueueItem('list-2'), makeQueueItem('list-3')], {
+            placement: 'next',
+          });
+      });
+
+      await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(2));
+      expect(sentPositions()).toEqual([
+        ['list-1', 0],
+        ['list-3', 1],
+      ]);
+    });
+
+    it('gives a climb whose send failed no slot, so the next climb takes it', async () => {
+      const snapshots = await renderInSessionWithNothingCurrent();
+      queueMutations.addQueueItem.mockImplementation(async (item: ClimbQueueItem) => {
+        if (item.uuid === 'list-1') throw new Error('network down');
+      });
+
+      act(() => {
+        snapshots
+          .at(-1)
+          ?.appendQueueItems([makeQueueItem('list-1'), makeQueueItem('list-2'), makeQueueItem('list-3')], {
+            placement: 'next',
+          });
+      });
+
+      await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(3));
+      expect(sentPositions()).toEqual([
+        ['list-1', 0],
+        ['list-2', 0],
+        ['list-3', 1],
+      ]);
+    });
+
+    it("sends a single Play next after a draining list, so the server keeps this phone's order", async () => {
+      // Server queue [X]; the list goes to 0,1,2 and the single to 0. Sent in
+      // the middle of the drain, the single would land among the list's climbs.
+      const snapshots = await renderInSessionWithNothingCurrent();
+      let releaseFirstSend: () => void = () => {};
+      queueMutations.addQueueItem.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            releaseFirstSend = resolve;
+          }),
+      );
+
+      act(() => {
+        snapshots
+          .at(-1)
+          ?.appendQueueItems([makeQueueItem('list-1'), makeQueueItem('list-2'), makeQueueItem('list-3')], {
+            placement: 'next',
+          });
+      });
+      await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        await snapshots.at(-1)?.addToQueue(makeQueueItem('swiped'), { placement: 'next' });
+      });
+      expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toEqual([
+        'swiped',
+        'list-1',
+        'list-2',
+        'list-3',
+      ]);
+      // Still waiting on the list's first climb: the single has not gone out.
+      expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        releaseFirstSend();
+      });
+      await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(4));
+      expect(sentPositions()).toEqual([
+        ['list-1', 0],
+        ['list-2', 1],
+        ['list-3', 2],
+        ['swiped', 0],
+      ]);
+    });
+
+    // #6776 review: a move carries indexes. The backend's reorderQueueItem finds
+    // the climb by uuid but places it at the newIndex it is sent, and answers a
+    // stale index with a FullSync (#6792). While a whole-list Play next
+    // drains, this phone already shows every climb and the server does not, so
+    // the move must wait on the same lane and read its indexes against the
+    // queue the server holds when it goes.
+    describe('moves and removals while a list drains', () => {
+      // The backend's queue rules, so each test can assert the crew ends where
+      // this phone does: an add clamps a missing or out-of-range position to an
+      // append, a reorder finds the climb by uuid and clamps newIndex to the
+      // tail, a remove filters.
+      function installServerModel(seed: ClimbQueueItem[]) {
+        const server = { queue: [...seed] };
+        let releaseFirstSend: () => void = () => {};
+        let firstSendHeld = false;
+        queueMutations.addQueueItem.mockImplementation(async (item: ClimbQueueItem, position?: number) => {
+          const slot = position === undefined || position > server.queue.length ? server.queue.length : position;
+          server.queue.splice(slot, 0, item);
+          if (!firstSendHeld) {
+            firstSendHeld = true;
+            await new Promise<void>((resolve) => {
+              releaseFirstSend = resolve;
+            });
+          }
+        });
+        queueMutations.reorderQueueItem.mockImplementation(
+          async (uuid: string, _oldIndex: number, newIndex: number) => {
+            const movedFromIndex = server.queue.findIndex((entry) => entry.uuid === uuid);
+            if (movedFromIndex < 0) throw new Error(`Queue item ${uuid} is not in the queue`);
+            const [moved] = server.queue.splice(movedFromIndex, 1);
+            server.queue.splice(Math.min(newIndex, server.queue.length), 0, moved);
+          },
+        );
+        queueMutations.removeQueueItem.mockImplementation(async (uuid: string) => {
+          server.queue = server.queue.filter((entry) => entry.uuid !== uuid);
+        });
+        return {
+          serverUuids: () => server.queue.map((entry) => entry.uuid),
+          releaseFirstSend: () => releaseFirstSend(),
+        };
+      }
+
+      const localUuids = (snapshots: Snapshot[]) => snapshots.at(-1)?.state.queue.map((entry) => entry.uuid);
+      const listItems = () => [makeQueueItem('list-1'), makeQueueItem('list-2'), makeQueueItem('list-3')];
+
+      // [X, Y] on both sides with nothing current, then the list's Play next,
+      // held on its first send so everything after it happens mid-drain.
+      async function startDrainingOverXY() {
+        const snapshots = await renderInSessionWithNothingCurrent();
+        const itemX = makeQueueItem('item-x');
+        const itemY = makeQueueItem('item-y');
+        act(() => {
+          snapshots
+            .at(-1)
+            ?.dispatch({ type: 'UPDATE_QUEUE', payload: { queue: [itemX, itemY], currentClimbQueueItem: null } });
+        });
+        await waitFor(() => expect(localUuids(snapshots)).toEqual(['item-x', 'item-y']));
+        const server = installServerModel([itemX, itemY]);
+        act(() => {
+          snapshots.at(-1)?.appendQueueItems(listItems(), { placement: 'next' });
+        });
+        await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+        return { snapshots, server, itemY };
+      }
+
+      it('sends a Play next move of a queued climb after the drain, with indexes the server accepts', async () => {
+        const { snapshots, server, itemY } = await startDrainingOverXY();
+
+        await act(async () => {
+          const outcome = await snapshots.at(-1)?.playNext({ item: itemY, queueItemUuid: 'item-y' });
+          expect(outcome).toBe('moved');
+        });
+        expect(localUuids(snapshots)).toEqual(['item-y', 'list-1', 'list-2', 'list-3', 'item-x']);
+        // The server holds three climbs here; oldIndex 4 would be stale.
+        expect(queueMutations.reorderQueueItem).not.toHaveBeenCalled();
+
+        await act(async () => {
+          server.releaseFirstSend();
+        });
+        await waitFor(() => expect(queueMutations.reorderQueueItem).toHaveBeenCalledTimes(1));
+        expect(queueMutations.reorderQueueItem).toHaveBeenCalledWith('item-y', 4, 0);
+        expect(server.serverUuids()).toEqual(['item-y', 'list-1', 'list-2', 'list-3', 'item-x']);
+        expect(localUuids(snapshots)).toEqual(server.serverUuids());
+        expect(toast.showToast).not.toHaveBeenCalled();
+      });
+
+      it('counts a climb removed straight away as gone from the server when the move goes', async () => {
+        const { snapshots, server, itemY } = await startDrainingOverXY();
+
+        await act(async () => {
+          await snapshots.at(-1)?.playNext({ item: itemY, queueItemUuid: 'item-y' });
+        });
+        act(() => {
+          snapshots.at(-1)?.removeFromQueue('item-x');
+        });
+        await act(async () => {
+          server.releaseFirstSend();
+        });
+
+        await waitFor(() => expect(queueMutations.reorderQueueItem).toHaveBeenCalledTimes(1));
+        expect(queueMutations.reorderQueueItem).toHaveBeenCalledWith('item-y', 3, 0);
+        expect(server.serverUuids()).toEqual(['item-y', 'list-1', 'list-2', 'list-3']);
+        expect(localUuids(snapshots)).toEqual(server.serverUuids());
+        expect(toast.showToast).not.toHaveBeenCalled();
+      });
+
+      it('still counts a climb whose bulk removal waits behind the move', async () => {
+        const { snapshots, server, itemY } = await startDrainingOverXY();
+
+        await act(async () => {
+          await snapshots.at(-1)?.playNext({ item: itemY, queueItemUuid: 'item-y' });
+        });
+        act(() => {
+          snapshots.at(-1)?.removeQueueItems(['item-x']);
+        });
+        await act(async () => {
+          server.releaseFirstSend();
+        });
+
+        await waitFor(() => expect(queueMutations.removeQueueItem).toHaveBeenCalledWith('item-x'));
+        expect(queueMutations.reorderQueueItem).toHaveBeenCalledWith('item-y', 4, 0);
+        expect(server.serverUuids()).toEqual(['item-y', 'list-1', 'list-2', 'list-3']);
+        expect(localUuids(snapshots)).toEqual(server.serverUuids());
+      });
+
+      it('does not count a list climb the server never took', async () => {
+        const snapshots = await renderInSessionWithNothingCurrent();
+        const itemX = makeQueueItem('item-x');
+        const itemY = makeQueueItem('item-y');
+        act(() => {
+          snapshots
+            .at(-1)
+            ?.dispatch({ type: 'UPDATE_QUEUE', payload: { queue: [itemX, itemY], currentClimbQueueItem: null } });
+        });
+        await waitFor(() => expect(localUuids(snapshots)).toEqual(['item-x', 'item-y']));
+        const server = installServerModel([itemX, itemY]);
+        const modelAdd = queueMutations.addQueueItem.getMockImplementation();
+        queueMutations.addQueueItem.mockImplementation(async (item: ClimbQueueItem, position?: number) => {
+          if (item.uuid === 'list-2') throw new Error('network down');
+          await modelAdd?.(item, position);
+        });
+
+        act(() => {
+          snapshots.at(-1)?.appendQueueItems(listItems(), { placement: 'next' });
+        });
+        await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+        await act(async () => {
+          await snapshots.at(-1)?.playNext({ item: itemY, queueItemUuid: 'item-y' });
+        });
+        await act(async () => {
+          server.releaseFirstSend();
+        });
+
+        await waitFor(() => expect(queueMutations.reorderQueueItem).toHaveBeenCalledTimes(1));
+        expect(queueMutations.reorderQueueItem).toHaveBeenCalledWith('item-y', 3, 0);
+        expect(server.serverUuids()).toEqual(['item-y', 'list-1', 'list-3', 'item-x']);
+      });
+
+      it('re-reads a waiting single Play next slot after a climb ahead of it is removed', async () => {
+        // Current climb C at index 1. The first Play next is held on the wire;
+        // the second waits on the lane for slot 2, then A (ahead of C) goes.
+        const snapshots = await renderInSessionWithNothingCurrent();
+        const itemA = makeQueueItem('item-a');
+        const itemC = makeQueueItem('item-c');
+        const itemB = makeQueueItem('item-b');
+        act(() => {
+          snapshots.at(-1)?.dispatch({
+            type: 'UPDATE_QUEUE',
+            payload: { queue: [itemA, itemC, itemB], currentClimbQueueItem: itemC },
+          });
+        });
+        await waitFor(() => expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('item-c'));
+        const server = installServerModel([itemA, itemC, itemB]);
+
+        await act(async () => {
+          await snapshots.at(-1)?.playNext({ item: makeQueueItem('next-1') });
+        });
+        await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(1));
+        await act(async () => {
+          await snapshots.at(-1)?.playNext({ item: makeQueueItem('next-2') });
+        });
+        act(() => {
+          snapshots.at(-1)?.removeFromQueue('item-a');
+        });
+        await act(async () => {
+          server.releaseFirstSend();
+        });
+
+        await waitFor(() => expect(queueMutations.addQueueItem).toHaveBeenCalledTimes(2));
+        expect(sentPositions()).toEqual([
+          ['next-1', 2],
+          ['next-2', 1],
+        ]);
+        expect(server.serverUuids()).toEqual(['item-c', 'next-2', 'next-1', 'item-b']);
+        expect(localUuids(snapshots)).toEqual(server.serverUuids());
+      });
+    });
+
+    it('broadcasts the merged queue with the list behind the carried current to party peers', async () => {
+      sessionStore.getStoredSessionId.mockResolvedValue('session-1');
+      http.request.mockImplementation((operation: string) =>
+        operation.includes('SessionStatus')
+          ? Promise.resolve({ sessionStatus: 'active' })
+          : Promise.resolve({ createSession: { id: 'session-new' } }),
+      );
+      queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(null);
+
+      const snapshots: Snapshot[] = [];
+      renderProvider((snapshot) => snapshots.push(snapshot));
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.sessionId).toBe('session-1');
+      });
+
+      const itemA = makeQueueItem('item-a');
+      act(() => {
+        snapshots.at(-1)?.setCurrentClimb(itemA);
+      });
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('item-a');
+      });
+      act(() => {
+        snapshots.at(-1)?.appendQueueItems([makeQueueItem('later')]);
+      });
+      await waitFor(() => expect(snapshots.at(-1)?.state.queue.map((entry) => entry.uuid)).toContain('later'));
+
+      queueMutations.setQueue.mockClear();
+      act(() => {
+        snapshots.at(-1)?.appendQueueItems([makeQueueItem('list-1'), makeQueueItem('list-2')], { placement: 'next' });
+      });
+
+      await waitFor(() => expect(queueMutations.setQueue).toHaveBeenCalled());
+      const [wireQueue = [], wireCurrent] = queueMutations.setQueue.mock.calls.at(-1) ?? [];
+      expect(wireQueue.map((entry: { uuid: string }) => entry.uuid)).toEqual(['item-a', 'list-1', 'list-2', 'later']);
+      expect(wireCurrent?.uuid).toBe('item-a');
+    });
+
+    it('clamps to MAX_SYNCED_QUEUE_ITEMS, keeping the head of the list', async () => {
+      const seeded = Array.from({ length: MAX_SYNCED_QUEUE_ITEMS - 2 }, (_unused, index) =>
+        makeQueueItem(`seed-${index}`),
+      );
+      queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot(seeded, seeded[0]));
+
+      const snapshots: Snapshot[] = [];
+      renderProvider((snapshot) => snapshots.push(snapshot));
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS - 2);
+      });
+
+      let landedCount = -1;
+      act(() => {
+        landedCount =
+          snapshots.at(-1)?.appendQueueItems(
+            Array.from({ length: 5 }, (_unused, index) => makeQueueItem(`list-${index}`)),
+            { placement: 'next' },
+          ) ?? -1;
+      });
+
+      expect(landedCount).toBe(2);
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+      });
+      expect(
+        snapshots
+          .at(-1)
+          ?.state.queue.slice(0, 4)
+          .map((entry) => entry.uuid),
+      ).toEqual(['seed-0', 'list-0', 'list-1', 'seed-1']);
+    });
+
+    it('returns 0 and changes nothing when the queue is already at the cap', async () => {
+      const seeded = Array.from({ length: MAX_SYNCED_QUEUE_ITEMS }, (_unused, index) => makeQueueItem(`seed-${index}`));
+      queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot(seeded, seeded[0]));
+
+      const snapshots: Snapshot[] = [];
+      renderProvider((snapshot) => snapshots.push(snapshot));
+      await waitFor(() => {
+        expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+      });
+
+      queueMutations.setQueue.mockClear();
+      queueMutations.addQueueItem.mockClear();
+      let landedCount = -1;
+      act(() => {
+        landedCount = snapshots.at(-1)?.appendQueueItems([makeQueueItem('overflow')], { placement: 'next' }) ?? -1;
+      });
+
+      expect(landedCount).toBe(0);
+      expect(snapshots.at(-1)?.state.queue[1]?.uuid).toBe('seed-1');
+      expect(queueMutations.setQueue).not.toHaveBeenCalled();
+      expect(queueMutations.addQueueItem).not.toHaveBeenCalled();
+    });
+  });
+
+  it('appendQueueItems clamps the batch to MAX_SYNCED_QUEUE_ITEMS and returns what landed', async () => {
+    const seeded = Array.from({ length: MAX_SYNCED_QUEUE_ITEMS - 5 }, (_unused, index) =>
+      makeQueueItem(`seed-${index}`),
+    );
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot(seeded, seeded[0]));
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS - 5);
+    });
+
+    queueMutations.setQueue.mockClear();
+    let appendedCount = -1;
+    act(() => {
+      appendedCount =
+        snapshots
+          .at(-1)
+          ?.appendQueueItems(Array.from({ length: 20 }, (_unused, index) => makeQueueItem(`new-${index}`))) ?? -1;
+    });
+
+    // Only the remaining capacity lands — the resolver THROWS on a payload over
+    // the cap rather than truncating, so an over-long queue would wedge every
+    // later full sync for the session.
+    expect(appendedCount).toBe(5);
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+    });
+    expect(snapshots.at(-1)?.state.queue.at(-1)?.uuid).toBe('new-4');
+    const [wireQueue = []] = queueMutations.setQueue.mock.calls.at(-1) ?? [];
+    expect(wireQueue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+  });
+
+  it('setQueue clamps a replacement to MAX_SYNCED_QUEUE_ITEMS around the current climb', async () => {
+    const itemA = makeQueueItem('item-a');
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA], itemA));
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('item-a');
+    });
+
+    // 600 rows with the current one at row 550: a plain slice(0, 500) would
+    // drop it, and the resolver THROWS on the whole 600.
+    const replacement = Array.from({ length: 600 }, (_unused, index) => makeQueueItem(`row-${index}`));
+    const current = replacement[550];
+    queueMutations.setQueue.mockClear();
+    act(() => {
+      snapshots.at(-1)?.setQueue(replacement, current);
+    });
+
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+    });
+    const localQueue = snapshots.at(-1)?.state.queue ?? [];
+    expect(localQueue[0]?.uuid).toBe('row-100');
+    expect(localQueue.at(-1)?.uuid).toBe('row-599');
+    expect(snapshots.at(-1)?.state.currentClimbQueueItem?.uuid).toBe('row-550');
+    await waitFor(() => expect(queueMutations.setQueue).toHaveBeenCalled());
+    const [wireQueue = [], wireCurrent] = queueMutations.setQueue.mock.calls.at(-1) ?? [];
+    expect(wireQueue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+    expect(wireCurrent?.uuid).toBe('row-550');
+  });
+
+  it('appendQueueItems returns 0 and broadcasts nothing when the queue is already at the cap', async () => {
+    const seeded = Array.from({ length: MAX_SYNCED_QUEUE_ITEMS }, (_unused, index) => makeQueueItem(`seed-${index}`));
+    queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot(seeded, seeded[0]));
+
+    const snapshots: Snapshot[] = [];
+    renderProvider((snapshot) => snapshots.push(snapshot));
+    await waitFor(() => {
+      expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+    });
+
+    queueMutations.setQueue.mockClear();
+    queueMutations.addQueueItem.mockClear();
+    let appendedCount = -1;
+    act(() => {
+      appendedCount = snapshots.at(-1)?.appendQueueItems([makeQueueItem('overflow')]) ?? -1;
+    });
+
+    expect(appendedCount).toBe(0);
+    expect(snapshots.at(-1)?.state.queue.length).toBe(MAX_SYNCED_QUEUE_ITEMS);
+    expect(queueMutations.setQueue).not.toHaveBeenCalled();
+    expect(queueMutations.addQueueItem).not.toHaveBeenCalled();
+  });
+
+  it('appendQueueItems leaves an empty batch alone', async () => {
     const itemA = makeQueueItem('item-a');
     queueSnapshotStore.getStoredQueueSnapshot.mockResolvedValue(storedSnapshot([itemA], itemA));
 
@@ -653,7 +2330,7 @@ describe('QueueProvider local solo queue', () => {
 
     queueMutations.setQueue.mockClear();
     act(() => {
-      snapshots.at(-1)?.appendGeneratedSession([]);
+      snapshots.at(-1)?.appendQueueItems([]);
     });
 
     await waitFor(() => {
@@ -664,7 +2341,7 @@ describe('QueueProvider local solo queue', () => {
     expect(queueMutations.setQueue).not.toHaveBeenCalled();
   });
 
-  it('appendGeneratedSession broadcasts the merged queue with the carried current to party peers', async () => {
+  it('appendQueueItems broadcasts the merged queue with the carried current to party peers', async () => {
     sessionStore.getStoredSessionId.mockResolvedValue('session-1');
     http.request.mockImplementation((operation: string) =>
       operation.includes('SessionStatus')
@@ -689,7 +2366,7 @@ describe('QueueProvider local solo queue', () => {
 
     const generated = [makeQueueItem('gen-1'), makeQueueItem('gen-2')];
     act(() => {
-      snapshots.at(-1)?.appendGeneratedSession(generated);
+      snapshots.at(-1)?.appendQueueItems(generated);
     });
 
     await waitFor(() => {
@@ -700,7 +2377,7 @@ describe('QueueProvider local solo queue', () => {
     expect(wireCurrent?.uuid).toBe('item-a');
   });
 
-  it('appendGeneratedSession drops an unresolved current climb from the party payload but keeps it locally', async () => {
+  it('appendQueueItems drops an unresolved current climb from the party payload but keeps it locally', async () => {
     // Documents a pre-existing setQueue contract (#2527): a thin/partially-synced
     // item can't form a valid ClimbInput, so it never goes on the wire. Carrying
     // the current climb forward makes that path easier to hit — peers land on the
@@ -730,7 +2407,7 @@ describe('QueueProvider local solo queue', () => {
 
     queueMutations.setQueue.mockClear();
     act(() => {
-      snapshots.at(-1)?.appendGeneratedSession([makeQueueItem('gen-1')]);
+      snapshots.at(-1)?.appendQueueItems([makeQueueItem('gen-1')]);
     });
 
     await waitFor(() => {

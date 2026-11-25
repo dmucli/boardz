@@ -1,0 +1,247 @@
+name: Mobile OTA Unlock
+
+# Reverts a live canary on one branch, so the next publish there is accepted.
+# xprem refuses a publish (409) while a rollout is live on the same branch and
+# runtime version.
+#
+# It reverts and never finishes. Finishing would deliver an update nobody has
+# judged to every device; reverting republishes the previous update, and the
+# devices that took the canary return to it on their next check.
+#
+# iOS and Android resolve different runtime versions, so one release is two
+# rollouts. Give both and one run reverts both. Finding no live rollout on a
+# runtime version is a clean no-op, so a caller can run this unconditionally
+# before it publishes.
+#
+# Dispatch-only, on purpose. A reusable workflow would be loaded from the
+# CALLER's ref, so a release branch or a backport could change the steps that run
+# with the admin login. Other workflows start it with
+#
+#   gh workflow run mobile-ota-unlock.yml --ref main -f ios_runtime_version=... -f android_runtime_version=...
+#
+# so the workflow file and the scripts both come from main. Publishers await the
+# exact request_id run before uploading anything.
+# See docs/operations/mobile-ota-updates.md, "Managing xprem as code".
+run-name: ${{ inputs.request_id != '' && format('OTA unlock {0}', inputs.request_id) || 'Manual OTA unlock' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: 'Automatic caller correlation id; leave empty for a manual unlock'
+        type: string
+        default: ''
+      caller_lease:
+        description: 'Automatic caller lease JSON; leave empty for a manual unlock'
+        type: string
+        default: ''
+      branch:
+        description: 'xprem branch holding the rollout'
+        type: string
+        default: production
+      ios_runtime_version:
+        description: 'iOS runtime version (40-character fingerprint); leave empty to skip iOS'
+        type: string
+        default: ''
+      android_runtime_version:
+        description: 'Android runtime version (40-character fingerprint); leave empty to skip Android'
+        type: string
+        default: ''
+      staged_app_id:
+        description: 'Staged promotion only: app whose saved controls must be preserved'
+        type: string
+        default: ''
+      ios_baseline_update_id:
+        description: 'Staged iOS control UUID, or null for an empty runtime'
+        type: string
+        default: ''
+      android_baseline_update_id:
+        description: 'Staged Android control UUID, or null for an empty runtime'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+# Unlocks have a separate queued lane below, never the parent's production lane.
+# GitHub supports up to 100 pending unlock jobs with queue:max; keep older waiters.
+# https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency
+
+jobs:
+  revert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Holds the dashboard admin login. The owner creates this environment with a
+    # deployment-branch policy of `main` BEFORE adding its secrets; see the docs
+    # for the list. The first step below refuses any other ref regardless.
+    environment: ota-stable-release
+    concurrency:
+      group: mobile-ota-unlock
+      cancel-in-progress: false
+      queue: max
+    outputs:
+      events: ${{ steps.events.outputs.artifact-id }}
+
+    steps:
+      # Before anything reads a secret.
+      - name: Refuse any ref but main
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::This workflow holds the OTA admin login and only runs from main. Dispatch it with --ref main."
+          exit 1
+
+      - name: Checkout main
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # No dependency install: the script uses node built-ins only.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+
+      - name: Revert the live rollouts
+        env:
+          # A secret, never a variable: a variable is not masked in logs.
+          OTA_ADMIN_EMAIL: ${{ secrets.OTA_ADMIN_EMAIL }}
+          OTA_ADMIN_PASSWORD: ${{ secrets.OTA_ADMIN_PASSWORD }}
+          OTA_BRANCH: ${{ inputs.branch }}
+          REQUEST_ID: ${{ inputs.request_id }}
+          OTA_UNLOCK_CALLER_LEASE: ${{ inputs.caller_lease }}
+          GITHUB_TOKEN: ${{ github.token }}
+          IOS_RUNTIME_VERSION: ${{ inputs.ios_runtime_version }}
+          ANDROID_RUNTIME_VERSION: ${{ inputs.android_runtime_version }}
+          STAGED_APP_ID: ${{ inputs.staged_app_id }}
+          EXPECTED_IOS_UPDATE_ID: ${{ inputs.ios_baseline_update_id }}
+          EXPECTED_ANDROID_UPDATE_ID: ${{ inputs.android_baseline_update_id }}
+          EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL || 'https://updates.boardsesh.com/manifest' }}
+          NODE_NO_WARNINGS: '1'
+          OTA_DEPLOY_EVENTS_FILE: ota-unlock-events.json
+        run: |
+          set -euo pipefail
+
+          # The login email is a secret here and is masked as one. Mask it again
+          # explicitly before anything else can print it: a value that was ever
+          # moved to a variable would otherwise reach the log in the clear.
+          if [ -n "${OTA_ADMIN_EMAIL:-}" ]; then echo "::add-mask::$OTA_ADMIN_EMAIL"; fi
+
+          # Inputs reach the shell through the environment, never by
+          # interpolation, and are checked before anything uses them.
+          if ! printf '%s' "$OTA_BRANCH" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+            echo "::error::Invalid branch name."
+            exit 1
+          fi
+          if [ -z "$IOS_RUNTIME_VERSION" ] && [ -z "$ANDROID_RUNTIME_VERSION" ]; then
+            echo "::error::Give ios_runtime_version, android_runtime_version, or both."
+            exit 1
+          fi
+          for runtime_version in "$IOS_RUNTIME_VERSION" "$ANDROID_RUNTIME_VERSION"; do
+            if [ -n "$runtime_version" ] && ! printf '%s' "$runtime_version" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::A runtime version must be a 40-character fingerprint."
+              exit 1
+            fi
+          done
+
+          if [ -n "$REQUEST_ID" ] && ! printf '%s' "$REQUEST_ID" | grep -Eq '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+            echo "::error::Invalid automatic unlock request id."
+            exit 1
+          fi
+
+          # An automatic caller requires a judged unlock, never a skipped one.
+          # A manual diagnostic run keeps the existing missing-login no-op.
+          if [ -z "${OTA_ADMIN_EMAIL:-}" ] || [ -z "${OTA_ADMIN_PASSWORD:-}" ]; then
+            if [ -n "$REQUEST_ID" ]; then
+              echo "::error::Automatic unlock requires OTA_ADMIN_EMAIL and OTA_ADMIN_PASSWORD in ota-stable-release."
+              exit 1
+            fi
+            echo "::notice::OTA_ADMIN_EMAIL or OTA_ADMIN_PASSWORD is not set in the ota-stable-release environment; skipping."
+            echo "Skipped: the \`ota-stable-release\` environment has no \`OTA_ADMIN_EMAIL\` / \`OTA_ADMIN_PASSWORD\`. Nothing was read or reverted." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ -n "$STAGED_APP_ID" ]; then
+            node --experimental-strip-types scripts/mobile-ota-unlock-staged.ts "$RUNNER_TEMP/ota-unlock-receipt/receipt.json"
+            exit 0
+          fi
+
+          # Revert only the requested platform on its exact runtime. Both are
+          # attempted even when the first fails; the job still ends red.
+          status=0
+          : > "$RUNNER_TEMP/ota-unlock.log"
+          for platform in ios android; do
+            if [ "$platform" = ios ]; then runtime_version="$IOS_RUNTIME_VERSION"; else runtime_version="$ANDROID_RUNTIME_VERSION"; fi
+            if [ -z "$runtime_version" ]; then continue; fi
+            node --experimental-strip-types scripts/mobile-ota-rollout.ts revert \
+              --branch "$OTA_BRANCH" \
+              --runtime-version "$runtime_version" \
+              --platform "$platform" \
+              --if-live 2>&1 | tee -a "$RUNNER_TEMP/ota-unlock.log" || status=1
+          done
+          {
+            echo '### OTA unlock'
+            echo ''
+            echo '```'
+            cat "$RUNNER_TEMP/ota-unlock.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
+
+      - name: Retain verified staged unlock receipt
+        if: success() && inputs.staged_app_id != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ota-unlock-${{ inputs.request_id }}
+          path: ${{ runner.temp }}/ota-unlock-receipt/receipt.json
+          if-no-files-found: error
+          retention-days: 1
+      - name: Retain confirmed unlock events
+        id: events
+        continue-on-error: true
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ota-unlock-events
+          path: ota-unlock-events.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  notify:
+    needs: revert
+    if: always() && github.ref == 'refs/heads/main' && needs.revert.outputs.events != ''
+    # Publishers wait for the unlock workflow conclusion. A Discord outage must
+    # never turn a confirmed successful revert into a failed unlock handshake.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: Production
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ota-unlock-events
+          path: deployment-events
+      - name: Report confirmed unlocks to deployments
+        env:
+          DISCORD_DEPLOY_WEBHOOK: ${{ secrets.DISCORD_DEPLOY_WEBHOOK }}
+        run: node --experimental-strip-types scripts/mobile-ota-notify.ts deliver --events deployment-events/ota-unlock-events.json
+      - name: Retain delivery receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ota-unlock-notification-receipts
+          path: deployment-events/
+          retention-days: 30
+          if-no-files-found: ignore
+      - name: Surface delivery failures without blocking publishers
+        if: failure()
+        run: |
+          echo '::warning::Unlock completed independently of Discord. Deployment notification delivery failed; retry the retained events artifact.'
+          echo 'Discord notification failed. Retry the retained ota-unlock-events artifact; confirmed unlock results are unchanged.' >> "$GITHUB_STEP_SUMMARY"

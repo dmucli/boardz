@@ -1,12 +1,10 @@
+import { ReadableColumn } from '../ReadableColumn';
+import { useNativeRootHeader } from '../../hooks/use-native-root-header';
+import { ScrollEdgeListReset, type ScrollEdgeBackdrop } from '../../hooks/use-scroll-edge-backdrop';
+import { useHideOnScroll } from '../../hooks/use-hide-on-scroll';
+import { PressableSurface } from '../PressableSurface';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  Pressable,
-  RefreshControl,
-  StyleSheet,
-  View,
-  type NativeScrollEvent,
-  type NativeSyntheticEvent,
-} from 'react-native';
+import { RefreshControl, StyleSheet, View } from 'react-native';
 import { FlashList, type FlashListRef } from '@shopify/flash-list';
 import { useTranslation } from 'react-i18next';
 import type { PublicUserProfile } from '@boardsesh/shared-schema';
@@ -41,14 +39,20 @@ type SocialMode = 'followers' | 'following' | 'search';
 
 type SocialTabProps = {
   userId: string | undefined;
-  onScroll?: (event: NativeSyntheticEvent<NativeScrollEvent>) => void;
+  /** The Profile tab's `useScrollEdgeBackdrop().list`: tells the floating header
+   *  when this tab's list is scrolled under it. Undefined under an opaque header. */
+  scrollEdge?: ScrollEdgeBackdrop;
   topInset?: number;
   registerScrollToTop?: (scrollToTop: (() => void) | null) => void;
 };
 
 const EMPTY_PEOPLE: SocialPerson[] = [];
 
-export function SocialTab({ userId, onScroll, topInset = 0, registerScrollToTop }: SocialTabProps) {
+export function SocialTab({ userId, scrollEdge, topInset = 0, registerScrollToTop }: SocialTabProps) {
+  const nativeRootHeader = useNativeRootHeader();
+  // On the Profile tab the Android nav bar hides as this list scrolls down; each
+  // sub-tab is its own scroll source, so switching sub-tabs never reads as a jump.
+  const handleScroll = useHideOnScroll(scrollEdge?.listProps.onScroll);
   const { t } = useTranslation('you');
   const { systemColors, brandColors } = useTheme();
   const bottomChrome = useBottomChromeMetrics();
@@ -200,15 +204,18 @@ export function SocialTab({ userId, onScroll, topInset = 0, registerScrollToTop 
   }
 
   return (
-    <View style={styles.flex}>
+    <ReadableColumn style={styles.flex}>
+      {/* The signed-out branch above unmounts the list. */}
+      <ScrollEdgeListReset edge={scrollEdge} />
       <FlashList
         ref={listRef}
         data={showInitialSpinner || showSearchHint || showError || showOffline ? EMPTY_PEOPLE : people}
         renderItem={renderItem}
         keyExtractor={(person) => person.id}
-        onScroll={onScroll}
+        {...scrollEdge?.listProps}
+        onScroll={handleScroll}
         scrollEventThrottle={16}
-        contentInsetAdjustmentBehavior="never"
+        contentInsetAdjustmentBehavior={nativeRootHeader ? 'automatic' : 'never'}
         onEndReached={handleEndReached}
         onEndReachedThreshold={0.5}
         contentContainerStyle={{ paddingTop: topInset, paddingBottom }}
@@ -240,7 +247,7 @@ export function SocialTab({ userId, onScroll, topInset = 0, registerScrollToTop 
           ) : null
         }
       />
-    </View>
+    </ReadableColumn>
   );
 }
 
@@ -257,31 +264,38 @@ function SocialStatCard({
   active: boolean;
   onPress: () => void;
 }) {
-  const { systemColors, brandColors } = useTheme();
-  const color = active ? brandColors.primary : systemColors.secondaryLabel;
+  const { systemColors, selection } = useTheme();
+  const color = active ? selection.text : systemColors.secondaryLabel;
 
   return (
-    <Pressable
+    <PressableSurface
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={`${value} ${label}`}
+      accessibilityState={{ selected: active }}
       style={({ pressed }) => [
         styles.statCard,
         {
-          backgroundColor: systemColors.secondaryBackground,
-          borderColor: active ? brandColors.primary : systemColors.separator,
+          backgroundColor: active ? selection.fill : systemColors.secondaryBackground,
+          borderColor: active ? selection.checkmark : systemColors.separator,
         },
         pressed && { opacity: 0.75 },
       ]}
     >
       <Icon name={icon} size={20} color={color} />
+      {/* Not colour alone (HIG Color and Contrast / WCAG 1.4.1): the active card also carries a glyph. */}
+      {active ? (
+        <View style={styles.activeCheck} pointerEvents="none">
+          <Icon name="check.small" size={16} color={selection.checkmark} />
+        </View>
+      ) : null}
       <Text variant="title3" style={styles.statValue}>
         {getCachedNumberFormat(undefined).format(value)}
       </Text>
       <Text variant="footnote" color={systemColors.secondaryLabel}>
         {label}
       </Text>
-    </Pressable>
+    </PressableSurface>
   );
 }
 
@@ -294,7 +308,7 @@ function SocialEmptyState({ mode }: { mode: Exclude<SocialMode, 'search'> }) {
   return (
     <View style={styles.stateBlock}>
       <Icon name="people" size={48} color={systemColors.tertiaryLabel} />
-      <Text variant="headline" style={styles.stateTitle}>
+      <Text tone="secondary" variant="headline" style={styles.stateTitle}>
         {title}
       </Text>
     </View>
@@ -302,7 +316,7 @@ function SocialEmptyState({ mode }: { mode: Exclude<SocialMode, 'search'> }) {
 }
 
 const styles = StyleSheet.create({
-  flex: { flex: 1 },
+  flex: { flex: 1, minHeight: 0 },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   summaryRow: {
     flexDirection: 'row',
@@ -316,6 +330,11 @@ const styles = StyleSheet.create({
     borderRadius: borderRadius.lg,
     padding: spacing[4],
     gap: spacing[1],
+  },
+  activeCheck: {
+    position: 'absolute',
+    top: spacing[2],
+    right: spacing[2],
   },
   statValue: {
     fontWeight: '700',
@@ -338,7 +357,6 @@ const styles = StyleSheet.create({
   },
   stateTitle: {
     marginTop: spacing[3],
-    opacity: 0.65,
     textAlign: 'center',
   },
   footer: {

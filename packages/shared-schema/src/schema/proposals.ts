@@ -31,7 +31,7 @@ export const proposalsTypeDefs = /* GraphQL */ `
     climbUuid: String!
     boardType: String!
     angle: Int
-    proposerId: ID!
+    proposerId: ID
     proposerDisplayName: String
     proposerAvatarUrl: String
     type: ProposalType!
@@ -250,6 +250,7 @@ export const proposalsTypeDefs = /* GraphQL */ `
   }
 
   input ReportClimbInput {
+    releaseContext: ReleaseContextInput
     climbUuid: String!
     boardType: String!
     "Required for grade reports; ignored for hide"

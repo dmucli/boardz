@@ -1,15 +1,13 @@
 /**
- * `@boardsesh/spray-wall-geometry` — the maths a spray wall needs to survive
- * being photographed twice: the per-version homography that puts two photos in
- * one coordinate frame, and the matcher that decides which holds are still
- * there after a reset.
+ * `@boardsesh/spray-wall-geometry` — the maths a spray wall photo needs: the
+ * per-version homography that maps a photo onto the wall's canonical frame, and
+ * the rule that tells a hold-edit draft from a new-photo draft.
  *
- * Pure TypeScript, no dependencies. The backend runs the matcher for real
- * (`proposeSprayWallReset`, SW-12) and the app runs the same code for a preview,
- * which is the whole point of it living here.
- *
- * The frame, the gates and why a moved hold is removed + added are written up in
- * `docs/spray-walls.md`, "Canonical coordinates and matching".
+ * Pure TypeScript, shared by the backend, the app and the web climb page. Its one
+ * dependency is `@boardsesh/board-art-geometry/ring`, the outline-ring contract
+ * the hold projection hands back. The hold matcher that compared two photos of one wall went with the
+ * retired in-place reset. The frame is written up in `docs/product/spray-walls.md`,
+ * "Canonical coordinates".
  */
 export {
   IDENTITY_HOMOGRAPHY,
@@ -27,24 +25,124 @@ export {
   mapRing,
   quadDoubleArea,
 } from './homography';
-export { INFEASIBLE, type Assignment, solveAssignment } from './hungarian';
+
 export {
-  DEFAULT_DISTANCE_GATE,
-  DEFAULT_IOU_GATE,
-  DEFAULT_MATCH_WEIGHTS,
-  DEFAULT_MOVE_RADII,
-  type AliveHold,
-  type KeptHold,
-  type MatchGates,
-  type MatchOptions,
-  type MatchResult,
-  type MatchWeights,
-  type MoveSuggestion,
-  type SuggestMovesOptions,
-  type WallCircle,
-  circleIou,
-  colourDistance,
-  matchHolds,
-  pairCost,
-  suggestMoves,
-} from './match';
+  type CanonicalSprayHold,
+  type SprayHoldProvenance,
+  type SprayPhotoHold,
+  mapCanonicalHoldsToPhoto,
+  scaleCanonicalHoldsToArt,
+} from './hold-projection';
+
+export { classifySprayDraft, sameSprayGeometry, type SprayDraftPurpose, type SprayVersionPhoto } from './draft-purpose';
+
+export {
+  ART_CIRCLE_POINTS,
+  ART_DILATE_FRACTION,
+  ART_DILATE_MAX_PX,
+  ART_FEATHER_FRACTION,
+  ART_FEATHER_MAX_SIGMA,
+  ART_MAX_EDGE,
+  ART_RECIPE,
+  SPRAY_WALL_BACKGROUNDS,
+  type ArtHold,
+  type ArtMaskRing,
+  type ArtSize,
+  type SprayWallBackground,
+  artFeather,
+  canonicalArtSize,
+  holdMaskRings,
+  warpBilinear,
+} from './clean-art';
+export {
+  ART_MIN_FRAME_SHORT_EDGE,
+  ART_STRETCH_GOOD_MAX,
+  ART_STRETCH_GRID,
+  ART_STRETCH_GRID_MARGIN,
+  ART_STRETCH_SOFT_MAX,
+  type ArtQualityReason,
+  type ArtVerdict,
+  type PhotoQuality,
+  measureStretch,
+  photoQuality,
+} from './photo-quality';
+export {
+  PREVIEW_MESH_MAX_DIVISIONS,
+  PREVIEW_MESH_TOLERANCE_PX,
+  type AffineMatrix,
+  type PreviewMesh,
+  type PreviewMeshTriangle,
+  affinePreviewMesh,
+  applyViewMatrix,
+  perspectiveViewMatrix,
+  photoToTileHomography,
+} from './look-preview';
+
+export { SPRAY_WALL_PHOTO_MAX_LONG_SIDE, SPRAY_WALL_PHOTO_MAX_PIXELS, sprayWallPhotoMaxLongSide } from './photo-size';
+
+export {
+  DEFAULT_TNUT_CORNERS,
+  DEFAULT_TNUT_DIMENSION,
+  MAX_TNUT_DIMENSION,
+  MAX_TNUT_HOLES,
+  MAX_TNUT_LAYOUT_BYTES,
+  MIN_TNUT_DIMENSION,
+  generateTnutGrid,
+  isValidTnutCorners,
+  isValidTnutGrid,
+  readTnutLayout,
+  tnutGridPath,
+  type TnutCorners,
+  type TnutGridOptions,
+  type TnutLayout,
+  type TnutPattern,
+  type SprayLedPlacement,
+  type TnutPoint,
+} from './tnut-layout';
+export { migrateTnutLayoutColumns } from './tnut-layout';
+export {
+  MAX_HOLD_LED_LINKS,
+  MAX_LEDS_PER_HOLD_LINK,
+  clearHoldLedLink,
+  readHoldLedLinks,
+  setHoldLedLink,
+  type SprayHoldLedLink,
+} from './hold-led-links';
+export {
+  groupLedPair,
+  ledPairs,
+  ledPartner,
+  keepLedPairsFromOlderApp,
+  readLedPairs,
+  separateLedPair,
+  withLedPartners,
+  type SprayLedPair,
+} from './led-pairs';
+export {
+  bindLedPositionsToHoles,
+  buildSprayLedMapping,
+  findSprayHoldAtPoint,
+  type SprayHoleLedMapping,
+  type SprayHoldLedMapping,
+  type SprayLedMapping,
+} from './hold-led-mapping';
+export {
+  MAX_LED_POSITIONS,
+  MAX_WIRING_SKIP,
+  MAX_WIRING_TOTAL_SKIPS,
+  generateLedPositions,
+  createWiring,
+  connectWiring,
+  extendWiring,
+  cutWiring,
+  setWiringSkip,
+  wiringSkipCount,
+  setWiringInitialSkip,
+  assignLedIndices,
+  rowMajorLedIndices,
+  traceLedPath,
+  type LedPosition,
+  type TnutWiring,
+  type CableDirection,
+  type CableStartCorner,
+} from './led-layout';

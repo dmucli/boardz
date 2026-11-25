@@ -182,9 +182,9 @@ describe('family contracts', () => {
       {
         name: 'kilter-catalog-sync',
         role: 'routine-provider',
-        cron: '23 * * * *',
+        cron: '23 */6 * * *',
         options: {
-          expireInSeconds: 3600,
+          expireInSeconds: 7200,
           retryLimit: 1,
           retryDelay: 300,
           deadlineSeconds: AURORA_SHARED_SYNC_DEADLINE_SECONDS,
@@ -211,6 +211,18 @@ describe('family contracts', () => {
         cron: '13 * * * *',
         options: { expireInSeconds: 900, retryLimit: 1, retryDelay: 300, deadlineSeconds: 3600, heartbeatSeconds: 120 },
       },
+      {
+        name: 'reclaim-logbook-snapshots',
+        role: 'maintenance-delivery',
+        cron: '2,17,32,47 * * * *',
+        options: { expireInSeconds: 300, retryLimit: 1, retryDelay: 60, deadlineSeconds: 900, heartbeatSeconds: 60 },
+      },
+      {
+        name: 'prune-logbook-changes',
+        role: 'maintenance-delivery',
+        cron: '53 3 * * *',
+        options: { expireInSeconds: 600, retryLimit: 1, retryDelay: 300, deadlineSeconds: 3600, heartbeatSeconds: 60 },
+      },
     ];
     for (const { name, role, cron, options } of cases) {
       const family = requireFamily(name);
@@ -233,6 +245,8 @@ describe('family contracts', () => {
       'kilter-catalog-sync',
       'moonboard-locations-sync',
       'climb-stats-self-heal',
+      'reclaim-logbook-snapshots',
+      'prune-logbook-changes',
     ]) {
       const { options } = requireFamily(name);
       expect(options.retryBackoff).toBe(true);

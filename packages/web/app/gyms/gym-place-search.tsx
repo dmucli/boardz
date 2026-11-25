@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useTranslation } from 'react-i18next';
 import Autocomplete from '@mui/material/Autocomplete';
@@ -11,24 +11,43 @@ import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import { SEARCH_PLACES, type SearchPlacesQueryResponse } from '@boardsesh/graphql/operations';
 import type { PlaceSuggestion } from '@boardsesh/shared-schema';
+import { isPlaceSearchQuery, PLACE_SEARCH_DEBOUNCE_MS, placeSuggestionLabel } from '@boardsesh/gym-filters';
 import { createGraphQLHttpClient } from '@/app/lib/graphql/client';
 import type { Locale } from '@/app/lib/i18n/config';
 import { localeHref } from '@/app/lib/i18n/locale-href';
 import { buildDirectoryHref, FACET_BASE_PATHS, type DirectoryFacet, type DirectoryQuery } from './directory-facets';
 
-function placeLabel(place: PlaceSuggestion): string {
-  return [...new Set([place.name, place.region, place.country].filter(Boolean))].join(', ');
-}
+/** Serializable route and copy overrides for another public directory. */
+export type DirectorySearchAdapter = {
+  basePath: string;
+  /** Carries the directory's active filters when a suggested town is selected. */
+  selectedPlaceBaseHref: string;
+  searchLabel: string;
+  searchPlaceholder: string;
+  searchSubmit: string;
+  placeHint?: string;
+  placeEmpty?: string;
+  placeError?: string;
+  inputId?: string;
+  placeRadiusKm?: number;
+};
 
 export default function GymPlaceSearch({
-  facet,
+  facet = 'all',
   query,
   locale,
   children,
+  actions,
+  focusSearch = false,
+  directory,
 }: {
-  facet: DirectoryFacet;
+  facet?: DirectoryFacet;
   query: DirectoryQuery;
   locale: Locale;
+  focusSearch?: boolean;
+  directory?: DirectorySearchAdapter;
+  /** Secondary controls in the submit row; they must use type="button". */
+  actions?: React.ReactNode;
   /**
    * The board filter panel, rendered INSIDE this form.
    *
@@ -42,6 +61,10 @@ export default function GymPlaceSearch({
 }) {
   const { t } = useTranslation('gyms');
   const router = useRouter();
+  const searchInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (focusSearch) searchInput.current?.focus();
+  }, [focusSearch]);
   const [input, setInput] = useState(query.place ?? query.query);
   const [edited, setEdited] = useState(false);
   const [suggestions, setSuggestions] = useState<PlaceSuggestion[]>([]);
@@ -53,7 +76,7 @@ export default function GymPlaceSearch({
 
   useEffect(() => {
     const trimmed = input.trim();
-    if (!edited || trimmed.length < 3 || trimmed.length > 80) return;
+    if (!edited || !isPlaceSearchQuery(trimmed)) return;
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       try {
@@ -69,7 +92,7 @@ export default function GymPlaceSearch({
       } catch {
         if (!controller.signal.aborted) setStatus('error');
       }
-    }, 300);
+    }, PLACE_SEARCH_DEBOUNCE_MS);
     return () => {
       clearTimeout(timer);
       controller.abort();
@@ -77,6 +100,17 @@ export default function GymPlaceSearch({
   }, [input, edited]);
 
   const selectPlace = (place: PlaceSuggestion) => {
+    if (directory) {
+      const href = new URL(directory.selectedPlaceBaseHref, 'https://www.boardsesh.com');
+      href.searchParams.delete('q');
+      href.searchParams.delete('page');
+      href.searchParams.set('place', placeSuggestionLabel(place));
+      href.searchParams.set('lat', String(place.latitude));
+      href.searchParams.set('lng', String(place.longitude));
+      href.searchParams.set('radius', String(directory.placeRadiusKm ?? 50));
+      router.push(localeHref(`${href.pathname}?${href.searchParams.toString()}`, locale));
+      return;
+    }
     router.push(
       localeHref(
         buildDirectoryHref(
@@ -84,7 +118,7 @@ export default function GymPlaceSearch({
           {
             ...query,
             query: '',
-            place: placeLabel(place),
+            place: placeSuggestionLabel(place),
             latitude: place.latitude,
             longitude: place.longitude,
             radiusKm: 50,
@@ -101,16 +135,17 @@ export default function GymPlaceSearch({
     <Box
       component="form"
       method="get"
-      action={localeHref(FACET_BASE_PATHS[facet], locale)}
+      action={localeHref(directory?.basePath ?? FACET_BASE_PATHS[facet], locale)}
       role="search"
       sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'flex-start', mb: 3 }}
     >
       <Box sx={{ flex: '1 1 260px', minWidth: 0 }}>
         <Autocomplete<PlaceSuggestion, false, false, true>
+          id={directory?.inputId ?? 'gym-directory-query'}
           freeSolo
           options={suggestions}
           filterOptions={(options) => options}
-          getOptionLabel={(option) => (typeof option === 'string' ? option : placeLabel(option))}
+          getOptionLabel={(option) => (typeof option === 'string' ? option : placeSuggestionLabel(option))}
           getOptionKey={(option) => (typeof option === 'string' ? option : option.id)}
           inputValue={input}
           value={selectedPlace ? input : null}
@@ -124,7 +159,7 @@ export default function GymPlaceSearch({
             setEdited(true);
             setInput(next);
             setSuggestions([]);
-            setStatus(next.trim().length >= 3 && next.trim().length <= 80 ? 'loading' : 'idle');
+            setStatus(isPlaceSearchQuery(next) ? 'loading' : 'idle');
           }}
           onChange={(_event, next) => {
             if (next && typeof next !== 'string') selectPlace(next);
@@ -132,11 +167,13 @@ export default function GymPlaceSearch({
           renderInput={(params) => (
             <TextField
               {...params}
+              autoFocus={focusSearch}
+              inputRef={searchInput}
               name={selectedPlace ? undefined : 'q'}
               type="search"
               size="small"
-              label={t('search.label')}
-              placeholder={t('search.placeholder')}
+              label={directory?.searchLabel ?? t('search.label')}
+              placeholder={directory?.searchPlaceholder ?? t('search.placeholder')}
               sx={{ '& .MuiInputBase-root': { minHeight: 44, fontSize: 16 } }}
             />
           )}
@@ -145,10 +182,10 @@ export default function GymPlaceSearch({
           {status === 'loading'
             ? t('places.loading')
             : status === 'error'
-              ? t('places.error')
+              ? (directory?.placeError ?? t('places.error'))
               : status === 'ready' && suggestions.length === 0
-                ? t('places.empty')
-                : t('places.hint')}
+                ? (directory?.placeEmpty ?? t('places.empty'))
+                : (directory?.placeHint ?? t('places.hint'))}
         </Typography>
         <MuiLink href="https://www.geonames.org/" target="_blank" rel="noreferrer" variant="caption">
           {t('places.attribution')}
@@ -162,8 +199,11 @@ export default function GymPlaceSearch({
           panel renders them as real checkboxes inside this same form, so a
           hidden twin would submit alongside an UNCHECKED box and make the filter
           impossible to remove. Facet routes carry their board type in the path. */}
-      {facet === 'all' &&
+      {!directory &&
+        facet === 'all' &&
         query.boardTypes.map((boardType) => <input key={boardType} type="hidden" name="boardType" value={boardType} />)}
+      {/* Claim mode survives a search: the results keep their Claim buttons. */}
+      {!directory && query.claimMode && <input type="hidden" name="claim" value="1" />}
       {keepOrigin && (
         <>
           <input type="hidden" name="lat" value={String(query.latitude)} />
@@ -172,12 +212,15 @@ export default function GymPlaceSearch({
           {selectedPlace && <input type="hidden" name="place" value={query.place} />}
         </>
       )}
-      <Button type="submit" variant="contained" sx={{ textTransform: 'none', minHeight: 44, fontSize: 16 }}>
-        {t('search.submit')}
-      </Button>
+      <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+        <Button type="submit" variant="contained" sx={{ textTransform: 'none', minHeight: 44, fontSize: 16 }}>
+          {directory?.searchSubmit ?? t('search.submit')}
+        </Button>
+        {actions}
+      </Box>
       {/* Full-width below the search row, so the filter tiers get the measure
           they need while the text field and its button stay on one line. */}
-      <Box sx={{ flexBasis: '100%' }}>{children}</Box>
+      <Box sx={{ flex: '1 1 100%', minWidth: 0, width: '100%', maxWidth: '100%' }}>{children}</Box>
     </Box>
   );
 }

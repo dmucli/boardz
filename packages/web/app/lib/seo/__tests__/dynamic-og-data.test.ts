@@ -1,263 +1,307 @@
 // @vitest-environment node
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
-
-const executeMock = vi.fn();
-const buildBoardRenderUrlMock = vi.fn();
-const resolveBoardBySlugMock = vi.fn();
-const boardToRouteParamsMock = vi.fn();
-const getBoardDetailsForBoardMock = vi.fn();
-const parseBoardRouteParamsWithSlugsMock = vi.fn();
-
+const { execute } = vi.hoisted(() => ({ execute: vi.fn() }));
 vi.mock('server-only', () => ({}));
-
-vi.mock('@/app/components/board-renderer/util', () => ({
-  buildBoardRenderUrl: buildBoardRenderUrlMock,
+vi.mock('react', () => ({
+  cache: <Arguments extends unknown[], Result>(callback: (...args: Arguments) => Result) => callback,
 }));
+vi.mock('@/app/lib/graphql/server-cached-client', () => ({ executeGraphQLInternal: execute }));
+import { getPlaylistOgSummary, getProfileOgSummary, getSessionOgSummary, getSetterOgSummary } from '../dynamic-og-data';
 
-vi.mock('@/app/lib/board-slug-utils', () => ({
-  resolveBoardBySlug: resolveBoardBySlugMock,
-  boardToRouteParams: boardToRouteParamsMock,
-}));
+beforeEach(() => {
+  execute.mockReset();
+});
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: getBoardDetailsForBoardMock,
-}));
-
-// dynamic-og-data uses `dbzRead` (drizzle) and `getReadPool()` (postgres-js
-// tagged template) for replica-tolerant reads. Mock both onto the existing
-// `executeMock` and a fresh tagged-template fake.
-const mockSqlTag = vi.fn();
-const rowsFromResultMock = <T>(result: unknown): T[] => {
-  if (Array.isArray(result)) return result as T[];
-  throw new TypeError('Expected postgres-js query result to be a row array');
-};
-vi.mock('@/app/lib/db/db', () => ({
-  dbz: { execute: executeMock },
-  sql: mockSqlTag,
-  dbzRead: { execute: executeMock },
-  getReadPool: () => mockSqlTag,
-  rowsFromResult: rowsFromResultMock,
-  executeRows: async <T>(conn: { execute: (query: unknown) => Promise<unknown> }, query: unknown) =>
-    rowsFromResultMock<T>(await conn.execute(query)),
-}));
-
-vi.mock('@/app/lib/string-utils', () => ({
-  formatBoardDisplayName: vi.fn((value: string) =>
-    value === 'moonboard' ? 'MoonBoard' : value.charAt(0).toUpperCase() + value.slice(1),
-  ),
-}));
-
-vi.mock('@/app/lib/url-utils.server', () => ({
-  parseBoardRouteParamsWithSlugs: parseBoardRouteParamsWithSlugsMock,
-}));
-
-describe('getSessionOgSummary', () => {
-  beforeEach(() => {
-    executeMock.mockReset();
-    buildBoardRenderUrlMock.mockReset();
-    resolveBoardBySlugMock.mockReset();
-    boardToRouteParamsMock.mockReset();
-    getBoardDetailsForBoardMock.mockReset();
-    parseBoardRouteParamsWithSlugsMock.mockReset();
-
-    buildBoardRenderUrlMock.mockReturnValue('/api/internal/board-render?frames=&thumbnail=1');
-    boardToRouteParamsMock.mockReturnValue({
-      board_name: 'kilter',
-      layout_id: 1,
-      size_id: 7,
-      set_ids: [1, 20],
-      angle: 40,
+describe('public previews reauthorize through the backend', () => {
+  it('never fetches activity for a private profile', async () => {
+    execute.mockResolvedValue({
+      publicProfile: { displayName: 'Private climber', avatarUrl: '/avatar', isPrivate: true },
     });
-    getBoardDetailsForBoardMock.mockReturnValue({
-      board_name: 'kilter',
-      layout_id: 1,
-      size_id: 7,
-      set_ids: [1, 20],
-      layout_name: 'Kilter Board Original',
-      size_name: '12 x 12 Commercial',
-      size_description: 'Commercial',
-    });
-    parseBoardRouteParamsWithSlugsMock.mockResolvedValue({
-      board_name: 'tension',
-      layout_id: 2,
-      size_id: 3,
-      set_ids: [4],
-      angle: 0,
-    });
-    vi.resetModules();
+    expect(await getProfileOgSummary('owner')).toBeNull();
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 
-  it('reads party sessions from board_sessions and resolves slug board previews', async () => {
-    executeMock
-      .mockResolvedValueOnce([
-        {
-          name: 'Evening Session',
-          leader_name: 'Alex',
-          version_at: '2024-01-03T00:00:00.000Z',
-          board_path: '/b/my-home-wall',
-          board_slug: null,
-          board_angle: null,
-          board_type: null,
-          layout_id: null,
-          size_id: null,
-          set_ids: null,
-        },
-      ])
-      .mockResolvedValueOnce([{ participant_count: 2 }])
-      .mockResolvedValueOnce([{ display_name: 'Alex' }, { display_name: 'Sam' }])
-      .mockResolvedValueOnce([{ total_sends: 2 }])
-      .mockResolvedValueOnce([{ difficulty: 10, cnt: 2 }]);
-    resolveBoardBySlugMock.mockResolvedValue({
-      slug: 'my-home-wall',
-      boardType: 'kilter',
-      layoutId: 1,
-      sizeId: 7,
-      setIds: '1,20',
-      angle: 40,
+  it("reads the card's own documents: stats with consensus grades and the hardest visible send", async () => {
+    execute.mockResolvedValueOnce({ publicProfile: { displayName: 'Alex', avatarUrl: null, isPrivate: false } });
+    execute.mockResolvedValueOnce({
+      userProfileStats: {
+        totalDistinctClimbs: 14,
+        layoutStats: [
+          { boardType: 'tension', distinctClimbCount: 2, gradeCounts: [] },
+          { boardType: 'kilter', distinctClimbCount: 12, gradeCounts: [{ grade: '24', count: 1 }] },
+          { boardType: 'moonboard', distinctClimbCount: 0, gradeCounts: [] },
+        ],
+      },
+      userAscentsFeed: {
+        items: [
+          { climbUuid: 'c1', climbName: 'Swooped', boardType: 'kilter', difficulty: null, consensusDifficulty: 23.6 },
+        ],
+      },
     });
 
-    const { getSessionOgSummary } = await import('../dynamic-og-data');
-    const summary = await getSessionOgSummary('session-123');
+    const result = await getProfileOgSummary('owner');
 
-    const sessionQuery = executeMock.mock.calls[0][0] as {
-      queryChunks?: Array<{ value?: string[] }>;
-    };
-    const sqlText = (sessionQuery.queryChunks || [])
-      .map((chunk) => (Array.isArray(chunk?.value) ? chunk.value.join('') : ''))
-      .join('');
-
-    expect(sqlText).toContain('bs.name');
-    expect(sqlText).toContain('FROM board_sessions bs');
-    const gradeQuery = executeMock.mock.calls[4][0] as {
-      queryChunks?: Array<{ value?: string[] }>;
-    };
-    const gradeSql = (gradeQuery.queryChunks || [])
-      .map((chunk) => (Array.isArray(chunk?.value) ? chunk.value.join('') : ''))
-      .join('');
-
-    expect(executeMock).toHaveBeenCalledTimes(5);
-    expect(gradeSql).toContain('display_difficulty');
-    expect(resolveBoardBySlugMock).toHaveBeenCalledWith('my-home-wall');
-    expect(boardToRouteParamsMock).toHaveBeenCalled();
-    expect(buildBoardRenderUrlMock).toHaveBeenCalledWith(
-      expect.objectContaining({ board_name: 'kilter' }),
-      '',
-      expect.objectContaining({ thumbnail: true, includeBackground: true, format: 'png' }),
-    );
-    expect(summary.sessionType).toBe('party');
-    expect(summary.sessionName).toBe('Evening Session');
-    expect(summary.leaderName).toBe('Alex');
-    expect(summary.participantNames).toEqual(['Alex', 'Sam']);
-    expect(summary.participantCount).toBe(2);
-    expect(summary.totalSends).toBe(2);
-    expect(summary.boardLabel).toBe('Kilter Original 12x12');
-    expect(summary.boardAngle).toBe(40);
-    expect(summary.boardPreviewPath).toBe('/api/internal/board-render?frames=&thumbnail=1');
-    expect(summary.found).toBe(true);
+    expect(result).toMatchObject({
+      displayName: 'Alex',
+      topBoardType: 'kilter',
+      sentBoardTypes: ['kilter', 'tension'],
+      sentClimbCount: 14,
+      // No logged grade, so the consensus (rounded to 24) stands in.
+      hardestSend: { climbName: 'Swooped', grade: '7b/V8' },
+    });
+    const [, [document, variables]] = execute.mock.calls;
+    expect(String(document)).toContain('userProfileStats');
+    expect(variables).toMatchObject({
+      input: { limit: 1, sortBy: 'hardest', statusMode: 'send', excludeHiddenClimbs: true },
+    });
   });
 
-  it('returns not-found data when the session is not explicit', async () => {
-    executeMock.mockResolvedValueOnce([]);
+  it('leaves the name to the page when the climber has none, instead of inventing one', async () => {
+    execute.mockResolvedValueOnce({ publicProfile: { displayName: '  ', avatarUrl: null, isPrivate: false } });
+    execute.mockResolvedValueOnce({
+      userProfileStats: { totalDistinctClimbs: 0, layoutStats: [] },
+      userAscentsFeed: { items: [] },
+    });
 
-    const { getSessionOgSummary } = await import('../dynamic-og-data');
-    const summary = await getSessionOgSummary('missing-session');
-
-    expect(executeMock).toHaveBeenCalledTimes(1);
-    expect(summary.sessionType).toBeNull();
-    expect(summary.sessionName).toBe('Climbing Session');
-    expect(summary.leaderName).toBeNull();
-    expect(summary.participantNames).toEqual([]);
-    expect(summary.participantCount).toBe(0);
-    expect(summary.totalSends).toBe(0);
-    expect(summary.boardLabel).toBeNull();
-    expect(summary.boardPreviewPath).toBeNull();
-    expect(summary.found).toBe(false);
+    expect(await getProfileOgSummary('owner')).toMatchObject({
+      displayName: null,
+      hardestSend: null,
+      topBoardType: null,
+    });
   });
 
-  it('uses board config from legacy board paths when present', async () => {
-    executeMock
-      .mockResolvedValueOnce([
-        {
-          name: 'Board Night',
-          leader_name: 'Sam',
-          version_at: '2024-01-06T00:00:00.000Z',
-          board_path: '/tension/original/8x10/main_aux/35',
-          board_slug: null,
-          board_angle: null,
-          board_type: null,
-          layout_id: null,
-          size_id: null,
-          set_ids: null,
-        },
-      ])
-      .mockResolvedValueOnce([{ participant_count: 3 }])
-      .mockResolvedValueOnce([{ display_name: 'Sam' }, { display_name: 'Taylor' }])
-      .mockResolvedValueOnce([{ total_sends: 3 }])
-      .mockResolvedValueOnce([{ difficulty: 10, cnt: 3 }]);
-    parseBoardRouteParamsWithSlugsMock.mockResolvedValueOnce({
-      board_name: 'tension',
-      layout_id: 2,
-      size_id: 3,
-      set_ids: [4, 5],
-      angle: 35,
-    });
-    getBoardDetailsForBoardMock.mockReturnValueOnce({
-      board_name: 'tension',
-      layout_id: 2,
-      size_id: 3,
-      set_ids: [4, 5],
-      layout_name: 'Tension Board Original',
-      size_name: '8 x 10',
-      size_description: 'Home',
-    });
-
-    const { getSessionOgSummary } = await import('../dynamic-og-data');
-    const summary = await getSessionOgSummary('legacy-party-123');
-
-    expect(parseBoardRouteParamsWithSlugsMock).toHaveBeenCalledWith({
-      board_name: 'tension',
-      layout_id: 'original',
-      size_id: '8x10',
-      set_ids: 'main_aux',
-      angle: '35',
-    });
-    expect(summary.boardLabel).toBe('Tension Original 8x10');
-    expect(summary.boardAngle).toBe(35);
+  it('reauthorizes old profile URLs after a privacy change', async () => {
+    execute.mockResolvedValue({ publicProfile: { displayName: 'Alex', avatarUrl: null, isPrivate: true } });
+    expect(await getProfileOgSummary('owner')).toBeNull();
+    expect(await getProfileOgSummary('owner')).toBeNull();
+    expect(execute).toHaveBeenCalledTimes(2);
   });
 
-  it('counts sends even when tick difficulty is null and grades come from climb stats', async () => {
-    executeMock
-      .mockResolvedValueOnce([
-        {
-          name: 'Null Grade Night',
-          leader_name: 'Alex',
-          version_at: '2024-01-07T00:00:00.000Z',
-          board_path: '/b/my-home-wall',
-          board_slug: null,
-          board_angle: null,
-          board_type: null,
-          layout_id: null,
-          size_id: null,
-          set_ids: null,
-        },
-      ])
-      .mockResolvedValueOnce([{ participant_count: 1 }])
-      .mockResolvedValueOnce([{ display_name: 'Alex' }])
-      .mockResolvedValueOnce([{ total_sends: 5 }])
-      .mockResolvedValueOnce([{ difficulty: 20, cnt: 5 }]);
-    resolveBoardBySlugMock.mockResolvedValue({
-      slug: 'my-home-wall',
-      boardType: 'kilter',
-      layoutId: 1,
-      sizeId: 7,
-      setIds: '1,20',
-      angle: 40,
+  it('omits private sessions and playlists even when their IDs are known', async () => {
+    execute.mockResolvedValueOnce({ sessionDetail: null });
+    expect(await getSessionOgSummary('private-session')).toMatchObject({
+      found: false,
+      participantNames: [],
+      totalSends: 0,
+    });
+    execute.mockResolvedValueOnce({ playlist: null });
+    expect(await getPlaylistOgSummary('private-playlist')).toBeNull();
+  });
+
+  it('uses projected session participants and preserves allowed aggregate totals', async () => {
+    execute.mockResolvedValue({
+      sessionDetail: {
+        sessionName: 'Crew',
+        totalSends: 7,
+        lastTickAt: '2026-01-01',
+        boardTypes: ['kilter'],
+        gradeDistribution: [{ grade: '5c/V2', flash: 2, send: 5 }],
+        participants: [{ displayName: 'Alex' }, { displayName: null }],
+      },
+    });
+    expect(await getSessionOgSummary('public-session')).toMatchObject({
+      found: true,
+      participantNames: ['Alex'],
+      totalSends: 7,
+      participantCount: 2,
+      gradeRows: [{ difficulty: 15, count: 7 }],
+    });
+  });
+
+  it('keeps a public live invite preview before its first tick, without private roster names', async () => {
+    execute.mockResolvedValue({
+      sessionDetail: null,
+      session: {
+        name: 'First session',
+        startedAt: '2026-01-01',
+        users: [
+          { userId: null, username: 'Private climber', isLeader: true },
+          { userId: 'public-user', username: 'Alex', isLeader: false },
+        ],
+      },
+    });
+    expect(await getSessionOgSummary('new-session')).toMatchObject({
+      found: true,
+      sessionName: 'First session',
+      participantNames: ['Alex'],
+      participantCount: 2,
+      totalSends: 0,
+      leaderName: null,
+    });
+  });
+
+  it('does not reconstruct a private account link from a public setter name', async () => {
+    execute.mockResolvedValue({
+      setterProfile: { climbCount: 1, totalAscents: 4, linkedUserDisplayName: null, linkedUserAvatarUrl: null },
+    });
+    expect(await getSetterOgSummary('catalog-setter')).toMatchObject({
+      displayName: 'catalog-setter',
+      totalAscents: 4,
+    });
+  });
+
+  it("versions a setter's card on what it draws, not a constant", async () => {
+    execute.mockResolvedValueOnce({
+      setterProfile: {
+        climbCount: 391,
+        totalAscents: 1_136_595,
+        linkedUserDisplayName: null,
+        linkedUserAvatarUrl: null,
+      },
+    });
+    execute.mockResolvedValueOnce({
+      setterProfile: {
+        climbCount: 391,
+        totalAscents: 1_136_600,
+        linkedUserDisplayName: null,
+        linkedUserAvatarUrl: null,
+      },
     });
 
-    const { getSessionOgSummary } = await import('../dynamic-og-data');
-    const summary = await getSessionOgSummary('null-grade-session');
+    const before = await getSetterOgSummary('KilterStudio');
+    const after = await getSetterOgSummary('KilterStudio');
 
-    expect(summary.totalSends).toBe(5);
-    expect(summary.gradeRows).toEqual([{ difficulty: 20, count: 5 }]);
+    expect(before?.version).not.toBe(after?.version);
+  });
+
+  it('picks the hardest send and the hardest attempt from the ticks a stranger may see', async () => {
+    execute.mockResolvedValue({
+      sessionDetail: {
+        sessionName: null,
+        totalSends: 2,
+        totalFlashes: 1,
+        durationMinutes: 49,
+        lastTickAt: '2026-01-01',
+        boardTypes: ['kilter'],
+        gradeDistribution: [],
+        participants: [{ displayName: 'Zara' }],
+        ticks: [
+          {
+            boardType: 'kilter',
+            angle: 40,
+            status: 'flash',
+            difficulty: 16,
+            difficultyName: '6a/V3',
+          },
+          {
+            boardType: 'kilter',
+            angle: 45,
+            status: 'send',
+            difficulty: 22,
+            difficultyName: '7a/V6',
+          },
+          {
+            boardType: 'kilter',
+            angle: 45,
+            status: 'attempt',
+            difficulty: 25,
+            difficultyName: null,
+          },
+        ],
+      },
+      session: null,
+    });
+
+    expect(await getSessionOgSummary('recap')).toMatchObject({
+      isLive: false,
+      tickCount: 3,
+      totalFlashes: 1,
+      durationMinutes: 49,
+      recapParticipants: [{ name: 'Zara' }],
+      hardestSend: { grade: '7a/V6', angle: 45, flashed: false },
+      hardestAttempt: { grade: '7b+/V8', angle: 45, flashed: false },
+    });
+  });
+
+  it("reads a live session's named board through boardBySlug, keeping the path's angle", async () => {
+    execute.mockResolvedValueOnce({
+      sessionDetail: null,
+      session: {
+        name: null,
+        startedAt: '2026-01-01',
+        boardPath: '/b/boiler-room-moonboard/25/list',
+        users: [{ userId: 'u1', username: 'Huy Dang', isLeader: true }],
+      },
+    });
+    execute.mockResolvedValueOnce({ boardBySlug: { boardType: 'moonboard', angle: 40 } });
+
+    expect(await getSessionOgSummary('live')).toMatchObject({
+      isLive: true,
+      inviteName: 'Huy Dang',
+      liveBoard: { boardType: 'moonboard', angle: 25 },
+    });
+    expect(execute.mock.calls[1][1]).toEqual({ slug: 'boiler-room-moonboard' });
+  });
+
+  it('never asks the anonymous surface for climb names, since it cannot say which are hidden', async () => {
+    execute.mockResolvedValue({ sessionDetail: null, session: null });
+
+    await getSessionOgSummary('any');
+
+    expect(String(execute.mock.calls[0][0])).not.toContain('climbName');
+  });
+
+  it('keeps a live session found when its board lookup fails, and drops only the board', async () => {
+    execute.mockResolvedValueOnce({
+      sessionDetail: null,
+      session: { name: null, startedAt: '2026-01-01', boardPath: '/b/some-wall', users: [] },
+    });
+    execute.mockRejectedValueOnce(new Error('boardBySlug failed'));
+
+    expect(await getSessionOgSummary('live-flaky')).toMatchObject({ found: true, isLive: true, liveBoard: null });
+  });
+
+  it("reads a live session's geometry path without a lookup", async () => {
+    execute.mockResolvedValue({
+      sessionDetail: null,
+      session: { name: null, startedAt: '2026-01-01', boardPath: 'tension/9/1/8,9/40', users: [] },
+    });
+
+    expect(await getSessionOgSummary('geometry')).toMatchObject({
+      inviteName: null,
+      liveBoard: { boardType: 'tension', angle: 40 },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("counts a public playlist's climbs as a stranger sees them, and folds the band into the token", async () => {
+    execute.mockResolvedValueOnce({
+      playlist: {
+        name: 'Benchmarks',
+        description: null,
+        color: null,
+        icon: null,
+        isPublic: true,
+        boardType: 'kilter',
+        climbCount: 120,
+        updatedAt: '2026-01-01',
+        gradeSummary: { p10Difficulty: 20, p90Difficulty: 26 },
+      },
+    });
+    execute.mockResolvedValueOnce({ playlistClimbs: { totalCount: 117 } });
+
+    const result = await getPlaylistOgSummary('pl-1');
+
+    expect(result).toMatchObject({ climbCount: 117, gradeSummary: { p10Difficulty: 20, p90Difficulty: 26 } });
+    expect(execute.mock.calls[1][1]).toEqual({ input: { playlistId: 'pl-1', page: 0, pageSize: 1 } });
+  });
+
+  it("never reads a private playlist's climbs", async () => {
+    execute.mockResolvedValueOnce({
+      playlist: {
+        name: 'Mine',
+        description: null,
+        color: null,
+        icon: null,
+        isPublic: false,
+        boardType: 'kilter',
+        climbCount: 3,
+        updatedAt: '2026-01-01',
+        gradeSummary: null,
+      },
+    });
+
+    expect(await getPlaylistOgSummary('pl-private')).toMatchObject({ isPublic: false });
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 });

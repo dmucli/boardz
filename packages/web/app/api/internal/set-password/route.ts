@@ -1,11 +1,17 @@
-import { getServerSession } from 'next-auth/next';
+import { setPasswordMode } from '@boardsesh/auth-protocol';
+import { delegateSetPassword } from '@/app/lib/auth/set-password-command.server';
+import { AuthBackendUnavailableError } from '@/app/lib/auth/password-command-client.server';
+import { CredentialAuthorityUnavailable } from '@/app/lib/auth/credential-admission.server';
+import { unavailableCredentialResponse } from '@/app/lib/auth/credential-admission-response.server';
+import { getAdmittedServerSession } from '@/app/lib/auth/admitted-session.server';
+import { requireExpectedViewer } from '@/app/lib/auth/expected-viewer.server';
 import { type NextRequest, NextResponse } from 'next/server';
 import { getDb } from '@/app/lib/db/db';
 import * as schema from '@/app/lib/db/schema';
 import { hash } from 'bcryptjs';
+import { PASSWORD_HASH_COST } from '@boardsesh/auth-protocol/password-hash';
 import { eq, and, isNull } from 'drizzle-orm';
 import { z } from 'zod';
-import { authOptions } from '@/app/lib/auth/auth-options';
 import { checkRateLimit, getClientIp } from '@/app/lib/auth/rate-limiter';
 
 const setPasswordSchema = z
@@ -15,6 +21,8 @@ const setPasswordSchema = z
       .min(8, 'Password must be at least 8 characters')
       .max(128, 'Password must be less than 128 characters'),
     confirmPassword: z.string(),
+    expectedUserId: z.string().min(1).optional(),
+    expectedAuthSessionId: z.string().min(1).max(1024).optional(),
   })
   .refine((data) => data.password === data.confirmPassword, {
     message: 'Passwords do not match',
@@ -23,7 +31,22 @@ const setPasswordSchema = z
 
 export async function POST(request: NextRequest) {
   try {
-    const session = await getServerSession(authOptions);
+    // Validate mode before any legacy credential write; mirror-on cannot fall back.
+    try {
+      setPasswordMode(process.env);
+    } catch {
+      throw new AuthBackendUnavailableError();
+    }
+    const session = await getAdmittedServerSession({ method: request.method });
+    // In `legacy` mode nothing below compares the body's expected identity with
+    // the cookie, so this is the only thing that stops a stale tab writing a
+    // password to the account the cookie names now. The settings card, through
+    // the www guard, is the one caller, so a missing header is refused.
+    const viewerChanged = requireExpectedViewer(request, session, {
+      route: '/api/internal/set-password',
+      missing: 'reject',
+    });
+    if (viewerChanged) return viewerChanged;
 
     if (!session?.user?.id) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
@@ -67,7 +90,16 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: validationResult.error.issues[0].message }, { status: 400 });
     }
 
-    const { password } = validationResult.data;
+    const { password, confirmPassword, expectedUserId, expectedAuthSessionId } = validationResult.data;
+    const delegated = await delegateSetPassword(
+      request,
+      password,
+      confirmPassword,
+      expectedUserId && expectedAuthSessionId
+        ? { userId: expectedUserId, authSessionId: expectedAuthSessionId }
+        : undefined,
+    );
+    if (delegated) return delegated;
     const db = getDb();
 
     // Check if credentials already exist
@@ -82,7 +114,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Hash password and insert
-    const passwordHash = await hash(password, 12);
+    const passwordHash = await hash(password, PASSWORD_HASH_COST);
 
     try {
       await db.transaction(async (tx) => {
@@ -111,6 +143,12 @@ export async function POST(request: NextRequest) {
       message: 'Password set successfully. You can now log in with your email and password.',
     });
   } catch (error) {
+    if (error instanceof AuthBackendUnavailableError)
+      return NextResponse.json(
+        { error: 'Service temporarily unavailable' },
+        { status: 503, headers: { 'Retry-After': '1' } },
+      );
+    if (error instanceof CredentialAuthorityUnavailable) return unavailableCredentialResponse();
     console.error('Set password error:', error);
     return NextResponse.json({ error: 'An error occurred while setting the password' }, { status: 500 });
   }

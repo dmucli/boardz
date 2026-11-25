@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import { checkAdmin } from '@/app/lib/admin/check-admin';
 import { SERVER_FEATURE_FLAG_KEYS } from '@/app/flags';
 import { getPosthogDistinctId } from '@/app/lib/feature-flags/server-distinct-id';
+import { CredentialAuthorityUnavailable } from '@/app/lib/auth/credential-admission.server';
+import { unavailableCredentialResponse } from '@/app/lib/auth/credential-admission-response.server';
 import {
   ANONYMOUS_DISTINCT_ID,
   describeServerFeatureFlagConfig,
@@ -13,9 +15,8 @@ import {
 
 /**
  * Admin-only diagnostics for the SERVER-side feature flags — the ones that gate
- * whether a route renders at all. `SERVER_FEATURE_FLAG_KEYS` is empty since
- * `/gyms` launched unconditionally, so today every question comes in through
- * `?key=`; a registered flag is covered automatically once one exists again.
+ * whether a route renders at all. Every key in `SERVER_FEATURE_FLAG_KEYS` is
+ * reported automatically; anything else is asked for ad hoc through `?key=`.
  *
  * It exists because "the dashboard says 100% and the page still 404s" has half a
  * dozen causes that look identical from outside: no project key in the runtime
@@ -83,7 +84,7 @@ export type FeatureFlagDiagnosticsResponse = {
   flags: FeatureFlagDiagnostic[];
 };
 
-export async function GET(request: Request) {
+async function featureFlagDiagnostics(request: Request) {
   const access = await checkAdmin();
   if (!access.authenticated) {
     return NextResponse.json({ error: 'Sign in required' }, { status: 401 });
@@ -132,4 +133,13 @@ export async function GET(request: Request) {
   };
 
   return NextResponse.json(response, { headers: { 'Cache-Control': 'no-store' } });
+}
+
+export async function GET(request: Request) {
+  try {
+    return await featureFlagDiagnostics(request);
+  } catch (error) {
+    if (error instanceof CredentialAuthorityUnavailable) return unavailableCredentialResponse();
+    throw error;
+  }
 }

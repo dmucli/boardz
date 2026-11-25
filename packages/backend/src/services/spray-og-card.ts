@@ -1,11 +1,22 @@
+import { createHash } from 'node:crypto';
 import { and, eq, isNull } from 'drizzle-orm';
 import sharp from 'sharp';
-import { BoundedLru, OG_IMAGE_HEIGHT, OG_IMAGE_WIDTH, type OutputFormat } from '@boardsesh/board-render';
+import {
+  BoundedLru,
+  MAX_CARD_NAME_CODEPOINTS,
+  OG_CARD_BOARD_BOX,
+  normalizeOgCardText,
+  type OutputFormat,
+} from '@boardsesh/board-render';
+import { renderFrostedBokehBuffer } from '@boardsesh/board-render/frosted-bokeh';
+import { OG_CARD_BOARD_LINE_SEPARATOR } from '@boardsesh/board-render/og-board-line';
+import { renderOgCardText, type OgCardContent } from '@boardsesh/board-render/og-card';
+import { composeOgFamilyCard, renderOgFamilyPhotoLayers } from '@boardsesh/board-render/og-family';
 import { convertLitUpHoldsStringToMap } from '@boardsesh/board-constants';
 import { IDENTITY_HOMOGRAPHY, invert, mapPoint, mapRadius, type Homography } from '@boardsesh/spray-wall-geometry';
 import { sprayWallVersions, sprayWalls, userBoards } from '@boardsesh/db/schema';
 import { aliveHolds } from '@boardsesh/db/queries';
-import { runOnRenderSemaphore } from './board-render';
+import { noteOgIconState, runOnRenderSemaphore } from './board-render';
 import { db } from '../db/client';
 import { getPublicUrl, isS3Configured } from '../storage/s3';
 import { logger } from '../utils/logger';
@@ -25,9 +36,6 @@ import { logger } from '../utils/logger';
  * fixed geometry. sharp plus an SVG overlay does the whole job here.
  */
 
-/** The dark play field every other OG card composites over. */
-const OG_FIELD_COLOR = '#181225';
-
 const HEX_COLOR = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/;
 const FALLBACK_HOLD_COLOR = '#FFFFFF';
 
@@ -46,15 +54,16 @@ const MARK_FILL_OPACITY = 0.22;
 const PHOTO_FETCH_TIMEOUT_MS = 8_000;
 const MAX_PHOTO_BYTES = 12 * 1024 * 1024;
 
-const JPEG_OPTIONS: sharp.JpegOptions = { quality: 85, chromaSubsampling: '4:4:4', mozjpeg: true };
-const PNG_OPTIONS: sharp.PngOptions = { compressionLevel: 9, adaptiveFiltering: true };
-const WEBP_OPTIONS: sharp.WebpOptions = { quality: 80 };
+/** What a wall's card says it is under the climb, after the wall's own name. */
+const SPRAY_BOARD_LABEL = 'Spray wall';
 
 export type SprayOgWallRow = {
   wallId: number;
   layoutId: number;
   wallName: string;
   isPublic: boolean;
+  /** Set when an admin has hidden the wall (SW-17). A hidden wall gets no card. */
+  hiddenAt: Date | null;
   publicPhotoKey: string | null;
   currentVersionId: number | null;
 };
@@ -110,7 +119,14 @@ export class SprayPhotoUnavailableError extends Error {
 }
 
 export type SprayOgCardResult =
-  | { kind: 'card'; buffer: Buffer; contentType: string; timings: { photoMs: number; composeMs: number } }
+  | {
+      kind: 'card';
+      buffer: Buffer;
+      contentType: string;
+      timings: { photoMs: number; composeMs: number };
+      /** Drawn without the app icon: not cached here, and the response must not be cacheable. */
+      iconMissing: boolean;
+    }
   | { kind: 'not-found' };
 
 /**
@@ -139,8 +155,30 @@ function cardCacheKey(params: {
   publicPhotoKey: string;
   frames: string;
   format: OutputFormat;
+  text: SprayCardText;
 }): string {
-  return [params.layoutId, params.currentVersionId, params.publicPhotoKey, params.format, params.frames].join('|');
+  // The words are hashed rather than joined in: a wall or climb name may contain
+  // the separator, and the wall's name is in here because a rename changes the card.
+  const textDigest = createHash('sha1').update(JSON.stringify(params.text)).digest('base64url').slice(0, 16);
+  return [
+    params.layoutId,
+    params.currentVersionId,
+    params.publicPhotoKey,
+    params.format,
+    params.frames,
+    textDigest,
+  ].join('|');
+}
+
+/** The climb identity a wall's card draws: the URL's own params plus the wall's name. */
+type SprayCardText = Required<Pick<OgCardContent, 'boardLine'>> & Omit<OgCardContent, 'boardLine'>;
+
+function sprayCardText(wallName: string, card: Omit<OgCardContent, 'boardLine'>): SprayCardText {
+  const drawableWallName = normalizeOgCardText(wallName, MAX_CARD_NAME_CODEPOINTS);
+  return {
+    ...card,
+    boardLine: [drawableWallName, SPRAY_BOARD_LABEL].filter(Boolean).join(OG_CARD_BOARD_LINE_SEPARATOR),
+  };
 }
 
 /** Test seam: the cache is process-lifetime, so a test that renders twice needs this. */
@@ -173,7 +211,7 @@ export type SprayOverlayMark = {
  * placed photograph.
  *
  * `invert` is the canonical→photo direction (no image is ever warped, see
- * `docs/spray-walls.md`); `photoToPlaced` then scales that into whatever
+ * `docs/product/spray-walls.md`); `photoToPlaced` then scales that into whatever
  * rectangle the photo was resized into on the card.
  */
 export function buildSprayOverlayMarks(params: {
@@ -271,23 +309,25 @@ function formatPolygonPoints(points: readonly number[]): string {
   return pairs.join(' ');
 }
 
-function encodeCard(image: sharp.Sharp, format: OutputFormat): Promise<{ buffer: Buffer; contentType: string }> {
-  if (format === 'png') {
-    return image
-      .png(PNG_OPTIONS)
-      .toBuffer()
-      .then((buffer) => ({ buffer, contentType: 'image/png' }));
+/**
+ * The card's words, or none. A Pango failure costs the words, not the card, the
+ * same trade `/og/climb`'s catalogue path makes.
+ */
+async function renderSprayCardText(
+  layoutId: number,
+  text: SprayCardText,
+): Promise<{ layers: sharp.OverlayOptions[]; iconMissing: boolean }> {
+  try {
+    const { layers, iconError } = await renderOgCardText(text);
+    noteOgIconState(iconError, 'spray');
+    return { layers, iconMissing: iconError !== null };
+  } catch (error) {
+    logger.warn('[spray-og] card text failed to render; serving the wall alone', {
+      layoutId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return { layers: [], iconMissing: false };
   }
-  if (format === 'webp') {
-    return image
-      .webp(WEBP_OPTIONS)
-      .toBuffer()
-      .then((buffer) => ({ buffer, contentType: 'image/webp' }));
-  }
-  return image
-    .jpeg(JPEG_OPTIONS)
-    .toBuffer()
-    .then((buffer) => ({ buffer, contentType: 'image/jpeg' }));
 }
 
 /**
@@ -299,7 +339,13 @@ function encodeCard(image: sharp.Sharp, format: OutputFormat): Promise<{ buffer:
  * layout ids.
  */
 export async function renderSprayOgCard(
-  params: { layoutId: number; frames: string; format: OutputFormat },
+  params: {
+    layoutId: number;
+    frames: string;
+    format: OutputFormat;
+    /** The climb identity from the URL (`n`, `g`, `s`, `angle`), drawn in the family's text column. */
+    card?: Omit<OgCardContent, 'boardLine'>;
+  },
   deps: SprayOgCardDeps,
 ): Promise<SprayOgCardResult> {
   const { layoutId, frames, format } = params;
@@ -312,6 +358,11 @@ export async function renderSprayOgCard(
   // still gets no card: an OG image is fetched by a crawler that holds no
   // capability at all, so "hard to guess" would be the whole access control.
   if (wall.isPublic !== true) return { kind: 'not-found' };
+
+  // 2b. Hidden by an admin. Hidden means private for everybody but the owner,
+  // and a crawler is never the owner, so the answer is the private wall's
+  // answer: the same not-found, before a photo URL is even derived.
+  if (wall.hiddenAt !== null) return { kind: 'not-found' };
 
   // 3. A wall nobody has published has no photograph any climber has seen.
   if (wall.currentVersionId === null) return { kind: 'not-found' };
@@ -326,12 +377,16 @@ export async function renderSprayOgCard(
   const version = await deps.loadPublishedVersion(wall.wallId);
   if (!version) return { kind: 'not-found' };
 
+  // Built only after every gate: the wall's name is drawn, and a wall that is
+  // not public must never reach a byte of the card.
+  const text = sprayCardText(wall.wallName, params.card ?? {});
   const cacheKey = cardCacheKey({
     layoutId,
     currentVersionId: wall.currentVersionId,
     publicPhotoKey: wall.publicPhotoKey,
     frames,
     format,
+    text,
   });
   const cached = cardCache.get(cacheKey);
   if (cached) {
@@ -340,6 +395,7 @@ export async function renderSprayOgCard(
       buffer: cached.buffer,
       contentType: cached.contentType,
       timings: { photoMs: 0, composeMs: 0 },
+      iconMissing: false,
     };
   }
 
@@ -373,10 +429,10 @@ export async function renderSprayOgCard(
     const photoMs = performance.now() - photoT0;
 
     const composeT0 = performance.now();
-    // `fit: 'inside'` and a centred placement: a spray wall is photographed at
-    // whatever aspect ratio the climber's phone produced, and cropping to
-    // 1200x630 would cut the top or the bottom off the wall the card is supposed
-    // to show.
+    // `fit: 'inside'` the share-card family's art slot: a spray wall is
+    // photographed at whatever aspect ratio the climber's phone produced, and
+    // cropping it would cut the top or the bottom off the wall the card is
+    // supposed to show.
     //
     // One `sharp` instance for both the resize and the source dimensions. The
     // fallback below needs the photo's own width when the version row has none,
@@ -391,9 +447,10 @@ export async function renderSprayOgCard(
       const source = sharp(photoBytes);
       [sourceMetadata, placed] = await Promise.all([
         source.metadata(),
-        source.clone().resize({ width: OG_IMAGE_WIDTH, height: OG_IMAGE_HEIGHT, fit: 'inside' }).toBuffer({
-          resolveWithObject: true,
-        }),
+        source
+          .clone()
+          .resize({ width: OG_CARD_BOARD_BOX.width, height: OG_CARD_BOARD_BOX.height, fit: 'inside' })
+          .toBuffer({ resolveWithObject: true }),
       ]);
     } catch (error) {
       logger.warn('[spray-og] wall photo could not be decoded; answering not-found', {
@@ -405,8 +462,6 @@ export async function renderSprayOgCard(
 
     const placedWidth = placed.info.width;
     const placedHeight = placed.info.height;
-    const left = Math.round((OG_IMAGE_WIDTH - placedWidth) / 2);
-    const top = Math.round((OG_IMAGE_HEIGHT - placedHeight) / 2);
 
     // The version row is the source of truth: it records the dimensions of the
     // object as stored, after sharp baked the EXIF rotation in. The decoded
@@ -414,7 +469,7 @@ export async function renderSprayOgCard(
     const photoWidth = version.photoWidth ?? sourceMetadata.width ?? placedWidth;
     const photoToPlaced = photoWidth > 0 ? placedWidth / photoWidth : 1;
 
-    const overlaySvg = buildOverlayForWall({
+    const marks = buildMarksForWall({
       wall,
       holds,
       frames,
@@ -424,35 +479,47 @@ export async function renderSprayOgCard(
       photoToPlaced,
     });
 
-    const composites: sharp.OverlayOptions[] = [{ input: placed.data, left, top }];
-    if (overlaySvg !== null) composites.push({ input: Buffer.from(overlaySvg), left, top });
-
-    const canvas = sharp({
-      create: {
-        width: OG_IMAGE_WIDTH,
-        height: OG_IMAGE_HEIGHT,
-        channels: 4,
-        background: OG_FIELD_COLOR,
-      },
-    }).composite(composites);
-
-    const { buffer, contentType } = await encodeCard(canvas, format);
+    // The climb is drawn into the photo first, then the photo takes the family's
+    // art slot: rounded, hairline-bordered, right against the text column.
+    const drawn = sharp(placed.data);
+    if (marks.length > 0) {
+      const overlaySvg = buildSprayOverlaySvg({ width: placedWidth, height: placedHeight, marks });
+      drawn.composite([{ input: Buffer.from(overlaySvg), left: 0, top: 0 }]);
+    }
+    const art = await renderOgFamilyPhotoLayers({
+      image: await drawn.png().toBuffer(),
+      width: placedWidth,
+      height: placedHeight,
+    });
+    const background = await renderFrostedBokehBuffer({
+      points: marks.map((mark) => ({ x: mark.centerX, y: mark.centerY, color: mark.color })),
+      source: { w: placedWidth, h: placedHeight },
+    });
+    const cardText = await renderSprayCardText(layoutId, text);
+    const { buffer, contentType } = await composeOgFamilyCard({
+      background,
+      slot: 'full',
+      art,
+      textLayers: cardText.layers,
+      format,
+    });
     const composeMs = performance.now() - composeT0;
 
-    cardCache.set(cacheKey, { buffer, contentType });
-    return { kind: 'card', buffer, contentType, timings: { photoMs, composeMs } };
+    // Without its icon the card answers this request only; the next one retries.
+    if (!cardText.iconMissing) cardCache.set(cacheKey, { buffer, contentType });
+    return { kind: 'card', buffer, contentType, timings: { photoMs, composeMs }, iconMissing: cardText.iconMissing };
   });
 }
 
 /**
- * The overlay, or null when the wall's matrix cannot be inverted.
+ * Photo-mapped marks shared by the overlay and backdrop; empty for a singular matrix.
  *
  * `invert` throws on a singular matrix by design — it is handed something the
  * system itself stored, so a singular one is an upstream bug. It is not a reason
  * to break a shared link: a card with no holds on it is a worse card, a 500 on a
  * link somebody already posted is a broken one.
  */
-function buildOverlayForWall(params: {
+function buildMarksForWall(params: {
   wall: SprayOgWallRow;
   holds: readonly SprayOgHold[];
   frames: string;
@@ -460,7 +527,7 @@ function buildOverlayForWall(params: {
   placedWidth: number;
   placedHeight: number;
   photoToPlaced: number;
-}): string | null {
+}): SprayOverlayMark[] {
   let canonicalToPhoto: Homography;
   try {
     canonicalToPhoto = invert(params.homography ?? IDENTITY_HOMOGRAPHY);
@@ -470,18 +537,15 @@ function buildOverlayForWall(params: {
       wallId: params.wall.wallId,
       error: error instanceof Error ? error.message : String(error),
     });
-    return null;
+    return [];
   }
 
-  const marks = buildSprayOverlayMarks({
+  return buildSprayOverlayMarks({
     holds: params.holds,
     frames: params.frames,
     canonicalToPhoto,
     photoToPlaced: params.photoToPlaced,
   });
-  if (marks.length === 0) return null;
-
-  return buildSprayOverlaySvg({ width: params.placedWidth, height: params.placedHeight, marks });
 }
 
 /** The production dependency set, wired to drizzle + the media bucket + fetch. */
@@ -494,6 +558,7 @@ export function createSprayOgCardDeps(): SprayOgCardDeps {
           layoutId: sprayWalls.layoutId,
           wallName: userBoards.name,
           isPublic: userBoards.isPublic,
+          hiddenAt: sprayWalls.hiddenAt,
           publicPhotoKey: sprayWalls.publicPhotoKey,
           currentVersionId: sprayWalls.currentVersionId,
         })

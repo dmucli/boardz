@@ -1,20 +1,18 @@
 import type { IncomingMessage, ServerResponse } from 'http';
+import { gunzipSync } from 'node:zlib';
+import { ANALYTICS_CAPTURE_PATH, ANALYTICS_CONSENT_HEADER, ANALYTICS_CONSENT_HEADER_GRANTED } from '@boardsesh/consent';
 import { applyCorsHeaders } from './cors';
 import { logger } from '../utils/logger';
+import { resolveFlagCountry } from '../utils/flag-country';
+import { resolvePosthogVisitorIp } from '../utils/posthog-visitor-ip';
 
 const POSTHOG_UPSTREAM = 'https://us.i.posthog.com';
 const MAX_BODY_BYTES = 64 * 1024;
 const UPSTREAM_TIMEOUT_MS = 5000;
 const PROXY_PATH_PREFIX = '/api/posthog';
-
-function getClientIp(req: IncomingMessage): string | null {
-  const forwarded = req.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.length > 0) {
-    const first = forwarded.split(',')[0]?.trim();
-    if (first) return first;
-  }
-  return req.socket.remoteAddress ?? null;
-}
+// Omitting XFF makes PostHog geolocate our egress instead. This unspecified
+// address has no location, without decoding/re-encoding compressed SDK bodies.
+const UNKNOWN_VISITOR_IP = '0.0.0.0';
 
 function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer | { tooLarge: true }> {
   return new Promise((resolve, reject) => {
@@ -40,32 +38,40 @@ function readBody(req: IncomingMessage, limitBytes: number): Promise<Buffer | { 
  * Forwards POST /api/posthog/<rest> → https://us.i.posthog.com/<rest>, preserving
  * the query string, request body bytes, and Content-Encoding header (the JS SDK
  * gzips the /batch/ payload when CompressionStream is available, so the body is
- * binary, not text).
+ * binary, not text). GET is allowed only for the SDK's public project config
+ * endpoint, so flag/replay configuration uses the same privacy boundary.
  *
- * Also forwards the browser's User-Agent, so the upstream request carries the
- * real one rather than Node fetch's default. That header does NOT fill the
- * `$raw_user_agent` event property PostHog's bot flag (`$virt_is_bot`) reads:
- * 0 of ~660k proxied web events had it (#5653). The web client registers
- * `$raw_user_agent` itself as a super property (packages/web/app/lib/analytics.ts).
+ * Forwards the visitor IP (X-Forwarded-For) only on capture paths
+ * (`ANALYTICS_CAPTURE_PATH` from `@boardsesh/consent`) from a client that says it holds a current Allow
+ * (`x-boardsesh-analytics-consent: granted`), and only the `cf-connecting-ip` a
+ * request authenticated by our zone's origin proof reports, so PostHog geolocates consented events to the
+ * visitor rather than to our egress. Everything else is stripped: every other
+ * path, capture without the header (the anonymous OTA health event, kiosk
+ * telemetry, an older client), and requests that did not come through a
+ * verified zone. Otherwise XFF is the unspecified address, preventing our
+ * server's location from being attached to anonymous or unverified events.
+ * Never forwards the HTTP User-Agent: consented analytics registers
+ * `$raw_user_agent` in its event payload instead (#5653).
  */
 export async function handlePosthogProxy(req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> {
   if (!applyCorsHeaders(req, res)) return;
 
-  if (req.method !== 'POST') {
+  const rest = url.pathname.slice(PROXY_PATH_PREFIX.length);
+  const isPublicConfigRequest = req.method === 'GET' && /^\/array\/phc_[A-Za-z0-9_-]+\/config\/?$/.test(rest);
+  if (req.method !== 'POST' && !isPublicConfigRequest) {
     res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST, OPTIONS' });
     res.end(JSON.stringify({ error: 'Method not allowed' }));
     return;
   }
 
-  const rest = url.pathname.slice(PROXY_PATH_PREFIX.length);
   if (!rest || !rest.startsWith('/')) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Not found' }));
     return;
   }
 
-  const body = await readBody(req, MAX_BODY_BYTES);
-  if ('tooLarge' in body) {
+  let body = isPublicConfigRequest ? undefined : await readBody(req, MAX_BODY_BYTES);
+  if (body && 'tooLarge' in body) {
     res.writeHead(413, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Payload too large' }));
     return;
@@ -74,18 +80,64 @@ export async function handlePosthogProxy(req: IncomingMessage, res: ServerRespon
   const upstreamUrl = `${POSTHOG_UPSTREAM}${rest}${url.search}`;
   const headers: Record<string, string> = {
     'Content-Type': typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : 'application/json',
+    'X-Forwarded-For': UNKNOWN_VISITOR_IP,
   };
   const contentEncoding = req.headers['content-encoding'];
   if (typeof contentEncoding === 'string' && contentEncoding.length > 0) {
     headers['Content-Encoding'] = contentEncoding;
   }
-  const clientIp = getClientIp(req);
-  if (clientIp) headers['X-Forwarded-For'] = clientIp;
-  const userAgent = req.headers['user-agent'];
-  if (typeof userAgent === 'string' && userAgent.length > 0) {
-    headers['User-Agent'] = userAgent;
+  if (
+    req.method === 'POST' &&
+    ANALYTICS_CAPTURE_PATH.test(rest) &&
+    req.headers[ANALYTICS_CONSENT_HEADER] === ANALYTICS_CONSENT_HEADER_GRANTED
+  ) {
+    // Only our own zone's proof authenticates the visitor header, independent
+    // of how many ingress hops the hosting provider adds to X-Forwarded-For.
+    const visitorIp = resolvePosthogVisitorIp(req, url);
+    if (visitorIp) headers['X-Forwarded-For'] = visitorIp;
   }
-
+  if (/^\/(flags|decide)\/?$/.test(rest) && body) {
+    // Flag evaluation is functional without consent. Supply only a coarse
+    // edge-verified country, and prohibit upstream inference from our host IP
+    // or an account's stale location. Capture/replay bodies remain byte-exact.
+    try {
+      if (contentEncoding && contentEncoding !== 'gzip' && contentEncoding !== 'identity') {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unsupported flag encoding' }));
+        return;
+      }
+      const decoded = contentEncoding === 'gzip' ? gunzipSync(body, { maxOutputLength: MAX_BODY_BYTES }) : body;
+      const payload: unknown = JSON.parse(decoded.toString('utf8'));
+      if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new Error('Invalid flag payload');
+      const flagPayload = payload as Record<string, unknown>;
+      const properties = flagPayload.person_properties;
+      const personProperties =
+        properties && typeof properties === 'object' && !Array.isArray(properties)
+          ? Object.fromEntries(
+              Object.entries(properties).filter(
+                ([key]) =>
+                  !key.startsWith('$geoip_') && !key.startsWith('$initial_geoip_') && key !== '$ip' && key !== 'ip',
+              ),
+            )
+          : {};
+      delete flagPayload.ip;
+      delete flagPayload.$ip;
+      body = Buffer.from(
+        JSON.stringify({
+          ...flagPayload,
+          geoip_disable: true,
+          person_properties: { ...personProperties, $geoip_country_code: resolveFlagCountry(req) },
+        }),
+      );
+      delete headers['Content-Encoding'];
+      headers['Content-Type'] = 'application/json';
+    } catch (error) {
+      const oversized = error instanceof Error && 'code' in error && error.code === 'ERR_BUFFER_TOO_LARGE';
+      res.writeHead(oversized ? 413 : 400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: oversized ? 'Payload too large' : 'Invalid flag payload' }));
+      return;
+    }
+  }
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const startedAt = Date.now();
@@ -97,9 +149,9 @@ export async function handlePosthogProxy(req: IncomingMessage, res: ServerRespon
     // BodyInit (which excludes Buffer for SharedArrayBuffer-vs-ArrayBuffer
     // reasons).
     const upstream = await fetch(upstreamUrl, {
-      method: 'POST',
+      method: isPublicConfigRequest ? 'GET' : 'POST',
       headers,
-      body: body as unknown as BodyInit,
+      ...(body ? { body: body as unknown as BodyInit } : {}),
       signal: controller.signal,
     });
     const responseBody = Buffer.from(await upstream.arrayBuffer());
@@ -108,7 +160,12 @@ export async function handlePosthogProxy(req: IncomingMessage, res: ServerRespon
     res.writeHead(upstream.status, { 'Content-Type': contentType });
     res.end(responseBody);
 
-    logger.info('[posthog-proxy]', { status: upstream.status, durationMs: Date.now() - startedAt, path: rest });
+    logger.info('[posthog-proxy]', {
+      status: upstream.status,
+      durationMs: Date.now() - startedAt,
+      path: rest,
+      visitorIpForwarded: headers['X-Forwarded-For'] !== UNKNOWN_VISITOR_IP,
+    });
   } catch (err) {
     const aborted = err instanceof Error && err.name === 'AbortError';
     logger.error('[posthog-proxy] upstream error', {

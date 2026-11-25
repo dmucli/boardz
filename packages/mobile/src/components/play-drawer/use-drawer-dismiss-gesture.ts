@@ -1,4 +1,4 @@
-import { useMemo, useRef, type ComponentType, type RefObject } from 'react';
+import { useMemo, useRef, type ComponentType, type MutableRefObject, type RefObject } from 'react';
 import { Gesture, type GestureType } from 'react-native-gesture-handler';
 import { cancelAnimation, useSharedValue, withSpring, runOnJS, type SharedValue } from 'react-native-reanimated';
 import { springs } from '../../theme/animations';
@@ -22,6 +22,14 @@ import { springs } from '../../theme/animations';
 // isn't enough during fast climb-swapping — the carousel goes inert while a fling
 // settles, so a fresh downward touch reaches this Pan; we also hard-block it
 // whenever the carousel's swipe offset is non-zero or a fling is in progress.
+//
+// Being an ancestor also puts this Pan in direct competition with the zoomed
+// board's 1-finger pan: both want a downward drag, and z-order alone doesn't
+// settle it. The hook tags itself with `gestureRef` and the zoom pan declares
+// `.blocksExternalGesture(dismissRef)` (the same relation it already uses for
+// the scroll), so while the board is zoomed a downward drag pans the board and
+// this dismiss stands down. Unzoomed the zoom-pan detector isn't mounted, so
+// pull-to-dismiss keeps the whole surface.
 
 /** Downward travel (px) before the dismiss activates. */
 const DISMISS_ACTIVATE_OFFSET = 14;
@@ -36,8 +44,12 @@ export type SwipeDismissAnimation = {
   translateY: SharedValue<number>;
   height: SharedValue<number>;
   isDismissing: SharedValue<boolean>;
+  /** Entry owns the transform until its short opening animation finishes. */
+  isOpening?: SharedValue<boolean>;
+  /** Opening ownership captured at touch-down; absent for standalone hosts. */
+  revision?: SharedValue<number>;
   /** Called after the surface has finished sliding offscreen. */
-  onComplete: () => void;
+  onComplete: (revision?: number) => void;
 };
 
 type UseDrawerDismissGestureOptions = {
@@ -66,6 +78,10 @@ type UseDrawerDismissGestureReturn = {
   gesture: GestureType;
   /** Drawer translateY to apply for the rubber-band drag. */
   translateY: SharedValue<number>;
+  /** RNGH ref to this Pan. The zoomed board's pan takes it and declares
+   *  `.blocksExternalGesture(dismissRef)` so a downward drag on a zoomed board
+   *  pans the board instead of pulling the drawer down (see the note above). */
+  gestureRef: MutableRefObject<GestureType | undefined>;
 };
 
 export function useDrawerDismissGesture({
@@ -81,20 +97,29 @@ export function useDrawerDismissGesture({
   const translateY = swipeDismiss?.translateY ?? localTranslateY;
   const isDismissing = swipeDismiss?.isDismissing ?? localIsDismissing;
   const dismissHeight = swipeDismiss?.height;
+  const isOpening = swipeDismiss?.isOpening;
+  const dismissRevision = swipeDismiss?.revision;
+  // Stable across renders, populated by RNGH when the detector attaches. Handed
+  // to the zoomed board's pan so it can block this dismiss.
+  const gestureRef = useRef<GestureType | undefined>(undefined);
   // Captured at touch-down: only a gesture that STARTS at the top can dismiss, so
   // a scroll-up that reaches the top doesn't suddenly yank the drawer down.
   const startedAtTop = useSharedValue(false);
+  const startedRevision = useSharedValue<number | null>(null);
 
   // Captured ONCE by the gesture memo — must only close over the ref so a later
-  // render's onDismiss is still reached (mirrors use-carousel-gesture).
-  const onDismissRef = useRef(onDismiss);
+  // render's onDismiss is still reached.
+  const onDismissRef = useRef<(revision?: number) => void>(onDismiss);
   onDismissRef.current = swipeDismiss?.onComplete ?? onDismiss;
-  const commitDismiss = () => {
-    onDismissRef.current();
+  const commitDismiss = (revision?: number) => {
+    if (revision === undefined) onDismissRef.current();
+    else onDismissRef.current(revision);
   };
 
   const gesture = useMemo(() => {
     const pan = Gesture.Pan()
+      // Tag the Pan so the zoomed board's pan can block it by ref.
+      .withRef(gestureRef)
       // A 2-finger pinch must never read as a dismiss — fail the moment a second
       // finger lands so zoom stays with the board's pinch gesture.
       .maxPointers(1)
@@ -104,13 +129,15 @@ export function useDrawerDismissGesture({
       .failOffsetX([-DISMISS_FAIL_OFFSET_X, DISMISS_FAIL_OFFSET_X])
       .onBegin(() => {
         'worklet';
-        if (isDismissing.value) return;
+        if (isDismissing.value || isOpening?.value) return;
+        startedRevision.value = dismissRevision?.value ?? null;
         cancelAnimation(translateY);
         startedAtTop.value = scrollYSV.value <= 0;
       })
       .onUpdate((event) => {
         'worklet';
-        if (isDismissing.value) return;
+        if (dismissRevision && startedRevision.value !== dismissRevision.value) return;
+        if (isDismissing.value || isOpening?.value) return;
         // Once the carousel owns the gesture as a horizontal swipe (offset non-zero)
         // or is still settling a fling, block the vertical dismiss entirely — a
         // downward drift while quickly swapping climbs must not pull the drawer down.
@@ -127,7 +154,8 @@ export function useDrawerDismissGesture({
       })
       .onEnd((event) => {
         'worklet';
-        if (isDismissing.value) return;
+        if (dismissRevision && startedRevision.value !== dismissRevision.value) return;
+        if (isDismissing.value || isOpening?.value) return;
         // Same guard as onUpdate, and it must run BEFORE the velocity check: a fast
         // horizontal flick carries vertical velocity, so without this an accidental
         // down-component could satisfy velocityY > threshold and commit a dismiss
@@ -140,6 +168,7 @@ export function useDrawerDismissGesture({
           startedAtTop.value &&
           (translateY.value > DISMISS_DISTANCE_THRESHOLD || event.velocityY > DISMISS_VELOCITY_THRESHOLD);
         if (committed) {
+          const releasedRevision = startedRevision.value ?? undefined;
           isDismissing.value = true;
           if (dismissHeight) {
             // Never pause at the release position waiting for navigation/JS.
@@ -148,8 +177,9 @@ export function useDrawerDismissGesture({
               Math.max(dismissHeight.value, translateY.value),
               { ...springs.snappy, velocity: Math.max(0, event.velocityY), overshootClamping: true },
               (finished) => {
+                if (dismissRevision && dismissRevision.value !== releasedRevision) return;
                 if (finished) {
-                  runOnJS(commitDismiss)();
+                  runOnJS(commitDismiss)(releasedRevision);
                 } else {
                   isDismissing.value = false;
                   translateY.value = withSpring(0, springs.interactive);
@@ -169,14 +199,27 @@ export function useDrawerDismissGesture({
       // Cancellation (including a second finger) still returns an open drag home.
       .onFinalize((_event, success) => {
         'worklet';
+        if (dismissRevision && startedRevision.value !== dismissRevision.value) return;
         if (!dismissHeight) {
           isDismissing.value = false;
           return;
         }
-        if (!success && !isDismissing.value) translateY.value = withSpring(0, springs.interactive);
+        if (!success && !isDismissing.value && !isOpening?.value) translateY.value = withSpring(0, springs.interactive);
       });
     return scrollRef ? pan.simultaneousWithExternalGesture(scrollRef) : pan;
-  }, [translateY, isDismissing, dismissHeight, startedAtTop, scrollYSV, scrollRef, swipeTranslateX, swipeIsAnimating]);
+  }, [
+    translateY,
+    isDismissing,
+    isOpening,
+    dismissHeight,
+    dismissRevision,
+    startedAtTop,
+    startedRevision,
+    scrollYSV,
+    scrollRef,
+    swipeTranslateX,
+    swipeIsAnimating,
+  ]);
 
-  return { gesture, translateY };
+  return { gesture, translateY, gestureRef };
 }

@@ -31,7 +31,8 @@ const PERIODS: readonly { value: RankingPeriod; label: string }[] = [
   { value: 'all', label: 'All time' },
 ];
 
-const keyExtractor = (entry: LeaderboardEntry) => entry.userId;
+// Upstream now hides the id of climbers who keep their profile private, so fall back to the rank.
+const keyExtractor = (entry: LeaderboardEntry) => entry.userId ?? `rank-${entry.rank}`;
 
 const RankRow = memo(function RankRow({
   entry,
@@ -197,7 +198,7 @@ export default function RankingsScreen() {
         data={entries}
         keyExtractor={keyExtractor}
         renderItem={({ item }) => (
-          <RankRow entry={item} isYou={item.userId === profile?.id} gradeFormat={gradeFormat} />
+          <RankRow entry={item} isYou={item.userId != null && item.userId === profile?.id} gradeFormat={gradeFormat} />
         )}
         extraData={[profile?.id, gradeFormat]}
         ListHeaderComponent={header}

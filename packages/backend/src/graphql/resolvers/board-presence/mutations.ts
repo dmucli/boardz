@@ -1,3 +1,4 @@
+import { isNativeBoardClimb } from '@boardsesh/board-presence';
 import { v4 as uuidv4 } from 'uuid';
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import { GraphQLError } from 'graphql';
@@ -8,6 +9,7 @@ import type {
   BoardPresenceClimb,
 } from '@boardsesh/shared-schema';
 import { normaliseSetIds } from '@boardsesh/board-config';
+import { getGradeColor } from '@boardsesh/board-constants';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
@@ -23,24 +25,32 @@ import { assertBoardCapNotReached } from '../social/board-limits';
 import { assertKnownBoardConfig } from './board-catalog';
 import { lockBoardSerialWrite } from '../board-serial-write-lock';
 import { logger } from '../../../utils/logger';
-import { pubsub } from '../../../pubsub/index';
+import { canAccessResourceWithoutLink, canViewResourceLocation } from '../../../services/privacy';
+import { projectBoardLocation } from '../../../services/board-location-projection';
+import { assertSprayBoardIsReadable } from '../climbs/spray-read-access';
+import { boardReportDedupMarker, pubsub } from '../../../pubsub/index';
 import { roomManager } from '../../../services/room-manager';
 import { isApnsConfigured, sendLiveActivityUpdate } from '../../../services/apns';
 import { buildContentStateFromQueueState } from '../../../services/apns/content-state';
 import { publishBoardQueuePreviewForSession } from '../../../services/board-queue-preview';
+import { publishSessionWallChanged } from '../../../services/session-wall-refresh';
 import {
   assertValidBoardId,
   candidateToActiveBoard,
+  canClaimSerialForBoard,
   defaultBoardName,
   findActiveBoardsBySerial,
   findChosenBoardForSerial,
   findOwnActiveBoardByConfig,
   findReachableActiveBoardByUuid,
+  findSelectedBoardForConnect,
+  hasSyncedGymBoardForSerial,
   isDuplicateBoardSerialError,
+  isSyncedGymListing,
   lastSentAtByBoardIds,
   rememberBoardForSerial,
   reserveBoardPresenceSeq,
-  requireActiveBoardById,
+  requireActiveBoardWithVisibilityById,
   resolveSharedBoardForConfig,
   serialAlreadyBoundError,
   throwIfDuplicateBoardSerial,
@@ -89,12 +99,13 @@ type DurableBoardClimbEventInput = {
   climbUuid: string;
   angle: number;
   userId: string;
-  sessionId: null;
+  sessionId: string | null;
+  identityPolicyVersion?: number;
   frames: string | null;
   name: string | null;
   grade: string | null;
   setter: string | null;
-  confirmedAt: string;
+  reportingMirrored?: boolean | null;
 };
 
 class DurableBoardClimbPersistenceError extends Error {
@@ -113,12 +124,25 @@ class DurableBoardClimbPersistenceError extends Error {
 export async function reserveAndPersistBoardClimbEvent(
   input: DurableBoardClimbEventInput,
   candidate: number,
-): Promise<number> {
+): Promise<{ seq: number; confirmedAt: string }> {
   try {
     return await db.transaction(async (tx) => {
       const seq = await reserveBoardPresenceSeq(tx, input.boardId, candidate);
-      await tx.insert(dbSchema.boardClimbEvents).values({ ...input, seq });
-      return seq;
+      // The reservation holds the board row lock. A move or alias merge cannot
+      // change the venue between this confirmation and the durable insert.
+      const [board] = await tx
+        .select({ id: dbSchema.userBoards.id, gymId: dbSchema.userBoards.gymId })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.id, input.boardId));
+      const confirmedAt = new Date().toISOString();
+      await tx.insert(dbSchema.boardClimbEvents).values({
+        ...input,
+        seq,
+        confirmedAt,
+        reportingBoardId: board.id,
+        reportingGymId: board.gymId,
+      });
+      return { seq, confirmedAt };
     });
   } catch (error) {
     // Preserve the authoritative tombstone signal so reportBoardClimb fails a
@@ -130,25 +154,42 @@ export async function reserveAndPersistBoardClimbEvent(
 
 type BoardPresenceCommandDb = Pick<typeof db, 'select' | 'update' | 'insert'>;
 
-function toBoardCandidate(
+/**
+ * A serial is not a board's link, so a candidate carries a board's identity
+ * (uuid, name) only for a caller who may read it without the link: its owner,
+ * an approved grant, follower inheritance, or a Public board. Everyone else gets
+ * the board's geometry with an empty uuid, the projection anonymous
+ * `boardsBySerialNumbers` uses; `chooseBoardForSerial` takes the numeric id.
+ * Location and gym go through `projectBoardLocation` on top of that: the
+ * owner, and anyone the location audience admits, see the board's own place;
+ * anyone else who may name the board sees its public gym's name; nobody sees
+ * a hidden board's own place.
+ */
+async function toBoardCandidate(
   candidate: SerialCandidateBoard,
   userId: string,
   lastSentAt: string | null,
-): BoardCandidatePayload {
+): Promise<BoardCandidatePayload> {
   const isOwnedByMe = candidate.ownerId === userId;
-  // Private boards are still findable by serial, but we don't leak their
-  // location to people who neither own them nor would see them publicly.
-  const showLocation = candidate.isPublic || isOwnedByMe;
+  const showIdentity = isOwnedByMe || (await canAccessResourceWithoutLink('board', candidate.uuid, userId));
+  const showLocation = showIdentity && (isOwnedByMe || (await canViewResourceLocation(candidate.uuid, userId)));
+  const location = showIdentity
+    ? projectBoardLocation(
+        { locationName: candidate.locationName, latitude: null, longitude: null, gymId: candidate.gymId },
+        candidate.gym,
+        showLocation,
+      )
+    : null;
   return {
     boardId: candidate.id,
-    boardUuid: candidate.uuid,
-    boardName: candidate.name,
+    boardUuid: showIdentity ? candidate.uuid : '',
+    boardName: showIdentity ? candidate.name : candidate.boardType,
     boardType: candidate.boardType,
     layoutId: candidate.layoutId,
     sizeId: candidate.sizeId,
     setIds: candidate.setIds,
-    locationName: showLocation ? candidate.locationName : null,
-    gymName: showLocation ? candidate.gymName : null,
+    locationName: location?.locationName ?? null,
+    gymName: location?.gymName ?? null,
     isOwnedByMe,
     isPublic: candidate.isPublic,
     lastSentAt,
@@ -198,7 +239,7 @@ async function bindOrCreateOwnBoardForSerial(
       }
     } catch (error) {
       if (isDuplicateBoardSerialError(error)) {
-        logger.warn(`[board-presence] bind race on own board: ${String(error)}`);
+        logger.warn('[board-presence] bind race on own board');
         const winner = await findOwnActiveBoardByConfig(
           userId,
           config.boardType,
@@ -253,12 +294,16 @@ async function bindOrCreateOwnBoardForSerial(
         setIds: normaliseSetIds(config.setIds),
         name,
         serialNumber: serial,
+        // Same defaults as createBoard: public, exact location hidden until the
+        // owner shares it. The column default for hide_location is false.
+        isPublic: true,
+        hideLocation: true,
       })
       .returning();
     return created;
   } catch (error) {
     if (isDuplicateBoardSerialError(error)) {
-      logger.warn(`[board-presence] create race on own board: ${String(error)}`);
+      logger.warn('[board-presence] create race on own board');
       const winner = await findOwnActiveBoardByConfig(
         userId,
         config.boardType,
@@ -394,24 +439,107 @@ async function resolvePlannedSerialCandidate(
   });
 }
 
+/** Resolve a matching selection using the existing board-row → serial → pointer order. */
+async function resolveSelectedBoardForSerial(
+  userId: string,
+  serial: string,
+  selectedBoardUuid: string,
+  config: { boardType: string; layoutId: number; sizeId: number; setIds: string },
+  advertisedBoardType?: string | null,
+): Promise<ActivePresenceBoard | undefined> {
+  if (advertisedBoardType && advertisedBoardType !== config.boardType) return undefined;
+  // Invalid selections must not hold up other connects on the board-row lock.
+  if (!(await findSelectedBoardForConnect(userId, selectedBoardUuid, config))) return undefined;
+  return db.transaction(async (tx) => {
+    await tx.execute(sql`
+      SELECT id FROM user_boards
+       WHERE uuid = ${selectedBoardUuid}
+       FOR UPDATE
+    `);
+    await lockBoardSerialWrite(tx, serial);
+    // Recheck after waiting for the locks: the board or its access may have changed.
+    const selected = await findSelectedBoardForConnect(userId, selectedBoardUuid, config, tx);
+    if (!selected) return undefined;
+    const gymListingCarriesSerial = await hasSyncedGymBoardForSerial(serial, config, tx, advertisedBoardType);
+    if (gymListingCarriesSerial && !(selected.serialNumber === serial && isSyncedGymListing(selected)))
+      return undefined;
+    let board = selected;
+    if (selected.serialNumber === null && canClaimSerialForBoard(selected, userId)) {
+      try {
+        // A per-owner serial collision must roll back only the claim, leaving
+        // the parent transaction usable for the selected-board pointer.
+        const updated = await tx.transaction(async (claimTx) => {
+          const [claimed] = await claimTx
+            .update(dbSchema.userBoards)
+            .set({ serialNumber: serial, updatedAt: new Date() })
+            .where(
+              and(
+                eq(dbSchema.userBoards.id, selected.id),
+                isNull(dbSchema.userBoards.serialNumber),
+                isNull(dbSchema.userBoards.deletedAt),
+              ),
+            )
+            .returning({ serialNumber: dbSchema.userBoards.serialNumber });
+          return claimed;
+        });
+        if (updated) board = { ...selected, serialNumber: updated.serialNumber };
+      } catch (error) {
+        if (!isDuplicateBoardSerialError(error)) throw error;
+        logger.warn('[board-presence] serial claim skipped, already bound elsewhere');
+      }
+    }
+    await rememberBoardForSerial(userId, serial, board, tx);
+    return board;
+  });
+}
+
 /**
  * Decide which board a serial routes to for this user:
- *  - a previously-remembered choice wins (no prompt);
+ *  - a synced gym listing that carries the serial AND describes the connected
+ *    wall outranks everything else, including the caller's selection — unless
+ *    the selection IS that listing;
+ *  - otherwise the board the caller already had selected wins, when its config
+ *    matches the controller they just connected to (see below);
+ *  - otherwise a previously-remembered choice wins (no prompt);
  *  - no board carries the serial yet → bind/create the caller's own board;
  *  - exactly one board carries it → route there (and remember);
  *  - several boards carry it → return the candidates for the user to pick.
+ *
+ * Selection beating serial matching is what keeps a Bluetooth connect from
+ * silently moving someone off the wall they picked on the map. It also heals
+ * the data: most synced gym boards carry no serial, so before this the first
+ * connect at a gym fell through to `bindOrCreateOwnBoardForSerial` and minted a
+ * private duplicate that every later climber at that wall then resolved to.
+ * Claiming the serial onto the selected board makes the gym's own listing
+ * discoverable by serial for everyone after.
+ *
+ * The gym listing outranks a *personal* selection because most personal boards
+ * are the auto-named onboarding template and travel with the climber rather
+ * than describing a wall. It does not outrank the listing itself: a climber who
+ * picked that gym's wall on the map and connected to a controller with its
+ * serial has said everything there is to say about which wall they're on.
  */
 async function resolveSerialForUser(
   userId: string,
   serial: string,
   config: { boardType: string; layoutId: number; sizeId: number; setIds: string },
-  options: { autoPickMultiple?: boolean; advertisedBoardType?: string | null } = {},
+  options: { autoPickMultiple?: boolean; advertisedBoardType?: string | null; selectedBoardUuid?: string | null } = {},
 ): Promise<SerialResolution> {
   // The type the controller advertises over BLE. Every read below is scoped to
   // it, because Aurora reuses a serial across board apps and a board of another
   // type is a different physical controller, not a candidate.
-  const { advertisedBoardType } = options;
-  const chosen = await findChosenBoardForSerial(userId, serial, advertisedBoardType);
+  const { advertisedBoardType, selectedBoardUuid } = options;
+  if (selectedBoardUuid) {
+    const selected = await resolveSelectedBoardForSerial(
+      userId,
+      serial,
+      selectedBoardUuid,
+      config,
+      advertisedBoardType,
+    );
+    if (selected) return { kind: 'board', board: selected };
+  }
+  const chosen = await findChosenBoardForSerial(userId, serial, advertisedBoardType, config);
   if (chosen) {
     return { kind: 'board', board: chosen };
   }
@@ -488,6 +616,7 @@ export const boardPresenceMutations = {
       sizeId,
       setIds,
       advertisedBoardType,
+      selectedBoardUuid,
     }: {
       serial: string;
       boardType: string;
@@ -495,6 +624,7 @@ export const boardPresenceMutations = {
       sizeId: number;
       setIds: string;
       advertisedBoardType?: string | null;
+      selectedBoardUuid?: string | null;
     },
     ctx: ConnectionContext,
   ): Promise<ResolvedBoard> => {
@@ -504,6 +634,9 @@ export const boardPresenceMutations = {
     const validSerial = validateInput(BoardSerialSchema, serial, 'serial');
     const config = validateInput(BoardPresenceConfigInputSchema, { boardType, layoutId, sizeId, setIds }, 'input');
     const validAdvertisedBoardType = validateAdvertisedBoardType(advertisedBoardType);
+    const validSelectedBoardUuid = selectedBoardUuid
+      ? validateInput(UUIDSchema, selectedBoardUuid, 'selectedBoardUuid')
+      : null;
     const userId = ctx.userId!;
 
     // Old clients can't prompt. The auto-pick's final candidate read and
@@ -511,6 +644,7 @@ export const boardPresenceMutations = {
     const resolution = await resolveSerialForUser(userId, validSerial, config, {
       autoPickMultiple: true,
       advertisedBoardType: validAdvertisedBoardType,
+      selectedBoardUuid: validSelectedBoardUuid,
     });
     // Auto-pick never returns candidates for a populated list, so the only way
     // here is the cross-type refusal above: the controller is not the board type
@@ -541,6 +675,7 @@ export const boardPresenceMutations = {
       sizeId,
       setIds,
       advertisedBoardType,
+      selectedBoardUuid,
     }: {
       serial: string;
       boardType: string;
@@ -548,6 +683,7 @@ export const boardPresenceMutations = {
       sizeId: number;
       setIds: string;
       advertisedBoardType?: string | null;
+      selectedBoardUuid?: string | null;
     },
     ctx: ConnectionContext,
   ): Promise<{ board: ResolvedBoard | null; candidates: BoardCandidatePayload[] | null }> => {
@@ -557,10 +693,14 @@ export const boardPresenceMutations = {
     const validSerial = validateInput(BoardSerialSchema, serial, 'serial');
     const config = validateInput(BoardPresenceConfigInputSchema, { boardType, layoutId, sizeId, setIds }, 'input');
     const validAdvertisedBoardType = validateAdvertisedBoardType(advertisedBoardType);
+    const validSelectedBoardUuid = selectedBoardUuid
+      ? validateInput(UUIDSchema, selectedBoardUuid, 'selectedBoardUuid')
+      : null;
     const userId = ctx.userId!;
 
     const resolution = await resolveSerialForUser(userId, validSerial, config, {
       advertisedBoardType: validAdvertisedBoardType,
+      selectedBoardUuid: validSelectedBoardUuid,
     });
     if (resolution.kind === 'board') {
       await pubsub.stampBoardMembership(String(resolution.board.id), userId);
@@ -570,8 +710,10 @@ export const boardPresenceMutations = {
     const lastSent = await lastSentAtByBoardIds(resolution.candidates.map((candidate) => candidate.id));
     return {
       board: null,
-      candidates: resolution.candidates.map((candidate) =>
-        toBoardCandidate(candidate, userId, lastSent.get(candidate.id) ?? null),
+      candidates: await Promise.all(
+        resolution.candidates.map((candidate) =>
+          toBoardCandidate(candidate, userId, lastSent.get(candidate.id) ?? null),
+        ),
       ),
     };
   },
@@ -609,9 +751,10 @@ export const boardPresenceMutations = {
    * stats and live presence share the same board_id before any BLE connection.
    *
    * Auth-optional: board presence is universal, so an anonymous viewer can bind
-   * a public board and become a member (keyed by `conn:{connectionId}`). Owned
-   * boards stay reachable only to their logged-in owner (see
-   * findReachableActiveBoardByUuid).
+   * a board and become a member (keyed by `conn:{connectionId}`). The uuid is
+   * the board's link, so its policy decides with the link reading: Public and
+   * Unlisted bind for anyone holding it, others need the viewer's standing
+   * (see findReachableActiveBoardByUuid).
    */
   resolveBoardForUuid: async (
     _: unknown,
@@ -626,7 +769,7 @@ export const boardPresenceMutations = {
     if (!board) {
       throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
     }
-    const resolved = toResolvedBoard(board);
+    const resolved = toResolvedBoard(board, true);
     await pubsub.stampBoardMembership(String(resolved.boardId), emitterId);
     return resolved;
   },
@@ -708,7 +851,7 @@ export const boardPresenceMutations = {
     // first-seen for the durable dwell gate, and the A2 dedup marker) — one
     // Redis pipeline instead of the old separate hasBoardMembership call.
     const [board, gate] = await Promise.all([
-      requireActiveBoardById(boardId),
+      requireActiveBoardWithVisibilityById(boardId),
       pubsub.getBoardReportGate(String(boardId), emitterId),
     ]);
 
@@ -719,6 +862,10 @@ export const boardPresenceMutations = {
     if (!gate.isMember) {
       throw new GraphQLError('Not connected to this board');
     }
+    // A previously stamped membership cannot outlive an admin hide or current
+    // spray-wall restriction. The membership proves this channel's held link;
+    // check that link against current primary policy before any report side effect.
+    await assertSprayBoardIsReadable(board, ctx.userId, board.uuid, db);
 
     const validatedClimb = validateInput(ReportBoardClimbInputSchema, climb, 'climb');
     const validatedAngle = validateInput(BoardPresenceAngleSchema, angle, 'angle');
@@ -728,12 +875,16 @@ export const boardPresenceMutations = {
     // clients always send integer wall angles).
     const effectiveAngle = Math.round(validatedAngle ?? validatedClimb.climb.angle ?? Number(board.angle));
     const climbUuid = validatedClimb.climb.uuid;
+    // The orientation the reporter wrote to the wall. Older reporters send the
+    // queue item's flag (or nothing); a missing value stays null on the
+    // presence climb so clients can tell "unknown" from "not mirrored".
+    const reportedMirrored = validatedClimb.climb.mirrored ?? null;
 
     // Write-side idempotency (A2): a retry of the exact same (emitter, climb,
-    // angle) within REPORT_DEDUP_WINDOW_MS is a no-op — no new seq, no event,
+    // angle, orientation) within REPORT_DEDUP_WINDOW_MS is a no-op — no new seq, no event,
     // no durable insert. Still note the WS-close backstop so a deduped retry
     // doesn't let a stale backstop entry lapse. A different climb / angle /
-    // user is never suppressed (a user change still needs to broadcast the
+    // user / orientation is never suppressed (a user change still needs to broadcast the
     // hand-off).
     //
     // The short-circuit additionally requires this emitter to STILL hold the
@@ -746,7 +897,16 @@ export const boardPresenceMutations = {
     // through re-takes the writer and re-broadcasts. The cost is one
     // duplicate history/durable row in exactly that edge — holder correctness
     // wins over row dedup.
-    if (gate.lastReport === `${emitterId}|${climbUuid}|${effectiveAngle}` && gate.currentWriter === emitterId) {
+    //
+    // Unknown orientation (null) dedups as un-mirrored on purpose: an older
+    // reporter's exact retry still matches, and the presence climb keeps null.
+    const dedupMarker = boardReportDedupMarker({
+      emitterId,
+      climbUuid,
+      effectiveAngle,
+      mirrored: reportedMirrored === true,
+    });
+    if (gate.lastReport === dedupMarker && gate.currentWriter === emitterId) {
       roomManager.noteBoardWriter(ctx.connectionId, boardId, emitterId);
       return true;
     }
@@ -806,7 +966,8 @@ export const boardPresenceMutations = {
       throw new GraphQLError('Unknown climb for this board');
     }
 
-    const sentAt = new Date().toISOString();
+    const reportingSessionId = roomManager.getClient(ctx.connectionId)?.sessionId ?? null;
+    let sentAt = new Date().toISOString();
 
     // Logged-in senders with sustained presence get durable history. Reserve
     // the seq through an allocator override that keeps the board-row lock until
@@ -819,24 +980,27 @@ export const boardPresenceMutations = {
     let seq: number;
     if (durableUserId !== null && hasDurableDwell) {
       try {
-        seq = await pubsub.nextBoardSeq(String(boardId), (resolvedBoardId, candidate) =>
-          reserveAndPersistBoardClimbEvent(
+        seq = await pubsub.nextBoardSeq(String(boardId), async (resolvedBoardId, candidate) => {
+          const durable = await reserveAndPersistBoardClimbEvent(
             {
               boardId: resolvedBoardId,
               boardType: board.boardType,
               climbUuid,
               angle: effectiveAngle,
               userId: durableUserId,
-              sessionId: null,
+              sessionId: reportingSessionId,
+              identityPolicyVersion: 1,
               frames: catalogClimb.frames ?? null,
               name: catalogClimb.name ?? null,
               grade: catalogClimb.grade ?? null,
               setter: catalogClimb.setterUsername ?? null,
-              confirmedAt: sentAt,
+              reportingMirrored: reportedMirrored,
             },
             candidate,
-          ),
-        );
+          );
+          sentAt = durable.confirmedAt;
+          return durable.seq;
+        });
       } catch (error) {
         // A merge/delete is authoritative: never publish a fresh event under a
         // tombstoned board id. Other persistence failures retain the existing
@@ -857,15 +1021,16 @@ export const boardPresenceMutations = {
     }
 
     const presenceClimb: BoardPresenceClimb = {
+      sessionId: reportingSessionId,
+      identityPolicyVersion: 1,
       climbUuid,
       queueItemUuid: validatedClimb.uuid,
       name: catalogClimb.name ?? null,
       grade: catalogClimb.grade ?? null,
-      // Grade palettes are still client/theme-specific, so the server leaves
-      // this nullable until a shared color contract exists.
-      gradeColor: null,
+      gradeColor: getGradeColor(catalogClimb.grade) ?? null,
       frames: catalogClimb.frames ?? null,
       angle: effectiveAngle,
+      mirrored: reportedMirrored,
       setter: catalogClimb.setterUsername ?? null,
       sentByDisplayName: sender?.displayName ?? sender?.name ?? null,
       sentByAvatarUrl: sender?.avatarUrl ?? sender?.image ?? null,
@@ -884,17 +1049,16 @@ export const boardPresenceMutations = {
     // one), so the APNs Live Activity path can resolve the board's holder for a
     // session — QueueState/push-token rows carry sessionId but not boardId. Best-
     // effort: a solo (no-session) sender just doesn't establish a mapping.
-    const reportingSessionId = roomManager.getClient(ctx.connectionId)?.sessionId ?? null;
-
     // One Redis pipeline: durable FIFO history append, connection-holder
     // handoff (atomic SET..GET), the A2 dedup marker, and the session→board
     // mapping. Non-fatal on failure (see commitBoardClimb's contract).
-    const { previousWriter, writerSlotOk, sessionBindingChanged } = await pubsub.commitBoardClimb({
+    const { previousWriter, writerSlotOk, sessionBindingChanged, sessionBoardChanged } = await pubsub.commitBoardClimb({
       boardId: String(boardId),
       emitterId,
       climb: presenceClimb,
       climbUuid,
       effectiveAngle,
+      mirrored: reportedMirrored === true,
       sessionId: reportingSessionId,
     });
 
@@ -907,6 +1071,12 @@ export const boardPresenceMutations = {
     // gates and the superseded-binding re-check, and is publisher-instance-
     // only like every producer publish. Fire-and-forget — a failed preview
     // seed must never fail the accepted report.
+    // This send moved the session onto another wall. A session with no primary
+    // board is judged on the wall its live binding names, so connected peers
+    // re-project who they may name (roster and queue). Fire-and-forget, after
+    // the binding committed; it never fails the accepted report.
+    if (sessionBoardChanged && reportingSessionId) void publishSessionWallChanged(reportingSessionId);
+
     if (sessionBindingChanged && reportingSessionId) {
       publishBoardQueuePreviewForSession(reportingSessionId).catch((error: unknown) => {
         logger.warn(
@@ -993,5 +1163,53 @@ export const boardPresenceMutations = {
       });
     }
     return cleared;
+  },
+
+  /**
+   * "Turn off all lights" (#7015): the phone driving the wall blanked every LED
+   * but kept its BLE link. Without this, every other viewer kept showing the
+   * last climb as lit, because nothing told the feed the wall went dark.
+   *
+   * Gate: board membership (the same proof-of-presence `reportBoardClimb` asks
+   * for), and refused only when ANOTHER emitter holds the wall. A free wall is
+   * accepted: the WS-close backstop deletes the writer key on a socket reconnect
+   * while BLE stays up, and an anonymous holder's `conn:` id rotates with that
+   * reconnect, so "free" is the normal state for a genuine clearer after a blip.
+   *
+   * The seq comes from `nextBoardSeq` first (it may consult the Postgres floor,
+   * which can't run inside Lua), then the clear is compare-and-set stored. Seq
+   * ordering makes that safe against a racing climb set or a second clear. The
+   * holder slot is untouched: the phone is still connected. History is untouched.
+   */
+  reportBoardClear: async (_: unknown, { boardId }: { boardId: number }, ctx: ConnectionContext): Promise<boolean> => {
+    // Same anon-per-IP headroom as reportBoardDisconnect (issue #2863).
+    await applyRateLimit(ctx, ctx.isAuthenticated ? 60 : 240, 'reportBoardClear');
+    const emitterId = ctx.userId ?? `conn:${ctx.connectionId}`;
+    const boardKey = String(boardId);
+
+    const [board, gate] = await Promise.all([
+      requireActiveBoardWithVisibilityById(boardId),
+      pubsub.getBoardReportGate(boardKey, emitterId),
+    ]);
+    if (!gate.isMember) {
+      throw new GraphQLError('Not connected to this board');
+    }
+    await assertSprayBoardIsReadable(board, ctx.userId, board.uuid, db);
+    if (gate.currentWriter !== null && gate.currentWriter !== emitterId) {
+      return false;
+    }
+
+    const seq = await pubsub.nextBoardSeq(boardKey);
+    // Name the climb that went dark so a viewer can say which one is no longer
+    // lit, even when this clear reaches it before its history backfill does.
+    // Read after the seq is allocated, and only below it: a set that commits in
+    // between with a higher seq outranks this clear and must not be named.
+    const recentClimbs = await pubsub.getRecentBoardClimbs(boardKey);
+    const clearedClimb = recentClimbs.find((climb) => climb.seq < seq && isNativeBoardClimb(climb));
+    const climbUuid = clearedClimb?.climbUuid ?? null;
+    const clearedAt = new Date().toISOString();
+    await pubsub.commitBoardClear(boardKey, { seq, clearedAt, climbUuid });
+    pubsub.publishBoardPresenceEvent(boardKey, { __typename: 'BoardClimbCleared', clearedAt, seq, climbUuid });
+    return true;
   },
 };

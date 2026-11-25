@@ -7,11 +7,12 @@ import type { MaterialSurfaceContainers } from '../theme/colors';
 import { iosDarkColors, iosLightColors } from '../theme/ios-colors';
 import { shadows, type MaterialElevationLevel } from '../theme/tokens';
 import { useEffectiveSurfaceMode } from '../hooks/use-effective-surface-mode';
+import { useButtonSurface } from './Button.surface';
 
 type GlassSurfaceProps = {
   children?: ReactNode;
   style?: StyleProp<ViewStyle>;
-  /** 'regular' = frosted, elevated chrome (tab bar, sheets); 'clear' = lighter, content-forward (floating bars). */
+  /** 'regular' = legible chrome; 'clear' = highly translucent controls over visually rich media. */
   glassEffectStyle?: GlassStyle;
   /**
    * Tint composited onto the glass / blur (e.g. a climb's grade hue). Keep it
@@ -90,6 +91,7 @@ export function GlassSurface({
 }: GlassSurfaceProps) {
   const { systemColors, colorScheme, m3SurfaceContainers, materialElevation } = useTheme();
   const mode = useEffectiveSurfaceMode();
+  const onGlass = useButtonSurface() === 'glass';
   const isDark = colorScheme === 'dark';
 
   // The no-glass paths always start from an opaque base so the surface never
@@ -161,6 +163,17 @@ export function GlassSurface({
   // the native glass renders a rounded shape with its own clean edge (no parent
   // clip or RN border, which would seam at the cardinal points of a circle).
   if (mode === 'glass') {
+    // Inside a region that is already glass (`ButtonSurfaceProvider
+    // surface="glass"`: a glass panel, a native bar item) the container's glass
+    // is this control's glass. HIG Materials: never layer glass on glass, so
+    // keep the layout and drop the second GlassView.
+    if (onGlass) {
+      return (
+        <View style={style} pointerEvents={pointerEvents}>
+          {children}
+        </View>
+      );
+    }
     return (
       <View style={style} pointerEvents={pointerEvents}>
         <GlassView
@@ -208,7 +221,7 @@ const styles = StyleSheet.create({
    * `flexBasis` deliberately stays `auto` — this is NOT `flex: 1`. With
    * `flexBasis: 0` an auto-height surface would measure its only in-flow child at
    * zero, size itself to zero, and then have no free space to grow back into, so
-   * the whole surface would collapse (the reaction menu card is exactly that
+   * the whole surface would collapse (any auto-height card is exactly that
    * shape). `auto` starts from the content size, which is what an auto-height
    * surface wants, and still leaves free space for `flexGrow` to take when the
    * surface does have a definite height.

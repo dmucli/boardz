@@ -1,25 +1,64 @@
 // MUST be the first import: initializes Sentry + loads dotenv before any
 // instrumented module (HTTP, Postgres, Redis) is required.
 import './instrument';
+// Second, before anything that builds a Postgres pool.
+import './request-pool-defaults';
 import * as Sentry from '@sentry/node';
 import { startServer } from './server';
 import { redisClientManager } from './redis/client';
 import { closePool, closeReadPool } from '@boardsesh/db/client';
+import { closeCredentialDatabase } from './auth/credential-database';
+import { closeDatabasePools } from './shutdown-database-pools';
+import { closeAdmissionPool } from './auth/admission-pool';
 import { shutdownPosthog } from './services/analytics/posthog';
 import { logger } from './utils/logger';
 import { FORCE_SHUTDOWN_TIMEOUT_MS } from './shutdown-timing';
-import { startJobQueue, stopJobQueue } from './services/job-queue';
+import { startJobQueue, stopJobQueue, stopJobQueueWorkers } from './services/job-queue';
+import { startFeedbackGithubConversations } from './services/feedback-github-conversations';
+import { startSprayDetectionNotifications } from './services/spray-detection-notifications';
 import { startSprayDetectionMaintenance } from './services/spray-detection-maintenance';
 import { startBackgroundJobMaintenance } from './services/background-job-maintenance';
 import { startBatchSchedules } from './services/batch-schedules';
 import { db } from './db/client';
 import { startPopularBoardConfigsRefresh } from './services/popular-board-configs';
 import { startClimbPopularityRefresh } from './services/climb-popularity-refresh';
+import { startDirectoryReportSweep } from './services/directory-report-sweep';
+import { startDirectoryReportsFlagRefresh } from './services/directory-reports-flag';
+import { startPlaylistGradeSummaryRefresh } from './services/playlist-grade-summary-refresh';
+import { startPartnerOAuthSweep } from './services/partner-oauth-sweep';
+import { startPartnerConnectionNotices } from './services/partner-connection-notices';
+import { startAppWorkoutMaintenance, startSessionInactivityMaintenance } from './services/app-workout-maintenance';
+import { startPartnerWebhooks } from './services/partner-webhooks/worker';
+import { startPosthogPersonDeletion } from './services/analytics/posthog-person-deletion';
+import { assertNativeRevocationActivationConfiguration } from './auth/authority/native-revocation-configuration';
+import { qualifyIdentityMirrorAtStartup } from './auth/authority/mirror-activation';
+import { assertWebSessionWriterActivationConfiguration } from './auth/current-store/web-session-configuration';
+import { assertCutoffEnforcementConfiguration } from './auth/current-store/authority-configuration';
+import { assertBrowserSessionModeConfiguration } from './auth/authority/browser-session-mode';
+import { assertAccountGuessLimitConfiguration } from './auth/password-guess-limit';
+import { closePasswordGuessPool } from './auth/password-guess-pool';
 
 async function main() {
-  const { wss, httpServer, cleanupIntervals, shutdownServices } = await startServer();
+  // Before anything listens: a staged writer under AUTH_CUTOFF_ENFORCEMENT=observe
+  // would bump generations no reader enforces (docs/auth/better-auth-migration.md).
+  assertCutoffEnforcementConfiguration();
+  assertNativeRevocationActivationConfiguration();
+  assertWebSessionWriterActivationConfiguration();
+  assertBrowserSessionModeConfiguration();
+  assertAccountGuessLimitConfiguration();
+  // Off (the default) runs no query. On qualifies against the database and
+  // otherwise throws one fixed code and the process exits; after an authority
+  // switch it boots inert instead (docs/auth/better-auth-identity-mirror.md).
+  const identityMirror = await qualifyIdentityMirrorAtStartup();
+  if (identityMirror?.state === 'qualified')
+    logger.info(`[IdentityMirror] Qualified at writer epoch ${identityMirror.authority.epoch}`);
+  else if (identityMirror?.state === 'inert')
+    // An error, so Sentry records every boot in this state.
+    logger.error(
+      `[IdentityMirror] Inert (${identityMirror.reason}): mirrored credential writes refuse until a redeploy with AUTH_IDENTITY_MIRROR=off or the current CURRENT_STORE_AUTH_WRITER_EPOCH`,
+    );
 
-  // The durable job queue (docs/partner-workouts-internal.md, "The job queue").
+  // The durable job queue (docs/integrations/partner-workouts-internal.md, "The job queue").
   //
   // Started HERE and not in `startServer()` on purpose. The queue is a property
   // of the process, not of a server instance: it holds its own Postgres pool and
@@ -27,11 +66,23 @@ async function main() {
   // want an HTTP/WS surface and no background work. Starting it there added
   // enough connection pressure to make an unrelated suite flake. Its own tests
   // call `startJobQueue()` directly, which is the honest way to test it.
+  //
+  // And BEFORE `startServer()`, which starts listening: a mutation that
+  // enqueues inside its transaction (account deletion queues the PostHog
+  // erasure) must never find the queue missing. A missed erasure enqueue
+  // cannot be recovered once the user row is gone.
   const jobQueue = await startJobQueue();
+  // The `directory-reports` flag's first answer, before anything that reads it
+  // without waiting starts: the server's mutations and the push worker
+  // (services/directory-reports-flag.ts). Kept warm from here on. Never throws.
+  await startDirectoryReportsFlagRefresh();
+  const { wss, httpServer, cleanupIntervals, shutdownServices } = await startServer();
   await startSprayDetectionMaintenance(jobQueue);
+  await startSprayDetectionNotifications(jobQueue);
+  await startFeedbackGithubConversations(jobQueue);
   await startBackgroundJobMaintenance(jobQueue, db);
   // Not fatal: without it no family schedule fires, which is also the state
-  // with BATCH_FAMILIES_ENABLED unset. Work already queued is unaffected.
+  // with every family in BATCH_FAMILIES_DISABLED. Work already queued is unaffected.
   await startBatchSchedules(jobQueue, db).catch((error: unknown) => {
     logger.error('[BatchSchedules] Could not register family schedules', { error });
   });
@@ -44,6 +95,47 @@ async function main() {
   // table as last refreshed, or the old aggregation for a board never built.
   await startClimbPopularityRefresh(jobQueue).catch((error: unknown) => {
     logger.error('[ClimbPopularity] Could not register the refresh job', { error });
+  });
+  // Not fatal: without the sweep, reports wait for the next replica that
+  // registers it: no reminders, no hand-off to the admin queue, no digest.
+  await startDirectoryReportSweep(jobQueue).catch((error: unknown) => {
+    logger.error('[DirectoryReports] Could not register the sweep job', { error });
+  });
+  // Not fatal: without the job, summaries still follow every climb added or
+  // removed through the app; only upstream grade drift and synced circuits wait.
+  await startPlaylistGradeSummaryRefresh(jobQueue).catch((error: unknown) => {
+    logger.error('[PlaylistGradeSummaries] Could not register the refresh job', { error });
+  });
+  // Not fatal: without the sweep, expired partner OAuth rows wait for the next
+  // replica that registers it. Nothing a request reads depends on it.
+  await startPartnerOAuthSweep(jobQueue).catch((error: unknown) => {
+    logger.error('[PartnerOAuthSweep] Could not register the sweep job', { error });
+  });
+  await startPartnerConnectionNotices(jobQueue).catch((error: unknown) => {
+    logger.error('[PartnerConnectionNotices] Could not register notification delivery', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+    });
+  });
+  await startSessionInactivityMaintenance(jobQueue).catch((error: unknown) => {
+    logger.error('[SessionInactivity] Could not register the inactivity job', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+    });
+  });
+  await startAppWorkoutMaintenance(jobQueue).catch((error: unknown) => {
+    logger.error('[AppWorkoutMaintenance] Could not register the expiry job', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+    });
+  });
+  await startPartnerWebhooks(jobQueue).catch((error: unknown) => {
+    logger.error('[PartnerWebhooks] Could not register delivery workers', {
+      errorName: error instanceof Error ? error.name : 'unknown',
+    });
+  });
+  // Not fatal: a queued erasure waits up to 14 days for a worker
+  // (`retentionSeconds` on the queue; a finished one is kept 7 days), and the
+  // next replica that registers the worker sends it.
+  await startPosthogPersonDeletion(jobQueue).catch((error: unknown) => {
+    logger.error('[PostHogErasure] Could not register the PostHog person deletion worker', { error });
   });
 
   let shuttingDown = false;
@@ -94,14 +186,17 @@ async function main() {
     // Stop periodic tasks
     cleanupIntervals();
 
-    // Stop the queue before the pools it rides on close. Graceful, so an
-    // in-flight job finishes rather than being orphaned into the supervisor's
-    // reclaim window on every deploy; bounded, so a wedged handler cannot hold
-    // the drain open past Railway's `drainingSeconds`.
+    // Stop the queue's workers and timers now. Graceful, so an in-flight job
+    // finishes rather than being orphaned into the supervisor's reclaim window
+    // on every deploy; bounded, so a wedged handler cannot hold the drain open
+    // past Railway's `drainingSeconds`. Sends keep working: WebSocket mutations
+    // still run until the sockets close below, and one that enqueues in its
+    // transaction (account deletion) must not find the queue gone. The pool
+    // closes after the WebSocket and HTTP servers have.
     try {
-      await stopJobQueue();
+      await stopJobQueueWorkers();
     } catch (error) {
-      logger.error('Error stopping the job queue:', error);
+      logger.error('Error stopping the job queue workers:', error);
     }
 
     // Shutdown EventBroker + RoomManager (flushes pending writes)
@@ -124,16 +219,32 @@ async function main() {
 
     await httpServerClosed;
 
+    // No mutation runs any more, so nothing can enqueue: close the queue's
+    // pool before the pools it shares a database with.
+    try {
+      await stopJobQueue();
+    } catch (error) {
+      logger.error('Error stopping the job queue:', error);
+    }
+
     // Disconnect from Redis
     await redisClientManager.disconnect();
 
-    // Close database connection pools (primary + read replica)
-    try {
-      await closeReadPool();
-      await closePool();
+    // Close database connection pools (primary + read replica + admission).
+    // Admission goes last: nothing reads through it once the servers are closed,
+    // and its bounded close can never hold up the others.
+    if (
+      await closeDatabasePools({
+        credential: closeCredentialDatabase,
+        read: closeReadPool,
+        primary: closePool,
+        admission: closeAdmissionPool,
+        guessLimit: closePasswordGuessPool,
+      })
+    ) {
       logger.info('Database pools closed');
-    } catch (error) {
-      logger.warn('Error closing database pools:', error);
+    } else {
+      logger.warn('One or more database pools failed to close');
     }
 
     await shutdownPosthog();

@@ -16,8 +16,11 @@ import {
   useConnectivityBannerEnabled,
   useFirstBoardPickerEnabled,
   useFirstConnectCtaEnabled,
+  usePlayerSwapLookEnabled,
+  usePngWallFadeEnabled,
   useQaTesterGateEnabled,
   useSendRecoveryGateEnabled,
+  useStaleCurrentHoldEnabled,
 } from '../feature-flags-provider';
 
 vi.mock('@react-native-async-storage/async-storage', () => ({
@@ -34,6 +37,13 @@ const KILL_SWITCHES = [
   { key: 'send-recovery-gate-kill', useEnabled: useSendRecoveryGateEnabled },
   { key: 'first-board-picker-kill', useEnabled: useFirstBoardPickerEnabled },
   { key: 'first-connect-cta-kill', useEnabled: useFirstConnectCtaEnabled },
+  // Not a launch surface, but the same direction: the #4979 hold is on until
+  // PostHog says `true` (docs/product/current-climb-outside-queue.md, section 8).
+  { key: 'stale-current-hold-kill', useEnabled: useStaleCurrentHoldEnabled },
+  // The player board's swap look ships at 100% too: on until PostHog says `true`.
+  { key: 'player-swap-look-kill', useEnabled: usePlayerSwapLookEnabled },
+  // So does the PNG board's still wall: on until PostHog says `true`.
+  { key: 'png-wall-fade-kill', useEnabled: usePngWallFadeEnabled },
 ] as const;
 
 function readEnabled(useEnabled: () => boolean, flags?: Record<string, boolean | string | undefined>): boolean {

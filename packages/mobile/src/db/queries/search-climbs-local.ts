@@ -7,6 +7,7 @@ import { BOULDER_GRADES } from '@boardsesh/board-constants/boulder-grade-mapping
 import { climbNameLikePattern } from '@boardsesh/climb-filters';
 import { getGradeLabel, getClimbStars } from '../../lib/grade-label';
 import { followedAuthorsLocalCondition } from './followed-authors-local';
+import { tickOnCurrentHoldsLocalSql } from './climb-revisions-local';
 
 /**
  * On-device climb search over local SQLite (board_climbs ⋈ board_climb_stats),
@@ -37,6 +38,37 @@ import { followedAuthorsLocalCondition } from './followed-authors-local';
 
 export type LocalSearchResult = { climbs: Climb[]; hasMore: boolean };
 
+/** One owner/angle-scoped first graded ascent, before filtering or pagination. */
+export function localSprayGradeJoin(
+  boardName: string,
+  angle: number,
+  viewerId: string | null,
+): {
+  sql: string;
+  binds: (string | number | null)[];
+} {
+  if (boardName !== 'spray') return { sql: '', binds: [] };
+  return {
+    sql: `LEFT JOIN boardsesh_ticks local_first_ascent ON local_first_ascent.uuid = (
+      SELECT first_tick.uuid FROM boardsesh_ticks first_tick
+      WHERE first_tick.climb_uuid = c.uuid AND first_tick.board_type = 'spray'
+        AND first_tick.angle = ? AND first_tick.user_id = ?
+        AND first_tick.status IN ('send', 'flash') AND first_tick.difficulty IS NOT NULL
+      ORDER BY first_tick.climbed_at ASC, first_tick.uuid ASC LIMIT 1
+    )`,
+    binds: [angle, viewerId],
+  };
+}
+
+/** Canonical stats and grade estimates take precedence over an offline first ascent. */
+export function effectiveDisplayDifficultySql(boardName: string, crossAngle: boolean): string {
+  const canonical = effectiveStatsSql('display_difficulty', crossAngle);
+  return boardName === 'spray'
+    ? `COALESCE(${canonical}, CASE WHEN COALESCE(g.universal_grade, g.local_grade) IS NULL
+        THEN local_first_ascent.difficulty END)`
+    : canonical;
+}
+
 // `null` is a real bind value here, not an absence: with no `local_user_id`
 // stamp the owner predicate binds NULL, and `user_id = NULL` never matches — so
 // the read degrades to this device's own unsynced writes rather than to
@@ -66,7 +98,7 @@ const SORT_ALIASES: Record<string, string> = {
 // NULL). This won't reproduce the server's md5 order byte-for-byte — an accepted
 // offline gap, like the ASCII-collation note above — but it's stable per seed so
 // OFFSET pagination doesn't reshuffle mid-scroll.
-const RANDOM_ORDER_EXPR = `(
+export const RANDOM_ORDER_EXPR = `(
   (COALESCE(unicode(substr(c.uuid, 1, 1)), 0) * 131
    + COALESCE(unicode(substr(c.uuid, 4, 1)), 0) * 137
    + COALESCE(unicode(substr(c.uuid, 7, 1)), 0) * 139
@@ -136,7 +168,7 @@ export function isOfflineSearchSupported(input: ClimbSearchInput): boolean {
   // see buildJoinAndWhere), and personal progress/rating filters are all
   // supported (synced ticks carry quality + climbed_at).
   // These need tables we don't sync (or the drafts owner path), so fall back:
-  if (input.onlyDrafts) return false;
+  if (input.onlyDrafts && input.boardName !== 'spray') return false;
   // Personal grades (#4828) are NOT listed here: buildJoinAndWhere and
   // sortColumnSql implement the same latest-graded-tick rule the server does,
   // against the synced ticks (which carry both `difficulty` and `uuid`). This
@@ -145,10 +177,13 @@ export function isOfflineSearchSupported(input: ClimbSearchInput): boolean {
   // silently-ignored filter here is wrong results with no network fallback.
   if (input.onlyWithBetaVideos) return false;
   if (input.zoneBox) return false;
-  // Spray-wall hold integrity (SW-12) IS expressible now: SW-15 (#5448) mirrors
-  // `board_climbs.missing_hold_count` into the on-device schema at migration v7,
-  // and `buildJoinAndWhere` carries the same COALESCE predicate the server's
-  // `holdIntegrityCondition` uses. No fall-back clause here on purpose.
+  // A spray wall's retired-by-reset rule IS expressible: migration v12 mirrors
+  // `board_climbs.retired_by_reset` on the device, and `buildJoinAndWhere`
+  // applies it. No fall-back clause here on purpose.
+  // Liked climbs (`onlyFavorited`, #6002) ARE expressible: the hearts are synced
+  // into `user_favorites`, and buildJoinAndWhere carries the EXISTS. The read is
+  // user-scoped, so `canServeSearchLocal` (offline-request.ts) also requires the
+  // local user data to be complete and this climber's before it serves locally.
   const { hasHoldState } = parseHoldsFilter(input.holdsFilter);
   if (hasHoldState) return false;
   return true;
@@ -159,7 +194,7 @@ export function isOfflineSearchSupported(input: ClimbSearchInput): boolean {
 const COMPLETED_STATUSES = "('flash', 'send')";
 
 /**
- * The row-level half of the auth-scoping contract (docs/offline-reads.md).
+ * The row-level half of the auth-scoping contract (docs/data/offline-reads.md).
  *
  * Sign-out wipes the user tables, but best-effort: a locked database or a crash
  * mid-sign-out leaves the previous account's ticks behind, and these reads used
@@ -278,9 +313,13 @@ export function gradeValueSql(displayDifficulty: string, gradeSource: ClimbSearc
   return `CAST(ROUND(${coalesced}) AS INTEGER)`;
 }
 
-function ticksExists(negated: boolean, statusSql: string): string {
+// Catalogue progress/ratings read the current holds (#6023). Playlist filters
+// follow their server contract, which counts the climber's ticks on any holds
+// revision. Personal grades below are revision-independent in both contexts.
+function ticksExists(negated: boolean, statusSql: string, currentHoldsOnly = true): string {
   return `${negated ? 'NOT EXISTS' : 'EXISTS'} (SELECT 1 FROM boardsesh_ticks t
-    WHERE t.climb_uuid = c.uuid AND t.board_type = ? AND t.angle = ? AND ${ownedTicks('t')} AND ${statusSql})`;
+    WHERE t.climb_uuid = c.uuid AND t.board_type = ? AND t.angle = ? AND ${ownedTicks('t')} AND ${statusSql}
+    ${currentHoldsOnly ? `AND ${tickOnCurrentHoldsLocalSql('t')}` : ''})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +356,7 @@ function clampToBoulderScale(difficultyExpr: string): string {
  * `idx_ticks_climb` makes each probe a handful of rows and there is no 220k-row
  * candidate set for a per-row probe to multiply against.
  */
-const MY_GRADE_SUBQUERY = `(SELECT ${clampToBoulderScale('mg.difficulty')}
+export const MY_GRADE_SUBQUERY = `(SELECT ${clampToBoulderScale('mg.difficulty')}
     FROM boardsesh_ticks mg
     WHERE mg.climb_uuid = c.uuid AND mg.board_type = ? AND mg.angle = ? AND ${ownedTicks('mg')}
     AND mg.difficulty IS NOT NULL
@@ -346,17 +385,31 @@ function usesMyGrades(input: ClimbSearchInput): boolean {
 
 export type JoinAndWhere = { joinSql: string; whereSql: string; joinBinds: Bind[]; whereBinds: Bind[] };
 
+/** The browsed angle's stats row for the outer climb. Binds: board_type, angle. */
+const BROWSED_STATS_JOIN = `LEFT JOIN board_climb_stats s
+    ON s.climb_uuid = c.uuid AND s.board_type = ? AND s.angle = ?`;
+
+/**
+ * The browsed angle's Boardsesh grade for the outer climb, when stats are not
+ * resolved across angles. Binds: board_type, angle. Shared with the ranked walk,
+ * which drives from the stats row and so joins only this half.
+ */
+const BROWSED_GRADES_JOIN = `LEFT JOIN board_climb_grades g
+    ON g.climb_uuid = c.uuid AND g.board_type = ? AND g.angle = ?`;
+
 export function buildJoinAndWhere(
   input: ClimbSearchInput,
   ownerUserId: string | null,
   followedCondition?: { sql: string; binds: string[] },
+  context: 'catalogue' | 'playlist' = 'catalogue',
 ): JoinAndWhere {
   const boardType = input.boardName;
   const angle = input.angle;
   const setIds = parseSetIds(input.setIds);
   const isMoonboard = boardType === 'moonboard';
+  const isDraftQuery = context === 'catalogue' && input.onlyDrafts === true;
 
-  const crossAngle = isCrossAngleStats(input);
+  const crossAngle = context === 'catalogue' && isCrossAngleStats(input);
   const eff = (column: StatsColumn) => effectiveStatsSql(column, crossAngle);
 
   // Stats drive grade/quality/ascents; grades add the Boardsesh grade + confidence
@@ -371,17 +424,19 @@ export function buildJoinAndWhere(
   const joinBinds: Bind[] = crossAngle
     ? [boardType, angle, boardType, boardType, angle]
     : [boardType, angle, boardType, angle];
-  const joinSql = crossAngle
-    ? `LEFT JOIN board_climb_stats s
-    ON s.climb_uuid = c.uuid AND s.board_type = ? AND s.angle = ?
+  let joinSql = crossAngle
+    ? `${BROWSED_STATS_JOIN}
     LEFT JOIN board_climb_stats s_set
     ON s_set.climb_uuid = c.uuid AND s_set.board_type = ? AND s_set.angle = c.angle
     LEFT JOIN board_climb_grades g
     ON g.climb_uuid = c.uuid AND g.board_type = ? AND g.angle = COALESCE(s.angle, s_set.angle, ?)`
-    : `LEFT JOIN board_climb_stats s
-    ON s.climb_uuid = c.uuid AND s.board_type = ? AND s.angle = ?
-    LEFT JOIN board_climb_grades g
-    ON g.climb_uuid = c.uuid AND g.board_type = ? AND g.angle = ?`;
+    : `${BROWSED_STATS_JOIN}
+    ${BROWSED_GRADES_JOIN}`;
+  if (context === 'catalogue') {
+    const localGrade = localSprayGradeJoin(boardType, angle, ownerUserId);
+    joinSql += ` ${localGrade.sql}`;
+    joinBinds.push(...localGrade.binds);
+  }
 
   const conditions: string[] = [];
   const whereBinds: Bind[] = [];
@@ -392,47 +447,59 @@ export function buildJoinAndWhere(
 
   // Base: board / layout / listed / non-draft.
   if (followedCondition) push(followedCondition.sql, ...followedCondition.binds);
-  push('c.board_type = ?', boardType);
-  push('c.layout_id = ?', input.layoutId);
-  push('c.is_listed = 1');
-  push('c.is_draft = 0');
+  // Playlists own their membership, visibility and geometry. Their filters
+  // reuse the expressions below against stats joined at each row's display angle.
+  if (context === 'catalogue') {
+    push('c.board_type = ?', boardType);
+    push('c.layout_id = ?', input.layoutId);
+    if (isDraftQuery) {
+      push('c.is_draft = 1');
+      if (input.draftScope === 'WALL' && boardType === 'spray') {
+        push('EXISTS (SELECT 1 FROM spray_walls wall WHERE wall.layout_id = c.layout_id)');
+      } else {
+        push('c.user_id = ?', ownerUserId);
+      }
+    } else {
+      push('c.is_listed = 1');
+      push('c.is_draft = 0');
+    }
 
-  // Community-hidden climbs, mirroring hiddenClimbCondition in
-  // packages/db/src/queries/climbs/create-climb-filters.ts: gone from browsing,
-  // still findable by name. COALESCE because is_hidden arrived in the on-device
-  // schema at migration v5 and rows pulled before the server started sending it
-  // are NULL — an unknown flag reads as visible, which is the safe direction for
-  // a column the sync will refresh.
-  if (!hasNameQuery(input)) push('COALESCE(c.is_hidden, 0) = 0');
+    // Community-hidden climbs, mirroring hiddenClimbCondition in
+    // packages/db/src/queries/climbs/create-climb-filters.ts: gone from browsing,
+    // still findable by name. COALESCE because is_hidden arrived in the on-device
+    // schema at migration v5 and rows pulled before the server started sending it
+    // are NULL — an unknown flag reads as visible, which is the safe direction for
+    // a column the sync will refresh.
+    if (!hasNameQuery(input)) push('COALESCE(c.is_hidden, 0) = 0');
 
-  // The browsed-angle restriction, mirroring `browsedAngleRestrictionSql` in
-  // packages/db/src/queries/climbs/effective-stats.ts arm for arm (issue #5642):
-  // on Woods without the opt-in, keep a climb set at this angle, one with no set
-  // angle recorded, or one with a stats row here. `s` is the browsed-angle stats
-  // join in both join shapes above, and its climb_uuid is part of the primary key,
-  // so NULL means exactly "no row at this angle" — the same probe
-  // `effectiveStatsSql` uses. `countClimbsLocal` shares this builder, so the badge
-  // counts what the list shows.
-  if (isBrowsedAngleRestricted(input)) {
-    push('(c.angle = ? OR c.angle IS NULL OR s.climb_uuid IS NOT NULL)', angle);
+    // The browsed-angle restriction, mirroring `browsedAngleRestrictionSql` in
+    // packages/db/src/queries/climbs/effective-stats.ts arm for arm (issue #5642):
+    // on Woods without the opt-in, keep a climb set at this angle, one with no set
+    // angle recorded, or one with a stats row here. `s` is the browsed-angle stats
+    // join in both join shapes above, and its climb_uuid is part of the primary key,
+    // so NULL means exactly "no row at this angle" — the same probe
+    // `effectiveStatsSql` uses. `countClimbsLocal` shares this builder, so the badge
+    // counts what the list shows.
+    if (!isDraftQuery && isBrowsedAngleRestricted(input)) {
+      push('(c.angle = ? OR c.angle IS NULL OR s.climb_uuid IS NOT NULL)', angle);
+    }
+
+    // A spray climb that lost a hold is listed like any other: it carries a badge
+    // and a Remix, and is not hidden. The one exception mirrors the server's
+    // `retiredByResetCondition` (packages/db/src/queries/climbs/create-climb-filters.ts),
+    // which applies when the request carries no `holdIntegrity` (the app never
+    // sends one for a wall list): a climb a full in-place reset retired (#6024)
+    // leaves the default list, and comes back on a name search. A downloaded wall
+    // reads here even while online, so the two must agree or the list changes
+    // with the signal. The drafts list is answered by the network
+    // (`isOfflineSearchSupported`), which sends `ANY` for it.
+    //
+    // COALESCE because NULL reads as not retired: every catalogue climb, and any
+    // row pulled before on-device migration v12 added the column.
+    if (boardType === 'spray' && input.onlyDrafts !== true && !hasNameQuery(input)) {
+      push('COALESCE(c.retired_by_reset, 0) = 0');
+    }
   }
-
-  // Spray-wall hold integrity, mirroring `holdIntegrityCondition` in
-  // packages/db/src/queries/climbs/create-climb-filters.ts character for
-  // character — including the COALESCE, which is the whole of the NULL rule.
-  //
-  // `missing_hold_count` is NULL for every climb on the eight catalogue boards
-  // (holds do not come off a Kilter), for a spray climb written before the server
-  // materialised the column, and for any row pulled before on-device migration
-  // v7 added it — and the column is synced WITHOUT a refresh revision, so those
-  // pre-v7 rows are real and stay NULL until the climb is next touched. The
-  // honest reading of "unknown" is INTACT: a climb is presumed whole until a
-  // reset says otherwise. So INTACT keeps NULLs and BROKEN drops them. Reversed,
-  // one un-backfilled row would badge every Kilter climb on the device as broken.
-  //
-  // ANY (and an absent filter) carries no predicate on either side.
-  if (input.holdIntegrity === 'INTACT') push('COALESCE(c.missing_hold_count, 0) = 0');
-  if (input.holdIntegrity === 'BROKEN') push('COALESCE(c.missing_hold_count, 0) > 0');
 
   // Boulders / routes on frames_count (NULL is legacy single-frame → boulder).
   const wantsBoulders = !!input.boulders;
@@ -445,7 +512,7 @@ export function buildJoinAndWhere(
 
   // Size: compatible_size_ids contains sizeId (skipped for boards without size
   // variants — moonboard — via the shared isSizeScopedBoard predicate).
-  if (isSizeScopedBoard(boardType)) {
+  if (context === 'catalogue' && !isDraftQuery && isSizeScopedBoard(boardType)) {
     push(
       'c.compatible_size_ids IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(c.compatible_size_ids) WHERE value = ?)',
       input.sizeId,
@@ -455,7 +522,7 @@ export function buildJoinAndWhere(
   // Set membership (subset): every required set is in the selected sets. NULL
   // required_set_ids is excluded for non-draft/non-moonboard (matches Postgres
   // NULL <@ semantics); moonboard allows NULL (backfill pending).
-  if (setIds.length > 0) {
+  if (context === 'catalogue' && !isDraftQuery && setIds.length > 0) {
     const placeholders = setIds.map(() => '?').join(', ');
     const subsetProbe = `NOT EXISTS (SELECT 1 FROM json_each(c.required_set_ids) WHERE value NOT IN (${placeholders}))`;
     if (isMoonboard) {
@@ -480,7 +547,7 @@ export function buildJoinAndWhere(
   }
 
   // Min ascents (mutually exclusive with projectsOnly).
-  if (input.minAscents && !input.projectsOnly) {
+  if (!isDraftQuery && input.minAscents && !input.projectsOnly) {
     push(`${eff('ascensionist_count')} >= ?`, input.minAscents);
   }
 
@@ -497,19 +564,21 @@ export function buildJoinAndWhere(
   // Personal grades (#4828) wrap this same value: COALESCE(my grade, it). One
   // plain range test, the same shape the server uses — the EXISTS/NOT EXISTS
   // halves under an OR it replaced measured a 7.1x regression server-side.
-  const gradeRangeValue = gradeValueSql(eff('display_difficulty'), input.gradeSource);
+  const displayDifficulty =
+    context === 'catalogue' ? effectiveDisplayDifficultySql(boardType, crossAngle) : eff('display_difficulty');
+  const gradeRangeValue = gradeValueSql(displayDifficulty, input.gradeSource);
   const personalGradeBinds = usesMyGrades(input) ? myGradeBinds(boardType, angle, ownerUserId) : [];
   const rangeValue = usesMyGrades(input) ? effectiveGradeExpr(gradeRangeValue) : gradeRangeValue;
-  if (input.minGrade && input.maxGrade) {
+  if (!isDraftQuery && input.minGrade && input.maxGrade) {
     push(`${rangeValue} BETWEEN ? AND ?`, ...personalGradeBinds, input.minGrade, input.maxGrade);
-  } else if (input.minGrade) {
+  } else if (!isDraftQuery && input.minGrade) {
     push(`${rangeValue} >= ?`, ...personalGradeBinds, input.minGrade);
-  } else if (input.maxGrade) {
+  } else if (!isDraftQuery && input.maxGrade) {
     push(`${rangeValue} <= ?`, ...personalGradeBinds, input.maxGrade);
   }
 
   // Min rating (quality_average is canonical 1-5).
-  if (input.minRating) {
+  if (!isDraftQuery && input.minRating) {
     push(`${eff('quality_average')} >= ?`, input.minRating);
   }
 
@@ -519,22 +588,24 @@ export function buildJoinAndWhere(
   // must return the same rows the network would for the same input, even for
   // malformed deep-link values.
   const gradeAccuracy = input.gradeAccuracy ? parseFloat(String(input.gradeAccuracy)) : NaN;
-  if (Number.isFinite(gradeAccuracy)) {
+  if (!isDraftQuery && Number.isFinite(gradeAccuracy)) {
     // Always the upstream-first value, whatever the grade source: accuracy measures
     // how far the crowd average sits from the upstream grade.
-    push(
-      `ABS(${gradeValueSql(eff('display_difficulty'), 'UPSTREAM')} - ${eff('difficulty_average')}) <= ?`,
-      gradeAccuracy,
-    );
+    push(`ABS(${gradeValueSql(displayDifficulty, 'UPSTREAM')} - ${eff('difficulty_average')}) <= ?`, gradeAccuracy);
   }
 
-  // Benchmarks only.
-  if (input.onlyBenchmarks) {
-    push(`${eff('benchmark_difficulty')} > 0`);
+  // Benchmarks only: a real number above zero, the rule the server applies
+  // (#6232) and the one `mapRowToClimb` draws the ribbon from. SQLite cannot
+  // hold NaN (it stores NULL, which fails `> 0`), but it ranks any TEXT above
+  // every number, so a value that arrived as text would pass `> 0` the way NaN
+  // does in Postgres and come back as a climb with no benchmark.
+  if (!isDraftQuery && input.onlyBenchmarks) {
+    const benchmarkDifficulty = eff('benchmark_difficulty');
+    push(`(typeof(${benchmarkDifficulty}) IN ('integer', 'real') AND ${benchmarkDifficulty} > 0)`);
   }
 
   // Projects only: 0 ascents or no stats row.
-  if (input.projectsOnly) {
+  if (!isDraftQuery && input.projectsOnly) {
     push(`COALESCE(${eff('ascensionist_count')}, 0) = 0`);
   }
 
@@ -578,30 +649,37 @@ export function buildJoinAndWhere(
   }
 
   // Personal progress against local ticks (device is single-user).
-  if (input.hideAttempted) push(ticksExists(true, "t.status = 'attempt'"), boardType, angle, ownerUserId);
-  if (input.hideCompleted) push(ticksExists(true, `t.status IN ${COMPLETED_STATUSES}`), boardType, angle, ownerUserId);
-  if (input.showOnlyAttempted) push(ticksExists(false, "t.status = 'attempt'"), boardType, angle, ownerUserId);
+  const currentHoldsOnly = context === 'catalogue';
+  if (input.hideAttempted)
+    push(ticksExists(true, "t.status = 'attempt'", currentHoldsOnly), boardType, angle, ownerUserId);
+  if (input.hideCompleted)
+    push(ticksExists(true, `t.status IN ${COMPLETED_STATUSES}`, currentHoldsOnly), boardType, angle, ownerUserId);
+  if (input.showOnlyAttempted)
+    push(ticksExists(false, "t.status = 'attempt'", currentHoldsOnly), boardType, angle, ownerUserId);
   if (input.showOnlyCompleted)
-    push(ticksExists(false, `t.status IN ${COMPLETED_STATUSES}`), boardType, angle, ownerUserId);
+    push(ticksExists(false, `t.status IN ${COMPLETED_STATUSES}`, currentHoldsOnly), boardType, angle, ownerUserId);
 
   // Personal rating, mirroring create-climb-filters.ts case for case so an
   // offline search returns the same rows as an online one. The local ticks
   // table has no bigserial id, so the latest-rating tie-break falls back to
   // updated_at where the server uses id — only reachable when two ratings of
   // one climb share a climbed_at.
-  if (input.onlyRatedByMe) push(ticksExists(false, 't.quality IS NOT NULL'), boardType, angle, ownerUserId);
+  if (input.onlyRatedByMe)
+    push(ticksExists(false, 't.quality IS NOT NULL', currentHoldsOnly), boardType, angle, ownerUserId);
   if (input.minUserRating) {
     push(
       `NOT EXISTS (SELECT 1 FROM boardsesh_ticks rating_below
         WHERE rating_below.climb_uuid = c.uuid AND rating_below.board_type = ? AND rating_below.angle = ?
         AND ${ownedTicks('rating_below')}
         AND rating_below.quality IS NOT NULL AND rating_below.quality < ?
+        AND ${currentHoldsOnly ? tickOnCurrentHoldsLocalSql('rating_below') : '1 = 1'}
         AND NOT EXISTS (SELECT 1 FROM boardsesh_ticks rating_newer
           WHERE rating_newer.climb_uuid = rating_below.climb_uuid
           AND rating_newer.board_type = rating_below.board_type
           AND rating_newer.angle = rating_below.angle
           AND ${ownedTicks('rating_newer')}
           AND rating_newer.quality IS NOT NULL
+          AND ${currentHoldsOnly ? tickOnCurrentHoldsLocalSql('rating_newer') : '1 = 1'}
           AND (rating_newer.climbed_at > rating_below.climbed_at
             OR (rating_newer.climbed_at = rating_below.climbed_at
               AND rating_newer.updated_at > rating_below.updated_at))))`,
@@ -613,25 +691,50 @@ export function buildJoinAndWhere(
     );
   }
 
+  // Liked climbs (#6002), mirroring `onlyFavorited` in create-climb-filters.ts:
+  // a heart belongs to the climb, not the angle it was given at, so there is no
+  // angle condition — the (board_name, climb_uuid) prefix of the primary key
+  // answers it. The owner rule is the ticks' (see `ownedTicks`). With no owner
+  // stamp nobody is signed in to own a heart, so the filter matches nothing,
+  // the same `false` the server renders without a userId. The base clauses
+  // above already drop unlisted, draft and community-hidden climbs, as the
+  // server's search does.
+  if (input.onlyFavorited) {
+    if (ownerUserId === null) {
+      push('0 = 1');
+    } else {
+      push(
+        `EXISTS (SELECT 1 FROM user_favorites f
+          WHERE f.board_name = ? AND f.climb_uuid = c.uuid AND ${ownedTicks('f')})`,
+        boardType,
+        ownerUserId,
+      );
+    }
+  }
+
   return { joinSql, whereSql: conditions.join(' AND '), joinBinds, whereBinds };
 }
 
-function sortColumnSql(
+export function sortColumnSql(
   sortBy: string,
   crossAngle: boolean,
   gradeSource: ClimbSearchInput['gradeSource'],
   useMyGrades: boolean,
+  boardName?: string,
 ): string {
   const eff = (column: StatsColumn) => effectiveStatsSql(column, crossAngle);
   switch (sortBy) {
     case 'ascents':
       return eff('ascensionist_count');
     case 'difficulty':
-      // Under the Boardsesh source the sort keys on the grade the row is labelled
-      // with, as the server's does. The upstream sort has no fallback, unchanged.
+      // Spray sorts by its canonical grade or local first ascent. Catalogue
+      // boards retain their upstream sort without a grade-estimate fallback.
+      const displayDifficulty = boardName
+        ? effectiveDisplayDifficultySql(boardName, crossAngle)
+        : eff('display_difficulty');
       const crowdSort =
-        gradeSource === 'BOARDSESH'
-          ? gradeValueSql(eff('display_difficulty'), 'BOARDSESH')
+        gradeSource === 'BOARDSESH' || boardName === 'spray'
+          ? gradeValueSql(displayDifficulty, gradeSource)
           : `CAST(ROUND(${eff('display_difficulty')}) AS INTEGER)`;
       // With personal grades on, a climb the climber re-graded to V10 sorts among
       // the V10s rather than staying with the V0s (#4828).
@@ -663,6 +766,7 @@ function roundTo(value: number, digits: number): number {
 }
 
 export type LocalClimbRow = {
+  local_write_pending?: number;
   uuid: string;
   setter_username: string | null;
   user_id: string | null;
@@ -676,6 +780,11 @@ export type LocalClimbRow = {
    *  NULL on every catalogue-board climb and on rows pulled before the column
    *  existed; read as 0 — "no reset has taken anything off this climb". */
   missing_hold_count: number | null;
+  /** `board_climbs.holds_revision_number` (migration v11): the version at
+   *  which the climb's holds last moved. NULL on a row pulled before the column
+   *  existed and not delivered again since, which reads as unknown. Optional so
+   *  a reader that does not select it still type-checks. */
+  holds_revision_number?: number | null;
   characteristics: string | null;
   created_at: string | null;
   published_at: string | null;
@@ -753,6 +862,7 @@ export function mapRowToClimb(
   const bench = row.benchmark_difficulty;
   return {
     uuid: row.uuid,
+    ...(row.local_write_pending === 1 ? { localWritePending: true } : {}),
     boardType,
     layoutId,
     setter_username: row.setter_username ?? '',
@@ -765,7 +875,8 @@ export function mapRowToClimb(
     angle,
     statsAngle: row.stats_angle ?? null,
     ascensionist_count: Number(row.ascensionist_count ?? 0),
-    difficulty: getGradeLabel(difficultyId),
+    // On the board's own scale, so it matches the server's `boulder_name` (MoonBoard's 16 is "6a/V2").
+    difficulty: getGradeLabel(difficultyId, boardType),
     quality_average: row.quality_average !== null ? String(roundTo(row.quality_average, 2)) : '0',
     stars: getClimbStars(row.quality_average),
     difficulty_error: difficultyError,
@@ -776,6 +887,9 @@ export function mapRowToClimb(
     // is nullable for exactly the same rows, and a badge that reads "0 holds
     // lost" is not the same statement as "this is not a spray climb".
     missingHoldCount: row.missing_hold_count ?? null,
+    // Left NULL when the phone does not know. The sent glyph reads a NULL
+    // holds version as 1, so every tick on the climb counts.
+    holdsRevisionNumber: row.holds_revision_number ?? null,
     is_no_match: resolveClimbNoMatch(boardType, characteristics, row.description),
     characteristics,
     published_at: row.published_at,
@@ -798,6 +912,269 @@ export function mapRowToClimb(
     // personal grades, matching the server row shape.
     ...(hasPersonalGrade ? { myDifficulty: row.my_difficulty ?? null } : {}),
   };
+}
+
+// ---------------------------------------------------------------------------
+// The ranked walk: the default sort read off `idx_stats_ascents`.
+//
+// The full query below visits every listed climb on the board, runs two
+// json_each probes and a stats lookup on each, and sorts what is left, once per
+// page: on an iPhone 13 Pro with a Kilter download, 1.4 to 2.2 s for a page of
+// 30, whichever page is asked for.
+//
+// "Most ascents first" has the same order as `idx_stats_ascents` (on-device
+// migration v13), so the walk reads the browsed angle's stats rows in that
+// order, joins each climb, applies the same WHERE and stops at the row that
+// fills the page: 2 to 36 ms on the same phone, median 6.
+//
+// Why the two return the same rows. In the full order every climb somebody has
+// sent at this angle comes before every climb nobody has (a count of 0, then
+// NULL: DESC puts NULL last), and those first climbs are in (count DESC,
+// uuid DESC) order: the index's order. So what the walk yields is a PREFIX of
+// the full result. The walk therefore answers only when it produced the whole
+// `pageSize + 1` rows; a page that reaches the unsent climbs, or that the walk
+// could not fill, is handed to the full query unchanged.
+// ---------------------------------------------------------------------------
+
+const RANKED_WALK_INDEX = 'idx_stats_ascents';
+
+/**
+ * How many of the angle's stats rows one walk reads before it gives up, when
+ * the page is shallow. A filter that keeps almost nothing then costs a bounded
+ * extra, not a second pass over the board.
+ */
+const RANKED_WALK_MIN_BUDGET = 12_000;
+
+/**
+ * The budget grows with how deep the page is: this many stats rows per result
+ * row wanted. 25 means a filter that keeps at least 1 climb in 25 is answered by
+ * the walk at any depth. Measured in the 12,000 most-climbed Kilter rows at 40
+ * degrees: the default list keeps 97 in 100, a three-grade band 26 to 38.
+ */
+const RANKED_WALK_BUDGET_PER_WANTED_ROW = 25;
+
+/**
+ * And it never exceeds this share of the layout's listed climbs. The full query
+ * visits every one of those, and a walked row costs about what a visited climb
+ * does, so an eighth of them caps a wasted walk at about an eighth of the full
+ * query it then falls back to.
+ *
+ * The share is of the LAYOUT because that is what the full query's cost follows,
+ * while the walk's follows the ranking, which every layout of the board type
+ * shares. Kilter Homewall (28,977 listed climbs) next to Kilter Original
+ * (298,088) on one phone: its full query is 92 ms on a laptop, and an uncapped
+ * walk past its 9,156 sent climbs at 40 degrees was 200 ms on top of that.
+ *
+ * It applies once the layout has been counted (`refreshLayoutClimbCount`).
+ */
+const RANKED_WALK_LAYOUT_SHARE = 8;
+
+/** How long a layout's listed-climb count is reused. It only sizes the budget. */
+const LAYOUT_CLIMB_COUNT_TTL_MS = 5 * 60_000;
+
+/** `total` is null until the first count lands. */
+type LayoutClimbCount = { total: number | null; readAtMs: number; reading: boolean };
+
+// Per connection, so two databases never share a count.
+const layoutClimbCounts = new WeakMap<OfflineDatabase, Map<string, LayoutClimbCount>>();
+
+function layoutClimbCountFor(db: OfflineDatabase, boardType: string, layoutId: number): LayoutClimbCount {
+  let counts = layoutClimbCounts.get(db);
+  if (!counts) {
+    counts = new Map();
+    layoutClimbCounts.set(db, counts);
+  }
+  const key = `${boardType}:${layoutId}`;
+  let count = counts.get(key);
+  if (!count) {
+    count = { total: null, readAtMs: 0, reading: false };
+    counts.set(key, count);
+  }
+  return count;
+}
+
+/**
+ * Counts the layout's listed climbs off `idx_climbs_search` when the count is
+ * missing or five minutes old, WITHOUT being waited for. The count is 116 ms on
+ * an iPhone 13 Pro the first time after launch (286,255 climbs), which is the
+ * page it would otherwise sit in front of. So a search uses whatever count is
+ * already known, the first one on a layout walks with no layout cap, and the
+ * number arrives for the searches after it. A count that fails changes nothing.
+ */
+function refreshLayoutClimbCount(
+  db: OfflineDatabase,
+  count: LayoutClimbCount,
+  boardType: string,
+  layoutId: number,
+): void {
+  if (count.reading) return;
+  if (count.total !== null && Date.now() - count.readAtMs < LAYOUT_CLIMB_COUNT_TTL_MS) return;
+  count.reading = true;
+  void db
+    .getFirstAsync<{ total: number }>(
+      'SELECT COUNT(*) AS total FROM board_climbs WHERE board_type = ? AND layout_id = ? AND is_listed = 1',
+      [boardType, layoutId],
+    )
+    .then((row) => {
+      count.total = row?.total ?? 0;
+      count.readAtMs = Date.now();
+    })
+    .catch(() => undefined)
+    .finally(() => {
+      count.reading = false;
+    });
+}
+
+/**
+ * How long a walk that came up short is remembered. Until then the same search
+ * is not walked again at that page or deeper, so a filter the ranking is sparse
+ * in pays for one wasted walk and not one per page of scrolling.
+ */
+const WALK_MISS_MEMORY_MS = 60_000;
+const WALK_MISS_MEMORY_SIZE = 32;
+
+type WalkMiss = { page: number; atMs: number };
+
+// Per connection, like the layout counts above.
+const walkMisses = new WeakMap<OfflineDatabase, Map<string, WalkMiss>>();
+
+/** Everything about a search except which page of it is asked for. */
+function walkMissKey(input: ClimbSearchInput, ownerUserId: string | null): string {
+  return JSON.stringify([ownerUserId, { ...input, page: null }]);
+}
+
+function hasRecentWalkMiss(db: OfflineDatabase, key: string, page: number): boolean {
+  const miss = walkMisses.get(db)?.get(key);
+  return miss !== undefined && page >= miss.page && Date.now() - miss.atMs < WALK_MISS_MEMORY_MS;
+}
+
+function rememberWalkMiss(db: OfflineDatabase, key: string, page: number): void {
+  let misses = walkMisses.get(db);
+  if (!misses) {
+    misses = new Map();
+    walkMisses.set(db, misses);
+  }
+  // Re-inserting moves the key to the end, so the first key is the oldest.
+  misses.delete(key);
+  misses.set(key, { page, atMs: Date.now() });
+  if (misses.size > WALK_MISS_MEMORY_SIZE) {
+    const oldest = misses.keys().next();
+    if (!oldest.done) misses.delete(oldest.value);
+  }
+}
+
+/**
+ * Whether the walk can answer this search at all, and is worth trying.
+ *
+ * The first line is correctness: only the descending ascents sort on the
+ * browsed angle's own stats row has the index's order. The rest is cost. Each
+ * of these filters keeps a handful of climbs out of a whole board, so the walk
+ * would spend its budget and then run the full query anyway.
+ */
+function canWalkAscentsRanking(
+  input: ClimbSearchInput,
+  sortBy: string,
+  sortOrder: 'ASC' | 'DESC',
+  crossAngle: boolean,
+): boolean {
+  if (sortBy !== 'ascents' || sortOrder !== 'DESC' || crossAngle) return false;
+  if (hasNameQuery(input) || (input.setter && input.setter.length > 0) || input.onlyFollowedAuthors) return false;
+  // Projects are the climbs nobody has sent, which the index leaves out;
+  // benchmarks are a few hundred climbs per board.
+  if (input.projectsOnly || input.onlyBenchmarks) return false;
+  // Only the climber's own ticks.
+  if (input.showOnlyAttempted || input.showOnlyCompleted || input.onlyRatedByMe) return false;
+  const { anyHolds, notHolds } = parseHoldsFilter(input.holdsFilter);
+  return anyHolds.length === 0 && notHolds.length === 0;
+}
+
+type RankedWalkQuery = {
+  boardType: string;
+  ownerUserId: string | null;
+  layoutId: number;
+  angle: number;
+  selectSql: string;
+  selectBinds: Bind[];
+  whereSql: string;
+  whereBinds: Bind[];
+  pageSize: number;
+  offset: number;
+};
+
+/**
+ * One page off the ranking, or `null` when the walk could not produce all
+ * `pageSize + 1` rows and the full query has to answer instead.
+ */
+async function readRankedWalkRows(db: OfflineDatabase, walk: RankedWalkQuery): Promise<LocalClimbRow[] | null> {
+  const { boardType, layoutId, angle, pageSize, offset } = walk;
+  const localGrade = localSprayGradeJoin(boardType, angle, walk.ownerUserId);
+  const wantedRows = offset + pageSize + 1;
+  const layoutClimbs = layoutClimbCountFor(db, boardType, layoutId);
+  const budgetByDepth = Math.max(RANKED_WALK_MIN_BUDGET, wantedRows * RANKED_WALK_BUDGET_PER_WANTED_ROW);
+  const budget =
+    layoutClimbs.total === null
+      ? budgetByDepth
+      : Math.min(Math.floor(layoutClimbs.total / RANKED_WALK_LAYOUT_SHARE), budgetByDepth);
+  // Fewer ranks than rows wanted cannot fill the page: go straight to the full query.
+  if (budget < wantedRows) {
+    refreshLayoutClimbCount(db, layoutClimbs, boardType, layoutId);
+    return null;
+  }
+
+  // The stats row at rank `budget`, read from the index alone. The walk stops
+  // before it. No row means the whole angle is inside the budget.
+  const edge = await db.getFirstAsync<{ ascensionist_count: number; climb_uuid: string }>(
+    `SELECT ascensionist_count, climb_uuid
+    FROM board_climb_stats INDEXED BY ${RANKED_WALK_INDEX}
+    WHERE board_type = ? AND angle = ? AND ascensionist_count > 0
+    ORDER BY ascensionist_count DESC, climb_uuid DESC
+    LIMIT 1 OFFSET ?`,
+    [boardType, angle, budget],
+  );
+  const edgeSql = edge ? 'AND (s.ascensionist_count, s.climb_uuid) > (?, ?)' : '';
+  const edgeBinds: Bind[] = edge ? [edge.ascensionist_count, edge.climb_uuid] : [];
+
+  // CROSS JOIN pins the stats row as the outer loop, and INDEXED BY pins the
+  // index: either one left to the planner could turn this back into a sort.
+  // `ascensionist_count > 0` is the index's own predicate, spelled as its DDL
+  // spells it, which is what lets SQLite use a partial index here. The edge
+  // comes before it in the text because SQLite 3.50.3 (the build in the app)
+  // takes the first of the two as the index range and tests the other per row:
+  // edge first, the scan stops at the edge; edge second, it reads on to the end
+  // of the angle's sent climbs. The inner join on `c.uuid` (the primary key)
+  // yields one climb per stats row, so the tie-break on `s.climb_uuid` is the
+  // full query's `c.uuid`.
+  const query = `
+    SELECT
+      ${walk.selectSql}
+    FROM board_climb_stats s INDEXED BY ${RANKED_WALK_INDEX}
+    CROSS JOIN board_climbs c ON c.uuid = s.climb_uuid
+    ${BROWSED_GRADES_JOIN}
+    ${localGrade.sql}
+    WHERE s.board_type = ? AND s.angle = ? ${edgeSql} AND s.ascensionist_count > 0
+      AND ${walk.whereSql}
+    ORDER BY s.ascensionist_count DESC, s.climb_uuid DESC
+    LIMIT ? OFFSET ?
+  `;
+  // In the order the `?`s appear in the text above: the column list, the grades
+  // join (board, angle), the stats range (board, angle), the edge, the shared
+  // WHERE, then LIMIT and OFFSET.
+  const binds: Bind[] = [
+    ...walk.selectBinds,
+    boardType,
+    angle,
+    ...localGrade.binds,
+    boardType,
+    angle,
+    ...edgeBinds,
+    ...walk.whereBinds,
+    pageSize + 1,
+    offset,
+  ];
+  const rows = await db.getAllAsync<LocalClimbRow>(query, binds);
+  // Asked for after the page has been read, so the count never sits in front of it.
+  refreshLayoutClimbCount(db, layoutClimbs, boardType, layoutId);
+  return rows.length > pageSize ? rows : null;
 }
 
 export async function searchClimbsLocal(db: OfflineDatabase, input: ClimbSearchInput): Promise<LocalSearchResult> {
@@ -838,10 +1215,55 @@ export async function searchClimbsLocal(db: OfflineDatabase, input: ClimbSearchI
 
   const userAscentsSelect = `(SELECT COUNT(*) FROM boardsesh_ticks t
     WHERE t.climb_uuid = c.uuid AND t.board_type = ? AND t.angle = ? AND ${ownedTicks('t')}
-    AND t.status IN ${COMPLETED_STATUSES}) AS user_ascents`;
+    AND t.status IN ${COMPLETED_STATUSES} AND ${tickOnCurrentHoldsLocalSql('t')}) AS user_ascents`;
   const userAttemptsSelect = `(SELECT COUNT(*) FROM boardsesh_ticks t
     WHERE t.climb_uuid = c.uuid AND t.board_type = ? AND t.angle = ? AND ${ownedTicks('t')}
-    AND t.status = 'attempt') AS user_attempts`;
+    AND t.status = 'attempt' AND ${tickOnCurrentHoldsLocalSql('t')}) AS user_attempts`;
+
+  // One column list for both readers below, so a row means the same thing
+  // whichever of them produced it.
+  const selectSql = `c.uuid, c.setter_username, c.user_id, c.name, c.description, c.frames, c.is_draft, c.is_hidden,
+      EXISTS (SELECT 1 FROM pending_mutations mutation WHERE mutation.table_name = 'board_climbs'
+        AND mutation.entity_key = 'climb:' || c.board_type || ':' || c.uuid) AS local_write_pending,
+      c.missing_hold_count, c.holds_revision_number, c.characteristics,
+      c.created_at, c.published_at, c.frames_count, c.frames_pace, c.compatible_size_ids,
+      ${eff('ascensionist_count')} AS ascensionist_count,
+      ${effectiveDisplayDifficultySql(boardType, crossAngle)} AS display_difficulty,
+      ${eff('difficulty_average')} AS difficulty_average,
+      ${eff('quality_average')} AS quality_average,
+      ${eff('benchmark_difficulty')} AS benchmark_difficulty,
+      ${eff('angle')} AS stats_angle,
+      COALESCE(g.universal_grade, g.local_grade) AS boardsesh_difficulty,
+      g.confidence AS boardsesh_confidence,
+      ${userAscentsSelect},
+      ${userAttemptsSelect}${popularSelect}${myGradeSelect}`;
+
+  const toResult = (rows: LocalClimbRow[]): LocalSearchResult => {
+    const hasMore = rows.length > pageSize;
+    const trimmed = hasMore ? rows.slice(0, pageSize) : rows;
+    const climbs = trimmed.map((row) => mapRowToClimb(row, boardType, input.layoutId, angle, useMyGrades));
+    return { climbs, hasMore };
+  };
+
+  if (canWalkAscentsRanking(input, sortBy, sortOrder, crossAngle)) {
+    const missKey = walkMissKey(input, ownerUserId);
+    if (!hasRecentWalkMiss(db, missKey, page)) {
+      const rankedRows = await readRankedWalkRows(db, {
+        boardType,
+        ownerUserId,
+        layoutId: input.layoutId,
+        angle,
+        selectSql,
+        selectBinds,
+        whereSql,
+        whereBinds,
+        pageSize,
+        offset: page * pageSize,
+      });
+      if (rankedRows) return toResult(rankedRows);
+      rememberWalkMiss(db, missKey, page);
+    }
+  }
 
   // Random uses the seeded mixer (order direction is meaningless); every other
   // sort uses its column + direction. Both keep the c.uuid DESC secondary tiebreak.
@@ -852,23 +1274,11 @@ export async function searchClimbsLocal(db: OfflineDatabase, input: ClimbSearchI
   const randomSeedBind = input.sortSeed && Number.isFinite(seedInt) ? Math.trunc(seedInt) : 1;
   const orderBy = isRandom
     ? `${RANDOM_ORDER_EXPR} ASC, c.uuid DESC`
-    : `${sortColumnSql(sortBy, crossAngle, input.gradeSource, useMyGrades)} ${sortOrder}, c.uuid DESC`;
+    : `${sortColumnSql(sortBy, crossAngle, input.gradeSource, useMyGrades, boardType)} ${sortOrder}, c.uuid DESC`;
 
   const query = `
     SELECT
-      c.uuid, c.setter_username, c.user_id, c.name, c.description, c.frames, c.is_draft, c.is_hidden,
-      c.missing_hold_count, c.characteristics,
-      c.created_at, c.published_at, c.frames_count, c.frames_pace, c.compatible_size_ids,
-      ${eff('ascensionist_count')} AS ascensionist_count,
-      ${eff('display_difficulty')} AS display_difficulty,
-      ${eff('difficulty_average')} AS difficulty_average,
-      ${eff('quality_average')} AS quality_average,
-      ${eff('benchmark_difficulty')} AS benchmark_difficulty,
-      ${eff('angle')} AS stats_angle,
-      COALESCE(g.universal_grade, g.local_grade) AS boardsesh_difficulty,
-      g.confidence AS boardsesh_confidence,
-      ${userAscentsSelect},
-      ${userAttemptsSelect}${popularSelect}${myGradeSelect}
+      ${selectSql}
     FROM board_climbs c
     ${joinSql}
     WHERE ${whereSql}
@@ -882,12 +1292,7 @@ export async function searchClimbsLocal(db: OfflineDatabase, input: ClimbSearchI
   // rather than repeating that subquery and its three binds here.
   const orderBinds: Bind[] = isRandom ? [randomSeedBind] : [];
   const binds: Bind[] = [...selectBinds, ...joinBinds, ...whereBinds, ...orderBinds, pageSize + 1, page * pageSize];
-  const rows = await db.getAllAsync<LocalClimbRow>(query, binds);
-
-  const hasMore = rows.length > pageSize;
-  const trimmed = hasMore ? rows.slice(0, pageSize) : rows;
-  const climbs = trimmed.map((row) => mapRowToClimb(row, boardType, input.layoutId, angle, useMyGrades));
-  return { climbs, hasMore };
+  return toResult(await db.getAllAsync<LocalClimbRow>(query, binds));
 }
 
 export async function countClimbsLocal(db: OfflineDatabase, input: ClimbSearchInput): Promise<number> {

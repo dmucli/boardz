@@ -46,8 +46,9 @@ vi.mock('@/app/lib/url-utils.server', () => ({
 
 // Rich enough for the real (unmocked) `buildCanonicalClimbListUrl` to resolve
 // the production named-slug form.
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({
     board_name: 'kilter',
     layout_id: 1,
     size_id: 10,
@@ -72,14 +73,14 @@ vi.mock('@/app/components/climb-front-door/static-list-front-door', () => ({
   default: () => null,
 }));
 
-const pageModule = await import('../page');
+const pageModule = await import('@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/list/page');
 const { buildCanonicalClimbListUrl } = await import('@/app/lib/url-utils');
-const { getBoardDetailsForBoard } = await import('@/app/lib/board-utils');
+const { getBoardImageDetailsForBoard } = await import('@/app/lib/board-image-details');
 const { FRONT_DOOR_MAX_PAGE } = await import('@/app/lib/seo/list-page-robots');
 
 /** What the resolved ids canonically are, straight from the shared builder. */
 const RESOLVED_CANONICAL = buildCanonicalClimbListUrl(
-  getBoardDetailsForBoard({ board_name: 'kilter', layout_id: 1, size_id: 10, set_ids: [1, 20] }),
+  getBoardImageDetailsForBoard({ board_name: 'kilter', layout_id: 1, size_id: 10, set_ids: [1, 20] }),
   40,
 );
 
@@ -225,5 +226,31 @@ describe('legacy board list page ?page bounds', () => {
 
     expect(metadata.alternates).toBeUndefined();
     expect(metadata.robots).toEqual({ index: false, follow: true });
+  });
+});
+
+describe('legacy board list search copy', () => {
+  it('names the layout and size in the title and description, not just the board brand', async () => {
+    const metadata = await pageModule.generateMetadata({ params, searchParams: emptySearchParams() });
+
+    // Every Kilter layout, size and set at 40° used to share "Kilter climbs at 40°".
+    expect(metadata.title).toEqual({
+      absolute: 'metadata.list.title(boardName=Kilter Board Original 12x12 with kickboard,angle=40) | Boardsesh',
+    });
+    expect(metadata.description).toBe(
+      'metadata.list.description(boardName=Kilter Board Original 12x12 with kickboard,angle=40)',
+    );
+  });
+
+  it('keeps the layout and size on a paginated title', async () => {
+    const metadata = await pageModule.generateMetadata({
+      params,
+      searchParams: Promise.resolve({ page: '2' } as never),
+    });
+
+    expect(metadata.title).toEqual({
+      absolute:
+        'metadata.list.paginatedTitle(boardName=Kilter Board Original 12x12 with kickboard,angle=40,page=2) | Boardsesh',
+    });
   });
 });

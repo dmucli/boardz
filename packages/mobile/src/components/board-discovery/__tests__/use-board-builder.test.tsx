@@ -6,6 +6,29 @@ import { useBoardBuilder } from '../use-board-builder';
 // Kilter layout 1 = "Original"; selecting it auto-picks a default size + all its
 // sets, which is the behaviour that lets the per-set toggles stay behind Advanced.
 describe('useBoardBuilder', () => {
+  it('starts a new board public with its location hidden, with or without privacy controls', () => {
+    const { result, rerender } = renderHook(({ privacyEnabled }) => useBoardBuilder(null, { privacyEnabled }), {
+      initialProps: { privacyEnabled: false },
+    });
+    act(() => result.current.selectLayout(1));
+    expect(result.current.buildCreateInput()).not.toHaveProperty('audience');
+    expect(result.current.buildCreateInput()).not.toHaveProperty('locationAudience');
+    expect(result.current.buildCreateInput()).toMatchObject({ isPublic: true, isUnlisted: false, hideLocation: true });
+
+    rerender({ privacyEnabled: true });
+    expect(result.current.privacyAudience).toBe('public');
+    expect(result.current.buildCreateInput()).toMatchObject({
+      audience: 'public',
+      isPublic: true,
+      hideLocation: true,
+    });
+    // No location choice is sent until the owner makes one: the server keeps it hidden.
+    expect(result.current.buildCreateInput()).not.toHaveProperty('locationAudience');
+
+    act(() => result.current.setPrivacyAudience('followers'));
+    rerender({ privacyEnabled: true });
+    expect(result.current.buildCreateInput()?.audience).toBe('followers');
+  });
   it('auto-selects a size and all its sets when a layout is picked, satisfying canCreate', () => {
     const { result } = renderHook(() => useBoardBuilder());
     expect(result.current.canCreate).toBe(false);
@@ -56,6 +79,49 @@ describe('useBoardBuilder', () => {
     expect(result.current.canCreate).toBe(false);
   });
 
+  // A menu or chip row hands back its ticked option too: re-picking it must
+  // keep the setup below it, not reset it.
+  describe('re-picking the value already picked', () => {
+    function builtKilter() {
+      const { result } = renderHook(() => useBoardBuilder());
+      act(() => result.current.selectBoard('kilter'));
+      act(() => result.current.selectLayout(8));
+      const sizeId = result.current.sizes[1]?.id;
+      if (sizeId === undefined) throw new Error('Kilter Homewall has no second size');
+      act(() => result.current.selectSize(sizeId));
+      // A set taken off by hand, which any reset would put back.
+      const firstSet = result.current.setIds[0];
+      if (firstSet === undefined) throw new Error('no sets');
+      act(() => result.current.toggleSet(firstSet));
+      return { result, setup: { layoutId: 8, sizeId, setIds: [...result.current.setIds] } };
+    }
+
+    it('keeps everything on the same board type', () => {
+      const { result, setup } = builtKilter();
+      act(() => result.current.selectBoard('kilter'));
+      expect(result.current).toMatchObject(setup);
+    });
+
+    it('keeps the size and sets on the same layout', () => {
+      const { result, setup } = builtKilter();
+      act(() => result.current.selectLayout(8));
+      expect(result.current).toMatchObject(setup);
+    });
+
+    it('keeps the sets on the same size', () => {
+      const { result, setup } = builtKilter();
+      act(() => result.current.selectSize(setup.sizeId));
+      expect(result.current).toMatchObject(setup);
+    });
+
+    it('still resets below a real change', () => {
+      const { result, setup } = builtKilter();
+      act(() => result.current.selectLayout(1));
+      expect(result.current.layoutId).toBe(1);
+      expect(result.current.setIds).not.toEqual(setup.setIds);
+    });
+  });
+
   // #5654, "My own board": the builder opens with a setup chosen, so the
   // preview renders and Save works from the first frame.
   describe('with a preset', () => {
@@ -73,6 +139,30 @@ describe('useBoardBuilder', () => {
       expect(result.current.sizeId).toBe(10);
       expect(result.current.setIds).toEqual([1, 20]);
       expect(result.current.canCreate).toBe(true);
+    });
+
+    // The Bluetooth quickstart opens the builder on the type it heard.
+    it("opens on the board type it is given, with that type's preset and angle", () => {
+      const moonboardPreset = { layoutId: 2, sizeId: 1, setIds: [2, 3, 4] };
+      const { result } = renderHook(() =>
+        useBoardBuilder(null, {
+          initialBoardName: 'moonboard',
+          preset: (boardName) => (boardName === 'moonboard' ? moonboardPreset : null),
+        }),
+      );
+
+      expect(result.current.boardName).toBe('moonboard');
+      expect(result.current.layoutId).toBe(2);
+      expect(result.current.setIds).toEqual([2, 3, 4]);
+      expect(result.current.angle).toBe(40);
+      expect(result.current.presetKept).toBe(true);
+    });
+
+    it('lets a seed win over the board type it is given', () => {
+      const { result } = renderHook(() =>
+        useBoardBuilder({ boardName: 'woods', layoutId: 1, sizeId: 2, setIds: '1' }, { initialBoardName: 'moonboard' }),
+      );
+      expect(result.current.boardName).toBe('woods');
     });
 
     it('moves to the next board type preset instead of clearing the cascade', () => {
@@ -229,6 +319,35 @@ describe('useBoardBuilder', () => {
     act(() => result.current.setHasLeds(false));
     expect(result.current.buildCreateInput()?.hasLeds).toBe(false);
     expect(result.current.buildUpdateInput('board-uuid-1')?.hasLeds).toBe(false);
+  });
+
+  it('saves the wall device flag only while the board has LED lights', () => {
+    const { result } = renderHook(() =>
+      useBoardBuilder({ boardName: 'kilter', layoutId: 1, sizeId: 10, setIds: '20,1', litByWallDevice: true }),
+    );
+    expect(result.current.litByWallDevice).toBe(true);
+    expect(result.current.buildCreateInput()?.litByWallDevice).toBe(true);
+    expect(result.current.buildUpdateInput('board-uuid-1')?.litByWallDevice).toBe(true);
+
+    // The switch hides with the lights, and a hidden switch is left out of the
+    // save, so a value set elsewhere is never reset from here...
+    act(() => result.current.setHasLeds(false));
+    expect(result.current.litByWallDeviceShown).toBe(false);
+    expect(result.current.buildUpdateInput('board-uuid-1')?.litByWallDevice).toBeUndefined();
+    expect(result.current.buildCreateInput()?.litByWallDevice).toBeUndefined();
+
+    // ...and comes back with them.
+    act(() => result.current.setHasLeds(true));
+    expect(result.current.buildUpdateInput('board-uuid-1')?.litByWallDevice).toBe(true);
+  });
+
+  it('defaults the wall device flag off', () => {
+    const { result } = renderHook(() =>
+      useBoardBuilder({ boardName: 'kilter', layoutId: 1, sizeId: 10, setIds: '20,1' }),
+    );
+    expect(result.current.buildUpdateInput('board-uuid-1')?.litByWallDevice).toBe(false);
+    act(() => result.current.setLitByWallDevice(true));
+    expect(result.current.buildUpdateInput('board-uuid-1')?.litByWallDevice).toBe(true);
   });
 
   it('keeps a seeded hasLeds=false across re-renders', () => {
@@ -446,5 +565,56 @@ describe('useBoardBuilder', () => {
     expect(input?.layoutId).toBe(1);
     expect(input?.sizeId).toBe(10);
     expect(input?.setIds).toBe('1,20');
+  });
+});
+
+// The one unsaved box the In range slot heard: its serial fills the field, is
+// said out loud while it stands, and belongs to its own board type.
+describe('useBoardBuilder with a heard serial', () => {
+  function renderHeard() {
+    return renderHook(() => useBoardBuilder(null, { initialBoardName: 'kilter', initialSerialNumber: '751737' }));
+  }
+
+  it('opens with the serial filled in and said out loud', () => {
+    const { result } = renderHeard();
+    expect(result.current.serialNumber).toBe('751737');
+    expect(result.current.heardSerial).toBe('751737');
+  });
+
+  it('clears it when the board type moves off the one it was heard as', () => {
+    const { result } = renderHeard();
+    act(() => result.current.selectBoard('tension'));
+    expect(result.current.serialNumber).toBe('');
+    expect(result.current.heardSerial).toBeNull();
+    // Coming back does not bring it back: the climber moved off that box.
+    act(() => result.current.selectBoard('kilter'));
+    expect(result.current.serialNumber).toBe('');
+  });
+
+  it('keeps it on a tap of the same board type', () => {
+    const { result } = renderHeard();
+    act(() => result.current.selectBoard('kilter'));
+    expect(result.current.serialNumber).toBe('751737');
+  });
+
+  it('keeps a serial the climber typed over it, on any board type', () => {
+    const { result } = renderHeard();
+    act(() => result.current.setSerialNumber('999999'));
+    expect(result.current.heardSerial).toBeNull();
+    act(() => result.current.selectBoard('tension'));
+    expect(result.current.serialNumber).toBe('999999');
+  });
+
+  it('says nothing without one, and a seed (an edit) never takes it', () => {
+    const { result: plain } = renderHook(() => useBoardBuilder(null, { initialBoardName: 'kilter' }));
+    expect(plain.current.heardSerial).toBeNull();
+    const { result: edit } = renderHook(() =>
+      useBoardBuilder(
+        { boardName: 'kilter', layoutId: 1, sizeId: 7, setIds: '1', serialNumber: 'OWN' },
+        { initialSerialNumber: '751737' },
+      ),
+    );
+    expect(edit.current.serialNumber).toBe('OWN');
+    expect(edit.current.heardSerial).toBeNull();
   });
 });

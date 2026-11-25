@@ -2,23 +2,42 @@ import { AppState } from 'react-native';
 import { useEffect, useMemo, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { getBoardCapabilities, toBoardName, boardSupportsMirroring } from '@boardsesh/board-config';
+import { bluetoothTransport } from '../ble/transport-runtime';
 import { nativeBleSupportsBoard } from '../ble/adapter-factory';
 import { trackBoardConnectTapped } from '../analytics-board-connect';
+import { captureToSentry } from '../sentry';
 import { requestedBoardRenderMode, useBoardRenderSettings } from '../board-render-settings';
 import { resolveClimbRenderBoard } from '../boards/climb-render-board';
 import { useQueue } from '../../providers/queue-provider';
+import { useAndroidNotificationCardEnabled } from '../../providers/feature-flags-provider';
 import { useBoardConnectionState } from '../../components/ble/use-board-connection-state';
+import { useClimbWallGlow } from '../../components/queue-control/use-climb-wall-glow';
 import { useNativeClimbRender } from '../../hooks/use-native-climb-render';
+import { buildAndroidCardPayload } from './android-card-payload';
 import { useLiveActivity } from './use-live-activity';
+import { LiveActivityRestTimerSync } from './live-activity-rest-timer';
+import { LiveActivityLightingSync } from './live-activity-lighting';
+import { getDriveMode, isDriveWindowDue, stopDrivingForLink } from '../../components/play-drawer/drive-mode-store';
 import {
   addWidgetMirrorListener,
   getPendingWidgetMirror,
   acknowledgeWidgetMirror,
+  acknowledgeWidgetMirrorRequest,
   type WidgetMirrorEvent,
   addWidgetQueueNavigateListener,
   addBoardControlListener,
+  addNotificationPostFailedListener,
   isAndroidSessionPresence,
 } from './live-activity-plugin';
+
+/**
+ * A notification Stop driving tap still has a drive to stop: one live now,
+ * its end read off the wall clock, since Android pauses JS timers (#7038).
+ */
+function isDriveStillOn(now = Date.now()): boolean {
+  const drive = getDriveMode();
+  return drive?.phase === 'live' && !isDriveWindowDue(drive, now);
+}
 
 type LiveActivityBridgeProps = {
   boardName: string;
@@ -43,7 +62,24 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
   // Live Activity lightbulb + Previous/Next visibility: controls show only while
   // THIS device holds the BLE link (connectedByMe); once a peer takes the wall
   // the bulb goes out and the controls hide, leaving just the current climb.
-  const { bluetooth, boardConnection, holderDisplayName } = useBoardConnectionState();
+  const { bluetooth, boardConnection, holderDisplayName, pending: boardConnectPending } = useBoardConnectionState();
+  // Android notification bulb (#7087). With no remembered board a background
+  // reconnect could only end in the board list, on an activity nobody can see,
+  // so the bulb opens the app instead. While a connect runs the bulb reads
+  // "Connecting…", so a repeat tap visibly isn't lost (connect() ignores it).
+  // Pinned to false on iOS, where ActivityKit draws its own bulb: a flip there
+  // would only spend Live Activity updates.
+  const bulbOpensApp =
+    isAndroidSessionPresence &&
+    !bluetooth?.reconnectSerialForCurrentBoard &&
+    !bluetooth?.reconnectDeviceIdForCurrentBoard;
+  const boardConnecting = isAndroidSessionPresence && boardConnectPending;
+  // iOS card footer: it offers "Tap to reconnect" only while native still
+  // pairs a board, and reads that pairing only when it redraws. When the app
+  // forgets the board it kept (a hang-up's 10 minutes ran out, the route moved
+  // to another board, a sign-out), this changes, so the card redraws to "Open
+  // Boardsesh to connect" instead of offering a tap that can only fail.
+  const nativePairingRevision = isAndroidSessionPresence ? 0 : (bluetooth?.nativeBoardForgets ?? 0);
   // The climber's saved board look for the iOS server-rendered thumbnail. The
   // REQUESTED mode, not the device-probed effective one: the server always
   // renders aura. Pre-hydration the store snapshot resolves to the default
@@ -95,6 +131,23 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
     verifyOverlayFile: isAndroidSessionPresence,
   });
 
+  // The Android lock screen card's bokeh and grade (#7327). A string, so the
+  // update effects fire only when the card's look changes. Undefined keeps the
+  // classic card, which is what the kill switch asks for.
+  const androidCardEnabled = useAndroidNotificationCardEnabled() && isAndroidSessionPresence;
+  const notificationGlow = useClimbWallGlow(displayClimb, selectedBoardConfig, androidCardEnabled);
+  const androidBokehJson = useMemo(() => {
+    if (!androidCardEnabled || !displayClimb) return undefined;
+    return JSON.stringify(
+      buildAndroidCardPayload({
+        glow: notificationGlow,
+        difficulty: displayClimb.difficulty,
+        boardName: notificationBoard?.boardName ?? boardName,
+        angle: displayClimb.angle,
+      }),
+    );
+  }, [androidCardEnabled, displayClimb, notificationGlow, notificationBoard?.boardName, boardName]);
+
   // Localized strings for the Android foreground-service notification (channel +
   // Previous/Next + lightbulb actions, and the "on the wall" line). Built here
   // because hooks need a component context; ignored on iOS, where ActivityKit
@@ -110,12 +163,15 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
       unmirrorLabel: t('mobile.session.notification.unmirror'),
       relightLabel: t('mobile.session.notification.relight'),
       reconnectLabel: t('mobile.session.notification.reconnect'),
+      connectingLabel: t('mobile.session.notification.connecting'),
       onWallTemplate: t('mobile.session.notification.onWall'),
+      lightDrivingLabel: t('mobile.session.notification.drivingTheWall'),
+      stopDrivingLabel: t('mobile.session.notification.stopDriving'),
     }),
     [t],
   );
 
-  useLiveActivity({
+  const { activityStartCount } = useLiveActivity({
     queueSequence: state.serverSequence,
     queue: state.queue,
     currentClimbQueueItem: state.currentClimbQueueItem,
@@ -135,21 +191,25 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
       boardConnection === 'connectedByMe' &&
       getBoardCapabilities(boardName).nativeBoardControl &&
       nativeBleSupportsBoard(boardName),
-    isPartySession: sessionId !== null,
+    isPartySession: bluetoothTransport()?.widgetCommandDelivery !== 'javascript' && sessionId !== null,
     boardConnection,
     holderDisplayName,
+    bulbOpensApp,
+    boardConnecting,
+    nativePairingRevision,
     renderMode,
     androidNotification,
     androidThumbnailOverlayPath: overlayUri,
     androidThumbnailOverlayLoadKey: overlayLoadKey,
     validateAndroidThumbnailOverlay: verifyOverlayForNativeUse,
     androidThumbnailBackgroundPaths: backgroundPaths,
+    androidBokehJson,
   });
 
-  // Subscribe to widget Next/Previous taps. Native already advanced the shared
-  // index, updated the optimistic Live Activity, and sent the server mutation;
-  // this listener brings the JS reducer in line using the ABSOLUTE index native
-  // computed (event.currentIndex), not a relative nextClimb()/previousClimb().
+  // Subscribe to widget/notification Next/Previous taps. iOS publishes natively;
+  // Android forwards the event and JS publishes through the queue provider.
+  // This listener selects the ABSOLUTE index computed by native (`event.currentIndex`),
+  // not a relative `nextClimb()`/`previousClimb()` step.
   //
   // Why absolute: in a server-authorized session the backend's CurrentClimbChanged
   // broadcast (correlationId 'widget-navigate') often reaches JS before this
@@ -174,7 +234,11 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
       // momentarily diverged (e.g. a queue edit mid-tap). Drop it rather than
       // crash or wrap around.
       if (event.currentIndex < 0 || event.currentIndex >= queue.length) return;
-      dispatchWidgetNavigationRef.current(queue[event.currentIndex], event.correlationId);
+      if (isAndroidSessionPresence) {
+        dispatchWidgetNavigationRef.current(queue[event.currentIndex], event.correlationId, { sendMutation: true });
+      } else {
+        dispatchWidgetNavigationRef.current(queue[event.currentIndex], event.correlationId);
+      }
     });
     return unsubscribe;
   }, []);
@@ -185,7 +249,12 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
   //    peer (Aurora is last-connection-wins). The BLE auto-sender then re-lights
   //    the current climb on connect.
   //  - reassert (bulb was lit): re-push the current climb to the wall.
-  // Mirrors the iOS ReconnectBoardIntent / take-control. A ref keeps the listener
+  //  - stopDriving (bulb was lit while this phone drove): stop driving, as the
+  //    frosted button does (`stopped`; Disconnect Bluetooth when driving ends
+  //    then decides about the board). The notification was drawn a while ago,
+  //    so the drive is read again here, its end off the wall clock (#7038):
+  //    one already over just re-lights.
+  // Mirrors the iOS ReconnectBoardIntent / StopDrivingIntent / take-control. A ref keeps the listener
   // subscribed once while reading the latest bluetooth context (its identity
   // changes when a board is (de)selected).
   const bluetoothRef = useRef(bluetooth);
@@ -209,7 +278,9 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
         bluetoothCtx.armUndoWallChangeToast();
         // By serial (Aurora) or device id (MoonBoard); neither → adapter picker.
         void bluetoothCtx.connect(undefined, undefined, reconnectSerial, reconnectDeviceId);
-      } else if (event.action === 'reassert') {
+      } else if (event.action === 'stopDriving' && isDriveStillOn()) {
+        stopDrivingForLink();
+      } else if (event.action === 'reassert' || event.action === 'stopDriving') {
         // A re-push of the current climb — no climb change to undo, so no toast.
         bluetoothCtx.reassertWall();
       }
@@ -217,18 +288,44 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
     return unsubscribe;
   }, []);
 
+  // The card could not be posted as drawn. Native only logs otherwise, and this
+  // service is what keeps the Bluetooth link alive, so a failure must be visible.
+  useEffect(
+    () =>
+      addNotificationPostFailedListener(({ stage, errorName }) => {
+        captureToSentry(new Error('Android session notification post failed'), {
+          tags: { source: 'session-presence-post', stage },
+          extra: { errorName },
+        });
+      }),
+    [],
+  );
+
   const handleMirrorRef = useRef<(event: WidgetMirrorEvent) => Promise<void>>(async () => {});
   handleMirrorRef.current = async (event) => {
     if (event.sessionId !== sessionId) return;
     if (event.kind === 'confirmed') {
       // Native already changed the wall. Replay the sequenced result, never toggle again.
       if (await dispatchWidgetMirror(event)) await acknowledgeWidgetMirror(event.sessionId, event.sequence);
-    } else if (
-      boardConnection === 'connectedByMe' &&
-      boardSupportsMirroring(boardName, layoutId) &&
-      state.currentClimbQueueItem?.uuid === event.queueItemUuid
-    ) {
-      await mirrorCurrentClimb(event.mirrored, event.queueItemUuid);
+      return;
+    }
+    if (!boardSupportsMirroring(boardName, layoutId)) return;
+    if (state.currentClimbQueueItem?.uuid !== event.queueItemUuid) {
+      // The queue moved on, so the server would refuse this anyway. Retire an
+      // iOS tap parked by a failed request rather than replaying it forever.
+      await acknowledgeWidgetMirrorRequest(event.sessionId);
+      return;
+    }
+    // Not holding the board yet is a timing condition, not a verdict: a parked
+    // tap replayed during a cold launch can arrive before Bluetooth reconnects,
+    // so leave it parked for the next handover instead of acknowledging it.
+    if (boardConnection !== 'connectedByMe') return;
+    // Only a server-accepted replay retires the parked tap. The mutation turns
+    // a failure into a toast, which on a locked phone nobody sees, so acking
+    // unconditionally would throw the tap away in exactly the outage it exists
+    // to survive.
+    if (await mirrorCurrentClimb(event.mirrored, event.queueItemUuid)) {
+      await acknowledgeWidgetMirrorRequest(event.sessionId);
     }
   };
   useEffect(() => {
@@ -261,5 +358,12 @@ export function LiveActivityBridge({ boardName, layoutId, sizeId, setIds }: Live
       .catch((error: unknown) => console.warn('[LiveActivity] Mirror replay failed:', error));
   }, [state.queue]);
 
-  return null;
+  // The rest timer and the drive (timed or open-ended) ride their own leaves: their
+  // store events re-render those, not this.
+  return (
+    <>
+      <LiveActivityRestTimerSync sessionId={sessionId} activityStartCount={activityStartCount} />
+      <LiveActivityLightingSync sessionId={sessionId} activityStartCount={activityStartCount} />
+    </>
+  );
 }

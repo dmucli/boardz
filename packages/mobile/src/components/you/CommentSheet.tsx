@@ -1,19 +1,16 @@
 import { type RefObject, useState } from 'react';
-import { View, Pressable, StyleSheet } from 'react-native';
-import { BottomSheetTextInput, type BottomSheet } from '@expo/ui/community/bottom-sheet';
+import type { BottomSheet } from '../sheet-presentation';
 import { useTranslation } from 'react-i18next';
 import type { SocialEntityType } from '@boardsesh/shared-schema';
-import { Text } from '../Text';
+import { useScopedSheetError } from '../../hooks/use-scoped-sheet-error';
+import { usePublicationAudience } from '../privacy/use-publication-audience';
+import { PublicationAudiencePicker } from '../privacy/PublicationAudiencePicker';
+import { ContentAudienceControl } from '../privacy/ContentAudienceControl';
 import { PressableAvatar } from '../PressableAvatar';
-import { Icon } from '../Icon';
-import { Sheet } from '../Sheet';
-import { ActivityIndicator } from '../ActivityIndicator';
 import { useComments, useAddComment } from '../../lib/graphql/hooks';
 import { formatRelativeTime } from '../../lib/format-relative-time';
 import { hapticLight } from '../../lib/haptics';
-import { spacing, borderRadius } from '../../theme/tokens';
-import { useTheme } from '../../providers/theme-provider';
-import { useToast } from '../../providers/toast-provider';
+import { CommentSheetView, type CommentSheetComment } from './CommentSheetView';
 
 type CommentSheetProps = {
   sheetRef: RefObject<BottomSheet | null>;
@@ -37,10 +34,9 @@ export function CommentSheet({
   onClose,
 }: CommentSheetProps) {
   const { t } = useTranslation('you');
-  const { t: tCommon } = useTranslation('common');
-  const { systemColors, brandColors } = useTheme();
-  const { showToast } = useToast();
+  const { submitError, setSubmitError } = useScopedSheetError(`${entityType}:${entityId ?? ''}`, !!entityId);
   const [draft, setDraft] = useState('');
+  const privacy = usePublicationAudience(entityId ?? '', !!entityId);
 
   const commentsQuery = useComments(entityType, entityId ?? undefined, !!entityId);
   const addComment = useAddComment();
@@ -48,118 +44,48 @@ export function CommentSheet({
 
   const submit = () => {
     const body = draft.trim();
-    if (!body || !entityId) return;
+    if (!body || !entityId || addComment.isPending) return;
+    setSubmitError(null);
     hapticLight();
     // Clear the draft only once the comment lands. On failure keep the text in
-    // the composer and surface a toast so it isn't silently lost. The send
+    // the composer and surface an inline error above the native sheet. The send
     // button is disabled while the mutation is pending, so no double-send.
     addComment.mutate(
-      { entityType, entityId, body },
+      { entityType, entityId, body, ...(privacy.publication ? { privacy: privacy.publication } : {}) },
       {
         onSuccess: () => setDraft(''),
-        onError: () => showToast(t('mobile.comments.sendError'), 'error'),
+        onError: () => setSubmitError(t('mobile.comments.sendError')),
       },
     );
   };
 
   return (
-    <Sheet
-      ref={sheetRef}
-      snapPoints={['60%', '90%']}
-      scrollable
+    <CommentSheetView
+      sheetRef={sheetRef}
+      comments={comments}
+      loading={commentsQuery.isPending && !!entityId}
+      canComment={canComment}
+      draft={draft}
+      isPending={addComment.isPending}
+      submitError={submitError}
+      errorVisible={!!entityId}
+      errorScope={`${entityType}:${entityId ?? ''}`}
+      audiencePicker={<PublicationAudiencePicker privacy={privacy} disabled={addComment.isPending} />}
+      renderAvatar={renderCommentAvatar}
+      renderAudienceControl={renderCommentAudience}
+      formatTime={formatRelativeTime}
+      onChangeDraft={(next) => {
+        setDraft(next);
+        setSubmitError(null);
+      }}
+      onSubmit={submit}
       onClose={onClose}
-      footer={
-        canComment ? (
-          <View style={styles.composer}>
-            <BottomSheetTextInput
-              style={[styles.input, { backgroundColor: systemColors.fill, color: systemColors.label }]}
-              placeholder={t('mobile.comments.placeholder')}
-              placeholderTextColor={systemColors.tertiaryLabel}
-              value={draft}
-              onChangeText={setDraft}
-              multiline
-            />
-            <Pressable
-              onPress={submit}
-              disabled={draft.trim().length === 0 || addComment.isPending}
-              style={styles.send}
-              accessibilityRole="button"
-            >
-              <Icon
-                name="send"
-                size={22}
-                color={draft.trim().length > 0 ? brandColors.primary : systemColors.tertiaryLabel}
-              />
-            </Pressable>
-          </View>
-        ) : (
-          <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.signInPrompt}>
-            {tCommon('comment.signInPrompt')}
-          </Text>
-        )
-      }
-    >
-      <Text variant="title3" style={styles.title}>
-        {t('mobile.comments.title')}
-      </Text>
-      {commentsQuery.isPending && entityId ? (
-        <View style={styles.centered}>
-          <ActivityIndicator />
-        </View>
-      ) : comments.length === 0 ? (
-        <Text variant="subheadline" style={styles.empty}>
-          {t('mobile.comments.empty')}
-        </Text>
-      ) : (
-        comments.map((comment) => (
-          <View key={comment.uuid} style={styles.commentRow}>
-            <PressableAvatar
-              userId={comment.userId}
-              uri={comment.userAvatarUrl}
-              name={comment.userDisplayName}
-              size={32}
-            />
-            <View style={styles.commentBody}>
-              <View style={styles.commentMeta}>
-                <Text variant="subheadline" style={styles.commentName}>
-                  {comment.userDisplayName ?? t('mobile.unknownName')}
-                </Text>
-                <Text variant="caption2" color={systemColors.tertiaryLabel}>
-                  {formatRelativeTime(comment.createdAt)}
-                </Text>
-              </View>
-              <Text variant="subheadline">{comment.body}</Text>
-            </View>
-          </View>
-        ))
-      )}
-    </Sheet>
+    />
   );
 }
-
-const styles = StyleSheet.create({
-  title: { paddingHorizontal: spacing[4], paddingTop: spacing[2], paddingBottom: spacing[3] },
-  centered: { paddingVertical: spacing[10], alignItems: 'center' },
-  empty: { paddingHorizontal: spacing[4], paddingVertical: spacing[6], opacity: 0.6 },
-  commentRow: {
-    flexDirection: 'row',
-    gap: spacing[3],
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[2],
-  },
-  commentBody: { flex: 1, gap: 2 },
-  commentMeta: { flexDirection: 'row', alignItems: 'baseline', gap: spacing[2] },
-  commentName: { fontWeight: '600' },
-  composer: { flexDirection: 'row', alignItems: 'flex-end', gap: spacing[2] },
-  input: {
-    flex: 1,
-    minHeight: 40,
-    maxHeight: 120,
-    borderRadius: borderRadius.lg,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[2],
-    fontSize: 15,
-  },
-  send: { paddingBottom: spacing[2] },
-  signInPrompt: { paddingVertical: spacing[2], textAlign: 'center' },
-});
+const renderCommentAvatar = (comment: CommentSheetComment) => (
+  <PressableAvatar userId={comment.userId} uri={comment.userAvatarUrl} name={comment.userDisplayName} size={32} />
+);
+const renderCommentAudience = (comment: CommentSheetComment) => (
+  <ContentAudienceControl entityType="comment" entityId={comment.uuid} />
+);

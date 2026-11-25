@@ -4,9 +4,10 @@ import {
   QA_PREVIEWS_MAX_PR_NUMBERS,
 } from '@boardsesh/shared-schema';
 import { z } from 'zod';
+import { OptionalReleaseContextInputSchema } from './release-context';
 
 /**
- * Crowdsourced QA input bounds (docs/crowdsourced-qa.md).
+ * Crowdsourced QA input bounds (docs/qa/crowdsourced-qa.md).
  *
  * Unlike app feedback — where a malformed enrichment field must never cost us
  * the report — a verdict is an authored judgement on a specific PR, so every
@@ -46,6 +47,7 @@ export const QaPreviewsArgsSchema = z.object({
 export const SubmitQaVerdictInputSchema = z
   .object({
     prNumber: z.number().int().positive(),
+    releaseContext: OptionalReleaseContextInputSchema,
     branch: z.string().trim().min(1).max(64),
     verdict: z.enum(['approved', 'declined']),
     comment: z.string().trim().max(COMMENT_MAX).optional().nullable(),

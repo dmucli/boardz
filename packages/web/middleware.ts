@@ -1,7 +1,20 @@
 // middleware.ts
 import { NextResponse, type NextRequest } from 'next/server';
 import { SUPPORTED_BOARDS } from './app/lib/board-data';
-import { getClimbViewPageCacheTTL, getListPageCacheTTL } from './app/lib/list-page-cache';
+import {
+  getClimbViewPageCacheTTL,
+  getListPageCacheTTL,
+  isBoardPosterRequest,
+  isSprayWallCapabilityRequest,
+} from './app/lib/list-page-cache';
+import { BOARD_INVITE_PARAM, isBoardInviteRequest, searchCarriesBoardInvite } from './app/lib/board-invite';
+import {
+  isCacheableMarketingRequest,
+  MARKETING_CACHE_CONTROL,
+  MARKETING_CDN_CACHE_CONTROL,
+  MARKETING_CACHE_VARY,
+} from './app/lib/marketing-page-cache';
+import { LIVE_SEARCH_DATA_TTL_SECONDS } from './app/lib/live-search-data-boards';
 import { isCrawlerUserAgent } from './app/lib/is-crawler';
 import { CLIMB_SESSION_COOKIE } from './app/lib/climb-session-cookie';
 import { PATHNAME_HEADER } from './app/lib/request-pathname-header';
@@ -15,9 +28,15 @@ import {
   isSupportedLocale,
 } from './app/lib/i18n/config';
 import { detectLocale } from './app/lib/i18n/detect-locale';
+import { isAppGuidePath } from './app/lib/i18n/published-locales';
 import { isBlockedCrawler, isOriginAutomationDefaultDenyEnabled } from './app/lib/crawler-policy';
 
-const SPECIAL_ROUTES = ['angles', 'grades']; // routes that don't need board validation
+// The /api/v1 route families whose first segment is not a board name, so the
+// board-name check below must let them through. Every static directory under
+// app/api/v1 belongs here (middleware.test.ts walks the folder to hold that).
+// `spray-walls` serves a wall's photo and generated art: the route itself
+// answers `no-store` and 404s any wall an anonymous read may not see.
+const SPECIAL_ROUTES = ['angles', 'grades', 'spray-walls'];
 
 // Locale-prefixed embed URLs (/es/embed/..., /fr/embed/...) are 308'd to the
 // un-prefixed path (see the carve-out below). Derived from SUPPORTED_LOCALES
@@ -44,6 +63,36 @@ function isExpoWebProxyEnabled(): boolean {
 }
 
 export function middleware(request: NextRequest) {
+  const response = routeRequest(request);
+  const { strippedPath } = detectLocale(request.nextUrl.pathname);
+  if (
+    (strippedPath === '/' || isAppGuidePath(strippedPath)) &&
+    !isCacheableMarketingRequest({
+      method: request.method,
+      pathname: request.nextUrl.pathname,
+      search: request.nextUrl.search,
+      headers: request.headers,
+    })
+  ) {
+    // Apply after routing so session, sticky-language and guide-alias redirects
+    // receive the same protection as successful static marketing responses.
+    response.headers.set('Cache-Control', 'private, no-store');
+    response.headers.set('CDN-Cache-Control', 'no-store');
+    response.headers.set('Vercel-CDN-Cache-Control', 'no-store');
+    response.headers.append('Vary', MARKETING_CACHE_VARY);
+  }
+  // The capability survives sign-in inside callbackUrl, and can cross locale
+  // redirects. Protect every response branch carrying it, regardless of path.
+  if (request.nextUrl.searchParams.has(BOARD_INVITE_PARAM) || searchCarriesBoardInvite(request.nextUrl.search)) {
+    response.headers.set('Referrer-Policy', 'no-referrer');
+    response.headers.set('Cache-Control', 'private, no-store');
+    response.headers.set('CDN-Cache-Control', 'no-store');
+    response.headers.set('Vercel-CDN-Cache-Control', 'no-store');
+  }
+  return response;
+}
+
+function routeRequest(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   // Cheap origin fallback for crawlers that bypass Cloudflare's public hostname.
@@ -178,9 +227,40 @@ export function middleware(request: NextRequest) {
     }
   }
 
+  // API routes don't carry a locale prefix. The English-only app guides use
+  // one URL per page and leave the visitor's saved language alone.
+  const isApi = pathname.startsWith('/api/');
+  const { locale, strippedPath, needsRewrite } = isApi
+    ? { locale: DEFAULT_LOCALE, strippedPath: pathname, needsRewrite: false }
+    : detectLocale(pathname);
+  const isAppGuide = isAppGuidePath(strippedPath);
+  // Locale homepages have public, prerendered routes of their own. Other
+  // translated pages still rewrite to the existing application route.
+  const isLocalizedHome = needsRewrite && strippedPath === '/';
+  // Do not let the translated application rewrite create a second locale-home
+  // URL such as /fr/de that renders the German homepage under a French prefix.
+  if (
+    needsRewrite &&
+    SUPPORTED_LOCALES.some(
+      (candidate) =>
+        candidate !== DEFAULT_LOCALE && (strippedPath === `/${candidate}` || strippedPath === `/${candidate}/`),
+    )
+  ) {
+    return new NextResponse(null, {
+      status: 404,
+      headers: { 'Cache-Control': 'no-store', 'X-Robots-Tag': 'noindex, nofollow' },
+    });
+  }
+  if (isAppGuide && needsRewrite) {
+    const target = request.nextUrl.clone();
+    target.pathname = strippedPath;
+    return NextResponse.redirect(target, 307);
+  }
+
   // Backward compat: redirect old ?session= URLs to clean URLs with cookie.
   // The redirect cost (~150ms) is far less than a CDN cache miss (1.3-1.6s).
-  const sessionParam = request.nextUrl.searchParams.get('session');
+  // App guides never host a session. Keep their query intact across the alias.
+  const sessionParam = isAppGuide ? null : request.nextUrl.searchParams.get('session');
   if (sessionParam) {
     const cleanUrl = request.nextUrl.clone();
     cleanUrl.searchParams.delete('session');
@@ -195,13 +275,6 @@ export function middleware(request: NextRequest) {
     });
     return response;
   }
-
-  // Detect locale from URL prefix. API routes don't carry a locale prefix —
-  // skip them so we don't mangle their paths.
-  const isApi = pathname.startsWith('/api/');
-  const { locale, strippedPath, needsRewrite } = isApi
-    ? { locale: DEFAULT_LOCALE, strippedPath: pathname, needsRewrite: false }
-    : detectLocale(pathname);
 
   // Classify once for the two sticky-locale gates below. Skipped outright for
   // /api/*: the `/api/v1/:path*` and `/api/auth/:path*` matcher entries do
@@ -223,7 +296,7 @@ export function middleware(request: NextRequest) {
   // names no scraper newer than ~2023, and AhrefsBot, SemrushBot, DataForSeoBot
   // and MJ12bot were all still taking this 307 in production on 2026-08-24. See
   // `app/lib/is-crawler.ts` for the token list and the probe behind it.
-  if (!isApi && locale === DEFAULT_LOCALE && !isCrawler) {
+  if (!isApi && !isAppGuide && locale === DEFAULT_LOCALE && !isCrawler) {
     const cookieLocale = request.cookies.get(LOCALE_COOKIE)?.value;
     if (isSupportedLocale(cookieLocale) && cookieLocale !== DEFAULT_LOCALE) {
       const target = new URL(`/${cookieLocale}${pathname}`, request.url);
@@ -245,7 +318,7 @@ export function middleware(request: NextRequest) {
   requestHeaders.set(PATHNAME_HEADER, strippedPath);
 
   let response: NextResponse;
-  if (needsRewrite) {
+  if (needsRewrite && !isLocalizedHome) {
     const rewrittenUrl = request.nextUrl.clone();
     rewrittenUrl.pathname = strippedPath;
     response = NextResponse.rewrite(rewrittenUrl, {
@@ -269,10 +342,18 @@ export function middleware(request: NextRequest) {
     });
   }
 
-  // Use Vercel-CDN-Cache-Control because Next.js overwrites Cache-Control
-  // for dynamic pages (pages that use searchParams) with "private, no-store".
-  // Vercel-CDN-Cache-Control is the highest-priority header for Vercel's CDN
-  // and is not touched by Next.js rendering.
+  // The TTL goes in CDN-Cache-Control, which Cloudflare reads ahead of
+  // Cache-Control and browsers ignore, plus the Vercel-CDN-Cache-Control copy.
+  // Next never touches either. Cache-Control is left to Next: in 16.3.5 a
+  // dynamic page gets "private, no-cache, no-store" only when no Cache-Control
+  // is set yet (app-page-runtime, send-payload's sendRenderResult), so it does
+  // not overwrite one set here.
+  // Moving the TTL into Cache-Control would not stop errors being cached either.
+  // An in-page notFound() or render error only changes the status
+  // (app-render's shell catch), so the 404 or 500 would keep the TTL there too.
+  // This runs before the page renders and cannot know it will 404 or fail;
+  // `installErrorResponseCdnCacheGuard` (instrumentation.ts) turns these headers
+  // into `no-store` on any 4xx or 5xx once the status is final.
   // Cache-key follows the original (locale-prefixed) URL, so en and es never collide.
   // Climb view pages are equally URL-determined and personalization-free, so they
   // cache the same way — including their legacy numeric variants, whose permanent
@@ -280,8 +361,44 @@ export function middleware(request: NextRequest) {
   const cacheTTL =
     getListPageCacheTTL(strippedPath, request.nextUrl.searchParams) ??
     getClimbViewPageCacheTTL(strippedPath, request.nextUrl.searchParams);
-  if (cacheTTL !== null) {
-    const cdnCacheValue = `s-maxage=${cacheTTL}, stale-while-revalidate=${cacheTTL * 7}`;
+  if (
+    isSprayWallCapabilityRequest(strippedPath, request.nextUrl.searchParams) ||
+    isBoardInviteRequest(strippedPath, request.nextUrl.searchParams) ||
+    isBoardPosterRequest(strippedPath)
+  ) {
+    // An unlisted spray wall's share link, a home board's (`?invite=`), or a
+    // printable board poster. Said out loud rather than left to the missing CDN
+    // header: no shared cache may hold any of them, so a hide, a switch to
+    // private or a link reset takes effect on the next request, and a token
+    // never becomes part of a cache key. See `isSprayWallCapabilityRequest`,
+    // `isBoardInviteRequest` and `isBoardPosterRequest`.
+    response.headers.set('Cache-Control', 'private, no-store');
+    response.headers.set('CDN-Cache-Control', 'no-store');
+    response.headers.set('Vercel-CDN-Cache-Control', 'no-store');
+    // The page URL holds the capability; its own asset requests must not echo it.
+    if (isBoardInviteRequest(strippedPath, request.nextUrl.searchParams)) {
+      response.headers.set('Referrer-Policy', 'no-referrer');
+    }
+  } else if (
+    isCacheableMarketingRequest({
+      method: request.method,
+      pathname,
+      search: request.nextUrl.search,
+      headers: request.headers,
+    })
+  ) {
+    // Only anonymous, URL-determined documents get this public policy. The
+    // final-response guard revokes it on errors, redirects and Set-Cookie.
+    response.headers.set('Cache-Control', MARKETING_CACHE_CONTROL);
+    response.headers.set('CDN-Cache-Control', MARKETING_CDN_CACHE_CONTROL);
+    response.headers.set('Vercel-CDN-Cache-Control', MARKETING_CDN_CACHE_CONTROL);
+    response.headers.append('Vary', MARKETING_CACHE_VARY);
+  } else if (cacheTTL !== null) {
+    // The 15 minute live-data TTL keeps its stale window equal to the TTL: x7
+    // would let a quiet page serve a copy up to ~2 h old after expiry. This
+    // matches on the TTL value, so any future 900 s tier inherits it too.
+    const staleWhileRevalidate = cacheTTL === LIVE_SEARCH_DATA_TTL_SECONDS ? cacheTTL : cacheTTL * 7;
+    const cdnCacheValue = `s-maxage=${cacheTTL}, stale-while-revalidate=${staleWhileRevalidate}`;
     response.headers.set('Vercel-CDN-Cache-Control', cdnCacheValue);
     response.headers.set('CDN-Cache-Control', cdnCacheValue);
   }

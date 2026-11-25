@@ -1,4 +1,5 @@
-import { sql, type SQL } from 'drizzle-orm';
+import { and, eq, exists, isNotNull, isNull, notExists, sql, type SQL } from 'drizzle-orm';
+import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 
 /**
@@ -25,32 +26,137 @@ import * as dbSchema from '@boardsesh/db/schema';
  * them — a "12 results" header over nine rows, and a last page that is empty. The
  * predicate has to be in the WHERE that carries LIMIT/OFFSET *and* in the count,
  * which means one expression both can take.
+ *
+ * ## Hidden walls
+ *
+ * A wall an admin has hidden (`spray_walls.hidden_at`, SW-17) reads exactly like
+ * a private one for everybody but its owner, so it leaves every listing this
+ * predicate carries: `searchBoards`, `gymBoards` (gym editors included — they
+ * are not the owner) and a follower's `myBoards`. The owner escape sits OUTSIDE
+ * the EXISTS, so the owner still lists their own hidden wall and sees the
+ * notice on it. See "What hidden means" in docs/product/spray-walls.md.
+ *
+ * ## Archived walls
+ *
+ * A wall replaced by a reset (`spray_walls.archived_at`) leaves every listing
+ * this predicate carries, the OWNER'S included: these are the pickers a climber
+ * chooses a wall to climb on, and nothing new can be set on an archived wall. So
+ * the archived test sits OUTSIDE the owner escape. The owner finds archived walls
+ * in `mySprayWalls`, and every climb, tick and share link on them keeps working.
+ * See "Archive and reset" in docs/product/spray-walls.md.
  */
-export function listableSprayWallCondition(viewerId: string | null | undefined): SQL {
+export function listableSprayWallCondition(
+  viewerId: string | null | undefined,
+  options: { requirePublished?: boolean } = {},
+): SQL {
+  // The climbing picker must only offer usable walls. Owners can still see
+  // hidden published walls, but unfinished walls belong in mySprayWalls.
+  if (options.requirePublished) {
+    const ownerHiddenEscape = viewerId ? sql`OR ${dbSchema.userBoards.ownerId} = ${viewerId}` : sql``;
+    return sql`(
+      ${dbSchema.userBoards.boardType} IS DISTINCT FROM 'spray'
+      OR EXISTS (
+        SELECT 1 FROM spray_walls sw
+        JOIN spray_wall_versions sv ON sv.id = sw.current_version_id AND sv.wall_id = sw.id
+        WHERE sw.board_uuid = ${dbSchema.userBoards.uuid}
+          AND sw.deleted_at IS NULL
+          AND sw.archived_at IS NULL
+          AND sv.status = 'published'
+          AND (sw.hidden_at IS NULL ${ownerHiddenEscape})
+      )
+    )`;
+  }
   // `IS DISTINCT FROM` rather than `<>`: board_type is NOT NULL today, and a
   // three-valued comparison that quietly drops rows if that ever changes is not
   // the failure anybody wants from a visibility filter.
   const ownerEscape = viewerId ? sql`${dbSchema.userBoards.ownerId} = ${viewerId} OR ` : sql``;
 
+  // The archived test is its own NOT EXISTS, outside the owner escape, so the
+  // owner's listings drop an archived wall too (see "Archived walls" above).
   return sql`(
     ${dbSchema.userBoards.boardType} IS DISTINCT FROM 'spray'
-    OR ${ownerEscape}EXISTS (
-      SELECT 1 FROM spray_walls sw
-      WHERE sw.board_uuid = ${dbSchema.userBoards.uuid}
-        AND sw.deleted_at IS NULL
-        AND sw.current_version_id IS NOT NULL
+    OR (
+      NOT EXISTS (
+        SELECT 1 FROM spray_walls archived
+        WHERE archived.board_uuid = ${dbSchema.userBoards.uuid}
+          AND archived.archived_at IS NOT NULL
+      )
+      AND (
+        ${ownerEscape}EXISTS (
+          SELECT 1 FROM spray_walls sw
+          WHERE sw.board_uuid = ${dbSchema.userBoards.uuid}
+            AND sw.deleted_at IS NULL
+            AND sw.current_version_id IS NOT NULL
+            AND sw.hidden_at IS NULL
+        )
+      )
     )
   )`;
 }
 
 /**
+ * The viewer's OWN spray walls that have never been published: not deleted, not
+ * archived, no current version. `myBoards` ORs this onto the published-only
+ * picker rule when the caller opts in (`includeUnfinishedSprayWalls`), so My
+ * Boards and Manage can show a wall's import progress while every board picker
+ * keeps offering only walls that can be climbed on (#6040).
+ *
+ * Exactly the walls `readSprayWallImportProgress` reports, so every row this
+ * adds carries a `sprayImport` for its owner.
+ */
+export function ownedUnfinishedSprayWallCondition(viewerId: string): SQL {
+  return and(
+    eq(dbSchema.userBoards.ownerId, viewerId),
+    eq(dbSchema.userBoards.boardType, 'spray'),
+    exists(
+      db
+        .select({ id: dbSchema.sprayWalls.id })
+        .from(dbSchema.sprayWalls)
+        .where(
+          and(
+            eq(dbSchema.sprayWalls.boardUuid, dbSchema.userBoards.uuid),
+            isNull(dbSchema.sprayWalls.deletedAt),
+            isNull(dbSchema.sprayWalls.archivedAt),
+            isNull(dbSchema.sprayWalls.currentVersionId),
+          ),
+        ),
+    ),
+    boardIsNotArchivedSprayWall(),
+  )!;
+}
+
+/**
  * The same rule for a row already loaded from `spray_walls`, where the join has
- * been done and the SQL form would be a second query per row.
+ * been done and the SQL form would be a second query per row. Mirrors the SQL
+ * exactly: never an archived wall; otherwise the owner, or a published wall that
+ * is not admin-hidden.
  */
 export function sprayWallIsListable(
-  wall: { currentVersionId: number | null },
+  wall: { currentVersionId: number | null; hiddenAt: Date | null; archivedAt: Date | null },
   board: { ownerId: string },
   viewerId: string | null | undefined,
 ): boolean {
-  return wall.currentVersionId != null || (viewerId != null && board.ownerId === viewerId);
+  if (wall.archivedAt != null) return false;
+  if (viewerId != null && board.ownerId === viewerId) return true;
+  return wall.currentVersionId != null && wall.hiddenAt == null;
+}
+
+/**
+ * True for every `user_boards` row that is NOT an archived spray wall.
+ *
+ * For counts that measure what an account or gym has live: the board cap
+ * (`assertBoardCapNotReached`) and a gym's `boardCount`. An archived wall is a
+ * read-only record a reset left behind, and counting it would make every reset
+ * cost one board. A correlated `NOT EXISTS`, so it composes into any WHERE that
+ * has `user_boards` in scope.
+ */
+export function boardIsNotArchivedSprayWall(): SQL {
+  return notExists(
+    db
+      .select({ id: dbSchema.sprayWalls.id })
+      .from(dbSchema.sprayWalls)
+      .where(
+        and(eq(dbSchema.sprayWalls.boardUuid, dbSchema.userBoards.uuid), isNotNull(dbSchema.sprayWalls.archivedAt)),
+      ),
+  );
 }

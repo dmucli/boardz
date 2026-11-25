@@ -43,11 +43,23 @@ export const ADMIN_APP_FEEDBACK = gql`
         angle
         contactConsent
         createdAt
+        lastMessageAt
+        lastMessagePreview
+        needsReply
         status
         resolvedAt
         resolvedBy
         githubIssueNumber
         githubIssueUrl
+        releaseContext {
+          channel
+          branch
+          updateId
+          runtimeVersion
+          isEmbeddedLaunch
+          automaticCanary
+          canaryCheckedAt
+        }
         reporter {
           userId
           email
@@ -89,11 +101,23 @@ export const UPDATE_APP_FEEDBACK_STATUS = gql`
       angle
       contactConsent
       createdAt
+      lastMessageAt
+      lastMessagePreview
+      needsReply
       status
       resolvedAt
       resolvedBy
       githubIssueNumber
       githubIssueUrl
+      releaseContext {
+        channel
+        branch
+        updateId
+        runtimeVersion
+        isEmbeddedLaunch
+        automaticCanary
+        canaryCheckedAt
+      }
       reporter {
         userId
         email
@@ -126,4 +150,115 @@ export type UpdateAppFeedbackStatusMutationVariables = {
 
 export type UpdateAppFeedbackStatusMutationResponse = {
   updateAppFeedbackStatus: AppFeedbackReport;
+};
+
+export const MY_APP_BUG_REPORTS = gql`
+  query MyAppBugReports($input: AppBugReportsInput) {
+    myAppBugReports(input: $input) {
+      reports {
+        id
+        comment
+        createdAt
+        status
+        screenshotUrls
+        githubIssueNumber
+        githubIssueUrl
+        canReply
+        lastMessageAt
+        lastMessagePreview
+      }
+      hasMore
+      endCursor
+    }
+  }
+`;
+export const APP_BUG_REPORT = gql`
+  query AppBugReport($id: ID!) {
+    appBugReport(id: $id) {
+      id
+      comment
+      createdAt
+      status
+      screenshotUrls
+      githubIssueNumber
+      githubIssueUrl
+      canReply
+      lastMessageAt
+      lastMessagePreview
+    }
+  }
+`;
+export const APP_BUG_REPORT_MESSAGES = gql`
+  query AppBugReportMessages($input: AppBugReportMessagesInput!) {
+    appBugReportMessages(input: $input) {
+      messages {
+        id
+        reportId
+        body
+        authorRole
+        deliveryStatus
+        createdAt
+      }
+      hasMore
+      endCursor
+    }
+  }
+`;
+export const SEND_APP_BUG_REPORT_MESSAGE = gql`
+  mutation SendAppBugReportMessage($input: SendAppBugReportMessageInput!) {
+    sendAppBugReportMessage(input: $input) {
+      id
+      reportId
+      body
+      authorRole
+      deliveryStatus
+      createdAt
+    }
+  }
+`;
+export type MyAppBugReportsQueryVariables = { input?: import('@boardsesh/shared-schema').AppBugReportsInput | null };
+export type MyAppBugReportsQueryResponse = {
+  myAppBugReports: import('@boardsesh/shared-schema').AppBugReportConnection;
+};
+export type AppBugReportQueryVariables = { id: string };
+export type AppBugReportQueryResponse = { appBugReport: import('@boardsesh/shared-schema').AppBugReport | null };
+export type AppBugReportMessagesQueryVariables = {
+  input: import('@boardsesh/shared-schema').AppBugReportMessagesInput;
+};
+export type AppBugReportMessagesQueryResponse = {
+  appBugReportMessages: import('@boardsesh/shared-schema').AppBugReportMessageConnection;
+};
+export type SendAppBugReportMessageMutationVariables = {
+  input: import('@boardsesh/shared-schema').SendAppBugReportMessageInput;
+};
+export type SendAppBugReportMessageMutationResponse = {
+  sendAppBugReportMessage: import('@boardsesh/shared-schema').AppBugReportMessage;
+};
+
+export const RETRY_APP_BUG_REPORT_MESSAGE = gql`
+  mutation RetryAppBugReportMessage($id: ID!) {
+    retryAppBugReportMessage(id: $id) {
+      id
+      reportId
+      body
+      authorRole
+      deliveryStatus
+      createdAt
+    }
+  }
+`;
+export type RetryAppBugReportMessageMutationVariables = { id: string };
+export type RetryAppBugReportMessageMutationResponse = {
+  retryAppBugReportMessage: import('@boardsesh/shared-schema').AppBugReportMessage;
+};
+
+export const APP_BUG_REPORT_CHANGED = gql`
+  subscription AppBugReportChanged {
+    appBugReportChanged {
+      reportId
+    }
+  }
+`;
+export type AppBugReportChangedSubscriptionResponse = {
+  appBugReportChanged: import('@boardsesh/shared-schema').AppBugReportChangedEvent;
 };

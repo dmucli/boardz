@@ -1,4 +1,4 @@
-export type { AppSettings, SettingsKey } from './types';
+export type { AppSettings, SettingsKey, RememberedSprayWallArchive, StartupScreen } from './types';
 export { DEFAULT_SETTINGS } from './defaults';
 export {
   getSetting,
@@ -32,5 +32,16 @@ export {
   rememberDownloadAllTap,
   takeDownloadAllTap,
   forgetDownloadAllTap,
+  getUserStartedDownloads,
+  rememberUserStartedDownload,
+  forgetUserStartedDownload,
+  getRememberedSprayWallArchive,
+  rememberSprayWallArchive,
+  forgetSprayWallArchive,
+  clearSprayWallArchives,
+  getOwnedSprayWallPins,
+  setOwnedSprayWallPins,
+  forgetOwnedSprayWallPin,
+  clearOwnedSprayWallPins,
   type OfflineDownloadTrigger,
 } from './offline-boards';

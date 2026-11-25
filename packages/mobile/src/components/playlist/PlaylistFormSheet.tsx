@@ -1,12 +1,19 @@
+import { useUnsavedSheetGuard } from '../../hooks/use-unsaved-sheet-guard';
+import { AccessibleBottomSheetTextInput as BottomSheetTextInput } from '../AccessibleBottomSheetTextInput';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { PressableSurface } from '../PressableSurface';
+import { usePublicationAudience } from '../privacy/use-publication-audience';
+import { PublicationAudiencePicker } from '../privacy/PublicationAudiencePicker';
+import { ContentAudienceControl } from '../privacy/ContentAudienceControl';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, StyleSheet, Pressable } from 'react-native';
-import { BottomSheetTextInput } from '@expo/ui/community/bottom-sheet';
+import { View, StyleSheet } from 'react-native';
+
 import { useTranslation } from 'react-i18next';
 import type { Playlist } from '@boardsesh/graphql/operations/playlists';
 import { ModalSheet } from '../ModalSheet';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
-import { Button } from '../Button';
+import { SheetTopBar } from '../SheetTopBar';
 import { SwitchRow } from '../SwitchRow';
 import { PlaylistPreviewSquare } from './PlaylistPreviewSquare';
 import { normalizePlaylistColor, PLAYLIST_COLORS } from './playlist-colors';
@@ -61,9 +68,11 @@ export function PlaylistFormSheet({
   onSubmit,
   onClose,
 }: PlaylistFormSheetProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('playlists');
   const { systemColors, brandColors } = useTheme();
   const isEdit = mode === 'edit';
+  const privacy = usePublicationAudience(playlist?.uuid ?? 'new-playlist', visible);
 
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
@@ -104,6 +113,21 @@ export function PlaylistFormSheet({
     wasVisibleRef.current = visible;
   }, [visible, isEdit, playlist]);
 
+  const initial = isEdit && playlist ? playlist : null;
+  const dirty =
+    name !== (initial?.name ?? '') ||
+    description !== (initial?.description ?? '') ||
+    color !== (normalizePlaylistColor(initial?.color) ?? undefined) ||
+    icon !== initial?.icon ||
+    isPublic !== (initial?.isPublic ?? false);
+  const guard = useUnsavedSheetGuard({
+    visible,
+    dirty,
+    busy: submitting,
+    onClose,
+    scope: `${mode}:${playlist?.uuid ?? ''}`,
+  });
+
   const handleSubmit = useCallback(() => {
     const result = buildPlaylistFormValues(mode, { name, description, color, icon, isPublic });
     if (!result.ok) {
@@ -117,8 +141,28 @@ export function PlaylistFormSheet({
       return;
     }
     setError(null);
-    onSubmit(result.values);
-  }, [mode, name, description, color, icon, isPublic, onSubmit, t]);
+    const { isPublic: legacyVisibility, ...formFields } = result.values;
+    onSubmit({
+      ...formFields,
+      ...(!privacy.enabled ? { isPublic: legacyVisibility } : {}),
+      ...(privacy.publication && !isEdit
+        ? { privacy: privacy.publication, isPublic: privacy.audience === 'public' }
+        : {}),
+    });
+  }, [
+    mode,
+    name,
+    description,
+    color,
+    icon,
+    isPublic,
+    onSubmit,
+    t,
+    privacy.publication,
+    privacy.audience,
+    privacy.enabled,
+    isEdit,
+  ]);
 
   // Local validation takes precedence over a parent submit failure: a fresh
   // validation message (e.g. empty name) is the more actionable feedback, and
@@ -126,13 +170,7 @@ export function PlaylistFormSheet({
   const visibleError = error ?? (submitErrorDismissed ? null : submitError) ?? null;
 
   const title = isEdit ? t('edit.title') : t('create.drawerTitle');
-  const submitLabel = isEdit
-    ? submitting
-      ? t('edit.actions.saving')
-      : t('edit.actions.save')
-    : submitting
-      ? t('create.submitting')
-      : t('create.submit');
+  const submitLabel = isEdit ? t('edit.actions.save') : t('create.submit');
 
   const inputStyle = useMemo(
     () => [
@@ -146,21 +184,45 @@ export function PlaylistFormSheet({
     [systemColors],
   );
 
-  const footer = (
-    <Button title={submitLabel} onPress={handleSubmit} loading={submitting} disabled={submitting} size="large" />
+  const header = (
+    <SheetTopBar
+      title={title}
+      leading={{ kind: 'cancel', onPress: guard.requestClose }}
+      trailing={{
+        kind: 'confirm',
+        label: submitLabel,
+        onPress: handleSubmit,
+        loading: submitting,
+        disabled: submitting,
+        prominent: true,
+      }}
+      error={visibleError}
+      reserveErrorSlot
+    />
   );
 
   return (
-    <ModalSheet visible={visible} snapPoints={['90%']} onClose={onClose} scrollable footer={footer}>
+    <ModalSheet
+      visible={visible}
+      snapPoints={['90%']}
+      onDisplaced={onClose}
+      onClose={guard.requestClose}
+      onRequestClose={guard.requestClose}
+      enablePanDownToClose={guard.enablePanDownToClose}
+      scrollable
+      header={header}
+    >
+      {isEdit && playlist ? (
+        <ContentAudienceControl entityType="playlist" entityId={playlist.uuid} />
+      ) : (
+        <PublicationAudiencePicker privacy={privacy} disabled={submitting} />
+      )}
       <View style={styles.body}>
         <View style={styles.header}>
           <PlaylistPreviewSquare color={color} icon={icon} size={56} />
-          <Text variant="title3" style={styles.title}>
-            {title}
-          </Text>
         </View>
 
-        <Text variant="footnote" style={styles.label}>
+        <Text emphasized variant="footnote" style={styles.label}>
           {isEdit ? t('edit.fields.name') : t('create.fields.name')}
         </Text>
         <BottomSheetTextInput
@@ -176,7 +238,7 @@ export function PlaylistFormSheet({
           returnKeyType="done"
         />
 
-        <Text variant="footnote" style={styles.label}>
+        <Text emphasized variant="footnote" style={styles.label}>
           {isEdit ? t('edit.fields.description') : t('create.fields.description')}
         </Text>
         <BottomSheetTextInput
@@ -192,14 +254,14 @@ export function PlaylistFormSheet({
           style={[inputStyle, styles.multiline]}
         />
 
-        <Text variant="footnote" style={styles.label}>
+        <Text emphasized variant="footnote" style={styles.label}>
           {isEdit ? t('edit.fields.color') : t('create.fields.color')}
         </Text>
         <View style={styles.swatchRow}>
           {PLAYLIST_COLORS.map((swatch) => {
             const selected = color === swatch;
             return (
-              <Pressable
+              <PressableSurface
                 key={swatch}
                 onPress={() => setColor(selected ? undefined : swatch)}
                 accessibilityRole="button"
@@ -218,14 +280,14 @@ export function PlaylistFormSheet({
                 ]}
               >
                 {selected ? <Icon name="check.small" size={18} color={iosSystemColors.white} /> : null}
-              </Pressable>
+              </PressableSurface>
             );
           })}
         </View>
 
         {/* Emoji icon — a free-entry slot (system keyboard → any emoji) with a
             row of quick-pick suggestions. Shown for create + edit. */}
-        <Text variant="footnote" style={styles.label}>
+        <Text emphasized variant="footnote" style={styles.label}>
           {t('edit.fields.icon')}
         </Text>
         <View style={styles.iconRow}>
@@ -252,15 +314,15 @@ export function PlaylistFormSheet({
             ]}
           />
           {icon ? (
-            <Pressable
+            <PressableSurface
               onPress={() => setIcon(undefined)}
               accessibilityRole="button"
               style={[styles.removeChip, { borderColor: systemColors.separator }]}
             >
-              <Text variant="footnote" color={iosSystemColors.systemRed}>
+              <Text variant="footnote" color={systemColors.error} style={styles.removeLabel}>
                 {t('edit.fields.removeIcon')}
               </Text>
-            </Pressable>
+            </PressableSurface>
           ) : null}
         </View>
         <Text variant="caption1" style={styles.iconHint}>
@@ -270,7 +332,7 @@ export function PlaylistFormSheet({
           {SUGGESTED_ICONS.map((preset) => {
             const selected = icon === preset;
             return (
-              <Pressable
+              <PressableSurface
                 key={preset}
                 onPress={() => setIcon(selected ? undefined : preset)}
                 accessibilityRole="button"
@@ -286,12 +348,12 @@ export function PlaylistFormSheet({
                 <Text style={styles.emoji} allowFontScaling={false}>
                   {preset}
                 </Text>
-              </Pressable>
+              </PressableSurface>
             );
           })}
         </View>
 
-        {isEdit ? (
+        {isEdit && !privacy.enabled ? (
           <View style={styles.switchWrap}>
             <SwitchRow
               label={t('edit.fields.visibility')}
@@ -301,111 +363,107 @@ export function PlaylistFormSheet({
             />
           </View>
         ) : null}
-
-        {visibleError ? (
-          <Text variant="footnote" color={iosSystemColors.systemRed} style={styles.error}>
-            {visibleError}
-          </Text>
-        ) : null}
       </View>
     </ModalSheet>
   );
 }
 
-const styles = StyleSheet.create({
-  body: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[2],
-    paddingBottom: spacing[4],
-    gap: spacing[2],
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[3],
-    marginBottom: spacing[2],
-  },
-  title: {
-    fontWeight: '700',
-    flex: 1,
-  },
-  label: {
-    fontWeight: '600',
-    opacity: 0.6,
-    marginTop: spacing[2],
-  },
-  input: {
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: 10,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    fontSize: 16,
-  },
-  multiline: {
-    minHeight: 80,
-    textAlignVertical: 'top',
-  },
-  swatchRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: spacing[3],
-    marginTop: spacing[1],
-  },
-  iconRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[3],
-    marginTop: spacing[1],
-  },
-  emojiInput: {
-    width: 56,
-    height: 56,
-    borderRadius: 12,
-    borderWidth: StyleSheet.hairlineWidth,
-    fontSize: 28,
-    paddingVertical: 0,
-  },
-  iconHint: {
-    opacity: 0.5,
-    marginTop: spacing[2],
-  },
-  swatch: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  swatchSelected: {
-    borderWidth: 3,
-    borderColor: iosSystemColors.white,
-  },
-  emojiChip: {
-    width: 40,
-    height: 40,
-    borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  emojiChipSelected: {
-    borderWidth: 2,
-  },
-  emoji: {
-    fontSize: 22,
-  },
-  removeChip: {
-    height: 40,
-    paddingHorizontal: spacing[3],
-    borderRadius: 10,
-    borderWidth: StyleSheet.hairlineWidth,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  switchWrap: {
-    marginTop: spacing[2],
-    marginHorizontal: -spacing[4],
-  },
-  error: {
-    marginTop: spacing[2],
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    body: {
+      paddingHorizontal: spacing[4],
+      paddingTop: spacing[2],
+      paddingBottom: spacing[4],
+      gap: spacing[2],
+    },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing[3],
+      marginBottom: spacing[2],
+    },
+    label: {
+      opacity: 0.6,
+      marginTop: spacing[2],
+    },
+    input: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: 10,
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      fontSize: textStyles.callout.fontSize,
+    },
+    multiline: {
+      minHeight: 80,
+      textAlignVertical: 'top',
+    },
+    swatchRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: spacing[3],
+      marginTop: spacing[1],
+    },
+    iconRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      gap: spacing[3],
+      marginTop: spacing[1],
+    },
+    emojiInput: {
+      minWidth: 56,
+      minHeight: 56,
+      maxWidth: '100%',
+      paddingHorizontal: spacing[2],
+      borderRadius: 12,
+      borderWidth: StyleSheet.hairlineWidth,
+      fontSize: textStyles.title1.fontSize,
+      paddingVertical: 0,
+    },
+    iconHint: {
+      opacity: 0.5,
+      marginTop: spacing[2],
+    },
+    swatch: {
+      width: 36,
+      height: 36,
+      borderRadius: 18,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    swatchSelected: {
+      borderWidth: 3,
+      borderColor: iosSystemColors.white,
+    },
+    emojiChip: {
+      width: 40,
+      height: 40,
+      borderRadius: 10,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    emojiChipSelected: {
+      borderWidth: 2,
+    },
+    emoji: {
+      fontSize: textStyles.title2.fontSize,
+    },
+    removeLabel: {
+      flexShrink: 1,
+      textAlign: 'center',
+    },
+    removeChip: {
+      minHeight: 40,
+      maxWidth: '100%',
+      paddingVertical: spacing[2],
+      paddingHorizontal: spacing[3],
+      borderRadius: 10,
+      borderWidth: StyleSheet.hairlineWidth,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    switchWrap: {
+      marginTop: spacing[2],
+      marginHorizontal: -spacing[4],
+    },
+  });

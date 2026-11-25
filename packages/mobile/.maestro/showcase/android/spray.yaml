@@ -1,0 +1,38 @@
+appId: com.boardsesh.app.dev
+name: showcase take - a spray wall (Android)
+---
+# Take: spray -> .boardsesh/showcase-video/work/android/footage/spray/
+#
+# The Android twin of ../spray.yaml; that file says what the take shows and why.
+#
+# Coordinates (1080x2424 emulator, 411x923 dp, portrait):
+#   85%,42% -> 18%,42%  a right-to-left drag across the board = next climb
+#
+# Marks (work/android/marks/spray.json): next-1, next-2.
+
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/flow-start')}
+
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 1200
+    optional: true
+
+- swipe:
+    start: '85%,42%'
+    end: '18%,42%'
+    duration: 400
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/next-1')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 1200
+    optional: true
+
+- swipe:
+    start: '85%,42%'
+    end: '18%,42%'
+    duration: 400
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/next-2')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 3000
+    optional: true

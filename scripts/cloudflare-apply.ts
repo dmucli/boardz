@@ -9,10 +9,8 @@
  * What it manages (and nothing else on the zone):
  *   - DNS: the `ws.boardsesh.com` record's proxied flag → true (orange cloud). The
  *     record's target/type/content are NOT managed — the record already exists.
- *     The `assets.boardsesh.com` record is fully managed and created when absent:
- *     CNAME → the Tigris bucket target, automatic TTL, DNS-only, with per-record
- *     CNAME flattening disabled. Zone-wide CNAME flattening fails closed because
- *     it would hide the literal answer Tigris verifies.
+ *     R2 owns the `assets.boardsesh.com` record through its bucket custom domain;
+ *     this tool must not recreate the retained Tigris rollback CNAME.
  *     `www.boardsesh.com` is proxy-only managed like `ws`, so the origin flip
  *     off Vercel is one edit to infra/cloudflare/config.ts (#4655). The apex
  *     `boardsesh.com` is fully managed as a PROXIED, originless A record to the
@@ -45,7 +43,7 @@
  *   CLOUDFLARE_ZONE_ID    (optional) Skip the name→id lookup. When unset, the zone id is
  *                         resolved by name "boardsesh.com" via the API (needs Zone.Zone Read).
  *
- * See docs/og-climb.md ("Cloudflare in front of ws.boardsesh.com").
+ * See docs/web/og-climb.md ("Cloudflare in front of ws.boardsesh.com").
  */
 
 import { pathToFileURL } from 'node:url';
@@ -55,14 +53,18 @@ import type {
   FullyManagedDnsRecordDesired,
   R2BucketDesired,
   R2Cors,
+  R2LifecycleRule,
   SslMode,
 } from '../infra/cloudflare/config';
 import {
   MANAGED_RULE_PHASES,
+  R2LifecyclePolicyBlockedError,
   buildPlan,
   diffR2Bucket,
   r2CorsHasUnmanagedRules,
   r2CorsMatches,
+  mergeR2LifecycleRule,
+  r2LifecycleRuleMatches,
   resolveRulePhase,
   upsertCacheRule,
 } from '../infra/cloudflare/plan';
@@ -76,10 +78,10 @@ const TOKEN_SCOPES = [
   'Zone.Zone Read             — resolve the zone id by name + read zone list',
   'Zone.DNS Edit              — manage DNS records + read zone CNAME-flattening settings',
   'Zone.Cache Rules Edit      — create/update the /og/ cache rule',
-  'Zone.WAF Edit              — create/update the two crawler rules',
-  'Zone.Rate Limit Edit       — create/update the climb-view rate-limit rule (http_ratelimit phase)',
-  'Zone.Dynamic Redirect Edit — create/update the apex → www redirect (http_request_dynamic_redirect phase)',
-  'Zone.Transform Rules Edit  — create/update the assets CORS response-header rule\n                               (http_response_headers_transform phase)',
+  'Zone.Zone WAF Edit         — create/update crawler rules and the climb-view rate-limit rule\n                               (http_request_firewall_custom and http_ratelimit phases)',
+  'Zone.Single Redirect Edit  — create/update the apex → www redirect (http_request_dynamic_redirect phase)',
+  'Zone.Transform Rules Edit  — create/update the Observe country request-header rule and assets CORS\n                               response-header rule (request/response transform phases)',
+  'Zone.Response Compression Edit — create/update the OTA assets compression rule (http_response_compression\n                               phase)',
   'Zone.Zone Settings Read    — read the SSL/TLS mode',
   'Zone.Zone Settings Edit    — ONLY needed with --allow-zone-ssl (to set the zone SSL mode)',
   'Account.Workers R2 Storage Edit — create R2 buckets + attach their custom domains (Read is not enough:\n                               it detects drift but cannot converge it). Needs CLOUDFLARE_ACCOUNT_ID too.',
@@ -90,7 +92,7 @@ const TOKEN_SCOPES = [
 // ALONE authenticates here and fails with `Authentication error [code: 10000]`
 // there — which reads as a bad credential, not a missing scope, since
 // `wrangler whoami` still succeeds. That regression took app.boardsesh.com off
-// the deploy train on 2026-08-25. See the token section of docs/cloudflare.md.
+// the deploy train on 2026-08-25. See the token section of docs/operations/cloudflare.md.
 const SHARED_TOKEN_SCOPES = ['Account.Cloudflare Pages Edit — wrangler pages deploy (deploy-app-web)'];
 
 export interface CliOptions {
@@ -208,18 +210,29 @@ async function resolveZoneId(token: string, zoneName: string): Promise<string> {
  */
 export const MANAGED_DNS_RECORD_TYPES = ['A', 'AAAA', 'CNAME'] as const;
 
-/** Pick the one address record at `name`, or null. Throws when the name carries more than one. */
-export function selectManagedDnsRecord(records: LiveDnsRecord[], name: string): LiveDnsRecord | null {
-  const addressRecords = records.filter(
-    (candidate) => candidate.name === name && (MANAGED_DNS_RECORD_TYPES as readonly string[]).includes(candidate.type),
-  );
-  if (addressRecords.length > 1) {
+/**
+ * Pick the one record at `name` this tool would own, or null. Throws when the
+ * name carries more than one candidate.
+ *
+ * A desired TXT record (a Railway `_railway-verify.<host>` ownership proof)
+ * matches TXT records only; everything else matches the address types. The two
+ * never mix, so the SPF and verification TXT records beside an address record
+ * stay invisible to it.
+ */
+export function selectManagedDnsRecord(
+  records: LiveDnsRecord[],
+  name: string,
+  desiredType?: FullyManagedDnsRecordDesired['type'],
+): LiveDnsRecord | null {
+  const candidateTypes: readonly string[] = desiredType === 'TXT' ? ['TXT'] : MANAGED_DNS_RECORD_TYPES;
+  const candidates = records.filter((candidate) => candidate.name === name && candidateTypes.includes(candidate.type));
+  if (candidates.length > 1) {
     throw new Error(
-      `DNS name "${name}" is ambiguous: Cloudflare returned ${addressRecords.length} address records ` +
-        `(${addressRecords.map((record) => record.type).join(', ')}). Resolve it in the Cloudflare dashboard first.`,
+      `DNS name "${name}" is ambiguous: Cloudflare returned ${candidates.length} ${desiredType === 'TXT' ? 'TXT' : 'address'} records ` +
+        `(${candidates.map((record) => record.type).join(', ')}). Resolve it in the Cloudflare dashboard first.`,
     );
   }
-  return addressRecords[0] ?? null;
+  return candidates[0] ?? null;
 }
 
 /** One entry from `GET /accounts/:id/r2/buckets`. */
@@ -317,10 +330,11 @@ async function fetchR2State(
       continue;
     }
     const bucketPath = `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucket.name)}`;
-    const [domains, managedDomain, corsState] = await Promise.all([
+    const [domains, managedDomain, corsState, lifecycleRules] = await Promise.all([
       cfRequest<R2CustomDomainListing>(token, 'GET', `${bucketPath}/domains/custom`),
       cfRequest<R2ManagedDomain>(token, 'GET', `${bucketPath}/domains/managed`),
       bucket.cors ? fetchR2Cors(token, accountId, bucket.name) : Promise.resolve(null),
+      bucket.lifecycleRule ? fetchR2LifecycleRules(token, accountId, bucket.name) : Promise.resolve(null),
     ]);
     state.set(bucket.name, {
       name: bucket.name,
@@ -331,6 +345,7 @@ async function fetchR2State(
       })),
       r2DevDomainEnabled: managedDomain.enabled,
       ...(corsState ? { cors: corsState.cors, corsRuleCount: corsState.ruleCount } : { cors: null }),
+      lifecycleRules,
     });
   }
   return state;
@@ -389,13 +404,97 @@ async function putR2Cors(token: string, accountId: string, bucketName: string, c
   console.log(`[cf-apply] set CORS on R2 bucket ${bucketName}`);
 }
 
+async function fetchR2LifecycleRules(
+  token: string,
+  accountId: string,
+  bucketName: string,
+): Promise<R2LifecycleRule[] | null> {
+  try {
+    const response = await cfRequest<{ rules?: unknown }>(
+      token,
+      'GET',
+      `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}/lifecycle`,
+    );
+    // Cloudflare's lifecycle GET schema makes `rules` optional. An omitted list
+    // is an empty policy; explicit null or malformed rules are still unreadable.
+    if (response.rules === undefined) return [];
+    if (!Array.isArray(response.rules)) {
+      console.warn(`[cf-apply] R2 lifecycle GET for ${bucketName} returned a non-array rules value`);
+      return null;
+    }
+    const rules: R2LifecycleRule[] = [];
+    for (const [index, rawRule] of response.rules.entries()) {
+      const rule = normalizeR2LifecycleRule(rawRule);
+      if (!rule) {
+        const fields = typeof rawRule === 'object' && rawRule !== null ? rawRule : null;
+        const conditions = fields && 'conditions' in fields ? fields.conditions : undefined;
+        const prefix =
+          typeof conditions === 'object' && conditions !== null && 'prefix' in conditions
+            ? conditions.prefix
+            : undefined;
+        console.warn(
+          `[cf-apply] R2 lifecycle GET for ${bucketName} returned malformed rule #${index}` +
+            ` (id: ${typeof (fields && 'id' in fields ? fields.id : undefined)},` +
+            ` enabled: ${typeof (fields && 'enabled' in fields ? fields.enabled : undefined)},` +
+            ` prefix: ${typeof prefix})`,
+        );
+        return null;
+      }
+      rules.push(rule);
+    }
+    return rules;
+  } catch (error) {
+    if (isNotFoundError(error)) return [];
+    if (isAuthorizationError(error)) {
+      console.warn(`[cf-apply] R2 lifecycle GET for ${bucketName} was denied by Cloudflare`);
+      return null;
+    }
+    throw error;
+  }
+}
+
+/** Older bucket-wide rules can omit the prefix; Cloudflare treats that as all keys. */
+function normalizeR2LifecycleRule(rule: unknown): R2LifecycleRule | null {
+  if (typeof rule !== 'object' || rule === null) return null;
+  if (!('id' in rule) || typeof rule.id !== 'string' || !rule.id) return null;
+  if (!('enabled' in rule) || typeof rule.enabled !== 'boolean') return null;
+
+  const rawConditions = 'conditions' in rule ? rule.conditions : undefined;
+  if (rawConditions !== undefined && (typeof rawConditions !== 'object' || rawConditions === null)) return null;
+  const conditions = rawConditions ?? {};
+  const prefix = 'prefix' in conditions ? conditions.prefix : '';
+  if (typeof prefix !== 'string') return null;
+
+  return { ...rule, id: rule.id, enabled: rule.enabled, conditions: { ...conditions, prefix } };
+}
+
+/** Re-read before a whole-policy PUT so unrelated rules added since planning survive. */
+export async function applyR2LifecycleRule(
+  token: string,
+  accountId: string,
+  bucketName: string,
+  desired: R2LifecycleRule,
+): Promise<void> {
+  const existing = await fetchR2LifecycleRules(token, accountId, bucketName);
+  if (!existing) {
+    throw new R2LifecyclePolicyBlockedError(`Cannot read lifecycle rules on ${bucketName}; refusing to replace them`);
+  }
+  const merged = mergeR2LifecycleRule(existing, desired);
+  if (r2LifecycleRuleMatches(existing, desired)) return;
+  await cfRequest(token, 'PUT', `/accounts/${accountId}/r2/buckets/${encodeURIComponent(bucketName)}/lifecycle`, {
+    rules: merged,
+  });
+  console.log(`[cf-apply] set lifecycle rule ${desired.id} on R2 bucket ${bucketName}`);
+}
+
+/** Returns whether lifecycle work remains blocked after converging the other attributes. */
 async function applyR2Bucket(
   token: string,
   accountId: string,
   zoneId: string,
   desired: R2BucketDesired,
   live: LiveR2Bucket | null,
-): Promise<void> {
+): Promise<boolean> {
   if (!live || !live.exists) {
     await cfRequest(token, 'POST', `/accounts/${accountId}/r2/buckets`, {
       name: desired.name,
@@ -403,10 +502,27 @@ async function applyR2Bucket(
     });
     console.log(`[cf-apply] created R2 bucket ${desired.name}`);
     // The domain needs the bucket to exist first; the next run attaches it.
-    return;
+    return false;
   }
 
   const bucketPath = `/accounts/${accountId}/r2/buckets/${encodeURIComponent(desired.name)}`;
+  let lifecycleBlocked = false;
+
+  if (desired.lifecycleRule) {
+    // This path can also be entered for an unrelated domain change; enforce the
+    // lifecycle read/ownership guard here as well as in the dry-run diff.
+    try {
+      if (!live.lifecycleRules) {
+        throw new R2LifecyclePolicyBlockedError('Existing policy could not be read');
+      }
+      mergeR2LifecycleRule(live.lifecycleRules, desired.lifecycleRule);
+      await applyR2LifecycleRule(token, accountId, desired.name, desired.lifecycleRule);
+    } catch (error) {
+      if (!(error instanceof R2LifecyclePolicyBlockedError)) throw error;
+      lifecycleBlocked = true;
+      console.warn(`[cf-apply] SKIPPED lifecycle on ${desired.name}: ${error.message}`);
+    }
+  }
 
   if (!desired.r2DevDomainEnabled && live.r2DevDomainEnabled) {
     await cfRequest(token, 'PUT', `${bucketPath}/domains/managed`, { enabled: false });
@@ -439,21 +555,27 @@ async function applyR2Bucket(
       `[cf-apply] SKIPPED CORS on ${desired.name}: bucket has ${live.corsRuleCount} rules and this tool ` +
         'writes a single-rule policy. Reconcile them in the Cloudflare dashboard first.',
     );
-    return;
+    return lifecycleBlocked;
   }
 
   if (desired.cors && !r2CorsMatches(live.cors, desired.cors)) {
     await putR2Cors(token, accountId, desired.name, desired.cors);
   }
+  return lifecycleBlocked;
 }
 
-async function fetchDnsRecord(token: string, zoneId: string, name: string): Promise<LiveDnsRecord | null> {
+async function fetchDnsRecord(
+  token: string,
+  zoneId: string,
+  name: string,
+  desiredType?: FullyManagedDnsRecordDesired['type'],
+): Promise<LiveDnsRecord | null> {
   const records = await cfRequest<LiveDnsRecord[]>(
     token,
     'GET',
     `/zones/${zoneId}/dns_records?name=${encodeURIComponent(name)}`,
   );
-  return selectManagedDnsRecord(records, name);
+  return selectManagedDnsRecord(records, name, desiredType);
 }
 
 /** A phase's entrypoint ruleset. Returns an empty rule set when the phase has no ruleset yet (404). */
@@ -504,7 +626,16 @@ async function fetchLiveState(
   const [fetchedDnsRecords, phaseRules, sslMode, flattenAllCnames] = await Promise.all([
     Promise.all(
       desiredDnsRecords.map(
-        async (desiredRecord) => [desiredRecord, await fetchDnsRecord(token, zoneId, desiredRecord.name)] as const,
+        async (desiredRecord) =>
+          [
+            desiredRecord,
+            await fetchDnsRecord(
+              token,
+              zoneId,
+              desiredRecord.name,
+              desiredRecord.management === 'full' ? desiredRecord.type : undefined,
+            ),
+          ] as const,
       ),
     ),
     // One read per registered phase: adding a phase to the registry cannot leave
@@ -551,7 +682,8 @@ export function fullyManagedDnsBody(desired: FullyManagedDnsRecordDesired): Reco
   return {
     type: desired.type,
     name: desired.name,
-    content: desired.content,
+    // Cloudflare stores TXT content inside double quotes and warns on a bare value.
+    content: desired.type === 'TXT' ? `"${desired.content}"` : desired.content,
     ttl: desired.ttl,
     proxied: desired.proxied,
     // Left out entirely when we do not own it. `settings: undefined` would
@@ -688,6 +820,7 @@ export async function runCloudflareApply(argv: string[] = process.argv.slice(2))
   // leaves the zone partially converged. Safe because the plan is ordered
   // (SSL -> cache rule -> proxied flip last) and re-running converges the rest.
   const appliedPhases = new Set<string>();
+  const refusedPhases = new Set<string>();
   // Each bucket is fully converged on its first planned attribute.
   const appliedR2Buckets = new Set<string>();
   for (const change of changes) {
@@ -705,7 +838,12 @@ export async function runCloudflareApply(argv: string[] = process.argv.slice(2))
         console.log(`[cf-apply] skipped: ${change.summary} (${bucket.name} already converged)`);
         continue;
       }
-      await applyR2Bucket(token, accountId, zoneId, bucket, r2State.get(bucket.name) ?? null);
+      const lifecycleBlocked = await applyR2Bucket(token, accountId, zoneId, bucket, r2State.get(bucket.name) ?? null);
+      // A fresh lifecycle read may discover a block that did not exist in the
+      // plan. Keep the nonzero result without counting an existing block twice.
+      if (lifecycleBlocked && !changes.some((planned) => planned.blocked && planned.r2BucketName === bucket.name)) {
+        blockedRemaining += 1;
+      }
       appliedR2Buckets.add(bucket.name);
       console.log(`[cf-apply] applied: ${change.summary}`);
       continue;
@@ -728,10 +866,32 @@ export async function runCloudflareApply(argv: string[] = process.argv.slice(2))
       // resource throws here instead of falling out of the chain and reporting
       // "applied" for a write that never happened.
       const phase = resolveRulePhase(change.resource);
-      if (!appliedPhases.has(phase.phase)) {
+      if (!appliedPhases.has(phase.phase) && !refusedPhases.has(phase.phase)) {
         const { rules } = upsertCacheRule(phase.selectLive(live), [...phase.selectDesired(desired)]);
-        await applyPhaseRules(token, zoneId, phase.phase, rules);
-        appliedPhases.add(phase.phase);
+        try {
+          await applyPhaseRules(token, zoneId, phase.phase, rules);
+          appliedPhases.add(phase.phase);
+        } catch (error) {
+          // The write half of the `optional` concession. A token can read a
+          // phase it may not write, and a phase that has never existed on the
+          // zone can be refused for plan or validation reasons no dry run
+          // shows. Rules are applied before DNS and R2, so letting this throw
+          // would leave those unconverged and fail the production deploy over
+          // a rule nothing depends on yet. Phases that are not optional still
+          // throw.
+          const refused = error instanceof CloudflareApiRequestError && error.status >= 400 && error.status < 500;
+          if (!phase.optional || !refused) throw error;
+          refusedPhases.add(phase.phase);
+          console.warn(
+            `[cf-apply] Cloudflare refused the write to the ${phase.phase} phase (HTTP ${error.status}: ` +
+              `${error.message}). Skipping ${phase.resource}; everything else was still applied. Grant the ` +
+              'matching scope (keeping every existing one: editing a token REPLACES all its policies) and re-run.',
+          );
+        }
+      }
+      if (refusedPhases.has(phase.phase)) {
+        console.log(`[cf-apply] skipped (write refused): ${change.summary}`);
+        continue;
       }
       console.log(`[cf-apply] applied: ${change.summary}`);
     }

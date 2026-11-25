@@ -32,6 +32,7 @@ import {
   rewindDeletionsCheckpoint,
   SCOPE_COMPLETE_PREFIX,
   setCheckpoint,
+  snapshotSupplementCheckpoint,
   type SyncCheckpoint,
 } from './checkpoints';
 import { capturePurgeToken, hasPurgeLanded, isSigningOut } from '../mutation-queue/drainer';
@@ -168,8 +169,13 @@ export type SnapshotDownloadProgress = {
   totalBytes: number | null;
 };
 
+/** Random request identity captured before a sync cycle joins its FIFO queue. */
+export type DownloadRequestCorrelation = { requestId: string; batchId: string };
+
 /** Per-download seams the engine may pass; every one is optional for a source. */
 export type SnapshotDownloadOptions = {
+  /** First requesting scope owns a physical transfer shared by several sizes. */
+  downloadRequest?: DownloadRequestCorrelation;
   onProgress?: (progress: SnapshotDownloadProgress) => void;
   /**
    * Aborted when the cycle is torn down mid-transfer (sign-out, local purge, or
@@ -246,7 +252,10 @@ export interface SnapshotSource {
    * manifest and a new manifest against an old engine therefore both behave
    * exactly as before.
    */
-  downloadGradesArtifact?(artifact: SnapshotGradesArtifact): Promise<{ filePath: string } | null>;
+  downloadGradesArtifact?(
+    artifact: SnapshotGradesArtifact,
+    options?: SnapshotDownloadOptions,
+  ): Promise<{ filePath: string } | null>;
   /** Delete a downloaded artifact once the run is done with it. Best-effort. */
   deleteArtifact(filePath: string): Promise<void>;
   /**
@@ -265,7 +274,11 @@ export interface SnapshotSource {
 
 /** Where a bootstrap failed, for telemetry. */
 export type SnapshotBootstrapErrorReport = {
+  downloadContext?: import('./download-lifecycle').ScopeDownloadContext;
   scopeKey: string;
+  downloadRequest?: DownloadRequestCorrelation;
+  /** Artifact bytes arrived before this failure; absent for non-transfer failures. */
+  transferCompleted?: boolean;
   /**
    * How far the attempt got. `board-removed` and `abandoned` are the two values
    * no bootstrap stage produces.
@@ -326,6 +339,8 @@ export type SnapshotBootstrapErrorReporter = (report: SnapshotBootstrapErrorRepo
 export type SnapshotBootstrapResult = {
   climbsWatermark: SyncCheckpoint;
   statsWatermark: SyncCheckpoint;
+  /** Verified transaction identity used to pair a layout with its grades artifact. */
+  artifactBuiltAt?: string;
   /**
    * Rows this scope actually imported out of the layout artifact (issue #4316).
    * Both are INSERT OR REPLACE `changes` counts, so a re-import of the same
@@ -442,8 +457,8 @@ export class SnapshotArtifactTruncatedError extends Error {
 
 /**
  * The iOS background URLSession was interrupted while decoding a response body.
- * Expo surfaces NSURLErrorCannotDecodeRawData as English prose without a stable
- * code, so the mobile adapter converts that one platform-shaped error into this
+ * Expo surfaces NSURLErrorCannotDecodeRawData as localized prose without a stable
+ * code, so the mobile adapter converts the known platform signatures into this
  * renderer-independent signal. It belongs on the bounded transport retry
  * ladder, not the structural artifact/device budget.
  */
@@ -1318,6 +1333,10 @@ export async function bootstrapScopeFromSnapshot(params: {
   scope: OfflineBoardScope;
   scopeKey: string;
   filePath: string;
+  /** Privacy-safe artifacts omit authored rows; replay authorized rows from epoch. */
+  replayFromEpoch?: boolean;
+  /** Known signed-in viewer enables the one-time supplement instead of a full replay. */
+  snapshotSupplementViewerId?: string;
   onSchemaDrift?: SchemaDriftReporter;
   /**
    * The scope's CURRENT board-table checkpoints, when it already has any (the
@@ -1369,6 +1388,7 @@ export async function bootstrapScopeFromSnapshot(params: {
   const purgeKey = purgeNamespaceKey(scope);
 
   let watermarks: Record<SnapshotTableName, SyncCheckpoint> | null = null;
+  let artifactBuiltAt: string | undefined;
   let columns: Record<SnapshotTableName, string[]>;
   let deletionsReplayFrom: SyncCheckpoint | null = null;
   let imported = { climbsImported: 0, statsImported: 0, batches: 0 };
@@ -1402,6 +1422,7 @@ export async function bootstrapScopeFromSnapshot(params: {
         }
 
         const snapshotMeta = await verifySnapshotMeta(txn);
+        artifactBuiltAt = snapshotMeta.builtAt;
         columns = {
           board_climbs: await sharedColumns(txn, 'board_climbs', onSchemaDrift, snapshotMeta.schemaVersion),
           board_climb_stats: await sharedColumns(txn, 'board_climb_stats', onSchemaDrift, snapshotMeta.schemaVersion),
@@ -1445,7 +1466,22 @@ export async function bootstrapScopeFromSnapshot(params: {
       // the caller dispatches on (SnapshotSchemaStaleError vs SnapshotWipedError
       // vs a counted failure). The `.catch` covers the already-open case.
       try {
-        const stampedWatermarks: Record<SnapshotTableName, SyncCheckpoint> = watermarks;
+        const stampedWatermarks: Record<SnapshotTableName, SyncCheckpoint> = params.replayFromEpoch
+          ? params.snapshotSupplementViewerId
+            ? {
+                board_climbs: snapshotSupplementCheckpoint(
+                  watermarks.board_climbs,
+                  watermarks.board_climbs,
+                  params.snapshotSupplementViewerId,
+                ),
+                board_climb_stats: snapshotSupplementCheckpoint(
+                  watermarks.board_climb_stats,
+                  watermarks.board_climbs,
+                  params.snapshotSupplementViewerId,
+                ),
+              }
+            : { board_climbs: EPOCH_WATERMARK, board_climb_stats: EPOCH_WATERMARK }
+          : watermarks;
 
         /** One short exclusive transaction: take the lock, re-check, write, let go. */
         const runExclusive = async (body: () => Promise<void>): Promise<void> => {
@@ -1560,6 +1596,7 @@ export async function bootstrapScopeFromSnapshot(params: {
   return {
     climbsWatermark: finalWatermarks.board_climbs,
     statsWatermark: finalWatermarks.board_climb_stats,
+    artifactBuiltAt,
     climbsImported: imported.climbsImported,
     statsImported: imported.statsImported,
     importBatches: imported.batches,
@@ -1613,15 +1650,12 @@ function gradesScopeFilter(
  * Warm one scope's `board_climb_grades` rows from the layout's separate grades
  * artifact, and stamp the grades resume checkpoint at the imported rows'
  * watermark — replacing hundreds of serial authenticated GraphQL pages with one
- * file and one transaction.
+ * file and bounded import transactions.
  *
- * DELIBERATELY ITS OWN EXCLUSIVE TRANSACTION, not merged into
- * `bootstrapScopeFromSnapshot`'s. Merging would close a crash window but
- * lengthen a single `BEGIN EXCLUSIVE` hold on a database the app is also
- * reading (issue #4314). Splitting keeps each hold short, and the worst case is
- * exactly today's behaviour: if this fails, or the app dies between the two
- * transactions, no grades checkpoint is stamped and the scope crawls grades as
- * it always did. No data is at risk either way, so the shorter lock wins.
+ * Grades commit in their own bounded batches after the layout import. A
+ * single `BEGIN EXCLUSIVE` would block a database the app is also reading
+ * (issue #4314). The checkpoint commits last: if a batch fails or the app
+ * dies, the next attempt safely replays those rows or crawls their delta.
  *
  * No reconcile: `board_climb_grades` has no delete trigger at all (see
  * deletions-coverage.ts), so there is no tombstone stream to reconcile against
@@ -1637,7 +1671,13 @@ export async function bootstrapScopeGradesFromSnapshot(params: {
   scope: OfflineBoardScope;
   scopeKey: string;
   filePath: string;
+  /** Privacy-safe artifacts omit authored rows; replay authorized rows from epoch. */
+  replayFromEpoch?: boolean;
+  /** Only a verified layout imported from this same export proves the grades' climb coverage. */
+  snapshotSupplement?: { viewerUserId: string; climbWatermark: SyncCheckpoint; artifactBuiltAt: string };
   onSchemaDrift?: SchemaDriftReporter;
+  batchRows?: number;
+  onBatch?: (progress: SnapshotImportBatchProgress) => void;
   /** Sleep seam for the lost-lock ladder. Defaults to a real setTimeout. */
   sleep?: (ms: number) => Promise<void>;
 }): Promise<{
@@ -1647,16 +1687,25 @@ export async function bootstrapScopeGradesFromSnapshot(params: {
    * ATTACH + quick_check + meta verify, all in AUTOCOMMIT holding nothing, and
    * the exclusive hold that follows it — split for the same reason the
    * whole-layout import splits `importVerifyMs` from `importLockMaxMs` (issue
-   * #4310). This transaction is still UNBATCHED: one `INSERT OR REPLACE ...
-   * SELECT` over the layout's grades with a correlated EXISTS and a per-row
-   * `json_each`, plus a second descending scan for the watermark. Its docblock
-   * asserts the hold is short; `gradesLockMs` is what turns that into a
-   * measurement, and batching it is a follow-up only if the number says so.
+   * #4310). `gradesLockMs` is the longest bounded batch hold, COMMIT included.
+   * Scoped watermark selection runs in autocommit before any batch.
    */
   gradesVerifyMs: number;
   gradesLockMs: number;
 }> {
-  const { db, scope, scopeKey, filePath, onSchemaDrift, sleep = defaultImportSleep } = params;
+  const {
+    db,
+    scope,
+    scopeKey,
+    filePath,
+    onSchemaDrift,
+    sleep = defaultImportSleep,
+    batchRows = SNAPSHOT_IMPORT_BATCH_ROWS,
+    onBatch,
+  } = params;
+  if (!Number.isSafeInteger(batchRows) || batchRows < 1)
+    throw new Error('snapshot grades bootstrap: invalid batch size');
+  const importFilter = gradesScopeFilter(scope, 'g', 'main');
   // Same scoping argument as bootstrapScopeFromSnapshot: the INSERT is filtered
   // through gradesScopeFilter(scope) and the only checkpoint stamped is this
   // scope's grades cursor.
@@ -1664,6 +1713,7 @@ export async function bootstrapScopeGradesFromSnapshot(params: {
   const purgeKey = purgeNamespaceKey(scope);
 
   let watermark: SyncCheckpoint | null = null;
+  let canSupplement = false;
   let rowsImported = 0;
   let gradesVerifyMs = 0;
   let gradesLockMs = 0;
@@ -1686,49 +1736,13 @@ export async function bootstrapScopeGradesFromSnapshot(params: {
         // whole-layout SNAPSHOT_TABLES is untouched, which is what keeps this
         // change invisible to every pre-change artifact still on the CDN.
         const snapshotMeta = await verifySnapshotMeta(txn, GRADES_ALIAS, GRADES_SNAPSHOT_TABLES);
+        canSupplement = params.snapshotSupplement?.artifactBuiltAt === snapshotMeta.builtAt;
         gradeColumns = await sharedColumns(txn, GRADES_TABLE, onSchemaDrift, snapshotMeta.schemaVersion, GRADES_ALIAS);
 
         if (isSigningOut() || hasPurgeLanded(startToken, purgeKey)) throw new SnapshotWipedError();
 
         await applyBusyTimeout(txn);
-        // Deliberately NOT applyBulkImportPragmas: that exists to stop ~142 batch
-        // commits each paying an fsync, and this is ONE transaction, so a single
-        // durable commit is the cheaper end of the trade. If `gradesLockMs` says
-        // this needs batching too, the pragma comes with it.
-        gradesVerifyMs = Date.now() - verifyStartedAt;
-        await beginExclusiveWithRetry(txn, sleep);
-      } catch (preTransactionError) {
-        await txn.execAsync('BEGIN').catch(() => {});
-        throw preTransactionError;
-      }
-
-      // Same restore-BEGIN discipline as bootstrapScopeFromSnapshot's row loop,
-      // and needed for the same reason: this function now COMMITs its own
-      // transaction (so `gradesLockMs` covers the COMMIT) and hands the wrapper a
-      // fresh empty one. That opens a window the pre-#4310 shape did not have —
-      // a throw from the trailing `BEGIN` would meet expo's unconditional
-      // ROLLBACK with no transaction active, and "cannot rollback - no
-      // transaction is active" would MASK the real error the caller dispatches
-      // on (SnapshotWipedError vs a counted grades failure). The `.catch` covers
-      // the case where the throw happened while the exclusive transaction was
-      // still open.
-      try {
-        const lockHeldFrom = Date.now();
-        assertSafeColumns(gradeColumns);
-        if (gradeColumns.length === 0)
-          throw new Error('snapshot grades bootstrap: no shared board_climb_grades columns');
-        const columnList = gradeColumns.join(', ');
-
-        const importFilter = gradesScopeFilter(scope, 'g', 'main');
-        const inserted = await txn.runAsync(
-          `INSERT OR REPLACE INTO main.${GRADES_TABLE} (${columnList})
-         SELECT ${columnList} FROM ${GRADES_ALIAS}.${GRADES_TABLE} g
-         WHERE ${importFilter.sql}`,
-          importFilter.params,
-        );
-        rowsImported = inserted.changes;
-
-        // Stamp at the watermark of the rows the INSERT above actually selected:
+        // Select the watermark of the rows the batches below will import:
         // the ARTIFACT's rows, under the same scope filter (mirroring
         // scopedWatermarks' artifact-side reads for climbs/stats). Two wrong
         // alternatives, both a permanent silent gap because the strict `>` delta
@@ -1753,14 +1767,87 @@ export async function bootstrapScopeGradesFromSnapshot(params: {
           ? { updatedAt: String(watermarkRow.cursor_at), syncSeq: String(watermarkRow.sync_seq) }
           : EPOCH_WATERMARK;
 
+        await applyBulkImportPragmas(txn);
+        gradesVerifyMs = Date.now() - verifyStartedAt;
+      } catch (preTransactionError) {
+        await txn.execAsync('BEGIN').catch(() => {});
+        throw preTransactionError;
+      }
+
+      // Same restore-BEGIN discipline as bootstrapScopeFromSnapshot's row loop,
+      // and needed for the same reason: this function now COMMITs its own
+      // transaction (so `gradesLockMs` covers the COMMIT) and hands the wrapper a
+      // fresh empty one. That opens a window the pre-#4310 shape did not have —
+      // a throw from the trailing `BEGIN` would meet expo's unconditional
+      // ROLLBACK with no transaction active, and "cannot rollback - no
+      // transaction is active" would MASK the real error the caller dispatches
+      // on (SnapshotWipedError vs a counted grades failure). The `.catch` covers
+      // the case where the throw happened while the exclusive transaction was
+      // still open.
+      try {
+        const runExclusive = async (write: () => Promise<void>): Promise<void> => {
+          await beginExclusiveWithRetry(txn, sleep);
+          const heldFrom = Date.now();
+          try {
+            if (isSigningOut() || hasPurgeLanded(startToken, purgeKey)) throw new SnapshotWipedError();
+            await write();
+            await txn.execAsync('COMMIT');
+          } finally {
+            gradesLockMs = Math.max(gradesLockMs, Date.now() - heldFrom);
+          }
+        };
+        assertSafeColumns(gradeColumns);
+        if (gradeColumns.length === 0)
+          throw new Error('snapshot grades bootstrap: no shared board_climb_grades columns');
+        const columnList = gradeColumns.join(', ');
+
+        let cursor: StatsKey = STATS_KEYSET_START;
+        let batches = 0;
+        for (;;) {
+          const keyset = `${importFilter.sql} AND (g.climb_uuid, g.angle) > (?, ?)`;
+          const keysetParams = [...importFilter.params, cursor.climb_uuid, cursor.angle];
+          const probe = `SELECT g.climb_uuid, g.angle FROM ${GRADES_ALIAS}.${GRADES_TABLE} g
+            WHERE ${keyset} ORDER BY g.climb_uuid, g.angle LIMIT 1 OFFSET ?`;
+          const remaining = await txn.getFirstAsync<StatsKey>(probe, [...keysetParams, 0]);
+          if (!remaining) break;
+          const boundary = await txn.getFirstAsync<StatsKey>(probe, [...keysetParams, batchRows - 1]);
+          await runExclusive(async () => {
+            const inserted = await txn.runAsync(
+              `INSERT OR REPLACE INTO main.${GRADES_TABLE} (${columnList})
+               SELECT ${gradeColumns.map((column) => `g.${column}`).join(', ')}
+               FROM ${GRADES_ALIAS}.${GRADES_TABLE} g
+               WHERE ${keyset}${boundary ? ' AND (g.climb_uuid, g.angle) <= (?, ?)' : ''}`,
+              [...keysetParams, ...(boundary ? [boundary.climb_uuid, boundary.angle] : [])],
+            );
+            rowsImported += inserted.changes;
+          });
+          batches += 1;
+          try {
+            onBatch?.({ rowsImported, batches });
+          } catch {
+            /* Progress never fails an import. */
+          }
+          if (!boundary) break;
+          cursor = boundary;
+        }
+
         if (isSigningOut() || hasPurgeLanded(startToken, purgeKey)) throw new SnapshotWipedError();
 
-        await setCheckpoint(txn, getCheckpointKey(GRADES_TABLE, scopeKey), watermark);
-        await markSchemaRefreshComplete(txn, GRADES_TABLE, scopeKey, watermark);
-        // COMMIT here rather than leaving it for the wrapper, so gradesLockMs
-        // covers the whole hold, then hand the wrapper an empty transaction.
-        await txn.execAsync('COMMIT');
-        gradesLockMs = Date.now() - lockHeldFrom;
+        // Stamp only after every batch committed. A partial import safely replays.
+        await runExclusive(async () => {
+          if (!watermark) throw new Error('snapshot grades bootstrap: missing watermark');
+          const checkpoint = params.replayFromEpoch
+            ? canSupplement && params.snapshotSupplement
+              ? snapshotSupplementCheckpoint(
+                  watermark,
+                  params.snapshotSupplement.climbWatermark,
+                  params.snapshotSupplement.viewerUserId,
+                )
+              : EPOCH_WATERMARK
+            : watermark;
+          await setCheckpoint(txn, getCheckpointKey(GRADES_TABLE, scopeKey), checkpoint);
+          await markSchemaRefreshComplete(txn, GRADES_TABLE, scopeKey, checkpoint);
+        });
         await txn.execAsync('BEGIN');
       } catch (gradesImportError) {
         await txn.execAsync('BEGIN').catch(() => {});
@@ -1772,5 +1859,10 @@ export async function bootstrapScopeGradesFromSnapshot(params: {
   }
 
   if (!watermark) throw new Error('snapshot grades bootstrap: transaction completed without a watermark');
-  return { gradesWatermark: watermark, rowsImported, gradesVerifyMs, gradesLockMs };
+  return {
+    gradesWatermark: params.replayFromEpoch && !canSupplement ? EPOCH_WATERMARK : watermark,
+    rowsImported,
+    gradesVerifyMs,
+    gradesLockMs,
+  };
 }

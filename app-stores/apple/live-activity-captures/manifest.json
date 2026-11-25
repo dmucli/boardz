@@ -1,0 +1,535 @@
+{
+  "version": 1,
+  "fixtures": {
+    "kilter/en-US": {
+      "file": "kilter-en-US-notification-center.png",
+      "sha256": "f2c87d0d4d3d885b548ea8e67b8d545d83543eebc4dc52c3bfd4e590bcc1b2a5",
+      "sourcePngSha256": "f2c87d0d4d3d885b548ea8e67b8d545d83543eebc4dc52c3bfd4e590bcc1b2a5",
+      "boardFamily": "kilter",
+      "appLocale": "en-US",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "Development2.7.0(7)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-30T09:02:10.541360+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth, dimmed by existing Personal Focus",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1740,
+          "width": 1110,
+          "height": 409
+        }
+      },
+      "content": {
+        "climbName": "Lightest Pair of Shorts",
+        "grade": "V4",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "kilter",
+        "description": "Waveshare ESP32-S3 AMOLED gym fixture advertising a dedicated Kilter BLE identity; native Next received the changed LED payload",
+        "physicalWallLightingVerified": false
+      },
+      "review": {
+        "reviewedAt": "2026-10-30T09:48:11.472452+00:00",
+        "reviewedBy": "Codex independent visual review; capture operator source observations",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    },
+    "kilter/es": {
+      "file": "kilter-es-notification-center.png",
+      "sha256": "c7b727d98ee23d09476b38985e6d081e1b38581758693183f51f61080680da5c",
+      "sourcePngSha256": "c7b727d98ee23d09476b38985e6d081e1b38581758693183f51f61080680da5c",
+      "boardFamily": "kilter",
+      "appLocale": "es",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "TestFlight2.6.0(18)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-15T00:24:54.238574+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1668,
+          "width": 1110,
+          "height": 480
+        }
+      },
+      "content": {
+        "climbName": "Lightest Pair of Shorts",
+        "grade": "6b/V4",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "kilter",
+        "description": "Waveshare ESP32-S3 AMOLED development controller presenting as Kilter; native Next received the changed LED payload",
+        "physicalWallLightingVerified": false
+      },
+      "review": {
+        "reviewedAt": "2026-10-15T00:39:04.418908+00:00",
+        "reviewedBy": "Codex root with independent native capture QA",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    },
+    "kilter/fr": {
+      "file": "kilter-fr-notification-center.png",
+      "sha256": "e1991c81e5d03457b9fc2e5f14371b73091918e734efb11286a5a64284774acd",
+      "sourcePngSha256": "e1991c81e5d03457b9fc2e5f14371b73091918e734efb11286a5a64284774acd",
+      "boardFamily": "kilter",
+      "appLocale": "fr",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "TestFlight2.6.0(18)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-15T00:27:48.475239+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1713,
+          "width": 1110,
+          "height": 438
+        }
+      },
+      "content": {
+        "climbName": "Lightest Pair of Shorts",
+        "grade": "V4",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "kilter",
+        "description": "Waveshare ESP32-S3 AMOLED development controller presenting as Kilter; native Next received the changed LED payload",
+        "physicalWallLightingVerified": false
+      },
+      "review": {
+        "reviewedAt": "2026-10-15T00:39:04.418908+00:00",
+        "reviewedBy": "Codex root with independent native capture QA",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    },
+    "kilter/de": {
+      "file": "kilter-de-notification-center.png",
+      "sha256": "cb509013ab5b85d184d4feb0e20929b534ad8848ad74f645a358d1e796c403a4",
+      "sourcePngSha256": "cb509013ab5b85d184d4feb0e20929b534ad8848ad74f645a358d1e796c403a4",
+      "boardFamily": "kilter",
+      "appLocale": "de",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "TestFlight2.6.0(18)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-15T00:30:58.244164+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1713,
+          "width": 1110,
+          "height": 438
+        }
+      },
+      "content": {
+        "climbName": "Lightest Pair of Shorts",
+        "grade": "V4",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "kilter",
+        "description": "Waveshare ESP32-S3 AMOLED development controller presenting as Kilter; native Next received the changed LED payload",
+        "physicalWallLightingVerified": false
+      },
+      "review": {
+        "reviewedAt": "2026-10-15T00:39:04.418908+00:00",
+        "reviewedBy": "Codex root with independent native capture QA",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    },
+    "tension/en-US": {
+      "file": "tension-en-US-notification-center.png",
+      "sha256": "79e1878b9a1895661d7923b3890945fc00ceee1adb843ea41565ceaa31d6870c",
+      "sourcePngSha256": "79e1878b9a1895661d7923b3890945fc00ceee1adb843ea41565ceaa31d6870c",
+      "boardFamily": "tension",
+      "appLocale": "en-US",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "Development2.7.0(7)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-30T09:09:26.617948+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth, dimmed by existing Personal Focus",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1740,
+          "width": 1110,
+          "height": 409
+        }
+      },
+      "content": {
+        "climbName": "Masquerade",
+        "grade": "V3",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "tension",
+        "description": "Waveshare ESP32-S3 AMOLED gym fixture advertising a dedicated Tension BLE identity; native Next received the changed LED payload",
+        "physicalWallLightingVerified": false
+      },
+      "review": {
+        "reviewedAt": "2026-10-30T09:48:11.472586+00:00",
+        "reviewedBy": "Codex independent visual review; capture operator source observations",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    },
+    "tension/es": {
+      "file": "tension-es-notification-center.png",
+      "sha256": "cb8b07a6b1258db12893ff655cf74fbea976a8717de6ac9a88cec4c32d6b1f56",
+      "sourcePngSha256": "cb8b07a6b1258db12893ff655cf74fbea976a8717de6ac9a88cec4c32d6b1f56",
+      "boardFamily": "tension",
+      "appLocale": "es",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "TestFlight2.6.0(18)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-15T01:19:14.080992+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1716,
+          "width": 1110,
+          "height": 435
+        }
+      },
+      "content": {
+        "climbName": "Masquerade",
+        "grade": "V3",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "kilter",
+        "description": "Waveshare ESP32-S3 AMOLED development controller presenting as Kilter; native Tension Next received Putty LED payload after serial mismatch was accepted",
+        "physicalWallLightingVerified": false,
+        "compatibility": {
+          "protocol": "aurora-uart",
+          "targetBoardFamily": "tension",
+          "serialMismatchAccepted": true,
+          "verification": "native-next-and-received-led-payload"
+        }
+      },
+      "review": {
+        "reviewedAt": "2026-10-15T01:22:19.352198+00:00",
+        "reviewedBy": "Codex root with independent native capture QA",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    },
+    "tension/fr": {
+      "file": "tension-fr-notification-center.png",
+      "sha256": "f7b205e4d3ccac58d472ddb8223df34db6ac79ceb92b4bae09d03e26799cf913",
+      "sourcePngSha256": "f7b205e4d3ccac58d472ddb8223df34db6ac79ceb92b4bae09d03e26799cf913",
+      "boardFamily": "tension",
+      "appLocale": "fr",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "TestFlight2.6.0(18)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-15T01:32:11.818574+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1716,
+          "width": 1110,
+          "height": 435
+        }
+      },
+      "content": {
+        "climbName": "Masquerade",
+        "grade": "6a/V3",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "kilter",
+        "description": "Waveshare ESP32-S3 AMOLED development controller presenting as Kilter; native Tension Next received Putty LED payload after serial mismatch was accepted",
+        "physicalWallLightingVerified": false,
+        "compatibility": {
+          "protocol": "aurora-uart",
+          "targetBoardFamily": "tension",
+          "serialMismatchAccepted": true,
+          "verification": "native-next-and-received-led-payload"
+        }
+      },
+      "review": {
+        "reviewedAt": "2026-10-15T01:34:47.225669+00:00",
+        "reviewedBy": "Codex root with independent native capture QA",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    },
+    "tension/de": {
+      "file": "tension-de-notification-center.png",
+      "sha256": "66e3d5dcf2add3ffb47a80ce1f02858cf6ec1c32847cae4d572bb7cc2948364c",
+      "sourcePngSha256": "66e3d5dcf2add3ffb47a80ce1f02858cf6ec1c32847cae4d572bb7cc2948364c",
+      "boardFamily": "tension",
+      "appLocale": "de",
+      "widgetLocale": "en",
+      "captureSurface": "notification-center",
+      "device": "iPhone13Pro",
+      "sourceBuild": "TestFlight2.6.0(18)",
+      "appSourceCommit": null,
+      "capturedAt": "2026-10-15T01:51:42.948236+00:00",
+      "nativePixels": {
+        "width": 1170,
+        "height": 2532
+      },
+      "screenPoints": {
+        "width": 390,
+        "height": 844
+      },
+      "cropRect": {
+        "x": 0,
+        "y": 0,
+        "width": 1170,
+        "height": 2532
+      },
+      "captureFraming": "full-screen",
+      "notificationCenterContext": {
+        "wallpaper": "iOS stock Astronomy Earth",
+        "unrelatedNotificationsDismissed": true,
+        "entryFromAuthenticatedApp": true,
+        "authenticationState": "not-established",
+        "liveActivityRect": {
+          "x": 30,
+          "y": 1716,
+          "width": 1110,
+          "height": 435
+        }
+      },
+      "content": {
+        "climbName": "Masquerade",
+        "grade": "6a/V3",
+        "currentIndex": 1,
+        "totalClimbs": 2,
+        "nextEnabled": true
+      },
+      "controller": {
+        "connection": "real-ble",
+        "presentedBoardFamily": "kilter",
+        "description": "Waveshare ESP32-S3 AMOLED development controller presenting as Kilter; native Tension Next received Putty LED payload after serial mismatch was accepted",
+        "physicalWallLightingVerified": false,
+        "compatibility": {
+          "protocol": "aurora-uart",
+          "targetBoardFamily": "tension",
+          "serialMismatchAccepted": true,
+          "verification": "native-next-and-received-led-payload"
+        }
+      },
+      "review": {
+        "reviewedAt": "2026-10-15T01:55:30.651883+00:00",
+        "reviewedBy": "Codex root with independent native capture QA",
+        "nativePixelsUnmodified": true,
+        "unrelatedNotificationsExcluded": true,
+        "appLocaleVerified": true,
+        "nextNavigationVerified": true
+      }
+    }
+  },
+  "footage": {
+    "kilter": {
+      "sha256": "09bd9747c81c1940211614bd03d1b041ab66a4a8745473f56bbef2fca395da00",
+      "key": "sources/live-activity/09bd9747c81c1940211614bd03d1b041ab66a4a8745473f56bbef2fca395da00.zip",
+      "boardFamily": "kilter",
+      "sourceLocale": "en-US",
+      "nativeFixtureSourcePngSha256": "f2c87d0d4d3d885b548ea8e67b8d545d83543eebc4dc52c3bfd4e590bcc1b2a5",
+      "frameCount": 254,
+      "durationSeconds": 11.950810791999999,
+      "reviewedAt": "2026-10-30T09:09:21.498144+00:00",
+      "reviewedBy": "Codex independent visual and original-frame review"
+    },
+    "tension": {
+      "sha256": "1c080fe65bfbcec40ecb420b9ca2649ed19dc417a0ab9852ee51d00da7ba6e47",
+      "key": "sources/live-activity/1c080fe65bfbcec40ecb420b9ca2649ed19dc417a0ab9852ee51d00da7ba6e47.zip",
+      "boardFamily": "tension",
+      "sourceLocale": "en-US",
+      "nativeFixtureSourcePngSha256": "79e1878b9a1895661d7923b3890945fc00ceee1adb843ea41565ceaa31d6870c",
+      "frameCount": 256,
+      "durationSeconds": 11.931684749999999,
+      "reviewedAt": "2026-10-30T09:48:11.472141+00:00",
+      "reviewedBy": "Codex independent visual and original-frame review"
+    }
+  }
+}

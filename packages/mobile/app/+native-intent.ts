@@ -1,5 +1,7 @@
+import { deferConsentDestination } from '../src/lib/consent-navigation';
 import { getShareExtensionKey } from 'expo-share-intent';
 import { isLegacyPreviewLink } from '../src/lib/legacy-preview-link';
+import { isLegacyWallTabLink, WALL_DISPLAY_HREF } from '../src/lib/routing/wall-display-link';
 
 // Expo Router's redirect hook for OS-level deep links. The iOS Share Extension
 // (expo-share-intent) opens the app via a synthetic `com.boardsesh.app://...
@@ -11,6 +13,11 @@ import { isLegacyPreviewLink } from '../src/lib/legacy-preview-link';
 // unchanged and the provider handles it the same way.
 
 export function redirectSystemPath({ path, initial }: { path: string; initial: boolean }): string {
+  // The isolated story navigator never mounts the application's consent flow.
+  // Let its dev-only routes reach that navigator without deferring them forever.
+  if (__DEV__ && /^(?:com\.boardsesh\.app:\/\/)?\/*dev\/(?:stories|story-tabs)(?:[/?#]|$)/.test(path)) {
+    return path;
+  }
   // The browser-OAuth fallback's Linking listener owns this deep link (see
   // src/lib/auth.ts raceBrowserSignIn); return '' so Expo Router doesn't flash
   // +not-found on the non-existent /auth/callback route under the browser. Safe:
@@ -26,7 +33,14 @@ export function redirectSystemPath({ path, initial }: { path: string; initial: b
   // New builds no longer have that route; land those durable links on What's
   // New. Preview selection is available from More and the user drawer.
   if (isLegacyPreviewLink(path)) {
+    if (deferConsentDestination('/changelog')) return initial ? '/' : '';
     return '/changelog';
+  }
+  // The iPad "On the Wall" tab became the full-screen Wall display; its old
+  // `com.boardsesh.app://wall` link opens the new route.
+  if (isLegacyWallTabLink(path)) {
+    if (deferConsentDestination(WALL_DISPLAY_HREF)) return initial ? '/' : '';
+    return WALL_DISPLAY_HREF;
   }
   try {
     if (path.includes(`dataUrl=${getShareExtensionKey()}`)) {
@@ -44,5 +58,6 @@ export function redirectSystemPath({ path, initial }: { path: string; initial: b
     // loaded). Fall through to the no-op `return path` so ordinary deep links
     // (join/universal links) still reach their destination — never reroute them.
   }
+  if (deferConsentDestination(path)) return initial ? '/' : '';
   return path;
 }

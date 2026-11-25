@@ -11,7 +11,15 @@
       "privateDescription": "Diese Playlist ist privat.",
       "generatedDescription_one": "{{count}} {{board}}-Boulder in {{name}}. Öffne die Playlist in Boardsesh und klettere ihn.",
       "generatedDescription_other": "{{count}} {{board}}-Boulder in {{name}}. Öffne die Playlist in Boardsesh und klettere sie.",
-      "ogAlt": "Die Playlist {{name}} auf Boardsesh"
+      "ogAlt": "Die Playlist {{name}} auf Boardsesh",
+      "ogTitle": "{{name}} · {{board}}-Liste",
+      "ogTitleWithBand": "{{name}} · {{band}} {{board}}-Liste",
+      "ogDescriptionRange_one": "{{count}} {{board}}-Boulder von {{low}} bis {{high}}. Probier ihn.",
+      "ogDescriptionRange_other": "{{count}} {{board}}-Boulder von {{low}} bis {{high}}. Such dir einen aus und probier ihn.",
+      "ogDescriptionOneGrade_one": "{{count}} {{board}}-Boulder im Grad {{grade}}. Probier ihn.",
+      "ogDescriptionOneGrade_other": "{{count}} {{board}}-Boulder im Grad {{grade}}. Such dir einen aus und probier ihn.",
+      "ogDescriptionNoBand_one": "{{count}} {{board}}-Boulder. Probier ihn.",
+      "ogDescriptionNoBand_other": "{{count}} {{board}}-Boulder. Such dir einen aus und probier ihn."
     }
   },
   "library": {
@@ -26,6 +34,7 @@
       "community": "Community-Playlists"
     },
     "communityByline": "{{creatorName}} - {{climbCount}}",
+    "gradeBand": "Grade {{band}}",
     "allPlaylists": {
       "title": "Meine Playlists",
       "seeAll": "Alle ansehen",
@@ -33,6 +42,55 @@
       "clearSearch": "Suche zurücksetzen",
       "loadMoreError": "Es ließen sich nicht alle deine Playlists laden.",
       "noResults": "Keine Playlist passt zu „{{query}}“"
+    },
+    "community": {
+      "searchPlaceholder": "Playlists durchsuchen",
+      "madeByLabel": "Erstellt von",
+      "madeBy": {
+        "everyone": "Alle",
+        "mine": "Meine",
+        "following": "Gefolgt"
+      },
+      "sortLabel": "Sortieren",
+      "sort": {
+        "popular": "Beliebt",
+        "recent": "Neu"
+      },
+      "sizeLabel": "Größe",
+      "size": {
+        "any": "Jede Größe",
+        "short": "Kurz",
+        "session": "Session",
+        "big": "Groß"
+      },
+      "gradeLabel": "Grad",
+      "gradeAny": "Jeder Grad",
+      "gradeA11y": "Gradbereich: {{band}}",
+      "sizeBand": {
+        "upTo": "Bis {{max}} Boulder",
+        "range": "{{min}}–{{max}} Boulder",
+        "atLeast": "{{min}}+ Boulder"
+      },
+      "resultCount_one": "{{count}} Playlist",
+      "resultCount_other": "{{count}} Playlists",
+      "loadMoreError": "Weitere Playlists ließen sich nicht laden.",
+      "errors": {
+        "loadTitle": "Playlists ließen sich nicht laden",
+        "loadDescription": "Prüf deine Verbindung und versuch es erneut."
+      },
+      "empty": {
+        "title": "Hier gibt es noch keine Playlists",
+        "description": "Mach eine deiner Playlists öffentlich, dann sieht die Crew sie hier."
+      },
+      "emptyFollowing": {
+        "title": "Noch keine Playlists von deiner Crew",
+        "description": "Die Leute, denen du folgst, haben auf diesem Board noch keine öffentliche Playlist."
+      },
+      "noMatches": {
+        "title": "Nichts passt zu diesen Filtern",
+        "description": "Lockere einen Filter, dann siehst du mehr.",
+        "clearFilters": "Filter zurücksetzen"
+      }
     },
     "pin": {
       "pin": "Anpinnen",
@@ -83,7 +141,15 @@
         "title": "Smart-Playlist nicht gefunden",
         "description": "Diese Smart-Playlist gibt es nicht."
       },
-      "empty": "Noch keine Boulder in dieser Smart-Playlist."
+      "empty": "Noch keine Boulder in dieser Smart-Playlist.",
+      "createdClimbs": {
+        "title": "Meine Boulder",
+        "description": "Deine veröffentlichten Boulder auf allen Boards.",
+        "empty": {
+          "title": "Noch keine veröffentlichten Boulder",
+          "supporting": "Veröffentliche einen Boulder, um ihn hier zu finden. Deine Entwürfe bleiben im Editor."
+        }
+      }
     },
     "empty": {
       "title": "Noch keine Playlists",
@@ -102,7 +168,21 @@
   "detail": {
     "share": "Playlist teilen",
     "actions": "Playlist-Aktionen",
-    "activateAll": "Alle Boulder in die Warteschlange",
+    "activateAll": "Abspielen",
+    "addToQueue": {
+      "action": "Als Letztes dran",
+      "actionCount_one": "{{count}} als Letztes dran",
+      "actionCount_other": "{{count}} als Letztes dran",
+      "subtitle": "Kommen nach dem Rest deiner Warteschlange",
+      "playNextAction": "Als Nächstes dran",
+      "playNextActionCount_one": "{{count}} als Nächstes dran",
+      "playNextActionCount_other": "{{count}} als Nächstes dran",
+      "playNextSubtitle": "Kommen vor dem Rest deiner Warteschlange",
+      "queueFull": "Deine Warteschlange ist mit {{max}} Bouldern voll",
+      "nothingToAdd": "Hier ist noch nichts für dein Board",
+      "alreadyAdding": "Diese Playlist wird schon hinzugefügt",
+      "failed": "Konnte nicht hinzugefügt werden. Versuch's nochmal."
+    },
     "boardMismatch": {
       "title": "Wechsel zu {{board}}, um diese Playlist zu klettern",
       "subtitle": "Das sind {{board}}-Boulder. Wechsel das Board, um sie in die Warteschlange zu packen.",
@@ -133,7 +213,10 @@
       "message_other": "Die Playlist läuft ab hier der Reihe nach. Die {{count}} Boulder in der Warteschlange hinter deinem aktuellen fliegen raus.",
       "cancel": "Abbrechen",
       "confirm": "Playlist starten",
-      "loadFailed": "Die Playlist ließ sich nicht starten. Versuch's nochmal."
+      "loadFailed": "Die Playlist ließ sich nicht starten. Versuch's nochmal.",
+      "trimmed": "{{loaded}} von {{total}} Bouldern geladen. Deine Warteschlange fasst {{max}}.",
+      "trimmedUnknownTotal": "{{loaded}} Boulder geladen. Deine Warteschlange fasst {{max}}.",
+      "addInstead": "Als Letztes dran"
     },
     "deleteConfirm": {
       "title": "Playlist löschen?",
@@ -143,9 +226,37 @@
     },
     "discussion": "Diskussion",
     "empty": "Noch keine Boulder in dieser Playlist",
+    "view": {
+      "status_one": "{{shown}} von {{count}} Boulder",
+      "status_other": "{{shown}} von {{count}} Bouldern",
+      "clearFilters": "Filter zurücksetzen",
+      "editNote": "Beim Bearbeiten siehst du die Playlist-Reihenfolge",
+      "namePlaceholder": "Name des Boulders",
+      "empty": {
+        "noMatch": "Hier passt nichts zu diesen Filtern.",
+        "allSent": "Du hast alles auf dieser Liste getoppt. Stark.",
+        "noName": "Kein Boulder namens „{{name}}“ in dieser Playlist.",
+        "noBoardFit": "Keiner davon passt auf dein Board."
+      }
+    },
     "climbCount_one": "{{count}} Boulder",
     "climbCount_other": "{{count}} Boulder",
-    "openInApp": "Kletter das in der App",
+    "cta": {
+      "getAppHelper": "Beleuchte diese Boulder am Board, einen nach dem anderen.",
+      "openInBrowser": "Im Browser öffnen",
+      "openInBrowserMobile": "Oder die Playlist im Browser öffnen"
+    },
+    "qr": {
+      "title": "Scanne den Code, um diese Playlist auf deinem Handy zu öffnen",
+      "imageLabel": "QR-Code, der {{name}} auf deinem Handy öffnet"
+    },
+    "subline": {
+      "boardPlaylist": "{{board}}-Playlist",
+      "sprayWallPlaylist": "Spraywall-Playlist",
+      "sprayWall": "Spraywall",
+      "multiBoardPlaylist": "Playlist für {{boards}}",
+      "gradeBand": "{{low}} bis {{high}}"
+    },
     "followerCount_one": "{{count}} Follower",
     "followerCount_other": "{{count}} Follower",
     "followFailed": "Der Folgen-Status ließ sich nicht ändern",
@@ -155,7 +266,12 @@
       "loadTitle": "Playlist lädt nicht",
       "loadDescription": "Beim Laden dieser Playlist ist etwas schiefgegangen. Versuch's nochmal.",
       "tryAgain": "Nochmal versuchen"
-    }
+    },
+    "setterPicker": {
+      "showClimbs": "Boulder anzeigen",
+      "error": "Die Setter dieser Liste konnten nicht geladen werden."
+    },
+    "installHelper": "Noch keine App? Hol sie dir kostenlos und klettere diese Playlist auf deinem Board."
   },
   "editClimbs": {
     "done": "Fertig",
@@ -185,8 +301,7 @@
       "privateHint": "Private Playlists siehst nur du"
     },
     "actions": {
-      "save": "Speichern",
-      "saving": "Wird gespeichert ..."
+      "save": "Speichern"
     },
     "validation": {
       "nameRequired": "Gib der Playlist einen Namen",
@@ -201,7 +316,6 @@
   "create": {
     "drawerTitle": "Playlist erstellen",
     "submit": "Erstellen",
-    "submitting": "Wird erstellt ...",
     "fields": {
       "name": "Name",
       "namePlaceholder": "z. B. Fiese Leisten",

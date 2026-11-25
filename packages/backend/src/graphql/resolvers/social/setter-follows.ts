@@ -1,13 +1,14 @@
-import { eq, and, count, sql, ilike, inArray } from 'drizzle-orm';
-import { isSizeScopedBoard, resolveRenderBoard } from '@boardsesh/board-config';
+import { requestPrivacyFollow, removePrivacyFollow } from '../privacy';
+import { fetchUserClimbs } from '../shared/user-climbs';
+import { userActivityVisibilityCondition } from '../../../services/privacy';
+import { eq, and, count, desc, sql, ilike, inArray } from 'drizzle-orm';
+import { isSizeScopedBoard } from '@boardsesh/board-config';
 import { type ConnectionContext, type Climb, type BoardName, SUPPORTED_BOARDS } from '@boardsesh/shared-schema';
-import { executeRows } from '@boardsesh/db/client';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { sprayClimbVisibilityCondition } from '@boardsesh/db/queries';
 import { getClimbStars, getGradeLabel, toConfidenceTier } from '@boardsesh/db/queries';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
-import { fetchOwnerBoards } from '../shared/render-board';
 import {
   FollowSetterInputSchema,
   SetterProfileInputSchema,
@@ -32,6 +33,13 @@ const DEFAULT_ANGLE = 40;
  * `setterClimbsFull` listed them. None of these resolvers is authenticated
  * against the setter, so there is no "it's your own draft" case to preserve:
  * the caller is always someone else looking at someone else's work.
+ *
+ * A published, listed climb is public whoever set it, so a private account's
+ * climbs list here like anyone's. Who set it is public with it where the climb
+ * names the account (`board_climbs.user_id`), so `setterProfile` names a
+ * private account behind a setter name it set climbs under. A Kilter or
+ * Tension login linked to a private account (`user_board_mappings`) is not on
+ * any climb, and stays private to viewers who may not see its activity.
  */
 function visibleSetterClimbConditions(username: string, viewerUserId: string | null | undefined) {
   return [
@@ -60,6 +68,121 @@ function visibleSetterClimbConditions(username: string, viewerUserId: string | n
 function listableSetterClimbConditions(username: string, viewerUserId: string | null | undefined) {
   return [...visibleSetterClimbConditions(username, viewerUserId), eq(dbSchema.boardClimbs.isHidden, false)];
 }
+
+/**
+ * The Boardsesh account a setter name points to for this viewer, or null.
+ * `boardTypes` are the boards the name has visible climbs on.
+ */
+async function getSetterAccount(username: string, viewerUserId: string | null | undefined, boardTypes: string[]) {
+  // The Boardsesh account behind the name. First the account that set this
+  // name's listable climbs: who set a published, listed climb is public with
+  // it, a private account included, and a MoonBoard or other Boardsesh climb
+  // has no linked login to find it by. A climb the community hid names no
+  // one, as on every browse surface and the web hero. Most climbs first, then
+  // the id, so two accounts sharing a name resolve the same way every time.
+  const identityColumns = {
+    displayName: dbSchema.userProfiles.displayName,
+    avatarUrl: dbSchema.userProfiles.avatarUrl,
+    userName: dbSchema.users.name,
+    userImage: dbSchema.users.image,
+  };
+  const authors = await db
+    .select({ userId: dbSchema.users.id, ...identityColumns })
+    .from(dbSchema.boardClimbs)
+    .innerJoin(dbSchema.users, eq(dbSchema.boardClimbs.userId, dbSchema.users.id))
+    .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
+    .where(and(...listableSetterClimbConditions(username, viewerUserId)))
+    .groupBy(
+      dbSchema.users.id,
+      dbSchema.userProfiles.displayName,
+      dbSchema.userProfiles.avatarUrl,
+      dbSchema.users.name,
+      dbSchema.users.image,
+    )
+    .orderBy(desc(count()), dbSchema.users.id)
+    .limit(1);
+
+  // Otherwise a Kilter or Tension login linked under this name, on a board
+  // type the name has visible climbs on. That login is on no climb, so a
+  // private account's stays with the viewers who may see its activity.
+  // Ordered as the web setter hero orders it.
+  const linkedUsers =
+    authors.length > 0
+      ? authors
+      : await db
+          .select({ userId: dbSchema.userBoardMappings.userId, ...identityColumns })
+          .from(dbSchema.userBoardMappings)
+          .innerJoin(dbSchema.users, eq(dbSchema.userBoardMappings.userId, dbSchema.users.id))
+          .leftJoin(dbSchema.userProfiles, eq(dbSchema.userBoardMappings.userId, dbSchema.userProfiles.userId))
+          .where(
+            and(
+              eq(dbSchema.userBoardMappings.boardUsername, username),
+              inArray(dbSchema.userBoardMappings.boardType, boardTypes),
+              userActivityVisibilityCondition(dbSchema.userBoardMappings.userId, viewerUserId),
+            ),
+          )
+          .orderBy(sql`${dbSchema.userProfiles.userId} IS NULL`, dbSchema.userBoardMappings.userId)
+          .limit(1);
+
+  return linkedUsers[0] ?? null;
+}
+
+/**
+ * Whether a stranger gets a setter profile at all. The same predicate `setterProfile`
+ * answers null on, as one bounded row, so the share card can ask on every request
+ * without counting a prolific setter's whole catalogue each time.
+ */
+export async function setterHasVisibleClimbs(username: string): Promise<boolean> {
+  const [climb] = await db
+    .select({ uuid: dbSchema.boardClimbs.uuid })
+    .from(dbSchema.boardClimbs)
+    .where(and(...visibleSetterClimbConditions(username, null)))
+    .limit(1);
+  return !!climb;
+}
+
+/** Whether this climb is still one a stranger may be shown as this setter's. */
+export async function isSetterClimbListable(username: string, boardType: string, climbUuid: string): Promise<boolean> {
+  const [climb] = await db
+    .select({ uuid: dbSchema.boardClimbs.uuid })
+    .from(dbSchema.boardClimbs)
+    .where(
+      and(
+        ...listableSetterClimbConditions(username, null),
+        eq(dbSchema.boardClimbs.boardType, boardType),
+        eq(dbSchema.boardClimbs.uuid, climbUuid),
+      ),
+    )
+    .limit(1);
+  return !!climb;
+}
+
+/**
+ * Sends across a setter's listable climbs. Stats are per angle, and the same
+ * climber is on the rows for every angle they have sent, so the per-climb figure
+ * is the most-ascended angle rather than the sum: that matches the count on the
+ * climb's own row and cannot double-count someone who sent it at two angles.
+ * Lazy, because only the share card reads it.
+ */
+export const setterProfileFieldResolvers = {
+  totalAscents: async (parent: { username: string }, _: unknown, ctx: ConnectionContext): Promise<number> => {
+    const perClimb = db
+      .select({ best: sql<number>`MAX(${dbSchema.boardClimbStats.ascensionistCount})`.as('best') })
+      .from(dbSchema.boardClimbs)
+      .innerJoin(
+        dbSchema.boardClimbStats,
+        and(
+          eq(dbSchema.boardClimbStats.boardType, dbSchema.boardClimbs.boardType),
+          eq(dbSchema.boardClimbStats.climbUuid, dbSchema.boardClimbs.uuid),
+        ),
+      )
+      .where(and(...listableSetterClimbConditions(parent.username, ctx.userId)))
+      .groupBy(dbSchema.boardClimbs.boardType, dbSchema.boardClimbs.uuid)
+      .as('per_climb');
+    const [row] = await db.select({ total: sql<string>`COALESCE(SUM(${perClimb.best}), 0)::bigint` }).from(perClimb);
+    return Number(row?.total ?? 0);
+  },
+};
 
 export const setterFollowQueries = {
   /**
@@ -109,22 +232,7 @@ export const setterFollowQueries = {
       isFollowedByMe = Number(followCheck?.count ?? 0) > 0;
     }
 
-    // Check for linked Boardsesh user
-    const linkedUsers = await db
-      .select({
-        userId: dbSchema.userBoardMappings.userId,
-        displayName: dbSchema.userProfiles.displayName,
-        avatarUrl: dbSchema.userProfiles.avatarUrl,
-        userName: dbSchema.users.name,
-        userImage: dbSchema.users.image,
-      })
-      .from(dbSchema.userBoardMappings)
-      .innerJoin(dbSchema.users, eq(dbSchema.userBoardMappings.userId, dbSchema.users.id))
-      .leftJoin(dbSchema.userProfiles, eq(dbSchema.userBoardMappings.userId, dbSchema.userProfiles.userId))
-      .where(eq(dbSchema.userBoardMappings.boardUsername, username))
-      .limit(1);
-
-    const linkedUser = linkedUsers[0];
+    const linkedUser = await getSetterAccount(username, ctx.isAuthenticated ? ctx.userId : null, boardTypes);
 
     return {
       username,
@@ -227,7 +335,7 @@ export const setterFollowQueries = {
         boardType: c.boardType,
         layoutId: c.layoutId,
         angle: c.statsAngle ?? null,
-        difficultyName: getGradeLabel(c.difficultyId),
+        difficultyName: getGradeLabel(c.difficultyId, c.boardType),
         qualityAverage: c.qualityAverage ?? null,
         ascensionistCount: c.ascensionistCount ?? null,
         createdAt: c.createdAt ?? null,
@@ -319,8 +427,11 @@ export const setterFollowQueries = {
           // needs it to tell Woods' two sizes apart (their hold ids overlap as
           // different holds).
           compatible_size_ids: tables.climbs.compatibleSizeIds,
+          required_set_ids: tables.climbs.requiredSetIds,
           // How many of the climb's holds have come off the wall — see get-climb.ts.
           missing_hold_count: tables.climbs.missingHoldCount,
+          revision_number: tables.climbs.revisionNumber,
+          holds_revision_number: tables.climbs.holdsRevisionNumber,
           // Structured climb rules — see the note in hydrate-climbs.ts (#5214).
           characteristics: tables.climbs.characteristics,
           // The angle the stats row was joined at. Pinned to `angle` here, so it
@@ -378,12 +489,15 @@ export const setterFollowQueries = {
         framesCount: result.frames_count ?? null,
         framesPace: result.frames_pace ?? null,
         compatibleSizeIds: result.compatible_size_ids ?? null,
+        requiredSetIds: result.required_set_ids ?? null,
         missingHoldCount: result.missing_hold_count ?? null,
+        revisionNumber: result.revision_number ?? null,
+        holdsRevisionNumber: result.holds_revision_number ?? null,
         characteristics: result.characteristics ?? null,
         angle,
         statsAngle: result.statsAngle ?? null,
         ascensionist_count: Number(result.ascensionist_count || 0),
-        difficulty: getGradeLabel(result.difficulty_id),
+        difficulty: getGradeLabel(result.difficulty_id, boardName),
         quality_average: result.quality_average?.toString() || '0',
         stars: getClimbStars(result.quality_average),
         difficulty_error: result.difficulty_error?.toString() || '0',
@@ -438,8 +552,11 @@ export const setterFollowQueries = {
           frames_count: tables.climbs.framesCount,
           frames_pace: tables.climbs.framesPace,
           compatible_size_ids: tables.climbs.compatibleSizeIds,
+          required_set_ids: tables.climbs.requiredSetIds,
           // How many of the climb's holds have come off the wall — see get-climb.ts.
           missing_hold_count: tables.climbs.missingHoldCount,
+          revision_number: tables.climbs.revisionNumber,
+          holds_revision_number: tables.climbs.holdsRevisionNumber,
           // Structured climb rules — see the note in hydrate-climbs.ts (#5214).
           characteristics: tables.climbs.characteristics,
           statsAngle: tables.climbStats.angle,
@@ -505,12 +622,15 @@ export const setterFollowQueries = {
           framesCount: result.frames_count ?? null,
           framesPace: result.frames_pace ?? null,
           compatibleSizeIds: result.compatible_size_ids ?? null,
+          requiredSetIds: result.required_set_ids ?? null,
           missingHoldCount: result.missing_hold_count ?? null,
+          revisionNumber: result.revision_number ?? null,
+          holdsRevisionNumber: result.holds_revision_number ?? null,
           characteristics: result.characteristics ?? null,
           angle: result.statsAngle ?? DEFAULT_ANGLE,
           statsAngle: result.statsAngle ?? null,
           ascensionist_count: Number(result.ascensionist_count || 0),
-          difficulty: getGradeLabel(result.difficulty_id),
+          difficulty: getGradeLabel(result.difficulty_id, boardName),
           quality_average: result.quality_average?.toString() || '0',
           stars: getClimbStars(result.quality_average),
           difficulty_error: result.difficulty_error?.toString() || '0',
@@ -538,232 +658,7 @@ export const setterFollowQueries = {
     ctx: ConnectionContext,
   ): Promise<{ climbs: Climb[]; totalCount: number; hasMore: boolean }> => {
     const validatedInput = validateInput(UserClimbsInputSchema, input, 'input');
-    const { userId, sortBy, limit, offset } = validatedInput;
-
-    // 1. Look up linked Aurora usernames
-    const mappings = await db
-      .select({
-        boardType: dbSchema.userBoardMappings.boardType,
-        boardUsername: dbSchema.userBoardMappings.boardUsername,
-      })
-      .from(dbSchema.userBoardMappings)
-      .where(eq(dbSchema.userBoardMappings.userId, userId));
-
-    const linkedMappings = mappings.filter(
-      (mapping): mapping is { boardType: string; boardUsername: string } =>
-        mapping.boardUsername !== null && mapping.boardUsername.length > 0,
-    );
-
-    // 2. Build WHERE condition: userId match OR (boardType + setterUsername) in linked mappings, AND not draft
-    const tables = UNIFIED_TABLES;
-    const linkedOwnershipCondition =
-      linkedMappings.length > 0
-        ? sql.join(
-            linkedMappings.map(
-              ({ boardType, boardUsername }) =>
-                sql`(${tables.climbs.boardType} = ${boardType} AND ${tables.climbs.setterUsername} = ${boardUsername})`,
-            ),
-            sql` OR `,
-          )
-        : null;
-
-    const ownershipCondition = linkedOwnershipCondition
-      ? sql`(${tables.climbs.userId} = ${userId} OR ${linkedOwnershipCondition})`
-      : eq(tables.climbs.userId, userId);
-
-    // No is_hidden predicate, deliberately: this is the setter's own climbs list.
-    // Someone whose climb was hidden by the community has to be able to see that
-    // it happened — the row carries `is_hidden` so the UI can say so — rather than
-    // watching it vanish from their profile with no explanation.
-    // Scoped to no board type at all, so a spray climb rides along with every
-    // other board a climber has set on — including the layout id of their private
-    // wall. The condition is a no-op on the other eight board types.
-    const whereCondition = and(
-      ownershipCondition,
-      eq(tables.climbs.isDraft, false),
-      sprayClimbVisibilityCondition(
-        { boardType: tables.climbs.boardType, layoutId: tables.climbs.layoutId },
-        ctx.userId,
-      ),
-    );
-
-    // 3. Get total count
-    const [countResult] = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(tables.climbs)
-      .where(whereCondition);
-
-    const totalCount = Number(countResult?.count ?? 0);
-
-    // 4. Get climbs with stats at the most popular angle, but only compute stats for owned climbs.
-    const ownershipSql =
-      linkedMappings.length > 0
-        ? sql`(c.user_id = ${userId} OR ${sql.join(
-            linkedMappings.map(
-              ({ boardType, boardUsername }) =>
-                sql`(c.board_type = ${boardType} AND c.setter_username = ${boardUsername})`,
-            ),
-            sql` OR `,
-          )})`
-        : sql`c.user_id = ${userId}`;
-
-    const orderSql =
-      sortBy === 'popular'
-        ? sql`COALESCE(best.ascensionist_count, 0) DESC`
-        : sql`owned_climbs.created_at DESC NULLS LAST`;
-
-    type RawRow = {
-      uuid: string;
-      layout_id: number | null;
-      board_type: string;
-      setter_username: string | null;
-      name: string | null;
-      description: string | null;
-      frames: string | null;
-      frames_count: number | null;
-      frames_pace: number | null;
-      compatible_size_ids: number[] | null;
-      missing_hold_count: number | null;
-      characteristics: string[] | null;
-      required_set_ids: number[] | null;
-      is_hidden: boolean | null;
-      stats_angle: number | null;
-      ascensionist_count: number | null;
-      difficulty_id: number | null;
-      quality_average: number | null;
-      difficulty_error: number | null;
-      benchmark_difficulty: number | null;
-      boardsesh_difficulty: number | null;
-      boardsesh_confidence: string | null;
-    };
-
-    const rawRows = await executeRows<RawRow>(
-      db,
-      sql`
-      WITH owned_climbs AS (
-        SELECT
-          c.uuid,
-          c.layout_id,
-          c.board_type,
-          c.setter_username,
-          c.name,
-          c.description,
-          c.frames,
-          c.frames_count,
-          c.frames_pace,
-          c.compatible_size_ids,
-          c.missing_hold_count,
-          c.characteristics,
-          c.required_set_ids,
-          c.is_hidden,
-          c.created_at
-        FROM board_climbs c
-        WHERE ${ownershipSql} AND c.is_draft = false
-          -- The row list is built by this CTE, not by the drizzle whereCondition
-          -- used for the count above — so the spray rule has to be stated here too
-          -- or the count hides a private wall's climbs while the list returns them.
-          AND ${sprayClimbVisibilityCondition({ boardType: sql`c.board_type`, layoutId: sql`c.layout_id` }, ctx.userId)}
-      ),
-      best_angle AS (
-        SELECT DISTINCT ON (stats.board_type, stats.climb_uuid)
-          stats.board_type,
-          stats.climb_uuid,
-          stats.angle,
-          stats.ascensionist_count,
-          stats.display_difficulty,
-          stats.quality_average,
-          stats.difficulty_average,
-          stats.benchmark_difficulty
-        FROM board_climb_stats stats
-        INNER JOIN owned_climbs
-          ON owned_climbs.board_type = stats.board_type
-         AND owned_climbs.uuid = stats.climb_uuid
-        ORDER BY stats.board_type, stats.climb_uuid, stats.ascensionist_count DESC NULLS LAST, stats.angle ASC
-      )
-      SELECT
-        owned_climbs.uuid,
-        owned_climbs.layout_id,
-        owned_climbs.board_type,
-        owned_climbs.setter_username,
-        owned_climbs.name,
-        owned_climbs.description,
-        owned_climbs.frames,
-        owned_climbs.frames_count,
-        owned_climbs.frames_pace,
-        owned_climbs.compatible_size_ids,
-        owned_climbs.missing_hold_count,
-        owned_climbs.characteristics,
-        owned_climbs.required_set_ids,
-        owned_climbs.is_hidden,
-        best.angle AS stats_angle,
-        best.ascensionist_count,
-        ROUND(best.display_difficulty::numeric, 0)::int AS difficulty_id,
-        ROUND(best.quality_average::numeric, 2) AS quality_average,
-        ROUND(best.difficulty_average::numeric - best.display_difficulty::numeric, 2) AS difficulty_error,
-        best.benchmark_difficulty,
-        COALESCE(grades.universal_grade, grades.local_grade) AS boardsesh_difficulty,
-        grades.confidence AS boardsesh_confidence
-      FROM owned_climbs
-      LEFT JOIN best_angle best
-        ON best.board_type = owned_climbs.board_type
-       AND best.climb_uuid = owned_climbs.uuid
-      LEFT JOIN board_climb_grades grades
-        ON grades.board_type = owned_climbs.board_type
-       AND grades.climb_uuid = owned_climbs.uuid
-       AND grades.angle = best.angle
-      ORDER BY ${orderSql}, owned_climbs.uuid DESC
-      LIMIT ${limit + 1}
-      OFFSET ${offset}
-    `,
-    );
-
-    const hasMore = rawRows.length > limit;
-    const trimmedResults = hasMore ? rawRows.slice(0, limit) : rawRows;
-
-    // Draw a setter's climbs on their own wall rather than on the biggest size
-    // the layout comes in — the profile Climbs tab has no board in its route.
-    const ownerBoards = (await fetchOwnerBoards([userId])).get(userId) ?? [];
-
-    const climbs: Climb[] = trimmedResults.map((result) => {
-      const boardName = (result.board_type || 'kilter') as BoardName;
-      return {
-        uuid: result.uuid,
-        layoutId: result.layout_id,
-        setter_username: result.setter_username || '',
-        name: result.name || '',
-        description: result.description || '',
-        frames: result.frames || '',
-        framesCount: result.frames_count ?? null,
-        framesPace: result.frames_pace ?? null,
-        compatibleSizeIds: result.compatible_size_ids ?? null,
-        missingHoldCount: result.missing_hold_count ?? null,
-        characteristics: result.characteristics ?? null,
-        is_hidden: result.is_hidden ?? false,
-        angle: result.stats_angle ?? DEFAULT_ANGLE,
-        statsAngle: result.stats_angle ?? null,
-        ascensionist_count: Number(result.ascensionist_count || 0),
-        difficulty: getGradeLabel(result.difficulty_id),
-        quality_average: result.quality_average?.toString() || '0',
-        stars: getClimbStars(result.quality_average),
-        difficulty_error: result.difficulty_error?.toString() || '0',
-        benchmark_difficulty:
-          result.benchmark_difficulty && result.benchmark_difficulty > 0
-            ? result.benchmark_difficulty.toString()
-            : null,
-        boardType: boardName,
-        boardseshDifficulty: result.boardsesh_difficulty == null ? null : Number(result.boardsesh_difficulty),
-        boardseshConfidence: toConfidenceTier(result.boardsesh_confidence),
-        renderBoard: resolveRenderBoard({
-          boardType: boardName,
-          climbLayoutId: result.layout_id,
-          compatibleSizeIds: result.compatible_size_ids,
-          requiredSetIds: result.required_set_ids,
-          ownerBoards,
-        }),
-      };
-    });
-
-    return { climbs, totalCount, hasMore };
+    return fetchUserClimbs(validatedInput, ctx);
   },
 
   /**
@@ -965,14 +860,16 @@ export const setterFollowMutations = {
     const setterUsername = validatedInput.setterUsername;
 
     // Verify the setter exists AND is visible — the same rule the profile 404s
-    // on, so you cannot follow a setter whose page does not resolve.
-    const [exists] = await db
-      .select({ count: count() })
-      .from(dbSchema.boardClimbs)
-      .where(and(...visibleSetterClimbConditions(setterUsername, myUserId)))
-      .limit(1);
+    // on, so you cannot follow a setter whose page does not resolve. The board
+    // types it returns also limit which linked logins can name an account.
+    const boardTypes = (
+      await db
+        .selectDistinct({ boardType: dbSchema.boardClimbs.boardType })
+        .from(dbSchema.boardClimbs)
+        .where(and(...visibleSetterClimbConditions(setterUsername, myUserId)))
+    ).map((row) => row.boardType);
 
-    if (Number(exists?.count ?? 0) === 0) {
+    if (boardTypes.length === 0) {
       throw new Error('Setter not found');
     }
 
@@ -988,21 +885,13 @@ export const setterFollowMutations = {
 
     // Check if setter has a linked Boardsesh account
     if (result.length > 0) {
-      const linkedUsers = await db
-        .select({ userId: dbSchema.userBoardMappings.userId })
-        .from(dbSchema.userBoardMappings)
-        .where(eq(dbSchema.userBoardMappings.boardUsername, setterUsername))
-        .limit(1);
+      const linkedUser = await getSetterAccount(setterUsername, myUserId, boardTypes);
 
-      if (linkedUsers.length > 0 && linkedUsers[0].userId !== myUserId) {
-        // Also create user_follows entry
-        await db
-          .insert(dbSchema.userFollows)
-          .values({
-            followerId: myUserId,
-            followingId: linkedUsers[0].userId,
-          })
-          .onConflictDoNothing();
+      // A private linked account only gets a follow request (and its inbox
+      // notification). The setter follow itself is made either way: a setter's
+      // published climbs are public, so the result stays true.
+      if (linkedUser !== null && linkedUser.userId !== myUserId) {
+        await requestPrivacyFollow(myUserId, linkedUser.userId);
       }
 
       publishSocialEvent({
@@ -1033,29 +922,28 @@ export const setterFollowMutations = {
     const myUserId = ctx.userId!;
     const setterUsername = validatedInput.setterUsername;
 
+    const boardTypes = (
+      await db
+        .selectDistinct({ boardType: dbSchema.boardClimbs.boardType })
+        .from(dbSchema.boardClimbs)
+        .where(and(...visibleSetterClimbConditions(setterUsername, myUserId)))
+    ).map((row) => row.boardType);
+
     await db
       .delete(dbSchema.setterFollows)
       .where(
         and(eq(dbSchema.setterFollows.followerId, myUserId), eq(dbSchema.setterFollows.setterUsername, setterUsername)),
       );
 
-    // Also remove user_follows if linked
-    const linkedUsers = await db
-      .select({ userId: dbSchema.userBoardMappings.userId })
-      .from(dbSchema.userBoardMappings)
-      .where(eq(dbSchema.userBoardMappings.boardUsername, setterUsername))
-      .limit(1);
-
-    if (linkedUsers.length > 0) {
-      await db
-        .delete(dbSchema.userFollows)
-        .where(
-          and(
-            eq(dbSchema.userFollows.followerId, myUserId),
-            eq(dbSchema.userFollows.followingId, linkedUsers[0].userId),
-          ),
-        );
+    // No visible climbs, so no account to unfollow; the setter follow is already gone
+    if (boardTypes.length === 0) {
+      return true;
     }
+
+    // Also remove user_follows if linked
+    const linkedUser = await getSetterAccount(setterUsername, myUserId, boardTypes);
+
+    if (linkedUser !== null) await removePrivacyFollow(myUserId, linkedUser.userId);
 
     return true;
   },

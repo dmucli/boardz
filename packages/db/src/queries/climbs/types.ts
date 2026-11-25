@@ -76,11 +76,21 @@ export type ClimbSearchParams = {
    */
   useMyGrades?: boolean;
   onlyDrafts?: boolean;
+  draftScope?: 'OWN' | 'WALL';
+  /**
+   * Only climbs the user has hearted on this board. A heart belongs to the
+   * climb, not to an angle (`user_favorites.angle` is recorded but never
+   * compared), so the predicate matches at every angle. Needs a userId: without
+   * one the filter matches nothing rather than falling away.
+   */
+  onlyFavorited?: boolean;
   projectsOnly?: boolean;
   /**
    * Hold integrity, for spray walls: 'intact' keeps climbs that have lost no
-   * holds, 'broken' keeps only the ones that have, 'any' (the default, and what
-   * `undefined` means) adds no predicate at all.
+   * holds, 'broken' keeps only the ones that have, 'any' adds no integrity
+   * predicate. `undefined` is the default view, which on a spray wall also hides
+   * climbs retired by a full reset; 'any' shows them (#6024,
+   * `retiredByResetCondition`).
    *
    * Reads the materialised `board_climbs.missing_hold_count`, which a reset
    * re-computes (`recomputeMissingHoldCounts`). Lower case because that is what
@@ -153,6 +163,8 @@ export type ClimbSearchInputLike = {
   onlyRatedByMe?: boolean | null;
   useMyGrades?: boolean | null;
   onlyDrafts?: boolean | null;
+  draftScope?: 'OWN' | 'WALL' | null;
+  onlyFavorited?: boolean | null;
   projectsOnly?: boolean | null;
   holdIntegrity?: string | null;
   crossAngleStats?: boolean | null;
@@ -203,7 +215,9 @@ export function hasNameQuery(searchParams: Pick<ClimbSearchParams, 'name'>): boo
 export function normalizeHoldIntegrity(raw: string | null | undefined): ClimbSearchParams['holdIntegrity'] {
   if (!raw) return undefined;
   const value = raw.toLowerCase();
-  if (value === 'intact' || value === 'broken') return value;
+  // 'any' survives rather than collapsing to undefined: on a spray wall an
+  // omitted value hides retired climbs and an explicit 'any' shows them (#6024).
+  if (value === 'intact' || value === 'broken' || value === 'any') return value;
   return undefined;
 }
 
@@ -280,6 +294,9 @@ export function mapSearchInputToParams(input: ClimbSearchInputLike): ClimbSearch
     onlyRatedByMe: input.onlyRatedByMe ?? undefined,
     useMyGrades: input.useMyGrades ?? undefined,
     onlyDrafts: input.onlyDrafts ?? undefined,
+    draftScope: input.draftScope ?? undefined,
+    // false is the same as omitted, so it collapses and leaves the cache key alone.
+    onlyFavorited: input.onlyFavorited || undefined,
     projectsOnly: input.projectsOnly ?? undefined,
     // The GraphQL enum is SCREAMING_CASE and the param is lower case. ANY is the
     // "no filter" value, so it collapses to undefined here rather than travelling
@@ -363,8 +380,15 @@ export type ClimbRow = {
    *  (`canAddClimbToBoard`) can separate Woods' two sizes, whose hold ids
    *  overlap without meaning the same holds. */
   compatibleSizeIds: number[] | null;
+  /** Frame-derived hold-set requirements; null/undefined means unknown. */
+  requiredSetIds?: number[] | null;
   /** `board_climbs.missing_hold_count` — how many of this climb's holds have come
    *  off the wall. Spray only; null on every catalogue board and on any row the
    *  reset recompute has never touched, both of which mean "intact". */
   missingHoldCount: number | null;
+  /** `board_climbs.revision_number`, as stored. Edits no longer move it and the
+   *  server no longer uses it; kept for clients that still select it (#6023). */
+  revisionNumber: number | null;
+  /** `board_climbs.holds_revision_number`, as stored. Passed through only. */
+  holdsRevisionNumber: number | null;
 };

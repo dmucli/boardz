@@ -1,5 +1,7 @@
+import { Pressable } from 'react-native';
+import { PressableSurface } from '../PressableSurface';
 import { useCallback } from 'react';
-import { Pressable, ScrollView, StyleSheet } from 'react-native';
+import { ScrollView, StyleSheet } from 'react-native';
 import Animated, { useAnimatedStyle, useSharedValue, withSpring } from 'react-native-reanimated';
 import { useTranslation } from 'react-i18next';
 import { SUPPORTED_BOARDS, formatBoardDisplayName } from '@boardsesh/board-config';
@@ -28,7 +30,7 @@ function Chip({
   onPress: () => void;
   accessibilityLabel?: string;
 }) {
-  const { brandColors, systemColors } = useTheme();
+  const { selection, systemColors } = useTheme();
   const scale = useSharedValue(1);
   const animatedStyle = useAnimatedStyle(() => ({ transform: [{ scale: scale.value }] }));
 
@@ -53,11 +55,11 @@ function Chip({
         animatedStyle,
         styles.chip,
         active
-          ? { borderColor: brandColors.primary, backgroundColor: `${brandColors.primary}14` }
+          ? { borderColor: selection.checkmark, backgroundColor: selection.fill }
           : { borderColor: systemColors.separator },
       ]}
     >
-      <Text variant="caption1" color={active ? brandColors.primary : undefined} style={styles.chipLabel}>
+      <Text variant="caption1" color={selection.text} emphasized={active}>
         {label}
       </Text>
     </AnimatedPressable>
@@ -108,7 +110,7 @@ export function WallFinderFilterChips({
   onClear,
 }: WallFinderFilterChipsProps) {
   const { t } = useTranslation('common');
-  const { brandColors } = useTheme();
+  const { systemColors } = useTheme();
 
   const hasActive =
     multiBoardTypeOnly || selected.length > 0 || selectedLayoutIds.length > 0 || selectedSizeIds.length > 0;
@@ -154,11 +156,11 @@ export function WallFinderFilterChips({
       })}
 
       {hasActive ? (
-        <Pressable onPress={onClear} hitSlop={8} accessibilityRole="button" style={styles.clear}>
-          <Text variant="caption1" color={brandColors.primary} style={styles.chipLabel}>
+        <PressableSurface onPress={onClear} hitSlop={8} accessibilityRole="button" style={styles.clear}>
+          <Text variant="caption1" color={systemColors.accent}>
             {t('actions.clear')}
           </Text>
-        </Pressable>
+        </PressableSurface>
       ) : null}
     </ScrollView>
   );
@@ -174,9 +176,6 @@ const styles = StyleSheet.create({
     paddingVertical: spacing[2],
     borderRadius: 20,
     borderWidth: 1,
-  },
-  chipLabel: {
-    fontWeight: '500',
   },
   clear: {
     paddingHorizontal: spacing[2],

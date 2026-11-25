@@ -26,7 +26,7 @@
 import 'server-only';
 import { cache } from 'react';
 import {
-  GET_BOARD,
+  GET_EMBED_BOARD,
   GET_GYM,
   GET_GYM_BOARDS,
   type GetBoardQueryResponse,
@@ -36,6 +36,7 @@ import {
 import type { Gym, UserBoard } from '@boardsesh/shared-schema';
 import { getGraphQLHttpUrl } from '@/app/lib/graphql/client';
 import { SSR_BACKEND_FETCH_TIMEOUT_MS } from '@/app/lib/ssr-fetch-deadline';
+import { webClientIdentityHeaders } from '@/app/lib/client-identity';
 
 const EMBED_REVALIDATE_SECONDS = 300;
 
@@ -55,7 +56,7 @@ async function fetchEmbedGraphQL<ResponseData, Entity>(
   try {
     const response = await fetch(getGraphQLHttpUrl(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...webClientIdentityHeaders() },
       body: JSON.stringify({ query, variables }),
       signal: AbortSignal.timeout(SSR_BACKEND_FETCH_TIMEOUT_MS),
       next: { revalidate: EMBED_REVALIDATE_SECONDS },
@@ -77,7 +78,7 @@ async function fetchEmbedGraphQL<ResponseData, Entity>(
  * `resolveEmbeddableBoard` (the resolver serves private boards to anon). */
 export const fetchBoardForEmbed = cache(async (boardUuid: string): Promise<EmbedFetchResult<UserBoard | null>> => {
   return fetchEmbedGraphQL<GetBoardQueryResponse, UserBoard | null>(
-    GET_BOARD,
+    GET_EMBED_BOARD,
     { boardUuid },
     (responseData) => responseData.board,
   );

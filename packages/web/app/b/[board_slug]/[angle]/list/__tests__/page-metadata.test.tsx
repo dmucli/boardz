@@ -25,17 +25,22 @@ vi.mock('@/app/lib/i18n/server', () => ({
 
 type ResolvedBoard = {
   slug: string;
+  name: string;
+  angle: number;
   boardType: string;
   layoutId: number;
   sizeId: number;
   setIds: string;
   isPublic: boolean;
   isUnlisted: boolean;
+  gymIsListed?: boolean;
 };
 
 function board(overrides: Partial<ResolvedBoard> = {}): ResolvedBoard {
   return {
     slug: 'my-board',
+    name: 'Backspace',
+    angle: 40,
     boardType: 'kilter',
     layoutId: 1,
     sizeId: 7,
@@ -47,9 +52,15 @@ function board(overrides: Partial<ResolvedBoard> = {}): ResolvedBoard {
 }
 
 const resolveBoardBySlug = vi.fn<(slug: string) => Promise<ResolvedBoard | null>>();
+const resolveBoardBySlugAsStranger = vi.fn<(slug: string) => Promise<ResolvedBoard | null>>();
+
+vi.mock('@/app/lib/backend-url', () => ({
+  getPublicBackendHttpUrl: () => 'https://ws.boardsesh.com',
+}));
 
 vi.mock('@/app/lib/board-slug-utils', () => ({
   resolveBoardBySlug,
+  resolveBoardBySlugAsStranger,
   boardToRouteParams: vi.fn(() => ({
     board_name: 'kilter',
     layout_id: 1,
@@ -66,8 +77,9 @@ vi.mock('@/app/lib/board-slug-utils', () => ({
   })),
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({ board_name: 'kilter', layout_id: 1, size_id: 7, set_ids: [1, 20] })),
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({ board_name: 'kilter', layout_id: 1, size_id: 7, set_ids: [1, 20] })),
 }));
 
 vi.mock('@/app/lib/data/list-page-data.server', () => ({
@@ -83,7 +95,7 @@ vi.mock('@/app/components/climb-front-door/static-list-front-door', () => ({
   default: () => null,
 }));
 
-const pageModule = await import('../page');
+const pageModule = await import('@/app/(site)/b/[board_slug]/[angle]/list/page');
 
 // Every test states the board it wants. A shared `mockResolvedValueOnce` queue
 // made each outcome depend on how many times the previous test happened to call
@@ -91,6 +103,8 @@ const pageModule = await import('../page');
 beforeEach(() => {
   resolveBoardBySlug.mockReset();
   resolveBoardBySlug.mockResolvedValue(board());
+  resolveBoardBySlugAsStranger.mockReset();
+  resolveBoardBySlugAsStranger.mockImplementation((slug) => resolveBoardBySlug(slug));
 });
 
 function generateMetadata(searchParams: Record<string, string> = {}) {
@@ -106,10 +120,10 @@ function canonicalOf(metadata: Awaited<ReturnType<typeof generateMetadata>>) {
 }
 
 describe('board slug list metadata', () => {
-  it('canonicalises the unfiltered list INTO the config-tuple tree (A1), with no robots override', async () => {
+  it('noindexes a public catalogue alias while following links and keeping its canonical', async () => {
     const metadata = await generateMetadata();
 
-    expect(metadata.robots).toBeUndefined();
+    expect(metadata.robots).toEqual({ index: false, follow: true });
     // A1: `/b/{slug}` names a board a user owns, not a climb config. Most
     // configs have no `/b` URL and popular ones have many, so the config-tuple
     // tree is the consolidation target.
@@ -118,10 +132,10 @@ describe('board slug list metadata', () => {
     expect(canonicalOf(metadata)).toContain('/40/list');
   });
 
-  it('keeps pagination-only requests indexable, carrying the page into the cross-tree canonical', async () => {
+  it('noindexes pagination-only aliases, carrying the page into the cross-tree canonical', async () => {
     const metadata = await generateMetadata({ page: '2' });
 
-    expect(metadata.robots).toBeUndefined();
+    expect(metadata.robots).toEqual({ index: false, follow: true });
     expect(canonicalOf(metadata)).toContain('/40/list?page=2');
   });
 
@@ -165,6 +179,13 @@ describe('board slug list metadata', () => {
     expect(metadata.alternates).toBeUndefined();
   });
 
+  it('inherits noindex from an unlisted gym while retaining the board link', async () => {
+    resolveBoardBySlug.mockResolvedValue(board({ gymIsListed: false }));
+    const metadata = await generateMetadata();
+    expect(metadata.robots).toEqual({ index: false, follow: true });
+    expect(metadata.alternates).toBeUndefined();
+  });
+
   it('falls back to generic metadata for an unresolvable slug — no name or canonical leak', async () => {
     // `boardBySlug` answers null for a slug that does not exist, and will also
     // answer null for a private board once #4087 masks it.
@@ -174,6 +195,82 @@ describe('board slug list metadata', () => {
 
     expect(metadata.alternates?.canonical).toBeUndefined();
     expect(JSON.stringify(metadata.title)).not.toContain('my-board');
+  });
+});
+
+describe('board slug list search copy', () => {
+  it('names the layout and size in the title and description, like its config-tuple twin', async () => {
+    const { getBoardImageDetailsForBoard } = await import('@/app/lib/board-image-details');
+    vi.mocked(getBoardImageDetailsForBoard).mockReturnValueOnce({
+      board_name: 'kilter',
+      layout_id: 1,
+      size_id: 7,
+      set_ids: [1, 20],
+      layout_name: 'Kilter Board Original',
+      size_name: '12 x 14',
+    } as unknown as ReturnType<typeof getBoardImageDetailsForBoard>);
+
+    const metadata = await generateMetadata();
+
+    expect(metadata.title).toEqual({
+      absolute: 'metadata.list.title(boardName=Kilter Board Original 12x14,angle=40) | Boardsesh',
+    });
+    expect(metadata.description).toBe('metadata.list.description(boardName=Kilter Board Original 12x14,angle=40)');
+    // The share preview keeps naming the physical board, not the catalogue config.
+    expect(metadata.openGraph?.title).toBe('metadata.list.ogTitle(name=Backspace,angle=40)');
+  });
+});
+
+function imageUrlOf(metadata: Awaited<ReturnType<typeof generateMetadata>>): string | undefined {
+  const images = metadata.openGraph?.images as Array<{ url: string }> | undefined;
+  return images?.[0]?.url;
+}
+
+describe('board slug list share preview', () => {
+  it("points at the backend board card and names the board's own climbs", async () => {
+    const metadata = await generateMetadata();
+
+    expect(imageUrlOf(metadata)).toMatch(
+      /^https:\/\/ws\.boardsesh\.com\/og\/place\?kind=board&slug=my-board&v=[0-9a-f]{12}-[0-9a-z]+$/,
+    );
+    expect(metadata.openGraph?.title).toBe('metadata.list.ogTitle(name=Backspace,angle=40)');
+    expect(metadata.openGraph?.description).toBe('metadata.list.ogDescription');
+    // The search title still leads with the board type.
+    expect(JSON.stringify(metadata.title)).toContain('metadata.list.title');
+  });
+
+  it('gives an Unlisted home board a card: its slug is its link', async () => {
+    resolveBoardBySlug.mockResolvedValue(board({ isUnlisted: true }));
+
+    const metadata = await generateMetadata();
+
+    expect(imageUrlOf(metadata)).toContain('/og/place?kind=board&slug=my-board');
+  });
+
+  it('keeps the generic card for a board a stranger cannot open, which the backend would 404', async () => {
+    // A signed-in follower can open it; the stranger read cannot.
+    resolveBoardBySlug.mockResolvedValue(board({ isPublic: false }));
+    resolveBoardBySlugAsStranger.mockResolvedValue(null);
+
+    const metadata = await generateMetadata();
+
+    expect(imageUrlOf(metadata)).toBe('/opengraph-image');
+  });
+
+  it('never carries an invite token into the image URL', async () => {
+    const metadata = await generateMetadata({ invite: 'secret-invite-token' });
+
+    expect(imageUrlOf(metadata)).not.toContain('secret-invite-token');
+    expect(JSON.stringify(metadata)).not.toContain('secret-invite-token');
+  });
+
+  it('costs the card, never the metadata, when the stranger read fails', async () => {
+    resolveBoardBySlugAsStranger.mockRejectedValue(new Error('backend down'));
+
+    const metadata = await generateMetadata();
+
+    expect(imageUrlOf(metadata)).toBe('/opengraph-image');
+    expect(canonicalOf(metadata)).toContain('/40/list');
   });
 });
 

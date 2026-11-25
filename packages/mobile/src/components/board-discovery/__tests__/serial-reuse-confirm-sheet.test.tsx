@@ -1,27 +1,94 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import type { UserBoard } from '@boardsesh/shared-schema';
 
+// The bottom padding a style asks for, from a single object or an array of layers.
+function readPaddingBottom(style: unknown): number | undefined {
+  const layers = Array.isArray(style) ? style : [style];
+  let paddingBottom: number | undefined;
+  for (const layer of layers) {
+    if (layer && typeof layer === 'object' && 'paddingBottom' in layer) {
+      paddingBottom = (layer as { paddingBottom?: number }).paddingBottom;
+    }
+  }
+  return paddingBottom;
+}
+
 // react-native isn't satisfiable under jsdom; stub the host surface the sheet
 // touches onto DOM elements so the interaction assertions can drive it.
 vi.mock('react-native', () => ({
-  Modal: ({ visible, children }: { visible: boolean; children?: ReactNode }) =>
-    visible ? createElement('div', { 'data-testid': 'modal' }, children) : null,
-  View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  Pressable: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
-    createElement('div', { onClick: onPress }, children),
-  StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
+  Modal: ({ visible, children, animationType }: { visible: boolean; children?: ReactNode; animationType?: string }) =>
+    visible ? createElement('div', { 'data-testid': 'modal', 'data-animation': animationType }, children) : null,
+  View: ({
+    children,
+    style,
+    accessibilityViewIsModal,
+  }: {
+    children?: ReactNode;
+    style?: unknown;
+    accessibilityViewIsModal?: boolean;
+  }) =>
+    createElement(
+      'div',
+      { 'data-pb': String(readPaddingBottom(style) ?? ''), 'data-modal': String(!!accessibilityViewIsModal) },
+      children,
+    ),
+  Pressable: ({
+    children,
+    onPress,
+    accessible,
+    importantForAccessibility,
+  }: {
+    children?: ReactNode;
+    onPress?: () => void;
+    accessible?: boolean;
+    importantForAccessibility?: string;
+  }) =>
+    createElement(
+      'div',
+      {
+        onClick: onPress,
+        'data-backdrop': accessible === false && importantForAccessibility === 'no' ? 'true' : undefined,
+      },
+      children,
+    ),
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+    hairlineWidth: 1,
+    absoluteFill: {},
+  },
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
 }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: { secondaryBackground: '#111', secondaryLabel: '#888', tertiaryLabel: '#666', separator: '#333' },
   }),
 }));
+
+// A gesture-nav phone: the card must clear the home indicator.
+vi.mock('../../../hooks/use-window-bottom-inset', () => ({ useWindowBottomInset: () => 34 }));
+const motion = vi.hoisted(() => ({ reduce: false }));
+vi.mock('../../../hooks/use-reduce-motion', () => ({ useReduceMotion: () => motion.reduce }));
 
 vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { systemOrange: '#FF9500' } }));
 
@@ -121,5 +188,68 @@ describe('SerialReuseConfirmSheet', () => {
     );
     fireEvent.click(getByText('Create a duplicate anyway'));
     expect(onCreateAnyway).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears the window bottom inset under its buttons', () => {
+    const { container } = render(
+      <SerialReuseConfirmSheet
+        visible
+        board={existingBoard}
+        serialNumber="SN-1"
+        onUseExisting={vi.fn()}
+        onCreateAnyway={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+    // 34 for the home indicator plus spacing[4].
+    expect(container.querySelector('[data-pb="50"]')).not.toBeNull();
+  });
+
+  it('keeps the backdrop a hidden sibling of a modal card so VoiceOver reaches the buttons', () => {
+    const onCancel = vi.fn();
+    const { container } = render(
+      <SerialReuseConfirmSheet
+        visible
+        board={existingBoard}
+        serialNumber="ABC123"
+        onUseExisting={() => {}}
+        onCreateAnyway={() => {}}
+        onCancel={onCancel}
+      />,
+    );
+    const backdrop = container.querySelector('[data-backdrop="true"]') as HTMLElement;
+    const card = container.querySelector('[data-modal="true"]') as HTMLElement;
+    expect(backdrop).not.toBeNull();
+    expect(card).not.toBeNull();
+    // The card is not inside the tappable backdrop, so its buttons stay reachable.
+    expect(backdrop.contains(card)).toBe(false);
+    fireEvent.click(backdrop);
+    expect(onCancel).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SerialReuseConfirmSheet motion', () => {
+  function renderSheet() {
+    return render(
+      <SerialReuseConfirmSheet
+        visible
+        board={existingBoard}
+        serialNumber="ABC-123"
+        onUseExisting={vi.fn()}
+        onCreateAnyway={vi.fn()}
+        onCancel={vi.fn()}
+      />,
+    );
+  }
+
+  it('slides up by default', () => {
+    motion.reduce = false;
+    expect(renderSheet().getByTestId('modal').getAttribute('data-animation')).toBe('slide');
+  });
+
+  it('fades in instead under Reduce Motion', () => {
+    motion.reduce = true;
+    expect(renderSheet().getByTestId('modal').getAttribute('data-animation')).toBe('fade');
+    motion.reduce = false;
   });
 });

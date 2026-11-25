@@ -19,6 +19,11 @@ vi.mock('../../providers/auth-provider', () => ({ useAuth: () => ({ signOut: sig
 const databaseHandle = vi.hoisted(() => ({ current: {} as unknown }));
 vi.mock('../../db', () => ({ getDatabaseHandle: () => databaseHandle.current }));
 
+const schemaDowngrade = vi.hoisted(() => ({
+  current: null as { storedVersion: number; supportedVersion: number } | null,
+}));
+vi.mock('../../db/schema-downgrade', () => ({ getSchemaDowngrade: () => schemaDowngrade.current }));
+
 const hasDownloadedBoardDataMock = vi.hoisted(() => vi.fn(async (): Promise<boolean> => false));
 vi.mock('../../db/queries/board-download-status', () => ({
   hasDownloadedBoardData: hasDownloadedBoardDataMock,
@@ -65,22 +70,35 @@ import { useConfirmSignOut } from '../use-confirm-sign-out';
 // The hook holds a ref, so it needs a render tree; this drives it as a real
 // component. `press` awaits the whole flow inside act(); `tap` fires without
 // awaiting, for the double-tap case where the first call must still be in flight.
-function renderConfirmSignOut(): { press: () => Promise<void>; tap: () => Promise<void> } {
-  const hookRef = { current: null as (() => Promise<void>) | null };
+function renderConfirmSignOut(): {
+  press: (signal?: AbortSignal) => Promise<void>;
+  tap: (signal?: AbortSignal) => Promise<void>;
+} {
+  const hookRef = { current: null as ((signal?: AbortSignal) => Promise<void>) | null };
   function Probe() {
     hookRef.current = useConfirmSignOut();
     return null;
   }
   render(createElement(Probe));
-  const invoke = () => hookRef.current?.() ?? Promise.resolve();
+  const invoke = (signal?: AbortSignal) => hookRef.current?.(signal) ?? Promise.resolve();
   return {
-    press: async () => {
+    press: async (signal?: AbortSignal) => {
       await act(async () => {
-        await invoke();
+        await invoke(signal);
       });
     },
     tap: invoke,
   };
+}
+
+function deferred<Result>() {
+  let resolve!: (result: Result) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<Result>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 function messageOf(call = 0): string {
@@ -101,6 +119,7 @@ beforeEach(() => {
   reportErrorMock.mockClear();
   showSignOutFailureMock.mockClear();
   databaseHandle.current = {};
+  schemaDowngrade.current = null;
 });
 
 describe('useConfirmSignOut', () => {
@@ -303,5 +322,198 @@ describe('useConfirmSignOut', () => {
       'mobile.settings.signOut.failureTitle',
       'mobile.settings.signOut.failure',
     );
+  });
+
+  it('lets the user confirm and retry after a failed sign-out', async () => {
+    signOutMock.mockRejectedValueOnce(new Error('NextAuth sign-out unavailable'));
+    const { press } = renderConfirmSignOut();
+
+    await press();
+    expect(showSignOutFailureMock).toHaveBeenCalledTimes(1);
+
+    await press();
+
+    expect(confirmMock).toHaveBeenCalledTimes(2);
+    expect(signOutMock).toHaveBeenCalledTimes(2);
+    expect(signOutMock).toHaveBeenLastCalledWith('manual');
+    expect(showSignOutFailureMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels a pending outbox probe and permits retry while that read never settles', async () => {
+    getOutboxSummaryMock.mockReturnValueOnce(new Promise<OutboxSummary>(() => {}));
+    const controller = new AbortController();
+    const { tap, press } = renderConfirmSignOut();
+    let settled = false;
+    const abortedAttempt = tap(controller.signal).then(() => {
+      settled = true;
+    });
+
+    controller.abort();
+    await vi.waitFor(() => expect(settled).toBe(true));
+    await abortedAttempt;
+
+    expect(hasDownloadedBoardDataMock).not.toHaveBeenCalled();
+    expect(confirmMock).not.toHaveBeenCalled();
+    expect(signOutMock).not.toHaveBeenCalled();
+
+    await press();
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(signOutMock).toHaveBeenCalledTimes(1);
+    expect(showSignOutFailureMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['resolve', 'reject'] as const)('ignores late outbox %s after cancellation', async (outcome) => {
+    const outboxRead = deferred<OutboxSummary>();
+    getOutboxSummaryMock.mockReturnValueOnce(outboxRead.promise);
+    const controller = new AbortController();
+    const { tap } = renderConfirmSignOut();
+    let settled = false;
+    const attempt = tap(controller.signal).then(() => {
+      settled = true;
+    });
+
+    controller.abort();
+    await vi.waitFor(() => expect(settled).toBe(true));
+    await attempt;
+    if (outcome === 'resolve') outboxRead.resolve(outbox(2, 1));
+    else outboxRead.reject(new Error('late read failure'));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(hasDownloadedBoardDataMock).not.toHaveBeenCalled();
+    expect(confirmMock).not.toHaveBeenCalled();
+    expect(signOutMock).not.toHaveBeenCalled();
+    expect(reportErrorMock).not.toHaveBeenCalled();
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'cancels a pending downloads probe and ignores its late %s',
+    async (outcome) => {
+      const downloadsRead = deferred<boolean>();
+      hasDownloadedBoardDataMock.mockReturnValueOnce(downloadsRead.promise);
+      const controller = new AbortController();
+      const { tap } = renderConfirmSignOut();
+      let settled = false;
+      const attempt = tap(controller.signal).then(() => {
+        settled = true;
+      });
+      await vi.waitFor(() => expect(hasDownloadedBoardDataMock).toHaveBeenCalledTimes(1));
+
+      controller.abort();
+      await vi.waitFor(() => expect(settled).toBe(true));
+      await attempt;
+      if (outcome === 'resolve') downloadsRead.resolve(true);
+      else downloadsRead.reject(new Error('late downloads failure'));
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(confirmMock).not.toHaveBeenCalled();
+      expect(signOutMock).not.toHaveBeenCalled();
+      expect(reportErrorMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps the retry single-flight when an aborted attempt finishes its old read', async () => {
+    const oldRead = deferred<OutboxSummary>();
+    const retryRead = deferred<OutboxSummary>();
+    getOutboxSummaryMock.mockReturnValueOnce(oldRead.promise).mockReturnValueOnce(retryRead.promise);
+    const controller = new AbortController();
+    const { tap } = renderConfirmSignOut();
+    let settled = false;
+    const original = tap(controller.signal).then(() => {
+      settled = true;
+    });
+    controller.abort();
+    await vi.waitFor(() => expect(settled).toBe(true));
+    await original;
+
+    const retry = tap();
+    oldRead.resolve(outbox(1, 0));
+    await oldRead.promise;
+    await tap();
+    expect(getOutboxSummaryMock).toHaveBeenCalledTimes(2);
+    expect(confirmMock).not.toHaveBeenCalled();
+
+    retryRead.resolve(outbox(0, 0));
+    await retry;
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(signOutMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('finishes confirmed sign-out after cancellation during the pending sign-out', async () => {
+    const signOut = deferred<void>();
+    signOutMock.mockReturnValueOnce(signOut.promise);
+    const controller = new AbortController();
+    const { tap } = renderConfirmSignOut();
+    const attempt = tap(controller.signal);
+    await vi.waitFor(() => expect(signOutMock).toHaveBeenCalledTimes(1));
+
+    controller.abort();
+    signOut.resolve(undefined);
+    await attempt;
+
+    expect(signOutMock).toHaveBeenCalledWith('manual');
+    expect(showSignOutFailureMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('useConfirmSignOut when the offline database belongs to a newer app version', () => {
+  beforeEach(() => {
+    // The init chain never publishes a handle in this state.
+    databaseHandle.current = null;
+    schemaDowngrade.current = { storedVersion: 11, supportedVersion: 10 };
+  });
+
+  it('does not show a downgrade warning for a pre-aborted attempt', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const { press } = renderConfirmSignOut();
+
+    await press(controller.signal);
+
+    expect(confirmMock).not.toHaveBeenCalled();
+    expect(signOutMock).not.toHaveBeenCalled();
+  });
+
+  it('warns about the sends waiting on this phone, with staying as the safe choice', async () => {
+    const { press } = renderConfirmSignOut();
+
+    await press();
+
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(confirmMock).toHaveBeenCalledWith({
+      title: 'mobile.settings.signOut.title',
+      message: 'mobile.settings.signOut.downgradeMessage',
+      confirmLabel: 'mobile.settings.signOut.downgradeConfirm',
+      cancelLabel: 'mobile.settings.signOut.downgradeCancel',
+      destructive: true,
+    });
+  });
+
+  it('stays signed in when the climber backs out', async () => {
+    confirmMock.mockResolvedValue(false);
+    const { press } = renderConfirmSignOut();
+
+    await press();
+
+    expect(signOutMock).not.toHaveBeenCalled();
+  });
+
+  it('signs out when the climber chooses to anyway', async () => {
+    const { press } = renderConfirmSignOut();
+
+    await press();
+
+    expect(signOutMock).toHaveBeenCalledTimes(1);
+    expect(signOutMock).toHaveBeenCalledWith('manual');
+  });
+
+  it('never reads the refused database to compose the message', async () => {
+    const { press } = renderConfirmSignOut();
+
+    await press();
+
+    expect(getOutboxSummaryMock).not.toHaveBeenCalled();
+    expect(hasDownloadedBoardDataMock).not.toHaveBeenCalled();
   });
 });

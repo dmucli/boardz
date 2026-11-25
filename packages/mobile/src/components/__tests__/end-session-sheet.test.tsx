@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
-import { createElement, forwardRef, useImperativeHandle, type ReactNode, type Ref } from 'react';
+vi.mock('../use-ios-sheet-background-style', () => ({ useIosSheetBackgroundStyle: () => undefined }));
+vi.mock('../AccessibleBottomSheetTextInput', async () => {
+  const { BottomSheetTextInput } = await import('@expo/ui/community/bottom-sheet');
+  return { AccessibleBottomSheetTextInput: BottomSheetTextInput };
+});
+import { describe, it, expect, vi } from 'vitest';
+import { act, render, fireEvent } from '@testing-library/react';
+import { createElement, useState, type ReactNode } from 'react';
 
 // Pulls `paddingBottom` out of a style that may be a single object or an array
 // of layers (the component passes `[styles.content, { paddingBottom }]`).
@@ -15,11 +20,65 @@ function readPaddingBottom(style: unknown): number | undefined {
   return undefined;
 }
 
-const sheet = vi.hoisted(() => ({ expand: vi.fn() }));
+const coordinatedSheet = vi.hoisted(() => ({
+  onClose: undefined as (() => void) | undefined,
+  visible: false,
+}));
 
-type ViewMockProps = { children?: ReactNode };
+// Keep the original raw-sheet implementation renderable for regression proof.
+// Both implementations must fail or pass on behavior, rather than missing mocks.
+vi.mock('../../hooks/use-keyboard-height', () => ({ useKeyboardHeight: () => 0 }));
+vi.mock('../../hooks/use-window-bottom-inset', () => ({ useWindowBottomInset: () => 34 }));
+vi.mock('../../providers/sheet-presentation-provider', () => ({
+  useManagedSheet: ({ open, onClose }: { open: boolean; onClose?: () => void }) => {
+    coordinatedSheet.visible = open;
+    coordinatedSheet.onClose = onClose;
+    return { onChange: vi.fn(), onFullyDismissed: vi.fn() };
+  },
+}));
+
+vi.mock('../ModalSheet', () => ({
+  ModalSheet: ({
+    children,
+    header,
+    visible,
+    snapPoints,
+    scrollable,
+    androidContentSized,
+    enablePanDownToClose,
+    onClose,
+  }: {
+    children?: ReactNode;
+    header?: ReactNode;
+    visible?: boolean;
+    snapPoints?: string[];
+    scrollable?: boolean;
+    androidContentSized?: boolean;
+    enablePanDownToClose?: boolean;
+    onClose?: () => void;
+  }) => {
+    coordinatedSheet.onClose = onClose;
+    return createElement(
+      'div',
+      {
+        'data-sheet': 'true',
+        'data-visible': String(visible),
+        'data-snappoints': JSON.stringify(snapPoints),
+        'data-scrollable': String(scrollable),
+        'data-android-content-sized': String(androidContentSized),
+        'data-pan-close': String(enablePanDownToClose),
+      },
+      createElement('header', null, header),
+      createElement('main', null, children),
+    );
+  },
+}));
+type ViewMockProps = { children?: ReactNode; style?: unknown; testID?: string };
 vi.mock('react-native', () => ({
-  View: ({ children }: ViewMockProps) => createElement('div', {}, children),
+  Platform: { OS: 'ios' },
+  View: ({ children, style, testID }: ViewMockProps) =>
+    createElement('div', { 'data-testid': testID, 'data-pb': String(readPaddingBottom(style) ?? '') }, children),
+  // Present so a regression back to a KeyboardAvoidingView shows up below.
   KeyboardAvoidingView: ({ children }: ViewMockProps) => createElement('div', { 'data-kav': 'true' }, children),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles },
 }));
@@ -28,37 +87,33 @@ vi.mock('react-native', () => ({
 // constant so this jsdom test doesn't pull the whole schema package.
 vi.mock('@boardsesh/shared-schema', () => ({ SESSION_NOTES_MAX_LENGTH: 2000 }));
 
-// BottomSheet → div exposing the dynamic-sizing / snap-point props so a test can
-// assert the sheet is content-sized, with an imperative `expand` for the effect.
-type SheetMockProps = {
-  children?: ReactNode;
-  enableDynamicSizing?: boolean;
-  snapPoints?: (string | number)[];
-  index?: number;
-};
-type SheetViewMockProps = { children?: ReactNode; style?: unknown };
 vi.mock('@expo/ui/community/bottom-sheet', () => ({
-  default: forwardRef(({ children, enableDynamicSizing, snapPoints, index }: SheetMockProps, ref: Ref<unknown>) => {
-    useImperativeHandle(ref, () => ({ expand: sheet.expand }));
-    return createElement(
+  default: ({
+    children,
+    snapPoints,
+    enablePanDownToClose,
+  }: {
+    children?: ReactNode;
+    snapPoints?: string[];
+    enablePanDownToClose?: boolean;
+  }) =>
+    createElement(
       'div',
       {
         'data-sheet': 'true',
-        'data-dynamic': enableDynamicSizing ? 'true' : 'false',
-        'data-snappoints': snapPoints ? JSON.stringify(snapPoints) : '',
-        'data-index': index === undefined ? '' : String(index),
+        'data-visible': String(coordinatedSheet.visible),
+        'data-snappoints': JSON.stringify(snapPoints),
+        'data-pan-close': String(enablePanDownToClose),
       },
       children,
-    );
-  }),
-  BottomSheetView: ({ children, style }: SheetViewMockProps) =>
-    createElement('div', { 'data-sheet-view': 'true', 'data-pb': String(readPaddingBottom(style) ?? '') }, children),
+    ),
+  BottomSheetView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   BottomSheetTextInput: ({ placeholder, value, onChangeText, accessibilityLabel, maxLength }: TextInputMockProps) =>
     createElement('input', {
       'data-textinput': 'true',
       'data-placeholder': placeholder ?? '',
       'data-aria': accessibilityLabel ?? '',
-      'data-maxlength': maxLength === undefined ? '' : String(maxLength),
+      'data-maxlength': String(maxLength ?? ''),
       value: value ?? '',
       onChange: (event: { target: { value: string } }) => onChangeText?.(event.target.value),
     }),
@@ -71,35 +126,6 @@ type TextInputMockProps = {
   accessibilityLabel?: string;
   maxLength?: number;
 };
-
-// Isolate the sheet from the presentation coordinator (its serialization is
-// covered by sheet-presentation-provider.test.tsx). The sheet is always mounted
-// and opened/closed by the coordinator; these tests drive close via the Done
-// button's onDismiss prop, so a no-op managed handle is enough.
-vi.mock('../../providers/sheet-presentation-provider', () => ({
-  useManagedSheet: ({ onClose }: { onClose?: () => void }) => ({
-    onChange: (index: number) => {
-      if (index === -1) onClose?.();
-    },
-    onFullyDismissed: () => {},
-    handle: {
-      present: () => {},
-      dismiss: () => {},
-      close: () => {},
-      forceClose: () => {},
-      snapToIndex: () => {},
-      snapToPosition: () => {},
-      expand: () => {},
-      collapse: () => {},
-    },
-  }),
-}));
-
-// Gesture-nav phone: a non-zero bottom inset is the case the dynamic-sizing fix
-// guards against (button row crowded under the home indicator).
-vi.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 47, bottom: 34, left: 0, right: 0 }),
-}));
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -145,6 +171,46 @@ vi.mock('../Button', () => ({
     }),
 }));
 
+// The top bar's actions render as buttons keyed by their label, so the cases
+// below press them the way they pressed the old row of buttons.
+type TopBarActionMock = {
+  label?: string;
+  kind?: string;
+  accessibilityLabel?: string;
+  onPress: () => void;
+  loading?: boolean;
+  disabled?: boolean;
+  destructive?: boolean;
+};
+vi.mock('../SheetTopBar', () => ({
+  SheetTopBar: ({
+    title,
+    leading,
+    trailing,
+  }: {
+    title: string;
+    leading?: TopBarActionMock;
+    trailing?: TopBarActionMock;
+  }) =>
+    createElement(
+      'div',
+      { 'data-top-bar': title },
+      [leading, trailing].map((action, index) =>
+        action
+          ? createElement('button', {
+              key: index,
+              onClick: action.onPress,
+              'data-button': action.label ?? action.accessibilityLabel ?? action.kind,
+              'data-slot': index === 0 ? 'leading' : 'trailing',
+              'data-loading': action.loading ? 'true' : 'false',
+              'data-disabled': action.disabled ? 'true' : 'false',
+              'data-destructive': action.destructive ? 'true' : 'false',
+            })
+          : null,
+      ),
+    ),
+}));
+
 vi.mock('../Icon', () => ({
   Icon: ({ name }: { name: string }) => createElement('span', { 'data-icon': name }),
 }));
@@ -182,17 +248,11 @@ const button = (root: HTMLElement, title: string) =>
 const textInput = (root: HTMLElement) => root.querySelector('[data-textinput]') as HTMLInputElement | null;
 
 describe('EndSessionSheet', () => {
-  beforeEach(() => {
-    sheet.expand.mockClear();
-  });
-
-  it('stays mounted but closed (index -1) until the coordinator opens it', () => {
-    // The sheet is always mounted now — present/dismiss route through the
-    // coordinator — so it renders at the closed index rather than returning null.
+  it('delegates controlled visibility to the coordinated wrapper', () => {
     const { container } = render(<EndSessionSheet {...makeProps({ visible: false })} />);
     const sheetEl = container.querySelector('[data-sheet]') as HTMLElement;
     expect(sheetEl).not.toBeNull();
-    expect(sheetEl.getAttribute('data-index')).toBe('-1');
+    expect(sheetEl.getAttribute('data-visible')).toBe('false');
   });
 
   it('shows the confirmation copy, climb count, and both actions when visible', () => {
@@ -204,17 +264,75 @@ describe('EndSessionSheet', () => {
     expect(button(container, 'mobile.queue.endSession')).not.toBeNull();
   });
 
-  it('sizes to content instead of a fixed snap point', () => {
+  it('bounds the scrolling body while pinning actions outside it', () => {
     const { container } = render(<EndSessionSheet {...makeProps()} />);
-    const sheetEl = container.querySelector('[data-sheet]') as HTMLElement;
-    expect(sheetEl.getAttribute('data-dynamic')).toBe('true');
-    expect(sheetEl.getAttribute('data-snappoints')).toBe('');
+    const sheetEl = container.querySelector('[data-sheet]')!;
+    expect(sheetEl.getAttribute('data-snappoints')).toBe('["50%","90%"]');
+    expect(sheetEl.getAttribute('data-scrollable')).toBe('true');
+    expect(sheetEl.getAttribute('data-android-content-sized')).toBe('true');
+    expect(container.querySelector('header [data-top-bar]')).not.toBeNull();
+    expect(container.querySelector('main [data-top-bar]')).toBeNull();
+    // Only decorative padding lives here; the shared wrapper owns keyboard clearance.
+    expect(container.querySelector('[data-testid="end-session-content"]')?.getAttribute('data-pb')).toBe('12');
   });
 
-  it('pads the content past the safe-area bottom inset (34) plus spacing[3] (12)', () => {
+  it('retains typed recap across leave/end switches', () => {
+    function ControlledSheet() {
+      const [notes, onNotesChange] = useState('');
+      return <EndSessionSheet {...makeProps({ notes, onNotesChange })} />;
+    }
+    const { container } = render(<ControlledSheet />);
+    fireEvent.change(textInput(container)!, { target: { value: 'A long recap' } });
+    fireEvent.click(button(container, 'mobile.queue.leaveInsteadAction')!);
+    expect(textInput(container)).toBeNull();
+    fireEvent.click(button(container, 'mobile.queue.endForEveryone')!);
+    expect(textInput(container)?.value).toBe('A long recap');
+  });
+
+  it('puts End session in the top bar as the trailing action and the exit as leading', () => {
     const { container } = render(<EndSessionSheet {...makeProps()} />);
-    const view = container.querySelector('[data-sheet-view]') as HTMLElement;
-    expect(view.getAttribute('data-pb')).toBe('46');
+    expect(container.querySelector('[data-top-bar="mobile.queue.endSession"]')).not.toBeNull();
+    expect(button(container, 'mobile.queue.endSession')?.getAttribute('data-slot')).toBe('trailing');
+    expect(button(container, 'mobile.queue.endSessionCancel')?.getAttribute('data-slot')).toBe('leading');
+  });
+
+  it('draws End session as destructive but not Leave, which ends nothing for anyone else', () => {
+    const endSheet = render(<EndSessionSheet {...makeProps()} />);
+    expect(button(endSheet.container, 'mobile.queue.endSession')?.getAttribute('data-destructive')).toBe('true');
+    endSheet.unmount();
+    const leaveSheet = render(<EndSessionSheet {...makeProps({ defaultMode: 'leave' })} />);
+    expect(button(leaveSheet.container, 'mobile.queue.leaveSessionAction')?.getAttribute('data-destructive')).toBe(
+      'false',
+    );
+  });
+
+  it('keeps the sheet up while an exit is in flight', () => {
+    const onDismiss = vi.fn();
+    const { container } = render(<EndSessionSheet {...makeProps({ onDismiss, isEnding: true })} />);
+    fireEvent.click(button(container, 'mobile.queue.endSessionCancel')!);
+    expect(onDismiss).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-sheet]')?.getAttribute('data-pan-close')).toBe('false');
+  });
+
+  it.each(['ending', 'leaving'] as const)('clears controlled visibility when displaced while %s', (pendingExit) => {
+    function ControlledSheet() {
+      const [visible, setVisible] = useState(true);
+      return (
+        <EndSessionSheet
+          {...makeProps({
+            visible,
+            onDismiss: () => setVisible(false),
+            isEnding: pendingExit === 'ending',
+            isLeaving: pendingExit === 'leaving',
+          })}
+        />
+      );
+    }
+    const { container } = render(<ControlledSheet />);
+    expect(container.querySelector('[data-sheet]')?.getAttribute('data-pan-close')).toBe('false');
+    // Coordinator displacement notifies the parent even when user dismissal is locked.
+    act(() => coordinatedSheet.onClose?.());
+    expect(container.querySelector('[data-sheet]')?.getAttribute('data-visible')).toBe('false');
   });
 
   it('fires onConfirm when End session is pressed', () => {
@@ -224,7 +342,7 @@ describe('EndSessionSheet', () => {
     expect(onConfirm).toHaveBeenCalledTimes(1);
   });
 
-  it('fires onDismiss when Done is pressed', () => {
+  it('fires onDismiss when the top bar close is pressed', () => {
     const onDismiss = vi.fn();
     const { container } = render(<EndSessionSheet {...makeProps({ onDismiss })} />);
     fireEvent.click(button(container, 'mobile.queue.endSessionCancel')!);

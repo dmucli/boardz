@@ -11,7 +11,15 @@
       "privateDescription": "Esta playlist es privada.",
       "generatedDescription_one": "{{count}} bloque de {{board}} en {{name}}. Abre la playlist en Boardsesh y escálalo.",
       "generatedDescription_other": "{{count}} bloques de {{board}} en {{name}}. Abre la playlist en Boardsesh y escálalos.",
-      "ogAlt": "La playlist {{name}} en Boardsesh"
+      "ogAlt": "La playlist {{name}} en Boardsesh",
+      "ogTitle": "{{name}} · Lista de {{board}}",
+      "ogTitleWithBand": "{{name}} · Lista de {{board}} {{band}}",
+      "ogDescriptionRange_one": "{{count}} bloque de {{board}} de {{low}} a {{high}}. Pruébalo.",
+      "ogDescriptionRange_other": "{{count}} bloques de {{board}} de {{low}} a {{high}}. Elige uno y pruébalo.",
+      "ogDescriptionOneGrade_one": "{{count}} bloque de {{board}} de {{grade}}. Pruébalo.",
+      "ogDescriptionOneGrade_other": "{{count}} bloques de {{board}} de {{grade}}. Elige uno y pruébalo.",
+      "ogDescriptionNoBand_one": "{{count}} bloque de {{board}}. Pruébalo.",
+      "ogDescriptionNoBand_other": "{{count}} bloques de {{board}}. Elige uno y pruébalo."
     }
   },
   "library": {
@@ -26,6 +34,7 @@
       "community": "Playlists de la comunidad"
     },
     "communityByline": "{{creatorName}} - {{climbCount}}",
+    "gradeBand": "Grados {{band}}",
     "allPlaylists": {
       "title": "Mis listas",
       "seeAll": "Ver todas",
@@ -33,6 +42,55 @@
       "clearSearch": "Borrar búsqueda",
       "loadMoreError": "No se pudieron cargar todas tus listas.",
       "noResults": "Ninguna lista coincide con \"{{query}}\""
+    },
+    "community": {
+      "searchPlaceholder": "Buscar playlists",
+      "madeByLabel": "Creadas por",
+      "madeBy": {
+        "everyone": "Todos",
+        "mine": "Mías",
+        "following": "Siguiendo"
+      },
+      "sortLabel": "Ordenar",
+      "sort": {
+        "popular": "Populares",
+        "recent": "Nuevas"
+      },
+      "sizeLabel": "Tamaño",
+      "size": {
+        "any": "Cualquiera",
+        "short": "Corta",
+        "session": "Sesión",
+        "big": "Larga"
+      },
+      "gradeLabel": "Grado",
+      "gradeAny": "Cualquier grado",
+      "gradeA11y": "Rango de grados: {{band}}",
+      "sizeBand": {
+        "upTo": "Hasta {{max}} bloques",
+        "range": "{{min}}–{{max}} bloques",
+        "atLeast": "{{min}}+ bloques"
+      },
+      "resultCount_one": "{{count}} playlist",
+      "resultCount_other": "{{count}} playlists",
+      "loadMoreError": "No se pudieron cargar más playlists.",
+      "errors": {
+        "loadTitle": "No se pudieron cargar las playlists",
+        "loadDescription": "Revisa tu conexión e inténtalo de nuevo."
+      },
+      "empty": {
+        "title": "Aún no hay playlists aquí",
+        "description": "Haz pública una de las tuyas y la verá toda la crew."
+      },
+      "emptyFollowing": {
+        "title": "Tu crew aún no tiene playlists",
+        "description": "Las personas que sigues todavía no han hecho pública ninguna playlist en este plafón."
+      },
+      "noMatches": {
+        "title": "Nada encaja con esos filtros",
+        "description": "Afloja algún filtro para ver más.",
+        "clearFilters": "Borrar filtros"
+      }
     },
     "pin": {
       "pin": "Fijar",
@@ -83,7 +141,15 @@
         "title": "Playlist inteligente no encontrada",
         "description": "Esta playlist inteligente no existe."
       },
-      "empty": "Todavía no hay bloques en esta playlist inteligente."
+      "empty": "Todavía no hay bloques en esta playlist inteligente.",
+      "createdClimbs": {
+        "title": "Mis bloques",
+        "description": "Tus bloques publicados, en todos tus plafones.",
+        "empty": {
+          "title": "Aún no hay bloques publicados",
+          "supporting": "Publica un bloque para encontrarlo aquí. Tus borradores siguen en el editor."
+        }
+      }
     },
     "empty": {
       "title": "Aún no tienes playlists",
@@ -102,7 +168,21 @@
   "detail": {
     "share": "Compartir playlist",
     "actions": "Acciones de la playlist",
-    "activateAll": "Poner en cola todos los bloques",
+    "activateAll": "Reproducir",
+    "addToQueue": {
+      "action": "Poner al final",
+      "actionCount_one": "Poner {{count}} al final",
+      "actionCount_other": "Poner {{count}} al final",
+      "subtitle": "Van después del resto de tu cola",
+      "playNextAction": "Poner a continuación",
+      "playNextActionCount_one": "Poner {{count}} a continuación",
+      "playNextActionCount_other": "Poner {{count}} a continuación",
+      "playNextSubtitle": "Van antes del resto de tu cola",
+      "queueFull": "Tu cola ya está llena con {{max}} bloques",
+      "nothingToAdd": "Aquí no hay nada para tu plafón todavía",
+      "alreadyAdding": "Ya se está añadiendo esta playlist",
+      "failed": "No se pudo añadir a la cola. Inténtalo de nuevo."
+    },
     "boardMismatch": {
       "title": "Cambia a {{board}} para escalar esta playlist",
       "subtitle": "Estos son bloques de {{board}}. Cambia de plafón para ponerlos en cola.",
@@ -133,7 +213,10 @@
       "message_other": "Reproduce la playlist en orden desde aquí. Los {{count}} bloques en cola después de tu bloque actual se eliminan.",
       "cancel": "Cancelar",
       "confirm": "Iniciar playlist",
-      "loadFailed": "No se pudo iniciar la playlist. Inténtalo de nuevo."
+      "loadFailed": "No se pudo iniciar la playlist. Inténtalo de nuevo.",
+      "trimmed": "Se cargaron {{loaded}} de {{total}} bloques. Tu cola admite {{max}}.",
+      "trimmedUnknownTotal": "Se cargaron {{loaded}} bloques. Tu cola admite {{max}}.",
+      "addInstead": "Poner al final"
     },
     "deleteConfirm": {
       "title": "¿Eliminar playlist?",
@@ -143,9 +226,37 @@
     },
     "discussion": "Discusión",
     "empty": "Aún no hay bloques en esta playlist",
+    "view": {
+      "status_one": "{{shown}} de {{count}} bloque",
+      "status_other": "{{shown}} de {{count}} bloques",
+      "clearFilters": "Borrar filtros",
+      "editNote": "Mientras editas se muestra el orden de la playlist",
+      "namePlaceholder": "Nombre del bloque",
+      "empty": {
+        "noMatch": "Ningún bloque de aquí cumple esos filtros.",
+        "allSent": "Ya has encadenado todo lo de esta lista. ¡Bien hecho!",
+        "noName": "No hay ningún bloque llamado «{{name}}» en esta playlist.",
+        "noBoardFit": "Ninguno de estos bloques encaja en tu plafón."
+      }
+    },
     "climbCount_one": "{{count}} bloque",
     "climbCount_other": "{{count}} bloques",
-    "openInApp": "Escala esto en la app",
+    "cta": {
+      "getAppHelper": "Ilumina estos bloques en tu plafón, uno tras otro.",
+      "openInBrowser": "Ábrela en el navegador",
+      "openInBrowserMobile": "O abre la playlist en el navegador"
+    },
+    "qr": {
+      "title": "Escanea para abrir esta playlist en tu móvil",
+      "imageLabel": "Código QR que abre {{name}} en tu móvil"
+    },
+    "subline": {
+      "boardPlaylist": "Playlist de {{board}}",
+      "sprayWallPlaylist": "Playlist de Spraywall",
+      "sprayWall": "Spraywall",
+      "multiBoardPlaylist": "Playlist de {{boards}}",
+      "gradeBand": "de {{low}} a {{high}}"
+    },
     "followerCount_one": "{{count}} seguidor",
     "followerCount_other": "{{count}} seguidores",
     "followFailed": "No se pudo actualizar el seguimiento",
@@ -155,7 +266,12 @@
       "loadTitle": "No se pudo cargar la playlist",
       "loadDescription": "Hubo un error al cargar esta playlist. Inténtalo de nuevo.",
       "tryAgain": "Reintentar"
-    }
+    },
+    "setterPicker": {
+      "showClimbs": "Ver bloques",
+      "error": "No se pudieron cargar los creadores de esta lista."
+    },
+    "installHelper": "¿Aún no tienes la app? Descárgala gratis y escala esta lista en tu plafón."
   },
   "editClimbs": {
     "done": "Listo",
@@ -185,8 +301,7 @@
       "privateHint": "Las listas privadas solo son visibles para ti"
     },
     "actions": {
-      "save": "Guardar",
-      "saving": "Guardando..."
+      "save": "Guardar"
     },
     "validation": {
       "nameRequired": "Introduce un nombre de lista",
@@ -201,7 +316,6 @@
   "create": {
     "drawerTitle": "Crear playlist",
     "submit": "Crear",
-    "submitting": "Creando...",
     "fields": {
       "name": "Nombre",
       "namePlaceholder": "p. ej., Regletas duras",

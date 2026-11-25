@@ -4,7 +4,7 @@ export const syncTypeDefs = /* GraphQL */ `
   # ============================================
   #
   # The sync pull resolvers return opaque snake_case JSON documents (the keys are
-  # the mobile SQLite column names — see docs/sync-table-manifest.md). The cursor
+  # the mobile SQLite column names — see docs/data/sync-table-manifest.md). The cursor
   # is a composite (updatedAt, syncSeq) so timestamp collisions during Aurora bulk
   # updates never skip rows. Timestamps are ISO-8601 String, never a DateTime
   # scalar (the codebase has none).
@@ -21,6 +21,12 @@ export const syncTypeDefs = /* GraphQL */ `
     syncSeq: String
   }
 
+  "Rows needed by ordinary sync or to complete an imported public snapshot."
+  enum SyncAudience {
+    ALL
+    SNAPSHOT_SUPPLEMENTAL
+  }
+
   """
   Composite sync cursor returned by a pull. Feed it back as SyncCursorInput on
   the next page.
@@ -30,6 +36,14 @@ export const syncTypeDefs = /* GraphQL */ `
     updatedAt: String!
     "Sequence component of the last row, stringified bigint."
     syncSeq: String!
+  }
+
+  "Canonical saved-climb documents from one snapshot, without changing a pull cursor."
+  type SyncClimbDocuments {
+    "Authenticated account owning the client mirror, independent of the setter."
+    viewerId: ID!
+    climb: JSON!
+    stats: [JSON!]!
   }
 
   """
@@ -51,7 +65,7 @@ export const syncTypeDefs = /* GraphQL */ `
   type SyncDeletion {
     "Postgres table the row was deleted from."
     tableName: String!
-    "Natural-key encoding of the deleted row (see docs/sync-table-manifest.md)."
+    "Natural-key encoding of the deleted row (see docs/data/sync-table-manifest.md)."
     recordId: String!
     "When the row was deleted (ISO 8601)."
     deletedAt: String!

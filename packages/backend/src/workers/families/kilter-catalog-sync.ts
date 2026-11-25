@@ -50,13 +50,16 @@ export const kilterCatalogSyncFamily: BackgroundJobFamilyModule<KilterCatalogSyn
     // budget (fan-out-budget.ts), so it runs late instead of expiring at claim.
     deadlineSeconds: BOARD_WIDE_FAN_OUT_DEADLINE_SECONDS,
     // Equal to the routine cycle, so FIFO order keeps it from waiting behind
-    // an endless stream of cycles (docs/background-workers.md, "Queue share").
+    // an endless stream of cycles (docs/backend/background-workers.md, "Queue share").
     priority: 0,
     heartbeatSeconds: 300,
   },
   payload: kilterCatalogSyncPayload,
   singletonKey: () => 'kilter',
-  schedules: [{ key: 'hourly', cron: '23 * * * *', fanOut: async () => [{ payload: {} }] }],
+  // Every 6 hours, not hourly: each run streams the full Kilter catalog and
+  // takes ~43 minutes from the homelab while changing almost nothing (#5897),
+  // and the one-at-a-time routine worker runs no user syncs meanwhile.
+  schedules: [{ key: 'every-6h', cron: '23 */6 * * *', fanOut: async () => [{ payload: {} }] }],
   async execute(context) {
     // Loaded here, not at module scope; see loadProviderSyncAdapter.
     const [{ SyncRunner }, { DonorRelinkedError, KilterApiError, isTransientKilterError }] = await Promise.all([
@@ -67,6 +70,8 @@ export const kilterCatalogSyncFamily: BackgroundJobFamilyModule<KilterCatalogSyn
       db: context.database,
       signal: context.signal,
       onLog: (message) => logger.debug(message, { runId: context.runId, family: context.family }),
+      onCatalogPhase: (progress) =>
+        logger.info('[worker] catalog sync phase', { runId: context.runId, family: context.family, ...progress }),
       // A step the runner swallows (a crawl, the weekly repair) still leaves a
       // trace: the error's class and SQLSTATE, never its message.
       onError: (error) =>

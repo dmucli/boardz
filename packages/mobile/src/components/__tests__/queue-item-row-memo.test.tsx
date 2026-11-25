@@ -1,7 +1,20 @@
 // @vitest-environment jsdom
+vi.mock('../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render } from '@testing-library/react';
-import { createElement, useRef, type ReactNode } from 'react';
+import { createElement, isValidElement, useRef, type ReactNode } from 'react';
 import type { ClimbQueueItem } from '@boardsesh/queue';
 import type { QueueItemRowBoard } from '../QueueItemRow';
 import type { QueueDragControls } from '../play-drawer/use-queue-drag';
@@ -11,23 +24,41 @@ import type { QueueDragControls } from '../play-drawer/use-queue-drag';
 // faithful proxy for "QueueItemRow's body ran". If React.memo is working, an
 // identical-props re-render must NOT bump this counter.
 const renderCounter = vi.hoisted(() => ({ count: 0 }));
+const themeState = vi.hoisted(() => ({
+  variant: 'liquidGlass' as 'liquidGlass' | 'material',
+  scheme: 'dark' as 'dark' | 'light',
+}));
+const menuState = vi.hoisted(() => ({
+  target: null as unknown,
+  actions: [{ name: 'share', label: 'Share' }],
+  emptyActions: [] as { name: string; label: string }[],
+  rows: [{ id: 'share' }],
+  emptyRows: [] as { id: string }[],
+  onAction: vi.fn(),
+}));
+vi.mock('../climb-actions/ClimbActionsMenu', () => ({
+  useClimbMenu: (target: unknown) => {
+    menuState.target = target;
+    return {
+      rows: target ? menuState.rows : menuState.emptyRows,
+      menuKey: 'queue-slot',
+      accessibilityActions: target ? menuState.actions : menuState.emptyActions,
+      onAccessibilityAction: menuState.onAction,
+    };
+  },
+}));
 
-// Capture the latest callback handed to the row's tap gesture, long-press gesture,
-// history-row tick-button gesture, and delete button so a test can assert identity
-// across re-renders. `rowPress`/`longPress`/`tickPress` come from `Gesture.Tap()`/
-// `Gesture.LongPress()`'s `.onStart(...)` — the row AND its trailing tick moved off RN
-// core Pressable onto RNGH gestures (see QueueItemRow.tsx). The row tap is the one that
-// calls `.withRef(...)`; a nested no-ref tap is the tick button (they'd otherwise share
-// the `rowPress` slot). `tapRef`/`longPressRef` capture the `.withRef(...)` arguments so
-// a test can confirm the drag handle and the tick both block exactly those refs.
-// `deletePress` still comes from the delete Pressable.
+vi.mock('../climb-actions/ClimbMenu', () => ({
+  ClimbMenu: ({ children, rows }: { children?: ReactNode; rows: unknown[] }) =>
+    rows.length > 0 ? createElement('div', { 'data-native-menu': true }, children) : children,
+}));
+
+// Capture callbacks at their rendered targets so tests distinguish the row tap
+// from its sibling tick button without depending on gesture construction order.
 const captured = vi.hoisted(() => ({
   rowPress: null as null | (() => void),
-  longPress: null as null | (() => void),
   tickPress: null as null | (() => void),
   deletePress: null as null | (() => void),
-  tapRef: null as unknown,
-  longPressRef: null as unknown,
 }));
 
 // Per-instance call logs for gestures created via the RNGH mock below, keyed by
@@ -63,14 +94,23 @@ const a11y = vi.hoisted(() => ({
 const platform = vi.hoisted(() => ({ OS: 'ios' as 'ios' | 'android' }));
 
 vi.mock('react-native', () => {
-  const passthrough =
-    (tag: string) =>
-    ({ children }: { children?: ReactNode }) =>
-      createElement(tag, null, children);
   return {
     Platform: platform,
+    DynamicColorIOS: (appearances: { light: string }) => appearances.light,
     PlatformColor: (name: string) => name,
-    View: ({ children, testID, ...rest }: { children?: ReactNode; testID?: string } & AccessibilityCapture) => {
+    View: ({
+      children,
+      testID,
+      accessible,
+      accessibilityRole,
+      ...rest
+    }: {
+      children?: ReactNode;
+      testID?: string;
+      accessible?: boolean;
+      accessibilityRole?: string;
+    } & AccessibilityCapture) => {
+      if (accessible && accessibilityRole === 'button' && testID !== 'tick-button') a11y.row = rest;
       if (testID === 'tick-button') {
         a11y.tick = {
           onAccessibilityTap: rest.onAccessibilityTap,
@@ -78,7 +118,7 @@ vi.mock('react-native', () => {
           onAccessibilityAction: rest.onAccessibilityAction,
         };
       }
-      return createElement('div', null, children);
+      return createElement('div', { 'data-testid': testID }, children);
     },
     // Capture by testID so any future Pressable addition doesn't silently
     // overwrite the wrong slot. (The tick button is now an RNGH gesture, not a
@@ -88,6 +128,7 @@ vi.mock('react-native', () => {
       return createElement('button', null, children);
     },
     StyleSheet: {
+      flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
       create: (styles: Record<string, unknown>) => styles,
       hairlineWidth: 1,
     },
@@ -138,30 +179,33 @@ vi.mock('react-native-reanimated', () => {
 });
 
 vi.mock('react-native-gesture-handler', () => {
-  // A chainable gesture builder: every method call is logged into `log` (so a test
-  // can inspect exactly what was configured) and, when given, `onCapture` also gets
-  // a chance to stash a specific call's argument (e.g. the `.onStart` callback or a
-  // `.withRef` ref) into the shared `captured` bag. Every method returns the same
-  // proxy so chains like `.minDuration(400).onStart(fn)` resolve.
-  const makeBuilder = (
-    log: { method: string; args: unknown[] }[],
-    onCapture?: (method: string, arg: unknown) => void,
-  ) => {
+  // Record gesture configuration and expose its start callback to the detector.
+  const makeBuilder = (log: { method: string; args: unknown[] }[]) => {
+    let onStart: unknown;
     const builder: Record<string, (...args: unknown[]) => unknown> = {};
     const proxy: typeof builder = new Proxy(builder, {
-      get:
-        (_target, prop: string) =>
-        (...args: unknown[]) => {
+      get: (_target, prop: string) => {
+        if (prop === 'capturedOnStart') return onStart;
+        return (...args: unknown[]) => {
           log.push({ method: prop, args });
-          onCapture?.(prop, args[0]);
+          if (prop === 'onStart') onStart = args[0];
           return proxy;
-        },
+        };
+      },
     });
     return proxy;
   };
 
   return {
-    GestureDetector: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+    GestureDetector: ({ children, gesture }: { children?: ReactNode; gesture: { capturedOnStart?: () => void } }) => {
+      if (isValidElement<{ testID?: string; accessible?: boolean; accessibilityRole?: string }>(children)) {
+        if (children.props.testID === 'tick-button') captured.tickPress = gesture.capturedOnStart ?? null;
+        else if (children.props.accessible && children.props.accessibilityRole === 'button') {
+          captured.rowPress = gesture.capturedOnStart ?? null;
+        }
+      }
+      return createElement('div', null, children);
+    },
     Gesture: {
       Pan: () => {
         const log: { method: string; args: unknown[] }[] = [];
@@ -171,29 +215,12 @@ vi.mock('react-native-gesture-handler', () => {
       Tap: () => {
         const log: { method: string; args: unknown[] }[] = [];
         gestureCalls.tapLogs.push(log);
-        // A history row renders two taps: its own row tap (calls `.withRef(...)`) and
-        // the tick button's tap (no ref, calls `.blocksExternalGesture(...)`). Route
-        // each tap's `onStart` by whether it carried a ref so the two don't clobber a
-        // single slot — row tap → rowPress, nested tick tap → tickPress.
-        let hasRef = false;
-        return makeBuilder(log, (method, arg) => {
-          if (method === 'withRef') {
-            hasRef = true;
-            captured.tapRef = arg;
-          }
-          if (method === 'onStart' && typeof arg === 'function') {
-            if (hasRef) captured.rowPress = arg as () => void;
-            else captured.tickPress = arg as () => void;
-          }
-        });
+        return makeBuilder(log);
       },
       LongPress: () => {
         const log: { method: string; args: unknown[] }[] = [];
         gestureCalls.longPressLogs.push(log);
-        return makeBuilder(log, (method, arg) => {
-          if (method === 'onStart' && typeof arg === 'function') captured.longPress = arg as () => void;
-          if (method === 'withRef') captured.longPressRef = arg;
-        });
+        return makeBuilder(log);
       },
       // The composed tap/long-press gesture — nothing is chained onto it directly,
       // it's just handed to <GestureDetector>, so no call-logging needed here.
@@ -213,8 +240,18 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
-    systemColors: { secondaryBackground: '#fff', separator: '#ccc' },
+    selection: { text: '#111111', checkmark: '#00AA55', fill: 'rgba(0, 170, 85, 0.18)' },
+    variant: themeState.variant,
+    systemColors: {
+      secondaryBackground: '#fff',
+      separator: '#ccc',
+      label: themeState.scheme === 'dark' ? '#FFFFFF' : '#1C1C1E',
+      secondaryLabel: themeState.scheme === 'dark' ? '#D0D0D0' : '#3C3C43',
+      tertiaryLabel: 'tertiaryLabel',
+      error: 'systemRed',
+    },
     brandColors: { primary: '#6D28D9', success: '#0a0', error: '#a00' },
   }),
 }));
@@ -226,7 +263,8 @@ vi.mock('../Text', () => ({
 }));
 
 vi.mock('../Icon', () => ({
-  Icon: () => createElement('span', { 'data-icon': 'true' }),
+  Icon: ({ name, size, color }: { name: string; size: number; color: string }) =>
+    createElement('span', { 'data-icon': 'true', 'data-name': name, 'data-size': size, 'data-color': color }),
 }));
 
 vi.mock('../ClimbListItemContent', () => ({
@@ -236,7 +274,7 @@ vi.mock('../ClimbListItemContent', () => ({
   },
 }));
 
-vi.mock('../ClimbListThumbnail', () => ({ THUMBNAIL_WIDTH: 96 }));
+vi.mock('../ClimbListThumbnail', () => ({}));
 
 // Without this mock the new import drags PressableAvatar → expo-router's
 // useRouter and Avatar → Image/PixelRatio into a graph whose `react-native` mock
@@ -246,7 +284,10 @@ vi.mock('../board-presence/BoardDriverAvatar', () => ({
   BoardDriverAvatar: ({ name }: { name?: string | null }) => createElement('span', { 'data-added-by': name ?? '' }),
 }));
 
-vi.mock('../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 3: 12 } }));
+vi.mock('../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: { 1: 4, 2: 8, 3: 12 },
+}));
 
 vi.mock('../../theme/animations', () => ({ springs: { interactive: {} } }));
 
@@ -280,19 +321,90 @@ const onToggleSelect = vi.fn();
 
 describe('QueueItemRow React.memo', () => {
   beforeEach(() => {
+    themeState.variant = 'liquidGlass';
+    themeState.scheme = 'dark';
     renderCounter.count = 0;
     captured.rowPress = null;
-    captured.longPress = null;
     captured.tickPress = null;
     captured.deletePress = null;
-    captured.tapRef = null;
-    captured.longPressRef = null;
     gestureCalls.panLogs = [];
     gestureCalls.tapLogs = [];
     gestureCalls.longPressLogs = [];
     a11y.row = null;
     a11y.tick = null;
     vi.clearAllMocks();
+  });
+
+  it.each([
+    ['liquidGlass', 'dark', '#FFFFFF'],
+    ['liquidGlass', 'light', '#1C1C1E'],
+    ['material', 'dark', '#D0D0D0'],
+    ['material', 'light', '#3C3C43'],
+  ] as const)('keeps the queue history Tick neutral at 26 pt (%s, %s)', (variant, scheme, expectedColor) => {
+    themeState.variant = variant;
+    themeState.scheme = scheme;
+    const props = {
+      item: makeItem('history', 'Crimp Master'),
+      position: 1,
+      board,
+      isHistoryItem: true,
+      isCurrentClimb: false,
+      onPress,
+      onRemove,
+      onTickHistory: vi.fn(),
+    };
+    const rendered = render(<QueueItemRow {...props} />);
+    for (const isCurrentClimb of [false, true]) {
+      rendered.rerender(<QueueItemRow {...props} isCurrentClimb={isCurrentClimb} />);
+      const tick = rendered.container.querySelector('[data-name="tick.fill"]');
+      expect(tick?.getAttribute('data-color')).toBe(expectedColor);
+      expect(tick?.getAttribute('data-size')).toBe('26');
+    }
+  });
+
+  it('announces frame counts when route metadata arrives for the same queue climb', () => {
+    const item = makeItem('route', 'Long Route');
+    const props = { position: 1, board, isCurrentClimb: false, onPress, onRemove };
+    const { rerender } = render(<QueueItemRow {...props} item={item} />);
+    expect(a11y.row?.accessibilityLabel).not.toContain('mobile.climbRow.frameCount');
+    rerender(<QueueItemRow {...props} item={{ ...item, climb: { ...item.climb, framesCount: 4 } }} />);
+    expect(a11y.row?.accessibilityLabel).toContain('mobile.climbRow.frameCount');
+  });
+
+  it('reveals a short swipe, commits a full release, and ignores cancelled releases', () => {
+    render(
+      <QueueItemRow
+        item={makeItem('a', 'Crimp Master')}
+        position={1}
+        board={board}
+        isCurrentClimb={false}
+        onPress={onPress}
+        onRemove={onRemove}
+        onToggleSelect={onToggleSelect}
+      />,
+    );
+    const release = gestureCalls.panLogs[0].find((call) => call.method === 'onEnd')?.args[0] as (
+      event: { translationX: number },
+      success: boolean,
+    ) => void;
+    release({ translationX: -90 }, true);
+    expect(onRemove).not.toHaveBeenCalled();
+    release({ translationX: -220 }, false);
+    expect(onRemove).not.toHaveBeenCalled();
+    release({ translationX: -220 }, true);
+    expect(onRemove).toHaveBeenCalledExactlyOnceWith('a');
+  });
+
+  it('does not let a stale full swipe delete a recycled row', () => {
+    const props = { position: 1, board, isCurrentClimb: false, onPress, onRemove, onToggleSelect };
+    const { rerender } = render(<QueueItemRow item={makeItem('a', 'Crimp Master')} {...props} />);
+    const oldRelease = gestureCalls.panLogs[0].find((call) => call.method === 'onEnd')?.args[0] as (
+      event: { translationX: number },
+      success: boolean,
+    ) => void;
+    rerender(<QueueItemRow item={makeItem('b', 'New Climb')} {...props} />);
+    oldRelease({ translationX: -220 }, true);
+    expect(onRemove).not.toHaveBeenCalled();
   });
 
   it('skips re-render when given referentially-equal props', () => {
@@ -369,39 +481,29 @@ describe('QueueItemRow React.memo', () => {
     const { rerender } = render(<QueueItemRow item={first} {...rowProps} />);
 
     const rowPress = captured.rowPress;
-    const longPress = captured.longPress;
     const tickPress = captured.tickPress;
     expect(rowPress).toBeTypeOf('function');
-    expect(longPress).toBeTypeOf('function');
     expect(tickPress).toBeTypeOf('function');
 
     // A fresh item object with the same uuid + data — exactly what the queue
     // reducer produces when it rebuilds the array on an unrelated update. The
     // callbacks must keep their identity (they read the live item via a ref and
     // dep only on `item.uuid`), or the row's gestures/pressables churn and defeat
-    // memo. `longPress` sits in the same dep chain as `tapGesture`
-    // (handleLongPress → longPressGesture → tapGesture), so an unstable
-    // `longPressGesture` would churn the row's gesture composition just as surely
-    // as an unstable tap.
+    // memo. The native menu owns long-press independently of these tap callbacks.
     const second = makeItem('a', 'Crimp Master');
     expect(second).not.toBe(first);
     rerender(<QueueItemRow item={second} {...rowProps} />);
 
     expect(captured.rowPress).toBe(rowPress);
-    expect(captured.longPress).toBe(longPress);
     expect(captured.tickPress).toBe(tickPress);
   });
 
-  // Beyond identity stability, confirm the captured gesture callbacks route to the
-  // right handler: the long-press opens the reaction menu, a plain tap selects the
-  // row. The jsdom mock can't exercise the native gesture arena (see the iOS QA
-  // matrix in the PR body), but it can catch the JS plumbing being wired to the
-  // wrong handler — e.g. tap and long-press swapped, or the long-press dropped.
-  it('routes long-press to onOpenActions and tap to onPress', () => {
-    const onOpenActions = vi.fn();
+  it('resolves the native menu for the exact queue slot without selecting the climb', () => {
     const localOnPress = vi.fn();
     const item = makeItem('a', 'Crimp Master');
-    render(
+    const target = { climb: item.climb, boardConfig: board, queueItemUuid: item.uuid };
+    const onOpenActions = vi.fn(() => target);
+    const { container } = render(
       <QueueItemRow
         item={item}
         position={1}
@@ -414,18 +516,76 @@ describe('QueueItemRow React.memo', () => {
       />,
     );
 
-    expect(captured.longPress).toBeTypeOf('function');
     expect(captured.rowPress).toBeTypeOf('function');
-
-    captured.longPress?.();
     expect(onOpenActions).toHaveBeenCalledTimes(1);
     expect(onOpenActions).toHaveBeenCalledWith(item);
+    expect(menuState.target).toEqual(target);
+    expect(container.querySelector('[data-native-menu]')).not.toBeNull();
+    expect(gestureCalls.longPressLogs).toHaveLength(0);
+    expect(localOnPress).not.toHaveBeenCalled();
+
+    a11y.row?.onAccessibilityAction?.({ nativeEvent: { actionName: 'share' } });
+    expect(menuState.onAction).toHaveBeenCalledWith({ nativeEvent: { actionName: 'share' } });
+    expect(a11y.row?.accessibilityActions).toContainEqual({ name: 'share', label: 'Share' });
     expect(localOnPress).not.toHaveBeenCalled();
 
     captured.rowPress?.();
     expect(localOnPress).toHaveBeenCalledTimes(1);
     expect(localOnPress).toHaveBeenCalledWith(item);
     expect(onOpenActions).toHaveBeenCalledTimes(1);
+  });
+
+  it('hands the menu one target per slot while the queue rebuilds its items', () => {
+    const item = makeItem('slot-a', 'Crimp Master');
+    const onOpenActions = vi.fn(() => ({ climb: item.climb, boardConfig: board, queueItemUuid: item.uuid }));
+    const props = { position: 1, board, isCurrentClimb: false, onPress, onRemove, onOpenActions };
+    const { rerender } = render(<QueueItemRow {...props} item={item} />);
+    const first = menuState.target;
+    // The reducer hands a fresh item object for the same slot and climb.
+    rerender(<QueueItemRow {...props} item={{ ...item }} position={2} />);
+    expect(menuState.target).toBe(first);
+    expect(onOpenActions).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the menu's Log a tick off a History row that has its own tick", () => {
+    const item = makeItem('a', 'Crimp Master');
+    menuState.actions = [
+      { name: 'tick', label: 'Log a tick' },
+      { name: 'share', label: 'Share' },
+    ];
+    try {
+      render(
+        <QueueItemRow
+          item={item}
+          position={1}
+          board={board}
+          isCurrentClimb={false}
+          isHistoryItem
+          onPress={onPress}
+          onRemove={onRemove}
+          onToggleSelect={onToggleSelect}
+          onTickHistory={vi.fn()}
+          onOpenActions={() => ({ climb: item.climb, boardConfig: board, queueItemUuid: item.uuid })}
+        />,
+      );
+      const names = a11y.row?.accessibilityActions?.map((action) => action.name);
+      expect(names).toContain('share');
+      expect(names).not.toContain('tick');
+    } finally {
+      menuState.actions = [{ name: 'share', label: 'Share' }];
+    }
+  });
+
+  it('refreshes the menu board when the same queue slot remains after an angle change', () => {
+    const item = makeItem('same-slot', 'Crimp Master');
+    const onOpenActions = vi.fn(() => ({ climb: item.climb, boardConfig: board, queueItemUuid: item.uuid }));
+    const props = { item, position: 1, isCurrentClimb: false, onPress, onRemove, onOpenActions };
+    const { rerender } = render(<QueueItemRow {...props} board={board} />);
+    expect(menuState.target).toMatchObject({ queueItemUuid: item.uuid, boardConfig: { angle: 40 } });
+    rerender(<QueueItemRow {...props} board={{ ...board, angle: 30 }} />);
+    expect(onOpenActions).toHaveBeenCalledTimes(2);
+    expect(menuState.target).toMatchObject({ queueItemUuid: item.uuid, boardConfig: { angle: 30 } });
+    expect(onPress).not.toHaveBeenCalled();
   });
 
   // #3914: the row's press lives on an RNGH Gesture.Tap, which never registers with
@@ -643,13 +803,7 @@ describe('QueueItemRow React.memo', () => {
     expect(captured.deletePress).toBe(deletePress);
   });
 
-  // Regression guard for #3683: the drag handle used to sit inside a plain RN
-  // Pressable that grew an onLongPress, and on iOS the Pressable's long-press could
-  // win the race against the nested handle's Pan, opening the reaction menu instead
-  // of letting the drag start. The fix makes the row's tap/long-press RNGH gestures
-  // and has the drag handle's Pan `blocksExternalGesture` them, so a touch that
-  // starts on the handle is claimed by the drag and never reaches the row gestures.
-  it('wires the drag handle to block the row tap/long-press gestures', () => {
+  it('keeps the drag handle outside the native long-press trigger', () => {
     const handleGestureCalls: { method: string; args: unknown[] }[] = [];
     const handleGesture: Record<string, (...args: unknown[]) => unknown> = {};
     const handleGestureProxy = new Proxy(handleGesture, {
@@ -679,7 +833,7 @@ describe('QueueItemRow React.memo', () => {
     };
 
     const item = makeItem('a', 'Crimp Master');
-    render(
+    const { container } = render(
       <QueueItemRow
         item={item}
         position={1}
@@ -692,30 +846,22 @@ describe('QueueItemRow React.memo', () => {
         isDraggable
         rowIndex={0}
         queueIndex={0}
+        onOpenActions={() => ({ climb: item.climb, boardConfig: board, queueItemUuid: item.uuid })}
       />,
     );
 
     expect(makeHandleGesture).toHaveBeenCalledWith(0, 'a', 0);
-    expect(captured.tapRef).not.toBeNull();
-    expect(captured.longPressRef).not.toBeNull();
-
-    const blocksCall = handleGestureCalls.find((call) => call.method === 'blocksExternalGesture');
-    expect(blocksCall).toBeDefined();
-    expect(blocksCall?.args).toEqual([captured.tapRef, captured.longPressRef]);
+    expect(handleGestureCalls).toEqual([]);
+    const handle = container.querySelector('[data-testid="queue-row-drag-handle"]');
+    expect(handle).not.toBeNull();
+    expect(handle?.closest('[data-native-menu]')).toBeNull();
+    expect(container.querySelector('[data-native-menu] [data-climb-name]')).not.toBeNull();
   });
 
-  // Regression guard for the tick side of #3683: on a history row the trailing tick
-  // sits inside the row's tap/long-press arena. Without a blocking relationship a tap
-  // on the tick fires BOTH its own Log-Ascent handler and the row tap (which makes the
-  // history climb current, opens the Play Drawer, and dismisses the Queue Sheet). Like
-  // the drag handle, the tick's Tap must `blocksExternalGesture` the row's tap/long-
-  // press so a touch that starts on the tick is claimed by it alone. Mirrors
-  // ClimbListRow's moreButtonGesture. (Native arbitration only exists on-device — see
-  // the tick-tap case in the PR body's QA matrix.)
-  it('wires the history-row tick button to block the row tap/long-press gestures', () => {
+  it('keeps the history tick outside the menu and selects only its logging action', () => {
     const onTickHistory = vi.fn();
     const item = makeItem('a', 'Crimp Master');
-    render(
+    const { container } = render(
       <QueueItemRow
         item={item}
         position={1}
@@ -726,18 +872,16 @@ describe('QueueItemRow React.memo', () => {
         onRemove={onRemove}
         onToggleSelect={onToggleSelect}
         onTickHistory={onTickHistory}
+        onOpenActions={() => ({ climb: item.climb, boardConfig: board, queueItemUuid: item.uuid })}
       />,
     );
 
-    // The row registers its own tap (with a ref); the tick registers a second tap (no
-    // ref) that blocks the row gestures. Find the tick's tap by its block call and
-    // assert it targets exactly the row's tap/long-press refs.
-    expect(captured.tapRef).not.toBeNull();
-    expect(captured.longPressRef).not.toBeNull();
-    const tickLog = gestureCalls.tapLogs.find((calls) => calls.some((call) => call.method === 'blocksExternalGesture'));
-    expect(tickLog).toBeDefined();
-    const blocksCall = tickLog?.find((call) => call.method === 'blocksExternalGesture');
-    expect(blocksCall?.args).toEqual([captured.tapRef, captured.longPressRef]);
+    const tick = container.querySelector('[data-testid="tick-button"]');
+    expect(tick).not.toBeNull();
+    expect(tick?.closest('[data-native-menu]')).toBeNull();
+    captured.tickPress?.();
+    expect(onTickHistory).toHaveBeenCalledWith(item);
+    expect(onPress).not.toHaveBeenCalled();
   });
 
   // Regression guard for the swipe-to-delete side of #3683: this fix moved the row's
@@ -772,12 +916,10 @@ describe('QueueItemRow React.memo', () => {
     expect(swipeCalls).not.toContain('requireExternalGestureToFail');
     expect(swipeCalls).not.toContain('simultaneousWithExternalGesture');
 
-    // The row's tap/long-press gestures themselves also stay free of any wiring
-    // toward the swipe Pan — only the drag handle blocks them (see the test above).
+    // The native menu adds no competing RNGH long-press recognizer.
     expect(gestureCalls.tapLogs).toHaveLength(1);
     expect(gestureCalls.tapLogs[0].map((call) => call.method)).not.toContain('blocksExternalGesture');
-    expect(gestureCalls.longPressLogs).toHaveLength(1);
-    expect(gestureCalls.longPressLogs[0].map((call) => call.method)).not.toContain('blocksExternalGesture');
+    expect(gestureCalls.longPressLogs).toHaveLength(0);
   });
 
   // Regression guard for #3295: the swipe-to-remove Pan bailed on a ±5px vertical

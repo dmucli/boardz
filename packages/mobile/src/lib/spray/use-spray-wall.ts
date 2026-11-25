@@ -12,7 +12,7 @@
 // drawing a placeholder forever.
 //
 // The photo URLs are the reason nothing is persisted. `SprayWallPhoto.url` is a
-// signature over an object in the PRIVATE bucket (`docs/spray-walls.md`, "Photos
+// signature over an object in the PRIVATE bucket (`docs/product/spray-walls.md`, "Photos
 // and privacy"), so the query refetches rather than storing it, and the local
 // copy on disk is keyed on `(layoutId, version)` instead — see
 // `spray-photo-cache.ts`.
@@ -22,6 +22,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import {
   ensureSprayWallLoaded,
   getSprayWallLoadState,
+  sprayWallViewerCanEdit,
   subscribeToSprayWalls,
   type SprayWallLoadState,
 } from './spray-wall-registry';
@@ -44,6 +45,28 @@ export {
 export function useSprayWallLoader(): void {
   const queryClient = useQueryClient();
   useEffect(() => installSprayWallLoader(queryClient), [queryClient]);
+}
+
+/**
+ * Whether the viewer can edit the wall behind a board config. `false` on every
+ * catalogue board, and until the wall has registered.
+ *
+ * Asks for the wall too, so a registration past its revalidation window is
+ * re-read: this is what bounds how stale the answer can get. Safe per row: one
+ * Map lookup, and at most one in-flight fetch per wall.
+ */
+export function useSprayWallViewerCanEdit(boardName: string | null | undefined, layoutId: number | null): boolean {
+  const sprayLayoutId = boardName === 'spray' ? layoutId : null;
+  useEffect(() => {
+    if (sprayLayoutId != null) ensureSprayWallLoaded(sprayLayoutId);
+  }, [sprayLayoutId]);
+  return useSyncExternalStore(
+    subscribeToSprayWalls,
+    useCallback(
+      () => (sprayLayoutId == null ? false : sprayWallViewerCanEdit('spray', sprayLayoutId)),
+      [sprayLayoutId],
+    ),
+  );
 }
 
 export type UseSprayWallResult = {

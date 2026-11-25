@@ -1,9 +1,17 @@
 export const notificationsTypeDefs = /* GraphQL */ `
+  input RegisterNotificationDeviceInput {
+    installationId: String!
+    token: String!
+    platform: String!
+    locale: String!
+  }
+
   # ============================================
   # Notification Types
   # ============================================
 
   enum NotificationType {
+    app_feedback_reply
     new_follower
     comment_reply
     comment_on_tick
@@ -19,6 +27,22 @@ export const notificationsTypeDefs = /* GraphQL */ `
     new_climbs_synced
     gym_claim_approved
     proposal_on_your_climb
+    spray_wall_detection_completed
+    follow_request
+    comment_on_session
+    comment_on_playlist
+    comment_on_board
+    comment_on_gym
+    board_report_opened
+    board_report_resolved
+    board_removed_from_gym
+    board_deleted_by_staff
+    board_edited_by_staff
+    gym_report_opened
+    gym_report_resolved
+    gym_claimed_with_your_board
+    gym_claim_denied
+    board_setup_changed_by_climber
   }
 
   """
@@ -55,6 +79,11 @@ export const notificationsTypeDefs = /* GraphQL */ `
     proposalValue: String
     "Gym name (for gym_claim_approved notifications)"
     gymName: String
+    sprayWallName: String
+    sprayWallUuid: String
+    sprayVersionId: ID
+    "The wall the imported reset clone replaces; null for a plain new wall."
+    sprayResetOfWallUuid: String
     "Whether the notification has been read"
     isRead: Boolean!
     "When the notification was created (ISO 8601)"
@@ -134,6 +163,13 @@ export const notificationsTypeDefs = /* GraphQL */ `
     """
     climbCompatibleSizeIds: [Int!]
     """
+    Structured climb characteristics (e.g. 'no_match', 'method_footless').
+    Decode with @boardsesh/shared-schema helpers (isNoMatch / getMoonBoardMethod).
+    Drives the Woods matching/feet rules line and the no-match glyph elsewhere
+    when a notification opens the play drawer directly, without a climb refetch.
+    """
+    climbCharacteristics: [String!]
+    """
     The comment thread this notification belongs to, when it has one. For a
     comment or a vote on a comment that is the commented-on entity (a tick, a
     session, a playlist climb) rather than the comment itself, so a client can
@@ -152,6 +188,11 @@ export const notificationsTypeDefs = /* GraphQL */ `
     setterUsername: String
     "Gym name (for gym_claim_approved notifications)"
     gymName: String
+    sprayWallName: String
+    sprayWallUuid: String
+    sprayVersionId: ID
+    "The wall the imported reset clone replaces; null for a plain new wall."
+    sprayResetOfWallUuid: String
     "Whether all notifications in the group are read"
     isRead: Boolean!
     "When the most recent notification was created"

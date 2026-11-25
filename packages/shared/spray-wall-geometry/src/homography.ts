@@ -5,10 +5,11 @@
  * at a different pixel in every version's photo. The four anchors are the wall's
  * corners as tapped in THAT photo; mapping them onto a rectangle gives the one
  * transform that makes two photographs agree on where a hold is, which is what a
- * reset needs (`docs/spray-walls.md`).
+ * reset needs (`docs/product/spray-walls.md`).
  *
- * No image is ever warped in v1: this matrix is stored and the renderer maps
- * holds through its inverse at draw time.
+ * The stored photo is never warped: this matrix is stored and the renderer maps
+ * holds through its inverse at draw time. The generated wall looks
+ * (`clean-art.ts`) are derived copies made from it, never a replacement.
  *
  * Moved here from `packages/backend/src/lib/spray-wall-homography.ts` (SW-05,
  * #5438), which said in so many words that SW-06 would take it. The solver and
@@ -268,7 +269,7 @@ export function mapPoint(homography: Homography, x: number, y: number): [number,
  * The canonical→photo direction: the adjugate, which is the inverse up to a
  * scale factor a homography does not care about.
  *
- * This is the one the renderer uses. No image is warped in v1, so a hold stored
+ * This is the one the renderer uses. The stored photo is never warped, so a hold stored
  * in canonical coordinates has to be pushed back through this matrix before it
  * can be drawn on top of the version's photo.
  *

@@ -1,3 +1,4 @@
+import { PressableSurface } from '../PressableSurface';
 // One honest banner for "the app cannot reach the server right now" (issue
 // #4862), mounted ONCE at the app root so it can say the same thing on every
 // screen instead of each surface inventing its own empty state.
@@ -17,8 +18,9 @@
 // form, and in offline mode it is also the only way back online.
 
 import { useCallback, useEffect, useMemo, useRef } from 'react';
-import { AccessibilityInfo, Pressable, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
+import { AccessibilityInfo, StyleSheet, View, type LayoutChangeEvent } from 'react-native';
 import Animated, { FadeIn, FadeOut } from 'react-native-reanimated';
+import { TabBarHideFollower } from '../navigation/TabBarHideFollower';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { Text } from '../Text';
@@ -95,7 +97,7 @@ export function ConnectivityBanner() {
   const ready = launchReady && flagsResolved;
   // Screenshot builds never show it: a store screenshot must not carry a "server
   // trouble" card, and the capture rig has no backend to reach anyway.
-  if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return null;
+
   if (!ready || !enabled) return null;
   return <ConnectivityBannerContent />;
 }
@@ -160,111 +162,121 @@ function ConnectivityBannerContent() {
   // An opaque surface plus a brand-hued wash, exactly like Toast: the banner
   // floats over arbitrary content (board art, photos), where a translucent card
   // is unreadable. Dark mode needs the heavier wash to register at all.
+  // The brand tone's wash mixes from the fill, never the tint (Velvet Send rule 2);
+  // the semantic tones wash in their own hue, as Toast does.
   const washAlpha = colorScheme === 'dark' ? 0.24 : 0.15;
-  const tintColor = presentation.tint === 'none' ? null : withAlpha(brandColors[presentation.tint], washAlpha);
+  const tintColor =
+    presentation.tint === 'none'
+      ? null
+      : withAlpha(
+          presentation.tint === 'primary' ? brandColors.primaryFill : brandColors[presentation.tint],
+          washAlpha,
+        );
   const surfaceColors = { backgroundColor: systemColors.secondaryBackground, borderColor: systemColors.separator };
   const entering = reduceMotion ? undefined : FadeIn.duration(180);
   const exiting = reduceMotion ? undefined : FadeOut.duration(150);
 
   return (
-    <View
-      pointerEvents="box-none"
-      style={[styles.overlay, { bottom: bottomChrome.connectivityBannerBottom + spacing[2] }]}
-    >
-      {collapsed ? (
-        <Animated.View
-          key="pill"
-          entering={entering}
-          exiting={exiting}
-          onLayout={publishHeight}
-          style={[styles.pill, surfaceColors]}
-        >
-          {tintColor ? (
-            <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: tintColor }]} />
-          ) : null}
-          <Pressable
-            onPress={expand}
-            accessibilityRole="button"
-            accessibilityLabel={countLine ? `${presentation.title}. ${countLine}` : presentation.title}
-            accessibilityHint={t('mobile.connectivity.expand')}
-            style={styles.pillPressable}
+    <TabBarHideFollower zIndex={100}>
+      <View
+        pointerEvents="box-none"
+        style={[styles.overlay, { bottom: bottomChrome.connectivityBannerBottom + spacing[2] }]}
+      >
+        {collapsed ? (
+          <Animated.View
+            key="pill"
+            entering={entering}
+            exiting={exiting}
+            onLayout={publishHeight}
+            style={[styles.pill, surfaceColors]}
           >
-            <Icon name={presentation.icon} size={16} color={accentColor} />
-            <Text variant="subheadline" color={systemColors.label}>
-              {presentation.pillLabel}
-            </Text>
-            {countLine && pendingCount > 0 ? (
-              <View style={[styles.badge, { backgroundColor: systemColors.fill }]}>
-                <Text variant="caption1" color={systemColors.label}>
-                  {String(pendingCount)}
-                </Text>
+            {tintColor ? (
+              <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: tintColor }]} />
+            ) : null}
+            <PressableSurface
+              onPress={expand}
+              accessibilityRole="button"
+              accessibilityLabel={countLine ? `${presentation.title}. ${countLine}` : presentation.title}
+              accessibilityHint={t('mobile.connectivity.expand')}
+              style={styles.pillPressable}
+            >
+              <Icon name={presentation.icon} size={16} color={accentColor} />
+              <Text variant="subheadline" color={systemColors.label}>
+                {presentation.pillLabel}
+              </Text>
+              {countLine && pendingCount > 0 ? (
+                <View style={[styles.badge, { backgroundColor: systemColors.fill }]}>
+                  <Text variant="caption1" color={systemColors.label}>
+                    {String(pendingCount)}
+                  </Text>
+                </View>
+              ) : null}
+            </PressableSurface>
+          </Animated.View>
+        ) : (
+          <Animated.View
+            key="card"
+            entering={entering}
+            exiting={exiting}
+            onLayout={publishHeight}
+            style={[styles.card, surfaceColors]}
+          >
+            {tintColor ? (
+              <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: tintColor }]} />
+            ) : null}
+            <View style={styles.headerRow}>
+              {/* Title + body + count are ONE announcement; the buttons stay
+                separately focusable so a screen-reader user can act on them. */}
+              <View accessible accessibilityRole="alert" accessibilityLiveRegion="polite" style={styles.message}>
+                <View style={styles.titleRow}>
+                  {presentation.busy ? (
+                    <ActivityIndicator size="small" />
+                  ) : (
+                    <Icon name={presentation.icon} size={20} color={accentColor} />
+                  )}
+                  <Text variant="headline" color={systemColors.label} style={styles.title}>
+                    {presentation.title}
+                  </Text>
+                </View>
+                {presentation.body ? (
+                  <Text variant="subheadline" color={systemColors.secondaryLabel}>
+                    {presentation.body}
+                  </Text>
+                ) : null}
+                {countLine ? (
+                  <Text variant="footnote" color={systemColors.secondaryLabel}>
+                    {countLine}
+                  </Text>
+                ) : null}
+              </View>
+              <PressableSurface
+                onPress={dismiss}
+                accessibilityRole="button"
+                accessibilityLabel={t('mobile.connectivity.dismiss')}
+                hitSlop={8}
+                style={styles.close}
+              >
+                <Icon name="close" size={16} color={systemColors.secondaryLabel} />
+              </PressableSurface>
+            </View>
+            {actions.length > 0 ? (
+              <View style={styles.actions}>
+                {actions.map((action) => (
+                  <Button
+                    key={action.key}
+                    title={action.label}
+                    variant={action.variant}
+                    size="small"
+                    loading={action.loading}
+                    onPress={action.onPress}
+                  />
+                ))}
               </View>
             ) : null}
-          </Pressable>
-        </Animated.View>
-      ) : (
-        <Animated.View
-          key="card"
-          entering={entering}
-          exiting={exiting}
-          onLayout={publishHeight}
-          style={[styles.card, surfaceColors]}
-        >
-          {tintColor ? (
-            <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: tintColor }]} />
-          ) : null}
-          <View style={styles.headerRow}>
-            {/* Title + body + count are ONE announcement; the buttons stay
-                separately focusable so a screen-reader user can act on them. */}
-            <View accessible accessibilityRole="alert" accessibilityLiveRegion="polite" style={styles.message}>
-              <View style={styles.titleRow}>
-                {presentation.busy ? (
-                  <ActivityIndicator size="small" />
-                ) : (
-                  <Icon name={presentation.icon} size={20} color={accentColor} />
-                )}
-                <Text variant="headline" color={systemColors.label} style={styles.title}>
-                  {presentation.title}
-                </Text>
-              </View>
-              {presentation.body ? (
-                <Text variant="subheadline" color={systemColors.secondaryLabel}>
-                  {presentation.body}
-                </Text>
-              ) : null}
-              {countLine ? (
-                <Text variant="footnote" color={systemColors.secondaryLabel}>
-                  {countLine}
-                </Text>
-              ) : null}
-            </View>
-            <Pressable
-              onPress={dismiss}
-              accessibilityRole="button"
-              accessibilityLabel={t('mobile.connectivity.dismiss')}
-              hitSlop={8}
-              style={styles.close}
-            >
-              <Icon name="close" size={16} color={systemColors.secondaryLabel} />
-            </Pressable>
-          </View>
-          {actions.length > 0 ? (
-            <View style={styles.actions}>
-              {actions.map((action) => (
-                <Button
-                  key={action.key}
-                  title={action.label}
-                  variant={action.variant}
-                  size="small"
-                  loading={action.loading}
-                  onPress={action.onPress}
-                />
-              ))}
-            </View>
-          ) : null}
-        </Animated.View>
-      )}
-    </View>
+          </Animated.View>
+        )}
+      </View>
+    </TabBarHideFollower>
   );
 }
 

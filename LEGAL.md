@@ -2,7 +2,7 @@
 
 ## What This Project Is
 
-This is a free, open-source, community-built alternative for browsing and interacting with standardised LED climbing training boards (Kilter Board, Tension Board, MoonBoard, and others). It is non-commercial and maintained entirely by volunteers.
+This is a free, open-source, community-built alternative for browsing and interacting with standardised LED climbing training boards (Kilter Board, Tension Board, MoonBoard, and others). The app is free, the source is open, and the people who build it are volunteers. Boardsesh sells one optional thing — CNC build plans for a home wall, under a separate manufacturing licence — and that revenue pays for hosting and development.
 
 We believe climbers should have the freedom to choose how they interact with hardware they've purchased, and that community-created data should remain accessible to the community.
 
@@ -60,6 +60,32 @@ Our controller is designed to be interoperable with both this project's software
 
 We use board and product names (e.g. "Kilter Board", "MoonBoard", "Tension Board") solely to describe hardware compatibility and interoperability. These names are trademarks of their respective owners. This project is not affiliated with, endorsed by, or sponsored by Aurora Climbing, Moon Climbing, or any board manufacturer.
 
+## Hosted Service & API Access
+
+Boardsesh's code is open source under the Apache 2.0 licence. That licence covers the code. It does not cover the hosted service: the accounts, climb database, logbook sync and real-time servers that the Boardsesh apps and website connect to. We run and pay for those.
+
+The public API documented on the [API docs page](https://www.boardsesh.com/docs) is for integrations: tools that read climb data, or act on behalf of a signed-in climber from their own account, within the rate limits the service applies.
+
+The hosted service is not a backend for other apps. A publicly distributed app or fork whose accounts, climbing, board control or sessions run on Boardsesh's servers needs our written permission, and we do not currently grant it. Connecting a climber's Boardsesh account to your app with their permission is different: done through the OAuth API, within the scopes in the developer docs and under the developer terms you accept when you register the app, it is an integration and needs no further permission from us. If you fork Boardsesh, run your own backend too. The code is there for exactly that. The development setup in [CONTRIBUTING.md](./CONTRIBUTING.md) is the starting point today; official self-hosting docs are still to come.
+
+You do not have to start from an empty database either. The [nightly board snapshots](docs/data/board-snapshots-dataset.md) are public SQLite files of the climb catalogs, cheap for us to serve, and you are welcome to use them. We are also happy to talk about syncing non-user data such as climbs and grades to an alternative service.
+
+Questions about this policy: [legal@boardsesh.com](mailto:legal@boardsesh.com)
+
+---
+
+## Build Plans
+
+Boardsesh sells CNC build plans for a climbing home wall: a generated set of DXF cutting files, PDFs and a bill of materials for one wall, in the size and the manufacturing options the buyer picked.
+
+What is sold is the generated pack, not the generator. The software that produces the plans is closed source and is not distributed; the app itself stays Apache 2.0 and free.
+
+Each pack is generated individually for one order, carries its own licence id, and is licensed for one wall rather than sold outright. The terms are on the [build plans manufacturing licence](https://boardsesh.com/build-plans/licence) page.
+
+The plans are compatible with the Kilter Homewall hole pattern. That is a statement about hole positions, not a relationship: Boardsesh is not affiliated with, endorsed by, or sponsored by Aurora Climbing or any board manufacturer. Holds, LED kits and app access are not part of a pack and are bought from the manufacturer.
+
+Owner approval of the manufacturing licence and printed plans was recorded on 2026-11-14. This records owner approval, not independent lawyer review. Build plans remain in a restricted test-user beta until actual GST registration is confirmed; public sales start only after that confirmation and the live checkout cutover. The beta licence page retains its DRAFT notice until public release mode is selected.
+
 ---
 
 ## Third-Party Notices
@@ -94,4 +120,4 @@ If you are a board manufacturer and would like to discuss collaboration or have 
 
 ---
 
-_This document is provided for informational purposes and does not constitute legal advice. Last updated: 08-02-2026_
+_This document is provided for informational purposes and does not constitute legal advice. Last updated: 10-08-2026_

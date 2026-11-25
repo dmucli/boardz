@@ -1,7 +1,9 @@
+import { useMemo } from 'react';
 import type { NativeStackNavigationOptions } from 'expo-router';
 import { useTheme } from '../providers/theme-provider';
 import { selectByVariant } from '../theme/variants';
 import { glassStackScreenOptions } from '../theme/navigation';
+import { useHeaderBlurEffect } from './use-header-blur-effect';
 
 /**
  * The native-stack `screenOptions` for the active UI variant — one source of truth
@@ -11,10 +13,15 @@ import { glassStackScreenOptions } from '../theme/navigation';
  * (a Material `Appbar` or a glass collapsing header), so this only styles the
  * pushed screens.
  *
- * - **liquidGlass** → `glassStackScreenOptions`, the value **unchanged** (a
- *   transparent blur header that floats over transparent content on iOS; a solid
- *   header on Android, where a transparent one would draw under the status bar).
- *   Liquid Glass stays byte-identical.
+ * - **liquidGlass** → `glassStackScreenOptions` (a transparent header that floats
+ *   over transparent content on iOS; a solid header on Android, where a
+ *   transparent one would draw under the status bar), plus a `headerTintColor`
+ *   of the label colour. Without it UIKit tints every bar glyph (the back
+ *   chevron, an X, a plain action) in React Navigation's default iOS blue. The
+ *   brand colour is for the prominent confirm alone (docs/design/mobile-chrome.md,
+ *   "Top-bar buttons"). The legacy `systemMaterial` blur comes from
+ *   `useHeaderBlurEffect`, so only iOS without Liquid Glass gets it; iOS 26 draws
+ *   its own scroll edge effect under the bar.
  * - **material** → an opaque Material 3 small top app bar: a solid surface that
  *   blends with the screen, an `onSurface` tint, a left-aligned title, flat at rest
  *   (no shadow, no iOS blur). This fixes forced-Material-on-iOS getting a wrong
@@ -33,20 +40,33 @@ import { glassStackScreenOptions } from '../theme/navigation';
  */
 export function useStackScreenOptions(): NativeStackNavigationOptions {
   const { variant, systemColors } = useTheme();
-  return selectByVariant<NativeStackNavigationOptions>(variant, {
-    liquidGlass: glassStackScreenOptions,
-    material: {
-      headerLargeTitle: false,
-      headerTransparent: false,
-      headerShadowVisible: false,
-      // Material resolves `systemColors` to plain hex, so the header blends with
-      // the screen (M3 at-rest container = `surface`). `as string` narrows the
-      // iOS PlatformColor union that never applies on the Material branch.
-      headerStyle: { backgroundColor: systemColors.background as string },
-      headerTintColor: systemColors.label as string,
-      headerTitleAlign: 'left',
-      headerBackButtonDisplayMode: 'minimal',
-      contentStyle: { backgroundColor: systemColors.background as string },
-    },
-  });
+  const headerBlurEffect = useHeaderBlurEffect();
+  // Memoised: a stack's `screenOptions` that changes identity every render
+  // re-applies every screen's header.
+  return useMemo(
+    () =>
+      selectByVariant<NativeStackNavigationOptions>(variant, {
+        liquidGlass: {
+          ...glassStackScreenOptions,
+          headerBlurEffect,
+          // `headerTintColor` is typed `string`, but react-native-screens hands it
+          // to UIKit through processColor, which takes the iOS PlatformColor too.
+          headerTintColor: systemColors.label as unknown as string,
+        },
+        material: {
+          headerLargeTitle: false,
+          headerTransparent: false,
+          headerShadowVisible: false,
+          // Material resolves `systemColors` to plain hex, so the header blends with
+          // the screen (M3 at-rest container = `surface`). `as string` narrows the
+          // iOS PlatformColor union that never applies on the Material branch.
+          headerStyle: { backgroundColor: systemColors.background as string },
+          headerTintColor: systemColors.label as string,
+          headerTitleAlign: 'left',
+          headerBackButtonDisplayMode: 'minimal',
+          contentStyle: { backgroundColor: systemColors.background as string },
+        },
+      }),
+    [variant, headerBlurEffect, systemColors.label, systemColors.background],
+  );
 }

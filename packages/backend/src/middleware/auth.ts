@@ -1,13 +1,45 @@
-import { jwtDecrypt, jwtVerify } from 'jose';
-import { hkdf } from '@panva/hkdf';
+import { jwtVerify } from 'jose';
+import { createHash } from 'node:crypto';
 import { db } from '../db/client';
 import { esp32Controllers } from '@boardsesh/db/schema/app';
 import { eq } from 'drizzle-orm';
 import { logger } from '../utils/logger';
+import type { WebSignInProof } from '@boardsesh/shared-schema';
+import { decryptLegacyWebJwe } from '../auth/legacy-web-jwe';
+import { legacyWebSignIn } from '../auth/legacy-web-credentials';
+import {
+  AuthAdmissionUnavailableError,
+  AuthCredentialRefusedError,
+  admitsCredential,
+  readHumanSubjectState,
+} from '../auth/human-admission';
+import { decideCredential, type PresentedCredential } from '../auth/credential-cutoffs';
+import { webSessionMode } from '@boardsesh/auth-protocol';
+import {
+  claimsBrowserAudience,
+  readBrowserAccessSession,
+  verifyBrowserAccessToken,
+} from '../auth/authority/browser-access-token';
+import { browserAccessTokenKeyFromEnvironment } from '../auth/authority/browser-session-mode';
+import { webSignInProof } from '../auth/authority/session-reader';
 
 export type AuthResult = {
   userId: string;
   isAuthenticated: true;
+  credentialExpiresAt?: number;
+  /** The stamps admission decided on, so the WebSocket sweep can decide again without decrypting. */
+  credential: PresentedCredential;
+  /**
+   * When the climber behind a website credential signed in, for operations
+   * that need a recent sign-in. Unset for app tokens, which never count.
+   */
+  webSignIn?: WebSignInProof;
+  /**
+   * Set only for a browser access token: the session it was signed for. The
+   * WebSocket sweep re-reads that session, since the account state alone does
+   * not show a session that expired or lost its lineage.
+   */
+  browserSession?: { readonly sessionId: string; readonly generation: number };
 };
 
 export type ControllerAuthResult = {
@@ -20,37 +52,73 @@ export type ControllerAuthResult = {
   setIds: string;
 };
 
-// Cache the derived encryption key — it only changes if NEXTAUTH_SECRET changes,
-// which requires a process restart anyway.
-let cachedEncryptionKey: Uint8Array | null = null;
-let cachedSecret: string | null = null;
-
-async function deriveEncryptionKey(secret: string): Promise<Uint8Array> {
-  if (cachedEncryptionKey && cachedSecret === secret) {
-    return cachedEncryptionKey;
-  }
-  const encoder = new TextEncoder();
-  cachedEncryptionKey = await hkdf('sha256', encoder.encode(secret), '', 'NextAuth.js Generated Encryption Key', 32);
-  cachedSecret = secret;
-  return cachedEncryptionKey;
-}
-
-// Short-lived in-process cache for validated tokens: token → { result, expiresAt }
-// Avoids repeated JWE decryption for the same token across rapid requests.
+// Short-lived in-process cache for verified tokens: token → { result, expiresAt }
+// Avoids repeated JWE decryption for the same token across rapid requests. It
+// holds cryptography only: admission (account, generations) is read every call.
 const TOKEN_CACHE_TTL_MS = 60_000; // 60 seconds
 type TokenCacheEntry = {
   result: AuthResult;
   expiresAt: number;
+  format: 'jwe' | 'jws';
+  secretDigest: string;
 };
 const tokenCache = new Map<string, TokenCacheEntry>();
 
 // Periodically evict stale entries so the map doesn't grow unbounded.
-setInterval(() => {
+const cacheCleanup = setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of tokenCache) {
     if (entry.expiresAt <= now) tokenCache.delete(key);
   }
 }, TOKEN_CACHE_TTL_MS);
+cacheCleanup.unref();
+
+function requireSigningSecret(): string {
+  const secret = process.env.NEXTAUTH_SECRET;
+  if (!secret) throw new AuthAdmissionUnavailableError();
+  return secret;
+}
+
+function secretDigest(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex');
+}
+
+function cacheCryptoResult(token: string, result: AuthResult, format: TokenCacheEntry['format'], secret: string) {
+  tokenCache.set(token, {
+    result: Object.freeze({
+      ...result,
+      credential: Object.freeze(result.credential),
+      ...(result.webSignIn ? { webSignIn: Object.freeze(result.webSignIn) } : {}),
+    }),
+    format,
+    secretDigest: secretDigest(secret),
+    expiresAt: Math.min(Date.now() + TOKEN_CACHE_TTL_MS, (result.credentialExpiresAt ?? Infinity) + 60_000),
+  });
+}
+
+export type ValidateTokenOptions = {
+  /**
+   * Throw `AuthCredentialRefusedError` for a credential we signed that
+   * `decideCredential` refuses, instead of returning null. The optional-credential
+   * transports (GraphQL HTTP, the WebSocket handshake) need it to tell a refused
+   * credential, which must sign the app out, from an expired or foreign one,
+   * which stays anonymous.
+   */
+  readonly throwOnRefusal?: boolean;
+};
+
+async function admitCryptoResult(
+  result: AuthResult | null,
+  { throwOnRefusal = false }: ValidateTokenOptions,
+): Promise<AuthResult | null> {
+  // Keep database uncertainty OUTSIDE cryptographic catches. Every invocation,
+  // including a warm cache and either direct exported validator, checks primary.
+  if (!result) return null;
+  const subject = await readHumanSubjectState(result.userId);
+  if (admitsCredential(decideCredential(result.credential, subject, Date.now()), 'request')) return result;
+  if (throwOnRefusal) throw new AuthCredentialRefusedError();
+  return null;
+}
 
 /**
  * Validate a NextAuth JWT token.
@@ -63,25 +131,15 @@ setInterval(() => {
  * @param token - The JWT token from the client
  * @returns Auth result with userId if valid, null if invalid
  */
-export async function validateNextAuthToken(token: string): Promise<AuthResult | null> {
+async function verifyNextAuthToken(token: string, secret: string): Promise<AuthResult | null> {
   const now = Date.now();
   const cached = tokenCache.get(token);
-  if (cached && cached.expiresAt > now) {
+  if (cached?.format === 'jwe' && cached.expiresAt > now && cached.secretDigest === secretDigest(secret)) {
     return cached.result;
   }
 
   try {
-    const secret = process.env.NEXTAUTH_SECRET;
-    if (!secret) {
-      logger.warn('[Auth] NEXTAUTH_SECRET not configured');
-      return null;
-    }
-
-    const encryptionKey = await deriveEncryptionKey(secret);
-
-    const { payload } = await jwtDecrypt(token, encryptionKey, {
-      clockTolerance: 60,
-    });
+    const { payload } = await decryptLegacyWebJwe(token, secret, 60);
 
     const userId = payload.sub;
     if (!userId) {
@@ -89,8 +147,21 @@ export async function validateNextAuthToken(token: string): Promise<AuthResult |
       return null;
     }
 
-    const result: AuthResult = { userId, isAuthenticated: true };
-    tokenCache.set(token, { result, expiresAt: now + TOKEN_CACHE_TTL_MS });
+    // The same reading of `auth_time` and `link_guarded` the partner consent routes use.
+    const signIn = legacyWebSignIn(payload, new Date(now));
+    const result: AuthResult = {
+      userId,
+      isAuthenticated: true,
+      ...(typeof payload.exp === 'number' ? { credentialExpiresAt: payload.exp * 1000 } : {}),
+      credential: {
+        kind: 'web-session',
+        generationClaim: payload.gen,
+        sessionKeyClaim: payload.authSessionId,
+        authTimeClaim: payload.auth_time,
+      },
+      webSignIn: { authenticatedAtMs: signIn.authenticatedAt?.getTime() ?? null, linkGuarded: signIn.linkGuarded },
+    };
+    cacheCryptoResult(token, result, 'jwe', secret);
     return result;
   } catch (error) {
     if (error instanceof Error) {
@@ -98,6 +169,13 @@ export async function validateNextAuthToken(token: string): Promise<AuthResult |
     }
     return null;
   }
+}
+
+export async function validateNextAuthToken(
+  token: string,
+  options: ValidateTokenOptions = {},
+): Promise<AuthResult | null> {
+  return admitCryptoResult(await verifyNextAuthToken(token, requireSigningSecret()), options);
 }
 
 /**
@@ -108,14 +186,11 @@ export async function validateNextAuthToken(token: string): Promise<AuthResult |
  * @param token - The JWS token from the mobile client
  * @returns Auth result with userId if valid, null if invalid
  */
-export async function validateMobileJwt(token: string): Promise<AuthResult | null> {
+async function verifyMobileJwt(token: string, secret: string): Promise<AuthResult | null> {
+  const cached = tokenCache.get(token);
+  if (cached?.format === 'jws' && cached.expiresAt > Date.now() && cached.secretDigest === secretDigest(secret))
+    return cached.result;
   try {
-    const secret = process.env.NEXTAUTH_SECRET;
-    if (!secret) {
-      logger.warn('[Auth] NEXTAUTH_SECRET not configured');
-      return null;
-    }
-
     const secretKey = new TextEncoder().encode(secret);
     const { payload } = await jwtVerify(token, secretKey, {
       clockTolerance: 60,
@@ -129,13 +204,29 @@ export async function validateMobileJwt(token: string): Promise<AuthResult | nul
       return null;
     }
 
-    return { userId, isAuthenticated: true };
+    const result: AuthResult = {
+      userId,
+      isAuthenticated: true,
+      ...(typeof payload.exp === 'number' ? { credentialExpiresAt: payload.exp * 1000 } : {}),
+      credential: {
+        kind: 'native-access',
+        generationClaim: payload.gen,
+        nativeGenerationClaim: payload.ngen,
+        authTimeClaim: payload.auth_time,
+      },
+    };
+    cacheCryptoResult(token, result, 'jws', secret);
+    return result;
   } catch (error) {
     if (error instanceof Error) {
       logger.warn('[Auth] Mobile JWT validation failed:', error.message);
     }
     return null;
   }
+}
+
+export async function validateMobileJwt(token: string, options: ValidateTokenOptions = {}): Promise<AuthResult | null> {
+  return admitCryptoResult(await verifyMobileJwt(token, requireSigningSecret()), options);
 }
 
 /**
@@ -149,33 +240,76 @@ export async function validateMobileJwt(token: string): Promise<AuthResult | nul
  * @param token - The token from the client (JWE or JWS)
  * @returns Auth result with userId if valid, null if invalid
  */
-export async function validateToken(token: string): Promise<AuthResult | null> {
-  const now = Date.now();
-  const cached = tokenCache.get(token);
-  if (cached && cached.expiresAt > now) {
-    return cached.result;
-  }
-
-  let result: AuthResult | null = null;
-
+export async function validateToken(token: string, options: ValidateTokenOptions = {}): Promise<AuthResult | null> {
   // JWE tokens (NextAuth) have 5 dot-separated segments,
-  // JWS tokens (mobile JWT) have 3 segments.
+  // JWS tokens (mobile JWT and browser access token) have 3 segments.
   const segments = token.split('.').length;
   if (segments === 5) {
-    result = await validateNextAuthToken(token);
+    return validateNextAuthToken(token, options);
   } else if (segments === 3) {
-    result = await validateMobileJwt(token);
+    // The unverified audience only picks the verifier. With the web session
+    // mode off, a browser token takes the mobile path, as it did before B3a,
+    // and fails its audience check there.
+    // Mode first: with it off, no unverified input is decoded.
+    if (browserAccessTokensEnabled() && claimsBrowserAudience(token)) return validateBrowserAccessToken(token, options);
+    return validateMobileJwt(token, options);
   }
+  return null;
+}
 
-  // Cache successful results only (validateNextAuthToken already caches
-  // internally, but for mobile JWTs this is the only caching layer).
-  // Null results are not cached so transient failures (e.g. secret unset
-  // during restart) don't persist as permanent rejections.
-  if (segments === 3 && result) {
-    tokenCache.set(token, { result, expiresAt: now + TOKEN_CACHE_TTL_MS });
+/** Dark until `CURRENT_STORE_WEB_SESSION_MODE=backend-staging`. An unknown value counts as off here. */
+function browserAccessTokensEnabled(): boolean {
+  try {
+    return webSessionMode(process.env) === 'backend-staging';
+  } catch {
+    return false;
   }
+}
 
-  return result;
+/**
+ * A browser access token (#7596, B3a). Every call reads the session it names,
+ * by the cookie read's own rules (issue HARD RULE 3), so sign-out, a login
+ * that revoked it, a reset, set-password, deletion, a cutoff or a revoked
+ * lineage refuse it at once. Unlike the older kinds, a token that claims this
+ * audience but does not verify (expired, tampered, another key) is refused
+ * too, not read as anonymous: no shipped client depends on the anonymous
+ * fallback, and a 401 tells the web to fetch a new token.
+ *
+ * `credentialExpiresAt` is the SESSION's expiry, so leases (notification
+ * devices) last as long as the session, not the 15-minute token. `webSignIn`
+ * carries a sign-in time only for a `login` session.
+ */
+export async function validateBrowserAccessToken(
+  token: string,
+  { throwOnRefusal = false }: ValidateTokenOptions = {},
+): Promise<AuthResult | null> {
+  let tokenKey;
+  try {
+    tokenKey = browserAccessTokenKeyFromEnvironment(process.env);
+  } catch {
+    throw new AuthAdmissionUnavailableError();
+  }
+  const now = new Date();
+  const verified = await verifyBrowserAccessToken(tokenKey, token, now);
+  // An outage throws unavailable here; only a confirmed answer refuses.
+  const session = verified ? await readBrowserAccessSession(verified) : undefined;
+  if (!verified || !session) {
+    if (throwOnRefusal) throw new AuthCredentialRefusedError();
+    return null;
+  }
+  return {
+    userId: session.userId,
+    isAuthenticated: true,
+    credentialExpiresAt: session.expiresAt.getTime(),
+    credential: {
+      kind: 'web-session',
+      generationClaim: verified.generation,
+      sessionKeyClaim: verified.sessionId,
+      authTimeClaim: null,
+    },
+    webSignIn: webSignInProof(session),
+    browserSession: { sessionId: verified.sessionId, generation: verified.generation },
+  };
 }
 
 /**

@@ -1,0 +1,1452 @@
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { getOperationAST, parse } from 'graphql';
+import sharp from 'sharp';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { parse as parseYaml } from 'yaml';
+import {
+  GET_MY_BOARDS,
+  SEARCH_CLIMBS,
+  QUEUE_UPDATES_SUBSCRIPTION,
+} from '../../packages/mobile/src/lib/graphql/operations';
+import { JOIN_SESSION } from '../../packages/shared/graphql/src/operations/queue-session';
+import { SEARCH_CLIMBS_COUNT } from '../../packages/shared/graphql/src/operations/climb-search';
+import { bindCppGradeCountProof, cppGradeCountKey } from '../lib/cpp-grade-count';
+import { mergeFixtureSets, graphqlFixtureContentHash } from '../screenshot-fixtures-merge';
+import { CPP_MANIFEST_PATH, cppCaptureNames, readCppPage, type CppTarget } from '../lib/screenshot-cpp';
+import { graphqlFixtureKey, type GraphqlFixtureFile, type ScreenshotFixtureManifest } from '../lib/screenshot-fixtures';
+import { ACCEPTED_SIZES } from '../assert-screenshot-dimensions';
+import { loadLiveActivityFixture } from '../lib/screenshot-live-activity';
+import {
+  RETAINED_CPP_DEVICES,
+  downloadRetainedCppRecord,
+  verifyRetainedCppProducer,
+  verifyRetainedCppNative,
+  verifyRetainedCppSource,
+  verifyRetainedCppMerged,
+  type RetainedCppClient,
+  type RetainedCppOptions,
+} from '../prepare-retained-cpp-record';
+
+const owner = '11111111-2222-3333-4444-555555555555';
+const email = 'shots@example.test';
+const sha256 = (text: string | Buffer) => createHash('sha256').update(text).digest('hex');
+const directories: string[] = [];
+const directory = () => {
+  const root = mkdtempSync(join(tmpdir(), 'cpp-retained-test-'));
+  directories.push(root);
+  return root;
+};
+afterEach(() => {
+  vi.restoreAllMocks();
+  directories.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true }));
+});
+function sample(target: CppTarget = 'tension', emptySpray = false) {
+  const page = readCppPage(target);
+  const variants = [...page.heroBoards, ...page.otherBoards];
+  const boards = variants.map((variant, index) => ({
+    uuid: `10000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+    name: `${variant.selector} owned`,
+    ownerId: owner,
+    canEdit: true,
+    isPublic: false,
+    boardType: variant.boardType,
+    layoutId: variant.layoutId ?? index + 100,
+    sizeId: variant.sizeId ?? 1,
+    setIds: (variant.setIds ?? [1]).join(','),
+    angle: variant.angle ?? 40,
+  }));
+  const coverage = {
+    target,
+    boardReadyText: Object.fromEntries(variants.map((variant, index) => [variant.id, `Scene ${index + 1}`])),
+    boardIds: Object.fromEntries(variants.map((variant, index) => [variant.id, boards[index].uuid])),
+    boardNames: Object.fromEntries(variants.map((variant, index) => [variant.id, boards[index].name])),
+    boardHeroModes: Object.fromEntries(
+      variants.map((variant) => [variant.id, emptySpray && variant.family === 'spray' ? 'wall-editor' : 'climb']),
+    ) as Record<string, 'wall-editor' | 'climb'>,
+    boardClimbCounts: Object.fromEntries(
+      variants.map((variant) => [variant.id, emptySpray && variant.family === 'spray' ? 0 : 10]),
+    ),
+    heroClimbs: Object.fromEntries(
+      variants
+        .filter((variant) => !(emptySpray && variant.family === 'spray'))
+        .map((variant) => {
+          const index = variants.indexOf(variant);
+          return [
+            variant.id,
+            {
+              boardId: boards[index].uuid,
+              climbId:
+                index === 1 && target === 'tension'
+                  ? '18E0834CBBB64952AE12BB7DD7F56E28'
+                  : `20000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
+              readyText: `Scene ${index + 1}`,
+              gradeLabel: 'V3',
+              statsAngle: boards[index].angle,
+            },
+          ];
+        }),
+    ),
+    scenes: {},
+    ...(!(emptySpray && page.primaryBoard.family === 'spray')
+      ? {
+          accessoryClimb: {
+            boardId: boards[variants.findIndex((variant) => variant.id === page.primaryBoard.id)].uuid,
+            climbId: '30000000-0000-4000-8000-000000000001',
+            readyText: 'Accessory',
+            gradeLabel: 'V2',
+          },
+        }
+      : {}),
+  };
+  const manifest: ScreenshotFixtureManifest = {
+    formatVersion: 1,
+    flow: 'app-store-cpp',
+    accountUserId: owner,
+    accountEmail: email,
+    upstream: 'http://127.0.0.1:1',
+    recordedAt: '2026-10-12T00:00:00Z',
+    frozenNow: '2026-10-12T00:00:01Z',
+    graphql: [],
+    static: [],
+    capture: {
+      sharedSessionId: '40000000-0000-4000-8000-000000000001',
+      boards: boards.map((board) => board.name),
+      cpp: coverage,
+    },
+  };
+  const fixtures: GraphqlFixtureFile[] = [];
+  const append = (query: string, variables: Record<string, unknown>, response: unknown) => {
+    const operationName = getOperationAST(parse(query))!.name!.value;
+    const key = graphqlFixtureKey({ operationName, query, variables }, sha256);
+    const fixture: GraphqlFixtureFile = {
+      formatVersion: 1,
+      ...key,
+      query,
+      variables,
+      response,
+      status: 200,
+      upstream: manifest.upstream,
+      recordedAt: manifest.recordedAt,
+    };
+    manifest.graphql.push({ ...key, file: `graphql/${operationName}/${key.variablesHash.slice(0, 16)}.json` });
+    fixtures.push(fixture);
+    return fixture;
+  };
+  append(GET_MY_BOARDS, {}, { data: { myBoards: { boards } } });
+  for (const board of boards) {
+    const selected = [
+      ...Object.values(coverage.heroClimbs),
+      ...(coverage.accessoryClimb ? [coverage.accessoryClimb] : []),
+    ].filter((climb) => climb.boardId === board.uuid);
+    append(
+      SEARCH_CLIMBS,
+      {
+        input: {
+          boardName: board.boardType,
+          layoutId: board.layoutId,
+          sizeId: board.sizeId,
+          setIds: board.setIds,
+          angle: board.angle,
+          page: 0,
+          pageSize: 10,
+        },
+      },
+      {
+        data: {
+          searchClimbs: {
+            climbs: selected.map((climb) => ({
+              uuid: climb.climbId,
+              name: climb.readyText,
+              frames: 'p1r12p2r13p3r14',
+              statsAngle: board.angle,
+              boardType: board.boardType,
+              layoutId: board.layoutId,
+              angle: board.angle,
+            })),
+          },
+        },
+      },
+    );
+  }
+  if (target !== 'spray') {
+    const board = boards[variants.findIndex((variant) => variant.id === page.primaryBoard.id)];
+    const hero = coverage.heroClimbs[page.primaryBoard.id];
+    const sessionId = manifest.capture!.sharedSessionId!;
+    const boardPath = [board.boardType, board.layoutId, board.sizeId, board.setIds, board.angle].join('/');
+    const item = {
+      uuid: '50000000-0000-4000-8000-000000000001',
+      climb: {
+        uuid: hero.climbId,
+        name: hero.readyText,
+        boardType: board.boardType,
+        layoutId: board.layoutId,
+        angle: board.angle,
+        frames: 'p1r12p2r13p3r14',
+      },
+    };
+    const state = { queue: [item], currentClimbQueueItem: item };
+    Object.assign(coverage.scenes, {
+      search: { boardId: board.uuid, readyText: 'Filters' },
+      queue: { boardId: board.uuid, sessionId, readyText: hero.readyText },
+      status: { boardId: board.uuid, climbId: hero.climbId, readyText: hero.readyText },
+      island: { boardId: board.uuid, readyText: hero.readyText },
+    });
+    append(
+      JOIN_SESSION,
+      { sessionId, boardPath, username: 'Liz', avatarUrl: null },
+      {
+        data: {
+          joinSession: {
+            id: sessionId,
+            boardPath,
+            isPublic: false,
+            isLeader: true,
+            users: [{ userId: owner, isLeader: true }],
+            queueState: structuredClone(state),
+          },
+        },
+      },
+    );
+    append(QUEUE_UPDATES_SUBSCRIPTION, { sessionId }, { data: { queueUpdates: { __typename: 'FullSync', state } } });
+  }
+  return { manifest, fixtures, boards, append };
+}
+
+const producerSha = 'a'.repeat(40),
+  preparerSha = 'b'.repeat(40);
+function metadata() {
+  const root = directory();
+  const options: RetainedCppOptions = {
+    repository: 'boardsesh/boardsesh',
+    runId: 123,
+    target: 'tension',
+    preparerSha,
+    out: join(root, 'out'),
+    receipt: join(root, 'receipt.json'),
+  };
+  const run = {
+    id: 123,
+    path: '.github/workflows/mobile-screenshots-ios.yml',
+    repository: { full_name: options.repository },
+    head_repository: { full_name: options.repository },
+    workflow_id: 456,
+    event: 'workflow_dispatch',
+    status: 'completed',
+    conclusion: 'failure',
+    run_attempt: 1,
+    head_sha: producerSha,
+  };
+  let setupLog =
+    Object.entries({
+      SOURCE_SHA: producerSha,
+      CPP_TARGET: 'tension',
+      CPP_ACTION: 'capture',
+      FIXTURES_MODE: 'record',
+      LOCALES: 'en-US',
+      UPLOAD_DEFAULT: 'false',
+      PUBLISH_BASELINE: 'false',
+    })
+      .map(([name, value]) => `2026-10-12T01:00:00Z   ${name}: ${value}`)
+      .join('\n') +
+    `\n2026-10-12T01:00:01Z Resolved: gate=full ios_locales=["en-US"] upload=false flow=app-store source_sha=${producerSha}`;
+  const sourceFiles = new Map<string, Buffer>();
+  const jobs = [
+    { id: 1, name: 'setup' },
+    { id: 2, name: 'cpp-bootstrap' },
+    ...RETAINED_CPP_DEVICES.map(([name, slug], index) => ({
+      id: index + 3,
+      name: `cpp-capture (tension, en-US, ${name}, ${slug})`,
+    })),
+  ].map((job) => ({
+    ...job,
+    run_attempt: 1,
+    run_id: 123,
+    head_sha: producerSha,
+    steps: [
+      {
+        number: 1,
+        name: job.name.startsWith('cpp-capture') ? 'Capture target-specific native scenes' : 'Run job',
+        status: 'completed',
+        conclusion: 'success',
+        started_at: '2026-10-12T01:00:00Z',
+        completed_at: '2026-10-12T01:10:00Z',
+      },
+    ],
+    status: 'completed',
+    conclusion: 'success',
+    started_at: '2026-10-12T01:00:00Z',
+    completed_at: '2026-10-12T01:10:00Z',
+  }));
+  jobs.push({ ...jobs[0], id: 7, name: 'cpp-prepare-record', conclusion: 'failure' });
+  jobs.push({ ...jobs[0], id: 8, name: 'ios-build' });
+  const artifacts = [
+    { name: 'cpp-bootstrap-tension' },
+    ...RETAINED_CPP_DEVICES.flatMap(([, slug]) => [
+      { name: `screenshot-fixtures-cpp-capture-tension-en-US-${slug}` },
+      { name: `ios-cpp-tension-cpp-capture-en-US-${slug}` },
+    ]),
+  ].map((artifact, index) => ({
+    ...artifact,
+    id: index + 10,
+    expired: false,
+    size_in_bytes: 100,
+    digest: `sha256:${'c'.repeat(64)}`,
+    created_at: '2026-10-12T01:05:00Z',
+    workflow_run: { id: 123, head_sha: producerSha },
+  }));
+  const archives = new Map<number, Buffer>();
+  const calls: string[] = [];
+  let ancestor = true;
+  const client: RetainedCppClient = {
+    json: (path) => {
+      calls.push(path);
+      return path.includes('/runs/') ? run : { id: 456, path: run.path };
+    },
+    pages: (path, field) => {
+      calls.push(path);
+      return field === 'jobs' ? jobs : artifacts;
+    },
+    bytes: (path) => {
+      calls.push(path);
+      if (path === 'repos/boardsesh/boardsesh/actions/jobs/1/logs') return Buffer.from(setupLog);
+      if (path.endsWith('/logs'))
+        return Buffer.from(
+          'prepare-ios-campaign-fixtures.ts: CPP detail source lacks the genuine owned leader primary queue',
+        );
+      return archives.get(Number(path.split('/').at(-2)))!;
+    },
+    isAncestor: () => ancestor,
+    isCommit: () => true,
+    source: (_commit, path) => sourceFiles.get(path) ?? readFileSync(path),
+    workflow: () => readFileSync('.github/workflows/mobile-screenshots-ios.yml', 'utf8'),
+  };
+  return {
+    root,
+    options,
+    run,
+    jobs,
+    artifacts,
+    archives,
+    client,
+    calls,
+    sourceFiles,
+    setSetupLog: (transform: (log: string) => string) => {
+      setupLog = transform(setupLog);
+    },
+    setAncestor: (allowed: boolean) => {
+      ancestor = allowed;
+    },
+  };
+}
+
+function retriedMetadata() {
+  const source = metadata();
+  const prior = structuredClone(source.jobs);
+  prior[4].conclusion = 'failure';
+  prior[4].steps[0].conclusion = 'failure';
+  prior[6].conclusion = 'skipped';
+  prior[6].steps = [];
+  source.jobs.forEach((job) => {
+    job.id += 100;
+    job.run_attempt = 2;
+  });
+  const retried = source.jobs[4];
+  retried.started_at = '2026-10-12T02:00:00Z';
+  retried.completed_at = '2026-10-12T02:10:00Z';
+  retried.steps = [{ ...retried.steps[0], started_at: retried.started_at, completed_at: retried.completed_at }];
+  source.jobs[6].conclusion = 'success';
+  source.run.run_attempt = 2;
+  source.run.conclusion = 'success';
+  const partial = { ...source.artifacts[5], id: 99 };
+  source.artifacts[5].created_at = source.artifacts[6].created_at = '2026-10-12T02:05:00Z';
+  source.artifacts.push(partial);
+  source.client.pages = (path, field) =>
+    field === 'artifacts' ? source.artifacts : path.includes('/attempts/1/') ? prior : source.jobs;
+  return { ...source, prior, partial };
+}
+
+function sourceManifest(
+  source: ReturnType<typeof metadata>,
+  mutate: (manifest: { targets: Record<string, Record<string, unknown>>; version: number }) => void,
+): Buffer {
+  const manifest = JSON.parse(readFileSync(CPP_MANIFEST_PATH, 'utf8')) as {
+    targets: Record<string, Record<string, unknown>>;
+    version: number;
+  };
+  mutate(manifest);
+  const bytes = Buffer.from(JSON.stringify(manifest));
+  source.sourceFiles.set('app-stores/apple/custom-product-pages.json', bytes);
+  return bytes;
+}
+
+function producerCaptureTopology(
+  source: ReturnType<typeof metadata>,
+  mutate: (steps: Record<string, unknown>[]) => void,
+): void {
+  source.client.workflow = () => {
+    const workflow = parseYaml(readFileSync('.github/workflows/mobile-screenshots-ios.yml', 'utf8')) as {
+      jobs: { 'cpp-capture': { steps: Record<string, unknown>[] } };
+    };
+    mutate(workflow.jobs['cpp-capture'].steps);
+    return JSON.stringify(workflow);
+  };
+}
+const modernCaptureAction = './.boardsesh/cache-tooling/.github/actions/ios-screenshot-shard';
+const legacyCaptureAction = './.github/actions/ios-screenshot-shard';
+const identityStepName = 'Verify application and cache tooling identities';
+function topologyStep(steps: Record<string, unknown>[], role: 'root' | 'tooling' | 'identity' | 'capture') {
+  const step = steps.find((candidate) => {
+    if (role === 'identity') return candidate.name === identityStepName;
+    if (role === 'capture') return candidate.uses === modernCaptureAction;
+    if (candidate.uses !== 'actions/checkout@v4') return false;
+    const inputs = candidate.with as Record<string, unknown>;
+    return role === 'root' ? inputs.path === undefined : inputs.path === '.boardsesh/cache-tooling';
+  });
+  if (!step) throw new Error(`Missing ${role} fixture step`);
+  return step;
+}
+
+describe('retained producer capture topology', () => {
+  it('accepts the reviewed modern immutable-tooling shape', () => {
+    const source = metadata();
+    expect(verifyRetainedCppProducer(source.options, source.client).producerSha).toBe(producerSha);
+  });
+  it('preserves the historical root checkout and local action shape', () => {
+    const source = metadata();
+    producerCaptureTopology(source, (steps) => {
+      const capture = topologyStep(steps, 'capture');
+      const tooling = topologyStep(steps, 'tooling');
+      const identity = topologyStep(steps, 'identity');
+      capture.uses = legacyCaptureAction;
+      steps.splice(steps.indexOf(identity), 1);
+      steps.splice(steps.indexOf(tooling), 1);
+    });
+    expect(verifyRetainedCppProducer(source.options, source.client).producerSha).toBe(producerSha);
+  });
+  it('allows only the verified same repository when explicitly named', () => {
+    const source = metadata();
+    producerCaptureTopology(source, (steps) => {
+      for (const role of ['root', 'tooling'] as const)
+        (topologyStep(steps, role).with as Record<string, unknown>).repository = 'boardsesh/boardsesh';
+    });
+    expect(verifyRetainedCppProducer(source.options, source.client).producerSha).toBe(producerSha);
+  });
+  it.each([
+    'missing-tooling',
+    'wrong-tooling-ref',
+    'wrong-tooling-path',
+    'foreign-tooling-repository',
+    'foreign-root-repository',
+    'conditional-root',
+    'conditional-tooling',
+    'conditional-identity',
+    'ignored-identity',
+    'conditional-capture',
+    'wrong-root-path',
+    'wrong-root-ref',
+    'identity-after-capture',
+    'tooling-before-root',
+    'identity-before-tooling',
+    'duplicate-root',
+    'duplicate-tooling',
+    'duplicate-capture',
+    'conflicting-capture',
+    'wrong-application-binding',
+    'wrong-tooling-binding',
+    'fake-identity-command',
+    'missing-identity',
+    'duplicate-identity',
+  ])('rejects %s before any archive read or output', async (kind) => {
+    const source = metadata();
+    producerCaptureTopology(source, (steps) => {
+      const root = topologyStep(steps, 'root');
+      const tooling = topologyStep(steps, 'tooling');
+      const identity = topologyStep(steps, 'identity');
+      const capture = topologyStep(steps, 'capture');
+      const rootInputs = root.with as Record<string, unknown>;
+      const toolingInputs = tooling.with as Record<string, unknown>;
+      const identityEnvironment = identity.env as Record<string, unknown>;
+      switch (kind) {
+        case 'missing-tooling':
+          steps.splice(steps.indexOf(tooling), 1);
+          break;
+        case 'wrong-tooling-ref':
+          toolingInputs.ref = 'refs/heads/main';
+          break;
+        case 'wrong-tooling-path':
+          toolingInputs.path = '.boardsesh/other-tooling';
+          break;
+        case 'foreign-tooling-repository':
+          toolingInputs.repository = 'another/repository';
+          break;
+        case 'foreign-root-repository':
+          rootInputs.repository = 'another/repository';
+          break;
+        case 'conditional-root':
+          root.if = false;
+          break;
+        case 'conditional-tooling':
+          tooling.if = 'always()';
+          break;
+        case 'conditional-identity':
+          identity.if = false;
+          break;
+        case 'ignored-identity':
+          identity['continue-on-error'] = true;
+          break;
+        case 'conditional-capture':
+          capture.if = false;
+          break;
+        case 'wrong-root-path':
+          rootInputs.path = 'another-source';
+          break;
+        case 'wrong-root-ref':
+          rootInputs.ref = 'refs/heads/main';
+          break;
+        case 'identity-after-capture':
+          steps.splice(steps.indexOf(identity), 1);
+          steps.push(identity);
+          break;
+        case 'tooling-before-root':
+          steps.splice(steps.indexOf(tooling), 1);
+          steps.unshift(tooling);
+          break;
+        case 'identity-before-tooling':
+          steps.splice(steps.indexOf(identity), 1);
+          steps.splice(steps.indexOf(tooling), 0, identity);
+          break;
+        case 'duplicate-root':
+          steps.push(structuredClone(root));
+          break;
+        case 'duplicate-tooling':
+          steps.push(structuredClone(tooling));
+          break;
+        case 'duplicate-capture':
+          steps.push(structuredClone(capture));
+          break;
+        case 'conflicting-capture':
+          steps.push({ ...capture, uses: legacyCaptureAction });
+          break;
+        case 'wrong-application-binding':
+          identityEnvironment.APP_SOURCE_SHA = '${{ github.sha }}';
+          break;
+        case 'wrong-tooling-binding':
+          identityEnvironment.CACHE_TOOLING_SHA = '${{ github.sha }}';
+          break;
+        case 'fake-identity-command':
+          identity.run = 'true';
+          break;
+        case 'missing-identity':
+          steps.splice(steps.indexOf(identity), 1);
+          break;
+        case 'duplicate-identity':
+          steps.push(structuredClone(identity));
+          break;
+      }
+    });
+    await expect(downloadRetainedCppRecord(source.options, source.client)).rejects.toThrow(
+      'failed source or artifact verification',
+    );
+    expect(source.calls.some((path) => path.endsWith('/zip'))).toBe(false);
+    expect(existsSync(source.options.out)).toBe(false);
+    expect(existsSync(source.options.receipt)).toBe(false);
+  });
+});
+
+describe('retained record failed-job retries', () => {
+  it('binds carried successes and bootstrap to originals, selecting the fourth native retry and excluding only its failed partial', () => {
+    const source = retriedMetadata();
+    const result = verifyRetainedCppProducer(source.options, source.client);
+    expect(result.jobIds).toEqual([1, 2, 3, 4, 105, 6]);
+    expect(result.artifacts).toHaveLength(9);
+    expect(
+      result.artifacts
+        .filter((artifact) => artifact.device === 'ipad-pro-13-inch-m5')
+        .map((artifact) => artifact.jobId),
+    ).toEqual([105, 105]);
+    expect(result.retryHistory?.selectedExecutions.find((job) => job.name === 'cpp-bootstrap')).toMatchObject({
+      jobId: 2,
+      latestJobId: 102,
+      attempt: 1,
+    });
+    expect(result.retryHistory?.excludedArtifacts).toEqual([
+      {
+        id: 99,
+        name: source.partial.name,
+        digest: source.partial.digest,
+        createdAt: source.partial.created_at,
+        jobId: 5,
+        attempt: 1,
+      },
+    ]);
+  });
+  it.each([
+    [
+      'unrecorded earlier attempt',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.prior.pop();
+      },
+    ],
+    [
+      'overlapping executions',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.partial.created_at = '2026-10-12T02:05:00Z';
+        source.prior[4].completed_at = '2026-10-12T02:10:00Z';
+      },
+    ],
+    [
+      'unknown partial window',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.partial.created_at = '2026-10-12T01:30:00Z';
+      },
+    ],
+    [
+      'expired failed partial',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.partial.expired = true;
+      },
+    ],
+    [
+      'foreign failed partial source',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.partial.workflow_run = { id: 123, head_sha: preparerSha };
+      },
+    ],
+    [
+      'duplicate successful archive',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.artifacts.push({ ...source.artifacts[1], id: 199 });
+      },
+    ],
+    [
+      'different genuine success',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.prior[4].conclusion = 'success';
+        source.prior[4].steps[0].conclusion = 'success';
+      },
+    ],
+    [
+      'unknown relevant artifact',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.artifacts.push({
+          ...source.artifacts[0],
+          id: 199,
+          name: 'ios-cpp-moonboard-cpp-capture-en-US-iphone-16-pro',
+        });
+      },
+    ],
+    [
+      'changed carried-success steps',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.jobs[2].steps = [{ ...source.jobs[2].steps[0], number: 2 }];
+      },
+    ],
+    [
+      'failed capture step under successful job',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.jobs[2].steps = [{ ...source.jobs[2].steps[0], conclusion: 'skipped' }];
+      },
+    ],
+    [
+      'duplicate step number',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.jobs[2].steps.push({ ...source.jobs[2].steps[0] });
+      },
+    ],
+    [
+      'cancelled history',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.prior[4].conclusion = 'cancelled';
+      },
+    ],
+    [
+      'unrelated failed bootstrap history',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.prior[1].conclusion = 'failure';
+      },
+    ],
+    [
+      'out of bound attempt',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.run.run_attempt = 11;
+      },
+    ],
+    [
+      'missing fourth native',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.artifacts.splice(6, 1);
+      },
+    ],
+    [
+      'missing bootstrap',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.artifacts.shift();
+      },
+    ],
+    [
+      'failed latest fourth native',
+      (source: ReturnType<typeof retriedMetadata>) => {
+        source.jobs[4].conclusion = 'failure';
+      },
+    ],
+  ])('rejects %s', (_name, mutate) => {
+    const source = retriedMetadata();
+    mutate(source);
+    expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+  });
+  it.each([
+    'CPP_TARGET: tension',
+    'CPP_ACTION: capture',
+    'FIXTURES_MODE: record',
+    'LOCALES: en-US',
+    'UPLOAD_DEFAULT: false',
+    'PUBLISH_BASELINE: false',
+    'Resolved: gate=full',
+  ])('rejects missing or contradictory original setup %s', (field) => {
+    const source = metadata();
+    source.setSetupLog((log) => log.replace(field, `${field} changed`));
+    expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+  });
+  it.each(['duplicate-output', 'contradictory-env', 'only-shell-source'])('rejects %s setup evidence', (kind) => {
+    const source = metadata();
+    source.setSetupLog((log) =>
+      kind === 'duplicate-output'
+        ? `${log}\n${log.split('\n').at(-1)}`
+        : kind === 'contradictory-env'
+          ? `${log}\n2026-10-12T01:00:00Z   PUBLISH_BASELINE: true`
+          : log.replaceAll('Z   ', 'Z echo '),
+    );
+    expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+  });
+  it('preserves the legacy receipt producer shape for unchanged first attempts', () => {
+    const source = metadata(),
+      result = verifyRetainedCppProducer(source.options, source.client);
+    expect(Object.keys(result).sort()).toEqual(
+      ['runId', 'attempt', 'producerSha', 'preparerSha', 'jobIds', 'artifacts'].sort(),
+    );
+    expect(result.jobIds).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(Object.keys(result.artifacts[0]).sort()).toEqual(['id', 'name', 'digest', 'kind'].sort());
+    expect(Object.keys(result.artifacts[1]).sort()).toEqual(['id', 'name', 'digest', 'kind', 'device'].sort());
+  });
+});
+
+describe('original Git manifest context', () => {
+  it('accepts only unrelated target drift and binds actual source manifest bytes', () => {
+    const source = metadata();
+    const original = sourceManifest(source, (manifest) => {
+      manifest.targets.kilter.name = 'Earlier unrelated name';
+    });
+    const result = verifyRetainedCppProducer(source.options, source.client);
+    expect(result.captureSource?.manifest).toBe(original.toString());
+    expect(result.captureSource?.sourceSha).toBe(producerSha);
+    expect(result.compatibility?.sourceManifestSha256).toBe(sha256(original));
+  });
+  it.each(['target', 'globals', 'used-caption', 'noncommit', 'nonancestor', 'missing-original-bytes'])(
+    'rejects incompatible %s context',
+    (kind) => {
+      const source = metadata();
+      if (kind === 'target')
+        sourceManifest(source, (manifest) => {
+          manifest.targets.tension.name = 'Changed';
+        });
+      if (kind === 'globals')
+        sourceManifest(source, (manifest) => {
+          manifest.version = 2;
+        });
+      if (kind === 'used-caption') {
+        const path = 'app-stores/presentation/fr.json';
+        const captions = JSON.parse(readFileSync(path, 'utf8')) as Record<string, { headline: string }>;
+        captions[readCppPage('tension').recipes.phone[0].caption].headline += ' changed';
+        source.sourceFiles.set(path, Buffer.from(JSON.stringify(captions)));
+      }
+      if (kind === 'noncommit') source.client.isCommit = () => false;
+      if (kind === 'nonancestor') source.setAncestor(false);
+      if (kind === 'missing-original-bytes')
+        source.client.source = () => {
+          throw new Error('Missing original Git object');
+        };
+      expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+    },
+  );
+});
+
+describe('retained CPP producer authorization', () => {
+  it('accepts only the old preparation failure after four genuine native successes', () => {
+    const source = metadata();
+    expect(verifyRetainedCppProducer(source.options, source.client)).toMatchObject({
+      runId: 123,
+      attempt: 1,
+      producerSha,
+      preparerSha,
+    });
+    expect(source.calls).toContain('repos/boardsesh/boardsesh/actions/runs/123/attempts/1/jobs?per_page=100');
+  });
+  it.each([
+    [
+      'foreign repository',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.repository.full_name = 'foreign/repo';
+      },
+    ],
+    [
+      'fork source',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.head_repository.full_name = 'foreign/repo';
+      },
+    ],
+    [
+      'wrong workflow',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.workflow_id = 999;
+      },
+    ],
+    [
+      'different path',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.path = 'evil.yml';
+      },
+    ],
+    [
+      'wrong event',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.event = 'pull_request';
+      },
+    ],
+    [
+      'running producer',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.status = 'in_progress';
+      },
+    ],
+    [
+      'cancelled producer',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.conclusion = 'cancelled';
+      },
+    ],
+    [
+      'ambiguous second attempt',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.run_attempt = 2;
+      },
+    ],
+    [
+      'invalid head',
+      (source: ReturnType<typeof metadata>) => {
+        source.run.head_sha = 'bad';
+      },
+    ],
+    [
+      'foreign history',
+      (source: ReturnType<typeof metadata>) => {
+        source.setAncestor(false);
+      },
+    ],
+    [
+      'failed native',
+      (source: ReturnType<typeof metadata>) => {
+        source.jobs[2].conclusion = 'failure';
+      },
+    ],
+    [
+      'missing native',
+      (source: ReturnType<typeof metadata>) => {
+        source.jobs.splice(2, 1);
+      },
+    ],
+    [
+      'duplicate native',
+      (source: ReturnType<typeof metadata>) => {
+        source.jobs.push({ ...source.jobs[2] });
+      },
+    ],
+    [
+      'wrong target',
+      (source: ReturnType<typeof metadata>) => {
+        source.jobs[2].name = source.jobs[2].name.replace('tension', 'kilter');
+      },
+    ],
+    [
+      'wrong attempt',
+      (source: ReturnType<typeof metadata>) => {
+        source.jobs[2].run_attempt = 2;
+      },
+    ],
+    [
+      'foreign first-attempt namespace',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts.push({
+          ...source.artifacts[0],
+          id: 199,
+          name: 'ios-cpp-spray-cpp-capture-fr-ipad-pro-11-inch-m5',
+        });
+      },
+    ],
+    [
+      'invalid archive size',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[0].size_in_bytes = 0;
+      },
+    ],
+    [
+      'oversized archive',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[0].size_in_bytes = 128 * 1024 * 1024 + 1;
+      },
+    ],
+    [
+      'expired archive',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[1].expired = true;
+      },
+    ],
+    [
+      'duplicate archive',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts.push({ ...source.artifacts[1] });
+      },
+    ],
+    [
+      'old attempt archive',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[1].created_at = '2026-10-11T01:05:00Z';
+      },
+    ],
+    [
+      'late archive',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[1].created_at = '2026-10-12T01:15:00Z';
+      },
+    ],
+    [
+      'foreign artifact run',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[1].workflow_run.id = 999;
+      },
+    ],
+    [
+      'foreign artifact source',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[1].workflow_run.head_sha = preparerSha;
+      },
+    ],
+    [
+      'missing digest',
+      (source: ReturnType<typeof metadata>) => {
+        source.artifacts[1].digest = '';
+      },
+    ],
+  ])('rejects %s before archive reads or candidate output', async (_name, mutate) => {
+    const source = metadata();
+    mutate(source);
+    await expect(downloadRetainedCppRecord(source.options, source.client)).rejects.toThrow(
+      'failed source or artifact verification',
+    );
+    expect(source.calls.some((path) => path.endsWith('/zip'))).toBe(false);
+    expect(existsSync(source.options.out)).toBe(false);
+    expect(existsSync(source.options.receipt)).toBe(false);
+  });
+  it('rejects other preparation failures, unrelated job failures and an unpinned source workflow', () => {
+    const source = metadata();
+    source.client.bytes = () => Buffer.from('Authentication failed');
+    expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+    source.run.conclusion = 'success';
+    source.jobs[6].conclusion = 'success';
+    source.jobs[0].conclusion = 'failure';
+    expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+    source.jobs[0].conclusion = 'success';
+    // Replace every source checkout to guarantee the actual capture checkout is unpinned.
+    source.client.workflow = () =>
+      readFileSync('.github/workflows/mobile-screenshots-ios.yml', 'utf8').replaceAll(
+        'ref: ${{ needs.setup.outputs.source_sha }}',
+        'ref: evil',
+      );
+    expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+  });
+  it.each(['setup-output', 'compute-output', 'compute-env'])('rejects a changed producer %s source binding', (kind) => {
+    const source = metadata();
+    source.client.workflow = () => {
+      const workflow = readFileSync('.github/workflows/mobile-screenshots-ios.yml', 'utf8');
+      if (kind === 'setup-output')
+        return workflow.replace('source_sha: ${{ steps.compute.outputs.source_sha }}', 'source_sha: unrelated');
+      if (kind === 'compute-output') {
+        const computeStart = workflow.indexOf('      - name: Compute locales, matrix and gate');
+        return (
+          workflow.slice(0, computeStart) +
+          workflow.slice(computeStart).replace('source_sha=$SOURCE_SHA', 'source_sha=unrelated')
+        );
+      }
+      return workflow.replace(
+        'id: compute\n        env:',
+        'id: compute\n        env:\n          SOURCE_SHA: unrelated',
+      );
+    };
+    expect(() => verifyRetainedCppProducer(source.options, source.client)).toThrow();
+  });
+});
+
+function writeSource(root: string, source: ReturnType<typeof sample>) {
+  mkdirSync(root, { recursive: true });
+  writeFileSync(join(root, 'manifest.json'), JSON.stringify(source.manifest));
+  source.manifest.graphql.forEach((entry, index) => {
+    const filename = join(root, entry.file);
+    mkdirSync(dirname(filename), { recursive: true });
+    writeFileSync(filename, JSON.stringify(source.fixtures[index]));
+  });
+}
+let seedRoot: string;
+const pixels = new Map<string, Buffer>();
+beforeAll(async () => {
+  seedRoot = mkdtempSync(join(tmpdir(), 'cpp-retained-pixels-'));
+  for (const [, device] of RETAINED_CPP_DEVICES) {
+    const { width, height } = ACCEPTED_SIZES[device][0];
+    const bytes = Buffer.alloc(width * height * 3, 20);
+    let state = 123456789;
+    for (let offset = 0; offset < width * 64 * 3; offset++) {
+      state ^= state << 13;
+      state ^= state >>> 17;
+      state ^= state << 5;
+      bytes[offset] = state & 255;
+    }
+    pixels.set(
+      device,
+      await sharp(bytes, { raw: { width, height, channels: 3 } })
+        .png()
+        .toBuffer(),
+    );
+  }
+});
+afterAll(() => rmSync(seedRoot, { recursive: true, force: true }));
+function writeNative(root: string, device: string, manifest: ScreenshotFixtureManifest) {
+  const target = manifest.capture!.cpp!.target;
+  const page = readCppPage(target);
+  const png = pixels.get(device)!;
+  const raw = join(root, 'raw-screenshots', 'en-US', device),
+    framed = join(root, 'screenshots', 'en-US', device);
+  mkdirSync(raw, { recursive: true });
+  mkdirSync(framed, { recursive: true });
+  for (const name of cppCaptureNames(page, device)) writeFileSync(join(raw, name), png);
+  writeFileSync(
+    join(raw, 'cpp-capture.json'),
+    JSON.stringify({ target, verified: false, coverage: manifest.capture!.cpp }),
+  );
+  const presentation = {
+    version: 1,
+    locale: 'en-US',
+    cpp: { target, manifestSha256: sha256(readFileSync(CPP_MANIFEST_PATH)) },
+    files: {} as Record<string, unknown>,
+  };
+  for (const recipe of page.recipes[device.startsWith('ipad-') ? 'ipad' : 'phone']) {
+    writeFileSync(join(framed, recipe.output), png);
+    if (recipe.liveActivity) {
+      const native = loadLiveActivityFixture(recipe.liveActivity.boardFamily, 'en-US');
+      const { width, height } = ACCEPTED_SIZES[device][0];
+      presentation.files[recipe.output] = {
+        rawBytes: native.pixels.length,
+        rawSha256: native.provenance.sha256,
+        framedSha256: sha256(png),
+        liveActivity: {
+          fixture: native.provenance,
+          manifestSha256: native.manifestSha256,
+          outputCanvas: { width, height },
+        },
+      };
+      continue;
+    }
+    const source = { rawSha256: sha256(png), rawBytes: png.length };
+    presentation.files[recipe.output] = {
+      ...source,
+      framedSha256: sha256(png),
+      ...(recipe.sources.length > 1
+        ? { sources: Object.fromEntries(recipe.sources.map((name) => [name, source])) }
+        : {}),
+    };
+  }
+  writeFileSync(join(framed, 'presentation.json'), JSON.stringify(presentation));
+}
+function zip(root: string): Buffer {
+  const output = join(directory(), 'artifact.zip');
+  execFileSync('python3', [
+    '-c',
+    'import pathlib,sys,zipfile\nroot=pathlib.Path(sys.argv[1])\nwith zipfile.ZipFile(sys.argv[2],"w",zipfile.ZIP_DEFLATED) as archive:\n for path in sorted(root.rglob("*")):\n  if path.is_file(): archive.write(path,path.relative_to(root))',
+    root,
+    output,
+  ]);
+  return readFileSync(output);
+}
+function withCount(source: ReturnType<typeof sample>, totalCount?: number, index = 0) {
+  source.manifest.capture!.cpp!.scenes.search.gradeFilter = {
+    minLabel: 'V1',
+    maxLabel: 'V3',
+    minGradeId: 13,
+    maxGradeId: 16,
+    expectedCount: 100,
+  };
+  if (totalCount !== undefined) {
+    const key = cppGradeCountKey(source.manifest, source.fixtures);
+    const fixture = source.append(SEARCH_CLIMBS_COUNT, key.variables, { data: { searchClimbs: { totalCount } } });
+    fixture.recordedAt = `2026-10-12T00:00:00.${String(index).padStart(3, '0')}Z`;
+    source.manifest = bindCppGradeCountProof(source.manifest, source.fixtures);
+  }
+  return source;
+}
+function recordingArtifacts(source: ReturnType<typeof metadata>, changingCounts = false) {
+  const example = sample();
+  for (const artifact of source.artifacts) {
+    const root = join(source.root, String(artifact.id));
+    mkdirSync(root);
+    const device = artifact.name.split('en-US-')[1];
+    const index = RETAINED_CPP_DEVICES.findIndex(([, slug]) => slug === device) + 1;
+    const selected = changingCounts
+      ? withCount(sample(), artifact.name.startsWith('cpp-bootstrap') ? undefined : 100 + index, index)
+      : example;
+    if (artifact.name.startsWith('cpp-bootstrap'))
+      writeFileSync(join(root, 'cpp-scenario.json'), JSON.stringify(selected.manifest.capture));
+    else if (artifact.name.startsWith('screenshot-fixtures')) writeSource(root, selected);
+    else writeNative(root, device, selected.manifest);
+    const archive = zip(root);
+    source.archives.set(artifact.id, archive);
+    artifact.digest = `sha256:${sha256(archive)}`;
+    artifact.size_in_bytes = archive.length;
+  }
+  return example;
+}
+
+describe('retained original source and native bytes', () => {
+  it('imports retry shards without reading the failed partial or relabelling any original native bytes', async () => {
+    const source = retriedMetadata();
+    recordingArtifacts(source);
+    const originalBytes = new Map(source.archives);
+    source.archives.delete(99);
+    await downloadRetainedCppRecord(source.options, source.client);
+    const receipt = JSON.parse(readFileSync(source.options.receipt, 'utf8')) as {
+      retryHistory: { excludedArtifacts: Array<{ id: number }> };
+      manifestSha256: Record<string, string>;
+    };
+    expect(receipt.retryHistory.excludedArtifacts[0].id).toBe(99);
+    expect(Object.keys(receipt.manifestSha256).sort()).toEqual(RETAINED_CPP_DEVICES.map(([, device]) => device).sort());
+    for (const [artifactId, bytes] of source.archives) expect(bytes.equals(originalBytes.get(artifactId)!)).toBe(true);
+    expect(source.calls.some((path) => path.endsWith('/artifacts/99/zip'))).toBe(false);
+  });
+  it.each(['source hash', 'source bytes', 'fixture manifest', 'canvas', 'fixture identity', 'extra sources'])(
+    'rejects altered Live Activity %s in retained native presentations',
+    (kind) => {
+      const fixture = sample('kilter');
+      const root = directory();
+      const device = 'iphone-16-pro-max';
+      writeNative(root, device, fixture.manifest);
+      expect(() => verifyRetainedCppNative(root, device, fixture.manifest)).not.toThrow();
+      const filename = join(root, 'screenshots', 'en-US', device, 'presentation.json');
+      const presentation = JSON.parse(readFileSync(filename, 'utf8')) as {
+        files: Record<string, Record<string, unknown>>;
+      };
+      const recipe = readCppPage('kilter').recipes.phone.find((candidate) => candidate.liveActivity)!;
+      const metadata = presentation.files[recipe.output];
+      const activity = metadata.liveActivity as Record<string, unknown>;
+      if (kind === 'source hash') metadata.rawSha256 = 'f'.repeat(64);
+      if (kind === 'source bytes') metadata.rawBytes = 1;
+      if (kind === 'fixture manifest') activity.manifestSha256 = 'f'.repeat(64);
+      if (kind === 'canvas') activity.outputCanvas = { width: 1, height: 1 };
+      if (kind === 'fixture identity') {
+        const native = activity.fixture as Record<string, unknown>;
+        native.capturedAt = '2026-10-01T00:00:00Z';
+      }
+      if (kind === 'extra sources') metadata.sources = {};
+      writeFileSync(filename, JSON.stringify(presentation));
+      expect(() => verifyRetainedCppNative(root, device, fixture.manifest)).toThrow();
+    },
+  );
+  it('checks original native sidecars against exact Git bytes while current selected-target gates still apply', () => {
+    const source = metadata(),
+      fixture = sample(),
+      root = directory(),
+      device = 'iphone-16-pro-max';
+    const original = sourceManifest(source, (manifest) => {
+      manifest.targets.kilter.name = 'Previous unrelated name';
+    });
+    const context = verifyRetainedCppProducer(source.options, source.client).captureSource!;
+    writeNative(root, device, fixture.manifest);
+    const filename = join(root, 'screenshots', 'en-US', device, 'presentation.json');
+    const presentation = JSON.parse(readFileSync(filename, 'utf8')) as { cpp: { manifestSha256: string } };
+    expect(() => verifyRetainedCppNative(root, device, fixture.manifest, context)).toThrow();
+    presentation.cpp.manifestSha256 = sha256(original);
+    writeFileSync(filename, JSON.stringify(presentation));
+    const originalSidecar = readFileSync(filename);
+    expect(() => verifyRetainedCppNative(root, device, fixture.manifest, context)).not.toThrow();
+    expect(readFileSync(filename).equals(originalSidecar)).toBe(true);
+    expect(() => verifyRetainedCppNative(root, device, fixture.manifest)).toThrow();
+    expect(() =>
+      verifyRetainedCppNative(root, device, fixture.manifest, { ...context, version: 2 } as unknown as typeof context),
+    ).toThrow();
+    expect(() =>
+      verifyRetainedCppNative(root, device, fixture.manifest, { ...context, unknown: true } as typeof context),
+    ).toThrow();
+  });
+  it.each([
+    'selected-artifact',
+    'selected-time',
+    'selected-size',
+    'excluded-artifact',
+    'excluded-size',
+    'prior-history',
+    'late-attempt',
+    'diagnostic-addition',
+  ])('rejects a late %s change without local installation', async (kind) => {
+    const source = retriedMetadata();
+    recordingArtifacts(source);
+    const bytes = source.client.bytes.bind(source.client);
+    let changed = false;
+    source.client.bytes = (path) => {
+      const result = bytes(path);
+      if (!changed && path.endsWith('/zip')) {
+        changed = true;
+        if (kind === 'selected-artifact') source.artifacts[1].digest = `sha256:${'e'.repeat(64)}`;
+        if (kind === 'selected-time') source.artifacts[1].created_at = '2026-10-12T01:06:00Z';
+        if (kind === 'selected-size') source.artifacts[1].size_in_bytes++;
+        if (kind === 'excluded-size') source.partial.size_in_bytes++;
+        if (kind === 'diagnostic-addition')
+          source.artifacts.push({ ...source.artifacts[0], id: 199, name: 'capture-debug-new' });
+        if (kind === 'excluded-artifact') source.partial.digest = `sha256:${'e'.repeat(64)}`;
+        if (kind === 'prior-history') source.prior[4].steps[0].name = 'Altered failure';
+        if (kind === 'late-attempt') source.run.run_attempt = 3;
+      }
+      return result;
+    };
+    await expect(downloadRetainedCppRecord(source.options, source.client)).rejects.toThrow();
+    expect(existsSync(source.options.out)).toBe(false);
+    expect(existsSync(source.options.receipt)).toBe(false);
+  });
+  it('rejects changed first-attempt step metadata during download without altering the legacy receipt shape', async () => {
+    const source = metadata();
+    recordingArtifacts(source);
+    const bytes = source.client.bytes.bind(source.client);
+    source.client.bytes = (path) => {
+      const result = bytes(path);
+      if (path.endsWith('/zip')) source.jobs[2].steps = [{ ...source.jobs[2].steps[0], number: 2 }];
+      return result;
+    };
+    await expect(downloadRetainedCppRecord(source.options, source.client)).rejects.toThrow();
+    expect(existsSync(source.options.out)).toBe(false);
+  });
+  it('rejects only the mutated source context in an otherwise valid merged receipt', async () => {
+    const source = metadata();
+    recordingArtifacts(source);
+    await downloadRetainedCppRecord(source.options, source.client);
+    const merged = join(source.options.out, 'iphone-16-pro-max');
+    const originalReceipt = JSON.parse(readFileSync(source.options.receipt, 'utf8')) as Record<string, unknown>;
+    expect(() => verifyRetainedCppMerged(merged, source.options.receipt)).not.toThrow();
+    sourceManifest(source, (manifest) => {
+      manifest.targets.kilter.name = 'Earlier unrelated name';
+    });
+    const producer = verifyRetainedCppProducer(source.options, source.client);
+    for (const kind of ['partial-context', 'wrong-source', 'wrong-proof', 'unknown-version']) {
+      const receipt: Record<string, unknown> = {
+        ...originalReceipt,
+        captureSource: producer.captureSource,
+        compatibility: producer.compatibility,
+      };
+      if (kind === 'partial-context') delete receipt.compatibility;
+      if (kind === 'wrong-source') receipt.captureSource = { ...producer.captureSource, sourceSha: preparerSha };
+      if (kind === 'wrong-proof')
+        receipt.compatibility = { ...producer.compatibility, sourceManifestSha256: 'e'.repeat(64) };
+      if (kind === 'unknown-version') receipt.captureSource = { ...producer.captureSource, version: 2 };
+      writeFileSync(source.options.receipt, JSON.stringify(receipt));
+      expect(() => verifyRetainedCppMerged(merged, source.options.receipt)).toThrow();
+    }
+  });
+  it('accepts changing genuine counts across bootstrap, four shards and newest merge without rewriting originals', async () => {
+    const source = metadata();
+    recordingArtifacts(source, true);
+    const originals = new Map(
+      source.artifacts.map((artifact) => [artifact.id, source.archives.get(artifact.id)!.toString('base64')]),
+    );
+    await downloadRetainedCppRecord(source.options, source.client);
+    const sets = RETAINED_CPP_DEVICES.map(([, device]) => {
+      const label = join(source.options.out, device);
+      const manifest = verifyRetainedCppSource(label, 'tension');
+      const fixtures = manifest.graphql.map(
+        (entry) => JSON.parse(readFileSync(join(label, entry.file), 'utf8')) as GraphqlFixtureFile,
+      );
+      return {
+        label,
+        manifest,
+        contentHashes: new Map(
+          manifest.graphql.map((entry, index) => [entry.file, graphqlFixtureContentHash(fixtures[index])]),
+        ),
+        graphqlRecordedAt: new Map(manifest.graphql.map((entry, index) => [entry.file, fixtures[index].recordedAt])),
+        cppCountFixtures: fixtures,
+      };
+    });
+    const merged = mergeFixtureSets(sets, { onConflict: 'newest' });
+    expect(merged.manifest.capture!.cpp!.scenes.search.gradeFilter!.expectedCount).toBe(104);
+    const mergedRoot = join(source.root, 'merged');
+    mkdirSync(mergedRoot);
+    writeFileSync(join(mergedRoot, 'manifest.json'), JSON.stringify(merged.manifest));
+    for (const [filename, originalRoot] of merged.sources) {
+      mkdirSync(dirname(join(mergedRoot, filename)), { recursive: true });
+      writeFileSync(join(mergedRoot, filename), readFileSync(join(originalRoot, filename)));
+    }
+    expect(() => verifyRetainedCppMerged(mergedRoot, source.options.receipt)).not.toThrow();
+    for (const artifact of source.artifacts)
+      expect(source.archives.get(artifact.id)!.toString('base64')).toBe(originals.get(artifact.id));
+    merged.manifest.capture!.cpp!.scenes.search.gradeFilter!.proof!.responseSha256 = '0'.repeat(64);
+    writeFileSync(join(mergedRoot, 'manifest.json'), JSON.stringify(merged.manifest));
+    expect(() => verifyRetainedCppMerged(mergedRoot, source.options.receipt)).toThrow();
+  });
+  it('verifies nine original artifacts without authentication and emits a receipt with separate sources and no private fields', async () => {
+    const source = metadata();
+    const example = recordingArtifacts(source);
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Network forbidden'));
+    await downloadRetainedCppRecord(source.options, source.client);
+    const receipt = readFileSync(source.options.receipt, 'utf8');
+    expect(JSON.parse(receipt)).toMatchObject({ producerSha, preparerSha, target: 'tension' });
+    for (const privateField of [
+      owner,
+      email,
+      example.manifest.capture!.sharedSessionId!,
+      'http://127.0.0.1',
+      'accountUserId',
+      'accountEmail',
+    ])
+      expect(receipt).not.toContain(privateField);
+    for (const [, device] of RETAINED_CPP_DEVICES) {
+      expect(readFileSync(join(source.options.out, device, 'manifest.json'))).toEqual(
+        readFileSync(
+          join(
+            source.root,
+            String(
+              source.artifacts.find(
+                (artifact) => artifact.name === `screenshot-fixtures-cpp-capture-tension-en-US-${device}`,
+              )!.id,
+            ),
+            'manifest.json',
+          ),
+        ),
+      );
+    }
+    const merged = join(source.root, 'merged');
+    cpSync(join(source.options.out, 'iphone-16-pro-max'), merged, { recursive: true });
+    expect(() => verifyRetainedCppMerged(merged, source.options.receipt)).not.toThrow();
+    const joinFixture = example.fixtures.find((fixture) => fixture.operationName === 'JoinSession')!;
+    const response = joinFixture.response as { data: { joinSession: { isLeader: boolean } } };
+    response.data.joinSession.isLeader = false;
+    writeSource(merged, example);
+    expect(() => verifyRetainedCppMerged(merged, source.options.receipt)).toThrow();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it('rejects ZIP digest tampering before extracting or emitting source output', async () => {
+    const source = metadata();
+    source.archives.set(10, Buffer.from('tampered ZIP'));
+    source.artifacts[0].size_in_bytes = Buffer.byteLength('tampered ZIP');
+    await expect(downloadRetainedCppRecord(source.options, source.client)).rejects.toThrow();
+    expect(existsSync(source.options.out)).toBe(false);
+    expect(existsSync(source.options.receipt)).toBe(false);
+  });
+  it.each(['bootstrap-scenario', 'different-account', 'last-native'])(
+    'rejects an original digest-matching %s mismatch before auth/output',
+    async (kind) => {
+      const source = metadata();
+      const example = recordingArtifacts(source);
+      const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Network forbidden'));
+      const artifact = source.artifacts[kind === 'bootstrap-scenario' ? 0 : kind === 'different-account' ? 3 : 8];
+      const root = join(source.root, String(artifact.id));
+      if (kind === 'bootstrap-scenario')
+        writeFileSync(
+          join(root, 'cpp-scenario.json'),
+          JSON.stringify({ ...example.manifest.capture, boards: ['Foreign scenario'] }),
+        );
+      if (kind === 'different-account') {
+        example.manifest.accountEmail = 'foreign@example.test';
+        writeSource(root, example);
+      }
+      if (kind === 'last-native')
+        writeFileSync(join(root, 'raw-screenshots', 'en-US', 'ipad-pro-11-inch-m5', '04-led.png'), Buffer.alloc(0));
+      const archive = zip(root);
+      source.archives.set(artifact.id, archive);
+      artifact.digest = `sha256:${sha256(archive)}`;
+      artifact.size_in_bytes = archive.length;
+      await expect(downloadRetainedCppRecord(source.options, source.client)).rejects.toThrow(
+        'failed source or artifact verification',
+      );
+      expect(fetch).not.toHaveBeenCalled();
+      expect(existsSync(source.options.out)).toBe(false);
+      expect(existsSync(source.options.receipt)).toBe(false);
+    },
+  );
+  it.each(['traversal', 'duplicate', 'symlink'])(
+    'rejects a digest-matching %s archive without output',
+    async (kind) => {
+      const source = metadata();
+      const filename = join(source.root, 'unsafe.zip');
+      execFileSync(
+        'python3',
+        [
+          '-c',
+          'import sys,zipfile\nwith zipfile.ZipFile(sys.argv[1],"w") as archive:\n if sys.argv[2]=="traversal": archive.writestr("../escape","blocked")\n elif sys.argv[2]=="duplicate":\n  archive.writestr("same","one"); archive.writestr("same","two")\n else:\n  entry=zipfile.ZipInfo("link");entry.create_system=3;entry.external_attr=0o120777<<16;archive.writestr(entry,"/tmp/escape")',
+          filename,
+          kind,
+        ],
+        { stdio: 'pipe' },
+      );
+      const archive = readFileSync(filename);
+      source.archives.set(10, archive);
+      source.artifacts[0].digest = `sha256:${sha256(archive)}`;
+      source.artifacts[0].size_in_bytes = archive.length;
+      await expect(downloadRetainedCppRecord(source.options, source.client)).rejects.toThrow(
+        'failed source or artifact verification',
+      );
+      expect(existsSync(source.options.out)).toBe(false);
+      expect(existsSync(source.options.receipt)).toBe(false);
+    },
+  );
+  it.each(['owner', 'canonical', 'role', 'extra-file'])('rejects %s source evidence locally', (kind) => {
+    const root = directory();
+    const source = sample();
+    if (kind === 'owner') source.boards[0].ownerId = 'foreign';
+    if (kind === 'canonical') source.fixtures[0].documentHash = 'bad';
+    if (kind === 'role')
+      (
+        source.fixtures.find((fixture) => fixture.operationName === 'JoinSession')!.response as {
+          data: { joinSession: { isLeader: boolean } };
+        }
+      ).data.joinSession.isLeader = false;
+    writeSource(root, source);
+    if (kind === 'extra-file') writeFileSync(join(root, 'credentials.json'), 'synthetic-private');
+    expect(() => verifyRetainedCppSource(root, 'tension')).toThrow();
+  });
+  it.each(['raw-bytes', 'unused-raw', 'framed-bytes', 'missing-native', 'foreign-device', 'scenario', 'manifest'])(
+    'rejects %s native evidence',
+    (kind) => {
+      const source = sample();
+      const root = directory();
+      const device = 'iphone-16-pro-max';
+      writeNative(root, device, source.manifest);
+      const raw = join(root, 'raw-screenshots', 'en-US', device),
+        framed = join(root, 'screenshots', 'en-US', device);
+      if (kind === 'raw-bytes') writeFileSync(join(raw, 'hero-1.png'), Buffer.from('tampered'));
+      if (kind === 'unused-raw') writeFileSync(join(raw, '04-led.png'), Buffer.alloc(0));
+      if (kind === 'framed-bytes')
+        writeFileSync(join(framed, readCppPage('tension').recipes.phone[0].output), Buffer.from('tampered'));
+      if (kind === 'missing-native') rmSync(join(raw, 'hero-1.png'));
+      if (kind === 'foreign-device') mkdirSync(join(root, 'raw-screenshots', 'es', 'unknown'), { recursive: true });
+      if (kind === 'foreign-device')
+        writeFileSync(join(root, 'raw-screenshots', 'es', 'unknown', 'evil.png'), pixels.get(device)!);
+      if (kind === 'scenario')
+        writeFileSync(
+          join(raw, 'cpp-capture.json'),
+          JSON.stringify({ target: 'kilter', verified: false, coverage: source.manifest.capture!.cpp }),
+        );
+      if (kind === 'manifest') {
+        const filename = join(framed, 'presentation.json');
+        const presentation = JSON.parse(readFileSync(filename, 'utf8')) as { cpp: { manifestSha256: string } };
+        presentation.cpp.manifestSha256 = 'foreign';
+        writeFileSync(filename, JSON.stringify(presentation));
+      }
+      expect(() => verifyRetainedCppNative(root, device, source.manifest)).toThrow();
+    },
+  );
+});

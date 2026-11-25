@@ -17,7 +17,7 @@
 //   graph to load for one string.
 //
 // preference-secure-keys.test.ts guards the two ways an entry here can go wrong:
-// it pins the eighteen literals so a rename shows up as a diff, and it reads this
+// it pins the literals so a rename shows up as a diff, and it reads this
 // file's imports and fails if any of them names a module with a `.web` sibling —
 // the fork hazard above, which no value assertion can see because Vitest and tsc
 // both resolve to the native file.
@@ -30,27 +30,31 @@
 //
 // Two keys are deliberately absent:
 //
-// * boardsesh_party_profile — the analytics id, read synchronously at
-//   module-eval time (party-profile-store.ts:38) before any migration could run,
-//   with its failure already swallowed into a null that falls back to PostHog's
-//   own anonymous id. It contributes nothing to the background-read failures
-//   this fixes; the only gain would be analytics linkage on locked background
-//   launches. Not worth widening the blast radius of a change to credential
-//   storage. Revisit in phase 2 if that linkage turns out to matter.
+// * boardsesh_party_profile — the party-session peer id. A failed read is
+//   already swallowed into a null (party-profile-store.ts), so it contributes
+//   nothing to the background-read failures this fixes. Not worth widening the
+//   blast radius of a change to credential storage. It was also PostHog's
+//   anonymous id until the identity-split fix; it no longer is.
 //
 // * boardsesh_dev_metro_hosts — dev-only, and already read-and-deleted on its way
 //   to AsyncStorage (metro-target-store.ts:25). Nothing writes it any more.
 
 import {
   CHANGELOG_LAST_SEEN_KEY,
+  CHANGELOG_PREVIEW_FIRST_SPOTLIGHT_KEY,
   ONBOARDING_BOARD_TIP_KEY,
   ONBOARDING_LINK_EMPTY_DISMISSED_KEY,
   ONBOARDING_SEEN_KEY,
   ONBOARDING_TIP_ACCESSORY_KEY,
-  ONBOARDING_TIP_CLIMBS_TAB_KEY,
   ONBOARDING_TIP_CREW_KEY,
+  ONBOARDING_TIP_PREVIEW_FIRST_KEY,
   ONBOARDING_TIP_QUICKACTIONS_KEY,
   ONBOARDING_TIP_RECORD_KEY,
+  ONBOARDING_TIP_SPRAY_ADD_HOLD_KEY,
+  ONBOARDING_TIP_SPRAY_LONG_PRESS_KEY,
+  ONBOARDING_TIP_SPRAY_MAYBE_KEY,
+  ONBOARDING_TIP_SPRAY_PENCIL_KEY,
+  ONBOARDING_TIP_SPRAY_TAP_SELECT_KEY,
   ONBOARDING_TIP_WORKOUT_KEY,
   THEME_OVERRIDE_KEY,
   UI_VARIANT_KEY,
@@ -80,5 +84,11 @@ export const PREFERENCE_SECURE_KEYS: readonly string[] = [
   ONBOARDING_TIP_RECORD_KEY,
   ONBOARDING_TIP_ACCESSORY_KEY,
   ONBOARDING_TIP_QUICKACTIONS_KEY,
-  ONBOARDING_TIP_CLIMBS_TAB_KEY,
+  ONBOARDING_TIP_SPRAY_TAP_SELECT_KEY,
+  ONBOARDING_TIP_SPRAY_MAYBE_KEY,
+  ONBOARDING_TIP_SPRAY_LONG_PRESS_KEY,
+  ONBOARDING_TIP_SPRAY_ADD_HOLD_KEY,
+  ONBOARDING_TIP_SPRAY_PENCIL_KEY,
+  ONBOARDING_TIP_PREVIEW_FIRST_KEY,
+  CHANGELOG_PREVIEW_FIRST_SPOTLIGHT_KEY,
 ];

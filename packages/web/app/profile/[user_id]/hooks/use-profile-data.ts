@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSession } from 'next-auth/react';
 import { useIsRestoring, useQuery, useQueryClient } from '@tanstack/react-query';
 import { createGraphQLHttpClient } from '@/app/lib/graphql/client';
@@ -15,6 +15,7 @@ import {
   type GetUserClimbPercentileQueryResponse,
 } from '@boardsesh/graphql/operations';
 import { useSnackbar } from '@/app/components/providers/snackbar-provider';
+import { useWsAuthToken } from '@/app/hooks/use-ws-auth-token';
 import { useGradeFormat } from '@/app/hooks/use-grade-format';
 import {
   type UserProfile,
@@ -34,6 +35,7 @@ import {
   buildStatisticsSummary,
   buildVPointsTimeline,
 } from '../utils/chart-data-builders';
+import { guardedFetch, isSessionSuperseded, shouldRetryQuery } from '@/app/lib/auth/session-guard';
 
 type InitialData = {
   initialProfile?: UserProfile;
@@ -70,6 +72,7 @@ const PROFILE_GC_TIME_MS = PERSIST_MAX_AGE_MS;
 
 export function useProfileData(userId: string, initialData?: InitialData) {
   const { data: session } = useSession();
+  const { token } = useWsAuthToken();
   const { showMessage } = useSnackbar();
   const { gradeFormat } = useGradeFormat();
   const queryClient = useQueryClient();
@@ -98,8 +101,8 @@ export function useProfileData(userId: string, initialData?: InitialData) {
   const profileInitial = initialData?.initialProfile;
   const profileQuery = useQuery<UserProfile>({
     queryKey: ['userProfile', userId],
-    queryFn: async () => {
-      const response = await fetch(`/api/internal/profile/${userId}`);
+    queryFn: async ({ signal }) => {
+      const response = await guardedFetch(`/api/internal/profile/${userId}`, { signal });
       if (response.status === 404) throw new ProfileNotFoundError();
       if (!response.ok) throw new Error('Failed to fetch profile');
       const body = await response.json();
@@ -113,25 +116,41 @@ export function useProfileData(userId: string, initialData?: InitialData) {
         followerCount: body.followerCount ?? 0,
         followingCount: body.followingCount ?? 0,
         isFollowedByMe: body.isFollowedByMe ?? false,
+        isPrivate: body.isPrivate,
+        canViewActivity: body.canViewActivity,
       } satisfies UserProfile;
     },
     enabled: !initialData?.initialNotFound,
     staleTime: PROFILE_STALE_TIME_MS,
     gcTime: PROFILE_GC_TIME_MS,
     refetchOnMount: profileInitial ? true : 'always',
-    retry: (failureCount, error) => !(error instanceof ProfileNotFoundError) && failureCount < 3,
+    retry: (failureCount, error) => !(error instanceof ProfileNotFoundError) && shouldRetryQuery(failureCount, error),
     initialData: profileInitial,
     initialDataUpdatedAt: profileInitial ? Date.now() : undefined,
     meta: { persist: isOwnProfile },
   });
 
+  // RSC refreshes bring new authorization decisions without remounting this
+  // client component. Only new props replace the cache; never reinstall the
+  // original SSR snapshot after the revocation bridge has cleared it.
+  const previousProfileSeed = useRef(profileInitial);
+  useEffect(() => {
+    if (profileInitial !== previousProfileSeed.current) {
+      previousProfileSeed.current = profileInitial;
+      if (profileInitial) queryClient.setQueryData(['userProfile', userId], profileInitial);
+    }
+  }, [profileInitial, queryClient, userId]);
+
   const profileError = profileQuery.error;
   const notFound = (initialData?.initialNotFound ?? false) || profileError instanceof ProfileNotFoundError;
 
+  // showMessage changes when the account does, so remember which error was already shown.
+  const shownProfileErrorRef = useRef<unknown>(null);
   useEffect(() => {
-    if (!profileError) return;
+    if (!profileError || shownProfileErrorRef.current === profileError) return;
     if (profileError instanceof ProfileNotFoundError) return;
-    if (isAbortError(profileError)) return;
+    if (isAbortError(profileError) || isSessionSuperseded(profileError)) return;
+    shownProfileErrorRef.current = profileError;
     console.error('Failed to fetch profile:', profileError);
     showMessage('Failed to load profile data', 'error');
   }, [profileError, showMessage]);
@@ -142,13 +161,18 @@ export function useProfileData(userId: string, initialData?: InitialData) {
   const ticksInitial = initialData?.initialAllBoardsTicks;
   const ticksQuery = useQuery<BoardTicks>({
     queryKey: ['userTicks', userId],
-    queryFn: async () => {
-      const client = createGraphQLHttpClient(null);
+    enabled: !session?.user?.id || !!token,
+    queryFn: async ({ signal }) => {
+      const client = createGraphQLHttpClient(token);
       const collected: BoardTicks = {};
       await Promise.all(
         BOARD_TYPES.map(async (boardType) => {
           const variables: GetUserTicksQueryVariables = { userId, boardType };
-          const response = await client.request<GetUserTicksQueryResponse>(GET_USER_TICKS, variables);
+          const response = await client.request<GetUserTicksQueryResponse>({
+            document: GET_USER_TICKS,
+            variables,
+            signal,
+          });
           collected[boardType] = response.userTicks.map((tick) => ({
             climbed_at: tick.climbedAt,
             difficulty: tick.difficulty,
@@ -175,10 +199,15 @@ export function useProfileData(userId: string, initialData?: InitialData) {
   const profileStatsInitial = initialData?.initialProfileStats;
   const profileStatsQuery = useQuery<GetUserProfileStatsQueryResponse['userProfileStats']>({
     queryKey: ['userProfileStats', userId],
-    queryFn: async () => {
-      const client = createGraphQLHttpClient(null);
+    enabled: !session?.user?.id || !!token,
+    queryFn: async ({ signal }) => {
+      const client = createGraphQLHttpClient(token);
       const variables: GetUserProfileStatsQueryVariables = { userId };
-      const response = await client.request<GetUserProfileStatsQueryResponse>(GET_USER_PROFILE_STATS, variables);
+      const response = await client.request<GetUserProfileStatsQueryResponse>({
+        document: GET_USER_PROFILE_STATS,
+        variables,
+        signal,
+      });
       return response.userProfileStats;
     },
     staleTime: PROFILE_STALE_TIME_MS,
@@ -197,10 +226,13 @@ export function useProfileData(userId: string, initialData?: InitialData) {
   const percentileInitial = initialData?.initialPercentile;
   const percentileQuery = useQuery<GetUserClimbPercentileQueryResponse['userClimbPercentile'] | null>({
     queryKey: ['userClimbPercentile', userId],
-    queryFn: async () => {
-      const client = createGraphQLHttpClient(null);
-      const response = await client.request<GetUserClimbPercentileQueryResponse>(GET_USER_CLIMB_PERCENTILE, {
-        userId,
+    enabled: !session?.user?.id || !!token,
+    queryFn: async ({ signal }) => {
+      const client = createGraphQLHttpClient(token);
+      const response = await client.request<GetUserClimbPercentileQueryResponse>({
+        document: GET_USER_CLIMB_PERCENTILE,
+        variables: { userId },
+        signal,
       });
       return response.userClimbPercentile;
     },
@@ -288,34 +320,39 @@ export function useProfileData(userId: string, initialData?: InitialData) {
 
   // Compute hardest send and hardest flash from filtered ticks
   const { hardestSend, hardestFlash } = useMemo(() => {
-    const allTicks = Object.values(filteredBoardsTicks).flat();
-    const mapping = getDifficultyMapping(gradeFormat);
     let maxSendDifficulty = -1;
     let maxFlashDifficulty = -1;
+    let hardestSendBoard: string | null = null;
+    let hardestFlashBoard: string | null = null;
 
-    for (const tick of allTicks) {
-      // Prefer the server-coalesced consensus value; fall back to the raw
-      // override when absent (test fixtures, transient optimistic writes).
-      const grade = tick.effectiveDifficulty ?? tick.difficulty;
-      if (grade == null) continue;
-      if (tick.status === 'send' || tick.status === 'flash') {
-        if (grade > maxSendDifficulty) maxSendDifficulty = grade;
-      }
-      if (tick.status === 'flash') {
-        if (grade > maxFlashDifficulty) maxFlashDifficulty = grade;
+    for (const [boardType, ticks] of Object.entries(filteredBoardsTicks)) {
+      for (const tick of ticks) {
+        // Prefer the server-coalesced consensus value; fall back to the raw
+        // override when absent (test fixtures, transient optimistic writes).
+        const grade = tick.effectiveDifficulty ?? tick.difficulty;
+        if (grade == null) continue;
+        if ((tick.status === 'send' || tick.status === 'flash') && grade > maxSendDifficulty) {
+          maxSendDifficulty = grade;
+          hardestSendBoard = boardType;
+        }
+        if (tick.status === 'flash' && grade > maxFlashDifficulty) {
+          maxFlashDifficulty = grade;
+          hardestFlashBoard = boardType;
+        }
       }
     }
 
-    const makeHighlight = (difficulty: number, status: 'send' | 'flash') => {
-      const label = mapping[difficulty] ?? `${difficulty}`;
+    // Labelled on the hardest tick's board: MoonBoard's 6A reads V2.
+    const makeHighlight = (difficulty: number, status: 'send' | 'flash', boardType: string | null) => {
+      const label = getDifficultyMapping(gradeFormat, boardType)[difficulty] ?? `${difficulty}`;
       const color = getGradeColor(label) ?? 'var(--neutral-200)';
       const textColor = getGradeTextColor(color);
       return { label, color, textColor, status };
     };
 
     return {
-      hardestSend: maxSendDifficulty >= 0 ? makeHighlight(maxSendDifficulty, 'send') : null,
-      hardestFlash: maxFlashDifficulty >= 0 ? makeHighlight(maxFlashDifficulty, 'flash') : null,
+      hardestSend: maxSendDifficulty >= 0 ? makeHighlight(maxSendDifficulty, 'send', hardestSendBoard) : null,
+      hardestFlash: maxFlashDifficulty >= 0 ? makeHighlight(maxFlashDifficulty, 'flash', hardestFlashBoard) : null,
     };
   }, [filteredBoardsTicks, gradeFormat]);
 

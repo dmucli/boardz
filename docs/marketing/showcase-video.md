@@ -1,0 +1,1003 @@
+# Homepage showcase video: recording the app footage
+
+Video recording remains an integration flow against real application state and live backend responses. The dev bootstrap injects a simulator Bluetooth transport before application providers mount; production adapters and screens contain no capture flags. Historical setup links in the recipe registry are translated by the recorder into `/dev/integration/video` commands, which select exact owned boards and activate loaded query results through ordinary application actions. Every command must report its matching nonce ready before the next link runs. Grade filters are opened through their real control.
+
+The simulator transport cannot adopt native connections or persist its transient peripheral identity. Widget actions are delivered through JavaScript because simulator APNs tokens cannot authorize production session commands. Shared sessions, queue changes, timing, teardown, measured anchors and video encoding retain the existing real application paths. These recordings exercise integration behavior; isolated view stories remain the capture path for deterministic stills.
+
+The homepage showcase video is three pieces that share one contract
+(`scripts/lib/showcase-video/contract.ts`):
+
+1. **`vp run video:record`** (this doc) drives iOS simulators (or, with
+   `--platform android`, an Android emulator) and writes the app
+   footage: a 30 fps JPEG sequence per take plus where each callout target sat
+   on screen.
+2. The dev integration root observes generic layout anchors and injects a simulator Bluetooth transport so normal session controls can run.
+3. **`vp run video:render`** lays the footage into `marketing/showcase-video/`
+   and encodes its targets: the homepage hero, social masters, a Reels / ad
+   cut, an Apple App Preview and a Play promo (see [Targets](#targets)).
+
+`vp run video` runs both. After any native release, or any change to a screen a
+take shows, re-record: the footage is a picture of the app, and it goes stale
+the moment the app changes.
+
+## Prerequisites (macOS only)
+
+### CI measurement (Phase 0)
+
+Dispatch **Mobile Store Videos (Measure)** to record MoonBoard in en-US, es, fr and de
+on one macOS 26 runner, then render on Ubuntu. It reuses the screenshot
+dev-client cache and checksum-pinned Maestro. Set `SCREENSHOT_USER_EMAIL` and
+`SCREENSHOT_USER_PASSWORD` in the same scope as the screenshot workflow.
+MoonBoard needs neither a crew account nor physical Live Activity footage.
+
+The `store-videos-moonboard` artifact contains four MP4s, posters and
+`search-results.manifest.json` files. Every encode passes
+`creativeVideoProblems` before upload. Frames are an Actions handoff artifact
+with one-day retention; no frames go to R2. Metrics include per-step minutes,
+sampled process-tree RSS, total runner memory usage, and simulator boot-state
+transitions. The recorder tears down its simulator in every locale child;
+use the transitions and recorder logs to verify that behavior in CI. Memory
+samples are every five seconds, so brief peaks may be higher.
+
+Copy the timing artifact's table and measured RAM into the Phase 0 PR after a
+green dispatch. Those measurements decide Phase 5 optimizations; estimates
+are not recorded as measurements. This dispatch does not write to R2 or Apple.
+
+### Open-train Search Results pipeline
+
+**Mobile Store Videos** stays dormant for automatic runs until the repository
+variable `STORE_VIDEOS_ENABLED` is exactly `true`. Keep it unset while retained
+footage, the dedicated crew account or video storage credentials are missing.
+Manual dispatch remains available and runs the same strict prerequisite checks.
+
+Once enabled, it follows successful **Mobile Store Draft Submission** runs for
+`release/next`, including version-only releases. The draft publishes
+its pinned iOS source, marketing version and build as an Actions artifact.
+The dependent workflow uses that artifact rather than the fingerprint tag or
+the draft run's `head_branch` (which is `main` for a chained workflow run).
+Dispatching by hand checks the current train instead.
+
+A sparse, dependency-free Ubuntu job checks `isVersionTaken` and
+`readMarketingVersion` before Production environment approval. A closed train
+skips recording. The next gate requires an editable iOS version with that exact
+marketing version. Both recording accounts and all three
+`STORE_CREATIVES_R2_AWS_*` secrets must exist before any macOS job starts, and so
+must the reviewed physical source ZIP for every selected cut that ends on the
+Live Activity (Kilter's for the default page while its storyboard still has that
+ending, Tension's for Tension). After importing and reviewing both physical
+takes, configuring those credentials, and verifying a manual twenty-video run,
+enable automatic recording with `gh variable set STORE_VIDEOS_ENABLED --body true`.
+Unset the variable or set it to `false` to suspend automatic recording.
+
+#### Recording a subset of pages
+
+A manual dispatch takes a `variants` input: `all` (the default, and what every
+automatic run uses) or a comma list of `default`, `kilter`, `tension`,
+`moonboard` and `spray`. Each selected page renders in all four locales, so
+`default` alone makes 4 videos. To ship only the default page:
+
+```bash
+gh workflow run mobile-store-videos.yml --ref release/next -f variants=default
+```
+
+The preflight job resolves the list against the recording source's own
+storyboards (`store-videos-gate.ts plan`). It decides which pages need a crew
+take and which end on the Live Activity, and it checks physical footage only for
+those endings. A typo or an unknown name fails there, before any macOS minute.
+A source commit from before subset support has no `plan`; preflight then falls
+back to the old rules (every page, both physical takes) and refuses any list
+other than `all`.
+
+Run subsets for one train one at a time. A manual run waits for the running
+pipeline of the same version instead of cancelling it. GitHub keeps only one
+waiting run per version, so a third dispatch replaces the second while it
+waits. An automatic run from a newer draft still cancels whatever is running.
+
+One record job per selected page records the ordinary takes in all four
+locales, with at most three macOS jobs running together. One crew job then
+records the selected pages that have a crew take, serially; it is skipped when
+none do. A global crew concurrency group also prevents account conflicts
+between train versions. One Ubuntu cell per selected page and locale hydrates
+the physical ending where needed, renders and validates the MP4, and retains
+the poster and provenance. Simulator frame artifacts expire after one day.
+
+The publisher rechecks the open draft, collects exactly the selected exports,
+finalizes only their search entries using Apple's current placement
+specifications, and uploads SHA-addressed candidates to R2. It refreshes one
+draft PR on `store-videos/v<version>` with the posters and MP4 links for the
+pages under review. Pages this run did not record keep main's entries
+untouched. An earlier subset run of the same train that is still on the open
+review branch is carried forward, so recording Kilter later does not drop the
+default page from the PR. Only pages the branch itself changed against its
+merge-base with main are carried, so a fix that landed on main since is never
+reverted. Each review commit records every page's source commit in a
+`Store-Video-Source:` trailer; the PR body names each carried page, the review
+commit it came from and its source. Before pushing, the publisher HEAD-checks
+the carried pages' R2 candidates and stops if any expired (after 30 days):
+re-record those pages in the same run. The PR body also says exactly which
+pages merging will place. Ordinary same-version train syncs retain the pinned
+recording source; rewritten history or a changed version is rejected. A newer
+draft run cancels the older pipeline for that version. An already merged
+video PR prevents another review PR for the same train.
+
+Merge that review PR to promote and upload the exact hashes. See
+[the creative upload contract](app-store-creative-assets.md) for guards,
+manual live-version recovery and the separate Apple asset-review submission.
+Header PNG generation and App Preview uploads retain their manual paths.
+
+### Local recording prerequisites
+
+- Xcode with an iOS 26 simulator runtime.
+- Maestro (`curl -Ls "https://get.maestro.mobile.dev" | bash`) and a JDK 21 at
+  `~/.cache/boardsesh/jdk-21` (the recorder sets `JAVA_HOME` to it when it
+  exists). On Apple silicon that is a macOS aarch64 Temurin 21.
+- `ffmpeg` (`brew install ffmpeg`, or `FFMPEG_BIN`).
+- The screenshot dev-client `.app`. `--app-path` takes a built one; without it
+  the recorder builds one into `packages/mobile/.app-cache/` (about 30 min, once).
+- One free Metro port: the recorder tries 8081, then 8090–8099. An existing
+  Metro stays running; the recorder patches a temporary app copy for its port.
+- A few GB of free disk. Raw recordings, Metro caches and Maestro's debug output
+  all land on it; a full disk shows up as Postgres or Maestro failing, not as a
+  clear error.
+
+For parallel recording jobs, set `SHOWCASE_SIMULATOR_NAME_SUFFIX=Remaining`
+to use `Boardsesh Showcase [Remaining]` and `Boardsesh Showcase 2 [Remaining]`.
+Each worktree owns its own device pair, and occupied Metro ports remain untouched.
+Coordinate account usage before recording live sessions: separate simulators do
+not isolate sessions on a shared account.
+
+### Credentials
+
+The default backend is **prod**, for real content. Two accounts sign in:
+
+| Phone | Account | Env vars |
+| --- | --- | --- |
+| Primary (recorded) | `test@boardsesh.com`, the App Store account | `SCREENSHOT_USER_PASSWORD`; `SCREENSHOT_USER_EMAIL` overrides the email (default `test@boardsesh.com`) |
+| Secondary (crew take only) | Dedicated production crew account, with a real photo avatar and display name | `SHOWCASE_SECONDARY_EMAIL`, `SHOWCASE_SECONDARY_PASSWORD` |
+
+The recorder reads these from the environment, and from `--env-file`
+(default `~/.config/boardsesh/showcase-secrets.env`, mode 600, outside the
+repo). The file may only set those four keys; anything else in it is ignored.
+Never commit either password, and never paste them into a PR.
+
+Create the dedicated crew account before enabling the full train pipeline.
+Use the same GitHub secret scope as `SCREENSHOT_USER_*` (repository secrets,
+or add `--env Production` to both commands if those accounts are environment-scoped):
+
+```sh
+gh secret set SHOWCASE_SECONDARY_EMAIL
+gh secret set SHOWCASE_SECONDARY_PASSWORD
+```
+
+Each command prompts for its value. The pipeline records crew takes serially
+after the ordinary app takes; the shared account cannot run two live sessions.
+
+To fill the env file from 1Password without the values touching disk, keep
+`op://` references in a file and let `op run` resolve them:
+
+```sh
+cat > ~/.config/boardsesh/showcase-secrets.op.env <<'EOF'
+SCREENSHOT_USER_PASSWORD=op://<vault>/<App Store test account item>/password
+SHOWCASE_SECONDARY_EMAIL=op://<vault>/<dedicated crew account item>/username
+SHOWCASE_SECONDARY_PASSWORD=op://<vault>/<dedicated crew account item>/password
+EOF
+op run --env-file ~/.config/boardsesh/showcase-secrets.op.env -- vp run video:record
+```
+
+Both passwords are baked into the screenshot JS bundle (that is how screenshot
+mode signs in without a login screen), exactly like every App Store capture.
+The second phone's bundle is built in its own Metro cache under
+`.boardsesh/showcase-video/work/secondary-metro-tmp/`, and teardown deletes that
+cache and uninstalls the app from the second simulator.
+
+`--backend local` uses the seeded dev DB instead (`test@boardsesh.com` / `test`,
+plus a crew account the recorder registers). No credentials needed, but the
+content is fixture data.
+
+## Re-record everything
+
+```sh
+vp run video:record -- --app-path <Boardsesh.app>
+```
+
+Without `--kind` or a locale selector, recording retains the original English
+`work/footage` paths used by `vp run video` and the homepage renderer. For store
+creatives use the locale command in the next section.
+
+Every requested locale gets a new recorder process, Metro bundle, native take,
+and validation. The cached native app is reusable; its JS is regenerated with
+`EXPO_PUBLIC_SCREENSHOT_LOCALE` for each capture. There is no English footage
+fallback. It:
+
+1. creates (once) and boots two dedicated simulators, "Boardsesh Showcase" and,
+   for the crew take, "Boardsesh Showcase 2" (iPhone 16 Pro Max, status bar at
+   9:41, app in UTC), resets their keychains and installs the dev-client;
+2. starts Metro with the dev integration env (`EXPO_PUBLIC_SCREENSHOT_MODE=1`,
+   `EXPO_PUBLIC_SCREENSHOT_FAKE_BLE=1`, the walls in `EXPO_PUBLIC_SCREENSHOT_BOARDS`,
+   the account) and waits for the app to reach home. Each phone reports home
+   through its own GET endpoint on the recorder’s loopback signal server, independently
+   of analytics consent. A fresh counter increase after each native launch (or a fresh
+   legacy Metro home marker) confirms readiness; earlier pings and the other phone
+   cannot unblock it. Android reverses this ephemeral port onto the host. The second
+   phone gets its own Metro and a copy of the `.app` whose launcher URL points at it;
+3. per take: relaunches the app (so the one-shot deep-link params fire again),
+   opens the take's deep links, starts `simctl io recordVideo`, runs the take's
+   Maestro flow while collecting `[showcase-anchor]` lines from Metro's output,
+   stops the recording with SIGINT, and cuts Maestro's attach time off the head;
+4. writes `.boardsesh/showcase-video/work/boards/default/<locale>/footage/<take>/%05d.jpg`
+   (800 px wide, constant 30 fps), with sibling `anchors/` and `marks/`;
+5. checks every take (below), prints a summary, and tears everything down:
+   the crew take's live session is ended, Metro, the backend it started and the
+   simulators are stopped. Ctrl-C does the same.
+
+The iOS recorder passes `--initialUrl http://localhost:<port>` directly to
+Expo's native launch, before its last/default-server autoload. It waits for a
+fresh home signal for up to four minutes per cold start, matching the screenshot
+runner's allowance for authentication and keychain startup, with three attempts. It
+allows up to 12 minutes of home polling across those attempts, plus native launch
+and tool overhead; this is not a 12-minute wall-clock cap. The previous allowance
+was one minute per attempt, or three minutes of polling across all attempts. It
+does not open a second development-client URL while the first load is pending:
+a late timeout from that request can otherwise cover a working app with Expo's
+error screen. Navigation links still use the primed custom-scheme dialog.
+
+To inspect the profile filter without recording any takes, run
+`vp run video:record -- --kind moonboard --locale en-US --diagnose-profile-filter --app-path <Boardsesh.app>`
+on macOS, or dispatch **Mobile Store Videos (Measure)** with mode
+`diagnose-profile-filter`. This diagnostic requires the MoonBoard variant. It
+uses one iOS simulator and one locale, primes the
+profile as the progress take does, taps its filter once, and saves a screenshot
+immediately after the tap. It requires the filter sheet's localized All boards
+row within 30 seconds, matching the recording's per-attempt visibility budget,
+before any further scroll. A separate `maestro hierarchy` dump observes
+the later state; its timestamp is retained because attaching the CLI takes time.
+Both successful and failed diagnostic Maestro output stays in the debug artifact.
+No footage, take provenance, rendering, R2 upload, or App Store write occurs.
+
+Screenshot mode logs profile filter presses, whether the sheet ref is available,
+sheet change callbacks, and dismissal callbacks under `[showcase-profile-filter]`.
+A change callback reports the requested detent before native presentation; use
+the screenshot and hierarchy to establish that the sheet is actually visible.
+The dismissal callback can also follow the coordinator's timeout fallback; its
+associated warning distinguishes that from a native dismissal acknowledgment.
+A change with index `-1` followed by a dismissal callback records two stages
+of the same close, not two separate closes.
+
+Progress flows require the localized All boards row before any sheet-row tap or
+scroll. Opening an absent sheet has one retry, with a required 30-second visibility
+check per attempt. A completed tap or an idle animation alone does not establish
+native sheet presentation: CI has observed a tap inside the button without an app
+press event. An already-visible sheet is not tapped again. Selection, close and
+scrolling are not retried; a sheet that never appears fails the take before it can
+scroll the profile behind it. Native marks, anchors and frame checks still apply.
+
+Dispatch mode `record-profile` verifies one real English MoonBoard progress take
+with the existing frame, mark and anchor checks. It hands off that take's frames
+for one day and skips rendering. Mode `record-english` runs all three English
+MoonBoard takes in their full measurement order, including progress after board
+and grade-filter takes, with a 60-minute ceiling and the same one-day frame handoff.
+It skips rendering. Use the default `measure` mode after this sequence passes to
+produce the full four-locale measurement.
+The full measurement has a 180-minute job ceiling; the diagnostic and single-take
+modes retain 45 minutes. Three locale children already took 91 minutes in CI, so a fourth
+at the observed pace plus setup would exceed the old 120-minute ceiling.
+Individual startup and Maestro command limits remain unchanged.
+
+Crew setup uses the existing localized Start, Invite climbers, and Copy link
+accessibility labels across all four locales. The second phone waits for the
+localized Join session button on the join card. The invitation closes through its
+localized Close control. Session teardown waits for `end-session-content` and taps
+`sheet-top-bar-trailing`, the confirmation in the sheet header; these actions
+follow the current UI instead of relying on old sheet coordinates.
+The crew Queue action prefers its accessibility label. If the native iOS drawer
+exposes no controls, the observed `10%,84%` point is available only for a
+Kilter/default recording whose actual slot-zero log resolves to Kilter. Mirror
+boards receive no coordinate fallback. The existing avatar and Play next anchor
+checks still gate whether the resulting crew footage is valid.
+After the second phone adds its climb, the flow requires the first upcoming
+row's genuine avatar marker before long-pressing it. The preferred accessibility
+label combines localized position 2 with the added-by label. The verified iOS
+Kilter fallback presses row text at `50%,78%`, away from its drag handle; a
+missing avatar never substitutes a guessed coordinate.
+
+Screenshot mode skips persisted session restoration. End a capture session in
+its existing app context before any cold launch, and stop if that cannot be
+confirmed. Android cleanup collapses the notification shade first. Android crew
+capture currently stops before starting a session because invite extraction is
+not supported.
+
+### Board-specific store footage
+
+```sh
+vp run video:record -- --kind tension --locales all --app-path <Boardsesh.app> --dry-run
+vp run video:record -- --kind tension --locales all --app-path <Boardsesh.app> --keep-raw
+vp run video:record -- --kind moonboard --locales all --app-path <Boardsesh.app> --keep-raw
+```
+
+`--kind kilter|tension|moonboard|spray` records that store cut's required source
+takes, including its named log flow. Kilter and spray also record the mixed
+board pile; Tension and MoonBoard keep their own opening board. Feature takes
+selected with `--only wall,crew,workouts` activate the named screenshot slot
+and verify the actual resolved board type.
+Spray's progress take shows the genuine **All boards** activity calendar: the
+current app includes spray ticks in global totals but does not offer a Spray row
+in its progress filter. The localized All boards control and calendar must be
+visible, and `scrolled` marks the settled calendar. Its capture provenance must
+name that global scope rather than claiming a Spray-only filter.
+The optional MoonBoard grade take opens the existing native filter scene with
+`screenshotCppScene=search-grade` and `screenshotOpenFilters=1`. It supplies no
+grade range or invented results; loaded controls must be visible before its
+`grade-filter-shown` mark is accepted.
+The session prime opens a real climb on that board before navigating to Record.
+Variant footage lives in `work/boards/<kind>/<locale>/{raw,footage,anchors,marks}`;
+Android adds `/android` before those directories. Marks record `takeId`,
+`locale`, `kind`, `platform`, capture timestamp, and validation status. Previous
+success is invalidated before each attempt; a failed re-record cannot reuse it. A store renderer must
+verify this provenance rather than substitute legacy recordings.
+
+The optional `moonboard-import` take shows the native CSV import entry card;
+it does not prove a completed import. A genuine MoonBoard CSV export is required
+before recording a parsed preview or import completion. `moonboard-filter`
+shows the native filter sheet and real loaded grade controls. Neither take
+fabricates logbook rows, benchmark status, or result counts.
+
+Plan for 10–20 minutes per locale for a full showcase and 4–8 minutes per locale
+for one board variant, plus the first native build if no cached app is available.
+These estimates include Metro warmup and two-phone crew setup, not rendering.
+A dry run takes approximately 10 seconds and captures nothing.
+
+Useful flags:
+
+| Flag | What it does |
+| --- | --- |
+| `--locale fr` / `--locales all` | Record native UI for one locale or en-US, es, fr, and de. Comma-separated locales are supported. |
+| `--kind tension` | Record the sources used by that board's store cut. `--only wall,crew,workouts` activates that board for those feature takes. |
+| `--only crew` | Record one take (repeat or comma-separate for more). Other takes' footage is left alone. |
+| `--backend local` | Seeded dev DB: runs `vp run db:up`, starts a backend of its own on 8180+, seeds a MoonBoard and a crew account. `SHOWCASE_LOCAL_BACKEND_URL` reuses a running backend. |
+| `--boards "A\|B\|…"` | The seven walls by name, in slot order: kilter, tension, moonboard, woods, decoy, grasshopper, spray. |
+| `--app-path <app>` | Install this dev-client instead of building one. |
+| `--keep-raw` | Keep the raw `.mov` under `work/raw/` (otherwise deleted once the frames are out). |
+| `--skip-anchor-check` | Record without requiring the callout anchors. |
+| `--env-file <path>` | Where the credentials file is. |
+| `--dry-run` | Print the plan and which credentials are set; touch nothing. |
+| `--end-session <id>` | Record nothing: rejoin that session on the primary and end it (a crashed run's leftover; the crew take logs the id). |
+| `--platform android` | Film on the Android emulator instead (see [Android recording](#android-recording)). |
+| `--hold` | Stop once the phone is ready and wait for Ctrl-C, for calibrating flows by hand. |
+
+Logs: `.boardsesh/showcase-video/work/logs/` (Metro per phone, the backend,
+and every Maestro run's console and debug output).
+
+## The takes
+
+`scripts/lib/showcase-video/takes.ts` is the registry; each take's flow is in
+`packages/mobile/.maestro/showcase/`, with a header naming what it records and
+what every coordinate hits.
+
+| Take | Deep links before recording | What the flow does |
+| --- | --- | --- |
+| `boards-<type>` (9) | `climbs?screenshotOpenFirst=1&screenshotBoardIndex=N`, or a board-config link | Holds a lit climb still for 7 s. |
+| `spray` | `climbs?screenshotOpenFirst=1&screenshotBoardIndex=6` | The first climb on the spray wall's photo, then two swipes to the next climb. |
+| `wall` | `climbs?screenshotBoardIndex=0` | Taps the history clock by its localized label; the sheet shows the climb on the wall, then drags up to "Lit on this wall". |
+| `crew` | the first climb, then `record` | See below. |
+| `workouts` | the first climb, then `record` | Adds a block and switches it to Pyramid, arms a fixed-window 0:30 rest timer, taps Start (a private session, ended afterwards). |
+| `lock-screen` | the first Tension climb, then `record` | See below. The id stays; the take shows the Dynamic Island. |
+| `log` | `profile` | Scrolls to the activity calendar, filters Progress to Kilter, then Tension. |
+
+### Walls
+
+Kilter, Tension, MoonBoard, Woods, Decoy, Grasshopper and the spray wall are
+seven walls on the App Store account, picked by name (`SHOWCASE_DEFAULT_BOARDS`
+in `record.ts`, slot order in `SHOWCASE_BOARD_SLOTS`; the spray wall is slot 6).
+The account has no Touchstone or So iLL wall,
+so those takes deep-link a board CONFIG (`touchstone/1/1/1/40/list`,
+`soill/1/2/1/40/list`, `SHOWCASE_BOARD_CONFIG_LINKS` in `takes.ts`). The app
+resolves that the way a session join does: it reuses a matching board on the
+account or ADDS one to the account's own boards list. So the first prod run
+adds a Touchstone and a So iLL board to `test@boardsesh.com`; every later run
+reuses them. The take checks the link's `Board Route Handoff` resolved.
+
+The spray wall is filmed twice: held still as `boards-spray`, one of the nine
+board phones, and with two swipes as `spray`, the scene of its own. Its photo is
+fetched, so both takes give the last deep link 8 s to draw before recording
+starts (`primeSettleMs` in `takes.ts`; every other take gets 3 s). The default
+name is `Liz's Wall` (the CPP bootstrap renamed the old Home Spray Wall in place);
+point slot 6 at another wall with `--boards`.
+
+The wall's photo was taken by a friend of the project, who agreed to it
+appearing in the video, the store previews and ads. It is not in the repo: to
+rebuild the wall on another account, ask for the file (or use any wall you have
+permission for) and re-record the two spray takes. Keep the wall private: a
+public wall copies the photo into the world-readable media bucket and lists the
+wall.
+
+The wall check reads the board type from the app's own log line, which ends
+with it: `[screenshot] board[6] "Liz's Wall" -> "<name>" (<layout> L..
+S.. @..°, spray)`. A spray wall's name and layout are whatever its owner typed, so
+the type is never taken from either (`findBoardSlotProblem` in `record.ts`).
+
+On `--backend local` the dev DB has only the first three walls; the other
+board takes and `spray` are skipped with a note.
+
+### Live sessions
+
+`crew`, `workouts` and `lock-screen` start a live session on the account. Each
+first runs `session-private.yaml` ("Show this session live" off; the recorder
+stops unless the app logged it) and afterwards `session-end.yaml`, while the
+creator’s live app context still owns the session. The flow closes any overlay
+then navigates Home → Record; capture mode skips cold-start session restore.
+Teardown retries on failure or Ctrl-C, and recording stops before another cold
+launch if ending the session cannot be confirmed.
+
+### The lock-screen take (the Dynamic Island)
+
+A private session on the Tension wall with two more climbs queued and the fake
+board connected, then Home, onto an empty home screen (dark wallpaper only):
+the Live Activity sits in the island; a long press expands it (climb, grade, "2 of 4", Prev / relight / Mirror / Next), and
+Next changes the climb from outside the app. The simulator is set to dark
+appearance so the wallpaper behind the island is dark.
+
+The empty home screen is made once per run by `home-screen-clean.yaml` (the
+take's `deviceSetupFlows`, after the install). It first sets Settings > Home
+Screen & App Library to "App Library Only", so apps installed later (Maestro
+reinstalls its runner on every run) stay off the home screen; then it takes
+every widget, app,
+folder and dock icon off the home screen of the dedicated "Boardsesh Showcase"
+simulator, Boardsesh and Maestro's own runner included ("Remove from Home
+Screen" only; everything stays installed and in the App Library, and
+`simctl launch` still opens Boardsesh). It is idempotent, so an empty screen
+costs one lookup.
+
+Three things make the Live Activity work on a simulator:
+
+- **The Live Activity starts only with the push entitlement.** It is requested
+  with `pushType: .token`, and ActivityKit refuses that without
+  `aps-environment` (`LA_START_FAILED … ActivityInput error 0`). The screenshot
+  simulator build carries it (`scripts/screenshot-sim.entitlements`), together
+  with the team-prefixed keychain group the native shared keychain uses.
+  That group hardcodes the team ID (`9L3HKPZBH3`): a simulator build has no
+  provisioning profile to expand `$(AppIdentifierPrefix)` in entitlements,
+  while the app's Info.plist (`BoardseshKeychainAccessGroup`) gets it from the
+  project's team. The recorder checks the two agree before any take and, for a
+  run with the island take, stops with the fix if the team ID ever changes;
+  the scripts tests hold the file to `appleTeamId` in `app.config.ts`. A
+  dev-client built before that change needs a rebuild:
+  `vp run mobile:build-sim-app -- --app-out packages/mobile/.app-cache`.
+- **Screenshot builds drive the island's Next locally.** In a party session the
+  intent authorises each tap with the Live Activity's APNs token; prod pushes
+  through production APNs, rejects the simulator's sandbox token and deletes
+  it, and every tap is a 401. `live-activity-bridge.tsx` passes
+  `isPartySession: false` in screenshot mode, so the tap updates the activity
+  and hands the move to JS, which sends the queue mutation over the socket.
+- **The island's buttons can't log anchors** (they are SpringBoard's). The flow
+  raises the `island-expanded` mark and the recorder writes `lock-relight`,
+  `lock-mirror` and `lock-next` from the rects in the take registry, measured
+  on a recorded frame. Re-measure them if the widget layout changes.
+
+### The crew take
+
+Two phones in one live session. Replay fixtures cannot animate a subscription,
+so this needs a live backend.
+
+1. Primary: switches "Show this session live" off (the recorder refuses to go
+   on unless the app logged that), starts the session, opens the invite sheet
+   and taps Copy link (`session-private.yaml`, `crew-start.yaml`).
+2. The recorder reads the link with `xcrun simctl pbpaste`, and sends the second
+   phone to `com.boardsesh.app://join/<id>`, where `crew-join.yaml` taps Join.
+3. The second phone starts `crew-secondary.yaml`, which polls the recorder's
+   signal server. Recording starts on the primary's QR.
+4. `crew.yaml` closes the sheet, opens the queue, raises the `crew-add` signal;
+   the second phone swipes a climb into the queue and its row lands on the
+   primary with the second account's avatar. A long press on it shows
+   "Play next". The row's place depends on the queue's history, so the flow
+   reads it from the row's anchor, which the recorder republishes on the signal
+   server (`/value/anchor-<name>-x|-y|-cy`).
+5. `session-end.yaml` closes any overlay and ends the session with the live
+   primary app, preserving the creator’s queue context. It also runs on a failure
+   or Ctrl-C. A setup failure cleans up before the next take; unconfirmed cleanup
+   prevents further cold launches.
+
+Why a signal server: two Maestro processes each take 4-7 s to attach, so a
+timed wait cannot line them up. The flows `GET` the recorder's local server
+(`/mark/<name>`, `/set/<name>`, `/signal/<name>`) with Maestro's JavaScript
+`http.get`. The same `/mark/flow-start` request, the first step of every take's
+flow, tells the recorder exactly where to cut the head.
+
+### Marks: when things happen
+
+Besides footage and anchors, every take writes
+`.boardsesh/showcase-video/work/marks/<take>.json` (`ShowcaseMarksFile` in
+`contract.ts`): `{ "takeId", "marks": { "<name>": <seconds> } }`, seconds from
+the start of the trimmed footage, sorted by time. Place cuts and callouts on
+these instead of hand-read frame numbers; a re-record moves them with the
+footage.
+
+The flows raise them on the recorder's signal server
+(`- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/<name>')}`) right after
+the step's action, so a mark is the moment the action was sent; allow a few
+frames for the app to draw it.
+
+| Take | Marks |
+| --- | --- |
+| `boards-*` | none (held still) |
+| `spray` | `next-1`, `next-2` (the two swipes) |
+| `wall` | `sheet-open`, `history-shown` |
+| `crew` | `invite-closed`, `queue-open`, `crew-added` (the second phone's swipe), `row-landed` (derived: the new row's anchor first logged), `play-next-menu` |
+| `workouts` | `pyramid-picked`, `rest-armed`, `rest-pill`, `started` |
+| `lock-screen` | `home`, `island-expanded`, `next-tapped` |
+| `log` | `scrolled`, `filter-kilter`, `filter-tension` |
+
+A mark the flow never reached is simply absent. To add one, raise it in the
+flow and list it in the flow header and this table; a mark derived from an
+anchor goes in the take's `anchorMarks`.
+
+### What the anchors files do and do not say
+
+- Every anchor the app logged since the take's relaunch is in the file, pinned
+  to `t = 0` if it came before the footage starts. Hidden tabs mount at boot, so
+  a take's file also holds anchors from screens it never shows
+  (`workout-type` in a board take). Read only the callouts the scene draws.
+- An anchor inside a native sheet (`invite-qr`, `queue-row-avatar`,
+  `now-on-wall`, `wall-history`) is measured in the SHEET's window, so its `y`
+  is from the sheet's top, not the screen's (the queue sheet's top is 322 pt
+  down at its detent).
+- An anchor re-logs on layout, not on scroll. After the log take's scroll,
+  `profile-board-filter` and `activity-calendar` still carry their pre-scroll
+  `y`.
+
+The renderer corrects both per take in `SHOWCASE_TAKE_EDITS`
+(`scripts/lib/showcase-video/render.ts`), next to each scene's footage ranges
+and callout windows. Every time there is an offset from one of the take's
+marks (a scroll correction applies from `scrolled`, the wall sheet's drag from
+`history-shown`), so a re-record needs no edits. A render stops, naming the
+take and the marks, when a mark the edit reads is missing or a segment runs
+off the footage. The one exception is a scene's last segment running up to
+1.5 s past the end of its take: the render holds the last frame and warns
+instead. A segment can also hold its last frame on purpose (`hold`, in
+seconds) where the screen is still, which is how a callout gets its reading
+time when the app moves on sooner. `vp run video:render -- --stills --measure`
+shows every callout box over the recorded frames when you want to look.
+
+### Reading time
+
+Every render prints the reading budget as a table: per scene, the headline
+words, the callout words, how long the text is settled and how long it needs
+(0.3 s a word, headline and callouts together); per callout, how long it sits
+fully settled (box, leader and pill all in, until it or the scene's text starts
+out) against max(1.6 s, 0.45 s a word). Callout entrances are at least 0.5 s
+apart. `showcase-video-render.test` holds all of it on the recorded marks, so a
+change to a scene's length, an edit window or the copy that leaves a callout
+unread fails the tests before it reaches a render.
+
+### The donation line
+
+The outro's small line under the store pill, "Paid for by the climbers who use
+it." (`copy.en-US.json` `outro.donation`), uses the homepage's `proofNoCount`
+wording. It never claims tax relief or perks. Store listings must never mention
+donations, so the store and ad targets (`reel`, `app-store`, `play-promo`) are
+defined without it (`donationLine: false`) and their outros are 129 frames, the
+length the shorter outro's reading budget needs. `homepage` and `social` keep it.
+
+`--no-donation-line` still works as an override: it drops the line from every
+target it renders and leaves out `homepage`, whose files always keep it (with a
+warning; asking for `--target homepage` with it fails instead).
+
+## Targets
+
+### Whole native phone endings
+
+Kilter and Tension `store-search` cuts end with **Next climb. Outside the
+app.** The default cut ends on the logbook instead, so it renders from
+simulator takes alone. Their required `lock-screen` take is the complete physical iPhone
+13 Pro native screen, identified by `presentation: "native-lock-screen"` or
+`"native-notification-center"`, matching its actual `captureSurface`. Preserve
+its actual clock, wallpaper, notch, Live Activity and native controls. Clear
+unrelated notifications on the phone before capture; do not remove them by
+repainting footage. A Notification Center card crop cannot substitute.
+
+The renderer requires reviewed `captureFraming: "full-screen"` fixtures with
+the corresponding `lockScreenContext` or `notificationCenterContext`. The latter
+retains authentication as `not-established`; WDA's locked flag cannot prove it.
+Recording
+`nativeFixtureSourcePngSha256` must match that locale/family fixture's unchanged
+source PNG hash. Video dimensions must be 1170×2532, corresponding to the real
+390×844-point screen. A separate 416×870 frame fits the whole phone inside the
+safe area beside the caption. It adds no camera overlay, gloss or controls from
+a newer iPhone. Other scene geometry and the hero spring entrance/exit/loop
+stay unchanged. No exterior alpha mask or Live Activity card crop is used.
+
+Supply `activity-ready`, `next-tapped`, `next-changed` and `next-settled` in the
+30 fps timeline resampled from actual received native-frame timestamps.
+`editorialStartSeconds` is an optional edit boundary, not a native event. The
+six-second beat must include at least 0.4 seconds before actual Next and one
+second of sharply readable new state before the final 0.5-second loop transition;
+missing or out-of-range events stop rendering.
+Independently review the changed name, thumbnail and queue position to confirm
+that the native redraw has settled, rather than treating tap timing as proof.
+Record source timestamps and use one contiguous reviewed MJPEG range. Nearest
+timestamp resampling retains original JPEG bytes and genuine transition blur;
+do not remove interior frames or compress elapsed time. The physical TestFlight build has
+independent provenance from simulator app footage; never label it as current
+`main` when its source commit is unknown.
+
+See [Native Live Activity capture fixtures](live-activity-creative-captures.md)
+for the committed card pixels, CI screenshot reuse, and local regeneration.
+These requirements apply to the Kilter search ending; other targets retain
+their existing source contracts.
+
+`vp run video:render -- --target <name>` renders one target from the same
+recorded takes; `--target all` renders every one, and `--target` repeats or
+takes a comma list. With no `--target` it renders `homepage` and `social`,
+which is what `vp run video` ships. The registry is
+`scripts/lib/showcase-video/targets.ts`: per target the layout, size, scenes and
+their order, length cap, donation line, audio, outputs, and whether it may write
+into `packages/web/public` (only `homepage` may). `showcase-video-targets.test`
+holds all of that, and pins `homepage` field for field so a refactor can't
+change the hero.
+
+| Target | Layout | Size | Scenes | Length | Donation line | Audio | Writes |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `homepage` | motion | 1080x1920 → 720x1280 lite | all eight | 54.8 s | yes | none | `packages/web/public/videos/home/showcase-9x16-lite.{webm,mp4}`, `public/images/home/showcase-hero-9x16.webp` |
+| `social` | motion | 1920x1080 and 1080x1920 | all eight | 54.8 s | yes | none | `out/social/brag.mp4`, `brag-9x16.mp4`, `brag*.jpg`, `share-copy.txt` |
+| `reel` | motion, safe-area stage | 1080x1920 | boards, spray, crew, island, outro | 29.9 s | no | silent stereo AAC | `out/reel/reel-9x16.mp4`, `.jpg` |
+| `app-store` | full-bleed | 886x1920 | five clips: spray, wall, crew, island, log | 28 s | no | silent stereo AAC, 256 kbit/s | `out/app-store/iphone-6.9.mp4`, `iphone-6.5.mp4` (same file), `iphone-poster.jpg` |
+| `play-promo` | motion | 1920x1080 | boards, spray, crew, island, log, outro | 38.1 s | no | silent stereo AAC | `out/play/play-16x9.mp4`, `.jpg` |
+
+`out/` is `.boardsesh/showcase-video/out/` (gitignored). Only the `homepage`
+files are committed. `homepage` and `social` 9:16 render the same frames, so
+the browser runs once for both. `--format 16x9|9x16` keeps only the renditions
+of one format (a named target with no rendition in it fails; a default or
+`all` target is left out with a warning); `--stills`, `--measure` and `--frame` work per target and write
+under `out/stills/<target>/`.
+
+**Motion vs full-bleed.** `motion` is the stage in `index.html`: the phone
+mockup, callouts and motion-graphic scenes. `full-bleed` is `full-bleed.html`:
+the recorded footage fills the frame (800x1738 footage scaled to cover
+886x1920, about 1.1x, 2 px cropped top and bottom) with a one-line caption bar
+(Inter Tight 800, five words at most, `copy.en-US.json` `appStore.captions`) and
+nothing else. Each clip is cut on the take's marks like `SHOWCASE_TAKE_EDITS`.
+The bar sits over the status bar, except on the island clip, where it sits over
+the empty wallpaper below the Dynamic Island. Clips cut hard; a caption fades
+out before its cut, so no transition suggests something the app doesn't do.
+The island clip is the recorded Live Activity as it is.
+
+**The reel's safe area.** Meta's Reels and Stories ads margins at 1080x1920:
+14% top (270 px), 35% bottom (672 px, the caption, CTA and like rail), 6% each
+side (65 px), from Meta's [Reels ad specs](https://www.facebook.com/business/ads-guide/update/image/instagram-reels)
+and [text overlay safe zone](https://www.facebook.com/business/help/980593475366490),
+checked 2026-10-01. These are stricter than the organic Reels overlays (~250 px
+top, ~420 px bottom), so one file serves both. The `safe` stage variant puts
+headlines at 300 px, shrinks the callout phone to 0.76 and lifts it so the
+whole phone sits in the text band (520–1204 px), pulls the pills 72 px in from
+the edges and clamps them inside the band, and fades the board labels before
+the pile sinks. The renderer reads every text element's box from the page
+(`textBoxes()`) on every third frame and on every still, and fails the render
+if any word crosses a margin; `--measure` draws the band as a dashed box.
+
+**Apple's App Preview spec**, from
+[App preview specifications](https://developer.apple.com/help/app-store-connect/reference/app-preview-specifications)
+and [App previews](https://developer.apple.com/app-store/app-previews/), read
+2026-10-01. `APPLE_APP_PREVIEW_SPEC` in `targets.ts` holds the numbers, and the
+renderer probes the encode and fails when it misses any of them:
+
+| Spec | Apple | What we render |
+| --- | --- | --- |
+| iPhone 6.9" and 6.5" portrait (also 6.7", 6.3", 6.1") | 886 x 1920 | 886 x 1920, one file copied to both slots |
+| Length | 15–30 s | 28 s |
+| Frame rate | 30 fps max | 30 fps, progressive |
+| Video | H.264 up to High Profile Level 4.0, 10–12 Mbit/s target (or ProRes 422 HQ) | H.264 High 4.0, CBR 11 Mbit/s, `.mp4` |
+| Audio | stereo; H.264 files 256 kbit/s AAC, 44.1 or 48 kHz; all tracks enabled | silent stereo AAC 256 kbit/s, 48 kHz |
+| File size | 500 MB max | about 40 MB |
+| Content | only content from within the app; no people or hands on a device; overlays and captions allowed, legible and on screen long enough to read; no prices or dated references | the recorded app footage only, no device frame; captions of five words or fewer, at least 1 s longer than 0.3 s a word |
+| Poster frame | 5 s by default | `iphone-poster.jpg` is frame 150 (5 s) |
+
+The 5.5" slot (1080 x 1920) and iPads (1200 x 1600) are not rendered: an iPhone
+preview at 886 x 1920 covers every current iPhone slot.
+
+## Android recording
+
+```sh
+SCREENSHOT_USER_PASSWORD=... vp run video:record -- --platform android
+```
+
+The same takes, filmed on an Android emulator, into
+`.boardsesh/showcase-video/work/android/{footage,anchors,marks}/`
+(`showcaseWorkDirs('android')` in `contract.ts`). iOS stays the default and
+keeps `work/{footage,anchors,marks}/`. No manual steps:
+
+1. **SDK.** `vp run mobile:android-doctor` once (SDK and JDK 21 under
+   `~/.cache/boardsesh/`). The recorder installs the system image it needs
+   (`android-36;google_apis`, arm64 on Apple silicon, about 1.5 GB) on first
+   use.
+2. **Emulator.** A dedicated AVD, `Boardsesh_Showcase`, created from the
+   `pixel_7` profile with its screen set to a Pixel 9-class 1080 x 2424 at 420
+   dpi, so 411 x 923 dp (`SHOWCASE_ANDROID_DEVICE` in
+   `scripts/lib/showcase-video/android.ts`). `config.ini` is rewritten on every
+   boot, so a hand edit cannot drift it. It boots headless on port 5580
+   (`emulator-5580`), in UTC, cold, with dark system UI. An emulator already
+   running on that port is reused and left running.
+3. **App.** The dev-client APK (`com.boardsesh.app.dev`) from the latest
+   `rn-android-dev-*` release (`scripts/mobile-android-apk.ts`), or
+   `--app-path <apk>`. It is reinstalled every run with notifications allowed.
+   Metro runs on 8081 with the same screenshot and fake-Bluetooth env as iOS;
+   `adb reverse` maps the emulator's `localhost:8081` to it.
+4. **Status bar.** SystemUI demo mode (09:41, full wifi and battery, no mobile
+   signal, no notification icons), and the system's own notifications
+   ("Serial console enabled") snoozed. Both are re-sent before every take:
+   SystemUI drops them while it is still settling after boot, and nothing
+   reports whether they took.
+5. **Recording.** `adb shell screenrecord` at 12 Mbit/s. It stops itself at
+   180 s, so a longer take records in parts that are pulled and joined without
+   re-encoding. Stop is SIGINT to `screenrecord` on the device, which finalises
+   the mp4. From there the pipeline is the iOS one: the same ffmpeg pass to
+   constant 30 fps JPEGs at 800 px wide (800 x 1796), anchors from Metro's log
+   (dp), marks from the signal server.
+
+`--hold` stops after the device is ready (app at home, Metro up) and waits for
+Ctrl-C, for calibrating a flow by hand against the same emulator.
+
+**Flows.** A flow in `packages/mobile/.maestro/showcase/android/` replaces
+the shared flow of the same name on Android (`showcaseFlowPathFor`), so the
+two platforms never share a coordinate. Every flow the Android primary runs has
+an Android file (a test checks this): Material UI puts things elsewhere, and
+Maestro needs the dev-client's package as `appId`. Take-level differences
+(setup flows, static anchors) live in each take's `platforms.android` entry in
+`takes.ts` (`takeForPlatform`).
+
+What changes per take:
+
+| Take | On Android |
+| --- | --- |
+| `boards-*`, `spray`, `log`, `workouts` | Same story, own coordinates. The shorter screen keeps the workout preview below the fold. |
+| `wall` | The Climbs app bar shows the board name as a static title and no angle (it is the first filter chip); "+" is a new climb. The history clock beside the ⋯ menu (the `board-history-button` anchor) opens the sheet at half height. |
+| `crew` | The queue sheet is dragged to full height (history rows can push the new row below the fold at half height), and there is no "Play next" beat (see the app bugs below). The second phone is the iOS simulator, see below. |
+| `lock-screen` | The ongoing "session" notification in the shade instead of the Dynamic Island: Home, a swipe down from the status bar (the notification is expanded as the first one), Next by its label. No relaunch between setup and arm (a relaunch leaves the first climb without its thumbnail) and no home-screen cleanup (the shade covers it). |
+
+**The crew take's second phone is the iOS simulator.** Nothing of the second
+phone is filmed, so its platform does not show, and it reuses the iOS
+`crew-join.yaml` / `crew-secondary.yaml` that already work against prod. A
+second emulator would need its own 4 GB of RAM, a second cold boot (a minute or
+two), and its own calibrated flows. The Android primary cannot hand the invite
+link over by clipboard (`simctl pbpaste` has no emulator twin), so
+Android crew capture currently fails before starting a session: screenshot mode
+skips cold-start session restoration, so the previous relaunch-and-read-id
+strategy cannot recover its invite. An emulator clipboard reader is needed
+before this take can record; other Android takes keep their existing flows.
+
+**Two app bugs the recording found (not recorder ones).**
+
+1. [#5922](https://github.com/boardsesh/boardsesh/issues/5922): the notification's Next moves the queue on the phone only in a session: on
+   Android nothing sends the server mutation that the iOS widget intent sends
+   (`dispatchWidgetNavigation` in
+   `packages/mobile/src/providers/queue-provider.tsx` assumes native did), so
+   a few seconds later the queue's hash check pulls the server state back and
+   the climb reverts. The take ends before that happens.
+2. [#5923](https://github.com/boardsesh/boardsesh/issues/5923): a long press on a row in the Android queue sheet lands as a tap: the row
+   plays instead of opening the reaction menu. It happens with Maestro's long
+   press and with adb's raw `DOWN` / `UP` 1.2 s apart, so the crew take skips
+   "Play next" on Android. Worth checking on a real phone.
+
+## Android cuts (renderer)
+
+`vp run video:render -- --platform android` cuts the Android recording
+(`vp run video:record -- --platform android`, same take ids) instead of the
+iOS one. The platform decides four things and nothing else:
+
+1. **Footage.** `work/android/{footage,anchors,marks}/` (`showcaseWorkDirs` in
+   `contract.ts`), never `work/footage/`. `--placeholder-footage` builds iOS
+   stand-ins, so the render refuses it with `--platform android`.
+2. **The phone.** A Pixel-style body (`pixelPhone` in `render.ts`) instead of
+   the iPhone 16 Pro Max: the same 900 px height, so every pose, shadow and
+   board label lands where it does on iOS; a 390 x 876 screen, the width taken
+   from the recorded frames' aspect (800 x 1796, the 1080 x 2424 emulator
+   screen); a 3 px matte aluminium band, a 9 px bezel, 48 px outer corners
+   (36 px on the screen against the iPhone's 57); a 12 px punch-hole camera
+   centred 14 px from the top; power button and volume rocker on the right edge
+   only. The stage draws both phones from one set of CSS variables
+   (`data.phone`, `#stage[data-platform]`), so the iOS frames are unchanged.
+3. **Copy.** The `android` block in `copy.en-US.json` overrides single scenes
+   (`copyForPlatform`). Today that is the island scene, which on Android is the
+   "Active climbing session" notification: headline "Control the wall from
+   *notifications.*", and the bulb callout reads "Relight wall", the
+   notification's own label. "Next" and "Mirror climb" are shared.
+4. **Targets.** Android has its own registry (`SHOWCASE_ANDROID_TARGETS` in
+   `targets.ts`), each an iOS target with the same scenes, stage, length,
+   donation line and audio:
+
+| Target | Follows | Size | Length | Writes |
+| --- | --- | --- | --- | --- |
+| `homepage-android` | `homepage` | 1080x1920 → 720x1280 lite | 54.8 s | `packages/web/public/videos/home/showcase-9x16-lite-android.{webm,mp4}`, `public/images/home/showcase-hero-9x16-android.webp` |
+| `social-android` | `social` | 1920x1080 and 1080x1920 | 54.8 s | `out/android/social/brag.mp4`, `brag-9x16.mp4`, `brag*.jpg`, `share-copy.txt` |
+| `reel-android` | `reel` | 1080x1920, safe-area stage | 29.9 s | `out/android/reel/reel-9x16.mp4`, `.jpg` |
+| `play-promo-android` | `play-promo` | 1920x1080 | 38.1 s | `out/android/play/play-16x9.mp4`, `.jpg` |
+
+`app-store` has no Android variant: an App Preview is iOS footage.
+`homepage-android` is the only Android target that writes into
+`packages/web/public`, and the homepage does not load its files yet.
+
+**Which targets run.** `--platform` picks the registry and `--target` names
+targets in it. `all` is every target of that platform, and no `--target` is
+that platform's pair: `homepage` + `social` on iOS (what `vp run video` ships,
+unchanged), `homepage-android` + `social-android` on Android. A name from the
+other registry stops the render and says which `--platform` it needs, so one
+run never mixes the two recordings.
+
+```sh
+vp run video:render -- --platform android                                  # homepage-android + social-android
+vp run video:render -- --platform android --target reel-android,play-promo-android
+vp run video:render -- --platform android --target all --stills --measure  # check every callout box
+```
+
+**The edit.** The Android takes raise the iOS marks (`home` is the Home
+press, `island-expanded` the shade pulled down with the notification expanded,
+`next-tapped` the Next tap), and the recorder writes `lock-next`,
+`lock-relight` and `lock-mirror` for the notification's buttons (Next and
+Relight wall move right when Next adds "Previous", so their rects change at
+`next-tapped`). `SHOWCASE_ANDROID_TAKE_EDITS` in `render.ts` starts from the
+iOS edit and replaces what the Android recording measured differently:
+
+| Take | Android |
+| --- | --- |
+| `wall` | The sheet opens 1.8 s before `sheet-open` (2.75 s on iOS), so the list is too short for its callout alone: "Board history" stays up over the half-open sheet. Sheet top 510 dp at half height, 101 dp dragged up. |
+| `crew` | The QR still holds 1.1 s. No `play-next` callout. Invite sheet top 510 dp; the queue sheet, dragged to full height, 100 dp. |
+| `workouts` | The rest countdown starts 2.36 s after `rest-armed` (1.43 s on iOS); `restPill` follows it. The gap moved by a second between two recordings, so re-read it after a re-record. |
+| `log` | The scroll moves the Filters row 353 dp, and the Kilter view lifts the calendar 27 dp more. |
+
+`spray`, `lock-screen` and the boards cut on the iOS entries. Every number
+was checked with `--platform android --target all --stills --measure`, and
+`showcase-video-android-render.test` holds the reading budget on the Android
+marks, as the iOS test does. The Android recording on disk predates the spray
+takes: record `spray` and `boards-spray` on the emulator (and re-check the
+`spray` cut against its marks) before an Android render.
+
+**Trying a layout before the recording lands.** `--work-dir <dir>` reads
+`<dir>/{footage,anchors,marks}` instead. A copy of the iOS takes with the first
+one in `SHOWCASE_TAKE_IDS` (`boards-kilter`, whose first frame sizes the phone's
+screen) scaled to 800 x 1796 is enough to check the Pixel mockup and the copy.
+
+## Uploading
+
+Nothing uploads automatically. After `vp run video:render -- --target all`:
+
+1. **App Store Connect** (app-store). App Store Connect → the app → the version
+   → App Store tab → Previews and Screenshots → iPhone 6.9" Display → drag in
+   `out/app-store/iphone-6.9.mp4`, pick the poster frame, save. Do the same
+   with `iphone-6.5.mp4` if the 6.5" slot is shown separately. Apple processes
+   the preview for up to a day, and it goes live with the next version you
+   submit.
+2. **Google Play** (play-promo). Upload `out/play/play-16x9.mp4` to the
+   Boardsesh YouTube channel as public or unlisted, with ads and end screens
+   off. Then Play Console → Grow users → Store presence → Main store listing →
+   Graphics → Video → paste the YouTube URL, save. The listing shows it once
+   the change is reviewed.
+3. **Meta Ads** (reel). Ads Manager → the campaign's ad → Media → upload
+   `out/reel/reel-9x16.mp4` as a 9:16 Reels / Stories placement. Leave Meta's
+   text overlays and music off; the file already keeps its words inside the
+   safe area. For an organic Reel, post the same file from the Instagram app.
+4. **Social** (social). `out/social/brag.mp4` (16:9) and `brag-9x16.mp4`, with
+   `share-copy.txt`, for posts. They carry the donation line; never use them in
+   a store listing.
+
+## Adding or changing a take
+
+1. Add the id to `SHOWCASE_TAKE_IDS` in `contract.ts` and give a scene in
+   `timeline.ts` the take; its length there sets the take's minimum duration.
+2. Add an entry to `SHOWCASE_TAKES` in `takes.ts`: deep links, flow, board slot
+   (checked against the app's `[screenshot] board[N]` log), setup/teardown flows.
+3. Write the flow in `packages/mobile/.maestro/showcase/`. The first step must be
+   `- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/flow-start')}`.
+   Coordinates are whole-number percentages (Maestro will not parse `34.5%`);
+   pauses are `extendedWaitUntil` on text that is never on screen, since Maestro
+   has no `sleep` and each step costs about 1.5 s of hierarchy dumping anyway.
+4. `vp run video:record -- --only <take> --keep-raw`, then look at a few frames.
+   `vp test run --project scripts --reporter=agent` checks the registry, flows
+   and pure logic.
+
+To pin a take's opening screen, drop its first frame at
+`marketing/showcase-video/reference/<platform>/<kind>/<locale>/<take>.jpg` (`ios` or `android`:
+the two never open on the same pixels); the recorder then fails a take whose
+first frame differs in more than 35% of thumbnail pixels.
+
+## When the self-check fails
+
+Each failure names the take. The fixes:
+
+| Message | Cause | Fix |
+| --- | --- | --- |
+| `footage is Xs, the scene needs Ys` | The flow ended too soon after the trim. | Lengthen the flow's last pause. |
+| `the first frame is blank` | The app had not drawn when the footage starts. | Raise the flow's opening pause; check the raw with `--keep-raw`. |
+| `differs from marketing/showcase-video/reference/<platform>/<take>.jpg` | The take opened on another screen: a moved button, a dialog, a changed deep link. | Fix the flow or deep links; replace the reference if the screen changed on purpose. |
+| `wrong wall: slot N matched no wall (board roster: ...)` | The account has no wall by that name (renamed, unfollowed). | `--boards` with names from the roster, or update `SHOWCASE_DEFAULT_BOARDS` in `record.ts`. |
+| `wrong wall: slot N landed on a non-<kind> wall` | The name matched a wall of another board type (read from the `(<boardType>: …)` the app logs, never from the wall's name). | Put a wall of that type in that slot. |
+| `never logged anchor(s) ...` | The flow never reached the screen, or the bundle lacks the anchor hooks. | Check the flow's coordinates against a screenshot; `--skip-anchor-check` only while the hooks are missing. |
+| `its flow ... failed (Maestro exit N)` | A Maestro step failed. | Read `work/logs/maestro/<run>/console.log`. |
+| `"Show this session live" was not switched off` | The switch tap missed, or a session was already running. | End any running session on the account; check the point in `session-private.yaml`. |
+| `could not confirm the live session ended` | The end tap missed or the backend refused. Teardown retries once on exit. | `vp run video:record -- --end-session <id>` with the id from `hidden session <id> started`. "Session not found" there means the backend already closed it. |
+| `never reached home` | Sign-in failed or the bundle did not load. | Read `work/logs/metro-<phone>.log`: a wrong password shows as `auto sign-in FAILED`. |
+| `No free primary Metro port` | All recorder ports are occupied. | Free one of 8081 or 8090–8099; existing servers are never stopped. |
+
+## Where things live
+
+| Path | What |
+| --- | --- |
+| `scripts/showcase-video-record.ts` | The orchestrator (processes, simulators, files). |
+| `scripts/lib/showcase-video/record.ts` | Pure logic: args, ffmpeg args, anchor stamping, self-check. |
+| `scripts/lib/showcase-video/takes.ts` | The take registry. |
+| `scripts/lib/showcase-video/android.ts` | The emulator spec and the adb / emulator / screenrecord argument vectors. |
+| `packages/mobile/.maestro/showcase/` | One flow per take, plus the crew setup/teardown flows. |
+| `packages/mobile/.maestro/showcase/android/` | The Android flows (same names; they replace the shared ones on Android). |
+| `.boardsesh/showcase-video/work/boards/<kind>/<locale>/` | Fresh native footage, anchors, marks, and raw recordings (gitignored). Android adds `/android/`. Shared logs remain under `work/logs/`. |
+
+## Web delivery
+
+How the rendered files reach the homepage (`packages/web/app/components/home/home-showcase-video.tsx`).
+
+**English only.** The headlines are burned into the pixels, so es, fr and de keep the three-phone stack and the iOS/Android toggle in the hero. On the English page the toggle moves into the feature strip. The scene headlines also render as a visually hidden `<figcaption>` for screen readers and crawlers.
+
+**The poster is the page's main paint.** The card is a plain `<img>` with `width`/`height` (720 x 1280), `fetchPriority="high"` and no `decoding="async"`, and the component calls `preload(poster, { as: 'image', fetchPriority: 'high' })` so the hint is in the server HTML. The `<video>` has no `poster` attribute: it sits on top of the image in the same box at opacity 0, and turns visible on its `playing` event. The video can never be bigger than the poster.
+
+**The video loads late.** Nothing is requested until the window `load` event has fired and `requestIdleCallback` has run (3 s timeout, 200 ms timer where the API is missing). Then the component sets `src` (webm if `canPlayType('video/webm')`, else mp4) and `preload='auto'`, and the hook plays it. The IntersectionObserver (`rootMargin: 0px`, `threshold: 0.1`) only pauses it offscreen and resumes it. In autoplay mode the hook's effect is the single caller of `play()`/`pause()`; the pause button just flips `userPaused`, so a reader's pause survives scrolling.
+
+**Data saver, reduced motion and refused autoplay.** If `navigator.connection.saveData` is set or the reader prefers reduced motion, the poster stays and a centred play button appears. Nothing is fetched until they press it, and the press calls `play()` itself so iOS accepts it inside the click. A browser that refuses autoplay gets the same treatment: the poster and the centred play button, with no native controls. The small corner toggle pauses and resumes once the video is playing.
+
+**Files.** One cut serves every viewport: `showcase-9x16-lite.webm` and `.mp4` (720 x 1280, `SHOWCASE_WEB_LITE` in `scripts/lib/showcase-video/render.ts`, the `homepage` target), plus `showcase-hero-9x16.webp`. Caps: webm 1,750,000 bytes, mp4 1,900,000 bytes; the renderer fails the encode over its cap. The cut opens on the poster frame (`SHOWCASE_WEB_POSTER_FRAME`, frame 0: the boards trio settled under "Every board. One app."), so the first video frame equals the poster and nothing jumps when playback starts. `--poster-frame <n>` picks another frame and rotates the web encodes to start there; the loop closer lands the last frame on frame 0, so a rotated loop has no seam either.
+
+**Analytics.** `Showcase Video Progress` fires once per quartile per page view with `{ quartile: 25 | 50 | 75 | 100, placement: 'hero', cut: '9x16-lite', autoplayed }`. `autoplayed` is false when the reader pressed play. Quartile 100 fires at 97% of the duration, because a looping video may never report its exact end.
+
+**SEO.** `page.tsx` renders `VideoObject` JSON-LD next to the site JSON-LD, English only. Its `duration` (`PT54.8S`) must equal `SHOWCASE_TOTAL_FRAMES / SHOWCASE_FPS`. It is a literal in `packages/web/app/lib/showcase-video.ts` because the timeline module pulls in Node imports a client bundle can't take; `scripts/__tests__/showcase-video-web-duration.test.ts` fails when they drift. After changing the timeline, update the literal and bump `/` in the sitemap static entries.
+
+### Native endings in Apple search cuts
+
+Kilter keeps its five three-second beats ending on the reviewed native Live
+Activity. The default cut has four five-second beats: boards, spray wall, crew,
+and that genuine Kilter Lock Screen. Only the default `lock-screen` take may retain
+`kind: kilter`, `boardKind: kilter` and `presentation: native-lock-screen`; the
+locale and validation must still match. Supply that unchanged reviewed take in
+the default review bundle (a symlink is sufficient). All other default takes
+must retain `kind: default`. Crew footage must report the actual family: Kilter
+for default/Kilter cuts, Tension for Tension. Global All boards calendar footage
+keeps its global scope. No Kilter recording is relabeled as another family.
+
+Spray uses five three-second beats. The opening and photo beats hold an actual
+settled Black Pearl frame before the first Next. Its finale reserves the actual
+second Next, Teal Heel → Sunny Side, starting two seconds before `next-2` and
+continuing through the native result. Both ordered marks and at least 0.8 seconds
+of genuine settled footage after the second mark are required. The stage stores
+source ranges by caption, so repeating a take cannot overwrite its earlier edit.
+
+MoonBoard uses 90 frames of its native board, 90 of genuine MoonBoard-filtered
+logged history, 120 of loaded grade controls, then 150 of its actual hold map.
+The history beat says “Bring your logbook.” and requires the actual native
+`filter-moonboard` mark, matching MoonBoard recording identity and exact locale.
+A generic All boards calendar or CSV import entry cannot substitute for it.
+A missing or unvalidated log/filter take stops the render; these beats cannot
+silently disappear. The ending has no crew dependency or hardware-control claim.
+CSV import remains available as a separate explicit recorder/help feature; its
+entry card has no place in the final MoonBoard search cut.
+Tension uses 105 frames of its native board, 150 of its actual logbook, 105 of
+a freshly validated crew and 90 of its matched, complete native Lock Screen.
+Its final caption is “Next climb. / Outside the app.” and requires genuine
+Tension Next proof and that exact locale's reviewed full-screen fixture. A
+Kilter recording or old card crop cannot substitute. Controller advertising
+identity remains separate from the actual widget board family; development
+controller navigation does not establish physical wall illumination. All
+header/showcase cuts remain unchanged.
+
+The MoonBoard filter take checks the actual localized title, name, difficulty,
+grade-range label and a genuine grade-rail accessibility control. It retains an
+already complete presentation. An incomplete sheet gets one real Close → settled
+Climbs list → Filters reopen; the complete controls must then become visible
+before `grade-filter-shown`. If reopening stays blank, the flow fails and the
+take remains unvalidated. The recorder reads labels from all four real catalogs;
+it supplies no grade endpoints, synthetic result count or app-code overlay.
+
+The iPhone 16 Pro Max crew flow keeps accessibility labels first. If its native
+player omits Queue controls, verified Kilter/default slot 0 uses the measured
+10%,84% Queue button; verified Tension layout 10 in slot 1 uses its lower-right
+91%,90% Queue button. Tension’s primary first slot is Mirror and is never used
+as Queue. Layout 11 cannot mirror and is rejected. Android, other families,
+missing layouts/resolutions and mismatched boards
+receive no coordinate fallback. Native QueueSheet captures independently show
+the attributed first-upcoming row at 50%,78% for Kilter/default and Tension
+layout 10. The row fallback inherits the same verified platform, slot, family
+and Tension layout gate; it stays away from the trailing drag handle. Real
+peer-avatar and Play next anchors remain required before validation.

@@ -9,7 +9,19 @@ import { DEFAULT_LOCALE, DEFAULT_NAMESPACE, SUPPORTED_LOCALES, type Locale, type
 import { getLocale } from './get-locale';
 import { reportMissingI18nKey } from './missing-key-reporter';
 
-const resourceLoader = resourcesToBackend((locale: string, namespace: string) => loadCatalog(locale, namespace));
+const resourceLoader = resourcesToBackend(async (locale: string, namespace: string) => {
+  if (process.env.NODE_ENV === 'development') {
+    // Read disk on each request so an editor save is visible immediately, even
+    // before the JSON module watcher has rebuilt its cached import.
+    const { readDevCatalog } = await import('./dev-catalog-store');
+    return readDevCatalog(locale, namespace);
+  }
+  return loadCatalog(locale, namespace);
+});
+
+// These branches serve the native app, not Next's surviving display surfaces.
+// Keep this allowlist explicit: boards.mobile and session.mobile have web users.
+const NAMESPACES_WITH_NATIVE_ONLY_MOBILE_COPY = new Set<SeedNamespace>(['common', 'climbs', 'feed']);
 
 // Per-request memoization. React.cache dedupes calls with the same arguments
 // inside a single render, so generateMetadata + the page body share an
@@ -45,7 +57,14 @@ function namespacesToKey(namespaces: readonly string[]): string {
 export async function getServerTranslation(
   ns: SeedNamespace | readonly SeedNamespace[] = DEFAULT_NAMESPACE,
 ): Promise<{ t: TFunction; i18n: i18n; locale: Locale }> {
-  const locale = await getLocale();
+  return getServerTranslationForLocale(await getLocale(), ns);
+}
+
+/** API responses can resolve an explicit supported cookie locale without changing ambient headers. */
+export async function getServerTranslationForLocale(
+  locale: Locale,
+  ns: SeedNamespace | readonly SeedNamespace[] = DEFAULT_NAMESPACE,
+): Promise<{ t: TFunction; i18n: i18n; locale: Locale }> {
   const namespaces = Array.isArray(ns) ? ns : [ns];
   const instance = await initI18nForRequest(locale, namespacesToKey(namespaces));
   const primaryNs = namespaces[0];
@@ -59,7 +78,12 @@ export async function loadServerResources(
   const instance = await initI18nForRequest(locale, namespacesToKey(namespaces));
   const resources: Record<string, Record<string, unknown>> = {};
   for (const ns of namespaces) {
-    resources[ns] = (instance.getResourceBundle(locale, ns) ?? {}) as Record<string, unknown>;
+    const catalog = (instance.getResourceBundle(locale, ns) ?? {}) as Record<string, unknown>;
+    // Project the transport object; the cached server instance and shared
+    // catalogs retain their complete resources for server translation/native.
+    resources[ns] = NAMESPACES_WITH_NATIVE_ONLY_MOBILE_COPY.has(ns)
+      ? Object.fromEntries(Object.entries(catalog).filter(([key]) => key !== 'mobile'))
+      : catalog;
   }
   return resources;
 }

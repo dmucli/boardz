@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
 import { generateSessionHealthExport, generateSessionSummary } from '../graphql/resolvers/sessions/session-summary';
 
+// Summary formatting/aggregation is isolated from the separately tested SQL
+// access predicates; the mock rows below represent their authorized results.
+vi.mock('../services/privacy', () => ({
+  canAccessResource: vi.fn().mockResolvedValue(true),
+  climbDraftVisibilityCondition: () => ({}),
+}));
+vi.mock('../graphql/resolvers/shared/activity-privacy', () => ({ sessionTickVisibleCondition: () => ({}) }));
+
 // Shared mock state, declared with vi.hoisted to ensure availability before mock setup
 const mockState = vi.hoisted(() => ({
   selectCallIndex: 0,
@@ -39,7 +47,15 @@ vi.mock('../db/client', () => ({
           };
         }
         if (prop === 'execute') {
-          return (..._args: unknown[]) => Promise.resolve(mockState.participantRows);
+          return (..._args: unknown[]) =>
+            Promise.resolve(
+              mockState.participantRows.map((participant) => ({
+                rawSends: participant.sends,
+                rawFlashes: participant.flashes,
+                rawAttempts: participant.attempts,
+                ...participant,
+              })),
+            );
         }
       },
     },
@@ -69,17 +85,23 @@ vi.mock('@boardsesh/db/queries', () => ({
   // The spray wall visibility predicate. These tests mock the query builder, so the
   // fragment is never rendered — the module just has to export it.
   sprayClimbVisibilityCondition: () => ({ __sprayVisibility: true }),
+  ownedOrPublicClimbCondition: () => ({ __ownedOrPublicReference: true }),
+  // …and its fail-closed half for a spray tick whose climb row is gone (#6031).
+  sprayReferenceClimbExistsCondition: () => ({ __sprayClimbExists: true }),
+  sprayReferenceVisibilityCondition: () => ({ __sprayReferenceVisibility: true }),
 }));
 
 // Mock drizzle-orm functions to prevent errors from passing mock schema objects
-vi.mock('drizzle-orm', () => ({
+vi.mock('drizzle-orm', async (importOriginal) => ({
   eq: (..._args: unknown[]) => ({}),
   and: (..._args: unknown[]) => ({}),
+  or: (..._args: unknown[]) => ({}),
   inArray: (..._args: unknown[]) => ({}),
-  sql: (_strings: TemplateStringsArray, ..._values: unknown[]) => ({}),
+  sql: (await importOriginal<typeof import('drizzle-orm')>()).sql,
   count: (..._args: unknown[]) => ({}),
   desc: (..._args: unknown[]) => ({}),
   isNotNull: (..._args: unknown[]) => ({}),
+  isNull: (..._args: unknown[]) => ({}),
 }));
 
 describe('generateSessionSummary', () => {
@@ -121,7 +143,14 @@ describe('generateSessionSummary', () => {
       },
     ];
     mockState.participantRows = [
-      { userId: 'user-1', displayName: 'Alice', avatarUrl: null, sends: 4, flashes: 1, attempts: 8 },
+      {
+        userId: 'user-1',
+        displayName: 'Alice',
+        avatarUrl: null,
+        sends: 4,
+        flashes: 1,
+        attempts: 8,
+      },
       {
         userId: 'user-2',
         displayName: 'Bob',
@@ -283,6 +312,25 @@ describe('generateSessionSummary', () => {
     expect(result!.participants).toEqual([]);
   });
 
+  it('retains private ticks in totals without exposing a participant row', async () => {
+    mockState.sessionRows = [{ id: 'session-1', startedAt: null, endedAt: null, goal: null }];
+    mockState.participantRows = [
+      {
+        userId: 'private-user',
+        displayName: 'Hidden climber',
+        avatarUrl: null,
+        sends: 0,
+        flashes: 0,
+        attempts: 0,
+        rawSends: 3,
+        rawFlashes: 1,
+        rawAttempts: 5,
+      },
+    ];
+    const result = await generateSessionSummary('session-1');
+    expect(result).toMatchObject({ totalSends: 3, totalFlashes: 1, totalAttempts: 5, participants: [] });
+  });
+
   it('returns null goal when session has no goal', async () => {
     mockState.sessionRows = [{ id: 'session-1', startedAt: null, endedAt: null, goal: null }];
     mockState.gradeDistRows = [];
@@ -377,9 +425,30 @@ describe('generateSessionSummary', () => {
     mockState.gradeDistRows = [];
     mockState.hardestRows = [];
     mockState.participantRows = [
-      { userId: 'user-1', displayName: 'A', avatarUrl: null, sends: 10, flashes: 3, attempts: 15 },
-      { userId: 'user-2', displayName: 'B', avatarUrl: null, sends: 5, flashes: 1, attempts: 20 },
-      { userId: 'user-3', displayName: 'C', avatarUrl: null, sends: 0, flashes: 0, attempts: 3 },
+      {
+        userId: 'user-1',
+        displayName: 'A',
+        avatarUrl: null,
+        sends: 10,
+        flashes: 3,
+        attempts: 15,
+      },
+      {
+        userId: 'user-2',
+        displayName: 'B',
+        avatarUrl: null,
+        sends: 5,
+        flashes: 1,
+        attempts: 20,
+      },
+      {
+        userId: 'user-3',
+        displayName: 'C',
+        avatarUrl: null,
+        sends: 0,
+        flashes: 0,
+        attempts: 3,
+      },
     ];
 
     const result = await generateSessionSummary('session-1');

@@ -1,3 +1,6 @@
+# Deprecated live-route commands: retained only as the capture filename inventory.
+# Use vp run mobile:screenshots -- --flow <name>; its story runner ignores these commands.
+# Do not execute this file directly with Maestro.
 appId: com.boardsesh.app
 name: app-store screenshots (iPad)
 ---
@@ -9,57 +12,131 @@ name: app-store screenshots (iPad)
 # app's router — navigation just never happens. iPhone remembers the confirm after
 # the first prime; iPad does not.
 #
-# So the iPad navigates via the persistent left SIDEBAR. Each item is a real
-# accessibility element (IpadSidebar sets accessibilityLabel, a locale-independent
-# `testID` of ipad-sidebar-<segment>, and accessibilityState.selected on the active
-# item), so every step taps by id and then waits for `selected: true` — PROOF the
-# navigation took effect, wrapped in a retry that re-taps if it didn't. The previous
-# coordinate-tap flow had no such proof: on the 11" iPad the first tap after the
-# rotation relayout was silently swallowed, and 02-climbs shipped byte-identical to
-# 01-home with a dark wall hero (the orchestrator now also fails the run on
-# byte-identical captures).
+# The native iPad sidebar exposes localized accessibility labels and selected
+# state. Its UIKit items do not carry the custom React Native sidebar's testIDs.
+# Tap the first matching label (the sidebar parent precedes its duplicate text
+# child and page headings), then require selected: true on that destination.
+# Retry swallowed taps after rotation; keep content readiness gates below.
+# UIKit owns Hide Sidebar / Toggle sidebar: capture simulators use English system
+# language while the app catalog locale changes separately. Collapse the floating
+# sidebar before capture so it cannot cover the screen content; reopen for navigation.
+# The orchestrator also rejects byte-identical captures of different scenes.
 #
-# The wall kiosk seed (the active board's real climbs) is published at the root by
-# ScreenshotBoardAutoActivator as soon as the board activates, so the wall shot no
-# longer depends on the Climbs screen mounting first. Climbs is still visited first:
-# it re-publishes the same seed (idempotent) and gives the wall panel time to render.
+# Activate the verified primary board through the local screenshot bridge and
+# require its exact route ACK. This transport leaves CPP capture flags disabled.
+# The root publishes the active board's real wall seed; native content and paint
+# gates below still prove the selected climb before taking either board image.
 # The build auto-signs-in and lands on home — the orchestrator gates on reach-home
 # before running this flow.
 - setOrientation: ${MAESTRO_DEVICE_ORIENTATION}
 - waitForAnimationToEnd
-# The sidebar must be mounted and interactive before the first tap — the first tap
-# after the rotation relayout is the one that got swallowed in CI.
-- extendedWaitUntil:
-    visible:
-      id: "ipad-sidebar-climbs"
-    timeout: 15000
+- evalScript: ${output.primaryBoardSequence = JSON.parse(http.get(SCREENSHOT_PRIMARY_BOARD_URL + '/set?scene=hero-1').body).sequence}
+- retry:
+    maxRetries: 3
+    commands:
+      - evalScript: ${output.primaryBoardAcknowledged = JSON.parse(http.get(SCREENSHOT_PRIMARY_BOARD_URL + '/status?waitFor=' + output.primaryBoardSequence).body).acknowledged}
+      - assertTrue: ${output.primaryBoardAcknowledged == output.primaryBoardSequence}
+# The explicit primary hero intent opens the real player and starts driving through
+# its existing controller. Close it normally before the list/Home sources; the
+# tablet's existing MiniPlayer carries the live bulb, without inventing header copy.
+- runFlow:
+    when:
+      true: ${SCREENSHOT_PRIMARY_DRIVING == '1'}
+    commands:
+      - extendedWaitUntil:
+          visible:
+            id: '^play-drawer-board-overlay$'
+          timeout: 60000
+      - extendedWaitUntil:
+          visible:
+            id: '^cpp-climb-painted-.+$'
+          timeout: 90000
+      - extendedWaitUntil:
+          visible:
+            id: ${SCREENSHOT_PRIMARY_DRIVING_ID}
+          timeout: 90000
+      - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+      - extendedWaitUntil:
+          notVisible:
+            id: '^play-drawer-board-overlay$'
+          timeout: 60000
+      - extendedWaitUntil:
+          visible:
+            id: ${SCREENSHOT_PRIMARY_CURRENT_DRIVING_ID}
+          timeout: 90000
+# Each navigation also handles a sidebar left collapsed by a previous run.
 
 # Climbs — the browse list.
 - retry:
     maxRetries: 2
     commands:
-      - tapOn:
-          id: "ipad-sidebar-climbs"
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+      - extendedWaitUntil:
+          visible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+          timeout: 15000
+      # The primary-board ACK already selected Climbs. Tapping its label here
+      # can hit the matching header capsule, which opens the full-screen player.
       - extendedWaitUntil:
           visible:
-            id: "ipad-sidebar-climbs"
+            text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}
             selected: true
           timeout: 5000
+- tapOn: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+    timeout: 15000
+- assertNotVisible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
 - waitForAnimationToEnd
-- waitForAnimationToEnd
+- extendedWaitUntil:
+    visible:
+      id: '^climbs-screen$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^climb-row$'
+      text: ${SCREENSHOT_PRIMARY_CLIMB_ROW}
+      childOf:
+        id: '^climb-list$'
+    timeout: 90000
+- runFlow:
+    when:
+      true: ${SCREENSHOT_PRIMARY_DRIVING == '1'}
+    commands:
+      - extendedWaitUntil:
+          visible:
+            id: ${SCREENSHOT_PRIMARY_CURRENT_DRIVING_ID}
+          timeout: 90000
 - takeScreenshot: 02-climbs
 
 # Home — the "Everyone" feed, with the persistent wall rail showing the lit climb.
 - retry:
     maxRetries: 2
     commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+      - extendedWaitUntil:
+          visible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+          timeout: 15000
       - tapOn:
-          id: "ipad-sidebar-home"
+          text: ${SCREENSHOT_SIDEBAR_HOME_LABEL}
+          index: 0
       - extendedWaitUntil:
           visible:
-            id: "ipad-sidebar-home"
+            text: ${SCREENSHOT_SIDEBAR_HOME_LABEL}
             selected: true
           timeout: 5000
+- tapOn: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+    timeout: 15000
+- assertNotVisible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
 - waitForAnimationToEnd
 # The live rail settles independently from the session feed.
 - extendedWaitUntil:
@@ -70,36 +147,194 @@ name: app-store screenshots (iPad)
     id: 'live-sessions-error'
 - assertNotVisible:
     id: 'live-sessions-offline'
+# The live rail can succeed while Recent sessions renders an error or skeleton.
+- extendedWaitUntil:
+    visible:
+      id: 'session-feed-card'
+    timeout: 90000
+- runFlow:
+    when:
+      true: ${SCREENSHOT_PRIMARY_DRIVING == '1'}
+    commands:
+      - extendedWaitUntil:
+          visible:
+            id: ${SCREENSHOT_PRIMARY_CURRENT_DRIVING_ID}
+          timeout: 90000
 - takeScreenshot: 01-home
 
-# On the Wall — the wall-mounted kiosk HERO: the lit board + the current climb big
-# and readable from across the gym.
+# Wall display — the wall-mounted kiosk HERO: the lit board + the current climb big
+# and readable from the mat. Return to Climbs and put the verified climb in the
+# solo queue through its real row, so the native MiniPlayer has a climb to show.
 - retry:
     maxRetries: 2
     commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+      - extendedWaitUntil:
+          visible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+          timeout: 15000
       - tapOn:
-          id: "ipad-sidebar-wall"
+          text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}
+          index: 0
       - extendedWaitUntil:
           visible:
-            id: "ipad-sidebar-wall"
+            text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}
             selected: true
           timeout: 5000
+- tapOn: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+    timeout: 15000
+- assertNotVisible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
 - waitForAnimationToEnd
+- extendedWaitUntil:
+    visible:
+      id: '^climbs-screen$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^climbs-capture-settled$'
+    timeout: 90000
+- tapOn:
+    id: '^climb-row$'
+    text: ${SCREENSHOT_PRIMARY_CLIMB_ROW}
+    childOf:
+      id: '^climb-list$'
+- extendedWaitUntil:
+    visible:
+      id: '^play-drawer-board-overlay$'
+    timeout: 60000
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- tapOn: ${SCREENSHOT_CLOSE_LABEL}
+- extendedWaitUntil:
+    notVisible:
+      id: '^play-drawer-board-overlay$'
+    timeout: 60000
+# Both the native MiniPlayer and the legacy floating bar expose Log ascent.
+# Prove the queue is populated before deciding which Wall display entry exists.
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_MINI_PLAYER_LOG_LABEL}
+    timeout: 30000
 - waitForAnimationToEnd
+- retry:
+    maxRetries: 2
+    commands:
+      # A prior tap may already have opened the kiosk before a retry starts.
+      - runFlow:
+          when:
+            notVisible:
+              id: '^wall-display-controls(?:-faded)?$'
+          commands:
+            - runFlow:
+                when:
+                  visible: ${SCREENSHOT_WALL_DISPLAY_LABEL}
+                commands:
+                  - tapOn: ${SCREENSHOT_WALL_DISPLAY_LABEL}
+                  - extendedWaitUntil:
+                      visible:
+                        id: '^wall-display-controls(?:-faded)?$'
+                      timeout: 15000
+            - runFlow:
+                when:
+                  notVisible:
+                    id: '^wall-display-controls(?:-faded)?$'
+                commands:
+                  - runFlow:
+                      when:
+                        visible: ${SCREENSHOT_MINI_PLAYER_MORE_LABEL}
+                      commands:
+                        - tapOn: ${SCREENSHOT_MINI_PLAYER_MORE_LABEL}
+                        - extendedWaitUntil:
+                            visible: ${SCREENSHOT_WALL_DISPLAY_LABEL}
+                            timeout: 15000
+                        - tapOn: ${SCREENSHOT_WALL_DISPLAY_LABEL}
+                        - extendedWaitUntil:
+                            visible:
+                              id: '^wall-display-controls(?:-faded)?$'
+                            timeout: 15000
+                  # Only a bar without native controls uses the Climbs menu.
+                  - runFlow:
+                      when:
+                        notVisible:
+                          id: '^wall-display-controls(?:-faded)?$'
+                      commands:
+                        - assertNotVisible: ${SCREENSHOT_MINI_PLAYER_MORE_LABEL}
+                        - tapOn: ${SCREENSHOT_CLIMBS_OPTIONS_LABEL}
+                        - extendedWaitUntil:
+                            visible: ${SCREENSHOT_WALL_DISPLAY_LABEL}
+                            timeout: 15000
+                        - tapOn: ${SCREENSHOT_WALL_DISPLAY_LABEL}
+      - extendedWaitUntil:
+          visible:
+            id: '^wall-display-controls(?:-faded)?$'
+          timeout: 15000
+- extendedWaitUntil:
+    visible: '.*${SCREENSHOT_PRIMARY_CLIMB_TITLE}.*'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: ${SCREENSHOT_PRIMARY_WALL_PAINTED_ID}
+    timeout: 90000
+# Exit and Settings fade a few seconds after the display opens; capture the kiosk alone.
+# The visible kiosk reports the faded state; opacity-zero controls are pruned by iOS.
+- extendedWaitUntil:
+    visible:
+      id: '^wall-display-controls-faded$'
+    timeout: 15000
+- waitForAnimationToEnd
+- runFlow:
+    when:
+      true: ${SCREENSHOT_PRIMARY_DRIVING == '1'}
+    commands:
+      - extendedWaitUntil:
+          visible:
+            id: ${SCREENSHOT_PRIMARY_KIOSK_DRIVING_ID}
+          timeout: 90000
 - takeScreenshot: 00-wall
+# Any touch brings Exit back. Leave the display so the sidebar steps below can run.
+- retry:
+    maxRetries: 2
+    commands:
+      - tapOn: '.*${SCREENSHOT_PRIMARY_CLIMB_TITLE}.*'
+      - tapOn: ${SCREENSHOT_WALL_DISPLAY_EXIT_LABEL}
+      - extendedWaitUntil:
+          visible:
+            id: '^climbs-screen$'
+          timeout: 15000
 
 # Record — the workout generator (a workout is pre-selected in screenshot mode via
-# EXPO_PUBLIC_SCREENSHOT_WORKOUT).
+# EXPO_PUBLIC_SCREENSHOT_WORKOUT). UIKit appends the blank connection badge to
+# the selected parent label; require that parent rather than its unselected child.
 - retry:
     maxRetries: 2
     commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+      - extendedWaitUntil:
+          visible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+          timeout: 15000
       - tapOn:
-          id: "ipad-sidebar-record"
+          text: ${SCREENSHOT_SIDEBAR_RECORD_TAB_SELECTOR}
+          index: 0
       - extendedWaitUntil:
           visible:
-            id: "ipad-sidebar-record"
+            text: ${SCREENSHOT_SIDEBAR_RECORD_TAB_SELECTOR}
             selected: true
           timeout: 5000
+- tapOn: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+    timeout: 15000
+- assertNotVisible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
 - waitForAnimationToEnd
 # Pixel stability alone can still describe the preceding tab.
 - extendedWaitUntil:
@@ -114,13 +349,27 @@ name: app-store screenshots (iPad)
 - retry:
     maxRetries: 2
     commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+      - extendedWaitUntil:
+          visible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+          timeout: 15000
       - tapOn:
-          id: "ipad-sidebar-discover"
+          text: ${SCREENSHOT_SIDEBAR_DISCOVER_LABEL}
+          index: 0
       - extendedWaitUntil:
           visible:
-            id: "ipad-sidebar-discover"
+            text: ${SCREENSHOT_SIDEBAR_DISCOVER_LABEL}
             selected: true
           timeout: 5000
+- tapOn: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+    timeout: 15000
+- assertNotVisible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
 - waitForAnimationToEnd
 - takeScreenshot: 04-discover
 
@@ -128,13 +377,27 @@ name: app-store screenshots (iPad)
 - retry:
     maxRetries: 2
     commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+      - extendedWaitUntil:
+          visible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+          timeout: 15000
       - tapOn:
-          id: "ipad-sidebar-profile"
+          text: ${SCREENSHOT_SIDEBAR_PROFILE_LABEL}
+          index: 0
       - extendedWaitUntil:
           visible:
-            id: "ipad-sidebar-profile"
+            text: ${SCREENSHOT_SIDEBAR_PROFILE_LABEL}
             selected: true
           timeout: 5000
+- tapOn: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}
+    timeout: 15000
+- assertNotVisible: ${SCREENSHOT_SIDEBAR_HIDE_LABEL}
 - waitForAnimationToEnd
 - extendedWaitUntil:
     notVisible:

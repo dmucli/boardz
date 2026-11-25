@@ -1,69 +1,46 @@
-import { useCallback, useState } from 'react';
 import { StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../../providers/theme-provider';
 import { useActiveBoard } from '../../lib/graphql/use-active-board';
-import { useSetBoardAngle } from '../../lib/boards/use-set-board-angle';
-import { hapticLight } from '../../lib/haptics';
+import { canAdjustBoardAngle } from '../../lib/boards/can-adjust-board-angle';
+import { CHROME_LABEL_MAX_FONT_SCALE } from '../../theme/typography';
+import { LargeContentViewer } from '../LargeContentViewer';
 import { Text } from '../Text';
-import { AngleSelectorSheet } from '../play-drawer/AngleSelectorSheet';
+import { BoardAnglePicker } from './BoardAnglePicker';
 import { GlassToolbarAction } from './GlassActionToolbar';
 
 /**
- * The "{angle}°" toolbar button paired with its `AngleSelectorSheet`.
- * Self-contained: reads the active board, owns the sheet's open state, and writes
- * the chosen angle back through `useSetBoardAngle` (which re-grades the climbs in
- * the list / playlist). Renders nothing for fixed-angle boards (or none). Used by
- * both the Climbs and Discover chromes.
+ * The one-tap "40°" toolbar button and its picker, on the Liquid Glass Climbs
+ * and Discover chromes. Renders nothing for a fixed-angle board or none. Speaks
+ * the angle, and shows it in the Large Content Viewer where the capped label
+ * can't grow.
  */
-export function AngleToolbarAction() {
+export function AngleToolbarAction({ onPickerOpenChange }: { onPickerOpenChange?: (open: boolean) => void } = {}) {
   const { systemColors } = useTheme();
-  const { t: tSession } = useTranslation('session');
+  const { t } = useTranslation('session');
   const { data: activeBoard } = useActiveBoard();
-  const setBoardAngle = useSetBoardAngle();
-  const [visible, setVisible] = useState(false);
-
-  const canAdjust = activeBoard?.isAngleAdjustable !== false && activeBoard?.angle != null;
-
-  const handleOpen = useCallback(() => {
-    if (!activeBoard || activeBoard.isAngleAdjustable === false || activeBoard.angle == null) return;
-    hapticLight();
-    setVisible(true);
-  }, [activeBoard]);
-
-  const handleClose = useCallback(() => setVisible(false), []);
-
-  const handleAngleChange = useCallback(
-    (newAngle: number) => {
-      if (!activeBoard || activeBoard.isAngleAdjustable === false || newAngle === activeBoard.angle) return;
-      void setBoardAngle(activeBoard, newAngle);
-    },
-    [activeBoard, setBoardAngle],
-  );
-
-  if (!activeBoard || !canAdjust) return null;
+  if (!canAdjustBoardAngle(activeBoard)) return null;
+  const spokenLabel = t('mobile.angleSelector.buttonAria', { angle: activeBoard.angle });
 
   return (
-    <>
-      <GlassToolbarAction onPress={handleOpen} accessibilityLabel={tSession('mobile.angleSelector.title')}>
-        <Text variant="caption1" style={[styles.angleText, { color: systemColors.label }]}>
-          {activeBoard.angle}°
-        </Text>
-      </GlassToolbarAction>
-      <AngleSelectorSheet
-        visible={visible}
-        onClose={handleClose}
-        boardName={activeBoard.boardType}
-        layoutId={activeBoard.layoutId}
-        currentAngle={activeBoard.angle}
-        onAngleChange={handleAngleChange}
-      />
-    </>
+    <BoardAnglePicker onOpenChange={onPickerOpenChange}>
+      {(open) => (
+        <GlassToolbarAction onPress={open} accessibilityLabel={spokenLabel}>
+          <LargeContentViewer title={spokenLabel} onActivate={open}>
+            <Text
+              variant="caption1"
+              numeric
+              numberOfLines={1}
+              maxFontSizeMultiplier={CHROME_LABEL_MAX_FONT_SCALE}
+              style={[styles.angleText, { color: systemColors.label }]}
+            >
+              {activeBoard.angle}°
+            </Text>
+          </LargeContentViewer>
+        </GlassToolbarAction>
+      )}
+    </BoardAnglePicker>
   );
 }
 
-const styles = StyleSheet.create({
-  angleText: {
-    fontWeight: '700',
-  },
-});
+const styles = StyleSheet.create({ angleText: { fontWeight: '700' } });

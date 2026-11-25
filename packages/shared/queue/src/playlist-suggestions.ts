@@ -6,7 +6,76 @@
  * stays dependency-free.
  */
 
-import type { Climb, ClimbQueue, ClimbQueueItem, PlaylistSuggestionSource } from './types';
+import type {
+  Climb,
+  ClimbQueue,
+  ClimbQueueItem,
+  PlaylistSuggestionSource,
+  PlaylistTrackPage,
+  PlaylistTrackResume,
+} from './types';
+
+const acceptEveryClimb = () => true;
+
+/** Prepared once for an immutable loaded-results/board snapshot, before taps. */
+export type PreparedPlaylistClimbs = {
+  readonly inputClimbs: Climb[];
+  readonly isClimbable: (climb: Climb) => boolean;
+  readonly climbs: Climb[];
+  readonly firstIndexByUuid: ReadonlyMap<string, number>;
+};
+
+const sourceIndices = new WeakMap<
+  PlaylistSuggestionSource,
+  {
+    climbs: Climb[];
+    firstIndexByUuid: ReadonlyMap<string, number>;
+  }
+>();
+
+function indexClimbs(climbs: Climb[]): ReadonlyMap<string, number> {
+  const firstIndexByUuid = new Map<string, number>();
+  climbs.forEach((climb, index) => {
+    if (!firstIndexByUuid.has(climb.uuid)) firstIndexByUuid.set(climb.uuid, index);
+  });
+  return firstIndexByUuid;
+}
+
+export function preparePlaylistClimbs(
+  climbs: Climb[],
+  isClimbable: (climb: Climb) => boolean = acceptEveryClimb,
+): PreparedPlaylistClimbs {
+  const seen = new Set<string>();
+  const compatibleClimbs: Climb[] = [];
+  const firstIndexByUuid = new Map<string, number>();
+  for (const climb of climbs) {
+    if (seen.has(climb.uuid)) continue;
+    seen.add(climb.uuid);
+    if (!isClimbable(climb)) continue;
+    firstIndexByUuid.set(climb.uuid, compatibleClimbs.length);
+    compatibleClimbs.push(climb);
+  }
+  return { inputClimbs: climbs, isClimbable, climbs: compatibleClimbs, firstIndexByUuid };
+}
+
+// Sources built without `createPlaylistSuggestionSource` (a restored snapshot, a
+// board-filtered copy) get their index on first use, keyed by the climbs array,
+// which every track treats as immutable. Navigation asks about one queue entry at
+// a time (issue #6777: is this queued climb one the list walk put there?), so a
+// scan per question would cost the length of the list for every queued climb.
+const lazyClimbIndices = new WeakMap<Climb[], ReadonlyMap<string, number>>();
+
+/** Where `climbUuid` first sits on the track, or -1. No serialized metadata. */
+export function findPlaylistClimbIndex(source: PlaylistSuggestionSource, climbUuid: string): number {
+  const prepared = sourceIndices.get(source);
+  if (prepared?.climbs === source.climbs) return prepared.firstIndexByUuid.get(climbUuid) ?? -1;
+  let lazyIndex = lazyClimbIndices.get(source.climbs);
+  if (!lazyIndex) {
+    lazyIndex = indexClimbs(source.climbs);
+    lazyClimbIndices.set(source.climbs, lazyIndex);
+  }
+  return lazyIndex.get(climbUuid) ?? -1;
+}
 
 /**
  * Merge a list of playlist climbs with the activated climb, deduplicating
@@ -55,7 +124,7 @@ export function playlistSuggestionSourceMatches(
 export function getPlaylistSuggestedClimbs(source: PlaylistSuggestionSource | null, queue: ClimbQueue): Climb[] {
   if (!source) return [];
 
-  const activatedIndex = source.climbs.findIndex((climb) => climb.uuid === source.activatedClimbUuid);
+  const activatedIndex = findPlaylistClimbIndex(source, source.activatedClimbUuid);
   if (activatedIndex === -1) return [];
   const startIndex = activatedIndex + 1;
   const queuedClimbUuids = new Set(queue.map((item) => item.climb?.uuid).filter((uuid): uuid is string => !!uuid));
@@ -109,8 +178,11 @@ export function reanchorPlaylistSuggestionSource(
 ): PlaylistSuggestionSource | null {
   if (!source || !activatedClimbUuid) return source;
   if (source.activatedClimbUuid === activatedClimbUuid) return source;
-  if (!source.climbs.some((climb) => climb.uuid === activatedClimbUuid)) return source;
-  return { ...source, activatedClimbUuid };
+  if (findPlaylistClimbIndex(source, activatedClimbUuid) < 0) return source;
+  const reanchoredSource = { ...source, activatedClimbUuid };
+  const preparedIndex = sourceIndices.get(source);
+  if (preparedIndex?.climbs === source.climbs) sourceIndices.set(reanchoredSource, preparedIndex);
+  return reanchoredSource;
 }
 
 /**
@@ -157,27 +229,228 @@ export function getQueueBoardKey(target: QueueBoardKeyTarget): string {
  * `use-playlist-activation.ts`) so a mixed-board playlist can't feed `next` a
  * climb the wall can't draw. Web has no consumer since the climbing UI moved to
  * the Expo app in W-16 (#4435). Omitting the predicate keeps everything.
+ *
+ * `climbs` is the list from its first climb, in the list's order. `total` is
+ * kept only when the track walks exactly that list, so "4 of 23" is never a
+ * wrong number: a filter that dropped a climb, a duplicate, or an activated
+ * climb that had to be appended all move positions, and each clears it.
  */
 export function createPlaylistSuggestionSource({
   playlistUuid,
   activatedClimb,
   climbs,
   boardKey,
-  isClimbable = () => true,
+  isClimbable = acceptEveryClimb,
+  preparedClimbs,
+  label,
+  total,
+  continuation,
 }: {
   playlistUuid: string;
   activatedClimb: Climb;
   climbs: Climb[];
   boardKey: string;
   isClimbable?: (climb: Climb) => boolean;
+  preparedClimbs?: PreparedPlaylistClimbs;
+  label?: string;
+  total?: number;
+  continuation?: PlaylistSuggestionSource['continuation'];
 }): PlaylistSuggestionSource {
-  const climbableClimbs = mergeUniquePlaylistClimbs(activatedClimb, climbs).filter(
-    (climb) => climb.uuid === activatedClimb.uuid || isClimbable(climb),
-  );
-  return {
+  // A filtered-out or absent activated climb has exceptional inclusion/order
+  // semantics. Keep that uncommon path on the original builder.
+  const canReuse =
+    preparedClimbs?.inputClimbs === climbs &&
+    preparedClimbs.isClimbable === isClimbable &&
+    preparedClimbs.firstIndexByUuid.has(activatedClimb.uuid);
+  const climbableClimbs = canReuse
+    ? preparedClimbs.climbs
+    : mergeUniquePlaylistClimbs(activatedClimb, climbs).filter(
+        (climb) => climb.uuid === activatedClimb.uuid || isClimbable(climb),
+      );
+  const source: PlaylistSuggestionSource = {
     playlistUuid,
     activatedClimbUuid: activatedClimb.uuid,
     boardKey,
     climbs: climbableClimbs,
   };
+  if (label) source.label = label;
+  if (total !== undefined && keepsListPositions(climbableClimbs, climbs, total)) source.total = total;
+  if (continuation) source.continuation = continuation;
+  sourceIndices.set(source, {
+    climbs: climbableClimbs,
+    firstIndexByUuid: canReuse ? preparedClimbs.firstIndexByUuid : indexClimbs(climbableClimbs),
+  });
+  return source;
+}
+
+/** True when `track` is `list` climb for climb, so an index in one is a place in the other. */
+function keepsListPositions(track: Climb[], list: Climb[], total: number): boolean {
+  if (track.length !== list.length || total < track.length) return false;
+  for (let index = 0; index < track.length; index += 1) {
+    if (track[index].uuid !== list[index].uuid) return false;
+  }
+  return true;
+}
+
+/**
+ * The track with one more page on its end (issue #6664: lists longer than the
+ * first load keep going instead of stopping at the cap).
+ *
+ * Climbs the track already holds are not added twice. The count survives only
+ * when this page lands exactly where the track ends, nothing in it was dropped
+ * and nothing in it was already there; otherwise positions past this point no
+ * longer match the list, so the player stops showing them.
+ */
+export function appendPlaylistTrackPage(
+  source: PlaylistSuggestionSource,
+  page: PlaylistTrackPage,
+): PlaylistSuggestionSource {
+  const knownUuids = new Set(source.climbs.map(({ uuid }) => uuid));
+  const appended: Climb[] = [];
+  let hadDuplicates = false;
+  for (const climb of page.climbs) {
+    if (knownUuids.has(climb.uuid)) {
+      hadDuplicates = true;
+      continue;
+    }
+    knownUuids.add(climb.uuid);
+    appended.push(climb);
+  }
+  const climbs = appended.length > 0 ? [...source.climbs, ...appended] : source.climbs;
+  const next: PlaylistSuggestionSource = { ...source, climbs };
+  const total = page.total ?? source.total;
+  // An empty page moves no position (a load that failed ends the track this way).
+  const pageStartsAtTrackEnd = page.climbs.length === 0 || page.page * page.pageSize === source.climbs.length;
+  if (
+    source.total !== undefined &&
+    total !== undefined &&
+    total >= climbs.length &&
+    pageStartsAtTrackEnd &&
+    !hadDuplicates &&
+    !page.filteredOut
+  ) {
+    next.total = total;
+  } else {
+    delete next.total;
+  }
+  if (page.nextPage === null || !source.continuation) {
+    delete next.continuation;
+  } else {
+    next.continuation = { loaderId: source.continuation.loaderId, nextPage: page.nextPage };
+  }
+  const existingIndex = sourceIndices.get(source);
+  sourceIndices.set(
+    next,
+    existingIndex?.climbs === climbs ? existingIndex : { climbs, firstIndexByUuid: indexClimbs(climbs) },
+  );
+  return next;
+}
+
+/**
+ * A copy of `source` walking `climbs`, a filtered subset of its own. Dropping a
+ * climb moves every position after it, so the count goes with it.
+ */
+export function withPlaylistTrackClimbs(source: PlaylistSuggestionSource, climbs: Climb[]): PlaylistSuggestionSource {
+  const next: PlaylistSuggestionSource = { ...source, climbs };
+  if (climbs.length !== source.climbs.length) delete next.total;
+  return next;
+}
+
+/** Whether two resume anchors name the same list climb and queue entry; absent and null are the same. */
+export function samePlaylistTrackResume(
+  first: PlaylistTrackResume | null | undefined,
+  second: PlaylistTrackResume | null | undefined,
+): boolean {
+  if (!first || !second) return !first && !second;
+  return first.climbUuid === second.climbUuid && first.queueItemUuid === second.queueItemUuid;
+}
+
+/**
+ * A copy of `source` with its Up next resume point set, or cleared with null
+ * (issue #6777). `source` itself when nothing changes, so a step that stays on
+ * the list costs no new track. The copy keeps the source's prepared index.
+ *
+ * Clearing a resume is the walk coming back to the list from Up next, so the
+ * cleared one is kept as `detour` for Previous to retrace. Setting a resume
+ * starts a new stretch of Up next and drops the old detour.
+ *
+ * `steppedOffQueueItemUuid` is the queue entry the step leaves. When the step
+ * clears a resume, that is the last Up next climb the walk played, and the
+ * detour records it (`lastUpNextQueueItemUuid`, issue #7227) so Previous
+ * retraces from there, not from whatever is queued last by then.
+ */
+export function withPlaylistTrackResume(
+  source: PlaylistSuggestionSource,
+  resume: PlaylistTrackResume | null,
+  steppedOffQueueItemUuid?: string,
+): PlaylistSuggestionSource {
+  if (samePlaylistTrackResume(source.resume, resume)) return source;
+  const next: PlaylistSuggestionSource = { ...source };
+  if (resume) {
+    next.resume = resume;
+    delete next.detour;
+  } else {
+    if (source.resume) {
+      const { climbUuid, queueItemUuid } = source.resume;
+      next.detour =
+        steppedOffQueueItemUuid && steppedOffQueueItemUuid !== queueItemUuid
+          ? { climbUuid, queueItemUuid, lastUpNextQueueItemUuid: steppedOffQueueItemUuid }
+          : { climbUuid, queueItemUuid };
+    }
+    delete next.resume;
+  }
+  return keepPreparedIndex(source, next);
+}
+
+/**
+ * `source` as the list a look off the climb on the wall carries
+ * ({@link PlaylistSuggestionSource.lookOffWall}, issue #7227). `source` itself
+ * when it already says so. The copy keeps the source's prepared index.
+ */
+export function asLookOffWall(source: PlaylistSuggestionSource): PlaylistSuggestionSource {
+  if (source.lookOffWall) return source;
+  return keepPreparedIndex(source, { ...source, lookOffWall: true });
+}
+
+/**
+ * `source` without a look's mark, as the queue holds a list that went up
+ * (issue #7227): the mark says how a preview began, which a committed list
+ * never is. `source` itself when it has no mark.
+ */
+export function withoutLookOffWall(source: PlaylistSuggestionSource): PlaylistSuggestionSource {
+  if (!source.lookOffWall) return source;
+  const next: PlaylistSuggestionSource = { ...source };
+  delete next.lookOffWall;
+  return keepPreparedIndex(source, next);
+}
+
+/**
+ * `source` carrying `held`'s place on the walk: its Up next resume point and
+ * its last detour (issue #6777). For a fresh copy of the same list (a refresh,
+ * a longer page) that replaces the held track while the walk is under way.
+ */
+export function withPlaylistTrackPlace(
+  source: PlaylistSuggestionSource,
+  held: PlaylistSuggestionSource,
+): PlaylistSuggestionSource {
+  if (
+    samePlaylistTrackResume(source.resume, held.resume) &&
+    samePlaylistTrackResume(source.detour, held.detour) &&
+    source.detour?.lastUpNextQueueItemUuid === held.detour?.lastUpNextQueueItemUuid
+  ) {
+    return source;
+  }
+  const next: PlaylistSuggestionSource = { ...source };
+  if (held.resume) next.resume = held.resume;
+  else delete next.resume;
+  if (held.detour) next.detour = held.detour;
+  else delete next.detour;
+  return keepPreparedIndex(source, next);
+}
+
+/** Hand `source`'s prepared index to `next`, a copy walking the same climbs. */
+function keepPreparedIndex(source: PlaylistSuggestionSource, next: PlaylistSuggestionSource): PlaylistSuggestionSource {
+  const preparedIndex = sourceIndices.get(source);
+  if (preparedIndex?.climbs === source.climbs) sourceIndices.set(next, preparedIndex);
+  return next;
 }

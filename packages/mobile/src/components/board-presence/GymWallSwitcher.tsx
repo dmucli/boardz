@@ -1,5 +1,6 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useMemo, useState } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import { boardConfigLabel, disambiguateBoardSubtitles, stripGymNamePrefix } from '@boardsesh/board-config';
@@ -9,6 +10,7 @@ import { AccessoryClimbThumbnail } from '../queue-control/AccessoryClimbThumbnai
 import { useBoardRecentClimb } from '../../lib/graphql/hooks/use-board-recent-climb';
 import { useTheme } from '../../providers/theme-provider';
 import { useGymBoards } from '../../lib/graphql/hooks/use-gym-boards';
+import { boardHasLights } from '../../lib/boards/board-lighting';
 import { spacing, borderRadius } from '../../theme/tokens';
 
 /** Board art beside each row — small enough not to set the row's height floor. */
@@ -22,6 +24,8 @@ export type GymWallSwitcherProps = {
   activeBoard: UserBoard | null;
   /** Hop to this board. The sheet stays open — see `useSwitchBoard`. */
   onSelectBoard: (board: UserBoard) => void;
+  /** Overrides the list's padding where a host draws its own heading (the board picker). */
+  style?: StyleProp<ViewStyle>;
 };
 
 /**
@@ -42,11 +46,11 @@ export type GymWallSwitcherProps = {
  *
  * Presentation-agnostic on purpose: it mounts no sheet and no overlay, because
  * an `@expo/ui` sheet cannot stack over the one this already lives in. Same
- * shape as InlinePlaylistPicker — see docs/mobile-sheets-vs-routes.md.
+ * shape as InlinePlaylistPicker — see docs/mobile/mobile-sheets-vs-routes.md.
  */
-function GymWallSwitcherComponent({ activeBoard, onSelectBoard }: GymWallSwitcherProps) {
+function GymWallSwitcherComponent({ activeBoard, onSelectBoard, style }: GymWallSwitcherProps) {
   const { t } = useTranslation('session');
-  const { brandColors } = useTheme();
+  const { systemColors } = useTheme();
   const [expanded, setExpanded] = useState(false);
   const { data: gymBoards } = useGymBoards(activeBoard?.gymUuid ?? null);
 
@@ -78,7 +82,7 @@ function GymWallSwitcherComponent({ activeBoard, onSelectBoard }: GymWallSwitche
           ? t('mobile.boardPresence.gymWalls.header', { gym: gymName })
           : t('mobile.boardPresence.gymWalls.headerNoGym')
       }
-      style={styles.section}
+      style={[styles.section, style]}
     >
       {visibleSiblings.map((board, index) => (
         <GymWallRow
@@ -91,11 +95,11 @@ function GymWallSwitcherComponent({ activeBoard, onSelectBoard }: GymWallSwitche
       ))}
 
       {hiddenCount > 0 ? (
-        <Pressable onPress={handleExpand} accessibilityRole="button" style={styles.showAll}>
-          <Text variant="subheadline" color={brandColors.primary}>
+        <PressableSurface onPress={handleExpand} accessibilityRole="button" style={styles.showAll}>
+          <Text variant="subheadline" color={systemColors.accent}>
             {t('mobile.boardPresence.gymWalls.showAll', { count: siblings.length })}
           </Text>
-        </Pressable>
+        </PressableSurface>
       ) : null}
     </View>
   );
@@ -144,7 +148,7 @@ const GymWallRow = memo(function GymWallRow({
   // with history reads at a glance — you recognise the wall you were on and what
   // is on it now — where the generic glyph this replaces was the same picture on
   // every row. A board nobody has lit yet still renders its own art, just bare.
-  const recentClimb = useBoardRecentClimb(board.boardId);
+  const recentClimb = useBoardRecentClimb(board.boardId, board.uuid);
   const thumbnailBoardConfig = useMemo(
     () => ({
       boardName: board.boardType,
@@ -187,13 +191,14 @@ const GymWallRow = memo(function GymWallRow({
   const detail = [
     subtitle || (boardConfigLabel(board) ?? board.boardType),
     subtitleAlreadyNamesAngle ? null : angleLabel,
-    board.hasLeds === false ? t('mobile.boardPresence.gymWalls.noLights') : null,
+    // A wall device lights a wall with no LED kit, so only a truly dark wall says so.
+    boardHasLights(board) ? null : t('mobile.boardPresence.gymWalls.noLights'),
   ]
     .filter(Boolean)
     .join(' · ');
 
   return (
-    <Pressable
+    <PressableSurface
       onPress={handlePress}
       accessibilityRole="button"
       accessibilityLabel={t('mobile.boardPresence.gymWalls.rowAria', { board: title })}
@@ -208,12 +213,12 @@ const GymWallRow = memo(function GymWallRow({
           {detail}
         </Text>
         {sharesClimbsWithActive ? (
-          <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={1}>
+          <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={1}>
             {t('mobile.boardPresence.gymWalls.sameClimbs')}
           </Text>
         ) : null}
       </View>
-    </Pressable>
+    </PressableSurface>
   );
 });
 

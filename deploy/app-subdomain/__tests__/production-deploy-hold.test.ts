@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 // Guards the APP_WEB_DEPLOY_HOLD freeze on `deploy-app-web` in
 // .github/workflows/production-deploy.yml — the job that ships this directory's
-// Cloudflare Pages config (see ../README.md, docs/expo-web-deployment.md).
+// Cloudflare Pages config (see ../README.md, docs/operations/expo-web-deployment.md).
 //
 // deploy-web and deploy-production-backend read `check-rollback` and stage
 // instead of promoting while a Vercel Instant Rollback is pinned. Pages exposes
@@ -14,7 +14,7 @@ import { describe, expect, it } from 'vitest';
 // the rollback was mitigating.
 //
 // It lives in this project, not scripts/, because it reads the workflow via fs.
-// The `deploy-config` job in ci.yml runs this project UNFILTERED whenever
+// The `deploy-config` guard step in ci.yml runs this project UNFILTERED whenever
 // production-deploy.yml changes; Vitest's `--changed` module-graph selection can
 // never relate an fs read to a diff of the file it reads.
 
@@ -133,7 +133,7 @@ describe('production-deploy.yml: the app.boardsesh.com deploy hold', () => {
     // scripts/mobile-ci-env-parity.test.ts matches `^  KEY:` only, so moving
     // these into deploy-app-web blinds the test guarding them without failing
     // anything. That test is fs-read too, and `--changed` never selects it for a
-    // workflow-only diff — this assertion runs in the deploy-config job, which
+    // workflow-only diff — this assertion runs in the deploy-config guard step, which
     // does fire on one.
     expect(jobBlock('deploy-app-web'), 'EXPO_PUBLIC_* must not be re-declared inside the job').not.toMatch(
       /^\s*EXPO_PUBLIC_[A-Z_]+:/m,

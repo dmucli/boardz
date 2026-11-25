@@ -46,9 +46,28 @@ function recomputedKeys(): Array<{ climbUuid: string; angle: number }> {
 type CallRecord = {
   // `conflict` records the ON CONFLICT clause an insert was given, so a test
   // can assert the ownership `setWhere` guard was attached.
-  kind: 'select' | 'delete' | 'execute' | 'insert' | 'update' | 'conflict' | 'transaction';
+  kind:
+    | 'select'
+    | 'deletedLookup'
+    | 'delete'
+    | 'execute'
+    | 'gradeCopy'
+    | 'lock'
+    | 'insert'
+    | 'update'
+    | 'conflict'
+    | 'transaction';
   args: unknown[];
 };
+
+/**
+ * applyRatingGradesToTicks' UPDATE. The stubs record it as `gradeCopy` rather
+ * than `execute`, so the round-trip counts below keep describing the log and
+ * rating writes, and the grade copy is asserted on its own.
+ */
+function isGradeCopy(query: unknown): boolean {
+  return new PgDialect().sqlToQuery(query as never).sql.includes('difficulty = r.difficulty_grade_id');
+}
 
 type SelectResult = Array<Record<string, unknown>>;
 
@@ -72,7 +91,12 @@ type SelectResult = Array<Record<string, unknown>>;
 // caught at typecheck time via the Drizzle column references. Promote
 // to an integration test if the SQL grows another conditional.
 function createTx(
-  opts: { selectResults?: SelectResult[]; removeResult?: SelectResult; executeResults?: unknown[] } = {},
+  opts: {
+    selectResults?: SelectResult[];
+    removeResult?: SelectResult;
+    executeResults?: unknown[];
+    gradeCopyResult?: SelectResult;
+  } = {},
 ) {
   const calls: CallRecord[] = [];
   const selectResults = opts.selectResults ?? [];
@@ -125,6 +149,10 @@ function createTx(
       };
     },
     execute(query: unknown) {
+      if (isGradeCopy(query)) {
+        calls.push({ kind: 'gradeCopy', args: [query] });
+        return Promise.resolve(opts.gradeCopyResult ?? []);
+      }
       calls.push({ kind: 'execute', args: [query] });
       return Promise.resolve(executeResults[executeIdx++]);
     },
@@ -886,6 +914,42 @@ function existingKilterTick(overrides: Record<string, unknown> = {}): Record<str
   };
 }
 
+/** The (climb, angle) keys and user a recorded grade-copy UPDATE was bound to. */
+function gradeCopyBinding(call: CallRecord): { userId: unknown; keys: unknown } {
+  const { params } = new PgDialect().sqlToQuery(call.args[0] as never);
+  const payload = params.find((param) => typeof param === 'string' && param.startsWith('['));
+  return { userId: params.find((param) => param === 'user-1'), keys: JSON.parse(String(payload)) };
+}
+
+describe('applyLogs — copies the climber’s Kilter grade (#6182)', () => {
+  beforeEach(() => recomputeMock.mockClear());
+
+  it('runs the grade copy once over the keys the flush wrote', async () => {
+    const { tx, calls } = createTx({ selectResults: [[], []] });
+    const op = makeLogPutOp({
+      log_uuid: 'log-A',
+      climb_uuid: 'climb-1',
+      angle: 40,
+      created_at: '2026-05-01T12:00:00.000Z',
+    });
+
+    await applyLogs(tx as unknown as TxArg, 'user-1', [op], aliasCacheFor(['climb-1']), () => {});
+
+    const copies = calls.filter((c) => c.kind === 'gradeCopy');
+    expect(copies).toHaveLength(1);
+    expect(gradeCopyBinding(copies[0])).toEqual({ userId: 'user-1', keys: [{ climb_uuid: 'climb-1', angle: 40 }] });
+    // The copy runs after the insert, so the new tick is there to receive the grade.
+    expect(calls.findIndex((c) => c.kind === 'gradeCopy')).toBeGreaterThan(calls.findIndex((c) => c.kind === 'insert'));
+    expect(recomputedKeys()).toEqual([{ climbUuid: 'climb-1', angle: 40 }]);
+  });
+
+  it('skips the grade copy when the flush wrote nothing', async () => {
+    const { tx, calls } = createTx();
+    await applyLogs(tx as unknown as TxArg, 'user-1', [], aliasCacheFor([]), () => {});
+    expect(calls.filter((c) => c.kind === 'gradeCopy')).toHaveLength(0);
+  });
+});
+
 describe('applyLogs — PR4 offset inference + edit guard', () => {
   let logSpy: ReturnType<typeof vi.fn<(msg: string) => void>>;
 
@@ -1106,8 +1170,10 @@ describe('applyLogs — PR4 offset inference + edit guard', () => {
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import {
+  deletedUpstreamPlaylistIdsQuery,
   foreignPlaylistOwnerGuard,
   selectUpstreamPlaylistOwners,
+  upstreamPlaylistLockStatement,
   upstreamPlaylistOwnersQuery,
 } from '@boardsesh/db/queries';
 
@@ -1164,7 +1230,19 @@ describe('sanitizeKilterRating', () => {
     expect(sanitizeKilterRating(Number.NaN)).toBeNull();
   });
 });
-import { boardClimbRatings, playlists, playlistClimbs, playlistOwnership } from '@boardsesh/db/schema';
+import {
+  boardClimbRatings,
+  playlists,
+  playlistClimbs,
+  playlistOwnership,
+  userDeletedUpstreamPlaylists,
+} from '@boardsesh/db/schema';
+
+/** The per-user upstream-playlist lock (#7240), told apart from every other raw statement. */
+const UPSTREAM_PLAYLIST_LOCK_SQL = new PgDialect().sqlToQuery(upstreamPlaylistLockStatement('any-user')).sql;
+function isUpstreamPlaylistLock(query: unknown): boolean {
+  return new PgDialect().sqlToQuery(query as never).sql === UPSTREAM_PLAYLIST_LOCK_SQL;
+}
 
 type ChainTx = {
   tx: unknown;
@@ -1191,6 +1269,14 @@ function createRichTx(
      * vice versa) and quietly change what a test is asserting.
      */
     updateReturningRows?: Array<Array<Record<string, unknown>>>;
+    /** Rows applyRatingGradesToTicks' UPDATE … RETURNING hands back. */
+    gradeCopyResult?: SelectResult;
+    /**
+     * What the deleted-circuit lookup (#7240) reads. Served by table, not from
+     * the `selectResults` queue, so the queue keeps meaning "owner lookup,
+     * then adoption candidates, then playlist_climbs".
+     */
+    deletedUpstreamIds?: string[];
   } = {},
 ): ChainTx {
   const calls: CallRecord[] = [];
@@ -1204,8 +1290,6 @@ function createRichTx(
 
   const tx = {
     select(cols: unknown) {
-      calls.push({ kind: 'select', args: [cols] });
-      const next = selectResults[selectIdx++] ?? [];
       // applyCircuits chains .where(...).orderBy(...) for the playlist_climbs
       // read, so .where() needs to be both directly awaitable AND carry an
       // .orderBy() that's also awaitable. Object.assign on a Promise gives
@@ -1216,14 +1300,26 @@ function createRichTx(
         });
       // applyCircuits' owner lookup chains .leftJoin(...) before .where(...),
       // so the join step has to return the same awaitable shape.
-      const source = {
-        where: (_cond: unknown) => orderable(next),
-        orderBy: (..._cols: unknown[]) => Promise.resolve(next),
-        leftJoin: (_table: unknown, _on: unknown) => source,
-        innerJoin: (_table: unknown, _on: unknown) => source,
+      const sourceFor = (next: SelectResult) => {
+        const source = {
+          where: (_cond: unknown) => orderable(next),
+          orderBy: (..._cols: unknown[]) => Promise.resolve(next),
+          leftJoin: (_table: unknown, _on: unknown) => source,
+          innerJoin: (_table: unknown, _on: unknown) => source,
+        };
+        return source;
       };
       return {
-        from: (_table: unknown) => source,
+        from: (table: unknown) => {
+          // Recorded as its own kind so the tests that count owner, candidate
+          // and playlist_climbs reads keep counting exactly those.
+          if (table === userDeletedUpstreamPlaylists) {
+            calls.push({ kind: 'deletedLookup', args: [cols] });
+            return sourceFor((opts.deletedUpstreamIds ?? []).map((upstreamId) => ({ upstreamId })));
+          }
+          calls.push({ kind: 'select', args: [cols] });
+          return sourceFor(selectResults[selectIdx++] ?? []);
+        },
       };
     },
     delete(_table: unknown) {
@@ -1272,8 +1368,16 @@ function createRichTx(
       };
     },
     execute(query: unknown) {
+      if (isGradeCopy(query)) {
+        calls.push({ kind: 'gradeCopy', args: [query] });
+        return Promise.resolve(opts.gradeCopyResult ?? []);
+      }
+      if (isUpstreamPlaylistLock(query)) {
+        calls.push({ kind: 'lock', args: [query] });
+        return Promise.resolve([]);
+      }
       calls.push({ kind: 'execute', args: [query] });
-      return Promise.resolve();
+      return Promise.resolve([]);
     },
     // applyClimbRatings wraps each upsert chunk in a savepoint so one refused
     // row costs its chunk rather than the buffer. Drizzle models a savepoint as
@@ -1363,6 +1467,39 @@ describe('applyClimbRatings — bulk upsert with COALESCE comment', () => {
     expect(calls.filter((c) => c.kind === 'update')).toHaveLength(0);
     // boardClimbRatings is the schema target — used by the bulk insert.
     expect(boardClimbRatings).toBeDefined();
+  });
+
+  it('copies the climber’s grade onto their ticks for every rating key and recomputes only the changed ones (#6182)', async () => {
+    const { tx, calls } = createRichTx({ gradeCopyResult: [{ climb_uuid: 'climb-B', angle: 25 }] });
+    const recompute = vi.fn();
+    const ops = [
+      makeRatingPutOp({ climb_rating_uuid: 'r-1', climb_uuid: 'climb-A', angle: 40, difficulty_grade_id: 22 }),
+      makeRatingPutOp({ climb_rating_uuid: 'r-2', climb_uuid: 'climb-B', angle: 25, difficulty_grade_id: 23 }),
+    ];
+
+    await applyClimbRatings(
+      tx as unknown as ApplyClimbRatingsTx,
+      'user-1',
+      ops,
+      aliasCacheFor(['climb-A', 'climb-B']),
+      () => {},
+      new Map(),
+      recompute,
+    );
+
+    const copies = calls.filter((c) => c.kind === 'gradeCopy');
+    expect(copies).toHaveLength(1);
+    // After the upsert: the copy joins board_climb_ratings, so it must see this batch.
+    expect(calls.findIndex((c) => c.kind === 'gradeCopy')).toBeGreaterThan(calls.findIndex((c) => c.kind === 'insert'));
+    expect(gradeCopyBinding(copies[0])).toEqual({
+      userId: 'user-1',
+      keys: [
+        { climb_uuid: 'climb-A', angle: 40 },
+        { climb_uuid: 'climb-B', angle: 25 },
+      ],
+    });
+    expect(recompute).toHaveBeenCalledTimes(1);
+    expect(recompute.mock.calls[0][1]).toEqual([{ boardType: 'kilter', climbUuid: 'climb-B', angle: 25 }]);
   });
 
   it('sanitizes a Kilter rating=0 to NULL so the batch does not violate the CHECK', () => {
@@ -1704,7 +1841,10 @@ describe('applyCircuits — playlist upsert + diff-and-replace', () => {
  */
 describe('applyCircuits — foreign-owner guard (#3526)', () => {
   /** Every write applyCircuits can make. A refusal must produce none of them. */
-  const writeCalls = (calls: CallRecord[]) => calls.filter((c) => c.kind !== 'select' && c.kind !== 'conflict');
+  const writeCalls = (calls: CallRecord[]) =>
+    calls.filter(
+      (c) => c.kind !== 'select' && c.kind !== 'deletedLookup' && c.kind !== 'conflict' && c.kind !== 'lock',
+    );
 
   it('PUT on a circuit owned by ANOTHER Boardsesh user issues no insert, no update and no delete', async () => {
     const logged: string[] = [];
@@ -2473,5 +2613,115 @@ describe('applyCircuits — legacy playlist adoption (#4707)', () => {
       .find((row) => 'kilterType' in row);
     expect(playlistInsert?.updatedAt).toBeInstanceOf(Date);
     expect(playlistInsert?.updatedAt).toEqual(playlistInsert?.kilterSyncedAt);
+  });
+});
+
+/**
+ * #7240: "Deleted playlists come back next session". PowerSync re-sends every
+ * circuit every cycle, so a playlist deleted in Boardsesh came straight back
+ * as a fresh insert. deletePlaylist records the circuit; applyCircuits drops
+ * its PUTs before anything else reads them.
+ */
+describe('applyCircuits — circuits deleted in Boardsesh (#7240)', () => {
+  const nonReadCalls = (calls: CallRecord[]) =>
+    calls.filter((c) => c.kind !== 'select' && c.kind !== 'deletedLookup' && c.kind !== 'lock');
+
+  it('a deleted circuit produces no insert, adoption, update or climbs write', async () => {
+    const { tx, calls } = createRichTx({
+      deletedUpstreamIds: ['circuit-1'],
+      // If the skip were missing these would drive an adoption of the
+      // same-named legacy row: #1 owner lookup (no row), #2 candidates.
+      selectResults: [[], [{ id: BigInt(7), auroraId: 'circuit-1', name: 'Warmups' }]],
+    });
+
+    const result = await applyCircuits(
+      tx as unknown as ApplyCircuitsTx,
+      'user-1',
+      [makeCircuitPutOp({ circuit_uuid: 'circuit-1', name: 'Warmups' })],
+      [makeCircuitClimbPutOp({ circuit_uuid: 'circuit-1', climb_uuid: 'climb-A', position: 0 })],
+      aliasCacheFor(['climb-A']),
+    );
+
+    expect(nonReadCalls(calls)).toEqual([]);
+    // Not a duplicate-account refusal: nothing should reach sync_error.
+    expect(result.skippedForeignCircuits).toBe(0);
+  });
+
+  it('takes the per-user lock before reading the deleted list, and reads it before the owner lookup', async () => {
+    const { tx, calls } = createRichTx({
+      deletedUpstreamIds: ['circuit-1'],
+      selectResults: [[], []],
+      returningRows: [[{ id: BigInt(99) }]],
+    });
+
+    await applyCircuits(
+      tx as unknown as ApplyCircuitsTx,
+      'user-1',
+      [
+        makeCircuitPutOp({ circuit_uuid: 'circuit-1', name: 'Gone' }),
+        makeCircuitPutOp({ circuit_uuid: 'circuit-2', name: 'Kept' }),
+      ],
+      [],
+      new Map(),
+    );
+
+    expect(calls.map((c) => c.kind).slice(0, 3)).toEqual(['lock', 'deletedLookup', 'select']);
+    const rendered = new PgDialect().sqlToQuery(calls[0].args[0] as never);
+    expect(rendered.params).toContain('user-1');
+  });
+
+  it('still writes the circuits the climber kept in the same snapshot', async () => {
+    const { tx, insertValues } = createRichTx({
+      deletedUpstreamIds: ['circuit-gone'],
+      // Only circuit-kept reaches the owner lookup and the climbs read.
+      selectResults: [[], []],
+      returningRows: [[{ id: BigInt(99) }]],
+    });
+
+    await applyCircuits(
+      tx as unknown as ApplyCircuitsTx,
+      'user-1',
+      [
+        makeCircuitPutOp({ circuit_uuid: 'circuit-gone', name: 'Gone' }),
+        makeCircuitPutOp({ circuit_uuid: 'circuit-kept', name: 'Kept' }),
+      ],
+      [],
+      new Map(),
+    );
+
+    const playlistRows = insertValues
+      .flatMap((rows) => (Array.isArray(rows) ? rows : [rows]))
+      .filter((row) => 'kilterType' in row);
+    expect(playlistRows.map((row) => row.kilterId)).toEqual(['circuit-kept']);
+  });
+
+  it('applies an upstream REMOVE for a deleted circuit and takes no lock for a REMOVE-only batch', async () => {
+    const { tx, calls } = createRichTx({
+      deletedUpstreamIds: ['circuit-X'],
+      selectResults: [[{ upstreamId: 'circuit-X', ownerUserId: 'user-1' }]],
+    });
+
+    await applyCircuits(
+      tx as unknown as ApplyCircuitsTx,
+      'user-1',
+      [{ op_id: '1', op: 'REMOVE', object_type: 'circuits', object_id: 'circuit-X' }],
+      [],
+      new Map(),
+    );
+
+    expect(calls.filter((c) => c.kind === 'delete')).toHaveLength(1);
+    expect(calls.filter((c) => c.kind === 'lock')).toHaveLength(0);
+  });
+
+  it('scopes the deleted-list lookup to this climber, this source and these ids', () => {
+    const { sql: text, params } = deletedUpstreamPlaylistIdsQuery(renderOnlyDb, 'user-1', 'kilter', [
+      'circuit-1',
+      'circuit-2',
+    ]).toSQL();
+
+    expect(text).toContain('"user_deleted_upstream_playlists"."user_id" = $1');
+    expect(text).toContain('"user_deleted_upstream_playlists"."upstream_source" = $2');
+    expect(text).toContain('"user_deleted_upstream_playlists"."upstream_id" in ($3, $4)');
+    expect(params).toEqual(['user-1', 'kilter', 'circuit-1', 'circuit-2']);
   });
 });

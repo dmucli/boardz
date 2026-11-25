@@ -75,6 +75,10 @@ vi.mock('../integrations/credentials', () => ({
 
 // --- provider registry mock -------------------------------------------------
 const uploadSessionActivity = vi.fn();
+const generateSessionSummary = vi.fn();
+vi.mock('../graphql/resolvers/sessions/session-summary', () => ({
+  generateSessionSummary: (...args) => generateSessionSummary(...args),
+}));
 vi.mock('../integrations/registry', async () => {
   const actual = await vi.importActual('../integrations/registry');
   return {
@@ -86,6 +90,11 @@ vi.mock('../integrations/registry', async () => {
     })),
   };
 });
+
+// The stored workout is read through its own module (integration-export-workout.test.ts
+// covers it against the database); here it is absent, so the mocked selects above
+// line up with the export path alone.
+vi.mock('../integrations/export-workout', () => ({ loadExportWorkout: vi.fn(async () => null) }));
 
 import { IntegrationHttpError } from '../integrations/strava';
 import { autoSyncSessionToIntegrations, syncPartySessionForUser } from '../integrations/export-service';
@@ -100,6 +109,9 @@ function resetState() {
   vi.clearAllMocks();
   getFreshAccessToken.mockResolvedValue('access-token');
   recordSyncSuccess.mockResolvedValue(undefined);
+  generateSessionSummary.mockImplementation(async (_sessionId, userId) =>
+    summaryWith([{ userId, sends: 2, attempts: 4 }]),
+  );
 }
 
 function summaryWith(participants, overrides = {}) {
@@ -121,18 +133,18 @@ describe('autoSyncSessionToIntegrations', () => {
   beforeEach(resetState);
 
   it('skips when the summary is missing start/end times', async () => {
-    await autoSyncSessionToIntegrations(
-      'session-1',
+    selectResults.push([{ id: 1n, userId: 'user-1', provider: 'strava', status: 'active', autoSyncEnabled: true }]);
+    generateSessionSummary.mockResolvedValueOnce(
       summaryWith([{ userId: 'user-1', sends: 1, attempts: 1 }], { startedAt: null }),
-      'kilter/1',
     );
-    // No credential lookup, no upload.
+    await autoSyncSessionToIntegrations('session-1', 'kilter/1');
     expect(uploadSessionActivity).not.toHaveBeenCalled();
   });
 
-  it('skips when there are no participants', async () => {
-    await autoSyncSessionToIntegrations('session-1', summaryWith([]), 'kilter/1');
+  it('skips when no opted-in credential belongs to a participant', async () => {
+    await autoSyncSessionToIntegrations('session-1', 'kilter/1');
     expect(uploadSessionActivity).not.toHaveBeenCalled();
+    expect(generateSessionSummary).not.toHaveBeenCalled();
   });
 
   it('uploads only for active, auto-sync-enabled credentials returned by the query', async () => {
@@ -155,11 +167,7 @@ describe('autoSyncSessionToIntegrations', () => {
       url: 'https://www.strava.com/activities/111',
     });
 
-    await autoSyncSessionToIntegrations(
-      'session-1',
-      summaryWith([{ userId: 'user-1', sends: 2, attempts: 4 }]),
-      'kilter/1',
-    );
+    await autoSyncSessionToIntegrations('session-1', 'kilter/1');
 
     expect(uploadSessionActivity).toHaveBeenCalledTimes(1);
     // A success export row was upserted.
@@ -200,14 +208,7 @@ describe('autoSyncSessionToIntegrations', () => {
       .mockRejectedValueOnce(new Error('transient failure'))
       .mockResolvedValueOnce({ externalActivityId: '222', url: 'https://www.strava.com/activities/222' });
 
-    await autoSyncSessionToIntegrations(
-      'session-1',
-      summaryWith([
-        { userId: 'user-1', sends: 1, attempts: 1 },
-        { userId: 'user-2', sends: 2, attempts: 2 },
-      ]),
-      'kilter/1',
-    );
+    await autoSyncSessionToIntegrations('session-1', 'kilter/1');
 
     expect(uploadSessionActivity).toHaveBeenCalledTimes(2);
     // user-1 got an error export row; user-2 got a success export row.
@@ -230,11 +231,7 @@ describe('autoSyncSessionToIntegrations', () => {
     ]);
     uploadSessionActivity.mockRejectedValueOnce(new IntegrationHttpError('unauthorized', 401));
 
-    await autoSyncSessionToIntegrations(
-      'session-1',
-      summaryWith([{ userId: 'user-1', sends: 1, attempts: 1 }]),
-      'kilter/1',
-    );
+    await autoSyncSessionToIntegrations('session-1', 'kilter/1');
 
     // Error export row recorded.
     expect(insertCalls.some((call) => call.values.status === 'error')).toBe(true);

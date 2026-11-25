@@ -1,0 +1,209 @@
+import Link from '@mui/material/Link';
+import { parsePartnerOAuthMode } from '@boardsesh/auth-protocol/partner-oauth-mode';
+import { buildAppHandoffUrl } from '@/app/lib/app-handoff';
+import { createPageMetadata } from '@/app/lib/seo/metadata';
+import { getServerTranslation } from '@/app/lib/i18n/server';
+import { SUPPORT_CURRENCIES, hasMonthlyLinks, readSupportLinksConfig } from '@/app/support/support-links';
+import { PageShell, PageSection, Prose } from '@/app/components/ui/page-shell';
+
+export async function generateMetadata() {
+  const { t, locale } = await getServerTranslation('marketing');
+  return createPageMetadata({
+    title: t('metadata.privacy.title'),
+    description: t('metadata.privacy.description'),
+    path: '/privacy',
+    locale,
+  });
+}
+
+export default async function PrivacyPolicyPage() {
+  const { t } = await getServerTranslation('marketing');
+  // Apps can connect only once this web service's PARTNER_OAUTH_MODE is on, so
+  // the section describing them appears with them. DRAFT (#6981 F18): the
+  // wording waits for the owner's approval, which is also a launch gate.
+  const supportLinks = readSupportLinksConfig();
+  const cardGivingAvailable =
+    hasMonthlyLinks(supportLinks) || SUPPORT_CURRENCIES.some((currency) => Boolean(supportLinks.once[currency]));
+  const partnerAppsOn = parsePartnerOAuthMode(process.env.PARTNER_OAUTH_MODE) !== 'off';
+  return (
+    <PageShell title={t('privacy.title')} lead={t('privacy.lastUpdated')}>
+      <PageSection>
+        <Prose>{t('privacy.intro1')}</Prose>
+        <Prose>{t('privacy.operator')}</Prose>
+        <Prose>{t('funding.body')}</Prose>
+        <Prose>{t('privacy.intro2ProductAnalytics')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.collect.title')}>
+        <Prose>
+          <strong>{t('privacy.collect.accountLabel')}</strong> {t('privacy.collect.accountBody')}
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.collect.activityLabel')}</strong> {t('privacy.collect.activityBody')}
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.collect.locationLabel')}</strong> {t('privacy.collect.locationBody')}
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.collect.productAnalyticsLabel')}</strong> {t('privacy.collect.productAnalyticsBody')}
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.collect.adMeasurementLabel')}</strong> {t('privacy.collect.adMeasurementBody')}
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.collect.serviceStatsLabel')}</strong> {t('privacy.collect.serviceStatsBody')}
+        </Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.boardAccounts.title')}>
+        <Prose>{t('privacy.boardAccounts.sync')}</Prose>
+        <Prose>{t('privacy.boardAccounts.credentials')}</Prose>
+        <Prose>{t('privacy.boardAccounts.legalBasis')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.bluetooth.title')}>
+        <Prose>{t('privacy.bluetooth.body')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.location.title')}>
+        <Prose>{t('privacy.location.body1')}</Prose>
+        <Prose>{t('privacy.location.body2')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.sprayPhotos.title')}>
+        <Prose>{t('privacy.sprayPhotos.body1')}</Prose>
+        <Prose>{t('privacy.sprayPhotos.body2')}</Prose>
+        <Prose>{t('privacy.sprayPhotos.body3')}</Prose>
+        <Prose>{t('privacy.sprayPhotos.body4')}</Prose>
+        <Prose>{t('privacy.sprayPhotos.body5')}</Prose>
+      </PageSection>
+
+      {partnerAppsOn ? (
+        <PageSection title={t('privacy.connectedApps.title')}>
+          <Prose>{t('privacy.connectedApps.intro')}</Prose>
+          <Prose>{t('privacy.connectedApps.whatItGets')}</Prose>
+          <Prose>{t('privacy.connectedApps.afterSharing')}</Prose>
+          <Prose>{t('privacy.connectedApps.disconnect')}</Prose>
+        </PageSection>
+      ) : null}
+
+      <PageSection title={t('privacy.thirdParty.title')}>
+        <Prose>
+          <strong>{t('privacy.thirdParty.hostingLabel')}</strong> {t('privacy.thirdParty.hostingBody')}
+          <Link href="https://railway.com/legal/privacy" target="_blank" rel="noopener">
+            {t('privacy.thirdParty.hostingLink')}
+          </Link>
+          {' / '}
+          <Link href="https://www.cloudflare.com/privacypolicy/" target="_blank" rel="noopener">
+            {t('privacy.thirdParty.cloudflareLink')}
+          </Link>
+          .
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.thirdParty.posthogLabel')}</strong> {t('privacy.thirdParty.posthogBody')}
+          <Link href="https://posthog.com/privacy" target="_blank" rel="noopener">
+            {t('privacy.thirdParty.posthogLink')}
+          </Link>
+          .
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.thirdParty.adPixelsLabel')}</strong> {t('privacy.thirdParty.adPixelsBody')}
+          <Link href="https://www.facebook.com/privacy/policy/" target="_blank" rel="noopener">
+            {t('privacy.thirdParty.metaLink')}
+          </Link>
+          {t('privacy.thirdParty.adPixelsJoin')}
+          <Link href="https://www.reddit.com/policies/privacy-policy" target="_blank" rel="noopener">
+            {t('privacy.thirdParty.redditLink')}
+          </Link>
+          {t('privacy.thirdParty.adPixelsBodyEnd')}
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.thirdParty.sentryLabel')}</strong> {t('privacy.thirdParty.sentryBody')}
+          <Link href="https://sentry.io/privacy/" target="_blank" rel="noopener">
+            {t('privacy.thirdParty.sentryLink')}
+          </Link>
+          .
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.thirdParty.expoLabel')}</strong> {t('privacy.thirdParty.expoBody')}
+          <Link href="https://docs.expo.dev/eas/observe/configuration/" target="_blank" rel="noopener">
+            {t('privacy.thirdParty.expoLink')}
+          </Link>
+          .
+        </Prose>
+        {cardGivingAvailable ? (
+          <Prose>
+            <strong>{t('privacy.thirdParty.stripeLabel')}</strong> {t('privacy.thirdParty.stripeBody')}
+            <Link href="https://stripe.com/privacy" target="_blank" rel="noopener">
+              {t('privacy.thirdParty.stripeLink')}
+            </Link>
+            .
+          </Prose>
+        ) : null}
+      </PageSection>
+
+      <PageSection title={t('privacy.choices.title')}>
+        <Prose>{t('privacy.choices.storageBody')}</Prose>
+        <Prose>{t('privacy.choices.adCookiesBody')}</Prose>
+        <Prose>{t('privacy.choices.changeBody')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.sharing.title')}>
+        <Prose>{t('privacy.sharing.body1ProductAnalytics')}</Prose>
+        <Prose>{t('privacy.sharing.body2')}</Prose>
+        <Prose>{t('privacy.sharing.body3SprayPhotos')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.retention.title')}>
+        <Prose>{t('privacy.retention.body')}</Prose>
+        <Prose>{t('privacy.retention.donations')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.deletion.title')}>
+        <Prose>{t('privacy.deletion.intro')}</Prose>
+        <Prose>
+          <strong>{t('privacy.deletion.inApp')}</strong>
+          {t('privacy.deletion.inAppBody')}
+        </Prose>
+        <Prose>
+          <strong>{t('privacy.deletion.onWeb')}</strong>
+          {t('privacy.deletion.onWebBody')}
+          {/* W-21 (#4440) moved account deletion off www's /settings and into the
+              app's settings screen, so the policy's stated web route points at
+              the app origin now. Legally load-bearing copy — keep it matching
+              the button that actually exists, and the steps around it matching
+              how a climber actually reaches it (avatar → Settings, since
+              settings left the You tab). */}
+          <Link href={buildAppHandoffUrl('/settings')} target="_blank" rel="noopener">
+            {t('privacy.deletion.onWebLink')}
+          </Link>
+          {t('privacy.deletion.onWebBodyEnd')}
+        </Prose>
+        <Prose>{t('privacy.deletion.permanent')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.children.title')}>
+        <Prose>{t('privacy.children.body')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.changes.title')}>
+        <Prose>{t('privacy.changes.body')}</Prose>
+      </PageSection>
+
+      <PageSection title={t('privacy.contact.title')}>
+        <Prose>
+          {t('privacy.contact.body1Start')}
+          <Link href="mailto:support@boardsesh.com">{t('privacy.contact.body1Email')}</Link>
+          {t('privacy.contact.body1End')}
+        </Prose>
+        <Prose>
+          {t('privacy.contact.body2Start')}
+          <Link href="https://github.com/boardsesh/boardsesh" target="_blank" rel="noopener">
+            {t('privacy.contact.body2Link')}
+          </Link>
+          {t('privacy.contact.body2End')}
+        </Prose>
+      </PageSection>
+    </PageShell>
+  );
+}

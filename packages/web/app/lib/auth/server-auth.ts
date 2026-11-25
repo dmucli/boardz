@@ -1,9 +1,8 @@
 import 'server-only';
-import { cookies } from 'next/headers';
+import { getAdmittedRawServerToken } from './admitted-session.server';
 
+/** Forward only an admitted legacy credential or a backend-issued selected
+ * browser lease. An opaque source token is never forwarded or read from a SID. */
 export async function getServerAuthToken(): Promise<string | undefined> {
-  const cookieStore = await cookies();
-  return (
-    cookieStore.get('__Secure-next-auth.session-token')?.value ?? cookieStore.get('next-auth.session-token')?.value
-  );
+  return getAdmittedRawServerToken();
 }

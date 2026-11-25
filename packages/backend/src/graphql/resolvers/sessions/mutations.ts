@@ -1,4 +1,17 @@
+import { projectSessionBoardPath } from '../../../services/board-session-privacy';
+import {
+  resolveLockedSessionBoardId,
+  resolveSessionBoardId,
+  SESSION_BOARD_LOCK_TIMEOUT_MS,
+  lockSessionCreatorBeforeBoards,
+} from '../../../services/session-board-binding';
+import { lockActiveBoardForWrite } from '../../../services/board-reference-lock';
+import type { DbTransaction } from '../../../db/after-commit';
+import { canAccessResourceWithoutLink } from '../../../services/privacy';
+import { getPrivacySettings, legacyResourceAudience } from '../../../services/privacy';
+import { resourcePrivacy } from '@boardsesh/db/schema';
 import { v4 as uuidv4 } from 'uuid';
+import { GraphQLError } from 'graphql';
 import * as Sentry from '@sentry/node';
 import type { ConnectionContext, SessionEvent, ClimbQueueItem } from '@boardsesh/shared-schema';
 import { roomManager } from '../../../services/room-manager';
@@ -22,6 +35,8 @@ import {
   RATE_LIMIT_END_SESSION_OP,
   RATE_LIMIT_CONFIRM_CLIMB_ON_WALL,
   RATE_LIMIT_CONFIRM_CLIMB_ON_WALL_OP,
+  RATE_LIMIT_REST_CADENCE,
+  RATE_LIMIT_REST_CADENCE_OP,
 } from '../shared/helpers';
 import {
   SessionIdSchema,
@@ -35,20 +50,34 @@ import {
   ClimbQueueItemSchema,
   ClimbUuidSchema,
   BoardSerialSchema,
+  SessionRestCadenceInputSchema,
+  QueueIndexSchema,
 } from '../../../validation/schemas';
 import { logger } from '../../../utils/logger';
 import { markErrorReported } from '../../../utils/sentry-dedupe';
 import type { CreateSessionInput } from '../shared/types';
-import { db } from '../../../db/client';
-import { esp32Controllers, userBoards } from '@boardsesh/db/schema/app';
+import { db, runWithDatabaseTransaction } from '../../../db/client';
+import { esp32Controllers } from '@boardsesh/db/schema/app';
 import { sessionBoards, sessions } from '../../../db/schema';
-import { eq, inArray } from 'drizzle-orm';
+import {
+  AppWorkoutError,
+  prepareAppWorkoutSessionStart,
+  attachLockedAppWorkout,
+} from '../../../services/public-api/workouts';
+import { appWorkoutGraphError } from '../app-workouts/errors';
+import { parseAppWorkoutSeed, persistInitialAppWorkoutSeed } from '../../../services/public-api/workout-seed';
+import type { PartnerDatabase } from '../../../auth/partner/tables';
+import { readPartnerOAuthMode } from '../../../auth/partner/mode';
+import { eq } from 'drizzle-orm';
 import { generateSessionSummary } from './session-summary';
 import { autoSyncSessionToIntegrations } from '../../../integrations/export-service';
 import { normalizeIanaTimezone } from '../../../utils/timezone';
 import { endLiveActivity } from '../../../services/apns';
 import { buildSessionPayload } from './helpers';
+import { buildRestCadenceChange } from '../../../services/rest-cadence';
 import { logMutationMetrics } from '../queue/mutation-metrics';
+import { isNowSlotSession } from '../../../services/queue-now-slot-rollout';
+import { composeQueuePayload, maxPayloadItems } from '../queue/now-slot-payload';
 
 /**
  * `isLeader` audit (always-live sessions):
@@ -104,6 +133,7 @@ export const sessionMutations = {
       initialQueue,
       initialCurrentClimb,
       sessionName,
+      initialHistoryCount,
     }: {
       sessionId: string;
       boardPath: string;
@@ -113,6 +143,7 @@ export const sessionMutations = {
       initialQueue?: ClimbQueueItem[];
       initialCurrentClimb?: ClimbQueueItem;
       sessionName?: string;
+      initialHistoryCount?: number | null;
     },
     ctx: ConnectionContext,
   ) => {
@@ -130,6 +161,14 @@ export const sessionMutations = {
     if (avatarUrl) validateInput(AvatarUrlSchema, avatarUrl, 'avatarUrl');
     if (participantId) validateInput(ParticipantIdSchema, participantId, 'participantId');
     if (sessionName) validateInput(SessionNameSchema, sessionName, 'sessionName');
+    // F3: the seed's line goes through `QueueIndexSchema`, then
+    // `composeQueuePayload` clamps it. The caps apply when the seed carries a
+    // line, and to every seed inside `QUEUE_NOW_SLOT_PERCENT`.
+    const historyCountInput =
+      initialHistoryCount === undefined || initialHistoryCount === null
+        ? null
+        : validateInput(QueueIndexSchema, initialHistoryCount, 'initialHistoryCount');
+    const capsApply = historyCountInput !== null || isNowSlotSession(sessionId);
 
     // Validate the seed queue tolerantly — one malformed/legacy item must not
     // sink the whole join. Same class of bug as setQueue (issue #3857): a
@@ -138,7 +177,14 @@ export const sessionMutations = {
     let seedQueue: ClimbQueueItem[] | undefined;
     if (initialQueue) {
       const seedValidationStartTime = performance.now();
-      const { items, droppedCount } = parseArrayTolerant(ClimbQueueItemSchema, initialQueue, 'initialQueue', 500);
+      // Outside the caps the guard is 501 when the seed's current climb is in
+      // it, else 500: the climb on the wall doesn't count (section 5).
+      const { items, droppedCount } = parseArrayTolerant(
+        ClimbQueueItemSchema,
+        initialQueue,
+        'initialQueue',
+        maxPayloadItems(initialQueue, initialCurrentClimb, capsApply),
+      );
       // ClimbQueueItemSchema's `.nullish()` fields infer as `T | null | undefined`,
       // one shade looser than the hand-written `ClimbQueueItem` type (`T | null`)
       // — both mean "absent" downstream, so the cast is safe (see setQueue).
@@ -166,16 +212,31 @@ export const sessionMutations = {
         initialCurrentClimb,
         'initialCurrentClimb',
       ) as ClimbQueueItem;
-      // A current-climb pointer whose slot didn't survive tolerant parsing
-      // would dangle — only check membership when we actually filtered a
-      // seed queue; a caller seeding just a current climb (no queue) is an
-      // existing, independently-valid combination.
-      if (seedQueue && !seedQueue.some((item) => item.uuid === seedCurrentClimb?.uuid)) {
-        logger.warn(
-          `[joinSession] initialCurrentClimb uuid not present in the (post-filter) initialQueue for session ${sessionId} — clearing seed current climb instead of leaving a dangling pointer.`,
+    }
+
+    // Invariant 1 of F3, at every percent: a seed current climb missing from
+    // the seed queue (it didn't survive tolerant parsing, or an old solo
+    // snapshot never held it) is inserted at the line instead of being
+    // cleared, and a seed of only a current climb becomes `[current]` instead
+    // of being dropped. Seeds apply only to a brand-new room, so there is no
+    // stored History: with nothing current and no line, the line is 0.
+    let seedHistoryCount = 0;
+    if (seedQueue || seedCurrentClimb) {
+      const composed = composeQueuePayload({
+        queue: seedQueue ?? [],
+        currentClimbQueueItem: seedCurrentClimb,
+        historyCountInput,
+        stored: null,
+        capsApply,
+      });
+      if (composed.orphanInserted) {
+        logger.info(
+          `[joinSession] Inserted initialCurrentClimb at the History / Up next line for session ${sessionId} instead of clearing it (F3).`,
         );
-        seedCurrentClimb = null;
       }
+      seedQueue = composed.queue;
+      seedCurrentClimb = composed.currentClimbQueueItem;
+      seedHistoryCount = composed.historyCount;
     }
 
     const result = await roomManager.joinSession(
@@ -188,6 +249,8 @@ export const sessionMutations = {
       seedCurrentClimb,
       sessionName || undefined,
       participantId || undefined,
+      undefined, // isPublic: only createSession sets it
+      seedHistoryCount,
     );
     if (DEBUG)
       logger.info(
@@ -232,6 +295,9 @@ export const sessionMutations = {
         stateHashOrdered: result.stateHashOrdered,
         queue: result.queue,
         currentClimbQueueItem: result.currentClimbQueueItem,
+        historyCount: result.historyCount,
+        currentChangedAt: result.currentChangedAt,
+        currentChangedBy: result.currentChangedBy ?? null,
       },
       isLeader: result.isLeader,
       clientId: result.clientId,
@@ -255,14 +321,121 @@ export const sessionMutations = {
 
       // Validate input
       validateInput(CreateSessionInputSchema, input, 'createSession input');
+      if (input.appWorkoutId) {
+        requireAuthenticated(ctx);
+        const mode = readPartnerOAuthMode();
+        if (mode === 'off' || mode === 'hold')
+          throw new GraphQLError('Partner workouts are unavailable.', { extensions: { code: 'SERVICE_UNAVAILABLE' } });
+        if (input.isPermanent)
+          throw new GraphQLError('Start a personal session to use this workout.', {
+            extensions: { code: 'CONFLICT', reason: 'APP_WORKOUT_PERMANENT_SESSION' },
+          });
+      }
+      if (input.discoverable) requireAuthenticated(ctx);
 
       // Generate a unique session ID
       const sessionId = uuidv4();
       if (DEBUG) logger.info(`[createSession] Generated sessionId: ${sessionId}`);
 
-      // Absent or null means public — the pre-existing behaviour every client
-      // that predates the privacy switch relies on.
-      const isPublic = input.isPublic !== false;
+      // Legacy callers keep the public default until an account selects a
+      // restrictive audience. An old isPublic:true is not new public consent,
+      // and an old isPublic:false means unlisted: off the listings, the invite
+      // link still joins. Only an explicit audience asks for invite-only.
+      const defaults = ctx.userId ? await getPrivacySettings(ctx.userId) : null;
+      const defaultAudience = defaults?.defaultSessionAudience ?? 'public';
+      const audience =
+        input.audience ??
+        (input.isPublic === false ? legacyResourceAudience(defaultAudience, 'unlisted', 'session') : defaultAudience);
+      const isPublic = audience === 'public';
+      if (!isPublic) requireAuthenticated(ctx);
+      // Persist the audience before exposing the ID or publishing a live roster.
+      const replayedSession = await runWithDatabaseTransaction(async (executor) => {
+        const tx = executor as unknown as DbTransaction;
+        const attachedIds = [...new Set(input.boardIds ?? [])];
+        const boardId = attachedIds.length
+          ? await resolveSessionBoardId(input.boardPath, ctx.userId)
+          : await resolveLockedSessionBoardId(tx, input.boardPath, ctx.userId);
+        if (attachedIds.length) {
+          await lockSessionCreatorBeforeBoards(tx, ctx.userId);
+          const boards = [];
+          const lockedIds = [...new Set([...attachedIds, ...(boardId === null ? [] : [boardId])])];
+          for (const attachedId of lockedIds.sort((first, second) => first - second)) {
+            const board = await lockActiveBoardForWrite(
+              tx,
+              { id: attachedId },
+              { lockTimeoutMs: SESSION_BOARD_LOCK_TIMEOUT_MS },
+            );
+            if (!board) throw new Error('One or more board IDs do not exist');
+            if (attachedIds.includes(attachedId)) boards.push(board);
+          }
+          if ((await resolveSessionBoardId(input.boardPath, ctx.userId)) !== boardId)
+            throw new Error('One or more board IDs do not exist');
+          // A numeric board id is a sequential bigserial anyone can count, so it is
+          // never a board's link: each attached board takes the no-link reading.
+          // The one exception is the board the session path itself named, which
+          // `resolveSessionBoardId` already admitted through its link.
+          if (
+            boards.length !== attachedIds.length ||
+            (
+              await Promise.all(
+                boards.map(
+                  async (board) =>
+                    Number(board.id) === boardId || canAccessResourceWithoutLink('board', board.uuid, ctx.userId),
+                ),
+              )
+            ).some((allowed) => !allowed)
+          ) {
+            throw new Error('One or more board IDs do not exist');
+          }
+          if (new Set(boards.map((board) => board.gymId).filter(Boolean)).size > 1)
+            throw new Error('All boards must belong to the same gym for multi-board sessions');
+        }
+
+        const partnerTransaction = tx as unknown as PartnerDatabase;
+        const preparedWorkout = input.appWorkoutId
+          ? await prepareAppWorkoutSessionStart(partnerTransaction, ctx.userId!, input.appWorkoutId, sessionId)
+          : null;
+        if (preparedWorkout?.existingSession) {
+          if (preparedWorkout.existingSession.boardPath !== input.boardPath)
+            throw new GraphQLError('This workout is already running on another board. Open its session to resume.', {
+              extensions: { code: 'CONFLICT' },
+            });
+          return preparedWorkout.existingSession;
+        }
+        const appWorkout = preparedWorkout?.workout ?? null;
+        await tx.insert(sessions).values({
+          id: sessionId,
+          boardPath: input.boardPath,
+          boardId,
+          createdByUserId: ctx.userId ?? null,
+          name: input.name ?? null,
+          isPublic,
+          startedAt: new Date(),
+        });
+        if (attachedIds.length)
+          await tx.insert(sessionBoards).values(attachedIds.map((boardId) => ({ sessionId, boardId })));
+        // Omitted modern controls leave legacy visibility switches reversible.
+        // Account-selected restrictions remain protected even on an old client.
+        if (ctx.userId && (input.audience != null || defaultAudience !== 'public'))
+          await tx
+            .insert(resourcePrivacy)
+            .values({ kind: 'session', resourceId: sessionId, ownerId: ctx.userId, audience });
+        if (appWorkout) await attachLockedAppWorkout(partnerTransaction, appWorkout, sessionId);
+        if (appWorkout && input.appWorkoutSeed != null)
+          await persistInitialAppWorkoutSeed(
+            partnerTransaction,
+            appWorkout,
+            sessionId,
+            parseAppWorkoutSeed(input.appWorkoutSeed),
+          );
+        return null;
+      });
+      if (replayedSession)
+        return buildSessionPayload(replayedSession.id, ctx, {
+          sessionData: replayedSession,
+          isLeader: false,
+          clientId: '',
+        });
 
       if (input.discoverable) {
         // Discoverable sessions require authentication (they write to DB with userId)
@@ -281,33 +454,6 @@ export const sessionMutations = {
           input.color,
           isPublic,
         );
-
-        // If boardIds provided, create sessionBoards junction rows
-        if (input.boardIds && input.boardIds.length > 0) {
-          // Verify boards exist
-          const boards = await db
-            .select({ id: userBoards.id, gymId: userBoards.gymId })
-            .from(userBoards)
-            .where(inArray(userBoards.id, input.boardIds));
-
-          if (boards.length !== input.boardIds.length) {
-            throw new Error('One or more board IDs do not exist');
-          }
-
-          // Validate all boards share the same gym (multi-board requires same gym)
-          const gymIds = new Set(boards.map((b) => b.gymId).filter(Boolean));
-          if (gymIds.size > 1) {
-            throw new Error('All boards must belong to the same gym for multi-board sessions');
-          }
-
-          // Insert junction rows
-          await db.insert(sessionBoards).values(
-            input.boardIds.map((boardId) => ({
-              sessionId,
-              boardId,
-            })),
-          );
-        }
       }
 
       // For HTTP requests (stateless), skip joining the session in-memory.
@@ -346,6 +492,9 @@ export const sessionMutations = {
             stateHashOrdered: result.stateHashOrdered,
             queue: result.queue,
             currentClimbQueueItem: result.currentClimbQueueItem,
+            historyCount: result.historyCount,
+            currentChangedAt: result.currentChangedAt,
+            currentChangedBy: result.currentChangedBy ?? null,
           },
           isLeader: result.isLeader,
           // No board has been paired yet; gets set the first time anyone in the
@@ -384,6 +533,8 @@ export const sessionMutations = {
         await ensureSessionRecordExists(sessionId, input.boardPath, ctx.userId ?? null, input.name, false);
       }
 
+      if (input.appWorkoutId && input.appWorkoutSeed != null)
+        return buildSessionPayload(sessionId, ctx, { isLeader: false, clientId: '' });
       return {
         id: sessionId,
         name: input.name || null,
@@ -408,6 +559,8 @@ export const sessionMutations = {
         createdByUserId: ctx.userId ?? null,
       };
     } catch (err) {
+      if (err instanceof AppWorkoutError) throw appWorkoutGraphError(err);
+      if (err instanceof GraphQLError) throw err;
       // Rate-limit hits are expected abuse-protection noise, not a session-start
       // bug — let them flow through without a Sentry event.
       if (err instanceof Error && err.message.startsWith('Rate limit exceeded')) throw err;
@@ -639,7 +792,7 @@ export const sessionMutations = {
   },
 
   /**
-   * Broadcast a boardPath update (today: angle changes) to every session
+   * Broadcast an angle or authorized board switch to every session
    * participant. Any participant may call — angle is presentational and
    * doesn't drive BLE (hold positions ride on the climb, not the boardPath).
    * Idempotent: if the stored boardPath already matches, no event fires.
@@ -659,14 +812,7 @@ export const sessionMutations = {
     }
     const participantId = ctx.participantId;
 
-    const previousBoardPath = await roomManager.updateSessionBoardPathIfChanged(sessionId, boardPath);
-    if (previousBoardPath !== null) {
-      pubsub.publishSessionEvent(sessionId, {
-        __typename: 'SessionBoardPathChanged',
-        boardPath,
-        changedByParticipantId: participantId,
-      });
-    }
+    await roomManager.updateSessionBoardPathIfChanged(sessionId, boardPath, ctx.userId, participantId);
 
     // Return the resolved Session. Fan independent reads in parallel —
     // matches setSessionBoardSerial's shape.
@@ -692,7 +838,10 @@ export const sessionMutations = {
     return {
       id: sessionId,
       name: sessionData.name || null,
-      boardPath: sessionData.boardPath,
+      // A concurrent changer may have installed another path after our write.
+      boardPath: await projectSessionBoardPath(sessionData.boardPath, ctx.userId, {
+        presentedByViewer: sessionData.boardPath === boardPath,
+      }),
       users,
       queueState: {
         sequence: queueState.sequence,
@@ -700,6 +849,9 @@ export const sessionMutations = {
         stateHashOrdered: queueState.stateHashOrdered,
         queue: queueState.queue,
         currentClimbQueueItem: queueState.currentClimbQueueItem,
+        historyCount: queueState.historyCount,
+        currentChangedAt: queueState.currentChangedAt,
+        currentChangedBy: queueState.currentChangedBy ?? null,
       },
       isLeader: leaderConnectionId === ctx.connectionId,
       lastConnectedBoardSerial,
@@ -717,6 +869,64 @@ export const sessionMutations = {
       // non-member redaction).
       createdByUserId: sessionData.createdByUserId ?? null,
     };
+  },
+
+  /**
+   * Change the session's shared rest clock (#5382). Any session participant
+   * may call: the crew clock is shared the way the wall is. The server stamps
+   * every instant from its own clock and records `ctx.participantId` verbatim
+   * as `setByParticipantId` on ARM and CONFIGURE (it is already the session
+   * HMAC, or an anonymous connection id, exactly what peers see as
+   * `SessionUser.id`). Every write is a compare-and-set on the per-session
+   * revision; FIRE must carry `expectedRevision` and applies only for a due
+   * beat later than the last one fired, so each beat moves the wall at most
+   * once. `SessionRestCadenceChanged` is published when the call
+   * applied, so a lost race or a no-op reaches nobody but the caller, who gets
+   * the state that won. The one exception is a caller whose expectedRevision is
+   * above the stored one: the store lost state, so the stored clock goes out
+   * to the whole crew as a snapshot that resets every phone's revision floor.
+   * Session identity comes from the WebSocket connection context — no
+   * `sessionId` argument.
+   */
+  setSessionRestCadence: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
+    // Its own bucket, so a runaway rest timer cannot starve climb switching.
+    await applyRateLimit(ctx, RATE_LIMIT_REST_CADENCE, RATE_LIMIT_REST_CADENCE_OP);
+    const sessionId = requireSession(ctx);
+    // Authorize before parsing: a connection that is not a member gets the
+    // membership error whatever it sends.
+    await requireSessionMember(ctx, sessionId);
+    const validInput = validateInput(SessionRestCadenceInputSchema, input, 'input');
+
+    // Hard-error when ctx.participantId is missing, before any write — same
+    // reasoning as confirmClimbOnWall: connection ids rotate on reconnect.
+    if (!ctx.participantId) {
+      throw new Error('setSessionRestCadence requires ctx.participantId; refusing to fall back to connectionId.');
+    }
+
+    // One clock read for the write and the reply. A client calibrates its
+    // offset on the reply's serverNow and applies it to the anchors inside it,
+    // so both must come from the same instant; a second read after the store
+    // write would skew every offset by the write's latency.
+    const nowMs = Date.now();
+    const { applied, rewound, stored } = await roomManager.updateSessionRestCadence(
+      sessionId,
+      validInput,
+      ctx.participantId,
+      nowMs,
+    );
+    const change = buildRestCadenceChange(stored, {
+      // Every phone drops a revision at or below the one it holds unless the
+      // event is a snapshot. After the store lost state, the crew's floors sit
+      // above anything the store holds, so only a snapshot reaches them.
+      isSnapshot: rewound,
+      action: applied ? validInput.action : null,
+      // The live branch of sessionUpdates re-stamps this at delivery.
+      serverNowMs: nowMs,
+    });
+    if (applied || rewound) {
+      pubsub.publishSessionEvent(sessionId, change);
+    }
+    return { applied, change };
   },
 
   /**
@@ -834,22 +1044,11 @@ export const sessionMutations = {
     // connected external integration (Strava) that has auto-sync on. Never
     // blocks or fails the endSession response — failures are logged inside the
     // service and here as a backstop.
-    // No summary (no recorded activity) means there is nothing to export —
-    // skip the dispatch entirely so the catch below can never misattribute
-    // that case as a failure.
-    if (summary) {
-      // Generated again with NO viewer, because this copy is written into every
-      // participant's Strava activity: the ender's private-wall climb name is not
-      // theirs to receive. Only the response above is viewer-scoped.
-      const exportableSummary = await generateSessionSummary(sessionId, null);
-      if (exportableSummary) {
-        autoSyncSessionToIntegrations(sessionId, exportableSummary, sessionData.boardPath, normalizedTimezone).catch(
-          (error: unknown) => {
-            logger.error(`[Integrations] auto-sync dispatch failed for session ${sessionId}:`, error);
-          },
-        );
-      }
-    }
+    // Each recipient gets their own authorized summary. Neither the ender's
+    // permissions nor anonymous visibility determine another climber's opt-in.
+    autoSyncSessionToIntegrations(sessionId, sessionData.boardPath, normalizedTimezone).catch((error: unknown) => {
+      logger.error(`[Integrations] auto-sync dispatch failed for session ${sessionId}:`, error);
+    });
 
     return summary;
   },

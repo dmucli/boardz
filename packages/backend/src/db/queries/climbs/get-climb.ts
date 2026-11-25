@@ -83,11 +83,14 @@ export const getClimbByUuid = async (params: GetClimbParams): Promise<Climb | nu
       // client-side, and on Woods it is the only signal separating the 8x10
       // from the 12x12 (their hold ids overlap as different holds).
       compatible_size_ids: tables.climbs.compatibleSizeIds,
+      required_set_ids: tables.climbs.requiredSetIds,
       // How many of the climb's holds have come off the wall. Spray walls only —
       // NULL on every catalogue board, where holds do not come off — and the badge,
       // the Intact / Lost holds filter and the remix prompt all read it, so a
       // projection without it tells a climber that a climb they cannot do is fine.
       missing_hold_count: tables.climbs.missingHoldCount,
+      revision_number: tables.climbs.revisionNumber,
+      holds_revision_number: tables.climbs.holdsRevisionNumber,
       // Boardsesh grade at the angle the stats resolved to (the requested angle
       // unless cross-angle sent it to the set angle). The queue's angle-change
       // refetch routes through this query, so the fresh grade rides along free.
@@ -153,7 +156,7 @@ export const getClimbByUuid = async (params: GetClimbParams): Promise<Climb | nu
       // either angle — a genuine project.
       statsAngle: row.stats_angle ?? null,
       ascensionist_count: Number(row.ascensionist_count || 0),
-      difficulty: getGradeLabel(row.difficulty_id),
+      difficulty: getGradeLabel(row.difficulty_id, params.board_name),
       quality_average: row.quality_average?.toString() || '0',
       stars: getClimbStars(row.quality_average),
       difficulty_error: row.difficulty_error?.toString() || '0',
@@ -167,7 +170,10 @@ export const getClimbByUuid = async (params: GetClimbParams): Promise<Climb | nu
       framesPace: row.frames_pace ?? null,
       characteristics: row.characteristics ?? null,
       compatibleSizeIds: row.compatible_size_ids ?? null,
+      requiredSetIds: row.required_set_ids ?? null,
       missingHoldCount: row.missing_hold_count ?? null,
+      revisionNumber: row.revision_number ?? null,
+      holdsRevisionNumber: row.holds_revision_number ?? null,
       boardseshDifficulty: row.boardsesh_difficulty == null ? null : Number(row.boardsesh_difficulty),
       boardseshConfidence: toConfidenceTier(row.boardsesh_confidence),
     };

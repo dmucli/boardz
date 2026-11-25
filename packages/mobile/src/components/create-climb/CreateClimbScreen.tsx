@@ -1,28 +1,31 @@
-import { useCallback, useMemo, useState } from 'react';
-import { View, StyleSheet } from 'react-native';
+import type { WindowAnchorPoint } from '../navigation/AnchoredPopover.types';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { BackHandler, View, StyleSheet, type ViewInstance } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
+import { useIsFocused, useRouter } from 'expo-router';
 import { useTranslation } from 'react-i18next';
 import type { BoardName, Climb } from '@boardsesh/shared-schema';
 import { Text } from '../Text';
+import { Button } from '../Button';
 import { Icon } from '../Icon';
 import { useTheme } from '../../providers/theme-provider';
 import { useDrawerHost } from '../../providers/drawer-host-provider';
 import { openClimbInPlayDrawer } from '../../lib/open-climb-in-play-drawer';
 import { getCreateBoardHolds } from '../../lib/create-board-holds';
-import { getDifficultyIdForGradeName } from '../../lib/grade-label';
 import { useSprayWall } from '../../lib/spray/use-spray-wall';
 import { useSprayWallToken } from '../../lib/spray/use-spray-wall-token';
-import { isSprayBoard, shouldAwaitWall } from './spray-climb-rules';
+import { subscribeToSprayWalls } from '../../lib/spray/spray-wall-registry';
+import { sprayHoldEditorHref } from '../../lib/spray/spray-routes';
+import { editableSprayWallUuidFor, isSprayBoard, shouldAwaitWall } from './spray-climb-rules';
 import { ActivityIndicator } from '../ActivityIndicator';
 import { spacing } from '../../theme/tokens';
-import { iosSystemColors } from '../../theme/ios-colors';
 import { HoldRoleSheet } from './HoldRoleSheet';
+import { useLostHoldGhosts } from './use-lost-hold-ghosts';
 import { CreateDrawer } from './CreateDrawer';
 import { useCreateClimbScreen, type CreateClimbBoard } from './use-create-climb-screen';
 import { useHoldHeatmap } from '../../lib/graphql/hooks/use-hold-heatmap';
 import { useCatalogQuerySourceState } from '../../lib/offline/use-catalog-query-source';
-import { heatmapSearchInput } from '../play-drawer/heatmap/heatmap-search-input';
+import { heatmapSearchInput } from '../search/heatmap/heatmap-search-input';
 import { useActiveBoard } from '../../lib/graphql/use-active-board';
 import { heatMetricForBrush, type CreateHeatmap } from './create-heatmap';
 
@@ -33,17 +36,17 @@ type CreateClimbScreenProps = {
   forkDescription?: string;
   /** JSON-encoded `characteristics` of the climb being remixed (#4832). */
   forkCharacteristics?: string;
-  /** The remixed climb's grade, as a name on the shared scale ("6c/V5"). */
-  forkDifficulty?: string;
+  /** The remixed climb's uuid, so the editor can draw the holds it lost. */
+  forkParentUuid?: string;
   editClimbUuid?: string;
 };
 
 /**
- * The create-climb editor screen: a single Play Drawer-style sheet (the
- * CreateDrawer) carrying the header, the board, the brush + action rows, the
- * metadata form, and the Open Drafts table. The long-press role picker stacks
- * above the drawer. A successful publish dismisses the screen so the success
- * toast lands over the climbs list.
+ * The New climb screen: a full-height modal task (see the route options in
+ * app/(tabs)/climbs/_layout.tsx) whose body, CreateDrawer, carries the top bar,
+ * the board, the brush + action rows, the metadata form and the Open Drafts
+ * table. The long-press role picker presents above it. A successful publish
+ * dismisses the screen so the success toast lands over the climbs list.
  */
 export function CreateClimbScreen({
   board,
@@ -51,25 +54,21 @@ export function CreateClimbScreen({
   forkName,
   forkDescription,
   forkCharacteristics,
-  forkDifficulty,
+  forkParentUuid,
   editClimbUuid,
 }: CreateClimbScreenProps) {
   const { t } = useTranslation('climbs');
+  const { t: tCommon } = useTranslation('common');
   const { systemColors } = useTheme();
   const router = useRouter();
   const { openPlayDrawer } = useDrawerHost();
 
+  // Swapping the climb under the editor changes the route's params in place
+  // rather than replacing the route: a replace would drop this modal and
+  // present a new one, sliding the whole sheet away and back. The route keys
+  // the editor on these params, so it still remounts with a fresh session.
   const handleStartedNewClimb = useCallback(() => {
-    router.replace({
-      pathname: '/(tabs)/climbs/create',
-      params: {
-        boardName: board.boardName,
-        layoutId: String(board.layoutId),
-        sizeId: String(board.sizeId),
-        setIds: board.setIds,
-        angle: String(board.angle),
-      },
-    });
+    router.setParams(editorParams(board, undefined));
   }, [router, board]);
 
   // A spray wall's holds are runtime data, not a bundled table: on a cold open
@@ -91,10 +90,6 @@ export function CreateClimbScreen({
     forkName,
     forkDescription,
     forkCharacteristics,
-    // Resolved here rather than in the controller so the route param stays a
-    // plain string: null for a grade the shared scale does not name, which opens
-    // the picker unset instead of snapping the remix to a neighbouring grade.
-    forkDifficultyId: getDifficultyIdForGradeName(forkDifficulty),
     sprayWallToken,
     editClimbUuid,
     onPublished: () => router.back(),
@@ -102,6 +97,35 @@ export function CreateClimbScreen({
   });
 
   const [longPressHoldId, setLongPressHoldId] = useState<number | null>(null);
+  const [holdPopoverPoint, setHoldPopoverPoint] = useState<WindowAnchorPoint | null>(null);
+  const editorRootRef = useRef<ViewInstance>(null);
+  const holdAnchorRevision = useRef(0);
+  useEffect(
+    () => () => {
+      holdAnchorRevision.current += 1;
+    },
+    [],
+  );
+  // Read by the back handler, so opening the sheet does not re-register it.
+  const holdRoleOpenRef = useRef(false);
+  holdRoleOpenRef.current = longPressHoldId !== null;
+
+  // A remix of a climb that lost holds: a grey ring where each one was, and
+  // Save waits until the climber has tapped them away. Never on an edit in place.
+  const lostHolds = useLostHoldGhosts({
+    board,
+    parentClimbUuid: editClimbUuid ? null : (forkParentUuid ?? null),
+    sourceFrames: controller.remixSourceFrames,
+    availableHoldIds: controller.availableHoldIds,
+    sprayWallToken,
+  });
+
+  const handleRemoveMissingHolds = useCallback(() => {
+    // A remix can show a ghost for the same selection maintenance just removed.
+    // One acknowledgement should clear both representations of that missing hold.
+    lostHolds.dismissMissingGhosts(controller.missingHoldIds);
+    controller.removeMissingHolds();
+  }, [lostHolds, controller.missingHoldIds, controller.removeMissingHolds]);
 
   // The hold heatmap over the whole board (the create board has no list filters
   // to follow), counting the role the active brush paints: the downloaded board
@@ -189,40 +213,115 @@ export function CreateClimbScreen({
     [board.boardName, board.layoutId, board.sizeId, board.setIds, sprayWallToken],
   );
 
-  // Every dismiss path — chevron, pan-down, backdrop, hardware back — lands here.
-  // No confirm on any of them: the autosave flush on unmount already keeps the
-  // work, and a modal on the pan-down (the most-used gesture on this surface)
-  // would be hostile. Just say it once, and only when the climber could
+  // Both ways out — the X and Android's back — land here. (The iOS swipe-down
+  // is off: see the route options.) No confirm: the autosave flush on unmount
+  // already keeps the work. Just say it once, and only when the climber could
   // reasonably think it's gone — the controller decides that.
   //
   // Toast AFTER the pop, not before: the toast overlay is a root-level JS View
-  // that renders behind any native sheet (see toast-provider), so firing it while
-  // the drawer is still up shows nothing.
+  // that renders behind a native modal (see toast-provider), so firing it while
+  // the editor is still up shows nothing.
   const { notifyDraftKeptOnDismiss } = controller;
   const handleClose = useCallback(() => {
-    router.back();
+    if (router.canGoBack()) router.back();
+    else router.replace('/(tabs)/climbs');
     notifyDraftKeptOnDismiss();
   }, [router, notifyDraftKeptOnDismiss]);
 
-  const handleLongPress = useCallback((holdId: number) => setLongPressHoldId(holdId), []);
-  const closeHoldRole = useCallback(() => setLongPressHoldId(null), []);
+  // Android's back leaves the way the X does, so it also says the draft was
+  // kept. Focus-gated: BackHandler runs the newest listener first, so an
+  // unfocused editor would otherwise eat back presses on a screen above it.
+  const isFocused = useIsFocused();
+  const focusedRef = useRef(isFocused);
+  focusedRef.current = isFocused;
+  const editableWallUuid = useSyncExternalStore(
+    subscribeToSprayWalls,
+    useCallback(() => editableSprayWallUuidFor(board.boardName, board.layoutId), [board.boardName, board.layoutId]),
+    () => undefined,
+  );
+  const [openingHoldEditor, setOpeningHoldEditor] = useState(false);
+  const [holdEditorOpenFailed, setHoldEditorOpenFailed] = useState(false);
+  const openingHoldEditorRef = useRef(false);
+  const editorMountedRef = useRef(true);
+  useEffect(() => {
+    editorMountedRef.current = true;
+    return () => {
+      editorMountedRef.current = false;
+    };
+  }, []);
+  const { persistWorkingDraft } = controller;
+  const handleAddHolds = useCallback(async () => {
+    if (
+      !editableWallUuid ||
+      openingHoldEditorRef.current ||
+      controller.saveState === 'saving' ||
+      controller.pendingNewClimb
+    )
+      return;
+    openingHoldEditorRef.current = true;
+    setOpeningHoldEditor(true);
+    setHoldEditorOpenFailed(false);
+    try {
+      await persistWorkingDraft();
+      if (!editorMountedRef.current || !focusedRef.current) return;
+      if (editableSprayWallUuidFor(board.boardName, board.layoutId) !== editableWallUuid) return;
+      router.push(sprayHoldEditorHref(editableWallUuid, 'climb-editor'));
+    } catch {
+      if (editorMountedRef.current) setHoldEditorOpenFailed(true);
+    } finally {
+      openingHoldEditorRef.current = false;
+      if (editorMountedRef.current) setOpeningHoldEditor(false);
+    }
+  }, [
+    editableWallUuid,
+    persistWorkingDraft,
+    controller.saveState,
+    controller.pendingNewClimb,
+    board.boardName,
+    board.layoutId,
+    router,
+  ]);
+  useEffect(() => {
+    if (!isFocused) return undefined;
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      // The hold-role sheet is a native dialog that takes back itself, so this
+      // should never run while it is up. If it does, back closes the sheet,
+      // never the editor under it.
+      if (holdRoleOpenRef.current) {
+        setLongPressHoldId(null);
+        return true;
+      }
+      handleClose();
+      return true;
+    });
+    return () => subscription.remove();
+  }, [isFocused, handleClose]);
+
+  const handleLongPress = useCallback((holdId: number, anchor?: WindowAnchorPoint) => {
+    const revision = ++holdAnchorRevision.current;
+    if (anchor && editorRootRef.current) {
+      editorRootRef.current.measureInWindow((rootX, rootY) => {
+        if (revision !== holdAnchorRevision.current) return;
+        setHoldPopoverPoint({ x: anchor.x - rootX, y: anchor.y - rootY });
+        setLongPressHoldId(holdId);
+      });
+    } else {
+      setHoldPopoverPoint(null);
+      setLongPressHoldId(holdId);
+    }
+  }, []);
+  const closeHoldRole = useCallback(() => {
+    holdAnchorRevision.current += 1;
+    setLongPressHoldId(null);
+    setHoldPopoverPoint(null);
+  }, []);
 
   const handleLoadDraft = useCallback(
     (climb: Climb) => {
-      // Re-enter the screen in edit mode for the picked draft so the controller
+      // Re-enter the editor in edit mode for the picked draft so the controller
       // re-seeds holds/name/description cleanly. The route's key (editClimbUuid)
       // forces a remount, giving a fresh editing session + undo history.
-      router.replace({
-        pathname: '/(tabs)/climbs/create',
-        params: {
-          editClimbUuid: climb.uuid,
-          boardName: board.boardName,
-          layoutId: String(board.layoutId),
-          sizeId: String(board.sizeId),
-          setIds: board.setIds,
-          angle: String(board.angle),
-        },
-      });
+      router.setParams(editorParams(board, climb.uuid));
     },
     [router, board],
   );
@@ -259,6 +358,7 @@ export function CreateClimbScreen({
       <SafeAreaView style={[styles.container, { backgroundColor: systemColors.background }]} edges={['bottom']}>
         <View style={styles.centered}>
           <ActivityIndicator size="large" />
+          <Button title={tCommon('actions.close')} onPress={handleClose} />
         </View>
       </SafeAreaView>
     );
@@ -268,7 +368,7 @@ export function CreateClimbScreen({
     return (
       <SafeAreaView style={[styles.container, { backgroundColor: systemColors.background }]} edges={['bottom']}>
         <View style={styles.centered}>
-          <Icon name="boards" size={48} color={iosSystemColors.systemGray4} />
+          <Icon name="boards" size={48} color={systemColors.tertiaryLabel} />
           <Text variant="headline" style={styles.centeredTitle}>
             {t('mobile.create.unavailable.title')}
           </Text>
@@ -277,29 +377,33 @@ export function CreateClimbScreen({
               ? t('mobile.create.unavailable.wrongSize')
               : t('mobile.create.unavailable.subtitle')}
           </Text>
+          <Button title={tCommon('actions.close')} onPress={handleClose} />
         </View>
       </SafeAreaView>
     );
   }
 
   return (
-    // Transparent so the create drawer floats over the climbs/search list (dimmed
-    // by the drawer's own backdrop) — no separate modal card.
-    <View style={styles.container}>
+    <View ref={editorRootRef} testID="create-climb-editor" collapsable={false} style={styles.container}>
       <CreateDrawer
         board={board}
         controller={controller}
         boardHolds={boardHolds}
         onLongPressHold={handleLongPress}
-        subSheetOpen={longPressHoldId !== null}
         onLoadDraft={handleLoadDraft}
         onClose={handleClose}
         onViewDuplicate={handleViewDuplicate}
         heatmap={heatmap}
+        lostHolds={lostHolds}
+        onAddHolds={editableWallUuid ? handleAddHolds : undefined}
+        openingHoldEditor={openingHoldEditor}
+        holdEditorOpenFailed={holdEditorOpenFailed}
+        onRemoveMissingHolds={handleRemoveMissingHolds}
       />
 
       <HoldRoleSheet
         holdId={longPressHoldId}
+        anchorPoint={holdPopoverPoint}
         boardName={board.boardName as BoardName}
         litUpHoldsMap={controller.litUpHoldsMap}
         startingCount={controller.startingCount}
@@ -309,6 +413,27 @@ export function CreateClimbScreen({
       />
     </View>
   );
+}
+
+/**
+ * The route params for the editor on `board`: an edit of `editClimbUuid`, or a
+ * blank climb. Every remix param is cleared, so a remix can't leak into the
+ * next climb.
+ */
+function editorParams(board: CreateClimbBoard, editClimbUuid: string | undefined) {
+  return {
+    boardName: board.boardName,
+    layoutId: String(board.layoutId),
+    sizeId: String(board.sizeId),
+    setIds: board.setIds,
+    angle: String(board.angle),
+    editClimbUuid,
+    forkFrames: undefined,
+    forkName: undefined,
+    forkDescription: undefined,
+    forkCharacteristics: undefined,
+    forkParentUuid: undefined,
+  };
 }
 
 const styles = StyleSheet.create({

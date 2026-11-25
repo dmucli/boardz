@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { renderToString } from 'react-dom/server';
+import { DEFAULT_LOCALE, SUPPORTED_LOCALES, type Locale } from '@/app/lib/i18n/config';
+import type { ClimbConfigCompatibility } from '@/app/lib/canonical-climb-config';
 
 /**
  * Reposition invariant — A1 (canonical consolidation), LANDED in W-15 (#4369).
@@ -26,7 +28,7 @@ import { renderToString } from 'react-dom/server';
  * — ONE function per surface, which is why the parity assertions can be
  * equalities rather than shape checks.
  *
- * `getBoardDetailsForBoard` is mocked as a FUNCTION OF ITS ARGUMENT rather than
+ * `getBoardImageDetailsForBoard` is mocked as a FUNCTION OF ITS ARGUMENT rather than
  * a shared constant: with one frozen object both trees would agree no matter
  * how they derived their board details, and the parity assertion would hold by
  * construction. Deriving from the ids each tree actually passes is what makes
@@ -46,8 +48,10 @@ import { renderToString } from 'react-dom/server';
 vi.mock('server-only', () => ({}));
 vi.mock('next/navigation', () => ({ notFound: vi.fn(), permanentRedirect: vi.fn() }));
 
+let servedLocale: Locale = DEFAULT_LOCALE;
+
 vi.mock('@/app/lib/i18n/server', () => ({
-  getServerTranslation: vi.fn(async () => ({ t: (key: string) => key, locale: 'en-US' })),
+  getServerTranslation: vi.fn(async () => ({ t: (key: string) => key, locale: servedLocale })),
 }));
 
 const CLIMB_UUID = 'abcdef1234567890abcdef1234567890';
@@ -57,15 +61,18 @@ const CLIMB_UUID = 'abcdef1234567890abcdef1234567890';
  * shadowed size (27) and watch both trees follow it.
  */
 const boardConfig = { layoutId: 1, sizeId: 10, setIds: [1, 20] as number[], angle: 40 };
+let storedCompatibility: ClimbConfigCompatibility;
 
 vi.mock('@/app/lib/data/queries', () => ({
   getClimb: vi.fn(async () => ({
+    uuid: CLIMB_UUID,
     name: 'My Test Climb',
     difficulty: 'V5',
     setter_username: 'setter',
     quality_average: 4,
     ascensionist_count: 12,
     frames: 'p1r12',
+    ...storedCompatibility,
   })),
   getClimbStatsForAllAngles: vi.fn(async () => []),
 }));
@@ -88,8 +95,9 @@ vi.mock('@/app/lib/data/list-page-data.server', () => ({
 // off a board config it didn't resolve. Names are rich enough that the real
 // (unmocked) `tryResolveBoardSlugs` in url-utils produces the production
 // named-slug form.
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(
     (params: { board_name: string; layout_id: number; size_id: number; set_ids: number[] }) => ({
       board_name: params.board_name,
       layout_id: params.layout_id,
@@ -108,14 +116,14 @@ vi.mock('@/app/lib/board-utils', () => ({
 
 // Legacy pages: numeric route params, resolved from the shared board config.
 vi.mock('@/app/lib/url-utils.server', () => ({
-  parseRouteParams: vi.fn(async () => ({
+  parseRouteParams: vi.fn(async (params: { climb_uuid?: string }) => ({
     parsedParams: {
       board_name: 'kilter',
       layout_id: boardConfig.layoutId,
       size_id: boardConfig.sizeId,
       set_ids: boardConfig.setIds,
       angle: boardConfig.angle,
-      climb_uuid: CLIMB_UUID,
+      climb_uuid: params.climb_uuid ?? CLIMB_UUID,
     },
     isNumericFormat: true,
   })),
@@ -179,10 +187,10 @@ const { climbRowsToItems } = await import('@/app/lib/seo/sitemap/climb-entries')
 const { expandDefaultLocaleOnly } = await import('@/app/lib/seo/sitemap/entries');
 
 const legacyViewPage =
-  await import('@/app/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/view/[climb_uuid]/page');
-const slugViewPage = await import('@/app/b/[board_slug]/[angle]/view/[climb_uuid]/page');
-const legacyListPage = await import('@/app/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/list/page');
-const slugListPage = await import('@/app/b/[board_slug]/[angle]/list/page');
+  await import('@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/view/[climb_uuid]/page');
+const slugViewPage = await import('@/app/(site)/b/[board_slug]/[angle]/view/[climb_uuid]/page');
+const legacyListPage = await import('@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/list/page');
+const slugListPage = await import('@/app/(site)/b/[board_slug]/[angle]/list/page');
 const { getClimbStatsForAllAngles } = await import('@/app/lib/data/queries');
 
 function canonicalPath(canonical: string | URL | { url: string | URL } | null | undefined): string {
@@ -192,7 +200,7 @@ function canonicalPath(canonical: string | URL | { url: string | URL } | null | 
   return `${parsed.pathname}${parsed.search}`;
 }
 
-function legacyViewMetadata() {
+function legacyViewMetadata(climbUuid = CLIMB_UUID) {
   return legacyViewPage.generateMetadata({
     params: Promise.resolve({
       board_name: 'kilter',
@@ -200,17 +208,18 @@ function legacyViewMetadata() {
       size_id: String(boardConfig.sizeId),
       set_ids: boardConfig.setIds.join(','),
       angle: String(boardConfig.angle),
-      climb_uuid: CLIMB_UUID,
+      climb_uuid: climbUuid,
     }),
   });
 }
 
-function slugViewMetadata() {
+function slugViewMetadata(climbUuid = CLIMB_UUID) {
   return slugViewPage.generateMetadata({
+    searchParams: Promise.resolve({}),
     params: Promise.resolve({
       board_slug: 'kilter-original-12x12',
       angle: String(boardConfig.angle),
-      climb_uuid: CLIMB_UUID,
+      climb_uuid: climbUuid,
     }),
   });
 }
@@ -232,6 +241,7 @@ function legacyListMetadata(searchParams: Record<string, string> = {}) {
 async function renderSlugViewPage() {
   renderToString(
     await slugViewPage.default({
+      searchParams: Promise.resolve({}),
       params: Promise.resolve({
         board_slug: 'kilter-original-12x12',
         angle: String(boardConfig.angle),
@@ -249,8 +259,11 @@ function slugListMetadata(searchParams: Record<string, string> = {}) {
 }
 
 beforeEach(() => {
+  servedLocale = DEFAULT_LOCALE;
   boardConfig.sizeId = 10;
+  boardConfig.setIds = [1, 20];
   boardConfig.angle = 40;
+  storedCompatibility = {};
   vi.mocked(getClimbStatsForAllAngles).mockReset();
   vi.mocked(getClimbStatsForAllAngles).mockResolvedValue([]);
 });
@@ -263,12 +276,33 @@ describe('climb-view canonical parity (A1 landed in W-15)', () => {
     const slugCanonical = canonicalPath(slug.alternates?.canonical);
 
     expect(slugCanonical).toBe(legacyCanonical);
+    // The physical alias stays readable while search results belong to the
+    // catalogue. Crawlers can still follow links from the alias.
+    expect(slug.robots).toEqual({ index: false, follow: true });
+    expect(legacy.robots).toBeUndefined();
     // Non-vacuous: the shared string is the config-tuple tree, not `/b`.
     expect(slugCanonical.startsWith('/b/')).toBe(false);
     expect(slugCanonical.startsWith('/kilter/')).toBe(true);
     // The uuid survives into the canonical either way (embedded in the name slug).
     expect(slugCanonical).toContain(CLIMB_UUID);
   });
+
+  it.each(SUPPORTED_LOCALES.filter((locale) => locale !== DEFAULT_LOCALE))(
+    '%s climb views noindex both trees while preserving the English canonical and cards',
+    async (locale) => {
+      const english = await legacyViewMetadata();
+      servedLocale = locale;
+      const [legacy, slug] = await Promise.all([legacyViewMetadata(), slugViewMetadata()]);
+
+      for (const metadata of [legacy, slug]) {
+        expect(metadata.robots).toEqual({ index: false, follow: true });
+        expect(metadata.alternates).toEqual({ canonical: english.alternates?.canonical });
+        expect(metadata.openGraph?.url).toBe(english.alternates?.canonical);
+        expect(metadata.openGraph?.images).toEqual(english.openGraph?.images);
+        expect(metadata.twitter?.images).toEqual(english.twitter?.images);
+      }
+    },
+  );
 
   it('the config-tuple tree still canonicalizes onto itself', async () => {
     const path = canonicalPath((await legacyViewMetadata()).alternates?.canonical);
@@ -290,6 +324,29 @@ describe('climb-view canonical parity (A1 landed in W-15)', () => {
 
     expect(legacyCanonical).toMatch(/\/40\/view\//);
     expect(canonicalPath(slug.alternates?.canonical)).toBe(legacyCanonical);
+  });
+
+  it('aliases share resolved canonical and OG URLs across both trees and alternate angles', async () => {
+    boardConfig.angle = 45;
+    vi.mocked(getClimbStatsForAllAngles).mockResolvedValue([
+      { angle: 40, ascensionist_count: '20' },
+      { angle: 45, ascensionist_count: '12' },
+    ] as never);
+    const aliasUuid = '11112222333344445555666677778888';
+    const [legacy, slug, canonical] = await Promise.all([
+      legacyViewMetadata(aliasUuid),
+      slugViewMetadata(aliasUuid),
+      legacyViewMetadata(),
+    ]);
+    const expected = canonical.alternates?.canonical;
+    expect(legacy.alternates?.canonical).toBe(expected);
+    expect(slug.alternates?.canonical).toBe(expected);
+    expect(legacy.openGraph?.url).toBe(expected);
+    expect(slug.openGraph?.url).toBe(expected);
+    expect(canonicalPath(expected)).toContain(`/40/view/my-test-climb-${CLIMB_UUID}`);
+    expect(canonicalPath(expected)).not.toContain(aliasUuid);
+    expect(legacy.alternates?.languages).toBeUndefined();
+    expect(slug.alternates?.languages).toBeUndefined();
   });
 
   it('agrees on the shadowed size (Kilter layout 1 size 27) and keeps it distinct from size 10', async () => {
@@ -357,7 +414,15 @@ describe('sitemap ↔ canonical parity (W-23)', () => {
    */
   const sitemapPath = (sizeId: number) =>
     climbRowsToItems(
-      [{ uuid: CLIMB_UUID, name: 'My Test Climb', angle: boardConfig.angle, updatedAt: new Date('2026-05-04') }],
+      [
+        {
+          uuid: CLIMB_UUID,
+          name: 'My Test Climb',
+          angle: boardConfig.angle,
+          updatedAt: new Date('2026-05-04'),
+          ...storedCompatibility,
+        },
+      ],
       { boardType: 'kilter', layoutId: boardConfig.layoutId, sizeId, setIds: boardConfig.setIds },
     ).items[0].path;
 
@@ -366,6 +431,23 @@ describe('sitemap ↔ canonical parity (W-23)', () => {
 
     expect(sitemapPath(boardConfig.sizeId)).toBe(canonicalPath(legacy.alternates?.canonical));
     expect(sitemapPath(boardConfig.sizeId)).toBe(canonicalPath(slug.alternates?.canonical));
+  });
+
+  it('shares a canonical across compatible 12x14 and 16x12 Original configurations', async () => {
+    storedCompatibility = { compatibleSizeIds: [28, 7], requiredSetIds: [1] };
+    boardConfig.sizeId = 7;
+    const commercial = await legacyViewMetadata();
+
+    boardConfig.sizeId = 28;
+    boardConfig.setIds = [1];
+    const [superWide, slug] = await Promise.all([legacyViewMetadata(), slugViewMetadata()]);
+    const expected = `/kilter/original/12x14-commercial/screw_bolt/40/view/my-test-climb-${CLIMB_UUID}`;
+
+    expect(canonicalPath(commercial.alternates?.canonical)).toBe(expected);
+    expect(canonicalPath(superWide.alternates?.canonical)).toBe(expected);
+    expect(canonicalPath(slug.alternates?.canonical)).toBe(expected);
+    expect(sitemapPath(28)).toBe(expected);
+    expect(superWide.openGraph?.url).toBe(superWide.alternates?.canonical);
   });
 
   it('the emitted <loc> is the absolute form of that same canonical', () => {
@@ -392,6 +474,8 @@ describe('/list canonical parity (A1 landed in W-15)', () => {
     const slugCanonical = canonicalPath(slug.alternates?.canonical);
 
     expect(slugCanonical).toBe(legacyCanonical);
+    expect(slug.robots).toEqual({ index: false, follow: true });
+    expect(legacy.robots).toBeUndefined();
     expect(slugCanonical.startsWith('/b/')).toBe(false);
     expect(slugCanonical).toMatch(/^\/kilter\/.*\/40\/list$/);
   });

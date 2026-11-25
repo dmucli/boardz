@@ -9,7 +9,9 @@ import { cache } from 'react';
 import { unstable_cache } from 'next/cache';
 // oxlint-disable-next-line no-restricted-imports -- raw postgres-js sql usage; migrate to drizzle
 import { rowsFromResult, sql } from '@/app/lib/db/db';
-import { getGradeLabel } from '@boardsesh/db/queries';
+import { getGradeLabel, privateSafeFirstAscentAt, privateSafeFirstAscentName } from '@boardsesh/db/queries';
+import { sql as drizzleSql } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 
 import type { Climb, ParsedBoardRouteParametersWithUuid, BoardName, LayoutId, Size } from '../types';
 import { getSizesForLayoutId, getAllLayouts, getSetsForLayoutAndSize } from '@/app/lib/board-constants';
@@ -92,7 +94,11 @@ async function fetchClimbFromDb(
             )
           END AS uuid
         )
-        SELECT climbs.uuid, climbs.setter_username, climbs.user_id as "userId", climbs.name, climbs.description,
+        -- No author account id. Nothing on www reads it, and this read also opens
+        -- an unlisted climb by its link, whose author is named only under the
+        -- account rule. The app gets it from the backend's Climb.userId, which
+        -- names the author of a published, listed climb to everyone.
+        SELECT climbs.uuid, climbs.setter_username, NULL::text as "userId", climbs.name, climbs.description,
         climbs.layout_id as "layoutId", climbs.board_type as "boardType",
         climbs.frames, climbs.frames_count as "framesCount", climbs.frames_pace as "framesPace",
         COALESCE(climb_stats.angle, ${angle}) as angle, climbs.angle as "catalogAngle",
@@ -100,9 +106,12 @@ async function fetchClimbFromDb(
         ROUND(climb_stats.display_difficulty::numeric, 0) as difficulty_id,
         ROUND(climb_stats.quality_average::numeric, 2) as quality_average,
         ROUND(climb_stats.difficulty_average::numeric - climb_stats.display_difficulty::numeric, 2) AS difficulty_error,
-        CASE WHEN climb_stats.benchmark_difficulty > 0 THEN climb_stats.benchmark_difficulty::text ELSE NULL END as benchmark_difficulty,
+        -- realBenchmarkCondition's rule, written out because this is a postgres-js
+        -- template: NaN passes "> 0" in Postgres and would come back as 'NaN' (#6232).
+        CASE WHEN climb_stats.benchmark_difficulty > 0 AND climb_stats.benchmark_difficulty <> 'NaN'::double precision
+          THEN climb_stats.benchmark_difficulty::text ELSE NULL END as benchmark_difficulty,
         climbs.is_draft, climbs.is_hidden, climbs.created_at, climbs.published_at, climbs.characteristics,
-        climbs.compatible_size_ids as "compatibleSizeIds"
+        climbs.compatible_size_ids as "compatibleSizeIds", climbs.required_set_ids as "requiredSetIds"
         FROM resolved_climb
         INNER JOIN board_climbs climbs ON climbs.uuid = resolved_climb.uuid
         LEFT JOIN board_climb_stats climb_stats
@@ -111,6 +120,9 @@ async function fetchClimbFromDb(
           AND climb_stats.board_type = ${boardName}
         WHERE climbs.board_type = ${boardName}
         AND climbs.layout_id = ${layoutId}
+        -- A draft is its owner's alone, and this read has no viewer: it backs
+        -- public pages and a cache keyed on the uuid. NULL is not a draft.
+        AND climbs.is_draft IS NOT TRUE
         limit 1
       `,
       remainingReadBudgetMs(),
@@ -222,18 +234,30 @@ async function fetchClimbStatsForAllAnglesFromDb(
   boardName: BoardName,
   climbUuid: string,
 ): Promise<ClimbStatsForAngle[]> {
-  const result = rowsFromResult<ClimbStatsForAngle & { difficulty_id: number | null }>(
-    await withReadDeadline(
-      'climb-stats-all-angles',
-      sql`
+  // The first ascent is a tick projection, not the stored `fa_username`: for a
+  // climb set on Boardsesh the stored name is the earliest sender whatever their
+  // tick or account privacy, and after the author deletes their account it may
+  // be theirs. This page has no viewer, so it credits the earliest send an
+  // anonymous visitor may read, and dates that same send. Manufacturer climbs
+  // keep their stored credit. On the primary: tick audiences are privacy rules.
+  //
+  // The projection is built with drizzle and rendered to text, then run through
+  // postgres.js `unsafe`, so the read deadline can still `.cancel()` a
+  // timed-out statement (a drizzle `execute` promise has no cancel).
+  const firstAscentStats = {
+    boardType: drizzleSql`climb_stats.board_type`,
+    climbUuid: drizzleSql`climb_stats.climb_uuid`,
+    angle: drizzleSql`climb_stats.angle`,
+  };
+  const statsQuery = new PgDialect().sqlToQuery(drizzleSql`
     SELECT
       climb_stats.angle,
       COALESCE(climb_stats.ascensionist_count, 0) as ascensionist_count,
       ROUND(climb_stats.quality_average::numeric, 2) as quality_average,
       climb_stats.difficulty_average,
       climb_stats.display_difficulty,
-      climb_stats.fa_username,
-      climb_stats.fa_at,
+      ${privateSafeFirstAscentName({ ...firstAscentStats, username: drizzleSql`climb_stats.fa_username` }, null)} as fa_username,
+      ${privateSafeFirstAscentAt({ ...firstAscentStats, at: drizzleSql`climb_stats.fa_at` }, null)} as fa_at,
       climb_stats.quality_normalized,
       -- The blend's own denominator, verbatim from the definition on
       -- board_climb_stats.quality_average: the upstream side counts only when it
@@ -245,8 +269,20 @@ async function fetchClimbStatsForAllAnglesFromDb(
     FROM board_climb_stats climb_stats
     WHERE climb_stats.board_type = ${boardName}
     AND climb_stats.climb_uuid = ${climbUuid}
+    -- A draft's stats are its owner's alone, like the draft, and this read has
+    -- no viewer. A stats row with no climb row is unaffected.
+    AND NOT EXISTS (
+      SELECT 1 FROM board_climbs draft_climb
+      WHERE draft_climb.board_type = climb_stats.board_type
+        AND draft_climb.uuid = climb_stats.climb_uuid
+        AND draft_climb.is_draft IS TRUE
+    )
     ORDER BY climb_stats.angle ASC
-  `,
+  `);
+  const result = rowsFromResult<ClimbStatsForAngle & { difficulty_id: number | null }>(
+    await withReadDeadline(
+      'climb-stats-all-angles',
+      sql.unsafe(statsQuery.sql, statsQuery.params as Parameters<typeof sql.unsafe>[1]),
       remainingReadBudgetMs(),
     ),
   );
@@ -270,11 +306,20 @@ async function fetchClimbStatsForAllAnglesFromDb(
  * revalidate.
  */
 export const getClimbStatsForAllAngles = cache(
-  async (boardName: BoardName, climbUuid: string): Promise<ClimbStatsForAngle[]> =>
-    unstable_cache(fetchClimbStatsForAllAnglesFromDb, ['climb-stats-all-angles', boardName, climbUuid], {
-      revalidate: 3600,
-      tags: [`climb-${climbUuid}`],
-    })(boardName, climbUuid),
+  async (boardName: BoardName, climbUuid: string): Promise<ClimbStatsForAngle[]> => {
+    const angleStats: readonly (ClimbStatsForAngle | null | undefined)[] = await unstable_cache(
+      fetchClimbStatsForAllAnglesFromDb,
+      ['climb-stats-all-angles', boardName, climbUuid],
+      {
+        revalidate: 3600,
+        tags: [`climb-${climbUuid}`],
+      },
+    )(boardName, climbUuid);
+    // A failed streamed read used to leave holes in the driver's next result.
+    // JSON caching turns those holes into null. Normalize AFTER the cache so
+    // already-stored entries cannot crash canonical selection or the page.
+    return angleStats.filter((stats) => stats != null);
+  },
 );
 
 export type LayoutRow = {

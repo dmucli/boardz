@@ -1,7 +1,15 @@
 import { drizzle } from 'drizzle-orm/postgres-js';
 import type { Logger, SQLWrapper } from 'drizzle-orm';
 import postgres from 'postgres';
-import { getConnectionConfig, isLocalDevelopment } from './config';
+import {
+  assertWebDatabaseLoginAllowed,
+  getConnectionConfig,
+  isLocalDevelopment,
+  isWebDatabaseUrlProcess,
+  markWebDatabaseUrlProcess,
+  readWebDatabaseUrl,
+  WEB_DATABASE_LOGIN_BLOCKERS,
+} from './config';
 import { withConnectRetry } from './connect-retry';
 import * as schema from '../schema/index';
 import * as relations from '../relations/index';
@@ -20,11 +28,17 @@ const sqlLogger = process.env.DEBUG_SQL === 'true' ? new QueryLogger() : undefin
 
 const fullSchema = { ...schema, ...relations };
 
-/** Pool size when `DB_POOL_MAX` is unset — unchanged from before the knob existed. */
-export const DEFAULT_POOL_MAX = 10;
+/**
+ * Pool size when `DB_POOL_MAX` is unset. It was 10 until the 2026-09 connection
+ * budget: postgres.js round-robins over every open connection, so a pool sits at
+ * its `max` even though fleet-wide concurrency averages under one active
+ * statement. 5 per process keeps the whole fleet well under
+ * `max_connections`; see docs/operations/db-connectivity.md, "Connection budget".
+ */
+export const DEFAULT_POOL_MAX = 5;
 /** Seconds an idle connection is held when `DB_POOL_IDLE_TIMEOUT_S` is unset. */
 export const DEFAULT_POOL_IDLE_TIMEOUT_S = 30;
-/** Serverless (Vercel) pool defaults — smaller per-lambda footprint; see docs/db-connectivity.md § pool sizing. */
+/** Serverless (Vercel) pool defaults — smaller per-lambda footprint; see docs/operations/db-connectivity.md § pool sizing. */
 export const SERVERLESS_DEFAULT_POOL_MAX = 3;
 export const SERVERLESS_DEFAULT_POOL_IDLE_TIMEOUT_S = 5;
 /**
@@ -44,24 +58,47 @@ export const MIN_POOL_MAX = 2;
  * of most requests.
  */
 export const MIN_POOL_IDLE_TIMEOUT_S = 0;
+/**
+ * postgres.js builds one connection object per slot up front, so `max` is
+ * memory before it is connections: 100000 took 736 MB of heap and 1000000 ran
+ * out of memory. 100 is already past the whole database's `max_connections`.
+ */
+export const MAX_POOL_MAX = 100;
 
 /**
  * Mirrors `readEnvInt` in connect-retry.ts: a missing or unparseable value falls
- * back, a parseable one is clamped to `minimum`.
+ * back, a parseable one is clamped to `minimum`, and to `maximum` with a warning
+ * when one is given.
  */
-function readPoolInt(name: string, fallback: number, minimum: number): number {
+function readPoolInt(name: string, fallback: number, minimum: number, maximum?: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed)) return fallback;
+  if (maximum !== undefined && parsed > maximum) {
+    console.warn(`[db] ${name}=${raw} is above ${maximum}; using ${maximum}`);
+    return maximum;
+  }
   return Math.max(minimum, parsed);
 }
 
 /**
+ * `DB_POOL_MAX` as every pool in a process should read it: unset or unparseable
+ * gives `fallback`, anything else is clamped to `MIN_POOL_MAX` and, with a
+ * warning, to `MAX_POOL_MAX`. Exported for the sync daemons, which build their
+ * own postgres.js pools and keep their own default, so that one variable caps
+ * them the same way it caps `createDb()`.
+ */
+export function resolvePoolMax(fallback: number = DEFAULT_POOL_MAX): number {
+  return readPoolInt('DB_POOL_MAX', fallback, MIN_POOL_MAX, MAX_POOL_MAX);
+}
+
+/**
  * Per-deployment pool knobs. On Vercel the defaults are the serverless pair
- * above; everywhere else (backend, sync jobs, scripts) they stay the values
- * that were hard-coded here before, so nothing changes unless the env var is
- * set. The split exists because peak server-side connections scale with
+ * above; everywhere else (backend, sync jobs, scripts) they are
+ * `DEFAULT_POOL_MAX` / `DEFAULT_POOL_IDLE_TIMEOUT_S` unless the env var is set.
+ *
+ * The split exists because peak server-side connections scale with
  * *instance count* × held-idle connections, not with per-instance `max`.
  *
  * `prepare: false` is required when the target is PgBouncer in transaction
@@ -108,7 +145,7 @@ export function resetReportedPostgresNotices(): void {
 function basePoolOptions() {
   const isServerless = Boolean(process.env.VERCEL);
   return {
-    max: readPoolInt('DB_POOL_MAX', isServerless ? SERVERLESS_DEFAULT_POOL_MAX : DEFAULT_POOL_MAX, MIN_POOL_MAX),
+    max: resolvePoolMax(isServerless ? SERVERLESS_DEFAULT_POOL_MAX : DEFAULT_POOL_MAX),
     idle_timeout: readPoolInt(
       'DB_POOL_IDLE_TIMEOUT_S',
       isServerless ? SERVERLESS_DEFAULT_POOL_IDLE_TIMEOUT_S : DEFAULT_POOL_IDLE_TIMEOUT_S,
@@ -117,26 +154,140 @@ function basePoolOptions() {
     connect_timeout: 30,
     prepare: false,
     onnotice: handlePostgresNotice,
-    ...statementTimeoutOption(),
+    ...startupParameterOptions(),
+  };
+}
+
+const IDLE_IN_TRANSACTION_TIMEOUT_VARIABLE = 'DB_IDLE_IN_TRANSACTION_TIMEOUT_MS';
+
+/**
+ * `DB_STATEMENT_TIMEOUT_MS` as it has always been read: `parseInt`, so `8000ms`
+ * is 8000; nothing when unset, unparseable or not positive.
+ */
+function readStatementTimeoutMs(): number | undefined {
+  const raw = process.env.DB_STATEMENT_TIMEOUT_MS;
+  if (!raw) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return undefined;
+  return parsed;
+}
+
+/** Below a second is almost certainly seconds typed as milliseconds. */
+export const MIN_IDLE_IN_TRANSACTION_TIMEOUT_MS = 1_000;
+/** PostgreSQL's own ceiling for the setting; above it every connection fails. */
+export const MAX_IDLE_IN_TRANSACTION_TIMEOUT_MS = 2_147_483_647;
+
+/**
+ * `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS`, strictly. Unset or empty means nothing to
+ * send, and `0` means off. Anything else must be whole milliseconds from
+ * `MIN_IDLE_IN_TRANSACTION_TIMEOUT_MS` to `MAX_IDLE_IN_TRANSACTION_TIMEOUT_MS`,
+ * or the process fails at boot: `60` (seconds by mistake) would end nearly every
+ * transaction, `99999999999` would fail every connection, and `60s` has no
+ * reading we could trust.
+ */
+function readIdleInTransactionTimeoutMs(): number | undefined {
+  const raw = process.env[IDLE_IN_TRANSACTION_TIMEOUT_VARIABLE]?.trim();
+  if (!raw || raw === '0') return undefined;
+  const parsed = /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < MIN_IDLE_IN_TRANSACTION_TIMEOUT_MS ||
+    parsed > MAX_IDLE_IN_TRANSACTION_TIMEOUT_MS
+  ) {
+    throw new Error(
+      `${IDLE_IN_TRANSACTION_TIMEOUT_VARIABLE} must be 0 (off) or whole milliseconds from ${MIN_IDLE_IN_TRANSACTION_TIMEOUT_MS} to ${MAX_IDLE_IN_TRANSACTION_TIMEOUT_MS}; got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return parsed;
+}
+
+/**
+ * Session timeouts sent as startup parameters. Unitless values are milliseconds
+ * to PostgreSQL.
+ *
+ * - `DB_STATEMENT_TIMEOUT_MS` → `statement_timeout`. Deliberately OFF by
+ *   default: PgBouncer in transaction-pooling mode rejects startup parameters
+ *   that are not in `ignore_startup_parameters`, and `statement_timeout` is not
+ *   allowed there by default — so turning this on against a pooled URL fails
+ *   *every* connection rather than bounding one query. Against a pooler, set it
+ *   on the role instead: `ALTER ROLE <app_role> SET statement_timeout = '8s'`.
+ * - `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` → `idle_in_transaction_session_timeout`.
+ *   Unset here, so scripts, workers and daemons keep the server default (off).
+ *   Request-serving processes set it through `applyRequestPoolDefaults()`. It
+ *   has the same PgBouncer hazard.
+ *
+ * See docs/operations/db-connectivity.md.
+ */
+function startupParameterOptions(): {
+  connection?: { statement_timeout?: number; idle_in_transaction_session_timeout?: number };
+} {
+  const statementTimeout = readStatementTimeoutMs();
+  const idleInTransactionTimeout = readIdleInTransactionTimeoutMs();
+  if (statementTimeout === undefined && idleInTransactionTimeout === undefined) return {};
+  return {
+    connection: {
+      ...(statementTimeout === undefined ? {} : { statement_timeout: statementTimeout }),
+      ...(idleInTransactionTimeout === undefined
+        ? {}
+        : { idle_in_transaction_session_timeout: idleInTransactionTimeout }),
+    },
   };
 }
 
 /**
- * `DB_STATEMENT_TIMEOUT_MS` emits a `statement_timeout` startup parameter.
- * Deliberately OFF by default: PgBouncer in transaction-pooling mode rejects
- * startup parameters that are not in `ignore_startup_parameters`, and
- * `statement_timeout` is not allowed there by default — so turning this on
- * against a pooled URL fails *every* connection rather than bounding one query.
- * Against a pooler, set it on the role instead:
- * `ALTER ROLE <app_role> SET statement_timeout = '8s'`. See docs/db-connectivity.md.
+ * How long a request-serving process lets a session sit idle inside an open
+ * transaction before Postgres ends the session. The reasoning for 60 s is in
+ * docs/operations/db-connectivity.md, "Idle transactions end after 60 s on request pools".
  */
-function statementTimeoutOption(): { connection?: { statement_timeout: number } } {
-  const raw = process.env.DB_STATEMENT_TIMEOUT_MS;
-  if (!raw) return {};
-  const parsed = Number.parseInt(raw, 10);
-  if (!Number.isFinite(parsed) || parsed <= 0) return {};
-  // Unitless `statement_timeout` is milliseconds to PostgreSQL.
-  return { connection: { statement_timeout: parsed } };
+export const REQUEST_POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS = 60_000;
+
+/**
+ * Marks this process as one that serves requests (the backend's HTTP/GraphQL
+ * server, the web server), so every pool it builds from here on sends
+ * `idle_in_transaction_session_timeout`. An explicit
+ * `DB_IDLE_IN_TRANSACTION_TIMEOUT_MS` wins; unset or empty gets the 60 s
+ * default; `0` turns it off. A value out of range throws here, at boot.
+ *
+ * Call it before the first `createDb()`. The shared pools are built once per
+ * process, so one built earlier would keep running without the timeout; this
+ * throws instead of letting that pass silently. A pool built with the same
+ * setting (Next.js re-evaluating a module in dev) is fine.
+ */
+export function applyRequestPoolDefaults(): void {
+  if (!process.env[IDLE_IN_TRANSACTION_TIMEOUT_VARIABLE]?.trim()) {
+    process.env[IDLE_IN_TRANSACTION_TIMEOUT_VARIABLE] = String(REQUEST_POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS);
+  }
+  const expected = readIdleInTransactionTimeoutMs();
+  for (const pool of [cache.client, cache.readClient]) {
+    if (pool && pool.options.connection.idle_in_transaction_session_timeout !== expected) {
+      throw new Error(
+        'applyRequestPoolDefaults(): a shared Postgres pool already exists with a different idle_in_transaction_session_timeout. Call it before anything that calls createDb(), and restart the process after changing DB_IDLE_IN_TRANSACTION_TIMEOUT_MS.',
+      );
+    }
+  }
+}
+
+/**
+ * Marks this process as the web server, so its shared primary pool reads
+ * WEB_DATABASE_URL and falls back to DATABASE_URL when that is unset or blank.
+ * The read replica (READ_REPLICA_URL) is unchanged. Call it before the first
+ * `createDb()`, like `applyRequestPoolDefaults()`; it throws instead of leaving
+ * an earlier pool on a different login. The backend never calls it.
+ *
+ * While `WEB_DATABASE_LOGIN_BLOCKERS` is non-empty, a set WEB_DATABASE_URL is
+ * refused with `WEB_DATABASE_LOGIN_BLOCKED` on every call: the web still writes
+ * identity tables, which that login cannot. `blockers` exists for tests only.
+ */
+export function applyWebDatabaseUrl(blockers: readonly string[] = WEB_DATABASE_LOGIN_BLOCKERS): void {
+  assertWebDatabaseLoginAllowed(blockers);
+  if (isWebDatabaseUrlProcess()) return;
+  const webDatabaseUrl = readWebDatabaseUrl();
+  if (cache.client && webDatabaseUrl && webDatabaseUrl !== process.env.DATABASE_URL) {
+    throw new Error(
+      'applyWebDatabaseUrl(): a shared Postgres pool already exists on DATABASE_URL. Call it before anything that calls createDb().',
+    );
+  }
+  markWebDatabaseUrlProcess(blockers);
 }
 
 const LOCAL_HOST_PATTERN = /@(localhost|127\.0\.0\.1|\[::1\]|postgres|postgres-test)(:|\/|$)/;
@@ -229,6 +380,69 @@ export function createPool() {
     createDb();
   }
   return cache.client!;
+}
+
+/**
+ * What a dedicated pool may set for itself. These take effect only here:
+ * postgres.js copies `connect_timeout` when it builds each connection, so writing
+ * `pool.options` afterwards does nothing. TLS and pooler handling stay shared.
+ */
+export type DedicatedPoolOverrides = {
+  /** Seconds to open a connection, in place of the shared 30. */
+  connect_timeout?: number;
+  /** Startup parameters, merged over the shared ones and over the same names in the URL. */
+  connection?: Partial<postgres.ConnectionParameters>;
+};
+
+/**
+ * postgres.js lets a URL query parameter beat the same startup parameter given
+ * in options, so `?statement_timeout=45000` in DATABASE_URL would undo an
+ * override. Removes only the parameters the caller overrides.
+ */
+function withoutOverriddenUrlParameters(connectionString: string, overriddenNames: readonly string[]): string {
+  const url = new URL(connectionString);
+  const conflictingNames = overriddenNames.filter((name) => url.searchParams.has(name));
+  if (conflictingNames.length === 0) return connectionString;
+  for (const name of conflictingNames) url.searchParams.delete(name);
+  return url.href;
+}
+
+/**
+ * A pool of its own for work that must not compete with the shared one for
+ * connections. Same TLS and pooler handling as the primary, but never cached:
+ * the caller owns it, closes it, and wraps it in drizzle before reading through it.
+ */
+export function createDedicatedPool(max: number, overrides: DedicatedPoolOverrides = {}): PoolInstance {
+  const { connectionString } = getConnectionConfig();
+  return createDedicatedPoolFromUrl(connectionString, max, overrides);
+}
+
+/** Explicit credentials; never consults or mutates the shared DATABASE_URL. */
+export function createDedicatedPoolFromUrl(
+  connectionString: string,
+  max: number,
+  overrides: DedicatedPoolOverrides = {},
+): PoolInstance {
+  const sharedOptions = buildPoolOptions(connectionString);
+  const dedicatedConnectionString = withoutOverriddenUrlParameters(
+    connectionString,
+    Object.keys(overrides.connection ?? {}),
+  );
+  return postgres(dedicatedConnectionString, {
+    ...sharedOptions,
+    ...overrides,
+    max,
+    connection: { ...sharedOptions.connection, ...overrides.connection },
+  });
+}
+
+/**
+ * The full-schema drizzle handle `createDb()` builds, over a pool the caller
+ * owns (usually a `createDedicatedPool`), with the same connect retry. Closing
+ * the pool is still the caller's job.
+ */
+export function createDbOnPool(pool: PoolInstance, options: { readonly logger?: false } = {}): DbInstance {
+  return drizzle(withConnectRetry(pool), { schema: fullSchema, logger: options.logger ?? sqlLogger });
 }
 
 export async function closePool(): Promise<void> {

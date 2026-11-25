@@ -1,33 +1,12 @@
 .hero {
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
-  padding: var(--spacing-12) var(--spacing-4);
-}
-
-.hero::before {
-  content: '';
-  position: absolute;
-  z-index: -1;
-  top: 0;
-  left: 50%;
-  width: 100%;
-  height: 100%;
-  transform: translateX(-50%);
-  background: radial-gradient(
-    ellipse at center,
-    color-mix(in srgb, var(--color-primary-fill) 34%, transparent),
-    color-mix(in srgb, var(--color-primary-fill) 14%, transparent) 38%,
-    transparent 70%
-  );
-  pointer-events: none;
+  padding: var(--spacing-12) 0;
 }
 
 .disclosure {
   margin-top: var(--spacing-8);
   border-top: 1px solid var(--separator);
   padding-top: var(--spacing-6);
-  color: var(--neutral-500);
+  color: var(--neutral-900);
 }
 
 .disclosure p {
@@ -36,7 +15,7 @@
 
 .disclosure h2 {
   font-size: var(--font-size-base);
-  color: var(--neutral-500);
+  color: var(--neutral-900);
 }
 
 .disclosure svg {
@@ -48,7 +27,7 @@
 .heroActions {
   display: flex;
   flex-wrap: wrap;
-  justify-content: center;
+  justify-content: flex-start;
   align-items: center;
   gap: var(--spacing-3);
   margin-top: var(--spacing-5);
@@ -145,6 +124,52 @@
 
 .helpCta {
   margin-top: auto;
+}
+
+/* The hero's "Go monthly" scrolls here; clear the fixed header. */
+.chooser {
+  scroll-margin-top: calc(var(--global-header-height) + var(--spacing-4));
+}
+
+/* The monthly chooser: cadence on the left, currency on the right, wrapping
+   onto two lines on a phone rather than squeezing. */
+.chooserControls {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--spacing-3);
+  margin-bottom: var(--spacing-2);
+}
+
+/* One full-width pill per Payment Link, so a label of any length fits and every
+   target is the same size. */
+.optionList {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--spacing-3);
+  padding-top: var(--spacing-3);
+}
+
+.chooserNote {
+  margin-top: var(--spacing-2);
+  font-size: var(--font-size-sm);
+}
+
+.chooserNote a {
+  display: inline-flex;
+  align-items: center;
+  min-height: 44px;
+}
+
+/* Stripe sends a giver back to ?thanks=1. Above the promise, so it is the first
+   thing they read. */
+.thanksCard {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-2);
+  margin-bottom: var(--spacing-8);
+  text-align: center;
 }
 
 @media (max-width: 760px) {

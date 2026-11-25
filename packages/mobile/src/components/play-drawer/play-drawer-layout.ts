@@ -5,6 +5,7 @@
  */
 
 import type { ClimbQueueItem } from '@boardsesh/queue';
+import type { ActionBarSecondaryItem, ActionBarSecondaryRow } from './action-bar-layout';
 
 export type BoardBox = { width: number; height: number };
 
@@ -26,12 +27,155 @@ export function computeContainedBoardSize(boxWidth: number, boxHeight: number, a
 
 /**
  * Height of the play drawer's first screen: the window minus the reserve that
- * keeps the action bar visible and the Beta Videos header teasing at the fold.
+ * keeps the action bar visible and the first section header teasing at the fold.
  * Floored at a fraction of the window so an over-large reserve (e.g. a wildly
  * mismeasured header) can never collapse the board to nothing.
  */
 export function computeFirstScreenHeight(windowHeight: number, reserve: number, minFraction = 0.5): number {
   return Math.max(windowHeight - reserve, windowHeight * minFraction);
+}
+
+/**
+ * Keep the first section's header above the bottom safe area and its margin.
+ * Without sections, the content plus its bottom safe area exactly fills the viewport.
+ */
+export function computeDrawerFirstScreenHeight({
+  viewport,
+  bottomInset,
+  firstSectionHeaderHeight,
+  sectionTopPadding,
+  sectionMargin,
+}: {
+  viewport: number;
+  bottomInset: number;
+  firstSectionHeaderHeight: number | null;
+  sectionTopPadding: number;
+  sectionMargin: number;
+}): number {
+  if (firstSectionHeaderHeight === null) return Math.max(0, viewport - bottomInset);
+  return computeFirstScreenHeight(viewport, bottomInset + sectionTopPadding + firstSectionHeaderHeight + sectionMargin);
+}
+
+/** Width of the landscape iPad player's Up next / Logbook / Beta panel. */
+export const PLAYER_SIDE_PANEL_WIDTH = 400;
+/**
+ * The narrowest board column worth a side panel. The iPad mini's landscape
+ * window leaves 733pt; a Stage Manager window that leaves less keeps the board
+ * on top instead of squeezing it beside the panel.
+ */
+const MIN_SIDE_BY_SIDE_BOARD_COLUMN = 600;
+
+/**
+ * - `stacked`: the board on top, the sections below (iPhone, and iPad portrait).
+ * - `sideBySide`: the board on the left at full height, with the side panel on
+ *   the right, the way Music's iPad player puts the queue beside the artwork.
+ */
+export type PlayerArrangement = 'stacked' | 'sideBySide';
+
+/**
+ * How the full-screen player lays out in this window. Only a tablet whose window
+ * is wider than tall, with room for the panel and a 600pt board column, goes
+ * side by side; every phone (the iPhone Duo's split included) stays stacked.
+ */
+export function resolvePlayerArrangement({
+  width,
+  height,
+  isTablet,
+}: {
+  width: number;
+  height: number;
+  isTablet: boolean;
+}): PlayerArrangement {
+  if (!isTablet || width <= height) return 'stacked';
+  return width - PLAYER_SIDE_PANEL_WIDTH >= MIN_SIDE_BY_SIDE_BOARD_COLUMN ? 'sideBySide' : 'stacked';
+}
+
+/**
+ * Fits the board to the viewport's height: the first screen fills the viewport
+ * down to the bottom inset and `belowFoldHeight` more hangs below it, with the
+ * sections after that. The usual first screen (`computeDrawerFirstScreenHeight`)
+ * ends a section peek above the viewport's bottom instead.
+ *
+ * - The landscape iPad player hangs its favourite / share row below the fold
+ *   (`ACTION_BAR_SECONDARY_ROW_HEIGHT`), which draws the board larger.
+ * - The phone split's pane (iPhone Duo open in landscape) passes its bottom
+ *   inset, which clears the MiniPlayer capsule (`PhoneSplitPane`), and pads the
+ *   first screen's bottom by it. Both control rows end above the capsule, the
+ *   band under it stays empty at rest, and the sections start below the fold
+ *   and scroll up under the capsule like any list.
+ */
+export function computeFitToHeightFirstScreenHeight({
+  viewport,
+  bottomInset,
+  belowFoldHeight,
+}: {
+  viewport: number;
+  bottomInset: number;
+  belowFoldHeight: number;
+}): number {
+  return Math.max(0, viewport - bottomInset) + belowFoldHeight;
+}
+
+/**
+ * Whether an item may sit below the fold: a plain player button or the gap
+ * between them. The wall button never folds (#6956, Marco's call): a preview's
+ * Put on the wall is the only way to commit it, so it stays on screen. The
+ * `never` default makes a new kind of item a compile error here, so it stays
+ * on screen until someone decides otherwise.
+ */
+function isPlainSecondaryRowItem(item: ActionBarSecondaryItem): boolean {
+  switch (item) {
+    case 'mirror':
+    case 'favorite':
+    case 'queue':
+    case 'share':
+    case 'playNext':
+    case 'angle':
+    case 'spacer':
+      return true;
+    case 'wallControl':
+      return false;
+    default: {
+      const unhandled: never = item;
+      return unhandled;
+    }
+  }
+}
+
+/**
+ * Whether the action bar's second row may fold below the fold: an array with
+ * something in it, every item plain. The busy-wall question and Fell / Sent
+ * (the string rows) and any row with the wall button stay on screen.
+ */
+export function secondaryRowCanFold(secondaryRow: ActionBarSecondaryRow): boolean {
+  if (typeof secondaryRow === 'string' || secondaryRow.length === 0) return false;
+  return secondaryRow.every(isPlainSecondaryRowItem);
+}
+
+/**
+ * Whether the player fits the board to the viewport's height
+ * (`computeFitToHeightFirstScreenHeight`). The host must ask for it.
+ * - The phone split's pane always does: its bottom inset clears the MiniPlayer
+ *   capsule, so every row ends above it whatever the rows hold.
+ * - The landscape iPad player does only with sections to scroll to, with the
+ *   controls under the board, and with a plain second row
+ *   (`secondaryRowCanFold`), which hangs below the fold.
+ */
+export function shouldFitBoardToHeight({
+  fitBoardToHeight,
+  isPane,
+  hasVisibleSections,
+  controlsAbove,
+  secondaryRow,
+}: {
+  fitBoardToHeight: boolean;
+  isPane: boolean;
+  hasVisibleSections: boolean;
+  controlsAbove: boolean;
+  secondaryRow: ActionBarSecondaryRow;
+}): boolean {
+  if (!fitBoardToHeight) return false;
+  return isPane || (hasVisibleSections && !controlsAbove && secondaryRowCanFold(secondaryRow));
 }
 
 /**
@@ -61,15 +205,14 @@ export function shouldShowPanePlaceholder(isPane: boolean, hasDisplayedClimb: bo
 }
 
 /**
- * Scroll offset that brings a just-expanded Logbook section into view. The
- * Logbook is the first below-fold section, so it starts at
+ * Scroll offset that brings a just-expanded first section into view. It starts at
  * `firstScreenHeight + topPadding` in the scroll content. Prefer the minimal
  * scroll that lands the section's bottom just above the home indicator (a short
  * log keeps the board partly visible); for a section taller than the viewport,
  * cap it so the header stops just under the top inset rather than scrolling its
  * own top away. Never returns a negative offset.
  */
-export function computeLogbookScrollTarget(params: {
+export function computeFirstSectionScrollTarget(params: {
   firstScreenHeight: number;
   topPadding: number;
   sectionHeight: number;
@@ -90,13 +233,13 @@ export function computeLogbookScrollTarget(params: {
  * zIndex and hit-tests in reverse paint order, so these numbers decide which layer gets
  * the touch, not just what you see.
  *
- * The board is raised above the incoming peek card, which means the pan-while-zoomed
- * overlay — a SIBLING of the board, not an ancestor — has to be raised above the board
- * too. Bury it and it never receives a touch that starts on the board, which is exactly
- * how panning a zoomed climb died in the player (#4191).
+ * The three boards (the current climb and its two neighbours) share one level: only the
+ * one in the middle is drawn at rest, and two that are both drawn never overlap. The
+ * pan-while-zoomed overlay — a SIBLING of the boards, not an ancestor — has to be raised
+ * above them. Bury it and it never receives a touch that starts on the board, which is
+ * exactly how panning a zoomed climb died in the player (#4191).
  */
 export const CAROUSEL_LAYER_Z = {
-  peek: 0,
   board: 1,
   zoomPan: 2,
   resetZoom: 10,

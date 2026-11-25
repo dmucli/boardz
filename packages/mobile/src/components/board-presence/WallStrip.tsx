@@ -1,11 +1,13 @@
+import { useAuroraPresenceClimb } from '../../hooks/use-aurora-presence-grades';
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback } from 'react';
-import { View, StyleSheet, Pressable } from 'react-native';
+import { View, StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Icon } from '../Icon';
 import { Text } from '../Text';
 import { AccessoryClimbThumbnail } from '../queue-control/AccessoryClimbThumbnail';
-import { useWallClimbIfDistinct } from '../queue-control/use-wall-or-queue-climb';
+import { useLiveWallClimb } from '../queue-control/use-wall-or-queue-climb';
 import { useDrawerHost } from '../../providers/drawer-host-provider';
 import { useTheme } from '../../providers/theme-provider';
 import { useDisplayGrade } from '../../hooks/use-display-grade';
@@ -29,11 +31,11 @@ function WallStripComponent() {
   const insets = useSafeAreaInsets();
   const { systemColors, brandColors } = useTheme();
   const { resolveGrade } = useDisplayGrade();
-  // Pass `null`: the strip always mirrors whatever's lit on the wall, so it never
-  // hides the climb as a duplicate of the local queue head.
-  const litClimb = useWallClimbIfDistinct(null);
+  // The strip always mirrors whatever's lit on the wall.
+  const sourceClimb = useLiveWallClimb();
   const { openBoardSheet, boardPanelProps } = useDrawerHost();
   const boardConfig = boardPanelProps?.boardConfig ?? null;
+  const { climb: litClimb, grade: auroraGrade } = useAuroraPresenceClimb(sourceClimb, boardConfig);
 
   const handlePress = useCallback(() => {
     hapticSelection();
@@ -44,10 +46,12 @@ function WallStripComponent() {
   // `resolveGrade` falls back to the legacy label — the strip lights up the
   // Boardsesh grade once the backend stamps presence climbs. The colour stays the
   // warm live accent, so only the label matters here.
-  const grade = litClimb ? resolveGrade({ difficulty: litClimb.grade ?? '' }).label : null;
+  const grade = litClimb
+    ? resolveGrade(auroraGrade ?? { difficulty: litClimb.grade ?? '' }, boardConfig?.boardName).label
+    : null;
 
   return (
-    <Pressable
+    <PressableSurface
       onPress={handlePress}
       accessibilityRole="button"
       accessibilityLabel={
@@ -75,7 +79,7 @@ function WallStripComponent() {
         <Text variant="caption2" color={systemColors.secondaryLabel} numberOfLines={1}>
           {t('boardPresence.open')}
         </Text>
-        <Text variant="subheadline" color={systemColors.label} numberOfLines={1} style={styles.name}>
+        <Text emphasized variant="subheadline" color={systemColors.label} numberOfLines={1}>
           {litClimb ? (litClimb.name ?? '') : t('boardPresence.railDark')}
         </Text>
       </View>
@@ -85,7 +89,7 @@ function WallStripComponent() {
         </Text>
       ) : null}
       <Icon name="chevron.right" size={16} color={systemColors.tertiaryLabel} />
-    </Pressable>
+    </PressableSurface>
   );
 }
 
@@ -117,6 +121,5 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   body: { flex: 1, minWidth: 0 },
-  name: { fontWeight: '600' },
   grade: { fontWeight: '700' },
 });

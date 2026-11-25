@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { act, render } from '@testing-library/react';
+vi.mock('../../../climb-actions/ClimbActionsPressable', () => import('../../../../../test/climb-menu-stub'));
+import { act, render, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -34,14 +35,29 @@ const theme = vi.hoisted(() => ({
 // Controllable endSession + a captured view of the EndSessionSheet props, so the
 // error path (endSession rejects) can assert the spinner clears.
 const queue = vi.hoisted(() => ({ endSession: vi.fn(), setCurrentClimb: vi.fn() }));
+// What the history list handed the list-play hook, and the tap it got back.
+const tickList = vi.hoisted(() => ({
+  open: vi.fn(),
+  options: undefined as { sourceId: string; label: string; rows: readonly { uuid: string }[] } | undefined,
+}));
 // Session-history ticks fed to the list, so a tap on one can be asserted.
 const detail = vi.hoisted(() => ({ ticks: [] as Record<string, unknown>[] }));
 const sheet = vi.hoisted(() => ({ isEnding: false as boolean, onConfirm: null as (() => void) | null }));
 const router = vi.hoisted(() => ({ push: vi.fn() }));
 
+vi.mock('../../../../lib/playlists/use-tick-list-activation', () => ({
+  useTickListActivation: (options: { sourceId: string; label: string; rows: readonly { uuid: string }[] }) => {
+    tickList.options = options;
+    return tickList.open;
+  },
+}));
 vi.mock('../../RestTimerArmRow', () => ({ RestTimerArmRow: () => null }));
+vi.mock('../WorkoutRunCard', () => ({ WorkoutRunCard: () => null }));
+vi.mock('../AddWorkoutBlockSheet', () => ({ AddWorkoutBlockSheet: () => null }));
 vi.mock('../SessionVisibilityControl', () => ({ SessionVisibilityControl: () => null }));
 vi.mock('react-native', () => ({
+  // This suite exercises the JS chrome fallback; native headers have their own navigation tests.
+  Platform: { OS: 'android' },
   Pressable: ({ children }: { children?: ReactNode }) => createElement('button', null, children),
   StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
   View: ({ children, testID }: { children?: ReactNode; testID?: string }) =>
@@ -103,7 +119,12 @@ vi.mock('@shopify/flash-list', () => ({
 
 vi.mock('expo-crypto', () => ({ randomUUID: () => 'test-uuid' }));
 vi.mock('expo-router', () => ({ useRouter: () => router }));
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string, options?: { count?: number }) =>
+      key === 'mobile.climbRow.frameCount' ? `${options?.count} frames` : key,
+  }),
+}));
 vi.mock('@tanstack/react-query', () => ({ useQueryClient: () => ({ invalidateQueries: vi.fn() }) }));
 vi.mock('@boardsesh/play-view', () => ({ formatGrade: (grade: string) => grade, getGradeTextColor: () => '#fff' }));
 vi.mock('../../../Button', () => ({ Button: () => createElement('button') }));
@@ -113,8 +134,20 @@ vi.mock('../../../Card', () => ({
 vi.mock('../../../GlassSurface', () => ({ GlassSurface: () => null }));
 vi.mock('../../../ListRow', () => ({ ListRow: () => null }));
 vi.mock('../../../PressableSurface', () => ({
-  PressableSurface: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
-    createElement('div', { onClick: onPress, 'data-testid': onPress ? 'pressable' : undefined }, children),
+  PressableSurface: ({
+    children,
+    onPress,
+    accessibilityLabel,
+  }: {
+    children?: ReactNode;
+    onPress?: () => void;
+    accessibilityLabel?: string;
+  }) =>
+    createElement(
+      'div',
+      { onClick: onPress, 'aria-label': accessibilityLabel, 'data-testid': onPress ? 'pressable' : undefined },
+      children,
+    ),
 }));
 vi.mock('../../../SectionHeader', () => ({ SectionHeader: () => null }));
 vi.mock('../../RecordTopChrome', () => ({ RecordTopChrome: () => null }));
@@ -142,6 +175,7 @@ vi.mock('../../../../providers/theme-provider', () => ({
       separator: '#222',
     },
     brandColors: { success: '#0f0', warning: '#ff0', primary: '#00f', error: '#f00' },
+    chartColors: { secondaryLabel: '#999' },
     features: { inBodyLargeTitle: false },
   }),
 }));
@@ -150,6 +184,7 @@ vi.mock('../../../../providers/queue-provider', () => ({
     endSession: queue.endSession,
     clearSession: vi.fn(),
     setCurrentClimb: queue.setCurrentClimb,
+    getQueueSnapshot: () => ({ queue: [], currentClimbQueueItem: null }),
   }),
   useQueueLiveStats: () => ({ liveStats: null, sessionUsers: [] }),
   useQueueSessionControls: () => ({
@@ -165,7 +200,12 @@ vi.mock('../../../../lib/analytics', () => ({ track: vi.fn() }));
 vi.mock('../../use-session-exit-options', () => ({
   useSessionExitOptions: () => ({ canEnd: true, startedOnThisDevice: true, defaultMode: 'end' }),
 }));
-vi.mock('../../../../providers/drawer-host-provider', () => ({ useDrawerHost: () => ({ openPlayDrawer: vi.fn() }) }));
+vi.mock('../../../../providers/drawer-host-provider', () => ({
+  useDrawerHost: () => ({
+    openPlayDrawer: vi.fn(),
+    getClimbActions: (climb: unknown, boardConfig: unknown) => ({ climb, boardConfig }),
+  }),
+}));
 vi.mock('../../../../lib/graphql/hooks', () => ({
   useSessionDetail: () => ({
     data: {
@@ -185,6 +225,20 @@ vi.mock('../../../../lib/store-review', () => ({
   isSessionStoreReviewEligible: (summary: { totalSends: number }) => summary.totalSends >= 3,
 }));
 vi.mock('../../../../lib/graphql/use-active-board', () => ({ useActiveBoard: () => ({ data: null }) }));
+// #6903: the queued-tick wait (handed to endSession as `beforeEnd`) and the
+// late-tick summary refresh.
+const outbox = vi.hoisted(() => ({
+  calls: [] as string[],
+  waitForSessionTicksToSync: vi.fn(),
+  refreshSessionWhenQueuedTicksLand: vi.fn(),
+}));
+vi.mock('../../../../offline/session-tick-drain', () => ({
+  waitForSessionTicksToSync: outbox.waitForSessionTicksToSync,
+  refreshSessionWhenQueuedTicksLand: outbox.refreshSessionWhenQueuedTicksLand,
+}));
+vi.mock('../../../../offline/session-workout-outbox', () => ({
+  enqueueSessionWorkoutWrite: vi.fn(async () => 'skipped'),
+}));
 vi.mock('../../../../lib/integrations', () => ({
   runSessionEndExports: integrations.runSessionEndExports,
 }));
@@ -198,7 +252,6 @@ vi.mock('../../../../lib/playlists/board-details-for-playlist', () => ({
   getBoardConfigForPlaylist: () => null,
   renderBoardToPlaylistConfig: () => null,
 }));
-vi.mock('../../../../lib/open-climb-in-play-drawer', () => ({ openClimbInPlayDrawer: vi.fn() }));
 vi.mock('../../../../hooks/use-grade-format', () => ({
   useGradeFormat: () => ({ formatGrade: (grade: string | null) => grade, formatGradeByDifficultyId: () => null }),
 }));
@@ -227,11 +280,20 @@ describe('InSessionView footer', () => {
     theme.variant = 'liquidGlass';
     queue.endSession.mockReset();
     queue.endSession.mockResolvedValue(null);
+    outbox.calls = [];
+    outbox.waitForSessionTicksToSync.mockReset();
+    outbox.waitForSessionTicksToSync.mockImplementation(async () => {
+      outbox.calls.push('wait');
+      return 'none';
+    });
+    outbox.refreshSessionWhenQueuedTicksLand.mockReset();
     router.push.mockClear();
     sheet.isEnding = false;
     sheet.onConfirm = null;
     integrations.runSessionEndExports.mockReset();
     queue.setCurrentClimb.mockReset();
+    tickList.open.mockReset();
+    tickList.options = undefined;
     detail.ticks = [];
   });
 
@@ -313,27 +375,26 @@ describe('InSessionView footer', () => {
 
     await act(async () => {
       sheet.onConfirm?.();
-      // handleConfirmEnd awaits endSession before exporting; flush it.
-      await Promise.resolve();
     });
 
-    expect(integrations.runSessionEndExports).toHaveBeenCalledWith(summary, {});
+    // handleConfirmEnd awaits the tick wait and endSession before exporting.
+    await waitFor(() => expect(integrations.runSessionEndExports).toHaveBeenCalledWith(summary, {}));
   });
 
   it('marks the summary route as a store-review candidate after 3 ascents', async () => {
-    queue.endSession.mockResolvedValueOnce({
-      sessionId: 'session-1',
-      totalSends: 3,
-      totalAttempts: 0,
+    // Runs the tick wait like the real endSession: the prompt needs the ticks synced.
+    queue.endSession.mockImplementationOnce(async (options?: { beforeEnd?: (id: string) => Promise<void> }) => {
+      await options?.beforeEnd?.('session-1');
+      return { sessionId: 'session-1', totalSends: 3, totalAttempts: 0 };
     });
 
     render(createElement(InSessionView));
 
     await act(async () => {
       sheet.onConfirm?.();
-      await Promise.resolve();
     });
 
+    await waitFor(() => expect(router.push).toHaveBeenCalled());
     expect(router.push).toHaveBeenCalledWith({
       pathname: '/(tabs)/record/summary',
       params: { sessionId: 'session-1', reviewCandidate: '1' },
@@ -351,15 +412,85 @@ describe('InSessionView footer', () => {
 
     await act(async () => {
       sheet.onConfirm?.();
-      await Promise.resolve();
     });
 
+    await waitFor(() => expect(router.push).toHaveBeenCalled());
     expect(router.push).toHaveBeenCalledWith({
       pathname: '/(tabs)/record/summary',
       params: { sessionId: 'session-1' },
     });
   });
-  it('drops the list source when a history tick is tapped so swipes walk the queue (#4829)', () => {
+
+  it('hands the queued-tick wait to endSession as beforeEnd (#6903)', async () => {
+    queue.endSession.mockImplementationOnce(async (options?: { beforeEnd?: (id: string) => Promise<void> }) => {
+      await options?.beforeEnd?.('session-1');
+      outbox.calls.push('endSession');
+      return { sessionId: 'session-1', totalSends: 1, totalAttempts: 0 };
+    });
+
+    render(createElement(InSessionView));
+
+    await act(async () => {
+      sheet.onConfirm?.();
+    });
+
+    await waitFor(() => expect(router.push).toHaveBeenCalled());
+    expect(outbox.waitForSessionTicksToSync).toHaveBeenCalledWith('session-1', expect.anything());
+    expect(outbox.calls).toEqual(['wait', 'endSession']);
+    expect(outbox.refreshSessionWhenQueuedTicksLand).not.toHaveBeenCalled();
+  });
+
+  it.each(['timedOut', 'offline'])(
+    'holds back the store-review prompt and watches for late ticks when the wait ended %s (#6903)',
+    async (waitResult) => {
+      outbox.waitForSessionTicksToSync.mockResolvedValue(waitResult);
+      queue.endSession.mockImplementationOnce(async (options?: { beforeEnd?: (id: string) => Promise<void> }) => {
+        await options?.beforeEnd?.('session-1');
+        return { sessionId: 'session-1', totalSends: 3, totalAttempts: 0 };
+      });
+
+      render(createElement(InSessionView));
+
+      await act(async () => {
+        sheet.onConfirm?.();
+      });
+
+      await waitFor(() => expect(router.push).toHaveBeenCalled());
+      expect(router.push).toHaveBeenCalledWith({
+        pathname: '/(tabs)/record/summary',
+        params: { sessionId: 'session-1' },
+      });
+      expect(outbox.refreshSessionWhenQueuedTicksLand).toHaveBeenCalledWith('session-1', expect.anything());
+    },
+  );
+
+  it.each(['p1r15', 'p1r15,"p2r15,"'])('announces route frame counts on the history action: %s', (frames) => {
+    detail.ticks = [
+      {
+        uuid: 'tick-1',
+        climbUuid: 'climb-1',
+        climbName: 'Long Route',
+        frames,
+        angle: 40,
+        status: 'send',
+        userId: 'user-1',
+        climbedAt: '2026-01-01T00:10:00.000Z',
+        boardType: 'kilter',
+        layoutId: 1,
+        isMirror: false,
+        isNoMatch: false,
+      },
+    ];
+    const { getAllByTestId } = render(createElement(InSessionView));
+    expect(getAllByTestId('climb-actions-body')[0].getAttribute('aria-label')).toBe(
+      frames.includes(',') ? 'mobile.session.historyRowAria, 3 frames' : 'mobile.session.historyRowAria',
+    );
+  });
+
+  // Issue #6665: a history tap used to make the climb current for everyone with
+  // a fresh queue entry, which took a crewmate's wall and queued a second copy.
+  // It now plays from the session's ticks through the same hook as every list.
+  it('plays a history tick from the session list without taking the wall itself', () => {
     detail.ticks = [
       {
         uuid: 'tick-1',
@@ -375,17 +506,33 @@ describe('InSessionView footer', () => {
         isMirror: false,
         isNoMatch: false,
       },
+      {
+        uuid: 'tick-2',
+        climbUuid: 'climb-2',
+        climbName: 'Later Route',
+        frames: 'p2r15',
+        angle: 40,
+        status: 'send',
+        userId: 'user-1',
+        climbedAt: '2026-01-01T00:20:00.000Z',
+        boardType: 'woods',
+        layoutId: 1,
+        isMirror: false,
+        isNoMatch: false,
+      },
     ];
     const { getAllByTestId } = render(createElement(InSessionView));
 
     act(() => {
-      getAllByTestId('pressable')[0].click();
+      getAllByTestId('climb-actions-body')[0].click();
     });
 
-    expect(queue.setCurrentClimb).toHaveBeenCalledTimes(1);
-    expect(queue.setCurrentClimb).toHaveBeenCalledWith(
-      expect.objectContaining({ climb: expect.objectContaining({ uuid: 'climb-1' }) }),
-      { playlistSuggestionSource: null },
-    );
+    // Newest first, as the history lists them, and named for the player.
+    expect(tickList.options?.rows.map(({ uuid }) => uuid)).toEqual(['tick-2', 'tick-1']);
+    expect(tickList.options?.label).toBe('playView.track.sessionClimbs');
+    expect(tickList.open).toHaveBeenCalledTimes(1);
+    expect(tickList.open).toHaveBeenCalledWith(expect.objectContaining({ uuid: 'tick-2' }));
+    // The hook decides whether the climb goes up; the history writes nothing.
+    expect(queue.setCurrentClimb).not.toHaveBeenCalled();
   });
 });

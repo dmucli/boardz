@@ -12,10 +12,16 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  MAX_IOS_CAMPAIGN_PHONE_COMMANDS,
+  MAX_IOS_CAMPAIGN_DUO_COMMANDS,
+  iosCampaignPhoneScene,
+  iosCampaignDuoScene,
+} from './ios-campaign-phone-scenes';
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const MOBILE_DIR = resolve(ROOT_DIR, 'packages', 'mobile');
@@ -29,7 +35,17 @@ export const METRO_LOG_PATH = join(tmpdir(), 'boardsesh-screenshot-metro.log');
 // 8081; override with BOARDSESH_METRO_PORT when it's taken (this repo runs a
 // Metro per worktree). The orchestrator passes the matching dev-client URL to
 // Maestro via `-e MAESTRO_DEV_CLIENT_URL`, so the flows never hard-code a port.
-export const METRO_PORT = Number.parseInt(process.env.BOARDSESH_METRO_PORT ?? '', 10) || 8081;
+export const DEFAULT_METRO_PORT = 8081;
+export const METRO_PORT = Number.parseInt(process.env.BOARDSESH_METRO_PORT ?? '', 10) || DEFAULT_METRO_PORT;
+
+/**
+ * Where a Metro on `port` tees its output. 8081 keeps METRO_LOG_PATH (CI uploads
+ * it by that name); any other port gets its own file, so two Metros on one
+ * machine never truncate and interleave the same log.
+ */
+export function metroLogPathForPort(port: number = METRO_PORT): string {
+  return port === DEFAULT_METRO_PORT ? METRO_LOG_PATH : join(tmpdir(), `boardsesh-screenshot-metro-${port}.log`);
+}
 // The app pings this local port (from the sim, which shares the host loopback)
 // once it reaches home, so reach-home detection doesn't depend on Metro forwarding
 // the `$screen /home` marker to its stdout — that forwarding intermittently dies
@@ -45,13 +61,37 @@ function runCapture(command: string, args: string[]): { status: number; stdout: 
 }
 
 /** expo-development-client deep link that loads the JS bundle from our Metro. */
-export function metroDevClientUrl(metroPort = METRO_PORT): string {
-  return `${DEV_CLIENT_URL_SCHEME}://expo-development-client/?url=${encodeURIComponent(`http://localhost:${metroPort}`)}`;
+export function metroDevClientUrl(metroPort = METRO_PORT, scheme = DEV_CLIENT_URL_SCHEME): string {
+  return `${scheme}://expo-development-client/?url=${encodeURIComponent(`http://localhost:${metroPort}`)}`;
+}
+
+/** Unique pids from `ss -p` output (`users:(("node",pid=1234,fd=23))`). */
+export function parseSsListenerPids(output: string): number[] {
+  const pids = new Set<number>();
+  for (const match of output.matchAll(/pid=(\d+)/g)) pids.add(Number.parseInt(match[1], 10));
+  return [...pids];
+}
+
+/** Pids listening on a TCP port. Tries lsof, then `ss` for boxes without lsof (Fedora). */
+export function listeningPids(port: number): number[] {
+  const lsof = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8' });
+  if (!lsof.error) {
+    return (lsof.stdout ?? '')
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((pid) => Number.parseInt(pid, 10));
+  }
+  const ss = spawnSync('ss', ['-Hltnp', 'sport', '=', `:${port}`], { encoding: 'utf8' });
+  return ss.error ? [] : parseSsListenerPids(ss.stdout ?? '');
 }
 
 /** True if anything is already listening on the port (a foreign Metro). */
 export function portInUse(port: number): boolean {
-  return spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t']).status === 0;
+  const lsof = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN', '-t']);
+  if (!lsof.error) return lsof.status === 0;
+  // Without -p, so another user's listener still counts.
+  const ss = spawnSync('ss', ['-Hltn', 'sport', '=', `:${port}`], { encoding: 'utf8' });
+  return !ss.error && (ss.stdout ?? '').trim().length > 0;
 }
 
 /**
@@ -62,6 +102,11 @@ export function portInUse(port: number): boolean {
 // home. The reach-home wait counts new lines alongside the Metro `$screen /home`
 // marker — a signal that survives Metro's log forwarding dying.
 export const READINESS_LOG_PATH = join(tmpdir(), 'boardsesh-screenshot-ready.log');
+// The smoke flow's pings (`/smoke?kind=content&route=…&count=…`, or `kind=error`),
+// one request URL per line, written by the same readiness server. Kept apart
+// from READINESS_LOG_PATH because that file is a counter: every line in it means
+// "reached home". Parsed by scripts/lib/mobile-smoke.ts.
+export const SMOKE_PING_LOG_PATH = join(tmpdir(), 'boardsesh-screenshot-smoke-pings.log');
 // `logPath` is parameterized for tests only, so they never touch the real log a
 // concurrent capture run might be counting.
 export function screenshotReadinessCount(logPath: string = READINESS_LOG_PATH): number {
@@ -85,6 +130,62 @@ export function readinessServerReachable(): boolean {
   return probe.status === 0;
 }
 
+/** The exact detached child script, also exercised without opening a socket in tests. */
+export function buildReadinessServerScript(cppCountBackendPort?: number): string {
+  if (
+    cppCountBackendPort !== undefined &&
+    (!Number.isSafeInteger(cppCountBackendPort) || cppCountBackendPort < 1 || cppCountBackendPort > 65535)
+  )
+    throw new Error('CPP count backend requires a real local port');
+  return [
+    `const http = require('http');`,
+    `const fs = require('fs');`,
+    `let cppCommand = { sequence: 0, scene: 'reset' };`,
+    `let cppAcknowledged = -1;`,
+    `const cppScenes = new Set(['reset', 'hero-1', 'hero-2', 'hero-3', 'hero-2-editor-list', 'hero-3-editor-list', 'other-1', 'other-2', 'other-3', 'accessory-prepare', 'search', 'search-grade', 'search-results', 'logbook', 'led', 'queue-join', 'queue', 'workout', 'status', 'status-ipad', 'island', 'kiosk', ...${JSON.stringify(Array.from({ length: MAX_IOS_CAMPAIGN_PHONE_COMMANDS }, (_, index) => iosCampaignPhoneScene(index)))}, ...${JSON.stringify(Array.from({ length: MAX_IOS_CAMPAIGN_DUO_COMMANDS }, (_, index) => iosCampaignDuoScene(index)))}]);`,
+    `http.createServer((request, response) => {`,
+    `  const url = new URL(request.url || '/', 'http://localhost');`,
+    `  if (url.pathname.startsWith('/cpp/')) {`,
+    `    if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress)) { response.writeHead(403); response.end(); return; }`,
+    ...(cppCountBackendPort === undefined
+      ? []
+      : [
+          `    if (url.pathname === '/cpp/grade-count') {`,
+          `      const sequence = Number(url.searchParams.get('sequence')); const locale = url.searchParams.get('locale');`,
+          `      const valid = () => Number.isSafeInteger(sequence) && sequence > 0 && sequence === cppCommand.sequence && sequence === cppAcknowledged && cppCommand.scene === 'search-grade' && ['en-US', 'es', 'fr', 'de'].includes(locale);`,
+          `      const sendCount = (status, body) => { if (!response.destroyed) { response.writeHead(status, {'Content-Type':'application/json', 'Cache-Control':'no-store'}); response.end(JSON.stringify(body)); } };`,
+          `      if (!valid()) { sendCount(409, {error:'CPP grade count scene, sequence or locale differs'}); return; }`,
+          `      const deadline = Date.now() + 8000;`,
+          `      const poll = async () => { try { if (!valid()) { sendCount(409, {error:'CPP grade count scene changed'}); return; } const upstream = await fetch('http://127.0.0.1:${cppCountBackendPort}/__screenshot-backend/cpp-grade-count?locale=' + encodeURIComponent(locale), {signal:AbortSignal.timeout(2000)}); if (upstream.ok) { const body = await upstream.json(); if (!valid()) { sendCount(409, {error:'CPP grade count scene changed'}); return; } sendCount(200, {...body, sequence, locale}); return; } } catch {} if (response.destroyed) return; if (Date.now() >= deadline) { sendCount(409, {error:'CPP exact grade count proof unavailable'}); return; } setTimeout(poll, 100); };`,
+          `      void poll(); return;`,
+          `    }`,
+        ]),
+    `    if (url.pathname === '/cpp/set') {`,
+    `      const scene = url.searchParams.get('scene');`,
+    `      if (!cppScenes.has(scene)) { response.writeHead(400); response.end(); return; }`,
+    `      cppCommand = { sequence: cppCommand.sequence + 1, scene };`,
+    `    } else if (url.pathname === '/cpp/ack') { const sequence = Number(url.searchParams.get('sequence')); if (Number.isSafeInteger(sequence) && sequence >= 0 && sequence <= cppCommand.sequence) cppAcknowledged = Math.max(cppAcknowledged, sequence); } else if (!['/cpp/command', '/cpp/status'].includes(url.pathname)) { response.writeHead(404); response.end(); return; }`,
+    `    const send = () => { response.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); response.end(JSON.stringify({ ...cppCommand, acknowledged: cppAcknowledged })); };`,
+    `    const waitFor = Number(url.searchParams.get('waitFor'));`,
+    `    if (url.pathname === '/cpp/status' && Number.isSafeInteger(waitFor) && waitFor > cppAcknowledged) {`,
+    `      const deadline = Date.now() + 8000;`,
+    `      const timer = setInterval(() => { if (cppAcknowledged >= waitFor || Date.now() >= deadline) { clearInterval(timer); send(); } }, 100);`,
+    `      response.on('close', () => clearInterval(timer)); return;`,
+    `    }`,
+    `    send(); return;`,
+    `  }`,
+    `  if (request.url && request.url.indexOf('/ready') === 0) {`,
+    `    fs.appendFileSync(${JSON.stringify(READINESS_LOG_PATH)}, 'x\\n');`,
+    `  }`,
+    `  if (request.url && request.url.indexOf('/smoke') === 0) {`,
+    `    fs.appendFileSync(${JSON.stringify(SMOKE_PING_LOG_PATH)}, request.url + '\\n');`,
+    `  }`,
+    `  response.statusCode = 204;`,
+    `  response.end();`,
+    `}).listen(${SCREENSHOT_READY_PORT}, '0.0.0.0');`,
+  ].join('\n');
+}
+
 /**
  * Start the readiness server as a SEPARATE detached process. The orchestrator
  * itself is fully synchronous (spawnSync for sleep/simctl/maestro), so an
@@ -94,19 +195,10 @@ export function readinessServerReachable(): boolean {
  * 0.0.0.0 so the simulator reaches it over IPv4 the same way it reaches Metro.
  * Truncates the log first; kill the returned process in a finally.
  */
-export function startReadinessServer(): ChildProcess {
+export function startReadinessServer(cppCountBackendPort?: number): ChildProcess {
   writeFileSync(READINESS_LOG_PATH, '');
-  const serverCode = [
-    `const http = require('http');`,
-    `const fs = require('fs');`,
-    `http.createServer((request, response) => {`,
-    `  if (request.url && request.url.indexOf('/ready') === 0) {`,
-    `    fs.appendFileSync(${JSON.stringify(READINESS_LOG_PATH)}, 'x\\n');`,
-    `  }`,
-    `  response.statusCode = 204;`,
-    `  response.end();`,
-    `}).listen(${SCREENSHOT_READY_PORT}, '0.0.0.0');`,
-  ].join('\n');
+  writeFileSync(SMOKE_PING_LOG_PATH, '');
+  const serverCode = buildReadinessServerScript(cppCountBackendPort);
   const server = spawn(process.execPath, ['-e', serverCode], { stdio: 'ignore', detached: true });
   // Don't let the child keep the orchestrator's event loop alive at exit.
   server.unref();
@@ -146,7 +238,40 @@ export function stopReadinessServer(server: ChildProcess): void {
   }
 }
 
-export function startMetro(env: NodeJS.ProcessEnv): ChildProcess {
+export interface StartMetroOptions {
+  /**
+   * Keep Metro's file watcher on so edits hot-reload. Off by default: `CI=1`
+   * keeps expo non-interactive, and Expo also turns watching off under it,
+   * which store captures want (one frozen bundle per run).
+   */
+  watch?: boolean;
+  /** Where Metro's output is tee'd. Defaults to METRO_LOG_PATH. */
+  logPath?: string;
+}
+
+/**
+ * The environment `expo start` runs with. A watch run drops `CI` (Expo disables
+ * file watching under it) and defaults TAILSCALE_HOSTNAME to localhost: without
+ * it, Metro's log socket to the app dies after about five minutes on a machine
+ * running Tailscale, and console lines stop reaching the log.
+ */
+export function metroProcessEnv(env: NodeJS.ProcessEnv, watch = false): NodeJS.ProcessEnv {
+  if (!watch) return { ...env, CI: '1' };
+  const watchEnv: NodeJS.ProcessEnv = { ...env, TAILSCALE_HOSTNAME: env.TAILSCALE_HOSTNAME ?? 'localhost' };
+  delete watchEnv.CI;
+  return watchEnv;
+}
+
+/**
+ * The ad-hoc shots scripts' default: watch while `run` holds Metro, so edits
+ * hot-reload into the open app; a `--shutdown` one-shot never edits mid-run.
+ * `--watch` / `--no-watch` set `watch` explicitly.
+ */
+export function shotsMetroWatch(options: { watch: boolean | null; shutdown: boolean }): boolean {
+  return options.watch ?? !options.shutdown;
+}
+
+export function startMetro(env: NodeJS.ProcessEnv, options: StartMetroOptions = {}): ChildProcess {
   // Pipe Metro's output through `tee` to METRO_LOG_PATH so waitForHomeReady can poll
   // it for the app's "$screen /home" marker — the JS console logs land in Metro's
   // stdout, NOT the device's unified log.
@@ -163,9 +288,10 @@ export function startMetro(env: NodeJS.ProcessEnv): ChildProcess {
   //     so the marker appears promptly. `tee` (no `-a`) truncates for a clean run.
   // Trade-off: Metro no longer streams into the live CI run log — dumpMetroLogTail
   // surfaces it on a reach-home failure instead.
-  return spawn('sh', ['-c', `vp exec expo start --port ${METRO_PORT} 2>&1 | tee ${METRO_LOG_PATH}`], {
+  const logPath = options.logPath ?? METRO_LOG_PATH;
+  return spawn('sh', ['-c', `vp exec expo start --port ${METRO_PORT} 2>&1 | tee '${logPath}'`], {
     cwd: MOBILE_DIR,
-    env: { ...env, CI: '1' },
+    env: metroProcessEnv(env, options.watch),
     stdio: 'ignore',
     detached: true,
   });
@@ -177,15 +303,13 @@ export function startMetro(env: NodeJS.ProcessEnv): ChildProcess {
  * app-side console output (auth errors, a redbox, a missing `$screen /home`) is
  * surfaced for debugging.
  */
-export function dumpMetroLogTail(lines = 80): void {
-  if (!existsSync(METRO_LOG_PATH)) {
-    console.error(`${LOG} (no Metro log at ${METRO_LOG_PATH} to dump)`);
+export function dumpMetroLogTail(lines = 80, logPath: string = METRO_LOG_PATH): void {
+  if (!existsSync(logPath)) {
+    console.error(`${LOG} (no Metro log at ${logPath} to dump)`);
     return;
   }
-  const tail = readFileSync(METRO_LOG_PATH, 'utf8').split('\n').slice(-lines).join('\n');
-  console.error(
-    `${LOG} --- last ${lines} lines of Metro log (${METRO_LOG_PATH}) ---\n${tail}\n${LOG} --- end Metro log ---`,
-  );
+  const tail = readFileSync(logPath, 'utf8').split('\n').slice(-lines).join('\n');
+  console.error(`${LOG} --- last ${lines} lines of Metro log (${logPath}) ---\n${tail}\n${LOG} --- end Metro log ---`);
 }
 
 /**
@@ -293,8 +417,8 @@ function sleepSeconds(seconds: number): void {
  * analytics line lands in Metro's stdout (NOT the device's unified log), which
  * startMetro tee's to METRO_LOG_PATH — so count occurrences in that file.
  */
-export function homeReadyMarkerCount(): number {
-  const metroLog = existsSync(METRO_LOG_PATH) ? readFileSync(METRO_LOG_PATH, 'utf8') : '';
+export function homeReadyMarkerCount(metroLogPath: string = METRO_LOG_PATH): number {
+  const metroLog = existsSync(metroLogPath) ? readFileSync(metroLogPath, 'utf8') : '';
   return metroLog.split('$screen /home').length - 1;
 }
 
@@ -307,13 +431,75 @@ export function homeReadyMarkerCount(): number {
  *   - the Metro `$screen /home` marker (fast, but lost when Metro's log forwarding
  *     dies mid-run with ERR_STREAM_UNABLE_TO_PIPE), and
  *   - a direct GET from the app to the readiness server (survives that).
+ *
+ * `giveUpWhen` ends the wait early with `false`. The smoke passes "the app's
+ * process has died" so a launch crash costs seconds, not the whole timeout.
  */
-export function waitForHomeReady(markerBaseline = 0, readyBaseline = 0, timeoutSeconds = 180): boolean {
+export function waitForHomeReady(
+  markerBaseline = 0,
+  readyBaseline = 0,
+  timeoutSeconds = 180,
+  giveUpWhen?: () => boolean,
+  metroLogPath: string = METRO_LOG_PATH,
+): boolean {
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline) {
-    if (homeReadyMarkerCount() > markerBaseline) return true;
+    if (homeReadyMarkerCount(metroLogPath) > markerBaseline) return true;
     if (screenshotReadinessCount() > readyBaseline) return true;
+    if (giveUpWhen?.()) return false;
     sleepSeconds(2);
   }
   return false;
+}
+
+/** The log's size in bytes now: the baseline for readMetroLogSince. 0 if it doesn't exist yet. */
+export function metroLogOffset(logPath: string = METRO_LOG_PATH): number {
+  return existsSync(logPath) ? statSync(logPath).size : 0;
+}
+
+/**
+ * Everything written to the log after `offset`. Reads only the new bytes, so
+ * polling a long watch session's log stays cheap. A log smaller than the offset
+ * was truncated by a Metro restart; read it from the start.
+ */
+export function readMetroLogSince(offset: number, logPath: string = METRO_LOG_PATH): string {
+  if (!existsSync(logPath)) return '';
+  const size = statSync(logPath).size;
+  const start = size < offset ? 0 : offset;
+  if (size === start) return '';
+  const buffer = Buffer.alloc(size - start);
+  const descriptor = openSync(logPath, 'r');
+  try {
+    readSync(descriptor, buffer, 0, buffer.length, start);
+  } finally {
+    closeSync(descriptor);
+  }
+  return buffer.toString('utf8');
+}
+
+/** Metro's "iOS Bundled 812ms index.ts (4102 modules)" line: the app asked this Metro for its bundle. */
+export function isIosBundledLine(line: string): boolean {
+  return /\biOS\b.*\bBundled\b/.test(line);
+}
+
+/**
+ * Poll the log for a line written after `offset` that `matches`. Returns the
+ * first matching line, or null once `timeoutSeconds` pass.
+ */
+export function waitForMetroLogLine(
+  matches: (line: string) => boolean,
+  offset: number,
+  timeoutSeconds: number,
+  logPath: string = METRO_LOG_PATH,
+  pollSeconds = 0.25,
+): string | null {
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  for (;;) {
+    const found = readMetroLogSince(offset, logPath)
+      .split('\n')
+      .find((line) => matches(line));
+    if (found !== undefined) return found;
+    if (Date.now() >= deadline) return null;
+    sleepSeconds(pollSeconds);
+  }
 }

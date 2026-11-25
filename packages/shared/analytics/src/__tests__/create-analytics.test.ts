@@ -5,14 +5,21 @@ import type { PostHogClient } from '../client';
 function fakeClient() {
   const capture = vi.fn();
   const identify = vi.fn();
-  const alias = vi.fn();
   const reset = vi.fn();
   const setPersonProperties = vi.fn();
-  const client: PostHogClient = { capture, identify, alias, reset, setPersonProperties };
-  return { client, capture, identify, alias, reset, setPersonProperties };
+  const client: PostHogClient = { capture, identify, reset, setPersonProperties };
+  return { client, capture, identify, reset, setPersonProperties };
 }
 
 describe('createAnalytics', () => {
+  it('forwards deduplication UUID and original timestamp through boolean capture', () => {
+    const fake = fakeClient();
+    const analytics = createAnalytics(() => fake.client);
+    const options = { timestamp: new Date('2026-10-10T00:00:00.000Z'), uuid: '602c83bf-e090-4c90-9f7e-08ca0b6b5dad' };
+    expect(analytics.capture('Signup Completed', { provider: 'apple', absent: undefined }, options)).toBe(true);
+    expect(fake.capture).toHaveBeenCalledWith('Signup Completed', { provider: 'apple' }, options);
+    expect(createAnalytics(() => null).capture('Signup Completed', {}, options)).toBe(false);
+  });
   it('forwards track to capture with undefined properties stripped', () => {
     const fake = fakeClient();
     const analytics = createAnalytics(() => fake.client);
@@ -45,7 +52,6 @@ describe('createAnalytics', () => {
     expect(analytics.capture('Session Started')).toBe(false);
     expect(analytics.identify('user-1')).toBe(false);
     expect(analytics.setPersonProperties({ language: 'en' })).toBe(false);
-    expect(analytics.alias('user-1')).toBe(false);
     expect(analytics.reset()).toBe(false);
   });
 
@@ -56,12 +62,10 @@ describe('createAnalytics', () => {
     expect(analytics.capture('X')).toBe(true);
     expect(analytics.identify('user-1', { email: 'a@b.com' })).toBe(true);
     expect(analytics.setPersonProperties({ language: 'fr' }, { signup_at: '2024' })).toBe(true);
-    expect(analytics.alias('user-1')).toBe(true);
     expect(analytics.reset()).toBe(true);
 
     expect(fake.identify).toHaveBeenCalledWith('user-1', { email: 'a@b.com' });
     expect(fake.setPersonProperties).toHaveBeenCalledWith({ language: 'fr' }, { signup_at: '2024' });
-    expect(fake.alias).toHaveBeenCalledWith('user-1');
   });
 
   it('drops calls and never resolves the client when shouldSkip returns true', () => {

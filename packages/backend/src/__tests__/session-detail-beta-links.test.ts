@@ -76,7 +76,7 @@ function makeChain(rows: Record<string, unknown>[], onWhere?: (clause: unknown) 
 }
 
 vi.mock('../db/client', () => {
-  const select = vi.fn(() => ({
+  const select = vi.fn((projection?: Record<string, unknown>) => ({
     from: (table: unknown) => {
       if (table === dbSchema.boardBetaLinks) {
         betaLinkTestState.betaLinkSelectCallCount.value += 1;
@@ -95,7 +95,16 @@ vi.mock('../db/client', () => {
         ]);
       }
       if (table === dbSchema.boardseshTicks) {
-        return makeChain(betaLinkTestState.tickRows);
+        return makeChain(
+          // The readable-ticks lookup selects the uuid and whether its note is
+          // readable; every tick in these cases is the viewer's to read.
+          projection && 'uuid' in projection && !('tick' in projection)
+            ? betaLinkTestState.tickRows.map((row) => ({
+                uuid: (row.tick as { uuid: string }).uuid,
+                noteReadable: true,
+              }))
+            : betaLinkTestState.tickRows,
+        );
       }
       if (table === dbSchema.voteCounts) {
         // Both the per-tick batch (entityType='tick') and the session-level
@@ -164,6 +173,8 @@ function makeTickRow(overrides: {
   /** Boardsesh grade fields as the sessionDetail select aliases them (top-level). */
   boardseshDifficulty?: number | null;
   boardseshConfidence?: string | null;
+  /** Structured matching/feet rules (see decodeClimbRules). Defaults to unrecorded. */
+  characteristics?: string[] | null;
 }) {
   const boardType = overrides.boardType ?? 'kilter';
   const angle = overrides.angle ?? 40;
@@ -185,6 +196,8 @@ function makeTickRow(overrides: {
     },
     climbName: overrides.climbName,
     climbDescription: '',
+    // Match the alias selected by sessionDetail's Drizzle projection.
+    climbCharacteristics: overrides.characteristics ?? null,
     setterUsername: 'setter',
     layoutId: 1,
     frames: 'p1r1',
@@ -376,4 +389,46 @@ describe('sessionDetail per-tick betaLinks (tick-scoped to the crew)', () => {
     expect(byUuid.get('tick-ungraded')?.boardseshDifficulty).toBeNull();
     expect(byUuid.get('tick-ungraded')?.boardseshConfidence).toBeNull();
   });
+
+  // Regression guard for #5245: the characteristics assertions are the guard.
+  // characteristics must reach the client so the mobile Logbook/session play
+  // drawer can show Woods' explicit rules — see tickToClimb in
+  // packages/mobile/src/lib/tick-to-climb.ts. isNoMatch already comes from
+  // resolveClimbNoMatch; it is asserted only to pin that it agrees with the
+  // array on a climb with an empty description (fixture below).
+  it('carries characteristics onto each session-detail tick and derives isNoMatch from it', async () => {
+    betaLinkTestState.tickRows = [
+      makeTickRow({
+        uuid: 'tick-no-match',
+        climbUuid: 'climb-a',
+        climbName: 'No Match Send',
+        characteristics: ['no_match'],
+      }),
+      // No characteristics recorded → null, not [], and isNoMatch falls back to
+      // the (empty) legacy description heuristic.
+      makeTickRow({ uuid: 'tick-unrecorded', climbUuid: 'climb-b', climbName: 'Unrecorded' }),
+    ];
+    betaLinkTestState.betaLinkRowsByQuery.push([]);
+
+    const result = await sessionDetail(undefined, { sessionId: 'party-1' });
+
+    const byUuid = new Map((result?.ticks ?? []).map((tick) => [tick.uuid, tick] as const));
+    expect(byUuid.get('tick-no-match')?.characteristics).toEqual(['no_match']);
+    expect(byUuid.get('tick-no-match')?.isNoMatch).toBe(true);
+    expect(byUuid.get('tick-unrecorded')?.characteristics).toBeNull();
+    expect(byUuid.get('tick-unrecorded')?.isNoMatch).toBe(false);
+  });
 });
+
+// These fixture rows are public; policy semantics have their own real-DB matrix.
+vi.mock('../services/privacy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/privacy')>()),
+  canAccessResource: vi.fn(async (_kind: string, resourceId: string) => resourceId !== 'unknown-uuid'),
+  canViewActivityIdentity: vi.fn(async () => true),
+  canViewContent: vi.fn(async () => true),
+  // Every fixture board may be named; board-identity redaction has its own real-DB cases.
+  visibleBoardIdentityIds: vi.fn(
+    async (boardIds: readonly (number | null | undefined)[]) =>
+      new Set(boardIds.filter((boardId): boardId is number => boardId != null)),
+  ),
+}));

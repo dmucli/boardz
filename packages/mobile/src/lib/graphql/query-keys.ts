@@ -19,6 +19,14 @@ import type { MyBoardsInput } from '@boardsesh/shared-schema';
 export const myBoardsQueryKey = (input?: MyBoardsInput) => ['myBoards', input] as const;
 
 /**
+ * The roster My Boards and Manage ask for: the plain one plus the viewer's own
+ * unfinished spray walls, so their import progress can show. Only those two
+ * screens pass it. Its input is part of the key, so this entry never answers the
+ * plain `myBoardsQueryKey()` that board pickers and the imperative readers use.
+ */
+export const MY_BOARDS_WITH_IMPORTS_INPUT: MyBoardsInput = Object.freeze({ includeUnfinishedSprayWalls: true });
+
+/**
  * The boards linked to one gym, and the root every gym's list hangs off.
  *
  * Both live here because two modules that never import each other have to agree
@@ -47,6 +55,9 @@ export const SEARCH_CLIMBS_QUERY_KEY = ['searchClimbs'] as const;
 export const INFINITE_SEARCH_CLIMBS_QUERY_KEY = ['infiniteSearchClimbs'] as const;
 export const SEARCH_CLIMBS_COUNT_QUERY_KEY = ['searchClimbsCount'] as const;
 
+/** Shared root for moderation lists and per-climb proposals, invalidated by reports and votes. */
+export const PROPOSALS_QUERY_KEY = ['proposals'] as const;
+
 /**
  * Live sessions ("Climbing now" on Home, "Climbing here now" in the board sheet).
  *
@@ -58,5 +69,79 @@ export const LIVE_SESSIONS_QUERY_KEY = ['liveSessions'] as const;
 export const FOLLOWED_LIVE_SESSIONS_QUERY_KEY = [...LIVE_SESSIONS_QUERY_KEY, 'followed'] as const;
 export const followedLiveSessionsQueryKey = (boardUuid: string | null) =>
   [...FOLLOWED_LIVE_SESSIONS_QUERY_KEY, boardUuid] as const;
-export const boardLiveSessionsQueryKey = (boardId: number | null) =>
-  [...LIVE_SESSIONS_QUERY_KEY, 'board', boardId] as const;
+export const boardLiveSessionsQueryKey = (boardId: number | null, boardUuid: string | null = null) =>
+  [...LIVE_SESSIONS_QUERY_KEY, 'board', boardId, ...(boardUuid ? [boardUuid] : [])] as const;
+
+/**
+ * Logs from climbers the viewer follows, for one climb (the play drawer's
+ * "Climber logs" card and its full list).
+ *
+ * Here because `use-followed-authors.ts` invalidates the root on every follow
+ * and unfollow without importing the hook that writes under it. The root is a
+ * bare string, like the other entries in `AUTHOR_QUERY_KEYS`.
+ *
+ * The viewer id is part of the key so one account's rows can never answer for
+ * another. The angle is not: the server returns every angle in one answer, so
+ * turning the board refetches nothing.
+ */
+export const FOLLOWING_CLIMB_LOGS_QUERY_KEY = 'followingClimbLogs';
+export const followingClimbLogsQueryKey = (viewerId: string | undefined, boardName: string, climbUuid: string | null) =>
+  [FOLLOWING_CLIMB_LOGS_QUERY_KEY, viewerId, boardName, climbUuid] as const;
+
+/**
+ * Everyone's logs on one climb: the paged "Everyone" section of the Climber
+ * logs list, and the few rows the card falls back to when nobody followed has
+ * logged the climb.
+ *
+ * Both roots are in `AUTHOR_QUERY_KEYS` too. The server leaves out the people
+ * the viewer follows, so a follow or unfollow changes the answer.
+ *
+ * The list key carries everything the server filters on, so each chip
+ * combination is its own set of pages. The preview key has no angle: it asks
+ * for every angle, so turning the board refetches nothing.
+ */
+export const CLIMB_LOGS_QUERY_KEY = 'climbLogs';
+export const CLIMB_LOGS_PREVIEW_QUERY_KEY = 'climbLogsPreview';
+export const climbLogsQueryKey = (
+  viewerId: string | undefined,
+  boardName: string,
+  climbUuid: string | null,
+  filters: { angle: number | undefined; withNotes: boolean; sendsOnly: boolean; excludeFollowed: boolean },
+) =>
+  [
+    CLIMB_LOGS_QUERY_KEY,
+    viewerId,
+    boardName,
+    climbUuid,
+    filters.angle ?? null,
+    filters.withNotes,
+    filters.sendsOnly,
+    filters.excludeFollowed,
+  ] as const;
+export const climbLogsPreviewQueryKey = (viewerId: string | undefined, boardName: string, climbUuid: string | null) =>
+  [CLIMB_LOGS_PREVIEW_QUERY_KEY, viewerId, boardName, climbUuid] as const;
+
+/**
+ * A session's summary (start time and totals): the Session tab and Home's
+ * Session card. Here because Home's pull-to-refresh invalidates it without
+ * rendering the card's query.
+ */
+export const SESSION_SUMMARY_QUERY_KEY = 'sessionSummary';
+export const sessionSummaryQueryKey = (sessionId: string | null) => [SESSION_SUMMARY_QUERY_KEY, sessionId] as const;
+
+/**
+ * The workouts followed in a session (#6903): summary and session detail. A
+ * tick or workout write landing invalidates the `['sessionWorkouts']` prefix
+ * (`TABLE_INVALIDATE_KEYS`).
+ */
+export const sessionWorkoutsQueryKey = (sessionId: string | null | undefined) =>
+  ['sessionWorkouts', sessionId ?? null] as const;
+
+/** Feed-card workout lines for one page of sessions (#6903). */
+export const sessionWorkoutHeadlinesQueryKey = (sessionIds: readonly string[]) =>
+  ['sessionWorkoutHeadlines', ...sessionIds] as const;
+
+/** Home's Fresh beta shelf. Here so pull to refresh can invalidate it without rendering the shelf's query. */
+export const RECENT_BETA_LINKS_QUERY_KEY = 'recentBetaLinks';
+export const recentBetaLinksQueryKey = (limit: number, boardType: string | null, layoutId: number | null) =>
+  [RECENT_BETA_LINKS_QUERY_KEY, limit, boardType, layoutId] as const;

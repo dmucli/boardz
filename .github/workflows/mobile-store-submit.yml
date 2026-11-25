@@ -1,0 +1,495 @@
+name: Mobile Store Submission
+
+run-name: Mobile Store Submission (${{ inputs.action }} ${{ inputs.version }})
+
+# Public-store writes require an explicit manual dispatch selecting the exact
+# release commit and tester build pair. Merges and schedules never submit.
+# STORE_AUTO_SUBMIT=off remains an emergency read-only switch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: 'Full source commit SHA contained in main'
+        required: true
+        type: string
+      ios_build_number:
+        description: 'Exact uploaded iOS build number'
+        required: true
+        type: string
+      android_version_code:
+        description: 'Exact published Play internal versionCode'
+        required: true
+        type: string
+      version:
+        description: 'Exact marketing version at release_sha'
+        required: true
+        type: string
+      action:
+        description: 'plan reads both stores and plans; submit also writes'
+        required: true
+        type: choice
+        default: plan
+        options:
+          - plan
+          - submit
+
+# The whole run holds the store-draft lock, so no other draft, review submission,
+# release control or audit can change App Store Connect between this run's
+# readback and its submission. Queued, never replaced: every member of the group
+# sets queue: max. The called draft takes a per-run group of its own (it would
+# otherwise wait on this run forever).
+concurrency:
+  group: mobile-store-draft
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+
+jobs:
+  target:
+    name: Verify the selected build pair
+    # Schedules only run on main, but a dispatch can name any ref. With the kill
+    # switch off, scheduled runs have nothing to do: a push and a dispatch still plan.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      proceed: ${{ steps.target.outputs.proceed }}
+      mode: ${{ steps.target.outputs.mode }}
+      release_sha: ${{ steps.target.outputs.release_sha }}
+      version: ${{ steps.target.outputs.version }}
+      ios_build_number: ${{ steps.target.outputs.ios_build_number }}
+      android_version_code: ${{ steps.target.outputs.android_version_code }}
+      android_version_codes: ${{ steps.target.outputs.android_version_codes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+
+      # Git and GitHub reads only. Warns when the manual release was squashed (the
+      # changelog then drops the train's PRs) or its release notes did not change
+      # since the previous manual release; neither stops the submission. Most runs end
+      # here while holding the store-draft lock, so no workspace install: the
+      # script imports only Node builtins, and tsx is pinned to the lockfile's.
+      - name: Resolve the exact manual target
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBMIT_ACTION: ${{ inputs.action }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+          IOS_BUILD_NUMBER: ${{ inputs.ios_build_number }}
+          ANDROID_VERSION_CODE: ${{ inputs.android_version_code }}
+          STORE_AUTO_SUBMIT: ${{ vars.STORE_AUTO_SUBMIT }}
+        run: vp dlx tsx@4.23.12 scripts/mobile-store-submit-target.ts
+
+  # One GET-only status job per store, so a store that cannot be read fails its
+  # own submission (red run, retried) without holding back the other store's.
+  status-ios:
+    name: Read App Store Connect (GET-only)
+    needs: target
+    if: needs.target.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Production
+    outputs:
+      ios_status: ${{ steps.ios.outputs.status }}
+      # The App Store version's state, and whether the draft lane must run first
+      # (no version yet, or Prepare for Submission). A version already in a review
+      # draft (READY_FOR_REVIEW) is resumed without one: deliver cannot see it.
+      ios_state: ${{ steps.ios.outputs.state }}
+      ios_needs_draft: ${{ steps.ios.outputs.needs_draft }}
+    env:
+      RELEASE_VERSION: ${{ needs.target.outputs.version }}
+      IOS_BUILD_NUMBER: ${{ needs.target.outputs.ios_build_number }}
+      FASTLANE_SKIP_UPDATE_CHECK: '1'
+      FASTLANE_DISABLE_ANIMATION: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          working-directory: fastlane
+      - name: Install fastlane gems
+        working-directory: fastlane
+        run: |
+          bundle config set --local path "$PWD/vendor/bundle"
+          bundle config set --local deployment true
+          bundle install --jobs 4
+
+      - name: Where the iOS version stands
+        id: ios
+        working-directory: fastlane
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          STORE_SUBMISSION_STATUS_OUTPUT: ${{ runner.temp }}/ios-status.json
+        run: |
+          set -euo pipefail
+          [ -n "$APP_STORE_CONNECT_API_KEY_ID" ] && [ -n "$APP_STORE_CONNECT_ISSUER_ID" ] && [ -n "$ASC_PRIVATE_KEY_BASE64" ] || { echo '::error::Missing ASC credentials'; exit 1; }
+          ASC_KEY_PATH=$(mktemp "$RUNNER_TEMP/boardsesh-status-key.XXXXXX.p8")
+          export ASC_KEY_PATH
+          trap 'rm -f "$ASC_KEY_PATH"' EXIT
+          chmod 600 "$ASC_KEY_PATH"
+          printf '%s' "$ASC_PRIVATE_KEY_BASE64" | base64 --decode > "$ASC_KEY_PATH"
+          bundle exec fastlane ios submission_status
+          status="$(jq -r '.status' "$STORE_SUBMISSION_STATUS_OUTPUT")"
+          reason="$(jq -r '.reason' "$STORE_SUBMISSION_STATUS_OUTPUT")"
+          case "$status" in pending|done|deferred|blocked|superseded) ;; *) echo "::error::Unexpected iOS status: $status"; exit 1 ;; esac
+          {
+            echo "status=$status"
+            echo "state=$(jq -r '.state // ""' "$STORE_SUBMISSION_STATUS_OUTPUT")"
+            echo "needs_draft=$(jq -r '.needsDraft == true' "$STORE_SUBMISSION_STATUS_OUTPUT")"
+          } >> "$GITHUB_OUTPUT"
+          case "$status" in blocked|superseded) echo "::warning::iOS $RELEASE_VERSION: $status. $reason" ;; *) echo "::notice::iOS $RELEASE_VERSION: $status. $reason" ;; esac
+          echo "- **iOS $RELEASE_VERSION:** $status. $reason" >> "$GITHUB_STEP_SUMMARY"
+
+  status-android:
+    name: Read Google Play (GET-only)
+    needs: target
+    if: needs.target.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: Production
+    outputs:
+      android_status: ${{ steps.android.outputs.status }}
+    env:
+      RELEASE_VERSION: ${{ needs.target.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      # No workspace install: the Android status script imports only Node builtins.
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+
+      - name: Where the Android build stands
+        id: android
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          ANDROID_VERSION_CODES: ${{ needs.target.outputs.android_version_codes }}
+          STORE_SUBMIT_ANDROID_OUTPUT: ${{ runner.temp }}/android-status.json
+        run: |
+          set -euo pipefail
+          vp dlx tsx@4.23.12 scripts/mobile-store-submit-android.ts --status
+          reason="$(jq -r '.reason' "$STORE_SUBMIT_ANDROID_OUTPUT")"
+          echo "- **Android $RELEASE_VERSION:** $(jq -r '.status' "$STORE_SUBMIT_ANDROID_OUTPUT"). $reason" >> "$GITHUB_STEP_SUMMARY"
+
+  draft:
+    name: Draft from the selected release commit
+    needs: [target, status-ios, status-android]
+    # Runs when either store is pending, even if the other store's status job
+    # failed: that store's own submit job is skipped, and the run shows red.
+    if: >-
+      !cancelled() && needs.target.result == 'success' &&
+      (needs.status-ios.outputs.ios_status == 'pending' || needs.status-android.outputs.android_status == 'pending')
+    uses: ./.github/workflows/mobile-store-draft.yml
+    with:
+      release_sha: ${{ needs.target.outputs.release_sha }}
+      ios_build_number: ${{ needs.target.outputs.ios_build_number }}
+      android_version_code: ${{ needs.target.outputs.android_version_code }}
+      # Only the App Store needs a draft (the version, with the exact build
+      # attached) before it can be submitted, and only while the version is missing
+      # or in Prepare for Submission. A plan writes nothing: `none` still selects
+      # and fingerprint-checks both builds.
+      platform: ${{ needs.target.outputs.mode == 'submit' && vars.STORE_AUTO_SUBMIT != 'off' && needs.status-ios.outputs.ios_status == 'pending' && needs.status-ios.outputs.ios_needs_draft == 'true' && 'ios' || 'none' }}
+    secrets: inherit
+    # A called workflow cannot ask for more than its caller grants, and the draft's
+    # iOS job declares actions: write (its metadata dispatch, skipped on this path).
+    permissions:
+      contents: read
+      actions: write
+
+  submit-ios:
+    name: Submit iOS for review
+    needs: [target, status-ios, draft]
+    if: needs.status-ios.outputs.ios_status == 'pending'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: Production
+    env:
+      # Every store write below checks this. Read again here, not only in the
+      # target job, so flipping the kill switch mid-run stops the writes.
+      SUBMIT: ${{ needs.target.outputs.mode == 'submit' && vars.STORE_AUTO_SUBMIT != 'off' }}
+      RELEASE_VERSION: ${{ needs.draft.outputs.version }}
+      IOS_BUILD_NUMBER: ${{ needs.draft.outputs.ios_build_number }}
+      FASTLANE_SKIP_UPDATE_CHECK: '1'
+      FASTLANE_DISABLE_ANIMATION: '1'
+    steps:
+      # The draft finishes green in several cases that leave nothing to submit
+      # (no candidate yet, a fingerprint mismatch, a best-effort draft that
+      # failed). Fail here instead, so the next run retries and the run shows red.
+      - name: Require the exact verified candidate
+        env:
+          CANDIDATE_READY: ${{ needs.draft.outputs.candidate_ready }}
+          TARGET_VERSION: ${{ needs.target.outputs.version }}
+          IOS_DRAFT: ${{ needs.draft.outputs.ios_draft }}
+          NEEDS_DRAFT: ${{ needs.status-ios.outputs.ios_needs_draft }}
+        run: |
+          set -euo pipefail
+          [ "$CANDIDATE_READY" = true ] || { echo "::error::No verified build pair for $TARGET_VERSION: the tagged builds are missing or do not match the selected release commit's fingerprints. See the draft job."; exit 1; }
+          [ "$RELEASE_VERSION" = "$TARGET_VERSION" ] || { echo "::error::The draft read version '$RELEASE_VERSION' at the selected release commit, expected $TARGET_VERSION."; exit 1; }
+          [[ "$IOS_BUILD_NUMBER" =~ ^[1-9][0-9]*$ ]] || { echo "::error::The draft returned no iOS build number."; exit 1; }
+          if [ "$SUBMIT" = true ] && [ "$NEEDS_DRAFT" = true ] && [ "$IOS_DRAFT" != success ]; then
+            echo "::error::The App Store draft for $RELEASE_VERSION build $IOS_BUILD_NUMBER did not succeed ($IOS_DRAFT). See the draft job."
+            exit 1
+          fi
+
+      # Tooling from this run's commit (fixes on main reach every retry); listing
+      # text and release notes from the selected release commit, the version being submitted.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Take the listing text from the selected release commit
+        env:
+          RELEASE_SHA: ${{ needs.target.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Invalid selected release commit.'; exit 1; }
+          git fetch --quiet --no-tags --depth=1 origin "$RELEASE_SHA"
+          rm -rf fastlane/metadata
+          git checkout "$RELEASE_SHA" -- fastlane/metadata
+
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          working-directory: fastlane
+      - name: Install fastlane gems
+        working-directory: fastlane
+        run: |
+          bundle config set --local path "$PWD/vendor/bundle"
+          bundle config set --local deployment true
+          bundle install --jobs 4
+
+      - name: Test the submission guards
+        run: |
+          vp exec ruby fastlane/tests/store_audit_test.rb
+          vp exec ruby fastlane/tests/store_review_submission_test.rb
+          vp exec ruby fastlane/tests/store_release_control_test.rb
+
+      - name: Decode App Store Connect API key
+        env:
+          ASC_PRIVATE_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          [ -n "$ASC_PRIVATE_KEY_BASE64" ] || { echo '::error::Missing APP_STORE_CONNECT_API_KEY_BASE64'; exit 1; }
+          key_path="$RUNNER_TEMP/boardsesh-submit-key.p8"
+          ( umask 077 && printf '%s' "$ASC_PRIVATE_KEY_BASE64" | base64 --decode > "$key_path" )
+          grep -q 'BEGIN PRIVATE KEY' "$key_path" || { echo '::error::APP_STORE_CONNECT_API_KEY_BASE64 did not decode to a private key.'; exit 1; }
+          echo "ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+      # The draft workflow's own metadata dispatch is asynchronous; push the text
+      # now, from the selected release commit, so the plan below compares against it. It also
+      # creates any locale the version lacks. The lane refuses any other version
+      # and skips one that is already submitted or in a review draft.
+      - name: Push listing text and What's New
+        if: env.SUBMIT == 'true'
+        working-directory: fastlane
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: bundle exec fastlane ios metadata "expected_version:$RELEASE_VERSION"
+
+      # GET-only: the exact version and build, its locales, screenshot sets and
+      # processing. Any identity error or readiness issue stops here, before the
+      # release type or the review change, with every issue listed.
+      - name: Check the App Store version is ready
+        id: readiness
+        working-directory: fastlane
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          STORE_AUDIT_OUTPUT: ${{ runner.temp }}/ios-readiness.json
+        run: |
+          set -euo pipefail
+          # The lane writes its report, then fails on an identity error; read the
+          # report either way so every problem lands in the summary.
+          lane_status=0
+          bundle exec fastlane ios audit surfaces:default || lane_status=$?
+          [ -f "$STORE_AUDIT_OUTPUT" ] || { echo '::error::The readiness audit wrote no report.'; exit 1; }
+          {
+            echo "### iOS $RELEASE_VERSION build $IOS_BUILD_NUMBER"
+            jq -r '.identityErrors[] | "- ❌ " + .' "$STORE_AUDIT_OUTPUT"
+            jq -r '.readinessIssues[] | "- ❌ " + .' "$STORE_AUDIT_OUTPUT"
+          } >> "$GITHUB_STEP_SUMMARY"
+          problems="$(jq '(.identityErrors | length) + (.readinessIssues | length)' "$STORE_AUDIT_OUTPUT")"
+          if [ "$lane_status" != 0 ] || [ "$problems" != 0 ]; then
+            echo "::error::iOS $RELEASE_VERSION is not ready to submit ($problems issue(s), listed in the run summary)."
+            exit 1
+          fi
+          state="$(jq -r '.version.appVersionState // .version.appStoreState' "$STORE_AUDIT_OUTPUT")"
+          release_type="$(jq -r '.version.releaseType' "$STORE_AUDIT_OUTPUT")"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "release_type=$release_type" >> "$GITHUB_OUTPUT"
+          case "$state" in PREPARE_FOR_SUBMISSION|READY_FOR_REVIEW) editable=true ;; *) editable=false ;; esac
+          echo "editable=$editable" >> "$GITHUB_OUTPUT"
+          echo "- State $state, release type $release_type." >> "$GITHUB_STEP_SUMMARY"
+
+      # Release on approval. Set right before planning, never in the shared draft
+      # lane (which stays MANUAL), and read back independently.
+      - name: Release on approval
+        if: env.SUBMIT == 'true' && steps.readiness.outputs.editable == 'true'
+        working-directory: fastlane
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          STORE_RELEASE_TYPE: AFTER_APPROVAL
+          STORE_RELEASE_CONTROL_OUTPUT: ${{ runner.temp }}/ios-release-control.json
+        run: bundle exec ruby lib/store_release_control.rb
+
+      # GET-only. In submit mode the version must now say AFTER_APPROVAL. A plan
+      # changes nothing, so it checks against the release type the version has.
+      - name: Plan the review submission
+        id: plan
+        working-directory: fastlane
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          CURRENT_RELEASE_TYPE: ${{ steps.readiness.outputs.release_type }}
+          STORE_REVIEW_OUTPUT: ${{ runner.temp }}/ios-review-plan.json
+        run: |
+          set -euo pipefail
+          if [ "$SUBMIT" = true ]; then
+            policy=AFTER_APPROVAL
+          else
+            case "$CURRENT_RELEASE_TYPE" in MANUAL|AFTER_APPROVAL) policy="$CURRENT_RELEASE_TYPE" ;; *) echo "::error::Unsupported release type $CURRENT_RELEASE_TYPE."; exit 1 ;; esac
+            echo "::notice::Plan only: a submit run would set release type $CURRENT_RELEASE_TYPE to AFTER_APPROVAL, then submit."
+          fi
+          bundle exec fastlane ios review_submission action:plan surfaces:default "release_type:$policy"
+          sha="$(jq -r '.snapshotSha256' "$STORE_REVIEW_OUTPUT")"
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || { echo '::error::The plan has no snapshot SHA-256.'; exit 1; }
+          echo "snapshot_sha256=$sha" >> "$GITHUB_OUTPUT"
+          echo "- Planned snapshot \`$sha\` (release type $policy)." >> "$GITHUB_STEP_SUMMARY"
+
+      # The only irreversible write. It rechecks every snapshot binding against
+      # the plan above and never retries an ambiguous write; a rerun of a version
+      # already submitted returns already-submitted.
+      - name: Submit for App Review
+        if: env.SUBMIT == 'true'
+        working-directory: fastlane
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          REVIEW_SNAPSHOT_SHA256: ${{ steps.plan.outputs.snapshot_sha256 }}
+          STORE_REVIEW_OUTPUT: ${{ runner.temp }}/ios-review-receipt.json
+        run: |
+          set -euo pipefail
+          bundle exec fastlane ios review_submission action:submit surfaces:default release_type:AFTER_APPROVAL
+          echo "- **Submitted:** $(jq -r '.action + " (" + (.reviewState // "review active") + ")"' "$STORE_REVIEW_OUTPUT"), releases on approval." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain the readiness audit, plan and receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-submit-ios-${{ needs.target.outputs.version }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ios-readiness.json
+            ${{ runner.temp }}/ios-release-control.json
+            ${{ runner.temp }}/ios-review-plan.json
+            ${{ runner.temp }}/ios-review-receipt.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Clean up App Store Connect key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/boardsesh-submit-key.p8"
+
+  submit-android:
+    name: Release Android to production
+    needs: [target, status-android, draft]
+    if: needs.status-android.outputs.android_status == 'pending'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: Production
+    # Shared with Android Production Release, the store draft's Android job and the
+    # Play listing push: one Play production writer at a time, queued.
+    concurrency:
+      group: play-production-track
+      cancel-in-progress: false
+      queue: max
+    env:
+      SUBMIT: ${{ needs.target.outputs.mode == 'submit' && vars.STORE_AUTO_SUBMIT != 'off' }}
+      ANDROID_VERSION_CODE: ${{ needs.draft.outputs.android_version_code }}
+    steps:
+      - name: Require the exact verified candidate
+        env:
+          CANDIDATE_READY: ${{ needs.draft.outputs.candidate_ready }}
+          DRAFT_VERSION: ${{ needs.draft.outputs.version }}
+          TARGET_VERSION: ${{ needs.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ "$CANDIDATE_READY" = true ] || { echo "::error::No verified build pair for $TARGET_VERSION: the tagged builds are missing or do not match the selected release commit's fingerprints. See the draft job."; exit 1; }
+          [ "$DRAFT_VERSION" = "$TARGET_VERSION" ] || { echo "::error::The draft read version '$DRAFT_VERSION' at the selected release commit, expected $TARGET_VERSION."; exit 1; }
+          [[ "$ANDROID_VERSION_CODE" =~ ^[1-9][0-9]*$ ]] || { echo "::error::The draft returned no Android versionCode."; exit 1; }
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: false
+
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Test the release guards
+        run: vp test run scripts/__tests__/mobile-store-android-production.test.ts scripts/__tests__/mobile-store-submit-android.test.ts --reporter=agent
+
+      - name: Plan the Android release
+        if: env.SUBMIT != 'true'
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          STORE_SUBMIT_ANDROID_OUTPUT: ${{ runner.temp }}/android-submission.json
+        run: node --import tsx scripts/mobile-store-submit-android.ts
+
+      # 100% (`completed`): everyone gets it once Play approves. A review already
+      # in progress makes Play refuse the commit; that is a deferred run, green,
+      # retried by explicit dispatch, never a cancelled review.
+      - name: Release to production at 100%
+        if: env.SUBMIT == 'true'
+        env:
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          STORE_SUBMIT_ANDROID_OUTPUT: ${{ runner.temp }}/android-submission.json
+        run: node --import tsx scripts/mobile-store-submit-android.ts --apply
+
+      - name: Summarize
+        if: always()
+        env:
+          STORE_SUBMIT_ANDROID_OUTPUT: ${{ runner.temp }}/android-submission.json
+        run: |
+          [ -f "$STORE_SUBMIT_ANDROID_OUTPUT" ] || exit 0
+          echo "- **Android versionCode $ANDROID_VERSION_CODE:** $(jq -r '.action + ", " + .status + ". " + .reason' "$STORE_SUBMIT_ANDROID_OUTPUT")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Retain the plan or receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: store-submit-android-${{ needs.target.outputs.version }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/android-submission.json
+          if-no-files-found: warn
+          retention-days: 30

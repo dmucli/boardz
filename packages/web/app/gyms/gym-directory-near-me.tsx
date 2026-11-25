@@ -17,7 +17,7 @@ import {
   type SearchGymsDirectoryQueryResponse,
   type SearchGymsDirectoryQueryVariables,
 } from '@boardsesh/graphql/operations';
-import { gymDirectorySearched } from '@boardsesh/analytics';
+import { gymDirectorySearched, type GymClaimViewerState } from '@boardsesh/analytics';
 import { toGymBoardFilterInput, type GymBoardFilter } from '@boardsesh/gym-filters';
 import { useGeolocation } from '@/app/hooks/use-geolocation';
 import { trackGymFunnelEvent } from '@/app/lib/gym-funnel-analytics';
@@ -25,6 +25,9 @@ import { createGraphQLHttpClient } from '@/app/lib/graphql/client';
 import type { Locale } from '@/app/lib/i18n/config';
 import { themeTokens } from '@/app/theme/theme-config';
 import LocaleLink from '@/app/components/i18n/locale-link';
+import { PageCard } from '@/app/components/ui/page-shell';
+import SelectedCheck from '@/app/components/ui/selected-check';
+import GymDirectorySearchForm, { type GymDirectorySearchFormProps } from './gym-directory-search-form';
 import { buildDirectoryHref, type DirectoryFacet, type DirectoryQuery } from './directory-facets';
 import { numberFormatFor } from './directory-card-model';
 import GymDirectoryCard from './gym-directory-card';
@@ -52,6 +55,8 @@ import {
 const WIDE_LAYOUT = '@media (min-width: 960px)';
 
 type GymDirectoryNearMeProps = {
+  /** Server-rendered filters stay inside the search form; map state stays in this island. */
+  searchForm?: Omit<GymDirectorySearchFormProps, 'locale' | 'actions'>;
   selectedArea?: { facet: DirectoryFacet; query: DirectoryQuery };
   /**
    * The board filter the surrounding route is already applying — types,
@@ -74,6 +79,8 @@ type GymDirectoryNearMeProps = {
   browseShownCount: number;
   /** The server-rendered results block: heading, card grid, pagination. */
   children: React.ReactNode;
+  /** Claim mode (`?claim=1`): near-me cards carry Claim this gym too. */
+  claim?: { viewerState: GymClaimViewerState };
 };
 
 /**
@@ -106,6 +113,7 @@ type GymDirectoryNearMeProps = {
  * is not shareable and Back does not restore it.
  */
 export default function GymDirectoryNearMe({
+  searchForm,
   selectedArea,
   boardFilter,
   searchQuery,
@@ -114,6 +122,7 @@ export default function GymDirectoryNearMe({
   browsePinnedCount,
   browseShownCount,
   children,
+  claim,
 }: GymDirectoryNearMeProps) {
   const { t } = useTranslation('gyms');
 
@@ -124,7 +133,37 @@ export default function GymDirectoryNearMe({
 
   const [nearMeOn, setNearMeOn] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
+  const mapContainerRef = useRef<HTMLDivElement>(null);
+  const revealMapRef = useRef(false);
+  useEffect(() => {
+    const restoreView = () => {
+      revealMapRef.current = false;
+      setMapOpen(new URLSearchParams(window.location.search).get('view') === 'map');
+    };
+    restoreView();
+    window.addEventListener('popstate', restoreView);
+    return () => window.removeEventListener('popstate', restoreView);
+  }, []);
+  useEffect(() => {
+    if (!revealMapRef.current) return;
+    revealMapRef.current = false;
+    if (mapOpen) {
+      mapContainerRef.current?.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
+    }
+  }, [mapOpen]);
+  const toggleMap = () => {
+    const nextMapOpen = !mapOpen;
+    revealMapRef.current = nextMapOpen;
+    const nextUrl = new URL(window.location.href);
+    if (nextMapOpen) nextUrl.searchParams.set('view', 'map');
+    else nextUrl.searchParams.delete('view');
+    window.history.replaceState(window.history.state, '', nextUrl);
+    setMapOpen(nextMapOpen);
+  };
   const [radiusKm, setRadiusKm] = useState<NearMeRadiusKm>(DEFAULT_NEAR_ME_RADIUS_KM);
+  // The radius the toggle group shows as selected: the place's own radius when a
+  // place is picked (the buttons are links then), the local choice otherwise.
+  const activeRadiusKm: number = selectedArea ? (selectedArea.query.radiusKm ?? 50) : radiusKm;
   // Resolved in an effect rather than at render: `navigator` does not exist
   // during SSR, and a render-time read would make the server and the first
   // client render disagree.
@@ -245,8 +284,38 @@ export default function GymDirectoryNearMe({
     }
   }, []);
 
+  const mapControl = (
+    <Button
+      type="button"
+      variant="outlined"
+      startIcon={<MapOutlined />}
+      onClick={toggleMap}
+      sx={{
+        textTransform: 'none',
+        minHeight: 44,
+        fontSize: 16,
+        mb: searchForm ? 0 : 1.5,
+        [WIDE_LAYOUT]: { display: 'none' },
+      }}
+    >
+      {mapOpen ? t('map.hideMap') : t('map.showMap')}
+    </Button>
+  );
+
   return (
     <>
+      {searchForm && (
+        <PageCard
+          id="gym-directory-search"
+          sx={{
+            mb: 2,
+            '& form': { mb: 1.5 },
+            scrollMarginTop: 'calc(var(--global-header-height) + var(--spacing-4))',
+          }}
+        >
+          <GymDirectorySearchForm {...searchForm} locale={locale} actions={mapControl} />
+        </PageCard>
+      )}
       <Box component="section" sx={{ mb: 3 }}>
         <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1.5, alignItems: 'center' }}>
           {/* Keyed on the RESULTS being on screen, not on "the button was
@@ -275,7 +344,7 @@ export default function GymDirectoryNearMe({
             </Button>
           ) : (
             <Button
-              variant="contained"
+              variant="outlined"
               startIcon={<MyLocationOutlined />}
               onClick={handleUseMyLocation}
               disabled={loading || fallbackReason === 'unsupported'}
@@ -285,14 +354,16 @@ export default function GymDirectoryNearMe({
             </Button>
           )}
 
-          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+          {/* Wraps, so the label can sit above the group when a translated
+              label and the selected button's check do not fit one row. */}
+          <Box sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1 }}>
             <Typography variant="body2" color="text.secondary" id="gym-near-me-radius-label">
               {t('nearMe.radiusLabel')}
             </Typography>
             <ToggleButtonGroup
               exclusive
               size="small"
-              value={selectedArea ? (selectedArea.query.radiusKm ?? 50) : radiusKm}
+              value={activeRadiusKm}
               onChange={selectedArea ? undefined : handleRadiusChange}
               aria-labelledby="gym-near-me-radius-label"
             >
@@ -300,30 +371,23 @@ export default function GymDirectoryNearMe({
                 <ToggleButton
                   key={option}
                   value={option}
+                  // With a place picked the buttons are links, so the selected one
+                  // is aria-current and none carries ToggleButton's aria-pressed
+                  // (which only a button may carry).
                   {...(selectedArea
                     ? {
                         component: LocaleLink,
                         href: buildDirectoryHref(selectedArea.facet, { ...selectedArea.query, radiusKm: option }, 1),
+                        'aria-pressed': undefined,
+                        'aria-current': option === activeRadiusKm ? ('true' as const) : undefined,
                       }
                     : {})}
-                  // Same two states as the facet chips, for the same reason: on
-                  // the near-black ground a default toggle group is a row of
-                  // hairlines with no legible "this one".
-                  sx={{
-                    textTransform: 'none',
-                    minHeight: 44,
-                    fontSize: 14,
-                    borderColor: 'var(--control-border)',
-                    backgroundColor: 'var(--semantic-surface)',
-                    color: 'var(--neutral-900)',
-                    '&.Mui-selected': {
-                      backgroundColor: 'var(--semantic-surface-elevated)',
-                      borderColor: 'var(--color-primary)',
-                      color: 'var(--color-primary)',
-                    },
-                    '&.Mui-selected:hover': { backgroundColor: 'var(--semantic-surface-elevated)' },
-                  }}
+                  // The theme draws both states (grey edge at rest, the tonal
+                  // container when selected); the check is the selected state's
+                  // non-colour cue.
+                  sx={{ minHeight: 44, fontSize: 14, gap: 0.5 }}
                 >
+                  {option === activeRadiusKm && <SelectedCheck />}
                   {radiusOptionLabel(t, option)}
                 </ToggleButton>
               ))}
@@ -373,6 +437,7 @@ export default function GymDirectoryNearMe({
         )}
       </Box>
 
+      {!searchForm && mapControl}
       <Box
         sx={{
           display: 'grid',
@@ -383,9 +448,10 @@ export default function GymDirectoryNearMe({
       >
         {/* The list column is FIRST in the DOM at every width. The map is never
             in front of it and never replaces it. */}
-        <Box>
+        <Box sx={{ display: mapOpen ? 'none' : 'block', [WIDE_LAYOUT]: { display: 'block' } }}>
           {showingNearMeResults ? (
             <NearMeResults
+              claim={claim}
               gyms={nearMeGyms}
               totalCount={nearMeData.totalCount}
               origin={origin}
@@ -405,19 +471,19 @@ export default function GymDirectoryNearMe({
               before anyone asks for a map. The request carries the
               visitor's IP, and it becomes public traffic when #4382 drops the
               noindex. */}
-          <Button
-            variant="outlined"
-            startIcon={<MapOutlined />}
-            onClick={() => setMapOpen((open) => !open)}
-            sx={{ textTransform: 'none', minHeight: 44, fontSize: 16, mb: 1.5, [WIDE_LAYOUT]: { display: 'none' } }}
-          >
-            {mapOpen ? t('map.hideMap') : t('map.showMap')}
-          </Button>
+
           {/* `display: none` is what keeps the Leaflet bundle undownloaded and
               the tiles unrequested on a narrow screen with the map collapsed:
               the map's effect waits for its container to report a non-zero
               size. Above the breakpoint the container has one from the start. */}
-          <Box sx={{ display: mapOpen ? 'block' : 'none', [WIDE_LAYOUT]: { display: 'block' } }}>
+          <Box
+            ref={mapContainerRef}
+            sx={{
+              display: mapOpen ? 'block' : 'none',
+              scrollMarginTop: 'calc(var(--global-header-height) + var(--spacing-4))',
+              [WIDE_LAYOUT]: { display: 'block' },
+            }}
+          >
             <GymDirectoryMap pins={pins} pinnedCount={pinnedCount} shownCount={shownCount} locale={locale} />
           </Box>
         </Box>
@@ -460,6 +526,7 @@ function fallbackBody(t: TranslateFn, reason: 'unsupported' | 'denied' | 'unavai
 }
 
 type NearMeResultsProps = {
+  claim?: { viewerState: GymClaimViewerState };
   gyms: SearchGymsDirectoryQueryResponse['searchGyms']['gyms'];
   /** Everything in range, which is not always what fits in one request. */
   totalCount: number;
@@ -468,7 +535,7 @@ type NearMeResultsProps = {
   locale: Locale;
 };
 
-function NearMeResults({ gyms, totalCount, origin, radiusKm, locale }: NearMeResultsProps) {
+function NearMeResults({ gyms, totalCount, origin, radiusKm, locale, claim }: NearMeResultsProps) {
   const { t } = useTranslation('gyms');
   const formatNumber = numberFormatFor(locale);
   // The request is capped at the backend's 50 and near-me has no pagination, so
@@ -505,7 +572,7 @@ function NearMeResults({ gyms, totalCount, origin, radiusKm, locale }: NearMeRes
       ) : (
         <Box component="ul" sx={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr)', gap: 0, m: 0, p: 0 }}>
           {gyms.map((gym) => (
-            <GymDirectoryCard key={gym.uuid} gym={gym} origin={origin} locale={locale} />
+            <GymDirectoryCard key={gym.uuid} gym={gym} origin={origin} locale={locale} claim={claim} />
           ))}
         </Box>
       )}

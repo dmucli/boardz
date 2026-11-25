@@ -15,7 +15,23 @@ export type ResolvedMenuAction = {
   isDestructive: boolean;
   /** Row is shown but unselectable — SwiftUI `.disabled`, Compose `enabled={false}`, Paper `disabled`. */
   isDisabled: boolean;
+  /** A separator renders above this row: SwiftUI `Divider`, Compose `HorizontalDivider`, Paper `Divider`. */
+  dividerBefore: boolean;
 };
+
+/** SwiftUI shows at most this many controls in a menu's icon row. */
+export const MAX_PALETTE_ROWS = 3;
+
+/**
+ * How many leading rows draw as one icon row on iOS: the run of consecutive
+ * `palette` rows from the top, capped at 3. A run of 0 or 1 draws as plain rows,
+ * because a one-item control group looks odd.
+ */
+export function paletteRowCount(actions: readonly AppMenuAction[]): number {
+  let count = 0;
+  while (count < actions.length && count < MAX_PALETTE_ROWS && actions[count].palette === true) count += 1;
+  return count >= 2 ? count : 0;
+}
 
 export function resolveMenuAction(action: AppMenuAction): ResolvedMenuAction {
   return {
@@ -24,10 +40,16 @@ export function resolveMenuAction(action: AppMenuAction): ResolvedMenuAction {
     showCheck: action.selected === true,
     isDestructive: action.destructive === true,
     isDisabled: action.disabled === true,
+    dividerBefore: action.dividerBefore === true,
   };
 }
 
-export const resolveMenuActions = (actions: AppMenuAction[]): ResolvedMenuAction[] => actions.map(resolveMenuAction);
+/** The first row never carries a divider: there is no group above it to close. */
+export const resolveMenuActions = (actions: AppMenuAction[]): ResolvedMenuAction[] =>
+  actions.map((action, index) => {
+    const resolved = resolveMenuAction(action);
+    return index === 0 && resolved.dividerBefore ? { ...resolved, dividerBefore: false } : resolved;
+  });
 
 /**
  * Whether a press on row `index` may reach `onSelectIndex`. Every native menu already
@@ -48,6 +70,27 @@ const ANCHOR_GLYPHS: Partial<Record<IconName, string>> = {
   more: '⋯',
   'more.actions': '⋯',
   'more.vertical': '⋮',
+  plus: '+',
 };
 
 export const anchorGlyphForIcon = (iconName: IconName): string => ANCHOR_GLYPHS[iconName] ?? '⋯';
+
+/**
+ * The overflow family: on Android these anchors draw the M3 overflow IconButton
+ * (`more_vert`, 24dp in a 48dp target) instead of a text glyph.
+ */
+const OVERFLOW_ANCHORS: ReadonlySet<IconName> = new Set<IconName>(['more', 'more.actions', 'more.vertical']);
+
+export const isOverflowAnchor = (iconName: IconName): boolean => OVERFLOW_ANCHORS.has(iconName);
+
+/**
+ * The Material vector an Android icon anchor draws in an M3 IconButton, or null
+ * for a text glyph (`anchorGlyphForIcon`): `more_vert` for the overflow family,
+ * `add` for the + that opens a "new thing" menu (the board picker's top bar).
+ */
+export type AndroidAnchorIcon = 'more_vert' | 'add';
+
+export const androidAnchorIcon = (iconName: IconName): AndroidAnchorIcon | null => {
+  if (isOverflowAnchor(iconName)) return 'more_vert';
+  return iconName === 'plus' ? 'add' : null;
+};

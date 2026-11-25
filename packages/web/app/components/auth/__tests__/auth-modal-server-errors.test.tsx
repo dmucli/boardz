@@ -18,6 +18,7 @@ vi.mock('react-i18next', () => ({
 
 const mockSignIn = vi.fn();
 vi.mock('next-auth/react', () => ({
+  getSession: vi.fn().mockResolvedValue(null),
   signIn: (...args: unknown[]) => mockSignIn(...args),
 }));
 
@@ -35,16 +36,16 @@ const { default: AuthModal } = await import('../auth-modal');
 function submitLogin() {
   fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'climber@example.com' } });
   fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'hunter22' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Login' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
 }
 
 function submitRegister() {
-  fireEvent.click(screen.getByRole('tab', { name: 'Create Account' }));
+  fireEvent.click(screen.getByRole('tab', { name: 'Create account' }));
   fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'Crusher' } });
   fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'climber@example.com' } });
   fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'hunter2222' } });
   fireEvent.change(screen.getByLabelText('Confirm Password'), { target: { value: 'hunter2222' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Create Account' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Create account' }));
 }
 
 describe('AuthModal — login server errors', () => {
@@ -74,6 +75,46 @@ describe('AuthModal — login server errors', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it('shows retryable authentication failure for backend unavailability, keeping the form open', async () => {
+    mockSignIn.mockResolvedValueOnce({ error: 'AuthBackendUnavailable', status: 503, ok: false });
+    render(<AuthModal open onClose={vi.fn()} />);
+    submitLogin();
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/Authentication failed/i);
+    expect(alert.textContent).not.toMatch(/Invalid email or password/i);
+    expect((screen.getByRole('button', { name: 'Sign in' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('maps registration backend unavailability to translated auth-failed text without exposing its code', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi
+        .fn()
+        .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({ error: 'AuthBackendUnavailable' }) }),
+    );
+    render(<AuthModal open onClose={vi.fn()} />);
+    submitRegister();
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/Authentication failed/i);
+    expect(alert.textContent).not.toContain('AuthBackendUnavailable');
+    expect(mockSignIn).not.toHaveBeenCalled();
+  });
+
+  it('keeps committed registration separate from a failed automatic login without repeating registration', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, status: 201, json: async () => ({ requiresVerification: false }) });
+    vi.stubGlobal('fetch', fetchMock);
+    mockSignIn.mockResolvedValueOnce({ error: 'AuthBackendUnavailable', status: 503, ok: false });
+    render(<AuthModal open onClose={vi.fn()} />);
+    submitRegister();
+    const alert = await screen.findByRole('alert');
+    expect(alert.textContent).toMatch(/Authentication failed/i);
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeTruthy();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(mockSignIn).toHaveBeenCalledOnce();
+  });
+
   it('shows the generic auth-failed alert when signIn throws (network down)', async () => {
     mockSignIn.mockRejectedValueOnce(new Error('fetch failed'));
     const onClose = vi.fn();
@@ -86,7 +127,7 @@ describe('AuthModal — login server errors', () => {
     // The form must stay open and interactive — no frozen state.
     expect(onClose).not.toHaveBeenCalled();
     await waitFor(() => {
-      expect((screen.getByRole('button', { name: 'Login' }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole('button', { name: 'Sign in' }) as HTMLButtonElement).disabled).toBe(false);
     });
   });
 
@@ -120,8 +161,8 @@ describe('AuthModal — login server errors', () => {
     submitRegister();
     await screen.findByRole('alert');
 
-    fireEvent.click(screen.getByRole('tab', { name: 'Login' }));
-    fireEvent.click(screen.getByRole('tab', { name: 'Create Account' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Sign in' }));
+    fireEvent.click(screen.getByRole('tab', { name: 'Create account' }));
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
@@ -133,7 +174,7 @@ describe('AuthModal — login server errors', () => {
     submitLogin();
     await screen.findByRole('alert');
 
-    fireEvent.click(screen.getByRole('button', { name: 'Login' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in' }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(screen.queryByRole('alert')).toBeNull();
   });

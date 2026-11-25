@@ -6,6 +6,11 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
+    "./auth-web-acl": {
+      "types": "./src/auth-web-acl.ts",
+      "import": "./src/auth-web-acl.ts",
+      "default": "./src/auth-web-acl.ts"
+    },
     "./background-jobs": {
       "types": "./src/background-jobs.ts",
       "import": "./src/background-jobs.ts",
@@ -56,6 +61,11 @@
       "import": "./src/client/config.ts",
       "default": "./src/client/config.ts"
     },
+    "./fixed-system-owner-order": {
+      "types": "./src/fixed-system-owner-order.ts",
+      "import": "./src/fixed-system-owner-order.ts",
+      "default": "./src/fixed-system-owner-order.ts"
+    },
     "./catalog-snapshot": {
       "types": "./src/catalog-snapshot.ts",
       "import": "./src/catalog-snapshot.ts",
@@ -65,6 +75,16 @@
       "types": "./src/queries/index.ts",
       "import": "./src/queries/index.ts",
       "default": "./src/queries/index.ts"
+    },
+    "./queries/account-email": {
+      "types": "./src/queries/account-email.ts",
+      "import": "./src/queries/account-email.ts",
+      "default": "./src/queries/account-email.ts"
+    },
+    "./queries/constants": {
+      "default": "./src/queries/constants.ts",
+      "import": "./src/queries/constants.ts",
+      "types": "./src/queries/constants.ts"
     },
     "./jobs": {
       "types": "./src/jobs/index.ts",
@@ -90,6 +110,16 @@
       "types": "./src/testing/moonboard-residual-dedup-replay.ts",
       "import": "./src/testing/moonboard-residual-dedup-replay.ts",
       "default": "./src/testing/moonboard-residual-dedup-replay.ts"
+    },
+    "./credential-writer-acl": {
+      "types": "./src/credential-writer-acl.ts",
+      "import": "./src/credential-writer-acl.ts",
+      "default": "./src/credential-writer-acl.ts"
+    },
+    "./queries/sitemap": {
+      "types": "./src/queries/sitemap/index.ts",
+      "import": "./src/queries/sitemap/index.ts",
+      "default": "./src/queries/sitemap/index.ts"
     }
   },
   "scripts": {
@@ -135,10 +165,14 @@
     "db:report-moonboard-reconciliation": "NODE_OPTIONS=--max-old-space-size=8192 tsx scripts/report-moonboard-reconciliation.ts"
   },
   "dependencies": {
+    "@boardsesh/auth-protocol": "workspace:*",
     "@boardsesh/board-config": "workspace:*",
     "@boardsesh/board-constants": "workspace:*",
+    "@boardsesh/board-look": "workspace:*",
     "@boardsesh/climb-filters": "workspace:*",
     "@boardsesh/kiosk": "workspace:*",
+    "@boardsesh/play-view": "workspace:*",
+    "@boardsesh/playlist-generator": "workspace:*",
     "@boardsesh/shared-schema": "workspace:*",
     "@boardsesh/sync-runtime": "workspace:*",
     "drizzle-orm": "^0.45.2",

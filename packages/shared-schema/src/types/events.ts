@@ -14,6 +14,7 @@
  *    CurrentClimbChanged.item is nullable).
  */
 
+import type { ClientIdentity } from '../client-identity';
 import type { ClimbQueueItem, QueueState } from './queue';
 
 /**
@@ -97,6 +98,7 @@ export type QueueEvent =
       stateHashOrdered?: string | null;
       item: ClimbQueueItem | null;
       frames?: string | null;
+      currentChangedBy?: string | null;
       clientId: string | null;
       correlationId: string | null;
     }
@@ -149,6 +151,7 @@ export type SubscriptionQueueEvent =
       stateHashOrdered?: string | null;
       currentItem: ClimbQueueItem | null;
       frames?: string | null;
+      currentChangedBy?: string | null;
       clientId: string | null;
       correlationId: string | null;
     }
@@ -162,6 +165,18 @@ export type SubscriptionQueueEvent =
     }
   | PlaybackStateChangedEvent;
 
+/**
+ * When the climber behind a website credential signed in. Read from the
+ * session's `auth_time` and `link_guarded` claims, never from anything a
+ * request can choose.
+ */
+export type WebSignInProof = {
+  /** Epoch milliseconds of the sign-in; null when the credential does not prove one. */
+  readonly authenticatedAtMs: number | null;
+  /** The sign-in was made while the web guarded OAuth account links. */
+  readonly linkGuarded: boolean;
+};
+
 export type ConnectionContext = {
   connectionId: string;
   // Transport that produced this context. Resolvers branch on this for
@@ -169,22 +184,66 @@ export type ConnectionContext = {
   // which is fragile to id-format changes. Optional for test contexts that
   // don't care which transport they emulate; production paths always set it.
   transport?: 'http' | 'ws';
+  /** Optional private per-request identity used only by offline replay evidence. */
+  offlineWriteDeliveryId?: string;
+  /** Running bundle declared on the actual replay request, distinct from later reporting. */
+  offlineWriteRelease?: import('../offline-write-delivery').OfflineWriteRelease;
   sessionId?: string;
   participantId?: string;
   userId?: string;
   isAuthenticated?: boolean;
+  /** True when HTTP supplied an Authorization header, even when it failed verification. */
+  authCredentialProvided?: boolean;
+  /** Verified bearer expiry in epoch milliseconds; never supplied by the client. */
+  credentialExpiresAt?: number;
+  /**
+   * The sign-in behind a website credential (the www session cookie), as HTTP
+   * authentication verified it; never supplied by the client. Unset for app tokens and on WebSocket, which every
+   * reader treats as a sign-in of unknown age.
+   */
+  webSignIn?: WebSignInProof;
   // Set only by HTTP cron bearer authentication; never grants user access.
   isCronAuthenticated?: boolean;
   // Client IP for rate limiting anonymous callers on both transports: HTTP
   // sets it in graphql/yoga.ts, WebSocket in websocket/setup.ts via
   // resolveWebSocketClientIp (issue #2863).
   clientIp?: string;
-  // Normalized address of the TCP peer for WebSocket upgrades. This is kept
+  // Normalized address of the TCP peer for HTTP requests and WebSocket upgrades. This is kept
   // separately from clientIp so a direct-origin caller cannot evade the
   // secondary rate-limit bucket by forging cf-connecting-ip (issue #4038).
   socketPeerIp?: string;
+  // A per-address limit key no caller can choose (getTrustedClientIp in
+  // packages/backend/src/utils/client-ip.ts): cf-connecting-ip only from a
+  // verified Cloudflare edge, otherwise the hop our private ingress appended or
+  // the socket peer; an IPv6 client is its /64. Unset on test contexts.
+  trustedClientIp?: string;
+  // Cloudflare's country for an HTTP request, accepted only from a trusted
+  // edge hop (resolveFlagCountry in packages/backend/src/utils/flag-country.ts);
+  // 'XX' when unknown or untrusted, undefined on WebSocket and test contexts.
+  // A coarse country only: no IP is derived from or stored with it.
+  edgeCountry?: string;
+  // Coarse province/subdivision from the enabled, verified GraphQL edge rule.
+  // Unknown on untrusted, missing or malformed headers and WebSocket contexts.
+  edgeRegionCode?: string;
+  // True when an HTTP request carries `Sec-GPC: 1`, the browser's Global
+  // Privacy Control signal. `consentRegion` echoes it so the website treats it
+  // as a "no" outside the prompt regions. Undefined on WebSocket contexts.
+  globalPrivacyControl?: boolean;
+  // Which client app made the request, from the `x-boardsesh-client` header on
+  // HTTP and `connectionParams.clientIdentity` on WebSocket (see
+  // client-identity.ts). Identification only: nothing is gated on it.
+  // `clientIdentity` is the parsed form (undefined when absent or malformed);
+  // `clientIdentityRaw` is the trimmed string as sent, for logs.
+  clientIdentity?: ClientIdentity;
+  clientIdentityRaw?: string;
   // Controller-specific context (set when using API key auth)
   controllerId?: string;
   controllerApiKey?: string;
   controllerMac?: string; // Controller's MAC address (used as clientId for BLE disconnect logic)
+  // The user who owns the controller API key this connection presented. Read
+  // access only: it lets a wall device (an ESP32 or an external projector)
+  // read its owner's own boards through `readViewerIdForBoard`. It is NOT a
+  // login: `userId` and `isAuthenticated` stay unset, so every mutation,
+  // queue, session and account resolver still treats the socket as anonymous.
+  controllerOwnerUserId?: string;
 };

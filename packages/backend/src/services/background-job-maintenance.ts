@@ -1,9 +1,17 @@
+import { clearExpiredCncComputations } from './cnc/computation-retention';
+import { reconcileCncGenerationRuns } from './cnc/generation-queue';
 import { and, asc, eq, gt, inArray, lt } from 'drizzle-orm';
 import type { PgBoss } from 'pg-boss';
 import type { DbInstance } from '@boardsesh/db/client';
 import { BACKGROUND_JOB_RECONCILE_QUEUE } from '@boardsesh/db/background-jobs';
 import { backgroundJobRuns } from '@boardsesh/db/schema';
 import { clearFinishedProviderSyncRuns, reconcileBackgroundJobRun } from '@boardsesh/db/queries';
+import { deleteExpiredCommandClaims } from '../auth/current-store/command-context';
+import { purgeRetiredEmailKeys } from '../auth/current-store/email-reservations';
+import { runFirstPasswordPreparationMaintenance } from '../auth/authority/first-password-maintenance';
+import { prunePasswordGuessWindows } from '../auth/password-guess-windows';
+import { logger } from '../utils/logger';
+import { MAINTENANCE_POLLING_INTERVAL_SECONDS } from './job-queue-client';
 
 /** Backend-owned, bounded and fair even while every homelab consumer is offline. */
 export function backgroundJobReconciler(database: DbInstance) {
@@ -48,13 +56,52 @@ export function backgroundJobReconciler(database: DbInstance) {
     // "Sync now" would otherwise coalesce onto a dead run. Bounded like the
     // two steps above.
     await clearFinishedProviderSyncRuns(database, 100);
+    await reconcileCncGenerationRuns(database);
+    await clearExpiredCncComputations(database);
   };
+}
+
+/**
+ * Expired staged-auth records, whatever the mode: rows written while a staged
+ * mode was on must still go after it is switched off, and with none it is two
+ * empty reads. Replay records (`ba03-web-auth:`) go once expired; a deleted
+ * address's digest goes 90 days after the deletion; a password guess window
+ * goes once it has ended (#7656).
+ */
+export async function clearExpiredAuthRecords(database: DbInstance): Promise<void> {
+  // SQL failures can carry bound values. Keep fixed categories; the next minute retries.
+  try {
+    // A prefix LIKE cannot use the text primary key under en_US collation, so this
+    // reads all of verificationTokens each minute: 32 kB in production on 2026-11-11.
+    await deleteExpiredCommandClaims(database);
+  } catch {
+    logger.warn('Current-store command claim cleanup unavailable');
+  }
+  try {
+    await purgeRetiredEmailKeys(database);
+  } catch {
+    logger.warn('Deleted-address digest cleanup unavailable');
+  }
+  try {
+    // The existing worker awaits this bounded task and drains before the
+    // dedicated credential pool closes. It has no new timer or DB principal.
+    await runFirstPasswordPreparationMaintenance();
+  } catch {
+    logger.warn('First-password preparation scrub unavailable');
+  }
+  // Never throws: a failure is counted and logged as a fail-open inside.
+  await prunePasswordGuessWindows(database);
 }
 
 export async function startBackgroundJobMaintenance(boss: PgBoss, database: DbInstance): Promise<void> {
   await boss.schedule(BACKGROUND_JOB_RECONCILE_QUEUE, '* * * * *', {}, { tz: 'UTC' });
   const reconcile = backgroundJobReconciler(database);
-  await boss.work(BACKGROUND_JOB_RECONCILE_QUEUE, { localConcurrency: 1, batchSize: 1 }, async () => {
-    await reconcile();
-  });
+  await boss.work(
+    BACKGROUND_JOB_RECONCILE_QUEUE,
+    { localConcurrency: 1, batchSize: 1, pollingIntervalSeconds: MAINTENANCE_POLLING_INTERVAL_SECONDS },
+    async () => {
+      await reconcile();
+      await clearExpiredAuthRecords(database);
+    },
+  );
 }

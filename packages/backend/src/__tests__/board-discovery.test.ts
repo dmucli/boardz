@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { v4 as uuidv4 } from 'uuid';
-import { eq, inArray } from 'drizzle-orm';
+import { eq, inArray, sql } from 'drizzle-orm';
 import type { BoardDiscoveryClimb, ConnectionContext } from '@boardsesh/shared-schema';
 import { boardseshTicks, gyms, userBoards, users } from '@boardsesh/db/schema';
 import { db } from '../db/client';
@@ -68,6 +68,11 @@ async function seedTick(
 }
 
 beforeEach(async () => {
+  // `spray_walls.board_uuid` is ON DELETE RESTRICT, so a spray wall seeded below
+  // would block the user delete that cascades the boards away.
+  await db.execute(sql`
+    DELETE FROM spray_walls WHERE board_uuid IN (SELECT uuid FROM user_boards WHERE owner_id = ${OWNER})
+  `);
   await db.delete(users).where(inArray(users.id, CLIMBERS));
   await db.insert(users).values(CLIMBERS.map((id) => ({ id, email: `${id}@example.test`, name: id })));
   getDiscoveryClimb.mockReset().mockResolvedValue(null);
@@ -140,8 +145,33 @@ describe('physical board discovery', () => {
     },
   );
 
+  it('excludes a spray wall a reset archived, and keeps its published successor', async () => {
+    const gym = await seedGym();
+    const publishedSprayWall = async (archived: boolean) => {
+      const board = await seedBoard(gym.id, { boardType: 'spray', isAngleAdjustable: false, hasLeds: false });
+      const [wall] = (await db.execute(sql`
+        INSERT INTO spray_walls (board_uuid, layout_id, hold_count, archived_at)
+        VALUES (${board.uuid}, nextval('spray_wall_catalog_id_seq')::int, 0, ${archived ? sql`now()` : sql`NULL`})
+        RETURNING id
+      `)) as unknown as Array<{ id: number }>;
+      await db.execute(sql`
+        WITH version AS (
+          INSERT INTO spray_wall_versions (wall_id, version_number, status, published_at)
+          VALUES (${wall.id}, 1, 'published', now())
+          RETURNING id
+        )
+        UPDATE spray_walls SET current_version_id = (SELECT id FROM version) WHERE id = ${wall.id}
+      `);
+      return board;
+    };
+    await publishedSprayWall(true);
+    const successor = await publishedSprayWall(false);
+    expect((await discover({ gymUuid: gym.uuid })).map((board) => board.uuid)).toEqual([successor.uuid]);
+  });
+
   it.each([
     ['private', { isPublic: false }],
+    ['unlisted', { isListed: false }],
     ['deleted', { deletedAt: new Date() }],
     ['missing slug', { slug: null }],
     ['empty slug', { slug: '' }],
@@ -183,6 +213,7 @@ describe('physical board discovery', () => {
       locationName: null,
       uniqueClimbers: 0,
       currentClimb,
+      popularClimb: null,
     });
     expect(getDiscoveryClimb).toHaveBeenCalledWith(String(board.id));
     await db.update(userBoards).set({ hideLocation: true }).where(eq(userBoards.id, board.id));
@@ -269,5 +300,14 @@ describe('physical board discovery ranking cache', () => {
     const board = await seedBoard(gym.id);
 
     expect((await discover()).map((entry) => entry.uuid)).toEqual([board.uuid]);
+  });
+
+  it('immediately hides a gym and its linked boards after the gym becomes unlisted', async () => {
+    const gym = await seedGym();
+    const board = await seedBoard(gym.id);
+    expect((await discover()).map((entry) => entry.uuid)).toEqual([board.uuid]);
+    await db.update(gyms).set({ isListed: false }).where(eq(gyms.id, gym.id));
+    expect(await discover()).toEqual([]);
+    expect(setMock).toHaveBeenCalledTimes(1);
   });
 });

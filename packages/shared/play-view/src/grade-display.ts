@@ -2,29 +2,43 @@ import { getGradeColor, getVGradeColor, getFontGradeColor } from '@boardsesh/boa
 // Import via the narrow `/boulder-grade-mapping` deep-path so we don't pull
 // the whole @boardsesh/board-config module graph (board image dimensions,
 // set IDs, moonboard config) into anything that touches the grade helpers.
-import { BOULDER_GRADES } from '@boardsesh/board-constants/boulder-grade-mapping';
+import { getBoulderGradesForBoard, type BoulderGrade } from '@boardsesh/board-constants/boulder-grade-mapping';
 
 // Re-export for convenience
 export { getGradeColor };
 
-// V-grades that map from multiple Font grades. Only these need "+" disambiguation
-// when the source difficulty's Font part ends with "+". Computed once at module
-// load from BOULDER_GRADES so the set stays in sync with config.
-const V_GRADES_WITH_MULTIPLE_FONT_GRADES: Set<string> = (() => {
+type GradeScale = {
+  /**
+   * V-grades that map from multiple Font grades on this board. Only these need
+   * "+" disambiguation when the source difficulty's Font part ends with "+".
+   */
+  vGradesWithMultipleFontGrades: ReadonlySet<string>;
+  gradeByDifficultyId: ReadonlyMap<number, BoulderGrade>;
+};
+
+// Keyed by the grade table itself, so every board sharing the default table
+// shares one entry and the cache can hold at most one per distinct table.
+const GRADE_SCALE_BY_TABLE = new Map<readonly BoulderGrade[], GradeScale>();
+
+function getGradeScale(boardName: string | null | undefined): GradeScale {
+  const grades = getBoulderGradesForBoard(boardName);
+  const cached = GRADE_SCALE_BY_TABLE.get(grades);
+  if (cached) return cached;
   const countByVGrade = new Map<string, number>();
-  for (const grade of BOULDER_GRADES) {
+  for (const grade of grades) {
     countByVGrade.set(grade.v_grade, (countByVGrade.get(grade.v_grade) ?? 0) + 1);
   }
-  const result = new Set<string>();
+  const vGradesWithMultipleFontGrades = new Set<string>();
   for (const [vGrade, count] of countByVGrade) {
-    if (count > 1) result.add(vGrade);
+    if (count > 1) vGradesWithMultipleFontGrades.add(vGrade);
   }
-  return result;
-})();
-
-const GRADE_BY_DIFFICULTY_ID = new Map<number, (typeof BOULDER_GRADES)[number]>(
-  BOULDER_GRADES.map((grade) => [grade.difficulty_id, grade]),
-);
+  const scale: GradeScale = {
+    vGradesWithMultipleFontGrades,
+    gradeByDifficultyId: new Map(grades.map((grade) => [grade.difficulty_id, grade])),
+  };
+  GRADE_SCALE_BY_TABLE.set(grades, scale);
+  return scale;
+}
 
 function extractVGrade(difficulty: string | null | undefined): string | null {
   if (!difficulty) return null;
@@ -45,17 +59,19 @@ function extractFontGrade(difficulty: string | null | undefined): string | null 
 /**
  * Format a difficulty string to a V-grade display label.
  * Adds "+" only when the Font grade has "+" AND the V-grade has multiple Font
- * grade mappings (e.g., "6c+/V5" → "V5+" because V5 maps from both 6c and 6c+).
- * V-grades with a single Font mapping (e.g., "7a+/V7") never get a "+".
+ * grade mappings on the climb's board (e.g., "6c+/V5" → "V5+" because V5 maps
+ * from both 6c and 6c+). V-grades with a single Font mapping (e.g., "7a+/V7")
+ * never get a "+". Pass `boardName` so a board with its own conversion gets its
+ * own rule: MoonBoard's 6A is V2, so its "6a+/V3" is the only V3 and reads "V3".
  */
-export function formatVGrade(difficulty: string | null | undefined): string | null {
+export function formatVGrade(difficulty: string | null | undefined, boardName?: string | null): string | null {
   if (!difficulty) return null;
   const vGrade = extractVGrade(difficulty);
   if (!vGrade) return null;
   const slashIndex = difficulty.indexOf('/');
   if (slashIndex > 0) {
     const fontPart = difficulty.substring(0, slashIndex);
-    if (fontPart.endsWith('+') && V_GRADES_WITH_MULTIPLE_FONT_GRADES.has(vGrade)) {
+    if (fontPart.endsWith('+') && getGradeScale(boardName).vGradesWithMultipleFontGrades.has(vGrade)) {
       return `${vGrade}+`;
     }
   }
@@ -72,23 +88,42 @@ export function formatFontGrade(difficulty: string | null | undefined): string |
 export type GradeDisplayFormat = 'v-grade' | 'font' | 'both';
 export const DEFAULT_GRADE_DISPLAY_FORMAT: GradeDisplayFormat = 'v-grade';
 
+/** Languages whose climbers read Font grades first (most of Europe), so they default to Font. */
+const FONT_FIRST_LANGUAGES: ReadonlySet<string> = new Set(['es', 'fr', 'de', 'it']);
+
+/**
+ * The grade format a climber sees before they pick one in settings. Spanish,
+ * French, German and Italian climbers grade in Font (6A, 7B+), everyone else in V. Accepts a full
+ * locale tag (`fr-CA`, `es_MX`, `de-AT`) and matches on the language subtag.
+ */
+export function defaultGradeDisplayFormatForLocale(locale: string | null | undefined): GradeDisplayFormat {
+  if (!locale) return DEFAULT_GRADE_DISPLAY_FORMAT;
+  const language = locale.split(/[-_]/)[0].toLowerCase();
+  return FONT_FIRST_LANGUAGES.has(language) ? 'font' : DEFAULT_GRADE_DISPLAY_FORMAT;
+}
+
 /** What `'both'` joins its two grades with (`"V5 / 6C"`). */
 const BOTH_FORMAT_SEPARATOR = ' / ';
 
 /**
  * Format a difficulty string according to the user's preference.
  * `'v-grade'` → V-style label (`"V5"`, `"V5+"`). `'font'` → Font label
- * (`"6A"`). `'both'` → V then Font (`"V5+ / 6C+"`).
+ * (`"6A"`). `'both'` → V then Font (`"V5+ / 6C+"`). `boardName` picks the
+ * board's V-grade "+" rule; see {@link formatVGrade}.
  */
-export function formatGrade(difficulty: string | null | undefined, format: GradeDisplayFormat): string | null {
+export function formatGrade(
+  difficulty: string | null | undefined,
+  format: GradeDisplayFormat,
+  boardName?: string | null,
+): string | null {
   if (format === 'font') return formatFontGrade(difficulty);
   if (format === 'both') {
-    const vGrade = formatVGrade(difficulty);
+    const vGrade = formatVGrade(difficulty, boardName);
     const fontGrade = formatFontGrade(difficulty);
     if (vGrade && fontGrade) return `${vGrade}${BOTH_FORMAT_SEPARATOR}${fontGrade}`;
     return vGrade ?? fontGrade;
   }
-  return formatVGrade(difficulty);
+  return formatVGrade(difficulty, boardName);
 }
 
 /**
@@ -106,16 +141,43 @@ export function splitGradeLabel(label: string | null | undefined): string[] {
 /**
  * Format a numeric Aurora difficulty id according to the user's preference.
  * This keeps mobile feed/logbook rows from depending on whatever preformatted
- * grade label the backend sent alongside the id.
+ * grade label the backend sent alongside the id. `boardName` picks the board's
+ * labels (MoonBoard's 6A is V2).
  */
 export function formatGradeByDifficultyId(
   difficultyId: number | null | undefined,
   format: GradeDisplayFormat,
+  boardName?: string | null,
 ): string | null {
   if (difficultyId == null) return null;
-  const grade = GRADE_BY_DIFFICULTY_ID.get(difficultyId);
+  const grade = getGradeScale(boardName).gradeByDifficultyId.get(difficultyId);
   if (!grade) return null;
-  return formatGrade(grade.difficulty_name, format);
+  return formatGrade(grade.difficulty_name, format, boardName);
+}
+
+/** What a grade band joins its two ends with (`"V3–V5"`). */
+const GRADE_BAND_SEPARATOR = '–';
+
+/**
+ * A playlist's grade band, `"V3–V5"`, from its low and high difficulty ids
+ * (the 10th and 90th percentile of its climbs). One label when both ends read
+ * the same (`"V4"`, which also covers 6b..6b+ under the V format), one end when
+ * the other is off the scale, and null when neither is on it.
+ *
+ * `'both'` draws the V format: two `"V3 / 6A"` labels joined is too long for
+ * the cards this sits on, and the V grade is the default the app falls back to.
+ */
+export function formatGradeBand(
+  lowDifficultyId: number | null | undefined,
+  highDifficultyId: number | null | undefined,
+  format: GradeDisplayFormat,
+  boardName?: string | null,
+): string | null {
+  const bandFormat: GradeDisplayFormat = format === 'both' ? 'v-grade' : format;
+  const low = formatGradeByDifficultyId(lowDifficultyId, bandFormat, boardName);
+  const high = formatGradeByDifficultyId(highDifficultyId, bandFormat, boardName);
+  if (!low || !high) return low ?? high;
+  return low === high ? low : `${low}${GRADE_BAND_SEPARATOR}${high}`;
 }
 
 /**
@@ -288,4 +350,46 @@ export function getSoftGradeColorByFormat(
     return getSoftFontGradeColor(extractFontGrade(difficulty), darkMode);
   }
   return getSoftVGradeColor(extractVGrade(difficulty), darkMode);
+}
+
+/**
+ * Is this a project: a published climb nobody has graded yet (#5971)?
+ *
+ * On a spray wall a climb publishes with no grade and its first ascent grades
+ * it, so "no grade" is a real state a climber sees, not a missing value. It
+ * reads the same on every board: a user-set Kilter climb nobody has sent is a
+ * project too.
+ *
+ * Takes the grade label the surface is ABOUT to show (after the Boardsesh grade
+ * and your own grade have had their say), so a climb you graded yourself, or one
+ * the Boardsesh model has a grade for, never reads as a project. A draft is never
+ * one: it carries its own chip.
+ */
+export function isProjectClimb({
+  gradeLabel,
+  isDraft,
+  statsKnown = true,
+}: {
+  gradeLabel: string | null | undefined;
+  isDraft?: boolean | null;
+  /**
+   * False when the surface has no stats for the climb yet (an offline Kilter row
+   * before the stats table synced): a blank grade there is missing data, not a
+   * project. See {@link climbStatsKnown}.
+   */
+  statsKnown?: boolean;
+}): boolean {
+  if (isDraft === true || !statsKnown) return false;
+  return (gradeLabel ?? '').trim() === '';
+}
+
+/**
+ * Does this surface know the climb's stats? A spray climb always counts: it
+ * gets its stats row when it is published, ungraded or not. Elsewhere it is the
+ * `statsAngle` a search row carries (null when the climb has no stats row at
+ * any angle, which is every row of an offline search before the stats synced;
+ * absent on a queue item, which says nothing either way).
+ */
+export function climbStatsKnown(boardName: string | null | undefined, statsAngle: number | null | undefined): boolean {
+  return boardName === 'spray' || statsAngle != null;
 }

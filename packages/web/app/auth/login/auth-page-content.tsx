@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useId } from 'react';
+import { useCallback, useState, useEffect, useId, useRef } from 'react';
 import Tabs from '@mui/material/Tabs';
 import Tab from '@mui/material/Tab';
 import Typography from '@mui/material/Typography';
@@ -8,19 +8,21 @@ import Card from '@mui/material/Card';
 import CardContent from '@mui/material/CardContent';
 import TextField from '@mui/material/TextField';
 import InputAdornment from '@mui/material/InputAdornment';
-import MuiLink from '@mui/material/Link';
 import Box from '@mui/material/Box';
 import Stack from '@mui/material/Stack';
-import MuiDivider from '@mui/material/Divider';
+import Skeleton from '@mui/material/Skeleton';
 import PersonOutlined from '@mui/icons-material/PersonOutlined';
 import LockOutlined from '@mui/icons-material/LockOutlined';
 import MailOutlined from '@mui/icons-material/MailOutlined';
-import { signIn, useSession } from 'next-auth/react';
+import { useSession } from 'next-auth/react';
+import { signInWithSessionIntent as signIn } from '@/app/lib/auth/web-session-events';
+import { isAuthBackendUnavailable } from '@boardsesh/auth-protocol/client-errors';
 import { useSearchParams } from 'next/navigation';
 import { useTranslation } from 'react-i18next';
+import { DEFAULT_LOCALE, isSupportedLocale } from '@/app/lib/i18n/config';
 import { useLocaleRouter, usePathnameWithoutLocale } from '@/app/lib/i18n/use-locale-router';
 import Logo from '@/app/components/brand/logo';
-import BackButton from '@/app/components/back-button';
+import StoreInstallButtons from '@/app/components/marketing/store-install-buttons';
 import SocialLoginButtons from '@/app/components/auth/social-login-buttons';
 import { FormShell, FormSection, FormField, FormActions, focusFirstInvalidAfterRender } from '@/app/components/form';
 import {
@@ -29,18 +31,20 @@ import {
   validateLoginFields,
   validateRegisterFields,
   type LoginErrors,
+  type LoginValues,
   type RegisterErrors,
 } from '@/app/components/auth/validate-fields';
+import { PasswordSignInFields } from '@/app/components/auth/password-sign-in-fields';
 import { TabPanel } from '@/app/components/ui/tab-panel';
 import { useSnackbar } from '@/app/components/providers/snackbar-provider';
-import { themeTokens } from '@/app/theme/theme-config';
 import { track, setPersonProperties } from '@/app/lib/analytics';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { authMethodFromError, safeAuthError } from './auth-error-classification';
-import LocaleLink from '@/app/components/i18n/locale-link';
+import { safeCallbackUrl } from '../signout/safe-callback-url';
 
 export default function AuthPageContent() {
   const { t } = useTranslation('auth');
+  const { t: tMarketing, i18n: marketingI18n } = useTranslation('marketing');
   const { status } = useSession();
   const router = useLocaleRouter();
   const pathnameWithoutLocale = usePathnameWithoutLocale();
@@ -62,6 +66,19 @@ export default function AuthPageContent() {
   const [activeTab, setActiveTab] = useState('login');
 
   const verified = searchParams.get('verified');
+
+  const updateLoginField = (field: keyof LoginValues, value: string) => {
+    setLoginValues((prev) => ({ ...prev, [field]: value }));
+    if (loginErrors[field]) setLoginErrors((prev) => ({ ...prev, [field]: undefined }));
+    if (loginServerError) setLoginServerError(null);
+  };
+
+  // The page's only client-side navigation to `callbackUrl`. The social buttons
+  // keep the raw value: they POST it to NextAuth, whose redirect callback checks
+  // it, and the phone and Expo web flows need their return URLs intact.
+  const pushCallbackUrl = useCallback(() => {
+    router.push(safeCallbackUrl(callbackUrl, window.location.origin));
+  }, [router, callbackUrl]);
 
   // Surface NextAuth redirect errors (failed OAuth round-trip or credentials
   // redirect) as the login form's inline alert rather than a transient toast —
@@ -90,8 +107,12 @@ export default function AuthPageContent() {
     }
   }, [error, t, router, pathnameWithoutLocale, searchParams]);
 
-  // Show success message when email is verified
+  // Show success message when email is verified. showMessage changes when the
+  // account does (a sign-in here), so the link is greeted once.
+  const greetedVerifiedRef = useRef<string | null>(null);
   useEffect(() => {
+    if (greetedVerifiedRef.current === verified) return;
+    greetedVerifiedRef.current = verified;
     if (verified === 'true') {
       showMessage(t('login.toasts.verified'), 'success');
     }
@@ -100,9 +121,9 @@ export default function AuthPageContent() {
   // Redirect if already authenticated
   useEffect(() => {
     if (status === 'authenticated') {
-      router.push(callbackUrl);
+      pushCallbackUrl();
     }
-  }, [status, router, callbackUrl]);
+  }, [status, pushCallbackUrl]);
 
   const handleLogin = async () => {
     setLoginServerError(null);
@@ -124,7 +145,9 @@ export default function AuthPageContent() {
       });
 
       if (result?.error) {
-        setLoginServerError(t('login.toasts.invalidCredentials'));
+        setLoginServerError(
+          isAuthBackendUnavailable(result.error) ? t('login.toasts.authFailed') : t('login.toasts.invalidCredentials'),
+        );
         track('Login Failed', {
           auth_method: 'credentials',
           failure_reason: safeAuthError(result.error),
@@ -132,7 +155,7 @@ export default function AuthPageContent() {
       } else if (result?.ok) {
         showMessage(t('login.toasts.loggedIn'), 'success');
         track('Login Succeeded', { auth_method: 'credentials' });
-        router.push(callbackUrl);
+        pushCallbackUrl();
       }
     } catch (error) {
       // A thrown signIn (network down, server unreachable) must not leave the
@@ -172,7 +195,11 @@ export default function AuthPageContent() {
       const data = await response.json();
 
       if (!response.ok) {
-        setRegisterServerError(data.error || t('login.toasts.registrationFailed'));
+        setRegisterServerError(
+          isAuthBackendUnavailable(data.error)
+            ? t('login.toasts.authFailed')
+            : data.error || t('login.toasts.registrationFailed'),
+        );
         return;
       }
 
@@ -181,11 +208,11 @@ export default function AuthPageContent() {
         requires_verification: Boolean(data.requiresVerification),
       });
       // First-touch attribution — written once and never overwritten.
-      // PostHog merges these onto the authenticated user once alias() runs
-      // in party-profile-context after the auto-signin below.
+      // PostHog merges these onto the authenticated user once AnalyticsIdentity
+      // sends identify(userId) after the auto-signin below.
       //
       // Caveat: if requires_verification is true, we hit the early return below
-      // and the auto-signin never runs, so alias() may not fire in this session.
+      // and the auto-signin never runs, so that identify() does not fire in this session.
       // signup_at / signup_auth_method then live on the anonymous distinct_id
       // until the user comes back to verify and log in — at which point PostHog
       // merges them onto the authenticated user. Until that merge they're
@@ -218,11 +245,12 @@ export default function AuthPageContent() {
           auth_method: 'credentials',
           is_first_login: true,
         });
-        router.push(callbackUrl);
+        pushCallbackUrl();
       } else {
         setActiveTab('login');
         setLoginValues((prev) => ({ ...prev, email: registerValues.email }));
-        showMessage(t('login.toasts.loginAfterCreate'), 'info');
+        if (isAuthBackendUnavailable(loginResult?.error)) setLoginServerError(t('login.toasts.authFailed'));
+        else showMessage(t('login.toasts.loginAfterCreate'), 'info');
       }
     } catch (error) {
       console.error('Registration error:', error);
@@ -233,7 +261,24 @@ export default function AuthPageContent() {
   };
 
   if (status === 'loading') {
-    return null;
+    return (
+      <Box
+        component="main"
+        aria-busy="true"
+        sx={{
+          pt: 'calc(var(--global-header-height) + var(--spacing-8))',
+          px: 3,
+          minHeight: '100vh',
+          maxWidth: 448,
+          mx: 'auto',
+        }}
+      >
+        <Typography component="h1" variant="h4">
+          {t('login.header')}
+        </Typography>
+        <Skeleton variant="rounded" height={320} sx={{ mt: 3 }} />
+      </Box>
+    );
   }
 
   if (status === 'authenticated') {
@@ -243,38 +288,23 @@ export default function AuthPageContent() {
   return (
     <Box sx={{ minHeight: '100vh', background: 'var(--semantic-background)' }}>
       <Box
-        component="header"
-        sx={{
-          background: 'var(--semantic-surface)',
-          padding: '0 16px',
-          display: 'flex',
-          alignItems: 'center',
-          gap: 2,
-          boxShadow: themeTokens.shadows.xs,
-          height: 64,
-        }}
-      >
-        <BackButton />
-        <Logo size="sm" showText={false} />
-        <Typography variant="h4" sx={{ margin: 0, flex: 1 }}>
-          {t('login.header')}
-        </Typography>
-      </Box>
-
-      <Box
         component="main"
         sx={{
           padding: '24px',
           display: 'flex',
           justifyContent: 'center',
-          alignItems: 'flex-start',
-          paddingTop: '48px',
+          paddingTop: 'calc(var(--global-header-height) + var(--spacing-8))',
+          flexDirection: 'column',
+          alignItems: 'center',
         }}
       >
         <Card sx={{ width: '100%', maxWidth: 400 }}>
           <CardContent>
             <Stack spacing={1} sx={{ width: '100%', textAlign: 'center', marginBottom: 3 }}>
               <Logo size="md" />
+              <Typography component="h1" variant="h4">
+                {t('login.header')}
+              </Typography>
               <Typography variant="body2" component="span" color="text.secondary">
                 {t('login.subtitle')}
               </Typography>
@@ -307,73 +337,7 @@ export default function AuthPageContent() {
                 error={loginServerError}
                 maxWidth={false}
               >
-                <FormSection>
-                  <FormField label={t('login.fields.email')} error={loginErrors.email}>
-                    {(field) => (
-                      <TextField
-                        id={field.id}
-                        type="email"
-                        autoComplete="username"
-                        placeholder={t('login.placeholders.email')}
-                        fullWidth
-                        value={loginValues.email}
-                        onChange={(e) => {
-                          setLoginValues((prev) => ({ ...prev, email: e.target.value }));
-                          if (loginErrors.email) setLoginErrors((prev) => ({ ...prev, email: undefined }));
-                          if (loginServerError) setLoginServerError(null);
-                        }}
-                        error={Boolean(field.error)}
-                        slotProps={{
-                          input: {
-                            startAdornment: (
-                              <InputAdornment position="start">
-                                <MailOutlined />
-                              </InputAdornment>
-                            ),
-                          },
-                          htmlInput: { autoCapitalize: 'none', 'aria-describedby': field.describedBy },
-                        }}
-                      />
-                    )}
-                  </FormField>
-
-                  <FormField
-                    label={t('login.fields.password')}
-                    error={loginErrors.password}
-                    labelAccessory={
-                      <MuiLink component={LocaleLink} href="/auth/forgot-password" variant="body2">
-                        {t('login.links.forgotPassword')}
-                      </MuiLink>
-                    }
-                  >
-                    {(field) => (
-                      <TextField
-                        id={field.id}
-                        type="password"
-                        autoComplete="current-password"
-                        placeholder={t('login.placeholders.password')}
-                        fullWidth
-                        value={loginValues.password}
-                        onChange={(e) => {
-                          setLoginValues((prev) => ({ ...prev, password: e.target.value }));
-                          if (loginErrors.password) setLoginErrors((prev) => ({ ...prev, password: undefined }));
-                          if (loginServerError) setLoginServerError(null);
-                        }}
-                        error={Boolean(field.error)}
-                        slotProps={{
-                          input: {
-                            startAdornment: (
-                              <InputAdornment position="start">
-                                <LockOutlined />
-                              </InputAdornment>
-                            ),
-                          },
-                          htmlInput: { 'aria-describedby': field.describedBy },
-                        }}
-                      />
-                    )}
-                  </FormField>
-                </FormSection>
+                <PasswordSignInFields values={loginValues} errors={loginErrors} onFieldChange={updateLoginField} />
 
                 <FormActions submitLabel={t('login.submit.signIn')} submitting={loginLoading} layout="stacked" />
               </FormShell>
@@ -511,15 +475,23 @@ export default function AuthPageContent() {
               </FormShell>
             </TabPanel>
 
-            <MuiDivider>
-              <Typography variant="body2" component="span" color="text.secondary">
-                {t('login.divider')}
-              </Typography>
-            </MuiDivider>
-
-            <SocialLoginButtons callbackUrl={callbackUrl} />
+            <SocialLoginButtons callbackUrl={callbackUrl} showDivider />
           </CardContent>
         </Card>
+        <Box sx={{ mt: 3, textAlign: 'center', maxWidth: 400 }}>
+          <Typography component="p" variant="body2" sx={{ mb: 2 }}>
+            {t('login.appHelper')}
+          </Typography>
+          <StoreInstallButtons
+            placement="auth-login"
+            labels={{
+              ios: tMarketing('home.hero.ctaInstallIos'),
+              android: tMarketing('home.hero.ctaInstallAndroid'),
+              update: tMarketing('home.hero.ctaUpdate'),
+              locale: isSupportedLocale(marketingI18n.language) ? marketingI18n.language : DEFAULT_LOCALE,
+            }}
+          />
+        </Box>
       </Box>
     </Box>
   );

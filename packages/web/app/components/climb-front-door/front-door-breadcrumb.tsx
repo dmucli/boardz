@@ -1,10 +1,12 @@
 import React from 'react';
 import Box from '@mui/material/Box';
+import { visuallyHidden } from '@mui/utils';
 import MuiLink from '@mui/material/Link';
 import LocaleLink from '@/app/components/i18n/locale-link';
 import { getServerTranslation } from '@/app/lib/i18n/server';
 import { absoluteUrl } from '@/app/lib/seo/base-url';
 import { JsonLd } from '@/app/lib/seo/json-ld';
+import { quietLinkSx } from '@/app/components/ui/quiet-link';
 import { themeTokens } from '@/app/theme/theme-config';
 
 type FrontDoorBreadcrumbProps = {
@@ -35,12 +37,34 @@ const listSx = {
   margin: 0,
   padding: `${themeTokens.spacing[2]}px 0`,
   fontSize: themeTokens.typography.fontSize.sm,
-  color: 'var(--neutral-400)',
+  color: 'var(--neutral-500)',
+  '& > li': { minWidth: 0, maxWidth: '100%', overflowWrap: 'anywhere' },
 };
 
-const separatorSx = { color: 'var(--neutral-400)' };
+const separatorSx = { color: 'var(--neutral-500)' };
+
+// Grey crumbs that lift to the label ink with an underline on hover.
+const linkSx = {
+  ...quietLinkSx,
+  display: 'inline-flex',
+  alignItems: 'center',
+  minWidth: 44,
+  minHeight: 44,
+  maxWidth: '100%',
+  overflowWrap: 'anywhere' as const,
+};
 
 const currentCrumbSx = { color: 'text.primary', fontWeight: themeTokens.typography.fontWeight.medium };
+
+// Below md the climb crumb sits directly above an h1 that says the same thing,
+// so the leaf is hidden there: visually only, so a screen reader still hears
+// the `aria-current="page"` crumb. Its separator is decoration and goes
+// entirely. The JSON-LD keeps all three items at every width. The query is
+// MUI's `breakpoints.down('md')`, written out because a server component can't
+// hand an `sx` callback to a client component.
+const BELOW_MD_QUERY = '@media (max-width: 899.95px)';
+const separatorFromMdSx = { [BELOW_MD_QUERY]: { display: 'none' } };
+const leafVisuallyHiddenBelowMdSx = { [BELOW_MD_QUERY]: visuallyHidden };
 
 /**
  * Home → board list → this climb, or Home → board list on the `/list` page
@@ -76,7 +100,7 @@ export default async function FrontDoorBreadcrumb({
       {emitJsonLd ? <JsonLd data={breadcrumbJsonLd} /> : null}
       <Box component="ol" sx={listSx}>
         <li>
-          <MuiLink component={LocaleLink} href="/" underline="hover" color="inherit">
+          <MuiLink component={LocaleLink} href="/" underline="hover" sx={linkSx}>
             {t('frontDoor.breadcrumb.home')}
           </MuiLink>
         </li>
@@ -90,15 +114,15 @@ export default async function FrontDoorBreadcrumb({
                 component={LocaleLink}
                 href={navigationBoardListUrl ?? boardListUrl}
                 underline="hover"
-                color="inherit"
+                sx={linkSx}
               >
                 {boardCrumbLabel}
               </MuiLink>
             </li>
-            <Box component="li" aria-hidden sx={separatorSx}>
+            <Box component="li" aria-hidden sx={{ ...separatorSx, ...separatorFromMdSx }}>
               /
             </Box>
-            <Box component="li" aria-current="page" sx={currentCrumbSx}>
+            <Box component="li" aria-current="page" sx={{ ...currentCrumbSx, ...leafVisuallyHiddenBelowMdSx }}>
               {leaf.label}
             </Box>
           </>

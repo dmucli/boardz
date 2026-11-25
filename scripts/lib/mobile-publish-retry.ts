@@ -24,7 +24,7 @@ import { SURFABILITY_CONFIRM_BUDGET_MINUTES, SURFABILITY_PROBE_BUDGET_MINUTES } 
  * sleeps. Revisit only after a week of green publishes on 3.1.2 — and note that
  * shortening it means editing three workflows, since
  * scripts/mobile-ota-publish-workflow.test.ts derives their `timeout-minutes`
- * floors from these values. Rationale: docs/mobile-ota-updates.md.
+ * floors from these values. Rationale: docs/operations/mobile-ota-updates.md.
  */
 export const SELF_HOSTED_PUBLISH_RETRY_DELAYS_MS = [60_000, 180_000, 300_000, 600_000, 900_000] as const;
 export const SELF_HOSTED_PUBLISH_MAX_ATTEMPTS = SELF_HOSTED_PUBLISH_RETRY_DELAYS_MS.length + 1;
@@ -73,30 +73,43 @@ export const SELF_HOSTED_PREVIEW_WORST_CASE_MINUTES_PER_PLATFORM =
   PREVIEW_RUNTIME_RESOLUTION_BUDGET_MINUTES;
 
 /**
- * Everything a publish job does around the publish steps themselves. Dominated
- * by the two source-map uploads, which carry their own `timeout-minutes` in the
- * workflow; the rest (checkout, setup-vp, `vp install`, changelog, health
- * check) measured ~3 minutes in run 30855435091. mobile-ota-publish-workflow.test.ts
- * re-reads those step timeouts and fails if they outgrow this allowance.
+ * Everything a publish job does around the publish steps themselves. Each of
+ * the two source-map uploads reserves 30 minutes in the workflow. Keep the
+ * remaining 10 minutes for checkout, setup-vp, `vp install`, changelog and the
+ * health check, which measured ~3 minutes in run 30855435091.
+ * mobile-ota-publish-workflow.test.ts re-reads those step timeouts and fails if
+ * they outgrow this allowance.
  */
-export const SELF_HOSTED_PUBLISH_JOB_OVERHEAD_MINUTES = 30;
+export const SELF_HOSTED_PUBLISH_JOB_OVERHEAD_MINUTES = 70;
+
+/** Direct production/backport publishers await a bounded main-only unlock before uploading. */
+export const PRODUCTION_OTA_UNLOCK_BUDGET_MINUTES = 25;
 
 /**
  * Minimum `timeout-minutes` a publish job needs so a fully throttled run still
  * reaches the retry wrapper's own verdict instead of being killed mid-backoff.
  * `platforms` is how many platforms one job publishes sequentially: production
  * and preview do iOS then Android in a single job, backport fans out one
- * platform per matrix job.
+ * platform per matrix job. Set `unlocksProduction` for direct production and
+ * backport jobs; staging and preview never pay that unlock allowance.
  */
-export function minimumPublishJobTimeoutMinutes(platforms: number, probesBranch = false): number {
+export function minimumPublishJobTimeoutMinutes(
+  platforms: number,
+  probesBranch = false,
+  unlocksProduction = false,
+): number {
   const perPlatform = probesBranch
     ? SELF_HOSTED_PREVIEW_WORST_CASE_MINUTES_PER_PLATFORM
     : SELF_HOSTED_PUBLISH_WORST_CASE_MINUTES_PER_PLATFORM;
-  return Math.ceil(platforms * perPlatform) + SELF_HOSTED_PUBLISH_JOB_OVERHEAD_MINUTES;
+  return (
+    Math.ceil(platforms * perPlatform) +
+    SELF_HOSTED_PUBLISH_JOB_OVERHEAD_MINUTES +
+    (unlocksProduction ? PRODUCTION_OTA_UNLOCK_BUDGET_MINUTES : 0)
+  );
 }
 
 export type OtaPublishPlatform = 'ios' | 'android';
-export type PublishFailureKind = 's3-slowdown' | 'http-5xx' | 'permanent' | 'unknown';
+export type PublishFailureKind = 's3-slowdown' | 'http-429' | 'http-5xx' | 'permanent' | 'unknown';
 
 export type TextOutput = {
   write(chunk: string): unknown;
@@ -151,14 +164,18 @@ export type PublishRetryDependencies = {
   stdout?: TextOutput;
   stderr?: TextOutput;
   confirmPublished?: PublishConfirmation;
+  /** A failed authorization must prevent even the first upload of this attempt. */
+  beforeAttempt?: () => void | Promise<void>;
 };
 
 const CLASSIFIER_WINDOW_CHARS = 4096;
 
 const EXPLICIT_HTTP_5XX =
   /(?:\bHTTP(?:\/\d(?:\.\d)?)?\s+|\b(?:status|statusCode|status code|response (?:status|code))\s*[:=]?\s*)5\d{2}\b/i;
+const EXPLICIT_HTTP_429 =
+  /(?:\bHTTP(?:\/\d(?:\.\d)?)?\s+|\b(?:status|statusCode|status code|response (?:status|code))\s*[:=]?\s*)429\b/i;
 const EXPLICIT_HTTP_4XX =
-  /(?:\bHTTP(?:\/\d(?:\.\d)?)?\s+|\b(?:status|statusCode|status code|response (?:status|code))\s*[:=]?\s*)4\d{2}\b/i;
+  /(?:\bHTTP(?:\/\d(?:\.\d)?)?\s+|\b(?:status|statusCode|status code|response (?:status|code))\s*[:=]?\s*)(?!429\b)4\d{2}\b/i;
 /**
  * The finalize call at the very end of a publish: every asset is already in the
  * object store, and this is the request that records the update against the
@@ -196,6 +213,7 @@ const PERMANENT_BUILD_ERROR = /\b(?:expo export|bundle|build) failed\b|\b(?:Refe
 type FailureEvidence = {
   hasSlowDownCode: boolean;
   hasSlowDownMessage: boolean;
+  hasHttp429: boolean;
   hasHttp5xx: boolean;
   hasFinalizeTimeout: boolean;
   hasNoChangeNotice: boolean;
@@ -206,6 +224,7 @@ function emptyEvidence(): FailureEvidence {
   return {
     hasSlowDownCode: false,
     hasSlowDownMessage: false,
+    hasHttp429: false,
     hasHttp5xx: false,
     hasFinalizeTimeout: false,
     hasNoChangeNotice: false,
@@ -226,6 +245,7 @@ export class PublishFailureEvidenceScanner {
     const searchable = `${this.window}${chunk}`;
     this.evidence.hasSlowDownCode ||= S3_SLOWDOWN_CODE.test(searchable);
     this.evidence.hasSlowDownMessage ||= S3_SLOWDOWN_MESSAGE.test(searchable);
+    this.evidence.hasHttp429 ||= EXPLICIT_HTTP_429.test(searchable);
     this.evidence.hasHttp5xx ||= EXPLICIT_HTTP_5XX.test(searchable);
     this.evidence.hasFinalizeTimeout ||= FINALIZE_GATEWAY_TIMEOUT.test(searchable);
     this.evidence.hasNoChangeNotice ||= NO_CHANGE_NOTICE.test(searchable);
@@ -257,6 +277,7 @@ export class PublishFailureEvidenceScanner {
     // appeared earlier in the same command's mixed output.
     if (this.evidence.hasPermanent) return 'permanent';
     if (this.evidence.hasSlowDownCode && this.evidence.hasSlowDownMessage) return 's3-slowdown';
+    if (this.evidence.hasHttp429) return 'http-429';
     if (this.evidence.hasHttp5xx) return 'http-5xx';
     return 'unknown';
   }
@@ -312,15 +333,16 @@ function platformLabel(platform: OtaPublishPlatform): string {
 
 function failureDescription(kind: PublishFailureKind): string {
   if (kind === 's3-slowdown') return 'S3 SlowDown';
+  if (kind === 'http-429') return 'HTTP 429 Too Many Requests';
   if (kind === 'http-5xx') return 'HTTP 5xx';
   if (kind === 'permanent') return 'permanent error evidence';
   return 'no retryable error evidence';
 }
 
 /**
- * Run one platform's self-hosted publish with four total attempts. Only exact
- * S3 SlowDown XML or an explicit HTTP 5xx is retryable. Output is streamed once
- * as it arrives; notices contain classification metadata only.
+ * Run one platform's self-hosted publish through the bounded backoff ladder.
+ * Only exact S3 SlowDown XML or an explicit HTTP 429/5xx is retryable. Output is
+ * streamed once as it arrives; notices contain classification metadata only.
  */
 export async function publishSelfHostedPlatformWithRetry(
   invocation: PublishRetryInvocation,
@@ -334,6 +356,18 @@ export async function publishSelfHostedPlatformWithRetry(
   const label = platformLabel(invocation.platform);
 
   for (let attempt = 1; attempt <= SELF_HOSTED_PUBLISH_MAX_ATTEMPTS; attempt++) {
+    try {
+      await dependencies.beforeAttempt?.();
+    } catch {
+      stderr.write(`[mobile:publish] ${label} publish authorization expired; refusing upload.\n`);
+      return {
+        platform: invocation.platform,
+        success: false,
+        attempts: attempt - 1,
+        failureKind: 'permanent',
+        noChange: false,
+      };
+    }
     const scanner = new PublishFailureEvidenceScanner();
     let exitCode = 1;
     try {
@@ -406,7 +440,7 @@ export async function publishSelfHostedPlatformWithRetry(
     }
 
     const failureKind = scanner.classify();
-    const retryable = failureKind === 's3-slowdown' || failureKind === 'http-5xx';
+    const retryable = failureKind === 's3-slowdown' || failureKind === 'http-429' || failureKind === 'http-5xx';
     if (!retryable || attempt === SELF_HOSTED_PUBLISH_MAX_ATTEMPTS) {
       const exhausted = retryable ? ' after exhausting the retry budget' : '';
       stderr.write(

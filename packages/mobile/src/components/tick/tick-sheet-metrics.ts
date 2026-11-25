@@ -1,3 +1,4 @@
+import { MEDIUM_LARGE_SNAP_POINTS } from '../sheet-snap-points';
 // The one geometry module the create-tick sheet (LogAscentSheet/QuickTickBar)
 // and the edit-tick sheet (LogbookEditSheet) both import.
 //
@@ -25,6 +26,12 @@ export const TICK_LABEL_GAP = spacing[3]; // 12
  *  inset to. 16 + 56 + 12 = 84. */
 export const TICK_CONTROL_ORIGIN = TICK_GUTTER + TICK_LABEL_MIN_WIDTH + TICK_LABEL_GAP; // 84
 
+/** Material's label floor and gap. Labels drop to the 14/20 `subheadline` there,
+ *  and this pair keeps the same seam while leaving "My grade" room to fit:
+ *  16 + 60 + 8 = 84. */
+export const TICK_MATERIAL_LABEL_MIN_WIDTH = 60;
+export const TICK_MATERIAL_LABEL_GAP = spacing[2]; // 8
+
 /** The row beat. Every plain field row is this tall. */
 export const TICK_ROW_HEIGHT = 56;
 
@@ -36,12 +43,24 @@ export const TICK_RAIL_ROW_HEIGHT = 60;
  *  its thumb crowds the hairlines above and below. */
 export const TICK_ANGLE_ROW_HEIGHT = 64;
 
+/** The folded Angle and Date summary on the Android create sheet: the 48dp
+ *  Material touch target, and shorter than the two rows it stands in for. */
+export const TICK_DETAILS_ROW_HEIGHT = 48;
+
 /** Sheet header (grade identity bar + title + meta + close disc). */
 export const TICK_HEADER_HEIGHT = 56;
 
-/** The pinned action row. Matches the app's hero action height so a tick CTA is
- *  the same object as every other defining action. */
-export const TICK_ACTION_HEIGHT = glassSize.hero; // 56
+/** The pinned action row: the standard 48pt control, not the 56pt hero. At 56
+ *  the two buttons and their 17pt labels outweighed the form they finish. The
+ *  buttons render at `.regular` control size so both sit below the pin and fill
+ *  it to one height (#5663). */
+export const TICK_ACTION_HEIGHT = glassSize.standard; // 48
+
+/** How far the action labels grow with the OS text size. The buttons pass it as
+ *  `maxFontSizeMultiplier` (a SwiftUI Dynamic Type cap on iOS) and
+ *  `tickActionHeight` stops growing at the same point, so a label never outgrows
+ *  its pinned height. 1.3 is the iOS `xxLarge` step (21pt body). */
+export const TICK_ACTION_MAX_FONT_SCALE = 1.3;
 
 /** How much of TICK_ACTION_HEIGHT is label rather than the native control's own
  *  padding. Only the label grows with the OS text scale — a SwiftUI/Compose
@@ -66,10 +85,12 @@ export const TICK_ACTION_LABEL_HEIGHT = 22;
  * a height would flip `Host`'s `matchContents` mid-life, and the axis it stops
  * measuring is the axis nothing else sizes.
  *
- * Never below TICK_ACTION_HEIGHT: that is the hero floor, not a measurement.
+ * Never below TICK_ACTION_HEIGHT, the floor, and never above its height at
+ * TICK_ACTION_MAX_FONT_SCALE, where the labels stop growing.
  */
 export function tickActionHeight(fontScale: number): number {
-  return Math.round(TICK_ACTION_HEIGHT + TICK_ACTION_LABEL_HEIGHT * (Math.max(1, fontScale) - 1));
+  const labelScale = Math.min(Math.max(1, fontScale), TICK_ACTION_MAX_FONT_SCALE);
+  return Math.round(TICK_ACTION_HEIGHT + TICK_ACTION_LABEL_HEIGHT * (labelScale - 1));
 }
 
 /** Always-reserved height of the action bar's error slot. Reserved even when
@@ -89,36 +110,8 @@ export const TICK_STACK_FONT_SCALE = 1.3;
  *  is one tap even before the climber has entered a higher count. */
 export const TICK_COUNT_RAIL_MIN_CHIPS = 15;
 
-/**
- * Create sheet detents. iOS / web only — Android takes `@expo/ui`'s
- * content-fitting path (`androidContentSized` on `ModalSheet`, #4720) and never
- * reads these values.
- *
- * Column: header 56 + rows (date 56 + grade 60 + stars 56 + tries 60 + note 68
- * = 300) + footer (paddingTop 12 + error slot 18 + gap 8 + button 56 +
- * paddingBottom 12 + window inset ~34 = 140) = 496; plus SHEET_TOP_CHROME_PT 20
- * = 516. On an iPhone 16 Pro the fraction base is 852 - 59 top inset - 24 top
- * gap = 769, so 516/769 = 67.1%. The detent stays '65%' anyway — that is a
- * 480pt column, ~16pt short of the content, so the bottom edge of the note row
- * opens just under the fold. Deliberate: the body scrolls under a pinned
- * footer, and erring SHORT is the safe direction (use-sheet-column-style.ts:5-8
- * — a few spare points beat a clipped footer, #3330). The second detent is the
- * keyboard detent.
- *
- * The note row is 68, not the 56pt beat: the field's own minHeight 64 plus the
- * row's 4pt `alignTop` inset (#4642). Change either and this derivation moves.
- */
-export const CREATE_TICK_SNAP_POINTS = ['65%', '92%'];
-
-/**
- * Edit sheet detents. iOS / web only — Android takes the content-fitting path
- * (`androidContentSized`, #4720).
- *
- * Column: header 56 + rows (status 56 + date 56 + grade 60 + angle 64 + stars
- * 56 + tries 60 + note 68 = 420) + delete group (spacing[8] 32 + 56 = 88) +
- * footer 122 = 686; plus 20 = 706/769 = 91.8%. That is higher than we want a
- * sheet to open, so the first detent is deliberately '80%' (a 595pt column) and
- * the body scrolls the last ~91pt — safe because Save is pinned in the footer,
- * not chased down the scroll. The second detent is the keyboard detent.
- */
-export const EDIT_TICK_SNAP_POINTS = ['80%', '92%'];
+/** Standard medium/large on iOS and web. Both forms scroll beneath their
+ * pinned action row; settling on large is still the keyboard expansion path.
+ * Android keeps its measured content-fitting contract (`androidContentSized`). */
+export const CREATE_TICK_SNAP_POINTS = MEDIUM_LARGE_SNAP_POINTS;
+export const EDIT_TICK_SNAP_POINTS = MEDIUM_LARGE_SNAP_POINTS;

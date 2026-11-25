@@ -1,5 +1,5 @@
 import { getPublicUrl, isS3Configured, uploadToS3 } from '../storage/s3';
-import { assertAllowedImageHost, type ImageHostKind } from './safe-image-fetch';
+import { assertAllowedImageHost, readBodyWithCap, type ImageHostKind } from './safe-image-fetch';
 import { logger } from '../utils/logger';
 import { BETA_THUMBNAIL_REQUEST_SIZE } from '@boardsesh/shared-schema';
 import { writeImageVariants } from './image-resize';
@@ -109,41 +109,6 @@ function warnOncePublicUrlUnavailable(error: unknown): void {
   );
 }
 
-async function readBodyWithCap(res: Response, maxBytes: number): Promise<Buffer | null> {
-  // Streaming path with hard byte cap. Wall-clock is bounded by the fetch
-  // timeout but bytes aren't, so without this a hostile server over a fast
-  // pipe could exhaust memory before AbortSignal.timeout fires.
-  if (res.body) {
-    const reader = res.body.getReader();
-    let total = 0;
-    const chunks: Uint8Array[] = [];
-    // eslint-disable-next-line no-constant-condition
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      total += value.length;
-      if (total > maxBytes) {
-        try {
-          await reader.cancel();
-        } catch {
-          // best-effort
-        }
-        return null;
-      }
-      chunks.push(value);
-    }
-    return Buffer.concat(chunks);
-  }
-  // Fallback for environments / mocks where `res.body` isn't a ReadableStream.
-  // Fetch the whole buffer, then enforce the cap on the result. Less
-  // protective than streaming (the byte cap doesn't help if Node already
-  // buffered the whole response) but at least keeps the runtime check in
-  // place for the upload step.
-  const arrayBuffer = await res.arrayBuffer();
-  if (arrayBuffer.byteLength > maxBytes) return null;
-  return Buffer.from(arrayBuffer);
-}
-
 async function cacheRemoteThumbnail(key: string, sourceUrl: string, kind: ImageHostKind): Promise<string | null> {
   // SSRF defense: the source URL is derived from attacker-controlled HTML
   // (og:image / oembed.thumbnail_url), so refuse anything that isn't on the
@@ -170,6 +135,14 @@ async function cacheRemoteThumbnail(key: string, sourceUrl: string, kind: ImageH
     const buffer = await readBodyWithCap(res, MAX_THUMBNAIL_BYTES);
     if (!buffer) {
       logger.warn(`[BetaLinks] thumbnail body exceeded ${MAX_THUMBNAIL_BYTES} bytes; aborted`);
+      return null;
+    }
+    if (buffer.length === 0) {
+      // A CDN can answer `200 image/jpeg` with nothing in it. Storing that
+      // gives us a zero-byte object that serves as a "successful" empty image
+      // — and thumbnail keys are immutable with a one-year cache, so it would
+      // never repair itself. Fall back to no cached thumbnail instead.
+      logger.warn('[BetaLinks] thumbnail body was empty; not caching');
       return null;
     }
     // The public media bucket cannot resize on demand. Publish the size used

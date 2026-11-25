@@ -13,12 +13,22 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
+import {
+  authEmailProjection,
+  authEmailReservationMembers,
+  authEmailReservations,
+  logbookChanges,
+  users,
+} from '@boardsesh/db/schema';
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { userMutations } from '../graphql/resolvers/users/mutations';
 import { userQueries } from '../graphql/resolvers/users/queries';
+import { logger } from '../utils/logger';
 
 // Hoist mock variables so they're available before module evaluation
 const { mockDb, txCalls } = vi.hoisted(() => {
-  const txCalls: Array<{ method: string; args: unknown[] }> = [];
+  const txCalls: Array<{ method: string; args: unknown[]; table?: unknown }> = [];
 
   const mockDb = {
     select: vi.fn().mockReturnValue({
@@ -34,6 +44,28 @@ const { mockDb, txCalls } = vi.hoisted(() => {
 
 vi.mock('../db/client', () => ({
   db: mockDb,
+}));
+// These existing tests isolate draft cleanup; the real spray/FK contract is in
+// delete-account-spray-walls.test.ts against rolled-back synthetic rows.
+vi.mock('../graphql/resolvers/users/delete-account-spray-walls', () => ({
+  deleteAccountSprayWalls: vi.fn(async () => ({ wallIds: [], previewBoardIds: [] })),
+}));
+// Withdrawal and its durable FK behavior are exercised against real PostgreSQL.
+vi.mock('../graphql/resolvers/users/delete-account-privacy', () => ({
+  withdrawDeletedAccountContent: vi.fn(async () => undefined),
+  retryAccountDeletion: (transaction: () => Promise<unknown>) => transaction(),
+}));
+vi.mock('../graphql/resolvers/users/delete-account-boards', () => ({
+  deleteAccountBoards: vi.fn(async () => []),
+}));
+// The partner app locks and their order against consent, refresh and
+// Disconnect are exercised against real PostgreSQL in partner-launch-suite.test.ts.
+// Here only their place in the sequence is checked: before the users delete.
+vi.mock('../auth/partner/locks', () => ({
+  PARTNER_APP_LOCK_BUSY: 'partner_app_lock_busy',
+  lockOwnedAppsForDeletion: vi.fn(async (_tx: unknown, userId: string) => {
+    txCalls.push({ method: 'lockOwnedAppsForDeletion', args: [userId] });
+  }),
 }));
 
 function makeAuthCtx(userId = 'user-1'): ConnectionContext {
@@ -66,21 +98,33 @@ function makeAnonCtx(): ConnectionContext {
 function setupTransactionMock(options?: {
   failOnUserDelete?: boolean;
   draftClimbs?: Array<{ uuid: string; boardType: string }>;
+  manifestRows?: unknown[];
+  isolationRows?: readonly unknown[];
 }) {
   txCalls.length = 0;
 
   mockDb.transaction.mockImplementation(async (callback: (tx: unknown) => Promise<void>) => {
     const tx = {
+      execute: vi.fn().mockImplementation((statement: SQL) => {
+        txCalls.push({ method: 'execute', args: [statement] });
+        if (new PgDialect().sqlToQuery(statement).sql === 'SHOW transaction_isolation') {
+          return Promise.resolve(options?.isolationRows ?? [{ transaction_isolation: 'read committed' }]);
+        }
+        return Promise.resolve([{ present: false }]);
+      }),
       select: vi.fn().mockImplementation((columns: unknown) => {
-        const call = { method: 'select', columns, args: [] as unknown[] };
+        const call = { method: 'select', columns, args: [] as unknown[], table: undefined as unknown };
         return {
-          from: vi.fn().mockReturnValue({
+          from: vi.fn().mockImplementation((table: unknown) => ({
             where: vi.fn().mockImplementation((...args: unknown[]) => {
               call.args = args;
+              call.table = table;
               txCalls.push(call);
-              return Promise.resolve(options?.draftClimbs ?? []);
+              return Promise.resolve(
+                table === authEmailProjection ? (options?.manifestRows ?? []) : (options?.draftClimbs ?? []),
+              );
             }),
-          }),
+          })),
         };
       }),
       delete: vi.fn().mockImplementation((table: unknown) => {
@@ -142,9 +186,17 @@ describe('deleteAccount mutation', () => {
     const result = await userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx('user-1'));
 
     expect(result).toBe(true);
-    // Should have exactly 2 operations: delete drafts + delete user
+    // Exactly 3 operations: delete drafts, delete user, then purge the change
+    // rows the user delete's cascade wrote. The purge has to come last.
     const deleteCalls = txCalls.filter((c) => c.method === 'delete');
-    expect(deleteCalls).toHaveLength(2);
+    expect(deleteCalls).toHaveLength(3);
+    const deletedTables = deleteCalls.map((call) => (call as unknown as { table: unknown }).table);
+    expect(deletedTables[1]).toBe(users);
+    expect(deletedTables[2]).toBe(logbookChanges);
+    // The developer's partner apps are locked before the users delete cascades into them.
+    const lockIndex = txCalls.findIndex((call) => call.method === 'lockOwnedAppsForDeletion');
+    expect(txCalls[lockIndex]?.args).toEqual(['user-1']);
+    expect(lockIndex).toBeLessThan(txCalls.indexOf(deleteCalls[1]));
     // No update calls
     const updateCalls = txCalls.filter((c) => c.method === 'update');
     expect(updateCalls).toHaveLength(0);
@@ -171,6 +223,67 @@ describe('deleteAccount mutation', () => {
     expect(result).toBe(true);
   });
 
+  it.each(['current-store', 'better-auth'])(
+    'refuses legacy deletion when an enforced %s projection exists, before content changes',
+    async (writerAuthority) => {
+      setupTransactionMock({ manifestRows: [{ phase: 'enforced', writerAuthority }] });
+      const logged = vi.spyOn(logger, 'error').mockImplementation(() => logger);
+
+      // The climber sees the generic reply; the internal code goes to the server log only.
+      await expect(
+        userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx()),
+      ).rejects.toMatchObject({
+        message: 'Account deletion is temporarily unavailable.',
+        extensions: { code: 'SERVICE_UNAVAILABLE' },
+      });
+      expect(logged).toHaveBeenCalledWith('[deleteAccount] Legacy account deletion refused', {
+        failureCode: 'STALE_AUTHORITY',
+      });
+      expect(txCalls.some((call) => call.method === 'delete' || call.method === 'update')).toBe(false);
+      logged.mockRestore();
+    },
+  );
+
+  it('deletes with a prepared projection, then releases its projected addresses after the users delete', async () => {
+    // Between `auth-authority prepare` and `activate` (#7591).
+    setupTransactionMock({ manifestRows: [{ phase: 'prepared', writerAuthority: 'current-store' }] });
+
+    expect(await userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx())).toBe(true);
+    const userDelete = txCalls.findIndex((call) => call.method === 'delete' && call.table === users);
+    const membershipRead = txCalls.findIndex(
+      (call) => call.method === 'select' && call.table === authEmailReservationMembers,
+    );
+    expect(userDelete).toBeGreaterThan(-1);
+    expect(membershipRead).toBeGreaterThan(userDelete);
+  });
+
+  it('reads no projection rows when no projection exists', async () => {
+    expect(await userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx())).toBe(true);
+    expect(
+      txCalls.some((call) => call.table === authEmailReservationMembers || call.table === authEmailReservations),
+    ).toBe(false);
+  });
+
+  it.each([
+    ['missing', []],
+    ['unsupported', [{ transaction_isolation: 'repeatable read' }]],
+  ] as const)('refuses %s isolation evidence before content changes', async (_kind, isolationRows) => {
+    setupTransactionMock({ isolationRows });
+    const logged = vi.spyOn(logger, 'error').mockImplementation(() => logger);
+
+    await expect(
+      userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx()),
+    ).rejects.toMatchObject({
+      message: 'Account deletion is temporarily unavailable.',
+      extensions: { code: 'SERVICE_UNAVAILABLE' },
+    });
+    expect(logged).toHaveBeenCalledWith('[deleteAccount] Legacy account deletion refused', {
+      failureCode: 'UNSUPPORTED_ISOLATION',
+    });
+    expect(txCalls.some((call) => call.method !== 'execute')).toBe(false);
+    logged.mockRestore();
+  });
+
   it('should propagate transaction errors (rollback)', async () => {
     setupTransactionMock({ failOnUserDelete: true });
 
@@ -179,15 +292,25 @@ describe('deleteAccount mutation', () => {
     ).rejects.toThrow('DB error');
   });
 
-  it('should execute operations in correct order: select drafts, delete drafts, setter name, user', async () => {
+  it('locks and checks the favorites archive before deleting the user', async () => {
     await userMutations.deleteAccount({}, { input: { removeSetterName: true } }, makeAuthCtx());
 
-    // Order: select this user's draft climbs, delete drafts, update setter name, delete user
-    expect(txCalls).toHaveLength(4);
-    expect(txCalls[0].method).toBe('select'); // this user's draft climbs
-    expect(txCalls[1].method).toBe('delete'); // draft climbs
-    expect(txCalls[2].method).toBe('update'); // setter name
-    expect(txCalls[3].method).toBe('delete'); // user row
+    // Isolation verification and the authority gate/manifest read precede
+    // the relation lock and fresh optional-archive check.
+    expect(txCalls.map((call) => call.method)).toEqual([
+      'execute',
+      'execute',
+      'execute',
+      'select',
+      'execute',
+      'execute',
+      'select',
+      'delete',
+      'update',
+      'lockOwnedAppsForDeletion',
+      'delete',
+      'delete',
+    ]);
   });
 
   it('cleans up board_climb_stats/history/beta_links for a draft climb before deleting the drafts', async () => {
@@ -195,11 +318,27 @@ describe('deleteAccount mutation', () => {
 
     await userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx());
 
-    // select drafts, delete stats, delete history, delete beta links, delete drafts, delete user.
+    // select drafts, delete stats, delete history, delete beta links, delete drafts, lock the
+    // partner apps, delete user, purge the logbook change rows.
     // The dependent-row cleanup (3 deletes) must land between the select and the drafts delete.
-    expect(txCalls.map((call) => call.method)).toEqual(['select', 'delete', 'delete', 'delete', 'delete', 'delete']);
+    expect(txCalls.map((call) => call.method)).toEqual([
+      'execute',
+      'execute',
+      'execute',
+      'select',
+      'execute',
+      'execute',
+      'select',
+      'delete',
+      'delete',
+      'delete',
+      'delete',
+      'lockOwnedAppsForDeletion',
+      'delete',
+      'delete',
+    ]);
     const deleteCalls = txCalls.filter((call) => call.method === 'delete');
-    expect(deleteCalls).toHaveLength(5);
+    expect(deleteCalls).toHaveLength(6);
   });
 
   it('groups dependent-row cleanup by board type when drafts span multiple boards', async () => {
@@ -212,9 +351,9 @@ describe('deleteAccount mutation', () => {
 
     await userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx());
 
-    // 3 dependent-row deletes per board type (2 boards) + the drafts delete + the user delete.
+    // 3 dependent-row deletes per board type (2 boards) + drafts + user + logbook change rows.
     const deleteCalls = txCalls.filter((call) => call.method === 'delete');
-    expect(deleteCalls).toHaveLength(2 * 3 + 2);
+    expect(deleteCalls).toHaveLength(2 * 3 + 3);
   });
 
   it('skips dependent-row cleanup when the user has no draft climbs', async () => {
@@ -222,9 +361,9 @@ describe('deleteAccount mutation', () => {
 
     await userMutations.deleteAccount({}, { input: { removeSetterName: false } }, makeAuthCtx());
 
-    // Only the (empty) drafts delete + the user delete — no dependent-row deletes fire.
+    // Only the (empty) drafts delete, the user delete and the logbook purge.
     const deleteCalls = txCalls.filter((call) => call.method === 'delete');
-    expect(deleteCalls).toHaveLength(2);
+    expect(deleteCalls).toHaveLength(3);
   });
 });
 

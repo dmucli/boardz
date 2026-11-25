@@ -138,7 +138,7 @@ describe('buildQueueListModel', () => {
     expect(historyRow.item.climb.uuid).toBe('shared-climb');
   });
 
-  it('uses default history limit of 5', () => {
+  it('uses default history limit of 2', () => {
     const queue = Array.from({ length: 12 }, (_, i) => makeItem(`q${i}`, `c${i}`));
     const result = buildQueueListModel(queue, 'q10', { showHistory: true, showFullHistory: false });
 
@@ -146,9 +146,39 @@ describe('buildQueueListModel', () => {
       | Extract<QueueFlatRow, { type: 'history-show-all' }>
       | undefined;
     expect(showAllRow).toBeDefined();
-    expect(showAllRow!.hiddenCount).toBe(5);
+    expect(showAllRow!.hiddenCount).toBe(8);
 
     const historyRows = result.flatRows.filter((row) => row.type === 'history-item');
-    expect(historyRows).toHaveLength(5);
+    expect(historyRows).toHaveLength(2);
+  });
+});
+
+describe('buildQueueListModel with nothing current (F3 now-slot mode)', () => {
+  const queue = [makeItem('h1', 'c1'), makeItem('h2', 'c2'), makeItem('u1', 'c3')];
+
+  it('keeps History as History, before the divider', () => {
+    const { flatRows, currentItemFlatIndex } = buildQueueListModel(queue, null, {
+      showHistory: true,
+      showFullHistory: true,
+      historyCount: 2,
+    });
+    expect(flatRows.map((row) => row.type)).toEqual(['history-item', 'history-item', 'history-divider', 'future-item']);
+    const future = flatRows[3];
+    expect(future.type === 'future-item' && future.queueIndex).toBe(2);
+    expect(currentItemFlatIndex).toBe(3);
+  });
+
+  it('reads an orphan current climb as nothing current', () => {
+    const { flatRows } = buildQueueListModel(queue, 'orphan', {
+      showHistory: true,
+      showFullHistory: true,
+      historyCount: 1,
+    });
+    expect(flatRows.map((row) => row.type)).toEqual(['history-item', 'history-divider', 'future-item', 'future-item']);
+  });
+
+  it('legacy (no historyCount) still shows the whole queue as Up next', () => {
+    const { flatRows } = buildQueueListModel(queue, null, { showHistory: true, showFullHistory: true });
+    expect(flatRows.every((row) => row.type === 'future-item')).toBe(true);
   });
 });

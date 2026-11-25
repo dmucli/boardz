@@ -1,4 +1,23 @@
 // @vitest-environment jsdom
+// The list-play hook has its own suite; here a tap only has to reach it.
+vi.mock('../../../lib/playlists/use-tick-list-activation', () => ({ useTickListActivation: () => vi.fn() }));
+vi.mock('../../../providers/logbook-delete-provider', () => ({
+  usePendingLogbookDeletes: () => new Set(),
+  useLogbookDeleteActions: () => ({ getDeleteScope: () => 'scope', scheduleDelete: vi.fn(() => true) }),
+}));
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { render, screen, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -19,11 +38,20 @@ const feed = vi.hoisted(() => ({
 
 vi.mock('../../../lib/analytics', () => ({ track: vi.fn() }));
 
+// ReadableColumn pads by the side safe area; a portrait phone has none.
+vi.mock('react-native-safe-area-context', () => ({
+  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+}));
+
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   RefreshControl: () => null,
   useWindowDimensions: () => ({ fontScale: 1, width: 375, height: 800 }),
-  StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+    hairlineWidth: 1,
+  },
   Platform: { OS: 'ios', select: (specifics: Record<string, unknown>) => specifics.ios ?? specifics.default },
   Pressable: ({ children, onPress, disabled }: { children?: ReactNode; onPress?: () => void; disabled?: boolean }) =>
     createElement('button', { onClick: disabled ? undefined : onPress, disabled }, children),
@@ -46,14 +74,21 @@ vi.mock('@shopify/flash-list', () => ({
     ),
 }));
 
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en-US' } }) }));
 vi.mock('../LogbookRow', () => ({ LogbookRow: () => createElement('div') }));
 vi.mock('../LogbookDayDivider', () => ({ LogbookDayDivider: () => null }));
 vi.mock('../LogbookEntryChooserSheet', () => ({ LogbookEntryChooserSheet: () => null }));
 vi.mock('../LogbookEditSheet', () => ({ LogbookEditSheet: () => null }));
 vi.mock('../BoardLinkPrompt', () => ({ BoardLinkPrompt: () => null }));
 vi.mock('../LogbookFilterSheet', () => ({ LogbookFilterSheet: () => null }));
-vi.mock('../../SearchHeader', () => ({ SearchHeader: () => null }));
+// The capsule row's inputs, reduced to fixed values: these suites drive rows.
+vi.mock('../use-logbook-board-options', () => ({ useLogbookBoardOptions: () => [] }));
+vi.mock('../../../hooks/use-today', () => ({ useToday: () => new Date(2026, 5, 30) }));
+vi.mock('../../../hooks/use-grade-format', () => ({ useGradeFormat: () => ({ gradeFormat: 'v' }) }));
+vi.mock('../../../lib/routing/scoped-navigation', () => ({ useScopedRouter: () => ({ push: vi.fn() }) }));
+vi.mock('../../../lib/logbook-pinned-chips-store', () => ({
+  useLogbookPinnedChips: () => ({ pinned: [], loaded: true, isPinned: () => false, togglePin: vi.fn() }),
+}));
 vi.mock('../../../lib/haptics', () => ({ hapticSelection: vi.fn(), hapticSuccess: vi.fn(), hapticError: vi.fn() }));
 vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { black: '#000' } }));
 vi.mock('../../Text', () => ({
@@ -69,12 +104,16 @@ vi.mock('../../../lib/graphql/hooks', () => ({
 vi.mock('../../../hooks/use-bottom-chrome-metrics', () => ({
   useBottomChromeMetrics: () => ({ scrollBottomPadding: 0 }),
 }));
-vi.mock('../../../theme/tokens', () => ({ spacing: {}, borderRadius: {} }));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: {},
+  borderRadius: {},
+}));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({ systemColors: {}, brandColors: {} }),
 }));
 vi.mock('expo-router', () => ({ useRouter: () => ({ push: vi.fn() }), useFocusEffect: () => {} }));
-vi.mock('../../../lib/open-climb-in-play-drawer', () => ({ openClimbInPlayDrawer: vi.fn() }));
 vi.mock('../../../providers/drawer-host-provider', () => ({ useDrawerHost: () => ({ openPlayDrawer: vi.fn() }) }));
 vi.mock('@boardsesh/board-react', () => ({ useDeleteTick: () => ({ mutate: vi.fn(), isPending: false }) }));
 vi.mock('../../../providers/dialog-provider', () => ({ useConfirm: () => vi.fn(async () => false) }));

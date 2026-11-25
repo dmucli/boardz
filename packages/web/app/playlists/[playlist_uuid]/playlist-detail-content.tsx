@@ -14,7 +14,6 @@ import {
   LockOutlined,
   SentimentDissatisfiedOutlined,
   MoreVertOutlined,
-  ElectricBoltOutlined,
   DeleteOutlined,
   PeopleOutlined,
   IosShare,
@@ -23,6 +22,7 @@ import {
 } from '@mui/icons-material';
 import { useTranslation } from 'react-i18next';
 import type { Climb } from '@/app/lib/types';
+import type { ClimbThumbnailCrop } from '@/app/lib/climb-thumbnail-crop';
 import { executeGraphQL, createGraphQLHttpClient } from '@/app/lib/graphql/client';
 import {
   type GetPlaylistQueryResponse,
@@ -51,12 +51,16 @@ import { LoadingSpinner } from '@/app/components/ui/loading-spinner';
 import { EmptyState } from '@/app/components/ui/empty-state';
 import FollowButton from '@/app/components/ui/follow-button';
 import PlaylistPreviewSquare from '@/app/components/playlists/playlist-preview-square';
+import PlaylistCoverMosaic from '@/app/components/playlists/playlist-cover-mosaic';
 import { recordPlaylistOpen } from '@/app/lib/recent-playlists-db';
 import { useWsAuthToken } from '@/app/hooks/use-ws-auth-token';
+import { isSessionSuperseded } from '@/app/lib/auth/session-guard';
 import { getDefaultAngleForBoard } from '@/app/lib/board-config-for-playlist';
+import { currentBrandColor } from '@boardsesh/velvet-tokens';
 import { themeTokens } from '@/app/theme/theme-config';
+import { DEFAULT_LOCALE, isSupportedLocale } from '@/app/lib/i18n/config';
 import { useLocaleRouter } from '@/app/lib/i18n/use-locale-router';
-import { buildAppHandoffUrl } from '@/app/lib/app-handoff';
+import type { PlaylistGradeBandSummary } from '@/app/lib/playlist-grade-band';
 import BackButton from '@/app/components/back-button';
 import CommentSection from '@/app/components/social/comment-section';
 import MultiboardClimbList from '@/app/components/climb-list/multiboard-climb-list';
@@ -66,6 +70,9 @@ import { findMatchingBoard, type BoardConfig } from '@/app/lib/find-matching-boa
 import { ssrSeedMatchesQueryKey } from '@/app/lib/graphql/ssr-query-seed';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import styles from '@/app/components/ui/page-container.module.css';
+import shellStyles from '@/app/components/ui/page-shell/page-shell.module.css';
+import PlaylistHeroCta from './playlist-hero-cta';
+import PlaylistSubline, { playlistBoardTypes } from './playlist-subline';
 
 // Validate hex color format
 const isValidHexColor = (color: string): boolean => {
@@ -83,8 +90,36 @@ const PLAYLIST_COLORS = [
   themeTokens.colors.amber,
 ];
 
+// Named here, not left to the global `h1, h2` rule: a MUI Typography variant
+// sets its own font-family, and that class beats the element selector.
+const titleSx = {
+  m: 0,
+  fontFamily: 'var(--font-display), sans-serif',
+  fontWeight: themeTokens.typography.fontWeight.bold,
+  letterSpacing: '-0.025em',
+  textWrap: 'balance',
+} as const;
+
+// The call to action's distance from the description or follow button above it.
+const heroCtaSx = { mt: `${themeTokens.spacing[5]}px` } as const;
+
+// Outlined circles beside the hand-off, the size of a comfortable tap.
+const heroIconButtonSx = {
+  width: 44,
+  height: 44,
+  border: '1px solid var(--control-border)',
+} as const;
+
 type PlaylistDetailContentProps = {
   playlistUuid: string;
+  /** The page's locale, for the subline's list of boards and the hand-off event. */
+  locale: string;
+  /**
+   * The playlist's grade band, from the server. Null for a private playlist or
+   * one with no graded climb; the subline then leaves the band out.
+   */
+  gradeSummary?: PlaylistGradeBandSummary | null;
+  thumbnailCropsByClimb?: Record<string, ClimbThumbnailCrop>;
   /** Base path for navigating back to the playlists library (e.g. "/b/my-kilter/40/playlists"). Defaults to "/playlists". */
   playlistsBasePath?: string;
   /** When set from a board slug route, auto-selects the matching board filter. */
@@ -97,20 +132,31 @@ type PlaylistDetailContentProps = {
   initialPlaylist?: Playlist | null;
   /** SSR-fetched first page of climbs to avoid first-load spinner. */
   initialClimbs?: PlaylistClimbsResult | null;
+  /**
+   * The laptop's QR card, server-rendered by the page so `qrcode.react` never
+   * reaches the client. Absent when the server read the playlist as private or
+   * could not read it, and shown only while the playlist on screen is public.
+   */
+  qrCard?: React.ReactNode;
 };
 
 export default function PlaylistDetailContent({
   playlistUuid,
+  locale,
+  gradeSummary,
+  thumbnailCropsByClimb,
   playlistsBasePath = '/playlists',
   boardSlug,
   boardConfig,
   initialMyBoards,
   initialPlaylist,
   initialClimbs,
+  qrCard,
 }: PlaylistDetailContentProps) {
   const router = useLocaleRouter();
   const { showMessage } = useSnackbar();
   const { t } = useTranslation('playlists');
+  const { t: tMarketing, i18n: marketingI18n } = useTranslation('marketing');
   const [playlist, setPlaylist] = useState<Playlist | null>(initialPlaylist ?? null);
   const [loading, setLoading] = useState(!initialPlaylist);
   const [error, setError] = useState<string | null>(null);
@@ -180,6 +226,8 @@ export default function PlaylistDetailContent({
       hasPlaylistDataRef.current = true;
       setPlaylist(response.playlist);
     } catch (err) {
+      // A reply for an earlier account: the fetch for the current one owns the state.
+      if (isSessionSuperseded(err)) return;
       console.error('Error fetching playlist:', err);
       // Keep the SSR-rendered content on screen if a background refetch
       // hits a transient network error — we'd rather show slightly stale
@@ -278,6 +326,33 @@ export default function PlaylistDetailContent({
   // this screen uses web `Climb`. Runtime objects are the same flattened GraphQL
   // climbs, so cast once here.
   const allClimbs = sharedAllClimbs as unknown as Climb[];
+  const usableThumbnailCrops = useMemo(() => {
+    const initialByUuid = new Map(initialClimbs?.climbs.map((climb) => [climb.uuid, climb]));
+    return Object.fromEntries(
+      allClimbs.flatMap((climb) => {
+        const initial = initialByUuid.get(climb.uuid);
+        const crop = thumbnailCropsByClimb?.[climb.uuid];
+        return crop &&
+          initial?.frames === climb.frames &&
+          initial.boardType === climb.boardType &&
+          initial.layoutId === climb.layoutId
+          ? [[climb.uuid, crop]]
+          : [];
+      }),
+    );
+  }, [allClimbs, initialClimbs, thumbnailCropsByClimb]);
+
+  // The cover and the subline describe the playlist, not the current board
+  // filter, so they read the server's unfiltered first page while it exists.
+  const firstPageClimbs = useMemo<Climb[]>(
+    () => (initialClimbs ? (initialClimbs.climbs as unknown as Climb[]) : allClimbs),
+    [initialClimbs, allClimbs],
+  );
+  const playlistBoardType = playlist?.boardType;
+  const boardTypes = useMemo(
+    () => (playlistBoardType ? playlistBoardTypes(playlistBoardType, firstPageClimbs) : []),
+    [playlistBoardType, firstPageClimbs],
+  );
 
   const handleLoadMore = useCallback(() => {
     if (hasNextPage && !isFetchingNextPage) {
@@ -350,7 +425,7 @@ export default function PlaylistDetailContent({
 
   const getPlaylistColor = () => {
     if (playlist?.color && isValidHexColor(playlist.color)) {
-      return playlist.color;
+      return currentBrandColor(playlist.color);
     }
     return PLAYLIST_COLORS[0];
   };
@@ -387,6 +462,7 @@ export default function PlaylistDetailContent({
   const climbList = (
     <MultiboardClimbList
       climbs={allClimbs}
+      thumbnailCropsByClimb={usableThumbnailCrops}
       isFetching={isFetchingClimbs}
       isLoading={isClimbsLoading}
       hasMore={hasNextPage ?? false}
@@ -394,172 +470,203 @@ export default function PlaylistDetailContent({
       selectedBoard={selectedBoard}
       fallbackBoardTypes={[playlist.boardType]}
       boards={myBoards}
+      // www has no bottom tab bar to clear; the spacer left an empty band
+      // under a short list.
+      showBottomSpacer={false}
     />
   );
 
   return (
-    <>
-      {/* Back Button */}
-      <div className={styles.actionsSection}>
-        <BackButton fallbackUrl={playlistsBasePath} />
-      </div>
+    // PageShell's frame (header clearance, page width, gutters) without its
+    // header: the h1 sits beside the cover, which PageShell's title cannot.
+    <Box component="main" className={shellStyles.pageShell}>
+      <Box className={`${shellStyles.inner} ${shellStyles.wide}`}>
+        <Box className={shellStyles.breadcrumb}>
+          <BackButton fallbackUrl={playlistsBasePath} />
+        </Box>
 
-      {/* Main Content */}
-      <div className={styles.contentWrapper}>
-        {/* Hero Card */}
-        <div className={styles.heroSection}>
-          <div className={styles.heroContent}>
-            <div className={styles.heroSquare}>
-              <PlaylistPreviewSquare
-                boardType={playlist.boardType}
-                layoutId={playlist.layoutId}
-                color={getPlaylistColor()}
-                icon={playlist.icon}
-              />
-            </div>
-            <div className={styles.heroInfo}>
-              {/* The page's only `h1`, and `variant="h5"` keeps it looking
-                  exactly as it did — the name was an `h2` under no `h1` at
-                  all, so every playlist page shipped a heading outline with
-                  no top. Adding a heading here means checking this stays the
-                  one `h1` on the page. */}
-              <Typography
-                variant="h5"
-                component="h1"
-                className={`${styles.heroName} ${playlist.isPublic ? styles.heroNameWithShare : ''}`}
-              >
-                {playlist.name}
-              </Typography>
-              <div className={styles.heroMeta}>
-                <span className={styles.heroMetaItem}>{t('detail.climbCount', { count: playlist.climbCount })}</span>
-                <span className={styles.heroMetaItem}>
-                  <PeopleOutlined sx={{ fontSize: 14, verticalAlign: 'middle', mr: 0.5 }} />
-                  {t('detail.followerCount', { count: playlist.followerCount })}
-                </span>
-                <span
-                  className={`${styles.visibilityBadge} ${
-                    playlist.isPublic ? styles.publicBadge : styles.privateBadge
-                  }`}
-                >
-                  {playlist.isPublic ? (
-                    <>
-                      <PublicOutlined sx={{ fontSize: 14 }} /> {t('detail.visibility.public')}
-                    </>
-                  ) : (
-                    <>
-                      <LockOutlined sx={{ fontSize: 14 }} /> {t('detail.visibility.private')}
-                    </>
-                  )}
-                </span>
-              </div>
-              {playlist.description && (
-                <Typography variant="body2" className={styles.heroDescription}>
-                  {playlist.description}
-                </Typography>
-              )}
-              {/* Follow button for non-owners on public playlists */}
-              {!isOwner && playlist.isPublic && (
-                <Box sx={{ mt: 1 }}>
-                  <FollowButton
-                    entityId={playlist.uuid}
-                    initialIsFollowing={playlist.isFollowedByMe}
-                    followMutation={FOLLOW_PLAYLIST}
-                    unfollowMutation={UNFOLLOW_PLAYLIST}
-                    entityLabel="playlist"
-                    getFollowVariables={(id) => ({ input: { playlistUuid: id } })}
-                    onFollowChange={(isFollowing) => {
-                      setPlaylist({
-                        ...playlist,
-                        followerCount: playlist.followerCount + (isFollowing ? 1 : -1),
-                        isFollowedByMe: isFollowing,
-                      });
-                    }}
+        <Box component="header" className={styles.hero}>
+          <div className={styles.heroCover}>
+            <PlaylistCoverMosaic
+              climbs={firstPageClimbs}
+              fallbackBoardType={playlist.boardType}
+              cropsByClimb={thumbnailCropsByClimb}
+              fallback={
+                <div className={styles.heroSquare}>
+                  <PlaylistPreviewSquare
+                    boardType={playlist.boardType}
+                    layoutId={playlist.layoutId}
+                    color={getPlaylistColor()}
+                    icon={playlist.icon}
                   />
-                </Box>
-              )}
-              {/* Lighting the wall lives in the app. A plain cross-origin
-                  anchor, never a redirect — www and app share the
-                  `.boardsesh.com` session cookie, so there is no token to hand
-                  over (same contract as start-climbing-button.tsx). */}
-              <MuiButton
-                variant="contained"
-                component="a"
-                href={buildAppHandoffUrl(`/discover/${playlistUuid}`)}
-                startIcon={<ElectricBoltOutlined />}
-                sx={{ mt: 1 }}
-              >
-                {t('detail.openInApp')}
-              </MuiButton>
-            </div>
+                </div>
+              }
+            />
           </div>
 
-          {/* Share + Ellipsis Menu */}
-          <Box
-            sx={{
-              position: 'absolute',
-              top: 1.5,
-              right: 1.5,
-              display: 'flex',
-              flexDirection: 'row',
-              gap: 0.5,
-            }}
-          >
-            {/* Pin toggle: any signed-in viewer can pin a playlist they can
-                see (own private/public + others' public, gated server-side
-                by verifyPlaylistAccess). Hidden for unauthenticated users. */}
-            {token && (
-              <IconButton
-                onClick={handleTogglePin}
-                aria-label={t(playlist.isPinnedByMe ? 'library.pin.unpinAriaLabel' : 'library.pin.pinAriaLabel')}
-              >
-                {playlist.isPinnedByMe ? <PushPin /> : <PushPinOutlined />}
-              </IconButton>
-            )}
-            {playlist.isPublic && (
-              <IconButton onClick={handleShare} aria-label={t('detail.share')}>
-                <IosShare />
-              </IconButton>
-            )}
-            <IconButton
-              onClick={(e: React.MouseEvent<HTMLButtonElement>) => setMenuAnchor(e.currentTarget)}
-              aria-label={t('detail.actions')}
-            >
-              <MoreVertOutlined />
-            </IconButton>
-          </Box>
+          <div className={styles.heroTitle}>
+            <Typography variant="h2" component="h1" sx={titleSx}>
+              {playlist.name}
+            </Typography>
+            <PlaylistSubline
+              boardTypes={boardTypes}
+              // The list's own count, which the meta description and share card
+              // print too. `climbCount` also counts drafts and hidden spray climbs.
+              climbCount={initialClimbs?.totalCount ?? playlist.climbCount}
+              gradeSummary={gradeSummary}
+              locale={locale}
+            />
+          </div>
 
-          <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={() => setMenuAnchor(null)}>
-            {isOwner && (
+          <div className={styles.heroBody}>
+            <div className={styles.heroMeta}>
+              <span className={styles.heroMetaItem}>
+                <PeopleOutlined sx={{ fontSize: 14 }} />
+                {t('detail.followerCount', { count: playlist.followerCount })}
+              </span>
+              <span
+                className={`${styles.visibilityBadge} ${playlist.isPublic ? styles.publicBadge : styles.privateBadge}`}
+              >
+                {playlist.isPublic ? (
+                  <>
+                    <PublicOutlined sx={{ fontSize: 14 }} /> {t('detail.visibility.public')}
+                  </>
+                ) : (
+                  <>
+                    <LockOutlined sx={{ fontSize: 14 }} /> {t('detail.visibility.private')}
+                  </>
+                )}
+              </span>
+            </div>
+            {playlist.description && (
+              <Typography variant="body2" className={styles.heroDescription}>
+                {playlist.description}
+              </Typography>
+            )}
+            {/* Follow button for non-owners on public playlists */}
+            {!isOwner && playlist.isPublic && (
+              <Box sx={{ mt: 1.5 }}>
+                <FollowButton
+                  entityId={playlist.uuid}
+                  initialIsFollowing={playlist.isFollowedByMe}
+                  followMutation={FOLLOW_PLAYLIST}
+                  unfollowMutation={UNFOLLOW_PLAYLIST}
+                  entityLabel="playlist"
+                  getFollowVariables={(id) => ({ input: { playlistUuid: id } })}
+                  onFollowChange={(isFollowing) => {
+                    setPlaylist({
+                      ...playlist,
+                      followerCount: playlist.followerCount + (isFollowing ? 1 : -1),
+                      isFollowedByMe: isFollowing,
+                    });
+                  }}
+                />
+              </Box>
+            )}
+
+            <Box sx={heroCtaSx}>
+              <PlaylistHeroCta
+                playlistUuid={playlistUuid}
+                boardType={playlist.boardType}
+                layoutId={playlist.layoutId}
+                isPublic={playlist.isPublic}
+                locale={locale}
+                labels={{
+                  // The badges' own words, and the language they are in, which picks the artwork.
+                  store: {
+                    ios: tMarketing('home.hero.ctaInstallIos'),
+                    android: tMarketing('home.hero.ctaInstallAndroid'),
+                    update: tMarketing('home.hero.ctaUpdate'),
+                    locale: isSupportedLocale(marketingI18n.language) ? marketingI18n.language : DEFAULT_LOCALE,
+                  },
+                  storeHelper: t('detail.cta.getAppHelper'),
+                  // The playlist's own words: the climb page's "open it" names
+                  // a climb, which reads wrong where a playlist is feminine.
+                  handoffMobile: t('detail.cta.openInBrowserMobile'),
+                  handoffDesktop: t('detail.cta.openInBrowser'),
+                }}
+                // The live visibility, not the server's: a playlist read as
+                // private after the server rendered the card gets no code.
+                qrCard={playlist.isPublic ? qrCard : null}
+                actions={
+                  <>
+                    {/* Pin toggle: any signed-in viewer can pin a playlist they can
+                        see (own private/public + others' public, gated server-side
+                        by verifyPlaylistAccess). Hidden for unauthenticated users. */}
+                    {token && (
+                      <IconButton
+                        color="primary"
+                        sx={heroIconButtonSx}
+                        onClick={handleTogglePin}
+                        aria-label={t(
+                          playlist.isPinnedByMe ? 'library.pin.unpinAriaLabel' : 'library.pin.pinAriaLabel',
+                        )}
+                      >
+                        {playlist.isPinnedByMe ? <PushPin /> : <PushPinOutlined />}
+                      </IconButton>
+                    )}
+                    {playlist.isPublic && (
+                      <IconButton
+                        color="primary"
+                        sx={heroIconButtonSx}
+                        onClick={handleShare}
+                        aria-label={t('detail.share')}
+                      >
+                        <IosShare />
+                      </IconButton>
+                    )}
+                    {/* Delete is the menu's only item and only the owner may use it,
+                        so nobody else gets a button that opens an empty menu. */}
+                    {isOwner && (
+                      <IconButton
+                        color="primary"
+                        sx={heroIconButtonSx}
+                        onClick={(e: React.MouseEvent<HTMLButtonElement>) => setMenuAnchor(e.currentTarget)}
+                        aria-label={t('detail.actions')}
+                      >
+                        <MoreVertOutlined />
+                      </IconButton>
+                    )}
+                  </>
+                }
+              />
+            </Box>
+          </div>
+
+          {isOwner && (
+            <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={() => setMenuAnchor(null)}>
               <MenuItem onClick={handleDelete} sx={{ color: 'var(--color-error)' }}>
                 <ListItemIcon>
                   <DeleteOutlined sx={{ color: 'var(--color-error)' }} />
                 </ListItemIcon>
                 <ListItemText>{t('detail.menu.delete')}</ListItemText>
               </MenuItem>
-            )}
-          </Menu>
-        </div>
+            </Menu>
+          )}
+        </Box>
 
-        {/* Climbs List with multi-board support */}
-        <div className={styles.climbsSection}>
-          {allClimbs.length === 0 && !isFetchingClimbs && !isClimbsLoading ? (
-            <EmptyState description={t('detail.empty')} />
-          ) : (
-            climbList
+        <div className={styles.contentWrapper}>
+          {/* Climbs List with multi-board support */}
+          <div className={styles.climbsSection}>
+            {allClimbs.length === 0 && !isFetchingClimbs && !isClimbsLoading ? (
+              <EmptyState description={t('detail.empty')} />
+            ) : (
+              climbList
+            )}
+          </div>
+
+          {/* Discussion */}
+          {playlist.isPublic && (
+            <div className={styles.discussionSection}>
+              <CommentSection
+                entityType="playlist_climb"
+                entityId={`${playlistUuid}:_all`}
+                title={t('detail.discussion')}
+              />
+            </div>
           )}
         </div>
-
-        {/* Discussion */}
-        {playlist.isPublic && (
-          <div className={styles.discussionSection}>
-            <CommentSection
-              entityType="playlist_climb"
-              entityId={`${playlistUuid}:_all`}
-              title={t('detail.discussion')}
-            />
-          </div>
-        )}
-      </div>
-    </>
+      </Box>
+    </Box>
   );
 }

@@ -46,8 +46,8 @@ const accentSurface: Record<OnboardingCardAccent, string> = {
 function resolveAccentIconColor(accent: OnboardingCardAccent): string {
   switch (accent) {
     case 'spark':
-      // Amber is fill-only in Velvet Send, so on a tint it is the GLYPH that
-      // carries it, never a filled chip with amber behind pale text.
+      // The spark is fill-only in Velvet Send, so on a tint it is the GLYPH that
+      // carries it, never a filled chip with the spark behind pale text.
       return 'var(--color-accent)';
     case 'info':
       return 'var(--color-info)';
@@ -55,7 +55,7 @@ function resolveAccentIconColor(accent: OnboardingCardAccent): string {
       return 'inherit';
     case 'brand':
     default:
-      return 'var(--color-primary)';
+      return 'var(--neutral-500)';
   }
 }
 
@@ -133,8 +133,8 @@ export default function OnboardingCard({
       sx={{
         borderRadius: `${themeTokens.borderRadius.lg}px`,
         // A card needs a FILL on the dark ground: a bare hairline outline on
-        // #110A20 is nearly invisible, and depth here is a lighter violet
-        // rather than a shadow.
+        // the near-black page is nearly invisible, and depth here is a lighter
+        // grey rather than a shadow.
         backgroundColor: 'var(--semantic-surface)',
         border: '1px solid var(--control-border)',
         transition: themeTokens.transitions.fast,

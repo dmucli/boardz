@@ -1,11 +1,13 @@
+import { PressableSurface } from '../PressableSurface';
 // Home's "Climbing now" rail. Self-subscribing on purpose: Home's list header
 // is a `useMemo` whose deps must not include this query's data, or every poll
 // would rebuild the FlashList header. The screen passes the scope and a stable
 // invite callback; everything that changes on a poll stays in here.
 
 import { memo, useCallback, useEffect, useMemo, useRef } from 'react';
-import { FlatList, Pressable, StyleSheet, useWindowDimensions, View, type ListRenderItemInfo } from 'react-native';
-import { useIsFocused, useRouter } from 'expo-router';
+import { FlatList, Platform, StyleSheet, useWindowDimensions, View, type ListRenderItemInfo } from 'react-native';
+import { useIsFocused } from 'expo-router';
+import { useScopedRouter as useRouter } from '../../lib/routing/scoped-navigation';
 import { useTranslation } from 'react-i18next';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { Text } from '../Text';
@@ -71,12 +73,15 @@ type LiveSessionsRailProps = {
   enabled: boolean;
   /** Opens the invite sheet for the viewer's own solo session. */
   onInvite: (sessionId: string) => void;
+  /** False while Home's Session card shows, so Start is never offered twice. */
+  showStartPrompt?: boolean;
 };
 
 export const LiveSessionsRail = memo(function LiveSessionsRail({
   boardUuid,
   enabled,
   onInvite,
+  showStartPrompt = true,
 }: LiveSessionsRailProps) {
   const { t } = useTranslation('feed');
   const router = useRouter();
@@ -84,7 +89,7 @@ export const LiveSessionsRail = memo(function LiveSessionsRail({
   const backgrounded = useIsAppBackgrounded();
   const colors = useLiveSessionColors();
   const { fontScale } = useWindowDimensions();
-  const layout = useMemo(() => liveTileLayout(fontScale), [fontScale]);
+  const layout = useMemo(() => liveTileLayout(fontScale, Platform.OS), [fontScale]);
   const { formatGrade } = useGradeFormat();
 
   const { expanded, toggle, loaded } = useLiveSessionsCollapse();
@@ -133,8 +138,9 @@ export const LiveSessionsRail = memo(function LiveSessionsRail({
   const startCollapsed = impressions.loaded ? isStartPromptCollapsed(impressions.days, localDayKey(nowDate())) : null;
 
   const plan = useMemo(
-    () => planLiveRail({ cards, viewerInSession: queueSessionId != null, followsNobody, startCollapsed }),
-    [cards, queueSessionId, followsNobody, startCollapsed],
+    () =>
+      planLiveRail({ cards, viewerInSession: queueSessionId != null, followsNobody, startCollapsed, showStartPrompt }),
+    [cards, queueSessionId, followsNobody, startCollapsed, showStartPrompt],
   );
 
   const blockedOffline = offline.isBlocked && (offline.reason === 'offline' || offline.reason === 'offline_mode');
@@ -300,7 +306,7 @@ export const LiveSessionsRail = memo(function LiveSessionsRail({
   return (
     <View style={styles.section} testID="live-sessions-rail">
       {/* The whole heading row is one tap target (25pt + padding + hit slop ≥ 44pt). */}
-      <Pressable
+      <PressableSurface
         onPress={toggle}
         accessibilityRole="button"
         accessibilityLabel={title}
@@ -312,11 +318,11 @@ export const LiveSessionsRail = memo(function LiveSessionsRail({
         <SectionDisclosureChevron expanded={expanded} size={18} />
         <View style={styles.headerSpacer} />
         {liveCount > 0 ? (
-          <Text variant="footnote" color={colors.live} style={styles.liveCount}>
+          <Text emphasized variant="footnote" color={colors.live}>
             {t('mobile.liveSessions.liveCount', { count: liveCount })}
           </Text>
         ) : null}
-      </Pressable>
+      </PressableSurface>
       {/* Nothing until the stored collapse state lands: rendering the default
           and then correcting it is the cold-start flash this avoids. */}
       {!loaded || !expanded ? null : blockedOffline ? (
@@ -346,7 +352,6 @@ const styles = StyleSheet.create({
     paddingBottom: spacing[2],
   },
   headerSpacer: { flex: 1 },
-  liveCount: { fontWeight: '600' },
   body: {
     gap: spacing[3],
   },

@@ -1,12 +1,17 @@
+import { useHeaderHeight } from 'expo-router/react-navigation';
+import { AccessibleTextInput as TextInput } from './AccessibleTextInput';
+import { useTypographyStyles, type TypographyScale } from '../hooks/use-typography-styles';
 import { useState } from 'react';
-import { ScrollView, StyleSheet, TextInput, View, type ColorValue } from 'react-native';
-import { useRouter } from 'expo-router';
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View, type ColorValue } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { ClientError } from 'graphql-request';
 import { useTheme } from '../providers/theme-provider';
 import { useToast } from '../providers/toast-provider';
 import { useAuth } from '../providers/auth-provider';
+import { useKeyboardHeight } from '../hooks/use-keyboard-height';
+import { useBottomChromeMetrics } from '../hooks/use-bottom-chrome-metrics';
 import { useDeleteAccount, useDeleteAccountInfo } from '../lib/graphql/hooks';
+import { captureAuthCredentialGeneration, isAuthCredentialGenerationCurrent } from '../lib/auth-store';
 import { borderRadius, spacing } from '../theme/tokens';
 import { reportError } from '../lib/error-reporting';
 import { Text, type TextVariant } from './Text';
@@ -31,6 +36,7 @@ function EmphasizedText({
   variant?: TextVariant;
   color?: ColorValue;
 }) {
+  const styles = useTypographyStyles(createStyles);
   const segments = text.split(/<strong>(.*?)<\/strong>/g);
   return (
     <Text variant={variant} color={color}>
@@ -48,11 +54,14 @@ function EmphasizedText({
 }
 
 export function DeleteAccountScreen() {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('settings');
   const { systemColors } = useTheme();
   const { showToast } = useToast();
   const { signOut } = useAuth();
-  const router = useRouter();
+  const { scrollBottomPadding } = useBottomChromeMetrics();
+  const headerHeight = useHeaderHeight();
+  const keyboardHeight = useKeyboardHeight(Platform.OS === 'android');
 
   const [confirmText, setConfirmText] = useState('');
   const [removeSetterName, setRemoveSetterName] = useState(false);
@@ -75,17 +84,36 @@ export function DeleteAccountScreen() {
     // the delete through here would submit removeSetterName:false and leave the
     // setter name on preserved climbs without the user ever seeing the choice.
     if (!isConfirmed || isDeleting || infoQuery.isLoading) return;
+    const credentialGeneration = captureAuthCredentialGeneration();
     let accountDeleted = false;
     try {
       setIsDeleting(true);
-      await deleteAccount.mutateAsync({ input: { removeSetterName } });
+      const deletion = await deleteAccount.mutateAsync({ input: { removeSetterName }, credentialGeneration });
+      if (!deletion.deleted) throw new Error('Account deletion was not confirmed');
       accountDeleted = true;
+      if (!isAuthCredentialGenerationCurrent(deletion.intent.credentialGeneration)) {
+        setConfirmText('');
+        setRemoveSetterName(false);
+        setIsDeleting(false);
+        return;
+      }
       // Account gone — sign out. The auth provider clears local state and flips
       // isAuthenticated → false, which redirects to /auth/login (no manual nav).
       // signOut's revoke is best-effort, so this resolves even though the
       // session was just deleted server-side.
-      await signOut('account_deleted');
+      await signOut('account_deleted', deletion.intent);
+      // A newer owner may have won at the provider's own async guard. If the
+      // screen remains mounted, require a new confirmation for that owner.
+      setConfirmText('');
+      setRemoveSetterName(false);
+      setIsDeleting(false);
     } catch (error) {
+      if (!isAuthCredentialGenerationCurrent(credentialGeneration)) {
+        setConfirmText('');
+        setRemoveSetterName(false);
+        setIsDeleting(false);
+        return;
+      }
       reportError(error);
       // The account is already gone; only the local sign-out cleanup failed.
       // Showing a "deletion failed" toast or re-enabling the form would be
@@ -103,127 +131,131 @@ export function DeleteAccountScreen() {
     }
   };
 
+  // Grouped like the native settings pages: each control in a card, the prose as
+  // the footer under it. There is no Cancel: back is cancel. The destructive
+  // button stays in the body, below the typed confirmation it depends on (the
+  // documented exception in docs/mobile/mobile-sheets-vs-routes.md).
   return (
-    <ScrollView
-      contentInsetAdjustmentBehavior="automatic"
-      contentContainerStyle={styles.container}
-      keyboardShouldPersistTaps="handled"
+    <KeyboardAvoidingView
+      keyboardVerticalOffset={headerHeight}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      style={styles.flex}
     >
-      <View style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}>
-        <Text variant="body" color={systemColors.secondaryLabel}>
-          {t('deleteAccount.dialog.warning')}
-        </Text>
-      </View>
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        style={{ backgroundColor: systemColors.groupedBackground }}
+        contentContainerStyle={[styles.container, { paddingBottom: scrollBottomPadding + spacing[4] + keyboardHeight }]}
+        keyboardShouldPersistTaps="handled"
+      >
+        {infoQuery.isLoading ? (
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.footer}>
+            {t('deleteAccount.dialog.checking')}
+          </Text>
+        ) : null}
 
-      {infoQuery.isLoading ? (
-        <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.checking}>
-          {t('deleteAccount.dialog.checking')}
-        </Text>
-      ) : null}
+        {hasPublishedClimbs ? (
+          <View style={styles.section}>
+            <View
+              style={[styles.card, styles.cardPadded, { backgroundColor: systemColors.secondaryGroupedBackground }]}
+            >
+              <SwitchRow
+                label={t('deleteAccount.dialog.removeSetterName')}
+                value={removeSetterName}
+                onValueChange={setRemoveSetterName}
+                disabled={isDeleting}
+              />
+            </View>
+            <View style={styles.footer}>
+              <EmphasizedText
+                text={t('deleteAccount.dialog.publishedClimbs', { count: publishedClimbCount })}
+                variant="footnote"
+                color={systemColors.secondaryLabel}
+              />
+            </View>
+          </View>
+        ) : null}
 
-      {hasPublishedClimbs ? (
         <View style={styles.section}>
-          <View style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}>
-            <EmphasizedText
-              text={t('deleteAccount.dialog.publishedClimbs', { count: publishedClimbCount })}
-              variant="body"
-              color={systemColors.label}
+          <View style={[styles.card, { backgroundColor: systemColors.secondaryGroupedBackground }]}>
+            <TextInput
+              autoCapitalize="characters"
+              autoCorrect={false}
+              editable={!isDeleting}
+              value={confirmText}
+              onChangeText={setConfirmText}
+              placeholder={t('deleteAccount.dialog.confirmPlaceholder')}
+              placeholderTextColor={systemColors.tertiaryLabel}
+              accessibilityLabel={t('deleteAccount.dialog.confirmPlaceholder')}
+              style={[styles.input, { color: systemColors.label }]}
             />
           </View>
-          <View style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}>
-            <SwitchRow
-              label={t('deleteAccount.dialog.removeSetterName')}
-              value={removeSetterName}
-              onValueChange={setRemoveSetterName}
-              disabled={isDeleting}
+          <View style={[styles.footer, styles.footerParagraphs]}>
+            <Text variant="footnote" color={systemColors.secondaryLabel}>
+              {t('deleteAccount.dialog.warning')}
+            </Text>
+            <EmphasizedText
+              text={t('deleteAccount.dialog.confirmInstruction')}
+              variant="footnote"
+              color={systemColors.secondaryLabel}
             />
           </View>
         </View>
-      ) : null}
 
-      <View style={styles.confirmBlock}>
-        <EmphasizedText text={t('deleteAccount.dialog.confirmInstruction')} variant="body" color={systemColors.label} />
-        <TextInput
-          autoCapitalize="characters"
-          autoCorrect={false}
-          editable={!isDeleting}
-          value={confirmText}
-          onChangeText={setConfirmText}
-          placeholder={t('deleteAccount.dialog.confirmPlaceholder')}
-          placeholderTextColor={systemColors.tertiaryLabel}
-          accessibilityLabel={t('deleteAccount.dialog.confirmPlaceholder')}
-          style={[
-            styles.input,
-            {
-              color: systemColors.label,
-              backgroundColor: systemColors.tertiaryBackground,
-              borderColor: systemColors.separator,
-            },
-          ]}
-        />
-      </View>
-
-      <View style={styles.actions}>
-        <Button
-          title={t('deleteAccount.dialog.confirm')}
-          variant="filled"
-          role="destructive"
-          onPress={() => {
-            void handleDelete();
-          }}
-          disabled={!isConfirmed || isDeleting || infoQuery.isLoading}
-          loading={isDeleting}
-        />
-        <Button
-          title={t('deleteAccount.dialog.cancel')}
-          variant="text"
-          role="cancel"
-          onPress={() => router.back()}
-          disabled={isDeleting}
-        />
-      </View>
-    </ScrollView>
+        <View style={styles.actions}>
+          <Button
+            title={t('deleteAccount.dialog.confirm')}
+            variant="filled"
+            role="destructive"
+            onPress={() => {
+              void handleDelete();
+            }}
+            disabled={!isConfirmed || isDeleting || infoQuery.isLoading}
+            loading={isDeleting}
+          />
+        </View>
+      </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flexGrow: 1,
-    paddingTop: spacing[4],
-    paddingBottom: spacing[8],
-  },
-  card: {
-    overflow: 'hidden',
-    borderRadius: borderRadius.lg,
-    marginHorizontal: spacing[4],
-    padding: spacing[4],
-  },
-  section: {
-    gap: spacing[3],
-    marginTop: spacing[5],
-  },
-  checking: {
-    marginHorizontal: spacing[4],
-    marginTop: spacing[3],
-  },
-  confirmBlock: {
-    marginHorizontal: spacing[4],
-    marginTop: spacing[5],
-    gap: spacing[2],
-  },
-  input: {
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    borderRadius: borderRadius.md,
-    borderWidth: StyleSheet.hairlineWidth,
-    fontSize: 16,
-  },
-  actions: {
-    marginHorizontal: spacing[4],
-    marginTop: spacing[6],
-    gap: spacing[2],
-  },
-  bold: {
-    fontWeight: '700',
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    flex: { flex: 1 },
+    container: {
+      width: '100%',
+      maxWidth: 672,
+      alignSelf: 'center',
+      flexGrow: 1,
+      paddingTop: spacing[4],
+      gap: spacing[6],
+    },
+    section: {
+      gap: spacing[2],
+    },
+    card: {
+      overflow: 'hidden',
+      borderRadius: borderRadius.lg,
+      marginHorizontal: spacing[4],
+    },
+    cardPadded: {
+      padding: spacing[3],
+    },
+    footer: {
+      paddingHorizontal: spacing[4],
+    },
+    footerParagraphs: {
+      gap: spacing[2],
+    },
+    input: {
+      minHeight: 44,
+      paddingHorizontal: spacing[4],
+      paddingVertical: spacing[3],
+      fontSize: textStyles.body.fontSize,
+    },
+    actions: {
+      marginHorizontal: spacing[4],
+    },
+    bold: {
+      fontWeight: '700',
+    },
+  });

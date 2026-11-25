@@ -8,7 +8,14 @@
       "notFoundDescription": "This climbing profile could not be found.",
       "ogAlt": "{{name}}'s climbing profile",
       "title": "{{name}}'s Climbing Sessions",
-      "titleWithBoard": "{{name}}'s {{board}} Sessions"
+      "titleWithBoard": "{{name}}'s {{board}} Sessions",
+      "ogTitleSent": "{{name}} sent {{grade}}",
+      "ogTitleNoSends": "{{name}} on Boardsesh",
+      "ogDescriptionHardest_one": "{{climb}} is the first send on {{boards}}. See the logbook.",
+      "ogDescriptionHardest_other": "{{climb}} is the hardest of {{count}} climbs sent on {{boards}}. See the logbook.",
+      "ogDescriptionCount_one": "{{count}} climb sent on {{boards}}. See the logbook.",
+      "ogDescriptionCount_other": "{{count}} climbs sent on {{boards}}. See the logbook.",
+      "ogDescriptionNoSends": "No sends logged yet. See the profile."
     },
     "statistics": {
       "title": "Statistics"
@@ -20,18 +27,45 @@
       "title": "Created Climbs"
     },
     "setter": {
-      "title": "{{name}} - Setter",
+      "title": "Climbs set by {{name}}",
       "description": "Climbs created by {{name}} on Boardsesh",
+      "titleWithClimbs_one": "{{climbs}} {{boards}} climb set by {{name}}",
+      "titleWithClimbs_other": "{{climbs}} {{boards}} climbs set by {{name}}",
+      "titlePage": "Climbs set by {{name}} — Page {{page}}",
+      "titleWithClimbsPage_one": "{{climbs}} {{boards}} climb set by {{name}} — Page {{page}}",
+      "titleWithClimbsPage_other": "{{climbs}} {{boards}} climbs set by {{name}} — Page {{page}}",
+      "descriptionCtaSingle": "Light it on your board with Boardsesh.",
+      "boardSprayWall": "Spraywall",
+      "descriptionSetCount_one": "{{name}} has set {{climbs}} climb on {{boards}}.",
+      "descriptionSetCount_other": "{{name}} has set {{climbs}} climbs on {{boards}}.",
+      "descriptionSends_one": "{{sends}} send so far.",
+      "descriptionSends_other": "{{sends}} sends so far.",
+      "descriptionCta": "Pick one and light it on your board with Boardsesh.",
       "fallbackTitle": "Setter Profile",
       "fallbackDescription": "View setter profile and climbs on Boardsesh",
-      "ogAlt": "{{name}}'s setter profile"
+      "ogAlt": "{{name}}'s setter profile",
+      "ogTitleSends": "{{name}}: {{sends}} sends on their climbs",
+      "ogTitleSetCount_one": "{{name}} set {{climbs}} climb",
+      "ogTitleSetCount_other": "{{name}} set {{climbs}} climbs",
+      "ogSetCount_one": "Set {{climbs}} climb.",
+      "ogSetCount_other": "Set {{climbs}} climbs.",
+      "ogMostSent_one": "Most sent: {{climb}}, {{sends}} send.",
+      "ogMostSent_other": "Most sent: {{climb}}, {{sends}} sends.",
+      "ogMostSentSoFar": "Most sent so far: {{climb}}.",
+      "ogOnBoards": "On {{boards}}.",
+      "ogPickOne": "Pick one and get on it.",
+      "ogGoGetOnIt": "Go get on it."
     }
   },
   "page": {
     "lastThreeMonths": "Last 3 months",
     "activityChartLabel": "Activity over the last 3 months",
     "displayNameFallback": "Climber",
-    "betaVideos": "Their beta"
+    "betaVideos": "Their beta",
+    "shareAriaLabel": "Share profile",
+    "shareText": "Check out {{name}} on Boardsesh",
+    "linkCopied": "Link copied",
+    "shareFailed": "Couldn’t share the link"
   },
   "nav": {
     "statistics": {
@@ -57,6 +91,13 @@
     "calendarAria": "Climbing calendar: {{days}} active days, {{count}} climbs",
     "calendarLess": "Less",
     "calendarMore": "More",
+    "calendarToday": "Today",
+    "calendarTapHint": "Tap a day to see its climbs",
+    "calendarClimbs_one": "{{count}} climb",
+    "calendarClimbs_other": "{{count}} climbs",
+    "calendarNoClimbs": "No climbs",
+    "calendarWeekAria": "Week of {{date}}: {{days}}",
+    "calendarWeekEmptyAria": "Week of {{date}}: no climbs",
     "percentile": "Percentile",
     "topPercent": "Top {{value}}%",
     "moreSentThan": "More problems sent than {{value}}% of climbers",
@@ -98,7 +139,10 @@
       "rowAria": "{{name}}: {{count}} distinct climbs sent, all time",
       "recordAria": "Best send: {{grade}}",
       "publicTitle": "Across their boards",
-      "publicEmpty": "No sends logged yet."
+      "publicEmpty": "No sends logged yet.",
+      "totalsLoading": "Loading the totals",
+      "totalsError": "Couldn't load these totals.",
+      "totalsOffline": "These totals load when you're back online."
     },
     "progress": {
       "title": "Your progress",
@@ -144,11 +188,20 @@
     "shareFailed": "Failed to share",
     "follower_one": "follower",
     "follower_other": "followers",
-    "climb_one": "climb",
-    "climb_other": "climbs",
     "seoHeading": "Climbs set by {{name}}",
-    "seoSummary_one": "{{name}} has one climb up on Boardsesh, on {{boards}}.",
-    "seoSummary_other": "{{name}} has {{count}} climbs up on Boardsesh, on {{boards}}.",
+    "stats": {
+      "climbs_one": "{{climbs}} climb on {{boards}}",
+      "climbs_other": "{{climbs}} climbs on {{boards}}",
+      "sends_one": "sent once",
+      "sends_other": "sent {{sends}} times",
+      "joined": "{{climbs}}, {{sends}}"
+    },
+    "mostSent": {
+      "heading": "Most sent",
+      "meta_one": "{{sends}} send · {{angle}}°",
+      "meta_other": "{{sends}} sends · {{angle}}°",
+      "artAlt": "{{climbName}} lit up on the {{board}} at {{angle}}°"
+    },
     "climbsHeading": "Every climb by {{name}}",
     "empty": "No climbs on this page.",
     "browseBoard": "See every climb on {{boardName}}",
@@ -158,6 +211,11 @@
       "previous": "Previous climbs",
       "next": "More climbs",
       "pageLabel": "Page {{page}}"
+    },
+    "installHelper": "Get the free app and climb {{name}}’s problems on your board.",
+    "qr": {
+      "title": "Scan to open these climbs on your phone",
+      "imageLabel": "QR code that opens {{name}}’s climbs on your phone"
     }
   }
 }

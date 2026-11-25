@@ -4,10 +4,11 @@ import type { UiVariant } from '../theme/resolve-ui-variant';
 // this module's pure, react-native-free unit test. select-by-variant is type-only.
 import { selectByVariant } from '../theme/variants/select-by-variant';
 import {
-  MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT,
+  MATERIAL_MINI_PLAYER_CARD_RESERVE,
   MATERIAL_TAB_BAR_HEIGHT,
   NATIVE_BOTTOM_ACCESSORY_HEIGHT,
   REST_TIMER_RESERVE,
+  SIDEBAR_WIDTH,
   TAB_BAR_HEIGHT,
   TOOLBAR_GAP_ABOVE_TABBAR,
   TOOLBAR_RESERVE,
@@ -54,10 +55,11 @@ export type BottomChromeInputs = {
   /** Resolved UI variant; controls the JS toolbar shape/reserve. */
   uiVariant: UiVariant;
   /**
-   * Whether the native iOS 26 tab bar (`NativeTabs`) is the one on screen, as
+   * Whether the native UIKit tab bar (`NativeTabs`) is the one on screen, as
    * opposed to the JS `MaterialTabBar`. This is the *rendered tab bar*, which can
-   * differ from `uiVariant`: Liquid Glass on iOS < 26 / Android falls back to the
-   * JS bar. Drives tab-bar height + whether the bar overlays content.
+   * differ from `uiVariant`: Liquid Glass on Android and on the tablet shell keeps
+   * the JS bar, while every iPhone on Liquid Glass (iOS 18 included) gets the
+   * native one. Drives tab-bar height + whether the bar overlays content.
    */
   usesNativeTabBar: boolean;
   /** Bottom safe-area inset. */
@@ -83,9 +85,10 @@ export type BottomChromeInputs = {
    */
   nativeAccessoryPresented: boolean;
   /**
-   * Whether the regular-width iPad shell is on screen: a left sidebar replaces
-   * the bottom tab bar. Optional and defaults to `false` — every existing
-   * (phone / compact-iPad) call site keeps its current behavior unchanged.
+   * Whether the regular-width JS tablet shell is on screen (Android tablet, Expo
+   * web, a Material-variant iPad): a left rail replaces the bottom tab bar. The
+   * native iPad is not this shell; it takes the native-tab path with
+   * `tabBarAtBottom: false`. Optional and defaults to `false`.
    */
   usesSidebar?: boolean;
   /**
@@ -95,6 +98,8 @@ export type BottomChromeInputs = {
    * the JS queue toolbar because the pane is suppressed there.
    */
   detailPaneOwnsQueue?: boolean;
+  /** A card accompanies the browser sidebar, even when the selection pane is up. */
+  sidebarMiniPlayer?: boolean;
   /**
    * Bottom inset measured INSIDE the focused native tab's content (see the
    * module docblock's sampling-point contract), published by
@@ -137,6 +142,68 @@ export type BottomChromeInputs = {
    * it — it anchors to {@link BottomChromeMetrics.restTimerBottom}.
    */
   restTimerArmed?: boolean;
+  /**
+   * Whether the native tab bar runs along the bottom. False on iPhone Duo closed
+   * and open in landscape (`useVerticalTabBar`), where UIKit draws it as a
+   * vertical rail, and on a regular-width native iPad, where it is the sidebar or
+   * sits at the top. Only the accessory, along the bottom of the content, takes
+   * bottom space there.
+   * The unmeasured reconstruction then leaves the 49pt bar out instead of
+   * reserving dead space for it under every list. `true` (the default) leaves
+   * every other call site byte-identical.
+   */
+  tabBarAtBottom?: boolean;
+  /** A prepared workout uses the same pill reserve before its timer is armed. */
+  workoutStartPending?: boolean;
+  /**
+   * Whether the focused route hides the root rest-timer pill while the timer is
+   * idle (`isRestTimerPillHiddenRoute`: the Session tab's own page, which shows
+   * the timer's settings inline). `false` (the default) leaves every other call
+   * site byte-identical.
+   */
+  restTimerIdleHiddenRoute?: boolean;
+  /**
+   * Whether the rest timer is counting a rest (it has something to count from:
+   * a logged climb, or the on-the-minute anchor). Idle means armed but waiting
+   * for the first climb. The Session page shows the pill again while it counts,
+   * because nothing inline there shows the running time outside a workout block.
+   */
+  restTimerCounting?: boolean;
+  /**
+   * The largest in-tab bottom inset measured since the bottom chrome last changed
+   * shape (route, current climb, orientation), from
+   * {@link trackExpandedTabContentInset}. On iOS 26 the bar minimizes as you
+   * scroll and re-expands when you tap it or scroll back, so the measured inset
+   * flips between two values; this is the larger one, the EXPANDED bar.
+   *
+   * It floors `scrollBottomPadding` on the native-overlay path. The
+   * reconstruction there adds accessory height only on a tab root, but UIKit
+   * also draws the platter on pushed tab routes (DEVICE_VERIFIED iPhone 17 Pro,
+   * iOS 26.5, Discover › playlist: 83 minimized, 139 expanded). Without this
+   * floor a list scrolled to its end with the bar minimized kept 83pt of padding,
+   * and re-expanding the bar put the last row under the MiniPlayer. `null` (the
+   * default) leaves every other call site byte-identical.
+   */
+  expandedTabContentInsetBottom?: number | null;
+  /**
+   * Left and right insets measured inside the focused native tab, from the same
+   * probe as {@link measuredTabContentInsetBottom}: the native iPad sidebar
+   * (DEVICE_VERIFIED 280pt left, iPad landscape, iPadOS 27.0) and the iPhone Duo
+   * rail (DEVICE_VERIFIED 84pt right, closed). The accessory spans the content
+   * column between them, so a root overlay meant to sit on it has to be inset
+   * by the same amount. `null` means no measurement yet; ignored off the
+   * native-tab-bar path.
+   */
+  measuredTabContentInsetLeft?: number | null;
+  measuredTabContentInsetRight?: number | null;
+  /**
+   * The Android phone nav bar with hide-on-scroll on (`resolveHideOnScrollTabBar`:
+   * Android, not a tablet, flag on). On a tab root that bar is drawn over the
+   * content (opaque, with a fade above it) so it can slide away; everywhere else it stays in flow.
+   * Platform-keyed, not variant-keyed: an Android dev or screenshot build on
+   * Liquid Glass draws the same JS bar.
+   */
+  hideOnScrollTabBar?: boolean;
 };
 
 export type BottomChromeMetrics = {
@@ -212,15 +279,84 @@ export type BottomChromeMetrics = {
    * alone is never enough here: it excludes the 49pt bar, and anchoring to it
    * is exactly how the Start capsule ended up underneath the tab bar.
    *
-   * On the JS-tab-bar fallback (iOS < 26, non-glass-capable iPhones, iPad in a
-   * narrow split, Android forced to Liquid Glass) the floating
+   * Wherever the native accessory is absent (the native bar on iOS 18, iPad in
+   * a narrow split, Android forced to Liquid Glass) the floating
    * `PersistentQueueBar` is a JS overlay that does NOT extend the UIKit safe
    * area, so nothing reserves for it implicitly — the raw inset alone dropped
    * the Start capsule under the tray's log-ascent tick (#3967). Hence the
    * explicit `+ jsQueueReserve`.
    */
   preSessionFooterBottom: number;
+  /**
+   * Horizontal insets of the content column the bottom chrome spans, for
+   * overlays mounted at the ROOT (the rest-timer pill). The root lays out
+   * against the whole window, but on the native iPad the sidebar takes the
+   * leading 280pt and on the iPhone Duo the rail takes the trailing 84pt; the
+   * accessory sits on the column between. Centering the pill on the window put
+   * it 140pt left of the MiniPlayer on an iPad in landscape. Zero off the
+   * native-tab-bar path, where nothing narrows the column.
+   */
+  contentColumnLeft: number;
+  contentColumnRight: number;
+  /**
+   * Whether the focused route hides the pill right now: the Session page while
+   * the timer is idle. The root pill host gates on this same value, so the pill
+   * and its reserve come and go together (see `shouldRenderRestTimerPill`).
+   */
+  restTimerPillHiddenOnRoute: boolean;
+  /**
+   * The JS nav bar is drawn over the screen (position absolute) instead of
+   * below it: the Android phone bar on a top-level tab root (and under the
+   * player, which keeps the tab-root geometry). `MaterialTabBar` reads this to
+   * pick its layout, so the bar and the reserves can never disagree. The
+   * metrics describe the SHOWN bar; hiding it on scroll moves chrome by a
+   * transform and leaves every number here alone, as iOS does.
+   */
+  jsBarOverlaysContent: boolean;
 };
+
+/** What {@link trackExpandedTabContentInset} remembers between renders. */
+export type ExpandedTabContentInset = {
+  /** Identifies the bottom chrome's shape; a new key starts a fresh maximum. */
+  key: string;
+  /**
+   * The inset store's publish count when `key` began. Only readings published
+   * after it belong to this shape.
+   */
+  sincePublish: number;
+  /** Largest in-tab inset published under `key`, or null before the first. */
+  bottom: number | null;
+};
+
+/**
+ * Folds one in-tab inset measurement into the running maximum for the current
+ * chrome shape, which is the expanded-bar inset once the bar has been expanded
+ * under that shape at least once.
+ *
+ * A changed `key` (route, current climb, accessory, window size) drops the old
+ * maximum AND ignores the reading that is current at that moment: the probe
+ * republishes only after UIKit lays the new shape out, so for at least one
+ * render the store still holds the OLD shape's inset. Folding it would seed the
+ * new shape with, say, the 139pt of a tab root with the platter and keep it
+ * after a push to a route without one publishes 83, which is a 56pt dead band
+ * under the list (#3776). So a new key starts empty and folds only readings
+ * whose `publishCount` moved past the one recorded at the key change; until
+ * then the floor is null and padding falls back to the live value.
+ *
+ * Returns `previous` itself when nothing changed, so a caller can keep it in a
+ * ref.
+ */
+export function trackExpandedTabContentInset(
+  previous: ExpandedTabContentInset | null,
+  key: string,
+  measured: number | null,
+  publishCount: number,
+): ExpandedTabContentInset {
+  if (!previous || previous.key !== key) return { key, sincePublish: publishCount, bottom: null };
+  if (measured === null || publishCount <= previous.sincePublish) return previous;
+  const bottom = previous.bottom === null ? measured : Math.max(previous.bottom, measured);
+  return bottom === previous.bottom ? previous : { ...previous, bottom };
+}
 
 /**
  * Pure bottom-chrome arbitration. `nativeAccessoryVisible` and
@@ -265,11 +401,22 @@ export function computeBottomChromeMetrics({
   hasCurrentClimb,
   nativeAccessoryPresented,
   usesSidebar = false,
-  detailPaneOwnsQueue = usesSidebar,
+  sidebarMiniPlayer = false,
+  detailPaneOwnsQueue = usesSidebar && !sidebarMiniPlayer,
   measuredTabContentInsetBottom = null,
   connectivityBannerHeight = 0,
   restTimerArmed = false,
+  tabBarAtBottom = true,
+  workoutStartPending = false,
+  restTimerIdleHiddenRoute = false,
+  restTimerCounting = false,
+  expandedTabContentInsetBottom = null,
+  measuredTabContentInsetLeft = null,
+  measuredTabContentInsetRight = null,
+  hideOnScrollTabBar = false,
 }: BottomChromeInputs): BottomChromeMetrics {
+  // The Session page keeps an idle pill off screen; a counting one comes back.
+  const restTimerPillHiddenOnRoute = restTimerIdleHiddenRoute && !restTimerCounting;
   // Regular-width iPad with the detail pane mounted: the left sidebar replaces
   // the bottom tab bar and the selected-climb pane replaces the floating queue
   // toolbar, so nothing floats at the bottom. Every offset collapses to the raw
@@ -303,6 +450,10 @@ export function computeBottomChromeMetrics({
       fixedFooterBottom: insetsBottom,
       inSessionListBottom: insetsBottom,
       preSessionFooterBottom: insetsBottom,
+      contentColumnLeft: 0,
+      contentColumnRight: 0,
+      restTimerPillHiddenOnRoute,
+      jsBarOverlaysContent: false,
     };
   }
 
@@ -315,12 +466,12 @@ export function computeBottomChromeMetrics({
   // is false, so no JS bar — and no `jsQueueReserve` for a bar that isn't there.
   const jsQueueToolbarVisible = onAccessorySurface && hasCurrentClimb && !effectiveNativeAccessoryPresented;
   // The native iOS tab bar is 49pt; the JS M3 `MaterialTabBar` is taller. Key this
-  // on the *rendered* bar, not the variant — Liquid Glass on iOS < 26 / Android
-  // falls back to the JS bar. `tabBarHeight` describes the rendered bar, while
+  // on the *rendered* bar, not the variant — Liquid Glass on Android and on the
+  // tablet shell keeps the JS bar. `tabBarHeight` describes the rendered bar, while
   // `tabBarBottom` is the full clearance from the screen bottom: the opaque raw
   // inset for NativeTabs, or raw inset + JS bar height for the fallback.
   const tabBarConstant = usesNativeTabBar ? TAB_BAR_HEIGHT : MATERIAL_TAB_BAR_HEIGHT;
-  const tabBarHeight = insideTabs && !usesSidebar ? tabBarConstant : 0;
+  const tabBarHeight = insideTabs && !usesSidebar && tabBarAtBottom ? tabBarConstant : 0;
   // Only the native tab bar overlays content (UIKit draws it over the scroll view);
   // the JS `MaterialTabBar` sits in flow. NativeTabs extends the IN-TAB safe-area
   // inset to include both the bar and its BottomAccessory (DEVICE_VERIFIED 139 =
@@ -331,12 +482,16 @@ export function computeBottomChromeMetrics({
   // synthetic "sidebar + native tab signal" call must not consume the in-tab
   // measurement or its reconstruction — hence the `!usesSidebar` term.
   const tabBarOverlaysContent = insideTabs && usesNativeTabBar && !usesSidebar;
-  // The Material bar reserves its full height even though it's tucked ~2px into the
-  // tab bar (MATERIAL_TABBAR_OVERLAP in persistent-queue-bar), so its visible height
-  // above the tab bar is ~2px less. The resulting 2px of extra scroll padding is
-  // intentional slack — imperceptible, and not worth threading the overlap through
-  // this pure arbitration. Don't "fix" it by subtracting the overlap here.
-  const jsQueueToolbarReserve = uiVariant === 'material' ? MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT : TOOLBAR_RESERVE;
+  // The Android phone bar overlays its tab roots so it can hide on scroll. It is
+  // absolute only there: on a pushed sub-route it sits in flow, opaque, and never
+  // hides. Same height as in flow, so `tabBarBottom` is unchanged; only the
+  // screen's floor moves down to the window bottom (`contentInsetBottom`).
+  const jsBarOverlaysContent =
+    hideOnScrollTabBar && insideTabs && !usesNativeTabBar && !usesSidebar && tabBarAtBottom && onAccessorySurface;
+  // The Material MiniPlayer card floats one gap above the in-flow tab bar, so it
+  // takes its height plus that gap (`FloatingMiniPlayerCard`).
+  const jsQueueToolbarReserve =
+    sidebarMiniPlayer || uiVariant === 'material' ? MATERIAL_MINI_PLAYER_CARD_RESERVE : TOOLBAR_RESERVE;
   const jsQueueReserve = jsQueueToolbarVisible ? jsQueueToolbarReserve : 0;
   // A native accessory is UIKit-owned and already folded into `insetsBottom` on
   // the real NativeTabs path. Keep this field as an *additional* reserve so every
@@ -353,11 +508,23 @@ export function computeBottomChromeMetrics({
   // the window's own inset) — e.g. a probe publish that raced a provider
   // teardown — without imposing an assumption-based floor on valid ones.
   const nativeChromeFallback =
-    insetsBottom + TAB_BAR_HEIGHT + (nativeAccessoryVisible ? NATIVE_BOTTOM_ACCESSORY_HEIGHT : 0);
-  const nativeChromeBottom =
+    insetsBottom +
+    (tabBarAtBottom ? TAB_BAR_HEIGHT : 0) +
+    (nativeAccessoryVisible ? NATIVE_BOTTOM_ACCESSORY_HEIGHT : 0);
+  const measuredNativeChromeBottom =
     measuredTabContentInsetBottom !== null && measuredTabContentInsetBottom >= insetsBottom
       ? measuredTabContentInsetBottom
       : nativeChromeFallback;
+  // With no bottom tab bar (the native iPad, the iPhone Duo's rail) the accessory
+  // is the only chrome down there, so floor the clearance at it: should UIKit
+  // ever leave the accessory out of the tab's inset, a docked footer, the rest
+  // pill and the floating controls still sit above the MiniPlayer, not under it.
+  // A bottom bar's minimize state legitimately shrinks the measured inset, so the
+  // floor applies only off it.
+  const nativeChromeBottom =
+    !tabBarAtBottom && nativeAccessoryVisible
+      ? Math.max(measuredNativeChromeBottom, nativeChromeFallback)
+      : measuredNativeChromeBottom;
   const tabBarBottom = tabBarOverlaysContent ? nativeChromeBottom : insetsBottom + tabBarHeight;
   // Scroll padding is floored at the un-minimized reconstruction: the gesture
   // that minimizes the bar is the same one scrolling the list, and shrinking
@@ -365,14 +532,32 @@ export function computeBottomChromeMetrics({
   // the end of content. ≤49pt of extra padding while minimized is invisible
   // slack; floating controls deliberately keep tracking the live value instead
   // (a capsule following the minimizing bar is correct).
-  const scrollTabBarBottom = tabBarOverlaysContent ? Math.max(tabBarBottom, nativeChromeFallback) : tabBarBottom;
+  //
+  // The same reasoning covers the bar re-expanding at the END of a list: the
+  // padding has to be the expanded bar's, whichever state the bar is in, or the
+  // last row ends up under the MiniPlayer with nowhere left to scroll. The
+  // reconstruction only knows the expanded height on a tab root, so the largest
+  // inset measured under this chrome shape floors it too (see
+  // `expandedTabContentInsetBottom`). Invalid readings are rejected by the same
+  // `>= insetsBottom` rule as the live one.
+  const expandedNativeChromeBottom =
+    expandedTabContentInsetBottom !== null && expandedTabContentInsetBottom >= insetsBottom
+      ? expandedTabContentInsetBottom
+      : 0;
+  const scrollTabBarBottom = tabBarOverlaysContent
+    ? Math.max(tabBarBottom, nativeChromeFallback, expandedNativeChromeBottom)
+    : tabBarBottom;
   const activeQueueChromeReserve = Math.max(jsQueueReserve, nativeAccessoryReserve);
   // The rest-timer pill is a root-level floating overlay pinned just above the
   // queue chrome, so it exists exactly where that chrome does: inside the tabs,
   // off the sidebar shell (which returned above). A fixed reserve, not a
   // measured one — see REST_TIMER_RESERVE in theme/layout for why the pill is
   // not another publish-and-measure store.
-  const restTimerShows = restTimerArmed && insideTabs && !usesSidebar;
+  // The Session tab's own page hides an idle pill (its settings sit inline
+  // there), so it reserves nothing either: a reserve without a pill is a dead
+  // band under Start. Once a rest counts, the pill and its 54pt are back.
+  const restTimerShows =
+    (restTimerArmed || workoutStartPending) && insideTabs && !usesSidebar && !restTimerPillHiddenOnRoute;
   const restTimerReserve = restTimerShows ? REST_TIMER_RESERVE : 0;
   // The pill sits one gap ABOVE the queue chrome, not flush on it. Without this
   // the pill's rounded bottom edge touched the iOS 26 accessory platter and the
@@ -396,13 +581,22 @@ export function computeBottomChromeMetrics({
   // 10pt above the pill's top edge instead of on it.
   const queueChromeBottom = tabBarBottom + activeQueueChromeReserve;
   const restTimerBottom = queueChromeBottom + (restTimerShows ? TOOLBAR_GAP_ABOVE_TABBAR : 0);
-  const contentInsetBottom = tabBarOverlaysContent || !insideTabs ? tabBarBottom : 0;
+  const contentInsetBottom = tabBarOverlaysContent || jsBarOverlaysContent || !insideTabs ? tabBarBottom : 0;
   // A fixed footer docks exactly where the pill floats (on the native-overlay
   // path `contentInsetBottom + activeQueueChromeReserve` IS `restTimerBottom`;
   // on the in-flow JS bar the screen floor makes up the difference), so it has to
   // clear it. This is where the pill parts company with the connectivity banner,
   // which is transient and deliberately left out of the docked offsets.
   const fixedFooterBottom = contentInsetBottom + activeQueueChromeReserve + restTimerReserve;
+  // The column the accessory spans: the window less the in-tab side insets, on
+  // the only path where UIKit lays the tab out beside a sidebar or rail.
+  const contentColumnLeft =
+    usesSidebar && sidebarMiniPlayer
+      ? SIDEBAR_WIDTH
+      : tabBarOverlaysContent
+        ? Math.max(measuredTabContentInsetLeft ?? 0, 0)
+        : 0;
+  const contentColumnRight = tabBarOverlaysContent ? Math.max(measuredTabContentInsetRight ?? 0, 0) : 0;
 
   return {
     hasCurrentClimb,
@@ -435,7 +629,10 @@ export function computeBottomChromeMetrics({
     // adding it twice would leave a 54pt dead band under every Material session.
     inSessionListBottom: selectByVariant(uiVariant, {
       material: fixedFooterBottom,
-      liquidGlass: (tabBarOverlaysContent ? tabBarBottom : insetsBottom) + jsQueueReserve + restTimerReserve,
+      liquidGlass:
+        (tabBarOverlaysContent || jsBarOverlaysContent ? tabBarBottom : insetsBottom) +
+        jsQueueReserve +
+        restTimerReserve,
     }),
     // Keep this branch identical to `inSessionListBottom`: the JS queue tray is an
     // overlay outside the safe area, so the Start capsule only clears it when the
@@ -443,7 +640,14 @@ export function computeBottomChromeMetrics({
     // rest pill — it floats over both surfaces, so both clear it or neither does.
     preSessionFooterBottom: selectByVariant(uiVariant, {
       material: fixedFooterBottom,
-      liquidGlass: (tabBarOverlaysContent ? tabBarBottom : insetsBottom) + jsQueueReserve + restTimerReserve,
+      liquidGlass:
+        (tabBarOverlaysContent || jsBarOverlaysContent ? tabBarBottom : insetsBottom) +
+        jsQueueReserve +
+        restTimerReserve,
     }),
+    contentColumnLeft,
+    contentColumnRight,
+    restTimerPillHiddenOnRoute,
+    jsBarOverlaysContent,
   };
 }

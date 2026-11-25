@@ -2,8 +2,10 @@
 
 import type { SocialEntityType } from './comments';
 import type { ProposalType } from './proposals';
+import type { DirectoryNotice } from './directory-reports';
 
 export type NotificationType =
+  | 'app_feedback_reply'
   | 'new_follower'
   | 'comment_reply'
   | 'comment_on_tick'
@@ -18,7 +20,23 @@ export type NotificationType =
   | 'proposal_created'
   | 'new_climbs_synced'
   | 'gym_claim_approved'
-  | 'proposal_on_your_climb';
+  | 'proposal_on_your_climb'
+  | 'spray_wall_detection_completed'
+  | 'follow_request'
+  | 'comment_on_session'
+  | 'comment_on_playlist'
+  | 'comment_on_board'
+  | 'comment_on_gym'
+  | 'board_report_opened'
+  | 'board_report_resolved'
+  | 'board_removed_from_gym'
+  | 'board_deleted_by_staff'
+  | 'board_edited_by_staff'
+  | 'gym_report_opened'
+  | 'gym_report_resolved'
+  | 'gym_claimed_with_your_board'
+  | 'gym_claim_denied'
+  | 'board_setup_changed_by_climber';
 
 export type Notification = {
   uuid: string;
@@ -42,6 +60,12 @@ export type Notification = {
   proposalValue?: string | null;
   /** Gym name (for gym_claim_approved notifications). */
   gymName?: string | null;
+  sprayWallName?: string | null;
+  sprayWallUuid?: string | null;
+  sprayVersionId?: string | null;
+  sprayResetOfWallUuid?: string | null;
+  /** What a directory notification (reports, staff actions on boards) is about. */
+  directoryNotice?: DirectoryNotice | null;
   isRead: boolean;
   createdAt: string;
 };
@@ -78,6 +102,13 @@ export type GroupedNotification = {
   climbFrames?: string | null;
   /** Sizes the climb fits — Woods numbers holds per size, so the default size draws a different climb. */
   climbCompatibleSizeIds?: number[] | null;
+  /**
+   * Structured climb characteristics (e.g. 'no_match', 'method_footless').
+   * Decode with the CLIMB_CHARACTERISTICS helpers (isNoMatch / getMoonBoardMethod).
+   * Drives the Woods rules line and the no-match glyph when a notification opens
+   * the play drawer directly, without a climb refetch.
+   */
+  climbCharacteristics?: string[] | null;
   /** The commented-on entity behind a comment/vote row, so a client can open the thread. */
   threadEntityType?: SocialEntityType | null;
   threadEntityId?: string | null;
@@ -92,6 +123,12 @@ export type GroupedNotification = {
   setterUsername?: string | null;
   /** Gym name (for gym_claim_approved notifications). */
   gymName?: string | null;
+  sprayWallName?: string | null;
+  sprayWallUuid?: string | null;
+  sprayVersionId?: string | null;
+  sprayResetOfWallUuid?: string | null;
+  /** What a directory notification (reports, staff actions on boards) is about. */
+  directoryNotice?: DirectoryNotice | null;
   isRead: boolean;
   createdAt: string;
 };

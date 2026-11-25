@@ -420,19 +420,21 @@ describe('setSessionBoardPath mutation', () => {
     });
   });
 
-  it('persists the boardPath and publishes SessionBoardPathChanged when it changes, returning a Session', async () => {
+  it('delegates the committed wall change and participant identity, returning a Session', async () => {
     roomManagerMock.updateSessionBoardPathIfChanged.mockResolvedValueOnce(oldPath);
     const ctx = makeCtx({ participantId: 'participant-1' });
 
     const result = await sessionMutations.setSessionBoardPath(undefined, { boardPath: newPath }, ctx);
 
     expect(result).toMatchObject({ id: 'session-1', boardPath: newPath });
-    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledWith('session-1', newPath);
-    expect(pubsubMock.publishSessionEvent).toHaveBeenCalledWith('session-1', {
-      __typename: 'SessionBoardPathChanged',
-      boardPath: newPath,
-      changedByParticipantId: 'participant-1',
-    });
+    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledWith(
+      'session-1',
+      newPath,
+      undefined,
+      'participant-1',
+    );
+    // The real service publishes after commit; the resolver must not duplicate it.
+    expect(pubsubMock.publishSessionEvent).not.toHaveBeenCalled();
   });
 
   it('is idempotent — no event fires when the stored boardPath already matches', async () => {
@@ -442,7 +444,12 @@ describe('setSessionBoardPath mutation', () => {
 
     await sessionMutations.setSessionBoardPath(undefined, { boardPath: newPath }, ctx);
 
-    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledWith('session-1', newPath);
+    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledWith(
+      'session-1',
+      newPath,
+      undefined,
+      'participant-1',
+    );
     expect(pubsubMock.publishSessionEvent).not.toHaveBeenCalled();
   });
 
@@ -480,11 +487,15 @@ describe('setSessionBoardPath mutation', () => {
     await expect(sessionMutations.setSessionBoardPath(undefined, { boardPath: newPath }, ctx)).rejects.toThrow(
       /not found after membership check/,
     );
-    // The publish already happened (we successfully wrote and broadcast
-    // before the read). That's an acceptable outcome — clients receive
-    // the new boardPath; the throw only prevents serving back a malformed
-    // Session payload to the caller.
-    expect(pubsubMock.publishSessionEvent).toHaveBeenCalled();
+    // Publication belongs to the committed service, before this response read.
+    // Its real-DB event contract is covered by session-wall-move-notification.
+    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledWith(
+      'session-1',
+      newPath,
+      undefined,
+      'participant-1',
+    );
+    expect(pubsubMock.publishSessionEvent).not.toHaveBeenCalled();
   });
 
   it('propagates the room-manager not-found throw without publishing', async () => {
@@ -504,32 +515,27 @@ describe('setSessionBoardPath mutation', () => {
     expect(pubsubMock.publishSessionEvent).not.toHaveBeenCalled();
   });
 
-  it('pins the concurrent double-publish contract — two interleaved writes both broadcast', async () => {
-    // The helper is non-atomic (read-then-write per `session-discovery.ts`).
-    // Two callers landing concurrently can both read the same prior value
-    // and both publish `SessionBoardPathChanged`. The client tolerates this
-    // because `router.replace(newPath)` is a no-op when the URL is already
-    // at `newPath`. Pin the contract so a future de-dup change here doesn't
-    // silently invalidate the client's assumption.
+  it('passes each concurrent caller’s participant identity to the publication owner', async () => {
     roomManagerMock.updateSessionBoardPathIfChanged.mockResolvedValue(oldPath);
     const ctxA = makeCtx({ participantId: 'participant-a', connectionId: 'conn-a' });
     const ctxB = makeCtx({ participantId: 'participant-b', connectionId: 'conn-b' });
-
     await Promise.all([
       sessionMutations.setSessionBoardPath(undefined, { boardPath: newPath }, ctxA),
       sessionMutations.setSessionBoardPath(undefined, { boardPath: newPath }, ctxB),
     ]);
-
-    expect(pubsubMock.publishSessionEvent).toHaveBeenCalledTimes(2);
-    expect(pubsubMock.publishSessionEvent).toHaveBeenCalledWith('session-1', {
-      __typename: 'SessionBoardPathChanged',
-      boardPath: newPath,
-      changedByParticipantId: 'participant-a',
-    });
-    expect(pubsubMock.publishSessionEvent).toHaveBeenCalledWith('session-1', {
-      __typename: 'SessionBoardPathChanged',
-      boardPath: newPath,
-      changedByParticipantId: 'participant-b',
-    });
+    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledTimes(2);
+    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledWith(
+      'session-1',
+      newPath,
+      undefined,
+      'participant-a',
+    );
+    expect(roomManagerMock.updateSessionBoardPathIfChanged).toHaveBeenCalledWith(
+      'session-1',
+      newPath,
+      undefined,
+      'participant-b',
+    );
+    expect(pubsubMock.publishSessionEvent).not.toHaveBeenCalled();
   });
 });

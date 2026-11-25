@@ -1,0 +1,139 @@
+appId: com.boardsesh.app.dev
+name: Tutorial - your grades and combined progress
+---
+# "Use my grades" lives on Settings > Climbs & grades. Its switch is found by its
+# neighbours: the label above-left of it, and the Climb view row below the grades
+# and the Climb list row.
+- openLink: com.boardsesh.app://settings/climbs
+- waitForAnimationToEnd
+- scrollUntilVisible:
+    element: Use my grades
+    direction: DOWN
+    timeout: 90000
+    centerElement: true
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/flow-start')}
+- runFlow:
+    when:
+      notVisible:
+        rightOf: Use my grades
+        below: Use my grades
+        above: Climb view
+        checked: true
+    commands:
+      - tapOn:
+          rightOf: Use my grades
+          below: Use my grades
+          above: Climb view
+          checked: false
+- assertVisible:
+    rightOf: Use my grades
+    below: Use my grades
+    above: Climb view
+    checked: true
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/personal-grades')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true
+# The active spray wall sorts first in the retained horizontal board carousel.
+# Normalize this chapter's picker without changing other takes' setup flows.
+- openLink: com.boardsesh.app://boards
+- assertVisible: Your boards
+- repeat:
+    while:
+      notVisible: Tutorial Kilter
+    times: 4
+    commands:
+      - swipe:
+          start: '90%,46%'
+          end: '15%,46%'
+          duration: 800
+      - waitForAnimationToEnd
+- tapOn: Tutorial Kilter
+- extendedWaitUntil:
+    visible: Tutorial Kilter
+    timeout: 90000
+- extendedWaitUntil:
+    visible: 'Filters.*'
+    timeout: 90000
+- tapOn: 'Filters.*'
+- assertVisible:
+    id: sheet-top-bar-trailing
+    text: '(Show.*climbs?|Apply filters)'
+# The Filters sheet retains its scroll position after hold/region selection.
+- scrollUntilVisible:
+    element: Grade range
+    direction: UP
+    timeout: 90000
+- tapOn:
+    id: sheet-top-bar-leading
+- repeat:
+    while:
+      notVisible: Set grade filter to V4
+    times: 4
+    commands:
+      - swipe:
+          start: '15%,43%'
+          end: '80%,43%'
+          duration: 1000
+      - waitForAnimationToEnd
+- tapOn: Set grade filter to V4
+- assertVisible: V4 grade filter selected
+- tapOn:
+    id: sheet-top-bar-trailing
+- waitForAnimationToEnd
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/grade-filter')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true
+- openLink: com.boardsesh.app://profile
+- waitForAnimationToEnd
+- extendedWaitUntil:
+    visible: Across your boards
+    timeout: 90000
+- assertNotVisible: "Couldn't load this"
+- scrollUntilVisible:
+    element: Your progress
+    direction: DOWN
+    timeout: 90000
+    centerElement: true
+- assertVisible:
+    id: profile-progress-section
+- tapOn:
+    id: profile-progress-filter
+- tapOn: All boards
+- tapOn: All
+- back
+- scrollUntilVisible:
+    element: Across your boards
+    direction: UP
+    timeout: 90000
+- assertVisible: '.*Kilter.*'
+- assertVisible: '.*Tension.*'
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/multiboard')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true
+- scrollUntilVisible:
+    element: Your progress
+    direction: DOWN
+    timeout: 90000
+- tapOn:
+    id: profile-progress-filter
+- tapOn: Kilter
+- back
+- scrollUntilVisible:
+    element: 'Calendar'
+    direction: DOWN
+    timeout: 90000
+    centerElement: true
+- assertVisible: Kilter · All time
+- assertVisible: Less
+- assertVisible: More
+- evalScript: ${http.get(TUTORIAL_SIGNAL_URL + '/mark/calendar')}
+- extendedWaitUntil:
+    visible: tutorial-pause
+    timeout: 7000
+    optional: true

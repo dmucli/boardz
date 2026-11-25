@@ -10,19 +10,36 @@
 // Pure logic: it only touches the structural executor surface in ../database, so a
 // node-based fake (or node:sqlite) can exercise the version bookkeeping without
 // loading native expo-sqlite.
+//
+// DOWNGRADE RULE (docs/offline-sync-plan.md, "Older JS on a newer database"): JS can
+// go backwards on a device. A reverted canary OTA, or a climber leaving the
+// early-updates track, puts an older bundle on a database a newer bundle already
+// migrated. This runner only moves forward, so it REFUSES such a database instead
+// of running against a schema it does not know: see `readSchemaCompatibility`. It
+// never rewrites, re-stamps or deletes the newer file.
+//
+// The other half of the rule is on whoever edits this file: a migration must leave
+// a schema the PREVIOUS stable bundle can still read. Expand first (add a nullable
+// column, a new table, an index); contract (drop, rename, tighten) a release later,
+// once no bundle that reads the old shape can come back. CI holds a PR that changes
+// this file until its description says so (`@boardsesh/pr-body`,
+// offline-migration.ts).
 
 import {
   BOARD_CLIMB_HOLD_POSTINGS,
   BOARD_CLIMB_HOLD_SETS,
   HOLDS_INDEX_CLIMBS,
   INDEX_CLIMBS_SYNC_SEQ,
+  INDEX_STATS_ASCENTS,
   DEVICE_ONLY_STATEMENTS,
   SCHEMA_STATEMENTS,
   SPRAY_WALLS,
 } from './schema';
 import { applyBusyTimeout } from './pragmas';
 import { requeueTransportDeadLetters, setDeadLetterRecoveryNotice } from '../mutation-queue/dead-letter-recovery';
+import { ensureMutationQueueDependencies } from '../mutation-queue/schema';
 import type { OfflineDatabase, SqlExecutor } from '../database';
+import { ensureOfflineWriteDeliveryJournal } from '../mutation-queue/delivery-journal';
 
 export type Migration = {
   version: number;
@@ -181,6 +198,79 @@ export const MIGRATIONS: Migration[] = [
     version: 10,
     statements: [HOLDS_INDEX_CLIMBS, BOARD_CLIMB_HOLD_SETS, BOARD_CLIMB_HOLD_POSTINGS, INDEX_CLIMBS_SYNC_SEQ],
   },
+  {
+    // Climb revisions on the device (#6023): the revision a tick was logged
+    // against, and on each climb its current revision and the revision at which
+    // its holds last changed. Mirrors of the three Postgres columns that
+    // `syncTicks` and `syncClimbs` now emit.
+    //
+    // All three are nullable with no default, unlike the server's
+    // `revision_number NOT NULL DEFAULT 1`: a row pulled before this migration
+    // has never been told its revision, and NULL says so. A reader must treat
+    // NULL as unknown and never as 1. No `refreshRevision` bump either; see
+    // the comment on `board_climbs` in sync/table-config.ts.
+    //
+    // Expand-only, so the previous bundle can still read the file once it is
+    // allowed to open it. It changes `board_climbs`, an artifact table, so it
+    // moves ARTIFACT_SCHEMA_VERSION to 11: a snapshot built before it lacks two
+    // columns this client has and is refused until the export rebuilds it.
+    version: 11,
+    statements: [
+      'ALTER TABLE boardsesh_ticks ADD COLUMN climb_revision INTEGER;',
+      'ALTER TABLE board_climbs ADD COLUMN revision_number INTEGER;',
+      'ALTER TABLE board_climbs ADD COLUMN holds_revision_number INTEGER;',
+    ],
+  },
+  {
+    // Spray climbs retired by a full reset (#6024): the mirror of
+    // `board_climbs.retired_by_reset`, which `syncClimbs` now emits. The local
+    // search hides a retired climb from a wall's default list exactly as the
+    // server's `retiredByResetCondition` does, and a downloaded wall reads
+    // locally even while online, so the two must agree.
+    //
+    // Nullable, no default, SQLite boolean as INTEGER 0/1. NULL reads as not
+    // retired, the server's rule too: every catalogue climb is NULL. No
+    // table-wide `refreshRevision` bump; spray scopes get their own bump to 2
+    // (`refreshRevisionByBoardType`), see the comment on `board_climbs` in
+    // sync/table-config.ts.
+    //
+    // Expand-only, so the previous bundle can still read the file. It changes
+    // `board_climbs`, an artifact table, so it moves ARTIFACT_SCHEMA_VERSION to
+    // 12: an artifact built before it is refused until the export rebuilds it.
+    version: 12,
+    statements: ['ALTER TABLE board_climbs ADD COLUMN retired_by_reset INTEGER;'],
+  },
+  {
+    // The climb list's default order as an index: one board at one angle, most
+    // ascents first (`idx_stats_ascents`, see schema.ts). `searchClimbsLocal`
+    // walks it for the default sort instead of filtering and sorting every climb
+    // on the board for each page.
+    //
+    // An index and nothing else, so the previous bundle reads the file exactly
+    // as before once it is allowed to open it. On a phone that already holds a
+    // download the build runs once, inside this migration: 0.4 s on an iPhone
+    // 13 Pro holding two Kilter boards (412,515 stats rows).
+    //
+    // In DEVICE_ONLY_STATEMENTS, so it does not move ARTIFACT_SCHEMA_VERSION:
+    // v13 clients keep importing v12 artifacts.
+    version: 13,
+    statements: [INDEX_STATS_ASCENTS],
+  },
+  {
+    // Durable climb writes must precede the ticks and edits that reference them.
+    // Nullable device-only columns leave existing queued payloads unchanged and
+    // keep snapshot artifacts compatible. The version gate keeps older bundles
+    // from draining new climb writes without understanding their dependencies.
+    version: 14,
+    statements: [],
+    run: ensureMutationQueueDependencies,
+  },
+  {
+    // Device-only delivery evidence. Nullable queue columns preserve old payloads.
+    version: 15,
+    statements: [],
+    run: ensureOfflineWriteDeliveryJournal,
+  },
 ];
 
 const SCHEMA_VERSION_TABLE = `
@@ -235,13 +325,87 @@ async function stampVersion(db: SqlExecutor, version: number): Promise<void> {
 }
 
 /**
+ * Whether this bundle may open a database stamped at `storedVersion`.
+ *
+ * `newer` is the downgrade case: the file was migrated by a bundle that knows
+ * more migrations than this one. It is an OUTCOME, not an error. Nothing is
+ * wrong with the file, and reporting it as a failed init would file it next to
+ * corruption and lock contention, where the only fixes on offer are the wrong
+ * ones.
+ */
+export type SchemaCompatibility = {
+  status: 'compatible' | 'newer';
+  storedVersion: number;
+  supportedVersion: number;
+};
+
+/** The pure half of `readSchemaCompatibility`: compare two version numbers. */
+export function classifySchemaVersion(
+  storedVersion: number,
+  supportedVersion: number = LATEST_SCHEMA_VERSION,
+): SchemaCompatibility {
+  return {
+    status: storedVersion > supportedVersion ? 'newer' : 'compatible',
+    storedVersion,
+    supportedVersion,
+  };
+}
+
+/**
+ * Reads the stored schema version and says whether this bundle may open the file.
+ *
+ * READ-ONLY, which is the point: the caller runs it before any setup DDL, so a
+ * database from a newer bundle is recognised before this one has written a byte
+ * to it. That is why it looks the table up in `sqlite_master` instead of doing
+ * what `runMigrations` does (`CREATE TABLE IF NOT EXISTS schema_version`). A
+ * database with no `schema_version` table is a fresh one, at version 0.
+ */
+export async function readSchemaCompatibility(
+  db: SqlExecutor,
+  supportedVersion: number = LATEST_SCHEMA_VERSION,
+): Promise<SchemaCompatibility> {
+  const table = await db.getFirstAsync<{ name: string }>(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_version'",
+  );
+  const storedVersion = table ? await getCurrentVersion(db) : 0;
+  return classifySchemaVersion(storedVersion, supportedVersion);
+}
+
+/**
+ * Thrown by anything asked to use a database `readSchemaCompatibility` called
+ * `newer`. A class of its own so a caller can tell "this bundle is too old for
+ * the file" from a real SQLite failure.
+ */
+export class SchemaNewerThanAppError extends Error {
+  readonly storedVersion: number;
+  readonly supportedVersion: number;
+
+  constructor(storedVersion: number, supportedVersion: number) {
+    super(
+      `Offline database is at schema v${storedVersion}; this app version only knows v${supportedVersion}. ` +
+        'Refusing to use it until the app updates.',
+    );
+    this.name = 'SchemaNewerThanAppError';
+    this.storedVersion = storedVersion;
+    this.supportedVersion = supportedVersion;
+  }
+}
+
+/**
  * Brings the database up to LATEST_SCHEMA_VERSION. Applies each pending migration
  * (version > current) in ascending order; every migration's statements, its
  * optional data step, and its version stamp run inside one exclusive transaction,
  * so a crash mid-migration leaves the stored version untouched, rolls back
  * whatever the migration had done, and re-runs cleanly next launch.
+ *
+ * Returns `newer`, having touched nothing, when the file was migrated by a bundle
+ * with more migrations than this one (see the downgrade rule at the top of this
+ * file). A caller that gets `newer` back must not use the database.
  */
-export async function runMigrations(db: OfflineDatabase): Promise<void> {
+export async function runMigrations(db: OfflineDatabase): Promise<SchemaCompatibility> {
+  const compatibility = await readSchemaCompatibility(db);
+  if (compatibility.status === 'newer') return compatibility;
+
   await db.execAsync(SCHEMA_VERSION_TABLE);
 
   const currentVersion = await getCurrentVersion(db);
@@ -261,4 +425,6 @@ export async function runMigrations(db: OfflineDatabase): Promise<void> {
       await stampVersion(txn, migration.version);
     });
   }
+
+  return classifySchemaVersion(LATEST_SCHEMA_VERSION);
 }

@@ -65,7 +65,10 @@ vi.mock('react-i18next', () => ({
           'qa.pick.trySurfHint': 'It may not have a preview this build can load.',
           'qa.pick.notServableToast': 'No preview of #{{prNumber}} for this build — it may need a rebase onto main',
         }[key] ?? key;
-      return template.replace(/\{\{(\w+)\}\}/g, (_, name: string) => String(values?.[name] ?? ''));
+      return template.replace(/\{\{(\w+)\}\}/g, (_, name: string) => {
+        const replacement = values?.[name];
+        return typeof replacement === 'string' || typeof replacement === 'number' ? String(replacement) : '';
+      });
     },
   }),
 }));
@@ -131,6 +134,7 @@ vi.mock('../../../providers/theme-provider', () => ({
 const showToast = vi.hoisted(() => vi.fn());
 vi.mock('../../../providers/toast-provider', () => ({ useToast: () => ({ showToast }) }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24, 8: 32 },
   borderRadius: { lg: 12, full: 9999 },
 }));
@@ -152,20 +156,42 @@ const qa = vi.hoisted(() => ({
   surfToPr: vi.fn(),
   surfToStaging: vi.fn(),
   surfToProduction: vi.fn(),
+  // What a null list stands for: the server's own "surfing is off", or a 404
+  // from somewhere else that proves nothing.
+  noListKind: 'surfing-off' as 'surfing-off' | 'unavailable',
   staging: null as { lastUpdateAt: string } | null,
+  earlyUpdates: null as { lastUpdateAt: string } | null,
   refusedPrNumber: null as number | null,
 }));
 vi.mock('../../../lib/qa/qa-surf', () => ({
   qaSurfingAvailable: () => qa.surfingAvailable,
   listPrBranches: qa.listPrBranches,
-  listQaBranches: async (...args: unknown[]) => {
+  fetchQaBranches: async (...args: unknown[]) => {
     const branches = await qa.listPrBranches(...args);
-    return branches === null ? null : { previews: branches, staging: qa.staging };
+    return branches === null
+      ? { kind: qa.noListKind }
+      : { kind: 'listed', list: { previews: branches, staging: qa.staging, earlyUpdates: qa.earlyUpdates } };
   },
   surfToPr: qa.surfToPr,
   surfToStaging: qa.surfToStaging,
   surfToProduction: qa.surfToProduction,
   readRefusedPrNumber: () => qa.refusedPrNumber,
+}));
+
+// Membership of "Get updates early", and what leaving a preview does for a
+// member, are covered where they live (use-early-updates, early-updates,
+// ota-track-sequences). Here only what the screen does with the answer matters,
+// so `returnToOwnTrack` keeps its contract: production for everyone else, a
+// no-reload switch to early updates for a member.
+const earlyUpdates = vi.hoisted(() => ({
+  member: false,
+  joinEarlyUpdates: vi.fn(),
+  noteBranchSurfingOff: vi.fn(),
+}));
+vi.mock('../../../lib/qa/use-early-updates', () => ({ useEarlyUpdatesMember: () => earlyUpdates.member }));
+vi.mock('../../../lib/qa/early-updates', () => ({
+  returnToOwnTrack: async (member: boolean) => (member ? earlyUpdates.joinEarlyUpdates() : qa.surfToProduction()),
+  noteBranchSurfingOff: earlyUpdates.noteBranchSurfingOff,
 }));
 
 const previews = vi.hoisted(() => ({
@@ -183,11 +209,11 @@ vi.mock('../../../lib/qa/use-qa-previews', () => ({
 
 import { QaPickScreen } from '../QaPickScreen';
 
-function renderScreen() {
+function renderScreen(presentation: 'prompt' | 'page' = 'prompt') {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={queryClient}>
-      <QaPickScreen />
+      <QaPickScreen presentation={presentation} />
     </QueryClientProvider>,
   );
 }
@@ -216,23 +242,54 @@ beforeEach(() => {
   qa.surfToPr.mockReset().mockResolvedValue('reloading');
   qa.surfToStaging.mockReset().mockResolvedValue('reloading');
   qa.surfToProduction.mockReset().mockResolvedValue('reloading');
+  earlyUpdates.member = false;
+  earlyUpdates.joinEarlyUpdates.mockReset().mockResolvedValue('early-updates-next-launch');
+  earlyUpdates.noteBranchSurfingOff.mockReset().mockResolvedValue(undefined);
+  qa.noListKind = 'surfing-off';
+  qa.earlyUpdates = null;
 });
 
 describe('QaPickScreen', () => {
-  it('offers production and a compatible staging update beside PR previews', async () => {
-    qa.staging = { lastUpdateAt: '2026-08-26T11:00:00.000Z' };
-    renderScreen();
-    fireEvent.click(await screen.findByLabelText('qa.pick.stagingTitle'));
-    expect(qa.surfToStaging).toHaveBeenCalledOnce();
-    expect(qa.surfToProduction).not.toHaveBeenCalled();
+  it('uses native page navigation and never counts leaving the page as a skipped launch', async () => {
+    const mounted = renderScreen('page');
+    expect(await screen.findByText('pr-4792')).toBeTruthy();
+    expect(screen.queryByText('Skip')).toBeNull();
+    expect(screen.queryByText('Test a PR')).toBeNull();
+    mounted.unmount();
+    expect(trackMock).not.toHaveBeenCalledWith('QA Preview Skipped', {});
   });
 
-  it('offers production even when no PR or staging update is available', async () => {
-    qa.listPrBranches.mockResolvedValue([]);
+  it('keeps release choices out of the PR list', async () => {
+    qa.staging = { lastUpdateAt: '2026-08-26T11:00:00.000Z' };
     renderScreen();
-    fireEvent.click(await screen.findByLabelText('qa.pick.productionTitle'));
-    expect(qa.surfToProduction).toHaveBeenCalledOnce();
+    expect(await screen.findByText('pr-4792')).toBeTruthy();
+    expect(screen.queryByLabelText('qa.pick.stagingTitle')).toBeNull();
+    expect(screen.queryByLabelText('qa.pick.productionTitle')).toBeNull();
   });
+
+  it('acts once on the server switching surfing off, outside the query', async () => {
+    qa.listPrBranches.mockResolvedValue(null);
+    renderScreen();
+
+    expect(await screen.findByText('Previews are switched off')).toBeTruthy();
+    await waitFor(() => expect(earlyUpdates.noteBranchSurfingOff).toHaveBeenCalledOnce());
+  });
+
+  it("does not unpin anything on a 404 the server didn't decide", async () => {
+    qa.listPrBranches.mockResolvedValue(null);
+    qa.noListKind = 'unavailable';
+    renderScreen();
+
+    expect(await screen.findByText('Previews are switched off')).toBeTruthy();
+    expect(earlyUpdates.noteBranchSurfingOff).not.toHaveBeenCalled();
+  });
+
+  it('does not act on surfing-off while the list is being served', async () => {
+    renderScreen();
+    expect(await screen.findByText('pr-4792')).toBeTruthy();
+    expect(earlyUpdates.noteBranchSurfingOff).not.toHaveBeenCalled();
+  });
+
   it('renders a tappable row per loadable branch even with no PR metadata', async () => {
     // The branch list is the spine: GitHub being down must not cost a tester
     // the ability to load the branch.

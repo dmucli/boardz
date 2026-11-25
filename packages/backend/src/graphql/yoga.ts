@@ -1,21 +1,35 @@
 import { createYoga } from 'graphql-yoga';
 import { v4 as uuidv4 } from 'uuid';
 import { GraphQLError } from 'graphql';
+import { AuthCredentialRefusedError, isAuthAdmissionUnavailable } from '../auth/human-admission';
 import * as Sentry from '@sentry/node';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { schema } from './index';
 import { validateToken } from '../middleware/auth';
 import { authenticateCronBearer } from '../middleware/cron-auth';
 import type { AuthResult } from '../middleware/auth';
-import { resolveWebSocketClientIp } from '../websocket/client-ip';
-import type { ConnectionContext } from '@boardsesh/shared-schema';
-import { maxDepthPlugin } from '@escape.tech/graphql-armor-max-depth';
-import { costLimitPlugin } from '@escape.tech/graphql-armor-cost-limit';
+import { resolveWebSocketClientIp, resolveWebSocketSocketPeerIp } from '../websocket/client-ip';
+import { CLIENT_PLATFORM_HEADER, type ConnectionContext } from '@boardsesh/shared-schema';
+import { CLIENT_IDENTITY_HEADER } from '@boardsesh/shared-schema/client-identity';
+import { operationLimitsPlugin } from './query-validation';
 import { isLocalDevelopment, isTestEnvironment } from '@boardsesh/db/client/config';
 import { logger } from '../utils/logger';
 import { wasErrorReported } from '../utils/sentry-dedupe';
 import { maskDatabaseError } from './mask-error';
 import { responseCompressionPlugin } from './response-compression';
+import { recordUserActivity, resolveActivityPlatform } from '../services/user-activity';
+import { clientUsagePlugin, resolveClientIdentity } from '../services/client-usage';
+import { appleAdsTokenPrivacyPlugin, sanitizeAppleAdsLogArgument } from './apple-ads-token-privacy';
+import { resolveEdgeRegionCode, resolveFlagCountry } from '../utils/flag-country';
+import { getTrustedClientIp } from '../utils/client-ip';
+import { boardShareTokenPrivacyPlugin, sanitizeBoardShareLogArgument } from './board-share-token-privacy';
+import { addressLookupPrivacyPlugin, sanitizeAddressLookupLogArgument } from './address-lookup-privacy';
+import { OFFLINE_WRITE_DELIVERY_HEADER, OFFLINE_WRITE_RELEASE_HEADER } from '@boardsesh/shared-schema';
+import { parseOfflineWriteDeliveryId, parseOfflineWriteRelease } from './offline-write-delivery';
+
+function sanitizeTokenLogArgument(argument: unknown): unknown {
+  return sanitizeAddressLookupLogArgument(sanitizeBoardShareLogArgument(sanitizeAppleAdsLogArgument(argument)));
+}
 
 async function authenticateHttpBearer(authHeader: string | null): Promise<AuthResult | null> {
   if (!authHeader) return null;
@@ -26,7 +40,22 @@ async function authenticateHttpBearer(authHeader: string | null): Promise<AuthRe
   const token = bearerMatch[1]?.trim() ?? '';
   // Preserve the deployed transport contract: an invalid or expired optional
   // credential degrades to anonymous so public operations remain available.
-  return token ? validateToken(token) : null;
+  // A refused one does not. Anonymous would leave the app showing a signed-in
+  // climber whose every action fails; a 401 makes every shipped app refresh,
+  // and the refresh's own 401 signs it out.
+  try {
+    return token ? await validateToken(token, { throwOnRefusal: true }) : null;
+  } catch (error) {
+    if (error instanceof AuthCredentialRefusedError) {
+      throw new GraphQLError('Authentication is required', {
+        extensions: { code: 'UNAUTHENTICATED', http: { status: 401 } },
+      });
+    }
+    if (!isAuthAdmissionUnavailable(error)) throw error;
+    throw new GraphQLError('Authentication is temporarily unavailable', {
+      extensions: { code: 'SERVICE_UNAVAILABLE', http: { status: 503 } },
+    });
+  }
 }
 
 /**
@@ -71,18 +100,41 @@ export async function buildHttpConnectionContext({
 }: { request: Request } & NodeServerContext): Promise<ConnectionContext> {
   const authHeader = request.headers.get('authorization');
   const clientIp = resolveWebSocketClientIp(req);
+  const { clientIdentity, clientIdentityRaw } = resolveClientIdentity(request.headers.get(CLIENT_IDENTITY_HEADER));
 
   const isCronAuthenticated = authenticateCronBearer(authHeader);
   const authResult = isCronAuthenticated ? null : await authenticateHttpBearer(authHeader);
 
+  // First-party active-user count (#2644). Fire-and-forget: never on the
+  // request's critical path, and it never throws.
+  if (authResult) {
+    void recordUserActivity(authResult.userId, resolveActivityPlatform(request.headers.get(CLIENT_PLATFORM_HEADER)));
+  }
+
   return {
     connectionId: `http-${uuidv4()}`,
     transport: 'http' as const,
+    offlineWriteDeliveryId: parseOfflineWriteDeliveryId(request.headers.get(OFFLINE_WRITE_DELIVERY_HEADER)),
+    offlineWriteRelease: parseOfflineWriteRelease(request.headers.get(OFFLINE_WRITE_RELEASE_HEADER)),
     sessionId: undefined,
     userId: authResult?.userId,
+    credentialExpiresAt: authResult?.credentialExpiresAt,
+    webSignIn: authResult?.webSignIn,
     isAuthenticated: authResult !== null,
+    authCredentialProvided: authHeader !== null,
     isCronAuthenticated,
     clientIp,
+    socketPeerIp: resolveWebSocketSocketPeerIp(req),
+    // Unlike clientIp, believes cf-connecting-ip only from a verified edge.
+    trustedClientIp: req ? getTrustedClientIp(req) : undefined,
+    // The trusted-edge country decides whether the analytics prompt is shown
+    // (consentRegion). Without the Node request there is no peer to trust.
+    edgeCountry: req ? resolveFlagCountry(req) : undefined,
+    edgeRegionCode: req ? resolveEdgeRegionCode(req) : undefined,
+    // Global Privacy Control: the browser sets this header, a page script cannot.
+    globalPrivacyControl: request.headers.get('sec-gpc')?.trim() === '1',
+    clientIdentity,
+    clientIdentityRaw,
   };
 }
 
@@ -97,11 +149,19 @@ export function createYogaInstance() {
   const yoga = createYoga<NodeServerContext>({
     schema,
     graphqlEndpoint: '/graphql',
-    // Depth/cost limiting for HTTP GraphQL requests.
-    // WebSocket subscriptions are protected separately via onSubscribe in websocket/setup.ts
+    // HTTP and WebSocket requests share the same depth and cost validation rules.
     // Response compression: Railway bills uncompressed egress even though
     // Cloudflare compresses to the client. See ./response-compression.ts.
-    plugins: [maxDepthPlugin({ n: 10 }), costLimitPlugin({ maxCost: 5000 }), responseCompressionPlugin()],
+    // clientUsagePlugin counts operations per client identity for the
+    // once-a-minute usage summary (services/client-usage.ts); it gates nothing.
+    plugins: [
+      operationLimitsPlugin(),
+      responseCompressionPlugin(),
+      clientUsagePlugin(),
+      appleAdsTokenPrivacyPlugin(),
+      boardShareTokenPrivacyPlugin(),
+      addressLookupPrivacyPlugin(),
+    ],
     // Context function - extract auth and the trusted client IP from HTTP requests.
     // `req` is the Node request `server.ts` hands to `yoga.handle`; it carries the
     // TCP socket the client cannot forge.
@@ -118,20 +178,21 @@ export function createYogaInstance() {
     // Logging - suppress debug entirely (Yoga internals like "Parsing request" are noisy)
     logging: {
       debug: () => {},
-      info: (...args: unknown[]) => logger.info('[Yoga]', ...args),
-      warn: (...args: unknown[]) => logger.warn('[Yoga]', ...args),
+      info: (...args: unknown[]) => logger.info('[Yoga]', ...args.map(sanitizeTokenLogArgument)),
+      warn: (...args: unknown[]) => logger.warn('[Yoga]', ...args.map(sanitizeTokenLogArgument)),
       error: (...args: unknown[]) => {
+        const safeArgs = args.map(sanitizeTokenLogArgument);
         // Stringify any Error in the splat before handing to logger.error so
         // the SentryWinstonTransport doesn't fire — this handler runs its own
         // noise-filtered capture loop below for client-input GraphQLErrors,
         // and we don't want the transport to bypass that filter.
-        const stringifiedArgs = args.map((arg) =>
+        const stringifiedArgs = safeArgs.map((arg) =>
           arg instanceof Error ? (arg.stack ?? `${arg.name}: ${arg.message}`) : arg,
         );
         logger.error('[Yoga]', ...stringifiedArgs);
         // Skip GraphQLErrors triggered purely by client input (no originalError):
         // validation, parse, depth/cost limit, auth — high volume, low signal.
-        for (const arg of args) {
+        for (const arg of safeArgs) {
           if (!(arg instanceof Error)) continue;
           if (arg instanceof GraphQLError && !arg.originalError) continue;
           // A resolver already reported this with finer-grained tags/context

@@ -1,3 +1,15 @@
+import { adminBoardQueries, adminBoardMutations } from './social/admin-boards';
+import { offlineWriteDeliveryMutations } from './sync/offline-write-delivery';
+import { boardSessionPrivacyResolvers } from './shared/board-session-privacy';
+import {
+  privacyQueries,
+  privacyMutations,
+  privacyProfileFields,
+  privacySettingsFields,
+  privacySubscriptions,
+} from './privacy';
+import { boardShareLinkMutations, boardShareLinkQueries } from './privacy/board-share-links';
+import { notificationDeviceMutations } from './social/notification-devices';
 // eslint-disable-next-line import/no-named-as-default -- `graphql-type-json` exports both default and named `GraphQLJSON`; default is the canonical scalar.
 import GraphQLJSON from 'graphql-type-json';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
@@ -6,22 +18,31 @@ import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { boardQueries } from './board/queries';
 import { holdOutlineMutations, holdOutlineQueries } from './board/hold-outline-overrides';
 import { sprayWallMutations, sprayWallQueries } from './board/spray-walls';
+import { sprayWallLedSetupMutations, sprayWallLedSetupQueries } from './board/spray-wall-led-setup';
 import { sprayDetectionMutations, sprayDetectionQueries } from './board/spray-detection';
 import { sprayWallModerationMutations, sprayWallModerationQueries } from './board/spray-wall-moderation';
+import { sprayTrainingMutations, sprayTrainingQueries } from './board/spray-training';
 import { tickQueries } from './ticks/queries';
+import { tickBoardQueries } from './ticks/board-options';
 import { tickMutations } from './ticks/mutations';
 import { climbStatsSubscriptions } from './ticks/climb-stats-subscriptions';
 import { userQueries } from './users/queries';
 import { userMutations } from './users/mutations';
+import { userDataExportQueries, userDataExportMutations } from './users/data-export';
+import { analyticsConsentQueries, analyticsConsentMutations } from './users/analytics-consent';
+import { appleAdsAttributionMutations } from './users/apple-ads-attribution';
+import { activeUsersMutations } from './users/active-users';
 import { climbQueries } from './climbs/queries';
 import { climbMutations } from './climbs/mutations';
+import { deleteClimbMutations } from './climbs/delete-climb';
 import { climbFieldResolvers } from './climbs/field-resolvers';
 import { favoriteQueries } from './favorites/queries';
 import { favoriteClimbsQuery } from './favorites/favorite-climbs-query';
 import { favoriteMutations } from './favorites/mutations';
-import { playlistQueries } from './playlists/queries';
+import { playlistFieldResolvers, playlistQueries } from './playlists/queries';
 import { playlistMutations } from './playlists/mutations';
 import { sessionQueries } from './sessions/queries';
+import { partnerSessionHistoryQueries } from './sessions/partner-session-history';
 import { liveSessionQueries } from './sessions/live-sessions';
 import { sessionMutations } from './sessions/mutations';
 import { pushTokenMutations } from './sessions/push-tokens';
@@ -35,13 +56,15 @@ import { controllerMutations } from './controller/mutations';
 import { controllerSubscriptions, controllerEventResolver } from './controller/subscriptions';
 import { socialFollowQueries, socialFollowMutations } from './social/follows';
 import { socialSearchQueries } from './social/search';
-import { setterFollowQueries, setterFollowMutations } from './social/setter-follows';
+import { setterFollowQueries, setterFollowMutations, setterProfileFieldResolvers } from './social/setter-follows';
 import { socialFeedQueries } from './social/feed';
+import { climbLogsQueries } from './social/climb-logs';
 import { activityFeedQueries } from './social/activity-feed';
 import { sessionFeedQueries } from './social/session-feed';
 import { followedAuthorQueries } from './social/followed-authors';
 import { crewFeedQueries } from './social/crew-feed';
 import { sessionEditMutations } from './social/session-mutations';
+import { sessionWorkoutMutations, sessionWorkoutQueries } from './sessions/session-workouts';
 import { socialCommentQueries, socialCommentMutations } from './social/comments';
 import { socialVoteQueries, socialVoteMutations } from './social/votes';
 import { socialBoardQueries, socialBoardMutations } from './social/boards';
@@ -49,16 +72,23 @@ import { boardDiscoveryQueries } from './social/board-discovery';
 import { communityStatsQueries } from './social/community-stats';
 import { socialGymQueries, socialGymMutations } from './social/gyms';
 import { placeQueries } from './social/places';
+import { gymAddressLookupQueries } from './social/gym-address-lookup';
 import { gymActivityStatsMutations } from './social/gym-activity-stats';
+import { setterSitemapMutations } from './social/setter-sitemap';
 import { socialGymMatchQueries } from './social/gym-matching';
 import { socialGymStrayBoardQueries, socialGymStrayBoardMutations } from './social/gym-stray-boards';
+import { socialBoardWallCandidateQueries } from './social/board-wall-candidates';
 import { socialGymKioskQueries, socialGymKioskMutations } from './social/gym-kiosks';
 import { socialGymInsightsQueries } from './social/gym-insights';
+import { gymGradeComparisonQueries, gymGradeComparisonMutations } from './social/gym-grade-comparison';
+import { gymReportingSettingsMutations } from './social/gym-reporting-settings';
 import { socialGymClaimQueries, socialGymClaimMutations, gymClaimFieldResolvers } from './social/gym-claims';
 import { socialGymDuplicateQueries, socialGymDuplicateMutations } from './social/gym-duplicates';
 import { socialLocationSyncFreezeQueries, socialLocationSyncFreezeMutations } from './social/location-sync-freezes';
 import { socialGymOwnerReassignQueries, socialGymOwnerReassignMutations } from './social/gym-owner-reassign';
+import { socialGymClaimRevertMutations } from './social/gym-claim-revert';
 import { socialGymReportMutations } from './social/gym-reports';
+import { directoryReportQueries, directoryReportMutations } from './social/directory-reports';
 import {
   socialNotificationQueries,
   socialNotificationMutations,
@@ -66,22 +96,35 @@ import {
 } from './social/notifications';
 import { socialCommentSubscriptions } from './social/comment-subscriptions';
 import { socialProposalQueries, socialProposalMutations } from './social/proposals';
+import { proposalReportReleaseContextQueries } from './social/proposals/report-release-contexts';
 import { socialRoleQueries, socialRoleMutations } from './social/roles';
 import { socialCommunitySettingsQueries, socialCommunitySettingsMutations } from './social/community-settings';
 import { newClimbSubscriptionResolvers } from './social/new-climb-subscriptions';
 import { newClimbFeedSubscription } from './social/new-climb-feed-subscription';
 import { boardPresenceResolvers } from './board-presence';
+import { feedbackConversationSubscriptions } from './feedback/subscriptions';
+import { feedbackConversationQueries, feedbackConversationMutations } from './feedback/conversations';
 import { feedbackMutations } from './feedback/mutations';
 import { feedbackQueries } from './feedback/queries';
+import { mobileReleaseStatusQueries } from './mobile-release-status';
 import { qaMutations } from './qa/mutations';
 import { qaQueries } from './qa/queries';
 import { integrationQueries } from './integrations/queries';
 import { integrationMutations } from './integrations/mutations';
+import { oauthClientMutations, oauthClientQueries } from './oauth-clients/partner-registration';
+import { adminPartnerAppMutations, adminPartnerAppQueries } from './oauth-clients/admin-partner-apps';
+import { partnerWebhookMutations, partnerWebhookQueries } from './oauth-clients/partner-webhooks';
+import { appWorkoutMutations, appWorkoutQueries } from './app-workouts';
+import { connectedAppsMutations, connectedAppsQueries } from './connected-apps/connected-apps';
 import { betaLinkQueries } from './beta-videos/queries';
 import { instagramBetaImportQueries } from './beta-videos/instagram-beta-import';
 import { syncQueries } from './sync/queries';
-import { resolveClimbNoMatch } from './shared/helpers';
+import { resolveClimbNoMatchField } from './climbs/climb-no-match-field';
 import { resolveClimbLostHolds, type ClimbLostHoldsParent } from './climbs/lost-holds';
+import { resolveClimbAuthorId } from './climbs/climb-author';
+import { cncComputationQueries, cncComputationMutations } from './cnc-packs/computations';
+import { cncPackQueries } from './cnc-packs/queries';
+import { cncPackMutations } from './cnc-packs/mutations';
 
 export const resolvers = {
   // Scalar types
@@ -89,16 +132,25 @@ export const resolvers = {
 
   // Root operation types
   Query: {
+    ...mobileReleaseStatusQueries,
+    ...privacyQueries,
+    ...boardShareLinkQueries,
     ...sessionQueries,
+    ...partnerSessionHistoryQueries,
     ...liveSessionQueries,
     ...boardQueries,
     ...holdOutlineQueries,
     ...sprayWallQueries,
+    ...sprayWallLedSetupQueries,
     ...sprayDetectionQueries,
     ...sprayWallModerationQueries,
+    ...sprayTrainingQueries,
     ...climbQueries,
     ...tickQueries,
+    ...tickBoardQueries,
     ...userQueries,
+    ...userDataExportQueries,
+    ...analyticsConsentQueries,
     ...favoriteQueries,
     ...favoriteClimbsQuery,
     ...playlistQueries,
@@ -107,27 +159,35 @@ export const resolvers = {
     ...socialSearchQueries,
     ...setterFollowQueries,
     ...socialFeedQueries,
+    ...climbLogsQueries,
     ...socialCommentQueries,
     ...socialVoteQueries,
     ...socialBoardQueries,
+    ...adminBoardQueries,
     ...boardDiscoveryQueries,
     ...communityStatsQueries,
     ...socialGymQueries,
     ...placeQueries,
+    ...gymAddressLookupQueries,
     ...socialGymMatchQueries,
     ...socialGymStrayBoardQueries,
+    ...socialBoardWallCandidateQueries,
     ...socialGymKioskQueries,
     ...socialGymInsightsQueries,
+    ...gymGradeComparisonQueries,
     ...socialGymClaimQueries,
     ...socialGymDuplicateQueries,
     ...socialLocationSyncFreezeQueries,
     ...socialGymOwnerReassignQueries,
     ...activityFeedQueries,
     ...sessionFeedQueries,
+    ...sessionWorkoutQueries,
     ...followedAuthorQueries,
     ...crewFeedQueries,
     ...socialNotificationQueries,
+    ...directoryReportQueries,
     ...socialProposalQueries,
+    ...proposalReportReleaseContextQueries,
     ...socialRoleQueries,
     ...socialCommunitySettingsQueries,
     ...newClimbSubscriptionResolvers.Query,
@@ -135,22 +195,40 @@ export const resolvers = {
     ...instagramBetaImportQueries,
     ...boardPresenceResolvers.Query,
     ...integrationQueries,
+    ...oauthClientQueries,
+    ...adminPartnerAppQueries,
+    ...partnerWebhookQueries,
+    ...appWorkoutQueries,
+    ...connectedAppsQueries,
     ...syncQueries,
     ...feedbackQueries,
+    ...feedbackConversationQueries,
     ...qaQueries,
+    ...cncPackQueries,
+    ...cncComputationQueries,
   },
 
   Mutation: {
+    ...offlineWriteDeliveryMutations,
+    ...privacyMutations,
+    ...boardShareLinkMutations,
     ...sessionMutations,
     ...holdOutlineMutations,
     ...sprayWallMutations,
+    ...sprayWallLedSetupMutations,
     ...sprayDetectionMutations,
     ...sprayWallModerationMutations,
+    ...sprayTrainingMutations,
     ...pushTokenMutations,
     ...queueMutations,
     ...tickMutations,
     ...climbMutations,
+    ...deleteClimbMutations,
     ...userMutations,
+    ...userDataExportMutations,
+    ...analyticsConsentMutations,
+    ...appleAdsAttributionMutations,
+    ...activeUsersMutations,
     ...favoriteMutations,
     ...playlistMutations,
     ...controllerMutations,
@@ -159,37 +237,61 @@ export const resolvers = {
     ...socialCommentMutations,
     ...socialVoteMutations,
     ...socialBoardMutations,
+    ...adminBoardMutations,
     ...socialGymMutations,
+    ...gymReportingSettingsMutations,
+    ...gymGradeComparisonMutations,
     ...gymActivityStatsMutations,
+    ...setterSitemapMutations,
     ...socialGymStrayBoardMutations,
     ...socialGymKioskMutations,
     ...socialGymClaimMutations,
     ...socialGymDuplicateMutations,
     ...socialLocationSyncFreezeMutations,
     ...socialGymOwnerReassignMutations,
+    ...socialGymClaimRevertMutations,
     ...socialGymReportMutations,
+    ...directoryReportMutations,
     ...socialNotificationMutations,
+    ...notificationDeviceMutations,
     ...socialProposalMutations,
     ...socialRoleMutations,
     ...socialCommunitySettingsMutations,
     ...newClimbSubscriptionResolvers.Mutation,
     ...sessionEditMutations,
+    ...sessionWorkoutMutations,
     ...feedbackMutations,
+    ...feedbackConversationMutations,
     ...qaMutations,
     ...boardPresenceResolvers.Mutation,
     ...integrationMutations,
+    ...oauthClientMutations,
+    ...adminPartnerAppMutations,
+    ...partnerWebhookMutations,
+    ...appWorkoutMutations,
+    ...connectedAppsMutations,
+    ...cncPackMutations,
+    ...cncComputationMutations,
   },
 
   Subscription: {
+    ...privacySubscriptions,
     ...sessionSubscriptions,
     ...queueSubscriptions,
     ...controllerSubscriptions,
     ...socialNotificationSubscriptions,
+    ...feedbackConversationSubscriptions,
     ...socialCommentSubscriptions,
     ...newClimbFeedSubscription,
     ...boardPresenceResolvers.Subscription,
     ...climbStatsSubscriptions,
   },
+
+  ...boardSessionPrivacyResolvers,
+  PublicUserProfile: privacyProfileFields,
+  SetterProfile: setterProfileFieldResolvers,
+  Playlist: playlistFieldResolvers,
+  PrivacySettings: privacySettingsFields,
 
   // Field-level resolvers
   ClimbSearchResult: climbFieldResolvers,
@@ -200,18 +302,18 @@ export const resolvers = {
 
   // Climb type resolvers (derived fields)
   Climb: {
-    // One definition for every surface — see resolveClimbNoMatch.
+    // One definition for every surface — see resolveClimbNoMatchField. The
+    // parent's own `is_no_match` is kept only when characteristics are absent
+    // (a queued tick/proposal/feed stub, #6681), whatever the description says.
     // A parent that doesn't select `characteristics` silently falls back to the
-    // description, so every Climb producer must project the column.
-    is_no_match: (climb: {
-      characteristics?: string[] | null;
-      description?: string | null;
-      boardType?: string | null;
-    }) => resolveClimbNoMatch(climb.boardType, climb.characteristics, climb.description),
+    // description, so every Climb producer must project the column. The map is
+    // untyped: resolver-climb-fields.test.ts is the guard, and it fails when a
+    // new query returns Climb without a row there.
+    is_no_match: resolveClimbNoMatchField,
 
     // Spray only, and only for a climb whose materialised `missingHoldCount`
     // says it lost something — see resolveClimbLostHolds. Per-climb by design:
-    // a list must not select it.
+    // a list must not select it. The remix editor draws these as grey ghosts.
     //
     // `ctx` is not optional here: these rows are the geometry of somebody's
     // garage, the parent may be a synthetic `ClimbInput` a caller sent back
@@ -219,6 +321,13 @@ export const resolvers = {
     // climb's own row with the viewer this request actually has.
     lostHolds: (climb: ClimbLostHoldsParent, _args: unknown, ctx: ConnectionContext) =>
       resolveClimbLostHolds(climb, ctx),
+
+    // The author's account id: public with a published, listed climb, and
+    // otherwise only for a viewer who may see that account's activity — see
+    // resolveClimbAuthorId. Every Climb producer passes through here, after any
+    // shared cache.
+    userId: (climb: { uuid?: string | null; userId?: string | null }, _args: unknown, ctx: ConnectionContext) =>
+      resolveClimbAuthorId(climb, ctx),
   },
 
   // Union type resolvers

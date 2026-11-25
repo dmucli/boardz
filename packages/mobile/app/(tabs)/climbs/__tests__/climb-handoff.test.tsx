@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { grantAnalyticsForTest } from '../../../../test/consent-fixture';
 import { createElement, StrictMode, type ReactNode } from 'react';
 import { render } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +9,10 @@ import type { TickLike } from '../../../../src/lib/tick-to-climb';
 const routeParams = vi.hoisted(() => ({ current: {} as Record<string, string | string[]> }));
 const router = vi.hoisted(() => ({ push: vi.fn(), replace: vi.fn(), back: vi.fn(), canGoBack: () => true }));
 const openPlayDrawer = vi.hoisted(() => vi.fn());
+const lighting = vi.hoisted(() => ({ enabled: false }));
+vi.mock('../../../../src/components/play-drawer/use-climb-change-lights', () => ({
+  isDrivingWall: () => lighting.enabled,
+}));
 const loadedClimb = vi.hoisted(() => ({ current: undefined as Climb | undefined }));
 const uuidSequence = vi.hoisted(() => ({ current: 0 }));
 vi.mock('expo-crypto', () => ({ randomUUID: () => `intent-${++uuidSequence.current}` }));
@@ -18,17 +23,23 @@ vi.mock('expo-router', () => ({
   Stack: { Screen: () => null },
   Redirect: () => null,
 }));
+// Launch is long settled in these flows; the hold has its own suite.
+vi.mock('../../../../src/lib/launch-hold', () => ({ useLaunchHoldReleased: () => true }));
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   StyleSheet: { create: (styles: unknown) => styles },
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
-vi.mock('@tanstack/react-query', () => ({ onlineManager: { isOnline: () => true, subscribe: () => () => {} } }));
+vi.mock('@tanstack/react-query', () => ({
+  onlineManager: { isOnline: () => true, subscribe: () => () => {} },
+  useQueryClient: () => null,
+}));
 vi.mock('../../../../src/providers/auth-provider', () => ({
   useAuth: () => ({ isAuthenticated: true, isLoading: false }),
 }));
 vi.mock('../../../../src/providers/drawer-host-provider', () => ({ useDrawerHost: () => ({ openPlayDrawer }) }));
 vi.mock('../../../../src/providers/feature-flags-provider', () => ({ useAnonymousClimbViewEnabled: () => false }));
+vi.mock('../../../../src/providers/dialog-provider', () => ({ useConfirm: () => vi.fn(async () => true) }));
 vi.mock('../../../../src/providers/theme-provider', () => ({ useTheme: () => ({ systemColors: {} }) }));
 vi.mock('../../../../src/lib/analytics', () => ({ track: vi.fn() }));
 vi.mock('../../../../src/lib/active-board-store', () => ({ getStoredActiveBoard: vi.fn() }));
@@ -37,10 +48,11 @@ vi.mock('../../../../src/lib/graphql/use-active-board', () => ({ useSetActiveBoa
 vi.mock('../../../../src/lib/graphql/hooks', () => ({
   useClimb: () => ({ data: loadedClimb.current, isError: false, isSuccess: !!loadedClimb.current }),
   useCreateBoard: () => ({ mutateAsync: vi.fn() }),
-  fetchAllMyBoards: vi.fn(),
+  fetchAllMyOwnedBoards: vi.fn(),
   fetchBoardBySlug: vi.fn(),
   fetchBoardByUuid: vi.fn(),
 }));
+vi.mock('../../../../src/lib/graphql/hooks/fetch-all-my-owned-boards', () => ({ fetchAllMyOwnedBoards: vi.fn() }));
 vi.mock('../../../../src/lib/board-path-to-user-board', () => ({
   findOwnedBoardForSession: vi.fn(),
   parseBoardConfigFromPath: vi.fn(),
@@ -92,6 +104,11 @@ function startTick(preview = false) {
   latestActivationIntent = routeParams.current.activationIntent;
 }
 
+function startActiveTick() {
+  lighting.enabled = true;
+  startTick();
+}
+
 function drawerOptions() {
   expect(openPlayDrawer).toHaveBeenCalledTimes(1);
   return openPlayDrawer.mock.lastCall![1];
@@ -100,6 +117,7 @@ function drawerOptions() {
 beforeEach(() => {
   vi.clearAllMocks();
   latestActivationIntent = undefined;
+  lighting.enabled = false;
   routeParams.current = { ...PARAMS };
   loadedClimb.current = tickToClimb({ ...TICK, frames: 'p1145r12' })!;
 });
@@ -120,8 +138,21 @@ describe('session tick → public climb route → drawer handoff', () => {
     expect(drawerOptions().previewQueueItem.climb.uuid).toBe(TICK.climbUuid);
   });
 
-  it('retains an internal active tick while its missing frames load, then opens once', () => {
+  it('keeps the default missing-frames tick preview through route loading', () => {
     startTick();
+    expect(routeParams.current).not.toHaveProperty('activationIntent');
+    const resolvedClimb = loadedClimb.current;
+    loadedClimb.current = undefined;
+    const view = render(<ClimbDetail />);
+    expect(openPlayDrawer).not.toHaveBeenCalled();
+    loadedClimb.current = resolvedClimb;
+    view.rerender(<ClimbDetail />);
+    expect(drawerOptions().previewQueueItem.climb.uuid).toBe(TICK.climbUuid);
+    expect(openPlayDrawer.mock.lastCall![0].frames).toBe('p1145r12');
+  });
+
+  it('retains a saved lighting opt-in while missing tick frames load, then opens once', () => {
+    startActiveTick();
     const resolvedClimb = loadedClimb.current;
     loadedClimb.current = undefined;
     const view = render(
@@ -148,7 +179,7 @@ describe('session tick → public climb route → drawer handoff', () => {
   });
 
   it('previews repeated activation query parameters even when one id is valid', () => {
-    startTick();
+    startActiveTick();
     routeParams.current = {
       ...routeParams.current,
       activationIntent: [String(latestActivationIntent), 'forged'],
@@ -170,7 +201,7 @@ describe('session tick → public climb route → drawer handoff', () => {
   it.each(['climbUuid', 'boardName', 'layoutId', 'sizeId', 'setIds', 'angle'])(
     'rejects an intent for a different %s',
     (field) => {
-      startTick();
+      startActiveTick();
       const replacement = {
         climbUuid: 'other-climb',
         boardName: 'tension',
@@ -186,7 +217,7 @@ describe('session tick → public climb route → drawer handoff', () => {
   );
 
   it('does not reuse a consumed intent after remount', () => {
-    startTick();
+    startActiveTick();
     const view = render(<ClimbDetail />);
     expect(drawerOptions()).not.toHaveProperty('previewQueueItem');
     view.unmount();
@@ -197,18 +228,20 @@ describe('session tick → public climb route → drawer handoff', () => {
 
   it('expires a handoff that never completed', () => {
     const clock = vi.spyOn(Date, 'now').mockReturnValue(1000);
-    startTick();
+    startActiveTick();
     clock.mockReturnValue(61_000);
     render(<ClimbDetail />);
     expect(drawerOptions()).toHaveProperty('previewQueueItem');
   });
 
   it('supersedes an older handoff when another tick is tapped', () => {
-    startTick();
+    startActiveTick();
     const supersededParams = routeParams.current;
-    startTick();
+    startActiveTick();
     routeParams.current = supersededParams;
     render(<ClimbDetail />);
     expect(drawerOptions()).toHaveProperty('previewQueueItem');
   });
 });
+
+beforeEach(() => grantAnalyticsForTest());

@@ -11,7 +11,7 @@ import { describe, expect, it } from 'vitest';
 //
 // Same reasoning as production-deploy-hold.test.ts for living here: this reads
 // the workflow via fs, which Vitest's `--changed` selection cannot relate to a
-// diff of the file being read. ci.yml's `deploy-config` job runs this project
+// diff of the file being read. ci.yml's `deploy-config` guard step runs this project
 // unfiltered whenever production-deploy.yml changes.
 
 const WORKFLOW_PATH = resolve(import.meta.dirname, '..', '..', '..', '.github', 'workflows', 'production-deploy.yml');
@@ -64,5 +64,41 @@ describe('post-deploy smoke proves the entry chunk is JavaScript', () => {
 
   it('no longer relies on the header-only check it replaced', () => {
     expect(deployAppWeb).not.toContain('check_hashed_asset_immutable');
+  });
+});
+
+describe("deploy-app-web carries the previous deploys' chunks forward (#5780)", () => {
+  const carryStep = 'node scripts/lib/carry-over-expo-web-chunks.mjs "$RUNNER_TEMP/app-standalone"';
+
+  it('runs the carry-over script on the export with the agreed caps', () => {
+    expect(deployAppWeb).toContain(carryStep);
+    expect(deployAppWeb).toMatch(/--live https:\/\/app\.boardsesh\.com/);
+    expect(deployAppWeb).toMatch(/--max-age-days 3\b/);
+    expect(deployAppWeb).toMatch(/--max-files 4000\b/);
+  });
+
+  it('runs after the export checks and before the publish', () => {
+    // Before the checks, carried files would count toward the baked-env grep;
+    // after the publish, they would never ship.
+    const carryIndex = deployAppWeb.indexOf(carryStep);
+    const verifyIndex = deployAppWeb.indexOf('- name: Verify production origins');
+    const publishIndex = deployAppWeb.indexOf('wrangler@4 pages deploy');
+    expect(verifyIndex).toBeGreaterThan(-1);
+    expect(publishIndex).toBeGreaterThan(-1);
+    expect(carryIndex).toBeGreaterThan(verifyIndex);
+    expect(carryIndex).toBeLessThan(publishIndex);
+  });
+
+  it('can never fail or hold the deploy', () => {
+    const stepStart = deployAppWeb.indexOf('id: carryover');
+    const stepBody = deployAppWeb.slice(stepStart, deployAppWeb.indexOf(carryStep));
+    expect(stepStart).toBeGreaterThan(-1);
+    expect(stepBody).toMatch(/continue-on-error: true/);
+    expect(stepBody).toMatch(/timeout-minutes: [1-5]\b/);
+  });
+
+  it("smoke-checks the previous deploy's entry chunk", () => {
+    expect(deployAppWeb).toContain('PREVIOUS_ENTRY: ${{ steps.carryover.outputs.previous_entry }}');
+    expect(deployAppWeb).toMatch(/retry "[^"]*previous deploy[^"]*"\s+check_previous_entry_chunk/);
   });
 });

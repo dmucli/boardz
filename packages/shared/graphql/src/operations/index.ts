@@ -14,6 +14,7 @@ export * from './activity-feed';
 export * from './new-climb-feed';
 export * from './hold-heatmap';
 export * from './sessions';
+export * from './session-workouts';
 export * from './create-session';
 export * from './live-sessions';
 export * from './climb-stats-history';
@@ -26,8 +27,21 @@ export * from './integrations';
 export * from './location-sync-admin';
 export * from './gym-owner-reassign';
 export * from './spray-walls';
+export * from './spray-training';
 // queue-session.ts is intentionally NOT re-exported here: its CREATE_SESSION,
 // END_SESSION etc. collide with the per-feature operations above. Import it
 // directly via `@boardsesh/graphql/operations/queue-session`.
 // account.ts and proposals.ts are also imported directly (matches the
 // original web layout before the move).
+
+export * from './saved-climb-sync';
+export * from './apple-ads-attribution';
+export * from './release-context';
+
+export * from './admin-boards';
+export * from './oauth-clients';
+export * from './admin-partner-apps';
+export * from './partner-webhooks';
+export * from './cnc-packs';
+export * from './offline-write-delivery';
+export * from './directory-reports';

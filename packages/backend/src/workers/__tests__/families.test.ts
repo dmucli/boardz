@@ -14,6 +14,8 @@ describe('family registry', () => {
     }
     expect(allFamilies().map((family) => family.name)).toEqual([
       'worker-probe',
+      'cnc-computation',
+      'cnc-generation',
       'refresh-recommendations',
       'refresh-hold-features',
       'refresh-climb-grades',
@@ -28,6 +30,12 @@ describe('family registry', () => {
       'kilter-catalog-sync',
       'moonboard-locations-sync',
       'climb-stats-self-heal',
+      'user-data-export',
+      'spray-wall-art',
+      'spray-wall-health',
+      'community-monthly-stats',
+      'reclaim-logbook-snapshots',
+      'prune-logbook-changes',
     ]);
     expect(() => requireFamily('no-such-family')).toThrow('UNKNOWN_FAMILY');
   });

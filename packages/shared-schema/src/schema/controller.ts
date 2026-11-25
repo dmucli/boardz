@@ -1,4 +1,60 @@
 export const controllerTypeDefs = /* GraphQL */ `
+  type ControllerPreviewDescriptor {
+    imageUrl: String!
+    geometryUrl: String!
+    imageSha256: String!
+    geometrySha256: String!
+    imageBytes: Int!
+    geometryBytes: Int!
+    width: Int!
+    height: Int!
+    positionCount: Int!
+  }
+
+  type ControllerGymBoard {
+    uuid: ID!
+    name: String!
+    boardType: String!
+    serialNumber: String!
+    layoutId: Int!
+    sizeId: Int!
+    setIds: String!
+    angle: Int!
+    advertisedName: String!
+    preview: ControllerPreviewDescriptor!
+  }
+
+  """
+  One board owned by the account a controller API key belongs to, for a wall
+  device's setup screen (\`controllerBoards\`). Read-only identity and config.
+  """
+  type ControllerBoard {
+    "Numeric board-presence channel id (userBoards.id). Feeds boardNowPlaying(boardId)."
+    boardId: Int!
+    "The board's uuid. A spray wall's uuid is also its sprayWall(uuid) key."
+    uuid: ID!
+    "What the owner calls the board"
+    name: String!
+    "kilter, tension, moonboard, spray, ..."
+    boardType: String!
+    layoutId: Int!
+    sizeId: Int!
+    "Comma-separated hold set ids"
+    setIds: String!
+    "Board angle in degrees"
+    angle: Int!
+    "False for a board with no lights (every spray wall)"
+    hasLeds: Boolean!
+  }
+
+  type ControllerGymManifest {
+    version: Int!
+    gymUuid: ID!
+    name: String!
+    slug: String!
+    boards: [ControllerGymBoard!]!
+  }
+
   # ============================================
   # ESP32 Controller Types
   # ============================================

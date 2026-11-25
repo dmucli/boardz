@@ -1,7 +1,11 @@
+import { sessionTickVisibleCondition } from '../shared/activity-privacy';
+import { alias } from 'drizzle-orm/pg-core';
+import { canAccessResource } from '../../../services/privacy';
 import { db } from '../../../db/client';
 import { sessions } from '../../../db/schema';
 import * as dbSchema from '@boardsesh/db/schema';
 import { sprayClimbVisibilityCondition } from '@boardsesh/db/queries';
+import { sprayTickClimbExistsCondition, sprayTickVisibleSql } from '../shared/spray-tick-visibility';
 import { eq, and, inArray, sql, desc, isNotNull } from 'drizzle-orm';
 import type { SessionHealthExport, SessionSummary } from '@boardsesh/shared-schema';
 import { rowsFromResult } from '@boardsesh/db/client';
@@ -9,6 +13,7 @@ import { getSessionHealthExport } from '@boardsesh/db/queries';
 import { resolveRenderBoard } from '@boardsesh/board-config';
 import { fetchOwnerBoards, toTickBoardCandidate } from '../shared/render-board';
 import { logger } from '../../../utils/logger';
+import { sessionAnonymousUserIds, withSummaryParticipantSession } from '../../../services/board-session-privacy';
 
 /**
  * Generate a summary for a session including grade distribution,
@@ -32,11 +37,13 @@ export async function generateSessionSummary(
     return null;
   }
 
+  if (!(await canAccessResource('session', sessionId, viewerUserId))) return null;
   const session = sessionRows[0];
 
   // Run aggregation queries in parallel
   // Note: These queries use GROUP BY with aggregation, COUNT FILTER, and COALESCE
   // which cannot be expressed with Drizzle's query builder per CLAUDE.md guidelines.
+  const visibleTick = sessionTickVisibleCondition(viewerUserId, alias(dbSchema.boardseshTicks, 't'));
   const [gradeDistRows, hardestRows, participantRows] = await Promise.all([
     // Grade distribution: per-grade {flash, send, attempt} breakdown, the shape
     // the session-detail chart consumes (see buildSessionGradeBars). Grouped over
@@ -127,6 +134,9 @@ export async function generateSessionSummary(
           eq(dbSchema.boardseshTicks.sessionId, sessionId),
           inArray(dbSchema.boardseshTicks.status, ['flash', 'send']),
           isNotNull(dbSchema.boardseshTicks.difficulty),
+          // No climb rule: the climb was sent in this session, so naming it is
+          // the climber's activity. A draft or an unlisted climb sent here is
+          // named like any other (owner decision, 2026-10-13).
           // The hardest-send rows carry the climb's name and frames, and the
           // summary is keyed on a session id alone — session access is not wall
           // access. A no-op on the other eight board types. The viewer is the
@@ -136,20 +146,27 @@ export async function generateSessionSummary(
             { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
             viewerUserId,
           ),
+          // …and a spray send whose climb was hard-deleted is its author's alone.
+          sprayTickClimbExistsCondition(viewerUserId),
         ),
       )
       .orderBy(desc(dbSchema.boardseshTicks.difficulty))
       .limit(1),
 
-    // Participant stats: sends and attempts per user
+    // Participant stats: sends and attempts per user. A row counts the ticks
+    // this viewer may see: readable ones, and a fellow member's ticks from their
+    // time in the session (#6582).
     // Uses COUNT FILTER which requires raw SQL (not available in Drizzle query builder)
     db.execute(sql`
       SELECT t.user_id AS "userId",
              COALESCE(up.display_name, u.name) AS "displayName",
              up.avatar_url AS "avatarUrl",
-             COUNT(*) FILTER (WHERE t.status IN ('flash', 'send'))::int AS sends,
-             COUNT(*) FILTER (WHERE t.status = 'flash')::int AS flashes,
-             COUNT(*)::int AS attempts
+             COUNT(*) FILTER (WHERE t.status IN ('flash', 'send'))::int AS "rawSends",
+             COUNT(*) FILTER (WHERE t.status = 'flash')::int AS "rawFlashes",
+             COUNT(*)::int AS "rawAttempts",
+             COUNT(*) FILTER (WHERE t.status IN ('flash', 'send') AND ${visibleTick} AND ${sprayTickVisibleSql('t', viewerUserId)})::int AS sends,
+             COUNT(*) FILTER (WHERE t.status = 'flash' AND ${visibleTick} AND ${sprayTickVisibleSql('t', viewerUserId)})::int AS flashes,
+             COUNT(*) FILTER (WHERE ${visibleTick} AND ${sprayTickVisibleSql('t', viewerUserId)})::int AS attempts
       FROM boardsesh_ticks t
       LEFT JOIN users u ON u.id = t.user_id
       LEFT JOIN user_profiles up ON up.user_id = t.user_id
@@ -166,6 +183,9 @@ export async function generateSessionSummary(
     sends: number;
     flashes: number;
     attempts: number;
+    rawSends: number;
+    rawFlashes: number;
+    rawAttempts: number;
   }>(participantRows);
 
   // Build grade distribution (filter out null grades using type guard). Matches
@@ -205,20 +225,30 @@ export async function generateSessionSummary(
     };
   }
 
-  // Build participants
-  const participants = participantCastRows.map((r) => ({
-    userId: r.userId,
-    displayName: r.displayName,
-    avatarUrl: r.avatarUrl,
-    sends: r.sends,
-    flashes: r.flashes,
-    attempts: r.attempts,
-  }));
-
-  // Calculate totals
-  const totalSends = participants.reduce((sum, p) => sum + p.sends, 0);
-  const totalFlashes = participants.reduce((sum, p) => sum + p.flashes, 0);
-  const totalAttempts = participants.reduce((sum, p) => sum + p.attempts, 0);
+  // Individual rows contain only activity visible to this viewer. The totals
+  // deliberately include every tick, independently of account/item privacy.
+  // A climber who stays anonymous on boards they don't own keeps their row
+  // here, unnamed, when the session's board is not theirs and the viewer is not
+  // a fellow member of the session. Each row carries the session it was
+  // projected for, so its GraphQL fields keep a fellow member's name.
+  const anonymous = await sessionAnonymousUserIds(
+    participantCastRows.map((participant) => participant.userId),
+    viewerUserId,
+    sessionId,
+  );
+  const participants = participantCastRows
+    .filter((participant) => participant.attempts > 0)
+    .map(({ rawSends: _sends, rawFlashes: _flashes, rawAttempts: _attempts, ...participant }) =>
+      withSummaryParticipantSession(
+        anonymous.has(participant.userId)
+          ? { ...participant, userId: null, displayName: null, avatarUrl: null }
+          : participant,
+        sessionId,
+      ),
+    );
+  const totalSends = participantCastRows.reduce((sum, participant) => sum + participant.rawSends, 0);
+  const totalFlashes = participantCastRows.reduce((sum, participant) => sum + participant.rawFlashes, 0);
+  const totalAttempts = participantCastRows.reduce((sum, participant) => sum + participant.rawAttempts, 0);
 
   // Calculate duration. A null startedAt is unusual — sessions get one on
   // creation — but it's persisted as nullable so we have to handle it. Log

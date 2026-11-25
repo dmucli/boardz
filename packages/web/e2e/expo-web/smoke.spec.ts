@@ -17,7 +17,19 @@
 
 import { devices, expect, test, type Page } from '@playwright/test';
 import { and, asc, eq, sql } from 'drizzle-orm';
-import { boardClimbs, boardClimbStats, closePool, createDb, userBoards } from '@boardsesh/db';
+import { getAuroraBluetoothPacket } from '@boardsesh/ble-protocol/aurora';
+import { getLedPlacements } from '@boardsesh/board-constants/led-placements';
+import type { Climb } from '@boardsesh/shared-schema';
+import { CONSENT_VERSION } from '@boardsesh/consent';
+import {
+  boardClimbs,
+  boardClimbStats,
+  closePool,
+  createDb,
+  userAnalyticsConsentEvents,
+  userBoards,
+  users,
+} from '@boardsesh/db';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -29,13 +41,38 @@ const COLD_LOAD_TIMEOUT_MS = 180_000;
 const WARM_TIMEOUT_MS = 30_000;
 
 /** The five Material tab-bar entries, in mobile's canonical order. */
-const TAB_NAMES = ['Home', 'Climbs', 'Record', 'Discover', 'Profile'] as const;
+const TAB_NAMES = ['Home', 'Climbs', 'Session', 'Discover', 'Profile'] as const;
 
 /** The seeded shared board the suite binds through the board sheet (see e2e/SEED_CONTRACT.md). */
 const SEEDED_BOARD_NAME = 'Dyno Den';
 
-/** Android-tablet destinations: the wall view is promoted into the rail. */
-const DESKTOP_TAB_NAMES = ['Home', 'Climbs', 'Record', 'On the Wall', 'Discover', 'Profile'] as const;
+/** The seeded shared board the suite already binds through the board sheet. */
+async function findSeededBoard() {
+  process.env.DATABASE_URL ??= 'postgres://postgres:password@localhost:5432/main';
+  const db = createDb();
+  try {
+    const [board] = await db
+      .select({
+        slug: userBoards.slug,
+        layout: userBoards.layoutId,
+        size: userBoards.sizeId,
+        type: userBoards.boardType,
+        hasLeds: userBoards.hasLeds,
+      })
+      .from(userBoards)
+      .where(eq(userBoards.name, SEEDED_BOARD_NAME))
+      .limit(1);
+    if (!board) {
+      throw new Error(
+        `No board named "${SEEDED_BOARD_NAME}" in the e2e database — the dev DB image is stale ` +
+          '(docker compose down -v && vp run db:up).',
+      );
+    }
+    return board;
+  } finally {
+    await closePool();
+  }
+}
 
 /**
  * Console/page-error budget: the smoke fails on error classes that historically
@@ -90,8 +127,51 @@ async function ensureSignedIn(page: Page): Promise<void> {
     await page.getByRole('textbox', { name: 'Password', exact: true }).fill(TEST_PASSWORD);
     await page.getByRole('button', { name: 'Sign in' }).click();
   }
+  // The suite seeds a "No thanks" on the account (see `seedAccountConsent`),
+  // so the prompt should not open. This stays as the fallback for a stack
+  // where the seed could not land.
+  const declineAnalytics = page.getByRole('button', { name: 'No thanks', exact: true });
+  await expect(declineAnalytics.or(homeTab).first()).toBeVisible({ timeout: WARM_TIMEOUT_MS });
+  if (await declineAnalytics.isVisible()) await declineAnalytics.click();
   await expect(homeTab).toBeVisible({ timeout: WARM_TIMEOUT_MS });
 }
+
+/**
+ * Gives the test account an analytics answer before any test signs in.
+ *
+ * With no answer on the account, the consent prompt opens as a transparent
+ * modal over the tab shell up to ~10 s after Home renders (a 5 s wait for the
+ * account read, then a region lookup capped at 5 s). A check made when Home
+ * first shows misses it, and the late modal then hides or covers the tabs.
+ * With a denial stored, the account read settles consent and nothing opens.
+ */
+async function seedAccountConsent(): Promise<void> {
+  process.env.DATABASE_URL ??= 'postgres://postgres:password@localhost:5432/main';
+  const db = createDb();
+  try {
+    const [account] = await db.select({ id: users.id }).from(users).where(eq(users.email, TEST_EMAIL)).limit(1);
+    if (!account) {
+      throw new Error(
+        `No user ${TEST_EMAIL} in the e2e database — the dev DB image is stale (docker compose down -v && vp run db:up).`,
+      );
+    }
+    const [existing] = await db
+      .select({ id: userAnalyticsConsentEvents.id })
+      .from(userAnalyticsConsentEvents)
+      .where(eq(userAnalyticsConsentEvents.userId, account.id))
+      .limit(1);
+    if (existing) return;
+    await db
+      .insert(userAnalyticsConsentEvents)
+      .values({ userId: account.id, analytics: 'denied', version: CONSENT_VERSION, source: 'web' });
+  } finally {
+    await closePool();
+  }
+}
+
+test.beforeAll(async () => {
+  await seedAccountConsent();
+});
 
 test.describe('expo-web smoke', () => {
   test('boots, signs in, and renders the five-tab Material shell', async ({ page }) => {
@@ -106,6 +186,8 @@ test.describe('expo-web smoke', () => {
   test('home feed renders WASM board thumbnails; climbs tab shows the follow-your-wall state', async ({ page }) => {
     const fatalErrors = collectFatalConsoleErrors(page);
     await ensureSignedIn(page);
+    // The app opens on Climbs (`getAppEntryTab`), so the feed needs a tap.
+    await tabButton(page, 'Home').click();
     // WASM overlay renders resolve to blob: object URLs inside expo-image
     // <img>s — the Home feed's session cards carry them without any board
     // context.
@@ -125,15 +207,17 @@ test.describe('expo-web smoke', () => {
   });
 
   /**
-   * Binds one of the test user's seeded Kilter boards via the board sheet so
-   * the Climbs tab has a list and play-drawer actions aren't blocked by the
+   * Binds one of the test user's seeded boards via the board sheet so the
+   * Climbs tab has a list and play-drawer actions aren't blocked by the
    * switch-board overlay (feed climbs live on other boards). Fresh contexts
-   * start unbound; the exact followed-board sample can vary across seed images.
+   * start unbound. The sheet lists the account's boards under "Your boards";
+   * which boards the seed image puts there can vary, so this takes
+   * the first one rather than naming it.
    */
   async function bindSeededBoard(page: Page): Promise<void> {
     await tabButton(page, 'Climbs').click();
     const findBoardButton = page.getByRole('button', { name: 'Find my board' });
-    const boundThumbnail = page.locator('img[src^="blob:"]').first();
+    const boundThumbnail = page.getByTestId('climb-list').locator('img[src^="blob:"]').first();
     // The Climbs tab settles into one of two determinate states: the follow-
     // your-wall empty state (fresh context) or a populated list (already bound).
     // Wait for whichever appears so the bind decision below isn't racing an
@@ -142,10 +226,15 @@ test.describe('expo-web smoke', () => {
     await expect(findBoardButton.or(boundThumbnail).first()).toBeVisible({ timeout: WARM_TIMEOUT_MS });
     if (await findBoardButton.isVisible()) {
       await findBoardButton.click({ force: true });
-      await page
-        .getByRole('button', { name: /\bkilter$/i })
-        .first()
-        .click({ force: true });
+      // Board rows contain artwork; their separate action menus and the
+      // collapsed list's "Show all" button do not. Keep the pick inside the
+      // saved-board list so nearby boards cannot satisfy it.
+      const savedBoard = page
+        .getByTestId('picker-your-boards')
+        .getByRole('button')
+        .filter({ has: page.locator('img') })
+        .first();
+      await savedBoard.click({ force: true });
     }
     // Bound board → the list renders WASM thumbnails. Assert unconditionally so
     // a skipped bind (e.g. the empty-state button got renamed) fails loudly
@@ -164,7 +253,7 @@ test.describe('expo-web smoke', () => {
       .filter({ has: page.locator('img[src^="blob:"]') })
       .first();
     await firstClimbRow.click({ force: true });
-    await expect(page.getByRole('button', { name: 'Log ascent' })).toBeVisible({ timeout: WARM_TIMEOUT_MS });
+    await expect(page.getByRole('button', { name: 'Log ascent' }).first()).toBeVisible({ timeout: WARM_TIMEOUT_MS });
   }
 
   /**
@@ -180,6 +269,195 @@ test.describe('expo-web smoke', () => {
     await locator.dispatchEvent('click');
   }
 
+  async function checkBrowserDriving(page: Page, input: 'mouse' | 'touch'): Promise<void> {
+    const packets: number[][] = [];
+    const pendingBytes: number[] = [];
+    await page.exposeFunction('captureBoardWrite', (chunk: number[]) => {
+      pendingBytes.push(...chunk);
+      // A GATT write can carry part of an Aurora frame. Its length byte counts
+      // the body only, leaving five framing bytes to wait for.
+      while (pendingBytes.length >= 2 && pendingBytes.length >= pendingBytes[1] + 5) {
+        const packet = pendingBytes.splice(0, pendingBytes[1] + 5);
+        if (packet[1] > 1) packets.push(packet);
+      }
+    });
+    await page.addInitScript(() => {
+      const characteristic = {
+        writeValueWithoutResponse: (bytes: Uint8Array) =>
+          (window as unknown as { captureBoardWrite: (chunk: number[]) => Promise<void> }).captureBoardWrite(
+            Array.from(bytes),
+          ),
+      };
+      const gatt = {
+        connected: false,
+        async connect() {
+          this.connected = true;
+          return this;
+        },
+        disconnect() {
+          this.connected = false;
+        },
+        async getPrimaryService() {
+          return { getCharacteristic: async () => characteristic };
+        },
+      };
+      const device = Object.assign(new EventTarget(), { id: 'test-kilter', name: 'Kilter Board#12345@3', gatt });
+      Object.defineProperty(navigator, 'bluetooth', {
+        configurable: true,
+        value: { requestDevice: async () => device },
+      });
+    });
+    await ensureSignedIn(page);
+    // The web smoke runs --no-dev and declines analytics. Pin the rollout in
+    // this fresh browser's existing device preferences before reloading it.
+    await page.evaluate(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          const request = indexedDB.open('boardsesh-mobile-web');
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => {
+            const db = request.result;
+            const transaction = db.transaction('entries', 'readwrite');
+            transaction
+              .objectStore('entries')
+              .put(JSON.stringify({ 'wall-swipe-to-drive': true }), 'featureFlagOverrides');
+            transaction.oncomplete = () => {
+              db.close();
+              resolve();
+            };
+            transaction.onabort = () => {
+              db.close();
+              reject(transaction.error);
+            };
+          };
+        }),
+    );
+    const boardFixture = await findSeededBoard();
+    expect(boardFixture.type).toBe('kilter');
+    expect(boardFixture.hasLeds).toBe(true);
+    const positions = getLedPlacements('kilter', Number(boardFixture.layout), Number(boardFixture.size));
+    // Take three real single-frame climbs the fixture board can light. Pin their
+    // order so a change in the account's feed cannot change the swipe target.
+    type FixtureClimb = { climb: Climb; packet: number[] };
+    const fixture: FixtureClimb[] = [];
+    await page.route('**/graphql', async (route) => {
+      if (
+        route.request().method() !== 'POST' ||
+        !/\bquery SearchClimbs\b/.test(route.request().postDataJSON().query ?? '')
+      ) {
+        return route.fallback();
+      }
+      if (!fixture.length) {
+        const response = await route.fetch();
+        const { data } = (await response.json()) as { data: { searchClimbs: { climbs: Climb[] } } };
+        for (const climb of data.searchClimbs.climbs.toSorted((left, right) => left.uuid.localeCompare(right.uuid))) {
+          if ((climb.framesCount ?? 1) !== 1 || !climb.frames) continue;
+          const { packet, ledsWritten } = getAuroraBluetoothPacket(climb.frames, positions, 'kilter', 3);
+          // This test compares one complete, non-clear Aurora packet per climb.
+          if (!ledsWritten || packet.length !== packet[1] + 5) continue;
+          const bytes = Array.from(packet);
+          if (fixture.some((entry) => entry.climb.name === climb.name || entry.packet.join() === bytes.join()))
+            continue;
+          fixture.push({ climb, packet: bytes });
+          if (fixture.length === 3) break;
+        }
+      }
+      await route.fulfill({
+        json: { data: { searchClimbs: { climbs: fixture.map(({ climb }) => climb), hasMore: false } } },
+      });
+    });
+    await page.goto(`/app/b/${boardFixture.slug}/40/list`);
+    const list = page.getByTestId('climb-list');
+    await expect(list.locator('img[src^="blob:"]').first()).toBeVisible({ timeout: 60_000 });
+    expect(fixture, 'three different single-frame climbs on the seeded Kilter board').toHaveLength(3);
+    const [first, second, third] = fixture;
+    await list.getByRole('button').filter({ hasText: first.climb.name }).first().click({ force: true });
+    const control = page.getByTestId('play-drawer-wall-control');
+    const selectedHeader = page.getByTestId('play-drawer-header-accessibility');
+    await expect.poll(() => selectedHeader.getAttribute('aria-label')).toContain(first.climb.name);
+    await tapThroughGestureLayer(control);
+    await expect(control).toHaveAccessibleName(/You are driving the wall/i, { timeout: WARM_TIMEOUT_MS });
+    await expect.poll(() => packets.at(-1)).toEqual(first.packet);
+    const firstLabel = await selectedHeader.getAttribute('aria-label');
+    if (!firstLabel) throw new Error('The selected climb has no header');
+    const board = page.getByTestId('play-drawer-board-container');
+    if (input === 'mouse') expect(new URL(page.url()).pathname).toBe('/app/climbs');
+    const touch = input === 'touch' ? await page.context().newCDPSession(page) : null;
+    async function swipe(direction: 1 | -1): Promise<void> {
+      const box = await board.boundingBox();
+      if (!box) throw new Error('The player board has no hit area');
+      const y = box.y + box.height / 2;
+      const start = box.x + box.width * (direction === 1 ? 0.8 : 0.2);
+      if (!touch) {
+        await page.mouse.move(start, y);
+        await page.mouse.down();
+        await page.mouse.move(start - direction * 0.6 * box.width, y, { steps: 12 });
+        await page.mouse.up();
+        return;
+      }
+      await touch.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: start, y }] });
+      for (let step = 1; step <= 8; step++) {
+        const x = start - (direction * box.width * 0.6 * step) / 8;
+        await touch.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y }] });
+        await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => resolve())));
+      }
+      await touch.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+    }
+    async function swipeWhileDriving(direction: 1 | -1, expected: FixtureClimb): Promise<void> {
+      const before = packets.length;
+      await swipe(direction);
+      await expect.poll(() => selectedHeader.getAttribute('aria-label')).toContain(expected.climb.name);
+      await expect.poll(() => packets.slice(before).at(-1)).toEqual(expected.packet);
+      await expect(control).toHaveAccessibleName(/You are driving the wall/i);
+    }
+    await swipeWhileDriving(1, second);
+    await swipeWhileDriving(-1, first);
+    await expect(selectedHeader).toHaveAttribute('aria-label', firstLabel);
+    // The web fallback paints the climb's holds as CSS radial gradients.
+    await expect(control.getByTestId('wall-glow-blobs').locator(':scope > div').first()).toHaveCSS(
+      'background-image',
+      /radial-gradient/,
+    );
+    // A connected browser can stop driving and preview a different list climb.
+    // Put that preview up, then let the confirmation settle before swiping.
+    await tapThroughGestureLayer(control);
+    await expect(control).not.toHaveAccessibleName(/You are driving the wall/i);
+    const beforePreview = packets.length;
+    await swipe(1);
+    await expect.poll(() => selectedHeader.getAttribute('aria-label')).toContain(second.climb.name);
+    await expect(control).toHaveAccessibleName(/Put on board/i);
+    // Leave the preview dark through the wall control's 600 ms double-tap guard.
+    await page.waitForTimeout(650);
+    expect(packets).toHaveLength(beforePreview);
+    await tapThroughGestureLayer(control);
+    await expect.poll(() => packets.slice(beforePreview).at(-1)).toEqual(second.packet);
+    await expect(control).toHaveAccessibleName(/You are driving the wall/i);
+    await expect(control).toContainText(/0:(?:39|40)/, { timeout: 12_000 });
+    await swipeWhileDriving(1, third);
+    await expect(control).toContainText(/0:4[3-5]/);
+    await swipeWhileDriving(-1, second);
+  }
+
+  test('a browser driving the wall lights the next climb on swipe and restores the first on swipe back', async ({
+    page,
+  }) => {
+    await checkBrowserDriving(page, 'touch');
+  });
+
+  test.describe('desktop board driving', () => {
+    test.use({
+      userAgent: devices['Desktop Chrome'].userAgent,
+      viewport: { width: 1440, height: 900 },
+      contextOptions: { screen: { width: 1440, height: 900 } },
+      hasTouch: false,
+      isMobile: false,
+    });
+
+    test('dragging the board in the desktop pane lights each selected climb', async ({ page }) => {
+      await checkBrowserDriving(page, 'mouse');
+    });
+  });
+
   /**
    * Dismisses the presented sheet and waits for `stillVisible` to disappear.
    * gorhom's web backdrop and the Escape key each dismiss on their own, but
@@ -190,7 +468,10 @@ test.describe('expo-web smoke', () => {
     const backdrop = page.getByRole('button', { name: 'Bottom sheet backdrop' }).last();
     await expect(async () => {
       if (await backdrop.isVisible().catch(() => false)) {
-        await backdrop.click({ force: true });
+        // The center of a full-screen backdrop meets the 50% queue sheet's
+        // top edge on desktop. Click its exposed corner with real hit testing
+        // so the pointer reaches the backdrop rather than the sheet above it.
+        await backdrop.click({ position: { x: 10, y: 10 }, timeout: 2_000 });
       }
       await page.keyboard.press('Escape');
       await expect(stillVisible).toBeHidden({ timeout: 2_000 });
@@ -220,12 +501,12 @@ test.describe('expo-web smoke', () => {
     const queueButton = page.getByRole('button', { name: /queue/i }).first();
     await expect(queueButton).toBeVisible({ timeout: WARM_TIMEOUT_MS });
     await tapThroughGestureLayer(queueButton);
-    // The queue sheet hosts its list in a BottomSheetFlatList; its "Edit queue"
-    // header action is unique to the presented sheet and proves the gorhom web
-    // shim mounted it. Backdrop dismissal proves it closes.
-    const editQueueButton = page.getByRole('button', { name: 'Edit queue' });
-    await expect(editQueueButton).toBeVisible({ timeout: 15_000 });
-    await dismissSheet(page, editQueueButton);
+    // The history toggle belongs to the presented queue sheet, including when
+    // the queue is empty and correctly has no editing actions. Its visibility
+    // and dismissal prove the gorhom web shim opened and closed the sheet.
+    const historyToggle = page.getByRole('button', { name: 'Toggle history', exact: true });
+    await expect(historyToggle).toBeVisible({ timeout: 15_000 });
+    await dismissSheet(page, historyToggle);
     expect(fatalErrors).toEqual([]);
   });
 
@@ -247,26 +528,7 @@ test.describe('expo-web smoke', () => {
     await ensureSignedIn(page);
 
     // Bind a board so the Climbs tab renders a long enough list to scroll.
-    // Tolerates both states `bindSeededBoard` doesn't need to: a fresh account
-    // (no boards yet — pick the "kilter" search result) and this seed image's
-    // actual state, where the Aurora-synced account already has boards under
-    // "Your boards" the instant the picker opens (tap one to bind it here).
-    await tabButton(page, 'Climbs').click();
-    const findBoardButton = page.getByRole('button', { name: 'Find my board' });
-    const boundThumbnail = page.locator('img[src^="blob:"]').first();
-    await expect(findBoardButton.or(boundThumbnail).first()).toBeVisible({ timeout: WARM_TIMEOUT_MS });
-    if (await findBoardButton.isVisible()) {
-      await findBoardButton.click({ force: true });
-      const kilterResult = page.getByRole('button', { name: /\bkilter$/i }).first();
-      const ownedBoard = page.getByRole('button', { name: new RegExp(SEEDED_BOARD_NAME, 'i') }).first();
-      await expect(kilterResult.or(ownedBoard).first()).toBeVisible({ timeout: WARM_TIMEOUT_MS });
-      if (await ownedBoard.isVisible()) {
-        await ownedBoard.click({ force: true });
-      } else {
-        await kilterResult.click({ force: true });
-      }
-    }
-    await expect(boundThumbnail).toBeVisible({ timeout: 60_000 });
+    await bindSeededBoard(page);
 
     const list = page.getByTestId('climb-list');
     await expect(list).toBeVisible({ timeout: WARM_TIMEOUT_MS });
@@ -279,6 +541,25 @@ test.describe('expo-web smoke', () => {
     const centerX = box.x + box.width / 2;
     const dragStartY = box.y + box.height * 0.85;
     const dragEndY = box.y + box.height * 0.15;
+    // A late RNGH config update used to reset the swipeable host to `none`.
+    // Check the browser's actual hit path so a failure identifies that policy
+    // regression; the CDP drag and scroll-distance assertion below still decide
+    // whether touch scrolling works.
+    await expect
+      .poll(() =>
+        page.evaluate(
+          ({ x, y }) => {
+            const policies: string[] = [];
+            for (let element = document.elementFromPoint(x, y); element; element = element.parentElement) {
+              policies.push(getComputedStyle(element).touchAction);
+              if (element.getAttribute('data-testid') === 'climb-list') break;
+            }
+            return policies.filter((policy) => policy === 'none' || policy === 'pan-x');
+          },
+          { x: centerX, y: dragStartY },
+        ),
+      )
+      .toEqual([]);
     const dragSteps = 10;
     await cdpSession.send('Input.dispatchTouchEvent', {
       type: 'touchStart',
@@ -305,9 +586,9 @@ test.describe('expo-web smoke', () => {
   });
 
   test.describe('desktop adaptive shell', () => {
-    test('uses the tablet rail and keeps every play action and deferred section in the detail pane', async ({
+    test('uses the tablet rail and keeps default play actions and deferred sections in the detail pane', async ({
       browser,
-    }) => {
+    }, testInfo) => {
       // `screen` is a browser-context option rather than a per-test fixture.
       // Create the context here so Dimensions.get('screen') sees desktop
       // eligibility before the Expo bundle evaluates.
@@ -334,52 +615,45 @@ test.describe('expo-web smoke', () => {
           .toBe('dark');
         await expect
           .poll(() => page.evaluate(() => getComputedStyle(document.documentElement).backgroundColor))
-          .toBe('rgb(21, 16, 30)');
+          // Material uses the canonical Graphite page background (#0E0E0E).
+          .toBe('rgb(14, 14, 14)');
 
-        for (const tabName of DESKTOP_TAB_NAMES) {
+        // Desktop uses the same destinations in a rail; Wall display is a
+        // separate full-screen route, not a sixth tab.
+        for (const tabName of TAB_NAMES) {
           await expect(page.getByRole('tab', { name: tabName, exact: true })).toBeVisible();
         }
 
         await openPlayDrawerFromClimbsList(page);
         expect(new URL(page.url()).pathname).not.toContain('/play');
 
-        // The persistent detail pane embeds the same action bar as the mobile
-        // route. Check both rows so a desktop-only gate cannot silently strip an
-        // action while the main Log ascent button still makes the pane look live.
-        // The leading action is mirror on boards that support it and favorite
-        // otherwise. Both are the same capability-gated slot used on mobile.
-        await expect(
-          page
-            .getByRole('button', {
-              name: /^(Mirror climb|Unmirror climb|Add favorite|Remove favorite)$/,
-            })
-            .first(),
-        ).toBeVisible();
+        const playPane = page.getByTestId('desktop-play-pane');
+        const miniPlayer = page.getByTestId('persistent-mini-player');
+        await expect(miniPlayer).toBeVisible();
 
-        for (const actionName of [
-          'Previous climb',
-          'Log ascent',
-          'Next climb',
-          'Connect Board',
-          'Choose Angle',
-          'Climb actions',
-          'Share climb',
-        ]) {
-          await expect(page.getByRole('button', { name: actionName, exact: true })).toBeVisible();
+        // Mouse browsers show transport controls by default (#7963). These
+        // occupy the slots that phones use for Favorite and Share; optional
+        // actions remain available through the menus.
+        for (const actionName of ['Log ascent', 'Choose Angle', 'Previous climb', 'Next climb']) {
+          await expect(playPane.getByRole('button', { name: actionName, exact: true })).toBeVisible();
         }
-        const queueButton = page.getByRole('button', { name: /^Queue, \d+ climbs$/ });
+        const wallControl = playPane.getByTestId('play-drawer-wall-control');
+        await expect(wallControl).toBeVisible();
+        await expect(wallControl).toHaveRole('button');
+        await expect(wallControl).toHaveAccessibleName(/\S/);
+        const queueButton = playPane.getByRole('button', { name: /^Queue, (nothing up next|\d+ climbs?( up next)?)$/ });
         await expect(queueButton).toBeVisible();
 
-        const logAscentButton = page.getByRole('button', { name: 'Log ascent', exact: true });
+        const logAscentButton = playPane.getByRole('button', { name: 'Log ascent', exact: true });
         await tapThroughGestureLayer(logAscentButton);
         const saveTickButton = page.getByRole('button', { name: /Log (flash|send|attempt)/i }).first();
         await expect(saveTickButton).toBeVisible({ timeout: 15_000 });
         await dismissSheet(page, saveTickButton);
 
         await tapThroughGestureLayer(queueButton);
-        const editQueueButton = page.getByRole('button', { name: 'Edit queue', exact: true });
-        await expect(editQueueButton).toBeVisible({ timeout: 15_000 });
-        await dismissSheet(page, editQueueButton);
+        const historyToggle = page.getByRole('button', { name: 'Toggle history', exact: true });
+        await expect(historyToggle).toBeVisible({ timeout: 15_000 });
+        await dismissSheet(page, historyToggle);
 
         // Desktop wheel/trackpad scrolling does not emit RN's begin-drag event.
         // Scrolling over the pane must still open the deferred-content gate.
@@ -387,7 +661,39 @@ test.describe('expo-web smoke', () => {
         await page.mouse.wheel(0, 1200);
 
         for (const sectionName of ['Logbook', 'Beta Videos', 'Community', 'Similar Climbs']) {
-          await expect(page.getByText(sectionName, { exact: true }).first()).toBeVisible({ timeout: WARM_TIMEOUT_MS });
+          await expect(playPane.getByText(sectionName, { exact: true }).first()).toBeVisible({
+            timeout: WARM_TIMEOUT_MS,
+          });
+        }
+        // Profile must retain queue access without finding an action in the pane.
+        // These use real mouse hit testing: dispatchEvent would miss an overlay
+        // swallowing the new bar's controls.
+        await tabButton(page, 'Profile').click();
+        await expect(miniPlayer).toBeVisible();
+        await miniPlayer.getByRole('button', { name: /^More actions for / }).click();
+        await page.getByRole('menuitem', { name: 'Open the queue', exact: true }).click();
+        await expect(historyToggle).toBeVisible({ timeout: 15_000 });
+        await dismissSheet(page, historyToggle);
+        await expect(page).toHaveURL(/\/profile(?:[/?#]|$)/);
+        await expect(playPane).toBeVisible();
+        await page.screenshot({ path: testInfo.outputPath('desktop-profile-mini-player.png') });
+
+        // Start compact so the measured bottom-tab height is cached, then cross
+        // both the rail and detail-pane boundaries on the same browser screen.
+        for (const width of [699, 700, 815, 816, 1176, 1440]) {
+          await page.setViewportSize({ width, height: 900 });
+          await expect(miniPlayer).toHaveCount(1);
+          await expect(miniPlayer).toBeVisible();
+          await expect(playPane).toHaveCount(width >= 816 ? 1 : 0);
+          if (width >= 700) {
+            await expect.poll(async () => Math.round((await miniPlayer.boundingBox())?.x ?? -1)).toBe(104);
+            await expect
+              .poll(async () => {
+                const bounds = await miniPlayer.boundingBox();
+                return bounds ? Math.round(bounds.y + bounds.height) : -1;
+              })
+              .toBe(900);
+          }
         }
         expect(fatalErrors).toEqual([]);
       } finally {
@@ -433,28 +739,6 @@ test.describe('expo-web smoke', () => {
      * deterministic per dev-DB image without pinning a uuid the image is free
      * to drop.
      */
-    /** The seeded shared board the suite already binds through the board sheet. */
-    async function findSeededBoardSlug(): Promise<string> {
-      process.env.DATABASE_URL ??= 'postgres://postgres:password@localhost:5432/main';
-      const db = createDb();
-      try {
-        const [board] = await db
-          .select({ slug: userBoards.slug })
-          .from(userBoards)
-          .where(eq(userBoards.name, SEEDED_BOARD_NAME))
-          .limit(1);
-        if (!board) {
-          throw new Error(
-            `No board named "${SEEDED_BOARD_NAME}" in the e2e database — the dev DB image is stale ` +
-              '(docker compose down -v && vp run db:up).',
-          );
-        }
-        return board.slug;
-      } finally {
-        await closePool();
-      }
-    }
-
     async function findSeededClimbUuid(): Promise<string> {
       process.env.DATABASE_URL ??= 'postgres://postgres:password@localhost:5432/main';
       const db = createDb();
@@ -500,7 +784,7 @@ test.describe('expo-web smoke', () => {
 
     test.beforeAll(async () => {
       seededClimbUuid = await findSeededClimbUuid();
-      seededBoardSlug = await findSeededBoardSlug();
+      seededBoardSlug = (await findSeededBoard()).slug;
     });
 
     /** The board's climbs, whichever board is active, render WASM thumbnails. */
@@ -531,7 +815,9 @@ test.describe('expo-web smoke', () => {
       // preview:true — a deep link must not take over the queue's current climb,
       // which in a party session is everyone's climb.
       await expect(page.getByRole('button', { name: 'Log ascent' })).toBeVisible({ timeout: COLD_LOAD_TIMEOUT_MS });
-      await expect(page.getByRole('button', { name: 'Set active' })).toBeVisible({ timeout: WARM_TIMEOUT_MS });
+      await expect(page.getByRole('button', { name: 'Put on board', exact: true })).toBeVisible({
+        timeout: WARM_TIMEOUT_MS,
+      });
 
       // Second cold load of the same URL — a `reload()` would not do it, since
       // handing off rewrites the address bar to the drawer's own route. This is

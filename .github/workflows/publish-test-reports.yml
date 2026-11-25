@@ -1,58 +1,217 @@
 name: Publish Test Reports
 
-# Runs after the CI workflows complete — including PRs from forks.
-# The workflow_run trigger executes in the base repo context, so
-# GITHUB_TOKEN has checks:write permission even for forked PRs.
+# CI uploads JUnit using a read-only token. This trusted follow-up can write
+# checks and comments for fork PRs without executing their code.
 on:
   workflow_run:
-    workflows: ['Web Tests', 'Backend Integration Tests']
-    types:
-      - completed
+    workflows: ['CI']
+    types: [completed]
 
 permissions:
+  actions: read
+  contents: read
   checks: write
   pull-requests: write
-  contents: read
+
+concurrency:
+  group: ci-test-report-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}-${{ github.event.workflow_run.head_sha }}
+  # An older completion must not cancel the publisher for a newer PR head.
+  cancel-in-progress: false
 
 jobs:
-  publish-web-tests:
-    if: github.event.workflow.name == 'Web Tests'
+  publish:
+    if: github.event.workflow_run.event == 'pull_request' && github.event.workflow_run.conclusion != 'cancelled'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Publish Web Unit Tests report
-        uses: turing85/publish-report@v2
+      # Budget: GITHUB_TOKEN allows 1,000 REST calls/hour for the whole repo, shared by
+      # every workflow. An app installation token has its own, larger budget (#7659).
+      # Falls back to GITHUB_TOKEN if the app is not configured.
+      - name: Mint API token
+        id: api_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
         with:
-          checkout: 'true'
-          download-artifact-name: web-test-results
-          download-artifact-run-id: ${{ github.event.workflow_run.id }}
-          comment-header: web-test-report
-          comment-enabled: 'true'
-          report-name: Web Unit Tests
-          report-path: '**/*.xml'
-          report-reporter: java-junit
-          report-fail-on-error: false
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
+      - name: Find the current PR and test artifacts
+        id: inspect
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
+          script: |
+            const run = context.payload.workflow_run;
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            if (run.repository.full_name !== repository || run.head_commit?.id !== run.head_sha) {
+              core.notice('Run repository or report commit does not match; skipping.');
+              return;
+            }
 
-  publish-backend-tests:
-    if: github.event.workflow.name == 'Backend Integration Tests'
-    runs-on: ubuntu-latest
-    steps:
+            // workflow_run.pull_requests can be empty for forks. Resolve through
+            // GitHub instead of trusting a PR number supplied in an artifact.
+            const associated = await github.paginate(github.rest.repos.listPullRequestsAssociatedWithCommit, {
+              ...context.repo, commit_sha: run.head_sha, per_page: 100,
+            });
+            const matching = associated.filter((pullRequest) =>
+              pullRequest.state === 'open' &&
+              pullRequest.base.repo.full_name === repository &&
+              pullRequest.head.repo?.full_name === run.head_repository?.full_name &&
+              pullRequest.head.ref === run.head_branch &&
+              pullRequest.head.sha === run.head_sha,
+            );
+            if (matching.length !== 1) {
+              core.notice('No unique open PR at this run head; skipping a closed or superseded run.');
+              return;
+            }
+
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              ...context.repo, run_id: run.id, per_page: 100,
+            });
+            if (!artifacts.some((artifact) => !artifact.expired && artifact.name.startsWith('test-results-'))) {
+              core.notice('No test results were uploaded; nothing to publish.');
+              return;
+            }
+            core.setOutput('pr-number', matching[0].number);
+
+      # The reporter lists tracked files for annotations. Check out the trusted
+      # workflow commit, never the PR head; artifacts cannot overwrite this tree.
       - uses: actions/checkout@v6
+        if: steps.inspect.outputs.pr-number != ''
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Download all shard results
+      - name: Download all test results from CI
+        if: steps.inspect.outputs.pr-number != ''
         uses: actions/download-artifact@v4
         with:
-          pattern: backend-test-results-*
-          path: test-results
+          pattern: test-results-*
+          path: ${{ runner.temp }}/ci-test-results
           merge-multiple: true
           run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          github-token: ${{ github.token }}
 
-      - name: Publish Backend Integration Tests report
+      - name: Recheck the PR head before publishing
+        if: steps.inspect.outputs.pr-number != ''
+        id: current
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.inspect.outputs.pr-number }}
+        with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
+          script: |
+            const { data: pullRequest } = await github.rest.pulls.get({
+              ...context.repo, pull_number: Number(process.env.PR_NUMBER),
+            });
+            const run = context.payload.workflow_run;
+            const current = pullRequest.state === 'open' &&
+              pullRequest.head.sha === run.head_sha &&
+              pullRequest.head.ref === run.head_branch &&
+              pullRequest.head.repo?.full_name === run.head_repository?.full_name;
+            core.setOutput('publish', current);
+            if (!current) core.notice('PR closed or advanced while downloading reports; skipping.');
+
+      - name: Reset the test-results comment
+        if: steps.current.outputs.publish == 'true'
         uses: turing85/publish-report@v2
         with:
-          comment-header: backend-test-report
-          comment-enabled: 'true'
-          report-name: Backend Integration Tests
-          report-path: 'test-results/**/*.xml'
-          report-reporter: java-junit
-          report-fail-on-error: false
+          override-comment: 'true'
+          comment-header: ci-tests
+          comment-message-pr-number: ${{ steps.inspect.outputs.pr-number }}
+          comment-message-override: |
+            CI test results for [run #${{ github.event.workflow_run.run_number }}](${{ github.event.workflow_run.html_url }}).
+
+      - name: Parse CI test results
+        id: report
+        if: steps.current.outputs.publish == 'true'
+        uses: phoenix-actions/test-reporting@f957cd93fc2d848d556fa0d03c57bc79127b6b5e # v15
+        with:
+          name: CI Tests Report
+          path: '${{ runner.temp }}/ci-test-results/**/*.xml'
+          reporter: java-junit
+          fail-on-error: 'false'
+          output-to: step-summary
+          list-suites: failed
+          list-tests: failed
+
+      # The upstream reporter creates an in-progress check, then PATCHes it.
+      # A failed PATCH leaves an orphan that never finishes. Parse first, then
+      # create one completed check whose conclusion comes from those results.
+      - name: Publish CI test results
+        id: publish
+        if: steps.current.outputs.publish == 'true'
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.inspect.outputs.pr-number }}
+          REPORT_OUTCOME: ${{ steps.report.outcome }}
+          REPORT_CONCLUSION: ${{ steps.report.outputs.conclusion }}
+          REPORT_PASSED: ${{ steps.report.outputs.passed }}
+          REPORT_FAILED: ${{ steps.report.outputs.failed }}
+          REPORT_SKIPPED: ${{ steps.report.outputs.skipped }}
+        with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
+          script: |
+            if (process.env.REPORT_OUTCOME !== 'success') throw new Error('JUnit parsing did not succeed');
+            const count = (name) => {
+              const input = process.env[name] ?? '';
+              if (!/^(0|[1-9][0-9]{0,9})$/.test(input)) throw new Error(`Invalid JUnit count: ${name}`);
+              const result = Number(input);
+              if (!Number.isSafeInteger(result) || result > 1_000_000_000) throw new Error(`JUnit count exceeds bound: ${name}`);
+              return result;
+            };
+            const passed = count('REPORT_PASSED');
+            const failed = count('REPORT_FAILED');
+            const skipped = count('REPORT_SKIPPED');
+            const parserConclusion = failed > 0 ? 'failure' : 'success';
+            if (process.env.REPORT_CONCLUSION !== parserConclusion) throw new Error('JUnit conclusion/count mismatch');
+            const run = context.payload.workflow_run;
+            const noTests = passed + failed + skipped === 0;
+            if (noTests && run.conclusion !== 'success') throw new Error('Zero-test report requires successful source CI');
+            // Changed-file CI can upload valid, empty JUnit suites. Report that
+            // absence explicitly without claiming any tests passed.
+            const conclusion = noTests ? 'neutral' : parserConclusion;
+            const { data: pullRequest } = await github.rest.pulls.get({
+              ...context.repo, pull_number: Number(process.env.PR_NUMBER),
+            });
+            const current = pullRequest.state === 'open' &&
+              pullRequest.base.repo.full_name === `${context.repo.owner}/${context.repo.repo}` &&
+              pullRequest.head.sha === run.head_sha &&
+              pullRequest.head.ref === run.head_branch &&
+              pullRequest.head.repo?.full_name === run.head_repository?.full_name;
+            if (!current) {
+              core.notice('PR closed or advanced while parsing reports; skipping publication.');
+              return;
+            }
+            const reportUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const counts = `${passed} passed, ${failed} failed, ${skipped} skipped.`;
+            const summary = noTests ? `No tests ran. ${counts}` : counts;
+            const { data: check } = await github.rest.checks.create({
+              ...context.repo,
+              name: 'CI Tests Report',
+              head_sha: run.head_sha,
+              status: 'completed',
+              conclusion,
+              details_url: reportUrl,
+              output: { title: summary, summary: `${summary}\n\n[Full test report](${reportUrl}).` },
+            });
+            if (check.status !== 'completed' || check.conclusion !== conclusion || check.head_sha !== run.head_sha) {
+              throw new Error('GitHub did not confirm the completed test check');
+            }
+            core.setOutput('message', `${summary} [Full test report](${reportUrl}).`);
+
+      - name: Update the test-results comment
+        if: steps.publish.outputs.message != ''
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ci-tests
+          number: ${{ steps.inspect.outputs.pr-number }}
+          message: ${{ steps.publish.outputs.message }}
+
+      - name: Report publication failure
+        if: failure() && steps.current.outputs.publish == 'true'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ci-tests
+          number: ${{ steps.inspect.outputs.pr-number }}
+          message: |
+            Test report publication failed. [Inspect this publisher run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).

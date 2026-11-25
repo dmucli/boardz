@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // The stubbed window origin below isn't www, so the absolute form always wins.
 const WEB = 'https://www.boardsesh.com';
 
+// auth-interceptor.web reads the app version for its client identity header;
+// the real expo-constants pulls in react-native, which vitest cannot parse.
+vi.mock('expo-constants', () => ({ default: { expoConfig: { version: '2.6.0' } } }));
+
 type MessageListener = (event: MessageEvent<unknown>) => void;
 
 class MockBroadcastChannel {
@@ -268,6 +272,7 @@ describe('auth-store web cross-tab invalidation', () => {
       identity: { userId: 'user-1', authSessionId: 'login-1' },
     });
     resolveOldRequest(jsonResponse({ data: { privateForOldLogin: true } }));
+    // A sign-out that has only started is not an account change (#7596).
     await expect(oldRequest).resolves.toEqual(expect.objectContaining({ status: 200 }));
 
     fetchMock

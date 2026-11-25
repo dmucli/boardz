@@ -1,3 +1,4 @@
+import type { BoardRenderStyle } from '../lib/board-render-style';
 import { useCallback, useEffect, useMemo, useState, useRef, useSyncExternalStore } from 'react';
 import type { BoardName } from '@boardsesh/shared-schema';
 import {
@@ -10,12 +11,18 @@ import {
   type BoardRenderImageLoadFailureKind,
   type BoardRenderNativeFailureKind,
 } from '@boardsesh/analytics';
-import { listOverlayCacheEntries, onOverlayCacheHydrated, overlayCacheEntryExists } from './overlay-cache-warmup';
+import {
+  listOverlayCacheEntries,
+  onOverlayCacheHydrated,
+  overlayCacheEntryExists,
+  deleteOverlayCacheEntry,
+  rendererOverlayUri,
+} from './overlay-cache-warmup';
+import { isSprayOverlayCurrent, sprayPrivacyGeneration } from '../lib/spray/spray-privacy-generation';
 import { RENDERER_VERSION } from './renderer-version';
 import {
   HOLD_STATE_MAP,
   getBoardStrokeWidthMultiplier,
-  getHoldDisplayColor,
   parseFramesSegments,
   toFlatFrames,
 } from '@boardsesh/board-constants/hold-states';
@@ -28,7 +35,17 @@ import {
   type BoardArtGeometry,
 } from '@boardsesh/board-art-geometry';
 import { getBoardRenderData } from '../lib/board-details';
-import { ensureSprayWallLoaded, sprayCacheToken, subscribeToSprayWalls } from '../lib/spray/spray-wall-registry';
+import { auraGpuRenderWidth } from '../lib/board-render/gpu-render-size';
+import { useGpuFailureStatus } from '../lib/board-render/gpu-failure-store';
+import { isGpuConfigWarm } from '../lib/board-render/gpu-warm-configs';
+import {
+  activeSprayArt,
+  ensureSprayWallLoaded,
+  getSprayWall,
+  sprayCacheToken,
+  subscribeToSprayWalls,
+} from '../lib/spray/spray-wall-registry';
+import { useBoardRenderDefault } from './use-board-render-look';
 import {
   ensureBackgroundsCached,
   tryGetBackgroundPathsSync,
@@ -38,10 +55,11 @@ import {
 import { useAppColorScheme } from '../providers/theme-provider';
 import { addErrorBreadcrumb, reportError } from '../lib/error-reporting';
 import { track } from '../lib/analytics';
-import { sweepBoardArtCache } from '../lib/sweep-caches';
+import { reconcileOverlayIndexWithDisk, sweepBoardArtCache } from '../lib/sweep-caches';
 import { measureFreeCacheSpaceBytes } from '../lib/cache-dir-io';
 import {
   isRenderCancelled,
+  RenderCancelledError,
   requestRender,
   setRenderConcurrency,
   _resetRenderSchedulerForTests,
@@ -50,6 +68,7 @@ import {
 } from '../lib/board-render/render-scheduler';
 import {
   cacheRenderedOverlay,
+  getOverlayGenerationWatermark,
   getRenderedOverlay,
   invalidateRenderedOverlay,
   _renderedOverlaysForTests,
@@ -61,15 +80,13 @@ import {
   DEFAULT_HOLD_BRUSH_THICKNESS,
   DEFAULT_HOLD_MARKER_SHAPE,
   DEFAULT_HOLD_SHAPE_SIZE,
-  buildHoldColorOverrideSignature,
   buildHoldRenderOverrideSignature,
-  getEffectiveHoldStateColor,
-  getEffectiveHoldStateShape,
+  resolveHoldStateMarker,
   useHoldColorOverrides,
   type HoldColorOverrides,
   type HoldShapeOverrides,
 } from '../lib/hold-color-overrides';
-import { buildAuraRenderFields } from '@boardsesh/board-look';
+import { buildAuraRenderFields, supportsAuraGpu } from '@boardsesh/board-look';
 import {
   boardFieldColorForScheme,
   buildBoardRenderSignature,
@@ -89,6 +106,21 @@ import {
   setBoardseshSupportProbe,
   subscribeToBoardseshSupport,
 } from './boardsesh-renderer-support';
+import {
+  getUnsupportedSignatureRevision,
+  isRenderSignatureUnsupported,
+  markRenderSignatureUnsupported,
+  resolveEffectiveRenderOverrides,
+  subscribeToUnsupportedSignatures,
+} from './marker-renderer-support';
+import { getPlayOverlayWidth } from '../lib/board-render/play-board-prewarm';
+import { isBoardArtInMemory, msSinceImageMemorySweep } from '../lib/board-render/board-art-memory-index';
+import {
+  captureReadyBoardArt,
+  type ReadyBoardArtIdentity,
+  type ReadyBoardArtSnapshot,
+} from '../lib/board-render/ready-board-art';
+import { getCredentialGeneration, subscribeToCredentialChanges } from '../lib/privacy/privacy-cache';
 
 const MARKER_RENDERER_UNAVAILABLE_MESSAGE =
   'Marker shape, size, and brush overrides require a rebuilt BoardRenderer native binary';
@@ -168,6 +200,46 @@ type NativeClimbRenderParams = {
    *    climber is waiting on.
    */
   playSurface?: boolean;
+  /** Opt-in live GPU surface; callers gate native API compatibility and flag. */
+  gpuSurface?: boolean;
+  /** Binary advertises exact packed fields, annotations and catalogue roles. */
+  gpuCatalogueNative?: boolean;
+  gpuApiVersion?: number;
+  /** v3 editor keeps an empty transparent native scene as the first-edit baseline. */
+  gpuAllowEmpty?: boolean;
+  /**
+   * Render the overlay for empty `frames` too: the bare wall, the veil and LED
+   * covers with no lit holes, which the renderer draws for a climb with no
+   * holds. The PNG player board fades its climbs over it (`png-swap-layers.ts`).
+   * Without it empty frames render nothing, as every other surface expects.
+   */
+  bareWall?: boolean;
+  gpuFallbackConfigJson?: string | null;
+  /** Once this static configuration presented, the board keeps its GPU drawable: no PNG work at all. */
+  gpuPresentedConfigJson?: string | null;
+  /**
+   * GPU first. While a live GPU request is pending (`gpuSurface`, and a config
+   * that is ready or still loading), this hook still adopts a PNG already in the
+   * overlay cache, which costs nothing, but never schedules a render for one.
+   * The caller releases a render for exactly one cache key (`overlayCacheKey`)
+   * once the GPU has missed its grace period; see `BoardImageNative`.
+   */
+  gpuHedgeCacheKey?: string | null;
+  /**
+   * The tap prewarm for a board the player draws on the live GPU. Once that
+   * drawing is warm in this process (`gpu-warm-configs`), adopt an overlay that
+   * is already cached but never render one: the GPU draws the first holds. While
+   * it is cold the prewarm renders as it always did. Pass `gpuCatalogueNative`
+   * as the play board does, so both name the same drawing.
+   */
+  cachedOnlyOnceGpuWarm?: boolean;
+  /**
+   * The play board's own view layer writes here whether its live stack is held
+   * invisible under the opening-art bridge (`BoardImageNative`). Read only when
+   * the paint watchdog fires, and reported as `bridging` on `paint_timeout`.
+   * Left out, the event says `false`.
+   */
+  paintBridgingRef?: { readonly current: boolean };
   /**
    * A render nobody is looking at yet — the play drawer warming the next few
    * queue items. Requests at the scheduler's `prefetch` rank (runs only when
@@ -196,6 +268,8 @@ type NativeClimbRenderParams = {
    * store.
    */
   renderSettingsOverride?: BoardRenderSettings;
+  /** Complete per-surface drawing; takes precedence over individual preview overrides. */
+  renderStyleOverride?: BoardRenderStyle;
   /**
    * Draw under a DIFFERENT set of hold role colours than the climber's stored
    * ones — the colour-vision palette rail, whose cards each show the same climb
@@ -235,6 +309,8 @@ type NativeClimbRenderParams = {
    * cache with) the uncapped one.
    */
   maxVeilOpacity?: number;
+  /** Explicit host ground for the veil; omitted surfaces retain their shared drawing. */
+  fieldColorOverride?: string;
   /**
    * Hold-state codes this surface draws that no board defines — the hold
    * heatmap's buckets (900–904) and grade colours (910+) — merged into the
@@ -259,17 +335,50 @@ type NativeClimbRenderParams = {
 };
 
 type NativeClimbRenderResult = {
+  artworkIdentity: ReadyBoardArtIdentity;
+  /** Synchronous cache-only lookup; thumbnail fallback requires its exact displayed attempt. */
+  getReadyBoardArtSnapshot: (
+    climbUuid: string,
+    mirrored: boolean,
+    displayedOverlayLoadKey: string | null,
+  ) => ReadyBoardArtSnapshot | undefined;
   /**
    * file:// URI of the holds-only PNG, or null until the Rust render
    * completes (or forever if the native module is unavailable, e.g.
    * Expo Go). Consumers stack this on top of `backgroundPaths`.
    */
   overlayUri: string | null;
+  /** The PNG cache key this surface asks for now; names the climb a GPU hedge releases. */
+  overlayCacheKey: string;
+  /** Short name of the live GPU drawing, for `markGpuConfigWarm` on its first presentation. */
+  gpuWarmKey?: string | null;
+  /** This board's current GPU wait began before its drawing was warm in this process. */
+  gpuProcessCold?: boolean;
+  /** Stable full-layout config for a live GPU view; frames travel separately. */
+  gpuConfigJson?: string | null;
+  gpuStatus?: 'loading' | 'unavailable' | 'ready';
+  gpuFrames?: string;
   /**
    * Changes whenever this consumer must make expo-image perform a fresh load,
    * including a regeneration that writes back to the same file:// URI.
    */
   overlayLoadKey: string | null;
+  /**
+   * True when the overlay was already rendered the moment this surface took the
+   * climb, so the holds are in the same commit as everything else. Pass it to
+   * `suppressOverlayTransition`: a cross-fade from nothing would put the bare
+   * board on screen for 150ms that it never had to be there.
+   */
+  overlayImmediate: boolean;
+  /**
+   * True when no overlay is coming for this climb at all: the renderer is
+   * missing, the climb names no hold this board has, the board has no render
+   * config, or renders are backed off after a full disk. A surface that holds
+   * its photo back for the holds (`revealWithOverlay`) must not wait on these.
+   */
+  overlayUnavailable: boolean;
+  /** This exact key exhausted its render/image retry; retain the last complete climb. */
+  overlayFailed: boolean;
   /** Exact-attempt callbacks consumed by LayeredClimbImage's overlay Image. */
   onOverlayLoad: (loadKey: string | null) => void;
   onOverlayError: (event: { error: string }, loadKey: string | null) => void;
@@ -296,6 +405,14 @@ type NativeClimbRenderResult = {
    * be visible-broken to the user instead of invisibly-broken.
    */
   missingBackgroundCount: number;
+  backgroundsLoading: boolean;
+  /**
+   * Paint this under `backgroundPaths` (`LayeredClimbImage`'s `baseColor`), or
+   * nothing when undefined. Set only for a spray wall drawn on its "Holds only"
+   * look, whose image is transparent everywhere but the holds: the field colour
+   * of the current scheme goes behind it, so one image serves light and dark.
+   */
+  backgroundBaseColor: string | undefined;
   /**
    * The drawing this render actually used, after the climber's settings, the
    * rollout flags and the installed library have all had their say. Surfaced so
@@ -355,35 +472,6 @@ function isExactNativeRender(
 const inflightRenders = new Map<string, Promise<RenderedOverlayEntry>>();
 const INFLIGHT_RENDERS_MAX = 50;
 
-// Render signatures the installed renderer told us it cannot honour (an old
-// native binary that predates marker support throws
-// MARKER_RENDERER_UNAVAILABLE_MESSAGE). Module-scoped: one refusal is a
-// property of the binary, not of the climb, so every hook instance learns from
-// it. `unsupportedSignatureRevision` is the useSyncExternalStore tick — without
-// it a Set mutated inside a promise catch would never reach the components that
-// have to re-resolve which overrides they can still ask for.
-const unsupportedRenderSignatures = new Set<string>();
-const unsupportedSignatureListeners = new Set<() => void>();
-let unsupportedSignatureRevision = 0;
-
-function markRenderSignatureUnsupported(renderSignature: string): void {
-  if (unsupportedRenderSignatures.has(renderSignature)) return;
-  unsupportedRenderSignatures.add(renderSignature);
-  unsupportedSignatureRevision += 1;
-  for (const listener of unsupportedSignatureListeners) listener();
-}
-
-function subscribeToUnsupportedSignatures(onStoreChange: () => void): () => void {
-  unsupportedSignatureListeners.add(onStoreChange);
-  return () => {
-    unsupportedSignatureListeners.delete(onStoreChange);
-  };
-}
-
-function getUnsupportedSignatureRevision(): number {
-  return unsupportedSignatureRevision;
-}
-
 // ── Boardsesh render-mode capability (issue #2202) ─────────────────────────
 // Separate from `unsupportedRenderSignatures` on purpose. A marker refusal is
 // about ONE signature and degrades that signature's geometry; a Boardsesh
@@ -422,11 +510,7 @@ export function ensureBoardseshSupportProbed(): void {
     // `getNativeModule` retries across renders and only latches its failure
     // after exhausting the budget. Once it HAS given up there will never be a
     // binary to ask, so leaving the answer at `null` strands every consumer
-    // that waits for one — notably queue-provider, whose `renderSettingsPending`
-    // gate holds back the resolved render mode (and the screenshot gate's log
-    // line) for the whole session. (That is reachable only now that the app
-    // default asks for the Boardsesh drawing: before, an unresolved answer
-    // simply meant classic.) Deferred through the probe slot for the same
+    // that waits for one. Deferred through the probe slot for the same
     // reason the real probe is: a synchronous store notification here would
     // fire during render.
     if (moduleLoadAttempted) {
@@ -447,66 +531,7 @@ export function ensureBoardseshSupportProbed(): void {
 
 export const _BOARDSESH_RENDERER_UNAVAILABLE_MESSAGE_FOR_TESTS = BOARDSESH_RENDERER_UNAVAILABLE_MESSAGE;
 
-const EMPTY_HOLD_COLOR_OVERRIDES: HoldColorOverrides = {};
-const EMPTY_HOLD_SHAPE_OVERRIDES: HoldShapeOverrides = {};
-
-/** The override set the installed renderer can actually draw, plus its signature. */
-export type EffectiveRenderOverrides = {
-  signature: string;
-  colors: HoldColorOverrides;
-  shapes: HoldShapeOverrides;
-  brushThickness: number;
-  shapeSize: number;
-};
-
-/**
- * Pick the richest override set the renderer has not refused.
- *
- * A refusal is about marker GEOMETRY — shape, size, brush — which only the
- * marker-aware binaries draw. Colours are honoured by every binary ever
- * shipped, so the fallback keeps them and drops the geometry, rather than
- * dropping the overlay entirely. Before issue #4495 the caller simply stopped
- * rendering on a refused signature, so one unsupported setting blanked the
- * holds on every climb — the opposite of the "falls back to default rendering"
- * this code has always claimed.
- *
- * The signature must stay in lock-step with the overrides it describes: it is
- * the cache key, so returning a degraded config under the full signature would
- * persist wrong pixels under a key a capable renderer later reuses.
- */
-export function resolveEffectiveRenderOverrides(
-  colors: HoldColorOverrides,
-  shapes: HoldShapeOverrides,
-  brushThickness: number,
-  shapeSize: number,
-  renderSignature: string,
-): EffectiveRenderOverrides {
-  if (!unsupportedRenderSignatures.has(renderSignature)) {
-    return { signature: renderSignature, colors, shapes, brushThickness, shapeSize };
-  }
-
-  const colorSignature = buildHoldColorOverrideSignature(colors);
-  if (colorSignature !== renderSignature && !unsupportedRenderSignatures.has(colorSignature)) {
-    return {
-      signature: colorSignature,
-      colors,
-      shapes: EMPTY_HOLD_SHAPE_OVERRIDES,
-      brushThickness: DEFAULT_HOLD_BRUSH_THICKNESS,
-      shapeSize: DEFAULT_HOLD_SHAPE_SIZE,
-    };
-  }
-
-  // Colours alone were refused too (or there were none to keep). Fall all the
-  // way back to the board's own palette — DEFAULT_HOLD_COLOR_SIGNATURE is never
-  // recorded as unsupported, so this always renders something.
-  return {
-    signature: DEFAULT_HOLD_COLOR_SIGNATURE,
-    colors: EMPTY_HOLD_COLOR_OVERRIDES,
-    shapes: EMPTY_HOLD_SHAPE_OVERRIDES,
-    brushThickness: DEFAULT_HOLD_BRUSH_THICKNESS,
-    shapeSize: DEFAULT_HOLD_SHAPE_SIZE,
-  };
-}
+export { resolveEffectiveRenderOverrides, type EffectiveRenderOverrides } from './marker-renderer-support';
 
 // FIFO, keyed on getBoardConfig's `configKey` — board identity, style, width and
 // the render signature. Sized so a screen full of preview cards can never evict
@@ -633,6 +658,8 @@ type RenderFailureNote = {
   holdMatch?: { litCount: number; unmatchedCount: number };
   /** `render_stalled` only: where the render was waiting when the watchdog fired. */
   stall?: RenderQueueSnapshot;
+  /** `paint_timeout` only: what the board looked like when the watchdog fired. */
+  paint?: { bridging: boolean; msSinceImageSweep: number | null };
 } & (
   | { stage: 'native'; failureKind: BoardRenderNativeFailureKind }
   | { stage: 'image_load'; failureKind: BoardRenderImageLoadFailureKind }
@@ -712,6 +739,8 @@ function noteRenderFailure(note: RenderFailureNote): number {
           ms_waiting: note.stall.msWaiting,
         }
       : {}),
+    // And for the paint watchdog's two fields (#7081).
+    ...(note.paint ? { bridging: note.paint.bridging, ms_since_image_sweep: note.paint.msSinceImageSweep } : {}),
   };
   // Branch rather than spread a `{ stage, failure_kind }` pair: the two are one
   // discriminated pair in `BoardRenderFailedInput`, and keeping the branch is
@@ -1017,7 +1046,10 @@ function warmupRenderedOverlaysOnce(): void {
       // File and Directory instances; File has a .name like "<key>.png".
       const name = entry.name;
       if (!name || !name.endsWith('.png')) continue;
-      if (!name.startsWith(currentVersionPrefix)) {
+      // The capability probe owns these files and may still be comparing them.
+      // Deleting its first PNG here permanently misclassifies Aura as unavailable.
+      if (name.startsWith('boardsesh-probe-')) continue;
+      if (!name.startsWith(currentVersionPrefix) || !isSprayOverlayCurrent(name.slice(0, -'.png'.length))) {
         // Stale leftover from a prior RENDERER_VERSION. Best-effort delete;
         // any failure (permissions, race with another writer) is non-fatal
         // — the file simply lingers until the OS reclaims cache space.
@@ -1029,7 +1061,9 @@ function warmupRenderedOverlaysOnce(): void {
         continue;
       }
       const cacheKey = name.slice(0, -'.png'.length);
-      cacheRenderedOverlay(cacheKey, entry.uri);
+      // The listing's URI is percent-encoded on Android (`1,2,3` -> `1%2C2%2C3`);
+      // index the form the renderer returns, so one file has one URI (#7026).
+      cacheRenderedOverlay(cacheKey, rendererOverlayUri(entry.uri));
     }
   } catch {
     // Filesystem errors at startup shouldn't break the app — the hook's
@@ -1049,9 +1083,18 @@ onOverlayCacheHydrated(() => {
   warmupRenderedOverlaysOnce();
 });
 
+/**
+ * Set once the first native render of this JS lifetime has resolved and the
+ * index has been checked against the directory (issue #5882). Both native
+ * modules prune `board-thumbnails` once per launch, inside that first render and
+ * after the warm-up above indexed it, without telling JS what they deleted.
+ */
+let reconciledAfterNativePrune = false;
+
 /** Test-only handle for re-running the warm-up against a fresh mock list. */
 export function _resetWarmupForTests(): void {
   warmupRun = false;
+  reconciledAfterNativePrune = false;
   // Board hold ids are memoised per board key, so a suite that swaps what
   // `getBoardRenderData` returns for the SAME board would otherwise keep
   // matching against the previous fixture's holds.
@@ -1079,6 +1122,7 @@ export function getOrStartInflightRender(
   cacheKey: string,
   startRender: () => Promise<string>,
 ): Promise<RenderedOverlayEntry> {
+  if (!isSprayOverlayCurrent(cacheKey)) return Promise.reject(new RenderCancelledError(cacheKey));
   const existing = inflightRenders.get(cacheKey);
   if (existing) return existing;
 
@@ -1091,7 +1135,35 @@ export function getOrStartInflightRender(
     }
   }
 
-  const promise = startRender().then((uri) => cacheRenderedOverlay(cacheKey, uri));
+  const promise = startRender().then((uri) => {
+    if (!isSprayOverlayCurrent(cacheKey)) {
+      deleteOverlayCacheEntry(uri);
+      throw new RenderCancelledError(cacheKey);
+    }
+    // The watermark is taken before this result goes in: the file native just
+    // wrote is on disk, and only what the index held before the prune is suspect.
+    const generationBeforeFirstRender = reconciledAfterNativePrune ? null : getOverlayGenerationWatermark();
+    const entry = cacheRenderedOverlay(cacheKey, uri);
+    if (generationBeforeFirstRender !== null) {
+      reconciledAfterNativePrune = true;
+      void reconcileOverlayIndexWithDisk(generationBeforeFirstRender)
+        .then((forgottenKeys) => {
+          // Rides along on any later board-render report, so a BOARDSESH-DR event
+          // after release shows whether this launch's prune left dead keys behind.
+          addErrorBreadcrumb({
+            category: 'board-render',
+            message: 'Overlay index checked after native prune',
+            level: 'info',
+            data: { forgottenKeys },
+          });
+        })
+        .catch(() => {
+          // Best-effort: an index left unreconciled still recovers each dead key
+          // through the cache_entry_missing re-render, as it did before.
+        });
+    }
+    return entry;
+  });
   inflightRenders.set(cacheKey, promise);
   // Run cleanup as a detached handler so it doesn't change the promise
   // returned to callers, and so callers that only attach .then can still
@@ -1115,7 +1187,7 @@ export { _renderedOverlaysForTests };
 export const _cacheRenderedOverlayForTests = cacheRenderedOverlay;
 export const _getRenderedOverlayForTests = getRenderedOverlay;
 export const _invalidateRenderedOverlayForTests = invalidateRenderedOverlay;
-export const _unsupportedRenderSignaturesForTests = unsupportedRenderSignatures;
+export { _unsupportedRenderSignaturesForTests } from './marker-renderer-support';
 export const _markRenderSignatureUnsupportedForTests = markRenderSignatureUnsupported;
 export const _MARKER_RENDERER_UNAVAILABLE_MESSAGE_FOR_TESTS = MARKER_RENDERER_UNAVAILABLE_MESSAGE;
 
@@ -1420,7 +1492,7 @@ export function buildCacheKey(
   // For a wall it is `-sv<version>`, and it has to be here rather than folded
   // into `sizeId` — a wall's size id is its layout id forever, and encoding the
   // version there would leak into `compatible_size_ids`, the offline key,
-  // `board_sessions.board_path` and share URLs (`docs/spray-walls.md`). Drop this
+  // `board_sessions.board_path` and share URLs (`docs/product/spray-walls.md`). Drop this
   // token and a reset serves the previous generation's overlay over the new
   // photo, which is the whole failure this exists to prevent.
   //
@@ -1446,7 +1518,8 @@ export function buildCacheKey(
   // `_{boardName}_{layoutId}_{sizeId}_` run `overlayNameMatchesScope` reaps by
   // are both upstream of it and stay intact.
   const boardArt = boardArtPending ? '_geopending' : '';
-  return `v${RENDERER_VERSION}_${style}_w${width}_${boardName}_${layoutId}_${sizeId}_${canonicalSetIds}${spray}_${framesHash}${boardArt}`;
+  const privacy = boardName === 'spray' ? `_pg${sprayPrivacyGeneration(layoutId)}` : '';
+  return `v${RENDERER_VERSION}_${style}_w${width}_${boardName}_${layoutId}_${sizeId}_${canonicalSetIds}${spray}_${framesHash}${boardArt}${privacy}`;
 }
 
 /**
@@ -1544,18 +1617,19 @@ function getBoardConfig(
     const stateMap = HOLD_STATE_MAP[boardName];
     const holdStateMap: Record<number, { color: string; render_style?: string; shape?: string; role?: string }> = {};
     for (const [codeStr, stateInfo] of Object.entries(stateMap)) {
-      const shape = getEffectiveHoldStateShape(stateInfo.name, shapeOverrides);
       // The glyph vocabulary covers four roles; MoonBoard's AUX and the Tycho
       // colour-mode codes have no glyph and are left without a role rather than
       // handed one the renderer would draw wrong.
       const role = boardsesh && BOARDSESH_GLYPH_ROLES.has(stateInfo.name) ? stateInfo.name.toLowerCase() : undefined;
       // `colorOverrides` is the climber's own map on every real surface, and a
       // palette card's map on the colour-vision rail — substituted upstream, in
-      // the hook, so this point never has to know which it got.
-      const resolvedColor = getEffectiveHoldStateColor(
-        stateInfo.name,
-        getHoldDisplayColor(stateInfo, boardsesh ? 'aura' : 'classic'),
+      // the hook, so this point never has to know which it got. The active-holds
+      // line under the board resolves its markers through the same helper.
+      const { color: resolvedColor, shape } = resolveHoldStateMarker(
+        stateInfo,
+        boardsesh ? 'aura' : 'classic',
         colorOverrides,
+        shapeOverrides,
       );
       holdStateMap[Number(codeStr)] = {
         color: resolvedColor,
@@ -1809,6 +1883,14 @@ function isNativeRendererUnavailable(): boolean {
  * and the component shows backgrounds alone.
  */
 export function useNativeClimbRender(params: NativeClimbRenderParams): NativeClimbRenderResult {
+  const credentialGeneration = useSyncExternalStore(
+    subscribeToCredentialChanges,
+    getCredentialGeneration,
+    getCredentialGeneration,
+  );
+  // A later render does not authorize the old row projection again.
+  // Conservatively retire its handoff source for the rest of this hook's life.
+  const artworkCredentialGeneration = useRef(credentialGeneration).current;
   const {
     frames,
     boardName,
@@ -1819,19 +1901,31 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     renderWidth,
     backgroundVariant,
     renderSettingsOverride,
+    renderStyleOverride,
     holdColorOverride,
     verifyOverlayFile = false,
     playSurface = false,
+    gpuSurface = false,
+    gpuCatalogueNative = false,
+    gpuApiVersion = 0,
+    gpuAllowEmpty = false,
+    bareWall = false,
+    gpuFallbackConfigJson,
+    gpuPresentedConfigJson,
+    gpuHedgeCacheKey = null,
+    cachedOnlyOnceGpuWarm = false,
+    paintBridgingRef,
     prefetch = false,
     maxVeilOpacity,
+    fieldColorOverride,
     extraHoldStates,
     markStyleOverride,
   } = params;
   const {
     overrides: storedHoldColorOverrides,
-    shapes: holdShapeOverrides,
-    brushThickness,
-    shapeSize,
+    shapes: storedHoldShapeOverrides,
+    brushThickness: storedBrushThickness,
+    shapeSize: storedShapeSize,
     renderSignature: storedHoldRenderSignature,
   } = useHoldColorOverrides();
 
@@ -1841,18 +1935,29 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
   // cache key rather than painting palette pixels under the stored colours' key.
   // `{}` is a real value ("the board's own palette"), so the test is against
   // `undefined` rather than a truthiness check on an object that may be empty.
-  const holdColorOverrides = holdColorOverride ?? storedHoldColorOverrides;
+  const holdColorOverrides = renderStyleOverride?.holds.overrides ?? holdColorOverride ?? storedHoldColorOverrides;
+  const holdShapeOverrides = renderStyleOverride?.holds.shapes ?? storedHoldShapeOverrides;
+  const brushThickness = renderStyleOverride?.holds.brushThickness ?? storedBrushThickness;
+  const shapeSize = renderStyleOverride?.holds.shapeSize ?? storedShapeSize;
   const holdRenderSignature = useMemo(
     () =>
-      holdColorOverride === undefined
+      renderStyleOverride === undefined && holdColorOverride === undefined
         ? storedHoldRenderSignature
         : buildHoldRenderOverrideSignature({
-            colors: holdColorOverride,
+            colors: holdColorOverrides,
             shapes: holdShapeOverrides,
             brushThickness,
             shapeSize,
           }),
-    [holdColorOverride, storedHoldRenderSignature, holdShapeOverrides, brushThickness, shapeSize],
+    [
+      renderStyleOverride,
+      holdColorOverride,
+      holdColorOverrides,
+      storedHoldRenderSignature,
+      holdShapeOverrides,
+      brushThickness,
+      shapeSize,
+    ],
   );
 
   // Collapse a multi-frame route/circuit string to one static union snapshot —
@@ -1865,6 +1970,8 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
   // snapshots (PlayDrawer -> SwipeBoardCarousel -> BoardImageNative) are
   // comma-free, x-free `p{id}r{code}` strings and also pass through unchanged.
   const flatFrames = useMemo(() => toFlatFrames(frames, boardName), [frames, boardName]);
+  // Whether there is an overlay to render: lit holds, or the bare wall's veil.
+  const rendersOverlay = flatFrames !== '' || bareWall;
 
   // Small surfaces that pass a renderWidth want the bundled thumb-sized
   // background too, so neither the overlay nor the photo is a large source the
@@ -1921,7 +2028,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
   // in the cache key rather than painting preset pixels under the stored
   // settings' key.
   const { settings: storedRenderSettings } = useBoardRenderSettings();
-  const baseRenderSettings = renderSettingsOverride ?? storedRenderSettings;
+  const baseRenderSettings = renderStyleOverride?.settings ?? renderSettingsOverride ?? storedRenderSettings;
   // A mark-style override asks for the Aura drawing with that mark, whatever
   // mode the climber picked: the heatmap's fill has no classic counterpart. The
   // capability probe below still decides whether the binary can draw it.
@@ -1943,21 +2050,32 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     getBoardseshSupportRevision,
     getBoardseshSupportRevision,
   );
-  // Two native renders per launch, so only for someone whose settings or
-  // rollout flag ask for the mode.
-  if (requestedBoardRenderMode(boardRenderSettings) === 'aura') {
+  // The board's own stored look — a spray wall's, `null` for every catalogue
+  // board. A preview card's bundle and a heatmap's mark override are asking for
+  // one specific drawing, so the wall's look never applies to them.
+  const boardRenderDefault = useBoardRenderDefault(boardName, layoutId, {
+    hasSettingsOverride: renderStyleOverride !== undefined || renderSettingsOverride !== undefined,
+    hasMarkStyleOverride: markStyleOverride !== undefined,
+  });
+  // Two native renders per launch, so only for someone whose settings — or
+  // whose board's stored look — ask for the mode.
+  if (requestedBoardRenderMode(boardRenderSettings, boardRenderDefault) === 'aura') {
     ensureBoardseshSupportProbed();
   }
 
   const effectiveRenderSettings = useMemo(() => {
     void boardseshSupportTick;
-    return resolveEffectiveRenderSettings(boardRenderSettings, getBoardseshRendererSupport() === true);
-  }, [boardRenderSettings, boardseshSupportTick]);
+    return resolveEffectiveRenderSettings(
+      boardRenderSettings,
+      getBoardseshRendererSupport() === true,
+      boardRenderDefault,
+    );
+  }, [boardRenderSettings, boardseshSupportTick, boardRenderDefault]);
 
   // The play field the veil washes toward. Baked into the PNG, so it is part of
   // the cache key: a light-mode overlay reused in dark mode would show a wall
   // the veil never quieted.
-  const fieldColor = boardFieldColorForScheme(colorScheme);
+  const fieldColor = fieldColorOverride ?? boardFieldColorForScheme(colorScheme);
   const veilOpacity = useMemo(() => {
     if (effectiveRenderSettings.mode !== 'aura') return 0;
     const resolved = resolveVeilOpacity(
@@ -1970,10 +2088,14 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     // (which encodes this exact number) stays shared with the uncapped surfaces.
     return maxVeilOpacity != null ? Math.min(resolved, maxVeilOpacity) : resolved;
   }, [effectiveRenderSettings, boardName, layoutId, sizeId, fieldColor, maxVeilOpacity]);
-  const boardRenderSignature = useMemo(
-    () => buildBoardRenderSignature(effectiveRenderSettings, fieldColor, veilOpacity),
-    [effectiveRenderSettings, fieldColor, veilOpacity],
-  );
+  const boardRenderSignature = useMemo(() => {
+    const signature = buildBoardRenderSignature(effectiveRenderSettings, fieldColor, veilOpacity);
+    // A cutout base can change even with the veil off. Keep opening snapshots
+    // and GPU/PNG identities scoped to the explicit host ground as well.
+    return fieldColorOverride === undefined
+      ? signature
+      : `${signature}.field-${fieldColor.replace('#', '').toLowerCase()}`;
+  }, [effectiveRenderSettings, fieldColor, veilOpacity, fieldColorOverride]);
 
   // Marker overrides (colours included — a palette card's substituted map is
   // already inside `effectiveOverrideSignature`) and render mode are independent
@@ -2079,6 +2201,162 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
   // background-paths effect. Kept in sync with the strings that feed the keys.
   const setIdsArray = useMemo(() => setIds.split(',').map(Number).filter(Boolean), [setIds]);
 
+  const gpuRenderWidth = auraGpuRenderWidth(gpuCatalogueNative, renderWidth);
+  const gpuStaticConfig = useMemo(() => {
+    if (
+      !gpuSurface ||
+      filledStyle ||
+      prefetch ||
+      !supportsAuraGpu({ boardName, layoutId, catalogueNative: gpuCatalogueNative }) ||
+      effectiveRenderSettings.mode !== 'aura' ||
+      effectiveRenderSettings.boardsesh.softDisc ||
+      effectiveRenderSettings.boardsesh.markStyle === 'fill' ||
+      effectiveRenderSettings.boardsesh.markStyle === 'glow-fill' ||
+      extraHoldStates ||
+      boardArtChunkPending
+    )
+      return null;
+    const holdIds = getBoardHoldIds(boardName, layoutId, sizeId, setIds, setIdsArray);
+    if (!holdIds) return null;
+    const boardConfig = getBoardConfig(
+      boardName,
+      layoutId,
+      sizeId,
+      setIds,
+      false,
+      gpuRenderWidth,
+      effectiveOverrides.colors,
+      effectiveOverrides.shapes,
+      effectiveOverrides.brushThickness,
+      effectiveOverrides.shapeSize,
+      configRenderSignature,
+      {
+        settings: effectiveRenderSettings.boardsesh,
+        glowFalloff: effectiveRenderSettings.glowFalloff,
+        fieldColor,
+        veilOpacity,
+      },
+      holdIds,
+    );
+    if (!boardConfig) return null;
+    const roleMap = boardConfig.configBase.hold_state_map as Record<number, unknown>;
+    const holdStateMap = gpuCatalogueNative
+      ? roleMap
+      : Object.fromEntries([42, 43, 44, 45].map((code) => [code, roleMap[code]]));
+    const roleCodes = Object.keys(holdStateMap).map(Number);
+    const width = Number(boardConfig.configBase.output_width);
+    const height = Math.round(
+      (width * Number(boardConfig.configBase.board_height)) / Number(boardConfig.configBase.board_width),
+    );
+    if (
+      !supportsAuraGpu({
+        boardName,
+        layoutId,
+        catalogueNative: gpuCatalogueNative,
+        width,
+        height,
+        holdCount: holdIds.size,
+        roleCodes,
+        markStyle:
+          typeof boardConfig.configBase.mark_style === 'string' ? boardConfig.configBase.mark_style : undefined,
+      })
+    )
+      return null;
+    return {
+      holdIds,
+      roleCodes,
+      json: JSON.stringify({
+        ...boardConfig.configBase,
+        hold_state_map: holdStateMap,
+        frames: '',
+        geometry_cache_scope: `${boardName}/${layoutId}-${sizeId}`,
+      }),
+    };
+  }, [
+    gpuSurface,
+    gpuCatalogueNative,
+    filledStyle,
+    prefetch,
+    boardName,
+    layoutId,
+    sizeId,
+    setIds,
+    setIdsArray,
+    gpuRenderWidth,
+    effectiveRenderSettings,
+    effectiveOverrides,
+    configRenderSignature,
+    fieldColor,
+    veilOpacity,
+    extraHoldStates,
+    boardArtChunkPending,
+  ]);
+  const gpuFailureStatus = useGpuFailureStatus(gpuStaticConfig?.json ?? null, gpuApiVersion);
+  const gpuConfigJson = useMemo(() => {
+    if (
+      gpuFailureStatus !== 'allowed' ||
+      (!flatFrames && !gpuAllowEmpty) ||
+      !gpuStaticConfig ||
+      gpuStaticConfig.json === gpuFallbackConfigJson
+    )
+      return null;
+    const rolesSupported = supportsAuraGpu({
+      boardName,
+      layoutId,
+      catalogueNative: gpuCatalogueNative,
+      roleCodes: gpuStaticConfig.roleCodes,
+      frames: flatFrames,
+    });
+    if (!rolesSupported) return null;
+    const litIds = parseLitHoldIds(flatFrames);
+    if (litIds.size > 0 && ![...litIds].some((holdId) => gpuStaticConfig.holdIds.has(holdId))) return null;
+    return gpuStaticConfig.json;
+  }, [
+    gpuStaticConfig,
+    flatFrames,
+    gpuAllowEmpty,
+    gpuFallbackConfigJson,
+    boardName,
+    layoutId,
+    gpuCatalogueNative,
+    gpuFailureStatus,
+  ]);
+
+  // A stationary carousel must wait for geometry/capability discovery rather
+  // than permanently latching its PNG fallback during the first render.
+  const gpuStatus: 'loading' | 'unavailable' | 'ready' = gpuConfigJson
+    ? 'ready'
+    : gpuSurface &&
+        (!!flatFrames || gpuAllowEmpty) &&
+        requestedBoardRenderMode(boardRenderSettings, boardRenderDefault) === 'aura' &&
+        (boardArtChunkPending || getBoardseshRendererSupport() === null || gpuFailureStatus === 'loading')
+      ? 'loading'
+      : 'unavailable';
+
+  // Names the live GPU drawing (everything `gpuStaticConfig` is built from) in
+  // a short string, for the process-warm registry: O(1) to look up, unlike the
+  // config JSON itself.
+  const gpuWarmKey = useMemo(
+    () =>
+      gpuSurface || cachedOnlyOnceGpuWarm
+        ? [boardName, layoutId, sizeId, setIds, gpuRenderWidth, configRenderSignature].join('|')
+        : null,
+    [gpuSurface, cachedOnlyOnceGpuWarm, boardName, layoutId, sizeId, setIds, gpuRenderWidth, configRenderSignature],
+  );
+  // Whether this board's current wait for a GPU frame began before the drawing
+  // was warm in this process. Read once per climb and drawing, then held: a
+  // board that started cold keeps rendering its PNG even if a frame presents
+  // meanwhile, so a state change never withdraws a render already asked for.
+  // Cleared once this board shows the drawing, so the next wait (a return from
+  // the background) reads the registry afresh.
+  const gpuColdLatchRef = useRef<{ cacheKey: string; warmKey: string; cold: boolean } | null>(null);
+  if (!gpuSurface || gpuWarmKey === null || (gpuConfigJson !== null && gpuConfigJson === gpuPresentedConfigJson)) {
+    gpuColdLatchRef.current = null;
+  } else if (gpuColdLatchRef.current?.cacheKey !== currentCacheKey || gpuColdLatchRef.current.warmKey !== gpuWarmKey) {
+    gpuColdLatchRef.current = { cacheKey: currentCacheKey, warmKey: gpuWarmKey, cold: !isGpuConfigWarm(gpuWarmKey) };
+  }
+  const gpuProcessCold = gpuColdLatchRef.current?.cold ?? false;
+
   // Seed both pieces of state synchronously so the first paint already
   // shows whatever's available. Backgrounds in production are usually
   // available on the first frame (Asset.localUri pre-populated); the
@@ -2088,12 +2366,46 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     const existing = getRenderedOverlay(currentCacheKey);
     return existing ? { key: currentCacheKey, entry: existing, loadAttempt: 0 } : null;
   });
+  // A recycled list row keeps this hook instance and hands it a new climb. Left
+  // to the effect below, an overlay that is ALREADY in the index reaches state
+  // one commit late: the row first commits with no overlay at all (the key guard
+  // on `overlayUri`), then commits again with it, and the image fades up from
+  // nothing. That is a bare board followed by the holds flashing in on every
+  // recycled row of a scroll, for a picture that was on disk the whole time.
+  // Adopting the entry during render (React re-runs this render before it
+  // commits anything) lands the new climb's holds in the same commit as its name.
+  //
+  // `overlayArrivalRef` records, once per key, whether the overlay was there the
+  // moment this surface took the climb. The view layer skips the cross-fade when
+  // it was: nothing was ever shown without the holds, so there is nothing to
+  // fade from.
+  //
+  // Only on a key CHANGE. State for the current key can legitimately hold no
+  // overlay while the index still has one — a decode that failed for good
+  // withholds its entry on purpose — and re-adopting on every render would put
+  // that failed image straight back.
+  const overlayArrivalRef = useRef<{ key: string; immediate: boolean } | null>(null);
+  if (overlayArrivalRef.current === null) {
+    // First render of this instance: the state initializer consulted the index.
+    overlayArrivalRef.current = {
+      key: currentCacheKey,
+      immediate: nativeRender?.key === currentCacheKey && nativeRender.entry != null,
+    };
+  } else if (overlayArrivalRef.current.key !== currentCacheKey) {
+    const existing = rendersOverlay ? getRenderedOverlay(currentCacheKey) : undefined;
+    overlayArrivalRef.current = { key: currentCacheKey, immediate: existing !== undefined };
+    if (existing) setNativeRender({ key: currentCacheKey, entry: existing, loadAttempt: 0 });
+  }
   const [verifiedOverlay, setVerifiedOverlay] = useState<{
     cacheKey: string;
     uri: string;
     loadKey: string;
   } | null>(null);
   const [recoveryRequest, setRecoveryRequest] = useState(0);
+  // The cache key the overlay effect last gave up on; see `overlayUnavailable`
+  // on the result. Keyed, so a recycled row's next climb starts clean.
+  const [unavailableOverlayKey, setUnavailableOverlayKey] = useState<string | null>(null);
+  const [failedOverlayKey, setFailedOverlayKey] = useState<string | null>(null);
   // Mirrors the module-level give-up so it can drive a re-render; see the
   // `!nativeModule` branch in the overlay effect.
   const [rendererGaveUp, setRendererGaveUp] = useState(isNativeRendererUnavailable);
@@ -2109,6 +2421,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     key: string;
     paths: string[];
     missingCount: number;
+    settled: boolean;
   } | null>(() => {
     const sync = tryGetBackgroundPathsSync({
       boardName,
@@ -2119,7 +2432,12 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
       colorScheme,
     });
     if (!sync) return null;
-    return { key: currentBoardKey, paths: sync.paths, missingCount: sync.missingCount };
+    return {
+      key: currentBoardKey,
+      paths: sync.paths,
+      missingCount: sync.missingCount,
+      settled: sync.missingCount === 0,
+    };
   });
 
   const mountedRef = useRef(true);
@@ -2170,7 +2488,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     // `frames`, not `frames.length`: the memo only captures the length, but the
     // effect below already depends on the whole string, so keying on the length
     // would save nothing and would put a `.length` dep in a hot hook — the one
-    // shape docs/react-native-performance.md tells reviewers to reject.
+    // shape docs/mobile/react-native-performance.md tells reviewers to reject.
     [boardName, layoutId, sizeId, effectiveRenderSettings, filledStyle, playSurface, prefetch, renderWidth, frames],
   );
 
@@ -2205,6 +2523,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
           key: currentBoardKey,
           paths: sync.paths,
           missingCount: sync.missingCount,
+          settled: sync.missingCount === 0,
         });
       }
     }
@@ -2234,6 +2553,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
         // + first-path comparison is sufficient.
         if (
           prev?.key === currentBoardKey &&
+          prev.settled &&
           prev.missingCount === resolved.missingCount &&
           prev.paths.length === resolved.paths.length &&
           prev.paths[0] === resolved.paths[0]
@@ -2244,6 +2564,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
           key: currentBoardKey,
           paths: resolved.paths,
           missingCount: resolved.missingCount,
+          settled: true,
         };
       });
     })();
@@ -2275,7 +2596,19 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     // effectiveOverrideSignature has already stepped away from anything the
     // renderer refused, so this only trips on the pathological case where the
     // fallback itself was somehow recorded.
-    if (!flatFrames || unsupportedRenderSignatures.has(effectiveOverrideSignature)) return;
+    setFailedOverlayKey((failedKey) => (failedKey === currentCacheKey ? null : failedKey));
+    // The board already shows this configuration's GPU drawable: it stays on
+    // screen until the next frame presents, so there is nothing for a PNG to do.
+    if (gpuConfigJson && gpuConfigJson === gpuPresentedConfigJson) return;
+    // A v2 GPU binary has Aura support, but the ordinary capability probe may
+    // still be resolving on first mount. Do not launch a competing classic PNG.
+    if (
+      gpuSurface &&
+      requestedBoardRenderMode(boardRenderSettings, boardRenderDefault) === 'aura' &&
+      getBoardseshRendererSupport() === null
+    )
+      return;
+    if (!rendersOverlay || isRenderSignatureUnsupported(effectiveOverrideSignature)) return;
 
     // The lit placement ids the renderer will actually draw, parsed ONCE: the
     // hold-match check right below needs them, and so does the Aura outline
@@ -2350,6 +2683,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
           // effect ever runs, so a stale entry is already on screen by now.
           // Dropping it from the index alone would leave it painted.
           setNativeRender((previous) => (previous?.key === currentCacheKey ? null : previous));
+          setUnavailableOverlayKey(currentCacheKey);
           return;
         }
         // A partial match still draws: a climb that legitimately reaches past a
@@ -2415,6 +2749,22 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
       return;
     }
 
+    // GPU first: once the drawing is warm in this process, a pending GPU request
+    // is the first and only overlay. The cache read above is a free bridge; a
+    // render is not, so it waits until the caller hedges this exact key (the
+    // GPU missed its grace period). While the drawing is process-cold the PNG
+    // renders at once, as it always did: a first presentation takes most of a
+    // second. A native failure drops `gpuConfigJson` and the status leaves
+    // `loading`, so the PNG path starts on the very next run.
+    if (
+      gpuSurface &&
+      (gpuConfigJson !== null || gpuStatus === 'loading') &&
+      !gpuProcessCold &&
+      gpuHedgeCacheKey !== currentCacheKey
+    )
+      return;
+    if (cachedOnlyOnceGpuWarm && gpuWarmKey !== null && isGpuConfigWarm(gpuWarmKey)) return;
+
     const nativeModule = getNativeModule();
     if (!nativeModule) {
       // `getNativeModule` retries per CALL and latches its failure only once the
@@ -2463,11 +2813,15 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
       litHoldIds,
       extraHoldStates,
     );
-    if (!boardConfig) return;
+    if (!boardConfig) {
+      setUnavailableOverlayKey(currentCacheKey);
+      return;
+    }
     // Backed off after a full-disk failure: the write cannot succeed, and every
     // recycled row retrying it is what turned one out-of-space device into 50
     // Sentry events in 50 minutes. Overlay stays null; backgrounds still show.
     if (isDiskPressureLatched()) {
+      setUnavailableOverlayKey(currentCacheKey);
       // Come back once when the latch lifts. A list scrolls and remounts rows,
       // so it recovers on its own; a stationary play view never re-runs this
       // effect, and would sit with no overlay for the rest of the mount even
@@ -2647,6 +3001,8 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
             renderRetryTimerRef.current = null;
             if (mountedRef.current) setRecoveryRequest((request) => request + 1);
           }, RENDER_RETRY_DELAY_MS);
+        } else if (kind === 'render_failed' && mountedRef.current && latestCacheKeyRef.current === currentCacheKey) {
+          setFailedOverlayKey(currentCacheKey);
         }
       });
 
@@ -2672,10 +3028,19 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     currentCacheKey,
+    gpuConfigJson,
+    gpuPresentedConfigJson,
+    gpuSurface,
+    gpuStatus,
+    gpuHedgeCacheKey,
+    gpuProcessCold,
+    cachedOnlyOnceGpuWarm,
+    gpuWarmKey,
     // Redundant with `currentCacheKey`, which carries the `_geopending` token —
     // listed so the branch's own input is visible where the effect declares it.
     boardArtChunkPending,
     flatFrames,
+    rendersOverlay,
     boardName,
     layoutId,
     sizeId,
@@ -2718,14 +3083,55 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
    *
    * Arming on the mount rather than on `overlayUri` is the whole correctness
    * argument. `LayeredClimbImage` renders a bare `<View>` and no image at all
-   * while the app is backgrounded or the tab's board art is released (opening
-   * `/play` does exactly that to every other surface). Nothing then fires
+   * while the app is backgrounded or the tab's board art is released (an
+   * inactive iPad tab, including any tab the player is not open over). Nothing then fires
    * `onLoad` — there is nothing there to fire it — so a watchdog armed on the
    * URI would report silence from a surface that was never asked to paint, and
    * a backgrounded app's timers would land on resume before the remount.
    *
    * `playSurface` gates it to the one board a climber is actually waiting on.
+   * It is read through a ref so this callback keeps one identity: the view
+   * layer calls it from an effect, and a new identity would re-run that effect
+   * and report the SAME image as newly mounted. That matters since the play
+   * carousel keeps the neighbouring climbs' boards mounted and makes one of them
+   * the play surface when it is swiped onto. Its overlay painted long before;
+   * a watchdog armed then would wait four seconds for an `onLoad` that already
+   * happened and report a paint that never failed.
    */
+  const playSurfaceRef = useRef(playSurface);
+  playSurfaceRef.current = playSurface;
+  // Through a ref like the telemetry context above, so the watchdog's callback
+  // keeps one identity and reads whatever the view layer wrote last.
+  const paintBridgingSourceRef = useRef(paintBridgingRef);
+  paintBridgingSourceRef.current = paintBridgingRef;
+  // The overlay image that is mounted now, and whether expo-image has answered
+  // for it. The view layer reports a mount from a layout effect, inside the
+  // commit that mounts the image, so nothing that image fires can reach JS
+  // ahead of the report. An answer for anything else is from an image that is
+  // gone, and says nothing about the one that is here.
+  const mountedOverlayRef = useRef<{ loadKey: string; answered: boolean } | null>(null);
+  const noteOverlayAnswered = useCallback((emittingLoadKey: string | null) => {
+    if (mountedOverlayRef.current?.loadKey === emittingLoadKey) mountedOverlayRef.current.answered = true;
+  }, []);
+  const armPaintWatchdog = useCallback((loadKey: string) => {
+    const timer = setTimeout(() => {
+      paintWatchdogRef.current = null;
+      if (!mountedRef.current) return;
+      // eslint-disable-next-line no-console
+      console.warn(`[useNativeClimbRender] overlay never painted within ${OVERLAY_PAINT_TIMEOUT_MS}ms`);
+      noteRenderFailure({
+        stage: 'image_load',
+        failureKind: 'paint_timeout',
+        errorCode: 'paint_timeout',
+        context: failureTelemetryContextRef.current,
+        paint: {
+          bridging: paintBridgingSourceRef.current?.current ?? false,
+          msSinceImageSweep: msSinceImageMemorySweep(),
+        },
+      });
+    }, OVERLAY_PAINT_TIMEOUT_MS);
+    paintWatchdogRef.current = { loadKey, timer };
+  }, []);
   const onOverlayMounted = useCallback(
     (mountedLoadKey: string | null) => {
       const pending = paintWatchdogRef.current;
@@ -2733,23 +3139,32 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
         clearTimeout(pending.timer);
         paintWatchdogRef.current = null;
       }
-      if (!playSurface || mountedLoadKey === null) return;
-      const timer = setTimeout(() => {
-        paintWatchdogRef.current = null;
-        if (!mountedRef.current) return;
-        // eslint-disable-next-line no-console
-        console.warn(`[useNativeClimbRender] overlay never painted within ${OVERLAY_PAINT_TIMEOUT_MS}ms`);
-        noteRenderFailure({
-          stage: 'image_load',
-          failureKind: 'paint_timeout',
-          errorCode: 'paint_timeout',
-          context: failureTelemetryContextRef.current,
-        });
-      }, OVERLAY_PAINT_TIMEOUT_MS);
-      paintWatchdogRef.current = { loadKey: mountedLoadKey, timer };
+      if (mountedLoadKey === null) {
+        mountedOverlayRef.current = null;
+        return;
+      }
+      // Whatever mounts, even the same file again, has to answer for itself.
+      mountedOverlayRef.current = { loadKey: mountedLoadKey, answered: false };
+      if (!playSurfaceRef.current) return;
+      armPaintWatchdog(mountedLoadKey);
     },
-    [playSurface],
+    [armPaintWatchdog],
   );
+  // A board can become the play surface, or stop being it, while its overlay
+  // image stays mounted. Start watching one that has not answered yet; stop
+  // watching when the climber is no longer looking at this board.
+  useEffect(() => {
+    const pending = paintWatchdogRef.current;
+    if (!playSurface) {
+      if (pending) {
+        clearTimeout(pending.timer);
+        paintWatchdogRef.current = null;
+      }
+      return;
+    }
+    const mounted = mountedOverlayRef.current;
+    if (mounted && !mounted.answered && !pending) armPaintWatchdog(mounted.loadKey);
+  }, [playSurface, armPaintWatchdog]);
 
   // The view layer's mount effect disarms on its own teardown, but only while it
   // is mounted at all. This covers the hook outliving nothing — a surface that
@@ -2770,6 +3185,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
       // Before the key-match guards below: a paint is a paint, and the watchdog
       // only ever asks whether expo-image answered.
       clearPaintWatchdog(emittingLoadKey);
+      noteOverlayAnswered(emittingLoadKey);
       const expected = nativeRenderRef.current;
       if (
         !isLoadedNativeRender(expected) ||
@@ -2785,7 +3201,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
         retryBudgetRef.current.used = 0;
       }
     },
-    [currentCacheKey, clearPaintWatchdog],
+    [currentCacheKey, clearPaintWatchdog, noteOverlayAnswered],
   );
 
   const onOverlayError = useCallback(
@@ -2795,6 +3211,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
       // unconditional clear let that stale answer cancel the new image's watch —
       // silencing the very case the watchdog exists to catch.
       clearPaintWatchdog(emittingLoadKey);
+      noteOverlayAnswered(emittingLoadKey);
       // expo-image's message names the file it could not load, so it is bucketed
       // to a closed set of codes before it goes anywhere. `png` here means the
       // decoder said so, not that a filename happened to end in `.png`.
@@ -2819,6 +3236,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
         // existing file as a terminal decode failure.
         if (retryBudgetRef.current.key !== expected.key || retryBudgetRef.current.used >= 1) {
           reportOverlayLoadFailure({ kind: 'retry_exhausted', errorCode, context: failureTelemetryContext });
+          setFailedOverlayKey(expected.key);
           setNativeRender((previous) => (isExactNativeRender(previous, expected) ? null : previous));
           return;
         }
@@ -2840,6 +3258,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
         entryExists = overlayCacheEntryExists(expectedEntry.uri);
       } catch {
         reportOverlayLoadFailure({ kind: 'validation_failed', errorCode, context: failureTelemetryContext });
+        setFailedOverlayKey(expected.key);
         setNativeRender((previous) => (isExactNativeRender(previous, expected) ? null : previous));
         return;
       }
@@ -2857,6 +3276,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
             errorCode,
             context: failureTelemetryContext,
           });
+          setFailedOverlayKey(expected.key);
           setNativeRender((previous) => (isExactNativeRender(previous, expected) ? null : previous));
           return;
         }
@@ -2878,6 +3298,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
       // every unsupported image into a render loop.
       if (entryExists === null) {
         reportOverlayLoadFailure({ kind: 'validation_unsupported', errorCode, context: failureTelemetryContext });
+        setFailedOverlayKey(expected.key);
         setNativeRender((previous) => (isExactNativeRender(previous, expected) ? null : previous));
         return;
       }
@@ -2889,6 +3310,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
           errorCode,
           context: failureTelemetryContext,
         });
+        setFailedOverlayKey(expected.key);
         setNativeRender((previous) => (isExactNativeRender(previous, expected) ? null : previous));
         return;
       }
@@ -2924,7 +3346,7 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
       );
       setRecoveryRequest((request) => request + 1);
     },
-    [currentCacheKey, failureTelemetryContext, clearPaintWatchdog],
+    [currentCacheKey, failureTelemetryContext, clearPaintWatchdog, noteOverlayAnswered],
   );
 
   const verifyOverlayForNativeUse = useCallback(
@@ -2957,9 +3379,9 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
   // Only surface the native URI if it matches the *current* cache key —
   // a stale render (from before a prop change) would otherwise show.
   const candidateOverlayUri =
-    flatFrames && nativeRender?.key === currentCacheKey ? (nativeRender.entry?.uri ?? null) : null;
+    rendersOverlay && nativeRender?.key === currentCacheKey ? (nativeRender.entry?.uri ?? null) : null;
   const overlayLoadKey =
-    flatFrames && nativeRender?.key === currentCacheKey && nativeRender.entry
+    rendersOverlay && nativeRender?.key === currentCacheKey && nativeRender.entry
       ? `${nativeRender.entry.generation}:${nativeRender.loadAttempt}`
       : null;
   const verifiedOverlayFile =
@@ -2999,15 +3421,145 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
   // (FlashList row recycle case) must not bleed through to the new climb.
   const backgroundPaths = storedBackgrounds?.key === currentBoardKey ? storedBackgrounds.paths : [];
   const missingBackgroundCount = storedBackgrounds?.key === currentBoardKey ? storedBackgrounds.missingCount : 0;
+  // Read off the same registry answer the background key came from, and
+  // re-read whenever the spray token moves (it carries `-bg<variant>`).
+  const backgroundBaseColor = useMemo(() => {
+    void sprayVersionToken;
+    return boardName === 'spray' && activeSprayArt(getSprayWall(layoutId))?.variant === 'cutout'
+      ? fieldColor
+      : undefined;
+  }, [boardName, layoutId, fieldColor, sprayVersionToken]);
+  const artworkIdentity = useMemo<ReadyBoardArtIdentity>(
+    () => ({
+      boardName,
+      layoutId,
+      sizeId,
+      setIds,
+      frames,
+      renderSignature: effectiveRenderSignature,
+      colorScheme,
+    }),
+    [boardName, layoutId, sizeId, setIds, frames, effectiveRenderSignature, colorScheme],
+  );
+  const getReadyBoardArtSnapshot = useCallback(
+    (climbUuid: string, mirrored: boolean, displayedOverlayLoadKey: string | null) => {
+      // Credential invalidation is synchronous, before React gets to
+      // replace this recycled row's closure. Never bless its old pixels anew.
+      if (artworkCredentialGeneration !== getCredentialGeneration()) return undefined;
+      const width = getPlayOverlayWidth({ boardName, layoutId, sizeId, setIds });
+      if (width !== undefined) {
+        // This is the renderer's own key builder and resolved signature, not a
+        // guessed filename or an extra mounted full-size render in every row.
+        const fullKey = buildCacheKey(
+          boardName,
+          layoutId,
+          sizeId,
+          setIds,
+          flatFrames,
+          false,
+          width,
+          effectiveRenderSignature,
+          boardArtChunkPending,
+        );
+        const fullEntry = getRenderedOverlay(fullKey);
+        const fullBackgrounds = tryGetBackgroundPathsSync({
+          boardName,
+          layoutId,
+          sizeId,
+          setIds: setIdsArray,
+          variant: 'full',
+          colorScheme,
+        });
+        if (
+          fullEntry &&
+          isBoardArtInMemory(fullEntry.uri, String(fullEntry.generation)) &&
+          fullBackgrounds &&
+          fullBackgrounds.missingCount === 0 &&
+          fullBackgrounds.paths.every((path) => isBoardArtInMemory(path.includes('://') ? path : `file://${path}`))
+        ) {
+          return captureReadyBoardArt({
+            ...artworkIdentity,
+            climbUuid,
+            mirrored,
+            quality: 'full',
+            overlayCacheKey: fullKey,
+            overlayUri: fullEntry.uri,
+            overlayGeneration: fullEntry.generation,
+            overlayLoadKey: `${fullEntry.generation}:0`,
+            backgroundPaths: fullBackgrounds.paths,
+            backgroundBaseColor,
+          });
+        }
+      }
+      const entry = getRenderedOverlay(currentCacheKey);
+      if (
+        !entry ||
+        !overlayUri ||
+        entry.uri !== overlayUri ||
+        overlayLoadKey !== displayedOverlayLoadKey ||
+        !overlayLoadKey?.startsWith(`${entry.generation}:`) ||
+        !isBoardArtInMemory(overlayUri, String(entry.generation)) ||
+        missingBackgroundCount !== 0 ||
+        backgroundPaths.length === 0
+      )
+        return undefined;
+      return captureReadyBoardArt({
+        ...artworkIdentity,
+        climbUuid,
+        mirrored,
+        quality: !filledStyle && variant === 'full' ? 'full' : 'thumbnail',
+        overlayCacheKey: currentCacheKey,
+        overlayUri,
+        overlayGeneration: entry.generation,
+        overlayLoadKey,
+        backgroundPaths,
+        backgroundBaseColor,
+      });
+    },
+    [
+      boardName,
+      layoutId,
+      sizeId,
+      setIds,
+      flatFrames,
+      effectiveRenderSignature,
+      boardArtChunkPending,
+      setIdsArray,
+      colorScheme,
+      artworkIdentity,
+      backgroundBaseColor,
+      currentCacheKey,
+      overlayUri,
+      overlayLoadKey,
+      missingBackgroundCount,
+      backgroundPaths,
+      filledStyle,
+      artworkCredentialGeneration,
+    ],
+  );
   return {
+    artworkIdentity,
+    gpuConfigJson,
+    gpuStatus,
+    gpuWarmKey,
+    gpuProcessCold,
+    gpuFrames: flatFrames,
+    getReadyBoardArtSnapshot,
     overlayUri,
+    overlayCacheKey: currentCacheKey,
     overlayLoadKey,
+    overlayFailed: failedOverlayKey === currentCacheKey,
+    overlayImmediate: overlayArrivalRef.current?.key === currentCacheKey && overlayArrivalRef.current.immediate,
+    overlayUnavailable:
+      rendererGaveUp || isNativeRendererUnavailable() || (rendersOverlay && unavailableOverlayKey === currentCacheKey),
     onOverlayLoad,
     onOverlayError,
     onOverlayMounted,
     verifyOverlayForNativeUse,
     backgroundPaths,
     missingBackgroundCount,
+    backgroundsLoading: storedBackgrounds?.key !== currentBoardKey || !storedBackgrounds.settled,
+    backgroundBaseColor,
     effectiveRenderSettings,
     boardseshRendererAvailable: getBoardseshRendererSupport(),
     rendererUnavailable: rendererGaveUp || isNativeRendererUnavailable(),
@@ -3022,10 +3574,13 @@ export function useNativeClimbRender(params: NativeClimbRenderParams): NativeCli
  * Kicks the capability probe on the same terms the render path does, so opening
  * the screen is enough to find out whether the mode is available at all.
  */
-export function useEffectiveBoardRenderSettings(): {
+export function useEffectiveBoardRenderSettings(boardDefault: BoardRenderSettings | null = null): {
   effectiveRenderSettings: EffectiveBoardRenderSettings;
   boardseshRendererAvailable: boolean | null;
 } {
+  // `boardDefault` is a board's own stored look (a spray wall's). Every caller
+  // today describes the climber's OWN preference — the settings screen, the
+  // onboarding gate — so none passes one, and the answer is board-agnostic.
   const { settings } = useBoardRenderSettings();
   const boardseshSupportTick = useSyncExternalStore(
     subscribeToBoardseshSupport,
@@ -3033,12 +3588,12 @@ export function useEffectiveBoardRenderSettings(): {
     getBoardseshSupportRevision,
   );
 
-  if (requestedBoardRenderMode(settings) === 'aura') ensureBoardseshSupportProbed();
+  if (requestedBoardRenderMode(settings, boardDefault) === 'aura') ensureBoardseshSupportProbed();
 
   const effectiveRenderSettings = useMemo(() => {
     void boardseshSupportTick;
-    return resolveEffectiveRenderSettings(settings, getBoardseshRendererSupport() === true);
-  }, [settings, boardseshSupportTick]);
+    return resolveEffectiveRenderSettings(settings, getBoardseshRendererSupport() === true, boardDefault);
+  }, [settings, boardseshSupportTick, boardDefault]);
 
   return { effectiveRenderSettings, boardseshRendererAvailable: getBoardseshRendererSupport() };
 }

@@ -10,7 +10,9 @@
 #   3. Ensures pg_hba.conf allows Docker network and Tailscale connections
 #   4. Ensures the postgres user has a password set
 #   5. Syncs drizzle migration tracker (public → drizzle schema)
-#   6. Runs drizzle migrations (to pick up any newer migrations not yet in the image)
+#   6. Installs the deletion-sync cutoff helper that 0272_sync_deletions_cutoff_guard requires
+#   7. Runs drizzle migrations (to pick up any newer migrations not yet in the image)
+#   8. Installs the pg-boss job queue schema the backend refuses to start without
 
 set -e
 
@@ -142,11 +144,48 @@ sync_drizzle_migration_tracker() {
   echo "  drizzle.__drizzle_migrations has $DRIZZLE_COUNT records."
 }
 
+# The backend never runs pg-boss DDL itself; in a deployment the migrator does.
+# The SQL migrations above go through psql rather than the migrator, so without
+# this a fresh volume leaves the backend exiting with "pg-boss is not installed".
+ensure_job_queue_schema() {
+  echo "Ensuring the job queue schema is installed..."
+  (
+    cd "$REPO_ROOT/packages/db"
+    # The script resolves DB_URL and POSTGRES_URL too, DB_URL first. Drop both
+    # so a URL exported in the developer's shell cannot redirect or fail this.
+    env -u DB_URL -u POSTGRES_URL \
+      DATABASE_URL="postgresql://postgres:password@localhost:5432/main" \
+      "$REPO_ROOT/node_modules/.bin/tsx" scripts/ensure-dev-job-queue-schema.ts
+  )
+}
+
+# 0272_sync_deletions_cutoff_guard refuses to run until an administrator has installed the
+# deletion-sync cutoff helper and its NOLOGIN owner (docs/data/sync-deletions-cutoff.md):
+# the migration login cannot grant the statistics role the helper needs. A dev
+# volume created before that migration has neither, so install them first, with
+# the same development adapter CI, E2E and the dev-db image build use. It returns
+# early when the helper is already there and matches its contract, so every run
+# after the first is a no-op, and it refuses any host but a local one.
+ensure_sync_deletions_cutoff_helper() {
+  echo "Ensuring the deletion-sync cutoff helper is installed..."
+  (
+    cd "$REPO_ROOT/packages/db"
+    # Same reason as below: nothing from the developer's shell may pick the
+    # target, or the runtime role the helper grants to.
+    env -u DB_URL -u POSTGRES_URL -u DATABASE_URL -u SYNC_CUTOFF_RUNTIME_ROLE \
+      SYNC_CUTOFF_DEVELOPMENT_BOOTSTRAP=true \
+      SYNC_CUTOFF_ADMIN_DATABASE_URL="postgresql://postgres:password@localhost:5432/main" \
+      "$REPO_ROOT/node_modules/.bin/tsx" scripts/bootstrap-sync-deletions-cutoff-development.ts --apply
+  )
+}
+
 prepare_docker_postgres() {
   ensure_postgres_network_access
   ensure_postgres_password
   sync_drizzle_migration_tracker
+  ensure_sync_deletions_cutoff_helper
   run_pending_drizzle_sql_migrations
+  ensure_job_queue_schema
   write_dev_db_env "localhost" "$1" "$(detect_local_redis_url)"
 }
 
@@ -268,7 +307,8 @@ PG_CONTAINER=$(docker compose ps -q postgres)
 
 echo "Waiting for postgres to be healthy..."
 attempts=0
-max_attempts=30
+# A cold CI runner can take over 30 s to start the seeded image (#7810, run 44349715985).
+max_attempts=120
 until docker exec "$PG_CONTAINER" pg_isready -U postgres -q 2>/dev/null; do
   attempts=$((attempts + 1))
   if [ "$attempts" -ge "$max_attempts" ]; then

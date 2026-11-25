@@ -1,23 +1,33 @@
-New in 2.5:
+New in 2.8.0
 
-WORKS WITH WOODS, FRONT TO BACK
+Boardsesh is now available in Simplified Chinese.
 
-Got a Woods Board? Add your 12x12 or 8x10, browse 5,000+ climbs with their matching and feet rules, and light any of them over Bluetooth. Set and remix your own problems on either size (the creator only offers holds that are really on your wall), mirror a climb and the wall flips with it, and run Previous, Next and Mirror from the Lock Screen and Dynamic Island. Holds draw in the Aura look with crisper outlines.
+MORE WAYS TO TRAIN
 
-TAKE THE WALL, NO LEDS NEEDED
+Build 4x4, Limit Bouldering and On the Minute workouts alongside Volume, Pyramid, Ladder and Grade Focus. Preview your climbs and rests before starting. Pyramids can now come back down on the same climbs. Choose countdown buzzes and whether rest countdowns appear on your Lock Screen in Settings > Timers.
 
-Climbing on a board with no light kit? Take the wall and everyone in the session follows the climb you put up, and so does the gym screen. Switch Lights off in the board's settings: turns keep rotating, your chosen angle stays put, and sessions on a named wall log from your watch too.
+PICK UP WHERE YOU LEFT OFF
 
-MIRROR FROM THE LOCK SCREEN
+Home brings together your week’s climbing, climbs at your level and projects to try again. See your last workout and start a session from the Session card. Customize which sections you see. The board picker brings nearby boards and your gym’s walls within reach when location is enabled. Find your own climbs in Discover.
 
-While your phone drives the board, the Live Activity and Dynamic Island get a Mirror button next to Previous, Next and the lightbulb. The app, your crew, the thumbnails and the LEDs all follow the mirrored climb, and it's still mirrored when you open the app.
+Light your Spraywall
 
-FIXED
+Connect your Spraywall to WLED over Wi-Fi. Map holes, LEDs and cable on a zoomable photo, test individual holds and save the setup for your crew. Find controllers on your Wi-Fi, adjust brightness and choose an automatic switch-off time for Wi-Fi lighting.
 
-- Holds draw faster: the board renderer no longer waits behind the rest of the app.
-- Your board stays dark until you ask for it. A phone that drifts back into range hours or days later no longer relights your last climb. The lightbulb, the widget and mid-climb reconnects still light it instantly.
-- The Climbs tab and its search no longer go dead after a playlist closes over them mid-session. No more force-quitting to get search back.
-- Downloaded climbs stay up to date after an app update.
-- Closing climb search no longer pops up a stray preview sheet.
+Compatible controllers with Boardsesh Bluetooth support can also light climbs over Bluetooth. Installing Bluetooth support remains an opt-in beta for matching controllers, with compatibility checks and separate consent.
+
+FIND AND SHARE YOUR NEXT CLIMB
+
+Kilter’s Verified climbs have their own quick filter beside Grade. Share playlists, profiles, sessions, gyms and boards with lit-climb link previews. Playlist headers put Share within reach.
+
+EASIER TO READ, SMOOTHER TO BROWSE
+
+GPU-accelerated board rendering brings smoother climb transitions on supported boards and devices.
+
+Refreshed colours and layouts give your climbs more room. Text follows your iPhone’s text-size settings more closely, and VoiceOver announces the new climb after a swipe. Climb transitions respect Reduce Motion. Long climb names scroll again, and changing the grade filter keeps the Climbs list on screen.
+
+CONNECT WITH TRAINING APPS
+
+Open workouts from compatible third-party training apps in Boardsesh and let apps read your logbook with your permission. Developer details: https://www.boardsesh.com/developers/
 
 Free, no ads, open source.

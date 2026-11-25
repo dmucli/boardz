@@ -3,8 +3,11 @@
 // board_id (userBoards.id), resolved from the BLE serial.
 
 export type BoardPresenceClimb = {
+  /** Internal provenance retained in Redis; never exposed by GraphQL. */
+  sessionId?: string | null;
+  identityPolicyVersion?: number;
   /** Missing on older servers means a native Boardsesh display. */
-  source?: 'boardsesh' | 'kilter' | null;
+  source?: 'boardsesh' | 'kilter' | 'aurora' | null;
   climbUuid: string;
   queueItemUuid?: string | null;
   name?: string | null;
@@ -12,6 +15,8 @@ export type BoardPresenceClimb = {
   gradeColor?: string | null;
   frames?: string | null;
   angle?: number | null;
+  /** Orientation the reporter wrote to the wall. Null/missing means unknown (older reporter). */
+  mirrored?: boolean | null;
   setter?: string | null;
   /** Server-derived from the caller; never client-supplied. */
   sentByDisplayName?: string | null;
@@ -26,7 +31,7 @@ export type BoardPresenceClimb = {
 
 /** One distinct climber who recently sent the displayed climb on this wall. */
 export type BoardClimbRecentSender = {
-  userId: string;
+  userId: string | null;
   displayName?: string | null;
   avatarUrl?: string | null;
   /** ISO 8601 timestamp of this climber's latest successful tick for the climb. */
@@ -42,6 +47,8 @@ export type BoardClimbCleared = {
   __typename: 'BoardClimbCleared';
   clearedAt: string;
   seq: number;
+  /** The climb that was on the wall when it was cleared; absent from older servers. */
+  climbUuid?: string | null;
 };
 
 export type BoardStatsUpdated = {
@@ -80,10 +87,14 @@ export type BoardPresenceEvent =
   | BoardHistoryUpdated;
 
 export type BoardPresenceHardestSend = {
+  /** Internal provenance for viewer-specific identity and content projection. */
+  tickUuid?: string | null;
+  sessionId?: string | null;
+  climbOwnerId?: string | null;
   climbUuid: string;
   name?: string | null;
   grade: string;
-  sentByUserId: string;
+  sentByUserId: string | null;
   sentByDisplayName?: string | null;
   sentByAvatarUrl?: string | null;
   sentAt: string;
@@ -162,4 +173,12 @@ export type BoardPresenceStats = {
   hardestSend?: BoardPresenceHardestSend | null;
   topGrade?: string | null;
   lastSentAt?: string | null;
+};
+
+/** Public wall catalog grades at one viewer-selected angle. */
+export type BoardPresenceClimbGrade = {
+  uuid: string;
+  difficulty: string | null;
+  boardseshDifficulty: number | null;
+  boardseshConfidence: string | null;
 };

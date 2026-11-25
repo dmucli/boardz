@@ -3,9 +3,16 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { gunzipSync } from 'node:zlib';
+import {
+  applyFixtureOverlay,
+  validateFixtureOverlayReference,
+  type FixtureOverlayReference,
+} from './screenshot-fixture-overlay';
+import { assertCppNegativeFixtureFiles } from './cpp-native-background-coverage';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const FIXTURE_SNAPSHOT_REFERENCE = join(REPO_ROOT, 'app-stores/screenshot-fixtures.json');
+export const IOS_CAMPAIGN_FIXTURE_REFERENCE = join(REPO_ROOT, 'app-stores/apple/campaign-fixtures.json');
 const CACHE_ROOT = join(REPO_ROOT, '.boardsesh/screenshot-fixtures');
 const MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024;
 
@@ -15,15 +22,33 @@ export interface FixtureSnapshotReference {
   sha256: string;
   bytes: number;
   files: number;
+  overlay?: FixtureOverlayReference;
 }
 
 export function snapshotHash(bytes: Buffer): string {
   return createHash('sha256').update(bytes).digest('hex');
 }
 
-export function readFixtureSnapshotReference(filename = FIXTURE_SNAPSHOT_REFERENCE): FixtureSnapshotReference {
-  const parsed: unknown = JSON.parse(readFileSync(filename, 'utf8'));
-  if (!parsed || typeof parsed !== 'object') throw new Error(`Invalid fixture snapshot reference: ${filename}`);
+function publicHttpsUrl(input: string): URL {
+  const url = new URL(input);
+  const hostname = url.hostname.toLowerCase();
+  if (
+    url.protocol !== 'https:' ||
+    url.username ||
+    url.password ||
+    hostname === 'localhost' ||
+    hostname.endsWith('.localhost') ||
+    hostname.endsWith('.local') ||
+    hostname.endsWith('.internal') ||
+    hostname.startsWith('[') ||
+    /^\d+\.\d+\.\d+\.\d+$/.test(hostname)
+  )
+    throw new Error('Fixture snapshot URL must use public HTTPS without credentials');
+  return url;
+}
+
+export function validateFixtureSnapshotReference(parsed: unknown): FixtureSnapshotReference {
+  if (!parsed || typeof parsed !== 'object') throw new Error('Invalid fixture snapshot reference');
   const reference = parsed as Partial<FixtureSnapshotReference>;
   if (
     reference.version !== 1 ||
@@ -39,13 +64,38 @@ export function readFixtureSnapshotReference(filename = FIXTURE_SNAPSHOT_REFEREN
     !reference.files ||
     reference.files < 1
   ) {
-    throw new Error(`Invalid fixture snapshot reference: ${filename}`);
+    throw new Error('Invalid fixture snapshot reference');
   }
+  publicHttpsUrl(reference.url);
+  if (reference.overlay !== undefined) validateFixtureOverlayReference(reference.overlay);
   return reference as FixtureSnapshotReference;
 }
 
+export function readFixtureSnapshotReference(filename = FIXTURE_SNAPSHOT_REFERENCE): FixtureSnapshotReference {
+  return validateFixtureSnapshotReference(JSON.parse(readFileSync(filename, 'utf8')));
+}
+
+/** Reads a bounded candidate pin; the archive still passes the normal checksum gate. */
+export async function fetchFixtureSnapshotReference(
+  url: string,
+  request: typeof fetch = fetch,
+): Promise<FixtureSnapshotReference> {
+  publicHttpsUrl(url);
+  const response = await request(url, { signal: AbortSignal.timeout(30_000) });
+  if (!response.ok || !response.body) throw new Error(`Fixture snapshot reference returned HTTP ${response.status}`);
+  if (response.url) publicHttpsUrl(response.url);
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  for await (const chunk of response.body) {
+    received += chunk.length;
+    if (received > 16 * 1024) throw new Error('Fixture snapshot reference exceeds 16 KiB');
+    chunks.push(chunk);
+  }
+  return validateFixtureSnapshotReference(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+}
+
 export function fixtureSnapshotDirectory(reference = readFixtureSnapshotReference(), cacheRoot = CACHE_ROOT): string {
-  return join(cacheRoot, reference.sha256);
+  return join(cacheRoot, reference.overlay ? `${reference.sha256}-${reference.overlay.sha256}` : reference.sha256);
 }
 
 export function decodeFixtureSnapshot(bytes: Buffer, reference: FixtureSnapshotReference): Map<string, Buffer> {
@@ -72,6 +122,11 @@ export function decodeFixtureSnapshot(bytes: Buffer, reference: FixtureSnapshotR
     files.set(path, decoded);
   }
   if (!files.has('manifest.json') || files.size !== reference.files) throw new Error('Incomplete fixture snapshot');
+  assertCppNegativeFixtureFiles(JSON.parse(files.get('manifest.json')!.toString('utf8')), (file) => {
+    const contents = files.get(file);
+    if (!contents) throw new Error('Missing native background fixture source');
+    return contents;
+  });
   return files;
 }
 
@@ -80,6 +135,19 @@ function writeAtomic(filename: string, bytes: Buffer): void {
   const staged = `${filename}.${randomUUID()}.tmp`;
   writeFileSync(staged, bytes, { flag: 'wx' });
   renameSync(staged, filename);
+}
+
+/** Installs a CI candidate pin only after its archive verifies; failure preserves the prior pin. */
+export async function installFixtureSnapshotReference(
+  url: string,
+  filename = FIXTURE_SNAPSHOT_REFERENCE,
+  cacheRoot = CACHE_ROOT,
+  request: typeof fetch = fetch,
+): Promise<string> {
+  const reference = await fetchFixtureSnapshotReference(url, request);
+  const directory = await ensureScreenshotFixtures(reference, cacheRoot, request);
+  writeAtomic(filename, Buffer.from(`${JSON.stringify(reference, null, 2)}\n`));
+  return directory;
 }
 
 /** A content-addressed cache; local recordings are never read, changed, or removed. */
@@ -105,7 +173,15 @@ export async function ensureScreenshotFixtures(
     decodeFixtureSnapshot(compressed, reference);
     writeAtomic(archive, compressed);
   }
-  const files = decodeFixtureSnapshot(compressed, reference);
+  const baseline = decodeFixtureSnapshot(compressed, reference);
+  const files = reference.overlay
+    ? applyFixtureOverlay(
+        baseline,
+        reference.sha256,
+        readFileSync(join(REPO_ROOT, validateFixtureOverlayReference(reference.overlay).path)),
+        reference.overlay,
+      )
+    : baseline;
   const directory = fixtureSnapshotDirectory(reference, cacheRoot);
   for (const [path, bytes] of files) {
     const filename = join(directory, path);

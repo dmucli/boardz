@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -21,6 +34,7 @@ type ViewProps = { children?: ReactNode; testID?: string; style?: unknown };
 const feedFixture = vi.hoisted(() => ({ climbs: [] as Climb[] }));
 
 vi.mock('react-native', () => ({
+  useWindowDimensions: () => ({ fontScale: 1 }),
   View: ({ children }: ViewProps) => createElement('div', null, children),
   Pressable: ({
     children,
@@ -29,7 +43,11 @@ vi.mock('react-native', () => ({
   }: ViewProps & { onPress?: () => void; accessibilityLabel?: string }) =>
     createElement('button', { onClick: onPress, 'aria-label': accessibilityLabel }, children),
   Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 vi.mock('@expo/ui/community/bottom-sheet', () => ({
@@ -56,6 +74,7 @@ vi.mock('react-native-safe-area-context', () => ({
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: { separator: '#ccc', secondaryBackground: '#fff' },
     brandColors: { primary: '#6D28D9' },
@@ -64,9 +83,9 @@ vi.mock('../../../providers/theme-provider', () => ({
 
 vi.mock('../../../lib/haptics', () => ({ hapticSelection: vi.fn() }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 10: 40, 16: 64 },
 }));
-vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { systemGray: '#888' } }));
 vi.mock('../../sheet-content-inset', () => ({ withSheetBottomInset: (style: unknown) => style }));
 vi.mock('../use-queue-drag', () => ({
   useQueueDrag: () => ({
@@ -74,11 +93,12 @@ vi.mock('../use-queue-drag', () => ({
     controls: { shared: {}, onRowHeight: vi.fn(), makeHandleGesture: vi.fn() },
   }),
 }));
+vi.mock('../../SectionHeader', () => ({ SectionHeader: () => null }));
 vi.mock('../../Text', () => ({ Text: ({ children }: ViewProps) => createElement('span', null, children) }));
 vi.mock('../../ClimbListItemContent', () => ({ ClimbListItemContent: () => createElement('span', null) }));
 vi.mock('../../QueueItemRow', () => ({
   POSITION_SLOT_WIDTH: 28,
-  SEPARATOR_INSET: 200,
+  QUEUE_ROW_LEADING_INSET: 52,
   QueueItemRow: () => createElement('div'),
 }));
 
@@ -92,6 +112,8 @@ vi.mock('../../../providers/queue/use-board-continuation-feed', () => ({
 vi.mock('../../../providers/queue-provider', () => ({
   useQueueSessionId: () => ({ sessionId: null }),
 }));
+vi.mock('../../../providers/auth-provider', () => ({ useAuth: () => ({ isLoading: false }) }));
+
 vi.mock('../../../providers/party-profile-provider', () => ({
   usePartyProfile: () => ({ profile: null, isLoading: false }),
 }));
@@ -111,7 +133,7 @@ function renderList(
   return render(
     createElement(QueueList, {
       queue: [] as ClimbQueueItem[],
-      currentItemUuid: null,
+      currentItem: null,
       board,
       isEditMode: false,
       showHistory: true,

@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from 'vite-plus/test';
+import { describe, expect, it, afterEach, vi } from 'vite-plus/test';
 import net from 'node:net';
 import postgres from 'postgres';
 import { sql } from 'drizzle-orm';
@@ -43,6 +43,28 @@ describe('connectErrorCode', () => {
 });
 
 describe('withDbConnectRetry', () => {
+  it('keeps the process alive while it waits to retry a refused connect (#6703)', async () => {
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      let calls = 0;
+      const result = await withDbConnectRetry(
+        () => {
+          calls += 1;
+          return calls === 1 ? Promise.reject(connectError('ECONNREFUSED')) : Promise.resolve('rows');
+        },
+        { baseDelayMs: 40, random: () => 0, budgetMs: 10_000 },
+      );
+
+      expect(result).toBe('rows');
+      const retryCallIndex = timerSpy.mock.calls.findIndex(([, delayMs]) => delayMs === 20);
+      expect(retryCallIndex).toBeGreaterThanOrEqual(0);
+      const retryTimer = timerSpy.mock.results[retryCallIndex].value as NodeJS.Timeout;
+      expect(retryTimer.hasRef()).toBe(true);
+    } finally {
+      timerSpy.mockRestore();
+    }
+  });
+
   it('runs once when the statement succeeds', async () => {
     let calls = 0;
     const result = await withDbConnectRetry(
@@ -301,7 +323,7 @@ function deadPool(port: number, max: number) {
     // no wrapper at all, nine sequential connects take 7, 2, 17, 43, 131, 637,
     // 1305, 2540, 14204 ms. Pinning it to 0 keeps these tests measuring OUR
     // retry loop instead of that ramp. The production consequence is real and
-    // documented in docs/db-connectivity.md — it is what the wall-clock budget
+    // documented in docs/operations/db-connectivity.md — it is what the wall-clock budget
     // exists to bound, and it is why an ECONNREFUSED is only "fast" for the
     // first few failures of an outage.
     backoff: () => 0,

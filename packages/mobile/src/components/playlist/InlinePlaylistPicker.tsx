@@ -1,8 +1,9 @@
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { PressableSurface } from '../PressableSurface';
 import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
 import {
   ActivityIndicator,
   FlatList,
-  Pressable,
   ScrollView,
   StyleSheet,
   View,
@@ -19,11 +20,16 @@ import {
   type GetPlaylistsForClimbQueryResponse,
 } from '@boardsesh/graphql/operations/playlists';
 import { playlistMembershipStore } from '@boardsesh/climb-actions';
+import { Button } from '../Button';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { ListRow } from '../ListRow';
 import { useClimbPlaylistMemberships } from '../../hooks/use-climb-playlist-memberships';
-import { getHttpClient } from '../../lib/graphql/client';
+import { offlineAwareRequest } from '../../lib/graphql/offline-request';
+import {
+  beginPlaylistMembershipWrite,
+  isPlaylistMembershipWritePending,
+} from '../../lib/graphql/offline-user-read-recovery';
 import { usePlaylistsContext, type Playlist } from '../../providers/playlists-provider';
 import { useTheme } from '../../providers/theme-provider';
 import { useToast } from '../../providers/toast-provider';
@@ -36,8 +42,7 @@ import { NAME_MAX } from './playlist-form-values';
 
 // One-tap emoji shortcuts for the compact inline create form. The full emoji
 // picker (system keyboard + description field) lives on the playlist edit
-// screen; the inline form stays lightweight so it fits the reaction overlay's
-// floating card.
+// screen; the inline form stays lightweight so it fits a sheet or a popover.
 const QUICK_EMOJI = ['🔥', '💪', '🎯', '⭐', '🧗', '🪨', '🏆'] as const;
 
 // The subset of TextInput props the create form actually drives. Typing the
@@ -62,6 +67,8 @@ type InlinePlaylistPickerProps = {
   angle: number;
   boardName: BoardName;
   layoutId: number;
+  /** Retained native popover hosts can be mounted while their picker is hidden. */
+  active?: boolean;
   /**
    * Text input host: inject `BottomSheetTextInput` when rendered inside a
    * `ModalSheet` (so the keyboard pushes the sheet), and the plain RN
@@ -76,8 +83,10 @@ type InlinePlaylistPickerProps = {
   onBack?: () => void;
   /** When set, the header (with the back button) is pinned and the list scrolls
    *  within this height — so scrolling a long playlist list never hides "back".
-   *  Omit in a sheet host, whose own scroll already scrolls the body. */
+   *  Omit for a sheet host, which uses the bounded fill layout instead. */
   maxHeight?: number;
+  /** Fill the bounded body supplied by a sheet; overlays size to their content. */
+  layout?: 'content' | 'fill';
   /** Virtualized list host for the playlist rows: the RN `FlatList` in the reaction
    *  overlay (default), `BottomSheetFlatList` inside a `ModalSheet` so it scrolls
    *  with the sheet. Injected rather than `.map`-ing rows in a ScrollView. */
@@ -102,7 +111,7 @@ const playlistKey = (playlist: Playlist) => playlist.id;
 /**
  * Membership-aware "add to playlist" body: a toggle list (checkmark = the climb
  * is in that playlist; tap to add or remove) plus an inline create form. Shared
- * by the reaction overlay (`ClimbReactionMenu`) and the add-to-playlist
+ * by the add-to-playlist
  * `ModalSheet` (`AddToPlaylistSheet`).
  *
  * Feedback is inline *while the picker is on screen*: a toast fired while a
@@ -120,12 +129,15 @@ export function InlinePlaylistPicker({
   angle,
   boardName,
   layoutId,
+  active = true,
   TextInputComponent,
   onBack,
   maxHeight,
+  layout = 'content',
   ListComponent = FlatList,
   onDetachedFailure,
 }: InlinePlaylistPickerProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('climbs');
   const { t: tc } = useTranslation('common');
   const { systemColors, brandColors } = useTheme();
@@ -146,7 +158,12 @@ export function InlinePlaylistPicker({
   const { data: memberUuids } = useQuery({
     queryKey: membershipKey,
     queryFn: async (): Promise<string[]> => {
-      const response = await getHttpClient().request<GetPlaylistsForClimbQueryResponse>(GET_PLAYLISTS_FOR_CLIMB, {
+      // A retained/reopened picker may mount after staleTime while a slow
+      // toggle is still pending. Keep its optimistic snapshot until it settles.
+      if (isPlaylistMembershipWritePending(queryClient, membershipKey)) {
+        return queryClient.getQueryData<string[]>(membershipKey) ?? [];
+      }
+      const response = await offlineAwareRequest<GetPlaylistsForClimbQueryResponse>(GET_PLAYLISTS_FOR_CLIMB, {
         input: { boardType: boardName, layoutId, climbUuid: climb.uuid },
       });
       return response.playlistsForClimb;
@@ -170,6 +187,8 @@ export function InlinePlaylistPicker({
   // Whether this picker is still on screen. Read inside a settled request's catch
   // block to pick the channel the climber can actually see — see `surfaceFailure`.
   const mountedRef = useRef(true);
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   /**
    * Report a membership failure through whichever channel is visible right now.
@@ -192,7 +211,7 @@ export function InlinePlaylistPicker({
   detachedFailureRef.current = onDetachedFailure;
   const surfaceFailure = useCallback(
     (inlineMessage: string, detachedMessage: string) => {
-      if (mountedRef.current) {
+      if (mountedRef.current && activeRef.current) {
         setError(inlineMessage);
         return;
       }
@@ -238,6 +257,7 @@ export function InlinePlaylistPicker({
     async (playlist: Playlist) => {
       if (togglingRef.current.has(playlist.uuid)) return;
       togglingRef.current.add(playlist.uuid);
+      const finishMembershipWrite = beginPlaylistMembershipWrite(queryClient, membershipKey);
       try {
         await queryClient.cancelQueries({ queryKey: membershipKey });
         const before = queryClient.getQueryData<string[]>(membershipKey) ?? [...members];
@@ -280,6 +300,7 @@ export function InlinePlaylistPicker({
         }
       } finally {
         togglingRef.current.delete(playlist.uuid);
+        finishMembershipWrite();
       }
     },
     [
@@ -309,6 +330,12 @@ export function InlinePlaylistPicker({
   // continuation (add + UI updates) aborts instead of adding the climb after the
   // user backed out.
   const createRequestIdRef = useRef(0);
+  useEffect(() => {
+    if (!active) {
+      createRequestIdRef.current += 1;
+      setSubmitting(false);
+    }
+  }, [active]);
   useEffect(() => {
     // Set on mount as well as cleared on unmount: a mount/cleanup/mount cycle
     // (StrictMode, Fast Refresh) would otherwise leave a live picker classified
@@ -351,7 +378,7 @@ export function InlinePlaylistPicker({
     // No length check needed: the input caps at NAME_MAX (maxLength) and trim only
     // shortens, so the name can't exceed it.
     const requestId = (createRequestIdRef.current += 1);
-    const isCurrent = () => createRequestIdRef.current === requestId;
+    const isCurrent = () => createRequestIdRef.current === requestId && activeRef.current && mountedRef.current;
     setSubmitting(true);
     setCreateError(null);
     // Create and add are separate operations with separate failure handling: if
@@ -365,6 +392,8 @@ export function InlinePlaylistPicker({
       if (isCurrent()) {
         setCreateError(t('actions.playlist.toast.createFailed'));
         setSubmitting(false);
+      } else if (!activeRef.current || !mountedRef.current) {
+        surfaceFailure(t('actions.playlist.toast.createFailed'), t('actions.playlist.toast.createFailed'));
       }
       if (__DEV__) {
         console.warn('[playlist] inline create failed', {
@@ -444,7 +473,7 @@ export function InlinePlaylistPicker({
   // Bound the scroll area to the space left under the pinned header, measured so
   // the list scrolls (not clips) whatever the header's height.
   const [headerHeight, setHeaderHeight] = useState(0);
-  const scrollMaxHeight = maxHeight != null ? Math.max(120, maxHeight - headerHeight) : undefined;
+  const scrollMaxHeight = maxHeight != null ? Math.max(0, maxHeight - headerHeight) : undefined;
   const onHeaderLayout = useCallback(
     (event: LayoutChangeEvent) => setHeaderHeight(event.nativeEvent.layout.height),
     [],
@@ -471,10 +500,10 @@ export function InlinePlaylistPicker({
   );
 
   return (
-    <View style={[styles.container, maxHeight != null ? { maxHeight } : null]}>
+    <View style={[styles.container, layout === 'fill' && styles.fill, maxHeight != null ? { maxHeight } : null]}>
       <View style={styles.header} onLayout={onHeaderLayout}>
         {onBack ? (
-          <Pressable
+          <PressableSurface
             onPress={onBack}
             accessibilityRole="button"
             accessibilityLabel={tc('actions.back')}
@@ -482,7 +511,7 @@ export function InlinePlaylistPicker({
             style={styles.backButton}
           >
             <Icon name="chevron.left" size={20} color={systemColors.label} />
-          </Pressable>
+          </PressableSurface>
         ) : (
           <Icon name="playlist" size={20} color={systemColors.accent} />
         )}
@@ -490,21 +519,21 @@ export function InlinePlaylistPicker({
           {t('actions.playlist.popover.title')}
         </Text>
         {isAuthenticated && !createOpen ? (
-          <Pressable
+          <PressableSurface
             onPress={handleOpenCreate}
             accessibilityRole="button"
             accessibilityLabel={t('actions.playlist.popover.createNew')}
             hitSlop={8}
             style={[styles.createButton, { backgroundColor: systemColors.fill }]}
           >
-            <Icon name="plus" size={18} color={brandColors.primary} />
-          </Pressable>
+            <Icon name="plus" size={18} color={systemColors.accent} />
+          </PressableSurface>
         ) : null}
       </View>
 
       {createOpen ? (
         <ScrollView
-          style={scrollMaxHeight != null ? { maxHeight: scrollMaxHeight } : undefined}
+          style={[layout === 'fill' && styles.fill, scrollMaxHeight != null ? { maxHeight: scrollMaxHeight } : null]}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
           bounces={false}
@@ -530,7 +559,7 @@ export function InlinePlaylistPicker({
               {PLAYLIST_COLORS.map((swatch) => {
                 const selected = color === swatch;
                 return (
-                  <Pressable
+                  <PressableSurface
                     key={swatch}
                     onPress={() => setColor(selected ? undefined : swatch)}
                     accessibilityRole="button"
@@ -542,7 +571,7 @@ export function InlinePlaylistPicker({
                     ]}
                   >
                     {selected ? <Icon name="check.small" size={14} color={iosSystemColors.white} /> : null}
-                  </Pressable>
+                  </PressableSurface>
                 );
               })}
             </View>
@@ -550,7 +579,7 @@ export function InlinePlaylistPicker({
               {QUICK_EMOJI.map((preset) => {
                 const selected = icon === preset;
                 return (
-                  <Pressable
+                  <PressableSurface
                     key={preset}
                     onPress={() => setIcon(selected ? undefined : preset)}
                     accessibilityRole="button"
@@ -564,7 +593,7 @@ export function InlinePlaylistPicker({
                     <Text style={styles.emoji} allowFontScaling={false}>
                       {preset}
                     </Text>
-                  </Pressable>
+                  </PressableSurface>
                 );
               })}
             </View>
@@ -572,50 +601,44 @@ export function InlinePlaylistPicker({
                 so a membership failure that lands here (an add from before the form
                 was opened) shows in the form's slot instead of nowhere. */}
             {(createError ?? error) ? (
-              <Text variant="footnote" color={iosSystemColors.systemRed} style={styles.errorText}>
+              <Text variant="footnote" color={systemColors.error} style={styles.errorText}>
                 {createError ?? error}
               </Text>
             ) : null}
             <View style={styles.createActions}>
-              <Pressable
+              <Button
+                title={tc('actions.cancel')}
                 onPress={handleCloseCreate}
-                accessibilityRole="button"
-                accessibilityLabel={tc('actions.cancel')}
-                hitSlop={8}
-                style={styles.cancelButton}
+                variant="text"
+                role="cancel"
                 disabled={submitting}
-              >
-                <Text variant="body" color={systemColors.secondaryLabel}>
-                  {tc('actions.cancel')}
-                </Text>
-              </Pressable>
-              <Pressable
+              />
+              {/* The native filled button (HIG Buttons): its label sits on the
+                  scheme-aware `primaryFill`, so white text clears AA in dark too.
+                  The old hand-rolled white-on-#A78BFA pill was 2.7:1. */}
+              <Button
+                title={t('actions.playlist.create.submit')}
                 onPress={() => {
                   void handleSubmitCreate();
                 }}
-                accessibilityRole="button"
-                accessibilityLabel={t('actions.playlist.create.submit')}
-                hitSlop={8}
-                style={[styles.submitButton, { backgroundColor: brandColors.primary }]}
+                variant="filled"
+                loading={submitting}
                 disabled={submitting}
-              >
-                {submitting ? (
-                  <ActivityIndicator color={iosSystemColors.white} />
-                ) : (
-                  <Text variant="body" color={iosSystemColors.white} style={styles.submitLabel}>
-                    {t('actions.playlist.create.submit')}
-                  </Text>
-                )}
-              </Pressable>
+              />
             </View>
           </View>
         </ScrollView>
       ) : !isAuthenticated ? (
-        <View style={styles.message}>
-          <Text variant="subheadline" color={iosSystemColors.systemGray}>
+        <ScrollView
+          style={[layout === 'fill' && styles.fill, scrollMaxHeight != null ? { maxHeight: scrollMaxHeight } : null]}
+          contentContainerStyle={styles.message}
+          showsVerticalScrollIndicator={false}
+          bounces={false}
+        >
+          <Text variant="subheadline" color={systemColors.secondaryLabel}>
             {t('actions.playlist.popover.signInBlurb')}
           </Text>
-        </View>
+        </ScrollView>
       ) : isLoading && sortedPlaylists.length === 0 ? (
         // Spinner only before the user's playlists are cached at all; once they're
         // available we render immediately and checkmarks fill in.
@@ -632,17 +655,17 @@ export function InlinePlaylistPicker({
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
           bounces={false}
-          style={scrollMaxHeight != null ? { maxHeight: scrollMaxHeight } : undefined}
+          style={[layout === 'fill' && styles.fill, scrollMaxHeight != null ? { maxHeight: scrollMaxHeight } : null]}
           ListHeaderComponent={
             error ? (
-              <Text variant="footnote" color={iosSystemColors.systemRed} style={styles.errorText}>
+              <Text variant="footnote" color={systemColors.error} style={styles.errorText}>
                 {error}
               </Text>
-            ) : null
+            ) : undefined
           }
           ListEmptyComponent={
             <View style={styles.message}>
-              <Text variant="subheadline" color={iosSystemColors.systemGray}>
+              <Text variant="subheadline" color={systemColors.secondaryLabel}>
                 {t('actions.playlist.popover.empty')}
               </Text>
             </View>
@@ -653,110 +676,102 @@ export function InlinePlaylistPicker({
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    width: '100%',
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[3],
-    paddingBottom: spacing[2],
-  },
-  backButton: {
-    width: spacing[6],
-    alignItems: 'flex-start',
-    justifyContent: 'center',
-  },
-  headerTitle: {
-    flex: 1,
-  },
-  createButton: {
-    width: spacing[8],
-    height: spacing[8],
-    borderRadius: borderRadius.full,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  createForm: {
-    paddingHorizontal: spacing[4],
-    paddingBottom: spacing[3],
-    gap: spacing[3],
-  },
-  input: {
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: 10,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    fontSize: 16,
-  },
-  swatchRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: spacing[3],
-  },
-  swatch: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    borderWidth: StyleSheet.hairlineWidth,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  swatchSelected: {
-    borderWidth: 3,
-    borderColor: iosSystemColors.white,
-  },
-  emojiRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: spacing[2],
-  },
-  emojiChip: {
-    width: 38,
-    height: 38,
-    borderRadius: 10,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  emojiChipSelected: {
-    borderWidth: 2,
-  },
-  emoji: {
-    fontSize: 20,
-  },
-  createActions: {
-    flexDirection: 'row',
-    justifyContent: 'flex-end',
-    alignItems: 'center',
-    gap: spacing[3],
-    marginTop: spacing[1],
-  },
-  cancelButton: {
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[2],
-  },
-  submitButton: {
-    minWidth: 96,
-    height: spacing[10],
-    borderRadius: borderRadius.md,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: spacing[4],
-  },
-  submitLabel: {
-    fontWeight: '600',
-  },
-  message: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: spacing[6],
-    paddingHorizontal: spacing[4],
-  },
-  errorText: {
-    paddingHorizontal: spacing[4],
-    paddingBottom: spacing[2],
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    container: {
+      width: '100%',
+    },
+    fill: {
+      flex: 1,
+      minHeight: 0,
+    },
+    header: {
+      flexShrink: 0,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing[2],
+      paddingHorizontal: spacing[4],
+      paddingTop: spacing[3],
+      paddingBottom: spacing[2],
+    },
+    backButton: {
+      width: spacing[6],
+      alignItems: 'flex-start',
+      justifyContent: 'center',
+    },
+    headerTitle: {
+      flex: 1,
+    },
+    createButton: {
+      width: spacing[8],
+      height: spacing[8],
+      borderRadius: borderRadius.full,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    createForm: {
+      paddingHorizontal: spacing[4],
+      paddingBottom: spacing[3],
+      gap: spacing[3],
+    },
+    input: {
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: 10,
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      fontSize: textStyles.callout.fontSize,
+    },
+    swatchRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: spacing[3],
+    },
+    swatch: {
+      width: 32,
+      height: 32,
+      borderRadius: 16,
+      borderWidth: StyleSheet.hairlineWidth,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    swatchSelected: {
+      borderWidth: 3,
+      borderColor: iosSystemColors.white,
+    },
+    emojiRow: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: spacing[2],
+    },
+    emojiChip: {
+      width: 38,
+      height: 38,
+      borderRadius: 10,
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    emojiChipSelected: {
+      borderWidth: 2,
+    },
+    emoji: {
+      fontSize: textStyles.title3.fontSize,
+    },
+    createActions: {
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      justifyContent: 'flex-end',
+      alignItems: 'center',
+      gap: spacing[3],
+      marginTop: spacing[1],
+    },
+    message: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingVertical: spacing[6],
+      paddingHorizontal: spacing[4],
+    },
+    errorText: {
+      paddingHorizontal: spacing[4],
+      paddingBottom: spacing[2],
+    },
+  });

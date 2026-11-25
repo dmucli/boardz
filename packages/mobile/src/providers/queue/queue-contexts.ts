@@ -1,6 +1,8 @@
+import type { QueueContentSnapshot } from '../../lib/queue-undo';
 import type { WidgetMirrorEvent } from '../../../modules/live-activity/src/index';
 import { createContext, useContext } from 'react';
 import type {
+  ClimbAuthoredPatch,
   QueueState,
   QueueAction,
   ClimbQueueItem,
@@ -8,14 +10,42 @@ import type {
   QueueAddPlacement,
   SetCurrentClimbOptions,
 } from '@boardsesh/queue';
-import type { PublishPlaybackStateInput } from '@boardsesh/queue-react';
+import type { PublishPlaybackStateInput, SessionRestCadenceSendOptions } from '@boardsesh/queue-react';
+import type { SessionRestCadenceInput, SetSessionRestCadencePayload } from '@boardsesh/shared-schema/generated';
 import type { PlaybackStateChangedEvent, SessionSummary, SessionUser, UserBoard } from '@boardsesh/shared-schema';
-import type { SessionLiveStatsEvent } from '../../lib/graphql/operations';
+import type { AppWorkoutInitialSeed, SessionLiveStatsEvent } from '../../lib/graphql/operations';
+import type { CurrentChangeClock } from '../../lib/ble/stale-current-hold';
+export type { AppWorkoutInitialSeed } from '../../lib/graphql/operations';
 
 /** What triggered a queue reorder — attribution for `SHARED_EVENTS.QueueReordered`. */
 export type QueueReorderSource = 'drag' | 'play-next';
 
+/**
+ * Which queue-sheet control cleared the queue — attribution for
+ * `SHARED_EVENTS.QueueCleared`: the edit mode's Clear, or the header's ⋯ menu.
+ */
+export type QueueClearSource = 'edit' | 'menu';
+
+export type WidgetNavigationOptions = { sendMutation?: boolean };
+
+/** A Next the climber did not press: the rest timer moving the wall on its own. */
+export type NextClimbCaller = 'rest_timer';
+
+export type EndSessionOptions = {
+  notes?: string;
+  /**
+   * Awaited just before END_SESSION, with the session marked as ending locally.
+   * The in-session screen passes the queued-tick wait here (#6903); it lives
+   * outside the queue hooks so they never load the native offline engine.
+   * Errors are swallowed: the session ends whatever it does.
+   */
+  beforeEnd?: (sessionId: string) => Promise<void>;
+};
+
 export type StartSessionConfig = {
+  appWorkoutId?: string;
+  appWorkoutSeed?: AppWorkoutInitialSeed;
+  audience?: 'public' | 'unlisted' | 'followers' | 'invite_only';
   name?: string;
   goal?: string;
   color?: string;
@@ -46,6 +76,13 @@ type QueueContextValue = {
    */
   isSessionWallLit: boolean;
   /**
+   * When the current climb last became a different climb (#4979,
+   * docs/product/current-climb-outside-queue.md section 6). Read by the Bluetooth
+   * auto-sender's stale-climb hold. Stamped for the current queue-item uuid; it
+   * changes identity only when that uuid changes or a FullSync reseeds it.
+   */
+  lastCurrentChange: CurrentChangeClock;
+  /**
    * Queue a climb. Resolves `'cancelled'` when the climb belongs to another
    * board and the climber backed out of the cross-board prompt — callers that
    * sequence something on the add (activating the climb, closing a sheet)
@@ -64,9 +101,11 @@ type QueueContextValue = {
    * `queueItemUuid` when the action came from a queue row — it names the exact
    * slot, which matters when the same climb is queued twice.
    *
-   * - `'added'` — it wasn't queued, so it was inserted
+   * - `'added'` — it wasn't queued, so it was inserted; a climb on the wall
+   *   named without its `queueItemUuid` gets a repeat copy right behind it
    * - `'moved'` — it was queued elsewhere and jumped the line
-   * - `'unchanged'` — it was already up next (or is the climb on the wall)
+   * - `'unchanged'` — it was already up next, or `queueItemUuid` named the slot
+   *   on the wall
    * - `'cancelled'` — the climber backed out of the cross-board prompt
    */
   playNext: (target: {
@@ -74,40 +113,95 @@ type QueueContextValue = {
     queueItemUuid?: string;
   }) => Promise<'added' | 'moved' | 'unchanged' | 'cancelled'>;
   removeFromQueue: (uuid: string) => void;
+  /**
+   * Remove several queue items in one intent. The wire sends share the
+   * serialized queue lane, so `restoreQueueItems` lands after them.
+   */
+  removeQueueItems: (uuids: readonly string[]) => void;
+  /** Merge an Undo against live state when its serialized removal finishes. */
+  restoreQueueItems: (before: QueueContentSnapshot, removedUuids: ReadonlySet<string>, scope: string) => void;
   /** `source` is analytics attribution only — a drag in the queue sheet vs a Play next. */
   reorderQueue: (uuid: string, oldIndex: number, newIndex: number, options?: { source?: QueueReorderSource }) => void;
-  clearQueue: () => void;
-  /** Replace the entire queue (optimistic local UPDATE_QUEUE + best-effort party sync). */
-  setQueue: (queue: ClimbQueueItem[], currentClimbQueueItem?: ClimbQueueItem | null) => void;
+  /** `source` is analytics attribution only — the edit mode's Clear vs the header's ⋯ menu. */
+  clearQueue: (options?: { source?: QueueClearSource }) => void;
   /**
-   * Read the live queue + current climb without subscribing to state. Stable
+   * Replace the entire queue (optimistic local UPDATE_QUEUE + best-effort party
+   * sync). `historyCount` is the History / Up next line while nothing is current
+   * (F3); left out, such a payload is all Up next. A current climb's index is
+   * the line whatever it says.
+   */
+  setQueue: (queue: ClimbQueueItem[], currentClimbQueueItem?: ClimbQueueItem | null, historyCount?: number) => void;
+  /**
+   * Read the live queue, current climb and usable playlist source without
+   * subscribing to state. Stable
    * identity (backed by the internal stateRef), so action-only consumers — e.g.
    * playlist activation deciding whether replacing the queue would clear future
    * items — can read the latest queue at tap time without re-rendering on every
    * queue change.
    */
-  getQueueSnapshot: () => { queue: ClimbQueueItem[]; currentClimbQueueItem: ClimbQueueItem | null };
-  /** Append a generated session behind the live queue, leaving the current climb where it is. */
-  appendGeneratedSession: (items: ClimbQueueItem[]) => void;
-  setCurrentClimb: (item: ClimbQueueItem, options?: SetCurrentClimbOptions) => void;
-  nextClimb: () => void;
-  previousClimb: () => void;
+  getQueueSnapshot: () => {
+    /** Live session identity, for actions that must reject a stale session callback. */
+    sessionId?: string | null;
+    queue: ClimbQueueItem[];
+    currentClimbQueueItem: ClimbQueueItem | null;
+    /** F3 now-slot mode: the History / Up next line. Null or absent in legacy mode. */
+    historyCount?: number | null;
+    playlistSuggestionSource: PlaylistSuggestionSource | null;
+  };
   /**
-   * Apply a widget Next/Previous navigation by absolute index. Dispatches the
-   * current-climb change with the provided correlationId (so the racing
-   * `CurrentClimbChanged` server echo is suppressed) WITHOUT sending a fresh JS
-   * mutation — the native widget intent already sent the server mutation. Using
-   * the absolute item (not a relative `nextClimb`) keeps this idempotent, so it
-   * can't double-advance when the WebSocket echo lands before the Darwin event.
-   * Mirrors web's `dispatchWidgetNavigation`.
+   * Add a batch to Up next, in batch order, leaving the current climb where it is.
+   *
+   * `placement` (default `'end'`) is where the batch lands: `'end'` at the bottom
+   * of Up next (a list's Play last), `'next'` at the top of it, right behind the
+   * climb on the wall (a list's Play next). Climbs already queued are not moved:
+   * the batch goes in as new queue items either way.
+   *
+   * Returns how many items actually landed: the batch is clamped to
+   * `MAX_SYNCED_QUEUE_ITEMS` so a bulk add can't grow the queue past the size the
+   * party backend's `setQueue` accepts (it throws rather than truncating).
+   *
+   * `activateFirstWhenIdle` (default **false**) lets the caller open on the first
+   * added climb when nothing is current — the workout generator's contract.
+   * The playlist Play next / Play last rows leave it off: an add must never take
+   * the crew's wall. It can only fill an empty pointer, never move one that is set.
    */
-  mirrorCurrentClimb: (mirrored: boolean, queueItemUuid: string) => Promise<void>;
+  appendQueueItems: (
+    items: ClimbQueueItem[],
+    options?: { activateFirstWhenIdle?: boolean; placement?: QueueAddPlacement },
+  ) => number;
+  /**
+   * F3 Replay from here: the History entry `queueItemUuid` names, when the long-
+   * press menu should offer Replay from here for it. Null outside now-slot mode,
+   * with nothing current, and for any row that is not History. Reads live state
+   * without subscribing, like `getQueueSnapshot`.
+   */
+  findReplayFromHereItem: (queueItemUuid: string) => ClimbQueueItem | null;
+  setCurrentClimb: (item: ClimbQueueItem, options?: SetCurrentClimbOptions) => void;
+  /**
+   * Correct every queued copy of a climb its setter just saved again (name,
+   * holds, draft state). `setCurrentClimb` deliberately leaves an item that is
+   * already current untouched, and never rewrites a slot already in the queue,
+   * so without this a climb published from the editor keeps reading as a draft.
+   * Local-only; touches neither the queue order nor the party session.
+   */
+  refreshAuthoredClimb: (climbUuid: string, patch: ClimbAuthoredPatch) => void;
+  /** `caller` names a Next the climber did not press (the `Set Active Climb` trigger). */
+  nextClimb: (caller?: NextClimbCaller) => void;
+  previousClimb: () => void;
+  /** Resolves true only when the server accepted the orientation. */
+  mirrorCurrentClimb: (mirrored: boolean, queueItemUuid: string) => Promise<boolean>;
   dispatchWidgetMirror: (event: Extract<WidgetMirrorEvent, { kind: 'confirmed' }>) => Promise<boolean>;
-  dispatchWidgetNavigation: (item: ClimbQueueItem, correlationId: string) => void;
+  /**
+   * Select the absolute native navigation target with its correlation ID.
+   * iOS already publishes natively; Android requests the existing JS mutation
+   * path with sendMutation. Defaults to local-only to preserve iOS behavior.
+   */
+  dispatchWidgetNavigation: (item: ClimbQueueItem, correlationId: string, options?: WidgetNavigationOptions) => void;
   /** Replace the playlist suggestion source that drives swipe-through climbs. */
   setPlaylistSuggestionSource: (source: PlaylistSuggestionSource | null) => void;
   /** Refresh the suggestion source in place (no-op unless it matches the active one). */
-  refreshPlaylistSuggestionSource: (source: PlaylistSuggestionSource) => void;
+  /** True when the source replaced the active one; false when it was stale and ignored. */
+  refreshPlaylistSuggestionSource: (source: PlaylistSuggestionSource) => boolean;
   /**
    * Reset the active session locally. Pass `{ notifyServer: true }` on an
    * intentional leave (e.g. switching sessions) to emit LEAVE_SESSION so peers
@@ -118,8 +212,11 @@ type QueueContextValue = {
    * End the active session. An optional recap (`notes`) is trimmed and sent only
    * when non-empty; the returned SessionSummary echoes it back for the summary
    * screen. Resolves null when there's no active session or the mutation failed.
+   * `beforeEnd` runs after the session is marked as ending locally (so a remote
+   * SessionEnded during it is suppressed) and before END_SESSION; see
+   * EndSessionOptions.
    */
-  endSession: (options?: { notes?: string }) => Promise<SessionSummary | null>;
+  endSession: (options?: EndSessionOptions) => Promise<SessionSummary | null>;
   /**
    * Explicitly create a session with optional config (name, goal, etc.).
    * Returns the new sessionId, or null if there is no active board or the
@@ -134,7 +231,10 @@ type QueueContextValue = {
    * `startSession`, which *reads* the active board to create a new session;
    * `joinSession` *writes* the active board from the session's boardPath.
    */
-  joinSession: (sessionId: string, opts: { boardPath: string; userBoard: UserBoard }) => Promise<void>;
+  joinSession: (
+    sessionId: string,
+    opts: { boardPath: string; userBoard: UserBoard; isOperationCurrent?: () => boolean },
+  ) => Promise<boolean>;
   /**
    * Broadcast the session's boardPath so every party member follows the same
    * angle/board. Best-effort; a true no-op in solo (never creates a session).
@@ -162,6 +262,14 @@ type QueueContextValue = {
   subscribeToPlaybackEvents: (listener: (event: PlaybackStateChangedEvent) => void) => () => void;
   /** Broadcast local route-playback state to party peers. Best-effort; no-op solo. */
   publishPlaybackState: (input: PublishPlaybackStateInput) => Promise<void>;
+  /**
+   * Change the session's shared rest clock (#5382). Null with no session;
+   * throws on a transport error, so the caller decides what a lost write means.
+   */
+  setSessionRestCadence: (
+    input: SessionRestCadenceInput,
+    options?: SessionRestCadenceSendOptions,
+  ) => Promise<SetSessionRestCadencePayload | null>;
 };
 
 export const QueueContext = createContext<QueueContextValue | null>(null);
@@ -176,6 +284,7 @@ export const QueueContext = createContext<QueueContextValue | null>(null);
  * - useQueueSessionControls(): session id, serial/wall controls, and the member-userId set for party surfaces.
  * - useQueueLiveStats(): high-frequency live stats and roster updates.
  * - useIsSharedSession(): "is anyone else here" — browse-by-default gating.
+ * - useIsCrewSession(): the same roster answer without the browse rollout flag — the wall-driver rule.
  * - useActiveClimbUuid(): row-level active-climb highlighting.
  * - useHasActiveClimb(): presence-only bottom chrome metrics.
  * - usePlaylistSuggestionSource(): playlist peek/suggestion navigation.
@@ -213,9 +322,37 @@ export const QueueSessionControlContext = createContext<QueueSessionControlConte
  */
 type QueueSessionIdContextValue = {
   sessionId: string | null;
+  /** Scope for Undo offers: session, physical board configuration and account. */
+  undoScope: string;
 };
 
 export const QueueSessionIdContext = createContext<QueueSessionIdContextValue | null>(null);
+
+/**
+ * The session's board path (`/b/{slug}` or the positional tuple), '' outside a
+ * session. Its own context, read by the player to tell when a crewmate moved
+ * the session to another board at the gym (#7076); it changes only when the
+ * session's board does.
+ */
+export const QueueSessionBoardPathContext = createContext<string>('');
+
+export function useSessionBoardPath(): string {
+  return useContext(QueueSessionBoardPathContext);
+}
+
+/**
+ * Whether the cold-start queue restore has landed for this viewer: the saved
+ * solo queue came back, or there was nothing to bring back. A bare boolean
+ * that flips once per launch (and again after a sign-in or sign-out), in the
+ * same render as the restored climb, so a reader can tell the restore's change
+ * of current from the climber's own. Read by `LastPickWatcher`. False outside
+ * the provider, where no current change is the restore's.
+ */
+export const QueueRestoredContext = createContext<boolean>(false);
+
+export function useQueueRestored(): boolean {
+  return useContext(QueueRestoredContext);
+}
 
 /**
  * Live session analytics + presence, split out of the main QueueContext so the
@@ -255,6 +392,15 @@ export const QueueLiveStatsContext = createContext<QueueLiveStatsContextValue | 
  */
 type QueueSharedSessionContextValue = {
   isSharedSession: boolean;
+  /**
+   * The roster half of `isSharedSession` alone: someone else is in this session,
+   * past the arming dwell, whatever the `shared-session-browse` flag says. The
+   * flag gates how GESTURES behave in a crew; it must never gate who may move a
+   * crew's wall, or every armed phone in a flag-off crew could advance it.
+   * Read through `useIsCrewSession` by the wall-driver rule
+   * (`lib/session-timer/driver-rule.ts`).
+   */
+  isCrewSession: boolean;
 };
 
 export const QueueSharedSessionContext = createContext<QueueSharedSessionContextValue | null>(null);
@@ -293,6 +439,18 @@ export const QueueHasActiveClimbContext = createContext<QueueHasActiveClimbConte
 type QueueDataContextValue = {
   queue: ClimbQueueItem[];
   currentClimbQueueItem: ClimbQueueItem | null;
+  /** Server-bound participant who last changed the current queue item. */
+  currentChangedBy?: string | null;
+  /** Current mover projected through the session roster, excluding this participant. */
+  currentClimbMover?: { username: string; avatarUrl: string | null } | null;
+  /**
+   * F3 now-slot mode: the History / Up next line while nothing is current
+   * (`upNextStart` reads it). Null or absent in legacy mode, which every reader
+   * then treats exactly as today.
+   */
+  historyCount?: number | null;
+  /** F3 now-slot mode is on: History rows can be replayed from. Absent reads as off. */
+  nowSlotMode?: boolean;
 };
 
 export const QueueDataContext = createContext<QueueDataContextValue | null>(null);
@@ -313,6 +471,7 @@ type QueueActionsContextValue = Omit<
   | 'lastConnectedBoardSerial'
   | 'participantId'
   | 'isSessionWallLit'
+  | 'lastCurrentChange'
 >;
 
 export const QueueActionsContext = createContext<QueueActionsContextValue | null>(null);
@@ -356,6 +515,17 @@ export function useIsSharedSession(): boolean {
   const context = useContext(QueueSharedSessionContext);
   if (!context) throw new Error('useIsSharedSession must be used within QueueProvider');
   return context.isSharedSession;
+}
+
+/**
+ * True when another climber is in this session with me, past the arming dwell —
+ * the crew test for "may my timer move the wall", independent of the browse
+ * rollout flag. See {@link QueueSharedSessionContext}.
+ */
+export function useIsCrewSession(): boolean {
+  const context = useContext(QueueSharedSessionContext);
+  if (!context) throw new Error('useIsCrewSession must be used within QueueProvider');
+  return context.isCrewSession;
 }
 
 export function useActiveClimbUuid(): string | null {

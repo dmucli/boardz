@@ -7,6 +7,7 @@ const browser = vi.hoisted(() => ({ openBrowserAsync: vi.fn().mockResolvedValue(
 const scrollView = vi.hoisted(() => ({ contentContainerStyle: null as unknown }));
 const routerMock = vi.hoisted(() => ({ push: vi.fn() }));
 const toastMock = vi.hoisted(() => ({ showToast: vi.fn() }));
+const analyticsMock = vi.hoisted(() => ({ track: vi.fn() }));
 const partnerships = vi.hoisted(() => ({
   openPartnershipsEmail: vi.fn().mockResolvedValue(true),
   PARTNERSHIPS_EMAIL: 'partnerships@boardsesh.com',
@@ -14,6 +15,7 @@ const partnerships = vi.hoisted(() => ({
 
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (colorName: string) => colorName,
   ScrollView: ({ children, contentContainerStyle }: { children?: ReactNode; contentContainerStyle?: unknown }) => {
     scrollView.contentContainerStyle = contentContainerStyle;
@@ -33,14 +35,20 @@ vi.mock('react-i18next', () => ({
         'mobile.about.acknowledgementsLink': 'Acknowledgements',
         'mobile.about.changelogLink': "What's New",
         'mobile.about.viewOnGithub': 'View on GitHub',
+        'mobile.about.emailPartners': 'Email us',
+        'mobile.about.shareApp.link': 'Share Boardsesh',
       })[key] ?? key,
   }),
 }));
 
 vi.mock('../../src/components/BoardseshLogo', () => ({ BoardseshLogo: () => null }));
 vi.mock('../../src/components/Button', () => ({
-  Button: ({ icon, onPress, title }: { icon?: string; onPress: () => void; title: string }) =>
-    createElement('button', { 'data-icon': icon, onClick: onPress, type: 'button' }, title),
+  Button: ({ icon, onPress, title, size }: { icon?: string; onPress: () => void; title: string; size?: string }) =>
+    createElement(
+      'button',
+      { 'data-icon': icon, 'data-size': size ?? 'medium', onClick: onPress, type: 'button' },
+      title,
+    ),
 }));
 vi.mock('../../src/components/Icon', () => ({
   Icon: ({ name }: { name: string }) => createElement('span', { 'data-icon': name }),
@@ -59,13 +67,23 @@ vi.mock('../../src/components/PressableSurface', () => ({
 vi.mock('../../src/components/SectionHeader', () => ({
   SectionHeader: ({ title }: { title: string }) => createElement('h2', null, title),
 }));
+vi.mock('../../src/components/ShareAppSheet', () => ({
+  ShareAppSheet: ({ onDismiss }: { onDismiss: () => void }) =>
+    createElement(
+      'div',
+      { 'data-testid': 'share-app-sheet' },
+      createElement('button', { onClick: onDismiss }, 'close'),
+    ),
+}));
 vi.mock('../../src/components/Text', () => ({
-  Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+  Text: ({ children, selectable }: { children?: ReactNode; selectable?: boolean }) =>
+    createElement('span', { 'data-selectable': selectable ? 'true' : undefined }, children),
 }));
 vi.mock('../../src/hooks/use-bottom-chrome-metrics', () => ({
   useBottomChromeMetrics: () => ({ scrollBottomPadding: 80 }),
 }));
 vi.mock('../../src/lib/partnerships', () => partnerships);
+vi.mock('../../src/lib/analytics', () => analyticsMock);
 vi.mock('../../src/providers/toast-provider', () => ({ useToast: () => toastMock }));
 vi.mock('../../src/providers/theme-provider', () => ({
   useTheme: () => ({
@@ -109,9 +127,27 @@ describe('AboutScreen partnerships + acknowledgements', () => {
   it('opens the partnerships mail composer from the CTA', () => {
     render(<AboutScreen />);
 
-    fireEvent.click(screen.getByRole('button', { name: 'partnerships@boardsesh.com' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Email us' }));
 
     expect(partnerships.openPartnershipsEmail).toHaveBeenCalledTimes(1);
+  });
+
+  // HIG Buttons: a button's label is a verb, and a screen of info cards has no
+  // single prominent action, so none of its buttons is large.
+  it('labels the partnerships CTA with a verb and shows the address as text below it', () => {
+    render(<AboutScreen />);
+
+    expect(screen.queryByRole('button', { name: 'partnerships@boardsesh.com' })).toBeNull();
+    const address = screen.getByText('partnerships@boardsesh.com');
+    expect(address.getAttribute('data-selectable')).toBe('true');
+  });
+
+  it('keeps the in-card buttons small and the Discord button medium', () => {
+    render(<AboutScreen />);
+
+    expect(screen.getByRole('button', { name: 'View on GitHub' }).getAttribute('data-size')).toBe('small');
+    expect(screen.getByRole('button', { name: 'Email us' }).getAttribute('data-size')).toBe('small');
+    expect(screen.getByRole('button', { name: 'Join Discord' }).getAttribute('data-size')).toBe('medium');
   });
 
   it('navigates to the Acknowledgements screen', () => {
@@ -136,5 +172,20 @@ describe('AboutScreen partnerships + acknowledgements', () => {
     fireEvent.click(screen.getByRole('button', { name: 'View on GitHub' }));
 
     expect(browser.openBrowserAsync).toHaveBeenCalledWith('https://github.com/boardsesh/boardsesh');
+  });
+});
+
+describe('AboutScreen share the app', () => {
+  it('opens the share sheet from its row and closes it again', () => {
+    analyticsMock.track.mockClear();
+    render(<AboutScreen />);
+
+    expect(screen.queryByTestId('share-app-sheet')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Share Boardsesh' }));
+    expect(screen.getByTestId('share-app-sheet')).toBeTruthy();
+    expect(analyticsMock.track).toHaveBeenCalledWith('App Share Action', { action: 'open' });
+
+    fireEvent.click(screen.getByRole('button', { name: 'close' }));
+    expect(screen.queryByTestId('share-app-sheet')).toBeNull();
   });
 });

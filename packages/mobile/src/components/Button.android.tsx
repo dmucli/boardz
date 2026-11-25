@@ -3,7 +3,7 @@
 // stays until the paper-removal endgame, #3273).
 //
 // The emphasis tier maps onto the Compose Material 3 button family:
-//   filled   → Button (brand container)        tonal → FilledTonalButton (MD3
+//   filled   → Button (brand container)        tonal → FilledTonalButton (Velvet
 //   outlined → OutlinedButton                          secondaryContainer)
 //   text     → TextButton
 // Material is opaque, so the `over` surface prop is inert here (a Material button
@@ -12,7 +12,7 @@
 // (no native equivalent) swaps the leading icon for a CircularProgressIndicator
 // and disables the button. The press/haptic guard lives in Button.logic.ts.
 
-import { Host } from '@expo/ui';
+import { ComposeHost } from './ComposeHost.android';
 import {
   Button as ComposeButton,
   FilledTonalButton,
@@ -29,11 +29,21 @@ import {
   height as heightModifier,
   padding,
   size,
+  testID as testIDModifier,
 } from '@expo/ui/jetpack-compose/modifiers';
-import type { ImageSourcePropType } from 'react-native';
+import { useWindowDimensions, type ImageSourcePropType } from 'react-native';
 import { useTheme } from '../providers/theme-provider';
-import { brandAccentColor } from '../theme/expo-ui-modifiers';
-import { buttonFillAxes, buttonMatchContents, makeButtonPressHandler, pinnedButtonHeight } from './Button.logic';
+import { brandAccentColor, tonalButtonColors } from '../theme/expo-ui-modifiers';
+import {
+  buttonFillAxes,
+  buttonLabelStyle,
+  buttonMatchContents,
+  cappedComposeLabelSize,
+  makeButtonPressHandler,
+  pinnedButtonHeight,
+  resolveButtonMaxFontScale,
+} from './Button.logic';
+import { materialTextStyles } from '../theme/typography';
 import { sizeConfig, type ButtonProps } from './Button.types';
 import type { IconName } from './icon-map';
 
@@ -52,6 +62,8 @@ const BUTTON_ICON_SOURCE: Partial<Record<IconName, ImageSourcePropType>> = {
   share: require('../../assets/material-icons/share.xml'),
   transfer: require('../../assets/material-icons/transfer.xml'),
   camera: require('../../assets/material-icons/camera.xml'),
+  'crop.free': require('../../assets/material-icons/crop-free.xml'),
+  photo: require('../../assets/material-icons/image.xml'),
   add: require('../../assets/material-icons/add.xml'),
   refresh: require('../../assets/material-icons/refresh.xml'),
   instagram: require('../../assets/material-icons/instagram.xml'),
@@ -73,10 +85,22 @@ export function Button({
   tintColor,
   minHeight,
   role = 'default',
+  maxFontSizeMultiplier,
   testID,
   style,
 }: ButtonProps) {
-  const { brandColors, colorScheme } = useTheme();
+  const { brandColors, m3, systemColors } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  // Every tier and size step sets its label in M3 labelLarge (14/20, weight 500),
+  // the M3 Buttons spec. The @expo/ui Text has to be TOLD: it builds its own
+  // TextStyle instead of inheriting the button's LocalTextStyle, so without
+  // `typography` it drew 14sp at weight 400.
+  const cappedLabelSize = cappedComposeLabelSize(
+    materialTextStyles.label.fontSize,
+    fontScale,
+    resolveButtonMaxFontScale(maxFontSizeMultiplier),
+  );
+  const labelStyle = buttonLabelStyle(cappedLabelSize);
   const handlePress = makeButtonPressHandler({ onPress, disabled, loading, haptic });
 
   // A Compose Button takes its accessible name from its Text content (the title),
@@ -98,17 +122,24 @@ export function Button({
   const fillColor = tintColor ?? brandAccentColor(brandColors);
   const accentColor = tintColor ?? brandColors.primary;
 
-  // Per-variant Compose colours. tonal intentionally takes the MD3 default
-  // (secondaryContainer / onSecondaryContainer) and ignores tintColor — byte
-  // parity with Paper's `contained-tonal`. Destructive uses the brand error
-  // tokens (MoreForm.android idiom).
-  let colors: { containerColor?: string; contentColor?: string } | undefined;
+  // Per-variant Compose colours. tonal takes the Velvet secondaryContainer /
+  // onSecondaryContainer pair and ignores tintColor — parity with Paper's
+  // `contained-tonal`. It has to be named: the Compose default comes from the
+  // seeded scheme, not Velvet's roles. Destructive uses the brand error tokens
+  // (MoreForm.android idiom).
+  let colors: { containerColor?: string; contentColor?: string };
   if (variant === 'filled') {
     colors = isDestructive
       ? { containerColor: brandColors.error, contentColor: brandColors.onPrimary }
       : { containerColor: fillColor, contentColor: brandColors.onPrimary };
   } else if (variant === 'tonal') {
-    colors = isDestructive ? { containerColor: brandColors.error, contentColor: brandColors.onPrimary } : undefined;
+    colors = isDestructive
+      ? { containerColor: brandColors.error, contentColor: brandColors.onPrimary }
+      : tonalButtonColors(m3);
+  } else if (variant === 'outlined') {
+    // Label-coloured text on the neutral outline (#7695): violet stays for
+    // links, status and selection. An explicit tint still wins.
+    colors = { contentColor: isDestructive ? brandColors.error : (tintColor ?? (systemColors.label as string)) };
   } else {
     colors = { contentColor: isDestructive ? brandColors.error : accentColor };
   }
@@ -121,11 +152,11 @@ export function Button({
     // White on the brand fill (destructive fills with the error container, still white content).
     spinnerColor = brandColors.onPrimary;
   } else if (variant === 'tonal') {
-    // Non-destructive tonal content ≈ brand primary; destructive fills the error
-    // container, so its content (and the spinner) is white (onPrimary), not error.
-    spinnerColor = isDestructive ? brandColors.onPrimary : brandColors.primary;
+    // Matches the tonal content colour; destructive fills the error container, so
+    // its content (and the spinner) is white (onPrimary), not error.
+    spinnerColor = isDestructive ? brandColors.onPrimary : (colors.contentColor ?? brandColors.primary);
   } else {
-    spinnerColor = isDestructive ? brandColors.error : accentColor;
+    spinnerColor = isDestructive ? brandColors.error : (colors.contentColor ?? accentColor);
   }
 
   const Comp =
@@ -151,13 +182,14 @@ export function Button({
   // whose native styles measure differently (the tick bar). Compose takes it
   // directly; the Host stops measuring that axis so the value survives.
   const composeModifiers = [
+    ...(testID ? [testIDModifier(testID)] : []),
     ...(fills.width ? [fillMaxWidth()] : []),
     ...(pinnedHeight != null ? [heightModifier(pinnedHeight)] : []),
     ...(minHeight != null ? [defaultMinSize({ minHeight })] : []),
   ];
 
   return (
-    <Host matchContents={buttonMatchContents(style)} colorScheme={colorScheme} style={style} testID={testID}>
+    <ComposeHost matchContents={buttonMatchContents(style)} style={style} testID={testID}>
       <Comp
         onClick={handlePress}
         enabled={!(disabled || loading)}
@@ -184,11 +216,14 @@ export function Button({
               modifiers={[padding(0, 0, 8, 0), size(config.iconSize, config.iconSize)]}
             />
           ) : iconSource ? (
-            <Icon source={iconSource} size={config.iconSize} modifiers={[padding(0, 0, 8, 0)]} />
+            // Sized by modifier after the padding, as the spinner above is: the
+            // `size` prop lands before the padding, so the 8dp end margin came
+            // out of the glyph's own 16dp box and drew it at half size.
+            <Icon source={iconSource} modifiers={[padding(0, 0, 8, 0), size(config.iconSize, config.iconSize)]} />
           ) : null}
-          <Text>{title}</Text>
+          <Text style={labelStyle}>{title}</Text>
         </Row>
       </Comp>
-    </Host>
+    </ComposeHost>
   );
 }

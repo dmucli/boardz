@@ -1,73 +1,86 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, RefreshControl, Pressable, StyleSheet, Platform, useWindowDimensions } from 'react-native';
-import { FlashList } from '@shopify/flash-list';
-import { useRouter } from 'expo-router';
-import { useTranslation } from 'react-i18next';
-import type { BottomSheet } from '@expo/ui/community/bottom-sheet';
+import { SHARED_EVENTS } from '@boardsesh/analytics';
 import type { AscentFeedItem } from '@boardsesh/graphql/operations';
 import {
-  toAscentFeedInput,
   DEFAULT_LOGBOOK_FILTERS,
-  DEFAULT_LOGBOOK_SORT,
   buildLogbookListRows,
   dedupeLogbookItems,
-  shouldShowLogbookDividers,
-  pickBestGroupEntry,
-  sumGroupTries,
   logbookDayKey,
+  logbookSortKeyOf,
+  pickBestGroupEntry,
+  shouldShowLogbookDividers,
+  sumGroupTries,
+  toAscentFeedInput,
   type LogbookFilterState,
-  type LogbookSortPreset,
   type LogbookListRow,
+  type LogbookSortState,
 } from '@boardsesh/logbook';
-import { useDeleteTick } from '@boardsesh/board-react';
-import { SHARED_EVENTS } from '@boardsesh/analytics';
-import { track } from '../../lib/analytics';
-import { Text } from '../Text';
-import { Icon } from '../Icon';
-import { ActivityIndicator } from '../ActivityIndicator';
-import { SearchHeader, type SearchHeaderHandle } from '../SearchHeader';
-import { LogbookRow } from './LogbookRow';
-import { LogbookDayDivider, LogbookWallSubDivider } from './LogbookDayDivider';
-import { LogbookEditSheet } from './LogbookEditSheet';
-import { BoardLinkPrompt } from './BoardLinkPrompt';
-import { LogbookFilterSheet } from './LogbookFilterSheet';
-import { LogbookEntryChooserSheet } from './LogbookEntryChooserSheet';
-import { LogbookChipRow } from './LogbookChipRow';
-import { LogbookFacetRail } from './LogbookFacetRail';
-import type { LogbookFacetKey } from './LogbookChipRow.logic';
-import { useLogbookSearch, countActiveLogbookFilters } from './use-logbook-search';
-import { useUserAscentsFeed, useUserGroupedAscentsFeed, useGrades } from '../../lib/graphql/hooks';
-import { useOfflineQueryState } from '../../hooks/use-offline-query-state';
-import { OfflineState } from '../OfflineState';
-import type { Grade } from '@boardsesh/shared-schema';
-import { openClimbInPlayDrawer } from '../../lib/open-climb-in-play-drawer';
-import { tickToClimb } from '../../lib/tick-to-climb';
-import { renderBoardToPlaylistConfig } from '../../lib/playlists/board-details-for-playlist';
 import { getLayoutDisplayName } from '@boardsesh/profile-stats';
-import { nowDate } from '../../lib/clock';
+import type { Grade } from '@boardsesh/shared-schema';
+import type { BottomSheet } from '../sheet-presentation';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+import { StyleSheet, View, useWindowDimensions } from 'react-native';
+import { ShelfHeader } from '../ShelfHeader';
 import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
+import { useGradeFormat } from '../../hooks/use-grade-format';
+import { useHideOnScroll } from '../../hooks/use-hide-on-scroll';
+import { useNativeRootHeader } from '../../hooks/use-native-root-header';
+import { useOfflineQueryState } from '../../hooks/use-offline-query-state';
+import { type ScrollEdgeBackdrop } from '../../hooks/use-scroll-edge-backdrop';
+import { useToday } from '../../hooks/use-today';
+import { track } from '../../lib/analytics';
+import { createFilterPickerHandoffId } from '../../lib/filter-picker-handoff-id';
+import { buildGradeRailStops } from '../../lib/grade-stops';
+import { useGrades, useUserAscentsFeed, useUserGroupedAscentsFeed } from '../../lib/graphql/hooks';
+import { hapticSelection } from '../../lib/haptics';
+import { useLogbookPinnedChips } from '../../lib/logbook-pinned-chips-store';
+import { subscribeToLogbookSetterSelection } from '../../lib/logbook-setter-handoff';
+import { renderBoardToPlaylistConfig } from '../../lib/playlists/board-details-for-playlist';
+import { useTickListActivation } from '../../lib/playlists/use-tick-list-activation';
+import { useScopedRouter } from '../../lib/routing/scoped-navigation';
+import { normalizeSearchName } from '../../lib/search-name';
+import { tickToClimb } from '../../lib/tick-to-climb';
+import { useConfirm } from '../../providers/dialog-provider';
 import { useDrawerHost } from '../../providers/drawer-host-provider';
 import { useFeatureFlag } from '../../providers/feature-flags-provider';
-import { useConfirm } from '../../providers/dialog-provider';
-import { useToast } from '../../providers/toast-provider';
-import { normalizeSearchName } from '../../lib/search-name';
-import { hapticSelection, hapticSuccess, hapticError } from '../../lib/haptics';
-import { iosSystemColors } from '../../theme/ios-colors';
-import { spacing, borderRadius } from '../../theme/tokens';
-import { useTheme } from '../../providers/theme-provider';
-import { selectByVariant } from '../../theme/variants';
+import { useLogbookDeleteActions, usePendingLogbookDeletes } from '../../providers/logbook-delete-provider';
+import { borderRadius, opacity, spacing } from '../../theme/tokens';
+import { ReadableColumn } from '../ReadableColumn';
+import { FilterTokenRow } from '../search/FilterTokenRow';
+import { BoardLinkPrompt } from './BoardLinkPrompt';
+import { LogbookChipRow } from './LogbookChipRow';
+import { LogbookDayDivider, LogbookWallSubDivider } from './LogbookDayDivider';
+import { LogbookEditSheet } from './LogbookEditSheet';
+import { LogbookEntryChooserSheet } from './LogbookEntryChooserSheet';
+import { LogbookFacetRail } from './LogbookFacetRail';
+import { LogbookFilterSheet } from './LogbookFilterSheet';
+import { LogbookRow } from './LogbookRow';
+import { LogbookView } from './LogbookView';
+import {
+  buildLogbookFilterTokens,
+  countLogbookFilters,
+  logbookBoardLabel,
+  type LogbookRailKind,
+} from './logbook-capsules';
+import { useLogbookBoardOptions } from './use-logbook-board-options';
+import { useLogbookSearch } from './use-logbook-search';
 
 const SEARCH_DEBOUNCE_MS = 300;
+// How long a setter push blocks another one if its picks never come back (a
+// push that didn't land). Longer than the native push animation.
+const SETTER_PUSH_RELEASE_MS = 1500;
 
 // Kilter and Tension share an identical difficulty-id scale, so one board's grade
-// list is the canonical scale for the grade chip's label — the same source the
-// filter sheet's GradeRangeRail uses (LogbookFilterSheet's GRADE_SCALE_BOARD), so
-// the chip and the rail never word a grade differently.
+// list is the canonical scale for the grade capsule's label, the inline rail and
+// the sheet's rail, so they never word a grade differently.
 const GRADE_SCALE_BOARD = 'kilter';
 
-// Stable empty grade list so the chip row + facet rail (both memo'd) keep their
-// `grades` prop identity while the grade query is still loading (undefined).
+// Stable empty grade list so the memo'd rails keep their `grades` prop identity
+// while the grade query is still loading (undefined).
 const EMPTY_GRADES: Grade[] = [];
+
+/** Where a filter or sort change came from, for `Logbook Filter Changed` / `Logbook Sort Changed`. */
+type LogbookChangeSurface = 'capsule' | 'rail' | 'sheet' | 'token' | 'setter_picker' | 'empty_state';
 
 type LogbookTabProps = {
   userId: string | undefined;
@@ -80,6 +93,9 @@ type LogbookTabProps = {
    * read-only in the play drawer instead of the editable LogbookEditSheet.
    */
   viewerIsOwner?: boolean;
+  /** Compose controls into a measured profile header instead of the in-flow toolbar. */
+  renderHeader?: (controls: ReactNode, onHeightChange: (height: number) => void) => ReactNode;
+  scrollEdge?: ScrollEdgeBackdrop;
 };
 
 // One list unit for both modes: in grouped (date-ordered) views it is the
@@ -92,133 +108,315 @@ type LogbookGroupUnit = AscentFeedItem & {
   groupItems?: AscentFeedItem[];
 };
 
-export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: LogbookTabProps) {
-  const { t } = useTranslation('you');
-  const { systemColors, brandColors, variant } = useTheme();
-  // Kill switch for the search + filter UI — rolled out 100% in PostHog since
-  // 2026-07-03; the gate stays so a bad release can be turned off server-side.
-  const logbookFiltersEnabled = useFeatureFlag('logbook-filters') === true;
-  // Latest/Hardest become top-level Liquid Glass chips (iOS 26 only) so sort is
-  // switchable without opening the sheet; the variant goes through selectByVariant
-  // per the mobile variant guard. When shown, the sheet's Sort block is suppressed.
-  const showSortChips =
-    logbookFiltersEnabled && Platform.OS === 'ios' && selectByVariant(variant, { liquidGlass: true, material: false });
-  // Grade scale for the chip row's grade label — fetched only when the chip row is
-  // shown (the Android/Material toolbar has no grade chip). Same query as the sheet.
-  const { data: grades } = useGrades(GRADE_SCALE_BOARD, showSortChips);
-  const router = useRouter();
-  const { openPlayDrawer, openClimbActions } = useDrawerHost();
+type GroupedFeedPages = NonNullable<ReturnType<typeof useUserGroupedAscentsFeed>['data']>['pages'];
+type FlatFeedPages = NonNullable<ReturnType<typeof useUserAscentsFeed>['data']>['pages'];
+
+type LogbookRowsInput = {
+  groupedMode: boolean;
+  showDividers: boolean;
+  groupedPages: GroupedFeedPages | undefined;
+  flatPages: FlatFeedPages | undefined;
+  groupedHasMore: boolean;
+  flatHasMore: boolean;
+  hiddenTickUuids: ReadonlySet<string>;
+};
+
+// Wall label ("Alex's board") feeds the divider/subdivider context; board
+// identity only — the angle stays on every row. Derivation needs the app's
+// board metadata so it happens here, not in the shared builder.
+const wallOf = (item: AscentFeedItem) => item.boardDisplayName ?? getLayoutDisplayName(item.boardType, item.layoutId);
+
+/**
+ * The logbook's rows from the loaded feed pages. A plain function of the pages
+ * so a swipe track paging past the loaded rows (issue #6665) reads the list in
+ * exactly the order the screen shows it.
+ */
+function buildLogbookRows({
+  groupedMode,
+  showDividers,
+  groupedPages,
+  flatPages,
+  groupedHasMore,
+  flatHasMore,
+  hiddenTickUuids,
+}: LogbookRowsInput): LogbookListRow<LogbookGroupUnit>[] {
+  if (groupedMode) {
+    const groups = groupedPages?.flatMap((page) => page.userGroupedAscentsFeed.groups) ?? [];
+    // RE-BUCKET the backend groups client-side by (climb, LOCAL day, angle):
+    // the resolver cuts groups on the stored UTC calendar day, which
+    // disagrees with the local-day dividers on any non-UTC device (an
+    // evening session would split), and its key ignores angle, which would
+    // sum tries across angles under one row — the exact honesty rules the
+    // redesign set. Flattening items and regrouping fixes both without a
+    // backend timezone parameter; item-level dedupe absorbs group overlap
+    // from offset pagination.
+    const itemsByLocalKey = new Map<string, AscentFeedItem[]>();
+    const seenTickUuids = new Set<string>();
+    for (const group of groups) {
+      for (const item of group.items) {
+        if (seenTickUuids.has(item.uuid) || hiddenTickUuids.has(item.uuid)) continue;
+        seenTickUuids.add(item.uuid);
+        // isMirror splits the bucket: on Tension/Decoy the mirrored ascent is
+        // its own problem — collapsing it with the normal orientation would
+        // sum tries across orientations and mislabel the row's mirror tag.
+        const localKey = `${item.climbUuid}|${logbookDayKey(item.climbedAt)}|${item.angle}|${item.isMirror}`;
+        const bucket = itemsByLocalKey.get(localKey);
+        if (bucket) bucket.push(item);
+        else itemsByLocalKey.set(localKey, [item]);
+      }
+    }
+    const units: LogbookGroupUnit[] = Array.from(itemsByLocalKey.values()).map((bucketItems) => {
+      const best = pickBestGroupEntry(bucketItems);
+      // The unit's timestamp is the bucket's LATEST activity (not the best
+      // entry's) so ordering reads "when did I last touch this today".
+      const latestClimbedAt = bucketItems.reduce(
+        (latest, item) => (item.climbedAt > latest ? item.climbedAt : latest),
+        bucketItems[0].climbedAt,
+      );
+      return {
+        ...best,
+        climbedAt: latestClimbedAt,
+        wall: wallOf(best),
+        groupTries: sumGroupTries(bucketItems),
+        groupItems: bucketItems,
+      };
+    });
+    units.sort((a, b) => (a.climbedAt < b.climbedAt ? 1 : a.climbedAt > b.climbedAt ? -1 : 0));
+    return buildLogbookListRows(units, { hasMore: groupedHasMore });
+  }
+  const items =
+    flatPages?.flatMap((page) => page.userAscentsFeed.items).filter((item) => !hiddenTickUuids.has(item.uuid)) ?? [];
+  if (showDividers) {
+    // Date-ASC custom sort: dividers without grouping (the grouped resolver
+    // is DESC-only) — one row per tick, exactly as before grouping existed.
+    const withWalls = items.map((item) => ({ ...item, wall: wallOf(item) }));
+    return buildLogbookListRows(withWalls, { hasMore: flatHasMore });
+  }
+  return dedupeLogbookItems(items).map((item) => ({ type: 'entry', key: item.uuid, item, wallCovered: false }));
+}
+
+/** The ticks a logbook's rows show, in the order it shows them. */
+function logbookEntries(rows: LogbookListRow<LogbookGroupUnit>[]): LogbookGroupUnit[] {
+  const entries: LogbookGroupUnit[] = [];
+  for (const row of rows) if (row.type === 'entry') entries.push(row.item);
+  return entries;
+}
+
+export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true, renderHeader, scrollEdge }: LogbookTabProps) {
+  const nativeRootHeader = useNativeRootHeader();
+  // On the Profile tab the Android nav bar hides as this list scrolls down; each
+  // sub-tab is its own scroll source, so switching sub-tabs never reads as a jump.
+  const handleScroll = useHideOnScroll(scrollEdge?.listProps.onScroll);
+  const [headerHeight, setHeaderHeight] = useState(0);
+  const hasComposedHeader = renderHeader != null;
+  const headerMeasured = !hasComposedHeader || headerHeight > 0;
+  const scrollHeaderInset = hasComposedHeader && nativeRootHeader ? headerHeight : 0;
+  const { t, i18n } = useTranslation('you');
+  const { t: tSession } = useTranslation('session');
+  // One grade scale for the grade capsule's label, the inline rail and the sheet.
+  const { data: grades } = useGrades(GRADE_SCALE_BOARD);
+  const { gradeFormat } = useGradeFormat();
+  const gradeStops = useMemo(
+    () => buildGradeRailStops(grades ?? EMPTY_GRADES, gradeFormat, GRADE_SCALE_BOARD),
+    [grades, gradeFormat],
+  );
+  const boardOptions = useLogbookBoardOptions(userId);
+  const { pinned: pinnedChips, isPinned } = useLogbookPinnedChips();
+  const scopedRouter = useScopedRouter();
+  const { getClimbActions } = useDrawerHost();
   const bottomChrome = useBottomChromeMetrics();
   // One dimension subscription for the whole list; rows take fontScale as a prop.
   const { fontScale } = useWindowDimensions();
   const paddingBottom = bottomChrome.scrollBottomPadding + spacing[4];
+  // Day-granular: rolls over on focus and on foreground, so "Last 7 days" and
+  // "This month" move with the calendar.
+  const today = useToday();
+  const locale = i18n.language;
 
   const editSheetRef = useRef<BottomSheet | null>(null);
   const [editAscent, setEditAscent] = useState<AscentFeedItem | null>(null);
 
-  // Logbook search/filter/sort state. The committed name lives here; the visible
-  // input value is debounced before it commits to the query.
-  const logbookSearch = useLogbookSearch();
-  const { filters, sort, name, setName, setPreset, setFilters, apply, hydrated } = logbookSearch;
-  // Which preset the chips highlight; null (no chip lit) when a non-preset
-  // (custom) sort is in effect, rather than falsely lighting up Latest.
-  const sortPreset: LogbookSortPreset | null = sort.mode === 'preset' ? sort.preset : null;
-  const activeFilterCount = useMemo(() => countActiveLogbookFilters(filters), [filters]);
+  // Logbook search/filter/sort state. The name is typed in the filter sheet and
+  // debounced before it commits to the query. Only your own logbook saves its
+  // filters; someone else's keeps them for the visit.
+  const logbookSearch = useLogbookSearch({ persist: viewerIsOwner });
+  const { filters, sort, name, setName, setSort, setFilters, reset, hydrated } = logbookSearch;
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
   const [filterSheetOpen, setFilterSheetOpen] = useState(false);
-  // Which facet's inline rail is open below the chip row (Liquid Glass only); null
-  // when all closed. Tapping the open facet's chip closes it (toggle), tapping a
-  // different facet swaps to it — only one rail shows at a time.
-  const [openFacet, setOpenFacet] = useState<LogbookFacetKey | null>(null);
-  const handleToggleFacet = useCallback((facet: LogbookFacetKey) => {
+  // Which inline rail is open under the capsule row; one at a time. A rail only
+  // shows while its capsule is pinned: the capsule is its one way out.
+  const [openRail, setOpenRail] = useState<LogbookRailKind | null>(null);
+  const visibleRail = openRail != null && isPinned(openRail) ? openRail : null;
+  const handleToggleRail = useCallback((rail: LogbookRailKind) => {
     hapticSelection();
-    setOpenFacet((current) => (current === facet ? null : facet));
+    setOpenRail((current) => (current === rail ? null : rail));
   }, []);
-  // One stable "today" ceiling so the To-date row's maximumDate keeps a constant
-  // identity across renders (mirrors the filter sheet's `today`). Frozen at mount;
-  // if the app sits open past midnight it's a day stale, which is harmless here and
-  // matches the sheet.
-  const today = useMemo(() => nowDate(), []);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const searchHeaderRef = useRef<SearchHeaderHandle>(null);
 
   useEffect(() => () => clearTimeout(debounceTimerRef.current ?? undefined), []);
 
-  const handleSearchChange = useCallback(
+  // Each change is instrumented before it commits. Privacy: the changed field
+  // NAMES go as a sorted comma-joined string (analytics values are scalar), never
+  // the grade, date or setter values; `surface` says which control made it.
+  const changeFilters = useCallback(
+    (patch: Partial<LogbookFilterState>, surface: LogbookChangeSurface) => {
+      track(SHARED_EVENTS.LogbookFilterChanged, { fields: Object.keys(patch).sort().join(','), surface });
+      setFilters(patch);
+    },
+    [setFilters],
+  );
+  const changeSort = useCallback(
+    (nextSort: LogbookSortState, surface: LogbookChangeSurface) => {
+      const { key, direction } = logbookSortKeyOf(nextSort);
+      track(SHARED_EVENTS.LogbookSortChanged, {
+        preset: nextSort.mode === 'preset' ? nextSort.preset : 'custom',
+        sortKey: key,
+        direction,
+        surface,
+      });
+      setSort(nextSort);
+    },
+    [setSort],
+  );
+  // One stable handler per surface, so the memo'd row, rail and sheet hold.
+  const handleCapsuleFilters = useCallback(
+    (patch: Partial<LogbookFilterState>) => changeFilters(patch, 'capsule'),
+    [changeFilters],
+  );
+  const handleRailFilters = useCallback(
+    (patch: Partial<LogbookFilterState>) => changeFilters(patch, 'rail'),
+    [changeFilters],
+  );
+  const handleSheetFilters = useCallback(
+    (patch: Partial<LogbookFilterState>) => changeFilters(patch, 'sheet'),
+    [changeFilters],
+  );
+  const handleTokenFilters = useCallback(
+    (patch: Partial<LogbookFilterState>) => changeFilters(patch, 'token'),
+    [changeFilters],
+  );
+  const handleCapsuleSort = useCallback((nextSort: LogbookSortState) => changeSort(nextSort, 'capsule'), [changeSort]);
+  const handleSheetSort = useCallback((nextSort: LogbookSortState) => changeSort(nextSort, 'sheet'), [changeSort]);
+  const handleTokenSort = useCallback((nextSort: LogbookSortState) => changeSort(nextSort, 'token'), [changeSort]);
+
+  // The sheet's name field reports every keystroke; the term commits 300 ms after
+  // the last one. Privacy: only the committed term's length is tracked, never
+  // its text, and clearing back to '' is not a search.
+  const handleNameChange = useCallback(
     (text: string) => {
       const nextName = normalizeSearchName(text);
       if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
       debounceTimerRef.current = setTimeout(() => {
         setName(nextName);
-        // Privacy: report only that a search was committed and its length, never
-        // the query text. A non-empty term marks intent; clearing back to '' is
-        // not a search.
         if (nextName) track(SHARED_EVENTS.LogbookSearched, { length: nextName.length });
       }, SEARCH_DEBOUNCE_MS);
     },
     [setName],
   );
-
-  // Wrap the reducer's sort/filter setters so each change is instrumented before
-  // it commits — the chip row's React.memo holds because these are memoised. We
-  // send the preset and the changed field NAMES only (never grade/date values),
-  // so PostHog can show which facets get used without leaking what was searched.
-  const handleSelectPreset = useCallback(
-    (preset: LogbookSortPreset) => {
-      track(SHARED_EVENTS.LogbookSortChanged, { preset });
-      setPreset(preset);
-    },
-    [setPreset],
-  );
-  const handleUpdateFilters = useCallback(
-    (partial: Partial<LogbookFilterState>) => {
-      // Analytics property values are scalar (no arrays), so the changed field
-      // NAMES go as a sorted comma-joined string — PostHog can still break down
-      // which facets get used. Sorted so a `{minGrade,maxGrade}` patch groups
-      // the same regardless of key order. Never the grade/date values themselves.
-      track(SHARED_EVENTS.LogbookFilterChanged, { fields: Object.keys(partial).sort().join(',') });
-      setFilters(partial);
-    },
-    [setFilters],
-  );
-
-  // Clear the committed term AND the input field (silent: don't re-arm the
-  // debounce). Wired to the sheet's Reset so "Reset" is a true clean slate.
-  const clearSearch = useCallback(() => {
+  // The field's ×, the name token and Reset clear the committed term at once.
+  const clearName = useCallback(() => {
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
     setName('');
-    searchHeaderRef.current?.setText('', { silent: true });
   }, [setName]);
 
+  const handleReset = useCallback(() => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    track(SHARED_EVENTS.LogbookFilterChanged, { fields: 'reset', surface: 'sheet' });
+    reset();
+  }, [reset]);
+
+  // The empty state's "Clear filters": every filter and the name, not the sort.
+  const handleClearFilters = useCallback(() => {
+    if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
+    track(SHARED_EVENTS.LogbookFilterChanged, { fields: 'all', surface: 'empty_state' });
+    setName('');
+    setFilters(DEFAULT_LOGBOOK_FILTERS);
+  }, [setName, setFilters]);
+
+  // Which section the sheet opens scrolled to: the top, or When for "Custom…".
+  const [sheetSection, setSheetSection] = useState<'when' | undefined>(undefined);
   const handleOpenFilters = useCallback(() => {
     hapticSelection();
-    // Close any open inline rail so it doesn't linger under the sheet (and leave
-    // the toolbar over-tall after the sheet dismisses).
-    setOpenFacet(null);
+    // Close any open inline rail so it doesn't linger under the sheet.
+    setOpenRail(null);
+    setSheetSection(undefined);
+    setFilterSheetOpen(true);
+  }, []);
+  const handleOpenCustomDates = useCallback(() => {
+    setOpenRail(null);
+    setSheetSection('when');
     setFilterSheetOpen(true);
   }, []);
 
   const handleCloseFilters = useCallback(() => setFilterSheetOpen(false), []);
 
-  // The query input is rebuilt only when the committed filters/sort/name change,
-  // so the React Query key (and the FlashList data identity downstream) is stable
-  // between unrelated re-renders. When the flag is off the toolbar is hidden, so
-  // ignore any persisted filter/sort/name and feed defaults — otherwise prefs
-  // saved during a prior flag-on session would silently narrow the list.
-  const feedInput = useMemo(
-    () =>
-      toAscentFeedInput(
-        logbookFiltersEnabled
-          ? { filters, sort, name }
-          : { filters: DEFAULT_LOGBOOK_FILTERS, sort: DEFAULT_LOGBOOK_SORT, name: '' },
-      ),
-    [logbookFiltersEnabled, filters, sort, name],
+  // The setter picker is a route (native sheets can't stack). The capsule pushes
+  // it directly; the sheet suspends itself first. The picks come back through
+  // the handoff below, addressed to this Logbook alone.
+  const [setterHandoffId] = useState(createFilterPickerHandoffId);
+  // One picker at a time: set on push, cleared when its picks come back (every
+  // removal hands them back) or, should the push never land, after a beat.
+  const setterPushInFlightRef = useRef(false);
+  const setterPushReleaseRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const releaseSetterPush = useCallback(() => {
+    setterPushInFlightRef.current = false;
+    if (setterPushReleaseRef.current) clearTimeout(setterPushReleaseRef.current);
+    setterPushReleaseRef.current = null;
+  }, []);
+  useEffect(() => releaseSetterPush, [releaseSetterPush]);
+  /**
+   * Pushes the setter picker. `beforePush` runs only once the push is going
+   * ahead (the sheet suspends there), so a refused push never hides the sheet.
+   * Returns whether it pushed.
+   */
+  const handleOpenSetters = useCallback(
+    (beforePush?: () => void): boolean => {
+      if (!userId || setterPushInFlightRef.current) return false;
+      setterPushInFlightRef.current = true;
+      setterPushReleaseRef.current = setTimeout(releaseSetterPush, SETTER_PUSH_RELEASE_MS);
+      beforePush?.();
+      const current = filtersRef.current;
+      scopedRouter.push({
+        pathname: '/users/[userId]/logbook-setters',
+        params: {
+          userId,
+          handoffId: setterHandoffId,
+          setters: JSON.stringify(current.setterUsernames),
+          boardType: current.boardType,
+          layoutIds: JSON.stringify(current.layoutIds),
+        },
+      });
+      return true;
+    },
+    [userId, scopedRouter, setterHandoffId, releaseSetterPush],
   );
 
+  useEffect(
+    () =>
+      subscribeToLogbookSetterSelection(setterHandoffId, ({ setterUsernames, apply }) => {
+        releaseSetterPush();
+        const current = filtersRef.current.setterUsernames;
+        const unchanged =
+          current.length === setterUsernames.length &&
+          current.every((setter, index) => setter === setterUsernames[index]);
+        if (!unchanged) changeFilters({ setterUsernames }, 'setter_picker');
+        // "Show climbs": back to the list. A suspended sheet closes rather than
+        // coming back over it.
+        if (apply) setFilterSheetOpen(false);
+      }),
+    [setterHandoffId, changeFilters, releaseSetterPush],
+  );
+
+  // The query input is rebuilt only when the committed filters/sort/name or the
+  // calendar day change, so the React Query key (and the FlashList data
+  // identity downstream) is stable between unrelated re-renders.
+  const feedInput = useMemo(() => {
+    return toAscentFeedInput({ filters, sort, name, now: today });
+  }, [filters, sort, name, today]);
+
   // Gate on `hydrated` so the feed fetches once with the restored prefs rather
-  // than once with defaults then again after persistence loads. (With the flag
-  // off `feedInput` already ignores persisted prefs, so this just fetches the
-  // defaults once hydration settles. Keeping the gate while the flag is still
-  // resolving avoids an early default fetch for the flag-on cohort.)
+  // than once with defaults then again after persistence loads.
   // Date-DESC views use the GROUPED feed (same climb + same day collapses to
   // one row; the backend shares filter semantics with the flat feed). The
   // grouped resolver orders by latest activity DESC only, so a custom date-ASC
@@ -242,88 +440,125 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
   // below — without this it spins forever.
   const offline = useOfflineQueryState(feed);
 
+  // The sheet's subtitle: the flat feed's own total of entries. The date feed
+  // has none to show: its total counts the server's (climb, day) groups, and
+  // the list regroups them here by local day, angle and mirror, so the number
+  // would not match the rows.
+  const matchCount = groupedMode ? null : (flatFeed.data?.pages[0]?.userAscentsFeed.totalCount ?? null);
+
+  // Removable tokens for active filters whose capsule isn't pinned, plus the
+  // name, so a filtered list always says why.
+  const filterTokens = useMemo(
+    () =>
+      buildLogbookFilterTokens(
+        {
+          pinned: pinnedChips,
+          filters,
+          sort,
+          name,
+          viewerIsOwner,
+          gradeStops,
+          boardOptions,
+          locale,
+          onChangeFilters: handleTokenFilters,
+          onChangeSort: handleTokenSort,
+          onClearName: clearName,
+        },
+        t,
+      ),
+    [
+      pinnedChips,
+      filters,
+      sort,
+      name,
+      viewerIsOwner,
+      gradeStops,
+      boardOptions,
+      locale,
+      handleTokenFilters,
+      handleTokenSort,
+      clearName,
+      t,
+    ],
+  );
+  const isFiltered = countLogbookFilters(filters, name) > 0;
+
   // Day dividers render only on a date-ordered feed (the Latest preset or a
-  // custom date sort) — keyed off the EFFECTIVE feedInput, so the flag-off
-  // default (date-desc) gets dividers and a stale persisted custom sort can't
-  // suppress them wrongly. A climb-name search keeps them: it filters, the
+  // custom date sort) — keyed off the EFFECTIVE feedInput, so a stale
+  // persisted custom sort can't suppress them wrongly. A climb-name search
+  // keeps them: it filters, the
   // result is still a timeline. Both paths dedupe by uuid — offset pagination
   // can repeat a row across page boundaries (swipe-delete shifts offsets), and
   // duplicate FlashList keys throw. Memoised so the FlashList `data` identity
   // is stable between unrelated re-renders.
-  const { listRows } = useMemo(() => {
-    // Wall label ("Alex's board") feeds the divider/subdivider context; board
-    // identity only — the angle stays on every row. Derivation needs the app's
-    // board metadata so it happens here, not in the shared builder.
-    const wallOf = (item: AscentFeedItem) =>
-      item.boardDisplayName ?? getLayoutDisplayName(item.boardType, item.layoutId);
-
-    let rows: LogbookListRow<LogbookGroupUnit>[];
-    if (groupedMode) {
-      const groups = groupedFeed.data?.pages.flatMap((page) => page.userGroupedAscentsFeed.groups) ?? [];
-      // RE-BUCKET the backend groups client-side by (climb, LOCAL day, angle):
-      // the resolver cuts groups on the stored UTC calendar day, which
-      // disagrees with the local-day dividers on any non-UTC device (an
-      // evening session would split), and its key ignores angle, which would
-      // sum tries across angles under one row — the exact honesty rules the
-      // redesign set. Flattening items and regrouping fixes both without a
-      // backend timezone parameter; item-level dedupe absorbs group overlap
-      // from offset pagination.
-      const itemsByLocalKey = new Map<string, AscentFeedItem[]>();
-      const seenTickUuids = new Set<string>();
-      for (const group of groups) {
-        for (const item of group.items) {
-          if (seenTickUuids.has(item.uuid)) continue;
-          seenTickUuids.add(item.uuid);
-          // isMirror splits the bucket: on Tension/Decoy the mirrored ascent is
-          // its own problem — collapsing it with the normal orientation would
-          // sum tries across orientations and mislabel the row's mirror tag.
-          const localKey = `${item.climbUuid}|${logbookDayKey(item.climbedAt)}|${item.angle}|${item.isMirror}`;
-          const bucket = itemsByLocalKey.get(localKey);
-          if (bucket) bucket.push(item);
-          else itemsByLocalKey.set(localKey, [item]);
-        }
-      }
-      const units: LogbookGroupUnit[] = Array.from(itemsByLocalKey.values()).map((bucketItems) => {
-        const best = pickBestGroupEntry(bucketItems);
-        // The unit's timestamp is the bucket's LATEST activity (not the best
-        // entry's) so ordering reads "when did I last touch this today".
-        const latestClimbedAt = bucketItems.reduce(
-          (latest, item) => (item.climbedAt > latest ? item.climbedAt : latest),
-          bucketItems[0].climbedAt,
-        );
-        return {
-          ...best,
-          climbedAt: latestClimbedAt,
-          wall: wallOf(best),
-          groupTries: sumGroupTries(bucketItems),
-          groupItems: bucketItems,
-        };
-      });
-      units.sort((a, b) => (a.climbedAt < b.climbedAt ? 1 : a.climbedAt > b.climbedAt ? -1 : 0));
-      rows = buildLogbookListRows(units, { hasMore: groupedFeed.hasNextPage ?? false });
-    } else if (showDividers) {
-      // Date-ASC custom sort: dividers without grouping (the grouped resolver
-      // is DESC-only) — one row per tick, exactly as before grouping existed.
-      const items = flatFeed.data?.pages.flatMap((page) => page.userAscentsFeed.items) ?? [];
-      const withWalls = items.map((item) => ({ ...item, wall: wallOf(item) }));
-      rows = buildLogbookListRows(withWalls, { hasMore: flatFeed.hasNextPage ?? false });
-    } else {
-      const items = flatFeed.data?.pages.flatMap((page) => page.userAscentsFeed.items) ?? [];
-      rows = dedupeLogbookItems(items).map((item) => ({ type: 'entry', key: item.uuid, item, wallCovered: false }));
-    }
-    return { listRows: rows };
-  }, [groupedFeed.data, groupedFeed.hasNextPage, flatFeed.data, flatFeed.hasNextPage, groupedMode, showDividers]);
-
-  // Tap → set the climb active and open the play drawer (own logbook and another
-  // climber's read-only logbook alike). AscentFeedItem structurally satisfies the
-  // `tick` kind, which builds the climb + board config from frames.
-  const handleActivate = useCallback(
-    (ascent: AscentFeedItem) => {
-      // Default open mode is now "set active", so no option is needed here.
-      openClimbInPlayDrawer({ kind: 'tick', tick: ascent }, { openPlayDrawer, router });
-    },
-    [openPlayDrawer, router],
+  const hiddenTickUuids = usePendingLogbookDeletes();
+  const { scheduleDelete, getDeleteScope } = useLogbookDeleteActions();
+  const listRowsInput = useMemo<Omit<LogbookRowsInput, 'groupedPages' | 'flatPages'>>(
+    () => ({
+      groupedMode,
+      showDividers,
+      groupedHasMore: groupedFeed.hasNextPage ?? false,
+      flatHasMore: flatFeed.hasNextPage ?? false,
+      hiddenTickUuids,
+    }),
+    [groupedMode, showDividers, groupedFeed.hasNextPage, flatFeed.hasNextPage, hiddenTickUuids],
   );
+  const listRows = useMemo(
+    () =>
+      buildLogbookRows({
+        ...listRowsInput,
+        groupedPages: groupedFeed.data?.pages,
+        flatPages: flatFeed.data?.pages,
+      }),
+    [listRowsInput, groupedFeed.data, flatFeed.data],
+  );
+
+  // Tap → the climb opens playing from this logbook (own and another climber's
+  // alike, issue #6665): swipes walk the rows on screen, in their order, and
+  // page on through the feed. Driving the wall decides whether it goes up or
+  // opens as a preview.
+  const listRowsInputRef = useRef(listRowsInput);
+  listRowsInputRef.current = listRowsInput;
+  const fetchNextGroupedPage = groupedFeed.fetchNextPage;
+  const fetchNextFlatPage = flatFeed.fetchNextPage;
+  const loadMoreLogbookEntries = useCallback(async () => {
+    const input = listRowsInputRef.current;
+    if (input.groupedMode) {
+      const result = await fetchNextGroupedPage({ cancelRefetch: false });
+      if (result.isError) throw result.error;
+      const hasMore = result.hasNextPage ?? false;
+      return {
+        rows: logbookEntries(
+          buildLogbookRows({
+            ...input,
+            groupedPages: result.data?.pages,
+            flatPages: undefined,
+            groupedHasMore: hasMore,
+          }),
+        ),
+        hasMore,
+      };
+    }
+    const result = await fetchNextFlatPage({ cancelRefetch: false });
+    if (result.isError) throw result.error;
+    const hasMore = result.hasNextPage ?? false;
+    return {
+      rows: logbookEntries(
+        buildLogbookRows({ ...input, flatPages: result.data?.pages, groupedPages: undefined, flatHasMore: hasMore }),
+      ),
+      hasMore,
+    };
+  }, [fetchNextGroupedPage, fetchNextFlatPage]);
+  const entryRows = useMemo(() => logbookEntries(listRows), [listRows]);
+  const logbookListKey = useMemo(() => `${groupedMode}|${JSON.stringify(feedInput)}`, [groupedMode, feedInput]);
+  const handleActivate = useTickListActivation<AscentFeedItem>({
+    sourceId: `logbook:${userId ?? ''}`,
+    label: tSession('playView.track.logbook'),
+    rows: entryRows,
+    hasMore: feed.hasNextPage ?? false,
+    loadMore: loadMoreLogbookEntries,
+    listKey: logbookListKey,
+  });
 
   // Day-entries chooser for grouped rows: swipe-edit/delete on a row that
   // collapses several same-day entries must act on ONE tick, so the climber
@@ -336,6 +571,16 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
   const chooserOpenRef = useRef(false);
   chooserOpenRef.current = chooser != null;
   const closeChooser = useCallback(() => setChooser(null), []);
+  // Entries waiting out their Undo window leave the sheet at once, so the next
+  // pick is the next mislog; an Undo puts the entry back.
+  const visibleChooserEntries = useMemo(
+    () => chooser?.entries.filter((chooserEntry) => !hiddenTickUuids.has(chooserEntry.uuid)) ?? [],
+    [chooser, hiddenTickUuids],
+  );
+  const chooserEmptied = chooser != null && visibleChooserEntries.length === 0;
+  useEffect(() => {
+    if (chooserEmptied) setChooser(null);
+  }, [chooserEmptied]);
 
   const openEditSheet = useCallback((ascent: AscentFeedItem) => {
     setEditAscent(ascent);
@@ -365,60 +610,58 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
   // so a one-gesture commit is banned. The uuid is captured BEFORE the await —
   // the dialog blocks touches, not data, and FlashList can recycle the source
   // row onto a different ascent while it's up. The optimistic removal from the
-  // cached feed pages lives inside useDeleteTick, shared by every delete path.
-  const deleteTick = useDeleteTick();
+  // feed is hidden locally during Undo; the persistent owner commits later.
+  // Several deletes can sit in their Undo windows at once: the owner keys them
+  // by uuid and gives each its own timer.
   const confirmDialog = useConfirm();
-  const { showToast } = useToast();
-  // Depend on the STABLE pieces of the mutation, not the result object — that
-  // object gets a fresh identity every render, which would recreate this
-  // callback → recreate renderItem → re-render every visible row on each tab
-  // render (each search keystroke). `mutate` is identity-stable; the pending
-  // guard reads a ref for the same reason.
-  const { mutate: deleteTickMutate } = deleteTick;
-  const deleteTickPendingRef = useRef(deleteTick.isPending);
-  deleteTickPendingRef.current = deleteTick.isPending;
-  // Covers the CONFIRM window (swipe-commit → dialog resolution), where
-  // isPending is still false — a second swipe there would stack a second
-  // dialog. The modal itself blocks touches on both platforms; this flag makes
-  // single-flight true by construction rather than by dialog behaviour.
+  // Covers the CONFIRM window only (swipe-commit → dialog resolution): a second
+  // swipe there would stack a second dialog. The modal itself blocks touches on
+  // both platforms; this flag makes single-flight true by construction rather
+  // than by dialog behaviour.
   const deleteFlowActiveRef = useRef(false);
-  // The guarded core, shared by direct deletes and chooser picks: confirm
-  // dialog, then DELETE_TICK. Callers own the single-flight flag transitions
-  // into this function; it owns them out.
+  // The guarded core, shared by direct deletes, chooser picks and the chooser's
+  // Delete all: confirm dialog, then DELETE_TICK per entry. Callers own the
+  // single-flight flag transitions into this function; it owns them out.
   const startGuardedDelete = useCallback(
-    (targetUuid: string, method: 'swipe' | 'a11y', viaChooser = false) => {
+    (targetUuids: readonly string[], method: 'swipe' | 'a11y', viaChooser = false) => {
+      const originScope = getDeleteScope();
+      const count = targetUuids.length;
       const runGuardedDelete = async () => {
-        const confirmed = await confirmDialog({
-          title: t('mobile.logbook.deleteTitle'),
-          message: t('mobile.logbook.deleteConfirm'),
-          confirmLabel: t('mobile.logbook.delete'),
-          cancelLabel: t('mobile.cancel'),
-          destructive: true,
-        });
-        if (!confirmed) {
-          deleteFlowActiveRef.current = false;
-          return;
-        }
-        deleteTickMutate(targetUuid, {
-          onSuccess: () => {
-            deleteFlowActiveRef.current = false;
-            track(SHARED_EVENTS.LogbookEntryDeleted, { method, viaChooser });
-            hapticSuccess();
-            // Sequential-delete flow: prune the deleted entry so the chooser
-            // stays open (even down to a single entry) while any remain, and
-            // closes itself once the day's group is emptied.
+        const confirmed = await confirmDialog(
+          count > 1
+            ? {
+                title: t('mobile.logbook.deleteAllTitle', { count }),
+                message: t('mobile.logbook.deleteAllConfirm', { count }),
+                confirmLabel: t('mobile.logbook.deleteAll'),
+                cancelLabel: t('mobile.cancel'),
+                destructive: true,
+              }
+            : {
+                title: t('mobile.logbook.deleteTitle'),
+                message: t('mobile.logbook.deleteConfirm'),
+                confirmLabel: t('mobile.logbook.delete'),
+                cancelLabel: t('mobile.cancel'),
+                destructive: true,
+              },
+        );
+        deleteFlowActiveRef.current = false;
+        if (!confirmed) return;
+        scheduleDelete({
+          originScope,
+          uuids: targetUuids,
+          method,
+          viaChooser,
+          onSuccess: (deletedUuid) => {
+            // Sequential-delete flow: prune the committed entry from the
+            // chooser's snapshot. Entries still in their Undo window are
+            // already filtered out of the sheet by visibleChooserEntries.
             if (viaChooser) {
               setChooser((current) => {
                 if (!current) return current;
-                const remainingEntries = current.entries.filter((chooserEntry) => chooserEntry.uuid !== targetUuid);
+                const remainingEntries = current.entries.filter((chooserEntry) => chooserEntry.uuid !== deletedUuid);
                 return remainingEntries.length > 0 ? { ...current, entries: remainingEntries } : null;
               });
             }
-          },
-          onError: () => {
-            deleteFlowActiveRef.current = false;
-            hapticError();
-            showToast(t('mobile.logbook.deleteError'), 'error');
           },
         });
       };
@@ -429,12 +672,12 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
         deleteFlowActiveRef.current = false;
       });
     },
-    [deleteTickMutate, confirmDialog, showToast, t],
+    [scheduleDelete, getDeleteScope, confirmDialog, t],
   );
 
   const handleDeleteRequest = useCallback(
     (ascent: AscentFeedItem, method: 'swipe' | 'a11y') => {
-      if (chooserOpenRef.current || deleteFlowActiveRef.current || deleteTickPendingRef.current) return;
+      if (chooserOpenRef.current || deleteFlowActiveRef.current) return;
       const unit = ascent as LogbookGroupUnit;
       if (unit.groupItems && unit.groupItems.length > 1) {
         // The chooser is part of the delete flow: chooserOpenRef blocks
@@ -443,7 +686,7 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
         return;
       }
       deleteFlowActiveRef.current = true;
-      startGuardedDelete(ascent.uuid, method);
+      startGuardedDelete([ascent.uuid], method);
     },
     [startGuardedDelete],
   );
@@ -463,19 +706,32 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
         openEditSheet(entry);
         return;
       }
-      if (deleteFlowActiveRef.current || deleteTickPendingRef.current) return;
+      if (deleteFlowActiveRef.current) return;
       deleteFlowActiveRef.current = true;
-      startGuardedDelete(entry.uuid, active.method, true);
+      startGuardedDelete([entry.uuid], active.method, true);
     },
     [chooser, openEditSheet, startGuardedDelete],
   );
+
+  // Chooser Delete all → every entry still on the sheet, behind one confirm and
+  // one Undo. The sheet closes itself once they are all pending.
+  const handleChooserDeleteAll = useCallback(() => {
+    if (!chooser || chooser.intent !== 'delete' || deleteFlowActiveRef.current) return;
+    if (visibleChooserEntries.length === 0) return;
+    deleteFlowActiveRef.current = true;
+    startGuardedDelete(
+      visibleChooserEntries.map((chooserEntry) => chooserEntry.uuid),
+      chooser.method,
+      true,
+    );
+  }, [chooser, visibleChooserEntries, startGuardedDelete]);
 
   // Long press → open the climb actions sheet. For the owner it carries an
   // "Edit entry" row wired back to the tick editor. No-op when the board can't
   // resolve (no frames / MoonBoard) — nothing to render in the actions sheet.
   const handleOpenActions = useCallback(
     (ascent: AscentFeedItem) => {
-      // Fall back to the consensus grade so the reaction menu shows a grade even when
+      // Fall back to the consensus grade so the climb menu has a grade even when
       // the climber didn't log a personal one (tickToClimb only reads difficultyName).
       const climb = tickToClimb({
         ...ascent,
@@ -483,7 +739,7 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
       });
       const config = renderBoardToPlaylistConfig(ascent.boardType, ascent.layoutId, ascent.renderBoard);
       if (!climb || !config) return;
-      openClimbActions(
+      return getClimbActions(
         climb,
         {
           boardName: config.boardName,
@@ -495,7 +751,7 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
         viewerIsOwner ? { onEditEntry: () => handleEdit(ascent, 'a11y') } : undefined,
       );
     },
-    [openClimbActions, viewerIsOwner, handleEdit],
+    [getClimbActions, viewerIsOwner, handleEdit],
   );
 
   const handleEndReached = useCallback(() => {
@@ -535,269 +791,125 @@ export function LogbookTab({ userId, topInset = 0, viewerIsOwner = true }: Logbo
 
   const handleRefresh = useCallback(() => void feed.refetch(), [feed.refetch]);
 
-  if (!userId) {
-    return (
-      <View style={[styles.centered, { paddingTop: topInset }]}>
-        <ActivityIndicator size="large" />
+  const controls = (
+    <ReadableColumn>
+      <View style={[styles.controls, { paddingTop: hasComposedHeader ? 0 : topInset }]}>
+        {/* In a composed profile header the selected Logbook tab already names
+            the page. In flow (someone else's profile) the heading stays, and
+            its scope line names the board when one is picked. */}
+        {hasComposedHeader ? null : (
+          <View style={styles.heading}>
+            <ShelfHeader
+              title={t('tabs.logbook')}
+              caption={logbookBoardLabel(filters, boardOptions, t) ?? t('mobile.filter.allBoards')}
+            />
+          </View>
+        )}
+        <LogbookChipRow
+          pinned={pinnedChips}
+          filters={filters}
+          sort={sort}
+          name={name}
+          viewerIsOwner={viewerIsOwner}
+          gradeStops={gradeStops}
+          boardOptions={boardOptions}
+          locale={locale}
+          openRail={visibleRail}
+          onOpenFilters={handleOpenFilters}
+          onOpenCustomDates={handleOpenCustomDates}
+          onToggleRail={handleToggleRail}
+          onChangeFilters={handleCapsuleFilters}
+          onChangeSort={handleCapsuleSort}
+          onOpenSetters={handleOpenSetters}
+        />
+        <LogbookFacetRail
+          openRail={visibleRail}
+          filters={filters}
+          grades={grades ?? EMPTY_GRADES}
+          onUpdateFilters={handleRailFilters}
+        />
+        <FilterTokenRow tokens={filterTokens} />
       </View>
-    );
-  }
+    </ReadableColumn>
+  );
 
   return (
-    <View style={styles.flex}>
-      {/* Fixed top toolbar — all logbook actions concentrated here, below the
-          floating chrome. Sibling of the list, so list virtualization is intact. */}
-      <View style={[styles.toolbar, { paddingTop: topInset }]}>
-        <View style={styles.heading}>
-          <Text variant="title2" accessibilityRole="header">
-            {t('tabs.logbook')}
-          </Text>
-          <Text variant="footnote" color={systemColors.secondaryLabel}>
-            {t('mobile.filter.allBoards')}
-          </Text>
-        </View>
-        {showSortChips ? (
-          // iOS Liquid Glass: search sits on its own row, and the chip row below
-          // carries the filter entry + sort + active-filter chips (so no separate
-          // filter button here).
-          <>
-            {/* The row wrapper is load-bearing: SearchHeader's capsule is flex:1,
-                sized for a HORIZONTAL slot (Climbs toolbar, the Material row
-                below). As a direct child of this vertical toolbar, flex-basis 0
-                in an auto-height column beats the explicit height and collapses
-                the capsule to 0px — the search box invisibly disappears. */}
-            <View style={styles.searchRow}>
-              <SearchHeader
-                ref={searchHeaderRef}
-                placeholder={t('mobile.logbook.searchPlaceholder')}
-                onChangeText={handleSearchChange}
-                initialValue={name}
-                height={40}
-              />
-            </View>
-            {/* Filter entry + Latest/Hardest + every facet chip (grade/angle/show/
-                date) — switch sort and adjust filters inline without opening the
-                sheet. Grade/angle/date toggle the rail below; Show is a native
-                menu. The sheet's Sort block is hidden (showSort={false}) so sort
-                isn't worded twice. */}
-            <LogbookChipRow
-              sortPreset={sortPreset}
-              onSelectPreset={handleSelectPreset}
-              onOpenFilters={handleOpenFilters}
-              filters={filters}
-              grades={grades ?? EMPTY_GRADES}
-              onToggleFacet={handleToggleFacet}
-              onUpdateFilters={handleUpdateFilters}
+    <LogbookView
+      userId={userId}
+      viewerIsOwner={viewerIsOwner}
+      hasComposedHeader={hasComposedHeader}
+      controls={controls}
+      header={renderHeader?.(controls, setHeaderHeight)}
+      headerMeasured={headerMeasured}
+      nativeRootHeader={nativeRootHeader}
+      headerHeight={headerHeight}
+      scrollHeaderInset={scrollHeaderInset}
+      paddingBottom={paddingBottom}
+      offline={offline}
+      isFiltered={isFiltered}
+      listRows={listRows}
+      renderItem={renderItem}
+      scrollEdge={scrollEdge}
+      handleScroll={handleScroll}
+      handleRetry={handleRetry}
+      handleRefresh={handleRefresh}
+      handleEndReached={handleEndReached}
+      handleClearFilters={handleClearFilters}
+      feed={feed}
+      boardLinkPrompt={<BoardLinkPrompt key={userId} viewerIsOwner={viewerIsOwner} hasNoSends={!isFiltered} />}
+      overlays={
+        <>
+          {viewerIsOwner ? (
+            <LogbookEditSheet sheetRef={editSheetRef} ascent={editAscent} onClose={() => setEditAscent(null)} />
+          ) : null}
+          {chooser && !chooserEmptied ? (
+            <LogbookEntryChooserSheet
+              entries={visibleChooserEntries}
+              intent={chooser.intent}
+              onPick={handleChooserPick}
+              onDeleteAll={handleChooserDeleteAll}
+              onDismiss={closeChooser}
             />
-            {/* The open facet's inline rail, below the chip row. It grows the
-                toolbar View; the FlashList insets below the toolbar so results
-                still scroll under it. Live-commits via setFilters. */}
-            <LogbookFacetRail
-              openFacet={openFacet}
+          ) : null}
+          {filterSheetOpen ? (
+            <LogbookFilterSheet
+              onDismiss={handleCloseFilters}
               filters={filters}
+              sort={sort}
+              name={name}
+              viewerIsOwner={viewerIsOwner}
               grades={grades ?? EMPTY_GRADES}
-              onUpdateFilters={handleUpdateFilters}
+              boardOptions={boardOptions}
+              matchCount={matchCount}
               today={today}
+              onChangeFilters={handleSheetFilters}
+              onChangeSort={handleSheetSort}
+              onNameChange={handleNameChange}
+              onClearName={clearName}
+              onReset={handleReset}
+              onOpenSetters={handleOpenSetters}
+              initialSection={sheetSection}
             />
-          </>
-        ) : (
-          // Android / Material: the current layout — search + the round filter
-          // button (no chip row).
-          <>
-            {logbookFiltersEnabled ? (
-              <View style={styles.toolbarRow}>
-                <SearchHeader
-                  ref={searchHeaderRef}
-                  placeholder={t('mobile.logbook.searchPlaceholder')}
-                  onChangeText={handleSearchChange}
-                  initialValue={name}
-                  height={40}
-                />
-                <Pressable
-                  onPress={handleOpenFilters}
-                  accessibilityRole="button"
-                  accessibilityLabel={t('mobile.logbook.filter')}
-                  style={({ pressed }) => [
-                    styles.filterButton,
-                    { backgroundColor: brandColors.accent },
-                    pressed && styles.filterButtonPressed,
-                  ]}
-                >
-                  <Icon name="filter" size={18} color={iosSystemColors.black} />
-                  {activeFilterCount > 0 ? (
-                    <View style={[styles.filterBadge, { backgroundColor: iosSystemColors.black }]}>
-                      <Text variant="caption2" color={brandColors.accent} style={styles.filterBadgeText}>
-                        {activeFilterCount}
-                      </Text>
-                    </View>
-                  ) : null}
-                </Pressable>
-              </View>
-            ) : null}
-          </>
-        )}
-      </View>
-
-      {offline.isBlocked && offline.reason ? (
-        <View style={styles.centered}>
-          <OfflineState reason={offline.reason} onRetry={handleRetry} />
-        </View>
-      ) : feed.isPending ? (
-        <View style={styles.centered}>
-          <ActivityIndicator size="large" />
-        </View>
-      ) : feed.isError ? (
-        <View style={styles.errorContainer}>
-          <Icon name="error" size={48} color={systemColors.tertiaryLabel} />
-          <Text variant="headline" style={styles.errorTitle}>
-            {t('mobile.logbook.errorTitle')}
-          </Text>
-          <Text variant="subheadline" style={styles.errorBody}>
-            {t('mobile.logbook.errorBody')}
-          </Text>
-          <Pressable
-            onPress={handleRetry}
-            disabled={feed.isRefetching}
-            accessibilityRole="button"
-            accessibilityLabel={t('mobile.logbook.retry')}
-            style={({ pressed }) => [
-              styles.retryButton,
-              { borderColor: brandColors.primary },
-              feed.isRefetching && styles.retryButtonDisabled,
-              pressed && !feed.isRefetching && { backgroundColor: `${brandColors.primary}1A` },
-            ]}
-          >
-            <Text variant="footnote" color={brandColors.primary}>
-              {t('mobile.logbook.retry')}
-            </Text>
-          </Pressable>
-        </View>
-      ) : (
-        <FlashList
-          testID="logbook-screen"
-          data={listRows}
-          renderItem={renderItem}
-          keyExtractor={keyExtractor}
-          getItemType={getRowType}
-          contentInsetAdjustmentBehavior="never"
-          onEndReached={handleEndReached}
-          onEndReachedThreshold={0.5}
-          contentContainerStyle={{ paddingBottom }}
-          refreshControl={
-            <RefreshControl refreshing={feed.isRefetching} onRefresh={handleRefresh} tintColor={brandColors.primary} />
-          }
-          ListFooterComponent={
-            feed.isFetchingNextPage ? (
-              <View style={styles.footer}>
-                <ActivityIndicator size="small" />
-              </View>
-            ) : null
-          }
-          ListEmptyComponent={
-            <View style={styles.empty}>
-              <Icon name="tick.outline" size={48} color={systemColors.tertiaryLabel} />
-              <Text variant="headline" style={styles.emptyTitle}>
-                {activeFilterCount > 0 || name ? t('mobile.logbook.emptyFiltered') : t('mobile.logbook.empty')}
-              </Text>
-              {/* Unfiltered only: a logbook emptied by a filter says nothing about
-                  whether a board account is linked. */}
-              <BoardLinkPrompt
-                key={userId}
-                viewerIsOwner={viewerIsOwner}
-                hasNoSends={activeFilterCount === 0 && !name}
-              />
-            </View>
-          }
-        />
-      )}
-
-      {viewerIsOwner ? (
-        <LogbookEditSheet sheetRef={editSheetRef} ascent={editAscent} onClose={() => setEditAscent(null)} />
-      ) : null}
-
-      {chooser ? (
-        <LogbookEntryChooserSheet
-          entries={chooser.entries}
-          intent={chooser.intent}
-          onPick={handleChooserPick}
-          onDismiss={closeChooser}
-        />
-      ) : null}
-
-      {logbookFiltersEnabled && filterSheetOpen ? (
-        <LogbookFilterSheet
-          onDismiss={handleCloseFilters}
-          currentFilters={filters}
-          currentSort={sort}
-          onApply={apply}
-          onClearSearch={clearSearch}
-          // When the top-level sort chips are shown, drop the sheet's Sort block
-          // so sort isn't worded twice.
-          showSort={!showSortChips}
-        />
-      ) : null}
-    </View>
+          ) : null}
+        </>
+      }
+    />
   );
 }
-
-function keyExtractor(row: LogbookListRow<LogbookGroupUnit>) {
-  return row.key;
-}
-
-// Divider vs entry recycling pools — FlashList must never recycle a divider
-// into a climb row or vice versa.
-function getRowType(row: LogbookListRow<LogbookGroupUnit>) {
-  return row.type;
-}
-
 const styles = StyleSheet.create({
-  flex: { flex: 1 },
+  flex: { flex: 1, minHeight: 0 },
+  unmeasuredContent: { opacity: 0 },
   centered: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   footer: { paddingVertical: spacing[5], alignItems: 'center' },
-  toolbar: {
-    paddingHorizontal: spacing[4],
-    paddingBottom: spacing[2],
+  // The capsule row and the rails pad their own 16pt gutter and scroll out to
+  // the column's edge, so the block itself has no side padding.
+  controls: {
+    paddingBottom: spacing[1],
   },
   heading: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'baseline',
-    justifyContent: 'space-between',
-    gap: spacing[2],
     paddingTop: spacing[2],
-    paddingBottom: spacing[3],
+    paddingBottom: spacing[1],
   },
-  toolbarRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-  },
-  // Horizontal slot for the Liquid Glass search capsule (see the comment at the
-  // render site — flex:1 needs a row parent or it collapses to 0 height).
-  searchRow: {
-    flexDirection: 'row',
-    marginBottom: spacing[2],
-  },
-  filterButton: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  filterButtonPressed: { opacity: 0.85 },
-  filterBadge: {
-    position: 'absolute',
-    top: -2,
-    right: -2,
-    minWidth: 18,
-    height: 18,
-    borderRadius: 9,
-    paddingHorizontal: 4,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  filterBadgeText: { fontWeight: '700' },
   empty: {
     alignItems: 'center',
     justifyContent: 'center',
@@ -806,6 +918,7 @@ const styles = StyleSheet.create({
     gap: spacing[2],
   },
   emptyTitle: { opacity: 0.6, marginTop: spacing[3], textAlign: 'center' },
+  emptyAction: { marginTop: spacing[3] },
   errorContainer: {
     flex: 1,
     alignItems: 'center',
@@ -822,5 +935,5 @@ const styles = StyleSheet.create({
     borderRadius: borderRadius.full,
     borderWidth: StyleSheet.hairlineWidth,
   },
-  retryButtonDisabled: { opacity: 0.5 },
+  retryButtonDisabled: { opacity: opacity.disabled },
 });

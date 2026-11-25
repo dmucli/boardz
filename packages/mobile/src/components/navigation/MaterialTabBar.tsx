@@ -1,171 +1,26 @@
-import { useCallback } from 'react';
-import { type LayoutChangeEvent, Platform, StyleSheet, View } from 'react-native';
 import type { BottomTabBarProps } from 'expo-router/tabs';
-import { Text } from '../Text';
-import { PressableSurface } from '../PressableSurface';
-import { useTheme } from '../../providers/theme-provider';
+import { useCallback } from 'react';
+import type { LayoutChangeEvent } from 'react-native';
+import { useAnimatedStyle } from 'react-native-reanimated';
+import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
+import { tabBarHiddenProgress } from '../../lib/tab-bar-hide-progress';
+import { useTabBarHidden } from '../../lib/tab-bar-visibility-store';
 import { useSetMeasuredTabBarHeight } from '../../providers/tab-bar-height-provider';
-import { brandColors as staticBrandColors } from '../../theme/colors';
-import { material } from '../../theme/tokens';
 import { MATERIAL_TAB_BAR_HEIGHT } from '../../theme/layout';
-import { isLiveTabBadge } from './tab-badge';
-
-/**
- * Material 3 bottom navigation bar — the JS tab bar for the Material UI variant
- * (the Liquid Glass variant uses the native `NativeTabs` instead). Built from the
- * existing design tokens so it reads as the same product: an opaque elevated
- * surface, a tonal circular active indicator behind the focused icon, label
- * below, and a status dot for the Record tab. Icons/labels/badges come from
- * each screen's React Navigation options, so this stays a generic custom tab
- * bar.
- */
-export function MaterialTabBar({ state, descriptors, navigation, insets }: BottomTabBarProps) {
-  const { systemColors, brandColors, m3 } = useTheme();
-  // M3 navigation bar roles: the focused destination's icon sits on a
-  // secondaryContainer active-indicator circle (onSecondaryContainer glyph), its
-  // label lifts to onSurface, and inactive destinations use onSurfaceVariant for
-  // both icon and label. These read correctly on the tonal M3 surface in both
-  // schemes (the Paper palette resolves per scheme) — no manual alpha tinting.
-  const activeIconColor = m3.onSecondaryContainer;
-  const activeLabelColor = m3.onSurface;
-  const inactiveColor = m3.onSurfaceVariant;
-  const indicatorColor = m3.secondaryContainer;
-
-  // Publish the real rendered height so the root-level queue bar docks flush against
-  // it (rather than re-deriving the tab-bar top from TAB_BAR_HEIGHT + inset). #2611.
+import { MaterialTabBarView } from './MaterialTabBarView';
+export function MaterialTabBar(props: BottomTabBarProps) {
   const setMeasuredTabBarHeight = useSetMeasuredTabBarHeight();
   const handleLayout = useCallback(
     (event: LayoutChangeEvent) => setMeasuredTabBarHeight(event.nativeEvent.layout.height),
     [setMeasuredTabBarHeight],
   );
-
+  const { jsBarOverlaysContent: overlay } = useBottomChromeMetrics();
+  const hidden = useTabBarHidden() && overlay;
+  const barHeight = MATERIAL_TAB_BAR_HEIGHT + props.insets.bottom;
+  const slideStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: overlay ? tabBarHiddenProgress.value * barHeight : 0 }],
+  }));
   return (
-    <View
-      onLayout={handleLayout}
-      style={[
-        styles.bar,
-        {
-          backgroundColor: systemColors.elevatedSurface,
-          borderTopColor: systemColors.separator,
-          paddingBottom: insets.bottom,
-          height: MATERIAL_TAB_BAR_HEIGHT + insets.bottom,
-        },
-      ]}
-    >
-      {state.routes.map((route, index) => {
-        const { options } = descriptors[route.key];
-        // expo-router turns a screen's `href: null` into `tabBarItemStyle:
-        // { display: 'none' }` (the iPad-only /wall destination). This custom bar
-        // renders every route in `state.routes`, so without this filter a hidden
-        // route would show as a phone tab button. Skip it — the default RN tab bar
-        // hides it via `tabBarButton`, which a custom bar doesn't honor.
-        if (StyleSheet.flatten(options.tabBarItemStyle)?.display === 'none') return null;
-        const focused = state.index === index;
-        const label = typeof options.title === 'string' ? options.title : route.name;
-        const iconColor = focused ? activeIconColor : inactiveColor;
-        const labelColor = focused ? activeLabelColor : inactiveColor;
-
-        const onPress = () => {
-          const event = navigation.emit({ type: 'tabPress', target: route.key, canPreventDefault: true });
-          if (!focused && !event.defaultPrevented) {
-            navigation.navigate(route.name);
-          }
-        };
-        const onLongPress = () => {
-          navigation.emit({ type: 'tabLongPress', target: route.key });
-        };
-
-        return (
-          <PressableSurface
-            key={route.key}
-            onPress={onPress}
-            onLongPress={onLongPress}
-            feedback="none"
-            rippleColor={brandColors.primary}
-            rippleBorderless
-            accessibilityRole="tab"
-            accessibilityState={{ selected: focused }}
-            accessibilityLabel={label}
-            style={styles.item}
-          >
-            <View style={styles.indicator}>
-              {/* Opacity toggle, not a color swap — Android needs radius+color set together from mount. */}
-              <View
-                testID="indicator"
-                style={[styles.indicatorFill, { backgroundColor: indicatorColor, opacity: focused ? 1 : 0 }]}
-              />
-              {options.tabBarIcon?.({ focused, color: iconColor, size: 24 })}
-              {options.tabBarBadge != null ? (
-                <View
-                  testID="badge"
-                  style={[
-                    styles.badge,
-                    // Badge dot is a FILL (no text on it) → static light brand
-                    // colors, not the scheme-lifted theme value. Record's screen
-                    // options carry a state marker (not display text) on
-                    // `tabBarBadge` to tell a live session from a merely-connected
-                    // board; the producer/consumer contract lives in ./tab-badge.
-                    // Any other badge value keeps the standard green.
-                    {
-                      backgroundColor: isLiveTabBadge(options.tabBarBadge)
-                        ? staticBrandColors.live
-                        : staticBrandColors.success,
-                      borderColor: systemColors.elevatedSurface,
-                    },
-                  ]}
-                />
-              ) : null}
-            </View>
-            <Text variant="caption2" color={labelColor} numberOfLines={1}>
-              {label}
-            </Text>
-          </PressableSurface>
-        );
-      })}
-    </View>
+    <MaterialTabBarView {...props} overlay={overlay} hidden={hidden} slideStyle={slideStyle} onLayout={handleLayout} />
   );
 }
-
-const styles = StyleSheet.create({
-  bar: {
-    flexDirection: 'row',
-    borderTopWidth: StyleSheet.hairlineWidth,
-    ...Platform.select({
-      android: { elevation: material.navBar.surfaceElevation },
-      ios: { shadowColor: '#000', shadowOffset: { width: 0, height: -2 }, shadowOpacity: 0.08, shadowRadius: 8 },
-      default: {},
-    }),
-  },
-  item: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingTop: 6,
-    gap: 4,
-  },
-  // Active-indicator circle — fixed size, centers the icon over the fill layer below.
-  indicator: {
-    width: material.navBar.activeIndicatorWidth,
-    height: material.navBar.activeIndicatorHeight,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  // The tonal fill itself — color is constant, only opacity toggles with focus.
-  indicatorFill: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    borderRadius: material.navBar.activeIndicatorRadius,
-  },
-  badge: {
-    position: 'absolute',
-    top: 2,
-    right: 10,
-    width: 9,
-    height: 9,
-    borderRadius: 5,
-    borderWidth: 1.5,
-  },
-});

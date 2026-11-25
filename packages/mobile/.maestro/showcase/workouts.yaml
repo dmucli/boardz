@@ -1,0 +1,75 @@
+appId: com.boardsesh.app
+name: showcase take - a workout with a rest timer
+---
+# Take: workouts -> .boardsesh/showcase-video/work/footage/workouts/ (homepage showcase, scene "workouts")
+#
+# Records, on the pre-session Record tab: adding a block and switching it to
+# Pyramid (its card opens with the target grade, and the generated workout
+# appears below), turning the rest timer on with a fixed 0:30 window, and
+# Start. The rest pill counts on every tab from the moment the timer is armed.
+# Anchors: workout-type (the selected type chip, re-logged on a change),
+# rest-timer (the switch row).
+#
+# Before recording, the recorder has switched "Show this session live" off
+# (session-private.yaml); Start then begins a PRIVATE session, which the
+# recorder ends afterwards (session-end.yaml).
+#
+# EXPO_PUBLIC_SCREENSHOT_WORKOUT would pre-pick the workout, but it is baked
+# into the whole bundle and would turn the crew take's session into a workout
+# too, so this flow adds the block itself.
+#
+# Every tap goes by label or id, not by point: a new block's card scrolls
+# itself clear of Start, which moves everything above it, and scrolling back up
+# to the rest timer can resize the tab bar, which moves Start. A tap right
+# after a scroll can land mid-bounce, hence the waits.
+#
+# Marks (work/marks/workouts.json): pyramid-picked, rest-armed, rest-pill, started.
+
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/flow-start')}
+
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 800
+    optional: true
+
+# Pyramid: a new block opens as Volume; its chips switch it.
+- tapOn: 'Add a block'
+- waitForAnimationToEnd
+- tapOn: 'Block 1, Pyramid'
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/pyramid-picked')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 1000
+    optional: true
+
+# Rest timer: on, a fixed window, 0:30.
+- scrollUntilVisible:
+    element: 'Rest timer.*'
+    direction: UP
+    timeout: 10000
+- waitForAnimationToEnd
+- tapOn: 'Rest timer.*'
+- waitForAnimationToEnd
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/rest-armed')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 600
+    optional: true
+- tapOn: 'Fixed window'
+# The rest length pill: one tap goes from Off to 0:30.
+- tapOn:
+    id: rest-length-pill
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/rest-pill')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 1200
+    optional: true
+
+# Go.
+- tapOn: 'Start'
+- waitForAnimationToEnd
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/started')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 3000
+    optional: true

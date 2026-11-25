@@ -9,6 +9,14 @@ import {
   forceResetDistributedState,
 } from '../distributed-state';
 import { RECENT_CLIMBS_BUFFER_SIZE } from '../distributed-state/constants';
+import {
+  commitRestCadenceAction,
+  parseRestCadence,
+  type RestCadenceCommit,
+  type RestCadenceInput,
+  type RestCadenceStore,
+  type StoredRestCadence,
+} from '../rest-cadence';
 import { logger } from '../../utils/logger';
 import type {
   ConnectedClient,
@@ -16,6 +24,7 @@ import type {
   LiveSession,
   LocalSessionParticipant,
   QueueState,
+  QueueWriteResult,
   RoomManagerDeps,
   SessionDisconnectResult,
   SessionLeaveResult,
@@ -57,7 +66,6 @@ import {
 } from './session-liveness';
 
 const INACTIVITY_THRESHOLD_MS = 60 * 60 * 1000;
-const INACTIVITY_SWEEP_INTERVAL_MS = 60 * 1000;
 
 class RoomManager {
   private clients = new Map<string, ConnectedClient>();
@@ -76,11 +84,15 @@ class RoomManager {
   // same bound via Array.unshift + slice on every write, using the canonical
   // RECENT_CLIMBS_BUFFER_SIZE constant so the two paths can't drift.
   private localRecentClimbsBySession = new Map<string, string[]>();
+  // In-memory shared rest clock (#5382) for single-instance / no-Redis
+  // deploys, holding the same { revision, doc } pair the Redis hash does. Its
+  // compare-and-set checks and writes in one synchronous step, so it is as
+  // atomic as the Lua script it stands in for.
+  private localRestCadenceBySession = new Map<string, { revision: number; doc: string }>();
   private sessionGraceTimers = new Map<string, NodeJS.Timeout>();
   private readonly SESSION_GRACE_PERIOD_MS = 60_000;
   private pendingJoinPersists = new Map<string, Promise<void>>();
   private writeScheduler = new WriteScheduler();
-  private inactivitySweepInterval: NodeJS.Timeout | null = null;
 
   /**
    * Build the plumbing object passed to the room-manager/* free functions
@@ -121,6 +133,7 @@ class RoomManager {
     this.sessionParticipants.clear();
     this.localBoardSerialBySession.clear();
     this.localRecentClimbsBySession.clear();
+    this.localRestCadenceBySession.clear();
     this.redisStore = null;
     this.distributedState = null;
 
@@ -134,11 +147,6 @@ class RoomManager {
 
     // Clear pending join persist promises
     this.pendingJoinPersists.clear();
-
-    if (this.inactivitySweepInterval) {
-      clearInterval(this.inactivitySweepInterval);
-      this.inactivitySweepInterval = null;
-    }
 
     // Reset the distributed state singleton so initialize() creates a fresh one
     forceResetDistributedState();
@@ -160,17 +168,7 @@ class RoomManager {
       logger.info('[RoomManager] Redis not available - using Postgres only mode (single instance)');
     }
 
-    if (!this.inactivitySweepInterval) {
-      this.inactivitySweepInterval = setInterval(() => {
-        this.runInactivitySweep().catch((err) => {
-          logger.error('[RoomManager] Inactivity sweep failed:', err);
-        });
-      }, INACTIVITY_SWEEP_INTERVAL_MS);
-      this.inactivitySweepInterval.unref();
-      logger.info(
-        `[RoomManager] Inactivity sweep enabled (threshold ${INACTIVITY_THRESHOLD_MS / 60000}m, interval ${INACTIVITY_SWEEP_INTERVAL_MS / 60000}m)`,
-      );
-    }
+    // Inactivity is scheduled independently once per cluster at startup.
   }
 
   /**
@@ -183,11 +181,8 @@ class RoomManager {
    * instance leak `endSession` guards against, just reached via the
    * inactivity path instead of an explicit end).
    *
-   * Extracted from the `setInterval` callback in `initialize()` so tests can
-   * drive a single sweep tick directly instead of waiting on the real
-   * interval. Rethrows on failure: the interval callback catches and logs so
-   * a bad tick never kills the timer, while direct callers (tests) see the
-   * error.
+   * The backend-affine pg-boss job and tests call the same bounded sweep.
+   * Errors propagate so the durable job can retry.
    */
   async runInactivitySweep(): Promise<void> {
     const endedIds = await endStaleInactiveSessions(INACTIVITY_THRESHOLD_MS);
@@ -222,10 +217,6 @@ class RoomManager {
       for (const participant of participants.values()) {
         if (participant.reconnectTimer) clearTimeout(participant.reconnectTimer);
       }
-    }
-    if (this.inactivitySweepInterval) {
-      clearInterval(this.inactivitySweepInterval);
-      this.inactivitySweepInterval = null;
     }
     await shutdownDistributedState();
     logger.info('[RoomManager] Shutdown complete');
@@ -328,6 +319,7 @@ class RoomManager {
     sessionName?: string,
     participantId?: string | null,
     isPublic?: boolean,
+    initialHistoryCount?: number,
   ): Promise<{
     clientId: string;
     users: SessionUser[];
@@ -336,6 +328,9 @@ class RoomManager {
     sequence: number;
     stateHash: string;
     stateHashOrdered: string;
+    historyCount: number;
+    currentChangedAt: string | null;
+    currentChangedBy?: string | null;
     isLeader: boolean;
     sessionName: string | null;
     participantId: string;
@@ -352,7 +347,7 @@ class RoomManager {
         getSessionUsers: (sid) => this.getSessionUsers(sid),
         getSessionUsersLocal: (sid) => this.getSessionUsersLocal(sid),
         getSessionById: (sid) => this.getSessionById(sid),
-        updateQueueStateImmediate: (sid, q, c, v) => this.updateQueueStateImmediate(sid, q, c, v),
+        updateQueueStateImmediate: (sid, q, c, v, line) => this.updateQueueStateImmediate(sid, q, c, v, line),
         leaveSession: (cid) => this.leaveSession(cid),
       },
       {
@@ -360,6 +355,7 @@ class RoomManager {
         avatarUrl,
         initialQueue,
         initialCurrentClimb,
+        initialHistoryCount,
         sessionName,
         participantId,
         isPublic,
@@ -500,6 +496,55 @@ class RoomManager {
   }
 
   /**
+   * The session's shared rest clock (#5382) and its revision. Revision 0 with
+   * a null clock means it was never set (or its state expired).
+   */
+  async getSessionRestCadence(sessionId: string): Promise<StoredRestCadence> {
+    return this.restCadenceStore(sessionId).read();
+  }
+
+  /**
+   * Apply one `setSessionRestCadence` action: read, reduce, compare-and-set
+   * (see `commitRestCadenceAction`). `applied` is true only when a new
+   * revision was written; the caller publishes `SessionRestCadenceChanged`
+   * then, and never otherwise.
+   */
+  async updateSessionRestCadence(
+    sessionId: string,
+    input: RestCadenceInput,
+    participantId: string,
+    nowMs: number,
+  ): Promise<RestCadenceCommit> {
+    return commitRestCadenceAction(this.restCadenceStore(sessionId), input, nowMs, participantId);
+  }
+
+  private restCadenceStore(sessionId: string): RestCadenceStore {
+    const distributedState = this.distributedState;
+    if (distributedState) {
+      return {
+        read: () => distributedState.getSessionRestCadence(sessionId),
+        compareAndSet: (expectedRevision, nextDoc, minimumRevision) =>
+          distributedState.casSessionRestCadence(sessionId, expectedRevision, nextDoc, minimumRevision),
+      };
+    }
+    // Single-instance (no Redis): the in-memory shadow is the source of truth.
+    const local = this.localRestCadenceBySession;
+    return {
+      read: async () => {
+        const stored = local.get(sessionId);
+        return { revision: stored?.revision ?? 0, cadence: parseRestCadence(stored?.doc) };
+      },
+      compareAndSet: async (expectedRevision, nextDoc, minimumRevision) => {
+        const stored = local.get(sessionId) ?? { revision: 0, doc: '' };
+        if (stored.revision !== expectedRevision) return { ok: false, ...stored };
+        const committed = { revision: Math.max(stored.revision + 1, minimumRevision), doc: nextDoc };
+        local.set(sessionId, committed);
+        return { ok: true, ...committed };
+      },
+    };
+  }
+
+  /**
    * Record a climbUuid as one of this session's recent authoritative current
    * climbs. Called from queue-navigation whenever the wall climb changes, so
    * `confirmClimbOnWall` can accept a confirm that arrives in the small window
@@ -567,38 +612,56 @@ class RoomManager {
     }
   }
 
+  /**
+   * Write the queue and current climb. `historyCount` is the History / Up next
+   * line computed with `@boardsesh/queue` now-slot.ts (F3); it is required so
+   * no writer leaves it to a default. `expectedVersion: undefined` is a blind
+   * write, allowed only when a climb is current (the line is then derived).
+   */
   async updateQueueState(
     sessionId: string,
     queue: ClimbQueueItem[],
     currentClimbQueueItem: ClimbQueueItem | null,
-    expectedVersion?: number,
-  ): Promise<{
-    version: number;
-    sequence: number;
-    stateHash: string;
-    stateHashOrdered: string;
-    previousStateHash: string | null;
-    previousStateHashOrdered: string | null;
-  }> {
-    return updateQueueStateFn(this.deps(), sessionId, queue, currentClimbQueueItem, expectedVersion);
+    expectedVersion: number | undefined,
+    historyCount: number,
+    currentChangedBy?: string | null,
+  ): Promise<QueueWriteResult & { previousStateHash: string | null; previousStateHashOrdered: string | null }> {
+    return updateQueueStateFn(
+      this.deps(),
+      sessionId,
+      queue,
+      currentClimbQueueItem,
+      expectedVersion,
+      historyCount,
+      currentChangedBy,
+    );
   }
 
   async updateQueueStateImmediate(
     sessionId: string,
     queue: ClimbQueueItem[],
     currentClimbQueueItem: ClimbQueueItem | null,
-    expectedVersion?: number,
+    expectedVersion: number | undefined,
+    historyCount: number,
   ): Promise<number> {
-    return updateQueueStateImmediateFn(this.deps(), sessionId, queue, currentClimbQueueItem, expectedVersion);
+    return updateQueueStateImmediateFn(
+      this.deps(),
+      sessionId,
+      queue,
+      currentClimbQueueItem,
+      expectedVersion,
+      historyCount,
+    );
   }
 
   async updateQueueOnly(
     sessionId: string,
     queue: ClimbQueueItem[],
-    expectedVersion?: number,
-    knownState?: Pick<QueueState, 'currentClimbQueueItem'>,
-  ): Promise<{ version: number; sequence: number; stateHash: string; stateHashOrdered: string }> {
-    return updateQueueOnlyFn(this.deps(), sessionId, queue, expectedVersion, knownState);
+    expectedVersion: number | undefined,
+    knownState: Pick<QueueState, 'currentClimbQueueItem'> | undefined,
+    historyCount: number,
+  ): Promise<QueueWriteResult> {
+    return updateQueueOnlyFn(this.deps(), sessionId, queue, expectedVersion, knownState, historyCount);
   }
 
   async getQueueState(sessionId: string): Promise<QueueState> {
@@ -612,11 +675,16 @@ class RoomManager {
   /**
    * Update the session's stored boardPath, returning the previous value when
    * a change actually occurred, or `null` for no-op writes (idempotent).
-   * Used by the `setSessionBoardPath` mutation to gate the
-   * `SessionBoardPathChanged` event.
+   * Publishes `SessionBoardPathChanged` after the move commits, before
+   * fallible preview refreshes, so live identity projections are withdrawn.
    */
-  async updateSessionBoardPathIfChanged(sessionId: string, boardPath: string): Promise<string | null> {
-    return updateSessionBoardPathIfChangedFn(sessionId, boardPath);
+  async updateSessionBoardPathIfChanged(
+    sessionId: string,
+    boardPath: string,
+    viewerId?: string | null,
+    changedByParticipantId: string | null = null,
+  ): Promise<string | null> {
+    return updateSessionBoardPathIfChangedFn(sessionId, boardPath, viewerId, changedByParticipantId);
   }
 
   async createDiscoverableSession(
@@ -645,8 +713,13 @@ class RoomManager {
     );
   }
 
-  async findNearbySessions(latitude: number, longitude: number, radiusMeters?: number): Promise<DiscoverableSession[]> {
-    return findNearbySessionsFn(this.deps(), latitude, longitude, radiusMeters);
+  async findNearbySessions(
+    latitude: number,
+    longitude: number,
+    radiusMeters?: number,
+    viewerId?: string,
+  ): Promise<DiscoverableSession[]> {
+    return findNearbySessionsFn(this.deps(), latitude, longitude, radiusMeters, viewerId);
   }
 
   /**
@@ -664,12 +737,12 @@ class RoomManager {
   }
 
   /**
-   * Drop the in-memory board-serial / recent-climbs shadows for this
-   * session. The shadows are local to this RoomManager instance (the
-   * single-instance / no-Redis fallback for `localBoardSerialBySession` and
-   * `localRecentClimbsBySession` — see their field comments) and otherwise
-   * grow unbounded across session lifecycles, since nothing else ever
-   * deletes their entries. Distributed-state's Redis keys for the same data
+   * Drop the in-memory board-serial / recent-climbs / rest-clock shadows for
+   * this session. The shadows are local to this RoomManager instance (the
+   * single-instance / no-Redis fallback for `localBoardSerialBySession`,
+   * `localRecentClimbsBySession` and `localRestCadenceBySession` — see their
+   * field comments) and otherwise grow unbounded across session lifecycles,
+   * since nothing else ever deletes their entries. Distributed-state's Redis keys for the same data
    * are cleaned up by `cleanupEmptySession` when the session set drains;
    * this is the single-instance / single-process equivalent, called from
    * every path that durably ends a session (explicit `endSession` and the
@@ -678,6 +751,7 @@ class RoomManager {
   private clearLocalSessionShadows(sessionId: string): void {
     this.localBoardSerialBySession.delete(sessionId);
     this.localRecentClimbsBySession.delete(sessionId);
+    this.localRestCadenceBySession.delete(sessionId);
   }
 
   async endSession(sessionId: string): Promise<void> {

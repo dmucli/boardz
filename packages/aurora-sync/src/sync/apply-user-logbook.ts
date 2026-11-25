@@ -102,7 +102,7 @@ type ComparedRow = {
 };
 
 /** Aurora encodes is_listed across a few wire shapes; only tombstone on explicit false. */
-function isAuroraListedFalse(value: unknown): boolean {
+export function isAuroraListedFalse(value: unknown): boolean {
   return value === false || value === 0 || value === '0' || value === 'false';
 }
 
@@ -387,7 +387,7 @@ async function recordLogbookSyncSkips(
  * Drop quarantine rows for upstream ids that just synced cleanly, so the table
  * answers "what is broken right now" instead of accumulating into "what ever
  * broke" — the difference between state and a counter, and the reason this is
- * queryable at all (see docs/aurora-sync.md).
+ * queryable at all (see docs/data/aurora-sync.md).
  */
 async function reconcileLogbookSyncSkips(
   db: DrizzleDb,

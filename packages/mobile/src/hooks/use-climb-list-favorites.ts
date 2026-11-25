@@ -1,10 +1,25 @@
 import { useEffect, useRef } from 'react';
-import { InteractionManager } from 'react-native';
+import { scheduleIdleTask } from '../lib/schedule-idle-task';
 import { GET_FAVORITES, type FavoritesQueryResponse } from '@boardsesh/graphql/operations/favorites';
 import { favoritesStore } from '@boardsesh/climb-actions';
-import { getHttpClient } from '../lib/graphql/client';
+import { offlineAwareRequest } from '../lib/graphql/offline-request';
+import { useUserReadRefresh } from './use-user-read-refresh';
 import { useAuth } from '../providers/auth-provider';
 import { useStoredUserId } from './use-current-user-id';
+import { getDatabaseHandle } from '../db';
+import { getPendingFavoriteOverridesLocal } from '../db/queries/get-favorite-status-local';
+import { getCredentialGeneration } from '../lib/privacy/privacy-cache';
+
+async function pendingFavoriteOverrides(climbUuids: readonly string[], userId: string | undefined) {
+  const db = getDatabaseHandle();
+  if (!db || !userId) return new Map<string, boolean>();
+  try {
+    return await getPendingFavoriteOverridesLocal(db, climbUuids, userId);
+  } catch {
+    // A device without an available SQLite outbox still uses the network.
+    return new Map<string, boolean>();
+  }
+}
 
 // `FavoritesQueryClimbUuidsSchema` caps the query at 500 uuids; chunk longer
 // visible sets rather than eating a validation error.
@@ -30,8 +45,8 @@ type UseClimbListFavoritesArgs = {
  * No-op while signed out (`favorites` returns an empty list for an anonymous
  * reader anyway). Dedupes via a ref so each climb is requested once; hands the
  * board/angle/auth context to the store, which clears itself when it flips so
- * one board's hearts can't paint another's rows. Deferred past the active fling
- * via `runAfterInteractions`, mirroring the logbook and playlist-tag fetches.
+ * one board's hearts can't paint another's rows. Deferred until the JS thread
+ * has idle time after a frame paints.
  */
 export function useClimbListFavorites({ boardName, angle, climbUuids }: UseClimbListFavoritesArgs): void {
   const { isAuthenticated } = useAuth();
@@ -43,6 +58,7 @@ export function useClimbListFavorites({ boardName, angle, climbUuids }: UseClimb
   // `staleTime: Infinity` and dropped by the sign-out cache clear.
   const { userId, isLoading: isUserIdLoading } = useStoredUserId(isAuthenticated);
 
+  const refreshEpoch = useUserReadRefresh('favorites');
   const fetchedRef = useRef<Set<string>>(new Set());
   const contextKey = `${userId ?? 'anonymous'}:${boardName}:${angle}:${isAuthenticated ? 1 : 0}`;
 
@@ -56,6 +72,10 @@ export function useClimbListFavorites({ boardName, angle, climbUuids }: UseClimb
   }, [contextKey]);
 
   useEffect(() => {
+    fetchedRef.current = new Set();
+  }, [refreshEpoch]);
+
+  useEffect(() => {
     // Waiting out the id read costs nothing and saves a wasted round trip: the
     // key changes the moment it resolves, which would reset and refetch anyway.
     if (!isAuthenticated || isUserIdLoading || !boardName || climbUuids.length === 0) return;
@@ -67,13 +87,14 @@ export function useClimbListFavorites({ boardName, angle, climbUuids }: UseClimb
     // in a fresh one, and the bookkeeping below belongs to THIS context. Writing
     // through the ref after that swap would edit the new context's set.
     const fetchedForContext = fetchedRef.current;
+    const credentialGeneration = getCredentialGeneration();
     let mergedCount = 0;
     // Puts back every uuid whose chunk never merged, so a later run retries it.
     // Leaving them marked would wedge those climbs' hearts for the session.
     const releaseUnmerged = () => {
       for (const uuid of toFetch.slice(mergedCount)) fetchedForContext.delete(uuid);
     };
-    const handle = InteractionManager.runAfterInteractions(async () => {
+    const handle = scheduleIdleTask(async () => {
       // Mark up-front so an overlapping effect run doesn't double-request the
       // same uuids while this batch is in flight.
       for (const uuid of toFetch) fetchedForContext.add(uuid);
@@ -83,17 +104,26 @@ export function useClimbListFavorites({ boardName, angle, climbUuids }: UseClimb
           // Read the clock BEFORE asking, so a toggle that lands while this is
           // in flight is recognisably newer than the answer coming back.
           const startedAtStamp = favoritesStore.getWriteStamp();
-          const response = await getHttpClient().request<FavoritesQueryResponse>(GET_FAVORITES, {
+          // Capture BEFORE the network request: the drainer can acknowledge and
+          // remove an outbox row while that request still holds pre-write truth.
+          const overrides = await pendingFavoriteOverrides(chunk, userId);
+          if (cancelled || getCredentialGeneration() !== credentialGeneration) return;
+          const response = await offlineAwareRequest<FavoritesQueryResponse>(GET_FAVORITES, {
             boardName,
             climbUuids: chunk,
             angle,
           });
-          if (cancelled) return;
+          if (cancelled || getCredentialGeneration() !== credentialGeneration) return;
+          const favoriteUuids = new Set(response.favorites);
+          for (const [climbUuid, favorited] of overrides) {
+            if (favorited) favoriteUuids.add(climbUuid);
+            else favoriteUuids.delete(climbUuid);
+          }
           // The query returns only the favourited subset; `mergeFavorites`
           // clears the rest of the chunk so an unfavourite made elsewhere
           // doesn't leave a stale heart behind — except for climbs toggled
           // since `startedAtStamp`, whose newer state wins.
-          favoritesStore.mergeFavorites(chunk, response.favorites, startedAtStamp);
+          favoritesStore.mergeFavorites(chunk, [...favoriteUuids], startedAtStamp);
           mergedCount = offset + chunk.length;
         }
       } catch {
@@ -114,5 +144,5 @@ export function useClimbListFavorites({ boardName, angle, climbUuids }: UseClimb
       // list change happened to come along.
       releaseUnmerged();
     };
-  }, [isAuthenticated, isUserIdLoading, boardName, angle, climbUuids]);
+  }, [isAuthenticated, isUserIdLoading, userId, boardName, angle, climbUuids, refreshEpoch]);
 }

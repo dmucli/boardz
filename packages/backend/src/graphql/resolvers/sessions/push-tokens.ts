@@ -13,6 +13,7 @@ import { buildContentStateFromQueueState } from '../../../services/apns/content-
 import { roomManager } from '../../../services/room-manager';
 import { trackLiveActivityEnded, trackLiveActivityStarted } from '../../../services/analytics/live-activity';
 import { logger } from '../../../utils/logger';
+import { requireResourceAccess } from '../../../services/privacy';
 
 /**
  * APNs device tokens are hex-encoded byte blobs. Classic remote-notification
@@ -203,6 +204,8 @@ export const pushTokenMutations = {
       throw new Error('Unauthorized: not a participant in this session');
     }
 
+    await requireResourceAccess('session', sessionId, ctx.userId);
+
     // Bound the number of tokens per session and detect rebinding.
     //
     // Run lookup + (optional) eviction + insert inside one transaction with a
@@ -298,7 +301,6 @@ export const pushTokenMutations = {
     incrementApnsMetric('tokensRegistered');
     logger.info(`[APNs] Registered Live Activity token for session ${sessionId}: ${describeTokenForLog(token)}`);
     trackLiveActivityStarted({
-      userId: ctx.userId,
       sessionId,
       tokenLength: token.length,
       apnsConfigured: isApnsConfigured(),
@@ -390,7 +392,6 @@ export const pushTokenMutations = {
 
     logger.info(`[APNs] Unregistered Live Activity token for session ${sessionId}: ${describeTokenForLog(token)}`);
     trackLiveActivityEnded({
-      userId: ctx.userId,
       sessionId,
       reason: 'unregister',
     });

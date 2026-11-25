@@ -7,12 +7,13 @@
 // `QueueMutationsDeps`. `react` is a peerDependency.
 
 export { useQueueMutations } from './use-queue-mutations';
-export { createQueueMutations } from './create-queue-mutations';
+export { createQueueMutations, isNowSlotValidationError } from './create-queue-mutations';
 export type {
   QueueMutationsActions,
   QueueMutationsDeps,
   PublishPlaybackStateInput,
   BestEffortAction,
+  SessionRestCadenceSendOptions,
 } from './create-queue-mutations';
 // Re-exported for discoverability only. Consumers import the dedicated
 // `@boardsesh/queue-react/queue-item-input` subpath instead: nine mobile provider

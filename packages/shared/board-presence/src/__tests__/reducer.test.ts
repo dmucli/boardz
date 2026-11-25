@@ -5,7 +5,7 @@ import type {
   BoardPresenceEvent,
   BoardPresenceStats,
 } from '@boardsesh/shared-schema';
-import { boardPresenceReducer, initialBoardPresenceState, HISTORY_CAP } from '../reducer';
+import { boardPresenceReducer, initialBoardPresenceState, HISTORY_CAP, selectClearedClimbUuid } from '../reducer';
 import { mapBoardPresenceEnvelopeToAction } from '../map-envelope';
 import type { BoardPresenceState } from '../types';
 
@@ -22,6 +22,8 @@ function makeClimb(overrides: Partial<BoardPresenceClimb> & { seq: number }): Bo
 function makeState(overrides: Partial<BoardPresenceState> = {}): BoardPresenceState {
   return {
     ...initialBoardPresenceState,
+    // Existing fixtures describe a live event unless they give a separate wire cursor.
+    lastConnectionWireSeq: overrides.lastConnectionSeq ?? 0,
     ...overrides,
   };
 }
@@ -55,10 +57,13 @@ describe('initialBoardPresenceState', () => {
       history: [],
       lastSeq: 0,
       lastClearedAt: null,
+      lastClearedClimbUuid: null,
       stats: null,
       lastStatsSeq: 0,
       holder: null,
+      lastConnectionWireSeq: 0,
       lastConnectionSeq: 0,
+      lastHolderChangeSeq: 0,
     });
   });
 });
@@ -202,6 +207,65 @@ describe('APPLY_CLIMB_CLEARED', () => {
     });
 
     expect(result).toBe(state);
+  });
+});
+
+describe('selectClearedClimbUuid (#7015)', () => {
+  const clearedAt = '2026-06-09T01:00:00.000Z';
+
+  it('names the climb a live clear turned off, from the event', () => {
+    const current = makeClimb({ seq: 7, climbUuid: 'angel-eyes' });
+    const state = makeState({ currentClimb: current, history: [current], lastSeq: 7 });
+
+    const result = boardPresenceReducer(state, {
+      type: 'APPLY_CLIMB_CLEARED',
+      payload: { clearedAt, seq: 8, climbUuid: 'angel-eyes' },
+    });
+
+    expect(selectClearedClimbUuid(result)).toBe('angel-eyes');
+  });
+
+  it('falls back to the climb that was current when an older server sends no climb', () => {
+    const current = makeClimb({ seq: 7, climbUuid: 'angel-eyes' });
+    const state = makeState({ currentClimb: current, history: [current], lastSeq: 7 });
+
+    const result = boardPresenceReducer(state, { type: 'APPLY_CLIMB_CLEARED', payload: { clearedAt, seq: 8 } });
+
+    expect(selectClearedClimbUuid(result)).toBe('angel-eyes');
+  });
+
+  it('keeps the wall dark when the replayed clear lands before the history backfill', () => {
+    const replayed = boardPresenceReducer(initialBoardPresenceState, {
+      type: 'APPLY_CLIMB_CLEARED',
+      payload: { clearedAt, seq: 8, climbUuid: 'angel-eyes' },
+    });
+    const backfilled = boardPresenceReducer(replayed, {
+      type: 'BACKFILL_HISTORY',
+      payload: [makeClimb({ seq: 7, climbUuid: 'angel-eyes' }), makeClimb({ seq: 6 })],
+    });
+
+    expect(backfilled.currentClimb).toBeNull();
+    expect(backfilled.history).toHaveLength(2);
+    expect(selectClearedClimbUuid(backfilled)).toBe('angel-eyes');
+  });
+
+  it('answers null once a climb is lit again', () => {
+    const current = makeClimb({ seq: 7, climbUuid: 'angel-eyes' });
+    const cleared = boardPresenceReducer(makeState({ currentClimb: current, history: [current], lastSeq: 7 }), {
+      type: 'APPLY_CLIMB_CLEARED',
+      payload: { clearedAt, seq: 8, climbUuid: 'angel-eyes' },
+    });
+    const relit = boardPresenceReducer(cleared, {
+      type: 'APPLY_CLIMB_SET',
+      payload: makeClimb({ seq: 9, climbUuid: 'angel-eyes' }),
+    });
+
+    expect(relit.currentClimb?.climbUuid).toBe('angel-eyes');
+    expect(selectClearedClimbUuid(relit)).toBeNull();
+  });
+
+  it('is null when no clear was ever seen', () => {
+    expect(selectClearedClimbUuid(initialBoardPresenceState)).toBeNull();
   });
 });
 
@@ -496,6 +560,8 @@ describe('APPLY_CONNECTION_CHANGED', () => {
 
     expect(result.holder).toEqual(holder);
     expect(result.lastConnectionSeq).toBe(3);
+    // The server only pushes one when the holder changed.
+    expect(result.lastHolderChangeSeq).toBe(3);
   });
 
   it('a higher seq replaces the current holder', () => {
@@ -524,7 +590,7 @@ describe('APPLY_CONNECTION_CHANGED', () => {
     expect(result.lastConnectionSeq).toBe(6);
   });
 
-  it('ignores a stale or duplicate push (seq <= lastConnectionSeq) so out-of-order fan-out cannot regress', () => {
+  it('ignores a stale or duplicate push at or below the holder wire cursor', () => {
     const current = makeHolder({ userId: 'alice' });
     const state = makeState({ holder: current, lastConnectionSeq: 10 });
 
@@ -565,6 +631,7 @@ describe('SEED_CONNECTION', () => {
     const afterSeed = boardPresenceReducer(initialBoardPresenceState, { type: 'SEED_CONNECTION', payload: seeded });
     expect(afterSeed.holder).toEqual(seeded);
     expect(afterSeed.lastConnectionSeq).toBe(0);
+    expect(afterSeed.lastHolderChangeSeq).toBe(0);
 
     // A subsequent live push (any seq > 0) overrides the seed.
     const live = makeHolder({ userId: 'bob' });
@@ -598,11 +665,143 @@ describe('REFRESH_CONNECTION', () => {
 
     const result = boardPresenceReducer(state, {
       type: 'REFRESH_CONNECTION',
-      payload: { holder: refreshed, upToSeq: 9 },
+      payload: { holder: refreshed, upToSeq: 9, startedAtSeq: 9 },
     });
 
     expect(result.holder).toEqual(refreshed);
     expect(result.lastConnectionSeq).toBe(9);
+    expect(result.lastHolderChangeSeq).toBe(9);
+  });
+
+  // Board plan item 8: a catch-up moves `lastConnectionSeq` through every stats
+  // and history event it repaired, so only `lastHolderChangeSeq` says whether
+  // someone took the board after a given sequence.
+  it('keeps lastHolderChangeSeq when it reads back the same account', () => {
+    const state = makeState({
+      holder: makeHolder({ userId: 'sam', displayName: 'Sam' }),
+      lastConnectionSeq: 4,
+      lastHolderChangeSeq: 4,
+    });
+
+    const result = boardPresenceReducer(state, {
+      type: 'REFRESH_CONNECTION',
+      payload: { holder: makeHolder({ userId: 'sam', displayName: 'Sam R.' }), upToSeq: 13, startedAtSeq: 13 },
+    });
+
+    expect(result.holder?.displayName).toBe('Sam R.');
+    expect(result.lastConnectionSeq).toBe(13);
+    expect(result.lastHolderChangeSeq).toBe(4);
+  });
+
+  it('keeps lastHolderChangeSeq when it reads back an anonymous hold or a free board', () => {
+    const anonymous = makeState({
+      holder: makeHolder({ userId: null, displayName: null, lastSentAt: '2026-11-01T10:00:00Z' }),
+      lastConnectionSeq: 5,
+      lastHolderChangeSeq: 5,
+    });
+    // The read path carries no send time for an anonymous holder: still the same hold.
+    const rereadAnonymous = boardPresenceReducer(anonymous, {
+      type: 'REFRESH_CONNECTION',
+      payload: {
+        holder: makeHolder({ userId: null, displayName: null, lastSentAt: null }),
+        upToSeq: 10,
+        startedAtSeq: 10,
+      },
+    });
+    expect(rereadAnonymous.lastConnectionSeq).toBe(10);
+    expect(rereadAnonymous.lastHolderChangeSeq).toBe(5);
+
+    const free = makeState({ holder: null, lastConnectionSeq: 6, lastHolderChangeSeq: 6 });
+    const rereadFree = boardPresenceReducer(free, {
+      type: 'REFRESH_CONNECTION',
+      payload: { holder: null, upToSeq: 11, startedAtSeq: 11 },
+    });
+    expect(rereadFree.lastConnectionSeq).toBe(11);
+    expect(rereadFree.lastHolderChangeSeq).toBe(6);
+  });
+
+  it.each([
+    ['another account', { userId: 'sam' }, { userId: 'alex' }],
+    ['an account after an anonymous hold', { userId: null }, { userId: 'sam' }],
+    ['an anonymous hold after an account', { userId: 'sam' }, { userId: null }],
+    ['a hold on a free board', null, { userId: 'sam' }],
+    ['a free board after a hold', { userId: 'sam' }, null],
+  ] as const)('moves lastHolderChangeSeq when it reads %s', (_case, before, after) => {
+    const state = makeState({
+      holder: before === null ? null : makeHolder(before),
+      lastConnectionSeq: 4,
+      lastHolderChangeSeq: 4,
+    });
+
+    const result = boardPresenceReducer(state, {
+      type: 'REFRESH_CONNECTION',
+      payload: { holder: after === null ? null : makeHolder(after), upToSeq: 9, startedAtSeq: 9 },
+    });
+
+    expect(result.lastHolderChangeSeq).toBe(9);
+  });
+
+  it('does not let a later history sequence resurrect a holder released during the snapshot read', () => {
+    const released = boardPresenceReducer(initialBoardPresenceState, {
+      type: 'APPLY_CONNECTION_CHANGED',
+      payload: { holder: null, seq: 11 },
+    });
+    const result = boardPresenceReducer(released, {
+      type: 'REFRESH_CONNECTION',
+      payload: { holder: makeHolder({ userId: 'old' }), startedAtSeq: 10, upToSeq: 13 },
+    });
+
+    expect(result.holder).toBeNull();
+    expect(result.lastConnectionWireSeq).toBe(11);
+    expect(result.lastConnectionSeq).toBe(13);
+    expect(result.lastHolderChangeSeq).toBe(11);
+    const connectionSeqAtTake = result.lastConnectionSeq;
+    const delayed = boardPresenceReducer(result, {
+      type: 'APPLY_CONNECTION_CHANGED',
+      payload: { holder: makeHolder({ userId: 'earlier-peer' }), seq: 12 },
+    });
+    expect(delayed.holder?.userId).toBe('earlier-peer');
+    expect(delayed.lastConnectionSeq).toBe(connectionSeqAtTake);
+    expect(delayed.lastHolderChangeSeq > connectionSeqAtTake).toBe(false);
+  });
+
+  it('repairs public progress without blocking a delayed holder event or inventing a post-take event', () => {
+    const repaired = boardPresenceReducer(initialBoardPresenceState, {
+      type: 'REFRESH_CONNECTION',
+      payload: { holder: makeHolder({ userId: 'seed' }), startedAtSeq: 1, upToSeq: 13 },
+    });
+    const connectionSeqAtTake = repaired.lastConnectionSeq;
+    const delayed = boardPresenceReducer(repaired, {
+      type: 'APPLY_CONNECTION_CHANGED',
+      payload: { holder: makeHolder({ userId: 'earlier-peer' }), seq: 2 },
+    });
+
+    expect(delayed.holder?.userId).toBe('earlier-peer');
+    expect(delayed.lastConnectionWireSeq).toBe(2);
+    expect(delayed.lastConnectionSeq).toBe(connectionSeqAtTake);
+    expect(delayed.lastHolderChangeSeq).toBe(13);
+    expect(delayed.lastHolderChangeSeq > connectionSeqAtTake).toBe(false);
+
+    const later = boardPresenceReducer(delayed, {
+      type: 'APPLY_CONNECTION_CHANGED',
+      payload: { holder: makeHolder({ userId: 'later-peer' }), seq: 14 },
+    });
+    expect(later.lastConnectionWireSeq).toBe(14);
+    expect(later.lastConnectionSeq).toBe(14);
+    expect(later.lastHolderChangeSeq).toBe(14);
+    expect(later.lastHolderChangeSeq > connectionSeqAtTake).toBe(true);
+  });
+
+  it('updates a fresh equal-sequence holder snapshot without inventing a newer takeover', () => {
+    const state = makeState({ holder: makeHolder({ userId: 'old' }), lastConnectionSeq: 10 });
+    const result = boardPresenceReducer(state, {
+      type: 'REFRESH_CONNECTION',
+      payload: { holder: makeHolder({ userId: 'new' }), startedAtSeq: 10, upToSeq: 10 },
+    });
+
+    expect(result.holder?.userId).toBe('new');
+    expect(result.lastConnectionSeq).toBe(10);
+    expect(result.lastHolderChangeSeq > state.lastConnectionSeq).toBe(false);
   });
 
   it('ignores an older catch-up snapshot so neither holder nor lastConnectionSeq regress', () => {
@@ -610,7 +809,7 @@ describe('REFRESH_CONNECTION', () => {
 
     const result = boardPresenceReducer(state, {
       type: 'REFRESH_CONNECTION',
-      payload: { holder: null, upToSeq: 10 },
+      payload: { holder: null, upToSeq: 10, startedAtSeq: 10 },
     });
 
     expect(result).toBe(state);
@@ -650,7 +849,21 @@ describe('mapBoardPresenceEnvelopeToAction', () => {
 
     expect(mapBoardPresenceEnvelopeToAction(event)).toEqual({
       type: 'APPLY_CLIMB_CLEARED',
-      payload: { clearedAt: '2026-06-09T02:00:00.000Z', seq: 12 },
+      payload: { clearedAt: '2026-06-09T02:00:00.000Z', seq: 12, climbUuid: null },
+    });
+  });
+
+  it('carries the cleared climb named by a newer server (#7015)', () => {
+    const event: BoardPresenceEvent = {
+      __typename: 'BoardClimbCleared',
+      clearedAt: '2026-06-09T02:00:00.000Z',
+      seq: 12,
+      climbUuid: 'angel-eyes',
+    };
+
+    expect(mapBoardPresenceEnvelopeToAction(event)).toEqual({
+      type: 'APPLY_CLIMB_CLEARED',
+      payload: { clearedAt: '2026-06-09T02:00:00.000Z', seq: 12, climbUuid: 'angel-eyes' },
     });
   });
 

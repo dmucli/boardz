@@ -41,6 +41,8 @@ export const playlistsTypeDefs = /* GraphQL */ `
     isFollowedByMe: Boolean!
     "Whether the current user has pinned this playlist (false when unauthenticated)"
     isPinnedByMe: Boolean!
+    "Grade spread of the playlist's climbs. Null when none of its climbs has a grade yet."
+    gradeSummary: PlaylistGradeSummary
   }
 
   """
@@ -82,6 +84,7 @@ export const playlistsTypeDefs = /* GraphQL */ `
   Input for creating a playlist.
   """
   input CreatePlaylistInput {
+    privacy: PrivacyPublicationInput
     "Optional client-generated UUID for offline idempotent replay"
     uuid: ID
     "Board type"
@@ -102,6 +105,7 @@ export const playlistsTypeDefs = /* GraphQL */ `
   Input for updating a playlist.
   """
   input UpdatePlaylistInput {
+    privacy: PrivacyPublicationInput
     "Playlist ID to update"
     playlistId: ID!
     "New name"
@@ -239,6 +243,105 @@ export const playlistsTypeDefs = /* GraphQL */ `
   }
 
   """
+  How a playlist's climbs are ordered.
+  position is the playlist's own order (the default), added is when each climb
+  was added to the playlist. On the FIVE_STARS, PROJECTS and MOST_REPEATED smart
+  lists, which record no time a climb entered them, added is the list's own
+  order, the same as position. The others rank on the grade, quality and ascents
+  each row displays, or shuffle with a seed.
+  """
+  enum PlaylistClimbSort {
+    position
+    added
+    difficulty
+    quality
+    ascents
+    name
+    random
+  }
+
+  """
+  Sort and filters for a playlist's climbs: the Climbs list's filters, applied to
+  the playlist's own climbs. Every filter narrows the playlist and never adds a
+  climb to it.
+
+  Grade, quality, ascents and benchmark filters (and the matching sorts) read
+  each row's stats at the angle the row displays: on the active board's type the
+  wall angle, elsewhere the angle the climb was added at, and in both cases the
+  most-ascended angle when the climb has no stats at that one.
+
+  The personal and board-shaped filters (progress, your rating, liked, followed
+  authors, beta videos, tall, wide, holds, zone and onlyActiveBoard) only pass
+  climbs on the active board: the specific board in specific-board mode, the
+  active* fields in all-boards mode. They need its board type, layout and angle;
+  without them they match nothing.
+  """
+  input PlaylistClimbViewInput {
+    "Order of the climbs. Omitted means position (the playlist's own order)."
+    sortBy: PlaylistClimbSort
+    "Sort direction ('asc' or 'desc'). Omitted means the sort's natural direction: asc for position, difficulty and name, desc for added, quality and ascents."
+    sortOrder: String
+    "Seed for the 'random' sort; keeps OFFSET pagination stable across pages for one shuffle"
+    sortSeed: String
+    "Filter by climb name (partial match)"
+    name: String
+    "Minimum difficulty grade ID"
+    minGrade: Int
+    "Maximum difficulty grade ID"
+    maxGrade: Int
+    "Grade accuracy filter (maximum gap between the displayed grade and the average grade)"
+    gradeAccuracy: String
+    "Which grade minGrade and maxGrade (and the difficulty sort) read. Omitted means UPSTREAM."
+    gradeSource: ClimbGradeSource
+    "Key the grade filter and the difficulty sort off the climber's own grade on the active board, falling back to the crowd's grade elsewhere. (requires auth)"
+    useMyGrades: Boolean
+    "Minimum number of ascents"
+    minAscents: Int
+    "Minimum quality rating"
+    minRating: Float
+    "Only show benchmark climbs"
+    onlyBenchmarks: Boolean
+    "Filter by setter usernames"
+    setter: [String!]
+    "Only climbs by followed setters or followed users, on the active board. (requires auth)"
+    onlyFollowedAuthors: Boolean
+    "Only climbs on the active board that need its full height"
+    onlyTallClimbs: Boolean
+    "Only climbs on the active board that need its full width"
+    onlyWideClimbs: Boolean
+    "Only climbs on the active board that have a beta video"
+    onlyWithBetaVideos: Boolean
+    "Include single-frame climbs (boulders). Omitting both boulders and routes matches all climb types."
+    boulders: Boolean
+    "Include multi-frame climbs (routes). Omitting both boulders and routes matches all climb types."
+    routes: Boolean
+    "Only climbs with no ascents at the displayed angle"
+    projectsOnly: Boolean
+    "Hide climbs the user has attempted on the active board (requires auth)"
+    hideAttempted: Boolean
+    "Hide climbs the user has completed on the active board (requires auth)"
+    hideCompleted: Boolean
+    "Only climbs the user has attempted on the active board (requires auth)"
+    showOnlyAttempted: Boolean
+    "Only climbs the user has completed on the active board (requires auth)"
+    showOnlyCompleted: Boolean
+    "Hide climbs whose latest rating from the user, at the active angle, is below this many stars. 0 means no minimum. (requires auth)"
+    minUserRating: Int
+    "Only climbs the user has rated at the active angle (requires auth)"
+    onlyRatedByMe: Boolean
+    "Only climbs the user has hearted on the active board (requires auth)"
+    onlyFavorited: Boolean
+    "Hold filter object: { holdId: { STATE: 'include' | 'exclude' } }, matched on the active board"
+    holdsFilter: JSON
+    "Restrict to climbs on the active board inside this drawn zone"
+    zoneBox: ZoneBoxInput
+    "How the zone should match climb holds. Defaults to allHolds when omitted."
+    zoneMode: ZoneMatchMode
+    "Only climbs that fit the active board: its board type, layout, size and hold sets"
+    onlyActiveBoard: Boolean
+  }
+
+  """
   Input for getting climbs in a playlist with full data.
   """
   input GetPlaylistClimbsInput {
@@ -258,6 +361,14 @@ export const playlistsTypeDefs = /* GraphQL */ `
     activeBoardName: String
     "Selected wall angle to render grades at for on-active-board climbs in all-boards mode"
     activeAngle: Int
+    "Active board layout in all-boards mode. Needs activeBoardName. Used by the view's active-board filters."
+    activeLayoutId: Int
+    "Active board size in all-boards mode. Needs activeBoardName. Used by the view's active-board filters."
+    activeSizeId: Int
+    "Active board's comma-separated set IDs in all-boards mode. Needs activeBoardName. Used by the view's active-board filters."
+    activeSetIds: String
+    "Sort and filters. Omitted means the playlist's own order with no filter."
+    view: PlaylistClimbViewInput
     "Page number"
     page: Int
     "Page size"
@@ -270,10 +381,47 @@ export const playlistsTypeDefs = /* GraphQL */ `
   type PlaylistClimbsResult {
     "List of climbs with full data"
     climbs: [Climb!]!
-    "Total number of climbs matching the supplied board, layout, size, and hold-set filters before pagination"
+    "Total number of climbs matching the supplied board, layout, size, and hold-set scope and the view's filters, before pagination"
     totalCount: Int!
+    "Climbs the playlist shows in this board scope with no view filter applied. Set on page 0 of a view that carries a filter; null otherwise (a sort alone, and later pages)."
+    unfilteredCount: Int
     "Whether more are available"
     hasMore: Boolean!
+  }
+
+  """
+  A setter of the climbs in a playlist, with how many of them they set.
+  playlistSetters returns at most 200, those with the most climbs, and says
+  nothing when it cut the list: search by username prefix reaches the rest.
+  """
+  type PlaylistSetter {
+    "Setter username, exactly as a view's setter filter matches it"
+    username: String!
+    "How many of the playlist's climbs the viewer can see were set by them"
+    climbCount: Int!
+  }
+
+  """
+  Input for the setters of a playlist's climbs. Name a user playlist with
+  playlistId, or a logbook smart list with smartType and userId.
+  """
+  input PlaylistSettersInput {
+    "User playlist ID. Omit for a smart list."
+    playlistId: ID
+    "Smart list type, with userId: FIVE_STARS, MOST_REPEATED, PROJECTS or LIKED_CLIMBS. A recommendation is rejected."
+    smartType: SmartPlaylistType
+    "Whose smart list, with smartType"
+    userId: ID
+    "Board name. On a user playlist, the specific-board mode of playlistClimbs (omit for all boards); on a smart list, its board-type filter."
+    boardName: String
+    "Layout ID (user playlists only)"
+    layoutId: Int
+    "Size ID (user playlists only)"
+    sizeId: Int
+    "Set IDs (user playlists only)"
+    setIds: String
+    "Only setters whose username starts with this, ignoring case"
+    search: String
   }
 
   """
@@ -320,6 +468,30 @@ export const playlistsTypeDefs = /* GraphQL */ `
     creatorName: String!
     "Whether this is a system-generated recommendation playlist"
     isGeneratedRecommendation: Boolean!
+    "Grade spread of the playlist's climbs. Null when none of its climbs has a grade yet."
+    gradeSummary: PlaylistGradeSummary
+  }
+
+  """
+  The grade spread of a playlist's climbs. Every value is a difficulty id on the
+  playlist board's grade scale (the same ids SearchClimbs' minGrade/maxGrade take),
+  from ROUND(display_difficulty) at each climb's playlist angle. A climb saved
+  without an angle (synced circuits) is graded at its most-repeated angle.
+  Refreshed when climbs are added or removed, and daily for grade drift.
+  """
+  type PlaylistGradeSummary {
+    "Climbs that have a grade; the values below cover only these"
+    gradedClimbCount: Int!
+    "Easiest graded climb"
+    minDifficulty: Int!
+    "10th percentile: the low end of the band cards show and the grade filter checks"
+    p10Difficulty: Int!
+    "Median grade"
+    medianDifficulty: Int!
+    "90th percentile: the high end of the band cards show and the grade filter checks"
+    p90Difficulty: Int!
+    "Hardest graded climb"
+    maxDifficulty: Int!
   }
 
   """
@@ -346,6 +518,23 @@ export const playlistsTypeDefs = /* GraphQL */ `
     maxClimbs: Int
     "Filter by generated recommendation status"
     generatedRecommendation: Boolean
+    """
+    Only playlists whose grade band starts at or above this difficulty id: the
+    10th-percentile grade is >= minGrade, so one easy warm-up does not let a hard
+    list in. A playlist with no graded climb is left out whenever a grade bound is set.
+    """
+    minGrade: Int
+    """
+    Only playlists whose grade band ends at or below this difficulty id: the
+    90th-percentile grade is <= maxGrade, so one outlier V10 does not keep a V3
+    list out of a V3-V5 search.
+    """
+    maxGrade: Int
+    """
+    Only playlists by climbers the signed-in viewer follows. Resolved on the server
+    from the viewer's follows. Signed out, the result is empty.
+    """
+    followedOnly: Boolean
     "Sort by: 'recent' (default) or 'popular' (climbers who pinned or followed it, then size)"
     sortBy: String
     "Page number"
@@ -431,6 +620,9 @@ export const playlistsTypeDefs = /* GraphQL */ `
   """
   A computed playlist generated from a user's logbook or favourites, or a
   recommendation computed from the catalog for the user's board.
+  CREATED_CLIMBS is the owner's published work, including linked setter
+  accounts, and is private to that owner. It supports board geometry scoping
+  for playback but does not accept a sort/filter view.
 
   Logbook-derived:
   - FIVE_STARS: climbs the user has rated 5/5
@@ -450,6 +642,7 @@ export const playlistsTypeDefs = /* GraphQL */ `
     MOST_REPEATED
     PROJECTS
     LIKED_CLIMBS
+    CREATED_CLIMBS
     RECOMMENDED_CROWD_FAVORITES
     RECOMMENDED_HIDDEN_GEMS
     RECOMMENDED_AT_LEVEL
@@ -468,7 +661,7 @@ export const playlistsTypeDefs = /* GraphQL */ `
     userName: String!
     "Avatar URL of the user (or null)"
     userAvatar: String
-    "Total number of climbs in the playlist"
+    "Total number of climbs in the playlist. Under a view, read it from page 0: there it is the climbs the list shows with no view filter applied; a later page of a filtering view carries the filtered count."
     climbCount: Int!
   }
 
@@ -480,8 +673,10 @@ export const playlistsTypeDefs = /* GraphQL */ `
     meta: SmartPlaylistMeta!
     "Page of climbs with full data"
     climbs: [Climb!]!
-    "Total number of climbs (matches meta.climbCount)"
+    "Total number of climbs. Under a view, the climbs that match its filters."
     totalCount: Int!
+    "Climbs the playlist shows with no view filter applied. Set on page 0 of a view that carries a filter; null otherwise (a sort alone, and later pages)."
+    unfilteredCount: Int
     "Whether more pages are available"
     hasMore: Boolean!
   }
@@ -502,6 +697,28 @@ export const playlistsTypeDefs = /* GraphQL */ `
     sizeId: Int
     "Recommendation board-angle override"
     angle: Int
+    "Active board type, for the view's active-board filters. Needs activeAngle."
+    activeBoardName: String
+    "Active board's wall angle, for the view's active-board filters. Needs activeBoardName."
+    activeAngle: Int
+    "Active board layout, for the view's active-board filters. Needs activeBoardName."
+    activeLayoutId: Int
+    "Active board size, for the view's active-board filters. Needs activeBoardName."
+    activeSizeId: Int
+    "Active board's comma-separated set IDs, for the view's active-board filters. Needs activeBoardName."
+    activeSetIds: String
+    """
+    Sort and filters, on the logbook lists only (FIVE_STARS, MOST_REPEATED,
+    PROJECTS, LIKED_CLIMBS). The RECOMMENDED_* lists are already ranked for the
+    climber and reject a view with BAD_USER_INPUT. Omitted means the list's own
+    order with no filter. The position sort is the list's own order: latest
+    five-star climb first, most attempts first, or most recently liked first.
+    added is when the climb entered the list where the list records it (the like,
+    on LIKED_CLIMBS), and the list's own order elsewhere. Grades and stats read
+    the angle each row displays: activeAngle on activeBoardName's board type,
+    else the most-ascended angle (the lower angle on a tie).
+    """
+    view: PlaylistClimbViewInput
     "Page number"
     page: Int
     "Page size"

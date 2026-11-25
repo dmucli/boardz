@@ -1,0 +1,218 @@
+/**
+ * MEASUREMENT BUILDS ONLY. Injected by scripts/mobile-probe-kit/probe/apply_probes.py;
+ * the shipping app never imports this file. See docs/mobile/mobile-visible-performance.md.
+ *
+ * Events are buffered and written as JSON chunks to Documents/perf-probe/, which
+ * the host pulls after a run. A Release build drops console.log, so a file is
+ * the transport.
+ */
+import { Directory, File, Paths } from 'expo-file-system';
+import { runOnJS, type SharedValue } from 'react-native-reanimated';
+
+export const PERF_PROBE_ENABLED = process.env.EXPO_PUBLIC_PERF_PROBE === '1';
+type PerfProbeDetail = Record<string, string | number | boolean | null>;
+type PerfProbeEvent = PerfProbeDetail & { name: string; atMs: number; wallMs: number };
+let pendingEvents: PerfProbeEvent[] = [];
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+let chunkSequence = 0;
+let probeDirectory: Directory | null = null;
+let frameMonitorStarted = false;
+
+export function perfNow(): number {
+  return performance.now();
+}
+
+function applyColdRunRequest(): void {
+  try {
+    const coldMarker = new File(Paths.document, 'perf-probe-cold');
+    if (!coldMarker.exists) return;
+    coldMarker.delete();
+    const overlayCache = new Directory(Paths.cache, 'board-thumbnails');
+    if (overlayCache.exists) overlayCache.delete();
+  } catch {
+    // Best effort.
+  }
+}
+if (PERF_PROBE_ENABLED) applyColdRunRequest();
+
+function readQueueLimitRequest(): number {
+  try {
+    const marker = new File(Paths.document, 'perf-probe-queue-5');
+    if (!marker.exists) return 0;
+    marker.delete();
+    return 5;
+  } catch {
+    return 0;
+  }
+}
+/**
+ * Set for one launch by the `perf-probe-queue-5` marker: the saved queue comes
+ * back cut down to this many climbs, ending at the current one, and that
+ * launch saves to a key of its own, so the real queue is there again on the
+ * next launch. 0 on every other launch.
+ */
+export const PERF_PROBE_QUEUE_LIMIT = PERF_PROBE_ENABLED ? readQueueLimitRequest() : 0;
+
+function ensureProbeDirectory(): Directory {
+  if (probeDirectory) return probeDirectory;
+  const directory = new Directory(Paths.document, 'perf-probe');
+  if (directory.exists) directory.delete();
+  directory.create({ intermediates: true });
+  probeDirectory = directory;
+  return directory;
+}
+
+function flushPendingEvents(): void {
+  flushTimer = null;
+  if (pendingEvents.length === 0) return;
+  const events = pendingEvents;
+  pendingEvents = [];
+  try {
+    const chunk = new File(ensureProbeDirectory(), `chunk-${String(chunkSequence).padStart(5, '0')}.json`);
+    chunkSequence += 1;
+    chunk.create({ overwrite: true });
+    chunk.write(JSON.stringify(events));
+  } catch {
+    // A lost chunk shows up as a gap.
+  }
+}
+
+function recordEvent(name: string, detail?: PerfProbeDetail): void {
+  pendingEvents.push({ ...detail, name, atMs: Math.round(performance.now() * 10) / 10, wallMs: Date.now() });
+  // Throttled, not debounced: a busy session never goes 1.2s without an event.
+  if (flushTimer === null) flushTimer = setTimeout(flushPendingEvents, 1500);
+}
+
+function startJsFrameMonitor(): void {
+  if (frameMonitorStarted) return;
+  frameMonitorStarted = true;
+  let previousFrameMs = performance.now();
+  const onFrame = () => {
+    const frameMs = performance.now();
+    const gapMs = frameMs - previousFrameMs;
+    previousFrameMs = frameMs;
+    if (gapMs >= 34) recordEvent('js-frame-gap', { gapMs: Math.round(gapMs) });
+    requestAnimationFrame(onFrame);
+  };
+  requestAnimationFrame(onFrame);
+}
+
+export function perfProbe(name: string, detail?: PerfProbeDetail): void {
+  if (!PERF_PROBE_ENABLED) return;
+  startJsFrameMonitor();
+  recordEvent(name, detail);
+}
+
+/** A short stable id for a frames string, so events about one climb can be matched without logging its holds. */
+export function perfProbeId(text: string | null | undefined): string {
+  if (!text) return '';
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+// --- The UI thread -----------------------------------------------------------
+//
+// A gesture and its release animation run on the UI thread, where the stall
+// monitor above sees nothing. Two tools for worklets:
+//
+//   perfProbeUi(name)            an instant, stamped with the UI thread's clock
+//                                (`uiWallMs`). `wallMs` on the same event is when
+//                                the JS thread got round to recording it.
+//   perfProbeUiFramesStart(...)  samples one shared value at every UI-thread
+//                                frame callback until it has rested at 0, and
+//                                writes the intervals between callbacks. An
+//                                interval of two frame durations is a frame the
+//                                UI thread did not get to run.
+//
+// `uiFrame` on an instant is how many frames the running sampler had recorded,
+// which places the instant in the sampled series. -1 when no sampler is running.
+
+type UiFrameSession = {
+  label: string;
+  startedWallMs: number;
+  lastTimestamp: number;
+  quietFrames: number;
+  intervals: number[];
+  values: number[];
+};
+type UiProbeGlobal = { __perfProbeFrames?: UiFrameSession | null };
+
+/** Frames the sampled value has to rest at 0 before the sampler stops: 0.2 s at 120 Hz, so the frames after a settle are in the series. */
+const UI_FRAMES_QUIET = 24;
+/** A sampler that never comes to rest stops here: 6 s at 120 Hz. */
+const UI_FRAMES_MAX = 720;
+
+function recordFromUi(name: string, detail: PerfProbeDetail): void {
+  perfProbe(name, detail);
+}
+
+export function perfProbeUi(name: string, detail?: PerfProbeDetail): void {
+  'worklet';
+  if (!PERF_PROBE_ENABLED) return;
+  const session = (globalThis as unknown as UiProbeGlobal).__perfProbeFrames;
+  runOnJS(recordFromUi)(name, { ...detail, uiWallMs: Date.now(), uiFrame: session ? session.values.length : -1 });
+}
+
+function flushUiFrames(session: UiFrameSession, reason: string): void {
+  'worklet';
+  runOnJS(recordFromUi)('ui-frames', {
+    label: session.label,
+    reason,
+    startedWallMs: session.startedWallMs,
+    frames: session.values.length,
+    intervals: session.intervals.join(','),
+    values: session.values.join(','),
+  });
+}
+
+/**
+ * Start sampling `tracked` at every UI-thread frame. A no-op while a sampler is
+ * already running, so a second gesture inside the first one's tail lands in the
+ * same series. `busy` keeps the sampler going while the value sits at 0 for a
+ * reason (a fling that has not been handed back yet).
+ */
+export function perfProbeUiFramesStart(label: string, tracked: SharedValue<number>, busy?: SharedValue<boolean>): void {
+  'worklet';
+  if (!PERF_PROBE_ENABLED) return;
+  const uiGlobal = globalThis as unknown as UiProbeGlobal;
+  if (uiGlobal.__perfProbeFrames) return;
+  const session: UiFrameSession = {
+    label,
+    startedWallMs: Date.now(),
+    lastTimestamp: -1,
+    quietFrames: 0,
+    intervals: [],
+    values: [],
+  };
+  uiGlobal.__perfProbeFrames = session;
+  const onFrame = (timestamp: number) => {
+    if (uiGlobal.__perfProbeFrames !== session) return;
+    if (session.lastTimestamp >= 0) session.intervals.push(Math.round((timestamp - session.lastTimestamp) * 10) / 10);
+    session.lastTimestamp = timestamp;
+    const value = tracked.value;
+    session.values.push(Math.round(value));
+    session.quietFrames = value === 0 && !(busy && busy.value) ? session.quietFrames + 1 : 0;
+    if (session.quietFrames >= UI_FRAMES_QUIET || session.values.length >= UI_FRAMES_MAX) {
+      uiGlobal.__perfProbeFrames = null;
+      flushUiFrames(session, session.quietFrames >= UI_FRAMES_QUIET ? 'rest' : 'cap');
+      return;
+    }
+    requestAnimationFrame(onFrame);
+  };
+  requestAnimationFrame(onFrame);
+}
+
+/** Stop the running sampler now and write what it has: for an animation that ends somewhere other than 0. */
+export function perfProbeUiFramesStop(reason: string): void {
+  'worklet';
+  if (!PERF_PROBE_ENABLED) return;
+  const uiGlobal = globalThis as unknown as UiProbeGlobal;
+  const session = uiGlobal.__perfProbeFrames;
+  if (!session) return;
+  uiGlobal.__perfProbeFrames = null;
+  flushUiFrames(session, reason);
+}

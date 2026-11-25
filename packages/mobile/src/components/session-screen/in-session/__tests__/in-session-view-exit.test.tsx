@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
-import { act, fireEvent, render, waitFor } from '@testing-library/react';
+vi.mock('../../../climb-actions/ClimbActionsPressable', () => import('../../../../../test/climb-menu-stub'));
+import { act, render, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -23,7 +24,18 @@ const sheet = vi.hoisted(() => ({
   onConfirm: null as (() => void) | null,
   onLeave: null as (() => void) | null,
 }));
-const chrome = vi.hoisted(() => ({ exitVariant: null as string | null }));
+const chrome = vi.hoisted(() => ({
+  exitVariant: null as string | null,
+  title: null as string | null,
+  onEditTitle: null as (() => void) | null,
+  native: false,
+  inBodyLargeTitle: false,
+  titleSheetVisible: false,
+  contentInsetAdjustmentBehavior: undefined as string | undefined,
+}));
+// The list-play hook has its own suite; here a tap only has to reach it.
+vi.mock('../../../../lib/playlists/use-tick-list-activation', () => ({ useTickListActivation: () => vi.fn() }));
+vi.mock('../../../../hooks/use-native-root-header', () => ({ useNativeRootHeader: () => chrome.native }));
 const router = vi.hoisted(() => ({ push: vi.fn(), navigate: vi.fn() }));
 const toast = vi.hoisted(() => ({ showToast: vi.fn() }));
 const analytics = vi.hoisted(() => ({ track: vi.fn() }));
@@ -37,11 +49,17 @@ const session = vi.hoisted(() => ({
   users: [{ id: 'participant-1', username: 'Marco', isLeader: true, userId: 'user-me', connectionState: 'CONNECTED' }],
   ownerUserId: 'user-me' as string | null,
   createdSessionId: 'session-1' as string | null,
+  name: null as string | null,
+  detailOwnerUserId: null as string | null,
 }));
 
 vi.mock('../../RestTimerArmRow', () => ({ RestTimerArmRow: () => null }));
+vi.mock('../WorkoutRunCard', () => ({ WorkoutRunCard: () => null }));
+vi.mock('../AddWorkoutBlockSheet', () => ({ AddWorkoutBlockSheet: () => null }));
 vi.mock('../SessionVisibilityControl', () => ({ SessionVisibilityControl: () => null }));
 vi.mock('react-native', () => ({
+  // This suite exercises the JS chrome fallback; native headers have their own navigation tests.
+  Platform: { OS: 'android' },
   Pressable: ({ children }: { children?: ReactNode }) => createElement('button', null, children),
   StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
@@ -66,10 +84,15 @@ vi.mock('@shopify/flash-list', () => ({
   FlashList: ({
     ListHeaderComponent,
     ListFooterComponent,
+    contentInsetAdjustmentBehavior,
   }: {
     ListHeaderComponent?: ReactNode;
     ListFooterComponent?: ReactNode;
-  }) => createElement('div', null, ListHeaderComponent, ListFooterComponent),
+    contentInsetAdjustmentBehavior?: string;
+  }) => {
+    chrome.contentInsetAdjustmentBehavior = contentInsetAdjustmentBehavior;
+    return createElement('div', null, ListHeaderComponent, ListFooterComponent);
+  },
 }));
 vi.mock('expo-crypto', () => ({ randomUUID: () => 'test-uuid' }));
 vi.mock('expo-router', () => ({ useRouter: () => router }));
@@ -114,19 +137,33 @@ vi.mock('../../../PressableSurface', () => ({
     ),
 }));
 vi.mock('../../../SectionHeader', () => ({ SectionHeader: () => null }));
-vi.mock('../../../ScreenTitle', () => ({ ScreenTitle: () => null }));
 vi.mock('../../../ClimbListItemContent', () => ({ ClimbListItemContent: () => null }));
 vi.mock('../../../Icon', () => ({ Icon: () => null }));
 vi.mock('../../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
-vi.mock('../../SessionTitleSheet', () => ({ SessionTitleSheet: () => null }));
+vi.mock('../../SessionTitleSheet', () => ({
+  SessionTitleSheet: ({ visible }: { visible: boolean }) => {
+    chrome.titleSheetVisible = visible;
+    return null;
+  },
+}));
 
 // Capture what the chrome is told the exit does — a red Stop that only leaves
 // is the lie this issue is partly about.
 vi.mock('../../RecordTopChrome', () => ({
-  RecordTopChrome: ({ exitVariant }: { exitVariant?: string }) => {
+  RecordTopChrome: ({
+    exitVariant,
+    title,
+    onEditTitle,
+  }: {
+    exitVariant?: string;
+    title: string;
+    onEditTitle?: () => void;
+  }) => {
     chrome.exitVariant = exitVariant ?? null;
+    chrome.title = title;
+    chrome.onEditTitle = onEditTitle ?? null;
     return null;
   },
 }));
@@ -159,7 +196,7 @@ vi.mock('../../../../providers/theme-provider', () => ({
     variant: 'liquidGlass',
     systemColors: { background: '#000', secondaryBackground: '#111', secondaryLabel: '#999', separator: '#222' },
     brandColors: { success: '#0f0', warning: '#ff0', primary: '#00f', error: '#f00' },
-    features: { inBodyLargeTitle: false },
+    features: { inBodyLargeTitle: chrome.inBodyLargeTitle },
   }),
 }));
 vi.mock('../../../../providers/queue-provider', () => ({
@@ -167,17 +204,31 @@ vi.mock('../../../../providers/queue-provider', () => ({
     endSession: queue.endSession,
     clearSession: queue.clearSession,
     setCurrentClimb: vi.fn(),
+    getQueueSnapshot: () => ({ queue: outbox.queue, currentClimbQueueItem: null }),
   }),
   useQueueLiveStats: () => ({ liveStats: null, sessionUsers: session.users }),
   useQueueSessionControls: () => ({ participantId: 'participant-1', sessionId: 'session-1' }),
 }));
-vi.mock('../../../../providers/drawer-host-provider', () => ({ useDrawerHost: () => ({ openPlayDrawer: vi.fn() }) }));
+vi.mock('../../../../providers/drawer-host-provider', () => ({
+  useDrawerHost: () => ({
+    openPlayDrawer: vi.fn(),
+    getClimbActions: (climb: unknown, boardConfig: unknown) => ({ climb, boardConfig }),
+  }),
+}));
 vi.mock('../../../../lib/graphql/hooks', () => ({
   useSessionDetail: () => ({
-    data: { totalSends: 0, totalFlashes: 0, gradeDistribution: [], participants: [], hardestGrade: null, ticks: [] },
+    data: {
+      totalSends: 0,
+      totalFlashes: 0,
+      gradeDistribution: [],
+      participants: [],
+      hardestGrade: null,
+      ticks: [],
+      ownerUserId: session.detailOwnerUserId,
+    },
   }),
   useSessionSummary: () => ({ data: { startedAt: '2026-01-01T00:00:00.000Z' } }),
-  useSessionPreview: () => ({ data: null }),
+  useSessionPreview: () => ({ data: session.name ? { name: session.name } : null }),
   useSessionOwnerUserId: () => ({ data: session.ownerUserId }),
 }));
 vi.mock('../../../../lib/session-store', () => ({
@@ -188,13 +239,28 @@ vi.mock('../../../../lib/store-review', () => ({
   isSessionStoreReviewEligible: () => false,
 }));
 vi.mock('../../../../lib/integrations', () => ({ runSessionEndExports: integrations.runSessionEndExports }));
+// #6903: the queued-tick wait (handed to endSession as `beforeEnd`) and the
+// late-tick summary refresh.
+const outbox = vi.hoisted(() => ({
+  calls: [] as string[],
+  waitForSessionTicksToSync: vi.fn(),
+  refreshSessionWhenQueuedTicksLand: vi.fn(),
+  enqueueSessionWorkoutWrite: vi.fn(),
+  queue: [{ uuid: 'item-1', climb: { uuid: 'climb-1', angle: 40 } }],
+}));
+vi.mock('../../../../offline/session-tick-drain', () => ({
+  waitForSessionTicksToSync: outbox.waitForSessionTicksToSync,
+  refreshSessionWhenQueuedTicksLand: outbox.refreshSessionWhenQueuedTicksLand,
+}));
+vi.mock('../../../../offline/session-workout-outbox', () => ({
+  enqueueSessionWorkoutWrite: outbox.enqueueSessionWorkoutWrite,
+}));
 vi.mock('../../../../lib/session-comment-draft-store', () => ({
   setDraftComment: vi.fn(),
   clearDraftComment: vi.fn(),
 }));
 vi.mock('../../../../lib/climb-to-queue-item', () => ({ climbToQueueItem: vi.fn() }));
 vi.mock('../../../../lib/playlists/board-details-for-playlist', () => ({ getBoardConfigForPlaylist: () => null }));
-vi.mock('../../../../lib/open-climb-in-play-drawer', () => ({ openClimbInPlayDrawer: vi.fn() }));
 vi.mock('../../../../lib/tick-to-climb', () => ({ tickToClimb: () => null }));
 vi.mock('../../../../hooks/use-grade-format', () => ({
   useGradeFormat: () => ({ formatGrade: (grade: string | null) => grade, formatGradeByDifficultyId: () => null }),
@@ -232,6 +298,18 @@ describe('InSessionView session exit (#3502)', () => {
   beforeEach(() => {
     queue.endSession.mockReset();
     queue.endSession.mockResolvedValue(null);
+    outbox.calls = [];
+    outbox.waitForSessionTicksToSync.mockReset();
+    outbox.waitForSessionTicksToSync.mockImplementation(async () => {
+      outbox.calls.push('wait');
+      return 'none';
+    });
+    outbox.refreshSessionWhenQueuedTicksLand.mockReset();
+    outbox.enqueueSessionWorkoutWrite.mockReset();
+    outbox.enqueueSessionWorkoutWrite.mockImplementation(async () => {
+      outbox.calls.push('workout');
+      return 'queued';
+    });
     queue.clearSession.mockReset();
     queue.clearSession.mockResolvedValue(undefined);
     router.push.mockClear();
@@ -244,11 +322,63 @@ describe('InSessionView session exit (#3502)', () => {
     sheet.onConfirm = null;
     sheet.onLeave = null;
     chrome.exitVariant = null;
+    chrome.title = null;
+    chrome.onEditTitle = null;
+    chrome.native = false;
+    chrome.inBodyLargeTitle = false;
+    chrome.titleSheetVisible = false;
+    chrome.contentInsetAdjustmentBehavior = undefined;
+    session.name = null;
+    session.detailOwnerUserId = null;
     session.users = [
       { id: 'participant-1', username: 'Marco', isLeader: true, userId: 'user-me', connectionState: 'CONNECTED' },
     ];
     session.ownerUserId = 'user-me';
     session.createdSessionId = 'session-1';
+  });
+
+  it.each([
+    [true, true, true, false],
+    [true, false, true, true],
+    [true, false, false, false],
+    [false, false, true, false],
+  ] as const)(
+    'suppresses the duplicate body title for native, Material and overlay headers (%s, %s, %s)',
+    async (showChrome, native, inBodyLargeTitle, hasBodyTitle) => {
+      chrome.native = native;
+      chrome.inBodyLargeTitle = inBodyLargeTitle;
+      const { queryAllByText } = render(createElement(InSessionView, { showChrome }));
+      await waitFor(() => expect(sheet.defaultMode).not.toBeNull());
+      expect(queryAllByText('mobile.session.headerActive')).toHaveLength(hasBodyTitle ? 1 : 0);
+      expect(chrome.contentInsetAdjustmentBehavior).toBe(showChrome && native ? 'automatic' : 'never');
+      if (showChrome) {
+        expect(chrome.title).toBe('mobile.session.headerActive');
+        expect(chrome.onEditTitle).toEqual(expect.any(Function));
+      }
+    },
+  );
+
+  it('updates the native session name and opens rename without a second title', async () => {
+    chrome.native = true;
+    chrome.inBodyLargeTitle = true;
+    session.name = 'Friday crew';
+    const { rerender, queryByText } = await renderInSession();
+    expect(chrome.title).toBe('Friday crew');
+    expect(queryByText('Friday crew')).toBeNull();
+    act(() => chrome.onEditTitle?.());
+    expect(chrome.titleSheetVisible).toBe(true);
+
+    session.name = 'Saturday crew';
+    rerender(createElement(InSessionView, { showChrome: true }));
+    expect(chrome.title).toBe('Saturday crew');
+    expect(queryByText('Saturday crew')).toBeNull();
+  });
+
+  it('keeps rename out of the native header for another climber’s session', async () => {
+    chrome.native = true;
+    session.detailOwnerUserId = 'user-someone-else';
+    await renderInSession();
+    expect(chrome.onEditTitle).toBeNull();
   });
 
   it('leads with End on the device that started the session', async () => {
@@ -391,9 +521,26 @@ describe('InSessionView session exit (#3502)', () => {
     await act(async () => {
       sheet.onConfirm?.();
     });
+    await waitFor(() => expect(integrations.runSessionEndExports).toHaveBeenCalledTimes(1));
     expect(queue.endSession).toHaveBeenCalledTimes(1);
     expect(queue.clearSession).not.toHaveBeenCalled();
-    expect(integrations.runSessionEndExports).toHaveBeenCalledTimes(1);
     expect(router.push).toHaveBeenCalledWith(expect.objectContaining({ pathname: '/(tabs)/record/summary' }));
+  });
+
+  it('queues the workout after the tick wait and before END_SESSION, with the live queue (#6903)', async () => {
+    queue.endSession.mockImplementation(async (options?: { beforeEnd?: (id: string) => Promise<void> }) => {
+      await options?.beforeEnd?.('session-1');
+      outbox.calls.push('end');
+      return null;
+    });
+    await renderInSession();
+    await act(async () => {
+      sheet.onConfirm?.();
+    });
+    await waitFor(() => expect(outbox.calls).toEqual(['wait', 'workout', 'end']));
+    expect(outbox.enqueueSessionWorkoutWrite).toHaveBeenCalledWith(
+      'session-1',
+      expect.objectContaining({ queueItems: outbox.queue }),
+    );
   });
 });

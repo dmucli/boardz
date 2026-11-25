@@ -7,8 +7,12 @@ import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/h
 import { GroupedNotificationsInputSchema, NotificationActorsInputSchema } from '../../../validation/schemas';
 import { batchEnrichUserProfiles } from './helpers';
 import { pubsub } from '../../../pubsub/index';
-import { createAsyncIterator } from '../shared/async-iterators';
+import { createEagerAsyncIterator } from '../shared/async-iterators';
+import { enrichSprayNotificationTargets } from './spray-notification-targets';
+import { enrichDirectoryNotices } from './directory-reports/notices';
 import { withSubscriptionCleanup } from '../shared/managed-subscription';
+import { alias } from 'drizzle-orm/pg-core';
+import { notificationPrivacyCondition } from '../shared/activity-privacy';
 
 type NotificationRow = {
   uuid: string;
@@ -44,6 +48,7 @@ const NOTIFICATION_CLIMB_COLUMNS = {
   angle: dbSchema.boardClimbs.angle,
   frames: dbSchema.boardClimbs.frames,
   compatibleSizeIds: dbSchema.boardClimbs.compatibleSizeIds,
+  characteristics: dbSchema.boardClimbs.characteristics,
 } as const;
 
 type NotificationClimb = {
@@ -55,6 +60,7 @@ type NotificationClimb = {
   angle: number | null;
   frames: string | null;
   compatibleSizeIds: number[] | null;
+  characteristics: string[] | null;
 };
 
 type ClimbBoardFields = {
@@ -62,6 +68,7 @@ type ClimbBoardFields = {
   climbAngle?: number;
   climbFrames?: string;
   climbCompatibleSizeIds?: number[];
+  climbCharacteristics?: string[];
 };
 
 /**
@@ -73,14 +80,25 @@ type ClimbBoardFields = {
  * `frames` + `compatibleSizeIds` ride along so a row can draw the board art
  * without a follow-up climb query per row. The size list is not decoration:
  * boards that number holds independently per size (Woods) render a completely
- * different climb on the layout's default size — see docs/board-art-geometry.md.
+ * different climb on the layout's default size — see docs/rendering/board-art-geometry.md.
  */
 function applyClimbBoardFields(group: ClimbBoardFields, climb: NotificationClimb): void {
   group.climbLayoutId = climb.layoutId;
   group.climbAngle = climb.angle ?? undefined;
   group.climbFrames = climb.frames ?? undefined;
   group.climbCompatibleSizeIds = climb.compatibleSizeIds ?? undefined;
+  group.climbCharacteristics = climb.characteristics ?? undefined;
 }
+
+/**
+ * Types whose entity is a gym uuid and whose row names the gym. The directory
+ * report types name theirs through `directoryNotice` (enrichDirectoryNotices).
+ */
+const GYM_NAMED_TYPES: ReadonlySet<string> = new Set([
+  'gym_claim_approved',
+  'gym_claim_denied',
+  'gym_claimed_with_your_board',
+]);
 
 function truncateCommentBody(commentBody: string | null): string | undefined {
   if (!commentBody) return undefined;
@@ -118,6 +136,7 @@ export const socialNotificationQueries = {
 
     // Build where clause
     const unreadFilter = unreadOnly ? sql`AND n."read_at" IS NULL` : sql``;
+    const privacyFilter = notificationPrivacyCondition(userId, alias(dbSchema.notifications, 'n'));
 
     // Single query with scalar subqueries for totalCount and unreadCount.
     // These must be computed over ALL user notifications (not filtered by unreadOnly),
@@ -145,13 +164,14 @@ export const socialNotificationQueries = {
         u."name" as "actorName",
         u."image" as "actorImage",
         c."body" as "commentBody",
-        (SELECT COUNT(*) FROM "notifications" WHERE "recipient_id" = ${userId}) as "totalCount",
-        (SELECT COUNT(*) FROM "notifications" WHERE "recipient_id" = ${userId} AND "read_at" IS NULL) as "unreadCount"
+        (SELECT COUNT(*) FROM "notifications" n WHERE "recipient_id" = ${userId} AND ${privacyFilter}) as "totalCount",
+        (SELECT COUNT(*) FROM "notifications" n WHERE "recipient_id" = ${userId} AND "read_at" IS NULL AND ${privacyFilter}) as "unreadCount"
       FROM "notifications" n
       LEFT JOIN "users" u ON n."actor_id" = u."id"
       LEFT JOIN "user_profiles" up ON n."actor_id" = up."user_id"
       LEFT JOIN "comments" c ON n."comment_id" = c."id"
       WHERE n."recipient_id" = ${userId}
+        AND ${privacyFilter}
         ${unreadFilter}
       ORDER BY n."created_at" DESC
       LIMIT ${limit}
@@ -160,6 +180,8 @@ export const socialNotificationQueries = {
     );
 
     const notifications = rows.map(mapNotificationRow);
+    await enrichSprayNotificationTargets(notifications, userId);
+    await enrichDirectoryNotices(notifications, userId);
     const totalCount = rows.length > 0 ? Number(rows[0].totalCount) : 0;
     const unreadCount = rows.length > 0 ? Number(rows[0].unreadCount) : 0;
 
@@ -216,10 +238,11 @@ export const socialNotificationQueries = {
           MAX(n."created_at") as "latestCreatedAt",
           BOOL_AND(n."read_at" IS NOT NULL) as "allRead",
           (array_agg(c."body" ORDER BY n."created_at" DESC))[1] as "commentBody",
-          (array_agg(DISTINCT n."actor_id"))[1:3] as "actorIds"
+          (array_agg(DISTINCT n."actor_id") FILTER (WHERE n."actor_id" IS NOT NULL))[1:3] as "actorIds"
         FROM "notifications" n
         LEFT JOIN "comments" c ON n."comment_id" = c."id"
         WHERE n."recipient_id" = ${userId}
+          AND ${notificationPrivacyCondition(userId, alias(dbSchema.notifications, 'n'))}
         GROUP BY n."type", n."entity_type", n."entity_id"
       ),
       paged AS (
@@ -280,6 +303,7 @@ export const socialNotificationQueries = {
         climbAngle: undefined as number | undefined,
         climbFrames: undefined as string | undefined,
         climbCompatibleSizeIds: undefined as number[] | undefined,
+        climbCharacteristics: undefined as string[] | undefined,
         threadEntityType: undefined as string | undefined,
         threadEntityId: undefined as string | undefined,
         proposalUuid: undefined as string | undefined,
@@ -304,7 +328,17 @@ export const socialNotificationQueries = {
     const climbTypes = ['new_climb', 'new_climb_global'];
     // The types that hang off a comment thread. Clients open the thread for
     // these rather than a climb, so they need `threadEntityType`/`threadEntityId`.
-    const threadTypes = ['comment_reply', 'comment_on_tick', 'comment_on_climb', 'vote_on_tick', 'vote_on_comment'];
+    const threadTypes = [
+      'comment_reply',
+      'comment_on_tick',
+      'comment_on_climb',
+      'comment_on_session',
+      'comment_on_playlist',
+      'comment_on_board',
+      'comment_on_gym',
+      'vote_on_tick',
+      'vote_on_comment',
+    ];
 
     // Collect entity IDs by type
     const climbEntityIds: string[] = [];
@@ -312,13 +346,14 @@ export const socialNotificationQueries = {
     const gymEntityIds: string[] = [];
     const commentEntityIds: string[] = [];
     const tickEntityIds: string[] = [];
+    const boardEntityIds: string[] = [];
     for (const group of groups) {
       if (!group.entityId) continue;
       if (group.type === 'new_climbs_synced' || climbTypes.includes(group.type)) {
         climbEntityIds.push(group.entityId);
       } else if (proposalTypes.includes(group.type)) {
         proposalEntityIds.push(group.entityId);
-      } else if (group.type === 'gym_claim_approved') {
+      } else if (GYM_NAMED_TYPES.has(group.type)) {
         gymEntityIds.push(group.entityId);
       } else if (threadTypes.includes(group.type)) {
         // A vote on a comment names the COMMENT; the thread it lives in is the
@@ -326,6 +361,11 @@ export const socialNotificationQueries = {
         // names the commented-on entity.
         if (group.entityType === 'comment') commentEntityIds.push(group.entityId);
         else if (group.entityType === 'tick') tickEntityIds.push(group.entityId);
+        // The owner rows name the item, so the client can word them ("on your
+        // climb {{climb}}", "on your gym {{gym}}") and draw the climb.
+        else if (group.type === 'comment_on_climb') climbEntityIds.push(group.entityId);
+        else if (group.type === 'comment_on_gym') gymEntityIds.push(group.entityId);
+        else if (group.type === 'comment_on_board') boardEntityIds.push(group.entityId);
       }
     }
 
@@ -423,6 +463,20 @@ export const socialNotificationQueries = {
       }
     }
 
+    // Batch-fetch the board type behind a comment_on_board row: a spray wall is
+    // a Spraywall in every locale, never a bare "board", so the client words it
+    // apart. The type is not the board's identity (name, place), which stays out.
+    const boardTypeMap = new Map<string, string>();
+    if (boardEntityIds.length > 0) {
+      const boardRows = await db
+        .select({ uuid: dbSchema.userBoards.uuid, boardType: dbSchema.userBoards.boardType })
+        .from(dbSchema.userBoards)
+        .where(inArray(dbSchema.userBoards.uuid, boardEntityIds));
+      for (const row of boardRows) {
+        boardTypeMap.set(row.uuid, row.boardType);
+      }
+    }
+
     // Batch-fetch gym names (entityId is the gym UUID for gym_claim_approved)
     const gymNameMap = new Map<string, string>();
     if (gymEntityIds.length > 0) {
@@ -439,7 +493,7 @@ export const socialNotificationQueries = {
     for (const group of groups) {
       if (!group.entityId) continue;
 
-      if (group.type === 'gym_claim_approved') {
+      if (GYM_NAMED_TYPES.has(group.type)) {
         group.gymName = gymNameMap.get(group.entityId) ?? undefined;
       } else if (group.type === 'new_climbs_synced') {
         const climb = climbMap.get(group.entityId);
@@ -456,6 +510,10 @@ export const socialNotificationQueries = {
           group.climbUuid = group.entityId;
           group.climbName = climb.name ?? undefined;
           group.boardType = climb.boardType;
+          // A published climb's setter name is public. A new-climb row whose
+          // setter's account the viewer may not see carries no actor, and the
+          // client names the setter by this instead.
+          group.setterUsername = climb.setterUsername ?? undefined;
           applyClimbBoardFields(group, climb);
         }
       } else if (proposalTypes.includes(group.type)) {
@@ -487,6 +545,24 @@ export const socialNotificationQueries = {
         group.threadEntityType = thread.entityType;
         group.threadEntityId = thread.entityId;
 
+        if (group.type === 'comment_on_gym') {
+          group.gymName = gymNameMap.get(group.entityId) ?? undefined;
+          continue;
+        }
+        if (group.type === 'comment_on_board') {
+          group.boardType = boardTypeMap.get(group.entityId) ?? undefined;
+          continue;
+        }
+        if (group.type === 'comment_on_climb') {
+          const climb = climbMap.get(group.entityId);
+          if (!climb) continue;
+          group.climbUuid = group.entityId;
+          group.climbName = climb.name ?? undefined;
+          group.boardType = climb.boardType;
+          applyClimbBoardFields(group, climb);
+          continue;
+        }
+
         // An ascent's thread carries the climb it was logged on, which is what
         // lets these rows draw board art like a climb row does.
         if (thread.entityType !== 'tick') continue;
@@ -500,11 +576,20 @@ export const socialNotificationQueries = {
       }
     }
 
+    await enrichSprayNotificationTargets(groups, userId);
+    await enrichDirectoryNotices(groups, userId);
+
     // Unread count (individual notifications, not groups)
     const unreadCountResult = await db
       .select({ count: count() })
       .from(dbSchema.notifications)
-      .where(and(eq(dbSchema.notifications.recipientId, userId), isNull(dbSchema.notifications.readAt)));
+      .where(
+        and(
+          eq(dbSchema.notifications.recipientId, userId),
+          isNull(dbSchema.notifications.readAt),
+          notificationPrivacyCondition(userId),
+        ),
+      );
     const unreadCount = Number(unreadCountResult[0]?.count || 0);
 
     return {
@@ -522,7 +607,13 @@ export const socialNotificationQueries = {
     const result = await db
       .select({ count: count() })
       .from(dbSchema.notifications)
-      .where(and(eq(dbSchema.notifications.recipientId, userId), isNull(dbSchema.notifications.readAt)));
+      .where(
+        and(
+          eq(dbSchema.notifications.recipientId, userId),
+          isNull(dbSchema.notifications.readAt),
+          notificationPrivacyCondition(userId),
+        ),
+      );
 
     return Number(result[0]?.count || 0);
   },
@@ -548,6 +639,7 @@ export const socialNotificationQueries = {
     // `IS NOT DISTINCT FROM` rather than `=`: `new_follower` carries a null
     // entity_type, and `= NULL` matches nothing.
     const groupPredicate = and(
+      notificationPrivacyCondition(userId),
       eq(dbSchema.notifications.recipientId, userId),
       sql`${dbSchema.notifications.type} = ${type}`,
       sql`${dbSchema.notifications.entityType} IS NOT DISTINCT FROM ${entityType ?? null}`,
@@ -571,7 +663,7 @@ export const socialNotificationQueries = {
       .from(dbSchema.notifications)
       .where(groupPredicate)
       .groupBy(dbSchema.notifications.actorId)
-      .orderBy(sql`max(${dbSchema.notifications.createdAt}) DESC`)
+      .orderBy(sql`max(${dbSchema.notifications.createdAt}) DESC`, dbSchema.notifications.actorId)
       .limit(limit)
       .offset(offset);
 
@@ -679,7 +771,13 @@ export const socialNotificationMutations = {
     await db
       .update(dbSchema.notifications)
       .set({ readAt: new Date() })
-      .where(and(eq(dbSchema.notifications.recipientId, userId), isNull(dbSchema.notifications.readAt)));
+      .where(
+        and(
+          eq(dbSchema.notifications.recipientId, userId),
+          isNull(dbSchema.notifications.readAt),
+          notificationPrivacyCondition(userId),
+        ),
+      );
 
     return true;
   },
@@ -692,12 +790,24 @@ export const socialNotificationSubscriptions = {
       const userId = ctx.userId!;
 
       const asyncIterator = await lifetime.own(
-        createAsyncIterator<NotificationEvent>((push) => {
+        createEagerAsyncIterator<NotificationEvent>((push) => {
           return pubsub.subscribeNotifications(userId, push);
         }, `notificationReceived:${userId}`),
       );
 
       for await (const event of asyncIterator) {
+        const [visible] = await db
+          .select({ id: dbSchema.notifications.id })
+          .from(dbSchema.notifications)
+          .where(
+            and(
+              eq(dbSchema.notifications.uuid, event.notification.uuid),
+              eq(dbSchema.notifications.recipientId, userId),
+              notificationPrivacyCondition(userId),
+            ),
+          )
+          .limit(1);
+        if (!visible) continue;
         yield { notificationReceived: event };
       }
     }),

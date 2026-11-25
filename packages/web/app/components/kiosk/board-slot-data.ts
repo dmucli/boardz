@@ -5,13 +5,16 @@
 // Shared by the kiosk page renderer and the /embed/board/[board_uuid] widget.
 
 import 'server-only';
+import { boardFieldColorForScheme } from '@boardsesh/board-look';
+import { KIOSK_DEFAULT_THEME, type KioskTheme } from '@boardsesh/kiosk';
 import { BOARD_RECENT_CLIMBS } from '@boardsesh/graphql/operations';
 import type { BoardPresenceClimb } from '@boardsesh/shared-schema';
 import { getGraphQLHttpUrl } from '@/app/lib/graphql/client';
 import { SSR_BACKEND_FETCH_TIMEOUT_MS } from '@/app/lib/ssr-fetch-deadline';
-import { getBoardDetailsForBoard } from '@/app/lib/board-utils';
-import type { BoardDetails } from '@/app/lib/types';
+import { getBoardImageDetailsForBoard } from '@/app/lib/board-image-details';
+import type { BoardImageDetails } from '@/app/lib/types';
 import { buildBoardRenderUrl, toFlatFrames } from '../board-renderer/util';
+import { webClientIdentityHeaders } from '@/app/lib/client-identity';
 
 /** The board-config subset a slot needs; satisfied by both `GymKioskBoard` and `UserBoard`. */
 export type BoardSlotSource = {
@@ -26,7 +29,7 @@ export type BoardSlotSource = {
 };
 
 export type BoardSlotData = {
-  boardDetails: BoardDetails;
+  boardDetails: BoardImageDetails;
   /** Latest climb seen on the wall (boardRecentClimbs[0]) or null. */
   initialClimb: BoardPresenceClimb | null;
   /** Raster URL for the initial climb's frames (null when no initial climb). */
@@ -35,9 +38,9 @@ export type BoardSlotData = {
   bareBoardImageUrl: string;
 };
 
-function resolveBoardDetails(board: BoardSlotSource): BoardDetails | null {
+function resolveBoardDetails(board: BoardSlotSource): BoardImageDetails | null {
   try {
-    return getBoardDetailsForBoard({
+    return getBoardImageDetailsForBoard({
       board_name: board.boardType,
       layout_id: board.layoutId,
       size_id: board.sizeId,
@@ -58,12 +61,12 @@ function resolveBoardDetails(board: BoardSlotSource): BoardDetails | null {
  * so it is the one with the least excuse to be unbounded. It already degrades
  * to `[]` (the slot paints the bare board and the live subscription fills it in
  * a moment later), which is a far better answer than a render that never ends. */
-async function fetchInitialClimbs(boardId: number): Promise<BoardPresenceClimb[]> {
+async function fetchInitialClimbs(boardId: number, boardUuid: string): Promise<BoardPresenceClimb[]> {
   try {
     const response = await fetch(getGraphQLHttpUrl(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: BOARD_RECENT_CLIMBS, variables: { boardId } }),
+      headers: { 'Content-Type': 'application/json', ...webClientIdentityHeaders() },
+      body: JSON.stringify({ query: BOARD_RECENT_CLIMBS, variables: { boardId, boardUuid } }),
       signal: AbortSignal.timeout(SSR_BACKEND_FETCH_TIMEOUT_MS),
       cache: 'no-store',
     });
@@ -80,20 +83,24 @@ async function fetchInitialClimbs(boardId: number): Promise<BoardPresenceClimb[]
  * the board's config can't be resolved to render details — the caller drops
  * the slot (kiosk presets degrade; the embed 404s).
  */
-export async function buildBoardSlotData(board: BoardSlotSource): Promise<BoardSlotData | null> {
+export async function buildBoardSlotData(
+  board: BoardSlotSource,
+  theme: KioskTheme = KIOSK_DEFAULT_THEME,
+): Promise<BoardSlotData | null> {
   const boardDetails = resolveBoardDetails(board);
   if (boardDetails === null) return null;
 
-  const recentClimbs = await fetchInitialClimbs(board.boardId);
+  const recentClimbs = await fetchInitialClimbs(board.boardId, board.boardUuid);
   const initialClimb = recentClimbs[0] ?? null;
   const flatFrames = toFlatFrames(initialClimb?.frames, boardDetails.board_name);
+  const fieldColor = boardFieldColorForScheme(theme);
   return {
     boardDetails,
     initialClimb,
     initialClimbImageUrl:
       initialClimb === null || flatFrames.length === 0
         ? null
-        : buildBoardRenderUrl(boardDetails, flatFrames, { includeBackground: true }),
-    bareBoardImageUrl: buildBoardRenderUrl(boardDetails, '', { includeBackground: true }),
+        : buildBoardRenderUrl(boardDetails, flatFrames, { includeBackground: true, fieldColor }),
+    bareBoardImageUrl: buildBoardRenderUrl(boardDetails, '', { includeBackground: true, fieldColor }),
   };
 }

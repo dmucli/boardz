@@ -1,0 +1,783 @@
+// @vitest-environment node
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createRequire } from 'node:module';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+import { hashSync } from 'bcryptjs';
+import { NextRequest } from 'next/server';
+import { decode, encode, type JWT } from 'next-auth/jwt';
+import type { WebOAuthResolveReply } from '@boardsesh/auth-protocol';
+
+const { baseUrl, sessionSecret } = vi.hoisted(() => {
+  const fixtureUrl = 'http://localhost:3000';
+  const fixtureSecret = 'auth-time-claim-fixture-secret';
+  // auth-options reads both while it is imported, before any test body runs.
+  process.env.NEXTAUTH_URL = fixtureUrl;
+  process.env.NEXTAUTH_SECRET = fixtureSecret;
+  return { baseUrl: fixtureUrl, sessionSecret: fixtureSecret };
+});
+// Rows each table's `select ... limit` resolves to; an Error makes that read fail.
+// A left join adds the joined table's first row to each row of the first table.
+const databaseRows = vi.hoisted(() => new Map<unknown, unknown[] | Error>());
+const transferAdmission = vi.hoisted(() => ({ enabled: false, generations: [] as number[] }));
+// Identifiers of the `verificationTokens` rows inserted so far; a second insert of
+// one conflicts and returns no row, as the primary key makes it in Postgres.
+const insertedMarkers = vi.hoisted(() => new Set<string>());
+
+vi.mock('server-only', () => ({}));
+vi.mock('@sentry/nextjs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@sentry/nextjs')>()),
+  captureMessage: vi.fn(),
+}));
+vi.mock('@auth/drizzle-adapter', () => ({ DrizzleAdapter: vi.fn(() => ({})) }));
+vi.mock('@/app/lib/db/db', () => {
+  function readRows(table: unknown): unknown[] {
+    const rows = databaseRows.get(table);
+    if (rows instanceof Error) throw rows;
+    return rows ?? [];
+  }
+  function query(table: unknown, joinedTables: unknown[]) {
+    const limit = async () =>
+      readRows(table).map((row) =>
+        joinedTables.reduce<object>(
+          (merged, joined) => ({ ...(readRows(joined)[0] as object | undefined), ...merged }),
+          row as object,
+        ),
+      );
+    return {
+      leftJoin: (joined: unknown) => query(table, [...joinedTables, joined]),
+      where: () => ({ orderBy: () => ({ limit }), limit }),
+    };
+  }
+  function insert() {
+    return {
+      values: (row: { identifier: string; token: string }) => ({
+        onConflictDoNothing: () => ({
+          returning: async () => {
+            if (insertedMarkers.has(row.identifier)) return [];
+            insertedMarkers.add(row.identifier);
+            return [{ token: row.token }];
+          },
+        }),
+      }),
+    };
+  }
+  return { getDb: () => ({ select: () => ({ from: (table: unknown) => query(table, []) }), insert }) };
+});
+// Most age tests isolate callbacks; transfer publication cases retain the real
+// response buffer and replace only the primary generation admission RPC.
+vi.mock('@/app/lib/auth/auth-response-admission.server', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/app/lib/auth/auth-response-admission.server')>();
+  return {
+    withAuthResponseAdmission: (...parameters: Parameters<typeof actual.withAuthResponseAdmission>) =>
+      transferAdmission.enabled ? actual.withAuthResponseAdmission(...parameters) : parameters[2](() => {}),
+  };
+});
+vi.mock('@/app/lib/auth/credential-admission.server', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/app/lib/auth/credential-admission.server')>()),
+  admitPresentedWebCredential: async (credential: string) => {
+    const claims = await decode({ token: credential, secret: sessionSecret });
+    if (!claims?.sub) return null;
+    const generation = claims.gen ?? 0;
+    transferAdmission.generations.push(generation);
+    const rows = databaseRows.get(schema.authSubjectCutoffs);
+    const primaryGeneration = Array.isArray(rows)
+      ? ((rows[0] as { generation?: number } | undefined)?.generation ?? 0)
+      : 0;
+    return generation === primaryGeneration ? claims.sub : null;
+  },
+}));
+
+import * as Sentry from '@sentry/nextjs';
+import * as schema from '@/app/lib/db/schema';
+import { GET, POST } from '@/app/api/auth/[...nextauth]/route';
+import { authOptions } from '../auth-options';
+import { issueNativeOAuthTransferToken } from '../native-oauth-transfer';
+import { createWebOAuthIdentityAuthRequest } from '../web-oauth-auth.server';
+
+// Only the database, the backend admission call and Next's ambient request I/O are
+// replaced. The App Router handler, CSRF check, password compare, callbacks and
+// JWE encoder all run.
+const requestStorage = new AsyncLocalStorage<NextRequest>();
+const require = createRequire(import.meta.url);
+const nextIo = require('next/headers') as {
+  headers: () => Promise<Headers>;
+  cookies: () => Promise<{ getAll: () => { name: string; value: string }[] }>;
+};
+
+const SESSION_COOKIE = 'next-auth.session-token';
+// Half a second past the minute, so a claim that is not whole seconds cannot pass.
+const SIGN_IN_AT_MS = Date.UTC(2026, 10, 9, 12, 0, 0, 500);
+const SIGN_IN_AT_SECONDS = Math.floor(SIGN_IN_AT_MS / 1000);
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+const PASSWORD = 'correct horse battery staple';
+const climber = {
+  id: '602c83bf-e090-4c90-9f7e-08ca0b6b5dad',
+  email: 'climber@example.com',
+  name: 'Climber',
+  image: null,
+  emailVerified: new Date('2026-01-01T00:00:00.000Z'),
+};
+
+let cookies: Map<string, string>;
+let csrfToken: string;
+
+function remember(response: Response) {
+  for (const header of response.headers.getSetCookie()) {
+    const [pair] = header.split(';');
+    const separator = pair.indexOf('=');
+    cookies.set(pair.slice(0, separator), pair.slice(separator + 1));
+  }
+}
+
+async function invoke(path: string, form?: Record<string, string>) {
+  const request = new NextRequest(`${baseUrl}/api/auth/${path}`, {
+    method: form ? 'POST' : 'GET',
+    headers: {
+      Cookie: [...cookies].map(([name, cookie]) => `${name}=${cookie}`).join('; '),
+      ...(form ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
+    },
+    ...(form ? { body: new URLSearchParams(form) } : {}),
+  });
+  const context = { params: Promise.resolve({ nextauth: path.split('/') }) };
+  return requestStorage.run(request, () => (form ? POST(request, context) : GET(request, context)));
+}
+
+function signInWithPassword() {
+  return invoke('callback/credentials', {
+    email: climber.email,
+    password: PASSWORD,
+    csrfToken,
+    json: 'true',
+    callbackUrl: baseUrl,
+  });
+}
+
+function currentSessionClaims() {
+  return decode({ token: cookies.get(SESSION_COOKIE), secret: sessionSecret });
+}
+
+type JwtParameters = Parameters<NonNullable<NonNullable<typeof authOptions.callbacks>['jwt']>>[0];
+
+function runJwtCallback(parameters: Partial<JwtParameters>) {
+  const callback = authOptions.callbacks?.jwt;
+  if (!callback) throw new Error('jwt callback not defined');
+  return callback(parameters as JwtParameters);
+}
+
+function accountFor(provider: string): JwtParameters['account'] {
+  return { provider, type: 'oauth', providerAccountId: 'provider-account' };
+}
+
+beforeAll(() => {
+  vi.spyOn(nextIo, 'headers').mockImplementation(async () => requestStorage.getStore()?.headers ?? new Headers());
+  vi.spyOn(nextIo, 'cookies').mockImplementation(async () => ({
+    getAll: () => requestStorage.getStore()?.cookies.getAll() ?? [],
+  }));
+});
+
+beforeEach(async () => {
+  vi.useFakeTimers({ toFake: ['Date'], now: SIGN_IN_AT_MS });
+  transferAdmission.enabled = false;
+  transferAdmission.generations = [];
+  databaseRows.clear();
+  insertedMarkers.clear();
+  databaseRows.set(schema.users, [climber]);
+  databaseRows.set(schema.userCredentials, [{ passwordHash: hashSync(PASSWORD, 4) }]);
+  cookies = new Map();
+  const response = await invoke('csrf');
+  remember(response);
+  csrfToken = ((await response.json()) as { csrfToken: string }).csrfToken;
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
+});
+
+afterAll(() => vi.restoreAllMocks());
+
+describe('auth_time through the real NextAuth handler', () => {
+  it('records the sign-in second on a password sign-in', async () => {
+    const response = await signInWithPassword();
+    expect(response.status).toBe(200);
+    remember(response);
+
+    const claims = await currentSessionClaims();
+    expect(claims?.sub).toBe(climber.id);
+    expect(claims?.auth_time).toBe(SIGN_IN_AT_SECONDS);
+  });
+
+  it('keeps the original sign-in time when the cookie later rotates', async () => {
+    remember(await signInWithPassword());
+    vi.setSystemTime(SIGN_IN_AT_MS + ONE_DAY_MS);
+
+    const response = await invoke('session');
+    expect(response.status).toBe(200);
+    remember(response);
+
+    const claims = await currentSessionClaims();
+    expect(claims?.iat).toBe(SIGN_IN_AT_SECONDS + ONE_DAY_MS / 1000);
+    expect(claims?.auth_time).toBe(SIGN_IN_AT_SECONDS);
+  });
+
+  it('leaves a cookie from before the claim valid and still without it', async () => {
+    cookies.set(
+      SESSION_COOKIE,
+      await encode({
+        token: { sub: climber.id, email: climber.email, authSessionId: 'old-login' },
+        secret: sessionSecret,
+      }),
+    );
+
+    const response = await invoke('session');
+    expect(await response.clone().json()).toMatchObject({ user: { id: climber.id }, authSessionId: 'old-login' });
+    remember(response);
+
+    const claims = await currentSessionClaims();
+    expect(claims?.sub).toBe(climber.id);
+    expect(claims?.authSessionId).toBe('old-login');
+    expect(claims).not.toHaveProperty('auth_time');
+  });
+
+  it('never records a native transfer sign-in', async () => {
+    const response = await invoke('callback/native-oauth', {
+      transferToken: issueNativeOAuthTransferToken({ userId: climber.id, nextPath: '/' }),
+      csrfToken,
+      json: 'true',
+      callbackUrl: baseUrl,
+    });
+    expect(response.status).toBe(200);
+    remember(response);
+
+    const claims = await currentSessionClaims();
+    expect(claims?.sub).toBe(climber.id);
+    expect(claims).not.toHaveProperty('auth_time');
+  });
+
+  it('signs in once per native transfer token', async () => {
+    const transferToken = issueNativeOAuthTransferToken({ userId: climber.id, nextPath: '/' });
+    const signIn = () =>
+      invoke('callback/native-oauth', { transferToken, csrfToken, json: 'true', callbackUrl: baseUrl });
+
+    const first = await signIn();
+    expect(first.status).toBe(200);
+    expect(first.headers.getSetCookie().some((header) => header.startsWith(`${SESSION_COOKIE}=`))).toBe(true);
+
+    const replay = await signIn();
+    expect(replay.status).not.toBe(200);
+    expect(replay.headers.getSetCookie().some((header) => header.startsWith(`${SESSION_COOKIE}=`))).toBe(false);
+  });
+
+  it('stays out of the session JSON the browser reads', async () => {
+    remember(await signInWithPassword());
+
+    const response = await invoke('session');
+    expect(await response.text()).not.toContain('auth_time');
+  });
+
+  it('adds one small fixed-size claim to the cookie and nothing on rotation', async () => {
+    remember(await signInWithPassword());
+    const signedInCookie = cookies.get(SESSION_COOKIE) ?? '';
+    const { auth_time: _authTime, ...claimsWithoutAuthTime } = (await currentSessionClaims()) as JWT;
+    const cookieWithoutAuthTime = await encode({ token: claimsWithoutAuthTime, secret: sessionSecret });
+
+    expect(_authTime).toBe(SIGN_IN_AT_SECONDS);
+    expect(signedInCookie.length - cookieWithoutAuthTime.length).toBeGreaterThan(0);
+    expect(signedInCookie.length - cookieWithoutAuthTime.length).toBeLessThanOrEqual(32);
+
+    remember(await invoke('session'));
+    expect(cookies.get(SESSION_COOKIE)?.length).toBe(signedInCookie.length);
+  });
+});
+
+describe('auth_time on the backend-staged sign-in paths', () => {
+  it('records a password sign-in delegated to the backend', async () => {
+    vi.stubEnv('CURRENT_STORE_WEB_AUTH_MODE', 'backend-staging');
+    vi.stubEnv('CURRENT_STORE_AUTH_BACKEND_ORIGIN', 'http://127.0.0.1:54321');
+    vi.stubEnv('CURRENT_STORE_AUTH_RPC_SECRET', 'dedicated-rpc-test-server-secret-at-least-32');
+    const backend = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      if (typeof init?.body !== 'string') throw new Error('Expected a serialized command');
+      const { requestId } = JSON.parse(init.body) as { requestId: string };
+      return Response.json({
+        protocolVersion: 2,
+        operation: 'password',
+        requestId,
+        outcome: 'authenticated',
+        user: { id: climber.id, email: climber.email, name: climber.name, image: climber.image },
+        verification: { userId: climber.id, required: true, verified: true },
+      });
+    });
+    vi.stubGlobal('fetch', backend);
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 2 }]);
+
+    const response = await signInWithPassword();
+    expect(response.status).toBe(200);
+    remember(response);
+
+    expect(backend).toHaveBeenCalledOnce();
+    expect(await currentSessionClaims()).toMatchObject({ auth_time: SIGN_IN_AT_SECONDS, gen: 2 });
+  });
+
+  // Runs the wrapper's own callbacks and encoder. Going through a provider redirect
+  // here would need a local OIDC server and a provider registered at import time.
+  it('records an OAuth sign-in resolved by the backend identity wrapper', async () => {
+    const issuedAt = '2026-01-01T00:00:00.000Z';
+    const account = { provider: 'google', type: 'oauth' as const, providerAccountId: 'google-subject' };
+    const user = { id: climber.id, email: climber.email, name: climber.name };
+    const resolved: WebOAuthResolveReply = {
+      webOAuthProtocolVersion: 1,
+      requestId: '8f14e45f-ceea-4e67-8b3a-2f1d0a9b7701',
+      operation: 'resolve',
+      outcome: 'resolved',
+      user: { ...user, image: climber.image, emailVerified: issuedAt, createdAt: issuedAt },
+      createdUser: false,
+      account: { provider: 'google', providerAccountId: account.providerAccountId },
+    };
+    const { options } = createWebOAuthIdentityAuthRequest(
+      authOptions,
+      { provider: 'google', flow: 'a'.repeat(64), actorCookie: null },
+      () => ({ intent: vi.fn(), resolve: vi.fn(async () => resolved) }),
+    );
+    const { callbacks, jwt } = options;
+    if (!callbacks?.signIn || !callbacks.jwt || !jwt?.encode) throw new Error('wrapper is missing a callback');
+
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 2 }]);
+
+    expect(await callbacks.signIn({ user, account })).toBe(true);
+    const token = await callbacks.jwt({ token: { sub: climber.id }, user, account });
+    const encoded = await jwt.encode({ token, secret: sessionSecret });
+
+    expect(await decode({ token: encoded, secret: sessionSecret })).toMatchObject({
+      auth_time: SIGN_IN_AT_SECONDS,
+      gen: 2,
+    });
+  });
+});
+
+describe('auth_time in the jwt callback', () => {
+  it('refuses a completed Facebook login without issuing claims', async () => {
+    await expect(
+      runJwtCallback({
+        token: { sub: climber.id },
+        user: { id: climber.id },
+        account: accountFor('facebook'),
+      }),
+    ).rejects.toThrow('Unsupported OAuth provider');
+  });
+
+  it('preserves an existing Facebook-issued cookie without manufacturing freshness', async () => {
+    const existing = {
+      sub: climber.id,
+      authSessionId: 'stored-facebook-login',
+      gen: 3,
+      auth_time: SIGN_IN_AT_SECONDS - 3600,
+    };
+    const claims = await runJwtCallback({ token: { ...existing }, account: accountFor('facebook') });
+    expect(claims).toMatchObject(existing);
+  });
+
+  it.each(['google', 'apple', 'credentials'])('records a %s sign-in in whole seconds', async (provider) => {
+    const claims = await runJwtCallback({
+      token: { sub: climber.id },
+      user: { id: climber.id },
+      account: accountFor(provider),
+    });
+
+    expect(claims.auth_time).toBe(SIGN_IN_AT_SECONDS);
+  });
+
+  it('drops any earlier value when a native transfer signs in', async () => {
+    const claims = await runJwtCallback({
+      token: { sub: climber.id, auth_time: SIGN_IN_AT_SECONDS - 60 },
+      user: { id: climber.id },
+      account: accountFor('native-oauth'),
+    });
+
+    expect(claims).not.toHaveProperty('auth_time');
+  });
+
+  it('claims nothing when a user arrives without a sign-in method', async () => {
+    const claims = await runJwtCallback({ token: { sub: climber.id }, user: { id: climber.id } });
+
+    expect(claims).not.toHaveProperty('auth_time');
+  });
+
+  it.each([undefined, 'update'] as const)('never takes it from the client on a %s token read', async (trigger) => {
+    const claims = await runJwtCallback({
+      token: { sub: climber.id, authSessionId: 'old-login' },
+      session: { auth_time: 1 },
+      trigger,
+    });
+
+    expect(claims).not.toHaveProperty('auth_time');
+  });
+
+  it.each([undefined, 'update'] as const)('never moves an existing value on a %s token read', async (trigger) => {
+    const earlierSignIn = SIGN_IN_AT_SECONDS - ONE_DAY_MS / 1000;
+    const claims = await runJwtCallback({
+      token: { sub: climber.id, authSessionId: 'login-1', auth_time: earlierSignIn },
+      session: { auth_time: 1 },
+      trigger,
+    });
+
+    expect(claims.auth_time).toBe(earlierSignIn);
+  });
+});
+
+describe('link_guarded beside auth_time', () => {
+  it('is written by a password sign-in only while partner OAuth is on', async () => {
+    remember(await signInWithPassword());
+    expect(await currentSessionClaims()).not.toHaveProperty('link_guarded');
+
+    vi.stubEnv('PARTNER_OAUTH_MODE', 'allowlist');
+    remember(await signInWithPassword());
+    const claims = await currentSessionClaims();
+    expect(claims?.auth_time).toBe(SIGN_IN_AT_SECONDS);
+    expect(claims?.link_guarded).toBe(true);
+  });
+
+  it('survives a cookie rotation, and a rotation never adds it', async () => {
+    vi.stubEnv('PARTNER_OAUTH_MODE', 'allowlist');
+    remember(await signInWithPassword());
+    vi.setSystemTime(SIGN_IN_AT_MS + ONE_DAY_MS);
+    remember(await invoke('session'));
+    expect((await currentSessionClaims())?.link_guarded).toBe(true);
+
+    // A sign-in made while the mode was off stays unguarded after it turns on.
+    vi.stubEnv('PARTNER_OAUTH_MODE', 'off');
+    remember(await signInWithPassword());
+    vi.stubEnv('PARTNER_OAUTH_MODE', 'allowlist');
+    remember(await invoke('session'));
+    const claims = await currentSessionClaims();
+    expect(claims?.auth_time).toBeDefined();
+    expect(claims).not.toHaveProperty('link_guarded');
+  });
+
+  it('is never written for a native transfer, which has no auth_time', async () => {
+    vi.stubEnv('PARTNER_OAUTH_MODE', 'allowlist');
+    const claims = await runJwtCallback({
+      token: { sub: climber.id, auth_time: SIGN_IN_AT_SECONDS - 60, link_guarded: true },
+      user: { id: climber.id },
+      account: accountFor('native-oauth'),
+    });
+
+    expect(claims).not.toHaveProperty('auth_time');
+    expect(claims).not.toHaveProperty('link_guarded');
+  });
+
+  it('is never taken from the client on an update', async () => {
+    vi.stubEnv('PARTNER_OAUTH_MODE', 'allowlist');
+    const claims = await runJwtCallback({
+      token: { sub: climber.id, authSessionId: 'old-login', auth_time: SIGN_IN_AT_SECONDS },
+      session: { link_guarded: true },
+      trigger: 'update',
+    });
+
+    expect(claims).not.toHaveProperty('link_guarded');
+  });
+});
+
+// BA-04 PR 1: the cutoff generation a login signed in under. Nothing reads it
+// yet; PR 2 will end a cookie whose gen no longer matches.
+describe('gen beside auth_time', () => {
+  // next-auth's SessionStore splits a cookie value at 4096 - 163 bytes.
+  const CHUNK_SIZE = 4096 - 163;
+
+  function sessionCookieNames(response: Response) {
+    return response.headers
+      .getSetCookie()
+      .map((header) => header.slice(0, header.indexOf('=')))
+      .filter((name) => name.startsWith(SESSION_COOKIE));
+  }
+
+  it('stamps a password sign-in with the generation read at sign-in, and 0 with no cutoff row', async () => {
+    remember(await signInWithPassword());
+    expect((await currentSessionClaims())?.gen).toBe(0);
+
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 3 }]);
+    remember(await signInWithPassword());
+    expect((await currentSessionClaims())?.gen).toBe(3);
+  });
+
+  it.each([0, 3])(
+    'inherits native transfer generation %s despite a later primary generation, without claiming authentication age',
+    async (generation) => {
+      databaseRows.set(schema.authSubjectCutoffs, [{ generation: 4 }]);
+      remember(
+        await invoke('callback/native-oauth', {
+          transferToken: issueNativeOAuthTransferToken({ userId: climber.id, nextPath: '/', generation }),
+          csrfToken,
+          json: 'true',
+          callbackUrl: baseUrl,
+        }),
+      );
+
+      const claims = await currentSessionClaims();
+      expect(claims?.gen).toBe(generation);
+      expect(claims).not.toHaveProperty('auth_time');
+    },
+  );
+
+  it('keeps the sign-in generation when the cookie rotates after the generation moved', async () => {
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 3 }]);
+    remember(await signInWithPassword());
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 4 }]);
+    vi.setSystemTime(SIGN_IN_AT_MS + ONE_DAY_MS);
+
+    remember(await invoke('session'));
+
+    expect(await currentSessionClaims()).toMatchObject({ gen: 3, auth_time: SIGN_IN_AT_SECONDS });
+  });
+
+  it('stamps a cookie from before the claim with 0 at its next rotation, never the current generation', async () => {
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 5 }]);
+    cookies.set(
+      SESSION_COOKIE,
+      await encode({
+        token: { sub: climber.id, email: climber.email, authSessionId: 'old-login' },
+        secret: sessionSecret,
+      }),
+    );
+
+    const response = await invoke('session');
+    expect(await response.clone().json()).toMatchObject({ user: { id: climber.id }, authSessionId: 'old-login' });
+    remember(response);
+
+    const claims = await currentSessionClaims();
+    expect(claims).toMatchObject({ authSessionId: 'old-login', gen: 0 });
+    expect(claims).not.toHaveProperty('auth_time');
+  });
+
+  it.each([undefined, 'update'] as const)('never takes gen from the client on a %s token read', async (trigger) => {
+    const stamped = await runJwtCallback({
+      token: { sub: climber.id, authSessionId: 'login-1', gen: 2 },
+      session: { gen: 9 },
+      trigger,
+    });
+    const unstamped = await runJwtCallback({
+      token: { sub: climber.id, authSessionId: 'old-login' },
+      session: { gen: 9 },
+      trigger,
+    });
+
+    expect(stamped.gen).toBe(2);
+    expect(unstamped.gen).toBe(0);
+  });
+
+  it('stays out of the session JSON the browser reads', async () => {
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 7 }]);
+    remember(await signInWithPassword());
+
+    const session = (await (await invoke('session')).json()) as Record<string, unknown>;
+    expect(session).not.toHaveProperty('gen');
+    expect(JSON.stringify(session)).not.toContain('"gen"');
+  });
+
+  it('signs in with gen 0 when the read fails, a stamp that can only end the cookie sooner', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.mocked(Sentry.captureMessage).mockClear();
+    databaseRows.set(schema.authSubjectCutoffs, new Error('primary unavailable'));
+
+    const response = await signInWithPassword();
+    expect(sessionCookieNames(response)).toEqual([SESSION_COOKIE]);
+    remember(response);
+
+    expect(await currentSessionClaims()).toMatchObject({ sub: climber.id, gen: 0, auth_time: SIGN_IN_AT_SECONDS });
+    expect(warn).toHaveBeenCalledWith(JSON.stringify({ event: 'auth_generation_read_unavailable', phase: 'jwt' }));
+    // Counted in Sentry, so a web role without SELECT on the table raises an issue.
+    expect(Sentry.captureMessage).toHaveBeenCalledTimes(1);
+    expect(Sentry.captureMessage).toHaveBeenCalledWith(
+      'auth_generation_read_unavailable',
+      expect.objectContaining({ level: 'warning', fingerprint: ['auth_generation_read_unavailable'] }),
+    );
+    warn.mockRestore();
+  });
+
+  it('adds under 60 bytes to the largest cookie a sign-in writes, and never another chunk', async () => {
+    vi.stubEnv('PARTNER_OAUTH_MODE', 'allowlist');
+    databaseRows.set(schema.userProfiles, [
+      { avatarUrl: `https://cdn.example.com/avatars/${'a'.repeat(200)}.jpg`, displayName: 'd'.repeat(100) },
+    ]);
+    databaseRows.set(schema.authSubjectCutoffs, [{ generation: 0 }]);
+    const response = await signInWithPassword();
+    expect(sessionCookieNames(response)).toEqual([SESSION_COOKIE]);
+    remember(response);
+    const signedInCookie = cookies.get(SESSION_COOKIE) ?? '';
+    const { gen, ...claimsWithoutGen } = (await currentSessionClaims()) as JWT;
+    expect(gen).toBe(0);
+    const typicalGrowth =
+      signedInCookie.length - (await encode({ token: claimsWithoutGen, secret: sessionSecret })).length;
+    expect(typicalGrowth).toBeGreaterThan(0);
+    expect(typicalGrowth).toBeLessThan(60);
+
+    // The largest token any sign-in writes: a 254-character address, a long
+    // name and Apple's account-creation proof, at the largest generation.
+    const largest: JWT = {
+      ...claimsWithoutGen,
+      email: `${'e'.repeat(242)}@example.com`,
+      name: 'n'.repeat(100),
+      nativeOAuthCreationProof: {
+        authSessionId: claimsWithoutGen.authSessionId ?? '',
+        provider: 'apple',
+        signedInAt: SIGN_IN_AT_MS,
+        accountCreation: {
+          userId: climber.id,
+          accountCreated: true,
+          provider: 'apple',
+          createdAt: new Date(SIGN_IN_AT_MS).toISOString(),
+        },
+      },
+    };
+    const before = await encode({ token: largest, secret: sessionSecret });
+    const after = await encode({ token: { ...largest, gen: 2 ** 31 - 1 }, secret: sessionSecret });
+    expect(after.length - before.length).toBeLessThan(60);
+    expect(Math.ceil(after.length / CHUNK_SIZE)).toBe(Math.ceil(before.length / CHUNK_SIZE));
+    expect(Math.ceil(after.length / CHUNK_SIZE)).toBe(1);
+  });
+});
+
+describe('buffered SID sign-out writer through the real public NextAuth handler', () => {
+  function enableWriter() {
+    vi.stubEnv('CURRENT_STORE_WEB_SIGNOUT_MODE', 'backend-staging');
+    vi.stubEnv('CURRENT_STORE_AUTH_BACKEND_ORIGIN', 'http://127.0.0.1:47991');
+    vi.stubEnv('CURRENT_STORE_AUTH_RPC_SECRET', 'synthetic-independent-web-signout-rpc-secret');
+  }
+  async function signedOutRequest(csrf = csrfToken) {
+    const claims = await currentSessionClaims();
+    return invoke('signout', {
+      csrfToken: csrf,
+      json: 'true',
+      callbackUrl: baseUrl,
+      expectedUserId: climber.id,
+      expectedAuthSessionId: String(claims?.authSessionId),
+    });
+  }
+  it('forwards the exact signed credential and clears cookies only after a correlated SID acknowledgement', async () => {
+    remember(await signInWithPassword());
+    const credential = cookies.get(SESSION_COOKIE);
+    enableWriter();
+    const calls: unknown[] = [];
+    vi.stubGlobal('fetch', async (_destination: unknown, init: RequestInit) => {
+      if (typeof init.body !== 'string') throw new Error('Expected private JSON command');
+      const command = JSON.parse(init.body) as { requestId: string; payload: { credential: string } };
+      calls.push(command.payload.credential);
+      return Response.json({
+        protocolVersion: 2,
+        operation: 'signout',
+        requestId: command.requestId,
+        outcome: 'signed_out',
+      });
+    });
+    const response = await signedOutRequest();
+    expect(response.status).toBe(200);
+    expect(calls).toEqual([credential]);
+    expect(response.headers.get('set-cookie')).toContain(`${SESSION_COOKIE}=;`);
+  });
+  it('keeps every cookie when the required denial authority is unavailable', async () => {
+    remember(await signInWithPassword());
+    enableWriter();
+    vi.stubGlobal('fetch', async () => {
+      throw new Error('synthetic authority outage');
+    });
+    const response = await signedOutRequest();
+    expect(response.status).toBe(503);
+    expect(response.headers.get('set-cookie')).toBeNull();
+  });
+  it('retains real CSRF rejection without denial RPC or appended session clears', async () => {
+    remember(await signInWithPassword());
+    enableWriter();
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    const response = await signedOutRequest('invalid-csrf');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(response.headers.get('set-cookie') ?? '').not.toContain(`${SESSION_COOKIE}=;`);
+  });
+});
+
+describe('native transfer source proof at actual cookie publication', () => {
+  it.each([0, 3, 4])(
+    'admits only the unchanged signed legacy generation %s after primary reset',
+    async (generation) => {
+      transferAdmission.enabled = true;
+      databaseRows.set(schema.authSubjectCutoffs, [{ generation: 4 }]);
+      const response = await invoke('callback/native-oauth', {
+        transferToken: issueNativeOAuthTransferToken({ userId: climber.id, nextPath: '/', generation }),
+        csrfToken,
+        json: 'true',
+        callbackUrl: baseUrl,
+      });
+      expect(transferAdmission.generations).toEqual([generation]);
+      expect(response.status).toBe(generation === 4 ? 200 : 401);
+      if (generation !== 4) {
+        expect(response.headers.getSetCookie()).toEqual([]);
+      } else {
+        remember(response);
+        const claims = await currentSessionClaims();
+        expect(claims?.gen).toBe(4);
+        expect(claims).not.toHaveProperty('auth_time');
+        expect(claims).not.toHaveProperty('link_guarded');
+      }
+    },
+  );
+
+  it('keeps full inherited proof ahead of legacy generation and the primary generation', async () => {
+    databaseRows.set(schema.authSubjectCutoffs, new Error('A proved transfer must not read the primary stamp'));
+    const earlierSignIn = SIGN_IN_AT_SECONDS - 3600;
+    const claims = await runJwtCallback({
+      token: { sub: climber.id },
+      user: {
+        id: climber.id,
+        nativeOAuthSourceGeneration: 9,
+        webCredentialProof: {
+          version: 1,
+          userId: climber.id,
+          authSessionId: 'signed-source-login',
+          generation: 3,
+          authenticatedAt: new Date(earlierSignIn * 1000).toISOString(),
+          linkGuarded: true,
+        },
+      },
+      account: accountFor('native-oauth'),
+    });
+    expect(claims).toMatchObject({
+      gen: 3,
+      authSessionId: 'signed-source-login',
+      auth_time: earlierSignIn,
+      link_guarded: true,
+    });
+  });
+
+  it('preserves unknown inherited authentication age and guard state', async () => {
+    const claims = await runJwtCallback({
+      token: { sub: climber.id, auth_time: SIGN_IN_AT_SECONDS, link_guarded: true },
+      user: {
+        id: climber.id,
+        nativeOAuthSourceGeneration: 9,
+        webCredentialProof: {
+          version: 1,
+          userId: climber.id,
+          authSessionId: 'unknown-age-source',
+          generation: 3,
+          authenticatedAt: null,
+          linkGuarded: false,
+        },
+      },
+      account: accountFor('native-oauth'),
+    });
+    expect(claims).toMatchObject({ gen: 3, authSessionId: 'unknown-age-source' });
+    expect(claims).not.toHaveProperty('auth_time');
+    expect(claims).not.toHaveProperty('link_guarded');
+  });
+
+  it('refuses incomplete legacy source proof in required mode', async () => {
+    vi.stubEnv('CURRENT_STORE_WEB_CREDENTIAL_PROOF_MODE', 'required');
+    await expect(
+      runJwtCallback({
+        token: { sub: climber.id },
+        user: { id: climber.id, nativeOAuthSourceGeneration: 3 },
+        account: accountFor('native-oauth'),
+      }),
+    ).rejects.toThrow('Backend web credential proof required');
+  });
+});

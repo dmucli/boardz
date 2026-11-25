@@ -19,6 +19,7 @@ import type {
   NotificationType,
   SocialEntityType,
 } from '@boardsesh/shared-schema';
+import { APPROVE_FOLLOW_REQUEST, DECLINE_FOLLOW_REQUEST } from '@boardsesh/graphql/operations/privacy';
 import { getHttpClient } from '../client';
 // The stored-token read, NOT `useAuth`: this module is re-exported from the
 // hooks barrel, and `auth-provider` drags react-native's Flow source into the
@@ -30,21 +31,13 @@ import { useAuthToken } from '../use-auth-token';
 // Neither file can import the other (see that module's note), so the constant
 // lives on its own rather than as a literal in both.
 import { NOTIFICATION_ACTORS_QUERY_KEY } from '../notification-actors-key';
-import { screenshotModeNextPageParam } from '../../screenshot-mode';
+import { GROUPED_NOTIFICATIONS_QUERY_KEY, NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY } from '../notification-read-cache';
+export { GROUPED_NOTIFICATIONS_QUERY_KEY, NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY } from '../notification-read-cache';
 
 /** Groups per page — matches web's `use-grouped-notifications.ts`. */
 const PAGE_SIZE = 20;
 
 const NOTIFICATIONS_STALE_TIME_MS = 60 * 1000;
-
-/**
- * Keys stay next to their hooks rather than in `query-keys.ts`: nothing reads
- * either cache imperatively (`queryClient.getQueryData`), which is that file's
- * stated admission rule. The mutations below write through `queryClient`, but
- * they import the keys from this module, so the compiler links them.
- */
-export const GROUPED_NOTIFICATIONS_QUERY_KEY = ['notifications', 'grouped'] as const;
-export const NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY = ['notifications', 'unreadCount'] as const;
 
 /** The shape React Query stores for the infinite grouped-notifications query. */
 type GroupedNotificationPages = { pages: GroupedNotificationConnection[]; pageParams: unknown[] };
@@ -59,7 +52,7 @@ type GroupedNotificationPages = { pages: GroupedNotificationConnection[]; pagePa
  * key, so the Home bell's badge settles the moment the list loads instead of
  * waiting for its own request to come back.
  */
-export function useGroupedNotifications() {
+export function useGroupedNotifications(enabled = true) {
   const { data: authToken } = useAuthToken();
   const queryClient = useQueryClient();
 
@@ -81,11 +74,8 @@ export function useGroupedNotifications() {
     // `lastPageParam + lastPage.groups.length` because the resolver derives
     // `hasMore` from `offset + groups.length < totalCount`.
     getNextPageParam: (lastPage, allPages) =>
-      screenshotModeNextPageParam(
-        lastPage.hasMore ? allPages.reduce((total, page) => total + page.groups.length, 0) : undefined,
-        allPages.length,
-      ),
-    enabled: !!authToken,
+      lastPage.hasMore ? allPages.reduce((total, page) => total + page.groups.length, 0) : undefined,
+    enabled: !!authToken && enabled,
     staleTime: NOTIFICATIONS_STALE_TIME_MS,
   });
 }
@@ -109,10 +99,7 @@ type ActorPage = { users: unknown[]; hasMore: boolean };
  */
 export function nextActorsOffset(lastPage: ActorPage, allPages: ActorPage[]): number | undefined {
   if (!lastPage.hasMore || lastPage.users.length === 0) return undefined;
-  return screenshotModeNextPageParam(
-    allPages.reduce((total, page) => total + page.users.length, 0),
-    allPages.length,
-  );
+  return allPages.reduce((total, page) => total + page.users.length, 0);
 }
 
 /**
@@ -235,4 +222,68 @@ export function useMarkAllAsRead() {
       queryClient.setQueryData(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY, 0);
     },
   });
+}
+
+export type FollowRequestAnswer = 'approve' | 'decline';
+
+/**
+ * Approve or decline the follow request behind a `follow_request` row. The
+ * server deletes the row when the request is answered, so on success it leaves
+ * the loaded pages straight away rather than waiting for the refetch the
+ * privacy change triggers. The requester is the group's entity (one row per
+ * requester); the first actor is the same person and covers a row without one.
+ *
+ * Returns `mutateAsync`, which React Query keeps stable, so the screen can hand
+ * it to every memoized row without re-rendering them.
+ */
+export function useAnswerFollowRequest() {
+  const queryClient = useQueryClient();
+
+  const { mutateAsync } = useMutation({
+    networkMode: 'always',
+    mutationFn: async ({
+      notification,
+      answer,
+    }: {
+      notification: GroupedNotification;
+      answer: FollowRequestAnswer;
+    }) => {
+      const requesterId = notification.entityId ?? notification.actors[0]?.id;
+      if (!requesterId) throw new Error('A follow request row has no requester.');
+      await getHttpClient().request(answer === 'approve' ? APPROVE_FOLLOW_REQUEST : DECLINE_FOLLOW_REQUEST, {
+        userId: requesterId,
+      });
+    },
+    onSuccess: (_result, { notification, answer }) => {
+      queryClient.setQueriesData<GroupedNotificationPages>({ queryKey: GROUPED_NOTIFICATIONS_QUERY_KEY }, (previous) =>
+        previous
+          ? {
+              ...previous,
+              pages: previous.pages.map((page) => ({
+                ...page,
+                groups: page.groups.filter((group) => group.uuid !== notification.uuid),
+              })),
+            }
+          : previous,
+      );
+      if (!notification.isRead) {
+        queryClient.setQueryData<number>(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY, (previousCount) =>
+          Math.max(0, (previousCount ?? 0) - 1),
+        );
+      }
+      // The requests list in privacy settings shows the same request.
+      void queryClient.invalidateQueries({ queryKey: ['privacyFollowRequests'] });
+      if (answer === 'approve') {
+        // An approval adds a follower: the owner's follower list and count, the
+        // requester's following list, and both profiles' follow state change.
+        // The same keys the follow and privacy-settings approval paths refresh.
+        void queryClient.invalidateQueries({ queryKey: ['followers'] });
+        void queryClient.invalidateQueries({ queryKey: ['following'] });
+        void queryClient.invalidateQueries({ queryKey: ['publicProfile'] });
+        void queryClient.invalidateQueries({ queryKey: ['privacyRelationship'] });
+      }
+    },
+  });
+
+  return mutateAsync;
 }

@@ -1,5 +1,6 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useEffect, useRef, useState } from 'react';
-import { AccessibilityInfo, Pressable, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
+import { AccessibilityInfo, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { Text } from '../Text';
@@ -9,7 +10,11 @@ import { useLightbulbControl } from '../ble/use-lightbulb-control';
 import { track } from '../../lib/analytics';
 import { nowMs } from '../../lib/clock';
 import { reportError } from '../../lib/error-reporting';
-import { isConnectStepTreatmentLive, shouldShowFirstConnectCard } from '../../lib/onboarding/first-connect-decision';
+import {
+  firstConnectAlwaysDrives,
+  isConnectStepTreatmentLive,
+  shouldShowFirstConnectCard,
+} from '../../lib/onboarding/first-connect-decision';
 import {
   FIRST_CONNECT_LAUNCH_ID,
   dismissFirstConnectCardForLaunch,
@@ -18,7 +23,9 @@ import {
   useFirstConnectSelector,
   useFirstConnectSnapshot,
 } from '../../lib/onboarding/first-connect-store';
-import { useFirstConnectCtaEnabled } from '../../providers/feature-flags-provider';
+import { useSetting } from '../../settings';
+import { useFirstConnectCtaEnabled, useWallSwipeToDriveEnabled } from '../../providers/feature-flags-provider';
+import { useIsCrewSession } from '../../providers/queue-provider';
 import { useTheme } from '../../providers/theme-provider';
 import { selectByVariant } from '../../theme/variants/select-by-variant';
 import { borderRadius, spacing } from '../../theme/tokens';
@@ -29,7 +36,10 @@ type FirstRunCardAction = 'connect' | 'no_lights' | 'dismiss' | 'retry';
 type FirstConnectCardProps = {
   /** The bound board's name, or null when there is none to show. */
   boardName: string | null;
-  /** A board is bound and not flagged as having no lights (`hasLeds !== false`). */
+  /**
+   * A board is bound and climbs reach it over Bluetooth: not flagged as having
+   * no lights, and not lit by a wall device (`drivesWithoutBluetooth`).
+   */
   boardHasLights: boolean;
   /** Layout (margins) from the host list. */
   style?: StyleProp<ViewStyle>;
@@ -43,6 +53,12 @@ function trackCardAction(action: FirstRunCardAction): void {
  * The connect-step test's Climbs card (#5654, PR 7, treatment only): "Light
  * climbs on {{board}}", with **Connect**, **This wall has no lights** and an X
  * ("Not now").
+ *
+ * The body follows Always drive the wall (`firstConnectAlwaysDrives`): off (the
+ * default) a tap opens a preview, so it names Put on board; on, this phone
+ * drives the wall once connected and every climb picked lights, so it says
+ * that, except in a crew with In a session too off, where picks stay previews.
+ * It never promises a tap lights a climb when it won't.
  *
  * Shown while a board with lights is bound and this phone has never connected,
  * on at most two launches. The X hides it for this launch; "no lights" hides it
@@ -93,6 +109,16 @@ function FirstConnectCardBody({ boardName, boardHasLights, style }: FirstConnect
   const { variant, systemColors, brandColors, m3SurfaceContainers } = useTheme();
   const { device, enrolment, cardDismissedThisLaunch } = useFirstConnectSnapshot();
   const enabled = useFirstConnectCtaEnabled();
+  const [alwaysDrive] = useSetting('alwaysDrive');
+  const [drivesInSession] = useSetting('putOnBoardDrivesInSession');
+  const inSession = useIsCrewSession();
+  const swipeToDriveEnabled = useWallSwipeToDriveEnabled();
+  const alwaysDrives = firstConnectAlwaysDrives({
+    alwaysDrive,
+    swipeToDriveEnabled,
+    drivesInSession,
+    inSession,
+  });
   const { bluetooth, pressAction, pending, holderIsAuthoritative, onPress, connect } = useLightbulbControl({
     surface: 'first_connect_card',
   });
@@ -184,10 +210,10 @@ function FirstConnectCardBody({ boardName, boardHasLights, style }: FirstConnect
             {title}
           </Text>
           <Text variant="subheadline" color={systemColors.secondaryLabel}>
-            {t('mobile.firstConnect.card.body')}
+            {alwaysDrives ? t('mobile.firstConnect.card.bodyAlwaysDrive') : t('mobile.firstConnect.card.body')}
           </Text>
         </View>
-        <Pressable
+        <PressableSurface
           onPress={handleDismiss}
           accessibilityRole="button"
           accessibilityLabel={t('mobile.firstConnect.card.notNow')}
@@ -195,7 +221,7 @@ function FirstConnectCardBody({ boardName, boardHasLights, style }: FirstConnect
           style={styles.close}
         >
           <Icon name="close" size={16} color={systemColors.secondaryLabel} />
-        </Pressable>
+        </PressableSurface>
       </View>
       {/* Outcome-neutral on purpose: connect() resolves false for a dismissed
           picker, a denied permission and a radio that's off as well as a board
@@ -207,6 +233,11 @@ function FirstConnectCardBody({ boardName, boardHasLights, style }: FirstConnect
             : t('mobile.firstConnect.card.failedNoName')}
         </Text>
       ) : null}
+      {/* Both buttons opt out of the container safe area: the card can mount
+          while Climbs is scrolled (the wall frees up, or enrolment resolves
+          late), and an iOS button host that mounts off screen keeps a ~50pt
+          inset on its label. The fix for any list-header button that
+          mounts while the list is scrolled. */}
       <View style={styles.actions}>
         <Button
           title={attempt === 'failed' ? t('mobile.firstConnect.card.tryAgain') : t('mobile.firstConnect.card.connect')}
@@ -216,8 +247,15 @@ function FirstConnectCardBody({ boardName, boardHasLights, style }: FirstConnect
           loading={busy}
           disabled={busy}
           onPress={handleConnect}
+          ignoreContainerSafeArea
         />
-        <Button title={t('mobile.firstConnect.card.noLights')} variant="text" size="small" onPress={handleNoLights} />
+        <Button
+          title={t('mobile.firstConnect.card.noLights')}
+          variant="text"
+          size="small"
+          onPress={handleNoLights}
+          ignoreContainerSafeArea
+        />
       </View>
     </View>
   );

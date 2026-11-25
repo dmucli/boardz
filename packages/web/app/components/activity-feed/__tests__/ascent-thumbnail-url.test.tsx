@@ -10,8 +10,6 @@ vi.mock('@/app/components/i18n/locale-link', () => ({
 
 // The thumbnail itself is irrelevant here — only the href it wraps is.
 vi.mock('@/app/components/board-renderer/board-image-layers', () => ({ default: () => null }));
-vi.mock('@/app/components/board-renderer/board-canvas-renderer', () => ({ default: () => null }));
-vi.mock('@/app/lib/board-render-worker/worker-manager', () => ({ useCanvasRendererReady: () => false }));
 vi.mock('../ascents-feed.module.css', () => ({
   default: new Proxy({}, { get: (_target, prop) => String(prop) }),
 }));
@@ -55,5 +53,38 @@ describe('AscentThumbnail climb-view href', () => {
     expect(thumbnailHref({ layoutId: 1, sizeId: 10, setIds: [1, 20] })).toBe(
       '/kilter/original/12x12-square/screw_bolt/40/view/test-climb-ABC123',
     );
+  });
+});
+
+/**
+ * Woods numbers each size's holds from its own origin, so the layout default
+ * (the 12x12) would draw an 8x10 climb as different holds. With no resolved
+ * board the backend has no size for the climb, and the thumbnail draws nothing
+ * (#5241). Kilter keeps its layout default.
+ */
+describe('AscentThumbnail with no renderBoard', () => {
+  function renderWithoutBoard(boardType: string) {
+    return render(
+      <AscentThumbnail
+        boardType={boardType}
+        layoutId={1}
+        angle={40}
+        climbUuid="ABC123"
+        climbName="Test Climb"
+        frames="p1r12"
+        isMirror={false}
+        renderBoard={null}
+      />,
+    );
+  }
+
+  it('draws nothing for a Woods climb instead of guessing the 12x12', () => {
+    const { container } = renderWithoutBoard('woods');
+    expect(container.innerHTML).toBe('');
+  });
+
+  it('still falls back to the layout default for Kilter', () => {
+    renderWithoutBoard('kilter');
+    expect(screen.getByRole('link').getAttribute('href')).toContain('/kilter/');
   });
 });

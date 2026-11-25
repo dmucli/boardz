@@ -1,5 +1,7 @@
-Novedades de 2.5:
-- Compatible con Woods de principio a fin: añade tu 12x12 o 8x10, explora más de 5.000 bloques con sus reglas, enciéndelos por Bluetooth, crea y remezcla los tuyos, y espejea un bloque y el muro lo sigue.
-- Toma el muro en un plafón sin LED: tu gente y la pantalla del rocódromo siguen el bloque que pones.
-- Espejea tu bloque desde la notificación de Android; la app, tu gente y los LED lo siguen.
-- Las presas se dibujan más rápido y los bloques descargados siguen al día.
+Novedades de 2.8.0:
+Ahora en chino simplificado.
+- 4x4, Al límite y Al minuto. Inicio: tu semana y proyectos.
+- Spraywall con WLED; apagado automático por Wi-Fi. Instalación Bluetooth en beta opcional para controladores compatibles.
+- Interfaz Android más sencilla, navegación compacta y controles renovados en la pantalla de bloqueo.
+- GPU más fluida en plafones compatibles.
+- Abre entrenamientos de apps compatibles y autoriza la lectura de tu logbook: https://www.boardsesh.com/developers/

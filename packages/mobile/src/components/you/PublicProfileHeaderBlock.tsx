@@ -1,6 +1,7 @@
+import { PressableSurface } from '../PressableSurface';
 import { useCallback } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
-import { useRouter } from 'expo-router';
+import { StyleSheet, View } from 'react-native';
+import { useScopedRouter as useRouter } from '../../lib/routing/scoped-navigation';
 import { useTranslation } from 'react-i18next';
 import type { PublicUserProfile } from '@boardsesh/shared-schema';
 import { isInstagramUrl } from '@boardsesh/shared-schema';
@@ -8,6 +9,12 @@ import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { Avatar } from '../Avatar';
 import { Button } from '../Button';
+import {
+  usePrivacySettings,
+  usePrivacyRelationship,
+  usePrivacyFollowAction,
+} from '../../lib/graphql/hooks/use-privacy';
+import { useConnectivity } from '../../lib/connectivity/use-connectivity';
 import { useToggleUserFollow } from '../../lib/graphql/hooks';
 import { useTheme } from '../../providers/theme-provider';
 import { useToast } from '../../providers/toast-provider';
@@ -54,31 +61,33 @@ export function PublicProfileHeaderBlock({ profile, instagramUrl, currentUserId 
           <Text variant="title2" numberOfLines={2} style={styles.name}>
             {displayName}
           </Text>
-          <View style={styles.countsRow}>
-            <Pressable
-              onPress={() => openConnections('followers')}
-              accessibilityRole="button"
-              hitSlop={8}
-              style={({ pressed }) => pressed && styles.pressed}
-            >
-              <Text variant="subheadline" color={systemColors.secondaryLabel}>
-                {t('mobile.social.followerCount', { count: profile.followerCount })}
+          {profile.canViewActivity !== false ? (
+            <View style={styles.countsRow}>
+              <PressableSurface
+                onPress={() => openConnections('followers')}
+                accessibilityRole="button"
+                hitSlop={8}
+                style={({ pressed }) => pressed && styles.pressed}
+              >
+                <Text variant="subheadline" color={systemColors.secondaryLabel}>
+                  {t('mobile.social.followerCount', { count: profile.followerCount })}
+                </Text>
+              </PressableSurface>
+              <Text variant="subheadline" color={systemColors.tertiaryLabel} style={styles.dot}>
+                ·
               </Text>
-            </Pressable>
-            <Text variant="subheadline" color={systemColors.tertiaryLabel} style={styles.dot}>
-              ·
-            </Text>
-            <Pressable
-              onPress={() => openConnections('following')}
-              accessibilityRole="button"
-              hitSlop={8}
-              style={({ pressed }) => pressed && styles.pressed}
-            >
-              <Text variant="subheadline" color={systemColors.secondaryLabel}>
-                {t('mobile.social.followingCount', { count: profile.followingCount })}
-              </Text>
-            </Pressable>
-          </View>
+              <PressableSurface
+                onPress={() => openConnections('following')}
+                accessibilityRole="button"
+                hitSlop={8}
+                style={({ pressed }) => pressed && styles.pressed}
+              >
+                <Text variant="subheadline" color={systemColors.secondaryLabel}>
+                  {t('mobile.social.followingCount', { count: profile.followingCount })}
+                </Text>
+              </PressableSurface>
+            </View>
+          ) : null}
           {instagramUrl ? <InstagramLink url={instagramUrl} /> : null}
         </View>
       </View>
@@ -108,15 +117,42 @@ function FollowButton({
 }) {
   const { t } = useTranslation('you');
   const { variant } = useTheme();
+  const { t: tSettings } = useTranslation('settings');
+  const { data: settings } = usePrivacySettings();
+  const relationship = usePrivacyRelationship(targetUserId, !!settings);
+  const privacyFollow = usePrivacyFollowAction();
+  const { effectiveOffline } = useConnectivity();
+  const { showToast } = useToast();
   const toggleFollow = useToggleUserFollow(currentUserId);
-  const isPending = toggleFollow.isPending && toggleFollow.variables?.userId === targetUserId;
+  const isPending =
+    (toggleFollow.isPending && toggleFollow.variables?.userId === targetUserId) || privacyFollow.isPending;
+  const pendingRequest = relationship.data?.requestPending === true;
+  const privateRequest = relationship.data?.isPrivate === true && !isFollowedByMe;
+  const handleFollow = () => {
+    if (privateRequest || pendingRequest) {
+      privacyFollow.mutate(
+        { action: pendingRequest ? 'cancel' : 'request', userId: targetUserId },
+        {
+          onError: () => showToast(tSettings('privacy.followFailed'), 'error'),
+        },
+      );
+    } else toggleFollow.mutate({ userId: targetUserId, isFollowedByMe });
+  };
 
   // Following at rest reads as middle-emphasis: M3 → tonal, HIG → outlined capsule.
   const followingVariant = selectByVariant(variant, { liquidGlass: 'outlined', material: 'tonal' } as const);
 
   return (
     <Button
-      title={isFollowedByMe ? t('mobile.social.following') : t('mobile.social.followAction')}
+      title={
+        pendingRequest
+          ? tSettings('privacy.cancelRequest')
+          : privateRequest
+            ? tSettings('privacy.requestFollow')
+            : isFollowedByMe
+              ? t('mobile.social.following')
+              : t('mobile.social.followAction')
+      }
       accessibilityLabel={
         isFollowedByMe
           ? t('mobile.social.unfollowUser', { name: displayName })
@@ -125,9 +161,13 @@ function FollowButton({
       variant={isFollowedByMe ? followingVariant : 'filled'}
       size="medium"
       loading={isPending}
-      disabled={isPending}
+      disabled={
+        isPending ||
+        (!!settings && (effectiveOffline || relationship.isPending)) ||
+        ((privateRequest || pendingRequest) && !settings?.enabled)
+      }
       style={styles.followButton}
-      onPress={() => toggleFollow.mutate({ userId: targetUserId, isFollowedByMe })}
+      onPress={handleFollow}
     />
   );
 }
@@ -146,7 +186,7 @@ function InstagramLink({ url }: { url: string }) {
   }, [showToast, t, url]);
 
   return (
-    <Pressable
+    <PressableSurface
       onPress={handleOpen}
       accessibilityRole="link"
       accessibilityLabel={t('mobile.social.instagramLink')}
@@ -157,16 +197,19 @@ function InstagramLink({ url }: { url: string }) {
         pressed && styles.pressed,
       ]}
     >
-      <Icon name="instagram" size={15} color={systemColors.secondaryLabel} />
+      <Icon maxFontSizeMultiplier={1} name="instagram" size={15} color={systemColors.secondaryLabel} />
       <Text variant="footnote" color={systemColors.secondaryLabel}>
         {t('mobile.social.instagramLink')}
       </Text>
-    </Pressable>
+    </PressableSurface>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
+    width: '100%',
+    maxWidth: 672,
+    alignSelf: 'center',
     paddingHorizontal: spacing[4],
     paddingTop: spacing[3],
     paddingBottom: spacing[3],

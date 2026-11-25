@@ -1,0 +1,22 @@
+{
+  "boards": "Every board.\nOne *app.*",
+  "yourBoards": "Your boards.\nOne *app.*",
+  "spray": "Your Spraywall,\n*too.*",
+  "crew": "Your crew.\nOne *queue.*",
+  "island": "Next climb.\nOutside the *app.*",
+  "kilter": "Works with\n*Kilter.*",
+  "kilterLog": "Bring your\n*logbook.*",
+  "friends": "Friends pick\nwhat’s *next.*",
+  "tension": "Works with\n*Tension.*",
+  "tensionLog": "Bring your\n*logbook.*",
+  "tensionFriends": "Tension with\n*friends.*",
+  "moonboard": "Works with\n*MoonBoard.*",
+  "spraySet": "Set on your\n*spray wall.*",
+  "photo": "Holds on\nyour *photo.*",
+  "sends": "Track every\n*send.*",
+  "gymBoards": "Gym boards\n*too.*",
+  "sprayNext": "Next climb.\nSame *wall.*",
+  "moonboardGrade": "Filter by\n*grade.*",
+  "climbHolds": "See the climb.\nEvery *hold.*",
+  "moonboardLog": "Bring your\n*logbook.*"
+}

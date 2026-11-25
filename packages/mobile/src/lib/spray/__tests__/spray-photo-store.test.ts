@@ -21,9 +21,10 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 type FakeFile = { contents: string };
 
-const { files, downloadedUrls } = vi.hoisted(() => ({
+const { files, downloadedUrls, transfers } = vi.hoisted(() => ({
   files: new Map<string, FakeFile>(),
   downloadedUrls: [] as string[],
+  transfers: { suspended: false, pending: [] as (() => void)[] },
 }));
 
 // Both classes address by their full joined uri, so a file's identity is its
@@ -42,7 +43,7 @@ vi.mock('expo-file-system', () => {
       // Directories are implied by their files in this fake.
     }
     delete(): void {
-      for (const path of [...files.keys()]) {
+      for (const path of files.keys()) {
         if (path.startsWith(`${this.uri}/`)) files.delete(path);
       }
     }
@@ -76,15 +77,24 @@ vi.mock('expo-file-system', () => {
       files.delete(this.uri);
       files.set(destination.uri, contents);
     }
+    async copy(destination: { uri: string }): Promise<void> {
+      const contents = files.get(this.uri);
+      if (!contents) throw new Error(`no such file: ${this.uri}`);
+      files.set(destination.uri, { ...contents });
+    }
     static downloadFileAsync(
       url: string,
       destination: { uri: string },
     ): Promise<{ moveSync: (to: { uri: string }) => void; uri: string }> {
       downloadedUrls.push(url);
-      files.set(destination.uri, { contents: url });
-      return Promise.resolve(
-        new File(destination.uri) as unknown as { moveSync: (to: { uri: string }) => void; uri: string },
-      );
+      return new Promise((resolve) => {
+        const finish = () => {
+          files.set(destination.uri, { contents: url });
+          resolve(new File(destination.uri));
+        };
+        if (transfers.suspended) transfers.pending.push(finish);
+        else finish();
+      });
     }
   }
 
@@ -112,6 +122,10 @@ const KEY_V2 = 'spray-walls/wall-a/photo-2.jpg';
 const KEY_OTHER = 'spray-walls/wall-b/photo-1.jpg';
 
 beforeEach(() => {
+  transfers.suspended = false;
+  transfers.pending.length = 0;
+  // Advance the real epoch before clearing fixtures; never reset epochs to zero.
+  clearStoredSprayPhotos();
   files.clear();
   downloadedUrls.length = 0;
 });
@@ -220,9 +234,51 @@ describe('pruneStoredSprayPhotos', () => {
     expect(pruneStoredSprayPhotos([])).toBe(0);
     expect(names()).toHaveLength(1);
   });
+
+  it('keeps generation staging for a live key and deletes orphan or malformed staging', () => {
+    const liveName = sprayPhotoStoreFileName(KEY_V2);
+    const livePartial = `${liveName}-launch123-1-2-3-4.part`;
+    for (const name of [
+      livePartial,
+      `${sprayPhotoStoreFileName(KEY_V1)}-launch123-1-2-3-4.part`,
+      `${liveName}-not-a-generation.part`,
+    ]) {
+      files.set(`${DIR}/${name}`, { contents: 'half' });
+    }
+
+    expect(pruneStoredSprayPhotos([KEY_V2])).toBe(2);
+    expect(names()).toEqual([livePartial]);
+  });
+
+  it('discards a download still in flight for a key no wall names any more', async () => {
+    await storeSprayPhoto(KEY_V2, 'https://private.example/a?sig=2');
+    transfers.suspended = true;
+    const superseded = storeSprayPhoto(KEY_V1, 'https://private.example/a?sig=1');
+
+    pruneStoredSprayPhotos([KEY_V2]);
+    transfers.pending.shift()!();
+
+    expect(await superseded).toBeNull();
+    expect(names()).toEqual([sprayPhotoStoreFileName(KEY_V2)]);
+  });
 });
 
 describe('deleteStoredSprayPhoto', () => {
+  it('fences a removed wall’s late download while a fresh download for the same key lands', async () => {
+    transfers.suspended = true;
+    const pending = storeSprayPhoto(KEY_V1, 'https://private.example/a?sig=old');
+    deleteStoredSprayPhoto(KEY_V1);
+    transfers.suspended = false;
+    // Not joined to the revoked transfer: it stages under its own generation.
+    expect(await storeSprayPhoto(KEY_V1, 'https://private.example/a?sig=new')).not.toBeNull();
+    expect(downloadedUrls).toHaveLength(2);
+
+    transfers.pending.shift()!();
+    expect(await pending).toBeNull();
+    expect(names()).toEqual([sprayPhotoStoreFileName(KEY_V1)]);
+    expect(files.get(pathFor(KEY_V1))?.contents).toBe('https://private.example/a?sig=new');
+  });
+
   it('removes one wall’s photo and its staging file, leaving the others', async () => {
     await storeSprayPhoto(KEY_V2, 'https://private.example/a?sig=2');
     await storeSprayPhoto(KEY_OTHER, 'https://private.example/b?sig=1');
@@ -244,6 +300,28 @@ describe('deleteStoredSprayPhoto', () => {
 });
 
 describe('clearStoredSprayPhotos', () => {
+  it('rejects a late old-session completion without erasing the new session’s same-key photo', async () => {
+    transfers.suspended = true;
+    const oldDownload = storeSprayPhoto(KEY_V1, 'https://old.example/photo');
+    clearStoredSprayPhotos();
+    transfers.suspended = false;
+    await storeSprayPhoto(KEY_V1, 'https://new.example/photo');
+    transfers.pending.shift()!();
+    expect(await oldDownload).toBeNull();
+    expect(files.get(pathFor(KEY_V1))?.contents).toBe('https://new.example/photo');
+    expect(names()).toEqual([sprayPhotoStoreFileName(KEY_V1)]);
+  });
+
+  it('rejects a late completion for a deleted key while preserving another wall', async () => {
+    await storeSprayPhoto(KEY_V2, 'https://other.example/photo');
+    transfers.suspended = true;
+    const oldDownload = storeSprayPhoto(KEY_V1, 'https://old.example/photo');
+    deleteStoredSprayPhoto(KEY_V1);
+    transfers.suspended = false;
+    transfers.pending.shift()!();
+    expect(await oldDownload).toBeNull();
+    expect(names()).toEqual([sprayPhotoStoreFileName(KEY_V2)]);
+  });
   it('takes every photograph, whoever it belonged to', async () => {
     await storeSprayPhoto(KEY_V2, 'https://private.example/a?sig=2');
     await storeSprayPhoto(KEY_OTHER, 'https://private.example/b?sig=1');
@@ -251,5 +329,36 @@ describe('clearStoredSprayPhotos', () => {
     clearStoredSprayPhotos();
 
     expect(names()).toEqual([]);
+  });
+});
+
+// A climber usually opens a wall before downloading it, so the renderer's cache
+// already holds the photo. The key is the identity: those bytes ARE this photo.
+describe('storeSprayPhoto adopting the renderer copy', () => {
+  const KEY = 'spray-walls/wall-a/photo-1.jpg';
+  const URL = 'https://private.example/a?sig=1';
+  const CACHED = '/cache/spray-walls/4-v9.jpg';
+
+  it('copies the cached file instead of downloading it', async () => {
+    files.set(`file://${CACHED}`, { contents: 'cached bytes' });
+
+    const path = await storeSprayPhoto(KEY, URL, 4, CACHED);
+
+    expect(path).toBe(`/documents/${SPRAY_PHOTO_STORE_DIR_NAME}/${sprayPhotoStoreFileName(KEY)}`);
+    expect(downloadedUrls).toEqual([]);
+    expect(files.get(`${DIR}/${sprayPhotoStoreFileName(KEY)}`)?.contents).toBe('cached bytes');
+    // The renderer keeps its own copy: a board on screen may be drawing it.
+    expect(files.has(`file://${CACHED}`)).toBe(true);
+    // Nothing staged is left behind.
+    expect([...files.keys()].some((name) => name.endsWith('.part'))).toBe(false);
+  });
+
+  // The sweeper or the OS can take the cache file between lookup and copy.
+  it('downloads when the cached file has gone', async () => {
+    const path = await storeSprayPhoto(KEY, URL, 4, CACHED);
+
+    expect(path).not.toBeNull();
+    expect(downloadedUrls).toEqual([URL]);
+    expect(files.get(`${DIR}/${sprayPhotoStoreFileName(KEY)}`)?.contents).toBe(URL);
   });
 });

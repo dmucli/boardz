@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { type ChangeEvent, createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -14,11 +14,70 @@ const resizeMock = vi.hoisted(() => vi.fn());
 const renderAsyncMock = vi.hoisted(() => vi.fn());
 const saveAsyncMock = vi.hoisted(() => vi.fn());
 const releaseMock = vi.hoisted(() => vi.fn());
+const profileFixture = vi.hoisted(() => ({
+  id: '11111111-1111-4111-8111-111111111111',
+  email: 'alex@example.com',
+  displayName: null as string | null,
+  avatarUrl: null as string | null,
+}));
+// The latest top-bar action the screen asked for: Save lives in the header now.
+const headerActions = vi.hoisted(() => ({
+  trailing: null as null | { label: string; onPress: () => void; disabled?: boolean; loading?: boolean },
+}));
+
+const keyboard = vi.hoisted(() => ({
+  platform: 'ios',
+  listeners: new Map<string, (event: { endCoordinates: { height: number } }) => void>(),
+}));
+vi.mock('expo-router/react-navigation', () => ({ useHeaderHeight: () => 96 }));
 
 vi.mock('react-native', () => ({
-  Platform: { OS: 'ios' },
+  Keyboard: {
+    addListener: (name: string, callback: (event: { endCoordinates: { height: number } }) => void) => {
+      keyboard.listeners.set(name, callback);
+      return { remove: () => keyboard.listeners.delete(name) };
+    },
+  },
+  LayoutAnimation: { configureNext: vi.fn() },
+  KeyboardAvoidingView: ({
+    children,
+    behavior,
+    keyboardVerticalOffset,
+  }: {
+    children?: ReactNode;
+    behavior?: string;
+    keyboardVerticalOffset?: number;
+  }) =>
+    createElement(
+      'div',
+      { 'data-keyboard-avoiding': true, 'data-behavior': behavior ?? '', 'data-offset': keyboardVerticalOffset },
+      children,
+    ),
+  Platform: {
+    get OS() {
+      return keyboard.platform;
+    },
+  },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
-  ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', { 'data-scroll-view': true }, children),
+  ScrollView: ({
+    children,
+    contentContainerStyle,
+    automaticallyAdjustKeyboardInsets,
+  }: {
+    children?: ReactNode;
+    contentContainerStyle?: unknown;
+    automaticallyAdjustKeyboardInsets?: boolean;
+  }) =>
+    createElement(
+      'div',
+      {
+        'data-scroll-view': true,
+        'data-content-style': JSON.stringify(contentContainerStyle),
+        'data-automatic-keyboard': String(automaticallyAdjustKeyboardInsets),
+      },
+      children,
+    ),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
 }));
@@ -50,19 +109,22 @@ vi.mock('../../providers/theme-provider', () => ({
   }),
 }));
 
+vi.mock('../../hooks/use-header-actions', () => ({
+  useHeaderActions: ({ trailing }: { trailing: typeof headerActions.trailing }) => {
+    headerActions.trailing = trailing;
+  },
+}));
+
+vi.mock('../../hooks/use-bottom-chrome-metrics', () => ({
+  useBottomChromeMetrics: () => ({ scrollBottomPadding: 28 }),
+}));
+
 vi.mock('../../providers/toast-provider', () => ({
   useToast: () => ({ showToast: showToastMock }),
 }));
 
 vi.mock('../../lib/graphql/hooks', () => ({
-  useProfile: () => ({
-    data: {
-      id: '11111111-1111-4111-8111-111111111111',
-      email: 'alex@example.com',
-      displayName: null,
-      avatarUrl: null,
-    },
-  }),
+  useProfile: () => ({ data: profileFixture }),
   useUpdateProfile: () => ({ mutateAsync: mutateAsyncMock }),
 }));
 
@@ -118,7 +180,15 @@ vi.mock('../Text', () => ({
 
 import { EditProfileScreen } from '../EditProfileScreen';
 
+function saveAction() {
+  if (!headerActions.trailing) throw new Error('no top-bar Save');
+  return headerActions.trailing;
+}
+
 beforeEach(() => {
+  keyboard.platform = 'ios';
+  keyboard.listeners.clear();
+  headerActions.trailing = null;
   routerBackMock.mockClear();
   showToastMock.mockClear();
   mutateAsyncMock.mockReset();
@@ -130,8 +200,12 @@ beforeEach(() => {
   renderAsyncMock.mockReset();
   saveAsyncMock.mockReset();
   releaseMock.mockReset();
+  profileFixture.displayName = null;
+  profileFixture.avatarUrl = null;
 
-  requestMediaLibraryPermissionsMock.mockResolvedValue({ granted: true });
+  // A spy only: the screen must never ask. It answers "denied" so a request
+  // that came back would also block the pick, not just trip the call count.
+  requestMediaLibraryPermissionsMock.mockResolvedValue({ granted: false });
   launchImageLibraryMock.mockResolvedValue({
     canceled: false,
     assets: [{ uri: 'file://picked-avatar.jpg', width: 2400, height: 1600 }],
@@ -151,6 +225,57 @@ beforeEach(() => {
 });
 
 describe('EditProfileScreen', () => {
+  it('uses header-offset iOS keyboard avoidance without double-counting keyboard insets', () => {
+    const { container } = render(<EditProfileScreen />);
+    const avoiding = container.querySelector('[data-keyboard-avoiding]');
+    expect(avoiding?.getAttribute('data-behavior')).toBe('padding');
+    expect(avoiding?.getAttribute('data-offset')).toBe('96');
+    expect(container.querySelector('[data-scroll-view]')?.getAttribute('data-automatic-keyboard')).toBe('undefined');
+    expect(keyboard.listeners.size).toBe(0);
+  });
+
+  it('adds and clears Android keyboard space while preserving bottom chrome', () => {
+    keyboard.platform = 'android';
+    const { container, unmount } = render(<EditProfileScreen />);
+    const padding = () => {
+      const styles = JSON.parse(
+        container.querySelector('[data-scroll-view]')?.getAttribute('data-content-style') ?? '[]',
+      ) as { paddingBottom?: number }[];
+      return styles.find((style) => style.paddingBottom !== undefined)?.paddingBottom;
+    };
+    expect(padding()).toBe(44);
+    act(() => keyboard.listeners.get('keyboardDidShow')?.({ endCoordinates: { height: 300 } }));
+    expect(padding()).toBe(344);
+    act(() => keyboard.listeners.get('keyboardDidHide')?.({ endCoordinates: { height: 0 } }));
+    expect(padding()).toBe(44);
+    unmount();
+    expect(keyboard.listeners.size).toBe(0);
+  });
+
+  it('saves from a top-bar check that stays grey until something changed', () => {
+    render(createElement(EditProfileScreen));
+
+    expect(saveAction()).toMatchObject({ label: 'profile.save', disabled: true, loading: false });
+    expect(screen.queryByRole('button', { name: 'profile.save' })).toBeNull();
+
+    fireEvent.change(screen.getByLabelText('profile.displayName.label'), { target: { value: 'Alex' } });
+    expect(saveAction().disabled).toBe(false);
+
+    fireEvent.change(screen.getByLabelText('profile.displayName.label'), { target: { value: '   ' } });
+    expect(saveAction().disabled).toBe(true);
+  });
+
+  it('saves the typed name and goes back', async () => {
+    render(createElement(EditProfileScreen));
+
+    fireEvent.change(screen.getByLabelText('profile.displayName.label'), { target: { value: ' Alex ' } });
+    saveAction().onPress();
+
+    await waitFor(() => expect(routerBackMock).toHaveBeenCalledOnce());
+    expect(mutateAsyncMock).toHaveBeenCalledWith({ displayName: 'Alex' });
+    expect(uploadAvatarMock).not.toHaveBeenCalled();
+  });
+
   it('uploads the picked avatar and saves the exact returned versioned URL', async () => {
     render(createElement(EditProfileScreen));
 
@@ -160,7 +285,8 @@ describe('EditProfileScreen', () => {
       expect(screen.getByTestId('avatar').getAttribute('data-uri')).toBe('file://compressed-avatar.jpg');
     });
 
-    fireEvent.click(screen.getByRole('button', { name: 'profile.save' }));
+    expect(saveAction().disabled).toBe(false);
+    saveAction().onPress();
 
     await waitFor(() => {
       expect(uploadAvatarMock).toHaveBeenCalledWith(
@@ -172,5 +298,95 @@ describe('EditProfileScreen', () => {
       avatarUrl: 'https://ws.example.com/static/avatars/11111111-1111-4111-8111-111111111111.jpg?v=upload-123',
     });
     expect(routerBackMock).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a failed avatar on a named profile for retry without reporting success', async () => {
+    profileFixture.displayName = 'Alex';
+    uploadAvatarMock.mockRejectedValueOnce(new Error('Upload unavailable'));
+    render(<EditProfileScreen />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'profile.avatar.upload' }));
+    await waitFor(() => expect(saveAction().disabled).toBe(false));
+    act(() => saveAction().onPress());
+
+    await waitFor(() => {
+      expect(showToastMock.mock.calls).toEqual([['profile.avatarUploadFailed', 'warning']]);
+      expect(saveAction().loading).toBe(false);
+    });
+    // The saved name did not change, so there is nothing else to send.
+    expect(mutateAsyncMock).not.toHaveBeenCalled();
+    expect(routerBackMock).not.toHaveBeenCalled();
+    expect(screen.getByTestId('avatar').getAttribute('data-uri')).toBe('file://compressed-avatar.jpg');
+    expect(saveAction().disabled).toBe(false);
+
+    act(() => saveAction().onPress());
+
+    await waitFor(() => expect(routerBackMock).toHaveBeenCalledOnce());
+    expect(launchImageLibraryMock).toHaveBeenCalledOnce();
+    expect(uploadAvatarMock).toHaveBeenCalledTimes(2);
+    expect(mutateAsyncMock).toHaveBeenCalledExactlyOnceWith({
+      avatarUrl: 'https://ws.example.com/static/avatars/11111111-1111-4111-8111-111111111111.jpg?v=upload-123',
+    });
+    expect(showToastMock).toHaveBeenLastCalledWith('profile.saved', 'success');
+  });
+
+  it('still saves a name edit once when the avatar upload fails', async () => {
+    profileFixture.displayName = 'Alex';
+    uploadAvatarMock.mockRejectedValueOnce(new Error('Upload unavailable'));
+    render(<EditProfileScreen />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'profile.avatar.upload' }));
+    await waitFor(() => {
+      expect(screen.getByTestId('avatar').getAttribute('data-uri')).toBe('file://compressed-avatar.jpg');
+    });
+    fireEvent.change(screen.getByLabelText('profile.displayName.label'), { target: { value: ' Alex Sender ' } });
+    const save = saveAction();
+    act(() => {
+      save.onPress();
+      save.onPress();
+    });
+
+    await waitFor(() => {
+      expect(mutateAsyncMock).toHaveBeenCalledExactlyOnceWith({ displayName: 'Alex Sender' });
+      expect(showToastMock.mock.calls).toEqual([['profile.avatarUploadFailed', 'warning']]);
+      expect(saveAction().loading).toBe(false);
+    });
+    expect(uploadAvatarMock).toHaveBeenCalledOnce();
+    expect(routerBackMock).not.toHaveBeenCalled();
+    expect((screen.getByLabelText('profile.displayName.label') as HTMLInputElement).value).toBe(' Alex Sender ');
+    expect(screen.getByTestId('avatar').getAttribute('data-uri')).toBe('file://compressed-avatar.jpg');
+    expect(saveAction().disabled).toBe(false);
+  });
+
+  it('keeps an avatar-only failure retryable when the profile has no name', async () => {
+    uploadAvatarMock.mockRejectedValueOnce(new Error('Upload unavailable'));
+    render(<EditProfileScreen />);
+
+    fireEvent.click(screen.getByRole('button', { name: 'profile.avatar.upload' }));
+    await waitFor(() => expect(saveAction().disabled).toBe(false));
+    act(() => saveAction().onPress());
+
+    await waitFor(() => {
+      expect(showToastMock.mock.calls).toEqual([['profile.avatarUploadFailed', 'warning']]);
+      expect(saveAction().loading).toBe(false);
+    });
+    expect(mutateAsyncMock).not.toHaveBeenCalled();
+    expect(routerBackMock).not.toHaveBeenCalled();
+    expect(saveAction().disabled).toBe(false);
+  });
+
+  // The system picker hands back only the chosen photo and needs no permission
+  // (#5957). Asking first put a whole-library prompt in front of the picker.
+  it('opens the avatar picker without asking for photo library access', async () => {
+    render(createElement(EditProfileScreen));
+
+    fireEvent.click(screen.getByRole('button', { name: 'profile.avatar.upload' }));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('avatar').getAttribute('data-uri')).toBe('file://compressed-avatar.jpg');
+    });
+    expect(launchImageLibraryMock).toHaveBeenCalledWith(expect.objectContaining({ allowsEditing: true }));
+    expect(requestMediaLibraryPermissionsMock).not.toHaveBeenCalled();
+    expect(showToastMock).not.toHaveBeenCalled();
   });
 });

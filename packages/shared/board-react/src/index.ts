@@ -24,6 +24,7 @@ export {
   fetchedLogbookClimbUuidsQueryKey,
   logbookQueryKey,
   logbookClimbAngleKey,
+  withTickRevisions,
 } from './logbook-keys';
 export type { LogbookEntry, LogbookSourceTick, TickStatus } from './logbook-keys';
 
@@ -54,7 +55,7 @@ export type {
   CanonicalClimbStats,
   SettledOfflineTickAscent,
 } from './climb-stats-store';
-export { useUpdateTick, useDeleteTick } from './use-mutate-tick';
+export { useUpdateTick, useDeleteTick, invalidateTickDependents } from './use-mutate-tick';
 export { useSaveClimb, useUpdateClimb } from './use-save-climb';
 
 export {
@@ -68,3 +69,5 @@ export {
   BoardContext,
 } from './board-provider';
 export type { BoardContextType, BoardActionsContextType, BoardLogbookContextType } from './board-provider';
+
+export * from './use-gym-grade-comparison';

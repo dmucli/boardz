@@ -12,6 +12,8 @@ export type DraftStatusTone = 'muted' | 'warning' | 'error';
 export type DraftStatusView = {
   text: string;
   tone: DraftStatusTone;
+  /** This line reassures the setter that the current copy is saved. */
+  savedReassurance?: boolean;
   /**
    * Whether entering this state is worth speaking to assistive tech. True only
    * for the states that change the ANSWER to "is my work safe?" — never for the
@@ -19,6 +21,15 @@ export type DraftStatusView = {
    * The row's live region is `none`; this drives a rate-limited announcement.
    */
   announce: boolean;
+  /**
+   * True for a warning that only says what a PUBLISH still needs (a start and a
+   * finish). It describes ordinary work in progress rather
+   * than something that went wrong, so it gives its line box up to the hold
+   * heatmap's legend while the heat is on. On a spray wall, where Save publishes
+   * by default, it is up from the first hold until the climb is
+   * complete — which is exactly when the heatmap is in use.
+   */
+  yieldsToHeatmap?: boolean;
 };
 
 export type DraftStatusState = {
@@ -27,6 +38,7 @@ export type DraftStatusState = {
   /** False on signed-out expo-web, where nothing is written at all. */
   localPersistenceAvailable: boolean;
   hasSavedClimb: boolean;
+  waitingToSync?: boolean;
   /** Edited since the last successful explicit save. */
   hasUnsavedEdits: boolean;
   /** The last explicit save was rejected for a non-duplicate reason. */
@@ -34,12 +46,19 @@ export type DraftStatusState = {
   /** Publishing is selected but the climb has no start or no finish hold. */
   publishBlocked: boolean;
   /**
-   * The publish is blocked by the missing SETTER GRADE rather than by the holds
-   * (a spray wall, which has no crowd grade to fall back on). Separate because a
-   * line that says "add a start and a finish" to somebody who has both is worse
-   * than no line at all.
+   * Where the "Save as draft" switch sits. Decides only the wording of the two
+   * "it is saved" lines: with the switch off, calling a climb a draft is wrong —
+   * and on a spray wall it is off from the start. Absent reads as a draft, which
+   * is what every caller meant before the switch had a second default.
    */
-  publishBlockedByGrade?: boolean;
+  isDraft?: boolean;
+  /**
+   * Signed out. The header's Save still reads "Save" (its full "Sign in to
+   * save" doesn't fit beside the name), so this line says what the tap does.
+   */
+  signedOut?: boolean;
+  /** No holds painted, so Save is disabled; this line says why. */
+  noHolds?: boolean;
 };
 
 /**
@@ -52,7 +71,15 @@ export type DraftStatusState = {
  * line simply keeps whatever it said before the press, which stays true.
  */
 export function deriveDraftStatusView(state: DraftStatusState, t: TranslateDraftStatus): DraftStatusView | null {
-  if (!state.hasContent) return null;
+  // An empty editor has no work to report on, only the two things the header's
+  // Save is waiting for. Neither is announced: both are up from the first frame.
+  if (!state.hasContent) {
+    if (state.signedOut) {
+      return { text: t('mobile.create.save.login'), tone: 'muted', announce: false, yieldsToHeatmap: true };
+    }
+    if (state.noHolds) return { text: t('mobile.create.save.needsHold'), tone: 'muted', announce: false };
+    return null;
+  }
 
   // Storage truth first: on signed-out expo-web every write is dropped, so no
   // other branch is allowed to claim the work is kept anywhere.
@@ -71,17 +98,59 @@ export function deriveDraftStatusView(state: DraftStatusState, t: TranslateDraft
   // this line is what names the missing requirement.
   if (state.publishBlocked) {
     return {
-      text: state.publishBlockedByGrade ? t('mobile.create.publish.gradeBlocked') : t('mobile.create.publish.blocked'),
+      text: t('mobile.create.publish.blocked'),
       tone: 'warning',
+      announce: true,
+      yieldsToHeatmap: true,
+    };
+  }
+
+  // Save is disabled with no holds; a name or description alone can't be saved.
+  if (state.noHolds) {
+    return { text: t('mobile.create.save.needsHold'), tone: 'muted', announce: false, yieldsToHeatmap: true };
+  }
+
+  // Signed out, the header's Save goes to sign-in. Said here, in muted tone,
+  // in place of the on-device line: the draft is kept on the phone either way,
+  // and the close button's hint already says so.
+  // Gives its box to the heat line: signed out is a standing state, not news.
+  if (state.signedOut) {
+    return { text: t('mobile.create.save.login'), tone: 'muted', announce: false, yieldsToHeatmap: true };
+  }
+
+  const savingAsDraft = state.isDraft ?? true;
+
+  if (state.hasSavedClimb) {
+    if (state.waitingToSync)
+      return { text: t('mobile.create.autosave.waitingToSync'), tone: 'muted', savedReassurance: true, announce: true };
+    if (state.hasUnsavedEdits) {
+      return {
+        text: t('mobile.create.autosave.unsyncedEdits'),
+        tone: 'muted',
+        savedReassurance: true,
+        announce: false,
+      };
+    }
+    return {
+      text: savingAsDraft ? t('mobile.create.autosave.inAccount') : t('mobile.create.autosave.inAccountPublish'),
+      tone: 'muted',
+      savedReassurance: true,
       announce: true,
     };
   }
 
-  if (state.hasSavedClimb) {
-    return state.hasUnsavedEdits
-      ? { text: t('mobile.create.autosave.unsyncedEdits'), tone: 'muted', announce: false }
-      : { text: t('mobile.create.autosave.inAccount'), tone: 'muted', announce: true };
-  }
+  return {
+    text: savingAsDraft ? t('mobile.create.autosave.onDevice') : t('mobile.create.autosave.onDevicePublish'),
+    tone: 'muted',
+    savedReassurance: true,
+    announce: false,
+  };
+}
 
-  return { text: t('mobile.create.autosave.onDevice'), tone: 'muted', announce: false };
+/** The failed hold-editor checkpoint already explains that the latest work is not durable. */
+export function draftStatusWithHoldEditorFailure(
+  draftStatus: DraftStatusView | null,
+  failed: boolean,
+): DraftStatusView | null {
+  return failed && draftStatus?.savedReassurance === true ? null : draftStatus;
 }

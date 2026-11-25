@@ -7,6 +7,9 @@ export type Tick = {
   userId: string;
   boardType: string;
   climbUuid: string;
+  // `boardsesh_ticks.climb_revision`, as stored. Retired: null on every import
+  // and on every tick saved since the server stopped recording it.
+  climbRevision?: number | null;
   angle: number;
   isMirror: boolean;
   status: TickStatus;
@@ -19,7 +22,7 @@ export type Tick = {
   // mutation responses don't compute it.
   effectiveQuality?: number | null;
   // Raw user grade override; null means "use the climb's consensus grade".
-  // See docs/ascents-and-attempts.md.
+  // See docs/data/ascents-and-attempts.md.
   difficulty: number | null;
   // COALESCE(difficulty, ROUND(consensus_difficulty)) — what charts, leaderboards,
   // and grade-range filters should bucket on. Null when neither the user nor
@@ -55,10 +58,20 @@ export type Tick = {
   commentCount?: number | null;
 };
 
+export type TickReportingTimeInput = {
+  precision: 'instant' | 'day';
+  date?: string | null;
+  timeZone?: string | null;
+};
+
 export type SaveTickInput = {
+  privacy?: { audience: 'public' | 'followers' | 'only_me'; privacyRevision: number };
   uuid?: string;
   boardType: string;
   climbUuid: string;
+  // Accepted and ignored: climb revisions were retired. Older app bundles and
+  // queued offline sends still carry it, and no integer sent here fails the tick.
+  climbRevision?: number | null;
   angle: number;
   isMirror: boolean;
   status: TickStatus;
@@ -68,6 +81,7 @@ export type SaveTickInput = {
   isBenchmark: boolean;
   comment: string;
   climbedAt: string;
+  reportingTime?: TickReportingTimeInput | null;
   sessionId?: string;
   layoutId?: number;
   sizeId?: number;
@@ -91,6 +105,7 @@ export type GetTicksInput = {
 };
 
 export type AttachBetaLinkInput = {
+  privacy?: { audience: 'public' | 'followers' | 'only_me'; privacyRevision: number };
   boardType: string;
   climbUuid: string;
   link: string;

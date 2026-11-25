@@ -3,6 +3,10 @@ export const queriesTypeDefs = /* GraphQL */ `
   Root query type for all read operations.
   """
   type Query {
+    cncComputation(id: ID!): CncComputation
+
+    "Compatible saved and recent physical boards for a tick owned by the viewer."
+    tickBoardOptions(tickUuid: ID!, limit: Int, offset: Int): TickBoardOptions!
     """
     Get details of a specific session by ID.
     Returns null if session doesn't exist.
@@ -39,11 +43,16 @@ export const queriesTypeDefs = /* GraphQL */ `
 
     """
     Sessions climbing right now on one board. Same access rule as
-    \`boardHistory\`: anonymous callers only reach public and system-shared
-    boards and only see public sessions; followed-climber reasons need
-    authentication.
+    \`boardHistory\`. The board id alone is the no-link reading (ids can be
+    counted); pass \`boardUuid\` to open an Unlisted board and to have it named
+    on its sessions. Anonymous callers only see public sessions;
+    followed-climber reasons need authentication.
     """
-    boardLiveSessions(boardId: Int!): [LiveSession!]!
+    boardLiveSessions(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+    ): [LiveSession!]!
 
     """
     Get a session summary (stats, grade distribution, participants).
@@ -108,7 +117,7 @@ export const queriesTypeDefs = /* GraphQL */ `
     matching separately — see findExactDuplicateMatch.
     Admins get the live query. Everyone else reads the nightly precomputed
     index (top 25 per climb at 0.5 and above), and a frames-only lookup
-    (no climbUuid) is admin-only. See docs/similar-climbs.md.
+    (no climbUuid) is admin-only. See docs/data/similar-climbs.md.
     """
     similarClimbs(input: SimilarClimbsInput!): [SimilarClimb!]!
 
@@ -122,7 +131,15 @@ export const queriesTypeDefs = /* GraphQL */ `
     """
     Get a single climb by its UUID.
     """
-    climb(boardName: String!, layoutId: Int!, sizeId: Int!, setIds: String!, angle: Int!, climbUuid: ID!): Climb
+    climb(
+      boardName: String!
+      layoutId: Int!
+      sizeId: Int!
+      setIds: String!
+      angle: Int!
+      climbUuid: ID!
+      sprayWallUuid: String
+    ): Climb
 
     """
     Setter usernames with climb counts for the given board, optionally filtered by username substring.
@@ -172,6 +189,13 @@ export const queriesTypeDefs = /* GraphQL */ `
     # ============================================
     # User Management Queries (require auth)
     # ============================================
+
+    """
+    Immutable identity admitted from this request's presented credential.
+    Returns UNAUTHENTICATED when the credential cannot authorize the request.
+    Authority failures return SERVICE_UNAVAILABLE instead of an identity.
+    """
+    authenticatedUserId: ID!
 
     """
     Get the currently authenticated user's profile.
@@ -254,6 +278,12 @@ export const queriesTypeDefs = /* GraphQL */ `
     userAscentsFeed(userId: ID!, input: AscentFeedInput): AscentFeedResult!
 
     """
+    Setters of the climbs a user has logged, most-logged first. Uses the same
+    visibility rules as userAscentsFeed. Powers the logbook setter filter.
+    """
+    userLoggedSetters(userId: ID!, input: UserLoggedSettersInput): [LoggedSetter!]!
+
+    """
     Suggest the user's logged ascents that a shared reel caption is about, by
     matching the caption against their whole logbook's climb names. Returns full
     ascent rows (with board art) for the matched climbs, strongest match first.
@@ -320,6 +350,15 @@ export const queriesTypeDefs = /* GraphQL */ `
     """
     playlistClimbs(input: GetPlaylistClimbsInput!): PlaylistClimbsResult!
 
+    """
+    Setters of the climbs in a playlist, or a logbook smart list, that the viewer
+    can see: the same climbs as playlistClimbs or smartPlaylist without a view.
+    Most climbs first, then by username. Capped at the 200 with the most climbs,
+    with no sign that the list was cut; search by username prefix reaches the
+    rest. Powers the setter picker in a playlist's filter sheet.
+    """
+    playlistSetters(input: PlaylistSettersInput!): [PlaylistSetter!]!
+
     # ============================================
     # Playlist Discovery Queries (no auth required)
     # ============================================
@@ -358,6 +397,15 @@ export const queriesTypeDefs = /* GraphQL */ `
 
     # Get current user's registered controllers
     myControllers: [ControllerInfo!]!
+    "Read a gym's device configuration using a registered gym owner/admin's controller API key."
+    controllerGymManifest(gymRef: String!): ControllerGymManifest!
+    """
+    The boards the controller API key's owner owns (home boards and spray walls,
+    deleted and archived ones left out), so a wall device can let its owner pick
+    one. Requires a WebSocket connected with \`connectionParams.controllerApiKey\`;
+    without one it fails UNAUTHENTICATED, signed in or not.
+    """
+    controllerBoards: [ControllerBoard!]!
 
     # ============================================
     # Social / Follow Queries
@@ -426,10 +474,18 @@ export const queriesTypeDefs = /* GraphQL */ `
       @deprecated(reason: "Use activityFeed query instead")
 
     """
-    Get ticks from followed users for a specific climb.
-    Requires authentication.
+    Logs from followed users on a specific climb: the 100 newest, plus
+    counts that cover all of them. A spray climb the caller cannot see
+    answers like a climb nobody logged. Requires authentication.
     """
     followingClimbAscents(input: FollowingClimbAscentsInput!): FollowingClimbAscentsResult!
+
+    """
+    Everyone's logs on a specific climb, one page at a time. Public. Newest
+    first. A spray climb the caller cannot see answers like a climb nobody
+    logged.
+    """
+    climbLogs(input: ClimbLogsInput!): ClimbLogsResult!
 
     """
     Get global activity feed of all recent ascents.
@@ -472,44 +528,79 @@ export const queriesTypeDefs = /* GraphQL */ `
 
     """
     Backfill the recent "now on the wall" history for a board (last ~50, 1
-    week window (BOARD_HISTORY_TTL)) from the Redis FIFO. Used by late joiners
+    week window, checked against server time) from the Redis FIFO. Used by late joiners
     before the live \`boardNowPlaying\` subscription takes over.
     """
-    boardRecentClimbs(boardId: Int!): [BoardPresenceClimb!]!
-    "Merged native and imported recent displays, used to infer the current climb by display time."
-    boardRecentHistory(boardId: Int!): [BoardPresenceClimb!]!
-    "Chronological durable history with an opaque, board-scoped pagination cursor."
-    boardHistoryPage(boardId: Int!, limit: Int, before: String): BoardHistoryPage!
+    boardRecentClimbs(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+    ): [BoardPresenceClimb!]!
+    "Merged native and imported displays from the last seven days, used to infer the current climb by display time."
+    boardRecentHistory(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+      "Opt in to Aurora history; older clients only understand native and Kilter displays."
+      includeAurora: Boolean = false
+    ): [BoardPresenceClimb!]!
+    "Public catalog grades for up to 50 climbs on this wall, at the viewer's selected angle."
+    boardPresenceClimbGrades(boardId: Int!, boardUuid: ID, angle: Int!, climbUuids: [ID!]!): [BoardPresenceClimbGrade!]!
+    "Last seven days of chronological display history with an opaque, board-scoped cursor. Expired cursors return an empty final page."
+    boardHistoryPage(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+      limit: Int
+      before: String
+      "Opt in to Aurora history; older clients only understand native and Kilter displays."
+      includeAurora: Boolean = false
+    ): BoardHistoryPage!
 
     """
-    Durable history of what was pushed to a board (survives past the 1 week
-    Redis window (BOARD_HISTORY_TTL)), newest-first by \`seq\`. For keyset
+    Last seven days of native displays pushed to a board, newest-first by \`seq\`. For keyset
     paging pass the \`seq\` of the last item from the previous page as
     \`before\` (not \`sentAt\`) — \`seq\` is unique and monotonic per board, so
     paging never repeats or skips even when several sends share a \`sentAt\`
     second. A non-integer \`before\` is rejected with BAD_USER_INPUT. \`limit\`
-    is capped at 100. This is the lasting "what was on the wall" record;
-    \`boardRecentClimbs\` is the hot 1 week cache. Anonymous access is allowed
-    for public and system-shared boards; private boards are masked as
-    NOT_FOUND for anonymous callers.
+    is capped at 100. The rolling server-time window applies before pagination;
+    older rows remain stored but cannot be paged through here. Access follows the board's
+    policy: the board id alone is the no-link reading, \`boardUuid\` adds the
+    link. A board the caller may not read is masked as NOT_FOUND.
     """
-    boardHistory(boardId: Int!, limit: Int, before: String): [BoardPresenceClimb!]!
+    boardHistory(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+      limit: Int
+      before: String
+    ): [BoardPresenceClimb!]!
 
     """
     The five most recent distinct climbers to send or flash a climb at the
     displayed angle on this physical board, newest sender first. Canonical and
-    aliased climb UUIDs share one sender list. Anonymous access is allowed for
-    public and system-shared boards; private boards are masked as NOT_FOUND.
+    aliased climb UUIDs share one sender list. Same board access rule as
+    \`boardHistory\`; a board the caller may not read is masked as NOT_FOUND.
     """
-    boardClimbRecentSenders(boardId: Int!, climbUuid: String!, angle: Int!): [BoardClimbRecentSender!]!
+    boardClimbRecentSenders(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+      climbUuid: String!
+      angle: Int!
+    ): [BoardClimbRecentSender!]!
 
     """
     Lightweight stats for a board's wall feed — durable counts derived from
     \`boardsesh_ticks\` stamped with this board_id, plus the live window.
-    Anonymous access is allowed for public and system-shared boards; private
-    boards are masked as NOT_FOUND for anonymous callers.
+    Same board access rule as \`boardHistory\`; a board the caller may not
+    read is masked as NOT_FOUND.
     """
-    boardPresenceStats(boardId: Int!): BoardPresenceStats!
+    boardPresenceStats(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+    ): BoardPresenceStats!
 
     """
     The board's current connection holder — who's connected and writing right now
@@ -518,16 +609,21 @@ export const queriesTypeDefs = /* GraphQL */ `
     \`BoardConnectionChanged\` stream warms up. Anonymous holders carry null
     user/name/avatar (clients render a "?").
     """
-    boardConnection(boardId: Int!): BoardConnectionHolder
+    boardConnection(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+    ): BoardConnectionHolder
 
     """
     Redacted "Up next" snapshot of the party-session queue bound to a shared
-    board, for anonymous public displays (gym kiosks). Auth-optional; for
-    anonymous viewers a private board reads as NOT_FOUND (same existence
-    hiding as \`boardNowPlaying\`).
+    board, for anonymous public displays (gym kiosks). Auth-optional; a board
+    the caller may not read is NOT_FOUND (same existence hiding as
+    \`boardNowPlaying\`, including the \`boardUuid\` rule).
 
     Double privacy gate — returns null unless BOTH hold:
-    1. the board is anonymously readable (public / system-shared), and
+    1. the board is readable by a signed-out holder of its link (Public or
+       Unlisted, or system-shared), and
     2. the bound session is \`isPublic: true\` and still active.
 
     Gate 2 deliberately widens \`board_sessions.is_public\` from "appears in
@@ -541,7 +637,11 @@ export const queriesTypeDefs = /* GraphQL */ `
     null outright, never another session's queue. Items are redacted to
     climb-catalog fields only — never who added or ticked them.
     """
-    boardQueuePreview(boardId: Int!): BoardQueuePreview
+    boardQueuePreview(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+    ): BoardQueuePreview
 
     """
     Get the current user's new climb subscriptions.
@@ -560,8 +660,13 @@ export const queriesTypeDefs = /* GraphQL */ `
 
     """
     Get a board by slug (for URL routing).
+
+    wallUuid is a spray wall's share-link capability (the ?wall= param). When it
+    matches the uuid of the wall the slug resolved to, an UNLISTED wall opens for
+    any caller, the same as sprayWall(uuid). It never opens a private or
+    admin-hidden wall, a mismatch is ignored, and it does nothing on other boards.
     """
-    boardBySlug(slug: String!): UserBoard
+    boardBySlug(slug: String!, wallUuid: ID): UserBoard
 
     """
     Look up boards by controller serial numbers.
@@ -576,6 +681,8 @@ export const queriesTypeDefs = /* GraphQL */ `
     backward compatibility with already-shipped clients.
     """
     boardsBySerialNumbers(serialNumbers: [String!]!, boardType: String): [UserBoard!]!
+    "Correlate radio-observed serials with readable candidates without exposing stored owner-only serial fields."
+    observedBoardSerialMatches(input: [ObservedBoardSerialInput!]!): [ObservedBoardSerialMatch!]!
 
     """
     Recorded board configurations for the current user keyed by controller serial.
@@ -594,6 +701,18 @@ export const queriesTypeDefs = /* GraphQL */ `
     Search public boards.
     """
     searchBoards(input: SearchBoardsInput!): UserBoardConnection!
+
+    """
+    Find published, listed public spray walls using anonymous visibility, including for signed-in callers.
+    Supports text, exact angles, proximity and pagination; catalogue selectors are ignored.
+    Limited to 50 results per request and 300 requests per minute per caller.
+    """
+    publicSprayWalls(input: SearchBoardsInput!): UserBoardConnection!
+
+    "Search all active registered boards, including private boards. Global admins only."
+    adminBoards(input: AdminBoardsInput!): AdminBoardConnection!
+    "Stored editable metadata for one active board. Global admins only."
+    adminBoard(boardUuid: ID!): AdminBoard
 
     "Public physical boards ranked by distinct climbers before limiting; optionally within one public gym."
     boardDiscovery(input: BoardDiscoveryInput): [BoardDiscoveryBoard!]!
@@ -645,8 +764,12 @@ export const queriesTypeDefs = /* GraphQL */ `
     Search public gyms.
     """
     searchGyms(input: SearchGymsInput!): GymConnection!
+    "Canonical public venues for sitemap publication. Fails rather than truncating when the sitemap budget is exceeded."
+    publicGymSitemap: [GymSitemapEntry!]!
     "City/town suggestions; query must contain 3–80 characters. At most five results."
     searchPlaces(query: String!): [PlaceSuggestion!]!
+    "Explicit address search for a map pin. Authentication required; 5–500 characters; no autocomplete."
+    lookupGymAddressCoordinates(address: String!): GymAddressCoordinates
 
     """
     Live gyms that resemble one the user is about to create, so they can view or
@@ -676,6 +799,16 @@ export const queriesTypeDefs = /* GraphQL */ `
     gymBoards(gymUuid: ID!): [UserBoard!]!
 
     """
+    Walls that may already be the one a climber is about to add at a gym (#8151):
+    boards of the given type on the gym, on listings merged into it, and on
+    public, listed gyms within 150 m (at most 10). Only walls the caller can see
+    are returned or counted: their own, and public listed boards. A private gym
+    the caller can't edit throws NOT_FOUND. Auth-optional and rate-limited. A
+    failed lookup throws; it never answers with an empty list.
+    """
+    existingWallCandidates(input: ExistingWallCandidatesInput!): ExistingWallCandidates!
+
+    """
     Boards that probably belong to a gym but aren't linked to it yet, for the
     gym's Boards tab. Requires edit access to the gym. Returns two kinds of
     candidate: boards on a listing whose merged_into chain resolves to this gym
@@ -691,12 +824,25 @@ export const queriesTypeDefs = /* GraphQL */ `
     pendingGymClaims(input: PendingGymClaimsInput): GymClaimConnection!
 
     """
+    Claims that approved themselves (admin only), newest first: approved ones
+    an admin can revert with revertGymClaim, and ones already reverted.
+    """
+    autoApprovedGymClaims(input: AutoApprovedGymClaimsInput): GymClaimConnection!
+
+    """
     List submitted app feedback (bug reports + ratings) for the admin feedback
     dashboard, enriched with the reporter's identity and triage state. Admin
     only. Supports filtering by type/status/platform and free-text search over
     the comment, with offset pagination.
     """
+    myAppBugReports(input: AppBugReportsInput): AppBugReportConnection!
+    appBugReport(id: ID!): AppBugReport
+    appBugReportMessages(input: AppBugReportMessagesInput!): AppBugReportMessageConnection!
     adminAppFeedback(input: AdminAppFeedbackInput): AdminAppFeedbackResult!
+    "Current release context. Available without signing in."
+    mobileReleaseStatus(input: MobileReleaseStatusInput!): ReleaseContext!
+    "Stored report release diagnostics; empty for callers without an admin role on this board."
+    proposalReportReleaseContexts(proposalUuid: ID!): [ProposalReportReleaseContext!]!
 
     """
     Crowdsourced QA: the open pull requests among \`prNumbers\` (the tester's
@@ -719,6 +865,9 @@ export const queriesTypeDefs = /* GraphQL */ `
     bounded to the gym's linked boards and the time window.
     """
     gymStats(input: GymStatsInput!): GymStats!
+    "Compare current inventory and attributable sends. Requires live gym staff access."
+    gymGradeComparison(input: GymStatsInput!): GymGradeComparison!
+    gymGradeCollectionOptions(input: GymGradeCollectionOptionsInput!): GymGradeCollectionPage!
 
     """
     Candidate duplicate-gym clusters for the /admin/gym-duplicates review queue
@@ -773,7 +922,7 @@ export const queriesTypeDefs = /* GraphQL */ `
     The spray wall occupying a catalogue layout id, for a client holding only a
     board config. Same visibility rules as \`sprayWall\`.
     """
-    sprayWallByLayout(layoutId: Int!): SprayWall
+    sprayWallByLayout(layoutId: Int!, sprayWallUuid: String): SprayWall
 
     """
     Everything needed to render a wall at one version: the photo, the homography
@@ -783,6 +932,37 @@ export const queriesTypeDefs = /* GraphQL */ `
     as is a wall with nothing published yet.
     """
     sprayWallRenderData(uuid: ID!, version: Int): SprayWallRenderData
+
+    """
+    A spray wall's LED setup, for lighting it from this phone. Anyone who can read
+    the wall gets it, with the same rules as \`sprayWall\`; null when the wall does
+    not exist, is deleted, or this viewer may not see it. \`setup\` is null when the
+    wall has no saved setup yet.
+    """
+    sprayWallLedSetup(boardUuid: ID!): SprayWallLedSetupView
+
+    """
+    The generated wall looks of one version (\`wall-crop\`, \`hold-cutouts\`) and
+    its photo-quality verdict. Omit \`version\` for the published one. Same
+    visibility rules as \`sprayWallRenderData\`; null where that is null.
+    """
+    sprayWallArt(uuid: ID!, version: Int): SprayWallArt
+
+    """
+    How many climbs set on this wall use each of the given holds, for the hold
+    editor to ask before it removes (or moves) one that published climbs use.
+    One row per distinct requested hold, zeros included. Hidden climbs and
+    climbs a full reset retired are not counted. Same gate as editing the
+    wall's holds; refused on an archived wall. At most 500 holds per call.
+    """
+    sprayWallHoldUsage(wallUuid: ID!, holdIds: [Int!]!): [SprayWallHoldUsage!]!
+
+    """
+    Distinct published and draft climbs that use any of the given holds. A climb
+    using several requested holds counts once. Same editing and archive gates
+    as sprayWallHoldUsage. Accepts up to the wall's 1500 holds in one call.
+    """
+    sprayWallHoldUsageSummary(wallUuid: ID!, holdIds: [Int!]!): SprayWallHoldUsageSummary!
 
     "Every wall the caller owns, newest first. Includes walls with no published version."
     mySprayWalls: [SprayWall!]!
@@ -804,6 +984,9 @@ export const queriesTypeDefs = /* GraphQL */ `
     at all. Editor only, since a proposal describes an unpublished draft.
     """
     proposeSprayWallReset(input: ProposeSprayWallResetInput!): SprayWallResetProposal
+      @deprecated(
+        reason: "In-place resets were retired. Always refuses with SPRAY_WALL_RESET_RETIRED; use resetSprayWall."
+      )
 
     """
     A remix starting point: a climb on a spray wall with every hold it has since
@@ -821,6 +1004,7 @@ export const queriesTypeDefs = /* GraphQL */ `
     2026-09-14): a climb that lost three holds is exactly the one worth remixing.
     """
     remixClimb(parentUuid: ID!, sprayWallUuid: ID): SprayRemixSeed
+      @deprecated(reason: "Remix after a reset was retired. Always null.")
 
     """
     Every spray wall attached to a gym that the caller may see, by wall name.
@@ -953,6 +1137,12 @@ export const queriesTypeDefs = /* GraphQL */ `
     """
     bulkVoteSummaries(input: BulkVoteSummaryInput!): [VoteSummary!]!
 
+    """
+    Retired: climb edits are no longer recorded as revisions. Always empty.
+    """
+    climbRevisions(boardType: String!, climbUuid: String!): [ClimbRevision!]!
+      @deprecated(reason: "Climb revision history was retired. Always empty.")
+
     # ============================================
     # Beta Link Queries
     # ============================================
@@ -1009,7 +1199,7 @@ export const queriesTypeDefs = /* GraphQL */ `
     # Incremental pull with a composite (updatedAt, syncSeq) cursor. Each returns
     # snake_case JSON documents (keys = mobile local columns). User-data queries
     # are scoped to the authenticated user; board-data queries are scoped by
-    # boardType. See docs/sync-table-manifest.md.
+    # boardType. See docs/data/sync-table-manifest.md.
 
     "Pull the authenticated user's ticks changed since the cursor."
     syncTicks(cursor: SyncCursorInput, limit: Int! = 500): SyncResult!
@@ -1032,12 +1222,24 @@ export const queriesTypeDefs = /* GraphQL */ `
     "Pull the authenticated user's playlist-follows changed since the cursor."
     syncPlaylistFollows(cursor: SyncCursorInput, limit: Int! = 500): SyncResult!
 
+    "Read a saved climb immediately: own drafts or published spray climbs on accessible walls."
+    syncClimbDocuments(boardType: String!, layoutId: Int!, climbUuid: ID!, sprayWallUuid: ID): SyncClimbDocuments
+
     """
     Pull board climbs for a board type, changed since the cursor (reference data).
     Optional layoutId/sizeId narrow the pull to a single layout/size (all sets) so a
     downloaded board stays a fixed, cacheable superset. sizeId is ignored for moonboard.
     """
-    syncClimbs(boardType: String!, layoutId: Int, sizeId: Int, cursor: SyncCursorInput, limit: Int! = 500): SyncResult!
+    syncClimbs(
+      boardType: String!
+      layoutId: Int
+      sizeId: Int
+      sprayWallUuid: String
+      cursor: SyncCursorInput
+      limit: Int! = 500
+      audience: SyncAudience = ALL
+      snapshotClimbWatermark: SyncCursorInput
+    ): SyncResult!
 
     """
     Pull board climb stats for a board type, changed since the cursor (reference data).
@@ -1047,8 +1249,11 @@ export const queriesTypeDefs = /* GraphQL */ `
       boardType: String!
       layoutId: Int
       sizeId: Int
+      sprayWallUuid: String
       cursor: SyncCursorInput
       limit: Int! = 500
+      audience: SyncAudience = ALL
+      snapshotClimbWatermark: SyncCursorInput
     ): SyncResult!
 
     """
@@ -1059,8 +1264,11 @@ export const queriesTypeDefs = /* GraphQL */ `
       boardType: String!
       layoutId: Int
       sizeId: Int
+      sprayWallUuid: String
       cursor: SyncCursorInput
       limit: Int! = 500
+      audience: SyncAudience = ALL
+      snapshotClimbWatermark: SyncCursorInput
     ): SyncResult!
 
     """
@@ -1082,11 +1290,58 @@ export const queriesTypeDefs = /* GraphQL */ `
       boardType: String!
       layoutId: Int
       sizeId: Int
+      sprayWallUuid: String
       cursor: SyncCursorInput
       limit: Int! = 500
     ): SyncResult!
 
     "Pull hard deletions (user-scoped + reference data) since the cursor."
     syncDeletions(cursor: SyncCursorInput, limit: Int! = 500): SyncDeletionsResult!
+
+    # ============================================
+    # CNC build packs
+    # ============================================
+
+    """
+    Everything Boardsesh sells a CNC build pack for, with prices and the
+    manufacturing choices each wall allows. Public: the configurator renders
+    this before anyone signs in.
+    """
+    cncCatalog: CncCatalog!
+
+    """
+    Panel layout for a configuration: panels, seams, keep-outs and a BOM
+    preview, straight from the pack generator. Public, rate-limited, and
+    validated against the catalogue before the generator is touched.
+
+    Set \`includeHoles\` to draw the drill pattern; it adds roughly 40 KB of
+    hole positions and is left off for a plain panel outline. Requesting the
+    hole list requires a signed-in user and is held to a tighter rate limit
+    than the hole-free preview. Hold ids and set-screw angles are never
+    returned.
+    """
+    cncLayout(config: CncBoardConfigInput!, includeHoles: Boolean): JSON!
+
+    "The signed-in buyer's own orders, newest first. Requires authentication."
+    myCncOrders: [CncOrder!]!
+
+    """
+    One order by its licence id. Returns null for a licence that does not
+    exist and for one belonging to someone else — a licence id identifies an
+    order, it never grants access to it. Requires authentication.
+    """
+    cncOrder(licenceId: String!): CncOrder
+
+    """
+    Every buyer's orders, newest first — the list behind \`/admin/build-plans\`.
+    Admin only.
+
+    Carries the three fields \`CncOrder\` withholds (licensee email, attempts,
+    the generator's real error), because those are what an operator needs to
+    answer "whose pack is this, why did it fail, and who do I write to". Filter
+    with \`status\` to work one bucket at a time; \`limit\` defaults to 25 and
+    is capped at 100, and \`cursor\` comes from the previous page.
+    """
+    adminCncOrders(status: CncOrderStatus, limit: Int, cursor: String): CncOrderConnection!
   }
 `;

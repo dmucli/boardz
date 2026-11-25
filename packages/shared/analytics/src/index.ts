@@ -1,8 +1,8 @@
 // @boardsesh/analytics — platform-neutral PostHog wrapper shared by web and
 // mobile. The two apps supply their own SDK client (posthog-js-lite /
-// posthog-react-native) and platform I/O (alias-dedupe storage); everything that
-// would otherwise be duplicated — the wrapper surface, prop sanitization, the
-// identity state machine, and the cross-platform event names — lives here.
+// posthog-react-native); everything that would otherwise be duplicated — the
+// wrapper surface, prop sanitization, mobile's identity state machine, and the
+// cross-platform event names — lives here.
 export type { AnalyticsCaptureOptions, AnalyticsProperties, AnalyticsPropertyValue, PostHogClient } from './client';
 export { sanitizeForPosthog } from './sanitize';
 export { sanitizeErrorForAnalytics } from './sanitize-error';
@@ -14,11 +14,27 @@ export {
 } from './create-analytics';
 export {
   reconcileAnalyticsIdentity,
-  type AliasDedupeStore,
+  type AnalyticsIdentityAction,
   type IdentityClient,
   type ReconcileAnalyticsIdentityInput,
 } from './reconcile-identity';
 export { SHARED_EVENTS, type SharedEventKey, type SharedEventName } from './events';
+export { parseAccountCreationReceipt, type AccountCreationReceipt } from './account-creation';
+// Release-watch props on BLE Picker Devices Resolved (2.7): one picker session each.
+export { blePickerSessionProps, type BlePickerSessionInput, type BlePickerSessionProps } from './ble-picker-events';
+// Props shared by more than one event, built in one place so the emitters agree.
+export {
+  ANALYTICS_BOARD_TYPES,
+  boardTypeProperty,
+  type AnalyticsBoardType,
+  type BoardTypeProperty,
+} from './board-type-property';
+export {
+  loginProviderProperties,
+  type LoginAuthMethod,
+  type LoginProvider,
+  type LoginProviderProperties,
+} from './login-provider';
 // Board render mode telemetry (issue #2202). Cross-platform (SHARED_EVENTS),
 // unlike the gym funnel below — mobile fires every one of these today.
 export {
@@ -62,23 +78,114 @@ export {
   sprayWallUploadFinished,
   sprayWallDetectionFinished,
   sprayHoldsReviewed,
-  sprayWallResetPreviewed,
-  sprayWallResetApplied,
+  sprayWallBindStalled,
+  sprayWallResetStarted,
+  sprayWallHoldsRemovedInUse,
   climbRemixedFromBroken,
   SPRAY_ROLLOUT_GATES,
   type SprayWallPayload,
   type SprayPhotoSource,
   type SprayUploadOutcome,
   type SprayDetectionOutcome,
-  type SprayRemixSurface,
+  type SprayBindStage,
+  type SprayWallBindStalledProps,
   type SprayWallPhotoPickedProps,
   type SprayWallUploadFinishedProps,
   type SprayWallDetectionFinishedProps,
   type SprayHoldsReviewedProps,
-  type SprayWallResetPreviewedProps,
-  type SprayWallResetAppliedProps,
+  type SprayResetSurface,
+  type SprayWallResetStartedProps,
+  type SprayWallHoldsRemovedInUseProps,
+  type SprayRemixSurface,
   type ClimbRemixedFromBrokenProps,
 } from './spray-wall-events';
+// The gym finders (the wizard's "Which gym?" and the gym map). Mobile only,
+// and like the spray events they name no gym, place or climber.
+export {
+  gymFinderGymPicked,
+  gymFinderAddMyGymTapped,
+  gymFinderSearchUsed,
+  gymFinderLocateTapped,
+  gymCreated,
+  type GymCreatedSurface,
+  type GymCreatedProps,
+  type GymLocationSource,
+  type GymFinderSurface,
+  type GymFinderPickSection,
+  type GymFinderSearchKind,
+  type GymFinderGymPickedProps,
+  type GymFinderSurfaceProps,
+  type GymFinderSearchUsedProps,
+} from './gym-finder-events';
+// Board QR scans (#4415). A cross-platform name, www-only call site today; the
+// `app` surface is for the app's own landing. Names no board, like the spray
+// events above.
+export {
+  boardQrScanned,
+  parseBoardQrLanding,
+  BOARD_QR_MEDIUMS,
+  type BoardQrMedium,
+  type BoardQrLanding,
+  type BoardQrSurface,
+  type BoardQrScannedInput,
+  type BoardQrScannedProps,
+  type BoardQrPayload,
+} from './board-qr-events';
+// Climb, board-list, setter and playlist QR scans: the code a public page shows
+// on a laptop. Same contract as the board scans above; names no climb, board,
+// setter or playlist.
+export {
+  climbQrScanned,
+  listQrScanned,
+  setterQrScanned,
+  playlistQrScanned,
+  homeQrScanned,
+  parseClimbQrLanding,
+  CLIMB_QR_MEDIUMS,
+  type ClimbQrMedium,
+  type ClimbQrLanding,
+  type ClimbQrSurface,
+  type ClimbQrScannedInput,
+  type ClimbQrScannedProps,
+} from './climb-qr-events';
+// Queue navigation (#6940): Next / Previous and queue-sheet opens. Mobile-only
+// call sites today; `Queue Navigation` is the name www fired before W-16.
+export {
+  queueNavigation,
+  driveModeEnded,
+  driveModeStarted,
+  type DriveModeEndReason,
+  type DriveModeStartedBy,
+  type DriveModeTakenBy,
+  type DriveModeEndedInput,
+  type DriveModeEndedProps,
+  type DriveModeStartedInput,
+  type DriveModeStartedProps,
+  queueSheetOpened,
+  upNextBucket,
+  type QueueNavigationDirection,
+  type QueueNavigationMethod,
+  type QueueNavigationSurface,
+  type QueueNavigationOutcome,
+  type QueueNavigationBoard,
+  type QueueNavigationArtState,
+  type QueueNavigationArtWait,
+  type QueueNavigationTrack,
+  type QueueNavigationFrom,
+  type QueueNavigationUpNextBucket,
+  type QueueNavigationWalk,
+  type QueueNavigationInput,
+  type QueueNavigationProps,
+  type QueueNavigationPayload,
+  type QueueSheetSurface,
+  type QueueSheetOpenedInput,
+  type QueueSheetOpenedProps,
+} from './queue-navigation-events';
+export {
+  wallControlPreviewReason,
+  type WallControlPreviewReason,
+  type WallControlPreviewReasonInput,
+} from './wall-control-events';
 export {
   buildCohortPersonProperties,
   type CohortProfileInput,
@@ -101,6 +208,8 @@ export {
   gymManageTabViewed,
   gymDirectorySearched,
   parseGymQrLanding,
+  parseQrLanding,
+  GYM_PAGE_QR_MEDIUMS,
   buildGymQrHref,
   stripGymQrParams,
   type GymFunnelEventKey,
@@ -111,6 +220,8 @@ export {
   type GymClaimSubmitMethod,
   type GymClaimResultStatus,
   type GymQrMedium,
+  type GymPageQrMedium,
+  type GymPageQrLanding,
   type GymPageCta,
   type GymManageTabName,
   type GymClaimCtaClickedInput,
@@ -123,3 +234,58 @@ export {
   type GymQrSearchParams,
   type GymQrLanding,
 } from './gym-funnel';
+// The www /support page (#2 of the Q4 support plan). www-only, like the gym
+// funnel; the app's support link is SHARED_EVENTS.SupportLinkTapped.
+export {
+  SUPPORT_EVENTS,
+  supportCtaClicked,
+  type SupportCadence,
+  type SupportCtaClickedInput,
+  type SupportCtaCurrency,
+  type SupportCtaPlacement,
+  type SupportEventName,
+  type SupportEventPayload,
+} from './support-events';
+// www-only CNC build-pack funnel (plan section B6). Out of SHARED_EVENTS for the
+// same reason as the gym funnel above: /build-plans has no mobile counterpart.
+export {
+  CNC_FUNNEL_EVENTS,
+  cncBuildPlansPageViewed,
+  cncConfiguratorChanged,
+  cncArtworkPlaced,
+  cncPreviewRequested,
+  cncCheckoutStarted,
+  type CncFunnelEventKey,
+  type CncFunnelEventName,
+  type CncFunnelPayload,
+  type CncTier,
+  type CncConfiguratorStep,
+  type CncConfigProps,
+  type CncPageViewedInput,
+  type CncConfiguratorChangedInput,
+  type CncArtworkPlacedInput,
+  type CncPreviewRequestedInput,
+  type CncCheckoutStartedInput,
+} from './cnc-funnel';
+// The `FEATURE_FLAG_OVERRIDES` syntax, read by www's server flags and by the
+// backend's developer-console check, so one env line means the same to both.
+export { FEATURE_FLAG_OVERRIDES_ENV, parseFeatureFlagOverrides } from './feature-flag-overrides';
+
+// Website journey clicks, with the same vocabulary for all public pages.
+export {
+  WEBSITE_JOURNEY_EVENTS,
+  WEBSITE_JOURNEY_PLACEMENTS,
+  webAppOpened,
+  compatibilityBoardSelected,
+  importPathChosen,
+  spraywallPathClicked,
+  navLinkClicked,
+  gymClaimPathClicked,
+  partnerContactClicked,
+  type WebsiteJourneyPlacement,
+  type WebsiteCompatibilityBoard,
+  type WebsiteImportPath,
+  type WebsiteNavArea,
+  type WebsiteNavTarget,
+  type WebsiteJourneyEvent,
+} from './website-journey-events';

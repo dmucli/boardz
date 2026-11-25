@@ -4,17 +4,20 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import postgres from 'postgres';
 import { drizzle } from 'drizzle-orm/postgres-js';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, sql } from 'drizzle-orm';
 import { PgBoss } from 'pg-boss';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runRefreshClimbGrades, runRefreshClimbNeighbors, type JobDatabase } from '@boardsesh/db/jobs';
 import {
   CLIMB_POPULARITY_REFRESH_QUEUE,
+  PARTNER_OAUTH_SWEEP_QUEUE,
+  PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE,
+  CRON_JOB_DELETE_AFTER_SECONDS,
   initializeJobQueueSchema,
   parseWorkerLogin,
   POPULAR_BOARD_CONFIGS_REFRESH_QUEUE,
 } from '@boardsesh/db/job-queue-schema';
-import { BACKGROUND_JOB_QUEUES } from '@boardsesh/db/background-jobs';
+import { BACKGROUND_JOB_QUEUES, BACKGROUND_JOB_RECONCILE_QUEUE } from '@boardsesh/db/background-jobs';
 import { createDb, type DbInstance } from '@boardsesh/db/client';
 import { auroraCredentials, backgroundJobRuns, providerSyncControls } from '@boardsesh/db/schema';
 import { retrySprayDetectionAttempt } from '@boardsesh/db/queries';
@@ -43,6 +46,9 @@ import { refreshClimbNeighborsFamily } from '../../workers/families/refresh-clim
 import { refreshHoldFeaturesFamily } from '../../workers/families/refresh-hold-features';
 import { refreshMoonboardAngleEstimatesFamily } from '../../workers/families/refresh-moonboard-angle-estimates';
 import { refreshMoonboardWideAngleEstimatesFamily } from '../../workers/families/refresh-moonboard-wide-angle-estimates';
+import { sprayWallHealthFamily } from '../../workers/families/spray-wall-health';
+import { communityMonthlyStatsFamily } from '../../workers/families/community-monthly-stats';
+import { computeCommunityMonthlyStats } from '../community-monthly-stats';
 import { refreshRecommendationsFamily } from '../../workers/families/refresh-recommendations';
 import {
   FIXTURE_PREFIX,
@@ -122,6 +128,11 @@ describe('owner-only queue initialization', () => {
       // Production's ACL reconciler removes the default PUBLIC type grant.
       await owner`REVOKE ALL ON TYPE public.spray_detection_status FROM PUBLIC`;
       await initializeJobQueueSchema(drizzle(owner), undefined, role);
+      const cronQueues = ['__pgboss__send-it', SPRAY_DETECTION_RECONCILE_QUEUE, BACKGROUND_JOB_RECONCILE_QUEUE];
+      const retention = await owner<{ name: string; deletion_seconds: number }[]>`
+        SELECT name, deletion_seconds FROM pgboss.queue WHERE name = ANY(${cronQueues}) ORDER BY name`;
+      expect(retention).toHaveLength(cronQueues.length);
+      for (const queue of retention) expect(queue.deletion_seconds).toBe(CRON_JOB_DELETE_AFTER_SECONDS);
       const [typeGrant] =
         await restricted`SELECT has_type_privilege(current_user, 'public.spray_detection_status', 'USAGE') AS permitted`;
       expect(typeGrant.permitted).toBe(true);
@@ -134,6 +145,8 @@ describe('owner-only queue initialization', () => {
       for (const queue of [
         POPULAR_BOARD_CONFIGS_REFRESH_QUEUE,
         CLIMB_POPULARITY_REFRESH_QUEUE,
+        PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE,
+        PARTNER_OAUTH_SWEEP_QUEUE,
         SPRAY_DETECTION_QUEUE,
       ]) {
         await runtime.deleteAllJobs(queue);
@@ -150,6 +163,14 @@ describe('owner-only queue initialization', () => {
       await runtime.schedule(CLIMB_POPULARITY_REFRESH_QUEUE, '23 * * * *', null, { tz: 'UTC' });
       expect(await runtime.send(CLIMB_POPULARITY_REFRESH_QUEUE, {})).toBeTruthy();
       expect(await runtime.send(CLIMB_POPULARITY_REFRESH_QUEUE, {})).toBeNull();
+      // The playlist grade summary refresh: the same contract, daily.
+      await runtime.schedule(PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE, '41 7 * * *', null, { tz: 'UTC' });
+      expect(await runtime.send(PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE, {})).toBeTruthy();
+      expect(await runtime.send(PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE, {})).toBeNull();
+      // The partner OAuth sweep: the same contract, hourly.
+      await runtime.schedule(PARTNER_OAUTH_SWEEP_QUEUE, '34 * * * *', null, { tz: 'UTC' });
+      expect(await runtime.send(PARTNER_OAUTH_SWEEP_QUEUE, {})).toBeTruthy();
+      expect(await runtime.send(PARTNER_OAUTH_SWEEP_QUEUE, {})).toBeNull();
       const id = await runtime.send(SPRAY_DETECTION_QUEUE, { detectionId: randomUUID() });
       expect(id).toBeTruthy();
       const jobs = await runtime.fetch(SPRAY_DETECTION_QUEUE);
@@ -184,6 +205,73 @@ describe('worker login entries', () => {
     expect(() => parseWorkerLogin('batch=robert"; DROP')).toThrow('Invalid job queue role');
   });
 });
+
+const COMMUNITY_RECAP_USER_ID = `${FIXTURE_PREFIX}recap-climber`;
+const COMMUNITY_RECAP_GYM_NAME = 'Recap Fixture Gym';
+const COMMUNITY_RECAP_CLIMBER_NAME = 'Recap Fixture Climber';
+
+/** One public gym board, one lit climb and one native send, this month, by a public climber with a display name. */
+async function seedCommunityRecap(ownerDatabase: JobDatabase): Promise<void> {
+  const now = new Date().toISOString();
+  await ownerDatabase.insert(dbSchema.users).values({
+    id: COMMUNITY_RECAP_USER_ID,
+    email: `${COMMUNITY_RECAP_USER_ID}@example.invalid`,
+    name: 'Recap Account Name',
+  });
+  await ownerDatabase
+    .insert(dbSchema.userProfiles)
+    .values({ userId: COMMUNITY_RECAP_USER_ID, displayName: COMMUNITY_RECAP_CLIMBER_NAME });
+  const [gym] = await ownerDatabase
+    .insert(dbSchema.gyms)
+    .values({
+      uuid: randomUUID(),
+      name: COMMUNITY_RECAP_GYM_NAME,
+      slug: 'recap-fixture-gym',
+      ownerId: COMMUNITY_RECAP_USER_ID,
+    })
+    .returning({ id: dbSchema.gyms.id });
+  const [board] = await ownerDatabase
+    .insert(dbSchema.userBoards)
+    .values({
+      uuid: randomUUID(),
+      slug: `${COMMUNITY_RECAP_USER_ID}-board`,
+      ownerId: COMMUNITY_RECAP_USER_ID,
+      boardType: 'kilter',
+      layoutId: 8,
+      sizeId: 17,
+      setIds: '1',
+      name: 'Recap fixture wall',
+      gymId: gym.id,
+    })
+    .returning({ id: dbSchema.userBoards.id });
+  await ownerDatabase.insert(dbSchema.boardClimbEvents).values({
+    boardId: board.id,
+    boardType: 'kilter',
+    climbUuid: KILTER_CLIMBS[0],
+    angle: 40,
+    userId: COMMUNITY_RECAP_USER_ID,
+    seq: 1,
+    confirmedAt: now,
+  });
+  await ownerDatabase.insert(dbSchema.boardseshTicks).values({
+    uuid: randomUUID(),
+    userId: COMMUNITY_RECAP_USER_ID,
+    boardType: 'kilter',
+    climbUuid: KILTER_CLIMBS[0],
+    angle: 40,
+    status: 'send',
+    climbedAt: now,
+    boardId: board.id,
+  });
+}
+
+/** The recap fixture's user owns its gym and board (their lighting cascades); its tick has no foreign key here. */
+async function clearCommunityRecap(ownerDatabase: JobDatabase): Promise<void> {
+  await ownerDatabase
+    .delete(dbSchema.boardseshTicks)
+    .where(eq(dbSchema.boardseshTicks.userId, COMMUNITY_RECAP_USER_ID));
+  await ownerDatabase.delete(dbSchema.users).where(eq(dbSchema.users.id, COMMUNITY_RECAP_USER_ID));
+}
 
 /**
  * The batch login's grant list, proven: every batch family runs under a role
@@ -243,6 +331,19 @@ describe('batch worker grants', () => {
       // delete fires the sync_deletions trigger.
       await refreshRecommendationsFamily.execute(context('refresh-recommendations'), {});
       await refreshRecommendationsFamily.execute(context('refresh-recommendations'), {});
+      // Each rewritten cohort playlist's grade band is recomputed with its
+      // climbs. The job only warns when that fails, so a missing grant on
+      // playlist_grade_summaries shows up here as a missing band.
+      const cohortPlaylists = await ownerDatabase
+        .select({ id: dbSchema.playlists.id, summary: dbSchema.playlistGradeSummaries.playlistId })
+        .from(dbSchema.playlists)
+        .leftJoin(
+          dbSchema.playlistGradeSummaries,
+          eq(dbSchema.playlistGradeSummaries.playlistId, dbSchema.playlists.id),
+        )
+        .where(isNotNull(dbSchema.playlists.generatedRecommendation));
+      expect(cohortPlaylists).not.toHaveLength(0);
+      expect(cohortPlaylists.filter((playlist) => playlist.summary === null)).toEqual([]);
       await refreshHoldFeaturesFamily.execute(
         context('refresh-hold-features'),
         refreshHoldFeaturesFamily.payload.parse({}),
@@ -355,11 +456,57 @@ describe('batch worker grants', () => {
       expect(ladder).toEqual([...MOONBOARD_WIDE_LADDER_ANGLES]);
       expect(wide.some((row) => row.climbUuid === MOONBOARD_STALE_WIDE_CLIMB)).toBe(false);
 
+      // The weekly spray-wall health roll-up, run for real: read-only, so an
+      // empty fleet is its legitimate no-cohort path and the run still
+      // executes every table its roster/ticks/lit/climbs/versions/reports
+      // queries touch under the restricted login.
+      await sprayWallHealthFamily.execute(context('spray-wall-health'), { dryRun: false });
+
+      // The monthly community recap over one seeded month: a named climber's
+      // native send and a lit climb on a public gym's board. Every scan runs
+      // as the restricted login, including the tick privacy rule (account,
+      // item audience, the climb's listing and its spray-wall half) and the
+      // naming join, and the read-back proves those paths returned rows.
+      await seedCommunityRecap(ownerDatabase);
+      await communityMonthlyStatsFamily.execute(context('community-monthly-stats'), {
+        months: 13,
+        retireMonths: 1,
+        dryRun: false,
+      });
+      const [recapMonth] = (await computeCommunityMonthlyStats({ database, now: new Date(), months: 1 })).months;
+      expect(recapMonth?.topGyms).toContainEqual(
+        expect.objectContaining({ gymName: COMMUNITY_RECAP_GYM_NAME, climbers: 1, climbsLit: 1, boards: 1 }),
+      );
+      expect(recapMonth?.topClimbers).toContainEqual(
+        expect.objectContaining({ climberName: COMMUNITY_RECAP_CLIMBER_NAME, sends: 1, sendDays: 1 }),
+      );
+      expect(recapMonth?.summary.newAccounts).toBeGreaterThanOrEqual(1);
+
       // Nothing beyond the list: no user data it does not need, no catalog writes.
       await expect(restricted`SELECT email FROM users LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT avatar_url FROM user_profiles LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT image FROM users LIMIT 1`).rejects.toThrow('permission denied');
+      // The recap reads a gym's public name and slug, never how to reach it.
+      await expect(restricted`SELECT contact_email FROM gyms LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT owner_id FROM gyms LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT follower_id FROM user_follows LIMIT 1`).rejects.toThrow('permission denied');
+      // The recap names a climber by display name only, and its signed-out
+      // spray-wall check reads whether a wall is public, nothing about who may
+      // see it otherwise.
+      await expect(restricted`SELECT name FROM users LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT user_id FROM gym_members LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT user_id FROM resource_grants LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT inherit_followers FROM resource_privacy LIMIT 1`).rejects.toThrow(
+        'permission denied',
+      );
       await expect(restricted`SELECT comment FROM boardsesh_ticks LIMIT 1`).rejects.toThrow('permission denied');
       await expect(restricted`SELECT session_id FROM boardsesh_ticks LIMIT 1`).rejects.toThrow('permission denied');
       await expect(restricted`SELECT name FROM user_boards LIMIT 1`).rejects.toThrow('permission denied');
+      // The spray grants are column-level: the photo, the owner's reset note
+      // and the reporter's identity stay out of reach.
+      await expect(restricted`SELECT public_photo_key FROM spray_walls LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT notes FROM spray_wall_versions LIMIT 1`).rejects.toThrow('permission denied');
+      await expect(restricted`SELECT reporter_id FROM spray_wall_reports LIMIT 1`).rejects.toThrow('permission denied');
       await expect(restricted`SELECT id FROM aurora_credentials LIMIT 1`).rejects.toThrow('permission denied');
       await expect(restricted`DELETE FROM board_climbs WHERE uuid = 'none'`).rejects.toThrow('permission denied');
       await expect(restricted`UPDATE board_climbs SET name = name WHERE false`).rejects.toThrow('permission denied');
@@ -382,6 +529,7 @@ describe('batch worker grants', () => {
     } finally {
       await restricted.end();
       await clearBatchJobFixture(ownerDatabase);
+      await clearCommunityRecap(ownerDatabase);
       await owner.unsafe(`DROP OWNED BY "${role}"`);
       await owner.unsafe(`DROP ROLE "${role}"`);
       await owner.end();

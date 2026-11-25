@@ -1,3 +1,4 @@
+import { renderToString } from 'react-dom/server';
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
 import { render, screen } from '@testing-library/react';
 import React from 'react';
@@ -14,10 +15,11 @@ vi.mock('../../board-renderer/board-image-layers', () => ({
   default: () => <div data-testid="board-image-layers" />,
 }));
 
-// Mock getBoardDetailsForPlaylist
+// Mock getBoardImageDetailsForPlaylist
 const mockGetBoardDetailsForPlaylist = vi.fn();
-vi.mock('@/app/lib/board-config-for-playlist', () => ({
-  getBoardDetailsForPlaylist: (...args: unknown[]) => mockGetBoardDetailsForPlaylist(...args),
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForPlaylist: (...args: unknown[]) => mockGetBoardDetailsForPlaylist(...args),
 }));
 
 // Mock theme tokens
@@ -154,6 +156,18 @@ describe('PlaylistPreviewSquare', () => {
     expect(root.style.background).toContain('rgb(79, 70, 229)');
   });
 
+  it('shows a colour saved from a retired brand swatch as today’s brand token', () => {
+    mockGetBoardDetailsForPlaylist.mockReturnValue(null);
+
+    const { container: violet } = render(<PlaylistPreviewSquare boardType="kilter" layoutId={1} color="#6D28D9" />);
+    // #5B22F2 = rgb(91, 34, 242), the Ultraviolet fill.
+    expect((violet.firstChild as HTMLElement).style.background).toContain('rgb(91, 34, 242)');
+
+    const { container: amber } = render(<PlaylistPreviewSquare boardType="kilter" layoutId={1} color="#FF8A3D" />);
+    // #0F9F86 = rgb(15, 159, 134), the mint spark.
+    expect((amber.firstChild as HTMLElement).style.background).toContain('rgb(15, 159, 134)');
+  });
+
   it('applies frosted overlay with rgba color derived from hex', () => {
     mockGetBoardDetailsForPlaylist.mockReturnValue(MOCK_BOARD_DETAILS);
 
@@ -162,4 +176,21 @@ describe('PlaylistPreviewSquare', () => {
     const overlay = container.querySelector('.previewFrostedOverlay') as HTMLElement;
     expect(overlay.style.background).toBe('rgba(255, 102, 0, 0.45)');
   });
+  it.each(['EnergySavingsLeafOutlined', 'LocalFireDepartmentOutlined', 'DiamondOutlined', 'UnknownIconIdentifier'])(
+    'never prints the stored icon identifier %s',
+    (icon) => {
+      mockGetBoardDetailsForPlaylist.mockReturnValue(MOCK_BOARD_DETAILS);
+      const { container } = render(<PlaylistPreviewSquare boardType="kilter" icon={icon} />);
+      expect(container.textContent).not.toContain(icon);
+      expect(container.querySelector('svg[aria-hidden="true"]')).not.toBeNull();
+    },
+  );
+});
+
+it.each([true, false])('renders every prototype-named stored icon as the fallback with board art=%s', (hasBoardArt) => {
+  mockGetBoardDetailsForPlaylist.mockReturnValue(hasBoardArt ? MOCK_BOARD_DETAILS : null);
+  const fallback = renderToString(<PlaylistPreviewSquare boardType="kilter" />);
+  for (const icon of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+    expect(renderToString(<PlaylistPreviewSquare boardType="kilter" icon={icon} />)).toBe(fallback);
+  }
 });

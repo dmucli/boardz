@@ -1,12 +1,14 @@
 // Offline sync types (Phase 2). Mirror the SDL in schema/sync.ts and the
 // generated resolver types. Documents are opaque snake_case JSON objects (keys =
-// mobile local columns — see docs/sync-table-manifest.md), so they are typed as
+// mobile local columns — see docs/data/sync-table-manifest.md), so they are typed as
 // `unknown` here. Timestamps are ISO-8601 strings, never a DateTime scalar.
 
 export type SyncCursorInput = {
   updatedAt?: string | null;
   syncSeq?: string | null;
 };
+
+export type SyncAudience = 'ALL' | 'SNAPSHOT_SUPPLEMENTAL';
 
 export type SyncCursor = {
   updatedAt: string;
@@ -29,4 +31,11 @@ export type SyncDeletionsResult = {
   deletions: SyncDeletion[];
   cursor: SyncCursor;
   hasMore: boolean;
+};
+
+export type SyncClimbDocuments = {
+  viewerId: string;
+  /** Canonical snake_case column sets are defined in the saved-climb resolver. */
+  climb: unknown;
+  stats: unknown[];
 };

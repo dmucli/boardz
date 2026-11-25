@@ -18,7 +18,7 @@ name: Production Deploy
 # Anything else fails resolve-web-targets, which skips every web deploy. The
 # GHCR image is built and pushed on every run regardless of the setting — the
 # image is the artifact, publishing it is free, and only the redeploy is
-# gated. See docs/production-deploy.md.
+# gated. See docs/operations/production-deploy.md.
 #
 # Both Railway services (backend, web) deploy the same way: this run repoints
 # the moving `:production` GHCR tag at the fresh digest, then
@@ -33,7 +33,7 @@ name: Production Deploy
 # `:production`, which is exactly what this run repoints — so the replacement is
 # manual and ORDERED: set WEB_DEPLOY_TARGETS=none BEFORE rolling back in the
 # Railway dashboard, or the next merge will redeploy over the mitigation.
-# See the rollback runbook in docs/production-deploy.md.
+# See the rollback runbook in docs/operations/production-deploy.md.
 #
 # Migrations must still stay backward-compatible: a rollback reverts the
 # container, never the database.
@@ -74,7 +74,7 @@ env:
   #
   # EXPO_PUBLIC_WEB_URL is the AUTH origin and is deliberately www.boardsesh.com,
   # NOT app.boardsesh.com: the SPA does credentialed cross-origin auth against
-  # www. See docs/expo-web-deployment.md.
+  # www. See docs/operations/expo-web-deployment.md.
   EXPO_PUBLIC_BACKEND_URL: https://ws.boardsesh.com
   EXPO_PUBLIC_WS_URL: wss://ws.boardsesh.com/graphql
   EXPO_PUBLIC_WEB_URL: https://www.boardsesh.com
@@ -98,18 +98,25 @@ jobs:
     permissions:
       actions: read
       contents: read
+      pull-requests: read
     outputs:
       web_changed: ${{ steps.changes.outputs.web }}
       backend_changed: ${{ steps.changes.outputs.backend }}
       app_changed: ${{ steps.changes.outputs.app }}
-      ota_changed: ${{ steps.changes.outputs.ota }}
+      ota_changed: ${{ steps.critical-ota.outputs.critical_ota == 'true' && 'true' || steps.changes.outputs.ota }}
       deployment_base_sha: ${{ steps.changes.outputs.deployment_base_sha }}
+      critical_ota: ${{ steps.critical-ota.outputs.critical_ota }}
       cloudflare_changed: ${{ steps.changes.outputs.cloudflare }}
       static_assets_changed: ${{ steps.changes.outputs.static_assets }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
 
       - name: Read the latest successful production deploy
         id: deploy-history
@@ -118,8 +125,12 @@ jobs:
         run: |
           set -euo pipefail
           runs_json="$RUNNER_TEMP/production-deploy-runs.json"
+          # Plain listing on purpose: `status=` and `branch=` route through
+          # GitHub's search index, which has returned months-old runs first.
+          # production-deploy-changes.mjs filters to successful main runs and
+          # takes the highest run id.
           if ! gh api --method GET \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/production-deploy.yml/runs?branch=main&status=success&per_page=20" \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/production-deploy.yml/runs?per_page=100" \
             > "$runs_json"; then
             echo "::warning::Could not read prior production runs; falling back to a full deploy."
             printf '{"workflow_runs":[]}\n' > "$runs_json"
@@ -132,16 +143,23 @@ jobs:
           RUNS_JSON: ${{ steps.deploy-history.outputs.runs_json }}
         run: node scripts/production-deploy-changes.mjs --runs-json "$RUNS_JSON"
 
+      - name: Detect critical OTA opt-in across the deployment range
+        id: critical-ota
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOYMENT_BASE_SHA: ${{ steps.changes.outputs.deployment_base_sha }}
+        run: node --experimental-strip-types scripts/mobile-ota-critical.ts
+
   # Export and upload to the tester-only staging branch while web/backend build.
   # A staging failure is recorded in this run but never holds service deploys.
   stage-mobile-ota:
     needs: detect-changes
     if: needs.detect-changes.outputs.ota_changed == 'true'
     # The ceiling for the called workflow: it reads this commit's Railway Config
-    # runs (actions: read) before uploading. See scripts/mobile-ota-server-ready.mjs.
+    # runs (actions: write) before uploading. See scripts/mobile-ota-server-ready.mjs.
     permissions:
       contents: read
-      actions: read
+      actions: write
     uses: ./.github/workflows/mobile-ota-production.yml
     with:
       stage_for_production_deploy: true
@@ -216,7 +234,7 @@ jobs:
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       - name: Install dependencies
         run: vp install --frozen-lockfile
@@ -252,7 +270,7 @@ jobs:
     # so the CI expression's fork branch would be dead code here.
     #
     # Unset (the default) means ubuntu-latest, so merging this changes nothing.
-    # See docs/production-deploy.md for what flipping it costs and how to revert.
+    # See docs/operations/production-deploy.md for what flipping it costs and how to revert.
     runs-on: ${{ fromJSON(vars.DEPLOY_RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 25
     environment: Production
@@ -303,6 +321,7 @@ jobs:
         id: buildx-fleet
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
         with:
+          cache-binary: false
           driver: remote
           endpoint: docker-container://boardsesh-buildkitd-deploy
 
@@ -310,6 +329,8 @@ jobs:
         if: runner.environment == 'github-hosted'
         id: buildx-hosted
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
 
       - name: Extract web image metadata
         id: meta
@@ -317,13 +338,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.WEB_IMAGE_NAME }}
           # No `:staging` — unlike the backend, nothing in homelab consumes a
-          # staging web image. Railway pulls the moving `:production` tag;
+          # staging web image. The publisher promotes :production/:latest only
+          # after verifying their CDN assets. Railway pulls :production;
           # `:sha-<short>` is the immutable handle for a manual rollback.
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-
-            type=raw,value=production,enable={{is_default_branch}}
-            type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Generate web Docker context
         # Not `vp run docker-context:web`: that vp task is exactly this command
@@ -369,6 +389,10 @@ jobs:
             BOARDSESH_WEB=1
             NEXT_PUBLIC_POSTHOG_KEY=${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
             NEXT_PUBLIC_STATIC_ASSET_BASE_URL=https://assets.boardsesh.com
+            NEXT_PUBLIC_NEXT_ASSET_BASE_URL=https://assets.boardsesh.com
+            NEXT_PUBLIC_APP_STORE_PROVIDER_ID=${{ vars.NEXT_PUBLIC_APP_STORE_PROVIDER_ID }}
+            NEXT_PUBLIC_META_PIXEL_ID=${{ vars.NEXT_PUBLIC_META_PIXEL_ID }}
+            NEXT_PUBLIC_REDDIT_PIXEL_ID=${{ vars.NEXT_PUBLIC_REDDIT_PIXEL_ID }}
             SENTRY_RELEASE=${{ github.sha }}
             BOARDSESH_BUILD_RELEASE=${{ github.sha }}
           # A secret mount, never a build-arg: an ARG's value is recorded in the
@@ -424,6 +448,78 @@ jobs:
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
+  # Retain each build's hashed runtime assets before HTML can reference them.
+  # This runs even when web deployment is held: the published image must remain
+  # usable for a later manual redeploy. Older objects are never removed.
+  publish-next-assets:
+    needs: [detect-changes, build-web, deploy-cloudflare]
+    if: >-
+      always()
+      && needs.build-web.result == 'success'
+      && (needs.detect-changes.outputs.cloudflare_changed != 'true' || needs.deploy-cloudflare.result == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: Production
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
+        with:
+          node-version: '22.x'
+          cache: false
+
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract immutable Next assets from the built image
+        env:
+          WEB_IMAGE: ${{ needs.build-web.outputs.image }}
+          WEB_DIGEST: ${{ needs.build-web.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$WEB_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          docker pull "$WEB_IMAGE@$WEB_DIGEST"
+          next_asset_container=$(docker create "$WEB_IMAGE@$WEB_DIGEST")
+          trap 'docker rm "$next_asset_container" >/dev/null' EXIT
+          next_static_dir="$RUNNER_TEMP/boardsesh-next-static"
+          mkdir -p "$next_static_dir"
+          docker cp "$next_asset_container:/app/packages/web/.next/static/." "$next_static_dir"
+
+      - name: Publish and validate immutable Next assets
+        env:
+          STATIC_ASSETS_S3_BUCKET_NAME: ${{ secrets.STATIC_ASSETS_S3_BUCKET_NAME }}
+          STATIC_ASSETS_AWS_ACCESS_KEY_ID: ${{ secrets.STATIC_ASSETS_AWS_ACCESS_KEY_ID }}
+          STATIC_ASSETS_AWS_SECRET_ACCESS_KEY: ${{ secrets.STATIC_ASSETS_AWS_SECRET_ACCESS_KEY }}
+          STATIC_ASSETS_AWS_ENDPOINT_URL: ${{ secrets.STATIC_ASSETS_AWS_ENDPOINT_URL }}
+          STATIC_ASSETS_AWS_REGION: ${{ secrets.STATIC_ASSETS_AWS_REGION }}
+        run: vp run upload:next-static-assets -- --directory "$RUNNER_TEMP/boardsesh-next-static"
+
+      - name: Promote the verified web image
+        env:
+          WEB_IMAGE: ${{ needs.build-web.outputs.image }}
+          WEB_DIGEST: ${{ needs.build-web.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --prefer-index=false \
+            --tag "$WEB_IMAGE:production" --tag "$WEB_IMAGE:latest" "$WEB_IMAGE@$WEB_DIGEST"
+          for ready_tag in production latest; do
+            ready_digest=$(docker buildx imagetools inspect "$WEB_IMAGE:$ready_tag" --format '{{printf "%s" .Manifest.Digest}}')
+            if [ "$ready_digest" != "$WEB_DIGEST" ]; then
+              echo "::error::Validated web image tag $ready_tag does not resolve to the built digest." >&2
+              exit 1
+            fi
+          done
+
   build-backend:
     needs: [detect-changes]
     if: needs.detect-changes.outputs.backend_changed == 'true'
@@ -435,7 +531,7 @@ jobs:
     # so the CI expression's fork branch would be dead code here.
     #
     # Unset (the default) means ubuntu-latest, so merging this changes nothing.
-    # See docs/production-deploy.md for what flipping it costs and how to revert.
+    # See docs/operations/production-deploy.md for what flipping it costs and how to revert.
     runs-on: ${{ fromJSON(vars.DEPLOY_RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 20
     environment: Production
@@ -477,6 +573,7 @@ jobs:
         id: buildx-fleet
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
         with:
+          cache-binary: false
           driver: remote
           endpoint: docker-container://boardsesh-buildkitd-deploy
 
@@ -484,6 +581,8 @@ jobs:
         if: runner.environment == 'github-hosted'
         id: buildx-hosted
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        with:
+          cache-binary: false
 
       - name: Extract metadata
         id: meta
@@ -557,7 +656,7 @@ jobs:
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       - name: Install dependencies
         run: vp install --frozen-lockfile
@@ -577,7 +676,7 @@ jobs:
           # credential, which deliberately cannot run DDL.
           DATABASE_URL: ${{ secrets.MIGRATOR_DATABASE_URL }}
           # The five-variable migration execution contract
-          # (docs/postgres-18-migration.md §"Target roles and secrets") makes
+          # (docs/operations/postgres-18-migration.md §"Target roles and secrets") makes
           # the runner reserve one session, SET ROLE to the NOLOGIN owner for
           # DDL — the migrator itself deliberately cannot CREATE — and
           # reconcile runtime ACLs afterward. All five must be set together;
@@ -591,7 +690,7 @@ jobs:
           MIGRATION_RUNTIME_SCHEMAS: public drizzle
           VERIFY_MIGRATION_JOURNAL: '1'
           # `<worker-role>=<login>` list for the pg-boss worker logins
-          # (docs/background-workers.md). Environment variables are not
+          # (docs/backend/background-workers.md). Environment variables are not
           # exported to steps on their own; unset, the queue step grants none.
           MIGRATION_WORKER_ROLES: ${{ vars.MIGRATION_WORKER_ROLES }}
         run: vp exec pnpm --filter @boardsesh/db run db:migrate
@@ -641,7 +740,7 @@ jobs:
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       - name: Install dependencies
         run: vp install --frozen-lockfile
@@ -723,13 +822,69 @@ jobs:
           fi
           exit 1
 
+  # Read-only admission: only a stamped, publicly unreleased native pair can
+  # bypass the daily stable schedule. Released runtimes keep their normal soak.
+  unreleased-native-ota:
+    needs: [detect-changes, stage-mobile-ota]
+    if: >-
+      needs.stage-mobile-ota.result == 'success'
+      && vars.OTA_STABLE_RELEASE_ENABLED == 'true'
+      && needs.detect-changes.outputs.critical_ota != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: Production
+    permissions:
+      contents: read
+    outputs:
+      eligible: ${{ steps.admission.outputs.eligible }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mobile-ota-stage
+          path: ota-stage
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+      - name: Read fresh public stores and protected native history
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' '+refs/tags/*:refs/tags/*'
+          node --experimental-strip-types scripts/mobile-live-store-runtimes.ts --out "$RUNNER_TEMP/live-store-runtimes.json"
+      - name: Admit only an exact unreleased native candidate
+        id: admission
+        run: >-
+          node --experimental-strip-types scripts/mobile-ota-unreleased-native.ts
+          --stage ota-stage --source-sha "$GITHUB_SHA"
+          --live-store-runtimes "$RUNNER_TEMP/live-store-runtimes.json"
+
   # No polling runner: this starts only after staging and the backend deploy
   # have both finished. The live schema is checked again before any production
   # upload, including when backend_changed was false or deployment was held.
   promote-mobile-ota:
-    needs: [detect-changes, stage-mobile-ota, build-web, build-backend, migrate, deploy-production-backend]
+    needs:
+      [
+        detect-changes,
+        stage-mobile-ota,
+        build-web,
+        build-backend,
+        migrate,
+        deploy-production-backend,
+        unreleased-native-ota,
+      ]
     if: >-
       always()
+      && needs.detect-changes.result == 'success'
+      && (vars.OTA_STABLE_RELEASE_ENABLED != 'true' || needs.detect-changes.outputs.critical_ota == 'true' || needs.unreleased-native-ota.outputs.eligible == 'true')
       && needs.detect-changes.outputs.ota_changed == 'true'
       && needs.stage-mobile-ota.result == 'success'
       && (needs.build-web.result == 'success' || (needs.detect-changes.outputs.web_changed != 'true' && needs.build-web.result == 'skipped'))
@@ -737,30 +892,38 @@ jobs:
       && (needs.migrate.result == 'success' || (needs.detect-changes.outputs.web_changed != 'true' && needs.detect-changes.outputs.backend_changed != 'true' && needs.migrate.result == 'skipped'))
       && (needs.deploy-production-backend.result == 'success' || (needs.detect-changes.outputs.backend_changed != 'true' && needs.deploy-production-backend.result == 'skipped'))
     runs-on: ubuntu-latest
-    # 45 minutes for the promotion itself, plus up to 85 for the server-rollout wait.
-    timeout-minutes: 130
-    environment: Production
+    # 45 minutes for the promotion itself, plus up to 110 for the server-rollout wait.
+    timeout-minutes: 155
+    environment: ${{ needs.detect-changes.outputs.critical_ota == 'true' && 'ota-stable-release' || 'Production' }}
     permissions:
       contents: read
-      # scripts/mobile-ota-server-ready.mjs lists this commit's Railway Config runs.
+      # scripts/mobile-ota-server-ready.mjs lists this commit's OTA deployment runs.
       actions: read
     concurrency:
       group: mobile-ota-production
       cancel-in-progress: false
       queue: max
     steps:
-      - name: Mint changelog push token
-        id: push_token
-        if: vars.OTA_PUSH_APP_ID != ''
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
-        with:
-          app-id: ${{ vars.OTA_PUSH_APP_ID }}
-          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
-
+      - name: Refuse blind critical promotion retries
+        if: needs.detect-changes.outputs.critical_ota == 'true' && github.run_attempt != 1
+        run: exit 1
+      - name: Require critical release credentials before readiness waits
+        if: needs.detect-changes.outputs.critical_ota == 'true'
+        env:
+          OTA_ADMIN_EMAIL: ${{ secrets.OTA_ADMIN_EMAIL }}
+          OTA_ADMIN_PASSWORD: ${{ secrets.OTA_ADMIN_PASSWORD }}
+          EOO_TOKEN: ${{ secrets.EOO_TOKEN }}
+        run: |
+          set -euo pipefail
+          for credential in OTA_ADMIN_EMAIL OTA_ADMIN_PASSWORD EOO_TOKEN; do
+            if [ -z "${!credential:-}" ]; then
+              echo "::error::Missing $credential in ota-stable-release or repository secrets."
+              exit 1
+            fi
+          done
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
-          token: ${{ steps.push_token.outputs.token || github.token }}
 
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -782,14 +945,72 @@ jobs:
           node scripts/mobile-ota-schema-ready.mjs
 
       # Staging already waited, but promotion is a second upload to the server:
-      # re-check so a Railway Config run that failed after staging stops it here.
+      # re-check so an OTA deployment run that failed after staging stops it here.
       - name: Wait for the OTA server rollout on this commit
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: node scripts/mobile-ota-server-ready.mjs
 
+      - name: Restore trusted controller state before critical supersession
+        id: critical-state
+        if: needs.detect-changes.outputs.critical_ota == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p controller-state
+          state="$(node --experimental-strip-types scripts/mobile-ota-stable-artifacts.ts state \
+            --out controller-state --exclude-run-id "$GITHUB_RUN_ID" --production-locked)"
+          echo "loaded_run=$(jq -r '.runId // "0"' <<< "$state")" >> "$GITHUB_OUTPUT"
+
+      - name: Release critical staged bytes to 100% stable
+        id: critical-promote
+        if: needs.detect-changes.outputs.critical_ota == 'true'
+        env:
+          OTA_ADMIN_EMAIL: ${{ secrets.OTA_ADMIN_EMAIL }}
+          OTA_ADMIN_PASSWORD: ${{ secrets.OTA_ADMIN_PASSWORD }}
+          EOO_TOKEN: ${{ secrets.EOO_TOKEN }}
+          EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL || 'https://updates.boardsesh.com/manifest' }}
+          LOADED_STATE_RUN_ID: ${{ steps.critical-state.outputs.loaded_run }}
+        run: |
+          if [ -n "${OTA_ADMIN_EMAIL:-}" ]; then echo "::add-mask::$OTA_ADMIN_EMAIL"; fi
+          node --experimental-strip-types scripts/mobile-ota-critical-promote.ts \
+            --stage ota-stage --source-sha "$GITHUB_SHA" --state controller-state/state.json \
+            --loaded-state-run-id "$LOADED_STATE_RUN_ID"
+
+      - name: Retain critical supersession evidence
+        if: always() && needs.detect-changes.outputs.critical_ota == 'true' && steps.critical-promote.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: critical-ota-release-evidence
+          # Only receipt.json is guaranteed on failure. upload-artifact fails
+          # for zero matches, not for individually absent optional evidence.
+          path: |
+            ota-stage/receipt.json
+            ota-stage/critical-supersession.json
+            ota-stage/critical-receipt.json
+          retention-days: 30
+          if-no-files-found: error
+
+      # Store status can change while backend readiness waits. Re-admit inside
+      # the production lock immediately before writing, never from a saved flag.
+      - name: Recheck unreleased native admission before publication
+        if: needs.unreleased-native-ota.outputs.eligible == 'true'
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main' '+refs/tags/*:refs/tags/*'
+          node --experimental-strip-types scripts/mobile-live-store-runtimes.ts --out "$RUNNER_TEMP/live-store-runtimes.json"
+          node --experimental-strip-types scripts/mobile-ota-unreleased-native.ts \
+            --stage ota-stage --source-sha "$GITHUB_SHA" \
+            --live-store-runtimes "$RUNNER_TEMP/live-store-runtimes.json" --require-eligible
+
       - name: Promote exact staged iOS and Android exports
         id: promote
+        if: needs.detect-changes.outputs.critical_ota != 'true'
         env:
           EOO_TOKEN: ${{ secrets.EOO_TOKEN }}
           EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL }}
@@ -799,8 +1020,170 @@ jobs:
           --ios-export ota-stage/ios
           --android-export ota-stage/android
 
+      - name: OTA health check (non-blocking)
+        id: health
+        if: always() && (steps.promote.outcome == 'success' || steps.critical-promote.outcome == 'success')
+        continue-on-error: true
+        env:
+          POSTHOG_PERSONAL_API_KEY: ${{ secrets.POSTHOG_PERSONAL_API_KEY }}
+        run: |
+          sleep 30
+          node --experimental-strip-types scripts/mobile-ota-health-check.ts --hours 6 --out "$RUNNER_TEMP/ota-health.md"
+
+      - name: Report promoted OTA
+        if: always() && (steps.promote.outcome == 'success' || steps.critical-promote.outcome == 'success')
+        env:
+          DISCORD_DEPLOY_WEBHOOK: ${{ secrets.DISCORD_DEPLOY_WEBHOOK }}
+          OTA_TRACK: production
+          CRITICAL_OTA: ${{ needs.detect-changes.outputs.critical_ota }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          release_description="$OTA_TRACK"
+          if [ "$CRITICAL_OTA" = true ]; then release_description='production (critical, 100% stable)'; fi
+          echo "### Mobile OTA promoted to $release_description" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '.platforms | to_entries[] | "- \(.key): \(.value.runtimeVersion)"' ota-stage/receipt.json >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$DISCORD_DEPLOY_WEBHOOK" ]; then
+            summary="$(cat ota-stage/discord-changelog.md)"
+            [ -n "$summary" ] || summary="$(git log -1 --format=%s "$GITHUB_SHA")"
+            content="$(printf '📱 **%s OTA promoted** on `%s`\n%s\n<%s>' "$release_description" "${GITHUB_SHA:0:7}" "$summary" "$RUN_URL")"
+            jq -n --arg content "$content" '{content:$content,allowed_mentions:{parse:[]}}' \
+              | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' -d @- "$DISCORD_DEPLOY_WEBHOOK" \
+              || echo '::warning::Could not post OTA notification.'
+            if [ -s "$RUNNER_TEMP/ota-health.md" ]; then
+              content="$(printf '🩺 **Production OTA health**\n%s\n<%s>' "$(cat "$RUNNER_TEMP/ota-health.md")" "$RUN_URL")"
+              jq -n --arg content "$content" '{content:$content,allowed_mentions:{parse:[]}}' \
+                | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' -d @- "$DISCORD_DEPLOY_WEBHOOK" \
+                || echo '::warning::Could not post OTA health notification.'
+            fi
+          fi
+
+  # Always feed early updates, including during device QA before stable cutover.
+  promote-early-mobile-ota:
+    needs: [detect-changes, stage-mobile-ota, build-web, build-backend, migrate, deploy-production-backend]
+    if: >-
+      always()
+      && needs.detect-changes.outputs.ota_changed == 'true'
+      && needs.stage-mobile-ota.result == 'success'
+      && (needs.build-web.result == 'success' || (needs.detect-changes.outputs.web_changed != 'true' && needs.build-web.result == 'skipped'))
+      && (needs.build-backend.result == 'success' || (needs.detect-changes.outputs.backend_changed != 'true' && needs.build-backend.result == 'skipped'))
+      && (needs.migrate.result == 'success' || (needs.detect-changes.outputs.web_changed != 'true' && needs.detect-changes.outputs.backend_changed != 'true' && needs.migrate.result == 'skipped'))
+      && (needs.deploy-production-backend.result == 'success' || (needs.detect-changes.outputs.backend_changed != 'true' && needs.deploy-production-backend.result == 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 155
+    environment: ota-stable-release
+    permissions:
+      contents: read
+      actions: read
+    concurrency:
+      group: mobile-ota-beta
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - name: Refuse any ref but main
+        if: github.ref != 'refs/heads/main'
+        run: exit 1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mobile-ota-stage
+          path: ota-stage
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+      - name: Require live backend schema
+        run: |
+          git fetch origin main
+          node scripts/mobile-ota-schema-ready.mjs
+      - name: Wait for the OTA server rollout on this commit
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/mobile-ota-server-ready.mjs
+      - name: Promote exact staged bytes to early updates
+        env:
+          EOO_TOKEN: ${{ secrets.EOO_TOKEN }}
+          OTA_ADMIN_EMAIL: ${{ secrets.OTA_ADMIN_EMAIL }}
+          OTA_ADMIN_PASSWORD: ${{ secrets.OTA_ADMIN_PASSWORD }}
+          EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL }}
+        run: |
+          set -euo pipefail
+          if [ -n "${OTA_ADMIN_EMAIL:-}" ]; then echo "::add-mask::$OTA_ADMIN_EMAIL"; fi
+          node --experimental-strip-types scripts/mobile-ota-promote-track.ts ota-stage --verify-empty-target
+
+  verify-mobile-ota:
+    needs: [detect-changes, stage-mobile-ota, promote-mobile-ota, promote-early-mobile-ota, unreleased-native-ota]
+    if: always() && needs.detect-changes.outputs.ota_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require both staging and promotion
+        env:
+          STAGE_RESULT: ${{ needs.stage-mobile-ota.result }}
+          PROMOTE_RESULT: ${{ needs.promote-mobile-ota.result }}
+          EARLY_RESULT: ${{ needs.promote-early-mobile-ota.result }}
+          DAILY_ENABLED: ${{ vars.OTA_STABLE_RELEASE_ENABLED }}
+          CRITICAL_OTA: ${{ needs.detect-changes.outputs.critical_ota }}
+          NATIVE_ADMISSION_RESULT: ${{ needs.unreleased-native-ota.result }}
+          UNRELEASED_NATIVE: ${{ needs.unreleased-native-ota.outputs.eligible }}
+        run: |
+          expected_production=success
+          if [ "$DAILY_ENABLED" = true ] && [ "$CRITICAL_OTA" != true ]; then
+            if [ "$NATIVE_ADMISSION_RESULT" != success ]; then
+              echo "::error::Unreleased native OTA admission failed."
+              exit 1
+            fi
+            if [ "$UNRELEASED_NATIVE" != true ]; then expected_production=skipped; fi
+          fi
+          if [ "$STAGE_RESULT" != success ] || [ "$EARLY_RESULT" != success ] || [ "$PROMOTE_RESULT" != "$expected_production" ]; then
+            echo "::error::Main OTA not promoted (critical=$CRITICAL_OTA, stage=$STAGE_RESULT, early=$EARLY_RESULT, production=$PROMOTE_RESULT)."
+            exit 1
+          fi
+
+  # Keeps main's committed What's New current. The native builds (TestFlight, Play
+  # internal, store) embed main's copy of changelog.generated.json; an OTA carries its
+  # own regenerated copy. This used to be a step in promote-mobile-ota, which skips
+  # released-runtime non-critical OTAs under the daily stable policy, so main's copy
+  # froze. It runs after verify-mobile-ota, so whichever promotion this run owed has
+  # landed. No environment: OTA_PUSH_APP_PRIVATE_KEY is a repository secret, and a job
+  # waiting at an environment gate holds this run's group for every later push.
+  # Critical publication still never mints the push token.
+  # continue-on-error: the run's conclusion is what the daily stable release
+  # (latestSource) and the next deploy's baseline read, so a failed changelog push
+  # must not hold back an OTA that already promoted. The job still shows red, and it
+  # stays out of notify-failure, which would announce a deploy failure that wasn't one.
+  push-promoted-changelog:
+    needs: [detect-changes, verify-mobile-ota]
+    if: >-
+      !cancelled()
+      && needs.verify-mobile-ota.result == 'success'
+      && needs.detect-changes.outputs.critical_ota != 'true'
+      && vars.OTA_PUSH_APP_ID != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - name: Mint changelog push token
+        id: push_token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          token: ${{ steps.push_token.outputs.token }}
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: mobile-ota-stage
+          path: ota-stage
+
       - name: Push promoted changelog to main
-        if: steps.promote.outcome == 'success' && vars.OTA_PUSH_APP_ID != ''
         run: |
           set -euo pipefail
           git fetch origin main
@@ -817,77 +1200,44 @@ jobs:
           git add packages/mobile/src/data/changelog.generated.json CHANGELOG.md
           if git diff --cached --quiet; then
             echo 'Promoted changelog already matches main.'
-          else
-            git commit -m 'chore(changelog): refresh from promoted OTA [skip ci]'
-            if ! git push origin HEAD:main; then
-              git fetch origin main
-              if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
-                echo '::notice::main advanced during the changelog push; leaving it to the newer deploy.'
-              else
-                exit 1
-              fi
+            exit 0
+          fi
+          git commit -m 'chore(changelog): refresh from promoted OTA [skip ci]'
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              exit 0
             fi
-          fi
-
-      - name: OTA health check (non-blocking)
-        id: health
-        if: always() && steps.promote.outcome == 'success'
-        continue-on-error: true
-        env:
-          POSTHOG_PERSONAL_API_KEY: ${{ secrets.POSTHOG_PERSONAL_API_KEY }}
-        run: |
-          sleep 30
-          node --experimental-strip-types scripts/mobile-ota-health-check.ts --hours 6 --out "$RUNNER_TEMP/ota-health.md"
-
-      - name: Report promoted OTA
-        if: always() && steps.promote.outcome == 'success'
-        env:
-          DISCORD_DEPLOY_WEBHOOK: ${{ secrets.DISCORD_DEPLOY_WEBHOOK }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          echo '### Mobile OTA promoted to production' >> "$GITHUB_STEP_SUMMARY"
-          jq -r '.platforms | to_entries[] | "- \(.key): \(.value.runtimeVersion)"' ota-stage/receipt.json >> "$GITHUB_STEP_SUMMARY"
-          if [ -n "$DISCORD_DEPLOY_WEBHOOK" ]; then
-            summary="$(cat ota-stage/discord-changelog.md)"
-            [ -n "$summary" ] || summary="$(git log -1 --format=%s "$GITHUB_SHA")"
-            content="$(printf '📱 **Production OTA promoted** on `%s`\n%s\n<%s>' "${GITHUB_SHA:0:7}" "$summary" "$RUN_URL")"
-            jq -n --arg content "$content" '{content:$content,allowed_mentions:{parse:[]}}' \
-              | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' -d @- "$DISCORD_DEPLOY_WEBHOOK" \
-              || echo '::warning::Could not post OTA notification.'
-            if [ -s "$RUNNER_TEMP/ota-health.md" ]; then
-              content="$(printf '🩺 **Production OTA health**\n%s\n<%s>' "$(cat "$RUNNER_TEMP/ota-health.md")" "$RUN_URL")"
-              jq -n --arg content "$content" '{content:$content,allowed_mentions:{parse:[]}}' \
-                | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' -d @- "$DISCORD_DEPLOY_WEBHOOK" \
-                || echo '::warning::Could not post OTA health notification.'
+            git fetch origin main
+            if [ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]; then
+              echo '::notice::main advanced during the changelog push; leaving it to the newer deploy.'
+              exit 0
             fi
-          fi
-
-  verify-mobile-ota:
-    needs: [detect-changes, stage-mobile-ota, promote-mobile-ota]
-    if: always() && needs.detect-changes.outputs.ota_changed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Require both staging and promotion
-        env:
-          STAGE_RESULT: ${{ needs.stage-mobile-ota.result }}
-          PROMOTE_RESULT: ${{ needs.promote-mobile-ota.result }}
-        run: |
-          if [ "$STAGE_RESULT" != success ] || [ "$PROMOTE_RESULT" != success ]; then
-            echo "::error::Main OTA not promoted (stage=$STAGE_RESULT, promote=$PROMOTE_RESULT)."
-            exit 1
-          fi
+            echo "Changelog push failed (attempt ${attempt}/3)."
+            sleep $((attempt * 15))
+          done
+          echo "::error::Could not push the changelog to main after 3 attempts. The OTA shipped; main's What's New stays stale until a later deploy pushes it."
+          exit 1
 
   # www on Railway — the only web deployer since the Vercel scrub. Still gated
   # by WEB_DEPLOY_TARGETS so `none` remains the deploy hold, and so a second
   # target can be added back without reshaping the job.
   deploy-web-railway:
-    needs: [detect-changes, resolve-web-targets, build-web, migrate, deploy-production-backend, deploy-cloudflare]
+    needs:
+      [
+        detect-changes,
+        resolve-web-targets,
+        build-web,
+        publish-next-assets,
+        migrate,
+        deploy-production-backend,
+        deploy-cloudflare,
+      ]
     if: >-
       always()
       && needs.detect-changes.outputs.web_changed == 'true'
       && needs.resolve-web-targets.outputs.web_railway == 'true'
       && needs.build-web.result == 'success'
+      && needs.publish-next-assets.result == 'success'
       && needs.migrate.result == 'success'
       && (needs.detect-changes.outputs.backend_changed != 'true' || needs.deploy-production-backend.result == 'success')
       && (needs.detect-changes.outputs.cloudflare_changed != 'true' || needs.deploy-cloudflare.result == 'success')
@@ -943,6 +1293,14 @@ jobs:
         # script imports only node: builtins, so no workspace install is needed.
         run: node scripts/production-smoke.ts --base "$RAILWAY_WEB_ORIGIN"
 
+      - name: Warm anonymous marketing documents at the public edge
+        if: steps.railway-smoke.outcome == 'success'
+        # A cold edge is slower but healthy. Warming must never cause rollback.
+        continue-on-error: true
+        env:
+          SMOKE_EXPECTED_RELEASE: ${{ github.sha }}
+        run: node scripts/warm-marketing-pages.ts
+
       # Unconditional since the Vercel scrub. While Vercel still served www a
       # Railway smoke failure was a shadow signal and rolling back would have
       # been noise; now it is the live origin, so a failed smoke must restore
@@ -985,13 +1343,13 @@ jobs:
   # served at the root of its own subdomain via Cloudflare Pages (project
   # `boardsesh-app`, direct upload). This is the `--subdomain` artifact, distinct
   # from the `/app` export the web Docker image bakes. See
-  # docs/expo-web-deployment.md.
+  # docs/operations/expo-web-deployment.md.
   #
   # Independent of the web/backend build+migrate gate: it's a self-contained
   # static export + upload with no DB or image dependency, so it only needs
   # detect-changes. No inline Playwright smoke gate — a per-deploy expo-web boot
   # is too heavy here (this file has no such gate for web/backend either); the
-  # expo-web-smoke suite stays the dispatch-only gate in e2e-tests.yml.
+  # expo-web-smoke suite stays in e2e-tests.yml (nightly, and on dispatch).
   # Converges the Cloudflare zone config (infra/cloudflare) on main. Runs only
   # when the desired state or apply tooling changes (or on manual dispatch).
   # Static-asset publication waits for this job when both targets change, so it
@@ -1000,7 +1358,7 @@ jobs:
   # A non-zero exit = unapplied drift (e.g. a blocked zone-SSL change) and should
   # be investigated, not retried blindly.
   # www is a Railway container deployed by `deploy-web-railway`; Cloudflare only
-  # fronts DNS/cache for it (docs/production-deploy.md). This job converges the
+  # fronts DNS/cache for it (docs/operations/production-deploy.md). This job converges the
   # zone and nothing else — it does not build or serve the app.
   deploy-cloudflare:
     needs: [detect-changes]
@@ -1019,7 +1377,7 @@ jobs:
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       - name: Install dependencies
         run: vp install --frozen-lockfile
@@ -1058,7 +1416,7 @@ jobs:
       - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       - name: Install dependencies
         run: vp install --frozen-lockfile
@@ -1072,9 +1430,6 @@ jobs:
         # `--clear` + env-assertion support; once it does, it becomes the
         # in-export stale-env detector. The independent grep step below covers us
         # regardless of merge order.
-        env:
-          # Same repository variable CI's "Expo web bundle check" reads.
-          BOARDSESH_WEB_EAGER_BROTLI_BUDGET: ${{ vars.BOARDSESH_WEB_EAGER_BROTLI_BUDGET }}
         run: |
           BOARDSESH_EXPORT_EXPECT_URLS="https://ws.boardsesh.com https://www.boardsesh.com" \
           bash scripts/build-expo-web-export.sh --subdomain "$RUNNER_TEMP/app-standalone"
@@ -1127,6 +1482,25 @@ jobs:
           fi
           echo "ok: found the production-web environment tag in the emitted bundles"
 
+      - name: Carry the previous deploys' chunks forward
+        id: carryover
+        # Pages serves only the current deployment's files, so without this a
+        # tab opened before the deploy 404s on its next lazy route (#5780). The
+        # script reads the live site (its shell and /chunk-carryover.json) and
+        # copies up to 3 days / 4000 files of older chunks into the export. It
+        # runs after the export checks above, so carried files never count
+        # toward the eager budget or the baked-env grep. Best effort: the script
+        # exits 0 on any error with a ::warning::, stops after 60 s, and this
+        # step may not fail or hold the deploy either way.
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          node scripts/lib/carry-over-expo-web-chunks.mjs "$RUNNER_TEMP/app-standalone" \
+            --live https://app.boardsesh.com \
+            --max-age-days 3 \
+            --max-files 4000 \
+            --budget-ms 60000
+
       - name: Add Cloudflare Pages host config to the export
         # _redirects (SPA fallback) + _headers (noindex/caching/no-CSP) are host
         # config, not part of the export. Copy them into the publish dir.
@@ -1150,7 +1524,7 @@ jobs:
       # token. It is the same secret deploy-cloudflare uses for the zone, so a
       # rotation that grants only the zone scopes lands here as
       # `Authentication error [code: 10000]` while `wrangler whoami` still works.
-      # See the token section of docs/cloudflare.md.
+      # See the token section of docs/operations/cloudflare.md.
       - name: Publish to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -1166,7 +1540,10 @@ jobs:
         # check retries a short propagation loop. Verifies: root serves the HTML
         # shell, a deep route SPA-falls back to the shell, a content-hashed asset
         # is immutable-cached, index.html is NOT immutable, noindex is present,
-        # and the WASM binary serves with a wasm/octet content type.
+        # the WASM binary serves with a wasm/octet content type, and the previous
+        # deploy's entry chunk still serves after carry-over.
+        env:
+          PREVIOUS_ENTRY: ${{ steps.carryover.outputs.previous_entry }}
         run: |
           set -uo pipefail
           base=https://app.boardsesh.com
@@ -1228,18 +1605,17 @@ jobs:
           # mounts, and #root stays empty with no console error to explain it.
           # That is the exact silent failure this now catches, one step earlier
           # and with a message that says which part was wrong.
-          check_entry_chunk_is_js() {
-            local asset_path
-            asset_path=$(curl -sS --max-time 20 "$base/" \
-              | grep -oE '/_expo/static/[^"'"'"']+\.js' | head -n1)
-            [ -n "$asset_path" ] || { echo "  no /_expo asset found in index.html"; return 1; }
-
+          #
+          # check_chunk_is_js takes the chunk path, so the previous deploy's
+          # entry (carried forward, #5780) gets the same three checks.
+          check_chunk_is_js() {
+            local asset_path="$1"
             local head; head=$(curl -sSI --max-time 20 "$base$asset_path" | tr -d '\r')
             echo "$head" | grep -qiE '^content-type:.*javascript' || {
               echo "  $asset_path"
               echo "    status:       $(echo "$head" | head -n1 || echo '(none)')"
               echo "    content-type: $(echo "$head" | grep -i '^content-type:' || echo '(none)')"
-              echo "  the entry chunk index.html names is not being served as JavaScript."
+              echo "  this chunk is not being served as JavaScript."
               echo "  404 → the chunk is missing from the deployment (or has not propagated yet)."
               echo "  text/html → the SPA fallback answered it, which also means the asset-404"
               echo "    Function is not in the path; see deploy/app-subdomain/functions/_middleware.ts."
@@ -1269,6 +1645,21 @@ jobs:
               '<!doctype'*|'<!DOCTYPE'*|'<html'*)
                 echo "  $asset_path served the HTML shell, not JavaScript"; return 1 ;;
             esac
+          }
+
+          check_entry_chunk_is_js() {
+            local asset_path
+            asset_path=$(curl -sS --max-time 20 "$base/" \
+              | grep -oE '/_expo/static/[^"'"'"']+\.js' | head -n1)
+            [ -n "$asset_path" ] || { echo "  no /_expo asset found in index.html"; return 1; }
+            check_chunk_is_js "$asset_path"
+          }
+
+          # The carry-over step names the entry the live shell loaded before this
+          # deploy, and only when it put that file in the export. A failure here
+          # means a tab opened before the deploy can no longer load its routes.
+          check_previous_entry_chunk() {
+            check_chunk_is_js "$PREVIOUS_ENTRY"
           }
 
           check_manifest_link() {
@@ -1315,6 +1706,11 @@ jobs:
           retry "wasm binary → 200 wasm/octet-stream"     check_wasm
           retry "index.html is NOT immutable-cached"      check_index_not_immutable
           retry "entry chunk serves as immutable JavaScript"  check_entry_chunk_is_js
+          if [ -n "${PREVIOUS_ENTRY:-}" ]; then
+            retry "previous deploy's entry chunk still serves as JavaScript"  check_previous_entry_chunk
+          else
+            echo "skip: no previous entry was carried (first deploy, or carry-over failed open)"
+          fi
           retry "PWA manifest → JSON with start_url/scope /"  check_manifest_link
 
       - name: Install Playwright chromium
@@ -1404,12 +1800,13 @@ jobs:
   # run summary — so a forgotten hold would silently strand www on an old build
   # while every merge looked fine. No-ops if DISCORD_DEPLOY_WEBHOOK is unset.
   notify-web-held:
-    needs: [detect-changes, resolve-web-targets, build-web]
+    needs: [detect-changes, resolve-web-targets, build-web, publish-next-assets]
     if: >-
       always()
       && needs.detect-changes.outputs.web_changed == 'true'
       && needs.resolve-web-targets.outputs.web_targets == 'none'
       && needs.build-web.result == 'success'
+      && needs.publish-next-assets.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     environment: Production
@@ -1443,11 +1840,14 @@ jobs:
       [
         detect-changes,
         stage-mobile-ota,
+        unreleased-native-ota,
         promote-mobile-ota,
+        promote-early-mobile-ota,
         verify-mobile-ota,
         resolve-web-targets,
         sync-static-assets,
         build-web,
+        publish-next-assets,
         build-backend,
         migrate,
         verify-serial-plan,
@@ -1470,6 +1870,7 @@ jobs:
           DETECT_CHANGES: ${{ needs.detect-changes.result }}
           SYNC_STATIC_ASSETS: ${{ needs.sync-static-assets.result }}
           BUILD_WEB: ${{ needs.build-web.result }}
+          PUBLISH_NEXT_ASSETS: ${{ needs.publish-next-assets.result }}
           BUILD_BACKEND: ${{ needs.build-backend.result }}
           MIGRATE: ${{ needs.migrate.result }}
           VERIFY_SERIAL_PLAN: ${{ needs.verify-serial-plan.result }}
@@ -1479,6 +1880,8 @@ jobs:
           DEPLOY_APP_WEB: ${{ needs.deploy-app-web.result }}
           STAGE_MOBILE_OTA: ${{ needs.stage-mobile-ota.result }}
           PROMOTE_MOBILE_OTA: ${{ needs.promote-mobile-ota.result }}
+          EARLY_MOBILE_OTA: ${{ needs.promote-early-mobile-ota.result }}
+          VERIFY_MOBILE_OTA: ${{ needs.verify-mobile-ota.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           COMMIT_SHA: ${{ github.sha }}
         run: |
@@ -1487,8 +1890,8 @@ jobs:
             exit 0
           fi
           # URL wrapped in <…> so Discord suppresses the inline preview embed.
-          CONTENT=$(printf '🚨 **Production deploy failed** on \`%s\`\n• detect-changes: %s\n• stage-mobile-ota: %s\n• promote-mobile-ota: %s\n• resolve-web-targets: %s\n• sync-static-assets: %s\n• build-web: %s\n• build-backend: %s\n• migrate: %s\n• verify-serial-plan: %s\n• deploy-web-railway: %s\n• deploy-production-backend: %s\n• deploy-cloudflare: %s\n• deploy-app-web: %s\n<%s>' \
-            "${COMMIT_SHA:0:7}" "$DETECT_CHANGES" "$STAGE_MOBILE_OTA" "$PROMOTE_MOBILE_OTA" "$RESOLVE_WEB_TARGETS" "$SYNC_STATIC_ASSETS" "$BUILD_WEB" "$BUILD_BACKEND" "$MIGRATE" "$VERIFY_SERIAL_PLAN" "$DEPLOY_WEB_RAILWAY" "$DEPLOY_BACKEND" "$DEPLOY_CLOUDFLARE" "$DEPLOY_APP_WEB" "$RUN_URL")
+          CONTENT=$(printf '🚨 **Production deploy failed** on \`%s\`\n• detect-changes: %s\n• stage-mobile-ota: %s\n• promote-mobile-ota: %s\n• promote-early-mobile-ota: %s\n• verify-mobile-ota: %s\n• resolve-web-targets: %s\n• sync-static-assets: %s\n• build-web: %s\n• publish-next-assets: %s\n• build-backend: %s\n• migrate: %s\n• verify-serial-plan: %s\n• deploy-web-railway: %s\n• deploy-production-backend: %s\n• deploy-cloudflare: %s\n• deploy-app-web: %s\n<%s>' \
+            "${COMMIT_SHA:0:7}" "$DETECT_CHANGES" "$STAGE_MOBILE_OTA" "$PROMOTE_MOBILE_OTA" "$EARLY_MOBILE_OTA" "$VERIFY_MOBILE_OTA" "$RESOLVE_WEB_TARGETS" "$SYNC_STATIC_ASSETS" "$BUILD_WEB" "$PUBLISH_NEXT_ASSETS" "$BUILD_BACKEND" "$MIGRATE" "$VERIFY_SERIAL_PLAN" "$DEPLOY_WEB_RAILWAY" "$DEPLOY_BACKEND" "$DEPLOY_CLOUDFLARE" "$DEPLOY_APP_WEB" "$RUN_URL")
           # --fail-with-body surfaces Discord's status + error body (e.g. 429,
           # rotated webhook) in the log instead of failing silently. Don't let a
           # webhook hiccup fail the job — the alert is best-effort.
@@ -1507,11 +1910,14 @@ jobs:
       [
         detect-changes,
         stage-mobile-ota,
+        unreleased-native-ota,
         promote-mobile-ota,
+        promote-early-mobile-ota,
         verify-mobile-ota,
         resolve-web-targets,
         sync-static-assets,
         build-web,
+        publish-next-assets,
         build-backend,
         migrate,
         verify-serial-plan,
@@ -1531,7 +1937,7 @@ jobs:
       && !contains(needs.*.result, 'cancelled')
       && (needs.deploy-web-railway.result == 'success' ||
       needs.deploy-production-backend.result == 'success' || needs.deploy-cloudflare.result == 'success' ||
-      needs.deploy-app-web.result == 'success' || needs.promote-mobile-ota.result == 'success')
+      needs.deploy-app-web.result == 'success' || needs.promote-mobile-ota.result == 'success' || needs.promote-early-mobile-ota.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: Production
@@ -1565,6 +1971,8 @@ jobs:
           CLOUDFLARE_RESULT: ${{ needs.deploy-cloudflare.result }}
           APP_WEB_RESULT: ${{ needs.deploy-app-web.result }}
           OTA_RESULT: ${{ needs.promote-mobile-ota.result }}
+          EARLY_OTA_RESULT: ${{ needs.promote-early-mobile-ota.result }}
+          CRITICAL_OTA: ${{ needs.detect-changes.outputs.critical_ota }}
           # A held deploy is a skip, which would otherwise print as "unchanged" —
           # the exact invisibility notify-app-web-held exists to prevent.
           #
@@ -1618,7 +2026,14 @@ jobs:
             APP_WEB_LINE="held (APP_WEB_DEPLOY_HOLD set)"
           fi
           OTA_LINE="unchanged"
-          if [ "$OTA_RESULT" = "success" ]; then OTA_LINE="promoted"; fi
+          if [ "$EARLY_OTA_RESULT" = "success" ]; then OTA_LINE="early updates promoted"; fi
+          if [ "$OTA_RESULT" = "success" ]; then
+            if [ "$CRITICAL_OTA" = true ]; then
+              OTA_LINE="$OTA_LINE; critical release promoted to 100% stable"
+            else
+              OTA_LINE="$OTA_LINE; production promoted"
+            fi
+          fi
 
           # Pull PR numbers from merge-commit subjects in the exact cumulative
           # range used by change detection. Skip when a safe baseline was not

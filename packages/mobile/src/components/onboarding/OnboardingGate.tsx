@@ -1,9 +1,12 @@
+import { getConsentSnapshot } from '../../lib/consent-state';
+import { useConsentSettled } from '../../lib/consent-hooks';
 import { useEffect, useRef, useState } from 'react';
 import { AppState } from 'react-native';
 import { router, useSegments } from 'expo-router';
 import * as Linking from 'expo-linking';
 import { hasSeenOnboarding, markOnboardingSeen } from '../../lib/onboarding/onboarding-storage';
 import { DEEP_LINK_SEGMENTS } from '../../lib/deep-link-segments';
+import { didReplayBoardLink } from '../../lib/routing/board-link-replay';
 import { useProfile } from '../../lib/graphql/hooks';
 import { useActiveBoard } from '../../lib/graphql/use-active-board';
 import { reportError } from '../../lib/error-reporting';
@@ -32,6 +35,7 @@ import {
 import { useLaunchReady } from '../../providers/launch-ready-context';
 import { useOptionalTheme } from '../../providers/theme-provider';
 import { BoardLookStepGate } from '../board-look/BoardLookStepGate';
+import { ChineseTranslationOnboarding } from './ChineseTranslationOnboarding';
 
 /**
  * How much FOREGROUND time the gate gets to reach a decision before it reports
@@ -120,7 +124,7 @@ function isProfileSettled(profileQuery: {
  * - An account at most 7 days old with no board gets the board picker in
  *   first-board mode ("Where do you climb?"), at most twice per account, never
  *   offline, never over a launch that came from a link or a tapped
- *   notification, and never with `first-board-picker-kill` on. It is skippable,
+ *   notification, never over a shared climb opened after sign-in, and never with `first-board-picker-kill` on. It is skippable,
  *   and a bind from it lands on Climbs. Logged as `presented`.
  * - Every other climber without a board gets the log-only `would_present` the
  *   gate gave everyone before, with `picker_verdict` saying why the picker
@@ -150,7 +154,9 @@ function isProfileSettled(profileQuery: {
  * account gets its own first-run check.
  */
 export function OnboardingGate() {
-  const ready = useLaunchReady();
+  const launchReady = useLaunchReady();
+  const consentSettled = useConsentSettled();
+  const ready = launchReady && consentSettled;
   const flagsResolved = useFeatureFlagsResolved();
   const pickerEnabled = useFirstBoardPickerEnabled();
   const pickerEnabledRef = useRef(pickerEnabled);
@@ -194,10 +200,13 @@ export function OnboardingGate() {
   // back with a board bound. What keeps the two from overlapping is the route
   // guard (`onboarding` and `boards` are both blocked segments), not this flag.
   const [tourEvaluated, setTourEvaluated] = useState(false);
+  const [firstBoardPickerPresented, setFirstBoardPickerPresented] = useState(false);
   if (userId !== undefined && userId !== decidedForUserRef.current) {
     const switchedAccount = decidedForUserRef.current !== undefined;
     decidedForUserRef.current = userId;
     if (switchedAccount) {
+      setTourEvaluated(false);
+      setFirstBoardPickerPresented(false);
       decidedRef.current = false;
       triggerRef.current = 'account_switch';
       // `ms_since_mount` on the new account's decision counts from the switch,
@@ -236,8 +245,6 @@ export function OnboardingGate() {
     mountedAtRef.current = Date.now();
     triggerRef.current = mountedThisProcess ? 'remount' : 'cold_start';
     mountedThisProcess = true;
-    // Screenshot builds never decide (below), so a stall there means nothing.
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return;
 
     const stopWatchdog = startForegroundWatchdog({
       timeoutMs: ONBOARDING_GATE_STALL_MS,
@@ -279,10 +286,6 @@ export function OnboardingGate() {
 
   useEffect(() => {
     if (!ready || !boardResolved || !profileReady || !flagsResolved || decidedRef.current) return;
-    // Screenshot builds never auto-present the tour: the app-store flow needs to
-    // reach the tabs, and the onboarding-capture flow opens /onboarding itself.
-    // Nothing else auto-presents in a capture run either, so this stays `pending`.
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return;
     decidedRef.current = true;
 
     let cancelled = false;
@@ -296,6 +299,7 @@ export function OnboardingGate() {
     const markLookStepForNewAccount = isNewAccount(accountCreatedAtRef.current, nowMs()) && pickerEnabledRef.current;
     const decide = (decision: GateDecision) => {
       decided = true;
+      if (decision.outcome === 'presented') setFirstBoardPickerPresented(true);
       stopWatchdogRef.current?.();
       trackOnboardingGateEvaluated({
         ...decision,
@@ -345,7 +349,7 @@ export function OnboardingGate() {
         } catch {
           initialUrl = null;
         }
-        if (cancelled) return;
+        if (cancelled || !getConsentSnapshot().settled) return;
         if (initialUrl) {
           // The URL itself is never sent: only that there was one.
           decide({
@@ -376,8 +380,29 @@ export function OnboardingGate() {
           return;
         }
 
+        // A shared climb tapped while signed out is opened after sign-in by the
+        // deep-link provider (#6027). That link was tapped with the app already
+        // open, so there is no launch URL, and it lands on a board route, which
+        // is not a deep-link segment. Same intent, same answer: the climber
+        // signed up to see that climb, so nothing is pushed over it. Awaited,
+        // because the provider's read of its stash can still be in flight.
+        const replayedBoardLink = await didReplayBoardLink();
+        if (cancelled || !getConsentSnapshot().settled) return;
+        if (replayedBoardLink) {
+          decide({
+            outcome: 'skipped',
+            reason: 'replayed_board_link',
+            step: null,
+            hadBoard: hasBoardRef.current,
+            seenFlag: null,
+            pickerVerdict: null,
+            pickerTimesShown: null,
+          });
+          return;
+        }
+
         const seen = await hasSeenOnboarding();
-        if (cancelled) return;
+        if (cancelled || !getConsentSnapshot().settled) return;
 
         // The connect-step test (#5654, PR 7) enrols here, at the post-login
         // decision and before anything the arms do differently can show: the
@@ -392,7 +417,7 @@ export function OnboardingGate() {
           hadBoard: hasBoardRef.current,
           uiVariant: uiVariantRef.current,
         });
-        if (cancelled) return;
+        if (cancelled || !getConsentSnapshot().settled) return;
 
         // A bound board means the flow has already done its job, however the
         // climber got there — the picker, the builder, a Bluetooth adopt, or a
@@ -434,7 +459,7 @@ export function OnboardingGate() {
         let pickerTimesShown: number | null = null;
         if (pickerVerdict === 'presented' && accountId) {
           pickerTimesShown = await readFirstBoardPickerShowCount(accountId);
-          if (cancelled) return;
+          if (cancelled || !getConsentSnapshot().settled) return;
           pickerVerdict = decideFirstBoardPicker({ ...pickerInput, timesShown: pickerTimesShown });
         }
 
@@ -463,7 +488,7 @@ export function OnboardingGate() {
             reportError(error);
             pickerVerdict = 'storage_error';
           }
-          if (cancelled) return;
+          if (cancelled || !getConsentSnapshot().settled) return;
         }
 
         if (pickerVerdict === 'presented') {
@@ -522,5 +547,13 @@ export function OnboardingGate() {
   }, [ready, boardResolved, profileReady, flagsResolved, userId]);
 
   // The board-look step is evaluated and logged too, never presented (#5654).
-  return <BoardLookStepGate ready={ready} tourDecided={tourEvaluated} present={false} />;
+  return (
+    <>
+      <BoardLookStepGate ready={ready} tourDecided={tourEvaluated} present={false} />
+      <ChineseTranslationOnboarding
+        onboardingDecided={tourEvaluated}
+        firstBoardPickerPresented={firstBoardPickerPresented}
+      />
+    </>
+  );
 }

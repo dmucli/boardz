@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import type { ConnectionContext } from '@boardsesh/shared-schema';
+import type { ClientIdentity, ConnectionContext } from '@boardsesh/shared-schema';
 import { logger } from '../utils/logger';
 
 const DEBUG = process.env.NODE_ENV === 'development';
@@ -20,13 +20,25 @@ export type CreateContextOptions = {
   connectionId?: string;
   isAuthenticated?: boolean;
   userId?: string;
+  credentialExpiresAt?: number;
   controllerId?: string;
   controllerApiKey?: string;
   controllerMac?: string;
+  /**
+   * Owner of the validated controller API key. Read-only identity for
+   * `readViewerIdForBoard`; never copied into `userId`.
+   */
+  controllerOwnerUserId?: string;
   /** Rate-limit identity for anonymous callers; see websocket/client-ip.ts. */
   clientIp?: string;
   /** TCP-peer backstop for anonymous WebSocket rate limiting. */
   socketPeerIp?: string;
+  /** A per-address limit key no caller can choose; see utils/client-ip.ts getTrustedClientIp. */
+  trustedClientIp?: string;
+  /** Parsed client identity from connectionParams; identification only. */
+  clientIdentity?: ClientIdentity;
+  /** Trimmed raw client identity string as sent, for logs. */
+  clientIdentityRaw?: string;
 };
 
 /**
@@ -37,11 +49,16 @@ export function createContext({
   connectionId,
   isAuthenticated,
   userId,
+  credentialExpiresAt,
   controllerId,
   controllerApiKey,
   controllerMac,
+  controllerOwnerUserId,
   clientIp,
   socketPeerIp,
+  trustedClientIp,
+  clientIdentity,
+  clientIdentityRaw,
 }: CreateContextOptions = {}): ConnectionContext {
   const id = connectionId || uuidv4();
   const context: ConnectionContext = {
@@ -49,12 +66,17 @@ export function createContext({
     transport: 'ws',
     sessionId: undefined,
     userId: userId,
+    credentialExpiresAt,
     isAuthenticated: isAuthenticated || false,
     controllerId,
     controllerApiKey,
     controllerMac,
+    controllerOwnerUserId,
     clientIp,
     socketPeerIp,
+    trustedClientIp,
+    clientIdentity,
+    clientIdentityRaw,
   };
   connections.set(id, context);
   if (DEBUG) {

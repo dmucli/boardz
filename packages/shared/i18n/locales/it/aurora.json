@@ -1,0 +1,36 @@
+{
+  "metadata": {
+    "migration": {
+      "title": "Importa il tuo diario Kilter o Tension",
+      "description": "Collega il tuo account Kilter o Tension per portare le tue ripetizioni in Boardsesh, oppure importa un file dalla vecchia app Kilter."
+    }
+  },
+  "migration": {
+    "title": "Porta il tuo diario in Boardsesh",
+    "lead": "Puoi portare con te le tue ripetizioni di Kilter e Tension. Scegli il percorso in base a dove hai registrato le tue salite.",
+    "account": {
+      "title": "Hai un account Kilter o Tension",
+      "step1": "Scarica l’app gratuita e accedi.",
+      "step2": "Tocca il tuo avatar, poi Impostazioni, poi App collegate.",
+      "step3": "Tocca Accedi a Kilter oppure Collega sulla scheda Tension.",
+      "sync": "Dopo che colleghi l’account, Boardsesh cerca nuove ripetizioni in background. I tempi variano. Le importazioni vanno solo verso Boardsesh; nulla di ciò che registri qui torna alle loro app.",
+      "signIn": "Accedi"
+    },
+    "legacy": {
+      "title": "Usavi la vecchia app Kilter (Aurora)",
+      "request": "Chiedi ad Aurora una copia dei tuoi dati",
+      "export": "Riceverai un file con le tue salite, i tentativi e i circuiti.",
+      "support": "Scrivi all’assistenza Aurora",
+      "signIn": "Accedi a Boardsesh sul tuo telefono",
+      "upload": "Carica il file",
+      "uploadInstructions": "In App collegate, apri la scheda Kilter (Aurora) e seleziona il file."
+    },
+    "history": {
+      "title": "Perché esiste questa pagina",
+      "body": "A marzo 2026 la vecchia app Kilter ha smesso di funzionare. Chi non aveva esportato il proprio storico non poteva più consultarlo nell’app.",
+      "article": "Leggi l’articolo su Climbing.com"
+    },
+    "install": "Scarica l’app gratuita",
+    "logbookHelp": "Altre guide sul diario"
+  }
+}

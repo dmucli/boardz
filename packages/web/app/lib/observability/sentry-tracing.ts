@@ -8,6 +8,8 @@
  */
 
 import { DEFAULT_LOCALE, SUPPORTED_LOCALES } from '@boardsesh/i18n';
+import { carriesShareCapability } from '../share-capability';
+import { redactPasswordRecoveryUrls, scrubPasswordRecoveryEvent } from '@boardsesh/text-redaction';
 
 /**
  * Sample rate for a server transaction that isn't explicitly zeroed or
@@ -81,17 +83,21 @@ const HEALTH_PATH = '/api/health';
 export const CLIMB_VIEW_TRACES_SAMPLE_RATE = 0.05;
 
 /**
- * `/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/view/[climb_uuid]`,
- * optionally behind a locale prefix. The prefixes are derived from
+ * `/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/view/[climb_uuid]`
+ * and `/b/[board_slug]/[angle]/view/[climb_uuid]`, optionally behind a locale
+ * prefix. The prefixes are derived from
  * SUPPORTED_LOCALES so a new locale cannot slip its climb pages past the ration.
  *
  * Matched against the raw request path, because that is what the sampler sees
  * (`GET /moonboard/2016/standard-11x18-grid/.../40/view/skyline-7804be6e-...`),
- * not the parameterised route name. `view` must be exactly the sixth segment,
- * so `/play/...` and other seven-segment paths keep the default rate.
+ * not the parameterised route name. Both exact climb-view shapes share the
+ * same budget; named-board pages otherwise fall through to the 25% default.
+ * List, play and extra path segments must keep the default rate.
  */
 const LOCALE_PATH_PREFIXES = SUPPORTED_LOCALES.filter((locale) => locale !== DEFAULT_LOCALE).join('|');
-const CLIMB_VIEW_PATH = new RegExp(`^(?:/(?:${LOCALE_PATH_PREFIXES}))?/[^/]+/[^/]+/[^/]+/[^/]+/[^/]+/view/[^/]+/?$`);
+const CLIMB_VIEW_PATH = new RegExp(
+  `^(?:/(?:${LOCALE_PATH_PREFIXES}))?/(?:[^/]+/[^/]+/[^/]+/[^/]+/[^/]+|b/[^/]+/[^/]+)/view/[^/]+/?$`,
+);
 
 const HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'TRACE', 'CONNECT']);
 
@@ -242,54 +248,66 @@ export type RedactableSpan = {
 /**
  * Drop the query string from a URL that shouldn't have one recorded.
  *
- * `sendDefaultPii: true` is on and stays on — it is what puts a user on an
- * error, and triage depends on it. But turning tracing on widens its blast
- * radius from "errors carry a user" to "every sampled request records its URL",
- * so the two query strings that actually matter get stripped here:
+ * `sendDefaultPii` is off (#2644), but that is no promise a span's URL loses
+ * its query string: at most Sentry masks parameters whose NAMES look sensitive
+ * (`auth`, `token`, `session`, ...), and NextAuth's `code` and `state` match
+ * none of them. Tracing records a URL on every sampled request, so the two
+ * query strings that actually matter get stripped here:
  *
  *   /api/auth/**  — NextAuth's `code` and `state`. An OAuth authorization code
  *                   is a single-use credential; it has no business sitting in a
  *                   span attribute that a Sentry seat can read.
  *   ?session=...  — a session identifier in any path.
+ *   ?invite=...   — a home board's share-link token, which lets whoever holds
+ *                   it join the board (`app/lib/board-invite.ts`).
+ *   ?wall=...     — an unlisted Spraywall's uuid, which opens the wall
+ *                   (`app/lib/spray/spray-visibility.ts`). Both of these also
+ *                   when they ride inside a sign-in page's encoded `callbackUrl`.
  */
 export function stripSensitiveQueryString(rawUrl: string): string {
-  const queryStart = rawUrl.indexOf('?');
-  if (queryStart === -1) return rawUrl;
+  const recoverySafe = redactPasswordRecoveryUrls(rawUrl);
+  const queryStart = recoverySafe.indexOf('?');
+  if (queryStart === -1) return recoverySafe;
 
   let parsedUrl: URL;
   try {
-    parsedUrl = new URL(rawUrl, 'http://sampler.invalid');
+    parsedUrl = new URL(recoverySafe, 'http://sampler.invalid');
   } catch {
-    return rawUrl;
+    return recoverySafe;
   }
 
   const isAuthCallback = parsedUrl.pathname === '/api/auth' || parsedUrl.pathname.startsWith('/api/auth/');
-  if (isAuthCallback || parsedUrl.searchParams.has('session')) {
-    return rawUrl.slice(0, queryStart);
+  if (
+    isAuthCallback ||
+    parsedUrl.searchParams.has('session') ||
+    carriesShareCapability(recoverySafe.slice(queryStart))
+  ) {
+    return recoverySafe.slice(0, queryStart);
   }
 
-  return rawUrl;
+  return recoverySafe;
 }
 
 /**
  * `beforeSendSpan` body: rewrite URL attributes in place and hand the span back.
  *
- * Mutates rather than clones because Sentry passes ownership of the span
- * payload to this callback, and cloning a `SpanJSON` would lose nothing but
- * cost an allocation on every span of every sampled request.
+ * Recovery scrubbing clones only changed payloads. Other spans retain their
+ * reference, and existing callback/session/share URL stripping edits that
+ * SDK-owned result in place.
  */
 export function redactSensitiveSpanUrls<TSpan extends RedactableSpan>(span: TSpan): TSpan {
+  const recoverySafe = scrubPasswordRecoveryEvent(span);
   for (const attributeKey of SENSITIVE_URL_SPAN_ATTRIBUTE_KEYS) {
-    const rawUrl = span.data[attributeKey];
+    const rawUrl = recoverySafe.data[attributeKey];
     if (typeof rawUrl !== 'string') continue;
 
     const strippedUrl = stripSensitiveQueryString(rawUrl);
     if (strippedUrl !== rawUrl) {
-      span.data[attributeKey] = strippedUrl;
+      recoverySafe.data[attributeKey] = strippedUrl;
     }
   }
 
-  return span;
+  return recoverySafe;
 }
 
 /** Header Railway's edge stamps on every request it forwards into the container. */
@@ -311,9 +329,16 @@ export type RailwayTaggableEvent = {
  * edge stamps `x-railway-request-id` on the request to the container and logs
  * the same value, so with the tag in place a slow or failing request found in
  * one system can be looked up in the other. Nothing has to be plumbed through
- * the app — `sendDefaultPii: true` already puts request headers on the
- * isolation scope, so the header is sitting on the event by the time a
- * processor runs.
+ * the app: the SDK records the incoming request on the isolation scope, and its
+ * RequestData integration copies the headers onto the event before any scope
+ * processor (this one) runs.
+ *
+ * That still holds with `sendDefaultPii: false` (#2644). With PII off the
+ * integration keeps request headers and only deletes the IP-carrying ones
+ * (`x-forwarded-for`, `cf-connecting-ip`, ...), and `x-railway-request-id` is
+ * not one of them (@sentry/core `requestDataIntegration`,
+ * `extractNormalizedRequestData`). `sentry-railway-request-id.test.ts` runs the
+ * real integration with PII off to prove it.
  *
  * Absent header is the normal case off Railway (local dev, tests): return the
  * event untouched rather than writing an empty tag.

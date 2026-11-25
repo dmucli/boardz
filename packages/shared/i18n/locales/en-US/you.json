@@ -9,7 +9,8 @@
     "sessions": "Sessions",
     "logbook": "Logbook",
     "social": "Social",
-    "climbs": "Climbs"
+    "climbs": "Climbs",
+    "created": "Created"
   },
   "mobile": {
     "unknownName": "Climber",
@@ -35,6 +36,7 @@
       "following": "Following",
       "newFollowers": "New followers",
       "findFriends": "Find",
+      "searchTitle": "Find climbers",
       "searchPlaceholder": "Search climbers",
       "clearSearch": "Clear search",
       "you": "You",
@@ -87,43 +89,29 @@
       "all": "All",
       "year": "Year",
       "month": "Month",
-      "week": "Week",
-      "done": "Done"
+      "week": "Week"
     },
     "logbook": {
       "empty": "Your logbook's empty — log your first send.",
-      "emptyFiltered": "No climbs match these filters.",
+      "emptyFiltered": "Nothing matches these filters. Loosen one, or clear them all.",
       "errorTitle": "Couldn't load your logbook",
       "errorBody": "Check your connection and try again.",
       "retry": "Try again",
-      "searchPlaceholder": "Search your climbs",
-      "filter": "Filter",
-      "sort": "Sort",
-      "refine": "Refine",
-      "advanced": "Advanced",
-      "preset": {
-        "latest": "Latest",
-        "hardest": "Hardest"
-      },
-      "flashOnly": "Flash only",
       "grade": "Grade",
       "angle": "Angle",
-      "show": "Show",
-      "angleMin": "Min angle",
-      "angleMax": "Max angle",
-      "dateRange": "Date range",
       "dateFrom": "From",
       "dateTo": "To",
       "dateAny": "Any",
       "dateSince": "Since {{date}}",
       "dateUntil": "Until {{date}}",
-      "benchmarksOnly": "Benchmarks only",
       "reset": "Reset",
       "editTitle": "Edit ascent",
-      "statusLabel": "Status",
       "delete": "Delete",
+      "deleteAll": "Delete all",
       "deleteTitle": "Delete ascent",
+      "deleteAllTitle": "Delete {{count}} entries",
       "deleteConfirm": "This removes the logged ascent and can't be undone.",
+      "deleteAllConfirm": "This removes all {{count}} logged entries for this day and can't be undone.",
       "saveError": "Couldn't save your changes. Try again.",
       "deleteError": "Couldn't delete the ascent. Try again.",
       "tries_one": "{{count}} try",
@@ -134,7 +122,8 @@
         "attempt": "Attempt",
         "sends": "Sends",
         "attempts": "Attempts",
-        "both": "Both"
+        "all": "All",
+        "flashes": "Flashes"
       },
       "row": {
         "project": "Project",
@@ -148,8 +137,7 @@
         "a11yHasBetaVideo": "has beta video",
         "a11yMirrored": "mirrored",
         "editAction": "Edit entry",
-        "deleteAction": "Delete entry",
-        "moreActions": "More actions"
+        "deleteAction": "Delete entry"
       },
       "day": {
         "today": "Today",
@@ -162,7 +150,112 @@
       },
       "chooser": {
         "editTitle": "Which entry to edit?",
-        "deleteTitle": "Which entry to delete?"
+        "deleteTitle": "Which entry to delete?",
+        "deleteAll": "Delete all {{count}}"
+      },
+      "boardLabel": "Board",
+      "boardNone": "None",
+      "boardPickerLabel": "Choose a board",
+      "boardBack": "Back to edit",
+      "boardRetry": "Couldn’t load boards. Tap to retry.",
+      "boardEmpty": "No saved or recent boards fit this climb.",
+      "emptyOther": "Nothing logged here yet.",
+      "clearFilters": "Clear filters",
+      "capsules": {
+        "filters": "Filters",
+        "filtersWithCount": "Filters · {{count}}",
+        "status": "Status",
+        "stars": "Stars",
+        "anyStars": "Any stars",
+        "starsAtLeast": "{{count}}★+",
+        "when": "When",
+        "customDates": "Custom…",
+        "board": "Board",
+        "boardLayouts_one": "{{board}} · {{count}} layout",
+        "boardLayouts_other": "{{board}} · {{count}} layouts",
+        "setter": "Setter",
+        "setterAria": "Choose setters",
+        "setterPickedAria": "Setter: {{setters}}, choose setters",
+        "setters_one": "{{count}} setter",
+        "setters_other": "{{count}} setters",
+        "benchmarks": "Benchmarks",
+        "verified": "Verified",
+        "gradeOpenHint": "Shows the grade row",
+        "gradeCloseHint": "Hides the grade row",
+        "angleOpenHint": "Shows the angle row",
+        "angleCloseHint": "Hides the angle row",
+        "nameToken": "“{{name}}”"
+      },
+      "dateWindow": {
+        "any": "Any time",
+        "last7": "Last 7 days",
+        "month": "This month",
+        "last3months": "Last 3 months",
+        "year": "This year",
+        "custom": "Custom"
+      },
+      "sortLabel": {
+        "latest": "Latest",
+        "oldest": "Oldest",
+        "hardest": "Hardest",
+        "easiest": "Easiest",
+        "yourHardest": "Your hardest",
+        "yourEasiest": "Your easiest",
+        "theirHardest": "Their hardest",
+        "theirEasiest": "Their easiest",
+        "nameAsc": "Name A–Z",
+        "nameDesc": "Name Z–A",
+        "mostTries": "Most tries",
+        "fewestTries": "Fewest tries"
+      },
+      "filterSheet": {
+        "title": "Filters",
+        "close": "Close filters",
+        "entryCount_one": "{{count}} entry",
+        "entryCount_other": "{{count}} entries",
+        "sectionName": "Climb name",
+        "namePlaceholder": "Search climbs and notes",
+        "sectionDifficulty": "Difficulty",
+        "gradeRange": "Grade range",
+        "sectionYourAscents": "Your ascents",
+        "sectionTheirAscents": "Their ascents",
+        "status": "Status",
+        "yourStars": "Your stars",
+        "theirStars": "Their stars",
+        "anyStars": "Any",
+        "when": "When",
+        "sectionTheClimb": "The climb",
+        "board": "Board",
+        "layout": "Layout",
+        "allLayouts": "All layouts",
+        "setter": "Setter",
+        "setterAny": "Any",
+        "benchmarks": "Benchmarks",
+        "onlyBenchmarks": "Only benchmark climbs",
+        "verified": "Verified",
+        "onlyVerified": "Only Verified climbs",
+        "sectionSort": "Sort",
+        "sortBy": "Sort by",
+        "order": "Order",
+        "descending": "Descending",
+        "ascending": "Ascending",
+        "sortKey": {
+          "date": "Date",
+          "grade": "Grade",
+          "yourGrade": "Your grade",
+          "theirGrade": "Their grade",
+          "name": "Name",
+          "attempts": "Attempts"
+        }
+      },
+      "setterPicker": {
+        "title": "Setters",
+        "showResults": "Show climbs",
+        "tickCount_one": "{{count}} tick",
+        "tickCount_other": "{{count}} ticks",
+        "empty": "No setters in this logbook yet.",
+        "error": "Couldn't load setters.",
+        "limit": "Pick up to {{count}} setters."
       }
     },
     "boardLink": {
@@ -176,6 +269,10 @@
       "moonboardBody": "Bring your MoonBoard history over by requesting your data from MoonBoard, then importing the file here.",
       "moonboardCta": "Import my MoonBoard logbook",
       "dismiss": "Not now"
+    },
+    "loadError": {
+      "sessions": "Couldn't load your sessions",
+      "progress": "Couldn't load your progress"
     }
   }
 }

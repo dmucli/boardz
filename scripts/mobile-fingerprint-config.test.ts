@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 import { createRequire } from 'node:module';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -16,7 +18,10 @@ type HashSource = {
 };
 type ExtraSource = HashSource & { overrideHashKey: string };
 type FingerprintConfig = {
+  preset: string;
   extraSources: ExtraSource[];
+  ignorePaths: string[];
+  sourceSkips: string[];
   fileHookTransform(source: HookSource, chunk: HookChunk): HookChunk;
   __test: {
     AUTOLINKING_SOURCE_IDS: Set<string>;
@@ -36,9 +41,35 @@ type FingerprintResult = { hash: string; sources: FingerprintSource[] };
 type FingerprintApi = {
   DEFAULT_IGNORE_PATHS: string[];
 };
+type FingerprintSourceSkips = Record<string, string | number>;
+type FingerprintConfigApi = {
+  loadConfigAsync(projectRoot: string, silent?: boolean): Promise<{ sourceSkips?: number } | null>;
+  normalizeSourceSkips(sourceSkips: unknown): number;
+};
+type FingerprintOptionsApi = {
+  DEFAULT_SOURCE_SKIPS: number;
+  normalizeOptionsAsync(
+    projectRoot: string,
+    options?: Record<string, unknown>,
+  ): Promise<{
+    sourceSkips: number;
+    nativeModuleSourceType: string;
+    configPluginSourceType: string;
+    ignorePathMatchObjects: Array<{ pattern: string }>;
+  }>;
+};
+type ContentsSource = { type: 'contents'; id: string; contents: string; reasons: string[] };
+type ExpoSourcerApi = {
+  getExpoConfigSourcesAsync(
+    projectRoot: string,
+    config: { exp: Record<string, unknown> },
+    loadedModules: string[] | null,
+    options: { sourceSkips: number; platforms: string[] },
+  ): Promise<ContentsSource[]>;
+};
 type FingerprintHashApi = {
   createFingerprintFromSourcesAsync(
-    sources: HashSource[],
+    sources: Array<HashSource | ContentsSource>,
     projectRoot: string,
     options: Record<string, unknown>,
   ): Promise<FingerprintResult>;
@@ -63,6 +94,19 @@ const fingerprintHashApi = requireFromMobile(
   resolve(fingerprintPackageRoot, 'build/hash/Hash.js'),
 ) as FingerprintHashApi;
 const patchedPathApi = requireFromMobile(resolve(fingerprintPackageRoot, 'build/utils/Path.js')) as PatchedPathApi;
+const fingerprintPresetsApi = requireFromMobile(resolve(fingerprintPackageRoot, 'build/Presets.js')) as {
+  resolvePreset(preset: string): { sourceSkips: number };
+};
+const fingerprintConfigApi = requireFromMobile(
+  resolve(fingerprintPackageRoot, 'build/Config.js'),
+) as FingerprintConfigApi;
+const fingerprintOptionsApi = requireFromMobile(
+  resolve(fingerprintPackageRoot, 'build/Options.js'),
+) as FingerprintOptionsApi;
+const expoSourcerApi = requireFromMobile(resolve(fingerprintPackageRoot, 'build/sourcer/Expo.js')) as ExpoSourcerApi;
+const { SourceSkips } = requireFromMobile(resolve(fingerprintPackageRoot, 'build/sourcer/SourceSkips.js')) as {
+  SourceSkips: FingerprintSourceSkips;
+};
 
 const temporaryRoots: string[] = [];
 
@@ -78,8 +122,11 @@ function writeFixtureFile(projectRoot: string, relativePath: string, contents: s
   writeFileSync(absolutePath, contents);
 }
 
-function createHashOptions(): Record<string, unknown> {
-  const ignorePathMatchObjects = patchedPathApi.buildPathMatchObjects(fingerprintApi.DEFAULT_IGNORE_PATHS);
+function createHashOptions(extraIgnorePaths: string[] = []): Record<string, unknown> {
+  const ignorePathMatchObjects = patchedPathApi.buildPathMatchObjects([
+    ...fingerprintApi.DEFAULT_IGNORE_PATHS,
+    ...extraIgnorePaths,
+  ]);
   return {
     concurrentIoLimit: 4,
     debug: false,
@@ -211,7 +258,7 @@ describe('mobile fingerprint config', () => {
     ).toThrow();
   });
 
-  it('hashes the config itself, the iOS locale strings and the monorepo root patches with stable keys', () => {
+  it('hashes the config itself, the iOS locale strings, the Apple targets and the monorepo root patches with stable keys', () => {
     expect(fingerprintConfig.extraSources).toEqual([
       {
         type: 'file',
@@ -227,11 +274,141 @@ describe('mobile fingerprint config', () => {
       },
       {
         type: 'dir',
+        filePath: 'targets',
+        reasons: ['iosAppleTargets'],
+        overrideHashKey: 'iosAppleTargets',
+      },
+      {
+        type: 'dir',
         filePath: '../../patches',
         reasons: ['rootPatchedDependencies'],
         overrideHashKey: 'rootPatchedDependencies',
       },
     ]);
+  });
+
+  it('adds editor and patch leftovers to the default ignores instead of replacing them', async () => {
+    expect(fingerprintConfig.ignorePaths).toEqual(['**/*.swp', '**/*.swo', '**/*~', '**/*.orig', '**/*.rej']);
+
+    // The real loader: if the config replaced the defaults, .DS_Store and the
+    // Pods/build dirs would start hashing and every local resolve would drift.
+    const normalizedOptions = await fingerprintOptionsApi.normalizeOptionsAsync(MOBILE_ROOT, { silent: true });
+    const patterns = normalizedOptions.ignorePathMatchObjects.map((matchObject) => matchObject.pattern);
+    for (const pattern of [...fingerprintApi.DEFAULT_IGNORE_PATHS, ...fingerprintConfig.ignorePaths]) {
+      expect(patterns).toContain(pattern);
+    }
+  });
+
+  it('keeps a widget dir hash still for editor leftovers and moves it for a Swift edit', async () => {
+    const projectRoot = createTemporaryRoot();
+    writeFixtureFile(projectRoot, 'targets/Widget/Live.swift', 'struct Live {}\n');
+    const hashTargets = async () =>
+      (
+        await fingerprintHashApi.createFingerprintFromSourcesAsync(
+          [{ type: 'dir', filePath: 'targets', reasons: ['iosAppleTargets'], overrideHashKey: 'iosAppleTargets' }],
+          projectRoot,
+          createHashOptions(fingerprintConfig.ignorePaths),
+        )
+      ).hash;
+
+    const baseline = await hashTargets();
+    for (const leftover of ['.Live.swift.swp', '.Live.swift.swo', 'Live.swift~', 'Live.swift.orig', 'Live.swift.rej']) {
+      writeFixtureFile(projectRoot, `targets/Widget/${leftover}`, 'not source\n');
+    }
+    expect(await hashTargets()).toBe(baseline);
+
+    writeFixtureFile(projectRoot, 'targets/Widget/Live.swift', 'struct Live { let edited = true }\n');
+    expect(await hashTargets()).not.toBe(baseline);
+  });
+});
+
+describe('mobile fingerprint source skips', () => {
+  // Resolved Expo config for the fixture. Only fields with no external file
+  // behind them, so the sourcer returns the single `expoConfig` contents source.
+  function expoConfigFixture(overrides: {
+    version?: string;
+    buildNumber?: string;
+    versionCode?: number;
+    bundleIdentifier?: string;
+  }): { exp: Record<string, unknown> } {
+    return {
+      exp: {
+        name: 'Boardsesh',
+        slug: 'boardsesh',
+        version: overrides.version ?? '2.6.0',
+        ios: {
+          bundleIdentifier: overrides.bundleIdentifier ?? 'com.boardsesh.app',
+          buildNumber: overrides.buildNumber ?? '100',
+        },
+        android: { package: 'com.boardsesh.app', versionCode: overrides.versionCode ?? 100 },
+      },
+    };
+  }
+
+  async function expoConfigFingerprint(
+    sourceSkips: number,
+    overrides: Parameters<typeof expoConfigFixture>[0],
+  ): Promise<string> {
+    const projectRoot = createTemporaryRoot();
+    const sources = await expoSourcerApi.getExpoConfigSourcesAsync(projectRoot, expoConfigFixture(overrides), null, {
+      sourceSkips,
+      platforms: ['android', 'ios'],
+    });
+    expect(sources.map((source) => source.id)).toEqual(['expoConfig']);
+    return (await fingerprintHashApi.createFingerprintFromSourcesAsync(sources, projectRoot, createHashOptions())).hash;
+  }
+
+  it('skips the config versions and re-states the default skip it would otherwise replace', () => {
+    expect(fingerprintConfig.sourceSkips).toEqual([
+      'ExpoConfigVersions',
+      'PackageJsonAndroidAndIosScriptsIfNotContainRun',
+    ]);
+  });
+
+  it('names only real SourceSkips members, because the loader ignores an unknown name without an error', () => {
+    for (const skipName of fingerprintConfig.sourceSkips) {
+      expect(typeof SourceSkips[skipName], `"${skipName}" is not a key of the installed SourceSkips enum`).toBe(
+        'number',
+      );
+    }
+    // The failure this guards against: a typo resolves to "skip nothing".
+    expect(fingerprintConfigApi.normalizeSourceSkips(['ExpoConfigVersion'])).toBe(0);
+  });
+
+  it('resolves to bitmask 513 through the real config loader and option merge', async () => {
+    expect(fingerprintConfigApi.normalizeSourceSkips(fingerprintConfig.sourceSkips)).toBe(513);
+    expect(fingerprintConfig.preset).toBe('strict');
+    expect(fingerprintPresetsApi.resolvePreset('strict').sourceSkips).toBe(512);
+
+    const loadedConfig = await fingerprintConfigApi.loadConfigAsync(MOBILE_ROOT, true);
+    expect(loadedConfig?.sourceSkips).toBe(513);
+
+    // normalizeOptionsAsync spreads the config over the default, so this is the
+    // value the resolver actually hashes with. 513 & 512 proves the default
+    // package.json-scripts skip survived being replaced.
+    const normalizedOptions = await fingerprintOptionsApi.normalizeOptionsAsync(MOBILE_ROOT, { silent: true });
+    expect(normalizedOptions.sourceSkips).toBe(513);
+    expect(normalizedOptions.sourceSkips & fingerprintPresetsApi.resolvePreset('strict').sourceSkips).toBe(512);
+    expect(normalizedOptions.nativeModuleSourceType).toBe('files');
+    expect(normalizedOptions.configPluginSourceType).toBe('files');
+  });
+
+  it('keeps the hash still for a version or build-number bump and moves it for a real native input', async () => {
+    const configuredSkips = fingerprintConfigApi.normalizeSourceSkips(fingerprintConfig.sourceSkips);
+
+    const baseline = await expoConfigFingerprint(configuredSkips, {});
+    expect(await expoConfigFingerprint(configuredSkips, { version: '2.6.1' })).toBe(baseline);
+    expect(await expoConfigFingerprint(configuredSkips, { buildNumber: '101', versionCode: 101 })).toBe(baseline);
+    expect(await expoConfigFingerprint(configuredSkips, { bundleIdentifier: 'com.boardsesh.other' })).not.toBe(
+      baseline,
+    );
+
+    // Control: the strict preset without our explicit version skip hashes version
+    // changes. SDK 58's new balanced default already skips versions.
+    const defaultSkips = fingerprintPresetsApi.resolvePreset('strict').sourceSkips;
+    expect(await expoConfigFingerprint(defaultSkips, { version: '2.6.1' })).not.toBe(
+      await expoConfigFingerprint(defaultSkips, {}),
+    );
   });
 });
 
@@ -360,11 +537,11 @@ describe('@expo/fingerprint resolver parity', () => {
     const requireFromExpo = createRequire(expoPackageJsonPath);
     const expoFingerprintPath = requireFromExpo.resolve('@expo/fingerprint/package.json');
 
-    expect(mobilePackage.devDependencies?.['@expo/fingerprint']).toBe('0.20.11');
-    expect(workspaceManifest.patchedDependencies?.['@expo/fingerprint@0.20.11']).toBe(
-      'patches/@expo__fingerprint@0.20.11.patch',
+    expect(mobilePackage.devDependencies?.['@expo/fingerprint']).toBe('0.21.10');
+    expect(workspaceManifest.patchedDependencies?.['@expo/fingerprint@0.21.10']).toBe(
+      'patches/@expo__fingerprint@0.21.10.patch',
     );
-    expect(installedPackage.version).toBe('0.20.11');
+    expect(installedPackage.version).toBe('0.21.10');
     expect(realpathSync(expoFingerprintPath)).toBe(realpathSync(fingerprintPackageJsonPath));
     expect(readFileSync(resolve(dirname(expoPackageJsonPath), 'fingerprint.js'), 'utf8').trim()).toBe(
       "module.exports = require('@expo/fingerprint');",

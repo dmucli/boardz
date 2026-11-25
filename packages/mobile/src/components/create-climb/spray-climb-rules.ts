@@ -2,15 +2,12 @@
 //
 // The editor is board-agnostic once `create-board-holds.ts` knows the holds and
 // `getBoardCapabilities` allows authoring — SW-07 made both true for a wall. What
-// is left is four rules a wall answers differently from a catalogue board, and
+// is left is five rules a wall answers differently from a catalogue board, and
 // they live here as pure functions so the controller reads as one branch per rule
 // and every branch is table-testable without a renderer:
 //
-//  1. **A setter grade is required to publish.** `crowdGrade: false` means there
-//     is no consensus grade to converge on — a handful of people ever climb a
-//     home wall — so a published climb with no grade stays ungraded forever. The
-//     server refuses it (`assertSprayGradeOnPublish`); this is the client half,
-//     which says so BEFORE the round trip.
+//  1. **No setter grade.** The first ascent grades a spray climb, and the
+//     climbers' grades move it after that (#5971), so the editor asks for none.
 //  2. **Feet are open by default.** A spray wall is a field of holds with no
 //     "kicker" and no set-piece feet, and the overwhelming convention on one is
 //     that anything goes for feet. The toggle stays visible — a setter can mark
@@ -22,6 +19,9 @@
 //  4. **The angle is the wall's, not the caller's.** A wall does not adjust, so
 //     the route params (which a deep link can hand-edit, and which the active
 //     board fills in) are not authoritative — the registered wall is.
+//  5. **Save publishes.** The draft switch starts off, because a draft is left
+//     out of the Climbs list and a climb missing from the list of a wall five
+//     people share reads as a lost climb (#5954).
 //
 // Every function here takes the board name, so a catalogue board falls through
 // with today's behaviour rather than needing a `boardName !== 'spray'` at each
@@ -30,25 +30,60 @@
 import type { LitUpHoldsMap } from '@boardsesh/shared-schema';
 import { getSprayWall, SPRAY_BOARD_NAME } from '../../lib/spray/spray-wall-registry';
 
+/** A published, live wall this account may maintain, or no entry point. */
+export function editableSprayWallUuidFor(boardName: string, layoutId: number): string | undefined {
+  if (boardName !== SPRAY_BOARD_NAME) return undefined;
+  const wall = getSprayWall(layoutId);
+  if (!wall || wall.draft || !wall.viewerCanEdit || wall.archive.archivedAt != null) return undefined;
+  return wall.wallUuid;
+}
+
 /** True for the one board type these rules apply to. */
 export function isSprayBoard(boardName: string): boolean {
   return boardName === SPRAY_BOARD_NAME;
 }
 
-/**
- * Whether publishing on this board needs the setter's own grade.
- *
- * Spray only. MoonBoard has no crowd grade either, but its climbs are authored
- * through `saveMoonBoardClimb`, which carries its own grade field and its own
- * form — this editor never publishes one.
- */
-export function requiresSetterGrade(boardName: string): boolean {
-  return isSprayBoard(boardName);
-}
-
 /** Where the "any feet" switch starts on a fresh climb. */
 export function defaultAnyFeet(boardName: string): boolean {
   return isSprayBoard(boardName);
+}
+
+/**
+ * Where the "Save as draft" switch starts on a fresh climb.
+ *
+ * Off on a spray wall, so Save publishes (#5954). Drafts are left out of the
+ * Climbs list, and on a wall a handful of people share, a climb that is not in
+ * the list reads as a climb that was lost. A catalogue board keeps the draft
+ * default: publishing there puts the climb in front of everyone on that board.
+ *
+ * Only the switch's STARTING position. A restored autosave slot and an edit
+ * session both carry their own answer and overrule this.
+ */
+export function defaultIsDraft(boardName: string): boolean {
+  return !isSprayBoard(boardName);
+}
+
+/**
+ * Whether the "No kickboard" rule means anything on this board.
+ *
+ * A kickboard is the strip of fixed feet under a catalogue board. A spray wall
+ * is a photograph of a home wall with no such strip, so the editor hides the
+ * switch there (#5960).
+ */
+export function offersNoKickboardRule(boardName: string): boolean {
+  return !isSprayBoard(boardName);
+}
+
+/**
+ * Whether the editor offers its Bluetooth lightbulb on this board.
+ *
+ * On a Bluetooth board the bulb starts a connect. A spray wall only has lights
+ * when its owner set up LEDs for it; there the bulb takes the wall, so the
+ * editor previews the holds while you paint them. Without LEDs it would be a
+ * dead control (#5960).
+ */
+export function offersBoardLightbulb(boardName: string, sprayLedsEnabled = false): boolean {
+  return !isSprayBoard(boardName) || sprayLedsEnabled;
 }
 
 /** Does the working frame mark any foot holds? */

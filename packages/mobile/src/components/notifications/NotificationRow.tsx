@@ -12,6 +12,9 @@ import { useTheme } from '../../providers/theme-provider';
 import { spacing } from '../../theme/tokens';
 import { formatRelativeTime } from '../../lib/format-relative-time';
 import { actorSummary, notificationCopy, notificationIconName } from './notification-copy';
+import { FollowRequestNotificationRow, type AnswerFollowRequest } from './FollowRequestNotificationRow';
+import { SetupChangeNotificationRow } from './SetupChangeNotificationRow';
+import type { UndoSetupChange } from './setup-change-notice';
 
 const AVATAR_SIZE = 40;
 const GROUP_AVATAR_SIZE = 28;
@@ -22,6 +25,19 @@ type NotificationRowProps = {
   notification: GroupedNotification;
   /** Stable handler from the screen — marks read, then navigates. */
   onPress: (notification: GroupedNotification) => void;
+  /**
+   * Stable handler from the screen that approves or declines a follow request.
+   * Only a `follow_request` row reads it; without one that row falls back to
+   * the plain layout, which still opens the requester's profile.
+   */
+  onAnswerFollowRequest?: AnswerFollowRequest;
+  /**
+   * Stable handler from the screen that puts back the setup a climber's
+   * suggestion replaced. Only a `board_setup_changed_by_climber` row reads it;
+   * without one (the `directory-setup-suggestions` flag off) that row keeps the
+   * plain layout, which still opens the board.
+   */
+  onUndoSetupChange?: UndoSetupChange;
 };
 
 /**
@@ -39,7 +55,30 @@ type NotificationRowProps = {
  * undefined` so `PressableAvatar` degrades to a plain avatar rather than
  * nesting a competing pressable inside the row's own.
  */
-export const NotificationRow = memo(function NotificationRow({ notification, onPress }: NotificationRowProps) {
+export const NotificationRow = memo(function NotificationRow({
+  notification,
+  onPress,
+  onAnswerFollowRequest,
+  onUndoSetupChange,
+}: NotificationRowProps) {
+  // A follow request carries its own Approve / Decline buttons, so it cannot be
+  // one tap target like the rest: it gets its own layout.
+  if (notification.type === 'follow_request' && onAnswerFollowRequest) {
+    return (
+      <FollowRequestNotificationRow notification={notification} onPress={onPress} onAnswer={onAnswerFollowRequest} />
+    );
+  }
+  // So does a climber's setup change, for its Undo.
+  if (notification.type === 'board_setup_changed_by_climber' && onUndoSetupChange) {
+    return <SetupChangeNotificationRow notification={notification} onPress={onPress} onUndo={onUndoSetupChange} />;
+  }
+  return <ActivityNotificationRow notification={notification} onPress={onPress} />;
+});
+
+function ActivityNotificationRow({
+  notification,
+  onPress,
+}: Omit<NotificationRowProps, 'onAnswerFollowRequest' | 'onUndoSetupChange'>) {
   const { t } = useTranslation('notifications');
   const { systemColors, brandColors } = useTheme();
 
@@ -86,6 +125,10 @@ export const NotificationRow = memo(function NotificationRow({ notification, onP
     >
       {climbRender ? (
         <NotificationClimbThumbnail render={climbRender} actor={actors[0]} />
+      ) : notification.type === 'spray_wall_detection_completed' ? (
+        <View style={styles.avatarSlot}>
+          <Icon name={notificationIconName(notification.type)} size={32} color={brandColors.primary} />
+        </View>
       ) : (
         <View style={styles.avatarSlot}>
           {showAvatarGroup ? (
@@ -123,7 +166,7 @@ export const NotificationRow = memo(function NotificationRow({ notification, onP
       )}
     </PressableSurface>
   );
-});
+}
 
 const styles = StyleSheet.create({
   row: {

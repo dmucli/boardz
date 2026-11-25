@@ -8,7 +8,7 @@
  *  - the settings component directory and the stranded MoonBoard CSV importer
  *    stay deleted,
  *  - the surfaces the scope-down explicitly keeps stay present — including the
- *    lifted credential card, which two indexable pages render,
+ *    lifted credential card,
  *  - `/settings` keeps no redirect rule in any locale, and
  *  - `/settings` stays in `robots.ts`'s disallow list.
  */
@@ -24,12 +24,11 @@ const DELETED_PATHS = ['app/components/settings', 'app/lib/data-sync/moonboard']
 /**
  * The delete-safety half. A sweep that over-reached into `board-entity/`, the
  * controllers route or the Aurora JSON importer reds here rather than in
- * production: `/aurora-migration` and `/profile/{id}` are indexable and both
- * render the lifted credential card, and the controllers route is the ESP32
+ * production: `/profile/{id}` renders the lifted credential card, and the controllers route is the ESP32
  * hardware the epic deliberately keeps on Next.
  */
 const KEPT_PATHS = [
-  'app/settings/page.tsx',
+  'app/(site)/settings/page.tsx',
   'app/settings/settings-page-content.tsx',
   'app/components/account/controllers-section.tsx',
   'app/components/account/set-password-section.tsx',
@@ -38,7 +37,6 @@ const KEPT_PATHS = [
   'app/components/board-entity/board-credential-card.tsx',
   'app/components/board-entity/board-credential-card.module.css',
   'app/components/board-entity/board-import-prompt.tsx',
-  'app/aurora-migration/aurora-migration-content.tsx',
   'app/profile/[user_id]/components/board-stats-section.tsx',
   'app/lib/data-sync/aurora/json-import-stream.ts',
 ];

@@ -13,8 +13,9 @@
 // the list stay flat.
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, render, screen, fireEvent, waitFor } from '@testing-library/react';
-import { createElement, type ReactNode } from 'react';
+import { createElement, type ReactElement, type ReactNode } from 'react';
 import type { UserBoard } from '@boardsesh/shared-schema';
+import type { ScopeDownloadProgress } from '@boardsesh/offline-sync';
 
 type Children = { children?: ReactNode };
 type ButtonProps = { title: string; onPress?: () => void };
@@ -27,6 +28,7 @@ type ManageRowProps = {
   canRetryFastDownload?: boolean;
   onRetryFastDownload?: (board: UserBoard) => void;
   onToggleOffline: (board: UserBoard) => void;
+  offlineControlsDisabled?: boolean;
 };
 
 const routerMock = vi.hoisted(() => ({ push: vi.fn() }));
@@ -66,19 +68,15 @@ const state = vi.hoisted(() => ({
   snapshotSourceAvailable: true,
   /** `offline-download-progress`. Defaults ON, like the real flag. */
   downloadProgressEnabled: true,
+  /** `add-board-wizard`. */
+  wizard: false,
   syncStatus: {
     isSyncing: false,
     progress: null as {
       phase: string;
       currentTable: string | null;
       currentTableProcessed?: number;
-      snapshot?: {
-        scopeKey: string;
-        stage: 'manifest' | 'download' | 'import';
-        fraction: number | null;
-        wireBytes: number | null;
-        wireBytesDone: number | null;
-      };
+      download?: ScopeDownloadProgress;
     } | null,
     bootstrapMetadataRevision: 0,
     scopeCompletionRevision: 0,
@@ -90,6 +88,9 @@ const state = vi.hoisted(() => ({
     isError: false,
     isRefetching: false,
   },
+  myBoardsInputs: [] as unknown[],
+  // A live progress read that no longer lists a wall the board list called an import.
+  liveImportCleared: false,
 }));
 
 const board = (overrides: Partial<UserBoard> & { uuid: string; name: string }): UserBoard =>
@@ -103,6 +104,22 @@ const board = (overrides: Partial<UserBoard> & { uuid: string; name: string }): 
     ownerId: 'me',
     ...overrides,
   }) as unknown as UserBoard;
+
+function downloadFrame(
+  scopeKey: string,
+  phase: ScopeDownloadProgress['phase'],
+  rowsProcessed?: number,
+): ScopeDownloadProgress {
+  return {
+    scopeKey,
+    phase,
+    fraction: null,
+    wireBytes: null,
+    wireBytesDone: null,
+    queuedScopes: 0,
+    ...(rowsProcessed !== undefined ? { rowsProcessed } : {}),
+  };
+}
 
 function deferred<Result>() {
   let resolvePromise!: (result: Result) => void;
@@ -145,9 +162,48 @@ vi.mock('@shopify/flash-list', () => ({
     ),
 }));
 
+vi.mock('../../../src/lib/spray/use-spray-import-progress', () => ({
+  useSprayImportProgress: (boards: Array<{ uuid: string; sprayImport?: unknown }>) => ({
+    boards: state.liveImportCleared ? boards.map((listed) => ({ ...listed, sprayImport: null })) : boards,
+    stale: false,
+    unfinishedWallUuids: new Set(boards.filter((listed) => listed.sprayImport).map((listed) => listed.uuid)),
+  }),
+}));
+
+// The + menu rides the native header: `setOptions` records what the screen put
+// there, and `headerPlus()` renders it.
+const navigationMock = vi.hoisted(() => ({ setOptions: vi.fn() }));
 vi.mock('expo-router', () => ({
   useRouter: () => routerMock,
+  useNavigation: () => navigationMock,
 }));
+vi.mock('../../../src/components/board-discovery/AddBoardMenu', () => ({
+  AddBoardMenu: ({ onSelect }: { onSelect: (kind: string) => void }) =>
+    createElement(
+      'div',
+      null,
+      ['board', 'spraywall', 'gym_map'].map((kind) =>
+        createElement('button', { key: kind, type: 'button', onClick: () => onSelect(kind) }, `add ${kind}`),
+      ),
+    ),
+}));
+vi.mock('../../../src/components/board-discovery/AddBoardButton', () => ({
+  AddBoardButton: ({ onPress }: { onPress: () => void }) =>
+    createElement('button', { type: 'button', onClick: onPress }, 'add wizard'),
+}));
+const trackAddSelectedMock = vi.hoisted(() => vi.fn());
+const trackKindChosenMock = vi.hoisted(() => vi.fn());
+vi.mock('../../../src/lib/boards/board-picker-add-analytics', () => ({
+  trackBoardPickerAddSelected: trackAddSelectedMock,
+  trackBoardKindChosen: trackKindChosenMock,
+}));
+
+/** The header's trailing item as the screen last set it, or null. */
+function headerPlus(): (() => ReactElement) | null {
+  const calls = navigationMock.setOptions.mock.calls;
+  const options = calls.at(-1)?.[0] as { headerRight?: () => ReactElement } | undefined;
+  return options?.headerRight ?? null;
+}
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -243,18 +299,35 @@ vi.mock('@boardsesh/offline-sync', () => ({
 }));
 
 vi.mock('../../../src/lib/graphql/hooks', () => ({
-  useMyBoards: () => ({ ...state.myBoards, refetch: vi.fn() }),
+  useMyBoards: (input: unknown) => {
+    state.myBoardsInputs.push(input);
+    return { ...state.myBoards, refetch: vi.fn() };
+  },
   useProfile: () => ({
     data: state.profileId ? { id: state.profileId } : undefined,
     isLoading: state.isProfileLoading,
     isError: false,
     refetch: vi.fn(),
   }),
+  useDeleteBoard: () => ({ mutateAsync: archived.deleteBoard }),
 }));
 
 vi.mock('../../../src/lib/graphql/use-active-board', () => ({
   useActiveBoard: () => ({ data: state.activeBoard }),
+  getActiveBoardWriteGeneration: () => 0,
+  useClearActiveBoardIfCurrentGeneration: () => vi.fn(),
 }));
+vi.mock('../../../src/providers/queue-provider', () => ({ useQueueActions: () => ({ clearSession: vi.fn() }) }));
+const archived = vi.hoisted(() => ({
+  lifecycle: undefined as unknown,
+  refetch: vi.fn(),
+  deleteBoard: vi.fn(async () => true),
+  forget: vi.fn(async () => {}),
+  reportError: vi.fn(),
+  rows: [] as { wall: { uuid: string; layoutId: number; name: string }; onDelete: (wall: unknown) => void }[],
+}));
+vi.mock('../../../src/lib/spray/forget-deleted-spray-wall', () => ({ forgetDeletedSprayWall: archived.forget }));
+vi.mock('../../../src/lib/error-reporting', () => ({ reportError: archived.reportError }));
 
 vi.mock('../../../src/providers/auth-provider', () => ({
   useAuth: () => ({ isAuthenticated: true, refreshAuthState: vi.fn() }),
@@ -278,6 +351,7 @@ vi.mock('../../../src/providers/theme-provider', () => ({
 vi.mock('../../../src/providers/feature-flags-provider', () => ({
   useOfflineDownloadsEnabled: () => true,
   useOfflineDownloadProgressEnabled: () => state.downloadProgressEnabled,
+  useAddBoardWizardEnabled: () => state.wizard,
 }));
 vi.mock('../../../src/hooks/use-bottom-chrome-metrics', () => ({
   useBottomChromeMetrics: () => ({ scrollBottomPadding: 0 }),
@@ -296,7 +370,21 @@ vi.mock('../../../src/hooks/use-current-user-id', () => ({
     return { userId: state.storedUserId, isLoading: state.isStoredUserIdLoading };
   },
 }));
-vi.mock('../../../src/sync', () => ({ useSyncStatus: () => state.syncStatus }));
+vi.mock('../../../src/sync/sync-status', () => ({
+  getSyncStatusSnapshot: () => state.syncStatus,
+  useSyncStatusMetadata: () => ({ ...state.syncStatus, phase: state.syncStatus.progress?.phase ?? null }),
+}));
+vi.mock('../../../src/sync/download-activity-store', () => ({
+  useDownloadActivity: () => {
+    const progress = state.syncStatus.progress?.download;
+    return progress ? { status: 'active', progress } : null;
+  },
+}));
+vi.mock('../../../src/offline/download-keep-awake-store', () => ({
+  getPendingUserStartedDownloads: () => [],
+  isDownloadKeepAwakeActive: () => false,
+  subscribeDownloadKeepAwake: () => () => {},
+}));
 vi.mock('../../../src/offline/use-board-downloads', () => ({
   useBoardDownloads: () => ({ enableBoardsOffline: vi.fn(), retryFastDownload: retryFastDownloadMock }),
 }));
@@ -350,6 +438,19 @@ vi.mock('../../../src/components/Button', () => ({
 vi.mock('../../../src/components/ActivityIndicator', () => ({
   ActivityIndicator: () => createElement('div', { 'data-testid': 'spinner' }),
 }));
+// The Archived section reads the owner's wall list and opens a wall by uuid;
+// neither has anything to do with the offline list these cases cover.
+vi.mock('../../../src/lib/spray/use-create-spray-wall', () => ({
+  useMySprayWallLifecycle: () => ({ data: archived.lifecycle, refetch: archived.refetch }),
+}));
+vi.mock('../../../src/lib/spray/use-open-spray-wall', () => ({ useOpenSprayWall: () => vi.fn() }));
+vi.mock('../../../src/lib/boards/use-activate-board', () => ({ useActivateBoard: () => vi.fn() }));
+vi.mock('../../../src/components/board-discovery/ArchivedWallManageRow', () => ({
+  ArchivedWallManageRow: (props: (typeof archived.rows)[number]) => {
+    archived.rows.push(props);
+    return null;
+  },
+}));
 vi.mock('../../../src/components/board-discovery/BoardManageRow', () => ({
   BoardManageRow: ({
     board: rowBoard,
@@ -360,6 +461,7 @@ vi.mock('../../../src/components/board-discovery/BoardManageRow', () => ({
     canRetryFastDownload,
     onRetryFastDownload,
     onToggleOffline,
+    offlineControlsDisabled,
   }: ManageRowProps) =>
     createElement(
       'div',
@@ -370,6 +472,7 @@ vi.mock('../../../src/components/board-discovery/BoardManageRow', () => ({
         'data-download-notice': downloadNotice ?? '',
         'data-download-stage': downloadProgress?.stage ?? '',
         'data-can-retry-fast': String(!!canRetryFastDownload),
+        'data-offline-controls-disabled': String(!!offlineControlsDisabled),
       },
       rowBoard.name,
       createElement(
@@ -388,9 +491,11 @@ vi.mock('../../../src/components/board-discovery/BoardManageRow', () => ({
 }));
 
 const { default: ManageBoards } = await import('../manage');
+const { resetSchemaDowngradeForTests, setSchemaDowngrade } = await import('../../../src/db/schema-downgrade');
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetSchemaDowngradeForTests();
   confirmMock.mockResolvedValue(false);
   estimateScopeDownloadMock.mockReturnValue({ kind: 'unknown' });
   state.isOffline = false;
@@ -407,6 +512,7 @@ beforeEach(() => {
   state.bootstrapMetadataRead = undefined;
   state.snapshotSourceAvailable = true;
   state.downloadProgressEnabled = true;
+  state.wizard = false;
   state.syncStatus = {
     isSyncing: false,
     progress: null,
@@ -415,6 +521,10 @@ beforeEach(() => {
   };
   state.activeBoard = undefined;
   state.myBoards = { data: undefined, isLoading: false, isError: false, isRefetching: false };
+  state.myBoardsInputs = [];
+  state.liveImportCleared = false;
+  archived.lifecycle = undefined;
+  archived.rows = [];
 });
 
 describe('My Boards with no usable network list', () => {
@@ -519,6 +629,7 @@ describe('My Boards with no usable network list', () => {
         phase: 'board_data',
         currentTable: 'board_climbs:kilter:8:17',
         currentTableProcessed: 12,
+        download: downloadFrame('kilter:8:17', 'downloading', 12),
       },
       bootstrapMetadataRevision: 0,
       scopeCompletionRevision: 0,
@@ -651,6 +762,7 @@ describe('My Boards with no usable network list', () => {
       progress: {
         phase: 'bootstrap',
         currentTable: 'tension:2:10',
+        download: downloadFrame('tension:2:10', 'unpacking'),
       },
       bootstrapMetadataRevision: 1,
       scopeCompletionRevision: 0,
@@ -704,9 +816,10 @@ describe('My Boards with no usable network list', () => {
       progress: {
         phase: 'bootstrap',
         currentTable: 'kilter:8:17',
-        snapshot: {
+        download: {
           scopeKey: 'kilter:8:17',
-          stage: 'download',
+          phase: 'downloading',
+          queuedScopes: 0,
           fraction: 0.4,
           wireBytes: 103_000_000,
           wireBytesDone: 41_200_000,
@@ -719,11 +832,11 @@ describe('My Boards with no usable network list', () => {
     return document.querySelector('[data-board="net-1"]');
   };
 
-  it('hands the downloading row its live snapshot frame', () => {
+  it('hands the downloading row its whole-download frame', () => {
     expect(renderBootstrappingRow()?.getAttribute('data-download-stage')).toBe('download');
   });
 
-  it('withholds the snapshot frame from the row when the progress kill switch is off', () => {
+  it('withholds the whole-download frame from the row when the progress kill switch is off', () => {
     state.downloadProgressEnabled = false;
     const row = renderBootstrappingRow();
     expect(row?.getAttribute('data-download-stage')).toBe('');
@@ -757,6 +870,7 @@ describe('My Boards with no usable network list', () => {
         phase: 'board_data',
         currentTable: 'board_climb_grades:kilter:8:17',
         currentTableProcessed: 73,
+        download: downloadFrame('kilter:8:17', 'downloading', 73),
       },
       bootstrapMetadataRevision: 1,
       scopeCompletionRevision: 0,
@@ -816,6 +930,7 @@ describe('My Boards with no usable network list', () => {
         progress: {
           phase,
           currentTable: phase === 'user_data' ? 'boardsesh_ticks' : null,
+          download: downloadFrame('tension:2:10', 'finishing'),
         },
         bootstrapMetadataRevision: 0,
         scopeCompletionRevision: 0,
@@ -875,7 +990,15 @@ describe('My Boards with no usable network list', () => {
       ]);
       state.syncStatus = {
         isSyncing: true,
-        progress: { phase, currentTable },
+        progress: {
+          phase,
+          currentTable,
+          download: downloadFrame(
+            'tension:2:10',
+            phase === 'bootstrap' ? 'unpacking' : 'downloading',
+            phase === 'board_data' ? 0 : undefined,
+          ),
+        },
         bootstrapMetadataRevision: isSecondBootstrapDone ? 2 : 1,
         scopeCompletionRevision: 0,
       };
@@ -912,7 +1035,11 @@ describe('My Boards with no usable network list', () => {
     state.bootstrapMetadataRead = Promise.resolve(beforeImport);
     state.syncStatus = {
       isSyncing: true,
-      progress: { phase: 'bootstrap', currentTable: 'kilter:8:17' },
+      progress: {
+        phase: 'bootstrap',
+        currentTable: 'kilter:8:17',
+        download: downloadFrame('kilter:8:17', 'unpacking'),
+      },
       bootstrapMetadataRevision: 0,
       scopeCompletionRevision: 0,
     };
@@ -944,7 +1071,8 @@ describe('My Boards with no usable network list', () => {
     };
     rerender(createElement(ManageBoards));
 
-    // The prior revision's unfinished marker is rejected while the new-key read
+    // Without a scope finishing frame, the prior revision's unfinished marker
+    // is rejected while the new-key read
     // is pending, so the row cannot claim finalizing until SQLite confirms it.
     expect(document.querySelector('[data-board="board-a"]')?.getAttribute('data-download-state')).toBe('pending');
 
@@ -985,6 +1113,7 @@ describe('My Boards with no usable network list', () => {
         phase: 'board_data',
         currentTable: 'board_climbs:kilter:8:17',
         currentTableProcessed: 42,
+        download: downloadFrame('kilter:8:17', 'downloading', 42),
       },
       bootstrapMetadataRevision: 1,
       scopeCompletionRevision: 0,
@@ -1011,6 +1140,7 @@ describe('My Boards with no usable network list', () => {
         phase: 'board_data',
         currentTable: 'board_climbs:tension:2:10',
         currentTableProcessed: 7,
+        download: downloadFrame('tension:2:10', 'downloading', 7),
       },
       bootstrapMetadataRevision: 1,
       scopeCompletionRevision: 1,
@@ -1082,12 +1212,15 @@ describe('My Boards with no usable network list', () => {
     render(createElement(ManageBoards));
 
     expect(screen.queryByRole('button', { name: 'Create a board' })).toBeNull();
+    expect(headerPlus()).toBeNull();
     // The local offline toggle keeps working — its state comes off disk, not the wire.
     expect(document.querySelector('[data-board="board-a"]')?.getAttribute('data-download-state')).toBe('downloaded');
     expect(screen.getByText('toggle-offline board-a')).toBeTruthy();
   });
 
-  it('leaves the owned/followed split and the Create button alone online', () => {
+  // The outlined Create board button over the list became the picker's + menu
+  // in the top bar.
+  it('leaves the owned/followed split alone online, with the + menu in the top bar', () => {
     state.profileId = 'me';
     state.myBoards = {
       data: { boards: [board({ uuid: 'net-1', name: 'Network board' })] },
@@ -1101,9 +1234,46 @@ describe('My Boards with no usable network list', () => {
     render(createElement(ManageBoards));
 
     expect(screen.getByText('Your boards')).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Create a board' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Create a board' })).toBeNull();
     expect(screen.getByText('Network board')).toBeTruthy();
     expect(screen.queryByText('Marco garage')).toBeNull();
+
+    const plus = headerPlus();
+    expect(plus).not.toBeNull();
+    if (!plus) return;
+    render(createElement(plus));
+    fireEvent.click(screen.getByRole('button', { name: 'add spraywall' }));
+    expect(trackAddSelectedMock).toHaveBeenCalledWith({ kind: 'spraywall', surface: 'manage' });
+    expect(routerMock.push).toHaveBeenCalledWith({ pathname: '/boards/spray/new', params: {} });
+
+    // The gym map from here counts its own opening: no `from: 'picker'`.
+    fireEvent.click(screen.getByRole('button', { name: 'add gym_map' }));
+    expect(trackAddSelectedMock).toHaveBeenCalledWith({ kind: 'gym_map', surface: 'manage' });
+    expect(routerMock.push).toHaveBeenLastCalledWith({ pathname: '/boards/gyms', params: {} });
+  });
+
+  // With the add-a-board wizard on, the + is one button to its step 1.
+  it('opens the wizard from a single + when the flag is on', () => {
+    state.wizard = true;
+    state.profileId = 'me';
+    state.myBoards = {
+      data: { boards: [board({ uuid: 'net-1', name: 'Network board' })] },
+      isLoading: false,
+      isError: false,
+      isRefetching: false,
+    };
+
+    render(createElement(ManageBoards));
+    const plus = headerPlus();
+    expect(plus).not.toBeNull();
+    if (!plus) return;
+    render(createElement(plus));
+    expect(screen.queryByRole('button', { name: 'add gym_map' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'add wizard' }));
+    expect(trackAddSelectedMock).toHaveBeenCalledWith({ kind: 'board', surface: 'manage' });
+    expect(trackKindChosenMock).not.toHaveBeenCalled();
+    expect(routerMock.push).toHaveBeenLastCalledWith({ pathname: '/boards/add', params: { entry: 'manage' } });
   });
 
   it('degrades to the downloaded list, not the error state, when the profile fails online', () => {
@@ -1289,7 +1459,7 @@ describe('My Boards: retrying the fast download (#4313)', () => {
     retryAfter: null,
   };
 
-  function renderWithMetadata(metadata: Record<string, unknown>): void {
+  function renderWithMetadata(metadata: Record<string, unknown>) {
     state.profileId = 'me';
     state.myBoards = {
       data: { boards: [board({ uuid: 'net-1', name: 'Network board' })] },
@@ -1299,7 +1469,7 @@ describe('My Boards: retrying the fast download (#4313)', () => {
     };
     state.enabledBoards = ['kilter:8:17'];
     state.bootstrapMetadataByScope = new Map([['kilter:8:17', metadata]]) as typeof state.bootstrapMetadataByScope;
-    render(createElement(ManageBoards));
+    return render(createElement(ManageBoards));
   }
 
   it('offers the retry only for a settled board that has not finished downloading', () => {
@@ -1317,10 +1487,103 @@ describe('My Boards: retrying the fast download (#4313)', () => {
     expect(document.querySelector('[data-board="net-1"]')?.getAttribute('data-can-retry-fast')).toBe('false');
   });
 
-  it('does not offer it to a board that already imported an artifact', () => {
+  it('offers faster retry after an artifact import while the download remains incomplete', () => {
     renderWithMetadata({ ...settledMetadata, isBootstrapDone: true });
-    expect(document.querySelector('[data-board="net-1"]')?.getAttribute('data-can-retry-fast')).toBe('false');
+    expect(document.querySelector('[data-board="net-1"]')?.getAttribute('data-can-retry-fast')).toBe('true');
   });
+
+  it('hides retry through active snapshot phases and restores it for paged or interrupted work', () => {
+    const { rerender } = renderWithMetadata({ ...settledMetadata, isBootstrapDone: true, isTerminal: false });
+    const canRetry = () => document.querySelector('[data-board="net-1"]')?.getAttribute('data-can-retry-fast');
+    expect(canRetry()).toBe('true');
+    for (const phase of ['preparing', 'downloading', 'unpacking', 'grades'] as const) {
+      state.syncStatus = {
+        ...state.syncStatus,
+        isSyncing: true,
+        progress: { phase: 'bootstrap', currentTable: 'kilter:8:17', download: downloadFrame('kilter:8:17', phase) },
+      };
+      rerender(createElement(ManageBoards));
+      expect(canRetry(), phase).toBe('false');
+    }
+    for (const phase of ['downloading', 'finishing'] as const) {
+      state.syncStatus = {
+        ...state.syncStatus,
+        isSyncing: true,
+        progress: {
+          phase: 'bootstrap',
+          currentTable: 'kilter:8:17',
+          download: downloadFrame('kilter:8:17', phase, 500),
+        },
+      };
+      rerender(createElement(ManageBoards));
+      expect(canRetry(), phase).toBe('true');
+    }
+    state.syncStatus = { ...state.syncStatus, isSyncing: false, progress: null };
+    rerender(createElement(ManageBoards));
+    expect(canRetry()).toBe('true');
+  });
+
+  it('does not open a stale retry prompt after this scope starts bootstrapping', async () => {
+    renderWithMetadata({ ...settledMetadata, isBootstrapDone: true });
+    state.syncStatus = {
+      ...state.syncStatus,
+      isSyncing: true,
+      progress: {
+        phase: 'bootstrap',
+        currentTable: 'kilter:8:17',
+        download: downloadFrame('kilter:8:17', 'unpacking'),
+      },
+    };
+    await act(async () => {
+      fireEvent.click(screen.getByText('retry-fast net-1'));
+    });
+    expect(confirmMock).not.toHaveBeenCalled();
+    expect(retryFastDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it('coalesces rapid retry taps while a confirmation is pending', async () => {
+    const confirmation = deferred<boolean>();
+    confirmMock.mockReturnValue(confirmation.promise);
+    renderWithMetadata(settledMetadata);
+    fireEvent.click(screen.getByText('retry-fast net-1'));
+    fireEvent.click(screen.getByText('retry-fast net-1'));
+    await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      confirmation.resolve(false);
+    });
+    expect(retryFastDownloadMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['same-scope snapshot', 'kilter:8:17', 'unpacking', undefined, false],
+    ['sibling snapshot', 'kilter:8:18', 'unpacking', undefined, true],
+    ['same-scope paged tail', 'kilter:8:17', 'downloading', 500, true],
+    ['same-scope finishing', 'kilter:8:17', 'finishing', 500, true],
+  ] as const)(
+    'rechecks live %s after an awaiting confirmation',
+    async (_label, scopeKey, phase, rowsProcessed, shouldRetry) => {
+      const confirmation = deferred<boolean>();
+      confirmMock.mockReturnValue(confirmation.promise);
+      renderWithMetadata({ ...settledMetadata, isBootstrapDone: true });
+      fireEvent.click(screen.getByText('retry-fast net-1'));
+      await waitFor(() => expect(confirmMock).toHaveBeenCalledTimes(1));
+      // Deliberately do not re-render: the confirmation must inspect live state.
+      state.syncStatus = {
+        ...state.syncStatus,
+        isSyncing: true,
+        progress: {
+          phase: 'bootstrap',
+          currentTable: scopeKey,
+          download: downloadFrame(scopeKey, phase, rowsProcessed),
+        },
+      };
+      await act(async () => {
+        confirmation.resolve(true);
+      });
+      if (shouldRetry) await waitFor(() => expect(retryFastDownloadMock).toHaveBeenCalledTimes(1));
+      else expect(retryFastDownloadMock).not.toHaveBeenCalled();
+    },
+  );
 
   it('quotes the download size in the confirm and restores the budget only when accepted', async () => {
     estimateScopeDownloadMock.mockReturnValue({ kind: 'snapshot', bytes: 103_000_000 } as { kind: string });
@@ -1346,5 +1609,165 @@ describe('My Boards: retrying the fast download (#4313)', () => {
 
     await waitFor(() => expect(confirmMock).toHaveBeenCalled());
     expect(retryFastDownloadMock).not.toHaveBeenCalled();
+  });
+});
+
+// Older JS on a database newer JS migrated (a reverted canary OTA, leaving early
+// updates): nothing can be downloaded this session, and the screen has to say so
+// instead of leaving controls that do nothing.
+describe('My Boards while offline storage is paused', () => {
+  beforeEach(() => {
+    state.profileId = 'me';
+    state.myBoards = {
+      data: { boards: [board({ uuid: 'net-1', name: 'Network board' })] },
+      isLoading: false,
+      isError: false,
+      isRefetching: false,
+    };
+  });
+
+  it('leaves the download controls enabled on a database this app version can open', () => {
+    const { container } = render(createElement(ManageBoards));
+
+    expect(container.querySelector('[data-board="net-1"]')?.getAttribute('data-offline-controls-disabled')).toBe(
+      'false',
+    );
+    expect(screen.queryByText('mobile.settings.storage.downgradeTitle')).toBeNull();
+  });
+
+  it('disables every row\u2019s download controls and explains why, in the words Storage uses', () => {
+    setSchemaDowngrade({ storedVersion: 11, supportedVersion: 10 });
+
+    const { container } = render(createElement(ManageBoards));
+
+    expect(container.querySelector('[data-board="net-1"]')?.getAttribute('data-offline-controls-disabled')).toBe(
+      'true',
+    );
+    expect(screen.getByText('mobile.settings.storage.downgradeTitle')).toBeTruthy();
+    expect(screen.getByText('mobile.settings.storage.downgradeSubtitle')).toBeTruthy();
+    // Creating a board needs no local database.
+    expect(headerPlus()).not.toBeNull();
+  });
+});
+
+describe('My Boards archived walls', () => {
+  function renderWithArchivedWall() {
+    state.profileId = 'me';
+    state.myBoards = {
+      data: { boards: [board({ uuid: 'net-1', name: 'Network board' })] },
+      isLoading: false,
+      isError: false,
+      isRefetching: false,
+    };
+    archived.lifecycle = [
+      {
+        uuid: 'old-wall',
+        layoutId: 77,
+        archivedAt: '2026-10-01T09:00:00.000Z',
+        resetOfWallUuid: null,
+        board: { uuid: 'old-wall', name: 'Garage' },
+      },
+    ];
+    render(createElement(ManageBoards));
+    const row = archived.rows.at(-1);
+    if (!row) throw new Error('archived row not rendered');
+    return row;
+  }
+
+  // The archive cap tells the owner to delete one; this is where they can.
+  it('deletes an archived wall behind the confirm, and forgets it on this phone', async () => {
+    confirmMock.mockResolvedValue(true);
+    const row = renderWithArchivedWall();
+    expect(row.wall).toMatchObject({ uuid: 'old-wall', layoutId: 77, name: 'Garage' });
+
+    await act(async () => row.onDelete(row.wall));
+
+    expect(confirmMock).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'sprayArchive.deleteMessage', destructive: true }),
+    );
+    expect(archived.deleteBoard).toHaveBeenCalledExactlyOnceWith('old-wall');
+    expect(archived.forget).toHaveBeenCalledWith(
+      expect.objectContaining({ uuid: 'old-wall', layoutId: 77 }),
+      expect.anything(),
+    );
+    expect(archived.refetch).toHaveBeenCalled();
+  });
+
+  // The wall is gone on the server; a failure in this phone's own cleanup is
+  // reported, and the list still refreshes so the deleted row leaves.
+  it('still refreshes the list when the cleanup after a delete fails', async () => {
+    confirmMock.mockResolvedValue(true);
+    archived.forget.mockRejectedValueOnce(new Error('disk full'));
+    const row = renderWithArchivedWall();
+    await act(async () => row.onDelete(row.wall));
+    expect(archived.deleteBoard).toHaveBeenCalledTimes(1);
+    expect(archived.reportError).toHaveBeenCalledWith(expect.objectContaining({ message: 'disk full' }));
+    expect(archived.refetch).toHaveBeenCalled();
+  });
+
+  it('sends one delete for a second trash tap while the first is out', async () => {
+    let answer: (value: boolean) => void = () => {};
+    confirmMock.mockReturnValue(
+      new Promise<boolean>((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const row = renderWithArchivedWall();
+    await act(async () => {
+      row.onDelete(row.wall);
+      row.onDelete(row.wall);
+    });
+    await act(async () => answer(true));
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(archived.deleteBoard).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes nothing when the owner backs out', async () => {
+    confirmMock.mockResolvedValue(false);
+    const row = renderWithArchivedWall();
+    await act(async () => row.onDelete(row.wall));
+    expect(archived.deleteBoard).not.toHaveBeenCalled();
+    expect(archived.forget).not.toHaveBeenCalled();
+  });
+});
+
+describe('unfinished spray walls in Manage', () => {
+  const importing = board({
+    uuid: 'spray-wall',
+    name: 'Importing garage',
+    boardType: 'spray',
+    layoutId: 9001,
+    sizeId: 1,
+    canEdit: true,
+    sprayImport: {
+      wallUuid: 'spray-wall',
+      versionId: '42',
+      detectionId: null,
+      stage: 'draft',
+      queuePosition: null,
+      retryAt: null,
+      resetOfWallUuid: null,
+    },
+  });
+
+  it("asks the board list for the viewer's unfinished spray walls", () => {
+    state.profileId = 'me';
+    render(createElement(ManageBoards));
+    expect(state.myBoardsInputs.length).toBeGreaterThan(0);
+    for (const input of state.myBoardsInputs) expect(input).toEqual({ includeUnfinishedSprayWalls: true });
+  });
+
+  it('opens the wizard instead of a download for a wall the list called unfinished once its live progress is gone', async () => {
+    state.profileId = 'me';
+    state.liveImportCleared = true;
+    state.myBoards = { data: { boards: [importing] }, isLoading: false, isError: false, isRefetching: false };
+
+    render(createElement(ManageBoards));
+    await act(async () => {
+      fireEvent.click(screen.getByText('toggle-offline spray-wall'));
+    });
+
+    expect(routerMock.push).toHaveBeenCalledWith({ pathname: '/boards/spray/new', params: { wallUuid: 'spray-wall' } });
+    expect(confirmMock).not.toHaveBeenCalled();
   });
 });

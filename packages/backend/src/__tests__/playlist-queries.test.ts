@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
+import { sqlText } from '@boardsesh/db/test-utils';
 import { playlistQueries, getPlaylistFollowStats } from '../graphql/resolvers/playlists/queries';
 
 const { mockDb } = vi.hoisted(() => {
@@ -13,9 +14,16 @@ const { mockDb } = vi.hoisted(() => {
   return { mockDb };
 });
 
-vi.mock('../db/client', () => ({
-  db: mockDb,
-}));
+vi.mock('../db/client', async () => {
+  const { playlistOwnership } = await import('@boardsesh/db/schema');
+  const mockClient = {
+    ...mockDb,
+    select: (selection?: Record<string, unknown>) =>
+      // These payload/format tests use a public-playlist visitor; membership authorization has real-DB matrix coverage.
+      selection?.id === playlistOwnership.id ? createMockChain([]) : mockDb.select(selection),
+  };
+  return { db: mockClient, dbRead: mockClient };
+});
 
 vi.mock('../events/index', () => ({
   publishSocialEvent: vi.fn().mockResolvedValue(undefined),
@@ -82,7 +90,7 @@ function makeCtx(overrides: Partial<ConnectionContext> = {}): ConnectionContext 
 }
 
 function createMockChain(resolveValue: unknown = []): Record<string, unknown> {
-  const chain: Record<string, unknown> = {};
+  const chain = Object.assign(Promise.resolve(resolveValue), {} as Record<string, unknown>);
   const methods = [
     'select',
     'from',
@@ -101,8 +109,6 @@ function createMockChain(resolveValue: unknown = []): Record<string, unknown> {
     'update',
     'set',
   ];
-
-  chain.then = (resolve: (value: unknown) => unknown) => Promise.resolve(resolveValue).then(resolve);
 
   for (const method of methods) {
     chain[method] = vi.fn((..._args: unknown[]) => chain);
@@ -173,13 +179,16 @@ describe('playlistClimbs resolver', () => {
   it('should throw for private playlist when not authenticated', async () => {
     const ctx = makeCtx({ isAuthenticated: false, userId: undefined });
 
-    // Playlist exists but is private
-    const playlistChain = createMockChain([{ id: BigInt(1), isPublic: false }]);
+    // Authorization is part of the lookup WHERE, so an inaccessible row is absent.
+    const playlistChain = createMockChain([]);
     mockDb.select.mockReturnValueOnce(playlistChain);
 
     await expect(playlistQueries.playlistClimbs(null, { input: { playlistId: 'private-pl' } }, ctx)).rejects.toThrow(
       'Playlist not found or access denied',
     );
+    const predicate = vi.mocked(playlistChain.where as (condition: unknown) => unknown).mock.calls[0][0];
+    expect(sqlText(predicate)).toContain('public_consent_revision');
+    expect(sqlText(predicate)).toContain('is_private');
   });
 
   it('should return climbs in all-boards mode when boardName is omitted', async () => {

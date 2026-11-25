@@ -58,6 +58,17 @@ export function listOverlayCacheEntries(_cacheDirName: string): OverlayCacheEntr
   return entries.length > 0 ? entries : null;
 }
 
+/** Web URIs are the store's own object URLs, never file paths: kept as listed. */
+export function rendererOverlayUri(listedUri: string): string {
+  return listedUri;
+}
+
+export function deleteOverlayCacheEntry(uri: string): void {
+  snapshotOverlayEntries()
+    .find((entry) => entry.uri === uri)
+    ?.delete?.();
+}
+
 /**
  * Browser object URLs cannot be synchronously mapped back to a Cache API entry.
  * Returning null makes an image failure terminal instead of guessing that a

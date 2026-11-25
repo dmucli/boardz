@@ -19,6 +19,12 @@ export const subscriptionsTypeDefs = /* GraphQL */ `
     notificationReceived: NotificationEvent!
 
     """
+    Changes to the signed-in reporter's bug reports, including edits, withdrawals
+    and GitHub issue status. Ownership is rechecked before every event.
+    """
+    appBugReportChanged: AppBugReportChangedEvent!
+
+    """
     Subscribe to real-time comment updates on an entity.
     """
     commentUpdates(entityType: SocialEntityType!, entityId: String!): CommentEvent!
@@ -37,10 +43,17 @@ export const subscriptionsTypeDefs = /* GraphQL */ `
 
     """
     Subscribe to the live "now on the wall" feed for a shared board (board_id
-    resolved from the BLE serial). Membership-free: any authenticated user who
-    has connected to the board can watch. Sessions are not involved.
+    resolved from the BLE serial). Membership-free; the board's policy decides.
+    The board id alone is the no-link reading (ids can be counted); pass
+    \`boardUuid\` to open an Unlisted board. Sessions are not involved.
     """
-    boardNowPlaying(boardId: Int!): BoardPresenceEvent!
+    boardNowPlaying(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+      "Opt in to Aurora history; older clients only understand native and Kilter displays."
+      includeAurora: Boolean = false
+    ): BoardPresenceEvent!
 
     """
     Live redacted "Up next" previews of the party-session queue bound to a
@@ -59,7 +72,11 @@ export const subscriptionsTypeDefs = /* GraphQL */ `
     (\`current: null, upNext: [], queueLength: 0\`) is published so displays
     clear instead of showing the last queue forever.
     """
-    boardQueuePreview(boardId: Int!): BoardQueuePreview!
+    boardQueuePreview(
+      boardId: Int!
+      "The board's uuid, its link. The numeric id alone is countable, so without this an Unlisted board reads as NOT_FOUND."
+      boardUuid: ID
+    ): BoardQueuePreview!
 
     # ESP32 subscribes to receive LED commands - uses API key auth via connectionParams
     controllerEvents(sessionId: ID!): ControllerEvent!

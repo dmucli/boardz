@@ -14,7 +14,14 @@ export type HelpShot =
   | 'logbook'
   | 'board-sheet'
   | 'board-view'
-  | 'climb-actions';
+  | 'climb-actions'
+  | 'preview'
+  | 'board-lighting'
+  | 'drive-timed'
+  | 'drive-open'
+  | 'spray-editor-select'
+  | 'spray-editor-draw'
+  | 'spray-editor-corners';
 
 export type HelpCapture = { src: string; width: number; height: number };
 

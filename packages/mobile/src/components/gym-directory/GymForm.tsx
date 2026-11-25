@@ -1,20 +1,24 @@
+import { useHeaderHeight } from 'expo-router/react-navigation';
+import { AccessibleTextInput as TextInput } from '../AccessibleTextInput';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
 import { useCallback, useState, type ComponentProps, type ReactNode } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, TextInput, View } from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../../providers/theme-provider';
 import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
+import { useHeaderActions } from '../../hooks/use-header-actions';
 import { SwitchRow } from '../SwitchRow';
 import { Text } from '../Text';
-import { Button } from '../Button';
 import { spacing, borderRadius } from '../../theme/tokens';
-import { iosSystemColors } from '../../theme/ios-colors';
 import { parseCoordinate, LATITUDE_RANGE, LONGITUDE_RANGE } from './gym-coordinate';
+import { GYM_HOURS_MAX_LENGTH } from '@boardsesh/shared-schema';
 
 /** The gym's current values, used to seed the form once on mount. */
 export type GymFormSeed = {
   name: string;
   description: string;
+  /** Free-text opening hours; line breaks are kept and shown as typed. */
+  hours: string;
   address: string;
   website: string;
   contactEmail: string;
@@ -29,6 +33,7 @@ export type GymFormSeed = {
 export type GymFormSubmitValues = {
   name: string;
   description: string | null;
+  hours: string | null;
   address: string | null;
   website: string | null;
   contactEmail: string | null;
@@ -53,21 +58,23 @@ function coordToText(value: number | null): string {
 }
 
 /**
- * The gym editor form — name, description, address, contact email/phone,
- * coordinates, and a public toggle, with a pinned primary action. The native
+ * The gym editor form — name, description, opening hours, address, contact email/phone,
+ * coordinates, and a public toggle; the submit sits in the native header. The native
  * (StyleSheet + theme) counterpart of the web gym form; the gym-edit screen owns
  * the mutation, success toast, and navigation. Seeds its fields once via the
  * `useState` initializers, so re-renders never clobber in-progress edits (the
  * screen remounts it per gym).
  */
 export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections }: GymFormProps) {
+  const headerHeight = useHeaderHeight();
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('boards');
   const { systemColors } = useTheme();
-  const insets = useSafeAreaInsets();
   const bottomChrome = useBottomChromeMetrics();
 
   const [name, setName] = useState(seed.name);
   const [description, setDescription] = useState(seed.description);
+  const [hours, setHours] = useState(seed.hours);
   const [address, setAddress] = useState(seed.address);
   const [website, setWebsite] = useState(seed.website);
   const [contactEmail, setContactEmail] = useState(seed.contactEmail);
@@ -88,6 +95,7 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
     onSubmit({
       name: trimmedName,
       description: description.trim() || null,
+      hours: hours.trim() || null,
       address: address.trim() || null,
       website: website.trim() || null,
       contactEmail: contactEmail.trim() || null,
@@ -101,6 +109,7 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
     submitting,
     onSubmit,
     description,
+    hours,
     address,
     website,
     contactEmail,
@@ -110,11 +119,31 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
     isPublic,
   ]);
 
+  // Save sits in the header, never pinned over the keyboard. The gym editor is
+  // pushed on the root stack, so the native back chevron stays as leading.
+  useHeaderActions({
+    trailing: {
+      kind: 'confirm',
+      label: submitLabel,
+      onPress: handleSubmit,
+      disabled: !canSubmit,
+      loading: submitting,
+      prominent: true,
+    },
+    // The form can be swapped for a not-found or no-access state while the
+    // route stays: take Save with it.
+    clearOnUnmount: true,
+  });
+
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <KeyboardAvoidingView
+      keyboardVerticalOffset={headerHeight}
+      style={styles.flex}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
       <ScrollView
         contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={[styles.content, { paddingBottom: bottomChrome.scrollBottomPadding + spacing[16] }]}
+        contentContainerStyle={[styles.content, { paddingBottom: bottomChrome.scrollBottomPadding }]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
       >
@@ -139,6 +168,17 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
           style={styles.multiline}
         />
 
+        <SectionLabel>{t('mobile.gymEdit.hours')}</SectionLabel>
+        <GymTextInput
+          value={hours}
+          onChangeText={setHours}
+          placeholder={t('mobile.gymEdit.hoursPlaceholder')}
+          accessibilityLabel={t('mobile.gymEdit.hours')}
+          maxLength={GYM_HOURS_MAX_LENGTH}
+          multiline
+          style={styles.multiline}
+        />
+
         <SectionLabel>{t('mobile.gymEdit.address')}</SectionLabel>
         <GymTextInput
           value={address}
@@ -159,7 +199,7 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
           autoCorrect={false}
           maxLength={500}
         />
-        <Text variant="footnote" color={systemColors.tertiaryLabel} style={styles.fieldHint}>
+        <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.fieldHint}>
           {t('mobile.gymEdit.websiteHint')}
         </Text>
 
@@ -198,7 +238,7 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
               maxLength={20}
             />
             {latitude.error && (
-              <Text variant="footnote" color={iosSystemColors.systemRed} style={styles.coordError}>
+              <Text variant="footnote" color={systemColors.error} style={styles.coordError}>
                 {t('mobile.gymEdit.invalidCoordinate')}
               </Text>
             )}
@@ -215,7 +255,7 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
               maxLength={20}
             />
             {longitude.error && (
-              <Text variant="footnote" color={iosSystemColors.systemRed} style={styles.coordError}>
+              <Text variant="footnote" color={systemColors.error} style={styles.coordError}>
                 {t('mobile.gymEdit.invalidCoordinate')}
               </Text>
             )}
@@ -233,32 +273,12 @@ export function GymForm({ seed, submitting, onSubmit, submitLabel, extraSections
 
         {extraSections}
       </ScrollView>
-
-      {/* Pinned, safe-area-aware primary action — mirrors the board form footer. */}
-      <View
-        style={[
-          styles.footer,
-          {
-            backgroundColor: systemColors.secondaryBackground,
-            borderTopColor: systemColors.separator,
-            paddingBottom: insets.bottom + spacing[3],
-          },
-        ]}
-      >
-        <Button
-          title={submitLabel}
-          onPress={handleSubmit}
-          variant="filled"
-          size="large"
-          disabled={!canSubmit}
-          loading={submitting}
-        />
-      </View>
     </KeyboardAvoidingView>
   );
 }
 
 function SectionLabel({ children }: { children: string }) {
+  const styles = useTypographyStyles(createStyles);
   const { systemColors } = useTheme();
   return (
     <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.sectionLabel}>
@@ -269,6 +289,7 @@ function SectionLabel({ children }: { children: string }) {
 
 /** Themed text input for the gym form fields. Mirrors the board form's input. */
 function GymTextInput({ style, ...props }: ComponentProps<typeof TextInput>) {
+  const styles = useTypographyStyles(createStyles);
   const { systemColors } = useTheme();
   return (
     <TextInput
@@ -287,49 +308,45 @@ function GymTextInput({ style, ...props }: ComponentProps<typeof TextInput>) {
   );
 }
 
-const styles = StyleSheet.create({
-  flex: {
-    flex: 1,
-  },
-  content: {
-    padding: spacing[4],
-    gap: spacing[2],
-  },
-  sectionLabel: {
-    marginTop: spacing[3],
-    marginBottom: spacing[1],
-    textTransform: 'uppercase',
-  },
-  input: {
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    borderRadius: borderRadius.lg,
-    borderWidth: StyleSheet.hairlineWidth,
-    fontSize: 17,
-  },
-  multiline: {
-    minHeight: 88,
-    textAlignVertical: 'top',
-  },
-  fieldHint: {
-    marginTop: spacing[1],
-  },
-  coordRow: {
-    flexDirection: 'row',
-    gap: spacing[3],
-  },
-  coordField: {
-    flex: 1,
-  },
-  coordError: {
-    marginTop: spacing[1],
-  },
-  switchBlock: {
-    marginTop: spacing[4],
-  },
-  footer: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[3],
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    flex: {
+      flex: 1,
+    },
+    content: {
+      padding: spacing[4],
+      gap: spacing[2],
+    },
+    sectionLabel: {
+      marginTop: spacing[3],
+      marginBottom: spacing[1],
+      textTransform: 'uppercase',
+    },
+    input: {
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      borderRadius: borderRadius.lg,
+      borderWidth: StyleSheet.hairlineWidth,
+      fontSize: textStyles.body.fontSize,
+    },
+    multiline: {
+      minHeight: 88,
+      textAlignVertical: 'top',
+    },
+    fieldHint: {
+      marginTop: spacing[1],
+    },
+    coordRow: {
+      flexDirection: 'row',
+      gap: spacing[3],
+    },
+    coordField: {
+      flex: 1,
+    },
+    coordError: {
+      marginTop: spacing[1],
+    },
+    switchBlock: {
+      marginTop: spacing[4],
+    },
+  });

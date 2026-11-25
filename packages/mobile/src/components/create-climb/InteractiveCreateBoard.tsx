@@ -1,5 +1,6 @@
+import type { WindowAnchorPoint } from '../navigation/AnchoredPopover.types';
 import React, {
-  useEffect,
+  useCallback,
   useImperativeHandle,
   useMemo,
   useRef,
@@ -7,13 +8,14 @@ import React, {
   type ReactNode,
   type RefObject,
 } from 'react';
-import { View, StyleSheet, PixelRatio } from 'react-native';
-import Animated from 'react-native-reanimated';
+import { View, StyleSheet, PixelRatio, type ViewStyle } from 'react-native';
+import Animated, { useDerivedValue } from 'react-native-reanimated';
 import { GestureDetector, GestureHandlerRootView, type GestureType } from 'react-native-gesture-handler';
 import type { BoardName, LitUpHoldsMap } from '@boardsesh/shared-schema';
 import { BoardImageNative } from '../BoardImageNative';
 import { ResetZoomButton } from '../board-controls/ResetZoomButton';
 import { useZoomPanGesture } from '../play-drawer/use-zoom-pan-gesture';
+import type { ZoomViewport } from '../play-drawer/zoom-viewport-clamp';
 import { spacing } from '../../theme/tokens';
 import { EDITING_VEIL_OPACITY } from '../../lib/board-render-settings';
 import type { BoardHoldTarget } from '../../lib/create-board-holds';
@@ -43,34 +45,38 @@ type InteractiveCreateBoardProps = {
   holdTargets: BoardHoldTarget[];
   litUpHoldsMap: LitUpHoldsMap;
   onPaint: (holdId: number) => void;
-  onLongPressHold: (holdId: number) => void;
+  onLongPressHold: (holdId: number, anchor?: WindowAnchorPoint) => void;
   mirrored?: boolean;
   /** Exact on-screen board size, computed by the drawer up front so the board
-   *  renders immediately (no onLayout round-trip while the sheet animates in). */
+   *  renders immediately (no onLayout round-trip while the modal animates in). */
   renderWidth: number;
   renderHeight: number;
+  /** Full editing-card clip; the fitted board keeps its resting size inside it. */
+  viewport?: ZoomViewport;
   /** Optional overlay (e.g. heatmap) drawn between the board photo and the holds. */
   overlay?: ReactNode;
   /** Lets the drawer reset the zoom — both from its own chrome and on frame change. */
   controlRef?: RefObject<CreateBoardControls | null>;
-  /** Fires whenever the board is zoomed or mid-pinch. The create drawer's sheet
-   *  is an `@expo/ui` native bottom sheet (Jetpack Compose on Android, SwiftUI
-   *  on iOS), not an RNGH surface — RNGH's gesture-relation APIs (the pinchRef
-   *  simultaneity above) can't reach outside this board's own root, so nothing
-   *  here stops the sheet's own drag gesture from grabbing a 2-finger pinch or
-   *  a 1-finger pan-while-zoomed. The host uses this to disable that gesture
-   *  for the duration (see CreateDrawer's enablePanDownToClose). */
-  onInteractionActiveChange?: (active: boolean) => void;
   /** RNGH ref to the surrounding scroll (CreateDrawer's own RNGH `ScrollView`,
-   *  swapped in for `@expo/ui`'s plain-RN-ScrollView `BottomSheetScrollView`
-   *  specifically so this relation is possible). Declares the pinch
+   *  not a plain RN one, specifically so this relation is possible). Declares the pinch
    *  simultaneous with it so a 2-finger pinch with any vertical component
    *  isn't cancelled by the scroll's own touch interception, and makes that
    *  scroll wait on the zoomed-only pan so a 1-finger drag while zoomed pans
-   *  the board instead of scrolling the sheet. Mirrors PlayDrawer's
+   *  the board instead of scrolling the editor. Mirrors PlayDrawer's
    *  scrollRef — see the import comment at the top of CreateDrawer.tsx. */
   scrollRef?: RefObject<ComponentType | undefined | null>;
+  /**
+   * Holds a remixed climb lost, drawn as grey rings by the `overlay`, as tap
+   * targets in the same photo pixels as `holdTargets`. A lost hold's id can
+   * never be a live hold's id, so the two sets share one hit list and the
+   * nearest centre still decides; a hit on a ring goes to `onGhostPress`
+   * instead of painting.
+   */
+  ghostTargets?: readonly BoardHoldTarget[];
+  onGhostPress?: (lostHoldId: number) => void;
 };
+
+const NO_GHOST_TARGETS: readonly BoardHoldTarget[] = [];
 
 /**
  * The no-SVG interactive board editor. The board and its painted holds come from
@@ -90,16 +96,14 @@ type InteractiveCreateBoardProps = {
  * Sized by the drawer (renderWidth/renderHeight) so it paints on the first frame.
  * Gesture model mirrors the Play Drawer's board: pinch is always live, but the
  * 1-finger zoom-pan only mounts while zoomed (a conditional overlay) so idle
- * vertical drags fall through to the BottomSheetScrollView and scroll/close the
- * drawer instead of being eaten here.
+ * vertical drags fall through to the editor's ScrollView and scroll it instead
+ * of being eaten here.
  *
- * Wrapped in its own GestureHandlerRootView: on Android, CreateDrawer's sheet
- * (`@expo/ui/community/bottom-sheet`) hosts its content inside a Jetpack Compose
- * `ModalBottomSheet` via a native `RNHostView` bridge — a separate surface the
- * app's single root-level GestureHandlerRootView (app/_layout.tsx) doesn't cover.
- * Without a nested root here, the tap/long-press overlay and the pinch/pan
- * gestures silently never receive touches on Android, so no hold can be
- * painted (#4320). RNGH's own docs call out nesting a root per-Modal for exactly
+ * Wrapped in its own GestureHandlerRootView: the editor used to live in an
+ * `@expo/ui` bottom sheet, which on Android hosts its content in a separate
+ * Compose surface the app's root-level GestureHandlerRootView doesn't cover, and
+ * no hold could be painted (#4320). It is a modal route now, but the nested root
+ * is harmless and keeps the board working wherever it is hosted. RNGH's own docs call out nesting a root per-Modal for exactly
  * this reason; iOS isn't affected since its modal presentation doesn't split the
  * touch-dispatch tree the same way.
  */
@@ -118,10 +122,12 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
   mirrored = false,
   renderWidth,
   renderHeight,
+  viewport,
   overlay,
   controlRef,
-  onInteractionActiveChange,
   scrollRef,
+  ghostTargets = NO_GHOST_TARGETS,
+  onGhostPress,
 }: InteractiveCreateBoardProps) {
   // Shared with both tap overlays so they mark themselves simultaneous with the
   // pinch — otherwise a finger resting on the overlay claims the pointer and
@@ -131,13 +137,14 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
     pinchGesture,
     zoomPanGesture,
     isZoomed,
-    isPinching,
     isPinchingSV,
     scaleSV,
     translateXSV,
     translateYSV,
     containerWidthSV,
     containerHeightSV,
+    viewportOffsetXSV,
+    viewportOffsetYSV,
     resetZoom,
     animatedZoomStyle,
   } = useZoomPanGesture({
@@ -147,7 +154,14 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
     panActivationOffset: PAN_ACTIVATION_OFFSET,
     pinchRef,
     scrollRef,
+    viewport,
   });
+
+  // The zoomed overlay covers the viewport, so its screen coordinates include
+  // the resting board's offset. Fold that into the inverse-transform inputs,
+  // exactly as InteractiveFilterBoard does for its full-size editing stage.
+  const viewportTranslateX = useDerivedValue(() => translateXSV.value + (viewportOffsetXSV?.value ?? 0));
+  const viewportTranslateY = useDerivedValue(() => translateYSV.value + (viewportOffsetYSV?.value ?? 0));
 
   // Rasterize the holds overlay at the size it is actually displayed, not the
   // board's native ~1080px. Clamped to board width inside useNativeClimbRender
@@ -157,12 +171,6 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
 
   useImperativeHandle(controlRef, () => ({ resetZoom }), [resetZoom]);
 
-  // Tell the host (CreateDrawer) to disable its native sheet's own pan while
-  // the board is zoomed or mid-pinch — see onInteractionActiveChange above.
-  useEffect(() => {
-    onInteractionActiveChange?.(isZoomed || isPinching);
-  }, [isZoomed, isPinching, onInteractionActiveChange]);
-
   const holdById = useMemo(() => {
     const map = new Map<number, BoardHoldTarget>();
     for (const hold of holdTargets) map.set(hold.id, hold);
@@ -170,10 +178,40 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
   }, [holdTargets]);
 
   // Hit circles both tap overlays resolve a point against, so the two zoom
-  // levels agree on which hold a touch belongs to.
+  // levels agree on which hold a touch belongs to. Rings go FIRST: the nearest
+  // centre wins and a tie keeps the earlier target, and a ring often sits right
+  // under the live hold that replaced it (a resize or a traced outline keeps
+  // the centre). The tap takes the ring away, and the next one paints the hold.
   const hitTargets = useMemo(
-    () => buildHoldHitTargets(holdTargets, boardWidth, boardHeight, renderWidth, renderHeight, mirrored),
-    [holdTargets, boardWidth, boardHeight, renderWidth, renderHeight, mirrored],
+    () =>
+      buildHoldHitTargets(
+        ghostTargets.length > 0 ? [...ghostTargets, ...holdTargets] : holdTargets,
+        boardWidth,
+        boardHeight,
+        renderWidth,
+        renderHeight,
+        mirrored,
+      ),
+    [holdTargets, ghostTargets, boardWidth, boardHeight, renderWidth, renderHeight, mirrored],
+  );
+
+  // A tap or long-press that resolved to a ring dismisses it; anything else
+  // paints (or opens the role sheet) as before.
+  const ghostIds = useMemo(() => new Set(ghostTargets.map((target) => target.id)), [ghostTargets]);
+  const handleTap = useCallback(
+    (holdId: number) => {
+      if (onGhostPress && ghostIds.has(holdId)) onGhostPress(holdId);
+      else onPaint(holdId);
+    },
+    [ghostIds, onGhostPress, onPaint],
+  );
+  const handleLongPress = useCallback(
+    (holdId: number, anchor?: WindowAnchorPoint) => {
+      if (onGhostPress && ghostIds.has(holdId)) onGhostPress(holdId);
+      else if (anchor) onLongPressHold(holdId, anchor);
+      else onLongPressHold(holdId);
+    },
+    [ghostIds, onGhostPress, onLongPressHold],
   );
 
   // At rest the same circles feed a single full-bleed overlay, so a tap goes to
@@ -181,8 +219,8 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
   // render last (#4496).
   const restGesture = useRestHoldTapGesture({
     hitTargets,
-    onTap: onPaint,
-    onLongPress: onLongPressHold,
+    onTap: handleTap,
+    onLongPress: handleLongPress,
     pinchRef,
     isPinchingSV,
   });
@@ -190,13 +228,13 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
   const overlayGesture = useZoomedHoldTapGesture({
     zoomPanGesture,
     scaleSV,
-    translateXSV,
-    translateYSV,
+    translateXSV: viewport ? viewportTranslateX : translateXSV,
+    translateYSV: viewport ? viewportTranslateY : translateYSV,
     containerWidthSV,
     containerHeightSV,
     hitTargets,
-    onTap: onPaint,
-    onLongPress: onLongPressHold,
+    onTap: handleTap,
+    onLongPress: handleLongPress,
     pinchRef,
     isPinchingSV,
   });
@@ -232,12 +270,26 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
     [overlay],
   );
 
+  const boardBoxStyle: ViewStyle | null = viewport
+    ? {
+        position: 'absolute',
+        left: viewport.offsetX,
+        top: viewport.offsetY,
+        width: renderWidth,
+        height: renderHeight,
+      }
+    : null;
+
   return (
     <GestureHandlerRootView style={styles.root}>
       <GestureDetector gesture={pinchGesture}>
-        <View style={[styles.clip, { width: renderWidth, height: renderHeight }]}>
-          <Animated.View style={[styles.board, animatedZoomStyle]}>
+        <View
+          testID="create-board-viewport"
+          style={[styles.clip, { width: viewport?.width ?? renderWidth, height: viewport?.height ?? renderHeight }]}
+        >
+          <Animated.View testID="create-board-render-box" style={[boardBoxStyle ?? styles.board, animatedZoomStyle]}>
             <BoardImageNative
+              editorSurface
               frames={frames}
               boardName={boardName}
               layoutId={layoutId}
@@ -252,6 +304,7 @@ export const InteractiveCreateBoard = React.memo(function InteractiveCreateBoard
               retainPreviousOverlay
               underOverlay={underOverlay}
               emptyOverlayFallback={paintedHoldsFallback}
+              showGridLabels
             />
 
             {/* At-rest tap overlay: one full-bleed detector inside the (identity)

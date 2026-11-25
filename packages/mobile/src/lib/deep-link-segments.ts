@@ -10,8 +10,10 @@
  */
 export const DEEP_LINK_SEGMENTS: ReadonlySet<string> = new Set([
   'join',
+  'w',
   'share-beta',
   'session',
+  'history',
   'auth',
   'onboarding',
   'boards',

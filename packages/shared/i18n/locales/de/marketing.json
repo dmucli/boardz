@@ -1,9 +1,10 @@
 {
   "metadata": {
     "home": {
-      "title": "Kletter-App: kompatibel mit Kilter, Tension und MoonBoard",
-      "description": "Teile eine Live-Warteschlange mit deiner Crew und verfolge deine Begehungen an allen Boards. Kompatibel mit Kilter, Tension, MoonBoard und mehr.",
-      "ogDescription": "Teile eine Live-Warteschlange mit deiner Crew und verfolge deine Begehungen an allen Boards. Kompatibel mit Kilter, Tension, MoonBoard und mehr."
+      "title": "Kletter-App für Kilter, Tension und MoonBoard",
+      "description": "Wähle einen Boulder, beleuchte ihn am Board und teile eine Warteschlange mit deiner Crew. Kostenlos. Funktioniert mit Boards wie Kilter, Tension und MoonBoard.",
+      "ogDescription": "Wähle einen Boulder, beleuchte ihn am Board und teile eine Warteschlange mit deiner Crew.",
+      "ogTitle": "Wechsle das Board, nicht die App"
     },
     "about": {
       "title": "Von Kletterer*innen, offen für alle",
@@ -18,8 +19,8 @@
       "description": "Kurze Guides für die Boardsesh-App, wie du dein Kilter- oder Tension-Routenbuch mitnimmst, und wo du fragen kannst."
     },
     "docs": {
-      "title": "API-Dokumentation",
-      "description": "REST- und WebSocket-API-Dokumentation für Boardsesh - Anbindung interaktiver Kletter-Trainingsboards"
+      "title": "Referenz der öffentlichen Boulder-API",
+      "description": "Lies öffentliche Boulder, Grade und Board-Konfigurationen. Verbinde eine App über die separate OAuth-Entwickler-API mit einem persönlichen Logbuch."
     },
     "legal": {
       "title": "Rechtliches & Richtlinie zum geistigen Eigentum",
@@ -29,75 +30,50 @@
       "title": "Datenschutzerklärung",
       "description": "Datenschutzerklärung von Boardsesh - wie wir mit deinen Daten umgehen."
     },
-    "helpPlaylists": {
-      "title": "Eine Board-Playlist bauen und der Reihe nach klettern",
-      "description": "Leg eine Playlist für dein Kilter, Tension oder MoonBoard an, füg Boulder hinzu und nimm sie wieder raus, lade sie in die Warteschlange und nutz die acht Listen, die Boardsesh baut."
-    },
     "helpSessions": {
-      "title": "Eine Live-Session starten oder beitreten und eine Warteschlange teilen",
-      "description": "Starte eine Session im Tab Session, lade deine Crew per QR-Code oder Link ein und teilt euch eine Warteschlange und ein Board, ohne euch gegenseitig die Boulder zu beleuchten."
+      "title": "Eine Live-Session mit deiner Crew starten oder beitreten",
+      "description": "Starte im Tab Session eine Session, lad deine Crew per QR-Code oder Link ein und teilt euch ein Board, ohne euch gegenseitig die Boulder zu überschreiben."
     },
     "helpFindingClimbs": {
-      "title": "Boulder nach Griff, Board-Bereich und Routenbauer*in filtern",
-      "description": "Gradbereich, Grifftypen, Board-Bereich, Routenbauer*innen, denen du folgst, Wischgesten auf einer Boulder-Zeile und angepinnte Filter in der Boardsesh-App."
+      "title": "Boulder finden, gedrückt halten für Aktionen, Playlists bauen",
+      "description": "Filtere Kilter-, Tension- und MoonBoard-Boulder nach Grad, Griff, Bereich und Routenbauer*in, wisch durch eine Liste, halt einen Boulder für sein Menü gedrückt und bau Playlists in der Boardsesh-App."
     },
     "helpLogbook": {
-      "title": "Begehungen im Routenbuch eintragen, ändern und löschen",
-      "description": "Trag in der Boardsesh-App direkt am Board einen Boulder ein, ändere Grad, Sterne, Versuche oder Status später, lösch einen Eintrag und find eine alte Begehung wieder."
+      "title": "Begehungen eintragen, ändern und löschen und Beta-Videos anhängen",
+      "description": "Trag in der Boardsesh-App eine Begehung ein, ändere oder lösche sie später, übernimm dein Kilter- oder Tension-Routenbuch und häng ein Instagram- oder TikTok-Beta-Video an einen Boulder."
     },
     "helpBoardAndBluetooth": {
-      "title": "Dein Board per Bluetooth verbinden",
-      "description": "Verbinde Boardsesh mit einem Kilter-, Tension- oder MoonBoard-Controller, bring eine fehlgeschlagene Verbindung in Ordnung und steuer alles per Live Activity vom Sperrbildschirm."
+      "title": "Bring einen Boulder an dein Board: Bluetooth und Board steuern",
+      "description": "Verbinde Boardsesh mit einem Kilter, Tension oder MoonBoard, lern, was Board steuern heißt, wisch den Wand-Button, damit Boulder leuchten, und reparier ein Board, das sich nicht verbindet."
     },
-    "helpClimbActions": {
-      "title": "Aus jeder Boulder-Zeile heraus ansehen, eintragen oder in eine Playlist legen",
-      "description": "Das Menü hinter dem langen Druck auf eine Boulder-Zeile in der Boardsesh-App: Vorschau ohne das Board zu beleuchten, Eintrag machen, zur Playlist hinzufügen."
-    },
-    "helpBetaVideos": {
-      "title": "Ein Reel von Instagram oder TikTok als Beta teilen",
-      "description": "Teile ein Instagram-Reel oder TikTok aus dem Teilen-Menü nach Boardsesh, häng es an einen Boulder, film neue Beta und find die Beta der anderen."
+    "helpSprayWalls": {
+      "title": "So fotografierst und richtest du deine Spraywall ein",
+      "description": "Fotografier deine Spraywall frontal und hochkant, füg sie zu Boardsesh hinzu, korrigier die gefundenen Griffe und bearbeite sie später oder nach einem Zurücksetzen."
     }
   },
   "home": {
     "hero": {
-      "title": "Deine Boards. Eine App.",
-      "eyebrow": "Kompatibel mit Kilter, Tension, MoonBoard & mehr",
-      "playShotAlt": "Ein geöffneter Boulder in Boardsesh mit beleuchteten Griffen am Board",
-      "subtitle": "Wechsle das Board, ohne die App zu wechseln.",
-      "startClimbingAria": "In der App losklettern",
-      "startClimbingWeb": "Im Browser losklettern →",
-      "ctaInstallIos": "Im App Store laden",
-      "ctaInstallAndroid": "Bei Google Play holen",
+      "title": "Wechsle das Board, nicht die App",
+      "eyebrow": "Kostenlos. Funktioniert mit Boards wie Kilter, Tension und MoonBoard.",
+      "subtitle": "Wähle einen Boulder, beleuchte ihn am Board und teile eine Warteschlange mit deiner Crew.",
+      "compareApps": "Vergleiche Boardsesh mit der App deines Boards\u00a0(Englisch)",
+      "ctaInstallIos": "Laden im App Store",
+      "ctaInstallAndroid": "Jetzt bei Google Play",
       "ctaUpdate": "App aktualisieren",
+      "qrTitle": "Scanne den Code, um die App auf dein Handy zu holen",
+      "qrBody": "Kostenlos für iPhone und Android.",
+      "qrImageLabel": "QR-Code, der Boardsesh auf deinem Handy öffnet",
+      "proof": "In den letzten 30 Tagen haben rund {{formattedClimbers}} Kletternde mit Boardsesh {{formattedClimbs}} Mal einen Boulder am Board beleuchtet.",
       "tensionShotAlt": "Ein Boulder an einem Tension Board in Boardsesh",
       "moonboardShotAlt": "Ein Boulder an einem MoonBoard in Boardsesh",
-      "proof": "{{formattedClimbers}} Kletterer*innen haben in den letzten 30 Tagen {{formattedClimbs}} Boulder an echten Boards beleuchtet.",
-      "proofNoCount": "Kostenlos, Open Source und bezahlt von den Kletterer*innen, die es nutzen."
+      "playShotAlt": "Ein geöffneter Boulder in Boardsesh mit beleuchteten Griffen am Board"
     },
-    "onboardingHeader": "Mach's zu deinem",
-    "cards": {
-      "auroraTitle": "Kommst du von Kilter?",
-      "auroraDescription": "Hol Routenbuch und Historie in einem Schritt rüber",
-      "playlistTitle": "Bau eine Playlist",
-      "playlistDescription": "Stell deine Boulder zusammen, bevor du in die Halle kommst",
-      "bluetoothTitle": "Verbinde dein Board",
-      "bluetoothDescription": "Per Bluetooth koppeln und den nächsten Boulder beleuchten",
-      "gymTitle": "Finde eine Halle in deiner Nähe",
-      "gymDescription": "Sieh, welche Wände ein Kilter Board, Tension Board oder MoonBoard haben"
-    },
-    "gymCard": {
-      "ownerSubtitle": "Die Halle deiner Crew, nur einen Fingertipp entfernt",
-      "manage": "Verwalten",
-      "viewPage": "Seite ansehen"
-    },
+    "cards": {},
     "gymSearch": {
-      "eyebrow": "Hallenverzeichnis",
       "title": "Finde ein Board in deiner Nähe",
-      "lead_one": "{{formattedCount}} Halle, Vereinswand oder Garage hat schon ein Board eingetragen. Such nach Name oder Stadt, oder lass dich vom Browser orten.",
-      "lead_other": "{{formattedCount}} Hallen, Vereinswände und Garagen haben schon ein Board eingetragen. Such nach Name oder Stadt, oder lass dich vom Browser orten.",
-      "leadNoCount": "Hallen, Vereinswände und Garagen mit einem Board an der Wand sind schon eingetragen. Such nach Name oder Stadt, oder lass dich vom Browser orten.",
-      "geoHint": "Ortung aus? Tipp einfach eine Stadt ein: gleiche Ergebnisse, ohne Berechtigungsabfrage.",
-      "browseAll": "Zum kompletten Hallenverzeichnis"
+      "lead_one": "Im Boardverzeichnis stehen {{formattedCount}} Hallen, Vereinswände und Wände zu Hause.",
+      "lead_other": "Im Boardverzeichnis stehen {{formattedCount}} Hallen, Vereinswände und Wände zu Hause.",
+      "leadNoCount": "Hallen, Vereinswände und Garagen mit einem Board an der Wand sind schon eingetragen. Such nach Name oder Stadt, oder lass dich vom Browser orten."
     },
     "boards": {
       "title": "Beliebte Boards",
@@ -108,13 +84,30 @@
       "preview": "Board-Vorschau: {{board}}",
       "typeAngle": "{{board}} · {{angle}}°",
       "selectedClimb": "Ausgewählter Boulder: {{climb}}",
-      "open": "Dieses Board öffnen"
+      "open": "An diesem Board klettern"
     },
     "recentBeta": {
-      "title": "Frische Beta"
+      "title": "Frische Beta",
+      "lead": "Sieh dir den Boulder und seine Beta an: frisch verlinkte Videos von Kletternden."
+    },
+    "showcase": {
+      "videoLabel": "Demo: jedes Board in einer App, auch eine Spraywall, dann eine Crew-Warteschlange, ein Trainingsplan und eine eingetragene Begehung.",
+      "scenes": {
+        "boards": "Jedes Board. Eine App.",
+        "spray": "Auch deine Spraywall.",
+        "wall": "Sieh, was an der Wand läuft.",
+        "crew": "Deine Crew. Eine Warteschlange.",
+        "workouts": "Plane ein Training und klettere dann.",
+        "island": "Der nächste Boulder, direkt vom Sperrbildschirm.",
+        "log": "Jede Begehung im Blick.",
+        "outro": "Weniger Handy. Mehr Wand."
+      },
+      "unsupported": "Dein Browser kann dieses Video nicht abspielen.",
+      "pause": "Demo pausieren",
+      "play": "Demo abspielen"
     },
     "features": {
-      "title": "Board-Abend, geregelt",
+      "title": "So sieht eine Session aus",
       "lead": "Vom ersten Boulder bis zur letzten Begehung bleibt eure Session zusammen.",
       "queue": {
         "title": "Deine Crew. Eine Live-Warteschlange.",
@@ -130,16 +123,20 @@
         "title": "Alle deine Boards. Ein Profil.",
         "body": "Sieh Begehungen und Fortschritte an jedem Board.",
         "shotAlt": "Deine Begehungen und Fortschritte an allen Boards im Boardsesh-Profil"
-      }
+      },
+      "spray": {}
     },
     "support": {
       "eyebrow": "Kostenlos, und das bleibt so",
       "title": "Boardsesh läuft, weil Kletterer*innen beisteuern",
-      "p1": "Keine Werbung, keine gesperrten Screens, keine zweite Klasse. Ganz Boardsesh bleibt für alle offen, ob du sponserst oder nicht, Selbsthosting inklusive.",
-      "p2": "Hosting, Datenbank und die Rechnungen dahinter zahlen die Leute, die es benutzen.",
-      "chipIn": "Beisteuern",
+      "chipIn": "Mithelfen",
       "source": "Code ansehen",
       "otherWays": "Kein Geld übrig?"
+    },
+    "supportBanner": {
+      "text": "Boardsesh bleibt kostenlos und werbefrei, weil Kletterer*innen beisteuern. Jeder Beitrag hilft, einmalig oder monatlich.",
+      "cta": "Unterstütz uns",
+      "close": "Schließen"
     }
   },
   "about": {
@@ -149,53 +146,58 @@
     },
     "openSource": {
       "title": "Open Source",
-      "body": "Boardsesh ist Open Source unter der Apache-Lizenz. Stöber im Code, schick einen PR, meld einen Fehler oder fork das ganze Projekt.",
+      "body": "Der Code ist unter Apache 2.0 öffentlich, du kannst also deine eigene Kopie betreiben. CONTRIBUTING.md ist der aktuelle Einstieg; eine gepflegte Anleitung zum Selbsthosten steht noch aus.",
       "cta": "Auf GitHub ansehen →"
     },
     "api": {
       "title": "API-Dokumentation",
-      "body": "Du willst etwas mit Kletterdaten bauen? Die API ist öffentlich. Leg los.",
-      "cta": "API-Dokumentation ansehen →"
+      "body": "Die Lese-API für Boulder und Grade ist öffentlich. Über die separate OAuth-API kann eine App mit Erlaubnis der kletternden Person deren Logbuch lesen; der Entwicklerleitfaden nennt die aktuellen Zugangsregeln.",
+      "cta": "API-Dokumentation ansehen →",
+      "status": {
+        "open": "Die App-Registrierung ist offen.",
+        "invitation": "Während der Tests ist die App-Registrierung nur auf Einladung möglich.",
+        "unavailable": "App-Verbindungen sind derzeit nicht verfügbar."
+      }
     },
     "community": {
       "title": "Komm in die Community",
       "body": "Ob du Code schreibst, Boulder schraubst oder uns einfach sagen willst, was kaputt ist — wir hören gern von dir.",
       "discord": "Tritt der Crew auf Discord bei",
-      "support": "Unterstütze Boardsesh"
+      "support": "Mithelfen"
     },
     "legalLink": "Rechtliches & Richtlinie zum geistigen Eigentum",
     "footer": "Von Kletterer*innen gebaut. Offen für alle.",
-    "profile": {
-      "title": "Alle deine Boards. Ein Profil.",
-      "shotAlt": "Deine Begehungen und Fortschritte an allen Boards im Boardsesh-Profil"
-    },
     "story": {
       "title": "Warum es das gibt",
       "p1": "Jedes Board bringt seine eigene App mit, seinen eigenen Login und sein eigenes Logbuch. Du kletterst ein Kilter in deiner Halle und im Urlaub ein MoonBoard — und hast zwei Verläufe, die nie zusammenfinden.",
-      "p2": "Dann war eine dieser Apps über Nacht weg, und die Logbücher gleich mit. Das passiert, wenn eine einzige Firma den einzigen Zugang zu Hardware besitzt, die dir längst gehört.",
+      "p2": "Als die alte Kilter-App im März 2026 ausfiel, verloren manche den Zugriff auf ihre Historie. Dein Boardsesh-Logbuch kannst du schon heute herunterladen: Einstellungen → Konto → Kletterdaten exportieren und ein Board wählen. Der Code ist unter Apache 2.0 öffentlich.",
       "link": "Was passiert ist — und wie du deine Daten rausbekommst"
     },
     "who": {
       "title": "Wer daran baut",
-      "body": "Angefangen hat es 2024 mit einem Kletterer und einem Repo, und es ist immer noch so ein Projekt, an dem abends gearbeitet wird. Fehler findet, wer an der Wand steht — kein QA-Team.",
+      "body": "Boardsesh wird von Marco de Jongh betrieben, einem Board-Kletterer in Sydney, Australien. Andere Kletterer*innen tragen Code, Übersetzungen und Fehlermeldungen bei. Du erreichst ihn unter support@boardsesh.com.",
       "cta": "Schau, wer beigetragen hat"
     },
     "next": {
       "title": "Was als Nächstes kommt",
-      "body": "Mehr Boards, besser offline, und deine Daten so leicht wieder raus wie rein. Die Roadmap ist öffentlich, diskutiert wird auf Discord.",
+      "body": "Mehr Boards, besseres Offline-Klettern und Historienimporte aus weiteren Apps. Folge der Roadmap und diskutiere auf Discord mit.",
       "cta": "Lies die Roadmap"
+    },
+    "profile": {
+      "title": "Alle deine Boards. Ein Profil.",
+      "shotAlt": "Deine Begehungen und Fortschritte an allen Boards im Boardsesh-Profil"
     }
   },
   "support": {
     "hero": {
       "title": "Halt Boardsesh am Laufen",
-      "subtitle": "Kostenlos, Open Source und von Kletterer*innen bezahlt"
+      "ctaMonthly": "Unterstütze uns"
     },
-    "promise": "Keine gesperrten Screens, keine zweite Klasse, keine Werbung. Beisteuern zahlt die Rechnung, sonst nichts.",
+    "promise": "Alle bekommen dieselbe App, ob sie beitragen oder nicht. Keine Werbung in der App.",
     "why": {
       "title": "Warum es diese Seite gibt",
-      "p1": "Boardsesh ist kostenlos und Open Source, und das bleibt auch so. Der Betrieb kostet trotzdem echtes Geld: Hosting, Datenbank und Infrastruktur summieren sich, je mehr Leute dazukommen.",
-      "p2": "Wir versprechen, Boardsesh nicht zu verschlimmbessern, und Selbsthosten bleibt immer eine Option. Wenn dir die App etwas bringt und du es übrig hast, hältst du damit die Server am Netz."
+      "p1": "Boardsesh zu betreiben kostet Hosting, Datenbank und Entwicklungszeit.",
+      "p2": "Der Code ist unter Apache 2.0 öffentlich, du kannst deine eigene Kopie betreiben. Wenn du etwas übrig hast, hilft dein Beitrag bei der weiteren Arbeit."
     },
     "rails": {
       "title": "So kannst du beisteuern"
@@ -210,6 +212,18 @@
       "body": "Zahl per Karte, Apple Pay oder Google Pay direkt im Browser. Ohne Account.",
       "cta": "Einmal spenden"
     },
+    "chooser": {
+      "cadenceLabel": "Wie oft",
+      "monthly": "Monatlich",
+      "once": "Einmal",
+      "currencyLabel": "Währung",
+      "aud": "AUD",
+      "usd": "USD",
+      "perMonth": "{{amount}}/Monat",
+      "monthlyBody": "Monatliche Unterstützung bezahlt die Zeit, die es braucht, Boardsesh zu bauen. Zahl per Karte, Apple Pay oder Google Pay direkt im Browser. Ohne Account.",
+      "publicName": "Wenn du beim Bezahlen einen Namen angibst, kann er öffentlich erscheinen, wenn wir uns bei Unterstützer*innen bedanken. Lass das Feld leer, um anonym zu geben.",
+      "manage": "Du unterstützt schon monatlich? In Stripe ändern oder beenden →"
+    },
     "otherWays": {
       "title": "Andere Wege zu helfen",
       "body": "Geld ist davon das Langsamste. Jeder der vier Wege bringt die App weiter.",
@@ -220,11 +234,11 @@
       },
       "translate": {
         "title": "Einen Screen übersetzen",
-        "body": "Die spanischen, französischen und deutschen Kataloge liegen im Repo. Korrigier einen Satz oder füg eine Sprache dazu.",
+        "body": "Die spanischen, französischen, deutschen und italienischen Kataloge liegen im Repository. Verbessere einen Satz oder ergänze eine Sprache.",
         "cta": "Sprachkataloge ansehen →"
       },
       "patch": {
-        "title": "Code schicken",
+        "title": "Etwas im Code verbessern",
         "body": "Die ganze App ist öffentlich: Web, Mobile, Backend und die Board-Daten dahinter.",
         "cta": "Ansehen, wie es gebaut ist →"
       },
@@ -236,21 +250,27 @@
     },
     "honesty": {
       "title": "Das Kleingedruckte",
-      "p1": "Spenden sind nicht steuerlich absetzbar. Boardsesh ist kein Verein, nur Kletterer*innen, die die Serverrechnung zahlen.",
-      "p2": "Dein Geld geht in Hosting, Datenbank und Infrastruktur. Es kauft nichts extra in der App: Boardsesh bleibt komplett offen für alle, ob du spendest oder nicht."
+      "p1": "Spenden sind nicht steuerlich absetzbar. Boardsesh ist keine gemeinnützige Organisation.",
+      "p2": "Beiträge bezahlen Server und Entwicklungszeit. Sie schalten nichts Zusätzliches in der App frei."
     },
     "thanks": {
       "title": "Danke",
       "body": "An alle, die Boardsesh schon unterstützen, Fehler melden, Code schicken oder einen Screen übersetzen: danke. Ihr haltet das Ding in Bewegung."
     },
+    "thanksState": {
+      "title": "Danke",
+      "body": "Deine Unterstützung ist angekommen. Sie fließt direkt in Boardsesh."
+    },
     "aboutLink": "Mehr über das Projekt →",
-    "docsLink": "Sieh in der Doku, wie es gebaut ist →",
-    "footer": "Kostenlos für alle, finanziert von denen, die können."
+    "docsLink": "Lies den Code auf GitHub",
+    "footer": "Kostenlos für alle, finanziert von denen, die können.",
+    "legalLink": "Lies die rechtlichen Hinweise",
+    "privacyLink": "Lies die Datenschutzerklärung"
   },
   "legal": {
     "intro": {
       "title": "Rechtliches & Richtlinie zum geistigen Eigentum",
-      "p1": "Boardsesh ist eine kostenlose, quelloffene, von der Community gebaute Alternative, um standardisierte LED-Trainingsboards (Kilter Board, Tension Board, MoonBoard und andere) zu durchstöbern und zu bedienen. Das Projekt ist nicht kommerziell und wird ausschließlich von Freiwilligen betreut.",
+      "p1": "Boardsesh ist eine kostenlose, quelloffene App aus der Community, mit der du Boulder findest und kompatible Boards wie Kilter, Tension und MoonBoard nutzt.",
       "p2": "Wir finden: Kletternde sollten frei entscheiden dürfen, wie sie mit Hardware umgehen, die sie gekauft haben, und Daten, die die Community erzeugt hat, sollten der Community zugänglich bleiben."
     },
     "climbData": {
@@ -295,6 +315,18 @@
         "p2": "Unser Controller ist so gebaut, dass er sowohl mit der Software dieses Projekts als auch — nach Wahl der Nutzer*innen — mit offiziellen Hersteller-Apps zusammenspielt. Dieses Zusammenspiel geht immer von den Endnutzer*innen auf ihrer eigenen Hardware aus."
       }
     },
+    "hostedService": {
+      "title": "Gehosteter Dienst und API-Zugang",
+      "p1": "Der Code von Boardsesh ist Open Source unter der Apache-2.0-Lizenz. Diese Lizenz gilt für den Code. Sie gilt nicht für den gehosteten Dienst: die Konten, die Boulder-Datenbank, die Logbuch-Synchronisierung und die Echtzeit-Server, mit denen sich die Boardsesh-Apps und die Website verbinden. Die betreiben und bezahlen wir.",
+      "p2Start": "Die öffentliche API, die auf der",
+      "p2Link": "API-Dokumentationsseite",
+      "p2End": "beschrieben ist, ist für Integrationen gedacht: Tools, die Boulderdaten lesen oder für angemeldete Kletterer*innen über deren eigenes Konto handeln, innerhalb der Ratenlimits, die der Dienst anwendet.",
+      "p3": "Der gehostete Dienst ist kein Backend für andere Apps. Eine öffentlich verbreitete App oder ein Fork, deren Konten, Klettern, Board-Steuerung oder Sessions auf den Servern von Boardsesh laufen, braucht unsere schriftliche Erlaubnis, und die erteilen wir derzeit nicht. Das Boardsesh-Konto von Kletterer*innen mit ihrer Erlaubnis mit deiner App zu verbinden, ist etwas anderes: Über die OAuth-API, innerhalb der Scopes aus der Entwicklerdoku und unter den Nutzungsbedingungen für Entwickler*innen, die du bei der Registrierung der App akzeptierst, ist das eine Integration und braucht keine weitere Erlaubnis von uns. Wenn du Boardsesh forkst, betreibe auch dein eigenes Backend. Der Code ist genau dafür da. Das Entwicklungs-Setup in CONTRIBUTING.md ist heute der Einstieg; eine offizielle Self-Hosting-Doku kommt noch.",
+      "p4Start": "Du musst auch nicht mit einer leeren Datenbank anfangen. Die",
+      "p4Link": "nächtlichen Board-Snapshots",
+      "p4End": "sind öffentliche SQLite-Dateien der Boulder-Kataloge, für uns günstig auszuliefern, und du darfst sie gern nutzen. Wir sprechen auch gern darüber, Daten ohne Personenbezug wie Boulder und Grade mit einem anderen Dienst zu synchronisieren.",
+      "contact": "Fragen zu dieser Richtlinie:"
+    },
     "trademark": {
       "title": "Markennutzung",
       "body": "Wir verwenden Board- und Produktnamen (z. B. „Kilter Board“, „MoonBoard“, „Tension Board“) ausschließlich, um Hardware-Kompatibilität und Interoperabilität zu beschreiben. Diese Namen sind Marken der jeweiligen Inhaber. Dieses Projekt steht in keiner Verbindung zu Aurora Climbing, Moon Climbing oder einem anderen Board-Hersteller und wird von ihnen weder unterstützt noch gesponsert."
@@ -326,571 +358,548 @@
       "licenseLink": "CC BY 4.0",
       "copyright": ". Copyright 2024 Fonticons, Inc."
     },
-    "footer": "Dieses Dokument dient der Information und stellt keine Rechtsberatung dar. Zuletzt aktualisiert: 02.08.2026"
+    "footer": "Dieses Dokument dient der Information und stellt keine Rechtsberatung dar. Zuletzt aktualisiert: 08.10.2026"
   },
   "help": {
     "clip": {
       "unsupported": "Dein Browser kann diesen Clip nicht abspielen.",
       "playHint": "Tippe auf Play, um die Geste zu sehen."
     },
-    "hero": {
-      "title": "Hilfe",
-      "subtitle": "Guides für die App, dein Kilter- oder Tension-Routenbuch mitnehmen, und wo du fragen kannst."
-    },
-    "web": {
-      "title": "Auf dieser Seite",
-      "intro": "Alles auf boardsesh.com läuft im Browser, ohne Anmeldung.",
-      "item1": "Grad, Routenbauer*in, Begehungen und Beta-Videos eines Boulders nachschlagen.",
-      "item2": "Den Katalog eines Boards nach Layout, Größe und Winkel durchstöbern.",
-      "item3": "Einen Boulder, eine Playlist oder ein Profil als Link teilen.",
-      "item4": "Finde Hallen mit Boards in deiner Nähe.",
-      "playlistsLink": "Playlists ansehen",
-      "aboutLink": "Über Boardsesh"
-    },
-    "app": {
-      "title": "In der App",
-      "intro": "Alles, was die Wand oder dein Routenbuch anfasst, passiert in der App.",
-      "item1": "Bau dir eine Queue und arbeite sie mit deiner Crew ab.",
-      "item2": "Eine Live-Session fahren, damit jedes Handy dieselbe Warteschlange steuert.",
-      "item3": "Griffe per Bluetooth an Kilter-, Tension- und MoonBoard-Wänden beleuchten.",
-      "item4": "Begehungen und Versuche eintragen und Beta-Videos anhängen."
-    },
-    "aurora": {
-      "title": "Nimm dein Kilter- oder Tension-Routenbuch mit",
-      "intro": "Verknüpf dein Board-Konto einmal, und deine Begehungen kommen rüber.",
-      "item1": "Tipp auf deinen Avatar, dann Einstellungen, dann Verbundene Apps. Unter Board-Konten tippst du auf der Tension-Karte auf Verknüpfen oder auf der Kilter-Karte auf Bei Kilter anmelden und gibst Benutzernamen und Passwort für dieses Board ein.",
-      "item2": "Noch die alte Kilter-App benutzt? Die Karte Kilter (Aurora) nimmt stattdessen einen JSON-Export.",
-      "link": "Zum Migrations-Guide",
-      "item3": "Der Sync läuft in eine Richtung, aus ihren Apps nach Boardsesh, etwa alle 12 Stunden. Zurück geht nichts."
-    },
-    "climbCounts": {
-      "title": "Warum zeigt die Kilter-App mehr Boulder?",
-      "intro": "Beide Apps haben dieselben Boulder und zählen sie unterschiedlich.",
-      "item1": "Boardsesh zählt jeden Boulder einmal.",
-      "item2": "Kilters App zählt einen Boulder offenbar einmal pro Winkel, in dem er geklettert wurde.",
-      "item3": "An einer 8x12 Kilter-Homewall sind das rund 18.000 Boulder in Boardsesh und rund 36.000 in Kilters App."
-    },
-    "ask": {
-      "title": "Stell eine Frage",
-      "intro": "Auf Discord bekommst du am schnellsten eine Antwort.",
-      "discord": "Auf Discord fragen",
-      "github": "Ein Issue auf GitHub aufmachen",
-      "docs": "Entwickler-Doku lesen",
-      "bugLead": "Einen Fehler gefunden?",
-      "devLead": "Du baust auf der API?"
-    },
     "nav": {
       "label": "Brotkrumen-Navigation",
       "home": "Start",
-      "help": "Hilfe"
+      "help": "Hilfe",
+      "jump": "Auf dieser Seite"
     },
-    "guides": {
-      "title": "Guides",
-      "intro": "Sieben kurze Seiten mit Screenshots aus der App.",
-      "playlists": {
-        "title": "Playlists",
-        "body": "Playlist anlegen, einen Boulder wieder rausnehmen, die ganze Liste in die Warteschlange legen und die acht fertigen Listen nutzen."
-      },
-      "climbActions": {
-        "title": "Boulder-Aktionen",
-        "body": "Halt einen Boulder gedrückt: Vorschau ohne die Wand zu beleuchten, Eintrag machen oder zur Playlist hinzufügen."
-      },
-      "sessions": {
-        "title": "Live-Sessions",
-        "body": "Session starten, Crew per QR-Code oder Link einladen und stöbern, ohne die Wand zu bewegen."
-      },
-      "findingClimbs": {
-        "title": "Boulder finden",
-        "body": "Boulder nach Grad, Griff, Board-Bereich oder Routenbauer*in filtern und die Filter anpinnen, die du brauchst."
-      },
-      "logbook": {
-        "title": "Dein Routenbuch",
-        "body": "Am Board eine Begehung eintragen und Grad, Sterne, Versuche oder Status später ändern."
-      },
-      "bluetooth": {
-        "title": "Board und Bluetooth",
-        "body": "Mit dem Board verbinden, eine fehlgeschlagene Verbindung in Ordnung bringen und per Live Activity vom Sperrbildschirm steuern."
-      },
-      "betaVideos": {
-        "title": "Beta-Videos",
-        "body": "Ein Reel von Instagram oder TikTok nach Boardsesh teilen, an einen Boulder hängen und die Beta der anderen finden."
-      }
+    "install": {
+      "title": "Hol dir die App",
+      "intro": "Das Board beleuchten, Begehungen eintragen und Crew-Sessions laufen alle in der App."
     },
-    "playlists": {
-      "breadcrumb": "Playlists",
+    "board": {
+      "breadcrumb": "Board und Bluetooth",
       "hero": {
-        "title": "Eine Playlist bauen und der Reihe nach klettern",
-        "subtitle": "Heb Boulder für später auf und lade die Liste in deine Warteschlange."
+        "title": "Bring einen Boulder an dein Board",
+        "subtitle": "Ein Antippen zeigt eine Vorschau. Am Board beleuchten lässt den Boulder leuchten, und die Wand folgt eine Weile deiner Auswahl."
       },
-      "build": {
-        "title": "Eine Playlist anlegen",
-        "intro": "Jede Playlist gehört zu einem Board.",
-        "step1": "Öffne Entdecken. Prüf die Board-Anzeige oben.",
-        "step2": "Tipp auf das Plus. Name rein, Farbe wählen, auf Erstellen tippen.",
-        "step3": "Sie taucht unter Meine Playlists auf.",
-        "p1": "Wisch die Zeile eines Boulders nach links, oder halt sie gedrückt und tipp auf Zur Playlist hinzufügen.",
-        "p2": "Die Auswahl zeigt nur Playlists für Board und Layout des Boulders.",
-        "clipAlt": "Die Zeile eines Boulders nach links wischen, um ihn in eine Playlist zu legen",
-        "clipCaption": "Nach links wischen legt ihn in eine Playlist. Nach rechts in die Warteschlange.",
-        "shotAlt": "Der Tab Entdecken",
-        "shotCaption": "Angepinnt, dann Meine Playlists, dann Für dich.",
-        "playlistShotAlt": "Deine eigene Playlist",
-        "playlistShotCaption": "Anpinnen, bearbeiten, umsortieren oder entfernen."
+      "connect": {
+        "title": "Einen Boulder an die Wand bringen",
+        "lead": "Ein Antippen zeigt dir den Boulder. Am Board beleuchten verbindet sich bei Bedarf und beleuchtet ihn.",
+        "clipAlt": "Ein Tippen auf Am Board beleuchten startet das Steuern mit Zeit, erkennbar an einer Uhr und schrumpfendem Frost",
+        "clipCaption": "Tipp auf Am Board beleuchten. Die Uhr startet, und jeder neue Boulder, den du wählst, füllt sie wieder auf.",
+        "step1": "Tipp in einem Boulder auf den großen Button Am Board beleuchten.",
+        "step2": "Nur beim ersten Mal: Wähl dein Board aus der Liste. Siehst du es nicht? Tipp auf Nach allen Boards suchen.",
+        "step3": "Erlaub Bluetooth, wenn du gefragt wirst. Android fragt nach Geräten in der Nähe, auf Android 11 und älter nach dem Standort.",
+        "otherBoard": "Ein Boulder von einem anderen Board in deiner Halle zeigt Am Tension beleuchten oder den Namen dieses Boards. Tipp darauf, um dorthin zu wechseln und den Boulder zu beleuchten.",
+        "changeBoard": "An einer anderen Wand? Board wechseln ist die erste Zeile hinter deinem Avatar."
       },
-      "remove": {
-        "title": "Einen Boulder wieder rausnehmen",
-        "p1": "Vom Boulder aus: Zur Playlist hinzufügen öffnen und auf die angehakte Playlist tippen.",
-        "p2": "Aus der Playlist heraus: auf den Stift tippen oder im Menü ⋯ Boulder umsortieren & entfernen wählen. Tipp auf das rote Minus und bestätige. Zum Umsortieren am Griff ziehen.",
-        "p3": "Listen unter Für dich haben keinen Bearbeitungsmodus. Nimm stattdessen das Herz weg oder trag die Begehung ein.",
-        "clipAlt": "Den Haken bei einer Playlist wegnehmen",
-        "clipCaption": "Tipp auf eine angehakte Playlist, und der Boulder fliegt wieder raus."
+      "driving": {
+        "title": "Das Board steuern",
+        "lead": "Wenn du das Board steuerst, wird jeder Boulder, den du wählst, sofort beleuchtet.",
+        "looking": "Sonst öffnet ein Antippen eine Vorschau, und die Wand behält ihren Boulder.",
+        "waysIntro": "Drei Wege, das Steuern zu starten:",
+        "way1": "Am Board beleuchten beleuchtet den Boulder und steuert dann eine feste Zeit lang: 45 Sekunden, wenn du es nicht änderst. Jede Auswahl startet die Uhr neu.",
+        "way2": "Wisch den Wand-Button nach links, bis Loslassen, um jeden Boulder zu beleuchten dasteht, und lass los. Oder halt ihn gedrückt, sobald du verbunden bist, und wähl Jeden Boulder beleuchten. Du steuerst, bis du auf Du steuerst das Board tippst.",
+        "way3": "Schalt Board immer steuern unter Einstellungen, dann Board ein. Sobald dein Handy das Board hält, steuerst du. Ein Tippen pausiert, bis das Board getrennt wird oder du auf Am Board beleuchten tippst.",
+        "tell": "Ein gefrosteter Wand-Button mit Du steuerst das Board heißt: Du steuerst.",
+        "tellClock": "Eine Uhr neben dem Text steht für Steuern mit Zeit, und der Frost schrumpft, wenn die Zeit abläuft. Ohne Uhr dauert es, bis du tippst. Im Mini-Player wird die Glühbirne bernsteinfarben, solange du steuerst.",
+        "clipAlt": "Den Wand-Button nach links wischen, um zu steuern, und dann antippen, um zu stoppen",
+        "clipCaption": "Nach links wischen und loslassen, um jeden Boulder zu beleuchten. Tipp auf Du steuerst das Board, um zu stoppen.",
+        "end1": "Du auf Du steuerst das Board tippst.",
+        "end2": "Die Uhr abläuft. Nur beim Steuern mit Zeit.",
+        "end3": "Jemand aus deiner Crew einen Boulder an die Wand bringt. Nur beim Steuern mit Zeit.",
+        "end4": "Du auf Alle Lichter ausschalten tippst, die Verbindung abbricht oder du Board oder Session wechselst.",
+        "after": "Nach dem Steuern öffnet sich deine nächste Auswahl wieder als Vorschau.",
+        "states": {
+          "lookingAlt": "Der Player mit einer Vorschau: Die obere Leiste zeigt Vorschau · nicht am Board und der Button zeigt Am Board beleuchten",
+          "timedAlt": "Der Player beim Steuern mit Uhr: Der Button zeigt Du steuerst das Board · 0:28",
+          "openAlt": "Der Player beim Steuern ohne Uhr: Der Button zeigt Du steuerst das Board",
+          "lookingLabel": "Vorschau",
+          "lookingTitle": "Am Board beleuchten",
+          "lookingBody": "Nichts leuchtet, bis du darauf tippst.",
+          "timedLabel": "Steuern mit Zeit",
+          "timedTitle": "Die Uhr läuft runter",
+          "timedBody": "Nach Am Board beleuchten läuft die Uhr runter.",
+          "openLabel": "Wischen zum Steuern",
+          "openTitle": "Keine Uhr",
+          "openBody": "Es leuchtet, bis du tippst."
+        },
+        "statesEyebrow": "Den Wand-Button lesen",
+        "statesTitle": "Drei Zustände des Wand-Buttons",
+        "endsTitle": "Das Steuern endet, wenn",
+        "stop": "Tippe auf <label>{{drivingLabel}}</label>, um die Steuerung zu beenden."
       },
-      "queue": {
-        "title": "Die ganze Liste klettern",
-        "intro": "Tipp einen Boulder in einer Playlist an, und deine Warteschlange wird zu dieser Playlist.",
-        "p1": "Sie lädt der Reihe nach ab dem Boulder, den du angetippt hast. Standen schon Boulder hinter deinem aktuellen, fragt Playlist starten? erst nach. Der Play-Button oben startet von vorn.",
-        "p2": "In einer Session öffnet das Antippen den Boulder nur für dich. Die geteilte Warteschlange bleibt, wie sie ist.",
-        "sessionsLink": "Wie eine Session eine Warteschlange teilt",
-        "clipAlt": "Das Sheet Playlist starten?",
-        "clipCaption": "Stehen schon Boulder in der Warteschlange, fragt Playlist starten? erst nach."
+      "history": {
+        "title": "Was gerade an der Wand ist",
+        "lead": "Der Board-Verlauf listet jeden Boulder, den diese Wand beleuchtet hat, egal von wem, die neuesten zuerst.",
+        "p1": "Tipp auf die Uhr im Kopf von Boulder, um ihn zu öffnen. Tipp auf einen Boulder für die Vorschau. Der Verlauf deiner Warteschlange ist eine andere Liste.",
+        "p2": "Die Kapsel im Kopf von Boulder zeigt den Boulder der Wand, solange ein verbundenes Handy ihn beleuchtet hat, oder eine Stunde danach. Du kannst sie ausblenden, bis ein anderer Boulder an der Wand ist."
       },
-      "smart": {
-        "title": "Die acht Listen, die Boardsesh für dich baut",
-        "crowdFavorites": "Publikumslieblinge. Gut bewertet, oft begangen, von dir noch nicht.",
-        "hiddenGems": "Geheimtipps. 4,5 Sterne oder besser, von wenigen begangen.",
-        "atYourLevel": "Auf deinem Level. Beliebte Boulder rund um deinen Grad.",
-        "fresh": "Frisch. Neu auf deinem Board, Routenbauer*innen, denen du folgst, zuerst.",
-        "fiveStars": "Fünf Sterne. Boulder, denen du fünf Sterne gegeben hast.",
-        "mostRepeated": "Am häufigsten wiederholt. Boulder mit mehr als einem eingetragenen Versuch.",
-        "projects": "Projekte. Boulder, die du eingetragen, aber nie getoppt hast.",
-        "likedClimbs": "Gelikte Boulder. Jeder Boulder, dem du ein Herz gegeben hast.",
-        "p1": "Sie stehen unter Für dich in Entdecken. Die ersten vier lesen dein Board in deinem Winkel und lassen deine Begehungen weg. Die letzten vier kommen aus deinen Einträgen und Herzen.",
-        "p2": "Tipp auf die Nadel einer Karte, und sie wandert nach Angepinnt. Angepinnte Listen aus Für dich bleiben auf diesem Handy."
+      "controls": {
+        "title": "Board-Steuerung und Einstellungen",
+        "lead": "Halt den Wand-Button gedrückt, solange du verbunden bist, um die Board-Steuerung zu öffnen.",
+        "shotAlt": "Die Board-Steuerung für ein verbundenes Board",
+        "shotCaption": "Neu beleuchten, alle Lichter ausschalten oder trennen.",
+        "lightingShotAlt": "Beleuchtungseinstellungen des Boards mit Steuerdauer und automatischer Beleuchtung",
+        "lightingShotCaption": "Einstellungen, dann Board: wann das Steuern endet.",
+        "row1": "Steuern beenden nach. Ändere die Steuerzeit oder wähl Sofort.",
+        "row2": "Board neu beleuchten. Schickt den Boulder noch einmal an die LEDs.",
+        "row3": "Alle Lichter ausschalten. Das beendet auch das Steuern.",
+        "row4": "Board trennen. Nutz es, wenn du dich mit der falschen Wand verbunden hast.",
+        "row5": "Griff darüber beleuchten. Nur MoonBoard.",
+        "settingsIntro": "Den Rest findest du unter Einstellungen, dann Board:",
+        "setting1": "Steuern beenden nach: Sofort, 30 Sekunden bis 5 Minuten oder Bis ich stoppe.",
+        "setting2": "Board immer steuern: standardmäßig aus.",
+        "setting3": "Bluetooth trennen, wenn das Steuern endet: standardmäßig aus. Es gibt das Board für die nächste Person frei.",
+        "setting4": "Auch in einer Session: standardmäßig an. So kannst du in einer Crew steuern.",
+        "bulb": "Lieber eine Glühbirne? Stell Board-Steuerung auf Glühbirne unter ⋯, Ansichtsoptionen, Buttons."
       },
-      "tags": {
-        "title": "Sehen, in welchen Playlists ein Boulder steckt",
-        "p1": "Unter Einstellungen, dann Anzeige, schaltest du Playlist-Tags anzeigen ein. Zeilen in einer Playlist bekommen Chips. Ein Tipp auf einen Chip öffnet die Playlist nicht."
+      "control": {
+        "title": "Wenn ein anderes Handy das Board hat",
+        "lead": "Ein Kilter- oder Tension-Board spricht immer nur mit einem Handy, und eine neue Verbindung trennt die alte.",
+        "p1": "MoonBoard V3+ nimmt mehrere Handys an. Die originale MoonBoard-Box behält das erste und braucht eventuell einen Neustart des Controllers.",
+        "p2": "In einer Crew verbindet sich nur das Handy, das das Board hält. Dein Am Board beleuchten läuft über dieses Handy, und sein Gesicht erscheint auf deinem Wand-Button.",
+        "sessionsLink": "Mehr zum Teilen einer Wand"
+      },
+      "liveActivity": {
+        "title": "Sperrbildschirm und Dynamic Island",
+        "lead": "Starte eine Session, auch allein, und dein Sperrbildschirm bekommt Board-Steuerung.",
+        "p1": "Auf dem iPhone zeigt eine Live Activity den Boulder an der Wand und seinen Grad. Solange dein Handy das Board hält, kommen Zurück, Weiter und eine Glühbirne dazu, die die Wand neu beleuchtet.",
+        "p2": "Weiter springt in deiner Warteschlange weiter, nicht in der Liste, durch die du gewischt hast, und beleuchtet den Boulder sofort. Wie Am Board beleuchten startet oder verlängert es das Steuern.",
+        "p3": "Android zeigt dieselben Buttons in einer Benachrichtigung. Den Bildschirm zu sperren trennt das Board nie."
+      },
+      "failed": {
+        "title": "Das Board leuchtet nicht?",
+        "lead": "Der Hinweis Verbindung fehlgeschlagen nennt das Problem.",
+        "fix1": "Dein Board wurde nicht gefunden. Prüf, ob es an ist und du in Reichweite bist. Ist ein anderes Handy verbunden, trenn dort zuerst.",
+        "fix2": "Verbindung fehlgeschlagen. Geh näher ran und versuch es nochmal.",
+        "fix3": "Verbunden, aber das Board hat nicht geantwortet. Schalt das Board aus und wieder ein.",
+        "fix4": "Bluetooth ist aus. Schalt es ein.",
+        "fix5": "Wird auf Android nichts gefunden, tipp unten im Sheet auf Standort erlauben oder Standort einschalten.",
+        "twoBoards": "Zwei Boards in Reichweite? Deins steht zuerst. Lies die Seriennummer, bevor du tippst. Der Hinweis Board-Konfiguration passt nicht heißt, dass der Controller ein anderes Setup hat. Wähl Abbrechen, Trotzdem verbinden oder Board-Setup wechseln.",
+        "duplicate": "Dasselbe Board doppelt in der Liste? Zwei Seriennummern sind zwei Controller. Eine Zeile, die nur Kilter Board zeigt, ist eine neuere LED-Box, und mehr Signalbalken heißen meist, dass es deine Wand ist. Leuchtet die falsche Wand, tipp in der Board-Steuerung auf Board trennen.",
+        "duplicateYourBoards": "Ein Board doppelt unter Deine Boards ist etwas anderes. Tipp auf Bearbeiten, dann auf Löschen oder Nicht mehr folgen.",
+        "compareApps": "Kilter- oder MoonBoard-App funktioniert nicht? Vergleiche die Apps für <kilter>Kilter</kilter> und <moonboard>MoonBoard</moonboard> (Englisch)."
       },
       "next": {
-        "title": "Weiterlesen",
-        "climbActions": "Was ein langer Druck kann",
-        "browse": "Öffentliche Playlists im Web durchstöbern",
+        "title": "Weiter geht's",
+        "findingClimbs": "Find etwas für die Wand",
         "hub": "Alle Hilfethemen"
       }
     },
-    "sessions": {
+    "climbs": {
+      "breadcrumb": "Boulder finden, spielen und speichern",
+      "hero": {
+        "title": "Boulder finden, spielen und speichern",
+        "subtitle": "Filtere die Liste, wisch durch sie, halt gedrückt für mehr und speicher Boulder in Playlists."
+      },
+      "player": {
+        "title": "Durch eine Liste wischen",
+        "lead": "Ein Antippen zeigt eine Vorschau, und Wischen läuft durch die Liste, aus der du den Boulder angetippt hast.",
+        "p1": "Die obere Leiste zeigt Vorschau · nicht am Board und nennt die Liste, etwa Suchergebnisse · 4 von 23. Die Wand, deine Warteschlange und die Handys der anderen bleiben, wie sie waren.",
+        "p2": "Vom Boulder an der Wand führen Wische zuerst zu Als Nächstes. Dann gehen sie in der Liste weiter, aus der dieser Boulder kam, die das Warteschlangen-Sheet unter Danach aus und dem Listennamen zeigt. Am Ende der Liste erscheint eine Endkarte.",
+        "p3": "Der Zurück-Chip bringt dich zum Boulder an der Wand. Der Mini-Player ist dein letzter Blick: Tipp darauf, um diese Vorschau mit ihrer Liste wieder zu öffnen.",
+        "p4": "In einer Crew zeigt die obere Leiste Nur du siehst das, und jedes Handy läuft durch seine eigene Liste.",
+        "callout": "Am Board beleuchten macht einen Boulder aus der Vorschau zum Boulder der Wand. Während du das Board steuerst, gibt es keine Vorschau: Jede Auswahl wird sofort beleuchtet.",
+        "drivingLink": "So funktioniert das Steuern",
+        "clipAlt": "Im Player durch eine Liste wischen",
+        "clipCaption": "Wisch durch die Liste. Die Wand behält ihren Boulder."
+      },
+      "menu": {
+        "title": "Einen Boulder gedrückt halten",
+        "lead": "Halt eine Boulder-Zeile gedrückt, um alle Aktionen für diesen Boulder zu sehen.",
+        "p1": "Tipp auf eine Aktion oder daneben, um zu schließen. Eintrag machen, Zur Playlist hinzufügen und Teilen nutzt du am häufigsten.",
+        "playNext": "Als Nächstes dran setzt den Boulder oben in Als Nächstes. Als Letztes dran setzt ihn ans Ende.",
+        "favorite": "Favorit umschalten speichert den Boulder in Gelikte Boulder. Ist er dort, steht in der Zeile Aus Favoriten entfernen.",
+        "remix": "Diesen Boulder remixen startet einen neuen Boulder aus diesen Griffen.",
+        "edit": "Boulder bearbeiten geht bei deinen eigenen Bouldern, als Entwurf oder innerhalb von 24 Stunden nach dem Veröffentlichen.",
+        "others": "Beta-Video hinzufügen, Routenbuch-Eintrag bearbeiten, In der Aurora-App öffnen und Boulder melden erscheinen, wenn sie passen.",
+        "p2": "Lieber tippen? Schalt Schnellaktionen-Button anzeigen unter Einstellungen, dann Boulder & Grade, dann Boulderliste ein. Jede Zeile bekommt ein ⋮, das dasselbe Menü öffnet.",
+        "betaLink": "Ein Beta-Video anhängen",
+        "clipAlt": "Eine Boulder-Zeile gedrückt halten",
+        "clipCaption": "Halt die Zeile, und das Menü öffnet sich von selbst."
+      },
+      "filters": {
+        "title": "Nach Grad, Griff, Bereich oder Routenbauer*in filtern",
+        "lead": "Öffne Filter im Tab Boulder. Eine Nadel neben dem Namen eines Filters macht ihn zum Chip über der Liste.",
+        "grade": "Tipp auf Grad, dann auf einen Grad. Tipp innerhalb von drei Sekunden auf einen zweiten Grad für einen Bereich oder nochmal auf den gewählten Grad zum Löschen.",
+        "angle": "Grade und Begehungszahlen gelten für den Winkel des Boards. Tipp auf den Winkel-Chip, um ihn zu ändern.",
+        "progress": "Angemeldet nutzen die Fortschritt-Chips deine Historie. Nicht getoppt blendet deine Begehungen aus, Projekte behält versuchte, aber nicht getoppte Boulder, und Nicht versucht behält nie eingetragene Boulder.",
+        "gradeClipAlt": "Einen Gradbereich setzen",
+        "gradeClipCaption": "Zwei schnelle Taps bilden einen Bereich.",
+        "holdsIntro": "Um nach Griff zu filtern, scroll in Filter zu Der Boulder und tipp auf Grifftypen.",
+        "holdStep1": "Wähl Einschließen oder Ausschließen.",
+        "holdStep2": "Wähl einen Grifftyp.",
+        "holdStep3": "Zoom mit zwei Fingern, dann tipp auf Griffe. Nochmal mit demselben Pinsel tippen löscht die Markierung.",
+        "holdNote": "Alles zurücksetzen räumt das Board leer. Die MoonBoard hat keinen Fuß-Pinsel.",
+        "holdClipAlt": "Griffe markieren",
+        "holdClipCaption": "Wähl zuerst einen Pinsel, dann tipp auf Griffe.",
+        "region": "Um einen Teil der Wand einzugrenzen, tipp auf Board-Bereich, dann auf Bereich hinzufügen. Zieh die Mitte, um den Rahmen zu verschieben, und eine Ecke, um ihn zu ändern.",
+        "regionModes": "Alle Griffe behält Boulder, die ganz im Rahmen liegen. Beliebiger Griff behält Boulder, die hineinreichen.",
+        "regionClipAlt": "Den Bereich verschieben und in der Größe ändern",
+        "regionClipCaption": "Zieh die Mitte, um den Rahmen zu verschieben, eine Ecke, um ihn zu ändern.",
+        "setters": "Tipp auf Folgen auf der Seite einer Routenbauer*in oder im Bildschirm Routenbauer*innen. Schalt dann Boulder von Leuten, denen ich folge ein, direkt unter Routenbauer*innen.",
+        "settersPicker": "Setz im Bildschirm Routenbauer*innen einen Haken zum Filtern oder tipp auf einen Namen, um seine Boulder zu durchsuchen.",
+        "shotAlt": "Der Bildschirm Routenbauer*innen",
+        "shotCaption": "Haken setzen zum Filtern. Auf einen Namen tippen zum Durchsuchen.",
+        "count": "Der Button unten zeigt, wie viele Boulder passen. Zurücksetzen löscht alle Filter."
+      },
+      "rows": {
+        "title": "Eine Boulder-Zeile wischen",
+        "lead": "Wisch nach rechts, um einen Boulder als Nächstes zu spielen, oder nach links, um ihn zu einer Playlist hinzuzufügen.",
+        "p1": "Keiner der beiden Wische beleuchtet das Board.",
+        "p2": "Das kleine Symbol ist deine Historie: ein Blitz für Flash, ein Haken im Kreis für getoppt, ein Kreuz im Kreis für versucht, ein C im Kreis für Benchmark.",
+        "clipAlt": "Eine Zeile in beide Richtungen wischen",
+        "clipCaption": "Rechts spielt ihn als Nächstes. Links öffnet die Playlist-Auswahl."
+      },
+      "playlists": {
+        "title": "Playlists",
+        "lead": "Eine Playlist ist eine gespeicherte Liste von Bouldern für ein Board, die du mit Wischen durchläufst.",
+        "step1": "Öffne Entdecken und prüf den Board-Chip oben.",
+        "step2": "Tipp auf das Plus, gib einen Namen ein, wähl eine Farbe und tipp auf Erstellen.",
+        "step3": "Füg Boulder hinzu: Wisch eine Zeile nach links, oder halt sie gedrückt und tipp auf Zur Playlist hinzufügen.",
+        "p1": "Deine Playlist erscheint unter Meine Playlists. Die Auswahl zeigt nur Playlists für das Board und Layout des Boulders.",
+        "play": "Um eine Playlist zu spielen, tipp darin auf einen Boulder und wisch. Der Play-Button im Kopf startet beim ersten Boulder.",
+        "remove": "Um einen Boulder herauszunehmen, öffne bei ihm Zur Playlist hinzufügen und tipp auf die abgehakte Playlist. Oder tipp auf den Stift an der Playlist, auf das rote Minus und bestätige.",
+        "reorder": "Zieh am Griff, um die Reihenfolge zu ändern. Für-dich-Listen haben keinen Bearbeiten-Modus, nimm also stattdessen das Herz weg oder trag die Begehung ein.",
+        "removeClipAlt": "Eine Playlist abwählen",
+        "removeClipCaption": "Tipp auf eine abgehakte Playlist, und der Boulder kommt wieder raus.",
+        "forYou": "Entdecken baut acht Für-dich-Listen: Publikumslieblinge, Geheimtipps, Auf deinem Level, Frisch, Fünf Sterne, Am häufigsten wiederholt, Projekte und Gelikte Boulder.",
+        "forYouHow": "Die ersten vier lesen dein Board bei deinem Winkel und lassen deine Begehungen weg. Die letzten vier kommen aus deinen Einträgen und Herzen.",
+        "tags": "Um zu sehen, in welchen Playlists ein Boulder ist, schalt Playlist-Tags anzeigen unter Einstellungen, dann Boulder & Grade, dann Boulderliste ein.",
+        "browse": "Öffentliche Playlists im Web durchsuchen",
+        "discoverShotAlt": "Der Tab Entdecken",
+        "discoverShotCaption": "Angepinnt, dann Meine Playlists, dann Für dich.",
+        "detailShotAlt": "Deine eigene Playlist",
+        "detailShotCaption": "Anpinnen, bearbeiten, umsortieren oder entfernen."
+      },
+      "diagram": {
+        "description": "Wohin ein Wisch im Player führt. Öffnest du einen Boulder aus einer Liste, zeigt Wischen den Boulder davor oder danach in dieser Liste, ohne etwas zu beleuchten. Am Board beleuchten beleuchtet eine Vorschau. Vom Boulder an der Wand führt Wischen zuerst zu Als Nächstes, dann zur Liste, aus der er kam, dann zu einer Endkarte.",
+        "listCaption": "Tipp in einer Liste auf einen Boulder: Wischen läuft durch diese Liste. Nichts leuchtet.",
+        "listName": "Suchergebnisse",
+        "listCurrent": "{{list}} · 4 von 23",
+        "listPrevious": "Boulder 3",
+        "listNext": "Boulder 5",
+        "wallCaption": "Vom Boulder an der Wand: zuerst Als Nächstes, dann die Liste, aus der er kam.",
+        "preview": "Vorschau · nicht am Board",
+        "putOnBoard": "Am Board beleuchten",
+        "onWall": "An der Wand",
+        "upNext": "Als Nächstes",
+        "thenFrom": "Danach aus {{list}}",
+        "endCard": "Ende der Liste"
+      }
+    },
+    "hub": {
+      "hero": {
+        "title": "Hilfe",
+        "subtitle": "Kurze Anleitungen für die App, dafür, dein Kilter- oder Tension-Routenbuch zu übernehmen, und dafür, wo du fragen kannst."
+      },
+      "guides": {
+        "title": "Anleitungen",
+        "lead": "Wähl die Anleitung, die zu dem passt, was du gerade machst.",
+        "start": {
+          "title": "Board und Bluetooth",
+          "body": "Bring einen Boulder an die Wand, steuere das Board und reparier eines, das sich nicht verbindet."
+        },
+        "browse": {
+          "title": "Boulder finden, spielen und speichern",
+          "body": "Wisch durch Listen, filtere nach Grad oder Griff und bau Playlists."
+        },
+        "crew": {
+          "title": "Mit deiner Crew klettern",
+          "body": "Starte eine Session und lad deine Crew per QR-Code ein."
+        },
+        "logbook": {
+          "title": "Dein Routenbuch",
+          "body": "Trag Begehungen ein, ändere sie und häng Beta-Videos an."
+        },
+        "spray": {
+          "title": "Spraywalls",
+          "body": "Fotografier deine Spraywall und korrigier die Griffe, die Boardsesh findet."
+        },
+        "read": "Zur Anleitung"
+      },
+      "bring": {
+        "title": "Dein Kilter- oder Tension-Routenbuch übernehmen",
+        "lead": "Verknüpf dein Board-Konto einmal, und deine Begehungen kommen rüber.",
+        "link": "Schritte ansehen"
+      },
+      "counts": {
+        "title": "Warum zeigt die Kilter-App mehr Boulder?",
+        "lead": "Beide Apps haben dieselben Boulder und zählen sie unterschiedlich.",
+        "boardseshCount": "18.000",
+        "boardseshLabel": "Ungefähr so viele in Boardsesh auf einer 8x12 Kilter Homewall. Jeder Boulder zählt einmal.",
+        "kilterCount": "36.000",
+        "kilterLabel": "Ungefähr so viele in der Kilter-App, dasselbe Board. Sie zählt einen Boulder offenbar einmal pro Winkel, in dem er geklettert wurde."
+      },
+      "ask": {
+        "title": "Eine Frage stellen",
+        "lead": "Auf Discord bekommst du am schnellsten eine Antwort.",
+        "discord": "Auf Discord fragen",
+        "bugLead": "Einen Bug gefunden?",
+        "github": "Du hast ein GitHub-Konto? Öffne ein Issue",
+        "devLead": "Du baust auf der API?",
+        "docs": "Die Entwickler-Doku lesen",
+        "discordTitle": "Discord",
+        "discordBody": "Marco und andere Kletterer*innen auf Discord können helfen. Nenne dein Board, worauf du getippt hast und was du gesehen hast.",
+        "bugBody": "Tipp in der App auf deinen Avatar, dann auf Bug melden. Schreib uns, was passiert ist und auf welchem Handy.",
+        "devBody": "Du entwickelst ein Logbuch-Tool? Lies mit Erlaubnis der kletternden Person deren Historie. Der Entwicklerleitfaden erklärt den aktuellen Zugang.",
+        "contact": "Frage nach dem Entwicklerzugang"
+      },
+      "topics": {
+        "guides": "Anleitungen",
+        "app": "App holen",
+        "logbook": "Routenbuch übernehmen",
+        "counts": "Boulder-Zahlen",
+        "ask": "Hilfe holen"
+      }
+    },
+    "log": {
+      "breadcrumb": "Dein Routenbuch",
+      "hero": {
+        "title": "Dein Routenbuch und Beta-Videos",
+        "subtitle": "Trag einen Boulder an der Wand ein, korrigier ihn später und häng dein Beta-Video an."
+      },
+      "log": {
+        "title": "Trag ihn an der Wand ein",
+        "lead": "Tipp auf den Haken, füll aus, was du willst, und speicher.",
+        "shotAlt": "Der Haken-Button",
+        "shotCaption": "Der Haken öffnet das Eintrags-Sheet.",
+        "logbookShotAlt": "Das Routenbuch",
+        "p1": "Tipp auf den großen Haken im Player oder auf ✓ in der Leiste unten. Datum und Zeit sind schon ausgefüllt, der Rest ist freiwillig.",
+        "p2": "Versuch trägt einen Versuch ein, der nicht gehalten hat. Der andere Button heißt Flash beim ersten Eintrag in diesem Winkel, sonst Getoppt. Einträge werden offline gespeichert und später synchronisiert."
+      },
+      "edit": {
+        "title": "Einen Eintrag ändern oder löschen",
+        "lead": "Wisch eine Routenbuch-Zeile nach rechts, um sie zu bearbeiten, oder nach links, um sie zu löschen.",
+        "clipAlt": "Eine Routenbuch-Zeile wischen",
+        "clipCaption": "Ein kurzer Wisch zeigt den Stift oder den Papierkorb.",
+        "p1": "Öffne den Tab Profil, dann Routenbuch. Gedrückt halten bietet auch Routenbuch-Eintrag bearbeiten an.",
+        "p2": "Du kannst Status, Winkel, Versuche, Grad, Sterne und Notiz ändern. Änderungen brauchen eine Verbindung.",
+        "p3": "Zum Löschen wisch die Zeile nach links oder tipp im Bearbeiten-Sheet auf Diese Begehung löschen. Die App fragt vorher nach, und es gibt kein Rückgängig. Kommentare und Votes zu dieser Begehung verschwinden mit."
+      },
+      "repeats": {
+        "title": "Eine Zeile pro Boulder, Tag und Winkel",
+        "lead": "Dein Routenbuch hat eine Zeile pro Boulder, pro Tag und pro Winkel.",
+        "p1": "Vier Versuche heute Abend sind eine Zeile, mit addierten Versuchen und deinem besten Ergebnis. Gespiegelte Versuche bekommen eine eigene Zeile.",
+        "p2": "Filter sortiert nach Neueste oder Schwerste und grenzt nach Status, Grad, Winkel, Datum und Nur Benchmark-Boulder ein."
+      },
+      "bring": {
+        "title": "Dein Kilter- oder Tension-Routenbuch übernehmen",
+        "lead": "Verknüpf dein Board-Konto einmal, und deine Begehungen kommen rüber.",
+        "step1": "Tipp auf deinen Avatar, dann auf Einstellungen, dann auf Verbundene Apps.",
+        "step2": "Tipp unter Board-Konten auf Verknüpfen bei der Tension-Karte oder auf Bei Kilter anmelden bei der Kilter-Karte.",
+        "step3": "Gib für Kilter deine Anmeldedaten unter Verbundene Apps ein. Gib für Tension deinen Tension-Benutzernamen und dein Passwort ein.",
+        "p1": "Du hast die alte Kilter-App genutzt? Die Karte Kilter (Aurora) nimmt einen JSON-Export an.",
+        "p2": "Nach dem Verknüpfen prüft Boardsesh im Hintergrund auf neue Begehungen. Die Wartezeit variiert. Importe laufen nur zu Boardsesh; deine Einträge hier gehen nicht zurück an deren Apps.",
+        "link": "Routenbuch mitnehmen",
+        "credentials": "Gib für Kilter deine Anmeldedaten unter Verbundene Apps ein. Boardsesh tauscht sie gegen ein verschlüsseltes Anmeldetoken und speichert dein Kilter-Passwort nicht. Für Tension und andere Aurora-Board-Konten speichern wir Benutzernamen und Passwort verschlüsselt, um neue Begehungen abzurufen. Trennen entfernt die gespeicherten Zugangsdaten und stoppt künftige Importe."
+      },
+      "beta": {
+        "title": "Ein Beta-Video anhängen",
+        "lead": "Boardsesh verknüpft Instagram-Reels und TikToks mit Bouldern.",
+        "step1": "Tipp bei deinem Reel oder TikTok auf Teilen und wähl Boardsesh. In Instagram kann es sich unter Mehr verstecken.",
+        "step2": "Boardsesh öffnet Häng deine Beta an, mit deinen eingetragenen Bouldern unter dem Beitrag.",
+        "step3": "Tipp auf den Boulder, den das Video zeigt.",
+        "callout": "Es gibt keinen Bestätigungsschritt und keine Möglichkeit, ein Video zu entfernen, also prüf zuerst den Boulder-Namen.",
+        "p1": "Der Boulder muss als Begehung oder Versuch in deinem Routenbuch stehen. Nur öffentliche Instagram- und TikTok-Links funktionieren.",
+        "p2": "Um neue Beta zu filmen, halt einen Boulder gedrückt und wähl Beta-Video hinzufügen. Tipp auf Bildunterschrift kopieren, dann auf Instagram öffnen, und poste mit dieser Bildunterschrift.",
+        "p3": "Lass den Boulder-Namen in Anführungszeichen drin, denn der verknüpft das Reel. MoonBoard-Bildunterschriften haben keine Anführungszeichen, wähl den Boulder also selbst."
+      },
+      "findBeta": {
+        "title": "Die Beta anderer ansehen",
+        "lead": "Öffne einen Boulder und scroll nach unten zu Beta-Videos.",
+        "p1": "Tipp auf eine Karte, um sie in Instagram oder TikTok zu öffnen. Um nur Boulder mit Beta zu listen, schalt in Filter Nur mit Beta-Video ein.",
+        "filtersLink": "Mehr zu Filtern",
+        "p2": "Deine eigene Beta steht unten unter Fortschritt im Tab Profil."
+      },
+      "next": {
+        "title": "Weiter geht's",
+        "climbMenu": "Aus jeder Liste einen Eintrag machen"
+      }
+    },
+    "crew": {
       "breadcrumb": "Live-Sessions",
       "hero": {
-        "title": "Live-Sessions mit deiner Crew",
-        "subtitle": "Starte eine Session, teil den Link, und jedes Handy arbeitet an einer Warteschlange."
+        "title": "Mit deiner Crew klettern",
+        "subtitle": "Starte eine Session, teil den Link, und klettert zusammen an einem Board."
       },
       "start": {
         "title": "Eine Session starten",
-        "intro": "Jede Session startet im Tab Session.",
+        "lead": "Jede Session startet im Tab Session.",
         "step1": "Öffne den Tab Session. Prüf das Board oben.",
-        "step2": "Diese Session live zeigen lässt deine Crew sie sehen und beitreten. Aus geht nur noch dein Einladungslink.",
+        "step2": "Diese Session live zeigen lässt deine Crew sie finden und beitreten. Aus geht nur noch dein Einladungslink.",
         "step3": "Tipp auf Starten, dann auf Kletterer*innen einladen für QR-Code, Link kopieren und Teilen.",
         "shotAlt": "Eine Live-Session",
-        "shotCaption": "Wer dabei ist, was in der Warteschlange steht und was leuchtet.",
+        "shotCaption": "Wer dabei ist und was leuchtet.",
         "liveShotAlt": "Die Leiste Gerade am Klettern",
         "liveShotCaption": "Gerade am Klettern im Tab Start listet Sessions, denen du beitreten kannst."
       },
       "join": {
         "title": "Einer Session beitreten",
-        "way1": "Scann den QR-Code der gastgebenden Person oder öffne ihren Link.",
-        "way2": "Im Tab Start unter Gerade am Klettern nachsehen.",
-        "way3": "Tipp im Tab Boulder oben auf das Board, dann auf Gerade hier am Klettern.",
-        "p1": "Jeder Weg öffnet die Karte Session von Sam beitreten?. Tipp auf Session beitreten."
-      },
-      "queue": {
-        "title": "Eine Warteschlange, alle Handys",
-        "p1": "Alle in der Session können Boulder hinzufügen, umsortieren oder entfernen. Dein Avatar markiert deine Zeilen.",
-        "p2": "Beenden kann die Session nur, wer sie gestartet hat. Alle anderen tippen auf Session verlassen."
+        "lead": "Scann den Code der Gastgeber*in oder finde eine Session in der Nähe.",
+        "way1": "Scann den QR-Code der Gastgeber*in oder öffne den Link.",
+        "way2": "Schau im Tab Start unter Gerade am Klettern.",
+        "way3": "Tipp oben im Tab Boulder auf das Board, dann auf Gerade hier am Klettern.",
+        "p1": "Jeder Weg öffnet eine Karte Session von Sam beitreten?. Tipp auf Session beitreten."
       },
       "wall": {
         "title": "Wer die Wand beleuchtet",
-        "p1": "Ein Board nimmt immer nur eine Bluetooth-Verbindung. Auf jedem anderen Handy rufst du die Vorschau auf und tippst auf die Glühbirne, und das verbundene Handy beleuchtet den Boulder für dich.",
-        "p2": "An einer Wand ohne Licht heißt die Glühbirne Wand übernehmen.",
-        "bluetoothLink": "Mit einem Board verbinden"
+        "lead": "Ein Handy hält das Board, und alle anderen beleuchten Boulder darüber.",
+        "p1": "Tipp auf Am Board beleuchten. Das Handy, das das Board hält, beleuchtet den Boulder, und sein Gesicht erscheint auf deinem Wand-Button.",
+        "busy": "Hat jemand aus der Crew einen Boulder an die Wand gebracht, während du geschaut hast, fragt Am Board beleuchten vorher nach. Wand so lassen lässt seinen Boulder leuchten. Meinen beleuchten ersetzt ihn.",
+        "queue": "Alle können Boulder in der Warteschlange hinzufügen, umsortieren oder entfernen. Nur wer die Session gestartet hat, kann sie beenden. Alle anderen tippen auf Session verlassen."
       },
-      "crowd": {
+      "browsing": {
         "title": "Stöbern, ohne die Wand zu bewegen",
-        "p1": "Ist noch jemand in deiner Session, beleuchtet Wischen das Board nicht mehr und die Anzeige Stöbern erscheint. Tipp auf Am Board beleuchten, wenn du die Wand willst.",
-        "p2": "Allein am Board? Halt die Glühbirne gedrückt und schalt Boulder beim Wischen beleuchten und Boulder beim Antippen in der Liste beleuchten aus.",
-        "previewLink": "Einen Boulder aus jeder Liste in der Vorschau ansehen"
+        "lead": "In einer Crew ist jedes Antippen eine Vorschau, die nur du siehst.",
+        "p1": "Wische laufen durch deine eigene Liste und bewegen die Wand nie. Der Zurück-Chip mit dem Gesicht von wem auch immer die Wand beleuchtet hat, bringt dich zu deren Boulder zurück.",
+        "drivingLink": "Nur das Handy, das das Board hält, kann es steuern. So funktioniert das Steuern."
       },
       "history": {
-        "title": "Die Sessions auf deinem Profil",
-        "p1": "Der Tab Sessions in deinem Profil listet jede Session mit ihren Bouldern und Begehungen.",
-        "p2": "Die Zusammenfassung am Ende hat In Apple Health speichern und Auf Strava teilen. Verbundene Apps in den Einstellungen macht das automatisch."
+        "title": "Nach der Session",
+        "lead": "Der Tab Sessions in deinem Profil listet jede Session mit ihren Bouldern und Begehungen.",
+        "p1": "Die Zusammenfassung am Ende der Session bietet In Apple Health speichern und Auf Strava teilen. Verbundene Apps in den Einstellungen macht das automatisch."
       },
       "next": {
-        "title": "Weiterlesen",
-        "playlists": "Eine Playlist in die Warteschlange laden",
+        "title": "Weiter geht's",
+        "playlists": "Eine Playlist spielen",
         "hub": "Alle Hilfethemen"
       }
     },
-    "findingClimbs": {
-      "breadcrumb": "Boulder finden",
+    "spray": {
+      "breadcrumb": "Spraywalls",
       "hero": {
-        "title": "Boulder nach Griff, Bereich oder Routenbauer*in finden",
-        "subtitle": "Wo jeder Filter im Tab Boulder steckt."
+        "title": "Richte deine Spraywall ein",
+        "subtitle": "Jeder Griff und jeder Boulder wird auf einem Foto deiner Spraywall gesetzt, also kommt es auf die Aufnahme an."
       },
-      "start": {
-        "title": "Erst Grad und Winkel",
-        "p1": "Tipp auf die Anzeige Grad neben der Suche. Ein Grad zeigt nur diesen Grad, ein zweiter innerhalb von drei Sekunden ergibt einen Bereich, und der gewählte Grad nochmal setzt zurück.",
-        "p2": "Jeder Grad und jede Zahl an Begehungen gilt für den Winkel des Boards. Tipp auf den Winkel-Chip, um ihn zu ändern.",
-        "p3": "Angemeldet filtern die Fortschritt-Chips nach deiner Historie. Nicht getoppt blendet deine Begehungen aus, Projekte behält versuchte, aber nicht getoppte Boulder, Nicht versucht behält nie eingetragene.",
-        "clipAlt": "Einen Gradbereich setzen",
-        "clipCaption": "Zwei schnelle Taps bilden einen Bereich. Tipp denselben Grad nochmal an, um ihn zu löschen."
+      "watch": {
+        "title": "Sieh dir die Anleitung an",
+        "lead": "Boardsesh findet die Griffe auf deinem Foto, und ein gutes Foto heißt weniger zu korrigieren.",
+        "videoAlt": "Eine Spraywall hinzufügen und ihre Griffe in der Boardsesh-App bearbeiten"
       },
-      "holds": {
-        "title": "Nach Griff filtern",
-        "intro": "Öffne Filter, scroll zu Der Boulder und tipp auf Grifftypen.",
-        "step1": "Wähl Einschließen oder Ausschließen.",
-        "step2": "Wähl einen Grifftyp.",
-        "step3": "Zoom mit zwei Fingern, dann tipp auf Griffe. Nochmal mit demselben Pinsel tippen löscht die Markierung.",
-        "p2": "Ein Griff kann mehrere Markierungen tragen. Alles zurücksetzen räumt das Board leer.",
-        "p3": "Das MoonBoard hat keinen Pinsel Fuß.",
-        "clipAlt": "Griffe markieren",
-        "clipCaption": "Erst den Pinsel wählen, dann auf Griffe tippen."
-      },
-      "zone": {
-        "title": "Einen Teil der Wand eingrenzen",
-        "intro": "Öffne Filter, scroll zu Der Boulder und tipp auf Board-Bereich.",
-        "p1": "Tipp auf Bereich hinzufügen. Zieh in der Mitte, um den Rahmen zu verschieben, an einer Ecke, um ihn zu ändern. Alle Griffe behält Boulder, die ganz drin liegen, Beliebiger Griff behält alle, die hineinreichen.",
-        "p2": "Bereich löschen nimmt den Rahmen weg. Griff- und Bereichsfilter brauchen eine Verbindung.",
-        "clipAlt": "Den Bereich verschieben und in der Größe ändern",
-        "clipCaption": "Zieh die Mitte, um das Rechteck zu verschieben, eine Ecke, um es zu vergrößern."
-      },
-      "setters": {
-        "title": "Folge Routenbauer*innen und such nur bei ihnen",
-        "p1": "Folgen steht auf der Seite einer Routenbauer*in und auf dem Screen Routenbauer*innen unter Filter. Danach schaltest du direkt darunter Boulder von Leuten, denen ich folge ein.",
-        "p2": "Der Screen Routenbauer*innen ist auch eine Auswahl. Setz einen Haken zum Filtern, oder tipp auf einen Namen, um die Boulder durchzusehen.",
-        "shotAlt": "Der Screen Routenbauer*innen",
-        "shotCaption": "Haken setzen filtert. Auf einen Namen tippen zeigt die Boulder."
-      },
-      "rows": {
-        "title": "Was eine Boulder-Zeile kann",
-        "p1": "Nach rechts wischen legt den Boulder in die Warteschlange. Nach links wischen öffnet die Playlist-Auswahl. Beides beleuchtet das Board nicht.",
-        "p2": "Das kleine Zeichen ist deine Historie. Ein Blitz heißt geflasht, ein Haken im Kreis getoppt, ein Kreuz im Kreis versucht, ein C im Kreis Benchmark.",
-        "actionsLink": "Alles im Menü hinter dem langen Druck",
-        "p3": "Halt eine Zeile gedrückt für das volle Aktionsmenü.",
-        "clipAlt": "Eine Zeile in beide Richtungen wischen",
-        "clipCaption": "Rechts legt ihn in die Warteschlange, links öffnet die Playlist-Auswahl."
-      },
-      "keep": {
-        "title": "Behalte die Filter, die du nutzt",
-        "p1": "Die meisten Filter haben eine Nadel neben dem Namen. Tipp darauf, und der Filter wird zum Chip über der Liste.",
-        "p2": "Der Button unten zeigt, wie viele Boulder passen. Zurücksetzen räumt alles ab."
-      },
-      "next": {
-        "title": "Weiterlesen",
-        "climbActions": "Was dir ein langer Druck bringt",
-        "playlists": "Funde in eine Playlist retten",
-        "hub": "Alle Hilfethemen"
-      }
-    },
-    "logbook": {
-      "breadcrumb": "Dein Routenbuch",
-      "hero": {
-        "title": "Eine Begehung eintragen und später ändern",
-        "subtitle": "Trag einen Boulder direkt am Board mit zwei Tipps ein und ändere ihn jederzeit."
-      },
-      "log": {
-        "title": "Trag ihn an der Wand ein",
-        "p1": "Tipp auf den großen Haken im Player oder auf Begehung eintragen in der Warteschlangen-Leiste. Datum und Zeit stehen auf jetzt, der Rest ist freiwillig.",
-        "p2": "Versuch trägt einen Versuch ein, der nicht gehalten hat. Der andere Button heißt Flash beim ersten Eintrag in diesem Winkel, sonst Getoppt.",
-        "shotAlt": "Der Haken-Button",
-        "shotCaption": "Der Haken öffnet das Eintrags-Sheet.",
-        "logbookShotAlt": "Das Routenbuch",
-        "logbookShotCaption": "Nach rechts wischen bearbeitet, nach links löscht."
-      },
-      "edit": {
-        "title": "Einen Eintrag nachträglich ändern",
-        "p1": "Öffne den Tab Profil, dann Routenbuch. Wisch eine Zeile nach rechts, oder halt sie gedrückt und wähl Routenbuch-Eintrag bearbeiten.",
-        "field1": "Status. Flash, Getoppt oder Versuch.",
-        "field2": "Winkel und Versuche. Datum und Zeit bleiben, wie eingetragen.",
-        "field3": "Grad, Sterne und Notiz.",
-        "p2": "Bündelt eine Zeile mehrere Versuche von einem Tag, fragt die App Welchen Eintrag bearbeiten?",
-        "p3": "Änderungen brauchen eine Verbindung. Ein neuer Eintrag speichert offline und synct später.",
-        "clipAlt": "Eine Routenbuch-Zeile wischen",
-        "clipCaption": "Ein kurzer Wisch zeigt Stift oder Mülleimer. Ein voller Wisch nach links fragt vor dem Löschen."
-      },
-      "delete": {
-        "title": "Einen Eintrag löschen",
-        "p1": "Wisch die Zeile nach links, oder tipp unten im Sheet auf Diese Begehung löschen. Beides fragt nach. Rückgängig gibt es nicht.",
-        "p2": "Löschen nimmt Kommentare und Stimmen der Begehung mit und zählt deine Statistik neu."
-      },
-      "repeats": {
-        "title": "Versuche, Begehungen und Wiederholungen",
-        "p1": "Eine Zeile pro Boulder, pro Tag, pro Winkel. Vier Versuche heute Abend sind eine Zeile mit zusammengezählten Versuchen und dem besten Ergebnis. Gespiegelte Versuche bekommen ihre eigene Zeile.",
-        "p2": "Die Versuche nächste Woche sind eine neue Zeile."
-      },
-      "find": {
-        "title": "Einen alten Eintrag finden",
-        "p1": "Die Suche findet Boulder-Namen. Filter sortiert nach Neueste oder Schwerste und grenzt nach Status, Nur Flash, Grad, Winkel, Datum und Nur Benchmarks ein. Einen Board-Filter gibt es nicht.",
-        "p2": "Begehungen aus einem verknüpften Kilter- oder Tension-Konto kommen auch rüber. Tipp auf deinen Avatar, dann Einstellungen, dann Verbundene Apps.",
-        "auroraLink": "Zum Migrations-Guide"
-      },
-      "next": {
-        "title": "Weiterlesen",
-        "climbActions": "Aus jeder Liste einen Eintrag machen",
-        "findingClimbs": "Den Boulder wiederfinden",
-        "hub": "Alle Hilfethemen",
-        "betaVideos": "Ein Beta-Video anhängen"
-      }
-    },
-    "bluetooth": {
-      "breadcrumb": "Board und Bluetooth",
-      "hero": {
-        "title": "Verbinde dein Handy mit dem Board",
-        "subtitle": "Tipp auf die Glühbirne, wähl dein Board, und dein Boulder leuchtet."
-      },
-      "connect": {
-        "title": "Verbinden",
-        "p1": "Tipp auf die Glühbirne im Player oder in der oberen Leiste, dann in Board auswählen auf dein Board. Die Liste läuft vom stärksten Signal abwärts, jede Zeile mit ihrer Seriennummer.",
-        "p2": "Beim ersten Mal fragt iOS nach Bluetooth. Android fragt nach Geräten in der Nähe, auf Android 11 und älter nach dem Standort.",
-        "shotAlt": "Das Sheet Board auswählen",
-        "shotCaption": "Stärkstes Signal zuerst, mit Seriennummern.",
-        "litShotAlt": "Ein beleuchteter Boulder",
-        "litShotCaption": "Eine gefüllte Glühbirne heißt, die Wand leuchtet.",
-        "p3": "An einer anderen Wand? Board wechseln ist die erste Zeile hinter deinem Avatar."
-      },
-      "hidden": {
-        "title": "Halt die Glühbirne gedrückt",
-        "p1": "Solange du verbunden bist, hältst du die Glühbirne gedrückt. Diese Schalter kommen, von oben nach unten.",
-        "row1": "Automatisch trennen. Gibt das Board nach 30 Sekunden Leerlauf frei. Die Zeit änderst du in den Einstellungen.",
-        "row2": "Griff darüber beleuchten. Nur MoonBoard.",
-        "row3": "Boulder beim Wischen beleuchten.",
-        "row4": "Boulder beim Antippen in der Liste beleuchten. Schalt beides aus, und Stöbern ändert die Wand nicht mehr.",
-        "row5": "Board neu beleuchten. Schickt den Boulder nochmal an die LEDs.",
-        "row6": "Alle Lichter ausschalten. Dein Handy bleibt verbunden.",
-        "row7": "Board trennen. Nimm das, wenn du an der falschen Wand hängst.",
-        "p2": "Ein kurzer Tipp verbindet wieder mit deinem letzten Board."
-      },
-      "failed": {
-        "title": "Wenn es nicht verbindet",
-        "intro": "Die Meldung Verbindung fehlgeschlagen nennt das Problem.",
-        "fix1": "Dein Board wurde nicht gefunden. Prüf, ob es an ist und du in Reichweite bist. Hängt ein anderes Handy dran, trenn dort zuerst.",
-        "fix2": "Verbindung fehlgeschlagen. Geh näher ran und versuch es nochmal.",
-        "fix3": "Verbunden, aber das Board hat nicht geantwortet. Schalt das Board aus und wieder ein.",
-        "fix4": "Bluetooth ist aus. Schalt es ein.",
-        "fix5": "Verbindung zu deinem Board fehlgeschlagen. Versuch es nochmal. Passiert es weiter, schalt Bluetooth aus und wieder ein.",
-        "p1": "Findet Android nichts, tipp unten im Sheet auf Standort erlauben oder Standort einschalten."
-      },
-      "twoBoards": {
-        "title": "Zwei Boards in Reichweite",
-        "p1": "Lies die Seriennummer, bevor du tippst. Die Signalbalken aktualisieren sich nicht, während du davorstehst.",
-        "p2": "Die Meldung Board-Konfiguration passt nicht heißt, der Controller gehört zu einem anderen Board-Setup. Wähl Abbrechen, Trotzdem verbinden oder Board-Setup wechseln."
-      },
-      "duplicate": {
-        "title": "Dasselbe Board zweimal in der Liste",
-        "p1": "Zwei Zeilen mit verschiedenen Seriennummern sind zwei Controller. Eine Zeile, in der nur Kilter Board steht, ohne Seriennummer, ist eine neuere LED-Box vom Hersteller. Zwei davon in einer Halle stehen als zwei Zeilen in der Liste. Die mit mehr Signalbalken ist meist die Wand, vor der du stehst. Leuchtet die falsche Wand, halt die Glühbirne gedrückt, tipp auf Board trennen und versuch es nochmal.",
-        "p2": "Eine Liste zum Vergessen von Geräten gibt es nicht. Die App merkt sich nur dein letztes Board.",
-        "p3": "Ein Board, das doppelt unter Deine Boards steht, ist etwas anderes. Tipp neben Deine Boards auf Bearbeiten, dann auf Löschen oder Nicht mehr folgen."
-      },
-      "control": {
-        "title": "Wenn jemand anderes das Board hat",
-        "p1": "In einer Session hält ein Handy das Board. Auf den anderen rufst du die Vorschau auf und tippst auf die Glühbirne, und das verbundene Handy beleuchtet den Boulder.",
-        "p2": "An Wänden ohne Licht heißt der Button Wand übernehmen.",
-        "sessionsLink": "Mehr zum Teilen einer Wand"
-      },
-      "liveActivity": {
-        "title": "Das Board vom Sperrbildschirm steuern (Live Activity)",
-        "intro": "Starte erst eine Session oder tritt einer bei. Eine Solo-Warteschlange bekommt keine.",
-        "p1": "Auf dem iPhone legt eine Session eine Live Activity auf den Sperrbildschirm und in die Dynamic Island, mit Boulder, Grad und deinem Platz in der Warteschlange. Solange dein Handy das Board hält, sind auch Zurück, Weiter, eine Glühbirne zum Neubeleuchten und Boulder spiegeln dabei, wo es geht.",
-        "p2": "Android zeigt dieselben Schalter in einer laufenden Benachrichtigung namens Aktive Kletter-Session.",
-        "p3": "Den Bildschirm zu sperren trennt das Board nicht."
-      },
-      "next": {
-        "title": "Weiterlesen",
-        "findingClimbs": "Etwas für die Wand finden",
-        "hub": "Alle Hilfethemen"
-      }
-    },
-    "climbActions": {
-      "breadcrumb": "Boulder-Aktionen",
-      "hero": {
-        "title": "Halte einen Boulder gedrückt",
-        "subtitle": "Jede Aktion an einem Boulder sitzt hinter einem langen Druck auf seine Zeile."
-      },
-      "open": {
-        "title": "Das Menü öffnen",
-        "p1": "Halt eine Boulder-Zeile gedrückt. Sie hebt sich zu einer Karte, oben Eintrag machen, Zur Playlist hinzufügen und Teilen, der Rest darunter.",
-        "p2": "Lieber tippen? Unter Einstellungen, dann Anzeige, schaltest du Schnellaktionen-Button anzeigen ein und bekommst ein ⋮ auf jeder Zeile im Tab Boulder.",
-        "shotAlt": "Die Karte mit den Boulder-Aktionen",
-        "shotCaption": "Oben drei Schnell-Buttons, darunter die volle Liste.",
-        "clipAlt": "Eine Boulder-Zeile gedrückt halten",
-        "clipCaption": "Halt die Zeile, und die Karte hebt sich von selbst."
-      },
-      "preview": {
-        "title": "Einen Boulder ansehen, ohne das Board zu beleuchten",
-        "intro": "Vorschau ist der erste Eintrag in der Liste.",
-        "p1": "Sie öffnet den Boulder im Player, ohne deine Warteschlange anzurühren. Dein nächster Wisch bringt dich zurück.",
-        "p2": "In einer Session, oder wenn Boulder beim Wischen beleuchten aus ist, erscheint die Anzeige Stöbern. Tipp auf Aktiv setzen oder Am Board beleuchten, wenn du den Boulder willst.",
-        "sessionsLink": "Wie eine Session die Wand in Ruhe lässt",
-        "clipAlt": "Die Anzeige Stöbern",
-        "clipCaption": "Die Anzeige kommt nach dem Wisch. Die Wand bleibt, wie sie war."
-      },
-      "quick": {
-        "title": "Die drei Buttons oben",
-        "tick": "Eintrag machen öffnet das Begehungs-Sheet.",
-        "playlist": "Zur Playlist hinzufügen ist eine Checkliste. Haken setzen legt rein, Haken wegnehmen nimmt raus.",
-        "share": "Teilen gibt einen Link an das Teilen-Menü deines Handys.",
-        "p1": "Die Karte schließt sich, sobald eine Aktion losgeht. Ausnahme: Zur Playlist hinzufügen."
-      },
-      "rest": {
-        "title": "Der Rest der Liste",
-        "queue": "Zur Warteschlange hinzufügen setzt den Boulder hinter deinen aktuellen.",
-        "favorite": "Favorit umschalten ist das Herz. Boulder mit Herz landen in Gelikte Boulder.",
-        "editEntry": "Routenbuch-Eintrag bearbeiten, wenn du aus deinem Routenbuch kommst.",
-        "betaVideo": "Beta-Video hinzufügen, wenn du angemeldet bist.",
-        "edit": "Boulder bearbeiten, bei eigenen Bouldern als Entwurf oder bis 24 Stunden nach dem Veröffentlichen.",
-        "remix": "Diesen Boulder remixen startet einen neuen Boulder aus diesen Griffen.",
-        "openInAurora": "In der Aurora-App öffnen, bei Tension und anderen Aurora-Boards. Kilter hat keine.",
-        "report": "Boulder melden, wenn du angemeldet bist und die Moderation läuft."
-      },
-      "next": {
-        "title": "Weiterlesen",
-        "logbook": "Ändern, was du eingetragen hast",
-        "playlists": "Playlists",
-        "hub": "Alle Hilfethemen",
-        "betaVideos": "Beta-Videos"
-      }
-    },
-    "betaVideos": {
-      "breadcrumb": "Beta-Videos",
-      "hero": {
-        "title": "Ein Beta-Video an einen Boulder hängen",
-        "subtitle": "Boardsesh hängt Instagram-Reels und TikToks an Boulder."
-      },
-      "share": {
-        "title": "Ein Reel von Instagram oder TikTok teilen",
-        "step1": "Tipp bei deinem Reel oder TikTok auf Teilen. Wähl Boardsesh. In Instagram versteckt es sich manchmal unter Mehr.",
-        "step2": "Boardsesh öffnet Häng deine Beta an, oben der Post, darunter deine eingetragenen Boulder.",
-        "step3": "Tipp auf den Boulder, den das Video zeigt. Die Meldung Beta-Video angehängt bestätigt es.",
-        "p1": "Es gibt keine Rückfrage und kein Entfernen, sobald das Video hängt. Prüf also vorher den Namen des Boulders.",
-        "p2": "Du brauchst ein Konto, und der Boulder muss als Begehung oder Versuch in deinem Routenbuch stehen. Abgemeldet? Meld dich an, der Link wartet. Es gehen nur öffentliche Links von Instagram und TikTok."
-      },
-      "find": {
-        "title": "Die Beta zu einem Boulder finden",
-        "p1": "Öffne einen Boulder und scroll runter zu Beta-Videos. Tipp auf eine Karte, und sie öffnet sich in Instagram oder TikTok.",
-        "p2": "Angemeldet öffnet das Plus in der Überschrift Teile deine Beta, weiter unten beschrieben.",
-        "p3": "Willst du nur Boulder mit Beta sehen, öffne Filter und schalt Nur mit Beta-Video ein.",
-        "filtersLink": "Mehr zu Filtern"
+      "photo": {
+        "title": "Das Foto machen",
+        "lead": "Fünf Gewohnheiten geben der Grifferkennung ein sauberes Foto.",
+        "square": "Stell dich frontal hin, in einer Linie mit der Mitte der Spraywall. Von der Seite schrumpfen entfernte Griffe.",
+        "portrait": "Halt das Handy hochkant und fotografier mit 1x. Im Querformat schrumpfen die Griffe zu einem Streifen.",
+        "tilt": "Kipp das Handy passend zum Winkel der Spraywall, parallel zu ihrer Fläche.",
+        "frame": "Bring die ganze Spraywall ins Bild. Passt sie nicht, geh zurück, statt das Weitwinkel zu nehmen.",
+        "lighting": "Nimm helles, gleichmäßiges Licht, damit die Griffe herausstechen.",
+        "exampleAlt": "Eine Spraywall in der Halle, frontal fotografiert, alle Griffe im Bild",
+        "exampleCaption": "Ganze Spraywall im Bild, frontal aufgenommen."
       },
       "add": {
-        "title": "Neue Beta zu einem Boulder filmen",
-        "step1": "Halt einen Boulder gedrückt und wähl Beta-Video hinzufügen, oder tipp auf das Plus in seinem Abschnitt Beta-Videos.",
-        "step2": "Tipp auf Bildunterschrift kopieren. Sie trägt Name, Winkel und Board.",
-        "step3": "Tipp auf Instagram öffnen und poste dein Video mit dieser Bildunterschrift.",
-        "step4": "Teil das gepostete Reel wie oben nach Boardsesh, oder setz seinen Link unter Schon einen Link? ein und tipp auf Anhängen.",
-        "p1": "Lass den Namen des Boulders in Anführungszeichen stehen. Daran erkennt Boardsesh das Reel. MoonBoard-Bildunterschriften haben keine Anführungszeichen, dort wählst du den Boulder selbst."
+        "title": "Die Spraywall hinzufügen",
+        "lead": "Mach ein Foto, lass Boardsesh nach Griffen suchen und gib ihr dann einen Namen.",
+        "step1": "Öffne Boards und tipp auf Spraywall.",
+        "step2": "Mach oder wähl ein Foto. Mit Zuschneiden oder drehen bringst du die Ränder in Form.",
+        "step3": "Setz die vier Ecken, um weitere Hintergründe freizuschalten, oder überspring es, um das Foto zu behalten.",
+        "step4": "Lass Boardsesh das Foto scannen und prüf dann die Griffringe.",
+        "step5": "Wisch, um einen Hintergrund und die Art der Griffbeleuchtung zu wählen. Ohne gesetzte Ecken ist Foto der einzige Hintergrund.",
+        "p1": "Gib der Spraywall zuletzt einen Namen, stell ihren Winkel ein und veröffentliche sie. Der Winkel ist nach dem Veröffentlichen fest."
       },
-      "shelf": {
-        "title": "Deine Beta in deinem Profil",
-        "p1": "Öffne den Tab Profil und scroll ans Ende von Fortschritt. Das Regal Beta-Videos zeigt deine neuesten, und Alle ansehen öffnet alles.",
-        "p2": "Zusehen kann jede*r. Ein Boulder-Link zeigt die Beta auf boardsesh.com ohne Anmeldung."
+      "fix": {
+        "title": "Griffe vor dem Veröffentlichen korrigieren",
+        "lead": "Boardsesh zeigt die gefundenen Griffe als Ringe. Prüf sie, bevor jemand klettert.",
+        "select": "Auswählen: Tipp auf einen Griff, um ihn zu verschieben, zu skalieren oder auszuschalten.",
+        "add": "Hinzufügen: Markier einen übersehenen Griff mit Zeichnen oder Ecken.",
+        "trace": "Umranden: Zeichne die Kontur des gewählten Griffs in einer Schleife neu.",
+        "refine": "Nachbessern: Mal an der Kontur entlang, um sie zu vergrößern oder zu verkleinern.",
+        "join": "Verbinden: Wähl einen Griff und tipp dann auf einen anderen, um ihre Konturen zu verschmelzen.",
+        "imageAlt": "Der Spraywall-Editor mit einem gewählten Griff und den fünf Werkzeugen",
+        "imageCaption": "Wähl einen Ring, um seine Steuerung zu sehen.",
+        "maybe": "Gestrichelte Ringe sind unsicher. Tipp auf einen, dann auf Behalten.",
+        "toggle": "Tipp auf einen Ring, um ihn zu wählen, und nochmal, um ihn auszuschalten. Du kannst ihn wieder einschalten oder löschen.",
+        "longPress": "Halt einen Ring gedrückt, um ihn zu verschieben, oder die nackte Spraywall, um einen neuen Griff zu setzen.",
+        "gestures": "Verschieb mit zwei Fingern und zoom per Pinch. Rückgängig und Wiederholen gehen durch deine Änderungen.",
+        "missedTitle": "Ein Griff ohne Ring?",
+        "videoAlt": "Übersehene Griffe hinzufügen, Konturen korrigieren und Griffänderungen veröffentlichen",
+        "missed1": "Zoom mit zwei Fingern auf den übersehenen Griff.",
+        "missed2": "Wähl Hinzufügen, dann Zeichnen. Zeichne eine geschlossene Kontur um den Griff oder tipp für einen Kreis.",
+        "missed3": "Wiederhol es für weitere übersehene Griffe. Mach rückgängig, wenn du abrutschst.",
+        "corners": "Für gerade Kanten wähl Hinzufügen, dann Ecken. Tipp mindestens drei Punkte um den Griff, dann auf Abschließen.",
+        "drawAlt": "Das Werkzeug Hinzufügen im Modus Zeichnen mit einem umrandeten Griff",
+        "drawCaption": "Hinzufügen, Zeichnen: Umrande einen übersehenen Griff.",
+        "cornersAlt": "Das Werkzeug Hinzufügen im Modus Ecken mit Punkten um einen Griff",
+        "cornersCaption": "Hinzufügen, Ecken: drei oder mehr Punkte, dann Abschließen."
+      },
+      "edit": {
+        "title": "Griffe später bearbeiten",
+        "lead": "Du kannst Griffe jederzeit hinzufügen oder korrigieren. Neue Griffe lassen bestehende Boulder unverändert.",
+        "p1": "Tipp beim Setzen eines Boulders unter der Spraywall auf Griffe hinzufügen. Ergänze die fehlenden Griffe und tipp auf Veröffentlichen und zurück. Name, Beschreibung und ausgewählte Griffe deines Boulders bleiben erhalten. Du kannst Griffe bearbeiten auch über den Namen der Spraywall oben im Tab Boulder öffnen.",
+        "p2": "Entfernen deine Änderungen einen Griff, den veröffentlichte Boulder nutzen, bittet Boardsesh dich um Bestätigung. Griffe behalten bricht ab. Trotzdem entfernen veröffentlicht.",
+        "p3": "Diese Boulder bleiben mit einer Warnung über einen fehlenden Griff erhalten, ebenso ihre eingetragenen Begehungen. Verschieben, Skalieren, Umformen oder Verbinden eines Griffs hat denselben Effekt.",
+        "p4": "Tipp bei einem betroffenen Boulder auf Remixen, um eine aktualisierte Kopie zu setzen. Das repariert das Original nicht.",
+        "p5": "Haben sich die Griffe über die ganze Spraywall geändert, tipp im selben Sheet auf Spraywall zurücksetzen und fang mit einem neuen Foto an. Das Veröffentlichen archiviert die alte Spraywall mit ihren Bouldern.",
+        "p6": "Unveröffentlichte Griffänderungen werden auf diesem Gerät gespeichert. Du kannst die Ansicht verlassen, den Bildschirm sperren oder die App neu starten und später weitermachen. Griffe veröffentlichen macht die Änderungen auf der Spraywall verfügbar."
+      },
+      "pencil": {
+        "title": "Apple Pencil auf dem iPad",
+        "lead": "Im iPad-Editor in voller Breite zeichnet der Apple Pencil Griffe und schaltet sie um.",
+        "p1": "Zeichne um einen unmarkierten Griff, um seine Kontur hinzuzufügen, oder tipp auf eine unmarkierte Stelle für einen Kreis. Tipp auf einen markierten Griff, um ihn ein- oder auszuschalten.",
+        "p2": "Der Pencil schaltet sich beim ersten Berühren oder Schweben über dem Editor ein, außer du hast eine Einstellung gewählt. Bei Nur Pencil wählen, verschieben und scrollen Finger weiterhin."
       },
       "next": {
-        "title": "Weiterlesen",
-        "climbActions": "Alles andere hinter langem Drücken",
-        "logbook": "Trag den Boulder zuerst ein",
-        "hub": "Alle Hilfethemen"
+        "title": "Weiter geht's",
+        "logbook": "Trag deine Begehungen ein",
+        "sessions": "Klettere sie mit deiner Crew"
+      },
+      "visibility": {
+        "title": "Wer dein Spraywall sieht",
+        "body": "Wähle beim Veröffentlichen Privat, Nur per Link oder Öffentlich. Halteerkennung verbessern ist bei neuen Spraywalls eingeschaltet; du kannst es ausschalten. Wir nutzen diese Fotos nur zur Verbesserung der Halteerkennung und teilen die Trainingssammlung niemals. Ändere beide Optionen im Bearbeiten-Menü deiner Spraywall."
+      },
+      "installHelper": "Spraywalls richtest du in der App ein. Das ist kostenlos.",
+      "tools": {
+        "tool": "Werkzeug",
+        "action": "Funktion"
       }
-    },
-    "topics": {
-      "label": "Hilfethemen",
-      "guides": "Anleitungen",
-      "using": "Boardsesh nutzen",
-      "logbook": "Bring dein Routenbuch mit",
-      "counts": "Boulder-Anzahl",
-      "ask": "Hilfe finden"
     }
   },
   "docs": {
-    "loading": "Dokumentation wird geladen...",
-    "headerTitle": "API-Dokumentation",
-    "headerSubtitle": "Vollständige Referenz für die REST- und WebSocket-APIs von Boardsesh",
+    "headerTitle": "Referenz der öffentlichen Boulder-API",
+    "headerSubtitle": "Lies Boulderdaten ohne Boardsesh-Konto. Apps, die sich mit einem persönlichen Logbuch verbinden, verwenden die separate Entwickler-API.",
     "tabs": {
-      "overview": "Überblick",
-      "rest": "REST-API",
-      "graphql": "GraphQL-Schema",
-      "websocket": "WebSocket-Leitfaden"
+      "overview": "Übersicht",
+      "rest": "Öffentliche REST-Referenz",
+      "graphql": "Internes GraphQL-Schema"
     },
-    "overview": {
-      "title": "Überblick über die Boardsesh-API",
-      "intro": "Boardsesh bietet zwei APIs, die sich ergänzen, für den Umgang mit interaktiven Kletter-Trainingsboards (Kilter, Tension):",
-      "rest": {
-        "title": "REST-API",
-        "intro": "Nimm die REST-API für zustandslose Vorgänge wie die Bouldersuche, das Abrufen der Board-Konfiguration und die Authentifizierung. Die REST-API passt für:",
-        "feature1": "Boulderdaten und Statistiken abrufen",
-        "feature2": "Registrierung und Authentifizierung",
-        "feature3": "Profilverwaltung",
-        "feature4": "Auflösung von URL-Slugs zu IDs",
-        "baseUrlLabel": "Basis-URL:"
-      },
-      "ws": {
-        "title": "WebSocket-GraphQL-API",
-        "intro": "Nimm die WebSocket-API für Echtzeit-Funktionen wie Party-Sessions und die Sync der Warteschlange. Die GraphQL-API bietet:",
-        "feature1": "Echtzeit-Updates der Warteschlange über Subscriptions",
-        "feature2": "Session-Verwaltung (anlegen, beitreten, verlassen)",
-        "feature3": "Zusammenarbeit mehrerer Nutzer*innen",
-        "feature4": "Alle Funktionen der REST-API über Queries/Mutations",
-        "endpointLabel": "Endpunkt:",
-        "endpointSuffix": "(über das graphql-ws-Protokoll)"
-      },
-      "auth": {
-        "title": "Authentifizierung",
-        "restLabel": "REST-API:",
-        "restBody": "Nutzt NextAuth-Session-Cookies. Authentifizier dich über die",
-        "restBodyEnd": "Endpunkte.",
-        "wsLabel": "WebSocket-API:",
-        "wsBody": "Hol dir ein JWT-Token von",
-        "wsBodyEnd": "und gib es in den Verbindungsparametern mit:"
-      },
-      "rateLimit": {
-        "title": "Rate-Limits",
-        "body": "Die Endpunkte zur Authentifizierung sind rate-limitiert, um Missbrauch zu verhindern. Die Rate-Limit-Header stehen in den Antworten. Öffentliche Lese-Endpunkte haben großzügige Limits."
-      }
+    "public": {
+      "title": "Öffentliche Lese-API · Verfügbar",
+      "body": "Nutze /api/v1/ für öffentliche Boulder, Grade, Board-Konfigurationen und Slugs. Diese Leserouten verwenden keine Anmelde-Cookies, registrieren niemanden und ändern keine Profile."
     },
-    "ws": {
-      "title": "Leitfaden zur WebSocket-Verbindung",
-      "introStart": "Die WebSocket-API von Boardsesh nutzt das",
-      "introEnd": "Protokoll für GraphQL-Subscriptions in Echtzeit.",
-      "connection": {
-        "title": "Verbindung einrichten"
-      },
-      "session": {
-        "title": "Session-Verwaltung",
-        "body": "Sessions sind die zentrale Einheit für die Zusammenarbeit. Nutzer*innen treten einer Session bei, um sich eine Warteschlange zu teilen."
-      },
-      "delta": {
-        "title": "Delta-Synchronisation",
-        "body": "Nutz beim Wiederverbinden die Delta-Sync, um ohne vollständige Zustandsübertragung aufzuholen:"
-      },
-      "connectionHandling": {
-        "title": "Umgang mit der Verbindung",
-        "body": "Die WebSocket-Verbindung kann durch Netzwerkwechsel abreißen. Bau eine Reconnect-Logik mit den Retry-Optionen von graphql-ws und nutz die Delta-Sync, damit der Zustand konsistent bleibt."
-      }
-    }
+    "partners": {
+      "title": "Verbundene Apps",
+      "body": "Nutze OAuth, die Zustimmung der kletternden Person und deren freigegebene Berechtigungen für das persönliche Logbuch. Die Registrierung kann eine Einladung erfordern; der Leitfaden nennt den aktuellen Zugang. Workouts und Webhooks werden hier nicht als allgemein verfügbar angeboten.",
+      "link": "Lies den Entwicklerleitfaden",
+      "contact": "Frage nach dem Entwicklerzugang"
+    },
+    "internal": {
+      "title": "Internes Protokoll · Referenz für Beiträge",
+      "body": "GraphQL und Sitzungsprotokolle betreiben die Boardsesh-Apps. Das sind interne Schnittstellen, keine unterstützte API für das Backend einer anderen App. Forks betreiben ihren eigenen Dienst. Siehe die Referenz und die Regeln zum gehosteten Dienst.",
+      "link": "Lies die interne Protokollreferenz"
+    },
+    "policyLink": "Lies die Regeln zum gehosteten Dienst",
+    "loading": "Referenz wird geladen…"
   },
   "privacy": {
     "title": "Datenschutzerklärung",
-    "lastUpdatedProductAnalytics": "Zuletzt aktualisiert: Mai 2026",
+    "lastUpdated": "Zuletzt aktualisiert: 18. November 2026",
     "intro1": "Boardsesh ist eine quelloffene App, die Kletter-Trainingsboards (Kilter, Tension, MoonBoard) über Bluetooth steuert. Diese Erklärung sagt dir, welche Daten wir erheben, wozu, und was wir damit machen.",
-    "intro2ProductAnalytics": "Kurz gesagt: Wir erheben nur, was die App zum Laufen braucht. Wir verkaufen deine Daten nicht, wir schalten keine Werbung, und wir geben nichts an Werbetreibende oder Datenhändler weiter.",
+    "intro2ProductAnalytics": "Kurz gesagt: Wir erheben nur, was die App zum Laufen braucht. Wir verkaufen deine Daten nicht, in Boardsesh gibt es keine Werbung, und wir geben nichts an Datenhändler weiter. Wir werben für Boardsesh auf Reddit und Instagram, und auf unserer Website umfassen Analysen die Messung dieser Anzeigen mit Meta und Reddit, wie unten beschrieben.",
     "collect": {
       "title": "Was wir erheben",
       "accountLabel": "Kontodaten.",
-      "accountBody": "Wenn du ein Konto anlegst, speichern wir deine E-Mail-Adresse und deinen Benutzernamen. Die E-Mail-Adresse dient der Anmeldung. Dein Benutzername steht auf deinem Profil und ist für andere in Party-Modus-Sessions und den sozialen Funktionen sichtbar.",
+      "accountBody": "Wenn du ein Konto anlegst, speichern wir deine E-Mail-Adresse und deinen Benutzernamen. Die E-Mail-Adresse dient der Anmeldung. Dein Benutzername steht auf deinem Profil und ist für andere in Sitzungen und den sozialen Funktionen sichtbar.",
       "activityLabel": "Kletteraktivität.",
       "activityBody": "Wenn du eine Begehung oder einen Versuch einträgst, speichern wir die Details des Boulders, den Grad, das Datum und deine Notizen. Daraus entstehen dein Routenbuch und deine Entwicklung.",
       "locationLabel": "Standort.",
-      "locationBody": "Wenn du die Standortfreigabe erteilst, nutzen wir deinen ungefähren Standort, damit du Party-Modus-Sessions in der Nähe findest. Wir verfolgen deinen Standort nicht im Hintergrund und speichern keinen Standortverlauf.",
+      "locationBody": "Wenn du die Standortfreigabe erteilst, nutzen wir deinen ungefähren Standort, damit du Sitzungen in der Nähe findest. Wir verfolgen deinen Standort nicht im Hintergrund und speichern keinen Standortverlauf.",
       "productAnalyticsLabel": "Produktanalyse.",
-      "productAnalyticsBody": "Wir nutzen PostHog und Vercel Analytics, um zu verstehen, welche Funktionen genutzt werden, welche Seiten aufgerufen werden, wie die Performance aussieht und wo die App hakt. Manche Produktereignisse angemeldeter Nutzer*innen hängen an deinem Boardsesh-Konto, damit wir sehen, was wirklich hilft. Für Werbung nutzen wir diese Daten nicht."
+      "productAnalyticsBody": "Wir nutzen PostHog für Funktionsnutzung, Seitenaufrufe, Leistung und optionale Sitzungsaufzeichnungen in der App. In der EU, im EWR, im Vereinigten Königreich, in der Schweiz, in Gibraltar, auf Jersey, Guernsey und der Isle of Man, in China, Südkorea, Andorra, Monaco, San Marino, Vatikanstadt, auf den Färöern und in Québec sowie immer dann, wenn wir nicht erkennen, wo du bist, fragen wir zuerst, und PostHog läuft nur, wenn du Nutzungsanalysen erlaubst. Anderswo sind Nutzungsanalysen standardmäßig eingeschaltet, auf Grundlage unseres berechtigten Interesses, Boardsesh zu verbessern, und du kannst sie jederzeit in den Einstellungen oder über Datenschutzwahl ausschalten; sendet dein Browser ein Global-Privacy-Control-Signal, werten wir das als Nein. Wir entscheiden das anhand des Landes und in Kanada der Provinz, die Cloudflare für deine Verbindung meldet, und speichern diese Angaben nicht. Analysen angemeldeter Nutzer*innen können mit ihrem Boardsesh-Konto verknüpft sein. Die Installationszuordnung braucht überall deine eigene Erlaubnis; die Voreinstellung schaltet sie nicht ein. Mit deiner Erlaubnis kann die Installationszuordnung auf Android den Play-Store-Installationsverweis und Kampagneninformationen enthalten, und auf iOS nutzen wir Apple AdServices über unseren eigenen Server, um zu messen, welche Apple-Ads-Kampagnen zu Registrierungen und Kletteraktivität führen. Wir teilen geprüfte Kampagnenkennungen und den Downloadstatus mit PostHog, niemals das Zuordnungstoken. Wir verwenden diese Daten nicht, um dir Werbung anzuzeigen.",
+      "adMeasurementLabel": "Werbemessung auf unserer Website.",
+      "adMeasurementBody": "Wir werben für Boardsesh auf Reddit und Instagram. Wenn Analysen auf unserer Website aktiv sind, laden wir das Meta-Pixel und das Reddit-Pixel, damit Meta und Reddit uns sagen, welche Anzeigen Besuche und Fingertipps auf App-Store-Buttons bringen. Sie erhalten die Seiten, die du auf boardsesh.com besuchst, dein Tippen auf unsere App-Store-Buttons (welcher Store und wo der Button war) und was ihre Pixel aus deinem Browser lesen: deine IP-Adresse, Browserangaben und ihre eigenen Cookies. Wir schicken ihnen nie deine E-Mail-Adresse, dein Konto oder andere Kontaktdaten. In den Regionen, in denen wir zuerst fragen, braucht das ein „Erlauben“, das du gegeben hast, nachdem unser Banner Meta und Reddit nennt. Anderswo folgt es der Analyse-Voreinstellung und stoppt, sobald du in den Datenschutzoptionen Nein sagst oder dein Browser ein Global-Privacy-Control-Signal sendet. Es läuft nie in der App, auf Kiosk-Anzeigen, in eingebetteten Widgets oder auf Anmeldeseiten.",
+      "serviceStatsLabel": "Eigene Dienststatistiken.",
+      "serviceStatsBody": "Wir speichern den Aktivitätstag und die Plattform angemeldeter Konten in unserer eigenen Datenbank, unabhängig von der Analysewahl, auf Grundlage berechtigter Interessen zur Auswertung der Dienstnutzung. Die Einträge bleiben 13 Monate gespeichert. Nur zusammengefasste tägliche, wöchentliche und monatliche Zahlen werden an PostHog gesendet. Abgemeldete Besucher*innen werden in diesen kontobasierten Aktivitätszahlen nicht erfasst."
     },
     "bluetooth": {
       "title": "Bluetooth",
@@ -898,41 +907,70 @@
     },
     "location": {
       "title": "Standortdaten",
-      "body1": "Der Standortzugriff ist optional. Wenn du ihn erteilst, dient er genau einem Zweck: deine Party-Modus-Session für Kletternde in der Nähe auffindbar zu machen. Dein Standort geht nur an den Server, solange eine Party-Modus-Session läuft. Wir speichern keinen Standortverlauf, bauen kein Bewegungsprofil und geben Standortdaten außerhalb dieser Funktion an niemanden weiter.",
+      "body1": "Der Standortzugriff ist optional. Wenn du ihn erteilst, dient er dazu, deine Sitzung für Kletternde in der Nähe auffindbar zu machen. Dein Standort geht nur an den Server, solange eine Sitzung läuft. Wir speichern keinen Standortverlauf, bauen kein Bewegungsprofil und geben Standortdaten außerhalb dieser Funktion an niemanden weiter.",
       "body2": "Du kannst die Standortfreigabe jederzeit in den Geräteeinstellungen zurücknehmen. Die App funktioniert auch komplett ohne."
+    },
+    "sprayPhotos": {
+      "title": "Spraywall-Fotos",
+      "body1": "Wenn du eine Spraywall anlegst, speichern wir ihr Foto und die Griffe, die du markierst. Wer das Foto sehen kann, richtet sich nach der Sichtbarkeit der Spraywall: privat, nur mit Link oder öffentlich. Mitglieder einer Halle sehen außerdem die Spraywalls, die zu dieser Halle gehören.",
+      "body2": "Jede Spraywall hat einen Schalter „Hilf beim Training der Grifferkennung“. Solange er an ist, nutzen wir das Foto der Spraywall und die Griffe, die du markierst, um die Grifferkennung zu trainieren, also den Teil der App, der Griffe auf dem Foto einer neuen Spraywall findet. Ein*e Boardsesh-Admin prüft sie vorher darauf, ob sie sich zum Lernen eignen. Das gilt bei jeder Sichtbarkeit, auch für private Spraywalls. Die Kopie, die wir zum Training nutzen, liegt in einem privaten Speicher und wird nie außerhalb von Boardsesh weitergegeben oder veröffentlicht.",
+      "body3": "Der Schalter ist an, wenn du eine Spraywall anlegst, und du kannst ihn dabei oder später beim Bearbeiten der Spraywall ändern. Spraywalls, die es schon vor dem Schalter gab oder die mit einer App-Version ohne den Schalter angelegt wurden, starten mit ausgeschaltetem Schalter. Wir trainieren mit einer Spraywall, deren Schalter an ist, auf Grundlage berechtigter Interessen, um die Grifferkennung zu verbessern; ihn auszuschalten ist dein Widerspruch und wirkt wie unten beschrieben.",
+      "body4": "Wenn du ihn ausschaltest, die Spraywall löschst oder dein Konto löschst, nehmen wir die Spraywall innerhalb von 24 Stunden aus den gespeicherten Trainingsdaten. Eine Kopie, die schon für ein Training heruntergeladen wurde, kann noch bis zu 7 Tage genutzt werden und wird beim nächsten Abruf der Trainingsdaten gelöscht. Modelle, die wir schon trainiert haben, behalten, was sie gelernt haben, speichern aber keine Kopie deines Fotos.",
+      "body5": "Wird eine Spraywall gemeldet, kann ein*e Boardsesh-Admin ihr Foto sehen, um die Meldung zu prüfen, egal wie der Schalter steht. Wenn du eine Spraywall löschst, löschen wir ihr Foto nach 30 Tagen. Wenn du dein Konto löschst, werden die Fotos deiner Spraywalls mit gelöscht; für die Trainingskopie gelten die Fristen oben. Wenn du eine Spraywall zurücksetzt, bleibt die alte samt Foto als archivierte Spraywall erhalten, bis du sie auch löschst. Schaltest du den Schalter an einer der beiden aus, gilt das für beide."
+    },
+    "connectedApps": {
+      "title": "Apps, die du verbindest",
+      "intro": "Du kannst eine andere App mit deinem Boardsesh-Konto verbinden, zum Beispiel einen Trainingsplaner. Bevor etwas geteilt wird, zeigt dir Boardsesh die App, wer sie macht, einen Link zu ihrer Datenschutzerklärung und was sie sehen möchte. Geteilt wird erst, wenn du „Erlauben“ wählst.",
+      "whatItGets": "Je nachdem, was du erlaubst, sieht die App deinen Anzeigenamen und dein Profilbild sowie jeden Eintrag in deinem Routenbuch, auch Einträge, die du auf „Nur ich“ gestellt hast. Zu jedem Eintrag gehört der Boulder, auf den er sich bezieht: sein Name, sein Grad und sein Layout. Das gilt auch für einen Boulder, den jemand anderes geschraubt hat und der noch ein Entwurf oder nicht gelistet ist, denn der Eintrag gehört zu deinem Routenbuch. Bei der Spraywall einer anderen Person, die nicht öffentlich ist, bekommt die App deinen Eintrag, aber weder den Namen des Boulders noch den der Spraywall.",
+      "afterSharing": "Sobald die App deine Daten hat, gilt für das, was sie damit macht, ihre eigene Datenschutzerklärung.",
+      "disconnect": "Du kannst eine App jederzeit in deinen Boardsesh-Einstellungen trennen. Jede Änderung deines Passworts, auch das Zurücksetzen oder das erste Festlegen eines Passworts, trennt alle Apps. Danach kann die App nichts Neues mehr lesen. Was sie schon kopiert hat, löscht weder das Trennen noch das Löschen deines Boardsesh-Kontos: Bitte die App, es zu löschen."
     },
     "thirdParty": {
       "title": "Dienste von Drittanbietern",
-      "vercelLabel": "Vercel.",
-      "vercelBody": "Wir nutzen Vercel fürs Hosting und für Analytics. Vercel verarbeitet Anfragen, um die App auszuliefern, und erhebt anonyme Nutzungsdaten. Siehe ",
-      "vercelLink": "Datenschutzerklärung von Vercel",
       "posthogLabel": "PostHog.",
-      "posthogBody": "Wir nutzen PostHog für die Produktanalyse, inklusive serverseitiger Ereignisse für native App-Funktionen wie iOS Live Activities. Siehe ",
+      "posthogBody": "PostHog verarbeitet optionale Nutzungsanalysen und App-Sitzungsaufzeichnungen in den USA. Außerdem senden wir begrenzte Betriebsereignisse ohne Kontokennung zur Dienststabilität, für Hallenanzeigen und den Zustand von Updates sowie zusammengefasste Zahlen aktiver Nutzer*innen. Siehe ",
       "posthogLink": "Datenschutzerklärung von PostHog",
-      "auroraLabel": "Aurora-Climbing-API.",
-      "auroraBody": "Wenn du dein Konto bei Aurora Climbing verknüpfst (das Kilter und Tension nutzen), gleichen wir deine Boulderdaten mit den Servern von Aurora ab, damit dein Routenbuch überall gleich aussieht. Das passiert nur, wenn du es anstößt. Siehe ",
-      "auroraLink": "Aurora Climbing",
-      "auroraBodyEnd": " für deren Umgang mit Daten."
+      "adPixelsLabel": "Meta und Reddit.",
+      "adPixelsBody": "Meta Platforms und Reddit erhalten Daten zur Werbemessung von unserer Website, solange Analysen aktiv sind (siehe Was wir erheben). Sie nutzen sie auch nach ihren eigenen Datenschutzerklärungen, was eine Verarbeitung in den USA einschließen kann. Siehe ",
+      "metaLink": "Datenschutzerklärung von Meta",
+      "adPixelsJoin": " und ",
+      "redditLink": "Datenschutzerklärung von Reddit",
+      "adPixelsBodyEnd": ".",
+      "hostingLabel": "Railway und Cloudflare.",
+      "hostingLink": "die Datenschutzerklärung von Railway",
+      "cloudflareLink": "die Datenschutzerklärung von Cloudflare",
+      "sentryLabel": "Sentry.",
+      "sentryLink": "die Datenschutzerklärung von Sentry",
+      "expoLabel": "Expo EAS Observe.",
+      "expoLink": "die Dokumentation von Expo Observe",
+      "hostingBody": "Railway hostet Anwendung und Datenbank. Cloudflare liefert Inhalte aus, hostet die Browser-App und speichert Medien. Diese Anbieter verarbeiten die Anfragen, die für Boardsesh erforderlich sind. Siehe ",
+      "sentryBody": "Wir nutzen Sentry zur Fehlerüberwachung auf Grundlage berechtigter Interessen, damit Boardsesh funktioniert. Die standardmäßige Erfassung personenbezogener Informationen ist ausgeschaltet; Fehlerberichte werden begrenzt und sensible Felder entfernt. Der Dienst bleibt aktiv, wenn du Analysen ablehnst. Siehe ",
+      "expoBody": "Wir nutzen Expo Observe für Leistungsmessungen, Geräte- und App-Versionsinformationen sowie Fehlerdiagnosen auf unserem eigenen Server, auf Grundlage berechtigter Interessen, damit Boardsesh funktioniert. Diagnosen bleiben aktiviert, wenn du Analysen ablehnst. Installations- und Sitzungskennungen des SDK dienen der Prüfung von Updates; wir weisen Observe keine Boardsesh-Kontoidentität zu. Siehe ",
+      "stripeLabel": "Stripe.",
+      "stripeBody": "Wenn du über unsere Unterstützungsseite gibst, wickelt Stripe die Zahlung ab. Stripe erhält deine Karten- oder Wallet-Daten, deine E-Mail-Adresse, dein Rechnungsland und jeden Namen und jede Adresse, die du beim Bezahlen angibst. Boardsesh sieht nie deine vollständige Kartennummer. Wir sehen deine E-Mail, den angegebenen Namen, den Betrag, dein Rechnungsland (plus Postleitzahl oder Adresse, wenn der Bezahlvorgang danach fragt), die Kartenmarke, ihre letzten 4 Ziffern und das Ablaufdatum sowie ein kurzes Kürzel der Seite, von der du kamst. Wir nutzen das, um die von dir gewünschte Zahlung auszuführen, Belege zu schicken und Fragen zu beantworten, und bewahren es auf, weil das Steuerrecht Zahlungsbelege verlangt. Rechtsgrundlage sind die Ausführung der von dir gewünschten Zahlung und unsere gesetzliche Aufbewahrungspflicht. Einen angegebenen Namen nennen wir eventuell, wenn wir uns bei Unterstützer*innen bedanken; lass das Feld leer, um anonym zu bleiben. Siehe ",
+      "stripeLink": "Datenschutzerklärung von Stripe"
     },
     "sharing": {
       "title": "Datenweitergabe",
-      "body1ProductAnalytics": "Wir verkaufen deine Daten nicht. Wir schalten keine Werbung. Wir geben deine Daten nicht an Werbetreibende oder Datenhändler weiter. Nach außen geht nur, was oben beschrieben ist (Hosting und Analytics bei Vercel, Produktanalyse bei PostHog, Sync mit Aurora Climbing, wenn du sie einschaltest).",
-      "body2": "Andere Boardsesh-Nutzer*innen sehen deinen Benutzernamen, dein Profil und deine eingetragenen Boulder, wenn du bei sozialen Funktionen wie dem Party-Modus mitmachst. Das ist in der App sichtbar und gehört dazu."
+      "body1ProductAnalytics": "Wir verkaufen deine Daten nicht, zeigen in Boardsesh keine Werbung und teilen keine Informationen mit Datenhändlern. Die oben genannten Anbieter verarbeiten Daten für Hosting, Speicherung, Zahlungen, Dienstzuverlässigkeit und optionale Analysen, die auf unserer Website die Werbemessung mit Meta und Reddit umfassen. Die Synchronisierung mit Aurora Climbing läuft, wenn du sie aktivierst.",
+      "body2": "Andere Boardsesh-Nutzer*innen sehen deinen Benutzernamen, dein Profil und deine eingetragenen Boulder, wenn du bei sozialen Funktionen wie Sitzungen mitmachst. Das ist in der App sichtbar und gehört dazu.",
+      "body3SprayPhotos": "Wir geben Spraywall-Fotos und die Griffe, die du markierst, an niemanden zum Trainieren weiter. Das einzige Modell, das damit trainiert wird, ist unsere eigene Grifferkennung. Andere sehen das Foto einer Spraywall so, wie ihre Sichtbarkeit es erlaubt, und Mitglieder einer Halle sehen die Spraywalls dieser Halle, auch die privaten. Das Foto einer öffentlichen Spraywall steht im offenen Web."
     },
     "retention": {
       "title": "Speicherdauer",
-      "body": "Wir behalten deine Kontodaten und deine Kletterhistorie, solange dein Konto aktiv ist. Wenn du Boardsesh nicht mehr nutzt, bleiben deine Daten, bis du dein Konto löschst."
+      "body": "Wir behalten deine Kontodaten und deine Kletterhistorie, solange dein Konto aktiv ist. Wenn du Boardsesh nicht mehr nutzt, bleiben deine Daten, bis du dein Konto löschst.",
+      "donations": "Wenn du gespendet hast, bleiben Zahlungsbelege beim Zahlungsanbieter und in unserer Buchhaltung so lange, wie das Steuerrecht es verlangt. Sie sind von deinem Boardsesh-Konto getrennt. Fragen dazu? Schreib uns."
     },
     "deletion": {
       "title": "Konto löschen",
       "intro": "Du kannst dein Konto und alle zugehörigen Daten jederzeit löschen. Dafür gibt es zwei Wege:",
       "inApp": "In der App:",
-      "inAppBody": " Tipp auf dein Profilbild, öffne „Einstellungen“, scroll ganz nach unten und tipp auf „Konto löschen“. Vorher wirst du um Bestätigung gebeten.",
+      "inAppBody": " Tipp auf dein Profilbild, öffne „Einstellungen“, dann „Konto“ und tipp auf „Konto löschen“. Vorher wirst du um Bestätigung gebeten.",
       "onWeb": "Im Web:",
       "onWebBody": " Melde dich an unter ",
       "onWebLink": "app.boardsesh.com",
-      "onWebBodyEnd": " und öffne „Einstellungen“ über dein Profilbild — dort steht derselbe Button „Konto löschen“.",
-      "permanent": "Das Löschen passiert sofort und ist endgültig. Nach der Bestätigung entfernen wir deine E-Mail-Adresse, deinen Benutzernamen, deine Routenbuch-Einträge, deine Warteschlangen-Daten und die Historie deiner Party-Sessions von unseren Servern. Das lässt sich nicht rückgängig machen."
+      "onWebBodyEnd": " und öffne „Einstellungen“ über dein Profilbild — unter „Konto“ findest du denselben Button „Konto löschen“.",
+      "permanent": "Das Löschen passiert sofort und ist endgültig. Nach der Bestätigung entfernen wir deine E-Mail-Adresse, deinen Benutzernamen, deine Routenbuch-Einträge, deine Warteschlangen-Daten und die Historie deiner Sitzungen von unseren Servern. Das lässt sich nicht rückgängig machen."
     },
     "children": {
       "title": "Kinder",
@@ -950,11 +988,67 @@
       "body2Start": "Boardsesh ist Open Source. Im Quellcode auf ",
       "body2Link": "GitHub",
       "body2End": " siehst du genau, welche Daten die App erhebt und wie sie verarbeitet werden."
+    },
+    "choices": {
+      "title": "Cookies und Datenschutzwahl",
+      "storageBody": "Erforderlicher Speicher umfasst NextAuth-Anmeldecookies, deine Sprache (boardsesh-locale), Geräteeinstellungen und das Cookie boardsesh-consent. Das Zustimmungscookie gilt ein Jahr und wird zwischen boardsesh.com und app.boardsesh.com geteilt. Außerhalb der Regionen, in denen wir fragen, setzt die Website es bei deinem ersten Besuch auf die Voreinstellung für Nutzungsanalysen. Solange Nutzungsanalysen eingeschaltet sind (durch deine Erlaubnis oder durch die Voreinstellung außerhalb der Regionen, in denen wir fragen), speichert PostHog Kennungen und Ereignisse (ph_* auf der Website und SDK-Speicher in der App). Ablehnung oder Widerruf löscht Analysekennungen und stoppt optionale Analysen, Aufzeichnungen und Ereignisse zur Installationszuordnung. Grundlegende Fehler- und Leistungsdiagnosen auf unseren eigenen Servern bleiben aktiviert. Funktionsschalter verwenden weiterhin einen Client im Arbeitsspeicher; bei angemeldeten Konten können sie deine Kontokennung nutzen.",
+      "adCookiesBody": "Solange die Werbemessung aktiv ist, setzt das Meta-Pixel _fbp (und _fbc, wenn du über eine Meta-Anzeige kommst) und das Reddit-Pixel _rdt_uuid (und _rdt_cid, wenn du über eine Reddit-Anzeige kommst), jeweils für bis zu 90 Tage. Ein Nein in den Datenschutzoptionen stoppt beide Pixel sofort und löscht diese Cookies.",
+      "changeBody": "Ändere deine Antwort über Datenschutzwahl im Website-Fußbereich oder Nutzungsanalysen unter Einstellungen → Privatsphäre. Wir speichern deine Wahl auf dem Gerät und bei angemeldeten Konten auch im Konto. Wo Nutzungsanalysen standardmäßig eingeschaltet sind, bleibt diese Voreinstellung auf dem Gerät und wird nie als Zustimmung in deinem Konto gespeichert. Eine Ablehnung im Konto überschreibt Gerätefreigaben; eine Kontofreigabe gilt für Geräte ohne Antwort. Der Entscheidungsverlauf bleibt als Zustimmungsnachweis bis zur Kontolöschung gespeichert. Anonyme, kurzlebige Ereignisse zum Zustand von Updates und Hallenanzeigen bleiben zur Dienstzuverlässigkeit aktiv."
+    },
+    "operator": "Boardsesh wird von Marco de Jongh betrieben, der für die in dieser Erklärung beschriebenen Daten verantwortlich ist. Fragen zu deinen Daten gehen an support@boardsesh.com.",
+    "boardAccounts": {
+      "title": "Verknüpfte Board-Konten",
+      "sync": "Nach dem Verknüpfen prüft Boardsesh im Hintergrund auf neue Begehungen. Die Wartezeit variiert. Importe laufen nur zu Boardsesh; deine Einträge hier gehen nicht zurück an deren Apps. Trenne das Konto unter Einstellungen → Verbundene Apps, um künftige Importe zu stoppen.",
+      "credentials": "Für Kilter speichert Boardsesh ein verschlüsseltes Anmeldetoken, nicht dein Kilter-Passwort. Für Tension und andere Aurora-Board-Konten (Decoy, Touchstone, Grasshopper und So iLL) speichern wir Benutzernamen und Passwort verschlüsselt, um neue Begehungen abzurufen. Diese Zugangsdaten dienen nur der von dir gewünschten Verbindung. Beim Trennen werden sie entfernt, bereits importierte Boulder bleiben erhalten.",
+      "legalBasis": "Wir verarbeiten diese Zugangsdaten, um die von dir gewünschte Kontoverbindung bereitzustellen. Rechtsgrundlage ist die Erfüllung dieses Dienstes. Nach dem Trennen können wir auch den Widerruf des Kilter-Tokens anfordern; die lokale Löschung hängt nicht von Kilters Antwort ab."
     }
   },
   "preview": {
     "label": "App-Vorschau",
     "ios": "iOS",
     "android": "Android"
+  },
+  "funding": {
+    "title": "Wer dafür bezahlt",
+    "body": "Boardsesh ist kostenlos. Jede Funktion, für alle. Wer etwas übrig hat, trägt bei und bezahlt damit Server und Entwicklungszeit. Eine Spende schaltet nichts Zusätzliches in der App frei."
+  },
+  "trust": {
+    "title": "Was Kletterer*innen zuerst fragen",
+    "legal": "Lies die Kompatibilitätsregeln und rechtlichen Hinweise",
+    "import": "Bring dein Logbuch mit",
+    "privacy": "Lies die Datenschutzerklärung",
+    "questions": {
+      "operator": {
+        "question": "Wer betreibt Boardsesh?",
+        "answer": "Marco de Jongh, ein Board-Kletterer in Sydney, Australien, betreibt Boardsesh mit Beiträgen anderer Kletterer*innen. Kontakt: support@boardsesh.com."
+      },
+      "funding": {
+        "question": "Wie kann es kostenlos sein?"
+      },
+      "compatibility": {
+        "question": "Kann ich es mit Kilter, Tension oder MoonBoard nutzen?",
+        "answer": "Boardsesh ist unabhängige Software für kompatible Boards. Aurora Climbing, Kilter und Moon Climbing haben es weder entwickelt noch empfohlen. Die rechtlichen Hinweise erklären Kompatibilität und Regeln des gehosteten Dienstes."
+      },
+      "import": {
+        "question": "Kann ich meine Kilter- oder Tension-Historie mitnehmen?",
+        "answer": "Ja. Verknüpfe dein Konto unter Einstellungen → Verbundene Apps. Importe laufen nur zu Boardsesh; deine Einträge hier gehen nicht zurück. Der Leitfaden erklärt auch alte Aurora-Exporte."
+      },
+      "password": {
+        "question": "Was passiert mit meinem Board-Passwort?",
+        "answer": "Gib für Kilter deine Anmeldedaten unter Verbundene Apps ein. Boardsesh tauscht sie gegen ein verschlüsseltes Token und speichert dein Kilter-Passwort nicht. Für Tension und andere Aurora-Board-Konten werden Benutzername und Passwort zum Abruf deiner Historie verschlüsselt gespeichert. Trennen entfernt diese Zugangsdaten und stoppt künftige Importe."
+      },
+      "shutdown": {
+        "question": "Was passiert, wenn Boardsesh aufhört?",
+        "answer": "Du kannst dein Logbuch schon heute Board für Board unter Einstellungen → Konto → Kletterdaten exportieren herunterladen. Der Code und die nächtlichen Boulder-Kataloge sind öffentlich, sodass du außerhalb von Boardsesh eine Kopie behalten kannst."
+      },
+      "tracking": {
+        "question": "Verfolgt Boardsesh mich?",
+        "answer": "Datenschutzauswahl auf der Website und Analytics unter Einstellungen → Datenschutz steuern optionale Produktanalysen. Grundlegende Fehler- und Leistungsdiagnosen halten den Dienst am Laufen. Die Datenschutzerklärung beschreibt die einzelnen Anbieter."
+      },
+      "sprayPrivacy": {
+        "question": "Kann mein Spraywall-Foto privat bleiben?",
+        "answer": "Wähle eine private statt einer öffentlichen Spraywall. Mitglieder einer Halle können private Spraywalls sehen, die zu dieser Halle gehören. Öffentliche Spraywall-Fotos stehen im offenen Web."
+      }
+    }
   }
 }

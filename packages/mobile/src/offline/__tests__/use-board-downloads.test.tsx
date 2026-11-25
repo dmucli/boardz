@@ -1,4 +1,18 @@
 // @vitest-environment jsdom
+// Delivery metadata is covered by offline-write-context.test.ts; keep these unit tests native-free.
+vi.mock('../offline-write-context', () => ({
+  readOfflineWriteRelease: () => ({
+    platform: 'ios',
+    appVersion: null,
+    runtimeVersion: null,
+    updateId: null,
+    isEmbedded: null,
+    branch: null,
+  }),
+  enqueueMeasuredMutation: async (...args: Parameters<typeof import('@boardsesh/offline-sync').enqueue>) =>
+    (await import('@boardsesh/offline-sync')).enqueue(...args),
+}));
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act } from 'react';
 import { cleanup, renderHook } from '@testing-library/react';
@@ -8,21 +22,27 @@ import {
   type ScopeDownloadCompleteInfo,
 } from '@boardsesh/offline-sync';
 import type { UserBoard } from '@boardsesh/shared-schema';
+import { SHARED_EVENTS } from '@boardsesh/analytics';
 
 const fixtures = vi.hoisted(() => ({
   database: { name: 'offline-test-db' },
   queryClient: { invalidateQueries: vi.fn() },
   snapshotSource: { getManifest: vi.fn() },
+  connectivity: { effectiveOffline: false, reason: null as string | null },
 }));
 
 const spies = vi.hoisted(() => ({
   drainMutationQueue: vi.fn(),
   graphqlRequest: vi.fn(),
   hasUsableInternetConnection: vi.fn(),
+  markUserStartedDownload: vi.fn(),
   rememberOfflineBoards: vi.fn(),
   rememberDownloadTrigger: vi.fn(),
+  recordDownloadRequests: vi.fn(),
+  restoreBootstrapRetryBudget: vi.fn(),
   setOfflineBoardEnabled: vi.fn(),
   track: vi.fn(),
+  getSetting: vi.fn((): string[] => []),
   triggerSync: vi.fn(),
 }));
 
@@ -33,12 +53,19 @@ vi.mock('../offline-sync-adapter', () => ({
   hasUsableInternetConnection: spies.hasUsableInternetConnection,
   triggerSync: spies.triggerSync,
 }));
+// The keep-awake store reads and writes settings of its own; what this suite
+// owns is WHICH enables reach it (issue #4310).
+vi.mock('../download-keep-awake-store', () => ({ markUserStartedDownload: spies.markUserStartedDownload }));
+vi.mock('@boardsesh/offline-sync', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@boardsesh/offline-sync')>()),
+  restoreBootstrapRetryBudget: spies.restoreBootstrapRetryBudget,
+}));
 vi.mock('../use-snapshot-source', () => ({ useSnapshotSource: () => fixtures.snapshotSource }));
 vi.mock('../../lib/graphql/client', () => ({
   getOfflineSyncHttpClient: () => ({ request: spies.graphqlRequest }),
 }));
 vi.mock('../../settings', () => ({
-  getSetting: () => ['kilter:1:10', 'tension:2:11'],
+  getSetting: spies.getSetting,
   offlineBoardKeyForBoard: (board: UserBoard) => `${board.boardType}:${board.layoutId}:${board.sizeId}`,
   offlineBoardScopeForBoard: (board: UserBoard) => `${board.boardType}:${board.layoutId}:${board.sizeId}`,
   rememberOfflineBoards: spies.rememberOfflineBoards,
@@ -46,7 +73,11 @@ vi.mock('../../settings', () => ({
   setOfflineBoardEnabled: spies.setOfflineBoardEnabled,
 }));
 vi.mock('../../lib/analytics', () => ({ track: spies.track }));
+vi.mock('../download-request-telemetry', () => ({ recordDownloadRequests: spies.recordDownloadRequests }));
 vi.mock('../../lib/offline-engine', () => ({ isOfflineEngineEnabled: () => true }));
+vi.mock('../../lib/connectivity/connectivity-store', () => ({
+  getConnectivitySnapshot: () => fixtures.connectivity,
+}));
 
 import {
   __resetSyncStatusForTests,
@@ -56,17 +87,27 @@ import {
 } from '../../sync';
 import { setSchemaReady, __resetSchemaReadyForTests } from '../../db/schema-ready';
 import { useBoardDownloads } from '../use-board-downloads';
+import { getDownloadRequest, requestDownload, resetDownloadLifecycle } from '../download-lifecycle';
 
 const makeBoard = (uuid: string, boardType: 'kilter' | 'tension', layoutId: number, sizeId: number): UserBoard =>
   ({ uuid, name: uuid, boardType, layoutId, sizeId }) as unknown as UserBoard;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetDownloadLifecycle();
+  fixtures.connectivity.effectiveOffline = false;
+  fixtures.connectivity.reason = null;
+  spies.setOfflineBoardEnabled.mockImplementation(
+    (scopeKey: string, enabled: boolean, options?: { trigger?: string }) => {
+      if (enabled) requestDownload(scopeKey, options?.trigger ?? 'unknown');
+    },
+  );
   __resetSyncStatusForTests();
   // The ordinary launch: init won on its first attempt, so the schema is stamped
   // before any screen renders. The contended launch has its own case below.
   setSchemaReady(true);
   spies.hasUsableInternetConnection.mockResolvedValue(false);
+  spies.getSetting.mockReturnValue(['kilter:1:10', 'tension:2:11']);
 });
 
 afterEach(() => {
@@ -126,7 +167,9 @@ describe('useBoardDownloads', () => {
     expect(spies.setOfflineBoardEnabled).toHaveBeenCalledTimes(1);
     expect(spies.rememberDownloadTrigger).toHaveBeenCalledTimes(1);
     expect(spies.rememberDownloadTrigger).toHaveBeenCalledWith('kilter:1:10', 'download-all');
-    expect(spies.track).toHaveBeenCalledTimes(1);
+    expect(
+      spies.track.mock.calls.filter(([eventName]) => eventName === SHARED_EVENTS.OfflineBoardToggled),
+    ).toHaveLength(1);
     // Both board cards are still remembered — that list is per-board, and the
     // offline picker needs a row for each.
     expect(spies.rememberOfflineBoards).toHaveBeenCalledWith(boards);
@@ -140,6 +183,7 @@ describe('useBoardDownloads', () => {
   // aim people straight at this button.
   it('holds a download kicked before the schema is ready, then fires it once readiness lands', () => {
     setSchemaReady(false);
+    spies.getSetting.mockReturnValue([]);
     const board = makeBoard('garage', 'kilter', 1, 10);
     const { result } = renderHook(() => useBoardDownloads());
 
@@ -150,6 +194,11 @@ describe('useBoardDownloads', () => {
     expect(spies.setOfflineBoardEnabled).toHaveBeenCalledTimes(1);
     expect(spies.rememberOfflineBoards).toHaveBeenCalledWith([board]);
     expect(spies.triggerSync).not.toHaveBeenCalled();
+    expect(spies.recordDownloadRequests).toHaveBeenCalledWith(['kilter:1:10'], {
+      trigger: 'unknown',
+      source: 'manage',
+      replaceDisabled: true,
+    });
 
     act(() => setSchemaReady(true));
 
@@ -158,7 +207,7 @@ describe('useBoardDownloads', () => {
     // a board on and off again while the schema is unready gets a cycle that finds
     // nothing to do, not the download they cancelled.
     const enabledBoardsReader = spies.triggerSync.mock.calls[0]?.[3] as () => string[];
-    expect(enabledBoardsReader()).toEqual(['kilter:1:10', 'tension:2:11']);
+    expect(enabledBoardsReader()).toEqual([]);
   });
 
   it('does not kick a download on a readiness flip nobody asked for', () => {
@@ -170,6 +219,45 @@ describe('useBoardDownloads', () => {
     expect(spies.triggerSync).not.toHaveBeenCalled();
   });
 
+  it('records the request and schema deferral before any download can start', () => {
+    setSchemaReady(false);
+    const { result } = renderHook(() => useBoardDownloads());
+
+    result.current.enableBoardsOffline(makeBoard('garage', 'kilter', 1, 10), { trigger: 'download-all' });
+
+    const request = getDownloadRequest('kilter:1:10');
+    expect(request).toMatchObject({
+      state: 'deferred',
+      reason: 'schema-unready',
+      trigger: 'download-all',
+      origin: 'requested',
+    });
+    expect(request?.requestedAt).toEqual(expect.any(Number));
+    expect(spies.triggerSync).not.toHaveBeenCalled();
+    expect(spies.track).toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardToggled,
+      expect.objectContaining({ requestId: request?.requestId }),
+    );
+  });
+
+  it('records an explicit offline-mode deferral while retaining the original request', () => {
+    fixtures.connectivity.effectiveOffline = true;
+    fixtures.connectivity.reason = 'offline_mode';
+    const { result } = renderHook(() => useBoardDownloads());
+
+    result.current.enableBoardsOffline(makeBoard('garage', 'kilter', 1, 10), { trigger: 'toggle' });
+
+    expect(getDownloadRequest('kilter:1:10')).toMatchObject({
+      state: 'deferred',
+      reason: 'offline_mode',
+      trigger: 'toggle',
+    });
+    expect(spies.track).not.toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+      expect.objectContaining({ state: 'started' }),
+    );
+  });
+
   // A captive portal can look connected to React Query. The explicit NetInfo
   // reachability read must keep that tap armed without starting doomed work.
   it('leaves an armed board waiting when current reachability is false', async () => {
@@ -179,9 +267,10 @@ describe('useBoardDownloads', () => {
     result.current.armBoardsOffline(board);
     await act(async () => Promise.resolve());
 
-    expect(spies.setOfflineBoardEnabled).toHaveBeenCalledWith('kilter:1:10', true);
+    expect(spies.setOfflineBoardEnabled).toHaveBeenCalledWith('kilter:1:10', true, { trigger: 'unknown' });
     expect(spies.rememberOfflineBoards).toHaveBeenCalledWith([board]);
     expect(spies.triggerSync).not.toHaveBeenCalled();
+    expect(getDownloadRequest('kilter:1:10')).toMatchObject({ state: 'deferred', reason: 'connection-unavailable' });
   });
 
   it('kicks an armed board when reconnect already landed before the setting write', async () => {
@@ -192,8 +281,35 @@ describe('useBoardDownloads', () => {
     result.current.armBoardsOffline(board);
     await act(async () => Promise.resolve());
 
-    expect(spies.setOfflineBoardEnabled).toHaveBeenCalledWith('kilter:1:10', true);
+    expect(spies.setOfflineBoardEnabled).toHaveBeenCalledWith('kilter:1:10', true, { trigger: 'unknown' });
     expect(spies.triggerSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('records schema deferral when an armed board has a reachable connection before migrations finish', async () => {
+    spies.hasUsableInternetConnection.mockResolvedValue(true);
+    setSchemaReady(false);
+    const { result } = renderHook(() => useBoardDownloads());
+
+    result.current.armBoardsOffline(makeBoard('garage', 'kilter', 1, 10), { trigger: 'similar_climbs' });
+    const requestId = getDownloadRequest('kilter:1:10')?.requestId;
+    await act(async () => Promise.resolve());
+
+    expect(getDownloadRequest('kilter:1:10')).toMatchObject({ requestId, state: 'deferred', reason: 'schema-unready' });
+    expect(spies.triggerSync).not.toHaveBeenCalled();
+    act(() => setSchemaReady(true));
+    expect(getDownloadRequest('kilter:1:10')?.requestId).toBe(requestId);
+    expect(spies.triggerSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('records an unavailable reachability probe without losing the pending request', async () => {
+    spies.hasUsableInternetConnection.mockRejectedValueOnce(new Error('NetInfo unavailable'));
+    const { result } = renderHook(() => useBoardDownloads());
+
+    result.current.armBoardsOffline(makeBoard('garage', 'kilter', 1, 10));
+    await act(async () => Promise.resolve());
+
+    expect(getDownloadRequest('kilter:1:10')).toMatchObject({ state: 'deferred', reason: 'connection-probe-failed' });
+    expect(spies.triggerSync).not.toHaveBeenCalled();
   });
 
   it('re-probes after a transient NetInfo failure instead of losing the wake', async () => {
@@ -215,6 +331,65 @@ describe('useBoardDownloads', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  describe('marking a download as started by a person (issue #4310)', () => {
+    it('marks each scope once for a tap, after the scope is enabled', () => {
+      const boards = [makeBoard('garage', 'kilter', 1, 10), makeBoard('gym', 'kilter', 1, 10)];
+      const { result } = renderHook(() => useBoardDownloads());
+
+      result.current.enableBoardsOffline(boards, { trigger: 'toggle', source: 'manage' });
+
+      expect(spies.markUserStartedDownload).toHaveBeenCalledTimes(1);
+      expect(spies.markUserStartedDownload).toHaveBeenCalledWith('kilter:1:10');
+      // The store drops a mark for a board that is not enabled yet.
+      expect(spies.setOfflineBoardEnabled.mock.invocationCallOrder[0]).toBeLessThan(
+        spies.markUserStartedDownload.mock.invocationCallOrder[0] ?? 0,
+      );
+    });
+
+    it('marks a tap from a surface that names no trigger', () => {
+      const { result } = renderHook(() => useBoardDownloads());
+
+      result.current.enableBoardsOffline(makeBoard('garage', 'kilter', 1, 10));
+
+      expect(spies.markUserStartedDownload).toHaveBeenCalledWith('kilter:1:10');
+    });
+
+    it('marks a board armed with no signal, so its later download still counts', async () => {
+      const { result } = renderHook(() => useBoardDownloads());
+
+      result.current.armBoardsOffline(makeBoard('garage', 'kilter', 1, 10), { trigger: 'similar_climbs' });
+      await act(async () => Promise.resolve());
+
+      expect(spies.markUserStartedDownload).toHaveBeenCalledWith('kilter:1:10');
+    });
+
+    it.each(['auto-download-all', 'adopt-auto', 'owned-wall'] as const)(
+      'does not mark an enable the app made by itself (%s)',
+      (trigger) => {
+        const { result } = renderHook(() => useBoardDownloads());
+
+        result.current.enableBoardsOffline(makeBoard('garage', 'kilter', 1, 10), { trigger });
+
+        expect(spies.setOfflineBoardEnabled).toHaveBeenCalledTimes(1);
+        expect(spies.markUserStartedDownload).not.toHaveBeenCalled();
+      },
+    );
+
+    it('marks a retry before it kicks the cycle', async () => {
+      spies.restoreBootstrapRetryBudget.mockResolvedValue(undefined);
+      const { result } = renderHook(() => useBoardDownloads());
+
+      await act(async () => result.current.retryFastDownload(makeBoard('garage', 'kilter', 1, 10)));
+
+      expect(spies.restoreBootstrapRetryBudget).toHaveBeenCalledWith(fixtures.database, 'kilter:1:10');
+      expect(spies.markUserStartedDownload).toHaveBeenCalledWith('kilter:1:10');
+      expect(spies.triggerSync).toHaveBeenCalledTimes(1);
+      expect(spies.markUserStartedDownload.mock.invocationCallOrder[0]).toBeLessThan(
+        spies.triggerSync.mock.invocationCallOrder[0] ?? 0,
+      );
+    });
   });
 
   it('does nothing for an empty board list on either entry point', () => {

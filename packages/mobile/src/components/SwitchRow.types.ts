@@ -8,6 +8,12 @@
 export type SwitchRowProps = {
   /** Primary line, also the accessibility (VoiceOver / TalkBack) label. */
   label: string;
+  /**
+   * The switch's name for assistive tech when `label` leans on a row above
+   * ("In a session too" under Keep lighting): TalkBack, Voice Access and
+   * VoiceOver reach the switch on its own. Defaults to `label`.
+   */
+  accessibilityLabel?: string;
   /** Optional secondary line, rendered as native secondary text. */
   description?: string;
   /**
@@ -21,10 +27,4 @@ export type SwitchRowProps = {
   onValueChange: (next: boolean) => void;
   /** Dims the control and ignores taps. */
   disabled?: boolean;
-  /**
-   * On-track colour for the switch when on. Defaults to the brand accent (purple)
-   * so every existing call site is unchanged; the logbook passes `brandColors.accent`
-   * (amber) so its switches match the amber chip row.
-   */
-  tint?: string;
 };

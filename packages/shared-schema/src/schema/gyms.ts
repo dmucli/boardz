@@ -1,4 +1,10 @@
 export const gymsTypeDefs = /* GraphQL */ `
+  "Coordinates from an explicit authenticated address search; null when no unambiguous match is available."
+  type GymAddressCoordinates {
+    latitude: Float!
+    longitude: Float!
+  }
+
   "A city or town from the locally hosted GeoNames gazetteer."
   type PlaceSuggestion {
     id: Int!
@@ -34,7 +40,10 @@ export const gymsTypeDefs = /* GraphQL */ `
     pending
     approved
     denied
+    "An admin-review claim nobody decided within 30 days, or a domain link that went unused."
     expired
+    "An approved claim a Boardsesh admin took back (revertGymClaim). The gym is unclaimed again."
+    revoked
   }
 
   "Outcome of a requestGymClaim call, so clients can show the right next step."
@@ -73,6 +82,18 @@ export const gymsTypeDefs = /* GraphQL */ `
   }
 
   """
+  Who runs a gym listing. The same for every viewer.
+  """
+  enum GymListingState {
+    "Synced from an upstream board provider; nobody has claimed it yet."
+    UNCLAIMED
+    "Owned by a climber who did not claim it, usually by naming the gym while setting up a board."
+    CLIMBER_LISTED
+    "Owned through an approved claim or an admin handover: the gym runs it."
+    RUN_BY_GYM
+  }
+
+  """
   A physical gym location that can contain multiple boards.
   """
   type Gym {
@@ -90,7 +111,7 @@ export const gymsTypeDefs = /* GraphQL */ `
     name: String!
     "Optional description"
     description: String
-    "Opening hours as one free-text line the gym maintains itself (no structured per-day model)."
+    "Opening hours as free text the gym maintains itself, line breaks kept (no structured per-day model)."
     hours: String
     "ISO timestamp of the last time someone with edit access confirmed the hours. Shown publicly so a stale schedule reads as stale."
     hoursUpdatedAt: String
@@ -108,6 +129,8 @@ export const gymsTypeDefs = /* GraphQL */ `
     longitude: Float
     "Whether publicly visible"
     isPublic: Boolean!
+    "Whether this gym appears in discovery. False keeps direct links readable."
+    isListed: Boolean!
     "Image URL"
     imageUrl: String
     "Square gym logo (transparent brand mark) for the kiosk and embeds — distinct from imageUrl, which is the gym photo."
@@ -146,6 +169,16 @@ export const gymsTypeDefs = /* GraphQL */ `
     canClaim: Boolean!
     "Whether a real person owns this gym, as opposed to the system import user. Viewer-independent — unlike canClaim, which is false for every signed-out viewer."
     isClaimed: Boolean!
+    "Who runs this listing: not claimed yet, added by a climber, or run by the gym. Viewer-independent."
+    listingState: GymListingState!
+    """
+    Whether this gym's website can drive the self-service email claim: a real
+    (non-free-provider) domain that the gym's OWNER put on the listing. Mirrors
+    the two refusals in requestGymClaim, so a claim UI can open the form that
+    can actually succeed instead of dead-ending on submit. Viewer-independent —
+    unlike canClaim, this says nothing about who is asking.
+    """
+    canClaimByDomain: Boolean!
     """
     The viewer's own unresolved claim on this gym, so a claimant who already
     filed sees "under review" instead of the claim call-out. A lazy field
@@ -198,6 +231,13 @@ export const gymsTypeDefs = /* GraphQL */ `
     ownerType: GymOwnerType!
     "Whether the current viewer can start an ownership claim for this gym."
     isClaimable: Boolean!
+    """
+    Whether this gym's website can drive the self-service email claim: a real
+    (non-free-provider) domain that the gym's OWNER put on the listing. Mirrors
+    the two refusals in requestGymClaim. Answers a different question from
+    isClaimable, which is about the viewer's standing, not the website.
+    """
+    canClaimByDomain: Boolean!
     "Upstream provider origins for a synced gym (e.g. \\"kilter\\", \\"tension\\"), from source-key prefixes. Empty for user-created gyms."
     providerOrigins: [String!]!
   }
@@ -215,13 +255,19 @@ export const gymsTypeDefs = /* GraphQL */ `
   """
   A board that probably belongs to a gym but isn't linked to it yet — either it
   followed a listing that got merged into this gym, or it sits at the gym's
-  coordinates while unlinked or attached to a synced (SYSTEM) listing.
+  coordinates while unlinked or attached to a synced (SYSTEM) listing. Public,
+  unlinked boards owned by another person are candidates only for an in-scope
+  platform admin who can read their location.
   """
   type StrayBoard {
     "The board's unique identifier."
     uuid: ID!
     "The board's display name."
     name: String!
+    "Board type (kilter, tension, moonboard, ...)."
+    boardType: String!
+    "Board angle in degrees."
+    angle: Int!
     "The gym this board is currently linked to (a merged twin or a synced listing); null when unlinked."
     currentGymUuid: ID
     "Name of the gym this board is currently linked to; null when unlinked."
@@ -270,6 +316,8 @@ export const gymsTypeDefs = /* GraphQL */ `
     name: String!
     "Optional description"
     description: String
+    "Opening hours; nonblank hours receive a confirmation timestamp."
+    hours: String
     "Physical address"
     address: String
     "Website URL"
@@ -284,10 +332,45 @@ export const gymsTypeDefs = /* GraphQL */ `
     longitude: Float
     "Whether publicly visible (default true)"
     isPublic: Boolean
+    "Whether listed in discovery (default true)"
+    isListed: Boolean
     "Image URL"
     imageUrl: String
     "Optional board UUID to link on creation"
     boardUuid: String
+    """
+    How createGym treats similar gyms that are already listed (the same ones
+    findSimilarGyms returns). Absent means REJECT_IF_FOUND: the create is refused
+    with GYM_SIMILAR_EXISTS, whose extensions.candidates are SimilarGym objects.
+    """
+    duplicateCheck: GymDuplicateCheckInput
+  }
+
+  """
+  How createGym treats similar gyms that already exist.
+  """
+  enum GymDuplicateCheckMode {
+    "Refuse when any similar gym is listed."
+    REJECT_IF_FOUND
+    """
+    The climber saw the similar gyms and said theirs is a different one. Refuse
+    only for a similar gym missing from acknowledgedGymUuids.
+    """
+    CONFIRMED_SEPARATE
+  }
+
+  """
+  createGym's duplicate check.
+  """
+  input GymDuplicateCheckInput {
+    "What to do when similar gyms exist."
+    mode: GymDuplicateCheckMode!
+    """
+    With CONFIRMED_SEPARATE: the gyms the climber was shown and said are not
+    theirs. At most 50 (the server refuses more); a client that showed more
+    keeps the most recent 50.
+    """
+    acknowledgedGymUuids: [ID!]
   }
 
   """
@@ -318,6 +401,8 @@ export const gymsTypeDefs = /* GraphQL */ `
     longitude: Float
     "New visibility"
     isPublic: Boolean
+    "Whether listed in discovery"
+    isListed: Boolean
     "New image URL"
     imageUrl: String
     "Square gym logo (transparent brand mark) for the kiosk and embeds — distinct from imageUrl, the gym photo. Pass null to clear it."
@@ -366,15 +451,21 @@ export const gymsTypeDefs = /* GraphQL */ `
   input MyGymsInput {
     "Include gyms the user follows"
     includeFollowed: Boolean
+    "Include gyms covered by the viewer’s community admin or leader role."
+    includeManaged: Boolean
     "Max gyms to return"
     limit: Int
     "Offset for pagination"
     offset: Int
   }
 
-  """
-  Input for searching gyms.
-  """
+  "A public canonical venue URL and its last content update, without private gym fields."
+  type GymSitemapEntry {
+    slug: String!
+    updatedAt: String!
+  }
+
+  "Input for searching gyms."
   input SearchGymsInput {
     "Search query"
     query: String
@@ -390,6 +481,8 @@ export const gymsTypeDefs = /* GraphQL */ `
     multiBoardTypeOnly: Boolean
     "Only gyms that have a URL slug, i.e. that can be linked to at /gym/[slug]. Opt-in: omitting it leaves the emitted SQL untouched for existing callers."
     requireSlug: Boolean
+    "Only gyms with valid geographic coordinates. Opt-in; excludes personal walls without a location."
+    requireLocation: Boolean
     "Show claimed gyms first, preserving the existing order within each group. Opt-in; other callers keep their current ordering."
     prioritizeClaimed: Boolean
     "Latitude for proximity search"
@@ -450,6 +543,10 @@ export const gymsTypeDefs = /* GraphQL */ `
     gymUuid: ID!
     "Stray board UUID to attach"
     boardUuid: ID!
+    "False prevents merging an emptied source gym. Omitted preserves legacy behavior."
+    allowSourceGymMerge: Boolean
+    "The source gym the user saw; null means unlinked. A changed source rejects the move."
+    expectedCurrentGymUuid: ID
   }
 
   """
@@ -532,6 +629,14 @@ export const gymsTypeDefs = /* GraphQL */ `
     message: String
     "When the claim was created"
     createdAt: String!
+    "Admin queue only: days since the claimant's account was created."
+    claimantAccountAgeDays: Int
+    "Admin queue only: how many climbs the claimant has logged."
+    claimantTickCount: Int
+    "Admin queue only: how many other live gyms the claimant owns or is an admin of."
+    claimantGymsHeld: Int
+    "Auto-approved list only: when the claim took the gym."
+    approvedAt: String
   }
 
   """
@@ -565,6 +670,30 @@ export const gymsTypeDefs = /* GraphQL */ `
   }
 
   """
+  Input for taking back an approved gym claim (global admin only).
+  """
+  input RevertGymClaimInput {
+    "The approved claim to take back (the id the admin queue and the daily digest use)"
+    claimId: ID!
+    "Why, for the ownership audit trail. Optional."
+    reason: String
+  }
+
+  """
+  What revertGymClaim did.
+  """
+  type RevertGymClaimResult {
+    "The reverted claim"
+    claimId: ID!
+    "The gym, now unclaimed"
+    gymUuid: ID!
+    "The gym's name"
+    gymName: String!
+    "Gym members and editors removed: the claimant's own row and everyone added since the claim"
+    removedMemberCount: Int!
+  }
+
+  """
   Input for listing pending gym claims (admin only).
   """
   input PendingGymClaimsInput {
@@ -572,6 +701,18 @@ export const gymsTypeDefs = /* GraphQL */ `
     limit: Int
     "Offset for pagination"
     offset: Int
+  }
+
+  """
+  Input for listing claims that approved themselves (admin only).
+  """
+  input AutoApprovedGymClaimsInput {
+    "Max claims to return"
+    limit: Int
+    "Offset for pagination"
+    offset: Int
+    "Only this claim, for the daily digest's revert link. A claim that didn't approve itself comes back as an empty list."
+    claimId: ID
   }
 
   # ============================================
@@ -625,7 +766,15 @@ export const gymsTypeDefs = /* GraphQL */ `
   week-over-week deltas; the lists are only rendered for the current window.
   """
   type GymStatsWindow {
-    "Distinct climbers with a flash/send on the gym's boards in this window."
+    "Inclusive UTC boundary."
+    startAt: String!
+    "Exclusive UTC boundary."
+    endAt: String!
+    "Confirmed Boardsesh display events, including anonymous displays."
+    displayCount: Int!
+    "Eligible Boardsesh ticks, including attempts."
+    tickCount: Int!
+    "Distinct identified accounts from qualifying displays and ticks."
     uniqueClimbers: Int!
     "Total ascents (flash + send) on the gym's boards in this window."
     ascentCount: Int!
@@ -638,7 +787,186 @@ export const gymsTypeDefs = /* GraphQL */ `
   unbounded tick scans. \`topClimbs\` and \`busiestDays\` cover the CURRENT window
   only (that's all the dashboard renders). Requires gym edit access.
   """
+  type GymReportingBoardConfig {
+    uuid: ID!
+    name: String!
+  }
+
+  type GymReportingBoard {
+    uuid: ID!
+    name: String!
+    boardType: String!
+    configurations: [GymReportingBoardConfig!]!
+  }
+
+  type GymReportingCoverage {
+    "Inclusive UTC start of the 365-day descriptive observation interval, ending exclusively at asOf."
+    observedSince: String!
+    "Earliest eligible observed display in the checked interval, when known."
+    firstDisplayAt: String
+    "Earliest eligible observed tick with an exact timestamp in the checked interval."
+    firstTickAt: String
+    "Eligible records with an attested date and no trustworthy hour."
+    dateOnlyCount: Int!
+    "Date-only records whose possible occurrence crosses a window boundary."
+    boundaryUncertainCount: Int!
+    "Attributed ticks with no trustworthy occurrence time in the candidate scan."
+    unknownTimeCount: Int!
+    "The report includes activity scoped to boards currently linked to the gym."
+    includesCurrentBoardHistory: Boolean!
+    "Recorded sources cover only activity which meets their reporting rules."
+    isPartial: Boolean!
+  }
+
+  enum GymReachCoverage {
+    complete
+    partial
+    unavailable
+  }
+
+  type GymReachCount {
+    "Count of available eligible records or people. Consult coverage before displaying zero."
+    count: Int!
+    coverage: GymReachCoverage!
+  }
+
+  type GymReachWindow {
+    climbers: GymReachCount!
+    "First recorded here in available eligible records. It may change when older history arrives."
+    firstRecorded: GymReachCount!
+    uncertainFirstRecorded: Int!
+    sends: GymReachCount!
+    sendLoggers: Int!
+    "Distinct identified climber and gym-local date with a send."
+    sessions: GymReachCount!
+  }
+
+  type GymReachReturn {
+    returning: Int!
+    previousClimbers: Int!
+    "A return rate can be displayed only with complete coverage and a positive denominator."
+    coverage: GymReachCoverage!
+  }
+
+  type GymReachWeek {
+    "Gym-local Monday date in YYYY-MM-DD format."
+    startDate: String!
+    "Gym-local Sunday date in YYYY-MM-DD format."
+    endDate: String!
+    inProgress: Boolean!
+    climbers: GymReachCount!
+    sends: GymReachCount!
+  }
+
+  type GymReachOverview {
+    "UTC start of the forward observation contract for every accepted gym."
+    observationStartedAt: String
+    "UTC start of the interval immediately before the previous period."
+    baselineStartAt: String!
+    current: GymReachWindow!
+    previous: GymReachWindow!
+    cameBack: GymReachReturn!
+    previousCameBack: GymReachReturn!
+    "Twelve gym-local Monday-start weeks, including the week in progress."
+    weeklyTrend: [GymReachWeek!]!
+  }
+
+  type GymAngleActivityCounts {
+    "Qualifying native ticks, including attempts."
+    tickCount: Int!
+    "Canonical native flashes and sends."
+    sendCount: Int!
+    "Confirmed Boardsesh displays."
+    displayCount: Int!
+  }
+
+  type GymAngleUsageRow {
+    angle: Int!
+    distinctClimberCount: Int!
+    "Distinct identified climber and definitely known gym-local date pairs."
+    climberDayCount: Int!
+    "Identified ticks in the period without a provable gym-local date."
+    unresolvedLocalDateTickCount: Int!
+    tickCount: Int!
+    sendCount: Int!
+    displayCount: Int!
+  }
+
+  type GymBoardAngleUsage {
+    "An independently authorized physical LED board in the selected scope."
+    boardUuid: ID!
+    "Distinct identified climbers across all known angles on this physical board."
+    knownAngleClimberCount: Int!
+    "Recorded compatible angles, ordered by degrees."
+    angles: [GymAngleUsageRow!]!
+    "Activity with missing or unsupported recorded angles, excluded from ranking."
+    unknownAngle: GymAngleActivityCounts!
+  }
+
+  enum GymBusyTimesStatus {
+    ready
+    zoneRequired
+    historyUnavailable
+    calendarUnavailable
+  }
+
+  type GymBusyWeekday {
+    "ISO weekday, Monday 1 through Sunday 7."
+    dayOfWeek: Int!
+    "Completed covered dates of this weekday."
+    eligibleDates: Int!
+    "Sum of distinct identified climbers per eligible date."
+    recordedClimbers: Int!
+  }
+
+  type GymBusyHour {
+    "ISO weekday, Monday 1 through Sunday 7."
+    dayOfWeek: Int!
+    "Civil hour from 0 to 23 in the gym time zone."
+    hour: Int!
+    "Completed covered dates on which this local hour existed."
+    eligibleDates: Int!
+    "Sum of distinct identified climbers per eligible date and civil hour."
+    recordedClimbers: Int!
+  }
+
+  type GymBusyTimes {
+    status: GymBusyTimesStatus!
+    "First nominal local date of the fixed 90-day interval."
+    startDate: String
+    "Last nominal local date of the fixed 90-day interval."
+    endDate: String
+    coveredDates: Int!
+    firstCoveredDate: String
+    "Identified confirmed display records with a trustworthy occurrence instant in covered dates."
+    instantDisplays: Int!
+    "Identified eligible ticks with a trustworthy occurrence instant in covered dates."
+    instantTicks: Int!
+    "Eligible identified date-only ticks that could have occurred in a covered date."
+    dateOnlyRecords: Int!
+    "Date-only ticks with no definite assignment to a covered date."
+    unplacedDateOnlyRecords: Int!
+    "Identified candidates with unproved time in the bounded source scan."
+    unknownTimeRecords: Int!
+    "At least one in-scope identified tick has no provable occurrence date, regardless of its saved timestamp."
+    hasUnboundedUnknownTime: Boolean!
+    "Seven weekday cells in ISO order."
+    weekdays: [GymBusyWeekday!]!
+    "168 weekday and civil-hour cells in ISO weekday then hour order."
+    hours: [GymBusyHour!]!
+  }
+
   type GymStats {
+    gymName: String!
+    boardUuid: ID
+    boards: [GymReportingBoard!]!
+    canManageBoardAliases: Boolean!
+    asOf: String!
+    timeZone: String!
+    timeZoneConfigured: Boolean!
+    coverage: GymReportingCoverage!
+    reachOverview: GymReachOverview
+    busyTimes: GymBusyTimes
     "The gym these stats are for."
     gymUuid: ID!
     "Window length in days (7 for the default week)."
@@ -651,6 +979,8 @@ export const gymsTypeDefs = /* GraphQL */ `
     topClimbs: [GymTopClimb!]!
     "Ascents per day of week in the current window (only non-empty days)."
     busiestDays: [GymDayActivity!]!
+    "Recorded angle usage on eligible physical LED boards in the current window."
+    angleUsage: [GymBoardAngleUsage!]!
   }
 
   """
@@ -658,10 +988,78 @@ export const gymsTypeDefs = /* GraphQL */ `
   (7 days, the default) or \`month\` (30 days). The comparison window is always the
   equally-long span immediately before it.
   """
+  enum GymGradeInventoryKind {
+    SPRAY_WALL
+    LED_COLLECTION
+  }
+
+  enum GymGradeInventoryStatus {
+    READY
+    OWNER_ONLY
+    WALL_UNAVAILABLE
+    CHOOSE_COLLECTION
+    COLLECTION_UNAVAILABLE
+    COLLECTION_EMPTY
+  }
+
+  type GymGradeInventoryBoard {
+    boardUuid: ID!
+    physicalBoardUuid: ID!
+    boardName: String!
+    kind: GymGradeInventoryKind!
+    status: GymGradeInventoryStatus!
+    included: Boolean!
+    variantCount: Int!
+    collectionName: String
+  }
+
+  type GymGradeComparisonBucket {
+    boardType: String!
+    difficultyId: Int
+    availableCount: Int!
+    sendCount: Int!
+  }
+
+  type GymGradeComparison {
+    gymUuid: ID!
+    asOf: String!
+    startAt: String!
+    timeZone: String!
+    availableCount: Int!
+    sendCount: Int!
+    grades: [GymGradeComparisonBucket!]!
+    boards: [GymGradeInventoryBoard!]!
+  }
+
+  type GymGradeCollectionOption {
+    uuid: ID!
+    name: String!
+  }
+
+  type GymGradeCollectionPage {
+    collections: [GymGradeCollectionOption!]!
+    nextCursor: String
+  }
+
+  input GymGradeCollectionOptionsInput {
+    gymUuid: ID!
+    boardUuid: ID!
+    search: String
+    cursor: String
+  }
+
+  input SetGymGradeCollectionInput {
+    gymUuid: ID!
+    boardUuid: ID!
+    playlistUuid: ID
+  }
+
   input GymStatsInput {
     "The gym to report on. The caller must have gym edit access."
     gymUuid: ID!
-    "Window length: week (7 days, default) or month (30 days)."
+    "An authorized physical board in the requested gym. Omit for all boards."
+    boardUuid: ID
+    "Window length: week (7 days, default), month (30 days) or quarter (90 days)."
     period: GymStatsPeriod
   }
 
@@ -673,6 +1071,21 @@ export const gymsTypeDefs = /* GraphQL */ `
     week
     "Rolling last 30 days."
     month
+    "Rolling last 90 days."
+    quarter
+  }
+
+  input SetGymReportingTimeZoneInput {
+    gymUuid: ID!
+    "A valid IANA zone, or null to clear the setting."
+    timeZone: String
+  }
+
+  input SetGymReportingBoardAliasInput {
+    gymUuid: ID!
+    boardUuid: ID!
+    "The verified physical board root. Null removes the existing relationship."
+    rootBoardUuid: ID
   }
 
   # ============================================

@@ -51,7 +51,7 @@ const DEFAULT_MAX_DELAY_MS = 600;
  * seconds, and issuing three connects per statement ramps that counter faster.
  * The budget check after each attempt is what keeps a single request from
  * absorbing more than roughly two of those. Details and measurements:
- * docs/db-connectivity.md.
+ * docs/operations/db-connectivity.md.
  */
 const DEFAULT_BUDGET_MS = 10_000;
 
@@ -112,9 +112,9 @@ export function isRetryableConnectError(error: unknown): boolean {
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    // Never hold a process open just to pace a retry.
-    timer.unref?.();
+    // Ref'd on purpose: a caller is awaiting the statement, and an unref'd wait
+    // let a process with nothing else running exit 0 mid-retry (#6703).
+    setTimeout(resolve, ms);
   });
 }
 

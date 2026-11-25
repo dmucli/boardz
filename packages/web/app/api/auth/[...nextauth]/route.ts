@@ -1,7 +1,33 @@
+import { requiresWebSignOutForwarding } from '@boardsesh/auth-protocol';
+import { forwardWebSignOut, responseClearsNextAuthSession } from '@/app/lib/auth/web-signout-command.server';
+import { capturePresentedWebCredential } from '@/app/lib/auth/admitted-session.server';
+import { withAuthResponseAdmission, type SignOutCompletion } from '@/app/lib/auth/auth-response-admission.server';
 import NextAuth from 'next-auth';
+import type { NextAuthOptions } from 'next-auth';
 import { getToken } from 'next-auth/jwt';
-import { type NextRequest, NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
+import { responseSetsBrowserLoginCookie } from '@/app/lib/auth/browser-session.server';
+import { createDeviceTokenAuthRequest } from '@/app/lib/auth/device-token-request.server';
 import { authOptions } from '@/app/lib/auth/auth-options';
+import { withWebOAuthIdentity } from '@/app/lib/auth/web-oauth-request.server';
+import { unavailableCredentialResponse } from '@/app/lib/auth/credential-admission-response.server';
+import {
+  isAcceptableProviderOAuthCookieHeader,
+  isProviderOAuthRequest,
+} from '@/app/lib/auth/provider-oauth-cookie-header.server';
+import {
+  readSignInStartCallbackUrl,
+  withPartnerSignInFailureReturn,
+} from '@/app/lib/partner-oauth/sign-in-failure-return';
+import {
+  admitPasswordLogin,
+  createPasswordCommandAuthRequest,
+  unavailablePasswordAuthResponse,
+} from '@/app/lib/auth/password-command-auth.server';
+import { cloudflareVouchedVisitorAddress } from '@/app/lib/auth/trusted-client-ip.server';
+import { browserSessionRouteMode } from '@/app/lib/auth/browser-session-mode.server';
+import { routeBrowserSessionAuth } from '@/app/lib/auth/browser-session-route.server';
+import { withLegacyModeFirstPartyClears } from '@/app/lib/auth/browser-session.server';
 import {
   appendLegacyHostOnlySessionCookieClear,
   appendSignOutSessionCookieClears,
@@ -29,6 +55,9 @@ type ExpectedSignOutIdentity = {
 };
 
 const handler = NextAuth(authOptions) as NextAuthHandler;
+function handlerFor(options: NextAuthOptions): NextAuthHandler {
+  return options === authOptions ? handler : (NextAuth(options) as NextAuthHandler);
+}
 const OAUTH_SIGNIN_PATH_PATTERN = /\/api\/auth\/signin\/(apple|google)\/?$/;
 const OAUTH_CALLBACK_PATH_PATTERN = /\/api\/auth\/callback\/(apple|google)\/?$/;
 
@@ -70,6 +99,7 @@ async function handleExpoOAuthPost(
   request: NextRequest,
   context: NextAuthRouteContext,
   pathname: string,
+  handler: NextAuthHandler,
 ): Promise<Response | null> {
   const signInProvider = oauthProviderForPath(pathname, 'signin');
   if (signInProvider) {
@@ -145,13 +175,40 @@ function clearLegacyCookieIfSessionWritten(response: Response): Response {
   return response;
 }
 
-export async function POST(request: NextRequest, context: NextAuthRouteContext): Promise<Response> {
+async function postAuth(
+  request: NextRequest,
+  context: NextAuthRouteContext,
+  options: NextAuthOptions,
+  completeSignOut: SignOutCompletion,
+): Promise<Response> {
+  const handler = handlerFor(options);
+  // Match the public NextAuth App Router dispatch exactly. URL suffixes can
+  // differ from decoded catch-all parameters (and may contain extra segments).
+  const [action, provider] = (await context.params).nextauth;
   const pathname = request.nextUrl.pathname.endsWith('/')
     ? request.nextUrl.pathname.slice(0, -1)
     : request.nextUrl.pathname;
-  const expoOAuthResponse = await handleExpoOAuthPost(request, context, pathname);
-  if (expoOAuthResponse) return expoOAuthResponse;
-  if (!pathname.endsWith('/api/auth/signout')) {
+  if (action === 'callback' && provider === 'credentials') {
+    const admission = admitPasswordLogin(request);
+    if (admission.limitedResponse) return admission.limitedResponse;
+    const commandRequest = createPasswordCommandAuthRequest(
+      options,
+      undefined,
+      admission.passwordAccepted,
+      cloudflareVouchedVisitorAddress(request),
+      { cookieHeader: request.headers.get('cookie') },
+    );
+    const commandHandler = NextAuth(commandRequest.options) as NextAuthHandler;
+    const response = await commandHandler(request, context);
+    const retryAfterSeconds = commandRequest.limited();
+    if (retryAfterSeconds !== undefined) return unavailablePasswordAuthResponse(request.url, retryAfterSeconds);
+    return commandRequest.unavailable()
+      ? unavailablePasswordAuthResponse(request.url)
+      : clearLegacyCookieIfSessionWritten(response);
+  }
+  if (action !== 'signout') {
+    const expoOAuthResponse = await handleExpoOAuthPost(request, context, pathname, handler);
+    if (expoOAuthResponse) return expoOAuthResponse;
     return clearLegacyCookieIfSessionWritten(await handler(request, context));
   }
 
@@ -168,11 +225,24 @@ export async function POST(request: NextRequest, context: NextAuthRouteContext):
   // currently picks, a session living under the other name would fail the
   // comparison and turn every sign-out into a 409 the user cannot get past.
   const [preferredCookieName, fallbackCookieName] = sessionCookieNameCandidates();
-  const tokenOptions = { req: request, secret: process.env.NEXTAUTH_SECRET, secureCookie: isSecureCookieContext() };
+  // getToken also accepts Authorization bearer credentials. Sign-out is bound
+  // to the browser cookie: a bearer must not disguise which name was selected.
+  const cookieRequest = new NextRequest(request.url, {
+    headers: { cookie: request.headers.get('cookie') ?? '' },
+  });
+  const tokenOptions = {
+    req: cookieRequest,
+    secret: process.env.NEXTAUTH_SECRET,
+    secureCookie: isSecureCookieContext(),
+  };
   let token: Awaited<ReturnType<typeof getToken>>;
+  let selectedCookieName = preferredCookieName;
   try {
     token = await getToken({ ...tokenOptions, cookieName: preferredCookieName });
-    token ??= await getToken({ ...tokenOptions, cookieName: fallbackCookieName });
+    if (!token) {
+      token = await getToken({ ...tokenOptions, cookieName: fallbackCookieName });
+      selectedCookieName = fallbackCookieName;
+    }
   } catch {
     return guardedSignOutResponse(503, 'signout_identity_unavailable');
   }
@@ -183,7 +253,36 @@ export async function POST(request: NextRequest, context: NextAuthRouteContext):
   // NextAuth's sign-out clears only the Domain-scoped cookie under the one name
   // it picked. Clear both names in both scopes, so the read fallback above can't
   // resurrect a session the user just signed out of.
-  const response = await handler(request, context);
+  // The public handler must consume the same selected cookie as the identity
+  // guard. Otherwise a fallback-only session produces a redirect with no clear,
+  // which cannot prove a successful sign-out or trigger the backend denial.
+  const signOutHandler = handlerFor({
+    ...options,
+    cookies: {
+      ...options.cookies,
+      sessionToken: {
+        name: selectedCookieName,
+        options: options.cookies?.sessionToken?.options ?? {},
+      },
+    },
+  });
+  const response = await signOutHandler(request, context);
+  // Only a successful public NextAuth CSRF flow emits its session clear. Buffer
+  // those headers until the independent backend SID denial is acknowledged.
+  const clearedSession = responseClearsNextAuthSession(response);
+  // A CSRF refusal must not be transformed into cookie clearing or a denial,
+  // including when the legacy sign-out writer is selected.
+  if (!clearedSession) return response;
+  try {
+    if (requiresWebSignOutForwarding(process.env)) {
+      const presented = await capturePresentedWebCredential(request);
+      if (!presented) return guardedSignOutResponse(503, 'signout_identity_unavailable');
+      await forwardWebSignOut(presented.credential);
+      completeSignOut(response, presented.credential);
+    }
+  } catch {
+    return guardedSignOutResponse(503, 'signout_authority_unavailable');
+  }
   appendSignOutSessionCookieClears(
     response,
     request.cookies.getAll().map((requestCookie) => requestCookie.name),
@@ -191,7 +290,12 @@ export async function POST(request: NextRequest, context: NextAuthRouteContext):
   return response;
 }
 
-export async function GET(request: NextRequest, context: NextAuthRouteContext): Promise<Response> {
+async function getAuth(
+  request: NextRequest,
+  context: NextAuthRouteContext,
+  options: NextAuthOptions,
+): Promise<Response> {
+  const handler = handlerFor(options);
   const callbackProvider = oauthProviderForPath(request.nextUrl.pathname, 'callback');
   const state = request.nextUrl.searchParams.get('state');
   if (callbackProvider && state) {
@@ -202,4 +306,87 @@ export async function GET(request: NextRequest, context: NextAuthRouteContext): 
     }
   }
   return clearLegacyCookieIfSessionWritten(await handler(request, context));
+}
+
+async function routeAuth(request: NextRequest, context: NextAuthRouteContext): Promise<Response> {
+  // Check both route authorities before a delegate can exchange a code or write a cookie.
+  // The stored Facebook identity and an existing session remain readable.
+  const { nextauth } = await context.params;
+  let pathname = request.nextUrl.pathname;
+  try {
+    pathname = decodeURIComponent(pathname);
+  } catch {
+    // An undecodable URL cannot name a configured provider.
+  }
+  if (
+    ((nextauth[0] === 'signin' || nextauth[0] === 'callback') && nextauth[1] === 'facebook') ||
+    /\/api\/auth\/(?:signin|callback)\/facebook(?:\/|$)/.test(pathname)
+  ) {
+    return NextResponse.json(
+      { error: 'unsupported_provider' },
+      { status: 404, headers: { 'Cache-Control': 'private, no-store' } },
+    );
+  }
+  const browserSessionMode = browserSessionRouteMode();
+  // Under `better-auth`, Google and Apple sign-ins issue a first-party session (B5b).
+  const providerSessionCookies = browserSessionMode.kind === 'better-auth' ? browserSessionMode.cookies : undefined;
+  const recognition = createDeviceTokenAuthRequest(authOptions, (response) =>
+    providerSessionCookies ? responseSetsBrowserLoginCookie(response, providerSessionCookies) : true,
+  );
+  const legacyRoute = async () => {
+    const response = await withAuthResponseAdmission(request, context, (completeSignOut) =>
+      withWebOAuthIdentity(
+        request,
+        context,
+        recognition.options,
+        (current, options) =>
+          current.method === 'POST'
+            ? postAuth(current, context, options, completeSignOut)
+            : getAuth(current, context, options),
+        providerSessionCookies,
+      ),
+    );
+    return recognition.decorate(response);
+  };
+
+  // AUTH_BROWSER_SESSION_MODE unset, empty or `legacy`: the route as it was. The
+  // only difference: a login or sign-out reply also clears a first-party cookie
+  // the request carried, which no browser holds before the first cutover.
+  if (browserSessionMode.kind === 'legacy')
+    return withLegacyModeFirstPartyClears(request, nextauth[0] ?? '', await legacyRoute());
+  // The guarded sign-out keeps this route's form fields and answers.
+  return routeBrowserSessionAuth(request, context, browserSessionMode, {
+    legacyRoute,
+    readExpectedSignOutIdentity,
+    guardedSignOutResponse,
+  });
+}
+
+async function composedAuth(
+  request: NextRequest,
+  context: NextAuthRouteContext,
+  startCallbackUrl?: string | null,
+): Promise<Response> {
+  // Google and Apple have refused an oversized or malformed Cookie header with
+  // a 503 since #7526. Keep that answer, before any handler or admission work.
+  if (
+    isProviderOAuthRequest(new URL(request.url).pathname, (await context.params).nextauth) &&
+    !isAcceptableProviderOAuthCookieHeader(request.headers.get('cookie'))
+  )
+    return unavailableCredentialResponse();
+  return withPartnerSignInFailureReturn(request, await routeAuth(request, context), startCallbackUrl);
+}
+
+// A failed social sign-in that started on the partner sign-in page goes back
+// there, not to /auth/login, which the iPhone app claims.
+export async function GET(request: NextRequest, context: NextAuthRouteContext): Promise<Response> {
+  const captured = new NextRequest(request.clone(), { headers: new Headers(request.headers) });
+  return composedAuth(captured, context);
+}
+
+export async function POST(request: NextRequest, context: NextAuthRouteContext): Promise<Response> {
+  const captured = new NextRequest(request.clone(), { headers: new Headers(request.headers) });
+  // A sign-in start's own callbackUrl, read before NextAuth consumes the body.
+  const startCallbackUrl = await readSignInStartCallbackUrl(captured);
+  return composedAuth(captured, context, startCallbackUrl);
 }

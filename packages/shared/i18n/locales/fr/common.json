@@ -10,9 +10,35 @@
       "viewProfile": "Voir le profil de {{name}}",
       "thisClimber": "ce grimpeur"
     },
+    "a11y": {
+      "clearSearch": "Effacer la recherche",
+      "opensOutsideApp": "S’ouvre en dehors de Boardsesh"
+    },
     "settings": {
       "title": "Paramètres",
-      "library": "Bibliothèque",
+      "pages": {
+        "general": {
+          "title": "Général"
+        },
+        "board": {
+          "title": "Board"
+        },
+        "climbs": {
+          "title": "Blocs et cotations"
+        },
+        "home": {
+          "title": "Accueil"
+        },
+        "earlyAccess": {
+          "title": "Accès anticipé"
+        },
+        "developer": {
+          "title": "Développement"
+        },
+        "timers": {
+          "title": "Minuteurs"
+        }
+      },
       "development": "Développement",
       "dev": {
         "forceServerUnreachable": "Forcer le serveur injoignable",
@@ -22,7 +48,6 @@
       "metroServersSubtitle": "Basculer entre les bundlers Tailnet",
       "boardLook": {
         "title": "Look de la board",
-        "rowSubtitleShort": "Le rendu de ta board, plus les couleurs et les formes",
         "rendererUnavailable": {
           "title": "Mets à jour l'app",
           "body": "Cette version ne sait pas encore dessiner le rendu Aura. Mets à jour Boardsesh pour le débloquer — en attendant, ta board s'affiche en Classique."
@@ -40,6 +65,7 @@
           "aura": "Aura",
           "auraBold": "Aura intense",
           "auraSubtle": "Aura discrète",
+          "auraOutline": "Aura contour",
           "modernClassic": "Classique moderne",
           "maxContrast": "Contraste max",
           "descriptions": {
@@ -48,6 +74,7 @@
             "modernClassic": "Les cercles habituels, sur un mur assourdi.",
             "maxContrast": "Le voile le plus fort et des prises pleines.",
             "auraBold": "Une lueur plus large et plus dure, visible de loin.",
+            "auraOutline": "Un contour net sur chaque prise, avec une lueur serrée.",
             "classic": "Les marqueurs ronds que Boardsesh a toujours dessinés.",
             "custom": "Règle toi-même chaque partie du rendu."
           },
@@ -103,12 +130,16 @@
             "options": {
               "glow": "Lueur",
               "glowFill": "Lueur + remplissage",
-              "fill": "Remplissage"
+              "fill": "Remplissage",
+              "outline": "Contour"
             }
           },
           "fillOpacity": {
             "title": "Intensité du remplissage",
             "value": "{{value}}%"
+          },
+          "outlineOpacity": {
+            "title": "Intensité du contour"
           },
           "softDisc": {
             "label": "Disque doux",
@@ -132,6 +163,7 @@
         },
         "accessibility": {
           "title": "Accessibilité",
+          "pageTitle": "Couleurs et formes des prises",
           "classicOnlyNote": "La forme, l'épaisseur et la taille du marqueur ne s'appliquent qu'au rendu Classique. En Boardsesh, la silhouette de la prise allumée fait déjà office de forme — active les glyphes de rôle ci-dessous pour un repère basé sur la forme.",
           "roleGlyphs": {
             "label": "Glyphes de rôle",
@@ -177,8 +209,25 @@
             "body": "Les glyphes de rôle ajoutent une forme sur chaque prise allumée : départ, main, fin et pied restent distincts sans couleur. Les LED de ta board, elles, ne changent pas.",
             "apply": "Activer les glyphes de rôle"
           },
+          "differentiateWithoutColor": {
+            "title": "« Différencier sans couleur » est activé"
+          },
           "dismiss": "Pas maintenant",
           "dismissAccessibility": "Ignorer cette suggestion"
+        },
+        "sprayWalls": {
+          "title": "Spraywalls",
+          "useOwnLook": "Utiliser mon rendu sur les Spraywalls",
+          "footer": "Les Spraywalls s'affichent avec le rendu choisi par leur créateur pour la photo. Active cette option pour y voir ton propre rendu."
+        },
+        "moonboard": {
+          "title": "MoonBoard",
+          "gridLabels": "Lettres et numéros de la grille",
+          "footer": "Affiche les lettres de A à K et les numéros de rangée autour de la board, pour annoncer les prises comme F5."
+        },
+        "gpuAcceleration": {
+          "title": "Accélération GPU",
+          "description": "Dessine les prises allumées avec la puce graphique de ton téléphone. Désactive-la si la board clignote ou saccade."
         }
       },
       "accessibility": {
@@ -266,7 +315,6 @@
       },
       "storage": {
         "title": "Stockage",
-        "rowLabel": "Gérer le stockage",
         "rowSubtitle": "Vois ce que prennent tes téléchargements et libère ce dont tu n'as pas besoin",
         "intro": "Les boards que tu télécharges prennent de la place sur ce téléphone. Libère celles sur lesquelles tu ne grimpes pas.",
         "offNote": "Les téléchargements hors ligne sont désactivés pour le moment. Tu peux quand même libérer ce qui est déjà sur ce téléphone.",
@@ -282,7 +330,7 @@
         "keptOffline": "Gardée hors ligne",
         "notKeptOffline": "Plus gardée hors ligne — prend toujours de la place",
         "estimateNote": "Les tailles sont approximatives. Deux tailles d'un même layout partagent leurs voies : le total ne correspond donc pas à leur somme.",
-        "remove": "Retirer",
+        "tapToRemove": "Touche une board pour la retirer de ce téléphone.",
         "removeAria": "Retirer {{name}} de ce téléphone",
         "cancel": "Annuler",
         "removeTitle": "Retirer {{name}} ?",
@@ -299,6 +347,8 @@
         "errorTitle": "Impossible de mesurer tes téléchargements",
         "errorSubtitle": "Quelque chose a empêché de lire ce qui se trouve sur ce téléphone.",
         "errorRetry": "Réessayer",
+        "downgradeTitle": "Le stockage hors ligne est en pause",
+        "downgradeSubtitle": "Ce téléphone a une version de l'app plus ancienne que celle qui a enregistré tes données. Tes boards téléchargées et les croix en attente de synchronisation restent sur ce téléphone et reviennent à la prochaine mise à jour.",
         "cachedImagesHeader": "Images en cache",
         "cachedImagesArtLabel": "Dessin de la board",
         "cachedImagesPhotosLabel": "Photos",
@@ -325,11 +375,6 @@
         "both": "Les deux"
       },
       "displayOptions": {
-        "title": "Affichage",
-        "playlistTags": "Afficher les étiquettes de playlist",
-        "playlistTagsDescription": "Voyez dans quelles playlists se trouve chaque bloc, directement dans la liste.",
-        "quickActionsButton": "Afficher le bouton d'actions rapides",
-        "quickActionsButtonDescription": "Ajoute un bouton ⋮ à chaque bloc qui ouvre file, croix, listes et plus. Tu peux toujours appuyer longuement à la place.",
         "boardseshGrades": "Afficher les grades Boardsesh",
         "boardseshGradesDescription": "Des grades calculés à partir de vraies croix sur plusieurs boards. Le grade de l'ouvreur reste affiché tant qu'il n'y a pas assez de croix.",
         "personalGrades": "Utiliser mes cotations",
@@ -355,15 +400,13 @@
         "contributeTitle": "Aidez à traduire Boardsesh",
         "contributeSubtitle": "Les traductions sont maintenues par la communauté. Ouvrez les fichiers {{language}} sur GitHub pour corriger ou ajouter une phrase."
       },
-      "diagnostics": {
-        "title": "Confidentialité",
-        "recording": "Aidez-nous à nous améliorer",
-        "recordingDescription": "Envoyez des enregistrements de session anonymes et masqués pour qu'on corrige les bugs plus vite. Ce que vous tapez et vos photos restent masqués. Désactivez quand vous voulez."
+      "startup": {
+        "title": "Ouvrir l'app sur",
+        "footer": "S'applique à la prochaine ouverture de l'app. Les liens, les notifications et la configuration initiale t'emmènent toujours à leur destination."
       },
-      "integrations": {
-        "title": "Applications connectées",
-        "subtitle": "Apple Health et Strava",
-        "subtitleWithStrava": "Comptes de board, Apple Health, Strava"
+      "diagnostics": {
+        "recording": "Partager les enregistrements de session",
+        "recordingDescription": "Enregistre ton écran dans l’app pour qu’on voie le bug se produire. Ce que tu tapes et tes photos restent masqués. Active-le pendant que tu reproduis un problème pour le support, puis désactive-le."
       },
       "syncIssues": {
         "title": "Problèmes de synchronisation",
@@ -381,6 +424,9 @@
         "failedMessage_other": "{{count}} modifications n'ont pas pu se synchroniser, et la déconnexion les supprime. Annule et lance Réessayer la synchronisation d'abord si tu veux les garder.",
         "confirm": "Se déconnecter",
         "cancel": "Annuler",
+        "downgradeMessage": "Ce téléphone attend une mise à jour de l'app pour pouvoir ouvrir tes données hors ligne. Si quelqu'un d'autre se connecte ici avant cette mise à jour, les croix encore en attente de synchronisation sur ce téléphone sont perdues.",
+        "downgradeConfirm": "Se déconnecter quand même",
+        "downgradeCancel": "Rester connecté",
         "failureTitle": "Déconnexion non confirmée",
         "failure": "Boardsesh n'a pas pu confirmer la déconnexion. Reconnecte-toi et déconnecte-toi à nouveau avant de laisser cet appareil."
       },
@@ -392,6 +438,231 @@
         "pickSubtitle": "Essaie une nouveauté avant sa sortie et dis-nous ce que ça donne",
         "testPlanTitle": "Plan de test #{{prNumber}}",
         "testPlanSubtitle": "Ce qu'il faut essayer sur l'aperçu en cours"
+      },
+      "earlyUpdates": {
+        "sectionTitle": "Mises à jour de l'app",
+        "title": "Recevoir les mises à jour en avance",
+        "offSubtitle": "Les nouveautés dès qu'elles sont prêtes, avant tout le monde",
+        "onSubtitle": "Tu reçois les mises à jour anticipées",
+        "waitingSubtitle": "Activé, en attente de la prochaine mise à jour anticipée",
+        "leavingSubtitle": "Désactivé. Les mises à jour normales reprennent dès que la prochaine est prête pour ce téléphone.",
+        "testingBody": "Un aperçu est épinglé sur ce téléphone. Quitte-le d'abord, puis change ce réglage.",
+        "footer": "Les mises à jour anticipées peuvent avoir quelques défauts de temps en temps. Les changements s'appliquent à la prochaine ouverture de l'app.",
+        "joinDeferred": "Serveur de mises à jour injoignable. Nouvel essai à la prochaine ouverture de l'app ; les mises à jour anticipées démarrent à l'ouverture suivante.",
+        "leaveDeferred": "Retour impossible pour l'instant. Nouvel essai à la prochaine ouverture de l'app."
+      },
+      "climbDrawer": {
+        "description": "Choisis ce que tu vois sous le bloc, et dans quel ordre.",
+        "settingsFooter": "Choisis ce que tu vois sous le bloc. Pour changer l’ordre, ouvre le menu ⋯ d’un bloc et choisis Options d’affichage.",
+        "loading": "Chargement des options d’affichage…",
+        "hideAll": "Tout masquer",
+        "showAll": "Tout afficher",
+        "restoreDefaults": "Rétablir les réglages par défaut",
+        "sections": {
+          "activeHolds": "Prises actives",
+          "logbook": "Carnet",
+          "climberLogs": "Entrées des grimpeurs",
+          "setterNotes": "Notes de l’ouvreur",
+          "betaVideos": "Vidéos de méthodes",
+          "boardseshGrade": "Cotation Boardsesh",
+          "community": "Communauté",
+          "similarClimbs": "Blocs similaires"
+        },
+        "sheetTitle": "Options d’affichage",
+        "groupTitle": "Sous le bloc",
+        "footer": "Les changements s’appliquent immédiatement. Masque tout pour voir uniquement le bloc, sans défilement vertical.",
+        "tabs": {
+          "sections": "Sous le bloc",
+          "buttons": "Boutons",
+          "miniPlayer": "Mini-lecteur"
+        }
+      },
+      "sectionLayout": {
+        "moveUp": "Monter {{section}}",
+        "moveDown": "Descendre {{section}}",
+        "moved": "{{section}}, {{position}} sur {{count}}"
+      },
+      "homeSections": {
+        "groupTitle": "Sur l'accueil",
+        "customize": "Personnaliser l'accueil",
+        "description": "Choisis ce qu'affiche l'accueil, et dans quel ordre. Essentiel affiche ta board, ta session et tes listes.",
+        "settingsFooter": "Choisis ce qu'affiche l'accueil, et dans quel ordre. Personnaliser l'accueil, sur l'accueil, modifie la même liste.",
+        "footer": "Les changements s'appliquent immédiatement, sur ce téléphone uniquement. Ils ne changent pas qui peut voir ton activité.",
+        "showAll": "Tout afficher",
+        "focused": "Essentiel",
+        "restoreDefaults": "Rétablir les réglages par défaut",
+        "sections": {
+          "week": "Cette semaine",
+          "board": "Ta board",
+          "session": "Session",
+          "projects": "Tes projets",
+          "playlists": "À ton niveau",
+          "climbingNow": "En train de grimper",
+          "beta": "Beta récente",
+          "feed": "Fil"
+        },
+        "descriptions": {
+          "week": "Sessions, croix et semaines d’affilée",
+          "board": "Parcourir les blocs ou changer de board",
+          "session": "Ton dernier entraînement, ou démarre une session",
+          "projects": "Les blocs que tu as essayés sans les enchaîner",
+          "playlists": "À ton niveau, Pépites cachées et Nouveautés",
+          "climbingNow": "Sessions en direct à rejoindre",
+          "beta": "Nouvelles vidéos beta pour ta board",
+          "feed": "Sessions et nouveaux blocs de ton crew. Toujours en bas."
+        },
+        "presets": {
+          "default": "Par défaut",
+          "custom": "Personnalisé"
+        }
+      },
+      "climbList": {
+        "title": "Liste des blocs",
+        "picture": "Image",
+        "underName": "Sous le nom",
+        "yourClimbing": "Ta grimpe",
+        "actions": "Actions",
+        "layout": {
+          "title": "Colonnes",
+          "one": "Une colonne",
+          "two": "Deux colonnes",
+          "footer": "Les deux colonnes s'affichent quand la liste a assez de place, comme sur un iPad à l'horizontale."
+        },
+        "gradesTitle": "Cotations",
+        "previewFooter": "Exemple. Les croix, favoris et étiquettes apparaissent sur les blocs qui en ont.",
+        "gradeFooter": "Choisis la cotation principale dans Réglages → Blocs et cotations.",
+        "personalFooter": "Les marques personnelles et listes nécessitent une connexion au compte et se chargent en ligne.",
+        "presetsLabel": "Réglage rapide",
+        "presets": {
+          "namesOnly": "Noms seuls",
+          "textOnly": "Texte seul",
+          "default": "Par défaut",
+          "everything": "Tout",
+          "custom": "Personnalisé"
+        },
+        "fields": {
+          "thumbnail": "Image de la board",
+          "communityGrade": "Cotation de la communauté",
+          "sends": "Croix",
+          "rating": "Note",
+          "setter": "Ouvreur",
+          "sentMark": "Marque de croix",
+          "playlistTags": "Afficher les étiquettes de playlist",
+          "quickActions": "Afficher le bouton d'actions rapides",
+          "progress": "Ma progression"
+        },
+        "sampleName": "Projet du soir",
+        "sampleSetter": "ouvreur",
+        "samplePlaylistOne": "Projets",
+        "samplePlaylistTwo": "Échauffement",
+        "playlistTagsDescription": "Voyez dans quelles playlists se trouve chaque bloc, directement dans la liste.",
+        "quickActionsDescription": "Ajoute un bouton ⋮ à chaque bloc qui ouvre file, croix, listes et plus. Tu peux toujours appuyer longuement à la place."
+      },
+      "playerButtons": {
+        "title": "Boutons",
+        "description": "Choisis jusqu’à quatre boutons autour de Enregistrer, leur ordre et leur place.",
+        "position": {
+          "label": "Position",
+          "below": "Sous la board",
+          "above": "Au-dessus de la board",
+          "footer": "Enregistrer et Éclairage de la board gardent toujours leur place."
+        },
+        "previousNext": "Précédent et suivant",
+        "previousNextDescription": "Affiche des flèches à côté de Enregistrer à la place de deux boutons d’action. Glisser sur la board change toujours de bloc.",
+        "buttons": {
+          "mirror": "Miroir",
+          "favorite": "Favori",
+          "angle": "Inclinaison",
+          "playNext": "Mettre juste après",
+          "share": "Partager",
+          "queue": "File"
+        },
+        "mirrorDescription": "Seulement sur les boards avec miroir",
+        "angleDescription": "Seulement sur les boards à inclinaison réglable",
+        "fixed": {
+          "previous": "Précédent",
+          "next": "Suivant",
+          "log": "Enregistrer",
+          "boardLight": "Éclairage de la board"
+        },
+        "footer": "Sans flèches, jusqu’à quatre boutons activés entourent Enregistrer. S’il y en a davantage pour cette board, le premier et les trois derniers prennent les places. Avec les flèches, seuls le premier et le dernier apparaissent. Les autres, et ceux que tu masques, sont dans le menu ⋯.",
+        "settingsFooter": "Pour changer l’ordre, ouvre le menu ⋯ d’un bloc et choisis Options d’affichage.",
+        "previewLabel": "Aperçu, {{position}} : {{buttons}}",
+        "boardControl": {
+          "label": "Commande de la board",
+          "wallButton": "Bouton du mur",
+          "lightbulb": "Ampoule",
+          "footer": "Les deux commandes connectent, allument le bloc et montrent qui tient la board. Quand la board est connectée, maintiens pour les options. Lis le libellé du bouton du mur : Tu pilotes la board signifie que chaque bloc choisi s’allume ; touche-le pour arrêter de piloter. Ton téléphone reste connecté, sauf si Déconnecter le Bluetooth quand le pilotage s’arrête est activé. Quand le pilotage a une durée limite, un chrono à côté du libellé et le givre qui rétrécit montrent quand il s’arrête. L’ampoule est en haut à droite."
+        }
+      },
+      "climbView": {
+        "title": "Vue du bloc",
+        "valueDefault": "Par défaut",
+        "valueCustom": "Personnalisée"
+      },
+      "quickFilters": {
+        "title": "Filtres rapides",
+        "valueDefault": "Par défaut",
+        "valueCustom": "Personnalisés",
+        "climbsTitle": "Blocs",
+        "climbsFooter": "Ils s'affichent au-dessus de la liste des blocs, dans cet ordre. Un filtre que tu actives se place à la fin.",
+        "playlistsTitle": "Listes",
+        "playlistsFooter": "Ils s'affichent au-dessus de chaque playlist, playlist intelligente et page d'ouvreur, dans cet ordre.",
+        "restoreDefaults": "Rétablir les réglages par défaut",
+        "footer": "Les changements s'appliquent immédiatement, sur ce téléphone uniquement. Tous les filtres restent dans Filtres."
+      },
+      "timers": {
+        "restTitle": "Repos",
+        "restLength": "Repos",
+        "restLengthOff": "Désactivé",
+        "modeLabel": "Cadence",
+        "modeAfterTick": "Après chaque bloc",
+        "modeEvery": "Toutes les {{length}}",
+        "modeOnTheMinute": "Rythme fixe",
+        "modeAfterTickHint": "Ton repos repart à zéro à chaque essai ou croix que tu enregistres.",
+        "modeOnTheMinuteHint": "Des créneaux fixes dès que tu l’actives. Enregistrer un essai ou une croix ne relance jamais le chrono.",
+        "autoAdvance": "Passer au bloc suivant",
+        "autoAdvanceHint": "Il s’allume sur le mur pour toi, seulement avec Boardsesh ouvert.",
+        "autoAdvanceBlocked": "Seule la personne qui tient la board peut faire avancer la file.",
+        "autoAdvanceNeedsLength": "Choisis une durée de repos pour faire avancer la file automatiquement.",
+        "cuesTitle": "Signaux",
+        "cuesFooter": "Désactivés, tu reçois quand même une vibration d’alerte avant que le mur avance tout seul.",
+        "countdownCues": "Décompte des dernières secondes",
+        "countdownCuesHint": "Une vibration à chacune des dernières secondes, pour être sur les prises quand le bloc suivant s’allume.",
+        "sound": "Son",
+        "soundHint": "Joue un son avec les signaux. Il passe même en mode silencieux et laisse ta musique en route.",
+        "lockScreen": "Afficher sur l’écran verrouillé",
+        "lockScreenHint": "Vois ton repos défiler sans ouvrir l’app.",
+        "rogueTitle": "Minuteur de salle",
+        "rogueFooter": "Associe un minuteur Rogue à une board et son chrono repart avec ton repos : quand tu enregistres un bloc, quand la file avance et à chaque créneau du rythme fixe. Seul le téléphone connecté à la board le pilote.",
+        "rogueNotPaired": "Non associé",
+        "roguePairHint": "Associe un minuteur à cette board",
+        "rogueChangeHint": "Associe un autre minuteur à cette board",
+        "rogueRemove": "Retirer le minuteur de {{board}}",
+        "rogueNoBoardsTitle": "Pas encore de board à toi",
+        "rogueNoBoards": "Ajoute ta propre board pour lui associer un minuteur.",
+        "rogueConnected": "Connecté",
+        "rogueConnecting": "Connexion…",
+        "rogueUnreachable": "Introuvable. Vérifie qu’il est allumé et à proximité.",
+        "rogueSaveFailed": "Impossible d’enregistrer le minuteur. Réessaie."
+      },
+      "miniPlayer": {
+        "title": "Mini-lecteur",
+        "description": "La barre au-dessus des onglets garde le dernier bloc que tu as ouvert. Touche-la pour le rouvrir ; Éclairage de la board l'allume sur la board.",
+        "buttons": {
+          "next": "Bloc suivant",
+          "previous": "Bloc précédent",
+          "wallDisplay": "Affichage mural"
+        },
+        "fixedNote": "Éclairage de la board est toujours là, à côté d'Enregistrer. Enregistrer reste en dernier, sous ton pouce.",
+        "footer": "Sur un téléphone, la barre a de la place pour un seul de ces boutons à côté d'Éclairage de la board et d'Enregistrer : le premier qui est activé.",
+        "open": "Ouverte",
+        "collapsed": "Réduite",
+        "previewLabel": "Aperçu, barre {{shape}} : {{buttons}}",
+        "footerWide": "Sur un écran large, la barre garde autant de ces boutons qu'elle peut en contenir : les premiers de la liste passent d'abord.",
+        "shapeOpen": "ouverte",
+        "shapeCollapsed": "réduite",
+        "more": "Plus"
       }
     },
     "sendRecovery": {
@@ -414,15 +685,36 @@
       "openBody": "Le projet est open source pour que les grimpeurs puissent signaler les accrocs, demander des fonctions et aider à choisir la suite.",
       "independentBody": "Boardsesh n'est ni affilié ni approuvé par Aurora Climbing, Kilter, Tension, Moon Climbing ou un fabricant de boards.",
       "viewOnGithub": "Voir sur GitHub",
+      "emailPartners": "Nous écrire",
       "joinDiscord": "Rejoindre Discord",
       "partnerTitle": "Devenez partenaire officiel",
       "partnerBody": "Boardsesh fonctionne avec Kilter, Tension et MoonBoard depuis l'extérieur. Si vous fabriquez des boards et voulez construire quelque chose d'officiel ensemble, on serait ravis d'en parler.",
       "acknowledgementsLink": "Remerciements",
-      "acknowledgementsLinkBody": "Les personnes derrière Boardsesh"
+      "acknowledgementsLinkBody": "Les personnes derrière Boardsesh",
+      "shareApp": {
+        "link": "Partager Boardsesh",
+        "linkBody": "Un QR code pour les téléphones de ta crew",
+        "title": "Partager Boardsesh",
+        "body": "Ta crew scanne ce code avec l'appareil photo du téléphone pour installer l'app.",
+        "appStore": "App Store",
+        "googlePlay": "Google Play",
+        "storeToggleLabel": "Store",
+        "qrLabelIos": "QR code de Boardsesh sur l'App Store",
+        "qrLabelAndroid": "QR code de Boardsesh sur Google Play",
+        "copyLink": "Copier le lien",
+        "share": "Partager",
+        "copied": "Lien copié",
+        "copyFailed": "Impossible de copier le lien",
+        "messageCopied": "Message copié",
+        "messageCopyFailed": "Impossible de copier le message",
+        "message": "Installe Boardsesh pour tes séances de board.\niPhone : {{iosUrl}}\nAndroid : {{androidUrl}}"
+      }
     },
     "acknowledgements": {
       "title": "Remerciements",
       "intro": "Boardsesh existe grâce aux personnes qui le construisent, le soutiennent et supportent que je parle sans fin de boards. Merci.",
+      "openSourceRootsTitle": "Des racines open source",
+      "openSourceRootsBody": "J'ai commencé avec un fork de Climbdex. Comme l'idée prenait de l'ampleur, j'ai créé un dépôt à part pour Boardsesh. Climbdex et BoardLib ont servi de base à notre système d'importation de blocs. Merci à Luke Emery-Fertitta d'avoir créé ces deux projets.",
       "contributorsTitle": "Contributeurs",
       "contributorsBody": "Toutes les personnes qui ont apporté du code, des correctifs et des idées sur GitHub.",
       "sponsorsTitle": "Sponsors",
@@ -452,46 +744,56 @@
     "onboarding": {
       "replaySection": "Tutoriel",
       "replayTitle": "Revoir le tutoriel",
-      "replaySubtitle": "Affiche à nouveau le tutoriel",
       "replayError": "Impossible de rouvrir le tutoriel. Réessaie.",
       "prompt": {
         "title": "Vois ce qui est allumé sur ton mur, en direct",
-        "body": "Suis la board de ta salle et Boardsesh te montre ce qui est allumé en ce moment : qui l'a allumé, la cotation, qui l'a ouvert, et les croix récentes. Tu ne lances rien ; c'est juste là.",
-        "footnote": "En plus : les séances avec ta crew, le générateur d'entraînement et le suivi de tes croix, une fois sur un mur.",
+        "body": "Suis la board de ta salle pour voir ce qui est allumé en ce moment, qui l'a ouvert et les croix récentes.",
+        "footnote": "Sessions en crew, entraînements et suivi des croix arrivent une fois que tu es sur un mur.",
         "continue": "Choisir ma board"
       },
       "board": {
         "title": "Sur quelle board tu grimpes ?",
-        "body": "Chaque board garde son propre historique. Choisis celle que tu grimpes et tu verras les croix de tous les autres qui y passent.",
-        "offlineHint": "Touche la flèche pour garder une board sur ce téléphone. Elle s'ouvre instantanément et marche même quand le wifi de la salle lâche.",
+        "body": "Chaque board garde son historique. Choisis la tienne pour voir les croix de tout le monde.",
+        "offlineHint": "Choisis une board et on te proposera de la garder sur ce téléphone. Elle marche sans le Wi-Fi de la salle.",
         "findAnother": "Trouver une autre board",
         "findFirst": "Trouver ma board",
-        "offlineSkip": "Plus tard",
-        "downloadAria": "Garder {{name}} sur ce téléphone"
+        "offlineSkip": "Plus tard"
       },
-      "boardRevealTip": "Touche pour voir ce que d'autres utilisateurs de Boardsesh ont allumé au mur.",
-      "quickActionsTip": "Appuie longuement sur un bloc pour des actions rapides : file, croix, listes.",
+      "boardRevealTip": "Touche l’horloge pour voir ce qui a été allumé ici.",
+      "quickActionsTip": "Appuie longuement sur un bloc pour le mettre dans la file, le cocher ou l'ajouter à une playlist.",
       "tips": {
-        "workout": "Monte une séance : Volume, Pyramide, Échelle ou Cotation ciblée. Fixe une cotation, prévisualise les voies, enchaîne-les une par une.",
-        "crew": "Tu grimpes à plusieurs ? Lance une séance et partagez une file. N'importe qui allume la voie suivante, sans passer le téléphone.",
-        "record": "Tes croix s'affichent ici dans Progression : éventail de cotations et ta plus grosse croix. Importe ton carnet Kilter et Tension depuis Aurora pour partir avec ton historique.",
-        "accessory": "La barre du bas montre toujours ce qui est sur le mur. Change de voie depuis là.",
-        "climbsTab": "Pour revenir à tes blocs, touche la loupe dans la barre d'onglets."
+        "workout": "Monte un entraînement : choisis un style et une cotation, puis grimpe.",
+        "crew": "Tu grimpes à plusieurs ? Lance une session et partage une seule file.",
+        "record": "Progression affiche tes croix en graphiques. Importe ton carnet Kilter ou Tension pour la remplir.",
+        "accessory": "La barre du bas garde le dernier bloc ouvert. Touche-la pour le rouvrir.",
+        "previewFirst": {
+          "title": "Touche un bloc pour l'aperçu. Allumer sur la board l'allume.",
+          "windowSeconds": "Pendant {{seconds}} secondes après chaque bloc allumé, chaque bloc que tu choisis s'allume aussi.",
+          "windowMinute": "Pendant 1 minute après chaque bloc allumé, chaque bloc que tu choisis s'allume aussi.",
+          "windowMinutes": "Pendant {{minutes}} minutes après chaque bloc allumé, chaque bloc que tu choisis s'allume aussi.",
+          "untilStop": "Ensuite, chaque bloc que tu choisis s'allume jusqu'à ce que tu arrêtes.",
+          "frost": "Le bouton givré veut dire que chaque bloc que tu choisis s'allume. Fais-le glisser vers la gauche pour continuer jusqu'à ce que tu arrêtes. Touche-le pour arrêter.",
+          "frostScreenReader": "Quand le bouton affiche Tu pilotes la board, chaque bloc que tu choisis s'allume. Utilise l'action Allumer chaque bloc pour continuer jusqu'à ce que tu arrêtes. Touche le bouton pour arrêter.",
+          "frostOpenEnded": "Le bouton givré veut dire que chaque bloc que tu choisis s'allume. Fais-le glisser vers la gauche pour commencer. Touche-le pour arrêter.",
+          "frostOpenEndedScreenReader": "Quand le bouton affiche Tu pilotes la board, chaque bloc que tu choisis s'allume. Utilise l'action Allumer chaque bloc pour commencer. Touche le bouton pour arrêter.",
+          "settings": "Paramètres d'éclairage",
+          "done": "C'est noté",
+          "close": "Fermer l'astuce"
+        }
       },
       "link": {
         "title": "Emporte tes croix {{boardName}} avec toi",
-        "body": "Ton compte {{boardName}} et Boardsesh sont distincts, même si tu utilises le même e-mail. Lie ton compte pour synchroniser les croix disponibles avec ton carnet. Le délai de synchronisation et l’historique disponible varient.",
-        "footnote": "Pour lier ton compte, utilise ton identifiant {{boardName}}, pas ton e-mail.",
+        "body": "Ton compte {{boardName}} est distinct de Boardsesh. Lie-le pour ajouter tes croix à ton carnet.",
+        "footnote": "Pour le lier, utilise ton identifiant {{boardName}}, pas ton e-mail.",
         "continue": "Lier mon compte {{boardName}}",
         "skip": "Pas maintenant",
-        "skipHint": "Tu peux le faire à tout moment dans Réglages › Apps connectées."
+        "skipHint": "Fais-le quand tu veux dans Paramètres › Applications connectées."
       }
     },
     "nav": {
       "home": "Accueil",
       "boards": "Boards",
       "climbs": "Blocs",
-      "wall": "Sur le mur",
       "profile": "Profil",
       "holdFilter": "Types de prise",
       "zoneFilter": "Zone du mur",
@@ -499,9 +801,9 @@
     },
     "changelog": {
       "title": "Nouveautés",
-      "intro": "Dernières améliorations et corrections, les plus récentes en premier.",
-      "currentBuild": "Vous utilisez la version du {{date}}",
-      "currentBuildVersion": "Vous utilisez la version {{version}}",
+      "intro": "Derniers changements",
+      "currentBuild": "Mis à jour le {{date}}",
+      "currentBuildVersion": "Version {{version}}",
       "category": {
         "new": "Nouveau",
         "improved": "Amélioré",
@@ -530,7 +832,36 @@
       "checkError": {
         "title": "Impossible de rechercher des mises à jour",
         "message": "Une erreur s'est produite lors de la récupération de la dernière version. Réessayez dans un instant."
+      },
+      "updates": {
+        "regular": "Version stable",
+        "canary": "Version canary",
+        "canaryBody": "Sélection automatique pour ce déploiement. Les signalements incluent ta version.",
+        "statusUnknown": "Le statut du déploiement n’a pas pu être confirmé.",
+        "early": "Mises à jour anticipées",
+        "staging": "Version de test",
+        "preview": "Aperçu de la PR #{{prNumber}}",
+        "native": "Version installée",
+        "other": "Version {{channel}}",
+        "changeRelease": "Version",
+        "testPreview": "Tester un aperçu de PR",
+        "finishTesting": "Terminer le test de la PR #{{prNumber}}",
+        "options": "Options de mise à jour",
+        "earlyUpdatesHelp": "Les mises à jour anticipées peuvent avoir des bugs. Les changements s’appliquent au prochain lancement."
+      },
+      "previewFirstSpotlight": {
+        "title": "Parcours les blocs sans allumer la board",
+        "tap": "Touche un bloc pour l'aperçu. Allumer sur la board l'allume, et tes choix suivants aussi. Règle la durée dans Paramètres › Board.",
+        "swipe": "Fais glisser le bouton du mur vers la gauche pour allumer chaque bloc que tu choisis. Touche-le pour arrêter.",
+        "back": "Touche la flèche en haut à gauche pour fermer l'aperçu.",
+        "cta": "Voir comment ça marche",
+        "dismiss": "C'est noté"
       }
+    },
+    "launchUpdate": {
+      "checking": "Recherche de mises à jour",
+      "installing": "Installation de la dernière mise à jour",
+      "firstLaunchHint": "Seulement au premier lancement de l'app. Ça prend quelques secondes."
     },
     "connectivity": {
       "serverDown": {
@@ -577,6 +908,36 @@
       "errorTitle": "Impossible de charger ça",
       "errorBody": "Ça n'est pas passé. Réessaie.",
       "retry": "Réessayer"
+    },
+    "storePrompt": {
+      "title": "Prends l'appli Boardsesh",
+      "body": "Allume ta board et fais la croix sur chaque bloc, même hors ligne.",
+      "googlePlay": "Disponible sur Google Play",
+      "appStore": "Télécharger dans l'App Store",
+      "dismiss": "Pas maintenant"
+    },
+    "reportRelease": {
+      "title": "Détails de la version",
+      "channel": "Canal",
+      "branch": "Branche",
+      "updateId": "ID de mise à jour",
+      "runtimeVersion": "Runtime",
+      "automaticCanary": "Canary automatique",
+      "embedded": "Version intégrée",
+      "checkedAt": "Canary vérifié",
+      "yes": "Oui",
+      "no": "Non",
+      "unknown": "Inconnu"
+    },
+    "supportAsks": {
+      "accountRow": "Soutenir Boardsesh",
+      "cardTitle": "Aider à construire Boardsesh",
+      "cardBody": "Boardsesh est gratuit pour tous les grimpeurs et grimpeuses. Un soutien mensuel paie le temps passé à le construire.",
+      "giveMonthly": "Donner chaque mois",
+      "giveOnce": "Donner une fois",
+      "hideCard": "Masquer cette carte",
+      "settingTitle": "Afficher les demandes de soutien",
+      "settingFooter": "Une ligne « Soutenir Boardsesh » dans Compte, et une carte sur Accueil la première semaine de chaque mois."
     }
   },
   "lightControl": {
@@ -587,6 +948,7 @@
   },
   "bluetooth": {
     "boardNotFound": "Board introuvable. Vérifiez qu'elle est allumée et à proximité ; et si un autre téléphone y est connecté, déconnectez-le d'abord.",
+    "boardSwitchConnectFailed": "Vous avez changé de board, mais la connexion à la nouvelle a échoué. Rapprochez-vous d'elle et réessayez.",
     "connectFailed": "Connexion impossible. Rapprochez-vous de la board et réessayez.",
     "serviceMissing": "Connecté, mais la board n'a pas répondu. Redémarrez-la et réessayez.",
     "unavailable": "Le Bluetooth est éteint. Activez-le pour vous connecter à votre board.",
@@ -598,7 +960,6 @@
     "cancel": "Annuler",
     "clear": "Effacer",
     "delete": "Supprimer",
-    "edit": "Modifier",
     "close": "Fermer",
     "back": "Retour",
     "done": "Terminé",
@@ -624,16 +985,17 @@
     "statistics": "Statistiques",
     "sessions": "Sessions",
     "createdClimbs": "Blocs créés",
-    "auroraMigration": "Récupérer votre carnet",
     "startClimbing": "Commencer à grimper",
     "signIn": "Se connecter",
     "nav": {
       "gyms": "Salles",
       "playlists": "Playlists",
-      "about": "À propos",
-      "help": "Aide"
+      "help": "Aide",
+      "boards": "Boards",
+      "spray": "Spraywalls"
     },
-    "navLabel": "Navigation principale"
+    "navLabel": "Navigation principale",
+    "getApp": "Obtenir l’app"
   },
   "share": {
     "profileTitle": "Profil de grimpeur de {{name}}",
@@ -643,7 +1005,7 @@
     "shareFailed": "Échec du partage"
   },
   "myBoards": {
-    "title": "Gérer tes boards"
+    "title": "Tes boards"
   },
   "myGyms": {
     "roleOwner": "Propriétaire",
@@ -667,12 +1029,15 @@
       "finishTesting": "Terminer le test #{{prNumber}}",
       "testPlan": "Plan de test #{{prNumber}}",
       "badge": "QA"
-    }
+    },
+    "accountTitle": "Compte",
+    "myBugReports": "Tes signalements de bugs"
   },
   "qa": {
     "shared": {
       "backOnProduction": "De retour en production à la prochaine mise à jour",
-      "leaveFailed": "Impossible de désactiver cet aperçu — réessaie"
+      "leaveFailed": "Impossible de désactiver cet aperçu — réessaie",
+      "backOnEarlyUpdates": "Retour aux mises à jour anticipées à la prochaine ouverture de l'app"
     },
     "pick": {
       "title": "Tester un PR",
@@ -689,9 +1054,7 @@
       "crashedChip": "Plantage au lancement",
       "nothingNewToast": "Rien de nouveau pour le #{{prNumber}} sur cette version — sa prochaine publication s'appliquera au prochain relancement",
       "stagingTitle": "Préproduction",
-      "stagingBody": "Essaie la prochaine mise à jour avant sa sortie.",
       "productionTitle": "Production",
-      "productionBody": "Reçois les mises à jour publiques ; cette version peut rester jusqu’à la prochaine.",
       "stagingNextLaunch": "Préproduction choisie : la prochaine mise à jour s’appliquera au redémarrage",
       "productionNextLaunch": "Production choisie ; cette version peut rester jusqu’à une nouvelle mise à jour",
       "buildingChip": "En cours de build",
@@ -704,7 +1067,9 @@
       "noMatchBody": "Rien de publié pour cette version ne correspond à « {{query}} ».",
       "trySurfAction": "Essayer quand même la #{{prNumber}}",
       "trySurfHint": "Elle n'a peut-être pas de preview que cette version peut charger.",
-      "notServableToast": "Pas de preview de la #{{prNumber}} pour cette version — il lui faut peut-être un rebase sur main"
+      "notServableToast": "Pas de preview de la #{{prNumber}} pour cette version — il lui faut peut-être un rebase sur main",
+      "earlyUpdatesTitle": "Mises à jour anticipées",
+      "earlyUpdatesNextLaunch": "Les mises à jour anticipées reprennent à la prochaine ouverture de l'app"
     },
     "brief": {
       "screenTitle": "Quoi tester",
@@ -725,7 +1090,7 @@
       "verdictGroupLabel": "Verdict",
       "approvePlaceholder": "Quelque chose à signaler ? (facultatif)",
       "declinePlaceholder": "Qu'est-ce qui n'a pas marché ? Les étapes aident.",
-      "submitLabel": "Envoyer le verdict",
+      "submitLabel": "Envoyer",
       "leaveLabel": "Quitter l'aperçu sans donner d'avis",
       "submitError": "Impossible d'envoyer ce verdict — réessaie",
       "notOnPreview": "Tu es en production — rien sur quoi donner un verdict.",
@@ -741,7 +1106,6 @@
     "attachedCount_one": "{{count}} capture d'écran jointe",
     "attachedCount_other": "{{count}} captures d'écran jointes",
     "publicWarning": "Les captures d'écran jointes sont publiées sur GitHub, visibles par tout le monde.",
-    "permissionDenied": "Boardsesh a besoin d'accéder à tes photos pour joindre une capture d'écran.",
     "pickFailed": "Impossible de lire cette capture d'écran — choisis-en une autre.",
     "uploadFailed": "Impossible d'envoyer tes captures d'écran — ton rapport est toujours là."
   },
@@ -799,7 +1163,8 @@
       "delete": "Impossible de supprimer le commentaire",
       "reply": "Impossible de publier la réponse",
       "loadReplies": "Impossible de charger les réponses"
-    }
+    },
+    "signInToSuggestGrade": "Connecte-toi pour proposer une cotation"
   },
   "vote": {
     "upvote": "Voter pour",
@@ -855,10 +1220,12 @@
     "unfollow": "Se désabonner"
   },
   "betaVideos": {
-    "empty": "Pas encore de vidéo de beta"
-  },
-  "moonboardImport": {
-    "removeConfirmTitle": "Retirer ce bloc ?"
+    "empty": "Pas encore de vidéo de beta",
+    "openClimb": "Découvrir {{climb}} et sa beta",
+    "openVideo": "Regarder la beta de {{creator}} sur {{platform}}",
+    "watchOn": "Regarder la beta sur {{platform}}",
+    "watch": "Voir la beta",
+    "showAll": "Voir les {{total}} vidéos"
   },
   "ascents": {
     "deleteTitle": "Supprimer l'ascension",
@@ -883,28 +1250,60 @@
     "fallbackCta": "Ouvrir la page du store"
   },
   "footer": {
-    "tagline": "Tes boards. Une seule app. Change de board sans changer d’app.",
+    "tagline": "Vos boards. Une app. Gratuite pour votre prochaine session.",
     "navLabel": "Pied de page",
-    "trademarkNote": "Compatible Kilter, Tension et MoonBoard. Sans lien avec Aurora Climbing ni Moon Climbing.",
+    "trademarkNote": "Compatible avec les boards {{boards}}. Boardsesh est indépendant et n’est ni créé ni approuvé par un fabricant de boards, y compris Aurora Climbing. Les marques appartiennent à leurs propriétaires.",
+    "storeTrademarks": "Apple et le logo Apple sont des marques d’Apple Inc., déposées aux États-Unis et dans d’autres pays. App Store est une marque de service d’Apple Inc. Google Play et le logo Google Play sont des marques de Google LLC.",
     "links": {
-      "home": "Accueil",
       "about": "À propos",
       "support": "Soutenir Boardsesh",
       "help": "Aide",
-      "docs": "Doc développeur",
       "playlists": "Playlists",
       "auroraMigration": "Récupérer ton carnet",
       "legal": "Mentions légales",
       "privacy": "Confidentialité",
-      "gymsKilter": "Salles avec une board Kilter",
-      "gymsTension": "Salles avec une board Tension",
-      "gymsMoonboard": "Salles avec un MoonBoard",
-      "gyms": "Toutes les salles et tous les murs"
+      "gyms": "Toutes les salles"
     },
-    "groups": {
-      "findAGym": "Trouver une salle",
-      "explore": "Explorer",
-      "smallPrint": "Petits caractères"
-    }
+    "groups": {},
+    "journeys": {
+      "climb": "Grimper",
+      "walls": "Pour les murs",
+      "project": "Projet",
+      "help": "Aide",
+      "supportedBoards": "Boards compatibles",
+      "setupSpray": "Configurer votre Spraywall",
+      "claimGym": "Revendiquer votre salle",
+      "partners": "Partenaires et fabricants",
+      "source": "Code source",
+      "roadmap": "Feuille de route",
+      "discord": "Discord",
+      "developers": "Développeurs",
+      "bluetooth": "Le board ne se connecte pas ?",
+      "reportBug": "Signaler un bug",
+      "appGuides": "Guides des applis de board (en anglais)"
+    },
+    "openBrowser": "Ouvrir dans votre navigateur"
+  },
+  "unsavedChanges": {
+    "title": "Abandonner les modifications ?",
+    "message": "Tes modifications ne seront pas enregistrées.",
+    "discard": "Abandonner les modifications",
+    "keepEditing": "Continuer à modifier"
+  },
+  "undoDelete": {
+    "removed": "Entrée supprimée",
+    "removedMany": "{{count}} entrées supprimées",
+    "undo": "Annuler",
+    "cancelled": "Suppression annulée. Ton entrée a été conservée."
+  },
+  "chineseTranslation": {
+    "title": "Aide-nous à parler escalade en chinois",
+    "body": "Bienvenue sur Boardsesh en chinois simplifié. Nous avons utilisé l’IA pour traduire l’app et certains termes d’escalade peuvent manquer de naturel.",
+    "terms": "Comment appelles-tu une croix, un flash, une méthode ou un Spraywall ? Aide-nous à choisir les mots que les grimpeurs utilisent.",
+    "invitation": "Partage tes suggestions dans notre formulaire Google. C’est facultatif. Tu peux le retrouver dans Réglages → Général → Aider à traduire.",
+    "openForm": "Aider avec les termes d’escalade",
+    "continue": "Continuer vers Boardsesh",
+    "formPending": "Notre formulaire de terminologie n’est pas encore prêt. Tu peux contribuer depuis Aider à traduire dans Réglages → Général.",
+    "formDescription": "Remplis notre formulaire Google pour nous aider à choisir des termes d’escalade naturels en chinois."
   }
 }

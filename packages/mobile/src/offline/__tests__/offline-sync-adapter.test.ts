@@ -5,6 +5,22 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
+const authToken = vi.hoisted(() => ({
+  token: 'e30.eyJzdWIiOiJ2aWV3ZXItNjY1MyJ9.signature' as string | null,
+  readFails: false,
+  generationCurrent: true,
+  generation: 1,
+}));
+vi.mock('../../lib/auth-store', () => ({
+  getAuthToken: async () => {
+    if (authToken.readFails) throw new Error('SecureStore unavailable');
+    return authToken.token;
+  },
+  captureAuthCredentialGeneration: () => authToken.generation,
+  isAuthCredentialGenerationCurrent: (generation: number) =>
+    authToken.generationCurrent && generation === authToken.generation,
+}));
+
 const onlineManagerIsOnline = vi.fn(() => true);
 const onlineManagerSetOnline = vi.fn();
 // The adapter reads the persisted download-trigger attribution (issue #4316),
@@ -31,6 +47,8 @@ vi.mock('@tanstack/react-query', () => ({
 type AppStateListener = (state: string) => void;
 let appStateListener: AppStateListener | null = null;
 const appStateRemove = vi.fn();
+// iOS unless a case says otherwise: `suspendedMs` is sent there and nowhere else.
+const platform = vi.hoisted(() => ({ OS: 'ios' }));
 vi.mock('react-native', () => ({
   AppState: {
     addEventListener: (_event: string, listener: AppStateListener) => {
@@ -38,6 +56,7 @@ vi.mock('react-native', () => ({
       return { remove: appStateRemove };
     },
   },
+  Platform: platform,
 }));
 
 type NetInfoState = {
@@ -67,12 +86,31 @@ const startSyncSchedulerCore = vi.fn((..._args: unknown[]) => vi.fn());
 const triggerSyncCore = vi.fn();
 const pullSyncCore = vi.fn(async (..._args: unknown[]) => {});
 const setBackgroundedCore = vi.fn();
+// Which scopes the local database says are fully downloaded (issue #4310's
+// end-of-cycle check). Empty unless a test says otherwise.
+const completedScopeKeys = new Set<string>();
+const isScopeDownloadCompleteCore = vi.fn(async (_db: unknown, scopeKey: string) => completedScopeKeys.has(scopeKey));
+// The background-write telemetry seam (#5851): the sink the adapter registers,
+// and the label the engine leaves on a lock error that escaped a cycle.
+const pullWriteTelemetry = vi.hoisted(() => ({
+  reporter: null as ((report: Record<string, unknown>) => void) | null,
+  unregister: vi.fn(),
+}));
 vi.mock('@boardsesh/offline-sync', () => ({
   drainMutationQueue: (...args: unknown[]) => drainMutationQueueCore(...args),
   startSyncScheduler: (...args: unknown[]) => startSyncSchedulerCore(...args),
   triggerSync: (...args: unknown[]) => triggerSyncCore(...args),
   pullSync: (...args: unknown[]) => pullSyncCore(...args),
   setBackgrounded: (...args: unknown[]) => setBackgroundedCore(...args),
+  isScopeDownloadComplete: (db: unknown, scopeKey: string) => isScopeDownloadCompleteCore(db, scopeKey),
+  setPullWriteSettledReporter: (reporter: (report: Record<string, unknown>) => void) => {
+    pullWriteTelemetry.reporter = reporter;
+    return pullWriteTelemetry.unregister;
+  },
+  getSqliteWriteSite: (error: unknown) =>
+    typeof error === 'object' && error !== null && 'sqliteWriteSite' in error
+      ? String((error as { sqliteWriteSite: unknown }).sqliteWriteSite)
+      : null,
 }));
 
 // The connectivity store (issue #4862). The adapter reads its snapshot for the
@@ -129,8 +167,23 @@ const trackMock = vi.fn();
 vi.mock('../../lib/analytics', () => ({ track: (...args: unknown[]) => trackMock(...args) }));
 
 import { SHARED_EVENTS } from '@boardsesh/analytics';
-import { rememberDownloadTrigger } from '../../settings';
+import { getUserStartedDownloads, rememberDownloadTrigger, takeDownloadTrigger, setSetting } from '../../settings';
+import {
+  __resetDownloadKeepAwakeForTests,
+  getPendingUserStartedDownloads,
+  isDownloadKeepAwakeActive,
+  markUserStartedDownload,
+  subscribeDownloadKeepAwake,
+} from '../download-keep-awake-store';
 import { __resetSyncStatusForTests, setSyncProgress } from '../../sync';
+import { getDownloadActivity } from '../../sync/download-activity-store';
+import {
+  getDownloadRequest,
+  getDownloadRequests,
+  requestDownload,
+  resetDownloadLifecycle,
+  transitionDownload,
+} from '../download-lifecycle';
 import {
   drainMutationQueue,
   startSyncScheduler,
@@ -145,7 +198,11 @@ import {
   __resetCoverageVerdictDedupeForTests,
   __resetCycleErrorDedupeForTests,
   __resetMeteredStateForTests,
+  __resetOutboxOwnerReportForTests,
+  readSignedInAccount,
+  readSignedInUserIdOrNull,
 } from '../offline-sync-adapter';
+import { resetLaunchReloadWindowForTests, setJsRestartCount } from '../../lib/launch-reload-window';
 import type {
   OfflineDatabase,
   DrainOptions,
@@ -155,6 +212,7 @@ import type {
   SchedulerOptions,
   SnapshotSource,
   SyncOptions,
+  SyncProgress,
 } from '@boardsesh/offline-sync';
 
 // The engine package is vi.mock'd above, so its `emptyScopeDownloadPhases`
@@ -183,12 +241,22 @@ const NO_PHASE_PROPS = {
   gradesPullMs: 0,
 };
 
+// What a download event carries on iOS when nothing held the screen and the JS
+// thread never stopped (issue #4310): present and false/zero, never absent.
+const NO_KEEP_AWAKE_PROPS = { keepAwake: false, suspendedMs: 0 };
+
 const db = {} as OfflineDatabase;
 const invalidateQueries = vi.fn();
 const queryClient = { invalidateQueries } as unknown as import('@tanstack/react-query').QueryClient;
 const graphqlFetch = vi.fn() as unknown as import('@boardsesh/offline-sync').GraphQLFetch;
 
 beforeEach(() => {
+  // Before the mocks are cleared: dropping its app-state subscription calls the
+  // mocked `remove`, which the trigger-binding cases count.
+  __resetDownloadKeepAwakeForTests();
+  completedScopeKeys.clear();
+  isScopeDownloadCompleteCore.mockReset().mockImplementation(async (_db, scopeKey) => completedScopeKeys.has(scopeKey));
+  platform.OS = 'ios';
   vi.clearAllMocks();
   __resetSyncStatusForTests();
   __resetCycleErrorDedupeForTests();
@@ -200,6 +268,9 @@ beforeEach(() => {
   connectivity.confirmBackendAvailability.mockResolvedValue(true);
   // The trigger store is persisted, so it survives between tests unless cleared.
   mockSettingsStorage.clear();
+  resetDownloadLifecycle();
+  authToken.generationCurrent = true;
+  authToken.generation = 1;
 });
 
 describe('drainMutationQueue binding', () => {
@@ -296,6 +367,53 @@ describe('drainMutationQueue binding', () => {
       unsubscribeLater();
     }
   });
+
+  it('does not publish an old drain acknowledgement into a replacement account', async () => {
+    const listener = vi.fn();
+    const caller = vi.fn();
+    const unsubscribe = subscribeMutationDelivery(listener);
+    try {
+      await drainMutationQueue(db, queryClient, graphqlFetch, { onMutationStatus: caller });
+      const options = drainMutationQueueCore.mock.calls[0][3] as DrainOptions;
+      authToken.generationCurrent = false;
+      options.onMutationStatus?.({
+        tableName: 'board_climbs',
+        operation: 'create',
+        idempotencyKey: 'climb:create:ABC',
+        entityKey: 'climb:spray:ABC',
+        status: 'acknowledged',
+      });
+      expect(caller).not.toHaveBeenCalled();
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      authToken.generationCurrent = true;
+      unsubscribe();
+    }
+  });
+
+  it('rechecks the source account after a caller handles the acknowledgement', async () => {
+    const listener = vi.fn();
+    const unsubscribe = subscribeMutationDelivery(listener);
+    try {
+      await drainMutationQueue(db, queryClient, graphqlFetch, {
+        onMutationStatus: () => {
+          authToken.generationCurrent = false;
+        },
+      });
+      const options = drainMutationQueueCore.mock.calls[0][3] as DrainOptions;
+      options.onMutationStatus?.({
+        tableName: 'board_climbs',
+        operation: 'create',
+        idempotencyKey: 'climb:create:ABC',
+        entityKey: 'climb:spray:ABC',
+        status: 'acknowledged',
+      });
+      expect(listener).not.toHaveBeenCalled();
+    } finally {
+      authToken.generationCurrent = true;
+      unsubscribe();
+    }
+  });
 });
 
 // Issue #4315: before this binding a dead-lettered write — a user action that
@@ -386,6 +504,52 @@ describe('startBackgroundTracking', () => {
 
     unsubscribe();
     expect(appStateRemove).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a contended sync write as one PostHog event and unregisters on stop (#5851)', () => {
+    const stop = startBackgroundTracking();
+    expect(pullWriteTelemetry.reporter).toBeTypeOf('function');
+
+    pullWriteTelemetry.reporter?.({
+      site: 'scope-complete',
+      sizing: 'background',
+      attempts: 2,
+      outcome: 'refused',
+      elapsedMs: 5_310,
+    });
+
+    expect(trackMock).toHaveBeenCalledWith(SHARED_EVENTS.OfflineSyncWriteRetried, {
+      site: 'scope-complete',
+      sizing: 'background',
+      attempts: 2,
+      outcome: 'refused',
+      elapsedMs: 5_310,
+      jsRestartCount: null,
+    });
+    stop();
+    expect(pullWriteTelemetry.unregister).toHaveBeenCalledTimes(1);
+  });
+
+  // #6689: a sync write that never wins after a reload is the old runtime's orphan.
+  it('says how many times this runtime has been restarted on a contended sync write', () => {
+    setJsRestartCount(1);
+    try {
+      const stop = startBackgroundTracking();
+      pullWriteTelemetry.reporter?.({
+        site: 'deletions-coverage',
+        sizing: 'background',
+        attempts: 3,
+        outcome: 'exhausted',
+        elapsedMs: 15_520,
+      });
+      stop();
+      expect(trackMock).toHaveBeenCalledWith(
+        SHARED_EVENTS.OfflineSyncWriteRetried,
+        expect.objectContaining({ outcome: 'exhausted', jsRestartCount: 1 }),
+      );
+    } finally {
+      resetLaunchReloadWindowForTests();
+    }
   });
 });
 
@@ -747,6 +911,7 @@ describe('snapshot-bootstrap bindings', () => {
       statsPullMs: 0,
       gradesPullMs: 134,
       gradesRows: 500,
+      ...NO_KEEP_AWAKE_PROPS,
       offlineEngineEnabled: false,
     });
   });
@@ -845,6 +1010,7 @@ describe('snapshot-bootstrap bindings', () => {
       method: 'paged',
       durationMs: 500,
       ...NO_PHASE_PROPS,
+      ...NO_KEEP_AWAKE_PROPS,
       offlineEngineEnabled: false,
     });
   });
@@ -1135,6 +1301,7 @@ describe('snapshot-bootstrap bindings', () => {
       reason: 'network',
       aborted: false,
       errorMessage: 'The request timed out.',
+      ...NO_KEEP_AWAKE_PROPS,
       offlineEngineEnabled: false,
     });
     expect(reportHandledError).toHaveBeenCalledWith(expect.any(Error), expect.objectContaining({ level: 'warning' }));
@@ -1173,6 +1340,7 @@ describe('snapshot-bootstrap bindings', () => {
       reason: 'aborted-wipe',
       aborted: true,
       errorMessage: 'null',
+      ...NO_KEEP_AWAKE_PROPS,
       offlineEngineEnabled: false,
     });
     expect(reportHandledError).not.toHaveBeenCalled();
@@ -1243,6 +1411,7 @@ describe('snapshot-bootstrap bindings', () => {
       downloadMs: 800,
       importMs: 150,
       ...NO_PHASE_PROPS,
+      ...NO_KEEP_AWAKE_PROPS,
       offlineEngineEnabled: false,
     });
 
@@ -1260,6 +1429,7 @@ describe('snapshot-bootstrap bindings', () => {
       method: 'snapshot',
       durationMs: 2000,
       ...NO_PHASE_PROPS,
+      ...NO_KEEP_AWAKE_PROPS,
       offlineEngineEnabled: false,
     });
   });
@@ -1287,6 +1457,7 @@ describe('snapshot-bootstrap bindings', () => {
       method: 'paged',
       durationMs: 500,
       ...NO_PHASE_PROPS,
+      ...NO_KEEP_AWAKE_PROPS,
       offlineEngineEnabled: false,
     });
 
@@ -1296,6 +1467,519 @@ describe('snapshot-bootstrap bindings', () => {
       SHARED_EVENTS.OfflineBoardDownloadStarted,
       expect.objectContaining({ scopeKey: 'kilter:1:5', pathIntent: 'paged' }),
     );
+  });
+});
+
+describe('download lifecycle bindings (issue #7987)', () => {
+  const KILTER = 'kilter:1:10';
+
+  function schedulerLifecycleOptions(): SchedulerOptions {
+    startSyncScheduler(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [KILTER],
+      async () => {},
+    );
+    return startSyncSchedulerCore.mock.calls[0][6] as SchedulerOptions;
+  }
+
+  function captureContext(options: SchedulerOptions) {
+    const context = options.getScopeDownloadContext?.(KILTER);
+    expect(context).toBeDefined();
+    if (!context) throw new Error('download lifecycle context was not captured');
+    return context;
+  }
+
+  it('does not consume a replacement request trigger from an old queued Started callback', () => {
+    const original = requestDownload(KILTER, 'toggle');
+    const options = schedulerLifecycleOptions();
+    const originalContext = captureContext(options);
+    transitionDownload(original, 'abandoned', { reason: 'disabled' });
+    requestDownload(KILTER, 'download-all');
+    rememberDownloadTrigger(KILTER, 'download-all');
+    options.onScopeDownloadStart?.({
+      scopeKey: KILTER,
+      pathIntent: 'snapshot',
+      artifactBytes: 100,
+      downloadContext: originalContext,
+    });
+    expect(trackMock).not.toHaveBeenCalledWith(SHARED_EVENTS.OfflineBoardDownloadStarted, expect.anything());
+    expect(takeDownloadTrigger(KILTER)).toBe('download-all');
+  });
+
+  it('settles a disabled request left removal-pending by a previous process', async () => {
+    const request = requestDownload(KILTER, 'toggle');
+    transitionDownload(request, 'deferred', { reason: 'removal-pending' });
+    startSyncScheduler(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [],
+      async () => {},
+    );
+    const options = startSyncSchedulerCore.mock.calls[0][6] as SchedulerOptions;
+    await options.prepareScopeDownloadContexts?.();
+    expect(getDownloadRequest(KILTER)).toBeUndefined();
+    expect(trackMock).toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+      expect.objectContaining({
+        requestId: request.requestId,
+        state: 'abandoned',
+        reason: 'disabled',
+      }),
+    );
+  });
+
+  it('resumes an enabled request left removal-pending by a previous process', async () => {
+    const request = requestDownload(KILTER, 'toggle');
+    transitionDownload(request, 'deferred', { reason: 'removal-pending' });
+    const options = schedulerLifecycleOptions();
+    await options.prepareScopeDownloadContexts?.();
+    const context = captureContext(options);
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context, state: 'started' });
+    expect(getDownloadRequest(KILTER)).toMatchObject({ requestId: request.requestId, state: 'started' });
+  });
+
+  it('does not count owner preparation as an attempt before the first actual start', () => {
+    requestDownload(KILTER, 'toggle');
+    const options = schedulerLifecycleOptions();
+    options.onScopeDownloadLifecycle?.({
+      scopeKey: KILTER,
+      context: captureContext(options),
+      state: 'deferred',
+      reason: 'owner-unready',
+      stage: 'preparation',
+    });
+    expect(getDownloadRequest(KILTER)?.attemptId).toBeUndefined();
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context: captureContext(options), state: 'started' });
+    expect(getDownloadRequest(KILTER)?.state).toBe('started');
+  });
+
+  it('keeps one request identity across distinct execution attempts and reports the second as resumed', async () => {
+    const request = requestDownload(KILTER, 'toggle');
+    const options = schedulerLifecycleOptions();
+    await Promise.resolve();
+    const firstAttempt = captureContext(options);
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context: firstAttempt, state: 'started' });
+    options.onScopeDownloadLifecycle?.({
+      scopeKey: KILTER,
+      context: firstAttempt,
+      state: 'paused',
+      reason: 'background',
+    });
+    const secondAttempt = captureContext(options);
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context: secondAttempt, state: 'started' });
+
+    expect(secondAttempt.requestId).toBe(request.requestId);
+    expect(secondAttempt.attemptId).not.toBe(firstAttempt.attemptId);
+    expect(getDownloadRequest(KILTER)).toMatchObject({
+      requestId: request.requestId,
+      attemptId: secondAttempt.attemptId,
+      state: 'resumed',
+    });
+    const lifecycleEvents = trackMock.mock.calls.filter(
+      ([name]) => name === SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+    );
+    expect(lifecycleEvents.map(([, properties]) => properties.state)).toEqual([
+      'requested',
+      'started',
+      'paused',
+      'resumed',
+    ]);
+  });
+
+  it('labels a new attempt after an unresolved previous execution without declaring that execution failed', async () => {
+    requestDownload(KILTER, 'toggle');
+    const options = schedulerLifecycleOptions();
+    await Promise.resolve();
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context: captureContext(options), state: 'started' });
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context: captureContext(options), state: 'started' });
+
+    expect(getDownloadRequest(KILTER)).toMatchObject({ state: 'resumed', reason: 'previous-attempt-unresolved' });
+    expect(trackMock).not.toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+      expect.objectContaining({ state: 'failed' }),
+    );
+  });
+
+  it('ignores an old execution after the scope is canceled and enabled again', async () => {
+    const previous = requestDownload(KILTER, 'toggle');
+    const options = schedulerLifecycleOptions();
+    await Promise.resolve();
+    const oldContext = captureContext(options);
+    transitionDownload(previous, 'abandoned', { reason: 'disabled' });
+    const replacement = requestDownload(KILTER, 'toggle');
+    const eventCount = trackMock.mock.calls.length;
+
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context: oldContext, state: 'started' });
+    options.onScopeDownloadLifecycle?.({
+      scopeKey: KILTER,
+      context: oldContext,
+      state: 'completed',
+      completionSource: 'download',
+    });
+
+    expect(getDownloadRequest(KILTER)).toEqual(replacement);
+    expect(trackMock).toHaveBeenCalledTimes(eventCount);
+  });
+
+  it('ignores a lifecycle callback after the download activity account resets', async () => {
+    const request = requestDownload(KILTER, 'toggle');
+    const options = schedulerLifecycleOptions();
+    await Promise.resolve();
+    const context = captureContext(options);
+    __resetSyncStatusForTests();
+
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context, state: 'completed', completionSource: 'download' });
+
+    expect(getDownloadRequest(KILTER)).toEqual(request);
+    expect(options.getScopeDownloadContext?.(KILTER)).toBeUndefined();
+  });
+
+  it('ignores a lifecycle callback after credentials change even before activity is reset', async () => {
+    const request = requestDownload(KILTER, 'toggle');
+    const options = schedulerLifecycleOptions();
+    await Promise.resolve();
+    const context = captureContext(options);
+    authToken.generation += 1;
+
+    options.onScopeDownloadLifecycle?.({ scopeKey: KILTER, context, state: 'completed', completionSource: 'download' });
+
+    expect(getDownloadRequest(KILTER)).toEqual(request);
+  });
+
+  it('reconciles a committed cached completion without inventing a Started event', async () => {
+    const request = requestDownload(KILTER, 'toggle');
+    transitionDownload({ ...request, attemptId: 'previous-process-attempt' }, 'started');
+    trackMock.mockClear();
+    completedScopeKeys.add(KILTER);
+    await schedulerLifecycleOptions().prepareScopeDownloadContexts?.();
+
+    expect(getDownloadRequests()).toEqual([]);
+    expect(trackMock).toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+      expect.objectContaining({ requestId: request.requestId, state: 'completed', completionSource: 'recovered' }),
+    );
+    expect(trackMock).not.toHaveBeenCalledWith(SHARED_EVENTS.OfflineBoardDownloadStarted, expect.anything());
+    expect(trackMock).not.toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+      expect.objectContaining({ state: 'started' }),
+    );
+  });
+
+  it('resolves a new request for already-downloaded rows as cached rather than recovered work', async () => {
+    const request = requestDownload(KILTER, 'toggle');
+    completedScopeKeys.add(KILTER);
+
+    await schedulerLifecycleOptions().prepareScopeDownloadContexts?.();
+
+    expect(getDownloadRequest(KILTER)).toBeUndefined();
+    expect(trackMock).toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+      expect.objectContaining({ requestId: request.requestId, state: 'completed', completionSource: 'cached' }),
+    );
+    expect(trackMock).not.toHaveBeenCalledWith(SHARED_EVENTS.OfflineBoardDownloadStarted, expect.anything());
+  });
+
+  it('does not let a delayed cached completion settle a replacement scope generation', async () => {
+    const previous = requestDownload(KILTER, 'toggle');
+    const completion = Promise.withResolvers<boolean>();
+    isScopeDownloadCompleteCore.mockReturnValueOnce(completion.promise);
+    const preparation = schedulerLifecycleOptions().prepareScopeDownloadContexts?.();
+    transitionDownload(previous, 'abandoned', { reason: 'disabled' });
+    const replacement = requestDownload(KILTER, 'toggle');
+
+    completion.resolve(true);
+    await preparation;
+
+    expect(getDownloadRequest(KILTER)).toEqual(replacement);
+  });
+
+  it('prepares a recovered legacy request before cycle authority is captured', async () => {
+    const completion = Promise.withResolvers<boolean>();
+    isScopeDownloadCompleteCore.mockReturnValueOnce(completion.promise);
+    const options = schedulerLifecycleOptions();
+    const preparation = options.prepareScopeDownloadContexts?.();
+    expect(options.getScopeDownloadContext?.(KILTER)).toBeUndefined();
+
+    completion.resolve(false);
+    await preparation;
+
+    expect(captureContext(options).requestId).toBe(getDownloadRequest(KILTER)?.requestId);
+    expect(getDownloadRequest(KILTER)).toMatchObject({ state: 'recovered', origin: 'recovered', requestedAt: null });
+    expect(trackMock).not.toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadLifecycle,
+      expect.objectContaining({ state: 'requested' }),
+    );
+  });
+});
+
+describe('download keep-awake bindings (issue #4310)', () => {
+  const KILTER = 'kilter:1:10';
+  const KILTER_SCOPE = { boardType: 'kilter', layoutId: 1, sizeId: 10 };
+  const downloadFrame: SyncProgress = {
+    phase: 'bootstrap',
+    currentTable: KILTER,
+    documentsProcessed: 0,
+    snapshot: { scopeKey: KILTER, stage: 'download', fraction: 0.5, wireBytes: 110_000_000, wireBytesDone: 55_000_000 },
+  };
+  const idleFrame: SyncProgress = { phase: 'idle', currentTable: null, documentsProcessed: 0 };
+
+  /** A person tapped Download for Kilter, and the root component is mounted. */
+  function startKilterDownload(): void {
+    setSetting('syncEnabledBoards', [KILTER]);
+    markUserStartedDownload(KILTER);
+    subscribeDownloadKeepAwake(() => {});
+  }
+
+  function schedulerOptions(): SchedulerOptions {
+    startSyncScheduler(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [KILTER],
+      async () => {},
+    );
+    return startSyncSchedulerCore.mock.calls[0][6] as SchedulerOptions;
+  }
+
+  it('feeds the scheduler’s progress frames to the keep-awake store, with no caller sink needed', () => {
+    startKilterDownload();
+    const options = schedulerOptions();
+
+    options.onProgress?.(downloadFrame);
+
+    expect(isDownloadKeepAwakeActive()).toBe(true);
+  });
+
+  it('feeds an ad-hoc download kick’s frames to it too', () => {
+    startKilterDownload();
+    triggerSync(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [KILTER],
+      async () => {},
+    );
+    const options = triggerSyncCore.mock.calls[0][5] as SchedulerOptions;
+
+    options.onProgress?.(downloadFrame);
+
+    expect(isDownloadKeepAwakeActive()).toBe(true);
+  });
+
+  it('never lets the keep-awake tracking fail a sync cycle', () => {
+    const onProgress = vi.fn();
+    startSyncScheduler(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [KILTER],
+      async () => {},
+      { onProgress },
+    );
+    const options = startSyncSchedulerCore.mock.calls[0][6] as SchedulerOptions;
+    // A frame the store cannot read stands in for any throw from inside it.
+    const unreadableFrame = null as unknown as SyncProgress;
+
+    expect(() => options.onProgress?.(unreadableFrame)).not.toThrow();
+    expect(onProgress).toHaveBeenCalledWith(unreadableFrame);
+  });
+
+  it('reports keepAwake on Completed, then lets the screen lock again', () => {
+    startKilterDownload();
+    const options = schedulerOptions();
+    options.onProgress?.(downloadFrame);
+
+    options.onScopeDownloadComplete?.({ scopeKey: KILTER, method: 'snapshot', durationMs: 20_000, phases: NO_PHASES });
+
+    expect(trackMock).toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadCompleted,
+      expect.objectContaining({ scopeKey: KILTER, keepAwake: true, suspendedMs: 0 }),
+    );
+    expect(isDownloadKeepAwakeActive()).toBe(false);
+    expect(getUserStartedDownloads()).toEqual([]);
+    expect(getDownloadActivity()?.status).toBe('done');
+  });
+
+  it('reports how long the JS thread was stopped during the download', () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-10-11T12:00:00.000Z'));
+      startKilterDownload();
+      const options = schedulerOptions();
+      options.onProgress?.(downloadFrame);
+      // The phone locked for eight minutes mid-transfer: no timer ran.
+      vi.setSystemTime(Date.now() + 480_000);
+
+      options.onScopeDownloadComplete?.({
+        scopeKey: KILTER,
+        method: 'snapshot',
+        durationMs: 500_000,
+        phases: NO_PHASES,
+      });
+
+      expect(trackMock).toHaveBeenCalledWith(
+        SHARED_EVENTS.OfflineBoardDownloadCompleted,
+        expect.objectContaining({ keepAwake: true, suspendedMs: 480_000 }),
+      );
+    } finally {
+      // The cycle never ended here, so its heartbeat is still ticking.
+      __resetDownloadKeepAwakeForTests();
+      vi.useRealTimers();
+    }
+  });
+
+  it('carries keepAwake on a failure that leaves the download pending', () => {
+    startKilterDownload();
+    const options = schedulerOptions();
+    options.onProgress?.(downloadFrame);
+
+    options.onSnapshotBootstrapError?.({
+      scopeKey: KILTER,
+      stage: 'download',
+      attempt: 0,
+      cause: null,
+      expected: true,
+      reason: 'aborted-background',
+      aborted: true,
+    });
+
+    expect(trackMock).toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineBoardDownloadFailed,
+      expect.objectContaining({ reason: 'aborted-background', keepAwake: true, suspendedMs: 0 }),
+    );
+    // Still a download the person is waiting on.
+    expect(getPendingUserStartedDownloads()).toEqual([KILTER]);
+  });
+
+  // React Native on Android stops JS timers when the activity pauses while JS
+  // keeps running, so a heartbeat gap there is not suspension. Absent, not 0:
+  // a zero would read as a measured clean run.
+  it.each(['android', 'web'])('sends suspendedMs on iOS only: %s gets keepAwake alone', (os) => {
+    platform.OS = os;
+    startKilterDownload();
+    const options = schedulerOptions();
+    options.onProgress?.(downloadFrame);
+
+    options.onSnapshotBootstrapError?.({
+      scopeKey: KILTER,
+      stage: 'download',
+      attempt: 1,
+      cause: new Error('The request timed out.'),
+      expected: true,
+      reason: 'network',
+      aborted: false,
+    });
+    options.onScopeDownloadComplete?.({ scopeKey: KILTER, method: 'snapshot', durationMs: 20_000, phases: NO_PHASES });
+
+    const downloadEvents = trackMock.mock.calls.filter(
+      ([eventName]) =>
+        eventName === SHARED_EVENTS.OfflineBoardDownloadFailed ||
+        eventName === SHARED_EVENTS.OfflineBoardDownloadCompleted,
+    );
+    expect(downloadEvents).toHaveLength(2);
+    for (const [, properties] of downloadEvents) {
+      expect((properties as Record<string, unknown>).keepAwake).toBe(true);
+      expect(Object.hasOwn(properties as Record<string, unknown>, 'suspendedMs')).toBe(false);
+    }
+  });
+
+  // No attempt ran, and a removal or toggle-off has already dropped the board's
+  // record by the time it reports, so a value here would read false for a
+  // download that did hold the screen.
+  it.each([
+    ['a removal', () => reportScopeDownloadAbandoned({ scopeKey: KILTER, scope: KILTER_SCOPE })],
+    ['a sign-out', () => reportScopeDownloadAbandonedOnSignOut({ scopeKey: KILTER })],
+    ['a toggle-off', () => reportScopeDownloadAbandonedOnDisable({ scopeKey: KILTER })],
+  ])('sends neither keep-awake prop on a download abandoned by %s', (_label, reportAbandoned) => {
+    startKilterDownload();
+    schedulerOptions().onProgress?.(downloadFrame);
+
+    reportAbandoned();
+
+    const [, properties] = trackMock.mock.calls.find(
+      ([eventName]) => eventName === SHARED_EVENTS.OfflineBoardDownloadFailed,
+    ) as [string, Record<string, unknown>];
+    expect(Object.hasOwn(properties, 'keepAwake')).toBe(false);
+    expect(Object.hasOwn(properties, 'suspendedMs')).toBe(false);
+  });
+
+  it('forgets a user-started download whose board is already complete when a cycle ends', async () => {
+    startKilterDownload();
+    completedScopeKeys.add(KILTER);
+    const options = schedulerOptions();
+
+    options.onProgress?.(idleFrame);
+    await vi.waitFor(() => expect(getPendingUserStartedDownloads()).toEqual([]));
+
+    expect(isScopeDownloadCompleteCore).toHaveBeenCalledWith(db, KILTER);
+    expect(getUserStartedDownloads()).toEqual([]);
+    expect(getDownloadActivity()?.status).toBe('done');
+  });
+
+  it('ignores progress and completion callbacks from the previous account generation', () => {
+    startKilterDownload();
+    const options = schedulerOptions();
+    __resetSyncStatusForTests();
+    markUserStartedDownload(KILTER);
+    options.onProgress?.(downloadFrame);
+    options.onScopeDownloadComplete?.({ scopeKey: KILTER, method: 'snapshot', durationMs: 10, phases: NO_PHASES });
+    expect(getDownloadActivity()?.status).toBe('waiting');
+    expect(getPendingUserStartedDownloads()).toEqual([KILTER]);
+    expect(isDownloadKeepAwakeActive()).toBe(false);
+  });
+
+  it('ignores a cached completion read that resolves after the account resets', async () => {
+    startKilterDownload();
+    const options = schedulerOptions();
+    await Promise.resolve();
+    isScopeDownloadCompleteCore.mockClear();
+    const completion = Promise.withResolvers<boolean>();
+    isScopeDownloadCompleteCore.mockReturnValueOnce(completion.promise);
+    options.onProgress?.(idleFrame);
+    expect(isScopeDownloadCompleteCore).toHaveBeenCalledOnce();
+    __resetSyncStatusForTests();
+    markUserStartedDownload(KILTER);
+    completion.resolve(true);
+    await completion.promise;
+    expect(getDownloadActivity()?.status).toBe('waiting');
+    expect(getPendingUserStartedDownloads()).toEqual([KILTER]);
+  });
+
+  it('keeps a user-started download that is still incomplete when a cycle ends', async () => {
+    startKilterDownload();
+    const options = schedulerOptions();
+    await Promise.resolve();
+    isScopeDownloadCompleteCore.mockClear();
+
+    options.onProgress?.(idleFrame);
+    await vi.waitFor(() => expect(isScopeDownloadCompleteCore).toHaveBeenCalledTimes(1));
+
+    expect(getPendingUserStartedDownloads()).toEqual([KILTER]);
+  });
+
+  it('reads no database at the end of a cycle with nothing pending', async () => {
+    const options = schedulerOptions();
+    await Promise.resolve();
+    isScopeDownloadCompleteCore.mockClear();
+    options.onProgress?.(idleFrame);
+
+    expect(isScopeDownloadCompleteCore).not.toHaveBeenCalled();
+  });
+
+  it('keeps a pending download when the completion read fails', async () => {
+    startKilterDownload();
+    const options = schedulerOptions();
+    await Promise.resolve();
+    isScopeDownloadCompleteCore.mockClear();
+    isScopeDownloadCompleteCore.mockRejectedValueOnce(new Error('database is locked'));
+
+    options.onProgress?.(idleFrame);
+    await vi.waitFor(() => expect(isScopeDownloadCompleteCore).toHaveBeenCalledTimes(1));
+
+    expect(getPendingUserStartedDownloads()).toEqual([KILTER]);
   });
 });
 
@@ -1359,7 +2043,11 @@ describe('triggerSync / pullSync bindings', () => {
     );
 
     const options = triggerSyncCore.mock.calls[0][5] as SchedulerOptions;
-    expect(options.onProgress).toBe(onProgress);
+    // Wrapped, not handed over: the keep-awake store listens in (issue #4310).
+    const frame: SyncProgress = { phase: 'deletions', currentTable: null, documentsProcessed: 3 };
+    options.onProgress?.(frame);
+    expect(onProgress).toHaveBeenCalledTimes(1);
+    expect(onProgress).toHaveBeenCalledWith(frame);
     expect(options.onSchemaDrift).toBeTypeOf('function');
     expect(options.onCycleError).toBeTypeOf('function');
   });
@@ -1386,10 +2074,40 @@ describe('triggerSync / pullSync bindings', () => {
       status: null,
       errorKind: 'exception',
       offlineEngineEnabled: false,
+      jsRestartCount: null,
     });
     expect(reportHandledError).toHaveBeenCalledWith(cycleError, {
       tags: { source: 'offline-sync', kind: 'cycle', phase: 'deletions' },
       extra: { currentTable: null, documentsProcessed: 500 },
+    });
+  });
+
+  it('names the background write that lost the lock on both reports (#5851)', () => {
+    setSyncProgress({ phase: 'deletions', currentTable: null, documentsProcessed: 0 });
+    triggerSync(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [],
+      async () => {},
+    );
+
+    const options = triggerSyncCore.mock.calls[0][5] as SchedulerOptions;
+    const lockError = Object.assign(
+      new Error(
+        "Call to function 'NativeStatement.runAsync' has been rejected.\n→ Caused by: Error code 5: database is locked",
+      ),
+      { sqliteWriteSite: 'deletions-coverage' },
+    );
+    options.onCycleError?.(lockError);
+
+    expect(trackMock).toHaveBeenCalledWith(
+      SHARED_EVENTS.OfflineSyncCycleFailed,
+      expect.objectContaining({ phase: 'deletions', sqliteWriteSite: 'deletions-coverage' }),
+    );
+    expect(reportHandledError).toHaveBeenCalledWith(lockError, {
+      tags: { source: 'offline-sync', kind: 'cycle', phase: 'deletions', sqliteWriteSite: 'deletions-coverage' },
+      extra: { currentTable: null, documentsProcessed: 0 },
     });
   });
 
@@ -1559,5 +2277,132 @@ describe('triggerSync / pullSync bindings', () => {
     options.onSchemaDrift?.(drift);
     expect(customDrift).toHaveBeenCalledWith(drift);
     expect(reportHandledError).not.toHaveBeenCalled();
+  });
+});
+
+// #6824. Every mobile drain asks the token who is signed in, and every cycle
+// pulls only into a database stamped for that account.
+describe('outbox owner binding', () => {
+  beforeEach(() => {
+    __resetOutboxOwnerReportForTests();
+  });
+
+  it('gives every drain the account in the stored token', async () => {
+    await drainMutationQueue(db, queryClient, graphqlFetch);
+    const options = drainMutationQueueCore.mock.calls[0][3] as DrainOptions;
+    await expect(options.getSignedInUserId()).resolves.toBe('viewer-6653');
+  });
+
+  it('reads the account the owner claim needs from the token itself', async () => {
+    await expect(readSignedInAccount()).resolves.toEqual({ status: 'signed-in', userId: 'viewer-6653' });
+    // `{"iat":1}`: a well-formed token that names nobody.
+    authToken.token = 'e30.eyJpYXQiOjF9.signature';
+    await expect(readSignedInAccount()).resolves.toEqual({ status: 'no-user-id' });
+    // No token yet is not "names nobody": the claim asks again later.
+    authToken.token = null;
+    await expect(readSignedInAccount()).resolves.toEqual({ status: 'unsettled' });
+    authToken.token = 'e30.eyJzdWIiOiJ2aWV3ZXItNjY1MyJ9.signature';
+    authToken.generationCurrent = false;
+    await expect(readSignedInAccount()).resolves.toEqual({ status: 'unsettled' });
+  });
+
+  it("gives the workout write the token's account, or null, and never rejects (#6903)", async () => {
+    await expect(readSignedInUserIdOrNull()).resolves.toBe('viewer-6653');
+    authToken.token = null;
+    await expect(readSignedInUserIdOrNull()).resolves.toBeNull();
+    authToken.token = 'e30.eyJzdWIiOiJ2aWV3ZXItNjY1MyJ9.signature';
+    authToken.readFails = true;
+    await expect(readSignedInUserIdOrNull()).resolves.toBeNull();
+    authToken.readFails = false;
+  });
+
+  it('answers no account when credentials change while the token is read', async () => {
+    await drainMutationQueue(db, queryClient, graphqlFetch);
+    authToken.generationCurrent = false;
+    const options = drainMutationQueueCore.mock.calls[0][3] as DrainOptions;
+    await expect(options.getSignedInUserId()).resolves.toBeUndefined();
+  });
+
+  it('reports a drain held by another account once per sign-in, with no ids', async () => {
+    const callerRefusal = vi.fn();
+    await drainMutationQueue(db, queryClient, graphqlFetch, { onOutboxOwnerRefused: callerRefusal });
+    const options = drainMutationQueueCore.mock.calls[0][3] as DrainOptions;
+
+    options.onOutboxOwnerRefused?.('unstamped');
+    expect(reportHandledError).not.toHaveBeenCalled();
+    options.onOutboxOwnerRefused?.('other-account');
+    options.onOutboxOwnerRefused?.('other-account');
+
+    expect(callerRefusal).toHaveBeenCalledTimes(3);
+    expect(reportHandledError).toHaveBeenCalledOnce();
+    expect(reportHandledError.mock.calls[0][1]).toEqual({
+      level: 'warning',
+      tags: { source: 'offline-sync', kind: 'outbox-owner-hold', reason: 'other-account' },
+    });
+    expect(addErrorBreadcrumb).toHaveBeenCalledTimes(3);
+
+    // A sign-out and the next sign-in move the credential generation: that
+    // account's first held drain is reported too.
+    authToken.generation = 2;
+    options.onOutboxOwnerRefused?.('other-account');
+    options.onOutboxOwnerRefused?.('other-account');
+    expect(reportHandledError).toHaveBeenCalledTimes(2);
+  });
+
+  it('asks every pull path to pull only into a database stamped for the viewer', async () => {
+    startSyncScheduler(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [],
+      async () => {},
+    );
+    expect((startSyncSchedulerCore.mock.calls[0][6] as SchedulerOptions).requireOwnedDatabase).toBe(true);
+    triggerSync(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [],
+      async () => {},
+    );
+    expect((triggerSyncCore.mock.calls[0][5] as SchedulerOptions).requireOwnedDatabase).toBe(true);
+    await pullSync(db, queryClient, graphqlFetch, { enabledBoards: [] });
+    expect((pullSyncCore.mock.calls[0][3] as SyncOptions).requireOwnedDatabase).toBe(true);
+  });
+});
+
+describe('snapshot viewer binding', () => {
+  it('resolves the authenticated viewer at cycle time for scheduler and explicit downloads', async () => {
+    startSyncScheduler(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [],
+      async () => {},
+    );
+    const schedulerOptions = startSyncSchedulerCore.mock.calls[0][6] as SchedulerOptions;
+    await expect(schedulerOptions.getViewerUserId?.()).resolves.toBe('viewer-6653');
+    triggerSync(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [],
+      async () => {},
+    );
+    const triggerOptions = triggerSyncCore.mock.calls[0][5] as SchedulerOptions;
+    await expect(triggerOptions.getViewerUserId?.()).resolves.toBe('viewer-6653');
+  });
+
+  it('declines snapshot coverage if credentials change while the keychain is read', async () => {
+    startSyncScheduler(
+      db,
+      queryClient,
+      graphqlFetch,
+      () => [],
+      async () => {},
+    );
+    authToken.generationCurrent = false;
+    const options = startSyncSchedulerCore.mock.calls[0][6] as SchedulerOptions;
+    await expect(options.getViewerUserId?.()).resolves.toBeUndefined();
   });
 });

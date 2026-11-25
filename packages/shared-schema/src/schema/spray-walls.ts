@@ -19,11 +19,33 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
   }
 
   """
+  What the climber did with a detector suggestion before saving it as an AUTO
+  hold. Ranked ACCEPTED < CONFIRMED < EDITED; a hold never moves down.
+  """
+  enum SprayHoldAutoReview {
+    "Kept as found, through accept-defaults or keep-maybes."
+    ACCEPTED
+    "A maybe the climber switched on by itself."
+    CONFIRMED
+    "Its shape changed after the detector drew it. The server also sets this whenever an AUTO hold's geometry moves."
+    EDITED
+  }
+
+  """
+  Retired. A published spray climb follows the rule every board follows: only
+  its setter edits it, within 24 hours of first publish. Every wall reads SETTER.
+  """
+  enum SprayClimbEditPolicy {
+    SETTER
+    COLLABORATORS @deprecated(reason: "Retired. Only a climb's setter edits it, within 24 hours of first publish.")
+  }
+
+  """
   A wall photo, behind short-lived presigned URLs.
 
   Spray-wall photos live in the PRIVATE bucket, never the public \`media\` one:
   the photograph is of somebody's home, and \`media\` is world-readable under
-  guessable keys (\`docs/user-media-storage.md\`). So there is no stable URL to
+  guessable keys (\`docs/operations/user-media-storage.md\`). So there is no stable URL to
   store on a row — every read mints a fresh signature, and \`expiresAt\` is when
   the one in hand stops working.
   """
@@ -62,6 +84,12 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     source: SprayHoldSource!
     "Detector confidence 0-1 for AUTO holds; null when a human drew it."
     confidence: Float
+    "What the climber did with the suggestion. Null for MANUAL holds and for AUTO holds saved without provenance."
+    autoReview: SprayHoldAutoReview
+    "The detection run the suggestion came from. Null for MANUAL holds."
+    originDetectionId: ID
+    "Index of the suggestion in that run's result.candidates."
+    originCandidateIndex: Int
   }
 
   "One photograph of the wall, with the geometry that maps it onto the canonical frame."
@@ -107,6 +135,8 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
   \`user_boards\` row \`board\` returns — nothing about a wall is stored twice.
   """
   type SprayWall {
+    # Public identity is the owning UserBoard.uuid, also returned as board.uuid.
+    # The separate spray_walls.id is an internal numeric key, never a capability.
     uuid: ID!
     board: UserBoard!
     "The wall's board_layouts id. Also its board_product_sizes id: a wall has exactly one size, itself."
@@ -144,6 +174,15 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     them: they can edit the gym's page and not a wall's holds.
     """
     viewerCanEdit: Boolean!
+    "Always SETTER: only a climb's setter edits it, within 24 hours of first publish."
+    climbEditPolicy: SprayClimbEditPolicy!
+      @deprecated(reason: "Retired. Only a climb's setter edits it, within 24 hours of first publish.")
+    """
+    Always false. Editing someone else's published climb on a wall was retired;
+    the setter's own edit rights come from the climb, not the wall.
+    """
+    viewerCanEditClimbs: Boolean!
+      @deprecated(reason: "Retired. Only a climb's setter edits it, within 24 hours of first publish.")
     """
     When an admin hid this wall, ISO 8601, or null for the overwhelmingly common
     case.
@@ -154,13 +193,132 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     word would look like data loss.
     """
     hiddenAt: String
+    """
+    The wall's own stored default look, or null when its creator never set one
+    (including every wall created before this field existed). A
+    \`{ mode: 'classic' | 'aura', boardsesh: {...} }\` blob, opaque to the schema
+    and validated server-side — kept as JSON rather than a parallel GraphQL type
+    because the underlying knob set still changes independently. A viewer's own
+    EXPLICIT render-mode choice always overrides this; it only supplies the look
+    for a viewer who has never chosen one.
+
+    May also carry \`background: 'photo' | 'wall-crop' | 'hold-cutouts'\` — what
+    the wall is drawn on. Missing means 'photo'. The generated backgrounds are
+    read through \`sprayWallArt\`; a client falls back to the photo whenever that
+    art is not READY.
+    """
+    renderSettings: JSON
+    """
+    When this wall was archived, ISO 8601, or null for a live wall.
+
+    A wall is archived when a reset clone of it (\`resetSprayWall\`) reaches its
+    first publish. An archived wall is read-only: its climbs, ticks, playlists
+    and share links keep working, it leaves every board picker and listing, and
+    nobody can set a new climb, edit a climb or change its holds on it.
+    """
+    archivedAt: String
+    """
+    The wall this one was cloned from by \`resetSprayWall\`. Only for a viewer who
+    can see that wall without its uuid: its owner, a member of its gym, or anyone
+    when it is public.
+    """
+    resetOfWallUuid: ID
+    """
+    The published wall that replaced this one through \`resetSprayWall\`, when the
+    viewer may see it: its owner, a member of its gym, anyone when it is public,
+    or anyone holding this wall's share link when this wall is unlisted and not
+    public and the replacement is unlisted too. Null while the replacement is
+    unfinished.
+    """
+    replacedByWallUuid: ID
+    """
+    The visibility waiting for this wall's first publish, or null.
+
+    Only for the wall's OWNER, only while the wall has never been published, and
+    only when something other than private is waiting: createSprayWall and
+    updateSprayWall hold a requested public or unlisted wall private until the
+    first publish applies it. A reset clone's pair is the old wall's audience,
+    and its publish may narrow it to what the old wall has by then.
+    """
+    pendingVisibility: SprayWallVisibility
+    """
+    Whether this wall's photo and marked holds may help train hold finding. The
+    server stores a yes only when a client sends trainingConsent: true. The
+    app's add-a-wall switch is on when the wizard opens, and the app sends
+    whatever the owner leaves it at. A wall that existed before the switch, or
+    was created by an app without it, is off until its owner turns it on. A
+    Boardsesh admin checks a version before it is used. Only ever non-null for
+    the wall's OWNER.
+    """
+    trainingConsent: Boolean
+  }
+
+  "A wall's visibility pair, as the board row carries it."
+  type SprayWallVisibility {
+    isPublic: Boolean!
+    isUnlisted: Boolean!
+  }
+
+  "Where a version's generated wall looks are."
+  enum SprayWallArtStatus {
+    "Never asked for, or made by an older recipe."
+    NONE
+    "A job is queued or running."
+    PENDING
+    "Both images are ready."
+    READY
+    "The last job failed. Choosing a generated background again re-queues it."
+    FAILED
+    "The photo failed the quality gate, so nothing will be rendered for it."
+    REFUSED
+  }
+
+  enum SprayWallPhotoVerdict {
+    "Front-on enough to flatten cleanly."
+    GOOD
+    "Usable, but the far side will look stretched; suggest a front-on retake."
+    SOFT
+    "Too angled, too small, or no corner pins: the generated looks are not offered."
+    FAIL
+  }
+
+  "How straight-on a version's photo is. Same numbers on the server and in the app."
+  type SprayWallPhotoQuality {
+    "sqrt(max / min) of the area scale across the frame. 1 is a perfectly front-on photo. Null when unmeasurable."
+    stretch: Float
+    verdict: SprayWallPhotoVerdict!
+    "ok, no-pins, keystone, small-frame or singular."
+    reason: String!
+    "The canonical frame's short edge, in pixels."
+    frameShortEdge: Int!
+  }
+
+  """
+  One version's generated wall looks, drawn in the canonical frame (the frame
+  hold coordinates live in), scaled to \`width\` x \`height\`. Draw holds over it
+  with no homography: multiply canonical coordinates by width / boardWidth.
+
+  Read in its own query (\`sprayWallArt\`), never in a shared fragment.
+  """
+  type SprayWallArt {
+    versionNumber: Int!
+    "The rendering recipe the server runs. Art made by another recipe reads as NONE."
+    recipe: Int!
+    status: SprayWallArtStatus!
+    width: Int
+    height: Int
+    quality: SprayWallPhotoQuality!
+    "Wall only: the photo flattened into the canonical frame. JPEG. Null unless READY."
+    crop: SprayWallPhoto
+    "Holds only: the same pixels, transparent everywhere but the holds. WebP with alpha; draw the field colour behind it. Null unless READY."
+    cutout: SprayWallPhoto
   }
 
   """
   Everything a renderer needs for one wall at one version: the photo, the
   geometry that maps it, and the holds alive at that version.
 
-  No image is ever warped — the client maps holds through the INVERSE of
+  The stored photo is never warped — the client maps holds through the INVERSE of
   \`homography\` at draw time.
   """
   type SprayWallRenderData {
@@ -171,6 +329,13 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     "The canonical frame's height."
     boardHeight: Int!
     photo: SprayWallPhoto!
+    """
+    Presigned GET for the photo at up to 5712 px on its long side, or null when
+    this version has no copy larger than \`photo\` (#5911). Same pixels and frame
+    as \`photo\`, just more of them: the hold editor swaps it in once it zooms past
+    the base photo's resolution. Expires with \`photo.expiresAt\`.
+    """
+    photoFullUrl: String
     homography: [Float!]!
     holds: [SprayWallHold!]!
   }
@@ -190,13 +355,44 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     latitude: Float
     longitude: Float
     hideLocation: Boolean
+    "Accepted and ignored. Only a climb's setter edits it."
+    climbEditPolicy: SprayClimbEditPolicy @deprecated(reason: "Retired. Accepted and ignored.")
+    """
+    Let this wall's photo and marked holds help train hold finding. The server
+    stores a yes only for true; omitted and false both store a no. The app's
+    add-a-wall switch is on when the wizard opens, and the app sends whatever
+    the owner leaves it at.
+    """
+    trainingConsent: Boolean
+  }
+
+  "How many climbs on a wall use one hold. See \`sprayWallHoldUsage\`."
+  type SprayWallHoldUsage {
+    holdId: Int!
+    "Published climbs that use the hold. Removing it gives each of them a lost hold."
+    publishedClimbCount: Int!
+    "Draft climbs that use the hold."
+    draftClimbCount: Int!
+  }
+
+  "Distinct climbs on a wall that use any of the requested holds."
+  type SprayWallHoldUsageSummary {
+    publishedClimbCount: Int!
+    draftClimbCount: Int!
+  }
+
+  input ResetSprayWallInput {
+    "The published, live wall to replace."
+    wallUuid: ID!
   }
 
   input CreateSprayWallVersionInput {
     wallUuid: ID!
-    "photoId from POST /api/spray-wall-photos."
-    photoId: ID!
-    "The wall's four corners in this photo's pixels, TL/TR/BR/BL, as [[x, y], ...]. Omit to use the photo frame."
+    "photoId from POST /api/spray-wall-photos. Supply exactly one of photoId and sourceVersionId."
+    photoId: ID
+    "Reuse this wall's current published photo and its saved geometry for hold editing. Supply exactly one of photoId and sourceVersionId."
+    sourceVersionId: ID
+    "The wall's four corners in an uploaded photo's pixels, TL/TR/BR/BL, as [[x, y], ...]. When sourceVersionId is supplied, omit this field entirely; explicit null is rejected."
     anchors: JSON
     notes: String
   }
@@ -219,9 +415,26 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     source: SprayHoldSource
     confidence: Float
     movedFromHoldId: Int
+    """
+    What the climber did with the suggestion. AUTO holds only; ignored on MANUAL.
+    The server keeps the highest of this, the stored value and EDITED when the
+    geometry changed (against the stored hold, or the movedFromHoldId one), so
+    an omitted value never clears one. An explicit null does clear it.
+    """
+    autoReview: SprayHoldAutoReview
+    """
+    The detection run the suggestion came from, with originCandidateIndex. AUTO
+    holds only. A run of another wall, an unfinished run or an index out of range
+    is stored as null rather than failing the save. Omit both to keep what the
+    hold already records; send originDetectionId: null to clear it.
+    """
+    originDetectionId: ID
+    originCandidateIndex: Int
   }
 
   input UpsertSprayWallHoldsInput {
+    "Require a writer that preserves climb links when existing holds are refined. Omit for older clients; when supplied, must be true."
+    preserveClimbLinks: Boolean
     wallUuid: ID!
     "The DRAFT version being edited. Published versions are immutable."
     versionId: ID!
@@ -229,12 +442,16 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
   }
 
   input RemoveSprayWallHoldsInput {
+    "Require a writer that preserves climb links when existing holds are refined. Omit for older clients; when supplied, must be true."
+    preserveClimbLinks: Boolean
     wallUuid: ID!
     versionId: ID!
     holdIds: [Int!]!
   }
 
   input PublishSprayWallVersionInput {
+    "Require a writer that preserves climb links when existing holds are refined. Omit for older clients; when supplied, must be true."
+    preserveClimbLinks: Boolean
     versionId: ID!
   }
 
@@ -245,12 +462,28 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     """
     Make the wall world-readable. This is the switch that turns a private wall into
     a shared one, so it is also what starts publishing its climbs to feeds.
+
+    Owner only, like isUnlisted. On a wall that has never been published (and is
+    not a reset clone) the choice is held until the first publish, which applies
+    it: the wall stays private until there is something to see, and
+    SprayWall.pendingVisibility reports what is waiting. A flag left out keeps
+    the half already waiting.
     """
     isPublic: Boolean
-    "Reachable by uuid — the share link — and listed nowhere."
+    "Reachable by uuid — the share link — and listed nowhere. Held until the first publish, like isPublic."
     isUnlisted: Boolean
-    "Attach the wall to a gym the caller may link boards to, or pass null to detach."
+    """
+    Attach the wall to a gym the caller may link boards to, or pass null to detach.
+    A nearby public gym is checked against the coordinates this same call sets,
+    when it sets them.
+    """
     gymUuid: ID
+    locationName: String
+    "Pass together with longitude: both, or neither. Null clears the point."
+    latitude: Float
+    longitude: Float
+    "Owner only. Hides the wall's location from everyone else."
+    hideLocation: Boolean
     """
     Correct the wall's angle.
 
@@ -259,6 +492,83 @@ export const sprayWallsTypeDefs = /* GraphQL */ `
     rather than cascaded.
     """
     angle: Int
+    "Accepted and ignored. Only a climb's setter edits it."
+    climbEditPolicy: SprayClimbEditPolicy @deprecated(reason: "Retired. Accepted and ignored.")
+    """
+    Let this wall's photo and marked holds help train hold finding. Owner only,
+    like visibility. false switches it off for the whole physical wall: this
+    wall, every wall it was reset from and every reset clone made from any of
+    them. They leave the next training export, and stored exports that held one
+    of them are retired within 24 hours. true switches it on for this wall only.
+    """
+    trainingConsent: Boolean
+  }
+
+  """
+  The LED setup of one spray wall: which controller drives it, whether it is on,
+  and the hole, LED and cable layout that maps holds to physical LEDs.
+
+  Lives on the board, so every climber at the wall can light it from their own
+  phone. The phone talks to the controller directly over the local network; the
+  server only stores the setup and never contacts the address.
+  """
+  type SprayWallLedSetup {
+    boardUuid: ID!
+    "The driver for this controller. \`wled\` (local HTTP) or \`wled-ble\` (stable Bluetooth controller ID)."
+    controllerType: String!
+    "A local HTTP base address or wled-ble:wled-<hardware ID>; empty until selected."
+    controllerUrl: String!
+    enabled: Boolean!
+    "WLED master brightness, 1–255, the same on every phone that lights the wall."
+    brightness: Int!
+    "Minutes after the wall was last lit before the controller turns it off; 0 never does."
+    autoOffMinutes: Int!
+    "A saved T-nut layout. Null until the setup screen has saved one."
+    layout: JSON
+    "When this setup last changed, ISO 8601."
+    updatedAt: String!
+  }
+
+  """
+  A wall's LED setup as this viewer may use it. Null at the query, not here, when
+  the viewer cannot read the wall: the same answer \`sprayWall(uuid)\` gives.
+  """
+  type SprayWallLedSetupView {
+    "Whether this viewer may save changes: the wall's owner, on a wall still in use."
+    viewerCanEdit: Boolean!
+    "Null when nobody has saved a setup for this wall yet."
+    setup: SprayWallLedSetup
+  }
+
+  """
+  Save part of a wall's LED setup. A field left out (or null) keeps its stored
+  value, so the settings and the layout save from separate code paths without
+  overwriting each other.
+  """
+  input SaveSprayWallLedSetupInput {
+    boardUuid: ID!
+    controllerType: String
+    "Local HTTP address or stable WLED Bluetooth target matching controllerType."
+    controllerUrl: String
+    enabled: Boolean
+    "1–255."
+    brightness: Int
+    "0–255 minutes; 0 turns auto-off off."
+    autoOffMinutes: Int
+    layout: JSON
+  }
+
+  input SetSprayWallRenderSettingsInput {
+    uuid: ID!
+    """
+    Required: always send the key. A { mode, boardsesh } blob sets the wall's
+    stored default; an explicit null clears it. Omitting the key is rejected
+    rather than read as "leave it alone" — this mutation only ever sets or clears.
+
+    Declared nullable (not JSON!) because a non-null scalar could not carry the
+    null that clears it.
+    """
+    renderSettings: JSON
   }
 `;
 
@@ -330,9 +640,8 @@ export const sprayWallResetTypeDefs = /* GraphQL */ `
   }
 
   """
-  What a reset would do, computed and thrown away. \`proposeSprayWallReset\`
-  writes nothing at all — the owner reviews this and \`commitSprayWallVersion\`
-  is what lands it.
+  What an in-place reset would have done. Retired with \`proposeSprayWallReset\`,
+  which now always refuses; kept so older apps' documents still validate.
   """
   type SprayWallResetProposal {
     "The draft version number the proposal was computed against."
@@ -389,18 +698,23 @@ export const sprayWallResetTypeDefs = /* GraphQL */ `
   }
 
   """
-  The reviewed outcome of a reset. Re-validated against the wall's current state
-  inside the commit transaction — a proposal computed ten minutes ago against a
-  generation that has since been published is rejected, not applied.
+  Publish a wall's FIRST version. The in-place reset this input was built for is
+  retired: a draft with a new photo on a published wall is refused with
+  SPRAY_WALL_RESET_RETIRED. The decision lists are still required by the shape,
+  so older apps' documents validate, and are ignored.
   """
   input CommitSprayWallVersionInput {
     wallUuid: ID!
-    "The DRAFT version this reset lands as. It must carry anchors (see ProposeSprayWallResetInput)."
+    "The DRAFT version to publish."
     versionId: ID!
+    "Ignored. Retired with the in-place reset."
     kept: [SprayWallKeptDecisionInput!]!
-    "Hold ids that came off the wall."
+    "Ignored. Retired with the in-place reset."
     removed: [Int!]!
+    "Ignored. Retired with the in-place reset."
     added: [SprayWallAddedDecisionInput!]!
+    "Ignored. Partial and full resets were retired with the in-place reset."
+    fullReset: Boolean @deprecated(reason: "Retired with the in-place reset. Ignored.")
   }
 
   "What a committed reset changed."
@@ -420,17 +734,13 @@ export const sprayWallResetTypeDefs = /* GraphQL */ `
     removedCount: Int!
     "Holds this commit put on the wall."
     addedCount: Int!
-    "Climbs whose \`missingHoldCount\` moved as a result."
+    "Climbs whose \`missingHoldCount\` moved as a result. 0 on a first publish."
     climbsChanged: Int!
   }
 
   """
-  A remix starting point: the parent climb with every hold it has since lost
-  stripped out of its frames.
-
-  Nothing is written by asking for one. Pass \`parentUuid\` back as
-  \`SaveClimbInput.remixOfClimbUuid\` and the lineage row is written with the
-  child.
+  A remix starting point. Retired with \`remixClimb\`, which now always returns
+  null; kept so older apps' documents still validate.
   """
   type SprayRemixSeed {
     "The climb being remixed."
@@ -492,6 +802,7 @@ export const sprayWallModerationTypeDefs = /* GraphQL */ `
   }
 
   input ReportSprayWallInput {
+    releaseContext: ReleaseContextInput
     wallUuid: ID!
     reason: SprayWallReportReason!
   }
@@ -511,8 +822,12 @@ export const sprayWallModerationTypeDefs = /* GraphQL */ `
 
   "One pending report, for the admin queue."
   type SprayWallReport {
+    releaseContext: ReleaseContext
     id: ID!
     wallUuid: ID!
+    wallName: String!
+    "Admin-only preview, including private and hidden walls; null when unavailable."
+    photo: SprayWallPhoto
     layoutId: Int!
     reason: SprayWallReportReason!
     "Whether the wall is hidden right now."

@@ -1,16 +1,52 @@
-import { eq, ne, and, or, desc, inArray, isNull, sql, count, ilike, gte, lte } from 'drizzle-orm';
+import {
+  eq,
+  ne,
+  and,
+  or,
+  asc,
+  desc,
+  inArray,
+  isNull,
+  isNotNull,
+  sql,
+  count,
+  ilike,
+  gte,
+  lt,
+  lte,
+  type SQL,
+} from 'drizzle-orm';
 import {
   type ConnectionContext,
   type BoardName,
+  type LoggedSetter,
   type RenderBoardConfig,
+  type UserLoggedSettersInput,
   SUPPORTED_BOARDS,
   matchClimbsToCaption,
   extractQuotedClimbNames,
 } from '@boardsesh/shared-schema';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
-import { sprayClimbVisibilityCondition, sprayReferenceVisibilityCondition } from '@boardsesh/db/queries';
-import { toConfidenceTier, notAuroraTwinDuplicate, withSerialPlan } from '@boardsesh/db/queries';
+import {
+  sprayClimbVisibilityCondition,
+  sprayReferenceClimbExistsCondition,
+  sprayReferenceVisibilityCondition,
+} from '@boardsesh/db/queries';
+import { sprayTickClimbExistsCondition } from '../shared/spray-tick-visibility';
+import { tickPrivacyCondition, betaPrivacyCondition } from '../shared/activity-privacy';
+import { redactBoardIdentity } from '../../../services/board-session-privacy';
+import {
+  boardIdentityVisibleCondition,
+  canViewUserActivity,
+  climbDraftVisibilityCondition,
+} from '../../../services/privacy';
+import {
+  toConfidenceTier,
+  notAuroraTwinDuplicate,
+  withSerialPlan,
+  realBenchmarkCondition,
+} from '@boardsesh/db/queries';
 import { requireAuthenticated, applyRateLimit, validateInput, resolveClimbNoMatch } from '../shared/helpers';
 import { fetchOwnerBoards, toTickBoardCandidate } from '../shared/render-board';
 import { resolveRenderBoard } from '@boardsesh/board-config';
@@ -23,6 +59,9 @@ import {
   boardseshDifficultyExpr,
   boardseshConfidenceExpr,
   boardseshGradeTickJoin,
+  boardClimbRatingsJoinCondition,
+  effectiveQualityExpr,
+  effectiveQualityAtLeastCondition,
 } from '../shared/sql-expressions';
 
 // The `board_climb_grades` join shape lives in ONE place (boardseshGradeTickJoin).
@@ -33,65 +72,56 @@ const BOARDSESH_GRADE_TICK_JOIN = boardseshGradeTickJoin({
   aliases: 'board_climb_aliases',
 });
 import type { z } from 'zod';
-import { GetTicksInputSchema, BoardNameSchema, AscentFeedInputSchema } from '../../../validation/schemas';
+import {
+  GetTicksInputSchema,
+  BoardNameSchema,
+  AscentFeedInputSchema,
+  UserLoggedSettersInputSchema,
+  isCalendarDayBound,
+} from '../../../validation/schemas';
+import { escapeLikePattern } from '../../../utils/like-pattern';
 import { climbNameLikePattern } from '@boardsesh/climb-filters';
 import { extractInstagramHandle } from '../beta-videos/queries';
 import { selectedFieldNames, isFieldSelected } from '../shared/selected-fields';
+import { logSlowRead } from '../shared/slow-read-log';
 import type { GraphQLResolveInfo } from 'graphql';
 
 // Benchmark resolution shared by the flat and grouped ascent feeds: a climb
 // counts as benchmark when the stats row says so or the tick itself was
-// imported as one.
+// imported as one. The stats side goes through realBenchmarkCondition, so a NaN
+// benchmark_difficulty (tens of thousands of Kilter rows) is not a benchmark
+// here either (#6232).
 const resolvedBenchmarkExpr = sql<boolean>`CASE
-  WHEN COALESCE(${dbSchema.boardClimbStats.benchmarkDifficulty}, 0) > 0 OR ${dbSchema.boardseshTicks.isBenchmark} = true THEN true
+  WHEN ${realBenchmarkCondition(dbSchema.boardClimbStats.benchmarkDifficulty)} OR ${dbSchema.boardseshTicks.isBenchmark} = true THEN true
   ELSE false
 END`;
 
 // Filter on the effective difficulty (user override → consensus fallback) so a
 // grade-range filter doesn't silently hide ungraded ascents whose consensus is
-// in range. See docs/ascents-and-attempts.md.
+// in range. See docs/data/ascents-and-attempts.md.
 const effectiveDifficultyExpr = sql<number>`COALESCE(${dbSchema.boardseshTicks.difficulty}, ${consensusDifficultyExpr})`;
 
-// A tick pulled from Kilter carries no per-tick quality, but the climber's own
-// star rating for that (climb, angle) may already live in board_climb_ratings
-// (kilter-sync writes it there, keyed by board_type/climb_uuid/angle/user_id).
-// Join on the tick's OWN user + raw climb_uuid so a public viewer sees the
-// tick owner's synced rating, and expose it as `effectiveQuality`
-// (COALESCE(quality, rating)) — the same raw-vs-effective split as
-// `difficulty`/`effectiveDifficulty`, so the per-tick `quality` stays the raw
-// user value for edit/optimistic flows. Ratings are already 1–5 native (DB
-// check constraint), so there's nothing to rescale. The unique index
-// `board_climb_ratings_user_climb_angle_idx` on exactly
-// (board_type, climb_uuid, angle, user_id) — declared in
-// packages/db/src/schema/boards/unified.ts — makes this a 1:1 left join that
-// never multiplies rows and is fully index-backed.
-//
-// Detached ratings are excluded. When Kilter sends a REMOVE for a rating,
-// kilter-sync soft-detaches the row (kilter_id NULL + kilter_detached_at
-// stamped) instead of deleting it, so the climber's own edits survive a
-// PowerSync snapshot re-delivery. But a rating the climber deleted upstream
-// must stop feeding effectiveQuality: unlike a tick, every field on this row
-// comes from the Kilter payload, and Kilter never sends another PUT for a
-// rating it has deleted — so without this predicate the stale star would show
-// on the ascent forever. A REMOVE-then-PUT redelivery re-adopts the row and
-// clears the marker, so a live rating is unaffected.
-//
-// The marker is Kilter-specific but this predicate is not: a marked row is
-// hidden whatever its rating's origin. That is correct today because
-// kilter-sync is the only writer of this table. The day an Aurora writer
-// lands, revisit it — an Aurora-origin row that adopted a kilter_id and then
-// took a Kilter REMOVE would be hidden even though its Aurora rating is live.
-const boardClimbRatingsJoinCondition = and(
-  eq(dbSchema.boardseshTicks.boardType, dbSchema.boardClimbRatings.boardType),
-  eq(dbSchema.boardseshTicks.climbUuid, dbSchema.boardClimbRatings.climbUuid),
-  eq(dbSchema.boardseshTicks.angle, dbSchema.boardClimbRatings.angle),
-  eq(dbSchema.boardseshTicks.userId, dbSchema.boardClimbRatings.userId),
-  isNull(dbSchema.boardClimbRatings.kilterDetachedAt),
-);
+// climbed_at holds UTC wall-clock time with no zone. Casting an instant's text
+// straight to `timestamp` would silently drop its offset, so it goes through
+// timestamptz and back to UTC wall-clock time.
+const utcWallClock = (instant: string) => sql`((${instant})::timestamptz AT TIME ZONE 'UTC')`;
 
-const effectiveQualityExpr = sql<
-  number | null
->`COALESCE(${dbSchema.boardseshTicks.quality}, ${dbSchema.boardClimbRatings.rating})`;
+// fromDate is inclusive either way: a calendar day from its UTC midnight, an
+// instant from that instant.
+function climbedAtFromCondition(fromDate: string): SQL {
+  return isCalendarDayBound(fromDate)
+    ? gte(dbSchema.boardseshTicks.climbedAt, fromDate)
+    : gte(dbSchema.boardseshTicks.climbedAt, utcWallClock(fromDate));
+}
+
+// A calendar-day toDate takes in that whole UTC day, unchanged for older
+// clients. An instant is the EXCLUSIVE end: the start of the day after the last
+// local day the client wants.
+function climbedAtToCondition(toDate: string): SQL {
+  return isCalendarDayBound(toDate)
+    ? lte(dbSchema.boardseshTicks.climbedAt, toDate + 'T23:59:59.999Z')
+    : lt(dbSchema.boardseshTicks.climbedAt, utcWallClock(toDate));
+}
 
 // The validated AscentFeedInput both feeds filter on — inferred from the zod
 // schema so a new filter field can't silently diverge from validation.
@@ -100,9 +130,14 @@ type AscentFeedFilterInput = z.infer<typeof AscentFeedInputSchema>;
 /**
  * WHERE conditions over the ticks table (+ stats/consensus joins for grade and
  * benchmark filters) shared by userAscentsFeed and userGroupedAscentsFeed so
- * the two feeds can never disagree about what a filter means.
+ * the two feeds can never disagree about what a filter means. The stars filter
+ * needs no join of its own (see effectiveQualityAtLeastCondition), so the count
+ * queries, which never join board_climb_ratings, apply it unchanged.
+ *
+ * Exported so a test can run it inside a transaction with a non-UTC session
+ * time zone, which the resolvers' pooled connections can't be pinned to.
  */
-function buildAscentTickConditions(validated: AscentFeedFilterInput, userId: string) {
+export function buildAscentTickConditions(validated: AscentFeedFilterInput, userId: string) {
   const legacyStatus = validated.status;
   let inferredStatusMode = 'both';
   if (legacyStatus === 'attempt') {
@@ -128,8 +163,11 @@ function buildAscentTickConditions(validated: AscentFeedFilterInput, userId: str
     ...(validated.maxDifficulty !== undefined ? [lte(effectiveDifficultyExpr, validated.maxDifficulty)] : []),
     ...(validated.minAngle !== undefined ? [gte(dbSchema.boardseshTicks.angle, validated.minAngle)] : []),
     ...(validated.maxAngle !== undefined ? [lte(dbSchema.boardseshTicks.angle, validated.maxAngle)] : []),
-    ...(validated.fromDate ? [gte(dbSchema.boardseshTicks.climbedAt, validated.fromDate)] : []),
-    ...(validated.toDate ? [lte(dbSchema.boardseshTicks.climbedAt, validated.toDate + 'T23:59:59.999Z')] : []),
+    ...(validated.fromDate ? [climbedAtFromCondition(validated.fromDate)] : []),
+    ...(validated.toDate ? [climbedAtToCondition(validated.toDate)] : []),
+    // The stars the row shows as `effectiveQuality`: the tick's own, else the
+    // climber's synced rating.
+    ...(validated.minQuality !== undefined ? [effectiveQualityAtLeastCondition(validated.minQuality)] : []),
   ];
 
   if (statusMode === 'attempt') {
@@ -154,6 +192,7 @@ function buildAscentTickConditions(validated: AscentFeedFilterInput, userId: str
 /** Conditions that need the canonical board_climbs join (layout + name search). */
 function buildAscentClimbConditions(validated: AscentFeedFilterInput, viewerUserId: string | null | undefined) {
   return [
+    tickPrivacyCondition(viewerUserId),
     // These feeds are unauthenticated and take `boardTypes` / `layoutIds` from the
     // caller, so without this anyone could read a climber's ticks on their own
     // private spray wall — climb name, frames and the wall's layout id — which is
@@ -163,8 +202,16 @@ function buildAscentClimbConditions(validated: AscentFeedFilterInput, viewerUser
       { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
       viewerUserId,
     ),
+    // …and a spray log whose climb was hard-deleted, for everybody but its author.
+    sprayTickClimbExistsCondition(viewerUserId),
+    // `IS NOT TRUE`: the climb is LEFT JOINed, and a missing row is not a hidden one.
+    ...(validated.excludeHiddenClimbs ? [sql`${dbSchema.boardClimbs.isHidden} IS NOT TRUE`] : []),
     ...(validated.layoutIds && validated.layoutIds.length > 0
       ? [inArray(dbSchema.boardClimbs.layoutId, validated.layoutIds)]
+      : []),
+    // The canonical climb's setter, the same column the row shows as setterUsername.
+    ...(validated.setterUsernames && validated.setterUsernames.length > 0
+      ? [inArray(dbSchema.boardClimbs.setterUsername, validated.setterUsernames)]
       : []),
     // The same pattern climb search uses, so a name that finds a climb also finds
     // it in the logbook: apostrophe/quote and dash variants fold, the user's own
@@ -187,7 +234,12 @@ function buildAscentClimbConditions(validated: AscentFeedFilterInput, viewerUser
  * (the profile beta shelf). One profile lookup + one links query per call.
  * Returns `boardType:climbUuid` keys.
  */
-async function fetchUserBetaClimbKeys(userId: string, climbUuids: string[], tickUuids: string[]): Promise<Set<string>> {
+async function fetchUserBetaClimbKeys(
+  userId: string,
+  climbUuids: string[],
+  tickUuids: string[],
+  viewerId?: string | null,
+): Promise<Set<string>> {
   if (climbUuids.length === 0) return new Set();
   const profileRows = await db
     .select({ instagramUrl: dbSchema.userProfiles.instagramUrl })
@@ -206,7 +258,13 @@ async function fetchUserBetaClimbKeys(userId: string, climbUuids: string[], tick
   const betaLinkRows = await db
     .select({ boardType: dbSchema.boardBetaLinks.boardType, climbUuid: dbSchema.boardBetaLinks.climbUuid })
     .from(dbSchema.boardBetaLinks)
-    .where(and(inArray(dbSchema.boardBetaLinks.climbUuid, climbUuids), or(...ownershipConditions)));
+    .where(
+      and(
+        inArray(dbSchema.boardBetaLinks.climbUuid, climbUuids),
+        or(...ownershipConditions),
+        betaPrivacyCondition(viewerId),
+      ),
+    );
   return new Set(betaLinkRows.map((row) => `${row.boardType}:${row.climbUuid}`));
 }
 
@@ -238,9 +296,12 @@ type AscentFeedRow = {
   qualityAverage: number | null;
   isBenchmark: boolean;
   isNoMatch: boolean;
+  characteristics: string[] | null;
   comment: string;
   climbedAt: string;
   frames: string | null;
+  climbRevision: number | null;
+  climbCurrentRevision: number | null;
   hasBetaVideo: boolean;
 };
 
@@ -257,6 +318,16 @@ export const tickQueries = {
     validateInput(GetTicksInputSchema, input, 'input');
 
     const userId = ctx.userId!;
+    const startedAt = performance.now();
+    // A read that timed out is the slowest read there is, so it is logged too.
+    const logFailedRead = (err: unknown): never => {
+      logSlowRead('ticks', startedAt, {
+        boardType: input.boardType,
+        climbs: input.climbUuids?.length ?? null,
+        failed: true,
+      });
+      throw err;
+    };
 
     // Build query conditions
     const conditions = [
@@ -305,7 +376,8 @@ export const tickQueries = {
       // Synced-rating fallback for quality — see boardClimbRatingsJoinCondition.
       .leftJoin(dbSchema.boardClimbRatings, boardClimbRatingsJoinCondition)
       .where(and(...conditions))
-      .orderBy(desc(dbSchema.boardseshTicks.climbedAt));
+      .orderBy(desc(dbSchema.boardseshTicks.climbedAt))
+      .catch(logFailedRead);
 
     // Batch-fetch social aggregates in two grouped queries instead of running
     // a correlated subquery per row — this resolver is unbounded (no LIMIT),
@@ -337,8 +409,14 @@ export const tickQueries = {
                 ),
               )
               .groupBy(dbSchema.comments.entityId),
-          ])
+          ]).catch(logFailedRead)
         : [[], []];
+
+    logSlowRead('ticks', startedAt, {
+      boardType: input.boardType,
+      climbs: input.climbUuids?.length ?? null,
+      rows: results.length,
+    });
 
     const voteMap = new Map(voteRows.map((v) => [v.entityId, v]));
     const commentMap = new Map(commentRows.map((c) => [c.entityId, Number(c.commentCount)]));
@@ -350,6 +428,7 @@ export const tickQueries = {
         userId: tick.userId,
         boardType: tick.boardType,
         climbUuid: tick.climbUuid,
+        climbRevision: tick.climbRevision,
         angle: tick.angle,
         isMirror: tick.isMirror,
         status: tick.status,
@@ -420,6 +499,11 @@ export const tickQueries = {
         { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
         viewerUserId,
       ),
+      // That last part is right for the other boards ("Unknown Climb") and wrong
+      // for spray, where a missing climb means a hard-deleted one: only the
+      // climber who logged it keeps seeing the entry.
+      sprayTickClimbExistsCondition(viewerUserId),
+      tickPrivacyCondition(viewerUserId, dbSchema.boardseshTicks, true),
     ];
 
     // Fetch ticks with layoutId from unified board_climbs table. We surface
@@ -427,7 +511,7 @@ export const tickQueries = {
     // contract so optimistic writes don't flicker), and an additional
     // `effectiveDifficulty` that COALESCEs with the climb's consensus grade
     // for chart-bucket / aggregation consumers. NULL difficulty means "use
-    // consensus" — see docs/ascents-and-attempts.md.
+    // consensus" — see docs/data/ascents-and-attempts.md.
     // Unbounded (no LIMIT) over one user's whole logbook, fanning out through
     // five LEFT JOINs — board_climbs and board_climb_stats are the big ones.
     // Production picks a parallel hash join for that shape, and enough
@@ -463,6 +547,19 @@ export const tickQueries = {
           and(
             sql`COALESCE(${dbSchema.boardClimbAliases.canonicalUuid}, ${dbSchema.boardseshTicks.climbUuid}) = ${dbSchema.boardClimbs.uuid}`,
             eq(dbSchema.boardClimbs.boardType, boardType),
+            // A published climb is readable whoever set it; a draft by its owner alone.
+            climbDraftVisibilityCondition(
+              {
+                boardType: dbSchema.boardClimbs.boardType,
+                isDraft: dbSchema.boardClimbs.isDraft,
+                userId: dbSchema.boardClimbs.userId,
+              },
+              viewerUserId,
+            ),
+            sprayClimbVisibilityCondition(
+              { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
+              viewerUserId,
+            ),
           ),
         )
         .leftJoin(
@@ -490,6 +587,7 @@ export const tickQueries = {
         userId: tick.userId,
         boardType: tick.boardType,
         climbUuid: tick.climbUuid,
+        climbRevision: tick.climbRevision,
         angle: tick.angle,
         isMirror: tick.isMirror,
         status: tick.status,
@@ -505,7 +603,9 @@ export const tickQueries = {
         climbedAt: tick.climbedAt,
         createdAt: tick.createdAt,
         updatedAt: tick.updatedAt,
-        sessionId: tick.sessionId,
+        // A session id is its invite link, and a tick is not an invitation:
+        // only the tick's own climber gets it back from a public logbook.
+        sessionId: viewerUserId !== null && tick.userId === viewerUserId ? tick.sessionId : null,
         auroraType: tick.auroraType,
         auroraId: tick.auroraId,
         auroraSyncedAt: tick.auroraSyncedAt,
@@ -527,6 +627,7 @@ export const tickQueries = {
   userTickCountsByBoard: async (
     _: unknown,
     { userId }: { userId: string },
+    ctx?: ConnectionContext,
   ): Promise<Array<{ boardType: string; count: number }>> => {
     if (!userId || typeof userId !== 'string' || userId.trim() === '') return [];
 
@@ -535,7 +636,13 @@ export const tickQueries = {
       .from(dbSchema.boardseshTicks)
       // Aurora's own duplicate ascents count once (#3535), so the inferred
       // default board matches what the logbook actually shows.
-      .where(and(eq(dbSchema.boardseshTicks.userId, userId), notAuroraTwinDuplicate(dbSchema.boardseshTicks)))
+      .where(
+        and(
+          eq(dbSchema.boardseshTicks.userId, userId),
+          notAuroraTwinDuplicate(dbSchema.boardseshTicks),
+          tickPrivacyCondition(ctx?.isAuthenticated ? ctx.userId : null, dbSchema.boardseshTicks, true),
+        ),
+      )
       .groupBy(dbSchema.boardseshTicks.boardType);
 
     return rows.map((row) => ({ boardType: row.boardType, count: Number(row.tickCount) }));
@@ -571,6 +678,8 @@ export const tickQueries = {
         minAngle?: number;
         maxAngle?: number;
         benchmarkOnly?: boolean;
+        minQuality?: number;
+        setterUsernames?: string[];
         fromDate?: string;
         toDate?: string;
       };
@@ -608,8 +717,13 @@ export const tickQueries = {
         compatibleSizeIds: dbSchema.boardClimbs.compatibleSizeIds,
         requiredSetIds: dbSchema.boardClimbs.requiredSetIds,
         boardName: dbSchema.userBoards.name,
-        boardIsPublic: dbSchema.userBoards.isPublic,
-        boardIsUnlisted: dbSchema.userBoards.isUnlisted,
+        // The ascent follows its climber; the board's own policy decides only
+        // whether the row may name the wall (the climber always sees their own).
+        boardIdentityVisible: boardIdentityVisibleCondition(
+          dbSchema.boardseshTicks.boardId,
+          ctx?.userId,
+          dbSchema.boardseshTicks.userId,
+        ),
         // The board the tick was logged against, for renderBoard's first rung.
         boardLayoutId: dbSchema.userBoards.layoutId,
         boardSizeId: dbSchema.userBoards.sizeId,
@@ -776,6 +890,7 @@ export const tickQueries = {
         userId,
         Array.from(new Set(results.map(({ tick }) => tick.climbUuid))),
         results.map(({ tick }) => tick.uuid),
+        ctx?.userId,
       ),
       fetchOwnerBoards([userId]),
     ]);
@@ -794,8 +909,7 @@ export const tickQueries = {
         compatibleSizeIds,
         requiredSetIds,
         boardName,
-        boardIsPublic,
-        boardIsUnlisted,
+        boardIdentityVisible,
         boardLayoutId,
         boardSizeId,
         boardSetIds,
@@ -808,18 +922,15 @@ export const tickQueries = {
         qualityAverage,
         effectiveQuality,
       }) => {
-        const canShowBoard =
-          tick.boardId != null && (ctx?.userId === userId || (boardIsPublic === true && boardIsUnlisted !== true));
         return {
           uuid: tick.uuid,
           climbUuid: tick.climbUuid,
           climbName: climbName || 'Unknown Climb',
           setterUsername,
           boardType: tick.boardType,
-          boardId: canShowBoard ? tick.boardId : null,
-          boardDisplayName: canShowBoard ? boardName : null,
+          ...redactBoardIdentity({ boardId: tick.boardId, boardDisplayName: boardName }, boardIdentityVisible === true),
           layoutId,
-          // Deliberately NOT behind `canShowBoard`: this is wall geometry, not
+          // Deliberately NOT behind the board-identity rule: this is wall geometry, not
           // board identity — it never reveals that a named board exists, and
           // gating it would send other viewers back to the wrong-size render.
           renderBoard: resolveRenderBoard({
@@ -852,10 +963,14 @@ export const tickQueries = {
           boardseshConfidence: toConfidenceTier(boardseshConfidence),
           isBenchmark: Boolean(resolvedIsBenchmark),
           isNoMatch: resolveClimbNoMatch(tick.boardType, climbCharacteristics, climbDescription),
+          characteristics: climbCharacteristics ?? null,
           qualityAverage: qualityAverage != null ? Number(qualityAverage) : null,
           comment: tick.comment || '',
           climbedAt: tick.climbedAt,
           frames,
+          climbRevision: tick.climbRevision,
+          // Retired with revision history; null hides an older app's "Earlier version" tag.
+          climbCurrentRevision: null,
           hasBetaVideo: climbsWithBeta.has(`${tick.boardType}:${tick.climbUuid}`),
         };
       },
@@ -866,6 +981,69 @@ export const tickQueries = {
       totalCount,
       hasMore: offset + items.length < totalCount,
     };
+  },
+
+  /**
+   * Setters of the climbs a user has logged, most-logged first: the logbook's
+   * setter filter picker. Public, like userAscentsFeed, and filtered by the
+   * feed's own condition builders over the same board scope, so a setter is
+   * listed only when the viewer could find one of their climbs in the feed. A
+   * private tick, a draft or unlisted climb, or a private spray wall names no
+   * setter to a viewer who cannot see it, and the counts match the feed's
+   * totalCount for that setter (attempts included, Aurora twins counted once).
+   */
+  userLoggedSetters: async (
+    _: unknown,
+    { userId, input }: { userId: string; input?: UserLoggedSettersInput },
+    ctx?: ConnectionContext,
+  ): Promise<LoggedSetter[]> => {
+    const validatedInput = validateInput(UserLoggedSettersInputSchema, input || {}, 'input');
+    // Every other feed filter stays at its default (both statuses, no grade,
+    // date or stars), so these are the feed's unfiltered conditions for the scope.
+    const feedScope = AscentFeedInputSchema.parse({
+      boardTypes: validatedInput.boardTypes,
+      layoutIds: validatedInput.layoutIds,
+    });
+    const setterUsername = dbSchema.boardClimbs.setterUsername;
+    const tickCount = count();
+    const search = validatedInput.search;
+
+    const rows = await db
+      .select({ setterUsername, tickCount })
+      .from(dbSchema.boardseshTicks)
+      // The feed's alias resolution, so a tick on a deduped-away uuid counts for
+      // the canonical climb's setter, as its row shows. An inner join: a tick
+      // with no climb row has no setter to list.
+      .leftJoin(
+        dbSchema.boardClimbAliases,
+        and(
+          eq(dbSchema.boardseshTicks.climbUuid, dbSchema.boardClimbAliases.aliasUuid),
+          eq(dbSchema.boardseshTicks.boardType, dbSchema.boardClimbAliases.boardType),
+        ),
+      )
+      .innerJoin(
+        dbSchema.boardClimbs,
+        and(
+          sql`COALESCE(${dbSchema.boardClimbAliases.canonicalUuid}, ${dbSchema.boardseshTicks.climbUuid}) = ${dbSchema.boardClimbs.uuid}`,
+          eq(dbSchema.boardseshTicks.boardType, dbSchema.boardClimbs.boardType),
+        ),
+      )
+      .where(
+        and(
+          ...buildAscentTickConditions(feedScope, userId),
+          ...buildAscentClimbConditions(feedScope, ctx?.userId),
+          isNotNull(setterUsername),
+          ne(setterUsername, ''),
+          search ? ilike(setterUsername, `%${escapeLikePattern(search)}%`) : undefined,
+        ),
+      )
+      .groupBy(setterUsername)
+      .orderBy(desc(tickCount), asc(setterUsername))
+      .limit(validatedInput.limit);
+
+    return rows.flatMap((row) =>
+      row.setterUsername ? [{ setterUsername: row.setterUsername, tickCount: Number(row.tickCount) }] : [],
+    );
   },
 
   /**
@@ -952,11 +1130,11 @@ export const tickQueries = {
     const climbConditions = buildAscentClimbConditions(validatedInput, ctx?.userId);
     const groupFilterConditions = [...tickConditions, ...climbConditions];
 
-    // boardsesh_ticks.climbed_at is `timestamp without time zone` storing the
-    // climber's wall-clock time at the moment of the tick (the rest of the
-    // codebase reads it back via `dayjs(...).utc(true)` to preserve that wall
-    // clock — see ascents-feed.tsx). Group by the literal stored date so a
-    // session ending at 11pm local doesn't bleed into the next day.
+    // boardsesh_ticks.climbed_at is `timestamp without time zone` holding the
+    // tick's UTC wall-clock time (normalizeClimbedAt in ticks/mutations.ts
+    // converts every client timestamp to UTC before it is stored). Grouping by
+    // the stored date therefore makes each group one UTC calendar day, the same
+    // day the calendar-day form of fromDate/toDate means.
     const dayExpr = sql<string>`to_char(${dbSchema.boardseshTicks.climbedAt}, 'YYYY-MM-DD')`;
 
     // 1) Page of (climbUuid, day) keys, ordered by latest activity in that group.
@@ -1049,8 +1227,13 @@ export const tickQueries = {
         requiredSetIds: dbSchema.boardClimbs.requiredSetIds,
         difficultyName: difficultyNameWithFallbackExpr,
         boardName: dbSchema.userBoards.name,
-        boardIsPublic: dbSchema.userBoards.isPublic,
-        boardIsUnlisted: dbSchema.userBoards.isUnlisted,
+        // The ascent follows its climber; the board's own policy decides only
+        // whether the row may name the wall (the climber always sees their own).
+        boardIdentityVisible: boardIdentityVisibleCondition(
+          dbSchema.boardseshTicks.boardId,
+          ctx?.userId,
+          dbSchema.boardseshTicks.userId,
+        ),
         // The board the tick was logged against, for renderBoard's first rung.
         boardLayoutId: dbSchema.userBoards.layoutId,
         boardSizeId: dbSchema.userBoards.sizeId,
@@ -1141,9 +1324,12 @@ export const tickQueries = {
       qualityAverage: number | null;
       isBenchmark: boolean;
       isNoMatch: boolean;
+      characteristics: string[] | null;
       comment: string;
       climbedAt: string;
       frames: string | null;
+      climbRevision: number | null;
+      climbCurrentRevision: number | null;
       hasBetaVideo: boolean;
     };
 
@@ -1161,6 +1347,7 @@ export const tickQueries = {
       difficultyName: string | null;
       isBenchmark: boolean;
       isNoMatch: boolean;
+      characteristics: string[] | null;
       date: string;
       items: AscentItem[];
       flashCount: number;
@@ -1178,6 +1365,7 @@ export const tickQueries = {
         userId,
         climbUuidsInPage,
         tickRows.map(({ tick }) => tick.uuid),
+        ctx?.userId,
       ),
       fetchOwnerBoards([userId]),
     ]);
@@ -1197,8 +1385,7 @@ export const tickQueries = {
       requiredSetIds,
       difficultyName,
       boardName,
-      boardIsPublic,
-      boardIsUnlisted,
+      boardIdentityVisible,
       boardLayoutId,
       boardSizeId,
       boardSetIds,
@@ -1217,10 +1404,8 @@ export const tickQueries = {
 
       const isNoMatch = resolveClimbNoMatch(tick.boardType, climbCharacteristics, climbDescription);
 
-      const canShowBoard =
-        tick.boardId != null && (ctx?.userId === userId || (boardIsPublic === true && boardIsUnlisted !== true));
       // Wall geometry, not board identity — see the flat feed for why this is
-      // not behind `canShowBoard`.
+      // not behind the board-identity rule.
       const renderBoard = resolveRenderBoard({
         boardType: tick.boardType,
         climbLayoutId: layoutId,
@@ -1240,8 +1425,7 @@ export const tickQueries = {
         climbName: climbName || 'Unknown Climb',
         setterUsername,
         boardType: tick.boardType,
-        boardId: canShowBoard ? tick.boardId : null,
-        boardDisplayName: canShowBoard ? boardName : null,
+        ...redactBoardIdentity({ boardId: tick.boardId, boardDisplayName: boardName }, boardIdentityVisible === true),
         layoutId,
         renderBoard,
         angle: tick.angle,
@@ -1260,9 +1444,13 @@ export const tickQueries = {
         qualityAverage: qualityAverage != null ? Number(qualityAverage) : null,
         isBenchmark: Boolean(resolvedIsBenchmark),
         isNoMatch,
+        characteristics: climbCharacteristics ?? null,
         comment: tick.comment || '',
         climbedAt: tick.climbedAt,
         frames,
+        climbRevision: tick.climbRevision,
+        // Retired with revision history; null hides an older app's "Earlier version" tag.
+        climbCurrentRevision: null,
         hasBetaVideo: climbsWithBeta.has(`${tick.boardType}:${tick.climbUuid}`),
       };
 
@@ -1288,6 +1476,7 @@ export const tickQueries = {
           difficultyName,
           isBenchmark: Boolean(resolvedIsBenchmark),
           isNoMatch,
+          characteristics: climbCharacteristics ?? null,
           date: day,
           items: [],
           flashCount: 0,
@@ -1343,6 +1532,10 @@ export const tickQueries = {
    */
   userClimbPercentile: async (_: unknown, { userId }: { userId: string }, ctx: ConnectionContext) => {
     await applyRateLimit(ctx, 10, 'userClimbPercentile');
+
+    if (!(await canViewUserActivity(ctx.isAuthenticated ? ctx.userId : null, userId))) {
+      return { totalDistinctClimbs: 0, percentile: 0, totalActiveUsers: 0 };
+    }
 
     if (!userId || typeof userId !== 'string' || userId.trim() === '') {
       return { totalDistinctClimbs: 0, percentile: 0, totalActiveUsers: 0 };
@@ -1430,15 +1623,29 @@ export const tickQueries = {
       >`COALESCE(${dbSchema.boardseshTicks.difficulty}, ${consensusDifficultyExpr})`;
 
       const baseConditions = and(
+        tickPrivacyCondition(viewerUserId, dbSchema.boardseshTicks, true),
         eq(dbSchema.boardseshTicks.userId, userId),
         eq(dbSchema.boardseshTicks.boardType, boardType),
         ne(dbSchema.boardseshTicks.status, 'attempt'),
         // REFERENCE form, not the column form: `baseConditions` is shared with the
         // third query below, which selects distinct climb uuids straight off
         // `boardsesh_ticks` and joins `board_climbs` not at all.
-        sprayReferenceVisibilityCondition(
+        or(
+          viewerUserId ? eq(dbSchema.boardseshTicks.userId, viewerUserId) : sql`false`,
+          sprayReferenceVisibilityCondition(
+            { boardType: dbSchema.boardseshTicks.boardType, climbUuid: dbSchema.boardseshTicks.climbUuid },
+            viewerUserId,
+          ),
+        ),
+        // A spray send whose climb row has been hard-deleted (`deleteDraftClimb`,
+        // account deletion) passes the reference form for everybody and would
+        // show a stranger a `spray-unknown` bucket with the climber's counts and
+        // grades (#5981). Fail closed, except for the climber reading their own
+        // profile: the log is theirs, their logbook still lists it, and totals
+        // that dropped it would disagree with that logbook.
+        sprayReferenceClimbExistsCondition(
           { boardType: dbSchema.boardseshTicks.boardType, climbUuid: dbSchema.boardseshTicks.climbUuid },
-          viewerUserId,
+          { authorId: dbSchema.boardseshTicks.userId, viewerUserId },
         ),
       );
 
@@ -1481,6 +1688,19 @@ export const tickQueries = {
               and(
                 sql`COALESCE(${dbSchema.boardClimbAliases.canonicalUuid}, ${dbSchema.boardseshTicks.climbUuid}) = ${dbSchema.boardClimbs.uuid}`,
                 eq(dbSchema.boardClimbs.boardType, boardType),
+                // A published climb is readable whoever set it; a draft by its owner alone.
+                climbDraftVisibilityCondition(
+                  {
+                    boardType: dbSchema.boardClimbs.boardType,
+                    isDraft: dbSchema.boardClimbs.isDraft,
+                    userId: dbSchema.boardClimbs.userId,
+                  },
+                  viewerUserId,
+                ),
+                sprayClimbVisibilityCondition(
+                  { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
+                  viewerUserId,
+                ),
               ),
             )
             .leftJoin(
@@ -1512,6 +1732,19 @@ export const tickQueries = {
               and(
                 sql`COALESCE(${dbSchema.boardClimbAliases.canonicalUuid}, ${dbSchema.boardseshTicks.climbUuid}) = ${dbSchema.boardClimbs.uuid}`,
                 eq(dbSchema.boardClimbs.boardType, boardType),
+                // A published climb is readable whoever set it; a draft by its owner alone.
+                climbDraftVisibilityCondition(
+                  {
+                    boardType: dbSchema.boardClimbs.boardType,
+                    isDraft: dbSchema.boardClimbs.isDraft,
+                    userId: dbSchema.boardClimbs.userId,
+                  },
+                  viewerUserId,
+                ),
+                sprayClimbVisibilityCondition(
+                  { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
+                  viewerUserId,
+                ),
               ),
             )
             .where(baseConditions)

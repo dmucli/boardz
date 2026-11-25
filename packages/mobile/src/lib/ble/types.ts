@@ -1,6 +1,9 @@
 export type BleConnection = {
   deviceId: string;
   deviceName?: string;
+  // True only when the Android ble-plx adapter recovered a transient first
+  // GATT connect failure with its single in-budget retry.
+  retrySucceeded?: boolean;
   // Advertisement recon payload of the connected device, threaded through so the
   // `Bluetooth Connection Success` event can carry it. See `AdvertisementRecon`.
   manufacturerData?: string;
@@ -147,7 +150,7 @@ export type BleConnectDiagnostics = {
  *
  * `preferWriteWithResponse` forces acknowledged GATT writes (write request)
  * regardless of what the write characteristic advertises. The Woods board needs
- * it: its protocol spec (§8, `docs/WOODS_BLUETOOTH_PROTOCOL_SPEC.md`) mandates
+ * it: its protocol spec (§8, `docs/boards/WOODS_BLUETOOTH_PROTOCOL_SPEC.md`) mandates
  * write requests, and the acknowledgement also paces the 20-byte chunks for its
  * Arduino-class firmware. Aurora boards must never set it — write-without-
  * response is their proven path.
@@ -164,15 +167,30 @@ export type BleConnectDiagnostics = {
 export type BleAdapterOptions = {
   preferWriteWithResponse?: boolean;
   boardName?: string;
+  // RNBleAdapter only: wait for the scan to stop before the GATT connect, and
+  // retry one transient first GATT connect failure before surfacing it. Android
+  // only — set by createBluetoothAdapter from Platform.OS, never by a board's
+  // own preferences.
+  enableAndroidConnectRetry?: boolean;
 };
 
+export type BleDisconnectOptions = { keepBoard?: boolean };
+
 export type BluetoothAdapter = {
+  /** False for a transient transport whose peripheral identity cannot be reconnected after restart. */
+  readonly persistConnection?: boolean;
   isAvailable(): Promise<boolean>;
   // `targetSerial` (Aurora) / `targetDeviceId` (MoonBoard) auto-select the
   // remembered board on the reconnect scan while the picker shows "searching";
   // with neither, the picker opens straight to the list.
   requestAndConnect(targetSerial?: string, targetDeviceId?: string): Promise<BleConnection>;
-  disconnect(): Promise<void>;
+  /**
+   * `keepBoard`: free the board but keep the native pairing (a hang-up, for as
+   * long as JS remembers the board, or Disconnect Bluetooth when driving
+   * ends), so the iOS Live Activity bulb can reconnect to it. Only the native
+   * iOS adapter forgets a board on disconnect, so the others ignore it.
+   */
+  disconnect(options?: BleDisconnectOptions): Promise<void>;
   write(data: Uint8Array, signal?: AbortSignal): Promise<void>;
   onDisconnect(callback: (info?: BleDisconnectInfo) => void): () => void;
   // Transport diagnostics of the adapter's most recently settled write
@@ -182,4 +200,16 @@ export type BluetoothAdapter = {
   // Diagnostics of the adapter's most recent failed connect, for tagging a
   // service_missing report. Optional: only native iOS reports it.
   getLastConnectDiagnostics?(): Promise<BleConnectDiagnostics | null>;
+  // GATT connect attempts the adapter's most recent connect made: 0 when it
+  // never reached the connect, 1 for a single attempt, 2 when the Android retry
+  // ran. Optional: only the ble-plx adapter counts them.
+  getLastConnectAttemptCount?(): number;
+  // Whether that retry won its GATT connect, even if the connect then failed
+  // downstream (MTU, discovery). Needed on the failure path, where the thrown
+  // error carries no `retrySucceeded`. Optional: only the ble-plx adapter retries.
+  getLastConnectRetrySucceeded?(): boolean;
+  // The Android GATT status of the first attempt that set off that retry (133
+  // or 147), null when Android left it out, undefined when no retry ran.
+  // Optional: only the ble-plx adapter retries.
+  getLastConnectFirstAttemptCode?(): number | null | undefined;
 };

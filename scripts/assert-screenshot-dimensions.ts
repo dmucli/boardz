@@ -38,11 +38,13 @@ export interface Dimensions {
   height: number;
 }
 
-export const EXPECTED_APP_STORE_LOCALES = ['en-US', 'es-ES', 'es-MX', 'fr-FR', 'de-DE'] as const;
+export const EXPECTED_APP_STORE_LOCALES = ['en-US', 'es-ES', 'es-MX', 'fr-FR', 'de-DE', 'it'] as const;
 export const EXPECTED_APP_STORE_DEVICE_SLUGS = [
   'iphone-16-pro-max',
+  'iphone-16-pro',
   'ipad-pro-13-inch-m5',
   'ipad-pro-11-inch-m5',
+  'iphone-duo',
 ] as const;
 
 /**
@@ -52,14 +54,13 @@ export const EXPECTED_APP_STORE_DEVICE_SLUGS = [
  * slug can't sneak un-validated sizes past the gate.
  */
 export const ACCEPTED_SIZES: Record<string, readonly Dimensions[]> = {
-  // 6.9" iPhone slot — the ONLY size we capture. Apple auto-scales it down to every
-  // smaller iPhone, so one 6.9" set covers the whole device range and extra sizes add
-  // no store/ranking value (see app-store-submission-guide.md). Apple accepts the
-  // iPhone 16 Pro Max native 1320x2868 or the prior-gen 1290x2796 here.
+  // Large Dynamic Island iPhone slot; retain Apple's prior-generation size.
   'iphone-16-pro-max': [
     { width: 1320, height: 2868 },
     { width: 1290, height: 2796 },
   ],
+  // Medium Dynamic Island iPhone slot, captured at the Pro's native size.
+  'iphone-16-pro': [{ width: 1206, height: 2622 }],
   // 13" iPad slot, captured in landscape. Apple accepts the current 13" native
   // size and the earlier 12.9"/13" 2048x2732 family in the same slot.
   'ipad-pro-13-inch-m5': [
@@ -74,7 +75,44 @@ export const ACCEPTED_SIZES: Record<string, readonly Dimensions[]> = {
     { width: 2388, height: 1668 },
     { width: 2360, height: 1640 },
   ],
+  // iPhone Duo: Apple's one APP_IPHONE_DUO set takes both displays. We ship
+  // the inner display open in landscape and the outer display closed in
+  // portrait; ACCEPTED_SIZES_BY_FILENAME pins which file is which.
+  'iphone-duo': [
+    { width: 2853, height: 2007 },
+    { width: 1398, height: 2034 },
+  ],
 };
+
+export interface FilenameSizeRule {
+  /** Matched against the PNG's basename. */
+  pattern: RegExp;
+  sizes: readonly Dimensions[];
+}
+
+/**
+ * Per-file sizes for device folders that mix displays. A file in such a folder
+ * must match exactly one rule, and its size must be one of that rule's sizes,
+ * so an outer-display capture can never stand in for an inner-display slot.
+ */
+export const ACCEPTED_SIZES_BY_FILENAME: Record<string, readonly FilenameSizeRule[]> = {
+  'iphone-duo': [
+    // 00-04: the inner display, open, landscape.
+    { pattern: /^0[0-4]-[\w-]+\.png$/, sizes: [{ width: 2853, height: 2007 }] },
+    // 05-07: the outer display, closed, portrait.
+    { pattern: /^0[5-7]-[\w-]+\.png$/, sizes: [{ width: 1398, height: 2034 }] },
+  ],
+};
+
+/** The sizes a file in `deviceSlug` may have, or a reason it has no valid size at all. */
+export function acceptedSizesForFile(deviceSlug: string, fileName: string): readonly Dimensions[] | string {
+  const rules = ACCEPTED_SIZES_BY_FILENAME[deviceSlug];
+  if (!rules) return ACCEPTED_SIZES[deviceSlug] ?? `no accepted-size list for device "${deviceSlug}"`;
+  const baseName = fileName.slice(fileName.lastIndexOf('/') + 1);
+  const matching = rules.filter((rule) => rule.pattern.test(baseName));
+  if (matching.length !== 1) return `matches ${matching.length} filename size rules for device "${deviceSlug}"`;
+  return matching[0].sizes;
+}
 
 /** Read width/height from a PNG buffer's IHDR. Throws on a non-PNG / truncated file. */
 export function readPngDimensions(buffer: Buffer): Dimensions {
@@ -104,16 +142,13 @@ export type ScreenshotTree = Record<string, Record<string, PngFile[]>>;
 
 /** Pure: validate one App Store device folder's PNGs against its accepted-size allow-list. */
 export function findOffenders(deviceSlug: string, files: readonly PngFile[]): Offender[] {
-  const accepted = ACCEPTED_SIZES[deviceSlug];
-  if (!accepted) {
-    return files.map((file) => ({
-      file: file.name,
-      reason: `no accepted-size list for device "${deviceSlug}"`,
-    }));
-  }
-
   const offenders: Offender[] = [];
   for (const file of files) {
+    const accepted = acceptedSizesForFile(deviceSlug, file.name);
+    if (typeof accepted === 'string') {
+      offenders.push({ file: file.name, reason: accepted });
+      continue;
+    }
     let dimensions: Dimensions;
     try {
       dimensions = readPngDimensions(file.buffer);
@@ -273,7 +308,15 @@ export function findScreenshotTreeOffenders(tree: ScreenshotTree): Offender[] {
       }
       if (referenceDevices.includes(deviceName) && firstExpectedLocale) {
         const referenceFiles = tree[firstExpectedLocale]?.[deviceName] ?? [];
-        const expectedFiles = basenames(referenceFiles);
+        // Italian replaces the physical Live Activity shot with its native
+        // session recap. Only this exact phone slot may differ across locales.
+        const expectedFiles = basenames(referenceFiles)
+          .map((name) =>
+            expectedLocale === 'it' && deviceName.startsWith('iphone-') && name === '07-live-activity.png'
+              ? '07-session-detail.png'
+              : name,
+          )
+          .sort();
         const actualFiles = basenames(files);
         if (expectedFiles.length > 0 && !listsMatch(actualFiles, expectedFiles)) {
           offenders.push({

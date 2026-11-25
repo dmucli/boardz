@@ -1,4 +1,5 @@
-import { and, desc, eq, exists, gt, inArray, isNotNull, isNull, like, or, sql, type SQL } from 'drizzle-orm';
+import { canViewResourceLocation, resourceAccess, resourceAccessCondition } from './privacy';
+import { and, desc, eq, exists, gt, inArray, isNull, like, or, sql, type SQL } from 'drizzle-orm';
 import type {
   LiveSession,
   LiveSessionBoard,
@@ -7,14 +8,13 @@ import type {
   LiveSessionUser,
   SessionUser,
 } from '@boardsesh/shared-schema';
-import { normaliseSetIds, parseBoardPath, parseNamedBoardPath } from '@boardsesh/board-config';
 import { getGradeLabel } from '@boardsesh/db/queries';
 import * as dbSchema from '@boardsesh/db/schema';
 import { db } from '../db/client';
 import { pubsub } from '../pubsub/index';
 import { roomManager } from './room-manager';
+import { canReadClimbContent, sessionsVisibleUserIds } from './board-session-privacy';
 import { toBoardQueuePreviewItem } from './board-queue-preview';
-import { isRowAnonReadable } from '../graphql/resolvers/board-presence/shared';
 import { isSprayBoardType, sprayBoardRowIsReadable } from '../graphql/resolvers/climbs/spray-read-access';
 import {
   consensusGradeJoinCondition,
@@ -22,6 +22,14 @@ import {
   difficultyNameWithFallbackExpr,
 } from '../graphql/resolvers/shared/sql-expressions';
 import { logger } from '../utils/logger';
+import { parseSessionBoardPath, resolveSessionBoards, toBoardId } from './session-board';
+
+export {
+  parseSessionBoardPath,
+  resolveSessionBoards as resolveLiveSessionBoards,
+  type ParsedBoardConfig,
+  type ParsedSessionBoardPath,
+} from './session-board';
 
 /**
  * Live sessions: who is climbing right now, for Home's "Climbing now" rail
@@ -29,10 +37,10 @@ import { logger } from '../utils/logger';
  *
  * The pipeline, in order — each stage only sees what the previous one kept:
  *
- * 1. **Candidates** (SQL): explicit, active, not ended, touched in the last 4h,
- *    newest 50. The arm filters are pushed into the WHERE so the cap never
- *    drops a relevant session behind 50 unrelated ones, and so a private session
- *    the viewer has no row in never leaves Postgres.
+ * 1. **Candidates**: SQL narrows explicit, active, not-ended sessions touched
+ *    in the last 4h. Light metadata batches resolve board-arm matches before
+ *    counting the newest 50 candidates; exact SQL social matches still count.
+ *    Private sessions the viewer cannot list never leave Postgres.
  * 2. **Liveness** (Redis, no rosters): somebody connected, or a dormant session
  *    touched in the last 20 min whose Redis key still exists.
  * 3. **Board resolution**, then in board mode only the sessions on that board
@@ -44,7 +52,7 @@ import { logger } from '../utils/logger';
  * 6. **Sort + limit**, then enrichment (profiles, tick stats, current climb) on
  *    the page only.
  *
- * See the "Live sessions" section of docs/websocket-implementation.md.
+ * See the "Live sessions" section of docs/backend/websocket-implementation.md.
  */
 
 export const LIVE_SESSION_CANDIDATE_WINDOW_MS = 4 * 60 * 60 * 1000;
@@ -96,11 +104,11 @@ type BoardRow = {
   layoutId: number;
   angle: number;
   ownerId: string;
-  isPublic: boolean;
-  isUnlisted: boolean;
-  hideLocation: boolean;
+  identityVisible: boolean;
   deletedAt: Date | null;
   gymName: string | null;
+  gymIsPublic: boolean | null;
+  gymIsListed?: boolean | null;
 };
 
 /** A board that can put sessions in the board arm, with what every resolution step matches on. */
@@ -114,305 +122,11 @@ type ArmBoard = {
   sizeId: number;
 };
 
-// ---------------------------------------------------------------------------
-// Board paths
-// ---------------------------------------------------------------------------
-
-export type ParsedBoardConfig = { boardType: string; layoutId: number; sizeId: number; setIds: string };
-
-export type ParsedSessionBoardPath = {
-  /** `/b/<slug>/<angle>`: gym and LED-less boards */
-  slug: string | null;
-  /** `/<boardType>/<layout>/<size>/<sets>/<angle>`: every other board, personal LED boards included */
-  config: ParsedBoardConfig | null;
-  boardType: string | null;
-  angle: number | null;
-};
-
-function toAngle(angle: number | null): number | null {
-  return angle !== null && Number.isInteger(angle) && angle >= -90 && angle <= 90 ? angle : null;
-}
-
-/**
- * Pull what a board path says about its board, through the shared board-path
- * parsers (`parseNamedBoardPath` for `/b/<slug>`, `parseBoardPath` for a config
- * path). Both tolerate a missing leading slash, which older rows carry.
- */
-export function parseSessionBoardPath(boardPath: string | null | undefined): ParsedSessionBoardPath {
-  const path = boardPath ?? '';
-  const named = parseNamedBoardPath(path);
-  if (named) return { slug: named.slug, config: null, boardType: null, angle: toAngle(named.angle) };
-  const parsed = parseBoardPath(path);
-  if (parsed && Number.isSafeInteger(parsed.layoutId) && Number.isSafeInteger(parsed.sizeId)) {
-    return {
-      slug: null,
-      config: {
-        boardType: parsed.boardName,
-        layoutId: parsed.layoutId,
-        sizeId: parsed.sizeId,
-        setIds: normaliseSetIds(parsed.setIds),
-      },
-      boardType: parsed.boardName,
-      angle: toAngle(parsed.angle),
-    };
-  }
-  return { slug: null, config: null, boardType: null, angle: null };
-}
-
-// ---------------------------------------------------------------------------
-// Board resolution
-// ---------------------------------------------------------------------------
-
-function toBoardId(value: number | string | null | undefined): number | null {
-  const id = Number(value);
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
-}
-
-/**
- * The board each session is on right now, most specific evidence first:
- *
- * 1. its newest `boardsesh_ticks` row with a board,
- * 2. the `board_sessions.board_id` column,
- * 3. a `/b/<slug>/…` board path → `user_boards.slug`,
- * 4. the Redis session→board binding stamped by `reportBoardClimb`,
- * 5. a config path (`/<type>/<layout>/<size>/<sets>/<angle>`, what mobile
- *    builds for any non-gym LED board) → a live board with that exact config
- *    (set ids normalised) that the session CREATOR owns, else one they follow.
- *    Several in the deciding tier resolve to the one the creator most recently
- *    ticked on; if that does not single one out, the session stays unresolved.
- *    A board the creator neither owns nor follows is never picked. It comes
- *    after Redis because it is an inference: a creator on a wall that shares a
- *    config with one of theirs is placed correctly by the binding once a climb
- *    has been sent, and possibly wrongly by this step.
- *
- * `board_climb_events` is deliberately absent: it has a `session_id` column,
- * but `reportBoardClimb` writes null there today, so it cannot place a session.
- * Once that write carries the session, its newest event belongs first here and
- * in `boardArmPrefilter`.
- *
- * At most three batched SQL reads regardless of how many sessions come in;
- * Redis is only asked about sessions the first three steps left unresolved,
- * and step 5 runs two parallel queries for whatever Redis left (plus one
- * tie-break query when a creator has several identical boards).
- */
-export async function resolveLiveSessionBoards(
-  sessions: ReadonlyArray<{
-    id: string;
-    boardId: number | null;
-    boardPath: string | null;
-    createdByUserId: string | null;
-  }>,
-): Promise<Map<string, number>> {
-  const resolved = new Map<string, number>();
-  if (sessions.length === 0) return resolved;
-
-  const sessionIds = sessions.map((session) => session.id);
-  const slugBySessionId = new Map<string, string>();
-  for (const session of sessions) {
-    const { slug } = parseSessionBoardPath(session.boardPath);
-    if (slug) slugBySessionId.set(session.id, slug);
-  }
-  const slugs = [...new Set(slugBySessionId.values())];
-
-  const ticks = dbSchema.boardseshTicks;
-  const [tickRows, slugRows] = await Promise.all([
-    db
-      .selectDistinctOn([ticks.sessionId], { sessionId: ticks.sessionId, boardId: ticks.boardId })
-      .from(ticks)
-      .where(and(inArray(ticks.sessionId, sessionIds), isNotNull(ticks.boardId)))
-      .orderBy(ticks.sessionId, desc(ticks.climbedAt), desc(ticks.id)),
-    slugs.length > 0
-      ? db
-          .select({ id: dbSchema.userBoards.id, slug: dbSchema.userBoards.slug })
-          .from(dbSchema.userBoards)
-          .where(and(inArray(dbSchema.userBoards.slug, slugs), isNull(dbSchema.userBoards.deletedAt)))
-      : Promise.resolve([]),
-  ]);
-
-  const tickBoardBySession = new Map<string, number>();
-  for (const row of tickRows) {
-    const boardId = toBoardId(row.boardId);
-    if (row.sessionId && boardId) tickBoardBySession.set(row.sessionId, boardId);
-  }
-  const boardIdBySlug = new Map(slugRows.map((row) => [row.slug, Number(row.id)]));
-
-  const unresolved: string[] = [];
-  for (const session of sessions) {
-    const slug = slugBySessionId.get(session.id);
-    const boardId =
-      tickBoardBySession.get(session.id) ?? toBoardId(session.boardId) ?? (slug ? boardIdBySlug.get(slug) : undefined);
-    if (boardId) {
-      resolved.set(session.id, boardId);
-    } else {
-      unresolved.push(session.id);
-    }
-  }
-
-  const redisBindings = await Promise.all(
-    unresolved.map(async (sessionId) => {
-      try {
-        return [sessionId, toBoardId(await pubsub.getSessionBoard(sessionId))] as const;
-      } catch (error) {
-        logger.warn(`[live-sessions] session→board binding read failed for ${sessionId}: ${String(error)}`);
-        return [sessionId, null] as const;
-      }
-    }),
-  );
-  for (const [sessionId, boardId] of redisBindings) {
-    if (boardId) resolved.set(sessionId, boardId);
-  }
-
-  const configBoards = await resolveCreatorConfigBoards(sessions.filter((session) => !resolved.has(session.id)));
-  for (const [sessionId, boardId] of configBoards) resolved.set(sessionId, boardId);
-
-  return resolved;
-}
-
-/**
- * Step 5 of `resolveLiveSessionBoards`: a config path matched against the
- * boards the session CREATOR owns or follows. Mobile builds a config path for
- * any LED board that is not a gym board, including a friend's wall the creator
- * only follows.
- *
- * Tiers, first non-empty tier decides: boards the creator owns, then boards
- * the creator follows. Within the deciding tier a single match wins; several
- * go to the board the creator most recently ticked on; anything else (never
- * ticked on any of them, or a tie) leaves the session unresolved. A board that
- * is neither owned nor followed by the creator is never picked, however
- * identical its config.
- *
- * Two batched queries in parallel (owned via the owner index, followed via the
- * follower index), plus one batched tick query only when a tier has a tie.
- */
-async function resolveCreatorConfigBoards(
-  sessions: ReadonlyArray<{ id: string; boardPath: string | null; createdByUserId: string | null }>,
-): Promise<Map<string, number>> {
-  const resolved = new Map<string, number>();
-  const lookups = sessions.flatMap((session) => {
-    const { config } = parseSessionBoardPath(session.boardPath);
-    return config && session.createdByUserId
-      ? [{ sessionId: session.id, creatorId: session.createdByUserId, config }]
-      : [];
-  });
-  if (lookups.length === 0) return resolved;
-
-  const userBoards = dbSchema.userBoards;
-  const boardFollows = dbSchema.boardFollows;
-  const ticks = dbSchema.boardseshTicks;
-  const distinctLookups = [
-    ...new Map(
-      lookups.map((lookup) => [
-        `${lookup.creatorId}|${lookup.config.boardType}|${lookup.config.layoutId}|${lookup.config.sizeId}`,
-        lookup,
-      ]),
-    ).values(),
-  ];
-  const configColumns = {
-    id: userBoards.id,
-    ownerId: userBoards.ownerId,
-    boardType: userBoards.boardType,
-    layoutId: userBoards.layoutId,
-    sizeId: userBoards.sizeId,
-    setIds: userBoards.setIds,
-  };
-  const configMatches = (config: ParsedBoardConfig) =>
-    and(
-      eq(userBoards.boardType, config.boardType),
-      eq(userBoards.layoutId, config.layoutId),
-      eq(userBoards.sizeId, config.sizeId),
-    );
-
-  const [ownedRows, followedRows] = await Promise.all([
-    db
-      .select(configColumns)
-      .from(userBoards)
-      .where(
-        and(
-          isNull(userBoards.deletedAt),
-          or(
-            ...distinctLookups.map(({ creatorId, config }) =>
-              and(eq(userBoards.ownerId, creatorId), configMatches(config)),
-            ),
-          ),
-        ),
-      ),
-    db
-      .select({ ...configColumns, followerId: boardFollows.userId })
-      .from(boardFollows)
-      .innerJoin(userBoards, eq(userBoards.uuid, boardFollows.boardUuid))
-      .where(
-        and(
-          isNull(userBoards.deletedAt),
-          or(
-            ...distinctLookups.map(({ creatorId, config }) =>
-              and(eq(boardFollows.userId, creatorId), configMatches(config)),
-            ),
-          ),
-        ),
-      ),
-  ]);
-
-  type ConfigRow = (typeof ownedRows)[number];
-  const sameConfig = (row: ConfigRow, config: ParsedBoardConfig) =>
-    row.boardType === config.boardType &&
-    Number(row.layoutId) === config.layoutId &&
-    Number(row.sizeId) === config.sizeId &&
-    normaliseSetIds(row.setIds) === config.setIds;
-
-  // The deciding tier for each session: owned boards if any match, else followed.
-  const tierBySession = new Map(
-    lookups.map(({ sessionId, creatorId, config }) => {
-      const owned = ownedRows.filter((row) => row.ownerId === creatorId && sameConfig(row, config));
-      const followed = followedRows.filter(
-        (row) => row.followerId === creatorId && row.ownerId !== creatorId && sameConfig(row, config),
-      );
-      const tier = owned.length > 0 ? owned : followed;
-      const uniqueBoards = [...new Map(tier.map((row) => [Number(row.id), row])).values()];
-      return [sessionId, { creatorId, boards: uniqueBoards }] as const;
-    }),
-  );
-
-  // Ties: read each tied board's newest tick by the creator, in one query.
-  const tied = [...tierBySession.values()].filter(({ boards }) => boards.length > 1);
-  const creatorLastTickedAt = new Map<string, number>();
-  if (tied.length > 0) {
-    const tickRows = await db
-      .select({
-        boardId: ticks.boardId,
-        userId: ticks.userId,
-        // Epoch seconds, so the comparison never depends on how the driver renders a timestamp.
-        lastTickedAt: sql<number>`EXTRACT(EPOCH FROM MAX(${ticks.climbedAt}))`.mapWith(Number),
-      })
-      .from(ticks)
-      .where(
-        and(
-          inArray(ticks.boardId, [...new Set(tied.flatMap(({ boards }) => boards.map((row) => Number(row.id))))]),
-          inArray(ticks.userId, [...new Set(tied.map(({ creatorId }) => creatorId))]),
-        ),
-      )
-      .groupBy(ticks.boardId, ticks.userId);
-    for (const row of tickRows) {
-      creatorLastTickedAt.set(`${row.boardId}|${row.userId}`, row.lastTickedAt);
-    }
-  }
-
-  for (const [sessionId, { creatorId, boards }] of tierBySession) {
-    if (boards.length === 1) {
-      resolved.set(sessionId, Number(boards[0].id));
-      continue;
-    }
-    const ticked = boards.flatMap((row) => {
-      const lastTickedAt = creatorLastTickedAt.get(`${Number(row.id)}|${creatorId}`);
-      return lastTickedAt === undefined || !Number.isFinite(lastTickedAt) ? [] : [{ row, lastTickedAt }];
-    });
-    const newest = Math.max(...ticked.map(({ lastTickedAt }) => lastTickedAt));
-    const newestBoards = ticked.filter(({ lastTickedAt }) => lastTickedAt === newest);
-    if (newestBoards.length === 1) resolved.set(sessionId, Number(newestBoards[0].row.id));
-  }
-  return resolved;
-}
-
-async function loadBoardRows(boardIds: readonly number[]): Promise<Map<number, BoardRow>> {
+async function loadBoardRows(
+  boardIds: readonly number[],
+  viewerId: string | null,
+  heldBoardIds: ReadonlySet<number>,
+): Promise<Map<number, BoardRow>> {
   if (boardIds.length === 0) return new Map();
   const rows = await db
     .select({
@@ -424,11 +138,14 @@ async function loadBoardRows(boardIds: readonly number[]): Promise<Map<number, B
       layoutId: dbSchema.userBoards.layoutId,
       angle: dbSchema.userBoards.angle,
       ownerId: dbSchema.userBoards.ownerId,
-      isPublic: dbSchema.userBoards.isPublic,
-      isUnlisted: dbSchema.userBoards.isUnlisted,
-      hideLocation: dbSchema.userBoards.hideLocation,
+      identityVisible: sql<boolean>`${resourceAccessCondition('board', dbSchema.userBoards.uuid, viewerId, {
+        allowUnlistedLink: false,
+        unlistedWhen: heldBoardIds.size > 0 ? inArray(dbSchema.userBoards.id, [...heldBoardIds]) : sql`false`,
+      })}`,
       deletedAt: dbSchema.userBoards.deletedAt,
       gymName: dbSchema.gyms.name,
+      gymIsPublic: dbSchema.gyms.isPublic,
+      gymIsListed: dbSchema.gyms.isListed,
     })
     .from(dbSchema.userBoards)
     .leftJoin(dbSchema.gyms, and(eq(dbSchema.gyms.id, dbSchema.userBoards.gymId), isNull(dbSchema.gyms.deletedAt)))
@@ -440,26 +157,31 @@ async function loadBoardRows(boardIds: readonly number[]): Promise<Map<number, B
  * The board as this viewer may see it, or null. Never leaks a board the viewer
  * could not otherwise find:
  *
- * - it must be live (not deleted) and anonymously readable (public, or a
- *   system-shared board — the one anon rule, `isRowAnonReadable`), or owned;
- * - an UNLISTED board is reachable by link, never enumerated, so it is only
- *   named to a viewer who already holds it: they follow it, selected it, or
- *   are reading that board's own sheet (`heldBoardIds`). Same rule as the tick
- *   feeds' `canShowBoard`;
- * - a spray wall additionally needs the wall's own enumerable rule, since a
- *   public-flagged wall can still be admin-hidden or scoped to a gym.
+ * - it must be live (not deleted) and readable under the board's policy, read
+ *   the way `resourceAccess` reads it (the `resource_privacy` row first, the
+ *   legacy booleans second), so an Unlisted board saved with the current
+ *   controls (`is_public = false`) is judged by its audience, not its flag;
+ * - a board the viewer holds the link of (`heldBoardIds`: they follow it,
+ *   selected it by uuid, or presented its uuid with the board's own sheet) gets
+ *   the link reading. Any other board, including one named only by a session
+ *   or by the numeric id the sheet was asked for, gets the no-link reading: an
+ *   Unlisted board is named only to people who already hold it;
+ * - a spray wall additionally needs its current wall rule; a held UUID permits
+ *   Unlisted access, while an admin hide still withdraws it from non-owners.
  */
 async function toVisibleBoard(
   row: BoardRow | undefined,
   viewerId: string | null,
-  heldBoardIds: ReadonlySet<number>,
+  linkHeld: boolean,
 ): Promise<LiveSessionBoard | null> {
-  if (!row || row.deletedAt) return null;
+  if (!row || row.deletedAt || !row.identityVisible) return null;
   const isOwner = viewerId !== null && row.ownerId === viewerId;
+  if (row.gymIsListed === false && !linkHeld && !isOwner) return null;
   if (!isOwner) {
-    if (!isRowAnonReadable(row)) return null;
-    if (row.isUnlisted && !heldBoardIds.has(row.id)) return null;
-    if (isSprayBoardType(row.boardType) && !(await sprayBoardRowIsReadable(row, viewerId, 'enumerable'))) {
+    if (
+      isSprayBoardType(row.boardType) &&
+      !(await sprayBoardRowIsReadable(row, viewerId, linkHeld ? 'capability' : 'enumerable', db))
+    ) {
       return null;
     }
   }
@@ -468,7 +190,10 @@ async function toVisibleBoard(
     name: row.name,
     slug: row.slug,
     boardType: row.boardType,
-    gymName: row.hideLocation && !isOwner ? null : row.gymName,
+    // The gym is the board's place: its location policy decides, except that a
+    // public gym's name is shown to everyone (projectBoardLocation).
+    gymName:
+      row.gymIsPublic === true || isOwner || (await canViewResourceLocation(row.uuid, viewerId)) ? row.gymName : null,
   };
 }
 
@@ -476,8 +201,8 @@ async function toVisibleBoard(
  * Whether a board may drive the board arm for this viewer. A spray wall that
  * went private, lost the viewer's gym membership or was hidden by an admin
  * stops listing its sessions even though the follow row survives. Uses the
- * enumerable rule for every spray wall: the capability form's unlisted
- * exemption does not check the admin-hidden flag.
+ * enumerable rule for discovery arms; a remembered numeric association is
+ * not a presented Unlisted link. Sheet projections separately retain a held UUID.
  */
 async function viewerMayUseBoardArm(
   row: { boardType: string; layoutId: number; ownerId: string },
@@ -538,52 +263,35 @@ function recentParticipantRowExists(userCondition: SQL, now: Date): SQL {
 }
 
 /**
- * The SQL half of the visibility rule. A private session only passes when the
- * viewer created it or joined it inside the candidate window; the live roster
+ * The SQL half of the visibility rule. Listings are discovery, not a link: an
+ * unlisted session (a legacy private one) only passes for the viewer who
+ * created it or joined it inside the candidate window, and the live roster
  * confirms the latter afterwards.
  */
 function visibilityPrefilter(viewerId: string | null, now: Date): SQL {
-  if (!viewerId) return eq(boardSessions.isPublic, true);
-  return anyOf(
-    eq(boardSessions.isPublic, true),
-    eq(boardSessions.createdByUserId, viewerId),
-    recentParticipantRowExists(eq(dbSchema.boardSessionParticipants.userId, viewerId), now),
-  );
+  return resourceAccessCondition('session', boardSessions.id, viewerId, {
+    allowUnlistedLink: false,
+    unlistedWhen: viewerId
+      ? recentParticipantRowExists(eq(dbSchema.boardSessionParticipants.userId, viewerId), now)
+      : undefined,
+  });
 }
 
 /**
- * Every durable or live way a session can point at one of `boards`. Mirrors
- * the resolution order in `resolveLiveSessionBoards` (which still decides the
- * final board — this only keeps the 50-row cap honest).
+ * Coarse SQL matches for every way a session can point at one of `boards`.
+ * Stronger current-board evidence can override a historical tick; metadata
+ * paging resolves that precedence before a match counts toward the cap.
  */
 function boardArmPrefilter(boards: readonly ArmBoard[], redisBoundSessionIds: readonly string[]): SQL | undefined {
   if (boards.length === 0) return undefined;
   const boardIds = boards.map((board) => board.id);
   const slugs = [...new Set(boards.map((board) => board.slug))];
+  // A spray layout identifies one wall; catalogue configurations do not.
+  const sprayLayouts = [
+    ...new Set(boards.filter((board) => board.boardType === 'spray').map((board) => String(board.layoutId))),
+  ];
   const ticks = dbSchema.boardseshTicks;
   const trimmedPath = sql`ltrim(${boardSessions.boardPath}, '/')`;
-  // Step 5's shape: the board's owner, or someone following it, started the
-  // session on a config path naming its type, layout and size. Set ids are
-  // left to the resolver, which normalises them; the prefilter only has to be
-  // a superset. The follower probe is one lookup on the unique
-  // (user_id, board_uuid) index per surviving session.
-  const followsBoard = dbSchema.boardFollows;
-  const creatorConfigPaths = boards.map((board) =>
-    and(
-      sql`split_part(${trimmedPath}, '/', 1) = ${board.boardType}`,
-      sql`split_part(${trimmedPath}, '/', 2) = ${String(board.layoutId)}`,
-      sql`split_part(${trimmedPath}, '/', 3) = ${String(board.sizeId)}`,
-      or(
-        eq(boardSessions.createdByUserId, board.ownerId),
-        exists(
-          db
-            .select({ one: sql`1` })
-            .from(followsBoard)
-            .where(and(eq(followsBoard.boardUuid, board.uuid), eq(followsBoard.userId, boardSessions.createdByUserId))),
-        ),
-      ),
-    ),
-  );
   return or(
     exists(
       db
@@ -593,8 +301,10 @@ function boardArmPrefilter(boards: readonly ArmBoard[], redisBoundSessionIds: re
     ),
     inArray(boardSessions.boardId, boardIds),
     and(like(trimmedPath, 'b/%'), inArray(sql`split_part(${trimmedPath}, '/', 2)`, slugs)),
+    sprayLayouts.length > 0
+      ? and(like(trimmedPath, 'spray/%'), inArray(sql`split_part(${trimmedPath}, '/', 2)`, sprayLayouts))
+      : undefined,
     redisBoundSessionIds.length > 0 ? inArray(boardSessions.id, [...redisBoundSessionIds]) : undefined,
-    ...creatorConfigPaths,
   );
 }
 
@@ -613,14 +323,50 @@ async function readBoardBoundSessionIds(boardIds: readonly number[]): Promise<st
   return [...new Set(sessionIds.filter((sessionId): sessionId is string => Boolean(sessionId)))];
 }
 
-async function loadCandidates(where: SQL): Promise<CandidateSession[]> {
-  const rows = await db
-    .select(candidateColumns)
-    .from(boardSessions)
-    .where(where)
-    .orderBy(desc(boardSessions.lastActivity), desc(boardSessions.id))
-    .limit(LIVE_SESSION_CANDIDATE_CAP);
-  return rows.map((row) => ({ ...row, boardId: toBoardId(row.boardId) }));
+async function loadCandidates(where: SQL, boardIds: ReadonlySet<number>, socialArm?: SQL): Promise<CandidateSession[]> {
+  const candidates: CandidateSession[] = [];
+  const seen = new Set<string>();
+  let cursor: { lastActivity: string; id: string } | undefined;
+  // Only light metadata and board resolution run outside the 50-candidate cap.
+  // The fixed four-hour lookback bounds this scan to the active candidate set;
+  // strict keyset ordering and deduplication keep updates from repeating rows.
+  while (candidates.length < LIVE_SESSION_CANDIDATE_CAP) {
+    const rows = await db
+      .select({
+        ...candidateColumns,
+        // Keep PostgreSQL's full timestamp precision for the next page.
+        cursorAt: sql<string>`${boardSessions.lastActivity}::text`,
+        socialMatch: socialArm ? sql<boolean>`COALESCE((${socialArm}), false)` : sql<boolean>`false`,
+      })
+      .from(boardSessions)
+      .where(
+        allOf(
+          where,
+          cursor
+            ? sql`(${boardSessions.lastActivity}, ${boardSessions.id}) < (${cursor.lastActivity}::timestamp, ${cursor.id})`
+            : undefined,
+        ),
+      )
+      .orderBy(desc(boardSessions.lastActivity), desc(boardSessions.id))
+      .limit(LIVE_SESSION_CANDIDATE_CAP);
+    if (rows.length === 0) break;
+    const batch = rows.map(({ cursorAt: _cursorAt, socialMatch: _socialMatch, ...row }) => ({
+      ...row,
+      boardId: toBoardId(row.boardId),
+    }));
+    const resolvedBoards = boardIds.size > 0 ? await resolveSessionBoards(batch) : new Map<string, number>();
+    for (const [index, candidate] of batch.entries()) {
+      if (seen.has(candidate.id)) continue;
+      seen.add(candidate.id);
+      const boardId = resolvedBoards.get(candidate.id);
+      if (rows[index].socialMatch || (boardId !== undefined && boardIds.has(boardId))) candidates.push(candidate);
+      if (candidates.length === LIVE_SESSION_CANDIDATE_CAP) break;
+    }
+    const lastCandidateRow = rows[rows.length - 1];
+    cursor = { lastActivity: lastCandidateRow.cursorAt, id: lastCandidateRow.id };
+    if (rows.length < LIVE_SESSION_CANDIDATE_CAP) break;
+  }
+  return candidates;
 }
 
 // ---------------------------------------------------------------------------
@@ -685,6 +431,11 @@ async function loadTickStats(sessionIds: readonly string[]): Promise<Map<string,
       hardestGradeName: sql<
         string | null
       >`(ARRAY_AGG(${difficultyNameWithFallbackExpr} ORDER BY ${hardestOrder}) FILTER (WHERE ${isSend}))[1]`,
+      // The hardest send's own board, so the fallback label below is on that
+      // board's scale (MoonBoard's 16 is "6a/V2", not the shared "6a/V3").
+      hardestBoardType: sql<
+        string | null
+      >`(ARRAY_AGG(${ticks.boardType} ORDER BY ${hardestOrder}) FILTER (WHERE ${isSend}))[1]`,
     })
     .from(ticks)
     .leftJoin(aliases, and(eq(aliases.boardType, ticks.boardType), eq(aliases.aliasUuid, ticks.climbUuid)))
@@ -709,20 +460,23 @@ async function loadTickStats(sessionIds: readonly string[]): Promise<Map<string,
       sendCount: Number(row.sendCount),
       flashCount: Number(row.flashCount),
       hardestSendGrade:
-        row.hardestGradeName || (hardestDifficulty != null ? getGradeLabel(hardestDifficulty) : null) || null,
+        row.hardestGradeName ||
+        (hardestDifficulty != null ? getGradeLabel(hardestDifficulty, row.hardestBoardType) : null) ||
+        null,
     });
   }
   return stats;
 }
 
 /**
- * The climb on the wall, through the board queue preview's redaction
- * (`toBoardQueuePreviewItem`: catalog fields only, never who added it).
+ * The climb on the wall, authorized for this viewer before selecting display
+ * fields. Session access alone never authorizes a restricted authored climb.
  */
-async function loadCurrentClimb(sessionId: string): Promise<LiveSessionClimb | null> {
+async function loadCurrentClimb(sessionId: string, viewerId: string | null): Promise<LiveSessionClimb | null> {
   try {
     const queueState = await roomManager.getQueueState(sessionId);
     if (!queueState.currentClimbQueueItem) return null;
+    if (!(await canReadClimbContent(queueState.currentClimbQueueItem.climb.uuid, viewerId))) return null;
     const redacted = toBoardQueuePreviewItem(queueState.currentClimbQueueItem);
     return redacted.name ? { name: redacted.name, grade: redacted.grade ?? null } : null;
   } catch (error) {
@@ -801,7 +555,7 @@ async function buildLiveSessions(params: BuildLiveSessionsParams): Promise<LiveS
   });
   if (live.length === 0) return [];
 
-  const boardBySession = await resolveLiveSessionBoards(live);
+  const boardBySession = await resolveSessionBoards(live);
   // Board mode never lists a session on another board, so it never pays for
   // that session's roster.
   const shortlist =
@@ -810,14 +564,24 @@ async function buildLiveSessions(params: BuildLiveSessionsParams): Promise<LiveS
       : live;
   if (shortlist.length === 0) return [];
 
-  const rosters = await Promise.all(shortlist.map((candidate) => loadRoster(candidate.id)));
+  // `withoutLink` is discovery access; `withLink` is what the invite link
+  // opens. A session the viewer may only reach by link is listed only once the
+  // live roster shows them in it. One policy load per candidate.
+  const sessionAccess = await Promise.all(
+    shortlist.map((candidate) => resourceAccess('session', candidate.id, viewerId)),
+  );
+  const rosters = await Promise.all(
+    shortlist.map((candidate, index) =>
+      sessionAccess[index].withLink ? loadRoster(candidate.id) : Promise.resolve([]),
+    ),
+  );
   const withRosters = shortlist.flatMap((candidate, index) => {
     const roster = rosters[index];
     const viewerIsMember =
       viewerId !== null &&
       (candidate.createdByUserId === viewerId || roster.some((member) => member.userId === viewerId));
-    // Visibility: a private session is pruned for everyone not in it.
-    if (!candidate.isPublic && !viewerIsMember) return [];
+    // Visibility: an unlisted or restricted session is pruned for everyone not in it.
+    if (!sessionAccess[index].withoutLink && !(sessionAccess[index].withLink && viewerIsMember)) return [];
     return [{ candidate, roster, viewerIsMember }];
   });
   if (withRosters.length === 0) return [];
@@ -832,13 +596,29 @@ async function buildLiveSessions(params: BuildLiveSessionsParams): Promise<LiveS
       )
     : new Set<string>();
 
+  // The preference beats the follow: a followed climber who stays anonymous on
+  // a session's board neither lists it as a following session, lifts it up the
+  // rail, nor shows among its followed climbers. Judged on the board the card
+  // shows, the one the session itself is on. One query, and none unless the
+  // viewer follows somebody on these rosters.
+  const namedFollowed = await sessionsVisibleUserIds(
+    withRosters.map(({ candidate, roster }) => ({
+      session: candidate,
+      userIds: [...signedInUserIds(roster), candidate.createdByUserId].filter(
+        (userId) => !!userId && followed.has(userId),
+      ),
+    })),
+    viewerId,
+    boardBySession,
+  );
+
   const listed: ListedSession[] = [];
-  for (const entry of withRosters) {
+  for (const [index, entry] of withRosters.entries()) {
     const { candidate, roster, viewerIsMember } = entry;
     // Only a followed climber who is actually on the live roster counts — a
     // participant row is permanent and outlives leaving.
-    const followedParticipantIds = signedInUserIds(roster).filter((userId) => followed.has(userId));
-    const followsCreator = candidate.createdByUserId !== null && followed.has(candidate.createdByUserId);
+    const followedParticipantIds = signedInUserIds(roster).filter((userId) => namedFollowed[index].has(userId));
+    const followsCreator = candidate.createdByUserId !== null && namedFollowed[index].has(candidate.createdByUserId);
     const boardId = boardBySession.get(candidate.id);
     const matchedBoardReasons = boardReasons(boardId);
 
@@ -856,20 +636,35 @@ async function buildLiveSessions(params: BuildLiveSessionsParams): Promise<LiveS
   const page = listed.sort(compareListed).slice(0, limit);
   if (page.length === 0) return [];
 
-  const [profiles, tickStats, boardRows] = await Promise.all([
-    loadProfiles(
-      page.flatMap(({ candidate, roster }) => [
-        ...signedInUserIds(roster),
-        ...(candidate.createdByUserId ? [candidate.createdByUserId] : []),
-      ]),
-    ),
+  const pageUserIds = page.flatMap(({ candidate, roster }) => [
+    ...signedInUserIds(roster),
+    ...(candidate.createdByUserId ? [candidate.createdByUserId] : []),
+  ]);
+  // Every climber on the page is named by their own account, unless they stay
+  // anonymous on boards they don't own and the card's board is not theirs.
+  // Following them does not override that. One lookup for the page.
+  const [profiles, tickStats, boardRows, visibleByCard] = await Promise.all([
+    loadProfiles(pageUserIds),
     loadTickStats(page.map(({ candidate }) => candidate.id)),
-    loadBoardRows(page.flatMap(({ boardId }) => (boardId ? [boardId] : []))),
+    loadBoardRows(
+      page.flatMap(({ boardId }) => (boardId ? [boardId] : [])),
+      viewerId,
+      heldBoardIds,
+    ),
+    sessionsVisibleUserIds(
+      page.map(({ candidate, roster }) => ({
+        session: candidate,
+        userIds: [...signedInUserIds(roster), candidate.createdByUserId],
+      })),
+      viewerId,
+      boardBySession,
+    ),
   ]);
 
   return Promise.all(
-    page.map(async (entry): Promise<LiveSession> => {
+    page.map(async (entry, pageIndex): Promise<LiveSession> => {
       const { candidate, roster, followedParticipantIds } = entry;
+      const visibleUserIds = visibleByCard[pageIndex];
       const boardRow = entry.boardId ? boardRows.get(entry.boardId) : undefined;
       const parsedPath = parseSessionBoardPath(candidate.boardPath);
       const boardType = parsedPath.boardType ?? boardRow?.boardType ?? null;
@@ -893,21 +688,26 @@ async function buildLiveSessions(params: BuildLiveSessionsParams): Promise<LiveS
         return true;
       });
       const followedSet = new Set(followedParticipantIds);
+      const visibleMembers = new Set(
+        members.map((member) => member.userId).filter((userId) => visibleUserIds.has(userId)),
+      );
       const participants = [
         ...members.filter((member) => followedSet.has(member.userId)),
         ...members.filter((member) => !followedSet.has(member.userId)),
       ]
+        .filter((member) => visibleMembers.has(member.userId))
         .slice(0, LIVE_SESSION_ROSTER_CAP)
         .map((member) => toUser(member.userId, member));
 
-      const creatorId = candidate.createdByUserId;
+      const creatorId =
+        candidate.createdByUserId && visibleUserIds.has(candidate.createdByUserId) ? candidate.createdByUserId : null;
       const [board, currentClimb] = await Promise.all([
-        toVisibleBoard(boardRow, viewerId, heldBoardIds),
+        toVisibleBoard(boardRow, viewerId, entry.boardId !== undefined && heldBoardIds.has(entry.boardId)),
         // Public sessions only, and only when the board type is known and is
         // not a spray wall: a spray wall's climbs stay private to the wall even
         // when the session is public, and an unknown type could be one.
         candidate.isPublic && boardType !== null && !isSprayBoardType(boardType)
-          ? loadCurrentClimb(candidate.id)
+          ? loadCurrentClimb(candidate.id, viewerId)
           : Promise.resolve(null),
       ]);
 
@@ -928,7 +728,7 @@ async function buildLiveSessions(params: BuildLiveSessionsParams): Promise<LiveS
         // The live roster is deduped by participant, so its length is the
         // display head-count (anonymous connections included).
         participantCount: roster.length,
-        followedParticipantIds,
+        followedParticipantIds: followedParticipantIds.filter((userId) => visibleMembers.has(userId)),
         viewerIsMember: entry.viewerIsMember,
         isPublic: candidate.isPublic,
         board,
@@ -1051,6 +851,8 @@ export async function findFollowedLiveSessions(
       visibilityPrefilter(viewerId, now),
       anyOf(socialArm, boardArmPrefilter([...armBoards.values()], redisBoundSessionIds)),
     ),
+    new Set(armBoards.keys()),
+    socialArm,
   );
 
   const followedBoardIds = new Set(followedBoards.map((board) => board.id));
@@ -1073,9 +875,15 @@ export async function findFollowedLiveSessions(
 /**
  * A board's presence sheet: the live sessions on this board. The caller has
  * already applied the board's read gate (see `boardLiveSessions`); anonymous
- * viewers (`viewerId` null) only see public sessions.
+ * viewers (`viewerId` null) only see public sessions. `linkHeld` says the
+ * caller presented the board's uuid, not just its countable numeric id: only
+ * then may an Unlisted board's own name, slug and uuid ride on the sessions.
  */
-export async function findBoardLiveSessions(boardId: number, viewerId: string | null): Promise<LiveSession[]> {
+export async function findBoardLiveSessions(
+  boardId: number,
+  viewerId: string | null,
+  options: { linkHeld: boolean },
+): Promise<LiveSession[]> {
   const now = new Date();
   const [boardRow] = await db
     .select({
@@ -1096,6 +904,7 @@ export async function findBoardLiveSessions(boardId: number, viewerId: string | 
   const redisBoundSessionIds = await readBoardBoundSessionIds([board.id]);
   const candidates = await loadCandidates(
     allOf(candidateBase(now), visibilityPrefilter(viewerId, now), boardArmPrefilter([board], redisBoundSessionIds)),
+    new Set([board.id]),
   );
 
   return buildLiveSessions({
@@ -1104,8 +913,9 @@ export async function findBoardLiveSessions(boardId: number, viewerId: string | 
     now,
     limit: BOARD_LIVE_SESSIONS_LIMIT,
     mode: 'board',
-    // The caller passed this board's read gate to get here, so it is held.
-    heldBoardIds: new Set([board.id]),
+    // Held only when the caller presented the board's link. The numeric id
+    // passed the no-link gate, which says nothing about holding an Unlisted board.
+    heldBoardIds: options.linkHeld ? new Set([board.id]) : new Set<number>(),
     boardReasons: (resolvedBoardId) => (resolvedBoardId === board.id ? ['SELECTED_BOARD'] : []),
   });
 }

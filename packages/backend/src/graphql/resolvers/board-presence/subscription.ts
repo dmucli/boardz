@@ -1,14 +1,17 @@
+import { isSupportedBoardClimb } from '@boardsesh/board-presence';
+import { redactBoardEvent } from '../../../services/board-session-privacy';
 import type { ConnectionContext, BoardPresenceEvent } from '@boardsesh/shared-schema';
 import { pubsub } from '../../../pubsub/index';
 import { kilterLiveSync } from '../../../services/kilter-live-sync';
+import { auroraLiveSync, isAuroraLiveEnabled } from '../../../services/aurora-live-sync';
 import { createEagerAsyncIterator } from '../shared/async-iterators';
 import { withSubscriptionCleanup } from '../shared/managed-subscription';
 import { applyRateLimit } from '../shared/helpers';
-import { requireAnonReadableBoard } from './shared';
+import { assertValidBoardId, requireAnonReadableBoard } from './shared';
 import { and, eq, isNull } from 'drizzle-orm';
 import * as dbSchema from '@boardsesh/db/schema';
 import { db } from '../../../db/client';
-import { assertSprayBoardIsReadable, sprayStreamGate } from '../climbs/spray-read-access';
+import { assertSprayBoardIsReadable, readViewerIdForBoard, sprayStreamGate } from '../climbs/spray-read-access';
 
 export const boardPresenceSubscriptions = {
   /**
@@ -16,8 +19,10 @@ export const boardPresenceSubscriptions = {
    * presence is universal, so anonymous viewers are first-class (they need to
    * watch to see the holder + who's connected). A rate limit (so an anonymous
    * client can't loop board ids and grow the subscriber set unbounded) plus
-   * `assertValidBoardId` bound it; it is otherwise membership-free — anyone who
-   * can name the board_id may watch. Keyed on the shared board_id; no driver.
+   * `assertValidBoardId` bound it; it is otherwise membership-free. The board
+   * id alone is the no-link reading (it can be counted); an Unlisted board's
+   * feed opens when the caller also presents its uuid (`boardUuid`). Keyed on
+   * the shared board_id; no driver.
    *
    * Eager subscribe: `createEagerAsyncIterator` awaits the Redis channel
    * subscribe before the first yield so a `reportBoardClimb` that lands during
@@ -27,7 +32,11 @@ export const boardPresenceSubscriptions = {
     subscribe: withSubscriptionCleanup(async function* (
       lifetime,
       _: unknown,
-      { boardId }: { boardId: number },
+      {
+        boardId,
+        boardUuid,
+        includeAurora,
+      }: { boardId: number; boardUuid?: string | null; includeAurora?: boolean | null },
       ctx: ConnectionContext,
     ) {
       // Bumped to the same 60/min budget as the sibling anon-tolerant reads
@@ -39,23 +48,44 @@ export const boardPresenceSubscriptions = {
       // poll rather than in a tight loop, so 60/min still leaves room for a
       // gym's worth of screens.
       await applyRateLimit(ctx, 60, 'boardNowPlaying');
-      // Validates the id and, for anonymous viewers, restricts to public /
-      // system-shared boards (not a private wall reached by enumerating ids);
-      // logged-in callers are unbounded.
-      await requireAnonReadableBoard(boardId, ctx.userId);
-      // …and the wall's own rule on top, because the line above waves through ANY
-      // authenticated caller and `boardId` is a small integer. The events on this
+      assertValidBoardId(boardId);
+      // The row first: whose board it is decides whether a wall device's key reads
+      // it as its owner (readViewerIdForBoard), and the spray rule below needs its
+      // type and layout.
+      const loadBoard = async () => {
+        const [row] = await db
+          .select({
+            boardType: dbSchema.userBoards.boardType,
+            layoutId: dbSchema.userBoards.layoutId,
+            ownerId: dbSchema.userBoards.ownerId,
+          })
+          .from(dbSchema.userBoards)
+          .where(and(eq(dbSchema.userBoards.id, boardId), isNull(dbSchema.userBoards.deletedAt)))
+          .limit(1);
+        return row;
+      };
+      // A controller key (no ctx.userId) is re-judged per event: the board can
+      // change hands and the controller can be deleted while the socket is open.
+      const isKeyReader = !ctx.userId && ctx.controllerOwnerUserId !== undefined;
+      const presenceBoard = await loadBoard();
+      // Read access for the gates and the climb half of the redaction: the
+      // signed-in user, or a wall device's key owner on a board that owner owns.
+      // The rate limit above, the Kilter live-sync lease and the names in the
+      // redaction below stay on ctx.userId, so a key reads its owner's own boards
+      // and nothing more.
+      const readerId = await readViewerIdForBoard(ctx, presenceBoard);
+      // Validates the id and applies the board gate: the no-link reading for the
+      // id alone (not a private or Unlisted wall reached by counting ids), the
+      // link reading when `boardUuid` is this board's own.
+      await requireAnonReadableBoard(boardId, readerId, boardUuid);
+      // …and the wall's own rule on top, because the board policy above does not
+      // know the spray wall rule and `boardId` is a small integer. The events on this
       // channel carry the climb's name and frames (`reportBoardClimb`, and the
       // hardest-send name in `publishBoardStats`), so without this a signed-in
       // caller could walk the ids and watch a private spray wall live. The sibling
       // QUERIES were patched for exactly this; the subscription was missed.
-      const [presenceBoard] = await db
-        .select({ boardType: dbSchema.userBoards.boardType, layoutId: dbSchema.userBoards.layoutId })
-        .from(dbSchema.userBoards)
-        .where(and(eq(dbSchema.userBoards.id, boardId), isNull(dbSchema.userBoards.deletedAt)))
-        .limit(1);
       if (presenceBoard) {
-        await assertSprayBoardIsReadable(presenceBoard, ctx.userId);
+        await assertSprayBoardIsReadable(presenceBoard, readerId, boardUuid, db);
       }
 
       const boardKey = String(boardId);
@@ -63,12 +93,24 @@ export const boardPresenceSubscriptions = {
       const asyncIterator = await lifetime.own(
         createEagerAsyncIterator<BoardPresenceEvent>(async (push) => {
           const unsubscribe = await pubsub.subscribeBoardPresence(boardKey, push);
+          // Replay a "Turn off all lights" that is still the wall's latest state
+          // (#7015). The history backfill only carries climbs, so without this a
+          // late joiner would put the cleared climb back on the wall. Pushed
+          // through the iterator, after the live subscribe, so it passes the same
+          // per-event access gate and redaction as live events, and a set that
+          // lands in between outranks it by seq on the client.
+          const activeClear = await pubsub.getActiveBoardClear(boardKey);
+          if (activeClear) push({ __typename: 'BoardClimbCleared', ...activeClear });
           // The managed lifetime closes late setup and idle subscriptions.
           // Keep the polling lease in the same owned source as its listener.
-          const stopWatching =
-            !lifetime.closed && ctx.userId && presenceBoard?.boardType === 'kilter'
-              ? kilterLiveSync.watch(boardId, ctx.userId, ctx.connectionId)
-              : () => {};
+          let stopWatching = () => {};
+          if (!lifetime.closed && ctx.userId && presenceBoard) {
+            if (presenceBoard.boardType === 'kilter') {
+              stopWatching = kilterLiveSync.watch(boardId, ctx.userId, ctx.connectionId);
+            } else if (includeAurora === true && isAuroraLiveEnabled(presenceBoard.boardType)) {
+              stopWatching = auroraLiveSync.watch(boardId, ctx.userId, ctx.connectionId);
+            }
+          }
           return () => {
             stopWatching();
             unsubscribe();
@@ -80,10 +122,31 @@ export const boardPresenceSubscriptions = {
       // it: a wall going private, or a revoked gym membership, has to end a stream
       // that is already running. Ending the iterator is the subscription's empty
       // page — no error naming a wall the caller may no longer see.
-      const gate = sprayStreamGate(presenceBoard?.boardType, presenceBoard?.layoutId, ctx.userId);
       for await (const event of asyncIterator) {
+        const eventReaderId = isKeyReader ? await readViewerIdForBoard(ctx, await loadBoard()) : readerId;
+        await requireAnonReadableBoard(boardId, eventReaderId, boardUuid);
+        const gate = sprayStreamGate(presenceBoard?.boardType, presenceBoard?.layoutId, eventReaderId, boardUuid, db);
         if (gate && !(await gate())) return;
-        yield { boardNowPlaying: event };
+        // Old installed clients classify unknown sources as native. Do not
+        // deliver Aurora displays until that subscription opts into them.
+        if (
+          event.__typename === 'BoardClimbSet' &&
+          (!isSupportedBoardClimb(event.climb) || (includeAurora !== true && event.climb.source === 'aurora'))
+        )
+          continue;
+        const compatibleEvent =
+          event.__typename === 'BoardHistoryUpdated'
+            ? {
+                ...event,
+                climbs: event.climbs.filter(
+                  (climb) => isSupportedBoardClimb(climb) && (includeAurora === true || climb.source !== 'aurora'),
+                ),
+              }
+            : event;
+        if (compatibleEvent.__typename === 'BoardHistoryUpdated' && compatibleEvent.climbs.length === 0) continue;
+        yield {
+          boardNowPlaying: await redactBoardEvent(compatibleEvent, ctx.userId, boardId, boardUuid, eventReaderId),
+        };
       }
     }),
   },

@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from 'vitest';
 import { buildBoardLookModel, type BoardLookModelInput } from '../board-look-model';
-import type { MoreNavRow } from '../../../MoreForm.types';
+import type { MoreNavRow, MoreSection } from '../../../MoreForm.types';
 import type { BoardLookSuggestion } from '../../../../lib/board-render/board-look-suggestions';
+
+// Stand-ins for the lighting half; its own builder is covered in board-lighting-model.test.ts.
+const LIGHTING_SECTIONS: MoreSection[] = [
+  { key: 'lighting', title: 'Board lighting', rows: [] },
+  { key: 'bluetooth', title: 'Bluetooth', rows: [] },
+];
 
 function makeInput(overrides: Partial<BoardLookModelInput> = {}): BoardLookModelInput {
   return {
@@ -17,10 +23,13 @@ function makeInput(overrides: Partial<BoardLookModelInput> = {}): BoardLookModel
     t: (key: string, options?: Record<string, unknown>) => (options ? `${key}:${JSON.stringify(options)}` : key),
     onOpenCustomLook: vi.fn(),
     onOpenAccessibility: vi.fn(),
-    onResetBoardLook: vi.fn(),
     suggestion: null,
     onApplySuggestion: vi.fn(),
     onDismissSuggestion: vi.fn(),
+    sprayWalls: null,
+    moonboardGridLabels: null,
+    gpuAcceleration: null,
+    lightingSections: LIGHTING_SECTIONS,
     ...overrides,
   };
 }
@@ -38,12 +47,28 @@ function navRow(input: BoardLookModelInput, key: string): MoreNavRow {
 }
 
 describe('buildBoardLookModel — what the screen leads with', () => {
-  it('puts the presets rail first, then the two destinations, then the reset', () => {
-    expect(sectionKeys(makeInput())).toEqual(['presets', 'destinations', 'reset']);
+  it('puts the presets rail first, then the two destinations, then lighting and Bluetooth', () => {
+    expect(sectionKeys(makeInput())).toEqual(['presets', 'destinations', 'lighting', 'bluetooth']);
+  });
+
+  // The player's preview-first card sends a climber here for the keep-lighting
+  // choice, and a SwiftUI Form can't scroll to a section, so the group leads.
+  it('leads with lighting and Bluetooth when opened for them, the looks after', () => {
+    expect(sectionKeys(makeInput({ leadWithLighting: true }))).toEqual([
+      'lighting',
+      'bluetooth',
+      'presets',
+      'destinations',
+    ]);
   });
 
   it('drops the rail entirely when there is no board to draw', () => {
-    expect(sectionKeys(makeInput({ carousel: null }))).toEqual(['destinations', 'reset']);
+    expect(sectionKeys(makeInput({ carousel: null }))).toEqual(['destinations', 'lighting', 'bluetooth']);
+  });
+
+  it('has no reset of its own: each leaf resets what it shows', () => {
+    const keys = buildBoardLookModel(makeInput()).sections.flatMap((section) => section.rows.map((row) => row.key));
+    expect(keys).not.toContain('resetBoardLook');
   });
 
   it('hosts the rail full-bleed at the height it was given', () => {
@@ -84,6 +109,10 @@ describe('buildBoardLookModel — what the nav rows say is behind them', () => {
     );
   });
 
+  it('names the hold-marker leaf after what it holds', () => {
+    expect(navRow(makeInput(), 'accessibility').label).toBe('mobile.settings.boardLook.accessibility.pageTitle');
+  });
+
   it('reports default markers when nothing has been customised', () => {
     expect(navRow(makeInput(), 'accessibility').subtitle).toBe(
       'mobile.settings.boardLook.accessibility.rowSubtitleDefault',
@@ -95,20 +124,79 @@ describe('buildBoardLookModel — what the nav rows say is behind them', () => {
   });
 });
 
-describe('buildBoardLookModel — the reset', () => {
-  it('carries the note promising hold colours are left alone', () => {
-    const reset = buildBoardLookModel(makeInput()).sections.at(-1);
-    expect(reset?.footer).toBe('mobile.settings.boardLook.resetAllNote');
+describe('buildBoardLookModel — spray walls', () => {
+  it('leaves the section out for a climber without spray walls', () => {
+    expect(sectionKeys(makeInput())).not.toContain('sprayWalls');
   });
 
-  it('fires only the board-look reset', () => {
-    const onResetBoardLook = vi.fn();
-    const row = buildBoardLookModel(makeInput({ onResetBoardLook }))
-      .sections.flatMap((section) => section.rows)
-      .find((candidate) => candidate.key === 'resetBoardLook');
-    if (row?.kind !== 'button') throw new Error('no reset button');
-    row.onPress();
-    expect(onResetBoardLook).toHaveBeenCalledTimes(1);
+  it('sits between the destinations and the lighting, and flips the setting', () => {
+    const onUseOwnLookChange = vi.fn();
+    const input = makeInput({ sprayWalls: { useOwnLook: false, onUseOwnLookChange } });
+    expect(sectionKeys(input)).toEqual(['presets', 'destinations', 'sprayWalls', 'lighting', 'bluetooth']);
+
+    const section = buildBoardLookModel(input).sections.find((candidate) => candidate.key === 'sprayWalls');
+    expect(section?.footer).toBe('mobile.settings.boardLook.sprayWalls.footer');
+    const row = section?.rows[0];
+    if (row?.kind !== 'toggle') throw new Error('no spray walls toggle');
+    expect(row.value).toBe(false);
+    row.onValueChange(true);
+    expect(onUseOwnLookChange).toHaveBeenCalledWith(true);
+  });
+});
+
+describe('buildBoardLookModel — MoonBoard grid letters and numbers', () => {
+  it('leaves the section out when the active board is not a MoonBoard', () => {
+    expect(sectionKeys(makeInput())).not.toContain('moonboard');
+  });
+
+  it('sits after the spray walls and before the lighting, and flips the setting', () => {
+    const onChange = vi.fn();
+    const input = makeInput({
+      sprayWalls: { useOwnLook: false, onUseOwnLookChange: vi.fn() },
+      moonboardGridLabels: { enabled: true, onChange },
+    });
+    expect(sectionKeys(input)).toEqual(['presets', 'destinations', 'sprayWalls', 'moonboard', 'lighting', 'bluetooth']);
+
+    const section = buildBoardLookModel(input).sections.find((candidate) => candidate.key === 'moonboard');
+    expect(section?.title).toBe('mobile.settings.boardLook.moonboard.title');
+    expect(section?.footer).toBe('mobile.settings.boardLook.moonboard.footer');
+    const row = section?.rows[0];
+    if (row?.kind !== 'toggle') throw new Error('no MoonBoard grid labels toggle');
+    expect(row.key).toBe('moonboardGridLabels');
+    expect(row.label).toBe('mobile.settings.boardLook.moonboard.gridLabels');
+    expect(row.value).toBe(true);
+    row.onValueChange(false);
+    expect(onChange).toHaveBeenCalledWith(false);
+  });
+});
+
+describe('buildBoardLookModel — GPU acceleration', () => {
+  it('leaves the row out when the switch would do nothing', () => {
+    expect(sectionKeys(makeInput())).not.toContain('gpuAcceleration');
+  });
+
+  it('sits after the MoonBoard section and before the lighting, and flips the setting', () => {
+    const onChange = vi.fn();
+    const input = makeInput({
+      moonboardGridLabels: { enabled: true, onChange: vi.fn() },
+      gpuAcceleration: { enabled: true, onChange },
+    });
+    expect(sectionKeys(input)).toEqual([
+      'presets',
+      'destinations',
+      'moonboard',
+      'gpuAcceleration',
+      'lighting',
+      'bluetooth',
+    ]);
+
+    const row = buildBoardLookModel(input).sections.find((candidate) => candidate.key === 'gpuAcceleration')?.rows[0];
+    if (row?.kind !== 'toggle') throw new Error('no GPU acceleration toggle');
+    expect(row.label).toBe('mobile.settings.boardLook.gpuAcceleration.title');
+    expect(row.subtitle).toBe('mobile.settings.boardLook.gpuAcceleration.description');
+    expect(row.value).toBe(true);
+    row.onValueChange(false);
+    expect(onChange).toHaveBeenCalledWith(false);
   });
 });
 
@@ -129,7 +217,8 @@ describe('buildBoardLookModel — a suggestion from the phone', () => {
       'suggestion',
       'presets',
       'destinations',
-      'reset',
+      'lighting',
+      'bluetooth',
     ]);
   });
 

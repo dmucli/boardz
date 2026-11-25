@@ -1,6 +1,8 @@
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
+import { Platform } from 'react-native';
 import { MoreForm } from '../../MoreForm';
+import { MoreFormRN } from '../../MoreForm.rn';
 import { CustomLookPreview, CUSTOM_LOOK_PREVIEW_HEIGHT } from '../../board-look/CustomLookPreview';
 import { useBoardPreviewClimb } from '../../../hooks/use-board-preview-climb';
 import { useDraftNumber } from '../../../hooks/use-committed-slider-value';
@@ -21,7 +23,7 @@ import { buildCustomLookModel, type CustomLookModelInput } from './custom-look-m
  */
 export function CustomLookScreen() {
   const { t } = useTranslation('common');
-  const { settings, effectiveRenderSettings, boardseshRendererAvailable, setMode, setBoardseshField } =
+  const { settings, effectiveRenderSettings, boardseshRendererAvailable, setMode, setBoardseshField, resetBoardLook } =
     useBoardLookSettings();
   const { preview } = useBoardPreviewClimb();
 
@@ -69,6 +71,7 @@ export function CustomLookScreen() {
         draft,
         preview: previewContent,
         previewHeight: CUSTOM_LOOK_PREVIEW_HEIGHT,
+        onResetBoardLook: resetBoardLook,
       }),
     [
       settings.boardsesh,
@@ -81,8 +84,9 @@ export function CustomLookScreen() {
       setBoardseshField,
       draft,
       previewContent,
+      resetBoardLook,
     ],
   );
 
-  return <MoreForm model={model} />;
+  return Platform.OS === 'android' ? <MoreFormRN model={model} /> : <MoreForm model={model} />;
 }

@@ -1,5 +1,9 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { grantAnalyticsForTest } from '../../../test/consent-fixture';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GRAPHQL_EMPTY_RESPONSE_ERROR_NAME } from '@boardsesh/offline-sync/error-classification';
+import { SchemaNewerThanAppError } from '@boardsesh/offline-sync';
+import { SCHEMA_NEWER_REPORT_KIND } from '../../db/schema-downgrade';
+import { GraphQLTransportClosedError } from '@boardsesh/graphql-client';
 import { reportError, reportHandledError } from '../error-reporting';
 import { addBreadcrumbToSentry, captureToSentry } from '../sentry';
 import { resetObserveRuntimeForTests, setObserveRuntime } from '../observe-runtime';
@@ -12,6 +16,19 @@ vi.mock('../sentry', () => ({
   addBreadcrumbToSentry: vi.fn(),
 }));
 
+/** The refusal shape the deleted Expo web selected mode threw. error-reporting
+ * still matches it by name and status, so the filter keeps its test.
+ * TODO(#7596): nothing in packages/mobile throws it any more. error-reporting.ts
+ * ships to phones by OTA, so the selected-mode deletion left its branch alone;
+ * the #7596 follow-up that removes the `BrowserBackendConsumerError` branch
+ * deletes this class and the test below with it. */
+class BrowserBackendConsumerError extends Error {
+  constructor(readonly status: 'superseded' | 'denied') {
+    super('Selected browser credential is unavailable');
+    this.name = 'BrowserBackendConsumerError';
+  }
+}
+
 const mockedCaptureToSentry = vi.mocked(captureToSentry);
 const mockedAddBreadcrumbToSentry = vi.mocked(addBreadcrumbToSentry);
 
@@ -21,10 +38,38 @@ afterEach(() => {
 });
 
 describe('reportHandledError', () => {
+  it('leaves a breadcrumb, not a report, for a socket loss the client retried to exhaustion', () => {
+    reportHandledError(new GraphQLTransportClosedError(1006, ''), { tags: { source: 'queue-sync' } });
+    expect(mockedCaptureToSentry).not.toHaveBeenCalled();
+    expect(mockedAddBreadcrumbToSentry).toHaveBeenCalledWith(expect.objectContaining({ category: 'network' }));
+  });
+
+  it('reports a fatal websocket close at warning, grouped by close code', () => {
+    reportHandledError(new GraphQLTransportClosedError(4500, 'Internal error'));
+    expect(mockedCaptureToSentry).toHaveBeenCalledWith(
+      expect.any(GraphQLTransportClosedError),
+      expect.objectContaining({
+        level: 'warning',
+        tags: expect.objectContaining({ ws_close_code: 4500 }),
+        fingerprint: ['ws-transport-closed', '4500'],
+      }),
+    );
+  });
+
   it('drops cancellations (user dismiss / unmount) without reporting', () => {
     reportHandledError(Object.assign(new Error('aborted'), { name: 'AbortError' }));
     reportHandledError(Object.assign(new Error('cancelled'), { name: 'CancelledError' }));
     expect(mockedCaptureToSentry).not.toHaveBeenCalled();
+  });
+
+  it('drops a request the account or view retired, but reports other consumer refusals', () => {
+    // A write in flight at sign-out is refused with `superseded`: the app did
+    // what was asked. The query and mutation caches report through here.
+    reportHandledError(new BrowserBackendConsumerError('superseded'), { tags: { source: 'react-query' } });
+    expect(mockedCaptureToSentry).not.toHaveBeenCalled();
+
+    reportHandledError(new BrowserBackendConsumerError('denied'), { tags: { source: 'react-query' } });
+    expect(mockedCaptureToSentry).toHaveBeenCalledOnce();
   });
 
   it('drops expected auth-required GraphQL errors (a session-only query ran logged-out)', () => {
@@ -158,7 +203,7 @@ describe('reportHandledError', () => {
         errors: [
           {
             message: 'Rate limit exceeded. Try again in 7 seconds.',
-            extensions: { code: 'RATE_LIMITED', operation: 'searchBoards', retryAfterSeconds: 7 },
+            extensions: { code: 'RATE_LIMITED', operation: 'createSession', retryAfterSeconds: 7 },
           },
         ],
       },
@@ -168,6 +213,65 @@ describe('reportHandledError', () => {
       level: 'warning',
       tags: { source: 'react-query', kind: 'query', rate_limited: true },
     });
+  });
+
+  it('breadcrumbs discovery throttles once without leaking request context or reporting', () => {
+    const observeReport = vi.fn();
+    setObserveRuntime({ configure: vi.fn(), dispatchEvents: vi.fn(async () => undefined), reportError: observeReport });
+    const rateLimited = Object.assign(new Error('Request including private coordinates'), {
+      response: {
+        errors: [{ extensions: { code: 'RATE_LIMITED', operation: 'searchBoards', retryAfterSeconds: 11 } }],
+      },
+      request: { variables: { latitude: 40, longitude: -3 } },
+    });
+    reportHandledError(rateLimited, { tags: { source: 'board-search' }, extra: { latitude: 40 } });
+    reportHandledError(rateLimited, { tags: { source: 'react-query' } });
+    expect(mockedAddBreadcrumbToSentry).toHaveBeenCalledTimes(1);
+    expect(mockedAddBreadcrumbToSentry).toHaveBeenCalledWith({
+      category: 'graphql',
+      message: 'board discovery throttled',
+      level: 'info',
+      data: { operation: 'searchBoards', retryAfterSeconds: 11, source: 'board-search' },
+    });
+    expect(mockedCaptureToSentry).not.toHaveBeenCalled();
+    expect(observeReport).not.toHaveBeenCalled();
+    reportError(rateLimited);
+    expect(mockedCaptureToSentry).toHaveBeenCalledWith(rateLimited, undefined);
+    expect(observeReport).toHaveBeenCalledWith(rateLimited);
+    resetObserveRuntimeForTests();
+  });
+
+  it('excludes malformed breadcrumb sources and retry delays', () => {
+    reportHandledError(
+      { extensions: { code: 'RATE_LIMITED', operation: 'searchBoards', retryAfterSeconds: Infinity } },
+      {
+        tags: { source: { latitude: 40 } },
+      },
+    );
+    expect(mockedAddBreadcrumbToSentry).toHaveBeenCalledWith({
+      category: 'graphql',
+      message: 'board discovery throttled',
+      level: 'info',
+      data: { operation: 'searchBoards', retryAfterSeconds: null, source: null },
+    });
+    expect(mockedCaptureToSentry).not.toHaveBeenCalled();
+  });
+
+  it('keeps reporting resolver failures accompanying a discovery throttle', () => {
+    const mixedError = {
+      response: {
+        errors: [
+          { extensions: { code: 'RATE_LIMITED', operation: 'searchBoards', retryAfterSeconds: 11 } },
+          { extensions: { code: 'INTERNAL_SERVER_ERROR' }, message: 'Gym query failed' },
+        ],
+      },
+    };
+    reportHandledError(mixedError);
+    expect(mockedCaptureToSentry).toHaveBeenCalledWith(mixedError, {
+      level: 'warning',
+      tags: { rate_limited: true },
+    });
+    expect(mockedAddBreadcrumbToSentry).not.toHaveBeenCalled();
   });
 
   it('reports a GRAPHQL_VALIDATION_FAILED rejection as a warning fingerprinted by its message (#5370)', () => {
@@ -387,6 +491,22 @@ describe('reportError', () => {
     reportError(error, { level: 'error', tags: { source: 's' } });
     expect(mockedCaptureToSentry).toHaveBeenCalledWith(error, { level: 'error', tags: { source: 's' } });
   });
+
+  describe('a call refused on a database a newer bundle migrated', () => {
+    it('is dropped, from the raw funnel and the handled one alike', () => {
+      reportError(new SchemaNewerThanAppError(11, 10), { tags: { source: 'offline-sync', kind: 'cache-clear' } });
+      reportError(new SchemaNewerThanAppError(11, 10));
+      reportHandledError(new SchemaNewerThanAppError(11, 10), { tags: { source: 'react-query' } });
+      expect(mockedCaptureToSentry).not.toHaveBeenCalled();
+    });
+
+    it('lets the init chain report the state itself, once, under its own kind', () => {
+      const error = new SchemaNewerThanAppError(11, 10);
+      const context = { level: 'warning' as const, tags: { source: 'offline-sync', kind: SCHEMA_NEWER_REPORT_KIND } };
+      reportError(error, context);
+      expect(mockedCaptureToSentry).toHaveBeenCalledWith(error, context);
+    });
+  });
 });
 
 describe('Observe forwarding', () => {
@@ -398,7 +518,7 @@ describe('Observe forwarding', () => {
   });
 
   function registerObserve(reportError_ = vi.fn()) {
-    setObserveRuntime({ configure: vi.fn(), reportError: reportError_ });
+    setObserveRuntime({ configure: vi.fn(), dispatchEvents: vi.fn(async () => undefined), reportError: reportError_ });
     return reportError_;
   }
 
@@ -451,6 +571,7 @@ describe('Observe forwarding', () => {
     // able to lose the actual error.
     setObserveRuntime({
       configure: vi.fn(),
+      dispatchEvents: vi.fn(async () => undefined),
       reportError: () => {
         throw new Error('native module exploded');
       },
@@ -469,3 +590,5 @@ describe('Observe forwarding', () => {
     expect(mockedCaptureToSentry).toHaveBeenCalledWith(error, undefined);
   });
 });
+
+beforeEach(() => grantAnalyticsForTest());

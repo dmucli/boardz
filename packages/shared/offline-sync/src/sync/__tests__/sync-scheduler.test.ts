@@ -78,6 +78,22 @@ describe('sync-scheduler', () => {
     mockPullSync.mockResolvedValue(undefined);
   });
 
+  it('forwards request correlation and durable-marker observations into each pull', async () => {
+    const getDownloadRequestContext = vi.fn(() => ({ requestId: 'request', batchId: 'batch' }));
+    const onScopeDownloadObserved = vi.fn();
+    triggerSync(mockDb, createMockQueryClient(), mockGraphqlFetch, getEnabledBoards, async () => {}, {
+      getDownloadRequestContext,
+      onScopeDownloadObserved,
+    });
+    await flush();
+    expect(mockPullSync).toHaveBeenCalledWith(
+      mockDb,
+      expect.anything(),
+      mockGraphqlFetch,
+      expect.objectContaining({ getDownloadRequestContext, onScopeDownloadObserved }),
+    );
+  });
+
   it('drains (push) before pulling (fetch) on a trigger', async () => {
     const order: string[] = [];
     const drainQueue: DrainQueue = vi.fn(async () => {
@@ -101,6 +117,124 @@ describe('sync-scheduler', () => {
       mockGraphqlFetch,
       expect.objectContaining({ enabledBoards: ['kilter'] }),
     );
+  });
+
+  it('forwards the live requested-board priority getter', async () => {
+    const drainQueue: DrainQueue = vi.fn().mockResolvedValue(undefined);
+    const getPriorityBoards = () => ['tension:2:10', 'kilter:1:5'];
+    triggerSync(mockDb, createMockQueryClient(), mockGraphqlFetch, getEnabledBoards, drainQueue, { getPriorityBoards });
+    await flush();
+    expect(mockPullSync).toHaveBeenCalledWith(
+      mockDb,
+      expect.anything(),
+      mockGraphqlFetch,
+      expect.objectContaining({ getPriorityBoards }),
+    );
+  });
+
+  it('retains the scope capability resolver on scheduled startup and reconnect cycles', async () => {
+    const fakeTriggers = createFakeTriggers();
+    const drainQueue: DrainQueue = vi.fn().mockResolvedValue(undefined);
+    const getSprayWallUuid = vi.fn(async () => 'verified-wall-capability');
+    const stop = startSyncScheduler(
+      mockDb,
+      createMockQueryClient(),
+      mockGraphqlFetch,
+      () => ['spray:7:7'],
+      drainQueue,
+      fakeTriggers.triggers,
+      { getSprayWallUuid },
+    );
+    await flush();
+    expect(mockPullSync).toHaveBeenCalledWith(
+      mockDb,
+      expect.anything(),
+      mockGraphqlFetch,
+      expect.objectContaining({ enabledBoards: ['spray:7:7'], getSprayWallUuid }),
+    );
+    fakeTriggers.fireConnectivity(false);
+    fakeTriggers.fireConnectivity(true);
+    await flush();
+    expect(mockPullSync).toHaveBeenCalledTimes(2);
+    expect(mockPullSync.mock.calls[1]?.[3]).toEqual(expect.objectContaining({ getSprayWallUuid }));
+    stop();
+  });
+
+  it('binds scheduled snapshot supplementation to the authenticated viewer', async () => {
+    const drainQueue: DrainQueue = vi.fn().mockResolvedValue(undefined);
+    triggerSync(mockDb, createMockQueryClient(), mockGraphqlFetch, getEnabledBoards, drainQueue, {
+      viewerUserId: 'viewer-supplement',
+    });
+    await flush();
+    expect(mockPullSync).toHaveBeenCalledWith(
+      mockDb,
+      expect.anything(),
+      mockGraphqlFetch,
+      expect.objectContaining({ viewerUserId: 'viewer-supplement' }),
+    );
+  });
+
+  it('resolves an asynchronous viewer once after draining, before starting the pull', async () => {
+    const lifecycle: string[] = [];
+    const drainQueue: DrainQueue = vi.fn(async () => {
+      lifecycle.push('drain');
+    });
+    const getViewerUserId = vi.fn(async () => {
+      lifecycle.push('viewer');
+      return 'resolved-viewer';
+    });
+    triggerSync(mockDb, createMockQueryClient(), mockGraphqlFetch, getEnabledBoards, drainQueue, {
+      viewerUserId: 'stale-viewer',
+      getViewerUserId,
+    });
+    await flush();
+    expect(lifecycle).toEqual(['drain', 'viewer']);
+    expect(getViewerUserId).toHaveBeenCalledTimes(1);
+    expect(mockPullSync).toHaveBeenCalledWith(
+      mockDb,
+      expect.anything(),
+      mockGraphqlFetch,
+      expect.objectContaining({ viewerUserId: 'resolved-viewer' }),
+    );
+  });
+
+  it('bounds a hung request-ledger preparation so telemetry cannot strand the pull', async () => {
+    vi.useFakeTimers();
+    try {
+      triggerSync(mockDb, createMockQueryClient(), mockGraphqlFetch, getEnabledBoards, async () => {}, {
+        prepareScopeDownloadContexts: () => new Promise<void>(() => {}),
+      });
+      await flush();
+      expect(mockPullSync).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(mockPullSync).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('continues a pull after request-ledger preparation rejects', async () => {
+    triggerSync(mockDb, createMockQueryClient(), mockGraphqlFetch, getEnabledBoards, async () => {}, {
+      prepareScopeDownloadContexts: async () => {
+        throw new Error('ledger unavailable');
+      },
+    });
+    await vi.waitFor(() => expect(mockPullSync).toHaveBeenCalledOnce());
+  });
+
+  it('reports a failed viewer resolution without falling back to an older viewer or pulling', async () => {
+    const cause = new Error('secure-store unavailable');
+    const getViewerUserId = vi.fn().mockRejectedValue(cause);
+    const onCycleError = vi.fn();
+    const drainQueue: DrainQueue = vi.fn().mockResolvedValue(undefined);
+    triggerSync(mockDb, createMockQueryClient(), mockGraphqlFetch, getEnabledBoards, drainQueue, {
+      viewerUserId: 'stale-viewer',
+      getViewerUserId,
+      onCycleError,
+    });
+    await flush();
+    expect(mockPullSync).not.toHaveBeenCalled();
+    expect(onCycleError).toHaveBeenCalledWith(cause);
   });
 
   it('forwards per-scope bootstrap metadata settlement to pullSync', async () => {
@@ -628,7 +762,7 @@ describe('sync-scheduler', () => {
     expect(mockPullSync).toHaveBeenCalledTimes(1);
   });
 
-  it('hands an in-flight cycle off to a replacement scheduler with its new snapshot source', async () => {
+  it('hands an in-flight cycle off to a replacement scheduler with its new database and snapshot source', async () => {
     const oldPull = deferred();
     mockPullSync.mockImplementationOnce(() => oldPull.promise).mockResolvedValue(undefined);
     const oldTriggers = createFakeTriggers();
@@ -650,8 +784,9 @@ describe('sync-scheduler', () => {
 
     stopOld();
     const snapshotSource = { fetchManifest: vi.fn() } as never;
+    const replacementDb = {} as OfflineDatabase;
     const stopNew = startSyncScheduler(
-      mockDb,
+      replacementDb,
       queryClient,
       mockGraphqlFetch,
       () => ['tension:11:8'],
@@ -665,6 +800,7 @@ describe('sync-scheduler', () => {
     oldPull.resolve();
     await flush();
     expect(mockPullSync).toHaveBeenCalledTimes(2);
+    expect(mockPullSync.mock.calls[1]?.[0]).toBe(replacementDb);
     expect(mockPullSync.mock.calls[1]?.[3]).toEqual(
       expect.objectContaining({ enabledBoards: ['tension:11:8'], snapshotSource }),
     );

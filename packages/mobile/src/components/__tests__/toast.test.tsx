@@ -1,17 +1,12 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, it, expect, vi } from 'vitest';
-import { render } from '@testing-library/react';
+import { act, render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 
 // Controls the resolved UI variant the Toast branches on.
 const ctrl = vi.hoisted(() => ({
   variant: 'material' as 'material' | 'liquidGlass',
   colorScheme: 'light' as 'light' | 'dark',
-  nativeTabBar: false,
-  nativeBottomAccessoryAvailable: true,
-  insetsBottom: 34,
-  measuredTabContentInsetBottom: null as number | null,
-  segments: ['(tabs)', 'climbs'] as readonly string[],
 }));
 
 type ViewMockProps = { children?: ReactNode; accessibilityRole?: string; pointerEvents?: string; style?: unknown };
@@ -79,16 +74,8 @@ vi.mock('react-native-paper', () => ({
     ),
 }));
 
-vi.mock('expo-router', () => ({ useSegments: () => ctrl.segments }));
 vi.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 47, bottom: ctrl.insetsBottom, left: 0, right: 0 }),
-}));
-vi.mock('../../hooks/use-bottom-accessory', () => ({
-  isBottomAccessoryAvailable: () => ctrl.nativeBottomAccessoryAvailable,
-  useNativeTabBar: () => ctrl.nativeTabBar,
-}));
-vi.mock('../../lib/native-tab-content-inset-store', () => ({
-  useNativeTabContentInsetBottom: () => ctrl.measuredTabContentInsetBottom,
+  useSafeAreaInsets: () => ({ top: 47, bottom: 34, left: 0, right: 0 }),
 }));
 
 vi.mock('../Text', () => ({
@@ -106,15 +93,6 @@ vi.mock('../../theme/colors', () => ({
   blendOpaque: (foreground: string, background: string, alpha: number) => `${foreground}|${background}|${alpha}`,
 }));
 vi.mock('../../theme/tokens', () => ({ borderRadius: { full: 999 }, spacing: { 2: 8, 3: 12, 4: 16 } }));
-vi.mock('../../theme/layout', () => ({
-  MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT: 48,
-  MATERIAL_TAB_BAR_HEIGHT: 80,
-  TAB_BAR_HEIGHT: 49,
-  // Production semantics: glassSize.hero(56) + TOOLBAR_GAP_ABOVE_TABBAR(10).
-  TOOLBAR_RESERVE: 66,
-  // Production semantics: glassSize.capsule(44) + TOOLBAR_GAP_ABOVE_TABBAR(10).
-  REST_TIMER_RESERVE: 54,
-}));
 vi.mock('../../providers/theme-provider', () => ({
   useTheme: () => {
     const brandColorsByScheme = {
@@ -123,8 +101,8 @@ vi.mock('../../providers/theme-provider', () => ({
     } as const;
     const systemColorsByVariant = {
       material: {
-        light: { secondaryBackground: '#FFFFFF', label: '#16111F' },
-        dark: { secondaryBackground: '#221A33', label: '#F5F2FB' },
+        light: { secondaryBackground: '#FFFFFF', label: '#1A1A1A' },
+        dark: { secondaryBackground: '#1E1E1E', label: '#EDEDED' },
       },
       liquidGlass: {
         light: { secondaryBackground: '#FFFFFF', label: '#16111F' },
@@ -141,14 +119,9 @@ vi.mock('../../providers/theme-provider', () => ({
 }));
 
 import { Toast } from '../Toast';
-import { REST_TIMER_RESERVE, TAB_BAR_HEIGHT, TOOLBAR_RESERVE } from '../../theme/layout';
-import { spacing } from '../../theme/tokens';
-import { armRestTimer, resetRestTimerStoreForTests } from '../../lib/rest-timer-store';
+import { publishToastBottomOffset, resetToastBottomOffsetForTests } from '../../lib/toast-offset-store';
 
 const toast = { id: 't1', message: 'Saved tick', variant: 'success' as const, duration: 3000 };
-// The IN-TAB inset without BottomAccessory (root 34 + bar 49), as published by
-// NativeTabContentInsetProbe. Realistic arithmetic, INFERRED not device-verified.
-const NATIVE_TAB_ONLY_INSET = 34 + TAB_BAR_HEIGHT;
 
 type HexChannels = [red: number, green: number, blue: number];
 
@@ -177,11 +150,14 @@ function contrastRatio(firstColor: string, secondColor: string): number {
   return (lighterLuminance + 0.05) / (darkerLuminance + 0.05);
 }
 
-/** The `bottom` the snackbar wrapper resolved to, as a number. */
-function readWrapperBottom(container: HTMLElement): number {
-  const style = container.querySelector('[data-paper-snackbar]')?.getAttribute('data-wrapper-style') ?? '';
+/** The `bottom` the toast resolved to on either variant, as a number. */
+function readToastBottom(container: HTMLElement): number {
+  const style =
+    container.querySelector('[data-paper-snackbar]')?.getAttribute('data-wrapper-style') ??
+    container.querySelector('[data-animated]')?.getAttribute('data-style') ??
+    '';
   const match = /"bottom":(-?\d+(?:\.\d+)?)/.exec(style);
-  if (!match) throw new Error(`no bottom in wrapper style: ${style}`);
+  if (!match) throw new Error(`no bottom in toast style: ${style}`);
   return Number(match[1]);
 }
 
@@ -189,12 +165,7 @@ describe('Toast', () => {
   beforeEach(() => {
     ctrl.variant = 'material';
     ctrl.colorScheme = 'light';
-    ctrl.nativeTabBar = false;
-    ctrl.nativeBottomAccessoryAvailable = true;
-    ctrl.insetsBottom = 34;
-    ctrl.measuredTabContentInsetBottom = null;
-    ctrl.segments = ['(tabs)', 'climbs'];
-    resetRestTimerStoreForTests();
+    resetToastBottomOffsetForTests();
   });
 
   it('renders a Paper Snackbar on the Material variant', () => {
@@ -210,49 +181,10 @@ describe('Toast', () => {
     // blendOpaque(config.color, secondaryBackground): success → brand success hue.
     expect(snackbar?.getAttribute('data-bg')).toBe('#047857|#FFFFFF|0.15');
     expect(container.querySelector('[data-icon="success"]')?.getAttribute('data-color')).toBe('#047857');
-    expect(container.querySelector('[data-text]')?.getAttribute('data-color')).toBe('#16111F');
+    expect(container.querySelector('[data-text]')?.getAttribute('data-color')).toBe('#1A1A1A');
     expect(container.querySelector('[data-view][data-role="alert"]')).not.toBeNull();
     // The glass animated pill must not render on Material.
     expect(container.querySelector('[data-animated]')).toBeNull();
-  });
-
-  it('lifts a Material toast clear of the rest-timer pill while it is armed', () => {
-    // The toast reconstructs its own offset (ToastProvider sits above the
-    // bottom-chrome provider), so the rest-timer reserve has to be added here
-    // too — otherwise a toast lands on top of the running countdown, which is
-    // the one control the climber is watching.
-    ctrl.variant = 'material';
-    const disarmed = render(<Toast toast={toast} onDismiss={() => {}} />);
-    const disarmedBottom = readWrapperBottom(disarmed.container);
-
-    armRestTimer('afterTick', Date.parse('2026-09-11T10:00:00.000Z'), 'session-1');
-    const armed = render(<Toast toast={toast} onDismiss={() => {}} />);
-
-    expect(readWrapperBottom(armed.container)).toBe(disarmedBottom + REST_TIMER_RESERVE);
-  });
-
-  it('reserves nothing for the pill off the tabs, where no pill renders', () => {
-    ctrl.variant = 'material';
-    ctrl.segments = ['gym', '123'];
-    const disarmed = render(<Toast toast={toast} onDismiss={() => {}} />);
-    const disarmedBottom = readWrapperBottom(disarmed.container);
-
-    armRestTimer('afterTick', Date.parse('2026-09-11T10:00:00.000Z'), 'session-1');
-    const armed = render(<Toast toast={toast} onDismiss={() => {}} />);
-
-    expect(readWrapperBottom(armed.container)).toBe(disarmedBottom);
-  });
-
-  it('positions Material toasts above the docked climb bar and tab bar', () => {
-    ctrl.variant = 'material';
-    const { container } = render(<Toast toast={toast} onDismiss={() => {}} />);
-    // insets.bottom(34) + MATERIAL_TAB_BAR_HEIGHT(80) + active-context bar(48) +
-    // spacing[2](8) = 170. The tab-bar term is the taller M3 80dp nav bar, not the
-    // 49pt iOS bar, so the Material snackbar clears the nav bar rather than tucking
-    // under it.
-    expect(container.querySelector('[data-paper-snackbar]')?.getAttribute('data-wrapper-style')).toContain(
-      '"bottom":170',
-    );
   });
 
   it.each([
@@ -269,11 +201,18 @@ describe('Toast', () => {
         colorScheme === 'dark'
           ? { success: '#34D399', error: '#F87171', warning: '#FBBF24', info: '#A78BFA' }
           : { success: '#047857', error: '#C81E1E', warning: '#B45309', info: '#6D28D9' };
-      const expectedLabel = colorScheme === 'dark' ? '#F5F2FB' : '#16111F';
+      const expectedLabel =
+        uiVariant === 'material'
+          ? colorScheme === 'dark'
+            ? '#EDEDED'
+            : '#1A1A1A'
+          : colorScheme === 'dark'
+            ? '#F5F2FB'
+            : '#16111F';
       const expectedSurface =
         uiVariant === 'material'
           ? colorScheme === 'dark'
-            ? '#221A33'
+            ? '#1E1E1E'
             : '#FFFFFF'
           : colorScheme === 'dark'
             ? '#181225'
@@ -355,73 +294,19 @@ describe('Toast', () => {
     expect(container.querySelector('[data-paper-snackbar]')).toBeNull();
   });
 
-  it('preserves explicit tab and queue reserves on the Liquid Glass JS fallback', () => {
-    ctrl.variant = 'liquidGlass';
-    const { container } = render(<Toast toast={toast} onDismiss={() => {}} />);
-    const expectedBottom = 34 + TAB_BAR_HEIGHT + TOOLBAR_RESERVE + spacing[2];
-    expect(container.querySelector('[data-animated]')?.getAttribute('data-style')).toContain(
-      `"bottom":${expectedBottom}`,
-    );
-  });
+  it.each(['material' as const, 'liquidGlass' as const])(
+    'floats at the offset ToastOffsetPublisher published on %s',
+    (variant) => {
+      ctrl.variant = variant;
+      act(() => publishToastBottomOffset(170));
+      const { container } = render(<Toast toast={toast} onDismiss={() => {}} />);
+      expect(readToastBottom(container)).toBe(170);
+    },
+  );
 
-  it('does not add native tab or accessory chrome to the measured 139pt in-tab inset (#3973)', () => {
-    ctrl.variant = 'liquidGlass';
-    ctrl.nativeTabBar = true;
-    // Toast samples the ROOT inset (34); the 139 accessory inset arrives as the
-    // in-tab measurement from NativeTabContentInsetProbe.
-    ctrl.insetsBottom = 34;
-    ctrl.measuredTabContentInsetBottom = 139;
+  it('sits on the root inset plus its 8pt gap before anything is published', () => {
     const { container } = render(<Toast toast={toast} onDismiss={() => {}} />);
-    // 139 already includes the home indicator, native tab bar, and accessory;
-    // Toast adds only its 8pt visual gap.
-    expect(container.querySelector('[data-animated]')?.getAttribute('data-style')).toContain('"bottom":147');
-  });
-
-  it('reconstructs the native bar from the root inset before the probe publishes', () => {
-    ctrl.variant = 'liquidGlass';
-    ctrl.nativeTabBar = true;
-    ctrl.insetsBottom = 34;
-    ctrl.measuredTabContentInsetBottom = null;
-    const { container } = render(<Toast toast={toast} onDismiss={() => {}} />);
-    // Pre-measurement frames: root (34) + TAB_BAR_HEIGHT + gap. The accessory
-    // cannot be reconstructed up here (no climb state above QueueProvider), so a
-    // pre-publish toast may briefly sit behind the accessory platter — see the
-    // useToastBottomOffset docblock. The accessory is available in this state, so
-    // no JS queue reserve either.
-    const expectedBottom = 34 + TAB_BAR_HEIGHT + spacing[2];
-    expect(container.querySelector('[data-animated]')?.getAttribute('data-style')).toContain(
-      `"bottom":${expectedBottom}`,
-    );
-  });
-
-  it('clears the JS queue bar when NativeTabs cannot mount a BottomAccessory', () => {
-    ctrl.variant = 'liquidGlass';
-    ctrl.nativeTabBar = true;
-    ctrl.nativeBottomAccessoryAvailable = false;
-    ctrl.insetsBottom = 34;
-    ctrl.measuredTabContentInsetBottom = NATIVE_TAB_ONLY_INSET;
-    const { container } = render(<Toast toast={toast} onDismiss={() => {}} />);
-    const expectedBottom = NATIVE_TAB_ONLY_INSET + TOOLBAR_RESERVE + spacing[2];
-    // The in-tab measurement owns the tab-bar clearance, while the unavailable
-    // BottomAccessory falls back to the JS queue tray. Do not add TAB_BAR_HEIGHT
-    // a second time.
-    expect(container.querySelector('[data-animated]')?.getAttribute('data-style')).toContain(
-      `"bottom":${expectedBottom}`,
-    );
-  });
-
-  it('does not reserve the JS queue bar on a pushed NativeTabs route', () => {
-    ctrl.variant = 'liquidGlass';
-    ctrl.nativeTabBar = true;
-    ctrl.nativeBottomAccessoryAvailable = false;
-    ctrl.insetsBottom = 34;
-    ctrl.measuredTabContentInsetBottom = NATIVE_TAB_ONLY_INSET;
-    ctrl.segments = ['(tabs)', 'home', 'session', '[sessionId]'];
-    const { container } = render(<Toast toast={toast} onDismiss={() => {}} />);
-    const expectedBottom = NATIVE_TAB_ONLY_INSET + spacing[2];
-    expect(container.querySelector('[data-animated]')?.getAttribute('data-style')).toContain(
-      `"bottom":${expectedBottom}`,
-    );
+    expect(readToastBottom(container)).toBe(34 + 8);
   });
 
   it('auto-dismisses via timer on the Liquid Glass variant', () => {

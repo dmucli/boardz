@@ -1,13 +1,22 @@
 import { eq, and, sql, inArray, count, isNull } from 'drizzle-orm';
 import { db } from '../../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
-import { sprayClimbVisibilityCondition } from '@boardsesh/db/queries';
+import {
+  sprayClimbVisibilityCondition,
+  ownedOrPublicClimbCondition,
+  userActivityVisibilityCondition,
+} from '@boardsesh/db/queries';
 import { resolveCommunitySetting, DEFAULTS } from '../community-settings';
 import { resolveClimbNoMatch } from '../../shared/helpers';
 
 /**
  * Enrich a single proposal with proposer info, vote counts, climb data, and stats.
  * Independent queries are parallelised with Promise.all to minimise round-trip latency.
+ *
+ * A proposal is moderation content on a published climb, so its reason, votes
+ * and comment count read for everyone the climb reads for. The proposer's and
+ * resolver's identities follow their account privacy: a private account the
+ * viewer cannot see comes back with no id, name or avatar.
  */
 export async function enrichProposal(
   proposal: typeof dbSchema.climbProposals.$inferSelect,
@@ -25,6 +34,7 @@ export async function enrichProposal(
   const [proposerRows, voteRows, threshold, climbRows, myVoteRows, commentCountRows] = await Promise.all([
     db
       .select({
+        id: dbSchema.users.id,
         name: dbSchema.users.name,
         image: dbSchema.users.image,
         displayName: dbSchema.userProfiles.displayName,
@@ -32,8 +42,12 @@ export async function enrichProposal(
       })
       .from(dbSchema.users)
       .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
-      .where(eq(dbSchema.users.id, proposal.proposerId))
-      .limit(1),
+      .where(
+        and(
+          inArray(dbSchema.users.id, [proposal.proposerId, ...(proposal.resolvedBy ? [proposal.resolvedBy] : [])]),
+          userActivityVisibilityCondition(dbSchema.users.id, authenticatedUserId),
+        ),
+      ),
 
     db
       .select({
@@ -61,6 +75,17 @@ export async function enrichProposal(
         and(
           eq(dbSchema.boardClimbs.uuid, proposal.climbUuid),
           eq(dbSchema.boardClimbs.boardType, proposal.boardType),
+          // A proposal is not a read of the climb by its link: it names an
+          // unlisted climb to its owner alone, like proposalClimbVisibilityCondition.
+          ownedOrPublicClimbCondition(
+            {
+              boardType: dbSchema.boardClimbs.boardType,
+              isDraft: dbSchema.boardClimbs.isDraft,
+              isListed: dbSchema.boardClimbs.isListed,
+              userId: dbSchema.boardClimbs.userId,
+            },
+            authenticatedUserId,
+          ),
           // `browseProposals` is auth-optional and takes `boardType` from the
           // caller, and nothing stops a proposal being raised against a spray
           // climb — so the enrichment would hand back a private wall's name,
@@ -98,7 +123,7 @@ export async function enrichProposal(
       ),
   ]);
 
-  const proposer = proposerRows[0];
+  const proposer = proposerRows.find((profile) => profile.id === proposal.proposerId);
   const climb = climbRows[0];
   const requiredUpvotes = parseInt(threshold, 10) || 5;
   const userVote = myVoteRows[0]?.value || 0;
@@ -124,7 +149,7 @@ export async function enrichProposal(
   let climbBenchmarkDifficulty: string | undefined;
 
   const effectiveAngle = proposal.angle ?? climb?.angle;
-  if (effectiveAngle != null) {
+  if (climb && effectiveAngle != null) {
     const [stats] = await db
       .select({
         displayDifficulty: dbSchema.boardClimbStats.displayDifficulty,
@@ -172,16 +197,18 @@ export async function enrichProposal(
     climbUuid: proposal.climbUuid,
     boardType: proposal.boardType,
     angle: proposal.angle,
-    proposerId: proposal.proposerId,
+    proposerId: proposer ? proposal.proposerId : null,
     proposerDisplayName: proposer?.displayName || proposer?.name || undefined,
     proposerAvatarUrl: proposer?.avatarUrl || proposer?.image || undefined,
     type: proposal.type,
     proposedValue: proposal.proposedValue,
     currentValue: proposal.currentValue,
     status: proposal.status,
+    // Moderation reasoning on a published climb is public; only a private
+    // proposer's id, name and avatar are withheld above.
     reason: proposal.reason,
     resolvedAt: proposal.resolvedAt?.toISOString() || undefined,
-    resolvedBy: proposal.resolvedBy,
+    resolvedBy: proposerRows.some((profile) => profile.id === proposal.resolvedBy) ? proposal.resolvedBy : null,
     createdAt: proposal.createdAt.toISOString(),
     weightedUpvotes,
     weightedDownvotes,
@@ -213,7 +240,11 @@ export async function batchEnrichProposals(
   if (proposals.length === 0) return [];
 
   const proposalIds = proposals.map((p) => p.id);
-  const uniqueProposerIds = [...new Set(proposals.map((p) => p.proposerId))];
+  const uniqueProposerIds = [
+    ...new Set(
+      proposals.flatMap((proposal) => [proposal.proposerId, ...(proposal.resolvedBy ? [proposal.resolvedBy] : [])]),
+    ),
+  ];
 
   // Query 1: Batch proposer profiles
   const proposerRows = await db
@@ -226,7 +257,12 @@ export async function batchEnrichProposals(
     })
     .from(dbSchema.users)
     .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
-    .where(inArray(dbSchema.users.id, uniqueProposerIds));
+    .where(
+      and(
+        inArray(dbSchema.users.id, uniqueProposerIds),
+        userActivityVisibilityCondition(dbSchema.users.id, authenticatedUserId),
+      ),
+    );
 
   const proposerMap = new Map(proposerRows.map((p) => [p.id, p]));
 
@@ -292,6 +328,15 @@ export async function batchEnrichProposals(
     .where(
       and(
         inArray(dbSchema.boardClimbs.uuid, uniqueClimbUuids),
+        ownedOrPublicClimbCondition(
+          {
+            boardType: dbSchema.boardClimbs.boardType,
+            isDraft: dbSchema.boardClimbs.isDraft,
+            isListed: dbSchema.boardClimbs.isListed,
+            userId: dbSchema.boardClimbs.userId,
+          },
+          authenticatedUserId,
+        ),
         // Same as the single-proposal path above.
         sprayClimbVisibilityCondition(
           { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
@@ -306,6 +351,7 @@ export async function batchEnrichProposals(
   // Build unique (climbUuid, boardType, angle) tuples from proposals that have an angle
   // For classic proposals (angle null), fall back to the climb's default angle
   const proposalsWithEffectiveAngle = proposals
+    .filter((proposal) => climbMap.has(`${proposal.climbUuid}:${proposal.boardType}`))
     .map((p) => ({
       ...p,
       effectiveAngle: p.angle ?? climbMap.get(`${p.climbUuid}:${p.boardType}`)?.angle ?? null,
@@ -443,7 +489,7 @@ export async function batchEnrichProposals(
       climbUuid: proposal.climbUuid,
       boardType: proposal.boardType,
       angle: proposal.angle,
-      proposerId: proposal.proposerId,
+      proposerId: proposer ? proposal.proposerId : null,
       proposerDisplayName: proposer?.displayName || proposer?.name || undefined,
       proposerAvatarUrl: proposer?.avatarUrl || proposer?.image || undefined,
       type: proposal.type,
@@ -452,7 +498,7 @@ export async function batchEnrichProposals(
       status: proposal.status,
       reason: proposal.reason,
       resolvedAt: proposal.resolvedAt?.toISOString() || undefined,
-      resolvedBy: proposal.resolvedBy,
+      resolvedBy: proposal.resolvedBy && proposerMap.has(proposal.resolvedBy) ? proposal.resolvedBy : null,
       createdAt: proposal.createdAt.toISOString(),
       weightedUpvotes: votes.weightedUpvotes,
       weightedDownvotes: votes.weightedDownvotes,

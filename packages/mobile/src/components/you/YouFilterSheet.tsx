@@ -1,18 +1,18 @@
-import { type RefObject, useMemo } from 'react';
-import { View, StyleSheet } from 'react-native';
-import type { BottomSheet } from '@expo/ui/community/bottom-sheet';
-import { useTranslation } from 'react-i18next';
-import { BOARD_FILTER_TYPES, type UnifiedTimeframeType } from '@boardsesh/profile-stats';
 import { formatBoardDisplayName } from '@boardsesh/board-config';
-import { Text } from '../Text';
+import { BOARD_FILTER_TYPES, type UnifiedTimeframeType } from '@boardsesh/profile-stats';
+import type { BottomSheet } from '../sheet-presentation';
+import { type RefObject, useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
+import { StyleSheet, View } from 'react-native';
+import { useTheme } from '../../providers/theme-provider';
+import { spacing } from '../../theme/tokens';
 import { Icon } from '../Icon';
 import { ListRow } from '../ListRow';
-import { Sheet } from '../Sheet';
-import { Button } from '../Button';
-import { SegmentedControl } from '../SegmentedControl';
 import { SectionHeader } from '../SectionHeader';
-import { spacing } from '../../theme/tokens';
-import { useTheme } from '../../providers/theme-provider';
+import { SegmentedControl } from '../SegmentedControl';
+import { Sheet } from '../Sheet';
+import { MEDIUM_LARGE_SNAP_POINTS } from '../sheet-snap-points';
+import { SheetTopBar } from '../SheetTopBar';
 
 type YouFilterSheetProps = {
   sheetRef: RefObject<BottomSheet | null>;
@@ -32,7 +32,6 @@ export function YouFilterSheet({
 }: YouFilterSheetProps) {
   const { t } = useTranslation('you');
   const { systemColors, brandColors } = useTheme();
-
   // BOARD_FILTER_TYPES, not BOARD_TYPES: the wider list is what the You screen
   // FETCHES so no ascent is dropped, this is what the filter OFFERS.
   const boardOptions = useMemo(() => ['all', ...BOARD_FILTER_TYPES], []);
@@ -49,17 +48,20 @@ export function YouFilterSheet({
   return (
     <Sheet
       ref={sheetRef}
-      snapPoints={['55%']}
-      // Android's fixed partial detent strands the footer below the form.
+      snapPoints={MEDIUM_LARGE_SNAP_POINTS}
+      // Android's fixed partial detent leaves empty sheet under the form.
       // Fit its bounded content there; iOS keeps the requested 55% detent.
       androidContentSized
       scrollable
-      footer={<Button title={t('mobile.filter.done')} onPress={() => sheetRef.current?.close()} />}
+      header={
+        // A close, not a trailing Done: the filters apply as they change, so
+        // there is nothing to commit.
+        <SheetTopBar
+          title={t('mobile.filter.title')}
+          leading={{ kind: 'close', onPress: () => sheetRef.current?.close() }}
+        />
+      }
     >
-      <Text variant="title3" style={styles.title}>
-        {t('mobile.filter.title')}
-      </Text>
-
       <SectionHeader title={t('mobile.filter.timeRange')} />
       <View style={styles.segment}>
         <SegmentedControl
@@ -88,10 +90,6 @@ export function YouFilterSheet({
 }
 
 const styles = StyleSheet.create({
-  title: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[2],
-  },
   segment: {
     paddingHorizontal: spacing[4],
   },

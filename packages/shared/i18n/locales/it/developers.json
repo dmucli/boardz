@@ -1,0 +1,521 @@
+{
+  "metadata": {
+    "title": "Le tue app | Boardsesh per sviluppatori",
+    "description": "Registra un'app che legge il diario Boardsesh di un climber una volta che l'ha approvata."
+  },
+  "page": {
+    "eyebrow": "Boardsesh per sviluppatori",
+    "title": "Le tue app",
+    "lead": "Registra un'app così i climber possono collegarla al loro diario Boardsesh. Non viene condiviso nulla finché un climber non approva la tua app nella schermata di consenso.",
+    "register": "Registra un'app",
+    "limits": "Fino a {{apps}} app per account. Ogni nuova app può collegare {{connections}} climber, di cui {{perDay}} nuovi al giorno."
+  },
+  "states": {
+    "loading": "Caricamento delle tue app…",
+    "empty": {
+      "title": "Ancora nessuna app",
+      "body": "Registra un'app per ottenere un client ID. Un'app il cui server scambia il codice riceve anche un client secret.",
+      "action": "Registra la tua prima app"
+    },
+    "notAvailable": {
+      "title": "La registrazione delle app non è ancora aperta",
+      "body": "Boardsesh non ha ancora attivato le app partner. Torna più tardi."
+    },
+    "notAllowlisted": {
+      "title": "Per ora la registrazione delle app è solo su invito",
+      "body": "Il tuo account non è nella lista degli inviti. Chiedi l'accesso al team di Boardsesh."
+    },
+    "inviteCheckFailed": {
+      "title": "Non siamo riusciti a verificare il tuo invito",
+      "body": "Boardsesh non è riuscito a consultare la lista degli inviti. Riprova tra un minuto."
+    },
+    "paused": {
+      "title": "La registrazione delle app è in pausa",
+      "body": "Boardsesh ha messo in pausa le app partner per un momento. Riprova tra un minuto."
+    },
+    "failed": {
+      "title": "Le tue app non si sono caricate",
+      "body": "Controlla la connessione e riprova.",
+      "retry": "Riprova"
+    }
+  },
+  "app": {
+    "publisher": "Creata da {{publisher}}",
+    "noPublisher": "Nessun autore indicato. Modifica l'app per aggiungerlo; fino ad allora la schermata di consenso non mostra la riga «Creata da».",
+    "clientId": "Client ID",
+    "kind": {
+      "WEB": "App web",
+      "NATIVE": "App nativa"
+    },
+    "clientTypeTerm": "Tipo di client",
+    "auth": {
+      "NONE": "Pubblica: nessun secret, solo PKCE",
+      "CLIENT_SECRET_BASIC": "Riservata: secret in un header HTTP Basic",
+      "CLIENT_SECRET_POST": "Riservata: secret nel corpo del modulo"
+    },
+    "redirectUris": "Redirect URI",
+    "homepage": "Sito web",
+    "privacyPolicy": "Informativa sulla privacy",
+    "linksTerm": "Link",
+    "linksLabel": "Link di {{app}}",
+    "connectionsTerm": "Climber",
+    "connections_one": "{{count}} climber collegato su {{max}}",
+    "connections_other": "{{count}} climber collegati su {{max}}",
+    "newPerDay": "Fino a {{count}} nuovi climber al giorno",
+    "registeredTerm": "Registrata",
+    "suspended": {
+      "title": "Sospesa da Boardsesh",
+      "body": "Questa app non riceve token e non può essere modificata né eliminata. Motivo: {{reason}}",
+      "noReason": "Questa app non riceve token e non può essere modificata né eliminata."
+    },
+    "actions": {
+      "label": "Azioni per {{app}}",
+      "edit": "Modifica",
+      "rotate": "Nuovo secret",
+      "delete": "Elimina"
+    }
+  },
+  "form": {
+    "createTitle": "Registra un'app",
+    "editTitle": "Modifica {{app}}",
+    "name": "Nome dell'app",
+    "nameHelp": "I climber lo vedono nella schermata di consenso. Da 3 a 50 caratteri.",
+    "publisher": "Autore",
+    "publisherHelp": "La persona o l'azienda che crea l'app. I climber vedono «Creata da» con questo nome.",
+    "homepage": "URL del sito web (facoltativo)",
+    "privacyPolicy": "URL dell'informativa sulla privacy",
+    "urlHelp": "Inizia con https://. Compare come link nella schermata di consenso.",
+    "applicationType": "Dove torna l'accesso",
+    "applicationTypeWeb": "Un sito web",
+    "applicationTypeWebHelp": "Solo redirect URI con https://.",
+    "applicationTypeNative": "Un'app mobile, desktop o da riga di comando",
+    "applicationTypeNativeHelp": "Consente anche http://127.0.0.1 o http://[::1] su qualsiasi porta, e uno schema personalizzato come com.example.app:/oauth/boardsesh.",
+    "clientType": "Dove il codice viene scambiato con i token",
+    "clientTypeConfidential": "Sul mio server",
+    "clientTypeConfidentialHelp": "Ricevi un client secret. Tienilo solo sul server.",
+    "clientTypePublic": "Sul dispositivo o nel browser",
+    "clientTypePublicHelp": "Nessun secret. PKCE protegge il codice. Usalo per tutto ciò che distribuisci agli utenti.",
+    "secretMethod": "Come il tuo server invia il secret",
+    "secretMethodBasic": "Header HTTP Basic (consigliato)",
+    "secretMethodPost": "Nel corpo del modulo",
+    "redirectUris": "Redirect URI",
+    "redirectUrisHelp": "Uno per riga, fino a 10. Devono coincidere esattamente, tranne la porta di un indirizzo loopback.",
+    "fixed": "Fissato alla registrazione: {{kind}}, {{auth}}.",
+    "required": "Compila questo campo.",
+    "cancel": "Annulla",
+    "create": "Registra l'app",
+    "creating": "Registrazione…",
+    "save": "Salva le modifiche",
+    "saving": "Salvataggio…",
+    "refused": "Boardsesh non ha salvato questa app",
+    "readTerms": "Leggi i termini per sviluppatori (si aprono in una nuova scheda)",
+    "acceptTerms": "Accetto i termini di Boardsesh per sviluppatori per questa app",
+    "acceptTermsRequired": "Accetta i termini per sviluppatori per registrare un'app."
+  },
+  "secret": {
+    "createdTitle": "{{app}} è registrata",
+    "rotatedTitle": "Nuovo secret per {{app}}",
+    "createdWarning": "Copia subito il client secret. Boardsesh non lo mostrerà di nuovo.",
+    "rotatedWarning": "Il vecchio secret ha smesso di funzionare. Copia subito quello nuovo: Boardsesh non lo mostrerà di nuovo.",
+    "lostHelp": "Perso in seguito? Crea un nuovo secret dalla scheda dell'app. Quello vecchio smette di funzionare subito.",
+    "publicNote": "Questa è un'app pubblica, quindi non c'è nessun secret. Invia un PKCE code challenge a ogni autorizzazione.",
+    "clientSecret": "Client secret",
+    "copy": "Copia",
+    "copied": "Copiato",
+    "copyFailed": "Impossibile copiare. Seleziona il testo e copialo tu.",
+    "confirmSaved": "Ho salvato il secret",
+    "done": "Fatto"
+  },
+  "rotate": {
+    "title": "Creare un nuovo secret per {{app}}?",
+    "body": "Il secret attuale smette di funzionare appena confermi. Le richieste di token del tuo server falliscono finché non distribuisci quello nuovo.",
+    "confirm": "Crea nuovo secret",
+    "working": "Creazione del nuovo secret…"
+  },
+  "delete": {
+    "title": "Eliminare {{app}}?",
+    "connected_one": "{{count}} climber è collegato. Eliminando l'app viene scollegato subito e i suoi token smettono di funzionare.",
+    "connected_other": "{{count}} climber sono collegati. Eliminando l'app vengono scollegati tutti subito e i loro token smettono di funzionare.",
+    "noneConnected": "Nessun climber è collegato. Qualsiasi accesso in corso per questa app smette di funzionare.",
+    "permanent": "Non puoi annullare questa azione.",
+    "confirm": "Elimina l'app",
+    "working": "Eliminazione…"
+  },
+  "toasts": {
+    "saved": "Modifiche salvate",
+    "deleted": "{{app}} eliminata"
+  },
+  "errors": {
+    "busy": "Boardsesh è occupato. Riprova tra qualche secondo.",
+    "rateLimited": "Troppe modifiche in un minuto. Aspetta un attimo, poi riprova.",
+    "gone": "Questa app non esiste più. L'elenco è stato aggiornato.",
+    "suspended": "Boardsesh ha sospeso questa app, quindi non può essere modificata.",
+    "emailNotVerified": "Verifica il tuo indirizzo email prima di registrare un'app.",
+    "generic": "Qualcosa è andato storto. Riprova."
+  },
+  "signInAgain": {
+    "title": "Accedi di nuovo per fare questa modifica",
+    "body": "Per cambiare i redirect URI, creare un nuovo secret o eliminare un'app serve un accesso degli ultimi {{minutes}} minuti. Così nessun altro che usa il tuo accesso può prendersi la tua app.",
+    "next": "Uscirai, accederai di nuovo e tornerai subito qui. Poi rifai la modifica.",
+    "formKept": "Le tue modifiche restano nel modulo dietro questo messaggio. Accedendo di nuovo lasci questa pagina e vanno perse, quindi copia prima i redirect URI che hai scritto.",
+    "button": "Accedi di nuovo"
+  },
+  "terms": {
+    "metadata": {
+      "title": "Developer terms | Boardsesh for developers",
+      "description": "The terms an app accepts when it registers to connect to Boardsesh accounts."
+    },
+    "title": "Boardsesh developer terms",
+    "version": "Version {{version}}",
+    "intro": "These terms apply to anyone who registers an app that connects to Boardsesh accounts through the Boardsesh API. You accept them when you register an app, for yourself and for everyone who works on the app with you.",
+    "data": {
+      "title": "Climbers’ data",
+      "items": {
+        "purpose": "Use what a climber shares only for the features they connected your app for.",
+        "noSale": "Don’t sell or rent it, and don’t share it with anyone for advertising, profiling or data brokering.",
+        "setterClimbs": "A tick comes with the climb it is on, including a draft or an unlisted climb someone else set. That detail is there so the climber can see their own logbook. Don’t publish it, show it to other people or build a list of climbs from it.",
+        "delete": "Delete a climber’s Boardsesh data when they disconnect your app or ask you to, unless they ask you to keep it.",
+        "privacyPolicy": "Have a privacy policy that says what you do with Boardsesh data, and register its link with your app. Climbers see it before they approve.",
+        "security": "Keep tokens and client secrets on your server or in the device’s secure storage, never in a URL or a log. If you learn that one leaked, or that someone reached climbers’ data without permission, tell us at legal@boardsesh.com within 72 hours."
+      }
+    },
+    "api": {
+      "title": "Using the API",
+      "items": {
+        "limits": "Stay within the rate limits, and wait as long as Retry-After says.",
+        "scopes": "Ask only for the scopes you use. Don’t try to get around a scope, a limit, a suspension or a climber’s choices.",
+        "catalog": "Don’t use the API to copy Boardsesh’s climb catalogue. The public nightly snapshots are there for that.",
+        "service": "Board control, sessions and the climb catalogue are not part of the API. An app whose accounts, climbing, board control or sessions run on Boardsesh’s servers needs our written permission, which we don’t currently give."
+      }
+    },
+    "names": {
+      "title": "Names and trademarks",
+      "items": {
+        "worksWith": "Say that your app works with Boardsesh, for example “Works with Boardsesh” or “Import your Boardsesh logbook”. Don’t suggest that Boardsesh made, reviewed or endorses your app.",
+        "ownName": "Don’t use Boardsesh, or anything that looks like it, in your app’s name, publisher name or icon.",
+        "boardBrands": "Kilter, Tension, MoonBoard and other board names belong to their owners. Use them only to say which board a climb is on, and don’t suggest that a board maker endorses your app or Boardsesh."
+      }
+    },
+    "ours": {
+      "title": "What Boardsesh may do",
+      "items": {
+        "suspend": "Suspend or delete an app that breaks these terms, puts climbers at risk or overloads the service. When we suspend an app, the console shows you the reason.",
+        "changes": "Change the API under the versioning rules in the developer docs, and change these terms. The console shows the new version, and the next app you register accepts it.",
+        "asIs": "The API is provided as it is, with no promise that it is always available or free of errors."
+      }
+    },
+    "ending": {
+      "title": "Stopping",
+      "body": "You can delete your app in the console at any time, and every climber’s connection to it ends at once. Then delete the Boardsesh data you hold, unless a climber asked you to keep theirs."
+    },
+    "contact": "Questions about these terms: legal@boardsesh.com"
+  },
+  "docs": {
+    "metadata": {
+      "title": "Leggi il diario di un climber con l'API di Boardsesh",
+      "description": "Registra un'app, manda il climber ad approvarla e leggi il suo diario: prima un download completo, poi solo ciò che è cambiato. Scope, limiti ed errori in una pagina."
+    },
+    "title": "Collega un'app al diario di un climber",
+    "lead": "Lascia che un pianificatore di allenamento, un diario o il tuo script legga le salite Boardsesh di un climber una volta che le ha approvate. Può scollegarla in qualsiasi momento.",
+    "access": {
+      "invitation": {
+        "title": "La registrazione è su invito",
+        "body": "Durante i test la registrazione è su invito. Ogni app inizia con spazio per {{live}} scalatori collegati contemporaneamente e {{perDay}} nuovi al giorno. Per chiedere accesso, scrivi a:"
+      },
+      "open": {
+        "title": "Registra la tua app",
+        "body": "Accedi, verifica la tua email sviluppatore e accetta i termini per creare un’app nella console. Ricevi un client ID e, se il tuo server scambia il codice, un client secret. Non serve un invito.",
+        "action": "Apri la console per sviluppatori"
+      }
+    },
+    "can": {
+      "title": "Cosa può fare un'app",
+      "items": {
+        "read": "Leggere ogni salita che il climber ha registrato, su ogni pannello, comprese quelle che tiene private su Boardsesh.",
+        "sync": "Scaricare tutto il diario una volta e poi chiedere solo ciò che è cambiato. Una modifica di solito compare entro un secondo.",
+        "profile": "Leggere il suo nome visualizzato e il suo avatar, se chiedi quello scope.",
+        "disconnect": "Il climber può scollegare la tua app in qualsiasi momento da Impostazioni, App collegate. La tua chiamata successiva fallisce e tu cancelli quello che avevi salvato.",
+        "notYet": "La sincronizzazione completa di sessioni e allenamenti richiede sessions:read. Non include video di beta né il controllo del pannello."
+      }
+    },
+    "steps": {
+      "title": "Come funziona",
+      "items": {
+        "register": "Registra un'app nella console per sviluppatori e conserva il client ID.",
+        "approve": "Manda il climber all'URL di autorizzazione nel browser di sistema. Accede e tocca Consenti.",
+        "exchange": "Scambia il codice che riceve il tuo redirect URI con un access token e un refresh token.",
+        "snapshot": "Chiama l'endpoint dei cambiamenti senza cursore e segui ogni pagina finché hasMore è false. Quello è il diario completo.",
+        "feed": "Da quel momento chiamalo con l'ultimo cursore per avere salite nuove, modificate ed eliminate."
+      }
+    },
+    "scopes": {
+      "title": "Scope",
+      "lead": "Chiedi il set più piccolo che ti serve. La schermata di consenso elenca ognuno in parole semplici.",
+      "items": {
+        "logbook": "Ogni salita su ogni pannello, comprese quelle che il climber tiene private.",
+        "profile": "Nome visualizzato e avatar.",
+        "offline": "Un refresh token, per continuare a leggere mentre il climber è assente. Da solo non apre alcun dato.",
+        "sessions": "Sessioni completate, note private del riepilogo, durata registrata e allenamenti completi, inclusi quelli di altre app. Richiede logbook:read."
+      }
+    },
+    "rules": {
+      "title": "Le regole che sorprendono gli sviluppatori",
+      "items": {
+        "consent": "Un'app senza client secret, e ogni app nativa, mostra la schermata di consenso a ogni autorizzazione. prompt=none non restituisce mai un codice; restituisce error=consent_required. Conserva il refresh token invece di autorizzare di nuovo. Solo un'app web confidenziale con reindirizzamento https viene ricordata.",
+        "redirect": "I redirect URI si confrontano come stringhe esatte, fino a {{max}} per app. Usa https, un indirizzo loopback (http://127.0.0.1 o http://[::1], porta ignorata) o uno schema privato che contenga un punto. http://localhost e i caratteri jolly vengono rifiutati.",
+        "redirectChange": "Aggiungere o sostituire un redirect URI chiede a ogni climber che ha approvato la tua app di approvarla di nuovo. Toglierne uno, o modificare nome e link, no. I token che hai già continuano a funzionare finché al climber non viene chiesto di nuovo.",
+        "recentSignIn": "Aggiungere, sostituire o togliere un redirect URI, ruotare il client secret ed eliminare un'app richiedono ciascuno un accesso negli ultimi {{minutes}} minuti. Se il tuo è più vecchio, la console ti chiede di accedere di nuovo.",
+        "notice": "Ricevi un'email quando cambiano i redirect URI, il secret viene ruotato, un'app viene eliminata o una nuova app viene registrata sul tuo account.",
+        "pkce": "PKCE con S256 è obbligatorio per ogni app. Invia resource=https://api.boardsesh.com/v1 quando autorizzi, scambi un codice e rinnovi. L'API rifiuta i token emessi senza.",
+        "code": "Un codice dura {{seconds}} secondi e vale una volta sola. Inviarlo due volte chiude anche i token che ha emesso: riavvia l'autorizzazione invece di riprovare.",
+        "tokens": "Un access token dura 1 ora. Un refresh token dura {{days}} giorni e cambia a ogni uso: salva il nuovo prima di usare il nuovo access token e non rinnovare mai in parallelo per lo stesso climber.",
+        "signin": "Un climber che ha acceduto l'ultima volta più di 30 giorni fa, o prima dell'ultimo cambio di password, accede di nuovo prima della schermata di consenso.",
+        "disconnect": "Se un climber scollega l'app, reimposta la password o elimina l'account, l'API risponde 401 invalid_token e un rinnovo risponde invalid_grant. Mostra uno stato Ricollega Boardsesh, smetti di chiamare per quel climber e cancella quello che avevi salvato."
+      }
+    },
+    "requests": {
+      "title": "Una prima connessione",
+      "lead": "Apri l'URL di autorizzazione nel browser di sistema, mai in una webview incorporata. Sostituisci con il tuo client ID, redirect URI, state e codice.",
+      "authorize": "Manda il climber qui:",
+      "authorizeLabel": "Richiesta di autorizzazione",
+      "exchange": "Il tuo redirect URI riceve un codice. Scambialo:",
+      "exchangeLabel": "Richiesta del token",
+      "exchangeResponseLabel": "Risposta del token",
+      "sync": "Poi leggi il diario. La prima volta ometti cursor e segui il cursore di ogni risposta. Sincronizza quando il climber apre la tua app e, in background, al massimo ogni 15 minuti per climber.",
+      "syncLabel": "Richiesta e risposta dei cambiamenti del diario",
+      "confidential": "Un'app confidenziale, che tiene un client secret sul proprio server, invia anche client_secret nel corpo (client_secret_post) o come HTTP Basic (client_secret_basic), a seconda di quello che ha registrato. Un'app pubblica invia solo client_id."
+    },
+    "limits": {
+      "title": "Limiti",
+      "items": {
+        "api": "API: {{climber}} richieste al minuto per climber e {{app}} al minuto per app.",
+        "token": "Endpoint dei token: {{refresh}} rinnovi al minuto per climber, e {{exchange}} scambi di codice o revoche al minuto per app e per IP del client.",
+        "fullSync": "Avviare un download completo: 2 al minuto per climber. Un 503 con Retry-After su un download significa aspettare almeno quel tempo.",
+        "page": "limit va da 1 a 200 e vale 100 per default. Una pagina può essere vuota e avere comunque hasMore: true.",
+        "history": "I cambiamenti restano per 90 giorni. Un cursore più vecchio risponde 410 cursor_expired; avvia un download completo senza cursore.",
+        "body": "Un corpo della richiesta oltre 64 KB risponde 413.",
+        "caps": "Accesso anticipato: {{apps}} app per account sviluppatore e, per app, {{live}} climber collegati contemporaneamente e {{perDay}} nuovi in 24 ore.",
+        "headers": "Ogni risposta porta Boardsesh-Request-Id e gli header RateLimit. Un 429 porta Retry-After in secondi."
+      }
+    },
+    "errors": {
+      "title": "Errori",
+      "lead": "Gli errori sono JSON con error, message e requestId. Decidi prima dallo stato HTTP; possono comparire codici nuovi.",
+      "items": {
+        "invalidToken": "L'access token è scaduto o è stato revocato. Rinnova una volta e riprova. Se il rinnovo fallisce, chiedi al climber di ricollegarsi.",
+        "insufficientScope": "Il token non ha lo scope che questa chiamata richiede.",
+        "cursorExpired": "Il cursore è troppo vecchio o non più valido. Avvia un download completo senza cursore.",
+        "rateLimited": "Hai superato un limite. Aspetta i secondi indicati da Retry-After.",
+        "busy": "Boardsesh è occupato o ha messo in pausa l'accesso delle app per un momento. Aspetta Retry-After e riprova. Non significa mai che il climber si è scollegato."
+      }
+    },
+    "versioning": {
+      "title": "Versioni",
+      "body": "La versione sta nel percorso, /v1. Nuovi campi, route, scope e valori di enumerazione arrivano su v1 senza preavviso: leggi ciò che conosci e ignora il resto. Rimuovere o rinominare un campo diventa v2, e v1 resta attiva per almeno sei mesi con un header Sunset su ogni risposta.",
+      "openapi": "La descrizione OpenAPI 3.1 di ogni route:"
+    },
+    "related": {
+      "title": "Continua a leggere",
+      "items": {
+        "docs": "L'API pubblica di lettura di blocchi e gradi",
+        "privacy": "Come Boardsesh tratta i tuoi dati",
+        "legal": "Termini e uso dei marchi",
+        "support": "Scrivi al team Boardsesh"
+      }
+    }
+  },
+  "emailVerification": {
+    "title": "Verifica la tua email sviluppatore",
+    "lead": "Conferma la tua email prima di registrare un’app.",
+    "description": "Invia un link di conferma a {{email}}. Ogni nuova email sostituisce il link precedente.",
+    "send": "Invia email di conferma",
+    "sending": "Invio…",
+    "sent": "Controlla la posta. Il link scade tra 30 minuti.",
+    "failed": "Impossibile inviare l’email. Aspetta un minuto e riprova.",
+    "confirmDescription": "Conferma solo se hai richiesto questa email per l’account con cui hai effettuato l’accesso.",
+    "signInHelp": "Accedi in una nuova scheda, poi torna qui. Usa l’account che ha richiesto questa email.",
+    "signIn": "Accedi",
+    "confirm": "Conferma email sviluppatore",
+    "confirming": "Conferma…",
+    "verified": "La tua email sviluppatore è verificata. Puoi registrare un’app.",
+    "invalid": "Questo link è scaduto, è stato sostituito o appartiene a un altro account. Richiedi una nuova email dalla console sviluppatore.",
+    "back": "Apri le app sviluppatore"
+  },
+  "guides": {
+    "labels": {
+      "home": "Panoramica sviluppatori",
+      "related": "Continua a leggere",
+      "markdown": "Leggi in Markdown",
+      "openapi": "Scarica OpenAPI 3.1",
+      "example": "Scarica l’esempio di sincronizzazione",
+      "loading": "Caricamento riferimento API…",
+      "invitation": "La registrazione è su invito. Scrivi a support@boardsesh.com per richiedere l’accesso."
+    },
+    "auth": {
+      "title": "Collega un account con OAuth",
+      "description": "Registra un’app, autorizza con PKCE e conserva al sicuro le credenziali rinnovate.",
+      "registration": {
+        "title": "Registra la tua app",
+        "body": "Accedi a /developers/apps e verifica l’email sviluppatore. Usa un’app pubblica nativa per terminale, mobile o desktop; pubblica web per il browser; riservata quando il tuo server scambia il codice. Conserva il segreto solo sul server.\n\nRegistra l’URI di ritorno esatto. Le app native ammettono http://127.0.0.1:8765/oauth/boardsesh e http://[::1]:8765/oauth/boardsesh; la porta di loopback non viene confrontata. Sono ammessi https e schemi privati con un punto. localhost, caratteri jolly, frammenti, host e schemi Boardsesh sono rifiutati. Massimo: 10 app per account e 10 ritorni per app. Limiti iniziali: 25 persone collegate e 20 nuove connessioni in 24 ore. Per aumentarli, scrivi a support@boardsesh.com."
+      },
+      "authorize": {
+        "title": "Autorizza nel browser di sistema",
+        "body": "Scopri gli endpoint su https://api.boardsesh.com/.well-known/oauth-authorization-server/api/auth. L’emittente è https://api.boardsesh.com/api/auth e la risorsa esatta è https://api.boardsesh.com/v1. Invia resource durante autorizzazione, scambio e rinnovo.\n\nGenera un verificatore PKCE casuale, la relativa challenge S256 e almeno 128 bit casuali per state. Richiedi logbook:read e offline_access; aggiungi profile:read solo per nome e avatar. Apri il browser di sistema e controlla state e iss al ritorno. I codici durano 60 secondi e valgono una volta. Se il risultato dello scambio è incerto, ricomincia l’autorizzazione."
+      },
+      "credentials": {
+        "title": "Salva ogni token rinnovato prima di usarlo",
+        "body": "I token di accesso durano un’ora; quelli di rinnovo, 90 giorni. Ogni rinnovo sostituisce il token precedente. Serializza i rinnovi per account e salva la nuova coppia in modo duraturo prima di usarla. Riutilizzare un token consumato invalida la sua famiglia. Dopo un errore di rete dall’esito sconosciuto, ricollega l’account anziché ripetere il token.\n\nSu 401 rinnova una volta e riprova. invalid_grant richiede una nuova connessione: smetti di usare quella credenziale. Mantieni il metodo registrato: none, client_secret_post o client_secret_basic. CORS ammette le origini https di ritorno registrate. Non conservare credenziali nelle preferenze del browser."
+      },
+      "disconnect": {
+        "title": "Scollega l’intera connessione",
+        "body": "DELETE /v1/connection non richiede altri scope. Un 204 conferma la disconnessione: elimina credenziali e copia del diario, salvo richiesta di conservarla. Un 401 non conferma un DELETE precedente. Rinnova una volta e riprova; se le credenziali non funzionano, chiedi di controllare App collegate in Boardsesh. Revocare un token OAuth non scollega tutte le famiglie. Anche cambio password ed eliminazione account scollegano le app."
+      }
+    },
+    "sync": {
+      "title": "Mantieni sincronizzato il diario completo",
+      "description": "Scarica un’istantanea completa, salva modifiche e cursori insieme e riparti dopo una scadenza.",
+      "snapshot": {
+        "title": "Prepara prima una copia sostitutiva",
+        "body": "GET /v1/logbook/changes senza cursore avvia un’istantanea completa, incluse salite vecchie invariate e precedenti a questa API. Segui tutti i cursori fino a hasMore: false. L’ultima pagina dell’istantanea passa al recupero incrementale con hasMore: true. Anche una pagina vuota può avere hasMore: true. limit va da 1 a 200, con 100 come valore predefinito.\n\nPrepara una copia separata. Pubblicala con il cursore finale in un’unica transazione duratura, conservando fino ad allora la vecchia copia. Dopo un arresto durante il primo download, scarta la copia incompleta e ricomincia senza cursore. Non applicare mai pagine di istantanea come modifiche incrementali alla copia precedente."
+      },
+      "changes": {
+        "title": "Salva ogni pagina con il suo cursore",
+        "body": "Con logbook:read, inserisci o sostituisci tick tramite tick.id ed elimina tick.deleted tramite id, anche se la salita era sconosciuta. Applica le voci in ordine e ignora i tipi di modifica nuovi. Salva modifiche e cursore atomicamente e serializza la sincronizzazione per account.\n\nUna salita contiene tentativi, grado, stelle e commento. I gradi del catalogo possono cambiare senza modificare la salita. Una pagina incrementale vuota non indica un’eliminazione. GET /v1/me restituisce un ID stabile per la tua app, diverso nelle altre. Separa le copie per app e account."
+      },
+      "recovery": {
+        "title": "Riparti da un 410 senza perdere la vecchia copia",
+        "body": "410 cursor_expired impone una sostituzione completa, non solo l’azzeramento del cursore. Salva prima un indicatore duraturo di sincronizzazione completa necessaria. I cursori di istantanea scadono dopo un’ora e appartengono a una connessione. La conservazione incrementale dipende dalla soglia di pulizia: non scartare un cursore solo per la sua età.\n\nL’esempio conserva credenziali, salite, cursore e indicatore in un file JSON privato. Ogni comando blocca il file, sostituisce con rinomina atomica, serializza i rinnovi e riprova errori di rete, 429 e 5xx con attese crescenti. Dopo un arresto, verifica che il comando sia terminato prima di eliminare il suo file .lock."
+      },
+      "poll": {
+        "title": "Sincronizza quando serve",
+        "body": "Sincronizza quando la persona apre la tua app; in background, al massimo ogni 15 minuti per account. Rispetta Retry-After su 429 e 503 temporanei. I webhook facoltativi logbook.changed chiedono questa stessa sincronizzazione, senza sostituire il feed.\n\nMantieni private le salite private. Sulla Spraywall non pubblica di un’altra persona, nome del blocco e identità della Spraywall sono nascosti. Non costruire un catalogo né pubblicare bozze o blocchi non elencati di altri tracciatori partendo dal diario."
+      },
+      "sessions": {
+        "title": "Sincronizzare sessioni completate e allenamenti",
+        "body": "Richiedi logbook:read sessions:read offline_access per importare sessioni personali, dedotte e condivise a cui lo scalatore ha partecipato, una volta completate. Sono escluse le sessioni attive e quelle permanenti della palestra. I record includono riepilogo, orari di inizio e fine salvati, durationSeconds e il piano e i risultati completi dell’allenamento, inclusi quelli di altre app. Se gli orari registrati mancano o sono invertiti, la durata è null; non stimarla mai dalle salite. Il riepilogo e le etichette private di un altro creatore non vengono condivisi. Sono esclusi i link di beta e le posizioni delle prese.\n\nCrea o aggiorna le voci session tramite session.id, rimuovi le voci session.deleted tramite id e usa tick.sessionId per raggruppare i blocchi. I riferimenti possono arrivare in pagine diverse. GET /v1/logbook/sessions/{id} legge una sessione autorizzata. Mantieni entrambi i tipi di entità nella stessa copia sostitutiva e salvali insieme al cursore.\n\nI token esistenti limitati alle salite non ottengono questo accesso. Richiedi un nuovo consenso con sessions:read, sostituisci la coppia di token salvata e avvia un’importazione sostitutiva completa senza il vecchio cursore. Un cursore del livello di accesso precedente restituisce 410. La sostituzione include sessioni precedenti all’integrazione; i piani di allenamento o gli orari storici mancanti non possono essere ricostruiti."
+      },
+      "attribution": {
+        "title": "Citare Boardsesh e collegare la sessione",
+        "body": "La vista principale di ogni sessione importata deve citare Boardsesh in modo visibile. Basta “Boardsesh” o “Registrato con Boardsesh” in un piccolo piè di pagina o in una nota. Una citazione nascosta in un menu con i tre puntini non basta.\n\nConsigliamo anche un’azione “Apri in Boardsesh” che usi url o appUrl della sessione. Può trovarsi in un menu con i tre puntini e non deve essere l’azione principale. I link della cronologia richiedono l’accesso con un account che ha registrato la sessione o vi ha partecipato; aprono il dettaglio in sola lettura e non fanno mai partecipare a una sessione. Mantieni utilizzabile l’alternativa HTTPS senza l’app."
+      }
+    },
+    "errors": {
+      "title": "Gestisci errori e limiti dell’API",
+      "description": "Riconosci quando rinnovare, ricostruire il diario, aspettare o ricollegare l’account.",
+      "status": {
+        "title": "Controlla prima lo stato HTTP",
+        "body": "400 indica richiesta o cursore non validi. Su 401 invalid_token rinnova una volta; invalid_grant al rinnovo richiede una nuova connessione. 403 insufficient_scope richiede quel permesso. 404 nasconde risorse di altre app o persone. 409 indica un conflitto, come externalRef riutilizzato o annullamento di un allenamento iniziato. 410 cursor_expired richiede sincronizzazione completa. 413 indica più di 64 KB; 422, validazione o idempotenza incoerente.\n\nRiprova 429 e 5xx rispettando Retry-After con attese esponenziali limitate. Un errore di rete non dimostra revoca. Tollera nuovi codici e campi in v1. Gli errori contengono error, message e requestId, talvolta field. OAuth usa error ed error_description."
+      },
+      "limits": {
+        "title": "Leggi le intestazioni di risposta",
+        "body": "L’API ammette 120 richieste al minuto per app/account e 6.000 per app. Rinnovo: 10 al minuto per connessione. Scambio e revoca: 60 al minuto per app/IP. Ogni nuova app ammette 25 persone collegate e 20 nuove connessioni in 24 ore. Un amministratore può modificare questi limiti.\n\nRateLimit-Limit, RateLimit-Remaining e RateLimit-Reset descrivono il limite più stretto. Retry-After indica l’attesa in secondi. Boardsesh-Request-Id identifica la richiesta per l’assistenza. Non inviare mai token, codici o segreti all’assistenza."
+      },
+      "versions": {
+        "title": "Prevedi aggiunte al contratto",
+        "body": "v1 può aggiungere campi, percorsi, scope, eventi e valori enumerati. Ignora ciò che non conosci. Eliminare o rinominare campi richiede v2; v1 continua almeno sei mesi con l’intestazione Sunset. Ogni cambiamento compare nella cronologia.\n\nGenera un client o simula l’API con OpenAPI 3.1. La simulazione mostra i formati, non la sicurezza OAuth o i cursori reali. Prova autorizzazione e sincronizzazione con il tuo account prima di pubblicare."
+      }
+    },
+    "reference": {
+      "title": "Riferimento API Boardsesh per le app",
+      "description": "Esplora l’API REST con scope e scarica il contratto OpenAPI 3.1.",
+      "contract": {
+        "title": "Usa il contratto pubblicato",
+        "body": "L’host è https://api.boardsesh.com. /v1 usa un token Bearer opaco per la risorsa https://api.boardsesh.com/v1. Gli endpoint OAuth e i metadati sono separati dal contratto REST. Questo riferimento usa lo stesso documento OpenAPI versionato del backend.\n\nGenera un client o avvia la simulazione Prism. Gli esempi sono illustrativi. La simulazione non autorizza app, rinnova token, mantiene istantanee o controlla la proprietà. Prova questi flussi con il tuo account."
+      }
+    },
+    "changelog": {
+      "title": "Cronologia API Boardsesh",
+      "description": "Leggi i cambiamenti del contratto, dal più recente.",
+      "contract": {
+        "title": "Cambiamenti del contratto",
+        "body": "Le voci provengono dalla stessa cronologia versionata che CI controlla rispetto al documento OpenAPI generato. Nuovi campi e percorsi restano in v1; eliminazioni e rinomine richiedono una nuova versione principale. Controlla questa pagina quando aggiorni il client."
+      }
+    }
+  },
+  "webhooks": {
+    "open": "Webhook",
+    "title": "Webhook di {{app}}",
+    "description": "Ricevi un avviso quando cambia un diario, termina un allenamento o finisce una connessione. Gli avvisi non contengono dati di arrampicata.",
+    "loading": "Caricamento impostazioni webhook…",
+    "failed": "Impossibile caricare o salvare le impostazioni. Riprova.",
+    "retry": "Riprova",
+    "url": "URL HTTPS di destinazione",
+    "urlHelp": "HTTPS pubblico sulla porta 443. Indirizzi privati e reindirizzamenti sono rifiutati.",
+    "events": "Eventi di notifica",
+    "enabled": "Attiva consegne",
+    "save": "Salva webhook",
+    "saving": "Salvataggio…",
+    "saved": "Webhook salvato.",
+    "testQueued": "Consegna di prova in coda. Aggiorna l’elenco per vedere il risultato.",
+    "secretOnce": "Copia il segreto adesso. Non verrà mostrato di nuovo.",
+    "secret": "Segreto di firma del webhook",
+    "rotationHelp": "Dopo la rotazione, le richieste hanno entrambe le firme per 24 ore. Aggiorna il ricevitore prima che scada il vecchio segreto.",
+    "rotate": "Ruota segreto di firma",
+    "test": "Invia prova",
+    "disable": "Disattiva consegne",
+    "enable": "Riattiva consegne",
+    "deliveries": "Consegne recenti",
+    "refresh": "Aggiorna consegne",
+    "noDeliveries": "Ancora nessuna consegna.",
+    "delivery": "{{event}} · {{status}} · {{attempts}} tentativi · HTTP {{code}}",
+    "noResponse": "nessuna risposta",
+    "close": "Chiudi",
+    "endpointGone": "La destinazione ha risposto HTTP 410. Correggila, poi riattiva le consegne.",
+    "failuresDisabled": "Le consegne sono state disattivate dopo errori ripetuti. Correggi la destinazione e riattivale.",
+    "reauthBody": "Cambiare impostazioni o ruotare il segreto richiede un accesso negli ultimi {{minutes}} minuti. Accedi di nuovo per proteggere la destinazione degli avvisi.",
+    "reauthForm": "Accedere di nuovo lascia questa pagina e cancella le modifiche non salvate. Copia l’URL prima di continuare.",
+    "deliveryStatus": {
+      "delivered": "Consegnato",
+      "failed": "Non riuscito",
+      "cancelled": "Annullato",
+      "retrying": "Nuovo tentativo",
+      "pending": "In attesa"
+    },
+    "rotationAvailableAfter": "Puoi ruotare di nuovo il segreto dopo {{time}}."
+  },
+  "gymMcp": {
+    "title": "Gestisci le tue palestre con un assistente IA",
+    "lead": "Collega ChatGPT o Claude a Boardsesh per consultare l’attività e gestire la palestra da una conversazione.",
+    "availability": "L’accesso viene attivato per fasi. Se il tuo account non può ancora collegarsi, continua con Gestisci palestra e riprova quando avrai accesso.",
+    "links": {
+      "gyms": "Trova la tua palestra",
+      "connections": "Gestisci le app collegate",
+      "support": "Ricevi aiuto per collegarti"
+    },
+    "setup": {
+      "title": "Collega il tuo assistente",
+      "endpoint": "URL del server MCP ospitato",
+      "copy": "Copia l’URL del server",
+      "copied": "URL del server copiato",
+      "copyFailed": "Copia non riuscita. Seleziona l’URL qui sopra e copialo.",
+      "steps": {
+        "add": "Aggiungi un server MCP remoto personalizzato nei plugin di ChatGPT o nei connettori di Claude.",
+        "paste": "Incolla l’URL. Scegli OAuth e l’opzione dell’identità pubblicata del client.",
+        "signIn": "Accedi a Boardsesh e controlla i permessi prima di consentire l’accesso.",
+        "try": "Apri una conversazione con il connettore e chiedi quali palestre puoi gestire."
+      },
+      "requirements": "Non devi installare nulla o registrare un’app sviluppatore. Il tuo account e spazio di lavoro devono consentire connessioni MCP personalizzate. Impostazioni e piani disponibili dipendono dal fornitore.",
+      "chatgptGuide": "Guida al collegamento di ChatGPT",
+      "claudeGuide": "Guida al collegamento di Claude"
+    },
+    "access": {
+      "title": "Cosa può fare il tuo assistente",
+      "gyms": "Un collegamento comprende tutte le palestre che il tuo account Boardsesh può gestire, incluse quelle a cui accederai in futuro. Il tuo ruolo attuale limita ogni azione.",
+      "actions": "Leggere rapporti di attività, modificare profilo e immagine della palestra, gestire pannelli e schermi, rispondere ai commenti e gestire gli accessi consentiti dello staff.",
+      "approvals": "Controlla le richieste di modifica prima di approvarle nell’assistente. È l’assistente a decidere quando chiedere l’approvazione; Boardsesh verifica i tuoi permessi attuali per ogni operazione.",
+      "privacy": "I risultati degli strumenti vengono condivisi con l’assistente che scegli. Inserisci la password di Boardsesh solo nella pagina di accesso di Boardsesh."
+    },
+    "examples": {
+      "title": "Prova una richiesta",
+      "activity": "«Mostrami l’attività degli ultimi 30 giorni della mia palestra, inclusi i limiti di copertura».",
+      "tv": "«Crea uno schermo TV con i nostri pannelli Kilter e Tension».",
+      "profile": "«Aggiorna la descrizione della palestra: il sabato apriamo alle 8».",
+      "photos": "Per una foto o un logo, fornisci un URL HTTPS pubblico dell’immagine. Puoi anche caricare un file dalla scheda del profilo o dell’immagine della palestra."
+    },
+    "disconnect": {
+      "title": "Interrompi l’accesso dell’assistente",
+      "body": "Apri le impostazioni, trova l’assistente nelle App collegate e scegli Scollega. Le richieste successive non funzioneranno più. Le informazioni già condivise rimangono all’assistente."
+    },
+    "pilotAvailability": "Questo connettore è in fase pilota solo su invito. Possono collegarsi solo gli account Boardsesh invitati. Aspetta il tuo invito prima di seguire i passaggi di accesso qui sotto."
+  }
+}

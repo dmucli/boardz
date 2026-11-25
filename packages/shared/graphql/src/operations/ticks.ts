@@ -1,5 +1,6 @@
 import { gql } from 'graphql-request';
 import type { Tick, SaveTickInput, GetTicksInput, RenderBoardConfig } from '@boardsesh/shared-schema';
+import type { TickReportingTimeInput } from '@boardsesh/shared-schema';
 import type { UpdateTickInput as GeneratedUpdateTickInput } from '../generated/graphql';
 
 export const GET_TICKS = gql`
@@ -206,6 +207,7 @@ export const GET_USER_ASCENTS_FEED = gql`
         qualityAverage
         isBenchmark
         isNoMatch
+        characteristics
         comment
         climbedAt
         frames
@@ -257,6 +259,9 @@ export type AscentFeedItem = {
   qualityAverage: number | null;
   isBenchmark: boolean;
   isNoMatch: boolean;
+  // Structured climb characteristics (e.g. 'no_match', 'method_footless').
+  // Decode with the CLIMB_CHARACTERISTICS helpers (isNoMatch / getMoonBoardMethod).
+  characteristics?: string[] | null;
   comment: string;
   climbedAt: string;
   frames: string | null;
@@ -299,7 +304,17 @@ export type GetUserAscentsFeedQueryVariables = {
     minAngle?: number;
     maxAngle?: number;
     benchmarkOnly?: boolean;
+    minQuality?: number;
+    setterUsernames?: string[];
+    /**
+     * Inclusive start. The logbook sends an ISO timestamp (the climber's local
+     * midnight); a bare `YYYY-MM-DD` still means that UTC day.
+     */
     fromDate?: string;
+    /**
+     * The logbook sends an ISO timestamp, EXCLUSIVE (local midnight after the
+     * last day); a bare `YYYY-MM-DD` still means through the end of that UTC day.
+     */
     toDate?: string;
   };
 };
@@ -311,6 +326,31 @@ export type GetUserAscentsFeedQueryResponse = {
     totalCount: number;
     hasMore: boolean;
   };
+};
+
+// Setters of the climbs a user has logged, most-logged first. Feeds the
+// logbook's setter filter picker.
+export const GET_USER_LOGGED_SETTERS = gql`
+  query GetUserLoggedSetters($userId: ID!, $input: UserLoggedSettersInput) {
+    userLoggedSetters(userId: $userId, input: $input) {
+      setterUsername
+      tickCount
+    }
+  }
+`;
+
+export type GetUserLoggedSettersQueryVariables = {
+  userId: string;
+  input?: {
+    boardTypes?: string[];
+    layoutIds?: number[];
+    search?: string;
+    limit?: number;
+  };
+};
+
+export type GetUserLoggedSettersQueryResponse = {
+  userLoggedSetters: Array<{ setterUsername: string; tickCount: number }>;
 };
 
 // Caption → ascent matches for the share-beta picker. Returns full ascent rows
@@ -342,6 +382,7 @@ export const GET_USER_ASCENT_CAPTION_MATCHES = gql`
       qualityAverage
       isBenchmark
       isNoMatch
+      characteristics
       comment
       climbedAt
       frames
@@ -384,6 +425,7 @@ export const GET_USER_GROUPED_ASCENTS_FEED = gql`
         difficultyName
         isBenchmark
         isNoMatch
+        characteristics
         date
         flashCount
         sendCount
@@ -419,6 +461,7 @@ export const GET_USER_GROUPED_ASCENTS_FEED = gql`
           qualityAverage
           isBenchmark
           isNoMatch
+          characteristics
           comment
           climbedAt
           frames
@@ -447,6 +490,9 @@ export type GroupedAscentFeedItem = {
   difficultyName: string | null;
   isBenchmark: boolean;
   isNoMatch: boolean;
+  // Structured climb characteristics (e.g. 'no_match', 'method_footless').
+  // Decode with the CLIMB_CHARACTERISTICS helpers (isNoMatch / getMoonBoardMethod).
+  characteristics?: string[] | null;
   date: string;
   flashCount: number;
   sendCount: number;
@@ -558,6 +604,8 @@ export const UPDATE_TICK = gql`
   mutation UpdateTick($uuid: ID!, $input: UpdateTickInput!) {
     updateTick(uuid: $uuid, input: $input) {
       uuid
+      boardId
+      boardDisplayName
       status
       attemptCount
       quality
@@ -576,6 +624,8 @@ export type DeleteTickVariables = {
 };
 
 export type UpdateTickInput = {
+  privacy?: { audience: 'public' | 'followers' | 'only_me'; privacyRevision: number };
+  boardUuid?: string | null;
   status?: 'flash' | 'send' | 'attempt';
   attemptCount?: number;
   quality?: number | null;
@@ -583,6 +633,7 @@ export type UpdateTickInput = {
   isBenchmark?: boolean;
   comment?: string;
   climbedAt?: string;
+  reportingTime?: TickReportingTimeInput | null;
   angle?: number;
 };
 
@@ -627,6 +678,8 @@ export type UpdateTickVariables = {
 export type UpdateTickResponse = {
   updateTick: {
     uuid: string;
+    boardId: number | null;
+    boardDisplayName: string | null;
     status: string;
     attemptCount: number;
     quality: number | null;
@@ -638,3 +691,46 @@ export type UpdateTickResponse = {
     updatedAt: string;
   };
 };
+
+export type TickBoardOption = {
+  uuid: string;
+  name: string;
+  boardType: string;
+  layoutId: number;
+  sizeId: number;
+  setIds: string;
+};
+
+export type TickBoardOptionsResponse = {
+  tickBoardOptions: {
+    currentBoard: TickBoardOption | null;
+    boards: TickBoardOption[];
+    totalCount: number;
+    hasMore: boolean;
+  };
+};
+
+export const TICK_BOARD_OPTIONS = gql`
+  query TickBoardOptions($tickUuid: ID!, $limit: Int, $offset: Int) {
+    tickBoardOptions(tickUuid: $tickUuid, limit: $limit, offset: $offset) {
+      currentBoard {
+        uuid
+        name
+        boardType
+        layoutId
+        sizeId
+        setIds
+      }
+      boards {
+        uuid
+        name
+        boardType
+        layoutId
+        sizeId
+        setIds
+      }
+      totalCount
+      hasMore
+    }
+  }
+`;

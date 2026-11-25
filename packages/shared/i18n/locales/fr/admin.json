@@ -25,7 +25,50 @@
     "gymClaims": "Revendications de salles",
     "feedback": "Rapports de bugs",
     "gymDuplicates": "Salles en double",
-    "locationSync": "Gels de synchronisation des lieux"
+    "locationSync": "Gels de synchronisation des lieux",
+    "sprayWalls": "Données d'entraînement des Spraywalls",
+    "boards": "Boards enregistrées",
+    "buildPlans": "Commandes de packs de construction",
+    "partnerApps": "Applications partenaires",
+    "boardReports": "Signalements de boards"
+  },
+  "buildPlans": {
+    "title": "Commandes de packs de construction",
+    "subtitle": "Toutes les commandes, aperçus gratuits compris, de la plus récente à la plus ancienne. Lis l'erreur du générateur, puis remets le pack en file.",
+    "previewsLastHour_one": "{{count}} aperçu tracé dans la dernière heure, sur les commandes chargées ici.",
+    "previewsLastHour_other": "{{count}} aperçus tracés dans la dernière heure, sur les commandes chargées ici.",
+    "backToAdmin": "Retour à l’administration",
+    "statusFilter": {
+      "all": "Toutes"
+    },
+    "table": {
+      "licence": "Licence",
+      "licensee": "Titulaire",
+      "tier": "Formule",
+      "wall": "Mur",
+      "status": "Statut",
+      "attempts": "Essais",
+      "created": "Créée le",
+      "actions": "Actions"
+    },
+    "actions": {
+      "regenerate": "Régénérer"
+    },
+    "confirm": {
+      "title": "Régénérer ce pack ?",
+      "body": "{{licenceId}} est régénéré avec le même identifiant de licence et remplace le fichier téléchargé par l’acheteur. Il garde la licence qu’il a payée.",
+      "cancel": "Le laisser tel quel",
+      "confirm": "Régénérer"
+    },
+    "snackbar": {
+      "regenerated": "De retour dans la file",
+      "regenerateFailed": "Impossible de remettre ce pack dans la file"
+    },
+    "empty": "Aucune commande ne correspond à ces filtres.",
+    "error": "Impossible de charger les commandes.",
+    "retry": "Réessayer",
+    "loadMore": "Charger plus",
+    "unknown": "Non renseigné"
   },
   "feedback": {
     "title": "Bugs et retours",
@@ -63,8 +106,9 @@
     "reporter": {
       "anonymous": "Anonyme",
       "copyEmail": "Copier l'e-mail",
-      "consentYes": "Contact autorisé",
-      "consentNo": "Pas de consentement"
+      "consentYes": "E-mails autorisés",
+      "consentNo": "E-mails refusés",
+      "showReports": "Voir les bugs signalés par cette personne"
     },
     "rating": {
       "value": "{{rating}}/5"
@@ -85,7 +129,16 @@
       "userAgent": "Agent utilisateur",
       "screenshots": "Captures d'écran",
       "screenshotAlt": "Capture d'écran {{index}}",
-      "resolvedBy": "Résolu par"
+      "resolvedBy": "Résolu par",
+      "releaseChannel": "Canal de publication",
+      "releaseBranch": "Branche en cours",
+      "updateId": "ID de mise à jour",
+      "runtimeVersion": "Runtime",
+      "automaticCanary": "Canary automatique",
+      "canaryYes": "Oui",
+      "canaryNo": "Non",
+      "canaryUnknown": "Inconnu",
+      "canaryCheckedAt": "Canary vérifié"
     },
     "empty": "Aucun retour ne correspond à ces filtres.",
     "error": "Impossible de charger les retours.",
@@ -97,6 +150,26 @@
       "updateFailed": "Impossible de mettre à jour le statut",
       "emailCopied": "E-mail copié",
       "copyFailed": "Impossible de copier"
+    },
+    "conversation": {
+      "title": "Conversation",
+      "open": "Lire la conversation",
+      "loadError": "Impossible de charger cette conversation.",
+      "loadOlder": "Charger les messages précédents",
+      "empty": "Les réponses à ce signalement apparaîtront ici.",
+      "staff": "Boardsesh",
+      "reporter": "Auteur du signalement",
+      "close": "Fermer",
+      "retry": "Réessayer",
+      "latestReply": "Dernière réponse",
+      "publicNotice": "Les réponses sont partagées sur le ticket GitHub public lié.",
+      "openGithub": "Répondre sur GitHub",
+      "githubHint": "Pour écrire à l’auteur du signalement, écris /reply seul sur la première ligne d’un commentaire GitHub. Seuls les contributeurs autorisés de Boardsesh peuvent envoyer ces messages."
+    },
+    "filters": {
+      "reporter": "ID du compte ayant signalé le bug",
+      "needsReply": "Réponse attendue",
+      "clearReporter": "Afficher tous les auteurs"
     }
   },
   "retention": {
@@ -154,9 +227,7 @@
       "roleLabel": "Rôle",
       "boardTypeLabel": "Type de board (facultatif)",
       "boardTypeOptions": {
-        "global": "Global (toutes les boards)",
-        "kilter": "Kilter",
-        "tension": "Tension"
+        "global": "Global (toutes les boards)"
       },
       "roleOptions": {
         "communityLeader": "Référent communauté",
@@ -234,6 +305,13 @@
       "disabled": "Approbation automatique désactivée.",
       "saveFailed": "Enregistrement impossible. Réessayez.",
       "loadFailed": "Impossible de charger les paramètres des salles."
+    },
+    "dailyCap": {
+      "label": "Limite quotidienne",
+      "description": "Combien de revendications peuvent s'approuver automatiquement en 24 heures, tous comptes confondus. Au-delà, elles attendent une vérification. Avec 0, toutes passent en vérification.",
+      "save": "Enregistrer la limite",
+      "invalid": "Saisissez un nombre entier entre 0 et 1000.",
+      "saved": "Limite quotidienne enregistrée."
     }
   },
   "gymClaims": {
@@ -245,6 +323,7 @@
     "retry": "Réessayer",
     "approve": "Approuver",
     "deny": "Refuser",
+    "claimantHistory": "Compte : {{days}} jours · Carnet : {{ticks}} · Salles gérées : {{gyms}}",
     "method": {
       "domain": "Domaine",
       "admin": "Vérification"
@@ -252,7 +331,8 @@
     "snackbar": {
       "approved": "Revendication approuvée — propriété transférée",
       "denied": "Revendication refusée",
-      "failed": "Impossible de mettre à jour la revendication"
+      "failed": "Impossible de mettre à jour la revendication",
+      "superseded": "Cette salle a changé de mains après le dépôt de la revendication. Refusez-la, ou utilisez Changer le propriétaire d’une salle plus bas."
     },
     "table": {
       "claimant": "Demandeur",
@@ -262,7 +342,36 @@
       "date": "Date",
       "actions": "Actions"
     },
-    "loadMore": "Charger plus"
+    "loadMore": "Charger plus",
+    "autoApproved": {
+      "heading": "Revendications approuvées automatiquement",
+      "intro": "Chacune a pris une salle non revendiquée sans vérification. Annuler rend la salle aux données publiques des boards.",
+      "empty": "Aucune revendication ne s'est encore approuvée automatiquement.",
+      "error": "Impossible de charger ces revendications. Réessayez.",
+      "approvedOn": "Approuvée le {{date}}",
+      "reverted": "Annulée",
+      "revert": "Annuler",
+      "revertAria": "Annuler la revendication de {{claimant}} sur {{gym}}"
+    },
+    "revert": {
+      "title": "Annuler la revendication de {{claimant}} sur {{gym}} ?",
+      "body": "{{gym}} redevient non revendiquée. {{claimant}} et les personnes ajoutées comme membres ou éditeurs depuis la revendication perdent l'accès, la synchronisation des lieux reprend la fiche, et nous prévenons {{claimant}} par e-mail.",
+      "notUndone": "Les modifications des boards, les bornes et la description, les horaires et la photo de la salle restent tels quels. Corrigez-les à la main.",
+      "reasonLabel": "Motif (facultatif)",
+      "confirm": "Annuler la revendication",
+      "cancel": "Fermer",
+      "done": "{{gym}} est de nouveau non revendiquée.",
+      "missing": "La revendication {{claimId}} ne s'est pas approuvée automatiquement, ou elle n'existe plus. Pour rendre une salle, utilisez Changer le propriétaire d’une salle plus bas.",
+      "alreadyReverted": "La revendication {{claimId}} a déjà été annulée.",
+      "errors": {
+        "notFound": "Cette revendication ou sa salle n'existe plus.",
+        "notApproved": "Cette revendication n'est plus approuvée, il n'y a donc rien à annuler.",
+        "notTransferred": "Cette revendication n'a jamais transféré la salle, il n'y a donc rien à annuler. Utilisez Changer le propriétaire d’une salle plus bas.",
+        "ownerChanged": "La salle a changé de mains après cette revendication. Utilisez Changer le propriétaire d’une salle plus bas.",
+        "priorOwner": "Cette revendication a pris la salle à une personne, pas aux données publiques des boards. Utilisez Changer le propriétaire d’une salle plus bas pour la lui rendre.",
+        "failed": "Impossible d'annuler la revendication. Réessayez."
+      }
+    }
   },
   "gymOwnerReassign": {
     "title": "Changer le propriétaire d’une salle",
@@ -428,6 +537,236 @@
     },
     "ownerReports": {
       "note": "Les propriétaires peuvent désormais signaler des doublons depuis la page de leur salle. Pour l'instant ces signalements arrivent par e-mail à l'équipe, alors surveillez la boîte de réception en plus de cette file."
+    }
+  },
+  "sprayTraining": {
+    "title": "Données d'entraînement des Spraywalls",
+    "statusLabel": "Statut de relecture",
+    "status": {
+      "unreviewed": "À relire ({{total}})",
+      "approved": "Approuvés ({{total}})",
+      "rejected": "Refusés ({{total}})"
+    },
+    "empty": "Rien ici",
+    "error": "Impossible de charger la file. Réessayez.",
+    "retry": "Réessayer",
+    "loadMore": "Charger plus",
+    "card": {
+      "open": "Relire la version {{version}} du Spraywall",
+      "holds": "Prises : {{total}}",
+      "edited": "Modifiées : {{percent}} %",
+      "accepted": "Acceptées sans vérif : {{percent}} %",
+      "deleted": "Suggestions supprimées : {{total}}"
+    },
+    "kind": {
+      "manual": "Posée à la main",
+      "auto": "Trouvée, sans relecture",
+      "accepted": "Acceptée sans vérif",
+      "confirmed": "Incertaine, confirmée",
+      "edited": "Modifiée",
+      "deleted": "Suggestion supprimée",
+      "notShown": "Jamais montrée"
+    },
+    "reason": {
+      "BAD_HOLDS": "Prises mal tracées",
+      "MISSING_HOLDS": "Prises manquantes",
+      "PHOTO_QUALITY": "Qualité de la photo",
+      "NOT_A_WALL": "Pas un mur d'escalade",
+      "PEOPLE_OR_PERSONAL_INFO": "Personnes ou infos personnelles",
+      "DUPLICATE": "Doublon",
+      "OTHER": "Autre motif"
+    },
+    "visibility": {
+      "PRIVATE": "Visibilité : privé",
+      "UNLISTED": "Visibilité : lien seulement",
+      "PUBLIC": "Visibilité : public"
+    },
+    "review": {
+      "title": "Spraywall, version {{version}}",
+      "close": "Fermer",
+      "previous": "Spraywall précédent",
+      "next": "Spraywall suivant",
+      "position": "{{current}} sur {{total}}",
+      "photoAlt": "Photo d'un Spraywall avec les prises marquées",
+      "noPhoto": "Cette photo n'est plus disponible.",
+      "photoLoading": "Chargement de la photo",
+      "loadingNext": "Chargement d'autres Spraywalls",
+      "unmappable": "Prises qu'on n'a pas pu placer sur la photo : {{total}}",
+      "model": "Détecteur de prises : {{version}}",
+      "showMarks": "Afficher les marques (H)",
+      "legend": "Légende",
+      "reason": "Motif du refus",
+      "notes": "Notes (facultatif)",
+      "approve": "Approuver (A)",
+      "reject": "Refuser (R)",
+      "backToUnreviewed": "Remettre à relire",
+      "shortcuts": "A approuve, R refuse, H masque les marques, les flèches gauche et droite changent de Spraywall."
+    },
+    "snackbar": {
+      "approved": "Approuvé",
+      "rejected": "Refusé",
+      "reset": "De retour dans la file à relire",
+      "failed": "Impossible d'enregistrer la relecture",
+      "notEligible": "Non enregistré. Ce Spraywall n'est plus disponible comme données d'entraînement."
+    },
+    "backToAdmin": "Retour à l'admin",
+    "noAccess": "Vos droits d'administration ne couvrent pas les Spraywalls. Cette page demande un accès admin Spraywall ou sur tout le site."
+  },
+  "boards": {
+    "title": "Boards enregistrées",
+    "description": "Recherchez et modifiez les boards enregistrées, y compris les boards privées et celles sans salle associée.",
+    "backToAdmin": "Retour à l’administration",
+    "search": "Rechercher des boards",
+    "searchPlaceholder": "Nom de la board, UUID, slug ou salle",
+    "boardType": "Type de board",
+    "allTypes": "Tous les types",
+    "searchAction": "Rechercher",
+    "loading": "Chargement des boards",
+    "editLoadError": "Impossible de charger cette board pour la modifier.",
+    "retry": "Réessayer",
+    "backToList": "Toutes les boards",
+    "loadError": "Impossible de charger les boards enregistrées.",
+    "empty": "Aucune board ne correspond à cette recherche.",
+    "owner": "Propriétaire : {{name}}",
+    "systemOwner": "Boardsesh",
+    "noGym": "Aucune salle associée",
+    "editNamed": "Modifier {{name}}",
+    "results_one": "{{count}} board",
+    "results_other": "{{count}} boards",
+    "previous": "Précédent",
+    "next": "Suivant",
+    "visibility": {
+      "public": "Publique",
+      "unlisted": "Non répertoriée",
+      "private": "Privée"
+    }
+  },
+  "partnerApps": {
+    "title": "Applications partenaires",
+    "description": "Applications inscrites, grimpeurs connectés et limites de connexions.",
+    "limitsHelp": "Les limites concernent les nouvelles connexions. Réduire une limite préserve les connexions existantes. Zéro bloque les nouvelles connexions. Les modifications sont enregistrées avec votre compte administrateur.",
+    "search": "Rechercher une application, un éditeur ou un développeur",
+    "searchAction": "Rechercher",
+    "app": "Application",
+    "developer": "Développeur",
+    "connections": "Connexions",
+    "limits": "Limites",
+    "actions": "Actions",
+    "activeLimit": "Nombre maximal de connexions actives",
+    "dailyLimit": "Nombre maximal de nouvelles connexions par 24 heures",
+    "usage": "{{active}} actives · {{recent}} nouvelles en 24 heures",
+    "invalidLimit": "Utilisez un nombre entier de 0 à 2147483647.",
+    "save": "Enregistrer les limites",
+    "saved": "Limites enregistrées",
+    "saveError": "Impossible d’enregistrer ces limites. Réessayez.",
+    "loading": "Chargement des applications partenaires",
+    "loadError": "Impossible de charger les applications partenaires.",
+    "retry": "Réessayer",
+    "empty": "Aucune application ne correspond à cette recherche.",
+    "total_one": "{{count}} application inscrite",
+    "total_other": "{{count}} applications inscrites",
+    "previous": "Page précédente",
+    "next": "Page suivante",
+    "active": "Active",
+    "suspended": "Suspendue"
+  },
+  "boardReports": {
+    "title": "Signalements de boards et de salles",
+    "backToAdmin": "Retour à l’administration",
+    "description": "Les signalements que personne d'autre ne peut traiter, et tous ceux encore ouverts après 14 jours. Ceux qui nous arrivent directement d'abord, puis les plus anciens.",
+    "filters": {
+      "status": "Statut",
+      "kind": "Afficher",
+      "kindAll": "Boards et salles",
+      "kindBoard": "Boards",
+      "kindGym": "Salles"
+    },
+    "status": {
+      "escalated": "Chez notre équipe",
+      "open": "Chez la personne qui l'a ajoutée ou l'équipe de la salle",
+      "fixed": "Corrigé",
+      "removed": "Retiré",
+      "deleted": "Supprimé",
+      "kept": "Gardé tel quel",
+      "merged": "Fusionné"
+    },
+    "kind": {
+      "board": "Board",
+      "gym": "Salle"
+    },
+    "chips": {
+      "sentToTeam": "Arrivé directement chez nous",
+      "waited": "Ouvert depuis 14 jours"
+    },
+    "meta_one": "{{count}} personne · ouvert {{age}}",
+    "meta_other": "{{count}} personnes · ouvert {{age}}",
+    "ageToday": "aujourd'hui",
+    "ageDays_one": "il y a {{count}} jour",
+    "ageDays_other": "il y a {{count}} jours",
+    "routedToLine": "Envoyé à : {{recipients}}",
+    "routedTo": {
+      "creator": "la personne qui l'a ajoutée",
+      "gymStaff": "l'équipe de la salle",
+      "admin": "notre équipe"
+    },
+    "duplicateOf": "Identique à {{name}}",
+    "note": "{{name}} : {{note}}",
+    "reporterUnknown": "Compte supprimé",
+    "closedOn": "Fermé le {{date}} : {{outcome}}",
+    "actions": {
+      "deleteBoard": "Supprimer la board",
+      "removeFromGym": "Retirer de la salle",
+      "hideGym": "Masquer la salle de la recherche",
+      "keep": "Garder tel quel",
+      "mergeGyms": "Fusionner dans Salles en double",
+      "openGym": "Ouvrir Gérer la salle"
+    },
+    "confirm": {
+      "deleteTitle": "Supprimer {{board}} pour tout le monde ?",
+      "deleteBody": "Elle disparaît pour chaque personne qui l'a enregistrée. Les croix déjà faites restent dans les carnets. Le signalement est fermé comme supprimé.",
+      "removeTitle": "Retirer {{board}} de {{gym}} ?",
+      "removeBody": "Elle disparaît de la page, des bornes et de la carte de la salle. La personne qui l'a ajoutée la garde. Le signalement est fermé comme retiré.",
+      "hideTitle": "Masquer {{gym}} de la recherche ?",
+      "hideBody": "Elle n'apparaît plus dans l'annuaire des salles ni dans la recherche. Sa page reste accessible avec le lien. Le signalement est fermé comme retiré.",
+      "keepTitle": "Garder tel quel ?",
+      "keepBody": "Le signalement est fermé et les personnes qui l'ont envoyé apprennent qu'il a été gardé tel quel.",
+      "keepNoteLabel": "Un mot pour elles (facultatif)",
+      "cancel": "Annuler"
+    },
+    "snackbar": {
+      "deleted": "Board supprimée. Le signalement est fermé.",
+      "removed": "Retirée de la salle. Le signalement est fermé.",
+      "hidden": "Salle masquée de la recherche. Le signalement est fermé.",
+      "hiddenStillOpen": "Salle masquée de la recherche, mais le signalement est toujours ouvert. Réessaie.",
+      "kept": "Signalement fermé.",
+      "failed": "Ça n'a pas marché. Réessaie."
+    },
+    "empty": "Rien ici.",
+    "error": "Impossible de charger les signalements. Réessaie.",
+    "retry": "Réessayer",
+    "loadMore": "Charger plus",
+    "tabs": {
+      "reports": "Signalements",
+      "setupChanges": "Configurations changées par des grimpeurs"
+    },
+    "setupChanges": {
+      "description": "Chaque configuration de board qu'une proposition de grimpeur a changée, les plus récentes d'abord. Ça n'arrive que dans les salles que personne ne gère. Annuler remet l'ancienne configuration tant que la board a encore celle du grimpeur.",
+      "before": "Avant",
+      "after": "Après",
+      "byLine": "Changée par {{name}} {{when}}",
+      "state": {
+        "live": "En place",
+        "undone": "Annulée",
+        "changedSince": "Changée depuis"
+      },
+      "undo": "Annuler",
+      "confirmTitle": "Annuler le changement sur {{board}} ?",
+      "confirmBody": "Elle repasse en {{setup}} pour tout le monde. Les propositions pour cette board sont vérifiées d'abord pendant les {{days}} prochains jours.",
+      "undone": "Configuration remise.",
+      "changedSinceError": "Changée depuis : la board a une autre configuration maintenant, donc ce changement ne peut plus être annulé.",
+      "alreadyUndone": "Quelqu'un a déjà remis l'ancienne configuration.",
+      "empty": "Aucun grimpeur n'a encore changé de board.",
+      "error": "Impossible de charger les changements de configuration. Réessaie."
     }
   }
 }

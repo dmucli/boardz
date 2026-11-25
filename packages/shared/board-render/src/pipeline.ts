@@ -1,11 +1,8 @@
 import sharp from 'sharp';
-import {
-  createOgBackgroundBuffer,
-  getBackgroundRelPaths,
-  resolveArtPath,
-  type BoardArtColorScheme,
-} from './background';
+import { createOgFrameBuffer, getBackgroundRelPaths, resolveArtPath, type BoardArtColorScheme } from './background';
 import { OG_IMAGE_HEIGHT, OG_IMAGE_WIDTH, placeOgBoard } from './headers';
+import { renderFrostedBokehBuffer, type OgBokehInput } from './frosted-bokeh';
+import { buildOgFamilyScrim, OG_JPEG_OPTIONS } from './og-family';
 import type { BoundedLru } from './lru';
 import type { OutputFormat, RenderableBoardDetails } from './types';
 
@@ -37,16 +34,6 @@ const DEFAULT_JPEG_OPTIONS: sharp.JpegOptions = {
   mozjpeg: true,
 };
 
-/**
- * OG social-card JPEG encode: mozjpeg at quality 85 with full chroma so hold
- * rings stay crisp (~50–80KB at 1200×630).
- */
-export const OG_JPEG_OPTIONS: sharp.JpegOptions = {
-  quality: 85,
-  chromaSubsampling: '4:4:4',
-  mozjpeg: true,
-};
-
 function getJpegOptions(thumbnail: boolean): sharp.JpegOptions {
   return thumbnail ? THUMBNAIL_JPEG_OPTIONS : DEFAULT_JPEG_OPTIONS;
 }
@@ -63,7 +50,7 @@ export type ResolveImagePath = (relPath: string) => string | null;
 export type RenderBoardImageCaches = {
   /** Folded board photos (raw RGBA, dim already baked in) for the plain render path. */
   boardBase?: BoundedLru<Buffer>;
-  /** Gradient backdrop + board photos (raw RGBA) for the OG social-card path. */
+  /** Board photos and framing on transparency, independent of each climb's bokeh. */
   ogBase?: BoundedLru<OgBaseResult>;
   /** Coalesces identical OG base compositions, analogous to `boardBaseInFlight`. */
   ogBaseInFlight?: Map<string, Promise<OgBaseResult>>;
@@ -106,6 +93,8 @@ export type RenderBoardImageParams = {
    * would turn the per-board `ogBase` cache into a per-climb one.
    */
   cardLayers?: readonly sharp.OverlayOptions[];
+  /** Coloured points in source coordinates for this climb's OG backdrop. */
+  ogBokeh?: OgBokehInput;
 };
 
 export type RenderTimings = {
@@ -253,6 +242,7 @@ export async function renderBoardImageBuffer({
   colorScheme,
   caches,
   cardLayers,
+  ogBokeh,
 }: RenderBoardImageParams): Promise<RenderBoardImageResult> {
   const sharpT0 = performance.now();
   const rawPlane = { width, height, channels: 4 as const };
@@ -268,9 +258,8 @@ export async function renderBoardImageBuffer({
   const bgRelPaths = includeBackground ? getBackgroundRelPaths(boardDetails, thumbnail, colorScheme) : [];
 
   if (includeBackground && isOgVariant && dimBackground === 0) {
-    // OG social card: backdrop + board photos are identical for every climb on
-    // the board, so the composed base is cached and only the overlay composite
-    // + encode runs per climb.
+    // Only the transparent board/photo plane is shared across climbs. Bokeh is
+    // composed underneath it after this lookup, so holds never leak across cards.
     const bgT0 = performance.now();
     // The OG base always composes full-size photos, so key it on those paths —
     // not on `bgRelPaths`, which honours `thumbnail`.
@@ -302,6 +291,9 @@ export async function renderBoardImageBuffer({
 
     const composeT0 = performance.now();
     const encoded = await encodeOgImage({
+      background: await renderFrostedBokehBuffer(
+        ogBokeh ?? { points: [], source: { w: boardDetails.boardWidth, h: boardDetails.boardHeight } },
+      ),
       base: ogBase.base,
       overlay: { buffer: overlayBuffer, width, height, left: ogBase.left, top: ogBase.top },
       format,
@@ -420,12 +412,23 @@ export async function renderBoardImageBuffer({
 
   if (outputBuffer === null && isOgVariant && imageBuffer) {
     const ogPlacement = placeOgBoard(width, height);
-    const ogImage = sharp(createOgBackgroundBuffer({ ...ogPlacement, width, height })).composite([
+    const background = await renderFrostedBokehBuffer(
+      ogBokeh ?? { points: [], source: { w: boardDetails.boardWidth, h: boardDetails.boardHeight } },
+    );
+    const ogImage = sharp(background, {
+      raw: { width: OG_IMAGE_WIDTH, height: OG_IMAGE_HEIGHT, channels: 4 },
+    }).composite([
+      { input: buildOgFamilyScrim('full') },
+      { input: createOgFrameBuffer({ ...ogPlacement, width, height }) },
       { input: imageBuffer, left: ogPlacement.left, top: ogPlacement.top, blend: 'over' },
+      ...(cardLayers ?? []),
     ]);
     if (format === 'jpeg') {
       outputBuffer = await ogImage.jpeg(getJpegOptions(thumbnail)).toBuffer();
       outputContentType = 'image/jpeg';
+    } else if (format === 'webp') {
+      outputBuffer = await ogImage.webp(DEFAULT_WEBP_OPTIONS).toBuffer();
+      outputContentType = 'image/webp';
     } else {
       outputBuffer = await ogImage.png(DEFAULT_PNG_OPTIONS).toBuffer();
       outputContentType = 'image/png';
@@ -454,7 +457,7 @@ export async function renderBoardImageBuffer({
 }
 
 export type OgBaseResult = {
-  /** Raw RGBA pixels of the composited backdrop + board photos, `OG_IMAGE_WIDTH`×`OG_IMAGE_HEIGHT`. */
+  /** Board photos and framing on a transparent `OG_IMAGE_WIDTH`×`OG_IMAGE_HEIGHT` RGBA plane. */
   base: Buffer;
   /** X offset where the board photo (and later the overlay) sits on the canvas. */
   left: number;
@@ -463,10 +466,10 @@ export type OgBaseResult = {
 };
 
 /**
- * Compose the OG social-card base for a board config: the gradient backdrop
- * with the board photos composited (no climb overlay). The result is a raw
+ * Compose the board photos and framing on transparency (no climb overlay).
+ * The climb-specific frosted backdrop is drawn underneath this cached raw
  * RGBA buffer the backend caches per board config — every climb on the same
- * board reuses it, so only the cheap overlay composite + encode runs per climb.
+ * board reuses it; bokeh, the hold overlay and encoding run per climb.
  */
 export async function composeOgBaseBuffer(params: {
   boardDetails: RenderableBoardDetails;
@@ -476,9 +479,9 @@ export async function composeOgBaseBuffer(params: {
   colorScheme?: BoardArtColorScheme;
 }): Promise<OgBaseResult> {
   const { boardDetails, boardWidth, boardHeight, resolveImagePath, colorScheme } = params;
-  // Right-aligned in the board box, vertically centred: the climb-identity
-  // column owns the right of the canvas, and pushing the art towards it is what
-  // keeps a portrait board inside a search engine's square centre crop.
+  // The share-card family's `full` slot: right-aligned against the text column,
+  // vertically centred, so a portrait board reaches into a search engine's
+  // square centre crop.
   const { left, top } = placeOgBoard(boardWidth, boardHeight);
 
   const bgRelPaths = getBackgroundRelPaths(boardDetails, false, colorScheme);
@@ -493,7 +496,7 @@ export async function composeOgBaseBuffer(params: {
     .filter((result): result is PromiseFulfilledResult<Buffer> => result.status === 'fulfilled')
     .map((result) => result.value);
 
-  const backdrop = sharp(createOgBackgroundBuffer({ left, top, width: boardWidth, height: boardHeight })).composite(
+  const backdrop = sharp(createOgFrameBuffer({ left, top, width: boardWidth, height: boardHeight })).composite(
     resizedBoardPhotos.map((buf) => ({ input: buf, left, top, blend: 'over' as const })),
   );
 
@@ -504,18 +507,25 @@ export async function composeOgBaseBuffer(params: {
 /**
  * Composite the climb overlay onto a cached OG base and encode. JPEG is the OG
  * default (mozjpeg, quality 85); PNG and WebP are honoured when requested.
+ *
+ * The layer order is the share-card family's (`composeOgFamilyCard`): bokeh, the
+ * family scrim, the framed board, its holds, then the text.
  */
 export async function encodeOgImage(params: {
+  /** Raw RGBA frosted backdrop for this climb. */
+  background: Buffer;
   base: Buffer;
   overlay: { buffer: Buffer; width: number; height: number; left: number; top: number };
   format: OutputFormat;
   /** Climb-identity text layers, composited above the overlay. */
   cardLayers?: readonly sharp.OverlayOptions[];
 }): Promise<{ buffer: Buffer; contentType: string }> {
-  const { base, overlay, format, cardLayers = [] } = params;
-  const composited = sharp(base, {
+  const { background, base, overlay, format, cardLayers = [] } = params;
+  const composited = sharp(background, {
     raw: { width: OG_IMAGE_WIDTH, height: OG_IMAGE_HEIGHT, channels: 4 },
   }).composite([
+    { input: buildOgFamilyScrim('full') },
+    { input: base, raw: { width: OG_IMAGE_WIDTH, height: OG_IMAGE_HEIGHT, channels: 4 } },
     {
       input: overlay.buffer,
       raw: { width: overlay.width, height: overlay.height, channels: 4 as const },

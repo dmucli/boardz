@@ -4,6 +4,8 @@
 // turn these decisions into views.
 
 import type { LiveSession, LiveSessionReason } from '@boardsesh/shared-schema';
+import { textFontScale } from '../../theme/dynamic-type';
+import type { TextVariant } from '../../theme/typography';
 
 export type LiveCardPerson = {
   userId: string;
@@ -214,16 +216,27 @@ export type RailPlanInput = {
   followsNobody: boolean | null;
   /** Quiet-days verdict; null until the impression store has been read. */
   startCollapsed: boolean | null;
+  /**
+   * False when something else on the screen already offers Start, such as
+   * Home's Session card: the rail then never offers it a second time.
+   */
+  showStartPrompt?: boolean;
 };
 
 const EMPTY_PLAN_ENTRIES: RailEntry[] = [];
 
-export function planLiveRail({ cards, viewerInSession, followsNobody, startCollapsed }: RailPlanInput): RailPlan {
+export function planLiveRail({
+  cards,
+  viewerInSession,
+  followsNobody,
+  startCollapsed,
+  showStartPrompt = true,
+}: RailPlanInput): RailPlan {
   const inSession = viewerInSession || cards.some((card) => card.viewerIsMember);
   // A session already on the selected board: a second solo session on the same
   // wall is the outcome the rail exists to prevent.
   const liveOnSelectedBoard = cards.some((card) => !card.viewerIsMember && card.reasons.includes('SELECTED_BOARD'));
-  const showStart = !inSession && !liveOnSelectedBoard;
+  const showStart = showStartPrompt && !inSession && !liveOnSelectedBoard;
   // Find climbers can lead the rail, so its position matters whenever it can show.
   const findCouldShow = !inSession && (followsNobody !== false || cards.length === 0);
   // The Start row only replaces the tile on an empty rail.
@@ -258,8 +271,16 @@ const AVATAR_GAP = 6;
 const ACTION_HEIGHT = 44;
 const FOOTER_GAP = 8;
 // names (headline 22) + board (subheadline 20) + gym (footnote 18) + climb (footnote 18)
-const TEXT_BLOCK_AT_1X = 78;
+const TEXT_LINES_AT_1X: readonly (readonly [TextVariant, number])[] = [
+  ['headline', 22],
+  ['subheadline', 20],
+  ['footnote', 18],
+  ['footnote', 18],
+];
+// The stats line (footnote), which moves into the text block when the action stacks.
 const STATS_LINE_AT_1X = 18;
+// The tile stops growing here. LiveSessionCard's `Text` has no cap, so from AX1
+// up its lines can outgrow the tile.
 const MAX_TEXT_SCALE = 1.5;
 
 export type LiveTileLayout = { height: number; stacked: boolean };
@@ -268,11 +289,18 @@ export type LiveTileLayout = { height: number; stacked: boolean };
  * 192pt at the default text size. Above 1.2× the action drops under the stats
  * so neither truncates, and every tile in the rail shares the height (a cell
  * that is not mounted cannot be measured, so "match the tallest" would jump).
+ * Each line grows on its own Dynamic Type ramp on iOS (`platform` is
+ * `Platform.OS`): footnote outgrows `fontScale` from xLarge to xxxLarge.
  */
-export function liveTileLayout(fontScale: number): LiveTileLayout {
-  const scale = Math.min(Math.max(fontScale, 1), MAX_TEXT_SCALE);
+export function liveTileLayout(fontScale: number, platform: string): LiveTileLayout {
+  const lineScale = (variant: TextVariant) =>
+    Math.min(Math.max(textFontScale(variant, fontScale, platform), 1), MAX_TEXT_SCALE);
   const stacked = fontScale > 1.2;
   const chrome = TILE_PADDING * 2 + AVATAR_ROW + AVATAR_GAP + ACTION_HEIGHT;
-  const text = TEXT_BLOCK_AT_1X * scale + (stacked ? STATS_LINE_AT_1X * scale + FOOTER_GAP : 0);
+  const textBlock = TEXT_LINES_AT_1X.reduce(
+    (total, [variant, lineHeight]) => total + lineHeight * lineScale(variant),
+    0,
+  );
+  const text = textBlock + (stacked ? STATS_LINE_AT_1X * lineScale('footnote') + FOOTER_GAP : 0);
   return { height: Math.max(LIVE_TILE_BASE_HEIGHT, Math.ceil(chrome + text)), stacked };
 }

@@ -1,6 +1,7 @@
 import { gql } from 'graphql-request';
 import type {
   Gym,
+  GymAddressCoordinates,
   GymBoardSummary,
   GymConnection,
   MyGymClaim,
@@ -19,12 +20,16 @@ import type {
   RequestGymClaimInput,
   RequestGymClaimResult,
   ReviewGymClaimInput,
+  RevertGymClaimInput,
+  RevertGymClaimResult,
   PendingGymClaimsInput,
+  AutoApprovedGymClaimsInput,
   GymClaimConnection,
   FindSimilarGymsInput,
   SimilarGym,
   StrayBoard,
   AttachBoardToGymInput,
+  DetachBoardFromGymInput,
   UserBoard,
   GymStats,
   GymStatsInput,
@@ -42,6 +47,18 @@ import type {
 // ============================================
 // Gym Queries
 // ============================================
+
+export const LOOKUP_GYM_ADDRESS_COORDINATES = gql`
+  query LookupGymAddressCoordinates($address: String!) {
+    lookupGymAddressCoordinates(address: $address) {
+      latitude
+      longitude
+    }
+  }
+`;
+
+export type LookupGymAddressCoordinatesVariables = { address: string };
+export type LookupGymAddressCoordinatesResponse = { lookupGymAddressCoordinates: GymAddressCoordinates | null };
 
 /**
  * Shared by GET_GYM, GET_GYM_BY_SLUG, GET_MY_GYMS and SEARCH_GYMS, all typed
@@ -69,6 +86,7 @@ const GYM_FIELDS = `
   latitude
   longitude
   isPublic
+  isListed
   imageUrl
   logoUrl
   brandPrimaryColor
@@ -87,6 +105,8 @@ const GYM_FIELDS = `
   canGrantAccess
   canClaim
   isClaimed
+  canClaimByDomain
+  listingState
 `;
 
 export const GET_GYM = gql`
@@ -182,6 +202,7 @@ export const SEARCH_GYMS_DIRECTORY = gql`
         latitude
         longitude
         isClaimed
+        listingState
         boardSummaries {
           boardType
           angle
@@ -203,6 +224,7 @@ export const FIND_SIMILAR_GYMS = gql`
       distanceMeters
       ownerType
       isClaimable
+      canClaimByDomain
       providerOrigins
     }
   }
@@ -227,6 +249,10 @@ export const GET_GYM_MEMBERS = gql`
 // Board fields the manage-gym board pickers and the leaderboard embed read from
 // gymBoards. `boardId` is the numeric board-presence channel id (null unless the
 // board is public or the viewer can edit it) — it feeds boardNowPlaying(boardId).
+// `canDelete` and `canRemoveFromGym` are the server's word on the staff actions,
+// so no client rebuilds the permission rule. Both read false for an anonymous
+// viewer, so they are safe in the leaderboard embed. `ownerDisplayName` is not:
+// see GET_GYM_BOARDS_FOR_MANAGE.
 const GYM_BOARD_FIELDS = `
   uuid
   slug
@@ -239,6 +265,7 @@ const GYM_BOARD_FIELDS = `
   angle
   isAngleAdjustable
   hasLeds
+  litByWallDevice
   isPublic
   isUnlisted
   locationName
@@ -246,6 +273,8 @@ const GYM_BOARD_FIELDS = `
   gymUuid
   boardId
   canEdit
+  canDelete
+  canRemoveFromGym
 `;
 
 export const GET_GYM_BOARDS = gql`
@@ -280,6 +309,32 @@ export const GET_GYM_BOARDS_FOR_LISTING = gql`
 `;
 
 /**
+ * The gym's boards for Manage gym → Boards, which says who put each one there
+ * ("Added by Sam", "Added by you", "From public board data") and which ones
+ * climbers reported.
+ *
+ * A separate document because `ownerDisplayName` must stay out of
+ * `GYM_BOARD_FIELDS`: the anonymous leaderboard embed selects that fragment,
+ * and a climber's name has no business in an unauthenticated payload. The
+ * server still applies the owner's privacy, so `ownerId` and the name come back
+ * null for a climber whose activity the viewer can't see.
+ *
+ * `openReportCount` is the waiting reports this viewer can act on (null for
+ * anyone who can act on none), for the "Reported" chip
+ * (docs/product/directory-reports.md). Only www selects this document, and
+ * it ships after the backend that answers the field.
+ */
+export const GET_GYM_BOARDS_FOR_MANAGE = gql`
+  query GetGymBoardsForManage($gymUuid: ID!) {
+    gymBoards(gymUuid: $gymUuid) {
+      ${GYM_BOARD_FIELDS}
+      ownerDisplayName
+      openReportCount
+    }
+  }
+`;
+
+/**
  * The same boards, but every one of them ready to become the mobile app's ACTIVE
  * board. The gym board switcher activates a row on tap, and the app persists the
  * whole board object to storage, so a row has to be a structurally complete
@@ -298,11 +353,18 @@ export const GET_GYM_BOARDS_FOR_LISTING = gql`
  * `layoutName` / `sizeName` / `sizeDescription` / `setNames` stay out on purpose:
  * `enrichBoards` hard-codes all four to null for every board it returns, so
  * asking for them buys a bigger response and nothing else.
+ *
+ * `openReportCount` and `viewerHasOpenReport` follow `canRemoveFromGym` as a
+ * pair, as in `BOARD_FIELDS`: the app's gym page draws the "Reported" pill and
+ * the report rows from them. Both are null for a viewer they don't concern, so
+ * they stay out of `GYM_BOARD_FIELDS` all the same.
  */
 export const GET_GYM_BOARDS_FOR_SWITCHER = gql`
   query GetGymBoardsForSwitcher($gymUuid: ID!) {
     gymBoards(gymUuid: $gymUuid) {
       ${GYM_BOARD_FIELDS}
+      openReportCount
+      viewerHasOpenReport
       hideLocation
       isOwned
       createdAt
@@ -320,13 +382,15 @@ export const GET_GYM_BOARDS_FOR_SWITCHER = gql`
 `;
 
 // Boards that probably belong to the gym but aren't linked yet — merged-twin
-// leftovers and nearby unlinked/SYSTEM boards. Powers the "Boards that might be
-// yours" section on the manage-gym Boards tab. Requires gym edit access.
+// leftovers and nearby unlinked/SYSTEM boards, including public unlinked boards
+// within a platform admin's scope. Requires gym edit access.
 export const STRAY_BOARDS_FOR_GYM = gql`
   query StrayBoardsForGym($gymUuid: ID!) {
     strayBoardsForGym(gymUuid: $gymUuid) {
       uuid
       name
+      boardType
+      angle
       currentGymUuid
       currentGymName
       distanceMeters
@@ -342,12 +406,136 @@ export const GET_GYM_STATS = gql`
   query GetGymStats($input: GymStatsInput!) {
     gymStats(input: $input) {
       gymUuid
+      gymName
+      boardUuid
+      boards {
+        uuid
+        name
+        boardType
+        configurations {
+          uuid
+          name
+        }
+      }
+      canManageBoardAliases
+      asOf
+      timeZone
+      timeZoneConfigured
+      coverage {
+        observedSince
+        firstDisplayAt
+        firstTickAt
+        dateOnlyCount
+        boundaryUncertainCount
+        unknownTimeCount
+        includesCurrentBoardHistory
+        isPartial
+      }
+      busyTimes {
+        status
+        startDate
+        endDate
+        coveredDates
+        firstCoveredDate
+        instantDisplays
+        instantTicks
+        dateOnlyRecords
+        unplacedDateOnlyRecords
+        unknownTimeRecords
+        hasUnboundedUnknownTime
+        weekdays {
+          dayOfWeek
+          eligibleDates
+          recordedClimbers
+        }
+        hours {
+          dayOfWeek
+          hour
+          eligibleDates
+          recordedClimbers
+        }
+      }
+      reachOverview {
+        observationStartedAt
+        baselineStartAt
+        current {
+          climbers {
+            count
+            coverage
+          }
+          firstRecorded {
+            count
+            coverage
+          }
+          uncertainFirstRecorded
+          sends {
+            count
+            coverage
+          }
+          sendLoggers
+          sessions {
+            count
+            coverage
+          }
+        }
+        previous {
+          climbers {
+            count
+            coverage
+          }
+          firstRecorded {
+            count
+            coverage
+          }
+          uncertainFirstRecorded
+          sends {
+            count
+            coverage
+          }
+          sendLoggers
+          sessions {
+            count
+            coverage
+          }
+        }
+        cameBack {
+          returning
+          previousClimbers
+          coverage
+        }
+        previousCameBack {
+          returning
+          previousClimbers
+          coverage
+        }
+        weeklyTrend {
+          startDate
+          endDate
+          inProgress
+          climbers {
+            count
+            coverage
+          }
+          sends {
+            count
+            coverage
+          }
+        }
+      }
       periodDays
       current {
+        startAt
+        endAt
+        displayCount
+        tickCount
         uniqueClimbers
         ascentCount
       }
       previous {
+        startAt
+        endAt
+        displayCount
+        tickCount
         uniqueClimbers
         ascentCount
       }
@@ -363,6 +551,24 @@ export const GET_GYM_STATS = gql`
         dayOfWeek
         ascentCount
       }
+      angleUsage {
+        boardUuid
+        knownAngleClimberCount
+        angles {
+          angle
+          distinctClimberCount
+          climberDayCount
+          unresolvedLocalDateTickCount
+          tickCount
+          sendCount
+          displayCount
+        }
+        unknownAngle {
+          tickCount
+          sendCount
+          displayCount
+        }
+      }
     }
   }
 `;
@@ -376,6 +582,18 @@ export const CREATE_GYM = gql`
     createGym(input: $input) {
       ${GYM_FIELDS}
     }
+  }
+`;
+
+export const SET_GYM_REPORTING_TIME_ZONE = gql`
+  mutation SetGymReportingTimeZone($input: SetGymReportingTimeZoneInput!) {
+    setGymReportingTimeZone(input: $input)
+  }
+`;
+
+export const SET_GYM_REPORTING_BOARD_ALIAS = gql`
+  mutation SetGymReportingBoardAlias($input: SetGymReportingBoardAliasInput!) {
+    setGymReportingBoardAlias(input: $input)
   }
 `;
 
@@ -462,6 +680,18 @@ export const REVIEW_GYM_CLAIM = gql`
   }
 `;
 
+/** Take back an approved claim (global admin). The daily digest links each auto-approval to it. */
+export const REVERT_GYM_CLAIM = gql`
+  mutation RevertGymClaim($input: RevertGymClaimInput!) {
+    revertGymClaim(input: $input) {
+      claimId
+      gymUuid
+      gymName
+      removedMemberCount
+    }
+  }
+`;
+
 // ============================================
 // Gym Claim Admin Queue
 // ============================================
@@ -478,6 +708,9 @@ const GYM_CLAIM_FIELDS = `
   claimEmail
   message
   createdAt
+  claimantAccountAgeDays
+  claimantTickCount
+  claimantGymsHeld
 `;
 
 export const PENDING_GYM_CLAIMS = gql`
@@ -485,6 +718,20 @@ export const PENDING_GYM_CLAIMS = gql`
     pendingGymClaims(input: $input) {
       claims {
         ${GYM_CLAIM_FIELDS}
+      }
+      totalCount
+      hasMore
+    }
+  }
+`;
+
+/** Claims that approved themselves, for the admin's Revert list (and the digest's `?revert=` link). */
+export const AUTO_APPROVED_GYM_CLAIMS = gql`
+  query AutoApprovedGymClaims($input: AutoApprovedGymClaimsInput) {
+    autoApprovedGymClaims(input: $input) {
+      claims {
+        ${GYM_CLAIM_FIELDS}
+        approvedAt
       }
       totalCount
       hasMore
@@ -650,7 +897,7 @@ export type SearchGymsQueryResponse = {
  */
 export type GymDirectoryCard = Pick<
   Gym,
-  'uuid' | 'slug' | 'name' | 'address' | 'latitude' | 'longitude' | 'isClaimed'
+  'uuid' | 'slug' | 'name' | 'address' | 'latitude' | 'longitude' | 'isClaimed' | 'listingState'
 > & {
   boardSummaries: GymBoardSummary[];
 };
@@ -687,6 +934,14 @@ export type GetGymBoardsQueryVariables = {
 };
 
 export type GetGymBoardsQueryResponse = {
+  gymBoards: UserBoard[];
+};
+
+export type GetGymBoardsForManageQueryVariables = {
+  gymUuid: string;
+};
+
+export type GetGymBoardsForManageQueryResponse = {
   gymBoards: UserBoard[];
 };
 
@@ -808,6 +1063,14 @@ export type AttachBoardToGymMutationResponse = {
   attachBoardToGym: boolean;
 };
 
+export type DetachBoardFromGymMutationVariables = {
+  input: DetachBoardFromGymInput;
+};
+
+export type DetachBoardFromGymMutationResponse = {
+  detachBoardFromGym: boolean;
+};
+
 export type GrantGymWriteAccessMutationVariables = {
   input: GrantGymWriteAccessInput;
 };
@@ -840,12 +1103,28 @@ export type ReviewGymClaimMutationResponse = {
   reviewGymClaim: boolean;
 };
 
+export type RevertGymClaimMutationVariables = {
+  input: RevertGymClaimInput;
+};
+
+export type RevertGymClaimMutationResponse = {
+  revertGymClaim: RevertGymClaimResult;
+};
+
 export type PendingGymClaimsQueryVariables = {
   input?: PendingGymClaimsInput;
 };
 
 export type PendingGymClaimsQueryResponse = {
   pendingGymClaims: GymClaimConnection;
+};
+
+export type AutoApprovedGymClaimsQueryVariables = {
+  input?: AutoApprovedGymClaimsInput;
+};
+
+export type AutoApprovedGymClaimsQueryResponse = {
+  autoApprovedGymClaims: GymClaimConnection;
 };
 
 export type DuplicateGymClustersQueryVariables = {
@@ -887,3 +1166,64 @@ export type ReportGymDuplicateMutationVariables = {
 export type ReportGymDuplicateMutationResponse = {
   reportGymDuplicate: ReportGymDuplicateResult;
 };
+
+/** Public canonical venue enumeration, bounded by the backend sitemap budget. */
+export const PUBLIC_GYM_SITEMAP = gql`
+  query PublicGymSitemap {
+    publicGymSitemap {
+      slug
+      updatedAt
+    }
+  }
+`;
+
+export type PublicGymSitemapQueryResponse = {
+  publicGymSitemap: Array<{ slug: string; updatedAt: string }>;
+};
+
+export const GET_GYM_GRADE_COMPARISON = gql`
+  query GetGymGradeComparison($input: GymStatsInput!) {
+    gymGradeComparison(input: $input) {
+      gymUuid
+      asOf
+      startAt
+      timeZone
+      availableCount
+      sendCount
+      grades {
+        boardType
+        difficultyId
+        availableCount
+        sendCount
+      }
+      boards {
+        boardUuid
+        physicalBoardUuid
+        boardName
+        kind
+        status
+        included
+        variantCount
+        collectionName
+      }
+    }
+  }
+`;
+
+export const GET_GYM_GRADE_COLLECTION_OPTIONS = gql`
+  query GetGymGradeCollectionOptions($input: GymGradeCollectionOptionsInput!) {
+    gymGradeCollectionOptions(input: $input) {
+      collections {
+        uuid
+        name
+      }
+      nextCursor
+    }
+  }
+`;
+
+export const SET_GYM_GRADE_COLLECTION = gql`
+  mutation SetGymGradeCollection($input: SetGymGradeCollectionInput!) {
+    setGymGradeCollection(input: $input)
+  }
+`;

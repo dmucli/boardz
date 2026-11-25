@@ -1,6 +1,19 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { render, cleanup } from '@testing-library/react';
+import { render, cleanup, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import type { UserBoard } from '@boardsesh/shared-schema';
 
@@ -30,7 +43,11 @@ vi.mock('react-native', () => ({
     onPress?: () => void;
     accessibilityLabel?: string;
   }) => createElement('button', { onClick: onPress, 'aria-label': accessibilityLabel }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 vi.mock('../../BoardImageNative', () => ({
@@ -64,6 +81,7 @@ vi.mock('../../../lib/board-details', () => ({
   getBoardRenderData: () => null,
 }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: new Proxy({}, { get: () => 4 }),
   borderRadius: { lg: 12, md: 8, full: 999 },
 }));
@@ -71,6 +89,7 @@ vi.mock('../../../theme/ios-colors', () => ({
   iosSystemColors: { systemGray4: '#ccc', systemRed: '#f00', systemOrange: '#fa0' },
 }));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: {
       background: '#fff',
@@ -142,6 +161,17 @@ describe('BoardManageRow offline toggle gating', () => {
     expect(offlineToggleProps.last?.state).toBe('off');
   });
 
+  it('leaves the toggle enabled by default', () => {
+    render(<BoardManageRow {...rowProps} downloadState="off" />);
+    expect(offlineToggleProps.last?.disabled).toBe(false);
+  });
+
+  it('keeps the toggle in place but disabled while offline storage is paused', () => {
+    const { queryByTestId } = render(<BoardManageRow {...rowProps} downloadState="off" offlineControlsDisabled />);
+    expect(queryByTestId('offline-toggle')).not.toBeNull();
+    expect(offlineToggleProps.last?.disabled).toBe(true);
+  });
+
   it('renders no toggle and no offline caption when downloadState is undefined (flag off)', () => {
     const { queryByTestId, queryByText } = render(<BoardManageRow {...rowProps} downloadState={undefined} />);
     expect(queryByTestId('offline-toggle')).toBeNull();
@@ -161,6 +191,59 @@ describe('BoardManageRow offline toggle gating', () => {
     expect(queryByText('mobile.offline.finalizing')).not.toBeNull();
     expect(queryByText('mobile.offline.pending')).toBeNull();
     expect(offlineToggleProps.last?.state).toBe('finalizing');
+  });
+
+  it('shows live work counts during indeterminate finishing', () => {
+    const { queryByText } = render(
+      <BoardManageRow
+        {...rowProps}
+        downloadState="finalizing"
+        downloadProgress={{
+          stage: 'import',
+          phase: 'finishing',
+          fraction: null,
+          bytesDone: null,
+          bytesTotal: null,
+          rowsProcessed: 1500,
+        }}
+      />,
+    );
+    expect(queryByText('mobile.offline.pill.rows')).not.toBeNull();
+    expect(translationCalls.calls).toContainEqual({ key: 'mobile.offline.pill.rows', options: { count: 1500 } });
+  });
+
+  it.each([
+    { downloadState: 'downloading' as const, downloadNotice: null },
+    { downloadState: 'finalizing' as const, downloadNotice: null },
+    { downloadState: 'downloading' as const, downloadNotice: 'paged-fallback' as const },
+  ])('keeps finishing counts in an existing text row ($downloadState, $downloadNotice)', (stateProps) => {
+    const { container, queryByText, rerender } = render(
+      <BoardManageRow
+        {...rowProps}
+        {...stateProps}
+        downloadProgress={{ stage: 'import', phase: 'grades', fraction: 0.9, bytesDone: null, bytesTotal: null }}
+      />,
+    );
+    const textRowsBeforeFinishing = container.querySelectorAll('span').length;
+
+    rerender(
+      <BoardManageRow
+        {...rowProps}
+        {...stateProps}
+        downloadProgress={{
+          stage: 'import',
+          phase: 'finishing',
+          fraction: null,
+          bytesDone: null,
+          bytesTotal: null,
+          rowsProcessed: 1500,
+        }}
+      />,
+    );
+
+    expect(queryByText('mobile.offline.pill.rows')).not.toBeNull();
+    expect(queryByText('mobile.offline.pill.rows')?.getAttribute('data-number-of-lines')).toBe('1');
+    expect(container.querySelectorAll('span').length).toBe(textRowsBeforeFinishing);
   });
 
   it('shows the bootstrapping caption (not the climb count) during the snapshot warm-up', () => {
@@ -225,8 +308,8 @@ describe('BoardManageRow offline toggle gating', () => {
       />,
     );
     expect(importing.queryByText('mobile.offline.bootstrapImporting')).not.toBeNull();
-    // The bar is only meaningful while bytes are moving.
-    expect(progressBarProps.last?.fraction).toBeUndefined();
+    // Import keeps the phase bar visible even without a known denominator.
+    expect(progressBarProps.last?.fraction).toBeNull();
   });
 
   it('keeps the legacy caption when no progress frame has arrived (flag off, or a downloader that never reports)', () => {
@@ -413,5 +496,54 @@ describe('BoardManageRow subtitle', () => {
       <BoardManageRow {...rowProps} board={anonymous} isOwned={false} downloadState={undefined} />,
     );
     expect(queryByText('Original 12×12 with kickboard')).not.toBeNull();
+  });
+});
+
+describe('BoardManageRow import actions', () => {
+  it('keeps an unfinished import resumable and removes unusable download actions', () => {
+    const importing = {
+      ...board,
+      boardType: 'spray',
+      sprayImport: {
+        wallUuid: board.uuid,
+        versionId: '42',
+        detectionId: 'detection',
+        stage: 'queued' as const,
+        queuePosition: 3,
+        retryAt: null,
+        resetOfWallUuid: null,
+      },
+    };
+    const onOpenImport = vi.fn();
+    const { getByText, queryByTestId } = render(
+      <BoardManageRow {...rowProps} board={importing} onOpenImport={onOpenImport} downloadState="off" />,
+    );
+    expect(getByText('sprayImport.queuePosition')).toBeTruthy();
+    expect(queryByTestId('offline-toggle')).toBeNull();
+    fireEvent.click(getByText('sprayImport.open'));
+    expect(onOpenImport).toHaveBeenCalledWith(importing);
+  });
+
+  it('treats a reset clone as an unpublished import with a ready-to-review action', () => {
+    const resetting = {
+      ...board,
+      boardType: 'spray',
+      sprayImport: {
+        wallUuid: board.uuid,
+        versionId: '42',
+        detectionId: 'detection',
+        stage: 'ready' as const,
+        queuePosition: null,
+        retryAt: null,
+        resetOfWallUuid: 'old-wall',
+      },
+    };
+    const onOpenImport = vi.fn();
+    const { getByText, queryByTestId } = render(
+      <BoardManageRow {...rowProps} board={resetting} onOpenImport={onOpenImport} downloadState="off" />,
+    );
+    expect(queryByTestId('offline-toggle')).toBeNull();
+    fireEvent.click(getByText('sprayImport.review'));
+    expect(onOpenImport).toHaveBeenCalledWith(resetting);
   });
 });

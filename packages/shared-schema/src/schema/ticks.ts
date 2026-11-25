@@ -1,4 +1,19 @@
 export const ticksTypeDefs = /* GraphQL */ `
+  type TickBoardOption {
+    uuid: ID!
+    name: String!
+    boardType: String!
+    layoutId: Int!
+    sizeId: Int!
+    setIds: String!
+  }
+
+  type TickBoardOptions {
+    currentBoard: TickBoardOption
+    boards: [TickBoardOption!]!
+    totalCount: Int!
+    hasMore: Boolean!
+  }
   # ============================================
   # Ticks Types (Local Ascent Tracking)
   # ============================================
@@ -27,6 +42,8 @@ export const ticksTypeDefs = /* GraphQL */ `
     boardType: String!
     "UUID of the climb attempted"
     climbUuid: String!
+    "Retired with climb revisions. The stored value: null on every imported tick and on every tick saved since the server stopped recording it; a number only on ticks saved while it did."
+    climbRevision: Int
     "Board angle when attempted"
     angle: Int!
     "Whether the climb was mirrored"
@@ -39,7 +56,7 @@ export const ticksTypeDefs = /* GraphQL */ `
     quality: Int
     "Effective quality for display: COALESCE(quality, the climber's own synced star rating for this climb+angle from board_climb_ratings). Both are 1-5 native (no rescaling). Still nullable when neither exists. Populated by read queries; mutation responses don't compute it."
     effectiveQuality: Int
-    "User's personal grade override as a difficulty_id. Null means the user did not attach a personal grade — read \`effectiveDifficulty\` for the value to display (it falls back to the climb's consensus). See docs/ascents-and-attempts.md."
+    "User's personal grade override as a difficulty_id. Null means the user did not attach a personal grade — read \`effectiveDifficulty\` for the value to display (it falls back to the climb's consensus). See docs/data/ascents-and-attempts.md."
     difficulty: Int
     "Effective grade for display and aggregation: COALESCE(difficulty, ROUND(consensus_difficulty)). Still nullable when the climb has no consensus yet."
     effectiveDifficulty: Int
@@ -69,6 +86,8 @@ export const ticksTypeDefs = /* GraphQL */ `
     layoutId: Int
     "Board entity ID if tick was associated with a board"
     boardId: Int
+    "Physical board name, populated by updateTick for immediate editor refresh."
+    boardDisplayName: String
     # Social aggregates are only populated by read queries (e.g. \`ticks\`).
     # Mutation resolvers (\`saveTick\`, \`updateTick\`) don't compute them so they
     # are nullable here; when a client needs guaranteed counts, prefer
@@ -84,13 +103,29 @@ export const ticksTypeDefs = /* GraphQL */ `
   """
   Input for recording a climb attempt.
   """
+  enum TickReportingTimePrecision {
+    instant
+    day
+  }
+
+  input TickReportingTimeInput {
+    precision: TickReportingTimePrecision!
+    "The chosen calendar date, in YYYY-MM-DD form, for a day-only tick."
+    date: String
+    "IANA zone of the author’s chosen calendar date."
+    timeZone: String
+  }
+
   input SaveTickInput {
+    privacy: PrivacyPublicationInput
     "Optional client-generated UUID for offline idempotent replay"
     uuid: ID
     "Board type"
     boardType: String!
     "Climb UUID"
     climbUuid: String!
+    "Accepted and ignored: climb revisions were retired and a new tick stores none. Kept so a tick sent by an older app, or already queued offline, is not refused. No integer sent here fails the tick."
+    climbRevision: Int
     "Board angle"
     angle: Int!
     "Whether climb was mirrored"
@@ -109,6 +144,7 @@ export const ticksTypeDefs = /* GraphQL */ `
     comment: String!
     "When the climb was attempted (ISO 8601)"
     climbedAt: String!
+    reportingTime: TickReportingTimeInput
     "Session ID if in a session"
     sessionId: String
     "Layout ID for board resolution"
@@ -130,6 +166,9 @@ export const ticksTypeDefs = /* GraphQL */ `
   All fields are optional — only provided fields are updated.
   """
   input UpdateTickInput {
+    privacy: PrivacyPublicationInput
+    "Omit to preserve attribution; null clears it; a UUID selects a compatible physical board."
+    boardUuid: String
     "Result of the attempt"
     status: TickStatus
     "Number of attempts"
@@ -144,6 +183,7 @@ export const ticksTypeDefs = /* GraphQL */ `
     comment: String
     "When the climb was attempted (ISO 8601)"
     climbedAt: String
+    reportingTime: TickReportingTimeInput
     "Board angle to move this ascent to"
     angle: Int
   }
@@ -174,6 +214,7 @@ export const ticksTypeDefs = /* GraphQL */ `
   Input for attaching an Instagram or TikTok video as beta for a climb.
   """
   input AttachBetaLinkInput {
+    privacy: PrivacyPublicationInput
     "Board type"
     boardType: String!
     "Climb UUID"

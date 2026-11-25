@@ -1,6 +1,7 @@
 import { memo, useCallback } from 'react';
 import { StyleSheet, View } from 'react-native';
 import type { Gym } from '@boardsesh/shared-schema';
+import { StatusPill } from '../StatusPill';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { PressableSurface } from '../PressableSurface';
@@ -23,10 +24,13 @@ type MyGymRowProps = {
   manageLabel: string;
   manageAccessibilityLabel: string;
   noAddressLabel: string;
-  /** Open the gym editor (only wired when `gym.canEdit`). */
+  analyticsLabel: string;
+  analyticsAccessibilityLabel: string;
+  /** Open the gym's page (only wired when `gym.canEdit`). */
   onOpenGym: (gym: Gym) => void;
   /** Hand off to the web kiosk/TV manage console (only wired when `gym.canEdit`). */
   onManageKiosks: (gym: Gym) => void;
+  onOpenAnalytics: (gym: Gym) => void;
 };
 
 // Owner beats any membership role: an owner is always the owner even if they also
@@ -54,20 +58,23 @@ function MyGymRowComponent({
   manageLabel,
   manageAccessibilityLabel,
   noAddressLabel,
+  analyticsLabel,
+  analyticsAccessibilityLabel,
   onOpenGym,
   onManageKiosks,
+  onOpenAnalytics,
 }: MyGymRowProps) {
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors } = useTheme();
 
   const isOwner = !!currentUserId && gym.ownerId === currentUserId;
   const roleLabel = resolveRoleLabel(gym, currentUserId, roleLabels);
   const addressLine = gym.address?.trim() ? gym.address.trim() : noAddressLabel;
 
   const handleOpen = useCallback(() => onOpenGym(gym), [onOpenGym, gym]);
+  const handleAnalytics = useCallback(() => onOpenAnalytics(gym), [onOpenAnalytics, gym]);
   const handleManage = useCallback(() => onManageKiosks(gym), [onManageKiosks, gym]);
 
-  // The name / address / badge block. It's the edit tap target when the viewer can
-  // edit; otherwise it's a plain detail block (no-op tap).
+  // Staff can open the gym page by tapping the name, address, or badge.
   const summary = (
     <View style={styles.summary}>
       <View style={styles.summaryText}>
@@ -78,13 +85,7 @@ function MyGymRowComponent({
           {addressLine}
         </Text>
       </View>
-      {roleLabel ? (
-        <View style={[styles.badge, { backgroundColor: isOwner ? brandColors.primary : systemColors.fill }]}>
-          <Text variant="caption1" color={isOwner ? brandColors.onPrimary : systemColors.secondaryLabel}>
-            {roleLabel}
-          </Text>
-        </View>
-      ) : null}
+      {roleLabel ? <StatusPill label={roleLabel} icon={isOwner ? 'crown.fill' : undefined} /> : null}
     </View>
   );
 
@@ -105,6 +106,20 @@ function MyGymRowComponent({
 
       {gym.canEdit ? (
         <>
+          <View style={[styles.separator, { backgroundColor: systemColors.separator }]} />
+          <PressableSurface
+            onPress={handleAnalytics}
+            feedback="opacity"
+            accessibilityRole="button"
+            accessibilityLabel={analyticsAccessibilityLabel}
+            style={styles.manageRow}
+          >
+            <Icon name="chart.bar" size={18} color={systemColors.secondaryLabel} />
+            <Text variant="subheadline" color={systemColors.label} style={styles.manageLabel}>
+              {analyticsLabel}
+            </Text>
+            <Icon name="chevron.right" size={16} color={systemColors.tertiaryLabel} />
+          </PressableSurface>
           <View style={[styles.separator, { backgroundColor: systemColors.separator }]} />
           {/* Kiosk/TV management is web-only by design — this is a hand-off to the
               browser console, not an in-app screen. */}
@@ -149,14 +164,9 @@ const styles = StyleSheet.create({
   address: {
     marginTop: spacing[1],
   },
-  badge: {
-    paddingHorizontal: spacing[2],
-    paddingVertical: spacing[1],
-    borderRadius: borderRadius.full,
-  },
   separator: {
     height: StyleSheet.hairlineWidth,
-    marginLeft: spacing[4],
+    marginStart: spacing[4],
   },
   manageRow: {
     flexDirection: 'row',

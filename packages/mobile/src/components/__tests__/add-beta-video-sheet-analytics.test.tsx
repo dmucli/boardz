@@ -1,4 +1,10 @@
 // @vitest-environment jsdom
+vi.mock('../AccessibleBottomSheetTextInput', async () => {
+  const { BottomSheetTextInput } = await import('@expo/ui/community/bottom-sheet');
+  return { AccessibleBottomSheetTextInput: BottomSheetTextInput };
+});
+vi.mock('../../providers/dialog-provider', () => ({ useConfirm: () => async () => false }));
+vi.mock('../../lib/announce-queued', () => ({ announceQueued: vi.fn() }));
 import { act, render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,18 +15,16 @@ const analytics = vi.hoisted(() => ({ track: vi.fn() }));
 // the component's onSuccess (where the analytics fire) runs inline in the test.
 const attach = vi.hoisted(() => ({
   isPending: false,
-  mutate: vi.fn((_variables: unknown, callbacks: { onSuccess?: () => void }) => {
+  mutate: vi.fn((_variables: unknown, callbacks: { onSuccess?: () => void; onError?: (error: Error) => void }) => {
     callbacks.onSuccess?.();
   }),
 }));
 
-// Capture the paste field + submit button handlers so the test can drive a
-// submit without a real renderer. The only react-native Pressable in the sheet
-// is the submit button (steps use Views; copy / open-Instagram are <Button>s,
-// which we mock out below).
+// Capture the paste field handler so the test can type a URL without a real
+// renderer; the submit is the top bar's trailing action (copy / open-Instagram
+// are <Button>s, which we mock out below).
 const captured = vi.hoisted(() => ({
   onChangeText: null as ((text: string) => void) | null,
-  onPress: null as (() => void) | null,
   buttons: {} as Record<string, (() => Promise<void>) | undefined>,
 }));
 
@@ -29,12 +33,9 @@ const clipboard = vi.hoisted(() => ({ setStringAsync: vi.fn(async (_text: string
 vi.mock('../../lib/analytics', () => ({ track: analytics.track }));
 
 vi.mock('react-native', () => ({
+  Platform: { OS: 'ios' },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
-  Pressable: ({ onPress, children }: { onPress?: () => void; children?: ReactNode }) => {
-    captured.onPress = onPress ?? null;
-    return createElement('button', null, typeof children === 'function' ? null : children);
-  },
 }));
 
 // The paste field is a gorhom `BottomSheetTextInput` (so the host sheet lifts it
@@ -55,10 +56,12 @@ vi.mock('expo-haptics', () => ({
   NotificationFeedbackType: { Success: 'success', Error: 'error' },
 }));
 vi.mock('../ModalSheet', () => ({
-  // Render both slots: the paste field + submit now live in `footer`.
-  ModalSheet: ({ children, footer }: { children?: ReactNode; footer?: ReactNode }) =>
-    createElement('div', null, children, footer),
+  // Render both slots: the submit lives in the `header` top bar.
+  ModalSheet: ({ children, header }: { children?: ReactNode; header?: ReactNode }) =>
+    createElement('div', null, header, children),
 }));
+vi.mock('../SheetTopBar', async () => (await import('../../test/sheet-top-bar-stub')).sheetTopBarModule);
+vi.mock('../sheet-scroll-into-view', () => ({ useSheetScrollIntoView: () => null }));
 vi.mock('../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
@@ -96,12 +99,12 @@ beforeEach(() => {
   attach.isPending = false;
   clipboard.setStringAsync.mockClear();
   captured.onChangeText = null;
-  captured.onPress = null;
   captured.buttons = {};
 });
 
+let rendered: ReturnType<typeof render> | null = null;
 function renderSheet() {
-  return render(
+  rendered = render(
     createElement(AddBetaVideoSheet, {
       visible: true,
       climb: CLIMB,
@@ -111,13 +114,16 @@ function renderSheet() {
       onClose: vi.fn(),
     }),
   );
+  return rendered;
 }
 
 // Type a URL (flushing the setState re-render so the submit closure sees it),
 // then press submit.
 function typeAndSubmit(url: string) {
   act(() => captured.onChangeText?.(url));
-  act(() => captured.onPress?.());
+  act(() => {
+    (rendered?.container.querySelector('[data-testid="sheet-top-bar-trailing"]') as HTMLButtonElement | null)?.click();
+  });
 }
 
 describe('AddBetaVideoSheet attach analytics', () => {
@@ -152,6 +158,18 @@ describe('AddBetaVideoSheet attach analytics', () => {
     expect(analytics.track).not.toHaveBeenCalled();
   });
 
+  it('keeps a failed link editable and displays the error until retry', () => {
+    attach.mutate.mockImplementationOnce((_variables, callbacks) => callbacks.onError?.(new Error('offline')));
+    const screen = renderSheet();
+    typeAndSubmit('https://www.instagram.com/reel/ABC123/');
+    expect(screen.getByText('mobile.betaVideos.attachError')).toBeTruthy();
+    expect(analytics.track).not.toHaveBeenCalled();
+    act(() => captured.onChangeText?.('https://www.instagram.com/reel/XYZ456/'));
+    expect(screen.queryByText('mobile.betaVideos.attachError')).toBeNull();
+    typeAndSubmit('https://www.instagram.com/reel/XYZ456/');
+    expect(attach.mutate).toHaveBeenCalledTimes(2);
+  });
+
   // Regression guard for the decoupled copy/open flow: "Open Instagram" must copy
   // the caption itself, so a user who skips "Copy caption" still arrives in the
   // camera with it on the clipboard (PR #2846 review finding #1).
@@ -171,3 +189,31 @@ describe('AddBetaVideoSheet attach analytics', () => {
     });
   });
 });
+
+// This suite exercises the existing flow before the server privacy rollout.
+vi.mock('../../lib/graphql/hooks/use-privacy', () => ({ usePrivacySettings: () => ({ data: undefined }) }));
+vi.mock('../privacy/PublicationAudiencePicker', () => ({
+  PublicationAudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/ContentAudienceControl', () => ({
+  ContentAudienceControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/ResourcePrivacyControl', () => ({
+  ResourcePrivacyControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/AudiencePicker', () => ({
+  AudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/use-publication-audience', () => ({
+  usePublicationAudience: () => ({
+    enabled: false,
+    isPrivate: false,
+    audience: 'public',
+    publication: undefined,
+    chooseAudience: () => {},
+  }),
+}));

@@ -11,7 +11,12 @@
  * `redactSensitiveText` before they land in a world-readable issue.
  */
 
-import type { AppFeedbackPlatform, AppFeedbackSource, FeedbackContextInput } from '@boardsesh/shared-schema';
+import type {
+  AppFeedbackPlatform,
+  AppFeedbackSource,
+  FeedbackContextInput,
+  ReleaseContext,
+} from '@boardsesh/shared-schema';
 import { redactSensitiveText } from '@boardsesh/text-redaction';
 import { GITHUB_API, ensureLabels, githubHeaders, resolveGithubToken, resolveGithubRepo } from '../lib/github-client';
 import { GithubRequestError, readGithubErrorDetail } from '../lib/github-error';
@@ -39,6 +44,7 @@ export type FeedbackIssuePayload = {
   setIds?: number[] | null;
   angle?: number | null;
   context?: FeedbackContextInput | null;
+  releaseContext?: ReleaseContext | null;
   contactConsent?: boolean | null;
   /**
    * Public URLs of the reporter's screenshots, already resolved from their
@@ -100,6 +106,19 @@ function buildMetadataTable(payload: FeedbackIssuePayload): string {
   const rows: Array<[string, string | null]> = [
     ['Platform', payload.platform],
     ['App version', payload.appVersion ?? null],
+    ['Release channel', payload.releaseContext?.channel ?? null],
+    ['Running branch', payload.releaseContext?.branch ?? null],
+    ['Running update', payload.releaseContext?.updateId ?? null],
+    ['Runtime', payload.releaseContext?.runtimeVersion ?? null],
+    [
+      'Embedded bundle',
+      payload.releaseContext?.isEmbeddedLaunch == null ? null : String(payload.releaseContext.isEmbeddedLaunch),
+    ],
+    [
+      'Automatic canary',
+      payload.releaseContext?.automaticCanary == null ? null : String(payload.releaseContext.automaticCanary),
+    ],
+    ['Canary checked', payload.releaseContext?.canaryCheckedAt ?? null],
     ['Source', payload.source],
     ['Board', formatBoard(payload)],
     ['Climb', formatClimb(payload.context)],
@@ -119,9 +138,9 @@ function buildMetadataTable(payload: FeedbackIssuePayload): string {
 
 function buildContactLine(payload: FeedbackIssuePayload): string {
   if (payload.contactConsent) {
-    return `## Contact\n\n✅ Reporter agreed to follow-up — resolve **app_feedback #${payload.feedbackId}** in the DB to reach them.`;
+    return `## Contact\n\n✅ Reporter agreed to email follow-up — resolve **app_feedback #${payload.feedbackId}** in the DB to reach them.`;
   }
-  return '## Contact\n\n🚫 No contact consent — do not reach out.';
+  return '## Contact\n\n🚫 No email consent — do not email the reporter.';
 }
 
 /**
@@ -143,6 +162,10 @@ export function buildFeedbackIssue(payload: FeedbackIssuePayload): FeedbackIssue
     '## Comment',
     '',
     redactedComment || '_No comment provided._',
+    '',
+    '## Reply to the reporter',
+    '',
+    'Collaborators with write access can put `/reply` alone on the first line of a comment and write their message on the following lines. Signed-in reporters receive the message in the app.',
     '',
     buildMetadataTable(payload),
     ...screenshotMarkdownSection(payload.screenshotUrls ?? []),

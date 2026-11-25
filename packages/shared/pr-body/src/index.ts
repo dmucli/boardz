@@ -12,7 +12,15 @@ export {
   stripHtmlComments,
 } from './sections';
 export { TEST_PLAN_HEADING, parseTestPlan, type TestPlan } from './test-plan';
+export { CRITICAL_OTA_RELEASE_CHECKBOX, CRITICAL_OTA_RELEASE_LABEL, hasCriticalOtaRelease } from './ota-release';
 export { describeDeveloperVoice, findDeveloperVoice, type StepVoiceProblem } from './tester-voice';
+export {
+  OFFLINE_MIGRATIONS_PATH,
+  OFFLINE_MIGRATION_ACK_LINE,
+  findOfflineMigrationProblem,
+  hasOfflineMigrationAck,
+  isOfflineMigrationsPath,
+} from './offline-migration';
 export { RISK_HEADING, findWrittenRiskScore, parseRisk, type Risk, type RiskLevel } from './risk';
 export {
   MAX_STEP_CHARS,

@@ -1,0 +1,19 @@
+appId: com.boardsesh.app
+name: diagnose one profile filter tap
+---
+- scrollUntilVisible:
+    element:
+      id: 'profile-progress-filter'
+    direction: DOWN
+    timeout: 30000
+    centerElement: true
+- takeScreenshot: profile-filter-before-tap
+- tapOn:
+    id: 'profile-progress-filter'
+- takeScreenshot: profile-filter-immediately-after-tap
+- waitForAnimationToEnd
+# Match the production visibility budget, but still observe just one tap.
+- extendedWaitUntil:
+    visible: '${SHOWCASE_ALL_BOARDS_LABEL}'
+    timeout: 30000
+- takeScreenshot: profile-filter-after-animation

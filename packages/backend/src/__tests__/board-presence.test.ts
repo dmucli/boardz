@@ -1,13 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vite-plus/test';
 import Redis from 'ioredis';
 import { v4 as uuidv4 } from 'uuid';
-import { inArray, sql } from 'drizzle-orm';
+import { and, asc, count, countDistinct, desc, eq, inArray, isNull, like, min, or, sql } from 'drizzle-orm';
 import { GraphQLError } from 'graphql';
+import { getGradeColor } from '@boardsesh/board-constants';
 import { MOONBOARD_LAYOUTS, MOONBOARD_SETS, MOONBOARD_SIZE } from '@boardsesh/board-config';
 import type {
   ConnectionContext,
   BoardPresenceEvent,
   BoardClimbSet,
+  BoardClimbCleared,
   BoardConnectionChanged,
   BoardStatsUpdated,
   BoardPresenceClimb,
@@ -26,13 +28,20 @@ import {
 } from '../graphql/resolvers/board-presence/mutations';
 import { boardPresenceQueries } from '../graphql/resolvers/board-presence/queries';
 import { boardPresenceSubscriptions } from '../graphql/resolvers/board-presence/subscription';
-import { socialBoardQueries } from '../graphql/resolvers/social/boards';
-import { allocateBoardPresenceSeq, getBoardSeqFloor } from '../graphql/resolvers/board-presence/shared';
+import { socialBoardMutations, socialBoardQueries } from '../graphql/resolvers/social/boards';
+import {
+  allocateBoardPresenceSeq,
+  claimSerialForBoard,
+  findSelectedBoardForConnect,
+  getBoardSeqFloor,
+  type SelectedConnectBoard,
+} from '../graphql/resolvers/board-presence/shared';
 import { setCachedBoardPresenceStats } from '../graphql/resolvers/board-presence/stats';
 import { buildTickBoardLockQuery, tickMutations } from '../graphql/resolvers/ticks/mutations';
 import { seedAuroraCatalogFixtures } from './helpers/board-catalog-fixture';
 import { logger } from '../utils/logger';
 import { createBarrier, createValueBarrier, handleLater } from './helpers/concurrency';
+import { lockBoardSerialWrite } from '../graphql/resolvers/board-serial-write-lock';
 
 // Board presence is always-on (the BOARD_PRESENCE_ENABLED env gate and the
 // PostHog flag were removed when the feature went GA), so the suite needs no
@@ -151,74 +160,172 @@ function makeQueueItemInput(overrides: Partial<ClimbQueueItemInput['climb']> = {
 }
 
 async function seedUser(): Promise<void> {
-  await db.execute(sql`
-    INSERT INTO users (id, email, name, image, created_at, updated_at)
-    VALUES (${TEST_USER_ID}, 'carla@board-presence.test', 'Carla Fallback', null, now(), now())
-    ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
-  `);
-  await db.execute(sql`
-    INSERT INTO users (id, email, name, image, created_at, updated_at)
-    VALUES (${SECOND_USER_ID}, 'second@board-presence.test', 'Second Sender', null, now(), now())
-    ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name
-  `);
-  await db.execute(sql`
-    INSERT INTO user_profiles (user_id, display_name, avatar_url)
-    VALUES (${TEST_USER_ID}, ${SENDER_DISPLAY_NAME}, ${SENDER_AVATAR_URL})
-    ON CONFLICT (user_id) DO UPDATE SET display_name = EXCLUDED.display_name, avatar_url = EXCLUDED.avatar_url
-  `);
+  await db
+    .insert(dbSchema.users)
+    .values({
+      id: TEST_USER_ID,
+      email: 'carla@board-presence.test',
+      name: 'Carla Fallback',
+      image: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({ target: [dbSchema.users.id], set: { name: sql`excluded.name` } });
+  await db
+    .insert(dbSchema.users)
+    .values({
+      id: SECOND_USER_ID,
+      email: 'second@board-presence.test',
+      name: 'Second Sender',
+      image: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .onConflictDoUpdate({ target: [dbSchema.users.id], set: { name: sql`excluded.name` } });
+  await db
+    .insert(dbSchema.userProfiles)
+    .values({ userId: TEST_USER_ID, displayName: SENDER_DISPLAY_NAME, avatarUrl: SENDER_AVATAR_URL })
+    .onConflictDoUpdate({
+      target: [dbSchema.userProfiles.userId],
+      set: { displayName: sql`excluded.display_name`, avatarUrl: sql`excluded.avatar_url` },
+    });
 }
 
 async function seedCatalogClimb(): Promise<void> {
-  await db.execute(sql`
-    INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, angle, is_listed, is_draft)
-    VALUES (${TEST_CLIMB_UUID}, 'kilter', 1, 'Real Catalog Climb', 'p1145r12', 40, true, false)
-    ON CONFLICT (uuid) DO NOTHING
-  `);
-  await db.execute(sql`
-    INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, angle, is_listed, is_draft)
-    VALUES (${OTHER_TEST_CLIMB_UUID}, 'kilter', 1, 'Other Catalog Climb', 'p9999r12', 40, true, false)
-    ON CONFLICT (uuid) DO NOTHING
-  `);
-  await db.execute(sql`
-    INSERT INTO board_difficulty_grades (board_type, difficulty, boulder_name, is_listed)
-    VALUES ('kilter', 17, 'V5', true), ('kilter', 18, 'V6', true)
-    ON CONFLICT (board_type, difficulty) DO UPDATE SET boulder_name = EXCLUDED.boulder_name
-  `);
-  await db.execute(sql`
-    INSERT INTO board_climb_stats (board_type, climb_uuid, angle, display_difficulty, ascensionist_count, difficulty_average, quality_average)
-    VALUES
-      ('kilter', ${TEST_CLIMB_UUID}, 40, 17, 10, 17, 4),
-      ('kilter', ${TEST_CLIMB_UUID}, 45, 18, 10, 18, 4),
-      ('kilter', ${OTHER_TEST_CLIMB_UUID}, 40, 18, 5, 18, 3)
-    ON CONFLICT (board_type, climb_uuid, angle) DO UPDATE SET display_difficulty = EXCLUDED.display_difficulty
-  `);
-  await db.execute(sql`
-    INSERT INTO board_climb_aliases (board_type, alias_uuid, canonical_uuid, source)
-    VALUES ('kilter', ${ALIAS_TEST_CLIMB_UUID}, ${TEST_CLIMB_UUID}, 'board-presence-test')
-    ON CONFLICT (board_type, alias_uuid) DO UPDATE
-      SET canonical_uuid = EXCLUDED.canonical_uuid,
-          source = EXCLUDED.source,
-          last_seen_at = now()
-  `);
+  await db
+    .insert(dbSchema.boardClimbs)
+    .values({
+      uuid: TEST_CLIMB_UUID,
+      boardType: 'kilter',
+      layoutId: 1,
+      name: 'Real Catalog Climb',
+      frames: 'p1145r12',
+      angle: 40,
+      isListed: true,
+      isDraft: false,
+    })
+    .onConflictDoNothing({ target: [dbSchema.boardClimbs.uuid] });
+  await db
+    .insert(dbSchema.boardClimbs)
+    .values({
+      uuid: OTHER_TEST_CLIMB_UUID,
+      boardType: 'kilter',
+      layoutId: 1,
+      name: 'Other Catalog Climb',
+      frames: 'p9999r12',
+      angle: 40,
+      isListed: true,
+      isDraft: false,
+    })
+    .onConflictDoNothing({ target: [dbSchema.boardClimbs.uuid] });
+  await db
+    .insert(dbSchema.boardDifficultyGrades)
+    .values([
+      { boardType: 'kilter', difficulty: 17, boulderName: 'V5', isListed: true },
+      { boardType: 'kilter', difficulty: 18, boulderName: 'V6', isListed: true },
+    ])
+    .onConflictDoUpdate({
+      target: [dbSchema.boardDifficultyGrades.boardType, dbSchema.boardDifficultyGrades.difficulty],
+      set: { boulderName: sql`excluded.boulder_name` },
+    });
+  await db
+    .insert(dbSchema.boardClimbStats)
+    .values([
+      {
+        boardType: 'kilter',
+        climbUuid: TEST_CLIMB_UUID,
+        angle: 40,
+        displayDifficulty: 17,
+        ascensionistCount: 10,
+        difficultyAverage: 17,
+        qualityAverage: 4,
+      },
+      {
+        boardType: 'kilter',
+        climbUuid: TEST_CLIMB_UUID,
+        angle: 45,
+        displayDifficulty: 18,
+        ascensionistCount: 10,
+        difficultyAverage: 18,
+        qualityAverage: 4,
+      },
+      {
+        boardType: 'kilter',
+        climbUuid: OTHER_TEST_CLIMB_UUID,
+        angle: 40,
+        displayDifficulty: 18,
+        ascensionistCount: 5,
+        difficultyAverage: 18,
+        qualityAverage: 3,
+      },
+    ])
+    .onConflictDoUpdate({
+      target: [dbSchema.boardClimbStats.boardType, dbSchema.boardClimbStats.climbUuid, dbSchema.boardClimbStats.angle],
+      set: { displayDifficulty: sql`excluded.display_difficulty` },
+    });
+  await db
+    .insert(dbSchema.boardClimbAliases)
+    .values({
+      boardType: 'kilter',
+      aliasUuid: ALIAS_TEST_CLIMB_UUID,
+      canonicalUuid: TEST_CLIMB_UUID,
+      source: 'board-presence-test',
+    })
+    .onConflictDoUpdate({
+      target: [dbSchema.boardClimbAliases.boardType, dbSchema.boardClimbAliases.aliasUuid],
+      set: { canonicalUuid: sql`excluded.canonical_uuid`, source: sql`excluded.source`, lastSeenAt: new Date() },
+    });
 }
 
 async function cleanup(): Promise<void> {
-  await db.execute(sql`DELETE FROM boardsesh_ticks WHERE user_id IN (${TEST_USER_ID}, ${SECOND_USER_ID})`);
-  await db.execute(sql`
-    DELETE FROM user_boards
-    WHERE owner_id IN (${TEST_USER_ID}, ${SECOND_USER_ID})
-       OR (owner_id = '00000000-0000-0000-0000-000000000000' AND slug LIKE 'presence-%')
-  `);
-  await db.execute(
-    sql`DELETE FROM board_climb_stats WHERE climb_uuid IN (${TEST_CLIMB_UUID}, ${OTHER_TEST_CLIMB_UUID})`,
-  );
-  await db.execute(sql`
-    DELETE FROM board_climb_aliases
-    WHERE alias_uuid IN (${TEST_CLIMB_UUID}, ${OTHER_TEST_CLIMB_UUID}, ${ALIAS_TEST_CLIMB_UUID})
-       OR canonical_uuid IN (${TEST_CLIMB_UUID}, ${OTHER_TEST_CLIMB_UUID}, ${ALIAS_TEST_CLIMB_UUID})
-  `);
-  await db.execute(sql`DELETE FROM board_climbs WHERE uuid IN (${TEST_CLIMB_UUID}, ${OTHER_TEST_CLIMB_UUID})`);
-  await db.execute(sql`DELETE FROM user_profiles WHERE user_id = ${TEST_USER_ID}`);
+  // setup.ts resets the in-memory limiter. Redis-backed cases also need to
+  // retire only these fixture users' distributed buckets between tests.
+  if (redisClientManager.isRedisConnected()) {
+    const { publisher } = redisClientManager.getClients();
+    for (const userId of [TEST_USER_ID, SECOND_USER_ID]) {
+      let cursor = '0';
+      do {
+        const [nextCursor, bucketKeys] = await publisher.scan(cursor, 'MATCH', `ratelimit:${userId}:*`, 'COUNT', 100);
+        cursor = nextCursor;
+        if (bucketKeys.length > 0) await publisher.del(...bucketKeys);
+      } while (cursor !== '0');
+    }
+  }
+  await db
+    .delete(dbSchema.boardseshTicks)
+    .where(inArray(dbSchema.boardseshTicks.userId, [TEST_USER_ID, SECOND_USER_ID]));
+  await db
+    .delete(dbSchema.userBoards)
+    .where(
+      or(
+        inArray(dbSchema.userBoards.ownerId, [TEST_USER_ID, SECOND_USER_ID]),
+        and(
+          eq(dbSchema.userBoards.ownerId, '00000000-0000-0000-0000-000000000000'),
+          like(dbSchema.userBoards.slug, 'presence-%'),
+        ),
+      ),
+    );
+  // Gym rows minted by the selectedBoardUuid suite's synced-listing fixtures.
+  await db.delete(dbSchema.gyms).where(like(dbSchema.gyms.slug, 'presence-selected-%'));
+  await db
+    .delete(dbSchema.boardClimbStats)
+    .where(inArray(dbSchema.boardClimbStats.climbUuid, [TEST_CLIMB_UUID, OTHER_TEST_CLIMB_UUID]));
+  await db
+    .delete(dbSchema.boardClimbAliases)
+    .where(
+      or(
+        inArray(dbSchema.boardClimbAliases.aliasUuid, [TEST_CLIMB_UUID, OTHER_TEST_CLIMB_UUID, ALIAS_TEST_CLIMB_UUID]),
+        inArray(dbSchema.boardClimbAliases.canonicalUuid, [
+          TEST_CLIMB_UUID,
+          OTHER_TEST_CLIMB_UUID,
+          ALIAS_TEST_CLIMB_UUID,
+        ]),
+      ),
+    );
+  await db
+    .delete(dbSchema.boardClimbs)
+    .where(inArray(dbSchema.boardClimbs.uuid, [TEST_CLIMB_UUID, OTHER_TEST_CLIMB_UUID]));
+  await db.delete(dbSchema.userProfiles).where(eq(dbSchema.userProfiles.userId, TEST_USER_ID));
   await db
     .delete(dbSchema.users)
     .where(inArray(dbSchema.users.id, [TEST_USER_ID, SECOND_USER_ID, ...RECENT_SENDER_TEST_USER_IDS]));
@@ -347,50 +454,47 @@ describe('board-presence pubsub', () => {
 // unreachable so the rest of the suite still runs.
 // ============================================================
 describe('board-presence FIFO history (Redis)', () => {
-  const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6380';
-  let redis: Redis | null = null;
   let redisReachable = false;
 
   beforeAll(async () => {
-    redis = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1 });
-    try {
-      await redis.connect();
-      await redis.ping();
-      redisReachable = true;
-    } catch {
-      redisReachable = false;
-    }
+    redisReachable = await ensureRedisConnectedForTest();
   });
 
-  afterAll(async () => {
-    if (redis) {
-      await redis.quit().catch(() => {});
-    }
-  });
-
-  it('lpush + ltrim + sort-by-seq-desc backfill works (direct Redis FIFO contract)', async () => {
-    if (!redisReachable || !redis) {
+  it('commits and reads the newest 50 climbs through the production store', async () => {
+    if (!redisReachable) {
       console.warn('[board-presence] Redis unreachable — skipping FIFO history test');
       return;
     }
-    const key = `board:fifo-test-${Date.now()}:history`;
-    const climbs: BoardPresenceClimb[] = [];
-    for (let seq = 1; seq <= 60; seq++) {
-      const climb: BoardPresenceClimb = { climbUuid: `c${seq}`, sentAt: new Date().toISOString(), seq };
-      climbs.push(climb);
-      await redis.lpush(key, JSON.stringify(climb));
-      await redis.ltrim(key, 0, 49);
+    const store = new BoardPresenceStore({
+      isRedisAvailable: () => redisClientManager.isRedisConnected(),
+      isRedisRequired: () => true,
+      logger,
+    });
+    const boardId = `fifo-test-${Date.now()}`;
+    const { publisher } = redisClientManager.getClients();
+    try {
+      // Two late commits arrive out of order; the production reader must sort them.
+      for (const seq of [...Array.from({ length: 58 }, (_, index) => index + 1), 60, 59]) {
+        const climb: BoardPresenceClimb = { climbUuid: `c${seq}`, sentAt: new Date().toISOString(), seq };
+        const committed = await store.commitBoardClimb({
+          boardId,
+          emitterId: TEST_USER_ID,
+          climb,
+          climbUuid: climb.climbUuid,
+          effectiveAngle: 40,
+          mirrored: false,
+          sessionId: null,
+        });
+        expect(committed.writerSlotOk).toBe(true);
+      }
+      const history = await store.getRecentBoardClimbs(boardId);
+      expect(history).toHaveLength(50);
+      expect(history.map((climb) => climb.seq)).toEqual(Array.from({ length: 50 }, (_, index) => 60 - index));
+      expect(history[0].climbUuid).toBe('c60');
+      expect(await publisher.ttl(`board:${boardId}:history`)).toBeGreaterThan(0);
+    } finally {
+      await publisher.del(`board:${boardId}:history`, `board:${boardId}:writer`, `board:${boardId}:lastReport`);
     }
-
-    const raw = await redis.lrange(key, 0, -1);
-    expect(raw.length).toBe(50); // capped at 50
-
-    const parsed = raw.map((j) => JSON.parse(j) as BoardPresenceClimb).sort((a, b) => b.seq - a.seq);
-    // Newest seq first, oldest retained seq is 11 (1..10 trimmed away).
-    expect(parsed[0].seq).toBe(60);
-    expect(parsed[parsed.length - 1].seq).toBe(11);
-
-    await redis.del(key);
   });
 });
 
@@ -420,6 +524,12 @@ describe('board-presence resolvers', () => {
       expect(first.boardId).toBeGreaterThan(0);
       expect(first.boardType).toBe('kilter');
       expect(first.setIds).toBe('1,2');
+      // Same defaults as createBoard: public with the exact location hidden.
+      const [createdRow] = await db
+        .select({ isPublic: dbSchema.userBoards.isPublic, hideLocation: dbSchema.userBoards.hideLocation })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.id, first.boardId));
+      expect(createdRow).toEqual({ isPublic: true, hideLocation: true });
 
       // Second call (same serial) returns the already-bound shared board.
       const second = await boardPresenceMutations.resolveBoardForSerial(
@@ -449,10 +559,17 @@ describe('board-presence resolvers', () => {
 
     it("binds the serial onto the caller's existing config-matching board", async () => {
       // Pre-create a board for this config with NO serial.
-      await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number)
-        VALUES (${`uuid-${Date.now()}`}, ${`slug-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', 7, 11, '3,4', 'My Garage', null)
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: `uuid-${Date.now()}`,
+        slug: `slug-${Date.now()}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 7,
+        sizeId: 11,
+        setIds: '3,4',
+        name: 'My Garage',
+        serialNumber: null,
+      });
 
       const serial = `BIND-${Date.now()}`;
       const resolved = await boardPresenceMutations.resolveBoardForSerial(
@@ -460,17 +577,29 @@ describe('board-presence resolvers', () => {
         { serial, boardType: 'kilter', layoutId: 7, sizeId: 11, setIds: '3,4' },
         authCtx(),
       );
-      expect(resolved.boardName).toBe('My Garage');
+      // A serial lookup returns the hardware label, not a home's identifying name.
+      expect(resolved.boardName).toBe('Kilter Board');
 
-      const [row] = await db.execute(sql`SELECT serial_number FROM user_boards WHERE id = ${resolved.boardId}`);
+      const [row] = await db
+        .select({ serial_number: dbSchema.userBoards.serialNumber, name: dbSchema.userBoards.name })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.id, resolved.boardId));
       expect((row as { serial_number: string }).serial_number).toBe(serial);
+      expect((row as { name: string }).name).toBe('My Garage');
     });
 
     it('normalizes setIds before binding a serial to an own config board', async () => {
-      await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number)
-        VALUES (${`uuid-normalized-${Date.now()}`}, ${`slug-normalized-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', 17, 21, '3,4', 'My Normalized Garage', null)
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: `uuid-normalized-${Date.now()}`,
+        slug: `slug-normalized-${Date.now()}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 17,
+        sizeId: 21,
+        setIds: '3,4',
+        name: 'My Normalized Garage',
+        serialNumber: null,
+      });
 
       const serial = `NORM-${Date.now()}`;
       const resolved = await boardPresenceMutations.resolveBoardForSerial(
@@ -478,22 +607,35 @@ describe('board-presence resolvers', () => {
         { serial, boardType: 'kilter', layoutId: 17, sizeId: 21, setIds: '4,3' },
         authCtx(),
       );
-      expect(resolved.boardName).toBe('My Normalized Garage');
+      expect(resolved.boardName).toBe('Kilter Board');
       expect(resolved.setIds).toBe('3,4');
 
-      const [row] = await db.execute(sql`
-        SELECT serial_number FROM user_boards
-        WHERE owner_id = ${TEST_USER_ID} AND layout_id = 17 AND size_id = 21
-      `);
+      const [row] = await db
+        .select({ serial_number: dbSchema.userBoards.serialNumber })
+        .from(dbSchema.userBoards)
+        .where(
+          and(
+            eq(dbSchema.userBoards.ownerId, TEST_USER_ID),
+            eq(dbSchema.userBoards.layoutId, 17),
+            eq(dbSchema.userBoards.sizeId, 21),
+          ),
+        );
       expect((row as { serial_number: string }).serial_number).toBe(serial);
     });
 
     it('rejects rebinding an own config board that already has a different serial', async () => {
       const existingSerial = `BOUND-${Date.now()}`;
-      await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number)
-        VALUES (${`uuid-bound-${Date.now()}`}, ${`slug-bound-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', 8, 12, '5,6', 'My Garage', ${existingSerial})
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: `uuid-bound-${Date.now()}`,
+        slug: `slug-bound-${Date.now()}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 8,
+        sizeId: 12,
+        setIds: '5,6',
+        name: 'My Garage',
+        serialNumber: existingSerial,
+      });
 
       await expect(
         boardPresenceMutations.resolveBoardForSerial(
@@ -505,10 +647,16 @@ describe('board-presence resolvers', () => {
         extensions: { code: 'BOARD_SERIAL_ALREADY_BOUND' },
       });
 
-      const [row] = await db.execute(sql`
-        SELECT serial_number FROM user_boards
-        WHERE owner_id = ${TEST_USER_ID} AND layout_id = 8 AND size_id = 12
-      `);
+      const [row] = await db
+        .select({ serial_number: dbSchema.userBoards.serialNumber })
+        .from(dbSchema.userBoards)
+        .where(
+          and(
+            eq(dbSchema.userBoards.ownerId, TEST_USER_ID),
+            eq(dbSchema.userBoards.layoutId, 8),
+            eq(dbSchema.userBoards.sizeId, 12),
+          ),
+        );
       expect((row as { serial_number: string }).serial_number).toBe(existingSerial);
     });
 
@@ -519,10 +667,17 @@ describe('board-presence resolvers', () => {
         { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2' },
         authCtx(),
       );
-      await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number)
-        VALUES (${`uuid-second-${Date.now()}`}, ${`slug-second-${Date.now()}`}, ${SECOND_USER_ID}, 'kilter', 1, 10, '1,2', 'Own Config', null)
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: `uuid-second-${Date.now()}`,
+        slug: `slug-second-${Date.now()}`,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+        name: 'Own Config',
+        serialNumber: null,
+      });
 
       const second = await boardPresenceMutations.resolveBoardForSerial(
         undefined,
@@ -531,10 +686,10 @@ describe('board-presence resolvers', () => {
       );
 
       expect(second.boardId).toBe(first.boardId);
-      const [secondOwnBoard] = await db.execute(sql`
-        SELECT serial_number FROM user_boards
-        WHERE owner_id = ${SECOND_USER_ID} AND name = 'Own Config'
-      `);
+      const [secondOwnBoard] = await db
+        .select({ serial_number: dbSchema.userBoards.serialNumber })
+        .from(dbSchema.userBoards)
+        .where(and(eq(dbSchema.userBoards.ownerId, SECOND_USER_ID), eq(dbSchema.userBoards.name, 'Own Config')));
       expect((secondOwnBoard as { serial_number: string | null }).serial_number).toBeNull();
     });
 
@@ -567,11 +722,14 @@ describe('board-presence resolvers', () => {
 
       expect(second.boardId).toBe(first.boardId);
       expect(first.boardType).toBe('moonboard');
-      const [row] = await db.execute(sql`
-        SELECT owner_id, serial_number, is_unlisted
-        FROM user_boards
-        WHERE id = ${first.boardId}
-      `);
+      const [row] = await db
+        .select({
+          owner_id: dbSchema.userBoards.ownerId,
+          serial_number: dbSchema.userBoards.serialNumber,
+          is_unlisted: dbSchema.userBoards.isUnlisted,
+        })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.id, first.boardId));
       expect((row as { owner_id: string }).owner_id).toBe('00000000-0000-0000-0000-000000000000');
       expect((row as { serial_number: string | null }).serial_number).toBeNull();
       expect((row as { is_unlisted: boolean }).is_unlisted).toBe(true);
@@ -613,15 +771,18 @@ describe('board-presence resolvers', () => {
       expect(first.setIds).toBe(normalizedSetIds);
       expect(second.setIds).toBe(normalizedSetIds);
 
-      const [row] = await db.execute(sql`
-        SELECT count(*)::int AS count, min(set_ids) AS set_ids
-        FROM user_boards
-        WHERE owner_id = '00000000-0000-0000-0000-000000000000'
-          AND board_type = 'moonboard'
-          AND layout_id = ${MOONBOARD_2016_LAYOUT.id}
-          AND size_id = ${MOONBOARD_SIZE.id}
-          AND deleted_at IS NULL
-      `);
+      const [row] = await db
+        .select({ count: count(), set_ids: min(dbSchema.userBoards.setIds) })
+        .from(dbSchema.userBoards)
+        .where(
+          and(
+            eq(dbSchema.userBoards.ownerId, '00000000-0000-0000-0000-000000000000'),
+            eq(dbSchema.userBoards.boardType, 'moonboard'),
+            eq(dbSchema.userBoards.layoutId, MOONBOARD_2016_LAYOUT.id),
+            eq(dbSchema.userBoards.sizeId, MOONBOARD_SIZE.id),
+            isNull(dbSchema.userBoards.deletedAt),
+          ),
+        );
       expect(Number((row as { count: number }).count)).toBe(1);
       expect((row as { set_ids: string }).set_ids).toBe(normalizedSetIds);
     });
@@ -636,21 +797,33 @@ describe('board-presence resolvers', () => {
 
       // Attempt to UPDATE a *different* board to the same serial — must fail the
       // unique partial index (serial → exactly one active board).
-      await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number)
-        VALUES (${`uuid-other-${Date.now()}`}, ${`slug-other-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', 2, 20, '5,6', 'Other Wall', null)
-      `);
-      const [other] = await db.execute(
-        sql`SELECT id FROM user_boards WHERE owner_id = ${TEST_USER_ID} AND layout_id = 2 LIMIT 1`,
-      );
+      await db.insert(dbSchema.userBoards).values({
+        uuid: `uuid-other-${Date.now()}`,
+        slug: `slug-other-${Date.now()}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 2,
+        sizeId: 20,
+        setIds: '5,6',
+        name: 'Other Wall',
+        serialNumber: null,
+      });
+      const [other] = await db
+        .select({ id: dbSchema.userBoards.id })
+        .from(dbSchema.userBoards)
+        .where(and(eq(dbSchema.userBoards.ownerId, TEST_USER_ID), eq(dbSchema.userBoards.layoutId, 2)))
+        .limit(1);
       const otherId = (other as { id: number }).id;
 
       await expect(
-        db.execute(sql`UPDATE user_boards SET serial_number = ${serialA} WHERE id = ${otherId}`),
+        db.update(dbSchema.userBoards).set({ serialNumber: serialA }).where(eq(dbSchema.userBoards.id, otherId)),
       ).rejects.toThrow();
 
       // The original board still owns the serial.
-      const [orig] = await db.execute(sql`SELECT serial_number FROM user_boards WHERE id = ${resolved.boardId}`);
+      const [orig] = await db
+        .select({ serial_number: dbSchema.userBoards.serialNumber })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.id, resolved.boardId));
       expect((orig as { serial_number: string }).serial_number).toBe(serialA);
     });
   });
@@ -668,13 +841,22 @@ describe('board-presence resolvers', () => {
     }): Promise<{ id: number; uuid: string }> {
       const uuid = `uuid-${Math.random().toString(36).slice(2)}`;
       const slug = `slug-${Math.random().toString(36).slice(2)}`;
-      const [row] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public, location_name)
-        VALUES (${uuid}, ${slug}, ${opts.ownerId}, 'kilter', ${opts.layoutId}, ${opts.sizeId}, ${opts.setIds},
-                ${opts.name}, ${opts.serial}, ${opts.isPublic ?? true}, ${opts.locationName ?? null})
-        RETURNING id, uuid
-      `);
+      const [row] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: uuid,
+          slug: slug,
+          ownerId: opts.ownerId,
+          boardType: 'kilter',
+          layoutId: opts.layoutId,
+          sizeId: opts.sizeId,
+          setIds: opts.setIds,
+          name: opts.name,
+          serialNumber: opts.serial,
+          isPublic: opts.isPublic ?? true,
+          locationName: opts.locationName ?? null,
+        })
+        .returning({ id: dbSchema.userBoards.id, uuid: dbSchema.userBoards.uuid });
       return { id: Number((row as { id: number }).id), uuid: (row as { uuid: string }).uuid };
     }
 
@@ -754,9 +936,12 @@ describe('board-presence resolvers', () => {
       expect(result.candidates).toBeNull();
       expect(result.board?.boardId).toBe(only.id);
 
-      const [row] = await db.execute(
-        sql`SELECT board_uuid FROM user_board_serials WHERE user_id = ${TEST_USER_ID} AND serial_number = ${serial}`,
-      );
+      const [row] = await db
+        .select({ board_uuid: dbSchema.userBoardSerials.boardUuid })
+        .from(dbSchema.userBoardSerials)
+        .where(
+          and(eq(dbSchema.userBoardSerials.userId, TEST_USER_ID), eq(dbSchema.userBoardSerials.serialNumber, serial)),
+        );
       expect((row as { board_uuid: string }).board_uuid).toBe(only.uuid);
     });
 
@@ -849,16 +1034,1213 @@ describe('board-presence resolvers', () => {
         insertBoard({ ownerId: TEST_USER_ID, serial, layoutId: 9, sizeId: 10, setIds: '1', name: 'C' }),
       ).rejects.toThrow();
     });
+
+    // The wrong-board bug: a gym's synced listing carries no serial, so the first
+    // climber to connect minted a private duplicate that everyone afterwards
+    // matched instead — while the map finder still pointed at the gym listing.
+    describe('selectedBoardUuid (a picked board beats serial matching)', () => {
+      const SYSTEM_OWNER_ID = '00000000-0000-0000-0000-000000000000';
+
+      // Gym listings are owned by the system user. Other suites create it as a
+      // side effect of resolveSharedBoardForConfig, but these tests insert
+      // system-owned rows directly, so the FK target has to exist first.
+      beforeEach(async () => {
+        await db
+          .insert(dbSchema.users)
+          .values({
+            id: SYSTEM_OWNER_ID,
+            email: 'system@boardsesh.com',
+            name: 'Boardsesh',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .onConflictDoNothing({ target: [dbSchema.users.id] });
+      });
+
+      async function insertRealUuidBoard(opts: {
+        ownerId: string;
+        serial: string | null;
+        layoutId: number;
+        sizeId: number;
+        setIds: string;
+        name: string;
+        isPublic?: boolean;
+        gymId?: number | null;
+      }): Promise<{ id: number; uuid: string }> {
+        const uuid = uuidv4();
+        const slug = `presence-selected-${Math.random().toString(36).slice(2)}`;
+        const [row] = await db
+          .insert(dbSchema.userBoards)
+          .values({
+            uuid: uuid,
+            slug: slug,
+            ownerId: opts.ownerId,
+            boardType: 'kilter',
+            layoutId: opts.layoutId,
+            sizeId: opts.sizeId,
+            setIds: opts.setIds,
+            name: opts.name,
+            serialNumber: opts.serial,
+            isPublic: opts.isPublic ?? true,
+            gymId: opts.gymId ?? null,
+          })
+          .returning({ id: dbSchema.userBoards.id, uuid: dbSchema.userBoards.uuid });
+        return { id: Number((row as { id: number }).id), uuid: (row as { uuid: string }).uuid };
+      }
+
+      /** A synced gym listing: system-owned and linked to a gym row. */
+      async function insertGymListing(opts: {
+        serial: string | null;
+        layoutId: number;
+        sizeId: number;
+        setIds: string;
+        name: string;
+      }): Promise<{ id: number; uuid: string }> {
+        const [gymRow] = await db
+          .insert(dbSchema.gyms)
+          .values({
+            uuid: uuidv4(),
+            name: opts.name,
+            slug: `presence-selected-${Math.random().toString(36).slice(2)}`,
+            ownerId: SYSTEM_OWNER_ID,
+            isPublic: true,
+          })
+          .returning({ id: dbSchema.gyms.id });
+        return insertRealUuidBoard({
+          ...opts,
+          ownerId: SYSTEM_OWNER_ID,
+          gymId: Number((gymRow as { id: number }).id),
+        });
+      }
+
+      async function serialOf(boardId: number): Promise<string | null> {
+        const [row] = await db
+          .select({ serial_number: dbSchema.userBoards.serialNumber })
+          .from(dbSchema.userBoards)
+          .where(eq(dbSchema.userBoards.id, boardId));
+        return (row as { serial_number: string | null }).serial_number;
+      }
+
+      /** The per-user (serial → board) link both the resolver and recordBoardSerial write. */
+      async function linkedBoardUuid(serial: string): Promise<string | null> {
+        const [row] = await db
+          .select({ board_uuid: dbSchema.userBoardSerials.boardUuid })
+          .from(dbSchema.userBoardSerials)
+          .where(
+            and(eq(dbSchema.userBoardSerials.userId, TEST_USER_ID), eq(dbSchema.userBoardSerials.serialNumber, serial)),
+          );
+        return (row as { board_uuid: string | null } | undefined)?.board_uuid ?? null;
+      }
+
+      async function rememberSerialLink(serial: string, boardUuid: string): Promise<void> {
+        await db
+          .insert(dbSchema.userBoardSerials)
+          .values({
+            userId: TEST_USER_ID,
+            serialNumber: serial,
+            boardName: 'kilter',
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,2',
+            boardUuid: boardUuid,
+          })
+          .onConflictDoUpdate({
+            target: [
+              dbSchema.userBoardSerials.userId,
+              dbSchema.userBoardSerials.boardName,
+              dbSchema.userBoardSerials.serialNumber,
+            ],
+            set: { boardUuid: sql`excluded.board_uuid` },
+          });
+      }
+
+      it('keeps the connect on the picked gym board and claims the serial for it', async () => {
+        const serial = `SEL-${Date.now()}`;
+        // The duplicate an earlier climber minted, already carrying the serial.
+        const clone = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          name: 'Kilter Board',
+        });
+        // The gym's synced listing — right wall, no serial.
+        const gymBoard = await insertGymListing({
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          name: 'The Gym - Kilter Board Original',
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          {
+            serial,
+            boardType: 'kilter',
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,2',
+            selectedBoardUuid: gymBoard.uuid,
+          },
+          authCtx(),
+        );
+
+        expect(result.candidates).toBeNull();
+        expect(result.board?.boardId).toBe(gymBoard.id);
+        expect(result.board?.boardId).not.toBe(clone.id);
+        // The claim is what stops the NEXT climber landing on the clone.
+        expect(await serialOf(gymBoard.id)).toBe(serial);
+      });
+
+      it('remembers the picked board so a later connect without a selection stays on it', async () => {
+        const serial = `SELMEM-${Date.now()}`;
+        const clone = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial,
+          layoutId: 2,
+          sizeId: 20,
+          setIds: '5,6',
+          name: 'Kilter Board',
+        });
+        const gymBoard = await insertGymListing({
+          serial: null,
+          layoutId: 2,
+          sizeId: 20,
+          setIds: '5,6',
+          name: 'Gym Wall',
+        });
+
+        await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 2, sizeId: 20, setIds: '5,6', selectedBoardUuid: gymBoard.uuid },
+          authCtx(),
+        );
+
+        // A background reconnect carries no selection; the remembered link must
+        // hold the wall rather than falling back to the (now ambiguous) serial.
+        const reconnect = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 2, sizeId: 20, setIds: '5,6' },
+          authCtx(),
+        );
+        expect(reconnect.candidates).toBeNull();
+        expect(reconnect.board?.boardId).toBe(gymBoard.id);
+        expect(reconnect.board?.boardId).not.toBe(clone.id);
+      });
+
+      it('ignores a selection whose config does not match the connected controller', async () => {
+        const serial = `SELMISMATCH-${Date.now()}`;
+        const serialBoard = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial,
+          layoutId: 3,
+          sizeId: 30,
+          setIds: '7,8',
+          name: 'Actual Wall',
+        });
+        // The user picked this on the map, then walked to a different wall.
+        const staleSelection = await insertGymListing({
+          serial: null,
+          layoutId: 2,
+          sizeId: 20,
+          setIds: '5,6',
+          name: 'Somewhere Else',
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          {
+            serial,
+            boardType: 'kilter',
+            layoutId: 3,
+            sizeId: 30,
+            setIds: '7,8',
+            selectedBoardUuid: staleSelection.uuid,
+          },
+          authCtx(),
+        );
+
+        expect(result.board?.boardId).toBe(serialBoard.id);
+        expect(await serialOf(staleSelection.id)).toBeNull();
+      });
+
+      it('binds a picked board that already carries a different serial without rewriting it', async () => {
+        const connectedSerial = `SELNEW-${Date.now()}`;
+        const existingSerial = `SELOLD-${Date.now()}`;
+        const picked = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: existingSerial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,7',
+          name: 'Recontrollered Wall',
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          {
+            serial: connectedSerial,
+            boardType: 'kilter',
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,7',
+            selectedBoardUuid: picked.uuid,
+          },
+          authCtx(),
+        );
+
+        expect(result.board?.boardId).toBe(picked.id);
+        // A board that already has a serial keeps it: a swapped controller is the
+        // owner's call to make, not something a connect should silently rewrite.
+        expect(await serialOf(picked.id)).toBe(existingSerial);
+      });
+
+      // A personal board is usually the auto-named onboarding template, which
+      // follows the climber between gyms — it can't say which wall they're at.
+      it('routes a generic personal selection to the gym listing that owns the serial', async () => {
+        const serial = `SELTEMPLATE-${Date.now()}`;
+        const gymBoard = await insertGymListing({
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,5',
+          name: 'Real Gym Wall',
+        });
+        const template = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,5',
+          name: 'Kilter Original 12×12 with kickboard',
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,5', selectedBoardUuid: template.uuid },
+          authCtx(),
+        );
+
+        expect(result.board?.boardId).toBe(gymBoard.id);
+        // And the template must not absorb the gym's serial, or it would start
+        // competing for it on every later climber's connect.
+        expect(await serialOf(template.id)).toBeNull();
+      });
+
+      it('lets a personal selection take the serial when no gym listing claims it', async () => {
+        const serial = `SELHOME-${Date.now()}`;
+        const homeBoard = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,6',
+          name: "Marco's Garage",
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,6', selectedBoardUuid: homeBoard.uuid },
+          authCtx(),
+        );
+
+        expect(result.board?.boardId).toBe(homeBoard.id);
+        expect(await serialOf(homeBoard.id)).toBe(serial);
+      });
+
+      it('prompts rather than guessing when a gym listing and the selection both carry the serial', async () => {
+        const serial = `SELOWNSERIAL-${Date.now()}`;
+        // Serials are reused across real gyms (10 in production, 4 km to
+        // 7,400 km apart), so a serial alone cannot say which wall someone is
+        // at. Falling through to the candidate list is what lets the client ask
+        // instead of silently picking — the pick is then remembered per user.
+        const gymBoard = await insertGymListing({
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,7',
+          name: 'Some Other Gym',
+        });
+        const mine = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,7',
+          name: 'My Wall With That Serial',
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,7', selectedBoardUuid: mine.uuid },
+          authCtx(),
+        );
+
+        expect(result.board).toBeNull();
+        expect((result.candidates ?? []).map((candidate) => candidate.boardId).sort()).toEqual(
+          [gymBoard.id, mine.id].sort(),
+        );
+      });
+
+      it('sends a picked gym listing to its own board once it carries the serial', async () => {
+        // The steady state after a claim: the gym listing owns the serial, so
+        // the serial path lands on exactly that board with no prompt.
+        const serial = `SELGYMOWNS-${Date.now()}`;
+        const gymBoard = await insertGymListing({
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,11',
+          name: 'Claimed Gym Wall',
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,11', selectedBoardUuid: gymBoard.uuid },
+          authCtx(),
+        );
+
+        expect(result.candidates).toBeNull();
+        expect(result.board?.boardId).toBe(gymBoard.id);
+      });
+
+      it('ignores a same-serial gym listing that describes a different wall', async () => {
+        // Nine production serials are carried by gym listings 4 km to 7,400 km
+        // apart. A listing whose layout/size/sets don't match the controller in
+        // front of this climber can't be the wall they're on, so it must not
+        // outrank the local listing they picked — or that listing never learns
+        // its serial and every climber there keeps falling through to the far
+        // gym's board.
+        const serial = `SELREUSED-${Date.now()}`;
+        const foreignGymBoard = await insertGymListing({
+          serial,
+          layoutId: 2,
+          sizeId: 20,
+          setIds: '5,6',
+          name: 'Gym 7,400 km Away',
+        });
+        const localGymBoard = await insertGymListing({
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,12',
+          name: 'The Gym Round The Corner',
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          {
+            serial,
+            boardType: 'kilter',
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,12',
+            selectedBoardUuid: localGymBoard.uuid,
+          },
+          authCtx(),
+        );
+
+        expect(result.candidates).toBeNull();
+        expect(result.board?.boardId).toBe(localGymBoard.id);
+        expect(result.board?.boardId).not.toBe(foreignGymBoard.id);
+        expect(await serialOf(localGymBoard.id)).toBe(serial);
+      });
+
+      it('skips a remembered link that no longer carries the serial a gym listing now owns', async () => {
+        // The pre-fix connect path wrote whatever board the route was showing,
+        // which for ~200 climbers is the onboarding template. Honouring that
+        // link once the gym's listing carries the serial pins them to the
+        // template forever, with no prompt and no way out.
+        const serial = `SELSTALELINK-${Date.now()}`;
+        const gymBoard = await insertGymListing({
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,13',
+          name: 'Gym Wall That Owns The Serial',
+        });
+        const template = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,13',
+          name: 'Kilter Original 12×12 with kickboard',
+        });
+        await rememberSerialLink(serial, template.uuid);
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,13' },
+          authCtx(),
+        );
+
+        expect(result.candidates).toBeNull();
+        expect(result.board?.boardId).toBe(gymBoard.id);
+        expect(result.board?.boardId).not.toBe(template.id);
+        // And the stale link is repointed, so the next connect is a direct hit.
+        expect(await linkedBoardUuid(serial)).toBe(gymBoard.uuid);
+      });
+
+      it('prompts instead of honouring a stale remembered link when the serial is shared', async () => {
+        const serial = `SELSTALESHARED-${Date.now()}`;
+        const gymBoard = await insertGymListing({
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,14',
+          name: 'Gym Wall',
+        });
+        const clone = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,14',
+          name: 'Kilter Board',
+        });
+        const template = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,14',
+          name: 'Kilter Original 12×12 with kickboard',
+        });
+        await rememberSerialLink(serial, template.uuid);
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,14' },
+          authCtx(),
+        );
+
+        expect(result.board).toBeNull();
+        expect((result.candidates ?? []).map((candidate) => candidate.boardId).sort()).toEqual(
+          [gymBoard.id, clone.id].sort(),
+        );
+      });
+
+      it('keeps a freshly picked gym listing over a stale remembered link, with no prompt', async () => {
+        const serial = `SELFRESHPICK-${Date.now()}`;
+        const gymBoard = await insertGymListing({
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,15',
+          name: 'The Gym The Climber Picked',
+        });
+        // A second board carries the serial, so falling through would prompt.
+        await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,15',
+          name: 'Kilter Board',
+        });
+        const template = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,15',
+          name: 'Kilter Original 12×12 with kickboard',
+        });
+        await rememberSerialLink(serial, template.uuid);
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,15', selectedBoardUuid: gymBoard.uuid },
+          authCtx(),
+        );
+
+        // Picking that gym's wall on the map and plugging into a controller
+        // carrying its serial says everything there is to say about which wall
+        // this is — asking again would be the "keep the picked board" bug.
+        expect(result.candidates).toBeNull();
+        expect(result.board?.boardId).toBe(gymBoard.id);
+        expect(await linkedBoardUuid(serial)).toBe(gymBoard.uuid);
+      });
+
+      it('recordBoardSerial fills the link but never overwrites what the resolver wrote', async () => {
+        // Both fire on the same BLE connect and both write
+        // user_board_serials.board_uuid: the recording knows only which board
+        // the route was showing, the resolver knows which wall this is. The
+        // resolver has to win in either arrival order.
+        const serial = `SELRECORD-${Date.now()}`;
+        const gymBoard = await insertGymListing({
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,16',
+          name: 'Gym Wall The Climber Picked',
+        });
+        const template = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,16',
+          name: 'Kilter Original 12×12 with kickboard',
+        });
+        const recordInput = {
+          serialNumber: serial,
+          boardName: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '2,16',
+          apiLevel: 3,
+          boardUuid: template.uuid,
+        };
+
+        // Recording first: it establishes the link for a client that never
+        // reaches the resolver...
+        await socialBoardMutations.recordBoardSerial(null, { input: recordInput }, authCtx());
+        expect(await linkedBoardUuid(serial)).toBe(template.uuid);
+
+        // ...and the resolver still repoints it at the wall that was picked.
+        const resolved = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '2,16', selectedBoardUuid: gymBoard.uuid },
+          authCtx(),
+        );
+        expect(resolved.board?.boardId).toBe(gymBoard.id);
+        expect(await linkedBoardUuid(serial)).toBe(gymBoard.uuid);
+
+        // The other order — a late recording landing after the resolver — must
+        // not drag the climber back onto the template.
+        await socialBoardMutations.recordBoardSerial(null, { input: recordInput }, authCtx());
+        expect(await linkedBoardUuid(serial)).toBe(gymBoard.uuid);
+      });
+
+      it('binds a stranger-owned public selection but never brands it with the serial', async () => {
+        const serial = `SELSTRANGER-${Date.now()}`;
+        const strangersBoard = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,8',
+          name: "Someone Else's Wall",
+          isPublic: true,
+        });
+
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          {
+            serial,
+            boardType: 'kilter',
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,8',
+            selectedBoardUuid: strangersBoard.uuid,
+          },
+          authCtx(),
+        );
+
+        expect(result.board?.boardId).toBe(strangersBoard.id);
+        // Stamping a serial here would redirect it for every climber who
+        // connects afterwards, so only own/system boards may be claimed.
+        expect(await serialOf(strangersBoard.id)).toBeNull();
+      });
+
+      it('binds a stranger-owned Unlisted selection picked by its uuid, without branding it', async () => {
+        const serial = `SELUNLISTED-${Date.now()}`;
+        const board = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,9',
+          name: 'Link Only Wall',
+          isPublic: false,
+        });
+        // Saved the way the current audience control saves Unlisted.
+        await db.update(dbSchema.userBoards).set({ isUnlisted: true }).where(eq(dbSchema.userBoards.id, board.id));
+        await db.insert(dbSchema.resourcePrivacy).values({
+          kind: 'board',
+          resourceId: board.uuid,
+          ownerId: SECOND_USER_ID,
+          audience: 'unlisted',
+        });
+
+        // The picked board's uuid is its link, so a climber who opened it can connect on it.
+        const selected = await findSelectedBoardForConnect(TEST_USER_ID, board.uuid, {
+          boardType: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,9',
+        });
+        expect(selected?.id).toBe(board.id);
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,9', selectedBoardUuid: board.uuid },
+          authCtx(),
+        );
+        expect(result.board?.boardId).toBe(board.id);
+        expect(await serialOf(board.id)).toBeNull();
+      });
+
+      it('rejects a legacy-public selection with a private override without remembering it', async () => {
+        const serial = `SELPRIVATE-${Date.now()}`;
+        const board = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,8',
+          name: 'Private Override Wall',
+          isPublic: true,
+        });
+        await db.insert(dbSchema.resourcePrivacy).values({
+          kind: 'board',
+          resourceId: board.uuid,
+          ownerId: SECOND_USER_ID,
+          audience: 'only_me',
+        });
+        try {
+          expect(
+            await findSelectedBoardForConnect(TEST_USER_ID, board.uuid, {
+              boardType: 'kilter',
+              layoutId: 1,
+              sizeId: 10,
+              setIds: '1,8',
+            }),
+          ).toBeUndefined();
+          const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+            undefined,
+            {
+              serial,
+              boardType: 'kilter',
+              layoutId: 1,
+              sizeId: 10,
+              setIds: '1,8',
+              selectedBoardUuid: board.uuid,
+            },
+            authCtx(),
+          );
+          expect(result.board?.boardId).not.toBe(board.id);
+          expect(await serialOf(board.id)).toBeNull();
+          expect(await linkedBoardUuid(serial)).not.toBe(board.uuid);
+        } finally {
+          await db
+            .delete(dbSchema.resourcePrivacy)
+            .where(
+              and(eq(dbSchema.resourcePrivacy.kind, 'board'), eq(dbSchema.resourcePrivacy.resourceId, board.uuid)),
+            );
+        }
+      });
+
+      it('admits an approved account grant despite a private legacy board flag', async () => {
+        const serial = `SELGRANT-${Date.now()}`;
+        const board = await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,8',
+          name: 'Invited Wall',
+          isPublic: false,
+        });
+        await db.insert(dbSchema.resourcePrivacy).values({
+          kind: 'board',
+          resourceId: board.uuid,
+          ownerId: SECOND_USER_ID,
+          audience: 'invite_only',
+        });
+        await db.insert(dbSchema.resourceGrants).values({
+          kind: 'board',
+          resourceId: board.uuid,
+          userId: TEST_USER_ID,
+          status: 'approved',
+        });
+        try {
+          const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+            undefined,
+            {
+              serial,
+              boardType: 'kilter',
+              layoutId: 1,
+              sizeId: 10,
+              setIds: '1,8',
+              selectedBoardUuid: board.uuid,
+            },
+            authCtx(),
+          );
+          expect(result.board?.boardId).toBe(board.id);
+          expect(await linkedBoardUuid(serial)).toBe(board.uuid);
+          expect(await serialOf(board.id)).toBeNull();
+        } finally {
+          await db
+            .delete(dbSchema.resourceGrants)
+            .where(and(eq(dbSchema.resourceGrants.kind, 'board'), eq(dbSchema.resourceGrants.resourceId, board.uuid)));
+          await db
+            .delete(dbSchema.resourcePrivacy)
+            .where(
+              and(eq(dbSchema.resourcePrivacy.kind, 'board'), eq(dbSchema.resourcePrivacy.resourceId, board.uuid)),
+            );
+        }
+      });
+
+      it('remembers the selection after a duplicate serial claim rolls back its savepoint', async () => {
+        const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+        const serial = `SELDUPE-${Date.now()}`;
+        const original = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,8',
+          name: 'Already Bound Wall',
+        });
+        const selected = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,8',
+          name: 'Picked Wall',
+        });
+        const result = await boardPresenceMutations.resolveBoardCandidatesForSerial(
+          undefined,
+          {
+            serial,
+            boardType: 'kilter',
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,8',
+            selectedBoardUuid: selected.uuid,
+          },
+          authCtx(),
+        );
+        expect(result.board?.boardId).toBe(selected.id);
+        expect(await linkedBoardUuid(serial)).toBe(selected.uuid);
+        expect(await serialOf(selected.id)).toBeNull();
+        expect(await serialOf(original.id)).toBe(serial);
+        expect(warnSpy).toHaveBeenCalledWith('[board-presence] serial claim skipped, already bound elsewhere');
+        expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(serial);
+      });
+
+      it('rechecks a gym serial claim committed while the selected connect waits', async () => {
+        const serial = `SELWRITER-${Date.now()}`;
+        const selected = await insertRealUuidBoard({
+          ownerId: TEST_USER_ID,
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,8',
+          name: 'Travelling Template',
+        });
+        const gym = await insertGymListing({
+          serial: null,
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '8,1',
+          name: 'Synced Wall',
+        });
+        const writerReady = createValueBarrier<number>();
+        const releaseWriter = createBarrier();
+        const writer = db.transaction(async (transaction) => {
+          await transaction.execute(sql`SELECT id FROM user_boards WHERE id = ${gym.id} FOR UPDATE`);
+          await lockBoardSerialWrite(transaction, serial);
+          await transaction.execute(sql`UPDATE user_boards SET serial_number = ${serial} WHERE id = ${gym.id}`);
+          const [session] = await transaction.execute(sql`SELECT pg_backend_pid() AS pid`);
+          writerReady.release(Number((session as { pid: number }).pid));
+          await releaseWriter.promise;
+        });
+        handleLater(writer);
+        let connect: ReturnType<typeof boardPresenceMutations.resolveBoardCandidatesForSerial> | undefined;
+        try {
+          const writerPid = await writerReady.promise;
+          connect = boardPresenceMutations.resolveBoardCandidatesForSerial(
+            undefined,
+            {
+              serial,
+              boardType: 'kilter',
+              layoutId: 1,
+              sizeId: 10,
+              setIds: '1,8',
+              advertisedBoardType: 'kilter',
+              selectedBoardUuid: selected.uuid,
+            },
+            authCtx(),
+          );
+          handleLater(connect);
+          await waitForSessionBlockedBy(writerPid);
+          releaseWriter.release();
+          await writer;
+          expect((await connect).board?.boardId).toBe(gym.id);
+          expect(await linkedBoardUuid(serial)).toBe(gym.uuid);
+          expect(await serialOf(selected.id)).toBeNull();
+        } finally {
+          releaseWriter.release();
+          await Promise.allSettled([writer, connect]);
+        }
+      });
+
+      it.each(['mismatched', 'private'] as const)(
+        'skips a locked %s selection without waiting for its row',
+        async (invalidSelection) => {
+          const serial = `SELINVALIDLOCK-${Date.now()}`;
+          const selected = await insertRealUuidBoard({
+            ownerId: SECOND_USER_ID,
+            serial: null,
+            layoutId: invalidSelection === 'mismatched' ? 2 : 1,
+            sizeId: 10,
+            setIds: '1,8',
+            name: 'Invalid Picked Wall',
+            isPublic: invalidSelection !== 'private',
+          });
+          const fallback = await insertRealUuidBoard({
+            ownerId: TEST_USER_ID,
+            serial,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,8',
+            name: 'Connected Wall',
+          });
+          const writerReady = createBarrier();
+          const releaseWriter = createBarrier();
+          const writer = db.transaction(async (transaction) => {
+            await transaction.execute(sql`SELECT id FROM user_boards WHERE id = ${selected.id} FOR UPDATE`);
+            writerReady.release();
+            await releaseWriter.promise;
+          });
+          handleLater(writer);
+          let connect: ReturnType<typeof boardPresenceMutations.resolveBoardCandidatesForSerial> | undefined;
+          try {
+            await writerReady.promise;
+            let resolved: Awaited<ReturnType<typeof boardPresenceMutations.resolveBoardCandidatesForSerial>>;
+            connect = boardPresenceMutations
+              .resolveBoardCandidatesForSerial(
+                undefined,
+                {
+                  serial,
+                  boardType: 'kilter',
+                  layoutId: 1,
+                  sizeId: 10,
+                  setIds: '1,8',
+                  selectedBoardUuid: selected.uuid,
+                },
+                authCtx(),
+              )
+              .then((resolution) => {
+                resolved = resolution;
+                return resolution;
+              });
+            handleLater(connect);
+            // The selected row stays locked until finally; only fallback may be locked.
+            await vi.waitFor(() => expect(resolved?.board?.boardId).toBe(fallback.id), { timeout: 2_000 });
+            expect(await linkedBoardUuid(serial)).toBe(fallback.uuid);
+            expect(await serialOf(selected.id)).toBeNull();
+          } finally {
+            releaseWriter.release();
+            await Promise.allSettled([writer, connect]);
+          }
+        },
+      );
+
+      it.each(['config', 'privacy'] as const)(
+        'rechecks selected-board %s after waiting for its row lock',
+        async (changedSelection) => {
+          const serial = `SELCHANGEDLOCK-${Date.now()}`;
+          const selected = await insertRealUuidBoard({
+            ownerId: SECOND_USER_ID,
+            serial: null,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,8',
+            name: 'Initially Valid Wall',
+          });
+          const fallback = await insertRealUuidBoard({
+            ownerId: TEST_USER_ID,
+            serial,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1,8',
+            name: 'Connected Wall',
+          });
+          const writerReady = createValueBarrier<number>();
+          const releaseWriter = createBarrier();
+          const writer = db.transaction(async (transaction) => {
+            await transaction.execute(sql`SELECT id FROM user_boards WHERE id = ${selected.id} FOR UPDATE`);
+            const [session] = await transaction.execute(sql`SELECT pg_backend_pid() AS pid`);
+            writerReady.release(Number((session as { pid: number }).pid));
+            await releaseWriter.promise;
+            await transaction
+              .update(dbSchema.userBoards)
+              .set(changedSelection === 'config' ? { setIds: '1,2' } : { isPublic: false })
+              .where(eq(dbSchema.userBoards.id, selected.id));
+          });
+          handleLater(writer);
+          let connect: ReturnType<typeof boardPresenceMutations.resolveBoardCandidatesForSerial> | undefined;
+          try {
+            const writerPid = await writerReady.promise;
+            connect = boardPresenceMutations.resolveBoardCandidatesForSerial(
+              undefined,
+              {
+                serial,
+                boardType: 'kilter',
+                layoutId: 1,
+                sizeId: 10,
+                setIds: '1,8',
+                selectedBoardUuid: selected.uuid,
+              },
+              authCtx(),
+            );
+            handleLater(connect);
+            await waitForSessionBlockedBy(writerPid);
+            releaseWriter.release();
+            await writer;
+            expect((await connect).board?.boardId).toBe(fallback.id);
+            expect(await linkedBoardUuid(serial)).toBe(fallback.uuid);
+            expect(await serialOf(selected.id)).toBeNull();
+          } finally {
+            releaseWriter.release();
+            await Promise.allSettled([writer, connect]);
+          }
+        },
+      );
+
+      it('legacy resolveBoardForSerial honours the selection too', async () => {
+        const serial = `SELLEGACY-${Date.now()}`;
+        await insertRealUuidBoard({
+          ownerId: SECOND_USER_ID,
+          serial,
+          layoutId: 3,
+          sizeId: 30,
+          setIds: '7,8',
+          name: 'Clone',
+        });
+        const gymBoard = await insertGymListing({
+          serial: null,
+          layoutId: 3,
+          sizeId: 30,
+          setIds: '7,8',
+          name: 'Gym Listing',
+        });
+
+        const resolved = await boardPresenceMutations.resolveBoardForSerial(
+          undefined,
+          { serial, boardType: 'kilter', layoutId: 3, sizeId: 30, setIds: '7,8', selectedBoardUuid: gymBoard.uuid },
+          authCtx(),
+        );
+        expect(resolved.boardId).toBe(gymBoard.id);
+      });
+
+      describe('claimSerialForBoard', () => {
+        async function boardFor(id: number, uuid: string): Promise<SelectedConnectBoard> {
+          const [row] = await db
+            .select({
+              owner_id: dbSchema.userBoards.ownerId,
+              board_type: dbSchema.userBoards.boardType,
+              layout_id: dbSchema.userBoards.layoutId,
+              size_id: dbSchema.userBoards.sizeId,
+              set_ids: dbSchema.userBoards.setIds,
+              serial_number: dbSchema.userBoards.serialNumber,
+              angle: dbSchema.userBoards.angle,
+              name: dbSchema.userBoards.name,
+              gym_id: dbSchema.userBoards.gymId,
+            })
+            .from(dbSchema.userBoards)
+            .where(eq(dbSchema.userBoards.id, id));
+          const board = row as {
+            owner_id: string;
+            board_type: string;
+            layout_id: number;
+            size_id: number;
+            set_ids: string;
+            serial_number: string | null;
+            angle: number;
+            name: string;
+            gym_id: number | null;
+          };
+          return {
+            id,
+            uuid,
+            ownerId: board.owner_id,
+            name: board.name,
+            boardType: board.board_type,
+            layoutId: Number(board.layout_id),
+            sizeId: Number(board.size_id),
+            setIds: board.set_ids,
+            serialNumber: board.serial_number,
+            angle: Number(board.angle),
+            gymId: board.gym_id === null ? null : Number(board.gym_id),
+          };
+        }
+
+        it('reports the winner’s serial after losing the concurrent-claim race', async () => {
+          const mine = `RACEMINE-${Date.now()}`;
+          const theirs = `RACEWON-${Date.now()}`;
+          const board = await insertRealUuidBoard({
+            ownerId: SYSTEM_OWNER_ID,
+            serial: null,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,7',
+            name: 'Contested Wall',
+          });
+          const stale = await boardFor(board.id, board.uuid);
+
+          // Another connect claimed it between our read and our write. The
+          // `serial_number IS NULL` predicate makes our UPDATE a no-op, and the
+          // re-read is what stops us reporting a serial the board doesn't have.
+          await db
+            .update(dbSchema.userBoards)
+            .set({ serialNumber: theirs })
+            .where(eq(dbSchema.userBoards.id, board.id));
+
+          const claimed = await claimSerialForBoard(stale, mine);
+          expect(claimed.serialNumber).toBe(theirs);
+          expect(await serialOf(board.id)).toBe(theirs);
+        });
+
+        it('stamps the serial and reports it when the claim wins', async () => {
+          const serial = `RACEWIN-${Date.now()}`;
+          const board = await insertRealUuidBoard({
+            ownerId: SYSTEM_OWNER_ID,
+            serial: null,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,8',
+            name: 'Free Wall',
+          });
+
+          const claimed = await claimSerialForBoard(await boardFor(board.id, board.uuid), serial);
+          expect(claimed.serialNumber).toBe(serial);
+          expect(await serialOf(board.id)).toBe(serial);
+        });
+
+        it('rolls back a serial claim with its caller transaction', async () => {
+          const serial = `RACEROLLBACK-${Date.now()}`;
+          const board = await insertRealUuidBoard({
+            ownerId: SYSTEM_OWNER_ID,
+            serial: null,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,8',
+            name: 'Transactional Wall',
+          });
+          const selected = await boardFor(board.id, board.uuid);
+          const rollbackError = new Error('rollback serial claim');
+          await expect(
+            db.transaction(async (transaction) => {
+              expect((await claimSerialForBoard(selected, serial, transaction)).serialNumber).toBe(serial);
+              throw rollbackError;
+            }),
+          ).rejects.toBe(rollbackError);
+          expect(await serialOf(board.id)).toBeNull();
+        });
+
+        it('rereads a losing claim through the caller transaction', async () => {
+          const committedSerial = `RACECOMMITTED-${Date.now()}`;
+          const transactionSerial = `RACEUNCOMMITTED-${Date.now()}`;
+          const attemptedSerial = `RACEATTEMPTED-${Date.now()}`;
+          const board = await insertRealUuidBoard({
+            ownerId: SYSTEM_OWNER_ID,
+            serial: committedSerial,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,8',
+            name: 'Already Claimed Wall',
+          });
+          const selected = await boardFor(board.id, board.uuid);
+          await db.transaction(async (transaction) => {
+            await transaction
+              .update(dbSchema.userBoards)
+              .set({ serialNumber: transactionSerial })
+              .where(eq(dbSchema.userBoards.id, board.id));
+            const claimed = await claimSerialForBoard(selected, attemptedSerial, transaction);
+            expect(claimed.serialNumber).toBe(transactionSerial);
+          });
+          expect(await serialOf(board.id)).toBe(transactionSerial);
+        });
+
+        it('keeps its caller transaction usable after a duplicate serial claim', async () => {
+          const serial = `RACETXDUPE-${Date.now()}`;
+          await insertRealUuidBoard({
+            ownerId: TEST_USER_ID,
+            serial,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,9',
+            name: 'Already Bound',
+          });
+          const board = await insertRealUuidBoard({
+            ownerId: TEST_USER_ID,
+            serial: null,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,10',
+            name: 'Second Wall',
+          });
+          const selected = await boardFor(board.id, board.uuid);
+          await db.transaction(async (transaction) => {
+            const claimed = await claimSerialForBoard(selected, serial, transaction);
+            expect(claimed.serialNumber).toBeNull();
+            const [updated] = await transaction
+              .update(dbSchema.userBoards)
+              .set({ name: 'Still Connected' })
+              .where(eq(dbSchema.userBoards.id, board.id))
+              .returning({ name: dbSchema.userBoards.name });
+            expect(updated.name).toBe('Still Connected');
+          });
+          const [current] = await db
+            .select({ name: dbSchema.userBoards.name, serialNumber: dbSchema.userBoards.serialNumber })
+            .from(dbSchema.userBoards)
+            .where(eq(dbSchema.userBoards.id, board.id));
+          expect(current).toEqual({ name: 'Still Connected', serialNumber: null });
+        });
+
+        it('keeps the board bound when the owner already has that serial elsewhere', async () => {
+          const serial = `RACEDUPE-${Date.now()}`;
+          // The per-owner unique index rejects the stamp; binding must still work.
+          await insertRealUuidBoard({
+            ownerId: TEST_USER_ID,
+            serial,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,9',
+            name: 'Already Bound',
+          });
+          const second = await insertRealUuidBoard({
+            ownerId: TEST_USER_ID,
+            serial: null,
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '2,10',
+            name: 'Second Wall',
+          });
+
+          const claimed = await claimSerialForBoard(await boardFor(second.id, second.uuid), serial);
+          expect(claimed.serialNumber).toBeNull();
+          expect(claimed.id).toBe(second.id);
+          expect(await serialOf(second.id)).toBeNull();
+        });
+      });
+    });
   });
 
   describe('resolveBoardForUuid', () => {
     it('resolves the selected named board and stamps proof-of-presence', async () => {
       const boardUuid = uuidv4();
       const slug = `presence-uuid-${Date.now()}`;
-      await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${boardUuid}, ${slug}, ${TEST_USER_ID}, 'kilter', 4, 12, '1,2', 'Named Wall', null, false)
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: boardUuid,
+        slug: slug,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 4,
+        sizeId: 12,
+        setIds: '1,2',
+        name: 'Named Wall',
+        serialNumber: null,
+        isPublic: false,
+      });
 
       const resolved = await boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid }, authCtx());
 
@@ -871,10 +2253,18 @@ describe('board-presence resolvers', () => {
     it('rejects a private board owned by another user', async () => {
       const boardUuid = uuidv4();
       const slug = `presence-private-${Date.now()}`;
-      await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${boardUuid}, ${slug}, ${SECOND_USER_ID}, 'kilter', 4, 12, '1,2', 'Private Wall', null, false)
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: boardUuid,
+        slug: slug,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 4,
+        sizeId: 12,
+        setIds: '1,2',
+        name: 'Private Wall',
+        serialNumber: null,
+        isPublic: false,
+      });
 
       await expect(boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid }, authCtx())).rejects.toThrow(
         'Board not found',
@@ -885,25 +2275,40 @@ describe('board-presence resolvers', () => {
       const canonicalUuid = uuidv4();
       const loserUuid = uuidv4();
       const suffix = Date.now().toString(36);
-      await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES
-          (${canonicalUuid}, ${`presence-merged-canonical-${suffix}`}, ${SECOND_USER_ID}, 'kilter', 5, 12, '1,2', 'Canonical Wall', null, true)
-      `);
-      await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number,
-           is_public, deleted_at, merged_into_board_uuid)
-        VALUES
-          (${loserUuid}, ${`presence-merged-loser-${suffix}`}, ${TEST_USER_ID}, 'kilter', 5, 12, '1,2', 'Old Wall', null,
-           false, now(), ${canonicalUuid})
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: canonicalUuid,
+        slug: `presence-merged-canonical-${suffix}`,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 5,
+        sizeId: 12,
+        setIds: '1,2',
+        name: 'Canonical Wall',
+        serialNumber: null,
+        isPublic: true,
+      });
+      await db.insert(dbSchema.userBoards).values({
+        uuid: loserUuid,
+        slug: `presence-merged-loser-${suffix}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 5,
+        sizeId: 12,
+        setIds: '1,2',
+        name: 'Old Wall',
+        serialNumber: null,
+        isPublic: false,
+        deletedAt: new Date(),
+        mergedIntoBoardUuid: canonicalUuid,
+      });
 
       const resolved = await boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid: loserUuid }, authCtx());
 
       expect(resolved.boardName).toBe('Canonical Wall');
-      const [canonical] = await db.execute(sql`SELECT id FROM user_boards WHERE uuid = ${canonicalUuid}`);
+      const [canonical] = await db
+        .select({ id: dbSchema.userBoards.id })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.uuid, canonicalUuid));
       expect(resolved.boardId).toBe(Number((canonical as { id: number }).id));
       expect(await pubsub.hasBoardMembership(String(resolved.boardId), TEST_USER_ID)).toBe(true);
     });
@@ -912,20 +2317,32 @@ describe('board-presence resolvers', () => {
       const canonicalUuid = uuidv4();
       const loserUuid = uuidv4();
       const suffix = Date.now().toString(36);
-      await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES
-          (${canonicalUuid}, ${`presence-private-canonical-${suffix}`}, ${SECOND_USER_ID}, 'kilter', 6, 12, '1,2', 'Private Canonical', null, false)
-      `);
-      await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number,
-           is_public, deleted_at, merged_into_board_uuid)
-        VALUES
-          (${loserUuid}, ${`presence-private-loser-${suffix}`}, ${TEST_USER_ID}, 'kilter', 6, 12, '1,2', 'Owned Old Wall', null,
-           true, now(), ${canonicalUuid})
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: canonicalUuid,
+        slug: `presence-private-canonical-${suffix}`,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 6,
+        sizeId: 12,
+        setIds: '1,2',
+        name: 'Private Canonical',
+        serialNumber: null,
+        isPublic: false,
+      });
+      await db.insert(dbSchema.userBoards).values({
+        uuid: loserUuid,
+        slug: `presence-private-loser-${suffix}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 6,
+        sizeId: 12,
+        setIds: '1,2',
+        name: 'Owned Old Wall',
+        serialNumber: null,
+        isPublic: true,
+        deletedAt: new Date(),
+        mergedIntoBoardUuid: canonicalUuid,
+      });
 
       await expect(
         boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid: loserUuid }, authCtx()),
@@ -957,37 +2374,62 @@ describe('board-presence resolvers', () => {
     it('reserves above both the durable event floor and prior reservations without Redis', async () => {
       const boardUuid = uuidv4();
       const slug = `presence-seq-authority-${Date.now()}`;
-      const [inserted] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number,
-           is_public, presence_seq)
-        VALUES (${boardUuid}, ${slug}, ${TEST_USER_ID}, 'kilter', 7, 12, '1,2', 'Sequence Wall', null, false, 25)
-        RETURNING id
-      `);
+      const [inserted] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: boardUuid,
+          slug: slug,
+          ownerId: TEST_USER_ID,
+          boardType: 'kilter',
+          layoutId: 7,
+          sizeId: 12,
+          setIds: '1,2',
+          name: 'Sequence Wall',
+          serialNumber: null,
+          isPublic: false,
+          presenceSeq: 25,
+        })
+        .returning({ id: dbSchema.userBoards.id });
       const boardId = Number((inserted as { id: number }).id);
-      await db.execute(sql`
-        INSERT INTO board_climb_events (board_id, board_type, climb_uuid, angle, seq, confirmed_at)
-        VALUES (${boardId}, 'kilter', ${TEST_CLIMB_UUID}, 40, 40, now())
-      `);
+      await db.insert(dbSchema.boardClimbEvents).values({
+        boardId: boardId,
+        boardType: 'kilter',
+        climbUuid: TEST_CLIMB_UUID,
+        angle: 40,
+        seq: 40,
+        confirmedAt: new Date().toISOString(),
+      });
 
       expect(await allocateBoardPresenceSeq(boardId, 3)).toBe(41);
       expect(await allocateBoardPresenceSeq(boardId, 3)).toBe(42);
 
-      const [row] = await db.execute(sql`SELECT presence_seq FROM user_boards WHERE id = ${boardId}`);
+      const [row] = await db
+        .select({ presence_seq: dbSchema.userBoards.presenceSeq })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.id, boardId));
       expect(Number((row as { presence_seq: number }).presence_seq)).toBe(42);
     });
 
     it('fails closed for a merged-away board', async () => {
       const boardUuid = uuidv4();
       const slug = `presence-seq-deleted-${Date.now()}`;
-      const [inserted] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${boardUuid}, ${slug}, ${TEST_USER_ID}, 'kilter', 8, 12, '1,2', 'Merged Sequence Wall', null, false)
-        RETURNING id
-      `);
+      const [inserted] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: boardUuid,
+          slug: slug,
+          ownerId: TEST_USER_ID,
+          boardType: 'kilter',
+          layoutId: 8,
+          sizeId: 12,
+          setIds: '1,2',
+          name: 'Merged Sequence Wall',
+          serialNumber: null,
+          isPublic: false,
+        })
+        .returning({ id: dbSchema.userBoards.id });
       const boardId = Number((inserted as { id: number }).id);
-      await db.execute(sql`UPDATE user_boards SET deleted_at = now() WHERE id = ${boardId}`);
+      await db.update(dbSchema.userBoards).set({ deletedAt: new Date() }).where(eq(dbSchema.userBoards.id, boardId));
 
       await expect(allocateBoardPresenceSeq(boardId, 1)).rejects.toThrow('Board not found');
     });
@@ -996,20 +2438,36 @@ describe('board-presence resolvers', () => {
       const canonicalUuid = uuidv4();
       const loserUuid = uuidv4();
       const suffix = Date.now().toString(36);
-      const [canonical] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${canonicalUuid}, ${`presence-seq-race-canonical-${suffix}`}, ${TEST_USER_ID},
-                'kilter', 9, 12, '1,2', 'Sequence Survivor', null, false)
-        RETURNING id
-      `);
-      const [loser] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${loserUuid}, ${`presence-seq-race-loser-${suffix}`}, ${SECOND_USER_ID},
-                'kilter', 9, 12, '1,2', 'Sequence Loser', null, false)
-        RETURNING id
-      `);
+      const [canonical] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: canonicalUuid,
+          slug: `presence-seq-race-canonical-${suffix}`,
+          ownerId: TEST_USER_ID,
+          boardType: 'kilter',
+          layoutId: 9,
+          sizeId: 12,
+          setIds: '1,2',
+          name: 'Sequence Survivor',
+          serialNumber: null,
+          isPublic: false,
+        })
+        .returning({ id: dbSchema.userBoards.id });
+      const [loser] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: loserUuid,
+          slug: `presence-seq-race-loser-${suffix}`,
+          ownerId: SECOND_USER_ID,
+          boardType: 'kilter',
+          layoutId: 9,
+          sizeId: 12,
+          setIds: '1,2',
+          name: 'Sequence Loser',
+          serialNumber: null,
+          isPublic: false,
+        })
+        .returning({ id: dbSchema.userBoards.id });
       const canonicalId = Number((canonical as { id: number }).id);
       const loserId = Number((loser as { id: number }).id);
 
@@ -1045,7 +2503,6 @@ describe('board-presence resolvers', () => {
           name: 'Real Catalog Climb',
           grade: 'V5',
           setter: 'setter-bob',
-          confirmedAt: new Date().toISOString(),
         },
         1,
       ).then(
@@ -1061,9 +2518,10 @@ describe('board-presence resolvers', () => {
       expect(persistenceError).toBeInstanceOf(GraphQLError);
       expect((persistenceError as Error).message).toBe('Board not found');
 
-      const [eventCount] = await db.execute(
-        sql`SELECT count(*)::int AS count FROM board_climb_events WHERE board_id = ${loserId}`,
-      );
+      const [eventCount] = await db
+        .select({ count: count() })
+        .from(dbSchema.boardClimbEvents)
+        .where(eq(dbSchema.boardClimbEvents.boardId, loserId));
       expect(Number((eventCount as { count: number }).count)).toBe(0);
     });
   });
@@ -1117,6 +2575,7 @@ describe('board-presence resolvers', () => {
       expect(event.climb.frames).toBe('p1145r12');
       expect(event.climb.setter).toBeNull();
       expect(event.climb.grade).toBe('V6');
+      expect(event.climb.gradeColor).toBe(getGradeColor('V6'));
       expect(event.climb.angle).toBe(45);
       expect(event.climb.seq).toBeGreaterThan(0);
       expect(JSON.stringify(received)).not.toContain('Fake Client Name');
@@ -1174,6 +2633,7 @@ describe('board-presence resolvers', () => {
       expect(climbSet).toBeDefined();
       expect(climbSet!.climb.angle).toBe(-5);
       expect(climbSet!.climb.grade).toBeNull();
+      expect(climbSet!.climb.gradeColor).toBeNull();
       unsubscribe();
     });
 
@@ -1296,6 +2756,7 @@ describe('board-presence resolvers', () => {
       expect(row!.sentByUserId).toBe(TEST_USER_ID);
       expect(row!.sentByDisplayName).toBe(SENDER_DISPLAY_NAME);
       expect(row!.sentByAvatarUrl).toBe(SENDER_AVATAR_URL);
+      expect(row!.gradeColor).toBe(getGradeColor('V6'));
     });
 
     // The connection-holder hand-off broadcast is Redis-only (see the
@@ -1622,22 +3083,30 @@ describe('board-presence resolvers', () => {
 
     async function createOwnConfigBoard(): Promise<number> {
       const slug = `own-config-${Date.now()}`;
-      const [row] = await db.execute(sql`
-        INSERT INTO user_boards (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number)
-        VALUES (${`uuid-${slug}`}, ${slug}, ${TEST_USER_ID}, 'kilter', 1, 10, '1,2', 'Own Config', null)
-        RETURNING id
-      `);
+      const [row] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: `uuid-${slug}`,
+          slug: slug,
+          ownerId: TEST_USER_ID,
+          boardType: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          name: 'Own Config',
+          serialNumber: null,
+        })
+        .returning({ id: dbSchema.userBoards.id });
       return Number((row as { id: number }).id);
     }
 
     async function latestTickBoardId(): Promise<number | null> {
-      const [row] = await db.execute(sql`
-        SELECT board_id
-        FROM boardsesh_ticks
-        WHERE user_id = ${TEST_USER_ID}
-        ORDER BY created_at DESC
-        LIMIT 1
-      `);
+      const [row] = await db
+        .select({ board_id: dbSchema.boardseshTicks.boardId })
+        .from(dbSchema.boardseshTicks)
+        .where(eq(dbSchema.boardseshTicks.userId, TEST_USER_ID))
+        .orderBy(desc(dbSchema.boardseshTicks.createdAt))
+        .limit(1);
       return row ? Number((row as { board_id: number | null }).board_id) : null;
     }
 
@@ -1662,7 +3131,7 @@ describe('board-presence resolvers', () => {
       await tickMutations.saveTick(undefined, { input: baseTickInput({ boardId: 999_999_999 }) }, authCtx());
       expect(await latestTickBoardId()).toBe(ownBoardId);
 
-      await db.execute(sql`DELETE FROM boardsesh_ticks WHERE user_id = ${TEST_USER_ID}`);
+      await db.delete(dbSchema.boardseshTicks).where(eq(dbSchema.boardseshTicks.userId, TEST_USER_ID));
       await tickMutations.saveTick(undefined, { input: baseTickInput({ boardId: tensionBoard.boardId }) }, authCtx());
       expect(await latestTickBoardId()).toBe(ownBoardId);
     });
@@ -1672,21 +3141,35 @@ describe('board-presence resolvers', () => {
       const canonicalUuid = uuidv4();
       const loserUuid = uuidv4();
       const tickUuid = uuidv4();
-      const [canonical] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${canonicalUuid}, ${`tick-uuid-canonical-${suffix}`}, ${TEST_USER_ID},
-                'kilter', 1, 10, '1,2', 'Tick UUID survivor', ${`TICK-UUID-${suffix}`}, true)
-        RETURNING id
-      `);
-      await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number,
-           is_public, deleted_at, merged_into_board_uuid)
-        VALUES (${loserUuid}, ${`tick-uuid-loser-${suffix}`}, ${SECOND_USER_ID},
-                'kilter', 1, 10, '1,2', 'Tick UUID loser', ${`TICK-UUID-${suffix}`},
-                false, now(), ${canonicalUuid})
-      `);
+      const [canonical] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: canonicalUuid,
+          slug: `tick-uuid-canonical-${suffix}`,
+          ownerId: TEST_USER_ID,
+          boardType: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          name: 'Tick UUID survivor',
+          serialNumber: `TICK-UUID-${suffix}`,
+          isPublic: true,
+        })
+        .returning({ id: dbSchema.userBoards.id });
+      await db.insert(dbSchema.userBoards).values({
+        uuid: loserUuid,
+        slug: `tick-uuid-loser-${suffix}`,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+        name: 'Tick UUID loser',
+        serialNumber: `TICK-UUID-${suffix}`,
+        isPublic: false,
+        deletedAt: new Date(),
+        mergedIntoBoardUuid: canonicalUuid,
+      });
       const canonicalId = Number((canonical as { id: number }).id);
 
       const saved = (await tickMutations.saveTick(
@@ -1696,23 +3179,152 @@ describe('board-presence resolvers', () => {
       )) as { boardId: number | null };
 
       expect(saved.boardId).toBe(canonicalId);
-      const [persistedTick] = await db.execute(sql`
-        SELECT board_id FROM boardsesh_ticks WHERE uuid = ${tickUuid}
-      `);
+      const [persistedTick] = await db
+        .select({ board_id: dbSchema.boardseshTicks.boardId })
+        .from(dbSchema.boardseshTicks)
+        .where(eq(dbSchema.boardseshTicks.uuid, tickUuid));
       expect(Number((persistedTick as { board_id: number }).board_id)).toBe(canonicalId);
+    });
+
+    it('logs merged_into_unreadable_survivor when a merge lands on another owner board the climber cannot read', async () => {
+      const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      const canonicalUuid = uuidv4();
+      const loserUuid = uuidv4();
+      const tickUuid = uuidv4();
+      await db.insert(dbSchema.userBoards).values({
+        uuid: canonicalUuid,
+        slug: `tick-unreadable-canonical-${suffix}`,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+        name: 'Tick unreadable survivor',
+        serialNumber: `TICK-UNREADABLE-${suffix}`,
+        isPublic: false,
+      });
+      await db.insert(dbSchema.resourcePrivacy).values({
+        kind: 'board',
+        resourceId: canonicalUuid,
+        ownerId: SECOND_USER_ID,
+        audience: 'invite_only',
+      });
+      await db.insert(dbSchema.userBoards).values({
+        uuid: loserUuid,
+        slug: `tick-unreadable-loser-${suffix}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+        name: 'Tick unreadable loser',
+        serialNumber: `TICK-UNREADABLE-${suffix}`,
+        isPublic: false,
+        deletedAt: new Date(),
+        mergedIntoBoardUuid: canonicalUuid,
+      });
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      try {
+        const saved = (await tickMutations.saveTick(
+          undefined,
+          { input: baseTickInput({ uuid: tickUuid, boardUuid: loserUuid }) },
+          authCtx(),
+        )) as { boardId: number | null };
+
+        expect(saved.boardId).toBeNull();
+        const [persistedTick] = await db
+          .select({ board_id: dbSchema.boardseshTicks.boardId })
+          .from(dbSchema.boardseshTicks)
+          .where(eq(dbSchema.boardseshTicks.uuid, tickUuid));
+        expect((persistedTick as { board_id: number | null }).board_id).toBeNull();
+        expect(warnSpy).toHaveBeenCalledWith(
+          '[saveTick] Board association became unavailable; saving tick without board association',
+          expect.objectContaining({
+            tickUuid,
+            reason: 'merged_into_unreadable_survivor',
+            boardAssociationSource: 'boardUuid',
+          }),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
+    });
+
+    it('logs merged_survivor_does_not_fit when a merge lands on a readable board the climb no longer fits', async () => {
+      const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+      const canonicalUuid = uuidv4();
+      const loserUuid = uuidv4();
+      const tickUuid = uuidv4();
+      await db.insert(dbSchema.userBoards).values({
+        uuid: canonicalUuid,
+        slug: `tick-unfit-canonical-${suffix}`,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 2,
+        sizeId: 10,
+        setIds: '1,2',
+        name: 'Tick unfit survivor',
+        serialNumber: `TICK-UNFIT-${suffix}`,
+        isPublic: true,
+      });
+      await db.insert(dbSchema.userBoards).values({
+        uuid: loserUuid,
+        slug: `tick-unfit-loser-${suffix}`,
+        ownerId: TEST_USER_ID,
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+        name: 'Tick unfit loser',
+        serialNumber: `TICK-UNFIT-${suffix}`,
+        isPublic: false,
+        deletedAt: new Date(),
+        mergedIntoBoardUuid: canonicalUuid,
+      });
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
+      try {
+        const saved = (await tickMutations.saveTick(
+          undefined,
+          { input: baseTickInput({ uuid: tickUuid, boardUuid: loserUuid }) },
+          authCtx(),
+        )) as { boardId: number | null };
+
+        expect(saved.boardId).toBeNull();
+        const [persistedTick] = await db
+          .select({ board_id: dbSchema.boardseshTicks.boardId })
+          .from(dbSchema.boardseshTicks)
+          .where(eq(dbSchema.boardseshTicks.uuid, tickUuid));
+        expect((persistedTick as { board_id: number | null }).board_id).toBeNull();
+        expect(warnSpy).toHaveBeenCalledWith(
+          '[saveTick] Board association became unavailable; saving tick without board association',
+          expect.objectContaining({
+            tickUuid,
+            reason: 'merged_survivor_does_not_fit',
+            boardAssociationSource: 'boardUuid',
+          }),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
 
     it('keeps an ordinary soft-deleted boardUuid unassociated without config fallback or warning', async () => {
       const ownBoardId = await createOwnConfigBoard();
       const staleBoardUuid = uuidv4();
       const tickUuid = uuidv4();
-      await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name,
-           is_public, deleted_at, merged_into_board_uuid)
-        VALUES (${staleBoardUuid}, ${`tick-plain-deleted-${Date.now()}`}, ${SECOND_USER_ID},
-                'kilter', 1, 10, '1,2', 'Plain deleted tick board', false, now(), NULL)
-      `);
+      await db.insert(dbSchema.userBoards).values({
+        uuid: staleBoardUuid,
+        slug: `tick-plain-deleted-${Date.now()}`,
+        ownerId: SECOND_USER_ID,
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+        name: 'Plain deleted tick board',
+        isPublic: false,
+        deletedAt: new Date(),
+        mergedIntoBoardUuid: null,
+      });
       const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => logger);
 
       const saved = (await tickMutations.saveTick(
@@ -1723,9 +3335,10 @@ describe('board-presence resolvers', () => {
 
       expect(saved.boardId).toBeNull();
       expect(saved.boardId).not.toBe(ownBoardId);
-      const [persistedTick] = await db.execute(sql`
-        SELECT board_id FROM boardsesh_ticks WHERE uuid = ${tickUuid}
-      `);
+      const [persistedTick] = await db
+        .select({ board_id: dbSchema.boardseshTicks.boardId })
+        .from(dbSchema.boardseshTicks)
+        .where(eq(dbSchema.boardseshTicks.uuid, tickUuid));
       expect((persistedTick as { board_id: number | null }).board_id).toBeNull();
       expect(warnSpy).not.toHaveBeenCalledWith(
         '[saveTick] Board association became unavailable; saving tick without board association',
@@ -1739,20 +3352,36 @@ describe('board-presence resolvers', () => {
       const canonicalUuid = uuidv4();
       const loserUuid = uuidv4();
       const tickUuid = uuidv4();
-      const [canonical] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${canonicalUuid}, ${`tick-merge-canonical-${suffix}`}, ${TEST_USER_ID},
-                'kilter', 1, 10, '1,2', 'Tick survivor', ${serial}, true)
-        RETURNING id
-      `);
-      const [loser] = await db.execute(sql`
-        INSERT INTO user_boards
-          (uuid, slug, owner_id, board_type, layout_id, size_id, set_ids, name, serial_number, is_public)
-        VALUES (${loserUuid}, ${`tick-merge-loser-${suffix}`}, ${SECOND_USER_ID},
-                'kilter', 1, 10, '1,2', 'Tick loser', ${serial}, true)
-        RETURNING id
-      `);
+      const [canonical] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: canonicalUuid,
+          slug: `tick-merge-canonical-${suffix}`,
+          ownerId: TEST_USER_ID,
+          boardType: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          name: 'Tick survivor',
+          serialNumber: serial,
+          isPublic: true,
+        })
+        .returning({ id: dbSchema.userBoards.id });
+      const [loser] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: loserUuid,
+          slug: `tick-merge-loser-${suffix}`,
+          ownerId: SECOND_USER_ID,
+          boardType: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          name: 'Tick loser',
+          serialNumber: serial,
+          isPublic: true,
+        })
+        .returning({ id: dbSchema.userBoards.id });
       const canonicalId = Number((canonical as { id: number }).id);
       const loserId = Number((loser as { id: number }).id);
       const mergeReady = createValueBarrier<number>();
@@ -1800,9 +3429,10 @@ describe('board-presence resolvers', () => {
         const saved = (await savePromise) as { boardId: number | null };
         expect(saved.boardId).toBe(canonicalId);
 
-        const [lateTick] = await db.execute(sql`
-          SELECT board_id FROM boardsesh_ticks WHERE uuid = ${tickUuid}
-        `);
+        const [lateTick] = await db
+          .select({ board_id: dbSchema.boardseshTicks.boardId })
+          .from(dbSchema.boardseshTicks)
+          .where(eq(dbSchema.boardseshTicks.uuid, tickUuid));
         expect(Number((lateTick as { board_id: number }).board_id)).toBe(canonicalId);
       } finally {
         releaseMerge.release();
@@ -1844,9 +3474,10 @@ describe('board-presence resolvers', () => {
         const saved = (await savePromise) as { boardId: number | null };
         expect(saved.boardId).toBeNull();
 
-        const [persistedTick] = await db.execute(sql`
-          SELECT board_id FROM boardsesh_ticks WHERE uuid = ${tickUuid}
-        `);
+        const [persistedTick] = await db
+          .select({ board_id: dbSchema.boardseshTicks.boardId })
+          .from(dbSchema.boardseshTicks)
+          .where(eq(dbSchema.boardseshTicks.uuid, tickUuid));
         expect((persistedTick as { board_id: number | null }).board_id).toBeNull();
         expect(warnSpy).toHaveBeenCalledWith(
           '[saveTick] Board association became unavailable; saving tick without board association',
@@ -1854,6 +3485,7 @@ describe('board-presence resolvers', () => {
             tickUuid,
             userId: TEST_USER_ID,
             requestedBoardId: boardId,
+            reason: 'canonical_missing',
             boardAssociationSource: 'explicitBoardId',
           }),
         );
@@ -1864,32 +3496,165 @@ describe('board-presence resolvers', () => {
       }
     });
 
-    it('keeps the serial-cluster lock lookup eligible for the active-row partial indexes', async () => {
+    type ExplainPlanNode = {
+      'Relation Name'?: string;
+      Alias?: string;
+      'Index Name'?: string;
+      Filter?: string;
+      'Index Cond'?: string;
+      'Recheck Cond'?: string;
+      Plans?: ExplainPlanNode[];
+    };
+
+    const flattenPlan = (node: ExplainPlanNode): ExplainPlanNode[] => [
+      node,
+      ...(node.Plans ?? []).flatMap(flattenPlan),
+    ];
+
+    // True when every scan of the candidate `active_board` side keeps the
+    // active-row predicate, either through a partial index that requires
+    // `deleted_at IS NULL` (passed in, read from pg_index) or through a
+    // scan-level condition that carries it.
+    const activeBoardScansKeepActiveRowPredicate = (
+      root: ExplainPlanNode,
+      activeRowPartialIndexes: ReadonlySet<string>,
+    ): boolean => {
+      const nodes = flattenPlan(root);
+      const activeBoardScans = nodes.filter(
+        (node) => node['Relation Name'] === 'user_boards' && node.Alias === 'active_board',
+      );
+      if (activeBoardScans.length === 0) return false;
+      return activeBoardScans.every((scan) => {
+        const usesPartialIndex = flattenPlan(scan).some(
+          (node) => node['Index Name'] !== undefined && activeRowPartialIndexes.has(node['Index Name']),
+        );
+        const carriesPredicate = [scan.Filter, scan['Index Cond'], scan['Recheck Cond']].some((condition) =>
+          condition?.includes('deleted_at IS NULL'),
+        );
+        return usesPartialIndex || carriesPredicate;
+      });
+    };
+
+    it('keeps the active-row predicate on the serial-cluster candidate scan', async () => {
       const sharedBoardId = await createSecondUserSharedBoard();
+      // Every partial index on user_boards that implies the active-row
+      // predicate. Read from the catalog so a new or renamed index cannot
+      // leave the allow-list stale.
+      const partialIndexRows = await db.execute(sql`
+        SELECT c.relname AS index_name
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        WHERE i.indrelid = 'user_boards'::regclass
+          AND pg_get_expr(i.indpred, i.indrelid) LIKE '%deleted_at IS NULL%'
+      `);
+      const activeRowPartialIndexes = new Set(
+        (partialIndexRows as unknown as Array<{ index_name: string }>).map((row) => row.index_name),
+      );
+      expect(activeRowPartialIndexes.size).toBeGreaterThan(0);
       const planRows = await db.transaction(async (transaction) => {
         // Tiny test tables naturally favor a sequential scan. Disabling it
-        // makes this a predicate-eligibility assertion: PostgreSQL can only use
-        // a partial index when the production query explicitly preserves that
-        // index's conditions.
+        // keeps the plan on index paths so the active-row predicate shows up.
         await transaction.execute(sql`SET LOCAL enable_seqscan = off`);
-        return transaction.execute(sql`EXPLAIN (FORMAT TEXT, COSTS OFF) ${buildTickBoardLockQuery(sharedBoardId)}`);
+        return transaction.execute(sql`EXPLAIN (FORMAT JSON, COSTS OFF) ${buildTickBoardLockQuery(sharedBoardId)}`);
       });
-      const plan = planRows.map((row) => String((row as { 'QUERY PLAN': string })['QUERY PLAN'])).join('\n');
+      const rawPlan = (planRows[0] as { 'QUERY PLAN': unknown })['QUERY PLAN'];
+      const parsedPlan = (typeof rawPlan === 'string' ? JSON.parse(rawPlan) : rawPlan) as Array<{
+        Plan: ExplainPlanNode;
+      }>;
 
-      // Deliberately NOT pinned to one index name. #4166 added
-      // user_boards_owner_config_idx, and on tables this small the planner picks
-      // between it and user_boards_serial_idx on costs that move with whatever
-      // rows the rest of the suite has inserted — naming one made this flaky.
-      // Every candidate is partial on `deleted_at IS NULL`, so the cluster join
-      // can only reach any of them while the query keeps that condition. Drop it
-      // and the scan falls back to the primary key and this goes red.
+      // Asserts what the query does, not which index the planner picks (#6704).
+      // With seq scans off, a full user_boards_pkey scan with a Filter costs
+      // about the same as a partial-index probe on tables this small, so the
+      // choice flips between runs (#4166 hit the same thing). Either plan keeps
+      // `active_board.deleted_at IS NULL` as a restriction on the candidate
+      // scan. Drop that condition from the query and neither path carries it.
       //
       // The serial nonblank conditions deliberately have no assertion of their
       // own: the same two strings appear in the plan for the `requested_board`
       // side of the join, so a `toContain` on them passes even with the
-      // candidate side's copy removed — it would read like coverage and prove
-      // nothing.
-      expect(plan).toMatch(/Index (Only )?Scan using user_boards_(serial_idx|owner_config_idx|unique_owner_serial)/);
+      // candidate side's copy removed.
+      expect(activeBoardScansKeepActiveRowPredicate(parsedPlan[0].Plan, activeRowPartialIndexes)).toBe(true);
+    });
+
+    it('recognises the active-row predicate in the plan shapes the planner flips between', () => {
+      const activeBoardScan = (fields: ExplainPlanNode): ExplainPlanNode => ({
+        'Relation Name': 'user_boards',
+        Alias: 'active_board',
+        ...fields,
+      });
+      const partialIndexes = new Set([
+        'user_boards_serial_idx',
+        'user_boards_owner_config_idx',
+        'user_boards_owner_owned_idx',
+        'user_boards_public_idx',
+        'user_boards_unique_slug',
+        'user_boards_gym_filter_idx',
+      ]);
+      const underNestedLoop = (scan: ExplainPlanNode): ExplainPlanNode => ({ Plans: [{ Plans: [scan] }] });
+
+      // The plan that failed CI in #6704: full pkey scan carrying a Filter.
+      expect(
+        activeBoardScansKeepActiveRowPredicate(
+          underNestedLoop(
+            activeBoardScan({
+              'Index Name': 'user_boards_pkey',
+              Filter: "((serial_number IS NOT NULL) AND (deleted_at IS NULL) AND (serial_number <> ''::text))",
+            }),
+          ),
+          partialIndexes,
+        ),
+      ).toBe(true);
+      expect(
+        activeBoardScansKeepActiveRowPredicate(
+          underNestedLoop(
+            activeBoardScan({
+              'Index Name': 'user_boards_serial_idx',
+              'Index Cond': '(serial_number = requested_board.serial_number)',
+            }),
+          ),
+          partialIndexes,
+        ),
+      ).toBe(true);
+      expect(
+        activeBoardScansKeepActiveRowPredicate(
+          underNestedLoop(
+            activeBoardScan({
+              Plans: [{ 'Index Name': 'user_boards_owner_config_idx' }],
+            }),
+          ),
+          partialIndexes,
+        ),
+      ).toBe(true);
+      // Partial indexes the planner can pick that imply the predicate: the scan
+      // Filter drops it, which is correct on `active_board`.
+      for (const indexName of ['user_boards_gym_filter_idx', 'user_boards_owner_owned_idx']) {
+        expect(
+          activeBoardScansKeepActiveRowPredicate(
+            underNestedLoop(
+              activeBoardScan({
+                'Index Name': indexName,
+                Filter: "((serial_number IS NOT NULL) AND (serial_number <> ''::text))",
+              }),
+            ),
+            partialIndexes,
+          ),
+        ).toBe(true);
+      }
+      // Predicate dropped: a pkey scan whose Filter lacks deleted_at.
+      expect(
+        activeBoardScansKeepActiveRowPredicate(
+          underNestedLoop(
+            activeBoardScan({
+              'Index Name': 'user_boards_pkey',
+              Filter: "((serial_number IS NOT NULL) AND (serial_number <> ''::text))",
+            }),
+          ),
+          partialIndexes,
+        ),
+      ).toBe(false);
+      expect(
+        activeBoardScansKeepActiveRowPredicate(underNestedLoop({ 'Relation Name': 'climbs' }), partialIndexes),
+      ).toBe(false);
     });
 
     it('pushes a BoardStatsUpdated event that excludes attempts, resolves grades, and equals the cold fetch', async () => {
@@ -1898,12 +3663,23 @@ describe('board-presence resolvers', () => {
       // A second climber's ATTEMPT on a different (never-sent) climb, at a
       // HARDER difficulty. It must count toward distinctClimbersCount but must
       // NOT inflate climbsSentCount or hardestGrade — that's the status FILTER.
-      await db.execute(sql`
-        INSERT INTO boardsesh_ticks
-          (uuid, user_id, board_type, climb_uuid, angle, is_mirror, status, attempt_count, difficulty, is_benchmark, comment, climbed_at, created_at, updated_at, board_id)
-        VALUES
-          (${`presence-attempt-${Date.now()}`}, ${SECOND_USER_ID}, 'kilter', ${OTHER_TEST_CLIMB_UUID}, 40, false, 'attempt', 3, 20, false, '', ${new Date().toISOString()}, now(), now(), ${sharedBoardId})
-      `);
+      await db.insert(dbSchema.boardseshTicks).values({
+        uuid: `presence-attempt-${Date.now()}`,
+        userId: SECOND_USER_ID,
+        boardType: 'kilter',
+        climbUuid: OTHER_TEST_CLIMB_UUID,
+        angle: 40,
+        isMirror: false,
+        status: 'attempt',
+        attemptCount: 3,
+        difficulty: 20,
+        isBenchmark: false,
+        comment: '',
+        climbedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        boardId: sharedBoardId,
+      });
 
       const received: BoardPresenceEvent[] = [];
       const unsubscribe = await pubsub.subscribeBoardPresence(String(sharedBoardId), (event) => received.push(event));
@@ -2033,14 +3809,59 @@ describe('board-presence resolvers', () => {
 
       const oldClimbedAt = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
       const recentClimbedAt = new Date().toISOString();
-      await db.execute(sql`
-        INSERT INTO boardsesh_ticks
-          (uuid, user_id, board_type, climb_uuid, angle, is_mirror, status, attempt_count, difficulty, is_benchmark, comment, climbed_at, created_at, updated_at, board_id)
-        VALUES
-          (${`tick-old-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', ${TEST_CLIMB_UUID}, 40, false, 'send', 1, 17, false, '', ${oldClimbedAt}, now(), now(), ${boardId}),
-          (${`tick-attempt-${Date.now()}`}, ${SECOND_USER_ID}, 'kilter', ${OTHER_TEST_CLIMB_UUID}, 40, false, 'attempt', 2, 18, false, '', ${recentClimbedAt}, now(), now(), ${boardId}),
-          (${`tick-other-board-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', ${OTHER_TEST_CLIMB_UUID}, 40, false, 'send', 1, 18, false, '', ${recentClimbedAt}, now(), now(), ${otherBoard.boardId})
-      `);
+      await db.insert(dbSchema.boardseshTicks).values([
+        {
+          uuid: `tick-old-${Date.now()}`,
+          userId: TEST_USER_ID,
+          boardType: 'kilter',
+          climbUuid: TEST_CLIMB_UUID,
+          angle: 40,
+          isMirror: false,
+          status: 'send',
+          attemptCount: 1,
+          difficulty: 17,
+          isBenchmark: false,
+          comment: '',
+          climbedAt: oldClimbedAt,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          boardId: boardId,
+        },
+        {
+          uuid: `tick-attempt-${Date.now()}`,
+          userId: SECOND_USER_ID,
+          boardType: 'kilter',
+          climbUuid: OTHER_TEST_CLIMB_UUID,
+          angle: 40,
+          isMirror: false,
+          status: 'attempt',
+          attemptCount: 2,
+          difficulty: 18,
+          isBenchmark: false,
+          comment: '',
+          climbedAt: recentClimbedAt,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          boardId: boardId,
+        },
+        {
+          uuid: `tick-other-board-${Date.now()}`,
+          userId: TEST_USER_ID,
+          boardType: 'kilter',
+          climbUuid: OTHER_TEST_CLIMB_UUID,
+          angle: 40,
+          isMirror: false,
+          status: 'send',
+          attemptCount: 1,
+          difficulty: 18,
+          isBenchmark: false,
+          comment: '',
+          climbedAt: recentClimbedAt,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          boardId: otherBoard.boardId,
+        },
+      ]);
 
       const stats = await boardPresenceQueries.boardPresenceStats(undefined, { boardId }, authCtx());
       expect(stats.climbsSentCount).toBe(1);
@@ -2070,13 +3891,42 @@ describe('board-presence resolvers', () => {
 
       const firstHardestClimbedAt = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000).toISOString();
       const laterHardestClimbedAt = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-      await db.execute(sql`
-        INSERT INTO boardsesh_ticks
-          (uuid, user_id, board_type, climb_uuid, angle, is_mirror, status, attempt_count, difficulty, is_benchmark, comment, climbed_at, created_at, updated_at, board_id)
-        VALUES
-          (${`tick-first-hardest-${Date.now()}`}, ${SECOND_USER_ID}, 'kilter', ${OTHER_TEST_CLIMB_UUID}, 40, false, 'send', 1, 18, false, '', ${firstHardestClimbedAt}, now(), now(), ${resolved.boardId}),
-          (${`tick-later-hardest-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', ${TEST_CLIMB_UUID}, 40, false, 'flash', 1, 18, false, '', ${laterHardestClimbedAt}, now(), now(), ${resolved.boardId})
-      `);
+      await db.insert(dbSchema.boardseshTicks).values([
+        {
+          uuid: `tick-first-hardest-${Date.now()}`,
+          userId: SECOND_USER_ID,
+          boardType: 'kilter',
+          climbUuid: OTHER_TEST_CLIMB_UUID,
+          angle: 40,
+          isMirror: false,
+          status: 'send',
+          attemptCount: 1,
+          difficulty: 18,
+          isBenchmark: false,
+          comment: '',
+          climbedAt: firstHardestClimbedAt,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          boardId: resolved.boardId,
+        },
+        {
+          uuid: `tick-later-hardest-${Date.now()}`,
+          userId: TEST_USER_ID,
+          boardType: 'kilter',
+          climbUuid: TEST_CLIMB_UUID,
+          angle: 40,
+          isMirror: false,
+          status: 'flash',
+          attemptCount: 1,
+          difficulty: 18,
+          isBenchmark: false,
+          comment: '',
+          climbedAt: laterHardestClimbedAt,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          boardId: resolved.boardId,
+        },
+      ]);
 
       const stats = await boardPresenceQueries.boardPresenceStats(undefined, { boardId: resolved.boardId }, authCtx());
       expect(stats.hardestGrade).toBe('V6');
@@ -2099,12 +3949,23 @@ describe('board-presence resolvers', () => {
       );
 
       const climbedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-      await db.execute(sql`
-        INSERT INTO boardsesh_ticks
-          (uuid, user_id, board_type, climb_uuid, angle, is_mirror, status, attempt_count, difficulty, is_benchmark, comment, climbed_at, created_at, updated_at, board_id)
-        VALUES
-          (${`tick-alias-hardest-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', ${ALIAS_TEST_CLIMB_UUID}, 40, false, 'send', 1, NULL, false, '', ${climbedAt}, now(), now(), ${resolved.boardId})
-      `);
+      await db.insert(dbSchema.boardseshTicks).values({
+        uuid: `tick-alias-hardest-${Date.now()}`,
+        userId: TEST_USER_ID,
+        boardType: 'kilter',
+        climbUuid: ALIAS_TEST_CLIMB_UUID,
+        angle: 40,
+        isMirror: false,
+        status: 'send',
+        attemptCount: 1,
+        difficulty: null,
+        isBenchmark: false,
+        comment: '',
+        climbedAt: climbedAt,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        boardId: resolved.boardId,
+      });
 
       const stats = await boardPresenceQueries.boardPresenceStats(undefined, { boardId: resolved.boardId }, authCtx());
       expect(stats.climbsSentCount).toBe(1);
@@ -2168,9 +4029,10 @@ describe('board-presence durable history (board_climb_events)', () => {
   }
 
   async function countEvents(boardId: number): Promise<number> {
-    const [row] = await db.execute(
-      sql`SELECT count(*)::int AS count FROM board_climb_events WHERE board_id = ${boardId}`,
-    );
+    const [row] = await db
+      .select({ count: count() })
+      .from(dbSchema.boardClimbEvents)
+      .where(eq(dbSchema.boardClimbEvents.boardId, boardId));
     return Number((row as { count: number }).count);
   }
 
@@ -2238,12 +4100,16 @@ describe('board-presence durable history (board_climb_events)', () => {
     // Five rows at the SAME confirmed_at second with distinct monotonic seq —
     // exactly the case a confirmedAt-only cursor would repeat or skip across
     // pages.
-    const sameTs = '2026-01-01 00:00:00';
+    const sameTs = new Date().toISOString();
     for (const seq of [10, 11, 12, 13, 14]) {
-      await db.execute(
-        sql`INSERT INTO board_climb_events (board_id, board_type, climb_uuid, angle, seq, confirmed_at)
-            VALUES (${boardId}, 'kilter', ${TEST_CLIMB_UUID}, 40, ${seq}, ${sameTs})`,
-      );
+      await db.insert(dbSchema.boardClimbEvents).values({
+        boardId: boardId,
+        boardType: 'kilter',
+        climbUuid: TEST_CLIMB_UUID,
+        angle: 40,
+        seq: seq,
+        confirmedAt: sameTs,
+      });
     }
 
     const page1 = await boardPresenceQueries.boardHistory(undefined, { boardId, limit: 3 }, authCtx());
@@ -2275,13 +4141,51 @@ describe('board-presence durable history (board_climb_events)', () => {
     expect((error as GraphQLError).extensions?.code).toBe('BAD_USER_INPUT');
   });
 
+  it('applies the same seven-day window to legacy sequence pages and recent cached history', async () => {
+    const boardId = await resolveBoardId(`WINDOW-${Date.now()}`);
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-11-24T12:00:00.123Z'));
+    for (const [seq, confirmedAt, source] of [
+      [1, '2026-11-17 12:00:00.123000', 'boardsesh'],
+      [2, '2026-11-17 12:00:00.123001', 'boardsesh'],
+      [3, '2026-11-17 12:00:00.122999', 'boardsesh'],
+      [4, '2026-11-24 11:00:00', 'kilter'],
+      [5, '2026-01-01 12:00:00', 'boardsesh'],
+    ] as const) {
+      await db
+        .insert(dbSchema.boardClimbEvents)
+        .values({ boardId, boardType: 'kilter', climbUuid: TEST_CLIMB_UUID, angle: 40, seq, confirmedAt, source });
+    }
+    const first = await boardPresenceQueries.boardHistory(undefined, { boardId, limit: 1 }, authCtx());
+    expect(first.map((entry) => entry.seq)).toEqual([2]);
+    expect(
+      (await boardPresenceQueries.boardHistory(undefined, { boardId, before: '2' }, authCtx())).map(
+        (entry) => entry.seq,
+      ),
+    ).toEqual([1]);
+    expect(await boardPresenceQueries.boardHistory(undefined, { boardId, before: '1' }, authCtx())).toEqual([]);
+    const recent = { climbUuid: TEST_CLIMB_UUID, seq: 2, sentAt: '2026-11-17T12:00:00.123001Z' };
+    const expired = { ...recent, seq: 3, sentAt: '2026-11-17T12:00:00.122999Z' };
+    vi.spyOn(pubsub, 'getRecentBoardClimbs').mockResolvedValue([expired, recent]);
+    expect(
+      (await boardPresenceQueries.boardRecentClimbs(undefined, { boardId }, authCtx())).map((entry) => entry.seq),
+    ).toEqual([2]);
+    clock.mockReturnValue(Date.parse('2026-11-24T12:00:00.124Z'));
+    expect(await boardPresenceQueries.boardHistory(undefined, { boardId, before: '2' }, authCtx())).toEqual([]);
+    expect(await boardPresenceQueries.boardRecentClimbs(undefined, { boardId }, authCtx())).toEqual([]);
+    expect(await countEvents(boardId)).toBe(5);
+  });
+
   it('treats a whitespace-only cursor as no cursor (first page), never a silently empty page', async () => {
     const boardId = await resolveBoardId(`WS-${Date.now()}`);
     for (const seq of [1, 2]) {
-      await db.execute(
-        sql`INSERT INTO board_climb_events (board_id, board_type, climb_uuid, angle, seq, confirmed_at)
-            VALUES (${boardId}, 'kilter', ${TEST_CLIMB_UUID}, 40, ${seq}, '2026-01-01 00:00:00')`,
-      );
+      await db.insert(dbSchema.boardClimbEvents).values({
+        boardId: boardId,
+        boardType: 'kilter',
+        climbUuid: TEST_CLIMB_UUID,
+        angle: 40,
+        seq: seq,
+        confirmedAt: new Date().toISOString(),
+      });
     }
     // Number(' ') is 0, so without the trim guard this returned an empty page.
     const page = await boardPresenceQueries.boardHistory(undefined, { boardId, before: '   ' }, authCtx());
@@ -2365,6 +4269,116 @@ describe('board-presence connection holder', () => {
       await expect(boardPresenceQueries.boardConnection(undefined, { boardId }, authCtx())).resolves.toBeNull();
     });
 
+    async function makeOtherOwnersBoard(
+      name: string,
+      flags: { isPublic: boolean; isUnlisted?: boolean },
+    ): Promise<{ id: number; uuid: string }> {
+      const slug = `${name.toLowerCase().replace(/[^a-z]+/g, '-')}-${Date.now().toString(36)}-${holderSerialCounter++}`;
+      const [row] = await db
+        .insert(dbSchema.userBoards)
+        .values({
+          uuid: uuidv4(),
+          slug,
+          ownerId: SECOND_USER_ID,
+          boardType: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          name,
+          serialNumber: null,
+          isPublic: flags.isPublic,
+          isUnlisted: flags.isUnlisted ?? false,
+        })
+        .returning({ id: dbSchema.userBoards.id, uuid: dbSchema.userBoards.uuid });
+      return { id: Number(row.id), uuid: row.uuid };
+    }
+
+    /** The audience control's write: a policy row, with the legacy booleans projected from it. */
+    async function chooseAudience(boardUuid: string, audience: 'unlisted' | 'invite_only'): Promise<void> {
+      await db.insert(dbSchema.resourcePrivacy).values({
+        kind: 'board',
+        resourceId: boardUuid,
+        ownerId: SECOND_USER_ID,
+        audience,
+        locationAudience: 'only_me',
+      });
+      await db
+        .update(dbSchema.userBoards)
+        .set({ isPublic: false, isUnlisted: audience === 'unlisted', hideLocation: true })
+        .where(eq(dbSchema.userBoards.uuid, boardUuid));
+    }
+
+    it.each([
+      ['legacy booleans', false],
+      ['current audience control', true],
+    ] as const)(
+      "serves an unlisted board's live feed (%s) only to a caller presenting its uuid, never for the id alone",
+      async (_shape, viaAudienceControl) => {
+        const board = await makeOtherOwnersBoard('Unlisted Wall', { isPublic: true, isUnlisted: true });
+        if (viaAudienceControl) await chooseAudience(board.uuid, 'unlisted');
+        const boardId = board.id;
+
+        // The numeric id is a sequential bigserial: holding it is not holding the link.
+        for (const ctx of [anon(), authCtx()]) {
+          await expect(boardPresenceQueries.boardConnection(undefined, { boardId }, ctx)).rejects.toThrow(
+            'Board not found',
+          );
+          await expect(boardPresenceQueries.boardRecentClimbs(undefined, { boardId }, ctx)).rejects.toThrow(
+            'Board not found',
+          );
+          await expect(
+            boardPresenceSubscriptions.boardNowPlaying.subscribe(undefined, { boardId }, ctx).next(),
+          ).rejects.toThrow('Board not found');
+        }
+
+        // The uuid is the link, and anonymous resolution by it binds the feed.
+        const resolved = await boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid: board.uuid }, anon());
+        expect(resolved.boardId).toBe(boardId);
+        for (const ctx of [anon(), authCtx()]) {
+          await expect(
+            boardPresenceQueries.boardConnection(undefined, { boardId, boardUuid: board.uuid }, ctx),
+          ).resolves.toBeNull();
+          await expect(
+            boardPresenceQueries.boardRecentClimbs(undefined, { boardId, boardUuid: board.uuid }, ctx),
+          ).resolves.toEqual([]);
+        }
+      },
+    );
+
+    it('keeps an invite-only board closed to a signed-in stranger, even with its uuid, and open to a grantee', async () => {
+      const board = await makeOtherOwnersBoard('Invite Wall', { isPublic: false });
+      await chooseAudience(board.uuid, 'invite_only');
+      const boardId = board.id;
+
+      await expect(
+        boardPresenceQueries.boardConnection(undefined, { boardId, boardUuid: board.uuid }, authCtx()),
+      ).rejects.toThrow('Board not found');
+      await expect(
+        boardPresenceMutations.resolveBoardForUuid(undefined, { boardUuid: board.uuid }, authCtx()),
+      ).rejects.toThrow('Board not found');
+
+      await db
+        .insert(dbSchema.resourceGrants)
+        .values({ kind: 'board', resourceId: board.uuid, userId: TEST_USER_ID, status: 'approved' });
+      await expect(boardPresenceQueries.boardConnection(undefined, { boardId }, authCtx())).resolves.toBeNull();
+      const resolved = await boardPresenceMutations.resolveBoardForUuid(
+        undefined,
+        { boardUuid: board.uuid },
+        authCtx(),
+      );
+      expect(resolved.boardId).toBe(boardId);
+    });
+
+    it("keeps a legacy private (only-me) board's live feed from everyone but its owner", async () => {
+      const board = await makeOtherOwnersBoard('Only Me Wall', { isPublic: false });
+      await expect(
+        boardPresenceQueries.boardConnection(undefined, { boardId: board.id, boardUuid: board.uuid }, authCtx()),
+      ).rejects.toThrow('Board not found');
+      await expect(
+        boardPresenceQueries.boardConnection(undefined, { boardId: board.id }, authCtx({ userId: SECOND_USER_ID })),
+      ).resolves.toBeNull();
+    });
+
     it('lets anonymous viewers read a shared system per-config board', async () => {
       const config = { boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2' };
       // A logged-in user creates the shared feed; anon may then read it.
@@ -2391,10 +4405,14 @@ describe('board-presence connection holder', () => {
     it("lets anonymous viewers read a public board's durable history and stats (kiosk path)", async () => {
       // Serial-resolved boards default to isPublic = true.
       const boardId = await makeHolderBoard();
-      await db.execute(
-        sql`INSERT INTO board_climb_events (board_id, board_type, climb_uuid, angle, seq, confirmed_at)
-            VALUES (${boardId}, 'kilter', ${TEST_CLIMB_UUID}, 40, 1, '2026-01-01 00:00:00')`,
-      );
+      await db.insert(dbSchema.boardClimbEvents).values({
+        boardId: boardId,
+        boardType: 'kilter',
+        climbUuid: TEST_CLIMB_UUID,
+        angle: 40,
+        seq: 1,
+        confirmedAt: new Date().toISOString(),
+      });
 
       const history = await boardPresenceQueries.boardHistory(undefined, { boardId }, anon());
       expect(history.map((row) => row.climbUuid)).toEqual([TEST_CLIMB_UUID]);
@@ -2493,13 +4511,42 @@ describe('board-presence connection holder', () => {
       const { boardId, boardUuid } = await makeLeaderboardBoard(true);
       const recentClimbedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
       const staleClimbedAt = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString();
-      await db.execute(sql`
-        INSERT INTO boardsesh_ticks
-          (uuid, user_id, board_type, climb_uuid, angle, is_mirror, status, attempt_count, difficulty, is_benchmark, comment, climbed_at, created_at, updated_at, board_id)
-        VALUES
-          (${`tick-day-recent-${Date.now()}`}, ${TEST_USER_ID}, 'kilter', ${TEST_CLIMB_UUID}, 40, false, 'send', 1, 17, false, '', ${recentClimbedAt}, now(), now(), ${boardId}),
-          (${`tick-day-stale-${Date.now()}`}, ${SECOND_USER_ID}, 'kilter', ${OTHER_TEST_CLIMB_UUID}, 40, false, 'send', 1, 18, false, '', ${staleClimbedAt}, now(), now(), ${boardId})
-      `);
+      await db.insert(dbSchema.boardseshTicks).values([
+        {
+          uuid: `tick-day-recent-${Date.now()}`,
+          userId: TEST_USER_ID,
+          boardType: 'kilter',
+          climbUuid: TEST_CLIMB_UUID,
+          angle: 40,
+          isMirror: false,
+          status: 'send',
+          attemptCount: 1,
+          difficulty: 17,
+          isBenchmark: false,
+          comment: '',
+          climbedAt: recentClimbedAt,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          boardId: boardId,
+        },
+        {
+          uuid: `tick-day-stale-${Date.now()}`,
+          userId: SECOND_USER_ID,
+          boardType: 'kilter',
+          climbUuid: OTHER_TEST_CLIMB_UUID,
+          angle: 40,
+          isMirror: false,
+          status: 'send',
+          attemptCount: 1,
+          difficulty: 18,
+          isBenchmark: false,
+          comment: '',
+          climbedAt: staleClimbedAt,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          boardId: boardId,
+        },
+      ]);
 
       const dayBoard = await socialBoardQueries.boardLeaderboard(
         undefined,
@@ -2710,6 +4757,232 @@ describe('board-presence connection holder', () => {
         await roomManager.removeClient(otherConnectionId);
       }
     });
+
+    describe('reportBoardClear — "Turn off all lights" (#7015)', () => {
+      async function boardLitByHolder(): Promise<number> {
+        const boardId = await makeHolderBoard(authCtx());
+        await boardPresenceMutations.reportBoardClimb(
+          undefined,
+          { boardId, climb: makeQueueItemInput(), angle: 40 },
+          authCtx(),
+        );
+        return boardId;
+      }
+
+      async function collectPresenceEvents(boardId: number): Promise<{
+        events: BoardPresenceEvent[];
+        unsubscribe: () => void;
+      }> {
+        const events: BoardPresenceEvent[] = [];
+        const unsubscribe = await pubsub.subscribeBoardPresence(String(boardId), (event) => {
+          events.push(event);
+        });
+        return { events, unsubscribe };
+      }
+
+      it("tells every viewer the holder's wall went dark, naming the climb, and keeps history and the holder", async () => {
+        if (!redisOn) return;
+        const boardId = await boardLitByHolder();
+        const history = await pubsub.getRecentBoardClimbs(String(boardId));
+        // A set that commits between the clear's seq and its history read is
+        // numbered after the clear; the clear must name the climb below its own seq.
+        vi.spyOn(pubsub, 'getRecentBoardClimbs').mockResolvedValueOnce([
+          { ...history[0], climbUuid: OTHER_TEST_CLIMB_UUID, seq: history[0].seq + 1000 },
+          {
+            ...history[0],
+            climbUuid: OTHER_TEST_CLIMB_UUID,
+            source: 'future-provider',
+          } as unknown as BoardPresenceClimb,
+          { ...history[0], climbUuid: OTHER_TEST_CLIMB_UUID, source: 'aurora', angle: null },
+          { ...history[0], climbUuid: OTHER_TEST_CLIMB_UUID, source: 'kilter' },
+          ...history,
+        ]);
+        const { events, unsubscribe } = await collectPresenceEvents(boardId);
+        try {
+          expect(await boardPresenceMutations.reportBoardClear(undefined, { boardId }, authCtx())).toBe(true);
+          const cleared = events.filter(
+            (event): event is BoardClimbCleared => event.__typename === 'BoardClimbCleared',
+          );
+          expect(cleared).toHaveLength(1);
+          expect(cleared[0].climbUuid).toBe(TEST_CLIMB_UUID);
+          const [lit] = await pubsub.getRecentBoardClimbs(String(boardId));
+          expect(cleared[0].seq).toBeGreaterThan(lit.seq);
+          // History keeps the send, and the phone is still connected.
+          expect(lit.climbUuid).toBe(TEST_CLIMB_UUID);
+          expect(await pubsub.getBoardWriter(String(boardId))).toBe(TEST_USER_ID);
+          expect(events.some((event) => event.__typename === 'BoardConnectionChanged')).toBe(false);
+          // Kept for a week, like the history it masks, not the 12 h membership window.
+          const { publisher } = redisClientManager.getClients();
+          expect(await publisher.ttl(`board:${boardId}:cleared`)).toBeGreaterThan(BOARD_MEMBERSHIP_TTL_MS / 1000);
+        } finally {
+          unsubscribe();
+        }
+      });
+
+      it('refuses a clear from a member while someone else holds the board', async () => {
+        if (!redisOn) return;
+        const boardId = await boardLitByHolder();
+        await pubsub.stampBoardMembership(String(boardId), SECOND_USER_ID);
+        const { events, unsubscribe } = await collectPresenceEvents(boardId);
+        try {
+          expect(
+            await boardPresenceMutations.reportBoardClear(undefined, { boardId }, authCtx({ userId: SECOND_USER_ID })),
+          ).toBe(false);
+          expect(events).toHaveLength(0);
+          expect(await pubsub.getActiveBoardClear(String(boardId))).toBeNull();
+        } finally {
+          unsubscribe();
+        }
+      });
+
+      it('accepts a member clear on a free board (the crash backstop freed it while BLE stayed up)', async () => {
+        if (!redisOn) return;
+        const boardId = await boardLitByHolder();
+        const { publisher } = redisClientManager.getClients();
+        await publisher.del(`board:${boardId}:writer`);
+        expect(await boardPresenceMutations.reportBoardClear(undefined, { boardId }, authCtx())).toBe(true);
+        expect(await pubsub.getActiveBoardClear(String(boardId))).toEqual(
+          expect.objectContaining({ climbUuid: TEST_CLIMB_UUID }),
+        );
+      });
+
+      it('rejects a clear from a caller that never connected to the board', async () => {
+        if (!redisOn) return;
+        const boardId = await boardLitByHolder();
+        await expect(
+          boardPresenceMutations.reportBoardClear(undefined, { boardId }, authCtx({ userId: SECOND_USER_ID })),
+        ).rejects.toThrow('Not connected to this board');
+      });
+
+      it('publishes a fresh set when the same climb is re-lit inside the dedup window', async () => {
+        if (!redisOn) return;
+        const boardId = await boardLitByHolder();
+        await boardPresenceMutations.reportBoardClear(undefined, { boardId }, authCtx());
+        const { events, unsubscribe } = await collectPresenceEvents(boardId);
+        try {
+          await boardPresenceMutations.reportBoardClimb(
+            undefined,
+            { boardId, climb: makeQueueItemInput(), angle: 40 },
+            authCtx(),
+          );
+          expect(events.filter((event) => event.__typename === 'BoardClimbSet')).toHaveLength(1);
+          // The relit climb supersedes the clear for late joiners.
+          expect(await pubsub.getActiveBoardClear(String(boardId))).toBeNull();
+        } finally {
+          unsubscribe();
+        }
+      });
+
+      it('replays the clear to a late subscriber, and stops once a climb is lit again', async () => {
+        if (!redisOn) return;
+        const boardId = await boardLitByHolder();
+        await boardPresenceMutations.reportBoardClear(undefined, { boardId }, authCtx());
+
+        const lateJoiner = boardPresenceSubscriptions.boardNowPlaying.subscribe(undefined, { boardId }, authCtx());
+        const replayed = await lateJoiner.next();
+        expect(replayed.done).toBe(false);
+        const replayedEvent = (replayed.value as { boardNowPlaying: BoardPresenceEvent }).boardNowPlaying;
+        expect(replayedEvent).toEqual(
+          expect.objectContaining({ __typename: 'BoardClimbCleared', climbUuid: TEST_CLIMB_UUID }),
+        );
+        await lateJoiner.return?.(undefined);
+
+        await boardPresenceMutations.reportBoardClimb(
+          undefined,
+          { boardId, climb: makeQueueItemInput({ uuid: OTHER_TEST_CLIMB_UUID }), angle: 40 },
+          authCtx(),
+        );
+        const afterRelight = boardPresenceSubscriptions.boardNowPlaying.subscribe(undefined, { boardId }, authCtx());
+        const firstEvent = afterRelight.next();
+        handleLater(firstEvent);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        // Nothing was replayed: the first event is the next live one.
+        await boardPresenceMutations.reportBoardClimb(
+          undefined,
+          { boardId, climb: makeQueueItemInput(), angle: 40 },
+          authCtx(),
+        );
+        const live = await firstEvent;
+        expect((live.value as { boardNowPlaying: BoardPresenceEvent }).boardNowPlaying.__typename).toBe(
+          'BoardClimbSet',
+        );
+        await afterRelight.return?.(undefined);
+      });
+
+      it('keeps the newer of two racing clears', async () => {
+        if (!redisOn) return;
+        // The store alone: a fresh key, so no earlier run's clear can outrank these seqs.
+        const boardId = `clear-race-${uuidv4()}`;
+        const { publisher } = redisClientManager.getClients();
+        await publisher.set(`board:${boardId}:seq`, 90, 'EX', 60);
+        try {
+          expect(await pubsub.commitBoardClear(boardId, { seq: 90, clearedAt: 'newer', climbUuid: null })).toBe(true);
+          expect(await pubsub.commitBoardClear(boardId, { seq: 80, clearedAt: 'older', climbUuid: null })).toBe(false);
+          expect(await pubsub.getActiveBoardClear(boardId)).toEqual({ seq: 90, clearedAt: 'newer', climbUuid: null });
+        } finally {
+          await publisher.del(`board:${boardId}:seq`, `board:${boardId}:cleared`);
+        }
+      });
+
+      it('treats a clear as stale once the seq counter went back below it', async () => {
+        if (!redisOn) return;
+        const boardId = `clear-stale-${uuidv4()}`;
+        const { publisher } = redisClientManager.getClients();
+        try {
+          await pubsub.commitBoardClear(boardId, { seq: 50, clearedAt: 'cleared', climbUuid: null });
+          // The counter expired first (it is set a few ms earlier) or was reseeded.
+          expect(await pubsub.getActiveBoardClear(boardId)).toBeNull();
+          await publisher.set(`board:${boardId}:seq`, 12, 'EX', 60);
+          expect(await pubsub.getActiveBoardClear(boardId)).toBeNull();
+          await publisher.set(`board:${boardId}:seq`, 50, 'EX', 60);
+          expect(await pubsub.getActiveBoardClear(boardId)).toEqual(expect.objectContaining({ seq: 50 }));
+        } finally {
+          await publisher.del(`board:${boardId}:seq`, `board:${boardId}:cleared`);
+        }
+      });
+
+      it('does not let a set that loses the race to a clear leave its dedup marker behind', async () => {
+        if (!redisOn) return;
+        const boardId = `clear-marker-${uuidv4()}`;
+        const { publisher } = redisClientManager.getClients();
+        const commitSet = (seq: number) =>
+          pubsub.commitBoardClimb({
+            boardId,
+            emitterId: TEST_USER_ID,
+            climb: { climbUuid: TEST_CLIMB_UUID, sentAt: new Date().toISOString(), seq },
+            climbUuid: TEST_CLIMB_UUID,
+            effectiveAngle: 40,
+            mirrored: false,
+            sessionId: null,
+          });
+        try {
+          await pubsub.commitBoardClear(boardId, { seq: 20, clearedAt: 'cleared', climbUuid: null });
+          // A set numbered before the clear, whose pipeline runs after it.
+          await commitSet(19);
+          expect(await publisher.get(`board:${boardId}:lastReport`)).toBeNull();
+          // A set numbered after the clear keeps its retry dedup.
+          await commitSet(21);
+          expect(await publisher.get(`board:${boardId}:lastReport`)).not.toBeNull();
+        } finally {
+          await publisher.del(
+            `board:${boardId}:cleared`,
+            `board:${boardId}:lastReport`,
+            `board:${boardId}:history`,
+            `board:${boardId}:writer`,
+          );
+        }
+      });
+
+      it('hides the discovery preview once the holder turned the lights off', async () => {
+        if (!redisOn) return;
+        const boardId = await boardLitByHolder();
+        expect(await pubsub.getBoardDiscoveryClimb(String(boardId))).toEqual(
+          expect.objectContaining({ uuid: TEST_CLIMB_UUID }),
+        );
+        await boardPresenceMutations.reportBoardClear(undefined, { boardId }, authCtx());
+        expect(await pubsub.getBoardDiscoveryClimb(String(boardId))).toBeNull();
+      });
+    });
   });
 });
 
@@ -2856,9 +5129,10 @@ describe('board-presence write-side idempotency (Redis)', () => {
   }
 
   async function countEvents(boardId: number): Promise<number> {
-    const [row] = await db.execute(
-      sql`SELECT count(*)::int AS count FROM board_climb_events WHERE board_id = ${boardId}`,
-    );
+    const [row] = await db
+      .select({ count: count() })
+      .from(dbSchema.boardClimbEvents)
+      .where(eq(dbSchema.boardClimbEvents.boardId, boardId));
     return Number((row as { count: number }).count);
   }
 
@@ -2942,6 +5216,68 @@ describe('board-presence write-side idempotency (Redis)', () => {
     expect(await testRedis.get(writerKey)).toBe(SECOND_USER_ID);
   });
 
+  it('does not suppress a flip of the same climb, and records the orientation on the presence climb (#5238)', async () => {
+    if (!redisOn || !testRedis) return;
+    const boardId = await makeIdemBoard();
+
+    await boardPresenceMutations.reportBoardClimb(
+      undefined,
+      { boardId, climb: makeQueueItemInput({ mirrored: false }), angle: 40 },
+      authCtx(),
+    );
+    // Same user, climb and angle, inside the 10 s dedup window, but flipped on
+    // the wall. That is a real wall change, not a retry.
+    await boardPresenceMutations.reportBoardClimb(
+      undefined,
+      { boardId, climb: makeQueueItemInput({ mirrored: true }), angle: 40 },
+      authCtx(),
+    );
+    // An exact retry of the flipped send is still a no-op.
+    await boardPresenceMutations.reportBoardClimb(
+      undefined,
+      { boardId, climb: makeQueueItemInput({ mirrored: true }), angle: 40 },
+      authCtx(),
+    );
+
+    const history = await testRedis.lrange(`board:${boardId}:history`, 0, -1);
+    expect(history).toHaveLength(2);
+    const [newest, oldest] = history.map((entry) => JSON.parse(entry) as BoardPresenceClimb);
+    expect(newest.mirrored).toBe(true);
+    expect(oldest.mirrored).toBe(false);
+  });
+
+  it('accepts a flip back to the first orientation inside the dedup window (#5238)', async () => {
+    if (!redisOn || !testRedis) return;
+    const boardId = await makeIdemBoard();
+
+    // Each accepted send overwrites the dedup marker, so flipping back to the
+    // first orientation is compared against the flipped send, not the first one.
+    for (const mirrored of [false, true, false]) {
+      await boardPresenceMutations.reportBoardClimb(
+        undefined,
+        { boardId, climb: makeQueueItemInput({ mirrored }), angle: 40 },
+        authCtx(),
+      );
+    }
+
+    const history = await testRedis.lrange(`board:${boardId}:history`, 0, -1);
+    expect(history.map((entry) => (JSON.parse(entry) as BoardPresenceClimb).mirrored)).toEqual([false, true, false]);
+  });
+
+  it('stores an unknown orientation as null when an older reporter leaves mirrored out', async () => {
+    if (!redisOn || !testRedis) return;
+    const boardId = await makeIdemBoard();
+
+    await boardPresenceMutations.reportBoardClimb(
+      undefined,
+      { boardId, climb: makeQueueItemInput(), angle: 40 },
+      authCtx(),
+    );
+
+    const [entry] = await testRedis.lrange(`board:${boardId}:history`, 0, -1);
+    expect((JSON.parse(entry) as BoardPresenceClimb).mirrored).toBeNull();
+  });
+
   it('re-accepts a retry once the dedup window has expired', async () => {
     if (!redisOn || !testRedis) return;
     const boardId = await makeIdemBoard();
@@ -3005,9 +5341,10 @@ describe('board-presence write-side idempotency (Redis)', () => {
     const history = await testRedis.lrange(`board:${boardId}:history`, 0, -1);
     expect(history).toHaveLength(2);
     expect(await countEvents(boardId)).toBe(2);
-    const [durableRow] = await db.execute(
-      sql`SELECT count(DISTINCT seq)::int AS distinct_seqs FROM board_climb_events WHERE board_id = ${boardId}`,
-    );
+    const [durableRow] = await db
+      .select({ distinct_seqs: countDistinct(dbSchema.boardClimbEvents.seq) })
+      .from(dbSchema.boardClimbEvents)
+      .where(eq(dbSchema.boardClimbEvents.boardId, boardId));
     expect(Number((durableRow as { distinct_seqs: number }).distinct_seqs)).toBe(2);
   });
 });
@@ -3059,7 +5396,11 @@ describe('board-presence seq continuity across dormancy (Redis)', () => {
   }
 
   async function durableSeqs(boardId: number): Promise<number[]> {
-    const rows = await db.execute(sql`SELECT seq FROM board_climb_events WHERE board_id = ${boardId} ORDER BY seq ASC`);
+    const rows = await db
+      .select({ seq: dbSchema.boardClimbEvents.seq })
+      .from(dbSchema.boardClimbEvents)
+      .where(eq(dbSchema.boardClimbEvents.boardId, boardId))
+      .orderBy(asc(dbSchema.boardClimbEvents.seq));
     return rows.map((row) => Number((row as { seq: number }).seq));
   }
 
@@ -3099,6 +5440,18 @@ describe('board-presence seq continuity across dormancy (Redis)', () => {
     const boardId = await makeSeqBoard();
     await testRedis.del(`board:${boardId}:seq`); // no-op: the board never sent, so this key never existed
     expect(await pubsub.nextBoardSeq(String(boardId))).toBe(1);
+  });
+
+  it('keeps reservations monotonic after Redis loss when no climb was persisted', async () => {
+    if (!redisOn || !testRedis) return;
+    const boardId = await makeSeqBoard();
+    const first = await pubsub.nextBoardSeq(String(boardId));
+    const second = await pubsub.nextBoardSeq(String(boardId));
+    expect(second).toBeGreaterThan(first);
+    expect(await durableSeqs(boardId)).toEqual([]);
+
+    await testRedis.del(`board:${boardId}:seq`);
+    expect(await pubsub.nextBoardSeq(String(boardId))).toBeGreaterThan(second);
   });
 
   it('allocates distinct seqs above the durable floor under concurrent reports issued right after a reset', async () => {
@@ -3282,12 +5635,23 @@ describe('board-presence stats cache (Redis)', () => {
   }
 
   async function insertSendTick(boardId: number, climbUuid: string, difficulty: number): Promise<void> {
-    await db.execute(sql`
-      INSERT INTO boardsesh_ticks
-        (uuid, user_id, board_type, climb_uuid, angle, is_mirror, status, attempt_count, difficulty, is_benchmark, comment, climbed_at, created_at, updated_at, board_id)
-      VALUES
-        (${uuidv4()}, ${TEST_USER_ID}, 'kilter', ${climbUuid}, 40, false, 'send', 1, ${difficulty}, false, '', ${new Date().toISOString()}, now(), now(), ${boardId})
-    `);
+    await db.insert(dbSchema.boardseshTicks).values({
+      uuid: uuidv4(),
+      userId: TEST_USER_ID,
+      boardType: 'kilter',
+      climbUuid: climbUuid,
+      angle: 40,
+      isMirror: false,
+      status: 'send',
+      attemptCount: 1,
+      difficulty: difficulty,
+      isBenchmark: false,
+      comment: '',
+      climbedAt: new Date().toISOString(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      boardId: boardId,
+    });
   }
 
   // saveTick's explicit-boardId fast path only attaches boardId when the
@@ -3520,9 +5884,15 @@ describe('board-presence commit degradation', () => {
       climb: { climbUuid: 'climb-degraded', sentAt: new Date().toISOString(), seq: 1 },
       climbUuid: 'climb-degraded',
       effectiveAngle: 40,
+      mirrored: false,
       sessionId: null,
     });
-    expect(result).toEqual({ previousWriter: null, writerSlotOk: false, sessionBindingChanged: false });
+    expect(result).toEqual({
+      previousWriter: null,
+      writerSlotOk: false,
+      sessionBindingChanged: false,
+      sessionBoardChanged: false,
+    });
   });
 
   it('reportBoardClimb publishes the climb but no hand-off when the writer slot did not verifiably execute', async () => {
@@ -3541,6 +5911,7 @@ describe('board-presence commit degradation', () => {
       previousWriter: null,
       writerSlotOk: false,
       sessionBindingChanged: false,
+      sessionBoardChanged: false,
     });
     const publishSpy = vi.spyOn(pubsub, 'publishBoardPresenceEvent');
 

@@ -4,10 +4,274 @@
  */
 
 import { readFileSync } from 'node:fs';
+const gymDirectoryRepairAuditSchema = readFileSync(
+  new URL('../../../db/drizzle/0349_gym_directory_repair_audit.sql', import.meta.url),
+  'utf8',
+);
+const gymDirectoryRepairActorRetentionSchema = readFileSync(
+  new URL('../../../db/drizzle/0350_gym_repair_actor_retention.sql', import.meta.url),
+  'utf8',
+);
+const gymMcpSchema = readFileSync(new URL('../../../db/drizzle/0346_hosted_gym_mcp.sql', import.meta.url), 'utf8');
+const gymMcpReceiptRetentionSchema = readFileSync(
+  new URL('../../../db/drizzle/0347_gym_mcp_receipt_retention.sql', import.meta.url),
+  'utf8',
+);
+const sitemapSummarySchema = readFileSync(
+  new URL('../../../db/drizzle/0203_bouncy_ken_ellis.sql', import.meta.url),
+  'utf8',
+);
+// Notification types are text in this fixture; reuse the generated conversation DDL.
+const feedbackConversationSchema = readFileSync(
+  new URL('../../../db/drizzle/0331_feedback_github_conversations.sql', import.meta.url),
+  'utf8',
+)
+  .split('--> statement-breakpoint')
+  .filter((statement) => !statement.trim().startsWith('ALTER TYPE'))
+  .join('\n');
+const gymReportingSchema = readFileSync(
+  new URL('../../../db/drizzle/0338_gym_reporting_foundation.sql', import.meta.url),
+  'utf8',
+);
+const gymReportingTickTimeBinding = readFileSync(
+  new URL('../../../db/drizzle/0339_gym_reporting_tick_time_binding.sql', import.meta.url),
+  'utf8',
+);
+const gymReportingAliasVenueGuard = readFileSync(
+  new URL('../../../db/drizzle/0340_gym_reporting_alias_venue_guard.sql', import.meta.url),
+  'utf8',
+);
+const gymReachObservationsSchema = readFileSync(
+  new URL('../../../db/drizzle/0342_gym_reach_observations.sql', import.meta.url),
+  'utf8',
+);
+const offlineWriteDeliverySchema = readFileSync(
+  new URL('../../../db/drizzle/0332_offline_write_delivery.sql', import.meta.url),
+  'utf8',
+);
+const boardModerationEventsSchema = readFileSync(
+  new URL('../../../db/drizzle/0333_board_moderation_events.sql', import.meta.url),
+  'utf8',
+).replaceAll('--> statement-breakpoint', '');
+// Notification types are text in this fixture, so the enum additions are skipped.
+const directoryReportsSchema = readFileSync(
+  new URL('../../../db/drizzle/0334_directory_reports.sql', import.meta.url),
+  'utf8',
+)
+  .split('--> statement-breakpoint')
+  .filter((statement) => !statement.trim().startsWith('ALTER TYPE'))
+  .join('\n');
+// Suggested setups on "Set up wrong" reports (migration 0341). Notification
+// types are text in this fixture, so only that enum addition is skipped; the
+// board moderation and resolver role enums are real types here.
+const boardSetupSuggestionsSchema = readFileSync(
+  new URL('../../../db/drizzle/0341_board_setup_suggestions.sql', import.meta.url),
+  'utf8',
+)
+  .split('--> statement-breakpoint')
+  .filter((statement) => !statement.trim().startsWith('ALTER TYPE "public"."notification_type"'))
+  .join('\n');
+
+const partnerSessionHintPrivacySchema = readFileSync(
+  new URL('../../../db/drizzle/0330_session_hint_privacy.sql', import.meta.url),
+  'utf8',
+);
+const partnerSessionSyncSchema = readFileSync(
+  new URL('../../../db/drizzle/0328_partner_session_sync.sql', import.meta.url),
+  'utf8',
+);
+const partnerSessionTriggersSchema = readFileSync(
+  new URL('../../../db/drizzle/0329_partner_session_change_triggers.sql', import.meta.url),
+  'utf8',
+);
+
+const partnerNoticeRetentionSchema = readFileSync(
+  new URL('../../../db/drizzle/0326_partner_notice_retention_7811.sql', import.meta.url),
+  'utf8',
+);
+const partnerReviewSchema = readFileSync(
+  new URL('../../../db/drizzle/0325_partner_review_7811.sql', import.meta.url),
+  'utf8',
+);
+const partnerInitialHistorySchema = readFileSync(
+  new URL('../../../db/drizzle/0324_partner_workout_initial_history.sql', import.meta.url),
+  'utf8',
+);
+const partnerSelfServiceSchema = readFileSync(
+  new URL('../../../db/drizzle/0318_partner_self_service_admin.sql', import.meta.url),
+  'utf8',
+);
+const partnerWorkoutWebhookSchema = readFileSync(
+  new URL('../../../db/drizzle/0319_partner_workouts_webhooks.sql', import.meta.url),
+  'utf8',
+);
+const partnerLifecycleEventsSchema = readFileSync(
+  new URL('../../../db/drizzle/0320_partner_lifecycle_events.sql', import.meta.url),
+  'utf8',
+);
+const partnerWebhookFencesSchema = readFileSync(
+  new URL('../../../db/drizzle/0321_partner_webhook_delivery_fences.sql', import.meta.url),
+  'utf8',
+);
+const partnerEventGenerationsSchema = readFileSync(
+  new URL('../../../db/drizzle/0322_partner_webhook_event_generations.sql', import.meta.url),
+  'utf8',
+);
+const partnerReconcileFairnessSchema = readFileSync(
+  new URL('../../../db/drizzle/0323_partner_webhook_reconcile_fairness.sql', import.meta.url),
+  'utf8',
+);
+// Reuse the existing generated account table and FK for actual social writes.
+const legacyAccountsSchema = readFileSync(
+  new URL('../../../db/drizzle/0016_exotic_valkyrie.sql', import.meta.url),
+  'utf8',
+)
+  .split('--> statement-breakpoint')
+  .filter(
+    (statement) =>
+      statement.trimStart().startsWith('CREATE TABLE IF NOT EXISTS "accounts"') ||
+      statement.includes('ALTER TABLE "accounts" ADD CONSTRAINT'),
+  )
+  .join('\n');
+// Public NextAuth callback proof: reuse legacy generated receipt tables. The
+// namespaced verification-token tombstones intentionally have no users FK.
+const legacyWebSessionSchema = readFileSync(
+  new URL('../../../db/drizzle/0016_exotic_valkyrie.sql', import.meta.url),
+  'utf8',
+)
+  .split('--> statement-breakpoint')
+  .filter(
+    (statement) =>
+      statement.trimStart().startsWith('CREATE TABLE IF NOT EXISTS "sessions"') ||
+      statement.trimStart().startsWith('CREATE TABLE IF NOT EXISTS "verificationTokens"') ||
+      statement.includes('ALTER TABLE "sessions" ADD CONSTRAINT'),
+  )
+  .join('\n');
+const authDenialIndexSchema = readFileSync(
+  new URL('../../../db/drizzle/0309_native_denial_index.sql', import.meta.url),
+  'utf8',
+);
+const authNativeRevocationSchema = readFileSync(
+  new URL('../../../db/drizzle/0308_native_revocation_events.sql', import.meta.url),
+  'utf8',
+);
+const authAuthoritySchema = readFileSync(
+  new URL('../../../db/drizzle/0306_yielding_scrambler.sql', import.meta.url),
+  'utf8',
+);
+const legacyWebSignoutSchema = readFileSync(
+  new URL('../../../db/drizzle/0307_legacy_web_signout.sql', import.meta.url),
+  'utf8',
+);
+const authWriterAuthoritySchema = readFileSync(
+  new URL('../../../db/drizzle/0310_identity_writer_authority.sql', import.meta.url),
+  'utf8',
+);
+const authCurrentStoreFoundationSchema = readFileSync(
+  new URL('../../../db/drizzle/0291_auth_current_store_foundation.sql', import.meta.url),
+  'utf8',
+);
+const authUidVerificationSchema = readFileSync(
+  new URL('../../../db/drizzle/0292_auth_uid_email_verification.sql', import.meta.url),
+  'utf8',
+);
+const authUidPasswordRecoverySchema = readFileSync(
+  new URL('../../../db/drizzle/0293_auth_uid_password_recovery.sql', import.meta.url),
+  'utf8',
+);
+// Per-account password guess windows (#7656), straight from the generated migration.
+const authPasswordGuessWindowsSchema = readFileSync(
+  new URL('../../../db/drizzle/0327_password_guess_windows.sql', import.meta.url),
+  'utf8',
+);
+const authWebOAuthIdentitySchema = readFileSync(
+  new URL('../../../db/drizzle/0294_auth_web_oauth_identity.sql', import.meta.url),
+  'utf8',
+);
+// The tables behind partner OAuth, straight from the generated migration.
+const partnerOAuthSchema = readFileSync(
+  new URL('../../../db/drizzle/0296_partner_oauth_schema.sql', import.meta.url),
+  'utf8',
+);
+// The logbook change feed, straight from the migrations so the tests run the
+// triggers production runs. They are applied at the schema tail: the triggers
+// need boardsesh_ticks and board_climb_aliases to exist.
+const logbookChangesSchema = readFileSync(
+  new URL('../../../db/drizzle/0297_logbook_changes.sql', import.meta.url),
+  'utf8',
+);
+const logbookChangeTriggersSchema = readFileSync(
+  new URL('../../../db/drizzle/0298_logbook_change_triggers.sql', import.meta.url),
+  'utf8',
+);
+const logbookSnapshotsSchema = readFileSync(
+  new URL('../../../db/drizzle/0299_logbook_snapshots.sql', import.meta.url),
+  'utf8',
+);
+// The password-write trigger that ends partner connections, straight from the migration.
+const partnerRevocationTriggerSchema = readFileSync(
+  new URL('../../../db/drizzle/0300_partner_revocation_trigger.sql', import.meta.url),
+  'utf8',
+);
+// Binds snapshots to their partner connection; needs both tables above.
+const logbookSnapshotsConnectionSchema = readFileSync(
+  new URL('../../../db/drizzle/0301_logbook_snapshots_connection_fk.sql', import.meta.url),
+  'utf8',
+);
+// The publisher an app names at registration ("Made by"), with the migration's lock guard.
+const partnerPublisherNameSchema = readFileSync(
+  new URL('../../../db/drizzle/0302_oauth_app_publisher_name.sql', import.meta.url),
+  'utf8',
+);
+// BA-04 PR 1: credential stamps on auth_subject_cutoffs and mobile_refresh_tokens.
+const stampNewCredentialsSchema = readFileSync(
+  new URL('../../../db/drizzle/0303_stamp_new_credentials.sql', import.meta.url),
+  'utf8',
+);
+const sharedSprayDraftsSchema = readFileSync(
+  new URL('../../../db/drizzle/0285_shared_spray_drafts.sql', import.meta.url),
+  'utf8',
+);
+const climbMutationReceiptsSchema = readFileSync(
+  new URL('../../../db/drizzle/0287_climb_mutation_receipts.sql', import.meta.url),
+  'utf8',
+);
+// The circuits a climber deleted in Boardsesh (#7240), straight from the
+// generated migration. The provider sync grant list names it, and the migrator
+// refuses to grant on a table that does not exist.
+const deletedUpstreamPlaylistsSchema = readFileSync(
+  new URL('../../../db/drizzle/0288_user_deleted_upstream_playlists.sql', import.meta.url),
+  'utf8',
+);
+import { socialEntityTypeEnum } from '@boardsesh/db/schema';
+
+const socialEntityTypeLabels = socialEntityTypeEnum.enumValues.map((entityType) => `'${entityType}'`).join(', ');
+
+// Install the real wall deletion triggers so resolver tests exercise offline
+// tombstones as well as the row's deleted_at flag. Install at the schema tail
+// after all referenced tables exist; trigger installation has no DDL ordering dependency.
+const sprayWallDeletionSchema = readFileSync(
+  new URL('../../../db/drizzle/0228_spray_walls_sync_deletions.sql', import.meta.url),
+  'utf8',
+);
 
 // Exercise the generated migration instead of maintaining a second detection schema.
+const notificationDeviceSchema = readFileSync(
+  new URL('../../../db/drizzle/0259_lumpy_cerise.sql', import.meta.url),
+  'utf8',
+)
+  .split('--> statement-breakpoint')
+  .filter((statement) => !statement.trim().startsWith('ALTER TYPE'))
+  .join('\n');
+// Notification types are text in this fixture; use the generated table/FK DDL.
 const detectionSchema = readFileSync(
   new URL('../../../db/drizzle/0234_shallow_the_phantom.sql', import.meta.url),
+  'utf8',
+);
+// SW-20 (#5471) training-data columns and the review table. After the detection
+// schema: `spray_wall_holds.origin_detection_id` references it.
+const sprayTrainingSchema = readFileSync(
+  new URL('../../../db/drizzle/0278_spray_training_data.sql', import.meta.url),
   'utf8',
 );
 const placesSchema = readFileSync(new URL('../../../db/drizzle/0235_places_search.sql', import.meta.url), 'utf8');
@@ -23,22 +287,102 @@ const climbPopularitySchema = readFileSync(
   new URL('../../../db/drizzle/0242_climb_popularity.sql', import.meta.url),
   'utf8',
 );
+const playlistGradeSummariesSchema = readFileSync(
+  new URL('../../../db/drizzle/0264_playlist_grade_summaries.sql', import.meta.url),
+  'utf8',
+);
 const climbStatsRecomputePendingSchema = readFileSync(
   new URL('../../../db/drizzle/0246_climb_stats_recompute_pending.sql', import.meta.url),
+  'utf8',
+);
+const climbRevisionsSchema = readFileSync(
+  new URL('../../../db/drizzle/0251_climb_revisions.sql', import.meta.url),
   'utf8',
 );
 const providerSyncControlsSchema = readFileSync(
   new URL('../../../db/drizzle/0244_provider_sync_controls.sql', import.meta.url),
   'utf8',
 );
+// The account consent log and the first-party active-user table, straight from
+// the generated migration so the fixture can't drift from the CHECK constraints
+// the resolvers rely on.
+const analyticsConsentSchema = readFileSync(
+  new URL('../../../db/drizzle/0262_analytics_consent_and_user_activity.sql', import.meta.url),
+  'utf8',
+);
+
+const sessionBoardsSchema = readFileSync(
+  new URL('../../../db/drizzle/0055_enhanced-sessions.sql', import.meta.url),
+  'utf8',
+)
+  .split('--> statement-breakpoint')
+  .filter((statement) => statement.includes('"session_boards"'))
+  .join('\n');
+const privacySchema = readFileSync(
+  new URL('../../../db/drizzle/0261_account_resource_privacy.sql', import.meta.url),
+  'utf8',
+);
+// Contract step of #6376: the CHECK without 'climb', applied after 0261 so the
+// test database rejects a climb policy exactly as production does.
+const narrowedPrivacyTypeCheck = readFileSync(
+  new URL('../../../db/drizzle/0282_narrow_content_privacy_type_check.sql', import.meta.url),
+  'utf8',
+);
+const anonymousOnForeignBoardsSchema = readFileSync(
+  new URL('../../../db/drizzle/0266_anonymous_on_foreign_boards.sql', import.meta.url),
+  'utf8',
+);
+// A home board's share link; straight from the generated migration, installed
+// after user_boards so its foreign key and partial unique index match production.
+const boardShareLinksSchema = readFileSync(
+  new URL('../../../db/drizzle/0267_board_share_links.sql', import.meta.url),
+  'utf8',
+);
+// A spray wall's LED setup, straight from the generated migration, after user_boards.
+const sprayWallLedSetupsSchema = readFileSync(
+  new URL('../../../db/drizzle/0304_spray_wall_led_setups.sql', import.meta.url),
+  'utf8',
+);
+// Its shared brightness and auto-off, from the migration that added them.
+const sprayWallLedBrightnessSchema = readFileSync(
+  new URL('../../../db/drizzle/0317_spray_wall_led_brightness.sql', import.meta.url),
+  'utf8',
+);
+// The workout a climber followed in a session (#6903), straight from the
+// generated migration, after board_sessions and users.
+const sessionWorkoutsSchema = readFileSync(
+  new URL('../../../db/drizzle/0284_session_workouts.sql', import.meta.url),
+  'utf8',
+);
+
+const gymInventorySchema = readFileSync(
+  new URL('../../../db/drizzle/0343_gym_grade_inventory.sql', import.meta.url),
+  'utf8',
+);
+const sprayExposureSchema = readFileSync(
+  new URL('../../../db/drizzle/0344_observe_spray_inventory.sql', import.meta.url),
+  'utf8',
+);
 
 export const schemaSQL = `
+  DROP TABLE IF EXISTS logbook_snapshot_session_chunks;
+  DROP TABLE IF EXISTS logbook_session_changes;
+  DROP TABLE IF EXISTS "climb_mutation_receipts" CASCADE;
+  DROP TABLE IF EXISTS "offline_write_deliveries" CASCADE;
+  DROP TABLE IF EXISTS "spray_wall_led_setups" CASCADE;
+  DROP TABLE IF EXISTS "user_deleted_upstream_playlists" CASCADE;
+  DROP TYPE IF EXISTS "upstream_playlist_source";
+  DROP TABLE IF EXISTS board_share_links, resource_grants, resource_privacy, content_privacy, user_follow_requests, session_boards CASCADE;
   DROP TABLE IF EXISTS "board_session_queues" CASCADE;
   DROP TABLE IF EXISTS "session_health_kit_workouts" CASCADE;
+  DROP TABLE IF EXISTS "session_workouts" CASCADE;
   DROP TABLE IF EXISTS "board_session_participants" CASCADE;
   DROP TABLE IF EXISTS "board_sessions" CASCADE;
   DROP TABLE IF EXISTS "user_climb_percentiles" CASCADE;
   DROP TABLE IF EXISTS "user_credentials" CASCADE;
+  DROP TABLE IF EXISTS "accounts" CASCADE;
+  DROP TABLE IF EXISTS "sessions";
+  DROP TABLE IF EXISTS "verificationTokens";
   DROP TABLE IF EXISTS "users" CASCADE;
 
   CREATE TABLE IF NOT EXISTS "users" (
@@ -50,6 +394,9 @@ export const schemaSQL = `
     "created_at" timestamp DEFAULT now() NOT NULL,
     "updated_at" timestamp DEFAULT now() NOT NULL
   );
+
+  ${legacyAccountsSchema}
+  ${legacyWebSessionSchema}
 
   CREATE TABLE IF NOT EXISTS "user_credentials" (
     "user_id" text PRIMARY KEY NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
@@ -239,12 +586,16 @@ export const schemaSQL = `
     "hold_fingerprint" text,
     "characteristics" text[],
     "missing_hold_count" integer,
+    "retired_by_reset" boolean,
+    "revision_number" integer DEFAULT 1 NOT NULL,
+    "holds_revision_number" integer DEFAULT 1 NOT NULL,
     "updated_at" timestamp DEFAULT now() NOT NULL,
     "sync_seq" bigserial NOT NULL
   );
 
   CREATE INDEX IF NOT EXISTS "board_climbs_hold_fingerprint_idx" ON "board_climbs" ("board_type", "layout_id", "hold_fingerprint");
-  CREATE INDEX IF NOT EXISTS "board_climbs_characteristics_idx" ON "board_climbs" USING gin ("characteristics");
+  -- Migration 0253: the climbs whose holds an edit has moved (#6023).
+  CREATE INDEX IF NOT EXISTS "board_climbs_holds_moved_idx" ON "board_climbs" ("board_type", "uuid", "holds_revision_number") WHERE "holds_revision_number" > 1;
 
   CREATE TABLE IF NOT EXISTS "board_climb_aliases" (
     "board_type" text NOT NULL,
@@ -303,6 +654,13 @@ export const schemaSQL = `
   -- CREATE TABLE block never lands on a worker DB that already exists. Backfill
   -- it here so tick_graded_at is present everywhere.
   ALTER TABLE "board_climb_stats" ADD COLUMN IF NOT EXISTS "tick_graded_at" timestamp;
+
+  ALTER TABLE "board_climb_stats" ADD COLUMN IF NOT EXISTS "play_count" bigint DEFAULT 0 NOT NULL;
+  DO $$ BEGIN
+    ALTER TABLE "board_climb_stats" ADD CONSTRAINT "board_climb_stats_play_count_nonnegative" CHECK (play_count >= 0);
+  EXCEPTION WHEN duplicate_object THEN NULL;
+  END $$;
+  CREATE INDEX IF NOT EXISTS board_climb_stats_positive_play_count_idx ON board_climb_stats (board_type,climb_uuid,angle) WHERE play_count>0;
 
   CREATE TABLE IF NOT EXISTS "board_climb_grades" (
     "board_type" text NOT NULL,
@@ -417,6 +775,13 @@ export const schemaSQL = `
   EXCEPTION WHEN duplicate_object THEN NULL;
   END $$;
 
+  -- Aurora's claim UPDATE casts to the production enum. A text-only fixture
+  -- hid that write path until the interrupted-import claim regressions.
+  DO $$ BEGIN
+    CREATE TYPE aurora_table_type AS ENUM ('ascents', 'bids');
+  EXCEPTION WHEN duplicate_object THEN NULL;
+  END $$;
+
   DROP TABLE IF EXISTS "boardsesh_ticks" CASCADE;
   CREATE TABLE IF NOT EXISTS "boardsesh_ticks" (
     "id" bigserial PRIMARY KEY NOT NULL,
@@ -424,6 +789,7 @@ export const schemaSQL = `
     "user_id" text NOT NULL,
     "board_type" text NOT NULL,
     "climb_uuid" text NOT NULL,
+    "climb_revision" integer,
     "angle" integer NOT NULL,
     "is_mirror" boolean DEFAULT false,
     "origin" tick_origin NOT NULL DEFAULT 'native',
@@ -438,7 +804,7 @@ export const schemaSQL = `
     "updated_at" timestamp DEFAULT now() NOT NULL,
     "session_id" text,
     "board_id" bigint,
-    "aurora_type" text,
+    "aurora_type" aurora_table_type,
     "aurora_id" text,
     "aurora_synced_at" timestamp,
     "aurora_sync_error" text,
@@ -452,6 +818,7 @@ export const schemaSQL = `
   -- JSON-import upserts (ON CONFLICT (aurora_id) / (kilter_id)) resolve an
   -- arbiter index. Postgres allows many NULLs under a unique index, so pending
   -- (unsynced) ticks are unaffected.
+  CREATE INDEX IF NOT EXISTS "boardsesh_ticks_board_climbed_at_idx" ON "boardsesh_ticks" ("board_id", "climbed_at");
   CREATE UNIQUE INDEX IF NOT EXISTS "boardsesh_ticks_aurora_id_unique" ON "boardsesh_ticks" ("aurora_id");
   CREATE UNIQUE INDEX IF NOT EXISTS "boardsesh_ticks_kilter_id_unique" ON "boardsesh_ticks" ("kilter_id");
 
@@ -823,6 +1190,7 @@ export const schemaSQL = `
     "latitude" double precision,
     "longitude" double precision,
     "is_public" boolean DEFAULT true NOT NULL,
+    "is_listed" boolean DEFAULT true NOT NULL,
     "description" text,
     "hours" text,
     "hours_updated_at" timestamp,
@@ -844,6 +1212,7 @@ export const schemaSQL = `
   -- above never lands on a DB that already exists. Backfill it here.
   ALTER TABLE "gyms" ADD COLUMN IF NOT EXISTS "hours" text;
   ALTER TABLE "gyms" ADD COLUMN IF NOT EXISTS "hours_updated_at" timestamp;
+  ALTER TABLE "gyms" ADD COLUMN IF NOT EXISTS "is_listed" boolean DEFAULT true NOT NULL;
 
   DROP TABLE IF EXISTS "user_boards" CASCADE;
   CREATE TABLE IF NOT EXISTS "user_boards" (
@@ -867,6 +1236,7 @@ export const schemaSQL = `
     "angle" bigint DEFAULT 40 NOT NULL,
     "is_angle_adjustable" boolean DEFAULT true NOT NULL,
     "has_leds" boolean DEFAULT true NOT NULL,
+    "lit_by_wall_device" boolean DEFAULT false NOT NULL,
     "created_at" timestamp DEFAULT now() NOT NULL,
     "updated_at" timestamp DEFAULT now() NOT NULL,
     "serial_number" text,
@@ -952,6 +1322,18 @@ export const schemaSQL = `
   );
   CREATE UNIQUE INDEX IF NOT EXISTS "board_follows_unique_user_board" ON "board_follows" ("user_id", "board_uuid");
 
+  -- "Tell me about new climbs on this layout" (migration 0050). A spray reset
+  -- carries these from the archived wall's layout to its successor's.
+  CREATE TABLE IF NOT EXISTS "new_climb_subscriptions" (
+    "id" bigserial PRIMARY KEY NOT NULL,
+    "user_id" text NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
+    "board_type" text NOT NULL,
+    "layout_id" integer NOT NULL,
+    "created_at" timestamp DEFAULT now() NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS "new_climb_subscriptions_unique_user_board_layout"
+    ON "new_climb_subscriptions" ("user_id", "board_type", "layout_id");
+
   -- Auto-recorded serial→config rows + the user's remembered board choice for a
   -- serial (board_uuid). Resolver reads this to skip the disambiguation prompt.
   CREATE TABLE IF NOT EXISTS "user_board_serials" (
@@ -987,7 +1369,7 @@ export const schemaSQL = `
     "external_occurrence_key" text,
     "external_display_name" text,
     "climb_uuid" text NOT NULL,
-    "angle" integer NOT NULL,
+    "angle" integer,
     "user_id" text REFERENCES "users"("id") ON DELETE SET NULL,
     "session_id" text REFERENCES "board_sessions"("id") ON DELETE SET NULL,
     "seq" bigint NOT NULL,
@@ -998,10 +1380,16 @@ export const schemaSQL = `
     "confirmed_at" timestamp NOT NULL,
     "created_at" timestamp DEFAULT now() NOT NULL
   );
-  CREATE INDEX IF NOT EXISTS "board_climb_events_board_confirmed_at_idx" ON "board_climb_events" ("board_id", "confirmed_at");
   CREATE UNIQUE INDEX IF NOT EXISTS "board_climb_events_board_seq_unique" ON "board_climb_events" ("board_id", "seq");
   CREATE INDEX IF NOT EXISTS "board_climb_events_session_idx" ON "board_climb_events" ("session_id");
-  CREATE INDEX IF NOT EXISTS "board_climb_events_board_climb_idx" ON "board_climb_events" ("board_id", "climb_uuid");
+  DROP TABLE IF EXISTS "kilter_aurora_benchmarks";
+CREATE TABLE "kilter_aurora_benchmarks" (
+	"climb_uuid" text NOT NULL,
+	"angle" integer NOT NULL,
+	"benchmark_difficulty" double precision NOT NULL,
+	"captured_at" timestamp DEFAULT now() NOT NULL,
+	CONSTRAINT "kilter_aurora_benchmarks_climb_uuid_angle_pk" PRIMARY KEY("climb_uuid","angle")
+);
   DROP TABLE IF EXISTS "kilter_wall_sources";
 CREATE TABLE "kilter_wall_sources" (
 	"source_key" text PRIMARY KEY NOT NULL,
@@ -1018,6 +1406,24 @@ CREATE TABLE "kilter_wall_sources" (
 
 ALTER TABLE "kilter_wall_sources" ADD CONSTRAINT "kilter_wall_sources_source_board_uuid_user_boards_uuid_fk" FOREIGN KEY ("source_board_uuid") REFERENCES "public"."user_boards"("uuid") ON DELETE cascade ON UPDATE no action;
 CREATE INDEX "kilter_wall_sources_board_idx" ON "kilter_wall_sources" USING btree ("source_board_uuid");
+DROP TABLE IF EXISTS "aurora_wall_sources";
+CREATE TABLE "aurora_wall_sources" (
+  "source_key" text PRIMARY KEY,
+  "source_board_uuid" text REFERENCES "user_boards"("uuid") ON DELETE CASCADE,
+  "board_type" text NOT NULL,
+  "gym_user_id" integer NOT NULL,
+  "wall_uuid" text NOT NULL,
+  "serial_number" text NOT NULL,
+  "layout_id" integer NOT NULL,
+  "size_id" integer NOT NULL,
+  "set_ids" text NOT NULL,
+  "is_listed" boolean NOT NULL DEFAULT true,
+  "updated_at" timestamp NOT NULL DEFAULT now()
+);
+CREATE INDEX "aurora_wall_sources_board_idx" ON "aurora_wall_sources"("source_board_uuid");
+CREATE INDEX "aurora_wall_sources_serial_idx" ON "aurora_wall_sources"("board_type", "serial_number");
+CREATE INDEX "aurora_wall_sources_gym_idx" ON "aurora_wall_sources"("board_type", "gym_user_id");
+
 CREATE UNIQUE INDEX "board_climb_events_external_occurrence_unique" ON "board_climb_events" USING btree ("source","external_occurrence_key");
 CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USING btree ("board_id","confirmed_at","seq");
 
@@ -1057,12 +1463,15 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   );
   CREATE UNIQUE INDEX IF NOT EXISTS "unique_integration_export" ON "integration_exports" ("provider","user_id","session_type","session_id");
 
-  -- Social tables the session-grouped feed LEFT-joins for vote/comment counts.
-  -- entity_type is a text column here (the real schema uses an enum); the feed
-  -- only does string-equality filters on it, so text is behavior-equivalent.
+  -- Match production: enum/text comparisons and recursive UNIONs have different
+  -- PostgreSQL typing rules, so plain text here hides real query failures.
+  DO $$ BEGIN
+    CREATE TYPE social_entity_type AS ENUM (${socialEntityTypeLabels});
+  EXCEPTION WHEN duplicate_object THEN NULL;
+  END $$;
   DROP TABLE IF EXISTS "vote_counts" CASCADE;
   CREATE TABLE IF NOT EXISTS "vote_counts" (
-    "entity_type" text NOT NULL,
+    "entity_type" social_entity_type NOT NULL,
     "entity_id" text NOT NULL,
     "upvotes" integer DEFAULT 0 NOT NULL,
     "downvotes" integer DEFAULT 0 NOT NULL,
@@ -1077,23 +1486,23 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "id" bigserial PRIMARY KEY NOT NULL,
     "uuid" text NOT NULL UNIQUE,
     "user_id" text NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
-    "entity_type" text NOT NULL,
+    "entity_type" social_entity_type NOT NULL,
     "entity_id" text NOT NULL,
     "parent_comment_id" bigint,
     "body" text NOT NULL,
+    "release_context" jsonb,
     "created_at" timestamp DEFAULT now() NOT NULL,
     "updated_at" timestamp DEFAULT now() NOT NULL,
     "deleted_at" timestamp
   );
   CREATE INDEX IF NOT EXISTS "comments_entity_created_at_idx" ON "comments" ("entity_type", "entity_id", "created_at");
 
-  -- Votes on a comment/tick/climb/etc. entity_type is text here (see the
-  -- comments-table note above — the real schema uses an enum).
+  -- Votes on a comment/tick/climb/etc.
   DROP TABLE IF EXISTS "votes" CASCADE;
   CREATE TABLE IF NOT EXISTS "votes" (
     "id" bigserial PRIMARY KEY NOT NULL,
     "user_id" text NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
-    "entity_type" text NOT NULL,
+    "entity_type" social_entity_type NOT NULL,
     "entity_id" text NOT NULL,
     "value" integer NOT NULL,
     "created_at" timestamp DEFAULT now() NOT NULL
@@ -1102,14 +1511,14 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   CREATE INDEX IF NOT EXISTS "votes_entity_idx" ON "votes" ("entity_type", "entity_id");
 
   -- Per-user activity feed rows (ascent/new_climb/comment/etc.), fanned out on
-  -- write. entity_type/type are text here (see the comments-table note above).
+  -- write. Keep the entity enum; the unrelated activity type stays text here.
   DROP TABLE IF EXISTS "feed_items" CASCADE;
   CREATE TABLE IF NOT EXISTS "feed_items" (
     "id" bigserial PRIMARY KEY NOT NULL,
     "recipient_id" text NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
     "actor_id" text REFERENCES "users"("id") ON DELETE SET NULL,
     "type" text NOT NULL,
-    "entity_type" text NOT NULL,
+    "entity_type" social_entity_type NOT NULL,
     "entity_id" text NOT NULL,
     "board_uuid" text,
     "metadata" jsonb,
@@ -1118,8 +1527,8 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   CREATE INDEX IF NOT EXISTS "feed_items_recipient_created_at_idx" ON "feed_items" ("recipient_id", "created_at" DESC, "id" DESC);
   CREATE INDEX IF NOT EXISTS "feed_items_entity_type_entity_id_idx" ON "feed_items" ("entity_type", "entity_id");
 
-  -- User notifications (comment replies, votes, follows, etc.). type/entity_type
-  -- are text here (see the comments-table note above).
+  -- User notifications retain the production entity enum. Notification type
+  -- remains text in this fixture.
   DROP TABLE IF EXISTS "notifications" CASCADE;
   CREATE TABLE IF NOT EXISTS "notifications" (
     "id" bigserial PRIMARY KEY NOT NULL,
@@ -1127,13 +1536,17 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "recipient_id" text NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
     "actor_id" text REFERENCES "users"("id") ON DELETE SET NULL,
     "type" text NOT NULL,
-    "entity_type" text,
+    "entity_type" social_entity_type,
     "entity_id" text,
     "comment_id" bigint REFERENCES "comments"("id") ON DELETE SET NULL,
     "read_at" timestamp,
     "created_at" timestamp DEFAULT now() NOT NULL
   );
   CREATE INDEX IF NOT EXISTS "notifications_recipient_created_at_idx" ON "notifications" ("recipient_id", "created_at");
+  DROP TABLE IF EXISTS "notification_deliveries";
+  DROP TABLE IF EXISTS "notification_devices";
+  ${notificationDeviceSchema}
+
 
   -- Beta links the session feed INNER-joins for featured-beta enrichment. Empty
   -- in tests (no featured beta), but the relation must exist so the query plans.
@@ -1297,6 +1710,19 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   CREATE UNIQUE INDEX IF NOT EXISTS "gym_claims_token_hash_idx" ON "gym_claims" ("token_hash") WHERE "token_hash" IS NOT NULL;
   CREATE UNIQUE INDEX IF NOT EXISTS "gym_claims_unique_pending" ON "gym_claims" ("gym_id", "claimant_user_id") WHERE "status" = 'pending';
 
+  -- Distinguish actual claim-driven ownership transfers from approvals that
+  -- merely close a current-owner claim. Missing rows are intentionally legacy.
+  DROP TABLE IF EXISTS "gym_claim_ownership_decisions" CASCADE;
+  CREATE TABLE IF NOT EXISTS "gym_claim_ownership_decisions" (
+    "claim_id" bigint PRIMARY KEY NOT NULL REFERENCES "gym_claims"("id") ON DELETE CASCADE,
+    "gym_uuid" text NOT NULL,
+    "did_transfer" boolean NOT NULL,
+    "decided_at" timestamp NOT NULL,
+    "previous_owner_id" text
+  );
+  CREATE INDEX IF NOT EXISTS "gym_claim_ownership_decisions_transfer_history_idx"
+    ON "gym_claim_ownership_decisions" ("gym_uuid", "decided_at") WHERE "did_transfer";
+
   -- Gym kiosks (smart-TV dashboards). layout holds the preset config (1–4 board
   -- slots + optional leaderboard rail); the resolver validates it with
   -- @boardsesh/kiosk's KioskLayoutSchema. Partial unique index keeps one live
@@ -1319,6 +1745,7 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   -- packages/db/src/schema/app/feedback.ts. status/resolved_* + github_issue_*
   -- were added in migration 0183. status is plain text here (prod uses the
   -- app_feedback_status enum); the resolvers only read the string value.
+  DROP TABLE IF EXISTS "app_feedback_messages";
   DROP TABLE IF EXISTS "app_feedback" CASCADE;
   CREATE TABLE IF NOT EXISTS "app_feedback" (
     "id" bigserial PRIMARY KEY NOT NULL,
@@ -1347,6 +1774,7 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   CREATE INDEX IF NOT EXISTS "app_feedback_user_idx" ON "app_feedback" ("user_id");
   CREATE INDEX IF NOT EXISTS "app_feedback_board_idx" ON "app_feedback" ("board_name");
   CREATE INDEX IF NOT EXISTS "app_feedback_status_idx" ON "app_feedback" ("status");
+  ${feedbackConversationSchema}
 
   -- Crowdsourced-QA verdicts a tester filed on a PR preview. Mirrors
   -- packages/db/src/schema/app/qa-verdicts.ts (migration 0206; device_model/
@@ -1370,6 +1798,7 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "app_version" text,
     "update_id" text,
     "runtime_version" text,
+    "release_context" jsonb,
     "bundle_created_at" timestamp,
     "screenshot_keys" jsonb,
     "github_comment_id" bigint,
@@ -1481,6 +1910,35 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   CREATE INDEX IF NOT EXISTS "gym_owner_reassignments_performed_by_idx"
     ON "gym_owner_reassignments" ("performed_by");
 
+  -- The directory report tables (below) use board_moderation_actor_role, so
+  -- they go before the type does on a reapplied fixture.
+  DROP TABLE IF EXISTS "directory_notification_context" CASCADE;
+
+  -- Staff and admin actions on boards (migration 0333), straight from the
+  -- generated migration. Dropped first so a reapplied fixture starts clean.
+  DROP TABLE IF EXISTS "board_moderation_events" CASCADE;
+  DROP TYPE IF EXISTS board_moderation_action;
+  DROP TYPE IF EXISTS board_moderation_actor_role;
+  ${boardModerationEventsSchema}
+
+  -- Directory reports (migration 0334), straight from the generated migration.
+  DROP TABLE IF EXISTS "directory_notification_context" CASCADE;
+  DROP TABLE IF EXISTS "directory_report_reporters" CASCADE;
+  DROP TABLE IF EXISTS "directory_reports" CASCADE;
+  DROP TABLE IF EXISTS "admin_daily_digests" CASCADE;
+  DROP TYPE IF EXISTS directory_report_reason;
+  DROP TYPE IF EXISTS directory_report_recipient;
+  DROP TYPE IF EXISTS directory_report_resolver_role;
+  DROP TYPE IF EXISTS directory_report_status;
+  DROP TYPE IF EXISTS directory_report_target_kind;
+  ${directoryReportsSchema}
+
+  -- Suggested setups (migration 0341): enum values, the reporter's suggestion,
+  -- the notice's link to the setup change and the per-climber index on
+  -- board_moderation_events. The tables and types above are dropped and made
+  -- again first, so a reapplied fixture adds them once.
+  ${boardSetupSuggestionsSchema}
+
   -- Board followers (enrichBoard counts these per board).
   DROP TABLE IF EXISTS "board_follows" CASCADE;
   CREATE TABLE IF NOT EXISTS "board_follows" (
@@ -1528,6 +1986,125 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "heartbeat_at" timestamp DEFAULT now() NOT NULL,
     "hostname" text
   );
+
+  -- Mirrors packages/db schema/app/cnc-packs.ts (migrations 0216 + 0218). The
+  -- order row IS the generation queue, so the claim tests need the real enum
+  -- types and the (status, queued_at) index they scan. The four preview_*
+  -- values are appended, exactly as 0218's ALTER TYPE ... ADD VALUE leaves them.
+  -- Dropped and recreated rather than guarded with a duplicate_object handler.
+  -- The guarded form silently keeps whatever enum a previous run left behind,
+  -- so adding a value to the schema (0218's four preview_* statuses) would fail
+  -- every insert on a worker database that already had the old type. The tables
+  -- that use it go first so the type has no dependants.
+  DROP TABLE IF EXISTS "cnc_art_assets" CASCADE;
+  DROP TABLE IF EXISTS "cnc_stripe_events" CASCADE;
+  DROP TABLE IF EXISTS "cnc_orders" CASCADE;
+  DROP TYPE IF EXISTS cnc_order_status;
+  DROP TYPE IF EXISTS cnc_licence_tier;
+
+  CREATE TYPE cnc_order_status AS ENUM ('pending_payment', 'queued', 'generating', 'ready', 'failed', 'cancelled', 'refunded', 'preview_queued', 'preview_generating', 'preview_ready', 'preview_failed');
+  CREATE TYPE cnc_licence_tier AS ENUM ('personal', 'commercial_single');
+  CREATE TABLE IF NOT EXISTS "cnc_orders" (
+    "id" bigserial PRIMARY KEY NOT NULL,
+    "licence_id" text NOT NULL,
+    "user_id" text REFERENCES "users"("id") ON DELETE SET NULL,
+    "tier" cnc_licence_tier,
+    "status" cnc_order_status NOT NULL,
+    "board_name" text NOT NULL,
+    "layout_id" integer NOT NULL,
+    "size_id" integer NOT NULL,
+    "set_ids" text NOT NULL,
+    "options" jsonb NOT NULL,
+    "artwork" jsonb,
+    "catalog_version" text NOT NULL,
+    "config_hash" text,
+    "generation_run_id" uuid,
+    "notification_generation" integer DEFAULT 0 NOT NULL,
+    "notification_status" text,
+    "notification_claim_token" uuid,
+    "notification_claimed_at" timestamptz,
+    "licensee_name" text,
+    "licensee_email" text,
+    "customer_site_name" text,
+    "licence_accepted_at" timestamp,
+    "currency" text,
+    "amount_cents" integer,
+    "stripe_checkout_session_id" text,
+    "stripe_payment_intent_id" text,
+    "paid_at" timestamp,
+    "refunded_at" timestamp,
+    "queued_at" timestamp,
+    "claimed_at" timestamp,
+    "heartbeat_at" timestamp,
+    "worker_id" text,
+    "claim_token" text,
+    "attempts" integer DEFAULT 0 NOT NULL,
+    "last_error" text,
+    "generation" integer DEFAULT 1 NOT NULL,
+    "generated_at" timestamp,
+    "zip_key" text,
+    "zip_size_bytes" bigint,
+    "zip_sha256" text,
+    "fingerprint_manifest" jsonb,
+    "preview_zip_key" text,
+    "preview_zip_size_bytes" bigint,
+    "preview_generated_at" timestamp,
+    "preview_keys" jsonb,
+    "previews_generated" integer DEFAULT 0 NOT NULL,
+    "download_count" integer DEFAULT 0 NOT NULL,
+    "last_downloaded_at" timestamp,
+    "created_at" timestamp DEFAULT now() NOT NULL,
+    "updated_at" timestamp DEFAULT now() NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS "cnc_orders_licence_id_unique" ON "cnc_orders" ("licence_id");
+  CREATE UNIQUE INDEX IF NOT EXISTS "cnc_orders_stripe_checkout_session_unique" ON "cnc_orders" ("stripe_checkout_session_id");
+  CREATE INDEX IF NOT EXISTS "cnc_orders_stripe_payment_intent_idx" ON "cnc_orders" ("stripe_payment_intent_id");
+  CREATE INDEX IF NOT EXISTS "cnc_orders_user_created_idx" ON "cnc_orders" ("user_id", "created_at" DESC NULLS LAST);
+  CREATE INDEX IF NOT EXISTS "cnc_orders_status_queued_idx" ON "cnc_orders" ("status", "queued_at");
+  CREATE INDEX IF NOT EXISTS "cnc_orders_user_config_hash_idx" ON "cnc_orders" ("user_id", "config_hash");
+
+  CREATE TABLE IF NOT EXISTS "cnc_computations" (
+    "id" uuid PRIMARY KEY,
+    "owner_id" text REFERENCES "users"("id") ON DELETE CASCADE,
+    "operation" text NOT NULL,
+    "request_hash" text NOT NULL,
+    "generator_sha" text NOT NULL,
+    "request" jsonb NOT NULL,
+    "asset_keys" jsonb DEFAULT '{}'::jsonb NOT NULL,
+    "run_id" uuid NOT NULL,
+    "status" text DEFAULT 'queued' NOT NULL,
+    "result" jsonb,
+    "error_code" text,
+    "created_at" timestamptz DEFAULT now() NOT NULL,
+    "expires_at" timestamptz NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS "cnc_stripe_events" (
+    "id" text PRIMARY KEY NOT NULL,
+    "type" text NOT NULL,
+    "order_id" bigint REFERENCES "cnc_orders"("id") ON DELETE SET NULL,
+    "received_at" timestamp DEFAULT now() NOT NULL,
+    "processed_at" timestamp
+  );
+
+  -- Mirrors migration 0217. user_id CASCADEs (an upload is the buyer's own
+  -- file) while order_id is SET NULL (losing an order must not delete the
+  -- file it named); the art-asset tests turn on exactly that asymmetry.
+  CREATE TABLE IF NOT EXISTS "cnc_art_assets" (
+    "id" text PRIMARY KEY NOT NULL,
+    "user_id" text NOT NULL REFERENCES "users"("id") ON DELETE CASCADE,
+    "key" text NOT NULL,
+    "mime" text NOT NULL,
+    "size_bytes" integer NOT NULL,
+    "width_px" integer,
+    "height_px" integer,
+    "sha256" text NOT NULL,
+    "order_id" bigint REFERENCES "cnc_orders"("id") ON DELETE SET NULL,
+    "created_at" timestamp DEFAULT now() NOT NULL
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS "cnc_art_assets_key_unique" ON "cnc_art_assets" ("key");
+  CREATE INDEX IF NOT EXISTS "cnc_art_assets_user_created_idx" ON "cnc_art_assets" ("user_id", "created_at" DESC NULLS LAST);
+  CREATE INDEX IF NOT EXISTS "cnc_art_assets_order_idx" ON "cnc_art_assets" ("order_id");
 
   -- Mirrors 0146: sync cursor indexes lead with board_type; deleted_at serves
   -- the daily prune's DELETE WHERE deleted_at < cutoff.
@@ -1603,13 +2180,19 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     FOR EACH ROW EXECUTE FUNCTION log_deletion_favorites();
 
   CREATE OR REPLACE FUNCTION log_deletion_board_climb_stats() RETURNS TRIGGER AS $$
+  DECLARE
+    draft_owner text;
   BEGIN
     -- Mirrors 0144: see log_deletion_board_climbs.
     IF current_setting('boardsesh.suppress_sync_tombstones', true) = 'on' THEN
       RETURN OLD;
     END IF;
+    -- Mirrors 0280 (#6150): a draft's stats tombstone is scoped to its setter.
+    SELECT bc.user_id INTO draft_owner
+    FROM board_climbs bc
+    WHERE bc.board_type = OLD.board_type AND bc.uuid = OLD.climb_uuid AND bc.is_draft IS TRUE;
     INSERT INTO sync_deletions (table_name, record_id, user_id)
-    VALUES (TG_TABLE_NAME, OLD.board_type || ':' || OLD.climb_uuid || ':' || OLD.angle::text, NULL);
+    VALUES (TG_TABLE_NAME, OLD.board_type || ':' || OLD.climb_uuid || ':' || OLD.angle::text, draft_owner);
     RETURN OLD;
   END;
   $$ LANGUAGE plpgsql;
@@ -1637,8 +2220,10 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     IF current_setting('boardsesh.suppress_sync_tombstones', true) = 'on' THEN
       RETURN OLD;
     END IF;
+    -- Mirrors 0280 (#6150): a draft reaches only its setter, so its tombstone
+    -- is scoped to them. Published and ownerless climbs stay NULL-scoped.
     INSERT INTO sync_deletions (table_name, record_id, user_id)
-    VALUES (TG_TABLE_NAME, OLD.uuid, NULL);
+    VALUES (TG_TABLE_NAME, OLD.uuid, CASE WHEN OLD.is_draft IS TRUE THEN OLD.user_id ELSE NULL END);
     RETURN OLD;
   END;
   $$ LANGUAGE plpgsql;
@@ -1729,6 +2314,10 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     CREATE TYPE spray_hold_source AS ENUM ('manual', 'auto');
   EXCEPTION WHEN duplicate_object THEN null; END $$;
 
+  DO $$ BEGIN
+    CREATE TYPE spray_climb_edit_policy AS ENUM ('setter', 'collaborators');
+  EXCEPTION WHEN duplicate_object THEN null; END $$;
+
   -- ONE sequence value is BOTH a layout id and a size id; the other hands out a
   -- number that is BOTH a board_holes id and a board_placements id. Both stop at
   -- int4 max, because every catalogue id column they feed is an integer: a default
@@ -1748,6 +2337,14 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     -- The key of this wall's photo copy in the PUBLIC media bucket, non-null
     -- exactly while the wall is public (migration 0229, SW-14).
     "public_photo_key" text,
+    -- The visibility asked for at creation, applied and nulled by the first
+    -- publish (migration 0240, #5513). Both NULL = nothing pending.
+    "pending_is_public" boolean,
+    "pending_is_unlisted" boolean,
+    -- The wall's stored default look, { mode, boardsesh }, or NULL for "no wall
+    -- default" (migration 0249).
+    "render_settings" jsonb,
+    "climb_edit_policy" spray_climb_edit_policy DEFAULT 'setter' NOT NULL,
     "created_at" timestamp DEFAULT now() NOT NULL,
     "updated_at" timestamp DEFAULT now() NOT NULL,
     "deleted_at" timestamp,
@@ -1758,7 +2355,11 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     -- SW-17 retention: when the purge swept this wall's storage prefix. Explicit
     -- state, because a purged wall's row is never deleted and a wall can own
     -- objects no version row names (an abandoned wizard upload).
-    "photos_purged_at" timestamp
+    "photos_purged_at" timestamp,
+    -- Archive and reset (migration 0258): when a reset clone's first publish
+    -- replaced this wall, and the wall a clone was made from.
+    "archived_at" timestamp,
+    "reset_from_wall_id" bigint REFERENCES "spray_walls"("id") ON DELETE SET NULL
   );
 
   CREATE TABLE IF NOT EXISTS "spray_wall_versions" (
@@ -1772,6 +2373,8 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "anchors" jsonb,
     "homography" jsonb,
     "notes" text,
+    "is_full_reset" boolean DEFAULT false NOT NULL,
+    "art" jsonb,
     "created_by" text REFERENCES "users"("id") ON DELETE SET NULL,
     "published_at" timestamp,
     "created_at" timestamp DEFAULT now() NOT NULL,
@@ -1791,6 +2394,8 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   -- whole table.
   CREATE INDEX IF NOT EXISTS "spray_walls_deleted_at_idx"
     ON "spray_walls" ("deleted_at") WHERE "deleted_at" IS NOT NULL AND "photos_purged_at" IS NULL;
+  CREATE INDEX IF NOT EXISTS "spray_walls_reset_from_wall_idx"
+    ON "spray_walls" ("reset_from_wall_id") WHERE "reset_from_wall_id" IS NOT NULL;
 
   CREATE TABLE IF NOT EXISTS "spray_wall_holds" (
     "wall_id" bigint NOT NULL REFERENCES "spray_walls"("id") ON DELETE CASCADE,
@@ -1802,6 +2407,7 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "installed_version_id" bigint NOT NULL REFERENCES "spray_wall_versions"("id") ON DELETE CASCADE,
     "removed_version_id" bigint REFERENCES "spray_wall_versions"("id") ON DELETE RESTRICT,
     "moved_from_hold_id" integer,
+    "is_refinement" boolean DEFAULT false NOT NULL,
     "source" spray_hold_source DEFAULT 'manual' NOT NULL,
     "confidence" real,
     "created_at" timestamp DEFAULT now() NOT NULL,
@@ -1840,6 +2446,7 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "wall_id" bigint NOT NULL REFERENCES "spray_walls"("id") ON DELETE CASCADE,
     "reporter_id" text REFERENCES "users"("id") ON DELETE SET NULL,
     "reason" spray_wall_report_reason NOT NULL,
+    "release_context" jsonb,
     "created_at" timestamp DEFAULT now() NOT NULL,
     "reviewed_at" timestamp,
     "reviewed_by" text REFERENCES "users"("id") ON DELETE SET NULL
@@ -1873,6 +2480,11 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   DROP TABLE IF EXISTS spray_wall_detections;
   DROP TYPE IF EXISTS spray_detection_status;
   ${detectionSchema}
+  DROP TABLE IF EXISTS spray_wall_training_reviews;
+  DROP TYPE IF EXISTS spray_hold_auto_review;
+  DROP TYPE IF EXISTS spray_training_review_status;
+  DROP TYPE IF EXISTS spray_training_reject_reason;
+  ${sprayTrainingSchema}
   CREATE EXTENSION IF NOT EXISTS pg_trgm;
   DROP TABLE IF EXISTS places, place_imports;
   ${placesSchema}
@@ -1881,6 +2493,8 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   ${climbNeighborResumableBuildsSchema}
   DROP TABLE IF EXISTS board_climb_popularity, board_climb_popularity_runs;
   ${climbPopularitySchema}
+  DROP TABLE IF EXISTS playlist_grade_summaries;
+  ${playlistGradeSummariesSchema}
 
   CREATE UNIQUE INDEX IF NOT EXISTS "playlists_generated_recommendation_idx" ON "playlists" ("generated_recommendation");
 
@@ -1951,6 +2565,19 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "sync_seq" bigserial NOT NULL,
     PRIMARY KEY ("board_type", "climb_uuid", "angle")
   );
+  -- Migration 0176. Only written by the offline similarity loader; deleteClimb
+  -- (#5960) clears a deleted climb's rows.
+  CREATE TABLE IF NOT EXISTS "board_climb_similar" (
+    "board_type" text NOT NULL,
+    "climb_uuid" text NOT NULL,
+    "angle" integer NOT NULL,
+    "neighbor_uuid" text NOT NULL,
+    "score" real NOT NULL,
+    "rank" integer NOT NULL,
+    "model_version" text NOT NULL,
+    "updated_at" timestamp DEFAULT now() NOT NULL,
+    PRIMARY KEY ("board_type", "climb_uuid", "angle", "neighbor_uuid")
+  );
   DO $$ BEGIN
     CREATE TYPE "hold_type" AS ENUM ('jug', 'sloper', 'pinch', 'crimp', 'pocket');
   EXCEPTION WHEN duplicate_object THEN NULL;
@@ -1975,6 +2602,10 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
   ${providerSyncControlsSchema}
   DROP TABLE IF EXISTS climb_stats_recompute_pending;
   ${climbStatsRecomputePendingSchema}
+  -- After the spray tables: it references spray_wall_versions, which is dropped
+  -- and recreated above.
+  DROP TABLE IF EXISTS board_climb_revisions;
+  ${climbRevisionsSchema}
 
   -- The Aurora applier's skip log (migration 0187). The worker grant proof in
   -- job-queue-roles.test.ts grants on it, so it has to exist here.
@@ -2029,4 +2660,102 @@ CREATE INDEX "board_climb_events_chronological_idx" ON "board_climb_events" USIN
     "rejected_reason" text,
     CONSTRAINT "board_climb_ingest_skips_board_type_climb_uuid_pk" PRIMARY KEY ("board_type", "climb_uuid")
   );
+  DROP TABLE IF EXISTS user_analytics_consent_events;
+  DROP TABLE IF EXISTS user_activity_days;
+  ${analyticsConsentSchema}
+  ${sprayWallDeletionSchema}
+  ${sessionBoardsSchema}
+  ${privacySchema}
+  ${narrowedPrivacyTypeCheck}
+  ${anonymousOnForeignBoardsSchema};
+  ${boardShareLinksSchema}
+  ${sessionWorkoutsSchema}
+  ${sharedSprayDraftsSchema}
+  ${climbMutationReceiptsSchema}
+  ${deletedUpstreamPlaylistsSchema}
+  ${sprayWallLedSetupsSchema}
+  ${sprayWallLedBrightnessSchema}
+  DROP TABLE IF EXISTS auth_email_reservation_members;
+  DROP TABLE IF EXISTS auth_email_reservations;
+  DROP TABLE IF EXISTS auth_email_projection;
+  DROP TABLE IF EXISTS auth_security_mutation_events;
+  DROP TABLE IF EXISTS auth_subject_cutoffs;
+  ${authCurrentStoreFoundationSchema}
+  ${legacyWebSignoutSchema}
+  ${authWriterAuthoritySchema}
+  DROP TABLE IF EXISTS auth_email_verification_tokens;
+  DROP TABLE IF EXISTS auth_email_verification_state;
+  ${authUidVerificationSchema}
+  DROP TABLE IF EXISTS auth_password_recovery_tokens;
+  DROP TABLE IF EXISTS auth_password_recovery_state;
+  ${authUidPasswordRecoverySchema}
+  DROP TABLE IF EXISTS auth_password_guess_windows;
+  ${authPasswordGuessWindowsSchema}
+  DROP TABLE IF EXISTS auth_web_oauth_intents;
+  DROP TABLE IF EXISTS auth_web_oauth_commands;
+  ${authWebOAuthIdentitySchema}
+  DROP TABLE IF EXISTS auth_account, auth_session, auth_verification, auth_credential_lineage, auth_session_denials, auth_migration_epochs CASCADE;
+  ${authAuthoritySchema}
+  ${authNativeRevocationSchema}
+  ${authDenialIndexSchema}
+  DROP TABLE IF EXISTS gym_mcp_write_receipts, oauth_mcp_client_policy, oauth_consent_interactions, oauth_refresh_ancestors, oauth_grants, oauth_subjects, oauth_connections, oauth_app_policy, oauth_consent, oauth_access_token, oauth_refresh_token, oauth_client_assertion, oauth_client_resource, oauth_resource, oauth_client, oauth_verification, oauth_session CASCADE;
+  ${partnerOAuthSchema}
+  ${gymMcpSchema}
+  ${gymMcpReceiptRetentionSchema}
+  DROP TABLE IF EXISTS logbook_changes;
+  DROP TABLE IF EXISTS logbook_change_watermark;
+  ${logbookChangesSchema};
+  ${logbookChangeTriggersSchema};
+  -- Test fixtures reset boardsesh_ticks with TRUNCATE; the guard against that
+  -- is covered by logbook-changes.test.ts, which enables it for its own test.
+  ALTER TABLE boardsesh_ticks DISABLE TRIGGER trg_boardsesh_ticks_logbook_truncate;
+  DROP TABLE IF EXISTS logbook_snapshot_chunks;
+  DROP TABLE IF EXISTS logbook_snapshots;
+  ${logbookSnapshotsSchema};
+  ${partnerRevocationTriggerSchema}
+  ${logbookSnapshotsConnectionSchema};
+  ${partnerPublisherNameSchema}
+  ${stampNewCredentialsSchema}
+  DROP TABLE IF EXISTS partner_connection_notices, partner_developer_emails, partner_app_cap_audit;
+  ${partnerSelfServiceSchema}
+  DROP TABLE IF EXISTS app_workout_requests, app_workouts, webhook_deliveries, partner_webhook_outbox, partner_webhook_debounce, partner_webhook_feed_state, oauth_client_webhooks;
+  ${partnerWorkoutWebhookSchema}
+  DROP TRIGGER IF EXISTS trg_partner_account_deletion_events ON users;
+  ${partnerLifecycleEventsSchema}
+  ${partnerWebhookFencesSchema}
+  ${partnerEventGenerationsSchema}
+  ${partnerReconcileFairnessSchema}
+  ${partnerInitialHistorySchema}
+  ${partnerReviewSchema}
+  ${partnerNoticeRetentionSchema}
+  DROP TABLE IF EXISTS logbook_snapshot_session_chunks;
+  DROP TABLE IF EXISTS logbook_session_changes;
+  ALTER TABLE board_sessions DROP CONSTRAINT IF EXISTS board_sessions_export_id_unique;
+  ALTER TABLE board_sessions DROP COLUMN IF EXISTS export_id;
+  ${partnerSessionSyncSchema};
+  ${partnerSessionTriggersSchema};
+  ${partnerSessionHintPrivacySchema};
+  ${offlineWriteDeliverySchema};
+  DROP TABLE IF EXISTS sitemap_shard_refreshes;
+  ${sitemapSummarySchema};
+  DROP TABLE IF EXISTS gym_reporting_board_aliases;
+  ALTER TABLE gyms DROP COLUMN IF EXISTS reporting_time_zone;
+  ${gymReportingSchema};
+  ${gymReportingTickTimeBinding};
+  DROP FUNCTION IF EXISTS public.revoke_gym_reporting_aliases_on_board_move();
+  ${gymReportingAliasVenueGuard};
+  DROP TABLE IF EXISTS gym_reporting_observations;
+  ${gymReachObservationsSchema};
+  DROP FUNCTION IF EXISTS spray_exposure_board_change(), spray_exposure_wall_change(),
+    spray_exposure_version_change(), spray_exposure_policy_change(), spray_exposure_climb_change(),
+    spray_exposure_invalidate(text, text, text), spray_exposure_policy_invalidate(text),
+    spray_exposure_fence_key(text, text), spray_exposure_climb_key(integer, text) CASCADE;
+  DROP TABLE IF EXISTS gym_board_grade_collections, spray_exposure_invalidations,
+    spray_exposure_observations, spray_exposure_checkpoints;
+  DROP SEQUENCE IF EXISTS spray_exposure_event_seq;
+  ${gymInventorySchema};
+  ${sprayExposureSchema};
+  DROP TABLE IF EXISTS gym_directory_repair_audit;
+  ${gymDirectoryRepairAuditSchema};
+  ${gymDirectoryRepairActorRetentionSchema};
 `;

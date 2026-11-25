@@ -1,4 +1,43 @@
 // @vitest-environment jsdom
+// The list-play hook has its own suite; here the logbook only has to hand it
+// its rows, in order, and wire its tap onto every row.
+vi.mock('../../../lib/playlists/use-tick-list-activation', () => ({
+  useTickListActivation: (options: TickListOptions) => {
+    tickList.options = options;
+    return tickList.open;
+  },
+}));
+vi.mock('../../../providers/logbook-delete-provider', () => ({
+  usePendingLogbookDeletes: () => new Set(pendingDeletes.uuids),
+  useLogbookDeleteActions: () => ({
+    getDeleteScope: () => 'scope',
+    scheduleDelete: (request: { uuids: readonly string[]; onSuccess?: (uuid: string) => void }) => {
+      for (const uuid of request.uuids) {
+        pendingDeletes.uuids.add(uuid);
+        deleteTick.mutate(uuid, {
+          onSuccess: () => {
+            pendingDeletes.uuids.delete(uuid);
+            request.onSuccess?.(uuid);
+          },
+        });
+      }
+      return true;
+    },
+  }),
+}));
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { render, act } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -9,6 +48,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // (never acting on the whole group).
 const analytics = vi.hoisted(() => ({ track: vi.fn() }));
 const deleteTick = vi.hoisted(() => ({ mutate: vi.fn(), isPending: false }));
+const pendingDeletes = vi.hoisted(() => ({ uuids: new Set<string>() }));
 const dialog = vi.hoisted(() => ({ confirm: vi.fn<(options: unknown) => Promise<boolean>>(async () => false) }));
 const toast = vi.hoisted(() => ({ showToast: vi.fn() }));
 const haptics = vi.hoisted(() => ({ hapticSelection: vi.fn(), hapticSuccess: vi.fn(), hapticError: vi.fn() }));
@@ -53,6 +93,15 @@ const GROUP_ITEMS = [
     boardDisplayName: 'Test Board',
   },
 ];
+type TickListOptions = {
+  sourceId: string;
+  label: string;
+  rows: readonly { uuid: string }[];
+  hasMore?: boolean;
+  listKey?: string;
+  loadMore?: () => Promise<{ rows: readonly { uuid: string }[]; hasMore: boolean }>;
+};
+const tickList = vi.hoisted(() => ({ open: vi.fn(), options: undefined as TickListOptions | undefined }));
 const groupedFeed = vi.hoisted(() => ({
   data: {
     pages: [
@@ -84,12 +133,21 @@ const flatFeed = vi.hoisted(() => ({
 
 vi.mock('../../../lib/analytics', () => ({ track: analytics.track }));
 
+// ReadableColumn pads by the side safe area; a portrait phone has none.
+vi.mock('react-native-safe-area-context', () => ({
+  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 0, left: 0 }),
+}));
+
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   RefreshControl: () => null,
   Pressable: () => null,
   useWindowDimensions: () => ({ fontScale: 1, width: 375, height: 800 }),
-  StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+    hairlineWidth: 1,
+  },
   Platform: { OS: 'ios', select: (specifics: Record<string, unknown>) => specifics.ios ?? specifics.default },
 }));
 
@@ -105,7 +163,7 @@ vi.mock('@shopify/flash-list', () => ({
   }) => createElement('div', null, ...data.map((item, index) => renderItem({ item, index }))),
 }));
 
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: { language: 'en-US' } }) }));
 vi.mock('../LogbookRow', () => ({
   LogbookRow: (props: {
     onDeleteRequest?: (ascent: { uuid: string }, method: 'swipe' | 'a11y') => void;
@@ -134,7 +192,14 @@ vi.mock('../LogbookEditSheet', () => ({
   },
 }));
 vi.mock('../LogbookFilterSheet', () => ({ LogbookFilterSheet: () => null }));
-vi.mock('../../SearchHeader', () => ({ SearchHeader: () => null }));
+// The capsule row's inputs, reduced to fixed values: these suites drive rows.
+vi.mock('../use-logbook-board-options', () => ({ useLogbookBoardOptions: () => [] }));
+vi.mock('../../../hooks/use-today', () => ({ useToday: () => new Date(2026, 5, 30) }));
+vi.mock('../../../hooks/use-grade-format', () => ({ useGradeFormat: () => ({ gradeFormat: 'v' }) }));
+vi.mock('../../../lib/routing/scoped-navigation', () => ({ useScopedRouter: () => ({ push: vi.fn() }) }));
+vi.mock('../../../lib/logbook-pinned-chips-store', () => ({
+  useLogbookPinnedChips: () => ({ pinned: [], loaded: true, isPinned: () => false, togglePin: vi.fn() }),
+}));
 vi.mock('../../../lib/haptics', () => haptics);
 vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { black: '#000' } }));
 vi.mock('../../Text', () => ({ Text: () => null }));
@@ -148,16 +213,20 @@ vi.mock('../../../lib/graphql/hooks', () => ({
 vi.mock('../../../hooks/use-bottom-chrome-metrics', () => ({
   useBottomChromeMetrics: () => ({ scrollBottomPadding: 0 }),
 }));
-vi.mock('../../../theme/tokens', () => ({ spacing: {}, borderRadius: {} }));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: {},
+  borderRadius: {},
+}));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({ systemColors: {}, brandColors: {} }),
 }));
 vi.mock('expo-router', () => ({ useRouter: () => ({ push: vi.fn() }), useFocusEffect: () => {} }));
-vi.mock('../../../lib/open-climb-in-play-drawer', () => ({ openClimbInPlayDrawer: vi.fn() }));
 vi.mock('../../../lib/tick-to-climb', () => ({ tickToClimb: vi.fn() }));
 vi.mock('../../../lib/playlists/board-details-for-playlist', () => ({ getBoardConfigForPlaylist: vi.fn() }));
 vi.mock('../../../providers/drawer-host-provider', () => ({
-  useDrawerHost: () => ({ openPlayDrawer: vi.fn(), openClimbActions: vi.fn() }),
+  useDrawerHost: () => ({ openPlayDrawer: vi.fn(), getClimbActions: vi.fn() }),
 }));
 vi.mock('@boardsesh/board-react', () => ({ useDeleteTick: () => deleteTick }));
 vi.mock('../../../providers/dialog-provider', () => ({ useConfirm: () => dialog.confirm }));
@@ -181,6 +250,7 @@ async function fireDeleteRequest(method: 'swipe' | 'a11y') {
 beforeEach(() => {
   analytics.track.mockClear();
   deleteTick.mutate.mockClear();
+  pendingDeletes.uuids.clear();
   deleteTick.mutate.mockImplementation((_uuid: string, mutateOptions?: { onSuccess?: () => void }) => {
     mutateOptions?.onSuccess?.();
   });
@@ -195,6 +265,10 @@ beforeEach(() => {
   mountedRows.log = [];
   chooser.props = null;
   editSheet.ascent = null;
+  tickList.open.mockReset();
+  tickList.options = undefined;
+  groupedFeed.fetchNextPage.mockReset();
+  groupedFeed.hasNextPage = false;
   groupedFeed.data.pages[0].userGroupedAscentsFeed.groups = [
     { key: 'climb-1-2026-06-15', climbUuid: 'climb-1', date: '2026-06-15', items: GROUP_ITEMS },
   ];
@@ -245,6 +319,72 @@ describe('LogbookTab grouped mode', () => {
     });
     expect(deleteTick.mutate).toHaveBeenCalledWith('tick-send', expect.anything());
     expect(chooser.props).toBeNull();
+  });
+
+  it('drops an entry from the chooser while it waits out Undo, so the next pick deletes the next tick', async () => {
+    // The owner holds every delete in its Undo window: nothing commits here.
+    deleteTick.mutate.mockImplementation(() => {});
+    const { rerender } = render(createElement(LogbookTab, { userId: 'user-1' }));
+
+    await fireDeleteRequest('swipe');
+    const onPick = chooser.props?.onPick as ((entry: { uuid: string }) => void) | undefined;
+    await act(async () => {
+      onPick?.(GROUP_ITEMS[1]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    rerender(createElement(LogbookTab, { userId: 'user-1' }));
+    const remaining = chooser.props?.entries as Array<{ uuid: string }>;
+    expect(remaining.map((entry) => entry.uuid)).toEqual(['tick-send']);
+
+    const onPickNext = chooser.props?.onPick as ((entry: { uuid: string }) => void) | undefined;
+    await act(async () => {
+      onPickNext?.(GROUP_ITEMS[0]);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(deleteTick.mutate).toHaveBeenCalledTimes(2);
+    expect(deleteTick.mutate).toHaveBeenLastCalledWith('tick-send', expect.anything());
+
+    // Both entries pending: the emptied sheet closes itself.
+    chooser.props = null;
+    rerender(createElement(LogbookTab, { userId: 'user-1' }));
+    expect(chooser.props).toBeNull();
+  });
+
+  it('Delete all confirms once with the count, then deletes every entry and closes the chooser', async () => {
+    deleteTick.mutate.mockImplementation(() => {});
+    const { rerender } = render(createElement(LogbookTab, { userId: 'user-1' }));
+
+    await fireDeleteRequest('swipe');
+    const onDeleteAll = chooser.props?.onDeleteAll as (() => void) | undefined;
+    expect(onDeleteAll).toBeDefined();
+    await act(async () => {
+      onDeleteAll?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(dialog.confirm).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        title: 'mobile.logbook.deleteAllTitle',
+        confirmLabel: 'mobile.logbook.deleteAll',
+        destructive: true,
+      }),
+    );
+    expect(deleteTick.mutate.mock.calls.map(([uuid]) => uuid)).toEqual(['tick-send', 'tick-burn']);
+
+    chooser.props = null;
+    rerender(createElement(LogbookTab, { userId: 'user-1' }));
+    expect(chooser.props).toBeNull();
+  });
+
+  it('Delete all deletes nothing when the confirm is declined', async () => {
+    dialog.confirm.mockImplementationOnce(async () => false);
+    render(createElement(LogbookTab, { userId: 'user-1' }));
+    await fireDeleteRequest('swipe');
+    await act(async () => {
+      (chooser.props?.onDeleteAll as () => void)();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(deleteTick.mutate).not.toHaveBeenCalled();
+    expect((chooser.props?.entries as Array<{ uuid: string }>).length).toBe(2);
   });
 
   it('routes edit on a multi-entry group through the chooser to the edit sheet', async () => {
@@ -422,5 +562,62 @@ describe('LogbookTab grouped mode', () => {
 
     expect(chooser.props).toBeNull();
     expect(editSheet.ascent?.uuid).toBe('tick-send');
+  });
+});
+
+// Issue #6665: a logbook row plays from the logbook, in the order it shows.
+describe('LogbookTab row taps', () => {
+  it('hands the list-play hook the rows on screen and wires its tap onto each', () => {
+    render(createElement(LogbookTab, { userId: 'user-1' }));
+
+    expect(tickList.options).toMatchObject({
+      sourceId: 'logbook:user-1',
+      label: 'playView.track.logbook',
+      hasMore: false,
+    });
+    // One row per group: its best entry, which is what the row shows.
+    expect(tickList.options?.rows.map(({ uuid }) => uuid)).toEqual(['tick-send']);
+    expect(row.props?.onActivate).toBe(tickList.open);
+  });
+
+  it('pages on through the grouped feed, rebuilding rows the way the screen does', async () => {
+    groupedFeed.hasNextPage = true;
+    const olderItem = {
+      ...GROUP_ITEMS[0],
+      uuid: 'tick-older',
+      climbUuid: 'climb-2',
+      climbedAt: '2026-06-01T12:00:00.000Z',
+    };
+    groupedFeed.fetchNextPage.mockResolvedValueOnce({
+      isError: false,
+      hasNextPage: false,
+      data: {
+        pages: [
+          groupedFeed.data.pages[0],
+          {
+            userGroupedAscentsFeed: {
+              groups: [{ key: 'older', climbUuid: 'climb-2', date: '2026-06-01', items: [olderItem] }],
+              totalCount: 2,
+              hasMore: false,
+            },
+          },
+        ],
+      },
+    });
+    render(createElement(LogbookTab, { userId: 'user-1' }));
+
+    const loaded = await tickList.options?.loadMore?.();
+
+    expect(groupedFeed.fetchNextPage).toHaveBeenCalledWith({ cancelRefetch: false });
+    expect(loaded?.rows.map(({ uuid }) => uuid)).toEqual(['tick-send', 'tick-older']);
+    expect(loaded?.hasMore).toBe(false);
+  });
+
+  it('fails the page when the feed does, so the track ends where it is', async () => {
+    groupedFeed.hasNextPage = true;
+    groupedFeed.fetchNextPage.mockResolvedValueOnce({ isError: true, error: new Error('offline'), hasNextPage: true });
+    render(createElement(LogbookTab, { userId: 'user-1' }));
+
+    await expect(tickList.options?.loadMore?.()).rejects.toThrow('offline');
   });
 });

@@ -1,4 +1,7 @@
+import { captureMetroRuntimeEnv } from './lib/capture-metro-runtime';
+import { createCppStoryCapture, cppStorySourceSha256 } from './lib/cpp-story-provenance';
 import { guardSimulatorCommand } from './lib/ios-simulator-lease';
+import { CPP_MAESTRO_TIMEOUT_MS, IOS_MAESTRO_TIMEOUT_MS } from './mobile-screenshot-maestro';
 /// <reference types="node" />
 
 /**
@@ -21,12 +24,13 @@ import { guardSimulatorCommand } from './lib/ios-simulator-lease';
  * Android PNGs land in app-stores/google/screenshots/<device>/.
  *
  * Usage:
- *   vp run mobile:screenshots -- [--platform ios] [--flow app-store|onboarding|help]
- *                                 [--backend local|prod] [--devices common|phones|ipads|<comma-list>]
+ *   vp run mobile:screenshots -- [--platform ios] [--flow app-store|app-store-campaign|onboarding|help|smoke]
+ *                                 [--backend local|prod] [--devices common|phones|ipads|duo|<comma-list>]
  *                                 [--locales all|<comma-list>] [--device "iPhone 16 Pro Max"]
  *                                 [--variant material|liquidGlass] [--shutdown]
  *                                 [--app-path <path/to/Boardsesh.app|app.apk>]
  *                                 [--orientation portrait|landscape] [--dev-client]
+ *                                 [--cpp kilter|tension|moonboard|spray|all] [--cpp-scenario <json>]
  *                                 [--fixtures off|record|replay] [--fixtures-dir <path>] [--fresh]
  *                                 [--no-pseudonymise]
  *
@@ -34,7 +38,7 @@ import { guardSimulatorCommand } from './lib/ios-simulator-lease';
  * (scripts/screenshot-backend.ts) instead of a live one, so the screenshots stop
  * moving whenever PROD's data does. `record` proxies `--backend` and writes down
  * every answer; `replay` serves those bytes and never leaves the machine. See
- * docs/mobile-screenshot-fixtures.md.
+ * docs/qa/mobile-screenshot-fixtures.md.
  *
  * --dev-client makes the Android capture work the way iOS always has: install the
  * dev-client APK (com.boardsesh.app.dev) and load its JS from a Metro this script
@@ -48,11 +52,18 @@ import { guardSimulatorCommand } from './lib/ios-simulator-lease';
  * (or resolves a dev-client APK itself with --dev-client).
  * Credentials come from SCREENSHOT_USER_EMAIL / SCREENSHOT_USER_PASSWORD
  * (default test@boardsesh.com / test).
+ *
+ * The iPhone Duo store capture runs twice in one shard: closed on the outer
+ * display (app-store-duo.yaml, plain Maestro), then open on the inner display
+ * (app-store-duo-inner.yaml, one Maestro run per shot, captured with simctl
+ * because Maestro only sees the outer display). See scripts/lib/ios-duo-hinge.ts.
  */
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { assertCppLogbookAttemptsReady, type CppLogbookAttemptsProof } from './lib/cpp-logbook-coverage';
 import { createHash } from 'node:crypto';
 import {
+  appendFileSync,
   closeSync,
   copyFileSync,
   cpSync,
@@ -67,15 +78,48 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { fixtureSnapshotDirectory } from './lib/screenshot-fixture-snapshot';
+import {
+  IOS_CAPTURE_LOG_PREDICATE,
+  recordIosProcessCommand,
+  iosDiagnosticReportDirectories,
+  preserveIosCaptureDiagnostics,
+  snapshotIosDiagnosticReports,
+} from './lib/ios-capture-diagnostics';
+import {
+  fixtureSnapshotDirectory,
+  FIXTURE_SNAPSHOT_REFERENCE,
+  IOS_CAMPAIGN_FIXTURE_REFERENCE,
+  readFixtureSnapshotReference,
+} from './lib/screenshot-fixture-snapshot';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { captionLocaleForStore } from './lib/screenshot-presentation';
+import {
+  CPP_TARGETS,
+  CPP_MANIFEST_PATH,
+  isCppTarget,
+  readCppPage,
+  cppNavigationCommands,
+  isCppAscentId,
+  isCppClimbId,
+  type CppBoard,
+  cppReadinessSelector,
+  assertCppCaptureReady,
+  resolveCppRecipes,
+  type CppTarget,
+  type CppSelection,
+  type CppRecordedBoard,
+  type CppCaptureCoverage,
+  type CppPage,
+  type CppSceneCoverage,
+} from './lib/screenshot-cpp';
+import { formatActiveBoardLabel } from '../packages/mobile/src/lib/boards/active-board-label';
+import { captionLocaleForStore, IOS_CAMPAIGN_CAPTURE_NAMES } from './lib/screenshot-presentation';
 import { SUPPORTED_LOCALES, isSupportedLocale, type Locale } from '../packages/shared/i18n/src/config';
 import {
   METRO_LOG_PATH,
   METRO_PORT,
   SCREENSHOT_READY_PORT,
+  SMOKE_PING_LOG_PATH,
   dumpMetroLogTail,
   homeReadyMarkerCount,
   metroDevClientUrl,
@@ -89,18 +133,40 @@ import {
   stopReadinessServer,
   waitForHomeReady,
   waitForMetro,
+  metroLogOffset,
   waitForPortToClose,
 } from './lib/metro-dev-server';
 import {
   connectDevClient,
   installDevClient,
   launchDevClientToHome,
+  launchDevClient,
   startMetroForDevClient,
   stopDevClientSession,
   type DevClientSession,
 } from './lib/android-dev-client';
 import { ANDROID_DEV_PACKAGE } from './lib/android-app';
 import { readScreenshotFixtureManifest } from './lib/screenshot-backend';
+import {
+  IOS_CRASH_LOG_PREDICATE,
+  SMOKE_FAILURE_LABELS,
+  SMOKE_ROUTES,
+  bestSmokeCounts,
+  buildSmokeResult,
+  classifySmokeFailure,
+  collectSmokeObservations,
+  findAndroidNativeCrashes,
+  findIosNativeCrashes,
+  findSmokePingProblems,
+  parseSmokePingLog,
+  replayProblemsForSmoke,
+  shouldRetrySmoke,
+  smokePingsSettled,
+  type NativeCrash,
+  type SmokeAttempt,
+  type SmokePing,
+  type SmokeResult,
+} from './lib/mobile-smoke';
 import {
   DEFAULT_SCREENSHOT_FIXTURES_DIR,
   RE_RECORD_COMMAND,
@@ -109,6 +175,10 @@ import {
   parseScreenshotBackendLogLine,
   resolveScreenshotBackendPort,
   startOfSecondIso,
+  canonicalJson,
+  graphqlFixtureKey,
+  normalizeDocument,
+  type GraphqlFixtureFile,
   type ScreenshotBackendMode,
   type ScreenshotCaptureScenario,
 } from './lib/screenshot-fixtures';
@@ -116,6 +186,41 @@ import {
 // same): resolving a dev-client APK is one behaviour with one cache, and the lib
 // layer can't own it because it shells out to gh/gradle.
 import { ensureAndroidApk } from './mobile-android-apk';
+import { assertCppGradeCountProof, readCppCountFixtures } from './lib/cpp-grade-count';
+import { readIosCampaignPrimaryCapture, type IosCampaignPrimaryCapture } from './lib/ios-campaign-primary';
+import { iosCampaignPhoneScene, iosCampaignDuoScene } from './lib/ios-campaign-phone-scenes';
+import { SEARCH_CLIMBS } from '../packages/mobile/src/lib/graphql/operations';
+import { DEFAULT_CLIMB_FILTER_STATE, toClimbSearchInput } from '../packages/shared/climb-filters/src/filter-state';
+import {
+  buildDuoHingeLibrary,
+  captureDuoDisplay,
+  duoHingeLogPath,
+  installDuoHinge,
+  pngIsLit,
+  setDuoPose,
+} from './lib/ios-duo-hinge';
+import { launchIosCaptureReady, waitForIosCaptureReady } from './lib/ios-capture-ready';
+import { bootIosCaptureDevice } from './lib/ios-capture-boot';
+import { snapshotCaptureLogs, waitForCaptureLogLine, type CaptureLogBoundary } from './lib/capture-readiness-logs';
+import { iosStoryNavigationFlow } from './lib/ios-story-navigation';
+import {
+  matchScreenshotBoardCandidates,
+  parseScreenshotBoardSelectors,
+} from '../packages/mobile/src/dev/integration/screenshot-board-matching';
+
+import {
+  buildStoryEnv,
+  isStoryRootReadyLine,
+  settleAfterStory,
+  storyRoute,
+  type StoryVariant,
+} from './lib/mobile-stories';
+import {
+  readVisualStoryCaptures,
+  cppStoryCaptures,
+  storyForCaptureName,
+  type VisualStoryCapture,
+} from './lib/mobile-visual-stories';
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const MOBILE_DIR = resolve(ROOT_DIR, 'packages', 'mobile');
@@ -133,14 +238,14 @@ const OUTPUT_ROOT = resolve(ROOT_DIR, 'app-stores');
  * This is not tidiness. `writeCapturedScreenshots` DELETES every PNG in the
  * output directory before writing, and an unframed flow writes straight into
  * `screenshots/<locale>/<device>/`. Sharing the root meant a bare
- * `vp run mobile:screenshots --flow help` — which defaults to three devices and
- * all four locales — wiped and replaced all twelve committed store shards with
- * help screens, two thirds of them captured on iPads where deep links don't
+ * `vp run mobile:screenshots --flow help` — which defaults to the common devices and
+ * all four locales — wiped and replaced the existing store shards with
+ * help screens, including iPads where deep links don't
  * navigate at all. The next `vp run screenshot:compare` would then diff help
  * pages against the store baseline.
  */
 function outputRootForFlow(flow: ScreenshotFlow): string {
-  return flow === 'app-store' ? OUTPUT_ROOT : join(OUTPUT_ROOT, flow);
+  return flow === 'app-store' || flow === 'app-store-campaign' ? OUTPUT_ROOT : join(OUTPUT_ROOT, flow);
 }
 /**
  * Android's answer to the Metro tee: the device log, streamed to a file for the
@@ -190,9 +295,14 @@ const LOCAL_WEB_URL = 'http://localhost:3000';
 // An emulator's localhost is its OWN loopback, so --backend local additionally
 // needs these two reversed onto the host. Derived from the URLs above so a port
 // move there can't leave the reverse behind.
-const LOCAL_BACKEND_REVERSE_PORTS: readonly number[] = [LOCAL_BACKEND_URL, LOCAL_WEB_URL].map((url) =>
+export const LOCAL_BACKEND_REVERSE_PORTS: readonly number[] = [LOCAL_BACKEND_URL, LOCAL_WEB_URL].map((url) =>
   Number.parseInt(new URL(url).port, 10),
 );
+
+/** Ports an emulator must reverse to the host: the local backend and web, none for prod. */
+export function androidShotsReversePorts(backend: 'prod' | 'local'): readonly number[] {
+  return backend === 'local' ? LOCAL_BACKEND_REVERSE_PORTS : [];
+}
 export const DEFAULT_USER_EMAIL = 'test@boardsesh.com';
 export const DEFAULT_USER_PASSWORD = 'test';
 const MAESTRO_INSTALL_HINT = 'Install Maestro: curl -Ls "https://get.maestro.mobile.dev" | bash';
@@ -201,13 +311,18 @@ export type ScreenshotPlatform = 'ios' | 'android' | 'all';
 /**
  * Which committed Maestro flow a run drives.
  *
- * `app-store` is the only FRAMED flow — it is the one `collectScreenshots` runs
+ * `app-store` and its iOS replay `app-store-campaign` flow are FRAMED: `collectScreenshots` runs them
  * through `screenshot:frame` (captions, device frames, the recipe table in
- * `scripts/lib/screenshot-presentation.ts`) and the only one whose captures are
- * required to carry a board-render log line. `onboarding` and `help` write raw,
+ * `scripts/lib/screenshot-presentation.ts`). `onboarding` and `help` write raw,
  * uncaptioned PNGs straight to the shard directory.
+ *
+ * `smoke` is not a capture at all: it is the mobile E2E gate's navigation smoke
+ * (docs/qa/mobile-e2e-gate.md). It walks a few screens, takes no screenshots and
+ * writes nothing under `app-stores/`; the run is judged on the app's own pings,
+ * the device log and the replay backend's log, and the answer lands in the
+ * result file `smokeResultPath()` names.
  */
-export type ScreenshotFlow = 'app-store' | 'onboarding' | 'help';
+export type ScreenshotFlow = 'app-store' | 'app-store-campaign' | 'app-store-cpp' | 'onboarding' | 'help' | 'smoke';
 export type ScreenshotBackend = 'local' | 'prod';
 /**
  * Whether this capture talks to a real backend (`off`), proxies one while
@@ -226,17 +341,17 @@ export interface IosScreenshotDevice {
   orientation: IosDeviceOrientation;
 }
 
-// iPhones: just the 6.9" iPhone 16 Pro Max. App Store Connect auto-scales the
-// largest iPhone size down to every smaller iPhone, so a single 6.9" set covers the
-// whole iPhone range — extra iPhone sizes are invisible to users and add no ranking
-// value, only CI time (see app-stores/apple/app-store-submission-guide.md). iPad is
-// a separate App Store slot that does NOT auto-scale from the iPhone screenshots, so
-// it gets its own captures below. Locale, not iPhone size, is the axis that helps the
-// listing, so the orchestrator still captures every app locale.
+// Capture both Dynamic Island display slots at native resolution. The smoke and
+// pixel probe remain on one Pro Max; store coverage is a separate inventory.
 export const IOS_PHONE_SCREENSHOT_DEVICES: readonly IosScreenshotDevice[] = [
   {
     name: 'iPhone 16 Pro Max',
     typeId: 'com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro-Max',
+    orientation: 'PORTRAIT',
+  },
+  {
+    name: 'iPhone 16 Pro',
+    typeId: 'com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro',
     orientation: 'PORTRAIT',
   },
 ];
@@ -254,17 +369,38 @@ export const IOS_IPAD_SCREENSHOT_DEVICES: readonly IosScreenshotDevice[] = [
   },
 ];
 
+/** The phones and iPads: every device with a custom product page set too. */
 export const IOS_SCREENSHOT_DEVICES: readonly IosScreenshotDevice[] = [
   ...IOS_PHONE_SCREENSHOT_DEVICES,
   ...IOS_IPAD_SCREENSHOT_DEVICES,
 ];
 
-const COMMON_IOS_DEVICE_NAMES = IOS_SCREENSHOT_DEVICES.map((device) => device.name);
+// The foldable's one App Store set takes both displays: the inner one open
+// (landscape, 2853x2007) and the outer one closed (1398x2034). One shard shoots
+// both, outer pass first; scripts/lib/ios-duo-hinge.ts folds the simulator in
+// between. Needs Xcode 27 and the iOS 27.1 runtime. No custom product page set.
+export const IOS_DUO_SCREENSHOT_DEVICES: readonly IosScreenshotDevice[] = [
+  {
+    name: 'iPhone Duo',
+    typeId: 'com.apple.CoreSimulator.SimDeviceType.iPhone-Duo',
+    orientation: 'PORTRAIT',
+  },
+];
+
+/** The full App Store matrix (`--devices common`). */
+export const IOS_STORE_SCREENSHOT_DEVICES: readonly IosScreenshotDevice[] = [
+  ...IOS_SCREENSHOT_DEVICES,
+  ...IOS_DUO_SCREENSHOT_DEVICES,
+];
+
+const COMMON_IOS_DEVICE_NAMES = IOS_STORE_SCREENSHOT_DEVICES.map((device) => device.name);
 const PHONE_IOS_DEVICE_NAMES = IOS_PHONE_SCREENSHOT_DEVICES.map((device) => device.name);
 const IPAD_IOS_DEVICE_NAMES = IOS_IPAD_SCREENSHOT_DEVICES.map((device) => device.name);
+const DUO_IOS_DEVICE_NAMES = IOS_DUO_SCREENSHOT_DEVICES.map((device) => device.name);
 const DEFAULT_IOS_DEVICES_ARGUMENT = 'common';
 const PHONE_IOS_DEVICES_ARGUMENT = 'phones';
 const IPAD_IOS_DEVICES_ARGUMENT = 'ipads';
+const DUO_IOS_DEVICES_ARGUMENT = 'duo';
 const DEFAULT_LOCALES_ARGUMENT = 'all';
 
 export interface AppStoreLocaleTarget {
@@ -277,10 +413,12 @@ const APP_STORE_LOCALES_BY_APP_LOCALE: Record<Locale, readonly string[]> = {
   es: ['es-ES', 'es-MX'],
   fr: ['fr-FR'],
   de: ['de-DE'],
+  it: ['it'],
+  'zh-CN': ['zh-Hans'],
 };
 
 /** Default / `--locales all` set. Excludes app locales without store screenshot folders yet. */
-const STORE_READY_APP_LOCALES: readonly Locale[] = ['en-US', 'es', 'fr', 'de'];
+const STORE_READY_APP_LOCALES: readonly Locale[] = ['en-US', 'es', 'fr', 'de', 'it'];
 
 export interface ScreenshotOptions {
   platform: ScreenshotPlatform;
@@ -301,7 +439,7 @@ export interface ScreenshotOptions {
   /**
    * `|`-separated board selectors, in slot order — slot 0 is the board every
    * board-backed shot sits on, slot 1 the second board-view's wall. `null` leaves
-   * the app's defaults (see `screenshot-mode.ts`) in place.
+   * the integration defaults (see `src/dev/integration/config.ts`) in place.
    */
   boards: string | null;
   /** Prebuilt/cached app artifact to install; iOS can build one when null. */
@@ -340,7 +478,7 @@ export interface ScreenshotOptions {
    * mints one (now, to the second). This is the START instant the app runs on
    * during the recording, not the value the finished set ships with: the
    * backend bumps the PERSISTED manifest's `frozenNow` past the newest
-   * response actually recorded (see docs/mobile-screenshot-fixtures.md, "The
+   * response actually recorded (see docs/qa/mobile-screenshot-fixtures.md, "The
    * frozen clock"), so a run that takes 20 minutes never ships a fixture that
    * would replay as being in the future. Optional even for a multi-shard
    * recording — `mergeFixtureSets` takes the MAXIMUM finalized `frozenNow`
@@ -349,6 +487,15 @@ export interface ScreenshotOptions {
    */
   frozenNow: string | null;
   shutdown: boolean;
+  cpp?: CppSelection | null;
+  cppCoverage?: CppCaptureCoverage;
+  cppLogbookAttempts?: CppLogbookAttemptsProof;
+  cppRecordedBoards?: CppRecordedBoard[];
+  cppFixtureSha256?: string;
+  cppScenarioFile?: string;
+  cppCapturePage?: CppPage;
+  iosCampaignPrimaryCapture?: IosCampaignPrimaryCapture;
+  iosCampaignPhoneBoards?: IosCampaignPhoneBoard[];
 }
 
 export function parseArgs(argv: readonly string[]): ScreenshotOptions {
@@ -391,7 +538,23 @@ export function parseArgs(argv: readonly string[]): ScreenshotOptions {
         index++;
         break;
       case '--flow':
-        options.flow = expectEnum(flag, value, ['app-store', 'onboarding', 'help']) as ScreenshotFlow;
+        options.flow = expectEnum(flag, value, [
+          'app-store',
+          'app-store-campaign',
+          'onboarding',
+          'help',
+          'smoke',
+        ]) as ScreenshotFlow;
+        index++;
+        break;
+      case '--cpp-scenario':
+        options.cppScenarioFile = resolve(expectValue(flag, value));
+        index++;
+        break;
+      case '--cpp':
+        if (value !== 'all' && !isCppTarget(value))
+          throw new Error('--cpp requires kilter|tension|moonboard|spray|all');
+        options.cpp = value;
         index++;
         break;
       case '--backend':
@@ -474,6 +637,53 @@ export function parseArgs(argv: readonly string[]): ScreenshotOptions {
     }
   }
 
+  if (options.cpp) {
+    if (
+      options.platform !== 'ios' ||
+      !['app-store', 'app-store-campaign', 'app-store-cpp'].includes(options.flow) ||
+      options.boards
+    )
+      throw new Error('--cpp requires iOS App Store capture and controls its board selectors');
+    const campaign = JSON.parse(readFileSync(CPP_MANIFEST_PATH, 'utf8')) as { locales: Record<string, string[]> };
+    const campaignLocales = Object.keys(campaign.locales).filter(isSupportedLocale);
+    const localesFlag = args.indexOf('--locales');
+    if (localesFlag === -1 || args[localesFlag + 1] === 'all') {
+      options.appLocales = campaignLocales;
+    } else if (options.appLocales.some((locale) => !campaignLocales.includes(locale))) {
+      throw new Error(`--cpp locales must have reviewed campaign assets (${campaignLocales.join(', ')})`);
+    }
+    options.flow = 'app-store-cpp';
+    if (!args.includes('--fixtures')) options.fixtures = 'replay';
+  }
+
+  if (options.cppScenarioFile && (!options.cpp || options.fixtures !== 'record'))
+    throw new Error('--cpp-scenario requires --cpp with --fixtures record');
+  if (options.cpp && options.fixtures === 'off') throw new Error('--cpp requires record or replay fixtures');
+  if (options.cpp === 'all' && options.fixtures === 'record')
+    throw new Error('Record one CPP target per scenario; --cpp all requires replay');
+
+  if (options.flow === 'app-store-campaign' && options.platform !== 'ios') {
+    throw new Error('--flow app-store-campaign requires --platform ios; Android keeps its existing campaign.');
+  }
+
+  if (
+    options.platform === 'ios' &&
+    (options.flow === 'app-store' || options.flow === 'app-store-campaign') &&
+    !args.includes('--fixtures')
+  )
+    options.fixtures = 'replay';
+
+  if (options.flow === 'smoke') {
+    // One result file and one retry budget per invocation, so one platform.
+    if (options.platform === 'all') {
+      throw new Error('--flow smoke runs one platform per invocation; pass --platform ios or --platform android');
+    }
+    // The pinned fixture set was recorded on the iPhone in en-US, and the smoke
+    // can only ask for what that set holds. An explicit flag still wins.
+    if (!args.includes('--device') && !args.includes('--devices')) options.devices = ['iPhone 16 Pro Max'];
+    if (!args.includes('--locales')) options.appLocales = ['en-US'];
+  }
+
   // Replay has nothing to discard and record is the only mode that writes, so a
   // `--fresh` anywhere else is a typo that would otherwise pass silently and
   // leave the caller believing the set was rebuilt.
@@ -511,6 +721,9 @@ function parseDevicesArgument(value: string): string[] {
   }
   if (value === IPAD_IOS_DEVICES_ARGUMENT) {
     return [...IPAD_IOS_DEVICE_NAMES];
+  }
+  if (value === DUO_IOS_DEVICES_ARGUMENT) {
+    return [...DUO_IOS_DEVICE_NAMES];
   }
   const devices = value
     .split(',')
@@ -565,6 +778,49 @@ export function deviceSlug(deviceName: string): string {
     .replace(/^-+|-+$/g, '');
 }
 
+// Metro is reused across phone and iPad captures. Publish both real surfaces in
+// its registry; an iPad flow uses kiosk while a phone flow keeps island.
+function cppRuntimeNavigationCommands(
+  page: CppPage,
+  coverage: CppCaptureCoverage,
+  recordedBoards: readonly CppRecordedBoard[],
+) {
+  const commands = cppNavigationCommands(page, coverage, recordedBoards, false);
+  // Stop requesting the modal once its screenshot is captured. Replacing the
+  // same Climbs route clears its existing screenshotOpenFilters lifecycle gate.
+  const resultsRoute = new URL(commands.search.route, 'http://localhost');
+  resultsRoute.searchParams.delete('screenshotOpenFilters');
+  resultsRoute.searchParams.set('screenshotCppScene', 'search-results');
+  commands['search-results'] = { ...commands.search, route: `${resultsRoute.pathname}${resultsRoute.search}` };
+  if (coverage.target === 'spray') {
+    // Cherry and Bowlo can be verified empty walls. On iPad, replacing the
+    // stack root with their editor renders it inline beside the previous player.
+    // Enter the owned list first; the real Create control pushes its modal.
+    for (const index of [1, 2]) {
+      if (coverage.boardHeroModes?.[page.heroBoards[index].id] !== 'wall-editor') continue;
+      const scene = `hero-${index + 1}`;
+      const alias = `${scene}-editor-list`;
+      commands[alias] = {
+        ...commands[scene],
+        route: `/climbs?screenshotBoardIndex=${index}&screenshotCppScene=${alias}`,
+      };
+    }
+  }
+  if (coverage.target !== 'spray')
+    commands.kiosk = { ...commands.island, route: '/wall-display?screenshotCppScene=kiosk' };
+  if (coverage.target !== 'spray') {
+    const tabletStatus = new URL(commands.island.route, 'http://localhost');
+    tabletStatus.searchParams.set('screenshotCppScene', 'status-ipad');
+    if (coverage.heroClimbs) {
+      if (!isCppClimbId(coverage.scenes.status.climbId))
+        throw new Error('CPP tablet status requires its genuine original climb ID');
+      tabletStatus.searchParams.set('screenshotClimbId', coverage.scenes.status.climbId);
+    }
+    commands['status-ipad'] = { ...commands.island, route: `${tabletStatus.pathname}${tabletStatus.search}` };
+  }
+  return commands;
+}
+
 /**
  * Build the env Metro bundles with (EXPO_PUBLIC_* are inlined into the JS bundle
  * at bundle time, so these shape the dev-client's JS, not the native compile).
@@ -588,9 +844,9 @@ export function buildScreenshotEnv(
   const env: NodeJS.ProcessEnv = {
     ...baseEnv,
     EXPO_PUBLIC_SCREENSHOT_MODE: '1',
-    // Baked at JS-bundle time; theme-provider locks to it in screenshot mode.
+    // Passed to the dev integration root as presentation props.
     EXPO_PUBLIC_SCREENSHOT_THEME: options.theme,
-    // The app auto-signs-in with these on boot (see screenshot-mode.ts), so the
+    // The dev integration bootstrap signs in with these on boot, so the
     // Maestro flow never types into the login form — which pops iOS's
     // "Save Password?" dialog over every shot and blocks the board picker.
     // `||`, not `??`: CI passes these through as EMPTY on a replay run (the
@@ -605,6 +861,60 @@ export function buildScreenshotEnv(
     // survives Metro's log-forwarding dying mid-run.
     EXPO_PUBLIC_SCREENSHOT_READY_URL: `http://localhost:${SCREENSHOT_READY_PORT}/ready`,
   };
+  if (options.flow === 'smoke') {
+    // Only the smoke gets this, so a store capture makes exactly the requests it
+    // always has. With it set, each smoke-visited screen reports its content
+    // count and the crash screen reports itself (src/dev/integration/screenshot-smoke.ts).
+    env.EXPO_PUBLIC_SCREENSHOT_SMOKE_URL = `http://localhost:${SCREENSHOT_READY_PORT}/smoke`;
+  }
+  const wallControlCapture =
+    options.flow === 'app-store' || options.flow === 'app-store-campaign' || options.flow === 'help' || !!options.cpp;
+  if (wallControlCapture) {
+    env.EXPO_PUBLIC_SCREENSHOT_FAKE_BLE = '1';
+    env.EXPO_PUBLIC_SCREENSHOT_DRIVING = '1';
+  } else {
+    delete env.EXPO_PUBLIC_SCREENSHOT_DRIVING;
+  }
+  if (options.flow === 'app-store-campaign' && !options.cpp && options.iosCampaignPrimaryCapture) {
+    const primary = options.iosCampaignPrimaryCapture;
+    const { board } = primary;
+    // A regular seven-board capture must not enable CPP's six-slot board mapping.
+    delete env.EXPO_PUBLIC_SCREENSHOT_CPP_URL;
+    delete env.EXPO_PUBLIC_SCREENSHOT_CPP_COMMANDS;
+    env.EXPO_PUBLIC_SCREENSHOT_PRIMARY_BOARD_URL = `http://localhost:${SCREENSHOT_READY_PORT}/cpp`;
+    env.EXPO_PUBLIC_SCREENSHOT_PRIMARY_BOARD_COMMANDS = JSON.stringify({
+      'hero-1': {
+        selector: board.name,
+        identity: {
+          uuid: board.uuid,
+          boardType: board.boardType,
+          layoutId: board.layoutId,
+          sizeId: board.sizeId,
+          setIds: board.setIds.split(',').map(Number),
+          angle: board.angle,
+        },
+        route: iosCampaignPrimaryDriveEnabled(primary)
+          ? `/climbs?screenshotBoardIndex=0&screenshotOpenFirst=1&screenshotDrive=1&screenshotClimbId=${encodeURIComponent(primary.climb.uuid)}`
+          : '/climbs?screenshotBoardIndex=0',
+      },
+      ...(options.iosCampaignPhoneBoards
+        ? compileIosCampaignPhoneNavigation(readIosCampaignPhoneSource(), options.iosCampaignPhoneBoards).commands
+        : {}),
+      ...(options.iosCampaignPhoneBoards
+        ? compileIosCampaignDuoNavigation(
+            readFileSync(join(MAESTRO_DIR, DUO_INNER_FLOW_FILE), 'utf8'),
+            options.iosCampaignPhoneBoards,
+          ).commands
+        : {}),
+    });
+  }
+  if (options.cpp && options.cpp !== 'all') {
+    env.EXPO_PUBLIC_SCREENSHOT_CPP_URL = `http://localhost:${SCREENSHOT_READY_PORT}/cpp`;
+    if (!options.cppCoverage) throw new Error('CPP capture requires explicit fixture coverage');
+    const page = options.cppCapturePage ?? readCppPage(options.cpp);
+    const commands = cppRuntimeNavigationCommands(page, options.cppCoverage, options.cppRecordedBoards ?? []);
+    env.EXPO_PUBLIC_SCREENSHOT_CPP_COMMANDS = JSON.stringify(commands);
+  }
   if (appLocale) {
     env.EXPO_PUBLIC_SCREENSHOT_LOCALE = appLocale;
   }
@@ -651,6 +961,23 @@ export function buildScreenshotEnv(
   return env;
 }
 
+/** Keep the fixture clock, origin and board roster together at both Metro call sites. */
+export function buildScreenshotSessionEnv(
+  options: ScreenshotOptions,
+  baseEnv: NodeJS.ProcessEnv,
+  appLocale: Locale | null,
+  session: Pick<ScreenshotBackendSession, 'frozenNow' | 'port' | 'capture'> | null,
+): NodeJS.ProcessEnv {
+  return buildScreenshotEnv(
+    options,
+    baseEnv,
+    appLocale,
+    session?.frozenNow ?? null,
+    session?.port ?? null,
+    session?.capture ?? null,
+  );
+}
+
 export interface DeviceInfo {
   udid: string;
   name: string;
@@ -663,13 +990,48 @@ function runInherit(command: string, args: string[], env: NodeJS.ProcessEnv, cwd
   return result.status ?? 1;
 }
 
-function runCapture(command: string, args: string[], env?: NodeJS.ProcessEnv): { status: number; stdout: string } {
+/** Bound every iOS Maestro process, including each tapless Duo inner-display pass. */
+export function runIosScreenshotMaestro(
+  maestroArgs: readonly string[],
+  context: { deviceId: string; cpp: boolean; captureDir: string; env?: NodeJS.ProcessEnv },
+  execution: { guard?: typeof guardSimulatorCommand; run?: typeof runInherit } = {},
+): number {
+  const checkLease = execution.guard ?? guardSimulatorCommand;
+  checkLease('maestro', ['--device', context.deviceId], ROOT_DIR);
+  const runCommand = execution.run ?? runInherit;
+  return runCommand(
+    'tsx',
+    [
+      resolve(ROOT_DIR, 'scripts/mobile-screenshot-maestro.ts'),
+      '--capture-timeout-ms',
+      String(context.cpp ? CPP_MAESTRO_TIMEOUT_MS : IOS_MAESTRO_TIMEOUT_MS),
+      ...maestroArgs,
+    ],
+    context.env ?? process.env,
+    context.captureDir,
+  );
+}
+
+export function runCapture(
+  command: string,
+  args: string[],
+  env?: NodeJS.ProcessEnv,
+  timeoutMs?: number,
+): { status: number; stdout: string; stderr: string } {
   guardSimulatorCommand(command, args, ROOT_DIR);
   // No `env` key at all when the caller passed none: spawnSync inherits
   // process.env only when the option is absent, and `env: undefined` would be a
   // silent, empty environment.
-  const result = spawnSync(command, args, env ? { encoding: 'utf8', env } : { encoding: 'utf8' });
-  return { status: result.status ?? 1, stdout: result.stdout ?? '' };
+  const result = spawnSync(command, args, {
+    encoding: 'utf8',
+    ...(env ? { env } : {}),
+    ...(timeoutMs ? { timeout: timeoutMs, killSignal: 'SIGKILL' as const } : {}),
+  });
+  return {
+    status: result.status ?? 1,
+    stdout: result.stdout ?? '',
+    stderr: [result.stderr, result.error?.message].filter(Boolean).join('\n'),
+  };
 }
 
 /**
@@ -685,6 +1047,11 @@ function runCapture(command: string, args: string[], env?: NodeJS.ProcessEnv): {
  */
 function simulatorLaunchEnv(): NodeJS.ProcessEnv {
   return { ...process.env, SIMCTL_CHILD_TZ: 'UTC' };
+}
+
+/** Expo's explicit process URL avoids its default-launcher fallback resetting the React host. */
+export function iosSimulatorLaunchArgs(udid: string, metroPort = METRO_PORT): string[] {
+  return ['simctl', 'launch', udid, APP_ID, '--initialUrl', `http://localhost:${metroPort}`];
 }
 
 function readPlistString(plistPath: string, key: string): string | null {
@@ -714,8 +1081,8 @@ function commandExists(command: string): boolean {
 }
 
 /** All simulator devices, flattened across runtimes. */
-function listSimulatorDevices(): DeviceInfo[] {
-  const { status, stdout } = runCapture('xcrun', ['simctl', 'list', 'devices', '--json']);
+function listSimulatorDevices(capture = runCapture): DeviceInfo[] {
+  const { status, stdout } = capture('xcrun', ['simctl', 'list', 'devices', '--json']);
   if (status !== 0) return [];
   // simctl can emit partial/empty JSON while Xcode is installing or updating
   // components; treat unparseable output as "no devices" rather than throwing a
@@ -736,26 +1103,45 @@ function listSimulatorDevices(): DeviceInfo[] {
   return devices;
 }
 
+interface SimulatorRuntimeInfo {
+  identifier: string;
+  isAvailable?: boolean;
+  version?: string;
+  supportedDeviceTypes?: Array<{ identifier?: string }>;
+}
+
+/**
+ * The newest available iOS runtime that can host `typeId`. The iPhone Duo only
+ * exists on iOS 27.1, and that runtime refuses older phones, so "newest" alone
+ * picks a runtime the device cannot be created on. Runtimes that do not list
+ * their device types are kept.
+ */
+export function pickIosRuntime(runtimes: readonly SimulatorRuntimeInfo[], typeId: string): string | null {
+  const candidates = runtimes
+    .filter((runtime) => runtime.isAvailable !== false && /iOS/i.test(runtime.identifier))
+    .filter(
+      (runtime) =>
+        !runtime.supportedDeviceTypes ||
+        typeId.length === 0 ||
+        runtime.supportedDeviceTypes.some((deviceType) => deviceType.identifier === typeId),
+    )
+    .sort((a, b) => (a.version ?? '').localeCompare(b.version ?? '', undefined, { numeric: true }));
+  return candidates.length > 0 ? candidates[candidates.length - 1].identifier : null;
+}
+
 /** Newest available iOS runtime identifier (for creating a missing device). */
-function newestIosRuntime(): string | null {
-  const { status, stdout } = runCapture('xcrun', ['simctl', 'list', 'runtimes', '--json']);
+function newestIosRuntime(typeId: string, capture = runCapture): string | null {
+  const { status, stdout } = capture('xcrun', ['simctl', 'list', 'runtimes', '--json']);
   if (status !== 0) return null;
   // Same defensive parse as listSimulatorDevices: partial JSON during a Xcode
   // component install shouldn't crash the run.
-  let parsed: {
-    runtimes: Array<{ identifier: string; isAvailable?: boolean; platform?: string; version?: string }>;
-  };
+  let parsed: { runtimes: SimulatorRuntimeInfo[] };
   try {
-    parsed = JSON.parse(stdout) as {
-      runtimes: Array<{ identifier: string; isAvailable?: boolean; platform?: string; version?: string }>;
-    };
+    parsed = JSON.parse(stdout) as { runtimes: SimulatorRuntimeInfo[] };
   } catch {
     return null;
   }
-  const ios = parsed.runtimes
-    .filter((runtime) => runtime.isAvailable !== false && /iOS/i.test(runtime.identifier))
-    .sort((a, b) => (a.version ?? '').localeCompare(b.version ?? '', undefined, { numeric: true }));
-  return ios.length > 0 ? ios[ios.length - 1].identifier : null;
+  return pickIosRuntime(parsed.runtimes, typeId);
 }
 
 export function resolveIosScreenshotDevices(
@@ -763,7 +1149,7 @@ export function resolveIosScreenshotDevices(
   orientationOverride: IosDeviceOrientation | null = null,
 ): IosScreenshotDevice[] {
   return deviceNames.map((deviceName) => {
-    const knownDevice = IOS_SCREENSHOT_DEVICES.find((device) => device.name === deviceName);
+    const knownDevice = IOS_STORE_SCREENSHOT_DEVICES.find((device) => device.name === deviceName);
     // A known device keeps its own orientation — an override never clobbers a
     // record whose orientation we already know is correct.
     if (knownDevice) return knownDevice;
@@ -786,8 +1172,8 @@ export function resolveAppStoreLocaleTargets(appLocales: readonly Locale[]): App
   }));
 }
 
-export function findOrCreateIosDevice(screenshotDevice: IosScreenshotDevice): DeviceInfo {
-  const devices = listSimulatorDevices();
+export function findOrCreateIosDevice(screenshotDevice: IosScreenshotDevice, capture = runCapture): DeviceInfo {
+  const devices = listSimulatorDevices(capture);
   const selectedUdid = process.env.BOARDSESH_IOS_SIMULATOR_UDID;
   if (selectedUdid) {
     const selectedDevice = devices.find((device) => device.udid.toUpperCase() === selectedUdid.toUpperCase());
@@ -812,18 +1198,26 @@ export function findOrCreateIosDevice(screenshotDevice: IosScreenshotDevice): De
     );
   }
 
-  const runtime = newestIosRuntime();
+  const runtime = newestIosRuntime(screenshotDevice.typeId, capture);
   if (!runtime) {
     throw new Error(
-      `No "${screenshotDevice.name}" simulator found and no iOS runtime available to create one. Open Xcode > Settings > Components to install a simulator runtime, or create the device in Xcode.`,
+      `No "${screenshotDevice.name}" simulator found and no compatible iOS runtime is available for ${screenshotDevice.typeId}. Open Xcode > Settings > Components to install a simulator runtime, or create the device in Xcode.`,
     );
   }
   console.log(`${LOG} Creating simulator "${screenshotDevice.name}" (${runtime})...`);
-  const { status } = runCapture('xcrun', ['simctl', 'create', screenshotDevice.name, screenshotDevice.typeId, runtime]);
+  const { status, stdout, stderr } = capture('xcrun', [
+    'simctl',
+    'create',
+    screenshotDevice.name,
+    screenshotDevice.typeId,
+    runtime,
+  ]);
   if (status !== 0) {
-    throw new Error(`Failed to create simulator "${screenshotDevice.name}". Create it manually in Xcode and rerun.`);
+    throw new Error(
+      `Failed to create simulator "${screenshotDevice.name}" (${screenshotDevice.typeId}, ${runtime}): ${stderr.trim() || stdout.trim() || 'simctl returned no diagnostic output'}`,
+    );
   }
-  const created = listSimulatorDevices().find((device) => device.name === screenshotDevice.name);
+  const created = listSimulatorDevices(capture).find((device) => device.name === screenshotDevice.name);
   if (!created) throw new Error(`Created "${screenshotDevice.name}" but could not locate it afterwards.`);
   return created;
 }
@@ -852,10 +1246,12 @@ export function resolveBootedIosDevice(name?: string): DeviceInfo | null {
 export function bootDevice(device: DeviceInfo): void {
   if (device.state !== 'Booted') {
     console.log(`${LOG} Booting ${device.name} (${device.udid})...`);
-    // `boot` errors if already booted; ignore that specific case.
-    runCapture('xcrun', ['simctl', 'boot', device.udid]);
   }
-  runCapture('xcrun', ['simctl', 'bootstatus', device.udid, '-b']);
+  bootIosCaptureDevice({
+    device,
+    debugDir: process.env.SCREENSHOT_DEBUG_DIR ?? join(tmpdir(), 'boardsesh-ios-boot'),
+    run: (args, timeoutMs) => runCapture('xcrun', args, undefined, timeoutMs),
+  });
   // Bring up the Simulator window so Maestro's iOS driver has a foreground app.
   spawnSync('open', ['-a', 'Simulator'], { stdio: 'ignore' });
 }
@@ -916,7 +1312,7 @@ export function findDuplicateScreenshotGroups(captureDir: string): string[][] {
 
 /**
  * The app's screenshot default when `--render-mode` is not passed. Kept in step
- * with `SCREENSHOT_RENDER_MODE` in `packages/mobile/src/lib/screenshot-mode.ts`;
+ * with the renderer fallback in `packages/mobile/src/dev/stories/StoryRoot.tsx`;
  * asserting against it is what catches a bundle that never picked the env up.
  */
 export const DEFAULT_SCREENSHOT_RENDER_MODE = 'aura';
@@ -980,7 +1376,7 @@ export function findScreenshotRenderProblems(
   }
   // The roster the app logged alongside a miss, so the failing run says what to
   // use instead. Carried separately because the app logs it on its own line —
-  // see the truncation note in screenshot-board-selection.ts.
+  // see the truncation note in dev/integration/screenshot-board-matching.ts.
   if (boardProblems.length > 0) {
     for (const line of lines) {
       const roster = line.match(BOARD_ROSTER_LINE);
@@ -1014,7 +1410,8 @@ function reportScreenshotRenderProblems(logText: string, options: ScreenshotOpti
     renderMode: options.renderMode,
     // Only the store flow is board-backed; the onboarding flow shoots screens
     // that never mount a board, so a missing render line there is expected.
-    requireRenderLine: options.flow === 'app-store',
+    // (The smoke opens a board too, and checks the same line in judgeSmokeAttempt.)
+    requireRenderLine: options.flow === 'app-store' || options.flow === 'app-store-campaign',
   });
   if (problems.length === 0) {
     for (const line of summariseScreenshotRender(logText)) {
@@ -1029,11 +1426,7 @@ function reportScreenshotRenderProblems(logText: string, options: ScreenshotOpti
   return false;
 }
 
-/**
- * The frozen-clock line the app logs once at boot
- * (`screenshot-board-auto-activator.tsx`), as it reaches the capture log —
- * Metro's tee on iOS, logcat on Android.
- */
+/** Legacy frozen-clock evidence retained for historical capture-log validation. */
 const FROZEN_CLOCK_LINE = /\[screenshot\] clock: frozen at (\S+)/;
 const LIVE_CLOCK_LINE = /\[screenshot\] clock: live/;
 
@@ -1082,6 +1475,17 @@ export function findFrozenClockProblems(logText: string, frozenNow: string): str
   return [...new Set(problems)];
 }
 
+/**
+ * Copies the capture's notes into the GitHub step summary, when there is one.
+ *
+ * A note never fails the run, so in the log it sits unread among thousands of
+ * Maestro lines. The summary is the one place a green run's caveats get seen.
+ */
+export function appendNotesToStepSummary(notes: readonly string[], summaryPath: string | undefined): void {
+  if (!summaryPath || notes.length === 0) return;
+  appendFileSync(summaryPath, `${notes.map((note) => `- Screenshot replay note: ${note}`).join('\n')}\n`);
+}
+
 /** Print what `findFrozenClockProblems` found; true when the clock is pinned correctly. */
 function reportFrozenClockProblems(logText: string, frozenNow: string, source: string): boolean {
   const problems = findFrozenClockProblems(logText, frozenNow);
@@ -1100,7 +1504,9 @@ function reportFrozenClockProblems(logText: string, frozenNow: string, source: s
  * does not cover, which is draw distance, not a broken capture).
  */
 function reportScreenshotBackendProblems(logText: string, mode: ScreenshotBackendMode): boolean {
-  for (const note of findScreenshotBackendNotes(logText)) console.log(`${LOG} NOTE: ${note}`);
+  const notes = findScreenshotBackendNotes(logText);
+  for (const note of notes) console.log(`${LOG} NOTE: ${note}`);
+  appendNotesToStepSummary(notes, process.env.GITHUB_STEP_SUMMARY);
   const problems = findScreenshotBackendProblems(logText, { mode });
   if (problems.length === 0) return true;
   for (const problem of problems) console.error(`${LOG} FAILED: ${problem}`);
@@ -1256,9 +1662,14 @@ export function startScreenshotBackend(options: ScreenshotOptions): ScreenshotBa
   const mode: ScreenshotBackendMode = options.fixtures === 'record' ? 'record' : 'replay';
   let fixturesDir = resolveFixturesDir(options);
   if (mode === 'replay' && fixturesDir === resolve(ROOT_DIR, DEFAULT_SCREENSHOT_FIXTURES_DIR)) {
-    const status = runInherit('vp', ['run', 'mobile:screenshot-fixtures-fetch'], process.env);
+    const reference = screenshotFixtureReference(options);
+    const status = runInherit(
+      'vp',
+      ['run', 'mobile:screenshot-fixtures-fetch', '--', '--reference', reference],
+      process.env,
+    );
     if (status !== 0) throw new Error('Could not download the pinned screenshot fixtures');
-    fixturesDir = fixtureSnapshotDirectory();
+    fixturesDir = fixtureSnapshotDirectory(readFixtureSnapshotReference(reference));
   }
   const port = resolveScreenshotBackendPort(process.env.BOARDSESH_SCREENSHOT_BACKEND_PORT);
   if (port === 0) {
@@ -1308,7 +1719,12 @@ export function startScreenshotBackend(options: ScreenshotOptions): ScreenshotBa
   console.log(`${LOG} Starting the screenshot backend (mode=${mode}, port=${port}, frozenNow=${frozenNow})...`);
   const backend = spawn('tsx', args, {
     cwd: ROOT_DIR,
-    env: process.env,
+    env: {
+      ...process.env,
+      ...(options.cppScenarioFile
+        ? { BOARDSESH_SCREENSHOT_CAPTURE_SCENARIO: readFileSync(options.cppScenarioFile, 'utf8') }
+        : {}),
+    },
     stdio: ['ignore', logFd, logFd],
     detached: true,
   });
@@ -1464,10 +1880,11 @@ export function collectScreenshots(
   appStoreLocales: readonly string[] | null,
   framed: boolean,
   outputRoot = OUTPUT_ROOT,
+  cpp?: CppTarget,
 ): string[] {
-  const storeRoot = join(outputRoot, STORE_BY_PLATFORM[platform]);
+  const storeRoot = join(outputRoot, STORE_BY_PLATFORM[platform], ...(cpp ? ['cpp', cpp] : []));
   const saved: string[] = [];
-  for (const storeLocale of appStoreLocales ?? ['']) {
+  for (const storeLocale of appStoreLocales?.length ? appStoreLocales : ['']) {
     const shard = join(storeLocale, deviceSlug(deviceName));
     const output = join(storeRoot, 'screenshots', shard);
     if (!framed) {
@@ -1479,6 +1896,7 @@ export function collectScreenshots(
     if (writeCapturedScreenshots(captureDir, raw).length === 0) {
       throw new Error(`No PNG screenshots were captured in ${captureDir}; refusing to frame previous images.`);
     }
+    if (cpp) cpSync(join(captureDir, 'cpp-capture.json'), join(raw, 'cpp-capture.json'));
     const status = runInherit(
       'vp',
       [
@@ -1495,6 +1913,7 @@ export function collectScreenshots(
         deviceSlug(deviceName),
         '--locale',
         captionLocale,
+        ...(cpp ? ['--cpp', cpp] : []),
       ],
       process.env,
     );
@@ -1508,6 +1927,218 @@ export function collectScreenshots(
   return saved;
 }
 
+// ---------------------------------------------------------------------------
+// The E2E gate's navigation smoke (`--flow smoke`). The decisions are pure and
+// live in scripts/lib/mobile-smoke.ts; this half reads the files and prints.
+// ---------------------------------------------------------------------------
+
+/** How long after Maestro finishes a screen may still deliver its content ping. */
+const SMOKE_PING_WAIT_SECONDS = 60;
+/** How long a rebooted emulator gets to report `sys.boot_completed`. */
+const ANDROID_REBOOT_TIMEOUT_SECONDS = 300;
+/**
+ * The simulator's log for the app, streamed for the whole smoke: SpringBoard's
+ * exit line and the app's own native logging. See findIosNativeCrashes.
+ */
+export const IOS_DEVICE_LOG_PATH = join(tmpdir(), 'boardsesh-screenshot-ios-device.log');
+
+/**
+ * Where the smoke writes its verdict. The workflow reads this file rather than
+ * the exit code, because the exit code cannot say WHY a run failed and the
+ * gate counts one failure class (the launch crash) separately.
+ */
+export function smokeResultPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.SMOKE_RESULT_PATH || join(ROOT_DIR, '.boardsesh', 'smoke-result.json');
+}
+
+/**
+ * Every attempt this invocation has judged. Module-level for the same reason as
+ * `freshConsumedThisRun`: the retry budget belongs to the process, and the
+ * platform runners below return an exit code, not a record.
+ */
+const smokeAttempts: SmokeAttempt[] = [];
+
+function readTextIfPresent(path: string): string {
+  return existsSync(path) ? readFileSync(path, 'utf8') : '';
+}
+
+/** The pings so far, waiting until every route has reported or the bound passes. */
+function waitForSmokePings(baseline = 0): SmokePing[] {
+  const deadline = Date.now() + SMOKE_PING_WAIT_SECONDS * 1000;
+  for (;;) {
+    const pings = parseSmokePingLog(readTextIfPresent(SMOKE_PING_LOG_PATH).slice(baseline));
+    if (smokePingsSettled(pings, SMOKE_ROUTES) || Date.now() >= deadline) return pings;
+    runCapture('sleep', ['1']);
+  }
+}
+
+function describeNativeCrash(crash: NativeCrash): string {
+  const timing = crash.secondsAfterStart === null ? '' : ` (${crash.secondsAfterStart}s after the process started)`;
+  const frames = crash.frames.length > 0 ? `\n      ${crash.frames.join('\n      ')}` : '';
+  return `the app's process died${timing}: ${crash.headline}${frames}`;
+}
+
+/** Keep the files a failed attempt was judged on, next to the other debug artifacts. */
+function preserveSmokeEvidence(attemptNumber: number): void {
+  const debugDir = process.env.SCREENSHOT_DEBUG_DIR;
+  if (!debugDir) return;
+  const target = join(debugDir, `smoke-attempt-${attemptNumber}`);
+  mkdirSync(target, { recursive: true });
+  for (const [source, name] of [
+    [SMOKE_PING_LOG_PATH, 'smoke-pings.log'],
+    [LOGCAT_LOG_PATH, 'logcat.txt'],
+    [IOS_DEVICE_LOG_PATH, 'ios-device.log'],
+    [METRO_LOG_PATH, 'metro.log'],
+    [SCREENSHOT_BACKEND_LOG_PATH, 'screenshot-backend.log'],
+  ] as const) {
+    if (existsSync(source)) copyFileSync(source, join(target, name));
+  }
+  console.error(`${LOG} kept the evidence for smoke attempt ${attemptNumber} in ${target}`);
+}
+
+interface SmokeAttemptInput {
+  options: ScreenshotOptions;
+  readNativeCrashes: () => NativeCrash[];
+  logStreamAlive: () => boolean;
+  reachedHome: boolean;
+  /** Maestro's exit code; null when the run never got that far. */
+  maestroStatus: number | null;
+  /** Where the app's own `[screenshot]` lines land: Metro's tee on iOS, logcat on Android. */
+  readCaptureLog: () => string;
+  backendSession: ScreenshotBackendSession | null;
+  backendLogBaseline: number;
+  /** Ignore content emitted by a terminated app process, while retaining raw evidence. */
+  smokePingBaseline?: number;
+}
+
+/**
+ * Judge one smoke attempt, print the reasons, and record it. Returns the exit
+ * code the platform runner hands back.
+ */
+function judgeSmokeAttempt(input: SmokeAttemptInput): number {
+  const { nativeCrashes, pings, logStreamAlive } = collectSmokeObservations({
+    ...input,
+    readPings: () => parseSmokePingLog(readTextIfPresent(SMOKE_PING_LOG_PATH).slice(input.smokePingBaseline ?? 0)),
+    waitForPings: () => waitForSmokePings(input.smokePingBaseline),
+  });
+  const pingProblems = findSmokePingProblems(pings, SMOKE_ROUTES);
+
+  let backendProblems: string[] = [];
+  if (input.backendSession) {
+    const backendLog = readScreenshotBackendLogSince(input.backendLogBaseline);
+    const notes = findScreenshotBackendNotes(backendLog);
+    for (const note of notes) console.log(`${LOG} NOTE: ${note}`);
+    appendNotesToStepSummary(notes, process.env.GITHUB_STEP_SUMMARY);
+    backendProblems = replayProblemsForSmoke(
+      findScreenshotBackendProblems(backendLog, { mode: input.backendSession.mode }),
+      input.reachedHome,
+    );
+  }
+
+  // Rendered content and errors are observed inside the real view tree through
+  // smoke pings. The removed screenshot renderer diagnostics are not evidence
+  // for this integration flow; native crash detection still requires its log.
+  const captureLogProblems = logStreamAlive
+    ? []
+    : ['the device log stream died: native crashes and render errors cannot be ruled out.'];
+
+  const failureClass = classifySmokeFailure({
+    nativeCrashes,
+    reachedHome: input.reachedHome,
+    backendProblems,
+    pingProblems,
+    maestroStatus: input.maestroStatus,
+    captureLogProblems,
+  });
+
+  const problems = [
+    ...nativeCrashes.map(describeNativeCrash),
+    ...pingProblems.errors,
+    ...backendProblems,
+    ...(input.reachedHome ? [] : ['the app never signalled home (auto sign-in or bundle load).']),
+    ...(input.maestroStatus !== null && input.maestroStatus !== 0
+      ? [`Maestro exited with ${input.maestroStatus}: a flow step did not hold.`]
+      : []),
+    ...pingProblems.content,
+    ...captureLogProblems,
+  ];
+  const counts = [...bestSmokeCounts(pings)].map(([route, count]) => ({ route, count }));
+  smokeAttempts.push({ failureClass, problems: failureClass === null ? [] : problems, pings: counts });
+
+  const countSummary = counts.map(({ route, count }) => `${route}=${count}`).join(', ') || 'none';
+  if (failureClass === null) {
+    console.log(`${LOG} Smoke passed. Content pings: ${countSummary}.`);
+    return 0;
+  }
+  console.error(`${LOG} FAILED: smoke attempt ${smokeAttempts.length}: ${SMOKE_FAILURE_LABELS[failureClass]}.`);
+  for (const problem of problems) console.error(`${LOG}   - ${problem}`);
+  console.error(`${LOG}   content pings received: ${countSummary}.`);
+  preserveSmokeEvidence(smokeAttempts.length);
+  return 1;
+}
+
+/** Stream the simulator's crash-relevant log lines to IOS_DEVICE_LOG_PATH until killed. */
+function startIosDeviceLogStream(udid: string, predicate = IOS_CRASH_LOG_PREDICATE): ChildProcess {
+  writeFileSync(IOS_DEVICE_LOG_PATH, '');
+  const logFile = openSync(IOS_DEVICE_LOG_PATH, 'a');
+  const stream = spawn(
+    'xcrun',
+    ['simctl', 'spawn', udid, 'log', 'stream', '--style', 'compact', '--level', 'info', '--predicate', predicate],
+    { stdio: ['ignore', logFile, 'ignore'] },
+  );
+  closeSync(logFile);
+  stream.on('error', (error) => console.error(`${LOG} simulator log stream failed to start: ${error.message}`));
+  return stream;
+}
+
+/**
+ * Put the device back to a cold state before the one retry a launch crash earns.
+ * A reinstall alone reuses the same booted system; the crash's odds have moved
+ * with the boot in every run on record, so the retry starts from a new one.
+ */
+function freshBootForSmokeRetry(options: ScreenshotOptions): void {
+  if (options.platform === 'ios') {
+    for (const screenshotDevice of resolveIosScreenshotDevices(options.devices, options.orientation)) {
+      runCapture('xcrun', ['simctl', 'shutdown', findOrCreateIosDevice(screenshotDevice).udid]);
+    }
+    return;
+  }
+  const deviceId = resolveAndroidDeviceId();
+  if (!deviceId) throw new Error('no Android device to reboot for the smoke retry');
+  console.log(`${LOG} Rebooting ${deviceId}...`);
+  runCapture('adb', ['-s', deviceId, 'reboot']);
+  runCapture('adb', ['-s', deviceId, 'wait-for-device']);
+  const deadline = Date.now() + ANDROID_REBOOT_TIMEOUT_SECONDS * 1000;
+  while (runCapture('adb', ['-s', deviceId, 'shell', 'getprop', 'sys.boot_completed']).stdout.trim() !== '1') {
+    if (Date.now() >= deadline) throw new Error(`${deviceId} did not finish booting after the smoke retry reboot`);
+    runCapture('sleep', ['2']);
+  }
+  // Dismiss the keyguard, as the emulator action does after its own boot.
+  runCapture('adb', ['-s', deviceId, 'shell', 'input', 'keyevent', '82']);
+}
+
+/** The smoke's verdict as a step-summary section. */
+export function renderSmokeSummary(result: SmokeResult): string {
+  const lines = [`### Navigation smoke (${result.platform}): ${result.passed ? 'passed' : 'failed'}`, ''];
+  result.attempts.forEach((attempt, index) => {
+    const outcome = attempt.failureClass === null ? 'passed' : SMOKE_FAILURE_LABELS[attempt.failureClass];
+    const counts = attempt.pings.map(({ route, count }) => `${route}=${count}`).join(', ') || 'none';
+    lines.push(`- Attempt ${index + 1}: ${outcome}. Content pings: ${counts}.`);
+    // First line only: a backtrace belongs in the log, not the summary.
+    for (const problem of attempt.problems) lines.push(`  - ${problem.split('\n')[0]}`);
+  });
+  return `${lines.join('\n')}\n`;
+}
+
+function writeSmokeResult(platform: 'ios' | 'android'): void {
+  const result = buildSmokeResult(platform, smokeAttempts);
+  const resultPath = smokeResultPath();
+  mkdirSync(dirname(resultPath), { recursive: true });
+  writeFileSync(resultPath, `${JSON.stringify(result, null, 2)}\n`);
+  console.log(`${LOG} Wrote the smoke result to ${resultPath}.`);
+  if (process.env.GITHUB_STEP_SUMMARY) appendFileSync(process.env.GITHUB_STEP_SUMMARY, renderSmokeSummary(result));
+}
+
 function flowFileForPlatform(options: ScreenshotOptions, platform: 'ios' | 'android'): string {
   const platformFlowFile = join(MAESTRO_DIR, `${options.flow}-${platform}.yaml`);
   if (existsSync(platformFlowFile)) return platformFlowFile;
@@ -1518,42 +2149,767 @@ export function isIpadScreenshotDevice(screenshotDevice: IosScreenshotDevice): b
   return screenshotDevice.typeId.includes('iPad');
 }
 
+export function isDuoScreenshotDevice(screenshotDevice: IosScreenshotDevice): boolean {
+  return screenshotDevice.typeId.includes('iPhone-Duo');
+}
+
+/** Store flows that shoot the Duo's two passes instead of the phone listing. */
+export function usesDuoStoreFlow(options: ScreenshotOptions, screenshotDevice: IosScreenshotDevice): boolean {
+  return (
+    !options.cpp &&
+    (options.flow === 'app-store' || options.flow === 'app-store-campaign') &&
+    isDuoScreenshotDevice(screenshotDevice)
+  );
+}
+
+export const DUO_INNER_FLOW_FILE = 'app-store-duo-inner.yaml';
+/** A segment with this comment on a line of its own starts from a freshly launched app at home. */
+export const DUO_RELAUNCH_MARKER = '# duo: relaunch';
+
+export interface DuoInnerShot {
+  /** Capture name without `.png`. */
+  name: string;
+  /** A complete Maestro flow: the source's header plus this shot's commands. */
+  flow: string;
+  relaunch: boolean;
+}
+
+/**
+ * Split the inner-display flow at each `takeScreenshot` into one flow per shot.
+ * Maestro only sees the Duo's outer display, so the orchestrator runs each
+ * shot's commands, then captures the inner display itself.
+ */
+export function splitDuoInnerFlow(source: string): DuoInnerShot[] {
+  const separator = source.indexOf('\n---\n');
+  if (separator < 0) throw new Error('Duo inner flow has no `---` header separator');
+  const header = source.slice(0, separator + 5);
+  const shots: DuoInnerShot[] = [];
+  let commands: string[] = [];
+  for (const line of source.slice(separator + 5).split('\n')) {
+    const screenshot = /^- takeScreenshot:\s*(\S+)\s*$/.exec(line);
+    if (!screenshot) {
+      commands.push(line);
+      continue;
+    }
+    const body = commands.join('\n');
+    if (!/^- /m.test(body)) throw new Error(`Duo inner shot ${screenshot[1]} has no commands before it`);
+    const relaunch = body.split('\n').some((commandLine) => commandLine.trim() === DUO_RELAUNCH_MARKER);
+    shots.push({ name: screenshot[1], flow: `${header}${body}\n`, relaunch });
+    commands = [];
+  }
+  if (/^- /m.test(commands.join('\n'))) throw new Error('Duo inner flow has commands after its last takeScreenshot');
+  if (shots.length === 0) throw new Error('Duo inner flow takes no screenshots');
+  return shots;
+}
+
+/** Compile the exact source registered in Metro before splitting the inner-display passes. */
+export function buildIosDuoInnerShots(
+  options: ScreenshotOptions,
+  screenshotDevice: IosScreenshotDevice,
+): DuoInnerShot[] {
+  let source = readFileSync(join(MAESTRO_DIR, DUO_INNER_FLOW_FILE), 'utf8');
+  if (options.flow === 'app-store-campaign' && !options.cpp) {
+    if (!options.iosCampaignPhoneBoards) throw new Error('Duo campaign requires verified board navigation');
+    source = compileIosCampaignDuoNavigation(source, options.iosCampaignPhoneBoards).source;
+  }
+  return splitDuoInnerFlow(renderMaestroFlowForIosDevice(source, screenshotDevice));
+}
+
 /**
  * The Maestro flow source for an iOS device. iPad deep links don't navigate on
  * the simulator — the "Open in 'Boardsesh'?" scheme-confirm dialog swallows every
- * `openurl` — so iPad drives navigation via sidebar coordinate taps from a
+ * `openurl` — so iPad uses localized sidebar accessibility labels from a
  * dedicated `<flow>-ipad.yaml`. Falls back to the shared `<flow>[-ios].yaml`
  * (iPhone's deep-link flow) when no iPad variant exists.
  */
 export function iosSourceFlowFile(options: ScreenshotOptions, screenshotDevice: IosScreenshotDevice): string {
+  if (options.cpp) return join(MAESTRO_DIR, 'app-store-cpp.yaml');
+  if (usesDuoStoreFlow(options, screenshotDevice)) return join(MAESTRO_DIR, 'app-store-duo.yaml');
   if (isIpadScreenshotDevice(screenshotDevice)) {
-    const ipadFlowFile = join(MAESTRO_DIR, `${options.flow}-ipad.yaml`);
+    const ipadFlow = options.flow === 'app-store-campaign' ? 'app-store' : options.flow;
+    const ipadFlowFile = join(MAESTRO_DIR, `${ipadFlow}-ipad.yaml`);
     if (existsSync(ipadFlowFile)) return ipadFlowFile;
   }
   return flowFileForPlatform(options, 'ios');
 }
 
-// The iPad flow taps sidebar items by their locale-independent testID
-// (`ipad-sidebar-<segment>`, see IpadSidebar) and verifies each navigation via
+// The iPad flow taps native sidebar items by catalog-derived accessibility labels
+// (see buildIosSidebarMaestroEnv) and verifies each navigation via
 // the item's `selected` accessibility state — no per-device coordinate math.
 // Only the orientation placeholder needs substituting per device.
 export function renderMaestroFlowForIosDevice(flowSource: string, screenshotDevice: IosScreenshotDevice): string {
   return flowSource.replaceAll(MAESTRO_DEVICE_ORIENTATION_PLACEHOLDER, screenshotDevice.orientation);
 }
 
+/** Match the genuine native row's localized status, literal title and metadata. */
+export function cppLogbookReadinessSelector(
+  climbName: string,
+  locale: Locale,
+  ascentId: unknown,
+): { id: string; text: string } {
+  if (!isCppAscentId(ascentId)) throw new Error('CPP logbook readiness requires a genuine ascent UUID');
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'you.json'), 'utf8'),
+  ) as { mobile: { logbook: { row: { a11yFlashed: string; a11ySent: string; project: string } } } };
+  const row = catalog.mobile.logbook.row;
+  const statuses = [row.a11yFlashed, row.a11ySent, row.project].map(cppReadinessSelector).join('|');
+  // LogbookRow groups its title into one accessible button with this prefix and
+  // comma-delimited metadata. The verified ascent UUID identifies this row;
+  // comma-containing climb titles cannot select a different ascent by prefix.
+  return {
+    id: `logbook-entry-${cppReadinessSelector(ascentId)}`,
+    text: `^(?:${statuses}) ${cppReadinessSelector(climbName)}, .+$`,
+  };
+}
+
+/** Select the real native menu; the original row gate still follows these steps. */
+export function cppLogbookAttemptsCommands(locale: Locale): string[] {
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'you.json'), 'utf8'),
+  ) as {
+    mobile: { logbook: { capsules: { status: string }; status: { attempts: string; all: string } } };
+  };
+  const labels = catalog.mobile.logbook;
+  const status = `^${cppReadinessSelector(labels.capsules.status)}$`;
+  const attempts = `^${cppReadinessSelector(labels.status.attempts)}$`;
+  const all = `^${cppReadinessSelector(labels.status.all)}$`;
+  const restingOrAttempts = `^(?:${cppReadinessSelector(labels.capsules.status)}|${cppReadinessSelector(labels.status.attempts)})$`;
+  // The simulator preserves logbook preferences between retries/locales. An
+  // already selected Attempts capsule needs no tap; never toggle back to All.
+  return [
+    `- extendedWaitUntil:\n    visible: ${JSON.stringify(restingOrAttempts)}\n    timeout: 30000`,
+    `- extendedWaitUntil:\n    notVisible: ${JSON.stringify(all)}\n    timeout: 30000`,
+    `- runFlow:\n    when:\n      visible: ${JSON.stringify(status)}\n    commands:\n      - tapOn: ${JSON.stringify(status)}\n      - extendedWaitUntil:\n          visible: ${JSON.stringify(all)}\n          timeout: 30000\n      - tapOn: ${JSON.stringify(attempts)}`,
+    `- extendedWaitUntil:\n    notVisible: ${JSON.stringify(all)}\n    timeout: 30000`,
+    `- extendedWaitUntil:\n    visible: ${JSON.stringify(attempts)}\n    timeout: 30000`,
+  ];
+}
+
+/** The native badge exists only for integer counts above one. */
+function cppFrameCountReadinessSelector(locale: Locale): string {
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'climbs.json'), 'utf8'),
+  ) as { mobile: { climbRow: { frameCount_other: string } } };
+  return catalog.mobile.climbRow.frameCount_other
+    .split('{{count}}')
+    .map(cppReadinessSelector)
+    .join('(?:[2-9]|[1-9][0-9]+)');
+}
+
+/** Native composed content can announce its frame badge before the title. */
+export function cppClimbRowReadinessSelector(climbName: string, locale: Locale): string {
+  return `^(?:${cppFrameCountReadinessSelector(locale)}, )?${cppReadinessSelector(climbName)}, .+$`;
+}
+
+/** Native queue rows announce the exact climb title followed by their position. */
+export function cppQueueReadinessSelectors(climbName: string, locale: Locale): { row: string; header: string } {
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'session.json'), 'utf8'),
+  ) as { queueDrawer: { title: string }; mobile: { queue: { positionLabel: string; addedByAria: string } } };
+  const position = catalog.mobile.queue.positionLabel.split('{{position}}').map(cppReadinessSelector).join('[0-9]+');
+  const addedBy = catalog.mobile.queue.addedByAria.split('{{name}}').map(cppReadinessSelector).join('.+');
+  return {
+    row: `^${cppReadinessSelector(climbName)}, ${position}(?:, ${addedBy})?(?:, ${cppFrameCountReadinessSelector(locale)})?$`,
+    // The native header also contains the localized climb count. Its composite
+    // announcement can include that text alongside the real queue title.
+    header: `.*${cppReadinessSelector(catalog.queueDrawer.title)}.*`,
+  };
+}
+
+export function cppBoardHeaderReadinessSelector(board: CppBoard, coverage: CppCaptureCoverage): string {
+  const name = coverage.boardNames?.[board.id];
+  if (!name?.trim()) throw new Error(`CPP board ${board.id} needs its genuine recorded name`);
+  const label = formatActiveBoardLabel({ name, boardType: board.boardType, angle: board.angle ?? null });
+  return `^${cppReadinessSelector(label!)}${board.angle == null ? '(?: • -?[0-9]+(?:\\.[0-9]+)?°)?' : ''}$`;
+}
+
+/** The capsule announces the actual lit climb, never an arbitrary list row. */
+export function cppWallStatusReadinessSelector(climbName: string, locale: Locale): string {
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'session.json'), 'utf8'),
+  ) as { mobile: { boardPresence: { stripA11yLabel: string; stripA11yLabelWithSender: string } } };
+  const expand = (template: string) =>
+    template
+      .split(/(\{\{(?:name|grade|sender)\}\})/)
+      .map((part) => {
+        if (part === '{{name}}') return cppReadinessSelector(climbName);
+        if (part === '{{grade}}') return '[^,\\r\\n]*';
+        if (part === '{{sender}}') return '[^\\r\\n]+';
+        return cppReadinessSelector(part);
+      })
+      .join('');
+  const labels = catalog.mobile.boardPresence;
+  return `^(?:${expand(labels.stripA11yLabel)}|${expand(labels.stripA11yLabelWithSender)})$`;
+}
+
+/** Actual GradeRail labels and its genuine, localized count subtitle. */
+export function cppGradeFilterSelectors(filter: NonNullable<CppSceneCoverage['gradeFilter']>, locale: Locale) {
+  if (
+    !filter.minLabel?.trim() ||
+    (filter.maxLabel !== undefined && !filter.maxLabel.trim()) ||
+    !Number.isInteger(filter.minGradeId) ||
+    !Number.isInteger(filter.maxGradeId) ||
+    filter.minGradeId > filter.maxGradeId ||
+    !Number.isSafeInteger(filter.expectedCount) ||
+    filter.expectedCount < 1
+  )
+    throw new Error('CPP grade filter requires genuine bounds, labels and a positive count');
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'climbs.json'), 'utf8'),
+  ) as {
+    mobile: {
+      gradeRail: { selectedFilterAria: string };
+      filter: Record<string, string>;
+    };
+  };
+  const grade = (template: string, label: string) =>
+    `^${cppReadinessSelector(template.replaceAll('{{grade}}', () => label))}$`;
+  const countTemplate =
+    catalog.mobile.filter[`matchingCount_${new Intl.PluralRules(locale).select(filter.expectedCount)}`];
+  if (!countTemplate) throw new Error(`Missing native matchingCount plural for ${locale}`);
+  const countLabel = countTemplate.replace(/\{\{count(?:, number)?\}\}/g, () =>
+    new Intl.NumberFormat(locale).format(filter.expectedCount),
+  );
+  return {
+    minSelected: grade(catalog.mobile.gradeRail.selectedFilterAria, filter.minLabel),
+    maxSelected: filter.maxLabel ? grade(catalog.mobile.gradeRail.selectedFilterAria, filter.maxLabel) : undefined,
+    reset: `^${cppReadinessSelector(catalog.mobile.filter.reset)}$`,
+    close: `^${cppReadinessSelector(catalog.mobile.filter.close)}$`,
+    count: `^${cppReadinessSelector(countLabel)}$`,
+  };
+}
+
+export function cppMirrorSelectors(locale: Locale) {
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'session.json'), 'utf8'),
+  ) as {
+    playView: { actionBar: { mirrorAria: string; unmirrorAria: string } };
+  };
+  return {
+    mirror: `^${cppReadinessSelector(catalog.playView.actionBar.mirrorAria)}$`,
+    unmirror: `^${cppReadinessSelector(catalog.playView.actionBar.unmirrorAria)}$`,
+  };
+}
+
+/** The real list's error CTA retries its current query without changing inputs. */
+export function cppClimbListErrorSelectors(locale: Locale) {
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'common.json'), 'utf8'),
+  ) as { mobile: { offlineState: { errorTitle: string; retry: string } } };
+  const { errorTitle, retry } = catalog.mobile.offlineState;
+  // UIKit flattens climbs-screen into a sibling marker. The generic FlashList
+  // remains the real ancestor while its stricter owned-results ID is absent.
+  const childOf = { id: '^climb-list$' };
+  return {
+    error: { text: `^${cppReadinessSelector(errorTitle)}$`, childOf },
+    retry: { text: `^${cppReadinessSelector(retry)}$`, childOf, enabled: true },
+  };
+}
+
+/** Strict target fixture text supplies content gates; no default campaign scenes are reused. */
+export function renderCppMaestroFlow(
+  target: CppTarget,
+  device: IosScreenshotDevice,
+  coverage?: CppCaptureCoverage,
+  locale: Locale = 'en-US',
+  recordFixtures = false,
+  logbookAttempts?: CppLogbookAttemptsProof,
+): string {
+  if (!coverage || coverage.target !== target) throw new Error(`Missing CPP content gates for ${target}`);
+  if (
+    target === 'moonboard' &&
+    !recordFixtures &&
+    (!logbookAttempts ||
+      logbookAttempts.target !== target ||
+      logbookAttempts.ascentId !== coverage.scenes.logbook.ascentId ||
+      !/^[a-f0-9]{64}$/.test(logbookAttempts.variablesHash) ||
+      !/^[a-f0-9]{64}$/.test(logbookAttempts.responseSha256))
+  )
+    throw new Error('MoonBoard replay requires the prepared genuine Attempts page');
+  const page = readCppPage(target);
+  const ipad = isIpadScreenshotDevice(device);
+  const navigation = cppRuntimeNavigationCommands(page, coverage, []);
+  const scenes = [
+    ...page.heroBoards.map((board, index) => ({
+      command: `hero-${index + 1}`,
+      filename: `hero-${index + 1}`,
+      ready:
+        coverage.heroClimbs?.[board.id]?.readyText ??
+        coverage.boardReadyTextByLocale?.[board.id]?.[locale] ??
+        coverage.boardReadyText[board.id],
+      wallEditor: coverage.boardHeroModes?.[board.id] === 'wall-editor',
+      variant: board,
+    })),
+    ...page.otherBoards.map((board, index) => ({
+      command: `other-${index + 1}`,
+      filename: `other-${index + 1}`,
+      ready:
+        coverage.heroClimbs?.[board.id]?.readyText ??
+        coverage.boardReadyTextByLocale?.[board.id]?.[locale] ??
+        coverage.boardReadyText[board.id],
+      wallEditor: coverage.boardHeroModes?.[board.id] === 'wall-editor',
+      variant: board,
+    })),
+    // Restore a real primary solo climb after the other-board trio. It differs
+    // from the lit wall climb, so the wall-status capsule names a different climb
+    // from the pick (it shows either way since the 2026-11-02 owner decision).
+    ...(coverage.accessoryClimb
+      ? [
+          {
+            command: 'accessory-prepare',
+            filename: '',
+            ready: coverage.accessoryClimb.readyText,
+            wallEditor: false,
+            variant: page.primaryBoard,
+          },
+        ]
+      : []),
+    ...['search', 'workout', 'status', 'queue', 'logbook', 'led', 'island']
+      .filter((scene) => scene !== 'island' || ipad || !page.recipes.phone.some((recipe) => recipe.liveActivity))
+      .map((scene) => ({
+        command:
+          target !== 'spray' && ipad && scene === 'island'
+            ? 'kiosk'
+            : target !== 'spray' && ipad && scene === 'status'
+              ? 'status-ipad'
+              : scene,
+        filename: [
+          '02-search',
+          '03-logbook',
+          target === 'spray' ? '04-setting' : '04-led',
+          '05-queue',
+          '06-workout',
+          target === 'spray' ? '07-playlist' : '07-status',
+          target === 'spray' ? '08-holds' : ipad ? '08-kiosk' : '08-island',
+        ][['search', 'logbook', 'led', 'queue', 'workout', 'status', 'island'].indexOf(scene)],
+        ready: coverage.scenes[scene].readyTextByLocale?.[locale] ?? coverage.scenes[scene].readyText,
+        wallEditor: false,
+        variant: undefined,
+      })),
+  ];
+  const commands: string[] = [];
+  const gradeFilter = coverage.scenes.search.gradeFilter;
+  const gradeSelectors = gradeFilter ? cppGradeFilterSelectors(gradeFilter, locale) : null;
+  const gradeControl = (text: string, selected?: boolean) => ({
+    text,
+    ...(selected === undefined ? {} : { selected }),
+  });
+  // UIKit's accessibility tree exposes the filter toolbar, column and chips
+  // as peers. Match the real control's exact ID/label/state, not JSX ancestry.
+  const filterReset = { id: '^sheet-top-bar-trailing$', text: gradeSelectors?.reset };
+  const resetFilters = `- tapOn: ${JSON.stringify({ ...filterReset, enabled: true })}\n- extendedWaitUntil:\n    visible: ${JSON.stringify({ ...filterReset, enabled: false })}\n    timeout: 90000\n- waitForAnimationToEnd:\n    timeout: 30000`;
+  const dismiss = `- repeat:\n    times: 2\n    commands:\n      - runFlow:\n          when:\n            visible: \${SCREENSHOT_CLOSE_LABEL}\n          commands:\n            - tapOn: \${SCREENSHOT_CLOSE_LABEL}\n            - waitForAnimationToEnd`;
+  // Close only the real open-state control; a second tap would reopen it.
+  const openSidebar = 'id: "^ToggleSidebar$"\ntext: "^${SCREENSHOT_SIDEBAR_HIDE_LABEL}$"';
+  const collapseSidebarCommands = [
+    `- repeat:\n    times: 3\n    while:\n      visible:\n${openSidebar
+      .split('\n')
+      .map((line) => `        ${line}`)
+      .join('\n')}\n    commands:\n      - tapOn:\n${openSidebar
+      .split('\n')
+      .map((line) => `          ${line}`)
+      .join('\n')}\n      - waitForAnimationToEnd:\n          timeout: 30000`,
+    `- extendedWaitUntil:\n    notVisible:\n${openSidebar
+      .split('\n')
+      .map((line) => `      ${line}`)
+      .join('\n')}\n    timeout: 15000`,
+    '- waitForAnimationToEnd:\n    timeout: 30000',
+  ];
+  const editorCatalog =
+    target === 'spray' && ipad
+      ? (JSON.parse(readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'climbs.json'), 'utf8')) as {
+          mobile: { create: { fab: { ariaLabel: string }; actions: { close: string } } };
+        })
+      : undefined;
+  for (const scene of scenes) {
+    const tabletWallEditor = target === 'spray' && ipad && scene.wallEditor;
+    const navigationScene = tabletWallEditor ? `${scene.command}-editor-list` : scene.command;
+    const selectedHero =
+      scene.command === 'accessory-prepare'
+        ? coverage.accessoryClimb
+        : scene.variant
+          ? coverage.heroClimbs?.[scene.variant.id]
+          : undefined;
+    const sceneCommands =
+      scene.command === 'queue'
+        ? ['queue-join', scene.command]
+        : scene.command === 'search'
+          ? [scene.command, ...(gradeSelectors ? ['search-grade'] : []), 'search-results']
+          : [navigationScene];
+    for (const command of sceneCommands) {
+      if (!navigation[command]) throw new Error(`CPP ${target} has no native navigation command for ${command}`);
+    }
+    if (!scene.ready?.trim()) throw new Error(`Missing CPP ready text for ${scene.command}`);
+    commands.push(dismiss);
+    if (scene.command === 'logbook') {
+      if (!ipad)
+        commands.push('- extendedWaitUntil:\n    notVisible:\n      id: play-drawer-board-overlay\n    timeout: 60000');
+    }
+    if (scene.command === 'queue') {
+      commands.push(
+        "- evalScript: ${output.cppSequence = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/set?scene=queue-join').body).sequence}",
+        "- retry:\n    maxRetries: 3\n    commands:\n      - evalScript: ${output.cppAcknowledged = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/status?waitFor=' + output.cppSequence).body).acknowledged}\n      - assertTrue: ${output.cppAcknowledged == output.cppSequence}",
+        '- extendedWaitUntil:\n    visible: ${SCREENSHOT_JOIN_LABEL}\n    timeout: 90000',
+        '- tapOn: ${SCREENSHOT_JOIN_LABEL}',
+        '- waitForAnimationToEnd',
+      );
+      if (ipad)
+        commands.push(
+          // Join replaces its route with Session. Wait for that native selection
+          // before using the Climbs tab, which UIKit also exposes when collapsed.
+          '- extendedWaitUntil:\n    visible:\n      text: ${SCREENSHOT_SIDEBAR_RECORD_LABEL}\n      selected: true\n    timeout: 90000',
+          '- extendedWaitUntil:\n    visible:\n      text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}\n      selected: false\n    timeout: 90000',
+          // Retained French tablet traces hit this unique enabled tab correctly,
+          // but the first tap sometimes leaves Session selected. Recheck native
+          // selection before each bounded retry; a completed tap is not readiness.
+          target === 'spray'
+            ? '- tapOn:\n    text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}\n    selected: false'
+            : '- repeat:\n    times: 3\n    while:\n      visible:\n        text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}\n        selected: false\n        enabled: true\n    commands:\n      - tapOn:\n          text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}\n          selected: false\n          enabled: true\n      - waitForAnimationToEnd:\n          timeout: 10000',
+          '- extendedWaitUntil:\n    visible:\n      text: ${SCREENSHOT_SIDEBAR_CLIMBS_LABEL}\n      selected: true\n    timeout: 90000',
+        );
+    }
+    commands.push(
+      `- evalScript: \${output.cppSequence = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/set?scene=${navigationScene}').body).sequence}`,
+      "- retry:\n    maxRetries: 3\n    commands:\n      - evalScript: ${output.cppAcknowledged = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/status?waitFor=' + output.cppSequence).body).acknowledged}\n      - assertTrue: ${output.cppAcknowledged == output.cppSequence}",
+    );
+    if (tabletWallEditor) {
+      const create = { text: `^${cppReadinessSelector(editorCatalog!.mobile.create.fab.ariaLabel)}$`, enabled: true };
+      commands.push(
+        '- extendedWaitUntil:\n    visible:\n      id: "^climbs-screen$"\n    timeout: 90000',
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(cppBoardHeaderReadinessSelector(scene.variant!, coverage))}\n    timeout: 90000`,
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(create)}\n    timeout: 90000`,
+        `- tapOn: ${JSON.stringify(create)}`,
+      );
+    }
+    if (selectedHero && !scene.wallEditor) {
+      if (!isCppClimbId(selectedHero.climbId) || selectedHero.boardId !== coverage.boardIds?.[scene.variant!.id])
+        throw new Error(`CPP ${scene.command} requires a genuine selected climb on its actual board`);
+      if (
+        recordFixtures &&
+        ipad &&
+        scene.variant?.boardType !== 'spray' &&
+        (scene.command.startsWith('hero-') || scene.command.startsWith('other-'))
+      ) {
+        const listError = cppClimbListErrorSelectors(locale);
+        const paintedHero = {
+          id: `^${cppReadinessSelector(`cpp-climb-painted-${selectedHero.boardId}-${selectedHero.climbId}`)}$`,
+        };
+        // A live list can settle into its genuine error state before data lands.
+        // Tap only that list's real retry CTA on the acknowledged, owned board.
+        // Wait after a real retry tap only. Normal loads keep the original
+        // 90-second paint gate instead of gaining a shorter recording deadline.
+        commands.push(
+          `- retry:\n    maxRetries: 2\n    commands:\n      - runFlow:\n          when:\n            visible: ${JSON.stringify(listError.error)}\n          commands:\n            - assertVisible:\n                id: "^climbs-screen$"\n            - assertVisible: ${JSON.stringify(cppBoardHeaderReadinessSelector(scene.variant!, coverage))}\n            - tapOn: ${JSON.stringify(listError.retry)}\n            - extendedWaitUntil:\n                visible: ${JSON.stringify(paintedHero)}\n                timeout: 30000`,
+        );
+      }
+    }
+    if (scene.command === 'logbook') {
+      const rowSelector = cppLogbookReadinessSelector(scene.ready, locale, coverage.scenes.logbook.ascentId);
+      commands.push(
+        '- extendedWaitUntil:\n    visible:\n      id: logbook-screen\n    timeout: 90000',
+        ...(target === 'moonboard' && !recordFixtures ? cppLogbookAttemptsCommands(locale) : []),
+        // Maestro 2.6.1 has no scrollUntilVisible parent/max-swipes options.
+        // A bounded loop swipes only from the real FlashList and stops once
+        // this verified ascent's composite accessibility row is visible.
+        `- repeat:\n    times: 5\n    while:\n      notVisible:\n        id: ${JSON.stringify(rowSelector.id)}\n        text: ${JSON.stringify(rowSelector.text)}\n    commands:\n      - swipe:\n          from:\n            id: logbook-screen\n          direction: UP\n          duration: 700\n      - waitForAnimationToEnd:\n          timeout: 30000`,
+        `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(rowSelector.id)}\n      text: ${JSON.stringify(rowSelector.text)}\n    timeout: 90000`,
+      );
+    } else if (scene.command === 'status' && target === 'spray') {
+      // Projects renders ClimbListRow as one accessible name/author/grade row.
+      // Match that real row; Maestro cannot find a standalone title inside it.
+      const rowSelector = { id: '^climb-row$', text: cppClimbRowReadinessSelector(scene.ready, locale) };
+      commands.push(`- extendedWaitUntil:\n    visible: ${JSON.stringify(rowSelector)}\n    timeout: 90000`);
+    } else if (scene.command === 'status' && target !== 'spray') {
+      commands.push(
+        '- extendedWaitUntil:\n    visible:\n      id: climbs-screen\n    timeout: 90000',
+        '- extendedWaitUntil:\n    notVisible:\n      id: play-drawer-board-overlay\n    timeout: 60000',
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(cppWallStatusReadinessSelector(scene.ready, locale))}\n    timeout: 90000`,
+      );
+    } else if (scene.command === 'status-ipad') {
+      const status = coverage.scenes.status;
+      if (!isCppClimbId(status.climbId)) throw new Error('CPP tablet wall status requires its genuine climb ID');
+      commands.push(
+        '- extendedWaitUntil:\n    visible:\n      id: climbs-screen\n    timeout: 90000',
+        `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(cppReadinessSelector(`cpp-climb-list-${status.boardId}`))}\n    timeout: 90000`,
+        '- extendedWaitUntil:\n    visible:\n      id: play-drawer-board-overlay\n    timeout: 60000',
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(cppBoardHeaderReadinessSelector(page.primaryBoard, coverage))}\n    timeout: 90000`,
+        '- extendedWaitUntil:\n    visible:\n      id: board-sheet-stats\n    timeout: 60000',
+        `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(cppReadinessSelector(`cpp-wall-hero-${status.boardId}-${status.climbId}`))}\n    timeout: 90000`,
+      );
+      if (coverage.heroClimbs)
+        commands.push(
+          `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(cppReadinessSelector(`cpp-climb-painted-${status.boardId}-${status.climbId}`))}\n    timeout: 90000`,
+        );
+    } else if (scene.command !== 'queue')
+      commands.push(
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(cppReadinessSelector(scene.ready))}\n    timeout: 90000`,
+      );
+    commands.push('- waitForAnimationToEnd:\n    timeout: 30000');
+    if (selectedHero && !scene.wallEditor) {
+      commands.push(
+        `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(cppReadinessSelector(`cpp-climb-painted-${selectedHero.boardId}-${selectedHero.climbId}`))}\n    timeout: 90000`,
+      );
+      if (selectedHero.gradeLabel)
+        commands.push(
+          `- extendedWaitUntil:\n    visible: ${JSON.stringify(`^${cppReadinessSelector(selectedHero.gradeLabel)}$`)}\n    timeout: 90000`,
+        );
+    }
+    if (
+      !ipad &&
+      coverage.accessoryClimb &&
+      (!scene.filename || scene.command === 'workout' || scene.command === 'status')
+    ) {
+      const primary = coverage.accessoryClimb;
+      if (!scene.filename)
+        commands.push(
+          dismiss,
+          '- extendedWaitUntil:\n    notVisible:\n      id: play-drawer-board-overlay\n    timeout: 60000',
+          '- waitForAnimationToEnd:\n    timeout: 30000',
+        );
+      commands.push(
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify({ id: `^cpp-accessory-climb-${cppReadinessSelector(primary.climbId)}$`, text: `^${cppReadinessSelector(primary.readyText)}$` })}\n    timeout: 90000`,
+      );
+    }
+    if (ipad && scene.variant && !scene.wallEditor) {
+      const uuid = coverage.boardIds?.[scene.variant.id];
+      if (!uuid?.trim()) throw new Error(`CPP ${scene.variant.id} lacks its genuine board UUID`);
+      const scrollSelectedHero =
+        target !== 'spray' &&
+        selectedHero !== undefined &&
+        (scene.command.startsWith('hero-') || scene.command.startsWith('other-'));
+      const listId = cppReadinessSelector(`cpp-climb-list-${uuid}`);
+      const listSelector = { id: scrollSelectedHero ? `^${listId}$` : listId };
+      const rowSelector = {
+        id: scrollSelectedHero ? '^climb-row$' : 'climb-row',
+        text: cppClimbRowReadinessSelector(scene.ready, locale),
+      };
+      commands.push(
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(listSelector)}\n    timeout: 90000`,
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(cppBoardHeaderReadinessSelector(scene.variant, coverage))}\n    timeout: 90000`,
+      );
+      if (scrollSelectedHero)
+        // A genuine selected hero can be eighth in the first ten query rows,
+        // below the tablet viewport even after its detail has painted. Search
+        // only this owned board's FlashList and retain the final exact row gate.
+        commands.push(
+          `- repeat:\n    times: 3\n    while:\n      notVisible: ${JSON.stringify(rowSelector)}\n    commands:\n      - swipe:\n          from: ${JSON.stringify(listSelector)}\n          direction: UP\n          duration: 700\n      - waitForAnimationToEnd:\n          timeout: 30000`,
+        );
+      commands.push(
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(rowSelector)}\n    timeout: 90000`,
+        '- extendedWaitUntil:\n    visible:\n      id: play-drawer-board-overlay\n    timeout: 60000',
+        '- waitForAnimationToEnd:\n    timeout: 30000',
+      );
+    }
+    if (
+      !ipad &&
+      !scene.wallEditor &&
+      (scene.command.startsWith('hero-') ||
+        scene.command.startsWith('other-') ||
+        scene.command === 'queue' ||
+        (scene.command === 'island' && target !== 'spray'))
+    )
+      commands.push('- extendedWaitUntil:\n    visible:\n      id: play-drawer-board-overlay\n    timeout: 60000');
+    if (scene.command === 'island' && target === 'spray')
+      commands.push('- extendedWaitUntil:\n    visible:\n      id: spray-hold-editor-board\n    timeout: 60000');
+    if (scene.wallEditor)
+      commands.push('- extendedWaitUntil:\n    visible:\n      id: create-climb-editor\n    timeout: 60000');
+    if (tabletWallEditor)
+      commands.push(
+        '- extendedWaitUntil:\n    notVisible:\n      id: "^play-drawer-board-overlay$"\n    timeout: 60000',
+        '- extendedWaitUntil:\n    notVisible:\n      id: "^board-sheet-stats$"\n    timeout: 60000',
+      );
+    if (scene.command === 'search')
+      commands.push('- extendedWaitUntil:\n    visible:\n      id: climb-filter-column\n    timeout: 60000');
+    if (scene.command === 'search' && gradeSelectors) {
+      // Maestro's visible selector finds hierarchy entries even offscreen, and
+      // tapOn uses their coordinates. Use the fixed real header Reset, then
+      // the capture route's validated native live-filter action for the range.
+      commands.push(
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify({ id: '^sheet-top-bar-leading$', text: gradeSelectors.close, enabled: true })}\n    timeout: 90000`,
+        `- runFlow:\n    when:\n      visible: ${JSON.stringify({ ...filterReset, enabled: true })}\n    commands:\n${resetFilters
+          .split('\n')
+          .map((line) => `      ${line}`)
+          .join('\n')}`,
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify({ ...filterReset, enabled: false })}\n    timeout: 90000`,
+        "- evalScript: ${output.cppSequence = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/set?scene=search-grade').body).sequence}",
+        "- retry:\n    maxRetries: 3\n    commands:\n      - evalScript: ${output.cppAcknowledged = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/status?waitFor=' + output.cppSequence).body).acknowledged}\n      - assertTrue: ${output.cppAcknowledged == output.cppSequence}",
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(gradeControl(gradeSelectors.minSelected, true))}\n    timeout: 90000`,
+      );
+      if (gradeFilter?.maxLabel && gradeFilter.maxLabel !== gradeFilter.minLabel)
+        commands.push(
+          `- extendedWaitUntil:\n    visible: ${JSON.stringify(gradeControl(gradeSelectors.maxSelected!, true))}\n    timeout: 90000`,
+        );
+      if (recordFixtures) {
+        const proofCondition = `\${output.cppGradeCount.sequence == output.cppSequence && output.cppGradeCount.locale == '${locale}' && output.cppGradeCount.proof.totalCount > 0}`;
+        const recordedCountProof = `- retry:\n    maxRetries: 3\n    commands:\n      - evalScript: \${output.cppGradeCount = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/grade-count?sequence=' + output.cppSequence + '&locale=${locale}').body)}\n      - assertTrue: ${proofCondition}`;
+        const commandAck =
+          "- retry:\n    maxRetries: 3\n    commands:\n      - evalScript: ${output.cppAcknowledged = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/status?waitFor=' + output.cppSequence).body).acknowledged}\n      - assertTrue: ${output.cppAcknowledged == output.cppSequence}";
+        const remountFilters = [
+          `- tapOn: ${JSON.stringify({ id: '^sheet-top-bar-leading$', text: gradeSelectors.close, enabled: true })}`,
+          '- extendedWaitUntil:\n    notVisible:\n      id: climb-filter-column\n    timeout: 60000',
+          "- evalScript: ${output.cppSequence = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/set?scene=search-results').body).sequence}",
+          commandAck,
+          "- evalScript: ${output.cppSequence = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/set?scene=search-grade').body).sequence}",
+          commandAck,
+          '- extendedWaitUntil:\n    visible:\n      id: climb-filter-column\n    timeout: 90000',
+          `- extendedWaitUntil:\n    visible: ${JSON.stringify(gradeControl(gradeSelectors.minSelected, true))}\n    timeout: 90000`,
+          ...(gradeFilter?.maxLabel && gradeFilter.maxLabel !== gradeFilter.minLabel
+            ? [
+                `- extendedWaitUntil:\n    visible: ${JSON.stringify(gradeControl(gradeSelectors.maxSelected!, true))}\n    timeout: 90000`,
+              ]
+            : []),
+          recordedCountProof,
+        ].join('\n');
+        // Recording can finish a genuine upstream count after the phone's
+        // request expires. Remount only a missing native count; a 30s wait
+        // lets an initially pending query expire before the next mount refetches.
+        // Recheck proof even when a later attempt skips the remount branch.
+        commands.push(
+          recordedCountProof,
+          `- retry:\n    maxRetries: 2\n    commands:\n      - runFlow:\n          when:\n            notVisible: \${output.cppGradeCount.selector}\n          commands:\n${remountFilters
+            .split('\n')
+            .map((line) => `            ${line}`)
+            .join(
+              '\n',
+            )}\n      - assertTrue: ${proofCondition}\n      - extendedWaitUntil:\n          visible: \${output.cppGradeCount.selector}\n          timeout: 30000`,
+        );
+      }
+      commands.push(
+        recordFixtures
+          ? '- extendedWaitUntil:\n    visible: ${output.cppGradeCount.selector}\n    timeout: 90000'
+          : `- extendedWaitUntil:\n    visible: ${JSON.stringify(gradeSelectors.count)}\n    timeout: 90000`,
+        '- waitForAnimationToEnd:\n    timeout: 30000',
+      );
+    }
+    const mirrorHero =
+      target === 'tension' && !!scene.filename && scene.variant?.id === page.primaryBoard.id && !!selectedHero;
+    const mirrorSelectors = mirrorHero ? cppMirrorSelectors(locale) : null;
+    if (mirrorSelectors && selectedHero)
+      commands.push(
+        `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(cppReadinessSelector(`cpp-climb-local-mirror-${selectedHero.boardId}-${selectedHero.climbId}`))}\n    timeout: 60000`,
+        `- extendedWaitUntil:\n    visible:\n      text: ${JSON.stringify(mirrorSelectors.mirror)}\n      selected: false\n    timeout: 60000`,
+        `- tapOn: ${JSON.stringify(mirrorSelectors.mirror)}`,
+        `- extendedWaitUntil:\n    visible:\n      text: ${JSON.stringify(mirrorSelectors.unmirror)}\n      selected: true\n    timeout: 60000`,
+        `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(cppReadinessSelector(`cpp-climb-painted-${selectedHero.boardId}-${selectedHero.climbId}-mirrored`))}\n    timeout: 60000`,
+        '- waitForAnimationToEnd:\n    timeout: 30000',
+      );
+    if (scene.command === 'queue') {
+      const selectors = cppQueueReadinessSelectors(scene.ready, locale);
+      // The modal removes sidebar controls from accessibility while leaving the
+      // floating sidebar drawn underneath. Verify it is closed before opening.
+      if (ipad)
+        commands.push(
+          ...collapseSidebarCommands,
+          '- extendedWaitUntil:\n    visible:\n      id: "^ToggleSideBar$"\n      text: "^${SCREENSHOT_SIDEBAR_TOGGLE_LABEL}$"\n    timeout: 15000',
+        );
+      commands.push(
+        '- tapOn: ${SCREENSHOT_QUEUE_LABEL}',
+        '- swipe:\n    start: "50%,54%"\n    end: "50%,15%"\n    duration: 700',
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(selectors.header)}\n    timeout: 60000`,
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(selectors.row)}\n    timeout: 90000`,
+        '- waitForAnimationToEnd:\n    timeout: 30000',
+      );
+    }
+    if (scene.command === 'island' && target !== 'spray')
+      commands.push(
+        '- tapOn:\n    point: "87%,84%"',
+        '- waitForAnimationToEnd',
+        '- pressKey: home',
+        '- longPressOn:\n    point: "50%,3%"',
+        '- extendedWaitUntil:\n    visible: "Next climb"\n    timeout: 15000',
+      );
+    if (scene.filename && scene.variant && scene.variant.boardType !== 'spray' && !scene.wallEditor) {
+      const drivingId = selectedHero
+        ? `^${cppReadinessSelector(`store-driving-${selectedHero.boardId}-${selectedHero.climbId}${mirrorHero ? '-mirrored' : ''}`)}$`
+        : '^store-driving-.+$';
+      commands.push(`- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(drivingId)}\n    timeout: 60000`);
+    }
+    if (ipad) commands.push(...collapseSidebarCommands);
+    if (scene.filename) commands.push(`- takeScreenshot: ${scene.filename}`);
+    if (tabletWallEditor) {
+      const close = { text: `^${cppReadinessSelector(editorCatalog!.mobile.create.actions.close)}$`, enabled: true };
+      commands.push(
+        `- extendedWaitUntil:\n    visible: ${JSON.stringify(close)}\n    timeout: 60000`,
+        `- tapOn: ${JSON.stringify(close)}`,
+        '- extendedWaitUntil:\n    notVisible:\n      id: "^create-climb-editor$"\n    timeout: 60000',
+      );
+    }
+    if (mirrorSelectors && selectedHero)
+      commands.push(
+        `- tapOn: ${JSON.stringify(mirrorSelectors.unmirror)}`,
+        `- extendedWaitUntil:\n    visible:\n      text: ${JSON.stringify(mirrorSelectors.mirror)}\n      selected: false\n    timeout: 60000`,
+        `- extendedWaitUntil:\n    visible:\n      id: ${JSON.stringify(cppReadinessSelector(`cpp-climb-painted-${selectedHero.boardId}-${selectedHero.climbId}`))}\n    timeout: 60000`,
+        '- waitForAnimationToEnd:\n    timeout: 30000',
+      );
+    if (scene.command === 'search') {
+      if (gradeSelectors)
+        commands.push(
+          `- extendedWaitUntil:\n    visible: ${JSON.stringify({ ...filterReset, enabled: true })}\n    timeout: 90000`,
+          // Reset is disabled iff all live filters, including BOTH grade
+          // bounds and the name, are cleared. Any may be offscreen in the rail.
+          resetFilters,
+        );
+      // The current native filter sheet has leading Close and trailing Reset.
+      // Close through its real control before clearing the route opener, then
+      // require dismissal so the next scene cannot remain behind the sheet.
+      const closeFilters =
+        "- tapOn:\n    id: sheet-top-bar-leading\n- evalScript: ${output.cppSequence = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/set?scene=search-results').body).sequence}\n- retry:\n    maxRetries: 3\n    commands:\n      - evalScript: ${output.cppAcknowledged = JSON.parse(http.get(SCREENSHOT_CPP_URL + '/status?waitFor=' + output.cppSequence).body).acknowledged}\n      - assertTrue: ${output.cppAcknowledged == output.cppSequence}\n- extendedWaitUntil:\n    notVisible:\n      id: climb-filter-column\n    timeout: 60000\n- waitForAnimationToEnd:\n    timeout: 30000";
+      // A static iPad filter column has no native sheet action to dismiss.
+      commands.push(
+        ipad
+          ? `- runFlow:\n    when:\n      visible:\n        id: sheet-top-bar-leading\n    commands:\n${closeFilters
+              .split('\n')
+              .map((line) => `      ${line}`)
+              .join('\n')}`
+          : closeFilters,
+      );
+    }
+  }
+  return readFileSync(join(MAESTRO_DIR, 'app-store-cpp.yaml'), 'utf8').replace(/^CPP_COMMANDS$/m, () =>
+    commands.join('\n'),
+  );
+}
+
 export function rotationDegreesForIosOrientation(orientation: IosDeviceOrientation): number | null {
   return orientation === 'LANDSCAPE_LEFT' ? -90 : null;
 }
 
-function renderedFlowFileForIosDevice(
+export function renderedFlowFileForIosDevice(
   options: ScreenshotOptions,
   screenshotDevice: IosScreenshotDevice,
   captureDir: string,
+  locale: Locale = 'en-US',
 ): string {
   const flowFile = iosSourceFlowFile(options, screenshotDevice);
   if (!existsSync(flowFile)) return flowFile;
   const renderedFlowFile = join(captureDir, `${options.flow}-${deviceSlug(screenshotDevice.name)}.yaml`);
-  writeFileSync(renderedFlowFile, renderMaestroFlowForIosDevice(readFileSync(flowFile, 'utf8'), screenshotDevice));
+  let source = readFileSync(flowFile, 'utf8');
+  if (
+    options.flow === 'app-store-campaign' &&
+    !isIpadScreenshotDevice(screenshotDevice) &&
+    !usesDuoStoreFlow(options, screenshotDevice)
+  ) {
+    // Inline the existing ten-shot flow: Maestro resolves relative subflows from
+    // this temporary directory, where the committed app-store.yaml does not live.
+    const legacyCommands = readFileSync(join(MAESTRO_DIR, 'app-store.yaml'), 'utf8').split('\n---\n')[1];
+    // A replacement string expands $' in single-quoted regex anchors into the
+    // campaign suffix. The callback inserts the legacy YAML bytes literally.
+    source = source.replace('- runFlow: app-store.yaml', () => legacyCommands);
+    if (!options.cpp) {
+      if (!options.iosCampaignPhoneBoards) throw new Error('Default phone campaign requires verified board navigation');
+      source = compileIosCampaignPhoneNavigation(source, options.iosCampaignPhoneBoards).source;
+    }
+  }
+  if (options.cpp && options.cpp !== 'all')
+    source = renderCppMaestroFlow(
+      options.cpp,
+      screenshotDevice,
+      options.cppCoverage,
+      locale,
+      options.fixtures === 'record',
+      options.cppLogbookAttempts,
+    );
+  writeFileSync(renderedFlowFile, renderMaestroFlowForIosDevice(source, screenshotDevice));
   return renderedFlowFile;
 }
 
@@ -1585,6 +2941,15 @@ function normalizeCapturedIosScreenshots(captureDir: string, screenshotDevice: I
   return 0;
 }
 
+/** Load the hinge library into the Duo's SpringBoard and start closed. Returns its log path. */
+function prepareDuoHinge(udid: string): string {
+  const logPath = duoHingeLogPath(udid);
+  console.log(`${LOG} Loading the Duo hinge helper into SpringBoard...`);
+  installDuoHinge(udid, buildDuoHingeLibrary(join(tmpdir(), 'boardsesh-duo-hinge')), logPath);
+  setDuoPose(udid, 'closed', logPath);
+  return logPath;
+}
+
 function captureIosDevice(
   options: ScreenshotOptions,
   screenshotDevice: IosScreenshotDevice,
@@ -1594,6 +2959,8 @@ function captureIosDevice(
 ): number {
   const device = findOrCreateIosDevice(screenshotDevice);
   bootDevice(device);
+  // Before the status bar overrides: loading the hinge library restarts SpringBoard.
+  const duoHingeLog = usesDuoStoreFlow(options, screenshotDevice) ? prepareDuoHinge(device.udid) : null;
   applyCleanStatusBar(device.udid);
 
   console.log(`${LOG} Installing ${appPath} on ${device.name} for ${localeTarget.appLocale}...`);
@@ -1608,6 +2975,22 @@ function captureIosDevice(
   // Every exit below this point but the last is a failure, and the finally block
   // cannot see a return value — so the last statement of the try flips this.
   let captureSucceeded = false;
+  // CPP failures also need live process evidence; post-job collection runs after shutdown.
+  const deviceLogStream =
+    options.flow === 'smoke' || options.cpp
+      ? startIosDeviceLogStream(
+          device.udid,
+          options.flow === 'smoke' ? `(${IOS_CRASH_LOG_PREDICATE}) OR (${IOS_CAPTURE_LOG_PREDICATE})` : undefined,
+        )
+      : null;
+  const diagnosticReportDirectories = options.cpp ? iosDiagnosticReportDirectories(device.udid) : [];
+  const diagnosticReportBaseline = snapshotIosDiagnosticReports(diagnosticReportDirectories);
+  const smokeCrashes = (): NativeCrash[] => findIosNativeCrashes(readTextIfPresent(IOS_DEVICE_LOG_PATH));
+  // A dead process will not reach home, so stop waiting for it (smoke only).
+  const giveUpOnCrash =
+    options.flow === 'smoke' && deviceLogStream
+      ? () => smokeCrashes().length > 0 || !deviceLogStreamAlive(deviceLogStream.pid)
+      : undefined;
   try {
     // Metro is already up and pre-warmed by runIos (once per locale, before this
     // per-device loop), so this goes straight to launching the app.
@@ -1617,51 +3000,66 @@ function captureIosDevice(
     // still in the log. Snapshot the current marker count and wait for it to
     // INCREASE (not merely be present), or device 2+ would skip the readiness wait
     // on a stale marker and capture a blank/loading frame.
-    const homeReadyBaseline = homeReadyMarkerCount();
-    const readinessBaseline = screenshotReadinessCount();
+    let homeReadyBaseline = homeReadyMarkerCount();
+    if (options.cpp || options.flow === 'app-store-campaign')
+      runCapture('curl', ['--fail', '--silent', `http://localhost:${SCREENSHOT_READY_PORT}/cpp/set?scene=reset`]);
+    let readinessBaseline = screenshotReadinessCount();
+    let smokePingBaseline = 0;
     // Snapshot before the app can talk to the backend, so the gate below judges
     // only this device's traffic (one backend serves the whole run).
     const backendLogBaseline = screenshotBackendLogLineCount();
 
-    // First try a plain launch — no `simctl openurl`. The screenshots build bakes
-    // DEV_CLIENT_DEFAULT_LAUNCHER_URL=http://localhost:${METRO_PORT} into
-    // Info.plist (see ./plugins/with-screenshot-dev-menu), so the dev-client
-    // auto-connects to Metro on a plain launch and — auto-signed-in (see auth-provider's
-    // SCREENSHOT_MODE branch) — lands straight on home, without ever opening the
-    // custom-scheme URL or showing a login screen. That matters because a fresh CI
-    // sim raises an "Open in Boardsesh?" confirmation for ANY openurl of the
-    // scheme, and Maestro can't dismiss it reliably. Dev-menu chrome is suppressed
-    // via the same plugin.
-    console.log(`${LOG} Launching the app (auto-loads Metro via DEV_CLIENT_DEFAULT_LAUNCHER_URL)...`);
-    runCapture('xcrun', ['simctl', 'launch', device.udid, APP_ID], simulatorLaunchEnv());
-
-    // The app auto-signs-in and boots straight to home, so wait for it to get
-    // there before Maestro runs — this is what login.yaml's readiness wait used to
-    // do (now deleted; there's no login screen to gate on).
-    console.log(`${LOG} Waiting for the app to auto-sign-in and reach home...`);
-    // The dev-client's auto-connect to Metro is intermittently flaky in CI — the app
-    // lands on the "Searching for development servers" launcher (or the "Failed to
-    // load app" error) instead of loading the JS. When that happens, re-launch and try
-    // again; each fresh launch re-attempts the connect, and a shard that never recovers
-    // fails hard (rather than capturing the launcher) so it can be re-run.
-    //
-    // Re-launch PLAINLY on BOTH devices — never `openurl`. A plain `simctl launch`
-    // re-triggers the dev-client's DEV_CLIENT_DEFAULT_LAUNCHER_URL auto-connect with no
-    // dialog. An openurl raises the "Open in 'Boardsesh'?" confirm which, undismissed
-    // here (this is BEFORE the flow's prime block), blocks the app from ever loading —
-    // that's exactly why the iPhone shards hung through every retry in CI while the iPad
-    // (already plain-relaunch) passed. The readiness ping + `$screen /home` marker then
-    // both register once the app actually reaches home.
-    //
-    // Generous per-wait budget: a CI cold bundle build alone is ~35-60s, on top of a
-    // slow simulator boot + auto-sign-in, so 45s (the old iPhone value) timed out before
-    // the app could ever get home.
-    let reachedHome = waitForHomeReady(homeReadyBaseline, readinessBaseline, 120);
-    for (let attempt = 1; attempt <= 3 && !reachedHome; attempt += 1) {
-      console.log(`${LOG} Not home yet; terminating and re-launching (attempt ${attempt}/3)...`);
-      runCapture('xcrun', ['simctl', 'terminate', device.udid, APP_ID]);
-      runCapture('xcrun', ['simctl', 'launch', device.udid, APP_ID], simulatorLaunchEnv());
-      reachedHome = waitForHomeReady(homeReadyBaseline, readinessBaseline, 120);
+    // Pass Expo's native process argument, rather than a custom-scheme openurl:
+    // no OS confirmation dialog. SDK 58's default-launcher fallback starts loading
+    // then navigates back to its launcher, resetting the React host. Its explicit
+    // initial URL branch returns after loading and preserves the app host.
+    const checkedProcessCommand = (args: string[]): boolean => {
+      const result = recordIosProcessCommand(
+        process.env.SCREENSHOT_DEBUG_DIR ?? join(tmpdir(), 'boardsesh-ios-process'),
+        args,
+        () => runCapture('xcrun', args, simulatorLaunchEnv()),
+      );
+      if (result.status !== 0) {
+        console.error(`${LOG} FAILED: ${args.join(' ')} exited ${result.status}: ${result.stderr || result.stdout}`);
+      }
+      return result.status === 0;
+    };
+    const reachedHome = launchIosCaptureReady({
+      snapshot: () => {
+        // Termination may take long enough for the old process to emit readiness.
+        // Snapshot after it exits, before launching; retain full logs as evidence.
+        homeReadyBaseline = homeReadyMarkerCount();
+        readinessBaseline = screenshotReadinessCount();
+        smokePingBaseline = readTextIfPresent(SMOKE_PING_LOG_PATH).length;
+        return { homeReadyBaseline, readinessBaseline };
+      },
+      launch: () => {
+        console.log(`${LOG} Launching the app with Metro as its explicit initial URL...`);
+        return checkedProcessCommand(iosSimulatorLaunchArgs(device.udid));
+      },
+      terminate: () => checkedProcessCommand(['simctl', 'terminate', device.udid, APP_ID]),
+      waitReady: (baseline) => {
+        console.log(`${LOG} Waiting for the app to auto-sign-in and reach home...`);
+        return waitForHomeReady(baseline.homeReadyBaseline, baseline.readinessBaseline, 120, giveUpOnCrash);
+      },
+      beforeRetry: (attempt) => {
+        console.log(`${LOG} Not home yet; terminating and re-launching (attempt ${attempt}/3)...`);
+      },
+      giveUp: giveUpOnCrash,
+    });
+    if (!reachedHome && options.flow === 'smoke') {
+      dumpMetroLogTail();
+      return judgeSmokeAttempt({
+        options,
+        readNativeCrashes: smokeCrashes,
+        reachedHome: false,
+        maestroStatus: null,
+        readCaptureLog: () => '',
+        logStreamAlive: () => deviceLogStreamAlive(deviceLogStream?.pid),
+        backendSession,
+        backendLogBaseline,
+        smokePingBaseline,
+      });
     }
     if (!reachedHome) {
       console.error(`${LOG} FAILED: app did not reach the home screen (auto sign-in / bundle load).`);
@@ -1677,12 +3075,31 @@ function captureIosDevice(
       return 1;
     }
 
+    if (options.cpp && options.cpp !== 'all' && backendSession?.mode === 'record') {
+      console.log(`${LOG} Waiting for the six verified CPP roster identities before Maestro...`);
+      try {
+        options.cppRecordedBoards = waitForCppRecordedRoster(
+          options.cpp,
+          options.cppCapturePage ?? readCppPage(options.cpp),
+          options.cppCoverage,
+          backendSession.fixturesDir,
+        );
+        console.log(`${LOG} CPP roster preflight passed (${options.cppRecordedBoards.length} unique recorded boards).`);
+      } catch (error) {
+        console.error(
+          `${LOG} CPP pre-Maestro roster gate failed: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        console.error(`${LOG} Recording directory: ${backendSession.fixturesDir}`);
+        dumpMetroLogTail();
+        throw error;
+      }
+    }
     const sourceFlowFile = iosSourceFlowFile(options, screenshotDevice);
     if (!existsSync(sourceFlowFile)) {
       console.error(`${LOG} FAILED: flow not found: ${sourceFlowFile}`);
       return 1;
     }
-    const flowFile = renderedFlowFileForIosDevice(options, screenshotDevice, captureDir);
+    const flowFile = renderedFlowFileForIosDevice(options, screenshotDevice, captureDir, localeTarget.appLocale);
     // `||` — see buildScreenshotEnv: CI passes these empty on a replay run.
     const email = process.env.SCREENSHOT_USER_EMAIL || DEFAULT_USER_EMAIL;
     const password = process.env.SCREENSHOT_USER_PASSWORD || DEFAULT_USER_PASSWORD;
@@ -1694,27 +3111,105 @@ function captureIosDevice(
     // (`ps aux`) for the run's duration. This is acceptable here: CI runs on an
     // ephemeral, single-tenant runner, and locally it's the developer's own
     // machine. Revisit with `--env-file` if/when we bump to a Maestro that has it.
-    const maestroStatus = runInherit(
-      'maestro',
-      [
-        '--device',
-        device.udid,
-        'test',
-        flowFile,
-        // The flows load their JS via this dev-client deep link (port-agnostic).
-        '-e',
-        `MAESTRO_DEV_CLIENT_URL=${metroDevClientUrl()}`,
-        '-e',
-        `SCREENSHOT_USER_EMAIL=${email}`,
-        '-e',
-        `SCREENSHOT_USER_PASSWORD=${password}`,
-      ],
-      process.env,
-      captureDir,
-    );
+    const maestroArgs = (maestroFlowFile: string): string[] => [
+      '--device',
+      device.udid,
+      'test',
+      maestroFlowFile,
+      // The flows load their JS via this dev-client deep link (port-agnostic).
+      '-e',
+      `MAESTRO_DEV_CLIENT_URL=${metroDevClientUrl()}`,
+      '-e',
+      `SCREENSHOT_USER_EMAIL=${email}`,
+      '-e',
+      `SCREENSHOT_USER_PASSWORD=${password}`,
+      ...(options.cpp ? ['-e', `SCREENSHOT_CPP_URL=http://localhost:${SCREENSHOT_READY_PORT}/cpp`] : []),
+      ...(['app-store', 'app-store-campaign'].includes(options.flow) || options.cpp
+        ? buildIosCampaignMaestroEnv(localeTarget.appLocale, backendSession?.capture, options.iosCampaignPrimaryCapture)
+        : []),
+      ...(isIpadScreenshotDevice(screenshotDevice) &&
+      ['app-store', 'app-store-campaign', 'app-store-cpp'].includes(options.flow)
+        ? buildIosSidebarMaestroEnv(localeTarget.appLocale)
+        : []),
+    ];
+    const runIosMaestroFlow = (maestroFlowFile: string) =>
+      runIosScreenshotMaestro(maestroArgs(maestroFlowFile), {
+        deviceId: device.udid,
+        cpp: Boolean(options.cpp),
+        captureDir,
+      });
+    const maestroStatus = runIosMaestroFlow(flowFile);
+    if (options.flow === 'smoke') {
+      // No screenshots to collect: the run is judged on evidence, pass or fail.
+      const smokeStatus = judgeSmokeAttempt({
+        options,
+        readNativeCrashes: smokeCrashes,
+        reachedHome: true,
+        maestroStatus,
+        readCaptureLog: () => readTextIfPresent(METRO_LOG_PATH),
+        logStreamAlive: () => deviceLogStreamAlive(deviceLogStream?.pid),
+        backendSession,
+        backendLogBaseline,
+        smokePingBaseline,
+      });
+      captureSucceeded = smokeStatus === 0;
+      return smokeStatus;
+    }
     if (maestroStatus !== 0) {
       console.error(`${LOG} FAILED: Maestro exited with ${maestroStatus}.`);
       return maestroStatus;
+    }
+
+    if (duoHingeLog) {
+      // Second pass: unfold, then shoot the inner display one shot at a time.
+      const shots = buildIosDuoInnerShots(options, screenshotDevice);
+      setDuoPose(device.udid, 'open', duoHingeLog);
+      for (const [index, shot] of shots.entries()) {
+        if (shot.relaunch) {
+          // A fresh app must not replay the previous shot's retained command
+          // before it reaches home and receives this shot's new sequence.
+          if (options.flow === 'app-store-campaign') {
+            const reset = runCapture('curl', [
+              '--fail',
+              '--silent',
+              `http://localhost:${SCREENSHOT_READY_PORT}/cpp/set?scene=reset`,
+            ]);
+            if (reset.status !== 0) throw new Error('Could not reset Duo navigation before relaunch');
+          }
+          const markerBaseline = homeReadyMarkerCount();
+          const readyBaseline = screenshotReadinessCount();
+          runCapture('xcrun', ['simctl', 'terminate', device.udid, APP_ID]);
+          runCapture('xcrun', iosSimulatorLaunchArgs(device.udid), simulatorLaunchEnv());
+          if (!waitForHomeReady(markerBaseline, readyBaseline, 120)) {
+            console.error(`${LOG} FAILED: the app did not return home before Duo shot ${shot.name}.`);
+            dumpMetroLogTail();
+            return 1;
+          }
+        }
+        const shotFlowFile = join(captureDir, `duo-inner-${String(index).padStart(2, '0')}.yaml`);
+        writeFileSync(shotFlowFile, shot.flow);
+        console.log(`${LOG} Duo inner display: ${shot.name}...`);
+        const shotStatus = runIosMaestroFlow(shotFlowFile);
+        if (shotStatus !== 0) {
+          console.error(`${LOG} FAILED: Maestro exited with ${shotStatus} before Duo shot ${shot.name}.`);
+          return shotStatus;
+        }
+        const shotPath = join(captureDir, `${shot.name}.png`);
+        // Judge the PNG that will ship, not a second screenshot taken after it.
+        if (captureDuoDisplay(device.udid, 'open', shotPath) !== 0 || !pngIsLit(shotPath)) {
+          console.error(`${LOG} FAILED: the Duo's inner display was dark for ${shot.name}.`);
+          return 1;
+        }
+      }
+      // The captures are done; folding back is tidying up. The finally block
+      // below tries again, so a failure here only warns.
+      try {
+        setDuoPose(device.udid, 'closed', duoHingeLog);
+      } catch (error) {
+        console.warn(
+          `${LOG} Could not fold the Duo back yet: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
 
     const normalizeStatus = normalizeCapturedIosScreenshots(captureDir, screenshotDevice);
@@ -1734,6 +3229,20 @@ function captureIosDevice(
       if (!reportFrozenClockProblems(metroLog, backendSession.frozenNow, METRO_LOG_PATH)) return 1;
     }
 
+    if (options.cpp && options.cpp !== 'all')
+      resolveCppRecipes(
+        readCppPage(options.cpp),
+        deviceSlug(device.name),
+        readdirSync(captureDir).filter((file) => file.endsWith('.png')),
+      );
+    if (
+      options.flow === 'app-store-campaign' &&
+      !isIpadScreenshotDevice(screenshotDevice) &&
+      !usesDuoStoreFlow(options, screenshotDevice)
+    ) {
+      assertIosCampaignSources(readdirSync(captureDir).filter((file) => file.endsWith('.png')));
+    }
+
     const duplicateGroups = findDuplicateScreenshotGroups(captureDir);
     if (duplicateGroups.length > 0) {
       for (const group of duplicateGroups) {
@@ -1744,26 +3253,85 @@ function captureIosDevice(
       return 1;
     }
 
+    if (options.cpp && options.cpp !== 'all') {
+      if (!backendSession) throw new Error('CPP captures require a record/replay fixture session');
+      if (options.cppCoverage?.scenes.search?.gradeFilter) {
+        const recorded = readScreenshotFixtureManifest(backendSession.fixturesDir);
+        if (!recorded) throw new Error('CPP grade count recording manifest is missing');
+        assertCppGradeCountProof(recorded, readCppCountFixtures(backendSession.fixturesDir, recorded));
+        options.cppCoverage = recorded.capture?.cpp;
+      }
+      writeFileSync(
+        join(captureDir, 'cpp-capture.json'),
+        JSON.stringify({
+          target: options.cpp,
+          fixtureSha256: options.cppFixtureSha256,
+          verified: !!options.cppFixtureSha256,
+          coverage: options.cppCoverage,
+        }),
+      );
+    }
     const saved = collectScreenshots(
       captureDir,
       'ios',
       device.name,
       localeTarget.appStoreLocales,
-      options.flow === 'app-store',
-      outputRootForFlow(options.flow),
+      options.flow === 'app-store' || options.flow === 'app-store-campaign' || !!options.cpp,
+      options.cpp ? OUTPUT_ROOT : outputRootForFlow(options.flow),
+      options.cpp && options.cpp !== 'all' ? options.cpp : undefined,
     );
     if (saved.length === 0) {
       console.error(`${LOG} WARNING: flow completed but no PNGs were captured.`);
       return 1;
     }
     console.log(
-      `${LOG} Saved ${saved.length} screenshot(s) to ${relative(ROOT_DIR, outputRootForFlow(options.flow))}/${STORE_BY_PLATFORM.ios}/screenshots/{${localeTarget.appStoreLocales.join(',')}}/${deviceSlug(device.name)}/`,
+      `${LOG} Saved ${saved.length} screenshot(s) to ${relative(ROOT_DIR, options.cpp ? OUTPUT_ROOT : outputRootForFlow(options.flow))}/${STORE_BY_PLATFORM.ios}${options.cpp ? `/cpp/${options.cpp}` : ''}/screenshots/{${localeTarget.appStoreLocales.join(',')}}/${deviceSlug(device.name)}/`,
     );
     for (const file of saved) console.log(`${LOG}   ${file}`);
     captureSucceeded = true;
   } finally {
-    if (!captureSucceeded) preserveFailedRunArtifacts(captureDir);
+    if (!captureSucceeded) {
+      if (options.cpp) preserveFailedRunArtifacts(captureDir);
+      if (options.cpp && process.env.SCREENSHOT_DEBUG_DIR) {
+        try {
+          preserveIosCaptureDiagnostics({
+            udid: device.udid,
+            debugDir: process.env.SCREENSHOT_DEBUG_DIR,
+            nativeLogPath: IOS_DEVICE_LOG_PATH,
+            reportDirectories: diagnosticReportDirectories,
+            baseline: diagnosticReportBaseline,
+            runCommand: (args) => {
+              const result = spawnSync('xcrun', args, {
+                encoding: 'utf8',
+                timeout: 15000,
+                killSignal: 'SIGKILL',
+                maxBuffer: 1024 * 1024,
+              });
+              return { status: result.status ?? 1, stdout: result.stdout ?? '' };
+            },
+          });
+        } catch {
+          console.error(`${LOG} CPP native diagnostic collection did not complete.`);
+        }
+      }
+      if (process.env.SCREENSHOT_DEBUG_DIR)
+        runCapture(
+          'xcrun',
+          ['simctl', 'io', device.udid, 'screenshot', join(captureDir, 'failure-screen.png')],
+          undefined,
+          options.cpp ? 15000 : undefined,
+        );
+      preserveFailedRunArtifacts(captureDir);
+    }
+    deviceLogStream?.kill();
     rmSync(captureDir, { force: true, recursive: true });
+    if (duoHingeLog && !options.shutdown) {
+      try {
+        setDuoPose(device.udid, 'closed', duoHingeLog);
+      } catch (error) {
+        console.error(`${LOG} Could not fold the Duo back: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     clearStatusBar(device.udid);
     if (options.shutdown) {
       runCapture('xcrun', ['simctl', 'shutdown', device.udid]);
@@ -1829,7 +3397,7 @@ export function screenshotLogcatState(streamAlive: boolean, logText: string): 'r
  * that is gone; `Z` is one that exited and is still waiting to be reaped by an
  * event loop that will not run until the capture is over.
  */
-function logcatStreamAlive(pid: number | undefined): boolean {
+function deviceLogStreamAlive(pid: number | undefined): boolean {
   if (pid === undefined) return false;
   const state = runCapture('ps', ['-o', 'stat=', '-p', String(pid)]).stdout.trim();
   return state.length > 0 && !state.startsWith('Z');
@@ -1865,7 +3433,7 @@ function readSettledLogcat(stream: ChildProcess): string | null {
       lastSize = size;
       logcat = size > 0 ? readFileSync(LOGCAT_LOG_PATH, 'utf8') : '';
     }
-    const state = screenshotLogcatState(logcatStreamAlive(stream.pid), logcat);
+    const state = screenshotLogcatState(deviceLogStreamAlive(stream.pid), logcat);
     if (state === 'ready') return logcat;
     if (state === 'reader-died') {
       console.error(
@@ -1883,6 +3451,409 @@ function readSettledLogcat(stream: ChildProcess): string | null {
   return logcat;
 }
 
+/** Campaign fixtures are explicit; an old two/six-board bundle must never masquerade as the new listing. */
+export function assertIosCampaignSources(capturedNames: readonly string[]): void {
+  const missing = IOS_CAMPAIGN_CAPTURE_NAMES.filter((name) => !capturedNames.includes(name));
+  const unexpected = capturedNames.filter((name) => !(IOS_CAMPAIGN_CAPTURE_NAMES as readonly string[]).includes(name));
+  if (missing.length || unexpected.length) {
+    throw new Error(
+      `Incomplete iOS campaign capture; missing: ${missing.join(', ') || 'none'}; unexpected: ${unexpected.join(', ') || 'none'}. Refusing legacy framing.`,
+    );
+  }
+}
+
+export type IosCampaignBoard = CppRecordedBoard & { layoutName?: string | null; hasLeds?: boolean };
+
+export interface IosCampaignPhoneBoard {
+  selector: string;
+  board: CppRecordedBoard & { setIds: string };
+  climb: { uuid: string; name: string; frames: string; angle: number };
+}
+
+const IOS_CAMPAIGN_BOARD_TYPES = ['kilter', 'tension', 'moonboard', 'woods', 'decoy', 'grasshopper', 'spray'];
+
+const canonicalCampaignSets = (setIds: string) =>
+  setIds
+    .split(',')
+    .map(Number)
+    .sort((left, right) => left - right)
+    .join(',');
+
+/** Read every commanded identity from a genuine exact default-search seed. */
+export function readIosCampaignPhoneBoards(
+  fixturesDir: string,
+  selectors: readonly string[],
+  recordedBoards: readonly IosCampaignBoard[],
+): IosCampaignPhoneBoard[] {
+  if (selectors.length !== IOS_CAMPAIGN_BOARD_TYPES.length)
+    throw new Error('Phone campaign needs exactly seven board selectors');
+  const manifest = readScreenshotFixtureManifest(fixturesDir);
+  if (!manifest || manifest.flow !== 'app-store-campaign')
+    throw new Error('Phone campaign requires its recorded manifest');
+  const captures = selectors.map((selector, index) => {
+    const candidates = matchScreenshotBoardCandidates(recordedBoards, selector);
+    if (
+      !candidates.length ||
+      candidates.some(
+        (board) =>
+          !/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i.test(board.uuid) ||
+          board.boardType !== IOS_CAMPAIGN_BOARD_TYPES[index] ||
+          !Number.isSafeInteger(board.layoutId) ||
+          board.layoutId < 1 ||
+          !Number.isSafeInteger(board.sizeId) ||
+          board.sizeId < 1 ||
+          !Number.isFinite(board.angle) ||
+          !board.setIds ||
+          !/^\d+(,\d+)*$/.test(board.setIds),
+      )
+    )
+      throw new Error(`Phone campaign board[${index}] has no genuine recorded identity`);
+    const identities = new Map(
+      candidates.map((board) => [
+        canonicalJson({
+          uuid: board.uuid,
+          boardType: board.boardType,
+          layoutId: board.layoutId,
+          sizeId: board.sizeId,
+          setIds: canonicalCampaignSets(board.setIds!),
+          angle: board.angle,
+        }),
+        board,
+      ]),
+    );
+    if (identities.size !== 1) throw new Error(`Phone campaign board[${index}] identity is ambiguous`);
+    const recorded = [...identities.values()][0];
+    const board = { ...recorded, setIds: recorded.setIds! };
+    const expectedInput = toClimbSearchInput(
+      DEFAULT_CLIMB_FILTER_STATE,
+      {
+        boardName: board.boardType,
+        layoutId: board.layoutId,
+        sizeId: board.sizeId,
+        setIds: canonicalCampaignSets(board.setIds),
+        angle: board.angle,
+      },
+      { page: 0, pageSize: 6 },
+    );
+    const seeds = manifest.graphql
+      .filter((entry) => entry.operationName === 'SearchClimbs')
+      .flatMap((entry) => {
+        const fixture = JSON.parse(readFileSync(join(fixturesDir, entry.file), 'utf8')) as GraphqlFixtureFile;
+        const variables = fixture.variables as { input?: { setIds?: unknown } } | undefined;
+        const input = variables?.input;
+        if (
+          !input ||
+          typeof input.setIds !== 'string' ||
+          canonicalJson({ ...input, setIds: canonicalCampaignSets(input.setIds) }) !== canonicalJson(expectedInput)
+        )
+          return [];
+        if (normalizeDocument(fixture.query) !== normalizeDocument(SEARCH_CLIMBS))
+          throw new Error('Phone campaign seed document changed');
+        const key = graphqlFixtureKey(fixture, (text) => createHash('sha256').update(text).digest('hex'));
+        const response = fixture.response as {
+          errors?: unknown[];
+          data?: {
+            searchClimbs?: {
+              climbs?: Array<{
+                uuid: string;
+                name: string;
+                frames: string;
+                boardType: string;
+                layoutId: number;
+                angle: number;
+                compatibleSizeIds?: number[];
+              }>;
+            };
+          };
+        };
+        if (
+          fixture.status !== 200 ||
+          response.errors?.length ||
+          fixture.operationName !== entry.operationName ||
+          key.documentHash !== entry.documentHash ||
+          key.variablesHash !== entry.variablesHash ||
+          fixture.documentHash !== entry.documentHash ||
+          fixture.variablesHash !== entry.variablesHash
+        )
+          throw new Error('Phone campaign seed provenance is invalid');
+        const climb = response.data?.searchClimbs?.climbs?.[0];
+        if (
+          !climb ||
+          !isCppClimbId(climb.uuid) ||
+          !climb.name?.trim() ||
+          !climb.frames?.trim() ||
+          climb.boardType !== board.boardType ||
+          climb.layoutId !== board.layoutId ||
+          climb.angle !== board.angle ||
+          (climb.compatibleSizeIds && !climb.compatibleSizeIds.includes(board.sizeId))
+        )
+          throw new Error('Phone campaign seed has no genuine compatible hero climb');
+        return [{ uuid: climb.uuid, name: climb.name, frames: climb.frames, angle: climb.angle }];
+      });
+    const uniqueSeeds = new Map(seeds.map((climb) => [canonicalJson(climb), climb]));
+    if (uniqueSeeds.size !== 1) throw new Error(`Phone campaign board[${index}] needs one unambiguous exact seed`);
+    return { selector, board, climb: [...uniqueSeeds.values()][0] };
+  });
+  if (new Set(captures.map(({ board }) => board.uuid)).size !== 7)
+    throw new Error('Phone campaign board UUIDs must be distinct');
+  return captures;
+}
+
+function readIosCampaignPhoneSource(): string {
+  const source = readFileSync(join(MAESTRO_DIR, 'app-store-campaign.yaml'), 'utf8');
+  const legacy = readFileSync(join(MAESTRO_DIR, 'app-store.yaml'), 'utf8').split('\n---\n')[1];
+  return source.replace('- runFlow: app-store.yaml', () => legacy);
+}
+
+/** Replace only default campaign Climbs links; every occurrence has its own latch identity. */
+export function compileIosCampaignPhoneNavigation(source: string, boards: readonly IosCampaignPhoneBoard[]) {
+  return compileIosCampaignClimbsNavigation(source, boards, 'phone');
+}
+
+export function compileIosCampaignDuoNavigation(source: string, boards: readonly IosCampaignPhoneBoard[]) {
+  return compileIosCampaignClimbsNavigation(source, boards, 'duo');
+}
+
+function compileIosCampaignClimbsNavigation(
+  source: string,
+  boards: readonly IosCampaignPhoneBoard[],
+  device: 'phone' | 'duo',
+) {
+  const deviceLabel = device === 'duo' ? 'Duo' : 'Phone';
+  if (boards.length !== 7) throw new Error(`${deviceLabel} campaign navigation requires seven verified boards`);
+  const sequenceVariable = device === 'duo' ? 'campaignDuoSequence' : 'campaignPhoneSequence';
+  const acknowledgedVariable = device === 'duo' ? 'campaignDuoAcknowledged' : 'campaignPhoneAcknowledged';
+  const commands: Record<
+    string,
+    {
+      selector: string;
+      identity: { uuid: string; boardType: string; layoutId: number; sizeId: number; setIds: number[]; angle: number };
+      route: string;
+    }
+  > = {};
+  const rewritten = source.replace(
+    /^([ \t]*)- openLink:\s*(com\.boardsesh\.app:\/\/climbs(?:\?[^\r\n]*)?)[ \t]*$/gm,
+    (_line, indent: string, rawLink: string) => {
+      const link = new URL(rawLink.trim());
+      const rawIndex = link.searchParams.get('screenshotBoardIndex');
+      if (
+        link.searchParams.getAll('screenshotBoardIndex').length > 1 ||
+        (rawIndex !== null && !/^[0-6]$/.test(rawIndex))
+      )
+        throw new Error(`${deviceLabel} campaign link has an invalid board index`);
+      const index = rawIndex === null ? 0 : Number(rawIndex);
+      const capture = boards[index];
+      const scene = (device === 'duo' ? iosCampaignDuoScene : iosCampaignPhoneScene)(Object.keys(commands).length);
+      link.searchParams.set('screenshotBoardIndex', String(index));
+      link.searchParams.set('screenshotCppScene', scene);
+      if (link.searchParams.get('screenshotOpenFirst')) link.searchParams.set('screenshotClimbId', capture.climb.uuid);
+      commands[scene] = {
+        // Preflight accepts native selector aliases; the runtime command resolver
+        // intentionally requires the resolved recorded name plus exact identity.
+        selector: capture.board.name,
+        identity: {
+          uuid: capture.board.uuid,
+          boardType: capture.board.boardType,
+          layoutId: capture.board.layoutId,
+          sizeId: capture.board.sizeId,
+          setIds: capture.board.setIds.split(',').map(Number),
+          angle: capture.board.angle,
+        },
+        route: `/climbs${link.search}`,
+      };
+      return [
+        `- evalScript: \${output.${sequenceVariable} = JSON.parse(http.get(SCREENSHOT_PRIMARY_BOARD_URL + '/set?scene=${scene}').body).sequence}`,
+        '- retry:',
+        '    maxRetries: 3',
+        '    commands:',
+        `      - evalScript: \${output.${acknowledgedVariable} = JSON.parse(http.get(SCREENSHOT_PRIMARY_BOARD_URL + '/status?waitFor=' + output.${sequenceVariable}).body).acknowledged}`,
+        `      - assertTrue: \${output.${acknowledgedVariable} == output.${sequenceVariable}}`,
+      ]
+        .map((line) => `${indent}${line}`)
+        .join('\n');
+    },
+  );
+  if (/^\s*- openLink:\s*['"]?com\.boardsesh\.app:\/\/climbs/m.test(rewritten))
+    throw new Error(`Uncompiled ${device} campaign Climbs link`);
+  return { source: rewritten, commands };
+}
+
+export function readIosCampaignBoards(fixturesDir: string): IosCampaignBoard[] {
+  const manifest = readScreenshotFixtureManifest(fixturesDir);
+  return (manifest?.graphql ?? [])
+    .filter((entry) => entry.operationName === 'GetMyBoards')
+    .flatMap((entry) => {
+      const fixture = JSON.parse(readFileSync(join(fixturesDir, entry.file), 'utf8')) as {
+        response?: { data?: { myBoards?: { boards?: IosCampaignBoard[] } } };
+      };
+      return fixture.response?.data?.myBoards?.boards ?? [];
+    });
+}
+
+/** Home mounting precedes its async roster query; do not validate an empty recording mid-flight. */
+export function waitForCppRecordedRoster(
+  target: CppTarget,
+  page: CppPage,
+  coverage: CppCaptureCoverage | undefined,
+  fixturesDir: string,
+  readBoards: () => CppRecordedBoard[] = () => readIosCampaignBoards(fixturesDir) as CppRecordedBoard[],
+  pause: () => void = () => {
+    runCapture('sleep', ['1']);
+  },
+  maxAttempts = 30,
+): CppRecordedBoard[] {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const recorded = [...new Map(readBoards().map((board) => [board.uuid, board])).values()];
+    try {
+      assertCppCaptureReady(target, page, coverage, recorded, fixturesDir, false);
+      return recorded;
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt + 1 < maxAttempts) pause();
+  }
+  throw new Error(
+    `CPP roster did not become ready within ${maxAttempts} checks: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
+}
+
+export function assertIosCampaignCaptureReady(
+  options: ScreenshotOptions,
+  capture?: ScreenshotCaptureScenario,
+  recordedBoards: readonly Pick<IosCampaignBoard, 'name' | 'layoutName' | 'boardType'>[] = [],
+): void {
+  const boards = parseScreenshotBoardSelectors(options.boards ?? capture?.boards.join('|') ?? '');
+  if (options.fixtures !== 'replay' || !capture?.sharedSessionId || boards.length < 7) {
+    throw new Error(
+      'app-store-campaign needs a verified replay campaign fixture with a shared crew session and seven board selectors ' +
+        'in order: Kilter, Tension, MoonBoard, Woods, Decoy, Grasshopper, spray wall. ' +
+        'The previous fixture lacks Decoy/spray captures; record and sanitize the missing sources before running this flow.',
+    );
+  }
+  const expectedTypes = ['kilter', 'tension', 'moonboard', 'woods', 'decoy', 'grasshopper', 'spray'];
+  for (const [index, expectedType] of expectedTypes.entries()) {
+    // Same precedence as the app's matchScreenshotBoard, without positional fallback.
+    const recorded = matchScreenshotBoardCandidates(recordedBoards, boards[index])[0];
+    if (recorded?.boardType !== expectedType) {
+      throw new Error(
+        `app-store-campaign board[${index}] "${boards[index]}" must resolve to ${expectedType} in recorded GetMyBoards responses; found ${recorded?.boardType ?? 'no recorded board'}. Record and sanitize the missing campaign fixture.`,
+      );
+    }
+  }
+}
+
+/** No-lights walls keep their existing capture semantics and never wait for a BLE drive. */
+export function iosCampaignPrimaryDriveEnabled(primary: IosCampaignPrimaryCapture): boolean {
+  return primary.board.boardType !== 'spray' && primary.board.hasLeds !== false;
+}
+
+/** UIKit appends its blank native status badge to the selected Record tab label. */
+export function iosRecordTabReadinessSelector(label: string): string {
+  return `^${cppReadinessSelector(label)}(?:,\\s+)?$`;
+}
+
+/** Read accessibility labels from the same catalog as the native UI for all store locales. */
+export function buildIosSidebarMaestroEnv(locale: Locale): string[] {
+  const directory = join(ROOT_DIR, 'packages/shared/i18n/locales', locale);
+  const common = JSON.parse(readFileSync(join(directory, 'common.json'), 'utf8')) as {
+    mobile: { nav: { home: string; climbs: string; profile: string } };
+  };
+  const session = JSON.parse(readFileSync(join(directory, 'session.json'), 'utf8')) as {
+    mobile: {
+      session: { recordTab: string };
+      boardPresence: { wallDisplay: { open: string; exitA11y: string } };
+      queue: { logAscent: string; alreadyLogged: string };
+    };
+  };
+  const playlists = JSON.parse(readFileSync(join(directory, 'playlists.json'), 'utf8')) as {
+    bottomTabBar: { discover: string };
+  };
+  const climbs = JSON.parse(readFileSync(join(directory, 'climbs.json'), 'utf8')) as {
+    mobile: { listOptions: { title: string } };
+  };
+  const labels = {
+    SCREENSHOT_SIDEBAR_HOME_LABEL: common.mobile.nav.home,
+    SCREENSHOT_SIDEBAR_CLIMBS_LABEL: common.mobile.nav.climbs,
+    SCREENSHOT_SIDEBAR_RECORD_LABEL: session.mobile.session.recordTab,
+    SCREENSHOT_SIDEBAR_RECORD_TAB_SELECTOR: iosRecordTabReadinessSelector(session.mobile.session.recordTab),
+    SCREENSHOT_SIDEBAR_DISCOVER_LABEL: playlists.bottomTabBar.discover,
+    SCREENSHOT_SIDEBAR_PROFILE_LABEL: common.mobile.nav.profile,
+    // Prefer the populated MiniPlayer; older chrome keeps the Climbs menu entry.
+    SCREENSHOT_CLIMBS_OPTIONS_LABEL: climbs.mobile.listOptions.title,
+    SCREENSHOT_WALL_DISPLAY_LABEL: session.mobile.boardPresence.wallDisplay.open,
+    SCREENSHOT_WALL_DISPLAY_EXIT_LABEL: session.mobile.boardPresence.wallDisplay.exitA11y,
+    SCREENSHOT_MINI_PLAYER_LOG_LABEL: `^${cppReadinessSelector(session.mobile.queue.logAscent)}(?:, ${cppReadinessSelector(session.mobile.queue.alreadyLogged)})?$`,
+    // These UIKit-owned controls follow the simulator system language, not the JS catalog.
+    // Store capture simulators use English; an unsupported native language fails closed.
+    SCREENSHOT_SIDEBAR_HIDE_LABEL: 'Hide Sidebar',
+    SCREENSHOT_SIDEBAR_TOGGLE_LABEL: 'Toggle sidebar',
+  };
+  return Object.entries(labels).flatMap(([name, label]) => ['-e', `${name}=${label}`]);
+}
+
+type QueueButtonLabels = {
+  queueCountAria: string;
+  queueUpNextAria_zero: string;
+  queueUpNextAria_one: string;
+  queueUpNextAria_other: string;
+};
+
+/** Match the real queue button in either mode; the optional drawn badge is not a control. */
+export function queueButtonReadinessSelector(labels: QueueButtonLabels): string {
+  const templates = [
+    labels.queueCountAria,
+    labels.queueUpNextAria_zero,
+    labels.queueUpNextAria_one,
+    labels.queueUpNextAria_other,
+  ];
+  const alternatives = templates.map((template) =>
+    template.split('{{count}}').map(cppReadinessSelector).join('[0-9]+'),
+  );
+  return `^(?:${[...new Set(alternatives)].join('|')})$`;
+}
+
+/** Read accessibility labels from the same catalog as the native UI for all store locales. */
+export function buildIosCampaignMaestroEnv(
+  locale: Locale,
+  capture?: ScreenshotCaptureScenario,
+  primary?: IosCampaignPrimaryCapture,
+): string[] {
+  const catalog = JSON.parse(
+    readFileSync(join(ROOT_DIR, 'packages/shared/i18n/locales', locale, 'session.json'), 'utf8'),
+  ) as {
+    mobileJoin: { join: string };
+    mobile: { boardPresence: { stripA11yLabelWithSender: string } };
+    queueDrawer: { title: string };
+    playView: { closeAria: string; actionBar: QueueButtonLabels & { moreActionsForAria: string } };
+  };
+  const labels = {
+    ...(primary
+      ? {
+          SCREENSHOT_PRIMARY_BOARD_URL: `http://localhost:${SCREENSHOT_READY_PORT}/cpp`,
+          SCREENSHOT_PRIMARY_DRIVING: iosCampaignPrimaryDriveEnabled(primary) ? '1' : '0',
+          SCREENSHOT_PRIMARY_DRIVING_ID: `^store-driving-${cppReadinessSelector(primary.board.uuid)}-${cppReadinessSelector(primary.climb.uuid)}$`,
+          SCREENSHOT_PRIMARY_CURRENT_DRIVING_ID: `^store-current-driving-${cppReadinessSelector(primary.board.uuid)}-${cppReadinessSelector(primary.climb.uuid)}$`,
+          SCREENSHOT_PRIMARY_KIOSK_DRIVING_ID: `^store-kiosk-driving-${cppReadinessSelector(primary.board.uuid)}-${cppReadinessSelector(primary.climb.uuid)}$`,
+          SCREENSHOT_PRIMARY_CLIMB_ROW: cppClimbRowReadinessSelector(primary.climb.name, locale),
+          SCREENSHOT_PRIMARY_CLIMB_TITLE: cppReadinessSelector(primary.climb.name),
+          SCREENSHOT_PRIMARY_WALL_PAINTED_ID: `^${cppReadinessSelector(primary.paintedId)}$`,
+          SCREENSHOT_MINI_PLAYER_MORE_LABEL: `^${cppReadinessSelector(catalog.playView.actionBar.moreActionsForAria.replaceAll('{{name}}', () => primary.climb.name))}$`,
+        }
+      : {}),
+    SCREENSHOT_SHARED_SESSION_ID: capture?.sharedSessionId ?? '',
+    SCREENSHOT_JOIN_LABEL: catalog.mobileJoin.join,
+    SCREENSHOT_CLOSE_LABEL: catalog.playView.closeAria,
+    SCREENSHOT_QUEUE_LABEL: queueButtonReadinessSelector(catalog.playView.actionBar),
+    SCREENSHOT_QUEUE_TITLE: catalog.queueDrawer.title,
+    SCREENSHOT_WALL_STATUS_LABEL: catalog.mobile.boardPresence.stripA11yLabelWithSender
+      .replace('{{name}}', 'Lightest Pair of Shorts')
+      .replace('{{grade}}', '.*')
+      .replace('{{sender}}', '.*'),
+  };
+  return Object.entries(labels).flatMap(([name, label]) => ['-e', `${name}=${label}`]);
+}
+
 export function buildAndroidMaestroArgs(
   context: {
     deviceId: string;
@@ -1894,7 +3865,7 @@ export function buildAndroidMaestroArgs(
   env: NodeJS.ProcessEnv = process.env,
 ): string[] {
   const boards = context.boards ?? context.capture?.boards.join('|') ?? env.EXPO_PUBLIC_SCREENSHOT_BOARDS;
-  // Match screenshot-mode.ts: missing or blank selectors use its two default boards.
+  // Match dev/integration/config.ts: blank selectors use the two default boards.
   const boardCount = boards?.split('|').filter((selector) => selector.trim().length > 0).length || 2;
   return [
     '--device',
@@ -1942,6 +3913,12 @@ function runAndroid(options: ScreenshotOptions): number {
     );
     return 1;
   }
+  // The smoke is judged on what happens between launch and home, and only the
+  // dev-client path launches the app from here.
+  if (options.flow === 'smoke' && !options.devClient) {
+    console.error(`${LOG} FAILED: --flow smoke needs --dev-client on Android.`);
+    return 1;
+  }
 
   // The dev-client APK carries no JS, so it resolves through the shared APK
   // cache (download the latest rn-android-dev-* release, or build one) and runs
@@ -1987,19 +3964,13 @@ function runAndroid(options: ScreenshotOptions): number {
   let devClientSession: DevClientSession | null = null;
   let backendSession: ScreenshotBackendSession | null = null;
   let backendLogBaseline = 0;
+  const smokeCrashes = (): NativeCrash[] => findAndroidNativeCrashes(readTextIfPresent(LOGCAT_LOG_PATH), packageId);
   try {
     if (options.fixtures !== 'off') backendSession = startScreenshotBackend(options);
     if (options.devClient) {
       // Android captures the single en-US tree (the locale matrix is iOS-only),
       // so no locale is baked into the bundle here.
-      const metroEnv = buildScreenshotEnv(
-        options,
-        process.env,
-        null,
-        backendSession?.frozenNow ?? null,
-        backendSession?.port ?? null,
-        backendSession?.capture ?? null,
-      );
+      const metroEnv = buildScreenshotSessionEnv(options, process.env, null, backendSession);
       console.log(
         `${LOG} Starting Metro on ${METRO_PORT} (backend=${options.backend}, theme=${options.theme}, flow=${options.flow}${options.variant ? `, variant=${options.variant}` : ''}${options.fixtures !== 'off' ? `, fixtures=${options.fixtures}` : ''})...`,
       );
@@ -2007,12 +3978,31 @@ function runAndroid(options: ScreenshotOptions): number {
       // The emulator's localhost is its own loopback, so the fixtures backend
       // needs reversing onto the host exactly like the local dev backend does.
       const reversePorts = [
-        ...(options.backend === 'local' ? LOCAL_BACKEND_REVERSE_PORTS : []),
+        ...androidShotsReversePorts(options.backend),
         ...(backendSession ? [backendSession.port] : []),
       ];
       connectDevClient('adb', deviceId, reversePorts);
       backendLogBaseline = screenshotBackendLogLineCount();
-      if (!launchDevClientToHome('adb', deviceId, { logPrefix: LOG })) {
+      const reachedHome = launchDevClientToHome('adb', deviceId, {
+        logPrefix: LOG,
+        // A dead process will not reach home, so stop waiting for it (smoke only).
+        giveUpWhen: options.flow === 'smoke' ? () => smokeCrashes().length > 0 : undefined,
+      });
+      if (!reachedHome && options.flow === 'smoke') {
+        // Give the crash dumper a moment to finish writing its backtrace.
+        runCapture('sleep', ['5']);
+        return judgeSmokeAttempt({
+          options,
+          readNativeCrashes: smokeCrashes,
+          reachedHome: false,
+          maestroStatus: null,
+          readCaptureLog: () => '',
+          logStreamAlive: () => deviceLogStreamAlive(logcatStream.pid),
+          backendSession,
+          backendLogBaseline,
+        });
+      }
+      if (!reachedHome) {
         console.error(`${LOG} FAILED: dev-client never reached home`);
         return 1;
       }
@@ -2031,6 +4021,24 @@ function runAndroid(options: ScreenshotOptions): number {
       process.env,
       captureDir,
     );
+    if (options.flow === 'smoke') {
+      // No screenshots to collect: the run is judged on evidence, pass or fail.
+      // The settled read waits for the board's render line, which only a flow
+      // that ran to the end can have produced.
+      if (maestroStatus === 0) readSettledLogcat(logcatStream);
+      const smokeStatus = judgeSmokeAttempt({
+        options,
+        readNativeCrashes: smokeCrashes,
+        reachedHome: true,
+        maestroStatus,
+        readCaptureLog: () => readTextIfPresent(LOGCAT_LOG_PATH),
+        logStreamAlive: () => deviceLogStreamAlive(logcatStream.pid),
+        backendSession,
+        backendLogBaseline,
+      });
+      captureSucceeded = smokeStatus === 0;
+      return smokeStatus;
+    }
     if (maestroStatus !== 0) {
       console.error(`${LOG} FAILED: Maestro exited with ${maestroStatus}.`);
       return maestroStatus;
@@ -2065,15 +4073,16 @@ function runAndroid(options: ScreenshotOptions): number {
       'android',
       deviceName,
       null,
-      options.flow === 'app-store',
-      outputRootForFlow(options.flow),
+      options.flow === 'app-store' || options.flow === 'app-store-campaign' || !!options.cpp,
+      options.cpp ? OUTPUT_ROOT : outputRootForFlow(options.flow),
+      options.cpp && options.cpp !== 'all' ? options.cpp : undefined,
     );
     if (saved.length === 0) {
       console.error(`${LOG} WARNING: flow completed but no PNGs were captured.`);
       return 1;
     }
     console.log(
-      `${LOG} Saved ${saved.length} screenshot(s) to ${relative(ROOT_DIR, outputRootForFlow(options.flow))}/${STORE_BY_PLATFORM.android}/screenshots/${deviceSlug(deviceName)}/`,
+      `${LOG} Saved ${saved.length} screenshot(s) to ${relative(ROOT_DIR, options.cpp ? OUTPUT_ROOT : outputRootForFlow(options.flow))}/${STORE_BY_PLATFORM.android}/screenshots/${deviceSlug(deviceName)}/`,
     );
     for (const file of saved) console.log(`${LOG}   ${file}`);
     captureSucceeded = true;
@@ -2118,11 +4127,15 @@ function preserveFailedRunArtifacts(captureDir: string): void {
     for (const png of pngs) copyFileSync(join(captureDir, png), join(target, png));
     console.error(`${LOG} kept ${pngs.length} capture(s) from the failed run in ${target}`);
   }
-  if (!existsSync(SCREENSHOT_BACKEND_LOG_PATH)) return;
   mkdirSync(debugDir, { recursive: true });
-  const backendLogTarget = join(debugDir, 'screenshot-backend.log');
-  copyFileSync(SCREENSHOT_BACKEND_LOG_PATH, backendLogTarget);
-  console.error(`${LOG} kept the screenshot backend log from the failed run in ${backendLogTarget}`);
+  for (const [source, filename] of [
+    [SCREENSHOT_BACKEND_LOG_PATH, 'screenshot-backend.log'],
+    [METRO_LOG_PATH, 'metro.log'],
+  ]) {
+    if (!existsSync(source)) continue;
+    copyFileSync(source, join(debugDir, filename));
+    console.error(`${LOG} kept ${filename} from the failed run in ${debugDir}`);
+  }
 }
 
 function resolveAndroidDeviceId(): string | null {
@@ -2271,6 +4284,17 @@ export function clearAndroidStatusBar(deviceId: string): void {
   ]);
 }
 
+/** The regular tablet flow needs verified campaign identities before building or launching. */
+export function assertIosRegularIpadCaptureFlow(
+  options: ScreenshotOptions,
+  devices: readonly IosScreenshotDevice[],
+): void {
+  if (!options.cpp && options.flow === 'app-store' && devices.some(isIpadScreenshotDevice))
+    throw new Error(
+      'Regular iPad captures require --flow app-store-campaign --fixtures replay with a verified campaign fixture',
+    );
+}
+
 function runIos(options: ScreenshotOptions): number {
   if (!commandExists('xcrun') || runCapture('xcrun', ['simctl', 'help']).status !== 0) {
     console.log(`${LOG} Skipped: iOS simulator tooling (xcrun simctl) not available.`);
@@ -2292,16 +4316,101 @@ function runIos(options: ScreenshotOptions): number {
     return 1;
   }
 
+  const screenshotDevices = resolveIosScreenshotDevices(options.devices, options.orientation).filter((device) => {
+    if (!options.cpp || !isDuoScreenshotDevice(device)) return true;
+    console.log(`${LOG} Skipping ${device.name}: custom product pages have no iPhone Duo set.`);
+    return false;
+  });
+  assertIosRegularIpadCaptureFlow(options, screenshotDevices);
   const appPath = resolveAppPath(options);
-  const screenshotDevices = resolveIosScreenshotDevices(options.devices, options.orientation);
   const localeTargets = resolveAppStoreLocaleTargets(options.appLocales);
 
-  const readinessServer = startReadinessServer();
+  const readinessServer = startReadinessServer(
+    options.cpp && options.fixtures === 'record'
+      ? resolveScreenshotBackendPort(process.env.BOARDSESH_SCREENSHOT_BACKEND_PORT)
+      : undefined,
+  );
   let backendSession: ScreenshotBackendSession | null = null;
   try {
     // Started once for the whole run (every locale, every device), so the
     // per-capture gate slices the log from a baseline rather than reading it whole.
     if (options.fixtures !== 'off') backendSession = startScreenshotBackend(options);
+    if (options.cpp && options.cpp !== 'all') {
+      const fixturesDir = backendSession?.fixturesDir ?? resolveFixturesDir(options);
+      const manifest = readScreenshotFixtureManifest(fixturesDir);
+      const capture = manifest?.capture as (ScreenshotCaptureScenario & { cpp?: CppCaptureCoverage }) | undefined;
+      if (
+        options.fixtures === 'replay' &&
+        resolveFixturesDir(options) === resolve(ROOT_DIR, DEFAULT_SCREENSHOT_FIXTURES_DIR)
+      )
+        options.cppFixtureSha256 = readFixtureSnapshotReference(screenshotFixtureReference(options)).sha256;
+      options.cppCoverage = capture?.cpp;
+      let selectors = capture?.boards;
+      if (options.cppScenarioFile)
+        selectors = (JSON.parse(readFileSync(options.cppScenarioFile, 'utf8')) as ScreenshotCaptureScenario).boards;
+      const page = readCppPage(options.cpp);
+      if (!selectors || selectors.length !== 6 || new Set(selectors).size !== 6)
+        throw new Error('CPP fixture must name its six verified roster boards');
+      const variants = [...page.heroBoards, ...page.otherBoards].map((board, index) => ({
+        ...board,
+        selector: selectors[index],
+      }));
+      options.cppCapturePage = {
+        ...page,
+        heroBoards: variants.slice(0, 3),
+        otherBoards: variants.slice(3),
+        primaryBoard: variants.find((board) => board.id === page.primaryBoard.id)!,
+      };
+      options.boards = selectors.join('|');
+      options.cppRecordedBoards = readIosCampaignBoards(fixturesDir) as CppRecordedBoard[];
+      if (options.fixtures === 'replay' && manifest) {
+        assertCppGradeCountProof(manifest, readCppCountFixtures(fixturesDir, manifest));
+        options.cppLogbookAttempts = assertCppLogbookAttemptsReady(
+          manifest,
+          manifest.graphql.map(
+            (entry) =>
+              JSON.parse(
+                readFileSync(join(fixturesDir, entry.file), 'utf8'),
+              ) as import('./lib/screenshot-fixtures').GraphqlFixtureFile,
+          ),
+        );
+      }
+      if (options.fixtures === 'replay')
+        assertCppCaptureReady(
+          options.cpp,
+          options.cppCapturePage,
+          options.cppCoverage,
+          options.cppRecordedBoards,
+          fixturesDir,
+        );
+      else if (options.cppScenarioFile) {
+        const scenario = JSON.parse(readFileSync(options.cppScenarioFile, 'utf8')) as ScreenshotCaptureScenario & {
+          cpp?: CppCaptureCoverage;
+        };
+        if (scenario.cpp?.target !== options.cpp) throw new Error('CPP recording scenario target mismatch');
+        options.cppCoverage = scenario.cpp;
+      }
+      if (!options.cppCoverage) throw new Error('CPP recording needs --cpp-scenario with real seeded scene identities');
+    }
+    if (options.flow === 'app-store-campaign') {
+      assertIosCampaignCaptureReady(
+        options,
+        backendSession?.capture,
+        backendSession ? readIosCampaignBoards(backendSession.fixturesDir) : [],
+      );
+      if (!backendSession) throw new Error('Regular campaign requires a verified fixture backend');
+      options.iosCampaignPrimaryCapture = readIosCampaignPrimaryCapture(
+        backendSession.fixturesDir,
+        parseScreenshotBoardSelectors(options.boards ?? backendSession.capture?.boards.join('|') ?? '')[0] ?? '',
+        readIosCampaignBoards(backendSession.fixturesDir),
+      );
+      if (screenshotDevices.some((device) => !isIpadScreenshotDevice(device)))
+        options.iosCampaignPhoneBoards = readIosCampaignPhoneBoards(
+          backendSession.fixturesDir,
+          parseScreenshotBoardSelectors(options.boards ?? backendSession.capture?.boards.join('|') ?? ''),
+          readIosCampaignBoards(backendSession.fixturesDir),
+        );
+    }
     const status = runIosLocales(options, appPath, screenshotDevices, localeTargets, backendSession);
     if (status !== 0) return status;
     if (backendSession?.mode === 'record' && !reportRecordingSummary(backendSession)) return 1;
@@ -2325,12 +4434,9 @@ function runIosLocales(
       return 1;
     }
     const localeTarget = localeTargets[localeIndex];
-    const metroEnv = buildScreenshotEnv(
-      options,
-      process.env,
-      localeTarget.appLocale,
-      backendSession?.frozenNow ?? null,
-      backendSession?.port ?? null,
+    const metroEnv = captureMetroRuntimeEnv(
+      buildScreenshotSessionEnv(options, process.env, localeTarget.appLocale, backendSession),
+      MOBILE_DIR,
     );
     console.log(
       `${LOG} Starting Metro on ${METRO_PORT} (backend=${options.backend}, theme=${options.theme}, flow=${options.flow}, locale=${localeTarget.appLocale}${options.variant ? `, variant=${options.variant}` : ''}${options.fixtures !== 'off' ? `, fixtures=${options.fixtures}` : ''})...`,
@@ -2409,16 +4515,480 @@ export function main(argv: readonly string[] = process.argv.slice(2)): number {
   const platforms: Array<'ios' | 'android'> = options.platform === 'all' ? ['ios', 'android'] : [options.platform];
 
   for (const platform of platforms) {
-    try {
-      const status = platform === 'ios' ? runIos(options) : runAndroid(options);
-      if (status !== 0) return status;
-    } catch (error) {
-      console.error(`${LOG} FAILED: ${error instanceof Error ? error.message : String(error)}`);
-      return 1;
-    }
+    const status =
+      options.flow === 'smoke'
+        ? runSmoke(options, platform)
+        : runPlatform(options, platform, !argv.includes('--fixtures'));
+    if (status !== 0) return status;
   }
 
   return 0;
+}
+
+/** Resolve each platform separately so an all-platform run cannot move Android onto the iOS fixture. */
+export function resolvePlatformScreenshotOptions(
+  options: ScreenshotOptions,
+  platform: 'ios' | 'android',
+  useFixtureDefaults = false,
+): ScreenshotOptions {
+  const fixtures =
+    platform === 'ios' && options.flow === 'app-store' && useFixtureDefaults ? 'replay' : options.fixtures;
+  return {
+    ...options,
+    platform,
+    fixtures,
+    flow:
+      platform === 'ios' && options.flow === 'app-store' && fixtures === 'replay' ? 'app-store-campaign' : options.flow,
+  };
+}
+
+export function screenshotFixtureReference(options: ScreenshotOptions): string {
+  if (options.cpp && options.cpp !== 'all') {
+    const reference = readCppPage(options.cpp).fixtureReference;
+    if (!reference)
+      throw new Error(
+        `CPP ${options.cpp} needs a verified fixtureReference; record and pin its own complete capture first`,
+      );
+    return reference;
+  }
+  return options.platform === 'ios' &&
+    (options.flow === 'app-store' || options.flow === 'app-store-campaign') &&
+    options.fixtures === 'replay'
+    ? IOS_CAMPAIGN_FIXTURE_REFERENCE
+    : FIXTURE_SNAPSHOT_REFERENCE;
+}
+
+/** Only derived thumbnail pixels in this simulator's app group are disposable. */
+export function clearNativeCaptureThumbnails(container: string): void {
+  const directory = join(container, 'thumbnails');
+  if (!existsSync(directory)) return;
+  for (const entry of readdirSync(directory, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith('.webp')) rmSync(join(directory, entry.name));
+  }
+}
+
+function endNativeActivityCapture(deviceId: string, captureDir: string): void {
+  const flow = join(captureDir, 'end-native-activity.yaml');
+  writeFileSync(
+    flow,
+    `appId: ${APP_ID}\n---\n- openLink: com.boardsesh.app://dev/stories/native-live-activity?end=1&shot=${Date.now()}\n- tapOn:\n    text: Open\n    optional: true\n`,
+  );
+  const boundary = snapshotCaptureLogs([METRO_LOG_PATH, IOS_DEVICE_LOG_PATH], IOS_DEVICE_LOG_PATH);
+  const status = runIosScreenshotMaestro(['--device', deviceId, 'test', flow], { deviceId, cpp: false, captureDir });
+  if (status !== 0 || !waitForCaptureLogLine((line) => line.includes('[stories] native ended'), boundary, 15))
+    throw new Error('Native activity cleanup was not confirmed');
+}
+
+/** Wait for the real native thumbnail cache, then expand ActivityKit before capturing pixels. */
+function prepareNativeActivityCapture(
+  deviceId: string,
+  board: string,
+  offset: number,
+  captureDir: string,
+  nativeBoundary: readonly CaptureLogBoundary[],
+): void {
+  const line = waitForCaptureLogLine(
+    (candidate) =>
+      candidate.includes(`[stories] native started ${board} `) ||
+      candidate.includes('[stories] error native-live-activity'),
+    [{ path: METRO_LOG_PATH, offset }, ...nativeBoundary],
+    30,
+  );
+  const filename = line?.match(/\[stories\] native started [a-z0-9-]+ ([A-Za-z0-9-]+-classic\.webp)/)?.[1];
+  if (!filename) throw new Error(line ?? 'Native activity did not initialize');
+  const container = runCapture('xcrun', ['simctl', 'get_app_container', deviceId, APP_ID, 'group.com.boardsesh.app']);
+  if (container.status !== 0 || !container.stdout.trim())
+    throw new Error('Native activity app-group container unavailable');
+  const thumbnail = join(container.stdout.trim(), 'thumbnails', filename);
+  const deadline = Date.now() + 30000;
+  while ((!existsSync(thumbnail) || statSync(thumbnail).size === 0) && Date.now() < deadline)
+    runCapture('sleep', ['0.25']);
+  if (!existsSync(thumbnail) || statSync(thumbnail).size === 0)
+    throw new Error(`Native activity thumbnail did not load: ${filename}`);
+  const flow = join(captureDir, 'expand-native-activity.yaml');
+  writeFileSync(
+    flow,
+    [
+      `appId: ${APP_ID}`,
+      '---',
+      '- pressKey: home',
+      '- longPressOn:',
+      '    point: "50%,3%"',
+      '- waitForAnimationToEnd:',
+      '    timeout: 5000',
+    ].join('\n') + '\n',
+  );
+  if (runIosScreenshotMaestro(['--device', deviceId, 'test', flow], { deviceId, cpp: true, captureDir }) !== 0)
+    throw new Error('Could not expand the native Live Activity');
+}
+
+/** Visual captures load only injected view props; the smoke runner retains real application providers. */
+function runVisualStories(options: ScreenshotOptions, platform: 'ios' | 'android'): number {
+  if (!commandExists(platform === 'ios' ? 'xcrun' : 'adb')) {
+    if (platform === 'ios') {
+      console.log(`${LOG} Skipped: iOS simulator tooling is unavailable.`);
+      return 0;
+    }
+    throw new Error('Android platform tooling (adb) is unavailable');
+  }
+  if (!commandExists('maestro')) throw new Error(`Maestro not found. ${MAESTRO_INSTALL_HINT}`);
+  if (portInUse(METRO_PORT)) throw new Error(`Metro port ${METRO_PORT} is already occupied`);
+  const iosDevices =
+    platform === 'ios'
+      ? resolveIosScreenshotDevices(options.devices, options.orientation).filter(
+          (device) => !options.cpp || !isDuoScreenshotDevice(device),
+        )
+      : [];
+  const androidId = platform === 'android' ? resolveAndroidDeviceId() : null;
+  if (platform === 'android' && !androidId) throw new Error('No ready Android emulator');
+  const appPath =
+    platform === 'ios' ? resolveAppPath(options) : ensureAndroidApk({ appPath: options.appPath ?? undefined });
+  const localeTargets =
+    platform === 'ios'
+      ? resolveAppStoreLocaleTargets(options.appLocales)
+      : [{ appLocale: 'en-US' as const, appStoreLocales: [] }];
+  const variant = (options.variant ?? (platform === 'ios' ? 'liquidGlass' : 'material')) as StoryVariant;
+  const storySourceSha256 = options.cpp ? cppStorySourceSha256() : undefined;
+  const storyEnv = buildStoryEnv(process.env);
+  const metroEnv = platform === 'ios' ? captureMetroRuntimeEnv(storyEnv, MOBILE_DIR) : storyEnv;
+  const metro = startMetro(metroEnv);
+  let nativeBackend: ScreenshotBackendSession | null = null;
+  try {
+    if (!waitForMetro()) throw new Error('Story Metro did not become ready');
+    prewarmMetroBundle(platform);
+    const devices =
+      platform === 'ios'
+        ? iosDevices.map((descriptor) => ({ descriptor, device: findOrCreateIosDevice(descriptor) }))
+        : [{ descriptor: null, device: { udid: androidId!, name: androidDeviceName(options), state: 'Booted' } }];
+    for (const { descriptor, device } of devices) {
+      const captureDir = mkdtempSync(join(tmpdir(), 'boardsesh-view-stories-'));
+      let succeeded = false;
+      let hingeLog: string | null = null;
+      let nativeActivityStarted = false;
+      let deviceLogStream: ChildProcess | null = null;
+      const reportDirectories = descriptor ? iosDiagnosticReportDirectories(device.udid) : [];
+      const reportBaseline = snapshotIosDiagnosticReports(reportDirectories);
+      const preserveNativeFailure = () => {
+        // Collect while this simulator and app are still alive. Post-job log
+        // collection runs after shutdown and otherwise loses launch failures.
+        if (descriptor && process.env.SCREENSHOT_DEBUG_DIR) {
+          try {
+            const diagnosticDir = preserveIosCaptureDiagnostics({
+              udid: device.udid,
+              debugDir: process.env.SCREENSHOT_DEBUG_DIR,
+              nativeLogPath: IOS_DEVICE_LOG_PATH,
+              reportDirectories,
+              baseline: reportBaseline,
+              runCommand: (args) => runCapture('xcrun', args, undefined, 15000),
+            });
+            const launchLog = join(captureDir, 'ios-launch.json');
+            if (existsSync(launchLog)) copyFileSync(launchLog, join(diagnosticDir, 'ios-launch.json'));
+            runCapture(
+              'xcrun',
+              ['simctl', 'io', device.udid, 'screenshot', join(diagnosticDir, 'failure-screen.png')],
+              undefined,
+              15000,
+            );
+          } catch (error) {
+            console.error(
+              `${LOG} Story native diagnostic collection failed: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+      };
+      try {
+        if (descriptor) {
+          bootDevice(device);
+          deviceLogStream = startIosDeviceLogStream(device.udid, IOS_CAPTURE_LOG_PREDICATE);
+          if (usesDuoStoreFlow(options, descriptor)) hingeLog = prepareDuoHinge(device.udid);
+          applyCleanStatusBar(device.udid);
+          if (runCapture('xcrun', ['simctl', 'install', device.udid, appPath]).status !== 0)
+            throw new Error('Story app install failed');
+          runCapture('xcrun', ['simctl', 'terminate', device.udid, APP_ID]);
+        } else {
+          installDevClient('adb', device.udid, appPath);
+          connectDevClient('adb', device.udid, []);
+          applyCleanAndroidStatusBar(device.udid);
+        }
+        const readinessPaths = descriptor ? [METRO_LOG_PATH, IOS_DEVICE_LOG_PATH] : [METRO_LOG_PATH];
+        let rootBoundary = snapshotCaptureLogs(readinessPaths, descriptor ? IOS_DEVICE_LOG_PATH : undefined);
+        const launchStoryApp = () => {
+          const launchArgs = iosSimulatorLaunchArgs(device.udid);
+          const launchResult = runCapture('xcrun', launchArgs, simulatorLaunchEnv());
+          writeFileSync(
+            join(captureDir, 'ios-launch.json'),
+            JSON.stringify({ args: launchArgs, ...launchResult }, null, 2),
+          );
+          if (launchResult.status !== 0) throw new Error(`Story app launch failed: ${launchResult.stderr}`);
+        };
+        if (descriptor) launchStoryApp();
+        else launchDevClient('adb', device.udid);
+        const waitForRoot = () => waitForCaptureLogLine(isStoryRootReadyLine, rootBoundary, 120) !== null;
+        const rootReady = descriptor
+          ? waitForIosCaptureReady({
+              waitReady: waitForRoot,
+              beforeRetry: (attempt) => {
+                preserveNativeFailure();
+                console.log(`${LOG} Story root not ready; terminating and re-launching (attempt ${attempt}/3)...`);
+              },
+              relaunch: () => {
+                if (runCapture('xcrun', ['simctl', 'terminate', device.udid, APP_ID]).status !== 0)
+                  throw new Error('Could not stop the previous story process');
+                rootBoundary = snapshotCaptureLogs(readinessPaths, descriptor ? IOS_DEVICE_LOG_PATH : undefined);
+                launchStoryApp();
+              },
+            })
+          : waitForRoot();
+        if (!rootReady) throw new Error('Isolated story root did not become ready after bounded launch attempts');
+        for (const localeTarget of localeTargets) {
+          const passes: Array<{ captures: VisualStoryCapture[]; inner: boolean }> = [];
+          if (options.cpp && options.cpp !== 'all') {
+            passes.push({
+              captures: cppStoryCaptures(
+                readCppPage(options.cpp),
+                descriptor && isIpadScreenshotDevice(descriptor) ? 'ipad' : 'phone',
+              ),
+              inner: false,
+            });
+          } else if (descriptor && usesDuoStoreFlow(options, descriptor)) {
+            passes.push({ captures: readVisualStoryCaptures(join(MAESTRO_DIR, 'app-store-duo.yaml')), inner: false });
+            passes.push({ captures: readVisualStoryCaptures(join(MAESTRO_DIR, DUO_INNER_FLOW_FILE)), inner: true });
+          } else if (descriptor && options.flow === 'app-store-campaign' && !isIpadScreenshotDevice(descriptor)) {
+            passes.push({
+              captures: IOS_CAMPAIGN_CAPTURE_NAMES.map((filename) => ({
+                name: filename.replace(/\.png$/, ''),
+                storyId: storyForCaptureName(filename),
+              })),
+              inner: false,
+            });
+          } else {
+            const flow = descriptor ? iosSourceFlowFile(options, descriptor) : flowFileForPlatform(options, 'android');
+            passes.push({ captures: readVisualStoryCaptures(flow), inner: false });
+          }
+          for (const pass of passes) {
+            if (hingeLog) setDuoPose(device.udid, pass.inner ? 'open' : 'closed', hingeLog);
+            for (const capture of pass.captures) {
+              if (capture.nativeActivityBoard && !descriptor)
+                throw new Error('Native Live Activity captures require iOS');
+              if (capture.nativeActivityBoard && !nativeBackend)
+                nativeBackend = startScreenshotBackend({ ...options, fixtures: 'replay' });
+              if (capture.nativeActivityBoard) {
+                // End the activity and stop its process before evicting pixels:
+                // endSession alone does not cancel native thumbnail tasks.
+                endNativeActivityCapture(device.udid, captureDir);
+                if (runCapture('xcrun', ['simctl', 'terminate', device.udid, APP_ID]).status !== 0)
+                  throw new Error('Could not stop the previous native thumbnail producer');
+                const container = runCapture('xcrun', [
+                  'simctl',
+                  'get_app_container',
+                  device.udid,
+                  APP_ID,
+                  'group.com.boardsesh.app',
+                ]);
+                if (container.status !== 0 || !container.stdout.trim())
+                  throw new Error('Native activity app-group container unavailable');
+                clearNativeCaptureThumbnails(container.stdout.trim());
+                const restartBoundary = snapshotCaptureLogs(
+                  readinessPaths,
+                  descriptor ? IOS_DEVICE_LOG_PATH : undefined,
+                );
+                if (
+                  runCapture('xcrun', iosSimulatorLaunchArgs(device.udid), simulatorLaunchEnv()).status !== 0 ||
+                  !waitForCaptureLogLine(isStoryRootReadyLine, restartBoundary, 120)
+                )
+                  throw new Error('Story root did not restart for a fresh native capture');
+              }
+              const route = capture.nativeActivityBoard
+                ? `dev/stories/native-live-activity?board=${capture.nativeActivityBoard}&server=${encodeURIComponent(`http://localhost:${nativeBackend!.port}`)}&shot=${Date.now()}`
+                : `${storyRoute({ id: capture.storyId, theme: options.theme, variant, renderMode: options.renderMode ?? 'aura' })}&locale=${localeTarget.appLocale}`;
+              const flowFile = join(captureDir, 'navigate-story.yaml');
+              writeFileSync(
+                flowFile,
+                descriptor
+                  ? iosStoryNavigationFlow(
+                      APP_ID,
+                      `com.boardsesh.app://${route}`,
+                      pass.inner ? 'LANDSCAPE_LEFT' : descriptor.orientation,
+                    )
+                  : [
+                      `appId: ${ANDROID_DEV_PACKAGE}`,
+                      '---',
+                      `- openLink: com.boardsesh.app://${route}`,
+                      '- tapOn:',
+                      '    text: Open',
+                      '    optional: true',
+                    ].join('\n') + '\n',
+              );
+              const offset = metroLogOffset(METRO_LOG_PATH);
+              const nativeBoundary = descriptor ? snapshotCaptureLogs([IOS_DEVICE_LOG_PATH], IOS_DEVICE_LOG_PATH) : [];
+              const args = ['--device', device.udid, 'test', flowFile];
+              const status = descriptor
+                ? runIosScreenshotMaestro(args, { deviceId: device.udid, cpp: false, captureDir })
+                : runInherit('maestro', args, process.env, captureDir);
+              if (status !== 0) throw new Error(`Story navigation failed for ${capture.storyId}`);
+              if (capture.nativeActivityBoard) {
+                nativeActivityStarted = true;
+                prepareNativeActivityCapture(
+                  device.udid,
+                  capture.nativeActivityBoard,
+                  offset,
+                  captureDir,
+                  nativeBoundary,
+                );
+              } else settleAfterStory(capture.storyId, METRO_LOG_PATH, offset, 0, LOG, nativeBoundary);
+              const path = join(captureDir, `${capture.name}.png`);
+              if (descriptor) {
+                const captureStatus = hingeLog
+                  ? captureDuoDisplay(device.udid, pass.inner ? 'open' : 'closed', path)
+                  : runCapture('xcrun', ['simctl', 'io', device.udid, 'screenshot', path]).status;
+                if (captureStatus !== 0) throw new Error(`Native screenshot failed for ${capture.name}`);
+                if (hingeLog && !pngIsLit(path)) throw new Error(`Duo display is dark for ${capture.name}`);
+              } else {
+                const descriptor = openSync(path, 'w');
+                try {
+                  const result = spawnSync('adb', ['-s', device.udid, 'exec-out', 'screencap', '-p'], {
+                    stdio: ['ignore', descriptor, 'inherit'],
+                  });
+                  if (result.status !== 0) throw new Error(`Android screenshot failed for ${capture.name}`);
+                } finally {
+                  closeSync(descriptor);
+                }
+              }
+              if (
+                capture.nativeActivityBoard &&
+                runCapture('vp', ['exec', 'tsx', 'scripts/assert-native-island-capture.ts', path]).status !== 0
+              )
+                throw new Error('The native screenshot does not contain the expanded Dynamic Island');
+              if (!existsSync(path) || statSync(path).size < 1000) throw new Error(`Empty screenshot: ${capture.name}`);
+            }
+          }
+          if (descriptor && !hingeLog && normalizeCapturedIosScreenshots(captureDir, descriptor) !== 0)
+            throw new Error('Screenshot orientation normalization failed');
+          const duplicates = findDuplicateScreenshotGroups(captureDir);
+          if (duplicates.length)
+            throw new Error(`Duplicate screenshots: ${duplicates.map((group) => group.join(' = ')).join('; ')}`);
+          if (options.cpp && options.cpp !== 'all') {
+            writeFileSync(
+              join(captureDir, 'cpp-capture.json'),
+              JSON.stringify(
+                createCppStoryCapture(
+                  {
+                    target: options.cpp,
+                    sourceSha256: storySourceSha256!,
+                    locale: localeTarget.appLocale,
+                    device: deviceSlug(device.name),
+                    theme: options.theme,
+                    variant,
+                    renderMode: options.renderMode ?? 'aura',
+                  },
+                  captureDir,
+                ),
+              ),
+            );
+          }
+          const saved = collectScreenshots(
+            captureDir,
+            platform,
+            device.name,
+            localeTarget.appStoreLocales,
+            options.flow === 'app-store' || options.flow === 'app-store-campaign' || !!options.cpp,
+            options.cpp ? OUTPUT_ROOT : outputRootForFlow(options.flow),
+            options.cpp && options.cpp !== 'all' ? options.cpp : undefined,
+          );
+          if (!saved.length) throw new Error('No story captures were saved');
+          console.log(`${LOG} Saved ${saved.length} view screenshots for ${device.name} / ${localeTarget.appLocale}`);
+        }
+        succeeded = true;
+      } finally {
+        if (descriptor && nativeActivityStarted) {
+          try {
+            endNativeActivityCapture(device.udid, captureDir);
+          } catch (error) {
+            console.error(`${LOG} ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        try {
+          if (!succeeded) {
+            preserveNativeFailure();
+            preserveFailedRunArtifacts(captureDir);
+          }
+        } finally {
+          deviceLogStream?.kill('SIGTERM');
+        }
+        rmSync(captureDir, { recursive: true, force: true });
+        if (descriptor) {
+          if (hingeLog) setDuoPose(device.udid, 'closed', hingeLog);
+          clearStatusBar(device.udid);
+          if (options.shutdown) runCapture('xcrun', ['simctl', 'shutdown', device.udid]);
+        } else clearAndroidStatusBar(device.udid);
+      }
+    }
+    return 0;
+  } finally {
+    stopMetro(metro);
+    stopScreenshotBackend(nativeBackend);
+  }
+}
+
+function runPlatform(
+  originalOptions: ScreenshotOptions,
+  platform: 'ios' | 'android',
+  useFixtureDefaults: boolean,
+): number {
+  const options = resolvePlatformScreenshotOptions(originalOptions, platform, useFixtureDefaults);
+  if (options.cpp === 'all') {
+    for (const target of CPP_TARGETS) {
+      const status = runPlatform({ ...options, cpp: target }, platform, false);
+      if (status !== 0) return status;
+    }
+    return 0;
+  }
+  if (options.cpp)
+    options.boards = [...readCppPage(options.cpp).heroBoards, ...readCppPage(options.cpp).otherBoards]
+      .map((board) => board.selector)
+      .join('|');
+  try {
+    if (options.flow !== 'smoke') return runVisualStories(options, platform);
+    return platform === 'ios' ? runIos(options) : runAndroid(options);
+  } catch (error) {
+    console.error(`${LOG} FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    return 1;
+  }
+}
+
+/**
+ * One smoke attempt, plus the single fresh-boot retry a launch crash earns, then
+ * the result file. Every other failure class is final on the first attempt: a
+ * retry there would hide exactly what the gate exists to report.
+ */
+function runSmoke(options: ScreenshotOptions, platform: 'ios' | 'android'): number {
+  const attempt = (): number => {
+    const judgedBefore = smokeAttempts.length;
+    const status = runPlatform(options, platform, false);
+    // A failure that never reached judgeSmokeAttempt happened before the app
+    // launched (no device, a failed install, a port in use).
+    if (status !== 0 && smokeAttempts.length === judgedBefore) {
+      smokeAttempts.push({
+        failureClass: 'setup',
+        problems: ['the run failed before the app launched; see the FAILED line above.'],
+        pings: [],
+      });
+    }
+    return status;
+  };
+
+  let status = attempt();
+  if (status !== 0 && shouldRetrySmoke(smokeAttempts)) {
+    console.warn(`${LOG} The app died natively at launch with no replay miss; retrying once from a fresh boot.`);
+    try {
+      freshBootForSmokeRetry(options);
+      status = attempt();
+    } catch (error) {
+      console.error(`${LOG} FAILED: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  writeSmokeResult(platform);
+  return status;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {

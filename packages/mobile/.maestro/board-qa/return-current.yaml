@@ -1,0 +1,15 @@
+appId: ${APP_ID}
+name: Close the last-look preview and reopen the queue's committed player
+---
+- tapOn:
+    id: play-drawer-close
+- extendedWaitUntil:
+    notVisible:
+      id: play-drawer-header-accessibility
+    timeout: 10000
+- openLink: ${APP_SCHEME}://play
+- extendedWaitUntil:
+    visible:
+      id: play-drawer-header-accessibility
+      text: ${CURRENT_CLIMB_LABEL_PATTERN}
+    timeout: 15000

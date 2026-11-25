@@ -1,9 +1,8 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo } from 'react';
-import { View, Pressable, StyleSheet } from 'react-native';
+import { View, StyleSheet } from 'react-native';
 import { useTheme } from '../../providers/theme-provider';
-import { spacing, borderRadius } from '../../theme/tokens';
-import { brandColors } from '../../theme/colors';
-import { iosSystemColors } from '../../theme/ios-colors';
+import { opacity, spacing, borderRadius } from '../../theme/tokens';
 import { Text } from '../Text';
 
 export type ChipOption<T> = {
@@ -35,11 +34,11 @@ type BoardConfigChipsProps<T> = {
  * fix the climb filter sheet's chip rows use.
  */
 function BoardConfigChipsInner<T>({ groupLabel, options, onSelect, disabled = false }: BoardConfigChipsProps<T>) {
-  const { systemColors, brandColors: themeBrandColors } = useTheme();
+  const { systemColors, selection } = useTheme();
   return (
     <View style={styles.row}>
       {options.map((option) => (
-        <Pressable
+        <PressableSurface
           key={option.key}
           onPress={disabled ? undefined : () => onSelect(option.value)}
           disabled={disabled}
@@ -51,17 +50,20 @@ function BoardConfigChipsInner<T>({ groupLabel, options, onSelect, disabled = fa
             styles.chip,
             disabled && styles.chipDisabled,
             {
-              // Border is a foreground accent → scheme-aware. Fill stays static:
-              // the selected label turns white and must sit on the brand fill.
-              borderColor: option.selected ? themeBrandColors.primary : systemColors.separator,
-              backgroundColor: option.selected ? brandColors.primary : 'transparent',
+              // The resting chip is a fill capsule with a transparent border (the
+              // grade rail's resting look, docs/design/mobile-chrome.md); selected
+              // is a state: the brand wash behind a label-colour title, with a
+              // visible ring. The border is 1 pt in both states, so a chip never
+              // changes size (and the label never jumps) when it is picked.
+              borderColor: option.selected ? selection.checkmark : 'transparent',
+              backgroundColor: option.selected ? selection.fill : systemColors.fill,
             },
           ]}
         >
-          <Text variant="footnote" color={option.selected ? iosSystemColors.white : systemColors.label}>
+          <Text variant="footnote" color={selection.text} emphasized={option.selected}>
             {option.label}
           </Text>
-        </Pressable>
+        </PressableSurface>
       ))}
     </View>
   );
@@ -83,11 +85,11 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing[3],
     paddingVertical: spacing[2],
     borderRadius: borderRadius.full,
-    borderWidth: StyleSheet.hairlineWidth,
+    borderWidth: 1,
     justifyContent: 'center',
     alignItems: 'center',
   },
   chipDisabled: {
-    opacity: 0.4,
+    opacity: opacity.disabled,
   },
 });

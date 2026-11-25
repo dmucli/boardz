@@ -19,7 +19,9 @@ import {
   trackLiveActivityPushDeliveryAttributionGap,
 } from '../analytics/live-activity';
 import { logger } from '../../utils/logger';
-import { type BoardHolder, deriveBoardConnection } from './board-connection';
+import { type BoardHolder } from './board-connection';
+import { projectLiveActivityContent } from './privacy';
+import { emptyLiveActivityContentState } from './content-state';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -146,6 +148,19 @@ export function isApnsConfigured(): boolean {
 
 /** Debounce map: sessionId -> pending send state */
 const pendingSends = new Map<string, DebouncedEntry>();
+const deliveryChains = new Map<string, Promise<void>>();
+
+async function serializeDelivery(sessionId: string, deliver: () => Promise<void>): Promise<void> {
+  const previous = deliveryChains.get(sessionId) ?? Promise.resolve();
+  const delivery = previous.then(deliver);
+  const settled = delivery.catch(() => undefined);
+  deliveryChains.set(sessionId, settled);
+  try {
+    await delivery;
+  } finally {
+    if (deliveryChains.get(sessionId) === settled) deliveryChains.delete(sessionId);
+  }
+}
 
 /** Whether a session currently has a pending debounced send in flight. */
 export function hasPendingSend(sessionId: string): boolean {
@@ -353,9 +368,10 @@ function trackPushDeliveryForRegistrations({
     }
   }
 
-  for (const [userId, deliveryCounts] of deliveryCountsByUserId.entries()) {
+  // One event per climber's set of devices, but the event names nobody: the
+  // grouping only keeps one person's failures from blurring into another's.
+  for (const deliveryCounts of deliveryCountsByUserId.values()) {
     trackLiveActivityPushDelivery({
-      userId,
       sessionId,
       event,
       source,
@@ -404,8 +420,11 @@ async function sendNotification(
     event,
   };
 
-  if (contentState && event === 'update') {
+  if (contentState) {
     notification.aps['content-state'] = contentState;
+  }
+  if (event === 'end' && contentState) {
+    notification.aps['dismissal-date'] = Math.floor(Date.now() / 1000);
   }
 
   notification.expiry = Math.floor(Date.now() / 1000) + (event === 'end' ? 60 : 300);
@@ -480,26 +499,27 @@ async function sendNotification(
 }
 
 /**
- * Resolve the session's board holder ONCE (the hot-path contract: one holder
- * lookup per send, never per token), then send the `update` push GROUPED by each
- * token's derived board-connection state.
- *
- * When the holder can't be resolved (no resolver wired, no board mapping, no
- * Redis, anonymous holder, or a lookup error) the whole set is sent as a single
- * group with boardConnection OMITTED — the prior behaviour, and the device then
- * falls back to its own App-Group state.
- *
- * When the holder IS known, registrations split into (typically ≤2) groups by
- * derived state — the holder's own device(s) get 'connectedByMe', everyone else
- * gets 'heldByPeer' (+ holderDisplayName). Each group is a separate
- * `sendNotification` call so the existing structured logging / analytics /
- * stale-token (410) handling keeps operating on the registrations it was given.
+ * Serialize updates with withdrawals, then authorize each recipient against
+ * current session, climb and identity access. Only identical projections share
+ * a push. Pushes for one session go out in order, so a later withdrawal never
+ * overtakes an earlier update.
  */
 async function sendGroupedNotification(
   sessionId: string,
   registrations: LiveActivityTokenRegistration[],
   baseContentState: LiveActivityContentState,
   options: SendOptions = {},
+): Promise<void> {
+  await serializeDelivery(sessionId, () =>
+    projectAndSendNotification(sessionId, registrations, baseContentState, options),
+  );
+}
+
+async function projectAndSendNotification(
+  sessionId: string,
+  registrations: LiveActivityTokenRegistration[],
+  baseContentState: LiveActivityContentState,
+  options: SendOptions,
 ): Promise<void> {
   if (registrations.length === 0) return;
 
@@ -516,29 +536,24 @@ async function sendGroupedNotification(
     }
   }
 
-  if (!holder) {
-    await sendNotification(sessionId, registrations, 'update', baseContentState, options);
-    return;
-  }
-
-  // Group registrations by their serialized per-token board-connection patch so
-  // every distinct state is one send. In practice this is ≤2 groups
-  // (connectedByMe for the holder's device(s), heldByPeer for the rest).
+  // Registrations outlive participation and grants. Authorize at delivery,
+  // including heartbeat/registration sends, and share only identical projections.
   const groups = new Map<
     string,
-    { contentState: LiveActivityContentState; registrations: LiveActivityTokenRegistration[] }
+    { event: 'update' | 'end'; contentState: LiveActivityContentState; registrations: LiveActivityTokenRegistration[] }
   >();
+  const projections = new Map<string | null, Awaited<ReturnType<typeof projectLiveActivityContent>>>();
   for (const registration of registrations) {
-    const derived = deriveBoardConnection({
-      tokenUserId: registration.userId,
-      holderUserId: holder.holderUserId,
-      holderDisplayName: holder.holderDisplayName,
-    });
-    const groupKey = `${derived.boardConnection}|${derived.holderDisplayName ?? ''}`;
+    let projection = projections.get(registration.userId);
+    if (!projection) {
+      projection = await projectLiveActivityContent(sessionId, registration.userId, baseContentState, holder);
+      projections.set(registration.userId, projection);
+    }
+    const groupKey = JSON.stringify(projection);
     let group = groups.get(groupKey);
     if (!group) {
       group = {
-        contentState: { ...baseContentState, ...derived },
+        ...projection,
         registrations: [],
       };
       groups.set(groupKey, group);
@@ -548,7 +563,7 @@ async function sendGroupedNotification(
 
   await Promise.all(
     [...groups.values()].map((group) =>
-      sendNotification(sessionId, group.registrations, 'update', group.contentState, options),
+      sendNotification(sessionId, group.registrations, group.event, group.contentState, options),
     ),
   );
 }
@@ -565,9 +580,8 @@ function trackSessionEndedForRegistrations(sessionId: string, registrations: Liv
     tokenCountsByUserId.set(registration.userId, (tokenCountsByUserId.get(registration.userId) ?? 0) + 1);
   }
 
-  for (const [userId, tokenCount] of tokenCountsByUserId.entries()) {
+  for (const tokenCount of tokenCountsByUserId.values()) {
     trackLiveActivityEnded({
-      userId,
       sessionId,
       reason: 'session-ended',
       tokenCount,
@@ -732,7 +746,9 @@ export async function endLiveActivity(sessionId: string): Promise<void> {
     logger.error(`[APNs] endLiveActivity: token lookup failed for session ${sessionId}:`, error);
   }
   if (registrations.length > 0) {
-    await sendNotification(sessionId, registrations, 'end');
+    await serializeDelivery(sessionId, async () => {
+      await sendNotification(sessionId, registrations, 'end', emptyLiveActivityContentState());
+    });
     trackSessionEndedForRegistrations(sessionId, registrations);
   } else {
     logger.debug(`[APNs] No registered Live Activity tokens for session ${sessionId}; skipping end`);
@@ -752,6 +768,7 @@ export async function cleanupTokensForSession(sessionId: string): Promise<void> 
 
 /** Internal helper for `__resetApnsForTests`: clears pendingSends timers and resets counters. */
 function __resetApnsStateForTests(): void {
+  deliveryChains.clear();
   for (const [, entry] of pendingSends) {
     clearTimeout(entry.timeout);
   }

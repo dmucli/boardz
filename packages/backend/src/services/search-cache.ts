@@ -40,14 +40,26 @@ export const DEFAULT_SEARCH_CACHE_TTL = 86400;
  * and a search that does not filter on integrity has no param that moved — so a
  * cached v8 page would serve rows with the field absent and every climb on a wall
  * that has just been reset would read as intact for the full 24h TTL.
+ * v10: search rows now carry `revisionNumber` and `holdsRevisionNumber` (#6023).
+ * A client will send `revisionNumber` back with a tick, so a cached v9 page,
+ * whose rows have neither field, would leave every tick logged from it to the
+ * server's by-date fallback for the full 24h TTL.
  *
  * Not bumped for #5642, which narrowed Woods searches back to the browsed angle
  * unless `crossAngleStats` opts in: Woods has not been cacheable since #4750
  * (`isCacheableBoard` in the climbs resolver), so no cached page describes it,
  * and every cacheable board resolves exactly as before. The v8 note above
  * predates that exclusion.
+ *
+ * Not bumped for the removal of the holds-epoch rule (#6023) either. The rule
+ * only changed per-viewer sent / attempted filters, which were never part of a
+ * shared page, and search rows still carry the same two revision fields.
  */
-export const CACHE_VERSION = 'v9';
+// v11: project frame-derived requiredSetIds so cached rows retain hold-set metadata.
+// v12: Kilter's benchmark column now holds Kilter's own Verified list (#2493): about
+// 4,400 rows gained a mark and 61 lost one. A cached v11 Benchmarks/Verified page
+// kept serving the old list for the full 24h TTL; seen as an empty Verified page.
+export const CACHE_VERSION = 'v12';
 
 /**
  * Recursively sorts the keys of an object so that JSON.stringify produces

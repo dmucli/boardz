@@ -1,22 +1,31 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshControl, StyleSheet, View } from 'react-native';
+import {
+  getPendingUserStartedDownloads,
+  isDownloadKeepAwakeActive,
+  subscribeDownloadKeepAwake,
+} from '../../src/offline/download-keep-awake-store';
+import { useSprayImportProgress } from '../../src/lib/spray/use-spray-import-progress';
+import { unfinishedSprayWallRoute } from '../../src/lib/spray/spray-import-progress';
+import { MY_BOARDS_WITH_IMPORTS_INPUT } from '../../src/lib/graphql/query-keys';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
+import { Alert, RefreshControl, StyleSheet, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
-import { useRouter } from 'expo-router';
+import { useNavigation, useRouter } from 'expo-router';
 import { useTranslation } from 'react-i18next';
-import { useSQLiteContext } from 'expo-sqlite';
 import { useQuery } from '@tanstack/react-query';
 import type { UserBoard } from '@boardsesh/shared-schema';
-import { useMyBoards, useProfile } from '../../src/lib/graphql/hooks';
+import { useDeleteBoard, useMyBoards, useProfile } from '../../src/lib/graphql/hooks';
 import { useActiveBoard } from '../../src/lib/graphql/use-active-board';
 import { useAuth } from '../../src/providers/auth-provider';
 import { useConfirm } from '../../src/providers/dialog-provider';
 import { useTheme } from '../../src/providers/theme-provider';
 import {
+  useAddBoardWizardEnabled,
   useOfflineDownloadProgressEnabled,
   useOfflineDownloadsEnabled,
 } from '../../src/providers/feature-flags-provider';
 import { useBottomChromeMetrics } from '../../src/hooks/use-bottom-chrome-metrics';
-import { useSyncStatus } from '../../src/sync';
+import { getSyncStatusSnapshot, useSyncStatusMetadata } from '../../src/sync/sync-status';
+import { useDownloadActivity } from '../../src/sync/download-activity-store';
 import {
   getCheckpoint,
   getCheckpointKey,
@@ -27,6 +36,8 @@ import {
   estimateScopeDownload,
 } from '@boardsesh/offline-sync';
 import { reportAbandonedDownloadOnDisable } from '../../src/offline/abandoned-download-terminals';
+import { useOfflineDatabase } from '../../src/db/use-offline-database';
+import { useOfflineSchemaDowngrade } from '../../src/db/use-offline-schema-downgrade';
 import { useBoardDownloads } from '../../src/offline/use-board-downloads';
 import { useSnapshotManifest } from '../../src/offline/use-snapshot-manifest';
 import { useConfirmBoardDownload } from '../../src/offline/use-confirm-board-download';
@@ -58,23 +69,66 @@ import {
   boardIsBootstrapping,
   boardDownloadProgress,
 } from '../../src/components/board-discovery/board-offline-state';
-import { buildManageItems, type ManageItem } from '../../src/components/board-discovery/manage-items';
+import {
+  archivedSprayWallSummaries,
+  buildManageItems,
+  type ManageItem,
+} from '../../src/components/board-discovery/manage-items';
+import { ArchivedWallManageRow } from '../../src/components/board-discovery/ArchivedWallManageRow';
+import { useMySprayWallLifecycle } from '../../src/lib/spray/use-create-spray-wall';
+import { forgetDeletedSprayWall } from '../../src/lib/spray/forget-deleted-spray-wall';
+import { reportError } from '../../src/lib/error-reporting';
+import {
+  getActiveBoardWriteGeneration,
+  useClearActiveBoardIfCurrentGeneration,
+} from '../../src/lib/graphql/use-active-board';
+import { useQueueActions } from '../../src/providers/queue-provider';
+import type { ArchivedSprayWallSummary } from '../../src/components/board-discovery/manage-items';
+import { useOpenSprayWall } from '../../src/lib/spray/use-open-spray-wall';
+import { useActivateBoard } from '../../src/lib/boards/use-activate-board';
+import { resolveBoardReturnTo } from '../../src/lib/boards/board-return-to';
+import { trackBoardPickerAddSelected, type BoardPickerAddKind } from '../../src/lib/boards/board-picker-add-analytics';
+import { addBoardRoute } from '../../src/components/board-discovery/add-board-route';
+import { AddBoardMenu } from '../../src/components/board-discovery/AddBoardMenu';
+import { AddBoardButton } from '../../src/components/board-discovery/AddBoardButton';
 import { offlineBoardRows } from '../../src/components/board-discovery/offline-board-items';
 import { useConnectivity } from '../../src/lib/connectivity/use-connectivity';
 import { pickerNoticeKey } from '../../src/lib/boards/local-only';
 import { useStoredUserId } from '../../src/hooks/use-current-user-id';
-import { iosSystemColors } from '../../src/theme/ios-colors';
 import { spacing } from '../../src/theme/tokens';
+import { openSignIn } from '../../src/lib/routing/open-sign-in';
 
 const EMPTY_BOARDS: UserBoard[] = [];
 const EMPTY_ITEMS: ManageItem[] = [];
 
 const keyExtractor = (item: ManageItem) => item.key;
+/** The boards modal's default destination; this screen is not given one. */
+const MANAGE_RETURN_TO = resolveBoardReturnTo(undefined);
 const getItemType = (item: ManageItem) => item.type;
+
+/** A paged frame can temporarily carry the bootstrap envelope; its row count identifies it. */
+function isFastDownloadActive(scopeKey: string): boolean {
+  const { isSyncing, progress } = getSyncStatusSnapshot();
+  const download = progress?.download;
+  const isPagedFrame =
+    download?.phase === 'downloading' && download.wireBytes === null && download.rowsProcessed !== undefined;
+  return (
+    isSyncing &&
+    progress?.phase === 'bootstrap' &&
+    progress.currentTable === scopeKey &&
+    download?.phase !== 'finishing' &&
+    !isPagedFrame
+  );
+}
 
 export default function ManageBoards() {
   const router = useRouter();
   const { t, i18n } = useTranslation('boards');
+  const { t: tCommon } = useTranslation('common');
+  // The offline database belongs to a newer app version, so nothing can be
+  // downloaded into it this session. The rows keep their download controls,
+  // disabled, and the header says why — the same words Storage uses.
+  const offlineStoragePaused = useOfflineSchemaDowngrade() !== null;
   const { isAuthenticated, refreshAuthState } = useAuth();
   const { systemColors, brandColors } = useTheme();
   const confirm = useConfirm();
@@ -95,14 +149,28 @@ export default function ManageBoards() {
   const { data: activeBoard } = useActiveBoard();
   const activeUuid = activeBoard?.uuid;
 
+  // With My Boards, the only caller that lists unfinished spray walls: they show
+  // import progress, and a press on one opens the wizard, never a climbing path.
   const {
     data: boardConnection,
     isLoading,
     isError,
     refetch,
     isRefetching,
-  } = useMyBoards(undefined, { enabled: isAuthenticated });
-  const myBoards = boardConnection?.boards ?? EMPTY_BOARDS;
+  } = useMyBoards(MY_BOARDS_WITH_IMPORTS_INPUT, { enabled: isAuthenticated });
+  const {
+    boards: myBoards,
+    stale: importStatusStale,
+    unfinishedWallUuids,
+  } = useSprayImportProgress(boardConnection?.boards ?? EMPTY_BOARDS);
+
+  const openImport = useCallback(
+    (board: UserBoard) => {
+      const importRoute = unfinishedSprayWallRoute(board, unfinishedWallUuids);
+      if (importRoute) router.push(importRoute);
+    },
+    [router, unfinishedWallUuids],
+  );
 
   // Offline download wiring. Subscribe to the sync status + enabled-boards setting
   // ONCE here (not per row) and derive a primitive state per row, so a download's
@@ -125,13 +193,11 @@ export default function ManageBoards() {
   const snapshotManifest = useSnapshotManifest();
   const snapshotManifestRef = useRef(snapshotManifest);
   snapshotManifestRef.current = snapshotManifest;
-  const db = useSQLiteContext();
-  const syncStatus = useSyncStatus();
-  // Mirrored for the toggle-off handler, which only reads it at tap time: keeping
-  // the live status out of that callback's deps means a progress frame can't churn
-  // its identity and re-render every memoised row.
-  const syncStatusRef = useRef(syncStatus);
-  syncStatusRef.current = syncStatus;
+  // Not `useSQLiteContext()` directly: see src/db/use-offline-database.
+  const db = useOfflineDatabase();
+  const syncStatus = useSyncStatusMetadata();
+  const downloadActivity = useDownloadActivity();
+  const keepsScreenAwake = useSyncExternalStore(subscribeDownloadKeepAwake, isDownloadKeepAwakeActive, () => false);
   // This must be the same source the sync bridge uses. A build without the
   // snapshot base URL safely gets the ordinary paged downloader.
   const snapshotSource = useSnapshotSource();
@@ -154,15 +220,31 @@ export default function ManageBoards() {
   const [enabledBoards] = useSetting('syncEnabledBoards');
   const enabledSet = useMemo(() => new Set(enabledBoards), [enabledBoards]);
   const isSyncing = syncStatus.isSyncing;
-  const currentTable = syncStatus.progress?.currentTable ?? null;
-  const currentTableProcessed = syncStatus.progress?.currentTableProcessed;
-  const currentPhase = syncStatus.progress?.phase ?? null;
-  // The live snapshot download frame, whichever scope it names (issue #4311).
-  // Read once here and matched per row below, so a row that is NOT the one
-  // downloading gets a stable `null` prop and its memo holds.
-  const snapshotFrame = syncStatus.progress?.snapshot;
+  const downloadFrame = downloadActivity?.status === 'active' ? downloadActivity.progress : undefined;
+  const isPagedFrame =
+    downloadFrame?.phase === 'downloading' &&
+    downloadFrame.wireBytes === null &&
+    downloadFrame.rowsProcessed !== undefined;
+  const currentTable =
+    downloadFrame?.phase === 'finishing'
+      ? null
+      : downloadFrame
+        ? isPagedFrame
+          ? `board_climbs:${downloadFrame.scopeKey}`
+          : downloadFrame.scopeKey
+        : null;
+  const currentTableProcessed = downloadFrame?.rowsProcessed;
+  const currentPhase =
+    downloadFrame?.phase === 'finishing'
+      ? ('user_data' as const)
+      : downloadFrame
+        ? isPagedFrame
+          ? ('board_data' as const)
+          : ('bootstrap' as const)
+        : syncStatus.phase;
   // Compatibility seam retained while the row API still accepts a boolean;
   // native snapshot progress is permanently enabled.
+  const pendingUserStarted = useMemo(() => new Set(getPendingUserStartedDownloads()), [downloadActivity]);
   const downloadProgressEnabled = useOfflineDownloadProgressEnabled();
 
   // Per-scope "downloaded" signal: which scopes actually have a board_climbs
@@ -219,21 +301,24 @@ export default function ManageBoards() {
 
   const handleToggleOffline = useCallback(
     async (board: UserBoard) => {
+      // An unfinished wall has no catalogue to download: finish it first.
+      const importRoute = unfinishedSprayWallRoute(board, unfinishedWallUuids);
+      if (importRoute) {
+        router.push(importRoute);
+        return;
+      }
       const scope = offlineBoardScopeForBoard(board);
       const key = offlineBoardKeyForBoard(board);
       const alreadyEnabled = getSetting('syncEnabledBoards').includes(key);
       if (alreadyEnabled) {
-        // How far had it got? Read BEFORE the setting write, so the cancel event
-        // below carries the live progress frame (issue #4316). It needs a
-        // snapshot frame naming this exact scope, so it is silent for a paged
-        // crawl — the funnel terminal further down is the signal that always
-        // fires, this is the extra detail when we happen to have it.
+        // Read the live frame before disabling; telemetry keeps the last visible progress.
         const liveProgress = boardDownloadProgress({
           scopeKey: key,
-          isSyncing: syncStatusRef.current.isSyncing,
-          currentTable: syncStatusRef.current.progress?.currentTable ?? null,
-          phase: syncStatusRef.current.progress?.phase ?? null,
-          snapshot: syncStatusRef.current.progress?.snapshot,
+          isSyncing: getSyncStatusSnapshot().isSyncing,
+          currentTable: getSyncStatusSnapshot().progress?.currentTable ?? null,
+          phase: getSyncStatusSnapshot().progress?.phase ?? null,
+          download: getSyncStatusSnapshot().progress?.download,
+          snapshot: getSyncStatusSnapshot().progress?.snapshot,
           // The progress hook is permanently true on native. Keeping the value
           // explicit here makes the cancellation telemetry contract obvious.
           progressEnabled: downloadProgressEnabled,
@@ -275,56 +360,66 @@ export default function ManageBoards() {
       // Size quote + confirm + enable, shared with the discovery-nudge surfaces.
       await confirmAndDownload(board, { trigger: 'toggle', source: 'manage' });
     },
-    [confirmAndDownload, db],
+    [confirmAndDownload, db, router, unfinishedWallUuids],
   );
 
   // The escape from a board that settled onto the slow crawl (issue #4313).
   // Consented and size-disclosed on purpose: this is the largest single download
   // in the app, and the automatic paths deliberately never ask.
+  const retryingScopeKeysRef = useRef(new Set<string>());
   const handleRetryFastDownload = useCallback(
     async (board: UserBoard) => {
       const scope = offlineBoardScopeForBoard(board);
       const key = offlineBoardKeyForBoard(board);
-      const now = Date.now();
-      const [climbsCheckpoint, statsCheckpoint, scopeComplete, bootstrapAlreadyDone] = await Promise.all([
-        getCheckpoint(db, getCheckpointKey('board_climbs', key)),
-        getCheckpoint(db, getCheckpointKey('board_climb_stats', key)),
-        isScopeDownloadComplete(db, key),
-        isBootstrapDone(db, key),
-      ]);
-      const hasBoardCheckpoint = !!climbsCheckpoint || !!statsCheckpoint;
-      const { state: retryState } = await readBootstrapRetryState(
-        db,
-        key,
-        { now, random: Math.random },
-        hasBoardCheckpoint,
-      );
-      const estimate = estimateScopeDownload({
-        manifest: snapshotManifestRef.current,
-        boardType: scope.boardType,
-        layoutId: scope.layoutId,
-        retryState,
-        hasBoardCheckpoint,
-        isScopeComplete: scopeComplete,
-        isBootstrapDone: bootstrapAlreadyDone,
-        now,
-        // Restoring the budget IS the action being confirmed, so the terminal
-        // state the row is showing must not suppress the size.
-        userRequested: true,
-      });
-      const confirmed = await confirm({
-        title: t('mobile.offline.retryFastDownloadTitle'),
-        message:
-          estimate.kind === 'snapshot'
-            ? t('mobile.offline.retryFastDownloadMessageWithSize', {
-                size: formatBytes(estimate.bytes, i18n.language),
-              })
-            : t('mobile.offline.retryFastDownloadMessage'),
-        confirmLabel: t('mobile.offline.retryFastDownloadConfirm'),
-        cancelLabel: t('mobile.manage.cancel'),
-      });
-      if (!confirmed) return;
-      await retryFastDownload(board);
+      if (retryingScopeKeysRef.current.has(key) || isFastDownloadActive(key)) return;
+      retryingScopeKeysRef.current.add(key);
+      try {
+        const now = Date.now();
+        const [climbsCheckpoint, statsCheckpoint, scopeComplete, bootstrapAlreadyDone] = await Promise.all([
+          getCheckpoint(db, getCheckpointKey('board_climbs', key)),
+          getCheckpoint(db, getCheckpointKey('board_climb_stats', key)),
+          isScopeDownloadComplete(db, key),
+          isBootstrapDone(db, key),
+        ]);
+        if (scopeComplete || isFastDownloadActive(key)) return;
+        const hasBoardCheckpoint = !!climbsCheckpoint || !!statsCheckpoint;
+        const { state: retryState } = await readBootstrapRetryState(
+          db,
+          key,
+          { now, random: Math.random },
+          hasBoardCheckpoint,
+        );
+        const estimate = estimateScopeDownload({
+          manifest: snapshotManifestRef.current,
+          boardType: scope.boardType,
+          layoutId: scope.layoutId,
+          retryState,
+          hasBoardCheckpoint,
+          isScopeComplete: scopeComplete,
+          isBootstrapDone: bootstrapAlreadyDone,
+          now,
+          // Restoring the budget IS the action being confirmed, so the terminal
+          // state the row is showing must not suppress the size.
+          userRequested: true,
+        });
+        if (isFastDownloadActive(key)) return;
+        const confirmed = await confirm({
+          title: t('mobile.offline.retryFastDownloadTitle'),
+          message:
+            estimate.kind === 'snapshot'
+              ? t('mobile.offline.retryFastDownloadMessageWithSize', {
+                  size: formatBytes(estimate.bytes, i18n.language),
+                })
+              : t('mobile.offline.retryFastDownloadMessage'),
+          confirmLabel: t('mobile.offline.retryFastDownloadConfirm'),
+          cancelLabel: t('mobile.manage.cancel'),
+        });
+        if (!confirmed) return;
+        if (isFastDownloadActive(key) || (await isScopeDownloadComplete(db, key)) || isFastDownloadActive(key)) return;
+        await retryFastDownload(board);
+      } finally {
+        retryingScopeKeysRef.current.delete(key);
+      }
     },
     [confirm, t, i18n.language, db, retryFastDownload],
   );
@@ -335,15 +430,110 @@ export default function ManageBoards() {
     if (isError) void refreshAuthState();
   }, [isError, refreshAuthState]);
 
-  // Split into owned + followed groups (pure helper, unit-tested). Each board
-  // carries precomputed isOwned/isActive so a row never scans for them.
+  // The walls a reset replaced. `myBoards` leaves them out, so they come from
+  // the owner's own wall list, read through the narrow lifecycle document (no
+  // photo URLs). A backend without the archive fields fails that one query and
+  // the section is simply absent. Tapping a row opens the wall to browse and
+  // log its climbs; its trash deletes it.
+  const { data: sprayWallLifecycle, refetch: refetchSprayWallLifecycle } = useMySprayWallLifecycle({
+    enabled: isAuthenticated,
+  });
+  const archivedWalls = useMemo(() => archivedSprayWallSummaries(sprayWallLifecycle), [sprayWallLifecycle]);
+  // `rethrow`: a failed write is said by `useOpenSprayWall`'s alert, not a toast
+  // the modal route would draw over.
+  // A switch here, even with the picker open underneath, says nothing about a
+  // box the picker's In range slot is holding (pending-board-recognition.ts).
+  const activateBoard = useActivateBoard({
+    returnTo: MANAGE_RETURN_TO,
+    isLocalOnly: true,
+    writeFailure: 'rethrow',
+    recognizesHeldBox: false,
+  });
+  const openSprayWall = useOpenSprayWall(activateBoard);
+  const openArchivedWall = useCallback(
+    (wallUuid: string) => {
+      void openSprayWall(wallUuid);
+    },
+    [openSprayWall],
+  );
+
+  const deleteBoard = useDeleteBoard();
+  const deleteBoardAsync = deleteBoard.mutateAsync;
+  const clearActiveBoard = useClearActiveBoardIfCurrentGeneration();
+  const { clearSession } = useQueueActions();
+  // One archived-wall delete at a time: a second trash tap while the first is
+  // out must not send a second delete. State as well as a ref, so the row can
+  // show its trash disabled while it runs.
+  const deletingArchivedWallRef = useRef(false);
+  const [deletingArchivedWallUuid, setDeletingArchivedWallUuid] = useState<string | null>(null);
+  const deleteArchivedWall = useCallback(
+    async (wall: ArchivedSprayWallSummary) => {
+      if (deletingArchivedWallRef.current) return;
+      deletingArchivedWallRef.current = true;
+      setDeletingArchivedWallUuid(wall.uuid);
+      try {
+        const wasActive = activeUuid === wall.uuid;
+        // Captured at action time, as the picker's delete does.
+        const activeBoardGeneration = getActiveBoardWriteGeneration();
+        const confirmed = await confirm({
+          title: t('mobile.manage.deleteWallTitle'),
+          message: t('sprayArchive.deleteMessage', { name: wall.name }),
+          confirmLabel: t('mobile.manage.deleteConfirm'),
+          cancelLabel: t('mobile.manage.cancel'),
+          destructive: true,
+        });
+        if (!confirmed) return;
+        try {
+          await deleteBoardAsync(wall.uuid);
+        } catch {
+          // An alert, not a toast: this is a modal route, which the toast draws behind.
+          Alert.alert(t('mobile.manage.deleteError'));
+          return;
+        }
+        // The wall is gone on the server. What is left is this phone's own
+        // bookkeeping; a failure there is reported, never shown, and never
+        // stops the list from refreshing.
+        try {
+          await forgetDeletedSprayWall(wall, db);
+          if (wasActive && activeBoardGeneration === getActiveBoardWriteGeneration()) {
+            await clearSession({ notifyServer: true });
+            await clearActiveBoard(activeBoardGeneration);
+          }
+        } catch (error) {
+          reportError(error);
+        }
+      } finally {
+        deletingArchivedWallRef.current = false;
+        setDeletingArchivedWallUuid(null);
+        void refetchSprayWallLifecycle();
+      }
+    },
+    [activeUuid, confirm, t, deleteBoardAsync, db, clearSession, clearActiveBoard, refetchSprayWallLifecycle],
+  );
+  const onDeleteArchivedWall = useCallback(
+    (wall: ArchivedSprayWallSummary) => {
+      void deleteArchivedWall(wall);
+    },
+    [deleteArchivedWall],
+  );
+
+  // Split into owned + followed groups (pure helper, unit-tested), then the
+  // archived walls. Each board carries precomputed isOwned/isActive so a row
+  // never scans for them.
   const items = useMemo(
     () =>
-      buildManageItems(myBoards, currentUserId, activeUuid, {
-        ownedHeader: t('mobile.manage.ownedHeader'),
-        followingHeader: t('mobile.manage.followingHeader'),
-      }),
-    [myBoards, currentUserId, activeUuid, t],
+      buildManageItems(
+        myBoards,
+        currentUserId,
+        activeUuid,
+        {
+          ownedHeader: t('mobile.manage.ownedHeader'),
+          followingHeader: t('mobile.manage.followingHeader'),
+          archivedHeader: t('sprayArchive.manageHeader'),
+        },
+        archivedWalls,
+      ),
+    [myBoards, currentUserId, activeUuid, archivedWalls, t],
   );
 
   // Offline this screen has TWO independent failures: `useMyBoards` and `useProfile`
@@ -400,11 +590,41 @@ export default function ManageBoards() {
   const showOfflineList = shouldUseOfflineList && offlineItems.length > 0;
   // Keep the snapshots fresh from the live list while online (renames, a backfill for
   // boards downloaded before this existed, and a prune of boards the server dropped).
-  useRememberDownloadedBoards(boardConnection);
+  // Archived walls are not in `myBoards`: name them, or their download cards
+  // would be pruned as if the walls were gone. Unknown when the list failed.
+  const archivedWallUuids = useMemo(
+    () => (sprayWallLifecycle ? archivedWalls.map((wall) => wall.uuid) : undefined),
+    [sprayWallLifecycle, archivedWalls],
+  );
+  useRememberDownloadedBoards(boardConnection, archivedWallUuids);
 
-  const onCreate = useCallback(() => {
-    router.push('/boards/create');
-  }, [router]);
+  // With the add-a-board wizard on, Create board and the + open its step 1,
+  // "Where's the board?". Off, the builder and the + menu as before.
+  const wizardEnabled = useAddBoardWizardEnabled();
+  const openAddRoute = useCallback(
+    (kind: BoardPickerAddKind) => {
+      trackBoardPickerAddSelected({ kind, surface: 'manage' });
+      const wizardEntry = kind === 'board' && wizardEnabled ? 'manage' : undefined;
+      router.push(addBoardRoute(kind, { wizardEntry }));
+    },
+    [router, wizardEnabled],
+  );
+  const onCreate = useCallback(() => openAddRoute('board'), [openAddRoute]);
+
+  // The same + as the picker's top bar, in place of the outlined Create board
+  // button that sat over the list. Online and signed in only: every way behind
+  // it needs a connection and an account.
+  const navigation = useNavigation();
+  const canAddBoards = isAuthenticated && !shouldUseOfflineList;
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerRight: canAddBoards
+        ? wizardEnabled
+          ? () => <AddBoardButton onPress={onCreate} />
+          : () => <AddBoardMenu onSelect={openAddRoute} />
+        : undefined,
+    });
+  }, [navigation, canAddBoards, openAddRoute, onCreate, wizardEnabled]);
 
   const renderItem = useCallback(
     ({ item }: { item: ManageItem }) => {
@@ -413,6 +633,17 @@ export default function ManageBoards() {
           <Text variant="title3" style={styles.sectionHeader}>
             {item.title}
           </Text>
+        );
+      }
+      if (item.type === 'archivedWall') {
+        return (
+          <ArchivedWallManageRow
+            wall={item.wall}
+            isActive={item.isActive}
+            onOpen={openArchivedWall}
+            onDelete={onDeleteArchivedWall}
+            deleting={deletingArchivedWallUuid === item.wall.uuid}
+          />
         );
       }
       const scopeKey = offlineBoardKeyForBoard(item.board);
@@ -430,6 +661,7 @@ export default function ManageBoards() {
         downloaded: isDownloaded,
         currentTable,
         phase: currentPhase,
+        download: downloadFrame,
       };
       const downloadState = offlineDownloadsEnabled ? boardDownloadState(downloadStateInput) : undefined;
       const isBootstrapping = downloadState === 'downloading' && boardIsBootstrapping(downloadStateInput);
@@ -454,70 +686,87 @@ export default function ManageBoards() {
       // flag; every other row gets undefined/false (stable props), so its
       // memo skips the per-frame churn.
       const downloadCount = downloadState === 'downloading' ? currentTableProcessed : undefined;
-      const downloadProgress = isBootstrapping
-        ? boardDownloadProgress({
-            scopeKey,
-            isSyncing,
-            currentTable,
-            phase: currentPhase,
-            snapshot: snapshotFrame,
-            progressEnabled: downloadProgressEnabled,
-          })
-        : null;
-      // Offered only where it can actually help: a board that has settled onto
-      // the crawl and has not yet finished it. A completed scope already holds
-      // the whole catalog, so an artifact buys it nothing.
+      const downloadProgress =
+        downloadState === 'downloading' || downloadState === 'finalizing'
+          ? boardDownloadProgress({
+              scopeKey,
+              isSyncing,
+              currentTable,
+              phase: currentPhase,
+              download: downloadFrame,
+              progressEnabled: downloadProgressEnabled,
+            })
+          : null;
+      // An explicit retry can replace an active, unfinished imported download:
+      // the engine yields after its committed page and tries a verified snapshot.
+      // Completed scopes already hold the full catalogue and stay excluded.
       const canRetryFastDownload =
         offlineDownloadsEnabled &&
         snapshotSourceAvailable &&
         enabledSet.has(scopeKey) &&
         !isDownloaded &&
-        (bootstrapMetadata?.isTerminal ?? false) &&
-        !(bootstrapMetadata?.isBootstrapDone ?? false);
+        !isBootstrapping &&
+        ((bootstrapMetadata?.isTerminal ?? false) || (bootstrapMetadata?.isBootstrapDone ?? false));
       return (
         <BoardManageRow
           board={item.board}
+          importStatusStale={importStatusStale}
+          onOpenImport={openImport}
           isOwned={item.isOwned}
           isActive={item.isActive}
           downloadState={downloadState}
           downloadCount={downloadCount}
           isBootstrapping={isBootstrapping}
           downloadProgress={downloadProgress}
+          keepsScreenAwake={
+            keepsScreenAwake &&
+            pendingUserStarted.has(scopeKey) &&
+            (downloadState === 'downloading' || downloadState === 'finalizing')
+          }
           downloadNotice={downloadNotice}
           canRetryFastDownload={canRetryFastDownload}
           onRetryFastDownload={handleRetryFastDownload}
           onToggleOffline={handleToggleOffline}
+          offlineControlsDisabled={offlineStoragePaused}
         />
       );
     },
     [
       offlineDownloadsEnabled,
+      importStatusStale,
+      openImport,
       enabledSet,
       isSyncing,
       downloadedSet,
       currentTable,
       currentTableProcessed,
       currentPhase,
-      snapshotFrame,
+      downloadFrame,
+      pendingUserStarted,
+      keepsScreenAwake,
       downloadProgressEnabled,
       bootstrapMetadataByScope,
       snapshotSourceAvailable,
       handleToggleOffline,
       handleRetryFastDownload,
+      offlineStoragePaused,
+      openArchivedWall,
+      onDeleteArchivedWall,
+      deletingArchivedWallUuid,
     ],
   );
 
   if (!isAuthenticated) {
     return (
       <View style={[styles.centered, { backgroundColor: systemColors.background }]}>
-        <Icon name="person" size={40} color={iosSystemColors.systemGray} />
+        <Icon name="person" size={40} color={systemColors.secondaryLabel} />
         <Text variant="headline" style={styles.stateTitle}>
           {t('mobile.signInTitle')}
         </Text>
-        <Text variant="subheadline" style={styles.stateSubtitle}>
+        <Text tone="secondary" variant="subheadline" style={styles.stateSubtitle}>
           {t('mobile.signInSubtitle')}
         </Text>
-        <Button title={t('mobile.signInCta')} onPress={() => router.push('/auth/login')} style={styles.stateButton} />
+        <Button title={t('mobile.signInCta')} onPress={() => openSignIn(router, 'boards')} style={styles.stateButton} />
       </View>
     );
   }
@@ -542,7 +791,7 @@ export default function ManageBoards() {
   if (!showOfflineList && ((isError && myBoards.length === 0) || !currentUserId)) {
     return (
       <View style={[styles.centered, { backgroundColor: systemColors.background }]}>
-        <Icon name="error" size={40} color={iosSystemColors.systemRed} />
+        <Icon name="error" size={40} color={systemColors.error} />
         <Text variant="headline" style={styles.stateTitle}>
           {t('mobile.errorTitle')}
         </Text>
@@ -576,7 +825,7 @@ export default function ManageBoards() {
                   mode, a Boardsesh outage, the profile failure and the lying
                   connection each read differently. Literal `t()` keys: the i18n
                   linter rejects a computed one. */}
-              <Text variant="subheadline" style={styles.offlineNotice}>
+              <Text tone="secondary" variant="subheadline">
                 {noticeKey === 'pickerNoticeOfflineMode'
                   ? t('mobile.offline.pickerNoticeOfflineMode')
                   : noticeKey === 'pickerNoticeUnreachable'
@@ -584,26 +833,39 @@ export default function ManageBoards() {
                     : t('mobile.offline.pickerNotice')}
               </Text>
             </View>
-          ) : items.length > 0 ? (
+          ) : items.length > 0 && offlineStoragePaused && offlineDownloadsEnabled ? (
             <View style={styles.listHeader}>
-              <Button title={t('mobile.discovery.create')} variant="outlined" onPress={onCreate} />
+              <View style={styles.pausedNotice}>
+                <Text variant="headline">{tCommon('mobile.settings.storage.downgradeTitle')}</Text>
+                <Text tone="secondary" variant="subheadline">
+                  {tCommon('mobile.settings.storage.downgradeSubtitle')}
+                </Text>
+              </View>
             </View>
           ) : null
         }
         ListEmptyComponent={
           <View style={styles.emptyState}>
             <Icon name="boards" size={48} color={systemColors.tertiaryLabel} />
-            <Text variant="headline" style={styles.emptyTitle}>
+            <Text tone="secondary" variant="headline" style={styles.emptyTitle}>
               {t('mobile.emptyTitle')}
             </Text>
-            <Text variant="subheadline" style={styles.emptySubtitle}>
+            <Text tone="tertiary" variant="subheadline" style={styles.emptySubtitle}>
               {t('mobile.emptySubtitle')}
             </Text>
             <Button title={t('mobile.discovery.create')} onPress={onCreate} style={styles.emptyCta} />
           </View>
         }
         refreshControl={
-          <RefreshControl refreshing={isRefetching} onRefresh={() => void refetch()} tintColor={brandColors.primary} />
+          <RefreshControl
+            refreshing={isRefetching}
+            onRefresh={() => {
+              void refetch();
+              // The Archived section comes from its own query; refresh it with the list.
+              void refetchSprayWallLifecycle();
+            }}
+            tintColor={brandColors.primary}
+          />
         }
       />
     </View>
@@ -619,8 +881,9 @@ const styles = StyleSheet.create({
     paddingTop: spacing[4],
     paddingBottom: spacing[2],
   },
-  offlineNotice: {
-    opacity: 0.7,
+  pausedNotice: {
+    gap: spacing[1],
+    paddingBottom: spacing[3],
   },
   sectionHeader: {
     paddingHorizontal: spacing[4],
@@ -640,7 +903,6 @@ const styles = StyleSheet.create({
   stateSubtitle: {
     marginTop: spacing[1],
     textAlign: 'center',
-    opacity: 0.6,
   },
   stateButton: {
     marginTop: spacing[4],
@@ -653,10 +915,8 @@ const styles = StyleSheet.create({
   },
   emptyTitle: {
     marginTop: spacing[3],
-    opacity: 0.6,
   },
   emptySubtitle: {
-    opacity: 0.4,
     textAlign: 'center',
   },
   emptyCta: {

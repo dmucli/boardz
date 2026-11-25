@@ -1,14 +1,20 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { grantAnalyticsForTest } from '../../../test/consent-fixture';
 
 const posthogClientMocks = vi.hoisted(() => ({
   getPostHogClient: vi.fn(),
   registerAppSuperProperties: vi.fn(),
+  clearPosthogQueues: vi.fn(),
+  applyPosthogConsent: vi.fn(async () => {}),
+  subscribePosthogInitialized: vi.fn(() => () => {}),
 }));
-const sharedAnalyticsMocks = vi.hoisted(() => ({ reset: vi.fn(() => true) }));
 
 vi.mock('../posthog-client', () => ({
   getPostHogClient: posthogClientMocks.getPostHogClient,
   registerAppSuperProperties: posthogClientMocks.registerAppSuperProperties,
+  clearPosthogQueues: posthogClientMocks.clearPosthogQueues,
+  applyPosthogConsent: posthogClientMocks.applyPosthogConsent,
+  subscribePosthogInitialized: posthogClientMocks.subscribePosthogInitialized,
 }));
 
 vi.mock('@boardsesh/analytics', () => ({
@@ -17,10 +23,12 @@ vi.mock('@boardsesh/analytics', () => ({
     capture: vi.fn(),
     identify: vi.fn(),
     setPersonProperties: vi.fn(),
-    alias: vi.fn(),
-    reset: sharedAnalyticsMocks.reset,
   }),
 }));
+
+function createClientFixture() {
+  return { register: vi.fn(), unregister: vi.fn(), reset: vi.fn() };
+}
 
 // #3814: PostHog's reset() clears every registered super property, and
 // getPostHogClient() caches the singleton so its construction-time registrations
@@ -32,17 +40,24 @@ vi.mock('@boardsesh/analytics', () => ({
 describe('analytics reset', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    sharedAnalyticsMocks.reset.mockReturnValue(true);
+    grantAnalyticsForTest();
   });
 
   it('re-registers the build-level super properties after resetting the client', async () => {
-    const fakeClient = { register: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { reset } = await import('../analytics');
 
     expect(reset()).toBe(true);
 
-    expect(sharedAnalyticsMocks.reset).toHaveBeenCalledOnce();
+    expect(fakeClient.reset).toHaveBeenCalledWith([]);
+    expect(posthogClientMocks.clearPosthogQueues).toHaveBeenCalledWith(fakeClient);
+    expect(fakeClient.reset.mock.invocationCallOrder[0]).toBeLessThan(
+      posthogClientMocks.clearPosthogQueues.mock.invocationCallOrder[0],
+    );
+    expect(posthogClientMocks.clearPosthogQueues.mock.invocationCallOrder[0]).toBeLessThan(
+      posthogClientMocks.applyPosthogConsent.mock.invocationCallOrder[0],
+    );
     expect(posthogClientMocks.registerAppSuperProperties).toHaveBeenCalledWith(fakeClient);
   });
 
@@ -50,7 +65,7 @@ describe('analytics reset', () => {
   // network transition, so a sign-out that dropped it would leave every
   // remaining event of the launch unattributable to online or offline.
   it('re-registers connectivity after resetting the client', async () => {
-    const fakeClient = { register: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { reset } = await import('../analytics');
 
@@ -63,7 +78,7 @@ describe('analytics reset', () => {
   // will not run again this launch, so a sign-out that dropped it would end the
   // bake measurement there — including for the account signed in next.
   it('re-registers the offline engine state after resetting the client', async () => {
-    const fakeClient = { register: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { registerOfflineEngineState, __resetOfflineEngineStateForTests } =
       await import('../analytics-offline-engine-state');
@@ -78,7 +93,7 @@ describe('analytics reset', () => {
   });
 
   it('registers no engine state when the flag effect has not decided one yet', async () => {
-    const fakeClient = { register: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { __resetOfflineEngineStateForTests } = await import('../analytics-offline-engine-state');
     __resetOfflineEngineStateForTests();
@@ -95,7 +110,7 @@ describe('analytics reset', () => {
   // sign-out that dropped it would leave every later event of the launch
   // unattributable to Low Power Mode until the climber plugged in.
   it('re-registers low power mode after resetting the client', async () => {
-    const fakeClient = { register: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { registerLowPowerMode, _resetLowPowerModeForTests } = await import('../analytics-low-power-mode');
     _resetLowPowerModeForTests();
@@ -108,8 +123,25 @@ describe('analytics reset', () => {
     expect(fakeClient.register).toHaveBeenCalledWith({ low_power_mode: true });
   });
 
+  // The theme only changes when the climber changes it, so a sign-out that
+  // dropped `color_scheme` / `ui_variant` would leave the rest of the launch
+  // unsplittable by light/dark and variant.
+  it('re-registers the theme properties after resetting the client', async () => {
+    const fakeClient = createClientFixture();
+    posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
+    const { registerThemeProperties, _resetThemePropertiesForTests } = await import('../analytics-theme');
+    _resetThemePropertiesForTests();
+    registerThemeProperties({ color_scheme: 'dark', ui_variant: 'material' });
+    fakeClient.register.mockClear();
+    const { reset } = await import('../analytics');
+
+    expect(reset()).toBe(true);
+
+    expect(fakeClient.register).toHaveBeenCalledWith({ color_scheme: 'dark', ui_variant: 'material' });
+  });
+
   it('registers no low power mode when the tracker has not read one yet', async () => {
-    const fakeClient = { register: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { _resetLowPowerModeForTests } = await import('../analytics-low-power-mode');
     _resetLowPowerModeForTests();
@@ -135,7 +167,7 @@ describe('analytics reset', () => {
   // the rename and stay green; the literal is what reds. analytics-gym.test.ts
   // uses the constants to assert behaviour — this one pins the names.
   it('re-registers the active gym after resetting the client', async () => {
-    const fakeClient = { register: vi.fn(), unregister: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { registerActiveGym, __resetActiveGymForTests } = await import('../analytics-gym');
     __resetActiveGymForTests();
@@ -149,7 +181,7 @@ describe('analytics reset', () => {
   });
 
   it('registers no gym when the active board has never carried one', async () => {
-    const fakeClient = { register: vi.fn(), unregister: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { __resetActiveGymForTests } = await import('../analytics-gym');
     __resetActiveGymForTests();
@@ -165,7 +197,7 @@ describe('analytics reset', () => {
   // so a sign-out would strip it from the leaving climber's last events. The
   // name is a literal for the same reason as the gym's: insights key on it.
   it('re-registers the connect-step arm after resetting the client', async () => {
-    const fakeClient = { register: vi.fn(), unregister: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { registerConnectStepArm, __resetConnectStepArmForTests } = await import('../analytics-connect-step-arm');
     __resetConnectStepArmForTests();
@@ -179,7 +211,7 @@ describe('analytics reset', () => {
   });
 
   it('registers no connect-step arm before an account was ever enrolled', async () => {
-    const fakeClient = { register: vi.fn(), unregister: vi.fn() };
+    const fakeClient = createClientFixture();
     posthogClientMocks.getPostHogClient.mockReturnValue(fakeClient);
     const { __resetConnectStepArmForTests } = await import('../analytics-connect-step-arm');
     __resetConnectStepArmForTests();
@@ -197,16 +229,16 @@ describe('analytics reset', () => {
     posthogClientMocks.getPostHogClient.mockReturnValue(null);
     const { reset } = await import('../analytics');
 
-    expect(reset()).toBe(true);
+    expect(reset()).toBe(false);
 
     expect(posthogClientMocks.registerAppSuperProperties).not.toHaveBeenCalled();
   });
 
-  it('propagates the underlying reset result', async () => {
-    sharedAnalyticsMocks.reset.mockReturnValue(false);
+  it('does not discard queues when there is no client', async () => {
     posthogClientMocks.getPostHogClient.mockReturnValue(null);
     const { reset } = await import('../analytics');
 
     expect(reset()).toBe(false);
+    expect(posthogClientMocks.clearPosthogQueues).not.toHaveBeenCalled();
   });
 });

@@ -1,5 +1,6 @@
 /// <reference types="node" />
 
+import { spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -14,15 +15,20 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runInNewContext } from 'node:vm';
 import { afterEach, describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 import { buildEasUpdateArgs, buildSelfHostedEoasArgs } from './mobile-publish';
 import {
   createSentryUploadEnvironment,
   parseUploadArgs,
   resolveInstalledSentryUploader,
+  SOURCE_MAP_UPLOAD_ATTEMPT_TIMEOUT_MS,
+  SOURCE_MAP_UPLOAD_RETRY_DELAYS_MS,
   uploadMobileSourceMaps,
   validateSourceMapOutput,
   type MobilePlatform,
+  type UploadSourceMapsDependencies,
 } from './mobile-upload-sourcemaps';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -74,6 +80,15 @@ function rewriteMetadata(fixture: MobileFixture, fileMetadata: Record<string, un
     join(fixture.outputDir, 'metadata.json'),
     JSON.stringify({ version: 0, bundler: 'metro', fileMetadata }),
   );
+}
+
+function installFixtureSentryUploader(fixture: MobileFixture, version: string): string {
+  const sentryRoot = join(fixture.mobileDir, 'node_modules', '@sentry', 'react-native');
+  const uploaderPath = join(sentryRoot, 'scripts', 'expo-upload-sourcemaps.js');
+  mkdirSync(dirname(uploaderPath), { recursive: true });
+  writeFileSync(join(sentryRoot, 'package.json'), JSON.stringify({ name: '@sentry/react-native', version }));
+  writeFileSync(uploaderPath, '#!/usr/bin/env node\n');
+  return uploaderPath;
 }
 
 function readRepositoryFile(relativePath: string): string {
@@ -404,26 +419,163 @@ describe('OTA source-map artifact validation', () => {
 });
 
 describe('official Sentry uploader invocation', () => {
-  it('pins the installed Sentry React Native uploader to 7.11.0', () => {
-    const fixture = createMobileFixture();
-    const sentryRoot = join(fixture.mobileDir, 'node_modules', '@sentry', 'react-native');
-    const uploaderPath = join(sentryRoot, 'scripts', 'expo-upload-sourcemaps.js');
-    mkdirSync(dirname(uploaderPath), { recursive: true });
-    writeFileSync(
-      join(sentryRoot, 'package.json'),
-      JSON.stringify({ name: '@sentry/react-native', version: '7.11.0' }),
-    );
-    writeFileSync(uploaderPath, '#!/usr/bin/env node\n');
-    expect(resolveInstalledSentryUploader(fixture.mobileDir)).toBe(uploaderPath);
+  it.each(['7.11.0', '8.24.0', '8.32.0', '8.33.0', '8.35.0'])(
+    'accepts the audited Sentry React Native uploader %s',
+    (version) => {
+      const fixture = createMobileFixture();
+      const uploaderPath = installFixtureSentryUploader(fixture, version);
+      if (version === '8.24.0' || version === '8.32.0' || version === '8.33.0' || version === '8.35.0') {
+        // Only the SDK owns this dependency; resolving from mobile would fail
+        // under pnpm's isolated linker even though the real uploader can load it.
+        const delegatedUploaderPath = join(
+          dirname(dirname(uploaderPath)),
+          'node_modules',
+          '@sentry',
+          'expo-upload-sourcemaps',
+          'cli.js',
+        );
+        mkdirSync(dirname(delegatedUploaderPath), { recursive: true });
+        writeFileSync(delegatedUploaderPath, '#!/usr/bin/env node\n');
+      }
+      expect(resolveInstalledSentryUploader(fixture.mobileDir)).toBe(uploaderPath);
+    },
+  );
 
-    writeFileSync(
-      join(sentryRoot, 'package.json'),
-      JSON.stringify({ name: '@sentry/react-native', version: '7.12.0' }),
-    );
+  it.each(['7.12.0', '8.25.0'])('rejects an unaudited SDK %s', (version) => {
+    const fixture = createMobileFixture();
+    installFixtureSentryUploader(fixture, version);
     expect(() => resolveInstalledSentryUploader(fixture.mobileDir)).toThrow(
-      'Unsupported @sentry/react-native version 7.12.0',
+      `Unsupported @sentry/react-native version ${version}; audited versions: 7.11.0, 8.24.0, 8.32.0, 8.33.0, 8.35.0.`,
     );
   });
+
+  it.each(['8.24.0', '8.32.0', '8.33.0', '8.35.0'])(
+    'rejects SDK %s when its delegated uploader is missing',
+    (version) => {
+      const fixture = createMobileFixture();
+      installFixtureSentryUploader(fixture, version);
+      expect(() => resolveInstalledSentryUploader(fixture.mobileDir)).toThrow(
+        'Official Sentry Expo source-map uploader dependency @sentry/expo-upload-sourcemaps is missing',
+      );
+    },
+  );
+
+  it.each([
+    ['.github/workflows/mobile-ota-production.yml', 'Validate Sentry uploader support before publishing'],
+    ['.github/workflows/mobile-ota-backport.yml', 'Validate anchored Sentry uploader support'],
+  ])('checks the actual installed mobile SDK with the %s preflight command', (workflowPath, stepName) => {
+    const uploaderPath = resolveInstalledSentryUploader(join(REPO_ROOT, 'packages', 'mobile'));
+    const step = workflowStep(readRepositoryFile(workflowPath), stepName);
+    const command = /--eval '([^']+)'/.exec(step)?.[1];
+    expect(command).toBeDefined();
+    const preflight = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', command ?? ''], {
+      cwd: REPO_ROOT,
+      env: processEnv({ PATH: process.env.PATH }),
+      encoding: 'utf8',
+    });
+    expect(preflight.error).toBeUndefined();
+    expect(preflight.status, preflight.stderr).toBe(0);
+    expect(preflight.stdout.trim()).toBe(uploaderPath);
+  });
+
+  it.each(['ios', 'android'] as const)(
+    'runs the installed official uploader for every %s pair and propagates CLI failures',
+    (platform) => {
+      const fixture = createMobileFixture(platform);
+      const originalSourceMap = readFileSync(fixture.sourceMapPath, 'utf8');
+      const relativeJsBundlePath = 'www.bundle/component.js';
+      const jsBundlePath = join(fixture.outputDir, relativeJsBundlePath);
+      mkdirSync(dirname(jsBundlePath), { recursive: true });
+      writeFileSync(jsBundlePath, 'component bundle');
+      writeFileSync(`${jsBundlePath}.map`, originalSourceMap);
+      rewriteMetadata(fixture, {
+        [platform]: {
+          bundle: fixture.relativeBundlePath,
+          assets: [{ path: relativeJsBundlePath, ext: 'js' }],
+        },
+      });
+      const invocationLogPath = join(fixture.mobileDir, 'cli-invocations.jsonl');
+      const fakeCliPath = join(fixture.mobileDir, 'fake-sentry-cli');
+      writeFileSync(
+        fakeCliPath,
+        `#!/usr/bin/env node
+const { appendFileSync, readFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+const sourceMaps = args.filter(argument => argument.endsWith('.map')).map(sourceMapPath => JSON.parse(readFileSync(sourceMapPath, 'utf8')));
+appendFileSync(process.env.SENTRY_TEST_INVOCATIONS_PATH, JSON.stringify({ args, sourceMaps, org: process.env.SENTRY_ORG, project: process.env.SENTRY_PROJECT, url: process.env.SENTRY_URL, release: process.env.SENTRY_RELEASE, dist: process.env.SENTRY_DIST }) + '\\n');
+process.exit(Number(process.env.SENTRY_TEST_EXIT_CODE));
+`,
+        { mode: 0o755 },
+      );
+      const uploaderPath = resolveInstalledSentryUploader(join(REPO_ROOT, 'packages', 'mobile'));
+      let cliExitCode = 0;
+      const dependencies: UploadSourceMapsDependencies = {
+        resolveUploader: () => uploaderPath,
+        // One real subprocess per call; the retry policy has its own tests.
+        retryDelaysMs: [],
+        spawnUploader: (executable, args, options) => {
+          // Inject the fake only at the test subprocess boundary. Production
+          // still strips SENTRY_CLI_EXECUTABLE and never receives real credentials.
+          return spawnSync(executable, args, {
+            ...options,
+            stdio: 'pipe',
+            env: {
+              ...options.env,
+              SENTRY_CLI_EXECUTABLE: fakeCliPath,
+              SENTRY_TEST_INVOCATIONS_PATH: invocationLogPath,
+              SENTRY_TEST_EXIT_CODE: String(cliExitCode),
+            },
+          });
+        },
+      };
+      const options = {
+        platform,
+        mobileDir: fixture.mobileDir,
+        outputDir: fixture.outputDir,
+        environment: processEnv({
+          PATH: process.env.PATH,
+          SENTRY_AUTH_TOKEN: 'offline-test-token',
+          SENTRY_RELEASE: 'untrusted-release',
+          SENTRY_DIST: 'untrusted-dist',
+        }),
+      };
+      expect(uploadMobileSourceMaps(options, dependencies)).toHaveLength(2);
+      const invocations = readFileSync(invocationLogPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map(
+          (entry) =>
+            JSON.parse(entry) as {
+              args: string[];
+              sourceMaps: { debug_id: string }[];
+              org: string;
+              project: string;
+              url: string;
+              release?: string;
+              dist?: string;
+            },
+        );
+      expect(invocations).toHaveLength(2);
+      for (const invocation of invocations) {
+        expect(invocation.args.slice(0, 2)).toEqual(['sourcemaps', 'upload']);
+        expect(invocation.sourceMaps).toEqual([expect.objectContaining({ debug_id: VALID_DEBUG_ID })]);
+        expect(invocation).toMatchObject({ org: 'boardsesh', project: 'boardsesh', url: 'https://sentry.io/' });
+        expect(invocation.release).toBeUndefined();
+        expect(invocation.dist).toBeUndefined();
+        if (invocation.args.some((argument) => argument.endsWith('.hbc'))) {
+          expect(invocation.args).toContain('--debug-id-reference');
+        } else {
+          expect(invocation.args).not.toContain('--debug-id-reference');
+        }
+      }
+      cliExitCode = 17;
+      expect(() => uploadMobileSourceMaps(options, dependencies)).toThrow(
+        /Official Sentry uploader failed with exit code (1|17)/,
+      );
+      expect(readFileSync(fixture.sourceMapPath, 'utf8')).toBe(originalSourceMap);
+      expect(readFileSync(`${jsBundlePath}.map`, 'utf8')).toBe(originalSourceMap);
+    },
+  );
 
   it('reports missing mobile directories and installed uploader files clearly', () => {
     const fixture = createMobileFixture();
@@ -541,6 +693,7 @@ describe('official Sentry uploader invocation', () => {
         },
         {
           resolveUploader: () => join(fixture.mobileDir, 'fake-uploader.js'),
+          retryDelaysMs: [],
           spawnUploader: (_executable, args, options) => {
             temporaryWorkingDirectory = options.cwd;
             stagingDirectory = args[1];
@@ -551,6 +704,123 @@ describe('official Sentry uploader invocation', () => {
     ).toThrow('Official Sentry uploader failed with exit code 17');
     expect(existsSync(temporaryWorkingDirectory ?? '')).toBe(false);
     expect(existsSync(stagingDirectory ?? '')).toBe(false);
+  });
+
+  it('retries a nonzero uploader exit against the same staged files, waiting 15 s then 45 s', () => {
+    const fixture = createMobileFixture('ios');
+    const exitCodes = [1, 1, 0];
+    const stagingDirectories: string[] = [];
+    const waits: number[] = [];
+
+    expect(
+      uploadMobileSourceMaps(
+        {
+          platform: 'ios',
+          mobileDir: fixture.mobileDir,
+          outputDir: fixture.outputDir,
+          environment: processEnv({ SENTRY_AUTH_TOKEN: 'secret-token' }),
+        },
+        {
+          resolveUploader: () => join(fixture.mobileDir, 'fake-uploader.js'),
+          sleepSync: (milliseconds) => waits.push(milliseconds),
+          spawnUploader: (_executable, args) => {
+            const stagingDirectory = args[1]!;
+            expect(readdirSync(stagingDirectory, { recursive: true }).length).toBeGreaterThan(0);
+            stagingDirectories.push(stagingDirectory);
+            return { status: exitCodes.shift() ?? 99 };
+          },
+        },
+      ),
+    ).toHaveLength(1);
+    expect(stagingDirectories).toHaveLength(3);
+    expect(new Set(stagingDirectories).size).toBe(1);
+    expect(waits).toEqual([...SOURCE_MAP_UPLOAD_RETRY_DELAYS_MS]);
+    expect(SOURCE_MAP_UPLOAD_RETRY_DELAYS_MS).toEqual([15_000, 45_000]);
+  });
+
+  it('cuts each attempt at 8 minutes and retries an attempt that timed out', () => {
+    const fixture = createMobileFixture('android');
+    const timeouts: number[] = [];
+    const results = [
+      { status: null, error: Object.assign(new Error('spawnSync node ETIMEDOUT'), { code: 'ETIMEDOUT' }) },
+      { status: 0 },
+    ];
+    const waits: number[] = [];
+
+    uploadMobileSourceMaps(
+      {
+        platform: 'android',
+        mobileDir: fixture.mobileDir,
+        outputDir: fixture.outputDir,
+        environment: processEnv({ SENTRY_AUTH_TOKEN: 'secret-token' }),
+      },
+      {
+        resolveUploader: () => join(fixture.mobileDir, 'fake-uploader.js'),
+        sleepSync: (milliseconds) => waits.push(milliseconds),
+        spawnUploader: (_executable, _args, options) => {
+          timeouts.push(options.timeout);
+          expect(options.killSignal).toBe('SIGTERM');
+          return results.shift() ?? { status: 99 };
+        },
+      },
+    );
+    expect(timeouts).toEqual([SOURCE_MAP_UPLOAD_ATTEMPT_TIMEOUT_MS, SOURCE_MAP_UPLOAD_ATTEMPT_TIMEOUT_MS]);
+    expect(SOURCE_MAP_UPLOAD_ATTEMPT_TIMEOUT_MS).toBe(8 * 60_000);
+    expect(waits).toEqual([SOURCE_MAP_UPLOAD_RETRY_DELAYS_MS[0]]);
+
+    expect(() =>
+      uploadMobileSourceMaps(
+        {
+          platform: 'android',
+          mobileDir: fixture.mobileDir,
+          outputDir: fixture.outputDir,
+          environment: processEnv({ SENTRY_AUTH_TOKEN: 'secret-token' }),
+        },
+        {
+          resolveUploader: () => join(fixture.mobileDir, 'fake-uploader.js'),
+          sleepSync: () => {},
+          spawnUploader: () => ({
+            status: null,
+            error: Object.assign(new Error('spawnSync node ETIMEDOUT'), { code: 'ETIMEDOUT' }),
+          }),
+        },
+      ),
+    ).toThrow('Official Sentry uploader timed out after 8 minutes.');
+  });
+
+  it('gives up after three nonzero exits and does not retry an uploader that cannot start', () => {
+    const fixture = createMobileFixture('android');
+    const uploadOptions = {
+      platform: 'android' as const,
+      mobileDir: fixture.mobileDir,
+      outputDir: fixture.outputDir,
+      environment: processEnv({ SENTRY_AUTH_TOKEN: 'secret-token' }),
+    };
+    let exits = 0;
+    expect(() =>
+      uploadMobileSourceMaps(uploadOptions, {
+        resolveUploader: () => join(fixture.mobileDir, 'fake-uploader.js'),
+        sleepSync: () => {},
+        spawnUploader: () => {
+          exits += 1;
+          return { status: 1 };
+        },
+      }),
+    ).toThrow('Official Sentry uploader failed with exit code 1');
+    expect(exits).toBe(3);
+
+    let starts = 0;
+    expect(() =>
+      uploadMobileSourceMaps(uploadOptions, {
+        resolveUploader: () => join(fixture.mobileDir, 'fake-uploader.js'),
+        sleepSync: () => {},
+        spawnUploader: () => {
+          starts += 1;
+          return { status: null, error: new Error('spawn node ENOENT') };
+        },
+      }),
+    ).toThrow('Could not start the official Sentry uploader: spawn node ENOENT');
+    expect(starts).toBe(1);
   });
 
   it('stages exactly declared executable groups, uses a fresh cwd, and cleans only its temporary root', () => {
@@ -656,6 +926,74 @@ describe('source-map CLI arguments', () => {
 });
 
 describe('self-hosted OTA publisher and workflow contracts', () => {
+  it('blocks both publishes on failed preflight and limits preflight to supported platforms', () => {
+    const workflow = parse(readRepositoryFile('.github/workflows/mobile-ota-production.yml')) as {
+      jobs: { publish: { steps: { id?: string; if?: string }[] } };
+    };
+    const evaluateCondition = (
+      stepId: string,
+      preflightOutcome: string,
+      inputPlatform = 'all',
+      publishContext: {
+        unlockOutcome?: string;
+        stageForProductionDeploy?: boolean;
+        baselineOutcome?: string;
+      } = {},
+    ) => {
+      const step = workflow.jobs.publish.steps.find((candidate) => candidate.id === stepId);
+      expect(step?.if).toBeDefined();
+      return runInNewContext(
+        step?.if ?? 'false',
+        {
+          always: () => true,
+          steps: {
+            gate: { outputs: { configured: 'true' } },
+            generate: { outcome: 'success' },
+            baseline: { outcome: publishContext.baselineOutcome ?? 'success' },
+            unlock: { outcome: publishContext.unlockOutcome ?? 'success' },
+            expect: { outputs: { mismatch: 'false' } },
+            sentry_uploader: { outcome: preflightOutcome },
+          },
+          inputs: { stage_for_production_deploy: publishContext.stageForProductionDeploy ?? false },
+          env: { INPUT_PLATFORM: inputPlatform },
+        },
+        { timeout: 100 },
+      ) as boolean;
+    };
+    for (const outcome of ['failure', 'skipped']) {
+      expect(evaluateCondition('publish_ios', outcome)).toBe(false);
+      expect(evaluateCondition('publish_android', outcome)).toBe(false);
+    }
+    expect(evaluateCondition('publish_ios', 'success')).toBe(true);
+    expect(evaluateCondition('publish_android', 'success')).toBe(true);
+    expect(evaluateCondition('sentry_uploader', 'skipped', 'invalid')).toBe(false);
+    expect(evaluateCondition('sentry_uploader', 'skipped', 'ios')).toBe(true);
+    expect(evaluateCondition('sentry_uploader', 'skipped', 'android')).toBe(true);
+    for (const stepId of ['sentry_uploader', 'publish_ios', 'publish_android']) {
+      for (const unlockOutcome of ['failure', 'skipped', 'cancelled', '']) {
+        expect(
+          evaluateCondition(stepId, 'success', 'all', { unlockOutcome }),
+          `${stepId} must refuse direct publication after unlock ${unlockOutcome || 'missing'}`,
+        ).toBe(false);
+      }
+      expect(
+        evaluateCondition(stepId, 'success', 'all', {
+          stageForProductionDeploy: true,
+          unlockOutcome: 'skipped',
+        }),
+        `${stepId} must allow staging without production unlock`,
+      ).toBe(true);
+      expect(
+        evaluateCondition(stepId, 'success', 'all', {
+          stageForProductionDeploy: true,
+          unlockOutcome: 'skipped',
+          baselineOutcome: 'failure',
+        }),
+        `${stepId} must refuse staging without a captured baseline`,
+      ).toBe(false);
+    }
+  });
+
   it('retains production EOAS source maps without adding export work to either preview path', () => {
     const productionArgs = buildSelfHostedEoasArgs('production', 'ios', 'source-map contract');
     const selfHostedPreviewArgs = buildSelfHostedEoasArgs('pr-4134', 'ios', 'preview contract');
@@ -674,6 +1012,7 @@ describe('self-hosted OTA publisher and workflow contracts', () => {
   it('publishes and uploads each production platform before the next export cleans dist', () => {
     const workflow = readRepositoryFile('.github/workflows/mobile-ota-production.yml');
     const orderedSteps = [
+      'Validate Sentry uploader support before publishing',
       'Publish iOS OTA',
       'Upload iOS OTA source maps to Sentry',
       'Publish Android OTA',
@@ -690,10 +1029,23 @@ describe('self-hosted OTA publisher and workflow contracts', () => {
     expect(positions.every((position) => position >= 0)).toBe(true);
     expect(positions).toEqual([...positions].sort((left, right) => left - right));
 
+    const preflight = workflowStep(workflow, 'Validate Sentry uploader support before publishing');
+    expect(preflight).toContain('resolveInstalledSentryUploader("packages/mobile")');
+    expect(preflight).not.toContain('SENTRY_AUTH_TOKEN');
+    expect(preflight).not.toContain('continue-on-error');
+    for (const platform of ['ios', 'android']) {
+      expect(preflight).not.toContain('train_guard');
+      expect(preflight).toContain(`env.INPUT_PLATFORM == '${platform}'`);
+      expect(workflowStep(workflow, `Publish ${platform === 'ios' ? 'iOS' : 'Android'} OTA`)).toContain(
+        "steps.sentry_uploader.outcome == 'success'",
+      );
+    }
+
     for (const stepName of ['Upload iOS OTA source maps to Sentry', 'Upload Android OTA source maps to Sentry']) {
       const step = workflowStep(workflow, stepName);
       expect(step).toContain('continue-on-error: true');
-      expect(step).toContain('timeout-minutes: 10');
+      // Three 8-minute attempts plus the 15 s and 45 s waits fit inside 30 minutes.
+      expect(step).toContain('timeout-minutes: 30');
       expect(step).toMatch(/^\s+SENTRY_AUTH_TOKEN:\s*\$\{\{ secrets\.SENTRY_AUTH_TOKEN \}\}$/m);
       expect(step).toContain('vp run mobile:upload-sourcemaps');
     }
@@ -772,26 +1124,32 @@ describe('self-hosted OTA publisher and workflow contracts', () => {
     expect(workflowStep(workflow, 'Snapshot trusted OTA publish tooling')).toContain(
       "Could not snapshot trusted OTA tooling file '$source_path'",
     );
-    expect(workflowStep(workflow, 'Validate anchored Sentry uploader support')).toContain('7.11.0');
+    const anchoredPreflight = workflowStep(workflow, 'Validate anchored Sentry uploader support');
+    expect(anchoredPreflight).toContain('resolveInstalledSentryUploader("packages/mobile")');
+    expect(anchoredPreflight).not.toContain('7.11.0');
+    expect(anchoredPreflight).not.toContain('SENTRY_AUTH_TOKEN');
 
     const uploadStep = workflowStep(workflow, 'Upload backport OTA source maps to Sentry');
     expect(uploadStep).toContain("!inputs.dry_run && steps.publish.outcome == 'success'");
     expect(uploadStep).toContain('continue-on-error: true');
-    expect(uploadStep).toContain('timeout-minutes: 10');
+    expect(uploadStep).toContain('timeout-minutes: 30');
     expect(uploadStep).toContain('run: node --import tsx scripts/mobile-upload-sourcemaps.ts');
     expect((workflow.match(/^\s+SENTRY_AUTH_TOKEN:/gm) ?? []).length).toBe(1);
     const backportGate = workflowStep(workflow, 'Require the published backport source-map upload');
     expect(backportGate).toContain('!inputs.dry_run');
     expect(backportGate).toContain("steps.publish.outcome == 'success'");
     expect(backportGate).toContain("steps.upload_sourcemaps.outcome != 'success'");
-    expect(workflowStep(workflow, 'Validate anchored Sentry uploader support')).toContain(
-      '.devDependencies["@sentry/react-native"]',
-    );
   });
 
   it('never uploads source maps or exposes a Sentry token in PR previews', () => {
     const previewWorkflow = readRepositoryFile('.github/workflows/mobile-ota-preview.yml');
-    expect(previewWorkflow).toContain('vp run mobile:publish');
+    const previewPublisher = readRepositoryFile('scripts/mobile-ota-preview-candidates.ts');
+    expect(workflowStep(previewWorkflow, 'Publish compatible preview runtime variants')).toContain(
+      'tooling/scripts/mobile-ota-preview-candidates.ts publish',
+    );
+    expect(previewPublisher).toContain("['run', 'mobile:publish'");
+    expect(previewPublisher).not.toContain('mobile:upload-sourcemaps');
+    expect(previewPublisher).not.toContain('mobile-upload-sourcemaps.ts');
     expect(previewWorkflow).not.toContain('mobile:upload-sourcemaps');
     expect(previewWorkflow).not.toContain('mobile-upload-sourcemaps.ts');
     expect(previewWorkflow).not.toMatch(/^\s+SENTRY_AUTH_TOKEN:/gm);

@@ -1,14 +1,16 @@
+import { GraphQLTransportClosedError, isTransientTransportClose } from '@boardsesh/graphql-client';
 import { isBleWriteTimeoutError } from '@boardsesh/ble-protocol/connection-error';
 import { getErrorStatus, isNetworkError as isSharedNetworkError } from '@boardsesh/offline-sync/error-classification';
-import { isDeadDatabaseHandleError } from '@boardsesh/offline-sync';
+import { isDeadDatabaseHandleError, SchemaNewerThanAppError } from '@boardsesh/offline-sync';
 import { addBreadcrumbToSentry, captureToSentry, type ErrorReportContext } from './sentry';
 import { isBackendUnavailableError } from './connectivity/backend-unavailable-error';
 import { noteDatabaseHandleFailure } from '../db/dead-handle';
+import { SCHEMA_NEWER_REPORT_KIND } from '../db/schema-downgrade';
 import { captureToObserve } from './observe-runtime';
 import {
   isExpectedAuthError,
   isExpectedBetaValidationError,
-  isGraphqlRateLimitedError,
+  readGraphqlRateLimit,
   isGraphqlValidationFailedError,
   readDuplicateBoardError,
   readGraphqlValidationFailedMessage,
@@ -32,6 +34,11 @@ export type { ErrorReportContext };
  * Sentry cannot answer; Sentry keeps the triage detail.
  */
 export function reportError(error: unknown, context?: ErrorReportContext): void {
+  // A call this bundle refused on a database a newer bundle migrated
+  // (db/refused-database). The init chain reports that state once, under the kind
+  // below; every later refusal is the same fact again, from whichever screen
+  // asked, so only the chain's own report goes through.
+  if (error instanceof SchemaNewerThanAppError && context?.tags?.kind !== SCHEMA_NEWER_REPORT_KIND) return;
   // Detection for #5410 hangs off this funnel because it is the one thing every
   // SQLite consumer already reaches: react-query reads and mutations, the sync
   // cycle, tick writes, and the init chain. Hooking `captureToSentry` instead would
@@ -66,12 +73,19 @@ export function addErrorBreadcrumb(breadcrumb: {
 /**
  * A request the user (or an unmounting screen) cancelled. Not a failure — the
  * app did exactly what was asked — so it must never reach error tracking.
- * Covers our own AbortController signals and TanStack Query's CancelledError.
+ * Covers our own AbortController signals, TanStack Query's CancelledError, and
+ * the `superseded` refusal of a request whose account or view has changed (a
+ * sign-in or sign-out while it was in flight). The other consumer refusals
+ * (`denied`, `conflict`, `unavailable`) are real failures and still report.
  */
 function isCancellation(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return false;
-  const name = (error as { name?: unknown }).name;
-  return name === 'AbortError' || name === 'CancelledError';
+  const { name, status } = error as { name?: unknown; status?: unknown };
+  return (
+    name === 'AbortError' ||
+    name === 'CancelledError' ||
+    (name === 'BrowserBackendConsumerError' && status === 'superseded')
+  );
 }
 
 /**
@@ -96,6 +110,9 @@ function isNetworkError(error: unknown): boolean {
   // Preserve statusless ClientError as a transport signal while allowing a
   // status nested in response.errors[].extensions to win over message prose.
   if (response !== undefined && getErrorStatus(error) === null) return true;
+  // A subscription that ran out of reconnect attempts: the socket is gone, which is
+  // a connectivity fact like the fetch failures above.
+  if (isTransientTransportClose(error)) return true;
   return isSharedNetworkError(error);
 }
 
@@ -134,12 +151,31 @@ function isExpectedDuplicateBoardError(error: unknown): boolean {
   return readDuplicateBoardError(error) !== null;
 }
 
+// A mixed response can include a real resolver failure alongside throttling.
+// Only suppress a response whose listed errors all describe discovery throttles.
+function hasOnlyDiscoveryRateLimits(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null) return false;
+  const record = error as { response?: { errors?: unknown }; graphqlErrors?: unknown };
+  const listedErrors = [
+    ...(Array.isArray(record.response?.errors) ? record.response.errors : []),
+    ...(Array.isArray(record.graphqlErrors) ? record.graphqlErrors : []),
+  ];
+  return listedErrors.every(
+    (graphqlError: unknown) => readGraphqlRateLimit(graphqlError)?.operation === 'searchBoards',
+  );
+}
+
+const breadcrumbedDiscoveryThrottles = new WeakSet<object>();
+
 /**
  * Report a *handled* error — one the app caught and surfaced as UX (a toast,
  * inline message, or degraded state) rather than letting crash. Applies the
  * noise policy so error tracking stays signal-rich:
  *   - cancellations are dropped entirely,
  *   - backend-unavailable short-circuits are dropped entirely (#4862),
+ *   - calls refused because the offline database belongs to a newer bundle are
+ *     dropped entirely, by `reportError` itself — the init chain reports that
+ *     state once,
  *   - expected auth-required GraphQL failures are dropped entirely,
  *   - expected beta-attach validation rejections are dropped entirely,
  *   - expected board-account credential rejections (wrong password, already
@@ -150,7 +186,8 @@ function isExpectedDuplicateBoardError(error: unknown): boolean {
  *     for a field the backend does not have) are downgraded to `warning`, tagged
  *     `schema_mismatch`, and fingerprinted by message so each mismatch is its
  *     own Sentry issue instead of one catch-all on the client frame (#5370),
- *   - GraphQL rate-limit rejections (RATE_LIMITED) are downgraded to `warning`
+ *   - board discovery throttling leaves one sanitized breadcrumb per rejection;
+ *   - other GraphQL rate-limit rejections (RATE_LIMITED) are downgraded to `warning`
  *     and tagged `rate_limited` — expected backpressure from typing/panning
  *     discovery searches too fast, not a bug (#3285),
  *   - offline/network failures are dropped entirely and left as a breadcrumb
@@ -158,6 +195,11 @@ function isExpectedDuplicateBoardError(error: unknown): boolean {
  *     `Backend Reachability Changed` event per outage episode, so a Sentry
  *     event per failed query adds nothing but quota (BOARDSESH-99, 6k
  *     events/12d),
+ *   - a subscription socket lost for good with a connection-loss close code
+ *     (`isTransientTransportClose`) is dropped entirely and left as a `network`
+ *     breadcrumb, like the fetch failures above,
+ *   - any other transport close (fatal code, or 4403 after auth refresh failed) is
+ *     downgraded to `warning`, tagged `ws_close_code`, and fingerprinted per code,
  *   - BLE write-resume timeouts are downgraded to `warning` and tagged
  *     `ble_write_timeout` (the native layer auto-recovers them by cycling the
  *     connection — #3181 — so they're transient, not hard failures),
@@ -192,7 +234,24 @@ export function reportHandledError(error: unknown, context?: ErrorReportContext)
     });
     return;
   }
-  if (isGraphqlRateLimitedError(error)) {
+  const rateLimit = readGraphqlRateLimit(error);
+  if (rateLimit?.operation === 'searchBoards' && hasOnlyDiscoveryRateLimits(error)) {
+    if (typeof error === 'object' && error !== null && !breadcrumbedDiscoveryThrottles.has(error)) {
+      breadcrumbedDiscoveryThrottles.add(error);
+      addErrorBreadcrumb({
+        category: 'graphql',
+        message: 'board discovery throttled',
+        level: 'info',
+        data: {
+          operation: rateLimit.operation,
+          retryAfterSeconds: rateLimit.retryAfterSeconds,
+          source: typeof context?.tags?.source === 'string' ? context.tags.source : null,
+        },
+      });
+    }
+    return;
+  }
+  if (rateLimit) {
     reportError(error, {
       ...context,
       level: 'warning',
@@ -215,6 +274,17 @@ export function reportHandledError(error: unknown, context?: ErrorReportContext)
       message: 'transport failure',
       level: 'warning',
       ...(context?.tags?.source !== undefined ? { data: { source: context.tags.source } } : {}),
+    });
+    return;
+  }
+  // A close with a fatal code (server error, auth, protocol). Kept at warning and
+  // fingerprinted by code so each one is its own issue and keeps the code.
+  if (error instanceof GraphQLTransportClosedError) {
+    reportError(error, {
+      ...context,
+      level: 'warning',
+      tags: { ...context?.tags, ws_close_code: error.code },
+      fingerprint: ['ws-transport-closed', String(error.code)],
     });
     return;
   }

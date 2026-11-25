@@ -1,0 +1,51 @@
+import { useQuery } from '@tanstack/react-query';
+import {
+  GET_MY_BOARD_SERIAL_CONFIGS,
+  type BoardSerialConfig,
+  type GetMyBoardSerialConfigsQueryResponse,
+} from '@boardsesh/graphql/operations';
+import { getHttpClient } from '../graphql/client';
+import { useAuthToken } from '../graphql/use-auth-token';
+
+const EMPTY_BOARD_SERIAL_CONFIGS: BoardSerialConfig[] = [];
+
+/** A query that has given up for now: it failed, or it is paused until the network returns. */
+function cannotAnswer(query: { isError: boolean; fetchStatus: 'fetching' | 'paused' | 'idle' }): boolean {
+  return query.isError || query.fetchStatus === 'paused';
+}
+
+/**
+ * Returns the current climber's recorded serial-to-board choices for BLE
+ * discovery. It lives beside BLE rather than the general GraphQL hook barrel:
+ * loading an auth token pulls in the native secure store, which unrelated
+ * GraphQL hooks must not need in their unit-test environment.
+ */
+export function useMyBoardSerialConfigs(serialNumbers: string[]) {
+  const authTokenQuery = useAuthToken();
+  const authToken = authTokenQuery.data;
+  const enabled = serialNumbers.length > 0 && authToken != null;
+  const query = useQuery({
+    queryKey: ['myBoardSerialConfigs', authToken ?? null, serialNumbers],
+    queryFn: () =>
+      getHttpClient().request<GetMyBoardSerialConfigsQueryResponse>(GET_MY_BOARD_SERIAL_CONFIGS, { serialNumbers }),
+    enabled,
+    retry: false,
+  });
+
+  return {
+    // A failed refetch may keep old query data. Offer the public/manual choices
+    // instead of treating a stale serial mapping as the climber's current pick.
+    data:
+      enabled && !query.isError
+        ? (query.data?.myBoardSerialConfigs ?? EMPTY_BOARD_SERIAL_CONFIGS)
+        : EMPTY_BOARD_SERIAL_CONFIGS,
+    // Wait for auth hydration before declaring a scan empty; otherwise a saved
+    // board can briefly appear as several public serial-collision candidates.
+    // A lookup that can't answer (paused for want of a network, or failed) is
+    // done waiting: holding on it left the quickstart on "Loading boards…" with
+    // no signal. The public candidates show, as after a failed refetch above.
+    isResolving:
+      (authToken === undefined && !cannotAnswer(authTokenQuery)) ||
+      (enabled && !cannotAnswer(query) && (query.isLoading || query.isFetching)),
+  };
+}

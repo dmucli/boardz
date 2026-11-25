@@ -24,8 +24,8 @@
   "directory": {
     "all": {
       "h1": "Climbing gyms with training boards",
-      "lead_one": "{{formattedCount}} gym has a board listed on Boardsesh. The listing shows the boards on its wall and the angle they are set at, so you know what you are walking into before you drive across town.",
-      "lead_other": "{{formattedCount}} gyms have a board listed on Boardsesh. Every listing shows the boards on the wall and the angle they are set at, so you know what you are walking into before you drive across town.",
+      "lead_one": "{{formattedCount}} gym, club wall or home wall is listed in the board directory.",
+      "lead_other": "{{formattedCount}} gyms, club walls and home walls are listed in the board directory.",
       "detail": "{{kilterCount}} of them run a Kilter board, {{moonboardCount}} a MoonBoard and {{tensionCount}} a Tension board, and plenty run more than one. Pick a board below, or search by name."
     },
     "kilter": {
@@ -45,18 +45,16 @@
       "lead_one": "{{formattedCount}} gym on Boardsesh has a Tension board on the wall. The listing shows the angle it is set at, so you can tell whether it matches the project you are on.",
       "lead_other": "{{formattedCount}} gyms on Boardsesh have a Tension board on the wall. Every listing shows the angle it is set at, so you can tell which one matches the project you are on.",
       "detail": "Climbers list these gyms themselves, and Boardsesh is not affiliated with the people who make the boards. Run one of these walls? Claim the listing and keep the details straight."
-    }
+    },
+    "source": "Listings come from public board-location data and climbers."
   },
   "facets": {
-    "heading": "Browse by board",
     "all": "All gyms · {{formattedCount}}",
     "kilter": "Kilter · {{formattedCount}}",
     "moonboard": "MoonBoard · {{formattedCount}}",
-    "tension": "Tension · {{formattedCount}}",
-    "countHint": "The numbers count gyms, not boards: a gym with three Kilter walls counts once."
+    "tension": "Tension · {{formattedCount}}"
   },
   "filters": {
-    "boardHeading": "Board",
     "moreLabel": "Narrow it down",
     "moreLabelActive": "Narrow it down · {{count}}",
     "layoutHeading": "Layout",
@@ -73,7 +71,6 @@
     "clearAll": "Clear all filters"
   },
   "search": {
-    "geoHint": "Location off? Type a town instead. No permission needed.",
     "label": "Search gyms",
     "placeholder": "Gym name or town",
     "submit": "Search"
@@ -93,14 +90,19 @@
     "home": "Back to Boardsesh"
   },
   "card": {
-    "claimed": "Claimed",
-    "unclaimed": "Unclaimed",
+    "claimed": "Run by the gym",
+    "climberListed": "Added by a climber",
+    "unclaimed": "Not claimed yet",
+    "claimCta": "Claim this gym",
+    "claimCtaAria": "Claim {{gym}}",
     "boardChip": "{{board}} {{angle}}°",
     "distance": "{{distance}} km away"
   },
   "claim": {
-    "body": "Is this your gym? Claim it and you set the boards, hours and links climbers see here.",
-    "action": "Find your gym"
+    "body": "Run one of these gyms? Claim it to fix its boards, hours and links.",
+    "action": "Find your gym",
+    "topAction": "Run one of these gyms? Find it and claim it. It's free.",
+    "modeHint": "Search for your gym, then claim it from its card."
   },
   "nearMe": {
     "cta": "Use my location",
@@ -160,5 +162,32 @@
     "area": "Gyms within {{radius}} km of {{place}}",
     "selectedArea": "the selected location",
     "pinlessNotice": "Nearby results only include gyms with a map pin."
+  },
+  "install": {
+    "heading": "Get the app",
+    "body": "Light up your gym's boards from your phone and log every send."
+  },
+  "create": {
+    "action": "Create gym",
+    "title": "Add your gym",
+    "description": "Put your gym on the map, then link the boards already listed on Boardsesh.",
+    "details": "Gym details",
+    "boards": "Existing boards",
+    "continue": "Save and choose boards",
+    "saved": "{{name}} is saved. Link its existing boards below, or come back later.",
+    "managerHint": "You will manage this listing. Gym staff can claim it later.",
+    "back": "Edit details",
+    "finish": "See gym",
+    "skip": "Skip for now",
+    "locationMissing": "Add a map pin in Gym details to find nearby boards. You can still link boards you own.",
+    "loadMore": "Load more boards",
+    "loadError": "We could not load your boards. Your gym is saved; try again.",
+    "retry": "Try again",
+    "refreshError": "Your changes are saved, but the gym directory has not refreshed yet.",
+    "refreshRetry": "Refresh directory",
+    "moveTitle": "Move this board?",
+    "moveBody": "Move {{board}} from {{source}} to this gym? If its old imported listing is left empty, it will be merged into this gym and its links will redirect here.",
+    "moveConfirm": "Move board",
+    "notListed": "Not listed? Add your gym"
   }
 }

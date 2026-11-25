@@ -3,6 +3,7 @@ import { cache } from 'react';
 import type { ParsedBoardRouteParameters, BoardName } from '@/app/lib/types';
 import { getServerAuthToken } from '@/app/lib/auth/server-auth';
 import { getGraphQLHttpUrl } from '@/app/lib/graphql/client';
+import { webClientIdentityHeaders } from '@/app/lib/client-identity';
 import { SSR_BACKEND_FETCH_TIMEOUT_MS } from '@/app/lib/ssr-fetch-deadline';
 import { parseBoardAngleSegment, toBoardName } from '@boardsesh/board-config';
 
@@ -20,6 +21,8 @@ export type ResolvedBoard = {
   // Link-only: reachable anonymously (when isPublic) but excluded from
   // search/browse and, per this fix, from crawler indexing (noindex,follow).
   isUnlisted: boolean;
+  /** Parent gym listing controls discovery without changing link access. */
+  gymIsListed?: boolean | null;
   isOwned: boolean;
   ownerId: string;
   angle: number;
@@ -50,11 +53,39 @@ export type ResolvedBoard = {
  * and never answers is otherwise not a failure at all, just a render that never
  * finishes.
  */
-export const resolveBoardBySlug = cache(async (slug: string): Promise<ResolvedBoard | null> => {
-  const url = getGraphQLHttpUrl();
-  const query = `
-    query BoardBySlug($slug: String!) {
-      boardBySlug(slug: $slug) {
+export const resolveBoardBySlug = cache(async (slug: string, wallUuid?: string): Promise<ResolvedBoard | null> => {
+  if (wallUuid === undefined) return fetchBoardBySlug(slug, undefined);
+  try {
+    return await fetchBoardBySlug(slug, wallUuid);
+  } catch (error) {
+    // The deploy window where www is ahead of the backend: an older schema has no
+    // `wallUuid` argument and rejects the whole document. Ask again without it, so
+    // the request gets exactly what it got before this argument existed (an
+    // unlisted wall is a 404, everything else renders) instead of a 500.
+    if (error instanceof UnknownWallUuidArgumentError) return fetchBoardBySlug(slug, undefined);
+    throw error;
+  }
+});
+
+/**
+ * The board as a stranger holding only its slug sees it: what an unfurler sees,
+ * and so the question the backend's board share card asks before it draws.
+ *
+ * With no viewer token this is the page's own `resolveBoardBySlug(slug, undefined)`
+ * read. `undefined` is passed explicitly because React `cache` keys on the argument
+ * list, so `(slug)` and `(slug, undefined)` are two entries and two backend calls.
+ * A signed-in viewer can open boards a stranger cannot (followers, invite-only,
+ * their own Only-me board), so their request asks again with the token left off.
+ * No `?wall=` capability is ever sent: an unlisted spray wall must read as missing.
+ */
+export const resolveBoardBySlugAsStranger = cache(async (slug: string): Promise<ResolvedBoard | null> => {
+  if (!(await getServerAuthToken())) return resolveBoardBySlug(slug, undefined);
+  return fetchBoardBySlug(slug, undefined, false);
+});
+
+class UnknownWallUuidArgumentError extends Error {}
+
+const BOARD_BY_SLUG_FIELDS = `
         uuid
         slug
         ownerId
@@ -67,22 +98,38 @@ export const resolveBoardBySlug = cache(async (slug: string): Promise<ResolvedBo
         locationName
         isPublic
         isUnlisted
+        gymIsListed
         isOwned
         angle
         isAngleAdjustable
-      }
-    }
-  `;
+`;
 
-  const authToken = await getServerAuthToken();
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+/**
+ * `wallUuid` is a spray wall's share-link capability (`?wall=`). The backend
+ * honours it only when it is the uuid of the wall the slug names, and only to
+ * open an UNLISTED wall; it is sent only when the request carried one, so every
+ * other lookup sends the same document, and hits the same cache entry, as before.
+ */
+async function fetchBoardBySlug(
+  slug: string,
+  wallUuid: string | undefined,
+  asViewer = true,
+): Promise<ResolvedBoard | null> {
+  const url = getGraphQLHttpUrl();
+  const query =
+    wallUuid === undefined
+      ? `query BoardBySlug($slug: String!) { boardBySlug(slug: $slug) { ${BOARD_BY_SLUG_FIELDS} } }`
+      : `query BoardBySlugWithWall($slug: String!, $wallUuid: ID) { boardBySlug(slug: $slug, wallUuid: $wallUuid) { ${BOARD_BY_SLUG_FIELDS} } }`;
+  const variables = wallUuid === undefined ? { slug } : { slug, wallUuid };
+
+  const authToken = asViewer ? await getServerAuthToken() : undefined;
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...webClientIdentityHeaders() };
   if (authToken) {
     headers.Authorization = `Bearer ${authToken}`;
   }
 
-  // Authenticated responses can contain private boards, so they must never
-  // enter the shared data cache. Anonymous responses remain safely reusable.
-  const cacheOptions = authToken ? { cache: 'no-store' as const } : { next: { revalidate: 300 } };
+  // A public board can become private between requests, including anonymous reads.
+  const cacheOptions = { cache: 'no-store' as const };
 
   // An abort lands in the same bucket as a rejected fetch: it throws, so
   // `/b/{slug}` answers 5xx (retried by crawlers, never CDN-cached) instead of
@@ -90,7 +137,7 @@ export const resolveBoardBySlug = cache(async (slug: string): Promise<ResolvedBo
   const response = await fetch(url, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ query, variables: { slug } }),
+    body: JSON.stringify({ query, variables }),
     signal: AbortSignal.timeout(SSR_BACKEND_FETCH_TIMEOUT_MS),
     ...cacheOptions,
   });
@@ -108,11 +155,20 @@ export const resolveBoardBySlug = cache(async (slug: string): Promise<ResolvedBo
   // `data.boardBySlug` is `null` alongside it — indistinguishable from a real
   // miss unless we look at `errors`.
   if (Array.isArray(payload.errors) && payload.errors.length > 0) {
+    if (wallUuid !== undefined && payload.errors.some(isUnknownWallUuidArgument)) {
+      throw new UnknownWallUuidArgumentError(`[board-slug] backend has no boardBySlug(wallUuid:) yet`);
+    }
     throw new Error(`[board-slug] boardBySlug lookup for "${slug}" returned GraphQL errors`);
   }
 
   return payload.data?.boardBySlug ?? null;
-});
+}
+
+function isUnknownWallUuidArgument(error: unknown): boolean {
+  if (error === null || typeof error !== 'object' || !('message' in error)) return false;
+  const { message } = error;
+  return typeof message === 'string' && message.includes('Unknown argument "wallUuid"');
+}
 
 /**
  * Convert a resolved board entity to ParsedBoardRouteParameters.

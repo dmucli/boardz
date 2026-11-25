@@ -1,8 +1,56 @@
 // @vitest-environment jsdom
+vi.mock('../../use-ios-sheet-background-style', () => ({ useIosSheetBackgroundStyle: () => undefined }));
+// The walk's board reads the active board and its gym; board-blind here, and
+// one object, as the real hook's memo hands out.
+const boardBlindWalk = vi.hoisted(() => ({}));
+vi.mock('../../../providers/queue/use-queue-walk-board', () => ({ useQueueWalkBoard: () => boardBlindWalk }));
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { act, render } from '@testing-library/react';
 import { createElement, createRef, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ClimbQueueItem } from '@boardsesh/queue';
+import type { WaitForPresentationResult } from '../../../providers/sheet-presentation-provider';
+import type { LogAscentInput } from '../../../providers/drawer-host-provider';
+import { invalidateCredentialSnapshots } from '../../../lib/privacy/privacy-cache';
+vi.mock('../../LogAscentSheet', () => ({
+  LogAscentSheet: ({
+    visible,
+    climbUuid,
+    presenterGroup,
+    parentSheetId,
+    onClose,
+    onFullyDismissed,
+  }: {
+    visible: boolean;
+    climbUuid: string;
+    presenterGroup?: string;
+    parentSheetId?: string;
+    onClose: () => void;
+    onFullyDismissed: () => void;
+  }) => {
+    sheetCallbacks.tickClose = onClose;
+    sheetCallbacks.tickFullyDismissed = onFullyDismissed;
+    return createElement('div', {
+      'data-testid': 'queue-tick-sheet',
+      'data-climb': climbUuid,
+      'data-visible': String(visible),
+      'data-presenter': presenterGroup,
+      'data-parent': parentSheetId,
+    });
+  },
+}));
 
 // Freeze-contract harness for QueueSheet. Both queue sheets (root + /play copy,
 // PR #3337) stay mounted the whole session. A HIDDEN sheet must freeze the queue
@@ -23,6 +71,7 @@ const managedSheet = vi.hoisted(() => ({
   dismissAndWait: vi.fn(async () => ({ status: 'dismissed' as const })),
   onChange: vi.fn(),
   onFullyDismissed: vi.fn(),
+  waitForPresentation: vi.fn<() => Promise<WaitForPresentationResult>>(),
 }));
 
 // Counts QueueList renders and records the queue prop identity it last saw. The
@@ -30,12 +79,47 @@ const managedSheet = vi.hoisted(() => ({
 // makes it bail — exactly the win the frozen snapshot buys.
 const queueList = vi.hoisted(() => ({ renders: 0, lastQueue: null as ClimbQueueItem[] | null }));
 
+const platform = vi.hoisted(() => ({ os: 'ios' }));
+// The local (mount-point) inset, and the callbacks the header / list mocks
+// capture so a test can drive edit mode + selection to reveal the bulk bar.
+const safeArea = vi.hoisted(() => ({ bottom: 0 }));
+const sheetCallbacks = vi.hoisted(() => ({
+  clearAll: null as (() => void) | null,
+  toggleEditMode: null as (() => void) | null,
+  toggleSelect: null as ((uuid: string) => void) | null,
+  tickHistory: null as ((item: ClimbQueueItem) => void | Promise<void>) | null,
+  tickClose: null as (() => void) | null,
+  tickFullyDismissed: null as (() => void) | null,
+}));
+const gestureRoot = vi.hoisted(() => ({ style: undefined as unknown }));
+
 type ViewProps = { children?: ReactNode; testID?: string; style?: unknown };
 vi.mock('react-native', () => ({
-  View: ({ children, testID }: ViewProps) => createElement('div', { 'data-testid': testID }, children),
+  View: ({ children, testID, style }: ViewProps) =>
+    createElement('div', { 'data-testid': testID, 'data-style': JSON.stringify(style) }, children),
   Pressable: ({ children }: ViewProps) => createElement('div', null, children),
-  Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  AccessibilityInfo: {
+    isScreenReaderEnabled: () => Promise.resolve(false),
+    addEventListener: () => ({ remove: () => {} }),
+  },
+  Platform: {
+    get OS() {
+      return platform.os;
+    },
+    select: (options: Record<string, unknown>) => options[platform.os] ?? options.default,
+  },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
+}));
+
+vi.mock('react-native-gesture-handler', () => ({
+  GestureHandlerRootView: ({ children, style }: ViewProps) => {
+    gestureRoot.style = style;
+    return createElement('div', { 'data-testid': 'dialog-gesture-root' }, children);
+  },
 }));
 
 vi.mock('@expo/ui/community/bottom-sheet', () => ({
@@ -44,25 +128,31 @@ vi.mock('@expo/ui/community/bottom-sheet', () => ({
   BottomSheetModal: ({ children }: ViewProps) => createElement('div', { 'data-testid': 'sheet' }, children),
 }));
 
-vi.mock('../../../providers/sheet-presentation-provider', () => ({
-  useManagedSheet: () => ({
-    handle: {
-      present: managedSheet.present,
-      dismiss: managedSheet.dismiss,
-      dismissAndWait: managedSheet.dismissAndWait,
-    },
-    onChange: managedSheet.onChange,
-    onFullyDismissed: managedSheet.onFullyDismissed,
-  }),
-}));
+vi.mock('../../../providers/sheet-presentation-provider', () => {
+  const handle = {
+    present: managedSheet.present,
+    dismiss: managedSheet.dismiss,
+    dismissAndWait: managedSheet.dismissAndWait,
+  };
+  return {
+    useManagedSheet: () => ({
+      sheetId: 'queue-sheet-test',
+      handle,
+      onChange: managedSheet.onChange,
+      onFullyDismissed: managedSheet.onFullyDismissed,
+      waitForPresentation: managedSheet.waitForPresentation,
+    }),
+  };
+});
 
 vi.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+  useSafeAreaInsets: () => ({ top: 0, bottom: safeArea.bottom, left: 0, right: 0 }),
 }));
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: { background: '#fff', separator: '#000' },
     sheet: { handleStyle: {} },
@@ -72,35 +162,70 @@ vi.mock('../../../providers/theme-provider', () => ({
 vi.mock('../../../lib/haptics', () => ({ hapticMedium: vi.fn(), hapticWarning: vi.fn() }));
 vi.mock('../../../theme/colors', () => ({ brandColors: { error: '#f00' } }));
 vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { white: '#fff' } }));
-vi.mock('../../../theme/tokens', () => ({ spacing: { 3: 12, 4: 16 } }));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: { 3: 12, 4: 16 },
+}));
 
-vi.mock('../QueueSheetHeader', () => ({ QueueSheetHeader: () => null }));
+vi.mock('../QueueSheetHeader', () => ({
+  QueueSheetHeader: ({ onToggleEditMode, onClearAll }: { onToggleEditMode: () => void; onClearAll: () => void }) => {
+    sheetCallbacks.clearAll = onClearAll;
+    sheetCallbacks.toggleEditMode = onToggleEditMode;
+    return null;
+  },
+}));
+vi.mock('../../UndoSnackbar', () => ({
+  UndoSnackbar: ({ bottom }: { bottom: number }) =>
+    createElement('div', { 'data-testid': 'undo-snackbar', 'data-bottom': bottom }),
+}));
 vi.mock('../../Text', () => ({ Text: ({ children }: ViewProps) => createElement('div', null, children) }));
 
 vi.mock('../QueueList', async () => {
   const React = await vi.importActual<typeof import('react')>('react');
   return {
-    QueueList: React.memo(({ queue }: { queue: ClimbQueueItem[] }) => {
-      queueList.renders += 1;
-      queueList.lastQueue = queue;
-      return React.createElement('div', {
-        'data-testid': 'queue-list',
-        'data-uuids': queue.map((item) => item.uuid).join(','),
-      });
-    }),
+    QueueList: React.memo(
+      ({
+        queue,
+        onToggleSelect,
+        onTickHistory,
+      }: {
+        queue: ClimbQueueItem[];
+        onToggleSelect: (uuid: string) => void;
+        onTickHistory: (item: ClimbQueueItem) => void | Promise<void>;
+      }) => {
+        sheetCallbacks.toggleSelect = onToggleSelect;
+        sheetCallbacks.tickHistory = onTickHistory;
+        queueList.renders += 1;
+        queueList.lastQueue = queue;
+        return React.createElement('div', {
+          'data-testid': 'queue-list',
+          'data-uuids': queue.map((item) => item.uuid).join(','),
+        });
+      },
+    ),
   };
 });
 
 // Stable across renders — the real useQueueActions returns memoized callbacks;
 // fresh functions each render would churn QueueList's props and defeat the memo.
-const queueActions = vi.hoisted(() => ({ removeFromQueue: vi.fn(), clearQueue: vi.fn(), reorderQueue: vi.fn() }));
+const queueActions = vi.hoisted(() => ({
+  removeFromQueue: vi.fn(),
+  removeQueueItems: vi.fn(),
+  clearQueue: vi.fn(),
+  reorderQueue: vi.fn(),
+  setQueue: vi.fn(),
+  getQueueSnapshot: vi.fn(() => queueData.current ?? { queue: [], currentClimbQueueItem: null }),
+  setPlaylistSuggestionSource: vi.fn(),
+}));
 vi.mock('../../../providers/queue-provider', () => ({
   useQueueData: () => queueData.current,
   useQueueActions: () => queueActions,
   usePlaylistSuggestionSource: () => null,
+  useQueueSessionId: () => ({ sessionId: null }),
 }));
 
 import { QueueSheet, type QueueSheetHandle } from '../QueueSheet';
+import { publishWindowInsetBottom, resetWindowInsetForTests } from '../../../lib/window-inset-store';
 
 function makeQueueItem(uuid: string): ClimbQueueItem {
   return {
@@ -127,6 +252,17 @@ function makeData(uuids: string[]) {
   return { queue, currentClimbQueueItem: queue[0] ?? null };
 }
 
+function presentLocalTick(item: ClimbQueueItem, present?: (input: LogAscentInput) => void) {
+  present?.({
+    climbUuid: item.climb.uuid,
+    boardName: 'kilter',
+    angle: 40,
+    isMirror: false,
+    isBenchmark: false,
+    baseAscensionistCount: 0,
+  });
+}
+
 const board = {
   boardName: 'kilter' as const,
   layoutId: 1,
@@ -143,18 +279,44 @@ const noopProps = {
   onTickHistory: () => {},
 };
 
-function renderSheet(handleRef: ReturnType<typeof createRef<QueueSheetHandle>>) {
-  return render(createElement(QueueSheet, { ...noopProps, ref: handleRef }));
+function renderSheet(
+  handleRef: ReturnType<typeof createRef<QueueSheetHandle>>,
+  overrides: Partial<Parameters<typeof QueueSheet>[0]> = {},
+) {
+  return render(createElement(QueueSheet, { ...noopProps, ...overrides, ref: handleRef }));
 }
 
 describe('QueueSheet freeze contract', () => {
   beforeEach(() => {
+    platform.os = 'ios';
+    gestureRoot.style = undefined;
     queueData.current = makeData(['a', 'b']);
     managedSheet.present.mockClear();
     managedSheet.dismiss.mockClear();
     managedSheet.dismissAndWait.mockClear();
+    managedSheet.waitForPresentation.mockReset().mockResolvedValue({ status: 'presented' });
+    sheetCallbacks.tickHistory = null;
+    sheetCallbacks.tickClose = null;
+    sheetCallbacks.tickFullyDismissed = null;
     queueList.renders = 0;
     queueList.lastQueue = null;
+    safeArea.bottom = 0;
+    resetWindowInsetForTests();
+  });
+
+  it('hosts Android queue gestures inside the native dialog with a flex root', () => {
+    platform.os = 'android';
+    const { getByTestId } = renderSheet(createRef<QueueSheetHandle>());
+    const root = getByTestId('dialog-gesture-root');
+    expect(getByTestId('sheet').contains(root)).toBe(true);
+    expect(root.contains(getByTestId('queue-list'))).toBe(true);
+    expect(gestureRoot.style).toHaveProperty('flex', 1);
+  });
+
+  it('preserves the iOS sheet content without an extra gesture root', () => {
+    const { queryByTestId, getByTestId } = renderSheet(createRef<QueueSheetHandle>());
+    expect(queryByTestId('dialog-gesture-root')).toBeNull();
+    expect(getByTestId('sheet').contains(getByTestId('queue-list'))).toBe(true);
   });
 
   it('does NOT re-render QueueList when queue data changes while hidden', () => {
@@ -205,5 +367,200 @@ describe('QueueSheet freeze contract', () => {
     if (!handleRef.current) throw new Error('queue sheet handle did not mount');
     await expect(handleRef.current.dismissAndWait()).resolves.toEqual({ status: 'dismissed' });
     expect(managedSheet.dismissAndWait).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits until the Queue parent settles before requesting its local Tick presenter', async () => {
+    let settleParent!: (outcome: WaitForPresentationResult) => void;
+    managedSheet.waitForPresentation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settleParent = resolve;
+        }),
+    );
+    const onTickHistory = vi.fn(presentLocalTick);
+    const handleRef = createRef<QueueSheetHandle>();
+    const rendered = renderSheet(handleRef, { onTickHistory });
+    act(() => handleRef.current?.present());
+    const item = makeQueueItem('history');
+    let pending: void | Promise<void>;
+    act(() => {
+      pending = sheetCallbacks.tickHistory?.(item);
+    });
+    expect(managedSheet.waitForPresentation).toHaveBeenCalledOnce();
+    expect(onTickHistory).not.toHaveBeenCalled();
+    await act(async () => {
+      settleParent({ status: 'presented' });
+      await pending;
+    });
+    expect(onTickHistory).toHaveBeenCalledExactlyOnceWith(item, expect.any(Function));
+    const tick = rendered.getByTestId('queue-tick-sheet');
+    expect(rendered.getByTestId('sheet').contains(tick)).toBe(true);
+    expect(tick.getAttribute('data-presenter')).toBe('queue-tick:queue-sheet-test');
+    expect(tick.getAttribute('data-parent')).toBe('queue-sheet-test');
+    expect(managedSheet.dismiss).not.toHaveBeenCalled();
+    expect(managedSheet.dismissAndWait).not.toHaveBeenCalled();
+  });
+
+  it.each(['dismiss', 'dismissAndWait'] as const)(
+    'cancels an immediate Tick then %s before the awaited continuation',
+    async (close) => {
+      const onTickHistory = vi.fn();
+      const handleRef = createRef<QueueSheetHandle>();
+      renderSheet(handleRef, { onTickHistory });
+      act(() => handleRef.current?.present());
+      let pending: void | Promise<void>;
+      act(() => {
+        pending = sheetCallbacks.tickHistory?.(makeQueueItem('history'));
+        void handleRef.current?.[close]();
+      });
+      await act(async () => {
+        await pending;
+      });
+      expect(onTickHistory).not.toHaveBeenCalled();
+      expect(managedSheet[close]).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('abandons an awaited Tick when the parent presentation is aborted', async () => {
+    managedSheet.waitForPresentation.mockResolvedValue({ status: 'aborted' });
+    const onTickHistory = vi.fn();
+    renderSheet(createRef<QueueSheetHandle>(), { onTickHistory });
+    await act(async () => {
+      await sheetCallbacks.tickHistory?.(makeQueueItem('history'));
+    });
+    expect(onTickHistory).not.toHaveBeenCalled();
+  });
+
+  it('abandons an awaited Tick after a credential boundary', async () => {
+    let settleParent!: (outcome: WaitForPresentationResult) => void;
+    managedSheet.waitForPresentation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settleParent = resolve;
+        }),
+    );
+    const onTickHistory = vi.fn();
+    renderSheet(createRef<QueueSheetHandle>(), { onTickHistory });
+    let pending: void | Promise<void>;
+    act(() => {
+      pending = sheetCallbacks.tickHistory?.(makeQueueItem('private-history'));
+    });
+    await act(async () => {
+      invalidateCredentialSnapshots();
+      settleParent({ status: 'presented' });
+      await pending;
+    });
+    expect(onTickHistory).not.toHaveBeenCalled();
+  });
+
+  it('abandons an awaited Tick when Queue unmounts', async () => {
+    let settleParent!: (outcome: WaitForPresentationResult) => void;
+    managedSheet.waitForPresentation.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settleParent = resolve;
+        }),
+    );
+    const onTickHistory = vi.fn();
+    const rendered = renderSheet(createRef<QueueSheetHandle>(), { onTickHistory });
+    let pending: void | Promise<void>;
+    act(() => {
+      pending = sheetCallbacks.tickHistory?.(makeQueueItem('history'));
+    });
+    rendered.unmount();
+    await act(async () => {
+      settleParent({ status: 'presented' });
+      await pending;
+    });
+    expect(onTickHistory).not.toHaveBeenCalled();
+  });
+
+  it('defers a layout-only Queue fold until the Tick fully dismisses', async () => {
+    const handleRef = createRef<QueueSheetHandle>();
+    const rendered = renderSheet(handleRef, { onTickHistory: presentLocalTick });
+    act(() => handleRef.current?.present());
+    await act(async () => {
+      await sheetCallbacks.tickHistory?.(makeQueueItem('history'));
+    });
+    const tick = rendered.getByTestId('queue-tick-sheet');
+    act(() => handleRef.current?.dismissWhenUncovered(true));
+    expect(managedSheet.dismiss).not.toHaveBeenCalled();
+    act(() => sheetCallbacks.tickClose?.());
+    expect(rendered.getByTestId('queue-tick-sheet')).toBe(tick);
+    expect(tick.getAttribute('data-visible')).toBe('false');
+    expect(managedSheet.dismiss).not.toHaveBeenCalled();
+    act(() => sheetCallbacks.tickFullyDismissed?.());
+    expect(rendered.queryByTestId('queue-tick-sheet')).toBeNull();
+    expect(managedSheet.dismiss).toHaveBeenCalledOnce();
+  });
+
+  it('cancels a deferred layout fold when rotating back before Tick finishes', async () => {
+    const handleRef = createRef<QueueSheetHandle>();
+    renderSheet(handleRef, { onTickHistory: presentLocalTick });
+    act(() => handleRef.current?.present());
+    await act(async () => {
+      await sheetCallbacks.tickHistory?.(makeQueueItem('history'));
+    });
+    act(() => handleRef.current?.dismissWhenUncovered(true));
+    act(() => handleRef.current?.dismissWhenUncovered(false));
+    act(() => sheetCallbacks.tickClose?.());
+    act(() => sheetCallbacks.tickFullyDismissed?.());
+    expect(managedSheet.dismiss).not.toHaveBeenCalled();
+  });
+
+  it('keeps a deferred layout fold waiting through a queued replacement Tick', async () => {
+    const handleRef = createRef<QueueSheetHandle>();
+    const rendered = renderSheet(handleRef, { onTickHistory: presentLocalTick });
+    act(() => handleRef.current?.present());
+    await act(async () => {
+      await sheetCallbacks.tickHistory?.(makeQueueItem('a'));
+    });
+    const firstFullyDismissed = sheetCallbacks.tickFullyDismissed;
+    act(() => handleRef.current?.dismissWhenUncovered(true));
+    act(() => sheetCallbacks.tickClose?.());
+    await act(async () => {
+      await sheetCallbacks.tickHistory?.(makeQueueItem('b'));
+    });
+    act(() => firstFullyDismissed?.());
+    expect(rendered.getByTestId('queue-tick-sheet').getAttribute('data-climb')).toBe('b');
+    expect(managedSheet.dismiss).not.toHaveBeenCalled();
+    act(() => sheetCallbacks.tickClose?.());
+    act(() => sheetCallbacks.tickFullyDismissed?.());
+    expect(managedSheet.dismiss).toHaveBeenCalledOnce();
+  });
+});
+
+describe('QueueSheet bulk-remove bar', () => {
+  beforeEach(() => {
+    platform.os = 'ios';
+    queueData.current = makeData(['a', 'b']);
+    safeArea.bottom = 0;
+    resetWindowInsetForTests();
+  });
+
+  it('pads by the WINDOW inset, not the in-tab inset that folds in the tab bar (#3776)', () => {
+    // A mount point inside a NativeTabs tab reports 139 (34 + 49 bar + 56
+    // accessory, DEVICE_VERIFIED iPhone 17 Pro); the sheet covers that chrome,
+    // so the bar clears only the window's 34 + spacing[3].
+    safeArea.bottom = 139;
+    act(() => publishWindowInsetBottom(34));
+    const { container } = renderSheet(createRef<QueueSheetHandle>());
+
+    act(() => sheetCallbacks.toggleEditMode?.());
+    act(() => sheetCallbacks.toggleSelect?.('a'));
+
+    const styles = [...container.querySelectorAll('[data-style]')].map((node) => node.getAttribute('data-style') ?? '');
+    const bulkBarStyle = styles.find((style) => style.includes('"paddingBottom"'));
+    expect(bulkBarStyle).toContain('"paddingBottom":46');
+  });
+
+  it('keeps Undo above the window inset after clearing the queue', () => {
+    safeArea.bottom = 139;
+    act(() => publishWindowInsetBottom(34));
+    const { getByTestId } = renderSheet(createRef<QueueSheetHandle>());
+
+    act(() => sheetCallbacks.clearAll?.());
+
+    expect(getByTestId('undo-snackbar').getAttribute('data-bottom')).toBe('46');
   });
 });

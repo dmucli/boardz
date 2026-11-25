@@ -1,0 +1,40 @@
+name: Resolve Public Store Runtimes
+
+# Callers download the `live-store-runtimes` artifact. A job output cannot carry
+# the JSON: the multi-line Play service-account secret registers its bare `{`
+# line as a masked value, and GitHub drops any job output that contains one.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: Production
+    steps:
+      # Never execute train or PR code with store credentials. No install hooks.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+      - name: Resolve exact publicly available store runtimes
+        env:
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          GOOGLE_PLAY_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: node --experimental-strip-types scripts/mobile-live-store-runtimes.ts --out live-store-runtimes.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: live-store-runtimes
+          path: live-store-runtimes.json
+          if-no-files-found: error
+          retention-days: 7

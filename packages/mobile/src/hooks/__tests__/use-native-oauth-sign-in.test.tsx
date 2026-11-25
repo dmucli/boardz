@@ -21,9 +21,7 @@ vi.mock('../../providers/auth-provider', () => ({
 
 const trackMock = vi.fn();
 vi.mock('../../lib/analytics', () => ({ track: (...args: unknown[]) => trackMock(...args) }));
-// Login Succeeded goes through useTrackLoginSucceeded, which waits for the
-// profile before tracking (covered in login-analytics.test.tsx). Here it tracks
-// straight away so every assertion reads one event stream.
+// Native successes belong to AuthProvider; this mock covers browser-only tracking.
 vi.mock('../../lib/login-analytics', () => ({
   useTrackLoginSucceeded: () => (properties: Record<string, unknown>) => trackMock('Login Succeeded', properties),
 }));
@@ -112,7 +110,7 @@ describe('useNativeOAuthSignIn — Google web fallback (iOS)', () => {
       recoverable: undefined,
       mechanism: 'browser_deeplink',
     });
-    expect(events).toContainEqual({
+    expect(events).not.toContainEqual({
       event: 'Login Succeeded',
       flow: 'web_fallback',
       reason: undefined,
@@ -123,8 +121,13 @@ describe('useNativeOAuthSignIn — Google web fallback (iOS)', () => {
     expect(events).toContainEqual({ event: 'Login Failed', flow: 'native', reason: 'exception', recoverable: true });
   });
 
-  it('falls back when native Google returns a non-cancel failure', async () => {
-    signInWithGoogleMock.mockResolvedValue({ success: false, status: 401, error: 'invalid' });
+  it.each([
+    [400, 'invalid_request'],
+    [401, 'invalid_oauth_token'],
+    [409, 'http_error'],
+    [503, 'service_unavailable'],
+  ] as const)('falls back when native Google returns HTTP%s', async (status, reason) => {
+    signInWithGoogleMock.mockResolvedValue({ success: false, status, error: 'invalid' });
     signInWithGoogleWebMock.mockResolvedValue({ success: true });
 
     await runSignIn('google');
@@ -134,7 +137,7 @@ describe('useNativeOAuthSignIn — Google web fallback (iOS)', () => {
     expect(trackedEvents()).toContainEqual({
       event: 'Login Failed',
       flow: 'native',
-      reason: 'invalid_oauth_token',
+      reason,
       recoverable: true,
     });
   });
@@ -208,6 +211,28 @@ describe('useNativeOAuthSignIn — Google web fallback (iOS)', () => {
     // A browser that never opened is a failure, not the user backing out.
     expect(events).not.toContainEqual(expect.objectContaining({ event: 'Login Cancelled', flow: 'web_fallback' }));
   });
+
+  it('tells the climber the server is slow when the web-fallback exchange timed out (#5852)', async () => {
+    signInWithGoogleMock.mockRejectedValue(new Error('Unable to open Safari'));
+    signInWithGoogleWebMock.mockResolvedValue({
+      success: false,
+      status: null,
+      error: 'network',
+      networkCause: 'timeout',
+    });
+
+    const setError = await runSignIn('google');
+
+    expect(setError).toHaveBeenLastCalledWith('nativeStart.slowServerError');
+    expect(trackMock).toHaveBeenCalledWith(
+      'Login Failed',
+      expect.objectContaining({ flow: 'web_fallback', failure_detail: 'network', network_cause: 'timeout' }),
+    );
+    expect(reportErrorMock).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({ extra: expect.objectContaining({ network_cause: 'timeout' }) }),
+    );
+  });
 });
 
 describe('useNativeOAuthSignIn — Expo web redirect', () => {
@@ -238,6 +263,7 @@ describe('useNativeOAuthSignIn — Expo web redirect', () => {
     expect(signInWithGoogleWebMock).not.toHaveBeenCalled();
     expect(trackMock).toHaveBeenCalledWith('Login Attempted', {
       auth_method: 'google',
+      provider: 'google',
       flow: 'web',
     });
     expect(trackMock).not.toHaveBeenCalledWith('Login Succeeded', expect.anything());
@@ -275,6 +301,7 @@ describe('useNativeOAuthSignIn — Expo web redirect', () => {
     expect(consumeFreshOAuthPendingMock).toHaveBeenCalledWith('attempt-apple-1');
     expect(trackMock).toHaveBeenCalledWith('Login Failed', {
       auth_method: 'apple',
+      provider: 'apple',
       flow: 'web',
       failure_reason: 'oauth',
       failure_detail: 'AccessDenied',
@@ -314,7 +341,7 @@ describe('useNativeOAuthSignIn — Apple web fallback (iOS)', () => {
       recoverable: undefined,
       mechanism: 'browser_deeplink',
     });
-    expect(events).toContainEqual({
+    expect(events).not.toContainEqual({
       event: 'Login Succeeded',
       flow: 'web_fallback',
       reason: undefined,
@@ -323,8 +350,8 @@ describe('useNativeOAuthSignIn — Apple web fallback (iOS)', () => {
     });
   });
 
-  it('falls back and signs in when native Apple returns a non-cancel failure', async () => {
-    signInWithAppleMock.mockResolvedValue({ success: false, status: 401, error: 'invalid' });
+  it.each([400, 401, 409, 503])('falls back and signs in when native Apple returns HTTP%s', async (status) => {
+    signInWithAppleMock.mockResolvedValue({ success: false, status, error: 'invalid' });
     signInWithAppleWebMock.mockResolvedValue({ success: true });
 
     const setError = await runSignIn('apple');
@@ -332,7 +359,7 @@ describe('useNativeOAuthSignIn — Apple web fallback (iOS)', () => {
     expect(signInWithAppleWebMock).toHaveBeenCalledTimes(1);
     expect(reportErrorMock).not.toHaveBeenCalled();
     expect(setError).toHaveBeenLastCalledWith(null);
-    expect(trackedEvents()).toContainEqual({
+    expect(trackedEvents()).not.toContainEqual({
       event: 'Login Succeeded',
       flow: 'web_fallback',
       reason: undefined,
@@ -438,7 +465,7 @@ describe('useNativeOAuthSignIn — Android Google config-class fallback (#3100)'
     const events = trackedEvents();
     // The native throw is now recoverable on Android too, so the failure metric excludes it.
     expect(events).toContainEqual({ event: 'Login Failed', flow: 'native', reason: 'exception', recoverable: true });
-    expect(events).toContainEqual({
+    expect(events).not.toContainEqual({
       event: 'Login Succeeded',
       flow: 'web_fallback',
       reason: undefined,
@@ -527,10 +554,10 @@ describe('useNativeOAuthSignIn — Android Google config-class fallback (#3100)'
     });
   });
 
-  it('does not fall back when native Google RETURNS a non-cancel failure (result path stays iOS-only)', async () => {
+  it.each([400, 401, 409, 503])('does not fall back when native Google RETURNS HTTP%s on Android', async (status) => {
     // Config errors are throws, not returns; a returned backend failure on Android
     // isn't a native-SDK dead-end, so the result path keeps surfacing it.
-    signInWithGoogleMock.mockResolvedValue({ success: false, status: 401, error: 'invalid' });
+    signInWithGoogleMock.mockResolvedValue({ success: false, status, error: 'invalid' });
 
     const setError = await runSignIn('google');
 
@@ -569,6 +596,45 @@ describe('useNativeOAuthSignIn — Android Google config-class fallback (#3100)'
   });
 });
 
+describe('useNativeOAuthSignIn — Android backend exchange network failures (#5852)', () => {
+  beforeEach(() => {
+    platform.OS = 'android';
+    trackMock.mockReset();
+    reportErrorMock.mockReset();
+    signInWithGoogleMock.mockReset();
+  });
+
+  it('tells the climber the server is slow when the exchange timed out', async () => {
+    signInWithGoogleMock.mockResolvedValue({ success: false, status: null, error: 'network', networkCause: 'timeout' });
+
+    const setError = await runSignIn('google');
+
+    expect(setError).toHaveBeenLastCalledWith('nativeStart.slowServerError');
+    expect(trackMock).toHaveBeenCalledWith(
+      'Login Failed',
+      expect.objectContaining({ failure_detail: 'network', network_cause: 'timeout' }),
+    );
+    expect(reportErrorMock).toHaveBeenCalledWith(
+      expect.any(Error),
+      expect.objectContaining({ extra: expect.objectContaining({ network_cause: 'timeout' }) }),
+    );
+  });
+
+  it('keeps the connection copy when the request never connected', async () => {
+    signInWithGoogleMock.mockResolvedValue({
+      success: false,
+      status: null,
+      error: 'network',
+      networkCause: 'unreachable',
+    });
+
+    const setError = await runSignIn('google');
+
+    expect(setError).toHaveBeenLastCalledWith('nativeStart.networkError');
+    expect(trackMock).toHaveBeenCalledWith('Login Failed', expect.objectContaining({ network_cause: 'unreachable' }));
+  });
+});
+
 describe('useNativeOAuthSignIn — Login Succeeded names its screen', () => {
   // Login Succeeded fires after a wait for the profile, by which time PostHog's
   // session `$screen_name` has usually moved on, so the screen rides as a prop.
@@ -584,39 +650,45 @@ describe('useNativeOAuthSignIn — Login Succeeded names its screen', () => {
     consumeWebOAuthReturnMock.mockReturnValue(null);
   });
 
-  it('tags a sign-in from the login screen as login', async () => {
+  it('delegates a native login without duplicating provider-owned success', async () => {
     signInWithGoogleMock.mockResolvedValue({ success: true });
 
     await runSignIn('google');
 
-    expect(trackMock).toHaveBeenCalledWith('Login Succeeded', {
+    expect(signInWithGoogleMock).toHaveBeenCalledWith(undefined, false);
+    expect(trackMock).not.toHaveBeenCalledWith('Login Succeeded', {
       auth_method: 'google',
+      provider: 'google',
       flow: 'native',
       screen: 'login',
     });
   });
 
-  it('tags a sign-up from the register screen as register', async () => {
+  it('passes registration intent to the native auth provider', async () => {
     signInWithAppleMock.mockResolvedValue({ success: true });
 
     await runSignIn('apple', vi.fn(), true);
 
-    expect(trackMock).toHaveBeenCalledWith('Login Succeeded', {
+    expect(signInWithAppleMock).toHaveBeenCalledWith(undefined, true);
+    expect(trackMock).not.toHaveBeenCalledWith('Login Succeeded', {
       auth_method: 'apple',
+      provider: 'apple',
       flow: 'native',
       screen: 'register',
       is_registration: true,
     });
   });
 
-  it('keeps the screen when the browser fallback completes the sign-up', async () => {
+  it('passes registration intent to the fallback without duplicating success', async () => {
     signInWithAppleMock.mockRejectedValue(Object.assign(new Error('unknown'), { code: 1000 }));
     signInWithAppleWebMock.mockResolvedValue({ success: true });
 
     await runSignIn('apple', vi.fn(), true);
 
-    expect(trackMock).toHaveBeenCalledWith('Login Succeeded', {
+    expect(signInWithAppleMock).toHaveBeenCalledWith(undefined, true);
+    expect(trackMock).not.toHaveBeenCalledWith('Login Succeeded', {
       auth_method: 'apple',
+      provider: 'apple',
       flow: 'web_fallback',
       fallback_mechanism: 'browser_deeplink',
       screen: 'register',

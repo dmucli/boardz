@@ -46,6 +46,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/postgres-credentials.sh"
 # shellcheck source=scripts/lib/postgres-spatial-capability.sh
 source "$SCRIPT_DIR/lib/postgres-spatial-capability.sh"
+# shellcheck source=scripts/lib/postgres-sync-cutoff.sh
+source "$SCRIPT_DIR/lib/postgres-sync-cutoff.sh"
 
 blocker_count=0
 
@@ -110,7 +112,7 @@ Optional controls:
                                     every PostGIS routine referenced from a
                                     catalog dependency or a routine body -- and
                                     requires the target to provide each one. See
-                                    docs/postgres-18-postgis-rehearsal.md.
+                                    docs/operations/postgres-18-postgis-rehearsal.md.
   MATERIALIZED_VIEWS_REFRESH_PLANNED
                                     Set true only when every reported materialized view
                                     has an explicit post-copy refresh/verification step.
@@ -1830,7 +1832,7 @@ SELECT coalesce(
 # downgrade script. Neither side could be moved to meet the other.
 #
 # What the decision actually needs is narrower: does everything this database
-# does with PostGIS exist on the target build? docs/postgres-18-postgis-rehearsal.md
+# does with PostGIS exist on the target build? docs/operations/postgres-18-postgis-rehearsal.md
 # answered that once by hand, matching 21 of 21 checks including a byte
 # comparison of ST_AsEWKB over every populated geography. This is the standing
 # version of the same question.
@@ -1861,7 +1863,7 @@ while IFS= read -r spatial_capability_row; do
   esac
 done <<<"$source_spatial_capability_manifest"
 if [[ "$postgis_version" != "$EXPECTED_POSTGIS_VERSION" ]]; then
-  printf 'NOTE: source PostGIS is %s and the pinned target artifact is %s. Version equality is deliberately not the gate; the capability manifest above must be satisfied by the target, which is only checked when TARGET_DATABASE_URL is set. Evidence for the 3.7.0dev to 3.6.4 step: docs/postgres-18-postgis-rehearsal.md.\n' \
+  printf 'NOTE: source PostGIS is %s and the pinned target artifact is %s. Version equality is deliberately not the gate; the capability manifest above must be satisfied by the target, which is only checked when TARGET_DATABASE_URL is set. Evidence for the 3.7.0dev to 3.6.4 step: docs/operations/postgres-18-postgis-rehearsal.md.\n' \
     "$postgis_version" "$EXPECTED_POSTGIS_VERSION"
 fi
 
@@ -2153,7 +2155,7 @@ SELECT coalesce(
         [[ -n "$spatial_capability_gap" ]] || continue
         blocker "$(boardsesh_describe_spatial_capability_gap "$spatial_capability_gap")"
       done <<<"$target_spatial_capability_gaps"
-      blocker "source PostGIS $postgis_version uses capabilities the target's $target_postgis_version build does not provide; a version difference is only acceptable while every capability above is satisfied (docs/postgres-18-postgis-rehearsal.md)"
+      blocker "source PostGIS $postgis_version uses capabilities the target's $target_postgis_version build does not provide; a version difference is only acceptable while every capability above is satisfied (docs/operations/postgres-18-postgis-rehearsal.md)"
     else
       printf 'Spatial capability: target PostGIS %s satisfies every capability the source PostGIS %s manifest requires.\n' \
         "$target_postgis_version" "$postgis_version"
@@ -2832,6 +2834,10 @@ WHERE namespace.nspname IN (${included_schemas_sql})
     [[ "$wrongly_owned_schemas" == '0' ]] ||
       blocker "$wrongly_owned_schemas target application schema(s) are not owned by $MIGRATION_OWNER_ROLE"
 
+    sync_cutoff_contract="$(scalar "$TARGET_DATABASE_URL" "$(boardsesh_sync_cutoff_contract_sql "$MIGRATION_RUNTIME_ROLE")")"
+    [[ "$sync_cutoff_contract" == 't' ]] ||
+      blocker "deletion cutoff helper must match its exact body, NOLOGIN stats owner, membership, and runtime-only EXECUTE contract"
+
     wrongly_owned_functions="$(scalar "$TARGET_DATABASE_URL" "
 SELECT count(*)
 FROM pg_catalog.pg_proc AS procedure
@@ -2841,7 +2847,8 @@ WHERE namespace.nspname IN (${included_schemas_sql})
   AND pg_catalog.pg_get_userbyid(procedure.proowner) <> '${MIGRATION_OWNER_ROLE}'
   AND procedure.oid NOT IN (
     coalesce(pg_catalog.to_regprocedure('ops.board_snapshot_cluster_identity()'), 0::pg_catalog.oid),
-    coalesce(pg_catalog.to_regprocedure('ops.acquire_board_snapshot_fence(integer)'), 0::pg_catalog.oid)
+    coalesce(pg_catalog.to_regprocedure('ops.acquire_board_snapshot_fence(integer)'), 0::pg_catalog.oid),
+    coalesce(pg_catalog.to_regprocedure('public.sync_deletions_safe_cutoff(double precision)'), 0::pg_catalog.oid)
   )
   AND NOT EXISTS (
     SELECT 1 FROM pg_catalog.pg_depend AS extension_dependency
@@ -2893,6 +2900,9 @@ WHERE namespace.nspname IN (${included_schemas_sql})
           coalesce(pg_catalog.to_regprocedure('ops.board_snapshot_cluster_identity()'), 0::pg_catalog.oid),
           coalesce(pg_catalog.to_regprocedure('ops.acquire_board_snapshot_fence(integer)'), 0::pg_catalog.oid)
         ) THEN '${MIGRATION_SNAPSHOT_FENCE_OWNER_ROLE}'
+        WHEN procedure.oid = coalesce(
+          pg_catalog.to_regprocedure('public.sync_deletions_safe_cutoff(double precision)'), 0::pg_catalog.oid
+        ) THEN 'boardsesh_sync_cutoff_owner'
         ELSE '${MIGRATION_OWNER_ROLE}'
       END
   )

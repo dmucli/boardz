@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import {
   classifyChangedFiles,
+  createCliGit,
   determineProductionDeployChanges,
   formatGitHubOutputs,
   selectLatestSuccessfulPriorRun,
@@ -19,7 +22,7 @@ function runsPayload(workflowRuns) {
 }
 
 function successfulRun(id, headSha = BASE_SHA) {
-  return { id, status: 'completed', conclusion: 'success', head_sha: headSha };
+  return { id, status: 'completed', conclusion: 'success', head_branch: 'main', head_sha: headSha };
 }
 
 function validGit(changedFiles = []) {
@@ -30,7 +33,50 @@ function validGit(changedFiles = []) {
   };
 }
 
-void test('selects the first successful prior run from GitHub newest-first results', () => {
+void test('moving app code into the backend rebuilds both app targets', (context) => {
+  const repoRoot = mkdtempSync(join(tmpdir(), 'boardsesh-production-deploy-changes-'));
+  context.after(() => rmSync(repoRoot, { recursive: true, force: true }));
+  const git = (args) =>
+    execFileSync(
+      'git',
+      [
+        '-c',
+        'core.hooksPath=/dev/null',
+        '-c',
+        'commit.gpgSign=false',
+        '-c',
+        'user.name=Boardsesh tests',
+        '-c',
+        'user.email=tests@boardsesh.invalid',
+        ...args,
+      ],
+      { cwd: repoRoot, encoding: 'utf8' },
+    ).trim();
+  const sourcePath = 'packages/mobile/src/session.ts';
+  const destinationPath = 'packages/backend/src/session.ts';
+
+  git(['init', '--quiet']);
+  git(['config', 'diff.renames', 'true']);
+  mkdirSync(dirname(join(repoRoot, sourcePath)), { recursive: true });
+  writeFileSync(join(repoRoot, sourcePath), 'export const sessionLabel = "Ready to climb";\n');
+  git(['add', '.']);
+  git(['commit', '--quiet', '-m', 'Add app session module']);
+  const baseSha = git(['rev-parse', 'HEAD']);
+  mkdirSync(dirname(join(repoRoot, destinationPath)), { recursive: true });
+  git(['mv', sourcePath, destinationPath]);
+  git(['commit', '--quiet', '-m', 'Move session module into backend']);
+  const headSha = git(['rev-parse', 'HEAD']);
+
+  // This is a real rename; name-only without --no-renames loses the app path.
+  assert.equal(git(['diff', '--name-only', baseSha, headSha]), destinationPath);
+  const changedPaths = createCliGit({ cwd: repoRoot }).changedFiles(baseSha, headSha);
+  assert.deepEqual(new Set(changedPaths), new Set([sourcePath, destinationPath]));
+  const targets = classifyChangedFiles(changedPaths);
+  assert.equal(targets.app, true);
+  assert.equal(targets.ota, true);
+});
+
+void test('selects the newest successful prior run and skips unfinished ones', () => {
   const selected = selectLatestSuccessfulPriorRun(
     runsPayload([
       { id: 30, conclusion: null, head_sha: HEAD_SHA },
@@ -68,8 +114,54 @@ void test('ignores incomplete runs and malformed head SHAs from the Actions resp
   assert.equal(selected?.head_sha, BASE_SHA);
 });
 
+void test('selects the highest successful run id when GitHub lists an old run first', () => {
+  // Runs 41618818054 and 41650355602 (2026-11-03) were handed months-old
+  // successes ahead of the newer ones and deployed against a June baseline.
+  const selected = selectLatestSuccessfulPriorRun(
+    runsPayload([
+      successfulRun(27_346_151_418, '5555555555555555555555555555555555555555'),
+      successfulRun(41_637_508_448),
+      successfulRun(36_239_433_703, '6666666666666666666666666666666666666666'),
+    ]),
+    { currentRunId: '41650355602' },
+  );
+
+  assert.equal(selected?.id, 41_637_508_448);
+  assert.equal(selected?.head_sha, BASE_SHA);
+});
+
+void test('ignores successful runs from branches other than main', () => {
+  const selected = selectLatestSuccessfulPriorRun(
+    runsPayload([{ ...successfulRun(50, HEAD_SHA), head_branch: 'fix/manual-dispatch' }, successfulRun(49)]),
+  );
+
+  assert.equal(selected?.id, 49);
+});
+
+void test('ignores runs whose id is not a positive integer', () => {
+  const selected = selectLatestSuccessfulPriorRun(
+    runsPayload([{ ...successfulRun(60), id: '61' }, { ...successfulRun(60), id: Number.NaN }, successfulRun(59)]),
+  );
+
+  assert.equal(selected?.id, 59);
+});
+
+void test('the workflow reads the plain run listing, not the search-backed filters', () => {
+  const workflow = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../.github/workflows/production-deploy.yml'),
+    'utf8',
+  );
+  const listing = workflow.match(/actions\/workflows\/production-deploy\.yml\/runs\?[^"]*/)?.[0] ?? '';
+
+  assert.equal(listing, 'actions/workflows/production-deploy.yml/runs?per_page=100');
+});
+
 void test('classifies changed paths with the production workflow semantics', () => {
+  assert.equal(classifyChangedFiles(['scripts/mobile-ota-unreleased-native.ts']).ota, true);
   assert.equal(classifyChangedFiles(['packages/mobile/src/data/changelog.generated.json']).ota, false);
+  assert.equal(classifyChangedFiles(['packages/mobile/src/data/changelog.generated.json']).backend, false);
+  // The Expo web export bundles What's New, so app.boardsesh.com still picks it up.
+  assert.equal(classifyChangedFiles(['packages/mobile/src/data/changelog.generated.json']).app, true);
   assert.deepEqual(classifyChangedFiles(['docs/deployments.md']), {
     web: false,
     backend: false,
@@ -138,6 +230,49 @@ void test('the deploy watchdog never queues a deploy of its own', () => {
   }
 });
 
+void test('app and OTA builds skip backend changes with only shared tests or QA recordings', () => {
+  const targets = classifyChangedFiles([
+    'packages/backend/src/graphql/resolvers/queue.ts',
+    'packages/db/src/schema/app/queue.ts',
+    'packages/shared/queue/src/__tests__/reducer.test.ts',
+    'packages/mobile/.maestro/queue.yaml',
+    'packages/mobile/screenshot-fixtures/GetBoard/recording.json',
+    'packages/mobile/docs/session.md',
+  ]);
+
+  assert.equal(targets.backend, true);
+  assert.equal(targets.web, true);
+  assert.equal(targets.app, false);
+  assert.equal(targets.ota, false);
+});
+
+void test('browser-only app changes export the browser app without staging an OTA', () => {
+  for (const filePath of [
+    'packages/mobile/src/components/climb-row.web.tsx',
+    'packages/mobile/src/web-shims/bottom-sheet.tsx',
+    'packages/mobile/web-runtime/pnpm-lock.yaml',
+    'packages/mobile/public/index.html',
+  ]) {
+    const targets = classifyChangedFiles([filePath]);
+    assert.equal(targets.app, true, filePath);
+    assert.equal(targets.ota, false, filePath);
+  }
+});
+
+void test('shared schemas and dependency files still stage both app targets', () => {
+  for (const filePath of [
+    'packages/shared-schema/src/generated/types.ts',
+    'packages/shared/graphql/src/generated/graphql.ts',
+    'pnpm-lock.yaml',
+    'packages/web/public/images/kilter/product_sizes_layouts_sets/36-1.webp',
+    'scripts/lib/app-build-inputs.mjs',
+  ]) {
+    const targets = classifyChangedFiles([filePath]);
+    assert.equal(targets.app, true, filePath);
+    assert.equal(targets.ota, true, filePath);
+  }
+});
+
 void test('a watchdog file alongside real code still deploys the real code', () => {
   // The skip is per-file, not per-changeset: a commit touching both must still
   // deploy what it changed, or the exclusion would swallow a real release.
@@ -178,7 +313,7 @@ void test('keeps production deploy unit tests CI-only', () => {
   for (const filePath of [
     'scripts/__tests__/docker-build-release-stamp.test.ts',
     // Reads production-deploy.yml as text to pin the verify-serial-plan wiring
-    // (#5352); runs in CI's deploy-config job and ships nothing.
+    // (#5352); runs in CI's deploy-config guard step and ships nothing.
     'scripts/__tests__/production-deploy-serial-plan.test.ts',
     'scripts/production-backend-smoke.test.mjs',
     'scripts/production-deploy-changes.test.mjs',
@@ -190,6 +325,7 @@ void test('keeps production deploy unit tests CI-only', () => {
     'scripts/railway-deployment-status.test.mjs',
     'scripts/production-smoke.test.ts',
     'scripts/mobile-ota-promote.test.ts',
+    'scripts/mobile-ota-unreleased-native.test.ts',
     'scripts/mobile-ota-schema-ready.test.mjs',
     'scripts/mobile-ota-stage-verify.test.ts',
   ]) {
@@ -200,6 +336,58 @@ void test('keeps production deploy unit tests CI-only', () => {
       ota: false,
       cloudflare: false,
       staticAssets: false,
+    });
+  }
+});
+
+for (const filePath of [
+  'scripts/__tests__/production-deploy-web-targets.test.ts',
+  'scripts/__tests__/static-asset-deploy-origin.test.ts',
+  'scripts/__tests__/future-deploy-contract.test.ts',
+]) {
+  void test(`keeps ${filePath} CI-only without an exact-path exception`, () => {
+    assert.deepEqual(classifyChangedFiles([filePath]), {
+      web: false,
+      backend: false,
+      app: false,
+      ota: false,
+      cloudflare: false,
+      staticAssets: false,
+    });
+  });
+}
+
+void test('limits the script test exclusion to direct test filenames', () => {
+  for (const filePath of [
+    'scripts/__tests__/runtime.ts',
+    'scripts/__tests__/fixture.test.ts.json',
+    'scripts/__tests__/nested/fixture.test.ts',
+    'nested/scripts/__tests__/fixture.test.ts',
+    'scripts/lib/deploy-runtime.ts',
+    'packages/web/app/page.tsx',
+  ]) {
+    assert.equal(classifyChangedFiles([filePath]).web, true, `${filePath} must remain web-affecting`);
+  }
+});
+
+void test('script tests alongside runtime code still deploy the runtime targets', () => {
+  for (const runtimePath of ['packages/backend/src/index.ts', 'packages/mobile/app/index.tsx']) {
+    assert.deepEqual(
+      classifyChangedFiles(['scripts/__tests__/future-deploy-contract.test.ts', runtimePath]),
+      classifyChangedFiles([runtimePath]),
+    );
+  }
+});
+
+void test('script tests alongside deploy controls still affect every target', () => {
+  for (const controlPath of ['.github/workflows/production-deploy.yml', 'scripts/production-deploy-changes.mjs']) {
+    assert.deepEqual(classifyChangedFiles(['scripts/__tests__/future-deploy-contract.test.ts', controlPath]), {
+      web: true,
+      backend: true,
+      app: true,
+      ota: true,
+      cloudflare: true,
+      staticAssets: true,
     });
   }
 });
@@ -240,6 +428,30 @@ void test('treats every input of the app.boardsesh.com export as app-affecting',
     cloudflare: false,
     staticAssets: false,
   });
+});
+
+void test('uses the shared app classifier for catalogue, WASM and hosting inputs', () => {
+  for (const filePath of [
+    'packages/web/public/images/kilter/product_sizes_layouts_sets/36-1.webp',
+    'packages/board-constants/src/generated/boards.ts',
+    'packages/board-renderer/wasm/src/lib.rs',
+    'deploy/app-subdomain/robots.txt',
+    'scripts/lib/expo-web-inputs.mjs',
+    'scripts/lib/expo-web-preview-controller.cjs',
+    '.github/workflows/expo-web-preview.yml',
+  ]) {
+    assert.equal(classifyChangedFiles([filePath]).app, true, filePath);
+  }
+
+  for (const filePath of [
+    'packages/web/public/images/kilter/product_sizes_layouts_sets/36-1.png',
+    'packages/mobile/README.md',
+    'packages/shared/queue/src/__tests__/reducer.test.ts',
+    'packages/shared-schema/src/schema.spec.ts',
+    'deploy/app-subdomain/__tests__/headers.test.ts',
+  ]) {
+    assert.equal(classifyChangedFiles([filePath]).app, false, filePath);
+  }
 });
 
 void test('publishes cataloged static images but excludes retained board PNG sources', () => {
@@ -409,7 +621,7 @@ void test('keeps every backend build and runtime control path backend-affecting'
   }
 });
 
-void test('manual dispatch builds every target without consulting history or git', () => {
+void test('manual dispatch builds every target when history is unavailable', () => {
   const result = determineProductionDeployChanges({
     eventName: 'workflow_dispatch',
     headSha: '',
@@ -428,6 +640,28 @@ void test('manual dispatch builds every target without consulting history or git
     { web: true, backend: true, app: true, cloudflare: true, fullBuild: true },
   );
   assert.equal(result.reason, 'workflow_dispatch');
+});
+
+void test('manual recovery retains its validated deployment range while building every target', () => {
+  const result = determineProductionDeployChanges({
+    eventName: 'workflow_dispatch',
+    headSha: HEAD_SHA,
+    currentRunId: '30',
+    runsPayload: runsPayload([successfulRun(29)]),
+    git: {
+      ...validGit(),
+      changedFiles() {
+        assert.fail('a manual full build does not need a path diff');
+      },
+    },
+  });
+  assert.equal(result.deploymentBaseSha, BASE_SHA);
+  assert.equal(result.fullBuild, true);
+  assert.equal(result.reason, 'workflow_dispatch');
+  assert.deepEqual(
+    [result.web, result.backend, result.app, result.ota, result.cloudflare, result.staticAssets],
+    [true, true, true, true, true, true],
+  );
 });
 
 void test('missing or malformed Actions history falls back to a full build', () => {
@@ -569,4 +803,17 @@ void test('deploys both web and Cloudflare when the shared crawler policy change
   const targets = classifyChangedFiles(['packages/web/app/lib/crawler-policy.ts']);
   assert.equal(targets.web, true);
   assert.equal(targets.cloudflare, true);
+});
+
+void test('the OTA ownership switch converges the tunnel DNS without rebuilding apps', () => {
+  for (const filePath of ['infra/ota/hosting.json', 'infra/ota/server.ts']) {
+    assert.deepEqual(classifyChangedFiles([filePath]), {
+      web: false,
+      backend: false,
+      app: false,
+      ota: false,
+      cloudflare: true,
+      staticAssets: false,
+    });
+  }
 });

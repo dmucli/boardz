@@ -1,10 +1,11 @@
+import { BoardSheetView } from './BoardSheetView';
 // Board sheet — "now on the wall" (the board-presence primary surface).
 //
 // A native BottomSheetModal (`@expo/ui/community/bottom-sheet`) sibling of
 // QueueSheet, presented/dismissed through the shared sheet coordinator
 // (`useManagedSheet`) so it never overlaps another sheet's transition. The wall's
-// now-on-the-wall hero, VIRTUALIZED history list, stat tiles, pull-to-refresh and
-// the "Switch board" footer all live in `NowOnTheWallPanel` (variant="sheet"),
+// now-on-the-wall hero, VIRTUALIZED history list, stat tiles and pull-to-refresh
+// all live in `NowOnTheWallPanel` (variant="sheet"),
 // which this sheet renders as its body. Keeping the body in a shared panel lets
 // the iPad shell render the same content inline as a standalone column
 // (variant="column").
@@ -27,19 +28,19 @@
 // so the inline iPad column never double-fires it.
 
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react';
-import { Platform, StyleSheet } from 'react-native';
-import { BottomSheetModal } from '@expo/ui/community/bottom-sheet';
+
+import { BottomSheetModal } from '../sheet-presentation';
 import { useManagedSheet, type DismissAndWaitResult } from '../../providers/sheet-presentation-provider';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { useBoardPresenceCurrent, useBoardPresenceFeed } from '@boardsesh/board-presence-react';
-import { useTheme } from '../../providers/theme-provider';
-import { useEffectiveSurfaceMode } from '../../hooks/use-effective-surface-mode';
-import type { BoardConfig } from '../../providers/drawer-host-provider';
+
+import type { BoardConfig, ClimbActionsTarget } from '../../providers/drawer-host-provider';
 import { useBoardPresenceControls } from '../../providers/board-presence-provider';
 import { track } from '../../lib/analytics';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import { NowOnTheWallPanel } from './NowOnTheWallPanel';
 import type { BoardSheetClimbAction, NowOnTheWallPanelHandle } from './NowOnTheWallPanel';
+import type { SprayDetailRowKey } from '../board-discovery/spray-detail-rows';
 
 export type { BoardSheetClimbAction } from './NowOnTheWallPanel';
 
@@ -65,24 +66,29 @@ type BoardSheetProps = {
    * interfering with `present()`, so the sheet never appeared.
    */
   boardConfig: BoardConfig | null;
+  getClimbMirror?: (climbUuid: string) => boolean | undefined;
   /** Request an animated close (header chevron) — the host calls `dismiss()`. */
   onClose: () => void;
   /** Optional: fired AFTER the dismiss animation has actually settled. */
   onDismissed?: () => void;
-  /** Open the existing board switcher from the footer control. */
+  /** Shared panel callback; only the inline column renders the switch footer. */
   onSwitchBoard: () => void;
   /** The board the climber is on — names the gym whose other boards we list. */
   activeBoard?: UserBoard | null;
+  onOpenSprayMaintenance?: (wallUuid: string, action: SprayDetailRowKey) => void;
+  onShareSprayWall?: (wallUuid: string) => void;
+  /** The signed-in climber's id. A spray wall's reset rows are its owner's alone. */
+  viewerUserId?: string | null;
   /** Hop to another board at the same gym, without closing the sheet. */
   onSelectGymWall?: (board: UserBoard) => void;
   /** Activate/open a climb from the wall feed. BoardSheet closes itself after this. */
   onClimbPress?: (action: BoardSheetClimbAction) => void;
-  /** Swipe action: append this wall-feed climb to the queue. */
-  onAddToQueue?: (action: BoardSheetClimbAction) => void;
+  /** Swipe action: play this wall-feed climb next. */
+  onPlayNext?: (action: BoardSheetClimbAction) => void;
   /** Swipe action: open the add-to-playlist sheet for this climb. */
   onOpenPlaylist?: (action: BoardSheetClimbAction) => void;
-  /** Long press action: open the existing climb actions sheet. */
-  onOpenActions?: (action: BoardSheetClimbAction) => void;
+  /** Resolve the row's native climb menu without running an action. */
+  onOpenActions?: (action: BoardSheetClimbAction) => ClimbActionsTarget | null | undefined;
 };
 
 export const BoardSheet = forwardRef<BoardSheetHandle, BoardSheetProps>(function BoardSheet(
@@ -93,15 +99,18 @@ export const BoardSheet = forwardRef<BoardSheetHandle, BoardSheetProps>(function
     onDismissed,
     onSwitchBoard,
     activeBoard,
+    onOpenSprayMaintenance,
+    onShareSprayWall,
+    viewerUserId,
     onSelectGymWall,
     onClimbPress,
-    onAddToQueue,
+    getClimbMirror,
+    onPlayNext,
     onOpenPlaylist,
     onOpenActions,
   },
   ref,
 ) {
-  const { sheet, sheetSurface } = useTheme();
   const sheetRef = useRef<BottomSheetModal>(null);
   const panelRef = useRef<NowOnTheWallPanelHandle>(null);
 
@@ -145,8 +154,6 @@ export const BoardSheet = forwardRef<BoardSheetHandle, BoardSheetProps>(function
       itemCount: visibleHistory.length,
     });
   }, [isPresented, visibleHistory.length]);
-
-  const snapPoints = useMemo(() => ['55%', '92%'], []);
   // Let the native sheet draw its own material wherever it can.
   //
   // This used to pass the colour unconditionally, which was meant to darken the
@@ -155,16 +162,8 @@ export const BoardSheet = forwardRef<BoardSheetHandle, BoardSheetProps>(function
   // colour it reaches for is the Android fallback palette, so an iPhone got a
   // flat #181225 panel where iOS 26 should be drawing Liquid Glass.
   //
-  // Keyed on the surface mode rather than the platform or the variant, per
-  // theme/variants/README: 'glass' and 'blur' hand the background back to
-  // SwiftUI, while 'material' keeps Android's intended solid and 'solid' keeps
-  // it for Reduce Transparency and for Android forced onto the glass variant.
-  const surfaceMode = useEffectiveSurfaceMode();
-  const backgroundStyle = useMemo(
-    () => (surfaceMode === 'glass' || surfaceMode === 'blur' ? undefined : { backgroundColor: sheetSurface }),
-    [surfaceMode, sheetSurface],
-  );
-
+  // iOS shares the same background rule as every other sheet. Elsewhere,
+  // preserve this panel's existing opaque Material/Reduce Transparency surface.
   const invalidatePanelActions = useCallback(() => {
     panelRef.current?.invalidatePendingActions();
   }, []);
@@ -223,24 +222,9 @@ export const BoardSheet = forwardRef<BoardSheetHandle, BoardSheetProps>(function
     },
     [managedOnChange],
   );
-  const sheetDismissProps = useMemo(() => ({ onFullyDismissed: managed.onFullyDismissed }), [managed.onFullyDismissed]);
 
   return (
-    <BottomSheetModal
-      ref={sheetRef}
-      index={0}
-      snapPoints={snapPoints}
-      // Height is driven by explicit snapPoints, so disable dynamic content
-      // sizing — it doesn't play well with a BottomSheetFlatList (no bounded
-      // content height to measure).
-      enableDynamicSizing={false}
-      enablePanDownToClose
-      onChange={handleSheetChange}
-      {...sheetDismissProps}
-      handleIndicatorStyle={sheet.handleStyle}
-      backgroundStyle={backgroundStyle}
-      style={styles.sheet}
-    >
+    <BoardSheetView ref={sheetRef} onChange={handleSheetChange} onFullyDismissed={managed.onFullyDismissed}>
       {isPresented ? (
         <NowOnTheWallPanel
           ref={panelRef}
@@ -251,29 +235,17 @@ export const BoardSheet = forwardRef<BoardSheetHandle, BoardSheetProps>(function
           dismissAndWait={dismissAndWait}
           onSwitchBoard={onSwitchBoard}
           activeBoard={activeBoard}
+          onOpenSprayMaintenance={onOpenSprayMaintenance}
+          onShareSprayWall={onShareSprayWall}
+          viewerUserId={viewerUserId}
           onSelectGymWall={onSelectGymWall}
           onClimbPress={onClimbPress}
-          onAddToQueue={onAddToQueue}
+          getClimbMirror={getClimbMirror}
+          onPlayNext={onPlayNext}
           onOpenPlaylist={onOpenPlaylist}
           onOpenActions={onOpenActions}
         />
       ) : null}
-    </BottomSheetModal>
+    </BoardSheetView>
   );
-});
-
-const styles = StyleSheet.create({
-  sheet: {
-    ...Platform.select({
-      ios: {
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: -4 },
-        shadowOpacity: 0.1,
-        shadowRadius: 12,
-      },
-      android: {
-        elevation: 16,
-      },
-    }),
-  },
 });

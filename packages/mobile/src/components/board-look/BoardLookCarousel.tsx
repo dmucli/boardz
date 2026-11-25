@@ -9,6 +9,7 @@ import { useBoardRenderSettings } from '../../lib/board-render-settings';
 import { ensureBoardseshSupportProbed } from '../../hooks/use-native-climb-render';
 import {
   buildBoardLookPreviewSettings,
+  type BoardLookPreviewSettingsMemo,
   type BoardLookOption,
   type BoardLookOptionId,
 } from '../../lib/board-render/board-look-options';
@@ -40,6 +41,8 @@ type BoardLookCarouselProps = {
   heroThumb?: { width: number; height: number } | null;
   /** Window width. Only needed alongside `heroThumb`, to centre the rail. */
   windowWidth?: number;
+  /** Keep compact fallback cards centred too, on a wizard preview surface. */
+  centered?: boolean;
   /**
    * Let a flick choose the card it lands on.
    *
@@ -82,6 +85,7 @@ export function BoardLookCarousel({
   onCardSeen,
   heroThumb,
   windowWidth,
+  centered = false,
   selectOnSnap,
   showDescriptions = true,
   contentStyle,
@@ -113,8 +117,15 @@ export function BoardLookCarousel({
 
   // Memoized because these identities become `renderSettingsOverride` on a
   // memoized image: a fresh map per render would re-fire every card's overlay
-  // effect on every tick.
-  const previewSettingsById = useMemo(() => buildBoardLookPreviewSettings(options, settings), [options, settings]);
+  // effect on every tick. The last answer is handed back in, so an `options`
+  // array that swaps one option (a dim drag on the selected card) keeps every
+  // other card's override, and only that one card re-draws.
+  const previewSettingsMemoRef = useRef<BoardLookPreviewSettingsMemo | null>(null);
+  const previewSettingsById = useMemo(() => {
+    const next = buildBoardLookPreviewSettings(options, settings, previewSettingsMemoRef.current);
+    previewSettingsMemoRef.current = { options, live: settings, settings: next };
+    return next;
+  }, [options, settings]);
 
   const layout = useMemo<BoardLookCardLayout>(() => {
     const aspect = preview.boardWidth / preview.boardHeight;
@@ -230,13 +241,13 @@ export function BoardLookCarousel({
         // answers — a recycled row is not re-rendered just because `renderItem`
         // changed identity.
         extraData={extraData}
-        align={heroThumb ? 'center' : 'start'}
+        align={heroThumb || centered ? 'center' : 'start'}
         windowWidth={windowWidth}
         initialScrollIndex={selectedIndex}
         // Tapping a neighbour that is only peeking in makes it the chosen look;
         // bringing it to the centre is what keeps "the card you are looking at"
         // and "the look the button will apply" the same card.
-        activeIndex={heroThumb ? selectedIndex : undefined}
+        activeIndex={heroThumb || centered ? selectedIndex : undefined}
         // One offscreen card at hero size. Each live card holds a multi-megabyte
         // bitmap, and this screen fires on a cold first launch right after a sync.
         drawDistance={heroThumb ? layout.thumbWidth : undefined}

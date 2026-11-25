@@ -40,6 +40,11 @@ export type SubscriptionWireEnvelope<TWireItem> =
         currentClimbQueueItem: TWireItem | null;
         stateHash?: string | null;
         stateHashOrdered?: string | null;
+        /** F3: selected only by the `_NOW_SLOT` subscription document. */
+        historyCount?: number | null;
+        /** F3: when the room's current climb last changed (ISO 8601). Read by the #4979 hold. */
+        currentChangedAt?: string | null;
+        currentChangedBy?: string | null;
       };
       sequence?: number | null;
       stateHash?: string | null;
@@ -80,6 +85,7 @@ export type SubscriptionWireEnvelope<TWireItem> =
       item?: TWireItem | null;
       clientId?: string | null;
       correlationId?: string | null;
+      currentChangedBy?: string | null;
       sequence?: number | null;
       stateHash?: string | null;
       stateHashOrdered?: string | null;
@@ -146,6 +152,9 @@ function liftEnvelopeToSyncEvent<TWireItem>(
           queue: envelope.state.queue.map(lift),
           currentClimbQueueItem:
             envelope.state.currentClimbQueueItem === null ? null : lift(envelope.state.currentClimbQueueItem),
+          historyCount: envelope.state.historyCount ?? null,
+          currentChangedAt: envelope.state.currentChangedAt ?? null,
+          currentChangedBy: envelope.state.currentChangedBy ?? null,
         },
       };
     case 'QueueItemAdded': {
@@ -172,6 +181,7 @@ function liftEnvelopeToSyncEvent<TWireItem>(
         item: wireItem == null ? null : lift(wireItem),
         clientId: envelope.clientId ?? null,
         correlationId: envelope.correlationId ?? null,
+        currentChangedBy: envelope.currentChangedBy ?? null,
       };
     }
     case 'ClimbMirrored':

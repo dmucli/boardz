@@ -36,14 +36,72 @@ beforeEach(() => {
   fetchFacetCounts
     .mockReset()
     .mockResolvedValue({ ok: true, counts: { all: 10, kilter: 4, moonboard: 5, tension: 1 } });
-  getServerTranslation.mockResolvedValue({
-    t: (key: string, options?: Record<string, unknown>) => tFromCatalog('gyms', key, options),
+  // The page reads `gyms` for itself and `marketing` for the store button
+  // wording, so the mock resolves against whichever catalog was asked for.
+  getServerTranslation.mockImplementation(async (namespace: string = 'gyms') => ({
+    t: (key: string, options?: Record<string, unknown>) => tFromCatalog(namespace, key, options),
     i18n: {},
     locale: 'en-US',
+  }));
+});
+
+describe('store button (#6027)', () => {
+  // The directory had no store link: 32 visitors in the 8 days measured, 0
+  // store clicks. One button per page, with the directory's own link id.
+  const storeButtons = (serialised: string) => serialised.match(/"placement":"gyms-directory"/g)?.length ?? 0;
+
+  it('is on /gyms and on every board page', async () => {
+    for (const facet of ['all', 'kilter', 'moonboard', 'tension'] as const) {
+      const serialised = JSON.stringify(await renderGymDirectory(facet, { searchParams: Promise.resolve({}) }));
+
+      expect(storeButtons(serialised), facet).toBe(1);
+    }
+  });
+
+  it("says what the app is for, in the store's own button wording", async () => {
+    const serialised = JSON.stringify(await renderGymDirectory('all', props));
+
+    expect(serialised).toContain('Get the app');
+    expect(serialised).toContain("Light up your gym's boards from your phone and log every send.");
+    // The badges' own words, which are their images' alt text.
+    expect(serialised).toContain('"ios":"Download on the App Store"');
+    expect(serialised).toContain('"android":"Get it on Google Play"');
+  });
+
+  it('stays on an empty result page, where the search failed but the app still works', async () => {
+    fetchDirectoryPage.mockResolvedValue({ ok: true, gyms: [], totalCount: 0 });
+
+    expect(storeButtons(JSON.stringify(await renderGymDirectory('kilter', props)))).toBe(1);
+  });
+
+  it('is left off the outage page, which has one job', async () => {
+    fetchDirectoryPage.mockResolvedValue({ ok: false });
+
+    expect(storeButtons(JSON.stringify(await renderGymDirectory('all', props)))).toBe(0);
+  });
+});
+
+describe('claim search entry', () => {
+  it('passes the claim query to input focus and keeps the active facet', async () => {
+    const tree = JSON.stringify(
+      await renderGymDirectory('kilter', { searchParams: Promise.resolve({ claim: '1', q: 'Nine' }) }),
+    );
+    expect(tree).toContain('"focusSearch":true');
+    // One anchor for every claim prompt: the search card, which clears the fixed header.
+    expect(tree).toContain('/gyms/kilter?q=Nine&claim=1#gym-directory-search');
+    expect(tree).not.toContain('#gym-directory-query');
   });
 });
 
 describe('reachability', () => {
+  it('offers gym creation in every directory header and empty state', async () => {
+    for (const facet of ['all', 'kilter', 'moonboard', 'tension'] as const) {
+      const markup = JSON.stringify(await renderGymDirectory(facet, props));
+      expect(markup.match(/"href":"\/gyms\/new"/g)?.length).toBe(2);
+      expect(markup).toContain('Create gym');
+    }
+  });
+
   it('renders /gyms for anyone who asks, with no flag in the way', async () => {
     const element = await renderGymDirectory('all', props);
 
@@ -181,11 +239,5 @@ describe('the closing claim prompt', () => {
     fetchDirectoryPage.mockResolvedValue({ ok: true, gyms: [], totalCount: 0 });
 
     expect(claimPrompts(JSON.stringify(await renderGymDirectory('all', props)))).toBe(0);
-  });
-
-  it('points at the search box it scrolls back to', async () => {
-    fetchDirectoryPage.mockResolvedValue({ ok: true, gyms: [listedGym], totalCount: 1 });
-
-    expect(JSON.stringify(await renderGymDirectory('all', props))).toContain('"id":"gym-directory-search"');
   });
 });

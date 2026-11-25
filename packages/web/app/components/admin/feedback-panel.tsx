@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
@@ -46,6 +46,7 @@ import type {
   AppFeedbackStatusCounts,
   AppFeedbackTypeFilter,
 } from '@boardsesh/shared-schema';
+import FeedbackConversation from './feedback-conversation';
 
 const PAGE_SIZE = 50;
 const COLUMN_COUNT = 8;
@@ -130,6 +131,13 @@ export default function FeedbackPanel() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [searchInput, setSearchInput] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
+  const [reporterInput, setReporterInput] = useState('');
+  const [reporterId, setReporterId] = useState('');
+  const [needsReply, setNeedsReply] = useState(false);
+  const [conversation, setConversation] = useState<AppFeedbackReport | null>(null);
+  const requestSequence = useRef(0);
+  const currentToken = useRef(token);
+  currentToken.current = token;
 
   const [reports, setReports] = useState<AppFeedbackReport[]>([]);
   const [counts, setCounts] = useState<AppFeedbackStatusCounts>(EMPTY_COUNTS);
@@ -147,9 +155,15 @@ export default function FeedbackPanel() {
     return () => clearTimeout(handle);
   }, [searchInput]);
 
+  useEffect(() => {
+    const handle = setTimeout(() => setReporterId(reporterInput.trim()), 300);
+    return () => clearTimeout(handle);
+  }, [reporterInput]);
+
   const fetchReports = useCallback(
     async (offset = 0) => {
       if (!token) return;
+      const sequence = ++requestSequence.current;
       setLoading(true);
       setErrorOffset(null);
       try {
@@ -161,29 +175,38 @@ export default function FeedbackPanel() {
               type,
               status: statusFilter === 'all' ? null : statusFilter,
               search: debouncedSearch || null,
+              reporterId: reporterId || null,
+              needsReply: needsReply || null,
               limit: PAGE_SIZE,
               offset,
             },
           },
         );
+        if (sequence !== requestSequence.current || currentToken.current !== token) return;
         const data = result.adminAppFeedback;
         setReports((prev) => (offset === 0 ? data.reports : [...prev, ...data.reports]));
         setHasMore(data.hasMore);
         setTotalCount(data.totalCount);
         setCounts(data.statusCounts);
       } catch (err) {
+        if (sequence !== requestSequence.current || currentToken.current !== token) return;
         console.error('[FeedbackPanel] Failed to fetch feedback:', err);
         setErrorOffset(offset);
       } finally {
-        setLoading(false);
+        if (sequence === requestSequence.current && currentToken.current === token) setLoading(false);
       }
     },
-    [token, type, statusFilter, debouncedSearch],
+    [token, type, statusFilter, debouncedSearch, reporterId, needsReply],
   );
 
   useEffect(() => {
     void fetchReports(0);
+    const refresh = () => void fetchReports(0);
+    window.addEventListener('focus', refresh);
+    return () => window.removeEventListener('focus', refresh);
   }, [fetchReports]);
+
+  const closeConversation = useCallback(() => setConversation(null), []);
 
   const changeStatus = useCallback(
     async (report: AppFeedbackReport, next: AppFeedbackStatus) => {
@@ -278,6 +301,19 @@ export default function FeedbackPanel() {
           );
         })}
         <Box sx={{ flexGrow: 1 }} />
+        <Chip
+          label={t('feedback.filters.needsReply')}
+          variant={needsReply ? 'filled' : 'outlined'}
+          color={needsReply ? 'primary' : 'default'}
+          onClick={() => setNeedsReply((current) => !current)}
+        />
+        <TextField
+          size="small"
+          label={t('feedback.filters.reporter')}
+          value={reporterInput}
+          onChange={(event) => setReporterInput(event.target.value)}
+        />
+        {reporterInput && <Button onClick={() => setReporterInput('')}>{t('feedback.filters.clearReporter')}</Button>}
         <TextField
           size="small"
           placeholder={t('feedback.search.placeholder')}
@@ -379,6 +415,14 @@ export default function FeedbackPanel() {
                           )}
                         </IconButton>
                       </Box>
+                      {report.needsReply && (
+                        <Chip size="small" color="primary" label={t('feedback.filters.needsReply')} />
+                      )}
+                      {report.lastMessagePreview && (
+                        <Typography variant="caption" color="text.secondary" sx={{ overflowWrap: 'anywhere' }}>
+                          {t('feedback.conversation.latestReply')}: {report.lastMessagePreview}
+                        </Typography>
+                      )}
                     </TableCell>
                     <TableCell sx={{ maxWidth: 200 }}>
                       {report.reporter?.email ? (
@@ -409,6 +453,11 @@ export default function FeedbackPanel() {
                         <Typography variant="body2" sx={{ color: 'var(--neutral-400)' }}>
                           {t('feedback.reporter.anonymous')}
                         </Typography>
+                      )}
+                      {report.reporter?.userId && (
+                        <Button size="small" onClick={() => setReporterInput(report.reporter?.userId ?? '')}>
+                          {t('feedback.reporter.showReports')}
+                        </Button>
                       )}
                     </TableCell>
                     <TableCell>
@@ -444,6 +493,11 @@ export default function FeedbackPanel() {
                     </TableCell>
                     <TableCell align="right">
                       <Stack direction="row" spacing={1} justifyContent="flex-end" alignItems="center">
+                        {isBug && (
+                          <Button size="small" onClick={() => setConversation(report)}>
+                            {t('feedback.conversation.open')}
+                          </Button>
+                        )}
                         <Select
                           size="small"
                           value={report.status}
@@ -499,6 +553,37 @@ export default function FeedbackPanel() {
                           <DetailRow label={t('feedback.detail.session')} value={report.context?.sessionName} />
                           <DetailRow label={t('feedback.detail.url')} value={report.context?.url} />
                           <DetailRow label={t('feedback.detail.userAgent')} value={report.context?.userAgent} />
+                          {report.releaseContext && (
+                            <>
+                              <DetailRow
+                                label={t('feedback.detail.releaseChannel')}
+                                value={report.releaseContext.channel}
+                              />
+                              <DetailRow
+                                label={t('feedback.detail.releaseBranch')}
+                                value={report.releaseContext.branch}
+                              />
+                              <DetailRow label={t('feedback.detail.updateId')} value={report.releaseContext.updateId} />
+                              <DetailRow
+                                label={t('feedback.detail.runtimeVersion')}
+                                value={report.releaseContext.runtimeVersion}
+                              />
+                              <DetailRow
+                                label={t('feedback.detail.automaticCanary')}
+                                value={
+                                  report.releaseContext.automaticCanary === true
+                                    ? t('feedback.detail.canaryYes')
+                                    : report.releaseContext.automaticCanary === false
+                                      ? t('feedback.detail.canaryNo')
+                                      : t('feedback.detail.canaryUnknown')
+                                }
+                              />
+                              <DetailRow
+                                label={t('feedback.detail.canaryCheckedAt')}
+                                value={report.releaseContext.canaryCheckedAt}
+                              />
+                            </>
+                          )}
                           {report.screenshotUrls.length > 0 && (
                             <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
                               <Typography
@@ -582,6 +667,14 @@ export default function FeedbackPanel() {
       </Box>
 
       <Snackbar open={!!snackbar} autoHideDuration={3000} onClose={() => setSnackbar('')} message={snackbar} />
+      {conversation && token && (
+        <FeedbackConversation
+          key={`${token}:${conversation.id}`}
+          report={conversation}
+          token={token}
+          onClose={closeConversation}
+        />
+      )}
     </Box>
   );
 }

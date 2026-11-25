@@ -12,12 +12,49 @@ import type { ExpoConfig, ConfigContext } from 'expo/config';
  * scripts/mobile-locales-parity.test.ts enforces that, and that each code has a
  * matching locales/<code>.json translating the same keys.
  */
-export const APP_LOCALIZATIONS = ['en', 'de', 'es', 'fr'] as const;
+export const APP_LOCALIZATIONS = ['en', 'de', 'es', 'fr', 'it', 'zh-Hans'] as const;
 
 /** Where the InfoPlist strings for a declared localization live, relative to this config. */
 export function localeStringsPath(language: string): string {
   return `./locales/${language}.json`;
 }
+
+// One Android App Link prefix per board name, so a shared climb or list link
+// (https://www.boardsesh.com/{board}/{layout}/{size}/{sets}/{angle}/view/{climb})
+// opens the app. The trailing slash keeps a prefix to whole path segments:
+// '/spray/' must not claim '/spray-walls'. Never collapse these into a catch-all
+// '/': that pulled /api/auth/callback/google out of Chrome Custom Tabs and broke
+// Google sign-in (#1797).
+//
+// Hardcoded rather than imported from SUPPORTED_BOARDS: this file is evaluated
+// by Expo's config loader, EAS and the fingerprint tooling, which do not all
+// resolve TypeScript-source workspace packages, and today it imports nothing
+// outside node builtins. scripts/mobile-ci-env-parity.test.ts fails when the two
+// lists differ, so a tenth board cannot ship without its prefix.
+export const ANDROID_BOARD_LINK_PREFIXES = [
+  '/kilter/',
+  '/tension/',
+  '/moonboard/',
+  '/decoy/',
+  '/touchstone/',
+  '/grasshopper/',
+  '/soill/',
+  '/woods/',
+  '/spray/',
+] as const;
+
+// The web app keeps a non-default locale in the path, so a climber on the
+// Spanish site copies https://www.boardsesh.com/es/kilter/.../view/{climb}.
+// app/+not-found.tsx already strips that segment and retries, which is how iOS
+// opens these links; Android has to claim each one by name. Board links only:
+// the retry drops the query string, and an unlisted wall's /b/ link needs its
+// ?wall= to open. Hardcoded for the same reason as the board list above, and
+// held to SUPPORTED_LOCALES minus the default by the same parity test.
+export const ANDROID_LINK_LOCALE_SEGMENTS = ['es', 'fr', 'de', 'it', 'zh-CN'] as const;
+
+export const ANDROID_LOCALISED_BOARD_LINK_PREFIXES: readonly string[] = ANDROID_LINK_LOCALE_SEGMENTS.flatMap((locale) =>
+  ANDROID_BOARD_LINK_PREFIXES.map((boardPrefix) => `/${locale}${boardPrefix}`),
+);
 
 type WebPlatformResolution = {
   platforms: NonNullable<ExpoConfig['platforms']>;
@@ -105,23 +142,17 @@ const CODE_SIGNING_CERT_PATH = './certs/certificate.pem';
 // Resolves the expo-observe ingest endpoint, read by the SDK from
 // `extra.eas.observe.endpointUrl`.
 //
-// Derived from EXPO_UPDATES_URL rather than hardcoded, so the telemetry and the
-// manifest can never point at different servers: one env var moves both. Gated
-// on the same two conditions as the self-hosted updates path below — an
-// EAS-hosted build has no server of ours to report to, and neither does a build
-// with no server URL. Those builds simply collect nothing.
+// A configured updates origin also hosts diagnostics. Every other build uses
+// Boardsesh's own collector, including EAS-hosted updates. Always bake this in:
+// the native SDK can dispatch before JS and otherwise falls back to Expo ingest.
 //
 // The path is `/observe/{APP_ID}`; xprem's ingest router mounts
 // `/observe/{APP_ID}/{PROJECT_ID}/v1/{logs,metrics}` and ignores PROJECT_ID
 // (internal/router/routes_ingest.go), which the SDK appends.
 //
 // Exported for unit tests, like resolveUpdatesConfig.
-export function resolveObserveEndpoint(otaAppId: string): string | undefined {
-  if (process.env.EAS_BUILD) return undefined;
-
-  const selfHostUrl = process.env.EXPO_UPDATES_URL;
-  if (!selfHostUrl) return undefined;
-
+export function resolveObserveEndpoint(otaAppId: string): string {
+  const selfHostUrl = process.env.EXPO_UPDATES_URL || 'https://updates.boardsesh.com';
   return `${new URL(selfHostUrl).origin}/observe/${otaAppId}`;
 }
 
@@ -290,10 +321,12 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
   // Deliberately scoped to Android identity + icons: `scheme`, ios.bundleIdentifier,
   // and the iOS entitlement/App-Group block stay on the production values (changing
   // the scheme breaks OAuth deep-link redirects; the iOS entitlements are irrelevant
-  // to an Android-only build). See docs/android-sideload-build.md.
+  // to an Android-only build). See docs/operations/android-sideload-build.md.
   const isDevVariant = process.env.BOARDSESH_APP_VARIANT === 'dev';
   const appName = isDevVariant ? 'Boardsesh Dev' : 'Boardsesh';
   const androidPackage = isDevVariant ? 'com.boardsesh.app.dev' : 'com.boardsesh.app';
+  // EAS file environment variable for this Android package's Firebase config.
+  const googleServicesFile = process.env.GOOGLE_SERVICES_JSON?.trim();
   const iconPath = isDevVariant ? './dev-assets/icon.png' : './assets/icon.png';
   const adaptiveIconPath = isDevVariant ? './dev-assets/adaptive-icon.png' : './assets/adaptive-icon.png';
   const splashIconPath = isDevVariant ? './dev-assets/splash-icon.png' : './assets/splash-icon.png';
@@ -306,8 +339,7 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
     ? [['@react-native-google-signin/google-signin', { iosUrlScheme: googleIosUrlScheme }]]
     : [];
 
-  // Telemetry ingest for expo-observe. Undefined on EAS-hosted and
-  // no-server builds, which is what keeps them from reporting anywhere.
+  // First-party diagnostics ingest is embedded for every native build.
   const observeEndpointUrl = resolveObserveEndpoint(OTA_APP_ID);
 
   return {
@@ -315,11 +347,15 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
     name: appName,
     slug: 'boardsesh',
     owner: 'boardsesh',
-    version: '2.5.0',
+    version: '2.8.0',
     scheme: 'com.boardsesh.app',
     orientation: 'portrait',
     icon: iconPath,
     userInterfaceStyle: 'automatic',
+    // Android `colorPrimary` (Expo's default is #023c69). The brand tint,
+    // brandColors.tint in @boardsesh/velvet-tokens; ./plugins/with-brand-accent-color
+    // sets the matching accent on both platforms.
+    primaryColor: '#5B22F2',
     newArchEnabled: true,
     // PILOT (draft — measure before merge): React Compiler auto-memoization.
     // SDK 57's babel-preset-expo enables babel-plugin-react-compiler when Expo
@@ -359,8 +395,8 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
     // plugin turns them into res/values-b+<lang>/strings.xml, so InfoPlist keys
     // would land as junk Android string resources.
     //
-    // This is also what makes the App Store product page list German, Spanish
-    // and French under "Languages" — Apple reads the localizations shipped in
+    // This is also what makes the App Store product page list German, Spanish,
+    // French and Italian under "Languages" — Apple reads the localizations shipped in
     // the binary, not the storefront listings, so a de-DE listing alone would
     // still show "English" there.
     locales: Object.fromEntries(APP_LOCALIZATIONS.map((language) => [language, localeStringsPath(language)])),
@@ -387,7 +423,7 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
           // Linux), which matches the binary's embedded Linux value for a JS-only
           // commit, and on a native change resolves the NEW fingerprint so old
           // binaries are correctly excluded. Override unset => identical to before, so
-          // the gate's canonical fingerprint is unchanged. See docs/mobile-ota-updates.md.
+          // the gate's canonical fingerprint is unchanged. See docs/operations/mobile-ota-updates.md.
           runtimeVersion: process.env.EXPO_UPDATES_FINGERPRINT_OVERRIDE?.trim()
             ? process.env.EXPO_UPDATES_FINGERPRINT_OVERRIDE.trim()
             : { policy: 'fingerprint' as const },
@@ -429,10 +465,13 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
       infoPlist: {
         ITSAppUsesNonExemptEncryption: false,
         CFBundleLocalizations: [...APP_LOCALIZATIONS],
-        // iPad rotates freely — landscape is the primary canvas for the sidebar +
-        // panes — while iPhone stays portrait-locked via the top-level
-        // `orientation: 'portrait'`. This `~ipad` key overrides the base
-        // UISupportedInterfaceOrientations for iPad only.
+        // Ordinary iPhone screens stay portrait through the navigation stack;
+        // fullscreen T-nut calibration can rotate. iPad remains freely rotatable.
+        UISupportedInterfaceOrientations: [
+          'UIInterfaceOrientationPortrait',
+          'UIInterfaceOrientationLandscapeLeft',
+          'UIInterfaceOrientationLandscapeRight',
+        ],
         'UISupportedInterfaceOrientations~ipad': [
           'UIInterfaceOrientationPortrait',
           'UIInterfaceOrientationPortraitUpsideDown',
@@ -445,10 +484,12 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
           'Boardsesh uses Bluetooth to connect to your Kilter Board, Tension Board, or MoonBoard and light up climbing holds. No personal data is sent over Bluetooth.',
         NSBluetoothPeripheralUsageDescription:
           'Boardsesh uses Bluetooth to connect to your climbing board and control the LED holds.',
+        NSLocalNetworkUsageDescription:
+          'Boardsesh connects to the LED controller on your network to light up the holds on your Spraywall.',
         NSLocationWhenInUseUsageDescription:
-          'Boardsesh uses your location to find nearby boards to climb on and to discover nearby climbing sessions in Party Mode.',
+          'Boardsesh uses your location to show boards and gyms near you, and to put a board you add on the map.',
         NSLocationAlwaysAndWhenInUseUsageDescription:
-          'Boardsesh uses your location to find nearby boards to climb on and to discover nearby climbing sessions in Party Mode.',
+          'Boardsesh uses your location to show boards and gyms near you, and to put a board you add on the map.',
         NSSupportsLiveActivities: true,
         // bluetooth-central: continuous BLE reconnect + write-during-background.
         // remote-notification: lets the backend's 90s APNs heartbeat update
@@ -463,10 +504,21 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
     },
     android: {
       package: androidPackage,
+      ...(googleServicesFile ? { googleServicesFile } : {}),
       playStoreUrl: ANDROID_PLAY_STORE_URL,
-      // App Links for the multiplayer join flow and retired OTA preview links:
+      // App Links for board shares, the multiplayer join flow and retired OTA preview links:
+      // https://www.boardsesh.com/b/{slug}/{angle}/list (including ?wall= for unlisted walls),
       // https://www.boardsesh.com/join/{sessionId} and
-      // https://www.boardsesh.com/preview/pr-N (plus the apex domain).
+      // https://www.boardsesh.com/preview/pr-N, plus every classic board link
+      // (https://www.boardsesh.com/{board}/.../{angle}/list and .../view/{climb})
+      // through ANDROID_BOARD_LINK_PREFIXES, and the same links under /es, /fr
+      // and /de. A board path the app has no route for falls through
+      // +not-found to Home.
+      // www only, never the apex: boardsesh.com answers assetlinks.json with a
+      // 301 to www, which Google's verifier rejects, and on Android 11 and older
+      // one unverified host fails verification for every host in the app. No
+      // share builder emits an apex link. iOS keeps applinks:boardsesh.com
+      // because Apple's CDN follows that redirect.
       // The preview ingress remains for old shared links; +native-intent maps it
       // to What's New, where xprem's marker is the only branch picker.
       // autoVerify lets Android open the link directly in the app once the
@@ -480,19 +532,21 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
           autoVerify: true,
           data: [
             { scheme: 'https', host: 'www.boardsesh.com', pathPrefix: '/join' },
-            { scheme: 'https', host: 'boardsesh.com', pathPrefix: '/join' },
+            { scheme: 'https', host: 'www.boardsesh.com', pathPrefix: '/w/' },
             { scheme: 'https', host: 'www.boardsesh.com', pathPrefix: '/preview' },
-            { scheme: 'https', host: 'boardsesh.com', pathPrefix: '/preview' },
+            { scheme: 'https', host: 'www.boardsesh.com', pathPrefix: '/b/' },
+            ...[...ANDROID_BOARD_LINK_PREFIXES, ...ANDROID_LOCALISED_BOARD_LINK_PREFIXES].map((pathPrefix) => ({
+              scheme: 'https',
+              host: 'www.boardsesh.com',
+              pathPrefix,
+            })),
           ],
           category: ['BROWSABLE', 'DEFAULT'],
         },
         {
           action: 'VIEW',
           autoVerify: true,
-          data: [
-            { scheme: 'https', host: 'www.boardsesh.com', pathPrefix: '/auth/reset-password' },
-            { scheme: 'https', host: 'boardsesh.com', pathPrefix: '/auth/reset-password' },
-          ],
+          data: [{ scheme: 'https', host: 'www.boardsesh.com', pathPrefix: '/auth/reset-password' }],
           category: ['BROWSABLE', 'DEFAULT'],
         },
       ],
@@ -524,6 +578,12 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
         'FOREGROUND_SERVICE',
         'FOREGROUND_SERVICE_CONNECTED_DEVICE',
         'POST_NOTIFICATIONS',
+        // Photographing a spray wall (epic #5346, SW-09). expo-image-picker's
+        // plugin already adds CAMERA when `cameraPermission` is set below, but
+        // that string is also what turns the iOS prompt on, so the Android name
+        // is listed here too: the two knobs are independent and a future edit to
+        // one should not silently drop the other.
+        'CAMERA',
       ],
       // BLUETOOTH_SCAN needs `android:usesPermissionFlags="neverForLocation"` on
       // Android 12+ or the OS silently drops every scan result for a caller
@@ -574,7 +634,7 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
         'expo-location',
         {
           locationWhenInUsePermission:
-            'Boardsesh uses your location to find nearby boards to climb on and to discover nearby climbing sessions in Party Mode.',
+            'Boardsesh uses your location to show boards and gyms near you, and to put a board you add on the map.',
         },
       ],
       // Board search map. Location permissions are already handled by
@@ -613,15 +673,26 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
       ],
       'expo-updates',
       'expo-web-browser',
-      // Photo-library access for picking a profile avatar (Edit Profile screen).
-      // Library-only — the editor doesn't open the camera, so we don't request
-      // NSCameraUsageDescription. Adds NSPhotoLibraryUsageDescription on iOS and
-      // the READ_MEDIA_IMAGES permission on Android; native change, ships on the
-      // next build (not OTA).
+      // Photo-library access for picking a profile avatar (Edit Profile screen),
+      // a spray wall photo and a feedback screenshot, plus camera access for
+      // photographing a spray wall (epic #5346, SW-09).
+      // Adds NSPhotoLibraryUsageDescription + NSCameraUsageDescription on iOS. On
+      // Android (expo-image-picker 57.0.14) the config plugin adds only RECORD_AUDIO;
+      // CAMERA and READ/WRITE_EXTERNAL_STORAGE (maxSdkVersion 32) come from the
+      // library's own AndroidManifest.xml through manifest merge, and there is no
+      // READ_MEDIA_IMAGES. Native change, ships on the next build (not OTA).
+      // The camera permission landed ahead of the UI that opens it, so that JS slice
+      // could ship by OTA into a fleet whose binary already declares it.
+      //
+      // These are the base/en strings. The localized prompts come from
+      // locales/<lang>.json (the `locales` map above), kept in step by
+      // scripts/mobile-locales-parity.test.ts.
       [
         'expo-image-picker',
         {
-          photosPermission: 'Boardsesh uses your photo library so you can pick a profile picture.',
+          photosPermission:
+            'Boardsesh uses your photo library so you can pick a profile picture, a photo of your wall, or a screenshot to send with feedback.',
+          cameraPermission: 'Boardsesh uses your camera so you can photograph a wall and set climbs on it.',
         },
       ],
       'react-native-ble-plx',
@@ -631,6 +702,24 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
         'expo-notifications',
         {
           color: '#8C4A52',
+        },
+      ],
+      // The rest timer's cue sounds (#5395, src/lib/sounds.ts). Foreground only:
+      // both background switches are off, so no `audio` UIBackgroundMode and no
+      // Android media-playback foreground service (their defaults would add both).
+      // Nothing here records. `microphonePermission` is deliberately left unset:
+      // NSMicrophoneUsageDescription is already in the binary (expo-image-picker
+      // adds it), expo-audio links the recording APIs that App Store processing
+      // checks for it (ITMS-90683), and `false` would delete it whenever this
+      // plugin's Info.plist mod runs after expo-image-picker's. Unset, it keeps
+      // the existing string. Android gains MODIFY_AUDIO_SETTINGS, a normal
+      // permission with no prompt. Native change, ships on the next build (not OTA).
+      [
+        'expo-audio',
+        {
+          recordAudioAndroid: false,
+          enableBackgroundPlayback: false,
+          enableBackgroundRecording: false,
         },
       ],
       // Makes Boardsesh a share target so a beta video link shared from
@@ -692,6 +781,9 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
       // service instead of always resolving FEATURE_NOT_SUPPORTED. EAS-safe pure
       // manifest addition.
       './plugins/with-android-install-referrer-queries',
+      // Lets release builds reach a WLED controller, which serves plain HTTP on
+      // the climber's own network. Boardsesh's own hosts stay HTTPS-only.
+      './plugins/with-android-lan-http',
       // Adds the <service android:foregroundServiceType="connectedDevice"> + the
       // notification-action <receiver> for the background BLE session (the
       // Android counterpart to the iOS Live Activity). EAS-safe manifest-only mod.
@@ -699,15 +791,31 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
       // Caps Gradle heap + parallel workers so the heavy native build (CMake ×4
       // ABIs + Kotlin + JS bundle + R8) doesn't OOM-kill the daemon. EAS-safe.
       './plugins/with-android-gradle-memory',
-      // Pins the generated Android wrapper below Gradle 9 until React Native's
-      // included Foojay toolchain resolver plugin is compatible with Gradle 9.
-      './plugins/with-android-gradle-wrapper-version',
+      // Turns R8 on for the `release` build type (minify + obfuscate + optimize)
+      // and injects the keep rules the reflective call sites need. Google Play's
+      // App optimisation report scored us at Obfuscation 1% (threshold 25%)
+      // because the Expo template defaults minifyEnabled off and nothing set the
+      // property. The plugin THROWS if a future SDK renames that property, so
+      // this can never silently revert to shipping unobfuscated. EAS-safe, and
+      // registered unconditionally: an EAS preview that differs from production
+      // in minification is exactly what hides an R8 bug until it's in the store.
+      './plugins/with-android-minify',
+      // Bakes the io.sentry.proguard-uuid the release workflow mints into the
+      // manifest, so Sentry can match the R8 mapping that workflow uploads and
+      // deobfuscate Java/Kotlin frames. No-op when the env var is unset (local
+      // prebuild, PR builds); never moves the fingerprint (env isn't hashed).
+      './plugins/with-android-sentry-proguard-uuid',
       // Register this before @bacons/apple-targets so Expo's mod chain runs it
       // after the widget target has been created, while keeping the provider last.
       './plugins/with-boardsesh-widget-build-settings',
       // Boardsesh is iPhone-only. Keep App Store Connect from validating the
       // generated app target as a "Designed for iPhone/iPad" macOS binary.
       './plugins/with-ios-app-store-build-settings',
+      // HIG Color: the brand tint for what the OS draws (alerts, context menus,
+      // share sheets, pickers). iOS gets an AccentColor asset named as the app's
+      // global accent; Android gets colorAccent (light + night) in the app
+      // theme. Without it those fall back to system blue and AppCompat teal.
+      './plugins/with-brand-accent-color',
       // Adds the BoardseshWidgets Xcode target on every `expo prebuild`. The
       // widget bundle hosts the Live Activity UI (lock screen + Dynamic
       // Island) plus the Next/Previous AppIntents. Target sources live in
@@ -735,6 +843,9 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
       // entitlement-merge ordering concern like the share-intent dedup above —
       // it sets its own distinct keys.
       './plugins/with-healthkit',
+      // #5293 (BOARDSESH-8S): RN 0.88 removed the Scheduler invalidation flag.
+      // Compile the source patch that preserves its enabled lifetime guard.
+      './plugins/with-react-native-source-builds',
       // AppCheckCore (pulled in by Google Sign-In) is a Swift pod that depends
       // on GoogleUtilities and RecaptchaInterop, which don't define modules by
       // default. Without this fix CocoaPods refuses to link them as static
@@ -746,6 +857,18 @@ export default ({ config, projectRoot }: ConfigContext): ExpoConfig & { newArchE
       // The auth token is supplied via the SENTRY_AUTH_TOKEN env var in CI
       // (never committed); url defaults to https://sentry.io/ (US region).
       ['@sentry/react-native/expo', { organization: 'boardsesh', project: 'boardsesh' }],
+      // Configure public native callbacks in our generated app startup code.
+      // JS leaves native initialization alone so it cannot replace them.
+      [
+        './plugins/with-sentry-native-privacy',
+        {
+          dsn: process.env.EXPO_PUBLIC_SENTRY_DSN,
+          // Preview is a JS-only OTA tag. Reading its variable here would change
+          // the fingerprint and prevent preview bundles reaching store binaries.
+          // The supported scope bridge updates native events after JS starts.
+          environment: 'production',
+        },
+      ],
     ],
     extra: {
       ...config.extra,

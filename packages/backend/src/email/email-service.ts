@@ -1,22 +1,25 @@
-import nodemailer, { type Transporter } from 'nodemailer';
+import nodemailer, { type SendMailOptions, type Transporter } from 'nodemailer';
+import { createConnection, type Socket } from 'node:net';
 import { z } from 'zod';
 import { logger } from '../utils/logger';
+import { backendPublicUrl, webPublicUrl } from '../utils/public-urls';
 
 // Validate recipient format before it ever goes into a URL or header.
-const emailSchema = z.string().email();
+const emailSchema = z
+  .string()
+  .email()
+  .refine(
+    (address) => !address.toLowerCase().split('@')[1]?.replace(/\.$/, '').endsWith('.invalid'),
+    'Recipient is unavailable.',
+  );
 
 // Where claim-review notifications go. Override with ADMIN_EMAIL.
 export const ADMIN_NOTIFICATION_EMAIL = process.env.ADMIN_EMAIL || 'admin@boardsesh.com';
 
-/** Public backend origin (no trailing slash) — used to build the verify link. */
-export function backendPublicUrl(): string {
-  return (process.env.BACKEND_PUBLIC_URL || 'https://ws.boardsesh.com').replace(/\/+$/, '');
-}
-
-/** Public web origin (no trailing slash) — used for admin/success links. */
-export function webPublicUrl(): string {
-  return (process.env.WEB_PUBLIC_URL || process.env.BOARDSESH_URL || 'https://www.boardsesh.com').replace(/\/+$/, '');
-}
+// The origins now live in `utils/public-urls`, with no dependencies of their
+// own, so a payments or handler module can reach them without importing the
+// mail transport. Re-exported here for the callers that already had them.
+export { backendPublicUrl, webPublicUrl } from '../utils/public-urls';
 
 // Muted rose primary + neutrals, matching the web transactional emails closely
 // enough without pulling in the web theme package.
@@ -33,24 +36,96 @@ const FONT_FAMILY = "'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Rob
 // Lazy transporter so importing this module never touches SMTP.
 let transporter: Transporter | null = null;
 
+function smtpOptions() {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) {
+    throw new Error('SMTP credentials not configured. Set SMTP_USER and SMTP_PASSWORD environment variables.');
+  }
+  const port = parseInt(process.env.SMTP_PORT || '465', 10);
+  // `secure: true` means TLS-on-connect (port 465). Port 587 uses STARTTLS and
+  // must be `secure: false`, or the connection hangs. Derive it from the port,
+  // with an explicit SMTP_SECURE override for non-standard setups.
+  const secure = process.env.SMTP_SECURE ? process.env.SMTP_SECURE === 'true' : port === 465;
+  return {
+    host: process.env.SMTP_HOST || 'smtp.fastmail.com',
+    port,
+    secure,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+  };
+}
+
 function getTransporter(): Transporter {
   if (!transporter) {
-    if (!process.env.SMTP_USER || !process.env.SMTP_PASSWORD) {
-      throw new Error('SMTP credentials not configured. Set SMTP_USER and SMTP_PASSWORD environment variables.');
-    }
-    const port = parseInt(process.env.SMTP_PORT || '465', 10);
-    // `secure: true` means TLS-on-connect (port 465). Port 587 uses STARTTLS and
-    // must be `secure: false`, or the connection hangs. Derive it from the port,
-    // with an explicit SMTP_SECURE override for non-standard setups.
-    const secure = process.env.SMTP_SECURE ? process.env.SMTP_SECURE === 'true' : port === 465;
-    transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || 'smtp.fastmail.com',
-      port,
-      secure,
-      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
-    });
+    transporter = nodemailer.createTransport(smtpOptions());
   }
   return transporter;
+}
+
+/** A separate, cancellable transport: CNC maintenance never changes other mail's defaults. */
+export async function sendBoundedCncNotification(mail: SendMailOptions): Promise<void> {
+  const options = smtpOptions();
+  const sockets = new Set<Socket>();
+  let closed = false;
+  const notificationTransport = nodemailer.createTransport({
+    ...options,
+    connectionTimeout: 5_000,
+    greetingTimeout: 5_000,
+    socketTimeout: 10_000,
+    // Retain the raw socket so the total deadline cancels a slow-drip SMTP
+    // conversation too. Nodemailer still performs normal TLS/STARTTLS and
+    // certificate validation around this plain connected socket.
+    getSocket(_options: unknown, callback: (error: Error | null, result?: { connection: Socket }) => void) {
+      if (closed) {
+        callback(new Error('CNC_NOTIFICATION_TIMEOUT'));
+        return;
+      }
+      const socket = createConnection({ host: options.host, port: options.port });
+      sockets.add(socket);
+      let returned = false;
+      const finish = (error: Error | null, result?: { connection: Socket }) => {
+        if (returned) return;
+        returned = true;
+        callback(error, result);
+      };
+      const connectionDeadline = setTimeout(() => {
+        const error = new Error('CNC_NOTIFICATION_CONNECTION_TIMEOUT');
+        socket.destroy(error);
+        finish(error);
+      }, 5_000);
+      connectionDeadline.unref();
+      socket.once('connect', () => {
+        clearTimeout(connectionDeadline);
+        if (closed) {
+          socket.destroy();
+          finish(new Error('CNC_NOTIFICATION_TIMEOUT'));
+        } else finish(null, { connection: socket });
+      });
+      socket.once('error', (error) => finish(error));
+      socket.once('close', () => {
+        clearTimeout(connectionDeadline);
+        sockets.delete(socket);
+        if (!returned) finish(new Error('CNC_NOTIFICATION_TIMEOUT'));
+      });
+    },
+  });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      notificationTransport.sendMail(mail),
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(() => {
+          closed = true;
+          reject(new Error('CNC_NOTIFICATION_TIMEOUT'));
+          for (const socket of sockets) socket.destroy();
+        }, 20_000);
+        deadline.unref();
+      }),
+    ]);
+  } finally {
+    closed = true;
+    clearTimeout(deadline);
+    for (const socket of sockets) socket.destroy();
+    notificationTransport.close();
+  }
 }
 
 function escapeHtml(text: string): string {
@@ -90,6 +165,22 @@ function shell(heading: string, body: string): string {
     </div>
   `;
 }
+
+// Shared with the other transactional-email modules (see `cnc-emails.ts`) so
+// every Boardsesh email uses one shell, one button and one escaping story
+// rather than each module growing its own near-identical copy. Exported as a
+// block at the end of the private helpers so the definitions above stay
+// unannotated and it is obvious in one place what leaves this module.
+export {
+  colors as emailColors,
+  emailSchema as deliverableEmailSchema,
+  escapeHtml,
+  headerSafe,
+  fromAddress,
+  getTransporter,
+  button,
+  shell,
+};
 
 /**
  * Send the domain-verification email for a gym claim. Clicking the link proves
@@ -186,6 +277,84 @@ export async function sendGymClaimAdminNotification(details: {
     `,
     ),
     text: `${details.claimantName} wants to claim ${details.gymName}.${backlogLine ? `\n\n${backlogLine}` : ''}${details.message ? `\n\nMessage: ${details.message}` : ''}\n\nReview: ${reviewUrl}\n\nGym UUID: ${details.gymUuid}`,
+  });
+}
+
+/** One line in a section of the admin daily digest. */
+export type AdminDigestRow = {
+  /** What the row is about, e.g. "Set up wrong: Crux Kilter at Crux". Plain text. */
+  label: string;
+  /** Where to act on it. Built by the caller from a static path; used raw in the href. */
+  url: string;
+};
+
+/**
+ * One section of the admin daily digest. The reports sweep adds "Reports in
+ * the admin queue" and "Setups climbers changed"; the claim guardrails add
+ * "Claims that approved themselves".
+ * `rows` holds at most the first {@link ADMIN_DIGEST_MAX_ROWS}; `total` is the
+ * full count, and `moreUrl` is where the rest are.
+ */
+export type AdminDigestSection = {
+  key: string;
+  heading: string;
+  total: number;
+  rows: AdminDigestRow[];
+  moreUrl: string;
+  moreLabel: string;
+};
+
+/** Rows listed per digest section; the rest are behind the section's link. */
+export const ADMIN_DIGEST_MAX_ROWS = 20;
+
+/**
+ * The once-a-day email to the Boardsesh team: what reached the admin queue
+ * since the last one, every claim that approved itself, with a link to
+ * revert it, and every setup a climber's suggestion changed, with a link to
+ * undo it. The caller skips the email when
+ * every section is empty (docs/product/directory-reports.md, "Daily digest").
+ */
+export async function sendAdminDailyDigestEmail(details: {
+  /** The UTC day the digest is for, YYYY-MM-DD. */
+  date: string;
+  sections: readonly AdminDigestSection[];
+}): Promise<void> {
+  const sections = details.sections.filter((section) => section.total > 0);
+  const summary = sections.map((section) => `${section.total} ${section.heading.toLowerCase()}`).join(', ');
+  const htmlSections = sections
+    .map((section) => {
+      const rows = section.rows
+        .slice(0, ADMIN_DIGEST_MAX_ROWS)
+        .map(
+          (row) =>
+            `<li style="margin-bottom: 6px;"><a href="${row.url}" style="color: ${colors.primary};">${escapeHtml(row.label)}</a></li>`,
+        )
+        .join('');
+      const more = section.total - Math.min(section.rows.length, ADMIN_DIGEST_MAX_ROWS);
+      return `
+      <h2 style="color: ${colors.textPrimary}; font-size: 18px; margin: 24px 0 8px;">${escapeHtml(section.heading)} (${section.total})</h2>
+      <ul style="color: ${colors.textPrimary}; font-size: 15px; line-height: 1.5; padding-left: 20px;">${rows}</ul>
+      ${more > 0 ? `<p style="color: ${colors.textSecondary}; font-size: 14px;">And ${more} more.</p>` : ''}
+      ${button(section.moreUrl, section.moreLabel)}
+    `;
+    })
+    .join('<hr style="border: none; border-top: 1px solid ' + colors.border + '; margin: 24px 0;" />');
+  const textSections = sections
+    .map((section) => {
+      const rows = section.rows
+        .slice(0, ADMIN_DIGEST_MAX_ROWS)
+        .map((row) => `- ${row.label}: ${row.url}`)
+        .join('\n');
+      return `${section.heading} (${section.total})\n${rows}\n${section.moreLabel}: ${section.moreUrl}`;
+    })
+    .join('\n\n');
+
+  await getTransporter().sendMail({
+    from: fromAddress(),
+    to: ADMIN_NOTIFICATION_EMAIL,
+    subject: headerSafe(`Boardsesh daily digest ${details.date}: ${summary}`),
+    html: shell('Daily digest', htmlSections),
+    text: `Boardsesh daily digest for ${details.date}\n\n${textSections}`,
   });
 }
 
@@ -288,6 +457,71 @@ export async function sendGymClaimDeniedEmail(email: string, gymName: string): P
     });
   } catch (error) {
     logger.warn('[GymClaim] Failed to send denial email:', error instanceof Error ? error.message : error);
+  }
+}
+
+/**
+ * Tell a claimant their admin-review claim expired: nobody decided it within
+ * 30 days (docs/product/gym-claims.md). Sent by the hourly sweep once the
+ * expiry commits. Best-effort.
+ */
+export async function sendGymClaimExpiredEmail(email: string, gymName: string): Promise<void> {
+  try {
+    const validatedEmail = emailSchema.parse(email);
+    const safeGym = escapeHtml(gymName);
+    await getTransporter().sendMail({
+      from: fromAddress(),
+      to: validatedEmail,
+      subject: headerSafe(`Your claim for ${gymName} expired`),
+      html: shell(
+        'Your claim expired',
+        `
+        <p style="color: ${colors.textPrimary}; font-size: 16px; line-height: 1.5;">
+          We didn't get to your claim for <strong>${safeGym}</strong> within 30 days, so it has expired
+          and the listing stays where it is. Sorry about the wait.
+        </p>
+        <p style="color: ${colors.textSecondary}; font-size: 15px; line-height: 1.5;">
+          If you run this gym, claim it again from its page, or reply to this email with something that
+          shows you manage it — a work email address, your role, anything on the gym's own site.
+        </p>
+      `,
+      ),
+      text: `We didn't get to your claim for ${gymName} within 30 days, so it has expired and the listing stays where it is. If you run this gym, claim it again from its page, or reply with something that shows you manage it.`,
+    });
+  } catch (error) {
+    logger.warn('[GymClaim] Failed to send expiry email:', error instanceof Error ? error.message : error);
+  }
+}
+
+/**
+ * Tell a claimant the Boardsesh team took their approved claim back
+ * (`revertGymClaim`). Best-effort; sent once the revert commits.
+ */
+export async function sendGymClaimRevokedEmail(email: string, gymName: string): Promise<void> {
+  try {
+    const validatedEmail = emailSchema.parse(email);
+    const safeGym = escapeHtml(gymName);
+    await getTransporter().sendMail({
+      from: fromAddress(),
+      to: validatedEmail,
+      subject: headerSafe(`Your claim for ${gymName} was reversed`),
+      html: shell(
+        'We reversed your gym claim',
+        `
+        <p style="color: ${colors.textPrimary}; font-size: 16px; line-height: 1.5;">
+          We looked at your claim for <strong>${safeGym}</strong> again and couldn't confirm you run it,
+          so the listing is unclaimed again and you no longer manage it on Boardsesh.
+        </p>
+        <p style="color: ${colors.textSecondary}; font-size: 15px; line-height: 1.5;">
+          If this is your gym, reply to this email with something that shows you manage it — a work
+          email address, your role, anything on the gym's own site — and we'll take another look.
+        </p>
+      `,
+      ),
+      text: `We looked at your claim for ${gymName} again and couldn't confirm you run it, so the listing is unclaimed again and you no longer manage it on Boardsesh. If this is your gym, reply with something that shows you manage it and we'll take another look.`,
+    });
+  } catch (error) {
+    logger.warn('[GymClaim] Failed to send revert email:', error instanceof Error ? error.message : error);
   }
 }
 

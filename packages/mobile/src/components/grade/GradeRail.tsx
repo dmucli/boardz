@@ -1,80 +1,33 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ElementRef, type ReactNode } from 'react';
-import { Platform, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
-import { Gesture, GestureDetector, ScrollView } from 'react-native-gesture-handler';
-import { runOnJS } from 'react-native-reanimated';
+import { useCallback, useEffect, useMemo, useRef, type ElementRef } from 'react';
+import { StyleSheet, type StyleProp, type ViewStyle } from 'react-native';
+import { ScrollView } from 'react-native-gesture-handler';
 import { useTranslation } from 'react-i18next';
 import type { Grade } from '@boardsesh/shared-schema';
-import {
-  RANGE_EXTEND_WINDOW_MS,
-  clearGradeBound,
-  computeGradeTap,
-  isAnyGrade,
-  isGradeEndpoint,
-  isGradeInRange,
-  isRangeGrade,
-  isSingleGrade,
-  type GradeBound,
-  type GradeTapMeta,
-} from '@boardsesh/climb-filters';
+import { findGradeStop, isAnyGrade, type GradeBound } from '@boardsesh/climb-filters';
 import { getGradeColor, DEFAULT_GRADE_COLOR } from '@boardsesh/board-constants/grade-colors';
-import { Text } from '../Text';
-import { GlassSurface } from '../GlassSurface';
-import { PressableSurface } from '../PressableSurface';
-import { useTheme } from '../../providers/theme-provider';
-import { useEffectiveSurfaceMode } from '../../hooks/use-effective-surface-mode';
 import { useGradeFormat } from '../../hooks/use-grade-format';
+import { distinctGradeChipLabels } from './grade-chip-labels';
 import { gradeRailCenter } from '../../lib/grade-seed';
+import { buildGradeRailStops, type GradeRailStop } from '../../lib/grade-stops';
 import { hapticSelection } from '../../lib/haptics';
 import { spacing } from '../../theme/tokens';
 import { GradeChip, type GradeChipColorway } from './GradeChip';
-import { railRestOffset, railSnapOffsets } from './grade-rail-offset';
-
-const CLEAR_DISMISS_MS = 300;
-// How many frames to re-assert the centring scroll. One scrollTo can be dropped
-// while the host sheet is still presenting; a few frames of re-assert lands it.
-const CENTER_ASSERT_FRAMES = 4;
-
-type ChipLayout = { x: number; width: number };
-
-type RailFrameProps = {
-  children: ReactNode;
-  style?: StyleProp<ViewStyle>;
-};
-
-function RailFrame({ children, style }: RailFrameProps) {
-  const { systemColors } = useTheme();
-  const surfaceMode = useEffectiveSurfaceMode();
-  // On the material/solid paths the background must NOT carry elevation: GlassSurface
-  // gives its material surface `shadows.sm` (elevation 2), and on Android elevation
-  // drives z-order, so an absoluteFill background view would paint ON TOP of the
-  // elevation-less grade chips and hide them. A flat coloured fill renders the chips.
-  const flatFill = surfaceMode === 'material' || surfaceMode === 'solid';
-  return (
-    <View collapsable={false} style={[styles.frame, style]}>
-      {flatFill ? (
-        <View
-          pointerEvents="none"
-          style={[StyleSheet.absoluteFill, { backgroundColor: systemColors.secondaryBackground, borderRadius: 24 }]}
-        />
-      ) : (
-        <GlassSurface
-          glassEffectStyle="regular"
-          fallbackColor={systemColors.secondaryBackground}
-          borderRadius={24}
-          style={StyleSheet.absoluteFill}
-          pointerEvents="none"
-        />
-      )}
-      {children}
-    </View>
-  );
-}
+import { useRailRest } from './use-rail-rest';
+import { RangeRail, type RangeRailChange, type RangeRailStopState } from './RangeRail';
 
 function sortedGrades(grades: readonly Grade[]): Grade[] {
   return [...grades].sort((firstGrade, secondGrade) => firstGrade.difficultyId - secondGrade.difficultyId);
 }
 
+/** Rides along with every change the rail reports, for the caller's analytics. */
+export type GradeRailChange = RangeRailChange;
+
+// A stable default, so an unset `sendDifficultyIds` does not re-run the centre memo.
+const EMPTY_DIFFICULTY_IDS: readonly number[] = [];
+
 type GradeRangeRailProps = {
+  /** Individual native glass in floating expanded filters; other hosts stay flat. */
+  glass?: boolean;
   grades: readonly Grade[];
   bound: GradeBound;
   sendDifficultyIds?: readonly number[];
@@ -90,295 +43,104 @@ type GradeRangeRailProps = {
    * false so an unset rail opens at the easiest grade instead of mid-scrolled.
    */
   centerOnEmpty?: boolean;
+  onChange: (next: GradeBound, change: GradeRailChange) => void;
   /**
-   * Accent for the "any grade" clear chip's selected fill. Defaults to the brand
-   * primary (purple) so climbs stays purple; the logbook passes `brandColors.accent`
-   * (amber) so its rail matches the amber chip row. Per-grade chips keep their own
-   * grade colour; this only tints the neutral clear chip's selected state.
+   * A value whose change centres the rail on the current selection again, even
+   * after the climber has scrolled or tapped it. A rail that stays on screen
+   * needs it: the climbs list bumps it when the screen regains focus. A change
+   * that lands while a finger is on the rail is dropped. (A `bound` that changes
+   * from outside the rail re-centres it the same way, with no key needed.)
    */
-  accentColor?: string;
-  // `meta` carries the rule-3 tap context (extendedRangeWithinWindow) so the
-  // call site can feed it into the `Grade Filter Changed` analytics event.
-  onChange: (next: GradeBound, meta?: GradeTapMeta) => void;
-  /**
-   * Asked to dismiss itself (swipe the handle, tap the handle, completed range, or
-   * cleared selection). Providing it also renders the grab handle + swipe-to-close
-   * gesture; an inline, always-open rail (e.g. inside the filter sheet) omits it.
-   */
-  onRequestClose?: () => void;
-  /**
-   * Auto-dismiss on completing a range / clearing the selection. Independent of the
-   * grab handle: the handle + swipe-to-close show whenever `onRequestClose` is set, so
-   * the chip-row rails (dismissible={false}) keep a manual close affordance without the
-   * rail vanishing mid-range-build.
-   */
-  dismissible?: boolean;
+  recenterKey?: number;
   showTitle?: boolean;
+  /** Left padding inside the strip, in front of the Any chip (and the title).
+   *  The rail has no frame of its own, so this is its container's gutter: the
+   *  strip scrolls out to the rail's edge and the first chip rests on the gutter. */
+  contentInsetLeft?: number;
+  /** Right padding inside the strip, after the last chip. */
+  contentInsetRight?: number;
+  /** The board the grades belong to, so labels follow its scale (MoonBoard's 6A is V2). */
+  boardName?: string | null;
   style?: StyleProp<ViewStyle>;
 };
 
+/**
+ * The grade filter as one plain row: a strip of grade stops that scrolls. It
+ * draws no frame and no handle, since it is a row of whatever holds it (the
+ * chrome under the filter chips, a filter sheet, a popover), not a sheet of its
+ * own.
+ *
+ * A stop is one chip. Grades that read the same in the climber's format share
+ * one (`buildGradeRailStops`), so "V0" is a single chip under V grades.
+ *
+ * A tap picks one stop, and a tap on a second stop within
+ * RANGE_EXTEND_WINDOW_MS of that pick makes a range. A touch and hold on the
+ * far end makes one without the clock. The gestures, centring and range window
+ * live in the shared `RangeRail`; this wrapper supplies the grade stops, the
+ * centre grade and the grade wording.
+ */
 export function GradeRangeRail({
+  glass = false,
   grades: unsortedGrades,
   bound,
-  sendDifficultyIds = [],
+  sendDifficultyIds = EMPTY_DIFFICULTY_IDS,
   lastUsedGradeId,
   centerOnEmpty = true,
   onChange,
-  onRequestClose,
-  dismissible = true,
+  recenterKey,
   showTitle = false,
-  accentColor,
+  contentInsetLeft = spacing[4],
+  contentInsetRight = spacing[4],
+  boardName,
   style,
 }: GradeRangeRailProps) {
   const { t } = useTranslation('climbs');
-  const { systemColors, brandColors } = useTheme();
-  // The clear chip's selected accent: brand primary (purple) by default so climbs
-  // stays purple; the logbook passes amber.
-  const clearAccent = accentColor ?? brandColors.primary;
-  const { formatGrade } = useGradeFormat();
-  const scrollRef = useRef<ElementRef<typeof ScrollView>>(null);
-  const chipLayoutsRef = useRef<Record<number, ChipLayout>>({});
-  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastSingleAtRef = useRef<number | undefined>(undefined);
-  // The pending dismiss runs through a ref so a parent re-render that swaps the
-  // onRequestClose identity between scheduling and firing can't strand a stale
-  // closure on the timer.
-  const onRequestCloseRef = useRef(onRequestClose);
-  const [railWidth, setRailWidth] = useState(0);
-  const didCenterRef = useRef(false);
-  const centeringRef = useRef(false);
-  const centerAssertsRef = useRef(0);
-  const centerRafRef = useRef<number | null>(null);
-  // Set once the climber taps/drags the rail. After that we never re-centre, so
-  // the row can't yank out from under their finger; before that we re-centre as
-  // the focus settles (e.g. lastUsedGrade resolving from storage after mount).
-  const userInteractedRef = useRef(false);
+  const { gradeFormat } = useGradeFormat();
 
   const grades = useMemo(() => sortedGrades(unsortedGrades), [unsortedGrades]);
-  const gradeIds = useMemo(() => grades.map((grade) => grade.difficultyId), [grades]);
-  const centerId = useMemo(() => {
+  const stops = useMemo(
+    () =>
+      buildGradeRailStops(unsortedGrades, gradeFormat, boardName).map((stop) => ({ ...stop, color: stop.gradeColor })),
+    [unsortedGrades, gradeFormat, boardName],
+  );
+  const centerStopId = useMemo(() => {
     // With centering-on-empty off (the logbook filter), only auto-center when a
     // grade is actually selected; otherwise open at the start, not mid-scrolled.
-    if (!centerOnEmpty && bound.minGradeId == null && bound.maxGradeId == null) return undefined;
-    return gradeRailCenter(bound, grades, sendDifficultyIds, lastUsedGradeId);
-  }, [centerOnEmpty, bound, grades, sendDifficultyIds, lastUsedGradeId]);
+    if (!centerOnEmpty && isAnyGrade(bound)) return undefined;
+    const centerGradeId = gradeRailCenter(bound, grades, sendDifficultyIds, lastUsedGradeId);
+    return centerGradeId == null ? undefined : findGradeStop(stops, centerGradeId)?.minGradeId;
+  }, [centerOnEmpty, bound, grades, stops, sendDifficultyIds, lastUsedGradeId]);
 
-  const clearDismissTimer = useCallback(() => {
-    if (dismissTimerRef.current) {
-      clearTimeout(dismissTimerRef.current);
-      dismissTimerRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    onRequestCloseRef.current = onRequestClose;
-  }, [onRequestClose]);
-
-  const handleRequestClose = useCallback(() => {
-    clearDismissTimer();
-    onRequestCloseRef.current?.();
-  }, [clearDismissTimer]);
-
-  useEffect(() => clearDismissTimer, [clearDismissTimer]);
-
-  const scheduleDismiss = useCallback(
-    (delay: number) => {
-      clearDismissTimer();
-      dismissTimerRef.current = setTimeout(() => onRequestCloseRef.current?.(), delay);
-    },
-    [clearDismissTimer],
+  const stopAccessibilityLabel = useCallback(
+    (stop: GradeRailStop, state: RangeRailStopState) =>
+      state === 'end'
+        ? t('mobile.gradeRail.selectedFilterAria', { grade: stop.label })
+        : state === 'inRange'
+          ? t('mobile.gradeRail.rangeFilterAria', { grade: stop.label })
+          : t('mobile.gradeRail.setFilterAria', { grade: stop.label }),
+    [t],
   );
-
-  const handleGestureClose = useMemo(
-    () =>
-      Gesture.Pan()
-        .activeOffsetY([-10, 10])
-        .failOffsetX([-32, 32])
-        .onEnd((event) => {
-          'worklet';
-          if (Math.abs(event.translationY) > 24 || Math.abs(event.velocityY) > 450) {
-            runOnJS(handleRequestClose)();
-          }
-        }),
-    [handleRequestClose],
-  );
-
-  const clearCenterRaf = useCallback(() => {
-    if (centerRafRef.current != null) {
-      cancelAnimationFrame(centerRafRef.current);
-      centerRafRef.current = null;
-    }
-  }, []);
-
-  // Scroll the focus grade into the centre once both the rail width and the
-  // focus chip's position are known. A single scrollTo issued while the host
-  // sheet is still presenting can be swallowed (the rail stays pinned at the
-  // start), so re-assert the offset across a few frames before latching.
-  const startCentering = useCallback(() => {
-    if (didCenterRef.current || centeringRef.current) return;
-    if (railWidth === 0 || centerId == null) return;
-    if (chipLayoutsRef.current[centerId] == null) return;
-    centeringRef.current = true;
-    centerAssertsRef.current = 0;
-    const assertCenter = () => {
-      const chipLayout = chipLayoutsRef.current[centerId];
-      if (chipLayout) {
-        const offset = Math.max(0, chipLayout.x + chipLayout.width / 2 - railWidth / 2);
-        scrollRef.current?.scrollTo({ x: offset, animated: false });
-      }
-      centerAssertsRef.current += 1;
-      if (centerAssertsRef.current >= CENTER_ASSERT_FRAMES) {
-        didCenterRef.current = true;
-        centeringRef.current = false;
-        centerRafRef.current = null;
-        return;
-      }
-      centerRafRef.current = requestAnimationFrame(assertCenter);
-    };
-    assertCenter();
-  }, [centerId, railWidth]);
-
-  // Re-centre whenever the focus or measured width settles — covers the case
-  // where lastUsedGrade resolves from storage a tick after mount (no layout
-  // event of its own) and would otherwise leave the rail latched on the default
-  // band centre. Skipped once the climber has interacted, so a tap never yanks
-  // the row. `startCentering` changes identity only when centerId/railWidth do.
-  useEffect(() => {
-    if (userInteractedRef.current) return;
-    clearCenterRaf();
-    didCenterRef.current = false;
-    centeringRef.current = false;
-    startCentering();
-  }, [startCentering, clearCenterRaf]);
-
-  // Cancel any in-flight re-assert loop on unmount.
-  useEffect(() => clearCenterRaf, [clearCenterRaf]);
-
-  // The user dragging the rail latches centring for good so it never fights
-  // their finger, and stops the dismiss timer.
-  const handleScrollBeginDrag = useCallback(() => {
-    clearDismissTimer();
-    clearCenterRaf();
-    userInteractedRef.current = true;
-    centeringRef.current = false;
-    didCenterRef.current = true;
-  }, [clearDismissTimer, clearCenterRaf]);
-
-  const handleTapGrade = useCallback(
-    (difficultyId: number) => {
-      hapticSelection();
-      clearDismissTimer();
-      userInteractedRef.current = true;
-      didCenterRef.current = true;
-      const withinWindow =
-        lastSingleAtRef.current !== undefined && Date.now() - lastSingleAtRef.current < RANGE_EXTEND_WINDOW_MS;
-      const result = computeGradeTap(bound, gradeIds, difficultyId, withinWindow);
-      onChange(result.next, result.meta);
-      lastSingleAtRef.current = isSingleGrade(result.next) ? Date.now() : undefined;
-      // The rail auto-closes only when a tap *completes a range* — extending a
-      // single grade into a two-ended range. Every other tap keeps it open:
-      // picking the first grade, switching the single grade, adjusting an
-      // existing range, and crucially clearing a grade (tapping the already-
-      // selected one). That clear case is how a user starts a fresh range from a
-      // prior selection, so closing there would cut them off mid-build. To
-      // dismiss without finishing a range, swipe the handle down.
-      const completedRange = isSingleGrade(bound) && isRangeGrade(result.next);
-      if (dismissible && completedRange) {
-        scheduleDismiss(CLEAR_DISMISS_MS);
-      }
-    },
-    [bound, gradeIds, onChange, clearDismissTimer, dismissible, scheduleDismiss],
-  );
-
-  const handleClear = useCallback(() => {
-    hapticSelection();
-    clearDismissTimer();
-    userInteractedRef.current = true;
-    didCenterRef.current = true;
-    lastSingleAtRef.current = undefined;
-    onChange(clearGradeBound());
-    if (dismissible) scheduleDismiss(CLEAR_DISMISS_MS);
-  }, [clearDismissTimer, dismissible, onChange, scheduleDismiss]);
-
-  const anySelected = isAnyGrade(bound);
 
   return (
-    <RailFrame style={style}>
-      {onRequestClose ? (
-        <GestureDetector gesture={handleGestureClose}>
-          <PressableSurface
-            onPress={handleRequestClose}
-            feedback="opacity"
-            hitSlop={12}
-            accessibilityRole="button"
-            accessibilityLabel={t('mobile.gradeRail.closeAria')}
-            style={styles.handleButton}
-          >
-            <View style={[styles.handle, { backgroundColor: systemColors.tertiaryLabel }]} />
-          </PressableSurface>
-        </GestureDetector>
-      ) : null}
-      {showTitle ? (
-        <View style={styles.topRow}>
-          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.title}>
-            {t('mobile.filter.gradeRange')}
-          </Text>
-        </View>
-      ) : null}
-      <ScrollView
-        ref={scrollRef}
-        horizontal
-        nestedScrollEnabled={Platform.OS === 'android'}
-        showsHorizontalScrollIndicator={false}
-        keyboardShouldPersistTaps="handled"
-        style={styles.railScroll}
-        contentContainerStyle={styles.railContent}
-        onScrollBeginDrag={handleScrollBeginDrag}
-        onContentSizeChange={startCentering}
-        onLayout={(event) => {
-          setRailWidth(event.nativeEvent.layout.width);
-          startCentering();
-        }}
-      >
-        <GradeChip
-          label={t('mobile.search.gradeClear')}
-          tone={anySelected ? 'selected' : 'neutral'}
-          gradeColor={clearAccent}
-          onPress={handleClear}
-          accessibilityLabel={anySelected ? t('mobile.gradeRail.anyGradeAria') : t('mobile.gradeRail.clearFilterAria')}
-          accessibilityState={{ selected: anySelected }}
-        />
-        {grades.map((grade) => {
-          const label = formatGrade(grade.name) ?? grade.name;
-          const gradeColor = getGradeColor(grade.name) ?? DEFAULT_GRADE_COLOR;
-          const endpoint = isGradeEndpoint(bound, grade.difficultyId);
-          const insideRange = !endpoint && isGradeInRange(bound, grade.difficultyId);
-          const tone = endpoint ? 'selected' : insideRange ? 'range' : 'neutral';
-          return (
-            <GradeChip
-              key={grade.difficultyId}
-              label={label}
-              tone={tone}
-              gradeColor={gradeColor}
-              onPress={() => handleTapGrade(grade.difficultyId)}
-              accessibilityLabel={
-                endpoint
-                  ? t('mobile.gradeRail.selectedFilterAria', { grade: label })
-                  : insideRange
-                    ? t('mobile.gradeRail.rangeFilterAria', { grade: label })
-                    : t('mobile.gradeRail.setFilterAria', { grade: label })
-              }
-              accessibilityHint={endpoint ? undefined : t('mobile.gradeRail.rangeHint')}
-              accessibilityState={{ selected: endpoint }}
-              onLayout={({ nativeEvent }) => {
-                chipLayoutsRef.current[grade.difficultyId] = nativeEvent.layout;
-                startCentering();
-              }}
-            />
-          );
-        })}
-      </ScrollView>
-    </RailFrame>
+    <RangeRail
+      glass={glass}
+      stops={stops}
+      bound={bound}
+      centerStopId={centerStopId}
+      onChange={onChange}
+      recenterKey={recenterKey}
+      title={showTitle ? t('mobile.filter.gradeRange') : undefined}
+      anyLabel={t('mobile.search.gradeClear')}
+      anySelectedAccessibilityLabel={t('mobile.gradeRail.anyGradeAria')}
+      clearAccessibilityLabel={t('mobile.gradeRail.clearFilterAria')}
+      stopAccessibilityLabel={stopAccessibilityLabel}
+      // A screen reader cannot count on the timing of a second tap, so the hint
+      // names the gesture that does not need it.
+      rangeHoldHint={t('mobile.gradeRail.rangeHoldHint')}
+      contentInsetLeft={contentInsetLeft}
+      contentInsetRight={contentInsetRight}
+      style={style}
+    />
   );
 }
 
@@ -401,6 +163,8 @@ type GradeSingleSelectRailProps = {
   /** Right padding inside the rail's content — the trailing inset that keeps the
    *  last chip short of the screen edge so the rail reads as scrollable. */
   contentInsetRight?: number;
+  /** The board the grades belong to, so labels follow its scale (MoonBoard's 6A is V2). */
+  boardName?: string | null;
   style?: StyleProp<ViewStyle>;
 };
 
@@ -413,24 +177,18 @@ export function GradeSingleSelectRail({
   colorway = 'grade',
   contentInsetLeft = spacing[4],
   contentInsetRight = spacing[4],
+  boardName,
   style,
 }: GradeSingleSelectRailProps) {
   const { t } = useTranslation('climbs');
-  const { formatGrade } = useGradeFormat();
+  const { gradeFormat } = useGradeFormat();
   const scrollRef = useRef<ElementRef<typeof ScrollView>>(null);
-  const chipLayoutsRef = useRef<Record<number, ChipLayout>>({});
-  const [railWidth, setRailWidth] = useState(0);
-  const [contentWidth, setContentWidth] = useState(0);
-  // Bumped whenever a chip re-measures, so the snap table recomputes off the
-  // layout ref without every chip's onLayout forcing a render of its own.
-  const [layoutVersion, setLayoutVersion] = useState(0);
-  const didCenterRef = useRef(false);
-  // Latched by the first tap or drag: after the climber has touched the rail it
-  // must never scroll itself out from under their thumb. Reset only when the rail
-  // takes on a new identity (below) — never on `focusId`, since a tap moves the
-  // focus and re-centring there IS the yank.
-  const userInteractedRef = useRef(false);
   const grades = useMemo(() => sortedGrades(unsortedGrades), [unsortedGrades]);
+  // No two chips read the same: "V0 V0 V0" becomes "V0 / 4A", "V0 / 4B"... (#5960).
+  const chipLabels = useMemo(
+    () => distinctGradeChipLabels(grades, gradeFormat, boardName),
+    [grades, gradeFormat, boardName],
+  );
   const focusId = selectedDifficultyId ?? consensusDifficultyId ?? undefined;
 
   // Snapping is a tick-sheet behaviour. Every other consumer (the generator
@@ -438,10 +196,11 @@ export function GradeSingleSelectRail({
   // that just rests on the focus chip, so gate the three snap props on colorway.
   const snapsToChips = colorway === 'selection';
 
-  const snapOffsets = useMemo(() => {
-    void layoutVersion;
-    return railSnapOffsets(chipLayoutsRef.current, contentInsetLeft);
-  }, [layoutVersion, contentInsetLeft]);
+  // Rest with the focus chip readable and flush to a chip start, again whenever
+  // the rail's width changes (the iPad sheet lays out at the window width first,
+  // #7062), until the climber's first tap or drag.
+  const { snapOffsets, maybeRest, onChipLayout, onRailLayout, onContentSizeChange, markInteracted, resetLatches } =
+    useRailRest({ scrollRef, focusId, leadIn: contentInsetLeft, snapToChipStart: snapsToChips });
 
   // What makes this a DIFFERENT rail rather than the same one with a new pick:
   // the grade set it renders, and whose consensus grade it is pointing at. Both
@@ -452,65 +211,26 @@ export function GradeSingleSelectRail({
     [consensusDifficultyId, grades],
   );
 
-  // Rest with the focus chip readable and flush to a chip start. `railRestOffset`
-  // clamps to the scrollable range and snaps DOWN to a chip boundary, so the rail
-  // can neither overscroll past its content nor come to rest mid-chip.
-  const maybeCenter = useCallback(() => {
-    if (userInteractedRef.current || didCenterRef.current) return;
-    const offset = railRestOffset({
-      layouts: chipLayoutsRef.current,
-      focusId,
-      railWidth,
-      contentWidth,
-      leadIn: contentInsetLeft,
-      snapToChipStart: snapsToChips,
-    });
-    if (offset == null) return;
-    didCenterRef.current = true;
-    scrollRef.current?.scrollTo({ x: offset, animated: false });
-  }, [focusId, railWidth, contentWidth, contentInsetLeft, snapsToChips]);
-
   // A new rail starts fresh: drop both latches so it rests on its own focus chip
   // even if the previous climb's rail had been dragged. One effect (rather than a
-  // reset effect plus a centring effect) so the reset can never land in a commit
-  // where the centring pass has already run.
+  // reset effect plus a resting effect) so the reset can never land in a commit
+  // where the resting pass has already run.
   const railIdentityRef = useRef(railIdentity);
   useEffect(() => {
     if (railIdentityRef.current !== railIdentity) {
       railIdentityRef.current = railIdentity;
-      userInteractedRef.current = false;
-      didCenterRef.current = false;
+      resetLatches();
     }
-    maybeCenter();
-  }, [railIdentity, maybeCenter]);
-
-  const handleChipLayout = useCallback(
-    (difficultyId: number, layout: ChipLayout) => {
-      const previous = chipLayoutsRef.current[difficultyId];
-      chipLayoutsRef.current[difficultyId] = layout;
-      if (previous?.x !== layout.x || previous?.width !== layout.width) {
-        setLayoutVersion((version) => version + 1);
-      }
-      maybeCenter();
-    },
-    [maybeCenter],
-  );
-
-  const handleContentSizeChange = useCallback(
-    (width: number) => {
-      setContentWidth(width);
-      maybeCenter();
-    },
-    [maybeCenter],
-  );
+    maybeRest();
+  }, [railIdentity, maybeRest, resetLatches]);
 
   const handleSelect = useCallback(
     (difficultyId: number) => {
-      userInteractedRef.current = true;
+      markInteracted();
       hapticSelection();
       onSelect(allowClear && selectedDifficultyId === difficultyId ? undefined : difficultyId);
     },
-    [allowClear, selectedDifficultyId, onSelect],
+    [allowClear, selectedDifficultyId, onSelect, markInteracted],
   );
 
   return (
@@ -522,22 +242,17 @@ export function GradeSingleSelectRail({
       snapToOffsets={snapsToChips && snapOffsets.length > 0 ? snapOffsets : undefined}
       snapToAlignment={snapsToChips ? 'start' : undefined}
       decelerationRate={snapsToChips ? 'fast' : undefined}
-      onScrollBeginDrag={() => {
-        userInteractedRef.current = true;
-      }}
+      onScrollBeginDrag={markInteracted}
       contentContainerStyle={[
         styles.singleSelectContent,
         style,
-        { paddingLeft: contentInsetLeft, paddingRight: contentInsetRight },
+        { paddingStart: contentInsetLeft, paddingEnd: contentInsetRight },
       ]}
-      onContentSizeChange={handleContentSizeChange}
-      onLayout={(event) => {
-        setRailWidth(event.nativeEvent.layout.width);
-        maybeCenter();
-      }}
+      onContentSizeChange={onContentSizeChange}
+      onLayout={onRailLayout}
     >
       {grades.map((grade) => {
-        const label = formatGrade(grade.name) ?? grade.name;
+        const label = chipLabels.get(grade.difficultyId) ?? grade.name;
         const gradeColor = getGradeColor(grade.name) ?? DEFAULT_GRADE_COLOR;
         const selected = grade.difficultyId === selectedDifficultyId;
         const consensus = !selected && grade.difficultyId === consensusDifficultyId;
@@ -557,7 +272,7 @@ export function GradeSingleSelectRail({
                   : t('mobile.gradeRail.setLogGradeAria', { grade: label })
             }
             accessibilityState={{ selected }}
-            onLayout={({ nativeEvent }) => handleChipLayout(grade.difficultyId, nativeEvent.layout)}
+            onLayout={({ nativeEvent }) => onChipLayout(grade.difficultyId, nativeEvent.layout)}
           />
         );
       })}
@@ -566,45 +281,6 @@ export function GradeSingleSelectRail({
 }
 
 const styles = StyleSheet.create({
-  frame: {
-    overflow: 'hidden',
-    borderRadius: 24,
-    minHeight: 62,
-    paddingTop: 2,
-    paddingBottom: spacing[2],
-  },
-  handleButton: {
-    minHeight: 18,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  handle: {
-    width: 38,
-    height: 4,
-    borderRadius: 2,
-  },
-  topRow: {
-    minHeight: 28,
-    paddingHorizontal: spacing[3],
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  title: {
-    fontWeight: '600',
-  },
-  railContent: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-    minHeight: 52,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[1],
-  },
-  railScroll: {
-    flexGrow: 0,
-    minHeight: 52,
-  },
   singleSelectContent: {
     flexDirection: 'row',
     alignItems: 'center',

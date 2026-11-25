@@ -210,6 +210,26 @@ describe('CORS Handler', () => {
       expect(isOriginAllowed('https://123.app.boardsesh.com')).toBe(true);
     });
 
+    it.each(['https://pr-1.boardsesh.com', 'https://pr-123.boardsesh.com'])(
+      'allows the flat app preview origin %s',
+      (origin) => {
+        expect(isOriginAllowed(origin)).toBe(true);
+      },
+    );
+
+    it.each([
+      'http://pr-123.boardsesh.com',
+      'https://pr-0.boardsesh.com',
+      'https://pr-0123.boardsesh.com',
+      'https://pr-example.boardsesh.com',
+      'https://pr-123.boardsesh.com.evil.com',
+      'https://evil-pr-123.boardsesh.com',
+      'https://pr-123.boardsesh.com:8443',
+      'https://pr-123.boardsesh.com/path',
+    ])('rejects the untrusted flat preview origin %s', (origin) => {
+      expect(isOriginAllowed(origin)).toBe(false);
+    });
+
     it('returns false for non-numeric or look-alike app subdomains', () => {
       expect(isOriginAllowed('https://pr-5.app.boardsesh.com')).toBe(false);
       expect(isOriginAllowed('http://app.boardsesh.com')).toBe(false); // http not https
@@ -422,7 +442,7 @@ describe('CORS Handler', () => {
 
       expect(res.setHeader).toHaveBeenCalledWith(
         'Access-Control-Allow-Headers',
-        'Content-Type, Authorization, Content-Encoding',
+        'Content-Type, Authorization, Content-Encoding, X-Boardsesh-Platform, X-Boardsesh-Client, X-Boardsesh-Analytics-Consent',
       );
     });
 
@@ -436,6 +456,14 @@ describe('CORS Handler', () => {
       expect(res.end).toHaveBeenCalled();
     });
 
+    it('lets browsers cache a preflight for ten minutes', () => {
+      const req = createMockReq('OPTIONS', 'https://boardsesh.com');
+      const res = createMockRes();
+      applyCorsHeaders(req, res);
+
+      expect(res.setHeader).toHaveBeenCalledWith('Access-Control-Max-Age', '600');
+    });
+
     it('returns true for non-OPTIONS requests', () => {
       const req = createMockReq('GET', 'https://boardsesh.com');
       const res = createMockRes();
@@ -444,6 +472,7 @@ describe('CORS Handler', () => {
       expect(result).toBe(true);
       expect(res.writeHead).not.toHaveBeenCalled();
       expect(res.end).not.toHaveBeenCalled();
+      expect(res.setHeader).not.toHaveBeenCalledWith('Access-Control-Max-Age', expect.anything());
     });
 
     it('returns true for POST requests', () => {

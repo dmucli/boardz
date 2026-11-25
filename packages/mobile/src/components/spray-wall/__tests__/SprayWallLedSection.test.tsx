@@ -1,0 +1,617 @@
+// @vitest-environment jsdom
+import { createElement, Fragment, type ReactNode } from 'react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  createLedPreviewSession,
+  getLedControllerDriver,
+  LedControllerError,
+  type LedControllerInfo,
+} from '@boardsesh/led-controller';
+import type { SprayWallLedSettings } from '../../../lib/spray/use-spray-wall-led-settings';
+
+const controller = vi.hoisted(() => ({ probe: vi.fn(), lightAll: vi.fn(), turnOff: vi.fn(), show: vi.fn() }));
+const storage = vi.hoisted(() => ({ read: vi.fn(), write: vi.fn(), records: new Map<string, unknown>() }));
+const navigation = vi.hoisted(() => ({ push: vi.fn() }));
+const network = vi.hoisted(() => ({ fetch: vi.fn() }));
+
+vi.mock('../WledBluetoothInstaller', () => ({
+  WledBluetoothInstaller: () => createElement('span', null, 'owner-installer'),
+}));
+// A list that renders every row, so the search results can be tapped.
+vi.mock('@shopify/flash-list', () => ({
+  FlashList: ({
+    data,
+    renderItem,
+    keyExtractor,
+  }: {
+    data: unknown[];
+    renderItem: (info: { item: unknown; index: number }) => unknown;
+    keyExtractor: (item: unknown) => string;
+  }) =>
+    createElement(
+      'div',
+      { 'data-testid': 'flash-list' },
+      data.map((item, index) =>
+        createElement(Fragment, { key: keyExtractor(item) }, renderItem({ item, index }) as never),
+      ),
+    ),
+}));
+
+vi.mock('expo-router', () => ({ useRouter: () => navigation }));
+
+vi.mock('@boardsesh/led-controller', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@boardsesh/led-controller')>()),
+  getLedControllerDriver: () => ({ ...controller, createPreview: () => controller }),
+  createWledDriver: () => ({ probe: (url: string, signal?: AbortSignal) => controller.probe(url, signal) }),
+}));
+vi.mock('@react-native-community/netinfo', () => ({ default: { fetch: network.fetch } }));
+vi.mock('../../../lib/preference-store', () => ({
+  getPreference: storage.read,
+  setPreference: storage.write,
+}));
+vi.mock('../../../lib/spray/spray-wall-led-sync', () => ({
+  prepareSprayWallLedRead: vi.fn(async () => undefined),
+  markSprayWallLedSaveStarted: vi.fn(async (_wallUuid: string, _field: string, writeCopy?: () => Promise<void>) =>
+    writeCopy?.(),
+  ),
+  queueSprayWallLedUpload: vi.fn(),
+}));
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-native', () => ({
+  View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+  AppState: { addEventListener: () => ({ remove: vi.fn() }) },
+  StyleSheet: { create: (styles: unknown) => styles },
+}));
+vi.mock('../../../providers/theme-provider', () => ({
+  useTheme: () => ({
+    systemColors: { secondaryLabel: '#666' },
+    brandColors: { error: '#900' },
+    spacing: [0, 4, 8, 12, 16, 20],
+  }),
+}));
+vi.mock('../../Icon', () => ({ Icon: () => null }));
+const lightingControls = vi.hoisted(() => ({
+  slider: null as null | { value: number; onCommit: (value: number) => void },
+  autoOff: null as null | { selectedKey: string; onSelect: (key: string) => void },
+}));
+vi.mock('../../ValueSlider', () => ({
+  ValueSlider: (props: { value: number; onCommit: (value: number) => void }) => {
+    lightingControls.slider = props;
+    return null;
+  },
+}));
+vi.mock('../../SegmentedControl', () => ({
+  SegmentedControl: (props: { selectedKey: string; onSelect: (key: string) => void }) => {
+    lightingControls.autoOff = props;
+    return null;
+  },
+}));
+vi.mock('../../Text', () => ({
+  Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+}));
+vi.mock('../../PressableSurface', () => ({
+  PressableSurface: ({
+    children,
+    onPress,
+    accessibilityLabel,
+    accessibilityState,
+  }: {
+    children?: ReactNode;
+    onPress: () => void;
+    accessibilityLabel: string;
+    accessibilityState: { expanded: boolean };
+  }) =>
+    createElement(
+      'button',
+      { onClick: onPress, 'aria-label': accessibilityLabel, 'aria-expanded': accessibilityState.expanded },
+      children,
+    ),
+}));
+vi.mock('../../Button', () => ({
+  Button: ({ title, disabled, onPress }: { title: string; disabled?: boolean; onPress: () => void }) =>
+    createElement('button', { disabled, onClick: onPress }, title),
+}));
+vi.mock('../../SwitchRow', () => ({
+  SwitchRow: ({
+    label,
+    value,
+    disabled,
+    onValueChange,
+  }: {
+    label: string;
+    value: boolean;
+    disabled?: boolean;
+    onValueChange: (enabled: boolean) => void;
+  }) =>
+    createElement('input', {
+      type: 'checkbox',
+      role: 'switch',
+      'aria-label': label,
+      checked: value,
+      disabled,
+      onChange: () => onValueChange(!value),
+    }),
+}));
+vi.mock('../../board-discovery/BoardMetaFields', () => ({
+  SectionLabel: ({ children }: { children: ReactNode }) => createElement('span', null, children),
+  BuilderTextInput: ({
+    value,
+    onChangeText,
+    accessibilityLabel,
+    editable,
+  }: {
+    value: string;
+    onChangeText: (url: string) => void;
+    accessibilityLabel: string;
+    editable: boolean;
+  }) =>
+    createElement('input', {
+      value,
+      'aria-label': accessibilityLabel,
+      disabled: !editable,
+      onChange: (event: { target: { value: string } }) => onChangeText(event.target.value),
+    }),
+}));
+
+import { SprayWallLedSection } from '../SprayWallLedSection';
+
+const settingsKey = 'sprayWallLedSettings:wall-1';
+const controllerInfo: LedControllerInfo = { name: 'Home wall', version: '0.15.2', ledCount: 180 };
+const savedSettings = (enabled = true, url = ''): SprayWallLedSettings => ({
+  version: 1,
+  enabled,
+  controller: { type: 'wled', url },
+  brightness: 64,
+  autoOffMinutes: 0,
+});
+function deferred<T>() {
+  let resolve!: (result: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+const button = (key: string) => screen.getByRole('button', { name: `sprayLed.${key}` });
+const enabledSwitch = () => screen.getByRole('switch', { name: 'sprayLed.enable' }) as HTMLInputElement;
+const urlInput = () => screen.getByRole('textbox', { name: 'sprayLed.url' }) as HTMLInputElement;
+function enterUrl(url: string) {
+  fireEvent.change(urlInput(), { target: { value: url } });
+}
+async function openSection() {
+  fireEvent.click(button('title'));
+  await waitFor(() => expect(enabledSwitch().disabled).toBe(false));
+}
+async function connect(url = 'wled.local') {
+  enterUrl(url);
+  fireEvent.click(button('confirm'));
+  await waitFor(() => expect(screen.queryByText('sprayLed.saved')).not.toBeNull());
+  await waitFor(() => expect((button('lightAll') as HTMLButtonElement).disabled).toBe(false));
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  storage.records.clear();
+  storage.read.mockReset().mockImplementation(async (key: string) => storage.records.get(key) ?? null);
+  storage.write.mockReset().mockImplementation(async (key: string, settings: unknown) => {
+    storage.records.set(key, settings);
+  });
+  controller.show.mockReset().mockResolvedValue(undefined);
+  controller.probe.mockReset().mockResolvedValue(controllerInfo);
+  controller.lightAll.mockReset().mockResolvedValue(undefined);
+  controller.turnOff.mockReset().mockResolvedValue(undefined);
+});
+afterEach(async () => {
+  cleanup();
+  await act(async () => undefined);
+});
+
+describe('SprayWallLedSection', () => {
+  it('offers firmware installation only to an explicitly identified owner', async () => {
+    storage.records.set('sprayWallLedSettings:wall-1', {
+      version: 1,
+      enabled: true,
+      controller: { type: 'wled', url: 'http://wled.local' },
+    });
+    const { rerender } = render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    expect(screen.queryByText('owner-installer')).toBeNull();
+    rerender(createElement(SprayWallLedSection, { wallUuid: 'wall-1', canInstall: true }));
+    expect(screen.queryByText('owner-installer')).not.toBeNull();
+  });
+
+  it('restores this phone’s Wi-Fi address after selecting Bluetooth', async () => {
+    storage.records.set('sprayWallLedSettings:wall-1', {
+      version: 1,
+      enabled: true,
+      controller: { type: 'wled', url: 'http://wled.local' },
+    });
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    fireEvent.click(button('bluetooth.title'));
+    await waitFor(() =>
+      expect(storage.records.get('sprayWallLedSettings:wall-1')).toMatchObject({
+        controller: { type: 'wled-ble', url: '' },
+        wifiUrl: 'http://wled.local',
+      }),
+    );
+    fireEvent.click(button('bluetooth.wifi'));
+    await waitFor(() => expect(urlInput().value).toBe('http://wled.local'));
+    expect(controller.probe).not.toHaveBeenCalled();
+  });
+
+  it('starts collapsed and disabled, without contacting or lighting a controller', async () => {
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    expect(button('title').getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('switch')).toBeNull();
+    await openSection();
+    expect(enabledSwitch().checked).toBe(false);
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'sprayLed.setup' })).toBeNull();
+    expect(controller.probe).not.toHaveBeenCalled();
+    expect(controller.lightAll).not.toHaveBeenCalled();
+    expect(controller.turnOff).not.toHaveBeenCalled();
+  });
+
+  it('finds a controller on the Wi-Fi and connects to it with one tap', async () => {
+    network.fetch.mockResolvedValue({ type: 'wifi', details: { ipAddress: '192.168.1.50', subnet: '255.255.255.0' } });
+    controller.probe.mockImplementation(async (url: string) => {
+      if (url === 'http://192.168.1.40') return controllerInfo;
+      throw new LedControllerError('unavailable');
+    });
+    storage.records.set(settingsKey, savedSettings());
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    fireEvent.click(button('find'));
+    const found = await screen.findByRole('button', { name: 'sprayLed.findResult' });
+    // The scan never probes the phone's own address.
+    expect(controller.probe).not.toHaveBeenCalledWith('http://192.168.1.50', expect.anything());
+    fireEvent.click(found);
+    await waitFor(() => expect(storage.records.get(settingsKey)).toEqual(savedSettings(true, 'http://192.168.1.40')));
+    expect(urlInput().value).toBe('http://192.168.1.40');
+  });
+
+  describe('while the phone reads its network', () => {
+    const wifi = { type: 'wifi', details: { ipAddress: '192.168.1.50', subnet: '255.255.255.0' } };
+    async function pressFindWithLookupPending() {
+      const lookups: ReturnType<typeof deferred<typeof wifi>>[] = [];
+      network.fetch.mockImplementation(() => {
+        const lookup = deferred<typeof wifi>();
+        lookups.push(lookup);
+        return lookup.promise;
+      });
+      controller.probe.mockRejectedValue(new LedControllerError('unavailable'));
+      storage.records.set(settingsKey, savedSettings());
+      const view = render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+      await openSection();
+      fireEvent.click(button('find'));
+      expect(network.fetch).toHaveBeenCalledOnce();
+      return { view, lookups };
+    }
+
+    it('runs one scan for a double press', async () => {
+      const { lookups } = await pressFindWithLookupPending();
+      // The second press stops the first search, a third starts a new one.
+      fireEvent.click(button('findStop'));
+      fireEvent.click(button('find'));
+      expect(lookups).toHaveLength(2);
+      await act(async () => lookups[0].resolve(wifi));
+      expect(controller.probe).not.toHaveBeenCalled();
+      await act(async () => lookups[1].resolve(wifi));
+      await screen.findByText('sprayLed.findNone');
+      // 253 addresses: the /24 without the network, broadcast and the phone itself.
+      expect(controller.probe).toHaveBeenCalledTimes(253);
+    });
+
+    it('starts no scan once an address is typed', async () => {
+      const { lookups } = await pressFindWithLookupPending();
+      enterUrl('wled.local');
+      await act(async () => lookups[0].resolve(wifi));
+      expect(controller.probe).not.toHaveBeenCalled();
+      expect(button('find')).toBeTruthy();
+    });
+
+    it('starts no scan after the screen closes', async () => {
+      const { view, lookups } = await pressFindWithLookupPending();
+      view.unmount();
+      await act(async () => lookups[0].resolve(wifi));
+      expect(controller.probe).not.toHaveBeenCalled();
+    });
+  });
+
+  it('says no controller is found on a Wi-Fi it cannot search, instead of asking to join one', async () => {
+    for (const ipAddress of ['2001:db8::5', '100.64.1.20', '8.8.4.4']) {
+      network.fetch.mockResolvedValue({ type: 'wifi', details: { ipAddress, subnet: null } });
+      storage.records.set(settingsKey, savedSettings());
+      const view = render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+      await openSection();
+      fireEvent.click(button('find'));
+      expect(await screen.findByText('sprayLed.findNotSearchable')).toBeTruthy();
+      expect(screen.queryByText('sprayLed.findNoWifi')).toBeNull();
+      view.unmount();
+    }
+    expect(controller.probe).not.toHaveBeenCalled();
+  });
+
+  it('lists what the search found in its own virtualized list', async () => {
+    network.fetch.mockResolvedValue({ type: 'wifi', details: { ipAddress: '192.168.1.50', subnet: '255.255.255.0' } });
+    controller.probe.mockImplementation(async (url: string) => {
+      if (url === 'http://192.168.1.40' || url === 'http://192.168.1.41') return controllerInfo;
+      throw new LedControllerError('unavailable');
+    });
+    storage.records.set(settingsKey, savedSettings());
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    fireEvent.click(button('find'));
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'sprayLed.findResult' })).toHaveLength(2));
+    const list = screen.getByTestId('flash-list');
+    expect(within(list).getAllByRole('button', { name: 'sprayLed.findResult' })).toHaveLength(2);
+  });
+
+  it('asks for Wi-Fi instead of scanning on mobile data', async () => {
+    network.fetch.mockResolvedValue({ type: 'cellular', details: { cellularGeneration: '5g' } });
+    storage.records.set(settingsKey, savedSettings());
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    fireEvent.click(button('find'));
+    expect(await screen.findByText('sprayLed.findNoWifi')).toBeTruthy();
+    expect(controller.probe).not.toHaveBeenCalled();
+  });
+
+  it('saves brightness and auto-off to the wall from the slider and the auto-off choice', async () => {
+    storage.records.set(settingsKey, savedSettings(true, 'http://wled.local'));
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    // 64 of 255 shows as 25 %.
+    expect(lightingControls.slider?.value).toBe(25);
+    expect(lightingControls.autoOff?.selectedKey).toBe('0');
+    act(() => lightingControls.slider?.onCommit(50));
+    await waitFor(() => expect(storage.records.get(settingsKey)).toMatchObject({ brightness: 128 }));
+    act(() => lightingControls.autoOff?.onSelect('30'));
+    await waitFor(() =>
+      expect(storage.records.get(settingsKey)).toMatchObject({ brightness: 128, autoOffMinutes: 30 }),
+    );
+  });
+
+  // iOS asks for Local Network access on the first contact, so that must be a press.
+  it('contacts nothing when a wall with a saved controller is opened', async () => {
+    storage.records.set('sprayWallLedSettings:wall-1', {
+      version: 1,
+      enabled: true,
+      controller: { type: 'wled', url: 'http://wled.local' },
+    });
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    expect(enabledSwitch().checked).toBe(true);
+    expect(controller.probe).not.toHaveBeenCalled();
+    expect(controller.lightAll).not.toHaveBeenCalled();
+    expect(controller.turnOff).not.toHaveBeenCalled();
+  });
+
+  it('retains the confirmed URL when disabled, re-enabled, and reopened', async () => {
+    const view = render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    fireEvent.click(enabledSwitch());
+    await waitFor(() => expect(screen.queryByRole('textbox')).not.toBeNull());
+    await connect('http://192.168.1.20/');
+    expect(urlInput().value).toBe('http://192.168.1.20');
+    fireEvent.click(enabledSwitch());
+    await waitFor(() => expect(screen.queryByRole('textbox')).toBeNull());
+    expect(storage.records.get(settingsKey)).toEqual(savedSettings(false, 'http://192.168.1.20'));
+    fireEvent.click(enabledSwitch());
+    await waitFor(() => expect(urlInput().value).toBe('http://192.168.1.20'));
+    view.unmount();
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    expect(urlInput().value).toBe('http://192.168.1.20');
+    expect(controller.probe).toHaveBeenCalledTimes(1);
+    expect(controller.lightAll).not.toHaveBeenCalled();
+    expect(controller.turnOff).not.toHaveBeenCalled();
+  });
+
+  it('only tests on OK, saves the normalized address, and leaves lighting to a separate tap', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    enterUrl('wled.local');
+    expect(controller.probe).not.toHaveBeenCalled();
+    fireEvent.click(button('confirm'));
+    await waitFor(() => expect(storage.records.get(settingsKey)).toEqual(savedSettings(true, 'http://wled.local')));
+    expect(screen.queryByText('sprayLed.connected')).not.toBeNull();
+    expect(controller.probe).toHaveBeenCalledWith('http://wled.local', expect.any(AbortSignal));
+    expect(controller.lightAll).not.toHaveBeenCalled();
+    fireEvent.click(button('lightAll'));
+    await waitFor(() => expect(screen.queryByText('sprayLed.lit')).not.toBeNull());
+    expect(controller.lightAll).toHaveBeenCalledWith();
+    fireEvent.click(button('turnOff'));
+    await waitFor(() => expect(screen.queryByText('sprayLed.off')).not.toBeNull());
+    expect(controller.turnOff).toHaveBeenCalledTimes(1);
+  });
+
+  it('deliberately clears a controller even before this editor has lit anything', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    await connect();
+    fireEvent.click(button('turnOff'));
+    await waitFor(() => expect(screen.queryByText('sprayLed.off')).not.toBeNull());
+    expect(controller.turnOff).toHaveBeenCalledWith('http://wled.local');
+  });
+
+  it('serializes settings tests behind route writes and leaves a newer route lit on unmount', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    const view = render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    await connect();
+    const route = createLedPreviewSession(getLedControllerDriver('wled'), 'http://wled.local');
+    const routeWrite = deferred<void>();
+    controller.show.mockReturnValueOnce(routeWrite.promise);
+    const sending = route.show([1]);
+    await waitFor(() => expect(controller.show).toHaveBeenCalledTimes(1));
+    fireEvent.click(button('lightAll'));
+    await act(async () => undefined);
+    expect(controller.lightAll).not.toHaveBeenCalled();
+    await act(async () => {
+      routeWrite.resolve();
+      await sending;
+    });
+    await waitFor(() => expect(screen.queryByText('sprayLed.lit')).not.toBeNull());
+    await act(async () => {
+      await route.show([2]);
+    });
+    view.unmount();
+    await act(async () => undefined);
+    expect(controller.turnOff).not.toHaveBeenCalled();
+    await route.close();
+  });
+
+  it.each(['unavailable', 'timeout', 'not-wled'] as const)(
+    'keeps a %s address only after the explicit keep action',
+    async (code) => {
+      storage.records.set(settingsKey, savedSettings(true, 'http://previous.local'));
+      controller.probe.mockRejectedValueOnce(new LedControllerError(code));
+      render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+      await openSection();
+      enterUrl('offline.local');
+      fireEvent.click(button('confirm'));
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'sprayLed.keepUrl' })).not.toBeNull());
+      expect(storage.records.get(settingsKey)).toEqual(savedSettings(true, 'http://previous.local'));
+      expect(screen.queryByRole('button', { name: 'sprayLed.lightAll' })).toBeNull();
+      fireEvent.click(button('keepUrl'));
+      await waitFor(() =>
+        expect(storage.records.get(settingsKey)).toEqual(savedSettings(true, 'http://offline.local')),
+      );
+      expect(screen.queryByText('sprayLed.saved')).not.toBeNull();
+      expect(controller.lightAll).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects a malformed URL without network traffic or overwriting the saved address', async () => {
+    storage.records.set(settingsKey, savedSettings(true, 'http://previous.local'));
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    enterUrl('https://');
+    fireEvent.click(button('confirm'));
+    expect(screen.queryByText('sprayLed.invalidUrl')).not.toBeNull();
+    expect(screen.queryByRole('button', { name: 'sprayLed.keepUrl' })).toBeNull();
+    expect(storage.write).not.toHaveBeenCalled();
+    expect(controller.probe).not.toHaveBeenCalled();
+  });
+
+  it('ignores an old successful probe after the user changes the address', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    const oldProbe = deferred<LedControllerInfo>();
+    controller.probe.mockReturnValueOnce(oldProbe.promise);
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    enterUrl('old.local');
+    fireEvent.click(button('confirm'));
+    const oldSignal = controller.probe.mock.calls[0][1] as AbortSignal;
+    enterUrl('new.local');
+    expect(oldSignal.aborted).toBe(true);
+    await act(async () => {
+      oldProbe.resolve(controllerInfo);
+    });
+    expect(screen.queryByText('sprayLed.connected')).toBeNull();
+    expect(storage.write).not.toHaveBeenCalled();
+    expect(urlInput().value).toBe('new.local');
+    await connect('new.local');
+    expect(storage.records.get(settingsKey)).toEqual(savedSettings(true, 'http://new.local'));
+  });
+
+  it.each(['collapse', 'disable', 'unmount'] as const)(
+    'cancels an in-flight probe on %s without applying its late result',
+    async (action) => {
+      storage.records.set(settingsKey, savedSettings());
+      const probe = deferred<LedControllerInfo>();
+      controller.probe.mockReturnValueOnce(probe.promise);
+      const view = render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+      await openSection();
+      enterUrl('wled.local');
+      fireEvent.click(button('confirm'));
+      const signal = controller.probe.mock.calls[0][1] as AbortSignal;
+      if (action === 'collapse') fireEvent.click(button('title'));
+      if (action === 'disable') fireEvent.click(enabledSwitch());
+      if (action === 'unmount') view.unmount();
+      expect(signal.aborted).toBe(true);
+      await act(async () => {
+        probe.resolve(controllerInfo);
+      });
+      expect(screen.queryByText('sprayLed.connected')).toBeNull();
+      expect(storage.records.get(settingsKey)).toEqual(savedSettings(action !== 'disable'));
+    },
+  );
+
+  it('shows a lighting failure and permits retry without duplicate in-flight commands', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    const command = deferred<void>();
+    controller.lightAll.mockReturnValueOnce(command.promise);
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    await connect();
+    fireEvent.click(button('lightAll'));
+    fireEvent.click(button('lightAll'));
+    await waitFor(() => expect(controller.lightAll).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      command.reject(new LedControllerError('command-failed'));
+    });
+    expect(screen.queryByText('sprayLed.lightFailed')).not.toBeNull();
+    fireEvent.click(button('lightAll'));
+    await waitFor(() => expect(screen.queryByText('sprayLed.lit')).not.toBeNull());
+    expect(controller.lightAll).toHaveBeenCalledTimes(2);
+  });
+
+  it('starts a fresh editor when changing walls and discards the old connection result', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    storage.records.set('sprayWallLedSettings:wall-2', savedSettings(true, 'http://second.local'));
+    const probe = deferred<LedControllerInfo>();
+    controller.probe.mockReturnValueOnce(probe.promise);
+    const view = render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    enterUrl('first.local');
+    fireEvent.click(button('confirm'));
+    const signal = controller.probe.mock.calls[0][1] as AbortSignal;
+    view.rerender(createElement(SprayWallLedSection, { wallUuid: 'wall-2' }));
+    expect(signal.aborted).toBe(true);
+    expect(button('title').getAttribute('aria-expanded')).toBe('false');
+    await openSection();
+    expect(urlInput().value).toBe('http://second.local');
+    await act(async () => {
+      probe.resolve(controllerInfo);
+    });
+    expect(screen.queryByText('sprayLed.connected')).toBeNull();
+    expect(storage.write).not.toHaveBeenCalled();
+  });
+
+  it('shows storage failures and retries without claiming the URL was saved', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    storage.write.mockRejectedValueOnce(new Error('Storage unavailable'));
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    await openSection();
+    enterUrl('wled.local');
+    fireEvent.click(button('confirm'));
+    await waitFor(() => expect(screen.queryByText('sprayLed.saveFailed')).not.toBeNull());
+    expect(screen.queryByText('sprayLed.saved')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'sprayLed.lightAll' })).toBeNull();
+    await connect();
+    expect(storage.records.get(settingsKey)).toEqual(savedSettings(true, 'http://wled.local'));
+  });
+
+  it('allows retrying a failed settings read and opens this wall’s setup route without contacting WLED', async () => {
+    storage.records.set(settingsKey, savedSettings());
+    storage.read.mockRejectedValueOnce(new Error('Storage unavailable'));
+    render(createElement(SprayWallLedSection, { wallUuid: 'wall-1' }));
+    fireEvent.click(button('title'));
+    await waitFor(() => expect(screen.queryByText('sprayLed.loadFailed')).not.toBeNull());
+    expect(enabledSwitch().disabled).toBe(true);
+    fireEvent.click(button('retry'));
+    await waitFor(() => expect(enabledSwitch().disabled).toBe(false));
+    fireEvent.click(button('setup'));
+    expect(navigation.push).toHaveBeenCalledWith('/boards/spray/led-setup?wallUuid=wall-1');
+    expect(screen.queryByText('sprayLed.setupPending')).toBeNull();
+    expect(controller.probe).not.toHaveBeenCalled();
+    expect(controller.lightAll).not.toHaveBeenCalled();
+  });
+});

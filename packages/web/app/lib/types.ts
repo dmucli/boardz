@@ -59,6 +59,8 @@ export type Climb = {
   // the two sizes, whose hold ids overlap without meaning the same holds
   // (canAddClimbToBoard rule 5).
   compatibleSizeIds?: number[] | null;
+  /** Stored hold sets needed to render this climb. */
+  requiredSetIds?: number[] | null;
 };
 
 export type ClimbQueryResult = {
@@ -167,6 +169,9 @@ export type SearchRequest = {
   // note there). Declared only so USER_SPECIFIC_SEARCH_PARAMS stays indexable
   // against this shape.
   useMyGrades?: boolean;
+  // Liked climbs only. Mobile-only control, same deal as useMyGrades: declared
+  // so USER_SPECIFIC_SEARCH_PARAMS stays indexable against this shape.
+  onlyFavorited?: boolean;
   onlyFollowedAuthors?: boolean;
   onlyDrafts: boolean;
   projectsOnly: boolean;
@@ -313,3 +318,5 @@ export type FetchCurrentProblemResponse = Climb;
 export type ErrorResponse = {
   error: string;
 };
+
+export type { BoardImageDetails } from '@boardsesh/board-config/image-metadata';

@@ -51,6 +51,21 @@ export function configureWorkerPools(): void {
  * startup turns that into a worker that refuses to start.
  */
 export const PROVIDER_FAMILY_SECRETS: Readonly<Record<string, readonly string[]>> = {
+  'cnc-computation': [
+    'CNC_GENERATOR_SHA',
+    'PRIVATE_S3_BUCKET_NAME',
+    'PRIVATE_AWS_ENDPOINT_URL',
+    'PRIVATE_AWS_ACCESS_KEY_ID',
+    'PRIVATE_AWS_SECRET_ACCESS_KEY',
+  ],
+  'cnc-generation': [
+    'CNC_GENERATOR_SHA',
+    'FINGERPRINT_SECRET',
+    'PRIVATE_S3_BUCKET_NAME',
+    'PRIVATE_AWS_ENDPOINT_URL',
+    'PRIVATE_AWS_ACCESS_KEY_ID',
+    'PRIVATE_AWS_SECRET_ACCESS_KEY',
+  ],
   'aurora-user-sync': ['AURORA_CREDENTIALS_SECRET'],
   'kilter-user-sync': ['AURORA_CREDENTIALS_SECRET', 'KILTER_OAUTH_CLIENT_ID'],
   // Both providers, every cycle.
@@ -63,11 +78,11 @@ export const PROVIDER_FAMILY_SECRETS: Readonly<Record<string, readonly string[]>
   // purpose. Without them each run succeeds as a logged skip (#3863).
 };
 
-/** Defaults for one `provider-routine-cycle` run; see docs/background-workers.md. */
+/** Defaults for one `provider-routine-cycle` run; see docs/backend/background-workers.md. */
 // 120 s a cycle (also the maximum): two providers every 5 minutes then offer
 // the one-at-a-time routine worker 240 s of cycles per 300 s plus the last
 // credentials' overrun, leaving room for the board-wide jobs
-// (docs/background-workers.md, "Queue share").
+// (docs/backend/background-workers.md, "Queue share").
 export const ROUTINE_CYCLE_DEFAULTS = { maxCredentials: 4, budgetMs: 120_000 } as const;
 
 /**
@@ -76,7 +91,7 @@ export const ROUTINE_CYCLE_DEFAULTS = { maxCredentials: 4, budgetMs: 120_000 } a
  * the budget is soft: the credential running when it passes finishes (up to
  * the lease). So 2 x 120 s plus that last credential's overrun must fit the
  * 300 s window, with room left for the board-wide jobs
- * (docs/background-workers.md, "Queue share").
+ * (docs/backend/background-workers.md, "Queue share").
  */
 export const ROUTINE_CYCLE_BUDGET_MAX_MS = 120_000;
 

@@ -12,12 +12,19 @@ const restMocks = vi.hoisted(() => ({
   fetchLayoutClimbs: vi.fn(),
   fetchLayoutClimbStats: vi.fn(),
   fetchDeletedClimbUuids: vi.fn(),
+  fetchCuratedClimbStats: vi.fn(),
 }));
 const deletionMocks = vi.hoisted(() => ({ reconcileDeletions: vi.fn() }));
 const locationMocks = vi.hoisted(() => ({ syncKilterLocations: vi.fn() }));
 const notificationMocks = vi.hoisted(() => ({ createSetterSyncNotifications: vi.fn() }));
 
+const curatedMocks = vi.hoisted(() => ({ applyCuratedBenchmarks: vi.fn() }));
 vi.mock('../api/kilter-rest', () => restMocks);
+vi.mock('./curated-benchmarks', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./curated-benchmarks')>();
+  curatedMocks.applyCuratedBenchmarks.mockImplementation(actual.applyCuratedBenchmarks);
+  return { ...actual, applyCuratedBenchmarks: curatedMocks.applyCuratedBenchmarks };
+});
 vi.mock('./deletions', () => deletionMocks);
 vi.mock('./locations-sync', () => locationMocks);
 vi.mock('./notifications', () => notificationMocks);
@@ -199,6 +206,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   restMocks.fetchLayoutClimbStats.mockResolvedValue([] as KilterCatalogStat[]);
   restMocks.fetchDeletedClimbUuids.mockResolvedValue([]);
+  restMocks.fetchCuratedClimbStats.mockResolvedValue([]);
   locationMocks.syncKilterLocations.mockResolvedValue({});
   notificationMocks.createSetterSyncNotifications.mockResolvedValue(undefined);
   deletionMocks.reconcileDeletions.mockResolvedValue({});
@@ -302,5 +310,68 @@ void describe('a failed /delteduuids fetch', () => {
     const { db } = createFakeDb(baseQueues());
 
     return expect(runCatalog(db)).rejects.toMatchObject({ code: 'rate_limited', retryAfterMs: 3_600_000 });
+  });
+});
+
+void describe('the Verified list', () => {
+  it('applies the list before the layouts, so a run cut short still has it', () => {
+    restMocks.fetchLayoutClimbs.mockResolvedValue([]);
+    const { db } = createFakeDb(baseQueues());
+
+    return runCatalog(db).then(() => {
+      const [applied] = curatedMocks.applyCuratedBenchmarks.mock.invocationCallOrder;
+      const [firstLayoutFetch] = restMocks.fetchLayoutClimbs.mock.invocationCallOrder;
+      expect(applied).toBeLessThan(firstLayoutFetch as number);
+    });
+  });
+
+  it('reports a failed pass and still finishes the run', () => {
+    restMocks.fetchLayoutClimbs.mockResolvedValue([]);
+    const failure = new Error('permission denied for table kilter_aurora_benchmarks');
+    curatedMocks.applyCuratedBenchmarks.mockRejectedValueOnce(failure);
+    const onStepError = vi.fn();
+    const { db } = createFakeDb(baseQueues());
+
+    return syncKilterCatalog({
+      db,
+      tokenProvider: () => Promise.resolve('access-token'),
+      reference: referencePull(),
+      layoutUuids: ['27'],
+      onStepError,
+    }).then((summary) => {
+      expect(onStepError).toHaveBeenCalledWith(failure);
+      expect(summary.curatedBenchmarks).toBeNull();
+      expect(locationMocks.syncKilterLocations).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('skips the pass and finishes the run when the fetch fails', () => {
+    restMocks.fetchCuratedClimbStats.mockRejectedValue(new Error('502 from Kilter'));
+    const { db, updates } = createFakeDb(baseQueues());
+
+    return runCatalog(db).then((summary) => {
+      expect(summary.curatedBenchmarks).toBeNull();
+      expect(updates.some((row) => row.table === 'board_climb_stats')).toBe(false);
+      expect(locationMocks.syncKilterLocations).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('rethrows a rate limit so the runner can park the slot', () => {
+    restMocks.fetchCuratedClimbStats.mockRejectedValue(
+      new KilterApiError('rate_limited', '/api/climbs/curated rate limited', 429, 3_600_000),
+    );
+    const { db } = createFakeDb(baseQueues());
+
+    return expect(runCatalog(db)).rejects.toMatchObject({ code: 'rate_limited', retryAfterMs: 3_600_000 });
+  });
+
+  it('refuses an empty list rather than clearing every mark', () => {
+    restMocks.fetchCuratedClimbStats.mockResolvedValue([]);
+    const { db, updates } = createFakeDb(baseQueues());
+
+    return runCatalog(db).then((summary) => {
+      expect(summary.curatedBenchmarks).toMatchObject({ listed: 0, refused: true, cleared: 0, marked: 0 });
+      expect(updates.some((row) => row.table === 'board_climb_stats')).toBe(false);
+    });
   });
 });

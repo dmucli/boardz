@@ -71,6 +71,15 @@ enum ClimbNavigationIntent {
             return
         }
 
+        // The press is in flight from here until just before the Darwin post
+        // (`SharedLockScreenPress`): JS's timed-drive end check waits for it
+        // instead of ending a drive the press may renew, and letting go of the
+        // board under it (Disconnect Bluetooth when driving ends). Only the
+        // app process writes the board, so only it stamps.
+        #if !WIDGET_EXTENSION
+        let pressId = SharedLockScreenPress.begin(in: defaults, asksServer: wallControl.requiresServerAuthorization)
+        #endif
+
         let navigationResult: WidgetNavigationResult
         if wallControl.requiresServerAuthorization {
             #if !WIDGET_EXTENSION
@@ -95,6 +104,10 @@ enum ClimbNavigationIntent {
         guard navigationResult != .serverRejected else {
             #if !WIDGET_EXTENSION
             completionClass = .serverRejected
+            // No write and no Darwin post: JS never hears this press. Settled,
+            // not removed: an earlier press whose stamp this one covered may
+            // still be writing the board.
+            SharedLockScreenPress.settle(pressId, in: defaults)
             #endif
             logger.notice("\(label).perform() rejected by server; skipping local widget, BLE, and JS fallback updates")
             return
@@ -180,7 +193,21 @@ enum ClimbNavigationIntent {
             if !writeSucceeded {
                 completionClass = .bleFailure
             }
+            // The press lit the wall, so it starts or renews a drive (2.7)
+            // the way a climb that lights in the app would, from the Stop
+            // driving after settings JS mirrored into the App Group (Right
+            // away starts none: the press lit its one climb). Written before
+            // the Darwin post so JS, if it is running, adopts it with the
+            // move. The optimistic frame above went out before the drive
+            // existed, so redraw once more.
+            if writeSucceeded, SharedLightingWindowRuntime.recordPress(in: defaults) != nil {
+                await LiveActivityManager.shared.rerenderForLightingWindow()
+            }
         }
+        // Settled once any drive it starts is stored, and before the post: a
+        // timed drive JS finds over from here on was over by this press, which
+        // ends it keeping the board, as its `queueNavigate` will.
+        SharedLockScreenPress.settle(pressId, in: defaults)
         #endif
 
         postQueueNavigateDarwinNotification()

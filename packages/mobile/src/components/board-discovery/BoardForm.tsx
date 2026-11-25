@@ -1,44 +1,70 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useHeaderHeight } from 'expo-router/react-navigation';
+import { PressableSurface } from '../PressableSurface';
+import { AudiencePicker, BOARD_AUDIENCES } from '../privacy/AudiencePicker';
+import { ResourcePrivacyControl } from '../privacy/ResourcePrivacyControl';
+import { OwnPublicGymWarning } from './OwnPublicGymWarning';
+import { usePrivacySettings } from '../../lib/graphql/hooks/use-privacy';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
+  AccessibilityInfo,
   View,
   ScrollView,
   StyleSheet,
-  Pressable,
   KeyboardAvoidingView,
   Platform,
   useWindowDimensions,
   type ViewStyle,
+  type ScrollViewInstance,
 } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { SUPPORTED_BOARDS } from '@boardsesh/board-config';
 import type { BoardName } from '@boardsesh/shared-schema';
 import { useTheme } from '../../providers/theme-provider';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { useNavigation, useRouter } from 'expo-router';
 import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
+import { useKeyboardHeight } from '../../hooks/use-keyboard-height';
+import { useAndroidKeyboardScroll } from '../../hooks/use-android-keyboard-scroll';
+import { useHeaderActions } from '../../hooks/use-header-actions';
+import { useTransparentHeaderInset } from '../../hooks/use-transparent-header-inset';
 import { useForeignSerialBoard } from '../../lib/boards/use-foreign-serial-board';
 import { serialReuseDisclosure } from '../../lib/boards/serial-reuse';
 import type { useBoardBuilder } from './use-board-builder';
 import type { LockedConfigReason } from './locked-config-reason';
 import { BoardConfigChips } from './BoardConfigChips';
+import { BoardSetupRows, type SetupRowModel } from './BoardSetupRows';
+import { StepCounter } from '../spray-wall/StepCounter';
+import {
+  createSetupOptionHandoffId,
+  subscribeToSetupOptionPicks,
+  type SetupOptionField,
+} from '../../lib/boards/setup-option-handoff';
+import { BoardHoldsSummary } from './BoardHoldsSummary';
 import { boardTypeLabel, cleanLayoutName, formatSizeLabel } from './board-builder-labels';
 import { BoardImageNative } from '../BoardImageNative';
 import { getBoardRenderData } from '../../lib/board-details';
 import { useSprayWallToken } from '../../lib/spray/use-spray-wall-token';
-import { sprayWallVisibility, type SprayWallVisibility } from '../../lib/spray/spray-share';
 import { AngleSlider } from '../play-drawer/AngleSlider';
 import { AngleBoardDiagram } from '../play-drawer/AngleBoardDiagram';
 import { SwitchRow } from '../SwitchRow';
-import { SegmentedControl } from '../SegmentedControl';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { Button } from '../Button';
 import { TimerPairingSheet } from '../ble/TimerPairingSheet';
-import { GymPickerSheet } from './GymPickerSheet';
-import { BoardIdentityFields, BoardVisibilityFields, BuilderTextInput, SectionLabel } from './BoardMetaFields';
+import { useGymPickerRoute } from '../../lib/boards/use-gym-picker-route';
+import type { GymPick } from '../../lib/boards/gym-pick-handoff';
+import {
+  BoardIdentityFields,
+  BoardVisibilityFields,
+  BuilderTextInput,
+  SectionLabel,
+  SprayWallVisibilityField,
+} from './BoardMetaFields';
 import { spacing, borderRadius } from '../../theme/tokens';
 import { iosSystemColors } from '../../theme/ios-colors';
 
 const PREVIEW_MAX_HEIGHT = 260;
+/** The restyled Set up's art (`setupStyle="rows"`): smaller, so the rows under it start on the first screen. */
+const ROWS_PREVIEW_MAX_HEIGHT = 200;
 
 type BoardBuilder = ReturnType<typeof useBoardBuilder>;
 
@@ -62,7 +88,7 @@ type BoardFormProps = {
    */
   lockedConfigReason?: LockedConfigReason;
   /**
-   * A submit failure, rendered inline above the action. The create/edit screens
+   * A submit failure, rendered in a reserved line at the top of the form. The create/edit screens
    * are `presentation: 'modal'` routes and the toast overlay draws behind those,
    * so a toast here would never be seen (#4166) — feedback lives in the form.
    */
@@ -72,12 +98,54 @@ type BoardFormProps = {
    * warning so editing your own board never warns about its own serial.
    */
   currentBoardUuid?: string;
+  /** A spray wall's background picker, drawn under its visibility rows. */
+  sprayBackgroundSection?: ReactNode;
+  /** Device-local spray wall lighting, immediately above More options. */
+  sprayLedSection?: ReactNode;
+  /**
+   * The owner's "Help train hold finding" switch. Drawn beside whichever control
+   * says who sees the wall: under the three-way one, or directly above the
+   * audience control once the privacy rollout has replaced it. Owner only.
+   */
+  sprayTrainingSection?: ReactNode;
+  /** Hold Save off without a spinner: something the board needs is still loading (the prefilled gym). */
+  submitBlocked?: boolean;
+  /**
+   * A way out of `errorMessage`, drawn under it (Try again). `opensGymPicker`
+   * also opens the gym picker, for a prefilled gym that turned out to be gone.
+   */
+  errorAction?: { label: string; onPress: () => void; opensGymPicker?: boolean };
+  /**
+   * A setup the catalogue doesn't list (#8151), from the app's own check of the
+   * bundled catalogue or the server's `UNKNOWN_BOARD_CONFIG` refusal: drawn
+   * under the row it is about. The caller clears it once the setup changes.
+   */
+  configError?: BoardConfigError | null;
+  /**
+   * How Board, Layout and Size are picked: `chips` (wrapping chip rows, the
+   * edit screen and the builder with the `add-board-wizard` flag off) or `rows`
+   * (inset-grouped rows opening a menu or a pushed checklist, the wizard's Set
+   * up). `rows` also draws the art at 200 pt with no tile behind it.
+   */
+  setupStyle?: 'chips' | 'rows';
+  /** The gym was picked earlier in the wizard: its row shows it and can't change it. */
+  gymLocked?: boolean;
+  /** The locked gym row's spoken hint, when it differs from "picked on the last step". */
+  gymLockedHint?: string;
+  /** "Step 4 of 4", above the art, when the wizard counts this screen. */
+  stepLabel?: string | null;
+};
+
+/** The setup row a catalogue refusal is about, and the set ids it refused. */
+export type BoardConfigError = {
+  field: 'boardType' | 'layoutId' | 'sizeId' | 'setIds';
+  invalidSetIds: readonly number[];
 };
 
 /**
  * The board builder form — preview art, the board → layout → size → sets cascade,
  * angle picker, name, and a "More options" section (ownership, visibility,
- * location, serial), with a pinned primary action. Shared by the create and edit
+ * location, serial). The submit action sits in the native header (headerRight). Shared by the create and edit
  * screens; the only difference between them is the submit handler/label and
  * whether the config chips are locked. Owns its own location-permission flow.
  */
@@ -91,8 +159,22 @@ export function BoardForm({
   lockedConfigReason = 'permission',
   errorMessage = null,
   currentBoardUuid,
+  sprayBackgroundSection,
+  sprayLedSection,
+  sprayTrainingSection,
+  submitBlocked = false,
+  errorAction,
+  configError = null,
+  setupStyle = 'chips',
+  gymLocked = false,
+  gymLockedHint,
+  stepLabel = null,
 }: BoardFormProps) {
+  const setupRows = setupStyle === 'rows';
+  const headerHeight = useHeaderHeight();
   const { t } = useTranslation('boards');
+  const { data: privacySettings } = usePrivacySettings();
+  const { t: tSettings } = useTranslation('settings');
   const { systemColors } = useTheme();
   // Only warn on a same-config foreign board — cross-model serial reuse is
   // legitimate (see useForeignSerialBoard). Config is null until the form has
@@ -111,12 +193,55 @@ export function BoardForm({
   );
   const foreignSerialBoard = useForeignSerialBoard(builder.serialNumber, currentBoardUuid, serialConflictConfig);
   const foreignSerialDisclosure = foreignSerialBoard ? serialReuseDisclosure(foreignSerialBoard) : null;
-  const insets = useSafeAreaInsets();
   const bottomChrome = useBottomChromeMetrics();
+  // Android draws the keyboard over edge-to-edge routes instead of resizing
+  // them. Keep the lower fields scrollable above it, as on the profile form.
+  const keyboardHeight = useKeyboardHeight(Platform.OS === 'android');
   const { width: windowWidth } = useWindowDimensions();
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const openAdvanced = useCallback(() => setAdvancedOpen(true), []);
+  // The set chips, under "Holds: 3 of 4 sets" in the main form. Closed by
+  // default: nearly every wall has every set, which the size picks for it.
+  const [setsOpen, setSetsOpen] = useState(false);
+  const toggleSetsOpen = useCallback(() => setSetsOpen((open) => !open), []);
+  // A refused set has to be reachable to fix, so its chips show with the error.
+  // A locked setup has no Change, so its (disabled) chips always show which
+  // sets it has.
+  const setsShown = setsOpen || configError?.field === 'setIds' || lockedConfig;
+  // The refused sets still picked: one tap takes them off ("Remove them").
+  const { toggleSet } = builder;
+  const refusedSelectedSetIds = useMemo(
+    () =>
+      configError?.field === 'setIds'
+        ? configError.invalidSetIds.filter((setId) => builder.setIds.includes(setId))
+        : [],
+    [configError, builder.setIds],
+  );
+  const removeRefusedSets = useCallback(() => {
+    for (const setId of refusedSelectedSetIds) toggleSet(setId);
+  }, [refusedSelectedSetIds, toggleSet]);
   const [timerPairingOpen, setTimerPairingOpen] = useState(false);
-  const [gymPickerOpen, setGymPickerOpen] = useState(false);
+  // The gym row pushes the gym picker in this stack (never a sheet on the
+  // Boards sheet); its answer comes back here.
+  const { setSelectedGym } = builder;
+  const onGymPick = useCallback(
+    (pick: GymPick) => {
+      if (pick.kind === 'gym') {
+        setSelectedGym(pick.gym);
+        return;
+      }
+      setSelectedGym(null);
+      // "My gym isn't listed": say where the board is instead.
+      if (pick.kind === 'not_listed') setAdvancedOpen(true);
+    },
+    [setSelectedGym],
+  );
+  const openGymPicker = useGymPickerRoute({
+    currentGymUuid: builder.selectedGym?.uuid ?? null,
+    boardCoords: builder.coords,
+    showsOnMap: builder.isPublic,
+    onPick: onGymPick,
+  });
 
   // Chip options — memoised so the per-snap angle re-render doesn't rebuild them
   // (they don't depend on angle), letting the memoised chip rows bail out.
@@ -164,6 +289,58 @@ export function BoardForm({
     [builder.sets, builder.setIds],
   );
 
+  // The restyled Set up's rows: the same options as the chips, picked by index
+  // from a menu, or by id from the pushed checklist (more than eight options).
+  const { selectBoard, selectLayout, selectSize } = builder;
+  const setupRowModels = useMemo<SetupRowModel[]>(
+    () => [
+      {
+        label: t('mobile.custom.board'),
+        options: boardOptions,
+        onSelectIndex: (index: number) => {
+          const option = boardOptions[index];
+          if (option) selectBoard(option.value);
+        },
+        testID: 'setup-row-board',
+      },
+      {
+        label: t('mobile.custom.layout'),
+        options: layoutOptions,
+        onSelectIndex: (index: number) => {
+          const option = layoutOptions[index];
+          if (option) selectLayout(option.value);
+        },
+        listField: 'layout',
+        testID: 'setup-row-layout',
+      },
+      {
+        label: t('mobile.custom.size'),
+        options: sizeOptions,
+        onSelectIndex: (index: number) => {
+          const option = sizeOptions[index];
+          if (option) selectSize(option.value);
+        },
+        listField: 'size',
+        testID: 'setup-row-size',
+      },
+    ],
+    [t, boardOptions, layoutOptions, sizeOptions, selectBoard, selectLayout, selectSize],
+  );
+  // The checklist hands its pick back to this form only.
+  const [setupHandoffId] = useState(createSetupOptionHandoffId);
+  const selectLayoutRef = useRef(selectLayout);
+  selectLayoutRef.current = selectLayout;
+  const selectSizeRef = useRef(selectSize);
+  selectSizeRef.current = selectSize;
+  useEffect(
+    () =>
+      subscribeToSetupOptionPicks(setupHandoffId, (pick) => {
+        if (pick.field === 'layout') selectLayoutRef.current(pick.value);
+        else selectSizeRef.current(pick.value);
+      }),
+    [setupHandoffId],
+  );
+
   // Editing a wall. `SUPPORTED_BOARDS` drops spray, so a wall can never be PICKED
   // here — this branch is only reached by opening an existing wall for editing,
   // and each thing it hides is a question a wall has no answer to: there is no
@@ -173,40 +350,113 @@ export function BoardForm({
   // screen was the sharp edge: flipping it would put a Bluetooth scan and a
   // device picker on a photograph.
   const isSprayWall = builder.boardName === 'spray';
-  const sprayVisibility = sprayWallVisibility(builder);
-  const { setIsPublic, setIsUnlisted } = builder;
-  // One control, two flags. Public wins over unlisted on read (`sprayWallVisibility`),
-  // so writing the pair exclusively is what keeps the round trip honest.
-  const onSelectVisibility = useCallback(
-    (next: SprayWallVisibility) => {
-      setIsPublic(next === 'public');
-      setIsUnlisted(next === 'unlisted');
-    },
-    [setIsPublic, setIsUnlisted],
-  );
-  const visibilityOptions = useMemo(
-    () => [
-      { key: 'private' as const, label: t('mobile.sprayVisibility.private') },
-      { key: 'unlisted' as const, label: t('mobile.sprayVisibility.unlisted') },
-      { key: 'public' as const, label: t('mobile.sprayVisibility.public') },
-    ],
-    [t],
-  );
   const showPreview = builder.layoutId != null && builder.sizeId != null && builder.setIds.length > 0;
   const setIdsWire = builder.setIds.join(',');
-  // Account for both the scroll content padding and the preview tile's padding.
-  const previewMaxWidth = windowWidth - (spacing[4] + spacing[3]) * 2;
+  // Account for both the scroll content padding and the preview tile's padding
+  // (the rows style draws no tile).
+  const previewMaxWidth = setupRows ? windowWidth - spacing[4] * 2 : windowWidth - (spacing[4] + spacing[3]) * 2;
+  const previewMaxHeight = setupRows ? ROWS_PREVIEW_MAX_HEIGHT : PREVIEW_MAX_HEIGHT;
+
+  // The submit lives in the header, so it never moves with the keyboard. The
+  // create/edit screens are pushed onto the boards modal stack and keep the
+  // native back chevron; only when one opens as the stack's FIRST screen (the
+  // gym finder pushes `/boards/edit` straight into a fresh boards modal) is
+  // there no way out, so Cancel takes the leading slot then.
+  const router = useRouter();
+  const navigation = useNavigation();
+  const { boardName: currentBoardName, layoutId: currentLayoutId, sizeId: currentSizeId } = builder;
+  const openSetupList = useCallback(
+    (field: SetupOptionField) => {
+      const selected = field === 'layout' ? currentLayoutId : currentSizeId;
+      const params: Record<string, string> = { field, boardType: currentBoardName, handoffId: setupHandoffId };
+      if (currentLayoutId != null) params.layoutId = String(currentLayoutId);
+      if (selected != null) params.selected = String(selected);
+      router.push({ pathname: '/boards/add/setup-option', params });
+    },
+    [router, currentBoardName, currentLayoutId, currentSizeId, setupHandoffId],
+  );
+  const isStackRoot = (navigation.getState()?.index ?? 0) === 0;
+  // Counts Save taps, so a second failure with the same words still brings the
+  // error into view and says it again.
+  const [submitAttempt, setSubmitAttempt] = useState(0);
+  const submit = useCallback(() => {
+    setSubmitAttempt((attempt) => attempt + 1);
+    onSubmit();
+  }, [onSubmit]);
+  useHeaderActions({
+    leading: isStackRoot ? { kind: 'cancel', onPress: () => router.back() } : null,
+    trailing: {
+      kind: 'confirm',
+      label: submitLabel,
+      onPress: submit,
+      disabled: !builder.canCreate || submitting || submitBlocked,
+      loading: submitting,
+      prominent: true,
+    },
+    // The form can be swapped for a not-found or no-access state while the
+    // route stays: take Save (and any Cancel) with it.
+    clearOnUnmount: true,
+  });
+
+  const scrollRef = useRef<ScrollViewInstance>(null);
+  const keyboardScroll = useAndroidKeyboardScroll(scrollRef, keyboardHeight, headerHeight + spacing[4]);
+  // A submit failure shows at the top of the form, so the form scrolls back up
+  // to it from wherever the climber was, and a screen reader hears it. The
+  // header inset is the rest offset under `automatic` on a glass header. Runs
+  // once per attempt, when the save has settled with an error.
+  const headerInset = useTransparentHeaderInset();
+  const headerInsetRef = useRef(headerInset);
+  headerInsetRef.current = headerInset;
+  useEffect(() => {
+    if (!errorMessage || submitting) return;
+    scrollRef.current?.scrollTo({ y: -headerInsetRef.current, animated: true });
+    AccessibilityInfo.announceForAccessibility(errorMessage);
+  }, [errorMessage, submitting, submitAttempt]);
 
   return (
-    <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+    <KeyboardAvoidingView
+      keyboardVerticalOffset={headerHeight}
+      style={styles.flex}
+      behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+    >
       <ScrollView
+        ref={scrollRef}
         contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={[styles.content, { paddingBottom: bottomChrome.scrollBottomPadding + spacing[16] }]}
+        contentContainerStyle={[styles.content, { paddingBottom: bottomChrome.scrollBottomPadding + keyboardHeight }]}
         showsVerticalScrollIndicator={false}
         keyboardShouldPersistTaps="handled"
+        {...keyboardScroll}
       >
+        {/* Above everything, so it never pushes a control the climber is
+            looking at; the scroll above brings it into view. */}
+        {errorMessage ? (
+          <Text
+            variant="footnote"
+            color={systemColors.error}
+            style={styles.errorMessage}
+            accessibilityRole="alert"
+            accessibilityLiveRegion="polite"
+          >
+            {errorMessage}
+          </Text>
+        ) : null}
+        {errorMessage && errorAction ? (
+          <Button
+            title={errorAction.label}
+            variant="text"
+            onPress={() => {
+              errorAction.onPress();
+              if (errorAction.opensGymPicker) openGymPicker();
+            }}
+          />
+        ) : null}
+        {stepLabel ? <StepCounter label={stepLabel} /> : null}
         {/* Live board art — turns layout/size/set IDs into a recognizable wall. */}
-        <View style={[styles.preview, { backgroundColor: systemColors.secondaryBackground }]}>
+        <View
+          style={
+            setupRows ? styles.rowsPreview : [styles.preview, { backgroundColor: systemColors.secondaryBackground }]
+          }
+        >
           {showPreview ? (
             <BoardConfigPreview
               boardName={builder.boardName}
@@ -214,11 +464,12 @@ export function BoardForm({
               sizeId={builder.sizeId!}
               setIds={setIdsWire}
               maxWidth={previewMaxWidth}
+              maxHeight={previewMaxHeight}
             />
           ) : (
             <View style={styles.previewPlaceholder}>
               <Icon name="boards" size={40} color={systemColors.tertiaryLabel} />
-              <Text variant="footnote" color={systemColors.tertiaryLabel} style={styles.previewHint}>
+              <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.previewHint}>
                 {t('mobile.create.previewHint')}
               </Text>
             </View>
@@ -239,7 +490,44 @@ export function BoardForm({
           </View>
         ) : null}
 
-        {isSprayWall ? null : (
+        {/* The serial the In range slot heard, said where it can be seen: the
+            field itself is under More options. Change opens it. */}
+        {builder.heardSerial ? (
+          <View
+            style={[styles.lockedHint, { backgroundColor: systemColors.secondaryBackground }]}
+            testID="heard-serial"
+          >
+            <Icon name="bluetooth" size={16} color={systemColors.secondaryLabel} />
+            <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.lockedHintText}>
+              {t('mobile.create.heardSerial', { serial: builder.heardSerial })}
+            </Text>
+            <Button title={t('mobile.create.heardSerialChange')} variant="text" onPress={openAdvanced} />
+          </View>
+        ) : null}
+
+        {setupRows && !isSprayWall ? (
+          <BoardSetupRows
+            rows={setupRowModels}
+            placeholder={t('mobile.setupSuggestion.choose')}
+            disabled={lockedConfig}
+            onOpenList={openSetupList}
+          />
+        ) : null}
+        {setupRows && !isSprayWall ? (
+          <>
+            {configError?.field === 'boardType' ? (
+              <ConfigFieldError message={t('mobile.create.configError.boardType')} testID="config-error-boardType" />
+            ) : null}
+            {configError?.field === 'layoutId' ? (
+              <ConfigFieldError message={t('mobile.create.configError.layoutId')} testID="config-error-layoutId" />
+            ) : null}
+            {configError?.field === 'sizeId' ? (
+              <ConfigFieldError message={t('mobile.create.configError.sizeId')} testID="config-error-sizeId" />
+            ) : null}
+          </>
+        ) : null}
+
+        {setupRows || isSprayWall ? null : (
           <>
             <SectionLabel>{t('mobile.custom.board')}</SectionLabel>
             <BoardConfigChips
@@ -248,6 +536,9 @@ export function BoardForm({
               onSelect={builder.selectBoard}
               disabled={lockedConfig}
             />
+            {configError?.field === 'boardType' ? (
+              <ConfigFieldError message={t('mobile.create.configError.boardType')} testID="config-error-boardType" />
+            ) : null}
           </>
         )}
 
@@ -255,7 +546,7 @@ export function BoardForm({
             PICKED here, but an existing wall can still be opened for editing, and
             a wall has no catalogue layouts at all — its layout IS the wall — so
             without this it would show a "Layout" heading over an empty row. */}
-        {builder.layouts.length > 0 ? (
+        {!setupRows && builder.layouts.length > 0 ? (
           <>
             <SectionLabel>{t('mobile.custom.layout')}</SectionLabel>
             <BoardConfigChips
@@ -266,8 +557,13 @@ export function BoardForm({
             />
           </>
         ) : null}
+        {/* Outside the row's gate: a layout the catalogue lacks is exactly the
+            case where the row may have nothing to draw. */}
+        {!setupRows && configError?.field === 'layoutId' ? (
+          <ConfigFieldError message={t('mobile.create.configError.layoutId')} testID="config-error-layoutId" />
+        ) : null}
 
-        {builder.sizes.length > 0 ? (
+        {!setupRows && builder.sizes.length > 0 ? (
           <>
             <SectionLabel>{t('mobile.custom.size')}</SectionLabel>
             <BoardConfigChips
@@ -277,6 +573,49 @@ export function BoardForm({
               disabled={lockedConfig}
             />
           </>
+        ) : null}
+        {!setupRows && configError?.field === 'sizeId' ? (
+          <ConfigFieldError message={t('mobile.create.configError.sizeId')} testID="config-error-sizeId" />
+        ) : null}
+
+        {/* The hold sets, in the main form (#8151): a setup missing a set shows
+            here, not behind More options. */}
+        {builder.sets.length > 0 && !isSprayWall ? (
+          <>
+            <SectionLabel>{t('mobile.custom.sets')}</SectionLabel>
+            <BoardHoldsSummary
+              boardName={builder.boardName}
+              layoutId={builder.layoutId}
+              sets={builder.sets}
+              selectedSetIds={builder.setIds}
+              expanded={setsShown}
+              onToggleExpanded={toggleSetsOpen}
+              onAddSet={toggleSet}
+              disabled={lockedConfig}
+            />
+            {setsShown ? (
+              <BoardConfigChips
+                groupLabel={t('mobile.custom.sets')}
+                options={setOptions}
+                onSelect={toggleSet}
+                disabled={lockedConfig}
+              />
+            ) : null}
+          </>
+        ) : null}
+        {configError?.field === 'setIds' ? (
+          <ConfigFieldError
+            message={t('mobile.create.configError.setIds', { count: Math.max(1, configError.invalidSetIds.length) })}
+            action={
+              refusedSelectedSetIds.length > 0
+                ? {
+                    label: t('mobile.create.configError.removeSets', { count: refusedSelectedSetIds.length }),
+                    onPress: removeRefusedSets,
+                  }
+                : undefined
+            }
+            testID="config-error-setIds"
+          />
         ) : null}
 
         {builder.angles.length > 0 && !isSprayWall ? (
@@ -308,7 +647,9 @@ export function BoardForm({
             <BoardIdentityFields
               builder={builder}
               namePlaceholder={defaultName}
-              onOpenGymPicker={() => setGymPickerOpen(true)}
+              onOpenGymPicker={openGymPicker}
+              gymLocked={gymLocked}
+              gymLockedHint={gymLockedHint}
             />
 
             {/* Visibility on a WALL lives in the main form, beside the name and
@@ -318,30 +659,66 @@ export function BoardForm({
                 climber's photograph and the open web. The two switches that
                 carry it on a catalogue board are hidden below for spray: three
                 states expressed as two independent booleans made "unlisted and
-                public" reachable, which is a state nobody meant to pick. */}
+                public" reachable, which is a state nobody meant to pick.
+
+                The training switch is the other answer to "who sees my photo",
+                so it stays next to that control in both modes. With the privacy
+                rollout on, the audience control is drawn after this block, and
+                the switch goes last here to sit directly above it. */}
             {isSprayWall ? (
-              <>
-                <SectionLabel>{t('mobile.sprayVisibility.label')}</SectionLabel>
-                <SegmentedControl<SprayWallVisibility>
-                  options={visibilityOptions}
-                  selectedKey={sprayVisibility}
-                  onSelect={onSelectVisibility}
-                  accessibilityLabel={t('mobile.sprayVisibility.label')}
-                />
-                <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.visibilityHint}>
-                  {sprayVisibility === 'public'
-                    ? t('mobile.sprayVisibility.publicHint')
-                    : sprayVisibility === 'unlisted'
-                      ? t('mobile.sprayVisibility.unlistedHint')
-                      : t('mobile.sprayVisibility.privateHint')}
-                </Text>
-              </>
+              privacySettings?.enabled ? (
+                <>
+                  {sprayBackgroundSection}
+                  {sprayTrainingSection}
+                </>
+              ) : (
+                <>
+                  <SprayWallVisibilityField builder={builder} />
+                  {sprayTrainingSection}
+                  {sprayBackgroundSection}
+                </>
+              )
             ) : null}
           </>
         ) : null}
 
-        {/* Advanced — hold sets (default all), visibility, location, serial. */}
-        <Pressable
+        {privacySettings?.enabled && currentBoardUuid ? (
+          <ResourcePrivacyControl kind="board" resourceId={currentBoardUuid} gymUuid={builder.selectedGym?.uuid} />
+        ) : null}
+
+        {privacySettings?.enabled && !currentBoardUuid ? (
+          <View style={{ gap: spacing[3] }}>
+            <AudiencePicker
+              resource
+              confirmPublic={privacySettings.isPrivate}
+              audience={builder.privacyAudience ?? 'public'}
+              options={BOARD_AUDIENCES}
+              disabled={submitting}
+              label={tSettings('privacy.boardAudience')}
+              onChange={(audience) => {
+                builder.setPrivacyAudience(audience);
+                builder.setIsPublic(audience === 'public');
+                builder.setIsUnlisted(audience === 'unlisted');
+              }}
+            />
+            <SwitchRow
+              label={tSettings('privacy.locationAudience')}
+              description={tSettings('privacy.locationMembers')}
+              value={builder.privacyLocationAudience === 'public'}
+              disabled={submitting}
+              onValueChange={(visible) => {
+                builder.setPrivacyLocationAudience(visible ? 'public' : 'only_me');
+                builder.setHideLocation(!visible);
+              }}
+            />
+            <OwnPublicGymWarning gymUuid={builder.selectedGym?.uuid} />
+          </View>
+        ) : null}
+
+        {isSprayWall ? sprayLedSection : null}
+
+        {/* Advanced — ownership, visibility, location, serial. */}
+        <PressableSurface
           onPress={() => setAdvancedOpen((open) => !open)}
           accessibilityRole="button"
           accessibilityState={{ expanded: advancedOpen }}
@@ -349,40 +726,47 @@ export function BoardForm({
         >
           <Text variant="headline">{t('mobile.create.moreOptions')}</Text>
           <Icon name={advancedOpen ? 'chevron.up' : 'chevron.down'} size={18} color={systemColors.secondaryLabel} />
-        </Pressable>
+        </PressableSurface>
 
         {advancedOpen ? (
           <View style={styles.advancedBody}>
-            {builder.sets.length > 0 ? (
-              <>
-                <SectionLabel>{t('mobile.custom.sets')}</SectionLabel>
-                <BoardConfigChips
-                  groupLabel={t('mobile.custom.sets')}
-                  options={setOptions}
-                  onSelect={builder.toggleSet}
-                  disabled={lockedConfig}
-                />
-              </>
-            ) : null}
-
             <SwitchRow label={t('mobile.create.ownBoard')} value={builder.isOwned} onValueChange={builder.setIsOwned} />
-            <BoardVisibilityFields builder={builder} hideVisibilitySwitches={isSprayWall} />
+            {!privacySettings?.enabled ? (
+              <BoardVisibilityFields builder={builder} hideVisibilitySwitches={isSprayWall} />
+            ) : null}
 
             {/* Lights heads the group the serial belongs to — both describe the
                 LED hardware on the wall. Nothing below is hidden when the toggle
                 goes off: buildUpdateInput submits the serial and timer from
                 retained state either way, so hiding a field would be a silent
-                submit trap, and the Rogue workout timer isn't an LED device. */}
+                submit trap, and the Rogue workout timer isn't an LED device. The
+                wall device switch is the exception: it hides with the lights,
+                and the builder leaves it out of the save while it is hidden. */}
+            <SectionLabel>{t('mobile.create.lights')}</SectionLabel>
+            {isSprayWall ? null : (
+              <SwitchRow
+                label={t('mobile.create.hasLeds')}
+                description={t('mobile.create.hasLedsHint')}
+                value={builder.hasLeds}
+                onValueChange={builder.setHasLeds}
+              />
+            )}
+            {/* A wall device (a laser projector, an LED controller on the
+                internet) follows the board feed, so every climber takes the
+                wall with no Bluetooth. Offered under LED lights on a catalogue
+                board, and on its own on a spray wall, which a projector can
+                light too. */}
+            {builder.litByWallDeviceShown ? (
+              <SwitchRow
+                label={t('mobile.create.litByWallDevice')}
+                description={t('mobile.create.litByWallDeviceHint')}
+                value={builder.litByWallDevice}
+                onValueChange={builder.setLitByWallDevice}
+              />
+            ) : null}
+
             {isSprayWall ? null : (
               <>
-                <SectionLabel>{t('mobile.create.lights')}</SectionLabel>
-                <SwitchRow
-                  label={t('mobile.create.hasLeds')}
-                  description={t('mobile.create.hasLedsHint')}
-                  value={builder.hasLeds}
-                  onValueChange={builder.setHasLeds}
-                />
-
                 <SectionLabel>{t('mobile.create.serial')}</SectionLabel>
                 <BuilderTextInput
                   value={builder.serialNumber}
@@ -392,7 +776,7 @@ export function BoardForm({
                   autoCapitalize="characters"
                   maxLength={100}
                 />
-                <Text variant="caption1" color={systemColors.tertiaryLabel} style={styles.serialHint}>
+                <Text variant="caption1" color={systemColors.secondaryLabel} style={styles.serialHint}>
                   {t('mobile.create.serialHint')}
                 </Text>
 
@@ -401,7 +785,7 @@ export function BoardForm({
                   <Icon name="clock" size={20} color={systemColors.secondaryLabel} />
                   <Text
                     variant="body"
-                    color={builder.timerName ? systemColors.label : systemColors.tertiaryLabel}
+                    color={builder.timerName ? systemColors.label : systemColors.secondaryLabel}
                     numberOfLines={1}
                     style={styles.timerName}
                   >
@@ -423,7 +807,7 @@ export function BoardForm({
                     />
                   ) : null}
                 </View>
-                <Text variant="caption1" color={systemColors.tertiaryLabel} style={styles.serialHint}>
+                <Text variant="caption1" color={systemColors.secondaryLabel} style={styles.serialHint}>
                   {t('mobile.create.timerHint')}
                 </Text>
               </>
@@ -457,58 +841,37 @@ export function BoardForm({
           onDismiss={() => setTimerPairingOpen(false)}
         />
       ) : null}
-
-      {/* Presence-driven, like TimerPairingSheet — the two are never open at
-          once and the sheet coordinator serialises them. A SIBLING of the
-          ScrollView, never a child of it. */}
-      {gymPickerOpen ? (
-        <GymPickerSheet
-          selectedUuid={builder.selectedGym?.uuid ?? null}
-          boardCoords={builder.coords}
-          onSelect={(gym) => {
-            builder.setSelectedGym(gym);
-            setGymPickerOpen(false);
-          }}
-          onRequestManualLocation={() => {
-            builder.setSelectedGym(null);
-            setGymPickerOpen(false);
-            setAdvancedOpen(true);
-          }}
-          onDismiss={() => setGymPickerOpen(false)}
-        />
-      ) : null}
-
-      {/* Pinned, safe-area-aware primary action. */}
-      <View
-        style={[
-          styles.footer,
-          {
-            backgroundColor: systemColors.secondaryBackground,
-            borderTopColor: systemColors.separator,
-            paddingBottom: insets.bottom + spacing[3],
-          },
-        ]}
-      >
-        {errorMessage ? (
-          <Text
-            variant="footnote"
-            color={iosSystemColors.systemRed}
-            style={styles.errorMessage}
-            accessibilityLiveRegion="polite"
-          >
-            {errorMessage}
-          </Text>
-        ) : null}
-        <Button
-          title={submitLabel}
-          onPress={onSubmit}
-          variant="filled"
-          size="large"
-          disabled={!builder.canCreate || submitting}
-          loading={submitting}
-        />
-      </View>
     </KeyboardAvoidingView>
+  );
+}
+
+/**
+ * A setup row the catalogue refused, said under that row, with the fix when
+ * there is a one-tap one. Announced as it appears, like the form's top error.
+ */
+function ConfigFieldError({
+  message,
+  action,
+  testID,
+}: {
+  message: string;
+  action?: { label: string; onPress: () => void };
+  testID: string;
+}) {
+  const { systemColors } = useTheme();
+  return (
+    <View style={styles.fieldError} testID={testID}>
+      <Text
+        variant="footnote"
+        color={systemColors.error}
+        accessibilityRole="alert"
+        accessibilityLiveRegion="polite"
+        style={styles.fieldErrorText}
+      >
+        {message}
+      </Text>
+      {action ? <Button title={action.label} variant="text" size="small" onPress={action.onPress} /> : null}
+    </View>
   );
 }
 
@@ -519,12 +882,14 @@ function BoardConfigPreview({
   sizeId,
   setIds,
   maxWidth,
+  maxHeight,
 }: {
   boardName: BoardName;
   layoutId: number;
   sizeId: number;
   setIds: string;
   maxWidth: number;
+  maxHeight: number;
 }) {
   // The preview of a wall being edited resolves synchronously too, so it needs
   // the same subscription as every other board surface. `''` off spray.
@@ -539,7 +904,7 @@ function BoardConfigPreview({
   if (!renderData) return null;
 
   const aspect = renderData.boardWidth / renderData.boardHeight;
-  let height = PREVIEW_MAX_HEIGHT;
+  let height = maxHeight;
   let width = height * aspect;
   if (width > maxWidth) {
     width = maxWidth;
@@ -582,6 +947,14 @@ const styles = StyleSheet.create({
     padding: spacing[3],
     marginBottom: spacing[2],
   },
+  // The restyled Set up: the art alone, its own hairline-free board on the
+  // screen's background, no tile behind it.
+  rowsPreview: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: ROWS_PREVIEW_MAX_HEIGHT,
+    marginBottom: spacing[2],
+  },
   previewPlaceholder: {
     alignItems: 'center',
     gap: spacing[2],
@@ -616,10 +989,6 @@ const styles = StyleSheet.create({
   serialHint: {
     marginTop: spacing[1],
   },
-  visibilityHint: {
-    marginTop: spacing[2],
-    lineHeight: 18,
-  },
   timerRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -649,13 +1018,15 @@ const styles = StyleSheet.create({
   serialWarningText: {
     flex: 1,
   },
-  footer: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[3],
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
   errorMessage: {
-    marginBottom: spacing[2],
     textAlign: 'center',
+  },
+  fieldError: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing[2],
+  },
+  fieldErrorText: {
+    flex: 1,
   },
 });

@@ -13,7 +13,9 @@
     <string id="EnterCode">Enter pairing code</string>
     <string id="Pairing">Pairing…</string>
     <string id="GetCode">Get a code in the Boardsesh app</string>
-    <string id="PairFailed">Bad code — try again</string>
+    <string id="PairFailed">Pairing failed — try again</string>
+    <string id="PairStorageUnavailable">Saved data unavailable</string>
+    <string id="PairStoragePaused">Pairing paused</string>
 
     <!-- Climb screen -->
     <string id="EmptyQueue">Queue is empty</string>
@@ -30,6 +32,7 @@
     <string id="FlashBang">Flash!</string>
     <string id="QueuedOffline">Saved offline</string>
     <string id="LogFailed">Couldn't log</string>
+    <string id="TickRejected">Not saved to logbook</string>
 
     <!-- Session actions -->
     <string id="ActionsTitle">Session</string>
@@ -73,4 +76,29 @@
     <string id="SummaryAttempts">Attempts</string>
     <string id="SummaryProblems">Problems</string>
     <string id="SummaryHint">START to end</string>
+    <!-- Kept on the watch: ticks the server refused, and ticks from an older
+         app version waiting for proof of whose they are. -->
+    <string id="SummaryRefused">refused</string>
+    <string id="SummaryRefusedFull">refused, full</string>
+    <string id="SummaryHeld">on hold</string>
+
+    <!-- Refused ticks (Session menu): retry or delete what the server refused -->
+    <string id="RefusedTitle">Refused ticks</string>
+    <string id="RefusedRetry">Retry all</string>
+    <string id="RefusedDelete">Delete all</string>
+    <string id="RefusedDeleteConfirm">Delete refused ticks? They are not in your logbook.</string>
+    <string id="RefusedRetrying">Queued to send again</string>
+    <string id="RefusedRetryFailed">Couldn't retry</string>
+    <string id="RefusedDeleted">Refused ticks deleted</string>
+    <!-- Only while the refused store is full: clear other accounts' refused ticks -->
+    <string id="RefusedDeleteOthers">Delete others' ticks</string>
+    <string id="RefusedOthersCount">from other accounts</string>
+    <string id="RefusedDeleteOthersConfirm">Delete other accounts' refused ticks? They can't be recovered.</string>
+    <string id="RefusedOthersDeleted">Other accounts' ticks deleted</string>
+    <string id="StatusAttempt">ATTEMPT</string>
+    <string id="RefusedClimbGone">Climb not found</string>
+    <string id="RefusedConflict">Used by another account</string>
+    <string id="RefusedInvalid">Server said invalid</string>
+    <string id="RefusedMissingData">Climb data missing</string>
+    <string id="RefusedOther">Refused</string>
 </strings>

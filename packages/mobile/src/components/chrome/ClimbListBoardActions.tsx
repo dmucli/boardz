@@ -1,0 +1,209 @@
+import { useCallback, useMemo } from 'react';
+import { StyleSheet, View } from 'react-native';
+import { useRouter } from 'expo-router';
+import { useTranslation } from 'react-i18next';
+import { Appbar } from 'react-native-paper';
+import { useTheme } from '../../providers/theme-provider';
+import { useActiveBoard } from '../../lib/graphql/use-active-board';
+import { useDirectoryReportsEnabled } from '../../providers/feature-flags-provider';
+import { aboutBoardHref } from '../../lib/boards/about-board-href';
+import { useDeviceLayout } from '../../hooks/use-device-layout';
+import { useTabChrome } from '../../hooks/use-bottom-accessory';
+import { smartPlaylistHref } from '../../lib/smart-playlists';
+import { WALL_DISPLAY_HREF } from '../../lib/routing/wall-display-link';
+import { formatActiveBoardLabel } from '../../lib/boards/active-board-label';
+import { canAdjustBoardAngle, type BoardAngleFields } from '../../lib/boards/can-adjust-board-angle';
+import { ShowcaseAnchorView } from '../../lib/showcase-anchor';
+import { hapticLight } from '../../lib/haptics';
+import { AppMenu } from '../AppMenu';
+import type { AppMenuAction } from '../AppMenu.types';
+import { Icon } from '../Icon';
+import { Badge } from '../Badge';
+import { iconMap } from '../icon-map';
+import { AngleToolbarAction } from './AngleToolbarAction';
+import { GlassToolbarAction, toolbarGlyphSize, useToolbarActionSize } from './GlassActionToolbar';
+
+type ClimbListBoardActionsProps = {
+  onOpenHistory: () => void;
+  badge?: boolean;
+  showcaseAnchor?: boolean;
+  material?: boolean;
+  /** Draw the one-tap angle first. Off where the angle lives in the leading island. */
+  showAngle?: boolean;
+  /** "Create a climb" as the ⋯ menu's first row, where + has left a compact bar (iPhone, Material phone). */
+  createRow?: { label: string; onPress: () => void };
+};
+
+type ListMenuRow = AppMenuAction & {
+  id: 'create' | 'myClimbs' | 'viewOptions' | 'wallDisplay' | 'aboutBoard' | 'switchBoard';
+};
+
+type CountedBoard = NonNullable<Parameters<typeof formatActiveBoardLabel>[0]> & BoardAngleFields;
+
+/**
+ * How many glass toolbar slots `ClimbListBoardActions` fills for this board:
+ * the angle (adjustable boards, unless `showAngle` is off), history (any board
+ * with a label) and the ⋯ menu. Read from the same conditions the component
+ * renders on.
+ */
+export function climbListBoardActionCount(
+  activeBoard: CountedBoard | null | undefined,
+  { showAngle = true }: { showAngle?: boolean } = {},
+): number {
+  const angle = showAngle && canAdjustBoardAngle(activeBoard) ? 1 : 0;
+  const history = formatActiveBoardLabel(activeBoard) ? 1 : 0;
+  return angle + history + 1;
+}
+
+/**
+ * The Climbs list's trailing board actions. Liquid Glass: the one-tap angle,
+ * history, then the ⋯ menu (View options, Switch board, and the full-screen
+ * Wall display on a tablet with no native MiniPlayer; one with it opens Wall
+ * display from the bar's ⛶). Material draws angle beside the avatar,
+ * so this group keeps history and the menu. The iOS 26 iPhone bar draws the
+ * angle in its leading island (`showAngle` off) and puts + in this menu; so does
+ * a compact Material bar.
+ */
+export function ClimbListBoardActions({
+  onOpenHistory,
+  badge = false,
+  showcaseAnchor = false,
+  material = false,
+  showAngle = true,
+  createRow,
+}: ClimbListBoardActionsProps) {
+  const { t } = useTranslation('climbs');
+  const { t: tSession } = useTranslation('session');
+  const { t: tBoards } = useTranslation('boards');
+  const { systemColors, brandColors } = useTheme();
+  const { data: activeBoard } = useActiveBoard();
+  // About this board: the active board's detail sheet, where Report a problem
+  // lives (never on the climb or the board art).
+  const aboutBoardUuid = useDirectoryReportsEnabled() ? (activeBoard?.uuid ?? null) : null;
+  const router = useRouter();
+  const actionSize = useToolbarActionSize();
+  // Wall display is for a tablet mounted at the board. A tablet with the native
+  // MiniPlayer opens it from the bar's ⛶; one without (Material, Android, iPadOS
+  // before 26) keeps this row.
+  const { isTablet } = useDeviceLayout();
+  const { nativeAccessory } = useTabChrome();
+  const wallDisplayInMenu = isTablet && !nativeAccessory;
+  const boardLabel = formatActiveBoardLabel(activeBoard);
+  const rows = useMemo<ListMenuRow[]>(
+    () => [
+      ...(createRow ? [{ id: 'create' as const, label: createRow.label, systemIcon: iconMap.plus.ios }] : []),
+      { id: 'myClimbs', label: t('mobile.listOptions.myClimbs'), systemIcon: 'person.crop.rectangle' },
+      { id: 'viewOptions', label: t('mobile.listOptions.viewOptions'), systemIcon: iconMap['view.options'].ios },
+      ...(wallDisplayInMenu
+        ? [
+            {
+              id: 'wallDisplay' as const,
+              label: tSession('mobile.boardPresence.wallDisplay.open'),
+              systemIcon: 'arrow.up.left.and.arrow.down.right',
+            },
+          ]
+        : []),
+      ...(aboutBoardUuid
+        ? [
+            {
+              id: 'aboutBoard' as const,
+              label: tBoards('mobile.boardDetail.about'),
+              systemIcon: 'info.circle',
+              dividerBefore: true,
+            },
+          ]
+        : []),
+      {
+        id: 'switchBoard',
+        label: tSession('mobile.boardPresence.switchBoard'),
+        systemIcon: 'arrow.left.arrow.right',
+        dividerBefore: !aboutBoardUuid,
+      },
+    ],
+    [createRow, t, tSession, tBoards, wallDisplayInMenu, aboutBoardUuid],
+  );
+  const rowSignature = rows.map((row) => `${row.id}:${row.label}`).join('|');
+  const handleOpenHistory = useCallback(() => {
+    hapticLight();
+    onOpenHistory();
+  }, [onOpenHistory]);
+
+  return (
+    <>
+      {material || !showAngle ? null : <AngleToolbarAction />}
+      {boardLabel ? (
+        <ShowcaseAnchorView name="board-history-button" enabled={showcaseAnchor}>
+          <View>
+            {material ? (
+              <Appbar.Action
+                icon={iconMap.history.android}
+                color={systemColors.label as string}
+                onPress={handleOpenHistory}
+                accessibilityLabel={t('mobile.listOptions.history', { board: boardLabel })}
+                accessibilityHint={t('mobile.listOptions.historyHint')}
+              />
+            ) : (
+              <GlassToolbarAction
+                onPress={handleOpenHistory}
+                accessibilityLabel={t('mobile.listOptions.history', { board: boardLabel })}
+                accessibilityHint={t('mobile.listOptions.historyHint')}
+              >
+                <Icon
+                  maxFontSizeMultiplier={1}
+                  name="history"
+                  size={toolbarGlyphSize(23, actionSize)}
+                  color={systemColors.label}
+                />
+              </GlassToolbarAction>
+            )}
+            {badge ? (
+              <View style={styles.badge} pointerEvents="none">
+                <Badge visible color={brandColors.primary} size="small" />
+              </View>
+            ) : null}
+          </View>
+        </ShowcaseAnchorView>
+      ) : null}
+      <View style={[styles.menu, !material && { width: actionSize, height: actionSize }]}>
+        <AppMenu
+          // Native popups retain their row indices until dismissed. Remount on
+          // board/row changes rather than let an old tap select a moved row.
+          key={`${activeBoard?.uuid ?? 'none'}|${rowSignature}`}
+          iconName="more"
+          iconAppearance="plain"
+          // The ⋯ fills its toolbar slot (38pt in UIKit's bar); Material keeps M3's.
+          anchorSize={material ? undefined : actionSize}
+          accessibilityLabel={t('mobile.listOptions.title')}
+          actions={rows}
+          onSelectIndex={(index) => {
+            switch (rows[index]?.id) {
+              case 'create':
+                createRow?.onPress();
+                break;
+              case 'myClimbs':
+                router.push(smartPlaylistHref('CREATED_CLIMBS', 'other'), { withAnchor: true });
+                break;
+              case 'viewOptions':
+                router.push('/(tabs)/climbs/settings/climb-list');
+                break;
+              case 'wallDisplay':
+                router.push(WALL_DISPLAY_HREF);
+                break;
+              case 'aboutBoard':
+                if (aboutBoardUuid) router.push(aboutBoardHref(aboutBoardUuid));
+                break;
+              case 'switchBoard':
+                router.push('/boards');
+                break;
+            }
+          }}
+        />
+      </View>
+    </>
+  );
+}
+
+const styles = StyleSheet.create({
+  badge: { position: 'absolute', top: 2, right: 2 },
+  menu: { alignItems: 'center', justifyContent: 'center' },
+});

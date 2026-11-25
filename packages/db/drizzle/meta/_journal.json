@@ -1730,6 +1730,734 @@
       "when": 1790507344172,
       "tag": "0246_climb_stats_recompute_pending",
       "breakpoints": true
+    },
+    {
+      "idx": 247,
+      "version": "7",
+      "when": 1790682183135,
+      "tag": "0247_long_junta",
+      "breakpoints": true
+    },
+    {
+      "idx": 248,
+      "version": "7",
+      "when": 1790749715921,
+      "tag": "0248_spray_wall_pending_visibility",
+      "breakpoints": true
+    },
+    {
+      "idx": 249,
+      "version": "7",
+      "when": 1790980220712,
+      "tag": "0249_adds_spray_wall_render_settings",
+      "breakpoints": true
+    },
+    {
+      "idx": 250,
+      "version": "7",
+      "when": 1790987038165,
+      "tag": "0250_drop_unused_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 251,
+      "version": "7",
+      "when": 1791202050447,
+      "tag": "0251_climb_revisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 252,
+      "version": "7",
+      "when": 1791203098580,
+      "tag": "0252_tick_climb_revision",
+      "breakpoints": true
+    },
+    {
+      "idx": 253,
+      "version": "7",
+      "when": 1791207959498,
+      "tag": "0253_climb_holds_moved_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 254,
+      "version": "7",
+      "when": 1791247958219,
+      "tag": "0254_bouncy_madame_web",
+      "breakpoints": true
+    },
+    {
+      "idx": 255,
+      "version": "7",
+      "when": 1791263940823,
+      "tag": "0255_spray_full_reset_retires_climbs",
+      "breakpoints": true
+    },
+    {
+      "idx": 256,
+      "version": "7",
+      "when": 1791285267769,
+      "tag": "0256_spray_wall_version_art",
+      "breakpoints": true
+    },
+    {
+      "idx": 257,
+      "version": "7",
+      "when": 1791330553107,
+      "tag": "0257_moonboard_v_grades",
+      "breakpoints": true
+    },
+    {
+      "idx": 258,
+      "version": "7",
+      "when": 1791336606054,
+      "tag": "0258_spray_wall_archive_and_reset",
+      "breakpoints": true
+    },
+    {
+      "idx": 259,
+      "version": "7",
+      "when": 1791372366437,
+      "tag": "0259_lumpy_cerise",
+      "breakpoints": true
+    },
+    {
+      "idx": 260,
+      "version": "7",
+      "when": 1791410924096,
+      "tag": "0260_gym_claim_ownership_decisions",
+      "breakpoints": true
+    },
+    {
+      "idx": 261,
+      "version": "7",
+      "when": 1791454934848,
+      "tag": "0261_account_resource_privacy",
+      "breakpoints": true
+    },
+    {
+      "idx": 262,
+      "version": "7",
+      "when": 1791496056466,
+      "tag": "0262_analytics_consent_and_user_activity",
+      "breakpoints": true
+    },
+    {
+      "idx": 263,
+      "version": "7",
+      "when": 1791670721875,
+      "tag": "0263_reset_retired_climb_revision_numbers",
+      "breakpoints": true
+    },
+    {
+      "idx": 264,
+      "version": "7",
+      "when": 1791705938495,
+      "tag": "0264_playlist_grade_summaries",
+      "breakpoints": true
+    },
+    {
+      "idx": 265,
+      "version": "7",
+      "when": 1791752629828,
+      "tag": "0265_privacy_reconcile_tick_tombstones",
+      "breakpoints": true
+    },
+    {
+      "idx": 266,
+      "version": "7",
+      "when": 1791765691056,
+      "tag": "0266_anonymous_on_foreign_boards",
+      "breakpoints": true
+    },
+    {
+      "idx": 267,
+      "version": "7",
+      "when": 1791838287922,
+      "tag": "0267_board_share_links",
+      "breakpoints": true
+    },
+    {
+      "idx": 268,
+      "version": "7",
+      "when": 1791842577777,
+      "tag": "0268_follow_request_notification",
+      "breakpoints": true
+    },
+    {
+      "idx": 269,
+      "version": "7",
+      "when": 1791842577778,
+      "tag": "0269_privacy_public_defaults_backfill",
+      "breakpoints": true
+    },
+    {
+      "idx": 270,
+      "version": "7",
+      "when": 1791848889612,
+      "tag": "0270_climb_reference_membership",
+      "breakpoints": true
+    },
+    {
+      "idx": 271,
+      "version": "7",
+      "when": 1791848889613,
+      "tag": "0271_sync_deletions_stream",
+      "breakpoints": true
+    },
+    {
+      "idx": 272,
+      "version": "7",
+      "when": 1791848889614,
+      "tag": "0272_sync_deletions_cutoff_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 273,
+      "version": "7",
+      "when": 1791848889615,
+      "tag": "0273_climb_membership_withdrawal_flag",
+      "breakpoints": true
+    },
+    {
+      "idx": 274,
+      "version": "7",
+      "when": 1791866044871,
+      "tag": "0274_drop_sync_deletion_stream_triggers",
+      "breakpoints": true
+    },
+    {
+      "idx": 275,
+      "version": "7",
+      "when": 1791866109016,
+      "tag": "0275_drop_sync_deletion_stream_columns",
+      "breakpoints": true
+    },
+    {
+      "idx": 276,
+      "version": "7",
+      "when": 1791884787776,
+      "tag": "0276_drop_climb_content_privacy",
+      "breakpoints": true
+    },
+    {
+      "idx": 277,
+      "version": "7",
+      "when": 1791962811434,
+      "tag": "0277_release_context",
+      "breakpoints": true
+    },
+    {
+      "idx": 278,
+      "version": "7",
+      "when": 1791976510687,
+      "tag": "0278_spray_training_data",
+      "breakpoints": true
+    },
+    {
+      "idx": 279,
+      "version": "7",
+      "when": 1792293023786,
+      "tag": "0279_owner_comment_notifications",
+      "breakpoints": true
+    },
+    {
+      "idx": 280,
+      "version": "7",
+      "when": 1792961429321,
+      "tag": "0280_scope_draft_climb_tombstones",
+      "breakpoints": true
+    },
+    {
+      "idx": 281,
+      "version": "7",
+      "when": 1792989245036,
+      "tag": "0281_drop_stray_climb_content_privacy",
+      "breakpoints": true
+    },
+    {
+      "idx": 282,
+      "version": "7",
+      "when": 1792989245037,
+      "tag": "0282_narrow_content_privacy_type_check",
+      "breakpoints": true
+    },
+    {
+      "idx": 283,
+      "version": "7",
+      "when": 1793123365285,
+      "tag": "0283_gym_listing",
+      "breakpoints": true
+    },
+    {
+      "idx": 284,
+      "version": "7",
+      "when": 1793164265387,
+      "tag": "0284_session_workouts",
+      "breakpoints": true
+    },
+    {
+      "idx": 285,
+      "version": "7",
+      "when": 1793343314383,
+      "tag": "0285_shared_spray_drafts",
+      "breakpoints": true
+    },
+    {
+      "idx": 286,
+      "version": "7",
+      "when": 1793343314384,
+      "tag": "0286_offline_climb_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 287,
+      "version": "7",
+      "when": 1793343933993,
+      "tag": "0287_climb_mutation_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 288,
+      "version": "7",
+      "when": 1793692597289,
+      "tag": "0288_user_deleted_upstream_playlists",
+      "breakpoints": true
+    },
+    {
+      "idx": 289,
+      "version": "7",
+      "when": 1793712417163,
+      "tag": "0289_board_lit_by_wall_device",
+      "breakpoints": true
+    },
+    {
+      "idx": 290,
+      "version": "7",
+      "when": 1794162086974,
+      "tag": "0290_posthog_daily_signups",
+      "breakpoints": true
+    },
+    {
+      "idx": 291,
+      "version": "7",
+      "when": 1794162998966,
+      "tag": "0291_auth_current_store_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 292,
+      "version": "7",
+      "when": 1794162998967,
+      "tag": "0292_auth_uid_email_verification",
+      "breakpoints": true
+    },
+    {
+      "idx": 293,
+      "version": "7",
+      "when": 1794162998968,
+      "tag": "0293_auth_uid_password_recovery",
+      "breakpoints": true
+    },
+    {
+      "idx": 294,
+      "version": "7",
+      "when": 1794162998969,
+      "tag": "0294_auth_web_oauth_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 295,
+      "version": "7",
+      "when": 1794234880275,
+      "tag": "0295_kilter_aurora_benchmarks",
+      "breakpoints": true
+    },
+    {
+      "idx": 296,
+      "version": "7",
+      "when": 1794239487648,
+      "tag": "0296_partner_oauth_schema",
+      "breakpoints": true
+    },
+    {
+      "idx": 297,
+      "version": "7",
+      "when": 1794299995530,
+      "tag": "0297_logbook_changes",
+      "breakpoints": true
+    },
+    {
+      "idx": 298,
+      "version": "7",
+      "when": 1794299995531,
+      "tag": "0298_logbook_change_triggers",
+      "breakpoints": true
+    },
+    {
+      "idx": 299,
+      "version": "7",
+      "when": 1794300197601,
+      "tag": "0299_logbook_snapshots",
+      "breakpoints": true
+    },
+    {
+      "idx": 300,
+      "version": "7",
+      "when": 1794300273523,
+      "tag": "0300_partner_revocation_trigger",
+      "breakpoints": true
+    },
+    {
+      "idx": 301,
+      "version": "7",
+      "when": 1794301080382,
+      "tag": "0301_logbook_snapshots_connection_fk",
+      "breakpoints": true
+    },
+    {
+      "idx": 302,
+      "version": "7",
+      "when": 1794307774903,
+      "tag": "0302_oauth_app_publisher_name",
+      "breakpoints": true
+    },
+    {
+      "idx": 303,
+      "version": "7",
+      "when": 1794352988594,
+      "tag": "0303_stamp_new_credentials",
+      "breakpoints": true
+    },
+    {
+      "idx": 304,
+      "version": "7",
+      "when": 1794392099632,
+      "tag": "0304_spray_wall_led_setups",
+      "breakpoints": true
+    },
+    {
+      "idx": 305,
+      "version": "7",
+      "when": 1794394633644,
+      "tag": "0305_auth_email_resolution_log",
+      "breakpoints": true
+    },
+    {
+      "idx": 306,
+      "version": "7",
+      "when": 1794395533905,
+      "tag": "0306_yielding_scrambler",
+      "breakpoints": true
+    },
+    {
+      "idx": 307,
+      "version": "7",
+      "when": 1794403570492,
+      "tag": "0307_legacy_web_signout",
+      "breakpoints": true
+    },
+    {
+      "idx": 308,
+      "version": "7",
+      "when": 1794407405045,
+      "tag": "0308_native_revocation_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 309,
+      "version": "7",
+      "when": 1794407446865,
+      "tag": "0309_native_denial_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 310,
+      "version": "7",
+      "when": 1794409701387,
+      "tag": "0310_identity_writer_authority",
+      "breakpoints": true
+    },
+    {
+      "idx": 311,
+      "version": "7",
+      "when": 1794572096228,
+      "tag": "0311_cnc_packs",
+      "breakpoints": true
+    },
+    {
+      "idx": 312,
+      "version": "7",
+      "when": 1794588584225,
+      "tag": "0312_browser_binding_selection",
+      "breakpoints": true
+    },
+    {
+      "idx": 313,
+      "version": "7",
+      "when": 1794589219363,
+      "tag": "0313_provider_security_receipts",
+      "breakpoints": true
+    },
+    {
+      "idx": 314,
+      "version": "7",
+      "when": 1794590446204,
+      "tag": "0314_first_password_challenges",
+      "breakpoints": true
+    },
+    {
+      "idx": 315,
+      "version": "7",
+      "when": 1794661067525,
+      "tag": "0315_browser-renewals",
+      "breakpoints": true
+    },
+    {
+      "idx": 316,
+      "version": "7",
+      "when": 1794759818452,
+      "tag": "0316_cnc_pgboss",
+      "breakpoints": true
+    },
+    {
+      "idx": 317,
+      "version": "7",
+      "when": 1794769787734,
+      "tag": "0317_spray_wall_led_brightness",
+      "breakpoints": true
+    },
+    {
+      "idx": 318,
+      "version": "7",
+      "when": 1794956550170,
+      "tag": "0318_partner_self_service_admin",
+      "breakpoints": true
+    },
+    {
+      "idx": 319,
+      "version": "7",
+      "when": 1794957338406,
+      "tag": "0319_partner_workouts_webhooks",
+      "breakpoints": true
+    },
+    {
+      "idx": 320,
+      "version": "7",
+      "when": 1794957369866,
+      "tag": "0320_partner_lifecycle_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 321,
+      "version": "7",
+      "when": 1794958290643,
+      "tag": "0321_partner_webhook_delivery_fences",
+      "breakpoints": true
+    },
+    {
+      "idx": 322,
+      "version": "7",
+      "when": 1794958323725,
+      "tag": "0322_partner_webhook_event_generations",
+      "breakpoints": true
+    },
+    {
+      "idx": 323,
+      "version": "7",
+      "when": 1794958662391,
+      "tag": "0323_partner_webhook_reconcile_fairness",
+      "breakpoints": true
+    },
+    {
+      "idx": 324,
+      "version": "7",
+      "when": 1794960085736,
+      "tag": "0324_partner_workout_initial_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 325,
+      "version": "7",
+      "when": 1794998979555,
+      "tag": "0325_partner_review_7811",
+      "breakpoints": true
+    },
+    {
+      "idx": 326,
+      "version": "7",
+      "when": 1794999983475,
+      "tag": "0326_partner_notice_retention_7811",
+      "breakpoints": true
+    },
+    {
+      "idx": 327,
+      "version": "7",
+      "when": 1795012121306,
+      "tag": "0327_password_guess_windows",
+      "breakpoints": true
+    },
+    {
+      "idx": 328,
+      "version": "7",
+      "when": 1795087223659,
+      "tag": "0328_partner_session_sync",
+      "breakpoints": true
+    },
+    {
+      "idx": 329,
+      "version": "7",
+      "when": 1795087260059,
+      "tag": "0329_partner_session_change_triggers",
+      "breakpoints": true
+    },
+    {
+      "idx": 330,
+      "version": "7",
+      "when": 1795089038022,
+      "tag": "0330_session_hint_privacy",
+      "breakpoints": true
+    },
+    {
+      "idx": 331,
+      "version": "7",
+      "when": 1795262380274,
+      "tag": "0331_feedback_github_conversations",
+      "breakpoints": true
+    },
+    {
+      "idx": 332,
+      "version": "7",
+      "when": 1795372348876,
+      "tag": "0332_offline_write_delivery",
+      "breakpoints": true
+    },
+    {
+      "idx": 333,
+      "version": "7",
+      "when": 1795428172077,
+      "tag": "0333_board_moderation_events",
+      "breakpoints": true
+    },
+    {
+      "idx": 334,
+      "version": "7",
+      "when": 1795432928470,
+      "tag": "0334_directory_reports",
+      "breakpoints": true
+    },
+    {
+      "idx": 335,
+      "version": "7",
+      "when": 1795439791727,
+      "tag": "0335_gym_claim_revoked",
+      "breakpoints": true
+    },
+    {
+      "idx": 336,
+      "version": "7",
+      "when": 1795443893672,
+      "tag": "0336_gym_claim_decision_previous_owner",
+      "breakpoints": true
+    },
+    {
+      "idx": 337,
+      "version": "7",
+      "when": 1795474912694,
+      "tag": "0337_climb_play_count",
+      "breakpoints": true
+    },
+    {
+      "idx": 338,
+      "version": "7",
+      "when": 1795478508503,
+      "tag": "0338_gym_reporting_foundation",
+      "breakpoints": true
+    },
+    {
+      "idx": 339,
+      "version": "7",
+      "when": 1795478508504,
+      "tag": "0339_gym_reporting_tick_time_binding",
+      "breakpoints": true
+    },
+    {
+      "idx": 340,
+      "version": "7",
+      "when": 1795478508505,
+      "tag": "0340_gym_reporting_alias_venue_guard",
+      "breakpoints": true
+    },
+    {
+      "idx": 341,
+      "version": "7",
+      "when": 1795506037104,
+      "tag": "0341_board_setup_suggestions",
+      "breakpoints": true
+    },
+    {
+      "idx": 342,
+      "version": "7",
+      "when": 1795510081319,
+      "tag": "0342_gym_reach_observations",
+      "breakpoints": true
+    },
+    {
+      "idx": 343,
+      "version": "7",
+      "when": 1795512012581,
+      "tag": "0343_gym_grade_inventory",
+      "breakpoints": true
+    },
+    {
+      "idx": 344,
+      "version": "7",
+      "when": 1795512012582,
+      "tag": "0344_observe_spray_inventory",
+      "breakpoints": true
+    },
+    {
+      "idx": 345,
+      "version": "7",
+      "when": 1795519774541,
+      "tag": "0345_spray_hold_refinements",
+      "breakpoints": true
+    },
+    {
+      "idx": 346,
+      "version": "7",
+      "when": 1795529110953,
+      "tag": "0346_hosted_gym_mcp",
+      "breakpoints": true
+    },
+    {
+      "idx": 347,
+      "version": "7",
+      "when": 1795529110954,
+      "tag": "0347_gym_mcp_receipt_retention",
+      "breakpoints": true
+    },
+    {
+      "idx": 348,
+      "version": "7",
+      "when": 1795548792025,
+      "tag": "0348_aurora_live_history",
+      "breakpoints": true
+    },
+    {
+      "idx": 349,
+      "version": "7",
+      "when": 1795553779208,
+      "tag": "0349_gym_directory_repair_audit",
+      "breakpoints": true
+    },
+    {
+      "idx": 350,
+      "version": "7",
+      "when": 1795556070734,
+      "tag": "0350_gym_repair_actor_retention",
+      "breakpoints": true
     }
   ]
 }

@@ -10,7 +10,7 @@ name: Mobile OTA Backport (Approved Release)
 # runtimeVersion and aborts unless its 12-char prefix equals the <shortfp> baked
 # into the anchor tag. A drift means the cherry-pick touched native inputs, so the
 # OTA would resolve a fingerprint no shipped binary has and silently never land —
-# better to fail loudly. See docs/mobile-ota-updates.md.
+# better to fail loudly. See docs/operations/mobile-ota-updates.md.
 #
 # V2 is GONE (destroyed 2026-08-25): this backport publishes only to the V3 server
 # (updates.boardsesh.com) via the eoas CLI pinned in scripts/lib/eoas.ts (used by
@@ -49,9 +49,13 @@ on:
 concurrency:
   group: mobile-ota-production
   cancel-in-progress: false
-  # Keep `queue: max` in lockstep with mobile-ota-production.yml — the two share
-  # this group, and a lane that supersedes pending runs on one side would drop the
-  # per-platform republishes the other side depends on. See the long note there.
+  # Keep `queue: max` in lockstep with mobile-ota-production.yml's `publish` job —
+  # the two share this group, and a lane that supersedes pending runs on one side
+  # would drop the per-platform republishes the other side depends on. See the
+  # long note there. This workflow keeps the group at workflow level: every job
+  # here belongs to the publish (setup only fans out the platform matrix).
+  # production-deploy-watchdog.yml does not watch this workflow, so a backport
+  # parked at its environment gate needs cancelling by hand.
   queue: max
 
 permissions:
@@ -75,9 +79,10 @@ env:
   EXPO_PUBLIC_SENTRY_DSN: https://f55e6626faf787ae5291ad75b010ea14@o4510644927660032.ingest.us.sentry.io/4510644930150400
   EXPO_PUBLIC_POSTHOG_KEY: ${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
   # Manifest base for the offline snapshot bootstrap (bundle-only, no fingerprint
-  # effect). Public Tigris bucket; keep in sync with SNAPSHOT_PUBLIC_BASE_URL in
-  # export-board-snapshots.yml.
-  EXPO_PUBLIC_SNAPSHOT_BASE_URL: https://boardsesh-board-snapshots.t3.tigrisfiles.io/board-snapshots/v1-gzip
+  # effect). Public R2 host; keep in sync with SNAPSHOT_PUBLIC_BASE_URL in
+  # blackheathdc-ansible/inventories/boardsesh_workers.yml (batch defaults).
+  # Cutover: docs/data/board-snapshots.md#batch-worker-owner-export-board-snapshots-family.
+  EXPO_PUBLIC_SNAPSHOT_BASE_URL: https://snapshots.boardsesh.com/board-snapshots/v1-gzip
   # Compatibility input for frozen V3 release anchors. Their app.config.ts reads
   # this variable to emit expo-channel-name; the current config ignores it and
   # bakes the production header literally.
@@ -86,7 +91,7 @@ env:
   # Pin RN's fetch as the global `fetch` (not expo/fetch), which crashes Hermes by
   # tearing down JSI promises off-thread (Sentry 7595562195). Bundle-only flag — it
   # doesn't enter the resolved config, so it never moves the fingerprint. Kept in
-  # lockstep with the other mobile fingerprint workflows. See docs/mobile-ota-updates.md.
+  # lockstep with the other mobile fingerprint workflows. See docs/operations/mobile-ota-updates.md.
   EXPO_PUBLIC_USE_RN_FETCH: '1'
 
 jobs:
@@ -110,13 +115,17 @@ jobs:
           esac
 
   backport:
+    permissions:
+      contents: read
+      actions: write
     needs: setup
     runs-on: ubuntu-latest
     # One platform per matrix job, so this needs a single 34-minute backoff
-    # budget rather than production's two. Derived and enforced in
+    # budget rather than production's two, plus the 25-minute unlock ceiling.
+    # Derived and enforced in
     # mobile-ota-publish-workflow.test.ts from the ladder in
     # scripts/lib/mobile-publish-retry.ts.
-    timeout-minutes: 90
+    timeout-minutes: 150
     # Gates EOO_TOKEN + GOOGLE_MAPS_API_KEY + the EXPO_UPDATES_URL variable.
     environment: Production
     strategy:
@@ -143,7 +152,7 @@ jobs:
       - uses: voidzero-dev/setup-vp@v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       # The hotfix tree is about to move to an older release anchor, which may
       # predate OTA source-map support. Snapshot the exact trusted workflow commit
@@ -155,6 +164,13 @@ jobs:
           mkdir -p "$tooling_root/scripts/lib"
           for source_path in \
             scripts/mobile-publish.ts \
+            scripts/lib/mobile-release-policy.ts \
+            scripts/lib/release-tags.ts \
+            scripts/lib/ota-preview-boot-receipt.ts \
+            scripts/lib/ota-publish-protocol.ts \
+            scripts/lib/ota-boot-check.ts \
+            scripts/mobile-ota-unlock-wait.mjs \
+            scripts/lib/ota-unlock-lease.mjs \
             scripts/lib/eoas.ts \
             scripts/lib/mobile-publish-retry.ts \
             scripts/lib/ota-branch-probe.ts \
@@ -222,8 +238,25 @@ jobs:
               exit 1
             fi
           done
-          echo "Cherry-picking onto $tag: ${commits[*]}"
-          git cherry-pick "${commits[@]}"
+          # Only reviewed code reaches a production OTA: every fix must already be
+          # on main (the runbook lands it there first). The checkout fetched every
+          # branch, so an unreviewed commit pushed anywhere would otherwise resolve.
+          # Fail closed on an unknown, ambiguous or off-main SHA.
+          git fetch --no-tags --quiet origin main
+          resolved=()
+          for commit in "${commits[@]}"; do
+            if ! full="$(git rev-parse --verify --quiet "${commit}^{commit}")"; then
+              echo "::error::'$commit' is not a single known commit."
+              exit 1
+            fi
+            if ! git merge-base --is-ancestor "$full" origin/main; then
+              echo "::error::$full is not on main. Land the fix on main first, then backport its SHA."
+              exit 1
+            fi
+            resolved+=("$full")
+          done
+          echo "Cherry-picking onto $tag: ${resolved[*]}"
+          git cherry-pick "${resolved[@]}"
 
       - name: Overlay trusted OTA publish tooling
         run: |
@@ -231,11 +264,16 @@ jobs:
           tooling_root="$RUNNER_TEMP/ota-publish-tooling"
           mkdir -p scripts/lib
           cp "$tooling_root/scripts/mobile-publish.ts" scripts/mobile-publish.ts
+          cp "$tooling_root/scripts/lib/mobile-release-policy.ts" scripts/lib/mobile-release-policy.ts
+          cp "$tooling_root/scripts/lib/release-tags.ts" scripts/lib/release-tags.ts
+          cp "$tooling_root/scripts/lib/ota-preview-boot-receipt.ts" scripts/lib/ota-preview-boot-receipt.ts
+          cp "$tooling_root/scripts/lib/ota-publish-protocol.ts" scripts/lib/ota-publish-protocol.ts
+          cp "$tooling_root/scripts/lib/ota-boot-check.ts" scripts/lib/ota-boot-check.ts
           cp "$tooling_root/scripts/lib/eoas.ts" scripts/lib/eoas.ts
           cp "$tooling_root/scripts/lib/mobile-publish-retry.ts" scripts/lib/mobile-publish-retry.ts
           cp "$tooling_root/scripts/lib/ota-branch-probe.ts" scripts/lib/ota-branch-probe.ts
           cp "$tooling_root/scripts/mobile-upload-sourcemaps.ts" scripts/mobile-upload-sourcemaps.ts
-          git add scripts/mobile-publish.ts scripts/lib/eoas.ts scripts/lib/mobile-publish-retry.ts scripts/lib/ota-branch-probe.ts scripts/mobile-upload-sourcemaps.ts
+          git add scripts/mobile-publish.ts scripts/lib/eoas.ts scripts/lib/mobile-publish-retry.ts scripts/lib/ota-branch-probe.ts scripts/mobile-upload-sourcemaps.ts scripts/lib/mobile-release-policy.ts scripts/lib/release-tags.ts scripts/lib/ota-preview-boot-receipt.ts scripts/lib/ota-publish-protocol.ts scripts/lib/ota-boot-check.ts
           if ! git diff --cached --quiet; then
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -257,25 +295,11 @@ jobs:
         run: vp install --frozen-lockfile
 
       # The trusted wrapper deliberately invokes the official uploader installed
-      # by the anchored app. Reject anchors that do not carry the audited 7.11.0
+      # by the anchored app. Reject anchors that do not carry an audited
       # implementation instead of changing dependencies (and the fingerprint).
       - name: Validate anchored Sentry uploader support
         run: |
-          set -euo pipefail
-          sentry_version="$(jq -r '.dependencies["@sentry/react-native"] // .devDependencies["@sentry/react-native"] // empty' packages/mobile/package.json)"
-          if [ "$sentry_version" != "7.11.0" ]; then
-            echo "::error::This anchor has @sentry/react-native $sentry_version; OTA source-map backports require exactly 7.11.0. Ship a native update instead."
-            exit 1
-          fi
-          # createRequire anchored at packages/mobile/package.json: under pnpm's
-          # isolated linker `require.resolve` must start from the consuming package,
-          # not the process CWD, to reach the hoisted .pnpm store path.
-          uploader_path="$(cd packages/mobile && node -e 'const path = require("node:path"); const { createRequire } = require("node:module"); const requireFromMobile = createRequire(path.join(process.cwd(), "package.json")); const packageJson = requireFromMobile.resolve("@sentry/react-native/package.json"); console.log(path.join(path.dirname(packageJson), "scripts", "expo-upload-sourcemaps.js"));')"
-          if [ ! -f "$uploader_path" ]; then
-            echo "::error::The anchored @sentry/react-native install has no official Expo source-map uploader."
-            exit 1
-          fi
-          echo "::notice::Anchored app has the audited @sentry/react-native 7.11.0 Expo uploader."
+          node --import tsx --input-type=module --eval 'import * as sourceMapTools from "./scripts/mobile-upload-sourcemaps.ts"; console.log((sourceMapTools.default ?? sourceMapTools).resolveInstalledSentryUploader("packages/mobile"));'
 
       - name: Write .env for Expo build-time inlining
         working-directory: packages/mobile
@@ -294,6 +318,7 @@ jobs:
           EOF
 
       - name: Resolve fingerprint and verify it matches the approved anchor
+        id: fingerprint
         env:
           PLATFORM: ${{ matrix.platform }}
           EXPECTED_SHORTFP: ${{ steps.anchor.outputs.shortfp }}
@@ -306,9 +331,8 @@ jobs:
           # beats the bare "Could not resolve" message below with no root cause.
           raw="$(cd packages/mobile && vp exec expo-updates runtimeversion:resolve --platform "$PLATFORM" || true)"
           fp="$(printf '%s' "$raw" | jq -r '.runtimeVersion // empty' 2>/dev/null || true)"
-          # Require >= 12 hex chars: we compare the first 12 against the anchor's
-          # shortfp, so anything shorter couldn't form a valid comparison anyway.
-          if ! printf '%s' "$fp" | grep -qiE '^[0-9a-f]{12,}$'; then
+          # Unlock and publish both require the complete native fingerprint.
+          if ! printf '%s' "$fp" | grep -qiE '^[0-9a-f]{40}$'; then
             echo "::error::Could not resolve the $PLATFORM fingerprint for the hotfix tree."
             exit 1
           fi
@@ -320,10 +344,22 @@ jobs:
             exit 1
           fi
           echo "::notice::$PLATFORM fingerprint $short matches the approved anchor — safe to publish."
+          echo "runtime_version=$(printf '%s' "$fp" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Await trusted main unlock before the backport publish
+        id: unlock
+        if: ${{ !inputs.dry_run }}
+        timeout-minutes: 25
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          OTA_BRANCH: production
+          IOS_RUNTIME_VERSION: ${{ matrix.platform == 'ios' && steps.fingerprint.outputs.runtime_version || '' }}
+          ANDROID_RUNTIME_VERSION: ${{ matrix.platform == 'android' && steps.fingerprint.outputs.runtime_version || '' }}
+        run: node "$RUNNER_TEMP/ota-publish-tooling/scripts/mobile-ota-unlock-wait.mjs"
 
       - name: Publish OTA to the approved release
         id: publish
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && steps.unlock.outcome == 'success' }}
         env:
           EOO_TOKEN: ${{ secrets.EOO_TOKEN }}
           PLATFORM: ${{ matrix.platform }}
@@ -337,7 +373,7 @@ jobs:
         id: upload_sourcemaps
         if: ${{ !inputs.dry_run && steps.publish.outcome == 'success' }}
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 30
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           PLATFORM: ${{ matrix.platform }}

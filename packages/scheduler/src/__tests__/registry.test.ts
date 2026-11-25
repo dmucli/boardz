@@ -1,10 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { isValidCronExpression } from '../cron/expression';
+import { isValidCronExpression, parseCronExpression } from '../cron/expression';
 import { assertValidTimeZone } from '../cron/zoned-time';
 import { findJob, JOBS, VERCEL_OWNED_CRON_PATHS } from '../jobs/registry';
 import { refreshGymActivityStats } from '../jobs/refresh-gym-activity-stats';
+import { refreshSitemapSetters } from '../jobs/refresh-sitemap-setters';
 import { purgeSprayWallPhotos } from '../jobs/purge-spray-wall-photos';
+import { purgeUserActivity, snapshotActiveUsers } from '../jobs/active-users';
+import { exportSprayTraining } from '../jobs/export-spray-training';
 
 type VercelConfig = { crons?: { path: string; schedule: string }[] };
 
@@ -102,6 +105,16 @@ describe('job registry', () => {
     expect(findJob('refresh-gym-activity-stats')?.webPath).toBeUndefined();
   });
 
+  it('refreshes the setter summary ten minutes after each six-hourly climb tick', () => {
+    expect(findJob('refresh-sitemap-setters')).toMatchObject({
+      schedule: '10 */6 * * *',
+      timezone: 'UTC',
+      timeoutMs: 120_000,
+      run: refreshSitemapSetters,
+    });
+    expect(findJob('refresh-sitemap-setters')?.webPath).toBeUndefined();
+  });
+
   it('runs the spray wall photo purge directly against GraphQL at 07:00 UTC', () => {
     // Pinned as data, like every row above: the 30-day retention window is only
     // as real as the job that acts on it, and a purge silently dropped from the
@@ -116,12 +129,58 @@ describe('job registry', () => {
     expect(findJob('purge-spray-wall-photos')?.webPath).toBeUndefined();
   });
 
+  it('snapshots active users just after midnight UTC and purges old activity at 07:30 UTC', () => {
+    // Pinned as data. The snapshot counts "yesterday", so it must run after UTC
+    // midnight. The purge is what makes the 60-day retention true: dropped
+    // from the registry, the table would grow past it (docs/analytics/analytics-consent.md).
+    expect(findJob('snapshot-active-users')).toMatchObject({
+      schedule: '20 0 * * *',
+      timezone: 'UTC',
+      timeoutMs: 600_000,
+      run: snapshotActiveUsers,
+    });
+    expect(findJob('purge-user-activity')).toMatchObject({
+      schedule: '30 7 * * *',
+      timezone: 'UTC',
+      timeoutMs: 600_000,
+      run: purgeUserActivity,
+    });
+    expect(findJob('snapshot-active-users')?.webPath).toBeUndefined();
+    expect(findJob('purge-user-activity')?.webPath).toBeUndefined();
+  });
+
+  it('runs the spray training export directly against GraphQL every six hours', () => {
+    // The schedule is the promise: a wall whose owner switches training off
+    // leaves every stored export within 24 hours, because each run retires
+    // before it writes. Six-hourly, so two failed runs in a row still keep it;
+    // a daily run would have no slack at all. 08:00 stays in the list, an hour
+    // after the 07:00 purge, and none of the four shares a tick with another job.
+    expect(findJob('export-spray-training')).toMatchObject({
+      schedule: '0 2,8,14,20 * * *',
+      timezone: 'UTC',
+      timeoutMs: 900_000,
+      run: exportSprayTraining,
+    });
+    expect(findJob('export-spray-training')?.webPath).toBeUndefined();
+
+    // Day-of-week is ignored on purpose: a job that only runs on Sundays still
+    // shares a tick on Sundays.
+    const exportSlots = parseCronExpression('0 2,8,14,20 * * *');
+    for (const otherJob of JOBS.filter((job) => job.name !== 'export-spray-training')) {
+      const otherSlots = parseCronExpression(otherJob.schedule);
+      const sharesTick =
+        [...exportSlots.hours].some((hour) => otherSlots.hours.has(hour)) &&
+        [...exportSlots.minutes].some((minute) => otherSlots.minutes.has(minute));
+      expect(sharesTick, `${otherJob.name} shares a tick with the export`).toBe(false);
+    }
+  });
+
   it('gives the long jobs more than the 300s Vercel capped them at', () => {
     // These routes were pinned at Vercel's Pro maximum, not at a measured
     // duration — `refresh-sitemap-climbs` included, whose route still exports
     // it. Dropping the scheduler timeout back to 300s would re-impose a limit
     // the platform no longer forces on us.
-    for (const job of JOBS.filter((candidate) => candidate.name !== 'cleanup')) {
+    for (const job of JOBS.filter((candidate) => !['cleanup', 'refresh-sitemap-setters'].includes(candidate.name))) {
       expect(job.timeoutMs, `${job.name} timeoutMs`).toBeGreaterThan(300_000);
     }
   });

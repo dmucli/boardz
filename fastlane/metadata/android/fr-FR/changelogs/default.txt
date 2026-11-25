@@ -1,5 +1,7 @@
-Nouveautés de la version 2.5 :
-- Compatible Woods de bout en bout : ajoute ta 12x12 ou 8x10, parcours 5 000 blocs et leurs règles, allume-les en Bluetooth, ouvre et remixe les tiens, mets un bloc en miroir et le mur suit.
-- Prends le mur sur une board sans LED : ton crew et l'écran de la salle suivent le bloc que tu mets.
-- Mets ton bloc en miroir depuis la notification Android ; l'app, ton crew et les LED suivent.
-- Les prises s'affichent plus vite et les blocs téléchargés restent à jour.
+Nouveau en 2.8.0 :
+Disponible en chinois simplifié.
+- 4x4, À la limite, À la minute. Accueil : ta semaine et projets.
+- Spraywall avec WLED ; extinction automatique en Wi-Fi. Installation Bluetooth en bêta facultative pour contrôleurs compatibles.
+- Interface Android simplifiée, navigation compacte et commandes sur écran verrouillé revues.
+- Rendu GPU plus fluide si compatible.
+- Ouvre les entraînements d’applis compatibles et autorise la lecture du carnet : https://www.boardsesh.com/developers/

@@ -5,6 +5,8 @@
 import * as Sentry from '@sentry/nextjs';
 import { isAutomatedCrawlerUserAgent } from './app/lib/is-crawler';
 import { isProductionHost } from './app/lib/production-hosts';
+import { redactShareCapabilitiesFromEvent } from './app/lib/observability/redact-share-capabilities';
+import { redactSensitiveSpanUrls } from './app/lib/observability/sentry-tracing';
 
 // Only enable Sentry on the production boardsesh.com hosts. Exact-host match
 // (see production-hosts.ts for why), NOT a substring: preview deploys run at
@@ -50,9 +52,11 @@ Sentry.init({
   // Enable logs to be sent to Sentry
   enableLogs: true,
 
-  // Enable sending user PII (Personally Identifiable Information)
+  // Off (#2644). Sentry runs under legitimate interest whatever a visitor's
+  // analytics consent, so the browser SDK must not ask Sentry to infer the
+  // visitor's IP address or attach other personal data by default.
   // https://docs.sentry.io/platforms/javascript/guides/nextjs/configuration/options/#sendDefaultPii
-  sendDefaultPii: true,
+  sendDefaultPii: false,
 
   // Browser page loads and client-side navigations. `browserTracingIntegration`
   // is already in @sentry/nextjs's client defaults (its `getDefaultIntegrations`
@@ -63,6 +67,7 @@ Sentry.init({
   // 10%, not the server's 25%: a page load fans out into many more spans
   // (resource timings, fetches, navigations) than a server transaction.
   tracesSampleRate: 0.1,
+  beforeSendSpan: redactSensitiveSpanUrls,
 
   // `tracePropagationTargets` is deliberately LEFT UNSET here.
   //
@@ -70,7 +75,7 @@ Sentry.init({
   // relative) only, which is exactly what we want. Adding 'ws.boardsesh.com' to
   // reach the backend would be wrong *today* — packages/backend/src/handlers/cors.ts
   // answers preflights with
-  //     Access-Control-Allow-Headers: 'Content-Type, Authorization, Content-Encoding'
+  //     Access-Control-Allow-Headers: 'Content-Type, Authorization, Content-Encoding, X-Boardsesh-Platform'
   // and nothing else. The moment the browser SDK decides a cross-origin request
   // is a propagation target it puts `sentry-trace, baggage` into that request's
   // Access-Control-Request-Headers, the preflight fails against that allowlist,
@@ -119,6 +124,11 @@ Sentry.init({
     return event;
   },
 });
+
+// A home board's share link (`/b/{slug}?invite=…`), an unlisted wall's share
+// link (`?wall=<uuid>`) and the sign-in page that carries either back all hold a
+// capability in the URL Sentry records.
+Sentry.addEventProcessor(redactShareCapabilitiesFromEvent);
 
 // eslint-disable-next-line import/namespace -- oxlint can't see captureRouterTransitionStart in @sentry/nextjs's exports, but it's a real export.
 export const onRouterTransitionStart = Sentry.captureRouterTransitionStart;

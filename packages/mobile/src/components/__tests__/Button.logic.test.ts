@@ -6,11 +6,19 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../../lib/haptics', () => ({ hapticLight: vi.fn() }));
 
 import {
+  DEFAULT_BUTTON_MAX_FONT_SCALE,
+  buttonLabelStyle,
+  buttonLabelWeight,
+  resolveIosButtonStyle,
+  resolveButtonMaxFontScale,
+  cappedComposeLabelSize,
+  dynamicTypeSizeCap,
   buttonFillAxes,
   buttonMatchContents,
   isFullWidthStyle,
   makeButtonPressHandler,
   pinnedButtonHeight,
+  iosControlSize,
 } from '../Button.logic';
 
 // The Button is a native @expo/ui control split across Button.ios.tsx /
@@ -132,5 +140,108 @@ describe('buttonMatchContents', () => {
   it('leaves the height to Yoga when the caller pinned one', () => {
     expect(buttonMatchContents({ flex: 1, height: 56 })).toEqual({ horizontal: false, vertical: false });
     expect(buttonMatchContents({ height: 56 })).toEqual({ horizontal: true, vertical: false });
+  });
+});
+
+describe('dynamicTypeSizeCap', () => {
+  it('caps 1.3x at xxLarge (21pt body, 1.24x): xxxLarge is 23pt, 1.35x', () => {
+    expect(dynamicTypeSizeCap(1.3)).toBe('xxLarge');
+  });
+
+  it('never caps below the default size, and walks up the scale', () => {
+    expect(dynamicTypeSizeCap(1)).toBe('large');
+    expect(dynamicTypeSizeCap(0.5)).toBe('large');
+    expect(dynamicTypeSizeCap(1.2)).toBe('xLarge');
+    expect(dynamicTypeSizeCap(2)).toBe('accessibility2');
+  });
+});
+
+describe('cappedComposeLabelSize', () => {
+  it('leaves the label alone within the cap, and holds it at the cap beyond', () => {
+    expect(cappedComposeLabelSize(14, 1.2, 1.3)).toBeUndefined();
+    expect(cappedComposeLabelSize(14, 2, undefined)).toBeUndefined();
+    // 14sp x 2 scale would be 28; capped at 1.3 it renders 18.2.
+    expect((cappedComposeLabelSize(14, 2, 1.3) ?? 0) * 2).toBeCloseTo(14 * 1.3);
+  });
+});
+
+describe('resolveButtonMaxFontScale', () => {
+  it('defaults to full accessibility text sizes', () => {
+    expect(DEFAULT_BUTTON_MAX_FONT_SCALE).toBe(0);
+    expect(resolveButtonMaxFontScale(undefined)).toBe(0);
+  });
+
+  it("keeps a caller's own cap", () => {
+    expect(resolveButtonMaxFontScale(1.3)).toBe(1.3);
+  });
+
+  it('resolves to accessibility5 on iOS', () => {
+    expect(dynamicTypeSizeCap(resolveButtonMaxFontScale(undefined))).toBe('accessibility5');
+  });
+
+  it('holds an Android label at 1.5x once the OS scale passes it', () => {
+    // 14sp labelLarge at a 2x OS font scale: 14 * 1.5 / 2 = 10.5sp, drawn at 21sp.
+    expect(cappedComposeLabelSize(14, 2, 1.5)).toBe(10.5);
+    expect(cappedComposeLabelSize(14, 1.4, 1.5)).toBeUndefined();
+  });
+});
+
+describe('buttonLabelWeight', () => {
+  it('is semibold only on the prominent styles', () => {
+    expect(buttonLabelWeight('borderedProminent')).toBe('semibold');
+    expect(buttonLabelWeight('glassProminent')).toBe('semibold');
+    expect(buttonLabelWeight('glass')).toBe('regular');
+    expect(buttonLabelWeight('bordered')).toBe('regular');
+    expect(buttonLabelWeight('borderless')).toBe('regular');
+  });
+});
+
+describe('resolveIosButtonStyle', () => {
+  it('draws filled prominent and text borderless on any surface', () => {
+    for (const overContent of [true, false]) {
+      expect(resolveIosButtonStyle({ variant: 'filled', overContent, supportsGlass: true })).toBe('borderedProminent');
+      expect(resolveIosButtonStyle({ variant: 'text', overContent, supportsGlass: true })).toBe('borderless');
+    }
+  });
+
+  it('draws the middle tier as a prominent scrim pill over board art', () => {
+    expect(resolveIosButtonStyle({ variant: 'outlined', overContent: true, supportsGlass: true })).toBe(
+      'borderedProminent',
+    );
+    expect(resolveIosButtonStyle({ variant: 'tonal', overContent: true, supportsGlass: false })).toBe(
+      'borderedProminent',
+    );
+  });
+
+  it('draws the middle tier as glass on iOS 26 and bordered before it', () => {
+    expect(resolveIosButtonStyle({ variant: 'outlined', overContent: false, supportsGlass: true })).toBe('glass');
+    expect(resolveIosButtonStyle({ variant: 'tonal', overContent: false, supportsGlass: false })).toBe('bordered');
+  });
+});
+
+describe('buttonLabelStyle', () => {
+  it('sets every Compose label in M3 labelLarge', () => {
+    expect(buttonLabelStyle(undefined)).toEqual({ typography: 'labelLarge' });
+  });
+
+  it('keeps labelLarge and scales the 20/14 line height when the size is capped', () => {
+    expect(buttonLabelStyle(10.5)).toEqual({ typography: 'labelLarge', fontSize: 10.5, lineHeight: 15 });
+  });
+});
+
+describe('iosControlSize', () => {
+  it('drops a pinned large button to regular so the pin owns the height (#5663)', () => {
+    expect(iosControlSize('large', { flex: 1, height: 48 })).toBe('regular');
+  });
+
+  it('keeps large when nothing is pinned', () => {
+    expect(iosControlSize('large', { flex: 1 })).toBe('large');
+    expect(iosControlSize('large', undefined)).toBe('large');
+  });
+
+  it('maps medium and small the same pinned or not', () => {
+    expect(iosControlSize('medium', { height: 48 })).toBe('regular');
+    expect(iosControlSize('medium', undefined)).toBe('regular');
+    expect(iosControlSize('small', { height: 48 })).toBe('small');
   });
 });

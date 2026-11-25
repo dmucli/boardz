@@ -1,12 +1,15 @@
+import { Text } from '../Text';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
 import { createElement, type ChangeEvent, type CSSProperties } from 'react';
-import { StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../../providers/theme-provider';
 import { spacing } from '../../theme/tokens';
 import { makeAngleSliderHandler, sliderIndexForAngle } from './AngleSlider.logic';
 import type { AngleSliderProps } from './AngleSlider.types';
 
-export function AngleSlider({ angles, value, onChange }: AngleSliderProps) {
+export function AngleSlider({ angles, value, onChange, accessibilityLabel, showValue = true }: AngleSliderProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('climbs');
   const { brandColors, systemColors } = useTheme();
   if (angles.length === 0) return null;
@@ -14,7 +17,9 @@ export function AngleSlider({ angles, value, onChange }: AngleSliderProps) {
   const valueIndex = sliderIndexForAngle(angles, value);
   const handleSliderValue = makeAngleSliderHandler(angles, valueIndex, onChange);
   const rangeStyle: CSSProperties = {
-    accentColor: brandColors.primaryFill,
+    // A control on the card takes `primary`, as the native sliders do; the
+    // dark-mode fill is under 3:1 there.
+    accentColor: brandColors.primary,
     cursor: 'pointer',
     flex: 1,
     minWidth: 0,
@@ -26,7 +31,9 @@ export function AngleSlider({ angles, value, onChange }: AngleSliderProps) {
     max: angles.length - 1,
     step: 1,
     value: valueIndex,
-    'aria-label': t('angleSelector.selectAngle'),
+    'aria-label': accessibilityLabel ?? t('angleSelector.selectAngle'),
+    // The range runs in INDEX space; without this a screen reader reads "4".
+    'aria-valuetext': `${angles[valueIndex]}°`,
     onChange: (event: ChangeEvent<HTMLInputElement>) => handleSliderValue(Number(event.currentTarget.value)),
     style: rangeStyle,
   });
@@ -34,23 +41,28 @@ export function AngleSlider({ angles, value, onChange }: AngleSliderProps) {
   return (
     <View style={styles.container}>
       {rangeInput}
-      <Text style={[styles.value, { color: systemColors.label as string }]}>{`${angles[valueIndex]}°`}</Text>
+      {showValue ? (
+        <Text
+          emphasized
+          style={[styles.value, { color: systemColors.label as string }]}
+        >{`${angles[valueIndex]}°`}</Text>
+      ) : null}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  container: {
-    alignItems: 'center',
-    flexDirection: 'row',
-    gap: spacing[4],
-    minHeight: 48,
-    width: '100%',
-  },
-  value: {
-    fontSize: 18,
-    fontWeight: '600',
-    minWidth: 56,
-    textAlign: 'center',
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    container: {
+      alignItems: 'center',
+      flexDirection: 'row',
+      gap: spacing[4],
+      minHeight: 48,
+      width: '100%',
+    },
+    value: {
+      fontSize: textStyles.body.fontSize,
+      minWidth: 56,
+      textAlign: 'center',
+    },
+  });

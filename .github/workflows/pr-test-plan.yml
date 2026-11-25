@@ -1,8 +1,10 @@
 name: PR Test Plan
 
 # Fails a PR whose description has no usable `## Test plan` (1–5 numbered steps)
-# or no `Risk: N/5 — why` line. Testers read the plan verbatim in the mobile app
-# (the crowdsourced-QA flow, docs/crowdsourced-qa.md), so the rules are the
+# or no `Risk: N/5 — why` line, and a PR that changes the phone's SQLite migration
+# list without a ticked statement that the previous stable bundle can read the
+# result (docs/data/offline-sync.md, "Older JS on a newer database"). Testers read the plan verbatim in the mobile app
+# (the crowdsourced-QA flow, docs/qa/crowdsourced-qa.md), so the rules are the
 # reader's: short, numbered, one action and one expected result per step. The
 # rule set is `validatePrBody` in @boardsesh/pr-body, run by
 # scripts/check-pr-test-plan.ts — the same parser the backend uses to serve the
@@ -107,6 +109,16 @@ jobs:
                 throw error;
               }
             }
+      - name: Check out app input policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # Keep the later full checkout/install free of sparse-checkout state.
+          path: app-input-policy
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/lib/app-build-inputs.mjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
       - name: Label PRs that also need a backend deploy
         if: ${{ contains(fromJSON('["opened", "synchronize", "reopened", "ready_for_review"]'), github.event.action) }}
         # Non-blocking, same as the migration label above: a tester aid must
@@ -122,23 +134,9 @@ jobs:
             // whatever production is running.
             const BACKEND_PREFIXES = ['packages/backend/', 'packages/db/', 'packages/shared-schema/'];
 
-            // Kept in step with `affectsMobilePreview` in mobile-ota-preview.yml
-            // — the label only means something for a PR that actually ships a
-            // preview bundle.
-            const affectsMobilePreview = (path) =>
-              path.startsWith('packages/mobile/') ||
-              path.startsWith('packages/shared/') ||
-              path.startsWith('packages/board-constants/') ||
-              path.startsWith('packages/shared-schema/') ||
-              path.startsWith('patches/') ||
-              path === 'package.json' ||
-              path === 'pnpm-lock.yaml' ||
-              path === 'pnpm-workspace.yaml' ||
-              path === 'scripts/mobile-publish.ts' ||
-              path === 'scripts/lib/mobile-publish-retry.ts' ||
-              path === 'scripts/lib/ota-branch-probe.ts' ||
-              path === 'scripts/lib/eoas.ts' ||
-              path === '.github/workflows/mobile-ota-preview.yml';
+            // The label uses the same app inputs as preview publication.
+            const { isNativeAppAffecting: affectsMobilePreview } =
+              await import(`${process.env.GITHUB_WORKSPACE}/app-input-policy/scripts/lib/app-build-inputs.mjs`);
 
             const pr = context.payload.pull_request;
             let wanted;
@@ -146,7 +144,8 @@ jobs:
               const files = await github.paginate(github.rest.pulls.listFiles, {
                 ...context.repo, pull_number: pr.number, per_page: 100,
               });
-              const paths = files.map((file) => file.filename);
+              if (files.length >= 3000) throw new Error('PR changed-file listing is incomplete.');
+              const paths = files.flatMap((file) => [file.filename, file.previous_filename].filter(Boolean));
               // Both halves, deliberately: a backend-only PR has no preview to
               // label, and a mobile-only PR needs no deploy.
               wanted =
@@ -196,15 +195,32 @@ jobs:
         if: ${{ !endsWith(github.event.pull_request.user.login, '[bot]') }}
         with:
           node-version: '22.x'
-          # Only on GitHub-hosted runners. The self-hosted CI image already
-          # bakes the pnpm store (boardsesh#5008), so a cache restore buys
-          # nothing there while the matching SAVE uploads to GitHub's cache
-          # service over the open internet. Measured on a bs-ci runner: the
-          # setup-vp post step took 148s of a 210s job, against 0s hosted.
-          cache: ${{ runner.environment == 'github-hosted' }}
+          # No shared cache: this job can write to pull requests
+          # (scripts/workflow-cache-restore.test.ts). The self-hosted CI image
+          # already bakes the pnpm store (boardsesh#5008), so self-hosted runs
+          # lose nothing; hosted runs install cold.
+          cache: false
       - name: Install dependencies
         if: ${{ !endsWith(github.event.pull_request.user.login, '[bot]') }}
         run: vp install --frozen-lockfile
+      - name: List the files this PR changes
+        if: ${{ !endsWith(github.event.pull_request.user.login, '[bot]') }}
+        # Blocking, unlike the label steps above: the gate below needs this list
+        # to know whether the PR changes the offline migration list, and a rule
+        # that is skipped whenever the listing fails is not a rule.
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo, pull_number: context.payload.pull_request.number, per_page: 100,
+            });
+            // Both names of a rename: moving the migration list is changing it.
+            const paths = files.flatMap((file) =>
+              file.previous_filename ? [file.filename, file.previous_filename] : [file.filename],
+            );
+            fs.writeFileSync('pr-files.txt', paths.join('\n') + '\n');
+            core.info(`Wrote ${paths.length} changed path(s) to pr-files.txt.`);
       - name: Check PR has a test plan and a risk score
         if: ${{ !endsWith(github.event.pull_request.user.login, '[bot]') }}
         env:
@@ -214,4 +230,4 @@ jobs:
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels) }}
         run: |
           printf '%s' "$PR_BODY" > pr-body.txt
-          vp run check:pr-test-plan -- --body-file pr-body.txt
+          vp run check:pr-test-plan -- --body-file pr-body.txt --changed-files-file pr-files.txt

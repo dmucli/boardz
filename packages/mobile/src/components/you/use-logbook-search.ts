@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useReducer } from 'react';
+import { useEffect, useMemo, useReducer, useState } from 'react';
 import {
   DEFAULT_LOGBOOK_FILTERS,
   DEFAULT_LOGBOOK_SORT,
+  isLogbookDateFilterActive,
+  statusSegmentFor,
   type LogbookFilterState,
-  type LogbookSortPreset,
   type LogbookSortState,
 } from '@boardsesh/logbook';
 import { loadLogbookPrefs, saveLogbookPrefs } from '../../lib/logbook-prefs-store';
@@ -14,8 +15,9 @@ import { loadLogbookPrefs, saveLogbookPrefs } from '../../lib/logbook-prefs-stor
  * (props) and to `toAscentFeedInput` for the feed query, mirroring the climbs
  * screen's `ClimbSearchProvider` but as a hook (single consumer, no context).
  *
- * Filters + sort persist across app restarts (AsyncStorage); the climb-name
- * term is transient and is not persisted.
+ * On your own logbook filters + sort persist across app restarts
+ * (AsyncStorage); on someone else's they last the visit (`persist: false`).
+ * The climb-name term is transient and is never persisted.
  */
 export type LogbookSearchState = {
   filters: LogbookFilterState;
@@ -25,7 +27,7 @@ export type LogbookSearchState = {
   /** True once persisted prefs have loaded (or been confirmed absent). */
   hydrated: boolean;
   /**
-   * True once the user has changed filters/sort this session. The Apply button is
+   * True once the user has changed filters/sort this session. The capsules are
    * live before hydration finishes, so a late `hydrate` must keep the user's
    * change instead of clobbering it with the just-loaded prefs.
    */
@@ -42,9 +44,8 @@ const DEFAULT_STATE: LogbookSearchState = {
 
 type Action =
   | { type: 'setName'; name: string }
-  | { type: 'setPreset'; preset: LogbookSortPreset }
+  | { type: 'setSort'; sort: LogbookSortState }
   | { type: 'setFilters'; filters: Partial<LogbookFilterState> }
-  | { type: 'apply'; filters: LogbookFilterState; sort: LogbookSortState }
   | { type: 'hydrate'; filters: LogbookFilterState; sort: LogbookSortState }
   | { type: 'reset' };
 
@@ -54,19 +55,13 @@ function reducer(state: LogbookSearchState, action: Action): LogbookSearchState 
       // The name is transient and not persisted, so typing one must NOT block a
       // pending hydrate from applying the user's saved filters/sort.
       return { ...state, name: action.name };
-    case 'setPreset':
-      return {
-        ...state,
-        sort: { ...DEFAULT_LOGBOOK_SORT, mode: 'preset', preset: action.preset },
-        userModified: true,
-      };
+    case 'setSort':
+      // Live commit of a whole sort (Sort by + Order); filters and name untouched.
+      return { ...state, sort: action.sort, userModified: true };
     case 'setFilters':
-      // Live per-field merge from the toolbar's facet chips/rails — same commit +
-      // persistence path as `apply`, but it touches only the named fields and
-      // never the sort or the name.
+      // Live per-field merge from the capsules, rails, tokens and the sheet. It
+      // touches only the named fields and never the sort or the name.
       return { ...state, filters: { ...state.filters, ...action.filters }, userModified: true };
-    case 'apply':
-      return { ...state, filters: action.filters, sort: action.sort, userModified: true };
     case 'hydrate':
       // If the user changed filters/sort while prefs were still loading, keep
       // their values and only open the gate; otherwise apply the loaded prefs.
@@ -82,19 +77,35 @@ function reducer(state: LogbookSearchState, action: Action): LogbookSearchState 
 
 export type UseLogbookSearch = LogbookSearchState & {
   setName: (name: string) => void;
-  setPreset: (preset: LogbookSortPreset) => void;
-  /** Live-commit a partial filter patch (the toolbar's facet chips/rails). */
+  /** Live-commit a whole sort, e.g. `logbookSortFor(key, direction)`. */
+  setSort: (sort: LogbookSortState) => void;
+  /** Live-commit a partial filter patch (capsules, rails, tokens, the sheet). */
   setFilters: (partial: Partial<LogbookFilterState>) => void;
-  apply: (filters: LogbookFilterState, sort: LogbookSortState) => void;
   reset: () => void;
 };
 
-export function useLogbookSearch(): UseLogbookSearch {
-  const [state, dispatch] = useReducer(reducer, DEFAULT_STATE);
+export type UseLogbookSearchOptions = {
+  /**
+   * Load and save the filters + sort (your own logbook). False keeps them for
+   * this visit only, so filtering someone else's logbook never changes yours.
+   * Read once at mount: to switch, remount (key the caller on it), since a
+   * mid-life switch could save defaults over the stored prefs before they load.
+   */
+  persist?: boolean;
+};
+
+export function useLogbookSearch({ persist = true }: UseLogbookSearchOptions = {}): UseLogbookSearch {
+  const [persistOnMount] = useState(persist);
+  // Session-only state has nothing to load, so it opens the feed at once.
+  const [state, dispatch] = useReducer(reducer, persistOnMount, (persisting) => ({
+    ...DEFAULT_STATE,
+    hydrated: !persisting,
+  }));
 
   // Hydrate persisted filter/sort once on mount. The feed waits on `hydrated`
   // (see LogbookTab) so it fetches once with the restored prefs, not twice.
   useEffect(() => {
+    if (!persistOnMount) return;
     let cancelled = false;
     // Always complete hydration — even if loading throws (storage unavailable) —
     // so the feed, which is gated on `hydrated`, never stays stuck disabled.
@@ -114,21 +125,20 @@ export function useLogbookSearch(): UseLogbookSearch {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [persistOnMount]);
 
   // Persist filter/sort across restarts once hydrated (the name stays transient).
   useEffect(() => {
-    if (!state.hydrated) return;
+    if (!persistOnMount || !state.hydrated) return;
     void saveLogbookPrefs({ filters: state.filters, sort: state.sort });
-  }, [state.hydrated, state.filters, state.sort]);
+  }, [persistOnMount, state.hydrated, state.filters, state.sort]);
 
-  // Stable action identities so the toolbar / name handler don't churn.
+  // Stable action identities so the capsule row and the name handler don't churn.
   const actions = useMemo(
     () => ({
       setName: (name: string) => dispatch({ type: 'setName', name }),
-      setPreset: (preset: LogbookSortPreset) => dispatch({ type: 'setPreset', preset }),
+      setSort: (sort: LogbookSortState) => dispatch({ type: 'setSort', sort }),
       setFilters: (partial: Partial<LogbookFilterState>) => dispatch({ type: 'setFilters', filters: partial }),
-      apply: (filters: LogbookFilterState, sort: LogbookSortState) => dispatch({ type: 'apply', filters, sort }),
       reset: () => dispatch({ type: 'reset' }),
     }),
     [],
@@ -137,22 +147,25 @@ export function useLogbookSearch(): UseLogbookSearch {
   return useMemo(() => ({ ...state, ...actions }), [state, actions]);
 }
 
-/** Number of active (non-default) logbook filters — drives the filter-button badge. */
+/**
+ * Number of active (non-default) logbook filters — drives the filter-button
+ * badge. Each dimension counts once however many of its fields are set (Flashes
+ * is one status, a min+max grade is one range, a board + layouts is one board).
+ * The climb-name search is not a filter field; the UI counts it separately.
+ */
 export function countActiveLogbookFilters(filters: LogbookFilterState): number {
-  let count = 0;
-  // The status rests on sends+attempts (the default); sends-only and
-  // attempts-only count, so it's active when either half is off.
-  if (!filters.includeSends || !filters.includeAttempts) count += 1;
-  if (filters.flashOnly) count += 1;
-  if (filters.minGrade !== '' || filters.maxGrade !== '') count += 1;
-  if (filters.fromDate || filters.toDate) count += 1;
-  // The angle range is one filter even when both bounds are narrowed.
-  if (
+  const activeDimensions = [
+    // Status rests on All (sends + attempts); Sends, Flashes and Attempts count.
+    statusSegmentFor(filters) !== 'all',
+    filters.minGrade !== '' || filters.maxGrade !== '',
     filters.angleRange[0] !== DEFAULT_LOGBOOK_FILTERS.angleRange[0] ||
-    filters.angleRange[1] !== DEFAULT_LOGBOOK_FILTERS.angleRange[1]
-  ) {
-    count += 1;
-  }
-  if (filters.benchmarkOnly) count += 1;
-  return count;
+      filters.angleRange[1] !== DEFAULT_LOGBOOK_FILTERS.angleRange[1],
+    // A Custom window with no date picked yet narrows nothing.
+    isLogbookDateFilterActive(filters),
+    filters.boardType !== '',
+    filters.minQuality !== '',
+    filters.setterUsernames.length > 0,
+    filters.benchmarkOnly,
+  ];
+  return activeDimensions.filter(Boolean).length;
 }

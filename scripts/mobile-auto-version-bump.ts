@@ -14,8 +14,7 @@ const ANDROID_PACKAGE_NAME = 'com.boardsesh.app';
 
 // App Store states that indicate Apple has accepted the submission. A version in
 // any of these states is anchored (release/* tag) so a JS fix can be backported to
-// it. We do NOT bump the marketing version on acceptance — that busts the fingerprint
-// of the binary already in the field and strands its OTAs (see main() below).
+// it. We do NOT bump the marketing version on acceptance (see main() below).
 export const ACCEPTED_APP_STORE_STATES = [
   'ACCEPTED',
   'PENDING_DEVELOPER_RELEASE',
@@ -56,7 +55,7 @@ type AppResource = {
   attributes?: { bundleId?: string };
 };
 
-type AppStoreVersionResource = {
+export type AppStoreVersionResource = {
   type: 'appStoreVersions';
   id: string;
   attributes?: {
@@ -92,7 +91,7 @@ type IncludedResource = {
   attributes?: { version?: string };
 };
 
-type JsonApiCollectionResponse<T> = {
+export type JsonApiCollectionResponse<T> = {
   data: T[];
   included?: IncludedResource[];
   links?: { next?: string | null };
@@ -112,7 +111,7 @@ function base64UrlEncode(input: Buffer | string): string {
   return Buffer.from(input).toString('base64url');
 }
 
-function createAppStoreConnectJwt(input: AppStoreJwtInput): string {
+export function createAppStoreConnectJwt(input: AppStoreJwtInput): string {
   const nowSeconds = input.nowSeconds ?? Math.floor(Date.now() / 1000);
   const expiresInSeconds = input.expiresInSeconds ?? 20 * 60;
   const header = { alg: 'ES256', kid: input.keyId, typ: 'JWT' };
@@ -130,7 +129,7 @@ function createAppStoreConnectJwt(input: AppStoreJwtInput): string {
   return `${signingInput}.${signature.toString('base64url')}`;
 }
 
-function decodePrivateKey(secret: string): string {
+export function decodePrivateKey(secret: string): string {
   const trimmed = secret.trim();
   return trimmed.includes('BEGIN PRIVATE KEY') ? trimmed : Buffer.from(trimmed, 'base64').toString('utf8');
 }
@@ -198,6 +197,35 @@ function getRequiredEnv(name: string): string {
   return value;
 }
 
+export class AppStoreAgreementRequiredError extends Error {
+  constructor() {
+    super(
+      'Apple requires the account holder to accept a missing or expired agreement in App Store Connect > Business (https://appstoreconnect.apple.com/business). Then retry this workflow.',
+    );
+    this.name = 'AppStoreAgreementRequiredError';
+  }
+}
+
+function requiresAppStoreAgreement(status: number, body: string): boolean {
+  if (status !== 403) return false;
+  try {
+    const response: unknown = JSON.parse(body);
+    if (typeof response !== 'object' || response === null) return false;
+    const errors = (response as Record<string, unknown>)['errors'];
+    return (
+      Array.isArray(errors) &&
+      errors.some(
+        (error: unknown) =>
+          typeof error === 'object' &&
+          error !== null &&
+          (error as Record<string, unknown>)['code'] === 'FORBIDDEN.REQUIRED_AGREEMENTS_MISSING_OR_EXPIRED',
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function ascFetch<T>(path: string, token: string, params?: Record<string, string>): Promise<T> {
   const url = new URL(path, APP_STORE_CONNECT_API_BASE);
   for (const [key, value] of Object.entries(params ?? {})) {
@@ -205,15 +233,18 @@ async function ascFetch<T>(path: string, token: string, params?: Record<string, 
   }
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
   });
   const body = await response.text();
   if (!response.ok) {
+    if (requiresAppStoreAgreement(response.status, body)) throw new AppStoreAgreementRequiredError();
     throw new Error(`ASC ${path} → ${response.status}: ${body.slice(0, 500)}`);
   }
   return JSON.parse(body) as T;
 }
 
-async function resolveAppId(token: string): Promise<string> {
+export async function resolveAppId(token: string): Promise<string> {
   const data = await ascFetch<JsonApiCollectionResponse<AppResource>>('/v1/apps', token, {
     'filter[bundleId]': BUNDLE_ID,
     'fields[apps]': 'bundleId',
@@ -272,11 +303,15 @@ export function mapAcceptedGoogleProductionReleases(releases: readonly GooglePro
   return [...acceptedByVersionCode.values()].sort((left, right) => left.buildNumber - right.buildNumber);
 }
 
-export async function getAcceptedVersions(token: string, appId: string): Promise<AcceptedBuild[]> {
+export async function getAppStoreVersions(
+  token: string,
+  appId: string,
+  states: readonly string[] = ACCEPTED_APP_STORE_STATES,
+): Promise<JsonApiCollectionResponse<AppStoreVersionResource>> {
   const endpointPath = `/v1/apps/${appId}/appStoreVersions`;
   let nextPage: string | undefined = endpointPath;
   let params: Record<string, string> | undefined = {
-    'filter[appVersionState]': ACCEPTED_APP_STORE_STATES.join(','),
+    'filter[appVersionState]': states.join(','),
     'filter[platform]': 'IOS',
     'fields[appStoreVersions]': 'versionString,appVersionState,build',
     // Pull the attached build inline so we learn its build number without a
@@ -307,7 +342,11 @@ export async function getAcceptedVersions(token: string, appId: string): Promise
     params = undefined;
   }
 
-  return mapAcceptedVersions(combined);
+  return combined;
+}
+
+export async function getAcceptedVersions(token: string, appId: string): Promise<AcceptedBuild[]> {
+  return mapAcceptedVersions(await getAppStoreVersions(token, appId));
 }
 
 function createGoogleServiceAccountJwt(
@@ -329,10 +368,12 @@ function createGoogleServiceAccountJwt(
   return `${signingInput}.${signer.sign(serviceAccount.private_key).toString('base64url')}`;
 }
 
-async function createGoogleAccessToken(serviceAccount: GoogleServiceAccount): Promise<string> {
+export async function createGoogleAccessToken(serviceAccount: GoogleServiceAccount): Promise<string> {
   const assertion = createGoogleServiceAccountJwt(serviceAccount);
   const response = await fetch(serviceAccount.token_uri, {
     method: 'POST',
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       assertion,
@@ -348,11 +389,17 @@ async function createGoogleAccessToken(serviceAccount: GoogleServiceAccount): Pr
   return parsed.access_token;
 }
 
-async function getAcceptedGoogleProductionBuilds(serviceAccount: GoogleServiceAccount): Promise<AcceptedBuild[]> {
+export async function getAcceptedGoogleProductionBuilds(
+  serviceAccount: GoogleServiceAccount,
+): Promise<AcceptedBuild[]> {
   const accessToken = await createGoogleAccessToken(serviceAccount);
   const path = `/androidpublisher/v3/applications/${encodeURIComponent(ANDROID_PACKAGE_NAME)}/tracks/production/releases`;
   const url = new URL(path, GOOGLE_PLAY_API_BASE);
-  const response = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const response = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+    redirect: 'error',
+    signal: AbortSignal.timeout(30_000),
+  });
   const body = await response.text();
   if (!response.ok) throw new Error(`Google Play production releases → ${response.status}: ${body.slice(0, 500)}`);
   const parsed: unknown = JSON.parse(body);
@@ -413,12 +460,20 @@ async function main(): Promise<number> {
     emitOutput('accepted_builds', JSON.stringify(accepted));
 
     // NO marketing-version bump. We used to bump the patch here the moment the current
-    // version was accepted, but bumping the version on main busts the fingerprint of
-    // the binary already in the field — and "accepted" is not "adopted", so every
-    // install still on the previous store binary stopped receiving OTAs (production
-    // publishes resolved a fingerprint no shipped binary embeds). Version bumps are a
-    // manual decision made alongside the native build that ships them. This script only
-    // reports accepted versions for anchoring; it never writes app.config.ts.
+    // version was accepted. At the time `version` was part of the Expo fingerprint, so
+    // the bump moved main's runtimeVersion off the binary already in the field — and
+    // "accepted" is not "adopted", so every install still on the previous store binary
+    // stopped receiving OTAs (production publishes resolved a fingerprint no shipped
+    // binary embeds).
+    //
+    // That failure can no longer happen: packages/mobile/fingerprint.config.js skips
+    // `version`, `ios.buildNumber` and `android.versionCode` (sourceSkips:
+    // ExpoConfigVersions), so a version-only change keeps the fingerprint. The bump
+    // stays manual for a different reason: a new version number only reaches the
+    // stores through a native build, and a version-only push no longer starts one
+    // (its fingerprint tag already exists), so an unattended bump here would change
+    // nothing a user can see. This script only reports accepted versions for
+    // anchoring; it never writes app.config.ts.
     return 0;
   } catch (err) {
     console.error(`[mobile-auto-version-bump] ${err instanceof Error ? err.message : String(err)}`);

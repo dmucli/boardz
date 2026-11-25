@@ -3,7 +3,6 @@ import { StyleSheet, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { router, useLocalSearchParams } from 'expo-router';
-import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { ActivityIndicator } from '../ActivityIndicator';
@@ -14,18 +13,12 @@ import { Text } from '../Text';
 import { useProfile } from '../../lib/graphql/hooks';
 import { useAppColorScheme, useTheme } from '../../providers/theme-provider';
 import { useToast } from '../../providers/toast-provider';
-import { spacing, borderRadius } from '../../theme/tokens';
+import { opacity, spacing, borderRadius } from '../../theme/tokens';
 import { formatRelativeTime } from '../../lib/format-relative-time';
 import { track } from '../../lib/analytics';
 import { reportHandledError } from '../../lib/error-reporting';
-import {
-  listQaBranches,
-  qaSurfingAvailable,
-  readRefusedPrNumber,
-  surfToPr,
-  surfToProduction,
-  surfToStaging,
-} from '../../lib/qa/qa-surf';
+import { qaSurfingAvailable, readRefusedPrNumber, surfToPr } from '../../lib/qa/qa-surf';
+import { useQaBranches } from '../../lib/qa/use-qa-branches';
 import { parsePrNumberList } from '../../lib/qa/pr-branch';
 import {
   buildQaPickRows,
@@ -68,10 +61,10 @@ const keyExtractor = (row: QaPickRow) => row.branch;
  * decorates it. A backend or GitHub failure therefore degrades to bare `pr-N`
  * rows that still surf — testing is never blocked on metadata.
  */
-export function QaPickScreen() {
+export function QaPickScreen({ presentation = 'prompt' }: { presentation?: 'prompt' | 'page' }) {
   const insets = useSafeAreaInsets();
   const { t } = useTranslation('common');
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors } = useTheme();
   const { showToast } = useToast();
   const { data: profile } = useProfile();
   const params = useLocalSearchParams<{ prNumbers?: string; origin?: string }>();
@@ -80,13 +73,10 @@ export function QaPickScreen() {
   // on the first render instead of waiting for a second round-trip.
   const seedPrNumbers = useMemo(() => parsePrNumberList(params.prNumbers), [params.prNumbers]);
 
-  const branchesQuery = useQuery({
-    queryKey: ['qaPrBranches'],
-    queryFn: ({ signal }) => listQaBranches(signal),
-    staleTime: 30_000,
-    retry: 1,
-  });
-  const branchList = branchesQuery.data ?? null;
+  const branchesQuery = useQaBranches();
+  // No list covers both "surfing is switched off" and an answer that is no
+  // evidence either way; the screen says the same thing for both.
+  const branchList = branchesQuery.data?.kind === 'listed' ? branchesQuery.data.list : null;
   const branches = branchList?.previews ?? null;
   const { refetch: refetchBranches } = branchesQuery;
 
@@ -107,7 +97,6 @@ export function QaPickScreen() {
   const unlistedPr = useMemo(() => unlistedPrNumber(rows, query), [rows, query]);
 
   const [surfingPrNumber, setSurfingPrNumber] = useState<number | null>(null);
-  const [surfingChannel, setSurfingChannel] = useState<'staging' | 'production' | null>(null);
   // Swipe-dismiss pops the route without touching Skip, so the "left without
   // choosing" signal is recorded on unmount — one place, both exits, no
   // double-count when a pick did happen.
@@ -118,7 +107,7 @@ export function QaPickScreen() {
   // only fire for a launch that was actually prompted. The drawer's "Test a PR
   // preview" row and the dev More row open the same screen on purpose — counting
   // those as skips inflated the denominator and made the funnel unreadable.
-  const isLaunchPrompt = params.origin === LAUNCH_ORIGIN;
+  const isLaunchPrompt = presentation === 'prompt' && params.origin === LAUNCH_ORIGIN;
   // Armed on "a launch prompt was actually shown". `QaTesterGate` is the only
   // thing that sets `origin=launch`, and only for a tester — but that is a
   // convention, and the screen is now reachable by anyone (including a
@@ -139,33 +128,6 @@ export function QaPickScreen() {
   );
 
   const surfingAvailable = qaSurfingAvailable();
-
-  const handleChannelPick = useCallback(
-    (channel: 'staging' | 'production') => {
-      if (!surfingAvailable || surfInFlightRef.current) return;
-      surfInFlightRef.current = true;
-      pickedRef.current = true;
-      setSurfingChannel(channel);
-      const switchBranch = channel === 'staging' ? surfToStaging : surfToProduction;
-      void switchBranch()
-        .then((outcome) => {
-          if (outcome === 'nothing-to-load') {
-            surfInFlightRef.current = false;
-            setSurfingChannel(null);
-            showToast(t(channel === 'staging' ? 'qa.pick.stagingNextLaunch' : 'qa.pick.productionNextLaunch'), 'info');
-          }
-        })
-        .catch((error: unknown) => {
-          surfInFlightRef.current = false;
-          setSurfingChannel(null);
-          pickedRef.current = false;
-          reportHandledError(error, { tags: { source: 'qa', op: `surf-to-${channel}` } });
-          showToast(error instanceof Error && error.message ? error.message : t('qa.pick.unreachableTitle'), 'error');
-        });
-    },
-    [showToast, surfingAvailable, t],
-  );
-
   const handlePick = useCallback(
     (row: QaPickRow) => {
       // A ref, not `surfingPrNumber`: two taps inside one React batch both see
@@ -239,14 +201,14 @@ export function QaPickScreen() {
         // 30s, so the commonest honest reason a PR is missing is that it published a
         // moment ago.
         const refreshed = await refetchBranches();
-        if (refreshed.data === null) {
+        if (refreshed.data !== undefined && refreshed.data.kind !== 'listed') {
           // Surfing was switched off since the screen loaded.
           rearm();
           pickedRef.current = false;
           showToast(t('qa.pick.surfingOffTitle'), 'info');
           return;
         }
-        if (refreshed.data?.previews.some((branch) => branch.prNumber === prNumber)) {
+        if (refreshed.data?.list.previews.some((branch) => branch.prNumber === prNumber)) {
           const outcome = await surfToPr(prNumber);
           // 'reloading' deliberately leaves the in-flight state set and `pickedRef`
           // true: the app is restarting onto that bundle and nothing after this
@@ -291,7 +253,7 @@ export function QaPickScreen() {
   // Every row goes flat while a surf is in flight, not just the one that was
   // tapped: the app is on its way to another bundle and a second choice cannot
   // be honoured, so offering it would be a lie.
-  const rowsDisabled = !surfingAvailable || surfingPrNumber !== null || surfingChannel !== null;
+  const rowsDisabled = !surfingAvailable || surfingPrNumber !== null;
 
   const renderItem = useCallback(
     ({ item }: { item: QaPickRow }) => (
@@ -309,6 +271,9 @@ export function QaPickScreen() {
   const listState = qaPickListState({
     isPending: branchesQuery.isPending,
     isError: branchesQuery.isError,
+    // `isLoading`, not `isPending`: a disabled query (signed out) is pending
+    // forever but never fetching, and must not hold the list back.
+    isMetadataPending: previewsQuery.isLoading,
     surfingOff: branchesQuery.isSuccess && branches === null,
     rows,
     visibleRows,
@@ -326,23 +291,30 @@ export function QaPickScreen() {
     ) : null;
 
   return (
-    <View style={[styles.root, { backgroundColor: systemColors.groupedBackground, paddingTop: insets.top }]}>
-      <View style={styles.header}>
-        <Text variant="title3" style={styles.headerTitle}>
-          {t('qa.pick.title')}
-        </Text>
-        <PressableSurface
-          onPress={() => router.back()}
-          feedback="opacity"
-          hitSlop={8}
-          accessibilityRole="button"
-          accessibilityLabel={t('qa.pick.skip')}
-        >
-          <Text variant="subheadline" color={brandColors.primary}>
-            {t('qa.pick.skip')}
+    <View
+      style={[
+        styles.root,
+        { backgroundColor: systemColors.groupedBackground, paddingTop: presentation === 'prompt' ? insets.top : 0 },
+      ]}
+    >
+      {presentation === 'prompt' ? (
+        <View style={styles.header}>
+          <Text variant="title3" style={styles.headerTitle}>
+            {t('qa.pick.title')}
           </Text>
-        </PressableSurface>
-      </View>
+          <PressableSurface
+            onPress={() => router.back()}
+            feedback="opacity"
+            hitSlop={8}
+            accessibilityRole="button"
+            accessibilityLabel={t('qa.pick.skip')}
+          >
+            <Text variant="subheadline" color={systemColors.accent}>
+              {t('qa.pick.skip')}
+            </Text>
+          </PressableSurface>
+        </View>
+      ) : null}
 
       {!surfingAvailable ? (
         <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.hint}>
@@ -358,39 +330,6 @@ export function QaPickScreen() {
             placeholder={t('qa.pick.searchPlaceholder')}
             clearAccessibilityLabel={t('qa.pick.clearSearch')}
           />
-        </View>
-      ) : null}
-
-      {surfingAvailable ? (
-        <View style={styles.channelChoices}>
-          {branchList?.staging ? (
-            <PressableSurface
-              onPress={() => handleChannelPick('staging')}
-              feedback="opacity"
-              disabled={rowsDisabled}
-              accessibilityRole="button"
-              accessibilityLabel={t('qa.pick.stagingTitle')}
-              style={[styles.row, styles.channelRow, { backgroundColor: systemColors.elevatedSurface }]}
-            >
-              <Text variant="body">{t('qa.pick.stagingTitle')}</Text>
-              <Text variant="footnote" color={systemColors.secondaryLabel}>
-                {t('qa.pick.stagingBody')}
-              </Text>
-            </PressableSurface>
-          ) : null}
-          <PressableSurface
-            onPress={() => handleChannelPick('production')}
-            feedback="opacity"
-            disabled={rowsDisabled}
-            accessibilityRole="button"
-            accessibilityLabel={t('qa.pick.productionTitle')}
-            style={[styles.row, styles.channelRow, { backgroundColor: systemColors.elevatedSurface }]}
-          >
-            <Text variant="body">{t('qa.pick.productionTitle')}</Text>
-            <Text variant="footnote" color={systemColors.secondaryLabel}>
-              {t('qa.pick.productionBody')}
-            </Text>
-          </PressableSurface>
         </View>
       ) : null}
 
@@ -494,7 +433,7 @@ function TrySurfBlock({ prNumber, busy, onTrySurf, t }: TrySurfBlockProps) {
         {busy ? (
           <ActivityIndicator />
         ) : (
-          <Text variant="subheadline" color={brandColors.primary}>
+          <Text variant="subheadline" color={systemColors.accent}>
             {t('qa.pick.trySurfAction', { prNumber })}
           </Text>
         )}
@@ -573,14 +512,14 @@ const QaPickRowItem = memo(function QaPickRowItem({ row, disabled, busy, onPress
           </Text>
           {row.risk !== null ? (
             <View style={[styles.riskChip, { backgroundColor: riskColor }]}>
-              <Text variant="caption2" color={brandColors.onPrimary} style={styles.chipLabel}>
+              <Text emphasized variant="caption2" color={brandColors.onPrimary}>
                 {`${row.risk}/5`}
               </Text>
             </View>
           ) : null}
         </View>
 
-        <Text variant="body" numberOfLines={2} style={styles.rowTitle}>
+        <Text emphasized variant="body" numberOfLines={2}>
           {title}
         </Text>
 
@@ -618,7 +557,7 @@ function Chip({ label, tone }: ChipProps) {
   const { systemColors } = useTheme();
   return (
     <View style={[styles.chip, { borderColor: tone ?? systemColors.separator }]}>
-      <Text variant="caption2" color={tone ?? systemColors.secondaryLabel} style={styles.chipLabel}>
+      <Text emphasized variant="caption2" color={tone ?? systemColors.secondaryLabel}>
         {label}
       </Text>
     </View>
@@ -695,16 +634,8 @@ const styles = StyleSheet.create({
     marginBottom: spacing[2],
     borderRadius: borderRadius.lg,
   },
-  channelChoices: {
-    paddingHorizontal: spacing[3],
-  },
-  channelRow: {
-    flexDirection: 'column',
-    alignItems: 'flex-start',
-    gap: spacing[1],
-  },
   rowDimmed: {
-    opacity: 0.4,
+    opacity: opacity.disabled,
   },
   rowBody: {
     flex: 1,
@@ -715,9 +646,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     gap: spacing[2],
-  },
-  rowTitle: {
-    fontWeight: '600',
   },
   riskChip: {
     paddingHorizontal: spacing[2],
@@ -734,8 +662,5 @@ const styles = StyleSheet.create({
     paddingVertical: 1,
     borderRadius: borderRadius.full,
     borderWidth: StyleSheet.hairlineWidth,
-  },
-  chipLabel: {
-    fontWeight: '600',
   },
 });

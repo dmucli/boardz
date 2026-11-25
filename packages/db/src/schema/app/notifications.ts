@@ -3,6 +3,7 @@ import { users } from '../auth/users';
 import { socialEntityTypeEnum, comments } from './social';
 
 export const notificationTypeEnum = pgEnum('notification_type', [
+  'app_feedback_reply',
   'new_follower',
   'comment_reply',
   'comment_on_tick',
@@ -18,6 +19,29 @@ export const notificationTypeEnum = pgEnum('notification_type', [
   'new_climbs_synced',
   'gym_claim_approved',
   'proposal_on_your_climb',
+  'spray_wall_detection_completed',
+  'follow_request',
+  // Comments on an item, sent to its owner (#6385). `comment_on_tick` and
+  // `comment_on_climb` above cover ticks and climbs.
+  'comment_on_session',
+  'comment_on_playlist',
+  'comment_on_board',
+  'comment_on_gym',
+  // Directory reports and staff actions on boards (docs/product/directory-reports.md).
+  // Sent only while the backend's `directory-reports` flag is on.
+  'board_report_opened',
+  'board_report_resolved',
+  'board_removed_from_gym',
+  'board_deleted_by_staff',
+  'board_edited_by_staff',
+  'gym_report_opened',
+  'gym_report_resolved',
+  // Claim notices; the claim guardrails PR sends them.
+  'gym_claimed_with_your_board',
+  'gym_claim_denied',
+  // A climber's suggested setup changed a board at an unclaimed gym; sent to
+  // the board's creator, who can undo it (docs/product/directory-reports.md).
+  'board_setup_changed_by_climber',
 ]);
 
 export const notifications = pgTable(
@@ -55,6 +79,7 @@ export const notifications = pgTable(
 export type Notification = typeof notifications.$inferSelect;
 export type NewNotification = typeof notifications.$inferInsert;
 export type NotificationType =
+  | 'app_feedback_reply'
   | 'new_follower'
   | 'comment_reply'
   | 'comment_on_tick'
@@ -69,4 +94,20 @@ export type NotificationType =
   | 'proposal_created'
   | 'new_climbs_synced'
   | 'gym_claim_approved'
-  | 'proposal_on_your_climb';
+  | 'proposal_on_your_climb'
+  | 'spray_wall_detection_completed'
+  | 'follow_request'
+  | 'comment_on_session'
+  | 'comment_on_playlist'
+  | 'comment_on_board'
+  | 'comment_on_gym'
+  | 'board_report_opened'
+  | 'board_report_resolved'
+  | 'board_removed_from_gym'
+  | 'board_deleted_by_staff'
+  | 'board_edited_by_staff'
+  | 'gym_report_opened'
+  | 'gym_report_resolved'
+  | 'gym_claimed_with_your_board'
+  | 'gym_claim_denied'
+  | 'board_setup_changed_by_climber';

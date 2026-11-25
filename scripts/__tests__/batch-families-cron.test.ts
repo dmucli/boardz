@@ -4,8 +4,9 @@
  * The batch families and the GitHub Actions workflows they replace must fire at
  * the same minute while both exist: the cutover enables a family, waits for
  * three green ledger rows, then deletes the workflow's `schedule:` in its own
- * PR (docs/background-workers.md, "Batch families"). A PR that changes either
- * cron, or deletes a workflow schedule, has to update this pin.
+ * PR (docs/backend/background-workers.md, "Batch families"). A PR that changes either
+ * cron, or deletes a workflow schedule, has to update this pin. `cutOver`
+ * marks a family whose workflow schedule is gone: the family alone owns it.
  */
 import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
@@ -29,37 +30,60 @@ function workflow(name: string): Workflow {
 }
 
 const PINS = [
-  { family: refreshRecommendationsFamily, workflow: 'refresh-recommendations.yml', crons: ['0 6 * * *'] },
-  { family: refreshHoldFeaturesFamily, workflow: 'refresh-hold-features.yml', crons: ['15 6 * * *'] },
-  { family: refreshClimbGradesFamily, workflow: 'refresh-climb-grades.yml', crons: ['30 6 * * *'] },
-  // The workflow runs a matrix job per board; the family fans out one job per board.
-  { family: refreshClimbNeighborsFamily, workflow: 'refresh-climb-neighbors.yml', crons: ['45 6 * * *'] },
-  // The nightly identity/gzip/catalogue export, then the 15-minute live scan.
   {
-    family: exportBoardSnapshotsFamily,
-    workflow: 'export-board-snapshots.yml',
-    crons: ['15 7 * * *', '7,22,37,52 * * * *'],
+    family: refreshRecommendationsFamily,
+    workflow: 'refresh-recommendations.yml',
+    cutOver: true,
+    crons: ['0 6 * * *'],
+  },
+  { family: refreshHoldFeaturesFamily, workflow: 'refresh-hold-features.yml', cutOver: true, crons: ['15 6 * * *'] },
+  { family: refreshClimbGradesFamily, workflow: 'refresh-climb-grades.yml', cutOver: true, crons: ['30 6 * * *'] },
+  // The workflow runs a matrix job per board; the family fans out one job per board.
+  {
+    family: refreshClimbNeighborsFamily,
+    workflow: 'refresh-climb-neighbors.yml',
+    cutOver: true,
+    crons: ['45 6 * * *'],
   },
   {
     family: refreshMoonboardAngleEstimatesFamily,
     workflow: 'refresh-moonboard-angle-estimates.yml',
+    cutOver: true,
     crons: ['0 8 * * 1'],
   },
   {
     family: refreshMoonboardWideAngleEstimatesFamily,
     workflow: 'refresh-moonboard-wide-angle-estimates.yml',
+    cutOver: true,
     crons: ['30 8 * * 1'],
   },
 ] as const;
 
 describe('batch family crons', () => {
-  it.each(PINS)('$workflow and its family fire at $crons UTC', ({ family, workflow: name, crons }) => {
-    const schedules = family.schedules ?? [];
-    expect(schedules.map((schedule) => schedule.cron)).toEqual(crons);
-    expect(schedules.every((schedule) => (schedule.tz ?? 'UTC') === 'UTC')).toBe(true);
-    const { on } = workflow(name);
-    expect(on.schedule?.map((entry) => entry.cron)).toEqual(crons);
-    // Cutover keeps the manual trigger for backfills and dry runs.
+  it('keeps snapshot crons solely on the homelab worker after owner cutover', () => {
+    expect(exportBoardSnapshotsFamily.schedules?.map((schedule) => schedule.cron)).toEqual([
+      '15 7 * * *',
+      '7,22,37,52 * * * *',
+    ]);
+    const { on } = workflow('export-board-snapshots.yml');
+    expect(on).not.toHaveProperty('schedule');
     expect(on).toHaveProperty('workflow_dispatch');
   });
+  it.each(PINS)(
+    '$family.name fires at $crons UTC; $workflow cut over: $cutOver',
+    ({ family, workflow: name, cutOver, crons }) => {
+      // `crons` always pins the family's schedule — including cut-over entries,
+      // where it is the only cron left. Changing a family's cadence means
+      // updating its PINS entry even after its workflow schedule is gone.
+      const schedules = family.schedules ?? [];
+      expect(schedules.map((schedule) => schedule.cron)).toEqual(crons);
+      expect(schedules.every((schedule) => (schedule.tz ?? 'UTC') === 'UTC')).toBe(true);
+      const { on } = workflow(name);
+      // Before the cutover the workflow mirrors the same minute; after it only the family fires.
+      if (cutOver) expect(on).not.toHaveProperty('schedule');
+      else expect(on.schedule?.map((entry) => entry.cron)).toEqual(crons);
+      // Cutover keeps the manual trigger for backfills and dry runs.
+      expect(on).toHaveProperty('workflow_dispatch');
+    },
+  );
 });

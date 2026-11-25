@@ -1,16 +1,36 @@
+import {
+  admitPresentedWebCredential,
+  CredentialAuthorityUnavailable,
+} from '@/app/lib/auth/credential-admission.server';
+import { unavailableCredentialResponse } from '@/app/lib/auth/credential-admission-response.server';
 import { type NextRequest, NextResponse } from 'next/server';
 import { decode, getToken, type JWT } from 'next-auth/jwt';
 import { isSecureCookieContext, sessionCookieNameCandidates } from '@/app/lib/auth/secure-cookies';
 import { createRequestLogger } from '@/app/lib/observability/request-logger';
 import { reportHandledError } from '@/app/lib/observability/report-error';
+import { browserSessionRouteMode } from '@/app/lib/auth/browser-session-mode.server';
+import { browserAccessTokenAnswer } from '@/app/lib/auth/browser-access-token-route.server';
 
 const PRIVATE_NO_STORE_HEADERS = { 'Cache-Control': 'private, no-store' } as const;
 
 /**
  * API endpoint to get a WebSocket authentication token.
- * Returns the NextAuth JWT token that can be passed to the WebSocket backend.
+ *
+ * With `AUTH_BROWSER_SESSION_MODE` unset, empty or `legacy`: the NextAuth JWT
+ * that can be passed to the WebSocket backend, exactly as before. Under
+ * `better-auth` (#7596 B3b): the backend's 15-minute browser access token for
+ * the session `/api/auth/session` resolves for the same request, with the same
+ * ids (`browser-access-token-route.server.ts`). Any other mode value is 503.
  */
 export async function GET(request: NextRequest) {
+  const mode = browserSessionRouteMode();
+  if (mode.kind === 'unavailable') return unavailableCredentialResponse();
+  if (mode.kind === 'better-auth') return browserAccessTokenAnswer(request, mode.cookies);
+  return legacyWsAuthToken(request);
+}
+
+/** The NextAuth JWT, read and admitted as on main. */
+async function legacyWsAuthToken(request: NextRequest) {
   const log = createRequestLogger(request);
   try {
     // Pass cookieName + secureCookie explicitly: next-auth's internal derivation
@@ -49,10 +69,7 @@ export async function GET(request: NextRequest) {
 
     const nextAuthSecret = process.env.NEXTAUTH_SECRET;
     if (!nextAuthSecret) {
-      // Server misconfiguration: without the secret the cookie can't be
-      // validated. Warn loudly and fail closed to an anonymous response.
-      log.warn('NEXTAUTH_SECRET is not configured; treating the request as anonymous.');
-      return NextResponse.json({ token: null, authenticated: false }, { headers: PRIVATE_NO_STORE_HEADERS });
+      return unavailableCredentialResponse();
     }
 
     let decodedToken: JWT | null;
@@ -67,10 +84,20 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ token: null, authenticated: false }, { headers: PRIVATE_NO_STORE_HEADERS });
     }
 
+    if (!(await admitPresentedWebCredential(token))) {
+      return NextResponse.json({ token: null, authenticated: false }, { headers: PRIVATE_NO_STORE_HEADERS });
+    }
+
+    // A cookie from before the authSessionId claim gets its id from `jti` in the
+    // jwt callback on every session read (auth-options.ts, `legacy_no_sid`).
+    // Answer the same id, or the focus probe and the WebSocket token read this
+    // login as another one until the session read has rewritten the cookie.
     const authSessionId =
       typeof decodedToken.authSessionId === 'string' && decodedToken.authSessionId.trim()
         ? decodedToken.authSessionId
-        : undefined;
+        : typeof decodedToken.jti === 'string' && decodedToken.jti.trim()
+          ? decodedToken.jti
+          : undefined;
 
     return NextResponse.json(
       {
@@ -82,6 +109,7 @@ export async function GET(request: NextRequest) {
       { headers: PRIVATE_NO_STORE_HEADERS },
     );
   } catch (error) {
+    if (error instanceof CredentialAuthorityUnavailable) return unavailableCredentialResponse();
     reportHandledError(error, { logger: log, message: 'Failed to read the WebSocket auth token' });
     return NextResponse.json(
       { token: null, authenticated: false, error: 'Failed to get token' },

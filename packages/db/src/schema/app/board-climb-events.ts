@@ -1,4 +1,5 @@
-import { pgTable, text, integer, bigint, bigserial, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
+import { pgTable, boolean, text, integer, bigint, bigserial, timestamp, index, uniqueIndex } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 import { users } from '../auth/users';
 import { boardSessions } from './sessions';
 import { userBoards } from './boards';
@@ -31,14 +32,14 @@ export const boardClimbEvents = pgTable(
     externalOccurrenceKey: text('external_occurrence_key'),
     externalDisplayName: text('external_display_name'),
     climbUuid: text('climb_uuid').notNull(),
-    angle: integer('angle').notNull(),
+    // Upstream Aurora displays do not carry an angle; viewers supply their current angle.
+    angle: integer('angle'),
     // The member whose phone wrote the frames. Nullable so deleting a user
     // doesn't erase the board's history.
     userId: text('user_id').references(() => users.id, { onDelete: 'set null' }),
-    // Reserved for session recaps: will hold the active session for in-session
-    // pushes. Not yet populated — reportBoardClimb writes null until the
-    // session-attribution follow-up threads the session through. Always null for
-    // solo pushes.
+    // Active session when the display occurred; null for a solo display.
+    // Legacy unscoped events have unknown privacy and stay anonymous to others.
+    identityPolicyVersion: integer('identity_policy_version').default(0).notNull(),
     sessionId: text('session_id').references(() => boardSessions.id, { onDelete: 'set null' }),
     // Per-board monotonic sequence (reused from the live Redis feed) — gives
     // cross-instance ordering and a natural idempotency key with boardId.
@@ -48,24 +49,30 @@ export const boardClimbEvents = pgTable(
     name: text('name'),
     grade: text('grade'),
     setter: text('setter'),
+    // Non-null only for reports that captured the original board and its gym
+    // under the sequence reservation lock. A null gym then means unlinked.
+    reportingBoardId: bigint('reporting_board_id', { mode: 'number' }),
+    reportingGymId: bigint('reporting_gym_id', { mode: 'number' }),
+    reportingMirrored: boolean('reporting_mirrored'),
     confirmedAt: timestamp('confirmed_at', { mode: 'string' }).notNull(),
     createdAt: timestamp('created_at', { mode: 'string' }).defaultNow().notNull(),
   },
   (table) => ({
-    // "Recent sends for a board" / "what's on board X now" (LIMIT 1). A plain
-    // (board, time) btree serves the DESC scan in either direction.
-    boardConfirmedAtIdx: index('board_climb_events_board_confirmed_at_idx').on(table.boardId, table.confirmedAt),
     // Keyset paging + double-flush idempotency (onConflictDoNothing target).
     boardSeqUnique: uniqueIndex('board_climb_events_board_seq_unique').on(table.boardId, table.seq),
     externalOccurrenceUnique: uniqueIndex('board_climb_events_external_occurrence_unique').on(
       table.source,
       table.externalOccurrenceKey,
     ),
+    // "Recent sends for a board" / "what's on board X now" (LIMIT 1) and the
+    // (confirmed_at, seq) keyset history page. Serves either DESC scan.
     chronologicalIdx: index('board_climb_events_chronological_idx').on(table.boardId, table.confirmedAt, table.seq),
+    // Candidate-scoped first-recorded lookups short-circuit on one prior display.
+    reportingActorTimeIdx: index('board_climb_events_reporting_actor_time_idx')
+      .on(table.boardId, table.userId, table.confirmedAt)
+      .where(sql`${table.source} = 'boardsesh' AND ${table.userId} IS NOT NULL`),
     // Session recap: every climb on the wall during a session.
     sessionIdx: index('board_climb_events_session_idx').on(table.sessionId),
-    // "How often was this climb on this wall" (future leaderboards).
-    boardClimbIdx: index('board_climb_events_board_climb_idx').on(table.boardId, table.climbUuid),
   }),
 );
 

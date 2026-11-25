@@ -1,4 +1,9 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -37,6 +42,7 @@ vi.mock('react-native', () => ({
       children,
     ),
   StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
     create: (styles: Record<string, unknown>) => styles,
     absoluteFill: { position: 'absolute' },
     hairlineWidth: 1,
@@ -58,10 +64,15 @@ vi.mock('../../GlassSurface', () => ({
   },
 }));
 vi.mock('../../PressableSurface', () => ({
-  PressableSurface: (props: { children?: ReactNode; onPress?: () => void; disabled?: boolean }) =>
+  PressableSurface: (props: { children?: ReactNode; onPress?: () => void; disabled?: boolean; testID?: string }) =>
     createElement(
       'button',
-      { 'data-pressable': 'true', 'data-disabled': props.disabled ? 'true' : 'false', onClick: props.onPress },
+      {
+        'data-testid': props.testID,
+        'data-pressable': 'true',
+        'data-disabled': props.disabled ? 'true' : 'false',
+        onClick: props.onPress,
+      },
       props.children,
     ),
 }));
@@ -74,6 +85,7 @@ vi.mock('../../icon-map', () => ({
 }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     variant: ctrl.variant,
     brandColors: { primary: '#6D28D9', primaryFill: '#7C3AED', onPrimary: '#FFFFFF' },
@@ -82,7 +94,11 @@ vi.mock('../../../providers/theme-provider', () => ({
 }));
 vi.mock('../../../hooks/use-native-glass', () => ({ useNativeGlass: () => ctrl.nativeGlass }));
 vi.mock('../../../lib/haptics', () => ({ hapticLight: haptics.light }));
-vi.mock('../../../theme/tokens', () => ({ spacing: { 2: 8, 4: 16, 5: 20 }, shadows: { sm: { shadowOpacity: 0.1 } } }));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: { 2: 8, 4: 16, 5: 20 },
+  shadows: { sm: { shadowOpacity: 0.1 } },
+}));
 
 import { SessionStartFab } from '../SessionStartFab';
 
@@ -107,6 +123,17 @@ beforeEach(() => {
 });
 
 describe('SessionStartFab', () => {
+  it.each(['liquidGlass', 'material'] as const)(
+    'identifies the %s action separately from its layout wrapper',
+    (variant) => {
+      ctrl.variant = variant;
+      const { getByTestId } = render(<SessionStartFab {...makeProps({ actionTestID: 'session-start' })} />);
+      expect(getByTestId('pre-session-footer').getAttribute('data-pointer-events')).toBe('box-none');
+      if (variant === 'material') expect(fab.props?.testID).toBe('session-start');
+      else expect(getByTestId('session-start').tagName).toBe('BUTTON');
+    },
+  );
+
   describe('glass variant', () => {
     it('renders a brand-tinted glass capsule (not a FAB) anchored to the safe-area inset, box-none', () => {
       const { getByTestId, container } = render(<SessionStartFab {...makeProps()} />);

@@ -1,10 +1,13 @@
 // @vitest-environment jsdom
 
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
-import { render, screen } from '@testing-library/react';
+import { render, screen, fireEvent } from '@testing-library/react';
 import React from 'react';
+import { trackWebsiteJourneyLinkClick } from '@/app/lib/website-journey-analytics';
+
 import { tFromCatalog } from '@/app/__test-helpers__/i18n-mock';
 import SiteFooter from '../site-footer';
+import { MarketingCapabilitiesContext } from '../../marketing/marketing-capabilities-context';
 
 /**
  * The footer carries two obligations the deleted chrome used to cover:
@@ -46,9 +49,12 @@ const SITEMAP_PATHS = [
   '/about',
   '/support',
   '/help',
-  '/docs',
+  '/developers',
+  '/boards',
+  '/spraywalls',
+  '/for-gyms#partners',
   '/playlists',
-  '/aurora-migration',
+  '/bring-your-logbook',
   '/legal',
   '/privacy',
 ];
@@ -62,11 +68,31 @@ const SITEMAP_PATHS = [
  * is the point — folding `/gyms` into `SITEMAP_PATHS` would make that
  * constant's name a lie and quietly assert a sitemap entry that must not exist.
  */
-const FOOTER_PATHS = [...SITEMAP_PATHS, '/gyms', '/gyms/kilter', '/gyms/tension', '/gyms/moonboard'];
+const FOOTER_PATHS = [...SITEMAP_PATHS.filter((path) => path !== '/'), '/gyms', '/gyms?claim=1'];
+
+vi.mock('@/app/lib/website-journey-analytics', () => ({
+  trackWebsiteJourneyEvent: vi.fn(),
+  trackWebsiteJourneyLinkClick: vi.fn(),
+}));
 
 describe('SiteFooter', () => {
   beforeEach(() => {
+    vi.clearAllMocks();
     mockPathname = '/';
+  });
+
+  it('reconciles the static marketing docs fallback with runtime public availability', () => {
+    const view = render(<SiteFooter developerHref="/docs" />);
+    expect(view.container.querySelector('a[href="/docs"]')).toBeTruthy();
+    view.rerender(
+      <MarketingCapabilitiesContext.Provider
+        value={{ enableExpoAuthBridge: true, developerHref: '/developers', hasMonthlySupport: false }}
+      >
+        <SiteFooter developerHref="/docs" />
+      </MarketingCapabilitiesContext.Provider>,
+    );
+    expect(view.container.querySelector('a[href="/developers"]')).toBeTruthy();
+    expect(view.container.querySelector('a[href="/docs"]')).toBeNull();
   });
 
   // Pinned here because `e2e/site-chrome.spec.ts` selects on it and e2e is
@@ -83,6 +109,11 @@ describe('SiteFooter', () => {
     expect(brandLink.textContent).toBe('Boardsesh');
     expect(brandLink.querySelector('img')?.getAttribute('src')).toContain('boardsesh-mark');
     expect(brandLink.querySelector('img')?.getAttribute('alt')).toBe('');
+    fireEvent.click(brandLink);
+    expect(trackWebsiteJourneyLinkClick).toHaveBeenCalledWith(expect.anything(), {
+      name: 'Nav Link Clicked',
+      properties: { area: 'footer', target: '/' },
+    });
   });
 
   it('links to every static page in the sitemap', () => {
@@ -97,33 +128,11 @@ describe('SiteFooter', () => {
   // The gym directory has no sitemap entry, so the footer is the crawl path
   // into it. Descriptive anchor text is the SEO half of that — "Gyms with a
   // Kilter board" is the query shape, "Gyms" is not.
-  it('links to each board-type gym directory with descriptive anchor text', () => {
+  it('gives wall owners direct spray, claim and partner paths', () => {
     const { container } = render(<SiteFooter />);
-
-    const anchorsByHref = new Map(
-      Array.from(container.querySelectorAll('a')).map((anchor) => [anchor.getAttribute('href'), anchor.textContent]),
-    );
-
-    expect(anchorsByHref.get('/gyms/kilter')).toBe('Gyms with a Kilter board');
-    expect(anchorsByHref.get('/gyms/tension')).toBe('Gyms with a Tension board');
-    expect(anchorsByHref.get('/gyms/moonboard')).toBe('Gyms with a MoonBoard');
-    expect(anchorsByHref.get('/gyms')).toBe('All gyms and walls');
-  });
-
-  // The wireframe drew `/gyms?board=kilter`; the routes shipped literal. A
-  // query-param href would point at a URL that self-canonicalises to `/gyms`,
-  // throwing away the per-board landing page the anchor exists to feed.
-  it('points at the literal facet routes, never the query-param form', () => {
-    const { container } = render(<SiteFooter />);
-
-    const gymHrefs = Array.from(container.querySelectorAll('a'))
-      .map((anchor) => anchor.getAttribute('href'))
-      .filter((href): href is string => href !== null && href.startsWith('/gyms'));
-
-    // Guards the filter itself: a renamed route would otherwise make the
-    // no-`?` assertion below pass over an empty list.
-    expect(gymHrefs).toHaveLength(4);
-    expect(gymHrefs.filter((href) => href.includes('?'))).toEqual([]);
+    for (const href of ['/boards', '/spraywalls', '/gyms?claim=1', '/for-gyms#partners', '/developers']) {
+      expect(container.querySelector(`nav a[href="${href}"]`)).toBeTruthy();
+    }
   });
 
   it('renders those links as real anchors inside a labelled nav', () => {
@@ -132,7 +141,7 @@ describe('SiteFooter', () => {
     const nav = container.querySelector('nav');
     expect(nav).toBeTruthy();
     expect(nav?.getAttribute('aria-label')).toBe(tFromCatalog('common', 'footer.navLabel'));
-    expect(nav?.querySelectorAll('a').length).toBe(FOOTER_PATHS.length);
+    for (const path of FOOTER_PATHS) expect(nav?.querySelector(`a[href="${path}"]`)).toBeTruthy();
   });
 
   it('groups the links under headings so twelve of them stay scannable', () => {
@@ -140,10 +149,27 @@ describe('SiteFooter', () => {
 
     const headings = Array.from(container.querySelectorAll('nav h2')).map((heading) => heading.textContent);
     expect(headings).toEqual([
-      tFromCatalog('common', 'footer.groups.findAGym'),
-      tFromCatalog('common', 'footer.groups.explore'),
-      tFromCatalog('common', 'footer.groups.smallPrint'),
+      tFromCatalog('common', 'footer.journeys.climb'),
+      tFromCatalog('common', 'footer.journeys.walls'),
+      tFromCatalog('common', 'footer.journeys.project'),
+      tFromCatalog('common', 'footer.journeys.help'),
     ]);
+  });
+
+  it('reports the navigation destination and app handoff placement', () => {
+    const { container } = render(<SiteFooter />);
+    const helpLink = container.querySelector<HTMLAnchorElement>('nav a[href="/help"]');
+    expect(helpLink).toBeTruthy();
+    fireEvent.click(helpLink!);
+    expect(trackWebsiteJourneyLinkClick).toHaveBeenCalledWith(expect.anything(), {
+      name: 'Nav Link Clicked',
+      properties: { area: 'footer', target: '/help' },
+    });
+    fireEvent.click(screen.getByLabelText('Start climbing in the app'));
+    expect(trackWebsiteJourneyLinkClick).toHaveBeenCalledWith(expect.anything(), {
+      name: 'Web App Opened',
+      properties: { placement: 'footer' },
+    });
   });
 
   it('hands off to the app', () => {
@@ -161,7 +187,7 @@ describe('SiteFooter', () => {
   it('carries the compatible-not-affiliated trademark line', () => {
     render(<SiteFooter />);
 
-    expect(screen.getByText(tFromCatalog('common', 'footer.trademarkNote'))).toBeTruthy();
+    expect(screen.getByText(/Boardsesh is independent and is not made or endorsed/)).toBeTruthy();
   });
 
   it('renders nothing on a kiosk route', () => {
@@ -176,3 +202,7 @@ describe('SiteFooter', () => {
     expect(container.firstChild).toBeNull();
   });
 });
+
+vi.mock('@/app/components/consent/consent-state-provider', () => ({
+  useConsent: () => ({ granted: true, openChoices: vi.fn() }),
+}));

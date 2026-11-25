@@ -7,14 +7,10 @@ import { toFlatFrames } from '@boardsesh/board-constants/hold-states';
 import type { BoardConnection } from '../../components/play-drawer/lightbulb-control';
 import type { LiveActivityBoardRenderMode } from '../../../modules/live-activity/src/index';
 import { getAuthToken } from '../auth-store';
+import { decodeFileUri } from '../file-uri';
 import { BACKEND_URL } from '../env';
-import {
-  startLiveActivitySession,
-  endLiveActivitySession,
-  updateLiveActivity,
-  updateLiveActivityClimb,
-  isLiveActivityAvailable,
-} from './live-activity-plugin';
+import { startLiveActivitySession, endLiveActivitySession, isLiveActivityAvailable } from './live-activity-plugin';
+import { useSessionPresenceUpdates } from './use-session-presence-updates';
 
 type BoardConfig = {
   boardName: string;
@@ -33,7 +29,21 @@ type AndroidNotificationStrings = {
   unmirrorLabel?: string;
   relightLabel: string;
   reconnectLabel: string;
+  connectingLabel?: string;
   onWallTemplate: string;
+  /** The header line while driving the wall (2.7), timed or open-ended. */
+  lightDrivingLabel?: string;
+  /** The lit bulb's label while this phone drives: a tap stops driving. */
+  stopDrivingLabel?: string;
+};
+
+export type UseLiveActivityResult = {
+  /**
+   * How many times the Live Activity / session notification has started in
+   * this mount. Rest-timer sync keys off it: native clears the rest snapshot
+   * when a session ends, so every start must re-send it.
+   */
+  activityStartCount: number;
 };
 
 type UseLiveActivityOptions = {
@@ -50,6 +60,19 @@ type UseLiveActivityOptions = {
   /** Display name of the peer holding the board (heldByPeer only). */
   holderDisplayName?: string | null;
   /**
+   * Android notification only: no remembered board, so the outline bulb opens
+   * the app rather than reconnecting in the background (#7087).
+   */
+  bulbOpensApp?: boolean;
+  /** Android notification only: a connect is running; the outline bulb says so (#7087). */
+  boardConnecting?: boolean;
+  /**
+   * iOS only: changes when native forgets the board it kept for the Live
+   * Activity bulb. The card reads that pairing only when it redraws, so a
+   * change pushes one full update. Never forwarded to native.
+   */
+  nativePairingRevision?: number;
+  /**
    * The climber's saved board look, for the iOS server-rendered thumbnail.
    * Sent on start AND on every update so a settings change reaches a running
    * activity (the session is never restarted for it). Android ignores it —
@@ -65,6 +88,8 @@ type UseLiveActivityOptions = {
   /** Revalidate the generated file immediately before each native notification push. */
   validateAndroidThumbnailOverlay?: (path: string | null, loadKey: string | null) => string | null;
   androidThumbnailBackgroundPaths?: string[];
+  /** Android lock screen card payload (#7327); undefined keeps the classic card. */
+  androidBokehJson?: string;
 };
 
 // Both iOS (ActivityKit) and Android (foreground service) back the session-
@@ -159,14 +184,21 @@ export function useLiveActivity({
   isPartySession,
   boardConnection,
   holderDisplayName,
+  bulbOpensApp = false,
+  boardConnecting = false,
+  nativePairingRevision = 0,
   renderMode,
   androidNotification,
   androidThumbnailOverlayPath,
   androidThumbnailOverlayLoadKey,
   validateAndroidThumbnailOverlay,
   androidThumbnailBackgroundPaths,
-}: UseLiveActivityOptions): void {
+  androidBokehJson,
+}: UseLiveActivityOptions): UseLiveActivityResult {
   const isActiveRef = useRef(false);
+  // Bumped after every successful start, so state that native drops between
+  // sessions (the rest timer, #6513) knows to send itself again.
+  const [activityStartCount, setActivityStartCount] = useState(0);
   const generationRef = useRef(0);
   const [available, setAvailable] = useState<boolean | null>(null);
   // The token is stored WITH the sessionId it was loaded for. Deriving
@@ -198,6 +230,10 @@ export function useLiveActivity({
   boardConnectionRef.current = boardConnection;
   const holderDisplayNameRef = useRef(holderDisplayName);
   holderDisplayNameRef.current = holderDisplayName;
+  const bulbOpensAppRef = useRef(bulbOpensApp);
+  bulbOpensAppRef.current = bulbOpensApp;
+  const boardConnectingRef = useRef(boardConnecting);
+  boardConnectingRef.current = boardConnecting;
   const renderModeRef = useRef(renderMode);
   renderModeRef.current = renderMode;
   const overlayPathRef = useRef(androidThumbnailOverlayPath);
@@ -208,17 +244,33 @@ export function useLiveActivity({
   overlayValidatorRef.current = validateAndroidThumbnailOverlay;
   const backgroundPathsRef = useRef(androidThumbnailBackgroundPaths);
   backgroundPathsRef.current = androidThumbnailBackgroundPaths;
+  const androidBokehJsonRef = useRef(androidBokehJson);
+  androidBokehJsonRef.current = androidBokehJson;
   const queueSequenceRef = useRef(queueSequence);
   queueSequenceRef.current = queueSequence;
   const queueRef = useRef(queue);
   queueRef.current = queue;
   const currentClimbRef = useRef(currentClimbQueueItem);
   currentClimbRef.current = currentClimbQueueItem;
+  const { sendUpdate, cancelUpdateRetry } = useSessionPresenceUpdates({
+    isActiveRef,
+    generationRef,
+    sessionIdRef,
+    currentClimbRef,
+    queueRef,
+  });
+  // Both thumbnail inputs leave here as plain paths, never percent-encoded URIs:
+  // the notification service strips `file://` and opens the rest with
+  // BitmapFactory.decodeFile, so a `%2C` in a set-ids segment names a file that
+  // doesn't exist and the artwork slot stays black (#7026). Decoded AFTER the
+  // validator, which compares the hook's own URI string.
   const getCurrentAndroidOverlayPath = useCallback(() => {
     const path = overlayPathRef.current ?? null;
     const validator = overlayValidatorRef.current;
-    return validator ? validator(path, overlayLoadKeyRef.current ?? null) : path;
+    const validatedPath = validator ? validator(path, overlayLoadKeyRef.current ?? null) : path;
+    return validatedPath ? decodeFileUri(validatedPath) : validatedPath;
   }, []);
+  const getCurrentAndroidBackgroundPaths = useCallback(() => backgroundPathsRef.current?.map(decodeFileUri), []);
 
   // Memoize queue serialization so it only recomputes when the queue array
   // changes, not on every currentClimbQueueItem navigation.
@@ -358,34 +410,41 @@ export function useLiveActivity({
         .then(() => {
           if (!isActiveRef.current || generationRef.current !== startGeneration) return;
           startFailureCountRef.current = 0;
+          setActivityStartCount((count) => count + 1);
           // Send an initial update so the widget doesn't stay on "Loading...".
           const q = queueRef.current;
           const displayItem = currentClimbRef.current ?? (q.length > 0 ? q[0] : null);
           if (!displayItem) return;
           const idx = q.findIndex((item) => item.uuid === displayItem.uuid);
           if (idx === -1) return;
-          void updateLiveActivity({
-            climbName: displayItem.climb.name,
-            climbDifficulty: displayItem.climb.difficulty,
-            angle: displayItem.climb.angle,
-            currentIndex: idx,
-            totalClimbs: q.length,
-            hasNext: idx < q.length - 1,
-            hasPrevious: idx > 0,
-            climbUuid: displayItem.climb.uuid,
-            sessionId: sessionIdRef.current ?? undefined,
-            queueSequence: queueSequenceRef.current,
-            queueItemUuid: displayItem.uuid,
-            mirrored: displayItem.climb.mirrored === true,
-            queue: serializedQueueRef.current,
-            supportsMirroring: boardSupportsMirroring(stableBoard.boardName, stableBoard.layoutId),
-            widgetNavigationAllowed: widgetNavigationAllowedRef.current,
-            isPartySession: isPartySessionRef.current,
-            boardConnection: boardConnectionRef.current,
-            holderDisplayName: holderDisplayNameRef.current,
-            renderMode: renderModeRef.current,
-            androidThumbnailOverlayPath: getCurrentAndroidOverlayPath(),
-            androidThumbnailBackgroundPaths: backgroundPathsRef.current,
+          sendUpdate({
+            method: 'full',
+            options: {
+              climbName: displayItem.climb.name,
+              climbDifficulty: displayItem.climb.difficulty,
+              angle: displayItem.climb.angle,
+              currentIndex: idx,
+              totalClimbs: q.length,
+              hasNext: idx < q.length - 1,
+              hasPrevious: idx > 0,
+              climbUuid: displayItem.climb.uuid,
+              sessionId: sessionIdRef.current ?? undefined,
+              queueSequence: queueSequenceRef.current,
+              queueItemUuid: displayItem.uuid,
+              mirrored: displayItem.climb.mirrored === true,
+              queue: serializedQueueRef.current,
+              supportsMirroring: boardSupportsMirroring(stableBoard.boardName, stableBoard.layoutId),
+              widgetNavigationAllowed: widgetNavigationAllowedRef.current,
+              isPartySession: isPartySessionRef.current,
+              boardConnection: boardConnectionRef.current,
+              holderDisplayName: holderDisplayNameRef.current,
+              bulbOpensApp: bulbOpensAppRef.current,
+              boardConnecting: boardConnectingRef.current,
+              renderMode: renderModeRef.current,
+              androidThumbnailOverlayPath: getCurrentAndroidOverlayPath(),
+              androidThumbnailBackgroundPaths: getCurrentAndroidBackgroundPaths(),
+              androidBokehJson: androidBokehJsonRef.current,
+            },
           });
         })
         .catch((error) => {
@@ -425,6 +484,7 @@ export function useLiveActivity({
     }
 
     return () => {
+      cancelUpdateRetry();
       clearStartRetry();
       if (isActiveRef.current) {
         void endLiveActivitySession();
@@ -432,7 +492,7 @@ export function useLiveActivity({
       }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- startRetryNonce re-fires the start after a failed attempt
-  }, [shouldBeActive, stableBoard, available, startRetryNonce]);
+  }, [shouldBeActive, stableBoard, available, startRetryNonce, cancelUpdateRetry, sendUpdate]);
 
   // Stable scalar trigger for the on-device thumbnail backgrounds: the paths array
   // has a fresh identity each render, so depending on it directly would churn the
@@ -467,28 +527,34 @@ export function useLiveActivity({
       queueSyncedRef.current = false;
     });
 
-    void updateLiveActivity({
-      climbName: displayItem.climb.name,
-      climbDifficulty: displayItem.climb.difficulty,
-      angle: displayItem.climb.angle,
-      currentIndex,
-      totalClimbs: queueRef.current.length,
-      hasNext: currentIndex < queueRef.current.length - 1,
-      hasPrevious: currentIndex > 0,
-      climbUuid: displayItem.climb.uuid,
-      sessionId: sessionIdRef.current ?? undefined,
-      queueSequence: queueSequenceRef.current,
-      queueItemUuid: displayItem.uuid,
-      mirrored: displayItem.climb.mirrored === true,
-      queue: serializedQueue,
-      supportsMirroring: boardSupportsMirroring(stableBoard.boardName, stableBoard.layoutId),
-      widgetNavigationAllowed,
-      isPartySession,
-      boardConnection,
-      holderDisplayName,
-      renderMode,
-      androidThumbnailOverlayPath: getCurrentAndroidOverlayPath(),
-      androidThumbnailBackgroundPaths,
+    sendUpdate({
+      method: 'full',
+      options: {
+        climbName: displayItem.climb.name,
+        climbDifficulty: displayItem.climb.difficulty,
+        angle: displayItem.climb.angle,
+        currentIndex,
+        totalClimbs: queueRef.current.length,
+        hasNext: currentIndex < queueRef.current.length - 1,
+        hasPrevious: currentIndex > 0,
+        climbUuid: displayItem.climb.uuid,
+        sessionId: sessionIdRef.current ?? undefined,
+        queueSequence: queueSequenceRef.current,
+        queueItemUuid: displayItem.uuid,
+        mirrored: displayItem.climb.mirrored === true,
+        queue: serializedQueue,
+        supportsMirroring: boardSupportsMirroring(stableBoard.boardName, stableBoard.layoutId),
+        widgetNavigationAllowed,
+        isPartySession,
+        boardConnection,
+        holderDisplayName,
+        bulbOpensApp,
+        boardConnecting,
+        renderMode,
+        androidThumbnailOverlayPath: getCurrentAndroidOverlayPath(),
+        androidThumbnailBackgroundPaths: getCurrentAndroidBackgroundPaths(),
+        androidBokehJson: androidBokehJsonRef.current,
+      },
     });
   }, [
     androidThumbnailOverlayLoadKey,
@@ -497,14 +563,24 @@ export function useLiveActivity({
     // resolved backgrounds change, so it re-fires the push when late-resolving
     // backgrounds arrive (the array is read at effect time).
     backgroundsKey,
+    // A string, so it fires only when the card's look changes, including a
+    // mid-session kill switch flip.
+    androidBokehJson,
     boardConnection,
+    getCurrentAndroidBackgroundPaths,
     getCurrentAndroidOverlayPath,
     holderDisplayName,
+    bulbOpensApp,
+    boardConnecting,
     isPartySession,
+    // Read by nothing in the payload: the iOS card's footer reads native's
+    // pairing at render, so a forget only needs the push.
+    nativePairingRevision,
     // A board-look change must push mid-session so the iOS widget re-fetches
     // its thumbnail in the new mode.
     renderMode,
     serializedQueue,
+    sendUpdate,
     queueSequence,
     stableBoard,
     widgetNavigationAllowed,
@@ -521,37 +597,50 @@ export function useLiveActivity({
     const currentIndex = queue.findIndex((q) => q.uuid === displayItem.uuid);
     if (currentIndex === -1) return;
 
-    void updateLiveActivityClimb({
-      climbName: displayItem.climb.name,
-      climbDifficulty: displayItem.climb.difficulty,
-      angle: displayItem.climb.angle,
-      currentIndex,
-      totalClimbs: queue.length,
-      hasNext: currentIndex < queue.length - 1,
-      hasPrevious: currentIndex > 0,
-      climbUuid: displayItem.climb.uuid,
-      sessionId: sessionIdRef.current ?? undefined,
-      queueSequence: queueSequenceRef.current,
-      queueItemUuid: displayItem.uuid,
-      mirrored: displayItem.climb.mirrored === true,
-      supportsMirroring: boardSupportsMirroring(stableBoard.boardName, stableBoard.layoutId),
-      widgetNavigationAllowed,
-      isPartySession,
-      boardConnection,
-      holderDisplayName,
-      renderMode,
-      androidThumbnailOverlayPath: getCurrentAndroidOverlayPath(),
-      androidThumbnailBackgroundPaths,
+    sendUpdate({
+      method: 'climb',
+      options: {
+        climbName: displayItem.climb.name,
+        climbDifficulty: displayItem.climb.difficulty,
+        angle: displayItem.climb.angle,
+        currentIndex,
+        totalClimbs: queue.length,
+        hasNext: currentIndex < queue.length - 1,
+        hasPrevious: currentIndex > 0,
+        climbUuid: displayItem.climb.uuid,
+        sessionId: sessionIdRef.current ?? undefined,
+        queueSequence: queueSequenceRef.current,
+        queueItemUuid: displayItem.uuid,
+        mirrored: displayItem.climb.mirrored === true,
+        supportsMirroring: boardSupportsMirroring(stableBoard.boardName, stableBoard.layoutId),
+        widgetNavigationAllowed,
+        isPartySession,
+        boardConnection,
+        holderDisplayName,
+        bulbOpensApp,
+        boardConnecting,
+        renderMode,
+        androidThumbnailOverlayPath: getCurrentAndroidOverlayPath(),
+        androidThumbnailBackgroundPaths: getCurrentAndroidBackgroundPaths(),
+        androidBokehJson: androidBokehJsonRef.current,
+      },
     });
   }, [
     androidThumbnailOverlayLoadKey,
     androidThumbnailOverlayPath,
     // See Effect 1: backgroundsKey re-fires the push on a late background resolution.
     backgroundsKey,
+    // A string, so it fires only when the card's look changes, including a
+    // mid-session kill switch flip.
+    androidBokehJson,
     boardConnection,
     currentClimbQueueItem,
+    sendUpdate,
+    getCurrentAndroidBackgroundPaths,
     getCurrentAndroidOverlayPath,
     holderDisplayName,
+    bulbOpensApp,
+    boardConnecting,
     isPartySession,
     queue,
     // See Effect 1: a board-look change must push mid-session.
@@ -559,4 +648,6 @@ export function useLiveActivity({
     stableBoard,
     widgetNavigationAllowed,
   ]);
+
+  return { activityStartCount };
 }

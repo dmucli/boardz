@@ -13,7 +13,7 @@ const board = vi.hoisted(() => ({
   updateClimb: vi.fn(),
 }));
 const toast = vi.hoisted(() => ({ showToast: vi.fn() }));
-const queue = vi.hoisted(() => ({ setCurrentClimb: vi.fn() }));
+const queue = vi.hoisted(() => ({ setCurrentClimb: vi.fn(), refreshAuthoredClimb: vi.fn() }));
 const router = vi.hoisted(() => ({ push: vi.fn() }));
 const draftStore = vi.hoisted(() => ({
   loadDraft: vi.fn(async () => null),
@@ -93,7 +93,10 @@ vi.mock('../../../lib/graphql/hooks', () => ({
   useClimb: () => ({ data: undefined }),
 }));
 vi.mock('../../../providers/queue-provider', () => ({
-  useQueueActions: () => ({ setCurrentClimb: queue.setCurrentClimb }),
+  useQueueActions: () => ({
+    setCurrentClimb: queue.setCurrentClimb,
+    refreshAuthoredClimb: queue.refreshAuthoredClimb,
+  }),
 }));
 vi.mock('../../../providers/bluetooth-provider', () => ({
   useOptionalBluetoothContext: () => null,
@@ -239,7 +242,7 @@ describe('useCreateClimbScreen handleNewClimb', () => {
     // Nothing is at risk: the row is in Open drafts. Only the new-climb slot goes,
     // never an `edit:` slot.
     expect(result.current.pendingNewClimb).toBe(false);
-    expect(draftStore.clearDraft).toHaveBeenCalledWith('draft-key');
+    expect(draftStore.clearDraft).toHaveBeenCalledWith('draft-key', null);
     expect(result.current.name).toBe('');
   });
 
@@ -311,7 +314,7 @@ describe('useCreateClimbScreen handleNewClimb', () => {
     expect(result.current.pendingNewClimb).toBe(false);
     expect(result.current.name).toBe('');
     expect(createClimb.resetHolds).toHaveBeenCalledTimes(1);
-    expect(draftStore.clearDraft).toHaveBeenCalledWith('draft-key');
+    expect(draftStore.clearDraft).toHaveBeenCalledWith('draft-key', null);
   });
 
   it('waits for the slot to be retired before resetting the editor', async () => {

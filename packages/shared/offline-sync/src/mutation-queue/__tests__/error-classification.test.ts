@@ -9,6 +9,7 @@ import {
   getErrorStatus,
   isNetworkError,
   isPermanentRejection,
+  isClimbReferenceToDeletedClimb,
   isServerFailureSignal,
   isServerUnavailableError,
   isTransportNetworkError,
@@ -638,7 +639,7 @@ describe('an edge/proxy 404 (issue #5295)', () => {
   // climbers with a 404 for 6m30s. The responses also carried
   // `x-railway-fallback: true` — recorded here as evidence and deliberately NOT
   // read by the classifier, which must not learn one host's header
-  // (docs/railway.md portability rule). The status alone is sufficient: this
+  // (docs/operations/railway.md portability rule). The status alone is sufficient: this
   // drainer speaks GraphQL-over-POST to one endpoint, and GraphQL answers
   // not-found as HTTP 200 + `errors`, so a 404 here is always an edge verdict.
   function railwayEdge404(body: string) {
@@ -760,9 +761,19 @@ describe('permanent GraphQL verdicts served over HTTP 200 (issue #5295)', () => 
     expect(Array.from(PERMANENT_GRAPHQL_ERROR_CODES).sort()).toEqual([
       'BAD_REQUEST',
       'BAD_USER_INPUT',
+      'CLIMB_NOT_FOUND',
       'FORBIDDEN',
       'GRAPHQL_VALIDATION_FAILED',
     ]);
+  });
+
+  it('dead-letters CLIMB_NOT_FOUND — the spray tick whose climb is gone can never win a retry', () => {
+    // `saveTick` answers this for a spray tick naming a missing climb or a wall
+    // the climber cannot see (#6032). Spray climbs are never queued by the
+    // outbox, so a replay that used to find the climb (hard-deleted since) is
+    // a permanent verdict, not a "later".
+    expect(isPermanentRejection(graphqlRejection('CLIMB_NOT_FOUND'))).toBe(true);
+    expect(isRetryable(graphqlRejection('CLIMB_NOT_FOUND'))).toBe(false);
   });
 
   it('dead-letters each of them on the first attempt', () => {
@@ -770,6 +781,20 @@ describe('permanent GraphQL verdicts served over HTTP 200 (issue #5295)', () => 
       expect(isPermanentRejection(graphqlRejection(code))).toBe(true);
       expect(isRetryable(graphqlRejection(code))).toBe(false);
     }
+  });
+
+  it('settles only a favourite or playlist CREATE answered CLIMB_NOT_FOUND by a resolver (#5960)', () => {
+    const gone = graphqlRejection('CLIMB_NOT_FOUND');
+    expect(isClimbReferenceToDeletedClimb('user_favorites', 'create', gone)).toBe(true);
+    expect(isClimbReferenceToDeletedClimb('playlist_climbs', 'create', gone)).toBe(true);
+    // A tick refused this way is a lost logbook entry: it keeps dead-lettering.
+    expect(isClimbReferenceToDeletedClimb('boardsesh_ticks', 'create', gone)).toBe(false);
+    expect(isClimbReferenceToDeletedClimb('user_favorites', 'delete', gone)).toBe(false);
+    expect(isClimbReferenceToDeletedClimb('user_favorites', 'create', graphqlRejection('BAD_USER_INPUT'))).toBe(false);
+    // An edge 404 body is not a resolver's answer.
+    expect(isClimbReferenceToDeletedClimb('user_favorites', 'create', graphqlRejection('CLIMB_NOT_FOUND', 404))).toBe(
+      false,
+    );
   });
 
   it('reads a bare re-thrown GraphQLError that carries no response envelope', () => {

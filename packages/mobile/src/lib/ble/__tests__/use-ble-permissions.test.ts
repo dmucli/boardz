@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   reactNativePermissionHarness,
   resetReactNativePermissionHarness,
@@ -26,11 +26,12 @@ vi.mock('react-native-ble-plx', () => ({
 }));
 
 vi.mock('../ble-manager', () => ({
-  bleManager: mockBleManager,
+  getBleManager: () => mockBleManager,
 }));
 
 import {
   ANDROID_NO_DIALOG_ANSWER_MAX_MS,
+  hasAndroidBleScanPermissions,
   requestBleRuntimePermissions,
   requestBleRuntimePermissionStatus,
   requestOptionalNotificationPermission,
@@ -251,5 +252,89 @@ describe('requestOptionalNotificationPermission', () => {
     reactNativePermissionHarness.permissionsAndroid.request.mockRejectedValue(new Error('no activity'));
 
     await expect(requestOptionalNotificationPermission()).resolves.toBeUndefined();
+  });
+});
+
+describe('requestBleRuntimePermissionStatus ignores retired screenshot flags', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetReactNativePermissionHarness();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('still asks Android when only the fake-Bluetooth flag is set', async () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_FAKE_BLE', '1');
+    await requestBleRuntimePermissionStatus();
+    expect(reactNativePermissionHarness.permissionsAndroid.requestMultiple).toHaveBeenCalled();
+  });
+
+  it('honors Android denial when both retired screenshot flags are set', async () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_FAKE_BLE', '1');
+    reactNativePermissionHarness.permissionsAndroid.requestMultiple.mockResolvedValue({
+      BLUETOOTH_SCAN: 'granted',
+      BLUETOOTH_CONNECT: 'denied',
+    });
+    expect(await requestBleRuntimePermissionStatus()).toBe('denied');
+    expect(reactNativePermissionHarness.permissionsAndroid.requestMultiple).toHaveBeenCalledWith([
+      'BLUETOOTH_SCAN',
+      'BLUETOOTH_CONNECT',
+    ]);
+  });
+});
+
+// The board picker's in-range slot scans by itself only once the climber has
+// already allowed Bluetooth, so it reads the grants without asking.
+describe('hasAndroidBleScanPermissions', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetReactNativePermissionHarness();
+  });
+
+  const check = reactNativePermissionHarness.permissionsAndroid.check;
+  const grantOnly = (granted: string[]) =>
+    check.mockImplementation(async (permission: string) => granted.includes(permission));
+
+  it.each([
+    {
+      name: 'Android 12+ with scan and connect',
+      apiLevel: 31,
+      granted: ['BLUETOOTH_SCAN', 'BLUETOOTH_CONNECT'],
+      expected: true,
+    },
+    { name: 'Android 12+ missing connect', apiLevel: 33, granted: ['BLUETOOTH_SCAN'], expected: false },
+    { name: 'Android 12+ with only location', apiLevel: 31, granted: ['ACCESS_FINE_LOCATION'], expected: false },
+    { name: 'Android 11 with fine location', apiLevel: 30, granted: ['ACCESS_FINE_LOCATION'], expected: true },
+    {
+      name: 'Android 11 without location',
+      apiLevel: 30,
+      granted: ['BLUETOOTH_SCAN', 'BLUETOOTH_CONNECT'],
+      expected: false,
+    },
+  ])('$name: $expected', async ({ apiLevel, granted, expected }) => {
+    reactNativePermissionHarness.platform.Version = apiLevel;
+    grantOnly(granted);
+    expect(await hasAndroidBleScanPermissions()).toBe(expected);
+  });
+
+  it('never shows a dialog', async () => {
+    grantOnly([]);
+    await hasAndroidBleScanPermissions();
+    expect(reactNativePermissionHarness.permissionsAndroid.requestMultiple).not.toHaveBeenCalled();
+    expect(reactNativePermissionHarness.permissionsAndroid.request).not.toHaveBeenCalled();
+  });
+
+  it('has nothing to say off Android', async () => {
+    reactNativePermissionHarness.platform.OS = 'ios';
+    expect(await hasAndroidBleScanPermissions()).toBeNull();
+    expect(check).not.toHaveBeenCalled();
+  });
+
+  it('has nothing to say when the check throws', async () => {
+    check.mockRejectedValue(new Error('activity gone'));
+    expect(await hasAndroidBleScanPermissions()).toBeNull();
   });
 });

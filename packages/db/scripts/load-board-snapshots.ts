@@ -15,6 +15,13 @@
  * derived here from each climb's `frames`, the same parse the render and
  * hold-filter paths use.
  *
+ * An artifact is read by table and column name only: `PRAGMA quick_check`,
+ * `PRAGMA table_info`, `count(*)` and plain `SELECT`s into `ON CONFLICT DO
+ * NOTHING` inserts. Nothing here depends on row order, a `rowid` or an index,
+ * so both artifact shapes load alike: shape 1 (rowid tables with secondary
+ * indexes) and shape 2 (`WITHOUT ROWID`, no secondary index, rows in key
+ * order; see `docs/data/board-snapshots.md`). Keep it that way.
+ *
  * Two shapes the artifacts cannot carry are filled in on the way through:
  *
  *  - `board_climb_grades.model_version` / `coeff_version` are stamped
@@ -55,12 +62,14 @@ import type { BoardName } from '@boardsesh/shared-schema';
 import {
   CATALOG_SNAPSHOT_CLIMB_REFERENCE_COLUMNS,
   catalogSnapshotBaseTables,
+  catalogSnapshotBoardTypeFilter,
   catalogSnapshotDeferredTables,
+  SPRAY_CATALOGUE_SEQUENCE_ADVANCE_SQL,
   type CatalogSnapshotTableName,
 } from '../src/catalog-snapshot.js';
 import { describeDatabaseHost, isLocalDatabaseUrl } from './db-connection.js';
 
-const DEFAULT_SNAPSHOT_BASE_URL = 'https://boardsesh-board-snapshots.t3.tigrisfiles.io';
+const DEFAULT_SNAPSHOT_BASE_URL = 'https://snapshots.boardsesh.com';
 const CLIMBS_MANIFEST_PATH = 'board-snapshots/v1-gzip/manifest.json';
 const CATALOG_MANIFEST_PATH = 'board-snapshots/v1-catalog/manifest.json';
 
@@ -292,7 +301,7 @@ async function downloadArtifact(url: string, destPath: string): Promise<void> {
  * artifact: the file must be a healthy SQLite database, and every table's
  * recorded `snapshot_meta.row_count` must equal its actual row count.
  */
-function verifyArtifact(db: DatabaseSync, label: string): void {
+export function verifyArtifact(db: DatabaseSync, label: string): void {
   const quickCheck = db.prepare('PRAGMA quick_check').get() as Record<string, unknown> | undefined;
   const quickCheckResult = quickCheck ? String(Object.values(quickCheck)[0]) : 'missing';
   if (quickCheckResult !== 'ok') {
@@ -352,7 +361,7 @@ async function pgColumns(sqlClient: Sql, tableName: string): Promise<PgColumn[]>
   }));
 }
 
-function sqliteColumns(db: DatabaseSync, tableName: string): string[] {
+export function sqliteColumns(db: DatabaseSync, tableName: string): string[] {
   const rows = db.prepare(`PRAGMA table_info(${tableName})`).all() as { name: string }[];
   if (rows.length === 0) throw new Error(`artifact has no table ${tableName}`);
   return rows.map((row) => row.name);
@@ -474,7 +483,7 @@ async function loadRows(params: {
   }
 }
 
-function* mapSqliteRows(
+export function* mapSqliteRows(
   db: DatabaseSync,
   selectSql: string,
   plans: readonly ColumnPlan[],
@@ -482,6 +491,18 @@ function* mapSqliteRows(
   for (const row of db.prepare(selectSql).iterate() as Iterable<SqliteRow>) {
     yield plans.map((plan) => plan.read(row));
   }
+}
+
+/**
+ * The SELECT that reads one artifact table. Rows of an excluded board type
+ * (spray) are skipped whatever the artifact carries: artifacts built before the
+ * exporter filtered them still hold private spray-wall rows.
+ */
+export function artifactSelectSql(table: string, artifactCols: readonly string[]): string {
+  const boardTypeScope = artifactCols.includes('board_type')
+    ? ` WHERE ${catalogSnapshotBoardTypeFilter('board_type')}`
+    : '';
+  return `SELECT ${artifactCols.join(', ')} FROM ${table}${boardTypeScope}`;
 }
 
 async function loadArtifactTable(params: {
@@ -501,7 +522,7 @@ async function loadArtifactTable(params: {
     sqlClient,
     targetTable: table,
     plans,
-    rows: mapSqliteRows(db, `SELECT ${artifactCols.join(', ')} FROM ${table}`, plans),
+    rows: mapSqliteRows(db, artifactSelectSql(table, artifactCols), plans),
     extraWhere: requiresClimb
       ? `EXISTS (SELECT 1 FROM board_climbs climb WHERE climb.board_type = staging.board_type AND climb.uuid = staging.${assertSafeIdentifier(requiresClimb, 'climb reference column')})`
       : undefined,
@@ -545,7 +566,7 @@ export function holdRowsForClimb(boardType: string, climbUuid: string, frames: s
   ]);
 }
 
-function* deriveHoldRows(db: DatabaseSync): Generator<readonly (string | null)[]> {
+export function* deriveHoldRows(db: DatabaseSync): Generator<readonly (string | null)[]> {
   const rows = db
     .prepare("SELECT uuid, board_type, frames FROM board_climbs WHERE frames IS NOT NULL AND frames != ''")
     .iterate() as Iterable<{ uuid: string; board_type: string; frames: string }>;
@@ -862,6 +883,12 @@ async function main(): Promise<void> {
         catalogDb.close();
       }
       await rm(catalogArtifactPath, { force: true });
+    }
+
+    // Defensive: nothing above loads a spray row any more, but a wall created on
+    // this database must never be handed an id a stray row already holds.
+    for (const statement of SPRAY_CATALOGUE_SEQUENCE_ADVANCE_SQL) {
+      await sqlClient.unsafe(statement);
     }
 
     console.info('\n>>> ANALYZE');

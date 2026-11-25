@@ -48,6 +48,13 @@ type UseGymPanelGestureOptions = {
   /** When the native map can't render, the Low ("reveal the map") detent is dropped
    *  from the snap set and the panel opens High — a peek over a dead map is worse. */
   mapAvailable: boolean;
+  /**
+   * The height of the box the panel is laid out in. Defaults to the window: the
+   * panel over a full-screen map (/gyms). While the keyboard is up the screen
+   * passes the height above it, and the panel re-snaps to its detent whenever
+   * that height changes.
+   */
+  availableHeight?: number;
 };
 
 type UseGymPanelGestureReturn = {
@@ -74,19 +81,24 @@ type UseGymPanelGestureReturn = {
   ensureVisible: () => void;
 };
 
-export function useGymPanelGesture({ mapAvailable }: UseGymPanelGestureOptions): UseGymPanelGestureReturn {
+export function useGymPanelGesture({
+  mapAvailable,
+  availableHeight,
+}: UseGymPanelGestureOptions): UseGymPanelGestureReturn {
   const { height: screenHeight } = useWindowDimensions();
   const insets = useSafeAreaInsets();
   const [headerHeight, setHeaderHeight] = useState(DEFAULT_HEADER_HEIGHT);
+  const boxHeight = availableHeight ?? screenHeight;
+  const hasLow = mapAvailable;
 
-  // Detent positions as the panel's top-edge Y (px from the screen top). Lower Y =
+  // Detent positions as the panel's top-edge Y (px from the box's top). Lower Y =
   // taller panel. The panel View is `panelHeight` tall and translated DOWN from the
   // High position, so translateY == one of these top-Y values.
-  const highTopY = screenHeight * (1 - HIGH_FRACTION);
-  const mediumTopY = screenHeight * (1 - MEDIUM_FRACTION);
+  const highTopY = boxHeight * (1 - HIGH_FRACTION);
+  const mediumTopY = boxHeight * (1 - MEDIUM_FRACTION);
   const lowVisible = headerHeight + insets.bottom + spacing[2];
-  const lowTopY = screenHeight - lowVisible;
-  const panelHeight = screenHeight - highTopY;
+  const lowTopY = boxHeight - lowVisible;
+  const panelHeight = boxHeight - highTopY;
 
   const defaultDetent: GymPanelDetent = mapAvailable ? 'medium' : 'high';
   const defaultTopY = mapAvailable ? mediumTopY : highTopY;
@@ -101,7 +113,7 @@ export function useGymPanelGesture({ mapAvailable }: UseGymPanelGestureOptions):
   const highTopYSV = useSharedValue(highTopY);
   const mediumTopYSV = useSharedValue(mediumTopY);
   const lowTopYSV = useSharedValue(lowTopY);
-  const hasLowSV = useSharedValue(mapAvailable);
+  const hasLowSV = useSharedValue(hasLow);
   const headerHeightSV = useSharedValue<number>(headerHeight);
   const listAtTopSV = useSharedValue(true);
   // Captured at gesture start.
@@ -116,13 +128,13 @@ export function useGymPanelGesture({ mapAvailable }: UseGymPanelGestureOptions):
     highTopYSV.value = highTopY;
     mediumTopYSV.value = mediumTopY;
     lowTopYSV.value = lowTopY;
-    hasLowSV.value = mapAvailable;
+    hasLowSV.value = hasLow;
     headerHeightSV.value = headerHeight;
   }, [
     highTopY,
     mediumTopY,
     lowTopY,
-    mapAvailable,
+    hasLow,
     headerHeight,
     highTopYSV,
     mediumTopYSV,
@@ -166,6 +178,16 @@ export function useGymPanelGesture({ mapAvailable }: UseGymPanelGestureOptions):
     },
     [highTopY, mediumTopY, lowTopY, translateY, atHighAtStart],
   );
+
+  // A measured box that changes height (a keyboard, place suggestions opening
+  // above it) moves every detent: keep the panel on the one it settled on. The
+  // full-screen panel keeps the window's height and never needs this.
+  const measuredBox = availableHeight !== undefined;
+  useEffect(() => {
+    if (!measuredBox) return;
+    const detent = settledDetentRef.current;
+    translateY.value = detent === 'high' ? highTopY : detent === 'medium' ? mediumTopY : lowTopY;
+  }, [measuredBox, highTopY, mediumTopY, lowTopY, translateY]);
 
   const ensureVisible = useCallback(() => {
     if (settledDetentRef.current === 'low') snapTo('medium');

@@ -2,27 +2,23 @@
 
 import React, { useCallback } from 'react';
 import Button from '@mui/material/Button';
-import Box from '@mui/material/Box';
-import Typography from '@mui/material/Typography';
+import type { SxProps, Theme } from '@mui/material/styles';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { track, trackBeforeNavigation } from '@/app/lib/analytics';
 import { buildAppHandoffUrl } from '@/app/lib/app-handoff';
-import { themeTokens } from '@/app/theme/theme-config';
 
 export type HandoffSurface = 'climb_front_door' | 'list_front_door';
 /** Which www route tree the reader came from — the config-tuple tree or `/b/{slug}`. */
 export type HandoffTree = 'config-tuple' | 'slug';
 
-type ClimbHandoffCtaProps = {
+/** What `Climb Handoff Clicked` says about the click, and where the link points. */
+export type ClimbHandoffTarget = {
   /**
    * The www pathname to hand off, locale prefix included or not — the
    * builder strips it. NOT a full URL and never carries a query string: the
    * CTA contract is "the same pathname on the app origin".
    */
   pathname: string;
-  label: string;
-  ariaLabel: string;
-  helperText?: string;
   surface: HandoffSurface;
   tree: HandoffTree;
   boardName: string;
@@ -32,30 +28,36 @@ type ClimbHandoffCtaProps = {
   locale: string;
 };
 
-const wrapperSx = {
-  display: 'flex',
-  flexDirection: 'column' as const,
-  alignItems: 'flex-start',
-  gap: `${themeTokens.spacing[2]}px`,
-  margin: `${themeTokens.spacing[6]}px 0`,
+type ClimbHandoffLinkProps = ClimbHandoffTarget & {
+  /**
+   * Leave it out when the visible text names the link well enough: an
+   * `aria-label` replaces that text, and must start with it (WCAG 2.5.3).
+   */
+  ariaLabel?: string;
+  /** What the link shows. A server page can pass its own markup: the label spans, an icon. */
+  children: React.ReactNode;
+  /** The link's look, which is the caller's: a text link on a phone, the filled button on a laptop. */
+  sx?: SxProps<Theme>;
+  /** Names the link for a page's own tests and styles (`data-cta`). */
+  ctaName?: string;
 };
 
-const helperSx = { color: 'var(--neutral-400)' };
-
 /**
- * The one action on the front door: open this exact route in the app.
+ * The hand-off itself: an anchor that opens this exact route in the browser
+ * app, and the click handler that measures it.
  *
  * It is a real `<a href>` rendered on the server, so it is crawlable and it
  * works with JavaScript off; the click handler only adds telemetry. The href
  * carries no UTM parameters — `buildAppHandoffUrl`'s contract is the same
  * pathname on the app origin, and a query string would break the app's route
  * match — so campaign attribution rides as event properties instead.
+ *
+ * How it looks is the caller's: `FrontDoorHeroCta` turns it into a text link on
+ * a phone and the filled button on a laptop, on the climb page and the board list.
  */
-export default function ClimbHandoffCta({
+export function ClimbHandoffLink({
   pathname,
-  label,
   ariaLabel,
-  helperText,
   surface,
   tree,
   boardName,
@@ -63,7 +65,10 @@ export default function ClimbHandoffCta({
   angle,
   climbUuid,
   locale,
-}: ClimbHandoffCtaProps) {
+  children,
+  sx,
+  ctaName,
+}: ClimbHandoffLinkProps) {
   const href = buildAppHandoffUrl(pathname);
 
   const handleClick = useCallback(
@@ -118,15 +123,17 @@ export default function ClimbHandoffCta({
   );
 
   return (
-    <Box sx={wrapperSx}>
-      <Button component="a" href={href} variant="contained" size="large" aria-label={ariaLabel} onClick={handleClick}>
-        {label}
-      </Button>
-      {helperText ? (
-        <Typography variant="body2" sx={helperSx}>
-          {helperText}
-        </Typography>
-      ) : null}
-    </Box>
+    <Button
+      component="a"
+      href={href}
+      variant="text"
+      size="large"
+      aria-label={ariaLabel}
+      onClick={handleClick}
+      sx={sx}
+      data-cta={ctaName}
+    >
+      {children}
+    </Button>
   );
 }

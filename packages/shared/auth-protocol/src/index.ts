@@ -1,0 +1,459 @@
+import { z } from 'zod';
+import { webCredentialProofSchema, WEB_CREDENTIAL_PROOF_VERSION } from './web-credential-proof';
+import { issuedWebSessionSchema, presentedWebSessionSchema, webSessionRequestSchema } from './web-session';
+export * from './web-credential-proof';
+
+export { AUTH_BACKEND_UNAVAILABLE, isAuthBackendUnavailable } from './client-errors';
+export * from './web-oauth-v1';
+export * from './provider-security-v1';
+export * from './first-password-v1';
+export * from './batch-system-user-v1';
+export * from './web-session';
+
+export const AUTH_PROTOCOL_VERSION = 2;
+/** Old private callers get the original strict reset reply; new callers opt in through this header. */
+export const PASSWORD_RESET_DEVICE_TOKEN_CAPABILITY_HEADER = 'x-boardsesh-reset-device-token';
+export const AUTH_COMMAND_PATHS = {
+  register: '/api/internal/auth/current-store/register',
+  password: '/api/internal/auth/current-store/password',
+  'verify-email': '/api/internal/auth/current-store/verify-email',
+  'resend-verification': '/api/internal/auth/current-store/resend-verification',
+  'forgot-password': '/api/internal/auth/current-store/forgot-password',
+  'reset-password': '/api/internal/auth/current-store/reset-password',
+  'set-password': '/api/internal/auth/current-store/set-password',
+  signout: '/api/internal/auth/current-store/signout',
+} as const;
+export const AUTH_COMMAND_ENV = {
+  mode: 'CURRENT_STORE_WEB_AUTH_MODE',
+  origin: 'CURRENT_STORE_AUTH_BACKEND_ORIGIN',
+  secret: 'CURRENT_STORE_AUTH_RPC_SECRET',
+} as const;
+export const AUTH_COMMAND_REQUEST_BYTES = 16_384;
+export const AUTH_COMMAND_RESPONSE_BYTES = 65_536;
+/** Existing location-sync ceiling; each private facade selects a smaller explicit budget. */
+export const AUTH_COMMAND_MAX_BODY_BYTES = 1_048_576;
+export const AUTH_COMMAND_TIMEOUT_MS = 8_000;
+export const AUTH_COMMAND_MAX_AGE_MS = 120_000;
+export const AUTH_COMMAND_FUTURE_SKEW_MS = 5_000;
+export const authProtocolRejectionSchema = z
+  .object({ error: z.enum(['invalid_request', 'expired_request', 'unauthorized', 'disabled']) })
+  .strict();
+
+export type WebAuthMode = 'legacy' | 'backend-staging';
+export function parseWebAuthMode(mode: string | undefined): WebAuthMode {
+  if (mode === undefined || mode === '' || mode === 'legacy') return 'legacy';
+  if (mode === 'backend-staging') return mode;
+  throw new Error('Invalid current-store web auth mode');
+}
+
+const requestId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+const issuedAt = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const identityId = z.string().min(1);
+const isoTimestamp = z.iso.datetime();
+const protocolVersion = z.literal(AUTH_PROTOCOL_VERSION);
+const commandMetadata = { protocolVersion, requestId, issuedAt };
+
+export const emailVerificationTokenSchema = z.string().regex(/^ev1_[A-Za-z0-9_-]{43}$/);
+export const passwordRecoveryTokenSchema = z.string().regex(/^pr1_[A-Za-z0-9_-]{43}$/);
+/** Reserve current, malformed and future recovery tokens before legacy dispatch. */
+export function isVersionedPasswordRecoveryToken(token: unknown): boolean {
+  return typeof token === 'string' && /^pr\d+_/i.test(token);
+}
+/** Reserve the namespace before any legacy dispatch, including future/malformed versions. */
+export function isVersionedEmailVerificationToken(token: unknown): boolean {
+  return typeof token === 'string' && /^ev\d+_/i.test(token);
+}
+/** Existing non-verification records must never reach the legacy orphan cleanup. */
+export function isReservedAuthRecordIdentifier(identifier: unknown): boolean {
+  return (
+    typeof identifier === 'string' &&
+    ['ba03-web-auth:', 'password-reset:', 'ba03-flow:', 'ba03-lineage:', 'ba03-batch-system-user:'].some((prefix) =>
+      identifier.startsWith(prefix),
+    )
+  );
+}
+
+export const registerCommandSchema = z
+  .object({
+    ...commandMetadata,
+    operation: z.literal('register'),
+    payload: z.unknown(),
+  })
+  .strict()
+  .refine((command) => Object.hasOwn(command, 'payload'), { message: 'Missing command payload' });
+export const passwordCommandSchema = z
+  .object({
+    ...commandMetadata,
+    operation: z.literal('password'),
+    credentialProofVersion: z.literal(WEB_CREDENTIAL_PROOF_VERSION).optional(),
+    /**
+     * The visitor address the web server trusts, ungrouped (IPv6 is grouped by
+     * `/64` on the backend). The backend keys its per-client sign-in limit on it
+     * and believes it only because the command carries the RPC secret. Absent,
+     * or not a public address, the sign-in takes the backend's per-process budget.
+     */
+    clientAddress: z.union([z.ipv4(), z.ipv6()]).optional(),
+    /**
+     * Issue a first-party web session for the account this command verifies,
+     * revoking `presented` in the same transaction. Needs
+     * `CURRENT_STORE_WEB_SESSION_MODE=backend-staging`; the command answers 404
+     * without it.
+     */
+    webSession: webSessionRequestSchema.optional(),
+    /**
+     * The browser's device token (#7656), from its HttpOnly cookie, as the web
+     * received it. The backend verifies it for the accounts the email names; a
+     * valid one charges the account's device bucket instead of the email's.
+     */
+    deviceToken: z.string().min(1).max(256).optional(),
+
+    payload: z.object({ email: z.string().min(1), password: z.string().min(1) }).strict(),
+  })
+  .strict();
+export const verifyEmailCommandSchema = z
+  .object({
+    ...commandMetadata,
+    operation: z.literal('verify-email'),
+    payload: z.object({ token: z.string().min(1).max(256), email: z.string().min(1).optional() }).strict(),
+  })
+  .strict();
+export const resendVerificationCommandSchema = z
+  .object({
+    ...commandMetadata,
+    operation: z.literal('resend-verification'),
+    payload: z.unknown(),
+  })
+  .strict()
+  .refine((command) => Object.hasOwn(command, 'payload'), { message: 'Missing command payload' });
+export const forgotPasswordCommandSchema = z
+  .object({ ...commandMetadata, operation: z.literal('forgot-password'), payload: z.unknown() })
+  .strict()
+  .refine((command) => Object.hasOwn(command, 'payload'), { message: 'Missing command payload' });
+export const resetPasswordCommandSchema = z
+  .object({ ...commandMetadata, operation: z.literal('reset-password'), payload: z.unknown() })
+  .strict()
+  .refine((command) => Object.hasOwn(command, 'payload'), { message: 'Missing command payload' });
+/** The password rule a chosen password must meet, in either set-password form. */
+export const setPasswordPasswordSchema = z.string().min(8).max(128);
+export const setPasswordCommandSchema = z
+  .object({
+    ...commandMetadata,
+    operation: z.literal('set-password'),
+    /**
+     * The first form names the legacy NextAuth cookie (`credential`). The
+     * second (#7596, B4b) presents the session the way the web-session
+     * commands do; a canonical token keeps its session and token through the
+     * password write, and a legacy cookie behaves exactly as the first form.
+     */
+    payload: z.union([
+      z
+        .object({
+          expectedUserId: identityId,
+          expectedAuthSessionId: z.string().min(1).max(1024),
+          credential: z.string().min(1).max(65_536),
+          password: setPasswordPasswordSchema,
+          confirmPassword: z.string(),
+        })
+        .strict()
+        .refine((payload) => payload.password === payload.confirmPassword),
+      z
+        .object({
+          expectedUserId: identityId,
+          expectedAuthSessionId: z.string().min(1).max(1024),
+          presented: presentedWebSessionSchema,
+          password: setPasswordPasswordSchema,
+          confirmPassword: z.string(),
+        })
+        .strict()
+        .refine((payload) => payload.password === payload.confirmPassword),
+    ]),
+  })
+  .strict();
+export const webSignOutCommandSchema = z
+  .object({
+    ...commandMetadata,
+    operation: z.literal('signout'),
+    payload: z.object({ credential: z.string().min(1).max(65_536) }).strict(),
+  })
+  .strict();
+export const authCommandSchema = z.union([
+  registerCommandSchema,
+  passwordCommandSchema,
+  verifyEmailCommandSchema,
+  resendVerificationCommandSchema,
+  forgotPasswordCommandSchema,
+  resetPasswordCommandSchema,
+  setPasswordCommandSchema,
+  webSignOutCommandSchema,
+]);
+
+/** Private RPC data. Public HTTP adapters must project a separate response. */
+export const registrationMailPlanSchema = z
+  .object({
+    kind: z.literal('uid-email-verification-v1'),
+    recipient: z.email(),
+    token: emailVerificationTokenSchema,
+    expiresAt: isoTimestamp,
+  })
+  .strict();
+export const emailVerificationMailPlanSchema = registrationMailPlanSchema;
+export const passwordRecoveryMailPlanSchema = z
+  .object({
+    kind: z.literal('uid-password-reset-v1'),
+    recipient: z.email(),
+    token: passwordRecoveryTokenSchema,
+    expiresAt: isoTimestamp,
+  })
+  .strict();
+
+export const REGISTRATION_VALIDATION_MESSAGES = [
+  'Invalid email address',
+  'Password must be at least 8 characters',
+  'Password must be less than 128 characters',
+  'Name is required',
+  'Name must be less than 100 characters',
+  'Invalid input: expected string, received undefined',
+  'Invalid input: expected string, received null',
+  'Invalid input: expected string, received number',
+  'Invalid input: expected string, received boolean',
+  'Invalid input: expected string, received object',
+  'Invalid input: expected string, received array',
+  'Invalid input: expected object, received undefined',
+  'Invalid input: expected object, received null',
+  'Invalid input: expected object, received number',
+  'Invalid input: expected object, received boolean',
+  'Invalid input: expected object, received string',
+  'Invalid input: expected object, received array',
+] as const;
+export const PASSWORD_RECOVERY_VALIDATION_MESSAGES = [
+  ...REGISTRATION_VALIDATION_MESSAGES,
+  'Invalid reset token',
+  'Passwords do not match',
+] as const;
+
+function transportErrorReplySchema<const Operation extends keyof typeof AUTH_COMMAND_PATHS>(operation: Operation) {
+  const base = { protocolVersion, operation: z.literal(operation), requestId, outcome: z.literal('error') };
+  return z.discriminatedUnion('code', [
+    z.object({ ...base, code: z.literal('replayed') }).strict(),
+    z
+      .object({
+        ...base,
+        code: z.literal('rate_limited'),
+        retryAfterSeconds: z
+          .number()
+          .int()
+          .min(1)
+          .max(operation === 'password' ? 86_400 : 3_600),
+      })
+      .strict(),
+    z.object({ ...base, code: z.literal('unavailable') }).strict(),
+  ]);
+}
+
+const registerCreated = {
+  protocolVersion,
+  operation: z.literal('register'),
+  requestId,
+  outcome: z.literal('created'),
+  userId: identityId,
+  createdAt: isoTimestamp,
+};
+export const registerReplySchema = z.union([
+  z.object({ ...registerCreated, requiresVerification: z.literal(false) }).strict(),
+  z
+    .object({ ...registerCreated, requiresVerification: z.literal(true), mailPlan: registrationMailPlanSchema })
+    .strict(),
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('register'),
+      requestId,
+      outcome: z.literal('error'),
+      code: z.literal('validation_error'),
+      message: z.enum(REGISTRATION_VALIDATION_MESSAGES),
+    })
+    .strict(),
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('register'),
+      requestId,
+      outcome: z.literal('error'),
+      code: z.literal('exists'),
+    })
+    .strict(),
+  transportErrorReplySchema('register'),
+]);
+
+export const passwordReplySchema = z.union([
+  z
+    .object({ protocolVersion, operation: z.literal('password'), requestId, outcome: z.literal('invalid_credentials') })
+    .strict(),
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('password'),
+      requestId,
+      outcome: z.literal('authenticated'),
+      credentialProof: webCredentialProofSchema.optional(),
+      /** Only when the command asked for one. */
+      webSession: issuedWebSessionSchema.optional(),
+      user: z
+        .object({ id: identityId, email: z.string().min(1), name: z.string().nullable(), image: z.string().nullable() })
+        .strict(),
+      verification: z.object({ userId: identityId, required: z.boolean(), verified: z.boolean() }).strict(),
+    })
+    .strict()
+    .refine(
+      (reply) =>
+        reply.user.id === reply.verification.userId &&
+        (!reply.credentialProof || reply.credentialProof.userId === reply.user.id),
+      { message: 'Verification identity mismatch' },
+    ),
+  transportErrorReplySchema('password'),
+]);
+
+export const verifyEmailReplySchema = z.union([
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('verify-email'),
+      requestId,
+      outcome: z.enum(['verified', 'invalid_token', 'expired', 'legacy_unbound']),
+    })
+    .strict(),
+  transportErrorReplySchema('verify-email'),
+]);
+export const resendVerificationReplySchema = z.union([
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('resend-verification'),
+      requestId,
+      outcome: z.literal('accepted'),
+      mailPlan: emailVerificationMailPlanSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('resend-verification'),
+      requestId,
+      outcome: z.literal('error'),
+      code: z.literal('validation_error'),
+      message: z.enum(REGISTRATION_VALIDATION_MESSAGES),
+    })
+    .strict(),
+  transportErrorReplySchema('resend-verification'),
+]);
+function recoveryValidationReply<const Operation extends 'forgot-password' | 'reset-password'>(operation: Operation) {
+  return z
+    .object({
+      protocolVersion,
+      operation: z.literal(operation),
+      requestId,
+      outcome: z.literal('error'),
+      code: z.literal('validation_error'),
+      message: z.enum(PASSWORD_RECOVERY_VALIDATION_MESSAGES),
+    })
+    .strict();
+}
+export const forgotPasswordReplySchema = z.union([
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('forgot-password'),
+      requestId,
+      outcome: z.literal('accepted'),
+      mailPlan: passwordRecoveryMailPlanSchema.optional(),
+    })
+    .strict(),
+  recoveryValidationReply('forgot-password'),
+  transportErrorReplySchema('forgot-password'),
+]);
+export const resetPasswordReplySchema = z.union([
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('reset-password'),
+      requestId,
+      outcome: z.enum(['reset', 'invalid_or_expired', 'legacy_unbound']),
+      /** Private-only recognition proof for the account whose reset committed. Never a login. */
+      deviceToken: z.string().min(1).max(128).optional(),
+    })
+    .strict(),
+  recoveryValidationReply('reset-password'),
+  transportErrorReplySchema('reset-password'),
+]);
+export const setPasswordReplySchema = z.union([
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('set-password'),
+      requestId,
+      outcome: z.literal('set'),
+      credentialProof: webCredentialProofSchema,
+    })
+    .strict(),
+  z
+    .object({
+      protocolVersion,
+      operation: z.literal('set-password'),
+      requestId,
+      outcome: z.enum(['already_set', 'reauthentication_required', 'unauthenticated', 'identity_changed']),
+    })
+    .strict(),
+  transportErrorReplySchema('set-password'),
+]);
+export const webSignOutReplySchema = z.union([
+  z.object({ protocolVersion, operation: z.literal('signout'), requestId, outcome: z.literal('signed_out') }).strict(),
+  transportErrorReplySchema('signout'),
+]);
+export const authCommandReplySchema = z.union([
+  registerReplySchema,
+  passwordReplySchema,
+  verifyEmailReplySchema,
+  resendVerificationReplySchema,
+  forgotPasswordReplySchema,
+  resetPasswordReplySchema,
+  setPasswordReplySchema,
+  webSignOutReplySchema,
+]);
+
+export type RegisterCommand = z.infer<typeof registerCommandSchema>;
+export type PasswordCommand = z.infer<typeof passwordCommandSchema>;
+export type VerifyEmailCommand = z.infer<typeof verifyEmailCommandSchema>;
+export type ResendVerificationCommand = z.infer<typeof resendVerificationCommandSchema>;
+export type ForgotPasswordCommand = z.infer<typeof forgotPasswordCommandSchema>;
+export type ResetPasswordCommand = z.infer<typeof resetPasswordCommandSchema>;
+export type WebSignOutCommand = z.infer<typeof webSignOutCommandSchema>;
+export type WebSignOutReply = z.infer<typeof webSignOutReplySchema>;
+export type SetPasswordCommand = z.infer<typeof setPasswordCommandSchema>;
+export type SetPasswordReply = z.infer<typeof setPasswordReplySchema>;
+export type AuthCommand = z.infer<typeof authCommandSchema>;
+export type RegistrationMailPlan = z.infer<typeof registrationMailPlanSchema>;
+export type RegisterReply = z.infer<typeof registerReplySchema>;
+export type PasswordReply = z.infer<typeof passwordReplySchema>;
+export type VerifyEmailReply = z.infer<typeof verifyEmailReplySchema>;
+export type ResendVerificationReply = z.infer<typeof resendVerificationReplySchema>;
+export type ForgotPasswordReply = z.infer<typeof forgotPasswordReplySchema>;
+export type ResetPasswordReply = z.infer<typeof resetPasswordReplySchema>;
+export type PasswordRecoveryMailPlan = z.infer<typeof passwordRecoveryMailPlanSchema>;
+export type AuthCommandReply = z.infer<typeof authCommandReplySchema>;
+
+export function authCommandReplyStatus(reply: AuthCommandReply): number {
+  if (reply.outcome === 'unauthenticated') return 401;
+  if (reply.outcome === 'reauthentication_required') return 403;
+  if (reply.outcome === 'identity_changed') return 409;
+  if (reply.outcome === 'already_set') return 409;
+  if (reply.outcome === 'legacy_unbound') return 503;
+  if (reply.outcome === 'created') return 201;
+  if (reply.outcome !== 'error') return 200;
+  if (reply.code === 'validation_error') return 400;
+  if (reply.code === 'exists' || reply.code === 'replayed') return 409;
+  if (reply.code === 'rate_limited') return 429;
+  return 503;
+}
+
+export * from './location-sync-v1';
+export * from './guess-limit-v1';

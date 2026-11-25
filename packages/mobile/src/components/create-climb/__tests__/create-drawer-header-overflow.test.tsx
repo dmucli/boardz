@@ -1,7 +1,9 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest';
-import { render } from '@testing-library/react';
-import { createElement, type ReactNode } from 'react';
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+import { beforeEach, describe, it, expect, vi } from 'vitest';
+import { fireEvent, render } from '@testing-library/react';
+import { createElement, forwardRef, useImperativeHandle, type ReactNode } from 'react';
+const themeVariant = vi.hoisted(() => ({ current: 'liquidGlass' as 'liquidGlass' | 'material' }));
 
 // The header owns the ⋯ menu, and the menu reports a POSITION. The row set
 // changes with editor state — Woods drops the route rows, a one-frame route has
@@ -12,11 +14,15 @@ import { createElement, type ReactNode } from 'react';
 type ViewMockProps = { children?: ReactNode; testID?: string };
 vi.mock('react-native', () => ({
   View: ({ children, testID }: ViewMockProps) => createElement('div', { 'data-testid': testID }, children),
-  Pressable: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
-    createElement('button', { onClick: onPress }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles },
+  TextInput: forwardRef(function TextInputMock(_props: unknown, ref) {
+    useImperativeHandle(ref, () => ({ focus: () => undefined }));
+    return createElement('input');
+  }),
+  StyleSheet: {
+    create: (styles: Record<string, unknown>) => styles,
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+  },
 }));
-vi.mock('@expo/ui/community/bottom-sheet', () => ({ BottomSheetTextInput: () => createElement('input') }));
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string, params?: Record<string, number | string>) => (params ? `${key}:${JSON.stringify(params)}` : key),
@@ -26,9 +32,6 @@ vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
 vi.mock('../../Icon', () => ({ Icon: ({ name }: { name?: string }) => createElement('span', { 'data-icon': name }) }));
-vi.mock('../../ble/BleLightbulbButton', () => ({
-  BleLightbulbButton: () => createElement('span', { 'data-ble': 'true' }),
-}));
 // One button per row, in the order the header handed them over — enough to fire
 // a specific POSITION, which is the thing under test.
 vi.mock('../../AppMenu', () => ({
@@ -36,14 +39,23 @@ vi.mock('../../AppMenu', () => ({
     actions,
     onSelectIndex,
     accessibilityLabel,
+    iconAppearance,
+    style,
   }: {
     actions: { label: string; disabled?: boolean }[];
     onSelectIndex: (index: number) => void;
     accessibilityLabel?: string;
+    iconAppearance?: string;
+    style?: unknown;
   }) =>
     createElement(
       'div',
-      { 'data-node': 'overflow', 'data-label': accessibilityLabel },
+      {
+        'data-node': 'overflow',
+        'data-label': accessibilityLabel,
+        'data-appearance': iconAppearance,
+        'data-style': JSON.stringify(Object.assign({}, ...[style].flat(10).filter(Boolean))),
+      },
       actions.map((action, index) =>
         createElement('button', {
           key: action.label,
@@ -54,16 +66,96 @@ vi.mock('../../AppMenu', () => ({
       ),
     ),
 }));
-vi.mock('../../../providers/theme-provider', () => ({
-  useTheme: () => ({ systemColors: { label: '#000', secondaryLabel: '#666', fill: '#EEE' } }),
+// The trailing Save, drawn as a plain button carrying what the header handed it.
+vi.mock('../../SheetTopBar', () => ({
+  SheetTopBarLayout: ({ leading, center, trailing }: { leading: ReactNode; center: ReactNode; trailing: ReactNode }) =>
+    createElement(
+      'div',
+      null,
+      createElement('div', { 'data-flank': 'leading' }, leading),
+      createElement('div', { 'data-node': 'name' }, center),
+      createElement('div', { 'data-flank': 'trailing' }, trailing),
+    ),
+  // The X, drawn as a plain button carrying what the header handed it.
+  SheetTopBarLeadingButton: ({
+    kind,
+    onPress,
+    accessibilityLabel,
+    accessibilityHint,
+  }: {
+    kind: string;
+    onPress: () => void;
+    accessibilityLabel?: string;
+    accessibilityHint?: string;
+  }) =>
+    createElement('button', {
+      'data-node': 'close',
+      'data-kind': kind,
+      'data-label': accessibilityLabel,
+      'data-hint': accessibilityHint,
+      onClick: onPress,
+    }),
+  SheetTopBarTrailingButton: ({
+    label,
+    accessibilityLabel,
+    onPress,
+    disabled,
+    loading,
+    prominent,
+    icon,
+    accessibilityHint,
+  }: {
+    label: string;
+    accessibilityLabel?: string;
+    onPress: () => void;
+    disabled?: boolean;
+    loading?: boolean;
+    prominent?: boolean;
+    icon?: string;
+    accessibilityHint?: string;
+  }) =>
+    createElement('button', {
+      'data-node': 'save',
+      'data-label': accessibilityLabel,
+      'data-loading': loading ? 'true' : 'false',
+      'data-prominent': prominent ? 'true' : 'false',
+      'data-icon': icon,
+      'data-hint': accessibilityHint,
+      disabled: disabled || loading,
+      onClick: onPress,
+      children: label,
+    }),
 }));
-vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { systemGray: '#8E8E93' } }));
+vi.mock('../../../providers/theme-provider', () => ({
+  useTheme: () => ({
+    variant: themeVariant.current,
+    textStyles: { body: { fontSize: 17, lineHeight: 22, fontWeight: '400' } },
+    systemColors: { label: '#000', secondaryLabel: '#666', fill: '#EEE' },
+  }),
+}));
+vi.mock('../../chrome/GlassActionToolbar', () => ({
+  GlassActionToolbar: ({
+    children,
+    actionCount,
+    actionSize,
+  }: {
+    children: ReactNode;
+    actionCount: number;
+    actionSize: number;
+  }) => createElement('div', { 'data-group': 'true', 'data-count': actionCount, 'data-size': actionSize }, children),
+}));
 vi.mock('../../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 3: 12, 4: 16 } }));
 
 import { CreateDrawerHeader } from '../CreateDrawerHeader';
+import type { SaveButtonState } from '../use-create-climb-screen';
 
-function renderHeader(overflow: Partial<Parameters<typeof CreateDrawerHeader>[0]['overflow']> = {}) {
+function renderHeader(
+  overflow: Partial<Parameters<typeof CreateDrawerHeader>[0]['overflow']> = {},
+  { saveState = 'ready', climbReady = true }: { saveState?: SaveButtonState; climbReady?: boolean } = {},
+) {
   const onSelectOverflowAction = vi.fn();
+  const onSave = vi.fn();
+  const onClose = vi.fn();
   const { container } = render(
     createElement(CreateDrawerHeader, {
       name: 'Test climb',
@@ -71,12 +163,12 @@ function renderHeader(overflow: Partial<Parameters<typeof CreateDrawerHeader>[0]
       startingCount: 0,
       finishCount: 0,
       focusSignal: 0,
-      onClose: vi.fn(),
-      bleConnected: false,
-      bleConnecting: false,
-      onToggleBle: vi.fn(),
-      overflow: { supportsMultiFrame: true, routeMode: false, frameCount: 1, ...overflow },
+      onClose,
+      overflow: { supportsMultiFrame: true, routeMode: false, frameCount: 1, holdListVisible: false, ...overflow },
       onSelectOverflowAction,
+      saveState,
+      onSave,
+      climbReady,
     }),
   );
   // Looked up by scanning rather than a CSS selector: a label may carry
@@ -84,10 +176,15 @@ function renderHeader(overflow: Partial<Parameters<typeof CreateDrawerHeader>[0]
   const row = (label: string) =>
     (Array.from(container.querySelectorAll('[data-row]')).find((node) => node.getAttribute('data-row') === label) ??
       null) as HTMLButtonElement | null;
-  return { container, onSelectOverflowAction, row };
+  const save = container.querySelector('[data-node="save"]') as HTMLButtonElement;
+  const close = container.querySelector('[data-node="close"]') as HTMLButtonElement;
+  return { container, onSelectOverflowAction, onSave, onClose, row, save, close };
 }
 
 describe('CreateDrawerHeader overflow menu', () => {
+  beforeEach(() => {
+    themeVariant.current = 'liquidGlass';
+  });
   it('labels the anchor, which is the only text a glyph trigger has', () => {
     const { container } = renderHeader();
     expect(container.querySelector('[data-node="overflow"]')?.getAttribute('data-label')).toBe(
@@ -114,25 +211,132 @@ describe('CreateDrawerHeader overflow menu', () => {
 
   it('resolves the FIRST row on a board that renders fewer of them', () => {
     // With the frame commands gone, Woods is the only state whose menu is a
-    // different LENGTH — one row where every other state has two. Index 0 there
-    // is newClimb, not the makeRoute that sits at 0 everywhere else, so this is
+    // different LENGTH — two rows where every other state has three. Index 0 there
+    // is toggleHoldList, not the makeRoute that sits at 0 elsewhere, so this is
     // what guards the header's index-to-action mapping against a stale row set.
     const { onSelectOverflowAction, container } = renderHeader({ supportsMultiFrame: false });
     const rows = Array.from(container.querySelectorAll('[data-row]')) as HTMLButtonElement[];
 
-    expect(rows).toHaveLength(1);
+    expect(rows).toHaveLength(2);
     rows[0]?.click();
+    expect(onSelectOverflowAction).toHaveBeenLastCalledWith('toggleHoldList');
+    rows[1]?.click();
     expect(onSelectOverflowAction).toHaveBeenLastCalledWith('newClimb');
   });
 
   it('marks the blocked route-to-boulder row disabled rather than dropping it', () => {
-    const { row } = renderHeader({ routeMode: true, frameCount: 4 });
+    const { row, onSelectOverflowAction } = renderHeader({ routeMode: true, frameCount: 4 });
     expect(row('mobile.create.routeMenu.makeBoulderBlocked')?.getAttribute('data-disabled')).toBe('true');
+    row('mobile.create.routeMenu.makeBoulderBlocked')?.click();
+    expect(onSelectOverflowAction).not.toHaveBeenCalled();
+    row('mobile.boardAccessibility.showList')?.click();
+    expect(onSelectOverflowAction).toHaveBeenCalledWith('toggleHoldList');
   });
 
   it('offers no route rows on a board that can only hold one frame', () => {
     const { row } = renderHeader({ supportsMultiFrame: false });
     expect(row('mobile.create.routeMenu.makeRoute')).toBeNull();
     expect(row('mobile.create.actions.newClimb')).not.toBeNull();
+  });
+
+  it('maps the way back from the list through the current menu rows', () => {
+    const { row, onSelectOverflowAction } = renderHeader({ holdListVisible: true });
+    expect(row('mobile.boardAccessibility.showList')).toBeNull();
+    row('mobile.boardAccessibility.showBoard')?.click();
+    expect(onSelectOverflowAction).toHaveBeenCalledWith('toggleHoldList');
+  });
+});
+
+// Every extra 44pt in this bar comes out of the name field, which a French or
+// German Save already narrows. The lightbulb moved to the tool row for that.
+describe('CreateDrawerHeader contents', () => {
+  it('holds only close, the name, the overflow menu and Save', () => {
+    const { container } = renderHeader();
+    const bar = container.firstElementChild as HTMLElement;
+    expect(bar.querySelector('[data-flank="leading"] [data-node="close"]')).not.toBeNull();
+    expect(bar.querySelector('[data-node="name"] input')).not.toBeNull();
+    const group = bar.querySelector('[data-flank="trailing"] [data-group]');
+    expect(group?.getAttribute('data-size')).toBe('44');
+    expect(group?.getAttribute('data-count')).toBe('2');
+    expect(group?.querySelector('[data-node="overflow"]')?.getAttribute('data-appearance')).toBe('plain');
+    expect(group?.querySelector('[data-node="save"]')).not.toBeNull();
+    expect(container.querySelector('[data-ble]')).toBeNull();
+  });
+
+  it('keeps Material menu at 48dp and Save at its natural translated width', () => {
+    themeVariant.current = 'material';
+    const { container } = renderHeader();
+    expect(container.querySelector('[data-group]')).toBeNull();
+    const menu = container.querySelector('[data-node="overflow"]');
+    expect(JSON.parse(menu?.getAttribute('data-style') ?? '{}')).toMatchObject({ width: 48, height: 48 });
+    expect(menu?.getAttribute('data-appearance')).toBeNull();
+    themeVariant.current = 'liquidGlass';
+  });
+});
+
+// A modal task's way out is an X on the leading edge (HIG): leaving loses
+// nothing, because the draft stays on this phone. There is no minimise any more.
+describe('CreateDrawerHeader X', () => {
+  it('is the top bar close X, not a collapse chevron, and says the draft is kept', () => {
+    const { close } = renderHeader();
+    expect(close.getAttribute('data-kind')).toBe('close');
+    expect(close.getAttribute('data-label')).toBe('mobile.create.actions.close');
+    expect(close.getAttribute('data-hint')).toBe('mobile.create.actions.closeHint');
+  });
+
+  it('leaves through onClose', () => {
+    const { close, onClose } = renderHeader();
+    fireEvent.click(close);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('CreateDrawerHeader Save', () => {
+  it('puts Save last in the header, prominent, and fires it', () => {
+    const { container, save, onSave } = renderHeader();
+    expect(save).toBeTruthy();
+    expect(save.getAttribute('data-prominent')).toBe('true');
+    expect(save.textContent).toBe('mobile.create.save.idle');
+    // Trailing: nothing follows it in the bar.
+    const buttons = Array.from(container.querySelectorAll('button, [data-ble]'));
+    expect(buttons[buttons.length - 1]).toBe(save);
+    save.click();
+    expect(onSave).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays disabled until the climb is ready, with the counts showing what is missing', () => {
+    const notReady = renderHeader({}, { climbReady: false });
+    expect(notReady.save.disabled).toBe(true);
+    expect(notReady.container.textContent).toContain('mobile.create.counts.start');
+    notReady.save.click();
+    expect(notReady.onSave).not.toHaveBeenCalled();
+
+    const ready = renderHeader({}, { climbReady: true });
+    expect(ready.save.disabled).toBe(false);
+  });
+
+  it('shows the spinner while saving, and refuses a second press', () => {
+    const { save, onSave } = renderHeader({}, { saveState: 'saving' });
+    expect(save.getAttribute('data-loading')).toBe('true');
+    expect(save.getAttribute('data-label')).toBe('mobile.create.save.saving');
+    save.click();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it('keeps the signed-out Save live, so the tap can go to sign-in', () => {
+    const { save } = renderHeader({}, { saveState: 'login', climbReady: false });
+    expect(save.disabled).toBe(false);
+    expect(save.getAttribute('data-label')).toBe('mobile.create.save.login');
+  });
+
+  it('marks a climb past its edit window with a lock and says why', () => {
+    const { save } = renderHeader({}, { saveState: 'editLocked' });
+    expect(save.disabled).toBe(true);
+    expect(save.getAttribute('data-icon')).toBe('lock');
+    expect(save.getAttribute('data-hint')).toBe('createClimbForm.alerts.editWindowExpired');
+
+    // Not ready is plain: no lock, so the two never look alike.
+    const notReady = renderHeader({}, { climbReady: false });
+    expect(notReady.save.getAttribute('data-icon')).toBeNull();
   });
 });

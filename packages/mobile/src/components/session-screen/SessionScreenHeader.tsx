@@ -1,8 +1,11 @@
-import { Pressable, StyleSheet, View } from 'react-native';
-import { GestureDetector, type PanGesture } from 'react-native-gesture-handler';
+import { PressableSurface } from '../PressableSurface';
+import { StyleSheet, View } from 'react-native';
+import { GestureDetector, type LegacyPanGesture as PanGesture } from 'react-native-gesture-handler';
 import { useTranslation } from 'react-i18next';
 import { Text } from '../Text';
+import { LargeContentViewer } from '../LargeContentViewer';
 import { Icon } from '../Icon';
+import { ChromeIconButton, useChromeIconButtonSize } from '../ChromeIconButton';
 import { useTheme } from '../../providers/theme-provider';
 import { spacing } from '../../theme/tokens';
 import { CHROME_LABEL_MAX_FONT_SCALE } from '../../theme/typography';
@@ -13,7 +16,7 @@ type SessionScreenHeaderProps = {
   sessionActive: boolean;
   /** When set, a share button floats at the trailing edge to invite climbers. */
   onShare?: () => void;
-  /** When set (session live), a labelled exit control (icon + "Stop" / "Leave")
+  /** When set (session live), a plain text exit control ("Stop" / "Leave")
    *  docks beside share so the overlay matches the tab chrome's trailing exit. */
   onEndSession?: () => void;
   /**
@@ -54,6 +57,9 @@ export function SessionScreenHeader({
 }: SessionScreenHeaderProps) {
   const { t } = useTranslation('session');
   const { systemColors, brandColors } = useTheme();
+  // The empty flank matches the minimise button, so the title stays centred.
+  const glyphButtonSize = useChromeIconButtonSize();
+  const flankSpacer = { width: glyphButtonSize, height: glyphButtonSize };
 
   const title = sessionActive ? t('mobile.session.headerActive') : t('mobile.session.headerStart');
   // Same split RecordTopChrome makes: leaving is non-destructive, so it gets
@@ -69,17 +75,15 @@ export function SessionScreenHeader({
   const row = (
     <View style={styles.row}>
       {onClose ? (
-        <Pressable
+        // A chevron, not an xmark: the session screen minimises to its pill.
+        <ChromeIconButton
+          testID="session-screen-minimize"
+          icon="chevron.down"
           onPress={onClose}
-          hitSlop={12}
-          accessibilityRole="button"
           accessibilityLabel={t('mobile.session.minimize')}
-          style={styles.iconButton}
-        >
-          <Icon name="chevron.down" size={26} color={systemColors.label} />
-        </Pressable>
+        />
       ) : (
-        <View style={styles.iconButton} />
+        <View style={flankSpacer} />
       )}
       <Text variant="title3" color={systemColors.label} style={styles.title} numberOfLines={1}>
         {title}
@@ -87,7 +91,8 @@ export function SessionScreenHeader({
       {onShare || onEndSession ? (
         <View style={styles.rightCluster}>
           {onShare ? (
-            <Pressable
+            <PressableSurface
+              testID="session-invite"
               onPress={onShare}
               hitSlop={12}
               accessibilityRole="button"
@@ -95,47 +100,49 @@ export function SessionScreenHeader({
               style={styles.shareButton}
             >
               {inviteHint ? (
-                <Text
-                  variant="subheadline"
-                  color={systemColors.label}
-                  numberOfLines={1}
-                  maxFontSizeMultiplier={CHROME_LABEL_MAX_FONT_SCALE}
-                  style={styles.shareLabel}
-                >
-                  {t('mobile.session.inviteAction')}
-                </Text>
+                <LargeContentViewer title={t('mobile.session.inviteAction')} onActivate={onShare}>
+                  <Text
+                    variant="subheadline"
+                    color={systemColors.label}
+                    numberOfLines={1}
+                    maxFontSizeMultiplier={CHROME_LABEL_MAX_FONT_SCALE}
+                    style={styles.shareLabel}
+                  >
+                    {t('mobile.session.inviteAction')}
+                  </Text>
+                </LargeContentViewer>
               ) : null}
-              <Icon name="share" size={22} color={systemColors.label} />
-            </Pressable>
+              <Icon maxFontSizeMultiplier={1} name="share" size={22} color={systemColors.label} />
+            </PressableSurface>
           ) : null}
           {onEndSession ? (
-            // Icon + word, matching the Stop pill in RecordTopChrome — the two
-            // surfaces show the same control for the same action, so neither can
-            // be the one a climber has to guess at.
-            <Pressable
+            // Plain text matches the native session header's exit action.
+            <PressableSurface
+              testID={`session-exit-${exitVariant}`}
               onPress={onEndSession}
               hitSlop={12}
               accessibilityRole="button"
               accessibilityLabel={exitLabel}
               style={styles.exitButton}
             >
-              <Icon name={isLeaveExit ? 'leave.session' : 'flag'} size={22} color={exitTint} />
-              <Text
-                variant="subheadline"
-                color={exitTint}
-                numberOfLines={1}
-                // The strip's controls are pinned to 40dp, so the label has to
-                // stop growing before it clips.
-                maxFontSizeMultiplier={CHROME_LABEL_MAX_FONT_SCALE}
-                style={styles.exitLabel}
-              >
-                {exitActionLabel}
-              </Text>
-            </Pressable>
+              <LargeContentViewer title={exitActionLabel} onActivate={onEndSession}>
+                <Text
+                  variant="label"
+                  color={exitTint}
+                  numberOfLines={1}
+                  // The strip's controls are pinned to 40dp, so the label has to
+                  // stop growing before it clips.
+                  maxFontSizeMultiplier={CHROME_LABEL_MAX_FONT_SCALE}
+                  style={styles.exitLabel}
+                >
+                  {exitActionLabel}
+                </Text>
+              </LargeContentViewer>
+            </PressableSurface>
           ) : null}
         </View>
       ) : (
-        <View style={styles.iconButton} />
+        <View style={flankSpacer} />
       )}
     </View>
   );
@@ -161,12 +168,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     fontWeight: '600',
   },
-  iconButton: {
-    width: 40,
-    height: 40,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
   rightCluster: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -179,7 +180,7 @@ const styles = StyleSheet.create({
     gap: spacing[1],
     minWidth: 40,
     height: 40,
-    paddingLeft: spacing[2],
+    paddingStart: spacing[2],
   },
   shareLabel: {
     fontWeight: '600',
@@ -193,7 +194,7 @@ const styles = StyleSheet.create({
     gap: spacing[1],
     minWidth: 40,
     height: 40,
-    paddingLeft: spacing[2],
+    paddingStart: spacing[2],
   },
   exitLabel: {
     fontWeight: '600',

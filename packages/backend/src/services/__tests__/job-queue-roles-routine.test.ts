@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import postgres from 'postgres';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import { PgBoss } from 'pg-boss';
-import { and, eq, inArray, sql } from 'drizzle-orm';
+import { eq, inArray, sql } from 'drizzle-orm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { encrypt } from '@boardsesh/crypto';
 import { BACKGROUND_JOB_QUEUES, type BackgroundWorkerRole } from '@boardsesh/db/background-jobs';
@@ -51,7 +51,7 @@ import {
  *       vp test run --project backend-serial job-queue-roles-routine
  *
  * The full recipe (a private dev DB container, migrated) is step 0 of the
- * routine cutover in docs/background-workers.md.
+ * routine cutover in docs/backend/background-workers.md.
  */
 
 // Keycloak is the one Kilter call no fixture can stand in for: the refresh
@@ -84,6 +84,8 @@ vi.mock('../../workers/families/provider-sync-batch', async (importOriginal) => 
 });
 
 const AURORA_USER = 'psync-rgrant-aurora';
+/** The app the logbook snapshot's connection belongs to. */
+const GRANT_TEST_APP = 'psync-rgrant-app';
 const AURORA_CLIMB = 'psync-climb-rgrant';
 const KILTER_USER = 'psync-rgrant-kilter';
 const KILTER_CLIMB = 'psync-kclimb-rgrant';
@@ -96,6 +98,11 @@ const FIRST_SYNC_USER = 'psync-rgrant-first';
 const SHARED_BOARD = 'soill';
 const SHARED_CLIMB = 'psync-shared-climb';
 const HEAL_CLIMB = 'psync-heal-climb';
+// A spray climb whose grade is an approved community grade (#5971): its
+// recompute reads climb_community_status and board_difficulty_grades.
+const SPRAY_HEAL_CLIMB = 'psync-heal-spray-climb';
+const SPRAY_PINNED_GRADE = 'psync/V99';
+const SPRAY_PINNED_DIFFICULTY = 99;
 const SETTER = 'psync-rgrant-setter';
 const CATALOG_ID = 990_001;
 const KILTER_PRODUCT = 'Psync Kilter Product';
@@ -458,10 +465,16 @@ async function proveRoutineGrants({ full, ownerUrl }: Proof) {
   }
 
   const cleanup = async () => {
+    // Deleting the app cascades into its connection.
+    await database.execute(sql`DELETE FROM oauth_client WHERE client_id = ${GRANT_TEST_APP}`);
     await removeFixtures(
       database,
       [AURORA_USER, KILTER_USER, DONOR_USER, FOLLOWER_USER, HEAL_USER, FIRST_SYNC_USER],
-      [AURORA_CLIMB, KILTER_CLIMB, HEAL_CLIMB],
+      [AURORA_CLIMB, KILTER_CLIMB, HEAL_CLIMB, SPRAY_HEAL_CLIMB],
+    );
+    await database.execute(sql`DELETE FROM climb_community_status WHERE climb_uuid = ${SPRAY_HEAL_CLIMB}`);
+    await database.execute(
+      sql`DELETE FROM board_difficulty_grades WHERE board_type = 'spray' AND difficulty = ${SPRAY_PINNED_DIFFICULTY}`,
     );
     await database.execute(sql`DELETE FROM background_job_runs WHERE payload->>'userId' = ${FIRST_SYNC_USER}`);
     await database.execute(sql`DELETE FROM notifications WHERE recipient_id = ${FOLLOWER_USER}`);
@@ -602,6 +615,20 @@ async function proveRoutineGrants({ full, ownerUrl }: Proof) {
                                    climbed_at, created_at, updated_at)
       VALUES (gen_random_uuid()::text, ${HEAL_USER}, 'kilter', ${HEAL_CLIMB}, 40, 'send'::tick_status,
               'native'::tick_origin, 1, '2026-01-01 00:00:00', now(), now())`);
+    // A spray climb with an approved community grade, for the self-heal's vote rule.
+    await database.execute(sql`
+      INSERT INTO board_climbs (uuid, board_type, layout_id, setter_username, name, frames, is_listed)
+      VALUES (${SPRAY_HEAL_CLIMB}, 'spray', 1, 'setter', 'Heal spray', 'p1r1', false)`);
+    await database.execute(sql`
+      INSERT INTO board_climb_stats (board_type, climb_uuid, angle, upstream_ascensionist_count, ascensionist_count,
+                                     boardsesh_ascensionist_count, updated_at)
+      VALUES ('spray', ${SPRAY_HEAL_CLIMB}, 40, 0, 0, 0, now() - interval '30 days')`);
+    await database.execute(sql`
+      INSERT INTO board_difficulty_grades (board_type, difficulty, boulder_name, route_name, is_listed)
+      VALUES ('spray', ${SPRAY_PINNED_DIFFICULTY}, ${SPRAY_PINNED_GRADE}, ${SPRAY_PINNED_GRADE}, false)`);
+    await database.execute(sql`
+      INSERT INTO climb_community_status (climb_uuid, board_type, angle, community_grade)
+      VALUES (${SPRAY_HEAL_CLIMB}, 'spray', 40, ${SPRAY_PINNED_GRADE})`);
     if (full) {
       await database.execute(sql`
         INSERT INTO board_products (board_type, id, name, is_listed) VALUES ('kilter', ${CATALOG_ID}, ${KILTER_PRODUCT}, true)`);
@@ -712,7 +739,8 @@ async function proveRoutineGrants({ full, ownerUrl }: Proof) {
     //    left pending, and a send whose recompute a deploy dropped.
     await database.execute(sql`
       INSERT INTO climb_stats_recompute_pending (board_type, climb_uuid, angle, requested_at)
-      VALUES ('kilter', ${HEAL_CLIMB}, 45, now() - interval '5 minutes')`);
+      VALUES ('kilter', ${HEAL_CLIMB}, 45, now() - interval '5 minutes'),
+             ('spray', ${SPRAY_HEAL_CLIMB}, 40, now() - interval '5 minutes')`);
     await runAs('maintenance-delivery', maintenance, 'climb-stats-self-heal', {});
     expect(
       await count(
@@ -723,6 +751,97 @@ async function proveRoutineGrants({ full, ownerUrl }: Proof) {
       await count(sql`SELECT boardsesh_ascensionist_count::int AS count FROM board_climb_stats
                        WHERE board_type = 'kilter' AND climb_uuid = ${HEAL_CLIMB} AND angle = 40`),
     ).toBe(1);
+    // The spray key took its pinned community grade (#5971): the recompute read
+    // climb_community_status and board_difficulty_grades as the maintenance login.
+    expect(
+      await count(
+        sql`SELECT count(*)::int AS count FROM climb_stats_recompute_pending WHERE climb_uuid = ${SPRAY_HEAL_CLIMB}`,
+      ),
+    ).toBe(0);
+    expect(
+      await count(sql`SELECT display_difficulty::int AS count FROM board_climb_stats
+                       WHERE board_type = 'spray' AND climb_uuid = ${SPRAY_HEAL_CLIMB} AND angle = 40`),
+    ).toBe(SPRAY_PINNED_DIFFICULTY);
+
+    // 6. The logbook snapshot reclaim, as the maintenance login: a row past its
+    //    hour goes, with both chunk kinds. The job never reads their payloads.
+    // A snapshot's connection_id references oauth_connections (migration 0301).
+    await database.execute(sql`
+      INSERT INTO oauth_client (id, client_id, redirect_uris)
+      VALUES (${GRANT_TEST_APP}, ${GRANT_TEST_APP}, ARRAY['https://app.example.test/callback'])
+      ON CONFLICT DO NOTHING`);
+    await database.execute(sql`
+      INSERT INTO oauth_connections (id, user_id, client_id, connected_at)
+      VALUES ('grant-test-connection', ${AURORA_USER}, ${GRANT_TEST_APP}, now())
+      ON CONFLICT DO NOTHING`);
+    const [expiredSnapshot] = (await database.execute(sql`
+      INSERT INTO logbook_snapshots
+        (user_id, connection_id, connection_generation, feed_generation, horizon_txid, status, expires_at)
+      VALUES (${AURORA_USER}, 'grant-test-connection', 0, gen_random_uuid(), '1'::xid8, 'ready', now() - interval '1 minute')
+      RETURNING id`)) as unknown as Array<{ id: string }>;
+    await database.execute(sql`
+      INSERT INTO logbook_snapshot_chunks (snapshot_id, chunk_index, ticks)
+      VALUES (${expiredSnapshot.id}::uuid, 0, '[]'::jsonb)`);
+    await database.execute(sql`
+      INSERT INTO logbook_snapshot_session_chunks (snapshot_id, chunk_index, session_export_ids)
+      VALUES (${expiredSnapshot.id}::uuid, 0, jsonb_build_array(gen_random_uuid()))`);
+    await runAs('maintenance-delivery', maintenance, 'reclaim-logbook-snapshots', {});
+    expect(
+      await count(sql`SELECT count(*)::int AS count FROM logbook_snapshots WHERE id = ${expiredSnapshot.id}::uuid`),
+    ).toBe(0);
+    expect(
+      await count(
+        sql`SELECT count(*)::int AS count FROM logbook_snapshot_chunks WHERE snapshot_id = ${expiredSnapshot.id}::uuid`,
+      ),
+    ).toBe(0);
+    expect(
+      await count(
+        sql`SELECT count(*)::int AS count FROM logbook_snapshot_session_chunks WHERE snapshot_id = ${expiredSnapshot.id}::uuid`,
+      ),
+    ).toBe(0);
+
+    // 7. The logbook change prune, as the maintenance login: every change row
+    //    written so far ages out and goes, and the watermark moves over it. The
+    //    job never reads whose row it is or which tick it names.
+    await database.execute(sql`INSERT INTO logbook_session_changes (user_id, session_export_id)
+      VALUES (${AURORA_USER}, gen_random_uuid())`);
+    await database.execute(sql`UPDATE logbook_changes SET created_at = localtimestamp - interval '91 days'`);
+    await database.execute(sql`UPDATE logbook_session_changes SET created_at = localtimestamp - interval '91 days'`);
+    const [lastChange] = (await database.execute(sql`
+      SELECT changes.txid::text AS txid, changes.seq::text AS seq FROM (
+        SELECT txid,seq FROM logbook_changes UNION ALL SELECT txid,seq FROM logbook_session_changes
+      ) changes ORDER BY changes.txid DESC, changes.seq DESC LIMIT 1`)) as unknown as Array<{
+      txid: string;
+      seq: string;
+    }>;
+    expect(lastChange).toBeDefined();
+    // Every write so far below the cluster-wide horizon, so none is skipped as unsettled.
+    const [fence] = (await database.execute(sql`SELECT pg_current_xact_id()::text AS txid`)) as unknown as Array<{
+      txid: string;
+    }>;
+    for (const deadline = Date.now() + 60_000; ;) {
+      const [snapshot] = (await database.execute(
+        sql`SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS horizon`,
+      )) as unknown as Array<{ horizon: string }>;
+      if (BigInt(snapshot.horizon) > BigInt(fence.txid)) break;
+      if (Date.now() > deadline) throw new Error('the transaction horizon never passed the fence');
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    try {
+      await runAs('maintenance-delivery', maintenance, 'prune-logbook-changes', {});
+      expect(await count(sql`SELECT count(*)::int AS count FROM logbook_changes`)).toBe(0);
+      expect(await count(sql`SELECT count(*)::int AS count FROM logbook_session_changes`)).toBe(0);
+      const [prunedThrough] = (await database.execute(sql`
+        SELECT pruned_through_txid::text AS txid, pruned_through_seq::text AS seq FROM logbook_change_watermark`)) as unknown as Array<{
+        txid: string;
+        seq: string;
+      }>;
+      expect(prunedThrough).toEqual(lastChange);
+    } finally {
+      await database.execute(
+        sql`UPDATE logbook_change_watermark SET pruned_through_txid = '0', pruned_through_seq = 0`,
+      );
+    }
 
     // Nothing was refused and swallowed on the way.
     expect(logged.filter((line) => /permission denied|"sqlState":"42501"/i.test(line))).toEqual([]);
@@ -733,7 +852,7 @@ async function proveRoutineGrants({ full, ownerUrl }: Proof) {
     await expect(routineDb.executeSql('DELETE FROM public.gyms WHERE false')).rejects.toThrow('permission denied');
     await expect(routineDb.executeSql('SELECT body FROM public.comments LIMIT 1')).rejects.toThrow('permission denied');
     const maintenanceDb = maintenance.boss.getDb();
-    await expect(maintenanceDb.executeSql('SELECT comment FROM public.boardsesh_ticks LIMIT 1')).rejects.toThrow(
+    await expect(maintenanceDb.executeSql('SELECT id FROM public.aurora_credentials LIMIT 1')).rejects.toThrow(
       'permission denied',
     );
     await expect(maintenanceDb.executeSql('UPDATE public.board_climbs SET name = name WHERE false')).rejects.toThrow(
@@ -742,6 +861,40 @@ async function proveRoutineGrants({ full, ownerUrl }: Proof) {
     await expect(maintenanceDb.executeSql('SELECT 1 FROM public.aurora_credentials LIMIT 1')).rejects.toThrow(
       'permission denied',
     );
+    await expect(maintenanceDb.executeSql('SELECT ticks FROM public.logbook_snapshot_chunks LIMIT 1')).rejects.toThrow(
+      'permission denied',
+    );
+    await expect(maintenanceDb.executeSql('SELECT user_id FROM public.logbook_snapshots LIMIT 1')).rejects.toThrow(
+      'permission denied',
+    );
+    await expect(
+      maintenanceDb.executeSql('SELECT session_export_ids FROM public.logbook_snapshot_session_chunks LIMIT 1'),
+    ).rejects.toThrow('permission denied');
+    for (const column of ['user_id', 'session_export_id', 'remove_if_missing']) {
+      await expect(
+        maintenanceDb.executeSql(`SELECT ${column} FROM public.logbook_session_changes LIMIT 1`),
+      ).rejects.toThrow('permission denied');
+    }
+    await expect(
+      maintenanceDb.executeSql(
+        "INSERT INTO public.logbook_session_changes (user_id, session_export_id) VALUES ('a', gen_random_uuid())",
+      ),
+    ).rejects.toThrow('permission denied');
+    await expect(
+      maintenanceDb.executeSql('UPDATE public.logbook_session_changes SET remove_if_missing = false WHERE false'),
+    ).rejects.toThrow('permission denied');
+    await expect(maintenanceDb.executeSql('SELECT user_id FROM public.logbook_changes LIMIT 1')).rejects.toThrow(
+      'permission denied',
+    );
+    await expect(maintenanceDb.executeSql('SELECT tick_uuid FROM public.logbook_changes LIMIT 1')).rejects.toThrow(
+      'permission denied',
+    );
+    await expect(
+      maintenanceDb.executeSql('SELECT feed_generation FROM public.logbook_change_watermark LIMIT 1'),
+    ).rejects.toThrow('permission denied');
+    await expect(
+      maintenanceDb.executeSql("INSERT INTO public.logbook_changes (user_id, tick_uuid) VALUES ('a', 'b')"),
+    ).rejects.toThrow('permission denied');
   } finally {
     await routine.boss.stop({ graceful: true, close: true });
     await maintenance.boss.stop({ graceful: true, close: true });

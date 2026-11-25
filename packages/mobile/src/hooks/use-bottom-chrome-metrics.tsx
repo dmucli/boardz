@@ -1,19 +1,40 @@
-import { createContext, useContext, useMemo, useSyncExternalStore, type ReactNode } from 'react';
+import { createContext, useContext, useMemo, useRef, useSyncExternalStore, type ReactNode } from 'react';
+import { Platform, useWindowDimensions } from 'react-native';
 import { useSegments } from 'expo-router';
-import { useWindowDimensions } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../providers/theme-provider';
-import { isAccessorySurfaceRoute, isTabsChromeRoute } from '../lib/route-segments';
-import { useNativeTabContentInsetBottom } from '../lib/native-tab-content-inset-store';
+import {
+  isAccessoryHiddenRoute,
+  isAccessorySurfaceRoute,
+  isRestTimerPillHiddenRoute,
+  isTabsChromeRoute,
+  isWallDisplayRoute,
+} from '../lib/route-segments';
+import {
+  useNativeTabContentInsetBottom,
+  useNativeTabContentInsetLeft,
+  useNativeTabContentInsetPublishCount,
+  useNativeTabContentInsetRight,
+} from '../lib/native-tab-content-inset-store';
 import { useConnectivityBannerHeight } from '../lib/connectivity-banner-inset-store';
 import { getRestTimerState, subscribeRestTimer } from '../lib/rest-timer-store';
+import { useWorkoutRunPendingStart } from '../lib/workout-run-store';
+import { useQueueSessionId } from '../providers/queue-provider';
 import { useStickyAccessoryPresence } from './use-sticky-accessory-presence';
-import { isBottomAccessoryAvailable, useNativeTabBar } from './use-bottom-accessory';
+import { useTabChrome } from './use-bottom-accessory';
 import { useDeviceLayout } from './use-device-layout';
-import { computeBottomChromeMetrics, type BottomChromeMetrics } from './bottom-chrome-metrics';
+import { useVerticalTabBar } from './use-vertical-tab-bar';
+import { useCurrentClimbSurface } from './use-current-climb-surface';
+import { resolveMiniPlayerHost } from './mini-player-host';
+import {
+  computeBottomChromeMetrics,
+  trackExpandedTabContentInset,
+  type BottomChromeMetrics,
+  type ExpandedTabContentInset,
+} from './bottom-chrome-metrics';
 import { shouldThrowOnMissingProvider } from './bottom-chrome-provider-gate';
-import { resolveDetailPaneSurface } from '../theme/size-class';
-import { SIDEBAR_WIDTH } from '../theme/layout';
+import { resolveHideOnScrollTabBar } from '../lib/tab-bar-visibility';
+import { useTabBarHideOnScrollEnabled } from '../providers/feature-flags-provider';
 import { reportHandledError } from '../lib/error-reporting';
 
 // The rest-timer store publishes a whole state object, and this provider cares
@@ -25,6 +46,9 @@ const getRestTimerArmed = () => getRestTimerState().armed;
 // Expo web renders the first pass on the server, where nothing has armed a timer
 // yet; the pill can only appear after hydration anyway.
 const getRestTimerArmedServerSnapshot = () => false;
+// Whether a rest is being counted (an anchor exists). A boolean snapshot too, so
+// the provider re-renders only when the timer goes from idle to counting or back.
+const getRestTimerCounting = () => getRestTimerState().anchorMs !== null;
 
 /**
  * Gathers the React inputs for the bottom-chrome geometry and delegates the
@@ -49,22 +73,28 @@ function useComputedBottomChromeMetrics(): BottomChromeMetrics {
   // The TAB BAR is present on every tab route, including pushed sub-routes (session
   // detail keeps it). The player route counts too (it's a modal over the live tabs)
   // so the tab-bar metrics don't churn across its open/close — see isTabsChromeRoute.
-  const insideTabs = isTabsChromeRoute(segments);
-  // The JS queue toolbar (Android / iOS < 26) only shows on a top-level tab page, plus
+  // The Wall display is the exception: it keeps the accessory host mounted
+  // (isTabsChromeRoute) but covers the bar, the accessory and the rest-timer pill's
+  // spot, so it reserves nothing. Counting it here put the root rest-timer pill
+  // over the kiosk and left a dead gap under its pages (RestTimerPillHost reads
+  // this same `insideTabs`).
+  const insideTabs = isTabsChromeRoute(segments) && !isWallDisplayRoute(segments);
+  // The JS queue toolbar (Android / iOS 18 / tablets) only shows on a top-level tab page, plus
   // occluded under the player. Keep it separate from `insideTabs` so a pushed sub-route
   // still reserves tab-bar height but no longer reserves toolbar space for a bar that's
   // gone. The NATIVE accessory is wider — see `nativeAccessoryPresented` below.
-  const onAccessorySurface = isAccessorySurfaceRoute(segments);
-  // The single canonical "is the native tab bar on screen?" predicate. The bottom
-  // accessory lives INSIDE that bar, so derive its mount from the SAME call plus the
-  // plain availability check — exactly what useNativeAccessoryActive() does — rather
-  // than calling useNativeTabBar() a second time. Sharing the one call (instead of
-  // re-deriving the accessory from the variant) is what guarantees the two never
-  // disagree about which bar is up; see use-bottom-accessory. It also drops the
-  // duplicate useTheme/useGlassCapability/useDeviceLayout subscriptions the second
-  // useNativeTabBar() call used to pull in.
-  const nativeTabBar = useNativeTabBar();
-  const nativeAccessoryActive = nativeTabBar && isBottomAccessoryAvailable();
+  // The single canonical answer to "which tab chrome is on screen?" — the same
+  // `useTabChrome()` the tab layout mounts from, so the accessory reserved here is
+  // exactly the accessory `_layout` mounts. On iOS 18 the native bar is up but the
+  // accessory is not (it is an iOS 26 UIKit feature), so the JS queue bar floats
+  // above the native bar and is reserved for below.
+  const { nativeTabBar, nativeAccessory: nativeAccessoryActive } = useTabChrome();
+  // The tab layout hides the platter on a few routes (`isAccessoryHiddenRoute`,
+  // never on the Duo's rail), with the same expression as here, and a hidden
+  // platter stops counting as an accessory surface.
+  const verticalTabBar = useVerticalTabBar();
+  const accessoryHidden = nativeAccessoryActive && isAccessoryHiddenRoute(segments) && !verticalTabBar;
+  const onAccessorySurface = isAccessorySurfaceRoute(segments) && !accessoryHidden;
   // `onAccessorySurface`, NOT the host-mount gate — the two genuinely differ here, and
   // conflating them costs a dead gap. The host stays MOUNTED on pushed sub-routes (that
   // is #5055's fix, see `isAccessoryHostRoute`), but UIKit does not PRESENT the platter
@@ -74,22 +104,63 @@ function useComputedBottomChromeMetrics(): BottomChromeMetrics {
   // accessory height on every sub-route, and `scrollBottomPadding` takes
   // `Math.max(measured, fallback)` — so the measured inset could not correct it and
   // every pushed screen got dead space under its last row (#3776's failure shape).
+  // iOS 26.5 does draw the platter on some pushes (Discover › playlist on an
+  // iPhone 17 Pro simulator, 2026-10-28). Lists there get its height from the
+  // measured inset instead, through `expandedTabContentInsetBottom` below, so the
+  // reserve follows what UIKit draws on each route rather than a guess.
   const nativeAccessoryPresented = onAccessorySurface && nativeAccessoryActive;
   const usesNativeTabBar = insideTabs && nativeTabBar;
-  // Regular-width iPad replaces the bottom tab bar with the left sidebar. Only
-  // widths that also mount the selected-climb detail pane suppress the floating
-  // queue toolbar; tight regular windows keep that toolbar because the pane is
-  // intentionally absent there.
-  const { width: windowWidth } = useWindowDimensions();
-  const { widthClass } = useDeviceLayout();
-  const usesSidebar = insideTabs && widthClass === 'regular';
-  const detailPaneOwnsQueue =
-    usesSidebar && resolveDetailPaneSurface({ width: windowWidth, widthClass, sidebarWidth: SIDEBAR_WIDTH }) === 'pane';
+  // The regular-width JS tablet shell replaces the bottom tab bar with its rail.
+  // Native tablet panes suppress the floating toolbar; the browser keeps its
+  // cross-tab MiniPlayer beside the pane. Tight regular windows keep the toolbar
+  // too, because the pane is absent there. The native iPad is not this shell: the
+  // same resolver the floating bar and the rest pill read keeps it on the
+  // native-tab path below.
+  const { sidebarShell, home } = useCurrentClimbSurface();
+  const usesSidebar = insideTabs && sidebarShell;
+  const miniPlayerHost = resolveMiniPlayerHost({ home, variant, platformOS: Platform.OS, sidebarShell });
+  const sidebarMiniPlayer = usesSidebar && Platform.OS === 'web' && miniPlayerHost === 'materialCard';
+  const detailPaneOwnsQueue = usesSidebar && home === 'detailPane' && !sidebarMiniPlayer;
+  // iPhone Duo (closed, or open in landscape with the split) keeps the phone
+  // path: the accessory stays presented along the bottom and the in-tab inset
+  // carries it. Only the tab bar leaves the bottom: it is a vertical rail.
+  // A regular-width native iPad is the same shape: its tab bar is the sidebar
+  // (landscape) or sits at the top (portrait), and only the accessory takes
+  // bottom space, which UIKit folds into the measured in-tab inset.
+  const { isTablet, widthClass } = useDeviceLayout();
+  const tabBarAtBottom = !verticalTabBar && !(isTablet && nativeTabBar && widthClass === 'regular');
   // This provider samples the ROOT safe-area inset (window / home indicator
   // only). The in-tab inset — the one UIKit extends with the native tab bar +
   // accessory — is published by NativeTabContentInsetProbe from inside the
   // focused tab; see the sampling-point contract in bottom-chrome-metrics.ts.
   const measuredTabContentInsetBottom = useNativeTabContentInsetBottom();
+  const measuredTabContentInsetLeft = useNativeTabContentInsetLeft();
+  const measuredTabContentInsetRight = useNativeTabContentInsetRight();
+  // The expanded bar's inset under the current chrome shape: the larger of the
+  // two values the in-tab inset flips between as the bar minimizes and
+  // re-expands. Lists pad for it so a bar re-expanding at the end of a list
+  // never covers the last row. The key holds everything that legitimately
+  // changes the expanded height; a new key starts empty and folds only readings
+  // the probe publishes after it (the store still holds the old shape's inset
+  // when the key flips; see trackExpandedTabContentInset).
+  const { width: windowWidth, height: windowHeight } = useWindowDimensions();
+  const insetPublishCount = useNativeTabContentInsetPublishCount();
+  const chromeShapeKey = [
+    segments.join('/'),
+    hasCurrentClimb ? 'climb' : 'none',
+    nativeAccessoryActive ? 'accessory' : 'no-accessory',
+    accessoryHidden ? 'hidden' : 'shown',
+    tabBarAtBottom ? 'bottom' : 'side',
+    `${Math.round(windowWidth)}x${Math.round(windowHeight)}`,
+  ].join('|');
+  const expandedInsetRef = useRef<ExpandedTabContentInset | null>(null);
+  expandedInsetRef.current = trackExpandedTabContentInset(
+    expandedInsetRef.current,
+    chromeShapeKey,
+    measuredTabContentInsetBottom,
+    insetPublishCount,
+  );
+  const expandedTabContentInsetBottom = expandedInsetRef.current.bottom;
   // The connectivity banner (issue #4862) is a root-level absolute overlay above
   // ALL of this chrome, on every route. It measures itself and publishes through
   // another module store for the same reason the in-tab probe does: `Toast` reads
@@ -102,6 +173,22 @@ function useComputedBottomChromeMetrics(): BottomChromeMetrics {
   // it here needs no flag plumbing. A module store rather than context, for the
   // same reason the two above are: the 1 Hz countdown must not re-render the app.
   const restTimerArmed = useSyncExternalStore(subscribeRestTimer, getRestTimerArmed, getRestTimerArmedServerSnapshot);
+  const { sessionId } = useQueueSessionId();
+  const workoutStartPending = useWorkoutRunPendingStart(sessionId);
+  const restTimerCounting = useSyncExternalStore(
+    subscribeRestTimer,
+    getRestTimerCounting,
+    getRestTimerArmedServerSnapshot,
+  );
+  const restTimerIdleHiddenRoute = isRestTimerPillHiddenRoute(segments);
+  // The Android phone nav bar overlays its tab roots and hides on scroll, behind
+  // the `tab-bar-hide-on-scroll-kill` switch. Off, the bar stays in flow.
+  const hideOnScrollFlagEnabled = useTabBarHideOnScrollEnabled();
+  const hideOnScrollTabBar = resolveHideOnScrollTabBar({
+    platformOS: Platform.OS,
+    isTablet,
+    flagEnabled: hideOnScrollFlagEnabled,
+  });
 
   return useMemo(
     () =>
@@ -115,11 +202,21 @@ function useComputedBottomChromeMetrics(): BottomChromeMetrics {
         nativeAccessoryPresented,
         usesSidebar,
         detailPaneOwnsQueue,
+        sidebarMiniPlayer,
         measuredTabContentInsetBottom,
         connectivityBannerHeight,
         restTimerArmed,
+        tabBarAtBottom,
+        workoutStartPending,
+        restTimerIdleHiddenRoute,
+        restTimerCounting,
+        expandedTabContentInsetBottom,
+        measuredTabContentInsetLeft,
+        measuredTabContentInsetRight,
+        hideOnScrollTabBar,
       }),
     [
+      tabBarAtBottom,
       variant,
       usesNativeTabBar,
       insets.bottom,
@@ -129,9 +226,17 @@ function useComputedBottomChromeMetrics(): BottomChromeMetrics {
       nativeAccessoryPresented,
       usesSidebar,
       detailPaneOwnsQueue,
+      sidebarMiniPlayer,
       measuredTabContentInsetBottom,
       connectivityBannerHeight,
       restTimerArmed,
+      workoutStartPending,
+      restTimerIdleHiddenRoute,
+      restTimerCounting,
+      expandedTabContentInsetBottom,
+      measuredTabContentInsetLeft,
+      measuredTabContentInsetRight,
+      hideOnScrollTabBar,
     ],
   );
 }

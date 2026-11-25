@@ -60,6 +60,7 @@ vi.mock('expo-glass-effect', () => ({
 }));
 
 import { ThemeProvider, useTheme } from '../theme-provider';
+import { useNeutralRippleInk } from '../../theme/neutral-ripple-context';
 import { THEME_OVERRIDE_KEY, UI_VARIANT_KEY } from '@boardsesh/key-value-storage';
 
 const wrapper = ({ children }: { children: ReactNode }) => <ThemeProvider>{children}</ThemeProvider>;
@@ -77,6 +78,25 @@ describe('ThemeProvider', () => {
     setMock.mockResolvedValue(undefined);
     useColorSchemeMock.mockReturnValue('light');
     platform.os = 'android';
+  });
+
+  it('keeps preview appearance in memory without reading or writing user preferences', async () => {
+    const { result } = renderHook(() => useTheme(), {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <ThemeProvider initialTheme="dark" initialVariant="material" preferences={null}>
+          {children}
+        </ThemeProvider>
+      ),
+    });
+    expect(result.current.colorScheme).toBe('dark');
+    expect(getMock).not.toHaveBeenCalled();
+    await act(async () => {
+      await result.current.setThemeOverride('light');
+      await result.current.setUiVariant('liquidGlass');
+    });
+    expect(result.current.colorScheme).toBe('light');
+    expect(result.current.variant).toBe('liquidGlass');
+    expect(setMock).not.toHaveBeenCalled();
   });
 
   describe('resolved colorScheme (without persistence)', () => {
@@ -220,9 +240,11 @@ describe('ThemeProvider', () => {
       await waitFor(() => expect(getMock).toHaveBeenCalledWith(UI_VARIANT_KEY));
       expect(result.current.uiVariantPreference).toBe('auto');
       expect(result.current.variant).toBe('material');
-      // Material maps M3 tonal surfaces + the 20dp button radius.
+      // Material maps the neutral Graphite surfaces + the 20dp button radius.
       expect(result.current.radii.button).toBe(20);
-      expect(result.current.systemColors.background).toBe('#F3EFFA');
+      expect(result.current.systemColors.background).toBe('#F2F2F2');
+      // Material's large-shape fill is neutral, not the violet Liquid Glass wash.
+      expect(result.current.systemColors.tertiaryFill).toBe('rgba(0, 0, 0, 0.04)');
     });
 
     it("defaults to the Liquid Glass variant on iPhone ('auto' → liquidGlass), incl. iOS < 26", async () => {
@@ -251,7 +273,23 @@ describe('ThemeProvider', () => {
       // surface — not the Material tonal map.
       expect(result.current.radii.button).toBe(10);
       expect(result.current.systemColors.background).toBe('#F4F1FB');
+      // Liquid Glass off iOS keeps its violet tertiary fill.
+      expect(result.current.systemColors.tertiaryFill).toBe('rgba(91, 34, 242, 0.06)');
       expect(setMock).toHaveBeenCalledWith(UI_VARIANT_KEY, 'liquidGlass');
+    });
+
+    it('gives Material pressables a neutral onSurface ripple and Liquid Glass none', async () => {
+      const { result } = renderHook(() => ({ theme: useTheme(), rippleInk: useNeutralRippleInk() }), { wrapper });
+      await waitFor(() => expect(getMock).toHaveBeenCalledWith(UI_VARIANT_KEY));
+      expect(result.current.theme.variant).toBe('material');
+      expect(result.current.rippleInk).toBe(result.current.theme.m3.onSurface);
+
+      await act(async () => {
+        await result.current.theme.setUiVariant('liquidGlass');
+      });
+
+      // null keeps PressableSurface's brand-tint ripple on Liquid Glass.
+      expect(result.current.rippleInk).toBeNull();
     });
 
     it('hydrates a stored variant preference on mount', async () => {
@@ -275,10 +313,10 @@ describe('ThemeProvider', () => {
       const { result } = renderHook(() => useTheme(), { wrapper });
       await waitFor(() => expect(getMock).toHaveBeenCalled());
       expect(result.current.colorScheme).toBe('light');
-      expect(result.current.brandColors.primary).toBe('#6D28D9');
+      expect(result.current.brandColors.primary).toBe('#5B22F2');
       expect(result.current.brandColors.success).toBe('#047857');
       // New scheme-aware interactive accent (replaces the static systemBlue).
-      expect(result.current.systemColors.accent).toBe('#6D28D9');
+      expect(result.current.systemColors.accent).toBe('#5B22F2');
     });
 
     it('dark scheme lifts brand foregrounds + the accent so they clear AA on near-black', async () => {
@@ -287,11 +325,18 @@ describe('ThemeProvider', () => {
       await waitFor(() => expect(getMock).toHaveBeenCalled());
       expect(result.current.colorScheme).toBe('dark');
       // The core #2583 fix: foreground brand + semantic tones lift in dark.
-      expect(result.current.brandColors.primary).toBe('#A78BFA');
+      expect(result.current.brandColors.primary).toBe('#9784FF');
       expect(result.current.brandColors.success).toBe('#34D399');
       expect(result.current.brandColors.warning).toBe('#FBBF24');
       expect(result.current.brandColors.error).toBe('#F87171');
-      expect(result.current.systemColors.accent).toBe('#A78BFA');
+      expect(result.current.systemColors.accent).toBe('#9784FF');
+    });
+
+    it('exposes the M3 error role as systemColors.error, scheme-aware', async () => {
+      useColorSchemeMock.mockReturnValue('dark');
+      const { result } = renderHook(() => useTheme(), { wrapper });
+      await waitFor(() => expect(getMock).toHaveBeenCalled());
+      expect(result.current.systemColors.error).toBe('#F87171');
     });
   });
 

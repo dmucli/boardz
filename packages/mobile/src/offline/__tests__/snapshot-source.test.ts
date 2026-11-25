@@ -239,7 +239,7 @@ vi.mock('expo-file-system', () => {
       writeFakeFile(this.uri, { bytes: new Uint8Array(), text: '' });
     }
 
-    write(content: string) {
+    writeSync(content: string) {
       writeFakeFile(this.uri, { bytes: new Uint8Array(), text: content });
     }
 
@@ -348,7 +348,9 @@ import {
   setBackgrounded,
   SnapshotArtifactTruncatedError,
   SnapshotBackgroundTransferInterruptedError,
+  SnapshotTransferError,
   SnapshotPermanentMissError,
+  classifySnapshotTransferFailure,
   type SnapshotManifestEntry,
 } from '@boardsesh/offline-sync';
 
@@ -447,8 +449,24 @@ function seedRetainedArtifact(uri: string, builtAt: string, sizeBytes = 1_000): 
 }
 
 describe('fetchManifest', () => {
+  it('excludes old public artifacts and accepts only privacy-safe manifest entries', async () => {
+    const protectedEntry = { ...ENTRY, privacyVersion: 1 };
+    const manifestBody = {
+      formatVersion: 2,
+      generatedAt: '2026-06-01T00:00:00.000Z',
+      entries: [ENTRY, protectedEntry],
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => jsonResponse(manifestBody)),
+    );
+    const result = await mobileSnapshotSource.fetchManifest();
+    expect(result).toEqual({ ...manifestBody, entries: [protectedEntry] });
+    vi.unstubAllGlobals();
+  });
+
   it('fetches the manifest URL with cache: no-store and returns the parsed JSON on 200', async () => {
-    const manifestBody = { formatVersion: 1, generatedAt: '2026-06-01T00:00:00.000Z', entries: [] };
+    const manifestBody = { formatVersion: 2, generatedAt: '2026-06-01T00:00:00.000Z', entries: [] };
     const fetchMock = vi.fn(async () => jsonResponse(manifestBody));
     vi.stubGlobal('fetch', fetchMock);
 
@@ -674,6 +692,75 @@ describe('downloadArtifact', () => {
         backgroundedDuringTransfer: false,
       }),
     );
+  });
+
+  it.each(['无法解码原始数据', 'Decodieren der Rohdaten nicht möglich'])(
+    'normalizes the observed localized background decoding failure: %s',
+    async (description) => {
+      const nativeCause = new Error(`Unable to download a file: ${description}`);
+      state.downloadError = new Error('FileSystemDownloadTask.start rejected', { cause: nativeCause });
+      const rejection = await mobileSnapshotSource.downloadArtifact(ENTRY).catch((error: unknown) => error);
+
+      expect(rejection).toBeInstanceOf(SnapshotBackgroundTransferInterruptedError);
+      expect((rejection as Error).cause).toBe(state.downloadError);
+      expect(classifySnapshotTransferFailure(rejection)).toEqual({
+        reason: 'background-transfer-decode',
+        retryable: true,
+        expected: true,
+      });
+      expect(state.taskCalls).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    'Connection reset',
+    'Software caused connection abort',
+    'Failed to connect to snapshots.boardsesh.com/104.21.81.90:443',
+  ])('preserves an Android transport failure for the snapshot retry ladder: %s', async (description) => {
+    const nativeCause = new Error(`Unable to download a file: ${description}`);
+    state.downloadError = nativeCause;
+    platformState.OS = 'android';
+    const rejection = await withFreshSnapshotSource((foregroundSnapshotSource) =>
+      foregroundSnapshotSource.downloadArtifact(ENTRY).catch((error: unknown) => error),
+    );
+
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).name).toBe('SnapshotTransferError');
+    expect((rejection as Error).cause).toBe(nativeCause);
+    expect(classifySnapshotTransferFailure(rejection)).toEqual({ reason: 'network', retryable: true, expected: true });
+  });
+
+  it('reports HTTP 416 without an immediate session retry, then permits a later fresh transfer', async () => {
+    const nativeCause = new Error('Unable to download a file: server returned HTTP 416');
+    state.downloadError = nativeCause;
+    const rejection = await mobileSnapshotSource.downloadArtifact(ENTRY).catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(SnapshotTransferError);
+    expect((rejection as Error).cause).toBe(nativeCause);
+    expect(classifySnapshotTransferFailure(rejection)).toEqual({
+      reason: 'http-range',
+      retryable: true,
+      expected: false,
+    });
+    expect(state.taskCalls).toHaveLength(1);
+    expect(state.taskCalls[0].sessionType).toBe('background');
+
+    state.downloadError = null;
+    await expect(mobileSnapshotSource.downloadArtifact(ENTRY)).resolves.not.toBeNull();
+    expect(state.taskCalls).toHaveLength(2);
+  });
+
+  it('keeps a missing artifact distinct while preserving its original native cause', async () => {
+    const nativeCause = new Error('FileSystemFile.open: ENOENT (No such file or directory)');
+    state.readError = nativeCause;
+    const rejection = await mobileSnapshotSource.downloadArtifact(ENTRY).catch((error: unknown) => error);
+
+    expect((rejection as Error).cause).toBe(nativeCause);
+    expect(classifySnapshotTransferFailure(rejection)).toEqual({
+      reason: 'artifact-missing',
+      retryable: false,
+      expected: false,
+    });
   });
 
   it('throws a descriptive error wrapping the underlying cause when the cache directory cannot be created', async () => {
@@ -923,7 +1010,7 @@ describe('the exact decoded-size gate', () => {
     expect(state.files.get(SIDECAR_URI)?.text).toBe(ENTRY.builtAt);
   });
 
-  it('skips the gate for an entry with no uncompressedBytes (grades artifact / pre-#4311 manifest)', async () => {
+  it('skips the gate for an entry with no uncompressedBytes (a pre-#4311 manifest)', async () => {
     expect(ENTRY.uncompressedBytes).toBeUndefined();
 
     await expect(mobileSnapshotSource.downloadArtifact(ENTRY)).resolves.not.toBeNull();
@@ -1123,7 +1210,7 @@ describe('Offline Artifact Transfer telemetry', () => {
     expect(reportArtifactTransfer).not.toHaveBeenCalled();
   });
 
-  it('reports a grades transfer without board dimensions its manifest block does not carry', async () => {
+  it('reports a shape-1 grades transfer without the dimensions its manifest block does not carry', async () => {
     await mobileSnapshotSource.downloadGradesArtifact?.({
       key: 'board-snapshots/v1-gzip/kilter/8/2026-06-01-grades.db',
       url: 'https://example.test/artifacts/kilter-8-grades.db',
@@ -1335,6 +1422,112 @@ describe('downloadGradesArtifact', () => {
     expect(state.downloadCalls).toHaveLength(0);
   });
 
+  it('normalizes localized background decode errors through the same grades transfer boundary', async () => {
+    const nativeCause = new Error('Unable to download a file: 无法解码原始数据');
+    state.downloadError = nativeCause;
+    const rejection = await mobileSnapshotSource
+      .downloadGradesArtifact?.(GRADES_ARTIFACT)
+      .catch((error: unknown) => error);
+
+    expect(rejection).toBeInstanceOf(SnapshotBackgroundTransferInterruptedError);
+    expect((rejection as Error).cause).toBe(nativeCause);
+    expect(classifySnapshotTransferFailure(rejection)?.expected).toBe(true);
+  });
+
+  it('forwards grades cancellation and byte progress to the downloader', async () => {
+    const controller = new AbortController();
+    const onProgress = vi.fn();
+    state.downloadProgressFrames = [{ bytesWritten: 100, totalBytes: 200 }];
+    await mobileSnapshotSource.downloadGradesArtifact?.(GRADES_ARTIFACT, {
+      signal: controller.signal,
+      onProgress,
+    });
+    expect(state.downloadCalls[0]).toMatchObject({ hasSignal: true, hasOnProgress: true });
+    expect(onProgress).toHaveBeenCalledWith({ bytesWritten: 100, totalBytes: 200 });
+  });
+
+  it('cancels the grades transfer through the forwarded abort signal', async () => {
+    const controller = new AbortController();
+    state.downloadProgressFrames = [{ bytesWritten: 100, totalBytes: 200 }];
+
+    await expect(
+      mobileSnapshotSource.downloadGradesArtifact?.(GRADES_ARTIFACT, {
+        signal: controller.signal,
+        onProgress: () => controller.abort(),
+      }),
+    ).rejects.toThrow(/download cancelled/);
+
+    expect(state.files.size).toBe(0);
+    expect(reportArtifactTransfer).toHaveBeenCalledWith(
+      expect.objectContaining({ artifact: 'grades', outcome: 'aborted' }),
+    );
+  });
+
+  it('finishes a valid grades transfer when its progress callback throws', async () => {
+    state.downloadProgressFrames = [{ bytesWritten: 100, totalBytes: -1 }];
+    const onProgress = vi.fn(() => {
+      throw new Error('progress sink failed');
+    });
+
+    await expect(
+      mobileSnapshotSource.downloadGradesArtifact?.(GRADES_ARTIFACT, { onProgress }),
+    ).resolves.not.toBeNull();
+
+    expect(onProgress).toHaveBeenCalledWith({ bytesWritten: 100, totalBytes: null });
+    expect(reportArtifactTransfer).toHaveBeenCalledWith(
+      expect.objectContaining({ artifact: 'grades', outcome: 'completed' }),
+    );
+  });
+
+  describe.each([
+    {
+      label: 'both decoded sizes share one reserve',
+      entry: {
+        ...ENTRY,
+        uncompressedBytes: 3_000_000,
+        grades: { ...GRADES_ARTIFACT, uncompressedBytes: 5_000_000 },
+      },
+      requiredBytes: ENTRY.bytes + 3_000_000 + GRADES_ARTIFACT.bytes + 5_000_000 + 32 * 1024 * 1024,
+    },
+    {
+      label: 'legacy gzip artifacts keep both conservative estimates',
+      entry: { ...ENTRY, grades: GRADES_ARTIFACT },
+      requiredBytes: ENTRY.bytes * 6 + GRADES_ARTIFACT.bytes * 6,
+    },
+    {
+      label: 'legacy identity artifacts keep both conservative estimates',
+      entry: {
+        ...ENTRY,
+        contentEncoding: 'identity' as const,
+        grades: { ...GRADES_ARTIFACT, contentEncoding: 'identity' as const },
+      },
+      requiredBytes: ENTRY.bytes * 2 + GRADES_ARTIFACT.bytes * 2,
+    },
+    {
+      label: 'legacy grades keep their estimate beside an exact layout',
+      entry: { ...ENTRY, uncompressedBytes: 3_000_000, grades: GRADES_ARTIFACT },
+      requiredBytes: ENTRY.bytes + 3_000_000 + GRADES_ARTIFACT.bytes * 6 + 32 * 1024 * 1024,
+    },
+    {
+      label: 'a legacy layout keeps its estimate beside exact grades',
+      entry: { ...ENTRY, grades: { ...GRADES_ARTIFACT, uncompressedBytes: 5_000_000 } },
+      requiredBytes: ENTRY.bytes * 6 + GRADES_ARTIFACT.bytes + 5_000_000 + 32 * 1024 * 1024,
+    },
+  ])('combined space reservation: $label', ({ entry, requiredBytes }) => {
+    it.each([-1, 0, 1])('checks the combined requirement at offset %i bytes', async (offset) => {
+      state.availableDiskSpace = requiredBytes + offset;
+      state.downloadedFileSize = entry.uncompressedBytes ?? (entry.contentEncoding === 'identity' ? entry.bytes : null);
+
+      if (offset < 0) {
+        await expect(mobileSnapshotSource.downloadArtifact(entry)).rejects.toThrow(/insufficient disk space/);
+        expect(state.downloadCalls).toHaveLength(0);
+      } else {
+        await expect(mobileSnapshotSource.downloadArtifact(entry)).resolves.not.toBeNull();
+        expect(state.downloadCalls).toHaveLength(1);
+      }
+    });
+  });
+
   it('permanently misses (and deletes) a body that arrived still gzip-compressed', async () => {
     state.downloadBytes = GZIP_BYTES;
 
@@ -1353,5 +1546,114 @@ describe('downloadGradesArtifact', () => {
     const rejection = await mobileSnapshotSource.downloadGradesArtifact?.(GRADES_ARTIFACT).catch((error) => error);
 
     expect((rejection as Error).cause).toBe(downloadError);
+  });
+
+  // The exact decoded-size gate on the GRADES file. A grades block published in
+  // artifact shape 2 carries `uncompressedBytes` (docs/data/board-snapshots.md,
+  // "Artifact shape"); one published in shape 1 does not. The gate is the layout
+  // artifact's, reached through the same `expectedDecodedBytesFor`, so the app
+  // starts holding grades downloads to their exact size the moment the export
+  // publishes shape 2, with no app change in between.
+  describe('the exact decoded-size gate', () => {
+    const DECODED_BYTES = 5_000_000;
+    const SHAPE_2_GRADES = { ...GRADES_ARTIFACT, uncompressedBytes: DECODED_BYTES };
+
+    it.each([-1, 0, 1])('checks standalone grades plus one reserve at offset %i bytes', async (offset) => {
+      state.availableDiskSpace = GRADES_ARTIFACT.bytes + DECODED_BYTES + 32 * 1024 * 1024 + offset;
+      state.downloadedFileSize = DECODED_BYTES;
+
+      if (offset < 0) {
+        await expect(mobileSnapshotSource.downloadGradesArtifact?.(SHAPE_2_GRADES)).rejects.toThrow(
+          /insufficient disk space/,
+        );
+        expect(state.downloadCalls).toHaveLength(0);
+      } else {
+        await expect(mobileSnapshotSource.downloadGradesArtifact?.(SHAPE_2_GRADES)).resolves.not.toBeNull();
+        expect(state.downloadCalls).toHaveLength(1);
+      }
+    });
+
+    it('accepts a grades file whose size is exactly the block’s uncompressedBytes', async () => {
+      state.downloadedFileSize = DECODED_BYTES;
+
+      const result = await mobileSnapshotSource.downloadGradesArtifact?.(SHAPE_2_GRADES);
+
+      expect(result?.filePath).toContain('board-snapshots-v1-gzip-kilter-8');
+      expect(state.deletedUris).toHaveLength(0);
+      expect(reportHandledError).not.toHaveBeenCalled();
+      expect(reportArtifactTransfer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          artifact: 'grades',
+          outcome: 'completed',
+          expectedDecodedBytes: DECODED_BYTES,
+          bytesOnDisk: DECODED_BYTES,
+          sizeMismatch: false,
+        }),
+      );
+    });
+
+    it('rejects a grades file of any other size, and reports it the way the layout gate does', async () => {
+      state.downloadedFileSize = DECODED_BYTES - 1;
+
+      const rejection = await mobileSnapshotSource
+        .downloadGradesArtifact?.(SHAPE_2_GRADES)
+        .catch((error: unknown) => error);
+
+      // The same typed error, so the engine files it under the same reason.
+      expect(rejection).toBeInstanceOf(SnapshotArtifactTruncatedError);
+      expect((rejection as Error).message).toMatch(/expected 5000000 bytes, got 4999999/);
+      // Deleted before anything could ATTACH it.
+      expect(state.deletedUris).toHaveLength(1);
+      expect([...state.files.keys()].some((uri) => uri.includes('grades'))).toBe(false);
+      expect(reportHandledError).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'snapshot artifact size mismatch' }),
+        expect.objectContaining({
+          tags: { source: 'offline-sync', kind: 'snapshot-bootstrap' },
+          extra: expect.objectContaining({
+            gradesKey: GRADES_ARTIFACT.key,
+            expectedDecodedBytes: DECODED_BYTES,
+            bytesOnDisk: DECODED_BYTES - 1,
+          }),
+        }),
+      );
+      expect(reportArtifactTransfer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          artifact: 'grades',
+          outcome: 'failed',
+          sizeMismatch: true,
+          bytesOnDisk: DECODED_BYTES - 1,
+        }),
+      );
+    });
+
+    it('rejects a grades file LONGER than expected too: the check is equality, not a floor', async () => {
+      state.downloadedFileSize = DECODED_BYTES + 4096;
+
+      await expect(mobileSnapshotSource.downloadGradesArtifact?.(SHAPE_2_GRADES)).rejects.toBeInstanceOf(
+        SnapshotArtifactTruncatedError,
+      );
+    });
+
+    it('does not gate a shape-1 gzip grades block, which carries no uncompressedBytes', async () => {
+      expect('uncompressedBytes' in GRADES_ARTIFACT).toBe(false);
+      state.downloadedFileSize = 123;
+
+      await expect(mobileSnapshotSource.downloadGradesArtifact?.(GRADES_ARTIFACT)).resolves.toEqual(
+        expect.objectContaining({ filePath: expect.stringContaining('board-snapshots-v1-gzip-kilter-8') }),
+      );
+      expect(reportHandledError).not.toHaveBeenCalled();
+      const report = reportArtifactTransfer.mock.calls[0][0] as Record<string, unknown>;
+      expect('expectedDecodedBytes' in report).toBe(false);
+      expect('sizeMismatch' in report).toBe(false);
+    });
+
+    it('keeps the gzip sniff winning over the size gate for a still-compressed grades body', async () => {
+      state.downloadBytes = GZIP_BYTES;
+      state.downloadedFileSize = DECODED_BYTES - 1;
+
+      await expect(mobileSnapshotSource.downloadGradesArtifact?.(SHAPE_2_GRADES)).rejects.toBeInstanceOf(
+        SnapshotPermanentMissError,
+      );
+    });
   });
 });

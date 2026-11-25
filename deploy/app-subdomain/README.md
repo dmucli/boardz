@@ -30,9 +30,16 @@ else falls through to the shell.
   search indexes. Since W-24 (#4438) retired the `/app` static path this file is
   the only production source of that header for the browser app; the dev `/app`
   proxy gets its own from `packages/web/middleware.ts` (see "Retired: the /app
-  static path" in `docs/expo-web-deployment.md`).
+  static path" in `docs/operations/expo-web-deployment.md`).
 - `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`
   — standard hardening.
+- Reset-password documents override the referrer policy with `no-referrer` and
+  use private/no-store caching, including locale and legacy `/app` prefixes.
+  [Pages documents source-path header matching alongside 200 rewrites](https://developers.cloudflare.com/pages/configuration/redirects/#redirects-and-header-matching).
+  Matching values are [combined in file order](https://developers.cloudflare.com/pages/configuration/headers/),
+  so the stricter referrer policy follows the global rule. Configuration tests
+  cover this ordering; effective deployed Pages/ingress headers remain a rollout
+  probe, separate from those local tests.
 - `/_expo/*` and `/assets/*` → `Cache-Control: public, max-age=31536000, immutable`.
   These paths are **content-hashed** (the filename changes whenever the content
   does), so they're safe to cache forever.
@@ -81,6 +88,48 @@ export, not in it — and publishes with `--cwd "$RUNNER_TEMP"`.
 `__tests__/asset-404-deploy-wiring.test.ts` guards that wiring; delete the
 `--cwd` and the Function silently stops shipping.
 
+## Chunk carry-over — old tabs keep loading their routes
+
+Pages serves only the files in the current deployment, and every chunk name is
+content-hashed, so each deploy used to delete the previous deploy's route
+chunks. A tab opened before the deploy still runs the old entry and asks for
+old chunk names; its next lazy route got the 404 above and had to reload
+(#5780).
+
+`scripts/lib/carry-over-expo-web-chunks.mjs` runs in `deploy-app-web` after the
+export checks and before the publish. It reads the live site:
+
+1. The live shell's eager scripts and every chunk they name, which is the live
+   deploy's JS set. On the first run this is all there is.
+2. `/chunk-carryover.json`, which the live deploy published. It lists that
+   deploy's own chunks and every older chunk it carried, each with the last
+   time it was live.
+
+Each file goes into the export unless the fresh build already has a file of
+that name (same hash, same bytes). The script then writes the new
+`/chunk-carryover.json`. `_headers` marks it `no-store` so the next deploy reads
+the real one.
+
+- **Caps:** a chunk is kept for 3 days after it was last live, and at most 4000
+  carried files per deploy, newest first. Both are flags on the step.
+- **Fails open:** a down site, a bad manifest, a chunk answered with HTML or a
+  60 s budget running out each log a `::warning::` and publish what was carried
+  so far. The step also has `continue-on-error`. The worst case is a deploy with
+  the fresh export alone, which is what every deploy did before this.
+- **Smoke:** the post-deploy smoke checks that the previous deploy's entry chunk
+  still serves as JavaScript, whenever the carry-over put it in the export.
+- **JS only:** `/assets/*` images an old chunk names are not carried. A changed
+  image 404s in a stale tab, which is cosmetic.
+- **Rollback:** a Pages dashboard rollback serves an older deployment with its
+  own manifest. The next deploy carries forward from that one.
+- **Backend:** a carried chunk is at most 3 days old and talks to the current
+  backend. Store builds older than that are still in use, so the backend already
+  has to accept older clients.
+
+`__tests__/asset-404-deploy-wiring.test.ts` guards the step's place, caps and
+fail-open settings; `scripts/__tests__/carry-over-expo-web-chunks.test.ts`
+covers the script.
+
 ## The one hard rule: no CSP `script-src`
 
 **Never add a `Content-Security-Policy` with a `script-src` to `_headers`.** The
@@ -109,7 +158,7 @@ cannot silently switch off the recovery.
 Run `vp test run --project deploy-app-subdomain`. The suite parses both config
 files and asserts what Cloudflare would send for concrete paths: the CSP rule
 above, the `noindex` tag, forever-caching on content-hashed assets only, and the
-`200` SPA rewrite for deep links. The `deploy-config` job in
+`200` SPA rewrite for deep links. The `deploy-config` guard step in
 `.github/workflows/ci.yml` runs it on every PR touching this directory, the
 export script, `Dockerfile.web`, or the deploy workflow.
 
@@ -122,11 +171,11 @@ the only gate that selects a test suite for a workflow-only diff, since Vitest's
 `--changed` can never relate an fs read to a diff of the file being read. (Other
 gates do fire on such a diff — `service-deploy-inputs.yml` lists the workflow in
 its paths filter — they just run no tests over it.) See
-`docs/expo-web-deployment.md`.
+`docs/operations/expo-web-deployment.md`.
 
 ## Why `EXPO_PUBLIC_WEB_URL` is www, not app
 
 The production export bakes `EXPO_PUBLIC_WEB_URL=https://www.boardsesh.com` — the
 **auth origin**, deliberately www and not app.boardsesh.com. The SPA does
 credentialed cross-origin auth against www; app.boardsesh.com is only where the
-static shell is served. See `docs/expo-web-deployment.md`.
+static shell is served. See `docs/operations/expo-web-deployment.md`.

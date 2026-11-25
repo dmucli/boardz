@@ -1,26 +1,44 @@
 // @vitest-environment jsdom
 import { act, renderHook, waitFor } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Climb, UserBoard } from '@boardsesh/shared-schema';
-import type { GeneratorGradeScale, PlannedClimbSlot, VolumeOptions } from '@boardsesh/playlist-generator';
-import type { GeneratorSelection } from '../GeneratorPickerCard';
-import type { FetchGradePool } from '../workout-preview-pool';
+import type { GeneratorGradeScale, StagedSlot, VolumeOptions } from '@boardsesh/playlist-generator';
+import { NO_WORKOUT, singleBlockSelection, type GeneratorSelection } from '../workout-blocks';
+import { NO_TOP_UPS, type FetchGradePool, type GradePool } from '../workout-preview-pool';
 
 const cryptoMock = vi.hoisted(() => {
   let n = 0;
   return { randomUUID: () => `qi-${n++}` };
 });
+const gradeSource = vi.hoisted(() => ({ active: false }));
+vi.mock('../../../../lib/graphql/hooks/search-grade-source', () => ({
+  useSearchGradeSourceActive: () => gradeSource.active,
+}));
 vi.mock('expo-crypto', () => ({ randomUUID: () => cryptoMock.randomUUID() }));
 
 // Plan is mocked so tests control the slot count/grades independent of the
 // real generator algorithm (covered by its own tests).
-const generator = vi.hoisted(() => ({
-  plan: [
-    { grade: 10, section: 'main', index: 0 },
-    { grade: 10, section: 'main', index: 1 },
-  ] as PlannedClimbSlot[],
-}));
-vi.mock('@boardsesh/playlist-generator', () => ({ generateWorkoutPlan: () => generator.plan }));
+const TWO_SLOTS_AT_10: StagedSlot[] = [
+  { grade: 10, section: 'main', index: 0, stageId: 'stage-main' },
+  { grade: 10, section: 'main', index: 1, stageId: 'stage-main' },
+];
+const generator = vi.hoisted(() => ({ plan: [] as StagedSlot[] }));
+vi.mock('@boardsesh/playlist-generator', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@boardsesh/playlist-generator')>();
+  return {
+    ...actual,
+    planFromBlocks: () => ({
+      stages: [
+        {
+          id: 'stage-main',
+          kind: 'volume',
+          options: { ...actual.DEFAULT_VOLUME_OPTIONS, targetGrade: 10, warmUp: 'none' },
+        },
+      ],
+    }),
+    generateStagedPlan: () => generator.plan,
+  };
+});
 
 // Don't load the real GraphQL-backed fetcher; the hook is driven via deps.fetchPool.
 vi.mock('../select-climbs-for-plan', () => ({ fetchGradePool: vi.fn() }));
@@ -48,14 +66,19 @@ function makeClimb(uuid: string): Climb {
   } as Climb;
 }
 
+/** A fetched pool with no top-up climbs, as a grade the first search tier fills. */
+function poolOf(climbs: Climb[]): GradePool {
+  return { climbs, topUpTiers: NO_TOP_UPS };
+}
+
 const board = { boardType: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2', angle: 40 } as UserBoard;
 const grades: GeneratorGradeScale = [{ difficulty_id: 10 }, { difficulty_id: 11 }];
 
-const OFF: GeneratorSelection = { type: 'off' };
+const OFF: GeneratorSelection = NO_WORKOUT;
+// One Volume block; filter overrides land in the block's own filters.
 function on(targetGrade: number, overrides?: Partial<VolumeOptions>): GeneratorSelection {
-  return {
-    type: 'on',
-    options: {
+  return singleBlockSelection(
+    {
       type: 'volume',
       targetGrade,
       warmUp: 'none',
@@ -68,7 +91,8 @@ function on(targetGrade: number, overrides?: Partial<VolumeOptions>): GeneratorS
       climbBias: 'any',
       ...overrides,
     },
-  };
+    'block-volume',
+  );
 }
 
 type Props = { selection: GeneratorSelection };
@@ -92,6 +116,11 @@ function renderPreviewWithAuth(fetchPool: FetchGradePool, initial: GeneratorSele
   );
 }
 
+beforeEach(() => {
+  generator.plan = TWO_SLOTS_AT_10;
+  gradeSource.active = false;
+});
+
 afterEach(() => {
   vi.useRealTimers();
   toast.showToast.mockClear();
@@ -107,7 +136,7 @@ describe('useWorkoutPreview', () => {
   });
 
   it('builds a preview after the debounce when turned on', async () => {
-    const fetchPool = vi.fn<FetchGradePool>(async () => [makeClimb('a'), makeClimb('b'), makeClimb('c')]);
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
     const { result, rerender } = renderPreview(fetchPool, OFF);
 
     rerender({ selection: on(10) });
@@ -121,11 +150,11 @@ describe('useWorkoutPreview', () => {
     expect(uuids.every((uuid) => ['a', 'b', 'c'].includes(uuid))).toBe(true);
     expect(result.current.plannedCount).toBe(2);
     expect(fetchPool).toHaveBeenCalledTimes(1); // one unique grade
-    expect(result.current.toQueueItems().map((item) => item.climb.uuid)).toEqual(uuids);
+    expect(result.current.toStagedQueueItems().items.map((item) => item.climb.uuid)).toEqual(uuids);
   });
 
   it('coalesces rapid selection changes into a single build', async () => {
-    const fetchPool = vi.fn<FetchGradePool>(async () => [makeClimb('a'), makeClimb('b'), makeClimb('c')]);
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
     const { result, rerender } = renderPreview(fetchPool, OFF);
 
     rerender({ selection: on(10) }); // schedules a build
@@ -136,25 +165,28 @@ describe('useWorkoutPreview', () => {
   });
 
   it('rebuilds when a workout-shape option changes without changing the target grade', async () => {
-    const fetchPool = vi.fn<FetchGradePool>(async () => [makeClimb('a'), makeClimb('b'), makeClimb('c')]);
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
     const { result, rerender } = renderPreview(fetchPool, OFF);
 
     rerender({ selection: on(10, { mainSetClimbs: 20 }) });
     await waitFor(() => expect(result.current.status).toBe('ready'));
     fetchPool.mockClear();
 
+    // One more climb at the same grade: the cached pool was fetched for one fewer.
+    generator.plan = [...TWO_SLOTS_AT_10, { grade: 10, section: 'main', index: 2, stageId: 'stage-main' }];
     rerender({ selection: on(10, { mainSetClimbs: 21 }) });
 
     await waitFor(() => expect(fetchPool).toHaveBeenCalledTimes(1));
+    expect(fetchPool).toHaveBeenCalledWith(10, expect.anything(), 3);
   });
 
   it('hides stale generated plan data while a changed selection rebuilds', async () => {
-    const fetchPool = vi.fn<FetchGradePool>(async () => [makeClimb('a'), makeClimb('b'), makeClimb('c')]);
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
     const { result, rerender } = renderPreview(fetchPool, OFF);
 
     rerender({ selection: on(10) });
     await waitFor(() => expect(result.current.status).toBe('ready'));
-    expect(result.current.toQueueItems()).toHaveLength(2);
+    expect(result.current.toStagedQueueItems().items).toHaveLength(2);
 
     rerender({ selection: on(11) });
 
@@ -162,16 +194,15 @@ describe('useWorkoutPreview', () => {
     expect(result.current.items).toHaveLength(2); // same board: keep rows while options rebuild
     expect(result.current.plannedSlots).toEqual([]);
     expect(result.current.plannedCount).toBe(0);
-    expect(result.current.toQueueItems()).toEqual([]);
+    expect(result.current.toStagedQueueItems().items).toEqual([]);
 
     await waitFor(() => expect(result.current.status).toBe('ready'));
   });
 
   it('hides the previous board’s rows immediately while the new preview loads', async () => {
-    const fetchPool = vi.fn<FetchGradePool>(async (_grade, { board: requestedBoard }) => [
-      makeClimb(`${requestedBoard.boardType}-a`),
-      makeClimb(`${requestedBoard.boardType}-b`),
-    ]);
+    const fetchPool = vi.fn<FetchGradePool>(async (_grade, { board: requestedBoard }) =>
+      poolOf([makeClimb(`${requestedBoard.boardType}-a`), makeClimb(`${requestedBoard.boardType}-b`)]),
+    );
     const selection = on(10);
     const { result, rerender } = renderHook(
       ({ activeBoard }: { activeBoard: UserBoard }) =>
@@ -185,13 +216,13 @@ describe('useWorkoutPreview', () => {
 
     expect(result.current.status).toBe('loading');
     expect(result.current.items).toEqual([]);
-    expect(result.current.toQueueItems()).toEqual([]);
+    expect(result.current.toStagedQueueItems().items).toEqual([]);
     await waitFor(() => expect(result.current.status).toBe('ready'));
     expect(result.current.items.map(({ item }) => item.climb.uuid).sort()).toEqual(['tension-a', 'tension-b']);
   });
 
   it('rebuilds when authentication changes because climb-bias filters depend on auth', async () => {
-    const fetchPool = vi.fn<FetchGradePool>(async () => [makeClimb('a'), makeClimb('b'), makeClimb('c')]);
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
     const selection = on(10, { climbBias: 'unfamiliar' });
     const { result, rerender } = renderPreviewWithAuth(fetchPool, selection, false);
 
@@ -204,7 +235,7 @@ describe('useWorkoutPreview', () => {
   });
 
   it('clears back to idle when the generator is turned off', async () => {
-    const fetchPool = vi.fn<FetchGradePool>(async () => [makeClimb('a'), makeClimb('b')]);
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b')]));
     const { result, rerender } = renderPreview(fetchPool, OFF);
 
     rerender({ selection: on(10) });
@@ -218,14 +249,15 @@ describe('useWorkoutPreview', () => {
 
   it('refreshes a single row and de-dupes a double-tap into one fetch', async () => {
     // Pool is exactly [a, b] for 2 slots → both used → refresh misses the cache
-    // and must refetch (so we can count the fetch).
-    const fetchPool = vi.fn<FetchGradePool>(async () => [makeClimb('a'), makeClimb('b')]);
+    // and must refetch (so we can count the fetch). The refetch finds 'c'.
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b')]));
     const { result } = renderPreview(fetchPool, on(10));
 
     await waitFor(() => expect(result.current.status).toBe('ready'));
     const targetUuid = result.current.items[0].item.uuid;
-    const initialClimbUuid = result.current.items[0].item.climb.uuid; // 'a' or 'b' (shuffled)
+    const otherClimbUuid = result.current.items[1].item.climb.uuid;
     fetchPool.mockClear();
+    fetchPool.mockImplementation(async () => poolOf(['a', 'b', 'c'].map(makeClimb)));
 
     await act(async () => {
       result.current.refreshSlot(targetUuid);
@@ -234,18 +266,54 @@ describe('useWorkoutPreview', () => {
     });
 
     await waitFor(() => expect(result.current.refreshingUuids.size).toBe(0));
-    expect(fetchPool).toHaveBeenCalledTimes(1); // single refetch despite the double tap
+    // A single refetch of grade 10 despite the double tap.
+    expect(fetchPool.mock.calls.map(([grade]) => grade)).toEqual([10]);
     expect(result.current.items[0].item.uuid).toBe(targetUuid); // queue-item identity preserved
-    expect(result.current.items[0].item.climb.uuid).not.toBe(initialClimbUuid); // swapped climb
-    expect(['a', 'b']).toContain(result.current.items[0].item.climb.uuid);
+    expect(result.current.items[0].item.climb.uuid).toBe('c'); // the one climb no row shows
+    expect(result.current.items[1].item.climb.uuid).toBe(otherClimbUuid);
+  });
+
+  it('keeps the row and says so when every climb that fits it is on another row', async () => {
+    // Grades 10 and 11 hold only the two climbs already shown, and both are read out.
+    const fetchPool = vi.fn<FetchGradePool>(async () => ({
+      ...poolOf([makeClimb('a'), makeClimb('b')]),
+      exhausted: true,
+    }));
+    const { result } = renderPreview(fetchPool, on(10));
+
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    const itemsBefore = result.current.items;
+    fetchPool.mockClear();
+
+    await act(async () => {
+      result.current.refreshSlot(itemsBefore[0].item.uuid);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(result.current.refreshingUuids.size).toBe(0));
+    expect(result.current.items).toBe(itemsBefore);
+    expect(new Set(result.current.items.map((preview) => preview.item.climb.uuid)).size).toBe(2);
+    expect(toast.showToast).toHaveBeenCalledWith('mobile.session.preWorkoutPreviewNoOtherClimb');
+    // Only grade 11 was new to this preview, and it is searched once.
+    expect(fetchPool.mock.calls.map(([grade]) => grade)).toEqual([11]);
+
+    toast.showToast.mockClear();
+    fetchPool.mockClear();
+    await act(async () => {
+      result.current.refreshSlot(itemsBefore[0].item.uuid);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(toast.showToast).toHaveBeenCalledTimes(1));
+    // The second tap answers from the pools the first one searched.
+    expect(fetchPool).not.toHaveBeenCalled();
   });
 
   it('drops a stale build whose fetch resolves after a newer one', async () => {
     vi.useFakeTimers();
-    const deferreds: Array<(climbs: Climb[]) => void> = [];
+    const deferreds: Array<(pool: GradePool) => void> = [];
     const fetchPool = vi.fn<FetchGradePool>(
       () =>
-        new Promise<Climb[]>((resolve) => {
+        new Promise<GradePool>((resolve) => {
           deferreds.push(resolve);
         }),
     );
@@ -262,26 +330,28 @@ describe('useWorkoutPreview', () => {
 
     // Resolve the STALE build first, then the fresh one.
     await act(async () => {
-      deferreds[0]?.([makeClimb('stale')]);
+      deferreds[0]?.(poolOf([makeClimb('stale')]));
       await Promise.resolve();
     });
     await act(async () => {
-      deferreds[1]?.([makeClimb('fresh')]);
+      // Enough for both slots, so the build has no short slot to borrow for.
+      deferreds[1]?.(poolOf([makeClimb('fresh-a'), makeClimb('fresh-b')]));
       await Promise.resolve();
     });
 
     expect(result.current.status).toBe('ready');
-    expect(result.current.items.every((preview) => preview.item.climb.uuid === 'fresh')).toBe(true);
+    expect(result.current.items).toHaveLength(2);
+    expect(result.current.items.every((preview) => preview.item.climb.uuid.startsWith('fresh'))).toBe(true);
   });
 
   it('drops a stale row refresh after the preview is cleared', async () => {
-    let resolveRefresh: ((climbs: Climb[]) => void) | null = null;
+    let resolveRefresh: ((pool: GradePool) => void) | null = null;
     const fetchPool = vi
       .fn<FetchGradePool>()
-      .mockResolvedValueOnce([makeClimb('a'), makeClimb('b')])
+      .mockResolvedValueOnce(poolOf([makeClimb('a'), makeClimb('b')]))
       .mockImplementationOnce(
         () =>
-          new Promise<Climb[]>((resolve) => {
+          new Promise<GradePool>((resolve) => {
             resolveRefresh = resolve;
           }),
       );
@@ -298,7 +368,7 @@ describe('useWorkoutPreview', () => {
     await waitFor(() => expect(result.current.status).toBe('idle'));
 
     await act(async () => {
-      resolveRefresh?.([makeClimb('c')]);
+      resolveRefresh?.(poolOf([makeClimb('c')]));
       await Promise.resolve();
     });
 
@@ -309,7 +379,7 @@ describe('useWorkoutPreview', () => {
   it('sets error status, toasts, and leaves previous items in place when a rebuild fails', async () => {
     const fetchPool = vi
       .fn<FetchGradePool>()
-      .mockResolvedValueOnce([makeClimb('a'), makeClimb('b')])
+      .mockResolvedValueOnce(poolOf([makeClimb('a'), makeClimb('b')]))
       .mockRejectedValueOnce(new Error('search failed'));
     const { result, rerender } = renderPreview(fetchPool, OFF);
 
@@ -317,13 +387,134 @@ describe('useWorkoutPreview', () => {
     await waitFor(() => expect(result.current.status).toBe('ready'));
     const previousUuids = result.current.items.map((preview) => preview.item.climb.uuid);
 
+    // A new grade has no cached pool to fall back on, so this build has to fetch.
+    generator.plan = TWO_SLOTS_AT_10.map((slot) => ({ ...slot, grade: 11 }));
     rerender({ selection: on(11) });
     await waitFor(() => expect(result.current.status).toBe('error'));
 
     expect(result.current.items.map((preview) => preview.item.climb.uuid)).toEqual(previousUuids);
     expect(result.current.plannedSlots).toEqual([]);
     expect(result.current.plannedCount).toBe(0);
-    expect(result.current.toQueueItems()).toEqual([]);
+    expect(result.current.toStagedQueueItems().items).toEqual([]);
     expect(toast.showToast).toHaveBeenCalledWith('mobile.session.preWorkoutPreviewError', 'error');
+  });
+
+  it('shuffles every row from the fetched pools without a new fetch', async () => {
+    const pool = Array.from({ length: 12 }, (_, index) => makeClimb(`c${index}`));
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf(pool));
+    const { result, rerender } = renderPreview(fetchPool, OFF);
+    rerender({ selection: on(10) });
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    const before = result.current.items.map((preview) => preview.item.uuid);
+
+    act(() => result.current.shuffle());
+
+    expect(fetchPool).toHaveBeenCalledTimes(1);
+    expect(result.current.items).toHaveLength(2);
+    // Fresh queue items for the same plan, each still a distinct climb from the pool.
+    expect(result.current.items.map((preview) => preview.item.uuid)).not.toEqual(before);
+    expect(result.current.items.map((preview) => preview.slot)).toEqual(generator.plan);
+    const climbUuids = result.current.items.map((preview) => preview.item.climb.uuid);
+    expect(new Set(climbUuids).size).toBe(2);
+    // Start queues exactly what the shuffled preview shows.
+    expect(result.current.toStagedQueueItems().items.map((item) => item.climb.uuid)).toEqual(climbUuids);
+  });
+
+  it('ignores Shuffle while a changed selection is still rebuilding', async () => {
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
+    const { result, rerender } = renderPreview(fetchPool, OFF);
+    rerender({ selection: on(10) });
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    rerender({ selection: on(11) });
+    expect(result.current.status).toBe('loading');
+    const during = result.current.items;
+    act(() => result.current.shuffle());
+
+    expect(result.current.items).toBe(during);
+  });
+
+  it('hands Start the reviewed climbs grouped by their workout stage', async () => {
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
+    const { result } = renderPreview(fetchPool, on(10));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    const { items, run } = result.current.toStagedQueueItems();
+    expect(run).toEqual({
+      stages: [{ id: 'stage-main', kind: 'volume', itemUuids: items.map((item) => item.uuid), targetGrade: 10 }],
+    });
+  });
+
+  it('passes over the climbs the caller avoids, on build and on shuffle', async () => {
+    const pool = Array.from({ length: 12 }, (_, index) => makeClimb(`c${index}`));
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf(pool));
+    const avoided = new Set(['c0', 'c1', 'c2', 'c3']);
+    const { result } = renderHook(() =>
+      useWorkoutPreview(
+        on(10, { mainSetClimbs: 4 }),
+        board,
+        { isAuthenticated: false, getAvoidedClimbUuids: () => avoided },
+        { fetchPool, grades },
+      ),
+    );
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    const shown = () => result.current.items.map((preview) => preview.item.climb.uuid);
+    expect(shown().length).toBeGreaterThan(0);
+    expect(shown().some((uuid) => avoided.has(uuid))).toBe(false);
+
+    act(() => result.current.shuffle());
+    expect(shown().some((uuid) => avoided.has(uuid))).toBe(false);
+  });
+
+  it('keeps the stage map in step with a row refresh and a shuffle', async () => {
+    const pool = Array.from({ length: 12 }, (_, index) => makeClimb(`c${index}`));
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf(pool));
+    const { result } = renderPreview(fetchPool, on(10));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    const refreshedUuid = result.current.items[0].item.uuid;
+    await act(async () => {
+      result.current.refreshSlot(refreshedUuid);
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.refreshingUuids.size).toBe(0));
+    expect(result.current.toStagedQueueItems().run?.stages[0].itemUuids).toEqual(
+      result.current.items.map((preview) => preview.item.uuid),
+    );
+
+    act(() => result.current.shuffle());
+    const afterShuffle = result.current.toStagedQueueItems();
+    expect(afterShuffle.items.map((item) => item.uuid)).not.toContain(refreshedUuid);
+    expect(afterShuffle.run?.stages[0].itemUuids).toEqual(afterShuffle.items.map((item) => item.uuid));
+  });
+
+  it('hands Start no run while a changed selection is still rebuilding', async () => {
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
+    const { result, rerender } = renderPreview(fetchPool, on(10));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+
+    rerender({ selection: on(11) });
+    expect(result.current.toStagedQueueItems()).toEqual({ items: [], run: null });
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+  });
+
+  it('fetches on the upstream grade with the preference off', async () => {
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
+    const { result } = renderPreview(fetchPool, on(10));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    expect(fetchPool.mock.calls[0][1].boardseshGrades).toBe(false);
+  });
+
+  it('fetches on the Boardsesh grade, and rebuilds when the preference flips', async () => {
+    const fetchPool = vi.fn<FetchGradePool>(async () => poolOf([makeClimb('a'), makeClimb('b'), makeClimb('c')]));
+    const { result, rerender } = renderPreview(fetchPool, on(10));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    const callsBefore = fetchPool.mock.calls.length;
+
+    gradeSource.active = true;
+    rerender({ selection: on(10) });
+    await waitFor(() => expect(fetchPool.mock.calls.length).toBeGreaterThan(callsBefore));
+    await waitFor(() => expect(result.current.status).toBe('ready'));
+    expect(fetchPool.mock.calls[fetchPool.mock.calls.length - 1][1].boardseshGrades).toBe(true);
   });
 });

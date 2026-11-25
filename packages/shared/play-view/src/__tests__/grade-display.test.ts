@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  defaultGradeDisplayFormatForLocale,
   getGradeColorWithOpacity,
   isLightColor,
   getGradeTextColor,
@@ -7,6 +8,7 @@ import {
   hexToHSL,
   formatGrade,
   formatGradeByDifficultyId,
+  formatGradeBand,
   formatVGrade,
   formatFontGrade,
   softenColor,
@@ -256,6 +258,35 @@ describe('formatGradeByDifficultyId', () => {
   });
 });
 
+describe('formatGradeBand', () => {
+  it('joins the two ends in the chosen format', () => {
+    expect(formatGradeBand(16, 20, 'v-grade')).toBe('V3–V5');
+    expect(formatGradeBand(16, 20, 'font')).toBe('6A–6C');
+  });
+
+  it('draws the V format for both, which keeps the band short enough for a card', () => {
+    expect(formatGradeBand(16, 20, 'both')).toBe('V3–V5');
+  });
+
+  it('collapses a band whose ends read the same into one label', () => {
+    expect(formatGradeBand(18, 18, 'v-grade')).toBe('V4');
+    // 4a and 4c are both V0.
+    expect(formatGradeBand(10, 12, 'v-grade')).toBe('V0');
+    expect(formatGradeBand(10, 12, 'font')).toBe('4A–4C');
+  });
+
+  it("uses the board's own scale", () => {
+    // MoonBoard reads 6A as V2.
+    expect(formatGradeBand(16, 16, 'v-grade', 'moonboard')).toBe('V2');
+  });
+
+  it('falls back to the end that is on the scale, and to null when neither is', () => {
+    expect(formatGradeBand(16, 999, 'v-grade')).toBe('V3');
+    expect(formatGradeBand(null, 20, 'v-grade')).toBe('V5');
+    expect(formatGradeBand(null, undefined, 'v-grade')).toBeNull();
+  });
+});
+
 describe('softenColor', () => {
   it('returns a light-mode HSL with the source hue', () => {
     // #FF0000 is hue 0 (red).
@@ -299,5 +330,45 @@ describe('getSoftGradeColor variants', () => {
     const byFormat = getSoftGradeColorByFormat('6a/V3', 'font');
     const byFont = getSoftFontGradeColor('6A');
     expect(byFormat).toBe(byFont);
+  });
+});
+
+describe('MoonBoard grade scale', () => {
+  // Moon converts 6A to V2, so 6A+ is its only V3 and needs no "+".
+  it('drops the "+" on 6a+/V3 for MoonBoard only', () => {
+    expect(formatVGrade('6a+/V3', 'moonboard')).toBe('V3');
+    expect(formatVGrade('6a+/V3', 'kilter')).toBe('V3+');
+    expect(formatVGrade('6a+/V3')).toBe('V3+');
+  });
+
+  it('labels difficulty 16 as V2 on MoonBoard and V3 elsewhere', () => {
+    expect(formatGradeByDifficultyId(16, 'v-grade', 'moonboard')).toBe('V2');
+    expect(formatGradeByDifficultyId(16, 'both', 'moonboard')).toBe('V2 / 6A');
+    expect(formatGradeByDifficultyId(16, 'v-grade', 'kilter')).toBe('V3');
+    expect(formatGradeByDifficultyId(16, 'font', 'moonboard')).toBe('6A');
+  });
+
+  it('keeps the "+" where MoonBoard still has two Font grades per V grade', () => {
+    expect(formatVGrade('6b+/V4', 'moonboard')).toBe('V4+');
+  });
+});
+
+describe('defaultGradeDisplayFormatForLocale', () => {
+  it('defaults Spanish, French, German and Italian to Font', () => {
+    expect(defaultGradeDisplayFormatForLocale('es')).toBe('font');
+    expect(defaultGradeDisplayFormatForLocale('fr')).toBe('font');
+    expect(defaultGradeDisplayFormatForLocale('fr-CA')).toBe('font');
+    expect(defaultGradeDisplayFormatForLocale('es_MX')).toBe('font');
+    expect(defaultGradeDisplayFormatForLocale('ES')).toBe('font');
+    expect(defaultGradeDisplayFormatForLocale('de')).toBe('font');
+    expect(defaultGradeDisplayFormatForLocale('de-AT')).toBe('font');
+    expect(defaultGradeDisplayFormatForLocale('it')).toBe('font');
+  });
+
+  it('defaults every other language to V', () => {
+    expect(defaultGradeDisplayFormatForLocale('en-US')).toBe('v-grade');
+    expect(defaultGradeDisplayFormatForLocale('en-GB')).toBe('v-grade');
+    expect(defaultGradeDisplayFormatForLocale(undefined)).toBe('v-grade');
+    expect(defaultGradeDisplayFormatForLocale('')).toBe('v-grade');
   });
 });

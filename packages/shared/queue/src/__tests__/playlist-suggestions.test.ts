@@ -1,11 +1,21 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   mergeUniquePlaylistClimbs,
+  preparePlaylistClimbs,
+  createPlaylistSuggestionSource,
+  findPlaylistClimbIndex,
   playlistSuggestionSourceMatches,
   pruneSuggestedQueueItemsAfterCurrent,
   reanchorPlaylistSuggestionSource,
+  appendPlaylistTrackPage,
+  withPlaylistTrackClimbs,
+  withPlaylistTrackResume,
+  withPlaylistTrackPlace,
+  samePlaylistTrackResume,
+  asLookOffWall,
+  withoutLookOffWall,
 } from '../playlist-suggestions';
-import type { Climb, ClimbQueueItem, PlaylistSuggestionSource } from '../types';
+import type { Climb, ClimbQueueItem, PlaylistSuggestionSource, PlaylistTrackPage } from '../types';
 
 function makeClimb(uuid: string, name?: string): Climb {
   return { uuid, name: name ?? `Climb ${uuid}` } as Climb;
@@ -142,5 +152,329 @@ describe('reanchorPlaylistSuggestionSource', () => {
     expect(reanchorPlaylistSuggestionSource(null, 'a')).toBeNull();
     const original = source('a', ['a']);
     expect(reanchorPlaylistSuggestionSource(original, undefined)).toBe(original);
+  });
+});
+
+describe('prepared playlist tracks', () => {
+  it('keeps first-occurrence semantics when a later compatible duplicate follows an incompatible row', () => {
+    const first = makeClimb('duplicate', 'blocked');
+    const climbs = [first, makeClimb('duplicate', 'allowed'), makeClimb('active')];
+    const isClimbable = (candidate: Climb) => candidate.name !== 'blocked';
+    const args = { playlistUuid: 'prepared', boardKey: 'board', climbs, activatedClimb: climbs[2], isClimbable };
+    expect(
+      createPlaylistSuggestionSource({ ...args, preparedClimbs: preparePlaylistClimbs(climbs, isClimbable) }),
+    ).toEqual(createPlaylistSuggestionSource(args));
+    expect(preparePlaylistClimbs(climbs, isClimbable).climbs).toEqual([climbs[2]]);
+  });
+
+  it('reuses the compatible ordered track across ordinary activations without filtering again', () => {
+    const first = makeClimb('a', 'first');
+    const duplicate = makeClimb('a', 'duplicate');
+    const climbs = [first, makeClimb('blocked'), duplicate, makeClimb('b')];
+    const isClimbable = vi.fn((climb: Climb) => climb.uuid !== 'blocked');
+    const preparedClimbs = preparePlaylistClimbs(climbs, isClimbable);
+    expect(isClimbable).toHaveBeenCalledTimes(3);
+    for (const activatedClimb of [first, climbs[3]]) {
+      const source = createPlaylistSuggestionSource({
+        playlistUuid: 'prepared',
+        boardKey: 'board',
+        climbs,
+        activatedClimb,
+        isClimbable,
+        preparedClimbs,
+      });
+      expect(source.climbs).toBe(preparedClimbs.climbs);
+      expect(source.climbs).toEqual([first, climbs[3]]);
+      expect(findPlaylistClimbIndex(source, 'b')).toBe(1);
+      expect(findPlaylistClimbIndex(reanchorPlaylistSuggestionSource(source, 'b')!, 'a')).toBe(0);
+    }
+    expect(isClimbable).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(['blocked', 'absent'])('preserves original activated inclusion for %s', (activatedUuid) => {
+    const climbs = [makeClimb('a'), makeClimb('blocked'), makeClimb('b')];
+    const activatedClimb = makeClimb(activatedUuid);
+    const isClimbable = (climb: Climb) => climb.uuid !== 'blocked';
+    const args = { playlistUuid: 'prepared', boardKey: 'board', climbs, activatedClimb, isClimbable };
+    expect(
+      createPlaylistSuggestionSource({ ...args, preparedClimbs: preparePlaylistClimbs(climbs, isClimbable) }),
+    ).toEqual(createPlaylistSuggestionSource(args));
+  });
+
+  it('rejects preparations from another snapshot or board predicate', () => {
+    const climbs = [makeClimb('a'), makeClimb('b')];
+    const args = { playlistUuid: 'prepared', boardKey: 'board', climbs, activatedClimb: climbs[0] };
+    const preparedClimbs = preparePlaylistClimbs(climbs);
+    const source = createPlaylistSuggestionSource({ ...args, preparedClimbs, isClimbable: () => false });
+    expect(source.climbs).toEqual([climbs[0]]);
+    const updatedClimbs = [climbs[0], makeClimb('c')];
+    expect(createPlaylistSuggestionSource({ ...args, climbs: updatedClimbs, preparedClimbs }).climbs).toEqual(
+      updatedClimbs,
+    );
+  });
+});
+
+// Issue #6664: the player names the list ("Projects · 4 of 23") and pages
+// past the first load. A count is only ever shown while it is right.
+describe('named, counted tracks', () => {
+  const list = ['a', 'b', 'c', 'd'].map((uuid) => makeClimb(uuid));
+  const base = { playlistUuid: 'playlist:p', boardKey: 'board', activatedClimb: list[0], climbs: list };
+
+  it('keeps the name, count and continuation on a track that is the list one for one', () => {
+    const source = createPlaylistSuggestionSource({
+      ...base,
+      label: 'Projects',
+      total: 9,
+      continuation: { loaderId: 'loader', nextPage: 1 },
+    });
+    expect(source).toMatchObject({
+      label: 'Projects',
+      total: 9,
+      continuation: { loaderId: 'loader', nextPage: 1 },
+    });
+  });
+
+  it('drops the count when a climb is filtered out, on either build path', () => {
+    const isClimbable = (climb: Climb) => climb.uuid !== 'c';
+    const plain = createPlaylistSuggestionSource({ ...base, isClimbable, label: 'Projects', total: 4 });
+    const prepared = createPlaylistSuggestionSource({
+      ...base,
+      isClimbable,
+      preparedClimbs: preparePlaylistClimbs(list, isClimbable),
+      label: 'Projects',
+      total: 4,
+    });
+    for (const source of [plain, prepared]) {
+      expect(source.label).toBe('Projects');
+      expect(source).not.toHaveProperty('total');
+    }
+  });
+
+  it('drops the count when the activated climb had to be appended', () => {
+    const source = createPlaylistSuggestionSource({
+      ...base,
+      activatedClimb: makeClimb('not-in-list'),
+      label: 'Projects',
+      total: 4,
+    });
+    expect(source).not.toHaveProperty('total');
+  });
+
+  it('drops a count smaller than the track', () => {
+    expect(createPlaylistSuggestionSource({ ...base, total: 3 })).not.toHaveProperty('total');
+  });
+
+  it('keeps the name, count and continuation through a re-anchor', () => {
+    const source = createPlaylistSuggestionSource({
+      ...base,
+      label: 'Projects',
+      total: 4,
+      continuation: { loaderId: 'loader', nextPage: 1 },
+    });
+    expect(reanchorPlaylistSuggestionSource(source, 'c')).toMatchObject({
+      activatedClimbUuid: 'c',
+      label: 'Projects',
+      total: 4,
+      continuation: { loaderId: 'loader', nextPage: 1 },
+    });
+  });
+
+  it('drops the count when the provider filters the track down for a board', () => {
+    const source = createPlaylistSuggestionSource({ ...base, label: 'Projects', total: 4 });
+    expect(withPlaylistTrackClimbs(source, source.climbs.slice(0, 3))).not.toHaveProperty('total');
+    expect(withPlaylistTrackClimbs(source, [...source.climbs])).toMatchObject({ total: 4 });
+  });
+});
+
+describe('appendPlaylistTrackPage', () => {
+  const firstPage = ['p0-a', 'p0-b'].map((uuid) => makeClimb(uuid));
+  const secondPage = ['p1-a', 'p1-b'].map((uuid) => makeClimb(uuid));
+
+  function trackOf(overrides: Partial<PlaylistSuggestionSource> = {}): PlaylistSuggestionSource {
+    return createPlaylistSuggestionSource({
+      playlistUuid: 'playlist:p',
+      activatedClimb: firstPage[0],
+      climbs: firstPage,
+      boardKey: 'board',
+      label: 'Projects',
+      total: 6,
+      continuation: { loaderId: 'loader', nextPage: 1 },
+      ...overrides,
+    });
+  }
+
+  function pageOf(overrides: Partial<PlaylistTrackPage> = {}): PlaylistTrackPage {
+    return { page: 1, pageSize: 2, climbs: secondPage, filteredOut: false, nextPage: 2, total: 6, ...overrides };
+  }
+
+  it('appends the page, advances the continuation and keeps the count', () => {
+    const next = appendPlaylistTrackPage(trackOf(), pageOf());
+    expect(next.climbs.map(({ uuid }) => uuid)).toEqual(['p0-a', 'p0-b', 'p1-a', 'p1-b']);
+    expect(next.continuation).toEqual({ loaderId: 'loader', nextPage: 2 });
+    expect(next.total).toBe(6);
+    expect(next.label).toBe('Projects');
+    // The new climbs are findable without a scan of the old index.
+    expect(findPlaylistClimbIndex(next, 'p1-b')).toBe(3);
+  });
+
+  it('ends the continuation on the last page', () => {
+    expect(appendPlaylistTrackPage(trackOf(), pageOf({ nextPage: null }))).not.toHaveProperty('continuation');
+  });
+
+  it('never adds a climb the track already holds', () => {
+    const next = appendPlaylistTrackPage(trackOf(), pageOf({ climbs: [firstPage[1], ...secondPage] }));
+    expect(next.climbs.map(({ uuid }) => uuid)).toEqual(['p0-a', 'p0-b', 'p1-a', 'p1-b']);
+    // A repeat means the list moved under the track: positions are no longer certain.
+    expect(next).not.toHaveProperty('total');
+  });
+
+  it('drops the count when the page did not start where the track ends', () => {
+    expect(appendPlaylistTrackPage(trackOf(), pageOf({ page: 2 }))).not.toHaveProperty('total');
+  });
+
+  it('drops the count when the track filter dropped a climb from the page', () => {
+    expect(appendPlaylistTrackPage(trackOf(), pageOf({ filteredOut: true }))).not.toHaveProperty('total');
+  });
+
+  it('never gains a count the track did not already have', () => {
+    const uncounted = trackOf({ total: undefined });
+    expect(appendPlaylistTrackPage(uncounted, pageOf())).not.toHaveProperty('total');
+  });
+
+  it('ends the track on an empty last page and keeps a count that is still right', () => {
+    // A page that failed to load ends the track this way: nothing moved.
+    const next = appendPlaylistTrackPage(trackOf(), pageOf({ climbs: [], pageSize: 0, nextPage: null }));
+    expect(next).not.toHaveProperty('continuation');
+    expect(next.total).toBe(6);
+  });
+
+  it('advances past a page of climbs it already had, without touching the climbs', () => {
+    const source = trackOf();
+    const next = appendPlaylistTrackPage(source, pageOf({ climbs: firstPage }));
+    expect(next.climbs).toBe(source.climbs);
+    expect(next.continuation).toEqual({ loaderId: 'loader', nextPage: 2 });
+  });
+});
+
+// Issue #6777: the list climb a walk left for Up next, kept on the track.
+describe('withPlaylistTrackResume', () => {
+  const climbs = [makeClimb('a'), makeClimb('b'), makeClimb('c')];
+  const track = createPlaylistSuggestionSource({ playlistUuid: 'p', activatedClimb: climbs[0], climbs, boardKey: 'k' });
+  const resume = { climbUuid: 'b', queueItemUuid: 'item-b' };
+
+  it('sets and clears the resume point, keeping everything else', () => {
+    const walking = withPlaylistTrackResume(track, resume);
+    expect(walking).not.toBe(track);
+    expect(walking).toEqual({ ...track, resume });
+    const back = withPlaylistTrackResume(walking, null);
+    expect(back).toEqual({ ...track, detour: resume });
+    expect('resume' in back).toBe(false);
+  });
+
+  it('keeps the cleared resume as the detour until a new one is set', () => {
+    const back = withPlaylistTrackResume(withPlaylistTrackResume(track, resume), null);
+    expect(back.detour).toEqual(resume);
+    // Another step on the list keeps it: nothing changes.
+    expect(withPlaylistTrackResume(back, null)).toBe(back);
+    const again = { climbUuid: 'c', queueItemUuid: 'item-c' };
+    const intoUpNext = withPlaylistTrackResume(back, again);
+    expect(intoUpNext).toEqual({ ...track, resume: again });
+    expect('detour' in intoUpNext).toBe(false);
+  });
+
+  it('returns the same track when nothing changes', () => {
+    expect(withPlaylistTrackResume(track, null)).toBe(track);
+    const walking = withPlaylistTrackResume(track, resume);
+    expect(withPlaylistTrackResume(walking, { ...resume })).toBe(walking);
+  });
+
+  it('keeps the prepared index, so lookups never rescan the list', () => {
+    const walking = withPlaylistTrackResume(track, resume);
+    const scan = vi.spyOn(walking.climbs, 'findIndex');
+    expect(findPlaylistClimbIndex(walking, 'c')).toBe(2);
+    expect(scan).not.toHaveBeenCalled();
+  });
+
+  it('compares resume points by both halves, absent and null alike', () => {
+    expect(samePlaylistTrackResume(undefined, null)).toBe(true);
+    expect(samePlaylistTrackResume(resume, { ...resume })).toBe(true);
+    expect(samePlaylistTrackResume(resume, { ...resume, queueItemUuid: 'repeat-b' })).toBe(false);
+    expect(samePlaylistTrackResume(resume, null)).toBe(false);
+  });
+
+  it('carries the walk place onto a fresh copy of the list', () => {
+    const fresh = createPlaylistSuggestionSource({
+      playlistUuid: 'p',
+      activatedClimb: climbs[0],
+      climbs,
+      boardKey: 'k',
+    });
+    const walking = withPlaylistTrackResume(track, resume);
+    expect(withPlaylistTrackPlace(fresh, walking)).toEqual({ ...fresh, resume });
+    const back = withPlaylistTrackResume(walking, null);
+    expect(withPlaylistTrackPlace(fresh, back)).toEqual({ ...fresh, detour: resume });
+    // Nothing to carry: the fresh copy itself.
+    expect(withPlaylistTrackPlace(fresh, track)).toBe(fresh);
+  });
+
+  // #7227 review: Previous retraces from the Up next climb the walk stepped
+  // off, not from whatever is queued last by then.
+  it('records the Up next climb a step back onto the list stepped off', () => {
+    const walking = withPlaylistTrackResume(track, resume);
+    const back = withPlaylistTrackResume(walking, null, 'item-up-next');
+    expect(back.detour).toEqual({ ...resume, lastUpNextQueueItemUuid: 'item-up-next' });
+    // The list climb's own entry is no Up next climb: nothing recorded.
+    expect(withPlaylistTrackResume(walking, null, 'item-b').detour).toEqual(resume);
+    // Into Up next again, the detour and what it recorded go.
+    expect('detour' in withPlaylistTrackResume(back, resume, 'item-b')).toBe(false);
+  });
+
+  it('carries the recorded climb onto a fresh copy of the list', () => {
+    const fresh = createPlaylistSuggestionSource({
+      playlistUuid: 'p',
+      activatedClimb: climbs[0],
+      climbs,
+      boardKey: 'k',
+    });
+    const back = withPlaylistTrackResume(withPlaylistTrackResume(track, resume), null, 'item-up-next');
+    const unrecorded = withPlaylistTrackResume(withPlaylistTrackResume(track, resume), null);
+    expect(withPlaylistTrackPlace(withPlaylistTrackPlace(fresh, unrecorded), back).detour).toEqual(back.detour);
+  });
+});
+
+// #7227 re-review: the list a look off the climb on the wall carries says so,
+// and the queue holds a list that went up without the mark.
+describe('asLookOffWall / withoutLookOffWall', () => {
+  const climbs = [makeClimb('a'), makeClimb('b'), makeClimb('c')];
+  const track = createPlaylistSuggestionSource({ playlistUuid: 'p', activatedClimb: climbs[0], climbs, boardKey: 'k' });
+  const resume = { climbUuid: 'b', queueItemUuid: 'item-b' };
+
+  it('marks a copy, keeping everything else, and leaves the list it was given alone', () => {
+    const walking = withPlaylistTrackResume(track, resume);
+    const look = asLookOffWall(walking);
+    expect(look).toEqual({ ...walking, lookOffWall: true });
+    expect('lookOffWall' in walking).toBe(false);
+    // Already marked: the same list.
+    expect(asLookOffWall(look)).toBe(look);
+  });
+
+  it('drops the mark and nothing else, and hands an unmarked list back as it is', () => {
+    const walking = withPlaylistTrackResume(track, resume);
+    const committed = withoutLookOffWall(asLookOffWall(walking));
+    expect(committed).toEqual(walking);
+    expect('lookOffWall' in committed).toBe(false);
+    expect(withoutLookOffWall(track)).toBe(track);
+  });
+});
+
+describe('findPlaylistClimbIndex on a track built elsewhere', () => {
+  it('indexes the list once and answers by first occurrence', () => {
+    const climbs = [makeClimb('a'), makeClimb('b'), makeClimb('a')];
+    const restored: PlaylistSuggestionSource = { playlistUuid: 'p', activatedClimbUuid: 'a', boardKey: 'k', climbs };
+    const scan = vi.spyOn(climbs, 'findIndex');
+    expect(findPlaylistClimbIndex(restored, 'a')).toBe(0);
+    expect(findPlaylistClimbIndex(restored, 'b')).toBe(1);
+    expect(findPlaylistClimbIndex(restored, 'missing')).toBe(-1);
+    expect(scan).not.toHaveBeenCalled();
   });
 });

@@ -13,6 +13,8 @@
  * rules, extract then.
  */
 
+import { parseRequestTarget } from './request-url';
+
 /**
  * ---------------------------------------------------------------------------
  * Span budget. Re-derive this before changing any rate below.
@@ -106,9 +108,16 @@ const ZERO_RATE_PATHS = new Set([
 const GRAPHQL_PATH = '/graphql';
 const GRAPHQL_SAMPLE_RATE = 0.01;
 
-/** Climb OG share cards. Low volume, but slow enough (image render) to be worth watching. */
-const OG_CLIMB_PATH = '/og/climb';
-const OG_CLIMB_SAMPLE_RATE = 0.05;
+/** OG share cards. Low volume, but slow enough (image render) to be worth watching. */
+const OG_CARD_PATHS: ReadonlySet<string> = new Set([
+  '/og/climb',
+  '/og/playlist',
+  '/og/session',
+  '/og/profile',
+  '/og/setter',
+  '/og/place',
+]);
+const OG_CARD_SAMPLE_RATE = 0.05;
 
 /** Everything else: /join/*, /integrations/*, the REST surface. */
 export const BACKEND_DEFAULT_SAMPLE_RATE = 0.1;
@@ -271,6 +280,37 @@ export function isGraphqlWsOperation(name: string | undefined): boolean {
   return name === GRAPHQL_EXECUTE_SPAN_NAME || GRAPHQL_WS_OPERATION_NAME.test(name);
 }
 
+/** The target out of Sentry's `<proto>://<authority><target>`, or the whole URL when it has no such prefix. */
+function targetFromSampledUrl(sampledUrl: string, authority: string | undefined): string {
+  if (!authority) return sampledUrl;
+  const authorityPrefix = `://${authority}`;
+  const prefixIndex = sampledUrl.indexOf(authorityPrefix);
+  return prefixIndex === -1 ? sampledUrl : sampledUrl.slice(prefixIndex + authorityPrefix.length);
+}
+
+/**
+ * True for a request the dispatcher will refuse with a 400 (handlers/request-guard.ts).
+ *
+ * The decision has to happen here because sampling runs before the handler, and
+ * a refused request's span would carry the sender's own target and Host to
+ * Sentry. The sampler is never given the raw target, only Sentry's URL, which
+ * joins `X-Forwarded-Host` or `Host` to it unless the target starts with `http`.
+ * Both readings are checked: `GET //` is a valid `http://host//`, and
+ * `GET http://host[/` is only invalid whole. A wrong guess here costs one trace
+ * of a request no real client sends.
+ */
+export function isRefusedRequest(request: BackendSamplingRequest): boolean {
+  const attributeUrl = request.attributes?.['http.url'];
+  const sampledUrl = typeof attributeUrl === 'string' ? attributeUrl : request.normalizedRequest?.url;
+  if (!sampledUrl) return false;
+
+  const headers = request.normalizedRequest?.headers;
+  const attributeHost = request.attributes?.['http.host'];
+  const host = headers?.host ?? (typeof attributeHost === 'string' ? attributeHost : undefined);
+  const target = targetFromSampledUrl(sampledUrl, headers?.['x-forwarded-host'] || host);
+  return parseRequestTarget(target, host) === null || parseRequestTarget(sampledUrl, host) === null;
+}
+
 function stripLeadingMethod(name: string | undefined): string {
   if (!name) return '';
 
@@ -306,13 +346,15 @@ export function resolveBackendTracesSampleRate(request: BackendSamplingRequest):
     return isGraphqlWsOperation(request.name) ? GRAPHQL_SAMPLE_RATE : 0;
   }
 
+  if (isRefusedRequest(request)) return 0;
+
   const path = resolveBackendRequestPath(request);
 
   if (ZERO_RATE_PATHS.has(path)) return 0;
   if (ZERO_RATE_PATH_PREFIXES.some((prefix) => path.startsWith(prefix))) return 0;
 
   if (path === GRAPHQL_PATH) return GRAPHQL_SAMPLE_RATE;
-  if (path === OG_CLIMB_PATH) return OG_CLIMB_SAMPLE_RATE;
+  if (OG_CARD_PATHS.has(path)) return OG_CARD_SAMPLE_RATE;
 
   return BACKEND_DEFAULT_SAMPLE_RATE;
 }

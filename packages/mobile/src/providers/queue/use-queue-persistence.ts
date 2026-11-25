@@ -1,10 +1,22 @@
-import { useEffect, useRef, useCallback } from 'react';
+import { getCredentialGeneration } from '../../lib/privacy/privacy-cache';
+import { getCurrentUserStorageOwner } from '../../lib/user-storage-owner';
+import { useEffect, useState, useCallback } from 'react';
 import type { ClimbQueueItem, PlaylistSuggestionSource, QueueAction, QueueState } from '@boardsesh/queue';
-import { getStoredQueueSnapshot, setStoredQueueSnapshot } from '../../lib/queue-snapshot-store';
+import {
+  getStoredQueueSnapshot,
+  setStoredQueueSnapshot,
+  getQueueSnapshotGeneration,
+} from '../../lib/queue-snapshot-store';
 import { getStoredSessionId, clearStoredSessionId } from '../../lib/session-store';
+import { announceStoredSessionEnded } from '../../lib/ended-session-signal';
 import { getHttpClient } from '../../lib/graphql/client';
 import { SESSION_STATUS, type SessionStatusQueryResponse } from '../../lib/graphql/operations';
 import { reportError } from '../../lib/error-reporting';
+import { track } from '../../lib/analytics';
+import { nowMs } from '../../lib/clock';
+import { holdAgeHours, parseClockInstant, type CurrentChangeClock } from '../../lib/ble/stale-current-hold';
+import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { isSameWallClimb, upNextOf, upNextStart } from '@boardsesh/queue';
 
 /**
  * How long the solo snapshot save waits before writing, coalescing mutation
@@ -16,6 +28,9 @@ import { reportError } from '../../lib/error-reporting';
 export const SOLO_QUEUE_SAVE_DEBOUNCE_MS = 500;
 
 type UseQueuePersistenceParams = {
+  authenticatedUserId?: string | null;
+  identityReady?: boolean;
+  credentialGeneration?: number;
   dispatch: React.Dispatch<QueueAction>;
   sessionIdRef: React.RefObject<string | null>;
   setSessionId: React.Dispatch<React.SetStateAction<string | null>>;
@@ -26,6 +41,16 @@ type UseQueuePersistenceParams = {
   /** Reactive queue/current climb — the solo persist effect's dependency array. */
   queue: ClimbQueueItem[];
   currentClimbQueueItem: ClimbQueueItem | null;
+  /** F3 now-slot mode: the History / Up next line, saved with the snapshot. */
+  historyCount?: number | null;
+  /**
+   * The #4979 hold's clock (`useCurrentChangeClock`). Saved with the snapshot as
+   * `lastCurrentChangeAt`; the cold-start restore seeds it back through
+   * `seedCurrentChange`. Both optional so a caller without the hold (tests,
+   * an older harness) saves today's snapshot shape.
+   */
+  lastCurrentChange?: CurrentChangeClock;
+  seedCurrentChange?: (queueItemUuid: string | null, changedAt: number) => void;
   /**
    * The board-masked source (see QueueProvider): a source stamped with another
    * board reads as null here, so the next debounced save drops it from the
@@ -45,11 +70,18 @@ type UseQueuePersistenceParams = {
 /**
  * Owns the solo-queue persistence lifecycle: cold-start restore (explicit
  * session first, then the local snapshot) and the debounced solo snapshot save.
- * `snapshotHydratedRef` is shared internally by both effects — set after the
- * cold-start hydrate settles, read as the save gate — so the initial empty
- * state can never clobber a stored snapshot.
+ * Hydration completion is reactive and scoped to the viewer and the sign-in
+ * generation, so a pending save resumes after a sign-in or sign-out without
+ * overwriting another owner.
+ *
+ * Returns `restored`: the cold-start restore has landed for this scope (the
+ * provider's `QueueRestoredContext`). It turns true in the same render as a
+ * restored climb.
  */
 export function useQueuePersistence({
+  authenticatedUserId,
+  identityReady = true,
+  credentialGeneration,
   dispatch,
   sessionIdRef,
   setSessionId,
@@ -57,44 +89,118 @@ export function useQueuePersistence({
   sessionId,
   queue,
   currentClimbQueueItem,
+  historyCount = null,
+  lastCurrentChange,
+  seedCurrentChange,
   playlistSuggestionSource,
   setPlaylistSuggestionSourceState,
   activeBoardSettled,
-}: UseQueuePersistenceParams): void {
+}: UseQueuePersistenceParams): { restored: boolean } {
+  const [verifiedOwner, setVerifiedOwner] = useState<{ userId: string; generation: number } | null>(null);
+  useEffect(() => {
+    if (identityReady) return;
+    let cancelled = false;
+    const generation = getCredentialGeneration();
+    void (async () => {
+      // The profile has not answered (an offline cold start), so the owner comes
+      // from the phone: the token's account, when the offline database is
+      // stamped for that same account, the check every user-scoped local read
+      // makes. That pins the read to one account; it attests nothing further.
+      // What keeps another account's queue out is the snapshot's own
+      // `ownerUserId` (getStoredQueueSnapshot) and the snapshot clear at sign-out.
+      // Native storage stays out of the queue's initial module graph.
+      const [{ getDatabaseHandle }, { getLocalUserId }, { readLocalUserId }] = await Promise.all([
+        import('../../db'),
+        import('@boardsesh/offline-sync'),
+        import('../../lib/local-user-id'),
+      ]);
+      if (cancelled || generation !== getCredentialGeneration()) return;
+      const database = getDatabaseHandle();
+      const [stampedUserId, tokenUserId] = database
+        ? await Promise.all([getLocalUserId(database), readLocalUserId()])
+        : [null, undefined];
+      const userId = stampedUserId && stampedUserId === tokenUserId ? stampedUserId : null;
+      if (!cancelled && generation === getCredentialGeneration()) {
+        setVerifiedOwner(userId ? { userId, generation } : null);
+      }
+    })().catch(() => {
+      /* An unreadable stamp or token leaves the saved queue untouched. */
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [identityReady, credentialGeneration]);
+  const ownerUserId =
+    authenticatedUserId ??
+    (!identityReady && verifiedOwner?.generation === getCredentialGeneration() ? verifiedOwner.userId : null);
+  const ownerReady = identityReady || !!ownerUserId;
+  const hydrationScope = JSON.stringify([ownerReady, ownerUserId, credentialGeneration ?? getCredentialGeneration()]);
+  const [hydratedScope, setHydratedScope] = useState<string | null>(null);
+
   const restoreQueueSnapshot = useCallback(
     (snapshot: {
       queue: ClimbQueueItem[];
       currentClimbQueueItem: ClimbQueueItem | null;
       playlistSuggestionSource: PlaylistSuggestionSource | null;
+      historyCount?: number | null;
+      lastCurrentChangeAt?: string | null;
+      savedAt?: string;
     }) => {
+      // #4979: the hold's clock comes back from the snapshot, never from "now",
+      // or every cold start would read as a fresh pick and light a climb left
+      // on the wall days ago. An older snapshot without the field seeds from
+      // `savedAt` once, which errs towards lighting; the next save writes the
+      // field, so it is never read from `savedAt` again. Seeded in the same tick
+      // as the dispatch below, so the render that restores the climb carries it.
+      const storedChangeAt = parseClockInstant(snapshot.lastCurrentChangeAt);
+      const changedAt = storedChangeAt ?? parseClockInstant(snapshot.savedAt);
+      if (changedAt !== null) {
+        seedCurrentChange?.(snapshot.currentClimbQueueItem?.uuid ?? null, changedAt);
+      }
+      reportQueueSnapshotRestored(snapshot, changedAt, storedChangeAt !== null ? 'snapshot' : 'savedAt');
+      // An older (or legacy-mode) snapshot has no line; the reducer derives it.
       dispatch({
         type: 'UPDATE_QUEUE',
-        payload: { queue: snapshot.queue, currentClimbQueueItem: snapshot.currentClimbQueueItem },
+        payload: {
+          queue: snapshot.queue,
+          currentClimbQueueItem: snapshot.currentClimbQueueItem,
+          ...(snapshot.historyCount == null ? {} : { historyCount: snapshot.historyCount }),
+        },
       });
       dispatch({ type: 'SET_PLAYLIST_SUGGESTION_SOURCE', payload: snapshot.playlistSuggestionSource });
       setPlaylistSuggestionSourceState(snapshot.playlistSuggestionSource);
     },
-    [],
+    [seedCurrentChange],
   );
 
   // Cold-start restore, explicit-session first: a stored session id (persisted
   // only on explicit start/join) is verified and rejoined; otherwise the local
   // solo queue snapshot hydrates the reducer. The gate flag below keeps the
   // save effect from clobbering a stored snapshot with the initial empty state.
-  const snapshotHydratedRef = useRef(false);
   useEffect(() => {
+    if (!ownerReady) return;
     let cancelled = false;
+    const generation = getCredentialGeneration();
+    const isCurrent = () => !cancelled && generation === getCredentialGeneration();
+    const owner = getCurrentUserStorageOwner() ?? (ownerUserId ? { userId: ownerUserId, authSessionId: '' } : null);
     const hydrateLocalSnapshot = async () => {
-      const snapshot = await getStoredQueueSnapshot();
-      if (cancelled || !snapshot) return;
+      const snapshotGeneration = getQueueSnapshotGeneration();
+      const snapshot = await getStoredQueueSnapshot(owner);
+      if (!isCurrent() || !snapshot || snapshotGeneration !== getQueueSnapshotGeneration()) return;
       // The user may have started acting — or a session may have appeared —
       // before the async load resolved; never clobber newer state.
       if (sessionIdRef.current !== null) return;
       if (stateRef.current.queue.length > 0 || stateRef.current.currentClimbQueueItem) return;
+      // Marked done in the same tick as the restore's dispatch, so the render
+      // that lands the restored climb is the render that says `restored`; the
+      // `finally` below then changes nothing. LastPickWatcher reads the two
+      // together to tell this change of current from the climber's own.
+      setHydratedScope(hydrationScope);
       restoreQueueSnapshot(snapshot);
     };
     void getStoredSessionId()
       .then(async (storedId) => {
+        if (!isCurrent() || sessionIdRef.current !== null) return;
         if (__DEV__) {
           console.info(`[session] restored from store: ${storedId ?? '(none)'}`);
         }
@@ -122,17 +228,28 @@ export function useQueuePersistence({
           const { sessionStatus } = await getHttpClient().request<SessionStatusQueryResponse>(SESSION_STATUS, {
             sessionId: storedId,
           });
-          if (cancelled) return;
+          if (!isCurrent() || sessionIdRef.current !== null) return;
           if (sessionStatus !== 'active') {
             if (__DEV__) {
               console.info(`[session] stored session ${storedId} ended/missing; clearing`);
             }
+            // A workout run for it is over too (#6903): its last copy and recap
+            // would otherwise wait for a session id that never comes back.
+            // Announced before any await, still under the isCurrent() check above.
+            announceStoredSessionEnded(storedId);
             await clearStoredSessionId();
             await hydrateLocalSnapshot();
             return;
           }
+          // `restored` turns true in the `finally` below, before the session's
+          // queue arrives from the server (the rejoin's FullSync). So a last
+          // pick made while launching into an open crew session is cleared
+          // when that queue lands: LastPickWatcher can't tell it from a
+          // crewmate's newer put-up, which must end the pick. Same for the
+          // offline rejoin below.
           setSessionId(storedId);
         } catch (err) {
+          if (!isCurrent()) return;
           // graphql-request's ClientError always carries `response`; a genuine
           // network failure (fetch reject) doesn't — same structural check as
           // createSessionWithConfig's error handling above.
@@ -153,16 +270,21 @@ export function useQueuePersistence({
           if (__DEV__) {
             console.warn('[session] status check failed; restoring optimistically', err);
           }
-          if (!cancelled) setSessionId(storedId);
+          if (isCurrent() && sessionIdRef.current === null) setSessionId(storedId);
         }
       })
       .finally(() => {
-        if (!cancelled) snapshotHydratedRef.current = true;
+        if (isCurrent()) setHydratedScope(hydrationScope);
       });
     return () => {
       cancelled = true;
     };
-  }, [restoreQueueSnapshot]);
+  }, [restoreQueueSnapshot, ownerUserId, ownerReady, hydrationScope]);
+
+  // Only the clock's time is saved; it is always stamped for the current climb,
+  // so its uuid needs no column of its own. A string, so the save effect's deps
+  // compare by value.
+  const lastCurrentChangeAt = lastCurrentChange ? new Date(lastCurrentChange.changedAt).toISOString() : null;
 
   // Persist the SOLO queue across launches. Only while no session is active —
   // a session's queue is server-owned (the rejoin FullSync restores it) — and
@@ -170,14 +292,98 @@ export function useQueuePersistence({
   // as the clear when the user empties the queue or a session teardown resets
   // it; the debounce coalesces mutation bursts (swipes, clear-queue removals).
   useEffect(() => {
-    if (!snapshotHydratedRef.current || sessionId !== null || !activeBoardSettled) return undefined;
+    if (!ownerReady || hydratedScope !== hydrationScope || sessionId !== null || !activeBoardSettled) return undefined;
+    const snapshotGeneration = getQueueSnapshotGeneration();
+    const generation = getCredentialGeneration();
+    const owner = getCurrentUserStorageOwner() ?? (ownerUserId ? { userId: ownerUserId, authSessionId: '' } : null);
     const persistTimeout = setTimeout(() => {
-      void setStoredQueueSnapshot({
-        queue,
-        currentClimbQueueItem,
-        playlistSuggestionSource,
-      });
+      if (generation !== getCredentialGeneration()) return;
+      void setStoredQueueSnapshot(
+        {
+          queue,
+          currentClimbQueueItem,
+          // Legacy mode keeps no line, and its snapshot keeps today's shape.
+          ...(historyCount == null ? {} : { historyCount }),
+          // Written as the provider holds it, never restamped here: the save
+          // runs after every restore, hydrate and regrade, so a value derived
+          // from the write time would release the hold on the next launch.
+          ...(lastCurrentChangeAt == null ? {} : { lastCurrentChangeAt }),
+          playlistSuggestionSource,
+        },
+        owner,
+        snapshotGeneration,
+      );
     }, SOLO_QUEUE_SAVE_DEBOUNCE_MS);
     return () => clearTimeout(persistTimeout);
-  }, [queue, currentClimbQueueItem, playlistSuggestionSource, sessionId, activeBoardSettled]);
+  }, [
+    queue,
+    currentClimbQueueItem,
+    historyCount,
+    lastCurrentChangeAt,
+    playlistSuggestionSource,
+    sessionId,
+    activeBoardSettled,
+    ownerUserId,
+    ownerReady,
+    hydrationScope,
+    hydratedScope,
+  ]);
+
+  return { restored: hydratedScope === hydrationScope };
+}
+
+let queueSnapshotRestoreReported = false;
+
+/**
+ * `Queue Snapshot Restored` (docs/product/current-climb-outside-queue.md, section 8):
+ * once per launch, what the cold start brought back. `upNextDuplicates` counts
+ * climbs that appear more than once in Up next (the copies F3 stops making), so
+ * it should fall as old solo snapshots age out.
+ */
+function reportQueueSnapshotRestored(
+  snapshot: { queue: ClimbQueueItem[]; currentClimbQueueItem: ClimbQueueItem | null; historyCount?: number | null },
+  lastCurrentChangeAt: number | null,
+  lastCurrentChangeSource: 'snapshot' | 'savedAt',
+): void {
+  if (queueSnapshotRestoreReported) return;
+  queueSnapshotRestoreReported = true;
+  const lineState = {
+    queue: snapshot.queue,
+    currentClimbQueueItem: snapshot.currentClimbQueueItem,
+    historyCount: snapshot.historyCount ?? null,
+  };
+  const currentInQueue =
+    snapshot.currentClimbQueueItem != null &&
+    snapshot.queue.some((item) => item.uuid === snapshot.currentClimbQueueItem?.uuid);
+  const historyCount = Math.max(
+    0,
+    upNextStart(snapshot.queue, snapshot.currentClimbQueueItem, snapshot.historyCount ?? null) -
+      (currentInQueue ? 1 : 0),
+  );
+  const upNext = upNextOf(lineState);
+  track(SHARED_EVENTS.QueueSnapshotRestored, {
+    historyCount,
+    upNextCount: upNext.length,
+    upNextDuplicates: countRepeatedClimbs(upNext),
+    hasCurrent: snapshot.currentClimbQueueItem != null,
+    lastCurrentChangeAgeHours: lastCurrentChangeAt === null ? null : holdAgeHours(lastCurrentChangeAt, nowMs()),
+    lastCurrentChangeSource,
+  });
+}
+
+/** Distinct climbs (by the Now slot's match key) that appear more than once. */
+function countRepeatedClimbs(items: readonly ClimbQueueItem[]): number {
+  const firstCopies: ClimbQueueItem[] = [];
+  const repeated = new Set<ClimbQueueItem>();
+  for (const item of items) {
+    const first = firstCopies.find((candidate) => isSameWallClimb(candidate.climb, item.climb));
+    if (first) repeated.add(first);
+    else firstCopies.push(item);
+  }
+  return repeated.size;
+}
+
+/** Test seam: the once-per-launch guard is module state. */
+export function resetQueueSnapshotRestoredReportForTests(): void {
+  queueSnapshotRestoreReported = false;
 }

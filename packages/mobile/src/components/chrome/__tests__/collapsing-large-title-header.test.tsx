@@ -1,20 +1,50 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi } from 'vitest';
+vi.mock('../../../hooks/use-native-root-header', () => ({ useNativeRootHeader: () => controls.nativeHeader }));
+vi.mock('../../chrome/NativeRootHeader', () => ({
+  NativeRootHeader: ({
+    centerContent,
+    children,
+    opaqueControls,
+    scrollEdge,
+  }: {
+    centerContent?: ReactNode;
+    children?: ReactNode;
+    opaqueControls?: boolean;
+    scrollEdge?: unknown;
+  }) => {
+    controls.nativeScrollEdge = scrollEdge;
+    return createElement(
+      'div',
+      null,
+      createElement('div', { 'data-native-center': 'true' }, centerContent),
+      createElement('div', { 'data-native-controls': 'true', 'data-opaque': String(opaqueControls) }, children),
+    );
+  },
+}));
+import { beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
+
+const controls = vi.hoisted(() => ({
+  nativeHeader: false,
+  // The scroll-edge store the native header was handed.
+  nativeScrollEdge: undefined as unknown,
+}));
 
 type ViewMockProps = {
   children?: ReactNode;
   onLayout?: (event: { nativeEvent: { layout: { height: number } } }) => void;
   pointerEvents?: string;
+  style?: unknown;
 };
 vi.mock('react-native', () => ({
-  View: ({ children, onLayout, pointerEvents }: ViewMockProps) =>
+  View: ({ children, onLayout, pointerEvents, style }: ViewMockProps) =>
     createElement(
       'div',
       {
         'data-has-layout': onLayout ? 'true' : 'false',
         'data-pointer': pointerEvents ?? '',
+        'data-style': JSON.stringify(Object.assign({}, ...[style].flat(10).filter(Boolean))),
         onClick: onLayout ? () => onLayout({ nativeEvent: { layout: { height: 72 } } }) : undefined,
       },
       children,
@@ -45,7 +75,7 @@ vi.mock('../../../hooks/use-native-glass', () => ({ useNativeGlass: () => false 
 // ProgressiveBlur renders the iOS blur path under this mode (short-circuits the
 // native a11y / glass-capability hooks it would otherwise pull in).
 vi.mock('../../../hooks/use-effective-surface-mode', () => ({ useEffectiveSurfaceMode: () => 'blur' }));
-vi.mock('../../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 4: 16 }, shadows: { sm: {} } }));
+vi.mock('../../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 4: 16, 6: 24 }, shadows: { sm: {} } }));
 vi.mock('../GlassActionToolbar', () => ({ TOP_ACTION_SIZE: 48 }));
 vi.mock('../../GlassSurface', () => ({ GlassSurface: () => createElement('div', { 'data-glass': 'true' }) }));
 vi.mock('../../PressableSurface', () => ({
@@ -64,6 +94,7 @@ vi.mock('../../Text', () => ({
 }));
 
 import { CollapsingLargeTitleHeader } from '../CollapsingLargeTitleHeader';
+import { createScrollEdgeBackdrop } from '../../../hooks/use-scroll-edge-backdrop';
 
 function makeProps(over: Partial<Parameters<typeof CollapsingLargeTitleHeader>[0]> = {}) {
   return {
@@ -73,6 +104,69 @@ function makeProps(over: Partial<Parameters<typeof CollapsingLargeTitleHeader>[0
 }
 
 describe('CollapsingLargeTitleHeader', () => {
+  it('passes disclosed controls together with the reserved native controls', () => {
+    controls.nativeHeader = true;
+    const { container } = render(
+      <CollapsingLargeTitleHeader {...makeProps()}>
+        <span>Persistent filters</span>
+        <button>Grade row</button>
+      </CollapsingLargeTitleHeader>,
+    );
+    expect(container.querySelector('[data-native-controls]')?.textContent).toBe('Persistent filtersGrade row');
+  });
+
+  beforeEach(() => {
+    controls.nativeHeader = false;
+    controls.nativeScrollEdge = undefined;
+  });
+
+  it('passes the interactive center to the native bar separately from supplementary controls', () => {
+    controls.nativeHeader = true;
+    const { container } = render(
+      <CollapsingLargeTitleHeader {...makeProps({ centerContent: <button>On the wall</button> })}>
+        <span>Profile segments</span>
+      </CollapsingLargeTitleHeader>,
+    );
+
+    expect(container.querySelector('[data-native-center]')?.textContent).toBe('On the wall');
+    expect(container.querySelector('[data-native-controls]')?.textContent).toBe('Profile segments');
+    expect(container.querySelectorAll('button')).toHaveLength(1);
+  });
+
+  it.each([
+    [true, 'true'],
+    [undefined, 'undefined'],
+  ] as const)('hands the opaque-controls opt-out (%s) to the native header', (opaqueControls, received) => {
+    controls.nativeHeader = true;
+    const { container } = render(
+      <CollapsingLargeTitleHeader {...makeProps({ opaqueControls })}>
+        <span>Profile segments</span>
+      </CollapsingLargeTitleHeader>,
+    );
+
+    expect(container.querySelector('[data-native-controls]')?.getAttribute('data-opaque')).toBe(received);
+  });
+
+  // The store the screen's list writes to. Left out, the native header keeps its
+  // blur always on; see NativeRootHeader.
+  it("hands the native header the screen's scroll-edge store, untouched", () => {
+    controls.nativeHeader = true;
+    const scrollEdge = createScrollEdgeBackdrop();
+    const { rerender } = render(
+      <CollapsingLargeTitleHeader {...makeProps({ scrollEdge })}>
+        <span>Profile segments</span>
+      </CollapsingLargeTitleHeader>,
+    );
+    expect(controls.nativeScrollEdge).toBe(scrollEdge);
+
+    rerender(
+      <CollapsingLargeTitleHeader {...makeProps()}>
+        <span>Profile segments</span>
+      </CollapsingLargeTitleHeader>,
+    );
+    expect(controls.nativeScrollEdge).toBeUndefined();
+  });
+
   it('renders the leftActions / rightActions / children slots when provided', () => {
     const { container } = render(
       <CollapsingLargeTitleHeader
@@ -128,6 +222,31 @@ describe('CollapsingLargeTitleHeader', () => {
     // progressive-blur.test.tsx.
     expect(container.querySelector('[data-testid="masked-view"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="blur-view"]')).not.toBeNull();
+  });
+
+  it('measures disclosed controls without remounting persistent controls', () => {
+    const onHeightChange = vi.fn();
+    const props = makeProps({ onHeightChange });
+    // Keep the same child slots while disclosure changes, as ClimbTopChrome does.
+    const header = (gradeVisible: boolean) => (
+      <CollapsingLargeTitleHeader {...props}>
+        <input aria-label="Search" defaultValue="project" />
+        {gradeVisible ? <button>Grade row</button> : null}
+      </CollapsingLargeTitleHeader>
+    );
+    const { container, rerender, getByText, queryByText } = render(header(false));
+    const search = container.querySelector('input')!;
+    const measure = () => container.querySelector('[data-has-layout="true"]')!;
+    fireEvent.click(measure());
+    onHeightChange.mockClear();
+    rerender(header(true));
+    expect(measure().contains(getByText('Grade row'))).toBe(true);
+    expect(container.querySelector('input')).toBe(search);
+    fireEvent.click(measure());
+    expect(onHeightChange).toHaveBeenLastCalledWith(72);
+    rerender(header(false));
+    expect(queryByText('Grade row')).toBeNull();
+    expect(container.querySelector('input')).toBe(search);
   });
 
   it('reports its measured height through onHeightChange (container onLayout)', () => {

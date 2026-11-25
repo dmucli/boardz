@@ -2,7 +2,7 @@ import { Platform } from 'react-native';
 import * as Application from 'expo-application';
 import type { RefObject } from 'react';
 import type { FeedbackMetadataReader } from './FeedbackMetadataCollector';
-import { useMutation } from '@tanstack/react-query';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   SUBMIT_APP_FEEDBACK,
   type SubmitAppFeedbackMutationResponse,
@@ -11,10 +11,13 @@ import {
 import type { SubmitAppFeedbackInput } from '@boardsesh/shared-schema';
 import { getHttpClient } from '../graphql/client';
 import { buildMobileFeedbackEnrichment } from './feedback-enrichment';
+import { readMobileReleaseContext } from '../release-context';
+import { requestReport } from '../graphql/request-report';
+import { bugReportQueryKeys } from './bug-report-query-keys';
 
 export type MobileSubmitAppFeedbackPayload = Omit<
   SubmitAppFeedbackInput,
-  'platform' | 'appVersion' | 'boardName' | 'layoutId' | 'sizeId' | 'setIds' | 'angle' | 'context'
+  'platform' | 'appVersion' | 'boardName' | 'layoutId' | 'sizeId' | 'setIds' | 'angle' | 'context' | 'releaseContext'
 >;
 
 /**
@@ -36,11 +39,17 @@ export function getNativeAppVersion(): string | null {
 
 async function submitMobileAppFeedback(payload: SubmitAppFeedbackInput): Promise<boolean> {
   const variables: SubmitAppFeedbackMutationVariables = { input: payload };
-  const response = await getHttpClient().request<SubmitAppFeedbackMutationResponse>(SUBMIT_APP_FEEDBACK, variables);
+  const response = await requestReport(
+    (requestVariables: SubmitAppFeedbackMutationVariables) =>
+      getHttpClient().request<SubmitAppFeedbackMutationResponse>(SUBMIT_APP_FEEDBACK, requestVariables),
+    variables,
+    'SubmitAppFeedbackInput',
+  );
   return response.submitAppFeedback;
 }
 
 export function useSubmitMobileAppFeedback(readerRef: RefObject<FeedbackMetadataReader | null>) {
+  const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (payload: MobileSubmitAppFeedbackPayload): Promise<boolean> => {
       const readMetadata = readerRef.current;
@@ -53,7 +62,13 @@ export function useSubmitMobileAppFeedback(readerRef: RefObject<FeedbackMetadata
         ...enrichment,
         platform: getMobilePlatform(),
         appVersion: getNativeAppVersion(),
+        releaseContext: readMobileReleaseContext(),
       });
+    },
+    onSuccess: (_, payload) => {
+      if (payload.source === 'shake-bug' || payload.source === 'drawer-bug') {
+        void queryClient.invalidateQueries({ queryKey: bugReportQueryKeys.all });
+      }
     },
   });
 }

@@ -69,7 +69,7 @@ const RAIL_COUNT_WORDS: Record<string, RegExp> = {
 
 const SUPPORT_COPY_KEYS = [
   'support.hero.title',
-  'support.hero.subtitle',
+  'funding.body',
   'support.promise',
   'support.why.p1',
   'support.why.p2',
@@ -78,6 +78,16 @@ const SUPPORT_COPY_KEYS = [
   'support.sponsors.cta',
   'support.oneTime.body',
   'support.oneTime.cta',
+  // The monthly-first layout, shown once SUPPORT_MONTHLY_LINKS_* is set.
+  'support.hero.ctaMonthly',
+  'support.chooser.perMonth',
+  'support.chooser.monthly',
+  'support.chooser.once',
+  'support.chooser.monthlyBody',
+  'support.chooser.publicName',
+  'support.chooser.manage',
+  'support.thanksState.title',
+  'support.thanksState.body',
   // "Other ways to help" is the non-monetary column. It is the copy most likely
   // to drift into promising something back, so every string on it is listed.
   'support.otherWays.title',
@@ -102,18 +112,29 @@ const SUPPORT_COPY_KEYS = [
   // `support.otherWays.*` titles above rather than duplicating them.
   'home.support.eyebrow',
   'home.support.title',
-  'home.support.p1',
-  'home.support.p2',
   'home.support.chipIn',
   'home.support.source',
   'home.support.otherWays',
+  // The monthly banner on the homepage.
+  'home.supportBanner.text',
+  'home.supportBanner.cta',
 ];
 
 describe.each(Object.keys(NOT_TAX_DEDUCTIBLE))('%s donation disclosure', (locale) => {
   const catalog = loadMarketing(locale);
 
-  it('says donations are not tax-deductible', () => {
+  // Both layouts render the same small print.
+  it('says donations are not tax-deductible in the shared small print', () => {
     expect(readString(catalog, 'support.honesty.p1')).toMatch(NOT_TAX_DEDUCTIBLE[locale]);
+  });
+
+  // A monthly button's label is the env's amount only ("A$5"); this template
+  // adds the cadence in the visitor's language. Losing the placeholder would
+  // drop the amount from every button.
+  it('wraps the monthly amount in a per-month template', () => {
+    const template = readString(catalog, 'support.chooser.perMonth');
+    expect(template).toContain('{{amount}}');
+    expect(template.replace('{{amount}}', '').trim().length).toBeGreaterThan(0);
   });
 
   it('promises nothing in return for a donation', () => {

@@ -121,7 +121,7 @@ under `fastlane/metadata/android/<locale>/changelogs/default.txt`.
 
 After Play accepts a `main` candidate, the same run publishes the exact signed
 arm64 sideload APK as the newest **Boardsesh Android Beta** GitHub prerelease.
-See `docs/android-sideload-build.md` for the one-time Play bootstrap and signing
+See `docs/operations/android-sideload-build.md` for the one-time Play bootstrap and signing
 details.
 
 The Play AAB comes from `.github/workflows/android-apk-rn.yml` (native changes on
@@ -223,7 +223,7 @@ Go to **Policy > App content > Data safety** and fill out Google's data safety q
 
 - **Does your app collect or share any of the required user data types?** Yes
 - **Is all of the user data collected by your app encrypted in transit?** Yes (HTTPS)
-- **Do you provide a way for users to request that their data is deleted?** Yes (Settings > Delete Account)
+- **Do you provide a way for users to request that their data is deleted?** Yes (Settings → Account → Delete account)
 - **Does your app follow Google Play's Families Policy?** No (not a children's app)
 
 ### Data collected

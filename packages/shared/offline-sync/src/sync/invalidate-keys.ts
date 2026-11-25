@@ -14,6 +14,11 @@
  * queries only, so the cost of a correct key is bounded to what is on screen.
  * The pull client already gates the whole loop on `totalProcessed > 0`, so a
  * cycle that moved zero rows invalidates nothing at all.
+ *
+ * "On screen" is still not free. A climb list is an infinite query, so one
+ * invalidation re-reads every page it has loaded, in sequence, and cancels a
+ * next-page fetch in flight. The heads in `BOARD_SCOPED_KEY_HEADS` are therefore
+ * narrowed to the board whose rows changed (`scopedInvalidateFilters`).
  */
 export type InvalidateKeys = readonly (readonly string[])[];
 
@@ -36,6 +41,8 @@ export const TABLE_INVALIDATE_KEYS: Record<string, InvalidateKeys> = {
   //   what the list filters and sorts by, so a pulled or drained tick moves
   //   climbs between grade bands. Without these keys the list keeps showing a
   //   re-graded climb in the band it just left.
+  // ['sessionWorkouts'] — a session's workout blocks (#6903) are tallied from
+  //   its ticks on read, so a tick landing, edited or deleted moves them.
   boardsesh_ticks: [
     ['logbook'],
     ['localTicks'],
@@ -46,7 +53,12 @@ export const TABLE_INVALIDATE_KEYS: Record<string, InvalidateKeys> = {
     ['searchClimbs'],
     ['infiniteSearchClimbs'],
     ['searchClimbsCount'],
+    ['sessionWorkouts'],
   ],
+
+  // ['sessionWorkouts'] / ['sessionWorkoutHeadlines'] — the workout a session
+  //   was climbed to (#6903): its summary, detail and feed-card line.
+  session_workouts: [['sessionWorkouts'], ['sessionWorkoutHeadlines']],
 
   // ['userPlaylists'] — the owned-playlist list (use-mobile-climb-actions-data).
   // ['playlistClimbs'] — a playlist's climb rows (@boardsesh/playlists-react).
@@ -57,10 +69,22 @@ export const TABLE_INVALIDATE_KEYS: Record<string, InvalidateKeys> = {
   user_playlist_pins: [['userPlaylists'], ['playlist']],
 
   // ['searchClimbs'] / ['infiniteSearchClimbs'] — the heart on each list row.
+  // ['searchClimbsCount'] — the Liked collection's filtered result count.
   // ['favoriteStatus'] — the per-climb heart, which must refetch AFTER a queued
   //   favorite lands: the optimistic write at enqueue time can otherwise be
   //   overwritten by a network refetch that raced the drain.
-  user_favorites: [['searchClimbs'], ['infiniteSearchClimbs'], ['favoriteStatus']],
+  // ['smartPlaylist', 'LIKED_CLIMBS'] / ['mySmartPlaylistCounts'] — the Liked
+  //   smart list and its library-card count, which must drop an un-liked climb
+  //   once the toggle lands (otherwise Play drains a fresh list that no longer
+  //   holds the rows on screen, #5304).
+  user_favorites: [
+    ['searchClimbs'],
+    ['infiniteSearchClimbs'],
+    ['searchClimbsCount'],
+    ['favoriteStatus'],
+    ['smartPlaylist', 'LIKED_CLIMBS'],
+    ['mySmartPlaylistCounts'],
+  ],
 
   // Follow changes affect Following searches on every board. This platform-neutral
   // table map knows query prefixes, not each client's filter-bearing key shape,
@@ -107,6 +131,11 @@ export const TABLE_INVALIDATE_KEYS: Record<string, InvalidateKeys> = {
   // ['similarClimbs'] / ['holdHeatmap'] — answered on device from board_climbs
   // joined to the derived holds index (holds-index/), so a climb arriving,
   // changing or being hidden changes the strip and the heatmap.
+  //
+  // ['localClimbArt'] / ['localTicks', 'activity'] — Home's projects shelf
+  //   (#7691) draws its rows from board_climbs' frames, and its tick read joins
+  //   board_climbs for each climb's name and layout. A board downloaded after
+  //   the shelf first drew must fill in the blank tiles and "Unknown climb".
   board_climbs: [
     ['searchClimbs'],
     ['infiniteSearchClimbs'],
@@ -115,6 +144,8 @@ export const TABLE_INVALIDATE_KEYS: Record<string, InvalidateKeys> = {
     ['setterStats'],
     ['similarClimbs'],
     ['holdHeatmap'],
+    ['localClimbArt'],
+    ['localTicks', 'activity'],
   ],
   // The setter picker reads stats too, on Woods only: a climb set at another angle
   // counts toward its setter at the browsed angle once it has a stats row there
@@ -154,9 +185,9 @@ export const TABLE_INVALIDATE_KEYS: Record<string, InvalidateKeys> = {
   // A wall's holds and photo are read back through the spray wall registry
   // (`packages/mobile/src/lib/spray/spray-wall-registry.ts`, SW-07 / #5440),
   // which is a plain map the render path reads synchronously and which carries
-  // its own subscription — there is no query key to bust. The climb-facing
-  // halves of a reset (the badge, the Intact / Lost-holds filter) ride on
-  // `board_climbs.missing_hold_count` and are already covered by that table's
+  // its own subscription — there is no query key to bust. The climb-facing half
+  // of a hold edit (a published climb that lost a hold gets its badge) rides
+  // on `board_climbs.missing_hold_count` and is already covered by that table's
   // keys above. Give this real keys if a wall ever grows a React Query surface.
   spray_walls: [],
 };
@@ -177,8 +208,20 @@ export function invalidateKeysForTable(tableName: string): InvalidateKeys | null
  * say to another board's entry, and the heatmap's aggregate is the most
  * expensive read on the device — re-running it for a board nobody is looking at
  * on every sync page is pure cost.
+ *
+ * The three climb-search heads are here for the same reason, at a higher price
+ * (#6302): every key is `[head, ClimbSearchInput, viewerId?]`, and a pull of one
+ * spray wall used to refetch the Kilter list on screen once per table. A list
+ * reads SQLite only when its own `boardName:layoutId:sizeId` is a downloaded
+ * scope, so rows landing for any other board cannot change what it shows.
  */
-const BOARD_SCOPED_KEY_HEADS: ReadonlySet<string> = new Set(['holdHeatmap', 'similarClimbs']);
+const BOARD_SCOPED_KEY_HEADS: ReadonlySet<string> = new Set([
+  'holdHeatmap',
+  'similarClimbs',
+  'searchClimbs',
+  'infiniteSearchClimbs',
+  'searchClimbsCount',
+]);
 
 export type BoardScopeKey = { boardType: string; layoutId: number };
 

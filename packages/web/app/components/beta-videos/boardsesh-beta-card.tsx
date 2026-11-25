@@ -1,15 +1,16 @@
 'use client';
 
 import React, { useCallback, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import Instagram from '@mui/icons-material/Instagram';
 import { track } from '@/app/lib/analytics';
 import type { BetaLink } from '@/app/lib/api-wrappers/sync-api-types';
-import { isInstagramUrl, isTikTokUrl } from '@/app/lib/beta-video-url';
 import LocaleLink from '@/app/components/i18n/locale-link';
+import { betaLinkPlatform } from './beta-link-platform';
 import TikTokIcon from './tiktok-icon';
 import styles from './boardsesh-beta.module.css';
 
-type BoardseshBetaCardSource = 'home' | 'drawer' | 'profile';
+export type BoardseshBetaCardSource = 'home' | 'drawer' | 'profile';
 
 type BoardseshBetaCardProps = {
   link: BetaLink;
@@ -46,6 +47,7 @@ const BoardseshBetaCard: React.FC<BoardseshBetaCardProps> = ({
   source = 'drawer',
   priority = false,
 }) => {
+  const { t } = useTranslation('common');
   const [thumbnailFailed, setThumbnailFailed] = useState(false);
   // A cached failure can finish before hydration attaches onError. Inspect the
   // actual image when React attaches it so SSR failures get the same fallback.
@@ -53,16 +55,8 @@ const BoardseshBetaCard: React.FC<BoardseshBetaCardProps> = ({
     if (image?.complete && image.naturalWidth === 0) setThumbnailFailed(true);
   }, []);
   const thumbnailSrc = !thumbnailFailed ? link.thumbnail : null;
-  const isTikTok = isTikTokUrl(link.link);
-  const isInstagram = !isTikTok && isInstagramUrl(link.link);
-  const PlatformIcon = isTikTok ? TikTokIcon : Instagram;
-  const displayPlatform = isTikTok ? 'TikTok' : 'Instagram';
-  let analyticsPlatform: 'TikTok' | 'Instagram' | 'Unknown' = 'Unknown';
-  if (isTikTok) {
-    analyticsPlatform = 'TikTok';
-  } else if (isInstagram) {
-    analyticsPlatform = 'Instagram';
-  }
+  const { displayPlatform, analyticsPlatform } = betaLinkPlatform(link.link);
+  const PlatformIcon = displayPlatform === 'TikTok' ? TikTokIcon : Instagram;
 
   const climbLabel = climbName?.trim() ? climbName : null;
   const climbHrefEffective = climbLabel && climbHref ? climbHref : null;
@@ -71,17 +65,41 @@ const BoardseshBetaCard: React.FC<BoardseshBetaCardProps> = ({
     (link.foreign_username ? ` by ${link.foreign_username}` : '') +
     (climbLabel ? ` for ${climbLabel}` : '');
 
-  return (
-    <article className={styles.card}>
-      <div className={styles.thumbnailWrapper}>
+  const opensClimb = source === 'home' && Boolean(climbHrefEffective);
+  const mainHref = opensClimb && climbHrefEffective ? climbHrefEffective : link.link;
+  if (!thumbnailSrc) {
+    if (source === 'home') return null;
+    return (
+      <article className={`${styles.card} ${styles.textCard}`}>
         <a
           href={link.link}
           target="_blank"
           rel="noopener noreferrer"
-          className={styles.bodyLink}
-          aria-label={ariaLabel}
+          className={styles.textLink}
           onClick={() =>
-            track('Beta Video Link Clicked', {
+            track('Beta Video Link Clicked', { platform: analyticsPlatform, climbUuid: link.climb_uuid, source })
+          }
+        >
+          {link.foreign_username
+            ? t('betaVideos.openVideo', { creator: link.foreign_username, platform: displayPlatform })
+            : t('betaVideos.watchOn', { platform: displayPlatform })}
+        </a>
+      </article>
+    );
+  }
+
+  return (
+    <article className={styles.card}>
+      <div className={styles.thumbnailWrapper}>
+        <LocaleLink
+          href={mainHref}
+          prefetch={false}
+          target={opensClimb ? undefined : '_blank'}
+          rel={opensClimb ? undefined : 'noopener noreferrer'}
+          className={styles.bodyLink}
+          aria-label={opensClimb ? t('betaVideos.openClimb', { climb: climbLabel }) : ariaLabel}
+          onClick={() =>
+            track(opensClimb ? 'Beta Video Climb Clicked' : 'Beta Video Link Clicked', {
               platform: analyticsPlatform,
               climbUuid: link.climb_uuid,
               source,
@@ -89,28 +107,34 @@ const BoardseshBetaCard: React.FC<BoardseshBetaCardProps> = ({
             })
           }
         >
-          {thumbnailSrc ? (
-            <img
-              ref={checkThumbnail}
-              src={thumbnailSrc}
-              alt={`Beta by ${link.foreign_username || 'unknown'}`}
-              className={styles.thumbnail}
-              loading={priority ? 'eager' : 'lazy'}
-              fetchPriority={priority ? 'high' : undefined}
-              referrerPolicy="no-referrer"
-              onError={() => setThumbnailFailed(true)}
-            />
-          ) : (
-            <div className={styles.thumbnailPlaceholder}>
-              <PlatformIcon sx={{ fontSize: 28, color: 'var(--neutral-400)' }} />
-            </div>
-          )}
+          <img
+            ref={checkThumbnail}
+            src={thumbnailSrc}
+            alt={`Beta by ${link.foreign_username || 'unknown'}`}
+            className={styles.thumbnail}
+            loading={priority ? 'eager' : 'lazy'}
+            fetchPriority={priority ? 'high' : undefined}
+            referrerPolicy="no-referrer"
+            onError={() => setThumbnailFailed(true)}
+          />
           <span className={styles.platformBadge} aria-label={`From ${displayPlatform}`}>
             <PlatformIcon sx={{ fontSize: 12 }} />
           </span>
-          {link.foreign_username && <span className={styles.userChip}>@{link.foreign_username}</span>}
-        </a>
-        {climbLabel &&
+          {!opensClimb && link.foreign_username && <span className={styles.userChip}>@{link.foreign_username}</span>}
+        </LocaleLink>
+        {opensClimb && link.foreign_username && (
+          <a
+            href={link.link}
+            target="_blank"
+            rel="noopener noreferrer"
+            className={styles.userChip}
+            aria-label={t('betaVideos.openVideo', { creator: link.foreign_username, platform: displayPlatform })}
+          >
+            @{link.foreign_username}
+          </a>
+        )}
+        {source !== 'home' &&
+          climbLabel &&
           (climbHrefEffective ? (
             <LocaleLink
               href={climbHrefEffective}

@@ -71,6 +71,19 @@ wait_for_postgres
 [[ "$(docker exec "$CONTAINER_NAME" printenv PGDATA)" == '/var/lib/postgresql/18/docker' ]]
 docker exec "$CONTAINER_NAME" test -f /var/lib/postgresql/18/docker/.boardsesh-dev-db-ready
 
+python3 "$REPOSITORY_ROOT/scripts/audit_reporting_tzdata.py" "$CONTAINER_NAME" main
+
+# The seeded image must include the same narrow helper prerequisite as live
+# migrations, without handing the runtime login broad statistics visibility.
+# shellcheck source=scripts/lib/postgres-sync-cutoff.sh
+source "$REPOSITORY_ROOT/scripts/lib/postgres-sync-cutoff.sh"
+cutoff_contract="$(boardsesh_sync_cutoff_contract_sql boardsesh_runtime | \
+  docker exec -i "$CONTAINER_NAME" psql -X -Atq -v ON_ERROR_STOP=1 -U postgres -d main)"
+[[ "$cutoff_contract" == 't' ]] || {
+  printf 'Seeded deletion cutoff helper has an unsafe owner/body/ACL contract\n' >&2
+  exit 1
+}
+
 docker exec -i "$CONTAINER_NAME" psql -X -v ON_ERROR_STOP=1 -U postgres -d main \
   -v expected_migration_count="$EXPECTED_MIGRATION_COUNT" \
   -v expected_postgis_version="$EXPECTED_POSTGIS_VERSION" <<'SQL'
@@ -111,7 +124,7 @@ BEGIN
     RAISE EXCEPTION 'seeded test user is missing';
   END IF;
   -- Catalogue coverage. The image is seeded from the published board snapshots
-  -- (docs/board-snapshots.md), so "board_climbs is not empty" no longer says
+  -- (docs/data/board-snapshots.md), so "board_climbs is not empty" no longer says
   -- much: a load that stopped after the first layout would still pass it. Assert
   -- the shape a developer actually needs instead.
   SELECT count(*) INTO climb_count FROM board_climbs;
@@ -165,12 +178,13 @@ BEGIN
 
   -- The legacy Aurora tables exist only as empty stubs during the build, so the
   -- journal can apply to a bare cluster; 0038 must have dropped every one.
-  -- The live wall mapping is current application data, not a legacy catalogue.
+  -- The live wall mapping is current application data, not a legacy catalogue,
+  -- and kilter_aurora_benchmarks is a frozen record added long after 0038.
   IF EXISTS (
     SELECT 1 FROM pg_tables
     WHERE schemaname = 'public'
       AND (tablename LIKE 'kilter\_%' OR tablename LIKE 'tension\_%')
-      AND tablename <> 'kilter_wall_sources'
+      AND tablename NOT IN ('kilter_wall_sources', 'kilter_aurora_benchmarks')
   ) THEN
     RAISE EXCEPTION 'legacy kilter_*/tension_* tables survived into the image';
   END IF;
@@ -194,6 +208,10 @@ BEGIN
   -- not ours to ALTER — exclude it the way
   -- scripts/postgres18-production-role-transition.sh already does, by
   -- pg_depend.deptype = 'e', rather than by name.
+  -- The reviewed 0322 lifecycle, 0335 reporting alias, and 0338 spray exposure
+  -- trigger bodies qualify their public relations and pin pg_catalog alone.
+  -- Keep the exact tuples aligned with the credential-writer and auth-web ACL
+  -- audits. A name or NULL configuration never grants an exception.
   IF EXISTS (
     SELECT 1
     FROM pg_catalog.pg_proc AS procedure
@@ -205,11 +223,28 @@ BEGIN
         WHERE dependency.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
           AND dependency.objid = procedure.oid AND dependency.deptype = 'e'
       )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM pg_catalog.unnest(coalesce(procedure.proconfig, '{}'::text[])) AS configured(setting)
-        WHERE pg_catalog.regexp_replace(configured.setting, '[[:space:]]+', '', 'g') =
-          'search_path=public,pg_catalog'
+      AND NOT (
+        EXISTS (
+          SELECT 1
+          FROM pg_catalog.unnest(coalesce(procedure.proconfig, '{}'::text[])) AS configured(setting)
+          WHERE pg_catalog.regexp_replace(configured.setting, '[[:space:]]+', '', 'g') =
+            'search_path=public,pg_catalog'
+        )
+        OR (
+          coalesce(procedure.proconfig, '{}'::text[]) = ARRAY['search_path=pg_catalog']::text[]
+          AND procedure.pronargs = 0 AND procedure.prosecdef
+          AND procedure.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'plpgsql')
+          AND (procedure.proname, pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(procedure.prosrc, 'UTF8')), 'hex')) IN (
+            ('partner_account_deletion_events', '467385c20855be8979e184cdbce603d51328d25d6de64003b48b2279a10af7b5'),
+            ('partner_connection_lifecycle_events', '958d841f4c621cf8cadcccffd06677da569654bd997ce5e87383776511c09c6e'),
+            ('revoke_gym_reporting_aliases_on_board_move', 'f645b67ae38be89b9af89bf000c68336c1d24e85e2335a32ecc79eebfddab243'),
+            ('spray_exposure_board_change', 'a5b9a6a15fa9b642b3a82d0557a8ea509fbb52e42a59386342a05a07e5161cbd'),
+            ('spray_exposure_climb_change', '3e76949ad298804cc6bbdebc6d4329402d412889f74c8a8f4a06edb3976b28d6'),
+            ('spray_exposure_policy_change', '22393e7eb8135ed6b1a3a9c04fcd823d9bac91a102dd4bcc30326d7047dbf8ea'),
+            ('spray_exposure_version_change', '8d4162050782726866cdb54d9715ba184eb772404ad393b356e4c0fe8f0c13fb'),
+            ('spray_exposure_wall_change', '60827d130962aa8daa73ffbdb838c44d643a99ac25c19d1c7f47b1453adc8b42')
+          )
+        )
       )
   ) THEN
     RAISE EXCEPTION 'trigger function(s) in public do not pin search_path to public, pg_catalog: % (#4699)',
@@ -223,11 +258,28 @@ BEGIN
            WHERE dependency.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
              AND dependency.objid = procedure.oid AND dependency.deptype = 'e'
          )
-         AND NOT EXISTS (
-           SELECT 1
-           FROM pg_catalog.unnest(coalesce(procedure.proconfig, '{}'::text[])) AS configured(setting)
-           WHERE pg_catalog.regexp_replace(configured.setting, '[[:space:]]+', '', 'g') =
-             'search_path=public,pg_catalog'
+         AND NOT (
+           EXISTS (
+             SELECT 1
+             FROM pg_catalog.unnest(coalesce(procedure.proconfig, '{}'::text[])) AS configured(setting)
+             WHERE pg_catalog.regexp_replace(configured.setting, '[[:space:]]+', '', 'g') =
+               'search_path=public,pg_catalog'
+           )
+           OR (
+             coalesce(procedure.proconfig, '{}'::text[]) = ARRAY['search_path=pg_catalog']::text[]
+             AND procedure.pronargs = 0 AND procedure.prosecdef
+             AND procedure.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'plpgsql')
+             AND (procedure.proname, pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(procedure.prosrc, 'UTF8')), 'hex')) IN (
+               ('partner_account_deletion_events', '467385c20855be8979e184cdbce603d51328d25d6de64003b48b2279a10af7b5'),
+               ('partner_connection_lifecycle_events', '958d841f4c621cf8cadcccffd06677da569654bd997ce5e87383776511c09c6e'),
+               ('revoke_gym_reporting_aliases_on_board_move', 'f645b67ae38be89b9af89bf000c68336c1d24e85e2335a32ecc79eebfddab243'),
+               ('spray_exposure_board_change', 'a5b9a6a15fa9b642b3a82d0557a8ea509fbb52e42a59386342a05a07e5161cbd'),
+               ('spray_exposure_climb_change', '3e76949ad298804cc6bbdebc6d4329402d412889f74c8a8f4a06edb3976b28d6'),
+               ('spray_exposure_policy_change', '22393e7eb8135ed6b1a3a9c04fcd823d9bac91a102dd4bcc30326d7047dbf8ea'),
+               ('spray_exposure_version_change', '8d4162050782726866cdb54d9715ba184eb772404ad393b356e4c0fe8f0c13fb'),
+               ('spray_exposure_wall_change', '60827d130962aa8daa73ffbdb838c44d643a99ac25c19d1c7f47b1453adc8b42')
+             )
+           )
          ));
   END IF;
   -- Fail closed: an empty inventory would satisfy the assertion above without

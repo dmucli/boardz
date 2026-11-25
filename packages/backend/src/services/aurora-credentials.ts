@@ -8,7 +8,7 @@ import {
   providerSyncControls,
   userBoardMappings,
 } from '@boardsesh/db/schema';
-import { rotateLinkGeneration, setPendingProviderSyncRun } from '@boardsesh/db/queries';
+import { clearDeletedUpstreamPlaylists, rotateLinkGeneration, setPendingProviderSyncRun } from '@boardsesh/db/queries';
 import type { BackgroundJobFamily } from '@boardsesh/db/background-jobs';
 import { AURORA_BOARDS, type AuroraBoardName } from '@boardsesh/shared-schema';
 import {
@@ -93,8 +93,8 @@ export function providerSyncFamily(
 /**
  * Queue an interactive sync of one link inside the caller's transaction, and
  * point the control row's `pending_run_id` at it. Returns null, and queues
- * nothing, while the board's family is not listed in `BATCH_FAMILIES_ENABLED`:
- * until then the daemons are the only thing syncing, exactly as before.
+ * nothing, while the board's family is named in the `BATCH_FAMILIES_DISABLED`
+ * kill switch.
  *
  * Transactional on purpose: the job commits with the link. A throw anywhere
  * after this call rolls back the credential, the new generation and the job
@@ -505,6 +505,8 @@ export async function saveAuroraCredential(input: {
     });
   });
 
+  await notifyAuroraCredentialChange();
+
   return {
     boardType: input.boardType,
     auroraUsername: input.username,
@@ -732,12 +734,17 @@ export async function deleteAuroraCredential(
     await tx
       .delete(userBoardMappings)
       .where(and(eq(userBoardMappings.userId, userId), eq(userBoardMappings.boardType, boardType)));
+    // The circuits the climber deleted in Boardsesh stay skipped while the
+    // account is linked (#7240). Unlinking is the deliberate reset: a later
+    // re-link imports every circuit the account has, the deleted ones too.
+    await clearDeletedUpstreamPlaylists(tx, userId, boardType);
     return encryptedRefreshToken;
   });
   // After the commit: the link is gone locally whatever Keycloak answers, and a
   // failed revocation is reported, not rolled back.
   const localRevocationSucceeded = await revokeKilterRefreshToken(refreshTokenToRevoke);
   if (boardType === KILTER_BOARD_TYPE) await notifyKilterCredentialChange();
+  else await notifyAuroraCredentialChange();
 
   if (!localRevocationSucceeded) {
     return { success: false, localCleared: true, reason: 'revocation_failed' };
@@ -753,5 +760,15 @@ async function notifyKilterCredentialChange(): Promise<void> {
     await kilterLiveSync.credentialsChanged();
   } catch {
     logger.warn('[KilterLive] Credential change notification failed');
+  }
+}
+
+async function notifyAuroraCredentialChange(): Promise<void> {
+  if (process.env.AURORA_LIVE_SYNC_ENABLED !== '1') return;
+  try {
+    const { auroraLiveSync } = await import('./aurora-live-sync');
+    await auroraLiveSync.credentialsChanged();
+  } catch {
+    logger.warn('[AuroraLive] Credential change notification failed');
   }
 }

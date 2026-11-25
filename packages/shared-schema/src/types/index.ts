@@ -29,3 +29,16 @@ export * from './sync';
 export * from './location-sync-admin';
 export * from './gym-owner-reassign';
 export * from './hold-outline-overrides';
+export * from './user-data-export';
+export * from './privacy';
+export * from './analytics-consent';
+export * from './oauth-clients';
+export * from './admin-partner-apps';
+export * from './partner-webhooks';
+export * from './connected-apps';
+export * from './apple-ads-attribution';
+export * from './release-context';
+
+export * from './admin-boards';
+export * from './cnc-packs';
+export * from './directory-reports';

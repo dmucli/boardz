@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // The two things `useReportClimb` owes its callers, neither visible in a render
-// test: it posts the shared REPORT_CLIMB document with the input verbatim, and a
+// test: it posts REPORT_CLIMB with running release identity, and a
 // landed report invalidates the proposal lists (the moderation feed reads
 // `['proposals']`) plus the climb detail, whose `is_hidden` the report can flip.
 //
@@ -18,8 +18,17 @@ import type { ReportClimbInput } from '@boardsesh/shared-schema';
 const requestMock = vi.hoisted(() => vi.fn());
 
 vi.mock('../../client', () => ({ getHttpClient: () => ({ request: requestMock }) }));
+const releaseContext = vi.hoisted(() => ({
+  channel: 'production',
+  branch: 'pr-beta',
+  updateId: 'running-update',
+  runtimeVersion: 'runtime-1',
+  isEmbeddedLaunch: false,
+}));
+vi.mock('../../../release-context', () => ({ readMobileReleaseContext: () => ({ ...releaseContext }) }));
 
-import { PROPOSALS_QUERY_KEY, useReportClimb } from '../use-report-climb';
+import { PROPOSALS_QUERY_KEY } from '../../query-keys';
+import { useReportClimb } from '../use-report-climb';
 
 function makeWrapper() {
   const queryClient = new QueryClient({
@@ -59,7 +68,7 @@ describe('useReportClimb', () => {
     result.current.mutate({ input: hideInput });
 
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
-    expect(requestMock).toHaveBeenCalledWith(REPORT_CLIMB, { input: hideInput });
+    expect(requestMock).toHaveBeenCalledWith(REPORT_CLIMB, { input: { ...hideInput, releaseContext } });
     expect(result.current.data).toEqual(reportResult.reportClimb);
   });
 
@@ -76,6 +85,35 @@ describe('useReportClimb', () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: PROPOSALS_QUERY_KEY });
     expect(PROPOSALS_QUERY_KEY).toEqual(['proposals']);
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['climb'] });
+  });
+
+  it('refreshes the climb lists when a grade came back approved (a wall owner, #5971)', async () => {
+    const { queryClient, Wrapper } = makeWrapper();
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    requestMock.mockResolvedValue({
+      reportClimb: { status: 'created', proposal: { uuid: 'proposal-2', type: 'grade', status: 'approved' } },
+    });
+    const { result } = renderHook(() => useReportClimb(), { wrapper: Wrapper });
+
+    result.current.mutate({ input: hideInput });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['searchClimbs'] });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['infiniteSearchClimbs'] });
+  });
+
+  it('leaves the climb lists alone for a proposal still open to the vote', async () => {
+    const { queryClient, Wrapper } = makeWrapper();
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    requestMock.mockResolvedValue({
+      reportClimb: { status: 'created', proposal: { uuid: 'proposal-3', type: 'grade', status: 'open' } },
+    });
+    const { result } = renderHook(() => useReportClimb(), { wrapper: Wrapper });
+
+    result.current.mutate({ input: hideInput });
+
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['searchClimbs'] });
   });
 
   it('leaves a rejection to the caller — nothing is invalidated', async () => {

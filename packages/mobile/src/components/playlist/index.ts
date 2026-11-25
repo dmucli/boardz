@@ -8,14 +8,16 @@ export {
   type PlaylistDetailHero,
   type PlaylistDetailEmptyState,
   type PlaylistDetailEmptyAction,
+  type PlaylistDetailFilterAction,
 } from './PlaylistDetailView';
-export { PlaylistBackFab } from './PlaylistBackFab';
+export { PlaylistStateHeader } from './PlaylistStateHeader';
 export { PlaylistFormSheet, type PlaylistFormValues } from './PlaylistFormSheet';
 export { PlaylistPinButton } from './PlaylistPinButton';
-export { PlaylistFollowButton } from './PlaylistFollowButton';
 export { PlaylistEditDoneButton } from './PlaylistEditDoneButton';
 export { PlaylistOwnerToolbar } from './PlaylistOwnerToolbar';
 export { PlaylistActionsMenu } from './PlaylistActionsMenu';
-export { PlaylistQueueReplaceSheet } from './PlaylistQueueReplaceSheet';
 export { PlaylistDiscussionRow } from './PlaylistDiscussionRow';
+export { PlaylistAddToQueueRow } from './PlaylistAddToQueueRow';
 export { PLAYLIST_COLORS, isValidPlaylistColor, normalizePlaylistColor } from './playlist-colors';
+export { PlaylistFilterBar, type PlaylistFilterStatus } from './PlaylistFilterBar';
+export { PlaylistFilterHeaderButton } from './PlaylistFilterHeaderButton';

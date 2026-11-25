@@ -1,9 +1,28 @@
+// Delivery metadata is covered by offline-write-context.test.ts; keep these unit tests native-free.
+vi.mock('../../../../offline/offline-write-context', () => ({
+  readOfflineWriteRelease: () => ({
+    platform: 'ios',
+    appVersion: null,
+    runtimeVersion: null,
+    updateId: null,
+    isEmbedded: null,
+    branch: null,
+  }),
+  enqueueMeasuredMutation: async (...args: Parameters<typeof import('@boardsesh/offline-sync').enqueue>) =>
+    (await import('@boardsesh/offline-sync')).enqueue(...args),
+}));
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { onlineManager } from '@tanstack/react-query';
 import { createTestDatabase, type TestSqliteDb } from '@boardsesh/offline-sync/testing';
 import { enqueue, runMigrations, stampLocalUserId } from '@boardsesh/offline-sync';
 import { readAuthorSnapshot, saveAuthorSnapshot } from '../../../../db/queries/followed-authors-local';
 import { loadFollowedAuthors } from '../use-followed-authors';
+import {
+  resetLaunchReloadWindowForTests,
+  setLaunchReloadPossible,
+  setLaunchReloadRequested,
+} from '../../../launch-reload-window';
 
 const request = vi.hoisted(() => vi.fn());
 let db: TestSqliteDb;
@@ -25,11 +44,12 @@ beforeEach(async () => {
 afterEach(() => {
   db.close();
   onlineManager.setOnline(true);
+  resetLaunchReloadWindowForTests();
 });
 
 // These cases own one mutable database fixture; overlap is introduced explicitly
 // inside the race tests, not by running separate fixtures concurrently.
-describe.sequential('followed author snapshot refresh', () => {
+describe('followed author snapshot refresh', { concurrent: false }, () => {
   it('persists successive snapshots without resetting the request generation', async () => {
     for (const setter of ['first', 'second', 'third']) {
       const authors = { setterUsernames: [setter], users: [] };
@@ -96,5 +116,39 @@ describe.sequential('followed author snapshot refresh', () => {
     onlineManager.setOnline(false);
     await expect(loadFollowedAuthors('other')).rejects.toThrow('online sync');
     expect(request).not.toHaveBeenCalled();
+  });
+});
+
+// #6689. While the launch update gate can still reload this runtime, the snapshot
+// write is a transaction a reload could strand: on Android it would hold SQLite's
+// write lock until the process dies. The bridge loads again once the launch settles.
+describe('followed authors while a launch reload is still possible', { concurrent: false }, () => {
+  it('serves the stored snapshot without a request or a write', async () => {
+    setLaunchReloadPossible(true);
+
+    expect(await loadFollowedAuthors('viewer')).toEqual(oldAuthors);
+    expect(request).not.toHaveBeenCalled();
+    expect((await readAuthorSnapshot(db, 'viewer'))?.authors).toEqual(oldAuthors);
+  });
+  it('answers from the network but writes nothing when no snapshot is stored', async () => {
+    await db.runAsync('DELETE FROM followed_author_snapshots');
+    setLaunchReloadPossible(true);
+
+    expect(await loadFollowedAuthors('viewer')).toEqual(newAuthors);
+    expect(await readAuthorSnapshot(db, 'viewer')).toBeNull();
+  });
+  it('writes nothing while a reload that outlived the gate may still land', async () => {
+    setLaunchReloadRequested(true);
+
+    expect(await loadFollowedAuthors('viewer')).toEqual(oldAuthors);
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('writes the snapshot again once the launch has settled', async () => {
+    setLaunchReloadPossible(true);
+    await loadFollowedAuthors('viewer');
+    setLaunchReloadPossible(false);
+
+    expect(await loadFollowedAuthors('viewer')).toEqual(newAuthors);
+    expect((await readAuthorSnapshot(db, 'viewer'))?.authors).toEqual(newAuthors);
   });
 });

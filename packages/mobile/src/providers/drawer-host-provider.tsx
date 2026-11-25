@@ -1,3 +1,5 @@
+import { useCurrentClimbSurface } from '../hooks/use-current-climb-surface';
+import type { TickClimbIdentity } from '@boardsesh/board-config';
 /**
  * DrawerHostProvider mounts PlayDrawer and LogAscentSheet once at the app root
  * and exposes imperative openers via `useDrawerHost()`. This lets the
@@ -13,13 +15,13 @@
 
 import { useClimbModerationEnabled } from './feature-flags-provider';
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { useWindowDimensions } from 'react-native';
-import { router, useSegments } from 'expo-router';
-import { tabsActiveSegment } from '../lib/route-segments';
+import { router, useNavigationContainerRef, useSegments } from 'expo-router';
+import { isTabsRoute } from '../lib/route-segments';
+import { useWallDisplayOpen } from '../lib/wall-display-presence';
 import type { BoardName, Climb, UserBoard } from '@boardsesh/shared-schema';
 import { buildBoardPath, formatBoardDisplayName } from '@boardsesh/board-config';
 import { buildSessionBoardPath } from '../lib/boards/session-board-path';
-import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { SHARED_EVENTS, type AnalyticsEventProperties } from '@boardsesh/analytics';
 import type { PlayDrawerOpenOptions, PlayDrawerOpenTarget } from '../components/play-drawer';
 import { LogAscentSheet } from '../components/LogAscentSheet';
 import { QueueSheet, type QueueSheetHandle } from '../components/play-drawer/QueueSheet';
@@ -35,24 +37,53 @@ import { useGymBoards } from '../lib/graphql/hooks/use-gym-boards';
 import { useReachableBoardKeys } from './queue/use-reachable-board-keys';
 import { formatActiveBoardLabel } from '../lib/boards/active-board-label';
 import { track } from '../lib/analytics';
-import { ClimbReactionMenu } from '../components/climb-actions/ClimbReactionMenu';
+import { trackQueueSheetOpened } from '../lib/queue-navigation-analytics';
+import { queueSheetOpenContext } from '../lib/queue-sheet-open-context';
+import { createQueueMirrorReader } from '../lib/queue-mirror-orientation';
+import { addErrorBreadcrumb } from '../lib/error-reporting';
+import { ClimbMenusProvider } from '../components/climb-actions/ClimbActionsMenu';
 import { AddBetaVideoSheet } from '../components/AddBetaVideoSheet';
 import { ReportClimbSheet } from '../components/report-climb/ReportClimbSheet';
 import { AddToPlaylistSheet } from '../components/AddToPlaylistSheet';
+import type { WindowAnchorPoint } from '../components/navigation/AnchoredPopover.types';
 import { useProfile, useMyBoards } from '../lib/graphql/hooks';
+import { useStoredUserId } from '../hooks/use-current-user-id';
+import { usePrivacyCredentialScope, usePrivacyScopedState } from '../hooks/use-privacy-scoped-state';
+import { useDeferredSheetData } from '../hooks/use-deferred-sheet-data';
+import { getCredentialGeneration } from '../lib/privacy/privacy-cache';
 import { boardLooselyMatches } from '../lib/boards/board-matches';
+import { findGymBoardForClimb, findGymBoardToConnectForClimb } from '../lib/boards/gym-board-for-climb';
+import {
+  ClimbBoardConnectContext,
+  type ClimbBoardConnectValue,
+  type ClimbBoardMove,
+} from '../lib/boards/climb-board-connect-context';
 import { useAuth } from './auth-provider';
-import { useReduceMotion } from '../hooks/use-reduce-motion';
 import { useSprayWall, useSprayWallLoader } from '../lib/spray/use-spray-wall';
+import { useSprayWallSheetActions } from '../lib/spray/use-spray-wall-sheet-actions';
+import { BoardShareSheet } from '../components/board-discovery/BoardShareSheet';
 import { climbToQueueItem } from '../lib/climb-to-queue-item';
 import { useActiveClimbUuid, useQueueActions, useQueueSessionControls } from './queue-provider';
-import { useDeviceLayout } from '../hooks/use-device-layout';
-import { resolveDetailPaneSurface } from '../theme/size-class';
-import { SIDEBAR_WIDTH } from '../theme/layout';
+import { isDrivingWall } from '../components/play-drawer/use-climb-change-lights';
+import { usePhoneSplit } from '../hooks/use-phone-split';
+import {
+  armPlayerScrollHandoff,
+  readRoutePlayerSnapshot,
+  useRoutePlayerBusy,
+} from '../components/play-drawer/route-player-handoff';
+import {
+  buildCarriedPaneTarget,
+  resolveAppStackState,
+  resolvePlayerSurface,
+  resolveSplitRouteClose,
+} from '../lib/phone-split-player';
+import { usePhoneSplitPaneTaken } from '../components/navigation/phone-split-pane-slot';
 import { useQueueSnackbar } from './queue-snackbar-provider';
 import { useBoardPresenceControls, type ResolveBoardUuidArgs } from './board-presence-provider';
+import { boardUuidOrNull } from '../lib/boards/board-identity';
 import { useOptionalBluetoothContext } from './bluetooth-provider';
 import { dismissManagedSheetAndWait, type DismissAndWaitResult } from './sheet-presentation-provider';
+import { AngleSelectorSheet } from '../components/play-drawer/AngleSelectorSheet';
 
 export type BoardConfig = {
   boardName: string;
@@ -67,39 +98,37 @@ export type OpenClimbActionsOptions = {
    *  "Play next" uses it to move that exact item rather than guessing which copy
    *  of a twice-queued climb was long-pressed. */
   queueItemUuid?: string;
-  /** When set, the climb actions sheet shows an "Edit entry" row wired to this
+  /** When set, the climb menu shows an "Edit entry" row wired to this
    *  callback (logbook rows pass it to open the tick editor). */
   onEditEntry?: () => void;
-  /** When set, the "Add beta video" action runs this instead of opening the root
-   *  beta sheet. The play drawer passes its own in-tree opener so the sheet stacks
-   *  above the `/play` fullScreenModal (a root-tree sheet can't — see #3505). It
-   *  receives the climb/board snapshot the menu was opened for. */
-  onAddBetaVideo?: (climb: Climb, boardConfig: BoardConfig) => void;
-  /** When set, the "Tick" action runs this instead of opening the root LogAscent
-   *  sheet. The play drawer passes its own in-tree opener so the tick sheet stacks
-   *  above the `/play` transparentModal — the root sheet mounts BEHIND it, and
-   *  presenting it forces UIKit to dismiss `/play`, dragging the tick sheet down
-   *  with it (the "tick sheet closes immediately" bug). Same fix shape as
-   *  `onAddBetaVideo` (#3505). Receives the climb/board snapshot the menu opened for. */
-  onTick?: (climb: Climb, boardConfig: BoardConfig) => void;
-  /** When set, the "Report climb" action runs this instead of opening the root
-   *  report sheet. The play drawer passes its own in-tree opener so the sheet
-   *  stacks above the `/play` fullScreenModal (a root-tree sheet can't — see
-   *  #3505). It receives the climb/board snapshot the menu was opened for. */
-  onReportClimb?: (climb: Climb, boardConfig: BoardConfig) => void;
-  /** When set, the menu offers an "Open the queue" action that runs this after
-   *  the menu closes. The play drawer passes its own queue opener while the
-   *  connect-step pill (#5654) has taken the queue button's place. */
-  onOpenQueue?: () => void;
-  /** Awaitable close for a native BoardSheet / QueueSheet underneath the custom
-   * actions overlay. Omitted when the source is an inline iPad pane. */
+  /** Awaitable close for the native BoardSheet / QueueSheet the menu was opened
+   * from, run before a command presents its own sheet. Omitted when the source
+   * is an inline iPad pane. */
   dismissSourceSheet?: () => Promise<DismissAndWaitResult>;
-  /** `/play`-owned native-stack close waiter. Threaded from the route because a
-   * root overlay cannot safely subscribe to the player's transition events. */
+  /** `/play`-owned native-stack close waiter. Threaded from the route because the
+   * root command host cannot safely subscribe to the player's transition events.
+   * Its presence also marks a menu opened inside the player: only those route
+   * Tick, Playlist, Beta and Report to the player's own sheets. */
   dismissPlayerAndWait?: () => Promise<DismissAndWaitResult>;
+  /** Add to playlist hosted inside the modal route the menu was opened from
+   * (the moderation feed). The root sheet would present under that route and
+   * vanish (docs/mobile/mobile-sheets-vs-routes.md, rule 1). Inside `/play` the
+   * player's own sheet wins. */
+  openPlaylistInRoute?: (climb: Climb, boardConfig: BoardConfig) => void;
+};
+
+/** A native menu's immutable climb, board and source-slot snapshot. */
+export type ClimbActionsTarget = OpenClimbActionsOptions & {
+  climb: Climb;
+  boardConfig: BoardConfig;
+  /** Run when a command is picked: the climb to run it on, or null to drop it.
+   * Presence menus hydrate the wall's snapshot here; the Climbs list drops a
+   * pick on a stale placeholder row. */
+  resolveClimb?: () => Promise<Climb | null>;
 };
 
 export type LogAscentInput = {
+  climb?: TickClimbIdentity;
   climbUuid: string;
   /** Shown in the tick sheet header so the climber sees what they are logging —
    *  the queue-bar entry point can open this on a climb they are no longer
@@ -148,7 +177,7 @@ export type OpenPlayDrawerOptions = PlayDrawerOpenOptions & {
  *  resolved. Consumed by `IpadPlayPane`. */
 export type PlayDrawerPaneProps = {
   boardConfig: BoardConfig;
-  onAngleChange: (angle: number) => void;
+  onAngleChange: (angle: number, analyticsContext?: AnalyticsEventProperties) => void;
   isAngleAdjustable: boolean;
   onOpenQueue: () => void;
   boardMismatch: boolean;
@@ -157,7 +186,6 @@ export type PlayDrawerPaneProps = {
    *  instead of raising the blocking scrim. */
   reachableBoardKeys: ReadonlySet<string>;
   onSwitchBoard: (climbBoardConfig?: BoardConfig) => void;
-  onOpenClimbActions: (climb: Climb, boardConfigOverride?: BoardConfig, options?: OpenClimbActionsOptions) => void;
   /** The climb to show in the pane, with a bumped nonce per selection so the pane
    *  re-applies even when the same climb is re-tapped. Set by `openPlayDrawer` on
    *  iPad regular width (where it drives the pane instead of the `/play` route). */
@@ -169,13 +197,14 @@ export type PlayDrawerPaneProps = {
  *  rendered inline. Mirrors the BoardSheet props passed below; null while no board
  *  is resolved. Consumed by `IpadWallColumn`. */
 export type NowOnTheWallColumnProps = {
+  getClimbMirror?: (climbUuid: string) => boolean | undefined;
   boardLabel: string | null;
   boardConfig: BoardConfig | null;
   onSwitchBoard: () => void;
   onClimbPress: (action: BoardSheetClimbAction) => void;
-  onAddToQueue: (action: BoardSheetClimbAction) => void;
+  onPlayNext: (action: BoardSheetClimbAction) => void;
   onOpenPlaylist: (action: BoardSheetClimbAction) => void;
-  onOpenActions: (action: BoardSheetClimbAction) => void;
+  onOpenActions: (action: BoardSheetClimbAction) => ClimbActionsTarget | null | undefined;
 };
 
 type DrawerHostValue = {
@@ -185,14 +214,20 @@ type DrawerHostValue = {
   boardConfig: BoardConfig | null;
   openPlayDrawer: (climb: Climb, options?: OpenPlayDrawerOptions) => void;
   openLogAscent: (input: LogAscentInput) => void;
-  /** Opens the climb actions bottom sheet for the given climb. Uses the active
-   *  boardConfig at the time of opening. Pass `onEditEntry` (logbook context) to
-   *  add an "Edit entry" row that edits the tick the climb was opened from. */
-  openClimbActions: (climb: Climb, boardConfigOverride?: BoardConfig, options?: OpenClimbActionsOptions) => void;
-  closeClimbActions: () => void;
+  /** Resolves the climb menu target for a row: the climb, the board its
+   *  commands file against (the stored active board unless overridden) and the
+   *  source slot. Presents nothing; the row's native menu owns the hold. Pass
+   *  `onEditEntry` (logbook context) to add an "Edit entry" row that edits the
+   *  tick the climb was opened from. Null before the board resolves, or for a
+   *  resolver captured before the credential scope changed. */
+  getClimbActions: (
+    climb: Climb,
+    boardConfigOverride?: BoardConfig,
+    options?: OpenClimbActionsOptions,
+  ) => ClimbActionsTarget | null;
   /** Opens the add-to-playlist bottom sheet for the given climb. Snapshots the
    *  active boardConfig (for the angle) at open time. */
-  openAddToPlaylist: (climb: Climb, boardConfigOverride?: BoardConfig) => void;
+  openAddToPlaylist: (climb: Climb, boardConfigOverride?: BoardConfig, anchorPoint?: WindowAnchorPoint) => void;
   /** Opens the share-your-beta sheet for the given climb. Snapshots the active
    *  boardConfig (for the angle) at open time. Used by the iOS climb context menu's
    *  shared action list (useClimbActions). */
@@ -209,50 +244,28 @@ type DrawerHostValue = {
    *  separate Switch-board control). Wired to the board glyph when the
    *  `board-presence` flag is on. */
   openBoardSheet: () => void;
-  /** Props for the iPad right-column PlayDrawer pane (regular width); null while
-   *  no board is resolved. Consumed by `IpadPlayPane` in the shell. On iPad regular
-   *  width `openPlayDrawer` drives this pane instead of the `/play` route. */
+  /** Opens the player's angle sheet for the MiniPlayer's Angle button (#6940),
+   *  with the player's own angle handler: the board override, the crew's board
+   *  path and AngleChanged, as the player's pill. The sheet lives here, not in
+   *  the tab bar's accessory, where it would present from inside UIKit's
+   *  platter. `climbUuid` asks for that climb's grade per angle; leave it out
+   *  for a climb drawn on another board. No-op on a fixed-angle board. */
+  openAnglePicker: (climbUuid?: string) => void;
+  /** Props for the tablet shell's right-column PlayDrawer pane (regular width) and
+   *  the iPhone Duo's split pane; null while no board is resolved. Consumed by
+   *  `IpadPlayPane`. Where that pane is up, `openPlayDrawer` drives it instead of
+   *  the `/play` route. */
   playDrawerPaneProps: PlayDrawerPaneProps | null;
   /** Props for the iPad "Now on the wall" column (regular landscape); null while
    *  no board is resolved. Consumed by `IpadWallColumn` in the shell. */
   boardPanelProps: NowOnTheWallColumnProps | null;
-  /** True when `openPlayDrawer` lands in the iPad shell's persistent right-column
-   *  pane (regular-width master-detail) rather than the `/play` route / bottom
-   *  sheet — a selection fills the pane beside the list instead of covering it. */
+  /** True when `openPlayDrawer` lands in a pane beside the list (the JS tablet
+   *  shell at regular width, the iPhone Duo's split) rather than the `/play` route.
+   *  Always false on the native iPad, which opens the full-screen player. */
   usesDetailPane: boolean;
 };
 
 const DrawerHostContext = createContext<DrawerHostValue | null>(null);
-
-/**
- * Data-backed sheet state that survives the dismiss animation. `open(value)`
- * shows it; `close()` requests the animated close (flips `visible` false) but
- * keeps the data mounted; `clearIfClosed()` (wired to the sheet's onFullyDismissed)
- * drops the data only once the animation has settled and the sheet wasn't
- * re-opened — so the native Host never unmounts mid-animation (an iOS freeze
- * vector) and the content doesn't blank out while sliding away.
- */
-function useDeferredSheetData<T>(): {
-  data: T | null;
-  visible: boolean;
-  open: (value: T) => void;
-  close: () => void;
-  clearIfClosed: () => void;
-} {
-  const [data, setData] = useState<T | null>(null);
-  const [visible, setVisible] = useState(false);
-  const visibleRef = useRef(visible);
-  visibleRef.current = visible;
-  const open = useCallback((value: T) => {
-    setData(value);
-    setVisible(true);
-  }, []);
-  const close = useCallback(() => setVisible(false), []);
-  const clearIfClosed = useCallback(() => {
-    if (!visibleRef.current) setData(null);
-  }, []);
-  return { data, visible, open, close, clearIfClosed };
-}
 
 export function useDrawerHost(): DrawerHostValue {
   const context = useContext(DrawerHostContext);
@@ -278,11 +291,11 @@ type PlayDrawerRouteValue = {
   /** Board models standing at this gym. A climb on one of them invites the walk
    *  instead of raising the blocking scrim. */
   reachableBoardKeys: ReadonlySet<string>;
-  onAngleChange: (angle: number) => void;
+  onAngleChange: (angle: number, analyticsContext?: AnalyticsEventProperties) => void;
   onSwitchBoard: (climbBoardConfig?: BoardConfig) => void;
   /** Run from the route's unmount cleanup: clears the board override + open
    *  target so the next open starts clean. */
-  onPlayDrawerClosed: () => void;
+  onPlayDrawerClosed: (consumedNonce: number | null) => void;
   /** Report that the route has applied this target, so the close above knows
    *  which one it is allowed to clear. */
   onPlayDrawerTargetConsumed: (nonce: number) => void;
@@ -327,12 +340,41 @@ export function usePlayDrawerRoute(): PlayDrawerRouteValue {
   return context;
 }
 
+/**
+ * Opens the `/play` route. Always through expo-router's queue, never a direct
+ * navigator dispatch: callers queue router calls of their own around an open
+ * (the deep-link hand-off leaves its screen with `router.back()` first), and a
+ * dispatch would run ahead of them, so the queued pop would close the player it
+ * just opened (#7069).
+ */
+function navigateToPlayer() {
+  router.navigate('/play');
+}
+
 export function DrawerHostProvider({ children }: { children: ReactNode }) {
+  const navigationRef = useNavigationContainerRef();
+  const composerCredentialScope = usePrivacyCredentialScope();
   // The climb to show in the player route, with a per-open nonce so a re-tap
   // while `/play` is already up still re-applies (navigate is a no-op then). The
   // route consumes this via usePlayDrawerRoute and runs PlayDrawer's openDrawer.
-  const [playTarget, setPlayTarget] = useState<PlayDrawerOpenTarget | null>(null);
+  const [playTarget, setPlayTarget] = usePrivacyScopedState<PlayDrawerOpenTarget>();
   const playTargetNonceRef = useRef(0);
+  const playTargetRef = useRef(playTarget);
+  playTargetRef.current = playTarget;
+  const navigationRequestedTargetRef = useRef<{
+    nonce: number;
+    credentialGeneration: number;
+  } | null>(null);
+  const replayFrameRef = useRef<number | null>(null);
+  const replayedTargetNonceRef = useRef<number | null>(null);
+  const hostMountedRef = useRef(false);
+  useEffect(() => {
+    hostMountedRef.current = true;
+    return () => {
+      hostMountedRef.current = false;
+      if (replayFrameRef.current != null) cancelAnimationFrame(replayFrameRef.current);
+    };
+  }, []);
   // See PreviewedClimbContext. Set when an open is preview-shaped (the caller
   // pinned a queue item the queue never receives), cleared when an open commits —
   // from then on `activeClimbUuid` is accurate and tracks onward swipes too.
@@ -345,8 +387,8 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   const [previewedClimbUuid, setPreviewedClimbUuid] = useState<string | null>(null);
   // ...but it IS cleared when the queue's committed climb moves on. A preview
   // outlives the drawer as "the climb you last had up" only until something is
-  // actually put up after it: an explicit Preview of A followed by a swipe that
-  // commits B (solo, `lightOnSwipe` on) must highlight B, not keep pointing at
+  // actually put up after it: a preview of A followed by a swipe that
+  // commits B (driving the wall) must highlight B, not keep pointing at
   // A until the next list tap. Keys on the head CHANGING after mount — a
   // re-render with the same head leaves the highlight alone — and a first
   // commit from an empty queue counts as a change, since "tap a row, then swipe
@@ -363,13 +405,19 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   // `onPlayDrawerClosed` for why "consumed" and not "latest" is the right test.
   const consumedPlayTargetNonceRef = useRef(0);
   const onPlayDrawerTargetConsumed = useCallback((nonce: number) => {
+    if (nonce < consumedPlayTargetNonceRef.current) return;
     consumedPlayTargetNonceRef.current = nonce;
+    if (navigationRequestedTargetRef.current?.nonce === nonce && replayFrameRef.current != null) {
+      cancelAnimationFrame(replayFrameRef.current);
+      replayFrameRef.current = null;
+    }
   }, []);
-  // iPad regular width shows the PlayDrawer inline in the right-column pane
-  // (IpadPlayPane) instead of the full-screen `/play` route. `paneTarget` is the
+  // The JS tablet shell at regular width shows the PlayDrawer inline in the
+  // right-column pane (IpadPlayPane) instead of the full-screen `/play` route, and
+  // the iPhone Duo's split shows it in its leading pane. `paneTarget` is the
   // pane's equivalent of `playTarget`: the selected climb with a per-selection
   // nonce so re-tapping the same climb still re-applies it in the pane.
-  const [paneTarget, setPaneTarget] = useState<PlayDrawerOpenTarget | null>(null);
+  const [paneTarget, setPaneTarget] = usePrivacyScopedState<PlayDrawerOpenTarget>();
   const paneTargetNonceRef = useRef(0);
   // QueueSheet stays mounted (whenever a board is resolved) and is opened via its
   // imperative handle. gorhom `present()` driven from a `visible`-prop effect is
@@ -378,23 +426,45 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   const queueSheetRef = useRef<QueueSheetHandle>(null);
   const boardSheetRef = useRef<BoardSheetHandle>(null);
   const { data: activeBoard } = useActiveBoard();
-  // iPad regular width hosts the PlayDrawer as a persistent right-column pane
-  // rather than the `/play` route. `usesDetailPane` mirrors the shell's pane
-  // budget (resolveDetailPaneSurface — the tightest regular portraits fall back
-  // to the route + compact sheets). A ref lets the empty-dep `openPlayDrawer`
-  // read it without churning its identity.
-  const { width: windowWidth } = useWindowDimensions();
-  const { widthClass } = useDeviceLayout();
-  // The "On the Wall" kiosk tab hides the shell's detail pane (it IS the wall
-  // surface and needs the full content pane), so a climb open there must fall back
-  // to the `/play` route instead of a paneTarget that lands in an unmounted pane.
-  // Folding it into `usesDetailPane` also makes the effect below clear a stale
-  // paneTarget when the wall tab becomes focused.
-  const onWallTab = tabsActiveSegment(useSegments()) === 'wall';
-  const usesDetailPane =
-    resolveDetailPaneSurface({ width: windowWidth, widthClass, sidebarWidth: SIDEBAR_WIDTH }) === 'pane' && !onWallTab;
+  // The JS tablet shell at regular width hosts the PlayDrawer as a persistent
+  // right-column pane rather than the `/play` route. `usesDetailPane` mirrors the
+  // shell's pane budget (the tightest regular portraits fall back to the route +
+  // compact sheets). The native iPad has no pane: like Music, a tap opens the
+  // full-screen player. A ref lets the empty-dep `openPlayDrawer` read it without
+  // churning its identity.
+  const { home: currentClimbHome } = useCurrentClimbSurface();
+  // The full-screen Wall display covers the shell and its detail pane, so a climb
+  // opened there falls back to the `/play` route above it instead of a paneTarget
+  // that lands in an unmounted pane. Folding it into `usesDetailPane` also makes
+  // the effect below clear a stale paneTarget when the display opens.
+  const routeSegments = useSegments();
+  // Anywhere in the root stack: with /play pushed over the kiosk the pane is
+  // still covered.
+  const wallDisplayOpen = useWallDisplayOpen();
+  // The phone split (iPhone Duo opened in landscape) hosts the same pane on the
+  // leading half of each tab. Never true on a tablet. A root page over the tabs
+  // hides the split's pane, so taps there
+  // open `/play` (see resolvePlayerSurface).
+  const phoneSplit = usePhoneSplit();
+  const splitPaneTaken = usePhoneSplitPaneTaken();
+  const { paneMounted, tapsOpenPane: usesDetailPane } = resolvePlayerSurface({
+    tabletPane: currentClimbHome === 'detailPane',
+    phoneSplit,
+    wallDisplayOpen,
+    tabsUncovered: isTabsRoute(routeSegments),
+    paneTaken: splitPaneTaken,
+  });
   const usesDetailPaneRef = useRef(usesDetailPane);
   usesDetailPaneRef.current = usesDetailPane;
+  const paneMountedRef = useRef(paneMounted);
+  paneMountedRef.current = paneMounted;
+  const phoneSplitRef = useRef(phoneSplit);
+  phoneSplitRef.current = phoneSplit;
+  // Which surface the current board override was set for: the pane or the
+  // `/play` route. The split can have both at once (a page over the tabs routes
+  // taps to `/play` while the pane stays mounted), so a route close clears only
+  // an override the route owned. See onPlayDrawerClosed.
+  const overrideOwnerRef = useRef<'pane' | 'route' | null>(null);
   // Auth gates two things here. (1) myBoards requires authentication: running it
   // while logged out throws "Authentication required to perform this operation"
   // (pure noise in error tracking) and returns nothing useful — every other call
@@ -422,7 +492,7 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     open: openPlaylistSheet,
     close: closePlaylistSheet,
     clearIfClosed: clearPlaylistSheet,
-  } = useDeferredSheetData<{ climb: Climb; boardConfig: BoardConfig }>();
+  } = useDeferredSheetData<{ climb: Climb; boardConfig: BoardConfig; anchorPoint?: WindowAnchorPoint }>();
   const {
     data: betaVideoData,
     visible: betaVideoVisible,
@@ -437,19 +507,7 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     close: closeReportClimbSheet,
     clearIfClosed: clearReportClimbSheet,
   } = useDeferredSheetData<{ climb: Climb; boardConfig: BoardConfig }>();
-  const [climbActions, setClimbActions] = useState<{
-    climb: Climb;
-    boardConfig: BoardConfig;
-    queueItemUuid?: string;
-    onEditEntry?: () => void;
-    onAddBetaVideo?: (climb: Climb, boardConfig: BoardConfig) => void;
-    onTick?: (climb: Climb, boardConfig: BoardConfig) => void;
-    onReportClimb?: (climb: Climb, boardConfig: BoardConfig) => void;
-    onOpenQueue?: () => void;
-    dismissSourceSheet?: () => Promise<DismissAndWaitResult>;
-    dismissPlayerAndWait?: () => Promise<DismissAndWaitResult>;
-  } | null>(null);
-  const { addToQueue, setSessionBoardPath, setCurrentClimb } = useQueueActions();
+  const { playNext, setSessionBoardPath, setCurrentClimb, getQueueSnapshot } = useQueueActions();
   const { sessionId } = useQueueSessionControls();
   const setActiveBoard = useSetActiveBoard();
   const setBoardAngle = useSetBoardAngle();
@@ -472,11 +530,12 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   const boardPresenceBoardIdRef = useRef(boardPresenceBoardId);
   boardPresenceBoardIdRef.current = boardPresenceBoardId;
   const { data: profile } = useProfile();
-  // Read at the app root (resolved by interaction time) and passed to the reaction
-  // menu so its mount-time enter animation uses the real value, not the hook's
-  // conservative `true` default.
-  const reduceMotion = useReduceMotion();
-
+  // Who owns a spray wall decides its reset rows. The profile is the fresher
+  // answer but it is network-only, so fall back to the id the signed token
+  // carries, as My Boards does: a failed profile read must not take the owner's
+  // reset away.
+  const { userId: storedUserId } = useStoredUserId(isAuthenticated && !profile?.id);
+  const sprayViewerUserId = profile?.id ?? storedUserId ?? null;
   // The user's STORED active board as a BoardConfig (never the override). Used
   // by non-drawer surfaces and to decide whether a climb opened with a board
   // override is genuinely a different board (→ switch-board gate) or the same
@@ -512,10 +571,16 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   const activeSprayLayoutId = activeBoardConfig?.boardName === 'spray' ? activeBoardConfig.layoutId : null;
   useSprayWall(activeSprayLayoutId);
 
+  const selectedBoardUuid = boardUuidOrNull(activeBoard?.uuid);
+  const selectedBoardId = activeBoard?.boardId;
   const selectedBoardPresenceBoard = useMemo<ResolveBoardUuidArgs | null>(() => {
-    if (!activeBoard) return null;
-    return { boardUuid: activeBoard.uuid };
-  }, [activeBoard?.uuid]);
+    // A hidden board picked from a signed-out scan is geometry with an empty
+    // uuid: no link to bind by. A Bluetooth connect binds it by its serial.
+    if (!selectedBoardUuid) return null;
+    // The numeric id the stored board carries lets the binding notice a uuid that
+    // a merge has since redirected to another board.
+    return { boardUuid: selectedBoardUuid, ...(selectedBoardId != null ? { boardId: selectedBoardId } : {}) };
+  }, [selectedBoardUuid, selectedBoardId]);
 
   useEffect(() => {
     if (!boardPresenceEnabled) return;
@@ -539,76 +604,195 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   const myBoardsRef = useRef(myBoardsConn);
   myBoardsRef.current = myBoardsConn;
 
-  const openPlayDrawer = useCallback((climb: Climb, options?: OpenPlayDrawerOptions) => {
-    // Pull `boardConfig` out so it doesn't reach the open target.
-    const { boardConfig: override, ...openOptions } = options ?? {};
-    // Set the board override BEFORE navigating so the route reads the right board
-    // from `activeBoardConfig` (reactive) on mount — no requestAnimationFrame /
-    // pending-replay dance. Only set an override that genuinely differs from the
-    // stored board; otherwise drop it so the drawer renders against the user's
-    // precise board (and clears any leftover override from a prior open).
-    if (override && !boardConfigsMatch(override, storedActiveBoardConfigRef.current)) {
-      setBoardConfigOverride(override);
-    } else {
-      setBoardConfigOverride(null);
-    }
-    setPreviewedClimbUuid(openOptions.previewQueueItem ? climb.uuid : null);
-    // iPad regular width hosts the drawer as a persistent right-column pane, so
-    // drive it in place instead of navigating to `/play`. The pane reads
-    // `paneTarget` via playDrawerPaneProps and re-applies on the bumped nonce (a
-    // re-tap of the same climb still re-applies). No router.navigate → no modal.
-    if (usesDetailPaneRef.current) {
-      paneTargetNonceRef.current += 1;
-      setPaneTarget({ climb, options: openOptions, nonce: paneTargetNonceRef.current });
-      return;
-    }
-    // Stash the target (bumped nonce) and navigate. When `/play` is already up the
-    // navigate is a no-op, but the new nonce re-applies the target in place.
-    playTargetNonceRef.current += 1;
-    setPlayTarget({ climb, options: openOptions, nonce: playTargetNonceRef.current });
-    router.navigate('/play');
-  }, []);
+  const openPlayDrawer = useCallback(
+    (climb: Climb, options?: OpenPlayDrawerOptions) => {
+      if (composerCredentialScope !== getCredentialGeneration()) return;
+      // Pull `boardConfig` out so it doesn't reach the open target.
+      const { boardConfig: override, ...requestedOptions } = options ?? {};
+      const openOptions =
+        !requestedOptions.previewQueueItem &&
+        !requestedOptions.committedExternally &&
+        !requestedOptions.reopensCurrent &&
+        !isDrivingWall()
+          ? { ...requestedOptions, previewQueueItem: climbToQueueItem(climb) }
+          : requestedOptions;
+      if (replayFrameRef.current != null) {
+        cancelAnimationFrame(replayFrameRef.current);
+        replayFrameRef.current = null;
+      }
+      navigationRequestedTargetRef.current = null;
+      // Set the board override BEFORE navigating so the route reads the right board
+      // from `activeBoardConfig` (reactive) on mount — no requestAnimationFrame /
+      // pending-replay dance. Only set an override that genuinely differs from the
+      // stored board; otherwise drop it so the drawer renders against the user's
+      // precise board (and clears any leftover override from a prior open).
+      if (override && !boardConfigsMatch(override, storedActiveBoardConfigRef.current)) {
+        setBoardConfigOverride(override);
+        overrideOwnerRef.current = usesDetailPaneRef.current ? 'pane' : 'route';
+      } else {
+        setBoardConfigOverride(null);
+        overrideOwnerRef.current = null;
+      }
+      setPreviewedClimbUuid(openOptions.previewQueueItem ? climb.uuid : null);
+      // A pane beside the list (the JS tablet shell, the Duo's split) hosts the
+      // drawer, so drive it in place instead of navigating to `/play`. The pane reads
+      // `paneTarget` via playDrawerPaneProps and re-applies on the bumped nonce (a
+      // re-tap of the same climb still re-applies). No router.navigate → no modal.
+      if (usesDetailPaneRef.current) {
+        paneTargetNonceRef.current += 1;
+        // The pane target outlives its first apply, and each tab mounts its own
+        // pane: only the first player to apply it treats it as this tap.
+        let applied = false;
+        const claimFirstApply = () => {
+          if (applied) return false;
+          applied = true;
+          return true;
+        };
+        setPaneTarget({ climb, options: openOptions, nonce: paneTargetNonceRef.current, claimFirstApply });
+        return;
+      }
+      // Stash the target (bumped nonce) and navigate. When `/play` is already up the
+      // navigate is a no-op, but the new nonce re-applies the target in place.
+      playTargetNonceRef.current += 1;
+      const target = { climb, options: openOptions, nonce: playTargetNonceRef.current };
+      playTargetRef.current = target;
+      setPlayTarget(target);
+      navigationRequestedTargetRef.current = {
+        nonce: target.nonce,
+        credentialGeneration: getCredentialGeneration(),
+      };
+      navigateToPlayer();
+    },
+    [setPaneTarget, setPlayTarget, composerCredentialScope],
+  );
 
   // Drop the pane's selected climb when the pane goes away (a resize into compact,
   // or a narrow-regular split where the /play route takes over), so a later return
   // to the pane starts from the current climb rather than a stale selection.
+  // Keyed on the pane being mounted, not on where taps go: a page pushed over the
+  // split's tabs routes taps to `/play` but leaves the pane (and its selection)
+  // underneath. On the tablet shell the two are the same value.
   useEffect(() => {
-    if (!usesDetailPane) setPaneTarget(null);
-  }, [usesDetailPane]);
+    if (!paneMounted) setPaneTarget(null);
+  }, [paneMounted, setPaneTarget]);
+
+  // Opening an iPhone Duo into landscape with the full-screen player up: the
+  // split's pane is now the player, so the route closes instead of staying over
+  // the split. Not while it has work open (a tick being typed, a sheet up): the
+  // close waits until the climber is done, and is dropped if they fold back
+  // first. The pane shows the queue's current climb by itself; a preview the
+  // route shows moves across as a look, never a fresh pick, and the scroll
+  // position follows it (route-player-handoff). Phone split only: a tablet shell
+  // crossing into its pane keeps the route as before.
+  const [splitRouteClosePending, setSplitRouteClosePending] = useState(false);
+  // Subscribed only while a close waits, so no device re-renders this provider
+  // on every sheet the player opens.
+  const routePlayerBusy = useRoutePlayerBusy(splitRouteClosePending);
+  const previousPhoneSplitRef = useRef(phoneSplit);
+  useEffect(() => {
+    const enteredSplit = phoneSplit && !previousPhoneSplitRef.current;
+    previousPhoneSplitRef.current = phoneSplit;
+    if (enteredSplit) setSplitRouteClosePending(true);
+    else if (!phoneSplit) setSplitRouteClosePending(false);
+  }, [phoneSplit]);
+  useEffect(() => {
+    if (!splitRouteClosePending) return;
+    // The app's Stack, not the root: expo-router mounts its own stack above it.
+    const appStack = navigationRef.isReady() ? resolveAppStackState(navigationRef.getRootState()) : null;
+    const decision = resolveSplitRouteClose({
+      phoneSplit,
+      routeOnTop: appStack?.routes[appStack.index]?.name === 'play',
+      routeOverTabs: appStack?.routes[appStack.index - 1]?.name === '(tabs)',
+      routeBusy: routePlayerBusy,
+    });
+    if (decision === 'wait') return;
+    setSplitRouteClosePending(false);
+    if (decision !== 'close' || !appStack) return;
+    const routePlayer = readRoutePlayerSnapshot();
+    const carriedTarget = buildCarriedPaneTarget(routePlayer, paneTargetNonceRef.current + 1);
+    if (carriedTarget) {
+      paneTargetNonceRef.current = carriedTarget.nonce;
+      setPaneTarget(carriedTarget);
+      // The carried climb now lives in the pane, so its board override does too.
+      overrideOwnerRef.current = 'pane';
+    }
+    armPlayerScrollHandoff(
+      routePlayer?.climbUuid ? { climbUuid: routePlayer.climbUuid, offsetY: routePlayer.offsetY } : null,
+    );
+    navigationRef.dispatch({ type: 'POP', target: appStack.key, payload: { count: 1 } });
+  }, [splitRouteClosePending, phoneSplit, routePlayerBusy, navigationRef, setPaneTarget]);
 
   // Reset on route unmount (close): drop the board override so non-drawer surfaces
   // snap back to the stored board, and clear the open target so a stray remount
   // can't replay a stale climb.
-  const onPlayDrawerClosed = useCallback(() => {
-    // A target written since the last one the route applied belongs to a tap the
-    // route has not served yet (see below). Its board override was set in the
-    // same `openPlayDrawer` call and the next mount reads the board from
-    // `activeBoardConfig`, so the override has to survive with it — cleared here,
-    // a dismiss-window tap on a climb from another board would replay against
-    // the stored board with no way back to the one it was tapped on.
-    const targetPending = playTargetNonceRef.current !== consumedPlayTargetNonceRef.current;
-    if (!targetPending) setBoardConfigOverride(null);
-    // Only drop the target this close was actually for. The reset runs from the
-    // route's UNMOUNT cleanup — the end of the dismiss animation — and the list
-    // underneath is live and tappable for that whole window (and for the pull-down
-    // that precedes it). A tap landing there sets a fresh target and finds
-    // `router.navigate('/play')` a no-op because the route is still in the stack,
-    // so an unguarded reset then nulls the target that tap just wrote and the
-    // drawer comes back on the previous climb. It reads as a dead tap.
-    //
-    // So the reset clears only a target the route actually CONSUMED. One that was
-    // written but never applied belongs to a tap that has not been served yet —
-    // replaying it on the next mount is the whole point, not a stale-climb bug.
-    // Previously the race was survivable by accident: every opener also wrote the
-    // queue, so the drawer still landed on the tapped climb even when the target
-    // was lost. Preview-shaped opens do not write the queue, which is what turned
-    // a latent race into a reproducible dead tap.
-    setPlayTarget((current) => (current && current.nonce === consumedPlayTargetNonceRef.current ? null : current));
-  }, []);
+  const onPlayDrawerClosed = useCallback(
+    (consumedNonce: number | null) => {
+      // A target written since the last one the route applied belongs to a tap the
+      // route has not served yet (see below). Its board override was set in the
+      // same `openPlayDrawer` call and the next mount reads the board from
+      // `activeBoardConfig`, so the override has to survive with it — cleared here,
+      // a dismiss-window tap on a climb from another board would replay against
+      // the stored board with no way back to the one it was tapped on.
+      const targetPending = playTargetRef.current != null && playTargetNonceRef.current !== consumedNonce;
+      addErrorBreadcrumb({ category: 'ui.play', message: 'play drawer closed', data: { targetPending } });
+      // A mounted pane keeps using the override. In the phone split, only when the
+      // pane owns it: an open from a page over the tabs went to this route, and its
+      // foreign board must not stick to the pane (it would raise the switch-board
+      // overlay there). On the tablet shell the old rule stands, byte for byte.
+      const paneKeepsOverride =
+        paneMountedRef.current && !(phoneSplitRef.current && overrideOwnerRef.current === 'route');
+      if (!targetPending && !paneKeepsOverride) setBoardConfigOverride(null);
+      // Only drop the target this close was actually for. The reset runs from the
+      // route's UNMOUNT cleanup — the end of the dismiss animation — and the list
+      // underneath is live and tappable for that whole window (and for the pull-down
+      // that precedes it). A tap landing there sets a fresh target and finds
+      // `router.navigate('/play')` a no-op because the route is still in the stack,
+      // so an unguarded reset then nulls the target that tap just wrote and the
+      // drawer comes back on the previous climb. It reads as a dead tap.
+      //
+      // So the reset clears only a target the route actually CONSUMED. One that was
+      // written but never applied belongs to a tap that has not been served yet —
+      // replaying it on the next mount is the whole point, not a stale-climb bug.
+      // Previously the race was survivable by accident: every opener also wrote the
+      // queue, so the drawer still landed on the tapped climb even when the target
+      // was lost. Preview-shaped opens do not write the queue, which is what turned
+      // a latent race into a reproducible dead tap.
+      // Capture the closing route's owner before the asynchronous state updater;
+      // another mounted route may already have consumed the newer global target.
+      setPlayTarget((current) => (current && current.nonce === consumedNonce ? null : current));
+      const requested = navigationRequestedTargetRef.current;
+      if (
+        !targetPending ||
+        !requested ||
+        requested.nonce === consumedPlayTargetNonceRef.current ||
+        requested.nonce === replayedTargetNonceRef.current ||
+        usesDetailPaneRef.current
+      )
+        return;
+      if (replayFrameRef.current != null) cancelAnimationFrame(replayFrameRef.current);
+      replayedTargetNonceRef.current = requested.nonce;
+      replayFrameRef.current = requestAnimationFrame(() => {
+        replayFrameRef.current = null;
+        if (
+          !hostMountedRef.current ||
+          usesDetailPaneRef.current ||
+          navigationRequestedTargetRef.current !== requested ||
+          playTargetRef.current?.nonce !== requested.nonce ||
+          consumedPlayTargetNonceRef.current === requested.nonce ||
+          requested.credentialGeneration !== getCredentialGeneration()
+        )
+          return;
+        // The old /play has unmounted. Serve the pending tap without minting a
+        // target nonce, redoing its commit, or changing its board override.
+        navigateToPlayer();
+      });
+    },
+    [setPlayTarget],
+  );
 
   // Apply an angle change made from the play drawer's angle selector.
   const handleAngleChange = useCallback(
-    (newAngle: number) => {
+    (newAngle: number, analyticsContext?: AnalyticsEventProperties) => {
       const cfg = activeBoardConfigRef.current;
       if (boardConfigOverride) {
         // Guard against the override's current angle, not the base board's.
@@ -634,6 +818,7 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
       }
 
       track(SHARED_EVENTS.AngleChanged, {
+        ...analyticsContext,
         angle: newAngle,
         boardName: cfg?.boardName,
         layoutId: cfg?.layoutId,
@@ -663,38 +848,21 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
 
   const openLogAscent = openLogAscentSheet;
 
-  // Snapshot the board config at open time so the sheet's per-row handlers
-  // (queue / favorite / tick) keep operating on the same angle even if the
-  // user switches their active board mid-interaction.
-  const openClimbActions = useCallback(
-    (climb: Climb, boardConfigOverride?: BoardConfig, options?: OpenClimbActionsOptions) => {
+  // Resolve a menu snapshot during render; native long-press owns presentation.
+  const getClimbActions = useCallback(
+    (climb: Climb, boardConfigOverride?: BoardConfig, options?: OpenClimbActionsOptions): ClimbActionsTarget | null => {
+      if (composerCredentialScope !== getCredentialGeneration()) return null;
       const boardConfig = boardConfigOverride ?? storedActiveBoardConfigRef.current;
-      if (!boardConfig) return;
-      setClimbActions({
-        climb,
-        boardConfig,
-        queueItemUuid: options?.queueItemUuid,
-        onEditEntry: options?.onEditEntry,
-        onAddBetaVideo: options?.onAddBetaVideo,
-        onTick: options?.onTick,
-        onReportClimb: options?.onReportClimb,
-        onOpenQueue: options?.onOpenQueue,
-        dismissSourceSheet: options?.dismissSourceSheet,
-        dismissPlayerAndWait: options?.dismissPlayerAndWait,
-      });
+      return boardConfig ? { climb, boardConfig, ...options } : null;
     },
-    [],
+    [composerCredentialScope],
   );
 
-  const closeClimbActions = useCallback(() => {
-    setClimbActions(null);
-  }, []);
-
   const openAddToPlaylist = useCallback(
-    (climb: Climb, boardConfigOverride?: BoardConfig) => {
+    (climb: Climb, boardConfigOverride?: BoardConfig, anchorPoint?: WindowAnchorPoint) => {
       const boardConfig = boardConfigOverride ?? storedActiveBoardConfigRef.current;
       if (!boardConfig) return;
-      openPlaylistSheet({ climb, boardConfig });
+      openPlaylistSheet({ climb, boardConfig, anchorPoint });
     },
     [openPlaylistSheet],
   );
@@ -702,7 +870,7 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   const closeAddToPlaylist = closePlaylistSheet;
 
   // Single parameterized beta-video opener (mirrors openAddToPlaylist), used both by
-  // the reaction menu's shared action list (useClimbActions) and by PlayDrawer.
+  // the climb menus' shared commands (useClimbActions) and by PlayDrawer.
   // Falls back to the stored active board, not the override-inclusive one, so a
   // temporary drawer board override can't leak into the beta-video surface.
   const openAddBetaVideo = useCallback(
@@ -717,7 +885,7 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   const closeAddBetaVideo = closeBetaVideoSheet;
 
   // Single parameterized report opener (mirrors openAddBetaVideo), used by the
-  // reaction menu's shared action list (useClimbActions). Falls back to the
+  // climb menus' shared commands (useClimbActions). Falls back to the
   // stored active board, not the override-inclusive one, so a temporary drawer
   // board override can't leak into the report.
   // The kill switch gates every entry point that reaches this opener; keep the
@@ -751,25 +919,57 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     return dismissManagedSheetAndWait(queueSheetRef.current);
   }, []);
 
+  // The MiniPlayer's angle sheet: mounted on its first open, then toggled.
+  const [anglePicker, setAnglePicker] = useState<{ visible: boolean; climbUuid: string | undefined } | null>(null);
+  const angleIsAdjustable = activeBoard?.isAngleAdjustable !== false;
+  const openAnglePicker = useCallback(
+    (climbUuid?: string) => {
+      if (!angleIsAdjustable) return;
+      setAnglePicker({ visible: true, climbUuid });
+    },
+    [angleIsAdjustable],
+  );
+  const closeAnglePicker = useCallback(
+    () => setAnglePicker((current) => (current?.visible ? { ...current, visible: false } : current)),
+    [],
+  );
+  const handleAnglePickerChange = useCallback(
+    (newAngle: number) => {
+      handleAngleChange(newAngle);
+      closeAnglePicker();
+    },
+    [handleAngleChange, closeAnglePicker],
+  );
+
+  const requestCloseBoardSheet = useCallback(() => boardSheetRef.current?.dismiss(), []);
+  const dismissBoardSheetAndWait = useCallback((): Promise<DismissAndWaitResult> => {
+    return dismissManagedSheetAndWait(boardSheetRef.current);
+  }, []);
+  const sprayWallActions = useSprayWallSheetActions(activeBoard ?? null, dismissBoardSheetAndWait, sprayViewerUserId);
+  const cancelPendingSprayAction = sprayWallActions.cancelPendingAction;
+
   // Board sheet: present imperatively via the ref, exactly like the queue sheet
   // and Play Drawer. gorhom's present() from a `visible`-prop effect is a silent
   // no-op in this build.
   const openBoardSheet = useCallback(() => {
+    cancelPendingSprayAction();
     track(SHARED_EVENTS.BoardSheetOpened, {
       boardId: boardPresenceBoardIdRef.current ?? undefined,
       source: 'board_pill',
     });
     boardSheetRef.current?.present();
-  }, []);
-  const requestCloseBoardSheet = useCallback(() => boardSheetRef.current?.dismiss(), []);
-  const dismissBoardSheetAndWait = useCallback((): Promise<DismissAndWaitResult> => {
-    return dismissManagedSheetAndWait(boardSheetRef.current);
-  }, []);
+  }, [cancelPendingSprayAction]);
   // Snackbar "Open": dismiss the snackbar, then open the queue sheet.
+  const snackbarBoardType = storedActiveBoardConfig?.boardName;
   const handleSnackbarOpen = useCallback(() => {
     dismissSnackbar();
+    trackQueueSheetOpened({
+      surface: 'snackbar',
+      boardType: snackbarBoardType,
+      ...queueSheetOpenContext(getQueueSnapshot()),
+    });
     openQueueSheet();
-  }, [dismissSnackbar, openQueueSheet]);
+  }, [dismissSnackbar, openQueueSheet, snackbarBoardType, getQueueSnapshot]);
 
   // The queue sheet renders climbs against the active board (thumbnails + tick).
   const queueBoard = useMemo<QueueItemRowBoard | null>(() => {
@@ -794,7 +994,7 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   } = useQueueSheetHandlers({
     setCurrentClimb,
     openPlayDrawer,
-    openClimbActions,
+    getClimbActions,
     openLogAscent,
     storedBoardConfig: storedActiveBoardConfig,
     sessionId,
@@ -889,11 +1089,7 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
       // session left every peer bound to the board the climber walked away from
       // — and board presence with them. `switchBoard` broadcasts the session
       // board path, clears the override and adopts the board's own angle.
-      const gymSibling = gymBoardsRef.current?.find(
-        (board) =>
-          board.uuid !== activeBoardRef.current?.uuid &&
-          boardLooselyMatches({ boardName: board.boardType, layoutId: board.layoutId }, override),
-      );
+      const gymSibling = findGymBoardForClimb(override, activeBoardRef.current?.uuid, gymBoardsRef.current);
       if (gymSibling) {
         void switchBoard(gymSibling, activeBoardRef.current ?? null, 'move_to_wall_callout');
         return;
@@ -933,6 +1129,22 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     [setActiveBoard, switchBoard],
   );
 
+  // Connect follows the climb (#7001). A connect on a MoonBoard climb while the
+  // gym's Kilter is active moves to the MoonBoard first, through the same switch
+  // as the Switch board button, so a crew session moves with it. Everything is
+  // read through refs, so the context value keeps one identity.
+  const moveToClimbBoard = useCallback(
+    async (climb?: Parameters<ClimbBoardConnectValue['moveToClimbBoard']>[0]): Promise<ClimbBoardMove> => {
+      const targetClimb = climb ?? getQueueSnapshot().currentClimbQueueItem?.climb ?? null;
+      const target = findGymBoardToConnectForClimb(targetClimb, activeBoardRef.current, gymBoardsRef.current);
+      if (!target) return { kind: 'none' };
+      const outcome = await switchBoard(target, activeBoardRef.current ?? null, 'connect_climb_board');
+      return outcome === 'switched' ? { kind: 'switched', board: target } : { kind: 'failed' };
+    },
+    [getQueueSnapshot, switchBoard],
+  );
+  const climbBoardConnectValue = useMemo<ClimbBoardConnectValue>(() => ({ moveToClimbBoard }), [moveToClimbBoard]);
+
   // The switch-board gate fires only when the drawer is showing a climb from a
   // genuinely DIFFERENT board model (board name + layout) than the user's stored
   // active board — not merely a different size/sets/angle on the same board
@@ -946,15 +1158,32 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     [boardConfigOverride],
   );
 
+  // A board-history row (the sheet and the iPad wall column) plays from the
+  // wall's history like any list (issue #6665): swipes walk back through what
+  // was lit. Like every list it opens a preview, so looking never takes a
+  // crewmate's wall, unless this phone is driving the wall (#7113: a swipe,
+  // Put on board or Always drive the wall), when it goes up.
+  // The queue entry the wall's climb already has is reused either way, so
+  // putting it up from the preview doesn't queue a second copy.
   const handleBoardSheetClimbPress = useCallback(
     (action: BoardSheetClimbAction) => {
       const item = climbToQueueItem(action.climb, { uuid: action.queueItemUuid ?? undefined });
       const boardConfigOverride = boardConfigsMatch(action.boardConfig, storedActiveBoardConfigRef.current)
         ? undefined
         : action.boardConfig;
-      // Opening from the board sheet means "walk the queue" — drop any list
-      // source so next/previous follow the queue again, not a stale list.
-      setCurrentClimb(item, { playlistSuggestionSource: null });
+      const track = action.track ?? null;
+      // Only driving the wall lights it, in a crew too (#7113): the list's one
+      // rule. A board-sheet tap never takes a crewmate's wall otherwise (#6665).
+      if (!isDrivingWall()) {
+        openPlayDrawer(action.climb, {
+          previewQueueItem: item,
+          previewIsWallClimb: action.isWallClimb ?? false,
+          playlistSuggestionSource: track,
+          boardConfig: boardConfigOverride,
+        });
+        return;
+      }
+      setCurrentClimb(item, { playlistSuggestionSource: track });
       openPlayDrawer(action.climb, {
         committedExternally: true,
         boardConfig: boardConfigOverride,
@@ -963,11 +1192,12 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     [openPlayDrawer, setCurrentClimb],
   );
 
-  const handleBoardSheetAddToQueue = useCallback(
+  // A row's right swipe: the top of Up next, like every other climb list (#6772).
+  const handleBoardSheetPlayNext = useCallback(
     (action: BoardSheetClimbAction) => {
-      void addToQueue(climbToQueueItem(action.climb));
+      void playNext({ item: climbToQueueItem(action.climb) });
     },
-    [addToQueue],
+    [playNext],
   );
 
   const handleBoardSheetOpenPlaylist = useCallback(
@@ -979,9 +1209,12 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
 
   const handleBoardSheetModalOpenActions = useCallback(
     (action: BoardSheetClimbAction) => {
-      openClimbActions(action.climb, action.boardConfig, { dismissSourceSheet: dismissBoardSheetAndWait });
+      return getClimbActions(action.climb, action.boardConfig, {
+        dismissSourceSheet: dismissBoardSheetAndWait,
+        queueItemUuid: action.queueItemUuid ?? undefined,
+      });
     },
-    [openClimbActions, dismissBoardSheetAndWait],
+    [getClimbActions, dismissBoardSheetAndWait],
   );
 
   // The regular-width iPad wall surface is a persistent inline pane, not the
@@ -989,9 +1222,9 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
   // an unrelated hidden/reopening sheet or abort a valid create navigation.
   const handleBoardPanelOpenActions = useCallback(
     (action: BoardSheetClimbAction) => {
-      openClimbActions(action.climb, action.boardConfig);
+      return getClimbActions(action.climb, action.boardConfig, { queueItemUuid: action.queueItemUuid ?? undefined });
     },
-    [openClimbActions],
+    [getClimbActions],
   );
 
   // Undo a wall change YOU just caused. Queue navigation is untouched; the
@@ -1027,7 +1260,6 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
             mismatchBoardLabel,
             reachableBoardKeys,
             onSwitchBoard: handleSwitchBoardFromDrawer,
-            onOpenClimbActions: openClimbActions,
             openTarget: paneTarget,
           }
         : null,
@@ -1040,10 +1272,11 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
       mismatchBoardLabel,
       reachableBoardKeys,
       handleSwitchBoardFromDrawer,
-      openClimbActions,
       paneTarget,
     ],
   );
+
+  const getClimbMirror = useMemo(() => createQueueMirrorReader(getQueueSnapshot), [getQueueSnapshot]);
 
   // Props for the iPad "Now on the wall" column — the same handlers passed to the
   // BoardSheet modal below, surfaced via context so the inline column renders the
@@ -1052,11 +1285,12 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     () =>
       storedActiveBoardConfig
         ? {
+            getClimbMirror,
             boardLabel: boardSheetLabel,
             boardConfig: storedActiveBoardConfig,
             onSwitchBoard: handleSwitchBoardFromSheet,
             onClimbPress: handleBoardSheetClimbPress,
-            onAddToQueue: handleBoardSheetAddToQueue,
+            onPlayNext: handleBoardSheetPlayNext,
             onOpenPlaylist: handleBoardSheetOpenPlaylist,
             onOpenActions: handleBoardPanelOpenActions,
           }
@@ -1066,9 +1300,10 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
       boardSheetLabel,
       handleSwitchBoardFromSheet,
       handleBoardSheetClimbPress,
-      handleBoardSheetAddToQueue,
+      handleBoardSheetPlayNext,
       handleBoardSheetOpenPlaylist,
       handleBoardPanelOpenActions,
+      getClimbMirror,
     ],
   );
 
@@ -1077,13 +1312,13 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
       boardConfig: storedActiveBoardConfig,
       openPlayDrawer,
       openLogAscent,
-      openClimbActions,
-      closeClimbActions,
+      getClimbActions,
       openAddToPlaylist,
       openAddBetaVideo,
       openReportClimb,
       openQueueSheet,
       openBoardSheet,
+      openAnglePicker,
       playDrawerPaneProps,
       boardPanelProps,
       usesDetailPane,
@@ -1092,13 +1327,13 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
       storedActiveBoardConfig,
       openPlayDrawer,
       openLogAscent,
-      openClimbActions,
-      closeClimbActions,
+      getClimbActions,
       openAddToPlaylist,
       openAddBetaVideo,
       openReportClimb,
       openQueueSheet,
       openBoardSheet,
+      openAnglePicker,
       playDrawerPaneProps,
       boardPanelProps,
       usesDetailPane,
@@ -1141,122 +1376,140 @@ export function DrawerHostProvider({ children }: { children: ReactNode }) {
     <DrawerHostContext.Provider value={value}>
       <PreviewedClimbContext.Provider value={previewedClimbValue}>
         <PlayDrawerRouteContext.Provider value={routeValue}>
-          {children}
-          {logAscentData ? (
-            <LogAscentSheet
-              visible={logAscentVisible}
-              onClose={closeLogAscentSheet}
-              onFullyDismissed={clearLogAscentSheet}
-              climbUuid={logAscentData.climbUuid}
-              climbName={logAscentData.climbName}
-              boardName={logAscentData.boardName}
-              angle={logAscentData.angle}
-              isMirror={logAscentData.isMirror}
-              isBenchmark={logAscentData.isBenchmark}
-              baseAscensionistCount={logAscentData.baseAscensionistCount}
-              layoutId={logAscentData.layoutId}
-              sizeId={logAscentData.sizeId}
-              setIds={logAscentData.setIds}
-              sessionId={logAscentData.sessionId}
-              consensusGradeName={logAscentData.consensusGradeName}
+          <ClimbMenusProvider
+            currentUserId={profile?.id ?? null}
+            isAuthenticated={isAuthenticated}
+            activeBoardConfig={storedActiveBoardConfig}
+          >
+            {/* Bulbs live in the screens, so only they need connect-follows-the-climb (#7001). */}
+            <ClimbBoardConnectContext.Provider value={climbBoardConnectValue}>
+              {children}
+            </ClimbBoardConnectContext.Provider>
+            {logAscentData ? (
+              <LogAscentSheet
+                key={composerCredentialScope}
+                visible={logAscentVisible}
+                onClose={closeLogAscentSheet}
+                onFullyDismissed={clearLogAscentSheet}
+                climbUuid={logAscentData.climbUuid}
+                climbName={logAscentData.climbName}
+                boardName={logAscentData.boardName}
+                angle={logAscentData.angle}
+                isMirror={logAscentData.isMirror}
+                isBenchmark={logAscentData.isBenchmark}
+                baseAscensionistCount={logAscentData.baseAscensionistCount}
+                layoutId={logAscentData.layoutId}
+                sizeId={logAscentData.sizeId}
+                setIds={logAscentData.setIds}
+                sessionId={logAscentData.sessionId}
+                consensusGradeName={logAscentData.consensusGradeName}
+              />
+            ) : null}
+            {betaVideoData ? (
+              <AddBetaVideoSheet
+                key={composerCredentialScope}
+                visible={betaVideoVisible}
+                climb={betaVideoData.climb}
+                boardName={betaVideoData.boardConfig.boardName as BoardName}
+                layoutId={betaVideoData.boardConfig.layoutId}
+                angle={betaVideoData.boardConfig.angle}
+                onClose={closeAddBetaVideo}
+                onFullyDismissed={clearBetaVideoSheet}
+              />
+            ) : null}
+            {reportClimbData ? (
+              <ReportClimbSheet
+                key={composerCredentialScope}
+                visible={reportClimbVisible}
+                climb={reportClimbData.climb}
+                boardName={reportClimbData.boardConfig.boardName as BoardName}
+                layoutId={reportClimbData.boardConfig.layoutId}
+                sizeId={reportClimbData.boardConfig.sizeId}
+                setIds={reportClimbData.boardConfig.setIds}
+                angle={reportClimbData.boardConfig.angle}
+                onClose={closeReportClimb}
+                onFullyDismissed={clearReportClimbSheet}
+              />
+            ) : null}
+            {playlistData ? (
+              <AddToPlaylistSheet
+                key={composerCredentialScope}
+                visible={playlistVisible}
+                climb={playlistData.climb}
+                boardName={playlistData.boardConfig.boardName as BoardName}
+                layoutId={playlistData.boardConfig.layoutId}
+                sizeId={playlistData.boardConfig.sizeId}
+                setIds={playlistData.boardConfig.setIds}
+                angle={playlistData.boardConfig.angle}
+                anchorPoint={playlistData.anchorPoint}
+                onClose={closeAddToPlaylist}
+                onFullyDismissed={clearPlaylistSheet}
+              />
+            ) : null}
+            {queueBoard ? (
+              <QueueSheet
+                ref={queueSheetRef}
+                board={queueBoard}
+                onClose={requestCloseQueueSheet}
+                onClimbPress={handleQueueClimbPress}
+                onOpenActions={handleQueueOpenActions}
+                onSuggestionPress={handleQueueSuggestionPress}
+                onTickHistory={handleQueueTickHistory}
+              />
+            ) : null}
+            <BoardSheet
+              ref={boardSheetRef}
+              boardLabel={boardSheetLabel}
+              boardConfig={storedActiveBoardConfig}
+              onClose={requestCloseBoardSheet}
+              onSwitchBoard={handleSwitchBoardFromSheet}
+              activeBoard={activeBoard ?? null}
+              onOpenSprayMaintenance={sprayWallActions.openMaintenance}
+              onShareSprayWall={sprayWallActions.openShare}
+              viewerUserId={sprayViewerUserId}
+              onSelectGymWall={handleSelectGymWall}
+              getClimbMirror={getClimbMirror}
+              onClimbPress={handleBoardSheetClimbPress}
+              onPlayNext={handleBoardSheetPlayNext}
+              onOpenPlaylist={handleBoardSheetOpenPlaylist}
+              onOpenActions={handleBoardSheetModalOpenActions}
             />
-          ) : null}
-          {betaVideoData ? (
-            <AddBetaVideoSheet
-              visible={betaVideoVisible}
-              climb={betaVideoData.climb}
-              boardName={betaVideoData.boardConfig.boardName as BoardName}
-              layoutId={betaVideoData.boardConfig.layoutId}
-              angle={betaVideoData.boardConfig.angle}
-              onClose={closeAddBetaVideo}
-              onFullyDismissed={clearBetaVideoSheet}
+            {anglePicker && activeBoardConfig ? (
+              <AngleSelectorSheet
+                visible={anglePicker.visible && angleIsAdjustable}
+                onClose={closeAnglePicker}
+                boardName={activeBoardConfig.boardName}
+                layoutId={activeBoardConfig.layoutId}
+                climbUuid={anglePicker.climbUuid}
+                currentAngle={activeBoardConfig.angle}
+                onAngleChange={handleAnglePickerChange}
+              />
+            ) : null}
+            {sprayWallActions.shareSnapshot ? (
+              <BoardShareSheet
+                visible={sprayWallActions.shareVisible}
+                onDismiss={sprayWallActions.closeShare}
+                onFullyDismissed={sprayWallActions.clearShareSnapshot}
+                shareUrl={sprayWallActions.shareSnapshot.url}
+                wallName={sprayWallActions.shareSnapshot.wallName}
+                visibility={sprayWallActions.shareSnapshot.visibility}
+                posterUrl={sprayWallActions.shareSnapshot.posterUrl}
+              />
+            ) : null}
+            <QueueAddedSnackbar
+              visible={snackbarVisible}
+              nonce={snackbarNonce}
+              queueAdded={snackbarQueueAdded}
+              onDismiss={dismissSnackbar}
+              onOpen={handleSnackbarOpen}
             />
-          ) : null}
-          {reportClimbData ? (
-            <ReportClimbSheet
-              visible={reportClimbVisible}
-              climb={reportClimbData.climb}
-              boardName={reportClimbData.boardConfig.boardName as BoardName}
-              layoutId={reportClimbData.boardConfig.layoutId}
-              sizeId={reportClimbData.boardConfig.sizeId}
-              setIds={reportClimbData.boardConfig.setIds}
-              angle={reportClimbData.boardConfig.angle}
-              onClose={closeReportClimb}
-              onFullyDismissed={clearReportClimbSheet}
+            <UndoWallChangeSnackbar
+              visible={undoWallChangeVisible}
+              nonce={undoWallChangeNonce}
+              onDismiss={dismissUndoWallChangeSnackbar}
+              onUndo={handleUndoWallChange}
             />
-          ) : null}
-          {playlistData ? (
-            <AddToPlaylistSheet
-              visible={playlistVisible}
-              climb={playlistData.climb}
-              boardName={playlistData.boardConfig.boardName as BoardName}
-              layoutId={playlistData.boardConfig.layoutId}
-              sizeId={playlistData.boardConfig.sizeId}
-              setIds={playlistData.boardConfig.setIds}
-              angle={playlistData.boardConfig.angle}
-              onClose={closeAddToPlaylist}
-              onFullyDismissed={clearPlaylistSheet}
-            />
-          ) : null}
-          {queueBoard ? (
-            <QueueSheet
-              ref={queueSheetRef}
-              board={queueBoard}
-              onClose={requestCloseQueueSheet}
-              onClimbPress={handleQueueClimbPress}
-              onOpenActions={handleQueueOpenActions}
-              onSuggestionPress={handleQueueSuggestionPress}
-              onTickHistory={handleQueueTickHistory}
-            />
-          ) : null}
-          <BoardSheet
-            ref={boardSheetRef}
-            boardLabel={boardSheetLabel}
-            boardConfig={storedActiveBoardConfig}
-            onClose={requestCloseBoardSheet}
-            onSwitchBoard={handleSwitchBoardFromSheet}
-            activeBoard={activeBoard ?? null}
-            onSelectGymWall={handleSelectGymWall}
-            onClimbPress={handleBoardSheetClimbPress}
-            onAddToQueue={handleBoardSheetAddToQueue}
-            onOpenPlaylist={handleBoardSheetOpenPlaylist}
-            onOpenActions={handleBoardSheetModalOpenActions}
-          />
-          {/* Rendered after the queue/board sheets so its iOS FullWindowOverlay mounts as a
-          later sibling and floats above them when a row inside those sheets is
-          long-pressed (RN-screens doesn't strictly guarantee cross-overlay z-order). */}
-          {climbActions ? (
-            <ClimbReactionMenu
-              key={climbActions.climb.uuid}
-              climb={climbActions.climb}
-              boardConfig={climbActions.boardConfig}
-              queueItemUuid={climbActions.queueItemUuid}
-              currentUserId={profile?.id ?? null}
-              isAuthenticated={isAuthenticated}
-              onEditEntry={climbActions.onEditEntry}
-              onAddBetaVideo={climbActions.onAddBetaVideo}
-              onTick={climbActions.onTick}
-              onReportClimb={climbActions.onReportClimb}
-              onOpenQueue={climbActions.onOpenQueue}
-              dismissSourceSheet={climbActions.dismissSourceSheet}
-              dismissPlayerAndWait={climbActions.dismissPlayerAndWait}
-              reduceMotion={reduceMotion}
-              onClose={closeClimbActions}
-            />
-          ) : null}
-          <QueueAddedSnackbar
-            visible={snackbarVisible}
-            nonce={snackbarNonce}
-            queueAdded={snackbarQueueAdded}
-            onDismiss={dismissSnackbar}
-            onOpen={handleSnackbarOpen}
-          />
-          <UndoWallChangeSnackbar
-            visible={undoWallChangeVisible}
-            nonce={undoWallChangeNonce}
-            onDismiss={dismissUndoWallChangeSnackbar}
-            onUndo={handleUndoWallChange}
-          />
+          </ClimbMenusProvider>
         </PlayDrawerRouteContext.Provider>
       </PreviewedClimbContext.Provider>
     </DrawerHostContext.Provider>

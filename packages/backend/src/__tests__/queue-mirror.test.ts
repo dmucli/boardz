@@ -20,6 +20,8 @@ function snapshot(uuid = 'slot-1', mirrored = false): QueueState {
     version: 4,
     stateHash: 'before',
     stateHashOrdered: 'before-v2',
+    historyCount: 0,
+    currentChangedAt: null,
   };
 }
 
@@ -32,7 +34,8 @@ describe('confirmed session mirroring', () => {
 
   it('updates the current slot and queue together and broadcasts the absolute orientation', async () => {
     const result = await mirrorSessionClimb('session', true, 'slot-1');
-    expect(mocks.write).toHaveBeenCalledWith('session', [result?.item], result?.item, 4);
+    // The slot is rewritten in place, so the stored line (its index, 0) stands.
+    expect(mocks.write).toHaveBeenCalledWith('session', [result?.item], result?.item, 4, 0);
     expect(result?.item.climb.mirrored).toBe(true);
     expect(mocks.publish).toHaveBeenCalledWith(
       'session',
@@ -67,5 +70,29 @@ describe('confirmed session mirroring', () => {
     await mirrorSessionClimb('session', true, 'slot-1');
     expect(mocks.write.mock.calls[1][1]).toHaveLength(2);
     expect(mocks.write.mock.calls[1][3]).toBe(5);
+  });
+
+  it('preserves the mover when orphan normalization publishes a FullSync', async () => {
+    const orphan = snapshot();
+    orphan.queue = [];
+    orphan.currentChangedBy = 'sam-participant';
+    mocks.read.mockResolvedValue(orphan);
+    mocks.write.mockResolvedValue({
+      sequence: 5,
+      stateHash: 'after',
+      stateHashOrdered: 'after-v2',
+      currentChangedAt: '2026-10-31T10:00:00.000Z',
+      currentChangedBy: 'sam-participant',
+    });
+
+    await mirrorSessionClimb('session', true, 'slot-1');
+
+    expect(mocks.publish).toHaveBeenCalledWith(
+      'session',
+      expect.objectContaining({
+        __typename: 'FullSync',
+        state: expect.objectContaining({ currentChangedBy: 'sam-participant' }),
+      }),
+    );
   });
 });

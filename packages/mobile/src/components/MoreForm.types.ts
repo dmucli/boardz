@@ -26,23 +26,26 @@ import type { ReactNode } from 'react';
  * screen and both renderers.
  */
 export type MoreIconName =
-  | 'notifications'
-  | 'moderation'
-  | 'playlists'
-  | 'gyms'
   | 'integrations'
-  | 'watch'
   | 'boardLook'
   | 'accessibility'
   | 'storage'
   | 'translate'
-  | 'replay'
-  | 'changelog'
   | 'devServers'
   | 'otaChannel'
   | 'featureFlags'
   | 'branchSwitcher'
-  | 'editProfile';
+  | 'editProfile'
+  | 'privacy'
+  | 'account'
+  | 'general'
+  | 'climbs'
+  | 'home'
+  | 'timers'
+  | 'earlyAccess'
+  | 'developer'
+  | 'export'
+  | 'policy';
 
 /** A choice in a segmented control or select menu. */
 export type MoreOption = {
@@ -64,6 +67,30 @@ export type MoreNavRow = {
   icon?: MoreIconName;
   /** Trailing badge text, e.g. the "New" pill on the changelog row. */
   badge?: string;
+  /**
+   * The setting's current value, e.g. the grade format behind a "Grades" row.
+   * iOS, web and the RN fallback draw it trailing, in the secondary label colour,
+   * just before the chevron; Android draws it as the M3 supporting text under
+   * the label.
+   */
+  value?: string;
+  /**
+   * The row leaves the app (a browser page, the store, a mail draft). The chevron
+   * becomes an outward arrow (`arrow.up.right` on iOS, the `open-external`
+   * drawable on Android) and screen readers hear that it opens outside the app.
+   */
+  external?: boolean;
+  onPress: () => void;
+};
+
+/** A small icon button on a row, before its label (a Home section's move up / move down). */
+export type MoreRowAction = {
+  key: string;
+  icon: 'moveUp' | 'moveDown';
+  /** What TalkBack reads for the button, e.g. "Move Playlists up". */
+  accessibilityLabel: string;
+  /** Greys the button out; `onPress` never fires. */
+  disabled?: boolean;
   onPress: () => void;
 };
 
@@ -72,9 +99,33 @@ export type MoreToggleRow = {
   kind: 'toggle';
   key: string;
   label: string;
+  /**
+   * The control's name for assistive tech when `label` leans on the row above
+   * ("In a session too" under Keep lighting): the VoiceOver rotor, Voice
+   * Control's names and TalkBack read the control on its own. iOS sets it on
+   * the Toggle (the subtitle then rides as its hint); MoreFormRN (Settings ›
+   * Board on Android) on the SwitchRow. MoreForm.android draws neither field:
+   * no screen it renders sets them.
+   */
+  accessibilityLabel?: string;
   subtitle?: string;
+  /**
+   * Why the row is greyed out, shown in place of `subtitle` while `disabled`,
+   * at full label contrast: on iOS as its own line under the Toggle, so the
+   * disabled control's dimming leaves it alone.
+   */
+  disabledReason?: string;
   value: boolean;
+  disabled?: boolean;
   onValueChange: (value: boolean) => void;
+  /**
+   * Icon buttons before the label. **Android only**: the Compose form draws no
+   * hosted React Native row (QA on a Pixel 8 Pro, #6546), so Settings › Home's
+   * move arrows are native buttons there. iOS and the browser draw no actions;
+   * Settings › Home hosts its own arrow rows on those. A screen with a `custom`
+   * row renders MoreFormRN on Android, which draws no actions.
+   */
+  actions?: readonly MoreRowAction[];
 };
 
 /** An inline segmented control (Appearance, Grade Format). */
@@ -93,6 +144,8 @@ export type MoreSegmentedRow = {
    * same one `SegmentedControl` already makes, via the shared `makeSelectHandler`.
    */
   disabledKeys?: ReadonlySet<string>;
+  /** Greys out the whole control; no segment can be selected. */
+  disabled?: boolean;
 };
 
 /** A menu-style picker that shows the current value and opens a menu (Language). */
@@ -100,9 +153,19 @@ export type MoreSelectRow = {
   kind: 'select';
   key: string;
   label: string;
+  /** The control's name for assistive tech when `label` leans on the row above (see `MoreToggleRow`). */
+  accessibilityLabel?: string;
+  /**
+   * Secondary text under the row (Settings › Board's Stop driving after row
+   * says why it is greyed), so its explanation rides the row a screen reader
+   * lands on, not only the footer.
+   */
+  subtitle?: string;
   options: MoreOption[];
   selectedKey: string;
   onSelect: (key: string) => void;
+  /** Greys out the row; the menu does not open. */
+  disabled?: boolean;
 };
 
 /** Read-only copy that belongs inside the form's single scrolling surface. */
@@ -124,13 +187,50 @@ export type MoreButtonRow = {
   role?: 'destructive';
   /**
    * Visual weight. `'primary'` (default) is the full-strength affordance — a
-   * filled red block on Android, a body-size destructive row on iOS. `'subtle'`
-   * is a quieter, secondary destructive affordance (a text-only button on
-   * Android, a footnote-size row on iOS) so two destructive actions stacked
-   * together (Sign Out + Delete Account) don't read as equal heavy red blocks.
+   * filled block on Android and web, a body-size row on iOS. `'subtle'` is a
+   * quieter, secondary affordance: a text button on Android and web whatever the
+   * `role`, a footnote-size row on iOS. It keeps two destructive actions stacked
+   * together (Sign Out + Delete Account) from reading as equal heavy red blocks.
    */
   emphasis?: 'primary' | 'subtle';
+  /** Greys the button out; `onPress` never fires. */
+  disabled?: boolean;
+  /**
+   * The button's action is in flight: a spinner sits beside the label and the
+   * button cannot be pressed again until the caller clears it.
+   */
+  loading?: boolean;
   onPress: () => void;
+};
+
+/**
+ * A label with a trailing value (storage used, last sync, signed-in email). No
+ * chevron. With `onPress` the row is tappable and shows press feedback, for a
+ * value that does something when tapped (copy, retry) without navigating.
+ */
+export type MoreValueRow = {
+  kind: 'value';
+  key: string;
+  label: string;
+  value?: string;
+  subtitle?: string;
+  /**
+   * Where the value sits. `'trailing'` (the default) is beside the label.
+   * `'below'` puts it on its own line under the label, for a row whose label and
+   * value are both names (a board and its paired timer): side by side at large
+   * text sizes, two narrow columns break words mid-way. The same choice as
+   * ListRow's `trailingPlacement`.
+   */
+  valuePlacement?: 'trailing' | 'below';
+  /** The value is being worked out; a spinner sits in the trailing slot. */
+  busy?: boolean;
+  onPress?: () => void;
+  /**
+   * What a tap does, read by VoiceOver and TalkBack after the label, for a row
+   * whose action the label alone doesn't say (a Storage board row removes the
+   * board). Only meaningful with `onPress`.
+   */
+  accessibilityHint?: string;
 };
 
 /**
@@ -198,6 +298,7 @@ export type MoreRow =
   | MoreSelectRow
   | MoreInfoRow
   | MoreButtonRow
+  | MoreValueRow
   | MoreSliderRow
   | MoreCustomRow;
 

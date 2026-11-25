@@ -5,7 +5,7 @@ import { buildLogPushItem } from './push-back';
 
 /**
  * pushPendingTicks (push-back.ts) builds a LogPushItem per pending tick
- * before handing off to Kilter's /api/logs/bulk. Kilter Grips ticks are
+ * before handing off to Kilter's candidate /api/v2/logs/bulk route. Kilter Grips ticks are
  * natively on a 1-5 quality scale (see catalog-sync.ts, quality-scale.ts,
  * user-sync.ts) — NOT Aurora's 1-3 scale. This guards against
  * convertQualityToAurora (an Aurora-scale-only helper) being reapplied
@@ -23,6 +23,7 @@ describe('buildLogPushItem', () => {
       userId: 'user-1',
       boardType: 'kilter',
       climbUuid: 'climb-uuid-1',
+      climbRevision: null,
       angle: 40,
       isMirror: false,
       origin: 'native',
@@ -37,6 +38,13 @@ describe('buildLogPushItem', () => {
       updatedAt: '2026-07-01T00:00:00.000Z',
       sessionId: null,
       boardId: null,
+      reportingAttribution: null,
+      reportingBoardId: null,
+      reportingGymId: null,
+      reportingDate: null,
+      reportingDateTimeZone: null,
+      reportingTimePrecision: null,
+      reportingClimbedAt: null,
       auroraType: null,
       auroraId: null,
       auroraSyncedAt: null,

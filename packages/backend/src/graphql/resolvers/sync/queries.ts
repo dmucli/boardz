@@ -1,5 +1,13 @@
+import { climbDraftVisibilityCondition, privateSafeFirstAscentName } from '@boardsesh/db/queries';
 import { sql, type SQL } from 'drizzle-orm';
-import type { ConnectionContext, SyncResult, SyncDeletionsResult, SyncCursorInput } from '@boardsesh/shared-schema';
+import type {
+  ConnectionContext,
+  SyncResult,
+  SyncDeletionsResult,
+  SyncCursorInput,
+  SyncCursor,
+  SyncAudience,
+} from '@boardsesh/shared-schema';
 import { isSizeScopedBoard } from '@boardsesh/board-config';
 import { db } from '../../../db/client';
 import { rowsFromResult } from '@boardsesh/db/client';
@@ -7,18 +15,20 @@ import { withSerialPlan, aliveHolds, type SerialPlanDb } from '@boardsesh/db/que
 import { isS3Configured, presignGetObject } from '../../../storage/s3';
 import { logger } from '../../../utils/logger';
 import { requireAuthenticated } from '../shared/helpers';
-import { isSprayBoardType, sprayLayoutIsReadable } from '../climbs/spray-read-access';
+import { isSprayBoardType, sprayLayoutIsReadableWithCapability } from '../climbs/spray-read-access';
 import { normalizeRow, toIso, type RawRow } from './row-normalize';
+import { syncClimbDocuments } from './saved-climb';
 import {
   validateInput,
   SyncCursorInputSchema,
   SyncLimitSchema,
   SyncBoardScopeIdSchema,
   BoardNameSchema,
+  UUIDSchema,
 } from '../../../validation/schemas';
 
 /**
- * Offline sync pull resolvers (Phase 2). See docs/sync-table-manifest.md — the
+ * Offline sync pull resolvers (Phase 2). See docs/data/sync-table-manifest.md — the
  * contract that binds these resolvers, the mobile SQLite DDL, and the mobile
  * table-config together.
  *
@@ -65,6 +75,41 @@ function cursorBounds(cursor: SyncCursorInput | null | undefined): { ts: string;
 }
 
 /**
+ * Where a `syncDeletions` page resumes: the earlier of the cursor's timestamp
+ * and the `deleted_at` of the marker the cursor names.
+ *
+ * #6339's backend served deletion sync from 2026-10-13 01:56 UTC until #6431
+ * deployed. Its cursors carry the last marker's insertion time (`stream_at`),
+ * which is later than that marker's `deleted_at`. Every marker one transaction
+ * writes shares one `deleted_at` (its default is the transaction's start), so
+ * comparing `deleted_at` with that later time would skip the rest of the
+ * transaction for good when a page ended inside it. Resuming from the cursor
+ * row's own `deleted_at` delivers them.
+ *
+ * A cursor this resolver issued already holds that row's exact `deleted_at`, so
+ * LEAST returns it unchanged. An epoch cursor, a pruned row, or a row outside
+ * the caller's scope matches nothing and keeps the cursor's time. A resumed
+ * #6339 cursor can deliver a marker twice, which the client's
+ * `updated_at <= deletedAt` guard makes harmless. It can still miss a marker
+ * from a transaction that started before the named marker's and committed
+ * after it; only devices holding a #6339 cursor are exposed, and that is
+ * accepted (docs/data/sync-deletions-cutoff.md). The text cast keeps the
+ * microseconds the next comparison needs. Names no column #6339 added, so it
+ * stays valid once those are dropped.
+ */
+async function deletionResumeTimestamp(userId: string, ts: string, seq: string): Promise<string> {
+  if (seq === EPOCH_SEQ) return ts;
+  const [cursorRow] = rowsFromResult<{ resume_ts: string }>(
+    await db.execute(sql`
+      SELECT LEAST(${ts}::timestamp, deleted_at)::text AS resume_ts
+      FROM sync_deletions
+      WHERE id = ${seq}::bigint AND (user_id = ${userId} OR user_id IS NULL)
+    `),
+  );
+  return cursorRow?.resume_ts ?? ts;
+}
+
+/**
  * Run a composite-cursor page query and shape it into a SyncResult.
  *
  * Both `updatedAtColumn` and `seqColumn` are caller-controlled SQL fragments
@@ -95,7 +140,12 @@ async function runSyncPage(params: {
     LIMIT ${limit}
   `);
 
-  const rows = rowsFromResult<RawRow>(result);
+  return syncPageResult(rowsFromResult<RawRow>(result), cursor, limit);
+}
+
+/** The same cursor and document contract for ordinary and snapshot-only pages. */
+function syncPageResult(rows: RawRow[], cursor: SyncCursorInput | null | undefined, limit: number): SyncResult {
+  const { ts, seq } = cursorBounds(cursor);
 
   const documents = rows.map((row) => {
     const normalized = normalizeRow(row);
@@ -205,6 +255,97 @@ function boardClimbsScope(boardType: string, layoutId: number | null, sizeId: nu
   );
 }
 
+/** A supplemental page must name the exact imported climb boundary, never a guessed latest manifest. */
+function prepareSnapshotSupplement(
+  audience: SyncAudience | null | undefined,
+  snapshotClimbWatermark: SyncCursorInput | null | undefined,
+): SyncCursor | undefined {
+  if (audience != null && audience !== 'ALL' && audience !== 'SNAPSHOT_SUPPLEMENTAL') {
+    throw new Error('Invalid audience: expected ALL or SNAPSHOT_SUPPLEMENTAL');
+  }
+  const watermark = validateInput(SyncCursorInputSchema, snapshotClimbWatermark, 'snapshotClimbWatermark');
+  if (audience !== 'SNAPSHOT_SUPPLEMENTAL') return undefined;
+  if (!watermark?.updatedAt || !watermark.syncSeq) {
+    throw new Error('Invalid snapshotClimbWatermark: both updatedAt and syncSeq are required');
+  }
+  if (BigInt(watermark.syncSeq) > 9_223_372_036_854_775_807n) {
+    throw new Error('Invalid snapshotClimbWatermark: syncSeq must fit a PostgreSQL bigint');
+  }
+  return { updatedAt: watermark.updatedAt, syncSeq: watermark.syncSeq };
+}
+
+/**
+ * Exact complement of the public artifact's climb predicate, plus changes since
+ * that artifact. The latter also pulls OLD stats/grades for a climb omitted at
+ * export time that became an imported reference climb afterward.
+ *
+ * Keep this aligned with CLIMBS_WHERE in export-board-snapshots.ts. Published
+ * unlisted climbs remain public; the existing draft and spray guards still
+ * decide authorization independently of artifact membership.
+ */
+function snapshotSupplementCondition(watermark: SyncCursor, prefix: SQL = sql``): SQL {
+  return sql`(
+    NOT (
+      ${prefix}user_id IS NULL AND NOT ${prefix}is_boardsesh_authored
+      AND ${prefix}is_draft IS NOT TRUE
+    )
+    OR (${prefix}updated_at, ${prefix}sync_seq) > (${watermark.updatedAt}::timestamp, ${watermark.syncSeq}::bigint)
+  )`;
+}
+
+/** Sparse artifact omissions must drive PK lookups, not filter a full grade-cursor scan. */
+async function runSnapshotSupplementRefPage(params: {
+  table: SQL;
+  climbUuidColumn: SQL;
+  viewerUserId?: string;
+  selectList: SQL;
+  updatedAtColumn: SQL;
+  seqColumn: SQL;
+  boardType: string;
+  layoutId: number | null;
+  sizeId: number | null;
+  cursor: SyncCursorInput | null | undefined;
+  limit: number;
+  snapshotClimbWatermark: SyncCursor;
+}): Promise<SyncResult> {
+  const { table, climbUuidColumn, selectList, updatedAtColumn, seqColumn, boardType, layoutId, sizeId, cursor, limit } =
+    params;
+  const { ts, seq } = cursorBounds(cursor);
+  const candidates = sql.join(
+    [
+      sql`bc.board_type = ${boardType}`,
+      ...boardClimbsLayoutSizeConditions(boardType, layoutId, sizeId, sql`bc.`),
+      climbDraftVisibilityCondition(
+        { isDraft: sql`bc.is_draft`, userId: sql`bc.user_id`, boardType: sql`bc.board_type` },
+        params.viewerUserId,
+      ),
+      snapshotSupplementCondition(params.snapshotClimbWatermark, sql`bc.`),
+    ],
+    sql` AND `,
+  );
+  return withSerialPlan(db, async (transactionDb) => {
+    const result = await transactionDb.execute(sql`
+      WITH snapshot_candidates AS MATERIALIZED (
+        SELECT bc.uuid FROM board_climbs bc WHERE ${candidates}
+      )
+      SELECT supplemental_rows.*
+      FROM snapshot_candidates
+      CROSS JOIN LATERAL (
+        SELECT ${selectList}, ${updatedAtColumn} AS __updated_at, ${seqColumn} AS __seq
+        FROM ${table}
+        WHERE board_type = ${boardType} AND ${climbUuidColumn} = snapshot_candidates.uuid
+          AND (${updatedAtColumn}, ${seqColumn}) > (${ts}::timestamp, ${seq}::bigint)
+          AND ${updatedAtColumn} < now() - make_interval(secs => ${STABILITY_WINDOW_SECONDS})
+        ORDER BY ${updatedAtColumn} ASC, ${seqColumn} ASC
+        LIMIT ${limit}
+      ) supplemental_rows
+      ORDER BY supplemental_rows.__updated_at ASC, supplemental_rows.__seq ASC
+      LIMIT ${limit}
+    `);
+    return syncPageResult(rowsFromResult<RawRow>(result), cursor, limit);
+  });
+}
+
 /**
  * Run one page of a per-board reference table that has no layout_id of its own
  * (board_climb_stats, board_climb_grades) — building the correlated-EXISTS scope
@@ -229,6 +370,7 @@ function boardClimbsScope(boardType: string, layoutId: number | null, sizeId: nu
 async function runScopedBoardRefSyncPage(params: {
   table: SQL;
   climbUuidColumn: SQL;
+  viewerUserId?: string;
   selectList: SQL;
   updatedAtColumn: SQL;
   seqColumn: SQL;
@@ -237,15 +379,27 @@ async function runScopedBoardRefSyncPage(params: {
   sizeId: number | null;
   cursor: SyncCursorInput | null | undefined;
   limit: number;
+  snapshotClimbWatermark?: SyncCursor;
 }): Promise<SyncResult> {
   const { table, climbUuidColumn, selectList, updatedAtColumn, seqColumn, boardType, layoutId, sizeId, cursor, limit } =
     params;
 
+  if (params.snapshotClimbWatermark) {
+    return runSnapshotSupplementRefPage({ ...params, snapshotClimbWatermark: params.snapshotClimbWatermark });
+  }
+
   // The reference row has no layout_id, so scope it to the climbs of that
   // (layout, size) via a correlated EXISTS on board_climbs, reusing the same
-  // shared conditions syncClimbs uses (bc.-qualified here). No scope → plain
-  // board_type filter.
-  const scopeConditions = boardClimbsLayoutSizeConditions(boardType, layoutId, sizeId, sql`bc.`);
+  // shared conditions syncClimbs uses (bc.-qualified here), and the same climb
+  // rule: a draft's stats and grades go only to the draft's owner. A published
+  // climb has no audience, so its rows go to everyone whoever set it.
+  const scopeConditions = [
+    ...boardClimbsLayoutSizeConditions(boardType, layoutId, sizeId, sql`bc.`),
+    climbDraftVisibilityCondition(
+      { isDraft: sql`bc.is_draft`, userId: sql`bc.user_id`, boardType: sql`bc.board_type` },
+      params.viewerUserId,
+    ),
+  ];
   let scope: SQL = sql`board_type = ${boardType}`;
   if (scopeConditions.length > 0) {
     const sub = sql.join(
@@ -341,6 +495,7 @@ async function enrichSprayWallDocument(document: RawRow): Promise<RawRow> {
 }
 
 export const syncQueries = {
+  syncClimbDocuments,
   /**
    * Pull the authenticated user's ticks. Local PK = uuid (the idempotency key).
    * Seq = id. Skips aurora_/kilter_ sync bookkeeping, board_id, inferred_session_id.
@@ -352,7 +507,7 @@ export const syncQueries = {
   ): Promise<SyncResult> => {
     const { userId, limit: lim } = prepareUserSync(ctx, cursor, limit);
     return runSyncPage({
-      selectList: sql`uuid, user_id, board_type, climb_uuid, angle, is_mirror, status,
+      selectList: sql`uuid, user_id, board_type, climb_uuid, climb_revision, angle, is_mirror, status,
         attempt_count, quality, difficulty, is_benchmark, comment, climbed_at, session_id,
         created_at, updated_at`,
       fromClause: sql`boardsesh_ticks`,
@@ -511,14 +666,20 @@ export const syncQueries = {
       boardType,
       layoutId,
       sizeId,
+      sprayWallUuid,
       cursor,
       limit,
+      audience,
+      snapshotClimbWatermark,
     }: {
       boardType: string;
       layoutId?: number | null;
       sizeId?: number | null;
+      sprayWallUuid?: string | null;
       cursor?: SyncCursorInput | null;
       limit: number;
+      audience?: SyncAudience | null;
+      snapshotClimbWatermark?: SyncCursorInput | null;
     },
     ctx: ConnectionContext,
   ): Promise<SyncResult> => {
@@ -528,14 +689,27 @@ export const syncQueries = {
       layoutId: lid,
       sizeId: sid,
     } = prepareBoardSync(ctx, cursor, limit, boardType, layoutId, sizeId);
+    const supplementalWatermark = prepareSnapshotSupplement(audience, snapshotClimbWatermark);
 
-    // The board scope here is `board_type` + an optional `layout_id` and NOTHING
-    // else — no `is_listed`, no `is_draft` — because this is a full row mirror for
-    // the offline database. On the eight catalogue boards that is correct; on spray
-    // it is the highest-fidelity leak in the API, because one authenticated account
-    // could walk `layoutId` 1..N and pull every column of every private wall's
-    // climbs. An unreadable scope returns an ordinary empty page.
-    if (isSprayBoardType(validBoardType) && !(await sprayLayoutIsReadable(validBoardType, lid, ctx.userId))) {
+    // The board scope here is `board_type` + an optional `layout_id` and the
+    // draft rule — no `is_listed`, no account privacy (a published climb is
+    // public whoever set it) — because this is a full row
+    // mirror for the offline database: unlisted climbs ship and the device's lists
+    // hide them. A draft ships only to its owner (`user_id` = viewer); a draft with
+    // no Boardsesh owner, imported from a Kilter or Tension account, ships to
+    // nobody. On spray the layout scope is the highest-fidelity leak in the API,
+    // because one authenticated account could walk `layoutId` 1..N and pull every
+    // column of every private wall's climbs. An unreadable scope returns an
+    // ordinary empty page.
+    if (
+      isSprayBoardType(validBoardType) &&
+      !(await sprayLayoutIsReadableWithCapability(
+        validBoardType,
+        lid,
+        ctx.userId,
+        sprayWallUuid == null ? null : validateInput(UUIDSchema, sprayWallUuid, 'sprayWallUuid'),
+      ))
+    ) {
       return emptySyncPage(cursor);
     }
 
@@ -543,9 +717,10 @@ export const syncQueries = {
       selectList: sql`uuid, board_type, layout_id, setter_id, setter_username, name, description,
         hsm, edge_left, edge_right, edge_bottom, edge_top, angle, frames_count, frames_pace, frames,
         is_draft, is_listed, is_hidden, created_at, published_at, user_id, required_set_ids, compatible_size_ids,
-        characteristics, hold_fingerprint, missing_hold_count, updated_at, sync_seq`,
+        characteristics, hold_fingerprint, missing_hold_count, retired_by_reset, revision_number, holds_revision_number,
+        updated_at, sync_seq`,
       fromClause: sql`board_climbs`,
-      scope: boardClimbsScope(validBoardType, lid, sid),
+      scope: sql`(${boardClimbsScope(validBoardType, lid, sid)}) AND ${climbDraftVisibilityCondition({ isDraft: sql`board_climbs.is_draft`, userId: sql`board_climbs.user_id`, boardType: sql`board_climbs.board_type` }, ctx.userId)}${supplementalWatermark ? sql` AND ${snapshotSupplementCondition(supplementalWatermark, sql`board_climbs.`)}` : sql``}`,
       updatedAtColumn: sql`updated_at`,
       seqColumn: sql`sync_seq`,
       cursor,
@@ -566,14 +741,20 @@ export const syncQueries = {
       boardType,
       layoutId,
       sizeId,
+      sprayWallUuid,
       cursor,
       limit,
+      audience,
+      snapshotClimbWatermark,
     }: {
       boardType: string;
       layoutId?: number | null;
       sizeId?: number | null;
+      sprayWallUuid?: string | null;
       cursor?: SyncCursorInput | null;
       limit: number;
+      audience?: SyncAudience | null;
+      snapshotClimbWatermark?: SyncCursorInput | null;
     },
     ctx: ConnectionContext,
   ): Promise<SyncResult> => {
@@ -583,20 +764,31 @@ export const syncQueries = {
       layoutId: lid,
       sizeId: sid,
     } = prepareBoardSync(ctx, cursor, limit, boardType, layoutId, sizeId);
+    const supplementalWatermark = prepareSnapshotSupplement(audience, snapshotClimbWatermark);
 
     // Same enumeration as `syncClimbs`: this scope reaches `board_climbs` by
     // layout to decide which rows belong to the pull, so a private spray wall
     // would hand over its climbs' stats (and grades) to any account that guessed
     // the layout id.
-    if (isSprayBoardType(validBoardType) && !(await sprayLayoutIsReadable(validBoardType, lid, ctx.userId))) {
+    if (
+      isSprayBoardType(validBoardType) &&
+      !(await sprayLayoutIsReadableWithCapability(
+        validBoardType,
+        lid,
+        ctx.userId,
+        sprayWallUuid == null ? null : validateInput(UUIDSchema, sprayWallUuid, 'sprayWallUuid'),
+      ))
+    ) {
       return emptySyncPage(cursor);
     }
 
     return runScopedBoardRefSyncPage({
+      viewerUserId: ctx.userId,
+      snapshotClimbWatermark: supplementalWatermark,
       table: sql`board_climb_stats`,
       climbUuidColumn: sql`board_climb_stats.climb_uuid`,
       selectList: sql`board_type, climb_uuid, angle, display_difficulty, benchmark_difficulty,
-        ascensionist_count, difficulty_average, quality_average, fa_username, fa_at, updated_at, sync_seq`,
+        ascensionist_count, difficulty_average, quality_average, ${privateSafeFirstAscentName({ boardType: sql`board_climb_stats.board_type`, climbUuid: sql`board_climb_stats.climb_uuid`, angle: sql`board_climb_stats.angle`, username: sql`board_climb_stats.fa_username` }, ctx.userId)} AS fa_username, fa_at, updated_at, sync_seq`,
       updatedAtColumn: sql`board_climb_stats.updated_at`,
       seqColumn: sql`board_climb_stats.sync_seq`,
       boardType: validBoardType,
@@ -622,14 +814,20 @@ export const syncQueries = {
       boardType,
       layoutId,
       sizeId,
+      sprayWallUuid,
       cursor,
       limit,
+      audience,
+      snapshotClimbWatermark,
     }: {
       boardType: string;
       layoutId?: number | null;
       sizeId?: number | null;
+      sprayWallUuid?: string | null;
       cursor?: SyncCursorInput | null;
       limit: number;
+      audience?: SyncAudience | null;
+      snapshotClimbWatermark?: SyncCursorInput | null;
     },
     ctx: ConnectionContext,
   ): Promise<SyncResult> => {
@@ -639,16 +837,27 @@ export const syncQueries = {
       layoutId: lid,
       sizeId: sid,
     } = prepareBoardSync(ctx, cursor, limit, boardType, layoutId, sizeId);
+    const supplementalWatermark = prepareSnapshotSupplement(audience, snapshotClimbWatermark);
 
     // Same enumeration as `syncClimbs`: this scope reaches `board_climbs` by
     // layout to decide which rows belong to the pull, so a private spray wall
     // would hand over its climbs' stats (and grades) to any account that guessed
     // the layout id.
-    if (isSprayBoardType(validBoardType) && !(await sprayLayoutIsReadable(validBoardType, lid, ctx.userId))) {
+    if (
+      isSprayBoardType(validBoardType) &&
+      !(await sprayLayoutIsReadableWithCapability(
+        validBoardType,
+        lid,
+        ctx.userId,
+        sprayWallUuid == null ? null : validateInput(UUIDSchema, sprayWallUuid, 'sprayWallUuid'),
+      ))
+    ) {
       return emptySyncPage(cursor);
     }
 
     return runScopedBoardRefSyncPage({
+      viewerUserId: ctx.userId,
+      snapshotClimbWatermark: supplementalWatermark,
       table: sql`board_climb_grades`,
       climbUuidColumn: sql`board_climb_grades.climb_uuid`,
       selectList: sql`board_type, climb_uuid, angle, local_grade, universal_grade, grade_low, grade_high,
@@ -703,12 +912,14 @@ export const syncQueries = {
       boardType,
       layoutId,
       sizeId,
+      sprayWallUuid,
       cursor,
       limit,
     }: {
       boardType: string;
       layoutId?: number | null;
       sizeId?: number | null;
+      sprayWallUuid?: string | null;
       cursor?: SyncCursorInput | null;
       limit: number;
     },
@@ -729,7 +940,15 @@ export const syncQueries = {
     // Only spray has walls, and `sprayLayoutIsReadable` answers false without a
     // layout id — there is no wall an unscoped pull could be checked against.
     // Both land on the same empty page.
-    if (!isSprayBoardType(validBoardType) || !(await sprayLayoutIsReadable(validBoardType, lid, ctx.userId))) {
+    if (
+      !isSprayBoardType(validBoardType) ||
+      !(await sprayLayoutIsReadableWithCapability(
+        validBoardType,
+        lid,
+        ctx.userId,
+        sprayWallUuid == null ? null : validateInput(UUIDSchema, sprayWallUuid, 'sprayWallUuid'),
+      ))
+    ) {
       return emptySyncPage(cursor);
     }
 
@@ -768,7 +987,7 @@ export const syncQueries = {
   /**
    * Pull hard deletions for the client to apply locally. Scoped to the user's own
    * deletions plus reference-data deletions (user_id IS NULL). Cursor on
-   * (deleted_at, id).
+   * (deleted_at, id), resumed through {@link deletionResumeTimestamp}.
    */
   syncDeletions: async (
     _: unknown,
@@ -777,12 +996,13 @@ export const syncQueries = {
   ): Promise<SyncDeletionsResult> => {
     const { userId, limit: lim } = prepareUserSync(ctx, cursor, limit);
     const { ts, seq } = cursorBounds(cursor);
+    const resumeTs = await deletionResumeTimestamp(userId, ts, seq);
 
     const result = await db.execute(sql`
       SELECT table_name, record_id, deleted_at, id AS __seq
       FROM sync_deletions
       WHERE (user_id = ${userId} OR user_id IS NULL)
-        AND (deleted_at, id) > (${ts}::timestamp, ${seq}::bigint)
+        AND (deleted_at, id) > (${resumeTs}::timestamp, ${seq}::bigint)
         AND deleted_at < now() - make_interval(secs => ${STABILITY_WINDOW_SECONDS})
       ORDER BY deleted_at ASC, id ASC
       LIMIT ${lim}

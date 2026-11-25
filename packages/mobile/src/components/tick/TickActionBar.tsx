@@ -10,14 +10,19 @@
 //
 // It adds NO padding of its own: Sheet/ModalSheet's footer bar already applies
 // the gutter, the top inset and the window bottom inset.
-import React, { useMemo } from 'react';
+import React, { useMemo, type ReactNode } from 'react';
 import { StyleSheet, useWindowDimensions, View } from 'react-native';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
-import { Button } from '../Button';
+import { TickActionButton as Button } from './TickActionButton';
 import { useTheme } from '../../providers/theme-provider';
 import type { IconName } from '../icon-map';
-import { TICK_ACTION_HEIGHT, TICK_ERROR_SLOT_HEIGHT, tickActionHeight } from './tick-sheet-metrics';
+import {
+  TICK_ACTION_HEIGHT,
+  TICK_ACTION_MAX_FONT_SCALE,
+  TICK_ERROR_SLOT_HEIGHT,
+  tickActionHeight,
+} from './tick-sheet-metrics';
 
 const ERROR_ICON_SIZE = 13;
 
@@ -40,9 +45,16 @@ type TickActionBarProps = {
   secondary?: TickAction;
   /** Rendered in the always-reserved slot above the buttons. */
   error?: string | null;
+  /** Comment stays above the actions at every sheet detent. */
+  note?: ReactNode;
 };
 
-export const TickActionBar = React.memo(function TickActionBar({ primary, secondary, error }: TickActionBarProps) {
+export const TickActionBar = React.memo(function TickActionBar({
+  primary,
+  secondary,
+  error,
+  note,
+}: TickActionBarProps) {
   const { brandColors, spacing } = useTheme();
   const { fontScale } = useWindowDimensions();
   // Memoized: `Button` is a native host, so a fresh style object every render is
@@ -51,6 +63,11 @@ export const TickActionBar = React.memo(function TickActionBar({ primary, second
 
   return (
     <View>
+      {note ? (
+        <View style={styles.noteRow} testID="tick-action-note">
+          {note}
+        </View>
+      ) : null}
       {/* The live region sits on the ALWAYS-mounted slot, not on the message:
           a region that mounts with its content is announced inconsistently, and
           moving it would give up the reserved height that keeps the buttons
@@ -64,7 +81,7 @@ export const TickActionBar = React.memo(function TickActionBar({ primary, second
       >
         {error ? (
           <>
-            <Icon name="warning" size={ERROR_ICON_SIZE} color={brandColors.error} />
+            <Icon maxFontSizeMultiplier={1} name="warning" size={ERROR_ICON_SIZE} color={brandColors.error} />
             <Text variant="footnote" color={brandColors.error} numberOfLines={2} style={styles.errorText}>
               {error}
             </Text>
@@ -80,6 +97,7 @@ export const TickActionBar = React.memo(function TickActionBar({ primary, second
             disabled={secondary.disabled}
             variant="tonal"
             size="large"
+            maxFontSizeMultiplier={TICK_ACTION_MAX_FONT_SCALE}
             style={buttonStyles.secondary}
           />
         ) : null}
@@ -92,6 +110,7 @@ export const TickActionBar = React.memo(function TickActionBar({ primary, second
           icon={primary.icon}
           variant="filled"
           size="large"
+          maxFontSizeMultiplier={TICK_ACTION_MAX_FONT_SCALE}
           style={secondary ? buttonStyles.primaryPaired : buttonStyles.primaryAlone}
         />
       </View>
@@ -100,6 +119,11 @@ export const TickActionBar = React.memo(function TickActionBar({ primary, second
 });
 
 const styles = StyleSheet.create({
+  noteRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    flexShrink: 0,
+  },
   errorSlot: {
     // Reserved, always. See the note at the top of the file.
     minHeight: TICK_ERROR_SLOT_HEIGHT,

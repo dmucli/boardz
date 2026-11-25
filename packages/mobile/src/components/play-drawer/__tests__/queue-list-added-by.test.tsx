@@ -1,7 +1,20 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { act, render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ClimbQueueItem } from '@boardsesh/queue';
 
 // Wiring guard for #4672. `QueueItemRow` renders in THREE places inside
@@ -17,7 +30,14 @@ import type { ClimbQueueItem } from '@boardsesh/queue';
 // starts mid-queue" test would prove nothing. A store notification re-renders
 // QueueList through the memo, exactly the way a real context change does.
 const session = vi.hoisted(() => {
-  type Snapshot = { sessionId: string | null; profile: { id: string } | null; isLoading?: boolean };
+  type Snapshot = {
+    sessionId: string | null;
+    profile: { id: string } | null;
+    isLoading?: boolean;
+    authenticatedUserId?: string | null;
+    isAuthenticated?: boolean;
+    isAuthLoading?: boolean;
+  };
   const listeners = new Set<() => void>();
   let snapshot: Snapshot = { sessionId: null, profile: null };
   return {
@@ -37,13 +57,20 @@ const capturedRows = vi.hoisted(() => ({
   props: [] as Record<string, unknown>[],
 }));
 
+const rowGeometry = vi.hoisted(() => ({ fontScale: 1 }));
+
 type ViewProps = { children?: ReactNode; testID?: string; style?: unknown };
 
 vi.mock('react-native', () => ({
+  useWindowDimensions: () => ({ fontScale: rowGeometry.fontScale }),
   View: ({ children }: ViewProps) => createElement('div', null, children),
   Pressable: ({ children }: ViewProps) => createElement('div', null, children),
   Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 vi.mock('@expo/ui/community/bottom-sheet', () => ({
@@ -63,13 +90,18 @@ vi.mock('@expo/ui/community/bottom-sheet', () => ({
     ),
 }));
 
+// The local (mount-point) inset, and every bottom inset QueueList hands to
+// withSheetBottomInset, so the window-inset test can see which one it used.
+const insetProbe = vi.hoisted(() => ({ localBottom: 0, sheetInsets: [] as number[] }));
+
 vi.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+  useSafeAreaInsets: () => ({ top: 0, bottom: insetProbe.localBottom, left: 0, right: 0 }),
 }));
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: { separator: '#ccc', secondaryBackground: '#fff' },
     brandColors: { primary: '#6D28D9' },
@@ -78,11 +110,16 @@ vi.mock('../../../providers/theme-provider', () => ({
 
 vi.mock('../../../lib/haptics', () => ({ hapticSelection: vi.fn() }));
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 10: 40, 16: 64 },
 }));
-vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: { systemGray: '#888' } }));
 vi.mock('../../../lib/graphql/hooks', () => ({ useSearchClimbs: () => ({ data: undefined }) }));
-vi.mock('../../sheet-content-inset', () => ({ withSheetBottomInset: (style: unknown) => style }));
+vi.mock('../../sheet-content-inset', () => ({
+  withSheetBottomInset: (style: unknown, insetBottom: number) => {
+    insetProbe.sheetInsets.push(insetBottom);
+    return style;
+  },
+}));
 vi.mock('../use-queue-drag', () => ({
   useQueueDrag: () => ({
     isDragging: false,
@@ -93,6 +130,7 @@ vi.mock('../use-queue-drag', () => ({
     },
   }),
 }));
+vi.mock('../../SectionHeader', () => ({ SectionHeader: () => null }));
 vi.mock('../../Text', () => ({ Text: ({ children }: ViewProps) => createElement('span', null, children) }));
 vi.mock('../../ClimbListItemContent', () => ({ ClimbListItemContent: () => createElement('span', null) }));
 
@@ -100,7 +138,7 @@ vi.mock('../../ClimbListItemContent', () => ({ ClimbListItemContent: () => creat
 // constants QueueList imports from the same module for its styles.
 vi.mock('../../QueueItemRow', () => ({
   POSITION_SLOT_WIDTH: 28,
-  SEPARATOR_INSET: 200,
+  QUEUE_ROW_LEADING_INSET: 52,
   QueueItemRow: (props: Record<string, unknown>) => {
     capturedRows.props.push(props);
     return createElement('div');
@@ -116,17 +154,40 @@ vi.mock('../../../providers/queue-provider', async () => {
   };
 });
 
+vi.mock('../../../providers/auth-provider', async () => {
+  const React = await vi.importActual<typeof import('react')>('react');
+  return {
+    useAuth: () => ({
+      isLoading:
+        React.useSyncExternalStore(session.subscribe, session.getSnapshot, session.getSnapshot).isAuthLoading ?? false,
+    }),
+  };
+});
+
 vi.mock('../../../providers/party-profile-provider', async () => {
   const React = await vi.importActual<typeof import('react')>('react');
   return {
     usePartyProfile: () => {
       const snapshot = React.useSyncExternalStore(session.subscribe, session.getSnapshot, session.getSnapshot);
-      return { profile: snapshot.profile, isLoading: snapshot.isLoading ?? false };
+      return {
+        profile: snapshot.profile,
+        isLoading: snapshot.isLoading ?? false,
+        isAuthenticated: snapshot.isAuthenticated ?? !!snapshot.profile,
+        authenticatedUserId:
+          snapshot.authenticatedUserId === undefined
+            ? snapshot.profile
+              ? 'account-me'
+              : null
+            : snapshot.authenticatedUserId,
+      };
     },
   };
 });
 
 import { QueueList } from '../QueueList';
+import { resolveQueueRowAttribution } from '../../../lib/queue-attribution';
+import { applyClimbRowPreset, resetClimbRowDisplayForTests } from '../../../lib/climb-row-display-preference';
+import { publishWindowInsetBottom, resetWindowInsetForTests } from '../../../lib/window-inset-store';
 
 const board = { boardName: 'kilter' as const, layoutId: 1, sizeId: 10, setIds: '1,2', angle: 40 };
 
@@ -140,11 +201,11 @@ function makeItem(uuid: string): ClimbQueueItem {
 
 const queue = [makeItem('a'), makeItem('b'), makeItem('c')];
 
-function renderList() {
+function renderList(items: ClimbQueueItem[] = queue) {
   return render(
     <QueueList
-      queue={queue}
-      currentItemUuid="b"
+      queue={items}
+      currentItem={items.find(({ uuid }) => uuid === 'b') ?? null}
       board={board}
       isEditMode={false}
       showHistory
@@ -182,7 +243,7 @@ describe('QueueList added-by wiring', () => {
 
     for (const props of capturedRows.props) {
       expect(props.showAddedBy).toBe(true);
-      expect(props.viewerUserId).toBe('me');
+      expect(props.viewerUserId).toBe('account-me');
     }
   });
 
@@ -210,7 +271,7 @@ describe('QueueList added-by wiring', () => {
     expect(capturedRows.props).toHaveLength(3);
     for (const props of capturedRows.props) {
       expect(props.showAddedBy).toBe(true);
-      expect(props.viewerUserId).toBe('me');
+      expect(props.viewerUserId).toBe('account-me');
     }
   });
 
@@ -225,12 +286,17 @@ describe('QueueList added-by wiring', () => {
     }
   });
 
-  it('holds every face back until the party profile has resolved', () => {
+  it('holds every face back until the authenticated account has resolved', () => {
     // A cold launch into a restored session resolves sessionId before the party
     // profile, so viewerUserId is null for a frame. Without this gate the
     // viewer's OWN face flashes on their own rows, because the queue provider
     // stamps solo adds with this device's identity too.
-    session.set({ sessionId: 'session-1', profile: null, isLoading: true });
+    session.set({
+      sessionId: 'session-1',
+      profile: { id: 'device-party' },
+      isAuthenticated: true,
+      authenticatedUserId: null,
+    });
     renderList();
 
     expect(capturedRows.props).toHaveLength(3);
@@ -245,7 +311,153 @@ describe('QueueList added-by wiring', () => {
     expect(capturedRows.props).toHaveLength(3);
     for (const props of capturedRows.props) {
       expect(props.showAddedBy).toBe(true);
-      expect(props.viewerUserId).toBe('me');
+      expect(props.viewerUserId).toBe('account-me');
     }
+  });
+});
+
+describe('QueueList authenticated account identity transitions', () => {
+  it('holds faces during unresolved authentication then permits genuine anonymous peers', () => {
+    capturedRows.props = [];
+    session.set({
+      sessionId: 'session-1',
+      profile: { id: 'device-party' },
+      isAuthenticated: false,
+      isAuthLoading: true,
+    });
+    renderList();
+    expect(capturedRows.props.every((props) => props.showAddedBy === false)).toBe(true);
+    capturedRows.props = [];
+    act(() =>
+      session.set({
+        sessionId: 'session-1',
+        profile: { id: 'device-party' },
+        isAuthenticated: false,
+        isAuthLoading: false,
+      }),
+    );
+    expect(capturedRows.props.every((props) => props.showAddedBy === true && props.viewerUserId === null)).toBe(true);
+  });
+
+  it('hides account-owned faces, retains peers, and waits through account refresh and switching', () => {
+    const ownItem = {
+      ...makeItem('a'),
+      addedByUser: { id: 'account-a', username: 'Marco', avatarUrl: 'https://example.test/marco.png' },
+    };
+    const peerItem = {
+      ...makeItem('b'),
+      addedByUser: { id: 'account-b', username: 'Mina', avatarUrl: 'https://example.test/mina.png' },
+    };
+    capturedRows.props = [];
+    session.set({
+      sessionId: 'session-1',
+      profile: { id: 'device-party' },
+      isAuthenticated: true,
+      authenticatedUserId: null,
+    });
+    renderList([ownItem, peerItem]);
+    expect(capturedRows.props.every((props) => props.showAddedBy === false)).toBe(true);
+    const visibleAuthors = () =>
+      capturedRows.props.map((props) =>
+        resolveQueueRowAttribution((props.item as ClimbQueueItem).addedByUser, {
+          showAddedBy: props.showAddedBy as boolean,
+          viewerUserId: props.viewerUserId as string | null,
+        }),
+      );
+    capturedRows.props = [];
+    act(() =>
+      session.set({
+        sessionId: 'session-1',
+        profile: { id: 'device-party' },
+        isAuthenticated: true,
+        authenticatedUserId: 'account-a',
+      }),
+    );
+    expect(visibleAuthors()).toEqual([null, { name: 'Mina', avatarUrl: 'https://example.test/mina.png' }]);
+    capturedRows.props = [];
+    act(() =>
+      session.set({
+        sessionId: 'session-1',
+        profile: { id: 'device-party' },
+        isAuthenticated: true,
+        authenticatedUserId: null,
+      }),
+    );
+    expect(visibleAuthors()).toEqual([null, null]);
+    capturedRows.props = [];
+    act(() =>
+      session.set({
+        sessionId: 'session-1',
+        profile: { id: 'device-party' },
+        isAuthenticated: true,
+        authenticatedUserId: 'account-b',
+      }),
+    );
+    expect(visibleAuthors()).toEqual([{ name: 'Marco', avatarUrl: 'https://example.test/marco.png' }, null]);
+    capturedRows.props = [];
+    act(() =>
+      session.set({
+        sessionId: 'session-1',
+        profile: { id: 'device-party' },
+        isAuthenticated: false,
+        authenticatedUserId: 'account-b',
+      }),
+    );
+    expect(capturedRows.props.every((props) => props.viewerUserId === null)).toBe(true);
+    expect(visibleAuthors()).toEqual([
+      { name: 'Marco', avatarUrl: 'https://example.test/marco.png' },
+      { name: 'Mina', avatarUrl: 'https://example.test/mina.png' },
+    ]);
+  });
+});
+
+describe('QueueList bottom inset', () => {
+  beforeEach(() => {
+    insetProbe.localBottom = 0;
+    insetProbe.sheetInsets = [];
+    resetWindowInsetForTests();
+  });
+
+  it('pads the list by the WINDOW inset, not the in-tab inset that folds in the tab bar (#3776)', () => {
+    // QueueList only renders inside the native QueueSheet, which covers the tab
+    // bar + accessory folded into a 139pt in-tab inset (DEVICE_VERIFIED iPhone
+    // 17 Pro). The last row must clear only the window's 34.
+    insetProbe.localBottom = 139;
+    act(() => publishWindowInsetBottom(34));
+    renderList();
+
+    expect(insetProbe.sheetInsets.at(-1)).toBe(34);
+  });
+});
+
+describe('mixed-board compact queue reorder', () => {
+  afterEach(() => {
+    rowGeometry.fontScale = 1;
+    resetClimbRowDisplayForTests();
+  });
+  // 1.353 is React Native's iOS fontScale at xxxLarge. A text-only row with the
+  // mirror budget: a body name, a footnote detail line, one caption2 direction
+  // line, two 2pt gaps and 16pt of padding, each line on its ramp (body 23/17,
+  // footnote 19/13, caption2 17/11).
+  it.each([
+    { fontScale: 1, expectedHeight: 73 },
+    { fontScale: 1.353, expectedHeight: Math.ceil(22 * (23 / 17) + 18 * (19 / 13) + 13 * (17 / 11) + 4 + 16) },
+  ])('gives every future row the mirror budget at font scale $fontScale', ({ fontScale, expectedHeight }) => {
+    rowGeometry.fontScale = fontScale;
+    applyClimbRowPreset('textOnly');
+    capturedRows.props = [];
+    const tensionItem = {
+      ...makeItem('d'),
+      climb: { uuid: 'tension-climb', name: 'Tension climb', boardType: 'tension', layoutId: 9, angle: 35 },
+    } as ClimbQueueItem;
+    renderList([...queue, tensionItem]);
+    const futureRows = capturedRows.props.filter((row) => row.isDraggable);
+    expect(futureRows).toHaveLength(2);
+    expect(futureRows.map((row) => row.minimumHeight)).toEqual([expectedHeight, expectedHeight]);
+    expect(
+      capturedRows.props
+        .filter((row) => row.isCurrentClimb || row.isHistoryItem)
+        .every((row) => row.minimumHeight === undefined),
+    ).toBe(true);
   });
 });

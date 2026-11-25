@@ -55,8 +55,8 @@ function makeCtx(overrides: Partial<ConnectionContext> = {}): ConnectionContext 
     transport: 'ws',
     sessionId: 'session-1',
     participantId: 'participant-1',
-    userId: undefined,
-    isAuthenticated: false,
+    userId: 'user-1',
+    isAuthenticated: true,
     ...overrides,
   };
 }
@@ -80,6 +80,8 @@ const sampleQueueState = {
   stateHashOrdered: 'hash-5-ordered',
   queue: [],
   currentClimbQueueItem: null,
+  historyCount: 0,
+  currentChangedAt: '2026-05-18T12:05:00.000Z',
   version: 3,
 };
 
@@ -110,6 +112,9 @@ describe('buildSessionPayload — defaults (no overrides)', () => {
         stateHashOrdered: 'hash-5-ordered',
         queue: [],
         currentClimbQueueItem: null,
+        historyCount: 0,
+        currentChangedAt: '2026-05-18T12:05:00.000Z',
+        currentChangedBy: null,
       },
       isLeader: true, // leaderConnectionId === ctx.connectionId
       lastConnectedBoardSerial: 'SERIAL-123',
@@ -143,7 +148,7 @@ describe('buildSessionPayload — override short-circuits', () => {
     const payload = await buildSessionPayload('session-1', makeCtx(), { users: prefetched });
 
     expect(getSessionUsersMock).not.toHaveBeenCalled();
-    expect(payload.users).toBe(prefetched);
+    expect(payload.users).toEqual(prefetched);
   });
 
   it('skips getQueueState when inputs.queueState is supplied', async () => {
@@ -157,7 +162,13 @@ describe('buildSessionPayload — override short-circuits', () => {
     const payload = await buildSessionPayload('session-1', makeCtx(), { queueState: prefetched });
 
     expect(getQueueStateMock).not.toHaveBeenCalled();
-    expect(payload.queueState).toEqual(prefetched);
+    // A prefetched state without the F3 fields (#6666) reads as null for both.
+    expect(payload.queueState).toEqual({
+      ...prefetched,
+      historyCount: null,
+      currentChangedAt: null,
+      currentChangedBy: null,
+    });
   });
 
   it('skips getSessionById when inputs.sessionData is supplied (including explicit null)', async () => {
@@ -263,9 +274,14 @@ describe('buildSessionPayload — name / boardPath / participantId fallthrough',
   // creator/leader server-side) — but a wrong value here either strands a
   // creator or dangles an action the server will refuse.
   describe('createdByUserId', () => {
-    it('comes from the session row by default', async () => {
+    it('comes from the session row for its authenticated creator', async () => {
       const payload = await buildSessionPayload('session-1', makeCtx());
       expect(payload.createdByUserId).toBe('user-1');
+    });
+
+    it('withholds a creator when the viewer cannot read the session identity', async () => {
+      const payload = await buildSessionPayload('session-1', makeCtx({ userId: undefined, isAuthenticated: false }));
+      expect(payload.createdByUserId).toBeNull();
     });
 
     it('is null when the session row has vanished (cleanup race) or the creator was anonymous', async () => {

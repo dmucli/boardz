@@ -1,4 +1,4 @@
-export const SUPPORTED_LOCALES = ['en-US', 'es', 'fr', 'de'] as const;
+export const SUPPORTED_LOCALES = ['en-US', 'es', 'fr', 'de', 'it', 'zh-CN'] as const;
 export type Locale = (typeof SUPPORTED_LOCALES)[number];
 
 export const DEFAULT_LOCALE: Locale = 'en-US';
@@ -9,6 +9,8 @@ export const LOCALE_HTML_LANG: Record<Locale, string> = {
   es: 'es',
   fr: 'fr',
   de: 'de',
+  it: 'it',
+  'zh-CN': 'zh-Hans',
 };
 
 export const LOCALE_OG: Record<Locale, string> = {
@@ -16,6 +18,8 @@ export const LOCALE_OG: Record<Locale, string> = {
   es: 'es_ES',
   fr: 'fr_FR',
   de: 'de_DE',
+  it: 'it_IT',
+  'zh-CN': 'zh_CN',
 };
 
 export const LOCALE_LABELS: Record<Locale, string> = {
@@ -23,6 +27,8 @@ export const LOCALE_LABELS: Record<Locale, string> = {
   es: 'Español',
   fr: 'Français',
   de: 'Deutsch',
+  it: 'Italiano',
+  'zh-CN': '中文（简体）',
 };
 
 /**
@@ -31,7 +37,10 @@ export const LOCALE_LABELS: Record<Locale, string> = {
  */
 export const ALL_NAMESPACES = [
   'common',
+  'consent',
   'marketing',
+  'appGuides',
+  'website',
   'auth',
   'settings',
   'profile',
@@ -46,15 +55,21 @@ export const ALL_NAMESPACES = [
   'boards',
   'kiosk',
   'gyms',
+  'devTools',
+  'oauth',
+  'developers',
+  'cnc',
+  'cnc-legal',
 ] as const;
 export type Namespace = (typeof ALL_NAMESPACES)[number];
 
 /**
- * Namespaces available in the mobile app. Web-only namespaces (`marketing`,
- * `admin`, `gyms`) are excluded so Metro never bundles them.
+ * Namespaces available in the mobile app. Web-only catalogs are excluded so
+ * Metro never bundles them.
  */
 export const MOBILE_NAMESPACES = [
   'common',
+  'consent',
   'auth',
   'climbs',
   'session',

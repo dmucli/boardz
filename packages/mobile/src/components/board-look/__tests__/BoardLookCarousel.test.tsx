@@ -15,14 +15,18 @@ const cardProps = vi.hoisted(() => ({
   enlarge: new Map<string, (id: string) => void>(),
   rendered: [] as { id: string; showSkeleton: boolean }[],
   press: new Map<string, (id: string) => void>(),
+  /** The override each card was last drawn with, by option id. */
+  overrides: new Map<string, unknown>(),
 }));
 const sheet = vi.hoisted(() => ({ visible: false, title: null as string | null }));
 
 vi.mock('react-native', () => ({
+  AppState: { addEventListener: () => ({ remove: () => {} }) },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1, absoluteFill: {} },
   // Something in the import graph reads Platform at module scope.
   Platform: { OS: 'ios', select: (spec: Record<string, unknown>) => spec.ios },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (color: string) => color,
   AccessibilityInfo: {
     isReduceMotionEnabled: () => Promise.resolve(false),
@@ -47,9 +51,11 @@ vi.mock('../BoardLookPreviewCard', () => ({
   BoardLookPreviewCard: (props: {
     option: { id: string };
     showSkeleton: boolean;
+    renderSettingsOverride?: unknown;
     onPress: (id: string) => void;
     onEnlarge: (id: string) => void;
   }) => {
+    cardProps.overrides.set(props.option.id, props.renderSettingsOverride);
     cardProps.rendered.push({ id: props.option.id, showSkeleton: props.showSkeleton });
     cardProps.press.set(props.option.id, props.onPress);
     cardProps.enlarge.set(props.option.id, props.onEnlarge);
@@ -65,7 +71,8 @@ vi.mock('../BoardPreviewSheet', () => ({
 }));
 
 const { BoardLookCarousel } = await import('../BoardLookCarousel');
-const { BOARD_LOOK_ONBOARDING_OPTIONS } = await import('../../../lib/board-render/board-look-options');
+const { BOARD_LOOK_ONBOARDING_OPTIONS, SPRAY_WALL_LOOK_OPTIONS, withSprayWallDim } =
+  await import('../../../lib/board-render/board-look-options');
 
 const PREVIEW = {
   frames: 'p1r12',
@@ -169,5 +176,30 @@ describe('BoardLookCarousel — pressing a card', () => {
     expect(sheet.title).toBe('mobile.settings.boardLook.mode.options.classic');
     // Looking is not choosing.
     expect(onSelect).not.toHaveBeenCalled();
+  });
+});
+
+describe('BoardLookCarousel — one changed option', () => {
+  it('keeps every other card on the override it already had', () => {
+    // The spray look step's dim drag swaps the selected option for a dimmed
+    // copy on every frame; only that card may get a new override, or every
+    // card's native render re-fires per frame.
+    const selectedId = SPRAY_WALL_LOOK_OPTIONS.find((option) => option.previewSettings?.mode !== 'classic')!.id;
+    const props = { selectedId, onSelect: vi.fn(), preview: PREVIEW, boardseshRendererAvailable: true };
+    const { rerender } = render(<BoardLookCarousel options={SPRAY_WALL_LOOK_OPTIONS} {...props} />);
+    const before = new Map(cardProps.overrides);
+
+    const dimmed = SPRAY_WALL_LOOK_OPTIONS.map((option) =>
+      option.id === selectedId ? (withSprayWallDim([option], 0.7)[0] ?? option) : option,
+    );
+    rerender(<BoardLookCarousel options={dimmed} {...props} />);
+
+    for (const option of SPRAY_WALL_LOOK_OPTIONS) {
+      if (option.id === selectedId) {
+        expect(cardProps.overrides.get(option.id)).not.toBe(before.get(option.id));
+      } else {
+        expect(cardProps.overrides.get(option.id)).toBe(before.get(option.id));
+      }
+    }
   });
 });

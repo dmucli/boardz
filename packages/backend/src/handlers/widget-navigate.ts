@@ -67,12 +67,15 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
-type WidgetNavigationAnalyticsEvent = Parameters<typeof trackLiveActivityWidgetNavigation>[0];
-type WidgetNavigationAnalyticsPayload = Omit<WidgetNavigationAnalyticsEvent, 'userId'>;
+type WidgetNavigationAnalyticsPayload = Parameters<typeof trackLiveActivityWidgetNavigation>[0];
 
+/**
+ * `userId` only picks which event fires: a token bound to a user is a normal
+ * navigation, one without is an attribution gap. Neither event carries the id.
+ */
 function trackWidgetNavigation(userId: string | null, event: WidgetNavigationAnalyticsPayload): void {
   if (userId) {
-    trackLiveActivityWidgetNavigation({ userId, ...event });
+    trackLiveActivityWidgetNavigation(event);
     return;
   }
 
@@ -224,7 +227,7 @@ export async function handleWidgetNavigate(req: IncomingMessage, res: ServerResp
     // change. Shared with /api/session/navigate (the Garmin watch) via
     // navigateSessionQueue so the server-authoritative index math lives in one
     // place. `currentIndex` in the request body is validated but ignored.
-    const outcome = await navigateSessionQueue(sessionId, action, 'widget-navigate');
+    const outcome = await navigateSessionQueue(sessionId, action, 'widget-navigate', authResult.userId);
 
     if (outcome.kind === 'queue_empty') {
       // Return 4xx so the widget's status-code check fires its Darwin-notification

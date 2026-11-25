@@ -1,3 +1,4 @@
+import { offlineWriteFetch } from '../../../offline/offline-write-transport';
 // Mobile's data hook for FavoritesProvider + PlaylistsProvider — the analog of
 // web's `useClimbActionsData`. Returns provider-shaped props the layout passes
 // straight in.
@@ -37,6 +38,7 @@ import {
   type CreatePlaylistMutationResponse,
 } from '@boardsesh/graphql/operations/playlists';
 import { getHttpClient } from '../client';
+import { offlineAwareRequest } from '../offline-request';
 import { useAuth } from '../../../providers/auth-provider';
 import { useOfflineDownloadsEnabled } from '../../../providers/feature-flags-provider';
 import { useActiveBoard } from '../use-active-board';
@@ -49,7 +51,7 @@ import { drainMutationQueue } from '../../../offline/offline-sync-adapter';
 const PLAYLISTS_QUERY_KEY = ['userPlaylists'] as const;
 
 function graphqlFetchFromClient(): GraphQLFetch {
-  return (query, variables) => getHttpClient().request(query, variables);
+  return offlineWriteFetch;
 }
 
 function scheduleDrain(db: NonNullable<ReturnType<typeof getDatabaseHandle>>, queryClient: QueryClient) {
@@ -120,7 +122,7 @@ export function useMobileClimbActionsData(): MobileClimbActionsData {
   const { data: playlists = [] as Playlist[], isLoading: playlistsLoading } = useQuery({
     queryKey: PLAYLISTS_QUERY_KEY,
     queryFn: async (): Promise<Playlist[]> => {
-      const response = await getHttpClient().request<GetAllUserPlaylistsQueryResponse>(GET_ALL_USER_PLAYLISTS, {
+      const response = await offlineAwareRequest<GetAllUserPlaylistsQueryResponse>(GET_ALL_USER_PLAYLISTS, {
         input: { pageSize: 200 },
       });
       return response.allUserPlaylists.playlists;

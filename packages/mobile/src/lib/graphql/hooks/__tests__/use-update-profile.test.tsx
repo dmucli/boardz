@@ -1,4 +1,18 @@
 // @vitest-environment jsdom
+// Delivery metadata is covered by offline-write-context.test.ts; keep these unit tests native-free.
+vi.mock('../../../../offline/offline-write-context', () => ({
+  readOfflineWriteRelease: () => ({
+    platform: 'ios',
+    appVersion: null,
+    runtimeVersion: null,
+    updateId: null,
+    isEmbedded: null,
+    branch: null,
+  }),
+  enqueueMeasuredMutation: async (...args: Parameters<typeof import('@boardsesh/offline-sync').enqueue>) =>
+    (await import('@boardsesh/offline-sync')).enqueue(...args),
+}));
+
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { renderHook } from '@testing-library/react';
 import type { ReactNode } from 'react';
@@ -40,6 +54,10 @@ vi.mock('../use-social', () => ({
 }));
 vi.mock('../use-session-detail', () => ({ useSessionDetail: vi.fn(), useSessionPreview: vi.fn() }));
 vi.mock('../use-delete-account', () => ({ useDeleteAccountInfo: vi.fn(), useDeleteAccount: vi.fn() }));
+// Draft deletion owns native auth/storage dependencies and is covered separately.
+vi.mock('../use-delete-draft-climb', () => ({ useDeleteDraftClimb: vi.fn() }));
+// Managed-gym reporting owns native auth dependencies and is covered separately.
+vi.mock('../use-managed-my-gyms', () => ({ useManagedMyGyms: vi.fn() }));
 vi.mock('../use-integrations', () => ({
   useIntegrationStatuses: vi.fn(),
   useDisconnectIntegration: vi.fn(),

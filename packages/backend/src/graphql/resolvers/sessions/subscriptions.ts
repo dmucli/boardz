@@ -1,9 +1,44 @@
+import { buildSessionStatsUpdatedEvent } from './live-session-stats';
+import { canAccessResource } from '../../../services/privacy';
+import {
+  projectSessionBoardPath,
+  redactSessionUsers,
+  sessionParticipantId,
+  sessionEventParticipantId,
+} from '../../../services/board-session-privacy';
 import type { ConnectionContext, SessionEvent } from '@boardsesh/shared-schema';
 import { pubsub } from '../../../pubsub/index';
+import {
+  clientPathEvent,
+  movesSessionWall,
+  type SessionBoardPathChangedMessage,
+} from '../../../services/session-wall-refresh';
 import { roomManager } from '../../../services/room-manager';
+import { buildRestCadenceChange, type StoredRestCadence } from '../../../services/rest-cadence';
+import { logger } from '../../../utils/logger';
 import { requireSessionMember } from '../shared/helpers';
 import { createEagerAsyncIterator } from '../shared/async-iterators';
 import { withSubscriptionCleanup } from '../shared/managed-subscription';
+
+/**
+ * The rest clock seed's read, retried once straight away: one failed Redis
+ * command should not cost a reconnecting phone its seed. Null after a second
+ * failure, so the caller skips the seed instead of failing the subscription.
+ */
+async function readRestCadenceSeed(sessionId: string): Promise<StoredRestCadence | null> {
+  try {
+    return await roomManager.getSessionRestCadence(sessionId);
+  } catch {
+    try {
+      return await roomManager.getSessionRestCadence(sessionId);
+    } catch (error) {
+      logger.warn(
+        `[sessionUpdates] rest cadence seed read failed twice for ${sessionId.slice(0, 8)}, skipping the seed: ${String(error)}`,
+      );
+      return null;
+    }
+  }
+}
 
 export const sessionSubscriptions = {
   /**
@@ -22,6 +57,22 @@ export const sessionSubscriptions = {
    * roster event slightly older than the seed right after it; accepted — the
    * snapshot is a self-contained REPLACE on the client and the next delta
    * converges.
+   *
+   * The second event is the crew rest clock seed (`SessionRestCadenceChanged`
+   * with `isSnapshot: true`), sent even when the clock is off, so a
+   * reconnecting phone clears a clock that was turned off while it was away.
+   * Its read runs after the eager subscribe like the roster's, so a cadence
+   * write that races the seed is either inside the snapshot or queued behind
+   * it with a higher revision; clients drop the duplicate by revision. A failed
+   * read is retried once (readRestCadenceSeed); when the retry fails too, the
+   * seed is skipped with a warning. The subscription goes on, because it also
+   * carries the roster, and no "off" seed stands in, because that would clear
+   * every client's clock. The client keeps its local clock until the next
+   * cadence event, and the holder's next FIRE is fenced by revision (its
+   * mutation response carries the server's clock). If the clock was turned off
+   * while this client was away, no later event may come, so a passenger can
+   * show a stale clock until it resubscribes or someone changes the clock.
+   * The wall-move roster re-snapshot does not re-seed it.
    */
   sessionUpdates: {
     subscribe: withSubscriptionCleanup(async function* (
@@ -52,25 +103,108 @@ export const sessionSubscriptions = {
         // reconnect re-runs JOIN_SESSION + resubscribe, which re-seeds the roster,
         // so a failed seed self-heals on the next reconnect rather than needing a
         // bespoke retry here.
-        const [users, session] = await Promise.all([
+        const [users, session, restCadence] = await Promise.all([
           roomManager.getSessionUsers(sessionId),
           roomManager.getSessionById(sessionId),
+          readRestCadenceSeed(sessionId),
         ]);
+        if (!(await canAccessResource('session', sessionId, ctx.userId))) return;
+        const protocolIds = new Map(
+          users.map((user) => [user.id, user.userId ? sessionParticipantId(sessionId, user.userId) : user.id]),
+        );
+        const protocolId = (id: string) => sessionEventParticipantId(sessionId, id, protocolIds);
         yield {
           sessionUpdates: {
             __typename: 'SessionRosterSnapshot',
-            users,
+            users: await redactSessionUsers(users, ctx.userId, sessionId),
             // boardPath is String! on the wire. Emit the empty-string sentinel
             // (not null) in the unreachable session-vanished-mid-subscribe case:
             // a null would raise a non-null-field violation that nulls the entire
             // sessionUpdates payload and silently drops the seed. Clients treat ''
             // as "keep current" (applySessionRuntimeEvent's `|| prev.boardPath`).
-            boardPath: session?.boardPath ?? '',
+            boardPath: await projectSessionBoardPath(session?.boardPath ?? '', ctx.userId),
           } as SessionEvent,
         };
+        if (restCadence) {
+          yield {
+            sessionUpdates: buildRestCadenceChange(restCadence, {
+              isSnapshot: true,
+              action: null,
+              serverNowMs: Date.now(),
+            }),
+          };
+        }
 
         for (let result = await eagerIterator.next(); !result.done; result = await eagerIterator.next()) {
-          yield { sessionUpdates: result.value };
+          if (!(await canAccessResource('session', sessionId, ctx.userId))) return;
+          const event = result.value;
+          if (event.__typename === 'UserJoined' || event.__typename === 'UserPresenceChanged') {
+            protocolIds.set(
+              event.user.id,
+              event.user.userId ? sessionParticipantId(sessionId, event.user.userId) : event.user.id,
+            );
+            yield {
+              sessionUpdates: {
+                ...event,
+                user: (
+                  await redactSessionUsers(
+                    [{ ...event.user, avatarUrl: event.user.avatarUrl ?? undefined }],
+                    ctx.userId,
+                    sessionId,
+                  )
+                )[0],
+              },
+            };
+          } else if (event.__typename === 'UserLeft') {
+            yield { sessionUpdates: { ...event, userId: protocolId(event.userId) } };
+          } else if (event.__typename === 'LeaderChanged') {
+            yield { sessionUpdates: { ...event, leaderId: protocolId(event.leaderId) } };
+          } else if (event.__typename === 'SessionBoardPathChanged') {
+            const pathEvent = clientPathEvent(event);
+            const { pathUnchanged } = event as SessionBoardPathChangedMessage;
+            // The member who chose the path presented its link in that request.
+            const projectPathEvent = () =>
+              projectSessionBoardPath(event.boardPath, ctx.userId, {
+                presentedByViewer: !!ctx.participantId && event.changedByParticipantId === ctx.participantId,
+              });
+            if (!movesSessionWall(event)) {
+              // An angle change keeps the wall, so every name stays as projected.
+              yield { sessionUpdates: { ...pathEvent, boardPath: await projectPathEvent() } };
+              continue;
+            }
+            const users = await roomManager.getSessionUsers(sessionId);
+            const roster = await redactSessionUsers(users, ctx.userId, sessionId);
+            // The snapshot follows this path event, so it projects the path the
+            // same way; a wall that moved under an unchanged path uses ordinary
+            // current board standing, like any other snapshot.
+            const boardPath = pathUnchanged
+              ? await projectSessionBoardPath(
+                  (await roomManager.getSessionById(sessionId))?.boardPath ?? '',
+                  ctx.userId,
+                )
+              : await projectPathEvent();
+            for (const user of users) {
+              protocolIds.set(user.id, user.userId ? sessionParticipantId(sessionId, user.userId) : user.id);
+            }
+            // Installed clients already handle presence deltas. Withdraw old
+            // names before publishing the destination, then replace the roster
+            // for clients that understand the authoritative snapshot. A wall
+            // that moved under an unchanged path sends no path event.
+            for (const user of roster) {
+              yield { sessionUpdates: { __typename: 'UserPresenceChanged' as const, user } };
+            }
+            if (!pathUnchanged) yield { sessionUpdates: { ...pathEvent, boardPath } };
+            yield { sessionUpdates: { __typename: 'SessionRosterSnapshot' as const, users: roster, boardPath } };
+          } else if (event.__typename === 'SessionRestCadenceChanged') {
+            // serverNow is stamped by the DELIVERING instance at the moment it
+            // yields, so a client's clock offset never absorbs Redis fan-out lag.
+            yield { sessionUpdates: { ...event, serverNow: String(Date.now()) } };
+          } else if (event.__typename === 'SessionStatsUpdated') {
+            const visibleStats = await buildSessionStatsUpdatedEvent(sessionId, ctx);
+            if (visibleStats) yield { sessionUpdates: visibleStats };
+          } else {
+            yield { sessionUpdates: result.value };
+          }
         }
       } finally {
         // The lifetime wrapper closes immediately on disconnect, even during

@@ -8,13 +8,15 @@ export default defineConfig({
     'process.env.NODE_ENV': '"test"',
   },
   test: {
+    // Preserve mock history from setup and beforeAll when upgrading from Vitest 4.
+    clearMocks: false,
     name: 'web',
     environment: 'jsdom',
     globals: true,
     env: {
       NODE_ENV: 'test',
     },
-    exclude: ['**/node_modules/**', '**/dist/**', 'backend/**', 'e2e/**'],
+    exclude: ['**/node_modules/**', '**/dist/**', 'backend/**', 'e2e/**', 'auth-proofs/**', 'partner-oauth-e2e/**'],
     coverage: {
       provider: 'v8',
       include: ['app/**/*.{ts,tsx}'],

@@ -26,51 +26,120 @@ vi.mock('@sentry/nextjs', () => ({
   captureException: (...args: unknown[]) => mockCaptureException(...args),
 }));
 
+const { mockHash } = vi.hoisted(() => ({
+  mockHash: vi.fn<(password: string, cost: number) => Promise<string>>(async () => 'hashed-password'),
+}));
 vi.mock('bcryptjs', () => ({
-  hash: async () => 'hashed-password',
+  hash: (password: string, cost: number) => mockHash(password, cost),
 }));
 
-const mockSelectLimit = vi.fn();
+const lookup = vi.hoisted(() => ({ stored: [] as StoredAccount[] }));
+vi.mock('@boardsesh/db/queries/account-email', async () => {
+  const { fakeAccountEmailLookup } = await import('@/app/test-utils/account-email-lookup');
+  return fakeAccountEmailLookup(() => lookup.stored);
+});
+
+const mockProfileValues = vi.fn();
+const mockUserValues = vi.fn();
+const mockTokenValues = vi.fn();
+const { mockUserProfilesTable, mockUsersTable, mockVerificationTokensTable } = vi.hoisted(() => ({
+  mockUserProfilesTable: { userId: 'user_profiles.userId' },
+  mockUsersTable: { id: 'users.id', email: 'users.email' },
+  mockVerificationTokensTable: { identifier: 'verification_tokens.identifier' },
+}));
 const mockTransaction = vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
-  const mockValues = vi.fn().mockResolvedValue(undefined);
-  await fn({ insert: () => ({ values: mockValues }) });
+  await fn({
+    insert: (table: unknown) => ({
+      values: (record: Record<string, unknown>) => {
+        if (table === mockUserProfilesTable) mockProfileValues(record);
+        if (table === mockUsersTable) mockUserValues(record);
+        if (table === mockVerificationTokensTable) mockTokenValues(record);
+        return Promise.resolve(undefined);
+      },
+    }),
+  });
 });
 
 vi.mock('@/app/lib/db/db', () => ({
   getDb: () => ({
-    select: () => ({ from: () => ({ where: () => ({ limit: mockSelectLimit }) }) }),
     transaction: (fn: (tx: unknown) => Promise<void>) => mockTransaction(fn),
   }),
 }));
 
 vi.mock('@/app/lib/db/schema', () => ({
-  users: { id: 'users.id', email: 'users.email' },
+  users: mockUsersTable,
   userCredentials: { userId: 'user_credentials.userId' },
-  userProfiles: { userId: 'user_profiles.userId' },
-  verificationTokens: { identifier: 'verification_tokens.identifier' },
+  userProfiles: mockUserProfilesTable,
+  verificationTokens: mockVerificationTokensTable,
 }));
 
+import type { StoredAccount } from '@/app/test-utils/account-email-lookup';
+import { findAccountsByEmail } from '@boardsesh/db/queries/account-email';
 import { POST } from '../route';
 
-function createRequest(body: Record<string, unknown>, origin = 'http://localhost'): NextRequest {
+function createRequest(
+  body: Record<string, unknown>,
+  origin = 'http://localhost',
+  headers: Record<string, string> = {},
+): NextRequest {
   return new NextRequest(`${origin}/api/auth/register`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
     body: JSON.stringify(body),
   });
 }
+
+const edgeHeaders = {
+  'X-Forwarded-For': '198.51.100.7, 203.0.113.9, 172.70.1.2',
+  'CF-Connecting-IP': '203.0.113.9',
+};
 
 describe('POST /api/auth/register', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGetClientIp.mockReturnValue('127.0.0.1');
     mockCheckRateLimit.mockReturnValue({ limited: false, retryAfterSeconds: 0 });
-    mockSelectLimit.mockResolvedValue([]); // no existing user
+    lookup.stored = []; // no existing user
     mockSendVerificationEmail.mockResolvedValue(undefined);
+    vi.stubEnv('CURRENT_STORE_WEB_AUTH_MODE', 'legacy');
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it('keeps the legacy limiter key when staged auth is off', async () => {
+    mockCheckRateLimit.mockReturnValueOnce({ limited: true, retryAfterSeconds: 30 });
+    const response = await POST(
+      createRequest({ email: 'limited@example.com', password: 'password123' }, undefined, edgeHeaders),
+    );
+    expect(response.status).toBe(429);
+    expect(mockCheckRateLimit).toHaveBeenCalledWith('register:127.0.0.1', 10, 60_000);
+    expect(mockGetClientIp).toHaveBeenCalledOnce();
+  });
+
+  // Sign-in compares an unknown address against a cost-12 stand-in. A new
+  // account hashed at any other cost would make its wrong-password answer take a
+  // different time from an unknown address, and reveal that it exists.
+  it('hashes the new password at bcrypt cost 12, the cost sign-in compares unknown addresses at', async () => {
+    const response = await POST(createRequest({ email: 'cost@example.com', password: 'password123' }));
+    expect(response.status).toBe(201);
+    expect(mockHash).toHaveBeenCalledOnce();
+    expect(mockHash).toHaveBeenCalledWith('password123', 12);
+  });
+
+  it.each(['0', '1'])('creates a public account with privacy controls enabled=%s', async (flag) => {
+    vi.stubEnv('BOARDSESH_PRIVACY_ENABLED', flag);
+    try {
+      const response = await POST(createRequest({ email: 'rollout@example.com', password: 'password123' }));
+      expect(response.status).toBe(201);
+      // Only the user id: the column defaults make the account public.
+      expect(mockProfileValues).toHaveBeenCalledWith({ userId: expect.any(String) });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('uses BASE_URL env var for verification email link when set', async () => {
@@ -116,6 +185,45 @@ describe('POST /api/auth/register', () => {
     }
   });
 
+  describe('one account per address in any capitalisation (BA-02)', () => {
+    it.each([
+      ['exactly as stored', 'Mixed.Case@Example.test'],
+      ['in lowercase', 'mixed.case@example.test'],
+      ['in capitals', 'MIXED.CASE@EXAMPLE.TEST'],
+    ])('refuses an address a mixed-case account holds, typed %s', async (_case, typed) => {
+      lookup.stored = [{ id: 'mixed', email: 'Mixed.Case@Example.test' }];
+
+      const response = await POST(createRequest({ email: typed, password: 'password123' }));
+
+      expect(response.status).toBe(409);
+      expect(mockTransaction).not.toHaveBeenCalled();
+      expect(mockHash).not.toHaveBeenCalled();
+    });
+
+    it('refuses an address several accounts already share instead of adding another', async () => {
+      lookup.stored = [
+        { id: 'title', email: 'Shared@Example.test' },
+        { id: 'upper', email: 'SHARED@EXAMPLE.TEST' },
+      ];
+
+      const response = await POST(createRequest({ email: 'shared@example.test', password: 'password123' }));
+
+      expect(response.status).toBe(409);
+      expect(mockTransaction).not.toHaveBeenCalled();
+    });
+
+    it('stores, verifies and mails the normalized address, keeping the typed name', async () => {
+      const response = await POST(createRequest({ email: 'New.Climber@Example.TEST', password: 'password123' }));
+
+      expect(response.status).toBe(201);
+      expect(mockUserValues).toHaveBeenCalledWith(
+        expect.objectContaining({ email: 'new.climber@example.test', name: 'New.Climber' }),
+      );
+      expect(mockTokenValues).toHaveBeenCalledWith(expect.objectContaining({ identifier: 'new.climber@example.test' }));
+      expect(mockSendVerificationEmail.mock.calls[0][0]).toBe('new.climber@example.test');
+    });
+  });
+
   it('reports a verification-email failure to Sentry while returning the account response', async () => {
     const smtpError = new Error('smtp failed');
     mockSendVerificationEmail.mockRejectedValueOnce(smtpError);
@@ -125,5 +233,168 @@ describe('POST /api/auth/register', () => {
     expect(response.status).toBe(201);
     expect(await response.json()).toMatchObject({ emailSent: false, requiresVerification: true });
     expect(mockCaptureException).toHaveBeenCalledWith(smtpError, expect.objectContaining({ tags: expect.anything() }));
+  });
+});
+
+describe('backend-staging registration public adapter', () => {
+  const token = `ev1_${'A'.repeat(43)}`;
+  const committedEmail = 'Committed@example.com';
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubEnv('CURRENT_STORE_WEB_AUTH_MODE', 'backend-staging');
+    vi.stubEnv('CURRENT_STORE_AUTH_BACKEND_ORIGIN', 'http://127.0.0.1:54321');
+    vi.stubEnv('CURRENT_STORE_AUTH_RPC_SECRET', 'dedicated-register-fixture-secret-at-least-32');
+    vi.stubEnv('BASE_URL', 'https://www.boardsesh.test');
+    mockCheckRateLimit.mockReturnValue({ limited: false, retryAfterSeconds: 0 });
+    mockSendVerificationEmail.mockResolvedValue(undefined);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+  it('keys the staged limiter on the trusted client, not the first forwarded hop', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    mockCheckRateLimit.mockReturnValueOnce({ limited: true, retryAfterSeconds: 30 });
+    const response = await POST(
+      createRequest({ email: 'limited@example.com', password: 'password123' }, undefined, edgeHeaders),
+    );
+    expect(response.status).toBe(429);
+    expect(mockCheckRateLimit).toHaveBeenCalledWith('register:203.0.113.9', 10, 60_000);
+    expect(mockGetClientIp).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+  function backend(outcome: Record<string, unknown>, status: number) {
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      if (typeof init.body !== 'string') throw new Error('Expected serialized command');
+      const command = JSON.parse(init.body) as { requestId: string };
+      return Response.json(
+        { protocolVersion: 2, operation: 'register', requestId: command.requestId, ...outcome },
+        { status },
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    return fetchMock;
+  }
+  function created(requiresVerification: boolean) {
+    return {
+      outcome: 'created',
+      userId: 'private-user-id',
+      createdAt: '2026-11-04T10:00:00.000Z',
+      requiresVerification,
+      ...(requiresVerification
+        ? {
+            mailPlan: {
+              kind: 'uid-email-verification-v1',
+              recipient: committedEmail,
+              token,
+              expiresAt: '2026-11-05T10:00:00.000Z',
+            },
+          }
+        : {}),
+    };
+  }
+  it('uses the exact committed recipient/token only for web SMTP and publishes the legacy fields', async () => {
+    const fetchMock = backend(created(true), 201);
+    const response = await POST(
+      createRequest({ email: 'Request@example.com', password: 'submitted-password' }, 'https://attacker.test'),
+    );
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      message: 'Account created. Please check your email to verify your account.',
+      requiresVerification: true,
+      emailSent: true,
+    });
+    expect(mockSendVerificationEmail).toHaveBeenCalledWith(committedEmail, token, 'https://www.boardsesh.test');
+    expect(findAccountsByEmail).not.toHaveBeenCalled();
+    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+  it('honors backend verification policy without inspecting the web flag or leaking an internal receipt', async () => {
+    backend(created(false), 201);
+    const response = await POST(createRequest({ email: 'x', password: 'x' }));
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      message: 'Account created. You can now log in.',
+      requiresVerification: false,
+    });
+    expect(mockSendVerificationEmail).not.toHaveBeenCalled();
+    expect(mockTransaction).not.toHaveBeenCalled();
+  });
+  it('keeps committed creation on SMTP failure and reports no private error cause', async () => {
+    const fetchMock = backend(created(true), 201);
+    const failure = new Error(`smtp private ${committedEmail} ${token}`);
+    mockSendVerificationEmail.mockRejectedValue(failure);
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const response = await POST(createRequest({ email: 'x', password: 'x' }));
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({
+      message: 'Account created. Please request a new verification email.',
+      requiresVerification: true,
+      emailSent: false,
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(mockCaptureException).toHaveBeenCalledOnce();
+    const [reported] = mockCaptureException.mock.calls[0] as [Error];
+    expect(reported).not.toBe(failure);
+    expect(reported.message).not.toContain(token);
+    expect(reported).not.toHaveProperty('cause');
+    expect(consoleSpy).not.toHaveBeenCalled();
+  });
+  it.each([
+    [
+      { outcome: 'error', code: 'validation_error', message: 'Invalid email address' },
+      400,
+      400,
+      'Invalid email address',
+    ],
+    [
+      { outcome: 'error', code: 'exists' },
+      409,
+      409,
+      'An account with this email already exists. Please sign in with your existing account.',
+    ],
+    [{ outcome: 'error', code: 'replayed' }, 409, 503, 'AuthBackendUnavailable'],
+    [{ outcome: 'error', code: 'unavailable' }, 503, 503, 'AuthBackendUnavailable'],
+  ] as const)(
+    'maps the finite domain outcome %j without local writes',
+    async (outcome, backendStatus, publicStatus, message) => {
+      backend(outcome, backendStatus);
+      const response = await POST(createRequest({ email: 'x', password: 'x' }));
+      expect(response.status).toBe(publicStatus);
+      expect(await response.json()).toEqual({ error: message });
+      expect(mockTransaction).not.toHaveBeenCalled();
+      expect(mockSendVerificationEmail).not.toHaveBeenCalled();
+    },
+  );
+  it('maps a rate limit with an exact bounded retry header', async () => {
+    backend({ outcome: 'error', code: 'rate_limited', retryAfterSeconds: 10 }, 429);
+    const response = await POST(createRequest({ email: 'x' }));
+    expect(response.status).toBe(429);
+    expect(response.headers.get('Retry-After')).toBe('10');
+  });
+  it('fails before any registration command if canonical mail origin is unavailable', async () => {
+    vi.stubEnv('NODE_ENV', 'production');
+    vi.stubEnv('BASE_URL', '');
+    vi.stubEnv('NEXTAUTH_URL', '');
+    const fetchMock = backend(created(true), 201);
+    const response = await POST(createRequest({ email: 'x' }, 'https://attacker.test'));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'AuthBackendUnavailable' });
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockTransaction).not.toHaveBeenCalled();
+  });
+  it('returns 503 for lost replies without retries, fallback, secret telemetry, or mail', async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error(`private ${token}`));
+    vi.stubGlobal('fetch', fetchMock);
+    const response = await POST(createRequest({ email: 'x', password: 'secret' }));
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({ error: 'AuthBackendUnavailable' });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(mockTransaction).not.toHaveBeenCalled();
+    expect(mockCaptureException).not.toHaveBeenCalled();
+    expect(mockSendVerificationEmail).not.toHaveBeenCalled();
   });
 });

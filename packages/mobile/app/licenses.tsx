@@ -1,15 +1,17 @@
 import { memo, useCallback, useEffect, useState } from 'react';
 import { Stack } from 'expo-router';
-import { Modal, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { Modal, ScrollView, StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { FlashList } from '@shopify/flash-list';
 import { useTranslation } from 'react-i18next';
 import { ActivityIndicator } from '../src/components/ActivityIndicator';
-import { Button } from '../src/components/Button';
 import { Icon } from '../src/components/Icon';
+import { SheetTopBar } from '../src/components/SheetTopBar';
 import { PressableSurface } from '../src/components/PressableSurface';
 import { Text } from '../src/components/Text';
 import { useBottomChromeMetrics } from '../src/hooks/use-bottom-chrome-metrics';
+import { useWindowBottomInset } from '../src/hooks/use-window-bottom-inset';
+import { useReduceMotion } from '../src/hooks/use-reduce-motion';
 import { useStackScreenOptions } from '../src/hooks/use-stack-screen-options';
 import { loadOssLicenses, type OssLicense } from '../src/lib/oss-licenses';
 import { openExternalUrl } from '../src/lib/open-url';
@@ -55,8 +57,11 @@ export default function LicensesScreen() {
   const { t } = useTranslation('common');
   const { systemColors } = useTheme();
   const insets = useSafeAreaInsets();
+  const windowBottomInset = useWindowBottomInset();
   const bottomChrome = useBottomChromeMetrics();
   const [selected, setSelected] = useState<OssLicense | null>(null);
+  // Reduce Motion swaps the slide-up for a fade (HIG "Motion").
+  const reduceMotion = useReduceMotion();
   // Lazily pull in the ~1 MB manifest only once this screen mounts.
   const [licenses, setLicenses] = useState<OssLicense[] | null>(null);
   useEffect(() => {
@@ -80,8 +85,8 @@ export default function LicensesScreen() {
     [handleSelect],
   );
 
-  // Variant-aware header from the shared hook: a transparent blur header on Liquid
-  // Glass (iOS), an opaque M3 app bar on Material — including the forced-Material-
+  // Variant-aware header from the shared hook: a transparent header on Liquid Glass
+  // (iOS), an opaque M3 app bar on Material — including the forced-Material-
   // on-iOS / Android paths where a transparent header would slide content under the
   // status bar.
   const screenOptions = useStackScreenOptions();
@@ -116,45 +121,27 @@ export default function LicensesScreen() {
 
       <Modal
         visible={selected !== null}
-        animationType="slide"
+        animationType={reduceMotion ? 'fade' : 'slide'}
         presentationStyle="pageSheet"
         onRequestClose={handleClose}
       >
         <View style={[styles.modal, { backgroundColor: systemColors.background, paddingTop: insets.top + spacing[2] }]}>
-          <View style={styles.modalHeader}>
-            <View style={styles.modalTitle}>
-              <Text variant="headline" numberOfLines={1}>
-                {selected?.name}
-              </Text>
-              <Text variant="footnote" color={systemColors.secondaryLabel} numberOfLines={1}>
-                {selected?.version} · {selected?.license}
-              </Text>
-            </View>
-            <Pressable
-              onPress={handleClose}
-              accessibilityRole="button"
-              accessibilityLabel={t('mobile.licenses.close')}
-              hitSlop={12}
-            >
-              <Icon name="close" size={22} color={systemColors.secondaryLabel} />
-            </Pressable>
-          </View>
-          <ScrollView contentContainerStyle={styles.modalBody}>
+          {/* Close leading, the package as the title, View source trailing. */}
+          <SheetTopBar
+            title={selected?.name ?? ''}
+            subtitle={selected ? `${selected.version} · ${selected.license}` : undefined}
+            leading={{ kind: 'close', onPress: handleClose, accessibilityLabel: t('mobile.licenses.close') }}
+            trailing={
+              selected?.repository
+                ? { kind: 'forward', label: t('mobile.licenses.viewSource'), onPress: handleViewSource }
+                : undefined
+            }
+          />
+          <ScrollView contentContainerStyle={[styles.modalBody, { paddingBottom: windowBottomInset + spacing[6] }]}>
             <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.licenseText}>
               {selected?.licenseText ?? selected?.license}
             </Text>
           </ScrollView>
-          {selected?.repository ? (
-            <View style={[styles.modalFooter, { paddingBottom: insets.bottom + spacing[3] }]}>
-              <Button
-                title={t('mobile.licenses.viewSource')}
-                icon="link"
-                size="large"
-                variant="outlined"
-                onPress={handleViewSource}
-              />
-            </View>
-          ) : null}
         </View>
       </Modal>
     </>
@@ -185,32 +172,16 @@ const styles = StyleSheet.create({
   },
   separator: {
     height: StyleSheet.hairlineWidth,
-    marginLeft: spacing[4],
+    marginStart: spacing[4],
   },
   modal: {
     flex: 1,
   },
-  modalHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[3],
-    paddingHorizontal: spacing[4],
-    paddingBottom: spacing[3],
-  },
-  modalTitle: {
-    flex: 1,
-    minWidth: 0,
-    gap: 2,
-  },
   modalBody: {
     paddingHorizontal: spacing[4],
-    paddingBottom: spacing[6],
+    paddingTop: spacing[3],
   },
   licenseText: {
     lineHeight: 18,
-  },
-  modalFooter: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[3],
   },
 });

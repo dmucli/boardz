@@ -1,5 +1,10 @@
 // Gym entity types
 
+export type GymAddressCoordinates = {
+  latitude: number;
+  longitude: number;
+};
+
 export type PlaceSuggestion = {
   id: number;
   name: string;
@@ -29,9 +34,12 @@ export const GYM_PHOTO_MAX_UPLOAD_BYTES = 5 * 1024 * 1024;
 
 export type GymMemberRole = 'admin' | 'editor' | 'member';
 
+/** Who runs a gym listing: not claimed yet, added by a climber, or run by the gym (approved claim or admin handover). */
+export type GymListingState = 'UNCLAIMED' | 'CLIMBER_LISTED' | 'RUN_BY_GYM';
+
 export type GymClaimMethod = 'domain' | 'admin';
 
-export type GymClaimStatus = 'pending' | 'approved' | 'denied' | 'expired';
+export type GymClaimStatus = 'pending' | 'approved' | 'denied' | 'expired' | 'revoked';
 
 export type GymClaimRequestStatus = 'email_sent' | 'admin_review' | 'approved';
 
@@ -64,7 +72,7 @@ export type Gym = {
   ownerAvatarUrl?: string | null;
   name: string;
   description?: string | null;
-  /** Opening hours as one free-text line the gym maintains itself (no structured per-day model). */
+  /** Opening hours as free text the gym maintains itself, line breaks kept (no structured per-day model). */
   hours?: string | null;
   /** ISO timestamp of the last time someone with edit access confirmed `hours` — shown publicly so a stale schedule reads as stale. */
   hoursUpdatedAt?: string | null;
@@ -75,6 +83,8 @@ export type Gym = {
   latitude?: number | null;
   longitude?: number | null;
   isPublic: boolean;
+  /** Omitted by older cached clients; absence means listed. */
+  isListed?: boolean;
   imageUrl?: string | null;
   /** Square gym logo (transparent brand mark) for the kiosk and embeds — distinct from imageUrl, the gym photo. */
   logoUrl?: string | null;
@@ -113,6 +123,19 @@ export type Gym = {
    * document typed `Gym` genuinely returns it.
    */
   isClaimed: boolean;
+  /** Who runs this listing. Viewer-independent. GYM_FIELDS selects it. */
+  listingState: GymListingState;
+  /**
+   * Whether this gym's website can drive the self-service email claim: a real
+   * (non-free-provider) domain that the gym's OWNER put on the listing. Mirrors
+   * the two refusals in requestGymClaim, so a claim UI can open the form that
+   * can succeed. Viewer-independent — it describes the listing, not the viewer.
+   *
+   * GYM_FIELDS selects it, and both claim UIs (web ClaimGymDialog, mobile
+   * ClaimGymSheet) pick their form from it rather than re-deriving it from the
+   * website, which can't see who put the website there.
+   */
+  canClaimByDomain: boolean;
   /**
    * The viewer's unresolved claim on this gym, or null when they have none.
    * OPTIONAL on purpose: only GET_GYM_BY_SLUG selects it. Adding it to the
@@ -155,6 +178,12 @@ export type SimilarGym = {
   distanceMeters?: number | null;
   ownerType: GymOwnerType;
   isClaimable: boolean;
+  /**
+   * Whether this gym's website can drive the self-service email claim: a real
+   * (non-free-provider) domain that the gym's OWNER put on the listing. A
+   * different question from `isClaimable`, which is about the viewer's standing.
+   */
+  canClaimByDomain: boolean;
   /** Upstream provider origins for a synced gym (e.g. "kilter"); empty for user-created gyms. */
   providerOrigins: string[];
 };
@@ -171,6 +200,8 @@ export type StrayBoardReason = 'MERGED_TWIN' | 'NEARBY';
 export type StrayBoard = {
   uuid: string;
   name: string;
+  boardType: string;
+  angle: number;
   /** The gym the board is currently linked to (a merged twin or a synced listing); null when unlinked. */
   currentGymUuid?: string | null;
   /** Name of the gym the board is currently linked to; null when unlinked. */
@@ -189,6 +220,10 @@ export type StrayBoard = {
 export type AttachBoardToGymInput = {
   gymUuid: string;
   boardUuid: string;
+  /** False prevents retiring an emptied source listing. Omitted preserves legacy behavior. */
+  allowSourceGymMerge?: boolean;
+  /** Bind the move to the displayed source listing; null means the board was unlinked. */
+  expectedCurrentGymUuid?: string | null;
 };
 
 export type DetachBoardFromGymInput = {
@@ -199,6 +234,8 @@ export type DetachBoardFromGymInput = {
 export type CreateGymInput = {
   name: string;
   description?: string;
+  /** Nonblank hours are trimmed and receive a confirmation timestamp on creation. */
+  hours?: string;
   address?: string;
   website?: string;
   contactEmail?: string;
@@ -206,8 +243,19 @@ export type CreateGymInput = {
   latitude?: number;
   longitude?: number;
   isPublic?: boolean;
+  isListed?: boolean;
   imageUrl?: string;
   boardUuid?: string;
+  /** Absent means REJECT_IF_FOUND: a similar listed gym refuses the create with GYM_SIMILAR_EXISTS. */
+  duplicateCheck?: GymDuplicateCheckInput | null;
+};
+
+export type GymDuplicateCheckMode = 'REJECT_IF_FOUND' | 'CONFIRMED_SEPARATE';
+
+export type GymDuplicateCheckInput = {
+  mode: GymDuplicateCheckMode;
+  /** With CONFIRMED_SEPARATE: the similar gyms the climber saw and said are not theirs. At most 50. */
+  acknowledgedGymUuids?: string[] | null;
 };
 
 export type UpdateGymInput = {
@@ -224,6 +272,7 @@ export type UpdateGymInput = {
   latitude?: number | null;
   longitude?: number | null;
   isPublic?: boolean;
+  isListed?: boolean;
   /** Gym photo. `undefined` leaves the column untouched; explicit `null` clears it. */
   imageUrl?: string | null;
   // Branding: `undefined` leaves the column untouched; explicit `null` clears it
@@ -267,6 +316,14 @@ export type GymClaim = {
   claimEmail?: string | null;
   message?: string | null;
   createdAt: string;
+  /** Admin queue only: days since the claimant's account was created. */
+  claimantAccountAgeDays?: number | null;
+  /** Admin queue only: climbs the claimant has logged. */
+  claimantTickCount?: number | null;
+  /** Admin queue only: other live gyms the claimant owns or admins. */
+  claimantGymsHeld?: number | null;
+  /** Auto-approved list only: when the claim took the gym. */
+  approvedAt?: string | null;
 };
 
 export type GymClaimConnection = {
@@ -280,9 +337,28 @@ export type ReviewGymClaimInput = {
   decision: GymClaimDecision;
 };
 
+export type RevertGymClaimInput = {
+  claimId: string;
+  reason?: string | null;
+};
+
+export type RevertGymClaimResult = {
+  claimId: string;
+  gymUuid: string;
+  gymName: string;
+  removedMemberCount: number;
+};
+
 export type PendingGymClaimsInput = {
   limit?: number;
   offset?: number;
+};
+
+export type AutoApprovedGymClaimsInput = {
+  limit?: number;
+  offset?: number;
+  /** Only this claim: the daily digest's revert link. */
+  claimId?: string | null;
 };
 
 export type AddGymMemberInput = {
@@ -302,6 +378,7 @@ export type FollowGymInput = {
 
 export type MyGymsInput = {
   includeFollowed?: boolean;
+  includeManaged?: boolean;
   limit?: number;
   offset?: number;
 };
@@ -322,6 +399,8 @@ export type SearchGymsInput = {
   radiusKm?: number;
   /** Only gyms with a slug, i.e. linkable at /gym/[slug]. Opt-in; omitting it leaves the emitted SQL unchanged. */
   requireSlug?: boolean;
+  /** Only gyms with valid geographic coordinates; omitted preserves existing discovery. */
+  requireLocation?: boolean;
   /** Claimed gyms first, then the existing newest-first or proximity order. */
   prioritizeClaimed?: boolean;
   limit?: number;
@@ -343,7 +422,7 @@ export type LinkBoardToGymInput = {
 // Gym Insights (owner activity dashboard)
 // ============================================
 
-export type GymStatsPeriod = 'week' | 'month';
+export type GymStatsPeriod = 'week' | 'month' | 'quarter';
 
 export type GymTopClimb = {
   climbUuid: string;
@@ -361,11 +440,131 @@ export type GymDayActivity = {
 };
 
 export type GymStatsWindow = {
+  startAt: string;
+  endAt: string;
+  displayCount: number;
+  tickCount: number;
   uniqueClimbers: number;
   ascentCount: number;
 };
 
+export type GymReportingBoard = {
+  uuid: string;
+  name: string;
+  boardType: string;
+  configurations: { uuid: string; name: string }[];
+};
+
+export type GymReportingCoverage = {
+  observedSince: string;
+  firstDisplayAt: string | null;
+  firstTickAt: string | null;
+  dateOnlyCount: number;
+  boundaryUncertainCount: number;
+  unknownTimeCount: number;
+  includesCurrentBoardHistory: boolean;
+  isPartial: boolean;
+};
+
+export type GymReachCoverage = 'complete' | 'partial' | 'unavailable';
+
+export type GymReachCount = {
+  count: number;
+  coverage: GymReachCoverage;
+};
+
+export type GymReachWindow = {
+  climbers: GymReachCount;
+  firstRecorded: GymReachCount;
+  uncertainFirstRecorded: number;
+  sends: GymReachCount;
+  sendLoggers: number;
+  sessions: GymReachCount;
+};
+
+export type GymReachReturn = {
+  returning: number;
+  previousClimbers: number;
+  coverage: GymReachCoverage;
+};
+
+export type GymReachWeek = {
+  startDate: string;
+  endDate: string;
+  inProgress: boolean;
+  climbers: GymReachCount;
+  sends: GymReachCount;
+};
+
+export type GymReachOverview = {
+  observationStartedAt: string | null;
+  baselineStartAt: string;
+  current: GymReachWindow;
+  previous: GymReachWindow;
+  cameBack: GymReachReturn;
+  previousCameBack: GymReachReturn;
+  weeklyTrend: GymReachWeek[];
+};
+
+export type GymAngleActivityCounts = {
+  tickCount: number;
+  sendCount: number;
+  displayCount: number;
+};
+
+export type GymAngleUsageRow = GymAngleActivityCounts & {
+  angle: number;
+  distinctClimberCount: number;
+  climberDayCount: number;
+  unresolvedLocalDateTickCount: number;
+};
+
+export type GymBoardAngleUsage = {
+  boardUuid: string;
+  knownAngleClimberCount: number;
+  angles: GymAngleUsageRow[];
+  unknownAngle: GymAngleActivityCounts;
+};
+
+export type GymBusyTimesStatus = 'ready' | 'zoneRequired' | 'historyUnavailable' | 'calendarUnavailable';
+
+export type GymBusyWeekday = {
+  /** ISO weekday, Monday 1 through Sunday 7. */
+  dayOfWeek: number;
+  eligibleDates: number;
+  /** Sum of distinct people in each eligible date or date/hour. */
+  recordedClimbers: number;
+};
+
+export type GymBusyHour = GymBusyWeekday & { hour: number };
+
+export type GymBusyTimes = {
+  status: GymBusyTimesStatus;
+  startDate: string | null;
+  endDate: string | null;
+  coveredDates: number;
+  firstCoveredDate: string | null;
+  instantDisplays: number;
+  instantTicks: number;
+  dateOnlyRecords: number;
+  unplacedDateOnlyRecords: number;
+  unknownTimeRecords: number;
+  hasUnboundedUnknownTime: boolean;
+  weekdays: GymBusyWeekday[];
+  hours: GymBusyHour[];
+};
+
 export type GymStats = {
+  gymName: string;
+  boardUuid: string | null;
+  boards: GymReportingBoard[];
+  canManageBoardAliases: boolean;
+  asOf: string;
+  timeZone: string;
+  timeZoneConfigured: boolean;
+  coverage: GymReportingCoverage;
+  reachOverview?: GymReachOverview | null;
+  busyTimes?: GymBusyTimes | null;
   gymUuid: string;
   periodDays: number;
   current: GymStatsWindow;
@@ -374,10 +573,12 @@ export type GymStats = {
   topClimbs: GymTopClimb[];
   /** Ascents per day of week in the current window (non-empty days only). */
   busiestDays: GymDayActivity[];
+  angleUsage: GymBoardAngleUsage[];
 };
 
 export type GymStatsInput = {
   gymUuid: string;
+  boardUuid?: string | null;
   period?: GymStatsPeriod;
 };
 
@@ -503,4 +704,57 @@ export type ReportGymDuplicateStatus = 'reported' | 'already_reported';
 
 export type ReportGymDuplicateResult = {
   status: ReportGymDuplicateStatus;
+};
+
+export type GymGradeInventoryStatus =
+  | 'READY'
+  | 'OWNER_ONLY'
+  | 'WALL_UNAVAILABLE'
+  | 'CHOOSE_COLLECTION'
+  | 'COLLECTION_UNAVAILABLE'
+  | 'COLLECTION_EMPTY';
+
+export type GymGradeInventoryBoard = {
+  boardUuid: string;
+  physicalBoardUuid: string;
+  boardName: string;
+  kind: 'SPRAY_WALL' | 'LED_COLLECTION';
+  status: GymGradeInventoryStatus;
+  included: boolean;
+  variantCount: number;
+  collectionName: string | null;
+};
+
+export type GymGradeComparison = {
+  gymUuid: string;
+  asOf: string;
+  startAt: string;
+  timeZone: string;
+  availableCount: number;
+  sendCount: number;
+  grades: {
+    boardType: string;
+    difficultyId: number | null;
+    availableCount: number;
+    sendCount: number;
+  }[];
+  boards: GymGradeInventoryBoard[];
+};
+
+export type GymGradeCollectionPage = {
+  collections: { uuid: string; name: string }[];
+  nextCursor: string | null;
+};
+
+export type GymGradeCollectionOptionsInput = {
+  gymUuid: string;
+  boardUuid: string;
+  search?: string;
+  cursor?: string | null;
+};
+
+export type SetGymGradeCollectionInput = {
+  gymUuid: string;
+  boardUuid: string;
+  playlistUuid: string | null;
 };

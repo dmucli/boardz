@@ -1,0 +1,1054 @@
+{
+  "metadata": {
+    "home": {
+      "title": "App di arrampicata per Kilter, Tension e MoonBoard",
+      "description": "Scegli un blocco, illuminalo in parete e condividi la coda con il gruppo. Gratis. Compatibile con pannelli come Kilter, Tension e MoonBoard.",
+      "ogDescription": "Scegli un blocco, illuminalo in parete e condividi la coda con il gruppo.",
+      "ogTitle": "Cambia pannello, non app"
+    },
+    "about": {
+      "title": "Fatta da climber, aperta a tutti",
+      "description": "Un'app per ogni pannello di arrampicata. Open source, guidata dalla community."
+    },
+    "support": {
+      "title": "Dona per tenere accesi i server",
+      "description": "Boardsesh è gratis e open source. Contribuisci alle spese di hosting, database e infrastruttura che lo tengono in vita."
+    },
+    "help": {
+      "title": "Aiuto di Boardsesh",
+      "description": "Guide brevi per l'app Boardsesh, come portare qui il tuo diario Kilter o Tension e dove fare una domanda."
+    },
+    "docs": {
+      "title": "Riferimento dell’API pubblica dei blocchi",
+      "description": "Consulta blocchi, gradi e configurazioni dei pannelli pubblici. Collega un’app al diario di uno scalatore tramite l’API OAuth per sviluppatori."
+    },
+    "legal": {
+      "title": "Note legali e proprietà intellettuale",
+      "description": "Note legali e policy sulla proprietà intellettuale di Boardsesh, con la nostra posizione su dati dei blocchi, interoperabilità e uso dei marchi."
+    },
+    "privacy": {
+      "title": "Informativa sulla privacy",
+      "description": "Informativa sulla privacy di Boardsesh: come trattiamo i tuoi dati."
+    },
+    "helpSessions": {
+      "title": "Avvia o unisciti a una session live con la tua crew",
+      "description": "Avvia una session nella scheda Session, invita la crew con un codice QR o un link e condividi un pannello senza illuminarvi i blocchi a vicenda."
+    },
+    "helpFindingClimbs": {
+      "title": "Trova blocchi, tieni premuto per le azioni, crea playlist",
+      "description": "Filtra i blocchi Kilter, Tension e MoonBoard per grado, presa, zona e tracciatore, scorri una lista, tieni premuto un blocco per il suo menu e crea playlist nell'app Boardsesh."
+    },
+    "helpLogbook": {
+      "title": "Registra, modifica ed elimina salite, e allega video della beta",
+      "description": "Registra una spunta nell'app Boardsesh, modificala o eliminala dopo, porta qui il tuo diario Kilter o Tension e allega un video della beta di Instagram o TikTok a un blocco."
+    },
+    "helpBoardAndBluetooth": {
+      "title": "Metti un blocco sul tuo pannello: Bluetooth e guida del pannello",
+      "description": "Connetti Boardsesh a un Kilter, Tension o MoonBoard, scopri cosa vuol dire guidare il pannello, scorri il pulsante del pannello per continuare a illuminare i blocchi e risolvi un pannello che non si connette."
+    },
+    "helpSprayWalls": {
+      "title": "Come fotografare e preparare la tua Spraywall",
+      "description": "Fotografa la tua Spraywall di fronte e in verticale, aggiungila a Boardsesh, correggi le prese che trova e modificale dopo o dopo un reset."
+    }
+  },
+  "home": {
+    "hero": {
+      "title": "Cambia pannello, non app",
+      "eyebrow": "Gratis. Compatibile con pannelli come Kilter, Tension e MoonBoard.",
+      "subtitle": "Scegli un blocco, illuminalo in parete e condividi la coda con il gruppo.",
+      "compareApps": "Confronta Boardsesh con l'app del tuo pannello\u00a0(in\u00a0inglese)",
+      "ctaInstallIos": "Scarica su App Store",
+      "ctaInstallAndroid": "Disponibile su Google Play",
+      "ctaUpdate": "Aggiorna l'app",
+      "qrTitle": "Inquadra il codice per avere l'app sul telefono",
+      "qrBody": "Gratis su iPhone e Android.",
+      "qrImageLabel": "Codice QR che apre Boardsesh sul telefono",
+      "proof": "Negli ultimi 30 giorni, circa {{formattedClimbers}} scalatori hanno usato Boardsesh per illuminare un blocco sul pannello {{formattedClimbs}} volte.",
+      "tensionShotAlt": "Un blocco su un Tension Board in Boardsesh",
+      "moonboardShotAlt": "Un blocco su una MoonBoard in Boardsesh",
+      "playShotAlt": "Un blocco aperto in Boardsesh con le prese illuminate sul pannello"
+    },
+    "cards": {},
+    "gymSearch": {
+      "title": "Trova un pannello vicino a te",
+      "lead_one": "L’elenco dei pannelli comprende {{formattedCount}} palestre, club e pareti domestiche.",
+      "lead_other": "L’elenco dei pannelli comprende {{formattedCount}} palestre, club e pareti domestiche.",
+      "leadNoCount": "Palestre, club e garage con un pannello in parete sono già in elenco. Cerca per nome o città, oppure lascia che il browser ti localizzi."
+    },
+    "boards": {
+      "title": "Pannelli popolari",
+      "lead": "Trova il pannello su cui arrampichi, poi aprilo nell'app con la tua crew.",
+      "ranking": "Ordinati per numero di climber che hanno registrato ripetizioni su ogni pannello. Le anteprime sono istantanee, non aggiornamenti in tempo reale.",
+      "climbers_one": "{{formattedCount}} climber",
+      "climbers_other": "{{formattedCount}} climber",
+      "preview": "Anteprima del pannello: {{board}}",
+      "typeAngle": "{{board}} · {{angle}}°",
+      "selectedClimb": "Blocco selezionato: {{climb}}",
+      "open": "Arrampica su questo pannello"
+    },
+    "recentBeta": {
+      "title": "Beta fresche",
+      "lead": "Guarda il blocco e la sua beta: video appena collegati dagli scalatori."
+    },
+    "showcase": {
+      "videoLabel": "Demo: tutti i pannelli in un'app, compresa una Spraywall, poi una coda condivisa con la crew, un piano di allenamento e una ripetizione registrata.",
+      "scenes": {
+        "boards": "Tutti i pannelli. Un'app.",
+        "spray": "Anche la tua Spraywall.",
+        "wall": "Guarda cosa c'è in parete.",
+        "crew": "La tua crew. Una coda.",
+        "workouts": "Organizza un allenamento, poi arrampica.",
+        "island": "Il prossimo blocco, dalla schermata di blocco.",
+        "log": "Ricorda ogni ripetizione.",
+        "outro": "Meno telefono. Più parete."
+      },
+      "unsupported": "Il tuo browser non può riprodurre questo video.",
+      "pause": "Metti in pausa la demo",
+      "play": "Avvia la demo"
+    },
+    "features": {
+      "title": "Ecco una sessione",
+      "lead": "Dal primo blocco all'ultima ripetizione, tieni insieme tutta la session.",
+      "queue": {
+        "title": "La tua crew. Una coda live.",
+        "body": "Aggiungete i blocchi insieme. Tutti restano sincronizzati.",
+        "shotAlt": "La coda condivisa di Boardsesh con i prossimi blocchi della crew"
+      },
+      "wall": {
+        "title": "Guarda cosa c'è in parete.",
+        "body": "Sai quale blocco è illuminato mentre sfogli il prossimo.",
+        "shotAlt": "Il blocco illuminato resta visibile mentre sfogli gli altri"
+      },
+      "profile": {
+        "title": "Tutti i tuoi pannelli. Un profilo.",
+        "body": "Guarda ripetizioni e progressi su ogni pannello.",
+        "shotAlt": "Le tue ripetizioni e i tuoi progressi sui vari pannelli nel profilo Boardsesh"
+      },
+      "spray": {}
+    },
+    "support": {
+      "eyebrow": "Gratis, e continuerà a esserlo",
+      "title": "Boardsesh va avanti grazie ai climber che contribuiscono",
+      "chipIn": "Contribuisci",
+      "source": "Leggi il codice",
+      "otherWays": "Non hai soldi da parte?"
+    },
+    "supportBanner": {
+      "text": "Boardsesh resta gratis e senza pubblicità grazie ai climber che contribuiscono. Ogni contributo aiuta, una tantum o ogni mese.",
+      "cta": "Sostienici",
+      "close": "Chiudi"
+    }
+  },
+  "about": {
+    "hero": {
+      "title": "Fatta da climber. Aperta a tutti.",
+      "subtitle": "Costruita da climber stufi di avere un'app per ogni pannello."
+    },
+    "openSource": {
+      "title": "Open source",
+      "body": "Il codice è pubblico con licenza Apache 2.0, quindi puoi eseguire la tua copia. CONTRIBUTING.md è il punto di partenza attuale; una guida di self-hosting mantenuta deve ancora arrivare.",
+      "cta": "Vedi su GitHub →"
+    },
+    "api": {
+      "title": "Documentazione API",
+      "body": "L’API di lettura di blocchi e gradi è pubblica. Un’app può leggere il diario di uno scalatore con il suo consenso tramite l’API OAuth separata; la guida per sviluppatori indica le condizioni di accesso attuali.",
+      "cta": "Esplora la documentazione API →",
+      "status": {
+        "open": "La registrazione delle app è aperta.",
+        "invitation": "Durante i test la registrazione delle app è solo su invito.",
+        "unavailable": "Le connessioni con altre app non sono disponibili al momento."
+      }
+    },
+    "community": {
+      "title": "Entra nella community",
+      "body": "Che tu scriva codice, tracci blocchi o voglia solo dirci cosa non funziona, ci fa piacere sentirti.",
+      "discord": "Entra nella crew su Discord",
+      "support": "Contribuisci"
+    },
+    "legalLink": "Note legali e proprietà intellettuale",
+    "footer": "Fatta da climber. Aperta a tutti.",
+    "story": {
+      "title": "Perché esiste",
+      "p1": "Ogni pannello ha la sua app, il suo login e il suo diario. Arrampichi su un Kilter in palestra e su una MoonBoard in vacanza e hai due storie che non si incontrano mai.",
+      "p2": "Quando la vecchia app Kilter ha smesso di funzionare nel marzo 2026, alcuni scalatori hanno perso accesso alla cronologia. Puoi già scaricare il diario Boardsesh: apri Impostazioni → Account → Esporta dati di arrampicata e scegli un pannello. Il codice è pubblico con licenza Apache 2.0.",
+      "link": "Cos'è successo e come recuperare i tuoi dati"
+    },
+    "who": {
+      "title": "Chi lo costruisce",
+      "body": "Boardsesh è gestito da Marco de Jongh, scalatore di pannello a Sydney, Australia, con codice, traduzioni e segnalazioni di altri scalatori. Scrivigli a support@boardsesh.com.",
+      "cta": "Vedi chi ha contribuito"
+    },
+    "next": {
+      "title": "Cosa viene dopo",
+      "body": "Più pannelli, arrampicata offline migliore e importazione della cronologia da altre app. Segui la roadmap e partecipa su Discord.",
+      "cta": "Leggi la roadmap"
+    },
+    "profile": {
+      "title": "Tutti i tuoi pannelli. Un profilo.",
+      "shotAlt": "Le tue ripetizioni e i tuoi progressi sui vari pannelli nel profilo Boardsesh"
+    }
+  },
+  "support": {
+    "hero": {
+      "title": "Aiuta Boardsesh a restare online",
+      "ctaMonthly": "Sostienici"
+    },
+    "promise": "Tutti hanno la stessa app, con o senza contributi. Nessuna pubblicità nell’app.",
+    "why": {
+      "title": "Perché esiste questa pagina",
+      "p1": "Mantenere Boardsesh richiede di pagare hosting, database e tempo di sviluppo.",
+      "p2": "Il codice è pubblico con licenza Apache 2.0, quindi puoi eseguire la tua copia. Se puoi contribuire, aiuti il lavoro a continuare."
+    },
+    "rails": {
+      "title": "Modi per contribuire"
+    },
+    "sponsors": {
+      "title": "GitHub Sponsors",
+      "body": "Sostieni Boardsesh ogni mese. Più semplice se hai già un account GitHub.",
+      "cta": "Sostieni su GitHub"
+    },
+    "oneTime": {
+      "title": "Donazione una tantum",
+      "body": "Paga con carta, Apple Pay o Google Pay nel browser. Nessun account richiesto.",
+      "cta": "Dona una volta"
+    },
+    "chooser": {
+      "cadenceLabel": "Frequenza",
+      "monthly": "Mensile",
+      "once": "Dona una volta",
+      "currencyLabel": "Valuta",
+      "aud": "AUD",
+      "usd": "USD",
+      "perMonth": "{{amount}}/mese",
+      "monthlyBody": "Il sostegno mensile finanzia il tempo necessario a sviluppare Boardsesh. Paga con carta, Apple Pay o Google Pay nel browser. Nessun account richiesto.",
+      "publicName": "Se inserisci un nome al pagamento, potremmo mostrarlo pubblicamente quando ringraziamo chi ci sostiene. Lascia il campo vuoto per donare in modo anonimo.",
+      "manage": "Doni già ogni mese? Modifica o interrompi la donazione su Stripe →"
+    },
+    "otherWays": {
+      "title": "Altri modi per aiutare",
+      "body": "I soldi sono il modo più lento. Ognuno di questi quattro fa avanzare l'app.",
+      "bug": {
+        "title": "Segnala un bug",
+        "body": "Dicci cosa non ha funzionato, su quale pannello e cosa ti aspettavi.",
+        "cta": "Apri una issue su GitHub →"
+      },
+      "translate": {
+        "title": "Traduci una schermata",
+        "body": "I cataloghi in spagnolo, francese, tedesco e italiano sono nel repository. Correggi una frase o aggiungi una lingua.",
+        "cta": "Sfoglia i cataloghi delle lingue →"
+      },
+      "patch": {
+        "title": "Migliora qualcosa nel codice",
+        "body": "Tutta l'app è pubblica: web, mobile, backend e i dati dei pannelli che ci stanno dietro.",
+        "cta": "Scopri come è fatta →"
+      },
+      "discord": {
+        "title": "Entra su Discord",
+        "body": "Chiedi a cosa si sta lavorando, discuti sui gradi, dicci cosa manca.",
+        "cta": "Vieni a salutare →"
+      }
+    },
+    "honesty": {
+      "title": "Le cose da sapere",
+      "p1": "Le donazioni non sono deducibili dalle tasse. Boardsesh non è un ente benefico.",
+      "p2": "I contributi pagano server e sviluppo. Non comprano nulla in più nell’app."
+    },
+    "thanks": {
+      "title": "Grazie",
+      "body": "A chi sostiene già Boardsesh, segnala bug, manda patch o traduce una schermata: grazie. Siete voi a far andare avanti tutto."
+    },
+    "thanksState": {
+      "title": "Grazie",
+      "body": "Il tuo contributo è andato a buon fine. Va direttamente allo sviluppo di Boardsesh."
+    },
+    "aboutLink": "Leggi di più sul progetto →",
+    "docsLink": "Leggi il codice su GitHub",
+    "footer": "Gratis per tutti, finanziato da chi può dare una mano.",
+    "legalLink": "Leggi la politica legale",
+    "privacyLink": "Leggi l’informativa sulla privacy"
+  },
+  "legal": {
+    "intro": {
+      "title": "Note legali e proprietà intellettuale",
+      "p1": "Boardsesh è un’app gratuita, open source e creata dalla community per trovare blocchi e usare pannelli compatibili, tra cui Kilter, Tension e MoonBoard.",
+      "p2": "Crediamo che i climber debbano essere liberi di scegliere come usare l'hardware che hanno acquistato, e che i dati creati dalla community debbano restare accessibili alla community."
+    },
+    "climbData": {
+      "title": "La nostra posizione sui dati dei blocchi",
+      "facts": {
+        "title": "I blocchi sono dati di fatto",
+        "p1": "Un blocco su un pannello standardizzato è un elenco di posizioni di prese su un layout fisso e standardizzato (ad es. \"parti da A5, usa B12, C3, D18, finisci su K11\"), insieme a un grado e a un'inclinazione della parete. Sono informazioni di fatto e funzionali, paragonabili a una posizione sulla scacchiera, a un insieme di coordinate GPS o a un numero di telefono, non un'opera creativa dell'ingegno.",
+        "p2": "Secondo la legge statunitense sul copyright, i fatti non sono proteggibili (<em>Feist Publications, Inc. v. Rural Telephone Service Co.</em>, 499 U.S. 340 (1991)). Un pannello standardizzato con un numero finito di prese (di solito 200–500) produce definizioni di blocchi che sono per natura vincolate, fattuali e funzionali."
+      },
+      "community": {
+        "title": "Il database è creato dalla community",
+        "p1": "I database dei blocchi di questi pannelli sono quasi interamente contenuti generati dagli utenti. I singoli climber creano e pubblicano i blocchi. I produttori dei pannelli non hanno creato questi contenuti: offrono una piattaforma per pubblicarli e mostrarli.",
+        "p2": "La posizione sulle licenze varia da produttore a produttore, ma in nessun caso un produttore possiede i dati dei blocchi della community:",
+        "aurora": "<strong>Aurora Climbing</strong> (Kilter Board, Tension Board e altri): i Termini d'uso di Aurora le concedono una \"licenza perpetua, senza restrizioni, illimitata, non esclusiva e irrevocabile\" sui contenuti caricati dagli utenti. Punto cruciale: questa licenza è <strong>non esclusiva</strong>. Non trasferisce la proprietà ad Aurora, né impedisce all'autore originale (o a terzi) di usare, raccogliere o presentare in modo indipendente gli stessi dati di fatto.",
+        "moonLabel": "Moon Climbing (MoonBoard):",
+        "moonBody": "All'ultima verifica dei documenti legali pubblici di Moon Climbing (febbraio 2026) non abbiamo trovato termini di servizio specifici per l'app, un contratto di licenza con l'utente finale né una licenza sui contenuti caricati che riguardi l'app MoonBoard o il suo database di blocchi. Come per ogni pannello qui, la nostra posizione si basa sul principio sopra: le definizioni dei blocchi sono dati di fatto e funzionali, e i database sono creati dalla community."
+      },
+      "compilation": {
+        "title": "I database completi hanno una debole tutela come compilazioni",
+        "body": "Anche dove l'organizzazione di un database potrebbe avere diritto a una tutela sottile come compilazione, la Corte Suprema degli Stati Uniti ha stabilito che la protezione copre solo la selezione o la disposizione creativa, non i fatti sottostanti. Un database che raccoglie in modo completo tutti i contributi degli utenti senza cura editoriale (come fanno queste piattaforme) è analogo a un elenco telefonico in ordine alfabetico, che la Corte ha ritenuto non tutelabile in <em>Feist</em>."
+      }
+    },
+    "attribution": {
+      "title": "Attribuzione e rispetto per chi crea",
+      "intro": "Rispettiamo la community dell'arrampicata e le persone che creano i blocchi.",
+      "item1": "Dove disponibili, indichiamo l'autore del blocco con il suo nome utente.",
+      "item2": "Non rivendichiamo la paternità di blocchi che non abbiamo creato.",
+      "item3Start": "Se sei l'autore di un blocco e vuoi che venga rimosso,",
+      "item3Link": "apri una issue",
+      "item3End": "o contattaci e rispetteremo subito la tua richiesta."
+    },
+    "interop": {
+      "title": "Interoperabilità e compatibilità hardware",
+      "intro": "Questo progetto fornisce software e progetti hardware compatibili con l'hardware dei pannelli di arrampicata standardizzati. I climber che hanno acquistato questi pannelli hanno il diritto di usare software e controller di terze parti con il proprio hardware.",
+      "software": {
+        "title": "Interoperabilità software",
+        "body": "La nostra app comunica con i controller dei pannelli tramite protocolli Bluetooth standard. Il protocollo di comunicazione Bluetooth usato da questi pannelli non è cifrato e si basa su hardware comune (LED indirizzabili WS2812B pilotati da normali controller Bluetooth). Realizzare un'interfaccia Bluetooth compatibile ai fini dell'interoperabilità è pacificamente lecito sia secondo il diritto statunitense sia secondo quello dell'UE (<em>Sega Enterprises Ltd. v. Accolade, Inc.</em>, 977 F.2d 1510 (9th Cir. 1992); Direttiva UE 2009/24/CE, articolo 6)."
+      },
+      "controller": {
+        "title": "Controller open source",
+        "p1": "Questo progetto offre anche progetti open source di hardware e firmware per un controller. Il controller è un'implementazione indipendente e originale che comunica con lo stesso protocollo Bluetooth dei controller ufficiali. È costruito su componenti comuni (microcontrollori standard e LED WS2812B) e non incorpora firmware, codice o progetti hardware proprietari di alcun produttore di pannelli. Non risultano brevetti che coprano i sistemi di controllo LED usati da alcun produttore attuale.",
+        "p2": "Il nostro controller è pensato per essere interoperabile sia con il software di questo progetto sia, a discrezione dell'utente, con le app ufficiali dei produttori. Qualsiasi interoperabilità di questo tipo è avviata dall'utente finale sul proprio hardware."
+      }
+    },
+    "hostedService": {
+      "title": "Servizio ospitato e accesso alle API",
+      "p1": "Il codice di Boardsesh è open source con licenza Apache 2.0. Questa licenza copre il codice. Non copre il servizio ospitato: gli account, il database dei blocchi, la sincronizzazione del diario e i server in tempo reale a cui si collegano le app e il sito di Boardsesh. Quelli li gestiamo e li paghiamo noi.",
+      "p2Start": "L'API pubblica documentata nella",
+      "p2Link": "pagina della documentazione API",
+      "p2End": "serve per le integrazioni: strumenti che leggono i dati dei blocchi o agiscono per conto di un climber che ha effettuato l'accesso, dal suo account, entro i limiti di richieste applicati dal servizio.",
+      "p3": "Il servizio ospitato non è un backend per altre app. Un'app o un fork distribuito pubblicamente i cui account, l'arrampicata, il controllo dei pannelli o le sessioni girano sui server di Boardsesh richiede il nostro permesso scritto, e al momento non lo concediamo. Collegare alla tua app l'account Boardsesh di un climber con il suo permesso è diverso: se avviene tramite l'API OAuth, entro gli scope della documentazione per sviluppatori e secondo i termini per sviluppatori che accetti quando registri l'app, è un'integrazione e non richiede altri permessi da parte nostra. Se fai un fork di Boardsesh, gestisci anche il tuo backend. Il codice è lì proprio per questo. Oggi il punto di partenza è la configurazione di sviluppo in CONTRIBUTING.md; la documentazione ufficiale sul self-hosting deve ancora arrivare.",
+      "p4Start": "Non devi nemmeno partire da un database vuoto. Gli",
+      "p4Link": "snapshot notturni dei pannelli",
+      "p4End": "sono file SQLite pubblici dei cataloghi dei blocchi, economici da servire per noi, e puoi usarli liberamente. Siamo anche disponibili a parlare della sincronizzazione di dati non utente, come blocchi e gradi, verso un servizio alternativo.",
+      "contact": "Domande su questa policy:"
+    },
+    "trademark": {
+      "title": "Uso dei marchi",
+      "body": "Usiamo i nomi dei pannelli e dei prodotti (ad es. \"Kilter Board\", \"MoonBoard\", \"Tension Board\") solo per descrivere la compatibilità e l'interoperabilità dell'hardware. Questi nomi sono marchi dei rispettivi proprietari. Questo progetto non è affiliato, approvato né sponsorizzato da Aurora Climbing, Moon Climbing o da alcun produttore di pannelli."
+    },
+    "dmca": {
+      "title": "DMCA e richieste di rimozione",
+      "intro": "Prendiamo sul serio la proprietà intellettuale. Se ritieni che un materiale di questo progetto violi il tuo copyright, contattaci con le seguenti informazioni:",
+      "item1": "L'identificazione dell'opera protetta da copyright che ritieni violata.",
+      "item2": "L'identificazione del materiale che ritieni in violazione, con abbastanza dettagli perché possiamo trovarlo.",
+      "item3": "I tuoi dati di contatto (nome, indirizzo, email, numero di telefono).",
+      "item4": "Una dichiarazione in cui affermi in buona fede che l'uso non è autorizzato dal titolare del copyright, dal suo agente o dalla legge.",
+      "item5": "Una dichiarazione, sotto pena di falsa testimonianza, che le informazioni nella tua segnalazione sono accurate e che sei il titolare del copyright o sei autorizzato ad agire per suo conto.",
+      "review1": "Esamineremo tutte le richieste valide con tempestività e in buona fede. Potremo anche presentare una contronotifica quando riteniamo che una richiesta di rimozione si basi su un'errata identificazione del materiale o su un'errata interpretazione della legge.",
+      "contactLabel": "Contatto:"
+    },
+    "community": {
+      "title": "Una nota per la community",
+      "p1": "La community dell'arrampicata ha una lunga tradizione di condivisione aperta della beta. Questo progetto nasce in quello spirito. Non cerchiamo di danneggiare nessuna azienda: cerchiamo di dare ai climber strumenti migliori per usare l'hardware che già possiedono e i dati che hanno contribuito a creare.",
+      "p2": "I produttori continuano a trarre vantaggio da questo ecosistema. Il nostro progetto fa crescere la domanda dei loro prodotti fisici (prese, pannelli) dove offrono un valore reale. Crediamo semplicemente che i climber meritino di poter scegliere come usare il proprio hardware.",
+      "p3": "Se sei un produttore di pannelli e vuoi parlare di collaborazione o hai dubbi, siamo aperti al dialogo. Scrivici."
+    },
+    "thirdParty": {
+      "title": "Note di terze parti",
+      "iconLabel": "Icona Persona che cade",
+      "iconFrom": "da",
+      "fontAwesomeLink": "Font Awesome Free 6.7.2",
+      "byAuthor": "di @fontawesome.",
+      "licenseLabel": "Licenza:",
+      "licenseLink": "CC BY 4.0",
+      "copyright": ". Copyright 2024 Fonticons, Inc."
+    },
+    "footer": "Questo documento è fornito a scopo informativo e non costituisce consulenza legale. Ultimo aggiornamento: 10-08-2026"
+  },
+  "help": {
+    "clip": {
+      "unsupported": "Il tuo browser non può riprodurre questa clip.",
+      "playHint": "Premi play per vedere il gesto."
+    },
+    "nav": {
+      "label": "Percorso di navigazione",
+      "home": "Home",
+      "help": "Aiuto",
+      "jump": "In questa pagina"
+    },
+    "install": {
+      "title": "Scarica l'app",
+      "intro": "Illuminare il pannello, registrare le ripetizioni e le session in crew si fanno nell'app."
+    },
+    "board": {
+      "breadcrumb": "Pannello e Bluetooth",
+      "hero": {
+        "title": "Metti un blocco sul tuo pannello",
+        "subtitle": "Un tocco mostra il blocco. Illumina il pannello lo accende, e il pannello segue le tue scelte per un po'."
+      },
+      "connect": {
+        "title": "Metti un blocco sul pannello",
+        "lead": "Un tocco ti mostra il blocco. Illumina il pannello si connette se serve e lo accende.",
+        "clipAlt": "Toccando Illumina il pannello parte una guida a tempo, con un timer e un ghiaccio che si restringe",
+        "clipCaption": "Tocca Illumina il pannello. Il timer parte e ogni nuovo blocco che scegli lo ricarica.",
+        "step1": "In un blocco, tocca il grande pulsante Illumina il pannello.",
+        "step2": "Solo la prima volta, scegli il tuo pannello dall'elenco. Non lo vedi? Tocca Cerca qualsiasi pannello.",
+        "step3": "Consenti il Bluetooth quando richiesto. Android chiede Dispositivi nelle vicinanze, o Posizione su Android 11 e precedenti.",
+        "otherBoard": "Un blocco di un altro pannello della tua palestra mostra Metti sul Tension, o il nome di quel pannello. Toccalo per spostarti lì e accendere il blocco.",
+        "changeBoard": "Su un altro pannello? Cambia pannello è la prima riga dietro il tuo avatar."
+      },
+      "driving": {
+        "title": "Guidare il pannello",
+        "lead": "Quando guidi il pannello, ogni blocco che scegli si accende subito.",
+        "looking": "Altrimenti un tocco apre un'anteprima e il pannello tiene il suo blocco.",
+        "waysIntro": "Tre modi per iniziare a guidare:",
+        "way1": "Illumina il pannello accende il blocco, poi guidi per un tempo fisso: 45 secondi se non lo cambi. Ogni scelta riavvia il timer.",
+        "way2": "Scorri a sinistra il pulsante del pannello finché non dice Rilascia per illuminare ogni blocco, poi rilascia. Oppure, una volta connesso, tienilo premuto e scegli Illumina ogni blocco. Guidi finché non tocchi Guidi tu il pannello.",
+        "way3": "Attiva Guida sempre il pannello in Impostazioni, poi Pannello. Finché il tuo telefono ha il pannello, guidi tu. Un tocco mette in pausa finché il pannello non si disconnette o tocchi Illumina il pannello.",
+        "tell": "Un pulsante del pannello smerigliato con scritto Guidi tu il pannello vuol dire che stai guidando.",
+        "tellClock": "Un timer accanto all'etichetta indica una guida a tempo, e il ghiaccio si restringe man mano che scade. Senza timer, dura finché non tocchi. Sul mini player, la lampadina diventa ambra mentre guidi.",
+        "clipAlt": "Scorrere a sinistra il pulsante del pannello per iniziare a guidare, poi toccarlo per fermarsi",
+        "clipCaption": "Scorri a sinistra e rilascia per illuminare ogni blocco. Tocca Guidi tu il pannello per fermarti.",
+        "end1": "Tocchi Guidi tu il pannello.",
+        "end2": "Il timer scade. Solo guide a tempo.",
+        "end3": "Un compagno mette un blocco. Solo guide a tempo.",
+        "end4": "Tocchi Spegni tutte le luci, la connessione cade o cambi pannello o session.",
+        "after": "Dopo una guida, la tua prossima scelta si apre di nuovo come anteprima.",
+        "states": {
+          "lookingAlt": "Il player con un'anteprima: la barra in alto dice Anteprima · non in parete e il pulsante dice Illumina il pannello",
+          "timedAlt": "Il player mentre guidi con un timer: il pulsante dice Guidi tu il pannello · 0:28",
+          "openAlt": "Il player mentre guidi senza timer: il pulsante dice Guidi tu il pannello",
+          "lookingLabel": "Stai guardando",
+          "lookingTitle": "Illumina il pannello",
+          "lookingBody": "Non si accende nulla finché non lo tocchi.",
+          "timedLabel": "Guida a tempo",
+          "timedTitle": "Il timer scende",
+          "timedBody": "Il timer scende dopo Illumina il pannello.",
+          "openLabel": "Scorri per guidare",
+          "openTitle": "Niente timer",
+          "openBody": "Resta acceso finché non tocchi."
+        },
+        "statesEyebrow": "Leggi il pulsante del pannello",
+        "statesTitle": "I tre stati del pulsante del pannello",
+        "endsTitle": "Una guida finisce quando",
+        "stop": "Tocca <label>{{drivingLabel}}</label> per smettere di controllarla."
+      },
+      "history": {
+        "title": "Cosa c'è ora in parete",
+        "lead": "Cronologia del pannello elenca ogni blocco acceso su questo pannello, da chiunque, dal più recente.",
+        "p1": "Tocca l'orologio nell'intestazione Blocchi per aprirla. Tocca un blocco per vederlo in anteprima. La cronologia della tua coda è un'altra lista.",
+        "p2": "La capsula nell'intestazione Blocchi mostra il blocco in parete finché un telefono connesso lo tiene acceso, o per un'ora dopo che è stato acceso. Puoi nasconderla fino a quando ne viene acceso un altro."
+      },
+      "controls": {
+        "title": "Controlli e impostazioni del pannello",
+        "lead": "Da connesso, tieni premuto il pulsante del pannello per aprire Controlli del pannello.",
+        "shotAlt": "Controlli del pannello per un pannello connesso",
+        "shotCaption": "Illumina di nuovo, spegni tutte le luci o disconnetti.",
+        "lightingShotAlt": "Impostazioni di illuminazione con durata della guida e accensione automatica",
+        "lightingShotCaption": "Impostazioni, poi Pannello: quando smette la guida.",
+        "row1": "Smetti di guidare dopo. Cambia il tempo o scegli Subito.",
+        "row2": "Illumina di nuovo il pannello. Rimanda il blocco ai LED.",
+        "row3": "Spegni tutte le luci. Ferma anche la guida.",
+        "row4": "Disconnetti il pannello. Usalo se ti sei connesso al pannello sbagliato.",
+        "row5": "Illumina la presa sopra. Solo MoonBoard.",
+        "settingsIntro": "Il resto sta in Impostazioni, poi Pannello:",
+        "setting1": "Smetti di guidare dopo: Subito, da 30 secondi a 5 minuti, o Finché non mi fermo.",
+        "setting2": "Guida sempre il pannello: spento di default.",
+        "setting3": "Disconnetti il Bluetooth quando smetti di guidare: spento di default. Libera il pannello per il prossimo.",
+        "setting4": "Anche in una session: acceso di default. Ti lascia guidare in una crew.",
+        "bulb": "Preferisci una lampadina? Imposta Controllo del pannello su Lampadina in ⋯, Opzioni di visualizzazione, Pulsanti."
+      },
+      "control": {
+        "title": "Quando un altro telefono ha il pannello",
+        "lead": "Un pannello Kilter o Tension parla con un solo telefono alla volta, e una nuova connessione butta giù la vecchia.",
+        "p1": "MoonBoard V3+ accetta più telefoni. La scatola della MoonBoard originale tiene il primo e potrebbe servire riavviare il controller.",
+        "p2": "In una crew si connette solo il telefono che ha il pannello. Il tuo Illumina il pannello passa da quel telefono, e la sua faccia compare sul tuo pulsante del pannello.",
+        "sessionsLink": "Altro sulla condivisione del pannello"
+      },
+      "liveActivity": {
+        "title": "Schermata di blocco e Dynamic Island",
+        "lead": "Avvia una session, anche da solo, e la schermata di blocco ottiene i controlli del pannello.",
+        "p1": "Su iPhone, una Live Activity mostra il blocco in parete e il suo grado. Finché il tuo telefono ha il pannello, aggiunge Precedente, Successivo e una lampadina che illumina di nuovo il pannello.",
+        "p2": "Successivo avanza nella tua coda, non nella lista che stavi scorrendo, e accende subito quel blocco. Come Illumina il pannello, avvia o allunga una guida.",
+        "p3": "Android mostra gli stessi controlli in una notifica. Bloccare lo schermo non disconnette mai il pannello."
+      },
+      "failed": {
+        "title": "Il pannello non si illumina?",
+        "lead": "L'avviso Impossibile connettersi indica il problema.",
+        "fix1": "Pannello non trovato. Controlla che sia acceso e che tu sia vicino. Se un altro telefono è connesso, disconnettilo prima da lì.",
+        "fix2": "Impossibile connettersi. Avvicinati e riprova.",
+        "fix3": "Connesso, ma il pannello non risponde. Spegnilo e riaccendilo.",
+        "fix4": "Il Bluetooth è spento. Accendilo.",
+        "fix5": "Su Android, se non trovi nulla, tocca Consenti posizione o Attiva posizione in fondo al foglio.",
+        "twoBoards": "Due pannelli nel raggio? Il tuo è in cima. Leggi il numero di serie prima di toccare. Un avviso di configurazione del pannello non corrispondente vuol dire che il controller ha un'altra configurazione. Scegli Annulla, Connetti comunque o Cambia configurazione del pannello.",
+        "duplicate": "Lo stesso pannello due volte? Due numeri di serie sono due controller. Una riga con solo Kilter Board è una scatola LED più recente, e più tacche di segnale di solito indicano il tuo pannello. Se si accende il pannello sbagliato, tocca Disconnetti il pannello in Controlli del pannello.",
+        "duplicateYourBoards": "Un pannello doppio sotto I tuoi pannelli è un'altra cosa. Tocca Modifica, poi Elimina o Smetti di seguire.",
+        "compareApps": "L’app Kilter o MoonBoard non funziona? Confronta le app per <kilter>Kilter</kilter> e <moonboard>MoonBoard</moonboard> (in inglese)."
+      },
+      "next": {
+        "title": "Continua",
+        "findingClimbs": "Trova qualcosa da mettere sul pannello",
+        "hub": "Tutti gli argomenti dell'aiuto"
+      }
+    },
+    "climbs": {
+      "breadcrumb": "Trova, riproduci e salva blocchi",
+      "hero": {
+        "title": "Trova, riproduci e salva blocchi",
+        "subtitle": "Filtra la lista, scorrila, tieni premuto per altro e salva i blocchi nelle playlist."
+      },
+      "player": {
+        "title": "Scorri una lista",
+        "lead": "Un tocco mostra un blocco, e scorrere percorre la lista da cui l'hai toccato.",
+        "p1": "La barra in alto dice Anteprima · non in parete e nomina la lista, tipo Risultati della ricerca · 4 di 23. Il pannello, la tua coda e i telefoni degli altri restano come sono.",
+        "p2": "Dal blocco in parete, gli scorrimenti vanno prima a Prossimi. Poi continuano nella lista da cui veniva quel blocco, che il foglio della coda mostra sotto Poi da e il nome della lista. A fine lista compare una scheda finale.",
+        "p3": "Il chip indietro ti porta al blocco in parete. Il mini player è la tua ultima occhiata: toccalo per riaprire quell'anteprima con la sua lista.",
+        "p4": "In una crew la barra in alto dice Lo vedi solo tu, e ogni telefono percorre la propria lista.",
+        "callout": "Illumina il pannello fa diventare un blocco in anteprima il blocco in parete. Mentre guidi il pannello non c'è anteprima: ogni scelta si accende subito.",
+        "drivingLink": "Come funziona la guida",
+        "clipAlt": "Scorrere una lista nel player",
+        "clipCaption": "Scorri la lista. Il pannello tiene il suo blocco."
+      },
+      "menu": {
+        "title": "Tieni premuto un blocco",
+        "lead": "Tieni premuta la riga di un blocco per tutte le sue azioni.",
+        "p1": "Tocca un'azione, o tocca fuori per chiudere. Registra una salita, Aggiungi alla playlist e Condividi sono quelle che userai di più.",
+        "playNext": "Metti subito dopo mette il blocco in cima a Prossimi. Metti in fondo lo mette in fondo.",
+        "favorite": "Attiva o disattiva il preferito salva il blocco in Blocchi che ti piacciono. Una volta lì, la riga dice Rimuovi dai preferiti.",
+        "remix": "Remixa questo blocco crea un nuovo blocco da queste prese.",
+        "edit": "Modifica il blocco funziona sui tuoi blocchi, come bozza o entro 24 ore dalla pubblicazione.",
+        "others": "Aggiungi un video della beta, Modifica la salita, Apri nell'app Aurora e Segnala il blocco compaiono quando servono.",
+        "p2": "Preferisci un tocco? Attiva Mostra il pulsante azioni rapide in Impostazioni, poi Blocchi e gradi, poi Elenco dei blocchi. Ogni riga ottiene un ⋮ che apre lo stesso menu.",
+        "betaLink": "Allega un video della beta",
+        "clipAlt": "Tenere premuta la riga di un blocco",
+        "clipCaption": "Tieni premuta la riga e il menu si apre da solo."
+      },
+      "filters": {
+        "title": "Filtra per grado, presa, zona o tracciatore",
+        "lead": "Apri Filtri nella scheda Blocchi. Una puntina accanto al nome di un filtro lo trasforma in chip sopra la lista.",
+        "grade": "Tocca Grado, poi un grado. Tocca un secondo grado entro tre secondi per un intervallo, o di nuovo il grado scelto per cancellarlo.",
+        "angle": "Gradi e conteggi delle ripetizioni usano l'inclinazione del pannello. Tocca il chip dei gradi per cambiarla.",
+        "progress": "Da connesso, i chip Progressi usano il tuo storico. Non chiusi nasconde le tue ripetizioni, Progetti tiene i blocchi provati ma non chiusi e Non provati tiene quelli mai registrati.",
+        "gradeClipAlt": "Creare un intervallo di gradi",
+        "gradeClipCaption": "Due tocchi veloci creano un intervallo.",
+        "holdsIntro": "Per filtrare per presa, scorri fino a Il blocco in Filtri e tocca Tipi di presa.",
+        "holdStep1": "Scegli Includi o Escludi.",
+        "holdStep2": "Scegli un tipo di presa.",
+        "holdStep3": "Pizzica per ingrandire, poi tocca le prese. Tocca di nuovo con lo stesso pennello per cancellare un segno.",
+        "holdNote": "Cancella tutto svuota il pannello. La MoonBoard non ha il pennello per i piedi.",
+        "holdClipAlt": "Segnare le prese",
+        "holdClipCaption": "Scegli prima un pennello, poi tocca le prese.",
+        "region": "Per delimitare una parte del pannello, tocca Zona del pannello, poi Aggiungi una zona. Trascina il centro per spostare il riquadro e un angolo per ridimensionarlo.",
+        "regionModes": "Tutte le prese tiene i blocchi interamente dentro il riquadro. Una presa qualsiasi tiene i blocchi che lo toccano.",
+        "regionClipAlt": "Spostare e ridimensionare la zona",
+        "regionClipCaption": "Trascina il centro per spostare il riquadro, un angolo per ridimensionarlo.",
+        "setters": "Tocca Segui sulla pagina di un tracciatore o nella schermata Tracciatori. Poi attiva Blocchi delle persone che seguo, subito sotto Tracciatori.",
+        "settersPicker": "Nella schermata Tracciatori, spunta una casella per filtrare o tocca un nome per sfogliare i suoi blocchi.",
+        "shotAlt": "La schermata Tracciatori",
+        "shotCaption": "Spunta una casella per filtrare. Tocca un nome per sfogliare.",
+        "count": "Il pulsante in basso mostra quanti blocchi corrispondono. Reimposta cancella tutti i filtri."
+      },
+      "rows": {
+        "title": "Scorri la riga di un blocco",
+        "lead": "Scorri a destra per mettere un blocco subito dopo, o a sinistra per aggiungerlo a una playlist.",
+        "p1": "Nessuno dei due scorrimenti illumina il pannello.",
+        "p2": "Il piccolo simbolo è il tuo storico: un fulmine per flash, una spunta cerchiata per chiuso, una croce cerchiata per provato, una C cerchiata per benchmark.",
+        "clipAlt": "Scorrere una riga nei due versi",
+        "clipCaption": "A destra la mette subito dopo. A sinistra apre il selettore di playlist."
+      },
+      "playlists": {
+        "title": "Playlist",
+        "lead": "Una playlist è una lista salvata di blocchi per un pannello, e la percorri scorrendo.",
+        "step1": "Apri Scopri e controlla la pillola del pannello in alto.",
+        "step2": "Tocca il più, dagli un nome, scegli un colore e tocca Crea.",
+        "step3": "Aggiungi blocchi: scorri una riga a sinistra, oppure tienila premuta e tocca Aggiungi alla playlist.",
+        "p1": "La tua playlist compare sotto Le mie playlist. Il selettore mostra solo le playlist del pannello e del layout del blocco.",
+        "play": "Per riprodurre una playlist, tocca un blocco al suo interno e scorri. Il pulsante play nell'intestazione parte dal primo blocco.",
+        "remove": "Per togliere un blocco, apri Aggiungi alla playlist su di esso e tocca la playlist spuntata. Oppure tocca la matita sulla playlist, il meno rosso e conferma.",
+        "reorder": "Trascina la maniglia per riordinare. Le liste Per te non hanno la modalità modifica: togli il cuore al blocco o registra la ripetizione.",
+        "removeClipAlt": "Togliere la spunta a una playlist",
+        "removeClipCaption": "Tocca una playlist spuntata e il blocco esce.",
+        "forYou": "Scopri crea otto liste Per te: Preferiti dalla community, Perle nascoste, Al tuo livello, Novità, Cinque stelle, Più ripetuti, Progetti e Blocchi che ti piacciono.",
+        "forYouHow": "Le prime quattro leggono il tuo pannello alla tua inclinazione e saltano le tue ripetizioni. Le ultime quattro vengono dalle tue spunte e dai tuoi cuori.",
+        "tags": "Per vedere in quali playlist si trova un blocco, attiva Mostra i tag delle playlist in Impostazioni, poi Blocchi e gradi, poi Elenco dei blocchi.",
+        "browse": "Sfoglia le playlist pubbliche sul web",
+        "discoverShotAlt": "La scheda Scopri",
+        "discoverShotCaption": "Fissate, poi Le mie playlist, poi Per te.",
+        "detailShotAlt": "La tua playlist",
+        "detailShotCaption": "Fissa, modifica, riordina o rimuovi."
+      },
+      "diagram": {
+        "description": "Dove porta uno scorrimento nel player. Apri un blocco da una lista e scorrere mostra il blocco prima o dopo in quella lista, senza accendere nulla. Illumina il pannello accende un'anteprima. Dal blocco in parete, scorrere va prima a Prossimi, poi alla lista di origine, poi a una scheda finale.",
+        "listCaption": "Tocca un blocco in una lista: gli scorrimenti percorrono quella lista. Non si accende nulla.",
+        "listName": "Risultati della ricerca",
+        "listCurrent": "{{list}} · 4 di 23",
+        "listPrevious": "Blocco 3",
+        "listNext": "Blocco 5",
+        "wallCaption": "Dal blocco in parete: prima Prossimi, poi la lista di origine.",
+        "preview": "Anteprima · non in parete",
+        "putOnBoard": "Illumina il pannello",
+        "onWall": "In parete",
+        "upNext": "Prossimi",
+        "thenFrom": "Poi da {{list}}",
+        "endCard": "Fine della lista"
+      }
+    },
+    "hub": {
+      "hero": {
+        "title": "Aiuto",
+        "subtitle": "Guide brevi per l'app, come portare qui il tuo diario Kilter o Tension e dove fare domande."
+      },
+      "guides": {
+        "title": "Guide",
+        "lead": "Scegli la guida che fa per quello che stai facendo.",
+        "start": {
+          "title": "Pannello e Bluetooth",
+          "body": "Metti un blocco in parete, guidalo e risolvi un pannello che non si connette."
+        },
+        "browse": {
+          "title": "Trova, riproduci e salva blocchi",
+          "body": "Scorri le liste, filtra per grado o presa e crea playlist."
+        },
+        "crew": {
+          "title": "Arrampica con la tua crew",
+          "body": "Avvia una session e invita la crew con un codice QR."
+        },
+        "logbook": {
+          "title": "Il tuo diario",
+          "body": "Registra e modifica le salite e allega video della beta."
+        },
+        "spray": {
+          "title": "Spraywall",
+          "body": "Fotografa la tua Spraywall e correggi le prese che trova Boardsesh."
+        },
+        "read": "Leggi la guida"
+      },
+      "bring": {
+        "title": "Porta qui il tuo diario Kilter o Tension",
+        "lead": "Collega il tuo account del pannello una volta e le tue ripetizioni arrivano qui.",
+        "link": "Vedi i passaggi"
+      },
+      "counts": {
+        "title": "Perché l'app Kilter mostra più blocchi?",
+        "lead": "Le due app hanno gli stessi blocchi e li contano in modo diverso.",
+        "boardseshCount": "18.000",
+        "boardseshLabel": "Circa questi in Boardsesh su un Kilter casalingo 8x12. Ogni blocco contato una volta.",
+        "kilterCount": "36.000",
+        "kilterLabel": "Circa questi nell'app Kilter, stesso pannello. Sembra contare un blocco una volta per ogni inclinazione a cui è stato scalato."
+      },
+      "ask": {
+        "title": "Fai una domanda",
+        "lead": "Discord è il posto più veloce per avere una risposta.",
+        "discord": "Chiedi su Discord",
+        "bugLead": "Hai trovato un bug?",
+        "github": "Hai un account GitHub? Apri una issue",
+        "devLead": "Sviluppi sull'API?",
+        "docs": "Leggi la documentazione per sviluppatori",
+        "discordTitle": "Discord",
+        "discordBody": "Marco e altri scalatori su Discord possono aiutarti. Indica il pannello, cosa hai toccato e cosa hai visto.",
+        "bugBody": "Nell'app, tocca il tuo avatar, poi Segnala un bug. Dicci cosa è successo e su quale telefono.",
+        "devBody": "Crei uno strumento per il diario? Leggi la cronologia di uno scalatore con il suo consenso. La guida per sviluppatori indica l’accesso attuale.",
+        "contact": "Chiedi informazioni sull’accesso per sviluppatori"
+      },
+      "topics": {
+        "guides": "Guide",
+        "app": "Scarica l'app",
+        "logbook": "Porta qui il tuo diario",
+        "counts": "Conteggio dei blocchi",
+        "ask": "Chiedi aiuto"
+      }
+    },
+    "log": {
+      "breadcrumb": "Il tuo diario",
+      "hero": {
+        "title": "Il tuo diario e i video della beta",
+        "subtitle": "Registra un blocco in parete, correggilo dopo e allega il tuo video della beta."
+      },
+      "log": {
+        "title": "Registralo in parete",
+        "lead": "Tocca la spunta, compila quello che vuoi e salva.",
+        "shotAlt": "Il pulsante della spunta",
+        "shotCaption": "La spunta apre il foglio di registrazione.",
+        "logbookShotAlt": "Il diario",
+        "p1": "Tocca la grande spunta nel player, o ✓ nella barra in basso. Data e Ora sono già compilate, il resto è facoltativo.",
+        "p2": "Tentativo registra un tentativo non riuscito. L'altro pulsante dice Flash al tuo primo tentativo a questa inclinazione, altrimenti Chiuso. Le spunte si salvano offline e si sincronizzano dopo."
+      },
+      "edit": {
+        "title": "Modifica o elimina una voce",
+        "lead": "Scorri a destra una riga del diario per modificarla, o a sinistra per eliminarla.",
+        "clipAlt": "Scorrere una riga del diario",
+        "clipCaption": "Uno scorrimento breve mostra la matita o il cestino.",
+        "p1": "Apri la scheda Profilo, poi Diario. Anche tenere premuta una riga offre Modifica la salita.",
+        "p2": "Puoi cambiare Stato, Inclinazione, Tentativi, Grado, Stelle e Nota. Le modifiche richiedono connessione.",
+        "p3": "Per eliminare, scorri la riga a sinistra, o tocca Elimina questa salita nel foglio di modifica. Chiede conferma e non si può annullare. Anche commenti e voti su quella salita vanno via."
+      },
+      "repeats": {
+        "title": "Una riga per blocco, giorno e inclinazione",
+        "lead": "Il tuo diario tiene una riga per blocco, per giorno, per inclinazione.",
+        "p1": "Quattro tentativi stasera sono una riga, con i tentativi sommati e il tuo risultato migliore in vista. I tentativi in specchio hanno una riga a parte.",
+        "p2": "Filtro ordina per Più recenti o Più dure e restringe per stato, grado, inclinazione, data e Solo benchmark."
+      },
+      "bring": {
+        "title": "Porta qui il tuo diario Kilter o Tension",
+        "lead": "Collega il tuo account del pannello una volta e le tue ripetizioni arrivano qui.",
+        "step1": "Tocca il tuo avatar, poi Impostazioni, poi App collegate.",
+        "step2": "In Account dei pannelli, tocca Collega sulla scheda Tension o Accedi a Kilter sulla scheda Kilter.",
+        "step3": "Per Kilter, inserisci i dati di accesso in App collegate. Per Tension, inserisci nome utente e password Tension.",
+        "p1": "Usavi la vecchia app Kilter? La scheda Kilter (Aurora) accetta un'esportazione JSON.",
+        "p2": "Dopo che colleghi l’account, Boardsesh cerca nuove ripetizioni in background. I tempi variano. Le importazioni vanno solo verso Boardsesh; nulla di ciò che registri qui torna alle loro app.",
+        "link": "Porta il tuo diario",
+        "credentials": "Per Kilter, inserisci i dati di accesso in App collegate. Boardsesh li scambia con un token di accesso cifrato e non salva la tua password Kilter. Per Tension e altri account dei pannelli Aurora, salviamo nome utente e password cifrati per recuperare nuove ripetizioni. Scollegare rimuove le credenziali salvate e ferma le importazioni future."
+      },
+      "beta": {
+        "title": "Allega un video della beta",
+        "lead": "Boardsesh collega reel di Instagram e TikTok ai blocchi.",
+        "step1": "Sul tuo reel o TikTok, tocca Condividi e scegli Boardsesh. In Instagram può stare sotto Altro.",
+        "step2": "Boardsesh apre Allega la tua beta, con i tuoi blocchi registrati sotto il post.",
+        "step3": "Tocca il blocco mostrato nel video.",
+        "callout": "Non c'è un passaggio di conferma né modo di rimuovere un video, quindi controlla prima il nome del blocco.",
+        "p1": "Il blocco deve essere nel tuo diario come ripetizione o tentativo. Funzionano solo link pubblici di Instagram e TikTok.",
+        "p2": "Per filmare una nuova beta, tieni premuto un blocco e scegli Aggiungi un video della beta. Tocca Copia didascalia, poi Apri Instagram, e pubblica con quella didascalia.",
+        "p3": "Lascia il nome del blocco tra virgolette, perché è ciò che lo collega al reel. Le didascalie MoonBoard non hanno virgolette, quindi scegli tu il blocco."
+      },
+      "findBeta": {
+        "title": "Guarda la beta degli altri",
+        "lead": "Apri un blocco e scorri fino a Video della beta.",
+        "p1": "Tocca una scheda per aprirla in Instagram o TikTok. Per elencare solo i blocchi con beta, attiva Solo con video della beta in Filtri.",
+        "filtersLink": "Altro sui filtri",
+        "p2": "La tua beta sta in fondo a Progressi nella scheda Profilo."
+      },
+      "next": {
+        "title": "Continua",
+        "climbMenu": "Registra una spunta da qualsiasi lista"
+      }
+    },
+    "crew": {
+      "breadcrumb": "Session live",
+      "hero": {
+        "title": "Arrampica con la tua crew",
+        "subtitle": "Avvia una session, condividi il link e arrampicate insieme su un pannello."
+      },
+      "start": {
+        "title": "Avvia una session",
+        "lead": "Ogni session parte dalla scheda Session.",
+        "step1": "Apri la scheda Session. Controlla il pannello in alto.",
+        "step2": "Mostra questa session in diretta fa trovare e unire la tua crew. Spento, funziona solo il tuo link d'invito.",
+        "step3": "Tocca Inizia, poi Invita climber per un codice QR, Copia il link e Condividi.",
+        "shotAlt": "Una session live",
+        "shotCaption": "Chi si è unito e cosa è acceso.",
+        "liveShotAlt": "Il carosello In arrampicata ora",
+        "liveShotCaption": "In arrampicata ora, nella scheda Home, elenca le session a cui puoi unirti."
+      },
+      "join": {
+        "title": "Unisciti a una session",
+        "lead": "Scansiona il codice di chi la organizza, o trova una session vicina.",
+        "way1": "Scansiona il codice QR di chi la organizza o apri il suo link.",
+        "way2": "Nella scheda Home, guarda sotto In arrampicata ora.",
+        "way3": "Tocca il pannello in alto nella scheda Blocchi, poi In arrampicata qui ora.",
+        "p1": "Ognuno apre una scheda Vuoi unirti alla session di Sam? Tocca Unisciti alla session."
+      },
+      "wall": {
+        "title": "Chi illumina il pannello",
+        "lead": "Un telefono ha il pannello e tutti gli altri illuminano i blocchi tramite lui.",
+        "p1": "Tocca Illumina il pannello. Il telefono che lo ha lo accende, e la sua faccia compare sul tuo pulsante del pannello.",
+        "busy": "Se un compagno ha messo un blocco mentre guardavi, Illumina il pannello chiede prima. Lascia il suo lo lascia acceso. Metti il mio lo sostituisce.",
+        "queue": "Chiunque può aggiungere, riordinare o rimuovere blocchi in coda. Solo chi ha avviato la session può chiuderla. Gli altri toccano Esci dalla session."
+      },
+      "browsing": {
+        "title": "Sfoglia senza muovere il pannello",
+        "lead": "In una crew ogni tocco è un'anteprima che vedi solo tu.",
+        "p1": "Gli scorrimenti percorrono la tua lista e non muovono mai il pannello. Il chip indietro, con la faccia di chi ha acceso il pannello, ti riporta al suo blocco.",
+        "drivingLink": "Solo il telefono che ha il pannello può guidarlo. Vedi come funziona la guida."
+      },
+      "history": {
+        "title": "Dopo la session",
+        "lead": "La scheda Session del tuo profilo elenca ogni session con i suoi blocchi e le sue ripetizioni.",
+        "p1": "Il riepilogo di fine session ha Salva su Apple Health e Condividi su Strava. App collegate in Impostazioni lo automatizza."
+      },
+      "next": {
+        "title": "Continua",
+        "playlists": "Riproduci una playlist",
+        "hub": "Tutti gli argomenti dell'aiuto"
+      }
+    },
+    "spray": {
+      "breadcrumb": "Spraywall",
+      "hero": {
+        "title": "Prepara la tua Spraywall",
+        "subtitle": "Ogni presa e ogni blocco sono tracciati su una foto della tua Spraywall, quindi lo scatto conta."
+      },
+      "watch": {
+        "title": "Guarda il tutorial",
+        "lead": "Boardsesh trova le prese nella tua foto, quindi uno scatto buono vuol dire meno da correggere.",
+        "videoAlt": "Aggiungere una Spraywall e modificarne le prese nell'app Boardsesh"
+      },
+      "photo": {
+        "title": "Scattare la foto",
+        "lead": "Cinque abitudini danno al rilevatore di prese una foto pulita.",
+        "square": "Mettiti di fronte, in linea con il centro della Spraywall. Di lato, le prese lontane si rimpiccioliscono.",
+        "portrait": "Tieni il telefono in verticale e scatta a 1x. In orizzontale le prese diventano una striscia.",
+        "tilt": "Inclina il telefono come la Spraywall, parallelo alla sua superficie.",
+        "frame": "Inquadra tutta la Spraywall. Se non ci sta, allontanati invece di usare il grandangolo.",
+        "lighting": "Usa una luce forte e uniforme così le prese risaltano.",
+        "exampleAlt": "Una Spraywall al coperto fotografata di fronte, con tutte le prese inquadrate",
+        "exampleCaption": "Tutta la Spraywall inquadrata, scattata di fronte."
+      },
+      "add": {
+        "title": "Aggiungi la Spraywall",
+        "lead": "Scatta una foto, lascia che Boardsesh cerchi le prese, poi dalle un nome.",
+        "step1": "Apri Pannelli e tocca Spraywall.",
+        "step2": "Scatta o scegli una foto. Usa Ritaglia o ruota per sistemarne i bordi.",
+        "step3": "Fissa i quattro angoli per sbloccare altri sfondi, o salta per tenere la foto.",
+        "step4": "Lascia che Boardsesh scansioni la foto, poi controlla gli anelli delle prese.",
+        "step5": "Scorri per scegliere uno sfondo e come si illuminano le prese. Senza angoli fissati, Foto è l'unico sfondo.",
+        "p1": "Infine, dai un nome alla Spraywall, imposta la sua inclinazione e pubblica. L'inclinazione non si cambia dopo la pubblicazione."
+      },
+      "fix": {
+        "title": "Correggi le prese prima di pubblicare",
+        "lead": "Boardsesh mostra le prese trovate come anelli. Controllali prima che qualcuno arrampichi.",
+        "select": "Seleziona: tocca una presa per spostarla, ridimensionarla o spegnerla.",
+        "add": "Aggiungi: segna una presa mancata con Disegna o Angoli.",
+        "trace": "Contorna: ridisegna il contorno della presa selezionata in un solo giro.",
+        "refine": "Rifinisci: passa il pennello lungo il contorno per allargarlo o stringerlo.",
+        "join": "Unisci: seleziona una presa, poi tocca un'altra per fondere i contorni.",
+        "imageAlt": "L'editor della Spraywall con una presa selezionata e i cinque strumenti",
+        "imageCaption": "Seleziona un anello per vedere i suoi controlli.",
+        "maybe": "Gli anelli tratteggiati sono incerti. Toccane uno, poi tocca Mantieni.",
+        "toggle": "Tocca un anello per selezionarlo e tocca di nuovo per spegnerlo. Puoi riaccenderlo o eliminarlo.",
+        "longPress": "Tieni premuto un anello per spostarlo, o la Spraywall vuota per mettere una nuova presa.",
+        "gestures": "Sposta con due dita e pizzica per ingrandire. Annulla e Ripeti ripercorrono le tue modifiche.",
+        "missedTitle": "Una presa senza anello?",
+        "videoAlt": "Aggiungere prese mancate, correggere i contorni e pubblicare le modifiche alle prese",
+        "missed1": "Pizzica per ingrandire sulla presa mancata.",
+        "missed2": "Scegli Aggiungi, poi Disegna. Disegna un contorno chiuso attorno alla presa, o tocca per un cerchio.",
+        "missed3": "Ripeti per le altre prese mancate. Annulla se sbagli.",
+        "corners": "Per i bordi dritti, scegli Aggiungi, poi Angoli. Tocca almeno tre punti attorno alla presa, poi tocca Fine.",
+        "drawAlt": "Lo strumento Aggiungi in modalità Disegna con una presa contornata",
+        "drawCaption": "Aggiungi, Disegna: contorna una presa mancata.",
+        "cornersAlt": "Lo strumento Aggiungi in modalità Angoli con punti attorno a una presa",
+        "cornersCaption": "Aggiungi, Angoli: tre o più punti, poi Fine."
+      },
+      "edit": {
+        "title": "Modifica le prese più tardi",
+        "lead": "Puoi aggiungere o correggere prese quando vuoi. Aggiungere prese non cambia i blocchi esistenti.",
+        "p1": "Mentre tracci un blocco, tocca Aggiungi prese sotto la Spraywall. Aggiungi le prese mancanti, poi tocca Pubblica e torna. Nome, descrizione e prese selezionate del blocco restano al loro posto. Puoi anche aprire Modifica le prese dal nome della Spraywall in cima alla scheda Blocchi.",
+        "p2": "Se le tue modifiche tolgono una presa usata da blocchi pubblicati, Boardsesh ti chiede conferma. Tieni le prese annulla. Rimuovi comunque pubblica.",
+        "p3": "Quei blocchi restano, con un avviso di presa mancante, e restano anche le salite registrate. Spostare, ridimensionare, rimodellare o unire una presa fa lo stesso.",
+        "p4": "Tocca Remix su un blocco interessato per tracciarne una copia aggiornata. Non ripara l'originale.",
+        "p5": "Se le prese sono cambiate su tutta la Spraywall, tocca Reimposta questa Spraywall nello stesso foglio e ricomincia da una nuova foto. Pubblicare archivia la vecchia Spraywall con i suoi blocchi.",
+        "p6": "Le modifiche alle prese non ancora pubblicate vengono salvate su questo dispositivo. Puoi uscire, bloccare lo schermo o riavviare l’app e continuare più tardi. Pubblica le prese rende le modifiche disponibili sulla Spraywall."
+      },
+      "pencil": {
+        "title": "Apple Pencil su iPad",
+        "lead": "Nell'editor a tutta larghezza su iPad, Apple Pencil disegna e attiva le prese.",
+        "p1": "Disegna attorno a una presa non segnata per aggiungerne il contorno, o tocca un punto non segnato per un cerchio. Tocca una presa segnata per accenderla o spegnerla.",
+        "p2": "Pencil si attiva quando tocca o si avvicina all'editor per la prima volta, a meno che tu non abbia scelto un'impostazione. Con Solo Pencil attivo, le dita continuano a selezionare, spostare e scorrere."
+      },
+      "next": {
+        "title": "Continua",
+        "logbook": "Registra le tue ripetizioni",
+        "sessions": "Arrampicala con la tua crew"
+      },
+      "visibility": {
+        "title": "Chi vede la tua Spraywall",
+        "body": "Scegli la visibilità privata, solo con link o pubblica quando pubblichi. Aiuta a riconoscere le prese è attivo per le nuove Spraywall; puoi disattivarlo. Usiamo queste foto solo per migliorare il riconoscimento delle prese e non condividiamo mai la raccolta di addestramento. Modifica entrambe le opzioni nel menu di modifica della Spraywall."
+      },
+      "installHelper": "Le Spraywall si configurano nell’app. È gratis.",
+      "tools": {
+        "tool": "Strumento",
+        "action": "Cosa fa"
+      }
+    }
+  },
+  "docs": {
+    "headerTitle": "Riferimento dell’API pubblica dei blocchi",
+    "headerSubtitle": "Leggi i dati dei blocchi senza un account Boardsesh. Le app collegate al diario di uno scalatore usano un’API per sviluppatori separata.",
+    "tabs": {
+      "overview": "Panoramica",
+      "rest": "Riferimento REST pubblico",
+      "graphql": "Schema GraphQL interno"
+    },
+    "public": {
+      "title": "API pubblica di lettura · Disponibile",
+      "body": "Usa /api/v1/ per consultare blocchi, gradi, configurazioni dei pannelli e slug pubblici. Queste rotte di lettura non usano cookie di accesso, non registrano utenti e non modificano profili."
+    },
+    "partners": {
+      "title": "App collegate",
+      "body": "Usa OAuth, il consenso dello scalatore e gli ambiti approvati per il suo diario personale. La registrazione può essere su invito; la guida indica l’accesso attuale. Questa pagina non presenta allenamenti o webhook come disponibili per tutti.",
+      "link": "Leggi la guida per sviluppatori",
+      "contact": "Chiedi informazioni sull’accesso per sviluppatori"
+    },
+    "internal": {
+      "title": "Protocollo interno · Riferimento per chi contribuisce",
+      "body": "GraphQL e i protocolli di sessione servono alle app Boardsesh. Sono interfacce interne, non un’API supportata per il backend di un’altra app. I fork eseguono il proprio servizio. Consulta il riferimento e le regole del servizio ospitato.",
+      "link": "Leggi il riferimento del protocollo interno"
+    },
+    "policyLink": "Leggi le regole del servizio ospitato",
+    "loading": "Caricamento del riferimento…"
+  },
+  "privacy": {
+    "title": "Informativa sulla privacy",
+    "lastUpdated": "Ultimo aggiornamento: 18 novembre 2026",
+    "intro1": "Boardsesh è un'app open source per controllare via Bluetooth i pannelli di allenamento in arrampicata (Kilter, Tension, MoonBoard). Questa informativa spiega quali dati raccogliamo, perché e cosa ne facciamo.",
+    "intro2ProductAnalytics": "In breve: raccogliamo solo ciò che serve a far funzionare l'app. Non vendiamo i tuoi dati, in Boardsesh non ci sono pubblicità e non condividiamo dati con data broker. Pubblicizziamo Boardsesh su Reddit e Instagram e sul nostro sito l'analisi include la misurazione di quegli annunci con Meta e Reddit, come spiegato più sotto.",
+    "collect": {
+      "title": "Cosa raccogliamo",
+      "accountLabel": "Informazioni sull'account.",
+      "accountBody": "Quando crei un account, salviamo il tuo indirizzo email e il tuo nome utente. L’email serve per l’autenticazione. Il tuo nome utente è mostrato sul profilo ed è visibile agli altri utenti nelle sessioni e nelle funzioni social.",
+      "activityLabel": "Attività di arrampicata.",
+      "activityBody": "Quando registri una ripetizione o un tentativo, salviamo i dettagli del blocco, il grado, la data e le eventuali note che aggiungi. Questo alimenta il tuo diario e il monitoraggio dei progressi.",
+      "locationLabel": "Posizione.",
+      "locationBody": "Se concedi il permesso di posizione, usiamo la tua posizione approssimativa per aiutarti a trovare sessioni vicine. Non tracciamo la tua posizione in background e non conserviamo uno storico delle posizioni.",
+      "productAnalyticsLabel": "Analisi di prodotto.",
+      "productAnalyticsBody": "Usiamo PostHog per l'uso delle funzioni, le visualizzazioni di pagina, le prestazioni e, facoltativamente, la registrazione delle sessioni nell'app. Nell'UE, nel SEE, nel Regno Unito, in Svizzera, a Gibilterra, Jersey, Guernsey, nell'Isola di Man, in Cina, Corea del Sud, Andorra, Monaco, San Marino, Città del Vaticano, nelle Isole Fær Øer e in Québec, e ogni volta che non è possibile capire dove ti trovi, chiediamo prima e PostHog funziona solo dopo che hai consentito l'analisi. Altrove l'analisi è attiva per impostazione predefinita, in base al nostro legittimo interesse a migliorare Boardsesh, e puoi disattivarla in qualsiasi momento in Impostazioni o in Scelte sulla privacy; se il tuo browser invia un segnale Global Privacy Control, lo trattiamo come un no. Lo decidiamo in base al paese e, in Canada, alla provincia che Cloudflare riporta per la tua connessione, e non li conserviamo. L'analisi con accesso effettuato può essere collegata al tuo account Boardsesh. L'attribuzione delle installazioni richiede ovunque il tuo Consenti esplicito; l'impostazione predefinita non la attiva. Con il tuo Consenti, l'attribuzione delle installazioni su Android può includere il referrer di installazione del Play Store e le informazioni sulla campagna, e su iOS usiamo Apple AdServices tramite il nostro backend per misurare quali campagne Apple Ads portano a registrazioni e attività di arrampicata. Condividiamo con PostHog identificatori di campagna validati e lo stato del download, mai il token di attribuzione. Non usiamo questi dati per mostrarti pubblicità.",
+      "adMeasurementLabel": "Misurazione degli annunci sul nostro sito.",
+      "adMeasurementBody": "Pubblicizziamo Boardsesh su Reddit e Instagram. Quando l'analisi è attiva sul nostro sito, carichiamo il pixel di Meta e il pixel di Reddit perché Meta e Reddit ci dicano quali annunci portano visite e tocchi sugli store. Ricevono le pagine che visiti su boardsesh.com, i tuoi tocchi sui nostri pulsanti degli store (quale store e dove si trovava il pulsante) e ciò che i loro pixel leggono dal tuo browser: il tuo indirizzo IP, dati del browser e i loro cookie. Non inviamo mai la tua email, il tuo account o altri dati di contatto. Nelle regioni in cui chiediamo prima, serve un «Consenti» dato dopo che il nostro banner ha iniziato a nominare Meta e Reddit. Altrove segue l'impostazione predefinita dell'analisi e si ferma se dici di no in Scelte sulla privacy o se il tuo browser invia il segnale Global Privacy Control. Non funziona mai nell'app, sugli schermi kiosk, nei widget incorporati o nelle pagine di accesso.",
+      "serviceStatsLabel": "Statistiche di servizio di prima parte.",
+      "serviceStatsBody": "Registriamo il giorno attivo e la piattaforma di un account con accesso effettuato nel nostro database, indipendentemente dal consenso all'analisi, in base al legittimo interesse a capire come viene usato il servizio. Queste righe sono conservate per 13 mesi. A PostHog vengono inviati solo conteggi aggregati giornalieri, settimanali e mensili. I visitatori senza accesso non sono inclusi in questi conteggi di utenti attivi basati sull'account."
+    },
+    "bluetooth": {
+      "title": "Bluetooth",
+      "body": "Boardsesh usa il Bluetooth Low Energy (BLE) per connettersi al controller LED del tuo pannello di arrampicata. La connessione Bluetooth serve esclusivamente a inviare al pannello i comandi di illuminazione delle prese. Nessun dato personale viene trasmesso via Bluetooth. L'app non legge dati dal pannello oltre alla semplice identificazione del dispositivo durante l'accoppiamento."
+    },
+    "location": {
+      "title": "Dati sulla posizione",
+      "body1": "L’accesso alla posizione è facoltativo. Se lo concedi, serve a rendere la tua sessione visibile agli scalatori vicini. La posizione viene condivisa con il server solo durante una sessione attiva. Non conserviamo uno storico, non creiamo un profilo di posizione e non condividiamo questi dati fuori dalla funzione di ricerca delle sessioni.",
+      "body2": "Puoi revocare il permesso di posizione in qualsiasi momento dalle impostazioni del dispositivo. L'app funziona benissimo anche senza."
+    },
+    "sprayPhotos": {
+      "title": "Foto delle Spraywall",
+      "body1": "Quando aggiungi una Spraywall, conserviamo la sua foto e le prese che segni. Chi può vedere la foto dipende dall'impostazione di visibilità della Spraywall: privata, solo con link o pubblica. I membri di una palestra possono vedere anche le Spraywall collegate a quella palestra.",
+      "body2": "Ogni Spraywall ha un interruttore “Aiuta ad addestrare il riconoscimento delle prese”. Finché è attivo, usiamo la foto della Spraywall e le prese che segni per addestrare il rilevatore di prese, la parte dell'app che individua le prese nella foto di una nuova Spraywall. Prima un admin di Boardsesh le controlla per assicurarsi che vadano bene per imparare. Vale a ogni livello di visibilità, comprese le Spraywall private. La copia che usiamo per l'addestramento è conservata in uno spazio privato e non viene mai condivisa né pubblicata fuori da Boardsesh.",
+      "body3": "L'interruttore è attivo quando aggiungi una Spraywall, e puoi cambiarlo subito o in qualsiasi momento successivo in Modifica pannello. Le Spraywall aggiunte prima che l'interruttore esistesse, o con una versione dell'app che non lo mostra, partono con l'interruttore spento. Addestriamo su una Spraywall con l'interruttore attivo in base al legittimo interesse a migliorare il riconoscimento delle prese; spegnerlo è il modo per opporti, e ha effetto come descritto sotto.",
+      "body4": "Spegnerlo, eliminare la Spraywall o eliminare il tuo account tolgono la Spraywall dal nostro insieme di addestramento archiviato entro 24 ore. Una copia già scaricata per un ciclo di addestramento può essere usata per altri 7 giorni al massimo, e viene eliminata la prossima volta che recuperiamo l'insieme. I modelli già addestrati conservano ciò che hanno imparato, ma non contengono nessuna copia della tua foto.",
+      "body5": "Se una Spraywall viene segnalata, un admin di Boardsesh può vedere la sua foto per esaminare la segnalazione, qualunque cosa dica l'interruttore. Quando elimini una Spraywall, eliminiamo la sua foto dopo 30 giorni. Quando elimini il tuo account, le foto delle tue Spraywall vengono eliminate con esso; una copia di addestramento esce secondo le tempistiche sopra. Reimpostare una Spraywall conserva la vecchia, foto inclusa, come Spraywall archiviata finché non elimini anche quella. Spegnere l'interruttore su una delle due Spraywall vale per entrambe."
+    },
+    "connectedApps": {
+      "title": "Le app che colleghi",
+      "intro": "Puoi collegare un'altra app al tuo account Boardsesh, per esempio un'app per pianificare gli allenamenti. Prima di condividere qualsiasi cosa, Boardsesh ti mostra l'app, chi la sviluppa, un link alla sua informativa sulla privacy e cosa chiede di vedere. Non viene condiviso nulla finché non scegli Consenti.",
+      "whatItGets": "In base a ciò che consenti, l'app può vedere il tuo nome visualizzato e la foto profilo, e ogni salita del tuo diario, comprese quelle che tieni su «Solo io». Ogni salita è accompagnata dal blocco a cui si riferisce: nome, grado, pannello e layout. Questo vale anche per un blocco tracciato da qualcun altro che è ancora una bozza o non in elenco, perché la salita fa parte del tuo diario. Sulla Spraywall di un'altra persona che non è pubblica, l'app riceve la tua salita, ma non il nome del blocco né quello della Spraywall.",
+      "afterSharing": "Una volta che l'app ha i tuoi dati, quello che ne fa è regolato dalla sua informativa sulla privacy.",
+      "disconnect": "Puoi scollegare un'app in qualsiasi momento dalle impostazioni di Boardsesh. Qualsiasi modifica della password, compreso reimpostarla o impostarne una per la prima volta, scollega tutte le app. Da quel momento l'app non può leggere nulla di nuovo. Scollegarla, o eliminare il tuo account Boardsesh, non cancella ciò che l'app ha già copiato: chiedi all'app di cancellarlo."
+    },
+    "thirdParty": {
+      "title": "Servizi di terze parti",
+      "posthogLabel": "PostHog.",
+      "posthogBody": "PostHog elabora negli Stati Uniti l'analisi di prodotto facoltativa e la registrazione delle sessioni dell'app. Inviamo anche eventi operativi minimi senza identificatori di account per la stabilità del servizio, i display kiosk e lo stato degli aggiornamenti, oltre ai conteggi aggregati di utenti attivi. Vedi ",
+      "posthogLink": "l'informativa sulla privacy di PostHog",
+      "adPixelsLabel": "Meta e Reddit.",
+      "adPixelsBody": "Meta Platforms e Reddit ricevono dati di misurazione degli annunci dal nostro sito finché l'analisi è attiva (vedi Cosa raccogliamo). Li usano anche secondo le proprie informative sulla privacy, il che può includere un trattamento negli Stati Uniti. Vedi ",
+      "metaLink": "l'informativa sulla privacy di Meta",
+      "adPixelsJoin": " e ",
+      "redditLink": "l'informativa sulla privacy di Reddit",
+      "adPixelsBodyEnd": ".",
+      "hostingLabel": "Railway e Cloudflare.",
+      "hostingLink": "l'informativa sulla privacy di Railway",
+      "cloudflareLink": "l'informativa sulla privacy di Cloudflare",
+      "sentryLabel": "Sentry.",
+      "sentryLink": "l'informativa sulla privacy di Sentry",
+      "expoLabel": "Expo EAS Observe.",
+      "expoLink": "la documentazione di Expo Observe",
+      "hostingBody": "Usiamo Railway per l'hosting dell'applicazione e del database, e Cloudflare per la distribuzione dei contenuti, l'hosting dell'app per browser e l'archiviazione dei media. Questi fornitori elaborano le richieste necessarie a fornire Boardsesh. Vedi ",
+      "sentryBody": "Usiamo Sentry per il monitoraggio degli errori in base al legittimo interesse a far funzionare Boardsesh. La raccolta predefinita di informazioni personali è disattivata; i report di errore sono limitati e i campi sensibili vengono rimossi. Questo servizio resta attivo anche se rifiuti l'analisi. Vedi ",
+      "expoBody": "Usiamo Expo Observe per tempi di prestazione, informazioni su dispositivo e build e diagnostica degli errori sul nostro server, in base al legittimo interesse a far funzionare Boardsesh. La diagnostica resta attiva anche se rifiuti l'analisi. L'installazione dell'SDK e gli identificatori di sessione supportano lo stato degli aggiornamenti; non assegniamo a Observe alcuna identità dell'account Boardsesh. Vedi ",
+      "stripeLabel": "Stripe.",
+      "stripeBody": "Se doni dalla nostra pagina di sostegno, Stripe gestisce il pagamento. Stripe riceve i dati della carta o del portafoglio digitale, il tuo indirizzo email, il paese di fatturazione e il nome o l'indirizzo che inserisci al pagamento. Boardsesh non vede mai il numero completo della tua carta. Vediamo la tua email, il nome che inserisci, l'importo, il paese di fatturazione (più il CAP o l'indirizzo quando richiesti al pagamento), il circuito della carta, le ultime 4 cifre e la scadenza, e un breve codice che indica la pagina da cui provieni. Usiamo queste informazioni per eseguire il pagamento che hai richiesto, inviare ricevute e rispondere alle domande, e le conserviamo perché la normativa fiscale impone di conservare la documentazione dei pagamenti. La base giuridica è l'esecuzione del pagamento che hai richiesto e il nostro obbligo legale di conservare questi dati. Un nome che inserisci può essere mostrato quando ringraziamo chi ci sostiene; lascia il campo vuoto per restare anonimo. Vedi ",
+      "stripeLink": "l'informativa sulla privacy di Stripe"
+    },
+    "sharing": {
+      "title": "Condivisione dei dati",
+      "body1ProductAnalytics": "Non vendiamo i tuoi dati, non mostriamo pubblicità in Boardsesh e non condividiamo informazioni con data broker. I fornitori descritti sopra elaborano dati per hosting, archiviazione, pagamenti, affidabilità del servizio e analisi facoltativa, che sul nostro sito include la misurazione degli annunci con Meta e Reddit. La sincronizzazione con Aurora Climbing avviene quando la attivi.",
+      "body2": "Gli altri utenti di Boardsesh possono vedere il tuo nome utente, il tuo profilo e i blocchi che hai registrato se partecipi a funzioni social come le sessioni. È visibile nell'app e fa parte di come funziona il prodotto.",
+      "body3SprayPhotos": "Non diamo a nessun altro le foto delle Spraywall né le prese che segni per addestrare modelli. L'unico modello addestrato su di esse è il nostro rilevatore di prese. Gli altri vedono la foto di una Spraywall come consente la sua impostazione di visibilità, e i membri di una palestra vedono le Spraywall collegate a quella palestra, comprese quelle private. La foto di una Spraywall pubblica è sul web aperto."
+    },
+    "retention": {
+      "title": "Conservazione dei dati",
+      "body": "Conserviamo i dati del tuo account e la tua cronologia di arrampicata finché il tuo account è attivo. Se smetti di usare Boardsesh, i tuoi dati restano finché non elimini l'account.",
+      "donations": "Se hai donato, i registri dei pagamenti restano presso il fornitore dei pagamenti e nella nostra contabilità per il periodo richiesto dalla legge fiscale. Sono separati dal tuo account Boardsesh. Per domande, scrivici."
+    },
+    "deletion": {
+      "title": "Eliminazione dell'account",
+      "intro": "Puoi eliminare il tuo account e tutti i dati associati in qualsiasi momento. Ci sono due modi:",
+      "inApp": "Nell'app:",
+      "inAppBody": " Tocca il tuo avatar, apri Impostazioni, poi Account, e tocca Elimina account. Ti verrà chiesto di confermare prima che venga rimosso qualcosa.",
+      "onWeb": "Sul web:",
+      "onWebBody": " Accedi su ",
+      "onWebLink": "app.boardsesh.com",
+      "onWebBodyEnd": " e apri Impostazioni, poi Account, dal menu del tuo avatar per trovare lo stesso pulsante Elimina account.",
+      "permanent": "L'eliminazione è immediata e permanente. Una volta confermata, rimuoviamo dai nostri server il tuo indirizzo email, il tuo nome utente, le voci del diario, i dati della coda e lo storico delle sessioni. Non si può annullare."
+    },
+    "children": {
+      "title": "Minori",
+      "body": "Boardsesh non è rivolto a minori di 13 anni. Non raccogliamo consapevolmente informazioni personali da minori di 13 anni. Se ritieni che un minore di 13 anni abbia creato un account, contattaci e lo elimineremo."
+    },
+    "changes": {
+      "title": "Modifiche a questa informativa",
+      "body": "Se modifichiamo questa informativa sulla privacy, aggiorneremo questa pagina con il nuovo testo e la data di \"ultimo aggiornamento\". Per modifiche significative, potremmo anche avvisarti nell'app."
+    },
+    "contact": {
+      "title": "Contatti",
+      "body1Start": "Domande su questa informativa o sui tuoi dati? Scrivici a ",
+      "body1Email": "support@boardsesh.com",
+      "body1End": ".",
+      "body2Start": "Boardsesh è open source. Puoi vedere esattamente quali dati raccoglie l'app e come vengono elaborati leggendo il codice sorgente su ",
+      "body2Link": "GitHub",
+      "body2End": "."
+    },
+    "choices": {
+      "title": "Cookie e scelte sulla privacy",
+      "storageBody": "L'archiviazione necessaria include i cookie di accesso e del flusso di accesso di NextAuth, la tua preferenza di lingua (boardsesh-locale), le preferenze del dispositivo e il cookie boardsesh-consent. Il cookie del consenso dura un anno ed è condiviso tra boardsesh.com e app.boardsesh.com. Fuori dalle regioni in cui chiediamo, il sito lo imposta sul valore predefinito dell'analisi alla tua prima visita. Quando l'analisi è attiva (il tuo Consenti, oppure il valore predefinito fuori dalle regioni in cui chiediamo), PostHog memorizza identificatori ed eventi (ph_* sul sito e archiviazione dell'SDK nell'app). Rifiutare o revocare cancella gli identificatori di analisi e interrompe l'analisi facoltativa, la registrazione delle sessioni e gli eventi di attribuzione delle installazioni. Restano attive la diagnostica di base dei crash e delle prestazioni di prima parte. I feature flag usano ancora un client in memoria; i flag con accesso effettuato possono usare l'ID del tuo account.",
+      "adCookiesBody": "Finché la misurazione degli annunci è attiva, il pixel di Meta imposta _fbp (e _fbc se arrivi da un annuncio Meta) e il pixel di Reddit imposta _rdt_uuid (e _rdt_cid se arrivi da un annuncio Reddit), ciascuno per un massimo di 90 giorni. Dire di no in Scelte sulla privacy ferma subito entrambi i pixel e cancella questi cookie.",
+      "changeBody": "Usa Scelte sulla privacy nel piè di pagina del sito o Analisi in Impostazioni → Privacy per cambiare la tua risposta. Salviamo la tua decisione sul dispositivo e, se hai effettuato l'accesso, sul tuo account. Dove l'analisi è attiva per impostazione predefinita, quel valore resta sul dispositivo e non viene mai salvato sul tuo account come consenso. Un rifiuto sull'account prevale sui consensi dei dispositivi; un consenso sull'account vale per i dispositivi che non hanno ancora risposto. Conserviamo lo storico delle decisioni come prova del consenso fino all'eliminazione dell'account. Gli eventi anonimi e di breve durata sullo stato degli aggiornamenti e dei kiosk restano attivi per l'affidabilità del servizio."
+    },
+    "operator": "Boardsesh è gestito da Marco de Jongh, responsabile dei dati descritti in questa informativa. Per domande sui tuoi dati scrivi a support@boardsesh.com.",
+    "boardAccounts": {
+      "title": "Account dei pannelli collegati",
+      "sync": "Dopo che colleghi l’account, Boardsesh cerca nuove ripetizioni in background. I tempi variano. Le importazioni vanno solo verso Boardsesh; nulla di ciò che registri qui torna alle loro app. Scollega l’account in Impostazioni → App collegate per fermare le importazioni future.",
+      "credentials": "Per Kilter, Boardsesh salva un token di accesso cifrato, non la tua password Kilter. Per Tension e altri account dei pannelli Aurora (Decoy, Touchstone, Grasshopper e So iLL), salviamo nome utente e password cifrati per recuperare nuove ripetizioni. Usiamo queste credenziali solo per il collegamento richiesto. Scollegare rimuove le credenziali salvate, non i blocchi già importati.",
+      "legalBasis": "Trattiamo queste credenziali per fornire il collegamento dell’account che richiedi. La base giuridica è l’esecuzione di quel servizio. Dopo lo scollegamento possiamo anche richiedere la revoca del token Kilter; la rimozione locale non dipende dalla risposta di Kilter."
+    }
+  },
+  "preview": {
+    "label": "Anteprima dell'app",
+    "ios": "iOS",
+    "android": "Android"
+  },
+  "funding": {
+    "title": "Chi paga",
+    "body": "Boardsesh è gratis. Ogni funzione, per tutti. Chi può contribuisce e paga così i server e le ore di sviluppo. Una donazione non compra nulla in più nell’app."
+  },
+  "trust": {
+    "title": "Le prime domande degli scalatori",
+    "legal": "Leggi le regole di compatibilità e la politica legale",
+    "import": "Porta il tuo diario",
+    "privacy": "Leggi l’informativa sulla privacy",
+    "questions": {
+      "operator": {
+        "question": "Chi gestisce Boardsesh?",
+        "answer": "Marco de Jongh, scalatore di pannello a Sydney, Australia, gestisce Boardsesh con i contributi di altri scalatori. Contatto: support@boardsesh.com."
+      },
+      "funding": {
+        "question": "Come può essere gratis?"
+      },
+      "compatibility": {
+        "question": "Posso usarlo con Kilter, Tension o MoonBoard?",
+        "answer": "Boardsesh è software indipendente per pannelli compatibili. Non è creato né approvato da Aurora Climbing, Kilter o Moon Climbing. La politica legale spiega la compatibilità e le regole del servizio ospitato."
+      },
+      "import": {
+        "question": "Posso portare la cronologia Kilter o Tension?",
+        "answer": "Sì. Collega l’account in Impostazioni → App collegate. Le importazioni vanno solo verso Boardsesh; nulla di ciò che registri qui torna alle loro app. La guida copre anche le vecchie esportazioni Aurora."
+      },
+      "password": {
+        "question": "Che cosa succede alla password del pannello?",
+        "answer": "Per Kilter, inserisci i dati di accesso in App collegate. Boardsesh li scambia con un token cifrato e non salva la tua password Kilter. Per Tension e altri account dei pannelli Aurora, nome utente e password sono salvati cifrati per recuperare la cronologia. Scollegare rimuove queste credenziali e ferma le importazioni future."
+      },
+      "shutdown": {
+        "question": "E se Boardsesh chiude?",
+        "answer": "Puoi già scaricare il diario, pannello per pannello, da Impostazioni → Account → Esporta dati di arrampicata. Il codice e i cataloghi notturni dei blocchi sono pubblici, quindi puoi tenere una copia fuori da Boardsesh."
+      },
+      "tracking": {
+        "question": "Boardsesh mi traccia?",
+        "answer": "Scelte sulla privacy nel sito e Analisi in Impostazioni → Privacy controllano le analisi facoltative. La diagnostica di base di errori e prestazioni mantiene il servizio. L’informativa spiega cosa riceve ciascun fornitore."
+      },
+      "sprayPrivacy": {
+        "question": "La foto della mia Spraywall può restare privata?",
+        "answer": "Scegli una Spraywall privata anziché pubblica. I membri di una palestra possono vedere le Spraywall private collegate a quella palestra. Le foto delle Spraywall pubbliche sono sul web aperto."
+      }
+    }
+  }
+}

@@ -1,5 +1,7 @@
-New in 2.5:
-- Works with Woods, front to back: add your 12x12 or 8x10, browse 5,000+ climbs with their rules, light them over Bluetooth, set and remix your own, and mirror a climb so the wall flips with it.
-- Take the wall on a board with no LEDs: your crew and the gym screen follow the climb you put up.
-- Mirror your climb from the Android notification; the app, your crew and the LEDs follow.
-- Holds draw faster. Downloaded climbs stay current after an app update.
+New in 2.8.0:
+Now in Simplified Chinese.
+- 4x4, Limit Bouldering and On the Minute. Home shows your week and projects.
+- WLED Spraywall lighting; Wi-Fi auto-off. Bluetooth install is an opt-in beta for matching controllers.
+- Simpler Android UI, slimmer navigation and updated lock-screen board controls.
+- Smoother GPU rendering on supported boards/devices.
+- Open workouts from compatible training apps and share your logbook with permission: https://www.boardsesh.com/developers/

@@ -34,13 +34,16 @@ export function BluetoothProviderWrapper({ children }: { children: ReactNode }) 
 
   return (
     <BluetoothProvider
+      angle={activeBoard?.angle}
       reachableBoardKeys={reachableBoardKeys}
       boardName={activeBoard?.boardType}
       layoutId={activeBoard?.layoutId}
       sizeId={activeBoard?.sizeId}
       setIds={activeBoard?.setIds}
       boardUuid={activeBoard?.uuid}
+      boardSerialNumber={activeBoard?.serialNumber}
       hasLeds={activeBoard?.hasLeds}
+      litByWallDevice={activeBoard?.litByWallDevice}
     >
       {activeBoard ? (
         <LiveActivityBridge

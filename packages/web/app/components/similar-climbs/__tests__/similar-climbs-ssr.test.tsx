@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vite-plus/test';
 import { renderToString } from 'react-dom/server';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { SimilarClimb } from '@boardsesh/shared-schema';
-import type { BoardDetails } from '@/app/lib/types';
+import type { BoardImageDetails } from '@/app/lib/types';
 import SimilarClimbsList from '../similar-climbs-list';
 
 /**
@@ -44,8 +44,6 @@ vi.mock('@/app/components/i18n/locale-link', () => ({
 }));
 
 vi.mock('@/app/components/board-renderer/board-image-layers', () => ({ default: () => null }));
-vi.mock('@/app/components/board-renderer/board-canvas-renderer', () => ({ default: () => null }));
-vi.mock('@/app/lib/board-render-worker/worker-manager', () => ({ useCanvasRendererReady: () => false }));
 vi.mock('@/app/hooks/use-grade-format', () => ({
   useGradeFormat: () => ({ formatGrade: (grade?: string) => grade, getGradeColor: () => undefined }),
 }));
@@ -71,7 +69,7 @@ function makeSimilarClimb(index: number): SimilarClimb {
   } as unknown as SimilarClimb;
 }
 
-function makeBoardDetails(): BoardDetails {
+function makeBoardDetails(): BoardImageDetails {
   return {
     board_name: 'kilter',
     layout_id: 1,
@@ -81,11 +79,11 @@ function makeBoardDetails(): BoardDetails {
     size_name: '12 x 12',
     size_description: 'Commercial',
     set_names: ['Bolt Ons', 'Screw Ons'],
-    images_to_holds: {},
-    holdsData: {},
+    backgroundImagePaths: [],
+
     boardHeight: 100,
     boardWidth: 100,
-  } as unknown as BoardDetails;
+  } as unknown as BoardImageDetails;
 }
 
 const seededClimbs = Array.from({ length: 6 }, (_, index) => makeSimilarClimb(index));
@@ -134,6 +132,26 @@ describe('SimilarClimbsList server render', () => {
     expect(html.match(/href="\/b\/gym-wall\//g)).toHaveLength(seededClimbs.length);
   });
 
+  it('draws and links a Woods 8x10-only climb on the 8x10, not the 12x12 default', () => {
+    const woods12x12 = { ...makeBoardDetails(), board_name: 'woods', layout_id: 1, size_id: 2 } as BoardImageDetails;
+    const eightByTenOnly = { ...makeSimilarClimb(0), compatibleSizeIds: [1] } as SimilarClimb;
+    const html = renderToString(
+      <QueryClientProvider client={makeQueryClient()}>
+        <SimilarClimbsList
+          boardType="woods"
+          layoutId={1}
+          viewerBoardDetails={woods12x12}
+          climbUuid="ORIGIN-CLIMB"
+          angle={40}
+          initialClimbs={[eightByTenOnly]}
+        />
+      </QueryClientProvider>,
+    );
+    const href = html.match(/href="(\/woods\/[^"]*)"/)?.[1] ?? '';
+    expect(href).toContain('8x10');
+    expect(href).not.toContain('12x12');
+  });
+
   it('emits one crawlable anchor per seeded climb, not a spinner', () => {
     const html = renderSeededList();
 
@@ -149,6 +167,19 @@ describe('SimilarClimbsList server render', () => {
     // Non-vacuous: the LAST seeded card is there too, so this isn't one anchor
     // plus a client-side tail.
     expect(html).toContain('/view/similar-boulder-5-SIMILAR5');
+  });
+
+  it('renders each climb as a row: name with its grade in words, setter and sends, and a grade tile', () => {
+    const page = new DOMParser().parseFromString(`<!doctype html><body>${renderSeededList()}</body>`, 'text/html');
+    const rows = [...page.querySelectorAll('ul > li')];
+    const firstRow = rows[0].querySelector('a');
+
+    expect(rows).toHaveLength(seededClimbs.length);
+    expect(firstRow?.textContent).toContain('Similar Boulder 0');
+    // The tile is aria-hidden; the hidden ", V4" is how a screen reader hears the grade.
+    expect(firstRow?.textContent).toContain('frontDoor.hero.gradeForSearch');
+    expect(firstRow?.querySelector('[aria-hidden="true"]')?.textContent).toBe('V4');
+    expect(firstRow?.textContent).toContain('setter · ★3.0 · sends');
   });
 
   it('renders no <button> cards — the queue-activation path is gone', () => {

@@ -70,5 +70,142 @@
   "crossBoardLogbook": {
     "headline": "All your boards.\nOne logbook.",
     "description": "Keep your sends and sessions together across boards."
+  },
+  "storeBoards": {
+    "headline": "One app for all your boards",
+    "description": "One logbook for every board."
+  },
+  "storeCrew": {
+    "headline": "Your crew.\nOne queue.",
+    "description": "Add climbs together. Everyone can pick what’s next.",
+    "emphasis": "queue."
+  },
+  "storeSpray": {
+    "headline": "Your Spraywall,\ntoo.",
+    "description": "Set climbs on your Spraywall photo.",
+    "emphasis": "too."
+  },
+  "storeMoreBoards": {
+    "headline": "More boards.\nSame app.",
+    "description": "Also works with Touchstone and So iLL.",
+    "emphasis": "app."
+  },
+  "storeIsland": {
+    "headline": "Next climb.\nFrom Dynamic Island.",
+    "description": "Change the climb without opening the app.",
+    "emphasis": "Dynamic Island."
+  },
+  "cppOtherBoards": {
+    "headline": "One app for all your boards",
+    "description": "All your logbooks in one place"
+  },
+  "cppSearch": {
+    "headline": "Find your\nnext project",
+    "description": "Filter by grade and hide your sends."
+  },
+  "cppLogbook": {
+    "headline": "Track every\nsend and try",
+    "description": "Grouped by day, with your top grade."
+  },
+  "cppQueue": {
+    "headline": "Friends pick\nwhat’s next",
+    "description": "Everyone queues from their own phone."
+  },
+  "cppWorkout": {
+    "headline": "Train with\na plan",
+    "description": "Climbs picked for your target grade."
+  },
+  "cppStatus": {
+    "headline": "Know what’s\nlit right now",
+    "description": "Shows any climb lit through Boardsesh."
+  },
+  "cppIsland": {
+    "headline": "Next climb\nfrom any app",
+    "description": "Right in the Dynamic Island."
+  },
+  "cppKiosk": {
+    "headline": "Leave it by\nthe board",
+    "description": "Shows the lit climb and stays awake."
+  },
+  "cppKilterGrade": {
+    "headline": "Kilter climbs\nat your grade",
+    "description": "Pick a grade and angle, then light it."
+  },
+  "cppKilterLayouts": {
+    "headline": "Supports Kilter",
+    "description": "We can also import your existing logbook for you"
+  },
+  "cppKilterLogbookImport": {
+    "headline": "Bring your\nKilter logbook",
+    "description": "Your past sends and attempts come too."
+  },
+  "cppMoonboardGrade": {
+    "headline": "MoonBoard climbs\nat your grade",
+    "description": "Pick a grade, then light your climb."
+  },
+  "cppMoonboardLogbook": {
+    "headline": "Track every\nsend and try",
+    "description": "Bring your log in from a CSV export."
+  },
+  "cppMoonboardSets": {
+    "headline": "Supports MoonBoard",
+    "description": "We can also import your existing logbook for you from a CSV export."
+  },
+  "cppSprayHolds": {
+    "headline": "Holds suggested\nfrom a photo",
+    "description": "You fix the rest, right on the photo."
+  },
+  "cppSprayOtherBoards": {
+    "headline": "Gym boards,\nsame logbook",
+    "description": "Kilter, Tension and MoonBoard sends too.",
+    "emphasis": "same logbook"
+  },
+  "cppSprayProjects": {
+    "headline": "Back to your\nprojects",
+    "description": "Climbs you’ve worked but not sent."
+  },
+  "cppSpraySetting": {
+    "headline": "Set on your\nspray wall",
+    "description": "Tap holds on a photo of your wall.",
+    "emphasis": "spray wall"
+  },
+  "cppSprayWalls": {
+    "headline": "Supports spray walls",
+    "description": "Set climbs on photos of your own walls."
+  },
+  "cppSprayWorkout": {
+    "headline": "Train with\na plan",
+    "description": "Once your wall has graded climbs."
+  },
+  "cppTensionLayouts": {
+    "headline": "Supports Tension",
+    "description": "We can also import your existing logbook for you"
+  },
+  "cppTensionLogbookImport": {
+    "headline": "Bring your\nTension logbook",
+    "description": "Your past sends land in one logbook."
+  },
+  "cppTensionMirrorBoard": {
+    "headline": "Climb on\nTension 2 Mirror",
+    "description": "Works with your mirrored board."
+  },
+  "cppTensionQueue": {
+    "headline": "Climb Tension\nwith friends",
+    "description": "Everyone queues from their own phone.",
+    "emphasis": "friends"
+  },
+  "cppTensionSearch": {
+    "headline": "Straight to\nyour grade",
+    "description": "Then hide the ones you’ve sent."
+  },
+  "storeLiveActivity": {
+    "headline": "Next climb.\nOutside the app.",
+    "description": "Change the climb without opening the app.",
+    "emphasis": "Outside the app."
+  },
+  "cppLiveActivity": {
+    "headline": "Next climb.\nOutside the app.",
+    "description": "Change the climb without opening the app.",
+    "emphasis": "Outside the app."
   }
 }

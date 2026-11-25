@@ -21,9 +21,13 @@ vi.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ bottom: 0, top: 0, left: 0, right: 0 }),
 }));
 vi.mock('../../providers/theme-provider', () => ({ useTheme: () => ({ variant: 'material' }) }));
-vi.mock('../use-bottom-accessory', () => ({ isBottomAccessoryAvailable: () => false, useNativeTabBar: () => false }));
+vi.mock('../use-bottom-accessory', () => ({
+  useTabChrome: () => ({ nativeTabBar: false, liquidGlassTabBar: false, nativeAccessory: false }),
+}));
 vi.mock('../use-device-layout', () => ({ useDeviceLayout: () => ({ widthClass: 'compact' }) }));
 vi.mock('../use-sticky-accessory-presence', () => ({ useStickyAccessoryPresence: () => false }));
+vi.mock('../../providers/queue-provider', () => ({ useQueueSessionId: () => ({ sessionId: null }) }));
+vi.mock('../../lib/workout-run-store', () => ({ useWorkoutRunPendingStart: () => false }));
 
 import { useBottomChromeMetrics, FALLBACK_BOTTOM_CHROME_METRICS } from '../use-bottom-chrome-metrics';
 

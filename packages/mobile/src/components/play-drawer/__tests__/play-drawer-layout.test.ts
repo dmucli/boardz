@@ -3,10 +3,76 @@ import {
   CAROUSEL_LAYER_Z,
   computeContainedBoardSize,
   computeFirstScreenHeight,
-  computeLogbookScrollTarget,
+  computeDrawerFirstScreenHeight,
+  computeFirstSectionScrollTarget,
+  computeFitToHeightFirstScreenHeight,
   initialDrawerPreviewItem,
+  PLAYER_SIDE_PANEL_WIDTH,
+  resolvePlayerArrangement,
+  secondaryRowCanFold,
+  shouldFitBoardToHeight,
   shouldShowPanePlaceholder,
 } from '../play-drawer-layout';
+import { resolveActionBarLayout, type ActionBarLayoutInput } from '../action-bar-layout';
+import { DEFAULT_PLAYER_BUTTONS } from '../../../lib/player-buttons';
+
+describe('resolvePlayerArrangement', () => {
+  const ipads = [
+    { name: 'iPad mini', portrait: { width: 744, height: 1133 } },
+    { name: 'iPad 11-inch', portrait: { width: 834, height: 1210 } },
+    { name: 'iPad 13-inch', portrait: { width: 1032, height: 1376 } },
+  ];
+
+  it.each(ipads)('$name puts the board beside the panel in landscape', ({ portrait }) => {
+    const landscape = { width: portrait.height, height: portrait.width };
+    expect(resolvePlayerArrangement({ ...landscape, isTablet: true })).toBe('sideBySide');
+    // The board column keeps at least 600pt beside the 400pt panel.
+    expect(landscape.width - PLAYER_SIDE_PANEL_WIDTH).toBeGreaterThanOrEqual(600);
+  });
+
+  it.each(ipads)('$name keeps the board on top in portrait', ({ portrait }) => {
+    expect(resolvePlayerArrangement({ ...portrait, isTablet: true })).toBe('stacked');
+  });
+
+  it('keeps every phone stacked, landscape and the iPhone Duo split included', () => {
+    for (const phone of [
+      { width: 402, height: 874 },
+      { width: 874, height: 402 },
+      { width: 440, height: 956 },
+      { width: 956, height: 440 },
+      // The Duo opened flat: a wide window, still a phone.
+      { width: 1338, height: 669 },
+    ]) {
+      expect(resolvePlayerArrangement({ ...phone, isTablet: false })).toBe('stacked');
+    }
+  });
+
+  it('keeps a wide but small Stage Manager window stacked', () => {
+    expect(resolvePlayerArrangement({ width: 980, height: 700, isTablet: true })).toBe('stacked');
+    expect(resolvePlayerArrangement({ width: 1000, height: 700, isTablet: true })).toBe('sideBySide');
+  });
+
+  it('stays stacked in a square window', () => {
+    expect(resolvePlayerArrangement({ width: 1032, height: 1032, isTablet: true })).toBe('stacked');
+  });
+});
+
+describe('computeFitToHeightFirstScreenHeight', () => {
+  // The iPhone Duo's split pane: 669pt tall, with a 90pt bottom inset that clears
+  // the MiniPlayer capsule. The pane hangs that inset below the fold and pads it,
+  // so the first screen spans the pane and the first section starts below it.
+  it('spans the whole pane when the capsule band hangs below the fold', () => {
+    expect(computeFitToHeightFirstScreenHeight({ viewport: 669, bottomInset: 90, belowFoldHeight: 90 })).toBe(669);
+  });
+
+  it("hangs the landscape iPad player's favourite / share row below the fold", () => {
+    expect(computeFitToHeightFirstScreenHeight({ viewport: 1000, bottomInset: 20, belowFoldHeight: 52 })).toBe(1032);
+  });
+
+  it('never goes negative before the viewport is measured', () => {
+    expect(computeFitToHeightFirstScreenHeight({ viewport: 0, bottomInset: 90, belowFoldHeight: 0 })).toBe(0);
+  });
+});
 
 describe('computeContainedBoardSize', () => {
   it('height-bounds a tall board on a wide box (horizontal letterbox)', () => {
@@ -69,7 +135,7 @@ describe('shouldShowPanePlaceholder', () => {
   });
 });
 
-describe('computeLogbookScrollTarget', () => {
+describe('computeFirstSectionScrollTarget', () => {
   // firstScreenHeight 700, topPadding 12 → the section starts at content y 712.
   const base = {
     firstScreenHeight: 700,
@@ -83,17 +149,19 @@ describe('computeLogbookScrollTarget', () => {
   it('lands a short section bottom just above the home indicator (board stays partly visible)', () => {
     // section 200 tall: bottom-into-view = 712 + 200 - 800 + 34 + 8 = 154;
     // header-to-top = 712 - 60 - 8 = 644 → min picks the gentler 154.
-    expect(computeLogbookScrollTarget({ ...base, sectionHeight: 200 })).toBe(154);
+    expect(computeFirstSectionScrollTarget({ ...base, sectionHeight: 200 })).toBe(154);
   });
 
   it('caps a tall section so its header stops under the top inset instead of scrolling its top away', () => {
     // section 900 tall: bottom-into-view = 712 + 900 - 800 + 34 + 8 = 854;
     // header-to-top = 644 → min caps at 644 so the header stays visible.
-    expect(computeLogbookScrollTarget({ ...base, sectionHeight: 900 })).toBe(644);
+    expect(computeFirstSectionScrollTarget({ ...base, sectionHeight: 900 })).toBe(644);
   });
 
   it('never returns a negative offset when the section already fits below the fold', () => {
-    expect(computeLogbookScrollTarget({ ...base, firstScreenHeight: 100, sectionHeight: 40, viewport: 800 })).toBe(0);
+    expect(computeFirstSectionScrollTarget({ ...base, firstScreenHeight: 100, sectionHeight: 40, viewport: 800 })).toBe(
+      0,
+    );
   });
 });
 
@@ -102,14 +170,11 @@ describe('CAROUSEL_LAYER_Z', () => {
   // SIBLING of the board, so burying it under the board means a drag that starts on
   // the board never reaches the pan — that's #4191, where zooming a climb in the
   // player left you unable to move around it (the create board, which has no zIndex
-  // at all, kept working). Raising boardWrapper for the card-stack paint order is
-  // what buried it, so keep the whole order asserted here.
+  // at all, kept working). Raising the board for the card-stack paint order is what
+  // buried it, so keep the whole order asserted here. The boards themselves share one
+  // level: see swipe-board-carousel-layout.test.tsx for why it must not vary.
   it('puts the zoom-pan overlay above the board so a drag on the board can pan it', () => {
     expect(CAROUSEL_LAYER_Z.zoomPan).toBeGreaterThan(CAROUSEL_LAYER_Z.board);
-  });
-
-  it('keeps the board above the incoming peek card', () => {
-    expect(CAROUSEL_LAYER_Z.board).toBeGreaterThan(CAROUSEL_LAYER_Z.peek);
   });
 
   it('keeps the reset-zoom button tappable above the pan overlay', () => {
@@ -138,5 +203,126 @@ describe('initialDrawerPreviewItem', () => {
     expect(initialDrawerPreviewItem({})).toBeNull();
     expect(initialDrawerPreviewItem(null)).toBeNull();
     expect(initialDrawerPreviewItem(undefined)).toBeNull();
+  });
+});
+
+describe('computeDrawerFirstScreenHeight', () => {
+  it.each([
+    { viewport: 844, bottomInset: 34 },
+    { viewport: 568, bottomInset: 0 },
+    { viewport: 320, bottomInset: 24 },
+  ])('fits board-only content exactly in $viewport points including safe area', ({ viewport, bottomInset }) => {
+    const height = computeDrawerFirstScreenHeight({
+      viewport,
+      bottomInset,
+      firstSectionHeaderHeight: null,
+      sectionTopPadding: 12,
+      sectionMargin: 8,
+    });
+    expect(height + bottomInset).toBe(viewport);
+  });
+  it('reserves the measured first enabled header instead of a hidden Logbook', () => {
+    expect(
+      computeDrawerFirstScreenHeight({
+        viewport: 844,
+        bottomInset: 34,
+        firstSectionHeaderHeight: 70,
+        sectionTopPadding: 12,
+        sectionMargin: 8,
+      }),
+    ).toBe(720);
+  });
+  it.each([
+    { viewport: 844, bottomInset: 0, firstSectionHeaderHeight: 52 },
+    { viewport: 915, bottomInset: 24, firstSectionHeaderHeight: 52 },
+    { viewport: 844, bottomInset: 34, firstSectionHeaderHeight: 70 },
+    { viewport: 568, bottomInset: 48, firstSectionHeaderHeight: 96 },
+  ])(
+    'keeps the first section header clear of the $bottomInset-point bottom inset',
+    ({ viewport, bottomInset, firstSectionHeaderHeight }) => {
+      const sectionTopPadding = 12;
+      const sectionMargin = 8;
+      const firstScreenHeight = computeDrawerFirstScreenHeight({
+        viewport,
+        bottomInset,
+        firstSectionHeaderHeight,
+        sectionTopPadding,
+        sectionMargin,
+      });
+      const headerBottom = firstScreenHeight + sectionTopPadding + firstSectionHeaderHeight;
+
+      expect(viewport - headerBottom).toBe(bottomInset + sectionMargin);
+    },
+  );
+});
+
+describe('shouldFitBoardToHeight (#6956)', () => {
+  // A member on a board with lights, on the landscape iPad player's route,
+  // where the MiniPlayer stands in for the first row.
+  const member: ActionBarLayoutInput = {
+    supportsMirroring: false,
+    isAnonymous: false,
+    commitButton: null,
+    workoutOutcome: false,
+    showLightbulb: true,
+    hasShare: true,
+    angleAvailable: true,
+    buttons: DEFAULT_PLAYER_BUTTONS,
+    previousNext: true,
+    miniPlayerMirrors: true,
+  };
+  const landscapeIpad = { fitBoardToHeight: true, isPane: false, hasVisibleSections: true, controlsAbove: false };
+  const fits = (input: Partial<ActionBarLayoutInput>) =>
+    shouldFitBoardToHeight({
+      ...landscapeIpad,
+      secondaryRow: resolveActionBarLayout({ ...member, ...input }).secondaryRow,
+    });
+
+  // Marco: never fold the wall button. With the bulb chosen a preview's Put on
+  // the wall is the second row, and the only way to commit the preview.
+  it("keeps the bulb's Put on the wall on screen", () => {
+    expect(fits({ boardControl: 'lightbulb', commitButton: 'putOnWall' })).toBe(false);
+  });
+
+  it('keeps the wall button on screen where no MiniPlayer stands in for the first row', () => {
+    expect(fits({ miniPlayerMirrors: false })).toBe(false);
+    expect(fits({ miniPlayerMirrors: false, commitButton: 'putOnWall' })).toBe(false);
+  });
+
+  it('keeps the busy-wall question and Fell / Sent on screen', () => {
+    expect(fits({ boardControl: 'lightbulb', commitButton: 'confirm' })).toBe(false);
+    expect(fits({ workoutOutcome: true })).toBe(false);
+  });
+
+  it("folds a plain row: the signed-out reader's Angle / Share, the bulb row's buttons", () => {
+    expect(fits({ isAnonymous: true })).toBe(true);
+    expect(fits({ miniPlayerMirrors: false, boardControl: 'lightbulb', supportsMirroring: true })).toBe(true);
+  });
+
+  it('does not fit with an empty second row, no sections, controls above, or a host that did not ask', () => {
+    const plainRow = resolveActionBarLayout({ ...member, isAnonymous: true }).secondaryRow;
+    expect(fits({})).toBe(false);
+    expect(shouldFitBoardToHeight({ ...landscapeIpad, hasVisibleSections: false, secondaryRow: plainRow })).toBe(false);
+    expect(shouldFitBoardToHeight({ ...landscapeIpad, controlsAbove: true, secondaryRow: plainRow })).toBe(false);
+    expect(shouldFitBoardToHeight({ ...landscapeIpad, fitBoardToHeight: false, secondaryRow: plainRow })).toBe(false);
+  });
+
+  it("always fits the Duo's pane, whose inset clears the MiniPlayer", () => {
+    const pane = { ...landscapeIpad, isPane: true };
+    expect(shouldFitBoardToHeight({ ...pane, secondaryRow: ['wallControl'] })).toBe(true);
+    expect(shouldFitBoardToHeight({ ...pane, hasVisibleSections: false, secondaryRow: [] })).toBe(true);
+    expect(shouldFitBoardToHeight({ ...pane, fitBoardToHeight: false, secondaryRow: [] })).toBe(false);
+  });
+});
+
+describe('secondaryRowCanFold', () => {
+  it('folds only a row of plain items', () => {
+    expect(secondaryRowCanFold(['angle', 'spacer', 'share'])).toBe(true);
+    expect(secondaryRowCanFold(['favorite', 'spacer', 'queue'])).toBe(true);
+    expect(secondaryRowCanFold(['wallControl'])).toBe(false);
+    expect(secondaryRowCanFold(['favorite', 'wallControl', 'queue'])).toBe(false);
+    expect(secondaryRowCanFold([])).toBe(false);
+    expect(secondaryRowCanFold('confirm')).toBe(false);
+    expect(secondaryRowCanFold('workoutOutcome')).toBe(false);
   });
 });

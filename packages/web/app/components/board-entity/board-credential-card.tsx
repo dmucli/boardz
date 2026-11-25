@@ -4,8 +4,7 @@
  * Lifted out of `components/settings/aurora-credentials-section.tsx` by W-21
  * (#4440). `/settings` no longer renders the Aurora credentials section — board
  * accounts live in the app now — but `board-import-prompt.tsx` still renders the
- * credential card and the import progress list, and that prompt is on two
- * indexable surfaces the epic keeps: `/aurora-migration` and `/profile/{id}`.
+ * credential card and the import progress list on profile pages.
  * Co-located with its only consumer so the lift removes a cross-directory edge
  * instead of relocating one.
  *
@@ -37,7 +36,7 @@ import WarningAmberOutlined from '@mui/icons-material/WarningAmberOutlined';
 import WarningOutlined from '@mui/icons-material/WarningOutlined';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR } from '@boardsesh/shared-schema/sync-error-codes';
+import { circuitPlaylistSyncWarningKind } from '@boardsesh/shared-schema/sync-error-codes';
 import { boardTypeLabel } from '@boardsesh/board-constants';
 import { ConfirmPopover } from '@/app/components/ui/confirm-popover';
 import type { AuroraCredentialStatus } from '@/app/lib/aurora-credentials/client';
@@ -83,7 +82,7 @@ function buildKilterDataRequestMailto(
   const subject = t('aurora.kilterEmail.subject');
   const body = t('aurora.kilterEmail.body', { name, email });
 
-  return `mailto:peter@auroraclimbing.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  return `mailto:support@auroraclimbing.com?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
 }
 
 // The surviving web prompt renders `kilterAurora` for the legacy Aurora-built
@@ -119,6 +118,9 @@ export function BoardCredentialCard({
   userEmail,
 }: BoardCredentialCardProps) {
   const { t } = useTranslation('settings');
+  const syncWarningKind = credential?.syncError
+    ? circuitPlaylistSyncWarningKind(credential.syncError, credential.syncErrorReason)
+    : null;
   const boardName = boardTypeLabel(boardType);
   const totalUnsynced = unsyncedCounts.ascents + unsyncedCounts.climbs;
   const isExpired = credential?.syncStatus === 'expired';
@@ -233,18 +235,14 @@ export function BoardCredentialCard({
           </div>
           {credential.syncError && (
             <div className={styles.errorRow}>
-              {/* Known codes get localised copy and a warning tone — the account is
-                  syncing, only its playlist mirror is paused (#3526). Anything else
-                  is legacy free text from an older path: render it verbatim rather
-                  than swallow it. */}
-              <Typography
-                variant="body2"
-                component="span"
-                color={credential.syncError === DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR ? 'warning.main' : 'error'}
-              >
-                {credential.syncError === DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR
-                  ? t('aurora.status.duplicateAccountCircuits')
-                  : credential.syncError}
+              <Typography variant="body2" component="span" color={syncWarningKind ? 'warning.main' : 'error'}>
+                {syncWarningKind === 'foreign'
+                  ? t('aurora.status.foreignAccountCircuits')
+                  : syncWarningKind === 'ambiguous'
+                    ? t('aurora.status.ambiguousAccountCircuits')
+                    : syncWarningKind === 'legacy'
+                      ? t('aurora.status.duplicateAccountCircuits')
+                      : credential.syncError}
               </Typography>
             </div>
           )}
@@ -321,7 +319,7 @@ export function ImportProgressSteps({ progress }: { progress: ImportProgress | n
               {isPending && <RadioButtonUncheckedOutlined color="disabled" fontSize="small" />}
               <Typography
                 variant="body2"
-                color={isPending ? 'text.disabled' : 'text.primary'}
+                color={isPending ? 'text.secondary' : 'text.primary'}
                 fontWeight={isActive ? 600 : 400}
               >
                 {stepLabels[step]}

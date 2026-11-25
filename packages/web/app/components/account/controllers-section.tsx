@@ -33,6 +33,13 @@ import { getBoardSelectorOptions } from '@/app/lib/board-constants';
 import type { BoardName } from '@/app/lib/types';
 import styles from './controllers-section.module.css';
 import { useSnackbar } from '@/app/components/providers/snackbar-provider';
+import {
+  guardedActionFetch,
+  isReloadRequired,
+  isSessionSuperseded,
+  isWriteRefused,
+} from '@/app/lib/auth/session-guard';
+import ReloadPageAlert, { TryAgainAlert } from './reload-page-alert';
 
 // Get board config data (synchronous - from generated data)
 const boardSelectorOptions = getBoardSelectorOptions();
@@ -45,7 +52,10 @@ type ControllerCardProps = {
 
 function ControllerCard({ controller, onRemove, isRemoving }: ControllerCardProps) {
   const { t } = useTranslation('settings');
-  const boardName = controller.boardName.charAt(0).toUpperCase() + controller.boardName.slice(1);
+  const isSpray = controller.boardName === 'spray';
+  const boardName = isSpray
+    ? t('controllers.register.boardSpray')
+    : controller.boardName.charAt(0).toUpperCase() + controller.boardName.slice(1);
 
   const getStatusTag = () => {
     if (controller.isOnline) {
@@ -91,14 +101,16 @@ function ControllerCard({ controller, onRemove, isRemoving }: ControllerCardProp
             </Typography>
             <Chip label={boardName} size="small" color="primary" />
           </div>
-          <div className={styles.infoRow}>
-            <Typography variant="body2" component="span" color="text.secondary">
-              {t('controllers.card.layout')}
-            </Typography>
-            <Typography variant="body2" component="span">
-              {t('controllers.card.layoutValue', { layoutId: controller.layoutId, sizeId: controller.sizeId })}
-            </Typography>
-          </div>
+          {isSpray ? null : (
+            <div className={styles.infoRow}>
+              <Typography variant="body2" component="span" color="text.secondary">
+                {t('controllers.card.layout')}
+              </Typography>
+              <Typography variant="body2" component="span">
+                {t('controllers.card.layoutValue', { layoutId: controller.layoutId, sizeId: controller.sizeId })}
+              </Typography>
+            </div>
+          )}
           <div className={styles.infoRow}>
             <Typography variant="body2" component="span" color="text.secondary">
               {t('controllers.card.lastSeen')}
@@ -232,16 +244,22 @@ export default function ControllersSection() {
   // Success state for showing API key
   const [successApiKey, setSuccessApiKey] = useState<string | null>(null);
   const [successControllerName, setSuccessControllerName] = useState('');
+  // An action that still failed after the session re-check: say so instead of nothing.
+  const [reloadRequired, setReloadRequired] = useState(false);
+  // The same, for the open register form, which keeps what was typed.
+  const [registerNotice, setRegisterNotice] = useState<'tryAgain' | 'reload' | null>(null);
 
   const fetchControllers = async () => {
     try {
-      const response = await fetch('/api/internal/controllers');
+      const response = await guardedActionFetch('/api/internal/controllers');
       if (response.ok) {
         const data = await response.json();
         setControllers(data.controllers);
       }
     } catch (error) {
-      console.error('Failed to fetch controllers:', error);
+      if (isReloadRequired(error)) setReloadRequired(true);
+      // The page is moving to another account and reloads.
+      else if (!isSessionSuperseded(error)) console.error('Failed to fetch controllers:', error);
     } finally {
       setLoading(false);
     }
@@ -257,6 +275,7 @@ export default function ControllersSection() {
     setSelectedLayout(undefined);
     setSelectedSize(undefined);
     setSelectedSets([]);
+    setRegisterNotice(null);
     setIsModalOpen(true);
   };
 
@@ -300,13 +319,14 @@ export default function ControllersSection() {
   const handleRegister = async (values: {
     name?: string;
     boardName: BoardName;
-    layoutId: number;
-    sizeId: number;
-    setIds: number[];
+    layoutId?: number;
+    sizeId?: number;
+    setIds?: number[];
   }) => {
     setIsSaving(true);
+    setRegisterNotice(null);
     try {
-      const response = await fetch('/api/internal/controllers', {
+      const response = await guardedActionFetch('/api/internal/controllers', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -314,7 +334,7 @@ export default function ControllersSection() {
           boardName: values.boardName,
           layoutId: values.layoutId,
           sizeId: values.sizeId,
-          setIds: Array.isArray(values.setIds) ? values.setIds.join(',') : values.setIds,
+          setIds: values.setIds?.join(','),
         }),
       });
 
@@ -335,6 +355,19 @@ export default function ControllersSection() {
 
       await fetchControllers();
     } catch (error) {
+      // Refused once, nothing registered: the form stays open with what was typed.
+      if (isWriteRefused(error)) {
+        setRegisterNotice('tryAgain');
+        return;
+      }
+      // The page is moving to another account and reloads.
+      if (isSessionSuperseded(error)) return;
+      if (isReloadRequired(error)) {
+        setRegisterNotice('reload');
+        // A lost answer may have registered a controller whose key is gone, so show the list.
+        await fetchControllers();
+        return;
+      }
       showMessage(error instanceof Error ? error.message : t('controllers.register.registerError'), 'error');
     } finally {
       setIsSaving(false);
@@ -344,7 +377,7 @@ export default function ControllersSection() {
   const handleRemove = async (controllerId: string) => {
     setRemovingId(controllerId);
     try {
-      const response = await fetch('/api/internal/controllers', {
+      const response = await guardedActionFetch('/api/internal/controllers', {
         method: 'DELETE',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ controllerId }),
@@ -358,6 +391,11 @@ export default function ControllersSection() {
       showMessage(t('controllers.deleteSuccess'), 'success');
       await fetchControllers();
     } catch (error) {
+      if (isSessionSuperseded(error)) return;
+      if (isReloadRequired(error)) {
+        setReloadRequired(true);
+        return;
+      }
       showMessage(error instanceof Error ? error.message : t('controllers.deleteError'), 'error');
     } finally {
       setRemovingId(null);
@@ -385,6 +423,7 @@ export default function ControllersSection() {
     <>
       <Card>
         <CardContent>
+          {reloadRequired && <ReloadPageAlert />}
           <Typography variant="h5">{t('controllers.title')}</Typography>
           <Typography variant="body2" component="span" color="text.secondary" className={styles.sectionDescription}>
             {t('controllers.subtitle')}
@@ -424,6 +463,8 @@ export default function ControllersSection() {
       <Dialog open={isModalOpen} onClose={handleModalCancel} maxWidth="sm" fullWidth>
         <DialogTitle>{t('controllers.register.title')}</DialogTitle>
         <DialogContent>
+          {registerNotice === 'tryAgain' && <TryAgainAlert />}
+          {registerNotice === 'reload' && <ReloadPageAlert />}
           <Typography variant="body2" component="span" color="text.secondary" className={styles.modalDescription}>
             {t('controllers.register.description')}
           </Typography>
@@ -431,6 +472,10 @@ export default function ControllersSection() {
             component="form"
             onSubmit={(e: React.FormEvent) => {
               e.preventDefault();
+              if (selectedBoard === 'spray') {
+                void handleRegister({ name: formValues.name, boardName: selectedBoard });
+                return;
+              }
               if (!selectedBoard || !selectedLayout || !selectedSize || selectedSets.length === 0) return;
               void handleRegister({
                 name: formValues.name,
@@ -464,54 +509,60 @@ export default function ControllersSection() {
                 <MenuItem value="kilter">Kilter</MenuItem>
                 {/* i18n-ignore-next-line -- brand name, not translated */}
                 <MenuItem value="tension">Tension</MenuItem>
+                <MenuItem value="spray">{t('controllers.register.boardSpray')}</MenuItem>
               </MuiSelect>
             </FormControl>
 
-            <FormControl fullWidth required disabled={!selectedBoard}>
-              <InputLabel>{t('controllers.register.layoutLabel')}</InputLabel>
-              <MuiSelect
-                value={selectedLayout ?? ''}
-                label={t('controllers.register.layoutLabel')}
-                onChange={(e) => handleLayoutChange(e.target.value)}
-              >
-                {layouts.map(({ id, name }) => (
-                  <MenuItem key={id} value={id}>
-                    {name}
-                  </MenuItem>
-                ))}
-              </MuiSelect>
-            </FormControl>
+            {/* A Spraywall key has no layout to set up: the device picks its wall when it subscribes. */}
+            {selectedBoard === 'spray' ? null : (
+              <>
+                <FormControl fullWidth required disabled={!selectedBoard}>
+                  <InputLabel>{t('controllers.register.layoutLabel')}</InputLabel>
+                  <MuiSelect
+                    value={selectedLayout ?? ''}
+                    label={t('controllers.register.layoutLabel')}
+                    onChange={(e) => handleLayoutChange(e.target.value)}
+                  >
+                    {layouts.map(({ id, name }) => (
+                      <MenuItem key={id} value={id}>
+                        {name}
+                      </MenuItem>
+                    ))}
+                  </MuiSelect>
+                </FormControl>
 
-            <FormControl fullWidth required disabled={!selectedLayout}>
-              <InputLabel>{t('controllers.register.sizeLabel')}</InputLabel>
-              <MuiSelect
-                value={selectedSize ?? ''}
-                label={t('controllers.register.sizeLabel')}
-                onChange={(e) => handleSizeChange(e.target.value)}
-              >
-                {sizes.map(({ id, name, description }) => (
-                  <MenuItem key={id} value={id}>
-                    {name} {description}
-                  </MenuItem>
-                ))}
-              </MuiSelect>
-            </FormControl>
+                <FormControl fullWidth required disabled={!selectedLayout}>
+                  <InputLabel>{t('controllers.register.sizeLabel')}</InputLabel>
+                  <MuiSelect
+                    value={selectedSize ?? ''}
+                    label={t('controllers.register.sizeLabel')}
+                    onChange={(e) => handleSizeChange(e.target.value)}
+                  >
+                    {sizes.map(({ id, name, description }) => (
+                      <MenuItem key={id} value={id}>
+                        {name} {description}
+                      </MenuItem>
+                    ))}
+                  </MuiSelect>
+                </FormControl>
 
-            <FormControl fullWidth required disabled={!selectedSize}>
-              <InputLabel>{t('controllers.register.setsLabel')}</InputLabel>
-              <MuiSelect
-                multiple
-                value={selectedSets}
-                label={t('controllers.register.setsLabel')}
-                onChange={(e) => handleSetsChange(e.target.value as number[])}
-              >
-                {sets.map(({ id, name }) => (
-                  <MenuItem key={id} value={id}>
-                    {name}
-                  </MenuItem>
-                ))}
-              </MuiSelect>
-            </FormControl>
+                <FormControl fullWidth required disabled={!selectedSize}>
+                  <InputLabel>{t('controllers.register.setsLabel')}</InputLabel>
+                  <MuiSelect
+                    multiple
+                    value={selectedSets}
+                    label={t('controllers.register.setsLabel')}
+                    onChange={(e) => handleSetsChange(e.target.value as number[])}
+                  >
+                    {sets.map(({ id, name }) => (
+                      <MenuItem key={id} value={id}>
+                        {name}
+                      </MenuItem>
+                    ))}
+                  </MuiSelect>
+                </FormControl>
+              </>
+            )}
 
             <Button
               variant="contained"

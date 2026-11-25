@@ -9,7 +9,10 @@ import {
   resolveWebTracesSampleRate,
   WEB_IGNORED_SPANS,
   WEB_TRACE_PROPAGATION_TARGETS,
+  redactSensitiveSpanUrls,
 } from './app/lib/observability/sentry-tracing';
+import { redactShareCapabilitiesFromEvent } from './app/lib/observability/redact-share-capabilities';
+import { redactOriginProof } from './app/lib/observability/redact-origin-proof';
 
 Sentry.init({
   dsn: 'https://f55e6626faf787ae5291ad75b010ea14@o4510644927660032.ingest.us.sentry.io/4510644930150400',
@@ -25,12 +28,20 @@ Sentry.init({
 
   environment: resolveSentryEnvironment(),
 
+  // The last steps before an event leaves: the Cloudflare origin proof header
+  // never reaches Sentry (#7766). See redact-origin-proof.ts.
+  beforeSend: redactOriginProof,
+  beforeSendTransaction: redactOriginProof,
+
   // Enable logs to be sent to Sentry
   enableLogs: true,
 
-  // Enable sending user PII (Personally Identifiable Information)
+  // Off (#2644). Sentry runs under legitimate interest whatever a visitor's
+  // analytics consent, so it collects no IP address, IP headers or request
+  // bodies. Request headers that aren't IP headers still reach the event, which
+  // is what keeps the Railway request-id tag working (see tagRailwayRequestId).
   // https://docs.sentry.io/platforms/javascript/guides/nextjs/configuration/options/#sendDefaultPii
-  sendDefaultPii: true,
+  sendDefaultPii: false,
 
   // Same shape as sentry.server.config.ts so a route can't be sampled at one
   // rate in middleware and another in its handler. The edge runtime only runs
@@ -45,9 +56,13 @@ Sentry.init({
 
   // Node defaults this to *every* host. Must be set. See the constant.
   tracePropagationTargets: WEB_TRACE_PROPAGATION_TARGETS,
+  beforeSendSpan: (span) => redactOriginProof(redactSensitiveSpanUrls(span)),
 
   // Same list as the server config. The edge SDK (@sentry/vercel-edge) ships
   // no Graphql integration, so there is nothing to filter out of
   // `integrations` here; the list covers the tunnel forward and any Next span.
   ignoreSpans: WEB_IGNORED_SPANS,
 });
+
+// A share link's capability (a home board's ?invite=, an unlisted wall's ?wall=) never leaves in an event.
+Sentry.addEventProcessor(redactShareCapabilitiesFromEvent);

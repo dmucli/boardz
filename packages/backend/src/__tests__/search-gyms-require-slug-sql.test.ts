@@ -104,9 +104,9 @@ const TEXT_INPUT = { limit: 24, offset: 0 };
 // Parameters are placeholders ($1…), so these strings capture query shape —
 // exactly what a no-regression guard needs.
 const BASELINE_PROXIMITY_COUNT_SQL =
-  'SELECT count(*)::int as count FROM gyms WHERE is_public = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint($1, $2)::geography, $3)';
+  'SELECT count(*)::int as count FROM gyms WHERE is_public = true AND is_listed = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint($1, $2)::geography, $3)';
 const BASELINE_PROXIMITY_ROWS_SQL =
-  'SELECT *, ST_Distance(location, ST_MakePoint($1, $2)::geography) as distance_meters FROM gyms WHERE is_public = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint($3, $4)::geography, $5) ORDER BY distance_meters ASC, gyms.id ASC LIMIT $6 OFFSET $7';
+  'SELECT *, ST_Distance(location, ST_MakePoint($1, $2)::geography) as distance_meters FROM gyms WHERE is_public = true AND is_listed = true AND deleted_at IS NULL AND location IS NOT NULL AND ST_DWithin(location, ST_MakePoint($3, $4)::geography, $5) ORDER BY distance_meters ASC, gyms.id ASC LIMIT $6 OFFSET $7';
 
 // The empty string is a SQL literal, not a bound parameter — it's a constant of
 // the predicate, never caller input.
@@ -284,7 +284,7 @@ describe('searchGyms requireSlug — rendered SQL, text path', () => {
   it('leaves the text where-clause byte-identical when requireSlug is omitted', async () => {
     const { wheres } = await textSearchWith(TEXT_INPUT);
 
-    const BASELINE_TEXT_WHERE = `("gyms"."is_public" = $1 and "gyms"."deleted_at" is null)`;
+    const BASELINE_TEXT_WHERE = `("gyms"."is_public" = $1 and "gyms"."is_listed" = $2 and "gyms"."deleted_at" is null)`;
     expect(wheres).toEqual([BASELINE_TEXT_WHERE, BASELINE_TEXT_WHERE]);
   });
 
@@ -292,8 +292,8 @@ describe('searchGyms requireSlug — rendered SQL, text path', () => {
     const { wheres } = await textSearchWith({ ...TEXT_INPUT, requireSlug: false });
 
     expect(wheres).toEqual([
-      `("gyms"."is_public" = $1 and "gyms"."deleted_at" is null)`,
-      `("gyms"."is_public" = $1 and "gyms"."deleted_at" is null)`,
+      `("gyms"."is_public" = $1 and "gyms"."is_listed" = $2 and "gyms"."deleted_at" is null)`,
+      `("gyms"."is_public" = $1 and "gyms"."is_listed" = $2 and "gyms"."deleted_at" is null)`,
     ]);
   });
 
@@ -394,5 +394,39 @@ describe('searchGyms angles — rendered SQL', () => {
       expect(where).toContain('ub.angle IN (');
       expect(where).toContain('ub.board_type IN (');
     }
+  });
+});
+
+describe('searchGyms requireLocation — both query paths', () => {
+  beforeEach(() => {
+    mockDb.execute.mockClear();
+    mockDb.select.mockClear();
+    textSelectCaptures.length = 0;
+  });
+
+  it('filters the same valid coordinates in text count and rows', async () => {
+    const { wheres } = await textSearchWith({ ...TEXT_INPUT, requireLocation: true });
+    expect(wheres).toHaveLength(2);
+    expect(wheres[0]).toBe(wheres[1]);
+    expect(wheres[0]).toContain('"gyms"."latitude" BETWEEN -90 AND 90');
+    expect(wheres[0]).toContain('"gyms"."longitude" BETWEEN -180 AND 180');
+  });
+
+  it('filters the same valid coordinates in proximity count and rows', async () => {
+    const statements = await searchWith({ ...PROXIMITY_INPUT, requireLocation: true });
+    expect(statements).toHaveLength(2);
+    for (const statement of statements) {
+      expect(statement).toContain('gyms.latitude BETWEEN -90 AND 90');
+      expect(statement).toContain('gyms.longitude BETWEEN -180 AND 180');
+    }
+  });
+
+  it('preserves existing text and proximity callers when false', async () => {
+    const baseline = await textSearchWith(TEXT_INPUT);
+    textSelectCaptures.length = 0;
+    expect(await textSearchWith({ ...TEXT_INPUT, requireLocation: false })).toEqual(baseline);
+    const [countSql, rowsSql] = await searchWith({ ...PROXIMITY_INPUT, requireLocation: false });
+    expect(countSql).toBe(BASELINE_PROXIMITY_COUNT_SQL);
+    expect(rowsSql).toBe(BASELINE_PROXIMITY_ROWS_SQL);
   });
 });

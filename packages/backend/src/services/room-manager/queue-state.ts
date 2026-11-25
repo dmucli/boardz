@@ -3,8 +3,8 @@ import { db } from '../../db/client';
 import { sessionQueues } from '../../db/schema';
 import { eq, and, sql } from 'drizzle-orm';
 import { CAS_ANY_VERSION, type RedisSessionStore, type QueueStateCasResult } from '../redis-session-store';
-import { computeQueueStateHash, computeQueueStateHashOrdered } from '@boardsesh/queue';
-import { VersionConflictError, type QueueState, type RoomManagerDeps } from './types';
+import { computeQueueStateHash, computeQueueStateHashOrdered, historyLine } from '@boardsesh/queue';
+import { VersionConflictError, type QueueState, type QueueWriteResult, type RoomManagerDeps } from './types';
 import { writeQueueStateToPostgres } from './write-scheduler';
 
 /**
@@ -28,6 +28,13 @@ async function casWithDormancyFloor(
     expectedVersion: number | typeof CAS_ANY_VERSION;
     stateHash: string;
     stateHashOrdered: string;
+    /**
+     * The History / Up next line (F3, docs/product/current-climb-outside-queue.md,
+     * section 2). Required, so the compiler finds every writer: a write that
+     * left it to a default would erase the line while nothing is current.
+     */
+    historyCount: number;
+    currentChangedBy?: string | null;
   },
 ): Promise<QueueStateCasResult> {
   const firstAttempt = await redisStore.casUpdateQueueState({
@@ -69,6 +76,77 @@ async function casWithDormancyFloor(
 const normalizeHash = (hash: string | undefined | null): string | null => (hash ? hash : null);
 
 /**
+ * The line a write stores: the current climb's index when it is in `queue`,
+ * else the caller's value clamped to `[0, queue.length]` (invariant 5 of the
+ * F3 design: every write stores a computed, in-range line).
+ */
+function storedLine(queue: ClimbQueueItem[], currentClimbQueueItem: ClimbQueueItem | null, historyCount: number) {
+  return historyLine({ queue, currentClimbQueueItem, historyCount });
+}
+
+/**
+ * The Postgres-only single-instance fallback has no Redis hash to keep the F3
+ * fields in, and `board_session_queues` has no column for them (no migration,
+ * section 2). They live here, keyed by session, and count only while the row's
+ * version still matches. After a restart the line comes back as derived.
+ * Bounded: past {@link MAX_POSTGRES_ONLY_LINES} sessions the least recently
+ * written is forgotten, and its line comes back as derived too.
+ */
+const MAX_POSTGRES_ONLY_LINES = 5000;
+const postgresOnlyLines = new Map<
+  string,
+  {
+    version: number;
+    historyCount: number;
+    currentUuid: string | null;
+    currentChangedAt: string;
+    currentChangedBy: string | null;
+  }
+>();
+
+function rememberPostgresOnlyLine(
+  sessionId: string,
+  version: number,
+  historyCount: number,
+  currentClimbQueueItem: ClimbQueueItem | null,
+  currentChangedBy: string | null = null,
+  previousCurrentUuid: string | null = null,
+): { currentChangedAt: string; currentChangedBy: string | null } {
+  const currentUuid = currentClimbQueueItem?.uuid ?? null;
+  const previous = postgresOnlyLines.get(sessionId);
+  const previousFresh = previous?.version === version - 1;
+  const currentChangedAt =
+    previousFresh && previous.currentUuid === currentUuid ? previous.currentChangedAt : new Date().toISOString();
+  const storedActor =
+    currentUuid === null
+      ? null
+      : previousFresh && previous.currentUuid === currentUuid
+        ? previous.currentChangedBy
+        : previousCurrentUuid !== currentUuid
+          ? currentChangedBy
+          : null;
+  // Delete first so the Map's insertion order is least recently written first.
+  postgresOnlyLines.delete(sessionId);
+  postgresOnlyLines.set(sessionId, {
+    version,
+    historyCount,
+    currentUuid,
+    currentChangedAt,
+    currentChangedBy: storedActor,
+  });
+  if (postgresOnlyLines.size > MAX_POSTGRES_ONLY_LINES) {
+    const oldestSessionId = postgresOnlyLines.keys().next().value;
+    if (oldestSessionId !== undefined) postgresOnlyLines.delete(oldestSessionId);
+  }
+  return { currentChangedAt, currentChangedBy: storedActor };
+}
+
+/** Test seam: forget the Postgres-only lines. */
+export function resetPostgresOnlyQueueLines(): void {
+  postgresOnlyLines.clear();
+}
+
+/**
  * Update queue state with Redis as source of truth and debounced Postgres writes.
  *
  * `expectedVersion` is a real optimistic-locking guard: when it is supplied and
@@ -85,15 +163,11 @@ export async function updateQueueState(
   queue: ClimbQueueItem[],
   currentClimbQueueItem: ClimbQueueItem | null,
   expectedVersion: number | undefined,
-): Promise<{
-  version: number;
-  sequence: number;
-  stateHash: string;
-  stateHashOrdered: string;
-  previousStateHash: string | null;
-  previousStateHashOrdered: string | null;
-}> {
+  historyCount: number,
+  currentChangedBy?: string | null,
+): Promise<QueueWriteResult & { previousStateHash: string | null; previousStateHashOrdered: string | null }> {
   const { redisStore, writeScheduler, distributedState } = deps;
+  const line = storedLine(queue, currentClimbQueueItem, historyCount);
 
   const stateHash = computeQueueStateHash(queue, currentClimbQueueItem?.uuid || null);
   // Order-sensitive companion (v2), computed from the exact same inputs so the
@@ -115,11 +189,21 @@ export async function updateQueueState(
       { queue, currentClimbQueueItem, version: newVersion, sequence: newSequence },
       writeScheduler,
     );
+    const currentChange = rememberPostgresOnlyLine(
+      sessionId,
+      newVersion,
+      line,
+      currentClimbQueueItem,
+      currentChangedBy ?? null,
+      pgState.currentClimbQueueItem?.uuid ?? null,
+    );
     return {
       version: newVersion,
       sequence: newSequence,
       stateHash,
       stateHashOrdered,
+      historyCount: line,
+      ...currentChange,
       previousStateHash: normalizeHash(pgState.stateHash),
       previousStateHashOrdered: normalizeHash(pgState.stateHashOrdered),
     };
@@ -137,6 +221,8 @@ export async function updateQueueState(
     expectedVersion: expectedVersion ?? CAS_ANY_VERSION,
     stateHash,
     stateHashOrdered,
+    historyCount: line,
+    currentChangedBy,
   });
 
   if (result.status !== 'OK') {
@@ -161,6 +247,9 @@ export async function updateQueueState(
     sequence: result.sequence,
     stateHash,
     stateHashOrdered,
+    historyCount: line,
+    currentChangedAt: new Date(result.currentChangedAt).toISOString(),
+    currentChangedBy: result.currentChangedBy,
     previousStateHash: normalizeHash(result.previousStateHash),
     previousStateHashOrdered: normalizeHash(result.previousStateHashOrdered),
   };
@@ -178,6 +267,7 @@ async function mirrorSettledStateToRedis(
   currentClimbQueueItem: ClimbQueueItem | null,
   version: number,
   sequence: number,
+  historyCount: number,
 ): Promise<void> {
   const currentClimbUuid = currentClimbQueueItem?.uuid || null;
   await redisStore.updateQueueState(
@@ -188,6 +278,7 @@ async function mirrorSettledStateToRedis(
     sequence,
     computeQueueStateHash(queue, currentClimbUuid),
     computeQueueStateHashOrdered(queue, currentClimbUuid),
+    historyCount,
   );
 }
 
@@ -201,8 +292,18 @@ export async function updateQueueStateImmediate(
   queue: ClimbQueueItem[],
   currentClimbQueueItem: ClimbQueueItem | null,
   expectedVersion: number | undefined,
+  historyCount: number,
 ): Promise<number> {
   const { redisStore } = deps;
+  const line = storedLine(queue, currentClimbQueueItem, historyCount);
+  // Mirror the settled row into Redis, or (Postgres-only) into the in-memory line store.
+  const settle = async (version: number, sequence: number) => {
+    if (redisStore) {
+      await mirrorSettledStateToRedis(redisStore, sessionId, queue, currentClimbQueueItem, version, sequence, line);
+    } else {
+      rememberPostgresOnlyLine(sessionId, version, line, currentClimbQueueItem);
+    }
+  };
 
   if (expectedVersion !== undefined) {
     if (expectedVersion === 0) {
@@ -224,18 +325,7 @@ export async function updateQueueStateImmediate(
         throw new VersionConflictError(sessionId, expectedVersion);
       }
 
-      // Also update Redis
-      if (redisStore) {
-        await mirrorSettledStateToRedis(
-          redisStore,
-          sessionId,
-          queue,
-          currentClimbQueueItem,
-          result[0].version,
-          result[0].sequence,
-        );
-      }
-
+      await settle(result[0].version, result[0].sequence);
       return result[0].version;
     }
 
@@ -256,18 +346,7 @@ export async function updateQueueStateImmediate(
       throw new VersionConflictError(sessionId, expectedVersion);
     }
 
-    // Also update Redis
-    if (redisStore) {
-      await mirrorSettledStateToRedis(
-        redisStore,
-        sessionId,
-        queue,
-        currentClimbQueueItem,
-        result[0].version,
-        result[0].sequence,
-      );
-    }
-
+    await settle(result[0].version, result[0].sequence);
     return result[0].version;
   }
 
@@ -297,11 +376,7 @@ export async function updateQueueStateImmediate(
   const newVersion = result[0]?.version ?? 1;
   const newSequence = result[0]?.sequence ?? 1;
 
-  // Also update Redis
-  if (redisStore) {
-    await mirrorSettledStateToRedis(redisStore, sessionId, queue, currentClimbQueueItem, newVersion, newSequence);
-  }
-
+  await settle(newVersion, newSequence);
   return newVersion;
 }
 
@@ -319,8 +394,9 @@ export async function updateQueueOnly(
   sessionId: string,
   queue: ClimbQueueItem[],
   expectedVersion: number | undefined,
-  knownState?: Pick<QueueState, 'currentClimbQueueItem'>,
-): Promise<{ version: number; sequence: number; stateHash: string; stateHashOrdered: string }> {
+  knownState: Pick<QueueState, 'currentClimbQueueItem'> | undefined,
+  historyCount: number,
+): Promise<QueueWriteResult> {
   const { redisStore, writeScheduler, distributedState } = deps;
 
   if (!redisStore) {
@@ -347,11 +423,22 @@ export async function updateQueueOnly(
       },
       writeScheduler,
     );
+    const line = storedLine(queue, pgState.currentClimbQueueItem, historyCount);
+    const currentChange = rememberPostgresOnlyLine(
+      sessionId,
+      newVersion,
+      line,
+      pgState.currentClimbQueueItem,
+      null,
+      pgState.currentClimbQueueItem?.uuid ?? null,
+    );
     return {
       version: newVersion,
       sequence: newSequence,
       stateHash: computeQueueStateHash(queue, currentClimbUuid),
       stateHashOrdered: computeQueueStateHashOrdered(queue, currentClimbUuid),
+      historyCount: line,
+      ...currentChange,
     };
   }
 
@@ -369,6 +456,10 @@ export async function updateQueueOnly(
 
   const stateHash = computeQueueStateHash(queue, currentClimbQueueItem?.uuid || null);
   const stateHashOrdered = computeQueueStateHashOrdered(queue, currentClimbQueueItem?.uuid || null);
+  // Without the line, every add or reorder would bump `version` past
+  // `historyCountVersion` and the reader would fall back to 0 while nothing is
+  // current: the erased line this field exists to prevent.
+  const line = storedLine(queue, currentClimbQueueItem, historyCount);
 
   const result = await casWithDormancyFloor(redisStore, sessionId, {
     queue,
@@ -376,6 +467,7 @@ export async function updateQueueOnly(
     expectedVersion: expectedVersion ?? CAS_ANY_VERSION,
     stateHash,
     stateHashOrdered,
+    historyCount: line,
   });
 
   if (result.status !== 'OK') {
@@ -392,7 +484,15 @@ export async function updateQueueOnly(
     distributedState,
   );
 
-  return { version: result.version, sequence: result.sequence, stateHash, stateHashOrdered };
+  return {
+    version: result.version,
+    sequence: result.sequence,
+    stateHash,
+    stateHashOrdered,
+    historyCount: line,
+    currentChangedAt: new Date(result.currentChangedAt).toISOString(),
+    currentChangedBy: result.currentChangedBy,
+  };
 }
 
 /**
@@ -403,11 +503,31 @@ export async function getQueueState(sessionId: string, redisStore: RedisSessionS
   if (redisStore) {
     const redisSession = await redisStore.getSession(sessionId);
     if (redisSession) {
+      // A pre-F3 instance's write (rolling deploy) bumps `version` and leaves
+      // the F3 fields behind: count them only when they were written at this
+      // version, otherwise derive the line (the current index, or 0 with
+      // nothing current, which is today's display) and fall back to
+      // `lastActivity`, which that old write just stamped (errs towards lighting).
+      const fieldsFresh =
+        redisSession.historyCountVersion !== null && redisSession.historyCountVersion === redisSession.version;
       return {
         queue: redisSession.queue,
         currentClimbQueueItem: redisSession.currentClimbQueueItem,
         version: redisSession.version,
         sequence: redisSession.sequence,
+        historyCount: historyLine({
+          queue: redisSession.queue,
+          currentClimbQueueItem: redisSession.currentClimbQueueItem,
+          historyCount: fieldsFresh ? redisSession.historyCount : null,
+        }),
+        currentChangedAt: (fieldsFresh && redisSession.currentChangedAt
+          ? redisSession.currentChangedAt
+          : redisSession.lastActivity
+        ).toISOString(),
+        currentChangedBy:
+          redisSession.currentClimbQueueItem && redisSession.currentChangedByVersion === redisSession.version
+            ? (redisSession.currentChangedBy ?? null)
+            : null,
         stateHash: redisSession.stateHash,
         // Both hashes are persisted since #3906. Sessions written before that
         // rollout have no stored v2 hash (empty string), so fall back to
@@ -429,19 +549,39 @@ export async function getQueueState(sessionId: string, redisStore: RedisSessionS
       currentClimbQueueItem: null,
       version: 0,
       sequence: 0,
+      historyCount: 0,
+      currentChangedAt: null,
+      currentChangedBy: null,
       stateHash: computeQueueStateHash([], null),
       stateHashOrdered: computeQueueStateHashOrdered([], null),
     };
   }
 
-  const stateHash = computeQueueStateHash(result[0].queue, result[0].currentClimbQueueItem?.uuid || null);
-  const stateHashOrdered = computeQueueStateHashOrdered(result[0].queue, result[0].currentClimbQueueItem?.uuid || null);
+  const row = result[0];
+  const stateHash = computeQueueStateHash(row.queue, row.currentClimbQueueItem?.uuid || null);
+  const stateHashOrdered = computeQueueStateHashOrdered(row.queue, row.currentClimbQueueItem?.uuid || null);
+  // An atomic partner Start stores its initial line for version 1. Ordinary
+  // queues and all later versions derive it from the current index, or 0
+  // with nothing current, and take the hold's
+  // clock from `updated_at`, which every queue flush writes. That is
+  // approximate in one direction only: an Up next add also bumps `updated_at`,
+  // so a restored room can read as changed recently and light, never the
+  // other way. The Postgres-only single instance keeps both in memory.
+  const remembered = postgresOnlyLines.get(sessionId);
+  const rememberedFresh = !redisStore && remembered !== undefined && remembered.version === row.version;
 
   return {
-    queue: result[0].queue,
-    currentClimbQueueItem: result[0].currentClimbQueueItem,
-    version: result[0].version,
-    sequence: result[0].sequence,
+    queue: row.queue,
+    currentClimbQueueItem: row.currentClimbQueueItem,
+    version: row.version,
+    sequence: row.sequence,
+    historyCount: historyLine({
+      queue: row.queue,
+      currentClimbQueueItem: row.currentClimbQueueItem,
+      historyCount: rememberedFresh ? remembered.historyCount : row.version === 1 ? row.initialHistoryCount : null,
+    }),
+    currentChangedAt: rememberedFresh ? remembered.currentChangedAt : row.updatedAt.toISOString(),
+    currentChangedBy: rememberedFresh && row.currentClimbQueueItem ? remembered.currentChangedBy : null,
     stateHash,
     stateHashOrdered,
   };

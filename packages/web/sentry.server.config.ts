@@ -12,6 +12,8 @@ import {
   WEB_TRACE_PROPAGATION_TARGETS,
 } from './app/lib/observability/sentry-tracing';
 import { tagPostgresError } from '@/app/lib/observability/postgres-error-tags';
+import { redactShareCapabilitiesFromEvent } from '@/app/lib/observability/redact-share-capabilities';
+import { redactOriginProof } from '@/app/lib/observability/redact-origin-proof';
 
 Sentry.init({
   dsn: 'https://f55e6626faf787ae5291ad75b010ea14@o4510644927660032.ingest.us.sentry.io/4510644930150400',
@@ -30,14 +32,20 @@ Sentry.init({
   // Normalise postgres.js and Drizzle wrapper shapes into queryable SQLSTATE
   // tags. Production alerts can now match `postgres.error_code:53300` without
   // relying on an English message or one particular error wrapper.
-  beforeSend: tagPostgresError,
+  // The last steps before an event leaves, so nothing added later can carry the
+  // Cloudflare origin proof header (#7766). See redact-origin-proof.ts.
+  beforeSend: (event, hint) => redactOriginProof(tagPostgresError(event, hint)),
+  beforeSendTransaction: redactOriginProof,
 
   // Enable logs to be sent to Sentry
   enableLogs: true,
 
-  // Enable sending user PII (Personally Identifiable Information)
+  // Off (#2644). Sentry runs under legitimate interest whatever a visitor's
+  // analytics consent, so it collects no IP address, IP headers or request
+  // bodies. Request headers that aren't IP headers still reach the event, which
+  // is what keeps the Railway request-id tag working (see tagRailwayRequestId).
   // https://docs.sentry.io/platforms/javascript/guides/nextjs/configuration/options/#sendDefaultPii
-  sendDefaultPii: true,
+  sendDefaultPii: false,
 
   // A sampler rather than a flat `tracesSampleRate`, because two routes have to
   // come out at zero — see resolveWebTracesSampleRate for which and why. The
@@ -54,7 +62,7 @@ Sentry.init({
 
   // Keeps OAuth codes and session ids out of span URLs now that spans record
   // one per sampled request. See the constant's doc comment.
-  beforeSendSpan: redactSensitiveSpanUrls,
+  beforeSendSpan: (span) => redactOriginProof(redactSensitiveSpanUrls(span)),
 
   // Next.js render internals, the tunnel's forward to Sentry, and GraphQL
   // document parsing. ~2.2M stored spans in 14 days. See the constant.
@@ -65,10 +73,19 @@ Sentry.init({
   // and produced ~246k `graphql.parse` spans in 7 days with no diagnostic value;
   // the outbound `http.client` span to the backend already carries the latency.
   // 'Graphql' is INTEGRATION_NAME in @sentry/node's tracing/graphql integration.
-  integrations: (defaultIntegrations) => defaultIntegrations.filter((integration) => integration.name !== 'Graphql'),
+  // RequestData is replaced because `sendDefaultPii` does not cover request bodies,
+  // and sign-in, registration and password routes carry credentials there.
+  integrations: (defaultIntegrations) => [
+    ...defaultIntegrations.filter(
+      (integration) => integration.name !== 'Graphql' && integration.name !== 'RequestData',
+    ),
+    Sentry.requestDataIntegration({ include: { data: false } }),
+  ],
 });
 
 // Join key between a Railway HTTP log line and a Sentry event. Registered as a
 // processor rather than folded into `beforeSend` so it applies to transactions
 // as well as errors.
 Sentry.addEventProcessor(tagRailwayRequestId);
+// A share link's capability (a home board's ?invite=, an unlisted wall's ?wall=) never leaves in an event.
+Sentry.addEventProcessor(redactShareCapabilitiesFromEvent);

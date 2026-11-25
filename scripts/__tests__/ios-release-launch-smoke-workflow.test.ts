@@ -1,0 +1,577 @@
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
+
+interface WorkflowStep {
+  name?: string;
+  id?: string;
+  run?: string;
+  uses?: string;
+  if?: string;
+  'timeout-minutes'?: number;
+  with?: Record<string, string | number>;
+}
+
+interface IosWorkflow {
+  on: { pull_request: { paths: string[] } };
+  env: Record<string, string>;
+  jobs: Record<string, { steps: WorkflowStep[] }>;
+}
+
+const repoRoot = resolve(import.meta.dirname, '../..');
+const workflow = parse(readFileSync(join(repoRoot, '.github/workflows/ios-rn-ci.yml'), 'utf8')) as IosWorkflow;
+const nativeAction = parse(readFileSync(join(repoRoot, '.github/actions/mobile-native-gate/action.yml'), 'utf8')) as {
+  runs: { steps: WorkflowStep[] };
+};
+const steps = workflow.jobs['build-and-test'].steps;
+const temporaryDirectories: string[] = [];
+
+afterEach(() => {
+  for (const directory of temporaryDirectories.splice(0)) rmSync(directory, { recursive: true, force: true });
+});
+
+function requiredStep(name: string): WorkflowStep {
+  const step = steps.find((candidate) => candidate.name === name);
+  expect(step, `missing workflow step: ${name}`).toBeDefined();
+  return step!;
+}
+
+function runReleaseBuild(options: { omitPatchedSource?: boolean; retryStatus?: number } = {}) {
+  const directory = mkdtempSync(join(tmpdir(), 'ios-release-build-'));
+  temporaryDirectories.push(directory);
+  const attemptsPath = join(directory, 'attempts');
+  const buildLogPath = join(directory, 'build.log');
+  writeFileSync(buildLogPath, 'stale compilation evidence\n');
+  const xcodebuildPath = join(directory, 'xcodebuild');
+  writeFileSync(
+    xcodebuildPath,
+    `#!/bin/bash
+attempt=1
+if [ -f "$CI_BUILD_ATTEMPTS" ]; then
+  attempt=$(( $(cat "$CI_BUILD_ATTEMPTS") + 1 ))
+fi
+printf '%s\\n' "$attempt" > "$CI_BUILD_ATTEMPTS"
+if [ "$attempt" -eq 1 ]; then
+  if [ "$CI_BUILD_OMIT_PATCHED_SOURCE" != 1 ]; then
+    echo 'CompileC /fixture/RNSScrollViewFinder.o /fixture/RNSScrollViewFinder.mm'
+  fi
+  echo 'SwiftCompile normal arm64 /fixture/expo-modules-core/ios/Core/Exceptions/Exception.swift'
+  echo 'SwiftCompile normal arm64 /fixture/expo-image/ios/ImageView.swift'
+  echo 'SwiftCompile normal arm64 /fixture/expo-sqlite/ios/SQLiteModule.swift'
+  echo "error: Scanning for @ExpoModule classes didn't complete" >&2
+  exit 65
+fi
+echo 'SwiftCompile normal arm64 /fixture/Boardsesh/AppDelegate.swift'
+if [ "$CI_BUILD_RETRY_STATUS" -eq 0 ]; then echo '** BUILD SUCCEEDED **'; fi
+exit "$CI_BUILD_RETRY_STATUS"
+`,
+  );
+  chmodSync(xcodebuildPath, 0o755);
+  const env = {
+    ...process.env,
+    PATH: `${directory}:${process.env.PATH}`,
+    WORKSPACE_PATH: 'fixture.xcworkspace',
+    CI_BUILD_ATTEMPTS: attemptsPath,
+    CI_BUILD_OMIT_PATCHED_SOURCE: options.omitPatchedSource ? '1' : '0',
+    CI_BUILD_RETRY_STATUS: String(options.retryStatus ?? 0),
+  };
+  const build = spawnSync(
+    'bash',
+    ['-e', '-c', requiredStep('Build the Release app (compiles startup + Pods + patched native modules)').run!],
+    { cwd: directory, env, encoding: 'utf8', timeout: 5_000 },
+  );
+  const assertions = spawnSync(
+    'bash',
+    ['-e', '-c', requiredStep('Assert app startup and patched native modules really compiled').run!],
+    { cwd: directory, env, encoding: 'utf8', timeout: 5_000 },
+  );
+  expect(build.error).toBeUndefined();
+  expect(assertions.error).toBeUndefined();
+  return {
+    build,
+    assertions,
+    attempts: readFileSync(attemptsPath, 'utf8').trim(),
+    buildLog: readFileSync(buildLogPath, 'utf8'),
+  };
+}
+
+describe('iOS Release launch workflow', () => {
+  const nativeSuites = [
+    [
+      'atlas',
+      'ClimbOverlayPacketLayout.swift',
+      'ClimbOverlayMotion.swift',
+      'ClimbOverlayAtlas.swift',
+      'tests/ClimbOverlayAtlasTests.swift',
+    ],
+    ['motion', 'ClimbOverlayPacketLayout.swift', 'ClimbOverlayMotion.swift', 'tests/ClimbOverlayMotionTests.swift'],
+    ['budget', 'ClimbOverlayPacketLayout.swift', 'ClimbOverlayBudget.swift', 'tests/ClimbOverlayBudgetTests.swift'],
+    ['arena', 'ClimbOverlayPacketLayout.swift', 'ClimbOverlayArenaIndex.swift', 'tests/ClimbOverlayArenaTests.swift'],
+    ['job', 'ClimbOverlayPacketJob.swift', 'tests/ClimbOverlayPacketJobTests.swift'],
+    [
+      'protocol',
+      'ClimbOverlayPacketLayout.swift',
+      'ClimbOverlayPacketProtocol.swift',
+      'tests/ClimbOverlayPacketProtocolTests.swift',
+    ],
+    [
+      'swap-look',
+      'ClimbOverlayPacketLayout.swift',
+      'ClimbOverlayMotion.swift',
+      'ClimbOverlayShader.swift',
+      'ClimbOverlaySwapLook.swift',
+      'tests/ClimbOverlaySwapLookTests.swift',
+    ],
+  ];
+  it.each([
+    { suite: 'all', compilerExit: 0, testExit: 0, expectedExit: 0 },
+    ...nativeSuites.flatMap(([suite]) => [
+      { suite, compilerExit: 13, testExit: 0, expectedExit: 13 },
+      { suite, compilerExit: 0, testExit: 17, expectedExit: 17 },
+    ]),
+  ])('compiles and executes native guards without hiding failures: %j', (scenario) => {
+    const directory = mkdtempSync(join(tmpdir(), 'ios-atlas-ci-'));
+    temporaryDirectories.push(directory);
+    const argumentsPath = join(directory, 'compile-arguments');
+    const executedPath = join(directory, 'test-executed');
+    const vpPath = join(directory, 'vp');
+    writeFileSync(
+      vpPath,
+      `#!/bin/bash
+set -e
+[ "$1" = exec ] || exit 91
+shift
+if [ "$1" = swiftc ]; then
+  shift
+  printf '%s\\n' "$@" >> "$AURA_CI_ARGUMENTS"
+  while [ "$#" -gt 0 ]; do
+    if [ "$1" = -o ]; then output="$2"; break; fi
+    shift
+  done
+  if [ "$(basename "$output")" = "aura-$AURA_CI_TARGET-tests" ] && [ "$AURA_CI_COMPILER_EXIT" -ne 0 ]; then
+    exit "$AURA_CI_COMPILER_EXIT"
+  fi
+  cat > "$output" <<'NATIVE_TEST'
+#!/bin/bash
+printf '%s\\n' "$(basename "$0")" >> "$AURA_CI_EXECUTED"
+if [ "$(basename "$0")" = "aura-$AURA_CI_TARGET-tests" ]; then exit "$AURA_CI_TEST_EXIT"; fi
+NATIVE_TEST
+  chmod +x "$output"
+  exit 0
+fi
+exec "$@"
+`,
+    );
+    chmodSync(vpPath, 0o755);
+    const result = spawnSync('bash', ['-e', '-c', requiredStep('Test Aura atlas decoding and descriptor bytes').run!], {
+      cwd: directory,
+      encoding: 'utf8',
+      timeout: 5_000,
+      env: {
+        ...process.env,
+        PATH: `${directory}:${process.env.PATH}`,
+        RUNNER_TEMP: directory,
+        AURA_CI_ARGUMENTS: argumentsPath,
+        AURA_CI_EXECUTED: executedPath,
+        AURA_CI_TARGET: scenario.suite,
+        AURA_CI_COMPILER_EXIT: String(scenario.compilerExit),
+        AURA_CI_TEST_EXIT: String(scenario.testExit),
+      },
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(scenario.expectedExit);
+    const selected =
+      scenario.suite === 'all'
+        ? nativeSuites.length
+        : nativeSuites.findIndex(([suite]) => suite === scenario.suite) + 1;
+    expect(
+      readFileSync(argumentsPath, 'utf8')
+        .split('\n')
+        .filter((argument) => argument.endsWith('.swift')),
+    ).toEqual(
+      nativeSuites
+        .slice(0, selected)
+        .flatMap(([, ...sources]) =>
+          sources.map((source) => `packages/mobile/modules/climb-overlay-gpu/ios/${source}`),
+        ),
+    );
+    const executed = existsSync(executedPath) ? readFileSync(executedPath, 'utf8').trim().split('\n') : [];
+    expect(executed).toEqual(
+      nativeSuites.slice(0, selected - (scenario.compilerExit ? 1 : 0)).map(([suite]) => `aura-${suite}-tests`),
+    );
+  });
+
+  it('launches the existing Release output immediately after its ABI check, before Swift tests', () => {
+    const abiIndex = steps.findIndex((step) => step.name === 'Check embedded framework ABI');
+    const smoke = requiredStep('Launch the Release app and watch for crashes');
+    expect(steps.indexOf(smoke)).toBe(abiIndex + 1);
+    expect(smoke.run).toContain('vp exec tsx scripts/ios-release-launch-smoke.ts');
+    expect(smoke.run).toContain('--app packages/mobile/ios/build/Build/Products/Release-iphonesimulator/Boardsesh.app');
+    expect(smoke.run).toContain("--device '${{ steps.simulator.outputs.udid }}'");
+    expect(smoke.run).toContain("--evidence-dir '${{ runner.temp }}/ios-release-launch-smoke'");
+    expect(smoke['timeout-minutes']).toBe(20);
+    expect(smoke.if).toBeUndefined();
+    expect(steps.indexOf(smoke)).toBeLessThan(steps.indexOf(requiredStep('Add RN Swift test target')));
+  });
+
+  it('builds a runnable Release binary with simulator entitlement packaging enabled', () => {
+    const build = requiredStep('Build the Release app (compiles startup + Pods + patched native modules)');
+    expect(build.run).toContain('-configuration Release');
+    expect(build.run).toContain('CODE_SIGN_IDENTITY=-');
+    expect(build.run).toContain('CODE_SIGNING_ALLOWED=YES');
+    expect(build.run).toContain('CODE_SIGN_ENTITLEMENTS="$PWD/scripts/screenshot-sim.entitlements"');
+    expect(build.run).not.toMatch(/CODE_SIGNING_(?:ALLOWED|REQUIRED)=NO/);
+    expect(workflow.env.EXPO_PUBLIC_SENTRY_DSN).toBe('http://ci-compiler@127.0.0.1:1/1');
+  });
+
+  it('retains first-attempt compilation proof when a successful retry reuses those products', () => {
+    const { build, assertions, attempts, buildLog } = runReleaseBuild();
+    expect(build.status, `${build.stdout}\n${build.stderr}`).toBe(0);
+    expect(assertions.status, `${assertions.stdout}\n${assertions.stderr}`).toBe(0);
+    expect(attempts).toBe('2');
+    expect(buildLog).toContain('RNSScrollViewFinder.mm');
+    expect(buildLog).toContain("error: Scanning for @ExpoModule classes didn't complete");
+    expect(buildLog).toContain('** BUILD SUCCEEDED **');
+    expect(buildLog).not.toContain('stale compilation evidence');
+  });
+
+  it('still rejects a missing patched source after a successful retry', () => {
+    const { build, assertions } = runReleaseBuild({ omitPatchedSource: true });
+    expect(build.status).toBe(0);
+    expect(assertions.status).toBe(1);
+    expect(assertions.stdout).toContain('RNScreens RNSScrollViewFinder.mm was not compiled');
+  });
+
+  it('still fails when both builds fail and does not add another retry', () => {
+    const { build, attempts } = runReleaseBuild({ retryStatus: 65 });
+    expect(build.status).toBe(65);
+    expect(attempts).toBe('2');
+  });
+
+  it('resolves an exact simulator before launching and reuses it for the standalone Swift tests', () => {
+    const simulator = requiredStep('Resolve simulator destination');
+    const smoke = requiredStep('Launch the Release app and watch for crashes');
+    expect(steps.indexOf(simulator)).toBeLessThan(steps.indexOf(smoke));
+    expect(simulator.run).toContain("simctl('create', name, device_type, runtime)");
+    expect(simulator.run).toContain('output.write(f"udid={simulator_udid}\\n")');
+    expect(simulator.run).toContain('capture_output=True, text=True, timeout=30');
+    for (const name of ['Build for testing', 'Run Swift unit tests']) {
+      expect(requiredStep(name).run).toContain(
+        "-destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.udid }}'",
+      );
+    }
+  });
+
+  it('uploads launch diagnostics even when the smoke fails', () => {
+    const artifact = requiredStep('Preserve Release launch evidence');
+    expect(artifact.if).toBe('always()');
+    expect(artifact.uses).toBe('actions/upload-artifact@v4');
+    expect(artifact.with?.path).toBe('${{ runner.temp }}/ios-release-launch-smoke');
+    expect(steps.indexOf(artifact)).toBeGreaterThan(
+      steps.indexOf(requiredStep('Launch the Release app and watch for crashes')),
+    );
+  });
+
+  it('triggers for the checker, tests, reused helpers, and simulator entitlements', () => {
+    expect(workflow.on.pull_request.paths).toEqual(
+      expect.arrayContaining([
+        'scripts/ios-release-launch-smoke.ts',
+        'scripts/__tests__/ios-release-launch-smoke*.test.ts',
+        'scripts/lib/ios-capture-diagnostics.ts',
+        'scripts/lib/ios-simulator-lease.ts',
+        'scripts/screenshot-sim.entitlements',
+      ]),
+    );
+    const checkerTests = requiredStep('Check the Release launch guard');
+    expect(checkerTests.run).toContain('scripts/__tests__/ios-release-launch-smoke.test.ts');
+    expect(checkerTests.run).toContain('scripts/__tests__/ios-release-launch-smoke-workflow.test.ts');
+    expect(steps.indexOf(checkerTests)).toBeLessThan(
+      steps.indexOf(requiredStep('Build the Release app (compiles startup + Pods + patched native modules)')),
+    );
+  });
+});
+
+const newSimulatorUdid = '67EF58B2-C7AA-44DB-9ABF-908729CC3F05';
+const templateSimulatorUdid = 'D0D80A96-1387-4502-BEFD-3CB0955AD02A';
+const selectedRuntime = 'com.apple.CoreSimulator.SimRuntime.iOS-27-1';
+const selectedDeviceType = 'com.apple.CoreSimulator.SimDeviceType.iPhone-17';
+const duoDeviceType = 'com.apple.CoreSimulator.SimDeviceType.iPhone-Duo';
+
+function simulatorInventory() {
+  return {
+    devices: {
+      'com.apple.CoreSimulator.SimRuntime.iOS-27-0': [
+        {
+          name: 'iPhone 17',
+          udid: '7F507CBA-0024-45B7-A914-E930C319DAD8',
+          isAvailable: true,
+          deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
+        },
+      ],
+      [selectedRuntime]: [
+        { name: 'iPad', udid: '225E0758-7000-4DB5-BDB8-9A5DB2ED81B3', isAvailable: true },
+        {
+          name: 'iPhone Duo',
+          udid: templateSimulatorUdid,
+          isAvailable: true,
+          deviceTypeIdentifier: duoDeviceType,
+        },
+        {
+          name: 'iPhone 17',
+          udid: 'EE64549B-A61D-4A36-B40F-EA63ECCCE04E',
+          isAvailable: true,
+          deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17',
+        },
+      ],
+    },
+    runtimes: [
+      { identifier: 'com.apple.CoreSimulator.SimRuntime.iOS-27-0', isAvailable: true },
+      { identifier: selectedRuntime, isAvailable: true },
+    ],
+    devicetypes: [{ identifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17' }, { identifier: duoDeviceType }],
+  };
+}
+
+function runSimulatorSelector(
+  options: {
+    inventory?: ReturnType<typeof simulatorInventory>;
+    createdUdid?: string;
+    createStatus?: number;
+    listStatus?: number;
+  } = {},
+) {
+  const directory = mkdtempSync(join(tmpdir(), 'ios-release-simulator-'));
+  temporaryDirectories.push(directory);
+  const xcrunPath = join(directory, 'xcrun');
+  const callsPath = join(directory, 'calls.jsonl');
+  const outputPath = join(directory, 'output');
+  writeFileSync(
+    xcrunPath,
+    `#!/usr/bin/env python3
+import json, os, sys
+arguments = sys.argv[1:]
+with open(os.environ['CI_SIM_CALLS'], 'a') as calls:
+    calls.write(json.dumps(arguments) + '\\n')
+if arguments == ['simctl', 'list', '--json']:
+    print(os.environ['CI_SIM_INVENTORY'])
+    sys.exit(int(os.environ['CI_SIM_LIST_STATUS']))
+if len(arguments) == 5 and arguments[:2] == ['simctl', 'create']:
+    print(os.environ['CI_SIM_CREATED_UDID'])
+    print('fixture creation diagnostic', file=sys.stderr)
+    sys.exit(int(os.environ['CI_SIM_CREATE_STATUS']))
+print('Unexpected simulator command', file=sys.stderr)
+sys.exit(1)
+`,
+  );
+  chmodSync(xcrunPath, 0o755);
+  const script = requiredStep('Resolve simulator destination').run!;
+  const result = spawnSync('bash', ['-c', script], {
+    cwd: directory,
+    env: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH}`,
+      GITHUB_OUTPUT: outputPath,
+      GITHUB_RUN_ID: '7171',
+      GITHUB_RUN_ATTEMPT: '3',
+      CI_SIM_CALLS: callsPath,
+      CI_SIM_INVENTORY: JSON.stringify(options.inventory ?? simulatorInventory()),
+      CI_SIM_CREATED_UDID: options.createdUdid ?? newSimulatorUdid,
+      CI_SIM_CREATE_STATUS: String(options.createStatus ?? 0),
+      CI_SIM_LIST_STATUS: String(options.listStatus ?? 0),
+    },
+    encoding: 'utf8',
+    timeout: 5_000,
+  });
+  expect(result.error).toBeUndefined();
+  const calls = existsSync(callsPath)
+    ? readFileSync(callsPath, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as string[])
+    : [];
+  return { result, calls, output: existsSync(outputPath) ? readFileSync(outputPath, 'utf8') : '' };
+}
+
+describe('CI-owned simulator allocation', () => {
+  it('creates a fresh single-screen iPhone on the newest compatible runtime', () => {
+    const { result, calls, output } = runSimulatorSelector();
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(calls).toEqual([
+      ['simctl', 'list', '--json'],
+      [
+        'simctl',
+        'create',
+        expect.stringMatching(/^Boardsesh CI 7171-3-[a-f0-9]{8}$/),
+        selectedDeviceType,
+        selectedRuntime,
+      ],
+    ]);
+    expect(output).toBe(`udid=${newSimulatorUdid}\n`);
+    expect(output).not.toContain(templateSimulatorUdid);
+    expect(result.stdout).toContain(`iPhone 17 on ${selectedRuntime}`);
+    expect(
+      calls.every((arguments_) => !arguments_.some((argument) => ['erase', 'delete', 'reset'].includes(argument))),
+    ).toBe(true);
+  });
+
+  it('prefers a single-screen iPhone on an older runtime over a newer Duo', () => {
+    const inventory = simulatorInventory();
+    inventory.devices[selectedRuntime] = inventory.devices[selectedRuntime].filter(
+      (device) => device.name !== 'iPhone 17',
+    );
+    const { result, calls } = runSimulatorSelector({ inventory });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(calls[1].slice(-2)).toEqual([selectedDeviceType, 'com.apple.CoreSimulator.SimRuntime.iOS-27-0']);
+  });
+
+  it('falls back to a Duo when no single-screen iPhone is available', () => {
+    const inventory = simulatorInventory();
+    for (const devices of Object.values(inventory.devices)) {
+      for (const device of devices) {
+        if (device.name === 'iPhone 17') device.isAvailable = false;
+      }
+    }
+    const { result, calls } = runSimulatorSelector({ inventory });
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(calls[1].slice(-2)).toEqual([duoDeviceType, selectedRuntime]);
+  });
+
+  it('fails before allocating when listing simulators fails', () => {
+    const { result, calls, output } = runSimulatorSelector({ listStatus: 9 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Simulator list --json failed (9)');
+    expect(calls).toHaveLength(1);
+    expect(output).toBe('');
+  });
+
+  it('fails clearly on creation failure without publishing a simulator destination', () => {
+    const { result, calls, output } = runSimulatorSelector({ createStatus: 7 });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('failed (7): fixture creation diagnostic');
+    expect(calls).toHaveLength(2);
+    expect(output).toBe('');
+  });
+
+  it.each(['runtime', 'device type'] as const)(
+    'rejects missing compatible %s metadata without switching model',
+    (missing) => {
+      const inventory = simulatorInventory();
+      if (missing === 'runtime') inventory.runtimes = [];
+      else inventory.devicetypes = inventory.devicetypes.filter(({ identifier }) => identifier !== selectedDeviceType);
+      const { result, calls, output } = runSimulatorSelector({ inventory });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Selected iPhone iPhone 17 has no compatible runtime/device metadata');
+      expect(calls).toHaveLength(1);
+      expect(output).toBe('');
+    },
+  );
+
+  it('rejects an inventory without an available iPhone', () => {
+    const inventory = simulatorInventory();
+    for (const devices of Object.values(inventory.devices)) {
+      for (const device of devices) device.isAvailable = false;
+    }
+    const { result, calls, output } = runSimulatorSelector({ inventory });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('no available iPhone');
+    expect(calls).toHaveLength(1);
+    expect(output).toBe('');
+  });
+
+  it.each(['not-a-uuid', '', `${newSimulatorUdid}\nextra output`])(
+    'rejects malformed created UUID %j',
+    (createdUdid) => {
+      const { result, output } = runSimulatorSelector({ createdUdid });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Simulator create returned a malformed UUID');
+      expect(output).toBe('');
+    },
+  );
+
+  it('rejects an existing UUID even when creation returns it with different casing', () => {
+    const { result, output } = runSimulatorSelector({ createdUdid: templateSimulatorUdid.toLowerCase() });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('Simulator create returned an existing UUID');
+    expect(output).toBe('');
+  });
+});
+
+function nativeGateDecision(changedPath: string, platform = 'ios'): string {
+  const directory = mkdtempSync(join(tmpdir(), 'ios-release-gate-'));
+  temporaryDirectories.push(directory);
+  const gitPath = join(directory, 'git');
+  // Only git discovery is stubbed: execute the actual action's decision script,
+  // including its pathspecs and platform condition, without network or installs.
+  writeFileSync(
+    gitPath,
+    `#!/bin/bash
+case "$1" in
+  fetch) exit 0 ;;
+  rev-parse) echo fixture-base ;;
+  diff)
+    while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+    shift
+    for pathspec in "$@"; do
+      case "$CI_GATE_CHANGED_FILE" in
+        $pathspec|"$pathspec"/*) echo "$CI_GATE_CHANGED_FILE"; exit 0 ;;
+      esac
+    done
+    ;;
+  *) echo "Unexpected git invocation: $*" >&2; exit 1 ;;
+esac
+`,
+  );
+  chmodSync(gitPath, 0o755);
+  const decisionScript = nativeAction.runs.steps.find((step) => step.id === 'decide')?.run;
+  expect(decisionScript).toBeDefined();
+  const outputPath = join(directory, 'output');
+  const result = spawnSync('bash', ['-c', decisionScript!], {
+    cwd: directory,
+    env: {
+      ...process.env,
+      PATH: `${directory}:${process.env.PATH}`,
+      CI_GATE_CHANGED_FILE: changedPath,
+      GITHUB_OUTPUT: outputPath,
+      EVENT: 'pull_request',
+      PLATFORM: platform,
+      BASE_REF: 'main',
+    },
+    encoding: 'utf8',
+    timeout: 5_000,
+  });
+  expect(result.error).toBeUndefined();
+  expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+  return readFileSync(outputPath, 'utf8').trim();
+}
+
+describe('native gate exercises iOS launch tooling changes', () => {
+  it.each([
+    '.github/workflows/ios-rn-ci.yml',
+    'scripts/ios-release-launch-smoke.ts',
+    'scripts/__tests__/ios-release-launch-smoke.test.ts',
+    'scripts/__tests__/ios-release-launch-smoke-workflow.test.ts',
+    'scripts/lib/ios-capture-diagnostics.ts',
+    'scripts/lib/ios-simulator-lease.ts',
+    'scripts/screenshot-sim.entitlements',
+  ])('forces an iOS build for %s even with unchanged native inputs', (changedPath) => {
+    expect(nativeGateDecision(changedPath)).toBe('should_build=true');
+  });
+
+  it('preserves skipping ordinary JS changes and Android builds for iOS-only tools', () => {
+    expect(nativeGateDecision('packages/mobile/src/example.ts')).toBe('should_build=false');
+    expect(nativeGateDecision('scripts/ios-release-launch-smoke.ts', 'android')).toBe('should_build=false');
+  });
+
+  it('runs the Android shader checker when only its implementation changes', () => {
+    const checkerPath = 'scripts/check-android-gpu-shaders.ts';
+    const androidWorkflow = parse(
+      readFileSync(join(repoRoot, '.github/workflows/android-pr-rn.yml'), 'utf8'),
+    ) as IosWorkflow;
+    expect(androidWorkflow.on.pull_request.paths).toContain(checkerPath);
+    expect(nativeGateDecision(checkerPath, 'android')).toBe('should_build=true');
+    expect(nativeGateDecision(checkerPath, 'ios')).toBe('should_build=false');
+  });
+});

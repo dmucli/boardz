@@ -4,18 +4,18 @@ import type { ObserveRuntimeOverrides } from './observe-config';
  * Pure in-memory slot for the expo-observe SDK, registered by
  * `observe-bootstrap.ts` (imported once, from app/_layout.tsx).
  *
- * Deliberately dependency-free — no `expo-observe`, no react-native — for the
- * same reason `analytics-bootstrap-id.ts` is: `error-reporting.ts` reads this,
- * and error-reporting is imported by a large part of the app that the node-env
- * test runner loads. Importing the SDK directly there drags in Expo's winter
- * runtime (`Cannot find module './ImportMetaRegistry'`) and takes 33 test files
- * down with it.
+ * Deliberately dependency-free — no `expo-observe`, no react-native —
+ * because `error-reporting.ts` reads this, and error-reporting is imported by
+ * a large part of the app that the node-env test runner loads. Importing the
+ * SDK directly there drags in Expo's winter runtime (`Cannot find module
+ * './ImportMetaRegistry'`) and takes 33 test files down with it.
  *
  * Unregistered is the normal state under test and on Expo web, so every call
  * here is a no-op rather than an error.
  */
 export type ObserveRuntime = {
   configure(overrides: ObserveRuntimeOverrides): void;
+  dispatchEvents(): Promise<void>;
   reportError(error: unknown): void;
 };
 
@@ -36,6 +36,21 @@ export function configureObserve(overrides: ObserveRuntimeOverrides = {}): void 
     runtime.configure(overrides);
   } catch {
     // A telemetry misconfiguration must not take the app down.
+  }
+}
+
+/**
+ * Flush locally persisted Observe events without making telemetry a dependency
+ * of the app lifecycle. Native module failures are best-effort by definition:
+ * a foreground transition must still complete when Observe cannot dispatch.
+ */
+export async function dispatchObserveEvents(): Promise<void> {
+  if (!runtime) return;
+  try {
+    await runtime.dispatchEvents();
+  } catch (error) {
+    // The next foreground/background transition can retry persisted events.
+    if (__DEV__) console.warn('[observe] event dispatch failed; will retry later', error);
   }
 }
 

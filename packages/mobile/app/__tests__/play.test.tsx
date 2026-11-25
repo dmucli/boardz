@@ -1,15 +1,41 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
-import { createElement, type ReactNode } from 'react';
+import { createElement, type ReactNode, type Ref } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { LayoutChangeEvent } from 'react-native';
 import type { SwipeDismissAnimation } from '../../src/components/play-drawer/use-drawer-dismiss-gesture';
+import type { QueueSheetHandle } from '../../src/components/play-drawer/QueueSheet';
+import type { PlayDrawerOpenTarget } from '../../src/components/play-drawer';
+import type { DismissAndWaitResult } from '../../src/providers/sheet-presentation-provider';
+import { materialSurfaceContainers, materialSurfaces } from '../../src/theme/colors';
 
 const router = vi.hoisted(() => ({ dismiss: vi.fn() }));
-const navigation = vi.hoisted(() => ({ setOptions: vi.fn(), isFocused: vi.fn(() => true) }));
+const navigation = vi.hoisted(() => ({
+  setOptions: vi.fn(),
+  isFocused: vi.fn(() => true),
+  removalListeners: new Map<string, () => void>(),
+  beforeRemove: null as ((event: { defaultPrevented: boolean }) => void) | null,
+  addListener: vi.fn<(event: string, listener: (event: { defaultPrevented: boolean }) => void) => () => void>(),
+}));
 const onClosed = vi.hoisted(() => vi.fn());
-const player = vi.hoisted(() => ({ swipeDismiss: null as SwipeDismissAnimation | null }));
+const routeTarget = vi.hoisted(() => ({ current: null as PlayDrawerOpenTarget | null, consumed: vi.fn() }));
+const player = vi.hoisted(() => ({
+  swipeDismiss: null as SwipeDismissAnimation | null,
+  dismissAndWait: null as (() => Promise<DismissAndWaitResult>) | null,
+  nativeWait: vi.fn<() => Promise<DismissAndWaitResult>>(),
+}));
 const surface = vi.hoisted(() => ({ onLayout: null as ((event: LayoutChangeEvent) => void) | null }));
+const queueSheet = vi.hoisted(() => ({
+  mounted: 0,
+  present: vi.fn(),
+  dismiss: vi.fn(),
+  dismissAndWait: vi.fn(),
+  dismissWhenUncovered: vi.fn(),
+}));
+const logAscentHost = vi.hoisted(() => ({ open: vi.fn(), queueOpeners: [] as unknown[] }));
+// An iPhone by default; the iPad cases change it before rendering.
+const device = vi.hoisted(() => ({ isPad: false, width: 400, height: 900 }));
+const drawerProps = vi.hoisted(() => ({ fitBoardToHeight: undefined as boolean | undefined }));
 const boardConfig = { boardName: 'kilter', layoutId: 1, sizeId: 1, setIds: '1', angle: 40 };
 
 // The play route now asks which boards stand at this gym, to decide whether a
@@ -22,10 +48,22 @@ vi.mock('../../src/lib/graphql/use-active-board', () => ({
   useActiveBoard: () => ({ data: null }),
 }));
 
+// The launch hold is covered by its own suite; here the screen renders as is.
+vi.mock('../../src/components/launch-update/hold-until-launch-ready', () => ({
+  holdUntilLaunchReady: <Screen,>(Screen: Screen) => Screen,
+}));
+
 vi.mock('react-native', () => ({
-  View: ({ children }: { children?: ReactNode }) => createElement('div', { 'data-testid': 'backing' }, children),
   StyleSheet: { create: (styles: unknown) => styles, absoluteFill: {} },
-  useWindowDimensions: () => ({ height: 900, width: 400 }),
+  PlatformColor: (name: string) => ({ semantic: name }),
+  DynamicColorIOS: (colors: unknown) => colors,
+  Platform: {
+    OS: 'ios',
+    get isPad() {
+      return device.isPad;
+    },
+  },
+  useWindowDimensions: () => ({ height: device.height, width: device.width }),
 }));
 vi.mock('react-native-reanimated', async () => {
   const { useRef } = await import('react');
@@ -47,25 +85,100 @@ vi.mock('react-native-reanimated', async () => {
     useSharedValue: (initial: unknown) => useRef({ value: initial }).current,
     useAnimatedStyle: (factory: () => unknown) => factory(),
     withSpring: (target: number) => target,
+    cancelAnimation: vi.fn(),
     runOnUI: (callback: () => void) => callback,
     runOnJS: (callback: () => void) => callback,
   };
 });
-vi.mock('expo-router', () => ({ useRouter: () => router, useNavigation: () => navigation }));
-vi.mock('../../src/components/GlassSurface', () => ({
-  GlassSurface: () => createElement('div', { 'data-testid': 'glass' }),
+vi.mock('expo-router', () => ({
+  useRouter: () => router,
+  useNavigation: () => navigation,
+  router: { push: vi.fn() },
+}));
+vi.mock('../../src/components/ScreenBackground', () => ({
+  ScreenBackground: () => createElement('div', { 'data-testid': 'background' }),
 }));
 vi.mock('../../src/components/play-drawer', () => ({
-  PlayDrawer: ({ swipeDismiss, onClose }: { swipeDismiss: SwipeDismissAnimation; onClose: () => void }) => {
+  PlayDrawer: ({
+    swipeDismiss,
+    onClose,
+    onOpenQueue,
+    dismissPlayerAndWait,
+    fitBoardToHeight,
+    renderSidePanel,
+  }: {
+    swipeDismiss: SwipeDismissAnimation;
+    onClose: () => void;
+    onOpenQueue: () => void;
+    dismissPlayerAndWait: () => Promise<DismissAndWaitResult>;
+    fitBoardToHeight?: boolean;
+    renderSidePanel?: (displayed: null) => ReactNode;
+  }) => {
     player.swipeDismiss = swipeDismiss;
-    return createElement('button', { onClick: onClose }, 'Close player');
+    player.dismissAndWait = dismissPlayerAndWait;
+    drawerProps.fitBoardToHeight = fitBoardToHeight;
+    return createElement(
+      'div',
+      null,
+      createElement('button', { onClick: onClose }, 'Close player'),
+      createElement('button', { onClick: onOpenQueue }, 'Open queue'),
+      renderSidePanel ? renderSidePanel(null) : null,
+    );
   },
 }));
-vi.mock('../../src/components/play-drawer/QueueSheet', () => ({ QueueSheet: () => null }));
+vi.mock('../../src/components/play-drawer/PlayerSidePanel', async () => {
+  const { useImperativeHandle, useState } = await import('react');
+  return {
+    PlayerSidePanel: ({ ref }: { ref: Ref<{ showUpNext: () => void }> }) => {
+      const [segment, setSegment] = useState('upNext');
+      useImperativeHandle(ref, () => ({ showUpNext: () => setSegment('upNext') }));
+      return createElement(
+        'div',
+        { 'data-testid': 'side-panel', 'data-segment': segment },
+        createElement('button', { onClick: () => setSegment('logbook') }, 'Logbook segment'),
+      );
+    },
+  };
+});
+vi.mock('../../src/components/play-drawer/QueueSheet', async () => {
+  const { useImperativeHandle, useEffect } = await import('react');
+  return {
+    QueueSheet: ({ ref }: { ref: Ref<QueueSheetHandle> }) => {
+      useImperativeHandle(ref, () => ({
+        present: queueSheet.present,
+        dismiss: queueSheet.dismiss,
+        dismissAndWait: queueSheet.dismissAndWait,
+        dismissWhenUncovered: queueSheet.dismissWhenUncovered,
+      }));
+      useEffect(() => {
+        queueSheet.mounted += 1;
+      }, []);
+      return createElement('div', { 'data-testid': 'queue-sheet' });
+    },
+  };
+});
 vi.mock('../../src/components/ble/DevicePickerSheetHost', () => ({ DevicePickerSheetHost: () => null }));
-vi.mock('../../src/components/play-drawer/use-queue-sheet-handlers', () => ({ useQueueSheetHandlers: () => ({}) }));
+// The route reports its picker as busy for the phone split; no picker is up here.
+vi.mock('../../src/providers/ble-picker-host', () => ({ useBlePickerHost: () => ({ pickerState: null }) }));
+vi.mock('../../src/components/play-drawer/use-queue-sheet-handlers', () => ({
+  useQueueSheetHandlers: ({ openLogAscent }: { openLogAscent: unknown }) => {
+    logAscentHost.queueOpeners.push(openLogAscent);
+    return {};
+  },
+}));
+vi.mock('../../src/components/tick/use-log-ascent-sheet-host', () => ({
+  useLogAscentSheetHost: () => ({
+    openLogAscent: logAscentHost.open,
+    sheet: createElement('div', { 'data-testid': 'route-tick-host' }),
+  }),
+}));
 vi.mock('../../src/providers/drawer-host-provider', () => ({
-  usePlayDrawerRoute: () => ({ activeBoardConfig: boardConfig, onPlayDrawerClosed: onClosed }),
+  usePlayDrawerRoute: () => ({
+    activeBoardConfig: boardConfig,
+    onPlayDrawerClosed: onClosed,
+    onPlayDrawerTargetConsumed: routeTarget.consumed,
+    playTarget: routeTarget.current,
+  }),
   useDrawerHost: () => ({ boardConfig }),
 }));
 vi.mock('../../src/providers/queue-provider', () => ({
@@ -73,11 +186,18 @@ vi.mock('../../src/providers/queue-provider', () => ({
   useQueueSessionControls: () => ({}),
 }));
 vi.mock('../../src/providers/theme-provider', () => ({
-  useTheme: () => ({ systemColors: { secondaryBackground: '#fff' }, colorScheme: 'light' }),
+  useTheme: () => ({
+    systemColors: materialSurfaces.light,
+    m3SurfaceContainers: materialSurfaceContainers.light,
+    colorScheme: 'light',
+    variant: 'material',
+  }),
 }));
-vi.mock('../../src/theme/colors', () => ({ playDrawerMaterialTint: { light: 'transparent', dark: 'transparent' } }));
+// The route uses its real surface resolver and palette. Only the native
+// capability/accessibility decision is fixed to this harness's Material theme.
+vi.mock('../../src/hooks/use-effective-surface-mode', () => ({ useEffectiveSurfaceMode: () => 'material' }));
 vi.mock('../../src/components/create-climb/use-player-dismiss-and-wait', () => ({
-  usePlayerDismissAndWait: () => vi.fn(),
+  usePlayerDismissAndWait: () => player.nativeWait,
 }));
 vi.mock('../../src/providers/sheet-presentation-provider', () => ({ dismissManagedSheetAndWait: vi.fn() }));
 
@@ -93,18 +213,35 @@ function flushFrame() {
 
 function renderPlayer() {
   const rendered = render(createElement(PlayScreen));
-  flushFrame(); // Existing cheap-first-frame content gate.
   const animation = player.swipeDismiss;
   if (!animation) throw new Error('player did not receive the route animation');
   return { ...rendered, animation };
 }
 
 beforeEach(() => {
+  logAscentHost.queueOpeners = [];
+  queueSheet.mounted = 0;
+  Object.assign(device, { isPad: false, width: 400, height: 900 });
+  drawerProps.fitBoardToHeight = undefined;
   vi.clearAllMocks();
   navigation.isFocused.mockReturnValue(true);
+  navigation.beforeRemove = null;
+  navigation.removalListeners.clear();
+  navigation.beforeRemove = (event) =>
+    navigation.removalListeners.get(event.defaultPrevented ? 'removePrevented' : 'removed')?.();
+  navigation.addListener.mockImplementation((event, listener) => {
+    const callback = () => listener({ defaultPrevented: event === 'removePrevented' });
+    navigation.removalListeners.set(event, callback);
+    return () => {
+      if (navigation.removalListeners.get(event) === callback) navigation.removalListeners.delete(event);
+    };
+  });
   frames.clear();
   nextFrame = 0;
   player.swipeDismiss = null;
+  player.dismissAndWait = null;
+  player.nativeWait.mockReset().mockResolvedValue({ status: 'dismissed' });
+  routeTarget.current = null;
   vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
     frames.set(++nextFrame, callback);
     return nextFrame;
@@ -117,11 +254,270 @@ afterEach(() => {
 });
 
 describe('player swipe dismissal', () => {
-  it('keeps backing, glass and player inside the same translated surface', () => {
+  it('restores a freshly opened target while the offscreen swipe pop is pending', () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { animation, rerender } = renderPlayer();
+    animation.translateY.value = 900;
+    animation.isDismissing.value = true;
+    act(() => animation.onComplete());
+    flushFrame();
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(animation.translateY.value).toBe(0);
+    expect(animation.isDismissing.value).toBe(false);
+    flushFrame();
+    flushFrame();
+    expect(router.dismiss).not.toHaveBeenCalled();
+    expect(navigation.setOptions).toHaveBeenLastCalledWith({ animation: 'slide_from_bottom' });
+  });
+
+  it('retires only the consumed target owned by the unmounting route instance', () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const firstRoute = renderPlayer();
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    const secondRoute = renderPlayer();
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(2);
+    firstRoute.unmount();
+    expect(onClosed).toHaveBeenLastCalledWith(1);
+    secondRoute.unmount();
+  });
+
+  it('leaves a fresh target unconsumed after the old native pop has already been requested', () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender, unmount } = renderPlayer();
+    fireEvent.click(screen.getByRole('button', { name: 'Close player' }));
+    expect(router.dismiss).toHaveBeenCalledTimes(1);
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenCalledTimes(1);
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+    unmount();
+    expect(onClosed).toHaveBeenLastCalledWith(1);
+  });
+
+  it('keeps a valid swipe pop pending when the same opener rerenders for a queued climb change', () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { animation, rerender } = renderPlayer();
+    animation.isDismissing.value = true;
+    act(() => animation.onComplete());
+    routeTarget.current = { nonce: 1, climb: { uuid: 'queue-swap' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(animation.isDismissing.value).toBe(true);
+    flushFrame();
+    flushFrame();
+    expect(router.dismiss).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a fresh target unconsumed during the route-owned programmatic dismiss waiter', async () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender, unmount } = renderPlayer();
+    await act(async () => {
+      await player.dismissAndWait?.();
+    });
+    expect(player.nativeWait).toHaveBeenCalledTimes(1);
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+    expect(routeTarget.consumed).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(onClosed).toHaveBeenLastCalledWith(1);
+  });
+
+  it('restores a fresh target when the programmatic native dismiss aborts', async () => {
+    let finish: (result: DismissAndWaitResult) => void = () => {};
+    player.nativeWait.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender, animation } = renderPlayer();
+    let waiting: Promise<DismissAndWaitResult> | undefined;
+    act(() => {
+      waiting = player.dismissAndWait?.();
+    });
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+    await act(async () => {
+      finish({ status: 'aborted' });
+      await waiting;
+    });
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(2);
+    expect(animation.translateY.value).toBe(0);
+    expect(animation.isDismissing.value).toBe(false);
+  });
+
+  it('restores a native request that emits its own beforeRemove event and then aborts', async () => {
+    player.nativeWait.mockImplementation(async () => {
+      navigation.beforeRemove?.({ defaultPrevented: false });
+      return { status: 'aborted' };
+    });
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender } = renderPlayer();
+    await act(async () => {
+      await player.dismissAndWait?.();
+    });
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(2);
+  });
+
+  it('keeps a later native removal owned after the first request emits its event and aborts', async () => {
+    let finish: (result: DismissAndWaitResult) => void = () => {};
+    player.nativeWait.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          navigation.beforeRemove?.({ defaultPrevented: false });
+          finish = resolve;
+        }),
+    );
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender } = renderPlayer();
+    let waiting: Promise<DismissAndWaitResult> | undefined;
+    act(() => {
+      waiting = player.dismissAndWait?.();
+    });
+    act(() => navigation.beforeRemove?.({ defaultPrevented: false }));
+    await act(async () => {
+      finish({ status: 'aborted' });
+      await waiting;
+    });
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+    expect(routeTarget.consumed).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts an old programmatic handoff when a fresh opener arrives during its native wait', async () => {
+    let finish: (result: DismissAndWaitResult) => void = () => {};
+    player.nativeWait.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender } = renderPlayer();
+    let waiting: Promise<DismissAndWaitResult> | undefined;
+    act(() => {
+      waiting = player.dismissAndWait?.();
+    });
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    await act(async () => {
+      finish({ status: 'dismissed' });
+      expect(await waiting).toEqual({ status: 'aborted' });
+    });
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+  });
+
+  it('rejects a programmatic dismiss callback captured by the previous opener', async () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender } = renderPlayer();
+    const previousWait = player.dismissAndWait;
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    await act(async () => {
+      expect(await previousWait?.()).toEqual({ status: 'aborted' });
+    });
+    expect(player.nativeWait).not.toHaveBeenCalled();
+  });
+
+  it('preserves a pending opener when native back removes the route', () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender, unmount } = renderPlayer();
+    act(() => navigation.beforeRemove?.({ defaultPrevented: false }));
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+    expect(routeTarget.consumed).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(onClosed).toHaveBeenLastCalledWith(1);
+  });
+
+  it('recovers a fresh target when another listener prevents native back removal', async () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender } = renderPlayer();
+    act(() => {
+      navigation.beforeRemove?.({ defaultPrevented: true });
+    });
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(2);
+    expect(router.dismiss).not.toHaveBeenCalled();
+  });
+
+  it('does not let a prevented removal restore a later valid removal for the same opener', async () => {
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender } = renderPlayer();
+    act(() => {
+      navigation.beforeRemove?.({ defaultPrevented: true });
+      navigation.beforeRemove?.({ defaultPrevented: false });
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+    expect(routeTarget.consumed).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let an old aborted waiter restore a later native removal for the same opener', async () => {
+    let finishFirst: (result: DismissAndWaitResult) => void = () => {};
+    player.nativeWait.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishFirst = resolve;
+        }),
+    );
+    player.nativeWait.mockImplementationOnce(() => new Promise(() => {}));
+    routeTarget.current = { nonce: 1, climb: { uuid: 'first' } } as PlayDrawerOpenTarget;
+    const { rerender } = renderPlayer();
+    let firstWait: Promise<DismissAndWaitResult> | undefined;
+    act(() => {
+      firstWait = player.dismissAndWait?.();
+    });
+    act(() => navigation.beforeRemove?.({ defaultPrevented: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => {
+      void player.dismissAndWait?.();
+    });
+    expect(player.nativeWait).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      finishFirst({ status: 'aborted' });
+      await firstWait;
+    });
+    routeTarget.current = { nonce: 2, climb: { uuid: 'fresh' } } as PlayDrawerOpenTarget;
+    rerender(createElement(PlayScreen));
+    expect(routeTarget.consumed).toHaveBeenLastCalledWith(1);
+    expect(routeTarget.consumed).toHaveBeenCalledTimes(1);
+  });
+
+  it('mounts the player core in the first commit and creates its queue host on the first queue press', () => {
+    render(createElement(PlayScreen));
+    expect(screen.getByRole('button', { name: 'Close player' })).toBeTruthy();
+    expect(player.swipeDismiss).not.toBeNull();
+    expect(frames.size).toBe(0);
+    expect(queueSheet.mounted).toBe(0);
+    fireEvent.click(screen.getByRole('button', { name: 'Open queue' }));
+    expect(queueSheet.mounted).toBe(1);
+    expect(queueSheet.present).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Open queue' }));
+    expect(queueSheet.mounted).toBe(1);
+    expect(queueSheet.present).toHaveBeenCalledTimes(2);
+  });
+  it('keeps the background and player inside the same translated surface', () => {
     const { animation } = renderPlayer();
     const movingSurface = screen.getByTestId('moving-surface');
-    expect(movingSurface.contains(screen.getByTestId('backing'))).toBe(true);
-    expect(movingSurface.contains(screen.getByTestId('glass'))).toBe(true);
+    expect(movingSurface.contains(screen.getByTestId('background'))).toBe(true);
     expect(movingSurface.contains(screen.getByRole('button', { name: 'Close player' }))).toBe(true);
     act(() => {
       animation.translateY.value = 900;
@@ -210,5 +606,63 @@ describe('player swipe dismissal', () => {
     flushFrame();
     flushFrame();
     expect(router.dismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('iPad player arrangement', () => {
+  it('uses the route-owned Tick host for both queue entry points', () => {
+    renderPlayer();
+    expect(logAscentHost.queueOpeners).toHaveLength(2);
+    expect(logAscentHost.queueOpeners.every((opener) => opener === logAscentHost.open)).toBe(true);
+    expect(screen.getByTestId('moving-surface').contains(screen.getByTestId('route-tick-host'))).toBe(true);
+  });
+  it('puts Up next beside the board in landscape and selects it from the queue button', () => {
+    Object.assign(device, { isPad: true, width: 1376, height: 1032 });
+    renderPlayer();
+    const panel = screen.getByTestId('side-panel');
+    expect(panel.getAttribute('data-segment')).toBe('upNext');
+    expect(drawerProps.fitBoardToHeight).toBe(true);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Logbook segment' }));
+    expect(screen.getByTestId('side-panel').getAttribute('data-segment')).toBe('logbook');
+
+    // Up next is already on screen: no second queue stacks over the player.
+    fireEvent.click(screen.getByRole('button', { name: 'Open queue' }));
+    expect(screen.getByTestId('side-panel').getAttribute('data-segment')).toBe('upNext');
+    expect(queueSheet.mounted).toBe(0);
+    expect(queueSheet.present).not.toHaveBeenCalled();
+  });
+
+  it('requests a deferred queue fold when the iPad turns to landscape', () => {
+    Object.assign(device, { isPad: true, width: 1032, height: 1376 });
+    const { rerender } = renderPlayer();
+    fireEvent.click(screen.getByRole('button', { name: 'Open queue' }));
+    expect(queueSheet.present).toHaveBeenCalledTimes(1);
+    expect(queueSheet.dismiss).not.toHaveBeenCalled();
+
+    Object.assign(device, { width: 1376, height: 1032 });
+    rerender(createElement(PlayScreen));
+    expect(screen.getByTestId('side-panel')).toBeTruthy();
+    expect(queueSheet.dismissWhenUncovered).toHaveBeenLastCalledWith(true);
+    expect(queueSheet.dismiss).not.toHaveBeenCalled();
+    Object.assign(device, { width: 1032, height: 1376 });
+    rerender(createElement(PlayScreen));
+    expect(queueSheet.dismissWhenUncovered).toHaveBeenLastCalledWith(false);
+  });
+
+  it('keeps the board on top in portrait and presents the queue sheet', () => {
+    Object.assign(device, { isPad: true, width: 1032, height: 1376 });
+    renderPlayer();
+    expect(screen.queryByTestId('side-panel')).toBeNull();
+    expect(drawerProps.fitBoardToHeight).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Open queue' }));
+    expect(queueSheet.present).toHaveBeenCalledTimes(1);
+  });
+
+  it('never shows the panel on a phone held sideways', () => {
+    Object.assign(device, { isPad: false, width: 956, height: 440 });
+    renderPlayer();
+    expect(screen.queryByTestId('side-panel')).toBeNull();
+    expect(drawerProps.fitBoardToHeight).toBe(false);
   });
 });

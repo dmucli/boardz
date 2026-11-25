@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useState } from 'react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Stack } from 'expo-router';
 import { Alert, Platform, StyleSheet, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
@@ -6,10 +6,14 @@ import { useTranslation } from 'react-i18next';
 import * as Updates from 'expo-updates';
 import * as Application from 'expo-application';
 import { Button } from '../src/components/Button';
+import { AppUpdatesCard } from '../src/components/AppUpdatesCard';
 import { Icon } from '../src/components/Icon';
 import { PressableSurface } from '../src/components/PressableSurface';
+import { changelogCategoryTone } from '../src/lib/changelog-category-tone';
+import { StatusPill } from '../src/components/StatusPill';
 import { Text } from '../src/components/Text';
 import { OfflineSpotlightCard } from '../src/components/offline/OfflineSpotlightCard';
+import { PreviewFirstSpotlightCard } from '../src/components/onboarding/PreviewFirstSpotlightCard';
 import { useBottomChromeMetrics } from '../src/hooks/use-bottom-chrome-metrics';
 import { useStackScreenOptions } from '../src/hooks/use-stack-screen-options';
 import {
@@ -22,6 +26,15 @@ import {
   type TimelineItem,
 } from '../src/lib/changelog';
 import { markChangelogSeen } from '../src/lib/changelog-seen';
+import { performChangelogUpdate } from '../src/lib/changelog-update';
+import { runOtaOperation } from '../src/lib/ota-operation-owner';
+import {
+  captureOtaReloadReceipt,
+  fetchOwnedOtaUpdate,
+  isOtaReloadReceiptCurrent,
+  waitForOtaUpdatesIdle,
+  waitForOtaReloadReceipt,
+} from '../src/lib/qa/qa-surf';
 import { reportError } from '../src/lib/error-reporting';
 import { formatRelativeTime } from '../src/lib/format-relative-time';
 import { hapticError } from '../src/lib/haptics';
@@ -41,11 +54,11 @@ const CATEGORY_ICONS: Record<ChangelogCategory, IconName> = {
   fixed: 'success',
 };
 
-// Header chip showing which build the user is running. On an OTA-updated build,
+// Quiet detail showing which build the user is running. On an OTA-updated build,
 // `Updates.createdAt` is the publish time of the JS bundle; on an embedded launch
 // (no OTA applied yet) fall back to the native app version. Kept tiny + memoized
 // so it never re-renders with the list.
-const CurrentBuildChip = memo(function CurrentBuildChip() {
+const CurrentBuildDetails = memo(function CurrentBuildDetails() {
   const { t } = useTranslation('common');
   const { systemColors } = useTheme();
 
@@ -62,28 +75,16 @@ const CurrentBuildChip = memo(function CurrentBuildChip() {
 
   if (!buildLabel) return null;
   return (
-    <View style={[styles.buildChip, { backgroundColor: systemColors.fill }]}>
-      <Icon name="info" size={14} color={systemColors.secondaryLabel} />
-      <Text variant="footnote" color={systemColors.secondaryLabel} numberOfLines={1}>
-        {buildLabel}
-      </Text>
-    </View>
+    <Text variant="footnote" color={systemColors.secondaryLabel}>
+      {buildLabel}
+    </Text>
   );
 });
 
 const CategoryChip = memo(function CategoryChip({ category }: { category: ChangelogCategory }) {
   const { t } = useTranslation('common');
-  const { systemColors, brandColors } = useTheme();
-  const tint =
-    category === 'new' ? brandColors.primaryFill : category === 'improved' ? brandColors.warning : brandColors.success;
-  return (
-    <View style={[styles.categoryChip, { backgroundColor: systemColors.fill }]}>
-      <Icon name={CATEGORY_ICONS[category]} size={12} color={tint} />
-      <Text variant="caption2" color={tint} style={styles.categoryChipLabel}>
-        {t(`mobile.changelog.category.${category}`)}
-      </Text>
-    </View>
-  );
+  const tone = changelogCategoryTone(category);
+  return <StatusPill tone={tone} icon={CATEGORY_ICONS[category]} label={t(`mobile.changelog.category.${category}`)} />;
 });
 
 type ChangelogEntryRowProps = { entry: ChangelogEntry; onPress: (entry: ChangelogEntry) => void };
@@ -99,12 +100,12 @@ const ChangelogEntryRow = memo(function ChangelogEntryRow({ entry, onPress }: Ch
     <View style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}>
       <View style={styles.cardHeader}>
         <CategoryChip category={entry.category} />
-        <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={1} style={styles.cardDate}>
+        <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={1} style={styles.cardDate}>
           {formatRelativeTime(entry.mergedAt)}
         </Text>
         {pressable ? <Icon name="chevron.right" size={14} color={systemColors.tertiaryLabel} /> : null}
       </View>
-      <Text variant="body" style={styles.cardTitle}>
+      <Text emphasized variant="body" style={styles.cardTitle}>
         {entry.title}
       </Text>
       {entry.body ? (
@@ -152,7 +153,7 @@ const NativeReleaseRow = memo(function NativeReleaseRow({ release }: { release: 
         <Text variant="footnote" color={brandColors.primary} style={styles.nativeTitle}>
           {t('mobile.changelog.nativeRelease.title')}
         </Text>
-        <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={1} style={styles.nativeDate}>
+        <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={1} style={styles.nativeDate}>
           {formatRelativeTime(release.date)}
         </Text>
       </View>
@@ -168,37 +169,55 @@ type UpdateStatus = 'idle' | 'checking' | 'downloading';
 // Pull an OTA on demand: check → download → "restart now?" → reload. Mirrors the
 // BranchSwitcherScreen flow. Hidden when Updates.isEnabled is false (dev / Expo Go),
 // where checkForUpdateAsync throws.
-const CheckForUpdatesButton = memo(function CheckForUpdatesButton() {
+const CheckForUpdatesButton = memo(function CheckForUpdatesButton({
+  disabled,
+  onBusyChange,
+}: {
+  disabled: boolean;
+  onBusyChange: (busy: boolean) => void;
+}) {
   const { t } = useTranslation('common');
   const confirm = useConfirm();
   const [status, setStatus] = useState<UpdateStatus>('idle');
+  const inFlight = useRef(false);
 
   const handlePress = useCallback(async () => {
-    try {
-      setStatus('checking');
-      const check = await Updates.checkForUpdateAsync();
-      if (!check.isAvailable) {
-        setStatus('idle');
-        Alert.alert(t('mobile.changelog.upToDate.title'), t('mobile.changelog.upToDate.message'));
-        return;
-      }
-      setStatus('downloading');
-      await Updates.fetchUpdateAsync();
-      setStatus('idle');
-      const confirmed = await confirm({
-        title: t('mobile.changelog.updateReady.title'),
-        message: t('mobile.changelog.updateReady.message'),
-        confirmLabel: t('mobile.changelog.updateReady.restart'),
-        cancelLabel: t('mobile.changelog.updateReady.later'),
-      });
-      if (confirmed) await Updates.reloadAsync();
-    } catch (error) {
-      setStatus('idle');
+    if (disabled || inFlight.current) return;
+    inFlight.current = true;
+    onBusyChange(true);
+    setStatus('checking');
+    const { result, error } = await performChangelogUpdate(
+      {
+        runOperation: runOtaOperation,
+        waitForIdle: waitForOtaUpdatesIdle,
+        checkForUpdate: () => Updates.checkForUpdateAsync(),
+        fetchUpdate: fetchOwnedOtaUpdate,
+        captureReloadReceipt: captureOtaReloadReceipt,
+        waitForReloadReceipt: waitForOtaReloadReceipt,
+        isReloadReceiptCurrent: isOtaReloadReceiptCurrent,
+        reload: () => Updates.reloadAsync(),
+        confirm: () =>
+          confirm({
+            title: t('mobile.changelog.updateReady.title'),
+            message: t('mobile.changelog.updateReady.message'),
+            confirmLabel: t('mobile.changelog.updateReady.restart'),
+            cancelLabel: t('mobile.changelog.updateReady.later'),
+          }),
+      },
+      { onPhase: setStatus },
+    );
+    inFlight.current = false;
+    onBusyChange(false);
+    if (result === 'up-to-date') {
+      Alert.alert(t('mobile.changelog.upToDate.title'), t('mobile.changelog.upToDate.message'));
+    } else if (result === 'failed' || result === 'stale') {
       hapticError();
-      reportError(error);
+      if (error) reportError(error);
+      // Reuse translated retry guidance when another operation replaced the
+      // receipt while the restart confirmation was open.
       Alert.alert(t('mobile.changelog.checkError.title'), t('mobile.changelog.checkError.message'));
     }
-  }, [confirm, t]);
+  }, [confirm, disabled, onBusyChange, t]);
 
   if (!Updates.isEnabled) return null;
 
@@ -217,7 +236,7 @@ const CheckForUpdatesButton = memo(function CheckForUpdatesButton() {
       size="small"
       icon="refresh"
       loading={status !== 'idle'}
-      disabled={status !== 'idle'}
+      disabled={disabled || status !== 'idle'}
       style={styles.checkButton}
     />
   );
@@ -262,45 +281,44 @@ export default function ChangelogScreen() {
           glass contentStyle is transparent and this screen is pushed over the
           user-drawer's transparentModal, so an unpainted scene shows the scrim. */}
       <View style={[styles.flex, { backgroundColor: systemColors.groupedBackground }]}>
-        {timeline.length === 0 ? (
-          <View style={styles.emptyWrap}>
-            <CurrentBuildChip />
-            <CheckForUpdatesButton />
+        <FlashList
+          data={timeline}
+          renderItem={renderItem}
+          keyExtractor={keyExtractor}
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerStyle={{
+            paddingHorizontal: spacing[4],
+            paddingTop: spacing[4],
+            paddingBottom: bottomChrome.scrollBottomPadding + spacing[6],
+          }}
+          ListHeaderComponent={
+            <View style={styles.listHeader}>
+              <AppUpdatesCard
+                buildDetails={<CurrentBuildDetails />}
+                checkForUpdates={(disabled, onBusyChange) => (
+                  <CheckForUpdatesButton disabled={disabled} onBusyChange={onBusyChange} />
+                )}
+              />
+              <Text emphasized variant="footnote" color={systemColors.secondaryLabel} style={styles.intro}>
+                {t('mobile.changelog.intro')}
+              </Text>
+              {/* 2.7: climbs open as a preview. Pinned for the same reason,
+                    translated; it goes on dismiss or 30 days after it first
+                    showed. */}
+              <PreviewFirstSpotlightCard style={styles.spotlight} />
+              {/* Pinned above the generated timeline — see OfflineSpotlightCard
+                    for why it isn't a changelog entry. Renders itself away once
+                    the user has a board offline. */}
+              <OfflineSpotlightCard style={styles.spotlight} />
+            </View>
+          }
+          ListEmptyComponent={
             <Text variant="body" color={systemColors.secondaryLabel} style={styles.emptyText}>
               {t('mobile.changelog.empty')}
             </Text>
-          </View>
-        ) : (
-          // FlashList v2 self-measures rows — `estimatedItemSize` was removed and
-          // no longer typechecks (see licenses.tsx for the same note).
-          <FlashList
-            data={timeline}
-            renderItem={renderItem}
-            keyExtractor={keyExtractor}
-            contentInsetAdjustmentBehavior="automatic"
-            contentContainerStyle={{
-              paddingHorizontal: spacing[4],
-              paddingTop: spacing[4],
-              paddingBottom: bottomChrome.scrollBottomPadding + spacing[6],
-            }}
-            ListHeaderComponent={
-              <View style={styles.listHeader}>
-                <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.intro}>
-                  {t('mobile.changelog.intro')}
-                </Text>
-                {/* Pinned above the generated timeline — see OfflineSpotlightCard
-                    for why it isn't a changelog entry. Renders itself away once
-                    the user has a board offline. */}
-                <OfflineSpotlightCard style={styles.spotlight} />
-                <View style={styles.headerMeta}>
-                  <CurrentBuildChip />
-                  <CheckForUpdatesButton />
-                </View>
-              </View>
-            }
-            ItemSeparatorComponent={Separator}
-          />
-        )}
+          }
+          ItemSeparatorComponent={Separator}
+        />
       </View>
     </>
   );
@@ -321,26 +339,11 @@ const styles = StyleSheet.create({
     gap: spacing[3],
     marginBottom: spacing[4],
   },
-  headerMeta: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: spacing[3],
-  },
   checkButton: {
     alignSelf: 'flex-start',
   },
   intro: {
     lineHeight: 20,
-  },
-  buildChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    alignSelf: 'flex-start',
-    gap: spacing[2],
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[2],
-    borderRadius: borderRadius.full,
   },
   separator: {
     height: spacing[3],
@@ -358,20 +361,7 @@ const styles = StyleSheet.create({
   cardDate: {
     flex: 1,
   },
-  categoryChip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[1],
-    paddingHorizontal: spacing[2],
-    paddingVertical: spacing[1],
-    borderRadius: borderRadius.full,
-  },
-  categoryChipLabel: {
-    fontWeight: '700',
-    textTransform: 'uppercase',
-  },
   cardTitle: {
-    fontWeight: '600',
     lineHeight: 22,
   },
   cardBody: {
@@ -395,13 +385,6 @@ const styles = StyleSheet.create({
   nativeDate: {
     flex: 1,
     textAlign: 'right',
-  },
-  emptyWrap: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing[4],
-    paddingHorizontal: spacing[6],
   },
   emptyText: {
     textAlign: 'center',

@@ -20,7 +20,14 @@ const transport = vi.hoisted(() => ({
   ),
   reportClimb: vi.fn(async () => true),
 }));
+const credentialScope = vi.hoisted(() => ({ generation: 0 }));
+vi.mock('../../lib/auth-store', () => ({
+  captureAuthCredentialGeneration: () => credentialScope.generation,
+  isAuthCredentialGenerationCurrent: (generation: number) => generation === credentialScope.generation,
+  subscribeAuthCredentialGenerationChanges: () => () => {},
+}));
 const sharedProvider = vi.hoisted(() => ({
+  lastBoardUuid: undefined as string | null | undefined,
   lastBoardId: undefined as number | null | undefined,
   lastClient: undefined as unknown,
   lastOnCatchUp: undefined as ((info: { reason: string; recoveredThroughSeqDelta: number }) => void) | undefined,
@@ -37,7 +44,7 @@ const disambiguationSheet = vi.hoisted(() => ({
   props: null as {
     visible: boolean;
     candidates: BoardCandidate[];
-    onPick: (boardId: number) => void;
+    onPick: (boardId: number) => Promise<void>;
     onCancel: () => void;
   } | null,
 }));
@@ -82,6 +89,21 @@ vi.mock('../../lib/board-presence/board-presence-client', () => ({
 
 vi.mock('../../lib/graphql/ws-client', () => ({ getWsClient: () => ({}) }));
 
+// `board(uuid)`: the read a uuid binding uses to refresh a stored uuid that a
+// merge may have redirected (#6392). It answers with the canonical board.
+const boardRead = vi.hoisted(() => ({
+  fetchBoardByUuid: vi.fn(async (_boardUuid: string): Promise<{ uuid: string } | null> => null),
+}));
+vi.mock('../../lib/graphql/hooks/fetch-board-by-uuid', () => ({ fetchBoardByUuid: boardRead.fetchBoardByUuid }));
+
+// The climber's stored selection. A serial connect reads its own numeric id to
+// tell a held uuid that a merge redirected (#6562). Null by default, so every
+// other test keeps the plain resolve check.
+const activeBoard = vi.hoisted(() => ({
+  board: null as { uuid: string; boardId?: number | null } | null,
+}));
+vi.mock('../../lib/graphql/use-active-board', () => ({ useActiveBoard: () => ({ data: activeBoard.board }) }));
+
 vi.mock('../../lib/connectivity/use-connectivity', () => ({
   selectOfflineMode: (snapshot: { offlineMode: boolean }) => snapshot.offlineMode,
   useConnectivityField: (select: (snapshot: { offlineMode: boolean }) => boolean) =>
@@ -102,16 +124,19 @@ vi.mock('../../components/board-discovery/BoardDisambiguationSheet', () => ({
 vi.mock('@boardsesh/board-presence-react', () => ({
   BoardPresenceProvider: ({
     boardId,
+    boardUuid,
     client,
     onCatchUp,
     children,
   }: {
     boardId: number | null;
+    boardUuid?: string | null;
     client: unknown;
     onCatchUp?: (info: { reason: string; recoveredThroughSeqDelta: number }) => void;
     children: ReactNode;
   }) => {
     sharedProvider.lastBoardId = boardId;
+    sharedProvider.lastBoardUuid = boardUuid;
     sharedProvider.lastClient = client;
     sharedProvider.lastOnCatchUp = onCatchUp;
     return createElement('div', { 'data-board-id': String(boardId) }, children);
@@ -168,6 +193,8 @@ describe('MobileBoardPresenceProvider', () => {
     } as unknown as ResolvedBoard);
     transport.reportClimb.mockClear();
     transport.reportClimb.mockResolvedValue(true);
+    boardRead.fetchBoardByUuid.mockReset();
+    boardRead.fetchBoardByUuid.mockResolvedValue(null);
     sharedProvider.lastBoardId = undefined;
     sharedProvider.lastClient = undefined;
     sharedProvider.lastOnCatchUp = undefined;
@@ -177,6 +204,8 @@ describe('MobileBoardPresenceProvider', () => {
     appState.addEventListener.mockClear();
     disambiguationSheet.props = null;
     capturedControls = null;
+    credentialScope.generation = 0;
+    activeBoard.board = null;
   });
 
   it('falls back to inert disabled controls when used outside the provider', () => {
@@ -324,7 +353,7 @@ describe('MobileBoardPresenceProvider', () => {
     let firstBinding: BoardBindingIdentity | null | undefined;
     let reconnectBinding: BoardBindingIdentity | null | undefined;
     await act(async () => {
-      disambiguationSheet.props?.onPick(2);
+      await disambiguationSheet.props?.onPick(2);
       [firstBinding, reconnectBinding] = await Promise.all([firstPromise, reconnectPromise]);
     });
 
@@ -401,7 +430,7 @@ describe('MobileBoardPresenceProvider', () => {
     });
 
     expect(serialBinding).toBeNull();
-    expect(uuidBinding).toEqual({ boardId: 44 });
+    expect(uuidBinding).toEqual({ boardId: 44, boardUuid: '11111111-1111-4111-8111-111111111111' });
     expect(disambiguationSheet.props?.visible).toBe(false);
     expect(sharedProvider.lastBoardId).toBe(44);
   });
@@ -464,7 +493,7 @@ describe('MobileBoardPresenceProvider', () => {
       cachedBinding = await capturedControls?.resolveAndBindBoardByUuid(args);
     });
 
-    expect(cachedBinding).toEqual({ boardId: 44 });
+    expect(cachedBinding).toEqual({ boardId: 44, boardUuid: '11111111-1111-4111-8111-111111111111' });
     expect(transport.resolveBoardForUuid).toHaveBeenCalledTimes(1);
   });
 
@@ -500,8 +529,8 @@ describe('MobileBoardPresenceProvider', () => {
       resolveBoard?.({ boardId: 44, boardName: 'Named Board' } as unknown as ResolvedBoard);
       [firstResult, secondResult] = await Promise.all([firstPromise, secondPromise]);
     });
-    expect(firstResult).toEqual({ boardId: 44 });
-    expect(secondResult).toEqual({ boardId: 44 });
+    expect(firstResult).toEqual({ boardId: 44, boardUuid: '11111111-1111-4111-8111-111111111111' });
+    expect(secondResult).toEqual({ boardId: 44, boardUuid: '11111111-1111-4111-8111-111111111111' });
     await waitFor(() => {
       expect(sharedProvider.lastBoardId).toBe(44);
     });
@@ -800,5 +829,609 @@ describe('MobileBoardPresenceProvider', () => {
     rerender(createElement(MobileBoardPresenceProvider, null, createElement(Probe)));
 
     expect(sharedProvider.lastClient).not.toBeNull();
+  });
+  it('retains a selected serial UUID only after its returned numeric channel matches', async () => {
+    transport.resolveBoardCandidatesForSerial.mockResolvedValue({ board: { boardId: 42 }, candidates: null });
+    transport.resolveBoardForUuid.mockResolvedValue({ boardId: 42 } as ResolvedBoard);
+    renderProvider();
+    const args = {
+      serial: 'serial',
+      boardType: 'kilter',
+      layoutId: 1,
+      sizeId: 10,
+      setIds: '1,2',
+      selectedBoardUuid: 'held-link',
+    };
+    await act(async () => {
+      await capturedControls?.resolveAndBindBoard(args);
+    });
+    expect(sharedProvider.lastBoardId).toBe(42);
+    expect(sharedProvider.lastBoardUuid).toBe('held-link');
+    transport.resolveBoardForUuid.mockResolvedValue({ boardId: 99 } as ResolvedBoard);
+    await act(async () => {
+      await capturedControls?.resolveAndBindBoard({ ...args, serial: 'other' });
+    });
+    expect(sharedProvider.lastBoardId).toBe(42);
+    expect(sharedProvider.lastBoardUuid).toBeNull();
+  });
+
+  it('does not retain an inferred serial UUID or install a UUID result from retired credentials', async () => {
+    renderProvider();
+    await act(async () => {
+      await capturedControls?.resolveAndBindBoard({
+        serial: 'serial',
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+      });
+    });
+    expect(sharedProvider.lastBoardUuid).toBeNull();
+    let resolveUuid!: (board: ResolvedBoard) => void;
+    transport.resolveBoardForUuid.mockImplementationOnce(
+      () =>
+        new Promise<ResolvedBoard>((resolve) => {
+          resolveUuid = resolve;
+        }),
+    );
+    let bindingPromise: Promise<BoardBindingIdentity | null> | undefined;
+    act(() => {
+      bindingPromise = capturedControls?.resolveAndBindBoardByUuid({ boardUuid: 'held-link' });
+    });
+    transport.resolveBoardForUuid.mockResolvedValue({ boardId: 46 } as ResolvedBoard);
+    credentialScope.generation += 1;
+    let retiredBinding: BoardBindingIdentity | null | undefined;
+    await act(async () => {
+      resolveUuid({ boardId: 44 } as ResolvedBoard);
+      retiredBinding = await bindingPromise;
+    });
+    expect(retiredBinding).toBeNull();
+    await waitFor(() => expect(sharedProvider.lastBoardId).toBe(46));
+    expect(sharedProvider.lastBoardUuid).toBe('held-link');
+  });
+
+  const twoCandidates = {
+    board: null,
+    candidates: [
+      {
+        boardId: 1,
+        boardUuid: 'held-home',
+        boardName: 'Home',
+        boardType: 'kilter',
+        isOwnedByMe: true,
+        isPublic: false,
+      },
+      {
+        boardId: 2,
+        boardUuid: 'candidate-gym',
+        boardName: 'Gym',
+        boardType: 'kilter',
+        isOwnedByMe: false,
+        isPublic: true,
+      },
+    ],
+  };
+
+  it('binds a picked serial candidate by its id alone, never with the candidate list uuid', async () => {
+    transport.resolveBoardCandidatesForSerial.mockResolvedValue(twoCandidates);
+    transport.chooseBoardForSerial.mockResolvedValue({ boardId: 2 } as ResolvedBoard);
+    renderProvider();
+    let binding: Promise<BoardBindingIdentity | null> | undefined;
+    act(() => {
+      binding = capturedControls?.resolveAndBindBoard({
+        serial: 'shared',
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+      });
+    });
+    await waitFor(() => expect(disambiguationSheet.props?.visible).toBe(true));
+    let settled: BoardBindingIdentity | null | undefined;
+    await act(async () => {
+      await disambiguationSheet.props?.onPick(2);
+      settled = await binding;
+    });
+    expect(sharedProvider.lastBoardId).toBe(2);
+    // A serial is not a board's link: the candidate's uuid never reaches presence.
+    expect(sharedProvider.lastBoardUuid).toBeNull();
+    expect(settled).toEqual({ boardId: 2 });
+    expect(transport.resolveBoardForUuid).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['the chosen board', 2, 'held-link'],
+    ['another board', 7, null],
+  ] as const)(
+    'pairs a pick with a uuid the climber already held only when it verifies as %s',
+    async (_case, verifiedBoardId, expectedUuid) => {
+      transport.resolveBoardCandidatesForSerial.mockResolvedValue(twoCandidates);
+      transport.chooseBoardForSerial.mockResolvedValue({ boardId: 2 } as ResolvedBoard);
+      transport.resolveBoardForUuid.mockResolvedValue({ boardId: verifiedBoardId } as ResolvedBoard);
+      renderProvider();
+      let binding: Promise<BoardBindingIdentity | null> | undefined;
+      act(() => {
+        binding = capturedControls?.resolveAndBindBoard({
+          serial: 'shared',
+          boardType: 'kilter',
+          layoutId: 1,
+          sizeId: 10,
+          setIds: '1,2',
+          selectedBoardUuid: 'held-link',
+        });
+      });
+      await waitFor(() => expect(disambiguationSheet.props?.visible).toBe(true));
+      await act(async () => {
+        await disambiguationSheet.props?.onPick(2);
+        await binding;
+      });
+      expect(transport.resolveBoardForUuid).toHaveBeenLastCalledWith({ boardUuid: 'held-link' });
+      expect(sharedProvider.lastBoardId).toBe(2);
+      expect(sharedProvider.lastBoardUuid).toBe(expectedUuid);
+    },
+  );
+
+  it('automatically revalidates the settled UUID binding after credential rotation without changing callbacks', async () => {
+    const view = renderProvider();
+    await act(async () => {
+      await capturedControls?.resolveAndBindBoardByUuid({ boardUuid: 'held-link' });
+    });
+    const resolveCallback = capturedControls?.resolveAndBindBoardByUuid;
+    const retiredReadClient = sharedProvider.lastClient;
+    transport.resolveBoardForUuid.mockResolvedValue({ boardId: 45 } as ResolvedBoard);
+    credentialScope.generation += 1;
+    view.rerender(createElement(MobileBoardPresenceProvider, null, createElement(Probe)));
+    await waitFor(() => expect(sharedProvider.lastBoardId).toBe(45));
+    expect(transport.resolveBoardForUuid).toHaveBeenLastCalledWith({ boardUuid: 'held-link' });
+    expect(sharedProvider.lastBoardUuid).toBe('held-link');
+    expect(capturedControls?.resolveAndBindBoardByUuid).toBe(resolveCallback);
+    expect(sharedProvider.lastClient).not.toBe(retiredReadClient);
+  });
+
+  it('retires automatic revalidation across another credential change and a wall switch', async () => {
+    const view = renderProvider();
+    await act(async () => {
+      await capturedControls?.resolveAndBindBoardByUuid({ boardUuid: 'old-wall' });
+    });
+    let finishRotation!: (board: ResolvedBoard) => void;
+    transport.resolveBoardForUuid.mockImplementationOnce(
+      () =>
+        new Promise<ResolvedBoard>((resolve) => {
+          finishRotation = resolve;
+        }),
+    );
+    credentialScope.generation += 1;
+    view.rerender(createElement(MobileBoardPresenceProvider, null, createElement(Probe)));
+    expect(sharedProvider.lastBoardId).toBeNull();
+    credentialScope.generation += 1;
+    transport.resolveBoardForUuid.mockResolvedValue({ boardId: 46 } as ResolvedBoard);
+    view.rerender(createElement(MobileBoardPresenceProvider, null, createElement(Probe)));
+    await act(async () => {
+      await capturedControls?.resolveAndBindBoardByUuid({ boardUuid: 'new-wall' });
+    });
+    await act(async () => {
+      finishRotation({ boardId: 99 } as ResolvedBoard);
+      await Promise.resolve();
+    });
+    expect(sharedProvider.lastBoardId).toBe(46);
+    expect(sharedProvider.lastBoardUuid).toBe('new-wall');
+  });
+
+  it('refuses a retired picker callback before the credential-change effect can clean it up', async () => {
+    transport.resolveBoardCandidatesForSerial.mockResolvedValue({
+      board: null,
+      candidates: [
+        {
+          boardId: 1,
+          boardUuid: 'held-home',
+          boardName: 'Home',
+          boardType: 'kilter',
+          isOwnedByMe: true,
+          isPublic: false,
+        },
+      ],
+    });
+    renderProvider();
+    act(() => {
+      void capturedControls?.resolveAndBindBoard({
+        serial: 'shared',
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 10,
+        setIds: '1,2',
+      });
+    });
+    await waitFor(() => expect(disambiguationSheet.props?.visible).toBe(true));
+    const retiredPick = disambiguationSheet.props!.onPick;
+    credentialScope.generation += 1;
+    await act(async () => {
+      await retiredPick(1);
+    });
+    expect(transport.chooseBoardForSerial).not.toHaveBeenCalled();
+  });
+
+  // #6392: the identity a uuid binding pairs with its numeric id.
+  describe('uuid binding identity', () => {
+    const LOSER = '11111111-1111-4111-8111-111111111111';
+    const SURVIVOR = '22222222-2222-4222-8222-222222222222';
+    const resolvedByUuid = (boardIds: Record<string, number>) =>
+      transport.resolveBoardForUuid.mockImplementation(async (args: unknown) => {
+        const { boardUuid } = args as { boardUuid: string };
+        if (boardIds[boardUuid] === undefined) throw new Error('Board not found');
+        return { boardId: boardIds[boardUuid], boardName: 'Wall' } as unknown as ResolvedBoard;
+      });
+
+    async function bind(args: { boardUuid: string; boardId?: number | null }) {
+      let binding: BoardBindingIdentity | null | undefined;
+      await act(async () => {
+        binding = await capturedControls?.resolveAndBindBoardByUuid(args);
+      });
+      return binding;
+    }
+
+    it('binds nothing for an empty uuid and sends no resolver request', async () => {
+      renderProvider();
+
+      expect(await bind({ boardUuid: '' })).toBeNull();
+      expect(transport.resolveBoardForUuid).not.toHaveBeenCalled();
+      expect(sharedProvider.lastBoardUuid).toBeNull();
+    });
+
+    it("pairs the stored uuid when the stored numeric id is the resolver's answer", async () => {
+      resolvedByUuid({ [LOSER]: 12 });
+      renderProvider();
+
+      expect(await bind({ boardUuid: LOSER, boardId: 12 })).toEqual({ boardId: 12, boardUuid: LOSER });
+      expect(boardRead.fetchBoardByUuid).not.toHaveBeenCalled();
+      expect(transport.resolveBoardForUuid).toHaveBeenCalledWith({ boardUuid: LOSER });
+    });
+
+    it('refreshes a stale cached selection through board(uuid) before pairing its uuid', async () => {
+      resolvedByUuid({ [LOSER]: 90 });
+      boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: LOSER });
+      renderProvider();
+
+      expect(await bind({ boardUuid: LOSER, boardId: 12 })).toEqual({ boardId: 90, boardUuid: LOSER });
+      expect(boardRead.fetchBoardByUuid).toHaveBeenCalledWith(LOSER);
+    });
+
+    it("follows a same-owner merge redirect to the survivor's uuid, never pairing the loser's", async () => {
+      resolvedByUuid({ [LOSER]: 90, [SURVIVOR]: 90 });
+      boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: SURVIVOR });
+      renderProvider();
+
+      expect(await bind({ boardUuid: LOSER, boardId: 12 })).toEqual({ boardId: 90, boardUuid: SURVIVOR });
+      // The refresh asks about the uuid the climber held; the survivor's uuid
+      // comes only from that answer.
+      expect(boardRead.fetchBoardByUuid.mock.calls).toEqual([[LOSER]]);
+      expect(transport.resolveBoardForUuid).toHaveBeenLastCalledWith({ boardUuid: SURVIVOR });
+      await waitFor(() => expect(sharedProvider.lastBoardUuid).toBe(SURVIVOR));
+    });
+
+    it('binds the numeric id alone when board(uuid) withholds a foreign-owner survivor', async () => {
+      resolvedByUuid({ [LOSER]: 90 });
+      boardRead.fetchBoardByUuid.mockResolvedValue(null);
+      renderProvider();
+
+      expect(await bind({ boardUuid: LOSER, boardId: 12 })).toEqual({ boardId: 90 });
+      await waitFor(() => expect(sharedProvider.lastBoardId).toBe(90));
+      expect(sharedProvider.lastBoardUuid).toBeNull();
+    });
+
+    it('binds nothing when the resolver refuses a foreign-owner merge', async () => {
+      resolvedByUuid({});
+      renderProvider();
+
+      expect(await bind({ boardUuid: LOSER, boardId: 12 })).toBeNull();
+      expect(sharedProvider.lastBoardId).toBeNull();
+      expect(sharedProvider.lastBoardUuid).toBeNull();
+    });
+
+    it('never pairs a survivor uuid that resolves to another numeric id', async () => {
+      resolvedByUuid({ [LOSER]: 90, [SURVIVOR]: 91 });
+      boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: SURVIVOR });
+      renderProvider();
+
+      expect(await bind({ boardUuid: LOSER, boardId: 12 })).toEqual({ boardId: 90 });
+    });
+
+    it('binds the numeric id alone, with a warning, when the refresh fails', async () => {
+      const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      resolvedByUuid({ [LOSER]: 90 });
+      boardRead.fetchBoardByUuid.mockRejectedValue(new Error('offline'));
+      renderProvider();
+
+      try {
+        expect(await bind({ boardUuid: LOSER, boardId: 12 })).toEqual({ boardId: 90 });
+        expect(consoleWarn).toHaveBeenCalledWith(
+          expect.stringContaining('[board-presence] merged board uuid refresh failed'),
+          expect.any(Error),
+        );
+      } finally {
+        consoleWarn.mockRestore();
+      }
+    });
+
+    // A switch or a sign-out during the first round trip retires the binding.
+    // Its follow-up reads must not go out: the second resolve stamps presence
+    // membership on the server under whoever is signed in by then.
+    function deferFirstResolve() {
+      let finish!: (board: ResolvedBoard) => void;
+      transport.resolveBoardForUuid.mockImplementationOnce(
+        () =>
+          new Promise<ResolvedBoard>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      return (boardId: number) => finish({ boardId, boardName: 'Wall' } as unknown as ResolvedBoard);
+    }
+
+    it('sends no board(uuid) read for a binding a sign-out retired mid-flight', async () => {
+      const finishFirstResolve = deferFirstResolve();
+      boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: SURVIVOR });
+      renderProvider();
+
+      let binding: Promise<BoardBindingIdentity | null> | undefined;
+      act(() => {
+        binding = capturedControls?.resolveAndBindBoardByUuid({ boardUuid: LOSER, boardId: 12 });
+      });
+      credentialScope.generation += 1;
+      await act(async () => {
+        finishFirstResolve(90);
+        expect(await binding).toBeNull();
+      });
+
+      expect(boardRead.fetchBoardByUuid).not.toHaveBeenCalled();
+      expect(transport.resolveBoardForUuid).toHaveBeenCalledTimes(1);
+    });
+
+    it('sends no board(uuid) read for a binding a board switch retired mid-flight', async () => {
+      const finishFirstResolve = deferFirstResolve();
+      boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: SURVIVOR });
+      renderProvider();
+
+      act(() => {
+        void capturedControls?.resolveAndBindBoardByUuid({ boardUuid: LOSER, boardId: 12 });
+      });
+      expect(await bind({ boardUuid: SURVIVOR })).toEqual({ boardId: 44, boardUuid: SURVIVOR });
+      await act(async () => {
+        finishFirstResolve(90);
+        await Promise.resolve();
+      });
+
+      expect(boardRead.fetchBoardByUuid).not.toHaveBeenCalled();
+      expect(sharedProvider.lastBoardId).toBe(44);
+    });
+
+    it('sends no second resolve when a sign-out lands during board(uuid)', async () => {
+      resolvedByUuid({ [LOSER]: 90, [SURVIVOR]: 90 });
+      let finishBoardRead!: (board: { uuid: string } | null) => void;
+      boardRead.fetchBoardByUuid.mockImplementationOnce(
+        () =>
+          new Promise<{ uuid: string } | null>((resolve) => {
+            finishBoardRead = resolve;
+          }),
+      );
+      renderProvider();
+
+      let binding: Promise<BoardBindingIdentity | null> | undefined;
+      act(() => {
+        binding = capturedControls?.resolveAndBindBoardByUuid({ boardUuid: LOSER, boardId: 12 });
+      });
+      await waitFor(() => expect(boardRead.fetchBoardByUuid).toHaveBeenCalledWith(LOSER));
+      credentialScope.generation += 1;
+      await act(async () => {
+        finishBoardRead({ uuid: SURVIVOR });
+        expect(await binding).toBeNull();
+      });
+
+      expect(transport.resolveBoardForUuid).not.toHaveBeenCalledWith({ boardUuid: SURVIVOR });
+      expect(sharedProvider.lastBoardUuid).toBeNull();
+    });
+  });
+
+  // #6562: the uuid a serial binding pairs. The connect holds the selected
+  // board's uuid; the resolver follows a merged-away uuid to the survivor's id,
+  // so only the selection's own numeric id tells the loser apart.
+  describe('serial binding identity', () => {
+    const LOSER = '11111111-1111-4111-8111-111111111111';
+    const SURVIVOR = '22222222-2222-4222-8222-222222222222';
+    const BOUND = 90;
+    const connectArgs = {
+      serial: 'serial',
+      boardType: 'kilter',
+      layoutId: 1,
+      sizeId: 10,
+      setIds: '1,2',
+      selectedBoardUuid: LOSER,
+    };
+    const resolvedByUuid = (boardIds: Record<string, number>) =>
+      transport.resolveBoardForUuid.mockImplementation(async (args: unknown) => {
+        const { boardUuid } = args as { boardUuid: string };
+        if (boardIds[boardUuid] === undefined) throw new Error('Board not found');
+        return { boardId: boardIds[boardUuid], boardName: 'Wall' } as unknown as ResolvedBoard;
+      });
+
+    type ConnectPath = 'single board' | 'disambiguation';
+    // The serial names one board, or several and the climber picks `BOUND`.
+    function arrangeSerial(path: ConnectPath) {
+      if (path === 'single board') {
+        transport.resolveBoardCandidatesForSerial.mockResolvedValue({ board: { boardId: BOUND }, candidates: null });
+        return;
+      }
+      transport.resolveBoardCandidatesForSerial.mockResolvedValue({
+        board: null,
+        candidates: [
+          { boardId: BOUND, boardUuid: '', boardName: 'Home', boardType: 'kilter', isOwnedByMe: true, isPublic: false },
+          { boardId: 7, boardUuid: '', boardName: 'Gym', boardType: 'kilter', isOwnedByMe: false, isPublic: true },
+        ],
+      });
+      transport.chooseBoardForSerial.mockResolvedValue({ boardId: BOUND } as ResolvedBoard);
+    }
+
+    // Starts the connect and, on the disambiguation path, opens the picker and
+    // starts the pick. The binding's promise comes back wrapped, so awaiting
+    // this does not also wait for the binding to settle.
+    async function startConnect(path: ConnectPath) {
+      let binding: Promise<BoardBindingIdentity | null> | undefined;
+      act(() => {
+        binding = capturedControls?.resolveAndBindBoard(connectArgs);
+      });
+      if (path === 'disambiguation') {
+        await waitFor(() => expect(disambiguationSheet.props?.visible).toBe(true));
+        act(() => {
+          void disambiguationSheet.props?.onPick(BOUND);
+        });
+      }
+      return { binding };
+    }
+
+    async function connect(path: ConnectPath) {
+      const { binding } = await startConnect(path);
+      let settled: BoardBindingIdentity | null | undefined;
+      await act(async () => {
+        settled = await binding;
+      });
+      return settled;
+    }
+
+    describe.each<ConnectPath>(['single board', 'disambiguation'])('%s', (path) => {
+      beforeEach(() => arrangeSerial(path));
+
+      it("binds a same-owner merged loser with the survivor's uuid, never the loser's", async () => {
+        activeBoard.board = { uuid: LOSER, boardId: 12 };
+        resolvedByUuid({ [LOSER]: BOUND, [SURVIVOR]: BOUND });
+        boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: SURVIVOR });
+        renderProvider();
+
+        expect(await connect(path)).toEqual({ boardId: BOUND, boardUuid: SURVIVOR });
+        expect(boardRead.fetchBoardByUuid.mock.calls).toEqual([[LOSER]]);
+        await waitFor(() => expect(sharedProvider.lastBoardUuid).toBe(SURVIVOR));
+      });
+
+      it('binds the numeric id alone when board(uuid) withholds a foreign-owner survivor', async () => {
+        activeBoard.board = { uuid: LOSER, boardId: 12 };
+        resolvedByUuid({ [LOSER]: BOUND });
+        boardRead.fetchBoardByUuid.mockResolvedValue(null);
+        renderProvider();
+
+        expect(await connect(path)).toEqual({ boardId: BOUND });
+        await waitFor(() => expect(sharedProvider.lastBoardId).toBe(BOUND));
+        expect(sharedProvider.lastBoardUuid).toBeNull();
+      });
+
+      it('pairs an unmerged selection with no board(uuid) read', async () => {
+        activeBoard.board = { uuid: LOSER, boardId: BOUND };
+        resolvedByUuid({ [LOSER]: BOUND });
+        renderProvider();
+
+        expect(await connect(path)).toEqual({ boardId: BOUND, boardUuid: LOSER });
+        expect(boardRead.fetchBoardByUuid).not.toHaveBeenCalled();
+      });
+
+      // The snapshot read from disk carries no `boardId` (it is sanitized), so
+      // a selection not yet rewritten in this app run, or one that no longer
+      // names the held uuid, has no numeric id to compare with. It keeps the
+      // plain resolve check until the active-board self-heal swaps it.
+      it.each([
+        ['a stored board without a numeric id', { uuid: LOSER }],
+        ['a selection that names another board', { uuid: SURVIVOR, boardId: 12 }],
+        ['no stored selection', null],
+      ])('keeps the plain resolve check for %s', async (_case, stored) => {
+        activeBoard.board = stored;
+        resolvedByUuid({ [LOSER]: BOUND });
+        renderProvider();
+
+        expect(await connect(path)).toEqual({ boardId: BOUND, boardUuid: LOSER });
+        expect(boardRead.fetchBoardByUuid).not.toHaveBeenCalled();
+      });
+
+      it('sends no board(uuid) read when a sign-out lands during the held-uuid resolve', async () => {
+        activeBoard.board = { uuid: LOSER, boardId: 12 };
+        boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: SURVIVOR });
+        let finishHeldResolve!: (board: ResolvedBoard) => void;
+        transport.resolveBoardForUuid.mockImplementationOnce(
+          () =>
+            new Promise<ResolvedBoard>((resolve) => {
+              finishHeldResolve = resolve;
+            }),
+        );
+        renderProvider();
+
+        const { binding } = await startConnect(path);
+        await waitFor(() => expect(transport.resolveBoardForUuid).toHaveBeenCalledWith({ boardUuid: LOSER }));
+        credentialScope.generation += 1;
+        await act(async () => {
+          finishHeldResolve({ boardId: BOUND } as ResolvedBoard);
+          expect(await binding).toBeNull();
+        });
+
+        expect(boardRead.fetchBoardByUuid).not.toHaveBeenCalled();
+        expect(transport.resolveBoardForUuid).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it('sends no held-uuid resolve when a sign-out lands during the pick', async () => {
+      arrangeSerial('disambiguation');
+      activeBoard.board = { uuid: LOSER, boardId: 12 };
+      let finishChoice!: (board: ResolvedBoard) => void;
+      transport.chooseBoardForSerial.mockImplementationOnce(
+        () =>
+          new Promise<ResolvedBoard>((resolve) => {
+            finishChoice = resolve;
+          }),
+      );
+      renderProvider();
+
+      const { binding } = await startConnect('disambiguation');
+      await waitFor(() => expect(transport.chooseBoardForSerial).toHaveBeenCalled());
+      credentialScope.generation += 1;
+      await act(async () => {
+        finishChoice({ boardId: BOUND } as ResolvedBoard);
+        expect(await binding).toBeNull();
+      });
+
+      expect(transport.resolveBoardForUuid).not.toHaveBeenCalled();
+    });
+
+    // The pick settles the connect's intent, so it compares the numeric id the
+    // selection carried when the connect started, not whatever it holds later.
+    it('checks a pick against the selection id captured when the connect started', async () => {
+      arrangeSerial('disambiguation');
+      activeBoard.board = { uuid: LOSER, boardId: 12 };
+      resolvedByUuid({ [LOSER]: BOUND, [SURVIVOR]: BOUND });
+      boardRead.fetchBoardByUuid.mockResolvedValue({ uuid: SURVIVOR });
+      const { rerender } = renderProvider();
+
+      let binding: Promise<BoardBindingIdentity | null> | undefined;
+      act(() => {
+        binding = capturedControls?.resolveAndBindBoard(connectArgs);
+      });
+      await waitFor(() => expect(disambiguationSheet.props?.visible).toBe(true));
+      // Same uuid, a different numeric id: read at pick time, it would match the
+      // bound board and pair the held loser uuid with no board(uuid) read.
+      activeBoard.board = { uuid: LOSER, boardId: BOUND };
+      rerender(createElement(MobileBoardPresenceProvider, null, createElement(Probe)));
+      let settled: BoardBindingIdentity | null | undefined;
+      await act(async () => {
+        await disambiguationSheet.props?.onPick(BOUND);
+        settled = await binding;
+      });
+
+      expect(settled).toEqual({ boardId: BOUND, boardUuid: SURVIVOR });
+      expect(boardRead.fetchBoardByUuid.mock.calls).toEqual([[LOSER]]);
+    });
+
+    it('reads the selection through a ref, keeping the controls value across a board switch', () => {
+      activeBoard.board = { uuid: LOSER, boardId: 12 };
+      const { rerender } = renderProvider();
+      const controlsBeforeSwitch = capturedControls;
+
+      activeBoard.board = { uuid: SURVIVOR, boardId: BOUND };
+      rerender(createElement(MobileBoardPresenceProvider, null, createElement(Probe)));
+
+      expect(capturedControls).not.toBeNull();
+      expect(capturedControls).toBe(controlsBeforeSwitch);
+    });
   });
 });

@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Pressable, RefreshControl, StyleSheet, View } from 'react-native';
+import { RefreshControl, StyleSheet, View } from 'react-native';
 import { FlashList } from '@shopify/flash-list';
-import { useNavigation } from 'expo-router';
+import { useIsFocused, useNavigation } from 'expo-router';
 import { useTranslation } from 'react-i18next';
-import type { BottomSheet } from '@expo/ui/community/bottom-sheet';
+import type { BottomSheet } from '../sheet-presentation';
 import type { GroupedNotification, SocialEntityType } from '@boardsesh/shared-schema';
 import { Text } from '../Text';
+import { HeaderTrailingButton } from '../HeaderActionButtons';
 import { Icon } from '../Icon';
 import { Button } from '../Button';
 import { ActivityIndicator } from '../ActivityIndicator';
@@ -14,7 +15,9 @@ import { CommentSheet } from '../you/CommentSheet';
 import { notificationClimbRender } from './notification-climb-render';
 import { NotificationRow } from './NotificationRow';
 import { useNotificationNavigation, type OpenCommentThread } from './use-notification-navigation';
+import { useUndoSetupChange } from './use-undo-setup-change';
 import {
+  useAnswerFollowRequest,
   useGroupedNotifications,
   useMarkAllAsRead,
   useUnreadNotificationCount,
@@ -22,7 +25,7 @@ import {
 import { useOfflineQueryState } from '../../hooks/use-offline-query-state';
 import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
 import { useTheme } from '../../providers/theme-provider';
-import { iosSystemColors } from '../../theme/ios-colors';
+import { useDirectorySetupSuggestionsEnabled } from '../../providers/feature-flags-provider';
 import { spacing } from '../../theme/tokens';
 
 // Module-level so the empty-list identity is stable across renders, and hoisted
@@ -32,13 +35,21 @@ const EMPTY_GROUPS: GroupedNotification[] = [];
 const keyExtractor = (group: GroupedNotification) => group.uuid;
 
 /**
- * Two row shapes now share this list: a 44x56 board thumbnail and a 40pt
- * avatar. FlashList recycles a cell's subtree across items, so without this it
+ * Four row shapes share this list: a 44x56 board thumbnail, a 40pt avatar,
+ * a follow request with its Approve / Decline buttons, and a climber's setup
+ * change with its Undo. FlashList recycles a cell's subtree across items, so without this it
  * would hand a thumbnail cell to an avatar row and remount the whole leading
  * slot mid-scroll. Separate types keep a recycling pool per shape — the same
  * thing GymListPanel and LogbookTab do. Hoisted so the prop identity is stable.
  */
-const getItemType = (group: GroupedNotification) => (notificationClimbRender(group) ? 'climb' : 'plain');
+const getItemType = (group: GroupedNotification) =>
+  group.type === 'follow_request'
+    ? 'followRequest'
+    : group.type === 'board_setup_changed_by_climber'
+      ? 'setupChange'
+      : notificationClimbRender(group)
+        ? 'climb'
+        : 'plain';
 
 /** The thread a tapped comment/vote row opens; null while the sheet is closed. */
 type CommentThread = { entityType: SocialEntityType; entityId: string };
@@ -58,6 +69,7 @@ export default function NotificationsScreen() {
   const { systemColors, brandColors } = useTheme();
   const navigation = useNavigation();
   const bottomChrome = useBottomChromeMetrics();
+  const focused = useIsFocused();
 
   // Destructured, not held as `query`: React Query mints a fresh result object
   // on every render, so a callback listing the whole object as a dep gets a new
@@ -74,9 +86,15 @@ export default function NotificationsScreen() {
     isFetchingNextPage,
     fetchNextPage,
     refetch,
-  } = useGroupedNotifications();
+  } = useGroupedNotifications(focused);
   const unreadCount = useUnreadNotificationCount();
   const { mutate: markAllAsRead } = useMarkAllAsRead();
+  // Stable (React Query's mutateAsync), so it can ride into every memoized row.
+  const answerFollowRequest = useAnswerFollowRequest();
+  // Undo on a climber's setup change, behind the same flag as the setup fields.
+  const undoSetupChange = useUndoSetupChange();
+  const setupSuggestionsEnabled = useDirectorySetupSuggestionsEnabled();
+  const onUndoSetupChange = setupSuggestionsEnabled ? undoSetupChange : undefined;
 
   // The comment thread lives here rather than in the navigation hook so that
   // hook keeps returning ONE stable callback: `openCommentThread` is empty-dep
@@ -103,11 +121,12 @@ export default function NotificationsScreen() {
   const showError = !showOffline && isError && groups.length === 0;
 
   const handleMarkAllAsRead = useCallback(() => markAllAsRead(), [markAllAsRead]);
-  const handleRefresh = useCallback(() => void refetch(), [refetch]);
+  const handleRefresh = useCallback(() => void refetch({ cancelRefetch: false }), [refetch]);
 
   const handleEndReached = useCallback(() => {
-    if (hasNextPage && !isFetchingNextPage) void fetchNextPage();
-  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+    if (focused && hasNextPage && !isFetchingNextPage && !isRefetching && fetchStatus === 'idle')
+      void fetchNextPage({ cancelRefetch: false });
+  }, [focused, hasNextPage, isFetchingNextPage, isRefetching, fetchStatus, fetchNextPage]);
 
   // "Mark all as read" lives in the native header rather than the list body, so
   // it stays reachable while the list is scrolled (the `setters` / `zone` filter
@@ -119,23 +138,24 @@ export default function NotificationsScreen() {
     navigation.setOptions({
       headerRight:
         unreadCount > 0 && groups.length > 0
-          ? () => (
-              <Pressable onPress={handleMarkAllAsRead} hitSlop={8} accessibilityRole="button">
-                <Text variant="subheadline" color={brandColors.primary}>
-                  {t('markAllRead')}
-                </Text>
-              </Pressable>
-            )
+          ? () => <HeaderTrailingButton label={t('markAllRead')} onPress={handleMarkAllAsRead} />
           : undefined,
     });
     // `groups.length` is a dep here on purpose. The perf playbook's ban on array
     // `.length` deps is about `renderItem` (it re-renders every row); this effect
     // only re-runs `setOptions` on the native header.
-  }, [navigation, unreadCount, groups.length, handleMarkAllAsRead, brandColors.primary, t]);
+  }, [navigation, unreadCount, groups.length, handleMarkAllAsRead, t]);
 
   const renderItem = useCallback(
-    ({ item }: { item: GroupedNotification }) => <NotificationRow notification={item} onPress={handlePress} />,
-    [handlePress],
+    ({ item }: { item: GroupedNotification }) => (
+      <NotificationRow
+        notification={item}
+        onPress={handlePress}
+        onAnswerFollowRequest={answerFollowRequest}
+        onUndoSetupChange={onUndoSetupChange}
+      />
+    ),
+    [handlePress, answerFollowRequest, onUndoSetupChange],
   );
 
   return (
@@ -161,8 +181,8 @@ export default function NotificationsScreen() {
             </View>
           ) : showError ? (
             <View style={styles.stateBlock}>
-              <Icon name="error" size={32} color={iosSystemColors.systemRed} />
-              <Text variant="headline" style={styles.stateTitle}>
+              <Icon name="error" size={32} color={systemColors.error} />
+              <Text tone="secondary" variant="headline" style={styles.stateTitle}>
                 {t('errors.load')}
               </Text>
               <View style={styles.stateCta}>
@@ -172,7 +192,7 @@ export default function NotificationsScreen() {
           ) : (
             <View style={styles.stateBlock}>
               <Icon name="notification" size={48} color={systemColors.tertiaryLabel} />
-              <Text variant="headline" style={styles.stateTitle}>
+              <Text tone="secondary" variant="headline" style={styles.stateTitle}>
                 {t('empty')}
               </Text>
             </View>
@@ -221,7 +241,6 @@ const styles = StyleSheet.create({
   },
   stateTitle: {
     marginTop: spacing[3],
-    opacity: 0.65,
     textAlign: 'center',
   },
   stateCta: {

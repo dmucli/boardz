@@ -5,7 +5,8 @@ import Button from '@mui/material/Button';
 import MuiLink from '@mui/material/Link';
 import Typography from '@mui/material/Typography';
 import GitHub from '@mui/icons-material/GitHub';
-import { getServerTranslation } from '@/app/lib/i18n/server';
+import { getServerTranslation, getServerTranslationForLocale } from '@/app/lib/i18n/server';
+import type { Locale } from '@/app/lib/i18n/config';
 import LocaleLink from '@/app/components/i18n/locale-link';
 import { PageSection, PageCard, Prose } from '@/app/components/ui/page-shell';
 import { brandCtaSx, brandCtaOutlinedSx } from '@/app/components/ui/brand-cta';
@@ -25,8 +26,7 @@ import styles from './home-support-block.module.css';
  * inventing a parallel set of keys.
  */
 
-// Hoisted: brandCtaSx returns a plain object. The amber glow stays on the
-// hero's one CTA — this block takes the plain filled violet.
+// Hoisted: brandCtaSx returns a plain object.
 const CHIP_IN_SX = brandCtaSx({ size: 'medium' });
 // Its pair-mate. It used to be a bare variant="outlined", so it fell through to
 // MUI's defaults: a 40px button with a half-opacity violet edge, next to a 44px
@@ -38,8 +38,10 @@ const GITHUB_ISSUES_URL = 'https://github.com/boardsesh/boardsesh/issues';
 const LOCALE_CATALOGS_URL = 'https://github.com/boardsesh/boardsesh/tree/main/packages/shared/i18n/locales';
 const DISCORD_URL = 'https://discord.gg/YXA8GsXfQK';
 
-export default async function HomeSupportBlock() {
-  const { t } = await getServerTranslation('marketing');
+export default async function HomeSupportBlock({ locale: explicitLocale }: { locale?: Locale } = {}) {
+  const { t } = explicitLocale
+    ? await getServerTranslationForLocale(explicitLocale, 'marketing')
+    : await getServerTranslation('marketing');
 
   const otherWays = [
     { id: 'bug', href: GITHUB_ISSUES_URL, label: t('support.otherWays.bug.title') },
@@ -56,8 +58,7 @@ export default async function HomeSupportBlock() {
             {t('home.support.eyebrow')}
           </Typography>
           <PageSection title={t('home.support.title')}>
-            <Prose>{t('home.support.p1')}</Prose>
-            <Prose>{t('home.support.p2')}</Prose>
+            <Prose>{t('funding.body')}</Prose>
             <Box className={styles.actions}>
               <Button variant="contained" sx={CHIP_IN_SX} component={LocaleLink} href="/support">
                 {t('home.support.chipIn')}

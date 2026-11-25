@@ -61,6 +61,7 @@ vi.mock('../../../modules/board-renderer/src/index', () => {
 });
 
 import { overlayNameMatchesScope } from '../../lib/cache-sweep-plan';
+import { RENDERED_OVERLAYS_MAX } from '../../lib/overlay-index';
 import { clearSprayWallRegistry, registerSprayWall } from '../../lib/spray/spray-wall-registry';
 
 const {
@@ -485,15 +486,21 @@ describe('renderedOverlays warm-up from disk cache', () => {
   });
 
   it('bounds the sync cache and promotes reads in LRU order', () => {
-    for (let entryIndex = 0; entryIndex < 200; entryIndex++) {
+    for (let entryIndex = 0; entryIndex < RENDERED_OVERLAYS_MAX; entryIndex++) {
       _cacheRenderedOverlayForTests(`key-${entryIndex}`, `file:///overlay-${entryIndex}.png`);
     }
     _getRenderedOverlayForTests('key-0');
-    _cacheRenderedOverlayForTests('key-200', 'file:///overlay-200.png');
+    _cacheRenderedOverlayForTests('key-overflow', 'file:///overlay-overflow.png');
 
-    expect(_renderedOverlaysForTests.size).toBe(200);
+    expect(_renderedOverlaysForTests.size).toBe(RENDERED_OVERLAYS_MAX);
     expect(_renderedOverlaysForTests.has('key-0')).toBe(true);
     expect(_renderedOverlaysForTests.has('key-1')).toBe(false);
+  });
+
+  // One scroll session used to outgrow the index (it was 200): every list row
+  // is an entry, and so is every row warmed ahead of the scroll.
+  it('remembers more overlays than a long scroll session renders', () => {
+    expect(RENDERED_OVERLAYS_MAX).toBeGreaterThanOrEqual(1000);
   });
 
   it('only loads PNGs whose name starts with the current RENDERER_VERSION prefix', () => {
@@ -551,6 +558,20 @@ describe('renderedOverlays warm-up from disk cache', () => {
     expect(_renderedOverlaysForTests.size).toBe(2);
   });
 
+  it('preserves capability probe PNGs while deleting stale overlays', () => {
+    const classicProbe = makeMockEntry('boardsesh-probe-classic-active.png');
+    const auraProbe = makeMockEntry('boardsesh-probe-veil-active.png');
+    const staleOverlay = makeMockEntry('v1_kilter_stale.png');
+    directoryListSpy.mockReturnValue([classicProbe, auraProbe, staleOverlay]);
+
+    _runWarmupForTests();
+
+    expect(classicProbe.delete).not.toHaveBeenCalled();
+    expect(auraProbe.delete).not.toHaveBeenCalled();
+    expect(staleOverlay.delete).toHaveBeenCalledOnce();
+    expect(_renderedOverlaysForTests.size).toBe(0);
+  });
+
   it('opportunistically deletes stale-version PNG files to reclaim disk', () => {
     const v1Entry = makeMockEntry('v1_kilter_1_10_24_aaaaaaaa.png');
     const v2Entry = makeMockEntry('v2_kilter_1_10_24_bbbbbbbb.png');
@@ -600,6 +621,28 @@ describe('renderedOverlays warm-up from disk cache', () => {
 
     expect(() => _runWarmupForTests()).not.toThrow();
     expect(_renderedOverlaysForTests.has('v16_kilter_1_10_24_bbbbbbbb')).toBe(true);
+  });
+
+  // #7026: expo-file-system lists the directory through Android's
+  // `Uri.fromFile(...).toString()`, which writes the commas between set ids as
+  // `%2C`. The renderer's own URI for the same file is unencoded, and the session
+  // notification opens what it is handed as a raw path, so an encoded URI in the
+  // index left the notification artwork black for every climb adopted from disk.
+  it('indexes a listed multi-set overlay under the unencoded URI the renderer returns', () => {
+    const name = 'v16_f_w384_moonboard_2_1_1,2,3_cafef00d.png';
+    directoryListSpy.mockReturnValue([
+      {
+        uri: 'file:///data/user/0/com.boardsesh.app/cache/board-thumbnails/v16_f_w384_moonboard_2_1_1%2C2%2C3_cafef00d.png',
+        name,
+        delete: vi.fn(),
+      },
+    ]);
+
+    _runWarmupForTests();
+
+    expect(_renderedOverlaysForTests.get('v16_f_w384_moonboard_2_1_1,2,3_cafef00d')?.uri).toBe(
+      'file:///data/user/0/com.boardsesh.app/cache/board-thumbnails/v16_f_w384_moonboard_2_1_1,2,3_cafef00d.png',
+    );
   });
 });
 
@@ -660,6 +703,7 @@ describe('the wall version in the render cache keys', () => {
       wallUuid: 'wall-uuid',
       angle: 40,
       version,
+      versionId: version,
       photoWidth: 1200,
       photoHeight: 1600,
       photoUrl: 'https://private.example/photo',

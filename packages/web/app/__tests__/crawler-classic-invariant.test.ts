@@ -84,8 +84,9 @@ vi.mock('@/app/lib/url-utils.server', async (importOriginal) => ({
   })),
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({
     board_name: 'kilter',
     layout_id: 1,
     size_id: 10,
@@ -99,7 +100,7 @@ vi.mock('@/app/lib/board-utils', () => ({
 }));
 
 vi.mock('@/app/lib/data/queries', () => ({
-  getClimb: vi.fn(async () => ({ name: 'My Test Climb', frames: 'p1r12' })),
+  getClimb: vi.fn(async () => ({ uuid: CLIMB_UUID, name: 'My Test Climb', frames: 'p1r12' })),
   getLayouts: vi.fn(async () => [{ id: 1, name: 'Kilter Board Original' }]),
   getSizes: vi.fn(async () => [{ id: 10, name: '12 x 12', description: 'Commercial' }]),
   getSets: vi.fn(async () => [
@@ -151,16 +152,17 @@ vi.mock('@/app/components/climb-detail/climb-view-seo-fragment', () => ({ defaul
 vi.mock('@/app/components/providers/i18n-provider', () => ({ default: () => null }));
 
 const { middleware } = await import('@/middleware');
-const BoardAngleLayout = (await import('@/app/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/layout')).default;
-const BoardListLayout = (await import('@/app/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/list/layout'))
+const BoardAngleLayout = (await import('@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/layout'))
+  .default;
+const BoardListLayout = (await import('@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/list/layout'))
   .default;
 const ClimbViewPage = (
-  await import('@/app/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/view/[climb_uuid]/page')
+  await import('@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/view/[climb_uuid]/page')
 ).default;
 const LegacyPlayPage = (
-  await import('@/app/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/play/[climb_uuid]/page')
+  await import('@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/play/[climb_uuid]/page')
 ).default;
-const SlugPlayPage = (await import('@/app/b/[board_slug]/[angle]/play/[climb_uuid]/page')).default;
+const SlugPlayPage = (await import('@/app/(site)/b/[board_slug]/[angle]/play/[climb_uuid]/page')).default;
 const { getClimb } = await import('@/app/lib/data/queries');
 
 const PROD_HOST = 'www.boardsesh.com';
@@ -279,15 +281,18 @@ describe.each([
     expectNoRedirect(response);
   });
 
-  it.each(['/kilter/original/12x12-square/screw_bolt/40/list', '/b/kilter-original-12x12/40/list'])(
-    '?classic=1 is inert on %s: the page renders, no 307, no cookie set',
-    (listPath) => {
-      const response = middleware(makeRequest(`${listPath}?classic=1`));
-      expectNoRedirect(response);
-      expect(response.headers.has('set-cookie')).toBe(false);
-      expect(response.headers.get('Vercel-CDN-Cache-Control')).toBe('s-maxage=86400, stale-while-revalidate=604800');
-    },
-  );
+  // Middleware cannot tell a `/b/{slug}` list's board without a backend call, so
+  // the slug tree takes the 15 minute live-data TTL; config-tuple Kilter pages
+  // keep 24 h (#6803).
+  it.each([
+    ['/kilter/original/12x12-square/screw_bolt/40/list', 's-maxage=86400, stale-while-revalidate=604800'],
+    ['/b/kilter-original-12x12/40/list', 's-maxage=900, stale-while-revalidate=900'],
+  ])('?classic=1 is inert on %s: the page renders, no 307, no cookie set', (listPath, expectedCdnCacheControl) => {
+    const response = middleware(makeRequest(`${listPath}?classic=1`));
+    expectNoRedirect(response);
+    expect(response.headers.has('set-cookie')).toBe(false);
+    expect(response.headers.get('Vercel-CDN-Cache-Control')).toBe(expectedCdnCacheControl);
+  });
 });
 
 describe('the three legitimate redirect classes stay on www.boardsesh.com', () => {

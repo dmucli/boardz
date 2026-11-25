@@ -1,4 +1,18 @@
 // @vitest-environment jsdom
+vi.mock('../../use-ios-sheet-background-style', () => ({ useIosSheetBackgroundStyle: () => undefined }));
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { createElement, type ReactNode } from 'react';
 import { render, cleanup } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,7 +42,10 @@ vi.mock('react-native', () => ({
   Platform: { OS: 'android' },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   Pressable: ({ children }: { children?: ReactNode }) => createElement('button', null, children),
-  StyleSheet: { create: (styleSheet: unknown) => styleSheet },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styleSheet: unknown) => styleSheet,
+  },
 }));
 
 vi.mock('@expo/ui/community/bottom-sheet', () => ({
@@ -62,8 +79,18 @@ vi.mock('react-native-screens', () => ({
   FullWindowOverlay: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
 }));
 
-vi.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 0, bottom: 0, left: 0, right: 0 }),
+vi.mock('../../../hooks/use-window-bottom-inset', () => ({ useWindowBottomInset: () => 0 }));
+
+type TopBarAction = { label?: string; kind?: string; onPress: () => void };
+vi.mock('../../SheetTopBar', () => ({
+  SheetTopBar: ({ title, leading, trailing }: { title: string; leading?: TopBarAction; trailing?: TopBarAction }) =>
+    createElement(
+      'div',
+      null,
+      title,
+      leading ? createElement('button', { onClick: leading.onPress, 'aria-label': `leading-${leading.kind}` }) : null,
+      trailing ? createElement('button', { onClick: trailing.onPress, 'aria-label': trailing.label }) : null,
+    ),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -79,6 +106,7 @@ vi.mock('@boardsesh/board-config', () => {
   return {
     ANGLES: angles,
     getBoardAngleOptions: (boardName: string) => angles[boardName] ?? [],
+    MOONBOARD_ANGLES: [25, 40],
   };
 });
 
@@ -103,11 +131,13 @@ vi.mock('../../../theme/ios-colors', () => ({ iosSystemColors: {} }));
 vi.mock('../../../theme/colors', () => ({ brandColors: { primary: '#000' } }));
 
 vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: [0, 4, 8, 12, 16, 20],
   sheetStyles: { indicator: {} },
 }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({ systemColors: {} }),
 }));
 

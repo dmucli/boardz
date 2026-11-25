@@ -6,6 +6,7 @@ import { createElement, type ReactNode } from 'react';
 const ctrl = vi.hoisted(() => ({
   mode: 'material' as 'glass' | 'blur' | 'material' | 'solid',
   variant: 'material' as 'liquidGlass' | 'material',
+  colorScheme: 'dark' as 'light' | 'dark',
 }));
 
 vi.mock('react-native', () => ({
@@ -25,13 +26,13 @@ vi.mock('../../../hooks/use-effective-surface-mode', () => ({
 vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({
     variant: ctrl.variant,
+    colorScheme: ctrl.colorScheme,
     systemColors: {
       elevatedSurface: '#FFFFFF',
       separator: '#CCCCCC',
     },
-    m3: { secondaryContainer: '#5A4A90' },
+    m3: { secondaryContainer: '#5A4A90', outlineVariant: 'rgba(255, 255, 255, 0.12)' },
     brandColors: { warning: '#FBBF24' },
-    m3SurfaceContainers: { lowest: '#101018', low: '#202028', base: '#2A2138', high: '#33293F', highest: '#3B2F49' },
     materialElevation: {
       level2: { elevation: 2, shadowOpacity: 0.12, shadowRadius: 3, shadowOffset: { width: 0, height: 1 } },
       level3: { elevation: 3, shadowOpacity: 0.14, shadowRadius: 5, shadowOffset: { width: 0, height: 2 } },
@@ -45,6 +46,7 @@ vi.mock('../../../theme/tokens', () => ({
 
 vi.mock('../../../theme/colors', () => ({
   withAlpha: (color: string, alpha: number) => `${color}-${alpha}`,
+  materialFloatingBarSurface: { light: '#E4E4E4', dark: '#2E2E2E' },
 }));
 
 import { AccessoryBarSurface } from '../AccessoryBarSurface';
@@ -53,11 +55,28 @@ describe('AccessoryBarSurface', () => {
   beforeEach(() => {
     ctrl.mode = 'material';
     ctrl.variant = 'material';
+    ctrl.colorScheme = 'dark';
   });
 
-  it('renders the Material docked treatment as an opaque full-width bar surface', () => {
+  it('floats the Material bar on its own surface step with a hairline edge, per scheme', () => {
+    // QA verdict 166: on the base step (#1A1A1A) the dark bar sat darker than the
+    // #1E1E1E cards it floats over and read as a hole in them.
+    const dark = render(<AccessoryBarSurface height={48}>child</AccessoryBarSurface>);
+    const darkStyle = dark.container.querySelector('[data-view]')?.getAttribute('data-style') ?? '';
+    expect(darkStyle).toContain('"backgroundColor":"#2E2E2E"');
+    expect(darkStyle).toContain('"borderColor":"rgba(255, 255, 255, 0.12)"');
+    dark.unmount();
+
+    ctrl.colorScheme = 'light';
+    const light = render(<AccessoryBarSurface height={48}>child</AccessoryBarSurface>);
+    expect(light.container.querySelector('[data-view]')?.getAttribute('data-style')).toContain(
+      '"backgroundColor":"#E4E4E4"',
+    );
+  });
+
+  it('renders the Material MiniPlayer card as an opaque rounded surface at level 2', () => {
     const { container } = render(
-      <AccessoryBarSurface height={48} treatment="docked">
+      <AccessoryBarSurface height={48} borderRadius={12}>
         child
       </AccessoryBarSurface>,
     );
@@ -65,35 +84,35 @@ describe('AccessoryBarSurface', () => {
     const surface = container.querySelector('[data-view]');
     const style = surface?.getAttribute('data-style') ?? '';
     expect(style).toContain('"height":48');
-    expect(style).toContain('"borderRadius":0');
+    expect(style).toContain('"borderRadius":12');
     // M3 bottom-bar surface: the surfaceContainer tone (not the old elevatedSurface).
-    expect(style).toContain('"backgroundColor":"#2A2138"');
-    expect(style).toContain('"borderTopWidth":1');
-    expect(style).toContain('"borderTopColor":"#CCCCCC"');
-    // The docked bar lifts one elevation step above the tab bar (M3 nav-bar = level 2).
+    expect(style).toContain('"backgroundColor":"#2E2E2E"');
+    // A floating card draws no hairline seam; its cast separates it.
+    expect(style).not.toContain('borderTopWidth');
     expect(style).toContain('"elevation":2');
     expect(container.querySelector('[data-glass]')).toBeNull();
+  });
+
+  it('defaults to a full pill', () => {
+    const { container } = render(<AccessoryBarSurface height={44}>child</AccessoryBarSurface>);
+    expect(container.querySelector('[data-view]')?.getAttribute('data-style')).toContain('"borderRadius":22');
   });
 
   it('keeps Material on the opaque surface path when reduce-transparency resolves mode to solid', () => {
     ctrl.mode = 'solid';
     ctrl.variant = 'material';
-    const { container } = render(
-      <AccessoryBarSurface height={48} treatment="docked">
-        child
-      </AccessoryBarSurface>,
-    );
+    const { container } = render(<AccessoryBarSurface height={48}>child</AccessoryBarSurface>);
 
     expect(container.querySelector('[data-glass]')).toBeNull();
-    expect(container.querySelector('[data-view]')?.getAttribute('data-style')).toContain('"backgroundColor":"#2A2138"');
+    expect(container.querySelector('[data-view]')?.getAttribute('data-style')).toContain('"backgroundColor":"#2E2E2E"');
   });
 
-  it('lights the Material docked bar: opaque base + a violet tint overlay + a higher elevation when connected', () => {
+  it('lights the Material card: opaque base + a violet tint overlay + a higher elevation when connected', () => {
     // "You have control" reads as the active-tab violet tonal + a level-3 cast.
     // The base stays OPAQUE so the list never bleeds through; the violet (a
     // low-alpha role here) is composited as an overlay on top.
     const { container } = render(
-      <AccessoryBarSurface height={48} treatment="docked" emphasis="connected">
+      <AccessoryBarSurface height={48} emphasis="connected">
         child
       </AccessoryBarSurface>,
     );
@@ -101,7 +120,7 @@ describe('AccessoryBarSurface', () => {
     const views = Array.from(container.querySelectorAll('[data-view]'));
     const outerStyle = views[0]?.getAttribute('data-style') ?? '';
     // Opaque base (NOT the translucent secondaryContainer) + the level-3 cast.
-    expect(outerStyle).toContain('"backgroundColor":"#2A2138"');
+    expect(outerStyle).toContain('"backgroundColor":"#2E2E2E"');
     expect(outerStyle).toContain('"elevation":3');
     // A separate violet overlay carries the "active" tone over the opaque base.
     const overlay = views.find((view) =>

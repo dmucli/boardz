@@ -81,7 +81,7 @@ describe('buildSessionLeaderboardRows', () => {
   });
 });
 
-function makeEntry(overrides: Partial<BoardLeaderboardEntry> & { userId: string }): BoardLeaderboardEntry {
+function makeEntry(overrides: Partial<BoardLeaderboardEntry> & { userId: string | null }): BoardLeaderboardEntry {
   return {
     rank: 1,
     totalSends: 1,
@@ -119,6 +119,23 @@ describe('mergePeriodLeaderboards', () => {
     expect(rows).toHaveLength(2);
     expect(rows[0]).toMatchObject({ key: 'user:user-2', sendCount: 8, hardestGradeName: null });
     expect(rows[1]).toMatchObject({ key: 'user:user-1', sendCount: 5, hardestGradeName: null });
+  });
+
+  it('folds anonymous climbers into one unnamed row instead of a list of pseudonyms', () => {
+    // The backend sends a private climber, or one who stays anonymous on boards
+    // they don't own, with no user id or name. Totals still count them.
+    const rows = mergePeriodLeaderboards([
+      makeLeaderboard('board-a', [
+        makeEntry({ userId: 'user-1', userDisplayName: 'Ada', totalSends: 3 }),
+        makeEntry({ userId: null, totalSends: 4 }),
+        makeEntry({ userId: null, totalSends: 2 }),
+      ]),
+      makeLeaderboard('board-b', [makeEntry({ userId: null, totalSends: 1 })]),
+    ]);
+    expect(rows).toEqual([
+      { key: 'private-climbers', displayName: null, avatarUrl: null, sendCount: 7, hardestGradeName: null },
+      { key: 'user:user-1', displayName: 'Ada', avatarUrl: null, sendCount: 3, hardestGradeName: null },
+    ]);
   });
 
   it('fills missing display name/avatar from a later board entry', () => {

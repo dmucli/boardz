@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
+import { BOARD_RENDER_VERSION } from '@boardsesh/board-render/version';
 
 const profilePageTestState = vi.hoisted(() => ({
   notFoundMock: vi.fn(),
@@ -23,8 +24,8 @@ vi.mock('@/app/lib/auth/server-auth', () => ({
   getServerAuthToken: profilePageTestState.getServerAuthTokenMock,
 }));
 
-vi.mock('next-auth/next', () => ({
-  getServerSession: profilePageTestState.getServerSessionMock,
+vi.mock('@/app/lib/auth/admitted-session.server', () => ({
+  getAdmittedServerSession: profilePageTestState.getServerSessionMock,
 }));
 
 vi.mock('@/app/lib/auth/auth-options', () => ({
@@ -43,6 +44,10 @@ vi.mock('@/app/lib/seo/dynamic-og-data', () => ({
   getProfileOgSummary: profilePageTestState.getProfileOgSummaryMock,
 }));
 
+vi.mock('@/app/lib/backend-url', () => ({
+  getPublicBackendHttpUrl: () => 'https://ws.boardsesh.com',
+}));
+
 vi.mock('../profile-page-content', () => ({
   default: (props: { userId: string }) => ({ type: 'ProfilePageContent', props }),
 }));
@@ -51,7 +56,16 @@ vi.mock('@/app/components/providers/i18n-provider', () => ({
   default: ({ children }: { children: unknown }) => children,
 }));
 
-const pageModule = await import('../page');
+const pageModule = await import('@/app/(site)/profile/[user_id]/page');
+
+const BASE_SUMMARY = {
+  displayName: 'Marco' as string | null,
+  topBoardType: null as string | null,
+  hardestSend: null as { climbName: string; grade: string | null } | null,
+  sentClimbCount: 0,
+  sentBoardTypes: [] as string[],
+  version: 'v1',
+};
 
 describe('profile page route', () => {
   beforeEach(() => {
@@ -91,11 +105,8 @@ describe('profile page route', () => {
 
   it('keeps a real public profile indexable, with a search-first title', async () => {
     profilePageTestState.getProfileOgSummaryMock.mockResolvedValue({
-      displayName: 'Marco',
-      avatarUrl: null,
-      fallbackImageUrl: null,
+      ...BASE_SUMMARY,
       topBoardType: 'kilter',
-      version: 'v1',
     });
 
     const metadata = await pageModule.generateMetadata({
@@ -111,24 +122,73 @@ describe('profile page route', () => {
       es: '/es/profile/user-1',
       fr: '/fr/profile/user-1',
       de: '/de/profile/user-1',
+      it: '/it/profile/user-1',
+      'zh-CN': '/zh-CN/profile/user-1',
       'x-default': '/profile/user-1',
     });
   });
 
   it('falls back to a board-free title when the climber has no ticks', async () => {
-    profilePageTestState.getProfileOgSummaryMock.mockResolvedValue({
-      displayName: 'Marco',
-      avatarUrl: null,
-      fallbackImageUrl: null,
-      topBoardType: null,
-      version: 'v1',
-    });
+    profilePageTestState.getProfileOgSummaryMock.mockResolvedValue(BASE_SUMMARY);
 
     const metadata = await pageModule.generateMetadata({
       params: Promise.resolve({ user_id: 'user-1' }),
     });
 
     expect(metadata.title).toEqual({ absolute: "Marco's Climbing Sessions | Boardsesh" });
+  });
+
+  it('names the hardest send in the share preview and keeps the search title', async () => {
+    profilePageTestState.getProfileOgSummaryMock.mockResolvedValue({
+      ...BASE_SUMMARY,
+      displayName: 'Reuben Amini',
+      topBoardType: 'kilter',
+      hardestSend: { climbName: 'Swooped', grade: '7b/V8' },
+      sentClimbCount: 212,
+      sentBoardTypes: ['kilter', 'tension'],
+    });
+
+    const metadata = await pageModule.generateMetadata({ params: Promise.resolve({ user_id: 'user-1' }) });
+    const [image] = (metadata.openGraph?.images ?? []) as Array<{ url: string }>;
+
+    expect(metadata.title).toEqual({ absolute: "Reuben Amini's Kilter Sessions | Boardsesh" });
+    expect(metadata.openGraph?.title).toBe('Reuben Amini sent 7b/V8');
+    expect(metadata.openGraph?.description).toBe(
+      'Swooped is the hardest of 212 climbs sent on Kilter and Tension. See the logbook.',
+    );
+    expect(image.url).toBe(`https://ws.boardsesh.com/og/profile?user_id=user-1&v=${BOARD_RENDER_VERSION}-v1`);
+  });
+
+  it('calls an unnamed climber by the page fallback, never Crusher', async () => {
+    profilePageTestState.getProfileOgSummaryMock.mockResolvedValue({ ...BASE_SUMMARY, displayName: null });
+
+    const metadata = await pageModule.generateMetadata({ params: Promise.resolve({ user_id: 'user-1' }) });
+
+    expect(metadata.title).toEqual({ absolute: "Climber's Climbing Sessions | Boardsesh" });
+    expect(metadata.openGraph?.title).toBe('Climber on Boardsesh');
+    expect(metadata.openGraph?.description).toBe('No sends logged yet. See the profile.');
+    expect(JSON.stringify(metadata)).not.toContain('Crusher');
+  });
+
+  it('counts sends it cannot name, when every one is on a hidden climb', async () => {
+    profilePageTestState.getProfileOgSummaryMock.mockResolvedValue({
+      ...BASE_SUMMARY,
+      sentClimbCount: 3,
+      sentBoardTypes: ['moonboard'],
+    });
+
+    const metadata = await pageModule.generateMetadata({ params: Promise.resolve({ user_id: 'user-1' }) });
+
+    expect(metadata.openGraph?.title).toBe('Marco on Boardsesh');
+    expect(metadata.openGraph?.description).toBe('3 climbs sent on MoonBoard. See the logbook.');
+  });
+
+  it('advertises no card for a private or missing profile', async () => {
+    profilePageTestState.getProfileOgSummaryMock.mockResolvedValue(null);
+
+    const metadata = await pageModule.generateMetadata({ params: Promise.resolve({ user_id: 'private-user' }) });
+
+    expect(metadata.openGraph?.images).toBeUndefined();
   });
 
   it('calls notFound and skips stats fetch when the user does not exist', async () => {

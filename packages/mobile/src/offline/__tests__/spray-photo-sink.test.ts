@@ -1,6 +1,16 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { getCheckpoint, getCheckpointKey, runMigrations, setCheckpoint } from '@boardsesh/offline-sync';
+import {
+  clearSprayWallRegistry,
+  getSprayWall,
+  registerSprayWall,
+  sprayGeometryKey,
+  unregisterSprayWall,
+} from '../../lib/spray/spray-wall-registry';
+import { getRuntimeGeometry } from '@boardsesh/board-art-geometry';
 import { createTestDatabase, type TestSqliteDb } from '@boardsesh/offline-sync/testing';
+const clearPrivateCaches = vi.hoisted(() => vi.fn());
+vi.mock('../../lib/spray/spray-privacy-cleanup', () => ({ clearSprayWallPrivateCaches: clearPrivateCaches }));
 
 /**
  * The two sinks that keep a wall's photograph in step with its row (#5448).
@@ -10,8 +20,11 @@ import { createTestDatabase, type TestSqliteDb } from '@boardsesh/offline-sync/t
  * which `spray-photo-store.test.ts` covers against a fake disk.
  */
 
-const { stored, deleted, pruned, storeResult, reportedErrors } = vi.hoisted(() => ({
-  stored: [] as { photoKey: string; photoUrl: string }[],
+const { stored, deleted, pruned, storeResult, reportedErrors, rendererCache, released } = vi.hoisted(() => ({
+  released: [] as string[],
+  stored: [] as { photoKey: string; photoUrl: string; cachedCopyPath?: string }[],
+  // What the renderer's cache holds, by `layoutId:photoKey`.
+  rendererCache: new Map<string, string>(),
   deleted: [] as string[],
   pruned: [] as string[][],
   // `available` models the platform, not a failure: the browser twin exports
@@ -31,10 +44,12 @@ vi.mock('../../lib/spray/spray-photo-store', () => ({
   get SPRAY_PHOTO_STORE_AVAILABLE() {
     return storeResult.available;
   },
-  storeSprayPhoto: vi.fn(async (photoKey: string, photoUrl: string) => {
-    stored.push({ photoKey, photoUrl });
-    return storeResult.ok ? `/documents/spray-wall-photos/${photoKey}` : null;
-  }),
+  storeSprayPhoto: vi.fn(
+    async (photoKey: string, photoUrl: string, _layoutId?: number, cachedCopyPath?: string | null) => {
+      stored.push({ photoKey, photoUrl, ...(cachedCopyPath ? { cachedCopyPath } : {}) });
+      return storeResult.ok ? `/documents/spray-wall-photos/${photoKey}` : null;
+    },
+  ),
   deleteStoredSprayPhoto: vi.fn((photoKey: string) => {
     deleted.push(photoKey);
   }),
@@ -42,6 +57,14 @@ vi.mock('../../lib/spray/spray-photo-store', () => ({
     pruned.push([...liveKeys]);
     return 0;
   }),
+}));
+
+vi.mock('../../lib/spray/spray-photo-cache', () => ({
+  findCachedSprayPhotoForObjectKey: (layoutId: number, photoKey: string) =>
+    rendererCache.get(`${layoutId}:${photoKey}`) ?? null,
+  releaseCachedSprayPhotoForObjectKey: (layoutId: number, photoKey: string) => {
+    released.push(`${layoutId}:${photoKey}`);
+  },
 }));
 
 const { sprayWallDeletedSink, sprayWallPhotoSink } = await import('../spray-photo-sink');
@@ -70,6 +93,10 @@ const pull = (documents: Record<string, unknown>[], tableName = 'spray_walls') =
   sprayWallPhotoSink({ tableName, documents, db });
 
 beforeEach(async () => {
+  clearSprayWallRegistry();
+  // The real cleanup withdraws the wall from the registry and erases its files;
+  // the files are `spray-privacy-cleanup.test.ts`'s business, the withdrawal is not.
+  clearPrivateCaches.mockReset().mockImplementation((layoutId: number) => unregisterSprayWall(layoutId));
   db = createTestDatabase();
   await runMigrations(db);
   stored.length = 0;
@@ -78,10 +105,47 @@ beforeEach(async () => {
   storeResult.ok = true;
   storeResult.available = true;
   reportedErrors.length = 0;
+  rendererCache.clear();
+  released.length = 0;
   await setCheckpoint(db, CHECKPOINT_KEY, { updatedAt: '2026-06-01T00:00:00Z', syncSeq: '12' });
 });
 
 describe('sprayWallPhotoSink', () => {
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY, 'not-a-layout'])(
+    'skips photographs whose layout identity is non-finite (%s)',
+    async (layoutId) => {
+      await insertWallRow();
+      await pull([wallDocument({ layout_id: layoutId })]);
+      expect(stored).toEqual([]);
+      expect(await getCheckpoint(db, CHECKPOINT_KEY)).not.toBeNull();
+      expect(
+        await db.getFirstAsync('SELECT key FROM sync_meta WHERE key LIKE ?', ['spray-photo-pending:%']),
+      ).toBeNull();
+    },
+  );
+  // Opening a wall before downloading it is the common order: the renderer
+  // already holds these exact bytes, so the store copies them instead of
+  // downloading the photo a second time.
+  it("hands the store the renderer's cached copy of the same object", async () => {
+    await insertWallRow();
+    rendererCache.set(`${LAYOUT_ID}:${PHOTO_KEY}`, '/cache/spray-walls/4-v9.jpg');
+
+    await pull([wallDocument()]);
+
+    expect(stored).toEqual([
+      { photoKey: PHOTO_KEY, photoUrl: PHOTO_URL, cachedCopyPath: '/cache/spray-walls/4-v9.jpg' },
+    ]);
+    // Stored, so the renderer's copy can go.
+    expect(released).toEqual([`${LAYOUT_ID}:${PHOTO_KEY}`]);
+  });
+
+  it("keeps the renderer's copy when the photo did not land", async () => {
+    await insertWallRow();
+    storeResult.ok = false;
+    await pull([wallDocument()]);
+    expect(released).toEqual([]);
+  });
+
   it('stores the photograph the page carried', async () => {
     await insertWallRow();
 
@@ -214,6 +278,70 @@ describe('sprayWallPhotoSink', () => {
 });
 
 describe('sprayWallDeletedSink', () => {
+  it('clears an orphan retry marker whose photo differs from the deleted capture', async () => {
+    await db.runAsync('INSERT INTO sync_meta (key, value) VALUES (?, ?)', [
+      `spray-photo-pending:${LAYOUT_ID}`,
+      JSON.stringify({ photoKey: 'previous-photo-generation', attempts: 3 }),
+    ]);
+
+    await sprayWallDeletedSink({
+      tableName: 'spray_walls',
+      rows: [{ layout_id: LAYOUT_ID, photo_key: PHOTO_KEY }],
+      db,
+    });
+
+    expect(
+      await db.getFirstAsync('SELECT key FROM sync_meta WHERE key = ?', [`spray-photo-pending:${LAYOUT_ID}`]),
+    ).toBeNull();
+  });
+
+  it('withdraws registered geometry and erases only the deleted wall’s private caches', async () => {
+    const registration = {
+      wallUuid: 'wall-4',
+      angle: 40,
+      version: 1,
+      versionId: 1,
+      photoWidth: 100,
+      photoHeight: 100,
+      photoUrl: PHOTO_URL,
+      photoThumbUrl: null,
+      photoExpiresAt: 'later',
+      holds: [],
+    };
+    registerSprayWall(LAYOUT_ID, registration);
+    registerSprayWall(9, { ...registration, wallUuid: 'wall-9' });
+
+    await sprayWallDeletedSink({
+      tableName: 'spray_walls',
+      rows: [{ layout_id: LAYOUT_ID, photo_key: PHOTO_KEY }],
+      db,
+    });
+
+    expect(getSprayWall(LAYOUT_ID)).toBeNull();
+    expect(getRuntimeGeometry(sprayGeometryKey(LAYOUT_ID))).toBeNull();
+    expect(getSprayWall(9)).not.toBeNull();
+    expect(clearPrivateCaches.mock.calls).toEqual([[LAYOUT_ID]]);
+  });
+
+  it.each([PHOTO_KEY, null])('preserves a recreated wall retry after deleting photo %s', async (deletedKey) => {
+    const replacementKey = 'replacement-photo';
+    await insertWallRow(LAYOUT_ID, replacementKey);
+    await db.runAsync('INSERT INTO sync_meta (key, value) VALUES (?, ?)', [
+      `spray-photo-pending:${LAYOUT_ID}`,
+      JSON.stringify({ photoKey: replacementKey, attempts: 2 }),
+    ]);
+
+    await sprayWallDeletedSink({
+      tableName: 'spray_walls',
+      rows: [{ layout_id: LAYOUT_ID, photo_key: deletedKey }],
+      db,
+    });
+
+    expect(
+      await db.getFirstAsync('SELECT key FROM sync_meta WHERE key = ?', [`spray-photo-pending:${LAYOUT_ID}`]),
+    ).not.toBeNull();
+  });
+
   it('deletes the photograph a tombstone orphaned', async () => {
     // The row is already gone, so this capture is the only thing that still
     // names the file — board teardown and the prune both look at rows.
@@ -224,6 +352,7 @@ describe('sprayWallDeletedSink', () => {
     });
 
     expect(deleted).toEqual([PHOTO_KEY]);
+    expect(clearPrivateCaches).toHaveBeenCalledWith(LAYOUT_ID);
   });
 
   it('clears the wall’s pending-photo state', async () => {

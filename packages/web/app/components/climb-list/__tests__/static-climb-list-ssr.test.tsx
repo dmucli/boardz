@@ -2,7 +2,7 @@ import React from 'react';
 import { describe, it, expect, vi } from 'vite-plus/test';
 import { renderToString } from 'react-dom/server';
 import { useWindowVirtualizer } from '@tanstack/react-virtual';
-import type { BoardDetails, Climb } from '@/app/lib/types';
+import type { BoardImageDetails, Climb } from '@/app/lib/types';
 import { LIST_ROW_HEIGHT } from '@/app/lib/climb-list-constants';
 import StaticClimbList from '../static-climb-list';
 
@@ -27,9 +27,10 @@ vi.mock('@/app/components/i18n/locale-link', () => ({
   default: ({ href, children }: { href: string; children: React.ReactNode }) => <a href={href}>{children}</a>,
 }));
 
-vi.mock('@/app/components/board-renderer/board-image-layers', () => ({ default: () => null }));
-vi.mock('@/app/components/board-renderer/board-canvas-renderer', () => ({ default: () => null }));
-vi.mock('@/app/lib/board-render-worker/worker-manager', () => ({ useCanvasRendererReady: () => false }));
+// Renders only the image priority it was asked for, so the first-row priority is readable off the HTML.
+vi.mock('@/app/components/board-renderer/board-image-layers', () => ({
+  default: ({ fetchPriority }: { fetchPriority?: string }) => <i data-fetch-priority={fetchPriority ?? 'auto'} />,
+}));
 vi.mock('@/app/components/climb-card/climb-title', () => ({
   default: ({ climb }: { climb: { name?: string } }) => <span>{climb.name}</span>,
 }));
@@ -51,21 +52,17 @@ function makeClimb(index: number): Climb {
   } as Climb;
 }
 
-function makeBoardDetails(): BoardDetails {
+function makeBoardDetails(): BoardImageDetails {
   return {
     board_name: 'kilter',
     layout_id: 1,
     size_id: 10,
     set_ids: [1, 20],
-    images_to_holds: {},
-    holdsData: {},
-    edge_left: 0,
-    edge_right: 100,
-    edge_bottom: 0,
-    edge_top: 100,
+    backgroundImagePaths: [],
+
     boardHeight: 100,
     boardWidth: 100,
-  } as BoardDetails;
+  } as BoardImageDetails;
 }
 
 const twentyClimbs = Array.from({ length: 20 }, (_, index) => makeClimb(index));
@@ -178,4 +175,52 @@ describe('StaticClimbList server render', () => {
     expect(withoutRect).toBe(0);
     expect(withRect).toBeGreaterThan(0);
   });
+});
+
+it('renders the supplied SSR crop in the first public row', () => {
+  const html = renderToString(
+    <StaticClimbList
+      climbs={[makeClimb(0)]}
+      boardDetails={makeBoardDetails()}
+      virtualize={false}
+      thumbnailCropsByClimb={{ CLIMB0: { x: 0.1, y: 0.2, width: 0.3, height: 0.4 } }}
+    />,
+  );
+  expect(html).toContain('data-testid="climb-thumbnail-crop"');
+  expect(html).toContain('href="/kilter/');
+});
+
+it('keeps the initial virtual window in document flow before JavaScript can measure responsive rows', () => {
+  const html = renderToString(<StaticClimbList climbs={fiftyClimbs} boardDetails={makeBoardDetails()} />);
+  const container = document.createElement('div');
+  container.innerHTML = html;
+  const rows = [...container.querySelectorAll<HTMLElement>('[data-index]')];
+  expect(rows.length).toBeGreaterThan(0);
+  expect(rows.length).toBeLessThan(fiftyClimbs.length);
+  for (const row of rows) {
+    expect(row.style.position).not.toBe('absolute');
+    expect(row.style.transform).toBe('');
+  }
+  expect(rows[0].parentElement?.style.height).toBe('');
+});
+
+it("asks for the first row's thumbnail at high priority, unless the page has bigger art above the list", () => {
+  const priorities = (html: string) => [...html.matchAll(/data-fetch-priority="(\w+)"/g)].map((match) => match[1]);
+
+  const byDefault = renderToString(
+    <StaticClimbList climbs={twentyClimbs} boardDetails={makeBoardDetails()} virtualize={false} />,
+  );
+  expect(priorities(byDefault)[0]).toBe('high');
+  expect(priorities(byDefault).filter((priority) => priority === 'high')).toHaveLength(1);
+
+  const yielding = renderToString(
+    <StaticClimbList
+      climbs={twentyClimbs}
+      boardDetails={makeBoardDetails()}
+      virtualize={false}
+      prioritizeFirstRow={false}
+    />,
+  );
+  expect(priorities(yielding)).toHaveLength(20);
+  expect(priorities(yielding)).not.toContain('high');
 });

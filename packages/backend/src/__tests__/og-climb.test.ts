@@ -26,6 +26,7 @@ vi.mock('../services/spray-og-card', () => ({
   renderSprayOgCard: vi.fn(),
 }));
 
+import { BOARD_RENDER_VERSION } from '@boardsesh/board-render/version';
 import { handleOgClimb } from '../handlers/og-climb';
 import { RenderQueueSaturatedError, ensureBoardRendererAvailable, renderOgClimb } from '../services/board-render';
 import { renderSprayOgCard } from '../services/spray-og-card';
@@ -96,6 +97,7 @@ describe('handleOgClimb', () => {
       contentType: 'image/jpeg',
       cache: 'miss',
       timings: { wasmMs: 12, baseMs: 8, encodeMs: 4 },
+      iconMissing: false,
     });
   });
 
@@ -385,12 +387,27 @@ describe('handleOgClimb', () => {
       expect(vi.mocked(renderOgClimb).mock.calls[0][0].format).toBe('png');
     });
 
+    it('lets nobody keep a card drawn without its app icon', async () => {
+      vi.mocked(renderOgClimb).mockResolvedValueOnce({
+        buffer: Buffer.from([0xff, 0xd8, 0xff, 0x00]),
+        contentType: 'image/jpeg',
+        cache: 'miss',
+        timings: { wasmMs: 12, baseMs: 8, encodeMs: 4 },
+        iconMissing: true,
+      });
+      const res = await run(validParams);
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['Cache-Control']).toBe('no-store');
+      expect(res.headers['CDN-Cache-Control']).toBe('no-store');
+    });
+
     it('surfaces a byte-cache hit in Server-Timing', async () => {
       vi.mocked(renderOgClimb).mockResolvedValueOnce({
         buffer: Buffer.from([0xff, 0xd8, 0xff, 0x00]),
         contentType: 'image/jpeg',
         cache: 'hit',
         timings: { wasmMs: 0, baseMs: 0, encodeMs: 0 },
+        iconMissing: false,
       });
       const res = await run(validParams);
       expect(res.statusCode).toBe(200);
@@ -430,6 +447,7 @@ describe('handleOgClimb', () => {
         buffer: Buffer.from([0xff, 0xd8, 0xff, 0x00]),
         contentType: 'image/jpeg',
         timings: { photoMs: 30, composeMs: 60 },
+        iconMissing: false,
       });
 
       const res = await run(sprayParams);
@@ -444,6 +462,21 @@ describe('handleOgClimb', () => {
       expect(String(res.headers['Server-Timing'])).toContain('photo;dur=');
       // The catalogue renderer has no part in this.
       expect(renderOgClimb).not.toHaveBeenCalled();
+    });
+
+    it('lets nobody keep a wall card drawn without its app icon', async () => {
+      vi.mocked(renderSprayOgCard).mockResolvedValueOnce({
+        kind: 'card',
+        buffer: Buffer.from([0xff, 0xd8, 0xff, 0x00]),
+        contentType: 'image/jpeg',
+        timings: { photoMs: 30, composeMs: 60 },
+        iconMissing: true,
+      });
+
+      const res = await run(sprayParams);
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['Cache-Control']).toBe('no-store');
+      expect(res.headers['CDN-Cache-Control']).toBe('no-store');
     });
 
     it('answers a private wall with an uncacheable 404, not a 403', async () => {
@@ -464,18 +497,20 @@ describe('handleOgClimb', () => {
         buffer: Buffer.from([0xff, 0xd8, 0xff, 0x00]),
         contentType: 'image/jpeg',
         timings: { photoMs: 1, composeMs: 2 },
+        iconMissing: false,
       });
 
       const res = await run(sprayParams);
       expect(res.statusCode).toBe(200);
     });
 
-    it('passes the layout id, frames and format straight through', async () => {
+    it('passes the layout id, frames, format and climb identity straight through', async () => {
       vi.mocked(renderSprayOgCard).mockResolvedValueOnce({
         kind: 'card',
         buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47]),
         contentType: 'image/png',
         timings: { photoMs: 1, composeMs: 2 },
+        iconMissing: false,
       });
 
       await run({ ...sprayParams, format: 'png' });
@@ -483,6 +518,7 @@ describe('handleOgClimb', () => {
         layoutId: 90001,
         frames: 'p501r1p502r2',
         format: 'png',
+        card: { name: undefined, grade: undefined, setter: undefined, angle: undefined, fontFamily: 'Noto Sans' },
       });
     });
 
@@ -622,4 +658,38 @@ describe('renderOgClimb (real render)', () => {
     });
     expect(boardseshRepeat.cache).toBe('hit');
   }, 30_000);
+});
+
+describe('handleOgClimb cache tier for version mismatches', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(ensureBoardRendererAvailable).mockResolvedValue(true);
+    vi.mocked(checkRateLimitRedis).mockResolvedValue(undefined);
+    vi.mocked(renderOgClimb).mockResolvedValue({
+      buffer: Buffer.from([0xff, 0xd8, 0xff, 0x00]),
+      contentType: 'image/jpeg',
+      cache: 'miss',
+      timings: { wasmMs: 12, baseMs: 8, encodeMs: 4 },
+      iconMissing: false,
+    });
+  });
+
+  it('keeps a request with no `v` immutable, as the already-shipped URLs are', async () => {
+    const res = await run(validParams);
+
+    expect(String(res.headers['Cache-Control'])).toContain('immutable');
+  });
+
+  it('keeps a request carrying the compiled version immutable', async () => {
+    const res = await run({ ...validParams, v: BOARD_RENDER_VERSION });
+
+    expect(String(res.headers['Cache-Control'])).toContain('immutable');
+  });
+
+  it('answers a stale `v` on the daily tier so old bytes cannot be pinned for a year', async () => {
+    const res = await run({ ...validParams, v: 'not-the-current-version' });
+
+    expect(String(res.headers['Cache-Control'])).not.toContain('immutable');
+    expect(String(res.headers['Cache-Control'])).toContain('s-maxage=86400');
+  });
 });

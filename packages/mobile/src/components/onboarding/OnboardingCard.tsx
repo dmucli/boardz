@@ -1,20 +1,22 @@
+import { Image, type ImageProps } from 'expo-image';
 import { memo } from 'react';
-import { StyleSheet, View, type ImageSourcePropType } from 'react-native';
-import { Image } from 'expo-image';
-import { Text } from '../Text';
+import { StyleSheet, View } from 'react-native';
+import { borderRadius, spacing } from '../../theme/tokens';
 import { Icon } from '../Icon';
-import { spacing, borderRadius } from '../../theme/tokens';
 import type { IconName } from '../icon-map';
+import { Text } from '../Text';
 
 const ILLUSTRATION_SIZE = 96;
 const ILLUSTRATION_IMAGE_WIDTH = 240;
 const ILLUSTRATION_IMAGE_HEIGHT = 360;
 
 type OnboardingCardProps = {
+  onImageDisplayed?: () => void;
+  onImageError?: (error: unknown) => void;
   /** Glyph for this page (resolved from the card data by the carousel). */
   icon: IconName;
   /** Real app-screen illustration; when present it replaces the glyph. */
-  image?: ImageSourcePropType;
+  image?: ImageProps['source'];
   /** Already-translated heading. Resolved at the call site with a static `t()`
    * literal so the i18n orphan checker can see the keys (no `t(variable)`). */
   title: string;
@@ -38,6 +40,8 @@ type OnboardingCardProps = {
  */
 function OnboardingCardComponent({
   icon,
+  onImageDisplayed,
+  onImageError,
   image,
   title,
   body,
@@ -56,7 +60,14 @@ function OnboardingCardComponent({
     >
       <View style={styles.illustration} importantForAccessibility="no-hide-descendants">
         {image ? (
-          <Image source={image} style={styles.illustrationImage} contentFit="contain" accessible={false} />
+          <Image
+            onDisplay={onImageDisplayed}
+            onError={onImageError}
+            source={image}
+            style={styles.illustrationImage}
+            contentFit="contain"
+            accessible={false}
+          />
         ) : (
           <Icon name={icon} size={ILLUSTRATION_SIZE} color={iconColor} />
         )}
@@ -68,7 +79,7 @@ function OnboardingCardComponent({
         {body}
       </Text>
       {footnote ? (
-        <Text variant="footnote" color={bodyColor} style={styles.footnote}>
+        <Text variant="footnote" tone="secondary" color={bodyColor} style={styles.footnote}>
           {footnote}
         </Text>
       ) : null}
@@ -107,6 +118,5 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     maxWidth: 340,
     marginTop: spacing[4],
-    opacity: 0.75,
   },
 });

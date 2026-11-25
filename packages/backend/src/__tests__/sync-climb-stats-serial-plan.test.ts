@@ -125,6 +125,45 @@ describe('syncClimbGrades serial-plan guard', () => {
 
     const pageStatement = renderStatement(transactionDatabase.execute.mock.calls[1][0]);
     expect(pageStatement).toContain('FROM board_climb_grades');
-    expect(pageStatement).not.toContain('EXISTS (');
+    // Omitting layout/size does not omit the climb's draft rule. A published
+    // climb has no audience, so no privacy table is read.
+    expect(pageStatement).toContain("bc.is_draft IS NOT TRUE OR COALESCE(bc.board_type = 'spray', false)");
+    expect(pageStatement).toContain('OR COALESCE(bc.user_id = ');
+    expect(pageStatement).not.toContain('content_privacy');
+    expect(pageStatement).toContain('FROM board_climbs bc');
+    expect(pageStatement).not.toMatch(/\bbc\.layout_id\s*=/);
+  });
+});
+
+describe.each([
+  { name: 'stats', resolver: syncQueries.syncClimbStats, table: 'board_climb_stats' },
+  { name: 'grades', resolver: syncQueries.syncClimbGrades, table: 'board_climb_grades' },
+])('snapshot supplemental $name query plan boundary', ({ resolver, table }) => {
+  it('materializes climb candidates and bounds PK child lookups on the guarded transaction', async () => {
+    await resolver(
+      undefined,
+      {
+        boardType: 'kilter',
+        layoutId: 1,
+        sizeId: 5,
+        limit: 20,
+        audience: 'SNAPSHOT_SUPPLEMENTAL',
+        snapshotClimbWatermark: { updatedAt: '2026-05-02T00:00:00.000Z', syncSeq: '10' },
+      },
+      connectionContext(),
+    );
+
+    expect(database.execute).not.toHaveBeenCalled();
+    expect(recordedHandles).toEqual(['transaction', 'transaction']);
+    expect(renderStatement(transactionDatabase.execute.mock.calls[0][0])).toMatch(SERIAL_PLAN_GUARD);
+    const pageStatement = renderStatement(transactionDatabase.execute.mock.calls[1][0]);
+    expect(pageStatement).toContain('WITH snapshot_candidates AS MATERIALIZED');
+    expect(pageStatement).toContain('CROSS JOIN LATERAL');
+    expect(pageStatement).toContain(`${table}.climb_uuid = snapshot_candidates.uuid`);
+    expect(pageStatement).toMatch(
+      /LIMIT \$\d+\s+\) supplemental_rows\s+ORDER BY supplemental_rows\.__updated_at ASC, supplemental_rows\.__seq ASC\s+LIMIT \$\d+/,
+    );
+    expect(pageStatement).toContain('bc.is_boardsesh_authored');
+    expect(pageStatement).toContain('(bc.updated_at, bc.sync_seq) >');
   });
 });

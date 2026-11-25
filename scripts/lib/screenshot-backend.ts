@@ -15,7 +15,8 @@
  * module (screenshot-fixtures.ts); this file is the I/O.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { bindFixtureAssetUrls } from './screenshot-fixture-assets';
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import {
   createServer,
@@ -27,8 +28,36 @@ import {
 import { extname, join, resolve as resolvePath, sep } from 'node:path';
 import type { Duplex } from 'node:stream';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
+import { Kind, parse } from 'graphql';
+import { SEARCH_CLIMBS_COUNT } from '../../packages/shared/graphql/src/operations/climb-search';
+import { createCppWsRecording, type CppWsOperation } from './cpp-ws-recording';
+import {
+  assertCppNativeJoinResponse,
+  assertCppNegativeStaticEntry,
+  assertCppNegativeFixtureFiles,
+  readCppBackgroundFile,
+  resolveCppNativeBackgroundPlan,
+  type CppNativeBackgroundPlan,
+} from './cpp-native-background-coverage';
+import { isCppTarget, readCppPage } from './screenshot-cpp';
+import {
+  assertCppGradeCountProof,
+  bindCppGradeCountProof,
+  cppGradeCountKey,
+  cppRecordedCountSelector,
+  readCppCountFixtures,
+  resolveCppGradeCountProof,
+} from './cpp-grade-count';
+import { formatCppUpstreamDiagnostic } from './cpp-upstream-diagnostics';
+import {
+  isCampaignPushRegistration,
+  isCampaignWallConfirmation,
+  isCppWallConfirmation,
+  replayCampaignSessionResponse,
+} from './screenshot-campaign-session';
 
 import {
+  AURORA_HISTORY_CAPABILITY_OPERATIONS,
   FIXTURE_HASH_DISPLAY_LENGTH,
   FIXTURE_SIZE_NOTE_BYTES,
   RE_RECORD_COMMAND,
@@ -38,7 +67,8 @@ import {
   batchRequestIds,
   batchScopeKey,
   batchedOperationSpec,
-  cappedUnrecordedIds,
+  cappedUncoveredIds,
+  canonicalJson,
   collectBatchItems,
   composeBatchedResponse,
   emptyManifest,
@@ -51,6 +81,8 @@ import {
   indexBatchItemsById,
   pseudonymiseResponse,
   redactIgnoredVariablePaths,
+  replayCompatibleFixtureResponse,
+  replayDefaultResponse,
   resolveOperationName,
   sortManifestEntries,
   sortedQueryString,
@@ -97,10 +129,21 @@ export type ScreenshotBackendServerOptions = {
   pseudonymise?: boolean;
   /** Which capture flow is being recorded. Stored in the manifest for provenance. */
   flow?: string;
+  /** Preparation only: persist this exact real native join after normal owned-session validation. */
+  nativeJoinRecording?: CppNativeBackgroundPlan['nativeJoin'];
+  /** Record-only bounded download/receipt policy for authorized CPP detail assets. */
+  staticRecording?: {
+    download: (pathname: string, query: string) => Promise<{ bytes: Buffer; contentType: string }>;
+    recorded: (entry: StaticManifestEntry, recordedAt: string) => void;
+  };
 };
 
 export type ScreenshotBackendStats = {
   mode: ScreenshotBackendMode;
+  /** Unique per server instance, so a restart cannot masquerade as continuous replay. */
+  processInstanceId: string;
+  /** SHA256 of the manifest loaded by this process; null until a recording is persisted. */
+  fixtureManifestSHA256: string | null;
   hits: number;
   misses: number;
   recorded: number;
@@ -110,8 +153,8 @@ export type ScreenshotBackendStats = {
 };
 
 export type ScreenshotBackendServer = {
-  /** Binds 0.0.0.0 and resolves with the actual port (pass 0 for an ephemeral one). */
-  listen(port: number): Promise<number>;
+  /** Resolves with the actual port; callers can select loopback-only binding. */
+  listen(port: number, host?: '127.0.0.1' | '0.0.0.0'): Promise<number>;
   close(): Promise<void>;
   stats(): ScreenshotBackendStats;
 };
@@ -149,6 +192,7 @@ const REPLAY_SESSION_LIFETIME_MS = 7 * 24 * 60 * 60 * 1000;
 const PASSIVE_SCREENSHOT_SUBSCRIPTIONS = new Set([
   'ClimbStatsUpdated',
   'NotificationReceived',
+  'AppBugReportChanged',
   'CommentUpdates',
   'OnNewClimbCreated',
   'BoardNowPlaying',
@@ -220,24 +264,82 @@ export function jwtSubject(token: string): string | null {
   }
 }
 
+/** Native keychain sessions can skip /auth on a relaunch. Bind only the
+ * upstream's authenticated profile, never an arbitrary public profile or JWT.
+ */
+function authenticatedRecordingProfile(
+  query: string,
+  responseBody: unknown,
+  token: string | null,
+): { id: string; email: string } | null {
+  if (!token || typeof responseBody !== 'object' || responseBody === null) return null;
+  const response = responseBody as { errors?: unknown; data?: { profile?: { id?: unknown; email?: unknown } } };
+  if (response.errors !== undefined && (!Array.isArray(response.errors) || response.errors.length > 0)) return null;
+  const profile = response.data?.profile;
+  if (
+    !profile ||
+    typeof profile.id !== 'string' ||
+    profile.id !== jwtSubject(token) ||
+    typeof profile.email !== 'string' ||
+    !profile.email.trim()
+  )
+    return null;
+  try {
+    const document = parse(query);
+    const operation = document.definitions[0];
+    if (
+      document.definitions.length !== 1 ||
+      operation.kind !== Kind.OPERATION_DEFINITION ||
+      operation.operation !== 'query' ||
+      operation.name?.value !== 'GetProfile' ||
+      operation.selectionSet.selections.length !== 1
+    )
+      return null;
+    const selection = operation.selectionSet.selections[0];
+    if (
+      selection.kind !== Kind.FIELD ||
+      selection.name.value !== 'profile' ||
+      selection.alias ||
+      selection.arguments?.length ||
+      !['id', 'email'].every((fieldName) =>
+        selection.selectionSet?.selections.some(
+          (field) =>
+            field.kind === Kind.FIELD && field.name.value === fieldName && !field.alias && !field.arguments?.length,
+        ),
+      )
+    )
+      return null;
+    return { id: profile.id, email: profile.email };
+  } catch {
+    return null;
+  }
+}
+
 function shortHash(hash: string): string {
   return hash.slice(0, FIXTURE_HASH_DISPLAY_LENGTH);
 }
 
 /** Read a manifest off disk. Returns null when there is none; throws when there is a broken one. */
 export function readScreenshotFixtureManifest(fixturesDir: string): ScreenshotFixtureManifest | null {
+  return readFixtureManifestSnapshot(fixturesDir)?.manifest ?? null;
+}
+
+function readFixtureManifestSnapshot(
+  fixturesDir: string,
+): { manifest: ScreenshotFixtureManifest; sha256: string } | null {
   const manifestPath = join(fixturesDir, MANIFEST_FILENAME);
   if (!existsSync(manifestPath)) return null;
+  const manifestBytes = readFileSync(manifestPath);
   let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(manifestPath, 'utf8'));
+    parsed = JSON.parse(manifestBytes.toString('utf8'));
   } catch (parseError) {
     const detail = parseError instanceof Error ? parseError.message : String(parseError);
     throw new Error(`${manifestPath} is not valid JSON: ${detail}`);
   }
   const validation = validateScreenshotFixtureManifest(parsed);
   if (!validation.ok) throw new Error(`${manifestPath} is not a usable fixture manifest: ${validation.reason}`);
-  return validation.manifest;
+  return { manifest: validation.manifest, sha256: createHash('sha256').update(manifestBytes).digest('hex') };
 }
 
 function writeJsonFile(filePath: string, value: unknown): void {
@@ -325,6 +427,7 @@ export function isFixtureFileWithinDirectory(fixturesDir: string, file: string):
 }
 
 export function createScreenshotBackend(options: ScreenshotBackendServerOptions): ScreenshotBackendServer {
+  const processInstanceId = randomUUID();
   const { mode, fixturesDir, frozenNow, log } = options;
   const isRecording = mode === 'record';
   // Defaults ON: a recording that forgets the flag must still be safe to
@@ -334,6 +437,25 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
   if (isRecording && !upstreamUrl) throw new Error('record mode needs an --upstream to record from');
   if (!isRecording && options.upstreamUrl) {
     throw new Error('replay mode makes no outbound requests — drop --upstream');
+  }
+
+  const recordingScenario =
+    isRecording && process.env.BOARDSESH_SCREENSHOT_CAPTURE_SCENARIO
+      ? (JSON.parse(process.env.BOARDSESH_SCREENSHOT_CAPTURE_SCENARIO) as unknown)
+      : undefined;
+  if (recordingScenario !== undefined) {
+    const scenarioValidation = validateScreenshotFixtureManifest({
+      ...emptyManifest({
+        recordedAt: new Date().toISOString(),
+        frozenNow,
+        upstream: upstreamUrl ?? '',
+        accountEmail: '',
+        accountUserId: '',
+        flow: options.flow ?? DEFAULT_SCREENSHOT_FLOW,
+      }),
+      capture: recordingScenario,
+    });
+    if (!scenarioValidation.ok) throw new Error(`Invalid recording capture scenario: ${scenarioValidation.reason}`);
   }
 
   const emit = (line: ScreenshotBackendLogLine): void => log(formatScreenshotBackendLine(line));
@@ -346,7 +468,9 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     rmSync(join(fixturesDir, MANIFEST_FILENAME), { force: true });
   }
 
-  const loadedManifest = readScreenshotFixtureManifest(fixturesDir);
+  const manifestSnapshot = readFixtureManifestSnapshot(fixturesDir);
+  const loadedManifest = manifestSnapshot?.manifest ?? null;
+  let fixtureManifestSHA256 = manifestSnapshot?.sha256 ?? null;
   if (!isRecording && !loadedManifest) {
     throw new Error(`replay needs a recorded fixture set — no ${MANIFEST_FILENAME} under ${fixturesDir}`);
   }
@@ -365,6 +489,9 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     manifest.frozenNow = frozenNow;
     manifest.upstream = upstreamUrl ?? '';
     manifest.flow = options.flow ?? manifest.flow;
+    if (recordingScenario !== undefined) {
+      manifest.capture = recordingScenario as ScreenshotFixtureManifest['capture'];
+    }
   }
 
   // (operationName, variablesHash) -> entry. The variables pick the fixture; the
@@ -374,6 +501,38 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
   const staticIndex = new Map<string, StaticManifestEntry>();
   for (const entry of manifest.static)
     staticIndex.set(entry.query ? `${entry.path}?${entry.query}` : entry.path, entry);
+  assertCppNegativeFixtureFiles(manifest, (file) => readCppBackgroundFile(fixturesDir, file));
+  const nativeBackgroundPlan =
+    options.nativeJoinRecording || manifest.static.some((entry) => entry.response)
+      ? resolveCppNativeBackgroundPlan(
+          manifest,
+          manifest.graphql.map(
+            (entry) =>
+              JSON.parse(readCppBackgroundFile(fixturesDir, entry.file).toString('utf8')) as GraphqlFixtureFile,
+          ),
+        )
+      : null;
+  if (
+    options.nativeJoinRecording &&
+    (!isRecording ||
+      !nativeBackgroundPlan ||
+      JSON.stringify(options.nativeJoinRecording) !== JSON.stringify(nativeBackgroundPlan.nativeJoin))
+  )
+    throw new Error('CPP native join recording is outside the exact verified preparation scope');
+  const nativeBackgroundSources =
+    nativeBackgroundPlan?.sourceFiles.map((file) => ({
+      file,
+      sha256: sha256Hex(readCppBackgroundFile(fixturesDir, file).toString('utf8')),
+    })) ?? [];
+  for (const entry of manifest.static)
+    if (entry.response)
+      assertCppNegativeStaticEntry(
+        entry,
+        readCppBackgroundFile(fixturesDir, entry.file),
+        nativeBackgroundPlan,
+        nativeBackgroundSources,
+        manifest.frozenNow,
+      );
 
   const variantCounts = new Map<string, number>();
   for (const entry of manifest.graphql) {
@@ -387,6 +546,15 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
    * git history.
    */
   const sensitiveTokens = new Set<string>();
+  // This only rejects mixed sessions. An unverified bearer subject never
+  // establishes manifest identity; the upstream auth/profile must do that.
+  let observedRecordingSubject = manifest.accountUserId || null;
+  const acceptRecordingSubject = (subject: string | null): boolean => {
+    if (!subject) return true;
+    if (observedRecordingSubject && observedRecordingSubject !== subject) return false;
+    observedRecordingSubject = subject;
+    return true;
+  };
 
   let hits = 0;
   let misses = 0;
@@ -427,6 +595,9 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       }
     }
     writeJsonFile(join(fixturesDir, MANIFEST_FILENAME), sortManifestEntries(manifest));
+    fixtureManifestSHA256 = createHash('sha256')
+      .update(readFileSync(join(fixturesDir, MANIFEST_FILENAME)))
+      .digest('hex');
   };
 
   const carriesSensitiveToken = (serialized: string): boolean => {
@@ -448,23 +619,105 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     rawBody: Buffer,
     parsedBody: Record<string, unknown>,
   ): Promise<void> => {
-    const upstreamResponse = await fetch(`${upstreamUrl}/graphql`, {
-      method: 'POST',
-      headers: { ...forwardableHeaders(request.headers), 'content-type': 'application/json' },
-      // Sent as text, not the Buffer: both bodies here are JSON, and `fetch`'s
-      // BodyInit does not accept a Node Buffer under the DOM lib.
-      body: rawBody.toString('utf8'),
-    });
-    const responseText = await upstreamResponse.text();
-    const contentType = upstreamResponse.headers.get('content-type') ?? 'application/json; charset=utf-8';
-    response.writeHead(upstreamResponse.status, {
-      'content-type': contentType,
-      'content-length': Buffer.byteLength(responseText),
-    });
-    response.end(responseText);
+    const authorization = request.headers.authorization;
+    const bearerToken =
+      typeof authorization === 'string' ? (/^Bearer\s+(\S+)$/i.exec(authorization)?.[1] ?? null) : null;
+    if (bearerToken) {
+      sensitiveTokens.add(bearerToken);
+      const payload = bearerToken.split('.')[1];
+      if (payload) sensitiveTokens.add(payload);
+    }
+    const bearerSubject = bearerToken ? jwtSubject(bearerToken) : null;
+    if (
+      !acceptRecordingSubject(bearerSubject) ||
+      (manifest.accountUserId && bearerSubject && manifest.accountUserId !== bearerSubject)
+    ) {
+      emit({
+        event: 'upstream-error',
+        operationName: resolveOperationName(parsedBody) ?? 'anonymous',
+        detail: 'recording-account-mismatch',
+      });
+      sendJson(response, 200, { errors: [{ message: 'Screenshot recording is bound to a different account' }] });
+      return;
+    }
+    const diagnosticKey =
+      manifest.flow === 'app-store-cpp'
+        ? graphqlFixtureKey(
+            {
+              operationName: resolveOperationName(parsedBody) ?? 'anonymous',
+              query: typeof parsedBody.query === 'string' ? parsedBody.query : '',
+              variables: parsedBody.variables,
+            },
+            sha256Hex,
+          )
+        : null;
+    const startedAt = Date.now();
+    const diagnose = (
+      phase: 'fetch-error' | 'body-error' | 'client-closed' | 'response',
+      status?: number,
+      error?: unknown,
+    ): void => {
+      if (diagnosticKey)
+        log(formatCppUpstreamDiagnostic({ ...diagnosticKey, phase, elapsedMs: Date.now() - startedAt, status, error }));
+    };
+    const clientClosed = (): void => {
+      if (!response.writableFinished) diagnose('client-closed');
+    };
+    if (diagnosticKey) response.on('close', clientClosed);
+    try {
+      let upstreamResponse: Response;
+      try {
+        upstreamResponse = await fetch(`${upstreamUrl}/graphql`, {
+          method: 'POST',
+          headers: { ...forwardableHeaders(request.headers), 'content-type': 'application/json' },
+          // Sent as text, not the Buffer: fetch's DOM BodyInit excludes Buffer.
+          body: rawBody.toString('utf8'),
+        });
+      } catch (error: unknown) {
+        diagnose('fetch-error', undefined, error);
+        throw error;
+      }
+      let responseText: string;
+      try {
+        responseText = await upstreamResponse.text();
+      } catch (error: unknown) {
+        diagnose('body-error', upstreamResponse.status, error);
+        throw error;
+      }
+      diagnose('response', upstreamResponse.status);
+      const contentType = upstreamResponse.headers.get('content-type') ?? 'application/json; charset=utf-8';
+      response.writeHead(upstreamResponse.status, {
+        'content-type': contentType,
+        'content-length': Buffer.byteLength(responseText),
+      });
+      response.end(responseText);
+      persistRecordedResponse(parsedBody, responseText, upstreamResponse.status, bearerToken);
+    } finally {
+      if (diagnosticKey) response.off('close', clientClosed);
+    }
+  };
 
+  /** HTTP and CPP WS share every credential, identity, privacy and provenance guard. */
+  let cppGradeCountFailed = false;
+  const persistRecordedResponse = (
+    parsedBody: Record<string, unknown>,
+    responseText: string,
+    status: number,
+    bearerToken: string | null,
+    verifiedSubject?: string,
+  ): void => {
+    const bearerSubject = verifiedSubject ?? (bearerToken ? jwtSubject(bearerToken) : null);
     const operationName = resolveOperationName(parsedBody);
     const loggedName = operationName ?? 'anonymous';
+    // Another request may have established the recording identity while this
+    // upstream request was in flight. Recheck before persisting any response.
+    if (
+      !acceptRecordingSubject(bearerSubject) ||
+      (manifest.accountUserId && bearerSubject && manifest.accountUserId !== bearerSubject)
+    ) {
+      emit({ event: 'upstream-error', operationName: loggedName, detail: 'recording-account-mismatch' });
+      return;
+    }
     const responseBody: unknown = ((): unknown => {
       try {
         return JSON.parse(responseText);
@@ -485,11 +738,11 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       );
     const hasData = typeof responseBody === 'object' && responseBody !== null && Object.hasOwn(responseBody, 'data');
 
-    if (upstreamResponse.status !== 200 || !hasData || hasInternalServerError) {
+    if (status !== 200 || !hasData || hasInternalServerError) {
       emit({
         event: 'upstream-error',
         operationName: loggedName,
-        detail: hasInternalServerError ? 'code=INTERNAL_SERVER_ERROR' : `status=${upstreamResponse.status}`,
+        detail: hasInternalServerError ? 'code=INTERNAL_SERVER_ERROR' : `status=${status}`,
       });
       return;
     }
@@ -501,8 +754,78 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     }
 
     const query = typeof parsedBody.query === 'string' ? parsedBody.query : '';
+    const profileIdentity = authenticatedRecordingProfile(query, responseBody, bearerToken);
+    if (profileIdentity) {
+      if (manifest.accountUserId && manifest.accountUserId !== profileIdentity.id) {
+        emit({ event: 'upstream-error', operationName: loggedName, detail: 'recording-account-mismatch' });
+        return;
+      }
+      if (manifest.accountUserId !== profileIdentity.id || manifest.accountEmail !== profileIdentity.email) {
+        manifest.accountUserId = profileIdentity.id;
+        manifest.accountEmail = profileIdentity.email;
+        rewriteManifest();
+      }
+    }
     const key = graphqlFixtureKey({ operationName, query, variables: parsedBody.variables }, sha256Hex);
     const indexKey = `${key.operationName}\n${key.variablesHash}`;
+    let exactCppGradeCount = false;
+    const incomingCountInput = (
+      parsedBody.variables as { input?: { minGrade?: unknown; maxGrade?: unknown } } | undefined
+    )?.input;
+    const selectedGradeRange = manifest.capture?.cpp?.scenes.search?.gradeFilter;
+    if (
+      key.operationName === 'SearchClimbsCount' &&
+      manifest.flow === 'app-store-cpp' &&
+      selectedGradeRange &&
+      incomingCountInput?.minGrade === selectedGradeRange.minGradeId &&
+      incomingCountInput?.maxGrade === selectedGradeRange.maxGradeId
+    ) {
+      try {
+        const countFixtures = readCppCountFixtures(fixturesDir, manifest);
+        const expected = cppGradeCountKey(manifest, countFixtures);
+        exactCppGradeCount = expected.variablesHash === key.variablesHash;
+        if (exactCppGradeCount) {
+          const candidate: GraphqlFixtureFile = {
+            formatVersion: SCREENSHOT_FIXTURE_FORMAT_VERSION,
+            ...key,
+            query,
+            variables: parsedBody.variables ?? {},
+            response: responseBody,
+            status,
+            recordedAt: new Date().toISOString(),
+            upstream: upstreamUrl!,
+          };
+          const prospective = {
+            ...manifest,
+            graphql: [
+              ...manifest.graphql.filter(
+                (entry) => entry.operationName !== key.operationName || entry.variablesHash !== key.variablesHash,
+              ),
+              { ...key, file: graphqlFixturePath(key.operationName, key.variablesHash) },
+            ],
+          };
+          const proof = resolveCppGradeCountProof(prospective, [
+            ...countFixtures.filter(
+              (fixture) => fixture.variablesHash !== key.variablesHash || fixture.operationName !== key.operationName,
+            ),
+            candidate,
+          ]);
+          if (
+            graphqlIndex.has(indexKey) &&
+            resolveCppGradeCountProof(manifest, countFixtures).totalCount !== proof.totalCount
+          )
+            throw new Error('changed exact count');
+        }
+      } catch {
+        cppGradeCountFailed = true;
+        emit({
+          event: 'upstream-error',
+          operationName: key.operationName,
+          detail: 'cpp-exact-grade-count-provenance-or-count-changed',
+        });
+        return;
+      }
+    }
     if (graphqlIndex.has(indexKey)) {
       // FIRST WINS. A capture calls the same query many times; re-recording on
       // every call would make the fixture set depend on scroll timing.
@@ -549,7 +872,7 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       // actually sends.
       variables: redactIgnoredVariablePaths(key.operationName, parsedBody.variables ?? {}),
       response: persistedResponse,
-      status: upstreamResponse.status,
+      status: status,
       recordedAt: new Date().toISOString(),
       upstream: upstreamUrl ?? '',
     };
@@ -590,6 +913,8 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     };
     manifest.graphql.push(entry);
     graphqlIndex.set(indexKey, entry);
+    if (exactCppGradeCount)
+      manifest.capture = bindCppGradeCountProof(manifest, readCppCountFixtures(fixturesDir, manifest)).capture;
     recordedAtInstants.push(fixture.recordedAt);
     recorded += 1;
     emit({
@@ -608,6 +933,49 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     rewriteManifest();
   };
 
+  const cppRecording =
+    isRecording && options.flow === 'app-store-cpp' && manifest.capture?.cpp
+      ? createCppWsRecording({
+          upstreamUrl: upstreamUrl!,
+          log,
+          scope: () => {
+            const coverage = manifest.capture?.cpp;
+            if (
+              !coverage ||
+              !isCppTarget(coverage.target) ||
+              !manifest.accountUserId ||
+              !manifest.capture?.sharedSessionId ||
+              coverage.scenes.queue?.sessionId !== manifest.capture.sharedSessionId
+            )
+              return null;
+            const primary = readCppPage(coverage.target).primaryBoard;
+            const boardUuid = coverage.boardIds?.[primary.id] ?? coverage.scenes.search?.boardId;
+            if (!boardUuid || coverage.scenes.queue.boardId !== boardUuid) return null;
+            return {
+              accountUserId: manifest.accountUserId,
+              sessionId: manifest.capture.sharedSessionId,
+              boardUuid,
+              primary,
+            };
+          },
+          authorizeToken: (token) => {
+            sensitiveTokens.add(token);
+            const payload = token.split('.')[1];
+            if (payload) sensitiveTokens.add(payload);
+            const subject = jwtSubject(token);
+            return Boolean(subject && acceptRecordingSubject(subject) && manifest.accountUserId === subject);
+          },
+          persist: (operation, body, subject) =>
+            persistRecordedResponse(
+              operation as unknown as Record<string, unknown>,
+              JSON.stringify(body),
+              200,
+              null,
+              subject,
+            ),
+        })
+      : null;
+
   /**
    * One batch scope's recorded fixtures, decomposed: every id the recording
    * ever asked for under these non-id variables, mapped to the items recorded
@@ -623,6 +991,66 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
    * once instead of per request.
    */
   const batchedIndexes = new Map<string, Map<string, BatchedScopeIndex>>();
+
+  // Count queries do not consume pagination in count-climbs.ts. Keep the exact
+  // recorded lookup first, then reuse a genuine count only when every other
+  // variable and the query document still match. Never rewrite recording keys.
+  const countPaginationIndexes = new Map<string, Map<string, { entry: GraphqlManifestEntry; count: number } | null>>();
+  const countDocumentHash = graphqlFixtureKey(
+    { operationName: 'SearchClimbsCount', query: SEARCH_CLIMBS_COUNT },
+    sha256Hex,
+  ).documentHash;
+  const countVariablesScope = (variables: unknown): string | null => {
+    if (typeof variables !== 'object' || variables === null || Array.isArray(variables)) return null;
+    const input = (variables as Record<string, unknown>).input;
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) return null;
+    return canonicalJson({
+      ...variables,
+      input: Object.fromEntries(Object.entries(input).filter(([name]) => name !== 'page' && name !== 'pageSize')),
+    });
+  };
+  const countEntryWithoutPagination = (documentHash: string, variables: unknown): GraphqlManifestEntry | null => {
+    if (documentHash !== countDocumentHash) return null;
+    const requestedScope = countVariablesScope(variables);
+    if (requestedScope === null) return null;
+    let scopes = countPaginationIndexes.get(documentHash);
+    if (!scopes) {
+      scopes = new Map();
+      for (const entry of manifest.graphql) {
+        if (entry.operationName !== 'SearchClimbsCount' || entry.documentHash !== documentHash) continue;
+        if (!isFixtureFileWithinDirectory(fixturesDir, entry.file)) throw new Error('Invalid count fixture path');
+        const fixture = JSON.parse(readFileSync(join(fixturesDir, entry.file), 'utf8')) as GraphqlFixtureFile;
+        const scope = countVariablesScope(fixture.variables);
+        if (scope === null) continue;
+        const fixtureKey = graphqlFixtureKey(fixture, sha256Hex);
+        const response = fixture.response as {
+          errors?: unknown;
+          data?: { searchClimbs?: { totalCount?: unknown } };
+        } | null;
+        const count = response?.data?.searchClimbs?.totalCount;
+        if (
+          fixture.operationName !== entry.operationName ||
+          fixture.documentHash !== documentHash ||
+          fixtureKey.documentHash !== documentHash ||
+          fixture.variablesHash !== entry.variablesHash ||
+          fixtureKey.variablesHash !== entry.variablesHash ||
+          fixture.status !== 200 ||
+          response?.errors !== undefined ||
+          typeof count !== 'number' ||
+          !Number.isSafeInteger(count) ||
+          count < 0
+        ) {
+          scopes.set(scope, null);
+          continue;
+        }
+        const previous = scopes.get(scope);
+        if (previous === null || (previous && previous.count !== count)) scopes.set(scope, null);
+        else if (!previous) scopes.set(scope, { entry, count });
+      }
+      countPaginationIndexes.set(documentHash, scopes);
+    }
+    return scopes.get(requestedScope)?.entry ?? null;
+  };
 
   const batchedIndexFor = (operationName: string, spec: BatchedOperationSpec): Map<string, BatchedScopeIndex> => {
     const cached = batchedIndexes.get(operationName);
@@ -680,11 +1108,22 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
    * covered ids and nothing for the rest is a shape the real server produces
    * too — a climb with no stats simply has no row.
    *
-   * The one thing that still misses is a batch where NOT ONE id was covered:
-   * that is not draw distance, it is a screen the recording never reached.
+   * A batch where NOT ONE id was covered is answered the same way, with an
+   * empty list. It used to miss, on the theory that only a screen the
+   * recording never reached could produce one. Run 37258958437 showed
+   * otherwise: the same twenty Grasshopper ids were asked for on all three
+   * attempts, two of them covered, and the attempt where the read coordinator
+   * happened to split the eighteen uncovered ids into a chunk of their own
+   * failed the capture. Whether a chunk holds a covered id is flush timing, so
+   * it cannot be what decides a miss. The hit line carries `composed=0`, and
+   * the capture's note counts those batches apart.
    *
-   * Returns true when it answered (composed, or a miss), false when this
-   * request is not composable at all and belongs on the ordinary miss path.
+   * What still misses is a SCOPE nothing was recorded under — another board,
+   * another entity type, an older document — which falls through to
+   * `no-fixture` below.
+   *
+   * Returns true when it answered, false when this request is not composable
+   * at all and belongs on the ordinary miss path.
    */
   const replayComposedBatch = (
     sendResponse: SendGraphqlResponse,
@@ -692,7 +1131,6 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     documentHash: string,
     hash12: string,
     variables: unknown,
-    missGraphql: (loggedName: string, reason: GraphqlMissReason, unrecordedIds?: readonly string[]) => void,
   ): boolean => {
     const spec = batchedOperationSpec(operationName);
     if (!spec) return false;
@@ -706,13 +1144,11 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     if (!scope) return false;
 
     const { items, unrecordedIds, answeredIds } = collectBatchItems(scope.itemsById, requestedIds);
-    if (answeredIds.length === 0) {
-      missGraphql(operationName, 'unrecorded-ids', cappedUnrecordedIds(unrecordedIds));
-      return true;
-    }
     const composed = composeBatchedResponse(spec, scope.templateResponse, items);
     if (!composed.ok) return false;
-    hits += 1;
+    // An answer with no recorded id behind it is not a hit; the capture's
+    // problem scanner applies the same rule to the log.
+    if (answeredIds.length > 0) hits += 1;
     emit({
       event: 'hit',
       kind: 'graphql',
@@ -720,7 +1156,7 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       hash12,
       composed: answeredIds.length,
       uncoveredCount: unrecordedIds.length,
-      uncoveredIds: cappedUnrecordedIds(unrecordedIds),
+      uncoveredIds: cappedUncoveredIds(unrecordedIds),
     });
     sendResponse(JSON.stringify(composed.response));
     return true;
@@ -737,11 +1173,7 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     const loggedVariables = formatMissVariables(operationName ?? '', parsedBody.variables);
 
     /** Every miss carries GraphQL `errors`; HTTP sends 200 — see `handleGraphql`. */
-    const missGraphql = (
-      loggedName: string,
-      reason: GraphqlMissReason,
-      unrecordedIds: readonly string[] = [],
-    ): void => {
+    const missGraphql = (loggedName: string, reason: GraphqlMissReason): void => {
       misses += 1;
       emit({
         event: 'miss',
@@ -749,7 +1181,6 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
         operationName: loggedName,
         hash12,
         reason,
-        unrecordedIds,
         variables: loggedVariables,
       });
       sendResponse(JSON.stringify(fixtureMissBody(loggedName, hash12)));
@@ -760,22 +1191,135 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       return;
     }
 
-    const entry = graphqlIndex.get(`${operationName}\n${key.variablesHash}`);
+    if (manifest.flow === 'app-store-campaign' && isCampaignPushRegistration(query)) {
+      emit({ event: 'default', operationName, hash12 });
+      sendResponse(
+        JSON.stringify({ errors: [{ message: 'APNs registration is disabled in local screenshot replay' }] }),
+      );
+      return;
+    }
+    if (['app-store-campaign', 'app-store-cpp'].includes(manifest.flow) && operationName === 'ConfirmClimbOnWall') {
+      try {
+        const fixtureOperations =
+          manifest.flow === 'app-store-cpp'
+            ? ['GetMyBoards', 'SearchClimbs', 'JoinSession', 'QueueUpdates']
+            : ['JoinSession', 'QueueUpdates'];
+        const recordedFixtures = manifest.graphql
+          .filter((item) => fixtureOperations.includes(item.operationName))
+          .map((item) => {
+            if (!isFixtureFileWithinDirectory(fixturesDir, item.file)) throw new Error('Invalid fixture path');
+            return JSON.parse(readFileSync(join(fixturesDir, item.file), 'utf8')) as GraphqlFixtureFile;
+          });
+        const crewFixtures = recordedFixtures.filter(
+          (fixture) =>
+            fixture.variables &&
+            typeof fixture.variables === 'object' &&
+            (fixture.variables as Record<string, unknown>).sessionId === manifest.capture?.sharedSessionId,
+        );
+        const queue = crewFixtures.find((fixture) => fixture.operationName === 'QueueUpdates');
+        const recognizedConfirmation =
+          manifest.flow === 'app-store-cpp'
+            ? isCppWallConfirmation(query, parsedBody.variables, manifest, recordedFixtures)
+            : queue &&
+              crewFixtures.some((fixture) => isCampaignWallConfirmation(query, parsedBody.variables, queue, fixture));
+        if (recognizedConfirmation) {
+          emit({ event: 'default', operationName, hash12 });
+          sendResponse(
+            JSON.stringify({
+              errors: [{ message: 'Physical wall confirmation is disabled in local screenshot replay' }],
+            }),
+          );
+          return;
+        }
+        if (manifest.flow === 'app-store-cpp') {
+          missGraphql(operationName, 'no-fixture');
+          return;
+        }
+      } catch {
+        missGraphql(operationName, 'unreadable-fixture');
+        return;
+      }
+    }
+    let entry = graphqlIndex.get(`${operationName}\n${key.variablesHash}`);
+    if (!entry && AURORA_HISTORY_CAPABILITY_OPERATIONS.has(operationName)) {
+      const variables = parsedBody.variables;
+      if (
+        variables &&
+        typeof variables === 'object' &&
+        !Array.isArray(variables) &&
+        (variables as Record<string, unknown>).includeAurora === true
+      ) {
+        const legacyVariables = Object.fromEntries(
+          Object.entries(variables).filter(([name]) => name !== 'includeAurora'),
+        );
+        const legacyKey = graphqlFixtureKey({ operationName, query, variables: legacyVariables }, sha256Hex);
+        const legacyEntry = graphqlIndex.get(`${operationName}\n${legacyKey.variablesHash}`);
+        if (legacyEntry && isFixtureFileWithinDirectory(fixturesDir, legacyEntry.file)) {
+          try {
+            const fixture = JSON.parse(readFileSync(join(fixturesDir, legacyEntry.file), 'utf8')) as GraphqlFixtureFile;
+            // Only replay the exact additive opt-in over the unchanged recorded
+            // snapshot. Recording keys/hashes and real board UUIDs stay intact.
+            if (!fixture.query.includes('includeAurora') && replayCompatibleFixtureResponse(query, fixture))
+              entry = legacyEntry;
+          } catch {
+            missGraphql(operationName, 'unreadable-fixture');
+            return;
+          }
+        }
+      }
+    }
+    if (!entry && operationName === 'SearchClimbsCount') {
+      try {
+        entry = countEntryWithoutPagination(key.documentHash, parsedBody.variables) ?? undefined;
+      } catch {
+        missGraphql(operationName, 'unreadable-fixture');
+        return;
+      }
+    }
+    let campaignResponse: { response: unknown } | null = null;
+    const cpp = manifest.capture?.cpp;
+    const cppReplayScope =
+      manifest.flow === 'app-store-cpp' &&
+      cpp &&
+      isCppTarget(cpp.target) &&
+      manifest.capture?.sharedSessionId &&
+      cpp.scenes?.queue?.sessionId === manifest.capture.sharedSessionId &&
+      typeof cpp.scenes.search?.boardId === 'string' &&
+      cpp.scenes.search.boardId.trim().length > 0 &&
+      cpp.scenes.queue.boardId === cpp.scenes.search.boardId &&
+      (parsedBody.variables as { sessionId?: unknown } | undefined)?.sessionId === manifest.capture.sharedSessionId;
+    if (!entry && (manifest.flow === 'app-store-campaign' || cppReplayScope) && operationName === 'JoinSession') {
+      for (const candidate of manifest.graphql.filter((item) => item.operationName === 'JoinSession')) {
+        try {
+          if (!isFixtureFileWithinDirectory(fixturesDir, candidate.file)) throw new Error('Invalid fixture path');
+          const fixture = JSON.parse(readFileSync(join(fixturesDir, candidate.file), 'utf8')) as GraphqlFixtureFile;
+          campaignResponse = replayCampaignSessionResponse(query, parsedBody.variables, fixture);
+          if (campaignResponse) {
+            entry = candidate;
+            break;
+          }
+        } catch {
+          missGraphql(operationName, 'unreadable-fixture');
+          return;
+        }
+      }
+    }
     if (!entry) {
       // EXACT KEY FIRST, always: a batch that was recorded verbatim replays its
       // own recorded bytes. Only a batch nobody recorded as a whole is composed
       // out of the recorded ones — see `BATCHED_OPERATIONS` for why membership,
       // not the exact id list, is the stable key for these.
-      if (
-        replayComposedBatch(sendResponse, operationName, key.documentHash, hash12, parsedBody.variables, missGraphql)
-      ) {
+      if (replayComposedBatch(sendResponse, operationName, key.documentHash, hash12, parsedBody.variables)) return;
+      // A declared default answers only an operation the set holds NOTHING for.
+      // Once it has a fixture, an unrecorded variables set is a real miss.
+      const hasRecordedFixture = manifest.graphql.some((recorded) => recorded.operationName === operationName);
+      const replayDefault = hasRecordedFixture ? null : replayDefaultResponse(operationName);
+      if (replayDefault) {
+        emit({ event: 'default', operationName, hash12 });
+        sendResponse(JSON.stringify(replayDefault.response));
         return;
       }
       missGraphql(operationName, 'no-fixture');
-      return;
-    }
-    if (entry.documentHash !== key.documentHash) {
-      missGraphql(operationName, 'document-changed');
       return;
     }
     if (!isFixtureFileWithinDirectory(fixturesDir, entry.file)) {
@@ -787,13 +1331,43 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       return;
     }
 
-    let serializedResponse = replayResponseCache.get(entry.file);
+    const responseCacheKey = `${entry.file}\n${key.documentHash}`;
+    let serializedResponse = replayResponseCache.get(responseCacheKey);
     if (serializedResponse === undefined) {
       try {
         const fixture = JSON.parse(readFileSync(join(fixturesDir, entry.file), 'utf8')) as GraphqlFixtureFile;
-        // The recorded body verbatim, `errors` included: a screen that was
-        // recorded showing a partial error must screenshot the same way.
-        serializedResponse = JSON.stringify(fixture.response);
+        // This set's own JoinSession replies: the only evidence an adapter may
+        // cite (GetSession's `isPermanent`, #6591). Read only when one asks.
+        const joinSessionFixtures = (): GraphqlFixtureFile[] =>
+          manifest.graphql
+            .filter((recorded) => recorded.operationName === 'JoinSession')
+            .map((recorded) => {
+              if (!isFixtureFileWithinDirectory(fixturesDir, recorded.file)) throw new Error('Invalid fixture path');
+              return JSON.parse(readFileSync(join(fixturesDir, recorded.file), 'utf8')) as GraphqlFixtureFile;
+            });
+        const compatibility =
+          campaignResponse ??
+          (entry.documentHash !== key.documentHash
+            ? (replayCompatibleFixtureResponse(query, fixture, { joinSessionFixtures }) ??
+              (manifest.flow === 'app-store-campaign' || cppReplayScope
+                ? replayCampaignSessionResponse(query, parsedBody.variables, fixture)
+                : null))
+            : null);
+        if (entry.documentHash !== key.documentHash && !compatibility) {
+          missGraphql(operationName, 'document-changed');
+          return;
+        }
+        // Preserve recorded errors. Compatibility is limited to known nullable
+        // board fields, GetSession's recorded `isPermanent`, and the campaign's
+        // recorded session projections.
+        serializedResponse = JSON.stringify(compatibility?.response ?? fixture.response);
+        const boundAddress = httpServer.address();
+        if (!boundAddress || typeof boundAddress === 'string') throw new Error('Replay asset origin is unavailable');
+        serializedResponse = bindFixtureAssetUrls(
+          serializedResponse,
+          `http://localhost:${boundAddress.port}`,
+          manifest.static.map((asset) => asset.path),
+        );
       } catch {
         // The startup check already read every fixture, so the file went
         // missing or was truncated DURING the run. Answer exactly like any
@@ -802,7 +1376,7 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
         missGraphql(operationName, 'unreadable-fixture');
         return;
       }
-      replayResponseCache.set(entry.file, serializedResponse);
+      replayResponseCache.set(responseCacheKey, serializedResponse);
     }
     hits += 1;
     emit({ event: 'hit', kind: 'graphql', operationName, hash12, composed: null, uncoveredCount: 0, uncoveredIds: [] });
@@ -837,8 +1411,16 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     // — not an empty list. The placard stays visible in the capture, which is
     // exactly what makes a miss noticeable at a glance, and the connectivity
     // store itself is never tripped.
-    if (isRecording) await recordGraphql(request, response, rawBody, parsedBody as Record<string, unknown>);
-    else
+    if (isRecording) {
+      if (cppRecording && typeof (parsedBody as Record<string, unknown>).query === 'string') {
+        const token =
+          typeof request.headers.authorization === 'string'
+            ? /^Bearer\s+(\S+)$/i.exec(request.headers.authorization)?.[1]
+            : undefined;
+        if (token) await cppRecording.preparePreview(parsedBody as CppWsOperation, token);
+      }
+      await recordGraphql(request, response, rawBody, parsedBody as Record<string, unknown>);
+    } else
       replayGraphql(
         (serializedResponse) => sendRawJson(response, 200, serializedResponse),
         parsedBody as Record<string, unknown>,
@@ -897,6 +1479,12 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       const token = (session as Record<string, unknown>)[field];
       if (typeof token === 'string' && token.length > 0) sensitiveTokens.add(token);
     }
+    const liveJwt = (session as Record<string, unknown>).jwt;
+    const subject = typeof liveJwt === 'string' ? jwtSubject(liveJwt) : null;
+    if (!acceptRecordingSubject(subject) || (manifest.accountUserId && subject && manifest.accountUserId !== subject)) {
+      emit({ event: 'upstream-error', operationName: 'NativeAuth', detail: 'recording-account-mismatch' });
+      return;
+    }
     const requestBody = parseJsonBody(rawBody);
     const email =
       typeof requestBody === 'object' && requestBody !== null ? (requestBody as { email?: unknown }).email : undefined;
@@ -908,8 +1496,6 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     // The id, not the token: replay needs a jwt the app can read a `sub` out
     // of, and the live jwt itself must never reach disk. `/auth/native/refresh`
     // carries no email but does carry a jwt, so it fills this in too.
-    const liveJwt = (session as Record<string, unknown>).jwt;
-    const subject = typeof liveJwt === 'string' ? jwtSubject(liveJwt) : null;
     if (subject && manifest.accountUserId !== subject) {
       manifest.accountUserId = subject;
       manifestChanged = true;
@@ -941,12 +1527,21 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     const subject = query ? `${pathname}?${query}` : pathname;
     // PROD answers /static/* with a 302 to a CDN. Follow it for the bytes, but
     // key by what the app asked for — the CDN URL is not stable.
-    const upstreamResponse = await fetch(`${upstreamUrl}${subject}`, { redirect: 'follow' });
-    const bytes = Buffer.from(await upstreamResponse.arrayBuffer());
-    const contentType = upstreamResponse.headers.get('content-type') ?? 'application/octet-stream';
-    response.writeHead(upstreamResponse.status, { 'content-type': contentType, 'content-length': bytes.length });
+    let bytes: Buffer;
+    let contentType: string;
+    let status: number;
+    if (options.staticRecording) {
+      ({ bytes, contentType } = await options.staticRecording.download(pathname, query));
+      status = 200;
+    } else {
+      const upstreamResponse = await fetch(`${upstreamUrl}${subject}`, { redirect: 'follow' });
+      bytes = Buffer.from(await upstreamResponse.arrayBuffer());
+      contentType = upstreamResponse.headers.get('content-type') ?? 'application/octet-stream';
+      status = upstreamResponse.status;
+    }
+    response.writeHead(status, { 'content-type': contentType, 'content-length': bytes.length });
     response.end(bytes);
-    if (!upstreamResponse.ok) return;
+    if (status < 200 || status >= 300) return;
     if (staticIndex.has(subject)) return;
 
     const key = staticFixtureKey(pathname, new URLSearchParams(query), sha256Hex);
@@ -956,7 +1551,9 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     const entry: StaticManifestEntry = { path: pathname, query, file: relativeFile, contentType, bytes: bytes.length };
     manifest.static.push(entry);
     staticIndex.set(subject, entry);
-    recordedAtInstants.push(new Date().toISOString());
+    const recordedAt = new Date().toISOString();
+    options.staticRecording?.recorded(entry, recordedAt);
+    recordedAtInstants.push(recordedAt);
     recorded += 1;
     emit({ event: 'recorded', kind: 'static', subject, file: relativeFile });
     rewriteManifest();
@@ -982,7 +1579,10 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     }
     let bytes: Buffer;
     try {
-      bytes = readFileSync(join(fixturesDir, entry.file));
+      bytes = entry.response
+        ? readCppBackgroundFile(fixturesDir, entry.file)
+        : readFileSync(join(fixturesDir, entry.file));
+      assertCppNegativeStaticEntry(entry, bytes, nativeBackgroundPlan, nativeBackgroundSources, manifest.frozenNow);
     } catch {
       // Deleted or truncated after the startup check — a miss, not a 500.
       misses += 1;
@@ -992,7 +1592,10 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     }
     hits += 1;
     emit({ event: 'hit', kind: 'static', subject });
-    response.writeHead(200, { 'content-type': entry.contentType, 'content-length': bytes.length });
+    response.writeHead(entry.response?.status ?? 200, {
+      'content-type': entry.contentType,
+      'content-length': bytes.length,
+    });
     response.end(bytes);
   };
 
@@ -1002,6 +1605,8 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
 
   const currentStats = (): ScreenshotBackendStats => ({
     mode,
+    processInstanceId,
+    fixtureManifestSHA256,
     hits,
     misses,
     recorded,
@@ -1029,7 +1634,7 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       }
       return;
     }
-    if (method === 'GET' && pathname.startsWith('/static/')) {
+    if (method === 'GET' && (pathname.startsWith('/static/') || pathname === '/api/internal/board-render')) {
       const query = sortedQueryString(requestUrl.searchParams);
       if (isRecording) await recordStatic(response, pathname, query);
       else replayStatic(response, pathname, query);
@@ -1043,6 +1648,25 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
     }
     if (method === 'GET' && pathname === '/__screenshot-backend/status') {
       sendJson(response, 200, currentStats());
+      return;
+    }
+    if (method === 'GET' && pathname === '/__screenshot-backend/cpp-grade-count') {
+      if (!isRecording || !['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? '')) {
+        sendJson(response, 403, { error: 'CPP grade count is restricted to local recording' });
+        return;
+      }
+      try {
+        if (cppGradeCountFailed) throw new Error('Count changed during recording');
+        const fixtures = readCppCountFixtures(fixturesDir, manifest);
+        assertCppGradeCountProof(manifest, fixtures);
+        const proof = resolveCppGradeCountProof(manifest, fixtures);
+        sendJson(response, 200, {
+          proof,
+          selector: cppRecordedCountSelector(proof.totalCount, requestUrl.searchParams.get('locale') ?? ''),
+        });
+      } catch {
+        sendJson(response, 409, { error: 'CPP exact grade count proof is unavailable' });
+      }
       return;
     }
 
@@ -1063,11 +1687,13 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
   });
 
   // -------------------------------------------------------------------------
-  // graphql-ws: deterministic initial snapshots, never a live upstream stream
+  // graphql-ws: frozen replay snapshots and explicitly scoped CPP recording
   // -------------------------------------------------------------------------
 
-  // Record mode retains its inert transport. Replay serves manifest-listed
-  // snapshots through the same key/document validation and cache as HTTP.
+  // Ordinary recording remains inert. An authorized CPP uses one real owned
+  // session connection; only its native join and initial snapshots reach disk.
+  // Replay serves manifest-listed snapshots through the same key/document
+  // validation and cache as HTTP.
   const webSocketServer = new WebSocketServer({
     noServer: true,
     handleProtocols: (protocols) => (protocols.has('graphql-transport-ws') ? 'graphql-transport-ws' : false),
@@ -1082,6 +1708,15 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
 
   webSocketServer.on('connection', (socket: WebSocket) => {
     let initialized = false;
+    let cppToken = '';
+    const cppOperations = new Map<string, { cancelled: boolean; cleanup?: () => void }>();
+    socket.on('close', () => {
+      for (const operation of cppOperations.values()) {
+        operation.cancelled = true;
+        operation.cleanup?.();
+      }
+      cppOperations.clear();
+    });
     const subscriptionIds = new Set<string>();
     const invalidMessage = (): void => {
       misses += 1;
@@ -1111,6 +1746,8 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
           return;
         }
         initialized = true;
+        const initPayload = (message as { payload?: { authToken?: unknown } }).payload;
+        if (typeof initPayload?.authToken === 'string') cppToken = initPayload.authToken;
         socket.send(JSON.stringify({ type: 'connection_ack' }));
         emit({ event: 'ws-ack' });
         return;
@@ -1156,7 +1793,84 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
         }
         const operationName = resolveOperationName(operation) ?? 'anonymous';
         emit({ event: 'ws-subscribe', operationName });
-        if (isRecording) return;
+        if (isRecording) {
+          if (cppRecording && ['JoinSession', 'QueueUpdates', 'SessionUpdates'].includes(operationName)) {
+            subscriptionIds.add(id);
+            const pending = { cancelled: false, cleanup: undefined as (() => void) | undefined };
+            cppOperations.set(id, pending);
+            const current = () => !pending.cancelled && cppOperations.get(id) === pending && socket.readyState === 1;
+            void cppRecording
+              .subscribe(
+                id,
+                operation as unknown as CppWsOperation,
+                cppToken,
+                (frame) => {
+                  if (!current()) return;
+                  if (
+                    options.nativeJoinRecording &&
+                    frame.type === 'next' &&
+                    graphqlFixtureKey(
+                      { operationName, query: String(operation.query), variables: operation.variables },
+                      sha256Hex,
+                    ).documentHash === graphqlFixtureKey(options.nativeJoinRecording, sha256Hex).documentHash &&
+                    graphqlFixtureKey(
+                      { operationName, query: String(operation.query), variables: operation.variables },
+                      sha256Hex,
+                    ).variablesHash === graphqlFixtureKey(options.nativeJoinRecording, sha256Hex).variablesHash
+                  ) {
+                    try {
+                      assertCppNativeJoinResponse(frame.payload, nativeBackgroundPlan!.sessionId);
+                    } catch {
+                      emit({ event: 'upstream-error', operationName, detail: 'cpp-native-join-response-rejected' });
+                      socket.send(
+                        JSON.stringify({
+                          id,
+                          type: 'error',
+                          payload: [{ message: 'CPP native join response rejected' }],
+                        }),
+                      );
+                      return;
+                    }
+                    persistRecordedResponse(
+                      operation,
+                      JSON.stringify(frame.payload),
+                      200,
+                      null,
+                      nativeBackgroundPlan!.accountUserId,
+                    );
+                  }
+                  socket.send(JSON.stringify(frame));
+                  if (frame.type === 'complete' || frame.type === 'error') {
+                    pending.cancelled = true;
+                    pending.cleanup?.();
+                    cppOperations.delete(id);
+                    subscriptionIds.delete(id);
+                  }
+                },
+                current,
+              )
+              .then((cleanup) => {
+                if (!cleanup) return;
+                if (!current()) cleanup();
+                else pending.cleanup = cleanup;
+              })
+              .catch(() => {
+                emit({ event: 'upstream-error', operationName, detail: 'cpp-owned-session-validation-failed' });
+                if (current()) {
+                  socket.send(
+                    JSON.stringify({
+                      id,
+                      type: 'error',
+                      payload: [{ message: 'CPP owned-session transport validation failed' }],
+                    }),
+                  );
+                  cppOperations.delete(id);
+                  subscriptionIds.delete(id);
+                }
+              });
+          }
+          return;
+        }
         // Screenshot documents begin with their operation, optionally preceded
         // by comments. Exact document hashing below still rejects changed text.
         const subscriptionDeclaration = operation.query.match(
@@ -1181,7 +1895,15 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       if (messageType === 'complete') {
         const id = (message as { id?: unknown }).id;
         if (typeof id !== 'string' || id.length === 0) invalidMessage();
-        else subscriptionIds.delete(id);
+        else {
+          subscriptionIds.delete(id);
+          const pending = cppOperations.get(id);
+          if (pending) {
+            pending.cancelled = true;
+            pending.cleanup?.();
+            cppOperations.delete(id);
+          }
+        }
         return;
       }
       if (messageType !== 'pong') invalidMessage();
@@ -1245,6 +1967,17 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
         }
       }
       if (!Object.hasOwn(recorded, 'response')) problems.push(`${label} has no recorded response`);
+      else {
+        try {
+          bindFixtureAssetUrls(
+            JSON.stringify(recorded.response),
+            'http://localhost',
+            manifest.static.map((asset) => asset.path),
+          );
+        } catch {
+          problems.push(`${label} contains an invalid or unbundled reserved screenshot asset reference`);
+        }
+      }
     }
     for (const entry of manifest.static) {
       const label = `${entry.file} (${entry.path})`;
@@ -1268,7 +2001,7 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
   };
 
   return {
-    listen(port: number): Promise<number> {
+    listen(port: number, host: '127.0.0.1' | '0.0.0.0' = '0.0.0.0'): Promise<number> {
       return new Promise<number>((resolve, reject) => {
         if (!isRecording) {
           const fixtureProblems = unusableFixtureProblems();
@@ -1287,9 +2020,9 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
         }
         const onListenError = (listenError: Error): void => reject(listenError);
         httpServer.once('error', onListenError);
-        // 0.0.0.0 so the iOS simulator (localhost) and the Android emulator
-        // (adb reverse) both reach it.
-        httpServer.listen(port, '0.0.0.0', () => {
+        // USB-reversed Android captures can bind only to loopback. Existing
+        // store-capture callers retain their explicit network-accessible default.
+        httpServer.listen(port, host, () => {
           httpServer.removeListener('error', onListenError);
           const address = httpServer.address();
           const boundPort = typeof address === 'object' && address !== null ? address.port : port;
@@ -1311,6 +2044,7 @@ export function createScreenshotBackend(options: ScreenshotBackendServerOptions)
       // after every new entry, so a SIGTERM mid-capture still leaves a manifest
       // that matches the files on disk.
       if (isRecording) rewriteManifest();
+      cppRecording?.close();
       for (const socket of webSocketServer.clients) socket.terminate();
       return new Promise<void>((resolve) => {
         webSocketServer.close(() => {

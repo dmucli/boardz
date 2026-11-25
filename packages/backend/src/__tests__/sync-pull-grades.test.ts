@@ -9,7 +9,7 @@ import { syncQueries } from '../graphql/resolvers/sync/queries';
  * syncClimbStats coverage (sync-pull-board-scope.test.ts): composite-cursor
  * paging on (computed_at, sync_seq), layout/size scoping via a correlated
  * board_climbs EXISTS (grades has no layout_id column), the auth requirement,
- * and an empty tail that echoes the supplied cursor. See docs/sync-table-manifest.md.
+ * and an empty tail that echoes the supplied cursor. See docs/data/sync-table-manifest.md.
  */
 
 const USER_ID = 'sync-grades-user';
@@ -184,9 +184,9 @@ describe('syncClimbGrades — scoping via correlated board_climbs EXISTS', () =>
     await insertGrade({ boardType: 'tension', climbUuid: 't-l1-s5', angle: 40 });
   });
 
-  it('returns all grades for the board type when unscoped (back-compat)', async () => {
+  it('returns authorized catalog grades when unscoped, excluding missing climbs', async () => {
     const result = await callSyncClimbGrades({ boardType: 'kilter' });
-    expect(gradeKeysOf(result)).toEqual(['g-l1-s5@40', 'g-l1-s7@40', 'g-l2-s5@40', 'g-orphan@40']);
+    expect(gradeKeysOf(result)).toEqual(['g-l1-s5@40', 'g-l1-s7@40', 'g-l2-s5@40']);
   });
 
   it('scopes grades to the climbs of the given layout', async () => {

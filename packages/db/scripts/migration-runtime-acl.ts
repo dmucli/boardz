@@ -1,4 +1,7 @@
+/// <reference types="node" />
 import type postgres from 'postgres';
+import { readFileSync } from 'node:fs';
+import { reconcileWebRuntimeAcl } from '../src/auth-web-acl';
 
 const SIMPLE_POSTGRES_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
@@ -38,6 +41,14 @@ export async function preflightMigrationRuntimeAcl(
   contract: MigrationRuntimeAclContract,
 ): Promise<void> {
   validateMigrationRuntimeAclContract(contract);
+  const cutoffContractSql = readFileSync(
+    new URL('./sync-deletions-cutoff-contract.sql', import.meta.url),
+    'utf8',
+  ).replaceAll('__SYNC_RUNTIME_ROLE__', contract.runtimeRole);
+  const [cutoffContract] = await client.unsafe<{ matches: boolean }[]>(cutoffContractSql);
+  if (!cutoffContract?.matches) {
+    throw new Error('Deletion cutoff helper has an unsafe body, owner, membership, or runtime ACL');
+  }
 
   const [roleContract] = await client<
     {
@@ -231,6 +242,12 @@ export async function reconcileMigrationRuntimeAcl(
         FROM pg_catalog.pg_proc AS procedure
         JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = procedure.pronamespace
         WHERE namespace.nspname = ANY(${contract.schemas}::text[])
+          -- This exact helper belongs to a separate NOLOGIN stats owner. Its
+          -- body/owner/ACL are gated by the migration and admin bootstrap; the
+          -- ordinary DDL owner cannot reconcile privileges on that function.
+          AND procedure.oid <> coalesce(
+            pg_catalog.to_regprocedure('public.sync_deletions_safe_cutoff(double precision)'), 0::pg_catalog.oid
+          )
           AND NOT EXISTS (
             SELECT 1 FROM pg_catalog.pg_depend AS dependency
             WHERE dependency.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
@@ -333,4 +350,14 @@ export async function reconcileMigrationRuntimeAcl(
       throw new Error('runtime/PUBLIC relation column ACLs remain after reconciliation');
     }
   });
+  // Separate web role: never grant membership of the broad backend runtime role.
+  // Reconcile every migration so new nonauth tables work while auth_* remains fenced.
+  const [webRole] = await client<
+    { present: boolean }[]
+  >`SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'boardsesh_web') AS present`;
+  if (webRole?.present) {
+    await client.begin(async (transaction) => {
+      await reconcileWebRuntimeAcl(transaction, contract.ownerRole);
+    });
+  }
 }

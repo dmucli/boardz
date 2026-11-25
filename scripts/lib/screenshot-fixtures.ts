@@ -125,6 +125,556 @@ export function normalizeDocument(query: string): string {
   return query.replace(/\s+/g, ' ').trim();
 }
 
+/**
+ * The selection a pinned DiscoverPlaylists recording predates: the nullable
+ * grade band on each playlist (#6217). Replayed as null, so a capture shows
+ * the cards without a band, exactly as they rendered when recorded.
+ */
+const DISCOVER_PLAYLISTS_GRADE_SELECTION = 'gradeSummary { gradedClimbCount p10Difficulty p90Difficulty }';
+
+/**
+ * The selection a pinned GetSmartPlaylist recording predates: a view's count
+ * before its filters (#6651). Null on every request without a filtering view,
+ * which is every request a capture makes, so it replays as null.
+ */
+const SMART_PLAYLIST_UNFILTERED_COUNT_SELECTION = 'unfilteredCount';
+
+/**
+ * The selection a pinned SessionUpdates recording predates: the crew rest
+ * clock's `SessionRestCadenceChanged` member (#5382). A fragment on a union
+ * member the recorded frame (a SessionRosterSnapshot) is not, so the recorded
+ * response replays unchanged. Must match the fragment in
+ * packages/mobile/src/lib/graphql/operations.ts byte for byte once whitespace
+ * is collapsed.
+ */
+export const SESSION_REST_CADENCE_SELECTION =
+  '... on SessionRestCadenceChanged { restCadence { mode targetSeconds autoAdvance autoAdvanceOnce advanceOn ' +
+  'source isRunning anchorAt pausedElapsedSeconds lastFiredBeatAt lastTickQueueItemUuid lastTickStatus ' +
+  'setByParticipantId } ' +
+  'revision serverNow isSnapshot action }';
+
+/**
+ * The selection a pinned GetSessionWorkoutHeadlines recording predates: the
+ * board a headline's target grade is on (#7027), selected straight after
+ * `mainTargetGrade`. Nullable, so it replays as null: the card then reads the
+ * grade on the shared scale, exactly as it rendered when recorded.
+ */
+const WORKOUT_HEADLINE_BOARD_SELECTION = 'mainTargetGrade mainTargetBoardType';
+
+/**
+ * The selection a pinned GetSession recording predates: whether the session is
+ * a gym's always-on one (#6591), which decides whether the join screen says
+ * everyone in it sees your name. Non-null, so it is never invented: see
+ * `replayGetSessionWithPermanence`.
+ */
+const GET_SESSION_PERMANENCE_SELECTION = 'isPermanent';
+
+/** Recordings from the same fixture set that a compatibility adapter may cite. */
+export type ReplayCompatibilityEvidence = {
+  /**
+   * Every JoinSession recording in the set. Read only when a GetSession
+   * recording predates `isPermanent`, so callers can load it lazily.
+   */
+  joinSessionFixtures?: () => readonly GraphqlFixtureFile[];
+};
+
+/**
+ * The operations whose pinned recordings predate a tick's nullable
+ * `characteristics` (#5245). Every tick object in them selects it straight
+ * after `isNoMatch`, sometimes twice in one document (a session's highlights
+ * and its grouped items), so the single-copy `matchesWithoutSelection` rule does
+ * not fit. Replayed as null on every tick, which is what the drawer showed for
+ * these climbs when the set was recorded. GetCrewFeed was recorded with the current fragment in the additive overlay.
+ */
+const TICK_CHARACTERISTICS_OPERATIONS = new Set([
+  'GetSessionDetail',
+  'GetSessionGroupedFeed',
+  'GetUserGroupedAscentsFeed',
+]);
+const TICK_CHARACTERISTICS_SELECTION = 'isNoMatch characteristics';
+
+/**
+ * The operations whose pinned recordings predate each board's
+ * `litByWallDevice`, selected straight after `hasLeds` on every board object.
+ * The field is non-null, so it replays as `false`, never null: that is the
+ * value the column (`NOT NULL DEFAULT false`) gave every board row that existed
+ * when these sets were recorded, so it is a fact about the recorded boards, not
+ * an invented one. A recording that already holds the field is not this case.
+ */
+const BOARD_WALL_DEVICE_OPERATIONS = new Set(['GetBoard', 'GetMyBoards', 'GetGymBoardsForSwitcher']);
+const BOARD_WALL_DEVICE_SELECTION = 'hasLeds litByWallDevice';
+
+/**
+ * The same three operations predate each board's `canDelete` and
+ * `canRemoveFromGym` (#8043), which every board object now selects as a pair
+ * (after `isPinnedByMe` in BOARD_FIELDS, after `canEdit` in GYM_BOARD_FIELDS).
+ * Both are non-null and say what the viewer may do, which the recording cannot
+ * tell us, so they replay as `false`: the conservative answer, under which a
+ * screen offers no staff action the recording never showed. No capture opens a
+ * board card's menu, so no shot changes. A recording that already holds either
+ * field is not this case.
+ */
+const BOARD_STAFF_ACTION_SELECTION = ' canDelete canRemoveFromGym';
+
+/**
+ * The same three operations also predate each board's `openReportCount` and
+ * `viewerHasOpenReport` (#8043, report a problem), selected as a pair straight
+ * after `canRemoveFromGym` (in BOARD_FIELDS, and after GYM_BOARD_FIELDS in
+ * GetGymBoardsForSwitcher). Both are nullable and the server
+ * answers null for a viewer they don't concern, which is what the recording's
+ * viewer would have read for boards nobody had reported (reports did not exist
+ * when the sets were recorded). So they replay as null: no "Reported" pill, no
+ * review row. A recording that already holds either field is not this case.
+ */
+const BOARD_REPORT_FLAG_SELECTION = ' openReportCount viewerHasOpenReport';
+
+/** Exact optional capability-argument change; selections and fixture variable keys stay unchanged. */
+const PRESENCE_CAPABILITY_OPERATIONS = new Set([
+  'BoardNowPlaying',
+  'BoardRecentHistory',
+  'BoardHistoryPage',
+  'BoardRecentClimbs',
+  'BoardHistory',
+  'BoardClimbRecentSenders',
+  'BoardPresenceStats',
+  'BoardConnection',
+  'BoardQueuePreview',
+  'BoardQueuePreviewUpdates',
+  'BoardLiveSessions',
+]);
+
+export const AURORA_HISTORY_CAPABILITY_OPERATIONS = new Set([
+  'BoardNowPlaying',
+  'BoardRecentHistory',
+  'BoardHistoryPage',
+]);
+
+/**
+ * Pinned recordings that predate a field the current document now selects.
+ * Adapt those responses in memory; never rewrite their bytes or hashes. A
+ * nullable field may replay as null; a non-null one only as a value the same
+ * set recorded. An exact selection match keeps every other document/schema
+ * change detectable.
+ *
+ * - GetBoard / GetMyBoards: the spray-only `sprayImport`, null on every
+ *   manufacturer board.
+ * - DiscoverPlaylists: each playlist's `gradeSummary`.
+ * - GetSmartPlaylist: the list's `unfilteredCount`.
+ * - SessionUpdates: the crew rest clock's union member, which the recorded
+ *   roster frame never is.
+ * - GetSession: the non-null `isPermanent`, taken from what the set recorded
+ *   (`replayGetSessionWithPermanence`), never defaulted.
+ * - GetSessionDetail / GetSessionGroupedFeed / GetUserGroupedAscentsFeed: each
+ *   tick's `characteristics`.
+ * - GetBoard / GetMyBoards / GetGymBoardsForSwitcher: each board's non-null
+ *   `litByWallDevice`, as `false` (`replayBoardsWithoutWallDevice`). It
+ *   composes with the `sprayImport` adapter above.
+ * - GetBoard / GetMyBoards / GetGymBoardsForSwitcher: each board's non-null
+ *   `canDelete` and `canRemoveFromGym`, as `false`
+ *   (`replayBoardsWithoutStaffActions`). It composes with both adapters above.
+ * - GetBoard / GetMyBoards / GetGymBoardsForSwitcher: each board's nullable
+ *   `openReportCount` and `viewerHasOpenReport`, as null
+ *   (`replayBoardsWithoutReportFlags`). It composes with every board adapter
+ *   above.
+ * - GetSessionWorkoutHeadlines: each headline's `mainTargetBoardType`.
+ */
+export function replayCompatibleFixtureResponse(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+  evidence: ReplayCompatibilityEvidence = {},
+): { response: unknown } | null {
+  const operationName = resolveOperationName({ query: requestQuery });
+  if (operationName !== fixture.operationName) return null;
+  if (operationName === 'GetSession') return replayGetSessionWithPermanence(requestQuery, fixture, evidence);
+  if (BOARD_WALL_DEVICE_OPERATIONS.has(operationName ?? '')) {
+    // The newest board fields first: each adapter strips its own selection and
+    // hands the rest back here, so a recording that predates both still lands.
+    const withoutReportFlags = replayBoardsWithoutReportFlags(requestQuery, fixture, evidence);
+    if (withoutReportFlags) return withoutReportFlags;
+    const withoutStaffActions = replayBoardsWithoutStaffActions(requestQuery, fixture, evidence);
+    if (withoutStaffActions) return withoutStaffActions;
+    const adapted = replayBoardsWithoutWallDevice(requestQuery, fixture, evidence);
+    if (adapted) return adapted;
+  }
+  if (PRESENCE_CAPABILITY_OPERATIONS.has(operationName ?? '')) {
+    let normalized = normalizeDocument(requestQuery);
+    const recorded = normalizeDocument(fixture.query);
+    const capabilities = [{ declaration: ', $boardUuid: ID', argument: ', boardUuid: $boardUuid' }];
+    if (AURORA_HISTORY_CAPABILITY_OPERATIONS.has(operationName ?? '')) {
+      capabilities.push({ declaration: ', $includeAurora: Boolean', argument: ', includeAurora: $includeAurora' });
+    }
+    for (const { declaration, argument } of capabilities) {
+      if (!recorded.includes(declaration) && normalized.includes(declaration)) {
+        if (normalized.split(declaration).length !== 2 || normalized.split(argument).length !== 2) return null;
+        normalized = normalized.replace(declaration, '').replace(argument, '');
+      }
+    }
+    if (normalized !== recorded) return null;
+    // The replay backend selects an entry by the unchanged variables hash first.
+    // Supplying a UUID therefore needs its own recording, never this old no-link response.
+    return { response: fixture.response };
+  }
+  if (operationName === 'DiscoverPlaylists') return replayDiscoverPlaylistsWithoutGrades(requestQuery, fixture);
+  if (operationName === 'GetSmartPlaylist') return replaySmartPlaylistWithoutUnfilteredCount(requestQuery, fixture);
+  if (operationName === 'SessionUpdates') return replaySessionUpdatesWithoutRestCadence(requestQuery, fixture);
+  if (operationName === 'GetSessionWorkoutHeadlines') {
+    return replayWorkoutHeadlinesWithoutBoard(requestQuery, fixture);
+  }
+  if (TICK_CHARACTERISTICS_OPERATIONS.has(operationName ?? '')) {
+    return replayTicksWithoutCharacteristics(requestQuery, fixture);
+  }
+  if (!['GetBoard', 'GetMyBoards'].includes(operationName ?? '')) return null;
+  const selection = 'sprayImport { wallUuid versionId detectionId stage queuePosition retryAt resetOfWallUuid }';
+  if (!matchesWithoutSelection(requestQuery, selection, fixture)) return null;
+  if (!isRecord(fixture.response) || !isRecord(fixture.response.data)) return null;
+  const response = fixture.response;
+  const data = fixture.response.data;
+  const manufacturerBoards = new Set(['kilter', 'tension', 'moonboard', 'grasshopper', 'woods', 'decoy']);
+  const compatibleBoard = (board: unknown): board is Record<string, unknown> =>
+    isRecord(board) &&
+    typeof board.boardType === 'string' &&
+    manufacturerBoards.has(board.boardType) &&
+    (board.sprayImport === undefined || board.sprayImport === null);
+  if (operationName === 'GetBoard') {
+    if (data.board === null) return { response };
+    if (!compatibleBoard(data.board)) return null;
+    return { response: { ...response, data: { ...data, board: { ...data.board, sprayImport: null } } } };
+  }
+  if (!isRecord(data.myBoards) || !Array.isArray(data.myBoards.boards)) return null;
+  if (!data.myBoards.boards.every(compatibleBoard)) return null;
+  return {
+    response: {
+      ...response,
+      data: {
+        ...data,
+        myBoards: { ...data.myBoards, boards: data.myBoards.boards.map((board) => ({ ...board, sprayImport: null })) },
+      },
+    },
+  };
+}
+
+/** The request is the recorded document plus exactly one copy of `selection`, and nothing else. */
+function matchesWithoutSelection(requestQuery: string, selection: string, fixture: GraphqlFixtureFile): boolean {
+  const normalized = normalizeDocument(requestQuery);
+  if (normalized.split(selection).length !== 2) return false;
+  return normalizeDocument(normalized.replace(selection, '')) === normalizeDocument(fixture.query);
+}
+
+/**
+ * GetSession recorded before the join screen selected `isPermanent` (#6591).
+ * The field is non-null and decides what the screen tells the climber, so this
+ * only replays a value the same set recorded:
+ *
+ * - the recorded session already carries a boolean `isPermanent`, which
+ *   replays unchanged. The shared and Apple campaign sets' GetSession is a
+ *   hand-curated recording (`upstream: local:curated-shared-session`) that
+ *   holds `false`;
+ * - or it carries none, and the set's JoinSession replies recorded one for the
+ *   same session id (`recordedJoinSessionPermanence`). The CPP sets are this
+ *   case: their sessions are permanent by design.
+ *
+ * Anything else stays a miss: a null session, a non-boolean value, no or
+ * disagreeing JoinSession evidence, or any other change to the document.
+ */
+function replayGetSessionWithPermanence(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+  evidence: ReplayCompatibilityEvidence,
+): { response: unknown } | null {
+  // A whole token, exactly once: `matchesWithoutSelection` alone would also
+  // accept the name spliced into another field's.
+  if (normalizeDocument(requestQuery).split(` ${GET_SESSION_PERMANENCE_SELECTION} `).length !== 2) return null;
+  if (!matchesWithoutSelection(requestQuery, GET_SESSION_PERMANENCE_SELECTION, fixture)) return null;
+  if (!isRecord(fixture.response) || !isRecord(fixture.response.data)) return null;
+  const response = fixture.response;
+  const data = fixture.response.data;
+  const session = data.session;
+  if (!isRecord(session)) return null;
+  if (typeof session.isPermanent === 'boolean') return { response };
+  if (session.isPermanent !== undefined) return null;
+  const sessionId = isRecord(fixture.variables) ? fixture.variables.sessionId : undefined;
+  if (typeof sessionId !== 'string' || session.id !== sessionId) return null;
+  const isPermanent = recordedJoinSessionPermanence(sessionId, evidence.joinSessionFixtures?.() ?? []);
+  if (isPermanent === null) return null;
+  return { response: { ...response, data: { ...data, session: { ...session, isPermanent } } } };
+}
+
+/**
+ * The `isPermanent` the JoinSession replies among `joinSessionFixtures`
+ * recorded for `sessionId`, or null when none recorded one or they disagree.
+ * Replies that selected no `isPermanent` (the native Live Activity join) say
+ * nothing either way and are skipped.
+ */
+export function recordedJoinSessionPermanence(
+  sessionId: string,
+  joinSessionFixtures: readonly GraphqlFixtureFile[],
+): boolean | null {
+  const recorded = new Set<boolean>();
+  for (const fixture of joinSessionFixtures) {
+    if (fixture.operationName !== 'JoinSession') continue;
+    if (!isRecord(fixture.variables) || fixture.variables.sessionId !== sessionId) continue;
+    if (!isRecord(fixture.response) || !isRecord(fixture.response.data)) continue;
+    const joined = fixture.response.data.joinSession;
+    if (!isRecord(joined) || joined.id !== sessionId || typeof joined.isPermanent !== 'boolean') continue;
+    recorded.add(joined.isPermanent);
+  }
+  return recorded.size === 1 ? [...recorded][0] : null;
+}
+
+function replaySessionUpdatesWithoutRestCadence(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+): { response: unknown } | null {
+  if (!matchesWithoutSelection(requestQuery, SESSION_REST_CADENCE_SELECTION, fixture)) return null;
+  // Only a frame of another member replays untouched: a recording that already
+  // holds a rest clock frame was made with the fragment, so it is not this case.
+  if (!isRecord(fixture.response) || !isRecord(fixture.response.data)) return null;
+  const event = fixture.response.data.sessionUpdates;
+  if (!isRecord(event) || event.__typename === 'SessionRestCadenceChanged') return null;
+  return { response: fixture.response };
+}
+
+function replayDiscoverPlaylistsWithoutGrades(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+): { response: unknown } | null {
+  if (!matchesWithoutSelection(requestQuery, DISCOVER_PLAYLISTS_GRADE_SELECTION, fixture)) return null;
+  if (!isRecord(fixture.response) || !isRecord(fixture.response.data)) return null;
+  const response = fixture.response;
+  const data = fixture.response.data;
+  const result = data.discoverPlaylists;
+  if (!isRecord(result) || !Array.isArray(result.playlists)) return null;
+  // A recording that already carries a band is not one this shim was written for.
+  if (!result.playlists.every((playlist) => isRecord(playlist) && playlist.gradeSummary === undefined)) return null;
+  return {
+    response: {
+      ...response,
+      data: {
+        ...data,
+        discoverPlaylists: {
+          ...result,
+          playlists: result.playlists.map((playlist: Record<string, unknown>) => ({ ...playlist, gradeSummary: null })),
+        },
+      },
+    },
+  };
+}
+
+function replaySmartPlaylistWithoutUnfilteredCount(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+): { response: unknown } | null {
+  if (!matchesWithoutSelection(requestQuery, SMART_PLAYLIST_UNFILTERED_COUNT_SELECTION, fixture)) return null;
+  if (!isRecord(fixture.response) || !isRecord(fixture.response.data)) return null;
+  const response = fixture.response;
+  const data = fixture.response.data;
+  const result = data.smartPlaylist;
+  // A recording that already carries the count is not one this shim was written for.
+  if (!isRecord(result) || result.unfilteredCount !== undefined) return null;
+  return {
+    response: { ...response, data: { ...data, smartPlaylist: { ...result, unfilteredCount: null } } },
+  };
+}
+
+function replayWorkoutHeadlinesWithoutBoard(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+): { response: unknown } | null {
+  const normalized = normalizeDocument(requestQuery);
+  const pieces = normalized.split(WORKOUT_HEADLINE_BOARD_SELECTION);
+  // Exactly one copy, straight after `mainTargetGrade`, and no other change.
+  if (pieces.length !== 2 || normalized.split('mainTargetBoardType').length !== 2) return null;
+  if (pieces.join('mainTargetGrade') !== normalizeDocument(fixture.query)) return null;
+  if (!isRecord(fixture.response) || !isRecord(fixture.response.data)) return null;
+  const response = fixture.response;
+  const data = fixture.response.data;
+  const headlines = data.sessionWorkoutHeadlines;
+  if (!Array.isArray(headlines)) return null;
+  // A recording that already carries the board was made with it, so it is not this case.
+  if (!headlines.every((headline) => isRecord(headline) && headline.mainTargetBoardType === undefined)) return null;
+  return {
+    response: {
+      ...response,
+      data: {
+        ...data,
+        sessionWorkoutHeadlines: headlines.map((headline: Record<string, unknown>) => ({
+          ...headline,
+          mainTargetBoardType: null,
+        })),
+      },
+    },
+  };
+}
+
+function replayTicksWithoutCharacteristics(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+): { response: unknown } | null {
+  const normalized = normalizeDocument(requestQuery);
+  const pieces = normalized.split(TICK_CHARACTERISTICS_SELECTION);
+  // Every tick selects the field, so a bare `isNoMatch` left over means some
+  // other change, and the response walk below would answer a field nobody asked for.
+  if (pieces.length < 2 || normalized.split('isNoMatch').length !== pieces.length) return null;
+  if (pieces.join('isNoMatch') !== normalizeDocument(fixture.query)) return null;
+  if (!isRecord(fixture.response) || fixture.response.data === undefined) return null;
+  // A recording that already carries the field was made with it, so it is not this case.
+  if (containsKey(fixture.response.data, 'characteristics')) return null;
+  return { response: { ...fixture.response, data: withNullCharacteristics(fixture.response.data) } };
+}
+
+/**
+ * A board document recorded before `litByWallDevice`: the request is the
+ * recorded one with the field straight after every `hasLeds`, plus any change
+ * another adapter accepts (GetBoard's `sprayImport`). Every board in the
+ * response gets `litByWallDevice: false` beside its `hasLeds`.
+ */
+function replayBoardsWithoutWallDevice(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+  evidence: ReplayCompatibilityEvidence,
+): { response: unknown } | null {
+  const normalized = normalizeDocument(requestQuery);
+  const pieces = normalized.split(BOARD_WALL_DEVICE_SELECTION);
+  // Every board selects it after `hasLeds`, so a stray copy anywhere else means
+  // some other change.
+  if (pieces.length < 2 || normalized.split('litByWallDevice').length !== pieces.length) return null;
+  if (!isRecord(fixture.response) || fixture.response.data === undefined) return null;
+  if (containsKey(fixture.response.data, 'litByWallDevice')) return null;
+  const withoutWallDevice = pieces.join('hasLeds');
+  // The request minus the field has no `litByWallDevice` left, so this cannot
+  // come back here: it is the recorded document, or another adapter's change.
+  const base =
+    withoutWallDevice === normalizeDocument(fixture.query)
+      ? { response: fixture.response }
+      : replayCompatibleFixtureResponse(withoutWallDevice, fixture, evidence);
+  if (!base || !isRecord(base.response)) return null;
+  return { response: { ...base.response, data: withWallDeviceOff(base.response.data) } };
+}
+
+/**
+ * A board document recorded before `canDelete` and `canRemoveFromGym`: the
+ * request is the recorded one with the pair added to every board object, plus
+ * any change another adapter accepts. Every board in the response (each object
+ * that answers `canEdit`, which every board selection carries) gets both as
+ * `false`.
+ */
+function replayBoardsWithoutStaffActions(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+  evidence: ReplayCompatibilityEvidence,
+): { response: unknown } | null {
+  const normalized = normalizeDocument(requestQuery);
+  const pieces = normalized.split(BOARD_STAFF_ACTION_SELECTION);
+  // Always the pair, in that order: a lone copy of either means some other change.
+  if (pieces.length < 2) return null;
+  if (normalized.split('canDelete').length !== pieces.length) return null;
+  if (normalized.split('canRemoveFromGym').length !== pieces.length) return null;
+  if (!isRecord(fixture.response) || fixture.response.data === undefined) return null;
+  if (containsKey(fixture.response.data, 'canDelete') || containsKey(fixture.response.data, 'canRemoveFromGym')) {
+    return null;
+  }
+  const withoutStaffActions = pieces.join('');
+  // The request minus the pair has neither field left, so this cannot come back
+  // here: it is the recorded document, or another adapter's change.
+  const base =
+    withoutStaffActions === normalizeDocument(fixture.query)
+      ? { response: fixture.response }
+      : replayCompatibleFixtureResponse(withoutStaffActions, fixture, evidence);
+  if (!base || !isRecord(base.response)) return null;
+  return { response: { ...base.response, data: withStaffActionsOff(base.response.data) } };
+}
+
+/**
+ * A board document recorded before `openReportCount` and `viewerHasOpenReport`:
+ * the request is the recorded one with the pair added to every board object,
+ * plus any change another adapter accepts. Every board in the response (each
+ * object that answers `canEdit`) gets both as null.
+ */
+function replayBoardsWithoutReportFlags(
+  requestQuery: string,
+  fixture: GraphqlFixtureFile,
+  evidence: ReplayCompatibilityEvidence,
+): { response: unknown } | null {
+  const normalized = normalizeDocument(requestQuery);
+  const pieces = normalized.split(BOARD_REPORT_FLAG_SELECTION);
+  // Always the pair, in that order: a lone copy of either means some other change.
+  if (pieces.length < 2) return null;
+  if (normalized.split('openReportCount').length !== pieces.length) return null;
+  if (normalized.split('viewerHasOpenReport').length !== pieces.length) return null;
+  if (!isRecord(fixture.response) || fixture.response.data === undefined) return null;
+  if (
+    containsKey(fixture.response.data, 'openReportCount') ||
+    containsKey(fixture.response.data, 'viewerHasOpenReport')
+  ) {
+    return null;
+  }
+  const withoutReportFlags = pieces.join('');
+  // The request minus the pair has neither field left, so this cannot come back
+  // here: it is the recorded document, or another adapter's change.
+  const base =
+    withoutReportFlags === normalizeDocument(fixture.query)
+      ? { response: fixture.response }
+      : replayCompatibleFixtureResponse(withoutReportFlags, fixture, evidence);
+  if (!base || !isRecord(base.response)) return null;
+  return { response: { ...base.response, data: withReportFlagsUnknown(base.response.data) } };
+}
+
+function withReportFlagsUnknown(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withReportFlagsUnknown);
+  if (!isRecord(value)) return value;
+  const adapted: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) adapted[key] = withReportFlagsUnknown(child);
+  if ('canEdit' in value) {
+    adapted.openReportCount = null;
+    adapted.viewerHasOpenReport = null;
+  }
+  return adapted;
+}
+
+function withStaffActionsOff(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withStaffActionsOff);
+  if (!isRecord(value)) return value;
+  const adapted: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) adapted[key] = withStaffActionsOff(child);
+  if ('canEdit' in value) {
+    adapted.canDelete = false;
+    adapted.canRemoveFromGym = false;
+  }
+  return adapted;
+}
+
+function withWallDeviceOff(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withWallDeviceOff);
+  if (!isRecord(value)) return value;
+  const adapted: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    adapted[key] = withWallDeviceOff(child);
+    if (key === 'hasLeds') adapted.litByWallDevice = false;
+  }
+  return adapted;
+}
+
+function containsKey(value: unknown, key: string): boolean {
+  if (Array.isArray(value)) return value.some((element) => containsKey(element, key));
+  if (!isRecord(value)) return false;
+  return key in value || Object.values(value).some((child) => containsKey(child, key));
+}
+
+/**
+ * Every object that answers `isNoMatch` here is a tick or an ascent group, and
+ * each of them now selects `characteristics` straight after it.
+ */
+function withNullCharacteristics(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withNullCharacteristics);
+  if (!isRecord(value)) return value;
+  const adapted: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    adapted[key] = withNullCharacteristics(child);
+    if (key === 'isNoMatch') adapted.characteristics = null;
+  }
+  return adapted;
+}
+
 function toCanonicalValue(value: unknown): unknown {
   if (value === null) return null;
   if (Array.isArray(value)) {
@@ -368,6 +918,13 @@ export const PSEUDONYMISED_PERSON_FIELDS: readonly PersonFieldGroup[] = [
     handleKeys: ['username', 'handle', 'instagramHandle'],
     avatarKeys: ['avatarUrl', 'userAvatarUrl', 'userAvatar', 'profileImageUrl'],
     emailKeys: ['email', 'userEmail'],
+  },
+  {
+    idKey: 'proposerId',
+    displayNameKeys: ['proposerDisplayName'],
+    handleKeys: [],
+    avatarKeys: ['proposerAvatarUrl'],
+    emailKeys: [],
   },
   {
     idKey: 'sentByUserId',
@@ -818,21 +1375,26 @@ export type BatchedOperationSpec = {
   idsVariablePath: string;
   /** Dot path inside the recorded response body of the list of items. */
   responseListPath: string;
-  /** Field on each response item carrying the id it answers for. */
-  responseIdField: string;
+  /**
+   * Field on each response item carrying the id it answers for, or `null` when
+   * the response list holds the ids themselves (`favorites` answers with the
+   * bare uuids of the requested climbs that are favourited).
+   */
+  responseIdField: string | null;
 };
 
 /**
  * Operations whose variables carry a LIST OF IDS assembled at runtime, so an
  * exact-variables key can never be stable for them.
  *
- * Both entries are viewport batches: `useQueries` over chunks of whatever rows
- * had mounted when the batch flushed
- * (`packages/mobile/src/lib/graphql/hooks/use-social.ts` for the vote
- * summaries, `fetchClimbStatsForClimbs` in
- * `packages/mobile/src/providers/board-adapter.tsx` for the stats). Replay is
- * instant, so the app scrolls and flushes on a different schedule than the
- * recording did and asks for id subsets the recording never sent as one batch.
+ * Every entry is a viewport batch: a chunk of whatever rows had mounted when
+ * the batch flushed (`packages/mobile/src/lib/graphql/hooks/use-social.ts` for
+ * the vote summaries, `fetchClimbStatsForClimbs` in
+ * `packages/mobile/src/providers/board-adapter.tsx` for the stats, the logbook
+ * and favourites reads behind every climb list for `GetTicks` and `Favorites`).
+ * Replay is instant, so the app scrolls and flushes on a different schedule
+ * than the recording did and asks for id subsets the recording never sent as
+ * one batch.
  *
  * The fix is to key these by MEMBERSHIP: every recorded batch of the operation
  * is decomposed into id -> its recorded items, and a request is answered by
@@ -864,6 +1426,22 @@ export const BATCHED_OPERATIONS: Readonly<Record<string, BatchedOperationSpec>> 
     idsVariablePath: 'input.entityIds',
     responseListPath: 'data.bulkVoteSummaries',
     responseIdField: 'entityId',
+  },
+  // query GetTicks($input: GetTicksInput!)
+  // — packages/shared/graphql/src/operations/ticks.ts. The viewer's own ticks
+  // on the listed climbs; one climb yields one row per tick.
+  GetTicks: {
+    idsVariablePath: 'input.climbUuids',
+    responseListPath: 'data.ticks',
+    responseIdField: 'climbUuid',
+  },
+  // query Favorites($boardName: String!, $climbUuids: [String!]!, $angle: Int!)
+  // — packages/shared/graphql/src/operations/favorites.ts. Answers with the
+  // subset of the requested uuids that are favourited, as bare strings.
+  Favorites: {
+    idsVariablePath: 'climbUuids',
+    responseListPath: 'data.favorites',
+    responseIdField: null,
   },
 };
 
@@ -922,6 +1500,14 @@ export function batchScopeKey(operationName: string, spec: BatchedOperationSpec,
   return canonicalJson(withoutIds);
 }
 
+/** The id one response item answers for, or `null` when the item does not carry one. */
+function batchItemId(spec: BatchedOperationSpec, item: unknown): string | null {
+  if (spec.responseIdField === null) return typeof item === 'string' ? item : null;
+  if (typeof item !== 'object' || item === null || Array.isArray(item)) return null;
+  const id = (item as Record<string, unknown>)[spec.responseIdField];
+  return typeof id === 'string' ? id : null;
+}
+
 /**
  * One recorded batch decomposed into id -> the items recorded for it. `null`
  * when the response has no list at `responseListPath`.
@@ -941,9 +1527,8 @@ export function indexBatchItemsById(
   const itemsById = new Map<string, unknown[]>();
   for (const id of recordedIds) itemsById.set(id, []);
   for (const item of items) {
-    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue;
-    const id = (item as Record<string, unknown>)[spec.responseIdField];
-    if (typeof id !== 'string') continue;
+    const id = batchItemId(spec, item);
+    if (id === null) continue;
     const bucket = itemsById.get(id);
     if (bucket) bucket.push(item);
     else itemsById.set(id, [item]);
@@ -1001,6 +1586,91 @@ export function composeBatchedResponse(
 }
 
 // ---------------------------------------------------------------------------
+// Replay defaults
+// ---------------------------------------------------------------------------
+
+/** One operation replay may answer without a recording, and why that is honest. */
+export type ReplayDefaultResponse = {
+  /** The whole response body, `data` envelope included, as a fixture stores it. */
+  response: unknown;
+  /** Why this answer is true of the recording account whatever was recorded. */
+  reason: string;
+};
+
+/**
+ * Queries replay answers with a fixed body when the recorded set holds NO
+ * fixture for them.
+ *
+ * A new query on a screen the capture visits is a replay miss on every run
+ * until the set is re-recorded, and a re-record is an operational task against
+ * PROD (see docs/qa/mobile-screenshot-fixtures.md). For a query whose honest
+ * answer for the screenshots account never depends on what was recorded, that
+ * cost buys nothing, so its answer is declared here instead.
+ *
+ * Only add a query when BOTH of these hold:
+ *  - the answer is the same for the recording account on every screen (a
+ *    capability flag, an empty inbox) — never a list or a count a screenshot
+ *    shows;
+ *  - the app already renders correctly on that answer.
+ *
+ * The moment a fixture for the operation is recorded, the default stops
+ * applying and the ordinary keyed lookup takes over, changed variables
+ * included. The drift test (`screenshot-fixture-drift.test.ts`) fails on an
+ * entry the app no longer sends, on one that is also recorded, and on a body
+ * that does not answer the current document.
+ */
+export const REPLAY_DEFAULT_RESPONSES: Readonly<Record<string, ReplayDefaultResponse>> = {
+  QueueCapabilitiesProbe: {
+    response: {
+      data: { queueState: { fields: [] }, currentClimbChanged: { fields: [] } },
+    },
+    reason: 'recorded queue sessions retain legacy documents without additive server capabilities',
+  },
+  PrivacySettings: {
+    response: {
+      data: {
+        privacySettings: {
+          isPrivate: false,
+          privacyRevision: 0,
+          defaultSessionAudience: 'public',
+          anonymousOnForeignBoards: false,
+          enabled: false,
+        },
+      },
+    },
+    reason: 'privacy rollout is disabled for the existing screenshot capture account',
+  },
+  // query ProfileAdminFlag — packages/mobile/src/lib/graphql/operations.ts.
+  // `useCatalogQuerySourceState` asks it for every board that is not
+  // downloaded, so it fires on most captured screens. `useIsAdmin` reads a
+  // null profile as "not an admin", the same answer the server gives the
+  // screenshots account.
+  ProfileAdminFlag: {
+    response: { data: { profile: null } },
+    reason: 'the screenshots account is not an admin',
+  },
+  // Historical sessions predate server workouts. Crew headline batches now
+  // have genuine recordings in the pinned overlay and require exact coverage.
+  GetSessionWorkouts: {
+    response: { data: { sessionWorkouts: [] } },
+    reason: 'no recorded session followed a workout stored on the server',
+  },
+  // query GetPartnerAppsEnabled — packages/shared/graphql/src/operations/connected-apps.ts
+  // (#6981 F16). The create-climb editor and the Spraywall visibility controls
+  // ask it whether to mention connected apps. Partner apps are off in production,
+  // where the set is recorded, and both screens draw exactly as before on false.
+  GetPartnerAppsEnabled: {
+    response: { data: { partnerAppsEnabled: false } },
+    reason: 'partner apps are off in production, where the set is recorded',
+  },
+};
+
+/** This operation's replay default, or `null` when it has none. */
+export function replayDefaultResponse(operationName: string): ReplayDefaultResponse | null {
+  return Object.hasOwn(REPLAY_DEFAULT_RESPONSES, operationName) ? REPLAY_DEFAULT_RESPONSES[operationName] : null;
+}
+
+// ---------------------------------------------------------------------------
 // Manifest
 // ---------------------------------------------------------------------------
 
@@ -1023,6 +1693,13 @@ export type StaticManifestEntry = {
   file: string;
   contentType: string;
   bytes: number;
+  /** Genuine bounded application error; absent retains the existing HTTP 200 contract. */
+  response?: {
+    status: 400;
+    recordedAt: string;
+    sha256: string;
+    sources: Array<{ file: string; sha256: string }>;
+  };
 };
 
 /** Optional replay scenario that enables the shared-session Android captures. */
@@ -1032,6 +1709,7 @@ export type ScreenshotCaptureScenario = {
   profileSessionId?: string;
   /** Ordered selectors: the original board captures first, then optional extra boards. */
   boards: string[];
+  cpp?: import('./screenshot-cpp').CppCaptureCoverage;
 };
 
 export type ScreenshotFixtureManifest = {
@@ -1199,6 +1877,36 @@ function staticEntryProblem(entry: unknown, index: number): string | null {
   if (typeof entry.bytes !== 'number' || !Number.isInteger(entry.bytes) || entry.bytes < 0) {
     return `static[${index}].bytes must be a non-negative integer`;
   }
+  if (entry.response !== undefined) {
+    const response = entry.response;
+    if (
+      entry.path !== '/api/internal/board-render' ||
+      entry.contentType !== 'application/json' ||
+      entry.bytes < 1 ||
+      entry.bytes > 1024 ||
+      !isRecord(response) ||
+      Object.keys(entry).sort().join(',') !== 'bytes,contentType,file,path,query,response' ||
+      Object.keys(response).sort().join(',') !== 'recordedAt,sha256,sources,status' ||
+      response.status !== 400 ||
+      typeof response.recordedAt !== 'string' ||
+      !Number.isFinite(Date.parse(response.recordedAt)) ||
+      typeof response.sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(response.sha256) ||
+      !Array.isArray(response.sources) ||
+      response.sources.length < 3 ||
+      response.sources.length > 4 ||
+      response.sources.some(
+        (source) =>
+          !isRecord(source) ||
+          Object.keys(source).sort().join(',') !== 'file,sha256' ||
+          typeof source.file !== 'string' ||
+          !/^graphql\/(?:GetMyBoards|JoinSession|QueueUpdates)\/[a-f0-9]{16}\.json$/.test(source.file) ||
+          typeof source.sha256 !== 'string' ||
+          !/^[a-f0-9]{64}$/.test(source.sha256),
+      )
+    )
+      return `static[${index}].response is not a bounded CPP application failure`;
+  }
   return null;
 }
 
@@ -1261,24 +1969,13 @@ export function validateScreenshotFixtureManifest(value: unknown): ScreenshotFix
 // Log grammar
 // ---------------------------------------------------------------------------
 
-export type GraphqlMissReason =
-  | 'no-fixture'
-  | 'document-changed'
-  | 'anonymous-operation'
-  | 'unreadable-fixture'
-  /**
-   * A batched operation (see `BATCHED_OPERATIONS`) asked for a scope that was
-   * recorded, but not ONE of its ids was covered. A partly-covered batch is
-   * answered instead — see `collectBatchItems` and the uncovered-ids note.
-   */
-  | 'unrecorded-ids';
+export type GraphqlMissReason = 'no-fixture' | 'document-changed' | 'anonymous-operation' | 'unreadable-fixture';
 
 const GRAPHQL_MISS_REASONS: readonly GraphqlMissReason[] = [
   'no-fixture',
   'document-changed',
   'anonymous-operation',
   'unreadable-fixture',
-  'unrecorded-ids',
 ];
 
 /**
@@ -1292,8 +1989,8 @@ const GRAPHQL_MISS_REASONS: readonly GraphqlMissReason[] = [
  */
 export const MISS_VARIABLES_LOG_LIMIT = 600;
 
-/** How many unrecorded ids a `reason=unrecorded-ids` miss names before it stops. */
-export const MISS_UNRECORDED_IDS_LOG_LIMIT = 10;
+/** How many uncovered ids a composed hit names before it stops. */
+export const UNCOVERED_IDS_LOG_LIMIT = 10;
 
 /**
  * The variables of a miss, canonically and with the ignored paths stripped —
@@ -1305,9 +2002,9 @@ export function formatMissVariables(operationName: string, variables: unknown): 
   return canonical.length <= MISS_VARIABLES_LOG_LIMIT ? canonical : `${canonical.slice(0, MISS_VARIABLES_LOG_LIMIT)}…`;
 }
 
-/** The ids a `reason=unrecorded-ids` line names, capped. */
-export function cappedUnrecordedIds(ids: readonly string[]): string[] {
-  return ids.slice(0, MISS_UNRECORDED_IDS_LOG_LIMIT);
+/** The uncovered ids a composed hit names, capped. */
+export function cappedUncoveredIds(ids: readonly string[]): string[] {
+  return ids.slice(0, UNCOVERED_IDS_LOG_LIMIT);
 }
 
 /**
@@ -1333,14 +2030,22 @@ export type ScreenshotBackendLogLine =
       /**
        * How many requested ids a batched hit was composed from recorded
        * batches (see `BATCHED_OPERATIONS`). `null` for an ordinary
-       * exact-key hit, which is every non-batched operation.
+       * exact-key hit, which is every non-batched operation. `0` is a batch
+       * where no requested id was covered, answered with an empty list.
        */
       composed: number | null;
       /** How many requested ids no recorded batch covered. 0 on any other hit. */
       uncoveredCount: number;
-      /** Up to `MISS_UNRECORDED_IDS_LOG_LIMIT` of those ids, for the note. */
+      /** Up to `UNCOVERED_IDS_LOG_LIMIT` of those ids, for the note. */
       uncoveredIds: readonly string[];
     }
+  /**
+   * An operation with no recorded fixture at all, answered with its declared
+   * `REPLAY_DEFAULT_RESPONSES` entry. Its own event rather than a hit: it
+   * proves nothing about the recorded set, so it must not count toward "the
+   * app reached the replay backend".
+   */
+  | { event: 'default'; operationName: string; hash12: string }
   | { event: 'hit'; kind: 'static'; subject: string }
   | { event: 'hit'; kind: 'auth'; route: AuthRoute }
   | {
@@ -1349,14 +2054,6 @@ export type ScreenshotBackendLogLine =
       operationName: string;
       hash12: string;
       reason: GraphqlMissReason;
-      /**
-       * Requested ids no recorded batch covers, capped at
-       * `MISS_UNRECORDED_IDS_LOG_LIMIT`. Empty unless the reason is
-       * `unrecorded-ids`. An id carrying whitespace would split the log field;
-       * these are GraphQL id scalars (uuids), and the same ids also appear
-       * inside `variables`, so the parser tolerates it rather than guarding it.
-       */
-      unrecordedIds: readonly string[];
       /** Canonical variables JSON, ignored paths stripped — see `formatMissVariables`. */
       variables: string;
     }
@@ -1419,12 +2116,12 @@ export function formatScreenshotBackendLine(line: ScreenshotBackendLogLine): str
             return `HIT auth ${line.route}`;
         }
         break;
+      case 'default':
+        return `DEFAULT graphql ${line.operationName} ${line.hash12}`;
       case 'miss':
         switch (line.kind) {
-          case 'graphql': {
-            const ids = line.unrecordedIds.length > 0 ? ` ids=${line.unrecordedIds.join(',')}` : '';
-            return `MISS graphql ${line.operationName} ${line.hash12} reason=${line.reason}${ids} variables=${line.variables}`;
-          }
+          case 'graphql':
+            return `MISS graphql ${line.operationName} ${line.hash12} reason=${line.reason} variables=${line.variables}`;
           case 'static':
             return `MISS static ${line.subject}`;
           case 'route':
@@ -1466,12 +2163,11 @@ const READY_PATTERN =
 const HIT_GRAPHQL_PATTERN = /^HIT graphql (\S+) (\S+)(?: composed=(\d+)(?: uncovered=(\d+) ids=(.*))?)?$/;
 const HIT_STATIC_PATTERN = /^HIT static (\S+)$/;
 const HIT_AUTH_PATTERN = /^HIT auth (\S+)$/;
-// `ids=` is non-greedy and `variables=` takes the rest of the line: the ids are
-// GraphQL id scalars and the variables are single-line JSON, but only one of
-// the two can safely be last. Both tails stay optional so a log written by an
-// older backend build (hash only) still parses — an unparsed MISS line would
-// vanish from `findScreenshotBackendProblems` and pass a broken capture.
-const MISS_GRAPHQL_PATTERN = /^MISS graphql (\S+) (\S+) reason=([a-z-]+)(?: ids=(.*?))?(?: variables=(.*))?$/;
+const DEFAULT_GRAPHQL_PATTERN = /^DEFAULT graphql (\S+) (\S+)$/;
+// `variables=` takes the rest of the line (single-line JSON) and stays optional
+// so a hash-only line still parses — an unparsed MISS line would vanish from
+// `findScreenshotBackendProblems` and pass a broken capture.
+const MISS_GRAPHQL_PATTERN = /^MISS graphql (\S+) (\S+) reason=([a-z-]+)(?: variables=(.*))?$/;
 const MISS_STATIC_PATTERN = /^MISS static (\S+)$/;
 const MISS_ROUTE_PATTERN = /^MISS route (\S+) (\S+)$/;
 const MISS_AUTH_PATTERN = /^MISS auth email=(\S*) expected=(\S*)$/;
@@ -1534,17 +2230,18 @@ export function parseScreenshotBackendLogLine(line: string): ScreenshotBackendLo
   const hitAuth = HIT_AUTH_PATTERN.exec(body);
   if (hitAuth && isAuthRoute(hitAuth[1])) return { event: 'hit', kind: 'auth', route: hitAuth[1] };
 
+  const defaulted = DEFAULT_GRAPHQL_PATTERN.exec(body);
+  if (defaulted) return { event: 'default', operationName: defaulted[1], hash12: defaulted[2] };
+
   const missGraphql = MISS_GRAPHQL_PATTERN.exec(body);
   if (missGraphql && isGraphqlMissReason(missGraphql[3])) {
-    const ids = missGraphql[4];
     return {
       event: 'miss',
       kind: 'graphql',
       operationName: missGraphql[1],
       hash12: missGraphql[2],
       reason: missGraphql[3],
-      unrecordedIds: ids === undefined || ids.length === 0 ? [] : ids.split(','),
-      variables: missGraphql[5] ?? '',
+      variables: missGraphql[4] ?? '',
     };
   }
 
@@ -1655,11 +2352,6 @@ function describeProblem(line: ScreenshotBackendLogLine): ScreenshotBackendProbl
                 description: `the recorded response for ${line.operationName} could not be read (${variables})`,
                 remedy: `the fixture file is missing or malformed; ${RE_RECORD_REMEDY}`,
               };
-            case 'unrecorded-ids':
-              return {
-                description: `${line.operationName} asked for a batch where NO id was recorded: ${line.unrecordedIds.join(', ')} (${variables})`,
-                remedy: `the screen those rows are on was never captured — add it to the flow and ${RE_RECORD_REMEDY}`,
-              };
           }
           break;
         }
@@ -1706,18 +2398,48 @@ function isProblemLine(line: ScreenshotBackendLogLine, mode: ScreenshotBackendMo
  * One line per distinct problem, repeats collapsed into a `×N` count, every line
  * ending in what to do about it.
  */
+/**
+ * The problem a replay reports when the app never made one GraphQL request.
+ * Exported because the smoke has to tell it apart from a real miss: an app that
+ * died before it reached home made no requests, and that silence is a
+ * consequence of the crash, not something wrong with the recorded set.
+ */
+export const NO_GRAPHQL_HIT_PROBLEM =
+  'no HIT graphql lines in the screenshot backend log — the app never reached the replay backend; check that EXPO_PUBLIC_BACKEND_URL reached the Metro bundle.';
+
 export function findScreenshotBackendProblems(logText: string, options: { mode: ScreenshotBackendMode }): string[] {
   const problemCounts = new Map<string, { problem: ScreenshotBackendProblem; count: number }>();
   // Only a GraphQL hit counts as "the app actually exercised a screen's data" —
   // an app that only ever authenticated (HIT auth) never reached a screen at
   // all, and must still fail the check below rather than being credited for it.
+  // A `composed=0` answer is not a hit either: like a replay default, it was
+  // answered without one recorded id behind it.
   let graphqlHitCount = 0;
+  // Per batched operation: how many requests were composed, and how many
+  // requested ids the recorded set covered across the whole capture (an
+  // exact-key hit replays a recorded batch verbatim, so it counts as covered).
+  const batchCoverage = new Map<string, { composedBatches: number; covered: number; firstUncoveredIds: string[] }>();
 
   for (const rawLine of logText.split('\n')) {
     const line = parseScreenshotBackendLogLine(rawLine);
     if (!line) continue;
     if (line.event === 'hit') {
-      if (line.kind === 'graphql') graphqlHitCount += 1;
+      if (line.kind !== 'graphql') continue;
+      if (line.composed !== 0) graphqlHitCount += 1;
+      if (batchedOperationSpec(line.operationName) === null) continue;
+      const coverage = batchCoverage.get(line.operationName) ?? {
+        composedBatches: 0,
+        covered: 0,
+        firstUncoveredIds: [],
+      };
+      if (line.composed === null) {
+        coverage.covered += 1;
+      } else {
+        coverage.composedBatches += 1;
+        coverage.covered += line.composed;
+        if (coverage.firstUncoveredIds.length === 0) coverage.firstUncoveredIds = [...line.uncoveredIds];
+      }
+      batchCoverage.set(line.operationName, coverage);
       continue;
     }
     if (!isProblemLine(line, options.mode)) continue;
@@ -1732,41 +2454,69 @@ export function findScreenshotBackendProblems(logText: string, options: { mode: 
     ({ problem, count }) => `${problem.description}${count > 1 ? ` ×${count}` : ''} — ${problem.remedy}`,
   );
 
-  if (options.mode === 'replay' && graphqlHitCount === 0) {
-    problems.push(
-      'no HIT graphql lines in the screenshot backend log — the app never reached the replay backend; check that EXPO_PUBLIC_BACKEND_URL reached the Metro bundle.',
-    );
+  if (options.mode === 'replay') {
+    // One chunk of uncovered ids beside covered ones is flush timing, and is
+    // tolerated (see `findScreenshotBackendNotes`). An operation that never
+    // got ONE recorded id across the whole capture is not timing: the app is
+    // asking about climbs the set does not know, and for ticks and favourites
+    // nothing else fills the row in, so the list would shoot with no send
+    // marks and the gate would stay green.
+    for (const [operationName, coverage] of batchCoverage) {
+      if (coverage.composedBatches === 0 || coverage.covered > 0) continue;
+      problems.push(
+        `${operationName} was asked for ${coverage.composedBatches} batch(es) and the recorded set covers none of ` +
+          `the requested ids (e.g. ${coverage.firstUncoveredIds.join(', ')}) — the app is asking about rows the ` +
+          `recording never showed; ${RE_RECORD_REMEDY}`,
+      );
+    }
   }
+
+  if (options.mode === 'replay' && graphqlHitCount === 0) problems.push(NO_GRAPHQL_HIT_PROBLEM);
   return problems;
 }
 
 /**
  * What a capture should MENTION but not fail on.
  *
- * Today that is one thing: a batched operation answered with some of its ids
- * uncovered by the recorded set (see the tolerance rule on
- * `collectBatchItems`'s caller in screenshot-backend.ts). Uncovered ids are
- * routine and self-correcting — a list mounts rows past the fold, a shuffled
- * pool picks differently — and the rows they belong to still render from the
- * search payload's own bootstrap values, so they cannot blank a visible screen.
- * Failing a capture on them would make the gate flap on draw distance; hiding
- * them would lose the one signal that says a re-record is due.
+ * Two things. A batched operation answered with some of its ids uncovered by
+ * the recorded set (see the tolerance rule on `collectBatchItems`'s caller in
+ * screenshot-backend.ts): uncovered ids are routine — a list mounts rows past
+ * the fold, a shuffled pool picks differently — and failing a capture on them
+ * would make the gate flap on draw distance, while hiding them would lose the
+ * one signal that says a re-record is due. And an operation answered from
+ * `REPLAY_DEFAULT_RESPONSES`, so a default never works unseen.
  *
- * One line per operation, counting the batches and the ids.
+ * One line per operation, counting the batches and the ids. Batches where no
+ * requested id was covered are counted apart: they are the ones worth opening
+ * the screenshot for.
  */
 export function findScreenshotBackendNotes(logText: string): string[] {
-  const uncoveredByOperation = new Map<string, { batches: number; ids: number }>();
+  const uncoveredByOperation = new Map<string, { batches: number; ids: number; emptyBatches: number }>();
+  const defaultedByOperation = new Map<string, number>();
   for (const rawLine of logText.split('\n')) {
     const line = parseScreenshotBackendLogLine(rawLine);
-    if (!line || line.event !== 'hit' || line.kind !== 'graphql' || line.uncoveredCount === 0) continue;
-    const seen = uncoveredByOperation.get(line.operationName) ?? { batches: 0, ids: 0 };
+    if (!line) continue;
+    if (line.event === 'default') {
+      defaultedByOperation.set(line.operationName, (defaultedByOperation.get(line.operationName) ?? 0) + 1);
+      continue;
+    }
+    if (line.event !== 'hit' || line.kind !== 'graphql' || line.uncoveredCount === 0) continue;
+    const seen = uncoveredByOperation.get(line.operationName) ?? { batches: 0, ids: 0, emptyBatches: 0 };
     seen.batches += 1;
     seen.ids += line.uncoveredCount;
+    if (line.composed === 0) seen.emptyBatches += 1;
     uncoveredByOperation.set(line.operationName, seen);
   }
-  return [...uncoveredByOperation.entries()].map(
-    ([operationName, { batches, ids }]) =>
-      `${operationName} answered ${batches} batch(es) with ${ids} uncovered id(s) — rows mounted beyond the fold; ` +
-      `re-record if a visible row shows blank stats.`,
+  const uncoveredNotes = [...uncoveredByOperation.entries()].map(([operationName, { batches, ids, emptyBatches }]) => {
+    const empty = emptyBatches > 0 ? `, ${emptyBatches} of them with no recorded id at all` : '';
+    return (
+      `${operationName} answered ${batches} batch(es) with ${ids} uncovered id(s)${empty} — rows the recording ` +
+      `never asked about; re-record if a visible row shows blank or wrong data.`
+    );
+  });
+  const defaultNotes = [...defaultedByOperation.entries()].map(
+    ([operationName, count]) =>
+      `${operationName} has no recorded fixture; answered ${count} request(s) with its replay default.`,
   );
+  return [...uncoveredNotes, ...defaultNotes];
 }

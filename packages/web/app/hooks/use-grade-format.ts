@@ -1,4 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { useTranslation } from 'react-i18next';
+import { defaultGradeDisplayFormatForLocale } from '@boardsesh/play-view';
 import { getGradeDisplayFormat, setGradeDisplayFormat } from '@/app/lib/user-preferences-db';
 import { type GradeDisplayFormat, formatGrade, getSoftGradeColorByFormat } from '@/app/lib/grade-colors';
 
@@ -6,7 +8,11 @@ import { type GradeDisplayFormat, formatGrade, getSoftGradeColorByFormat } from 
 const GRADE_FORMAT_CHANGE_EVENT = 'boardsesh:gradeFormatChange';
 
 export function useGradeFormat() {
-  const [gradeFormat, setGradeFormatState] = useState<GradeDisplayFormat>('v-grade');
+  const { i18n } = useTranslation();
+  // The climber's explicit pick; null until they make one. Without a pick,
+  // Spanish, French, German and Italian pages show Font grades and every other locale shows V.
+  const [chosenFormat, setGradeFormatState] = useState<GradeDisplayFormat | null>(null);
+  const gradeFormat = chosenFormat ?? defaultGradeDisplayFormatForLocale(i18n?.language);
   const [loaded, setLoaded] = useState(false);
   // Track whether this instance originated the current change so the event
   // listener can skip the redundant setState.
@@ -19,7 +25,7 @@ export function useGradeFormat() {
       })
       .catch(() => {
         // IndexedDB unavailable (private browsing, quota exceeded, etc.)
-        // Fall back to default v-grade so Skeletons don't stay forever.
+        // Fall back to the locale default so Skeletons don't stay forever.
       })
       .finally(() => {
         setLoaded(true);
@@ -48,9 +54,11 @@ export function useGradeFormat() {
     window.dispatchEvent(new CustomEvent(GRADE_FORMAT_CHANGE_EVENT, { detail: format }));
   }, []);
 
+  // `boardName` picks the board's own V scale: MoonBoard reads "6a+/V3" as V3,
+  // every other board as V3+.
   const formatGradeWithPreference = useCallback(
-    (difficulty: string | null | undefined): string | null => {
-      return formatGrade(difficulty, gradeFormat);
+    (difficulty: string | null | undefined, boardName?: string | null): string | null => {
+      return formatGrade(difficulty, gradeFormat, boardName);
     },
     [gradeFormat],
   );

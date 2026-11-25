@@ -21,7 +21,7 @@ nodeLinker: isolated
 linkWorkspacePackages: false
 
 # The React Native / Expo peer graph does not satisfy strict peer resolution
-# (react-native pins peers that Expo packages widen, and mobile pins React 19.2.3
+# (react-native pins peers that Expo packages widen, and mobile pins React 19.3.0
 # while the web side is on ^19.2.8). Revisit once the migration has settled.
 strictPeerDependencies: false
 
@@ -40,28 +40,71 @@ enableGlobalVirtualStore: false
 # runtimeVersion than CI does.
 virtualStoreDirMaxLength: 120
 
+# These packages import React types without declaring that peer. Bind them to
+# the consuming app instead of the store's hoisted types: mobile uses React
+# 19.3, while web stays on 19.2. Mixing the declarations breaks refs and keys.
+packageExtensions:
+  'next@16.3.5':
+    peerDependencies:
+      '@types/react': '*'
+      '@types/react-dom': '*'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+      '@types/react-dom':
+        optional: true
+  '@mui/styled-engine@7.3.10':
+    peerDependencies:
+      '@types/react': '*'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+  'react-i18next@17.0.12':
+    peerDependencies:
+      '@types/react': '*'
+    peerDependenciesMeta:
+      '@types/react':
+        optional: true
+
 overrides:
-  # Expo loads these browser datasets through its config plugins and hashes them.
-  # Keep main on the App Store 2.5.0 runtime; advance these only on release/next.
-  baseline-browser-mapping: 2.11.17
-  caniuse-lite: 1.0.30001809
+  # Keep Vite+ and direct test imports on the same bundled Vite/Vitest instances.
+  'vite@*': npm:@voidzero-dev/vite-plus-core@1.6.0
+  'vitest@*': 5.1.0
+  # Vitest 5 accepts ws ^8.22.0; keep its 8.x graph outside the 24h release cooldown.
+  # This selector deliberately leaves consumers of ws 7 on their existing major.
+  'ws@>=8.0.0 <9.0.0': 8.22.2
+  # These Expo fingerprint inputs advance with the release train's native builds.
+  baseline-browser-mapping: 2.11.24
+  caniuse-lite: 1.0.30001810
+  # Keep Observe and Updates on the same SDK 58 native interface.
+  expo-updates-interface: 58.0.1
   # Remove only when an upstream release passes the disconnect/recovery tests (#5299).
   postgres: 3.4.9
-  react-native-screens: 4.26.2
+  react-native-screens: 4.30.1
 
 patchedDependencies:
+  # Scope MUI's fallback ref declarations to web React, never the ambient mobile namespace.
+  '@mui/material@7.3.11': packages/web/patches/@mui__material@7.3.11.patch
+  'react-native@0.88.1': patches/react-native@0.88.1.patch
+  'expo-dev-launcher@58.0.21': patches/expo-dev-launcher@58.0.21.patch
+  'react-native-screens@4.30.1': patches/react-native-screens@4.30.1.patch
+  '@expo/fingerprint@0.21.10': patches/@expo__fingerprint@0.21.10.patch
+  'expo-updates@58.0.22': patches/expo-updates@58.0.22.patch
+  'expo-image@58.0.18': patches/expo-image@58.0.18.patch
+  '@expo/ui@58.0.29': patches/@expo__ui@58.0.29.patch
+  'expo-sqlite@58.0.18': patches/expo-sqlite@58.0.18.patch
+  'expo-modules-core@58.1.0': patches/expo-modules-core@58.1.0.patch
+  'posthog-react-native-session-replay@1.6.0': patches/posthog-react-native-session-replay@1.6.0.patch
   'postgres@3.4.9': packages/db/patches/postgres@3.4.9.patch
   'react-native-ble-plx@3.5.1': patches/react-native-ble-plx@3.5.1.patch
-  '@expo/fingerprint@0.20.11': patches/@expo__fingerprint@0.20.11.patch
-  '@expo/ui@57.0.14': patches/@expo__ui@57.0.14.patch
-  'expo-dev-launcher@57.0.16': patches/expo-dev-launcher@57.0.16.patch
-  'expo-image@57.0.3': patches/expo-image@57.0.3.patch
-  'expo-updates@57.0.19': patches/expo-updates@57.0.19.patch
-  'react-native-screens@4.26.2': patches/react-native-screens@4.26.2.patch
+  next@16.3.5: packages/web/patches/next@16.3.5.patch
 
 # pnpm blocks dependency lifecycle scripts unless they are listed here. Only
 # add a package after reviewing what its build script does.
 allowBuilds:
+  # v13 ships N-API prebuilds. pnpm 11 otherwise synthesizes an unnecessary
+  # node-gyp build during fetch, including in unrelated service images.
+  better-sqlite3: false
   # Downloads the platform sentry-cli binary. Native build phases invoke it.
   '@sentry/cli': true
   # Direct native image dependency used by web/backend/db/board rendering.

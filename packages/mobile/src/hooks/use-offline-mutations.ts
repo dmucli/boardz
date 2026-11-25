@@ -1,9 +1,10 @@
+import { enqueueMeasuredMutation as enqueue, cancelMeasuredMutations } from '../offline/offline-write-context';
 import { useCallback } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   beginImmediateWrite,
-  enqueue,
   getLocalUserId,
+  getLatestClimbMutationKey,
   runLocalWriteWithRetry,
   OFFLINE_DB_FOREGROUND_WRITE_TIMEOUT_MS,
   OFFLINE_DB_RETRY_BUSY_TIMEOUT_MS,
@@ -45,9 +46,11 @@ export async function writeAuthorFollowLocal(
     } else {
       await txn.runAsync(`DELETE FROM ${table} WHERE ${column} = ?`, [identifier]);
     }
-    await txn.runAsync("DELETE FROM pending_mutations WHERE idempotency_key = ? AND status = 'pending'", [
-      `${follow ? 'del' : 'add'}:${table}:${identifier}`,
-    ]);
+    await cancelMeasuredMutations(
+      txn,
+      "DELETE FROM pending_mutations WHERE idempotency_key = ? AND status = 'pending'",
+      [`${follow ? 'del' : 'add'}:${table}:${identifier}`],
+    );
     enqueueOutcome.result = await enqueue(
       txn,
       table,
@@ -185,11 +188,22 @@ export async function writeTickLocal(
       // attempt already committed: a `SQLITE_BUSY` can surface at COMMIT, which
       // makes "the transaction landed and still threw" a real shape. `uuid` is
       // the PRIMARY KEY, and every other statement here is already idempotent.
+      //
+      // `climb_revision` is stamped from the phone's own copy of the climb, and
+      // never sent: the server picks the version itself. The stamp is for the
+      // local sent marks only. They count a tick when its version is at or past
+      // the climb's `holds_revision_number` (`tickOnCurrentHoldsLocalSql`), and
+      // a NULL reads as version 1, so an unstamped send on a climb whose holds
+      // moved would show as not sent until the pull brings the server's value.
+      // The phone's row is never below its own holds version, so the stamp
+      // always agrees with the local check. NULL when the board is not on the
+      // phone, where no local sent mark reads it.
       await txn.runAsync(
         `INSERT OR IGNORE INTO boardsesh_ticks (uuid, user_id, board_type, climb_uuid, angle, status,
        attempt_count, quality, difficulty, comment, climbed_at, session_id, is_mirror, is_benchmark,
-       created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       created_at, updated_at, climb_revision)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+         (SELECT revision_number FROM board_climbs WHERE uuid = ? AND board_type = ?))`,
         [
           tickUuid,
           ownerUserId,
@@ -207,6 +221,8 @@ export async function writeTickLocal(
           input.isBenchmark ? 1 : 0,
           now,
           now,
+          input.climbUuid,
+          input.boardType,
         ],
       );
 
@@ -215,7 +231,9 @@ export async function writeTickLocal(
       // this INSERT OR IGNORE can never collide with an existing row. A future
       // tick key derived from climb+angle would inherit the deterministic-key
       // handling the favorites below need — re-check then.
-      await enqueue(txn, 'boardsesh_ticks', 'create', input, tickUuid);
+      const dependsOnKey =
+        input.boardType === 'spray' ? await getLatestClimbMutationKey(txn, input.boardType, input.climbUuid) : null;
+      await enqueue(txn, 'boardsesh_ticks', 'create', input, tickUuid, dependsOnKey ? { dependsOnKey } : {});
     },
     budgetMs,
   );
@@ -255,7 +273,9 @@ export async function enqueueTickOutboxOnly(
     async () => {
       await db.withExclusiveTransactionAsync(async (txn) => {
         await beginImmediateWrite(txn, OFFLINE_DB_FALLBACK_BUSY_TIMEOUT_MS);
-        await enqueue(txn, 'boardsesh_ticks', 'create', input, tickUuid);
+        const dependsOnKey =
+          input.boardType === 'spray' ? await getLatestClimbMutationKey(txn, input.boardType, input.climbUuid) : null;
+        await enqueue(txn, 'boardsesh_ticks', 'create', input, tickUuid, dependsOnKey ? { dependsOnKey } : {});
       });
     },
     { ...localWriteRetryOptions('boardsesh_ticks', 'create'), maxAttempts: 2, budgetMs },
@@ -270,6 +290,23 @@ export function favoriteAddKey(input: FavoriteInput): string {
 export function favoriteRemoveKey(input: FavoriteInput): string {
   return `del:user_favorites:${input.boardName}:${input.climbUuid}:${input.angle}`;
 }
+
+/**
+ * The key prefix shared by one climb's add (or remove) mutations at EVERY angle.
+ * A heart belongs to the climb: the server's remove clears every angle variant,
+ * so cancelling the opposite queued operation has to as well. Otherwise an add
+ * queued at 40° survives a remove at 25° and, queued ahead of a later re-add,
+ * nets the climb to un-hearted on the server.
+ */
+function favoriteKeyPrefix(operation: 'add' | 'del', input: FavoriteInput): string {
+  return `${operation}:user_favorites:${input.boardName}:${input.climbUuid}:`;
+}
+
+// Matches every angle's key for one climb. `substr` rather than LIKE: a climb
+// uuid could carry `_`, a LIKE wildcard, and the trailing `:` keeps one uuid
+// from matching another that merely starts with it.
+const CANCEL_OPPOSITE_FAVORITE_SQL = `DELETE FROM pending_mutations
+  WHERE substr(idempotency_key, 1, ?) = ? AND status IN ('pending', 'dead_letter')`;
 
 export async function addFavoriteLocal(db: OfflineDatabase, input: FavoriteInput): Promise<void> {
   const now = new Date().toISOString();
@@ -293,10 +330,8 @@ export async function addFavoriteLocal(db: OfflineDatabase, input: FavoriteInput
     // dead letter is by definition not in flight, and leaving it would keep the
     // "Sync issues" badge lit for a remove this add has just superseded — and
     // poison the key when the user toggles back.
-    await txn.runAsync(
-      `DELETE FROM pending_mutations WHERE idempotency_key = ? AND status IN ('pending', 'dead_letter')`,
-      [favoriteRemoveKey(input)],
-    );
+    const removePrefix = favoriteKeyPrefix('del', input);
+    await cancelMeasuredMutations(txn, CANCEL_OPPOSITE_FAVORITE_SQL, [removePrefix.length, removePrefix]);
     // A retry re-runs this and reassigns the holder — last attempt wins, which
     // is the outcome that matters. Re-running `enqueue` against a row a previous
     // attempt committed reports `pending`, and neither the revived nor the
@@ -343,10 +378,12 @@ export async function removeFavoriteLocal(db: OfflineDatabase, input: FavoriteIn
   const enqueueOutcome = newEnqueueOutcome();
 
   await runLocalWrite(db, 'user_favorites', 'delete', async (txn) => {
-    await txn.runAsync(`DELETE FROM user_favorites WHERE board_name = ? AND climb_uuid = ? AND angle = ?`, [
+    // Every angle, as the server's remove does (favorites/mutations.ts): the
+    // Liked list ignores angle, so a heart left at another angle would keep the
+    // climb listed until the next pull.
+    await txn.runAsync(`DELETE FROM user_favorites WHERE board_name = ? AND climb_uuid = ?`, [
       input.boardName,
       input.climbUuid,
-      input.angle,
     ]);
 
     // Cancel a not-yet-drained add so an offline add->remove nets to no server
@@ -357,10 +394,8 @@ export async function removeFavoriteLocal(db: OfflineDatabase, input: FavoriteIn
     // remove is harmless in the truly-canceled case and corrective in the race.
     // A dead-lettered add is cleared too (#4331) — it is not in flight, and it
     // would otherwise outlive the favorite the user just removed.
-    await txn.runAsync(
-      `DELETE FROM pending_mutations WHERE idempotency_key = ? AND status IN ('pending', 'dead_letter')`,
-      [favoriteAddKey(input)],
-    );
+    const addPrefix = favoriteKeyPrefix('add', input);
+    await cancelMeasuredMutations(txn, CANCEL_OPPOSITE_FAVORITE_SQL, [addPrefix.length, addPrefix]);
     enqueueOutcome.result = await enqueue(txn, 'user_favorites', 'delete', input, favoriteRemoveKey(input), {
       reviveDeadLetter: true,
     });
@@ -390,7 +425,8 @@ export function useOfflineFollowUser(db: OfflineDatabase, graphqlFetch: GraphQLF
         // without this, offline follow→unfollow→follow leaves [add, del] in
         // the queue (the second add is INSERT OR IGNOREd away) and drains to
         // UNFOLLOWED — the opposite of the user's last action.
-        await txn.runAsync(
+        await cancelMeasuredMutations(
+          txn,
           `DELETE FROM pending_mutations WHERE idempotency_key = ? AND status IN ('pending', 'dead_letter')`,
           [`del:user_follows:${followingId}`],
         );
@@ -425,7 +461,8 @@ export function useOfflineUnfollowUser(db: OfflineDatabase, graphqlFetch: GraphQ
         // Cancel a not-yet-drained follow, but ALWAYS enqueue the unfollow —
         // same TOCTOU reasoning as removeFavoriteLocal: the canceled add may
         // already be in flight, and the server unfollow is an idempotent no-op.
-        await txn.runAsync(
+        await cancelMeasuredMutations(
+          txn,
           `DELETE FROM pending_mutations WHERE idempotency_key = ? AND status IN ('pending', 'dead_letter')`,
           [`add:user_follows:${followingId}`],
         );

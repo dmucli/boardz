@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vite-plus/test';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { SPRAY_WALL_WRITE_LOCK_NAMESPACE } from '@boardsesh/shared-schema';
 
 /**
  * Every writer of spray wall state takes the wall lock, and takes it FIRST.
@@ -31,6 +32,10 @@ const SPRAY_WALLS_SOURCE = readFileSync(
 );
 const SPRAY_AUTHORING_SOURCE = readFileSync(
   fileURLToPath(new URL('../graphql/resolvers/climbs/spray-authoring.ts', import.meta.url)),
+  'utf8',
+);
+const SPRAY_LOCK_SOURCE = readFileSync(
+  fileURLToPath(new URL('../services/spray-wall-lock.ts', import.meta.url)),
   'utf8',
 );
 
@@ -125,6 +130,25 @@ const WRITERS: Array<{ name: string; source: string; why: string; exempt?: strin
     // sequence, so two concurrent creates cannot collide either.
     exempt: 'the wall does not exist yet, so there is nothing to lock on',
   },
+  {
+    name: 'insertSprayWallRows',
+    source: SPRAY_WALLS_SOURCE,
+    why: 'it inserts the spray_walls row for createSprayWall and resetSprayWall',
+    // Same reason as createSprayWall, whose transaction body this is: the wall it
+    // writes does not exist until the insert. resetSprayWall holds the SOURCE
+    // wall's lock around it, which is a different wall.
+    exempt: 'the wall it creates does not exist yet, so there is nothing to lock on',
+  },
+  {
+    name: 'resetSprayWall',
+    source: SPRAY_WALLS_SOURCE,
+    why: 'the source wall must not be archived, deleted or cloned twice while the clone is made',
+  },
+  {
+    name: 'archiveResetSourceUnderLock',
+    source: SPRAY_WALLS_SOURCE,
+    why: 'it stamps archived_at on the wall a reset clone replaces',
+  },
   { name: 'createSprayWallVersion', source: SPRAY_WALLS_SOURCE, why: 'the one-draft check decides on a read' },
   { name: 'upsertSprayWallHolds', source: SPRAY_WALLS_SOURCE, why: 'the draft-status and alive-set reads decide' },
   { name: 'removeSprayWallHolds', source: SPRAY_WALLS_SOURCE, why: 'the draft-status and alive-set reads decide' },
@@ -134,9 +158,25 @@ const WRITERS: Array<{ name: string; source: string; why: string; exempt?: strin
     source: SPRAY_WALLS_SOURCE,
     why: 'it IS the publish: supersede, hold count, catalogue image and the integrity recompute',
   },
-  { name: 'commitSprayWallVersion', source: SPRAY_WALLS_SOURCE, why: 'the alive-set and draft-status reads decide' },
+  {
+    name: 'commitSprayWallVersion',
+    source: SPRAY_WALLS_SOURCE,
+    why: 'the draft-status and draft-purpose reads decide',
+  },
   { name: 'discardSprayWallVersion', source: SPRAY_WALLS_SOURCE, why: 'the draft-status read decides' },
-  { name: 'updateSprayWall', source: SPRAY_WALLS_SOURCE, why: 'the angle rule reads current_version_id' },
+  { name: 'runUpdateSprayWall', source: SPRAY_WALLS_SOURCE, why: 'the angle rule reads current_version_id' },
+  {
+    name: 'setSprayWallRenderSettings',
+    source: SPRAY_WALLS_SOURCE,
+    why: 'it writes spray_walls.render_settings',
+    // A single-column write to a column no hold, version or publish path reads
+    // or writes. Its reads are a version's pins and frame (a generated
+    // background is refused when the photo fails the quality gate), which never
+    // change once written, and the stored background an older client's write
+    // keeps — the same column, where the last call wins. A publish racing it
+    // queues its own art. There is nothing to order it against.
+    exempt: 'it decides only on immutable version geometry and its own column, which no other writer touches',
+  },
   { name: 'deleteSprayWall', source: SPRAY_WALLS_SOURCE, why: 'a publish must not land on a wall being deleted' },
   {
     name: 'assertSprayHoldsAreAlive',
@@ -182,11 +222,20 @@ describe('every spray wall writer holds the wall lock', () => {
       // its caller is about to make in the same transaction, so the lock still has
       // to be held from here on.
       //
-      // `publishSprayWallVersion` delegates every write to `publishDraftUnderLock`,
-      // which is itself in this list and takes the lock again (re-entrant within a
-      // transaction) before its first write. The resolver still locks, so a reader
-      // of either function sees the rule stated where the transaction opens.
-      expect(['assertSprayHoldsAreAlive', 'publishSprayWallVersion']).toContain(name);
+      // `publishSprayWallVersion` and `commitSprayWallVersion` delegate every write
+      // to `publishDraftUnderLock`, which is itself in this list and takes the lock
+      // again (re-entrant within a transaction) before its first write. The
+      // resolvers still lock, so a reader of either function sees the rule stated
+      // where the transaction opens.
+      //
+      // `resetSprayWall` delegates its insert to `insertSprayWallRows` and holds
+      // the SOURCE wall's lock so the source cannot change under the clone.
+      expect([
+        'assertSprayHoldsAreAlive',
+        'publishSprayWallVersion',
+        'commitSprayWallVersion',
+        'resetSprayWall',
+      ]).toContain(name);
       return;
     }
     expect(lockAt, `${name} writes at offset ${writeAt} before locking at ${lockAt}`).toBeLessThan(writeAt);
@@ -206,8 +255,9 @@ describe('every spray wall writer holds the wall lock', () => {
   it('locks on the wall id, not the version id', () => {
     // A per-version lock would not make an edit and a publish queue: they contend on
     // different rows (a version row and the wall's `current_version_id`).
-    const body = functionBody(SPRAY_WALLS_SOURCE, 'lockWallForWrite');
-    expect(body).toMatch(/pg_advisory_xact_lock\(\$\{SPRAY_WALL_LOCK_NAMESPACE\}, \$\{wallId\}\)/);
+    const body = functionBody(SPRAY_LOCK_SOURCE, 'lockWallForWrite');
+    expect(body).toMatch(/pg_advisory_xact_lock\(\$\{SPRAY_WALL_WRITE_LOCK_NAMESPACE\}, \$\{wallId\}\)/);
+    expect(SPRAY_WALL_WRITE_LOCK_NAMESPACE).toBe(0x53505259);
   });
 });
 
@@ -303,12 +353,11 @@ describe('assertSprayHoldsAreAlive re-resolves the published generation under th
  * authz read and the lock is ordinary. Forcing that window in a behavioural test
  * means interleaving two transactions and would be flaky about hitting it; the
  * outer gate (a wall already deleted when the call arrives) is covered
- * behaviourally in spray-wall-reset.test.ts.
+ * behaviourally in spray-wall-retired-reset.test.ts.
  *
  * The `IS NULL` scope alone is not enough, which is why the throw is asserted too:
- * both guards below it read `wallNow?.currentVersionId` with an optional chain, so
- * a missing row without the throw means "nothing published yet" and publishes
- * straight into a wall nobody can reach.
+ * a missing row without the throw would read as "nothing published yet" and
+ * publish straight into a wall nobody can reach.
  */
 describe('publishDraftUnderLock refuses a wall that has been deleted', () => {
   it('scopes its wall re-read to deleted_at IS NULL and throws when the row is gone', () => {
@@ -326,57 +375,7 @@ describe('publishDraftUnderLock refuses a wall that has been deleted', () => {
     const throwAt = body.indexOf('if (!wallNow) throw notFoundError();');
     expect(throwAt, 'an absent wall row is not treated as an error').toBeGreaterThan(readAt);
     // The code, not the comment above it that names the same expression.
-    expect(throwAt).toBeLessThan(body.indexOf('if (wallNow?.currentVersionId != null)'));
-  });
-});
-
-/**
- * `recordRemixLineage` reads `current_version_id` under the lock too.
- *
- * `spray_climb_lineage.wall_version_id` says which generation the child was set
- * against, so a `commitSprayWallVersion` landing between that read and the
- * caller's commit would leave the row naming a generation that had already been
- * superseded. `assertSprayHoldsAreAlive` takes the same lock a few lines earlier in
- * `saveClimb` — but only when the climb HAS holds, so leaning on it would make this
- * function's correctness depend on another function's early return.
- */
-describe('recordRemixLineage reads the wall version under the lock', () => {
-  it('locks first, then reads the parent, then the wall', async () => {
-    const calls: string[] = [];
-    const rows: unknown[][] = [[{ uuid: 'parent-uuid' }], [{ currentVersionId: 7 }]];
-    let selectCount = 0;
-
-    const chainFor = (result: unknown[]) => {
-      const chain: Record<string, unknown> = {};
-      for (const method of ['from', 'innerJoin', 'leftJoin', 'where', 'limit', 'orderBy']) chain[method] = () => chain;
-      chain.then = (resolve: (value: unknown) => unknown) => Promise.resolve(result).then(resolve);
-      return chain;
-    };
-
-    const executor = {
-      execute: () => {
-        calls.push('lock');
-        return Promise.resolve([]);
-      },
-      select: () => {
-        calls.push(selectCount === 0 ? 'parent' : 'wall');
-        return chainFor(rows[selectCount++] ?? []);
-      },
-      insert: () => {
-        calls.push('insert');
-        return { values: () => Promise.resolve([]) };
-      },
-    } as never;
-
-    const { recordRemixLineage } = await import('../graphql/resolvers/climbs/spray-authoring');
-    await recordRemixLineage(executor, { wallId: 42, layoutId: 9 }, 'child-uuid', 'parent-uuid');
-
-    // The parent read is a pure existence check and may sit either side of the
-    // lock; the WALL read is the one the write depends on, so the lock has to be
-    // held by then.
-    expect(calls).toContain('lock');
-    expect(calls.indexOf('lock')).toBeLessThan(calls.indexOf('wall'));
-    expect(calls.at(-1)).toBe('insert');
+    expect(throwAt).toBeLessThan(body.indexOf('if (wallNow.currentVersionId != null)'));
   });
 });
 
@@ -400,7 +399,7 @@ describe('recordRemixLineage reads the wall version under the lock', () => {
  */
 describe('the feed retraction decision is re-read under the wall lock', () => {
   it('updateSprayWall reads is_public after the lock, not before', () => {
-    const body = functionBody(SPRAY_WALLS_SOURCE, 'updateSprayWall');
+    const body = functionBody(SPRAY_WALLS_SOURCE, 'runUpdateSprayWall');
 
     const lockAt = body.indexOf('lockWallForWrite(');
     const decisionAt = body.indexOf('const losingPublic =');
@@ -456,5 +455,119 @@ describe('the climb.created decision is re-read under the wall lock', () => {
     const { sprayWallMayAnnounceUnderLock } = await import('../graphql/resolvers/climbs/spray-authoring');
     await expect(sprayWallMayAnnounceUnderLock(executor, 42)).resolves.toBe(false);
     expect(calls).toEqual(['lock', 'read']);
+  });
+});
+
+/**
+ * An archived wall is read-only, and the refusal is decided under the wall lock.
+ *
+ * The archive is stamped by the replacing wall's first publish, under the archived
+ * wall's lock. A writer that checked `archived_at` before taking the lock could
+ * read "live", lose the race to that publish, and then write onto an archived wall.
+ * What an archived wall still ALLOWS is behavioural, in spray-wall-reset-clone.test.ts.
+ */
+describe('an archived wall refuses writes, decided under the wall lock', () => {
+  const MUTATIONS_SOURCE = readFileSync(
+    fileURLToPath(new URL('../graphql/resolvers/climbs/mutations.ts', import.meta.url)),
+    'utf8',
+  );
+
+  it.each([
+    'createSprayWallVersion',
+    'upsertSprayWallHolds',
+    'removeSprayWallHolds',
+    'commitSprayWallVersion',
+    'publishSprayWallVersion',
+  ])('%s checks right after the lock, before any write', (name) => {
+    const body = functionBody(SPRAY_WALLS_SOURCE, name);
+    const lockAt = body.indexOf('lockWallForWrite(');
+    const guardAt = body.indexOf('assertSprayWallNotArchivedUnderLock(');
+    expect(guardAt, `${name} never refuses an archived wall`).toBeGreaterThan(lockAt);
+    const writeAt = firstWriteOffset(body);
+    if (writeAt !== -1) expect(guardAt).toBeLessThan(writeAt);
+  });
+
+  it.each(['saveClimb', 'updateClimb'])('%s checks under the lock, before the holds', (resolver) => {
+    const body = functionBody(MUTATIONS_SOURCE, resolver);
+    const guardAt = body.indexOf('assertSprayWallAcceptsClimbsUnderLock(');
+    expect(guardAt, `${resolver} never refuses an archived wall under the lock`).toBeGreaterThanOrEqual(0);
+    expect(guardAt).toBeLessThan(body.indexOf('assertSprayHoldsAreAlive('));
+    expect(guardAt).toBeGreaterThan(body.indexOf('db.transaction('));
+  });
+
+  it('takes the clone lock before the source lock, and account deletion walks walls the same way', () => {
+    // publishDraftUnderLock holds the clone (always the higher id) and then takes
+    // the source. deleteAccountSprayWalls holds every lock it takes until commit,
+    // so it has to walk highest id first or the two can deadlock.
+    const publishBody = functionBody(SPRAY_WALLS_SOURCE, 'publishDraftUnderLock');
+    const cloneLockAt = publishBody.indexOf('lockWallForWrite(tx, wall.id)');
+    expect(cloneLockAt).toBeGreaterThanOrEqual(0);
+    expect(cloneLockAt).toBeLessThan(publishBody.indexOf('narrowToResetSourceUnderLock('));
+    expect(cloneLockAt).toBeLessThan(publishBody.indexOf('archiveResetSourceUnderLock('));
+    const deleteAccountSource = readFileSync(
+      fileURLToPath(new URL('../graphql/resolvers/users/delete-account-spray-walls.ts', import.meta.url)),
+      'utf8',
+    );
+    expect(deleteAccountSource).toContain('.orderBy(desc(dbSchema.sprayWalls.id))');
+  });
+
+  it('a write across the reset family locks all of it, account first and highest id first', () => {
+    // Two writers write OTHER walls' rows, to null `training_consent_at` on the
+    // rest of a reset family: `runUpdateSprayWall` when the owner switches
+    // consent off, and `deleteSprayWall` when the live wall goes. So they need
+    // those walls' locks too, taken in the order the two paths above use. The
+    // account lock comes first because `resetSprayWall` holds it while it
+    // clones: taken before the walk, no clone joins the family between the walk
+    // and the write.
+    const familyLockBody = functionBody(SPRAY_WALLS_SOURCE, 'lockResetFamilyForWrite');
+    const accountLockAt = familyLockBody.indexOf('lockSprayWallAccount(');
+    const walkAt = familyLockBody.indexOf('resetFamilyWallIds(');
+    const wallLockAt = familyLockBody.indexOf('lockWallForWrite(');
+    expect(accountLockAt).toBeGreaterThanOrEqual(0);
+    expect(walkAt).toBeGreaterThan(accountLockAt);
+    expect(wallLockAt).toBeGreaterThan(walkAt);
+    expect(familyLockBody).toContain('.sort((first, second) => second - first)');
+
+    // …and before anything else in the transaction: ahead of the wall's own lock
+    // (or the family would be locked out of order) and of the first write.
+    for (const writer of ['runUpdateSprayWall', 'deleteSprayWall']) {
+      const body = functionBody(SPRAY_WALLS_SOURCE, writer);
+      const familyLockAt = body.indexOf('lockResetFamilyForWrite(');
+      expect(familyLockAt, `${writer} never locks the reset family`).toBeGreaterThan(body.indexOf('db.transaction('));
+      expect(familyLockAt, `${writer} takes its own wall lock first`).toBeLessThan(body.indexOf('lockWallForWrite('));
+      expect(familyLockAt, `${writer} writes before locking the family`).toBeLessThan(firstWriteOffset(body));
+      expect(familyLockAt).toBeLessThan(body.indexOf('clearTrainingConsent('));
+    }
+  });
+
+  it('resetSprayWall takes the account lock before the source wall lock, and both before it clones', () => {
+    // The other half of "no clone joins the family unseen". A reset holds the
+    // account lock from before it reads the source until it commits, so a family
+    // write that takes the same lock first either sees the finished clone or
+    // runs before the reset reads the consent it copies. Wall lock first would
+    // also invert the account-then-walls order every other path uses.
+    const body = functionBody(SPRAY_WALLS_SOURCE, 'resetSprayWall');
+    const transactionAt = body.indexOf('db.transaction(');
+    const accountLockAt = body.indexOf('lockSprayWallAccount(');
+    const wallLockAt = body.indexOf('lockWallForWrite(');
+    expect(transactionAt).toBeGreaterThanOrEqual(0);
+    expect(accountLockAt, 'resetSprayWall never takes the account lock').toBeGreaterThan(transactionAt);
+    expect(wallLockAt, 'the source wall is locked before the account').toBeGreaterThan(accountLockAt);
+    // The consent the clone copies is read from the source AFTER both locks.
+    expect(body.indexOf('source.wall.trainingConsentAt')).toBeGreaterThan(wallLockAt);
+    expect(body.indexOf('insertSprayWallRows(')).toBeGreaterThan(wallLockAt);
+  });
+
+  it('a clone publishing with consent off clears the family under the source lock, with no new lock', () => {
+    // `archiveResetSourceUnderLock` runs with the clone's lock held and takes
+    // the source's. It must not take the account lock (walls are already held,
+    // and every other path takes the account first) or the family's other wall
+    // locks; its docstring says why it does not need them.
+    const body = functionBody(SPRAY_WALLS_SOURCE, 'archiveResetSourceUnderLock');
+    const sourceLockAt = body.indexOf('lockWallForWrite(tx, sourceWallId)');
+    expect(sourceLockAt).toBeGreaterThanOrEqual(0);
+    expect(body.indexOf('clearTrainingConsent(')).toBeGreaterThan(sourceLockAt);
+    expect(body).not.toContain('lockSprayWallAccount(');
+    expect(body).not.toContain('lockResetFamilyForWrite(');
   });
 });

@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, fireEvent, act, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -17,20 +30,34 @@ const params = vi.hoisted(() => ({
     setIds: '1,2',
     angle: '40',
     setters: undefined as string | undefined,
+    handoffId: undefined as string | undefined,
     countInput: undefined as string | undefined,
   },
 }));
 const emitMock = vi.hoisted(() => vi.fn());
-// Captures navigation.setOptions calls so tests can assert the headerRight
-// "Clear all" shows only while setters are selected; goBack is the footer's pop.
+// goBack is the header Apply's pop.
 const navMock = vi.hoisted(() => ({
-  setOptions: vi.fn(),
   goBack: vi.fn(),
   push: vi.fn(),
   addListener: vi.fn((_event: string, handler: () => void) => {
     focus.cleanup = handler;
     return () => {};
   }),
+}));
+// The latest actions the screen handed its native header.
+const headerActions = vi.hoisted(() => ({
+  current: null as null | {
+    trailing?: { label: string; onPress: () => void } | null;
+    trailingAccessory?: unknown;
+  },
+}));
+vi.mock('../../../../src/hooks/use-header-actions', () => ({
+  useHeaderActions: (actions: typeof headerActions.current) => {
+    headerActions.current = actions;
+  },
+}));
+vi.mock('../../../../src/hooks/use-bottom-chrome-metrics', () => ({
+  useBottomChromeMetrics: () => ({ scrollBottomPadding: 34 }),
 }));
 const followMock = vi.hoisted(() => vi.fn());
 const authorQuery = vi.hoisted(() => ({ failed: false, refetch: vi.fn() }));
@@ -55,7 +82,7 @@ const setterStats = vi.hoisted(() => ({
   refetch: vi.fn(),
 }));
 // The count query: returns a count only while enabled, like the real hook, and
-// records the input so tests can assert what the footer counts.
+// records the input so tests can assert what the header action counts.
 const countQuery = vi.hoisted(() => {
   const state = { count: 42 as number | undefined, isPlaceholderData: false };
   return {
@@ -75,7 +102,6 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('expo-router', () => ({
   useLocalSearchParams: () => params.value,
-  // The screen drives the native header (title + headerRight) through setOptions.
   useNavigation: () => navMock,
   useRouter: () => navMock,
   // Run the effect immediately and stash its cleanup so the test can fire it.
@@ -83,10 +109,6 @@ vi.mock('expo-router', () => ({
     const cleanup = effect();
     focus.cleanup = typeof cleanup === 'function' ? cleanup : null;
   },
-}));
-
-vi.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 47, bottom: 34, left: 0, right: 0 }),
 }));
 
 vi.mock('@shopify/flash-list', () => ({
@@ -128,6 +150,7 @@ vi.mock('../../../../src/lib/setter-filter-handoff', () => ({ emitSetterFilterSe
 vi.mock('../../../../src/lib/haptics', () => ({ hapticSelection: vi.fn() }));
 
 vi.mock('../../../../src/providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: {
       background: '#fff',
@@ -142,14 +165,13 @@ vi.mock('../../../../src/providers/theme-provider', () => ({
 
 vi.mock('../../../../src/theme/typography', () => ({ textStyles: { callout: { fontSize: 16 } } }));
 vi.mock('../../../../src/theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24 },
   borderRadius: { lg: 12 },
 }));
 
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  KeyboardAvoidingView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  Platform: { OS: 'ios' },
   Pressable: ({
     children,
     onPress,
@@ -184,7 +206,11 @@ vi.mock('react-native', () => ({
       placeholder,
       onChange: (event: { target: { value: string } }) => onChangeText?.(event.target.value),
     }),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 vi.mock('../../../../src/components/Text', () => ({
@@ -219,6 +245,7 @@ vi.mock('../../../../src/components/SegmentedControl', () => ({
 }));
 
 import SettersFilterScreen from '../setters';
+import { SetterPickerList } from '../../../../src/components/filter-sheet/SetterPickerList';
 
 // The sheet's count input for its draft, as the filter sheet serializes it.
 const sheetCountInput = {
@@ -245,7 +272,7 @@ beforeEach(() => {
   followMock.mockReset();
   followMock.mockResolvedValue(undefined);
   emitMock.mockClear();
-  navMock.setOptions.mockClear();
+  headerActions.current = null;
   navMock.goBack.mockClear();
   countQuery.hook.mockClear();
   countQuery.state.count = 42;
@@ -254,13 +281,19 @@ beforeEach(() => {
   params.value.boardName = 'kilter';
   params.value.sizeId = '10';
   params.value.setters = undefined;
+  params.value.handoffId = undefined;
   params.value.countInput = JSON.stringify(sheetCountInput);
 });
 
-// The headerRight the screen last handed the native header via setOptions.
-function lastHeaderRight(): unknown {
-  const lastOptions = navMock.setOptions.mock.calls.at(-1)?.[0] as { headerRight?: unknown } | undefined;
-  return lastOptions?.headerRight;
+// The header's trailing Apply, as the screen last set it.
+function headerApply(): { label: string; onPress: () => void } {
+  const trailing = headerActions.current?.trailing;
+  if (!trailing) throw new Error('The screen set no trailing header action');
+  return trailing;
+}
+
+function pressHeaderApply() {
+  act(() => headerApply().onPress());
 }
 
 function lastCountCall() {
@@ -306,15 +339,18 @@ describe('SettersFilterScreen', () => {
     expect(getByText('authors.viaUserFollow')).not.toBeNull();
     expect(getByText('authors.followingHint')).not.toBeNull();
   });
-  it('shows the headerRight Clear all only while setters are selected', () => {
-    const { getByLabelText } = render(<SettersFilterScreen />);
+  it('shows Clear all in the selection bar, not the header, only while setters are selected', () => {
+    const { getByLabelText, getByText, queryByText } = render(<SettersFilterScreen />);
 
-    // Nothing selected yet → no headerRight.
-    expect(lastHeaderRight()).toBeUndefined();
+    // Nothing selected yet → no Clear all anywhere; the header holds Apply alone.
+    expect(queryByText('mobile.filter.clearAll')).toBeNull();
+    expect(headerActions.current?.trailingAccessory).toBeUndefined();
 
-    // Select a setter → the Clear all headerRight appears.
+    // Select a setter → Clear all appears under the search, and clears.
     fireEvent.click(getByLabelText('alice'));
-    expect(lastHeaderRight()).toBeTypeOf('function');
+    expect(headerActions.current?.trailingAccessory).toBeUndefined();
+    fireEvent.click(getByText('mobile.filter.clearAll'));
+    expect(queryByText('mobile.filter.clearAll')).toBeNull();
   });
 
   it('hands the selected setters back without apply when the screen is removed', () => {
@@ -327,7 +363,7 @@ describe('SettersFilterScreen', () => {
 
     expect(emitMock).toHaveBeenCalledTimes(1);
     // Exactly one argument: back keeps the picks as a sheet draft.
-    expect(emitMock.mock.calls[0]).toEqual([['alice']]);
+    expect(emitMock.mock.calls[0]).toEqual([{ handoffId: '', setters: ['alice'] }]);
     expect(navMock.goBack).not.toHaveBeenCalled();
   });
 
@@ -396,13 +432,44 @@ describe('SettersFilterScreen', () => {
     expect((getByText('authors.follow').closest('button') as HTMLButtonElement).disabled).toBe(false);
   });
 
+  it('searches setters with the text typed, once the typing settles', () => {
+    vi.useFakeTimers();
+    try {
+      const { getByPlaceholderText } = render(<SettersFilterScreen />);
+      const input = getByPlaceholderText('mobile.filter.searchSetters');
+      fireEvent.change(input, { target: { value: 'al' } });
+      fireEvent.change(input, { target: { value: 'ali' } });
+      expect(setterStats.inputs.at(-1)).not.toHaveProperty('search');
+
+      act(() => {
+        vi.advanceTimersByTime(250);
+      });
+
+      expect(setterStats.inputs.at(-1)?.search).toBe('ali');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('echoes the handoffId route param in the back handoff and in Show climbs', () => {
+    params.value.handoffId = 'filter-picker-4';
+    params.value.setters = JSON.stringify(['bob']);
+    render(<SettersFilterScreen />);
+
+    focus.cleanup?.();
+    expect(emitMock).toHaveBeenLastCalledWith({ handoffId: 'filter-picker-4', setters: ['bob'] });
+
+    pressHeaderApply();
+    expect(emitMock).toHaveBeenLastCalledWith({ handoffId: 'filter-picker-4', setters: ['bob'], apply: true });
+  });
+
   it('seeds the selection from the route param', () => {
     params.value.setters = JSON.stringify(['bob']);
     render(<SettersFilterScreen />);
 
     focus.cleanup?.();
 
-    expect(emitMock).toHaveBeenCalledWith(['bob']);
+    expect(emitMock).toHaveBeenCalledWith({ handoffId: '', setters: ['bob'] });
   });
 
   it('toggles a seeded setter off', () => {
@@ -412,7 +479,7 @@ describe('SettersFilterScreen', () => {
     fireEvent.click(getByLabelText('alice'));
     focus.cleanup?.();
 
-    expect(emitMock).toHaveBeenCalledWith([]);
+    expect(emitMock).toHaveBeenCalledWith({ handoffId: '', setters: [] });
   });
 
   it('falls back to an empty selection for a malformed setters param', () => {
@@ -421,23 +488,22 @@ describe('SettersFilterScreen', () => {
 
     focus.cleanup?.();
 
-    expect(emitMock).toHaveBeenCalledWith([]);
+    expect(emitMock).toHaveBeenCalledWith({ handoffId: '', setters: [] });
   });
 
-  describe('Show N climbs footer', () => {
-    it('labels the footer with the live count', () => {
-      const { getByText } = render(<SettersFilterScreen />);
+  describe('Show N climbs header action', () => {
+    it('labels the header action with the live count', () => {
+      render(<SettersFilterScreen />);
 
-      expect(getByText('mobile.filter.showCount:42')).not.toBeNull();
+      expect(headerApply().label).toBe('mobile.filter.showCount:42');
       expect(lastCountCall().enabled).toBe(true);
     });
 
     it('shows the plain Apply label while the held count still belongs to the previous picks', () => {
       countQuery.state.isPlaceholderData = true;
-      const { getByText, queryByText } = render(<SettersFilterScreen />);
+      render(<SettersFilterScreen />);
 
-      expect(getByText('mobile.filter.apply')).not.toBeNull();
-      expect(queryByText('mobile.filter.showCount:42')).toBeNull();
+      expect(headerApply().label).toBe('mobile.filter.apply');
     });
 
     it.each([
@@ -447,10 +513,9 @@ describe('SettersFilterScreen', () => {
       ['an array', JSON.stringify([sheetCountInput])],
     ])('falls back to the plain Apply label when the count input is %s', (_label, countInput) => {
       params.value.countInput = countInput;
-      const { getByText, queryByText } = render(<SettersFilterScreen />);
+      render(<SettersFilterScreen />);
 
-      expect(getByText('mobile.filter.apply')).not.toBeNull();
-      expect(queryByText('mobile.filter.showCount:42')).toBeNull();
+      expect(headerApply().label).toBe('mobile.filter.apply');
       expect(lastCountCall().enabled).toBe(false);
     });
 
@@ -469,22 +534,22 @@ describe('SettersFilterScreen', () => {
     });
 
     it('applies with the picks and pops the route', () => {
-      const { getByLabelText, getByText } = render(<SettersFilterScreen />);
+      const { getByLabelText } = render(<SettersFilterScreen />);
 
       fireEvent.click(getByLabelText('alice'));
-      fireEvent.click(getByText('mobile.filter.showCount:42'));
+      pressHeaderApply();
 
       expect(emitMock).toHaveBeenCalledTimes(1);
-      expect(emitMock).toHaveBeenCalledWith(['alice'], { apply: true });
+      expect(emitMock).toHaveBeenCalledWith({ handoffId: '', setters: ['alice'], apply: true });
       expect(navMock.goBack).toHaveBeenCalledTimes(1);
     });
 
     it('does not hand the selection back again when the pop blurs the screen, or on a second tap', () => {
-      const { getByLabelText, getByText } = render(<SettersFilterScreen />);
+      const { getByLabelText } = render(<SettersFilterScreen />);
 
       fireEvent.click(getByLabelText('alice'));
-      fireEvent.click(getByText('mobile.filter.showCount:42'));
-      fireEvent.click(getByText('mobile.filter.showCount:42'));
+      pressHeaderApply();
+      pressHeaderApply();
       focus.cleanup?.();
 
       expect(emitMock).toHaveBeenCalledTimes(1);
@@ -508,7 +573,7 @@ describe('SettersFilterScreen', () => {
       render(<SettersFilterScreen />);
 
       expect(setterStats.inputs.at(-1)?.crossAngleStats).toBe(true);
-      // The footer counts the same opted-in search the sheet would apply.
+      // The header action counts the same opted-in search the sheet would apply.
       expect(lastCountCall().input.crossAngleStats).toBe(true);
     });
 
@@ -548,5 +613,56 @@ describe('SettersFilterScreen', () => {
 
       expect(setterStats.inputs.at(-1)).not.toHaveProperty('crossAngleStats');
     });
+  });
+});
+
+// The list on its own, fed the way the Logbook's picker will feed it.
+describe('SetterPickerList', () => {
+  function renderList(overrides: Partial<Parameters<typeof SetterPickerList>[0]> = {}) {
+    const props: Parameters<typeof SetterPickerList>[0] = {
+      setters: [{ setterUsername: 'cara', count: 2 }],
+      isLoading: false,
+      onSearchChange: vi.fn(),
+      searchPlaceholder: 'Search setters',
+      formatCount: (count) => `${count} logged`,
+      selected: [],
+      onToggle: vi.fn(),
+      onClearAll: vi.fn(),
+      emptyLabel: 'No setters yet',
+      ...overrides,
+    };
+    return { ...render(<SetterPickerList {...props} />), props };
+  }
+
+  it('hands the search back once, after the typing settles', () => {
+    vi.useFakeTimers();
+    try {
+      const { getByPlaceholderText, getByText, props } = renderList({ setters: [] });
+      expect(getByText('No setters yet')).not.toBeNull();
+      const input = getByPlaceholderText('Search setters');
+      fireEvent.change(input, { target: { value: 'c' } });
+      fireEvent.change(input, { target: { value: 'cr' } });
+
+      act(() => {
+        vi.advanceTimersByTime(249);
+      });
+      expect(props.onSearchChange).not.toHaveBeenCalled();
+
+      act(() => {
+        vi.advanceTimersByTime(1);
+      });
+      expect(vi.mocked(props.onSearchChange).mock.calls).toEqual([['cr']]);
+      // With a search typed, an empty list reads as no matches.
+      expect(getByText('mobile.emptyState.noMatches.title')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('names each count with the caller\u2019s wording, and toggles from the name when there is no page to open', () => {
+    const { getByText, props } = renderList();
+    expect(getByText('2 logged')).not.toBeNull();
+    fireEvent.click(getByText('cara'));
+    expect(props.onToggle).toHaveBeenCalledWith('cara');
   });
 });

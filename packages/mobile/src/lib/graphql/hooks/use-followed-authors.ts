@@ -1,3 +1,4 @@
+import { offlineWriteFetch } from '../../../offline/offline-write-transport';
 import { useEffect, useMemo, useRef } from 'react';
 import { onlineManager, useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import {
@@ -22,16 +23,25 @@ import {
 } from '../../../db/queries/followed-authors-local';
 import { useStoredUserId } from '../../../hooks/use-current-user-id';
 import { getHttpClient } from '../client';
+import { CLIMB_LOGS_PREVIEW_QUERY_KEY, CLIMB_LOGS_QUERY_KEY, FOLLOWING_CLIMB_LOGS_QUERY_KEY } from '../query-keys';
 import { isOfflineEngineEnabled } from '../../offline-engine';
+import { isLaunchReloadPossible } from '../../launch-reload-window';
 import { updateUserFollowCaches } from './user-follow-cache';
+import { FOLLOWING_CATALOGUE_QUERY_KEYS, invalidateFollowingCatalogueQueries } from '../author-query-invalidation';
+
+const AUTHOR_FEED_QUERY_KEYS = [
+  'crewFeed',
+  // The play drawer's "Climber logs" card: who you follow decides whose logs it shows.
+  FOLLOWING_CLIMB_LOGS_QUERY_KEY,
+  // Its "Everyone" rows leave out the people you follow, so they move too.
+  CLIMB_LOGS_QUERY_KEY,
+  CLIMB_LOGS_PREVIEW_QUERY_KEY,
+] as const;
 
 export const AUTHOR_QUERY_KEYS = [
   'followedAuthors',
-  'crewFeed',
-  'setterStats',
-  'searchClimbs',
-  'infiniteSearchClimbs',
-  'searchClimbsCount',
+  ...FOLLOWING_CATALOGUE_QUERY_KEYS,
+  ...AUTHOR_FEED_QUERY_KEYS,
 ] as const;
 // One local database has one active owner. A newer load (including an account
 // switch) supersedes older loads across hook instances. Real-SQLite race tests
@@ -46,6 +56,12 @@ export async function loadFollowedAuthors(userId: string): Promise<FollowedAutho
   const { getDatabaseHandle } = await import('../../../db');
   const db = isOfflineEngineEnabled() ? getDatabaseHandle() : null;
   const cached = db ? await readAuthorSnapshot(db, userId) : null;
+  // The launch update gate may still reload this runtime, and on Android the
+  // snapshot write below would keep SQLite's write lock for the rest of the
+  // process if the reload landed inside it (#6689). Serve what is stored and
+  // write nothing: the offline sync bridge loads again once the launch settles.
+  const launchReloadPossible = isLaunchReloadPossible();
+  if (cached && launchReloadPossible) return cached.authors;
   if (!onlineManager.isOnline()) {
     if (!cached) throw new Error('Followed authors need an online sync');
     return cached.authors;
@@ -57,7 +73,7 @@ export async function loadFollowedAuthors(userId: string): Promise<FollowedAutho
       throw error;
     });
   if ('offlineFallback' in response) return response.followedAuthors;
-  if (db) {
+  if (db && !launchReloadPossible) {
     // Check again after the request: sign-out or a local toggle may have raced it.
     const result: { saved: AuthorSnapshot | null } = { saved: null };
     await runLocalWriteWithRetry(() =>
@@ -104,12 +120,39 @@ export function useFollowedAuthors() {
     // Mounting another follow button with cached authors must not refetch feeds.
     // A first completed sync still retries searches gated on missing local authors.
     if (!query.data || previousAuthors === query.data) return;
-    for (const key of AUTHOR_QUERY_KEYS) {
-      if (key !== 'followedAuthors') void queryClient.invalidateQueries({ queryKey: [key] });
-    }
+    invalidateFollowingCatalogueQueries(queryClient);
+    for (const key of AUTHOR_FEED_QUERY_KEYS) void queryClient.invalidateQueries({ queryKey: [key] });
   }, [query.data, queryClient]);
   const userIds = useMemo(() => new Set(query.data?.users.map((user) => user.userId)), [query.data]);
   return { ...query, setterNames, userIds };
+}
+
+/**
+ * Reads the followed-authors answer the app already holds, for a surface that
+ * opens often (the play drawer). It never refetches an answer that exists:
+ * `OfflineSyncBridge` keeps the root observer mounted, and that one owns the
+ * refresh, the SQLite snapshot write and the feed invalidation. Mounting
+ * `useFollowedAuthors` here instead would send the query, and take the exclusive
+ * write lock, on every open more than a minute after the last sync.
+ *
+ * `loadWhenMissing` lets the caller pick the moment for the one case with no
+ * answer at all (a failed first sync, or the browser build, which has no
+ * bridge).
+ */
+export function useFollowedAuthorsSnapshot({ loadWhenMissing }: { loadWhenMissing: boolean }) {
+  const { userId } = useStoredUserId(true);
+  return useQuery({
+    queryKey: ['followedAuthors', userId],
+    queryFn: () => loadFollowedAuthors(userId!),
+    enabled: !!userId && loadWhenMissing,
+    networkMode: 'always',
+    // An answer in the cache is never stale to this observer, so neither
+    // mounting nor `loadWhenMissing` turning on refetches it.
+    staleTime: Infinity,
+    refetchOnMount: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  });
 }
 
 export function useToggleAuthorFollow() {
@@ -134,7 +177,7 @@ export function useToggleAuthorFollow() {
         const removedUserIds = await writeAuthorFollowLocal(db, userId, kind, identifier, follow);
         const snapshot = await readAuthorSnapshot(db, userId);
         if (snapshot) queryClient.setQueryData(['followedAuthors', userId], snapshot.authors);
-        const graphqlFetch: GraphQLFetch = (document, variables) => getHttpClient().request(document, variables);
+        const graphqlFetch: GraphQLFetch = offlineWriteFetch;
         const { drainMutationQueue } = await import('../../../offline/offline-sync-adapter');
         void drainMutationQueue(db, queryClient, graphqlFetch).catch(() => undefined);
         return { queued: true, viewerId: userId, removedUserIds };

@@ -76,8 +76,11 @@ export type BoardCapabilities = {
    * early termination needs two index-ordered streams merged at the page boundary,
    * which needs a new `(board_type, ascensionist_count DESC, climb_uuid)` index
    * because every existing ascent/quality index is prefixed `(board_type, angle, …)`.
-   * Until that lands, the mobile flag that opts non-Woods boards in MUST stay at 0%.
-   * Tracked in issue #5412.
+   * Tracked in issue #5412. Until then the backend ignores `crossAngleStats: true`
+   * on every board where this is false unless its `CROSS_ANGLE_STATS_BOARDS` env var
+   * names the board (unset in production; `gateCrossAngleStats` in
+   * packages/backend/src/graphql/resolvers/climbs/cross-angle-gate.ts), so the
+   * mobile flag that opts those boards in cannot reach the slow query on its own.
    */
   angleBoundClimbs: boolean;
   /**
@@ -147,7 +150,13 @@ export type BoardCapabilities = {
    * one, so the URL builder drops it separately — this flag is about the family
    * having such a site at all.
    */
-  auroraAppLink: boolean;
+  auroraAppLink: boolean /**
+   * What the app calls the climbs marked by `benchmark_difficulty`. Kilter's own
+   * app has no benchmarks and calls its list Verified, so Kilter says Verified.
+   * Only the word differs: the column, the filter flags and the wire fields are
+   * "benchmark" on every board.
+   */;
+  benchmarkTerm: 'benchmark' | 'verified';
 };
 
 /**
@@ -166,6 +175,7 @@ const AURORA_CAPABILITIES: BoardCapabilities = {
   multiFrameClimbs: true,
   nativeBoardControl: true,
   auroraAppLink: true,
+  benchmarkTerm: 'benchmark',
 };
 
 /**
@@ -183,6 +193,7 @@ const MOONBOARD_CAPABILITIES: BoardCapabilities = {
   multiFrameClimbs: true,
   nativeBoardControl: true,
   auroraAppLink: false,
+  benchmarkTerm: 'benchmark',
 };
 
 /**
@@ -200,6 +211,7 @@ const WOODS_CAPABILITIES: BoardCapabilities = {
   multiFrameClimbs: false,
   nativeBoardControl: true,
   auroraAppLink: false,
+  benchmarkTerm: 'benchmark',
 };
 
 /**
@@ -231,13 +243,14 @@ const SPRAY_CAPABILITIES: BoardCapabilities = {
   multiFrameClimbs: false,
   nativeBoardControl: false,
   auroraAppLink: false,
+  benchmarkTerm: 'benchmark',
 };
 
 // Typed as a total Record over BoardName, so adding a board to SUPPORTED_BOARDS
 // without deciding what it can do is a compile error rather than a silent
 // fallthrough to the Aurora defaults.
 const CAPABILITIES_BY_BOARD: Record<BoardName, BoardCapabilities> = {
-  kilter: AURORA_CAPABILITIES,
+  kilter: { ...AURORA_CAPABILITIES, benchmarkTerm: 'verified' },
   tension: AURORA_CAPABILITIES,
   decoy: AURORA_CAPABILITIES,
   touchstone: AURORA_CAPABILITIES,

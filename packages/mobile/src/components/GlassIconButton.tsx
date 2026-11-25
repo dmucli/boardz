@@ -1,7 +1,9 @@
+import { LargeContentViewer } from './LargeContentViewer';
 import { useCallback, useEffect, useRef } from 'react';
 import {
   type AccessibilityActionEvent,
   type AccessibilityActionInfo,
+  type AccessibilityState,
   type ColorValue,
   type StyleProp,
   StyleSheet,
@@ -14,6 +16,7 @@ import { GlassSurface } from './GlassSurface';
 import { PressableSurface } from './PressableSurface';
 import { Icon } from './Icon';
 import { Text } from './Text';
+import { COUNT_BADGE_MAX_FONT_SCALE, countBadgeBox, countBadgeText, formatCountBadge } from './count-badge-style';
 import { iconMap, type IconName } from './icon-map';
 import { createVariantComponent } from '../theme/variants';
 import { brandColors } from '../theme/colors';
@@ -34,6 +37,12 @@ type GlassIconButtonProps = {
   accessibilityHint?: string;
   /** Custom assistive-tech actions (e.g. a grade shortcut VoiceOver / Switch
    *  Control can reach, mirroring an otherwise-invisible long-press). */
+  /**
+   * Pass this only when the button really is a selection (a toggle, a filter).
+   * `active` is NOT a selection: it drives the search/close morph, so announcing
+   * "selected" for it would be wrong. Callers set the state themselves.
+   */
+  accessibilityState?: AccessibilityState;
   accessibilityActions?: ReadonlyArray<AccessibilityActionInfo>;
   onAccessibilityAction?: (event: AccessibilityActionEvent) => void;
   /** Translucent tint composited on the glass (iOS). Omit for a neutral surface. */
@@ -59,12 +68,9 @@ type GlassIconButtonProps = {
   active?: boolean;
 };
 
-const MAX_BADGE_COUNT = 99;
-const BADGE_MAX_FONT_SIZE_MULTIPLIER = 1;
-
 function formatBadgeCount(badgeCount: number | undefined): string | null {
   if (badgeCount == null || badgeCount <= 0) return null;
-  return badgeCount > MAX_BADGE_COUNT ? `${MAX_BADGE_COUNT}+` : String(badgeCount);
+  return formatCountBadge(badgeCount);
 }
 
 /**
@@ -95,6 +101,7 @@ function GlassIconButtonMaterial({
   onLongPress,
   accessibilityLabel,
   accessibilityHint,
+  accessibilityState,
   accessibilityActions,
   onAccessibilityAction,
   badgeCount,
@@ -124,6 +131,7 @@ function GlassIconButtonMaterial({
         disabled={disabled}
         accessibilityLabel={accessibilityLabel}
         accessibilityHint={accessibilityHint}
+        accessibilityState={accessibilityState}
         accessibilityActions={accessibilityActions}
         onAccessibilityAction={onAccessibilityAction}
       />
@@ -156,6 +164,7 @@ function GlassIconButtonGlass({
   onLongPress,
   accessibilityLabel,
   accessibilityHint,
+  accessibilityState,
   accessibilityActions,
   onAccessibilityAction,
   tintColor,
@@ -232,6 +241,7 @@ function GlassIconButtonGlass({
         accessibilityRole="button"
         accessibilityLabel={accessibilityLabel}
         accessibilityHint={accessibilityHint}
+        accessibilityState={accessibilityState}
         accessibilityActions={accessibilityActions}
         onAccessibilityAction={onAccessibilityAction}
         style={[styles.button, { width: size, height: size, borderRadius: size / 2 }]}
@@ -247,14 +257,23 @@ function GlassIconButtonGlass({
         {secondaryIconName ? (
           <>
             <Animated.View style={[StyleSheet.absoluteFill, styles.center, primaryIconStyle]} pointerEvents="none">
-              <Icon name={iconName} size={iconSize} color={iconColor as string} />
+              <Icon maxFontSizeMultiplier={1} name={iconName} size={iconSize} color={iconColor as string} />
             </Animated.View>
             <Animated.View style={[StyleSheet.absoluteFill, styles.center, secondaryIconStyle]} pointerEvents="none">
-              <Icon name={secondaryIconName} size={iconSize} color={iconColor as string} />
+              <Icon maxFontSizeMultiplier={1} name={secondaryIconName} size={iconSize} color={iconColor as string} />
             </Animated.View>
           </>
+        ) : onLongPress ? (
+          <Icon maxFontSizeMultiplier={1} name={iconName} size={iconSize} color={iconColor as string} />
         ) : (
-          <Icon name={iconName} size={iconSize} color={iconColor as string} />
+          <LargeContentViewer
+            title={accessibilityLabel}
+            systemImage={iconMap[iconName]?.ios}
+            onActivate={disabled ? undefined : handlePress}
+            style={styles.center}
+          >
+            <Icon maxFontSizeMultiplier={1} name={iconName} size={iconSize} color={iconColor as string} />
+          </LargeContentViewer>
         )}
       </PressableSurface>
 
@@ -281,7 +300,8 @@ function BadgeLabel({
       <Text
         variant="caption2"
         color={textColor}
-        maxFontSizeMultiplier={BADGE_MAX_FONT_SIZE_MULTIPLIER}
+        numeric
+        maxFontSizeMultiplier={COUNT_BADGE_MAX_FONT_SCALE}
         style={styles.badgeText}
       >
         {label}
@@ -311,20 +331,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  // caption2 (11pt) in a box that grows with the text (count-badge-style.ts).
   badge: {
+    ...countBadgeBox,
     position: 'absolute',
     top: -2,
     right: -2,
-    minWidth: 16,
-    height: 16,
-    borderRadius: 8,
-    paddingHorizontal: 4,
-    alignItems: 'center',
-    justifyContent: 'center',
   },
-  badgeText: {
-    fontWeight: '700',
-    fontSize: 10,
-    lineHeight: 14,
-  },
+  badgeText: countBadgeText,
 });

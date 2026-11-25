@@ -2,11 +2,24 @@ import {
   captureAuthCredentialGeneration,
   getAuthToken,
   isAuthCredentialGenerationCurrent,
+  isAuthTokenExpired,
+  isAuthTokenRefreshAllowed,
+  isTokenExpiringSoon,
   synchronizeWebSession,
+  hasConfirmedAnonymousWebSession,
 } from './auth-store.web';
 import { signOutForGeneration } from './auth.web';
 import { reportHandledError } from './error-reporting';
 import type { AuthRejectionResult } from './auth-rejection-result';
+import { CLIENT_IDENTITY_HEADER } from '@boardsesh/shared-schema/client-identity';
+import { getClientIdentityHeaderValue } from './client-identity.web';
+import { isBrowserPageRetired } from './browser-page-retirement.web';
+import {
+  admitSessionResponse,
+  assertBrowserPageLive,
+  captureSessionStamp,
+  SessionSupersededError,
+} from './browser-session-guard.web';
 
 let onForcedSignOut: (() => void) | null = null;
 type WebRefreshResult =
@@ -99,44 +112,70 @@ export async function recoverAuthRejection(): Promise<AuthRejectionResult> {
   return refreshResult.status;
 }
 
+/**
+ * A token to send, refreshed first when there is none or, for a 15-minute
+ * browser token (`better-auth`, #7596 B3b), when fewer than three minutes are
+ * left. Every caller shares the one session read in flight. A refresh that
+ * fails (503, timeout) keeps a token that has not ended yet; nothing here ever
+ * signs the page out. The legacy JWE has no end, so it is used as before.
+ */
 export async function ensureFreshToken(): Promise<boolean> {
   const generation = captureAuthCredentialGeneration();
-  if (await getAuthToken()) return isAuthCredentialGenerationCurrent(generation);
+  const held = await getAuthToken();
+  if (held && !(await isTokenExpiringSoon())) return isAuthCredentialGenerationCurrent(generation);
   if (!isAuthCredentialGenerationCurrent(generation)) return false;
+  // A failed refresh is backing off: send the held token while it lasts, read nothing.
+  if (held && !isAuthTokenRefreshAllowed()) return !isAuthTokenExpired();
   const session = await synchronizeWebSession();
-  return session.status === 'authenticated' && isAuthCredentialGenerationCurrent(generation);
+  if (!isAuthCredentialGenerationCurrent(generation)) return false;
+  if (session.status === 'authenticated') return true;
+  return (await getAuthToken()) !== null && !isAuthTokenExpired();
 }
 
 export async function authenticatedFetch(url: string | URL | Request, options: RequestInit = {}): Promise<Response> {
+  // A retired page belongs to an account that already left. Nothing it starts
+  // may go out, even after a local await such as an image compression.
+  assertBrowserPageLive();
   const requestGeneration = captureAuthCredentialGeneration();
-  await ensureFreshToken();
-  if (!isAuthCredentialGenerationCurrent(requestGeneration)) {
-    throw new Error('Authentication session changed before the request could be sent');
-  }
+  const fresh = await ensureFreshToken();
+  if (!isAuthCredentialGenerationCurrent(requestGeneration)) throw new SessionSupersededError();
+  if (!fresh && !hasConfirmedAnonymousWebSession())
+    throw new Error('Authentication session is unavailable before the request could be sent');
 
   const token = await getAuthToken();
-  if (!isAuthCredentialGenerationCurrent(requestGeneration)) {
-    throw new Error('Authentication session changed before the request could be sent');
-  }
+  if (!isAuthCredentialGenerationCurrent(requestGeneration)) throw new SessionSupersededError();
   const headers = new Headers(options.headers);
+  // Which app is calling (identification only). The 401 retry copies these
+  // headers, so it carries the identity too.
+  headers.set(CLIENT_IDENTITY_HEADER, getClientIdentityHeaderValue());
   if (token) headers.set('Authorization', `Bearer ${token}`);
 
+  // Again at the send itself: a session read inside the awaits above can retire
+  // the page without a new generation (a page that had lost its confirmed login
+  // confirms another one), and a retired page sends nothing.
+  assertBrowserPageLive();
+  // Captured after the token read: a cold page confirms its first login there
+  // without a generation change, and that login is who this request is sent as.
+  const stamp = captureSessionStamp();
   const response = await fetch(url, { ...options, headers });
-  if (!isAuthCredentialGenerationCurrent(requestGeneration)) return response;
-  if (response.status !== 401 || !token) return response;
+  // Every answer leaves through this one gate: a response sent as an account
+  // this page no longer has is cancelled and becomes a SessionSupersededError,
+  // and its body reads keep checking after the caller receives it.
+  const deliver = (delivered: Response): Promise<Response> => admitSessionResponse(delivered, stamp);
+  if (response.status !== 401 || !token) return deliver(response);
 
   const refreshResult = await deduplicatedSessionRefresh();
   if (refreshResult.status === 'anonymous') {
     await forceSignOut(refreshResult.generation);
-    return response;
+    return deliver(response);
   }
   if (refreshResult.status === 'superseded' || refreshResult.generation !== requestGeneration) {
-    return response;
+    return deliver(response);
   }
 
   if (refreshResult.status === 'authenticated') {
     const refreshedToken = await getAuthToken();
-    if (!isAuthCredentialGenerationCurrent(requestGeneration)) return response;
+    if (!isAuthCredentialGenerationCurrent(requestGeneration) || isBrowserPageRetired()) return deliver(response);
     if (refreshedToken) {
       const retryHeaders = new Headers(headers);
       retryHeaders.set('Authorization', `Bearer ${refreshedToken}`);
@@ -151,9 +190,9 @@ export async function authenticatedFetch(url: string | URL | Request, options: R
         const confirmation = await deduplicatedSessionRefresh();
         if (confirmation.status === 'anonymous') await forceSignOut(confirmation.generation);
       }
-      return retryResponse;
+      return deliver(retryResponse);
     }
   }
 
-  return response;
+  return deliver(response);
 }

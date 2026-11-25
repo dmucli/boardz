@@ -1,15 +1,40 @@
 import { describe, expect, it, vi } from 'vite-plus/test';
 import { drizzle } from 'drizzle-orm/postgres-js';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
 import { ANGLES, getRoutableBoardAngles } from '@boardsesh/board-config';
 import type { BoardName } from '@boardsesh/shared-schema';
 
 vi.mock('server-only', () => ({}));
+// Every raw statement the module hands `executeRows`, for the identity lookup's test.
+const executedStatements = vi.hoisted(() => [] as unknown[]);
 // A drizzle instance with no client behind it: building and rendering a query
 // never touches the connection, and the test must not need a database.
-vi.mock('@/app/lib/db/db', () => ({ dbzRead: drizzle({} as never), executeRows: async () => [] }));
+vi.mock('@/app/lib/db/db', () => ({
+  dbz: drizzle({} as never),
+  dbzRead: drizzle({} as never),
+  executeRows: async (_db: unknown, statement: unknown) => {
+    executedStatements.push(statement);
+    return [];
+  },
+}));
 vi.mock('@/app/lib/server-popular-configs', () => ({ getAllBoardConfigsOrThrow: async () => [] }));
 
-const { buildSetterClimbsQuery, buildSetterProfileQuery } = await import('../server-setter-data');
+const { buildSetterClimbsQuery, buildSetterProfileQuery, fetchSetterIdentity, orderSetterBoardTypes } =
+  await import('../server-setter-data');
+
+describe('orderSetterBoardTypes', () => {
+  it('puts the board with the most visible climbs first, and breaks ties alphabetically', () => {
+    expect(
+      orderSetterBoardTypes([
+        { boardType: 'kilter', climbCount: 3 },
+        { boardType: 'tension', climbCount: '41' },
+        { boardType: null, climbCount: 99 },
+        { boardType: 'decoy', climbCount: 3 },
+      ]),
+    ).toEqual(['tension', 'decoy', 'kilter']);
+  });
+});
 // From the module that owns it: a re-export hop only gives a grep two answers.
 const { SETTER_PAGE_SIZE } = await import('@/app/lib/seo/sitemap/setter-page-contract');
 const { buildTier2ClimbQuery } = await import('@/app/lib/seo/sitemap/climb-query');
@@ -93,6 +118,21 @@ describe('the setter page queries', () => {
       expect(sql).toMatch(/"board_climbs"\."is_hidden" = \$\d+/);
       expect(rendered.params).toContain(true);
       expect(rendered.params).toContain(false);
+    }
+  });
+
+  it("lists a private account's published climbs: no account or item privacy is consulted", () => {
+    // A published, listed climb is public to everyone, whoever set it. Account
+    // privacy (`user_profiles.is_private`), the item audience
+    // (`content_privacy`) and the follow relation belong to the setter's
+    // identity, never to the climb list or the count that decides the page
+    // exists. The spray-wall predicate is the wall's own rule and stays.
+    for (const rendered of [climbs, profile]) {
+      const sql = normalise(rendered.sql);
+      expect(sql).not.toContain('content_privacy');
+      expect(sql).not.toContain('user_profiles');
+      expect(sql).not.toContain('is_private');
+      expect(sql).toContain('spray_walls');
     }
   });
 
@@ -183,5 +223,35 @@ describe('the setter page queries', () => {
 
   it('asks for one row past the page so `hasMore` needs no second count', () => {
     expect(climbs.params).toContain(SETTER_PAGE_SIZE + 1);
+  });
+});
+
+describe('the setter hero identity', () => {
+  async function identitySql(): Promise<string> {
+    executedStatements.length = 0;
+    await fetchSetterIdentity('marco');
+    expect(executedStatements).toHaveLength(1);
+    return normalise(new PgDialect().sqlToQuery(executedStatements[0] as SQL).sql);
+  }
+
+  it("names the account that set the page's climbs first, whatever its privacy", async () => {
+    // Who set a published, listed climb is public with it (#6418), and a
+    // MoonBoard or other Boardsesh climb has no linked login to find it by.
+    const sql = await identitySql();
+    const authored = sql.indexOf('select board_climbs.user_id, 0 as source_rank');
+    const linked = sql.indexOf('from user_board_mappings ubm');
+    expect(authored).toBeGreaterThan(-1);
+    expect(linked).toBeGreaterThan(authored);
+    // The authored source reads no account privacy; the linked login does.
+    expect(sql.slice(authored, linked)).not.toContain('is_private');
+    expect(sql.slice(linked)).toContain('is_private');
+    expect(sql).toMatch(/order by candidate\.source_rank, candidate\.climb_count desc/);
+  });
+
+  it('only links a login on a board type this page lists climbs for, through the page predicate', async () => {
+    const sql = await identitySql();
+    expect(sql).toContain('board_climbs.board_type = ubm.board_type');
+    // Both sources read the page's visible-climb predicate, hidden climbs out.
+    expect(sql.match(/"board_climbs"\."is_hidden" = /g)?.length).toBe(2);
   });
 });

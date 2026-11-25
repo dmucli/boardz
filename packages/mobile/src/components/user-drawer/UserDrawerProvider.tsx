@@ -1,6 +1,9 @@
 import { createContext, useCallback, useContext, useMemo, useRef, useState, type ReactNode } from 'react';
-import { router, useSegments } from 'expo-router';
+import { useNavigationContainerRef, useSegments } from 'expo-router';
+import { Platform } from 'react-native';
+import { scopedRouter as router } from '../../lib/routing/scoped-navigation';
 import { openDiscordInvite } from '../../lib/discord';
+import { resolveAppStackState } from '../../lib/phone-split-player';
 import { useConfirmSignOut } from '../../hooks/use-confirm-sign-out';
 import type { ManagedSheetHandle } from '../../providers/sheet-presentation-provider';
 import { FeedbackSheet, type FeedbackSheetMode } from './FeedbackSheet';
@@ -11,8 +14,8 @@ type BoardReturnTo = '/(tabs)/discover' | '/(tabs)/climbs';
 // The drawer panel itself now lives in the `user-drawer` transparentModal route
 // (app/user-drawer.tsx). The provider is data + actions only: it opens the route
 // and exposes the RAW navigation/feedback actions. The route is responsible for
-// sequencing them (its animated `close(after)` runs `after` only once the route's
-// view controller has unmounted), so none of these defer on their own.
+// sequencing them (its animated `close(after)` queues `after` following React
+// unmount), so none of these defer on their own.
 type UserDrawerContextValue = {
   openUserDrawer: () => void;
   // Kept for type/back-compat. The route owns the animated close; this is a
@@ -23,10 +26,14 @@ type UserDrawerContextValue = {
   navigateToSettings: () => void;
   navigateToEditProfile: () => void;
   navigateToPlaylists: () => void;
+  /** The gyms the signed-in climber runs. */
+  navigateToMyGyms: () => void;
+  /** The community moderation feed, a root modal. */
+  navigateToModeration: () => void;
   navigateToChangelog: () => void;
   navigateToAbout: () => void;
   openDiscord: () => void;
-  signOutAction: () => void;
+  signOutAction: (signal?: AbortSignal) => Promise<void>;
   setFeedbackMode: (mode: FeedbackSheetMode) => void;
   presentFeedback: () => void;
   /** Crowdsourced QA (tester-only): the list of PR previews this build can load. */
@@ -50,6 +57,7 @@ function currentBoardReturnTo(segments: readonly string[]): BoardReturnTo {
 }
 
 export function UserDrawerProvider({ children }: { children: ReactNode }) {
+  const navigationRef = useNavigationContainerRef();
   const confirmSignOut = useConfirmSignOut();
   const segments = useSegments();
   const feedbackSheetRef = useRef<ManagedSheetHandle>(null);
@@ -69,9 +77,22 @@ export function UserDrawerProvider({ children }: { children: ReactNode }) {
   const returnToRef = useRef<BoardReturnTo>('/(tabs)/climbs');
 
   const openUserDrawer = useCallback(() => {
+    if (!navigationRef.isReady()) return;
+    const appStack = resolveAppStackState(navigationRef.getRootState());
+    if (!appStack) return;
+    // A stale avatar event must not push another modal or reset Account's
+    // nested Settings stack. Preloaded routes beyond index are not open yet.
+    if (
+      appStack.routes
+        .slice(0, appStack.index + 1)
+        .some((route) => route.name === 'account' || route.name === 'user-drawer')
+    )
+      return;
     returnToRef.current = currentBoardReturnTo(segmentsRef.current);
-    router.push('/user-drawer');
-  }, []);
+    // Repeated taps can queue before navigation state changes. NAVIGATE reuses
+    // the route in that case; PUSH creates duplicate modals or inner pages.
+    router.navigate(Platform.OS === 'ios' ? '/account' : '/user-drawer');
+  }, [navigationRef]);
 
   const closeUserDrawer = useCallback(() => {
     router.back();
@@ -93,7 +114,19 @@ export function UserDrawerProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const navigateToPlaylists = useCallback(() => {
-    router.push('/(tabs)/discover/all');
+    // With its anchor, so Back reaches Discover's main page even when Discover
+    // was never opened this launch (the JS tab bars mount tabs lazily).
+    router.navigate('/(tabs)/discover/all', { withAnchor: true });
+  }, []);
+
+  const navigateToMyGyms = useCallback(() => {
+    router.push('/gyms/mine');
+  }, []);
+
+  // A root modal (one copy, not one per tab), so it presents above whatever is
+  // open, once the drawer route is gone.
+  const navigateToModeration = useCallback(() => {
+    router.push('/moderation');
   }, []);
 
   const navigateToChangelog = useCallback(() => {
@@ -108,14 +141,13 @@ export function UserDrawerProvider({ children }: { children: ReactNode }) {
     void openDiscordInvite('user-drawer');
   }, []);
 
-  // The drawer row calls this via the route's animated `close(after)`, so the confirm
-  // is raised only once the drawer has slid away and its route popped — on iOS the
-  // dialog is a native Alert, which would otherwise sit over a half-dismissed drawer.
+  // The drawer confirms after closing. iOS Account confirms while mounted so its
+  // modal dismissal cannot race the native confirmation sheet (#6505). The shared
+  // hook owns confirmation, double-tap protection and retry after cancel/failure.
+  // Account can cancel warning probes when it closes, before a dialog is shown.
   // This row used to call `signOut` straight through: one tap discarded the downloaded
   // boards and any unsynced writes with no warning at all (issue #3621).
-  const signOutAction = useCallback(() => {
-    void confirmSignOut();
-  }, [confirmSignOut]);
+  const signOutAction = useCallback((signal?: AbortSignal) => confirmSignOut(signal), [confirmSignOut]);
 
   const presentFeedback = useCallback(() => {
     setFeedbackVisible(true);
@@ -145,6 +177,8 @@ export function UserDrawerProvider({ children }: { children: ReactNode }) {
       navigateToSettings,
       navigateToEditProfile,
       navigateToPlaylists,
+      navigateToMyGyms,
+      navigateToModeration,
       navigateToChangelog,
       navigateToAbout,
       openDiscord,
@@ -162,6 +196,8 @@ export function UserDrawerProvider({ children }: { children: ReactNode }) {
       navigateToSettings,
       navigateToEditProfile,
       navigateToPlaylists,
+      navigateToMyGyms,
+      navigateToModeration,
       navigateToChangelog,
       navigateToAbout,
       openDiscord,

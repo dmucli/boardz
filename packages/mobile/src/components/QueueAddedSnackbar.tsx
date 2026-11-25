@@ -1,5 +1,6 @@
+import { PressableSurface } from './PressableSurface';
 import { useEffect } from 'react';
-import { Pressable, StyleSheet, View, type ViewStyle } from 'react-native';
+import { StyleSheet, View, type ViewStyle } from 'react-native';
 import Animated, { FadeInDown, FadeOutDown } from 'react-native-reanimated';
 import { Snackbar } from 'react-native-paper';
 import { useTranslation } from 'react-i18next';
@@ -10,6 +11,7 @@ import { useTheme } from '../providers/theme-provider';
 import { createVariantComponent } from '../theme/variants';
 import { useBottomChromeMetrics } from '../hooks/use-bottom-chrome-metrics';
 import type { QueueAddedSnackbarOptions } from '../providers/queue-snackbar-provider';
+import { TabBarHideFollower } from './navigation/TabBarHideFollower';
 
 const DEFAULT_DURATION = 4000;
 
@@ -20,21 +22,28 @@ type QueueAddedSnackbarProps = {
   onDismiss: () => void;
   onOpen: () => void;
   duration?: number;
-  /** `kind: 'playNext'` swaps the message to the Play next confirmation.
-   *  Defaults to the plain "added to queue" copy. */
+  /** `kind: 'playNext'` confirms a Play next ("Playing next"). Defaults to the
+   *  Play last confirmation ("Playing last"). */
   queueAdded?: QueueAddedSnackbarOptions;
 };
 
 /** The message for this confirmation, resolved in one place so the Material and
  *  Liquid Glass implementations can't drift apart. Literal keys (never
- *  `t(variable)`) so the i18n orphan scanner can see both. `count` is ignored
- *  here — #4673 adds the plural against this same vocabulary. */
+ *  `t(variable)`) so the i18n orphan scanner can see both.
+ *
+ *  Both name where the climbs went, so a climber with a long queue knows whether
+ *  they will reach them soon (#6772). `count` resolves the plural for a whole
+ *  playlist going in (#4673). It defaults to 1, which every single-climb path
+ *  relies on. */
 function snackbarMessage(t: TFunction<'session'>, queueAdded: QueueAddedSnackbarOptions): string {
-  return queueAdded.kind === 'playNext' ? t('mobile.queueSnackbar.playingNext') : t('mobile.queueSnackbar.added');
+  const count = queueAdded.count ?? 1;
+  return queueAdded.kind === 'playNext'
+    ? t('mobile.queueSnackbar.playingNext', { count })
+    : t('mobile.queueSnackbar.added', { count });
 }
 
 /**
- * Bottom-anchored "Climb added to queue · Open" snackbar that floats just above
+ * Bottom-anchored "Playing next · Open" / "Playing last · Open" snackbar that floats just above
  * the persistent queue bar. Rendered inside DrawerHostProvider so it can read
  * the queue state (to drop lower when the bar is hidden) and bind "Open" to the
  * host's `openQueueSheet`. Routes to a Material 3 Paper Snackbar on the Material
@@ -66,20 +75,22 @@ function QueueAddedSnackbarMaterial({
   const wrapperStyle: ViewStyle = { bottom };
 
   return (
-    <Snackbar
-      key={nonce}
-      visible={visible}
-      onDismiss={onDismiss}
-      duration={duration}
-      wrapperStyle={wrapperStyle}
-      action={{
-        label: t('mobile.queueSnackbar.open'),
-        onPress: onOpen,
-        accessibilityLabel: t('mobile.queueSnackbar.openAria'),
-      }}
-    >
-      {snackbarMessage(t, queueAdded)}
-    </Snackbar>
+    <TabBarHideFollower>
+      <Snackbar
+        key={nonce}
+        visible={visible}
+        onDismiss={onDismiss}
+        duration={duration}
+        wrapperStyle={wrapperStyle}
+        action={{
+          label: t('mobile.queueSnackbar.open'),
+          onPress: onOpen,
+          accessibilityLabel: t('mobile.queueSnackbar.openAria'),
+        }}
+      >
+        {snackbarMessage(t, queueAdded)}
+      </Snackbar>
+    </TabBarHideFollower>
   );
 }
 
@@ -92,7 +103,7 @@ function QueueAddedSnackbarGlass({
   duration = DEFAULT_DURATION,
   queueAdded = { kind: 'added' },
 }: QueueAddedSnackbarProps) {
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors } = useTheme();
   const { t } = useTranslation('session');
   const bottomChrome = useBottomChromeMetrics();
 
@@ -107,31 +118,33 @@ function QueueAddedSnackbarGlass({
   const bottom = bottomChrome.floatingControlBottom + spacing[2];
 
   return (
-    <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
-      {visible ? (
-        <Animated.View
-          key={nonce}
-          entering={FadeInDown.duration(220)}
-          exiting={FadeOutDown.duration(180)}
-          style={[styles.snackbar, { bottom, backgroundColor: systemColors.secondaryBackground }]}
-          accessibilityRole="alert"
-        >
-          <Text variant="subheadline" color={systemColors.label} style={styles.message} numberOfLines={1}>
-            {snackbarMessage(t, queueAdded)}
-          </Text>
-          <Pressable
-            onPress={onOpen}
-            hitSlop={8}
-            accessibilityRole="button"
-            accessibilityLabel={t('mobile.queueSnackbar.openAria')}
+    <TabBarHideFollower>
+      <View pointerEvents="box-none" style={StyleSheet.absoluteFill}>
+        {visible ? (
+          <Animated.View
+            key={nonce}
+            entering={FadeInDown.duration(220)}
+            exiting={FadeOutDown.duration(180)}
+            style={[styles.snackbar, { bottom, backgroundColor: systemColors.secondaryBackground }]}
+            accessibilityRole="alert"
           >
-            <Text variant="subheadline" color={brandColors.primary} style={styles.open}>
-              {t('mobile.queueSnackbar.open')}
+            <Text variant="subheadline" color={systemColors.label} style={styles.message} numberOfLines={1}>
+              {snackbarMessage(t, queueAdded)}
             </Text>
-          </Pressable>
-        </Animated.View>
-      ) : null}
-    </View>
+            <PressableSurface
+              onPress={onOpen}
+              hitSlop={8}
+              accessibilityRole="button"
+              accessibilityLabel={t('mobile.queueSnackbar.openAria')}
+            >
+              <Text variant="subheadline" color={systemColors.accent} style={styles.open}>
+                {t('mobile.queueSnackbar.open')}
+              </Text>
+            </PressableSurface>
+          </Animated.View>
+        ) : null}
+      </View>
+    </TabBarHideFollower>
   );
 }
 

@@ -1,10 +1,22 @@
 import * as Sentry from '@sentry/nextjs';
 import { PostHog } from 'posthog-js-lite';
 import { createAnalytics } from '@boardsesh/analytics';
-import { analyticsPathname, isAdminAnalyticsUrl } from './analytics-paths';
+import { isAdminAnalyticsUrl, isProductAnalyticsFreeUrl } from './analytics-paths';
+import { searchCarriesBoardInvite } from './board-invite';
+import { redactShareCapabilities, scrubShareCapabilitiesFromEvent } from './share-capability';
+import { getWebConsentRecord, hasAnalyticsConsent, subscribeWebConsent } from './consent';
+import {
+  ANALYTICS_CONSENT_HEADER,
+  ANALYTICS_CONSENT_HEADER_GRANTED,
+  isAnalyticsCaptureUrl,
+  isAnalyticsGranted,
+} from '@boardsesh/consent';
+
 import { getBackendHttpUrl } from './backend-url';
+import { getSessionInboundCampaign, type InboundCampaign } from './inbound-campaign';
 import { isAutomatedCrawlerUserAgent } from './is-crawler';
 import { isProductionHost } from './production-hosts';
+import { getFlagsBrowserDistinctId, withAnonymousFlagsIdentity } from './anonymous-flags-id';
 
 // The property values a tracked event may carry. `undefined` is accepted at the
 // call site and dropped before capture (sanitizeForPosthog in
@@ -16,10 +28,182 @@ type EventProperties = Record<string, AllowedPropertyValues>;
 const DEFAULT_POSTHOG_HOST = 'https://us.i.posthog.com';
 let posthogClient: PostHog | null = null;
 let posthogInitAttempted = false;
+let posthogPersisted = false;
+let suspendedPosthogClient: PostHog | null = null;
+const suspendedClients = new WeakSet<PostHog>();
+let flagAccountId: string | null = null;
+const featureFlagListeners = new Set<() => void>();
+let unsubscribeSdkFlags: (() => void) | null = null;
+const retiredClients = new WeakSet<PostHog>();
+const activeRequests = new WeakMap<PostHog, Set<AbortController>>();
+type PersistedKey = Parameters<PostHog['setPersistedProperty']>[0];
+const QUEUE_KEYS = ['queue', 'ai_queue', 'ai_capture_queue', 'logs_queue'] as const;
+
+function clearPosthogStorage(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    // oxlint-disable-next-line no-restricted-globals -- remove legacy third-party analytics identifiers on withdrawal
+    const storage = localStorage;
+    for (const key of Object.keys(storage)) if (key.startsWith('ph_')) storage.removeItem(key);
+  } catch {
+    /* Storage can be unavailable; the SDK still switches to memory. */
+  }
+}
+function retirePosthog(client: PostHog): void {
+  retiredClients.add(client);
+  activeRequests.get(client)?.forEach((controller) => controller.abort());
+  void client.optOut().catch(() => {});
+  // reset([]) preserves all four SDK queues, and shutdown flushes even after optOut.
+  for (const key of QUEUE_KEYS) client.setPersistedProperty(key as PersistedKey, null);
+  client.reset([]);
+  void client.optOut().catch(() => {});
+  for (const key of QUEUE_KEYS) client.setPersistedProperty(key as PersistedKey, null);
+  // An old in-flight flush can otherwise recreate its localStorage blob after cleanup.
+  client.setPersistedProperty = () => {};
+  void client.shutdown(100).catch(() => {});
+}
+const BACKEND_POSTHOG_PROXY_PATH = '/api/posthog';
+
+/**
+ * True only when `host` is exactly our backend's PostHog proxy: the same origin
+ * and the same path (a trailing slash aside). Only that proxy reads the consent
+ * header, so any other host, including a direct-to-PostHog override or a
+ * mistyped proxy path, gets no header and capture simply keeps no location.
+ */
+export function isBackendPosthogProxy(host: string, backendUrl: string | null): boolean {
+  if (!backendUrl) return false;
+  try {
+    const target = new URL(host);
+    // Built exactly as getPosthog() builds the default host.
+    const proxy = new URL(`${backendUrl}${BACKEND_POSTHOG_PROXY_PATH}`);
+    const path = (url: URL) => url.pathname.replace(/\/+$/, '');
+    return target.origin === proxy.origin && path(target) === path(proxy);
+  } catch {
+    return false;
+  }
+}
+
+function installConsentTransport(client: PostHog, backendProxyHost: string | null): void {
+  const sdkFetch = client.fetch.bind(client);
+  const requests = new Set<AbortController>();
+  activeRequests.set(client, requests);
+  client.fetch = async (url, options) => {
+    const flagsRequest = /\/(flags|decide)\/?(?:\?|$)/.test(url);
+    if (retiredClients.has(client) || suspendedClients.has(client) || (!flagsRequest && !hasAnalyticsConsent())) {
+      throw new Error('Analytics consent does not permit this request');
+    }
+    // `/flags` is the one request `before_send` never sees, and it carries every
+    // person property identify() and setPersonProperties() were given. Its body
+    // is plain JSON (only /batch is gzipped), so the same rule runs here.
+    if (flagsRequest && typeof options.body === 'string') {
+      options = { ...options, body: redactShareCapabilities(options.body) };
+    }
+    if (flagsRequest && flagAccountId === null && typeof options.body === 'string') {
+      // Signed out, flags bucket on one id per browser whatever the consent
+      // answer, so a rollout neither re-rolls per load nor flips on Allow.
+      // Signed in, the request already carries the account id.
+      const distinctId = await getFlagsBrowserDistinctId();
+      // No secure random source: fail closed, flags keep their defaults.
+      if (distinctId === null) throw new Error('No secure random source for the flags id');
+      options = { ...options, body: withAnonymousFlagsIdentity(options.body, distinctId) };
+      if (retiredClients.has(client) || suspendedClients.has(client)) {
+        throw new Error('Analytics consent does not permit this request');
+      }
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) controller.abort();
+    requests.add(controller);
+    // Consented capture tells our proxy it may forward the visitor IP for GeoIP.
+    // Only capture paths carry it: never flags or the SDK config request. A
+    // direct-to-PostHog override never sends it: only our proxy reads it, and a
+    // header PostHog's CORS policy does not allow would fail the preflight.
+    const headers =
+      backendProxyHost !== null && isAnalyticsCaptureUrl(url, backendProxyHost)
+        ? { ...options.headers, [ANALYTICS_CONSENT_HEADER]: ANALYTICS_CONSENT_HEADER_GRANTED }
+        : options.headers;
+    try {
+      return await sdkFetch(url, { ...options, headers, signal: controller.signal });
+    } finally {
+      requests.delete(controller);
+      options.signal?.removeEventListener('abort', abort);
+    }
+  };
+}
+function bindFeatureFlags(client: PostHog): void {
+  unsubscribeSdkFlags?.();
+  unsubscribeSdkFlags = client.onFeatureFlags(() => featureFlagListeners.forEach((listener) => listener()));
+  featureFlagListeners.forEach((listener) => listener());
+}
+function refreshAnalyticsConsent(): void {
+  const deviceGranted = isAnalyticsGranted(getWebConsentRecord());
+  if (!deviceGranted) {
+    if (suspendedPosthogClient) {
+      retirePosthog(suspendedPosthogClient);
+      suspendedPosthogClient = null;
+    }
+    clearPosthogStorage();
+  }
+  if (!posthogClient) return;
+  if (posthogPersisted !== hasAnalyticsConsent()) {
+    const oldClient = posthogClient;
+    posthogClient = null;
+    if (posthogPersisted && deviceGranted) {
+      // Account authority is temporarily unresolved. Keep events captured with
+      // consent and their anonymous acquisition identity, but stop transport.
+      suspendedPosthogClient = oldClient;
+      suspendedClients.add(oldClient);
+      activeRequests.get(oldClient)?.forEach((controller) => controller.abort());
+      void oldClient.optOut().catch(() => {});
+    } else {
+      retirePosthog(oldClient);
+    }
+    if (!isAnalyticsGranted(getWebConsentRecord())) clearPosthogStorage();
+    posthogInitAttempted = false;
+    if (hasAnalyticsConsent() && suspendedPosthogClient) {
+      posthogClient = suspendedPosthogClient;
+      suspendedPosthogClient = null;
+      suspendedClients.delete(posthogClient);
+      posthogPersisted = true;
+      void posthogClient.optIn().catch(() => {});
+      bindFeatureFlags(posthogClient);
+      posthogClient.reloadFeatureFlags();
+      return;
+    }
+    getPosthog();
+  }
+}
+subscribeWebConsent(refreshAnalyticsConsent);
+export function setAnalyticsFlagAccountId(accountId: string | null): void {
+  if (flagAccountId === accountId) return;
+  // Only anonymous → signed-in may retain acquisition history. A sign-out or
+  // account switch must never resume the previous account's queued events.
+  if (flagAccountId !== null && suspendedPosthogClient) {
+    retirePosthog(suspendedPosthogClient);
+    suspendedPosthogClient = null;
+  }
+  flagAccountId = accountId;
+  if (!posthogClient || posthogPersisted) return;
+  const oldClient = posthogClient;
+  posthogClient = null;
+  retirePosthog(oldClient);
+  posthogInitAttempted = false;
+  getPosthog();
+}
 const shouldDebugAnalytics = process.env.NEXT_PUBLIC_ANALYTICS_DEBUG === '1';
 
 function getPosthog(): PostHog | null {
   if (typeof window === 'undefined') return null;
+  if (isProductAnalyticsFreeUrl(window.location.pathname)) return null;
+  // A home board's share link, or the sign-in page carrying it back: the SDK
+  // stamps `location.href` on every event, and that URL holds a membership token.
+  // `before_send` below scrubs the token from every event anyway; this stays as
+  // the second lock, because a page whose whole subject is a membership token
+  // has nothing to measure that is worth the risk of a scrub that misses.
+  // A wall's `?wall=` capability has no such switch: its pages are ordinary
+  // board pages people browse, so they keep analytics and rely on the scrub.
+  if (searchCarriesBoardInvite(window.location.search)) return null;
   if (posthogClient) return posthogClient;
   if (posthogInitAttempted) return null;
   posthogInitAttempted = true;
@@ -33,7 +217,7 @@ function getPosthog(): PostHog | null {
 
   // Crawlers that execute our JS boot this SDK and, holding no cookies, mint a
   // fresh person per page load: Applebot was 917 of the 946 web "users" on 2026-09-10.
-  // Not isCrawlerUserAgent — that one counts real YandexSearch users as bots. docs/feature-flags.md.
+  // Not isCrawlerUserAgent — that one counts real YandexSearch users as bots. docs/operations/feature-flags.md.
   if (isAutomatedCrawlerUserAgent(navigator.userAgent)) return null;
 
   const apiKey = process.env.NEXT_PUBLIC_POSTHOG_KEY;
@@ -56,7 +240,7 @@ function getPosthog(): PostHog | null {
   // recovery (point straight at us.i.posthog.com if the proxy is down).
   const backendUrl = getBackendHttpUrl();
   const configuredHost = process.env.NEXT_PUBLIC_POSTHOG_HOST?.trim() || null;
-  const host = configuredHost ?? (backendUrl ? `${backendUrl}/api/posthog` : DEFAULT_POSTHOG_HOST);
+  const host = configuredHost ?? (backendUrl ? `${backendUrl}${BACKEND_POSTHOG_PROXY_PATH}` : DEFAULT_POSTHOG_HOST);
   if (!configuredHost && !backendUrl) {
     const message =
       'PostHog proxy URL could not be derived on a production host; using direct PostHog ingestion. Check NEXT_PUBLIC_WS_URL or NEXT_PUBLIC_POSTHOG_HOST in the web build env.';
@@ -64,32 +248,34 @@ function getPosthog(): PostHog | null {
     Sentry.captureMessage(message, 'warning');
   }
 
+  if (!isAnalyticsGranted(getWebConsentRecord())) clearPosthogStorage();
   posthogClient = new PostHog(apiKey, {
     host,
     autocapture: false,
     captureHistoryEvents: false,
-    // Persist distinct_id in localStorage so anonymous → authed merges and
-    // cross-session retention cohorts work. This blob holds BOTH the distinct id
-    // and the anonymous id, and `AnalyticsIdentity`
-    // (components/providers/analytics-identity.tsx) reads the pair back to
-    // decide whether this browser is anonymous or already pinned to a person.
-    // Keeping that decision inside the SDK's own storage is deliberate: a
-    // second store of ours would start empty on every existing browser and
-    // disagree with this one.
-    //
-    // CLAUDE.md mandates IndexedDB for client persistence (the no-restricted-globals
-    // lint rule enforces it on bare globals, which is why this config string
-    // doesn't trigger it). posthog-js-lite only exposes
-    // 'localStorage' | 'sessionStorage' | 'cookie' | 'memory' — there is no
-    // IDB option in the lite SDK. 'memory' (the prior setting) regenerated a
-    // fresh anon id on every reload, which broke retention math. Until/unless
-    // we migrate to the full posthog-js SDK or self-host IDB-backed persistence,
-    // this is the documented exception. Do not copy this pattern for other
-    // persistence needs — use idb-helper.ts as usual.
-    persistence: 'localStorage',
+    // Persistence is constructor-fixed in lite. Consent transitions replace the instance.
+    persistence: hasAnalyticsConsent() ? 'localStorage' : 'memory',
+    defaultOptIn: false,
+    sendFeatureFlagEvent: false,
+    preloadFeatureFlags: false,
+    bootstrap:
+      !hasAnalyticsConsent() && flagAccountId ? { distinctId: flagAccountId, isIdentifiedId: true } : undefined,
+    // An unlisted wall's `?wall=<uuid>` and a home board's `?invite=` are
+    // capabilities, and the SDK copies `location.href` and `document.referrer`
+    // onto every event. The hook runs on every capture path (queued and
+    // immediate) after the SDK adds them. The `/flags` request is the one call
+    // that skips it; installConsentTransport scrubs its body instead.
+    // share-capability.ts has the rule.
+    before_send: scrubShareCapabilitiesFromEvent,
   });
 
+  posthogPersisted = hasAnalyticsConsent();
+  installConsentTransport(posthogClient, isBackendPosthogProxy(host, backendUrl) ? host : null);
+  if (posthogPersisted) void posthogClient.optIn().catch(() => {});
+  else void posthogClient.optOut().catch(() => {});
   registerWebSuperProperties(posthogClient);
+  bindFeatureFlags(posthogClient);
+  posthogClient.reloadFeatureFlags();
 
   return posthogClient;
 }
@@ -131,8 +317,7 @@ function webSuperProperties(userAgent: string): Record<string, string> {
 // resolveAppEnvironment().
 //
 // register() IS in posthog-js-lite's public typings (inherited from
-// @posthog/core's PostHogCoreStateless) — no structural cast needed here,
-// unlike registerSessionSuperProperties() below.
+// @posthog/core's PostHogCoreStateless) — no structural cast needed here.
 //
 // Best-effort, exactly like mobile's registerAppEnvironment: a failure here
 // must never block analytics init, so a rejection AND a synchronous throw are
@@ -162,8 +347,6 @@ type FeatureFlagReadOptions = { sendEvent?: boolean };
 type PosthogFeatureFlagClient = {
   getFeatureFlag?: (key: string, options?: FeatureFlagReadOptions) => unknown;
   isFeatureEnabled?: (key: string, options?: FeatureFlagReadOptions) => unknown;
-  reloadFeatureFlags?: () => unknown;
-  onFeatureFlags?: (callback: () => void) => unknown;
 };
 
 function isCurrentAdminAnalyticsPage(): boolean {
@@ -174,10 +357,17 @@ function isCurrentAdminAnalyticsPage(): boolean {
 // boolean "did it send" contract) lives in @boardsesh/analytics and is shared
 // with mobile. Web keeps the platform-specific bits in this file: the production
 // hostname gate inside getPosthog(), the admin-page skip, and URL pageviews.
-const core = createAnalytics(getPosthog, { shouldSkip: isCurrentAdminAnalyticsPage });
+function shouldSkipProductAnalytics(): boolean {
+  return (
+    !hasAnalyticsConsent() ||
+    isCurrentAdminAnalyticsPage() ||
+    (typeof window !== 'undefined' && isProductAnalyticsFreeUrl(window.location.pathname))
+  );
+}
+const core = createAnalytics(getPosthog, { shouldSkip: shouldSkipProductAnalytics });
 
 export function track(name: string, properties?: EventProperties): void {
-  if (isCurrentAdminAnalyticsPage()) return;
+  if (shouldSkipProductAnalytics()) return;
 
   if (process.env.NODE_ENV !== 'production' && shouldDebugAnalytics) {
     console.info('[analytics] track', name, properties);
@@ -186,7 +376,36 @@ export function track(name: string, properties?: EventProperties): void {
   // PostHog is the only sink. It stays hostname-gated inside getPosthog(), so a
   // dev or preview build sends nothing at all — set NEXT_PUBLIC_ANALYTICS_DEBUG=1
   // to see what a call would have carried.
-  core.track(name, properties);
+  core.track(name, withInboundCampaign(properties));
+}
+
+/**
+ * Add the campaign this visit landed with (`utm_*` and the ad click ids) to an event's
+ * properties (#6027).
+ *
+ * posthog-js-lite never parses campaign params, so nothing on www said where a
+ * visit came from. Sending them as plain event properties is enough for the
+ * session: PostHog derives `$entry_utm_source` from the first event that
+ * carries them.
+ *
+ * It does NOT give a signed-out visitor a person property. This client sets no
+ * `personProfiles`, so it runs on the SDK default `identified_only` and every
+ * anonymous event goes out with `$process_person_profile: false`. The person's
+ * `$initial_utm_source` exists only for someone identified on www. Break www
+ * traffic down by the session property or by the event's own `utm_source`.
+ *
+ * They go on `$pageview` and on every `track()` event, `App Install Click`
+ * included, so a store click can be broken down by the source that brought the
+ * visitor. The caller's own properties win a key collision. An untagged visit
+ * gets its properties back untouched — `undefined` stays `undefined` — so no
+ * existing payload changes.
+ */
+function withInboundCampaign(): InboundCampaign | undefined;
+function withInboundCampaign(properties: EventProperties | undefined): EventProperties | undefined;
+function withInboundCampaign(properties?: EventProperties): EventProperties | undefined {
+  const inboundCampaign = getSessionInboundCampaign();
+  if (!inboundCampaign) return properties;
+  return { ...inboundCampaign, ...properties };
 }
 
 /**
@@ -217,6 +436,7 @@ const NAVIGATION_FLUSH_BUDGET_MS = 250;
  * unaffected.
  */
 export async function trackBeforeNavigation(name: string, properties?: EventProperties): Promise<void> {
+  if (shouldSkipProductAnalytics()) return;
   track(name, properties);
 
   const posthog = getPosthog();
@@ -285,13 +505,6 @@ export function setPersonProperties(set?: PosthogProperties, setOnce?: PosthogPr
   return core.setPersonProperties(set, setOnce);
 }
 
-// Sends a $create_alias event linking the current distinct_id to `newId`.
-// Use this on signup/login to merge the anonymous IndexedDB UUID into the
-// authenticated user UUID, then call identify(newId) to switch.
-export function alias(newId: string): boolean {
-  return core.alias(newId);
-}
-
 // PostHog's reset() clears the distinct id AND every registered super
 // property, but getPosthog() caches the singleton, so the registration done at
 // construction never runs again. Re-register `environment` and `$raw_user_agent`
@@ -307,46 +520,24 @@ export function reset(): boolean {
   const didReset = core.reset();
   if (didReset) {
     const posthog = getPosthog();
-    if (posthog) registerWebSuperProperties(posthog);
+    if (posthog) {
+      if (hasAnalyticsConsent()) void posthog.optIn().catch(() => {});
+      else void posthog.optOut().catch(() => {});
+      registerWebSuperProperties(posthog);
+    }
   }
   return didReset;
 }
 
-type PosthogSuperPropertyClient = {
-  registerForSession?: (properties: PosthogProperties) => unknown;
-};
-
-/**
- * Register SESSION-scoped PostHog super properties — attached to every event
- * for the current PostHog session only, never persisted to storage. Used by
- * the kiosk routes to stamp `kiosk: true` so 24/7 TV traffic is
- * distinguishable from real climbers in product analytics.
- *
- * Deliberately session-scoped (`registerForSession`, memory-backed in
- * @posthog/core) rather than the persistent `register`: the persistent
- * variant writes to localStorage, so a gym owner who previews their kiosk in
- * a normal browser would be stamped `kiosk: true` on every future event. The
- * TV re-registers on every page load anyway (and kiosks reload daily), so
- * persistence buys nothing. posthog-js-lite exposes `registerForSession` at
- * runtime but not in its public typings, hence the narrow structural cast
- * (same pattern as the feature-flag client above). Returns whether the
- * property was registered.
- */
-export function registerSessionSuperProperties(properties: PosthogProperties): boolean {
-  const posthog = getPosthog();
-  if (!posthog) return false;
-  const superPropertyClient = posthog as unknown as PosthogSuperPropertyClient;
-  if (typeof superPropertyClient.registerForSession !== 'function') return false;
-  void superPropertyClient.registerForSession(properties);
-  return true;
-}
-
 export function pageview(url: string): void {
-  if (isAdminAnalyticsUrl(url)) return;
+  if (shouldSkipProductAnalytics() || isAdminAnalyticsUrl(url)) return;
 
   const posthog = getPosthog();
   if (!posthog) return;
-  posthog.capture('$pageview', { $current_url: analyticsPathname(url) });
+  // No `$current_url` here. The SDK stamps the full `location.href` on every
+  // event and spreads its own properties AFTER the caller's (@posthog/core
+  // `enrichProperties`), so a pathname passed in was always overwritten.
+  posthog.capture('$pageview', withInboundCampaign());
 }
 
 function coerceFeatureFlagBoolean(value: unknown): boolean | undefined {
@@ -358,12 +549,6 @@ function coerceFeatureFlagBoolean(value: unknown): boolean | undefined {
 
 function asFeatureFlagClient(posthog: PostHog): PosthogFeatureFlagClient {
   return posthog as unknown as PosthogFeatureFlagClient;
-}
-
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  if (typeof value !== 'object' || value === null) return false;
-  const thenValue = (value as { then?: unknown }).then;
-  return typeof thenValue === 'function';
 }
 
 // This provider re-reads the WHOLE flag catalog on every flags-changed tick, so
@@ -397,27 +582,12 @@ export function readPosthogFeatureFlags(keys: readonly string[]): Record<string,
 }
 
 export function subscribePosthogFeatureFlags(onChange: () => void): () => void {
-  const posthog = getPosthog();
-  if (!posthog) return () => {};
-  const featureFlagClient = asFeatureFlagClient(posthog);
-
-  const reloadResult =
-    typeof featureFlagClient.reloadFeatureFlags === 'function' ? featureFlagClient.reloadFeatureFlags() : undefined;
-  if (isPromiseLike(reloadResult)) {
-    void Promise.resolve(reloadResult)
-      .then(onChange)
-      .catch(() => {});
-  }
-
-  if (typeof featureFlagClient.onFeatureFlags !== 'function') {
-    return () => {};
-  }
-
-  const unsubscribe = featureFlagClient.onFeatureFlags(onChange);
-  if (typeof unsubscribe === 'function') {
-    return unsubscribe as () => void;
-  }
-  return () => {};
+  featureFlagListeners.add(onChange);
+  const client = getPosthog();
+  client?.reloadFeatureFlags();
+  return () => {
+    featureFlagListeners.delete(onChange);
+  };
 }
 
 export type { AllowedPropertyValues };

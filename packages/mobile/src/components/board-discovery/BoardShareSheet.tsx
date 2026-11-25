@@ -1,31 +1,55 @@
-import { useCallback, useMemo, useRef } from 'react';
-import { Share, StyleSheet, View } from 'react-native';
-import BottomSheet, { BottomSheetView, type BottomSheetMethods } from '@expo/ui/community/bottom-sheet';
+import { useCallback } from 'react';
+import { StyleSheet, View } from 'react-native';
+import { ModalSheet } from '../ModalSheet';
 import { useTranslation } from 'react-i18next';
 import * as Clipboard from 'expo-clipboard';
 import QRCode from 'react-native-qrcode-svg';
-import { useWindowBottomInset } from '../../hooks/use-window-bottom-inset';
 import { Text } from '../Text';
 import { Button } from '../Button';
+import { ActivityIndicator } from '../ActivityIndicator';
+import { SheetTopBar } from '../SheetTopBar';
 import { useTheme } from '../../providers/theme-provider';
 import { useToast } from '../../providers/toast-provider';
-import { useManagedSheet } from '../../providers/sheet-presentation-provider';
-import { androidSafeSnapPoints } from '../sheet-snap-points';
+import { MEDIUM_LARGE_SNAP_POINTS } from '../sheet-snap-points';
 import { hapticSelection } from '../../lib/haptics';
-import { spacing, borderRadius, sheetStyles } from '../../theme/tokens';
+import { useShareLinkAction } from '../../hooks/use-share-link-action';
+import { openExternalUrl } from '../../lib/open-url';
+import { spacing, borderRadius } from '../../theme/tokens';
 import type { SprayWallVisibility } from '../../lib/spray/spray-share';
+
+/**
+ * What the link grants. A private wall or an Only-me board never reaches this
+ * sheet. `invite` is a Followers or Invite-only home board's tokened link:
+ * whoever opens it can choose Join to become a member.
+ */
+export type BoardShareVisibility = Exclude<SprayWallVisibility, 'private'> | 'invite';
 
 type BoardShareSheetProps = {
   visible: boolean;
   onDismiss: () => void;
-  /** The wall's share URL — already built, and never null (a private wall has none). */
-  shareUrl: string;
-  wallName: string;
+  onPresented?: () => void;
+  onFullyDismissed?: () => void;
   /**
-   * What the link actually grants. A private wall never reaches this sheet, so
-   * only the two shareable states are spelled out.
+   * The share URL, already built. `null` only while an invite link is on its
+   * way from the server, or could not be fetched (`linkFailed`).
    */
-  visibility: Exclude<SprayWallVisibility, 'private'>;
+  shareUrl: string | null;
+  /** The wall's or board's name. */
+  wallName: string;
+  visibility: BoardShareVisibility;
+  /** A spray wall (the default) or a home board: the two say different things. */
+  subject?: 'wall' | 'board';
+  /** The invite link could not be fetched. */
+  linkFailed?: boolean;
+  /** Offered for an invite link: revoke it and mint a new one. The caller confirms first. */
+  onResetLink?: () => void;
+  resettingLink?: boolean;
+  /**
+   * The www print page for this wall's or board's poster, already gated by its
+   * builder (`buildSprayWallPosterUrl`, `buildHomeBoardPosterUrl`). Unset or
+   * null hides the action, and an invite link never shows it.
+   */
+  posterUrl?: string | null;
 };
 
 const QR_SIZE = 200;
@@ -35,103 +59,185 @@ const QR_SIZE = 200;
 const QR_TILE_BACKGROUND = '#FFFFFF';
 
 /**
- * Hand a wall's link to the crew — QR to scan at the wall, copy and share for
- * everywhere else.
+ * Hand a wall's or a home board's link to the crew — QR to scan at the wall,
+ * copy and share for everywhere else.
  *
- * Modelled on `InviteSheet`: same sheet primitives and the same coordinator, so
+ * Modelled on `InviteSheet`: both use the shared modal coordinator, so
  * the two never fight over a native transition. The one line of copy under the
- * title is the important part — an unlisted link is a capability and a public
- * wall is on the open web, and those are different promises.
+ * title is the important part — an unlisted link is a capability, a public
+ * wall is on the open web, and a home board's invite link lets whoever opens it
+ * choose to join; those are different promises. Only an invite link has a Reset: it is
+ * the one that grants something, so it is the one an owner needs to retire.
  */
-export function BoardShareSheet({ visible, onDismiss, shareUrl, wallName, visibility }: BoardShareSheetProps) {
+export function BoardShareSheet({
+  visible,
+  onDismiss,
+  onPresented,
+  onFullyDismissed,
+  shareUrl,
+  wallName,
+  visibility,
+  subject = 'wall',
+  linkFailed = false,
+  onResetLink,
+  resettingLink = false,
+  posterUrl = null,
+}: BoardShareSheetProps) {
   const { t } = useTranslation('boards');
+  const { t: tSession } = useTranslation('session');
   const { systemColors } = useTheme();
   const { showToast } = useToast();
-  const windowInsetBottom = useWindowBottomInset();
-  const sheetRef = useRef<BottomSheetMethods>(null);
-
-  const managed = useManagedSheet({ open: visible, sheetRef, onClose: onDismiss });
-
-  // A lone '60%' makes @expo/ui's Material sheet skip the partial state and open
-  // full-screen on Android; androidSafeSnapPoints adds the full detent.
-  const snapPoints = useMemo(() => androidSafeSnapPoints(['60%']), []);
 
   const handleCopyLink = useCallback(() => {
+    if (!shareUrl) return;
     hapticSelection();
     void Clipboard.setStringAsync(shareUrl).then(() => {
       showToast(t('mobile.sprayShare.copied'), 'success');
     });
   }, [shareUrl, showToast, t]);
 
-  const handleShare = useCallback(() => {
+  const handleShare = useShareLinkAction({
+    url: shareUrl,
+    message: shareUrl ?? '',
+    copiedMessage: t('mobile.sprayShare.copied'),
+    errorMessage: tSession('detail.shareError'),
+  });
+
+  // An invite token printed and taped to a wall is no longer an invite, so the
+  // sheet refuses the poster for one even if a caller passes a URL.
+  const printableUrl = visibility === 'invite' ? null : posterUrl;
+  // The in-app browser, never `Linking.openURL`: until a phone refetches the
+  // association file, `/poster` can still be claimed by the app and the tap
+  // would come straight back here.
+  const handlePrintPoster = useCallback(() => {
+    if (!printableUrl) return;
     hapticSelection();
-    void Share.share({ message: shareUrl, url: shareUrl });
-  }, [shareUrl]);
+    void openExternalUrl(printableUrl, 'board-share-poster');
+  }, [printableUrl]);
+
+  const title = subject === 'board' ? t('mobile.boardShare.title') : t('mobile.sprayShare.title');
+  const body = shareBody(subject, visibility, t);
 
   return (
-    <BottomSheet
-      ref={sheetRef}
-      index={-1}
-      snapPoints={snapPoints}
-      enablePanDownToClose
-      onChange={managed.onChange}
-      onFullyDismissed={managed.onFullyDismissed}
-      backgroundStyle={{ backgroundColor: systemColors.secondaryBackground }}
-      handleIndicatorStyle={sheetStyles.indicator}
+    <ModalSheet
+      onPresented={onPresented}
+      visible={visible}
+      onClose={onDismiss}
+      onFullyDismissed={onFullyDismissed}
+      snapPoints={MEDIUM_LARGE_SNAP_POINTS}
+      scrollable
+      contentContainerStyle={styles.content}
+      header={<SheetTopBar title={title} leading={{ kind: 'close', onPress: onDismiss }} />}
     >
-      <BottomSheetView style={[styles.content, { paddingBottom: windowInsetBottom + spacing[4] }]}>
-        <Text variant="title2" style={styles.title}>
-          {t('mobile.sprayShare.title')}
-        </Text>
-        <Text variant="body" color={systemColors.label} style={styles.wallName} numberOfLines={2}>
-          {wallName}
-        </Text>
-        <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.subtitle}>
-          {visibility === 'public' ? t('mobile.sprayShare.publicBody') : t('mobile.sprayShare.unlistedBody')}
-        </Text>
+      <Text emphasized variant="body" color={systemColors.label} style={styles.wallName} numberOfLines={2}>
+        {wallName}
+      </Text>
+      {/* Full label colour, not secondary: on the glass sheet the grey body
+          and URL were hard to read (#5960). */}
+      <Text variant="footnote" color={systemColors.label} style={styles.subtitle}>
+        {body}
+      </Text>
 
-        <View
-          style={styles.qrTile}
-          accessibilityRole="image"
-          accessibilityLabel={t('mobile.sprayShare.qrLabel', { name: wallName })}
-        >
-          <QRCode value={shareUrl} size={QR_SIZE} backgroundColor={QR_TILE_BACKGROUND} />
+      {shareUrl ? (
+        <>
+          <View
+            style={styles.qrTile}
+            accessibilityRole="image"
+            accessibilityLabel={t('mobile.sprayShare.qrLabel', { name: wallName })}
+          >
+            <QRCode value={shareUrl} size={QR_SIZE} backgroundColor={QR_TILE_BACKGROUND} />
+          </View>
+
+          <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={2} style={styles.url}>
+            {shareUrl}
+          </Text>
+        </>
+      ) : (
+        <View style={styles.qrPlaceholder}>
+          {linkFailed ? (
+            <Text
+              variant="footnote"
+              color={systemColors.secondaryLabel}
+              style={styles.subtitle}
+              accessibilityRole="alert"
+            >
+              {t('mobile.boardShare.loadFailed')}
+            </Text>
+          ) : (
+            <ActivityIndicator size="large" accessibilityLabel={t('mobile.boardShare.loading')} />
+          )}
         </View>
+      )}
 
-        <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={2} style={styles.url}>
-          {shareUrl}
-        </Text>
-
-        <View style={styles.buttonRow}>
+      {/* Content actions, not a form confirm: they stay in the body, one
+          full-width row (stacked they would overflow the medium detent). */}
+      <View style={styles.actions}>
+        <Button
+          title={t('mobile.sprayShare.copyLink')}
+          icon="copy"
+          variant="outlined"
+          onPress={handleCopyLink}
+          disabled={!shareUrl}
+          style={styles.button}
+        />
+        <Button
+          title={t('mobile.sprayShare.share')}
+          icon="share"
+          onPress={handleShare}
+          disabled={!shareUrl}
+          style={styles.button}
+        />
+      </View>
+      {printableUrl ? (
+        <View style={styles.poster}>
           <Button
-            title={t('mobile.sprayShare.copyLink')}
-            icon="copy"
+            title={t('mobile.wallPoster.print')}
+            icon="print"
             variant="outlined"
-            onPress={handleCopyLink}
-            style={styles.button}
+            onPress={handlePrintPoster}
+            style={styles.posterButton}
           />
-          <Button title={t('mobile.sprayShare.share')} icon="share" onPress={handleShare} style={styles.button} />
+          <Text variant="caption1" color={systemColors.secondaryLabel} style={styles.subtitle}>
+            {subject === 'board' ? t('mobile.wallPoster.boardHint') : t('mobile.wallPoster.sprayHint')}
+          </Text>
         </View>
-      </BottomSheetView>
-    </BottomSheet>
+      ) : null}
+      {onResetLink ? (
+        <Button
+          title={t('mobile.boardShare.resetLink')}
+          icon="refresh"
+          variant="text"
+          onPress={onResetLink}
+          disabled={resettingLink || (!shareUrl && !linkFailed)}
+          loading={resettingLink}
+          style={styles.resetButton}
+        />
+      ) : null}
+    </ModalSheet>
   );
+}
+
+type TFn = ReturnType<typeof useTranslation>['t'];
+
+/** The one line under the name: what opening this link does, in words. */
+function shareBody(subject: 'wall' | 'board', visibility: BoardShareVisibility, t: TFn): string {
+  if (subject === 'wall') {
+    return visibility === 'public' ? t('mobile.sprayShare.publicBody') : t('mobile.sprayShare.unlistedBody');
+  }
+  if (visibility === 'invite') return t('mobile.boardShare.inviteBody');
+  return visibility === 'public' ? t('mobile.boardShare.publicBody') : t('mobile.boardShare.unlistedBody');
 }
 
 const styles = StyleSheet.create({
   content: {
-    flex: 1,
     alignItems: 'center',
     paddingHorizontal: spacing[6],
     paddingTop: spacing[4],
+    paddingBottom: spacing[4],
     gap: spacing[2],
-  },
-  title: {
-    fontWeight: '600',
-    textAlign: 'center',
   },
   wallName: {
     textAlign: 'center',
-    fontWeight: '600',
   },
   subtitle: {
     textAlign: 'center',
@@ -143,16 +249,39 @@ const styles = StyleSheet.create({
     borderRadius: borderRadius.lg,
     marginVertical: spacing[2],
   },
+  // Holds the QR tile's footprint while the invite link loads, so the sheet
+  // does not jump when it arrives.
+  qrPlaceholder: {
+    width: QR_SIZE + spacing[4] * 2,
+    height: QR_SIZE + spacing[4] * 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginVertical: spacing[2],
+  },
   url: {
     textAlign: 'center',
+    // Breathing room above the buttons; the URL sat right against them.
+    marginBottom: spacing[3],
   },
-  buttonRow: {
+  actions: {
     flexDirection: 'row',
     gap: spacing[3],
-    width: '100%',
+    alignSelf: 'stretch',
     marginTop: spacing[2],
   },
   button: {
     flex: 1,
+  },
+  poster: {
+    alignSelf: 'stretch',
+    alignItems: 'center',
+    gap: spacing[2],
+    marginTop: spacing[2],
+  },
+  posterButton: {
+    alignSelf: 'stretch',
+  },
+  resetButton: {
+    alignSelf: 'center',
   },
 });

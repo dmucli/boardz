@@ -1,11 +1,13 @@
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import Skeleton from '@mui/material/Skeleton';
 import Button from '@mui/material/Button';
 import Box from '@mui/material/Box';
+import Alert from '@mui/material/Alert';
+import Divider from '@mui/material/Divider';
 
-import { signIn } from 'next-auth/react';
+import { signInWithSessionIntent as signIn } from '@/app/lib/auth/web-session-events';
 import { useTranslation } from 'react-i18next';
 import { isNativeApp } from '@/app/lib/ble/capacitor-utils';
 import { buildNativeOAuthSignInUrl } from '@/app/lib/auth/native-oauth-url';
@@ -13,7 +15,26 @@ import { track } from '@/app/lib/analytics';
 import { setOAuthPending } from '@/app/lib/oauth-pending-db';
 
 // Note: OAuth provider icons and button colors use brand-specific colors
-// per Google/Apple/Facebook brand guidelines, not design system tokens
+// per Google/Apple brand guidelines, not design system tokens
+
+/**
+ * The Apple button: a light fill with dark ink, per Apple's guidelines. It is an
+ * outlined Button, so the theme's hover rule for every non-contained button
+ * (`&:not(:disabled):not(.MuiButton-contained):hover`, the 8% state layer) would
+ * replace the light fill with a near-transparent wash and leave the dark label on
+ * the dark page, unreadable. The same selector here keeps a light ground on hover:
+ * one step down the label ramp, which the dark ink still reads on.
+ */
+export const APPLE_BUTTON_SX = {
+  backgroundColor: 'var(--neutral-900)',
+  color: 'var(--semantic-surface)',
+  borderColor: 'var(--neutral-900)',
+  '&:not(:disabled):not(.MuiButton-contained):hover': {
+    backgroundColor: 'var(--neutral-500)',
+    color: 'var(--semantic-surface)',
+    borderColor: 'var(--neutral-500)',
+  },
+} as const;
 
 const GoogleIcon = () => (
   <svg viewBox="0 0 24 24" width="16" height="16">
@@ -42,28 +63,38 @@ const AppleIcon = () => (
   </svg>
 );
 
-const FacebookIcon = () => (
-  <svg viewBox="0 0 24 24" width="16" height="16" fill="#1877F2">
-    <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" />
-  </svg>
-);
-
 type ProvidersConfig = {
   google: boolean;
   apple: boolean;
-  facebook: boolean;
 };
 
 type SocialLoginButtonsProps = {
   callbackUrl?: string;
   disabled?: boolean;
+  showDivider?: boolean;
 };
 
-export default function SocialLoginButtons({ callbackUrl = '/', disabled = false }: SocialLoginButtonsProps) {
+export default function SocialLoginButtons({
+  callbackUrl = '/',
+  disabled = false,
+  showDivider = false,
+}: SocialLoginButtonsProps) {
   const { t } = useTranslation('auth');
   const [providers, setProviders] = useState<ProvidersConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [isCapacitorApp, setIsCapacitorApp] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [failed, setFailed] = useState(false);
+  // One provider start at a time; the symbol identifies the attempt in flight.
+  const activeAttempt = useRef<symbol | null>(null);
+  const mounted = useRef(true);
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     setIsCapacitorApp(isNativeApp());
@@ -78,43 +109,58 @@ export default function SocialLoginButtons({ callbackUrl = '/', disabled = false
       })
       .catch(() => {
         // On error, don't show any OAuth buttons
-        setProviders({ google: false, apple: false, facebook: false });
+        setProviders({ google: false, apple: false });
         setLoading(false);
       });
   }, []);
 
-  const handleSocialSignIn = (provider: string) => {
-    const flow = isCapacitorApp ? 'native' : 'web';
-    track('Login Attempted', {
-      auth_method: provider,
-      flow,
-    });
-    // Drop an IDB marker that party-profile-context consumes on the next
-    // authenticated-session detection to emit Login Succeeded. NextAuth handles
-    // OAuth success via server-side redirect, so there's no explicit client
-    // callback to track from — the marker bridges the gap. Stale markers expire
-    // after 5 minutes (see oauth-pending-db).
-    void setOAuthPending({ provider, flow, attempted_at: Date.now() });
-
-    if (isCapacitorApp) {
-      const browser = window.Capacitor?.Plugins?.Browser;
-      if (!browser) return;
-
-      const url = buildNativeOAuthSignInUrl({
-        origin: window.location.origin,
-        provider,
-        callbackPath: callbackUrl,
+  const handleSocialSignIn = async (provider: 'apple' | 'google') => {
+    if (activeAttempt.current || disabled) return;
+    const attempt = Symbol(provider);
+    activeAttempt.current = attempt;
+    setPending(true);
+    setFailed(false);
+    try {
+      const flow = isCapacitorApp ? 'native' : 'web';
+      track('Login Attempted', {
+        auth_method: provider,
+        flow,
       });
+      // Drop an IDB marker that party-profile-context consumes on the next
+      // authenticated-session detection to emit Login Succeeded. NextAuth handles
+      // OAuth success via server-side redirect, so there's no explicit client
+      // callback to track from — the marker bridges the gap. Stale markers expire
+      // after 5 minutes (see oauth-pending-db).
+      void setOAuthPending({ provider, flow, attempted_at: Date.now() });
 
-      void browser.open({ url });
-      return;
+      if (isCapacitorApp) {
+        const browser = window.Capacitor?.Plugins?.Browser;
+        if (!browser) throw new Error('PROVIDER_SIGNIN_UNAVAILABLE');
+
+        const url = buildNativeOAuthSignInUrl({
+          origin: window.location.origin,
+          provider,
+          callbackPath: callbackUrl,
+        });
+
+        await browser.open({ url });
+        return;
+      }
+
+      const response = await signIn(provider, { callbackUrl });
+      if (response?.error) throw new Error('PROVIDER_SIGNIN_UNAVAILABLE');
+    } catch {
+      if (mounted.current) setFailed(true);
+    } finally {
+      if (activeAttempt.current === attempt) {
+        activeAttempt.current = null;
+        if (mounted.current) setPending(false);
+      }
     }
-
-    void signIn(provider, { callbackUrl });
   };
 
   // Don't render anything if no providers are configured
-  const hasAnyProvider = providers && (providers.google || providers.apple || providers.facebook);
+  const hasAnyProvider = providers && (providers.google || providers.apple);
 
   // Show single skeleton while loading to minimize layout shift
   // (we don't know how many providers are configured yet)
@@ -126,15 +172,10 @@ export default function SocialLoginButtons({ callbackUrl = '/', disabled = false
     return null;
   }
 
-  // Apple button needs custom colors per brand guidelines
-  const appleButtonStyles = {
-    backgroundColor: 'var(--neutral-900)',
-    color: 'var(--semantic-surface)',
-    borderColor: 'var(--neutral-900)',
-  };
-
   return (
     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      {showDivider && <Divider>{t('login.divider')}</Divider>}
+      {failed && <Alert severity="error">{t('nativeStart.oauthError')}</Alert>}
       {providers.google && (
         <Button
           fullWidth
@@ -142,7 +183,7 @@ export default function SocialLoginButtons({ callbackUrl = '/', disabled = false
           variant="outlined"
           startIcon={<GoogleIcon />}
           onClick={() => handleSocialSignIn('google')}
-          disabled={disabled}
+          disabled={disabled || pending}
         >
           {t('login.providers.google')}
         </Button>
@@ -155,23 +196,10 @@ export default function SocialLoginButtons({ callbackUrl = '/', disabled = false
           variant="outlined"
           startIcon={<AppleIcon />}
           onClick={() => handleSocialSignIn('apple')}
-          disabled={disabled}
-          sx={appleButtonStyles}
+          disabled={disabled || pending}
+          sx={APPLE_BUTTON_SX}
         >
           {t('login.providers.apple')}
-        </Button>
-      )}
-
-      {providers.facebook && (
-        <Button
-          fullWidth
-          size="large"
-          variant="outlined"
-          startIcon={<FacebookIcon />}
-          onClick={() => handleSocialSignIn('facebook')}
-          disabled={disabled}
-        >
-          {t('login.providers.facebook')}
         </Button>
       )}
     </Box>

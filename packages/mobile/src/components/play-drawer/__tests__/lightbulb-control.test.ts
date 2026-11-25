@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   deriveBoardConnection,
+  deriveCrewHolderSuspected,
+  deriveCrewHolderUnconfirmed,
   deriveInAppBoardConnection,
   deriveLightbulbLit,
   derivePlayDrawerLightbulbPressAction,
+  visibleWallHeldByOtherUser,
 } from '../lightbulb-control';
 import type { BoardConnection } from '../lightbulb-control';
 
@@ -391,6 +394,72 @@ describe('a wall with no LED light kit', () => {
     }
   });
 
+  describe('a board lit by a wall device', () => {
+    const wallDeviceBoard = {
+      hasBluetooth: true,
+      isBluetoothConnected: false,
+      isBluetoothLoading: false,
+      ledless: true,
+      wallDevice: true,
+      wallHeld: false,
+    };
+
+    it('takes the wall when nobody holds it', () => {
+      expect(
+        derivePlayDrawerLightbulbPressAction({ ...wallDeviceBoard, holderIsAuthoritative: false, canRelay: true }),
+      ).toBe('takeWall');
+    });
+
+    it("relays to a crewmate's authoritative hold instead of taking the wall off their link", () => {
+      // The crewmate may drive the LEDs over Bluetooth: Bluetooth wins across phones.
+      expect(
+        derivePlayDrawerLightbulbPressAction({ ...wallDeviceBoard, holderIsAuthoritative: true, canRelay: true }),
+      ).toBe('relay');
+      expect(
+        derivePlayDrawerLightbulbPressAction({ ...wallDeviceBoard, holderIsAuthoritative: true, canRelay: false }),
+      ).toBe('noop');
+    });
+
+    it('still hands back its own hold and hangs up its own link', () => {
+      expect(
+        derivePlayDrawerLightbulbPressAction({
+          ...wallDeviceBoard,
+          wallHeld: true,
+          holderIsAuthoritative: true,
+          canRelay: true,
+        }),
+      ).toBe('releaseWall');
+      expect(
+        derivePlayDrawerLightbulbPressAction({
+          ...wallDeviceBoard,
+          isBluetoothConnected: true,
+          holderIsAuthoritative: true,
+          canRelay: true,
+        }),
+      ).toBe('disconnect');
+    });
+
+    it('never connects', () => {
+      expect(
+        derivePlayDrawerLightbulbPressAction({ ...wallDeviceBoard, holderIsAuthoritative: false, canRelay: false }),
+      ).not.toBe('connect');
+    });
+  });
+
+  it('keeps taking the wall over a session holder on a board with no light kit', () => {
+    expect(
+      derivePlayDrawerLightbulbPressAction({
+        holderIsAuthoritative: true,
+        canRelay: true,
+        hasBluetooth: true,
+        isBluetoothConnected: false,
+        isBluetoothLoading: false,
+        ledless: true,
+        wallHeld: false,
+      }),
+    ).toBe('takeWall');
+  });
+
   it('keeps the pre-existing behaviour when the ledless inputs are omitted', () => {
     expect(
       derivePlayDrawerLightbulbPressAction({
@@ -520,5 +589,67 @@ describe('deriveBoardConnection is the Live Activity contract', () => {
       }
     }
     expect(Object.keys(expected)).toHaveLength(32);
+  });
+});
+
+describe('deriveCrewHolderSuspected (#7017 QA)', () => {
+  // A crewmate joined Liz's session: presence names the climb Liz lit, no holder event yet.
+  const joined = {
+    inSession: true,
+    holder: null,
+    lastConnectionSeq: 0,
+    wallSenderUserId: 'liz',
+    wallPresenceFresh: true,
+    sessionMemberUserIds: new Set(['me', 'liz']),
+    viewerUserId: 'me',
+  };
+
+  it.each([
+    ['no holder event yet, a crewmate lit the wall', {}, true],
+    ['an anonymous holder seeded, no holder event yet', { holder: { userId: null } }, true],
+    ['solo', { inSession: false }, false],
+    ['a named holder', { holder: { userId: 'stranger' } }, false],
+    ['a holder event said the board is free', { lastConnectionSeq: 5 }, false],
+    // Any holder event ends it, named or not (#7017 review).
+    ['a holder event named an anonymous holder', { holder: { userId: null }, lastConnectionSeq: 5 }, false],
+    ['presence over an hour old', { wallPresenceFresh: false }, false],
+    ['nobody named for the climb', { wallSenderUserId: null }, false],
+    ['the sender is not in the session', { wallSenderUserId: 'stranger' }, false],
+    // This climber's own climb, lit here before a relaunch or on another phone.
+    ['the sender is this climber', { wallSenderUserId: 'me' }, false],
+    ['the climber is not known yet', { viewerUserId: null }, false],
+  ])('%s', (_case, over, expected) => {
+    expect(deriveCrewHolderSuspected({ ...joined, ...over })).toBe(expected);
+  });
+});
+
+describe('deriveCrewHolderUnconfirmed (#7017 QA)', () => {
+  const suspected = {
+    suspected: true,
+    localConnected: false,
+    holderIsAuthoritative: false,
+    wallSenderUserId: 'liz',
+    lastLocalHolderUserId: null,
+  };
+
+  it.each([
+    ['the owner suspects a crewmate', {}, true],
+    ['no suspicion, or released after the window', { suspected: false }, false],
+    ['this phone holds the link', { localConnected: true }, false],
+    ['already authoritative', { holderIsAuthoritative: true }, false],
+    ["this phone's own stale hold", { lastLocalHolderUserId: 'liz' }, false],
+  ])('%s', (_case, over, expected) => {
+    expect(deriveCrewHolderUnconfirmed({ ...suspected, ...over })).toBe(expected);
+  });
+});
+
+describe('visibleWallHeldByOtherUser', () => {
+  it('never reads as someone else’s wall on the phone holding the radio', () => {
+    expect(visibleWallHeldByOtherUser({ isBluetoothConnected: true, wallHeldByOtherUser: true })).toBe(false);
+  });
+
+  it('passes the peer hold through with no link', () => {
+    expect(visibleWallHeldByOtherUser({ isBluetoothConnected: false, wallHeldByOtherUser: true })).toBe(true);
+    expect(visibleWallHeldByOtherUser({ isBluetoothConnected: false, wallHeldByOtherUser: false })).toBe(false);
   });
 });

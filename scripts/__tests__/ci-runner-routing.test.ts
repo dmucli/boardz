@@ -67,7 +67,7 @@ const ROUTED_JOBS: ReadonlyArray<readonly [workflow: string, job: string]> = [
   // Wave 2: ci.yml, everything that needs no service container and no Docker.
   //
   // NOT here, deliberately:
-  //   changes / ci-status  -- the control plane. `changes` gates 22 jobs and
+  //   changes / ci-status  -- the control plane. `changes` gates every job and
   //     `ci-status` is the required check, so both must be able to run when
   //     the fleet cannot.
   //   renderer-rust        -- dtolnay/rust-toolchain downloads a toolchain per
@@ -80,25 +80,16 @@ const ROUTED_JOBS: ReadonlyArray<readonly [workflow: string, job: string]> = [
   //     OOM-killed there. See MEMORY_BOUND_JOBS below and the comments on the
   //     jobs themselves.
   ['ci.yml', 'board-art-geometry'],
-  ['ci.yml', 'board-render-version'],
-  ['ci.yml', 'changelog-owned'],
-  ['ci.yml', 'codegen-drift'],
-  ['ci.yml', 'commit-lint'],
-  ['ci.yml', 'deploy-config'],
-  ['ci.yml', 'i18n'],
-  ['ci.yml', 'large-files'],
-  ['ci.yml', 'listing-guards'],
+  // Eleven former one-minute jobs folded into one: each paid a slot allocation
+  // and ~40 s of runner setup for a minute or less of work. See GUARD_STEPS.
+  ['ci.yml', 'guards'],
   ['ci.yml', 'mobile-bundle'],
-  ['ci.yml', 'pg18-artifacts'],
-  ['ci.yml', 'release-notes'],
-  ['ci.yml', 'rest-surface'],
   ['ci.yml', 'test-default'],
   ['ci.yml', 'test-ocr'],
-  ['ci.yml', 'test-report'],
 ];
 
 /**
- * ci.yml's control plane. `changes` gates 22 jobs and `ci-status` is the
+ * ci.yml's control plane. `changes` gates every job and `ci-status` is the
  * required check, so both must be able to run when the fleet cannot. Two of
  * GitHub's 20 slots is a cheap price for the aggregator always being able to
  * report.
@@ -120,6 +111,28 @@ const CI_CONTROL_PLANE_JOBS = ['changes', 'ci-status'] as const;
  * on an unchanged image.
  */
 const MEMORY_BOUND_JOBS = ['lint', 'typecheck'] as const;
+
+/**
+ * The former jobs that now run as steps of ci.yml's `guards` job, by step `id:`.
+ * Each was ~1 minute of work in its own job, which on a 20-slot pool cost a
+ * slot allocation plus ~40 s of runner setup apiece. Folding them is only safe
+ * while every one is still there, still reached even after an earlier guard
+ * fails, and still counted by the summary step that fails the job.
+ */
+const GUARD_STEPS = [
+  'large-files',
+  'release-notes',
+  'changelog-owned',
+  'board-render-version',
+  'public-api-openapi',
+  'public-api-changelog',
+  'i18n',
+  'deploy-config',
+  'listing-guards',
+  'pg18-artifacts',
+  'rest-surface',
+  'codegen-drift',
+] as const;
 
 function workflow(name: string): string {
   return readFileSync(`.github/workflows/${name}`, 'utf8');
@@ -188,6 +201,58 @@ describe('self-hosted runner routing', () => {
   });
 });
 
+describe('ci.yml `guards` job', () => {
+  const blocks = jobBlocks(workflow('ci.yml'));
+  const guards = blocks.get('guards') ?? [];
+
+  /** One step's lines, from its `- ` line to the next step at the same indent. */
+  function stepWithId(id: string): string[] {
+    const idIndex = guards.findIndex((line) => line.trim() === `id: ${id}`);
+    if (idIndex < 0) return [];
+    let start = idIndex;
+    while (start > 0 && !guards[start].startsWith('      - ')) start -= 1;
+    let end = start + 1;
+    while (end < guards.length && !guards[end].startsWith('      - ')) end += 1;
+    return guards.slice(start, end);
+  }
+
+  it('exists and replaces the jobs it folded', () => {
+    expect(guards.length).toBeGreaterThan(0);
+    for (const jobName of GUARD_STEPS) {
+      expect(blocks.has(jobName), `ci.yml still has a standalone \`${jobName}\` job`).toBe(false);
+    }
+  });
+
+  it.each(GUARD_STEPS)('runs guard `%s` as a step that survives an earlier guard failing', (id) => {
+    const step = stepWithId(id);
+    expect(step, `guards has no step with id ${id}`).not.toEqual([]);
+    const condition = step.find((line) => line.trim().startsWith('if:'));
+    expect(condition, `guard ${id} has no if:`).toBeDefined();
+    // Without !cancelled() the default success() skips every guard after the
+    // first failure, so a PR sees one broken guard per push instead of all.
+    expect(condition).toContain('!cancelled()');
+    expect(step.some((line) => line.trim() === 'continue-on-error: true')).toBe(false);
+  });
+
+  it('fails the job from an always() summary that reads every guard outcome', () => {
+    const summaryIndex = guards.findIndex((line) => line.trim() === '- name: Guards summary');
+    expect(summaryIndex).toBeGreaterThan(-1);
+    const summaryStep = guards.slice(summaryIndex).join('\n');
+    expect(summaryStep).toContain('if: always()');
+    expect(summaryStep).toContain('${{ toJSON(steps) }}');
+    expect(summaryStep).toContain('select(.value.outcome == "failure")');
+    expect(summaryStep).toContain('exit 1');
+  });
+
+  it('runs even when `changes` fails, for the guards that read no `changes` output', () => {
+    expect(guards).toContain('    if: ${{ !cancelled() }}');
+  });
+
+  it('is part of the required ci-status aggregate', () => {
+    expect(blocks.get('ci-status')).toContain('      - guards');
+  });
+});
+
 describe('routed jobs must not save a dependency cache on the fleet', () => {
   // Measured on bs-ci-1-12: the setup-vp POST step (its cache save) took 148s
   // of a 210s job, against 0s on GitHub-hosted, because a self-hosted runner
@@ -251,8 +316,10 @@ describe('routed jobs must not save a dependency cache on the fleet', () => {
             `gate it with \`cache: \${{ runner.environment == 'github-hosted' }}\``,
         ).toEqual([]);
 
-        // Anything that configures caching at all must use the gated form.
-        if (lines.some((line) => /^\s*cache:/.test(line))) {
+        // Anything that configures caching at all must use the gated form or
+        // turn it off (scripts/workflow-cache-restore.test.ts forces `false` in
+        // jobs that hold secrets or write permissions).
+        if (lines.some((line) => /^\s*cache:/.test(line) && !/^\s*cache:\s*false\s*$/.test(line))) {
           expect(lines.some((line) => gated.test(line))).toBe(true);
         }
       });

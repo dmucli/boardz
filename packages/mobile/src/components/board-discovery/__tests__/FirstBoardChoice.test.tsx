@@ -22,14 +22,15 @@ vi.mock('react-native', () => ({
 // Resolves against the real en-US catalog, so the test reads the shipped words.
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => {
+    t: (key: string, params?: Record<string, string>) => {
       const value = key
         .split('.')
         .reduce<unknown>(
           (node, part) => (node && typeof node === 'object' ? (node as Record<string, unknown>)[part] : undefined),
           boardsCatalog,
         );
-      return typeof value === 'string' ? value : key;
+      if (typeof value !== 'string') return key;
+      return value.replace(/\{\{(\w+)\}\}/g, (placeholder, name: string) => params?.[name] ?? placeholder);
     },
   }),
 }));
@@ -64,7 +65,7 @@ const { FirstBoardChoice } = await import('../FirstBoardChoice');
 const callbacks = {
   onGym: vi.fn(),
   onOwn: vi.fn(),
-  onScan: vi.fn(),
+  onAddSprayWall: vi.fn(),
   onFindGymOnMap: vi.fn(),
   onOpenSettings: vi.fn(),
   onRetryNearby: vi.fn(),
@@ -95,44 +96,47 @@ describe('FirstBoardChoice', () => {
     expect(screen.getByRole('heading').textContent).toBe('Where do you climb?');
     expect(
       screen.getByText(
-        "Pick your board to load its climbs. When you're connected, tapping a climb lights it on the wall.",
+        'Pick your board to load its climbs. A tap opens a climb as a preview; Put on board lights it on the wall.',
       ),
     ).toBeTruthy();
   });
 
-  it('offers the three ways to a board', () => {
+  // The board in front of them is the picker's In range slot, above this block,
+  // so there is no scan link here any more.
+  it('offers the three ways to a board, Spraywall included, and no scan link', () => {
     renderChoice();
     expect(screen.getByRole('button', { name: "At a gym. Pick your gym's board" })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'My own board. Set up the board you have at home' })).toBeTruthy();
-    expect(screen.getByRole('button', { name: 'Scan for the board in front of me' })).toBeTruthy();
-  });
-
-  // Climbs' no-board entry with the spray-walls flag on: the builder behind My
-  // own board cannot make a spray wall.
-  it('offers a spray wall only when the screen passes the path', () => {
-    renderChoice();
-    expect(screen.queryByRole('button', { name: 'Add my spray wall' })).toBeNull();
-    cleanup();
-
-    const onAddSprayWall = vi.fn();
-    render(<FirstBoardChoice gymState="idle" nearbyResults={null} {...callbacks} onAddSprayWall={onAddSprayWall} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Add my spray wall' }));
-    expect(onAddSprayWall).toHaveBeenCalledTimes(1);
-  });
-
-  it('says up front what the scan cannot see', () => {
-    renderChoice();
-    expect(screen.getByText("MoonBoards and some Kilter boxes don't show up here yet.")).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'My Spraywall. Photograph it and mark the holds' })).toBeTruthy();
+    expect(screen.queryByText(/Scan for the board/)).toBeNull();
   });
 
   it('hands each tap to its flow', () => {
     renderChoice();
     fireEvent.click(screen.getByRole('button', { name: "At a gym. Pick your gym's board" }));
     fireEvent.click(screen.getByRole('button', { name: 'My own board. Set up the board you have at home' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Scan for the board in front of me' }));
+    fireEvent.click(screen.getByRole('button', { name: 'My Spraywall. Photograph it and mark the holds' }));
     expect(callbacks.onGym).toHaveBeenCalledTimes(1);
     expect(callbacks.onOwn).toHaveBeenCalledTimes(1);
-    expect(callbacks.onScan).toHaveBeenCalledTimes(1);
+    expect(callbacks.onAddSprayWall).toHaveBeenCalledTimes(1);
+  });
+
+  // With the add-a-board wizard on, the cards are its step 1 answered inline:
+  // its words, and the same three ways (At a gym still lists nearby boards here).
+  it("uses the wizard's step 1 words with the wizard on", () => {
+    render(
+      <FirstBoardChoice
+        gymState="idle"
+        nearbyResults={createElement('div', { 'data-testid': 'nearby' }, 'Near you')}
+        {...callbacks}
+        wizardCopy
+      />,
+    );
+    expect(screen.getByRole('button', { name: "At a gym. Pick your gym's board" })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'At home. Your own wall or garage board' }));
+    fireEvent.click(screen.getByRole('button', { name: 'A Spraywall. Photograph it and mark the holds' }));
+    expect(callbacks.onOwn).toHaveBeenCalledTimes(1);
+    expect(callbacks.onAddSprayWall).toHaveBeenCalledTimes(1);
   });
 
   it('shows nothing under "At a gym" until it is tapped', () => {
@@ -160,6 +164,40 @@ describe('FirstBoardChoice', () => {
     expect(screen.queryByTestId('nearby')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: 'Find your gym on the map' }));
     expect(callbacks.onFindGymOnMap).toHaveBeenCalledTimes(1);
+  });
+
+  // The In range slot's "Use my location" narrows the search to one
+  // type. "Nothing within 20 km" would then be false in a gym full of other
+  // boards, so the line names the type and offers every board.
+  it('names the type it found none of, and offers every board', () => {
+    const onShowAllNearby = vi.fn();
+    render(
+      <FirstBoardChoice
+        gymState="none_nearby"
+        nearbyResults={null}
+        {...callbacks}
+        nearbyBoardType="moonboard"
+        onShowAllNearby={onShowAllNearby}
+      />,
+    );
+    expect(screen.getByText('No MoonBoards within 20 km')).toBeTruthy();
+    expect(screen.queryByText('Nothing within 20 km')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Show all' }));
+    expect(onShowAllNearby).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Find your gym on the map' }));
+    expect(callbacks.onFindGymOnMap).toHaveBeenCalledTimes(1);
+    cleanup();
+
+    render(
+      <FirstBoardChoice
+        gymState="none_nearby"
+        nearbyResults={null}
+        {...callbacks}
+        nearbyBoardType="tension"
+        onShowAllNearby={onShowAllNearby}
+      />,
+    );
+    expect(screen.getByText('No Tension boards within 20 km')).toBeTruthy();
   });
 
   // A failed lookup is not an empty one: a climber standing in a gym must not

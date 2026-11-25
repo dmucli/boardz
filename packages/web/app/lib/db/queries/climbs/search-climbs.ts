@@ -7,6 +7,7 @@ import type { ParsedBoardRouteParameters, SearchRequestPagination, BoardName, Cl
 import { sortObjectKeys } from '@/app/lib/cache-utils';
 import { resolveClimbNoMatch } from '@/app/lib/no-match-climb';
 import { withReadDeadline } from '@/app/lib/db/read-deadline';
+import { hasLiveSearchData, LIVE_SEARCH_DATA_TTL_SECONDS } from '@/app/lib/live-search-data-boards';
 
 /**
  * Cache durations for climb search queries (in seconds)
@@ -14,13 +15,19 @@ import { withReadDeadline } from '@/app/lib/db/read-deadline';
 const CACHE_DURATION_DEFAULT_SEARCH = 24 * 60 * 60; // 24 hours for default searches
 const CACHE_DURATION_FILTERED_SEARCH = 60 * 60; // 1 hour for filtered searches
 /**
- * MoonBoard front doors only. Short enough that an in-progress import shows up
- * within a quarter hour — the freshness the blanket bypass below was protecting
- * — but not so short that a crawler pays a live search per page view. MoonBoard
- * is the largest board in the catalogue, so it is also the biggest single
- * contributor to the crawl surface.
+ * MoonBoard and Woods front doors only: boards whose search data Boardsesh
+ * changes under the cache. MoonBoard has an import in progress; Woods gets new
+ * climbs from setter publishes (#4750) and tick-derived per-angle grades
+ * (#5212). Woods is singled out because Boardsesh is its only source of stats,
+ * so nothing upstream refreshes them; the Aurora boards (Kilter, Tension,
+ * Touchstone, Grasshopper) also get #5212 grades but keep the 24 h TTL, so do
+ * not extend this to them. Short enough that those show up within a quarter hour — the
+ * freshness the MoonBoard bypass below was protecting — but not so short that a
+ * crawler pays a live search per page view. MoonBoard is the largest board in
+ * the catalogue, so it is also the biggest single contributor to the crawl
+ * surface.
  */
-const CACHE_DURATION_MOONBOARD_FRONT_DOOR = 15 * 60;
+const CACHE_DURATION_LIVE_DATA_FRONT_DOOR = LIVE_SEARCH_DATA_TTL_SECONDS;
 
 /**
  * Module-level query function with explicit arguments so unstable_cache holds a
@@ -182,10 +189,14 @@ export async function cachedSearchClimbs(
   // freshness the bypass was protecting, and `revalidateClimbSearchTags` still
   // clears it on demand via the board-level tag.
   //
+  // Woods gets the same short TTL but never bypasses (see
+  // CACHE_DURATION_LIVE_DATA_FRONT_DOOR above).
+  //
   // Random sort bypasses unconditionally: each shuffle carries a unique ~31-bit
   // seed, so caching per seed is a 0%-hit-rate entry that only bloats the
   // Next.js data cache.
   const isMoonboard = params.board_name === 'moonboard';
+  const isLiveSearchDataBoard = hasLiveSearchData(params.board_name);
   const explicitlyCacheable = options?.cacheable === true;
   const cacheable =
     (options?.cacheable ?? !userId) && searchParams.sortBy !== 'random' && (explicitlyCacheable || !isMoonboard);
@@ -206,10 +217,10 @@ export async function cachedSearchClimbs(
   }
 
   // Keyed on the board, not on `explicitlyCacheable`: the front door is the only
-  // cacheable MoonBoard caller today, and if a second one appears it inherits
-  // the *shorter* TTL — erring toward import freshness rather than away from it.
-  const revalidate = isMoonboard
-    ? CACHE_DURATION_MOONBOARD_FRONT_DOOR
+  // cacheable MoonBoard or Woods caller today, and if a second one appears it
+  // inherits the *shorter* TTL — erring toward freshness rather than away from it.
+  const revalidate = isLiveSearchDataBoard
+    ? CACHE_DURATION_LIVE_DATA_FRONT_DOOR
     : isDefaultSearch
       ? CACHE_DURATION_DEFAULT_SEARCH
       : CACHE_DURATION_FILTERED_SEARCH;

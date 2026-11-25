@@ -1,0 +1,46 @@
+appId: com.boardsesh.app
+name: showcase teardown - end the live session
+---
+# Teardown for every take that starts a live session: crew, workouts,
+# lock-screen (primary phone, NOT recorded)
+#
+# Ends the live session the take began, for everyone in it, so nothing
+# is left running on the account. The recorder runs this after the take and on
+# an abort (Ctrl-C included) whenever a session was started, keeping the live
+# app state (capture mode skips cold-start session restore), and
+# then checks the app logged the session ending.
+#
+# The exit control uses the existing localized accessibility label. The
+# destructive confirmation moved into SheetTopBar; its stable trailing-action
+# testID identifies the actual commit button rather than the title beside it.
+
+# Close an invite or queue sheet before routing, while retaining the live session.
+- tapOn:
+    text: '${SHOWCASE_CLOSE_LABEL}'
+    optional: true
+- waitForAnimationToEnd
+
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- waitForAnimationToEnd
+- openLink: com.boardsesh.app://record
+- tapOn:
+    text: 'Open'
+    optional: true
+- waitForAnimationToEnd
+
+- tapOn:
+    text: '^(End session|Terminar sesión|Terminer la session|Session beenden)$'
+- waitForAnimationToEnd
+- extendedWaitUntil:
+    visible:
+      id: 'end-session-content'
+    timeout: 15000
+- tapOn:
+    id: 'sheet-top-bar-trailing'
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 4000
+    optional: true

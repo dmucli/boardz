@@ -1,0 +1,3802 @@
+import { PlayTopChromeView } from './PlayTopChromeView';
+import { PlayStageView } from './PlayStageView';
+import { randomUUID } from 'expo-crypto';
+import { registerClimbActionPresenters } from '../climb-actions/climb-action-presenters';
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentRef,
+  type ComponentType,
+  type RefObject,
+} from 'react';
+import { usePrivacyCredentialScope, usePrivacyScopedState } from '../../hooks/use-privacy-scoped-state';
+import {
+  AccessibilityInfo,
+  Platform,
+  PixelRatio,
+  View,
+  StyleSheet,
+  useWindowDimensions,
+  type LayoutChangeEvent,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
+} from 'react-native';
+import * as GestureHandler from 'react-native-gesture-handler';
+import Animated, { useAnimatedStyle, useSharedValue } from 'react-native-reanimated';
+import { scopedRouter as router } from '../../lib/routing/scoped-navigation';
+import { useTranslation } from 'react-i18next';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import type { BoardName, Climb } from '@boardsesh/shared-schema';
+import { configKey, getQueueBoardKey, isClimbOnReachableBoard } from '@boardsesh/queue';
+import type { ClimbQueueItem, PlaylistSuggestionSource } from '@boardsesh/queue';
+import { boardSupportsMirroring } from '@boardsesh/play-view';
+import { BoardPresenceClientContext } from '@boardsesh/board-presence-react';
+import { formatRenderBoardLabel, resolveClimbRenderBoard } from '../../lib/boards/climb-render-board';
+import {
+  findGymBoardToConnectForClimb,
+  gymBoardButtonName,
+  sessionBoardPathNamesBoard,
+} from '../../lib/boards/gym-board-for-climb';
+import { useSessionBoardPath } from '../../providers/queue/queue-contexts';
+import { useCrewGymBoardHeld } from '../../lib/boards/use-crew-gym-board-held';
+import type { ActiveSubDrawer, TrackLabelModel } from '@boardsesh/play-view';
+import {
+  SHARED_EVENTS,
+  wallControlPreviewReason,
+  type DriveModeStartedBy,
+  type QueueNavigationDirection,
+} from '@boardsesh/analytics';
+import { buildOpeningLayoutKey } from './opening-layout-cache';
+import { usePlayNavigationModel } from './use-play-navigation-model';
+import { usePlayLayoutMeasurements, usePlayOpeningLayout } from './use-play-opening-layout';
+import { DeferredBoard } from './DeferredBoard';
+import { PlayCoreSheetHosts } from './PlayCoreSheetHosts';
+import { usePlayFavorite } from './use-play-favorite';
+import { usePlaySelectionController, type PlayNavigationStep } from './use-play-selection-controller';
+import { trackQueueNavigation, trackQueueSheetOpened } from '../../lib/queue-navigation-analytics';
+import { queueSheetOpenContext } from '../../lib/queue-sheet-open-context';
+import { useAnySheetVisible } from '../../lib/sheet-visibility-store';
+import { usePlayerKeyboardNavigation } from './use-player-keyboard-navigation';
+import {
+  buildPlayDrawerActionsContext,
+  isPlayDrawerWallControlRendered,
+} from '../../lib/play-drawer-actions-analytics';
+import { usePlayDrawerActionsExposure, usePlayDrawerActionsVisibility } from './use-play-drawer-actions-exposure';
+import { useDeferredUntilFrame } from '../../hooks/use-deferred-until-frame';
+import { BoardRenderUnavailable } from './BoardRenderUnavailable';
+import { PlaybackControls } from '../playback/PlaybackControls';
+import { useMobilePlayback } from './use-mobile-playback';
+import { LivePlayDrawerHeader, describePlayDrawerGrade, useLivePlayDrawerHeaderModel } from './PlayDrawerHeader';
+import { formatBoardClimbValue } from './board-climb-value';
+import { useBoardValueAnnouncement } from './use-board-value-announcement';
+import { PlayDrawerStatusBarScrim } from './PlayDrawerStatusBarScrim';
+import { copyClimbName } from './copy-climb-name';
+import { SwipeableHeader } from './SwipeableHeader';
+import { useSwipeStaleContentStyle } from './use-swipe-stale-content';
+import { CollapsibleSummaryStyleContext } from '../collapsible-summary-style';
+import {
+  useSwipeNavigation,
+  useSwipePager,
+  useSwipePages,
+  useTrackEndSwipe,
+  type SwipeArtWait,
+} from './use-swipe-pager';
+import { useTrackPaging } from './use-track-paging';
+import { formatBrowseCaption, formatTrackLabelParts, spokenCaption } from './track-label-text';
+import { useThenSignposts } from './use-then-signposts';
+import { resolvePreviewNoteOnLine } from './then-signposts';
+import { PlayListContext } from './PlayListContext';
+import { resolveTopListContextFrame } from './top-list-context-frame';
+import { TrackEndCard } from './TrackEndCard';
+import { ACTION_BAR_SECONDARY_ROW_HEIGHT, PlayDrawerActionBar } from './PlayDrawerActionBar';
+import { PlayDrawerActionsMenu } from './PlayDrawerActionsMenu';
+import { resolveQueuedSlotUuid } from './play-drawer-menu-rows';
+import { resolveActionBarLayout, type ActionBarCommitButton } from './action-bar-layout';
+import { shouldShowWorkoutOutcome, type WorkoutOutcomeTarget } from './workout-outcome';
+import { useWorkoutOutcomeHold } from './use-workout-outcome-hold';
+import { WallStatePill } from './WallStatePill';
+import { PlayDrawerHeaderAccessibility } from './PlayDrawerHeaderAccessibility';
+import {
+  resolveWallPillState,
+  resolveHeaderPillState,
+  type HeaderPill,
+  resolveCommitBarModel,
+  resolveCommitButton,
+  shouldAdoptLateWallRead,
+  shouldArmBusyWallConfirm,
+  shouldShowHolderBadge,
+  resolveBrowseCaption,
+} from './wall-state';
+import { useWallStateAnnouncer } from './use-wall-state-announcer';
+import { resolvePreviewFirstTipInput, usePreviewFirstTip } from './use-preview-first-tip';
+import { WallStateLiveRegion } from './WallStateLiveRegion';
+import { PlayerPreviewTip, type PlayerPreviewTipExit } from '../onboarding/PlayerPreviewTip';
+import { retirePreviewFirstTip } from '../../lib/onboarding/preview-first-tip';
+import { BOARD_LOOK_LIGHTING_SECTION } from '../settings/board-look/board-look-model';
+import { usePresenceClearedClimbUuid, useWallClimb } from './use-wall-climb';
+import { resolveBusyWallHolder } from './busy-wall-question';
+import { formatBusyWallCaption } from './busy-wall-question-text';
+import { useBusyWallQuestion } from './use-busy-wall-question';
+import { claimJoinedBrowseNotice, claimSoloBrowseNotice } from './joined-browse-notice';
+import { previewNeedsAngleReanchor, reanchorPreviewAtAngle } from './preview-angle-anchor';
+import { SwitchBoardOverlay } from './SwitchBoardOverlay';
+import { DeferredSections } from './DeferredSections';
+import { EmptyState } from '../EmptyState';
+import { useRoutePlayerHandoff } from './use-route-player-handoff';
+import {
+  computeDrawerFirstScreenHeight,
+  computeFitToHeightFirstScreenHeight,
+  computeFirstSectionScrollTarget,
+  initialDrawerPreviewItem,
+  shouldFitBoardToHeight,
+  shouldShowPanePlaceholder,
+} from './play-drawer-layout';
+import { useBelowFoldContentRequest } from './use-below-fold-content-request';
+import { useDeliberateScrollGesture } from './use-deliberate-scroll-gesture';
+import {
+  DEFAULT_PLAY_DRAWER_SECTION_ORDER,
+  DEFAULT_PLAY_DRAWER_SECTIONS,
+  usePlayDrawerSectionsPreference,
+} from '../../lib/play-drawer-sections-preference';
+import { visiblePlayDrawerSections, withoutPanelSections } from './play-drawer-sections';
+import { PlaybackFrameContext } from './playback-frame-context';
+import { usePlayerButtonsPreference } from '../../lib/player-buttons-preference';
+import { resolveWallLit } from './wall-lit';
+import { resetWallCleared, useWallClearedClimbUuid } from '../ble/wall-cleared-store';
+import { nowMs } from '../../lib/clock';
+import { DEFAULT_PLAYER_BUTTONS_POSITION } from '../../lib/player-buttons';
+import { useDrawerDismissGesture } from './use-drawer-dismiss-gesture';
+import { useFullLogbookSheet } from './logbook/use-full-logbook-sheet';
+import { usePushAfterPlayerDismiss } from './use-push-after-player-dismiss';
+import { RestTimerPillHost } from '../queue-control/RestTimerPillHost';
+import { useWorkoutRun } from '../../lib/workout-run-store';
+import { useWorkoutQueueUuids, useWorkoutStageParts } from './use-workout-stage-label';
+import { WorkoutRunnerOverlay } from './WorkoutRunnerOverlay';
+import { useChromeIconButtonSize } from '../ChromeIconButton';
+import { topBarByVariant } from '../../theme/top-bar';
+import {
+  usePlaylistSuggestionSource,
+  useQueueData,
+  useQueueActions,
+  useQueueSessionId,
+  useQueueSessionControls,
+  useIsSharedSession,
+  useIsCrewSession,
+} from '../../providers/queue-provider';
+import { useOptionalBluetoothContext, type ReassertWallOptions } from '../../providers/bluetooth-provider';
+import { useSetting } from '../../settings';
+import {
+  DEFAULT_KEEP_LIGHTING,
+  alwaysDriveApplies,
+  resolveKeepLightingPlan,
+  sanitiseKeepLighting,
+  type KeepLightingPlan,
+} from '../../lib/keep-lighting';
+import { useAuth } from '../../providers/auth-provider';
+import {
+  useBoardseshGradeEnabled,
+  useWallFrostMotionEnabled,
+  useWallSwipeToDriveEnabled,
+} from '../../providers/feature-flags-provider';
+import { useToast } from '../../providers/toast-provider';
+import { useClimb, useGymBoards, useProfile } from '../../lib/graphql/hooks';
+import { useBluetoothWriteInProgress } from '../../providers/bluetooth-write-activity';
+import {
+  PlayCoreEnhancements,
+  getPlayCoreEnhancementTargetKey,
+  type PlayCoreEnhancementSnapshot,
+} from './PlayCoreEnhancements';
+import { useActiveBoard } from '../../lib/graphql/use-active-board';
+import { boardLooselyMatches } from '../../lib/boards/board-matches';
+import { useDisplayGrade } from '../../hooks/use-display-grade';
+import { useViewerUserId } from '../../hooks/use-viewer-user-id';
+import { useHorizontalSafeArea } from '../../hooks/use-horizontal-safe-area';
+import { useTabletopFoldTop } from '../../hooks/use-tabletop-fold-top';
+import { PHONE_SPLIT_FOLD_GUTTER } from '../../theme/size-class';
+import { playContentSideInsets } from './play-content-side-insets';
+import { useShareClimbAction } from '../../hooks/use-share-climb-action';
+import { registerPaneWallControl } from './pane-wall-control-store';
+import { useMiniPlayerMirrorsPlayer } from './use-mini-player-mirrors';
+import { isWallPresenceTrusted, usePresenceFresh } from '../../lib/board-presence/presence-freshness';
+import { resolvePlayerAngle } from './player-angle';
+import { activeBoardIsMoonboard } from '../../hooks/use-active-board-is-moonboard';
+import { isMoonboardBoardName } from '@boardsesh/board-config';
+import { LostHoldsBanner } from './LostHoldsBanner';
+import { useLostHoldRemix } from './use-lost-hold-remix';
+import { getBoardRenderData } from '../../lib/board-details';
+import { resolvePlayerWallLink } from '../../lib/spray/spray-led-wall-link';
+import { useSprayWallLedsEnabled } from '../../lib/spray/use-spray-wall-leds-enabled';
+import { useSprayWallToken } from '../../lib/spray/use-spray-wall-token';
+import { hapticSuccess } from '../../lib/haptics';
+import { resolveTickMirror } from '../../lib/queue-mirror-orientation';
+import { usePlayDrawerWakeLock } from './use-play-drawer-wake-lock';
+import { swipeStaysViewOnly } from './play-drawer-navigation';
+import { useLightbulbControl, type LightbulbControl } from '../ble/use-lightbulb-control';
+import { disconnectAllBluetooth } from '../../lib/ble/bluetooth-status-store';
+import { trackBoardControlsOpened } from '../../lib/analytics-board-connect';
+import {
+  isHolderSelfAccount,
+  isWallControlDrawn,
+  resolveBoardSheetStatus,
+  resolveWallControl,
+  type WallControlState,
+} from './wall-control';
+import { useWallControl, type DriveStartOutcome } from './use-wall-control';
+import { useDriveLightingMode, useDriveModePhase, useDrivingStoppedForLink } from './drive-mode-store';
+import { startDrive, startKeepLighting } from './drive-runner';
+import { formatCrewPutUp, useCrewPutUp } from './crew-put-up-store';
+import { formatLetsGo, resolveLetsGoTargetBoardId, useLetsGo } from './board-lets-go-store';
+import { useParseFrames } from '../board-renderer/use-parse-frames';
+import type { HoldPlacement } from '../board-renderer/types';
+import { useHoldStateColors } from './use-hold-state-colors';
+import type { WallGlowInput } from './use-wall-glow';
+import type { BoardSwapFrame } from './swap-look';
+import type { WallControlSwap } from './WallControlButton';
+import { PLAYER_SWAP_LOOK_ENCODED } from './player-swap-look';
+import { readFrostedBokehSwapFrameApi } from '../../../modules/frosted-bokeh-gpu/src/swap-frame-api';
+import { useReduceMotion } from '../../hooks/use-reduce-motion';
+import { buildWallGlowInput } from './wall-glow-input';
+import { wallControlFrostHasLeds, wallControlUsesFrost } from './wall-control-frost';
+import { boardHasLights, litByWallDevice } from '../../lib/boards/board-lighting';
+
+const EMPTY_HOLD_PLACEMENTS: HoldPlacement[] = [];
+/** Whether this binary's wall-button frost can follow the board's swap; read once. */
+const FROST_FOLLOWS_SWAP = readFrostedBokehSwapFrameApi() >= 1;
+/** A workout stage holds the top bar: the board's value names no list position then. */
+const NO_TRACK_LABEL: TrackLabelModel = { kind: 'hidden' };
+import { useWallHolderIdentity } from './use-wall-holder-name';
+import { track } from '../../lib/analytics';
+import { spacing } from '../../theme/tokens';
+import type { BoardConfig, PlayDrawerProps } from './play-drawer-types';
+import { pickBoardOverride, useLastPickWriter, type PickLatchStart } from './use-last-pick-writer';
+import { useSharedBrowseLatch } from './shared-browse-latch';
+import { usePutOnBoardIntent, usePutOnBoardIntentPress } from './use-put-on-board-intent';
+import type { AppliedPlayerOpen } from './use-play-selection-controller';
+export type { PlayDrawerOpenOptions, PlayDrawerOpenTarget, PlayDrawerProps } from './play-drawer-types';
+
+const { GestureDetector, Gesture, ScrollView: DefaultScrollView } = GestureHandler;
+// Builder gestures need the legacy scroll handler on both preview runtimes:
+// RNGH 3 renamed it, while main's RNGH 2 still exports it as ScrollView.
+const ScrollView =
+  'LegacyScrollView' in GestureHandler
+    ? (GestureHandler.LegacyScrollView as typeof DefaultScrollView)
+    : DefaultScrollView;
+
+/**
+ * What identifies a queue item's page in the swipe (see use-swipe-pager): its
+ * climb, or the item itself until the climb is known. Never null for an item
+ * that exists, so a neighbour the queue says is there always has a page.
+ */
+function swipePageId(item: ClimbQueueItem | null | undefined): string {
+  return item?.climb?.uuid || item?.uuid || 'unresolved';
+}
+// ⋯'s anchor as AppMenu draws it, which is split by OS rather than by variant:
+// Android's M3 overflow IconButton is a 48dp target, iOS and web draw 44pt.
+const MENU_ANCHOR_SIZE =
+  Platform.OS === 'android' ? topBarByVariant.material.iconTarget : topBarByVariant.liquidGlass.iconTarget;
+// Fallback used for the first-screen reserve before the Logbook header has
+// been measured, so the board fits without a visible jump on first open.
+// A collapsed section header is a single row (title + summary + chevron).
+const DEFAULT_SECTION_HEADER_HEIGHT = 52;
+
+// How long the session must stay solo before an armed browse latch lets go.
+export { SHARED_BROWSE_LATCH_RELEASE_MS } from './shared-browse-latch';
+
+/** A typical switch-board card at the default text size, until the real one is measured. */
+const SWITCH_BOARD_CARD_HEIGHT_ESTIMATE = 184;
+/** Room kept above and below the card inside the controls region. */
+const SWITCH_BOARD_CARD_MARGIN = spacing[2];
+
+/**
+ * Full-screen "now playing" player (Spotify-style track view). Rendered as the
+ * content of the `app/play.tsx` modal route (`presentation: 'transparentModal'`):
+ * the native modal VC gives the slide-up present, button dismiss, and —
+ * crucially — a view-controller stack that the sub-drawers / queue / share sheet
+ * present ABOVE (the FullWindowOverlay it replaced could not, since native sheets
+ * present off the key window beneath it).
+ */
+// How long after the wall button's connect linked a #4979 hold still counts as
+// the one that tap ran into. While the connect is on its way (the picker) there
+// is no limit: the hold can only come from that link.
+const RELIGHT_HELD_AFTER_CONNECT_MS = 60_000;
+
+/** The wall button's connect that owes its climb a relight through the #4979 hold. */
+type RelightHeldAfterConnect = {
+  queueItemUuid: string;
+  /** When the press connected, then (once linked) when the link came up. */
+  at: number;
+  /** The connect has not settled yet. */
+  connecting: boolean;
+};
+
+/**
+ * The wall button's connect settled. Linked, the minute starts now. Failed (or
+ * rejected), nothing is owed, so a later link (the bulb's) keeps the hold. A
+ * newer press has its own entry and is left alone.
+ */
+function settleRelightHeldAfterConnect(
+  ref: RefObject<RelightHeldAfterConnect | null>,
+  pending: RelightHeldAfterConnect | null,
+  connected: boolean,
+): void {
+  if (!pending || ref.current !== pending) return;
+  if (!connected) {
+    ref.current = null;
+    return;
+  }
+  pending.connecting = false;
+  pending.at = nowMs();
+}
+
+export function PlayCore({
+  fieldColorOverride,
+  swipeDismiss,
+  onClose,
+  boardConfig,
+  onAngleChange,
+  isAngleAdjustable = true,
+  onOpenQueue,
+  boardMismatch = false,
+  reachableBoardKeys,
+  mismatchBoardLabel,
+  onSwitchBoard,
+  dismissPlayerAndWait,
+  openTarget,
+  presentation = 'route',
+  paneTopInset = true,
+  paneEmptyState,
+  acceptsScrollHandoff = false,
+  fitBoardToHeight = false,
+  renderSidePanel,
+  viewer = 'member',
+  onSignIn,
+}: PlayDrawerProps) {
+  // The signed-out reader on app.boardsesh.com's read-only climb URL.
+  const isAnonymous = viewer === 'anonymous';
+  // The iPad right-column pane is persistent — it has no dismiss. Suppresses the
+  // pull-down dismiss gesture, the close chevron, the grabber, and router.dismiss.
+  const isPane = presentation === 'pane';
+  const { t, i18n } = useTranslation('session');
+  const storedSectionsPreference = usePlayDrawerSectionsPreference();
+  const [sectionsSettingsOpen, setSectionsSettingsOpen] = useState(false);
+  const handleOpenSectionsSettings = useCallback(() => setSectionsSettingsOpen(true), []);
+  const handleCloseSectionsSettings = useCallback(() => setSectionsSettingsOpen(false), []);
+  // The copy-name toast strings live in the `climbs` namespace, with the rest
+  // of the climb actions' copy.
+  const { t: tClimbs } = useTranslation('climbs');
+  const insets = useSafeAreaInsets();
+  // Clear of iPhone Duo's side status bar on the route; none in the pane. 0 on a
+  // portrait iPhone. See playContentSideInsets.
+  const routeSideInsets = useHorizontalSafeArea();
+  const contentSideInsets = playContentSideInsets(presentation, routeSideInsets);
+  // The close chevron's footprint (44pt on iOS, 48dp on Material). The top row's
+  // trailing cluster takes the same height so ⋯ centres on the chevron, and an
+  // Android 48dp overflow button sits inside the cluster it is tapped through.
+  const chromeButtonSize = useChromeIconButtonSize();
+  const { width: windowWidth, height: windowHeight, fontScale } = useWindowDimensions();
+  // The route is mounted only while the player is open, so the player is "open"
+  // for this component's whole lifetime — this gates the board render, favorite
+  // fetch, wake lock, and below-fold sections. Intentionally a constant, NOT
+  // useIsFocused: a presented sub-drawer / queue sheet must not drop the wake
+  // lock or blank the board mid-tick.
+  const isSheetOpen = true;
+  const enhancementsReady = useDeferredUntilFrame(isSheetOpen);
+  // Measured viewport of the scroll container; drives first-screen sizing so the
+  // below-fold (Beta Videos) peek lands.
+  const composerCredentialScope = usePrivacyCredentialScope();
+  const {
+    sheetViewportHeight,
+    headerBottomY,
+    sectionHeaderMeasurement,
+    setSectionHeaderMeasurement,
+    handleViewportLayout,
+    handleHeaderLayout,
+  } = usePlayLayoutMeasurements();
+  // Seeded from the open target rather than left null: the effect that applies
+  // the target runs after the first commit, so a pane that already has its climb
+  // would otherwise paint one frame of the "Pick a climb" placeholder first.
+  const [drawerPreviewItem, setDrawerPreviewItem] = usePrivacyScopedState<ClimbQueueItem | null>(() =>
+    initialDrawerPreviewItem(openTarget),
+  );
+  const [drawerPreviewSuggestionSource, setDrawerPreviewSuggestionSource] =
+    usePrivacyScopedState<PlaylistSuggestionSource | null>(() =>
+      initialDrawerPreviewItem(openTarget) ? (openTarget?.options?.playlistSuggestionSource ?? null) : null,
+    );
+  // Only crew-captured tracks expire with the latch; explicit previews stay private.
+  // True when the preview is the live wall climb (accessory bar) — the displayed
+  // climb IS the one physically lit, which is what the "On the wall" pill states.
+  const [drawerPreviewIsWallClimb, setDrawerPreviewIsWallClimb] = useState(
+    () => !!initialDrawerPreviewItem(openTarget) && !!openTarget?.options?.previewIsWallClimb,
+  );
+  // The wall-state pill's explainer, and the header's measured bottom edge it
+  // hangs from. Owned here rather than inside the pill because the callout is an
+  // absolute sibling of the swipeable header (so it doesn't ride the swipe
+  // translate) — it can't be a child of the 32pt pill in the header's flank.
+  // The end card of the list the player is walking (#6664), open for this climb.
+  // Keyed on the climb, and cleared on every climb change, so it never reopens
+  // by itself on a climb the climber comes back to.
+  const [trackEndCardClimbUuid, setTrackEndCardClimbUuid] = useState<string | null>(null);
+  // A preview's mirror toggle, scoped to the climb it was made on. A bare
+  // boolean went stale whenever the current climb changed by a route the drawer
+  // doesn't own (a party peer advancing the queue, a reorder, the accessory
+  // bar) — the drawer only resets it in its own navigation handlers. `isMirrored`
+  // is derived below, so a climb this flip wasn't made on simply reads false.
+  const [previewMirrorFlip, setPreviewMirrorFlip] = useState<{ climbUuid: string; mirrored: boolean } | null>(null);
+  const [isTickBarActive, setIsTickBarActive] = useState(false);
+  const [activeSubDrawer, setActiveSubDrawer] = useState<ActiveSubDrawer>('none');
+  const [addBetaVideoOpen, setAddBetaVideoOpen] = useState(false);
+  // The climb whose full climber-logs list is open. Keyed on the uuid (like
+  // `previewMirrorFlip`) so moving to another climb closes the sheet without an effect.
+  const [climberLogsClimbUuid, setClimberLogsClimbUuid] = useState<string | null>(null);
+  // Composer targets stay pinned while the climber types. A credential change
+  // drops them and remounts the composers.
+  const [betaVideoTarget, setBetaVideoTarget] = usePrivacyScopedState<{
+    climb: Climb;
+    boardConfig: BoardConfig;
+  }>(null);
+  // Keep the same target for a tick opened from the menu or FAB.
+  const [tickTarget, setTickTarget] = usePrivacyScopedState<{
+    climb: Climb;
+    boardConfig: BoardConfig;
+    isMirror: boolean;
+  }>(null);
+  // Reports keep their target while the climber types the reason.
+  const [reportTarget, setReportTarget] = usePrivacyScopedState<{ climb: Climb; boardConfig: BoardConfig }>(null);
+  const [reportClimbOpen, setReportClimbOpen] = useState(false);
+  // The playlist picker stays on the climb ⋯ was opened for, like the report.
+  const [playlistTarget, setPlaylistTarget] = usePrivacyScopedState<{ climb: Climb; boardConfig: BoardConfig }>(null);
+  const [addToPlaylistOpen, setAddToPlaylistOpen] = useState(false);
+  const {
+    requested: belowFoldContentRequested,
+    request: requestBelowFoldContent,
+    requestFromScrollOffset: requestBelowFoldContentFromScrollOffset,
+  } = useBelowFoldContentRequest();
+  const resetZoomRef = useRef<(() => void) | null>(null);
+  // Set true when the user taps to expand the first section peek; the section's next
+  // layout then glides it fully into view. Stays armed across the section's
+  // loading→loaded height growth (so a slow fetch still lands framed) and is
+  // disarmed once the user drives the scroll, collapses it, or the climb changes.
+  const pendingFirstSectionScrollRef = useRef(false);
+
+  // RNGH ref for the scroll container. Board gestures coordinate their
+  // scroll blocking / simultaneous recognition through this ref (otherwise the plain RN ScrollView starved
+  // them after the gorhom removal), and the dismiss gesture reads scroll offset
+  // from it. Typed as the ScrollView instance for the `ref` prop; widened to
+  // RNGH's GestureRef shape (same object) when handed to the board gestures.
+  const scrollRef = useRef<ComponentRef<typeof ScrollView>>(null);
+  const scrollGestureRef = scrollRef as unknown as RefObject<ComponentType | undefined | null>;
+
+  // Live scroll offset, gating the pull-down-to-dismiss: it only engages at the
+  // top (<= 0) so mid-scroll downward drags still scroll. JS-thread set at 16ms
+  // is plenty for a top-detection gate.
+  const scrollYSV = useSharedValue(0);
+  const actionsVisibility = usePlayDrawerActionsVisibility();
+  const updateActionsScroll = actionsVisibility.onScroll;
+  const handleScroll = useCallback(
+    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const offsetY = event.nativeEvent.contentOffset.y;
+      scrollYSV.value = offsetY;
+      updateActionsScroll(offsetY);
+      // RN Web does not synthesize onScrollBeginDrag for a mouse wheel,
+      // trackpad, scrollbar, or keyboard scroll. Open the same deferred-content
+      // gate from real movement so the lower drawer sections cannot stay absent.
+      requestBelowFoldContentFromScrollOffset(offsetY);
+      if (offsetY > 0) pendingFirstSectionScrollRef.current = false;
+    },
+    [requestBelowFoldContentFromScrollOffset, scrollYSV, updateActionsScroll],
+  );
+  const handleDismiss = useCallback(() => {
+    // The pane is persistent — nothing to dismiss (and no modal to pop).
+    if (isPane) return;
+    if (onClose) onClose();
+    else router.dismiss();
+  }, [isPane, onClose]);
+
+  // Which climb is in the middle of a swipe, and the offset it rides. The board
+  // carousel and the header (title + grade) share it so they move as one; the
+  // carousel's gesture drives it on the UI thread. Created here, ahead of the
+  // queue lookups that name the neighbours, because the dismiss gesture below
+  // reads the offset. See use-swipe-pager.
+  const { pager: swipePager, stepSignal: swipeStepSignal } = useSwipePager();
+  // The sections' collapsed lines (the Logbook's "1 send · sent at 35°") fade
+  // with the outgoing header and stay hidden until the step that changed the
+  // climb has rendered, so they never describe the climb that left.
+  const staleSummaryStyle = useSwipeStaleContentStyle(swipePager);
+  const swipeTranslateX = swipePager.translateX;
+  const swipeIsAnimating = swipePager.isAnimating;
+
+  // The dismiss reads these so it can stand down while a horizontal swipe owns the
+  // gesture (offset non-zero) or a fling is still settling (carousel inert) — that's
+  // when an accidental downward drift would otherwise yank the drawer down.
+  const {
+    gesture: dismissGesture,
+    translateY: dismissTranslateY,
+    gestureRef: dismissGestureRef,
+  } = useDrawerDismissGesture({
+    onDismiss: handleDismiss,
+    swipeDismiss,
+    scrollYSV,
+    scrollRef: scrollGestureRef,
+    swipeTranslateX,
+    swipeIsAnimating,
+  });
+  const dismissAnimatedStyle = useAnimatedStyle(() => ({
+    transform: [{ translateY: dismissTranslateY.value }],
+  }));
+
+  const { queue, currentClimbQueueItem, currentClimbMover, historyCount } = useQueueData();
+  const {
+    setCurrentClimb,
+    playNext,
+    nextClimb,
+    previousClimb,
+    mirrorCurrentClimb,
+    getQueueSnapshot,
+    refreshPlaylistSuggestionSource,
+  } = useQueueActions();
+  const { sessionId } = useQueueSessionId();
+  // "Is anyone else here." Read as one boolean off a dedicated selector context
+  // so the ≤1/2s session-stats push and every presence delta cost the drawer
+  // nothing — it flips only across the solo ↔ crew boundary.
+  const isSharedSession = useIsSharedSession();
+  // The roster's answer, whatever the browse rollout flag says: solo, Put on
+  // board opens a keep-lighting window; in a crew it stays a one-off put unless
+  // "In a session too" is on, on every board. A crewmate's arrival dwell
+  // counts as solo until the crew forms; a live drive goes on when it forms.
+  const isCrewSession = useIsCrewSession();
+  const playlistSuggestionSource = usePlaylistSuggestionSource();
+  const bluetooth = useOptionalBluetoothContext();
+  // Always drive the wall (Settings › Board): this phone drives with no end
+  // whenever its link holds the board (`DriveModeWatcher`), so the wall
+  // control's press only drops a stop where it applies (`alwaysDriveHere`).
+  const [alwaysDrive] = useSetting('alwaysDrive');
+  // Driving the wall (#7113): while live, every change of climb lights the
+  // wall, in a crew too; outside a drive every change of climb is a preview.
+  // A press on the frosted button stops it and keeps the link; picks then
+  // stay previews until the link drops or the next Put on board, whatever
+  // Always drive the wall says (the setting never flips).
+  const driveModePhase = useDriveModePhase();
+  const drivingStopped = useDrivingStoppedForLink();
+  const drivingLive = driveModePhase === 'live';
+  // Put on board's timed drive (2.7, Stop driving after): a live drive with an
+  // end. It lights every change of climb like any live drive, and the wall
+  // button draws the same frost, plus a clock, shrinking as its time runs out.
+  const lightWindow = useDriveLightingMode() === 'window';
+  // Stop driving after (Settings › Board): read here so the wall control's
+  // press knows whether its climb going up starts a drive.
+  const [storedKeepLighting] = useSetting('putOnBoardKeepsLighting');
+  const [putOnBoardDrivesInSession] = useSetting('putOnBoardDrivesInSession');
+  const keepLighting = sanitiseKeepLighting(storedKeepLighting, DEFAULT_KEEP_LIGHTING);
+  const [enhancementSnapshot, setEnhancementSnapshot] = usePrivacyScopedState<PlayCoreEnhancementSnapshot>();
+  const handleEnhancementSnapshot = useCallback(
+    (snapshot: PlayCoreEnhancementSnapshot | null) => setEnhancementSnapshot(snapshot),
+    [setEnhancementSnapshot],
+  );
+  // App-wide grade resolver: swaps the header grade (label + colour) to the
+  // Boardsesh grade when the "Show Boardsesh grades" toggle is on and a trusted
+  // one exists, else the legacy Aurora grade. `boardseshActive` also seeds the
+  // tick picker's default grade below.
+  const { boardseshActive } = useDisplayGrade();
+  const { isAuthenticated } = useAuth();
+  // The anonymous reader (the web export's read-only climb view) gets the
+  // default sections, whatever this browser has stored. They have no ⋯ and no
+  // Settings, so a member's "Hide all" left on a shared computer would otherwise
+  // strand them with nothing below the board and no way back. The defaults need
+  // no read, so they are ready at once. Every other viewer, a guest without an
+  // account included, keeps their stored choices: they can reach both ⋯ → View
+  // options and Settings → Climb view, and those write exactly that store.
+  const preferredSections = isAnonymous ? DEFAULT_PLAY_DRAWER_SECTIONS : storedSectionsPreference.sections;
+  // Beside the landscape iPad panel, the column leaves Logbook and Beta to the
+  // panel's segments rather than drawing them twice; every other section stays.
+  const hasSidePanel = renderSidePanel != null;
+  const sections = useMemo(
+    () => (hasSidePanel ? withoutPanelSections(preferredSections) : preferredSections),
+    [hasSidePanel, preferredSections],
+  );
+  const sectionOrder = isAnonymous ? DEFAULT_PLAY_DRAWER_SECTION_ORDER : storedSectionsPreference.order;
+  const sectionsReady = isAnonymous || storedSectionsPreference.ready;
+  // The climber's buttons and where the controls sit (#6229), read synchronously
+  // so the first frame already has them. The anonymous reader gets today's bar
+  // under the board for the same reason as the sections: `resolveActionBarLayout`
+  // ignores the stored buttons for them, and the position is pinned here.
+  const playerButtons = usePlayerButtonsPreference();
+  const controlsPosition = isAnonymous ? DEFAULT_PLAYER_BUTTONS_POSITION : playerButtons.position;
+  // Tabletop (the iPhone Duo half open, its inner display upright): the first
+  // screen ends at the fold, so the board fills the top half and never sits on
+  // the crease. The controls move out of it to just below the fold, where a
+  // hand resting on the table reaches them, whatever the View options say:
+  // above the board they would sit above the crease and squeeze a half-height
+  // board. The sections follow. Only the full-screen route: the persistent pane
+  // lives in the landscape split.
+  const tabletopFoldTop = useTabletopFoldTop();
+  const tabletop = !isPane && tabletopFoldTop !== null;
+  const controlsAbove = controlsPosition === 'above' && !tabletop;
+  // The switch-board card's height, so the controls region can hold all of it
+  // (see `controlsRegion`). Starts from a typical card and follows the measured one.
+  const [switchBoardCardHeight, setSwitchBoardCardHeight] = useState(SWITCH_BOARD_CARD_HEIGHT_ESTIMATE);
+  const handleSwitchBoardCardHeight = useCallback((height: number) => {
+    const measured = Math.ceil(height);
+    setSwitchBoardCardHeight((previous) => (Math.abs(previous - measured) > 1 ? measured : previous));
+  }, []);
+
+  const displayedQueueItem = drawerPreviewItem ?? currentClimbQueueItem;
+  const displayedClimb = displayedQueueItem?.climb;
+  // The slot ⋯ → Play next moves when the same climb is queued twice.
+  const displayedQueueItemUuid = displayedQueueItem?.uuid;
+  const displayedQueueSlotUuid = useMemo(
+    () => resolveQueuedSlotUuid(queue, displayedQueueItemUuid),
+    [queue, displayedQueueItemUuid],
+  );
+  // Where the climb sits in the workout generated at Start (#5379). Null for a
+  // session without one, a crew member's phone, and a climb outside the workout.
+  const workoutRun = useWorkoutRun(sessionId);
+  const workoutQueueUuids = useWorkoutQueueUuids(workoutRun, queue);
+  const workoutStageParts = useWorkoutStageParts(workoutRun, workoutQueueUuids, displayedQueueItemUuid);
+  // A view-only preview is showing (not the active/wall climb). Commit paths
+  // never set `drawerPreviewItem`, so this is true only for genuine previews
+  // (workout builder, logbook/cross-board, the peer-driven accessory wall climb).
+  const isPreview = drawerPreviewItem != null;
+  // The MiniPlayer beside this player stands in for its first row (#7000,
+  // the tablet rule): the open Duo's pane, or a tablet's player route. Then the
+  // first row is the full-width wall button, and the bar mirrors the rest.
+  const miniPlayerMirrors = useMiniPlayerMirrorsPlayer(isPane);
+  const wallControlOwnerRef = useRef(Symbol('player-wall-control'));
+
+  // #5099: the shown climb does not have to belong to the board the climber has
+  // selected. A queue item left over from a board switch, a party peer on
+  // another wall, or a restored launch snapshot all keep their own
+  // `boardType`/`layoutId` — and drawing them against the active board's
+  // placements matches none of their hold ids, so the renderer drops every hold
+  // and paints a veil over bare board art. Draw each climb on ITS board instead,
+  // at its own angle, and let the mismatch raise the switch-board gate below.
+  const renderBoardResolution = useMemo(
+    () => resolveClimbRenderBoard(displayedClimb, boardConfig),
+    [displayedClimb, boardConfig],
+  );
+  const renderBoardConfig = renderBoardResolution?.boardConfig ?? boardConfig;
+
+  const drawerGradeSectionEnabled = useBoardseshGradeEnabled();
+  // Swipe the wall button to drive (#7113): the gesture, the screen-reader
+  // action and the board sheet's row, all behind one positive flag.
+  const swipeToDriveEnabled = useWallSwipeToDriveEnabled();
+  const visibleSectionIds = useMemo(
+    () =>
+      visiblePlayDrawerSections({
+        sections,
+        order: sectionOrder,
+        isAuthenticated,
+        boardseshGradeEnabled: drawerGradeSectionEnabled,
+        description: displayedClimb?.description,
+        boardName: renderBoardConfig.boardName as BoardName,
+      }),
+    [
+      sections,
+      sectionOrder,
+      isAuthenticated,
+      drawerGradeSectionEnabled,
+      displayedClimb?.description,
+      renderBoardConfig.boardName,
+    ],
+  );
+  const firstSectionId = visibleSectionIds[0];
+  const hasVisibleSections = sectionsReady && visibleSectionIds.length > 0;
+  // In tabletop the sections start inside the viewport, under the controls,
+  // rather than one header peek below the fold, so their bodies load at once.
+  useEffect(() => {
+    if (tabletop && hasVisibleSections) requestBelowFoldContent();
+  }, [tabletop, hasVisibleSections, requestBelowFoldContent]);
+  const handleDeliberateScrollIntent = useCallback(() => {
+    if (hasVisibleSections) requestBelowFoldContent();
+  }, [hasVisibleSections, requestBelowFoldContent]);
+  const handleScrollTowardBelowFold = useCallback(() => {
+    pendingFirstSectionScrollRef.current = false;
+    handleDeliberateScrollIntent();
+  }, [handleDeliberateScrollIntent]);
+  const deliberateScrollGesture = useDeliberateScrollGesture({
+    scrollRef: scrollGestureRef,
+    scrollYSV,
+    isPane,
+    onScrollIntent: handleDeliberateScrollIntent,
+  });
+  const contentGesture = useMemo(
+    () =>
+      Platform.OS === 'web'
+        ? dismissGesture.enabled(!isPane)
+        : Gesture.Simultaneous(dismissGesture.enabled(!isPane), deliberateScrollGesture),
+    [dismissGesture, deliberateScrollGesture, isPane],
+  );
+  // An expanded header with a deferred body may fill the viewport exactly.
+  // One pixel lets the native recognizer or browser input start scrolling and
+  // request the body without waiting for another gesture to release the touch.
+  const initialScrollHeight =
+    hasVisibleSections && !belowFoldContentRequested ? (sheetViewportHeight || windowHeight) + 1 : undefined;
+  const visibleSectionsKey = sectionsReady ? visibleSectionIds.join(',') : 'loading';
+  const firstSectionHeaderHeight =
+    sectionHeaderMeasurement.sectionId === firstSectionId ? sectionHeaderMeasurement.height : 0;
+  const handleFirstSectionHeaderLayout = useCallback(
+    (measured: number) => {
+      setSectionHeaderMeasurement((previous) =>
+        previous.sectionId === firstSectionId && Math.abs(previous.height - measured) <= 2
+          ? previous
+          : { sectionId: firstSectionId, height: Math.round(measured) },
+      );
+    },
+    [firstSectionId],
+  );
+  useEffect(() => {
+    pendingFirstSectionScrollRef.current = false;
+    scrollYSV.value = 0;
+    scrollRef.current?.scrollTo({ y: 0, animated: false });
+  }, [visibleSectionsKey, scrollYSV]);
+
+  const displayedClimbUuid = displayedClimb?.uuid;
+  // Only previews have a local flip; committed occurrences persist their own.
+  const sharesMirrorState = sessionId !== null && !isPreview;
+  const isMirrored =
+    isPreview && previewMirrorFlip !== null && previewMirrorFlip.climbUuid === displayedClimbUuid
+      ? previewMirrorFlip.mirrored
+      : displayedClimb?.mirrored === true;
+  const clearMirror = useCallback(() => setPreviewMirrorFlip(null), []);
+  // The MiniPlayer reopening the climber's last pick puts its mirror flip back.
+  const restoreMirror = useCallback(
+    (climbUuid: string, mirrored: boolean) => setPreviewMirrorFlip({ climbUuid, mirrored }),
+    [],
+  );
+
+  // A climb that lost a hold: the banner's count and its one action, Remix.
+  const { lostHoldCount, onRemix: handleRemixLostHolds } = useLostHoldRemix({
+    displayedClimb,
+    renderBoardConfig,
+    dismissPlayerAndWait,
+  });
+
+  const pushAfterSetterDismiss = usePushAfterPlayerDismiss(dismissPlayerAndWait, 'setter-playlist-handoff');
+  const openSetterPlaylist = useCallback(() => {
+    const username = displayedClimb?.setter_username;
+    if (!username) return;
+    pushAfterSetterDismiss(() => router.push({ pathname: '/(tabs)/climbs/setter/[username]', params: { username } }));
+  }, [displayedClimb?.setter_username, pushAfterSetterDismiss]);
+  // The climb belongs to a genuinely DIFFERENT board model. Same gate as an
+  // explicit board override (`boardMismatch` from the host), just discovered
+  // from the climb rather than handed in by the opener.
+  //
+  // Only `'incompatible'` raises it — never `'upsized'`, which is the same board
+  // name and layout on a bigger wall (and a MoonBoard climb wanting a set this
+  // wall hasn't got). There is no other board to switch TO in that case: the
+  // host matches owned boards by name + layout, so the scrim's one button would
+  // "switch" to the board the climber is already on and never clear. Playlist
+  // rows already draw those on the upsized board without a prompt; so do we.
+  const climbBoardMismatch = renderBoardResolution?.fit === 'incompatible';
+  // ...but on another board at the gym the climber is standing in, which is a
+  // walk rather than a wall. Queue navigation already treats those as targets
+  // rather than skipping them, so a swipe lands here routinely now — and meeting
+  // a lock scrim that says "switch boards to queue it" for a climb they queued on
+  // purpose, twenty metres from the board that draws it, is the wrong answer.
+  // The same predicate the queue provider navigates by. Without it here, the
+  // drawer's peek, "N left" and canNext are computed from a DIFFERENT rule than
+  // the swipe they describe — and with a reachable climb as the only thing left,
+  // canNext goes false and the swipe is disabled, so the climb this feature
+  // exists to reach cannot be reached forward at all.
+  const isReachableClimb = useMemo(() => {
+    if (!reachableBoardKeys || reachableBoardKeys.size === 0) return undefined;
+    return (climb: { boardType?: string | null; layoutId?: number | null }) =>
+      isClimbOnReachableBoard(climb, reachableBoardKeys);
+  }, [reachableBoardKeys]);
+
+  const climbBoardReachable =
+    climbBoardMismatch &&
+    reachableBoardKeys != null &&
+    reachableBoardKeys.has(configKey({ boardName: renderBoardConfig.boardName, layoutId: renderBoardConfig.layoutId }));
+  // Only the genuinely-elsewhere case blocks. Everything gated on this — the
+  // a11y trap, the preview relay, the auto-activate — keeps its old meaning,
+  // because a reachable climb is one the controls underneath can still act on.
+  const showBoardMismatch = (boardMismatch || climbBoardMismatch) && !climbBoardReachable;
+  const switchBoardLabel = climbBoardMismatch ? formatRenderBoardLabel(renderBoardConfig) : mismatchBoardLabel;
+  // The host resolves an explicit override on its own; when the mismatch came
+  // from the climb there is no override to read, so hand it the board we
+  // resolved so "Switch board" lands on the CLIMB's board.
+  const handleSwitchBoard = useCallback(() => {
+    onSwitchBoard?.(climbBoardMismatch ? renderBoardConfig : undefined);
+  }, [onSwitchBoard, climbBoardMismatch, renderBoardConfig]);
+
+  // Everything the DISPLAYED climb is drawn from reads the resolved board. The
+  // selected board's own angle stays behind `activeAngle`: the angle pill and
+  // the angle sheet drive the wall the climber is standing at, not the picture.
+  const { boardName, layoutId, sizeId, setIds, angle } = renderBoardConfig;
+  const activeAngle = boardConfig.angle;
+  // Always drive the wall drives on this board and in this session (the read
+  // `DriveModeWatcher` starts its drive on): Put on board then only drops a
+  // stop, and the copy promises driving until the climber stops.
+  const alwaysDriveHere = alwaysDriveApplies({
+    alwaysDrive,
+    swipeToDriveEnabled,
+    drivesInSession: putOnBoardDrivesInSession,
+    inSession: isCrewSession,
+  });
+
+  // The play route hosts its OWN BLE controls sheet (below) rather than the
+  // app-root one — a native sheet presented from root lands BEHIND this modal
+  // route. Local visibility, opened by the lightbulb long-press.
+  const [bleControlVisible, setBleControlVisible] = useState(false);
+  const handleCloseBleControl = useCallback(() => setBleControlVisible(false), []);
+
+  usePlayDrawerWakeLock(isSheetOpen);
+
+  // The drawer's first render always beats the wall: `DrawerHostProvider` asks
+  // for it from an effect. Without a registry subscription this memo would hold
+  // the `null` it computed then, and the play surface — the one place a wall is
+  // actually climbed on — would sit on `BoardRenderUnavailable` until the
+  // climber switched board and back.
+  const sprayToken = useSprayWallToken(boardName, layoutId);
+  const boardRenderData = useMemo(() => {
+    const parsedSetIds = setIds.split(',').map(Number);
+    return getBoardRenderData({
+      boardName: boardName as BoardName,
+      layoutId,
+      sizeId,
+      setIds: parsedSetIds,
+    });
+    // `sprayToken` recomputes this when the wall lands or is reset.
+  }, [boardName, layoutId, sizeId, setIds, sprayToken]);
+
+  // Real favorite status for the heart, keyed on (boardName, climbUuid, angle).
+  // Gated on the sheet being open so it doesn't fetch while the drawer is closed.
+  // The displayed state is the local optimistic override when set, otherwise the
+  // server's truth — so the heart reflects whether the climb is already a favorite
+  // on open, and a single tap can't invert reality (the previous always-false
+  // local state silently un-favorited already-favorited climbs).
+  // `favorites` is `requireAuthenticated` on the backend, and the heart is hidden
+  // anonymously anyway — arming it would fire a query that can only 401 on every
+  // read-only open. The hook re-checks the session itself; this is the local half.
+  const { showToast } = useToast();
+  const matchingEnhancement =
+    enhancementSnapshot?.targetKey ===
+      getPlayCoreEnhancementTargetKey(boardName, displayedClimb?.uuid ?? null, angle) &&
+    enhancementSnapshot.credentialGeneration === composerCredentialScope
+      ? enhancementSnapshot
+      : null;
+  const serverFavorited = matchingEnhancement?.serverFavorited;
+  const toggleFavoriteMutate = matchingEnhancement?.toggleFavoriteMutate;
+
+  // Lit visual, pending pulse, and the connect/disconnect tap — shared with the
+  // toolbar bulb via `useLightbulbControl`, so both light identically (this
+  // device, or a session peer driving the wall) and run one connect path. The
+  // press action also accounts for a session peer holding the wall; the label
+  // follows that action rather than the local BLE connection alone.
+  //
+  // While a session peer holds the board, the tap RELAYS instead: an Aurora /
+  // MoonBoard box takes one central at a time, so a connect from here could only
+  // spend 15s scanning and then claim "Connection failed" over a wall that is
+  // lit and working. Making the displayed climb the session's current
+  // climb lights it on the holder's link — the same path a queue add already
+  // rides — with no BLE from this device.
+  //
+  // The relay itself is `commitDisplayedToWall`, declared far below because it
+  // needs the latch announcer. The bulb is handed a STABLE wrapper over a ref so
+  // the hook's press callback doesn't re-create on every preview change.
+  const relayToHolderRef = useRef<(() => void) | null>(null);
+  const handleRelayToHolder = useCallback(() => relayToHolderRef.current?.(), []);
+  // Only a PINNED PREVIEW is relayable. With none, the displayed climb is
+  // already the queue's current one, so there is nothing to put up and the tap
+  // resolves to 'noop' — reported honestly rather than claiming a 'relay' that
+  // could only early-return. `showBoardMismatch` is excluded for the same reason the
+  // commit bar excludes it (resolveCommitBarModel): committing a climb from a
+  // board the climber isn't on must not reach the wall. That was previously safe
+  // only because the SwitchBoardOverlay scrim happens to cover the bulb.
+  const canRelayToHolder = isPreview && !showBoardMismatch;
+  const {
+    lit: lightbulbActive,
+    localConnected: radioConnected,
+    pending: lightbulbPending,
+    onPress: handleLightbulb,
+    connect: connectRadio,
+    moveToClimbBoard: moveLightbulbToClimbBoard,
+    pressAction: bulbPressAction,
+    holderIsAuthoritative: lightbulbHolderIsAuthoritative,
+    wallHeldLocally,
+    ledless: boardIsLedless,
+  } = useLightbulbControl({
+    surface: 'play_drawer',
+    onRelayToHolder: handleRelayToHolder,
+    canRelay: canRelayToHolder,
+  });
+  const { data: activeBoardForNavigation } = useActiveBoard();
+  // A spray wall with its LED setup on for this phone. Only the wall the
+  // provider drives counts: the LAN sender lights that wall and no other, so a
+  // climb from another board or wall never borrows it.
+  const sprayLedsEnabled = useSprayWallLedsEnabled(boardName, layoutId);
+  const sprayLedWall = sprayLedsEnabled && bluetooth?.boardName === boardName && bluetooth.layoutId === layoutId;
+  const {
+    pressAction: lightbulbPressAction,
+    phoneLinked,
+    sprayLedHold,
+  } = resolvePlayerWallLink({
+    sprayLedWall,
+    pressAction: bulbPressAction,
+    radioConnected,
+    wallHeldLocally,
+    holderIsAuthoritative: lightbulbHolderIsAuthoritative,
+    canRelay: canRelayToHolder,
+  });
+  // A spray wall's connect is taking the wall: no radio and no picker, and the
+  // auto-sender's first send on the hold lights the climb.
+  const connectLightbulb = useCallback<LightbulbControl['connect']>(
+    (surface, climb) => {
+      if (!sprayLedWall) return connectRadio(surface, climb);
+      if (lightbulbPressAction !== 'connect') return Promise.resolve(false);
+      bluetooth?.takeVirtualWall();
+      return Promise.resolve(bluetooth !== null);
+    },
+    [sprayLedWall, connectRadio, lightbulbPressAction, bluetooth],
+  );
+  // Something on the wall lights up: an LED kit, or a wall device that follows
+  // the board feed (`boardHasLights`). A wall-device board keeps the wall button
+  // and the lit state even though its bulb takes the wall instead of connecting.
+  // `ledless` above is the bulb's `drivesWithoutBluetooth` (no light kit, or a
+  // wall device), so a board it marks has lights only through its wall device,
+  // or on a spray wall through this phone's LED setup, which counts the same.
+  // The type is the rendered climb's board, as before; the wall device counts
+  // only while that is the active board's type, so a climb rendered on another
+  // board never borrows this one's device.
+  const playerBoardLighting = useMemo(
+    () => ({
+      boardType: boardName,
+      hasLeds: !boardIsLedless,
+      litByWallDevice:
+        sprayLedWall ||
+        (activeBoardForNavigation?.boardType === boardName && litByWallDevice(activeBoardForNavigation)),
+    }),
+    [boardName, boardIsLedless, activeBoardForNavigation, sprayLedWall],
+  );
+  const playerBoardHasLights = boardHasLights(playerBoardLighting);
+  // The board at this gym that draws the climb on screen, when it isn't the
+  // active one (#7076): what Put on {board} names and moves to. The same lookup
+  // the connect and the drawer host's switch use, so all three name one board.
+  const { data: playerGymBoards } = useGymBoards(activeBoardForNavigation?.gymUuid ?? null);
+  const climbGymBoard = useMemo(
+    () =>
+      climbBoardReachable && !showBoardMismatch
+        ? findGymBoardToConnectForClimb(
+            { boardType: renderBoardConfig.boardName, layoutId: renderBoardConfig.layoutId },
+            activeBoardForNavigation,
+            playerGymBoards,
+          )
+        : null,
+    [
+      climbBoardReachable,
+      showBoardMismatch,
+      renderBoardConfig.boardName,
+      renderBoardConfig.layoutId,
+      activeBoardForNavigation,
+      playerGymBoards,
+    ],
+  );
+  const climbGymBoardName = climbGymBoard ? gymBoardButtonName(climbGymBoard, playerGymBoards) : null;
+  const presenceBinding = useContext(BoardPresenceClientContext);
+  const wallControlTarget = showBoardMismatch
+    ? null
+    : climbGymBoard
+      ? climbGymBoard
+      : activeBoardForNavigation &&
+          boardLooselyMatches(
+            { boardName: activeBoardForNavigation.boardType, layoutId: activeBoardForNavigation.layoutId },
+            { boardName, layoutId },
+          )
+        ? activeBoardForNavigation
+        : null;
+  const wallControlBoardId = resolveLetsGoTargetBoardId(
+    wallControlTarget,
+    presenceBinding?.client ? presenceBinding : null,
+  );
+  // Moving the session names the intended wall before the picker connects.
+  // Only a live member holding that target makes it the crew's board; otherwise
+  // Put on {board} must still let this phone move there and connect (#7181).
+  const sessionBoardPath = useSessionBoardPath();
+  const { sessionMemberUserIds } = useQueueSessionControls();
+  const crewGymBoardTarget =
+    isSharedSession && climbGymBoard !== null && sessionBoardPathNamesBoard(sessionBoardPath, climbGymBoard)
+      ? climbGymBoard
+      : null;
+  const climbOnCrewGymBoard = useCrewGymBoardHeld(crewGymBoardTarget, sessionMemberUserIds);
+  const activeBoardForLoggingRef = useRef(activeBoardForNavigation);
+  activeBoardForLoggingRef.current = activeBoardForNavigation;
+  // View options lists the MoonBoard-only Active holds switch on a MoonBoard
+  // climb even when the active board is another (a reachable gym board), so
+  // the climber can always turn off a section they can see.
+  const sectionsListActiveHolds = isMoonboardBoardName(boardName) || activeBoardIsMoonboard(activeBoardForNavigation);
+  const {
+    navigationSuggestionSource,
+    navigationState,
+    nextPreviewSource,
+    previousPreviewSource,
+    currentTrackLabel,
+    trackListClimbUuid,
+    trackEndCard,
+    listWalkUpNextCount,
+    signposts,
+    nextHeaderClimb,
+    previousHeaderClimb,
+    nextHeaderBoard,
+    previousHeaderBoard,
+    nextPeekFrames,
+    prevPeekFrames,
+    upcomingPrefetchFrames,
+  } = usePlayNavigationModel({
+    queue,
+    displayedQueueItem,
+    displayedClimb,
+    drawerPreviewItem,
+    drawerPreviewSuggestionSource,
+    currentClimbQueueItem,
+    historyCount,
+    playlistSuggestionSource,
+    activeBoardForNavigation,
+    boardConfig,
+    renderBoardConfig,
+    isReachableClimb,
+    enhancementsReady,
+  });
+
+  // The top bar says where the player is: the workout stage (#5379) or the list
+  // it walks (#6664), "Projects · 4 of 23". Not the header's stats line, where
+  // either pushed the sends and stars off the end (#6745). A climb outside the
+  // workout has no stage, so a list tapped mid-workout still names itself; a
+  // climb in both says its stage, the frame the climber planned around.
+  const trackLocale = i18n.language;
+  const currentTrackParts = useMemo(
+    () => formatTrackLabelParts(currentTrackLabel, t, trackLocale),
+    [currentTrackLabel, t, trackLocale],
+  );
+  const topBarParts = workoutStageParts ?? currentTrackParts;
+  // The then-signposts: "then Projects" rides `currentTrackParts`; these are
+  // the second line's words, the board's spoken extras and the crossing cue.
+  // A workout's stage label keeps the top bar, so a workout shows none of them.
+  const thenSignposts = useThenSignposts({
+    enabled: !isAnonymous && workoutStageParts === null,
+    isPreview,
+    previewSource: drawerPreviewSuggestionSource,
+    trackLabel: currentTrackLabel,
+    trackParts: currentTrackParts,
+    signposts,
+    displayedClimbUuid: displayedClimb?.uuid ?? null,
+    nextClimbUuid: navigationState.nextItem?.climb?.uuid ?? null,
+    previousClimbUuid: navigationState.prevItem?.climb?.uuid ?? null,
+    t,
+    locale: trackLocale,
+  });
+  const { onStep: noteSignpostStep, resetForOpen: resetSignpostsForOpen, board: boardSignposts } = thenSignposts;
+  // The list label sits between ⌄ and the timer + ⋯ cluster, so it needs the
+  // cluster's width, which grows when the rest timer comes up. Null until the
+  // cluster has laid out (see `resolveTopListContextFrame`).
+  const [topTrailingContentWidth, setTopTrailingContentWidth] = useState<number | null>(null);
+  const handleTopTrailingLayout = useCallback((event: LayoutChangeEvent) => {
+    const measured = Math.ceil(event.nativeEvent.layout.width);
+    setTopTrailingContentWidth((previous) => (previous === measured ? previous : measured));
+  }, []);
+  const topListContextFrame = resolveTopListContextFrame({
+    isPane,
+    chromeButtonSize,
+    trailingContentWidth: topTrailingContentWidth,
+    hasMenu: !isAnonymous,
+    gap: spacing[2],
+  });
+  // More of a long list arrives as the climber nears the end of what is loaded.
+  const getCommittedSuggestionSource = useCallback(
+    () => getQueueSnapshot().playlistSuggestionSource,
+    [getQueueSnapshot],
+  );
+  useTrackPaging({
+    source: navigationSuggestionSource,
+    listClimbUuid: trackListClimbUuid,
+    previewTrack: drawerPreviewItem != null,
+    setPreviewSource: setDrawerPreviewSuggestionSource,
+    getCommittedSource: getCommittedSuggestionSource,
+    refreshCommittedSource: refreshPlaylistSuggestionSource,
+  });
+
+  // The page each of the three climbs is on. Keyed on the CLIMB, which a
+  // suggestion keeps when a swipe turns it into a queue item, so the board that
+  // was the neighbour is recognised as the current one and is not remounted.
+  // Whether a neighbour EXISTS is `canNext` / `canPrevious`, the same answer the
+  // Next and Previous buttons use: a queue item a crew member added that has
+  // not been resolved to a climb yet is still somewhere to swipe to.
+  const swipeCenterPage = useSwipePages(
+    swipePager,
+    swipeStepSignal,
+    navigationState.canPrevious ? swipePageId(navigationState.prevItem) : null,
+    swipePageId(displayedQueueItem),
+    navigationState.canNext ? swipePageId(navigationState.nextItem) : null,
+  );
+
+  // Multi-frame route playback (animation + BLE + party-sync). Boulders
+  // short-circuit inside the hook (isAnimatable === false), so nothing renders
+  // and the drawer behaves exactly as before for single-frame climbs.
+  const playback = useMobilePlayback({
+    climb: displayedClimb ?? null,
+    boardName: boardName as BoardName,
+    mirrored: isMirrored,
+    isOpen: isSheetOpen,
+    // A pinned preview is not what the wall is showing, so scrubbing a route
+    // preview animates on screen and nowhere else: no BLE frame writes, no
+    // playback broadcast to the crew. The LIVE climb keeps its frames and
+    // resumes writing when the preview clears.
+    viewOnly: isPreview,
+    // A climb from another board is suppressed for a harder reason: its hold ids
+    // address a different wall, so writing them lights the WRONG holds on the
+    // connected board. The scrim hides the play controls, but a party peer's
+    // playback event starts the engine with no local tap, so the guard belongs
+    // here rather than on the button (#5099). Frames only — the crew still
+    // hears the playback, it is this wall that cannot show it.
+    suppressWallWrites: climbBoardMismatch,
+  });
+
+  // Auto-close the tick bar when the climb changes.
+  useEffect(() => {
+    setIsTickBarActive(false);
+    // Drop the local flip on EVERY climb change, not just the drawer's own
+    // navigation handlers. A climb change it doesn't own (a party peer, Live
+    // Activity, the accessory bar) would otherwise leave the flip parked on its
+    // old climb, and coming back to that climb would resurrect it — remembering
+    // a flip that swiping away forgets.
+    setPreviewMirrorFlip(null);
+    // A new climb's Logbook re-lays out from scratch — don't let a stale expand
+    // intent auto-scroll it.
+    pendingFirstSectionScrollRef.current = false;
+    // The end card was about the climb that was on screen.
+    setTrackEndCardClimbUuid(null);
+  }, [displayedClimbUuid]);
+
+  // --- The shared-session browse latch ---------------------------------------
+  //
+  // In a crew, every browse-shaped gesture stays view-only: a swipe, a climb-list
+  // tap and a similar-climb tap all show you a climb without writing the shared
+  // queue or moving anyone's wall. Putting a climb up becomes the one explicit
+  // act, on the commit row.
+  //
+  // The latch has its own state rather than being read live off
+  // `isSharedSession` because mid-browse the roster can change under you — a peer
+  // drops off the wifi, someone leaves — and a live gate would turn the very next
+  // swipe back into a wall-driving commit while the climber's hand was already
+  // moving. So entering a browse in a crew ARMS it, and the climber's own exits
+  // disarm it (Back to live, a commit, or opening a committed climb). The arming
+  // effect is deliberately broader than "the first view-only gesture": a crew
+  // forming while a preview is already pinned latches too, so the climber who was
+  // mid-browse when a second phone joined gets the safe posture without
+  // re-entering the preview.
+  //
+  // It is NOT one-way, though it was, and that was a bug rather than a strict
+  // reading of the rule above. A latch that only the climber can clear assumes
+  // they know it is there; the climber who never opened the commit row just found
+  // that their swipes had quietly stopped lighting the board, with the crew that
+  // caused it long gone. So the latch survives a peer flapping and then releases:
+  // once the session has genuinely been solo for a dwell, ordinary wall control
+  // comes back on its own. The exits still fire instantly — this only covers the
+  // case where nobody ever took one.
+  const [sharedBrowseLatched, setSharedBrowseLatched] = useSharedBrowseLatch(isSharedSession, isPreview);
+  // What the gestures and the chrome both read. Live crew OR a latch that armed
+  // while there was one.
+  const browseByDefault = isSharedSession || sharedBrowseLatched;
+
+  // --- Wall state (header back chip + the wall button) -----------------------
+  //
+  // Everything keys on DISPLAYED-EQUALS-WALL, never on who holds Bluetooth.
+  //
+  // The lit climb is read from board presence continuously, so the pill can say
+  // "On the wall" after a plain swipe lands back on it and the busy-wall confirm
+  // has something to compare against. `drawerPreviewIsWallClimb` stays as the
+  // fallback rather than being retired with it: the accessory-bar preview knows
+  // it is the lit climb by construction, and it is still right when this drawer
+  // renders outside the board-presence provider's subtree (where the read
+  // degrades to a dark wall instead of throwing).
+  const wallClimb = useWallClimb();
+  const wallClimbUuid = wallClimb.uuid ?? (isPreview && drawerPreviewIsWallClimb ? (displayedClimbUuid ?? null) : null);
+  // Board presence's wall climb is trusted with a live link, or for an hour
+  // after it was lit without one (QA #147): Aurora and MoonBoard boxes keep
+  // their LEDs after a disconnect. One rule for the board control, the lit
+  // read and the back chip (`presence-freshness.ts`).
+  const wallPresenceFresh = usePresenceFresh(wallClimb.sentAt);
+  const wallPresenceTrusted = isWallPresenceTrusted({
+    // A live link: this phone's, or a crewmate's (the same read the Climbs header's capsule takes).
+    linked: lightbulbActive,
+    presenceFresh: wallPresenceFresh,
+  });
+  // Being in a preview is NOT enough to claim browsing: while driving, the next
+  // swipe falls straight through to `setCurrentClimb` — it writes the shared
+  // queue and re-arms the BLE auto-sender. So the latch is "a preview whose
+  // navigation genuinely stays view-only", read off the same predicate the
+  // swipe handlers use, which is what stops the chrome from ever promising
+  // more than the gesture keeps.
+  //
+  // Driving the wall (#7113) ignores the crew and the latch: a swipe commits,
+  // so no browse chrome claims otherwise. A climb from another board stays a
+  // preview: the wall this phone drives can't light it. The latch itself is
+  // kept, so it is back once driving ends if a crew is still here.
+  const previewOnOtherBoard = isPreview && (boardMismatch || climbBoardMismatch);
+  const browseLatchActive =
+    isPreview &&
+    swipeStaysViewOnly({
+      previewItem: drawerPreviewItem,
+      previewSuggestionSource: drawerPreviewSuggestionSource,
+      driving: drivingLive,
+      previewOnOtherBoard,
+    });
+  // Whether a swipe from a NON-preview state would drive the wall — the pill's
+  // `live` claim. Derived from the same predicate rather than restated, so
+  // nobody outside a drive is told their next swipe goes up on the wall.
+  const navigationCommits = !swipeStaysViewOnly({
+    previewItem: null,
+    previewSuggestionSource: null,
+    driving: drivingLive,
+  });
+  // --- Busy-wall confirm -----------------------------------------------------
+  //
+  // Someone else lit a climb while you were browsing. Taking the wall silently
+  // would blank a climb another climber may be mid-attempt on, so the first
+  // "Put on the wall" tap asks instead of committing.
+  //
+  // What it compares against is the wall AS IT WAS when browsing began, which is
+  // why the snapshot is taken on the latch's rising edge and read from a ref:
+  // depending on `wallClimbUuid` here would re-snapshot on every wall event and
+  // the question could never arise.
+  const wallClimbUuidRef = useRef(wallClimbUuid);
+  wallClimbUuidRef.current = wallClimbUuid;
+  const wallUuidAtLatchStartRef = useRef<string | null>(null);
+  const latchStartedAtRef = useRef<number | null>(null);
+  // The MiniPlayer reopening the last pick hands over the wall as it was when
+  // the climber started looking (`previewLatchStart`): the latch starts from
+  // THAT wall, so a crewmate who lit something while the player was closed is
+  // still asked about. Only for the preview it came with.
+  const latchSeedRef = useRef<{ itemUuid: string; start: PickLatchStart } | null>(null);
+  const previewItemUuidRef = useRef(drawerPreviewItem?.uuid ?? null);
+  previewItemUuidRef.current = drawerPreviewItem?.uuid ?? null;
+  const browseLatchActiveRef = useRef(browseLatchActive);
+  browseLatchActiveRef.current = browseLatchActive;
+  useEffect(() => {
+    if (!browseLatchActive) return;
+    const seed = latchSeedRef.current;
+    latchSeedRef.current = null;
+    if (seed && seed.itemUuid === previewItemUuidRef.current) {
+      wallUuidAtLatchStartRef.current = seed.start.wallClimbUuid;
+      latchStartedAtRef.current = seed.start.at;
+      return;
+    }
+    wallUuidAtLatchStartRef.current = wallClimbUuidRef.current;
+    latchStartedAtRef.current = Date.now();
+  }, [browseLatchActive]);
+  // A wall read that lands AFTER the snapshot was taken. At a cold start the
+  // presence feed may still be connecting when browsing begins, so the snapshot
+  // reads `null` — which is what a dark wall reads like too. When the climb that
+  // then arrives was lit well before this browse started, it IS the snapshot, and
+  // recording it as such is what stops the first commit tap from announcing
+  // "Someone just lit X" about a climb nobody touched. Ambiguous reads change
+  // nothing and leave the confirm free to arm.
+  const wallClimbSentAt = wallClimb.sentAt;
+  useEffect(() => {
+    if (!browseLatchActive) return;
+    if (
+      shouldAdoptLateWallRead({
+        wallUuidAtLatchStart: wallUuidAtLatchStartRef.current,
+        wallClimbUuid,
+        wallClimbSentAt,
+        latchStartedAt: latchStartedAtRef.current,
+      })
+    ) {
+      wallUuidAtLatchStartRef.current = wallClimbUuid;
+    }
+  }, [browseLatchActive, wallClimbUuid, wallClimbSentAt]);
+  const [busyWallConfirmArmed, setBusyWallConfirmArmed] = useState(false);
+  // Browsing on is one of the three ways the confirm stands down: the question
+  // was "put THIS up instead of theirs", and this is no longer what's on screen.
+  // Keyed on the displayed climb rather than repeated in each of the prev /
+  // next / similar / list-tap handlers, so a navigation path added later can't
+  // forget it.
+  useEffect(() => {
+    setBusyWallConfirmArmed(false);
+  }, [displayedClimbUuid]);
+  // Amendment B: NO auto-timeout. A question about someone else's climb doesn't
+  // get to expire on a timer while the climber is looking at the wall to decide.
+  // It stands down on exactly three things: "Keep theirs" (below), any further
+  // browse navigation (the displayed-climb effect above — the question was about
+  // a climb that is no longer on screen), and the conflict resolving itself,
+  // which is this effect: the wall going dark, coming back to what it showed
+  // when browsing started, or landing on the very climb about to be committed
+  // all leave nothing to ask.
+  useEffect(() => {
+    if (!busyWallConfirmArmed) return;
+    const stillBusy = shouldArmBusyWallConfirm({
+      wallClimbUuid,
+      wallUuidAtLatchStart: wallUuidAtLatchStartRef.current,
+      displayedClimbUuid: displayedClimbUuid ?? null,
+    });
+    if (!stillBusy) setBusyWallConfirmArmed(false);
+  }, [busyWallConfirmArmed, wallClimbUuid, displayedClimbUuid]);
+
+  const commitBarModel = resolveCommitBarModel({
+    // Wider than the latch on purpose: a preview while driving shows no
+    // browsing chrome (its swipes commit), but the pinned climb keeps its
+    // activation button — the old banner's contract.
+    previewPinned: isPreview,
+    isAnonymous,
+    boardMismatch,
+    displayedClimbUuid: displayedClimbUuid ?? null,
+    committedHeadUuid: currentClimbQueueItem?.climb.uuid ?? null,
+    wallClimbUuid,
+    confirmArmed: busyWallConfirmArmed,
+    wallDriven: lightbulbActive,
+    // A connect already in flight counts, so Put on the wall keeps its label
+    // while the board is found. Never while
+    // another account holds the board: it takes one phone at a time.
+    tapConnects:
+      (lightbulbPressAction === 'connect' || (lightbulbPending && !phoneLinked)) &&
+      !(bluetooth?.wallHeldByOtherUser ?? false),
+  });
+  // #4979: the board connected but the hold kept this climb dark, because it
+  // hasn't changed for 4 h or more. The wall button reads it as dark and its
+  // tap re-lights it (a reassert, which releases the hold), with "Last on the
+  // wall …" saying why the board is dark.
+  const staleCurrentHold = bluetooth?.staleCurrentHold ?? null;
+  // The wall button's re-light of a dark current climb: a reassert, which
+  // releases the #4979 hold and clears a "Turn off all lights". A list pick of
+  // the held climb takes the same path (the selection controller, section 6
+  // decision A).
+  const handlePutHeldClimbOnWall = useCallback(() => {
+    resetWallCleared();
+    bluetooth?.armUndoWallChangeToast();
+    bluetooth?.reassertWall();
+  }, [bluetooth]);
+  // "Turn off all lights" (#6939): the link is up and the queue didn't move, so
+  // only this says the current climb is dark. The wall button re-lights it, the
+  // same reassert as the held climb's.
+  const wallClearedClimbUuid = useWallClearedClimbUuid();
+  // A "Turn off all lights" is about one link and one write. A dropped link
+  // forgets it, so the next connect's lit climb doesn't read dark; so does the
+  // wall coming back to the cleared climb (clear A, Next, Previous), since that
+  // write lit it again.
+  const linkedBeforeRef = useRef(phoneLinked);
+  useEffect(() => {
+    const dropped = linkedBeforeRef.current && !phoneLinked;
+    linkedBeforeRef.current = phoneLinked;
+    if (dropped) resetWallCleared();
+  }, [phoneLinked]);
+  const wallClimbBeforeRef = useRef(wallClimbUuid);
+  useEffect(() => {
+    const changed = wallClimbBeforeRef.current !== wallClimbUuid;
+    wallClimbBeforeRef.current = wallClimbUuid;
+    if (changed && wallClimbUuid !== null && wallClimbUuid === wallClearedClimbUuid) resetWallCleared();
+  }, [wallClimbUuid, wallClearedClimbUuid]);
+  const clearedClimbOnScreen =
+    wallClearedClimbUuid !== null &&
+    phoneLinked &&
+    !isAnonymous &&
+    !showBoardMismatch &&
+    displayedClimbUuid === wallClearedClimbUuid &&
+    currentClimbQueueItem?.climb.uuid === wallClearedClimbUuid;
+  // What the wall button reads: the held climb is dark
+  // wherever it is on screen, a pinned preview of it included, like the
+  // cleared climb above.
+  const heldClimbDisplayed =
+    staleCurrentHold !== null &&
+    !isAnonymous &&
+    !showBoardMismatch &&
+    currentClimbQueueItem?.uuid === staleCurrentHold.queueItemUuid &&
+    displayedClimbUuid === currentClimbQueueItem.climb.uuid;
+  const displayedClimbDark = heldClimbDisplayed || clearedClimbOnScreen;
+  // The resolvers take the RAW latch and do their own anonymous suppression, so
+  // that rule stays where its table tests can see it rather than being pre-baked
+  // out at this call site.
+  const wallPillState = resolveWallPillState({
+    isAnonymous,
+    displayedClimbUuid: displayedClimbUuid ?? null,
+    wallClimbUuid,
+    browseLatchActive,
+    // Not driving is precisely "the next swipe does NOT drive the wall" (it's
+    // what `getSwipeNavigationTarget` turns into `forceViewOnly`).
+    navigationCommits,
+    // The lightbulb's own signal: this device's BLE link, or a session member's.
+    // Merely being IN a session is not enough — the Start button opens one solo,
+    // and a solo session with nothing connected moves no wall.
+    wallDriven: lightbulbActive,
+    // A dark current climb (the #4979 hold, or the lights turned off) claims
+    // neither On the wall nor Live, whatever presence still names (#7000).
+    // Known only on this phone, the one holding the link.
+    currentDark: displayedClimbDark,
+    // A reachable other board's climb: the connected wall refuses its holds.
+    otherBoard: climbBoardMismatch,
+  });
+  // Whether the climb on screen is lit, for the wall button's "Lit on the
+  // wall" (#6939, #7000): the board draws the same glowing holds whether or not
+  // they are lit, so this is what says so. A story can force it, and the back
+  // chip below, to shoot every wall state on one simulator.
+  // A crewmate's phone turned the lights off on this climb (#7015): board
+  // presence says so. Only read without this phone's own link: the phone holding
+  // the link has its own store above, which a re-light resets at once, while the
+  // feed's copy would wait for the echo and read dark over a lit climb.
+  const feedClearedClimbUuid = usePresenceClearedClimbUuid();
+  const presenceClearedClimbUuid = phoneLinked ? null : feedClearedClimbUuid;
+  const displayedWallLit = resolveWallLit({
+    isAnonymous,
+    boardHasLights: bluetooth !== null && playerBoardHasLights,
+    boardMismatch: showBoardMismatch,
+    otherBoard: climbBoardMismatch,
+    displayedClimbUuid: displayedClimbUuid ?? null,
+    committedHeadUuid: currentClimbQueueItem?.climb.uuid ?? null,
+    wallClimbUuid,
+    isPreview,
+    wallDriven: lightbulbActive,
+    currentDark: displayedClimbDark,
+    presenceClearedClimbUuid,
+    presenceFresh: wallPresenceFresh,
+  });
+  const wallLit = displayedWallLit;
+  // "Turn off all lights" from a preview of the climb on the wall (not the queue
+  // head): the board sheet marks the wall's climb, so this preview reads dark.
+  const clearedWallPreviewOnScreen =
+    wallClearedClimbUuid !== null &&
+    phoneLinked &&
+    displayedClimbUuid === wallClearedClimbUuid &&
+    displayedClimbUuid === wallClimbUuid &&
+    currentClimbQueueItem?.climb.uuid !== wallClearedClimbUuid;
+  const displayedLit = wallLit === 'lit' && !clearedWallPreviewOnScreen;
+  // A timed workout block's one-tap Fell / Sent (#6231): the climb on the wall,
+  // in a stage that paces the rest, that this climber can log from here. It
+  // takes the second row (`workoutOutcome` below), and the bulb comes back to
+  // the first row meanwhile.
+  const showWorkoutOutcome =
+    sessionId !== null &&
+    shouldShowWorkoutOutcome({
+      run: workoutRun,
+      displayedQueueItemUuid: displayedQueueItemUuid ?? null,
+      committedQueueItemUuid: currentClimbQueueItem?.uuid ?? null,
+      signedIn: isAuthenticated && !isAnonymous,
+      boardMismatch: showBoardMismatch,
+      isDraft: displayedClimb?.is_draft === true,
+    });
+  // What a Fell / Sent tap logs against (`showWorkoutOutcome` above).
+  const liveWorkoutOutcome = useMemo<WorkoutOutcomeTarget | null>(() => {
+    const committedQueueItemUuid = currentClimbQueueItem?.uuid ?? null;
+    if (!showWorkoutOutcome || !displayedClimb || committedQueueItemUuid === null || sessionId === null) return null;
+    return {
+      climb: displayedClimb,
+      queueItemUuid: committedQueueItemUuid,
+      sessionId,
+      boardName,
+      layoutId,
+      sizeId,
+      setIds,
+      angle,
+      isMirror: isMirrored,
+    };
+  }, [
+    showWorkoutOutcome,
+    currentClimbQueueItem?.uuid,
+    displayedClimb,
+    sessionId,
+    boardName,
+    layoutId,
+    sizeId,
+    setIds,
+    angle,
+    isMirrored,
+  ]);
+  // When the wall leaves the timed block (an on-the-minute beat onto a climb
+  // outside it), Fell / Sent stays a moment for the climb it left, so a tap
+  // already on its way lands there and not on the angle or the heart. Everything
+  // below reads this, so the row swaps once, after the hold.
+  const workoutOutcomeShown = useWorkoutOutcomeHold({
+    live: liveWorkoutOutcome,
+    committedQueueItemUuid: currentClimbQueueItem?.uuid ?? null,
+    displayedQueueItemUuid: displayedQueueItemUuid ?? null,
+    sessionId,
+    canLog: isAuthenticated && !isAnonymous && !showBoardMismatch,
+  });
+  const workoutOutcome = workoutOutcomeShown?.target ?? null;
+  // What the browse latch asks for: Put on the wall (one of the wall button's
+  // states), or the busy-wall question in the wall button's place. A story can
+  // force the question (`ScenarioOverrides.player.busyWall`).
+  const commitButton: ActionBarCommitButton = resolveCommitButton(commitBarModel);
+  const busyWallUp = commitButton === 'confirm';
+  // The board control (#7000): what it says about the climb on screen, whose
+  // board it is, and what a tap and a hold do. One model for every view of
+  // it (the wall button, the bulb, the open Duo's bar bulb); they draw only
+  // this. A face needs a live link: presence alone never puts one up.
+  const wallWriting = useBluetoothWriteInProgress();
+  const wallHolderIdentity = useWallHolderIdentity();
+  // The signed-in climber, from the profile or the device's stored identity, so
+  // a second phone on this account knows itself before its profile loads.
+  // Unknown (signed out, nothing loaded yet) is never read as somebody else.
+  const viewerUserId = useViewerUserId();
+  // A story can say this phone holds the board (`ScenarioOverrides.player.selfHoldsBoard`).
+  const wallLinked = phoneLinked;
+  const selfHoldsBoard = wallLinked || wallHeldLocally;
+  // This climber's profile: their face while they hold the board.
+  const { data: wallSelfProfile } = useProfile({ enabled: selfHoldsBoard && !isAnonymous });
+  const selfFace = useMemo(
+    () =>
+      wallSelfProfile
+        ? { name: wallSelfProfile.displayName ?? null, avatarUrl: wallSelfProfile.avatarUrl ?? null }
+        : null,
+    [wallSelfProfile],
+  );
+  const wallControl = useMemo(
+    () =>
+      resolveWallControl({
+        commitButton,
+        pressAction: lightbulbPressAction,
+        holderIsAuthoritative: lightbulbHolderIsAuthoritative,
+        localConnected: wallLinked,
+        pending: lightbulbPending,
+        displayedLit,
+        // The switch-board overlay, another board's climb, or a board with no
+        // lights: the connected wall can't light what's on screen.
+        offWall: showBoardMismatch || climbBoardMismatch || !playerBoardHasLights,
+        // ...unless another board at this gym draws it: then Put on {board} (#7076).
+        gymBoardName: climbGymBoardName,
+        crewGymBoard: climbOnCrewGymBoard,
+        wallHeldLocally,
+        // On the wall per presence with no link (QA #147).
+        displayedIsWallClimb: wallClimb.uuid !== null && displayedClimbUuid === wallClimb.uuid,
+        presenceFresh: wallPresenceFresh,
+        displayedIsOwnCurrent:
+          displayedClimbUuid != null && displayedClimbUuid === (currentClimbQueueItem?.climb.uuid ?? null),
+        // Presence's named holder only, never whoever lit the climb: this phone's
+        // own climb from before a relaunch is not "On your other phone".
+        holderIsSelfAccount: isHolderSelfAccount(wallHolderIdentity.holderUserId, viewerUserId),
+        selfFace,
+        crewFace: wallHolderIdentity.face,
+        confirmArmed: busyWallUp,
+        commitLabel: commitBarModel.commitLabel,
+        otherClimbLit: wallClimbUuid !== null && wallClimbUuid !== displayedClimbUuid,
+        writing: wallWriting,
+        // Driving the board: a swipe from here goes up on the wall (#7017).
+        navigationCommits: navigationCommits && !browseLatchActive,
+        driveMode: driveModePhase,
+        drivingStopped,
+        // Keep-lighting's session read, the roster alone: the one the watcher
+        // ends a window on when In a session too turns off.
+        crewSession: isCrewSession,
+        // Always drive the wall drives here: the press only drops a stop.
+        alwaysDrive: alwaysDriveHere,
+        // After Put on board, keep lighting (2.7): Stop driving after, the
+        // same choice on every board.
+        keepLighting,
+        drivesInSession: putOnBoardDrivesInSession,
+        // The swipe's flag is keep-lighting's kill switch too.
+        swipeToDriveEnabled,
+        lightWindow,
+      }),
+    [
+      commitButton,
+      lightbulbPressAction,
+      lightbulbHolderIsAuthoritative,
+      wallLinked,
+      lightbulbPending,
+      displayedLit,
+      showBoardMismatch,
+      climbBoardMismatch,
+      climbGymBoardName,
+      climbOnCrewGymBoard,
+      playerBoardHasLights,
+      wallHeldLocally,
+      wallClimb.uuid,
+      wallPresenceFresh,
+      currentClimbQueueItem?.climb.uuid,
+      wallHolderIdentity,
+      viewerUserId,
+      selfFace,
+      busyWallUp,
+      commitBarModel.commitLabel,
+      wallClimbUuid,
+      displayedClimbUuid,
+      wallWriting,
+      navigationCommits,
+      browseLatchActive,
+      driveModePhase,
+      drivingStopped,
+      isCrewSession,
+      alwaysDriveHere,
+      keepLighting,
+      putOnBoardDrivesInSession,
+      swipeToDriveEnabled,
+      lightWindow,
+    ],
+  );
+  const wallControlState: WallControlState = wallControl.state;
+  const displayedClimbIsDraft = displayedClimb?.is_draft === true;
+  const supportsMirroring = boardSupportsMirroring(boardName, layoutId);
+  // The same layout the action bar resolves from the same inputs, read here for
+  // the buttons it has put away (⋯ carries a row for each) and for the opening
+  // layout's key (a second row that comes or goes moves the board).
+  const hasBluetooth = bluetooth !== null;
+  const angleAvailable = resolvePlayerAngle({ isAngleAdjustable, angle: activeAngle }) !== null;
+  // A wall with lights to put a climb on (LEDs, or a wall device); without one
+  // the wall button's row folds.
+  const playerHasWall = hasBluetooth && playerBoardHasLights;
+  const actionBarLayout = useMemo(
+    () =>
+      resolveActionBarLayout({
+        supportsMirroring,
+        isAnonymous,
+        commitButton,
+        workoutOutcome: workoutOutcome !== null,
+        showLightbulb: hasBluetooth,
+        hasWall: playerHasWall,
+        hasShare: !displayedClimbIsDraft,
+        angleAvailable,
+        buttons: playerButtons.buttons,
+        previousNext: playerButtons.previousNext,
+        boardControl: playerButtons.boardControl,
+        miniPlayerMirrors,
+      }),
+    [
+      supportsMirroring,
+      isAnonymous,
+      commitButton,
+      workoutOutcome,
+      hasBluetooth,
+      playerHasWall,
+      displayedClimbIsDraft,
+      angleAvailable,
+      playerButtons.buttons,
+      playerButtons.previousNext,
+      playerButtons.boardControl,
+      miniPlayerMirrors,
+    ],
+  );
+
+  const actionsAnalytics = useMemo(
+    () =>
+      buildPlayDrawerActionsContext({
+        layout: actionBarLayout,
+        boardControl: playerButtons.boardControl,
+        hasShare: !displayedClimbIsDraft,
+        wallControlVisible: isPlayDrawerWallControlRendered(actionBarLayout, wallControlState),
+        primaryVisible: actionsVisibility.visible.primary,
+        secondaryVisible: actionsVisibility.visible.secondary,
+      }),
+    [
+      actionBarLayout,
+      playerButtons.boardControl,
+      displayedClimbIsDraft,
+      wallControlState,
+      actionsVisibility.visible.primary,
+      actionsVisibility.visible.secondary,
+    ],
+  );
+  const { isFavorited, handleToggleFavorite, handleToggleFavoriteFromMenu } = usePlayFavorite({
+    analyticsContext: actionsAnalytics,
+    displayedClimb,
+    boardName,
+    layoutId,
+    angle,
+    serverFavorited,
+    toggleFavoriteMutate,
+    bluetoothConnected: bluetooth?.isConnected ?? false,
+    showToast,
+    t,
+  });
+
+  // Reserve only the first eligible section's header. Without sections, content
+  // plus bottom safe area exactly fills the measured viewport and cannot scroll.
+  // The phone split's pane and the landscape iPad player fit the board to the
+  // viewport's height instead (`computeFitToHeightFirstScreenHeight`).
+  // - The pane always does, whatever its rows hold: its bottom inset clears the
+  //   MiniPlayer capsule (`PhoneSplitPane`), and the first screen pads that band
+  //   so every button ends above the capsule and the first section starts below
+  //   the fold rather than peeking under the capsule.
+  // - The iPad player does only with sections to scroll to, with the controls
+  //   under the board, and with a plain second row that hangs below the fold.
+  //   The wall button, the busy-wall question and Fell / Sent keep their place
+  //   on screen (`shouldFitBoardToHeight`, #6956).
+  const fitsBoardToHeight = shouldFitBoardToHeight({
+    fitBoardToHeight,
+    isPane,
+    hasVisibleSections,
+    controlsAbove,
+    secondaryRow: actionBarLayout.secondaryRow,
+  });
+
+  // What the card says Put on board's drive does: the Stop driving after
+  // choice, read the way the press reads it
+  // (`resolveKeepLightingPlan`), so it never promises a drive where none can
+  // start: a crew session with In a session too off, or the swipe flag (the
+  // drive's kill switch) off.
+  const previewFirstKeepLighting = useMemo(
+    () =>
+      swipeToDriveEnabled
+        ? resolveKeepLightingPlan({
+            keepLighting,
+            drivesInSession: putOnBoardDrivesInSession,
+            inSession: isCrewSession,
+          })
+        : null,
+    [swipeToDriveEnabled, keepLighting, putOnBoardDrivesInSession, isCrewSession],
+  );
+
+  // The one-shot preview-first card under the wall button (2.7): the first
+  // preview on a board with lights, signed in, while nothing else is asking.
+  const previewFirstTip = usePreviewFirstTip(
+    resolvePreviewFirstTipInput({
+      signedIn: isAuthenticated && !isAnonymous,
+      playerHasWall,
+      wallControl,
+      isPreview,
+      displayedLit,
+      busyWallUp,
+      workoutOutcomeUp: workoutOutcome !== null,
+      boardMismatchUp: showBoardMismatch,
+      trackEndCardUp: trackEndCardClimbUuid !== null && trackEndCardClimbUuid === displayedClimbUuid,
+      hasVisibleSections,
+      tabletop,
+      fitsBoardToHeight,
+      openKey: openTarget?.nonce ?? null,
+    }),
+  );
+  const { markLatchExit, suppressBrowseAnnouncement, noteBrowseNoticeSpoken, liveRegionText } = useWallStateAnnouncer({
+    pillState: wallPillState,
+    climbName: displayedClimb?.name ?? null,
+    previewFirstDue: previewFirstTip.announcementDue,
+  });
+
+  // Something silently changed what a swipe does, so say so to a screen reader,
+  // once. Fires the first time the latch actually engages: joining a crew, or
+  // (solo) the first navigation that stays view-only because board lighting is
+  // off for swipes and taps. Sighted climbers get the Put on the wall button and
+  // the back chip appearing; there's no card on top of the board any more.
+  //
+  // The solo half is gated on a wall being reachable at all. With no board
+  // connected, no session and nothing lit, "the wall stays put" is a sentence
+  // about something the climber hasn't got. Read from the wall itself, not the
+  // commit label: with no board connected that label offers to connect one.
+  const wallReachable = wallClimbUuid != null || lightbulbActive;
+  const previewFirstDeciding = previewFirstTip.deciding;
+  const previewFirstDue = previewFirstTip.announcementDue;
+  useEffect(() => {
+    if (isAnonymous || !browseLatchActive) return;
+    // The preview-first card may be about to make its first show, and its line
+    // replaces this notice: wait the few milliseconds its seen flag takes.
+    if (previewFirstDeciding) return;
+    const claimed = isSharedSession ? claimJoinedBrowseNotice(sessionId) : wallReachable && claimSoloBrowseNotice();
+    if (!claimed) return;
+    // Spoken on both platforms. The drawer can open straight into a browse (a
+    // crew climb-list tap), where there is no state transition for the
+    // wall-state announcer to narrate. Its browse sentence stands down when this
+    // speaks, so one moment gets one sentence.
+    suppressBrowseAnnouncement();
+    // The preview-first line says the same thing for this moment (B1): it speaks
+    // instead, and the notice is spent all the same.
+    if (previewFirstDue) return;
+    noteBrowseNoticeSpoken();
+    AccessibilityInfo.announceForAccessibility(t('playView.wallState.joinedBrowseNotice'));
+  }, [
+    isAnonymous,
+    isSharedSession,
+    browseLatchActive,
+    sessionId,
+    wallReachable,
+    previewFirstDeciding,
+    previewFirstDue,
+    suppressBrowseAnnouncement,
+    noteBrowseNoticeSpoken,
+    t,
+  ]);
+
+  // Leave the browse latch: drop the pinned preview (and the peek anchor + wall
+  // flag that ride it) so the drawer re-derives from the committed queue head,
+  // and disarm the one-way shared-session latch — this is one of the two exits
+  // that are allowed to. Nothing is sent, nothing is written.
+  //
+  // This is also "Keep theirs": answering the busy-wall question by leaving the
+  // other climber's climb up IS going back to live, so the two share a handler
+  // rather than drifting into two subtly different exits.
+  const handleBackToLive = useCallback(() => {
+    markLatchExit('backToLive');
+    setBusyWallConfirmArmed(false);
+    setSharedBrowseLatched(false);
+    setDrawerPreviewItem(null);
+    setDrawerPreviewSuggestionSource(null);
+    setDrawerPreviewIsWallClimb(false);
+    // Mirroring is drawer-local per displayed climb: every other navigation
+    // resets it, and carrying a preview's mirror onto the committed head would
+    // render (and, once animatable playback resumes, re-send) the head flipped.
+    clearMirror();
+  }, [markLatchExit, setDrawerPreviewItem, setDrawerPreviewSuggestionSource]);
+  // The header chip as drawn (`resolveHeaderPillState`): during a preview it is
+  // the way back, when back goes anywhere.
+  const committedHeadUuid = currentClimbQueueItem?.climb.uuid ?? null;
+  const resolvedHeaderPill = useMemo(
+    () =>
+      resolveHeaderPillState({
+        previewPinned: isPreview,
+        isAnonymous,
+        displayedClimbUuid: displayedClimbUuid ?? null,
+        committedHeadUuid,
+        // Back to the wall only while presence is trusted (QA #147).
+        wallClimbUuid: wallPresenceTrusted ? wallClimbUuid : null,
+        isPane,
+      }),
+    [isPreview, isAnonymous, displayedClimbUuid, committedHeadUuid, wallClimbUuid, wallPresenceTrusted, isPane],
+  );
+  const headerPill: HeaderPill = resolvedHeaderPill;
+  const headerPillState = headerPill?.state ?? null;
+  const headerBackTarget = headerPill?.backTarget ?? null;
+  // The wall shows the climber's own climb, by trusted presence: the end card
+  // may then call it "On the wall" (the back chip's 'wall' rule, without its
+  // preview gate). Anything else and the card calls it "Your climb".
+  const committedOnWall = wallPresenceTrusted && wallClimbUuid !== null && wallClimbUuid === committedHeadUuid;
+  // Back always lands on the climber's committed climb (the wall's too, when
+  // back is to the wall), so the chip names that one to a screen reader.
+  const headerBackTargetName = currentClimbQueueItem?.climb.name ?? null;
+
+  // What looking at this climb does to the wall, while it is only a preview
+  // (`resolveBrowseCaption`): "Preview · not on the wall", or in a crew "Only
+  // you see this · the wall is on Crimp Ladder". It rides the top bar's second
+  // line (#6745), not the stats line, so it never pushes the sends and stars
+  // off; the top bar does not swipe, so the peeks carry none of their own.
+  // Under a list or a workout stage it takes the short crew form, which fits
+  // there. The board art draws the same glowing holds whether they are lit or
+  // not, so on a linked phone this line is what says a preview isn't up (B1);
+  // only a lit climb on screen leaves the saying to the wall button.
+  const browseCaptionModel = resolveBrowseCaption({
+    isAnonymous,
+    isPreview,
+    climbUuid: displayedClimbUuid ?? null,
+    committedHeadUuid,
+    wallClimbUuid,
+    wallClimbName: wallClimb.name,
+    inCrew: isSharedSession,
+    wallDriven: lightbulbActive,
+    holdsLink: phoneLinked,
+    wallPresenceTrusted,
+  });
+  const browseCaption = formatBrowseCaption(
+    displayedLit && browseCaptionModel?.kind === 'preview' ? null : browseCaptionModel,
+    t,
+    { sharesLine: topBarParts !== null },
+  );
+
+  // Changing angle keeps a preview pinned and regrades it below. Dropping it
+  // would restore the committed head and could light it without the board
+  // button. Driving the wall retains the previous return-to-current behavior,
+  // while foreign-board previews stay put. Read the policy at the angle change
+  // without reacting to drive changes.
+  const angleBrowsePolicyRef = useRef({ drivingLive, isAnonymous, previewOnOtherBoard });
+  angleBrowsePolicyRef.current = { drivingLive, isAnonymous, previewOnOtherBoard };
+  useEffect(() => {
+    setDrawerPreviewIsWallClimb(false);
+    const policy = angleBrowsePolicyRef.current;
+    if (policy.isAnonymous || policy.previewOnOtherBoard || !policy.drivingLive) return;
+    setDrawerPreviewItem(null);
+    setDrawerPreviewSuggestionSource(null);
+  }, [activeAngle, setDrawerPreviewItem, setDrawerPreviewSuggestionSource]);
+
+  // Re-anchor the pinned preview at the live angle. Only fetches while the
+  // preview's baked-in grade actually belongs to a different angle, and the patch
+  // preserves the item's uuid — that uuid is the drawer's navigation anchor, so
+  // minting a fresh one would break prev/next and the remaining count.
+  const previewClimbUuid = drawerPreviewItem?.climb?.uuid ?? null;
+  const { data: previewClimbAtAngle } = useClimb(
+    previewClimbUuid && previewNeedsAngleReanchor(drawerPreviewItem, angle)
+      ? { boardName, layoutId, sizeId, setIds, angle, climbUuid: previewClimbUuid }
+      : null,
+  );
+  useEffect(() => {
+    if (!previewClimbAtAngle) return;
+    // `reanchorPreviewAtAngle` returns the same reference for a stale response
+    // (one that landed after the climber swiped on) or an item already at this
+    // angle, so this never churns the preview.
+    setDrawerPreviewItem((current) => reanchorPreviewAtAngle(current, angle, previewClimbAtAngle));
+  }, [previewClimbAtAngle, angle, setDrawerPreviewItem]);
+
+  // Tracked as an intent, with a toast when the share sheet throws (shared with the MiniPlayer's).
+  const handleShare = useShareClimbAction({
+    climb: displayedClimb ?? null,
+    boardName,
+    layoutId,
+    sizeId,
+    setIds,
+    angle,
+    source: 'play_drawer',
+    analyticsContext: actionsAnalytics,
+  });
+
+  // A draft is visible to its setter alone: a share link opens nowhere for
+  // anyone else, and the only person who can report it is the setter (#5960).
+
+  // Long-press the climb name to copy it — handy for pasting into a chat when
+  // sharing beta. Delegates to the unit-tested copyClimbName helper; haptic for
+  // tactile confirmation, info toast matching the "Link copied" affordance.
+  const handleCopyName = useCallback(() => {
+    void copyClimbName(
+      displayedClimb,
+      { boardName, layoutId },
+      {
+        haptic: hapticSuccess,
+        track,
+        showToast: (message, variant) => showToast(message, variant ?? 'info'),
+        toastMessage: tClimbs('mobile.climbActions.nameCopied'),
+        errorToastMessage: tClimbs('mobile.climbActions.copyNameError'),
+      },
+    );
+  }, [displayedClimb, boardName, layoutId, showToast, tClimbs]);
+
+  // The similar-climbs strip plays as a list (#6665). A preview walks it on the
+  // board the player draws the climb on, which is the board its similar climbs
+  // come from. A committed tap keys it to the stored active board, the board
+  // the queue checks a track against: an upsized climb or a tick from another
+  // size is drawn on a bigger board, and a track keyed there would go dormant
+  // the moment it was set, leaving swipes to walk the queue.
+  const similarTrack = useMemo(() => {
+    const renderBoardKey = getQueueBoardKey({
+      board_name: boardName,
+      layout_id: layoutId,
+      size_id: sizeId,
+      set_ids: setIds,
+    });
+    return {
+      boardKey: renderBoardKey,
+      committedBoardKey: activeBoardForNavigation
+        ? getQueueBoardKey({
+            board_name: activeBoardForNavigation.boardType,
+            layout_id: activeBoardForNavigation.layoutId,
+            size_id: activeBoardForNavigation.sizeId,
+            set_ids: activeBoardForNavigation.setIds,
+          })
+        : renderBoardKey,
+      label: t('playView.track.similarClimbs'),
+    };
+  }, [boardName, layoutId, sizeId, setIds, activeBoardForNavigation, t]);
+
+  // `Queue Navigation` for each Next / Previous the climber takes here (#6940).
+  const navigationBoardType = activeBoardForNavigation?.boardType;
+  const navigationLayoutId = activeBoardForNavigation?.layoutId;
+  // `sessionMode` says whether a crew decides how navigation behaves, so it reads
+  // the latch the preview decision reads (`browseByDefault`), not the live
+  // roster: after a peer leaves mid-browse the latch still makes a step a preview.
+  // Each step also runs the then-signposts (the note, the crossing tick), which
+  // say which walk it took for the event, and queues the board's value to be
+  // announced where it lands.
+  // Set on every render below, once the value it announces is known.
+  const noteBoardValueStepRef = useRef<((direction: QueueNavigationDirection) => void) | null>(null);
+  const handleNavigationStep = useCallback(
+    (step: PlayNavigationStep) => {
+      noteBoardValueStepRef.current?.(step.direction);
+      trackQueueNavigation(
+        {
+          ...step,
+          surface: 'player',
+          inSharedSession: browseByDefault,
+          // The climber's setting, not a stop on this link.
+          alwaysDrive,
+          driving: drivingLive,
+          boardType: navigationBoardType,
+          layoutId: navigationLayoutId,
+          walk: noteSignpostStep(step),
+        },
+        actionsAnalytics,
+      );
+    },
+    [
+      browseByDefault,
+      alwaysDrive,
+      drivingLive,
+      navigationBoardType,
+      navigationLayoutId,
+      actionsAnalytics,
+      noteSignpostStep,
+    ],
+  );
+  const handlePlayNext = useCallback(() => {
+    const snapshot = getQueueSnapshot();
+    if (
+      !displayedClimb ||
+      isAnonymous ||
+      showBoardMismatch ||
+      displayedClimb.uuid === snapshot.currentClimbQueueItem?.climb.uuid
+    )
+      return;
+    void playNext({
+      item: { uuid: randomUUID(), climb: displayedClimb },
+      queueItemUuid: resolveQueuedSlotUuid(snapshot.queue, displayedQueueSlotUuid),
+    });
+  }, [displayedClimb, isAnonymous, showBoardMismatch, getQueueSnapshot, playNext, displayedQueueSlotUuid]);
+
+  // `Queue Sheet Opened`: the action bar's queue button and the ⋯ menu's row.
+  // Both also say what the player showed and how full Up next was (Then-signposts).
+  const handleOpenQueueFromBar = useCallback(() => {
+    trackQueueSheetOpened(
+      { surface: 'player', boardType: navigationBoardType, ...queueSheetOpenContext(getQueueSnapshot(), isPreview) },
+      actionsAnalytics,
+    );
+    onOpenQueue();
+  }, [onOpenQueue, navigationBoardType, actionsAnalytics, getQueueSnapshot, isPreview]);
+  const handleOpenQueueFromMenu = useCallback(() => {
+    trackQueueSheetOpened(
+      {
+        surface: 'player_menu',
+        boardType: navigationBoardType,
+        ...queueSheetOpenContext(getQueueSnapshot(), isPreview),
+      },
+      actionsAnalytics,
+    );
+    onOpenQueue();
+  }, [onOpenQueue, navigationBoardType, actionsAnalytics, getQueueSnapshot, isPreview]);
+
+  // The MiniPlayer's bulb on an unlit last pick (owner decision A): once the
+  // preview it opened lands, Put on board is pressed for it (below).
+  const [putOnBoardFor, setPutOnBoardFor] = useState<string | null>(null);
+  // Each open the controller applies: the last pick, the reopened pick's
+  // busy-wall snapshot, and the bulb's Put on board. The writer is built after
+  // the controller (its effect must follow the target effect), so this forwards.
+  const noteOpenAppliedRef = useRef<(applied: AppliedPlayerOpen) => void>(() => {});
+  const handleOpenApplied = useCallback(
+    (applied: AppliedPlayerOpen) => {
+      const item = applied.previewItem;
+      const latchStart = item ? applied.latchStart : undefined;
+      if (item && latchStart) {
+        if (browseLatchActiveRef.current) {
+          // A latch already up (a crew) took its snapshot on mount: correct it
+          // now and spend the seed, so a later rise on this preview (Back and the
+          // same slot again, a drive that starts and ends) reads the wall as it
+          // is then, never this old snapshot.
+          wallUuidAtLatchStartRef.current = latchStart.wallClimbUuid;
+          latchStartedAtRef.current = latchStart.at;
+          latchSeedRef.current = null;
+        } else {
+          // The latch rises once the preview lands, and takes the seed then.
+          latchSeedRef.current = { itemUuid: item.uuid, start: latchStart };
+        }
+      } else {
+        // Any other open is a look of its own: an older seed never applies to it.
+        latchSeedRef.current = null;
+      }
+      setPutOnBoardFor(applied.putOnBoard && item ? item.uuid : null);
+      // A new open: the preview note may show once more in it.
+      resetSignpostsForOpen();
+      noteOpenAppliedRef.current(applied);
+    },
+    [resetSignpostsForOpen],
+  );
+  const {
+    handlePrev,
+    handleNext,
+    handleSetActive,
+    handleSimilarClimbPress,
+    commitDisplayedToWall,
+    continueIntoQueue,
+    getPreviewCommitOptions,
+  } = usePlaySelectionController({
+    openTarget,
+    viewer,
+    showBoardMismatch,
+    preview: {
+      drawerPreviewItem,
+      drawerPreviewSuggestionSource,
+      setDrawerPreviewItem,
+      setDrawerPreviewSuggestionSource,
+      setDrawerPreviewIsWallClimb,
+      setSharedBrowseLatched,
+    },
+    queue: { currentClimbQueueItem, setCurrentClimb, previousClimb, nextClimb },
+    similarTrack,
+    navigation: {
+      navigationState,
+      nextPreviewSource,
+      previousPreviewSource,
+      browseByDefault,
+      driving: drivingLive,
+      previewOnOtherBoard,
+    },
+    chrome: { clearMirror, restoreMirror, setIsTickBarActive, setActiveSubDrawer },
+    confirmation: {
+      busyWallConfirmArmed,
+      browseLatchActive,
+      wallClimbUuid,
+      displayedClimbUuid,
+      wallUuidAtLatchStartRef,
+      setBusyWallConfirmArmed,
+      markLatchExit,
+    },
+    hold: {
+      heldQueueItemUuid: staleCurrentHold?.queueItemUuid ?? null,
+      putHeldClimbOnWall: handlePutHeldClimbOnWall,
+    },
+    onNavigationStep: handleNavigationStep,
+    onOpenApplied: handleOpenApplied,
+  });
+  // The climber's last pick, for the MiniPlayer once this player closes
+  // (owner decision A). Built after the controller so its effect follows the
+  // target effect: an open writes once, its state landing writes nothing.
+  const currentQueueItemUuidRef = useRef(currentClimbQueueItem?.uuid ?? null);
+  currentQueueItemUuidRef.current = currentClimbQueueItem?.uuid ?? null;
+  const getCurrentQueueItemUuid = useCallback(() => currentQueueItemUuidRef.current, []);
+  const getPickLatchStart = useCallback(
+    (): PickLatchStart =>
+      browseLatchActiveRef.current
+        ? { wallClimbUuid: wallUuidAtLatchStartRef.current, at: latchStartedAtRef.current ?? Date.now() }
+        : { wallClimbUuid: wallClimbUuidRef.current, at: Date.now() },
+    [],
+  );
+  // A logbook, session or profile row opens on its own board and angle: the
+  // pick keeps that board, so the bar reopens it there, at its own angle.
+  const pickBoardOverrideRef = useRef<BoardConfig | null>(null);
+  pickBoardOverrideRef.current = pickBoardOverride(boardConfig, activeBoardForNavigation);
+  const getPickBoardOverride = useCallback(() => pickBoardOverrideRef.current, []);
+  const { noteOpenApplied } = useLastPickWriter({
+    enabled: !isAnonymous,
+    previewItem: drawerPreviewItem,
+    previewSuggestionSource: drawerPreviewSuggestionSource,
+    previewMirrored: isMirrored,
+    getCommitOptions: getPreviewCommitOptions,
+    getCurrentItemUuid: getCurrentQueueItemUuid,
+    getLatchStart: getPickLatchStart,
+    getBoardOverride: getPickBoardOverride,
+  });
+  noteOpenAppliedRef.current = noteOpenApplied;
+  // The same step, told apart by how it was asked for.
+  const handlePrevButton = useCallback(() => handlePrev('button'), [handlePrev]);
+  const handleNextButton = useCallback(() => handleNext('button'), [handleNext]);
+  // The board's VoiceOver / TalkBack adjust action, the swipe's stand-in. It
+  // takes no arguments, so nothing it is called with reaches the analytics.
+  const handlePrevSwipe = useCallback(() => handlePrev('swipe'), [handlePrev]);
+  const handleNextSwipe = useCallback(() => handleNext('swipe'), [handleNext]);
+  // A swipe step: the pager hands it what its board was still doing, if anything.
+  const handlePrevSwipeStep = useCallback((artWait?: SwipeArtWait) => handlePrev('swipe', artWait), [handlePrev]);
+  const handleNextSwipeStep = useCallback((artWait?: SwipeArtWait) => handleNext('swipe', artWait), [handleNext]);
+
+  // A current climb unchanged for 4 h is held dark on the connect's first write
+  // (#4979). A tap that connects asked for the climb, so the hold it meets right
+  // after the connect is released, instead of needing a second tap. While the
+  // connect is still on its way (the picker can stay open for minutes) any
+  // hold is its own; once it linked, a hold within the minute after is. A
+  // connect that failed asks for nothing: a later link (the bulb's) keeps the hold.
+  const relightHeldAfterConnectRef = useRef<RelightHeldAfterConnect | null>(null);
+  useEffect(() => {
+    const pending = relightHeldAfterConnectRef.current;
+    if (!pending || !staleCurrentHold) return;
+    relightHeldAfterConnectRef.current = null;
+    if (staleCurrentHold.queueItemUuid !== pending.queueItemUuid) return;
+    if (!pending.connecting && nowMs() - pending.at > RELIGHT_HELD_AFTER_CONNECT_MS) return;
+    bluetooth?.reassertWall();
+  }, [staleCurrentHold, bluetooth]);
+
+  // "Light this climb" (#7000): the wall button (or the bulb) on a climb that
+  // isn't lit, and the busy-wall question's Put mine up. A preview is set first
+  // and the connect, when one is needed, runs after it (the picker when no
+  // board is remembered), so it lights whatever is current by then. The
+  // climber's own climb connects, or with a link already up is re-sent, which
+  // also clears a "Turn off all lights" and the #4979 hold. Never a
+  // disconnect: that is a row in the board sheet.
+  //
+  // Returns whether the climb went up (or a connect for it started): false when
+  // the busy-wall question took the tap, so Put on board's keep-lighting
+  // (`useWallControl`) waits for its Put mine up.
+  const handleLightThisClimb = useCallback((): boolean => {
+    if (commitBarModel.mode === 'commit') {
+      if (!commitBarModel.connectsOnCommit) return handleSetActive();
+      // The busy-wall question can take the tap instead of a commit: then nothing
+      // went up, and connecting would light the old climb under the question.
+      if (!handleSetActive()) return false;
+      // The climb the connect is for picks the board to connect to (#7001): the
+      // one just made current, which the queue may not report yet.
+      void connectLightbulb('put_on_wall', displayedClimb ?? null);
+      return true;
+    }
+    if (lightbulbPressAction === 'connect') {
+      const pending: RelightHeldAfterConnect | null = currentClimbQueueItem
+        ? { queueItemUuid: currentClimbQueueItem.uuid, at: nowMs(), connecting: true }
+        : null;
+      relightHeldAfterConnectRef.current = pending;
+      void connectLightbulb('play_drawer', currentClimbQueueItem?.climb ?? null).then(
+        (connected) => settleRelightHeldAfterConnect(relightHeldAfterConnectRef, pending, connected),
+        () => settleRelightHeldAfterConnect(relightHeldAfterConnectRef, pending, false),
+      );
+      return true;
+    }
+    if (!phoneLinked) return false;
+    handlePutHeldClimbOnWall();
+    return true;
+  }, [
+    commitBarModel.mode,
+    commitBarModel.connectsOnCommit,
+    displayedClimb,
+    handleSetActive,
+    connectLightbulb,
+    lightbulbPressAction,
+    currentClimbQueueItem,
+    phoneLinked,
+    handlePutHeldClimbOnWall,
+  ]);
+  // "On the wall" with no link (QA #147, Marco): the tap still connects and
+  // lights the climb on screen explicitly, in case it went dark meanwhile. A
+  // preview is made current first; then a reassert lights it, through the
+  // #4979 hold, without waiting on the auto-send.
+  const bluetoothForRelightRef = useRef(bluetooth);
+  bluetoothForRelightRef.current = bluetooth;
+  const handleLightAgain = useCallback((): boolean => {
+    let climb = currentClimbQueueItem?.climb ?? null;
+    const committing = commitBarModel.mode === 'commit';
+    if (committing) {
+      if (!handleSetActive()) return false;
+      climb = displayedClimb ?? null;
+    }
+    const relight = (options?: ReassertWallOptions) => {
+      resetWallCleared();
+      bluetoothForRelightRef.current?.reassertWall(options);
+    };
+    if (phoneLinked) {
+      relight();
+      return true;
+    }
+    // This press connected: the link it brought up owes the climb a write
+    // through the #4979 hold, even when that link mounts in this same render.
+    void connectLightbulb(committing ? 'put_on_wall' : 'play_drawer', climb).then((connected) => {
+      if (connected) relight({ carryToConnect: true });
+    });
+    return true;
+  }, [currentClimbQueueItem, commitBarModel.mode, handleSetActive, displayedClimb, phoneLinked, connectLightbulb]);
+  // Start driving the wall (#7113): what the wall button's swipe and its
+  // "Light every climb" action run, through `useWallControl`. Built on the
+  // light-again path: the climb on screen goes up (a preview is committed
+  // without the busy-wall question, since the climber who drives never sees
+  // it), the board connects when it isn't linked, and a reassert lights it,
+  // which also clears a Turn off all lights and the #4979 hold. The drive arms
+  // first and goes live once this phone's link lights the climb
+  // (`DriveModeWatcher`, at the app root); a connect that fails ends it.
+  //
+  // A crewmate's board isn't swipeable by design: their phone holds it, and
+  // Put on board relays the climb to it. So it refuses with `held_by_crew` and
+  // changes nothing.
+  const wallControlForDriveRef = useRef(wallControl);
+  wallControlForDriveRef.current = wallControl;
+  const startDriving = useCallback(
+    (startedBy: DriveModeStartedBy): DriveStartOutcome => {
+      // Behind the swipe's flag. During Put on board's keep-lighting window the
+      // swipe and Light every climb make the drive open-ended (`startDrive`).
+      if (!swipeToDriveEnabled) return 'unavailable';
+      const committing = commitBarModel.mode === 'commit';
+      const climb = committing ? (displayedClimb ?? null) : (currentClimbQueueItem?.climb ?? null);
+      return startDrive({
+        model: wallControlForDriveRef.current,
+        wallHeldByOtherUser: bluetoothForRelightRef.current?.wallHeldByOtherUser ?? false,
+        sessionId,
+        boardType: boardName,
+        startedBy,
+        committing,
+        commit: () => handleSetActive({ skipBusyWall: true }),
+        connected: phoneLinked,
+        connect: () => connectLightbulb(committing ? 'put_on_wall' : 'play_drawer', climb),
+        // A press, so after its connect the ask carries to the link it brought
+        // up (`carryToConnect`); with the link already up that is a no-op.
+        relight: () => {
+          resetWallCleared();
+          bluetoothForRelightRef.current?.reassertWall({ carryToConnect: true });
+        },
+      });
+    },
+    [
+      swipeToDriveEnabled,
+      sessionId,
+      boardName,
+      currentClimbQueueItem,
+      commitBarModel.mode,
+      handleSetActive,
+      displayedClimb,
+      phoneLinked,
+      connectLightbulb,
+    ],
+  );
+  // Put on board's keep-lighting (2.7): its climb went up (or a connect for it
+  // started), so arm the window, or the open-ended drive for Until I stop. It
+  // goes live, and the window's clock starts, at the wall's lit confirm
+  // (`DriveModeWatcher`). Not through `startDrive`, which commits without the
+  // busy-wall question: this runs after the ordinary put-up already asked.
+  const handleKeepLighting = useCallback(
+    (plan: KeepLightingPlan) => {
+      startKeepLighting({
+        plan,
+        sessionId,
+        boardType: boardName,
+        wallHeldByOtherUser: bluetoothForRelightRef.current?.wallHeldByOtherUser ?? false,
+      });
+    },
+    [sessionId, boardName],
+  );
+  // Put on {board} (#7076): the climb on screen is on another board at this gym.
+  // A preview goes up first (the busy-wall question can take the tap instead),
+  // then the move to that board, which connects there and lights it.
+  const handleMoveToGymBoard = useCallback(() => {
+    if (commitBarModel.mode === 'commit' && !handleSetActive()) return;
+    void moveLightbulbToClimbBoard('move_to_board', displayedClimb ?? null);
+  }, [commitBarModel.mode, handleSetActive, moveLightbulbToClimbBoard, displayedClimb]);
+  // The busy-wall question (#7017): who put the lit climb up, and the one
+  // handler behind its pair, which drops taps for the first 500 ms and speaks
+  // the caption once. Its words replace the browse caption while it is up.
+  const busyWallHolder = useMemo(
+    () =>
+      busyWallUp
+        ? resolveBusyWallHolder({
+            mover: currentClimbMover ?? null,
+            wallClimbUuid,
+            currentClimbUuid: currentClimbQueueItem?.climb.uuid ?? null,
+          })
+        : null,
+    [busyWallUp, currentClimbQueueItem, currentClimbMover, wallClimbUuid],
+  );
+  // Put mine up and Keep theirs go through the board control's handler (built
+  // below), so a press whose keep-lighting waited on the question gets it once
+  // its climb goes up (2.7), and Keep theirs drops it.
+  const wallControlAnswersRef = useRef<{ confirmPut: () => void; cancelPut: () => void } | null>(null);
+  // Set on every render below, before any press can ask the question.
+  const handleBusyWallPut = useCallback(() => wallControlAnswersRef.current?.confirmPut(), []);
+  const handleBusyWallKeep = useCallback(() => {
+    wallControlAnswersRef.current?.cancelPut();
+    handleBackToLive();
+  }, [handleBackToLive]);
+  const busyWall = useBusyWallQuestion({
+    armed: busyWallUp,
+    holder: busyWallHolder,
+    wallClimbName: wallClimb.name,
+    selfHoldsBoard,
+    onKeep: handleBusyWallKeep,
+    // Confirmation makes tapAction a noop; the state still names the board move.
+    onPut: wallControlState === 'move_to_board' ? handleMoveToGymBoard : handleBusyWallPut,
+  });
+  // A crewmate put a climb up while this phone drives the wall (#7113): "Your
+  // crew put up Crimp Ladder" for 4 s where "Only you see this" sits, on that climb.
+  const crewPutUp = useCrewPutUp();
+  const crewPutUpCaption =
+    crewPutUp && displayedQueueItemUuid === crewPutUp.queueItemUuid ? formatCrewPutUp(crewPutUp, t) : null;
+  // The board let go mid-drive (board plan item 8): "Sam took the board", or
+  // "Board disconnected · Put on board reconnects", for 10 s on any climb,
+  // beside the board art and never over it (`use-board-lets-go.ts`).
+  const letsGo = useLetsGo();
+  const letsGoCaption = letsGo ? formatLetsGo(letsGo, t, { short: true }) : null;
+  // Line 2's order: the busy wall, the board letting go, a crewmate's put-up, the preview note
+  // ("Preview · Up next: 4 waiting", in place of "not on the wall"), the browse
+  // caption, then on the climber's own climb "Up next first · 4 climbs".
+  const topBarCaption = busyWall.model
+    ? formatBusyWallCaption(busyWall.model, t)
+    : (letsGoCaption ??
+      crewPutUpCaption ??
+      thenSignposts.previewNote ??
+      browseCaption ??
+      thenSignposts.upNextFirstCaption);
+  // The note on line 2 now: only then does it spend its caps (once per open,
+  // three per run). TalkBack reads it as the board's value after the adjust
+  // action that earned it; on iOS the board carries no value and VoiceOver
+  // hears the landing announcement instead.
+  const previewNoteOnLine = resolvePreviewNoteOnLine({
+    previewNote: thenSignposts.previewNote,
+    busyWallUp: busyWall.model != null,
+    letsGoCaption,
+    crewPutUpCaption,
+  });
+  const { markPreviewNoteShown } = thenSignposts;
+  useEffect(() => {
+    if (previewNoteOnLine !== null) markPreviewNoteShown();
+  }, [previewNoteOnLine, markPreviewNoteShown]);
+  const boardExtraValueText = previewNoteOnLine !== null ? spokenCaption(previewNoteOnLine) : boardSignposts.valueText;
+  // The board sheet (Re-light / Turn off all lights / Disconnect). A hold on
+  // the board control opens it through `useWallControl`, which logs Board
+  // Controls Opened with the view; ⋯ › Board controls logs its own.
+  const openBoardSheet = useCallback(() => {
+    if (!phoneLinked) return;
+    setBleControlVisible(true);
+  }, [phoneLinked]);
+  // The board sheet offers Light every climb wherever the swipe is offered
+  // (#7113): the visible way in for the bulb view, and for Put on board with
+  // no link, where a hold opens no sheet. So ⋯ › Board controls opens it then
+  // even with no link, showing only that row.
+  const sheetOffersDrive = swipeToDriveEnabled && !isAnonymous && wallControl.swipeAction === 'drive';
+  const handleMenuBoardControls = useCallback(() => {
+    if (!phoneLinked && !sheetOffersDrive) return;
+    trackBoardControlsOpened({ surface: 'play_drawer', source: 'player_menu' });
+    setBleControlVisible(true);
+  }, [phoneLinked, sheetOffersDrive]);
+  // Disconnect board. A spray wall's LAN hold has no radio to hang up, so it
+  // gives the wall back, as the board sheet's Disconnect does there.
+  const handleDisconnectBoard = useCallback(() => {
+    if (sprayLedHold) bluetooth?.releaseVirtualWall();
+    else disconnectAllBluetooth();
+  }, [sprayLedHold, bluetooth]);
+  // The bulb's own press would take a crewmate's spray wall from them: it knows
+  // nothing of the LED setup, so the relay is run from here.
+  const relaysFromPlayer = climbOnCrewGymBoard || (sprayLedWall && lightbulbPressAction === 'relay');
+  // What each tap action runs; `useWallControl` (below) picks one from the model.
+  const wallControlRunners = useMemo(
+    () => ({
+      light: handleLightThisClimb,
+      // On the crew's gym board the relay commits the preview to the session;
+      // the bulb's own press would connect this phone to its own board.
+      toggle: relaysFromPlayer ? handleRelayToHolder : handleLightbulb,
+      // Disconnect board: let go of it, as the board sheet's Disconnect does.
+      // That frees it for the next climber; it stays remembered for 10 minutes.
+      disconnect: handleDisconnectBoard,
+      openSheet: openBoardSheet,
+      lightAgain: handleLightAgain,
+      moveToBoard: handleMoveToGymBoard,
+      drive: startDriving,
+      keepLighting: handleKeepLighting,
+    }),
+    [
+      handleLightThisClimb,
+      relaysFromPlayer,
+      handleRelayToHolder,
+      handleLightbulb,
+      handleDisconnectBoard,
+      openBoardSheet,
+      handleLightAgain,
+      handleMoveToGymBoard,
+      startDriving,
+      handleKeepLighting,
+    ],
+  );
+
+  // A swipe step changes the climb with these, whichever render it follows.
+  useSwipeNavigation(swipePager, handleNextSwipeStep, handlePrevSwipeStep);
+
+  // --- The end of the list (#6664) -------------------------------------------
+  //
+  // At the list's last climb Next, and one more forward swipe, open the end
+  // card instead of falling into the queue. While more of the list is loading
+  // there is no card (`trackEndCard` is null) and Next waits for the page.
+  const openTrackEndCard = useCallback(() => {
+    setTrackEndCardClimbUuid(displayedClimbUuid ?? null);
+  }, [displayedClimbUuid]);
+  const closeTrackEndCard = useCallback(() => setTrackEndCardClimbUuid(null), []);
+  const trackEndCardVisible =
+    trackEndCard !== null && trackEndCardClimbUuid !== null && trackEndCardClimbUuid === displayedClimbUuid;
+  useTrackEndSwipe(swipePager, trackEndCard ? openTrackEndCard : null);
+  const handleNextPress = trackEndCard ? openTrackEndCard : handleNextButton;
+  // The board's VoiceOver / TalkBack adjust action, the swipe's stand-in.
+  const handleNextAdjust = trackEndCard ? openTrackEndCard : handleNextSwipe;
+  const canPressNext = navigationState.canNext || trackEndCard !== null;
+  const trackEndAction = trackEndCard?.action ?? null;
+  const handleTrackEndKeepGoing = useCallback(() => {
+    setTrackEndCardClimbUuid(null);
+    if (!trackEndAction) return;
+    if (trackEndAction.kind === 'backToCommitted') {
+      // A preview's list ended: its queue starts back at the committed climb.
+      handleBackToLive();
+      return;
+    }
+    continueIntoQueue(trackEndAction.target);
+  }, [trackEndAction, handleBackToLive, continueIntoQueue]);
+
+  // The lightbulb's relay while a session peer drives the wall (see the
+  // `useLightbulbControl` call above). Committing a pinned preview IS the relay:
+  // it makes the climb the session's current one, and the holder's auto-sender
+  // writes whatever is current, so the climb lights on their link.
+  //
+  // With no preview pinned, leave the session current climb alone. This is not
+  // a remote re-light: recovering a failed holder write needs a reassert path.
+  useEffect(() => {
+    relayToHolderRef.current = commitDisplayedToWall;
+  }, [commitDisplayedToWall]);
+
+  const handleMirror = useCallback(() => {
+    if (!displayedClimbUuid) return;
+    track(SHARED_EVENTS.MirrorClimb, {
+      ...actionsAnalytics,
+      climbUuid: displayedClimbUuid,
+      boardName,
+      layoutId,
+      isMirrored: !isMirrored, // send the new orientation
+      surface: 'play_drawer',
+      shared: sharesMirrorState,
+    });
+    if (isPreview) {
+      setPreviewMirrorFlip({ climbUuid: displayedClimbUuid, mirrored: !isMirrored });
+    } else if (currentClimbQueueItem) {
+      const headItem = getQueueSnapshot().currentClimbQueueItem;
+      if (headItem?.uuid !== currentClimbQueueItem.uuid || headItem.climb.uuid !== displayedClimbUuid) return;
+      void mirrorCurrentClimb(!(headItem.climb.mirrored === true), headItem.uuid);
+    }
+  }, [
+    actionsAnalytics,
+    displayedClimbUuid,
+    isMirrored,
+    isPreview,
+    sharesMirrorState,
+    currentClimbQueueItem,
+    mirrorCurrentClimb,
+    getQueueSnapshot,
+    boardName,
+    layoutId,
+  ]);
+
+  // Pin the current target before opening the beta composer.
+  const handleOpenAddBetaVideo = useCallback(() => {
+    if (!displayedClimb) return;
+    setBetaVideoTarget({ climb: displayedClimb, boardConfig: { boardName, layoutId, sizeId, setIds, angle } });
+    setAddBetaVideoOpen(true);
+  }, [displayedClimb, boardName, layoutId, sizeId, setIds, angle, setBetaVideoTarget]);
+
+  // ⋯ beta: pin the climb/board the menu was opened for so a party-session
+  // queue/angle change mid-menu can't retarget the sheet (#3505).
+  const handleOpenAddBetaVideoForClimb = useCallback(
+    (targetClimb: Climb, targetBoardConfig: BoardConfig) => {
+      setBetaVideoTarget({ climb: targetClimb, boardConfig: targetBoardConfig });
+      setAddBetaVideoOpen(true);
+    },
+    [setBetaVideoTarget],
+  );
+
+  // ⋯ tick: open the drawer's OWN in-tree tick sheet (it stacks above the `/play`
+  // modal) instead of the root LogAscent sheet, which mounts behind `/play` —
+  // presenting it dismisses `/play` and the tick sheet closes on its own. Pin the
+  // climb/board the menu was opened for so a mid-menu queue change can't retarget
+  // it. ⋯ offers no tick row today (the hero button is always there), but the menu
+  // still takes the opener so a row added later can't fall back to the root sheet.
+  const handleOpenTickForClimb = useCallback(
+    (targetClimb: Climb, targetBoardConfig: BoardConfig, source?: { queueItemUuid?: string }) => {
+      resetZoomRef.current?.();
+      const activeBoard = activeBoardForLoggingRef.current;
+      const matchesActiveBoard =
+        activeBoard?.boardType === targetBoardConfig.boardName &&
+        activeBoard.layoutId === targetBoardConfig.layoutId &&
+        activeBoard.sizeId === targetBoardConfig.sizeId &&
+        activeBoard.setIds === targetBoardConfig.setIds &&
+        activeBoard.angle === targetBoardConfig.angle;
+      setTickTarget({
+        climb: targetClimb,
+        boardConfig: targetBoardConfig,
+        isMirror:
+          !source && isPreview && targetClimb.uuid === displayedClimbUuid
+            ? isMirrored
+            : resolveTickMirror(
+                getQueueSnapshot(),
+                targetClimb,
+                source
+                  ? source.queueItemUuid
+                  : targetClimb.uuid === displayedClimbUuid
+                    ? (displayedQueueItemUuid ?? undefined)
+                    : undefined,
+                matchesActiveBoard,
+              ),
+      });
+      setIsTickBarActive(true);
+    },
+    [setTickTarget, displayedClimbUuid, displayedQueueItemUuid, isPreview, isMirrored, getQueueSnapshot],
+  );
+
+  // ⋯ report: open the drawer's OWN in-tree sheet (it stacks above the `/play`
+  // modal) instead of the root one, and pin the climb/board the menu was opened
+  // for so a party-session queue/angle change can't retarget it (#3505).
+  const handleOpenReportClimbForClimb = useCallback(
+    (targetClimb: Climb, targetBoardConfig: BoardConfig) => {
+      setReportTarget({ climb: targetClimb, boardConfig: targetBoardConfig });
+      setReportClimbOpen(true);
+    },
+    [setReportTarget],
+  );
+
+  // Same rule as handleCloseAddBetaVideo: leave reportTarget alone while the
+  // sheet animates out, the next open overwrites it.
+  const handleCloseReportClimb = useCallback(() => {
+    setReportClimbOpen(false);
+  }, []);
+
+  // ⋯ add to playlist: the drawer's OWN picker sheet, for the reason the report
+  // has one (#3294 was the root picker flashing closed under `/play`).
+  const handleOpenAddToPlaylistForClimb = useCallback(
+    (targetClimb: Climb, targetBoardConfig: BoardConfig) => {
+      setPlaylistTarget({ climb: targetClimb, boardConfig: targetBoardConfig });
+      setAddToPlaylistOpen(true);
+    },
+    [setPlaylistTarget],
+  );
+  const climbActionPresentersRef = useRef({
+    tick: handleOpenTickForClimb,
+    beta: handleOpenAddBetaVideoForClimb,
+    report: handleOpenReportClimbForClimb,
+    playlist: handleOpenAddToPlaylistForClimb,
+  });
+  climbActionPresentersRef.current = {
+    tick: handleOpenTickForClimb,
+    beta: handleOpenAddBetaVideoForClimb,
+    report: handleOpenReportClimbForClimb,
+    playlist: handleOpenAddToPlaylistForClimb,
+  };
+  useEffect(() => {
+    if (isPane || isAnonymous || !isAuthenticated) return;
+    return registerClimbActionPresenters({
+      tick: (climb, board, source) => climbActionPresentersRef.current.tick(climb, board, source),
+      beta: (climb, board) => climbActionPresentersRef.current.beta(climb, board),
+      report: (climb, board) => climbActionPresentersRef.current.report(climb, board),
+      playlist: (climb, board) => climbActionPresentersRef.current.playlist(climb, board),
+    });
+  }, [isPane, isAnonymous, isAuthenticated]);
+
+  const handleCloseAddToPlaylist = useCallback(() => {
+    setAddToPlaylistOpen(false);
+  }, []);
+
+  // Don't clear betaVideoTarget here: the sheet is still animating out and reads
+  // from it, so nulling it mid-dismiss would swap the shown climb for a frame. The
+  // next open overwrites it with the newly selected target.
+  const handleCloseAddBetaVideo = useCallback(() => {
+    setAddBetaVideoOpen(false);
+  }, []);
+
+  // Logbook card "See full logbook": the virtualised history sheet.
+  // Pinned to the climb it was opened on: a climb change closes it for good.
+  const {
+    climbUuid: fullLogbookClimbUuid,
+    open: handleOpenFullLogbook,
+    close: handleCloseFullLogbook,
+  } = useFullLogbookSheet(displayedClimbUuid);
+  // Climber logs card: "See all logs" opens the virtualised list; a row opens
+  // that climber's profile; the empty states lead to climber search. Both routes
+  // are plain cards on the root stack, and on iOS a card pushed while the
+  // `/play` modal is up lands beneath it (docs/mobile/mobile-sheets-vs-routes.md), so
+  // they leave through `usePushAfterPlayerDismiss`.
+  const handleOpenClimberLogs = useCallback(() => {
+    setClimberLogsClimbUuid(displayedClimbUuid ?? null);
+  }, [displayedClimbUuid]);
+  const handleCloseClimberLogs = useCallback(() => {
+    setClimberLogsClimbUuid(null);
+  }, []);
+  const pushAfterPlayerDismiss = usePushAfterPlayerDismiss(dismissPlayerAndWait);
+  const handleOpenClimberProfile = useCallback(
+    (userId: string) => {
+      pushAfterPlayerDismiss(() => router.push({ pathname: '/users/[userId]', params: { userId } }));
+    },
+    [pushAfterPlayerDismiss],
+  );
+  const handleFindClimbers = useCallback(() => {
+    pushAfterPlayerDismiss(() => router.push('/users/search'));
+  }, [pushAfterPlayerDismiss]);
+  // "Workout done" → See your workout: the Record tab's card, once the player is
+  // out of the way (the pane has nothing to dismiss and goes straight there).
+  const handleSeeWorkout = useCallback(() => {
+    pushAfterPlayerDismiss(() => router.navigate('/(tabs)/record'));
+  }, [pushAfterPlayerDismiss]);
+  // The preview-first card goes for good on any of its exits; Lighting settings
+  // also opens Settings › Board once the player is out of the way.
+  const handlePreviewFirstTipExit = useCallback(
+    (exit: PlayerPreviewTipExit) => {
+      retirePreviewFirstTip();
+      if (exit === 'settings') {
+        // The Board page, opened on its lighting group, where the keep-lighting choice is.
+        pushAfterPlayerDismiss(() =>
+          router.push({ pathname: '/settings/board-look', params: { section: BOARD_LOOK_LIGHTING_SECTION } }),
+        );
+      }
+    },
+    [pushAfterPlayerDismiss],
+  );
+  // The card's height, so expanding the section below it still scrolls that
+  // section (not the card) into view.
+  const [previewFirstTipHeight, setPreviewFirstTipHeight] = useState(0);
+  const handlePreviewFirstTipLayout = useCallback((event: LayoutChangeEvent) => {
+    setPreviewFirstTipHeight(Math.round(event.nativeEvent.layout.height));
+  }, []);
+  const previewFirstTipOffset = previewFirstTip.visible ? previewFirstTipHeight + spacing[3] : 0;
+
+  // Arm (expand) / disarm (collapse) the scroll-into-view for the first section peek.
+  const handleFirstSectionToggle = useCallback(
+    (expanded: boolean) => {
+      pendingFirstSectionScrollRef.current = expanded;
+      if (expanded) requestBelowFoldContent();
+    },
+    [requestBelowFoldContent],
+  );
+
+  const handleOpenAngleSelector = useCallback(() => {
+    setActiveSubDrawer('angleSelector');
+  }, []);
+
+  const handleCloseSubDrawer = useCallback(() => {
+    setActiveSubDrawer('none');
+  }, []);
+
+  // Track only when a climb is displayed: the sheet itself is gated on
+  // `displayedClimb`, and a null climbUuid would pollute the
+  // Dismissed + Saved <= Opened watchdog this event exists to power.
+  const trackTickOpened = useCallback(() => {
+    if (!displayedClimb) return;
+    track(SHARED_EVENTS.QuickTickOpened, {
+      ...actionsAnalytics,
+      climbUuid: displayedClimb.uuid,
+      layoutId: layoutId ?? null,
+      source: 'play_fab',
+    });
+  }, [displayedClimb, layoutId, actionsAnalytics]);
+
+  const handleTickFabPress = useCallback(() => {
+    resetZoomRef.current?.();
+    trackTickOpened();
+    if (!displayedClimb) return;
+    // Keep the draft tied to its target even if the live queue or privacy changes.
+    setTickTarget({
+      climb: displayedClimb,
+      boardConfig: { boardName, layoutId, sizeId, setIds, angle },
+      isMirror: isPreview
+        ? isMirrored
+        : resolveTickMirror(getQueueSnapshot(), displayedClimb, displayedQueueItemUuid ?? undefined),
+    });
+    setIsTickBarActive(true);
+  }, [
+    trackTickOpened,
+    displayedClimb,
+    boardName,
+    layoutId,
+    sizeId,
+    setIds,
+    angle,
+    setTickTarget,
+    isPreview,
+    isMirrored,
+    getQueueSnapshot,
+    displayedQueueItemUuid,
+  ]);
+
+  // Long-press opens the same QuickTickBar as a short press; LogAscentSheet
+  // has been retired in favour of a single ticking surface (see PR #2366).
+  const handleTickFabLongPress = handleTickFabPress;
+
+  const handleTickBarDismiss = useCallback(() => {
+    setIsTickBarActive(false);
+  }, []);
+
+  const handleResetZoomReady = useCallback((resetFn: () => void) => {
+    resetZoomRef.current = resetFn;
+  }, []);
+
+  // One element for both header sites (the swipeable header and the live model).
+  const headerLeading = headerPillState ? (
+    <WallStatePill
+      state={headerPillState}
+      backTarget={headerBackTarget}
+      targetName={headerBackTargetName}
+      latched={browseLatchActive}
+      onPress={handleBackToLive}
+    />
+  ) : undefined;
+  // What every drawn header holds in the chip's place: the real chip, invisible,
+  // so it measures the same flank (with or without the driver's face).
+  const headerLeadingReserve = headerPillState ? (
+    <WallStatePill state={headerPillState} backTarget={headerBackTarget} reserveOnly />
+  ) : undefined;
+  const currentHeaderModel = useLivePlayDrawerHeaderModel({
+    climb: displayedClimb ?? null,
+    boardName: boardName as BoardName,
+    layoutId,
+    angle,
+    leading: headerLeading,
+    onLongPressName: handleCopyName,
+    onPressSetter: openSetterPlaylist,
+  });
+  // Wall Control Shown: only while the control that asks is drawn: the wall
+  // button, or for a connect the bulb (the player's, or the MiniPlayer's
+  // standing in for it).
+  const wallControlDrawn = !isAnonymous && !showBoardMismatch && isWallControlDrawn(actionBarLayout, wallControlState);
+  // The one handler behind every view of the board control: the tap, the
+  // hold, and the three events, once each whichever view was used.
+  const wallControlHandlers = useWallControl({
+    analyticsContext: actionsAnalytics,
+    model: wallControl,
+    runners: wallControlRunners,
+    climbUuid: displayedClimbUuid ?? null,
+    // The sheet mounts per open. The iPad pane stays mounted, so there an open
+    // is the stretch it shows a climb rather than its placeholder.
+    playerOpen: isPane ? displayedClimb != null : isSheetOpen,
+    visible: wallControlDrawn,
+    linked: phoneLinked,
+    // Why the climb on screen is a preview: how often a default preview gets
+    // lit is the 2.7 question.
+    previewReason: wallControlPreviewReason({
+      isPreview,
+      otherBoard: previewOnOtherBoard,
+      inSession: browseByDefault,
+    }),
+  });
+  wallControlAnswersRef.current = wallControlHandlers;
+  // The board's spoken value: the climb on screen by name and grade, and its
+  // place in the list the top bar names ("Yoshi's Island, V5, 5 of 40"), then
+  // Up next's stretch or the preview note. Every adjust reads it, and a step
+  // the climber took announces it where it lands.
+  const boardValueText = formatBoardClimbValue({
+    climbName: currentHeaderModel?.headerProps.name,
+    grade: currentHeaderModel ? describePlayDrawerGrade(currentHeaderModel.headerProps, tClimbs) : null,
+    trackLabel: workoutStageParts === null ? currentTrackLabel : NO_TRACK_LABEL,
+    extra: boardExtraValueText,
+    t,
+    locale: trackLocale,
+  });
+  noteBoardValueStepRef.current = useBoardValueAnnouncement({
+    displayedClimbUuid: displayedClimb?.uuid ?? null,
+    nextClimbUuid: navigationState.nextItem?.climb?.uuid ?? null,
+    previousClimbUuid: navigationState.prevItem?.climb?.uuid ?? null,
+    value: boardValueText,
+  });
+  // The MiniPlayer's bulb on an unlit last pick (owner decision A): the preview
+  // it opened has landed, so press Put on board for it through this handler,
+  // the wall button's own path. In a crew it waits for the browse latch, so
+  // the busy-wall question compares against the wall at the pick; a drive
+  // never asks. Analytics count it as the bar's control (`mini_bar`).
+  // `mini_bar` runs the button's tap (`tapAction`): nothing to light, or a stop
+  // where the pick is already lit, presses nothing.
+  const pressWallControlForBar = usePutOnBoardIntentPress(wallControl.tapAction, wallControlHandlers.press);
+  const clearPutOnBoard = useCallback(() => setPutOnBoardFor(null), []);
+  usePutOnBoardIntent({
+    intendedFor: putOnBoardFor,
+    clear: clearPutOnBoard,
+    previewItemUuid: drawerPreviewItem?.uuid ?? null,
+    ready: !isSharedSession || browseLatchActive || drivingLive,
+    press: pressWallControlForBar,
+  });
+  // The board sheet's Light every climb row (#7113): the sheet closes itself.
+  const { drive: driveWallControl } = wallControlHandlers;
+  const handleBoardSheetDrive = useCallback(() => {
+    driveWallControl('button');
+  }, [driveWallControl]);
+  // With the bulb chosen, the MiniPlayer beside this player draws the bulb for
+  // it: that bulb draws this model and runs these handlers, so its face and its
+  // taps match (pane-wall-control-store, `control: 'mini_bar'`).
+  const paneWallControl = useMemo(
+    () => ({
+      model: wallControl,
+      press: () => wallControlHandlers.press('mini_bar'),
+      longPress: () => wallControlHandlers.longPress('mini_bar'),
+    }),
+    [wallControl, wallControlHandlers],
+  );
+  useEffect(() => {
+    if (!miniPlayerMirrors) return undefined;
+    const owner = wallControlOwnerRef.current;
+    registerPaneWallControl(owner, paneWallControl);
+    return () => registerPaneWallControl(owner, null);
+  }, [miniPlayerMirrors, paneWallControl]);
+  // Only confirmed physical driving needs hold geometry for the button's frost.
+  // Swipe previews use flat progress; a target gym board owns its LED contract.
+  const wallGlowShown =
+    !isAnonymous && wallControlFrostHasLeds(playerBoardLighting, climbGymBoard) && wallControlUsesFrost(wallControl);
+  // The preview-first card draws the real wall button frosted in this climb's
+  // colours, so it needs the same hold geometry while it is up.
+  const wallGlowWanted = wallGlowShown || previewFirstTip.visible;
+  const wallGlowFrames = wallGlowWanted
+    ? playback.isAnimatable
+      ? playback.currentFrameString
+      : (displayedClimb?.frames ?? '')
+    : '';
+  const wallGlowParsed = useParseFrames(
+    wallGlowFrames,
+    boardName as BoardName,
+    boardRenderData?.holdsData ?? EMPTY_HOLD_PLACEMENTS,
+    isMirrored,
+  );
+  const holdStateColours = useHoldStateColors(boardName as BoardName, layoutId);
+  const wallGlowInput = useMemo<WallGlowInput | null>(() => {
+    if (!wallGlowWanted || !boardRenderData) return null;
+    return buildWallGlowInput({
+      parsedHolds: wallGlowParsed,
+      roleColors: holdStateColours,
+      boardWidth: boardRenderData.boardWidth,
+      boardHeight: boardRenderData.boardHeight,
+      climbUuid: displayedClimbUuid ?? null,
+      frames: wallGlowFrames,
+      mirrored: isMirrored,
+    });
+  }, [
+    wallGlowWanted,
+    boardRenderData,
+    wallGlowParsed,
+    holdStateColours,
+    displayedClimbUuid,
+    wallGlowFrames,
+    isMirrored,
+  ]);
+  // The frost follows the board's swap (option I): the board copies each swap
+  // frame here on the UI thread, and the button gets the neighbours' holds once
+  // per pair: only while the frost is up and moving (the flag, no Reduce
+  // Motion) on a binary whose frost can follow. Anywhere else nothing parses.
+  const frostSwapFrames = useSharedValue<BoardSwapFrame | null>(null);
+  const frostMotionOffered = useWallFrostMotionEnabled();
+  const reduceMotion = useReduceMotion();
+  const frostFollowsBoard = wallGlowShown && FROST_FOLLOWS_SWAP && frostMotionOffered && !reduceMotion;
+  const nextGlowFrames = frostFollowsBoard ? (nextPeekFrames ?? '') : '';
+  const previousGlowFrames = frostFollowsBoard ? (prevPeekFrames ?? '') : '';
+  const holdPlacements = boardRenderData?.holdsData ?? EMPTY_HOLD_PLACEMENTS;
+  const nextGlowParsed = useParseFrames(nextGlowFrames, boardName as BoardName, holdPlacements, isMirrored);
+  const previousGlowParsed = useParseFrames(previousGlowFrames, boardName as BoardName, holdPlacements, isMirrored);
+  const nextClimbUuid = nextHeaderClimb?.uuid ?? null;
+  const previousClimbUuid = previousHeaderClimb?.uuid ?? null;
+  const nextWallGlowInput = useMemo<WallGlowInput | null>(() => {
+    if (!nextGlowFrames || !boardRenderData) return null;
+    return buildWallGlowInput({
+      parsedHolds: nextGlowParsed,
+      roleColors: holdStateColours,
+      boardWidth: boardRenderData.boardWidth,
+      boardHeight: boardRenderData.boardHeight,
+      climbUuid: nextClimbUuid,
+      frames: nextGlowFrames,
+      mirrored: isMirrored,
+    });
+  }, [nextGlowFrames, boardRenderData, nextGlowParsed, holdStateColours, nextClimbUuid, isMirrored]);
+  const previousWallGlowInput = useMemo<WallGlowInput | null>(() => {
+    if (!previousGlowFrames || !boardRenderData) return null;
+    return buildWallGlowInput({
+      parsedHolds: previousGlowParsed,
+      roleColors: holdStateColours,
+      boardWidth: boardRenderData.boardWidth,
+      boardHeight: boardRenderData.boardHeight,
+      climbUuid: previousClimbUuid,
+      frames: previousGlowFrames,
+      mirrored: isMirrored,
+    });
+  }, [previousGlowFrames, boardRenderData, previousGlowParsed, holdStateColours, previousClimbUuid, isMirrored]);
+  const wallSwap = useMemo<WallControlSwap | undefined>(
+    () =>
+      frostFollowsBoard
+        ? {
+            frames: frostSwapFrames,
+            centerPage: swipeCenterPage,
+            previous: previousWallGlowInput,
+            next: nextWallGlowInput,
+            look: PLAYER_SWAP_LOOK_ENCODED,
+          }
+        : undefined,
+    [frostFollowsBoard, frostSwapFrames, swipeCenterPage, previousWallGlowInput, nextWallGlowInput],
+  );
+  // View options draws its buttons preview for the board on screen.
+  const buttonsPreviewBoard = useMemo(
+    () => ({ supportsMirroring, angleAvailable, angle: activeAngle, showLightbulb: hasBluetooth }),
+    [supportsMirroring, angleAvailable, activeAngle, hasBluetooth],
+  );
+  const openingLayoutKey =
+    sectionsReady && boardRenderData && displayedClimb && currentHeaderModel
+      ? buildOpeningLayoutKey({
+          boardName: boardName as BoardName,
+          layoutId,
+          sizeId,
+          setIds,
+          boardWidth: boardRenderData.boardWidth,
+          boardHeight: boardRenderData.boardHeight,
+          climbUuid: displayedClimb.uuid,
+          frames: displayedClimb.frames,
+          viewportWidth: windowWidth,
+          viewportHeight: windowHeight,
+          fontScale,
+          pixelRatio: PixelRatio.get(),
+          locale: i18n.language,
+          insets,
+          preferencesFingerprint: JSON.stringify([sections, sectionOrder]),
+          firstSectionId: hasVisibleSections ? (firstSectionId ?? null) : null,
+          presentation: isPane ? 'pane' : 'sheet',
+          paneInset: paneTopInset ? insets.top : 0,
+          headerFingerprint: JSON.stringify([
+            currentHeaderModel.layoutFingerprint,
+            isAnonymous,
+            showBoardMismatch,
+            headerPillState,
+          ]),
+          controlsFingerprint: JSON.stringify([
+            isAngleAdjustable,
+            isAuthenticated,
+            isTickBarActive,
+            commitButton,
+            workoutOutcome !== null,
+            bluetooth !== null,
+            boardSupportsMirroring(boardName, layoutId),
+            actionBarLayout.secondaryRow,
+            controlsPosition,
+            tabletop,
+          ]),
+          lostBanner: lostHoldCount > 0,
+          playbackFingerprint: JSON.stringify([playback.isAnimatable]),
+        })
+      : undefined;
+  const {
+    cachedOpeningLayout,
+    boardContainerSize,
+    handleBoardContainerLayout,
+    onViewportMeasured,
+    onHeaderMeasured,
+    onSectionHeaderMeasured,
+  } = usePlayOpeningLayout({
+    openingLayoutKey,
+    windowWidth,
+    windowHeight,
+    sheetViewportHeight,
+    headerBottomY,
+    hasVisibleSections,
+    firstSectionHeaderHeight,
+    handleViewportLayout,
+    handleHeaderLayout,
+    handleFirstSectionHeaderLayout,
+  });
+
+  // `fitsBoardToHeight` is resolved above, where the preview-first card reads it too.
+  const firstScreenPaddingBottom = fitsBoardToHeight && isPane ? insets.bottom : 0;
+  const firstScreenViewport = sheetViewportHeight || cachedOpeningLayout?.viewportHeight || windowHeight;
+  // In tabletop the controls sit between the first screen and the sections.
+  const [tabletopControlsHeight, setTabletopControlsHeight] = useState(0);
+  const handleTabletopControlsLayout = useCallback((event: LayoutChangeEvent) => {
+    setTabletopControlsHeight(Math.round(event.nativeEvent.layout.height));
+  }, []);
+  const firstScreenHeight = tabletop
+    ? (tabletopFoldTop ?? 0)
+    : fitsBoardToHeight
+      ? computeFitToHeightFirstScreenHeight({
+          viewport: firstScreenViewport,
+          bottomInset: insets.bottom,
+          belowFoldHeight: isPane ? firstScreenPaddingBottom : ACTION_BAR_SECONDARY_ROW_HEIGHT,
+        })
+      : computeDrawerFirstScreenHeight({
+          viewport: firstScreenViewport,
+          bottomInset: insets.bottom,
+          firstSectionHeaderHeight: hasVisibleSections
+            ? firstSectionHeaderHeight || cachedOpeningLayout?.firstSectionHeaderHeight || DEFAULT_SECTION_HEADER_HEIGHT
+            : null,
+          sectionTopPadding: spacing[3],
+          sectionMargin: spacing[2],
+        });
+  // Named because the wall-state callout needs it too: it hangs off the header's
+  // measured bottom edge, and that measurement is relative to the a11y-trap
+  // wrapper INSIDE this padding, not to the first screen itself.
+  // In the pane a docked WallStrip can already own the top inset.
+  const ownsTopInset = !isPane || paneTopInset;
+  const firstScreenPaddingTop = ownsTopInset ? insets.top + spacing[2] : spacing[2];
+
+  // When the user expands the first section peek, glide it fully into view. Fires on the
+  // section's layout (re-firing as a slow logbook fetch grows it) while armed.
+  // The first visible section starts right after the
+  // fixed-height first screen, past the DeferredSections top padding.
+  const handleFirstSectionLayout = useCallback(
+    (sectionHeight: number) => {
+      if (!pendingFirstSectionScrollRef.current) return;
+      const target = computeFirstSectionScrollTarget({
+        // In tabletop the controls sit between the first screen and the sections,
+        // and the preview-first card sits above them while it is up.
+        firstScreenHeight: firstScreenHeight + (tabletop ? tabletopControlsHeight : 0) + previewFirstTipOffset,
+        topPadding: spacing[3],
+        sectionHeight,
+        viewport: sheetViewportHeight || windowHeight,
+        topInset: insets.top,
+        bottomInset: insets.bottom,
+        margin: spacing[2],
+      });
+      scrollRef.current?.scrollTo({ y: target, animated: true });
+    },
+    [
+      firstScreenHeight,
+      tabletop,
+      tabletopControlsHeight,
+      previewFirstTipOffset,
+      sheetViewportHeight,
+      windowHeight,
+      insets.bottom,
+      insets.top,
+    ],
+  );
+
+  const ascentCount = displayedClimb?.userAscents ?? 0;
+
+  const angleSelectorVisible = activeSubDrawer === 'angleSelector';
+  const climberLogsOpen = climberLogsClimbUuid !== null && climberLogsClimbUuid === displayedClimbUuid;
+
+  // The phone split swaps this route for the pane mid-read; the pane picks up the
+  // same climb where the climber was, and waits while anything here is open (see
+  // route-player-handoff).
+  const readScrollOffset = useCallback(() => scrollYSV.value, [scrollYSV]);
+  const anySheetVisible = useAnySheetVisible();
+  const routeHasOpenWork =
+    isTickBarActive ||
+    activeSubDrawer !== 'none' ||
+    addBetaVideoOpen ||
+    addToPlaylistOpen ||
+    reportClimbOpen ||
+    sectionsSettingsOpen ||
+    climberLogsOpen ||
+    fullLogbookClimbUuid !== null ||
+    bleControlVisible;
+  const playerKeyboardProps = usePlayerKeyboardNavigation({
+    enabled: displayedClimb != null && !routeHasOpenWork && !anySheetVisible,
+    label: displayedClimb?.name,
+    canPrevious: navigationState.canPrevious,
+    canNext: canPressNext,
+    onPrevious: handlePrevButton,
+    onNext: handleNextPress,
+    onEscape: trackEndCardVisible ? closeTrackEndCard : isPane ? undefined : handleDismiss,
+  });
+  usePlayDrawerActionsExposure({
+    context: actionsAnalytics,
+    climbUuid: displayedClimbUuid ?? null,
+    boardName,
+    layoutId,
+    visible:
+      !miniPlayerMirrors && !showBoardMismatch && !routeHasOpenWork && !anySheetVisible && boardRenderData !== null,
+  });
+  const handleDrawerAngleChange = useCallback(
+    (nextAngle: number) => {
+      onAngleChange?.(nextAngle, actionsAnalytics);
+    },
+    [onAngleChange, actionsAnalytics],
+  );
+  const routePreview = useMemo(
+    () =>
+      drawerPreviewItem
+        ? {
+            item: drawerPreviewItem,
+            suggestionSource: drawerPreviewSuggestionSource,
+            isWallClimb: drawerPreviewIsWallClimb,
+            previewCommitOptions: getPreviewCommitOptions(),
+          }
+        : null,
+    [drawerPreviewItem, drawerPreviewSuggestionSource, drawerPreviewIsWallClimb, getPreviewCommitOptions, openTarget],
+  );
+  const handleScrollContentSizeChange = useRoutePlayerHandoff({
+    isPane,
+    acceptsHandoff: acceptsScrollHandoff,
+    busy: routeHasOpenWork,
+    displayedClimbUuid,
+    preview: routePreview,
+    scrollRef,
+    readScrollOffset,
+    viewportHeight: sheetViewportHeight || windowHeight,
+    requestBelowFoldContent,
+  });
+  const showPanePlaceholder = shouldShowPanePlaceholder(isPane, displayedClimb != null);
+  // The landscape iPad panel follows the climb on screen. Memoised on what it
+  // reads, so the panel's memoised content skips the player's own re-renders.
+  const sidePanelClimb = useMemo(
+    () =>
+      displayedClimb
+        ? { climb: displayedClimb, boardName, layoutId, angle, onOpenFullLogbook: handleOpenFullLogbook }
+        : null,
+    [displayedClimb, boardName, layoutId, angle, handleOpenFullLogbook],
+  );
+
+  // Controls region — gated by the switch-board overlay when the displayed
+  // climb is on a board the user isn't currently on. Board art + swipe stay
+  // interactive for viewing. The controls are wrapped so assistive tech can't
+  // reach them while gated (on BOTH platforms — the scrim's
+  // accessibilityViewIsModal is iOS-only); the overlay itself stays a sibling so
+  // its "Switch board" action remains focusable.
+  //
+  // It sits under the board, or between the header and the board when the
+  // climber chose Above the board (#6229). The block moves whole, so the scrim
+  // and its card still cover every control. Above the board the bar leads and
+  // the playback slider follows, so the slider stays next to the board.
+  //
+  // The card is taller than the controls (more so with the small row switched
+  // off), and a card that spilled out of the region would sit under whichever
+  // sibling comes next (the board above the fold, the first section below it),
+  // which then takes the taps meant for Switch board. So while the card is up
+  // the region is at least as tall as the card. Above the board the region also
+  // sits over its later siblings, in case a font change outgrows the last
+  // measurement for a frame.
+  const showSwitchBoardCard = showBoardMismatch && onSwitchBoard != null;
+  const playbackControls = playback.isAnimatable ? (
+    <PlaybackControls
+      frameIndex={playback.frameIndex}
+      frameCount={playback.frameCount}
+      isPlaying={playback.isPlaying}
+      paceSeconds={playback.paceSeconds}
+      // Releasing near the pace this route's setter chose
+      // snaps back to it exactly, so "as intended" stays
+      // one easy landing on the track.
+      magnetSeconds={playback.paceMs / 1000}
+      peerFrameMismatch={playback.peerFrameMismatch}
+      onPlay={playback.play}
+      onPause={playback.pause}
+      onSeek={playback.seek}
+      onPaceSecondsChange={playback.setPaceSeconds}
+    />
+  ) : null;
+  const actionBar = (
+    <PlayDrawerActionBar
+      onPrimaryLayout={actionsVisibility.onPrimaryLayout}
+      onSecondaryLayout={actionsVisibility.onSecondaryLayout}
+      canSwipePrevious={navigationState.canPrevious}
+      canSwipeNext={canPressNext}
+      isMirrored={isMirrored}
+      supportsMirroring={supportsMirroring}
+      isFavorited={isFavorited}
+      remainingQueueCount={navigationState.remainingCount}
+      upNextBadgeCount={listWalkUpNextCount}
+      // The board control's one model and one handler, whichever view draws it.
+      wallControl={wallControl}
+      wallControlBoardId={wallControlBoardId}
+      wallGlow={wallGlowShown ? wallGlowInput : null}
+      wallSwap={wallSwap}
+      miniPlayerMirrors={miniPlayerMirrors}
+      onWallControlPress={wallControlHandlers.press}
+      onWallControlLongPress={wallControlHandlers.longPress}
+      onWallControlDrive={swipeToDriveEnabled ? wallControlHandlers.drive : undefined}
+      onWallControlSwipe={swipeToDriveEnabled ? wallControlHandlers.swipe : undefined}
+      onWallControlSwipeCancel={swipeToDriveEnabled ? wallControlHandlers.swipeCancelled : undefined}
+      boardControl={playerButtons.boardControl}
+      // Whether a Bluetooth transport exists at all, and only
+      // that. The anonymous suppression lives in the bar, with
+      // the rest of the `viewer` rules and the test that pins
+      // them — Web Bluetooth IS mounted on the browser export,
+      // so without it the bulb would render for a signed-out
+      // visitor, whose board presence binds on an active board
+      // uuid they do not have and whose first-ever visit would
+      // open with a pairing prompt. Anonymous wall lighting is
+      // its own feature (#4606), not a v1 side effect.
+      showLightbulb={bluetooth !== null}
+      hasWall={playerHasWall}
+      // The back chip owns the driver's face whenever it renders
+      // the avatar; suppress the bulb's pip so the same face never
+      // shows twice in the drawer.
+      showHolderBadge={shouldShowHolderBadge(headerPill)}
+      // While browsing, the wall button says Put on the wall; going
+      // back is the chip in the header. Only the busy-wall question
+      // (someone else moved the wall) takes the whole row: Keep
+      // theirs / Put mine up, where the second tap is the commit.
+      commitButton={commitButton}
+      // A timed workout block: the second row is one-tap Fell / Sent.
+      workoutOutcome={workoutOutcome}
+      workoutOutcomeWallLeftAtMs={workoutOutcomeShown?.wallLeftAtMs ?? null}
+      busyWall={busyWall.model}
+      onKeepTheirs={busyWall.keep}
+      // The busy-wall question's Put mine up.
+      onCommit={busyWall.put}
+      ascentCount={ascentCount}
+      onPrevClick={handlePrevButton}
+      onNextClick={handleNextPress}
+      onMirror={handleMirror}
+      onToggleFavorite={handleToggleFavorite}
+      onOpenQueue={handleOpenQueueFromBar}
+      onPlayNext={handlePlayNext}
+      playNextDisabled={displayedClimbUuid === currentClimbQueueItem?.climb.uuid}
+      onShare={displayedClimbIsDraft ? undefined : handleShare}
+      onTickPress={handleTickFabPress}
+      onTickLongPress={handleTickFabLongPress}
+      viewer={viewer}
+      onSignInPress={onSignIn}
+      currentAngle={activeAngle}
+      onOpenAngleSelector={isAngleAdjustable ? handleOpenAngleSelector : undefined}
+      buttons={playerButtons.buttons}
+      previousNext={playerButtons.previousNext}
+      // Above the board the hairline faces the board, under it.
+      edge={controlsAbove ? 'bottom' : 'top'}
+    />
+  );
+  const measuredActionBar = (
+    <View ref={actionsVisibility.actionsRef} collapsable={false} onLayout={actionsVisibility.onLayout}>
+      {actionBar}
+    </View>
+  );
+  const controlsRegion = (
+    <View
+      testID="play-drawer-controls-region"
+      onLayout={actionsVisibility.onLayout}
+      style={[
+        styles.controlsRegion,
+        controlsAbove && styles.controlsRegionAbove,
+        showSwitchBoardCard && { minHeight: switchBoardCardHeight + SWITCH_BOARD_CARD_MARGIN * 2 },
+      ]}
+    >
+      <View
+        accessibilityElementsHidden={showBoardMismatch}
+        importantForAccessibility={showBoardMismatch ? 'no-hide-descendants' : 'auto'}
+      >
+        {controlsAbove ? measuredActionBar : playbackControls}
+        {controlsAbove ? playbackControls : measuredActionBar}
+      </View>
+
+      {showSwitchBoardCard ? (
+        <SwitchBoardOverlay
+          boardLabel={switchBoardLabel ?? ''}
+          onSwitchBoard={handleSwitchBoard}
+          onCardHeight={handleSwitchBoardCardHeight}
+        />
+      ) : null}
+    </View>
+  );
+
+  return (
+    // The play route paints its background and this interactive core together.
+    // The board column is always its own view, so a rotation that brings the
+    // side panel in or out never remounts the board.
+    <View
+      {...playerKeyboardProps}
+      ref={actionsVisibility.viewportRef}
+      collapsable={false}
+      onLayout={actionsVisibility.onLayout}
+      style={[styles.root, hasSidePanel ? styles.rootSideBySide : null]}
+    >
+      <View style={[styles.playerColumn, hasSidePanel ? styles.playerColumnSideBySide : null]}>
+        {enhancementsReady ? (
+          <PlayCoreEnhancements
+            boardName={boardName}
+            climbUuid={displayedClimb?.uuid ?? null}
+            angle={angle}
+            enabled={!isAnonymous}
+            onSnapshot={handleEnhancementSnapshot}
+          />
+        ) : null}
+        {showPanePlaceholder ? (
+          (paneEmptyState ?? (
+            <EmptyState
+              size="screen"
+              icon="search"
+              title={t('playView.paneEmpty.title')}
+              body={t('playView.paneEmpty.subtitle')}
+              style={{ paddingTop: (paneTopInset ? insets.top : 0) + spacing[8], paddingBottom: insets.bottom }}
+            />
+          ))
+        ) : (
+          <GestureDetector gesture={contentGesture}>
+            <Animated.View style={[styles.content, !swipeDismiss && dismissAnimatedStyle]}>
+              <ScrollView
+                ref={scrollRef}
+                nestedScrollEnabled
+                // In tabletop the controls hang below a fixed-height first
+                // screen, so a large text size can push them past the bottom.
+                scrollEnabled={hasVisibleSections || tabletop}
+                directionalLockEnabled={Platform.OS === 'ios'}
+                showsVerticalScrollIndicator={false}
+                showsHorizontalScrollIndicator={false}
+                // No top/bottom rubber-band: at the top, a downward drag is the
+                // dismiss (the drawer translates) — a simultaneous scroll bounce would
+                // fight it and read as double movement.
+                bounces={false}
+                overScrollMode="never"
+                style={styles.content}
+                contentContainerStyle={{
+                  paddingBottom: insets.bottom,
+                  paddingLeft: contentSideInsets.left,
+                  paddingRight: contentSideInsets.right,
+                  minHeight: initialScrollHeight,
+                }}
+                onLayout={onViewportMeasured}
+                onScroll={handleScroll}
+                scrollEventThrottle={16}
+                onScrollBeginDrag={handleScrollTowardBelowFold}
+                onContentSizeChange={handleScrollContentSizeChange}
+              >
+                {displayedClimb && (
+                  <>
+                    {/* The firstScreen container owns the top safe area, so the grabber +
+                close + climb name sit at the very top. In the pane a docked WallStrip
+                can already own the top inset (paneTopInset=false). */}
+                    <View
+                      style={[
+                        styles.firstScreen,
+                        {
+                          height: firstScreenHeight,
+                          paddingTop: firstScreenPaddingTop,
+                          paddingBottom: firstScreenPaddingBottom,
+                        },
+                      ]}
+                    >
+                      <PlayStageView
+                        boardHorizontalInset={0}
+                        topChrome={
+                          <PlayTopChromeView
+                            isPane={isPane}
+                            onDismiss={handleDismiss}
+                            closeLabel={t('playView.closeAria')}
+                            chromeButtonSize={chromeButtonSize}
+                            onTrailingLayout={handleTopTrailingLayout}
+                            caption={
+                              topBarParts || topBarCaption ? (
+                                <View
+                                  style={[
+                                    styles.topListContext,
+                                    {
+                                      height: chromeButtonSize,
+                                      left: topListContextFrame.left,
+                                      right: topListContextFrame.right,
+                                    },
+                                    topListContextFrame.measured ? null : styles.topListContextUnmeasured,
+                                  ]}
+                                >
+                                  <PlayListContext
+                                    parts={topBarParts}
+                                    caption={topBarCaption}
+                                    testID="play-drawer-track-label"
+                                  />
+                                </View>
+                              ) : null
+                            }
+                            trailing={
+                              <>
+                                <View style={styles.restTimerSlot}>
+                                  <RestTimerPillHost compact />
+                                </View>
+                                {/* Every row is an account action, and the signed-out reader's
+                            gate bounces most of their targets to login. Mounted a frame
+                            after the board, like the rest of the drawer's reads; the
+                            placeholder holds its place so the timer never jumps. */}
+                                {isAnonymous ? null : (
+                                  <View style={styles.menuSlot}>
+                                    {enhancementsReady ? (
+                                      <PlayDrawerActionsMenu
+                                        climb={displayedClimb}
+                                        boardConfig={renderBoardConfig}
+                                        queueItemUuid={displayedQueueSlotUuid}
+                                        isAuthenticated={isAuthenticated}
+                                        analyticsContext={actionsAnalytics}
+                                        hidden={actionBarLayout.hidden}
+                                        boardMismatch={showBoardMismatch}
+                                        isFavorited={isFavorited}
+                                        isMirrored={isMirrored}
+                                        onToggleFavorite={handleToggleFavoriteFromMenu}
+                                        onToggleMirror={handleMirror}
+                                        onOpenAngle={isAngleAdjustable ? handleOpenAngleSelector : undefined}
+                                        onTick={handleOpenTickForClimb}
+                                        onAddBetaVideo={handleOpenAddBetaVideoForClimb}
+                                        onReportClimb={handleOpenReportClimbForClimb}
+                                        onSelectPlaylist={handleOpenAddToPlaylistForClimb}
+                                        onOpenQueue={handleOpenQueueFromMenu}
+                                        onOpenViewOptions={handleOpenSectionsSettings}
+                                        dismissPlayerAndWait={dismissPlayerAndWait}
+                                        onOpenBoardControls={
+                                          phoneLinked || sheetOffersDrive ? handleMenuBoardControls : undefined
+                                        }
+                                      />
+                                    ) : (
+                                      <View style={styles.menuPlaceholder} />
+                                    )}
+                                  </View>
+                                )}
+                              </>
+                            }
+                          />
+                        }
+                        header={
+                          <View onLayout={onHeaderMeasured}>
+                            <SwipeableHeader
+                              pager={swipePager}
+                              centerPage={swipeCenterPage}
+                              // What the WALL is doing rides the header's leading slot
+                              // (left of the name, opposite the grade). Drawn once, over
+                              // the slots, so the back chip stays put through a swipe;
+                              // every header below reserves its width. Absent when there
+                              // are no wall stakes, so the plain solo header keeps
+                              // today's mirrored-flank centring.
+                              leading={headerLeading}
+                              // The header a screen reader reads, in one place that
+                              // the climb changing never moves: every drawn header
+                              // below is hidden from it.
+                              accessibilityStandIn={
+                                currentHeaderModel ? (
+                                  <PlayDrawerHeaderAccessibility
+                                    model={currentHeaderModel}
+                                    pillState={headerPillState}
+                                    pillBackTarget={headerBackTarget}
+                                    pillTargetName={headerBackTargetName}
+                                    pillLatched={browseLatchActive}
+                                    onPillPress={handleBackToLive}
+                                    onLongPressName={handleCopyName}
+                                    onPressSetter={openSetterPlaylist}
+                                  />
+                                ) : null
+                              }
+                              // All three headers are one component, so the neighbour that
+                              // becomes current is the header already on screen, gaining
+                              // only its handlers. Each reserves the flank the pinned chip
+                              // takes, so the name and its attribute glyphs sit at one
+                              // position in every header. The reserve is invisible and
+                              // a11y-hidden: it holds space, it claims nothing.
+                              current={
+                                currentHeaderModel ? (
+                                  <LivePlayDrawerHeader
+                                    model={currentHeaderModel}
+                                    climb={null}
+                                    boardName={boardName as BoardName}
+                                    layoutId={layoutId}
+                                    angle={angle}
+                                    leading={headerLeadingReserve}
+                                    onLongPressName={handleCopyName}
+                                    onPressSetter={openSetterPlaylist}
+                                  />
+                                ) : null
+                              }
+                              previous={
+                                previousHeaderClimb ? (
+                                  <LivePlayDrawerHeader
+                                    peek
+                                    climb={previousHeaderClimb}
+                                    boardName={previousHeaderBoard.boardName as BoardName}
+                                    layoutId={previousHeaderBoard.layoutId}
+                                    angle={previousHeaderBoard.angle}
+                                    leading={headerLeadingReserve}
+                                  />
+                                ) : null
+                              }
+                              next={
+                                nextHeaderClimb ? (
+                                  <LivePlayDrawerHeader
+                                    peek
+                                    climb={nextHeaderClimb}
+                                    boardName={nextHeaderBoard.boardName as BoardName}
+                                    layoutId={nextHeaderBoard.layoutId}
+                                    angle={nextHeaderBoard.angle}
+                                    leading={headerLeadingReserve}
+                                  />
+                                ) : null
+                              }
+                            />
+                          </View>
+                        }
+                        notice={<LostHoldsBanner count={lostHoldCount} onRemix={handleRemixLostHolds ?? undefined} />}
+                        controls={controlsRegion}
+                        controlsAbove={controlsAbove}
+                        controlsBelowFold={tabletop}
+                        onBoardLayout={handleBoardContainerLayout}
+                        board={
+                          <>
+                            {boardRenderData ? (
+                              <DeferredBoard
+                                fieldColorOverride={fieldColorOverride}
+                                open={isSheetOpen}
+                                containerSize={boardContainerSize}
+                                restingHorizontalInset={spacing[4]}
+                                boardName={boardName as BoardName}
+                                boardRenderData={boardRenderData}
+                                layoutId={layoutId}
+                                sizeId={sizeId}
+                                setIds={setIds}
+                                readyBoardArt={
+                                  openTarget?.climb.uuid === displayedClimb.uuid
+                                    ? openTarget.options?.readyBoardArt
+                                    : undefined
+                                }
+                                currentFrames={displayedClimb.frames}
+                                currentFrameOverride={playback.isAnimatable ? playback.currentFrameString : null}
+                                nextFrames={nextPeekFrames}
+                                prevFrames={prevPeekFrames}
+                                prefetchFrames={upcomingPrefetchFrames}
+                                mirrored={isMirrored}
+                                canSwipeNext={canPressNext}
+                                canSwipePrevious={navigationState.canPrevious}
+                                onSwipeNext={handleNextAdjust}
+                                onSwipePrevious={handlePrevSwipe}
+                                accessibilityValueText={boardValueText}
+                                nextActionLabel={boardSignposts.nextActionLabel}
+                                previousActionLabel={boardSignposts.previousActionLabel}
+                                onResetZoomReady={handleResetZoomReady}
+                                enabled={!isTickBarActive}
+                                scrollRef={scrollGestureRef}
+                                pager={swipePager}
+                                centerPage={swipeCenterPage}
+                                dismissRef={dismissGestureRef}
+                                swapFrameMirror={frostFollowsBoard ? frostSwapFrames : undefined}
+                              />
+                            ) : (
+                              <BoardRenderUnavailable
+                                boardName={boardName}
+                                layoutId={layoutId}
+                                sizeId={sizeId}
+                                setIds={setIds}
+                                climbUuid={displayedClimb.uuid}
+                                climbName={displayedClimb.name}
+                              />
+                            )}
+                            {/* A timed block's rest and "Workout done" (#6291), for the
+                            climb on the wall. The rest card leaves the board live;
+                            both wait while the end-of-list card or the switch-board
+                            gate owns the board. */}
+                            <WorkoutRunnerOverlay
+                              sessionId={sessionId}
+                              run={workoutRun}
+                              displayedQueueItemUuid={displayedQueueItemUuid ?? null}
+                              boardName={boardName}
+                              suppressed={trackEndCardVisible || showBoardMismatch}
+                              onSeeWorkout={handleSeeWorkout}
+                            />
+                            {/* Over the board only: the header and the action bar
+                            stay live, so Previous still walks back along the list. */}
+                            {trackEndCardVisible && trackEndCard ? (
+                              <TrackEndCard
+                                model={trackEndCard}
+                                committedOnWall={committedOnWall}
+                                onKeepGoing={handleTrackEndKeepGoing}
+                                onDismiss={closeTrackEndCard}
+                              />
+                            ) : null}
+                          </>
+                        }
+                      />
+                    </View>
+
+                    {/* Tabletop: the fold's gutter, then the controls below it, out
+                      of the first screen. */}
+                    {tabletop ? (
+                      <View
+                        testID="play-drawer-tabletop-controls"
+                        style={styles.tabletopBelowFold}
+                        onLayout={handleTabletopControlsLayout}
+                      >
+                        {controlsRegion}
+                      </View>
+                    ) : null}
+
+                    {/* The one-shot preview-first card (2.7): the first section
+                      under the board, above Logbook, its headline in the
+                      Logbook peek's slot. Never over the board, and outside the
+                      first screen, so the board keeps its size. */}
+                    {previewFirstTip.visible ? (
+                      <View style={styles.previewFirstTipSlot}>
+                        <PlayerPreviewTip
+                          glow={wallGlowInput}
+                          keepLighting={previewFirstKeepLighting}
+                          alwaysDrive={alwaysDriveHere}
+                          onExit={handlePreviewFirstTipExit}
+                          onLayout={handlePreviewFirstTipLayout}
+                        />
+                      </View>
+                    ) : null}
+
+                    {/* Below-fold deferred sections. */}
+                    {hasVisibleSections && (
+                      <View>
+                        {/* The frame the board paints on an animated climb, for Active
+                          holds alone (and only while it is on): the sections' own
+                          props stay the same between playback frames. */}
+                        <PlaybackFrameContext.Provider
+                          value={
+                            visibleSectionIds.includes('activeHolds') && playback.isAnimatable
+                              ? playback.currentFrameString
+                              : null
+                          }
+                        >
+                          <CollapsibleSummaryStyleContext.Provider value={staleSummaryStyle}>
+                            <DeferredSections
+                              climb={displayedClimb}
+                              boardName={boardName as BoardName}
+                              layoutId={layoutId}
+                              sizeId={sizeId}
+                              setIds={setIds}
+                              angle={angle}
+                              enabled={isSheetOpen}
+                              contentEnabled={belowFoldContentRequested}
+                              sections={sections}
+                              order={sectionOrder}
+                              onSimilarClimbPress={handleSimilarClimbPress}
+                              onFirstSectionHeaderLayout={onSectionHeaderMeasured}
+                              onFirstSectionLayout={handleFirstSectionLayout}
+                              onFirstSectionToggle={handleFirstSectionToggle}
+                              onAddBetaVideo={isAuthenticated ? handleOpenAddBetaVideo : undefined}
+                              onOpenFullLogbook={handleOpenFullLogbook}
+                              onOpenClimberLogs={handleOpenClimberLogs}
+                              onOpenClimberProfile={handleOpenClimberProfile}
+                              onFindClimbers={handleFindClimbers}
+                            />
+                          </CollapsibleSummaryStyleContext.Provider>
+                        </PlaybackFrameContext.Provider>
+                      </View>
+                    )}
+                  </>
+                )}
+              </ScrollView>
+              {/* Android's preview-first line: always in view, whatever the scroll. */}
+              <WallStateLiveRegion text={liveRegionText} />
+              {ownsTopInset && insets.top > 0 ? (
+                <PlayDrawerStatusBarScrim height={insets.top} scrollY={scrollYSV} />
+              ) : null}
+            </Animated.View>
+          </GestureDetector>
+        )}
+
+        <PlayCoreSheetHosts
+          displayedClimb={displayedClimb}
+          boardName={boardName}
+          layoutId={layoutId}
+          sizeId={sizeId}
+          setIds={setIds}
+          angle={angle}
+          boardConfig={boardConfig}
+          activeAngle={activeAngle}
+          climbBoardMismatch={climbBoardMismatch}
+          sectionsSettingsOpen={sectionsSettingsOpen}
+          sectionsListActiveHolds={sectionsListActiveHolds}
+          buttonsPreviewBoard={buttonsPreviewBoard}
+          addBetaVideoOpen={addBetaVideoOpen}
+          addToPlaylistOpen={addToPlaylistOpen}
+          fullLogbookClimbUuid={fullLogbookClimbUuid}
+          climberLogsOpen={climberLogsOpen}
+          reportClimbOpen={reportClimbOpen}
+          angleSelectorVisible={angleSelectorVisible}
+          isTickBarActive={isTickBarActive}
+          bleControlVisible={bleControlVisible}
+          // The climb physically lit: the one on screen when it says Lit on the
+          // wall (a lit preview then reads dark after Turn off all lights), else
+          // the wall's, else the queue head.
+          wallClearedTarget={
+            displayedLit ? (displayedClimbUuid ?? null) : (wallClimbUuid ?? currentClimbQueueItem?.climb.uuid ?? null)
+          }
+          composerCredentialScope={composerCredentialScope}
+          betaVideoTarget={betaVideoTarget}
+          playlistTarget={playlistTarget}
+          reportTarget={reportTarget}
+          tickTarget={tickTarget}
+          isMirrored={isMirrored}
+          boardseshActive={boardseshActive}
+          sessionId={sessionId}
+          onAngleChange={handleDrawerAngleChange}
+          handleCloseSectionsSettings={handleCloseSectionsSettings}
+          handleCloseSubDrawer={handleCloseSubDrawer}
+          handleCloseAddBetaVideo={handleCloseAddBetaVideo}
+          handleCloseAddToPlaylist={handleCloseAddToPlaylist}
+          handleCloseFullLogbook={handleCloseFullLogbook}
+          handleCloseClimberLogs={handleCloseClimberLogs}
+          handleOpenClimberProfile={handleOpenClimberProfile}
+          handleCloseReportClimb={handleCloseReportClimb}
+          handleTickBarDismiss={handleTickBarDismiss}
+          handleCloseBleControl={handleCloseBleControl}
+          onBoardSheetDrive={sheetOffersDrive ? handleBoardSheetDrive : undefined}
+          boardSheetStatus={resolveBoardSheetStatus(wallControl)}
+        />
+      </View>
+      {renderSidePanel ? renderSidePanel(sidePanelClimb) : null}
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  root: {
+    flex: 1,
+  },
+  rootSideBySide: {
+    flexDirection: 'row',
+  },
+  playerColumn: {
+    flex: 1,
+  },
+  // A fling sends the board a window width away; the column clips it so the
+  // outgoing board never draws over the panel.
+  playerColumnSideBySide: {
+    overflow: 'hidden',
+  },
+  content: {
+    flex: 1,
+  },
+  firstScreen: {
+    width: '100%',
+  },
+  tabletopBelowFold: {
+    paddingTop: PHONE_SPLIT_FOLD_GUTTER,
+  },
+  // Lines up with the Logbook card below it (DeferredSections' own padding).
+  previewFirstTipSlot: {
+    paddingHorizontal: spacing[4],
+    paddingTop: spacing[3],
+  },
+  // Spans the room ⌄ and the timer + ⋯ cluster leave (insets set inline), and
+  // centres the label on the buttons' centre line.
+  topListContext: {
+    position: 'absolute',
+    top: 0,
+    justifyContent: 'center',
+  },
+  topListContextUnmeasured: {
+    opacity: 0,
+  },
+  // Collapses to nothing while no timer is armed, so ⋯ keeps the chevron's inset.
+  restTimerSlot: {
+    flexShrink: 1,
+    minWidth: 0,
+  },
+  // The gap sits on ⋯'s side, not the cluster's: a `gap` would still space out
+  // the empty timer slot and push ⋯ in from the edge.
+  menuSlot: {
+    marginLeft: spacing[2],
+  },
+  // ⋯'s anchor, held while the menu waits for its first frame.
+  menuPlaceholder: {
+    width: MENU_ANCHOR_SIZE,
+    height: MENU_ANCHOR_SIZE,
+  },
+  // Anchors the switch-board overlay so its scrim covers exactly the playback +
+  // action controls, leaving the board art and header above it interactive.
+  controlsRegion: {
+    position: 'relative',
+  },
+  // Over the lost-holds banner and the board, its later siblings.
+  controlsRegionAbove: {
+    zIndex: 1,
+  },
+});

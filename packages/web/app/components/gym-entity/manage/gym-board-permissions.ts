@@ -1,8 +1,9 @@
-// Pure permission helpers for the manage-gym Boards tab, mirroring the backend
-// linkBoardToGym contract: BOTH link and unlink require the viewer to own the
-// board (`board.ownerId === userId`), and linking additionally requires the
-// viewer to be the gym's owner or an admin (requireGymOwnerOrAdmin). Gym
-// editors can open the tab (canEdit) but see the board list read-only.
+// Pure permission helpers for the manage-gym Boards tab. Only linking your own
+// board is decided here, mirroring the backend linkBoardToGym staff path: the
+// viewer owns the board (`board.ownerId === userId`) and is the gym's owner or
+// an admin. Remove from gym and Delete are the server's call, read off each
+// board (`UserBoard.canRemoveFromGym`, `UserBoard.canDelete`), so no client
+// rebuilds those rules.
 
 import type { Gym, UserBoard } from '@boardsesh/shared-schema';
 
@@ -10,11 +11,6 @@ import type { Gym, UserBoard } from '@boardsesh/shared-schema';
 export function canManageGymBoards(gym: Pick<Gym, 'ownerId' | 'myRole'>, viewerUserId: string | null): boolean {
   if (!viewerUserId) return false;
   return gym.ownerId === viewerUserId || gym.myRole === 'admin';
-}
-
-/** True when the viewer may unlink this board (they own the board itself). */
-export function canUnlinkBoard(board: Pick<UserBoard, 'ownerId'>, viewerUserId: string | null): boolean {
-  return !!viewerUserId && board.ownerId === viewerUserId;
 }
 
 /**

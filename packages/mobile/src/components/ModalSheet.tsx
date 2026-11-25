@@ -1,3 +1,5 @@
+import type { SheetPresentationOptions } from '../lib/sheet-presentation-policy';
+import { useSheetPresented } from './use-sheet-presented';
 // Modal bottom sheet, presented imperatively via ref (`present()` / `dismiss()`)
 // OR declaratively via the `visible` prop.
 //
@@ -10,30 +12,60 @@
 // serializes native sheet transitions so two never overlap on the same presenter
 // (the iOS UIKit deadlock / app freeze — see sheet-presentation-provider.tsx).
 
-import { forwardRef, useCallback, useImperativeHandle, useMemo, useRef, useState, type ReactNode } from 'react';
-import { KeyboardAvoidingView, Platform, StyleSheet, View, type StyleProp, type ViewStyle } from 'react-native';
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
+import {
+  Platform,
+  StyleSheet,
+  View,
+  type LayoutChangeEvent,
+  type StyleProp,
+  type ViewStyle,
+  type ViewInstance,
+} from 'react-native';
 import {
   BottomSheetModal,
   BottomSheetScrollView,
   BottomSheetView,
   type BottomSheetMethods,
-} from '@expo/ui/community/bottom-sheet';
-import { useWindowBottomInset } from '../hooks/use-window-bottom-inset';
-import { hapticMedium } from '../lib/haptics';
+} from './sheet-presentation';
 import { spacing } from '../theme/tokens';
 import { useTheme } from '../providers/theme-provider';
+import { selectByVariant } from '../theme/variants/select-by-variant';
 import { androidSafeSnapPoints } from './sheet-snap-points';
 import { useSheetBodyContentStyle } from './sheet-content-inset';
+import { useSheetKeyboardInset } from './sheet-keyboard-inset';
 import { useSheetColumnStyle } from './use-sheet-column-style';
 import { useSheetDetentProbe } from './sheet-detent-probe';
-import { SheetScrollIntoViewProvider, useProgrammaticSnap, useSheetScrollIntoViewHost } from './sheet-scroll-into-view';
+import {
+  SheetScrollIntoViewProvider,
+  keyboardDetentIndex,
+  useProgrammaticSnap,
+  useSheetScrollIntoViewHost,
+} from './sheet-scroll-into-view';
+import { useDetentDragHaptic } from './sheet-detent-haptic';
+import { useSheetBackgroundStyle } from './use-sheet-background-style';
+import { SheetKeyboardCalibration } from './sheet-keyboard-calibration';
+import { useSheetKeyboardCalibrationEnabled } from '../lib/sheet-keyboard-calibration-store';
 import {
   useManagedSheet,
   type ManagedSheetHandle,
   type PresenterGroup,
 } from '../providers/sheet-presentation-provider';
 
-type ModalSheetProps = {
+type ModalSheetProps = SheetPresentationOptions & {
+  /** A child mounted inside a native sheet keeps its parent open on web too. */
+  stacked?: boolean;
+  /** Actual native parent; valid only with an in-content child Host. */
+  parentSheetId?: string;
   children: ReactNode;
   /** Controlled open state. Leave undefined for purely imperative consumers that
    * drive the sheet through the forwarded ref. */
@@ -41,6 +73,8 @@ type ModalSheetProps = {
   snapPoints?: (string | number)[];
   enableDynamicSizing?: boolean;
   onChange?: (index: number) => void;
+  /** Fired after the coordinated presentation settles and the sheet content has laid out. */
+  onPresented?: () => void;
   /** Fired when the user closes the sheet themselves (pan-down / backdrop), so a
    * controlled parent can clear the state driving `visible`. */
   onClose?: () => void;
@@ -48,28 +82,27 @@ type ModalSheetProps = {
    * native post-animation `onDismiss` (accurate); on Android it settles off the
    * coordinator's ceiling timer (no native signal there). */
   onFullyDismissed?: () => void;
+  /** Fired when another sheet displaces this one. Defaults to `onClose`. */
+  onDisplaced?: () => void;
   /** Serialization domain. Sheets presented off the same view controller share a
    * group; defaults to the root window VC. */
   presenterGroup?: PresenterGroup;
   enablePanDownToClose?: boolean;
   scrollable?: boolean;
   contentContainerStyle?: StyleProp<ViewStyle>;
+  /** Composers and LogAscentSheet only: form actions go in a SheetTopBar through
+   * `header` (no-bottom-footers.test.ts holds the list of files allowed a footer). */
   footer?: ReactNode;
-  /** Sheet ground. `glass` (default) keeps the native material — right for chrome
-   * and short pickers. `solid` paints an opaque `theme.sheetSurface` so a
-   * data-entry form isn't read through the content behind it.
-   *
-   * The colour MUST stay a plain string: @expo/ui's `extractBackgroundColor`
-   * checks `typeof color === 'string'` and silently falls back to glass for a
-   * `PlatformColor`, with no error. */
-  surface?: 'glass' | 'solid';
   /** Pinned-footer ground. `plate` (default) keeps the raised
-   * `secondaryBackground` plate. `flush` makes it transparent so it reads as part
-   * of a `surface="solid"` sheet; the hairline top border stays either way. */
+   * `secondaryBackground` plate. `flush` makes it transparent. The hairline top
+   * border stays on Liquid Glass either way; Material drops it on `flush`. */
   footerSurface?: 'plate' | 'flush';
   /** Optional fixed header, rendered above the body and outside its scroll — so a
    * title and close affordance stay put while the body scrolls. */
   header?: ReactNode;
+  /** Intrinsic chrome measurements, including the footer's padding/border. */
+  onHeaderLayout?: (height: number) => void;
+  onFooterLayout?: (measurement: { height: number; bottomInset: number }) => void;
   /** Size the sheet to its content on Android via `@expo/ui`'s content-fitting
    * path (`enableDynamicSizing` + no snap points) instead of the `%` detents.
    * For a multi-detent form whose pinned footer only fits at the last detent
@@ -81,7 +114,7 @@ type ModalSheetProps = {
    * No effect on iOS / web — they keep the exact `%` detents.
    *
    * Designed for a sheet with a `header` / `footer` (the `maxHeight` lands on the
-   * KeyboardAvoidingView). A chrome-less sheet has no reason to reach for it —
+   * chrome column). A chrome-less sheet has no reason to reach for it —
    * pass `enableDynamicSizing` instead. */
   androidContentSized?: boolean;
 };
@@ -89,29 +122,35 @@ type ModalSheetProps = {
 export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(function ModalSheet(
   {
     children,
+    surfaceSize,
+    accessibilityLabel,
+    onRequestClose,
+    stacked = false,
+    parentSheetId,
     visible,
     snapPoints: customSnapPoints,
     enableDynamicSizing = false,
     onChange,
+    onPresented,
     onClose,
     onFullyDismissed,
+    onDisplaced,
     presenterGroup,
     enablePanDownToClose = true,
     scrollable = false,
     contentContainerStyle,
     footer,
-    surface = 'glass',
     footerSurface = 'plate',
     header,
+    onHeaderLayout,
+    onFooterLayout,
     androidContentSized = false,
   },
   ref,
 ) {
-  const { systemColors, sheet, sheetSurface } = useTheme();
-  const windowInsetBottom = useWindowBottomInset();
+  const { systemColors, sheet, variant } = useTheme();
+  const backgroundStyle = useSheetBackgroundStyle();
   const snapPoints = useMemo(() => customSnapPoints ?? ['50%', '90%'], [customSnapPoints]);
-  // Plain string, never a PlatformColor — see the `surface` prop doc.
-  const solidBackground = useMemo(() => ({ backgroundColor: sheetSurface }), [sheetSurface]);
 
   // On Android, `androidContentSized` swaps the `%` detents for `@expo/ui`'s
   // content-fitting path (no snap points at all reach the native sheet).
@@ -126,8 +165,10 @@ export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(functi
   const managed = useManagedSheet({
     open: visible,
     group: presenterGroup,
+    parentId: parentSheetId,
     sheetRef,
     onClose,
+    onDisplaced,
     onFullyDismissed,
   });
   useImperativeHandle(ref, () => managed.handle, [managed.handle]);
@@ -137,43 +178,90 @@ export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(functi
 
   // Track the resting detent so the iOS column bound follows drags between detents.
   const [activeIndex, setActiveIndex] = useState(0);
+  // Whether the native sheet is open, so a closed sheet never listens for the
+  // keyboard (see the keyboard block below).
+  const [isOpen, setIsOpen] = useState(false);
+  const observeContentLayout = useSheetPresented(isOpen, managed.waitForPresentation, onPresented);
   const columnStyle = useSheetColumnStyle(snapPoints, { enableDynamicSizing, activeIndex, contentSizedOnAndroid });
   // Dev-only observers for #3922 — they feed a log line, never layout.
   const { probeProps, sentinelProps, onColumnLayout } = useSheetDetentProbe(columnStyle, 'ModalSheet');
+  // QA-only keyboard calibration readout (#5964), off unless its flag is on.
+  const calibrationEnabled = useSheetKeyboardCalibrationEnabled();
 
   // The keyboard-detent snap on field focus is not a drag: no haptic for it.
   const { programmaticSnapRef, snapWithoutHaptic } = useProgrammaticSnap(managed.handle.snapToIndex);
 
+  // Silent on present; a selection tick only on the climber's own detent drags.
+  const playDetentHaptic = useDetentDragHaptic(programmaticSnapRef);
   const handleChange = useCallback(
     (index: number) => {
+      playDetentHaptic(index);
       if (index >= 0) {
-        if (!programmaticSnapRef.current) hapticMedium();
         setActiveIndex(index);
+        setIsOpen(true);
       } else {
         // Reset on close so a re-open of an always-mounted sheet starts at the
         // first detent's (shortest) column height until the native onChange
         // confirms the detent — erring short beats a stale taller column pushing
         // the pinned footer off-screen for a frame.
         setActiveIndex(0);
+        setIsOpen(false);
       }
       managed.onChange(index);
       onChangeRef.current?.(index);
     },
-    [managed, programmaticSnapRef],
+    [managed, playDetentHaptic],
   );
 
   // A fixed header or a pinned footer both need a wrapper around the body, and
   // the native sheet takes exactly one in-flow child — so either one puts us in
-  // the KeyboardAvoidingView branch below.
+  // the chrome column branch below.
   const hasChrome = Boolean(footer || header);
+  const lastDetentIndex = useContentFitting ? 0 : effectiveSnapPoints.length - 1;
+  // Keyboard clearance for the chrome column below, and the bottom inset the
+  // footer / footerless body still owes (the window inset, or 0 while the
+  // keyboard covers it). See sheet-keyboard-inset.ts. Listens only while there
+  // is a column to pad and the sheet is open. When the keyboard comes up the
+  // sheet rises to its keyboard detent (no haptic): at a short detent the
+  // keyboard can leave the body no room at all.
+  const activeIndexRef = useRef(activeIndex);
+  activeIndexRef.current = activeIndex;
+  const raiseToKeyboardDetent = useCallback(() => {
+    const next = keyboardDetentIndex(activeIndexRef.current, lastDetentIndex);
+    if (next != null) snapWithoutHaptic(next);
+  }, [lastDetentIndex, snapWithoutHaptic]);
+  const {
+    keyboardOverlap,
+    bottomInset,
+    columnRef,
+    onColumnLayout: measureColumnForKeyboard,
+    onHostLayout,
+    measureAfterDetentChange,
+  } = useSheetKeyboardInset({
+    enabled: hasChrome && (isOpen || visible === true),
+    onKeyboardShow: raiseToKeyboardDetent,
+  });
+  // A detent change while the keyboard is up (the raise above included) moves
+  // the column without a layout event once the native animation ends.
+  useEffect(() => {
+    if (isOpen) measureAfterDetentChange();
+  }, [activeIndex, isOpen, measureAfterDetentChange]);
+  const handleColumnLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      onColumnLayout?.(event);
+      observeContentLayout(event);
+      measureColumnForKeyboard();
+    },
+    [onColumnLayout, observeContentLayout, measureColumnForKeyboard],
+  );
   // The sheet's single child must carry the iOS detent bound (see
-  // useSheetColumnStyle): with a header or footer the KeyboardAvoidingView below
+  // useSheetColumnStyle): with a header or footer the chrome column below
   // is that child and the body just fills it (flex:1); without either the body
   // itself is the child, so it carries the bound directly — otherwise an iOS
   // scrollable sheet sizes to its content and anything past the detent is
   // clipped and unreachable instead of scrolling.
   //
-  // On Android's content-fitting path the KAV takes a `maxHeight`, not `flex: 1`,
+  // On Android's content-fitting path the column takes a `maxHeight`, not `flex: 1`,
   // so the body can't `flex: 1` into it — it takes its content height at rest
   // (this is what closes the void) and `flexShrink: 1` so it shrinks and scrolls
   // once a keyboard-up long note pushes the column into that ceiling.
@@ -187,15 +275,22 @@ export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(functi
   // Keyed on the FOOTER alone, not `hasChrome`: a header sits above the body and
   // leaves it against the bottom edge, so a header-only sheet still owes the
   // window inset.
-  const bodyContentContainerStyle = useSheetBodyContentStyle(Boolean(footer), contentContainerStyle, windowInsetBottom);
+  const bodyContentContainerStyle = useSheetBodyContentStyle(Boolean(footer), contentContainerStyle, bottomInset);
   // #3922: measure whichever view actually carries columnStyle — the body when
-  // there is no header or footer, the KeyboardAvoidingView below when there is.
-  const bodyLayout = hasChrome ? undefined : onColumnLayout;
+  // there is no header or footer, the chrome column below when there is.
+  const handleBodyLayout = useCallback(
+    (event: LayoutChangeEvent) => {
+      observeContentLayout(event);
+      if (!hasChrome) onColumnLayout?.(event);
+    },
+    [observeContentLayout, hasChrome, onColumnLayout],
+  );
+  const bodyLayout = handleBodyLayout;
   // A focused field that opts in (the tick note) is scrolled clear of the pinned
   // footer once the keyboard shrinks the body (#5665). See sheet-scroll-into-view.
   const { scrollIntoView, scrollProps } = useSheetScrollIntoViewHost({
     onBodyLayout: bodyLayout,
-    lastDetentIndex: useContentFitting ? 0 : effectiveSnapPoints.length - 1,
+    lastDetentIndex,
     activeIndex,
     snapToIndex: snapWithoutHaptic,
   });
@@ -213,21 +308,51 @@ export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(functi
   ) : useContentFitting && !hasChrome && Platform.OS === 'web' ? (
     // Web + dynamic sizing only, where the column is never bounded and the
     // #3922 probe stays idle — so there is nothing to measure here.
-    <BottomSheetView style={[bodyStyle, bodyContentContainerStyle]}>{children}</BottomSheetView>
+    <BottomSheetView style={[bodyStyle, bodyContentContainerStyle]}>
+      {onPresented ? <View onLayout={handleBodyLayout}>{children}</View> : children}
+    </BottomSheetView>
   ) : (
     <View style={[bodyStyle, bodyContentContainerStyle]} onLayout={bodyLayout}>
       {children}
     </View>
   );
 
+  const headerRef = useRef<ViewInstance>(null);
+  const footerRef = useRef<ViewInstance>(null);
+  useEffect(() => {
+    if (onHeaderLayout) headerRef.current?.measure((_left, _top, _measuredWidth, height) => onHeaderLayout(height));
+  }, [onHeaderLayout]);
+  useEffect(() => {
+    if (onFooterLayout)
+      footerRef.current?.measure((_left, _top, _measuredWidth, height) => onFooterLayout({ height, bottomInset }));
+  }, [onFooterLayout, bottomInset]);
+  const handleHeaderLayout = useCallback(
+    (event: LayoutChangeEvent) => onHeaderLayout?.(event.nativeEvent.layout.height),
+    [onHeaderLayout],
+  );
+  const handleFooterLayout = useCallback(
+    (event: LayoutChangeEvent) => onFooterLayout?.({ height: event.nativeEvent.layout.height, bottomInset }),
+    [onFooterLayout, bottomInset],
+  );
+
   const footerBar = footer ? (
     <View
+      ref={footerRef}
+      onLayout={handleFooterLayout}
+      testID="sheet-footer"
       style={[
         styles.footer,
         {
           backgroundColor: footerSurface === 'flush' ? 'transparent' : systemColors.secondaryBackground,
           borderTopColor: systemColors.separator,
-          paddingBottom: windowInsetBottom + spacing[3],
+          borderTopWidth: selectByVariant(variant, {
+            material: footerSurface === 'flush' ? 0 : StyleSheet.hairlineWidth,
+            liquidGlass: StyleSheet.hairlineWidth,
+          }),
+          // Window inset + gap at rest; just the gap while the keyboard is up,
+          // so the bar rests spacing[3] above the keyboard (the column below is
+          // padded by the overlap).
+          paddingBottom: bottomInset + spacing[3],
         },
       ]}
     >
@@ -237,7 +362,11 @@ export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(functi
 
   return (
     <BottomSheetModal
+      surfaceSize={surfaceSize}
+      accessibilityLabel={accessibilityLabel}
+      onRequestClose={onRequestClose}
       ref={sheetRef}
+      {...(Platform.OS === 'web' && stacked ? { stackBehavior: 'push' as const } : {})}
       // Native `@expo/ui` ignores this prop entirely (its `BottomSheetModal`
       // mounts closed regardless and is only ever opened via the imperative
       // `snapToIndex` `useManagedSheet` drives). The Expo-web shim is NOT so
@@ -252,7 +381,7 @@ export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(functi
       enableDynamicSizing={useContentFitting}
       enablePanDownToClose={enablePanDownToClose}
       handleIndicatorStyle={sheet.handleStyle}
-      backgroundStyle={surface === 'solid' ? solidBackground : undefined}
+      backgroundStyle={backgroundStyle}
       onChange={handleChange}
       onFullyDismissed={managed.onFullyDismissed}
       style={styles.sheet}
@@ -263,21 +392,51 @@ export const ModalSheet = forwardRef<ManagedSheetHandle, ModalSheetProps>(functi
           branches — the "single flex child" rule below still holds. */}
       {sentinelProps ? <View {...sentinelProps} /> : null}
       {probeProps ? <View {...probeProps} /> : null}
+      {Platform.OS === 'ios' && hasChrome ? (
+        <View
+          testID="sheet-keyboard-host"
+          pointerEvents="none"
+          style={StyleSheet.absoluteFill}
+          onLayout={onHostLayout}
+        />
+      ) : null}
       {hasChrome ? (
         // The single flex child of the native sheet: bound to the detent height on
         // iOS (see useSheetColumnStyle) so the pinned footer can't fall off-screen
         // (#3330); flex:1 on Android's detent path; a `maxHeight` ceiling on its
-        // content-fitting path (#4720). `padding` on both platforms: the Android
-        // Compose dialog window does not resize for the keyboard, so without it
-        // the keyboard covers the footer's input (emulator-verified).
-        <KeyboardAvoidingView style={columnStyle} behavior="padding" onLayout={onColumnLayout}>
-          {header}
+        // content-fitting path (#4720). Padded by the keyboard overlap on both
+        // platforms. On iOS the absolute-fill sibling above measures the host's
+        // keyboard-safe height; padding removes the column's overflow past it.
+        // See sheet-keyboard-inset.ts.
+        <View
+          testID="sheet-chrome-column"
+          style={keyboardOverlap > 0 ? [columnStyle, { paddingBottom: keyboardOverlap }] : columnStyle}
+          ref={columnRef}
+          onLayout={handleColumnLayout}
+        >
+          {header && onHeaderLayout ? (
+            <View ref={headerRef} onLayout={handleHeaderLayout} testID="sheet-header">
+              {header}
+            </View>
+          ) : (
+            header
+          )}
           {body}
           {footerBar}
-        </KeyboardAvoidingView>
+        </View>
       ) : (
         body
       )}
+      {/* After the column so it draws on top. All absolutely positioned and
+          touch-transparent, so the column stays the single in-flow child. */}
+      {calibrationEnabled && hasChrome ? (
+        <SheetKeyboardCalibration
+          label="ModalSheet"
+          columnRef={columnRef}
+          keyboardOverlap={keyboardOverlap}
+          bottomInset={bottomInset}
+        />
+      ) : null}
     </BottomSheetModal>
   );
 });
@@ -307,6 +466,5 @@ const styles = StyleSheet.create({
   footer: {
     paddingHorizontal: spacing[4],
     paddingTop: spacing[3],
-    borderTopWidth: StyleSheet.hairlineWidth,
   },
 });

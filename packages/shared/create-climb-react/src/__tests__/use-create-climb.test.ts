@@ -13,6 +13,7 @@ vi.mock('@boardsesh/board-constants/hold-states', async () => {
     ...actual,
     HOLD_STATE_MAP: {
       woods: actual.HOLD_STATE_MAP.woods,
+      spray: actual.HOLD_STATE_MAP.spray,
       kilter: {
         42: { name: 'STARTING', color: '#00FF00', displayColor: '#00FF00' },
         43: { name: 'HAND', color: '#00FFFF', displayColor: '#00FFFF' },
@@ -33,6 +34,7 @@ vi.mock('@boardsesh/board-constants/hold-states', async () => {
     },
     STATE_TO_PRIMARY_CODE: {
       woods: actual.STATE_TO_PRIMARY_CODE.woods,
+      spray: actual.STATE_TO_PRIMARY_CODE.spray,
       kilter: { STARTING: 42, HAND: 43, FINISH: 44, FOOT: 45 },
       tension: { STARTING: 1, HAND: 2, FINISH: 3, FOOT: 4 },
       moonboard: { STARTING: 42, HAND: 43, FINISH: 44 },
@@ -482,6 +484,102 @@ describe('useCreateClimb', () => {
         result.current.nextFrame();
       });
       expect(result.current.litUpHoldsMap).toEqual({});
+    });
+
+    // Editing a published climb seeds through `loadFrames` once the row arrives,
+    // not through `initialFrames`. The server refuses any save of a spray climb
+    // that still names a removed hold, so an edit that kept them could never be
+    // saved and the climber had no way to tap them off (#6024).
+    it('drops holds no longer on the wall when an edit loads its frames', () => {
+      const { result } = renderHook(() => useCreateClimb('kilter', { availableHoldIds: new Set([100, 400]) }));
+
+      act(() => {
+        result.current.loadFrames(PARENT_FRAMES);
+      });
+
+      expect(Object.keys(result.current.litUpHoldsMap).sort()).toEqual(['100', '400']);
+      expect(result.current.totalHolds).toBe(2);
+      expect(result.current.generateFramesString()).toBe('p100r42p400r44');
+    });
+
+    it('keeps missing local selections until acknowledged after a cold restore', () => {
+      const { result } = renderHook(() => useCreateClimb('spray', { availableHoldIds: new Set([100, 400]) }));
+      act(() =>
+        result.current.restoreWorkingFrames([
+          PARENT_FRAMES[0],
+          { 200: PARENT_FRAMES[0][200], 500: { state: 'OFF', color: '', displayColor: '' } },
+        ]),
+      );
+
+      expect(result.current.missingHoldIds).toEqual([200, 300]);
+      expect(result.current.frames[1]).toEqual({ 200: PARENT_FRAMES[0][200] });
+      expect(result.current.canSave).toBe(false);
+      expect(result.current.canPublish).toBe(false);
+      act(() => result.current.removeMissingHolds());
+      expect(result.current.frames).toEqual([{ 100: PARENT_FRAMES[0][100], 400: PARENT_FRAMES[0][400] }, {}]);
+      expect(result.current.canSave).toBe(true);
+      expect(result.current.canPublish).toBe(true);
+    });
+
+    it('keeps frames, the active frame and undo when holds are added', () => {
+      const { result, rerender } = renderHook(
+        ({ available }: { available: ReadonlySet<number> }) =>
+          useCreateClimb('kilter', { availableHoldIds: available }),
+        { initialProps: { available: new Set([100, 400]) } },
+      );
+      act(() => result.current.setHoldState(100, 'STARTING'));
+      act(() => result.current.duplicateFrame());
+      const loadFramesBefore = result.current.loadFrames;
+      const framesBefore = result.current.frames;
+
+      rerender({ available: new Set([100, 200, 400]) });
+
+      expect(result.current.frames).toBe(framesBefore);
+      expect(result.current.currentFrameIndex).toBe(1);
+      expect(result.current.canUndo).toBe(true);
+      expect(result.current.loadFrames).toBe(loadFramesBefore);
+      act(() => result.current.setHoldState(200, 'HAND'));
+      expect(result.current.litUpHoldsMap[200].state).toBe('HAND');
+      act(() => result.current.undo());
+      expect(result.current.frames).toEqual(framesBefore);
+    });
+
+    it('retains missing paint and blocks Save until removal is acknowledged', () => {
+      const { result, rerender } = renderHook(
+        ({ available }: { available: ReadonlySet<number> }) =>
+          useCreateClimb('kilter', { availableHoldIds: available }),
+        { initialProps: { available: new Set([100, 200, 400]) } },
+      );
+      act(() => result.current.loadFrames(PARENT_FRAMES));
+      act(() => result.current.duplicateFrame());
+      act(() => result.current.setHoldState(200, 'FOOT'));
+      act(() => result.current.undo());
+
+      rerender({ available: new Set([100, 400]) });
+      expect(result.current.missingHoldCount).toBe(1);
+      expect(result.current.litUpHoldsMap[200]).toBeDefined();
+      expect(result.current.canSave).toBe(false);
+      expect(result.current.canPublish).toBe(false);
+      expect(result.current.currentFrameIndex).toBe(1);
+
+      act(() => result.current.removeMissingHolds());
+      expect(result.current.missingHoldCount).toBe(0);
+      expect(result.current.canPublish).toBe(true);
+      expect(result.current.frameCount).toBe(2);
+      act(() => result.current.redo());
+      expect(result.current.litUpHoldsMap[200]).toBeUndefined();
+      act(() => result.current.undo());
+      expect(result.current.litUpHoldsMap[200]).toBeUndefined();
+    });
+
+    it('keeps every loaded hold on a catalogue board', () => {
+      const { result } = renderHook(() => useCreateClimb('kilter'));
+
+      act(() => {
+        result.current.loadFrames(PARENT_FRAMES);
+      });
+
+      expect(Object.keys(result.current.litUpHoldsMap).sort()).toEqual(['100', '200', '300', '400']);
     });
   });
 

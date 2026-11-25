@@ -30,6 +30,9 @@ import {
   findUnpseudonymisedPersonFields,
   isPseudonymDisplayName,
   normalizeDocument,
+  replayCompatibleFixtureResponse,
+  SESSION_REST_CADENCE_SELECTION,
+  type GraphqlFixtureFile,
   pseudonymDisplayName,
   pseudonymHandle,
   pseudonymiseResponse,
@@ -125,6 +128,738 @@ describe('normalizeDocument', () => {
     const compact = 'query Foo($id: ID!) { climb(id: $id) { uuid name } }';
     const reflowed = `query Foo($id: ID!) {\n\tclimb(id: $id) {\n\t\tuuid\n\t\tname\n\t}\n}`;
     expect(normalizeDocument(reflowed)).toBe(normalizeDocument(compact));
+  });
+});
+
+describe('board wall-device replay compatibility', () => {
+  const sprayImport = 'sprayImport { wallUuid versionId detectionId stage queuePosition retryAt resetOfWallUuid }';
+  const fixture = (operationName: string, query: string, data: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName,
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query,
+    variables: {},
+    response: { data },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+
+  it('answers false beside every recorded hasLeds, without mutating the recording', () => {
+    const legacy = 'query GetGymBoardsForSwitcher { gymBoards { boards { uuid hasLeds } } }';
+    const current = 'query GetGymBoardsForSwitcher { gymBoards { boards { uuid hasLeds litByWallDevice } } }';
+    const recorded = fixture('GetGymBoardsForSwitcher', legacy, {
+      gymBoards: {
+        boards: [
+          { uuid: 'one', hasLeds: true },
+          { uuid: 'two', hasLeds: false },
+        ],
+      },
+    });
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          gymBoards: {
+            boards: [
+              { uuid: 'one', hasLeds: true, litByWallDevice: false },
+              { uuid: 'two', hasLeds: false, litByWallDevice: false },
+            ],
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it('composes with the manufacturer-board sprayImport adapter', () => {
+    const legacy = 'query GetBoard { board { uuid boardType hasLeds } }';
+    const current = `query GetBoard { board { ${sprayImport} uuid boardType hasLeds litByWallDevice } }`;
+    const recorded = fixture('GetBoard', legacy, { board: { uuid: 'board', boardType: 'kilter', hasLeds: true } });
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          board: { uuid: 'board', boardType: 'kilter', hasLeds: true, sprayImport: null, litByWallDevice: false },
+        },
+      },
+    });
+  });
+
+  it('refuses a recording that already holds the field, a stray copy, or any other change', () => {
+    const legacy = 'query GetMyBoards { myBoards { boards { uuid hasLeds } } }';
+    const current = 'query GetMyBoards { myBoards { boards { uuid hasLeds litByWallDevice } } }';
+    const recordedWithField = fixture('GetMyBoards', legacy, {
+      myBoards: { boards: [{ uuid: 'one', hasLeds: true, litByWallDevice: true }] },
+    });
+    expect(replayCompatibleFixtureResponse(current, recordedWithField)).toBeNull();
+    const recorded = fixture('GetMyBoards', legacy, { myBoards: { boards: [{ uuid: 'one', hasLeds: true }] } });
+    expect(replayCompatibleFixtureResponse(current.replace('uuid', 'uuid litByWallDevice'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('uuid', 'uuid name'), recorded)).toBeNull();
+    const otherOperation = fixture('GetClimb', 'query GetClimb { climb { hasLeds } }', { climb: { hasLeds: true } });
+    expect(
+      replayCompatibleFixtureResponse('query GetClimb { climb { hasLeds litByWallDevice } }', otherOperation),
+    ).toBeNull();
+  });
+});
+
+describe('board staff-action replay compatibility', () => {
+  const sprayImport = 'sprayImport { wallUuid versionId detectionId stage queuePosition retryAt resetOfWallUuid }';
+  const fixture = (operationName: string, query: string, data: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName,
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query,
+    variables: {},
+    response: { data },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+
+  it('answers false for both beside every recorded board, without mutating the recording', () => {
+    const legacy = 'query GetGymBoardsForSwitcher { gymBoards { uuid hasLeds litByWallDevice canEdit hideLocation } }';
+    const current =
+      'query GetGymBoardsForSwitcher { gymBoards { uuid hasLeds litByWallDevice canEdit canDelete canRemoveFromGym hideLocation } }';
+    const recorded = fixture('GetGymBoardsForSwitcher', legacy, {
+      gymBoards: [
+        { uuid: 'one', hasLeds: true, litByWallDevice: false, canEdit: true, hideLocation: false },
+        { uuid: 'two', hasLeds: false, litByWallDevice: false, canEdit: false, hideLocation: false },
+      ],
+    });
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          gymBoards: [
+            {
+              uuid: 'one',
+              hasLeds: true,
+              litByWallDevice: false,
+              canEdit: true,
+              hideLocation: false,
+              canDelete: false,
+              canRemoveFromGym: false,
+            },
+            {
+              uuid: 'two',
+              hasLeds: false,
+              litByWallDevice: false,
+              canEdit: false,
+              hideLocation: false,
+              canDelete: false,
+              canRemoveFromGym: false,
+            },
+          ],
+        },
+      },
+    });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it('composes with the wall-device and sprayImport adapters', () => {
+    const legacy = 'query GetMyBoards { myBoards { boards { uuid boardType hasLeds canEdit isPinnedByMe boardId } } }';
+    const current = `query GetMyBoards { myBoards { boards { ${sprayImport} uuid boardType hasLeds litByWallDevice canEdit isPinnedByMe canDelete canRemoveFromGym boardId } } }`;
+    const recorded = fixture('GetMyBoards', legacy, {
+      myBoards: {
+        boards: [{ uuid: 'one', boardType: 'kilter', hasLeds: true, canEdit: true, isPinnedByMe: false, boardId: 7 }],
+      },
+    });
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          myBoards: {
+            boards: [
+              {
+                uuid: 'one',
+                boardType: 'kilter',
+                hasLeds: true,
+                litByWallDevice: false,
+                canEdit: true,
+                isPinnedByMe: false,
+                boardId: 7,
+                sprayImport: null,
+                canDelete: false,
+                canRemoveFromGym: false,
+              },
+            ],
+          },
+        },
+      },
+    });
+  });
+
+  it('refuses a recording that already holds either field, a lone or stray copy, or any other change', () => {
+    const legacy = 'query GetBoard { board { uuid canEdit isPinnedByMe } }';
+    const current = 'query GetBoard { board { uuid canEdit isPinnedByMe canDelete canRemoveFromGym } }';
+    const recordedWithField = fixture('GetBoard', legacy, {
+      board: { uuid: 'one', canEdit: true, isPinnedByMe: false, canDelete: true },
+    });
+    expect(replayCompatibleFixtureResponse(current, recordedWithField)).toBeNull();
+    const recorded = fixture('GetBoard', legacy, { board: { uuid: 'one', canEdit: true, isPinnedByMe: false } });
+    expect(replayCompatibleFixtureResponse(current, recorded)).not.toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('uuid', 'uuid canDelete'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace(' canRemoveFromGym', ''), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('uuid', 'uuid name'), recorded)).toBeNull();
+    const otherOperation = fixture('GetClimb', 'query GetClimb { climb { canEdit } }', { climb: { canEdit: true } });
+    expect(
+      replayCompatibleFixtureResponse(
+        'query GetClimb { climb { canEdit canDelete canRemoveFromGym } }',
+        otherOperation,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('board report-flag replay compatibility', () => {
+  const fixture = (operationName: string, query: string, data: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName,
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query,
+    variables: {},
+    response: { data },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+
+  it('answers null for both beside every recorded board, composed with the staff-action pair', () => {
+    const legacy = 'query GetMyBoards { myBoards { boards { uuid hasLeds litByWallDevice canEdit isPinnedByMe } } }';
+    const current =
+      'query GetMyBoards { myBoards { boards { uuid hasLeds litByWallDevice canEdit isPinnedByMe canDelete canRemoveFromGym openReportCount viewerHasOpenReport } } }';
+    const recorded = fixture('GetMyBoards', legacy, {
+      myBoards: {
+        boards: [{ uuid: 'one', hasLeds: true, litByWallDevice: false, canEdit: true, isPinnedByMe: false }],
+      },
+    });
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          myBoards: {
+            boards: [
+              {
+                uuid: 'one',
+                hasLeds: true,
+                litByWallDevice: false,
+                canEdit: true,
+                isPinnedByMe: false,
+                canDelete: false,
+                canRemoveFromGym: false,
+                openReportCount: null,
+                viewerHasOpenReport: null,
+              },
+            ],
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it("answers null for both on the gym page's switcher roster, after the staff-action pair", () => {
+    const legacy = 'query GetGymBoardsForSwitcher { gymBoards { uuid hasLeds litByWallDevice canEdit hideLocation } }';
+    const current =
+      'query GetGymBoardsForSwitcher { gymBoards { uuid hasLeds litByWallDevice canEdit canDelete canRemoveFromGym openReportCount viewerHasOpenReport hideLocation } }';
+    const recorded = fixture('GetGymBoardsForSwitcher', legacy, {
+      gymBoards: [{ uuid: 'one', hasLeds: true, litByWallDevice: false, canEdit: false, hideLocation: false }],
+    });
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          gymBoards: [
+            {
+              uuid: 'one',
+              hasLeds: true,
+              litByWallDevice: false,
+              canEdit: false,
+              hideLocation: false,
+              canDelete: false,
+              canRemoveFromGym: false,
+              openReportCount: null,
+              viewerHasOpenReport: null,
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it('refuses a recording that already holds either field, a lone copy, or any other change', () => {
+    const legacy = 'query GetBoard { board { uuid canEdit isPinnedByMe canDelete canRemoveFromGym } }';
+    const current =
+      'query GetBoard { board { uuid canEdit isPinnedByMe canDelete canRemoveFromGym openReportCount viewerHasOpenReport } }';
+    const recorded = fixture('GetBoard', legacy, {
+      board: { uuid: 'one', canEdit: true, isPinnedByMe: false, canDelete: true, canRemoveFromGym: false },
+    });
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          board: {
+            uuid: 'one',
+            canEdit: true,
+            isPinnedByMe: false,
+            canDelete: true,
+            canRemoveFromGym: false,
+            openReportCount: null,
+            viewerHasOpenReport: null,
+          },
+        },
+      },
+    });
+    const recordedWithField = fixture('GetBoard', legacy, {
+      board: {
+        uuid: 'one',
+        canEdit: true,
+        isPinnedByMe: false,
+        canDelete: true,
+        canRemoveFromGym: false,
+        openReportCount: 2,
+      },
+    });
+    expect(replayCompatibleFixtureResponse(current, recordedWithField)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace(' viewerHasOpenReport', ''), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('uuid', 'uuid openReportCount'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('uuid', 'uuid name'), recorded)).toBeNull();
+  });
+});
+
+describe('legacy manufacturer-board replay compatibility', () => {
+  const selection = 'sprayImport { wallUuid versionId detectionId stage queuePosition retryAt resetOfWallUuid }';
+  const legacy = 'query GetBoard { board { uuid boardType } }';
+  const current = `query GetBoard { board { ${selection} uuid boardType } }`;
+  const fixture = (board: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName: 'GetBoard',
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query: legacy,
+    variables: {},
+    response: { data: { board } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+  it('supplies only known-null spray status without mutating the recording', () => {
+    const recorded = fixture({ uuid: 'board', boardType: 'kilter' });
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: { data: { board: { uuid: 'board', boardType: 'kilter', sprayImport: null } } },
+    });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+  it.each([{ boardType: 'spray' }, { uuid: 'unknown' }, { boardType: 'kilter', sprayImport: { stage: 'detecting' } }])(
+    'refuses to invent spray state for %j',
+    (board) => {
+      expect(replayCompatibleFixtureResponse(current, fixture(board))).toBeNull();
+    },
+  );
+  it('keeps unrelated fields and spray subfields subject to document drift checks', () => {
+    const recorded = fixture({ boardType: 'kilter' });
+    expect(
+      replayCompatibleFixtureResponse(current.replace('uuid boardType', 'uuid boardType name'), recorded),
+    ).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('versionId', 'newField'), recorded)).toBeNull();
+  });
+});
+
+describe('legacy SessionUpdates replay compatibility', () => {
+  const legacy =
+    'subscription SessionUpdates($sessionId: ID!) { sessionUpdates(sessionId: $sessionId) { __typename ' +
+    '... on SessionRosterSnapshot { users { id username } boardPath } ... on SessionEnded { reason } } }';
+  const current = legacy.replace(
+    '... on SessionEnded { reason } }',
+    `... on SessionEnded { reason } ${SESSION_REST_CADENCE_SELECTION} }`,
+  );
+  const fixture = (sessionUpdates: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName: 'SessionUpdates',
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query: legacy,
+    variables: { sessionId: 'session-1' },
+    response: { data: { sessionUpdates } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+
+  it('replays the recorded roster frame unchanged under the document with the rest clock member', () => {
+    const recorded = fixture({ __typename: 'SessionRosterSnapshot', users: [], boardPath: 'kilter/8/25/26/35' });
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({ response: recorded.response });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it('keeps every other document change subject to drift checks', () => {
+    const recorded = fixture({ __typename: 'SessionRosterSnapshot', users: [], boardPath: '' });
+    expect(replayCompatibleFixtureResponse(current.replace('username', 'username avatarUrl'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('serverNow', 'serverTime'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(legacy, recorded)).toBeNull();
+  });
+
+  it('refuses a recording that already holds a rest clock frame', () => {
+    const recorded = fixture({ __typename: 'SessionRestCadenceChanged', revision: 1 });
+    expect(replayCompatibleFixtureResponse(current, recorded)).toBeNull();
+  });
+});
+
+describe('legacy GetSession replay compatibility (#6591)', () => {
+  const SESSION_ID = 'session-1';
+  const legacy =
+    'query GetSession($sessionId: ID!) { session(sessionId: $sessionId) { id name isPublic startedAt users { id username } } }';
+  const current = legacy.replace('isPublic startedAt', 'isPublic isPermanent startedAt');
+  const recordedFixture = (operationName: string, query: string, variables: unknown, data: unknown) =>
+    ({
+      formatVersion: 1,
+      operationName,
+      documentHash: 'original-hash',
+      variablesHash: 'variables',
+      query,
+      variables,
+      response: { data },
+      status: 200,
+      recordedAt: '2026-01-01T00:00:00Z',
+      upstream: 'https://example.test',
+    }) satisfies GraphqlFixtureFile;
+  const getSession = (session: unknown, sessionId = SESSION_ID) =>
+    recordedFixture('GetSession', legacy, { sessionId }, { session });
+  const joinSession = (joined: unknown, sessionId = SESSION_ID, operationName = 'JoinSession') =>
+    recordedFixture(
+      operationName,
+      `mutation ${operationName}($sessionId: ID!, $boardPath: String!) { joinSession(sessionId: $sessionId, boardPath: $boardPath) { id isPermanent } }`,
+      { sessionId, boardPath: 'kilter/8/25/26/40' },
+      { joinSession: joined },
+    );
+  const evidence = (...fixtures: GraphqlFixtureFile[]) => ({ joinSessionFixtures: () => fixtures });
+  // A session recorded before the document selected isPermanent, like the CPP sets'.
+  const unrecorded = { id: SESSION_ID, name: 'Kilter crew', isPublic: false, startedAt: null, users: [] };
+  const permanentJoin = joinSession({ id: SESSION_ID, isPermanent: true });
+
+  it('replays a recording that already holds the server’s isPermanent unchanged, whatever a JoinSession says', () => {
+    const recorded = getSession({ ...unrecorded, isPermanent: false });
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded, evidence(permanentJoin))).toEqual({
+      response: recorded.response,
+    });
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({ response: recorded.response });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it('fills a missing isPermanent from the same set’s JoinSession reply for that session, without mutating it', () => {
+    const recorded = getSession(unrecorded);
+    const bytes = JSON.stringify(recorded);
+    expect(
+      replayCompatibleFixtureResponse(current, recorded, evidence(joinSession({ id: SESSION_ID }), permanentJoin)),
+    ).toEqual({ response: { data: { session: { ...unrecorded, isPermanent: true } } } });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it.each([
+    ['no evidence at all', []],
+    [
+      'a JoinSession recorded under another session id',
+      [joinSession({ id: SESSION_ID, isPermanent: true }, 'session-2')],
+    ],
+    ['a JoinSession reply that selected no isPermanent', [joinSession({ id: SESSION_ID })]],
+    ['a JoinSession reply with a null isPermanent', [joinSession({ id: SESSION_ID, isPermanent: null })]],
+    ['a JoinSession reply naming another session', [joinSession({ id: 'session-2', isPermanent: true })]],
+    ['a null JoinSession reply', [joinSession(null)]],
+    [
+      'a JoinSession reply with no data (errors only)',
+      [{ ...joinSession(null), response: { errors: [{ message: 'Session not found' }] } }],
+    ],
+    ['another operation’s reply', [joinSession({ id: SESSION_ID, isPermanent: true }, SESSION_ID, 'LeaveSession')]],
+    ['JoinSession replies that disagree', [permanentJoin, joinSession({ id: SESSION_ID, isPermanent: false })]],
+  ])('refuses to fill isPermanent from %s', (_label, fixtures) => {
+    expect(replayCompatibleFixtureResponse(current, getSession(unrecorded), evidence(...fixtures))).toBeNull();
+  });
+
+  it('refuses a recording with no data, no session, a non-boolean isPermanent, or a session its variables do not name', () => {
+    expect(
+      replayCompatibleFixtureResponse(
+        current,
+        { ...getSession(unrecorded), response: { errors: [{ message: 'Session not found' }] } },
+        evidence(permanentJoin),
+      ),
+    ).toBeNull();
+    expect(replayCompatibleFixtureResponse(current, getSession(null), evidence(permanentJoin))).toBeNull();
+    expect(
+      replayCompatibleFixtureResponse(
+        current,
+        getSession({ ...unrecorded, isPermanent: null }),
+        evidence(permanentJoin),
+      ),
+    ).toBeNull();
+    expect(
+      replayCompatibleFixtureResponse(
+        current,
+        getSession(unrecorded, 'session-2'),
+        evidence(permanentJoin, joinSession({ id: 'session-2', isPermanent: true }, 'session-2')),
+      ),
+    ).toBeNull();
+  });
+
+  it('keeps every other GetSession document change subject to drift checks', () => {
+    const recorded = getSession({ ...unrecorded, isPermanent: false });
+    expect(replayCompatibleFixtureResponse(current.replace('name', 'name goal'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(legacy.replace('name', 'name goal'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(legacy, recorded)).toBeNull();
+    expect(
+      replayCompatibleFixtureResponse(current.replace('isPermanent', 'isPermanent isPermanent'), recorded),
+    ).toBeNull();
+    // Spliced into another field's name rather than selected on its own.
+    expect(replayCompatibleFixtureResponse(legacy.replace('name', 'nameisPermanent'), recorded)).toBeNull();
+  });
+});
+
+describe('legacy DiscoverPlaylists replay compatibility', () => {
+  const selection = 'gradeSummary { gradedClimbCount p10Difficulty p90Difficulty }';
+  const legacy = 'query DiscoverPlaylists { discoverPlaylists { playlists { uuid name } hasMore } }';
+  const current = `query DiscoverPlaylists { discoverPlaylists { playlists { uuid name ${selection} } hasMore } }`;
+  const fixture = (playlists: unknown[]): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName: 'DiscoverPlaylists',
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query: legacy,
+    variables: {},
+    response: { data: { discoverPlaylists: { playlists, hasMore: false } } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+
+  it('replays every recorded playlist with no grade band, without mutating the recording', () => {
+    const recorded = fixture([
+      { uuid: 'a', name: 'A' },
+      { uuid: 'b', name: 'B' },
+    ]);
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          discoverPlaylists: {
+            playlists: [
+              { uuid: 'a', name: 'A', gradeSummary: null },
+              { uuid: 'b', name: 'B', gradeSummary: null },
+            ],
+            hasMore: false,
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it('keeps every other document change subject to drift checks', () => {
+    const recorded = fixture([{ uuid: 'a', name: 'A' }]);
+    expect(replayCompatibleFixtureResponse(current.replace('uuid name', 'uuid name color'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(current.replace('p90Difficulty', 'maxDifficulty'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(legacy, recorded)).toBeNull();
+  });
+
+  it('refuses a recording that already carries a grade band', () => {
+    const recorded = fixture([{ uuid: 'a', name: 'A', gradeSummary: { p10Difficulty: 16 } }]);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toBeNull();
+  });
+});
+
+describe('legacy GetSmartPlaylist replay compatibility', () => {
+  const legacy =
+    'query GetSmartPlaylist($input: GetSmartPlaylistInput!) { smartPlaylist(input: $input) { meta { type } climbs { uuid } totalCount hasMore } }';
+  const current = legacy.replace('totalCount hasMore', 'totalCount unfilteredCount hasMore');
+  const fixture = (smartPlaylist: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName: 'GetSmartPlaylist',
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query: legacy,
+    variables: { input: { type: 'RECOMMENDED_CROWD_FAVORITES', userId: 'screenshots' } },
+    response: { data: { smartPlaylist } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+
+  it('replays the recorded list with no unfiltered count, without mutating the recording', () => {
+    const recorded = fixture({
+      meta: { type: 'RECOMMENDED_CROWD_FAVORITES' },
+      climbs: [{ uuid: 'c-1' }],
+      totalCount: 1,
+      hasMore: false,
+    });
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: {
+        data: {
+          smartPlaylist: {
+            meta: { type: 'RECOMMENDED_CROWD_FAVORITES' },
+            climbs: [{ uuid: 'c-1' }],
+            totalCount: 1,
+            unfilteredCount: null,
+            hasMore: false,
+          },
+        },
+      },
+    });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it('keeps every other document change subject to drift checks', () => {
+    const recorded = fixture({ meta: { type: 'FIVE_STARS' }, climbs: [], totalCount: 0, hasMore: false });
+    expect(
+      replayCompatibleFixtureResponse(current.replace('climbs { uuid }', 'climbs { uuid name }'), recorded),
+    ).toBeNull();
+    expect(replayCompatibleFixtureResponse(legacy, recorded)).toBeNull();
+  });
+
+  it('refuses a recording that already carries the count, or holds no list', () => {
+    expect(
+      replayCompatibleFixtureResponse(
+        current,
+        fixture({ climbs: [], totalCount: 0, unfilteredCount: 4, hasMore: false }),
+      ),
+    ).toBeNull();
+    expect(replayCompatibleFixtureResponse(current, fixture(null))).toBeNull();
+  });
+});
+
+describe('legacy GetSessionWorkoutHeadlines replay compatibility (#7027)', () => {
+  const legacy =
+    'query GetSessionWorkoutHeadlines($sessionIds: [ID!]!) { sessionWorkoutHeadlines(sessionIds: $sessionIds) { sessionId userId mainKind mainTargetGrade secondMainKind blockCount extraMainBlocks } }';
+  const current = legacy.replace('mainTargetGrade', 'mainTargetGrade mainTargetBoardType');
+  const fixture = (sessionWorkoutHeadlines: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName: 'GetSessionWorkoutHeadlines',
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query: legacy,
+    variables: { sessionIds: ['s-1'] },
+    response: { data: { sessionWorkoutHeadlines } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+  const headline = {
+    sessionId: 's-1',
+    userId: 'u-1',
+    mainKind: 'fourByFour',
+    mainTargetGrade: '6b/V4',
+    secondMainKind: null,
+    blockCount: 3,
+    extraMainBlocks: 0,
+  };
+
+  it('replays the recorded headlines with no board, without mutating the recording', () => {
+    const recorded = fixture([headline]);
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({
+      response: { data: { sessionWorkoutHeadlines: [{ ...headline, mainTargetBoardType: null }] } },
+    });
+    expect(replayCompatibleFixtureResponse(current, fixture([]))).toEqual({
+      response: { data: { sessionWorkoutHeadlines: [] } },
+    });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+  });
+
+  it('keeps every other document change subject to drift checks', () => {
+    const recorded = fixture([headline]);
+    // The field anywhere but straight after mainTargetGrade.
+    expect(
+      replayCompatibleFixtureResponse(legacy.replace('blockCount', 'blockCount mainTargetBoardType'), recorded),
+    ).toBeNull();
+    // Selected twice.
+    expect(
+      replayCompatibleFixtureResponse(current.replace('blockCount', 'blockCount mainTargetBoardType'), recorded),
+    ).toBeNull();
+    // The addition plus another change.
+    expect(replayCompatibleFixtureResponse(current.replace(' extraMainBlocks', ''), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(legacy, recorded)).toBeNull();
+  });
+
+  it('refuses a recording that already carries the board, or holds no list', () => {
+    expect(
+      replayCompatibleFixtureResponse(current, fixture([{ ...headline, mainTargetBoardType: 'kilter' }])),
+    ).toBeNull();
+    expect(replayCompatibleFixtureResponse(current, fixture(null))).toBeNull();
+  });
+});
+
+describe('legacy tick characteristics replay compatibility', () => {
+  // A session's highlights and its grouped items are two tick levels in one
+  // document, so the field is added twice.
+  const legacyFor = (operationName: string) =>
+    `query ${operationName}($id: ID!) { feed(id: $id) { ticks { uuid isNoMatch comment } ` +
+    `groups { isNoMatch items { uuid isNoMatch comment } } } }`;
+  const currentFor = (operationName: string) =>
+    legacyFor(operationName).replaceAll('isNoMatch', 'isNoMatch characteristics');
+  const fixture = (operationName: string, feed: unknown): GraphqlFixtureFile => ({
+    formatVersion: 1,
+    operationName,
+    documentHash: 'original-hash',
+    variablesHash: 'variables',
+    query: legacyFor(operationName),
+    variables: { id: 'session-1' },
+    response: { data: { feed } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  });
+  const recordedFeed = {
+    ticks: [{ uuid: 't-1', isNoMatch: true, comment: '' }],
+    groups: [{ isNoMatch: false, items: [{ uuid: 't-2', isNoMatch: false, comment: 'nice' }] }],
+  };
+
+  it.each(['GetSessionDetail', 'GetSessionGroupedFeed', 'GetUserGroupedAscentsFeed'])(
+    '%s: replays every tick with null characteristics, without mutating the recording',
+    (operationName) => {
+      const recorded = fixture(operationName, recordedFeed);
+      const bytes = JSON.stringify(recorded);
+      expect(replayCompatibleFixtureResponse(currentFor(operationName), recorded)).toEqual({
+        response: {
+          data: {
+            feed: {
+              ticks: [{ uuid: 't-1', isNoMatch: true, characteristics: null, comment: '' }],
+              groups: [
+                {
+                  isNoMatch: false,
+                  characteristics: null,
+                  items: [{ uuid: 't-2', isNoMatch: false, characteristics: null, comment: 'nice' }],
+                },
+              ],
+            },
+          },
+        },
+      });
+      expect(JSON.stringify(recorded)).toBe(bytes);
+    },
+  );
+
+  it('keeps every other document change subject to drift checks', () => {
+    const recorded = fixture('GetSessionDetail', recordedFeed);
+    const current = currentFor('GetSessionDetail');
+    expect(replayCompatibleFixtureResponse(current.replace('comment } }', 'comment frames } }'), recorded)).toBeNull();
+    expect(replayCompatibleFixtureResponse(legacyFor('GetSessionDetail'), recorded)).toBeNull();
+    // The field on only one tick level is not the shipped document.
+    const partial = legacyFor('GetSessionDetail').replace('isNoMatch', 'isNoMatch characteristics');
+    expect(replayCompatibleFixtureResponse(partial, recorded)).toBeNull();
+  });
+
+  it('refuses a recording that already carries characteristics, and other operations', () => {
+    const withField = {
+      ...recordedFeed,
+      ticks: [{ uuid: 't-1', isNoMatch: true, characteristics: ['no_match'], comment: '' }],
+    };
+    expect(
+      replayCompatibleFixtureResponse(currentFor('GetSessionDetail'), fixture('GetSessionDetail', withField)),
+    ).toBeNull();
+    expect(
+      replayCompatibleFixtureResponse(currentFor('GetActivityFeed'), fixture('GetActivityFeed', recordedFeed)),
+    ).toBeNull();
   });
 });
 
@@ -652,7 +1387,6 @@ describe('log grammar', () => {
         operationName: 'SyncTicks',
         hash12: '0123456789ab',
         reason: 'no-fixture',
-        unrecordedIds: [],
         variables: '{"cursor":null}',
       },
     ],
@@ -664,7 +1398,6 @@ describe('log grammar', () => {
         operationName: 'SyncTicks',
         hash12: '0123456789ab',
         reason: 'document-changed',
-        unrecordedIds: [],
         variables: '{}',
       },
     ],
@@ -676,7 +1409,6 @@ describe('log grammar', () => {
         operationName: 'anonymous',
         hash12: '0123456789ab',
         reason: 'anonymous-operation',
-        unrecordedIds: [],
         variables: '{}',
       },
     ],
@@ -688,21 +1420,12 @@ describe('log grammar', () => {
         operationName: 'SyncTicks',
         hash12: '0123456789ab',
         reason: 'unreadable-fixture',
-        unrecordedIds: [],
         variables: '{}',
       },
     ],
     [
-      'MISS graphql ClimbStatsForClimbs 0123456789ab reason=unrecorded-ids ids=climb-y,climb-z variables={"boardName":"kilter","climbUuids":["climb-y","climb-z"]}',
-      {
-        event: 'miss',
-        kind: 'graphql',
-        operationName: 'ClimbStatsForClimbs',
-        hash12: '0123456789ab',
-        reason: 'unrecorded-ids',
-        unrecordedIds: ['climb-y', 'climb-z'],
-        variables: '{"boardName":"kilter","climbUuids":["climb-y","climb-z"]}',
-      },
+      'DEFAULT graphql ProfileAdminFlag 0123456789ab',
+      { event: 'default', operationName: 'ProfileAdminFlag', hash12: '0123456789ab' },
     ],
     ['MISS static /static/avatars/a.jpg', { event: 'miss', kind: 'static', subject: '/static/avatars/a.jpg' }],
     ['MISS route GET /api/v1/climbs', { event: 'miss', kind: 'route', method: 'GET', path: '/api/v1/climbs' }],
@@ -786,7 +1509,6 @@ describe('log grammar', () => {
       operationName: 'SyncTicks',
       hash12: '0123456789ab',
       reason: 'no-fixture',
-      unrecordedIds: [],
       variables: '',
     });
   });
@@ -895,17 +1617,66 @@ describe('findScreenshotBackendProblems', () => {
     expect(problems[0]).toContain('×2');
   });
 
-  it('fails a batch where NOT ONE id was covered — that is a screen nobody recorded', () => {
+  it('fails a batched operation that never got one recorded id across the whole capture', () => {
+    // Not timing: every batch of the operation came back empty, so the app is
+    // asking about climbs the set does not know. For ticks nothing else fills
+    // the row in, and the list would shoot with no send marks.
     const log = [
       line('HIT graphql Me 0000aaaa1111'),
-      line(
-        'MISS graphql ClimbStatsForClimbs 0123456789ab reason=unrecorded-ids ids=climb-y,climb-z variables={"boardName":"kilter"}',
-      ),
+      line('HIT graphql GetTicks 0123456789ab composed=0 uncovered=2 ids=climb-y,climb-z'),
+      line('HIT graphql GetTicks 0123456789ac composed=0 uncovered=1 ids=climb-x'),
     ].join('\n');
-    const [problem] = findScreenshotBackendProblems(log, { mode: 'replay' });
-    expect(problem).toContain('ClimbStatsForClimbs asked for a batch where NO id was recorded: climb-y, climb-z');
-    expect(problem).toContain('was never captured');
-    expect(problem).toContain(RE_RECORD_COMMAND);
+    const problems = findScreenshotBackendProblems(log, { mode: 'replay' });
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain('GetTicks was asked for 2 batch(es) and the recorded set covers none');
+    expect(problems[0]).toContain('climb-y, climb-z');
+    expect(problems[0]).toContain(RE_RECORD_COMMAND);
+  });
+
+  it('counts an exact-key hit of a batched operation as coverage', () => {
+    const log = [
+      line('HIT graphql GetTicks 0000aaaa1111'),
+      line('HIT graphql GetTicks 0123456789ab composed=0 uncovered=2 ids=climb-y,climb-z'),
+    ].join('\n');
+    expect(findScreenshotBackendProblems(log, { mode: 'replay' })).toEqual([]);
+  });
+
+  it('does not count a composed=0 answer as proof the app reached the recorded set', () => {
+    const log = line('HIT graphql ClimbStatsForClimbs 0123456789ab composed=0 uncovered=2 ids=climb-y,climb-z');
+    const problems = findScreenshotBackendProblems(log, { mode: 'replay' });
+    expect(problems.some((problem) => problem.includes('no HIT graphql lines'))).toBe(true);
+  });
+
+  it('does not fail a capture for a batch where no id was covered, and counts it apart in the note', () => {
+    // Whether a chunk holds a covered id is flush timing (Android run
+    // 37258958437), so it cannot decide a miss. It is still the batch most
+    // worth a look, so the note says how many there were.
+    const log = [
+      line('HIT graphql ClimbStatsForClimbs 0123456789ab composed=2 uncovered=18 ids=climb-c'),
+      line('HIT graphql ClimbStatsForClimbs 0123456789ac composed=0 uncovered=2 ids=climb-y,climb-z'),
+    ].join('\n');
+    expect(findScreenshotBackendProblems(log, { mode: 'replay' })).toEqual([]);
+    expect(findScreenshotBackendNotes(log)).toEqual([
+      'ClimbStatsForClimbs answered 2 batch(es) with 20 uncovered id(s), 1 of them with no recorded id at all — ' +
+        'rows the recording never asked about; re-record if a visible row shows blank or wrong data.',
+    ]);
+  });
+
+  it('mentions an operation answered from its replay default, without failing the capture', () => {
+    const log = [
+      line('HIT graphql Me 0000aaaa1111'),
+      line('DEFAULT graphql ProfileAdminFlag 44136fa355b3'),
+      line('DEFAULT graphql ProfileAdminFlag 44136fa355b3'),
+    ].join('\n');
+    expect(findScreenshotBackendProblems(log, { mode: 'replay' })).toEqual([]);
+    expect(findScreenshotBackendNotes(log)).toEqual([
+      'ProfileAdminFlag has no recorded fixture; answered 2 request(s) with its replay default.',
+    ]);
+  });
+
+  it('does not count a replay default as proof the app reached the recorded set', () => {
+    const log = line('DEFAULT graphql ProfileAdminFlag 44136fa355b3');
+    expect(findScreenshotBackendProblems(log, { mode: 'replay' })).toHaveLength(1);
   });
 
   it('does not fail a capture for a partly-covered batch', () => {
@@ -1066,8 +1837,8 @@ describe('findScreenshotBackendNotes', () => {
     const notes = findScreenshotBackendNotes(log);
     expect(notes).toHaveLength(2);
     expect(notes[0]).toBe(
-      'ClimbStatsForClimbs answered 2 batch(es) with 3 uncovered id(s) — rows mounted beyond the fold; ' +
-        're-record if a visible row shows blank stats.',
+      'ClimbStatsForClimbs answered 2 batch(es) with 3 uncovered id(s) — rows the recording never asked about; ' +
+        're-record if a visible row shows blank or wrong data.',
     );
     expect(notes[1]).toContain('GetBulkVoteSummaries answered 1 batch(es) with 3 uncovered id(s)');
   });
@@ -1349,5 +2120,82 @@ describe('findUnpseudonymisedPersonFields', () => {
     };
     const { response } = pseudonymiseResponse(recorded, { ownUserId: OWN_USER_ID });
     expect(findUnpseudonymisedPersonFields(response, { ownUserId: OWN_USER_ID })).toEqual([]);
+  });
+});
+
+describe('legacy numeric-only presence recording compatibility', () => {
+  const legacy = 'query BoardLiveSessions($boardId: Int!) { boardLiveSessions(boardId: $boardId) { sessionId } }';
+  const current =
+    'query BoardLiveSessions($boardId: Int!, $boardUuid: ID) { boardLiveSessions(boardId: $boardId, boardUuid: $boardUuid) { sessionId } }';
+  const recorded: GraphqlFixtureFile = {
+    formatVersion: 1,
+    operationName: 'BoardLiveSessions',
+    documentHash: 'original',
+    variablesHash: 'original-vars',
+    query: legacy,
+    variables: { boardId: 42 },
+    response: { data: { boardLiveSessions: [] } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  };
+  it('keeps selections and recording bytes unchanged for exactly the optional argument addition', () => {
+    const bytes = JSON.stringify(recorded);
+    expect(replayCompatibleFixtureResponse(current, recorded)).toEqual({ response: recorded.response });
+    expect(JSON.stringify(recorded)).toBe(bytes);
+    expect(replayCompatibleFixtureResponse(current.replace('sessionId', 'sessionId name'), recorded)).toBeNull();
+    expect(
+      replayCompatibleFixtureResponse(current.replace('$boardUuid: ID)', '$boardUuid: ID!)'), recorded),
+    ).toBeNull();
+    expect(
+      replayCompatibleFixtureResponse(current.replace('BoardLiveSessions', 'OtherRead'), {
+        ...recorded,
+        operationName: 'OtherRead',
+      }),
+    ).toBeNull();
+  });
+  it('keeps a supplied UUID in the variables hash so it cannot match a numeric-only recording', () => {
+    const numeric = graphqlFixtureKey(
+      { operationName: 'BoardLiveSessions', query: current, variables: { boardId: 42 } },
+      sha256Hex,
+    );
+    const linked = graphqlFixtureKey(
+      { operationName: 'BoardLiveSessions', query: current, variables: { boardId: 42, boardUuid: 'held-link' } },
+      sha256Hex,
+    );
+    expect(numeric.variablesHash).not.toBe(linked.variablesHash);
+  });
+});
+
+describe('Aurora history opt-in recording compatibility', () => {
+  const legacy =
+    'query BoardRecentHistory($boardId: Int!) { boardRecentHistory(boardId: $boardId) { climbUuid source } }';
+  const current =
+    'query BoardRecentHistory($boardId: Int!, $boardUuid: ID, $includeAurora: Boolean) { boardRecentHistory(boardId: $boardId, boardUuid: $boardUuid, includeAurora: $includeAurora) { climbUuid source } }';
+  const fixture: GraphqlFixtureFile = {
+    formatVersion: 1,
+    operationName: 'BoardRecentHistory',
+    documentHash: 'old-document',
+    variablesHash: 'old-vars',
+    query: legacy,
+    variables: { boardId: 42 },
+    response: { data: { boardRecentHistory: [] } },
+    status: 200,
+    recordedAt: '2026-01-01T00:00:00Z',
+    upstream: 'https://example.test',
+  };
+  it('adapts only the two optional declarations and arguments, preserving recording bytes', () => {
+    const bytes = JSON.stringify(fixture);
+    expect(replayCompatibleFixtureResponse(current, fixture)).toEqual({ response: fixture.response });
+    expect(JSON.stringify(fixture)).toBe(bytes);
+    expect(
+      replayCompatibleFixtureResponse(current.replace('climbUuid source', 'climbUuid source angle'), fixture),
+    ).toBeNull();
+    expect(
+      replayCompatibleFixtureResponse(
+        current.replace('$includeAurora: Boolean)', '$includeAurora: Boolean!)'),
+        fixture,
+      ),
+    ).toBeNull();
   });
 });

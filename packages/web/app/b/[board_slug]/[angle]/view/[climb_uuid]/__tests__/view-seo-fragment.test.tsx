@@ -4,6 +4,10 @@ import { renderToString } from 'react-dom/server';
 import ClimbViewSeoFragment from '@/app/components/climb-detail/climb-view-seo-fragment';
 import { resolveServerTree } from '@/app/lib/__tests__/helpers/resolve-server-tree';
 import { getClimbStatsForAllAngles, type ClimbStatsForAngle } from '@/app/lib/data/queries';
+import { getRedirectStatusCodeFromError, getURLFromRedirectError } from 'next/dist/client/components/redirect';
+import { isRedirectError } from 'next/dist/client/components/redirect-error';
+import { constructBoardSlugViewUrl, extractUuidFromSlug } from '@/app/lib/url-utils';
+import { buildOgBoardRenderUrl } from '@/app/components/board-renderer/util';
 
 /**
  * The climb front door's acceptance suite — the vitest form of #4369's curl
@@ -24,7 +28,13 @@ import { getClimbStatsForAllAngles, type ClimbStatsForAngle } from '@/app/lib/da
 const climbRow = vi.hoisted(() => ({ description: null as string | null }));
 
 vi.mock('server-only', () => ({}));
-vi.mock('next/navigation', () => ({ notFound: vi.fn() }));
+// `usePathname` for the store button island, which re-reads a QR landing per page.
+vi.mock('next/navigation', async () => ({
+  notFound: vi.fn(),
+  permanentRedirect: (await import('next/dist/client/components/redirect')).permanentRedirect,
+  usePathname: () => null,
+}));
+vi.mock('@/app/lib/i18n/get-locale', () => ({ getLocale: vi.fn(async () => 'en-US') }));
 
 vi.mock('@/app/lib/i18n/server', () => ({
   getServerTranslation: vi.fn(async () => ({
@@ -69,8 +79,9 @@ vi.mock('@/app/lib/board-slug-utils', () => ({
   })),
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({
     board_name: 'kilter',
     layout_id: 1,
     size_id: 7,
@@ -149,17 +160,27 @@ vi.mock('@/app/components/board-renderer/util', () => ({
   buildOgBoardRenderUrl: vi.fn(() => 'https://ws.boardsesh.com/og/climb'),
   // The fixtures here are Kilter, which has no dark art — so the front door emits its
   // single board image and these assertions keep counting one.
-  hasDarkBoardArt: (board: string) => board === 'woods',
+  hasSplitDarkBoardArt: (board: string) => board === 'woods',
 }));
 
 // Below-the-fold client islands. They are not what this file asserts, and
 // mounting them under `renderToString` would drag React Query and the socket
 // providers into a node test.
 vi.mock('@/app/components/similar-climbs/similar-climbs-list', () => ({ default: () => null }));
+// The root layout's provider, as a cold server render sees it: no answer yet.
+vi.mock('@/app/components/consent/consent-state-provider', () => ({
+  useConsent: () => ({ granted: false, snapshot: { record: null }, dialogOpen: false }),
+}));
 vi.mock('@/app/components/social/climb-social-section', () => ({ default: () => null }));
 vi.mock('@/app/components/beta-videos/boardsesh-beta-list', () => ({ default: () => null }));
 
-const pageModule = await import('../page');
+function requireRedirectError(outcome: unknown) {
+  expect(isRedirectError(outcome)).toBe(true);
+  if (!isRedirectError(outcome)) throw new Error('Expected a Next redirect error');
+  return outcome;
+}
+
+const pageModule = await import('@/app/(site)/b/[board_slug]/[angle]/view/[climb_uuid]/page');
 
 const PARAMS = { board_slug: 'my-board', angle: '40', climb_uuid: 'test-climb' };
 
@@ -178,7 +199,10 @@ function treeContainsElementOfType(node: React.ReactNode, type: React.ElementTyp
 }
 
 async function renderFrontDoor(params = PARAMS): Promise<string> {
-  const element = (await pageModule.default({ params: Promise.resolve(params) })) as React.ReactElement;
+  const element = (await pageModule.default({
+    searchParams: Promise.resolve({}),
+    params: Promise.resolve(params),
+  })) as React.ReactElement;
   return renderToString(<>{await resolveServerTree(element)}</>);
 }
 
@@ -194,6 +218,12 @@ const CURRENT_ANGLE_STATS: ClimbStatsForAngle = {
   quality_normalized: true,
   rating_count: '12',
 };
+
+/** `buildClimbSearchDescription` through the key-printing `t` above: lead, sends with rating, call to action. */
+const JSON_LD_LEAD =
+  'metadata.view.descriptionLead(climbName=Test Climb,grade=V5,layoutName=Kilter Board Original,angle=40,setter=setter-person)';
+const JSON_LD_DESCRIPTION = `${JSON_LD_LEAD} metadata.view.descriptionSendsRated(count=12,ascents=12,quality=4.2) metadata.view.descriptionCta`;
+const UNRATED_JSON_LD_DESCRIPTION = `${JSON_LD_LEAD} metadata.view.descriptionSends(count=12,ascents=12) metadata.view.descriptionCta`;
 
 function jsonLdPayloads(html: string): Record<string, unknown>[] {
   return [...html.matchAll(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g)].map(
@@ -217,7 +247,10 @@ function breadcrumbItems(html: string): BreadcrumbItem[] {
 
 describe('board slug climb view SEO fragment', () => {
   it('SSR-emits ClimbViewSeoFragment in the server output', async () => {
-    const element = (await pageModule.default({ params: Promise.resolve(PARAMS) })) as React.ReactElement;
+    const element = (await pageModule.default({
+      searchParams: Promise.resolve({}),
+      params: Promise.resolve(PARAMS),
+    })) as React.ReactElement;
     // Expand every async server component EXCEPT the fragment, so the assertion
     // stays an element-identity check rather than a string match on its output.
     const tree = await resolveServerTree(element, new Set([ClimbViewSeoFragment]));
@@ -239,6 +272,63 @@ describe('climb front door server HTML', () => {
     expect(html).toMatch(/<img[^>]*height="1350"/);
   });
 
+  it('names the grade inside the <h1> and keeps the coloured tile out of the accessibility tree', async () => {
+    const html = await renderFrontDoor();
+    const heading = html.match(/<h1[\s>][\s\S]*?<\/h1>/)?.[0] ?? '';
+    expect(heading).toContain('Test Climb');
+    expect(heading).toContain('frontDoor.hero.gradeForSearch(grade=V5)');
+    expect(html).toMatch(/<span[^>]*aria-hidden="true"[^>]*><span[^>]*>V5<\/span><\/span>/);
+  });
+
+  it('loads the board image first: high fetch priority and never lazy', async () => {
+    const html = await renderFrontDoor();
+    const boardImage = html.match(/<img[^>]*\/api\/internal\/board-render[^>]*>/)?.[0] ?? '';
+    expect(boardImage).toMatch(/fetchPriority="high"|fetchpriority="high"/);
+    expect(boardImage).not.toMatch(/loading=/);
+  });
+
+  it('carries one hand-off link to the app', async () => {
+    const html = await renderFrontDoor();
+    expect(html.match(/href="https:\/\/app\.boardsesh\.com/g) ?? []).toHaveLength(1);
+  });
+
+  it('reads crumbs, title, board, call to action, then the details, in DOM order', async () => {
+    // The phone order. From md the CSS grid moves the board to a left column,
+    // but crawlers, screen readers and phones all get this sequence.
+    const html = await renderFrontDoor();
+    const positions = [
+      html.indexOf('aria-label="frontDoor.breadcrumb.aria"'),
+      html.indexOf('<h1'),
+      html.search(/<img[^>]*\/api\/internal\/board-render/),
+      html.indexOf('href="https://app.boardsesh.com'),
+      html.indexOf('<dl'),
+    ];
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect([...positions].sort((first, second) => first - second)).toEqual(positions);
+  });
+
+  it('prints the proof line from the current angle: sends, star and setter', async () => {
+    const html = await renderFrontDoor();
+    expect(html).toContain('sends(count=12,formattedCount=12)');
+    expect(html).toContain('frontDoor.hero.qualityAria(quality=4.2)');
+    expect(html).toContain('frontDoor.hero.boardAtAngle(board=Kilter Board Original,angle=40)');
+  });
+
+  it('agrees with the heading on quality: the facts list shows it only on the 1-5 scale', async () => {
+    const factsList = (html: string) => html.match(/<dl[\s>][\s\S]*?<\/dl>/)?.[0] ?? '';
+    const rated = factsList(await renderFrontDoor());
+    expect(rated).toContain('frontDoor.facts.qualityAtAngle(angle=40)');
+    expect(rated).toContain('frontDoor.hero.qualityAria(quality=4.2)');
+
+    // Aurora's raw 1-3 average: neither the star, the facts list nor the table prints it.
+    vi.mocked(getClimbStatsForAllAngles).mockResolvedValueOnce([
+      { ...CURRENT_ANGLE_STATS, quality_average: '2.40', quality_normalized: false },
+    ]);
+    const html = await renderFrontDoor();
+    expect(html).not.toContain('frontDoor.hero.qualityAria');
+    expect(factsList(html)).toContain('frontDoor.angles.notRated');
+  });
+
   it('emits one board image for a board with no dark art', async () => {
     // Woods ships a `.dark.webp` sibling and gets a light/dark pair the theme picks between
     // (issue #4753). Every other board must keep its single image — pairing them would
@@ -254,13 +344,22 @@ describe('climb front door server HTML', () => {
     expect(html).toContain('href="/setter/setter-person"');
   });
 
-  it('cross-links the other angles and does not self-link the current one', async () => {
+  it('cross-links the other angles from the angle table and does not self-link the current one', async () => {
     const html = await renderFrontDoor();
+    const table = html.match(/<table[\s>][\s\S]*?<\/table>/)?.[0] ?? '';
     // Angle navigation retains the shared physical board, while schema above
     // continues to use its canonical configuration URL.
-    expect(html).toMatch(/href="\/b\/my-board\/25\/view\//);
+    expect(table).toMatch(/href="\/b\/my-board\/25\/view\//);
     expect(html).not.toMatch(/href="\/b\/my-board\/40\/view\//);
-    expect(html).toContain('aria-current="page"');
+    expect(table).toMatch(/<tr[^>]*aria-current="page"[^>]*>[\s\S]*?frontDoor\.facts\.angleValue\(angle=40\)/);
+  });
+
+  it('writes the about paragraph from the page data', async () => {
+    const html = await renderFrontDoor();
+    expect(html).toContain(
+      'frontDoor.about.introWithSetter(climbName=Test Climb,board=Kilter Board Original,angle=40,grade=V5,setter=setter-person)',
+    );
+    expect(html).toContain('frontDoor.about.sendsHere(count=12,formattedCount=12)');
   });
 
   it('pins the BreadcrumbList crumbs, board name included', async () => {
@@ -307,25 +406,57 @@ describe('climb front door server HTML', () => {
   it('describes a climb from its normalized current-angle quality and ascents', async () => {
     const creativeWork = creativeWorkPayload(await renderFrontDoor());
 
-    expect(creativeWork.description).toBe(
-      'metadata.view.description(climbName=Test Climb,grade=V5,setter=setter-person,quality=4.20,ascents=12)',
-    );
+    expect(creativeWork.description).toBe(JSON_LD_DESCRIPTION);
   });
 
-  it('omits the description when the current angle has no quality instead of inventing 0/5', async () => {
+  it('carries the meta description verbatim, so the two can never disagree', async () => {
+    const creativeWork = creativeWorkPayload(await renderFrontDoor());
+    const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
+      params: Promise.resolve(PARAMS),
+    });
+
+    expect(creativeWork.description).toBe(metadata.description);
+  });
+
+  it("links the JSON-LD author to the setter's page and pictures the climb with its share card", async () => {
+    const creativeWork = creativeWorkPayload(await renderFrontDoor());
+    const metadata = await pageModule.generateMetadata({
+      searchParams: Promise.resolve({}),
+      params: Promise.resolve(PARAMS),
+    });
+    const [ogImage] = (metadata.openGraph?.images ?? []) as Array<{ url: string }>;
+
+    expect(creativeWork.author).toEqual({
+      '@type': 'Person',
+      name: 'setter-person',
+      url: 'https://www.boardsesh.com/setter/setter-person',
+    });
+    // The card `og:image` names, not the holds render the page draws.
+    expect(creativeWork.image).toBe(ogImage.url);
+    expect(String(creativeWork.image)).not.toContain('variant=overlay');
+    expect(vi.mocked(buildOgBoardRenderUrl)).toHaveBeenCalledWith(
+      expect.objectContaining({ board_name: 'kilter', layout_id: 1, size_id: 7 }),
+      'p1r12',
+      expect.objectContaining({ angle: 40, name: 'Test Climb', setter: 'setter-person' }),
+    );
+    expect(creativeWork).not.toHaveProperty('aggregateRating');
+  });
+
+  it('states no rating when the current angle has no quality, instead of inventing 0/5', async () => {
     vi.mocked(getClimbStatsForAllAngles).mockResolvedValueOnce([
       { ...CURRENT_ANGLE_STATS, quality_average: null, rating_count: '0' },
     ]);
 
-    expect(creativeWorkPayload(await renderFrontDoor())).not.toHaveProperty('description');
+    expect(creativeWorkPayload(await renderFrontDoor()).description).toBe(UNRATED_JSON_LD_DESCRIPTION);
   });
 
-  it('omits the description when current-angle quality is not normalized to five stars', async () => {
+  it('states no rating when current-angle quality is not normalized to five stars', async () => {
     vi.mocked(getClimbStatsForAllAngles).mockResolvedValueOnce([
       { ...CURRENT_ANGLE_STATS, quality_average: '2.40', quality_normalized: false },
     ]);
 
-    expect(creativeWorkPayload(await renderFrontDoor())).not.toHaveProperty('description');
+    expect(creativeWorkPayload(await renderFrontDoor()).description).toBe(UNRATED_JSON_LD_DESCRIPTION);
   });
 });
 
@@ -378,40 +509,75 @@ describe('setter notes on the climb front door', () => {
     climbRow.description = 'Match the rail, then a big move to the jug.';
     const creativeWork = creativeWorkPayload(await renderFrontDoor());
 
-    expect(creativeWork.description).toBe(
-      'metadata.view.description(climbName=Test Climb,grade=V5,setter=setter-person,quality=4.20,ascents=12)',
-    );
+    expect(creativeWork.description).toBe(JSON_LD_DESCRIPTION);
   });
 });
 
 describe('an alias URL', () => {
-  it('reads angle stats, similar climbs and beta for the canonical climb, not the husk uuid', async () => {
+  const canonicalUuid = 'abcdef1234567890abcdef1234567890';
+  const aliasUuid = '11112222333344445555666677778888';
+  const canonicalRow = {
+    uuid: canonicalUuid,
+    name: 'Test Climb',
+    difficulty: 'V5',
+    setter_username: 'setter-person',
+    quality_average: '4.20',
+    ascensionist_count: 12,
+    frames: 'p1r12',
+    description: null,
+  };
+
+  it.each([aliasUuid, `old-name-${aliasUuid}`])(
+    '308s alias %s within the same saved board and angle',
+    async (requestedClimb) => {
+      const { getClimb } = await import('@/app/lib/data/queries');
+      vi.mocked(getClimb).mockResolvedValueOnce(canonicalRow as never);
+      const outcome = await renderFrontDoor({ ...PARAMS, angle: '25', climb_uuid: requestedClimb }).catch(
+        (error: unknown) => error,
+      );
+      expect(getRedirectStatusCodeFromError(requireRedirectError(outcome))).toBe(308);
+      expect(getURLFromRedirectError(requireRedirectError(outcome))).toBe(
+        constructBoardSlugViewUrl('my-board', 25, canonicalUuid, 'Test Climb'),
+      );
+    },
+  );
+
+  it('preserves locale and redirects a non-Latin alias to the bare canonical UUID', async () => {
+    const { getClimb } = await import('@/app/lib/data/queries');
+    const { getLocale } = await import('@/app/lib/i18n/get-locale');
+    vi.mocked(getLocale).mockResolvedValueOnce('de');
+    vi.mocked(getClimb).mockResolvedValueOnce({ ...canonicalRow, name: 'Скала' } as never);
+    const outcome = await renderFrontDoor({ ...PARAMS, climb_uuid: aliasUuid }).catch((error: unknown) => error);
+    expect(getRedirectStatusCodeFromError(requireRedirectError(outcome))).toBe(308);
+    expect(getURLFromRedirectError(requireRedirectError(outcome))).toBe(
+      `/de${constructBoardSlugViewUrl('my-board', 40, canonicalUuid, 'Скала')}`,
+    );
+  });
+
+  it('renders the canonical landing once and reads its stats, similar climbs and beta', async () => {
     const { getClimb } = await import('@/app/lib/data/queries');
     const { getFrontDoorSimilarClimbs, getFrontDoorBetaLinks } = await import('@/app/lib/data/front-door-data.server');
-    // The URL names an old uuid; `getClimb` resolved it to the canonical row.
-    vi.mocked(getClimb).mockResolvedValueOnce({
-      uuid: 'canonical-climb',
-      name: 'Test Climb',
-      difficulty: 'V5',
-      setter_username: 'setter-person',
-      quality_average: '4.20',
-      ascensionist_count: 12,
-      frames: 'p1r12',
-      description: null,
-    } as unknown as Awaited<ReturnType<typeof getClimb>>);
+    vi.mocked(getClimb)
+      .mockResolvedValueOnce(canonicalRow as never)
+      .mockResolvedValueOnce(canonicalRow as never);
+    const outcome = await renderFrontDoor({ ...PARAMS, climb_uuid: aliasUuid }).catch((error: unknown) => error);
+    const target = getURLFromRedirectError(requireRedirectError(outcome));
+    if (!target) throw new Error('Expected canonical redirect');
+    const landingSegment = target.split('/').at(-1)!;
+    expect(extractUuidFromSlug(landingSegment)).toBe(canonicalUuid);
     vi.mocked(getClimbStatsForAllAngles).mockClear();
     vi.mocked(getFrontDoorSimilarClimbs).mockClear();
     vi.mocked(getFrontDoorBetaLinks).mockClear();
-
-    await renderFrontDoor({ ...PARAMS, climb_uuid: 'alias-climb' });
-
-    expect(vi.mocked(getClimbStatsForAllAngles)).toHaveBeenCalledWith('kilter', 'canonical-climb');
+    const html = await renderFrontDoor({ ...PARAMS, climb_uuid: landingSegment });
+    expect(html).toContain('<h1');
+    expect(vi.mocked(getClimbStatsForAllAngles)).toHaveBeenCalledWith('kilter', canonicalUuid);
     expect(vi.mocked(getFrontDoorSimilarClimbs)).toHaveBeenCalledWith(
-      expect.objectContaining({ climbUuid: 'canonical-climb' }),
+      expect.objectContaining({ climbUuid: canonicalUuid }),
     );
     expect(vi.mocked(getFrontDoorBetaLinks)).toHaveBeenCalledWith(
-      expect.objectContaining({ climbUuid: 'canonical-climb' }),
+      expect.objectContaining({ climbUuid: canonicalUuid }),
     );
+    expect(html).toContain(`https://app.boardsesh.com${target}`);
   });
 });
 

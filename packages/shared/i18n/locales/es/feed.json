@@ -22,6 +22,60 @@
         "everyone": "Todos",
         "findGym": "Busca un rocódromo cerca",
         "hint": "Cambia de quién ves las vías"
+      },
+      "sections": {
+        "week": {
+          "title": "Esta semana",
+          "sessions_one": "{{count}} sesión",
+          "sessions_other": "{{count}} sesiones",
+          "sends_one": "{{count}} encadene",
+          "sends_other": "{{count}} encadenes",
+          "hardest": "Lo más duro esta semana: {{grade}}",
+          "weeksRunning_one": "{{count}} semana seguida",
+          "weeksRunning_other": "{{count}} semanas seguidas",
+          "recordFirstGrade": "Nuevo: tu primer {{grade}}",
+          "recordHardestFlash": "Nuevo: tu flash más duro, {{grade}}",
+          "recordClimb": "{{record}} · {{climb}}",
+          "empty": "Registra un encadene para empezar tu semana",
+          "dayClimbed": "{{day}}, escalaste",
+          "openRecord": "Abrir {{climb}}"
+        },
+        "session": {
+          "startTitle": "Empieza una sesión",
+          "startBody": "Elige un entrenamiento o simplemente escala",
+          "running": "Sesión en marcha",
+          "open": "Abrir sesión",
+          "lastWorkoutToday": "Último entrenamiento · Hoy",
+          "lastWorkoutYesterday": "Último entrenamiento · Ayer",
+          "lastWorkoutOn": "Último entrenamiento · {{day}}",
+          "lastWorkoutSends_one": "{{count}} encadene",
+          "lastWorkoutSends_other": "{{count}} encadenes"
+        },
+        "projects": {
+          "title": "Vuelve a tus proyectos",
+          "tries_one": "{{count}} intento",
+          "tries_other": "{{count}} intentos",
+          "seeAll": "Ver todos",
+          "unknownClimb": "Bloque desconocido"
+        },
+        "playlists": {
+          "title": "A tu nivel, sin encadenar",
+          "all": "Todas las listas"
+        },
+        "empty": {
+          "title": "Tu Inicio está vacío",
+          "body": "Vuelve a activar secciones para ver tu plafón, tu sesión o tu crew."
+        },
+        "beta": {
+          "title": "Beta reciente",
+          "titleBoard": "Beta reciente en este plafón",
+          "empty": "Aún no hay vídeos de beta",
+          "error": "No se pudieron cargar los vídeos de beta.",
+          "offline": "Sin conexión. La beta reciente vuelve a aparecer cuando recuperes la conexión.",
+          "offlineMode": "El modo sin conexión está activado. La beta reciente vuelve a aparecer cuando lo desactives.",
+          "unknownClimb": "Bloque desconocido",
+          "openClimb": "Abrir {{climb}}"
+        }
       }
     },
     "liveSessions": {

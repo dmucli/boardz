@@ -1,3 +1,4 @@
+import { createHmac, randomUUID } from 'node:crypto';
 import { resolveSentryEnvironment } from '@boardsesh/db/client/config';
 import { PostHog } from 'posthog-node';
 import { logger } from '../../utils/logger';
@@ -14,16 +15,139 @@ export type BackendAnalyticsEvent =
   | 'Live Activity Widget Navigation'
   | 'Live Activity Widget Navigation Attribution Gap'
   // Counter behind the log-only climb-existence check in saveTick (#3528).
-  // Count DISTINCT USERS, not events — one looping client would otherwise read
-  // as a fleet-wide problem. A sustained zero is the signal to turn the check
-  // into a rejection (#3942).
-  | 'Tick Climb Not In Catalog';
+  // Count DISTINCT `climbUuid`s, not events — one looping client resends the
+  // same climb and would otherwise read as a fleet-wide problem. A sustained
+  // zero is the signal to turn the check into a rejection (#3942).
+  | 'Tick Climb Not In Catalog'
+  // The daily first-party DAU/WAU/MAU counts from user_activity_days. Counts
+  // only, on one fixed system id. See docs/analytics/analytics-consent.md.
+  | 'Active Users Snapshot'
+  // Versioned historical action-proxy counts; never substitute for request MAU.
+  | 'Historical Active Users Snapshot'
+  // Once-a-minute per-replica count of GraphQL operations per client app
+  // (services/client-usage.ts). One event per (client, version, transport).
+  | 'Client Usage Summary'
+  | 'Public API Usage Summary'
+  | 'Public API Feed Health'
+  | 'App Workout Completed'
+  // One personless weekly roll-up of the spray-wall fleet's health (issue
+  // #6062). The distinct id is a fixed synthetic actor; count WEEKS, and read
+  // the properties, never the event volume. Contract:
+  // services/analytics/wall-health-events.ts and docs/analytics/growth-metrics.md.
+  | 'Spray Wall Health Weekly'
+  // The monthly community recap (community-monthly-stats batch family): one
+  // summary and twenty ranked rows (top gyms, top climbers) per UTC month, on
+  // the fixed actor `system:community-monthly`, re-sent daily under
+  // deterministic uuids. Dedupe by uuid, keep the newest. `Community Monthly
+  // Rank` carries the one personal value a backend event may carry, see
+  // below. Contract: services/analytics/community-monthly-events.ts and
+  // docs/analytics/growth-metrics.md.
+  | 'Community Monthly Summary'
+  | 'Community Monthly Rank'
+  // Fires from the Stripe webhook once a build-pack payment is confirmed —
+  // never from the browser. The purchase is a server fact, and a client-side
+  // "Checkout Started" is not one: it fires whether or not the card clears,
+  // and an ad blocker eats it either way. Stratify revenue by `tier` and
+  // `board_name`; the two tiers are 5x apart in price, so pooling them makes
+  // the average meaningless.
+  // `amount_cents` is GST-inclusive — it is `session.amount_total`, i.e. what
+  // Stripe actually charged, not the catalogue's pre-tax display price.
+  // `amount_excluding_tax_cents` is the GST-exclusive equivalent, derived from
+  // `session.total_details.amount_tax` when Stripe reported a tax breakdown
+  // (null otherwise); use it rather than deriving a pre-tax figure from
+  // `amount_cents` with a guessed rate.
+  | 'Build Plans Pack Purchased'
+  // Fires from the worker's preview completion — the free, watermarked pack
+  // that now stands between "configured a wall" and "paid for one". It is the
+  // top of the build-plans funnel and the denominator every later step is read
+  // against: previews generated → `Checkout Started` (client, at finalise) →
+  // `Build Plans Pack Purchased`. Backend events count operations, not people;
+  // `preview_index` above 1 is a generator retry, not a buyer iterating, since
+  // changing anything writes a new order row.
+  | 'Build Plans Preview Generated'
+  // Fires from the authenticated download route, once per successful stream.
+  // Counts EVENTS, not distinct users, on purpose: a buyer re-downloading their
+  // own pack is the signal (a pack that is fetched twenty times is a pack
+  // someone is having trouble with, or sharing).
+  | 'Build Plans Pack Downloaded'
+  // Directory reports (docs/product/directory-reports.md). Counts of what
+  // happened to boards and gym listings, never who: no board, gym or account
+  // id travels. `Board Report Submitted` {targetKind, reason, status, routedTo};
+  // `Board Report Resolved` {targetKind, reason, outcome, resolvedBy, hoursOpen},
+  // whose share resolved without an admin is the launch metric;
+  // `Board Removed From Gym` {by} and `Board Deleted` {by}, where `by` is
+  // creator | gym_staff | moderator | admin.
+  // Suggested setups: `Board Setup Suggested` {outcome: APPLIED |
+  // SENT_FOR_REVIEW, reason: a BoardSetupReviewReason or null, boardType,
+  // gymState: UNCLAIMED | CLIMBER_LISTED | RUN_BY_GYM | NO_GYM} for every
+  // report that carried one, and `Board Setup Change Undone` {by: creator |
+  // gym_staff | admin}.
+  | 'Board Report Submitted'
+  | 'Board Report Resolved'
+  | 'Board Removed From Gym'
+  | 'Board Deleted'
+  | 'Board Setup Suggested'
+  | 'Board Setup Change Undone';
 
+/**
+ * Backend events are operational telemetry sent under legitimate interest, not
+ * product analytics, so they must not identify anyone whatever that person's
+ * consent (docs/analytics/analytics-consent.md). That is enforced here rather than at each
+ * call site:
+ *
+ * - there is no way to pass a distinct id. Every event gets its own random one
+ *   (`backend:<event>:<uuid>`), so PostHog cannot join two events into a person;
+ * - an aggregate system event may instead name a fixed `system:` id, which is
+ *   not a person either;
+ * - every event carries `$process_person_profile: false`, so PostHog creates no
+ *   person profile for it;
+ * - property names that carry identity (`userId`, `email`, ...) are dropped.
+ *
+ * One written exception: `Community Monthly Rank.climberName`, the display
+ * name of a climber in a month's top ten (never the account name, which can
+ * be an email's local part or a legal name). It is set only for a public
+ * account that has not chosen to be anonymous on boards it doesn't own and
+ * has a display name: people a signed-out visitor already sees named on a
+ * board leaderboard.
+ * Everyone else keeps their rank with a null name. No id, avatar or profile
+ * link travels with it, and the recap re-sends every month in its window daily
+ * (the last 2 months) and every Monday (the last 13), so a climber who goes
+ * private, turns on anonymity or deletes their account loses their name from
+ * every month in that window within 7 days. The Monday run also re-sends the
+ * month that just left the window with every name removed, so a name lives
+ * here for at most 13 months plus a week. Nothing else may name a person here
+ * (docs/analytics/analytics-consent.md, "Named climbers in the community recap").
+ */
 interface CaptureBackendEventOptions {
-  distinctId: string;
   properties?: AnalyticsProperties;
-  processPersonProfile?: boolean;
+  /** A fixed id for an aggregate system event, e.g. `system:active-users`. Never a user id. */
+  systemDistinctId?: `system:${string}`;
+  /** Overrides the event time, e.g. to date a daily snapshot to the day it counts. */
+  timestamp?: Date;
+  /**
+   * A deterministic event UUID, so a re-sent aggregate (a manual re-run of a
+   * daily job) collapses into the first copy in PostHog instead of doubling it.
+   */
+  uuid?: string;
 }
+
+/**
+ * Property names that would tie a backend event to a person. Compared
+ * lower-cased. Dropped at capture so a call site that copies a payload
+ * wholesale can't reintroduce one.
+ */
+const PERSONAL_PROPERTY_NAMES = new Set([
+  'userid',
+  'user_id',
+  'email',
+  'distinct_id',
+  '$ip',
+  '$user_id',
+  'sessionid',
+  'session_id',
+  'boundsessionid',
+  'bound_session_id',
+]);
 
 const DEFAULT_POSTHOG_HOST = 'https://us.i.posthog.com';
 const POSTHOG_FLUSH_AT = 20;
@@ -34,6 +158,7 @@ let initAttempted = false;
 let missingProjectKeyLogged = false;
 let nonProductionEnvironmentLogged = false;
 const loggedQueuedEvents = new Set<BackendAnalyticsEvent>();
+const loggedDroppedProperties = new Set<string>();
 
 function readOptionalEnv(envName: string): string | null {
   const rawValue = process.env[envName];
@@ -56,17 +181,34 @@ function getProjectKeyConfig(): {
   return null;
 }
 
-function sanitizeProperties(properties: AnalyticsProperties | undefined): SanitizedAnalyticsProperties {
+function sanitizeProperties(
+  eventName: BackendAnalyticsEvent,
+  properties: AnalyticsProperties | undefined,
+): SanitizedAnalyticsProperties {
   const sanitized: SanitizedAnalyticsProperties = {};
   if (!properties) return sanitized;
 
   for (const [propertyName, propertyValue] of Object.entries(properties)) {
+    if (PERSONAL_PROPERTY_NAMES.has(propertyName.toLowerCase())) {
+      const droppedKey = `${eventName}:${propertyName}`;
+      if (!loggedDroppedProperties.has(droppedKey)) {
+        loggedDroppedProperties.add(droppedKey);
+        logger.warn(`[PostHog] Dropped personal property '${propertyName}' from backend event: ${eventName}`);
+      }
+      continue;
+    }
     if (propertyValue !== undefined) {
       sanitized[propertyName] = propertyValue;
     }
   }
 
   return sanitized;
+}
+
+/** `backend:tick-climb-not-in-catalog:<uuid>`: one id per event, never reused. */
+function eventScopedDistinctId(eventName: BackendAnalyticsEvent): string {
+  const eventSlug = eventName.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  return `backend:${eventSlug}:${randomUUID()}`;
 }
 
 function getPosthogClient(): PostHog | null {
@@ -143,26 +285,44 @@ function getPosthogClient(): PostHog | null {
 // away. Sentry doesn't have that failure mode; now neither does this.
 // Preview/staging still opt out for free: branch-deploy.yml declares
 // SENTRY_ENVIRONMENT=preview (#3808), which wins over the runtime inference.
-function getAnalyticsEnvironment(): string {
+export function getAnalyticsEnvironment(): string {
   return readOptionalEnv('POSTHOG_ENVIRONMENT') ?? resolveSentryEnvironment();
 }
 
-export function captureBackendEvent(eventName: BackendAnalyticsEvent, options: CaptureBackendEventOptions): boolean {
+/**
+ * A keyed SHA-256 (HMAC) of a party-session id, so the operational events of
+ * one session can be joined in PostHog without sending the id itself. The key
+ * is `POSTHOG_SESSION_HASH_SALT`; unset, this returns undefined and the
+ * property is omitted. An unkeyed hash is not enough: a session id travels in
+ * join links, and anyone holding one could recompute the hash and find the
+ * session's events. Rotating the salt breaks joins across the rotation.
+ */
+export function hashSessionIdForAnalytics(sessionId: string | null | undefined): string | undefined {
+  if (!sessionId) return undefined;
+  const salt = readOptionalEnv('POSTHOG_SESSION_HASH_SALT');
+  if (!salt) return undefined;
+  return createHmac('sha256', salt).update(sessionId).digest('hex');
+}
+
+export function captureBackendEvent(
+  eventName: BackendAnalyticsEvent,
+  options: CaptureBackendEventOptions = {},
+): boolean {
   const posthog = getPosthogClient();
   if (!posthog) return false;
 
-  const properties = sanitizeProperties(options.properties);
+  const properties = sanitizeProperties(eventName, options.properties);
   properties.service = 'boardsesh-backend';
   properties.environment = getAnalyticsEnvironment();
-  if (options.processPersonProfile === false) {
-    properties.$process_person_profile = false;
-  }
+  properties.$process_person_profile = false;
 
   try {
     posthog.capture({
-      distinctId: options.distinctId,
+      distinctId: options.systemDistinctId ?? eventScopedDistinctId(eventName),
       event: eventName,
       properties,
+      ...(options.timestamp ? { timestamp: options.timestamp } : {}),
+      ...(options.uuid ? { uuid: options.uuid } : {}),
     });
     if (!loggedQueuedEvents.has(eventName)) {
       loggedQueuedEvents.add(eventName);
@@ -175,6 +335,22 @@ export function captureBackendEvent(eventName: BackendAnalyticsEvent, options: C
   }
 }
 
+/**
+ * Send whatever is queued now instead of on the next 10 s tick. For a batch
+ * job that queues many events at its end, so a worker stopped right after the
+ * job does not drop them. A failure is logged, never thrown: the events are
+ * telemetry, and the caller's work is already done.
+ */
+export async function flushBackendEvents(): Promise<void> {
+  const posthog = posthogClient;
+  if (!posthog) return;
+  try {
+    await posthog.flush();
+  } catch (error) {
+    logger.warn('[PostHog] Flush failed:', error);
+  }
+}
+
 export async function shutdownPosthog(): Promise<void> {
   const posthog = posthogClient;
   if (!posthog) return;
@@ -184,6 +360,7 @@ export async function shutdownPosthog(): Promise<void> {
   missingProjectKeyLogged = false;
   nonProductionEnvironmentLogged = false;
   loggedQueuedEvents.clear();
+  loggedDroppedProperties.clear();
 
   try {
     await posthog.shutdown();

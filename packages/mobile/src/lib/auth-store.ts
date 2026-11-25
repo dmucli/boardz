@@ -1,3 +1,4 @@
+import { invalidateCredentialSnapshots } from './privacy/privacy-cache';
 import {
   createOnceRunner,
   deferredReconcileKeys,
@@ -18,6 +19,22 @@ const EXPIRES_AT_KEY = 'boardsesh_token_expires_at';
 const AUTH_SECURE_KEYS = [JWT_KEY, REFRESH_TOKEN_KEY, EXPIRES_AT_KEY] as const;
 let credentialGeneration = 0;
 let credentialMutationQueue: Promise<void> = Promise.resolve();
+const credentialGenerationListeners = new Set<(generation: number) => void>();
+
+/** Notify private-file owners synchronously, before credential storage awaits. */
+export function subscribeAuthCredentialGenerationChanges(listener: (generation: number) => void): () => void {
+  credentialGenerationListeners.add(listener);
+  return () => {
+    credentialGenerationListeners.delete(listener);
+  };
+}
+
+function advanceCredentialGeneration(): number {
+  credentialGeneration += 1;
+  invalidateCredentialSnapshots();
+  for (const listener of credentialGenerationListeners) listener(credentialGeneration);
+  return credentialGeneration;
+}
 
 class AuthCredentialCleanupError extends Error {
   readonly failures: readonly unknown[];
@@ -83,13 +100,19 @@ export function retryDeferredCredentialReconcile(): Promise<void> {
 }
 
 async function getStoredCredential(key: string): Promise<string | null> {
+  const generation = credentialGeneration;
   // Best-effort. A keychain that refuses the migration refuses the read below
   // too, which is exactly today's behaviour — the migration must never change
   // the outcome of the read it precedes.
   await ensureAuthCredentialsMigrated().catch(() => undefined);
+  // A boundary notification can trigger a new request before SecureStore writes
+  // settle. Never read the preceding account's JWT under the new generation.
+  await credentialMutationQueue;
+  if (generation !== credentialGeneration) return null;
   // readSecureValue already maps SECURE_STORE_TOMBSTONE to null, in whichever
   // namespace it lands, so there is nothing left to translate here.
-  return readSecureValue(key);
+  const credential = await readSecureValue(key);
+  return generation === credentialGeneration ? credential : null;
 }
 
 /**
@@ -231,8 +254,7 @@ export function storeTokensForGeneration(
 export async function storeTokens(jwt: string, refreshToken: string, expiresAt: string): Promise<void> {
   // A completed sign-in is a new credential owner, even when it follows a
   // signed-out generation whose SecureStore cleanup is still settling.
-  credentialGeneration += 1;
-  const generation = captureAuthCredentialGeneration();
+  const generation = advanceCredentialGeneration();
   await storeTokensForGeneration(generation, jwt, refreshToken, expiresAt);
 }
 
@@ -240,8 +262,7 @@ export function clearTokensForGeneration(generation: number): Promise<boolean> {
   if (!isAuthCredentialGenerationCurrent(generation)) return Promise.resolve(false);
   // Invalidate in-flight token writes synchronously, before deletion waits for
   // the serialized SecureStore mutation boundary.
-  const clearedGeneration = generation + 1;
-  credentialGeneration = clearedGeneration;
+  const clearedGeneration = advanceCredentialGeneration();
   return serializeCredentialMutation(async (): Promise<boolean> => {
     const results = await Promise.allSettled([
       clearStoredCredential(JWT_KEY),
@@ -259,6 +280,18 @@ export function clearTokensForGeneration(generation: number): Promise<boolean> {
     }
     return isAuthCredentialGenerationCurrent(clearedGeneration);
   });
+}
+
+/**
+ * Retire a credential the server rejected, as `clearTokensForGeneration` retires
+ * one it deletes. Sign-out clears the cache next, and work started under this
+ * credential must not write into it afterwards. A token refresh never comes
+ * here: it stores under the current generation. Null when a newer sign-in or
+ * sign-out already owns the credential.
+ */
+export function retireRejectedCredential(generation: number): number | null {
+  if (!isAuthCredentialGenerationCurrent(generation)) return null;
+  return advanceCredentialGeneration();
 }
 
 export async function clearTokens(): Promise<void> {

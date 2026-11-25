@@ -1,9 +1,10 @@
-import * as Updates from 'expo-updates';
-import { StyleSheet, Text, View } from 'react-native';
+import { Text } from './Text';
+import { useTypographyStyles, type TypographyScale } from '../hooks/use-typography-styles';
+import { StyleSheet, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useSetting } from '../settings';
 import { isPreviewBuild } from '../lib/preview-build';
-import { readOtaBranch } from '../lib/ota-telemetry';
+import { otaBranchKind, readRunningOtaBranch } from '../lib/qa/qa-surf';
 import { useBottomChromeMetrics } from '../hooks/use-bottom-chrome-metrics';
 import { useNativeTabBar } from '../hooks/use-bottom-accessory';
 import { useTheme } from '../providers/theme-provider';
@@ -30,17 +31,20 @@ import { usePublishedWindowInsetBottom } from '../lib/window-inset-store';
  *
  * Off unless BOTH hold: the persisted "Bottom chrome diagnostics" toggle
  * (More → Diagnostics) is on, and the session is diagnostic-eligible — a dev
- * build, an EAS preview build, or a `pr-<N>` OTA channel override (the per-PR
- * preview a production install can switch onto).
+ * build, an EAS preview build, or a `pr-<N>` / staging OTA branch (the previews
+ * a production install can switch onto).
  */
 
 /**
  * Whether this session may surface bottom-chrome diagnostics at all. Also gates
  * the settings row that flips the persisted toggle, so production users outside
- * a pr- preview never see either.
+ * a preview never see either. The early-updates branch is named `pr-beta` but
+ * its members are ordinary climbers, so it is classified, not prefix-matched.
  */
 export function useBottomChromeDiagnosticsEligible(): boolean {
-  return __DEV__ || isPreviewBuild() || readOtaBranch(Updates.manifest)?.startsWith('pr-') === true;
+  if (__DEV__ || isPreviewBuild()) return true;
+  const runningBranchKind = otaBranchKind(readRunningOtaBranch());
+  return runningBranchKind === 'preview' || runningBranchKind === 'staging';
 }
 
 export function BottomChromeDebugOverlay() {
@@ -55,6 +59,7 @@ function formatOffset(value: number): string {
 }
 
 function BottomChromeDebugOverlayInner() {
+  const styles = useTypographyStyles(createStyles);
   // This component mounts at the root, so `insets` here IS the root sampling
   // point — the same value computeBottomChromeMetrics receives as insetsBottom.
   const insets = useSafeAreaInsets();
@@ -103,32 +108,33 @@ function BottomChromeDebugOverlayInner() {
   );
 }
 
-const styles = StyleSheet.create({
-  root: {
-    position: 'absolute',
-    right: 8,
-    zIndex: 99999,
-    elevation: 99999,
-    alignItems: 'flex-end',
-  },
-  panel: {
-    backgroundColor: 'rgba(0, 0, 0, 0.82)',
-    borderColor: '#34d399',
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-  },
-  title: {
-    color: '#34d399',
-    fontSize: 10,
-    fontWeight: '700',
-    letterSpacing: 1,
-    marginBottom: 2,
-  },
-  metrics: {
-    color: '#ffffff',
-    fontSize: 11,
-    fontVariant: ['tabular-nums'],
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    root: {
+      position: 'absolute',
+      right: 8,
+      zIndex: 99999,
+      elevation: 99999,
+      alignItems: 'flex-end',
+    },
+    panel: {
+      backgroundColor: 'rgba(0, 0, 0, 0.82)',
+      borderColor: '#34d399',
+      borderWidth: 1,
+      borderRadius: 8,
+      paddingHorizontal: 10,
+      paddingVertical: 6,
+    },
+    title: {
+      color: '#34d399',
+      fontSize: textStyles.caption2.fontSize,
+      fontWeight: '700',
+      letterSpacing: 1,
+      marginBottom: 2,
+    },
+    metrics: {
+      color: '#ffffff',
+      fontSize: textStyles.caption2.fontSize,
+      fontVariant: ['tabular-nums'],
+    },
+  });

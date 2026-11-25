@@ -1,6 +1,12 @@
 import { GraphQLError } from 'graphql';
+import { normaliseOrphanCurrent } from '@boardsesh/queue';
+import { resolveLockedSessionBoardId } from '../session-board-binding';
+import type { DbTransaction } from '../../db/after-commit';
+import { getPrivacySettings, legacyResourceAudience, requireResourceAccess } from '../privacy';
+import { resourcePrivacy } from '@boardsesh/db/schema';
+import { sessionParticipantId } from '../board-session-privacy';
 import type { ClimbQueueItem, SessionUser } from '@boardsesh/shared-schema';
-import { db } from '../../db/client';
+import { db, runWithDatabaseTransaction } from '../../db/client';
 import { sessions, boardSessionParticipants } from '../../db/schema';
 import type { DistributedStateManager } from '../distributed-state';
 import type {
@@ -13,6 +19,7 @@ import type {
   SessionDisconnectResult,
 } from './types';
 import { restoreSessionWithLock } from './session-restoration';
+import { loadAccountSessionIdentity } from './account-identity';
 import { logger } from '../../utils/logger';
 import { markErrorReported } from '../../utils/sentry-dedupe';
 
@@ -71,6 +78,9 @@ export async function joinSession(
   sequence: number;
   stateHash: string;
   stateHashOrdered: string;
+  historyCount: number;
+  currentChangedAt: string | null;
+  currentChangedBy?: string | null;
   isLeader: boolean;
   sessionName: string | null;
   participantId: string;
@@ -84,7 +94,6 @@ export async function joinSession(
     redisStore,
     distributedState,
     sessionGraceTimers,
-    pendingJoinPersists,
   } = deps;
   const {
     getQueueState: getQueueStateFn,
@@ -94,7 +103,16 @@ export async function joinSession(
     updateQueueStateImmediate,
     leaveSession: leaveSessionFn,
   } = callbacks;
-  const { username, avatarUrl, initialQueue, initialCurrentClimb, sessionName, participantId, isPublic } = options;
+  const {
+    username,
+    avatarUrl,
+    initialQueue,
+    initialCurrentClimb,
+    initialHistoryCount,
+    sessionName,
+    participantId,
+    isPublic,
+  } = options;
 
   const client = clients.get(connectionId);
   if (!client) {
@@ -108,6 +126,7 @@ export async function joinSession(
   // state is mutated or the current session is left, so a failed join here
   // never disturbs a session the client is already in.
   const existingSession = await getSessionById(sessionId);
+  if (existingSession) await requireResourceAccess('session', sessionId, client.userId);
   if (existingSession && (existingSession.status === 'ended' || existingSession.endedAt !== null)) {
     const endedError = new GraphQLError('This session has ended', {
       extensions: { code: 'SESSION_ENDED' },
@@ -117,6 +136,14 @@ export async function joinSession(
     markErrorReported(endedError);
     logger.info(`[RoomManager] Rejecting JOIN_SESSION for ended session ${sessionId}`);
     throw endedError;
+  }
+
+  // Establish the policy before exposing any presence. Concurrent UUID joins
+  // must re-read the winner's policy before they can join its roster.
+  let createdSession = false;
+  if (!existingSession) {
+    createdSession = await ensureSessionRecordExists(sessionId, boardPath, client.userId, sessionName, isPublic);
+    await requireResourceAccess('session', sessionId, client.userId);
   }
 
   // SECURITY: Never trust a client-supplied participantId. SessionUser.id is
@@ -130,7 +157,16 @@ export async function joinSession(
   // identity. The `participantId` parameter is accepted for API stability but
   // intentionally ignored.
   void participantId;
-  const resolvedParticipantId = client.userId || connectionId;
+  const resolvedParticipantId = client.userId ? sessionParticipantId(sessionId, client.userId) : connectionId;
+
+  // A signed-in join that doesn't name itself takes the account's profile
+  // identity. Every connection of one account shares this participant row, so
+  // the per-connection `User-xxxxxx` placeholder would otherwise overwrite the
+  // name and avatar the app's socket sent (#7018: the iOS Live Activity socket
+  // joins without them). An explicit name or avatar from the client still wins.
+  const accountIdentity = !username && client.userId ? await loadAccountSessionIdentity(client.userId) : null;
+  const joinUsername = username || accountIdentity?.username;
+  const joinAvatarUrl = avatarUrl || accountIdentity?.avatarUrl;
 
   // Leave current session if in one
   if (client.sessionId) {
@@ -140,11 +176,11 @@ export async function joinSession(
   // Update client info
   client.sessionId = sessionId;
   client.participantId = resolvedParticipantId;
-  if (username) {
-    client.username = username;
+  if (joinUsername) {
+    client.username = joinUsername;
   }
-  if (avatarUrl) {
-    client.avatarUrl = avatarUrl;
+  if (joinAvatarUrl) {
+    client.avatarUrl = joinAvatarUrl;
   }
 
   // Track if this is a new session
@@ -161,7 +197,8 @@ export async function joinSession(
   // Create or get session in memory - with lazy restore
   if (!sessionsMap.has(sessionId)) {
     if (redisStore) {
-      isNewSession = await restoreSessionWithLock(sessionId, sessionsMap, redisStore, getSessionById);
+      const restoredNewSession = await restoreSessionWithLock(sessionId, sessionsMap, redisStore, getSessionById);
+      isNewSession = createdSession || restoredNewSession;
       if (isNewSession) {
         logger.info(
           `[RoomManager] Creating new session ${sessionId} with ${initialQueue?.length || 0} initial queue items`,
@@ -207,24 +244,6 @@ export async function joinSession(
     sessionParticipants,
   );
 
-  // Ensure new sessions exist in Postgres before any queue state persists.
-  // Existing sessions stay Redis-only for join/leave activity.
-  if (isNewSession) {
-    const previous = pendingJoinPersists.get(sessionId) ?? Promise.resolve();
-    const chained = previous.then(() =>
-      ensureSessionRecordExists(sessionId, boardPath, client.userId, sessionName, isPublic),
-    );
-
-    pendingJoinPersists.set(sessionId, chained);
-    try {
-      await chained;
-    } finally {
-      if (pendingJoinPersists.get(sessionId) === chained) {
-        pendingJoinPersists.delete(sessionId);
-      }
-    }
-  }
-
   // Record the authenticated user as a permanent participant in this session.
   // Used by the push-token resolver to authorize Live Activity registrations.
   // Idempotent on (session_id, user_id) primary key.
@@ -236,10 +255,21 @@ export async function joinSession(
     }
   }
 
-  // Initialize queue state for new sessions with provided initial queue
-  if (isNewSession && initialQueue && initialQueue.length > 0) {
-    logger.info(`[RoomManager] Initializing queue for new session ${sessionId} with ${initialQueue.length} items`);
-    await updateQueueStateImmediate(sessionId, initialQueue, initialCurrentClimb || null, 0);
+  // Initialize queue state for new sessions with a provided seed: a seed queue
+  // or a seed current climb (F3). A current-only seed used to be dropped; the
+  // resolver now hands it over as `[current]`, so the queue is never empty here
+  // when a current climb was sent, but the guard says what it means.
+  const hasSeed = (initialQueue !== undefined && initialQueue.length > 0) || !!initialCurrentClimb;
+  if (isNewSession && hasSeed) {
+    // Invariant 1: never store an orphan, even from a caller that skipped the
+    // resolver's normalisation.
+    const seed = normaliseOrphanCurrent({
+      queue: initialQueue ?? [],
+      currentClimbQueueItem: initialCurrentClimb || null,
+      historyCount: initialHistoryCount ?? 0,
+    });
+    logger.info(`[RoomManager] Initializing queue for new session ${sessionId} with ${seed.queue.length} items`);
+    await updateQueueStateImmediate(sessionId, seed.queue, seed.currentClimbQueueItem, 0, seed.historyCount);
   }
 
   // Update Redis session state
@@ -268,6 +298,9 @@ export async function joinSession(
     sequence: queueState.sequence,
     stateHash: queueState.stateHash,
     stateHashOrdered: queueState.stateHashOrdered,
+    historyCount: queueState.historyCount,
+    currentChangedAt: queueState.currentChangedAt,
+    currentChangedBy: queueState.currentChangedBy ?? null,
     isLeader,
     sessionName: resolvedSessionName,
     participantId: resolvedParticipantId,
@@ -1066,23 +1099,40 @@ export async function ensureSessionRecordExists(
   boardPath: string,
   userId: string | null,
   sessionName?: string,
-  isPublic: boolean = true,
-): Promise<void> {
+  isPublic?: boolean,
+): Promise<boolean> {
   const now = new Date();
-  await db
-    .insert(sessions)
-    .values({
-      id: sessionId,
-      boardPath,
-      createdAt: now,
-      lastActivity: now,
-      latitude: null,
-      longitude: null,
-      discoverable: false,
-      createdByUserId: userId,
-      name: sessionName || null,
-      startedAt: now,
-      isPublic,
-    })
-    .onConflictDoNothing();
+  const defaultAudience = userId ? (await getPrivacySettings(userId)).defaultSessionAudience : 'public';
+  // A legacy private session is unlisted: off the listings, the link still joins.
+  const audience =
+    isPublic === false ? legacyResourceAudience(defaultAudience, 'unlisted', 'session') : defaultAudience;
+  return runWithDatabaseTransaction(async (executor) => {
+    const tx = executor as unknown as DbTransaction;
+    const boardId = await resolveLockedSessionBoardId(tx, boardPath, userId);
+    const inserted = await tx
+      .insert(sessions)
+      .values({
+        id: sessionId,
+        boardPath,
+        boardId,
+        createdAt: now,
+        lastActivity: now,
+        latitude: null,
+        longitude: null,
+        discoverable: false,
+        createdByUserId: userId,
+        name: sessionName || null,
+        startedAt: now,
+        isPublic: audience === 'public',
+      })
+      .onConflictDoNothing()
+      .returning({ id: sessions.id });
+    if (inserted.length && userId && defaultAudience !== 'public') {
+      await tx
+        .insert(resourcePrivacy)
+        .values({ kind: 'session', resourceId: sessionId, ownerId: userId, audience })
+        .onConflictDoNothing();
+    }
+    return inserted.length > 0;
+  });
 }

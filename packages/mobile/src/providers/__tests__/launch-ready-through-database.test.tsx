@@ -1,16 +1,38 @@
 // @vitest-environment jsdom
+vi.mock('../../lib/schedule-idle-task', () => ({
+  scheduleIdleTask: (task: () => void) => {
+    task();
+    return { cancel: () => {} };
+  },
+}));
+
+vi.mock('../../components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
+// Existing flow fixtures begin after the privacy choice has settled.
+vi.mock('../../lib/consent-hooks', () => ({ useConsentSettled: () => true }));
 //
 // #5654: the four launch gates sat frozen at "not ready" from 2.2.0 on, because
-// they are mounted inside <DatabaseProvider> and expo-sqlite's SQLiteProvider is
-// memo()'d with a comparator that ignores `children`. `RootLayout` re-rendered
+// they are mounted inside <DatabaseProvider> and expo-sqlite's SQLiteProvider was
+// memo()'d with a comparator that ignored `children`. `RootLayout` re-rendered
 // when auth and fonts resolved, and the re-render stopped at that memo: every
 // `ready={authReady && fontsReady}` below it kept its first-render `false`.
 //
 // No test caught it because every gate suite rendered its gate directly. This
 // one renders the REAL DatabaseProvider around the REAL gates, over a stand-in
-// for SQLiteProvider that keeps expo-sqlite's memo comparator verbatim (checked
-// against the installed package below), and flips readiness the way RootLayout
-// does: from state owned ABOVE the provider.
+// for SQLiteProvider using both its current comparator (which now compares
+// `children`, checked against the installed package below) and the historical
+// comparator. Both must deliver readiness from state owned ABOVE the provider.
 
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -19,7 +41,7 @@ import { useState, type ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, render, waitFor } from '@testing-library/react';
 
-const sqliteCtrl = vi.hoisted(() => ({ opened: 0 }));
+const sqliteCtrl = vi.hoisted(() => ({ opened: 0, comparator: 'current' as 'current' | 'legacy' }));
 const connectivityBannerHookMock = vi.hoisted(() => vi.fn());
 const trackGateMock = vi.hoisted(() => vi.fn());
 const decideQaGateMock = vi.hoisted(() => vi.fn());
@@ -33,17 +55,16 @@ const flagsCtrl = vi.hoisted(() => ({
     flagsCtrl.resolved = resolved;
     for (const listener of flagsCtrl.listeners) listener();
   },
-  subscribe(listener: () => void) {
+  subscribe(this: void, listener: () => void) {
     flagsCtrl.listeners.add(listener);
     return () => flagsCtrl.listeners.delete(listener);
   },
 }));
 
 // A faithful SQLiteProvider: `SQLiteProviderNonSuspense`'s open → onInit →
-// render-children shape, wrapped in the same memo comparator expo-sqlite ships
-// (build/hooks.js). The comparator is the whole point, so it is copied, not
-// simplified; `expo-sqlite still freezes children` below fails if upstream
-// changes it.
+// render-children shape, wrapped in its current or historical memo comparator.
+// The installed comparator check below keeps the current mode aligned with
+// expo-sqlite; legacy mode preserves the original freeze regression coverage.
 vi.mock('expo-sqlite', async () => {
   const {
     createContext,
@@ -112,7 +133,8 @@ vi.mock('expo-sqlite', async () => {
       prevProps.directory === nextProps.directory &&
       prevProps.onInit === nextProps.onInit &&
       prevProps.onError === nextProps.onError &&
-      prevProps.useSuspense === nextProps.useSuspense,
+      prevProps.useSuspense === nextProps.useSuspense &&
+      (sqliteCtrl.comparator === 'legacy' || prevProps.children === nextProps.children),
   );
 
   return { SQLiteProvider, useSQLiteContext: () => useContext(SQLiteContext) };
@@ -135,16 +157,15 @@ vi.mock('../../db/use-offline-schema-ready', () => ({ useOfflineSchemaReady: () 
 // gate get as far as its own decision, which is what the assertions look for.
 vi.mock('react-native', () => ({
   AppState: { currentState: 'active', addEventListener: () => ({ remove: () => {} }) },
-  InteractionManager: {
-    runAfterInteractions: (task: () => void) => {
-      task();
-      return { cancel: () => {} };
-    },
-  },
   AccessibilityInfo: { announceForAccessibility: () => {} },
   Pressable: () => null,
   View: () => null,
-  StyleSheet: { create: <T,>(styles: T) => styles, absoluteFill: {}, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: <T,>(styles: T) => styles,
+    absoluteFill: {},
+    hairlineWidth: 1,
+  },
 }));
 vi.mock('react-native-reanimated', () => ({
   default: { View: () => null },
@@ -165,6 +186,10 @@ vi.mock('../../components/Icon', () => ({ Icon: () => null }));
 vi.mock('../../components/Button', () => ({ Button: () => null }));
 vi.mock('../../components/ActivityIndicator', () => ({ ActivityIndicator: () => null }));
 vi.mock('../../components/board-look/BoardLookStepGate', () => ({ BoardLookStepGate: () => null }));
+// The first-board gate's children have their own presentation tests.
+vi.mock('../../components/onboarding/ChineseTranslationOnboarding', () => ({
+  ChineseTranslationOnboarding: () => null,
+}));
 vi.mock('../../components/connectivity/use-connectivity-banner', () => ({
   useConnectivityBanner: connectivityBannerHookMock,
 }));
@@ -195,6 +220,7 @@ vi.mock('../../hooks/use-reduce-motion', () => ({ useReduceMotion: () => false }
 vi.mock('../../lib/connectivity-banner-inset-store', () => ({ publishConnectivityBannerHeight: vi.fn() }));
 vi.mock('../../theme/colors', () => ({ withAlpha: (color: string) => color }));
 vi.mock('../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: new Proxy({}, { get: () => 0 }),
   borderRadius: new Proxy({}, { get: () => 0 }),
 }));
@@ -219,11 +245,15 @@ vi.mock('../../settings', () => ({
   useSetting: () => [true, vi.fn()],
 }));
 vi.mock('../../lib/qa/qa-surf', () => ({
-  listPrBranches: vi.fn(async () => []),
+  fetchQaBranches: vi.fn(async () => ({
+    kind: 'listed',
+    list: { previews: [], staging: null, earlyUpdates: null },
+  })),
   readRunningOtaBranch: () => null,
   readRunningPrNumber: () => null,
   STAGING_OTA_BRANCH: 'pr-staging',
 }));
+vi.mock('../../lib/qa/early-updates', () => ({ noteBranchSurfingOff: vi.fn() }));
 vi.mock('../../lib/qa/qa-gate-decision', () => ({ decideQaGate: decideQaGateMock }));
 vi.mock('../../lib/offline-recovery/send-recovery-decision', () => ({ decideSendRecovery: decideSendRecoveryMock }));
 
@@ -251,6 +281,7 @@ async function flipReady(): Promise<void> {
 
 beforeEach(() => {
   sqliteCtrl.opened = 0;
+  sqliteCtrl.comparator = 'current';
   resetOnboardingGateProcessForTests();
   resetQaGateSessionForTests();
   resetSendRecoverySessionForTests();
@@ -274,13 +305,14 @@ afterEach(() => {
   cleanup();
 });
 
-describe('expo-sqlite still freezes children', () => {
-  it('ships the memo comparator this suite stands in for, and it never looks at children', () => {
-    // If upstream starts comparing `children`, the freeze is gone and this whole
-    // suite (and the warning in database-provider.tsx) needs a second look.
+describe('expo-sqlite children updates', () => {
+  it('ships the current memo comparator, including children', () => {
     const packageJsonPath = createRequire(import.meta.url).resolve('expo-sqlite/package.json');
     const hooksSource = readFileSync(join(dirname(packageJsonPath), 'build', 'hooks.js'), 'utf8');
-    const normalized = hooksSource.replace(/\s+/g, ' ');
+    const normalized = hooksSource
+      .replace(/\/\*#__PURE__\*\//g, '')
+      .replace(/\s*=>\s*/g, ' => ')
+      .replace(/\s+/g, ' ');
 
     expect(normalized).toContain('export const SQLiteProvider = memo(function SQLiteProvider(');
     const comparator =
@@ -290,102 +322,116 @@ describe('expo-sqlite still freezes children', () => {
       'prevProps.directory === nextProps.directory && ' +
       'prevProps.onInit === nextProps.onInit && ' +
       'prevProps.onError === nextProps.onError && ' +
-      'prevProps.useSuspense === nextProps.useSuspense);';
+      'prevProps.useSuspense === nextProps.useSuspense && ' +
+      'prevProps.children === nextProps.children);';
     expect(normalized).toContain(comparator);
   });
 
-  // The old wiring, in miniature: a prop computed from the parent's state and
-  // handed to something inside DatabaseProvider. This is the shape that must
-  // never come back, and it is why the gates read a context instead.
-  it('keeps a prop created above the provider at its first-render value', async () => {
-    const seenByProbe: boolean[] = [];
-    function PropProbe({ ready }: { ready: boolean }) {
-      seenByProbe.push(ready);
-      return null;
+  // A parent-owned prop demonstrates the old freeze and the upstream fix.
+  it.each(['legacy', 'current'] as const)(
+    'updates parent-owned props only with the current comparator (%s)',
+    async (comparator) => {
+      sqliteCtrl.comparator = comparator;
+      const seenByProbe: boolean[] = [];
+      function PropProbe({ ready }: { ready: boolean }) {
+        seenByProbe.push(ready);
+        return null;
+      }
+
+      render(
+        <RootLayoutStandIn>
+          {(ready) => (
+            <DatabaseProvider>
+              <PropProbe ready={ready} />
+            </DatabaseProvider>
+          )}
+        </RootLayoutStandIn>,
+      );
+      await waitFor(() => expect(seenByProbe).toContain(false));
+
+      await flipReady();
+
+      expect(sqliteCtrl.opened).toBe(1);
+      expect(seenByProbe.at(-1)).toBe(comparator === 'current');
+      if (comparator === 'legacy') expect(seenByProbe).not.toContain(true);
+    },
+  );
+});
+
+describe.each(['legacy', 'current'] as const)(
+  'the launch gates inside DatabaseProvider (%s comparator)',
+  (comparator) => {
+    beforeEach(() => {
+      sqliteCtrl.comparator = comparator;
+    });
+    function renderRootTree() {
+      return render(
+        <RootLayoutStandIn>
+          {(ready) => (
+            <LaunchReadyProvider ready={ready}>
+              <DatabaseProvider>
+                <ConnectivityBanner />
+                <OnboardingGate />
+                <QaTesterGate />
+                <SendRecoveryGate />
+              </DatabaseProvider>
+            </LaunchReadyProvider>
+          )}
+        </RootLayoutStandIn>,
+      );
     }
 
-    render(
-      <RootLayoutStandIn>
-        {(ready) => (
-          <DatabaseProvider>
-            <PropProbe ready={ready} />
-          </DatabaseProvider>
-        )}
-      </RootLayoutStandIn>,
-    );
-    await waitFor(() => expect(seenByProbe).toContain(false));
+    it('hold still until the root says the app is ready', async () => {
+      renderRootTree();
+      // The database has opened and the gates have mounted...
+      await waitFor(() => expect(decideQaGateMock).toHaveBeenCalled());
+      await waitFor(() => expect(decideSendRecoveryMock).toHaveBeenCalled());
 
-    await flipReady();
-
-    expect(sqliteCtrl.opened).toBe(1);
-    expect(seenByProbe.at(-1)).toBe(false);
-    expect(seenByProbe).not.toContain(true);
-  });
-});
-
-describe('the launch gates, mounted inside DatabaseProvider as in app/_layout.tsx', () => {
-  function renderRootTree() {
-    return render(
-      <RootLayoutStandIn>
-        {(ready) => (
-          <LaunchReadyProvider ready={ready}>
-            <DatabaseProvider>
-              <ConnectivityBanner />
-              <OnboardingGate />
-              <QaTesterGate />
-              <SendRecoveryGate />
-            </DatabaseProvider>
-          </LaunchReadyProvider>
-        )}
-      </RootLayoutStandIn>,
-    );
-  }
-
-  it('hold still until the root says the app is ready', async () => {
-    renderRootTree();
-    // The database has opened and the gates have mounted...
-    await waitFor(() => expect(decideQaGateMock).toHaveBeenCalled());
-    await waitFor(() => expect(decideSendRecoveryMock).toHaveBeenCalled());
-
-    // ...and every one of them is still waiting.
-    expect(connectivityBannerHookMock).not.toHaveBeenCalled();
-    expect(trackGateMock).not.toHaveBeenCalled();
-    expect(decideQaGateMock.mock.calls.every(([input]) => input.ready === false)).toBe(true);
-    expect(decideSendRecoveryMock.mock.calls.every(([input]) => input.ready === false)).toBe(true);
-  });
-
-  it('all wake up when readiness flips above the provider', async () => {
-    renderRootTree();
-    await waitFor(() => expect(decideQaGateMock).toHaveBeenCalled());
-
-    await flipReady();
-
-    // ConnectivityBanner mounted its content.
-    await waitFor(() => expect(connectivityBannerHookMock).toHaveBeenCalled());
-    // OnboardingGate reached a decision (no board bound, so would_present).
-    await waitFor(() =>
-      expect(trackGateMock).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'would_present' })),
-    );
-    // QaTesterGate and SendRecoveryGate decided with the app ready.
-    await waitFor(() => expect(decideQaGateMock).toHaveBeenCalledWith(expect.objectContaining({ ready: true })));
-    await waitFor(() => expect(decideSendRecoveryMock).toHaveBeenCalledWith(expect.objectContaining({ ready: true })));
-    // Without reopening the database: nothing under the provider remounted.
-    expect(sqliteCtrl.opened).toBe(1);
-  });
-
-  // `connectivity-banner-kill` has to land before the banner's first paint, or a
-  // killed fleet still sees it for up to 2 s of every launch.
-  it('keeps the banner down until the feature flags have resolved', async () => {
-    flagsCtrl.resolved = false;
-    renderRootTree();
-    await waitFor(() => expect(decideQaGateMock).toHaveBeenCalled());
-    await flipReady();
-    // The app is ready, but PostHog has not answered yet.
-    expect(connectivityBannerHookMock).not.toHaveBeenCalled();
-
-    await act(async () => {
-      flagsCtrl.setResolved(true);
+      // ...and every one of them is still waiting.
+      expect(connectivityBannerHookMock).not.toHaveBeenCalled();
+      expect(trackGateMock).not.toHaveBeenCalled();
+      expect(decideQaGateMock.mock.calls.every(([input]) => input.ready === false)).toBe(true);
+      expect(decideSendRecoveryMock.mock.calls.every(([input]) => input.ready === false)).toBe(true);
     });
-    await waitFor(() => expect(connectivityBannerHookMock).toHaveBeenCalled());
-  });
-});
+
+    it('all wake up when readiness flips above the provider', async () => {
+      renderRootTree();
+      await waitFor(() => expect(decideQaGateMock).toHaveBeenCalled());
+
+      await flipReady();
+
+      // ConnectivityBanner mounted its content.
+      await waitFor(() => expect(connectivityBannerHookMock).toHaveBeenCalled());
+      // OnboardingGate reached a decision (no board bound, so would_present).
+      await waitFor(() =>
+        expect(trackGateMock).toHaveBeenCalledWith(expect.objectContaining({ outcome: 'would_present' })),
+      );
+      // QaTesterGate and SendRecoveryGate decided with the app ready.
+      await waitFor(() => expect(decideQaGateMock).toHaveBeenCalledWith(expect.objectContaining({ ready: true })));
+      await waitFor(() =>
+        expect(decideSendRecoveryMock).toHaveBeenCalledWith(expect.objectContaining({ ready: true })),
+      );
+      // Without reopening the database: nothing under the provider remounted.
+      expect(sqliteCtrl.opened).toBe(1);
+    });
+
+    // `connectivity-banner-kill` has to land before the banner's first paint, or a
+    // killed fleet still sees it for up to 2 s of every launch.
+    it('keeps the banner down until the feature flags have resolved', async () => {
+      flagsCtrl.resolved = false;
+      renderRootTree();
+      await waitFor(() => expect(decideQaGateMock).toHaveBeenCalled());
+      await flipReady();
+      // The app is ready, but PostHog has not answered yet.
+      expect(connectivityBannerHookMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        flagsCtrl.setResolved(true);
+      });
+      await waitFor(() => expect(connectivityBannerHookMock).toHaveBeenCalled());
+    });
+  },
+);
+
+import { grantAnalyticsForTest } from '../../../test/consent-fixture';
+beforeEach(() => grantAnalyticsForTest());

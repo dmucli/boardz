@@ -42,6 +42,8 @@ const consumeFreshOAuthPendingMock = vi.hoisted(() => vi.fn());
 const consumeWebOAuthReturnProviderMock = vi.hoisted(() => vi.fn());
 const trackMock = vi.hoisted(() => vi.fn());
 
+vi.mock('../../lib/user-data-export-download', () => import('../../lib/user-data-export-download.web'));
+
 // expo-router and react-native both reach for the native runtime; stub the
 // thin surface AuthProvider consumes. `useSegments` returning `[]` keeps the
 // provider out of its `<Redirect>` branches so the child tree renders and the
@@ -74,11 +76,6 @@ vi.mock('react-native', () => ({
 // renders the splash rather than a blank tree.
 vi.mock('../../components/AppLoadingSplash', () => ({
   AppLoadingSplash: () => 'app-loading-splash',
-}));
-
-vi.mock('../../lib/screenshot-mode', () => ({
-  SCREENSHOT_USER_EMAIL: 'screenshots@example.com',
-  SCREENSHOT_USER_PASSWORD: 'screenshot-password',
 }));
 
 // AuthProvider clears the shared banner dismissal at an account boundary.
@@ -165,6 +162,8 @@ beforeEach(() => {
   clearAllCreateClimbDraftsMock.mockResolvedValue(undefined);
   clearSessionCommentDraftMock.mockReset();
   clearSessionCommentDraftMock.mockResolvedValue(undefined);
+  clearWorkoutRunMock.mockReset();
+  clearWorkoutRunMock.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -195,6 +194,7 @@ vi.mock('../../lib/error-reporting', () => ({
 
 const resetAnalyticsMock = vi.hoisted(() => vi.fn());
 vi.mock('../../lib/analytics', () => ({
+  isAnalyticsPinnedToAPerson: () => false,
   reset: resetAnalyticsMock,
   track: (...args: unknown[]) => trackMock(...args),
 }));
@@ -257,6 +257,11 @@ vi.mock('../../lib/create-climb-draft-store', () => ({
 const clearSessionCommentDraftMock = vi.fn();
 vi.mock('../../lib/session-comment-draft-store', () => ({
   clearSessionCommentDraft: (...args: unknown[]) => clearSessionCommentDraftMock(...args),
+}));
+
+const clearWorkoutRunMock = vi.fn();
+vi.mock('../../lib/workout-run-store', () => ({
+  clearWorkoutRun: (...args: unknown[]) => clearWorkoutRunMock(...args),
 }));
 
 vi.mock('../../lib/user-storage-owner', () => ({
@@ -338,6 +343,8 @@ vi.mock('../../offline/offline-usage-signal', () => ({
 }));
 
 const stopTokenManagementMock = vi.fn(async () => {});
+vi.mock('../../notifications/device-registration', () => ({ deactivateNotificationDevice: vi.fn(async () => {}) }));
+
 vi.mock('../../notifications', () => ({
   stopTokenManagement: (_unregister: unknown) => stopTokenManagementMock(),
 }));
@@ -350,6 +357,8 @@ const clearOfflineBoardsMock = vi.hoisted(() => vi.fn());
 vi.mock('../../settings', () => ({
   setSetting: (...args: unknown[]) => setSettingMock(...args),
   clearOfflineBoards: () => clearOfflineBoardsMock(),
+  clearSprayWallArchives: () => undefined,
+  clearOwnedSprayWallPins: () => undefined,
 }));
 
 // The provider registers its forced-sign-out cleanup against this lib-layer hook
@@ -383,6 +392,9 @@ vi.mock('../../lib/routing/anonymous-auth-gate', async () => {
 
 import { AuthProvider } from '../auth-provider';
 import { GATED_PATHS, READ_ONLY_PATHS } from '../../lib/routing/__tests__/read-only-route-corpus';
+// The real store behind the start-up choice (only the settings barrel is
+// stubbed above), so `getAppEntryHref()` reads what the test wrote.
+import { setSetting } from '../../settings/hooks';
 
 function renderGate() {
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -468,5 +480,35 @@ describe('AuthProvider anonymous read-only gate (web)', () => {
 
     await waitFor(() => expect(redirectMock).toHaveBeenCalledWith('/(tabs)/climbs'));
     expect(redirectMock).not.toHaveBeenCalledWith(expect.stringContaining('evil.example'));
+  });
+
+  // #6289: the start-up choice only fills in when sign-in has nowhere of its
+  // own to go. The climb a visitor signed in to see still wins.
+  describe('with Home chosen as the start-up tab', () => {
+    beforeEach(() => setSetting('startupScreen', 'home'));
+    afterEach(() => setSetting('startupScreen', 'climbs'));
+
+    it('still lands a freshly signed-in visitor on the climb their next= names', async () => {
+      const next = '/b/the-gym/40/view/crimpy-thing-0A1B2C3D4E5F60718293A4B5C6D7E8F9';
+      getAuthTokenMock.mockResolvedValue('jwt-token');
+      routerState.segments = ['auth', 'login'];
+      window.history.replaceState({}, '', `/auth/login?next=${encodeURIComponent(next)}`);
+
+      renderGate();
+
+      await waitFor(() => expect(redirectMock).toHaveBeenCalledWith(next));
+      expect(redirectMock).not.toHaveBeenCalledWith('/(tabs)/home');
+    });
+
+    it('lands an untargeted sign-in on Home', async () => {
+      getAuthTokenMock.mockResolvedValue('jwt-token');
+      routerState.segments = ['auth', 'login'];
+      window.history.replaceState({}, '', '/auth/login');
+
+      renderGate();
+
+      await waitFor(() => expect(redirectMock).toHaveBeenCalledWith('/(tabs)/home'));
+      expect(redirectMock).not.toHaveBeenCalledWith('/(tabs)/climbs');
+    });
   });
 });

@@ -5,6 +5,7 @@ import type { PopularBoardConfig } from '@boardsesh/shared-schema';
 import { buildGymEntries } from '../gym-entries';
 
 vi.mock('server-only', () => ({}));
+vi.mock('../privacy-filter', () => ({ filterPublicSitemapItems: async (items: unknown) => items }));
 
 const KILTER_CONFIG: PopularBoardConfig = {
   boardType: 'kilter',
@@ -51,7 +52,6 @@ vi.mock('../setter-query', () => ({
   fetchSetterSitemapSummary: async () => ({ itemCount: 0, lastModified: null }),
   buildSetterSitemapItems: async () => [],
 }));
-
 const { PAGED_SHARD_REGISTRY, SHARD_REGISTRY } = await import('../shard-registry');
 
 const APP_ROOT = join(import.meta.dirname, '..', '..', '..', '..');
@@ -101,11 +101,36 @@ describe('SHARD_REGISTRY', () => {
     expect(Object.fromEntries(SHARD_REGISTRY.map((shard) => [shard.id, shard.expectsUrls]))).toEqual({
       static: true,
       boards: true,
+      'app-guides': true,
       // Zero public playlists holding a climb is a legitimate state, and zero
       // gyms/setters is the declared-empty design — none of these may 503.
       playlists: false,
       gyms: false,
+      // `build-plans` stays empty while its pages remain noindex. Failing
+      // closed would 503 a shard for being in its intended pre-launch state.
+      'build-plans': false,
     });
+  });
+
+  it('publishes nothing from the build-plans shard before legal review', async () => {
+    // The route exists, but its noindex pages must never enter the sitemap.
+    const buildPlans = SHARD_REGISTRY.find((shard) => shard.id === 'build-plans');
+    expect(buildPlans).toBeDefined();
+    await expect(buildPlans!.build()).resolves.toEqual([]);
+  });
+
+  it('opts only deliberately withheld build plans out of empty-result warnings', () => {
+    expect(SHARD_REGISTRY.filter((shard) => shard.warnWhenEmpty === false).map((shard) => shard.id)).toEqual([
+      'build-plans',
+    ]);
+  });
+
+  it('fans the build-plans pages out to every locale', () => {
+    // The counter-assertion to the board-content carve-out. `/build-plans` is
+    // genuinely translated copy, not translated chrome over shared data, so it
+    // takes the default `all-locales` expansion and keeps its hreflang cluster.
+    const buildPlans = SHARD_REGISTRY.find((shard) => shard.id === 'build-plans');
+    expect(buildPlans?.expansion).toBeUndefined();
   });
 
   it('marks the paged shards as expecting URLs on the shard route', () => {
@@ -161,10 +186,10 @@ describe('SHARD_REGISTRY', () => {
 });
 
 describe('declared-empty shards', () => {
-  it('ships gyms empty, on purpose', () => {
+  it('ships gyms empty until cleanup is verified', async () => {
     // Guards the #4381 hand-off: the route answers 200 with a valid empty
     // <urlset> and only needs its builder filled. `setters` was the other half
     // of that hand-off and is now a paged, data-backed shard.
-    expect(buildGymEntries()).toEqual([]);
+    expect(await buildGymEntries()).toEqual([]);
   });
 });

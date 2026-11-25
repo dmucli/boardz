@@ -12,8 +12,7 @@ import type { BoardLookSuggestionId } from './board-look-suggestions';
  * have. Same store as the thing it talks about, same lifecycle, no skew.
  *
  * Error posture is copied from `hasSeenBoardLookStep` exactly: a read error
- * reports DISMISSED, and screenshot mode reports DISMISSED. A flaky store or a
- * screenshot run can never produce a banner.
+ * reports DISMISSED, so a flaky store never produces a banner.
  */
 const STORAGE_KEY = 'boardLookSuggestionDismissals';
 
@@ -23,25 +22,27 @@ export type BoardLookSuggestionDismissals = Record<BoardLookSuggestionId, boolea
 export const NO_BOARD_LOOK_SUGGESTIONS_DISMISSED: BoardLookSuggestionDismissals = Object.freeze({
   increaseContrast: false,
   grayscale: false,
+  differentiateWithoutColor: false,
 });
 
 /** Everything turned down — the shape a read error or a screenshot run reports. */
 export const ALL_BOARD_LOOK_SUGGESTIONS_DISMISSED: BoardLookSuggestionDismissals = Object.freeze({
   increaseContrast: true,
   grayscale: true,
+  differentiateWithoutColor: true,
 });
 
 function sanitize(raw: Partial<Record<BoardLookSuggestionId, unknown>> | null): BoardLookSuggestionDismissals {
   return {
     increaseContrast: raw?.increaseContrast === true,
     grayscale: raw?.grayscale === true,
+    differentiateWithoutColor: raw?.differentiateWithoutColor === true,
   };
 }
 
 export async function loadBoardLookSuggestionDismissals(): Promise<BoardLookSuggestionDismissals> {
   // A captured screen must never carry a suggestion banner, mirroring
   // `hasSeenBoardLookStep`.
-  if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return ALL_BOARD_LOOK_SUGGESTIONS_DISMISSED;
   try {
     return sanitize(await getPreference<Partial<Record<BoardLookSuggestionId, unknown>>>(STORAGE_KEY));
   } catch {

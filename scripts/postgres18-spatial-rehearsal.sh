@@ -3,7 +3,7 @@
 # postgres18-spatial-rehearsal.sh — prove the PostGIS half of the PG16 -> PG18
 # cutover, without touching production.
 #
-# `docs/postgres-18-migration.md` blocks the catalog audit unless the source and
+# `docs/operations/postgres-18-migration.md` blocks the catalog audit unless the source and
 # target PostGIS versions are equal. Railway production reports `3.7.0dev`,
 # because the service tracks the mutable `postgis/postgis:16-master` tag; the
 # attested PG18 image ships stable 3.6.4, and PGDG publishes no stable 3.7 for
@@ -378,7 +378,7 @@ target_client bash -euo pipefail -c "
 # And COPY votes populates vote_counts through the trigger, so a later
 # COPY vote_counts collides on vote_counts_entity_type_entity_id_pk -- today
 # only because pg_dump emits TABLE DATA alphabetically and vote_counts sorts
-# before votes. See docs/postgres-18-postgis-rehearsal.md.
+# before votes. See docs/operations/postgres-18-postgis-rehearsal.md.
 data_status=0
 data_stderr="$(docker exec -i -u postgres "$TARGET_CONTAINER" bash -c "
   pg_restore --exit-on-error --data-only --disable-triggers --dbname $DATABASE_NAME /tmp/spatial.dump 2>&1 >/dev/null
@@ -425,6 +425,19 @@ report_fail() {
   failures=$((failures + 1))
 }
 
+# Equal wrong answers are not evidence: coordinate extraction must also match
+# the fixture's known latitude, including NULLs and signed/boundary points.
+check_expected_sql() {
+  local description="$1" query="$2" expected="$3" source_value target_value
+  source_value="$(source_psql -X -Atq -c "$query")" || fail "source query failed: $query"
+  target_value="$(target_psql -X -Atq -c "$query")" || fail "target query failed: $query"
+  if [[ "$source_value" == "$expected" && "$target_value" == "$expected" ]]; then
+    printf '  ok    %s\n' "$description"
+  else
+    report_fail "$description; expected $expected on both sides, source=$source_value target=$target_value"
+  fi
+}
+
 for spatial_table in gyms user_boards; do
   check_sql "$spatial_table row count" \
     "SELECT count(*) FROM $spatial_table;"
@@ -434,7 +447,7 @@ for spatial_table in gyms user_boards; do
     "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a WHERE a.attrelid = '$spatial_table'::regclass AND a.attname = 'location';"
 
   # ST_AsEWKB over every populated row, in a stable order. This is the
-  # comparison docs/postgres-18-migration.md asks for by name: it reads the
+  # comparison docs/operations/postgres-18-migration.md asks for by name: it reads the
   # on-the-wire binary of each geography, not a rendering of it. ST_AsEWKB is
   # defined over geometry, hence the cast -- passing a geography raises
   # "function st_asewkb(geography) does not exist", which is what made the first
@@ -448,6 +461,12 @@ for spatial_table in gyms user_boards; do
   # suite even though the EWKB matched.
   check_sql "$spatial_table ST_AsText digest over every populated row" \
     "SELECT md5(string_agg(ST_AsText(location::geometry), ',' ORDER BY id)) FROM $spatial_table WHERE location IS NOT NULL;"
+
+  # The location-sync proof reads latitude with this exact geography-to-geometry
+  # cast. Compare every extracted latitude to its input, rather than accepting
+  # an aggregate that could be identically wrong under both PostGIS versions.
+  check_expected_sql "$spatial_table ST_Y extracts every original latitude, preserving NULLs" \
+    "SELECT bool_and(ST_Y(location::geometry) IS NOT DISTINCT FROM latitude) FROM $spatial_table;" 't'
 
   # The repo's own order-independent row digest, from
   # scripts/postgres-table-digests.sql, which is what the cutover compares.
@@ -464,6 +483,14 @@ for spatial_table in gyms user_boards; do
     report_fail "$spatial_table has $always_triggers ENABLE ALWAYS/REPLICA trigger(s); --disable-triggers no longer models logical-replication apply"
   fi
 done
+
+check_expected_sql 'ST_Y preserves negative, zero, positive, polar and NULL latitudes' \
+  "WITH coordinates(latitude, longitude) AS (VALUES
+    (-90::double precision, -180::double precision), (-45.5, 120.25),
+    (0, 0), (52.3676, 4.9041), (90, 180), (NULL, NULL))
+  SELECT count(*) = 6 AND bool_and(
+    ST_Y((ST_MakePoint(longitude, latitude)::geography)::geometry) IS NOT DISTINCT FROM latitude
+  ) FROM coordinates;" 't'
 
 check_sql 'gyms_location_idx definition' \
   "SELECT indexdef FROM pg_indexes WHERE indexname = 'gyms_location_idx';"
@@ -526,6 +553,6 @@ fi
 printf '\nEvery spatial check matched across PostGIS %s -> %s.\n' "$source_postgis" "$target_postgis"
 printf 'This is evidence about the application spatial surface only: two geography(Point,4326)\n'
 printf 'columns, two partial GiST indexes, the lat/lng trigger, and ST_MakePoint/ST_Distance/\n'
-printf 'ST_DWithin. scripts/postgres18-spatial-surface.test.sh is what keeps that list honest.\n'
-printf 'It is NOT the docs/postgres-18-migration.md section 4 rehearsal: no whole-catalog\n'
+printf 'ST_DWithin/ST_Y. scripts/postgres18-spatial-surface.test.sh keeps that list honest.\n'
+printf 'It is NOT the docs/operations/postgres-18-migration.md section 4 rehearsal: no whole-catalog\n'
 printf 'fingerprint diff, no sequence fence, no failback drill, and no real production data.\n'

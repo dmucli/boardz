@@ -1,3 +1,4 @@
+import { assertCppStoryCapture, cppStorySourceSha256, type CppStoryCapture } from './lib/cpp-story-provenance';
 /// <reference types="node" />
 
 import {
@@ -13,6 +14,8 @@ import {
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import sharp from 'sharp';
+import { extractScreenshotIsland } from './lib/screenshot-island';
+import { loadFullScreenLiveActivityFixture, type NativeCaptureSize } from './lib/screenshot-live-activity';
 import { brandColors, brandColorsDark, materialSurfaces } from '../packages/shared/velvet-tokens/src/index';
 import {
   findGooglePlayImageOffenders,
@@ -30,13 +33,16 @@ import {
   resolveScreenshotRecipes,
   sha256Screenshot,
   sha256ScreenshotSources,
+  validateScreenshotBoardLabels,
   type CaptionLocale,
   type PresentationManifest,
   type ScreenshotCaption,
   type ScreenshotLayout,
 } from './lib/screenshot-presentation';
 
-type MaterialSurface = (typeof materialSurfaces)[keyof typeof materialSurfaces];
+import { readCppPage, resolveCppRecipes, isCppTarget, CPP_MANIFEST_PATH, type CppTarget } from './lib/screenshot-cpp';
+
+type MaterialSurface = Record<keyof (typeof materialSurfaces)['dark'], string>;
 
 /**
  * The iPad shell's trailing "Now on the wall" column is 300 points wide
@@ -50,6 +56,14 @@ const IPAD_WALL_COLUMN_PIXELS = 300 * 2;
 const LOG = '[screenshot:frame]';
 const COLORS = materialSurfaces.dark;
 const MIN_RAW_BYTES = 61_440;
+
+// Pango markup can reference more than one face. `fontfile` alone registers only
+// the current face, so pin Fontconfig's catalogue too instead of silently using
+// a runner's sans-serif fallback for Instrument Serif.
+process.env.FONTCONFIG_FILE = join(PRESENTATION_ROOT, 'fonts', 'fonts.conf');
+// macOS otherwise selects CoreText, which ignores Pango's fontfile catalogue
+// and silently substitutes system fonts even when these TTFs are present.
+process.env.PANGOCAIRO_BACKEND = 'fc';
 
 function escapeMarkup(text: string): string {
   return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;');
@@ -128,7 +142,11 @@ export async function frameComposition(
   sources: readonly Buffer[],
   caption: ScreenshotCaption,
   layout: ScreenshotLayout,
+  showcase = false,
+  options: { boardLabels?: readonly string[]; outputCanvas?: NativeCaptureSize } = {},
 ): Promise<Buffer> {
+  validateScreenshotBoardLabels(options.boardLabels, layout, sources.length);
+  if (showcase || layout.startsWith('store-')) return frameShowcaseComposition(sources, caption, layout, options);
   if (
     ((layout === 'screen' || layout === 'wall-status' || layout === 'wall-column') && sources.length !== 1) ||
     (layout === 'board-family' && sources.length !== 2 && sources.length !== 3) ||
@@ -179,10 +197,10 @@ export async function frameComposition(
     const panelWidth = Math.floor(width * scale);
     panels.push({ raw: sources[0], left: Math.floor((width - panelWidth) / 2), top: screenshotTop, width: panelWidth });
   } else if (layout === 'wall-status') {
-    // The actual Android rail occupies y270–418 in the 1080×1920 capture.
+    // The current-climb row occupies y390–620 in the 1080×1920 capture.
     // Enlarge those pixels separately; retain the complete native screen below
     // so the different locally selected climb remains visible in its context.
-    const crop = { top: 270 / 1920, height: 148 / 1920 };
+    const crop = { top: 390 / 1920, height: 230 / 1920 };
     const railHeight = Math.round((textWidth * height * crop.height) / width);
     const screenTop = screenshotTop + railHeight + Math.round(height * 0.028);
     const scale = Math.min(textWidth / width, (height * 0.96 - screenTop) / height);
@@ -227,6 +245,370 @@ export async function frameComposition(
   ];
   if (boardNames) layers.push({ input: boardNames.data, left: margin, top: boardNamesTop });
   return paintFrame({ width, height, colors, layers, panels, unit });
+}
+
+export const STORE_CREATIVE_PLACEMENTS = {
+  header: { width: 3840, height: 1646 },
+  'search-results': { width: 3840, height: 2560 },
+} as const;
+export type StoreCreativePlacement = keyof typeof STORE_CREATIVE_PLACEMENTS;
+
+/** Header art carries native content only; Apple's overlay supplies the listing copy. */
+/** One native phone in a Header: its source index, centre x, width, top y and black dim (0–1). */
+export interface StoreHeaderSlot {
+  source: number;
+  centerX: number;
+  width: number;
+  top: number;
+  dim?: number;
+}
+
+/** CPP trio: hero (source 1) in front at the centre, flanked by sources 0 and 2. */
+export const TRIO_HEADER_SLOTS: readonly StoreHeaderSlot[] = [
+  { source: 0, centerX: 1320, width: 560, top: 100 },
+  { source: 2, centerX: 2520, width: 560, top: 100 },
+  { source: 1, centerX: 1920, width: 640, top: 40 },
+];
+
+/**
+ * Default page: a seven-board fan, so the Header doesn't repeat screenshot 1's trio.
+ * Sources are ordered left to right; paint order runs outside-in so the hero (source 3) lands on top.
+ * The iPhone crop (x 1097–2743) keeps the three middle boards.
+ */
+export const FAN_HEADER_SLOTS: readonly StoreHeaderSlot[] = [
+  { source: 0, centerX: 290, width: 440, top: 220, dim: 0.3 },
+  { source: 6, centerX: 3550, width: 440, top: 220, dim: 0.3 },
+  { source: 1, centerX: 770, width: 500, top: 160, dim: 0.15 },
+  { source: 5, centerX: 3070, width: 500, top: 160, dim: 0.15 },
+  { source: 2, centerX: 1320, width: 560, top: 100 },
+  { source: 4, centerX: 2520, width: 560, top: 100 },
+  { source: 3, centerX: 1920, width: 640, top: 40 },
+];
+
+export async function frameStoreHeader(
+  sources: readonly Buffer[],
+  options: { sprayPhoto?: Buffer; slots?: readonly StoreHeaderSlot[] } = {},
+): Promise<Buffer> {
+  const slots = options.slots ?? TRIO_HEADER_SLOTS;
+  const used = new Set(slots.map((slot) => slot.source));
+  if (used.size !== slots.length || sources.length !== slots.length || slots.some((slot) => !sources[slot.source]))
+    throw new Error(`Header requires ${slots.length} native board captures, one per slot`);
+  const dimensions = sources.map(readPngDimensions);
+  if (dimensions.some((size) => size.width !== dimensions[0].width || size.height !== dimensions[0].height))
+    throw new Error('Header sources must come from the same capture device');
+  const { width, height } = STORE_CREATIVE_PLACEMENTS.header;
+  const background = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
+    <defs><radialGradient id="glow"><stop stop-color="#7C3AED" stop-opacity="0.23"/><stop offset="1" stop-color="#110A20" stop-opacity="0"/></radialGradient></defs>
+    <rect width="100%" height="100%" fill="#110A20"/>
+    <ellipse cx="50%" cy="45%" rx="45%" ry="65%" fill="url(#glow)"/>
+  </svg>`);
+  const layers: sharp.OverlayOptions[] = [];
+  if (options.sprayPhoto) {
+    // This photograph is scenery, never a substituted native app screen.
+    const photo = await sharp(options.sprayPhoto).rotate().resize(1280, 1450, { fit: 'cover' }).png().toBuffer();
+    const dimmed = await sharp(photo)
+      .composite([
+        {
+          input: Buffer.from(
+            '<svg width="1280" height="1450" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="black" fill-opacity="0.3"/></svg>',
+          ),
+        },
+      ])
+      .png()
+      .toBuffer();
+    layers.push({
+      input: await renderNativePanel({ raw: dimmed, left: 0, top: 0, width: 1280 }, height),
+      left: 1280,
+      top: 80,
+    });
+  }
+  for (const slot of slots) {
+    let panel = await renderNativePanel({ raw: sources[slot.source], left: 0, top: 0, width: slot.width }, height);
+    if (slot.dim) {
+      const size = readPngDimensions(panel);
+      // A shade over the outer phones keeps the eye on the hero; it never changes app pixels' content.
+      panel = await sharp(panel)
+        .composite([
+          {
+            input: Buffer.from(
+              `<svg width="${size.width}" height="${size.height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="black" fill-opacity="${slot.dim}"/></svg>`,
+            ),
+            blend: 'atop',
+          },
+        ])
+        .png()
+        .toBuffer();
+    }
+    layers.push({ input: panel, left: slot.centerX - Math.round(slot.width / 2), top: slot.top });
+  }
+  return sharp(background).composite(layers).flatten({ background: '#110A20' }).removeAlpha().png().toBuffer();
+}
+
+/** Load pinned faces through Pango, including the italic face used inside a headline. */
+export async function renderShowcaseText(
+  text: string,
+  size: number,
+  width: number,
+  color: string,
+  options: {
+    bold?: boolean;
+    emphasis?: string;
+    accent?: string;
+  } = {},
+) {
+  const fonts = join(PRESENTATION_ROOT, 'fonts');
+  if (options.emphasis) {
+    if (!text.includes(options.emphasis)) throw new Error('Showcase emphasis must appear in its headline');
+  }
+  let markup = escapeMarkup(text);
+  if (options.emphasis)
+    markup = markup.replace(
+      escapeMarkup(options.emphasis),
+      `<span font_family="Instrument Serif" style="italic" weight="normal" foreground="${options.accent ?? color}">${escapeMarkup(options.emphasis)}</span>`,
+    );
+  return sharp({
+    text: {
+      text: `<span foreground="${color}">${markup}</span>`,
+      font: `Inter Tight ${options.bold ? 'Bold ' : ''}${size}`,
+      fontfile: join(fonts, `InterTight-${options.bold ? 'Bold' : 'Regular'}.ttf`),
+      width,
+      dpi: 72,
+      rgba: true,
+      wrap: 'word',
+      spacing: 0,
+    },
+  })
+    .png()
+    .toBuffer({ resolveWithObject: true });
+}
+
+/** Still compositions use complete native PNGs, never the video's downsampled JPEG frames. */
+export async function frameShowcaseComposition(
+  sources: readonly Buffer[],
+  caption: ScreenshotCaption,
+  layout: ScreenshotLayout,
+  options: {
+    placement?: StoreCreativePlacement;
+    boardLabels?: readonly string[];
+    outputCanvas?: NativeCaptureSize;
+  } = {},
+): Promise<Buffer> {
+  const boardLabels = validateScreenshotBoardLabels(options.boardLabels, layout, sources.length);
+  const boards = layout === 'store-boards';
+  const boardCount = 3;
+  if (sources.length !== (boards ? boardCount : 1)) throw new Error(`Invalid showcase source count for ${layout}`);
+  const sourceSizes = sources.map(readPngDimensions);
+  const sourceSize = sourceSizes[0];
+  if (sourceSizes.some((size) => size.width !== sourceSize.width || size.height !== sourceSize.height))
+    throw new Error('Showcase sources must come from the same capture device');
+  if (options.outputCanvas && layout !== 'store-live-activity')
+    throw new Error('Separate output canvases are only supported for native Live Activity card fixtures');
+  if (layout === 'store-live-activity' && !options.outputCanvas)
+    throw new Error('Live Activity card framing requires the requested App Store output canvas');
+  if (
+    options.outputCanvas &&
+    (!Number.isSafeInteger(options.outputCanvas.width) ||
+      !Number.isSafeInteger(options.outputCanvas.height) ||
+      options.outputCanvas.width <= 0 ||
+      options.outputCanvas.height <= 0)
+  )
+    throw new Error('Invalid Live Activity output canvas dimensions');
+  if (options.placement && !boards) throw new Error('Creative placements require the three-board opening');
+  if (options.placement === 'header') return frameStoreHeader(sources);
+  const { width, height } = options.placement
+    ? STORE_CREATIVE_PLACEMENTS[options.placement]
+    : (options.outputCanvas ?? sourceSize);
+  const wide = width > height;
+  const tablet = wide && !options.placement;
+  const light = layout === 'store-wall' || layout === 'store-spray' || layout === 'wall-column';
+  const base = light ? materialSurfaces.light : materialSurfaces.dark;
+  // Same violet ground as the showcase stage; UI pixels retain their native appearance.
+  const colors = {
+    ...base,
+    background: light ? '#F4F1FB' : '#110A20',
+    secondaryBackground: light ? '#F4F1FB' : '#110A20',
+  };
+  const accent = light ? brandColors.primary : brandColorsDark.primary;
+  const margin = Math.round(width * 0.06);
+  const copyWidth = Math.round(wide ? width * 0.32 : width - margin * 2);
+  const headlineSize = Math.round(wide ? width * 0.053 : width * 0.105);
+  const wordmark = await renderShowcaseText(
+    'boardsesh',
+    Math.round(width * (wide ? 0.013 : 0.029)),
+    copyWidth,
+    accent,
+    {
+      bold: true,
+    },
+  );
+  const headline = await renderShowcaseText(caption.headline, headlineSize, copyWidth, colors.label, {
+    bold: true,
+    emphasis: caption.emphasis,
+    accent,
+  });
+  const description = await renderShowcaseText(
+    caption.description,
+    Math.round(width * (wide ? 0.018 : 0.037)),
+    copyWidth,
+    colors.secondaryLabel,
+  );
+  const gap = Math.round(height * 0.018);
+  const copyHeight = wordmark.info.height + headline.info.height + description.info.height + gap * 2;
+  if (copyHeight > height * (wide ? 0.82 : 0.33)) throw new Error(`Showcase caption overflows: ${caption.headline}`);
+  const copyTop = Math.round(wide ? (height - copyHeight) / 2 : height * 0.047);
+  const layers: sharp.OverlayOptions[] = [
+    { input: wordmark.data, left: margin, top: copyTop },
+    { input: headline.data, left: margin, top: copyTop + wordmark.info.height + gap },
+    { input: description.data, left: margin, top: copyTop + wordmark.info.height + headline.info.height + gap * 2 },
+  ];
+  const region = wide
+    ? { left: width * 0.42, top: height * 0.1, width: width * 0.52, height: height * 0.8 }
+    : {
+        left: margin,
+        top: copyTop + copyHeight + height * 0.045,
+        width: width - margin * 2,
+        height: height * 0.94 - (copyTop + copyHeight + height * 0.045),
+      };
+  const panels: NativePanel[] = [];
+  const aspect = sourceSize.height / sourceSize.width;
+  const foreground: sharp.OverlayOptions[] = [];
+  if (boards) {
+    // Lower the portrait foreground phone to expose more lit holds on both sides.
+    // Fit its complete native footer even when translated copy makes the stage shorter.
+    const foregroundDrop = wide ? 0.17 : 0.29;
+    const sideTop = region.top + height * 0.032;
+    const panelBleed = Math.max(2, Math.round(Math.min(width, height) * 0.002)) * 2 + 8;
+    const labelSize = Math.round(Math.min(width, height) * (wide ? 0.02 : 0.025));
+    const labelCellWidth = Math.floor(region.width / 3);
+    const labelPadding = Math.round(labelSize * 0.4);
+    const renderedLabels = boardLabels
+      ? await Promise.all(
+          boardLabels.map((label) =>
+            renderShowcaseText(label, labelSize, labelCellWidth - labelPadding * 2, colors.label, { bold: true }),
+          ),
+        )
+      : [];
+    const labelHeight = Math.max(0, ...renderedLabels.map((label) => label.info.height));
+    if (labelHeight > labelSize * 2.8) throw new Error('Board labels overflow the two-line trio footer');
+    const labelTop = Math.floor(height * 0.94 - labelHeight);
+    const panelBottom = boardLabels ? labelTop - height * 0.015 : height * 0.96;
+    const panelWidth = Math.min(
+      region.width * 0.49,
+      (panelBottom - sideTop - region.height * foregroundDrop - panelBleed) / aspect,
+    );
+    if (panelWidth <= 0) throw new Error('Board labels leave no room for the complete native panels');
+    // Short Header canvases limit phone height; keep the group compact enough
+    // that the center spray panel overlaps both sides instead of becoming a row.
+    const boardGroupWidth = options.placement ? Math.min(region.width, panelWidth * 2.05) : region.width;
+    const boardGroupLeft = region.left + (region.width - boardGroupWidth) / 2;
+    const positions = [
+      { left: boardGroupLeft, top: sideTop },
+      { left: boardGroupLeft + (boardGroupWidth - panelWidth) / 2, top: sideTop + region.height * foregroundDrop },
+      { left: boardGroupLeft + boardGroupWidth - panelWidth, top: sideTop },
+    ];
+    for (const index of [0, 2, 1]) {
+      const position = positions[index];
+      panels.push({ raw: sources[index], ...position, width: panelWidth });
+    }
+    for (const [index, label] of renderedLabels.entries()) {
+      foreground.push({
+        input: label.data,
+        left: Math.round(region.left + (index + 0.5) * labelCellWidth - label.info.width / 2),
+        top: labelTop,
+      });
+    }
+  } else if (!wide && (layout === 'store-queue' || layout === 'store-wall')) {
+    // These details are lifted from the same full native capture shown below.
+    // Queue: first two rows and their contributor avatars. Wall: the current-climb
+    // card in the expanded wall sheet (the presenting header is empty in this story).
+    const crop = layout === 'store-queue' ? { top: 0.195, height: 0.34 } : { top: 0.26, height: 0.125 };
+    const detailWidth = region.width;
+    const detailHeight = detailWidth * aspect * crop.height;
+    const screenTop = region.top + detailHeight + height * 0.025;
+    const screenWidth = Math.min(region.width, (region.top + region.height - screenTop) / aspect);
+    panels.push(
+      { raw: sources[0], left: region.left, top: region.top, width: detailWidth, crop },
+      { raw: sources[0], left: (width - screenWidth) / 2, top: screenTop, width: screenWidth },
+    );
+  } else if (tablet && layout === 'wall-column') {
+    const panelWidth = Math.min(region.width * 0.82, region.height / aspect);
+    const panelHeight = panelWidth * aspect;
+    const detailHeight = Math.min(region.height, panelHeight * 1.18);
+    const detailWidth = (detailHeight * IPAD_WALL_COLUMN_PIXELS) / (sourceSize.height * 0.62);
+    panels.push(
+      { raw: sources[0], left: region.left, top: (height - panelHeight) / 2, width: panelWidth },
+      {
+        raw: sources[0],
+        left: width - margin - detailWidth,
+        top: (height - detailHeight) / 2,
+        width: detailWidth,
+        crop: {
+          top: 0,
+          height: 0.62,
+          left: 1 - IPAD_WALL_COLUMN_PIXELS / sourceSize.width,
+          width: IPAD_WALL_COLUMN_PIXELS / sourceSize.width,
+        },
+      },
+    );
+  } else if (layout === 'store-live-activity') {
+    if (aspect > 1) {
+      // Preserve the entire native Lock Screen, including clock, wallpaper and
+      // controls. The panel adds only an exterior border; no fake camera UI.
+      const panelWidth = Math.min(region.width, region.height / aspect);
+      const panelHeight = panelWidth * aspect;
+      panels.push({
+        raw: sources[0],
+        left: region.left + (region.width - panelWidth) / 2,
+        top: region.top + (region.height - panelHeight) / 2,
+        width: panelWidth,
+      });
+    } else {
+      // A reviewed native card, already cropped on the physical device. Its
+      // dimensions identify the source card, not this App Store canvas or a phone.
+      const cardWidth = Math.floor(Math.min(region.width, region.height / aspect));
+      const card = await sharp(sources[0]).resize(cardWidth).png().toBuffer({ resolveWithObject: true });
+      foreground.push({
+        input: card.data,
+        left: Math.round(region.left + (region.width - card.info.width) / 2),
+        top: Math.round(
+          wide
+            ? region.top + (region.height - card.info.height) / 2
+            : Math.min(copyTop + copyHeight + height * 0.1, height - margin - card.info.height),
+        ),
+      });
+    }
+  } else if (layout === 'store-island') {
+    // Keep the actual native silhouette and contents; omit wallpaper and the
+    // decorative screenshot border. Center the Island on the complete canvas.
+    const island = await sharp(await extractScreenshotIsland(sources[0]))
+      .resize(Math.round(region.width))
+      .png()
+      .toBuffer({ resolveWithObject: true });
+    foreground.push({
+      input: island.data,
+      left: Math.round((width - island.info.width) / 2),
+      top: Math.round(Math.max(copyTop + copyHeight + height * 0.085, (height - island.info.height) / 2)),
+    });
+  } else {
+    const panelWidth = Math.min(region.width, region.height / aspect);
+    const panelHeight = panelWidth * aspect;
+    panels.push({
+      raw: sources[0],
+      left: region.left + (region.width - panelWidth) / 2,
+      top: region.top + (region.height - panelHeight) / 2,
+      width: panelWidth,
+    });
+  }
+  return paintFrame({
+    width,
+    height,
+    colors,
+    layers,
+    panels,
+    unit: Math.min(width, height),
+    showcase: true,
+    foreground,
+  });
 }
 
 /**
@@ -377,13 +759,26 @@ interface FramePaint {
   layers: sharp.OverlayOptions[];
   panels: readonly NativePanel[];
   unit: number;
+  showcase?: boolean;
+  foreground?: sharp.OverlayOptions[];
 }
 
 /** The gradient ground plus every native panel, clipped to the canvas. */
-async function paintFrame({ width, height, colors, layers, panels, unit }: FramePaint): Promise<Buffer> {
+async function paintFrame({
+  width,
+  height,
+  colors,
+  layers,
+  panels,
+  unit,
+  showcase,
+  foreground,
+}: FramePaint): Promise<Buffer> {
   const background = Buffer.from(`<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg">
-    <defs><linearGradient id="background" x2="0" y2="1"><stop stop-color="${colors.secondaryBackground}"/><stop offset="1" stop-color="${colors.background}"/></linearGradient></defs>
+    <defs><linearGradient id="background" x2="0" y2="1"><stop stop-color="${colors.secondaryBackground}"/><stop offset="1" stop-color="${colors.background}"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="${brandColorsDark.primaryFill}" stop-opacity="0.23"/><stop offset="1" stop-color="${colors.background}" stop-opacity="0"/></radialGradient></defs>
     <rect width="100%" height="100%" fill="url(#background)"/>
+    ${showcase ? '<ellipse cx="60%" cy="65%" rx="65%" ry="60%" fill="url(#glow)"/>' : ''}
   </svg>`);
   for (const panel of panels) {
     const rendered = await renderNativePanel(panel, unit);
@@ -401,7 +796,7 @@ async function paintFrame({ width, height, colors, layers, panels, unit }: Frame
     layers.push({ input: clipped, left: Math.max(0, left), top: Math.max(0, panelTop) });
   }
   return sharp(background)
-    .composite(layers)
+    .composite([...layers, ...(foreground ?? [])])
     .flatten({ background: colors.background })
     .removeAlpha()
     .png({ compressionLevel: 9 })
@@ -414,6 +809,9 @@ export interface FrameDirectoryOptions {
   locale: CaptionLocale;
   input: string;
   output: string;
+  cpp?: CppTarget;
+  /** Alternate reviewed fixture directory for local regeneration and tests. */
+  liveActivityFixtureRoot?: string;
 }
 
 export async function frameDirectory(options: FrameDirectoryOptions): Promise<string[]> {
@@ -426,7 +824,10 @@ export async function frameDirectory(options: FrameDirectoryOptions): Promise<st
   const names = readdirSync(input)
     .filter((name) => name.toLowerCase().endsWith('.png'))
     .sort();
-  const recipes = resolveScreenshotRecipes(options.platform, options.device, names);
+  if (options.cpp && options.platform !== 'ios') throw new Error('CPP framing requires iOS');
+  const recipes = options.cpp
+    ? resolveCppRecipes(readCppPage(options.cpp), options.device, names)
+    : resolveScreenshotRecipes(options.platform, options.device, names, options.locale);
   const outputNames = recipes.map((recipe) => recipe.output);
   const captures = names.map((name) => ({ name, buffer: readFileSync(join(input, name)) }));
   const offenders =
@@ -438,16 +839,64 @@ export async function frameDirectory(options: FrameDirectoryOptions): Promise<st
   }
   if (offenders.length) throw new Error(offenders.map(({ file, reason }) => `${file}: ${reason}`).join('\n'));
   const catalog = readCaptionCatalog(options.locale);
+  const cppCapture = options.cpp
+    ? (JSON.parse(readFileSync(join(input, 'cpp-capture.json'), 'utf8')) as {
+        kind?: string;
+        target?: string;
+        fixtureSha256?: string;
+        verified?: boolean;
+      })
+    : undefined;
+  if (options.cpp && cppCapture?.target !== options.cpp)
+    throw new Error('CPP raw captures lack target and fixture provenance');
+  if (options.cpp && cppCapture?.kind === 'view-stories') {
+    assertCppStoryCapture(
+      cppCapture,
+      { target: options.cpp, locale: options.locale, device: options.device, sourceSha256: cppStorySourceSha256() },
+      input,
+    );
+  }
   const capturesByName = new Map(captures.map((capture) => [capture.name, capture.buffer]));
   mkdirSync(dirname(output), { recursive: true });
   const staging = mkdtempSync(join(dirname(output), '.framing-'));
-  const manifest: PresentationManifest = { version: PRESENTATION_VERSION, locale: options.locale, files: {} };
+  const manifest: PresentationManifest = {
+    version: PRESENTATION_VERSION,
+    locale: options.locale,
+    files: {},
+    ...(options.cpp
+      ? {
+          cpp: {
+            target: options.cpp,
+            manifestSha256: sha256Screenshot(readFileSync(CPP_MANIFEST_PATH)),
+            ...(cppCapture?.kind === 'view-stories'
+              ? { storyCapture: cppCapture as CppStoryCapture }
+              : { fixtureSha256: cppCapture?.fixtureSha256 }),
+          },
+        }
+      : {}),
+  };
   try {
     const thumbnails: Array<{ data: Buffer; info: sharp.OutputInfo }> = [];
     for (const recipe of recipes) {
       const name = recipe.output;
-      const buffers = recipe.sources.map((source) => capturesByName.get(source)!);
-      const framed = await frameComposition(buffers, catalog[recipe.caption], recipe.layout);
+      const nativeFixture = recipe.liveActivity
+        ? loadFullScreenLiveActivityFixture(
+            recipe.liveActivity.boardFamily,
+            options.locale,
+            options.liveActivityFixtureRoot,
+          )
+        : undefined;
+      const buffers = nativeFixture
+        ? [nativeFixture.pixels]
+        : recipe.sources.map((source) => capturesByName.get(source)!);
+      const outputCanvas = nativeFixture ? readPngDimensions(captures[0].buffer) : undefined;
+      const framed = await frameComposition(
+        buffers,
+        catalog[recipe.caption],
+        recipe.layout,
+        options.platform === 'ios',
+        { boardLabels: recipe.boardLabels, outputCanvas },
+      );
       writeFileSync(join(staging, name), framed);
       thumbnails.push(await sharp(framed).resize({ width: 270 }).toBuffer({ resolveWithObject: true }));
       const sourceMetadata = Object.fromEntries(
@@ -464,6 +913,16 @@ export async function frameDirectory(options: FrameDirectoryOptions): Promise<st
         rawSha256: buffers.length === 1 ? sha256Screenshot(buffers[0]) : sha256ScreenshotSources(sourceMetadata),
         framedSha256: sha256Screenshot(framed),
         ...(buffers.length > 1 ? { sources: sourceMetadata } : {}),
+        ...(recipe.boardLabels ? { boardLabels: recipe.boardLabels } : {}),
+        ...(nativeFixture
+          ? {
+              liveActivity: {
+                fixture: nativeFixture.provenance,
+                manifestSha256: nativeFixture.manifestSha256,
+                outputCanvas: outputCanvas!,
+              },
+            }
+          : {}),
       };
     }
     if (options.platform === 'android') {
@@ -516,6 +975,7 @@ export function parseFrameArguments(argv: readonly string[]): {
   output: string;
   device?: string;
   locale?: CaptionLocale;
+  cpp?: CppTarget;
 } {
   const args = argv.filter((argument) => argument !== '--');
   const flags = new Map<string, string>();
@@ -523,7 +983,7 @@ export function parseFrameArguments(argv: readonly string[]): {
     const flag = args[index];
     const argument = args[index + 1];
     if (
-      !['--platform', '--input', '--output', '--device', '--locale'].includes(flag) ||
+      !['--platform', '--input', '--output', '--device', '--locale', '--cpp'].includes(flag) ||
       !argument ||
       argument.startsWith('--') ||
       flags.has(flag)
@@ -537,9 +997,12 @@ export function parseFrameArguments(argv: readonly string[]): {
   const output = flags.get('--output');
   if ((platform !== 'ios' && platform !== 'android') || !input || !output) {
     throw new Error(
-      'Usage: screenshot:frame --platform ios|android --input <raw tree> --output <store tree> [--device <slug> --locale en-US|es|fr|de]',
+      'Usage: screenshot:frame --platform ios|android --input <raw tree> --output <store tree> [--device <slug> --locale en-US|es|fr|de|it|zh-CN]',
     );
   }
+  const cpp = flags.get('--cpp');
+  if (cpp && (!isCppTarget(cpp) || platform !== 'ios'))
+    throw new Error('--cpp requires an iOS target: kilter|tension|moonboard|spray');
   const locale = flags.get('--locale');
   if (locale && !CAPTION_LOCALES.some((supportedLocale) => supportedLocale === locale))
     throw new Error(`Unsupported caption locale: ${locale}`);
@@ -551,6 +1014,7 @@ export function parseFrameArguments(argv: readonly string[]): {
     output: resolve(output),
     device: flags.get('--device'),
     locale: locale as CaptionLocale | undefined,
+    ...(cpp ? { cpp: cpp as CppTarget } : {}),
   };
 }
 
@@ -569,6 +1033,7 @@ export async function main(argv: readonly string[] = process.argv.slice(2)): Pro
             throw new Error(`Unrecognized raw screenshot directory: ${directory}`);
           groups.push({
             platform: options.platform,
+            cpp: options.cpp,
             device: basename(directory),
             locale,
             input: directory,

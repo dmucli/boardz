@@ -651,7 +651,11 @@ describe('gym admin member can edit a PRIVATE board linked to their gym', () => 
     });
   });
 
-  it('lets the gym admin member update the private linked board', async () => {
+  it('lets an owner-approved gym admin update the private linked board', async () => {
+    await db.execute(sql`INSERT INTO resource_privacy (kind, resource_id, owner_id, audience)
+      VALUES ('board', ${privateGymBoardUuid}, ${SYS_OWNER}, 'invite_only')`);
+    await db.execute(sql`INSERT INTO resource_grants (kind, resource_id, user_id, status)
+      VALUES ('board', ${privateGymBoardUuid}, ${GYM_ADMIN_MEMBER}, 'approved')`);
     const result = await socialBoardMutations.updateBoard(
       null,
       { input: { boardUuid: privateGymBoardUuid, name: 'Gym-admin private edit' } },
@@ -662,9 +666,19 @@ describe('gym admin member can edit a PRIVATE board linked to their gym', () => 
     expect((await boardConfig(privateGymBoardUuid)).name).toBe('Gym-admin private edit');
   });
 
-  it('reports canEdit=true for the gym admin member on the private linked board', async () => {
+  it('refuses a private board edit without owner approval', async () => {
+    await expect(
+      socialBoardMutations.updateBoard(
+        null,
+        { input: { boardUuid: privateGymBoardUuid, name: 'Unapproved edit' } },
+        authCtx(GYM_ADMIN_MEMBER),
+      ),
+    ).rejects.toThrow('Board not found');
+  });
+
+  it('does not grant the gym admin read access to the private linked board', async () => {
     const board = await socialBoardQueries.board(null, { boardUuid: privateGymBoardUuid }, authCtx(GYM_ADMIN_MEMBER));
-    expect(board?.canEdit).toBe(true);
+    expect(board).toBeNull();
   });
 });
 
@@ -698,9 +712,9 @@ describe('community roles reach public/catalog boards only, not private ones', (
     ).rejects.toThrow(/Not authorized to update this board/);
   });
 
-  it('reports canEdit=false for a community role on a private board', async () => {
+  it('does not reveal a private board to a community role', async () => {
     const board = await socialBoardQueries.board(null, { boardUuid: privateBoardUuid }, authCtx(KILTER_LEADER));
-    expect(board?.canEdit).toBe(false);
+    expect(board).toBeNull();
   });
 
   it("still lets the private board's owner edit it", async () => {
@@ -788,11 +802,21 @@ describe('community moderators cannot delete boards/gyms or link boards', () => 
     return row?.deleted_at != null;
   };
 
-  it('rejects a moderator deleting a board they do not own (delete stays owner-only)', async () => {
+  it.each([GLOBAL_LEADER, KILTER_LEADER])(
+    'rejects community leader %s deleting a board they do not own',
+    async (leader) => {
+      await expect(
+        socialBoardMutations.deleteBoard(null, { boardUuid: kilterBoardUuid }, authCtx(leader)),
+      ).rejects.toThrow('Not authorized to delete this board');
+      expect(await boardIsDeleted(kilterBoardUuid)).toBe(false);
+    },
+  );
+
+  it('lets a global admin delete a board they do not own (docs/product/gym-board-governance.md)', async () => {
     await expect(
       socialBoardMutations.deleteBoard(null, { boardUuid: kilterBoardUuid }, authCtx(GLOBAL_ADMIN)),
-    ).rejects.toThrow();
-    expect(await boardIsDeleted(kilterBoardUuid)).toBe(false);
+    ).resolves.toBe(true);
+    expect(await boardIsDeleted(kilterBoardUuid)).toBe(true);
   });
 
   it('rejects a moderator deleting a gym they do not own', async () => {

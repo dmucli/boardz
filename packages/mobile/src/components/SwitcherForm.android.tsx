@@ -4,10 +4,10 @@
 // The whole OTA Channel / Branch switcher screen is ONE `Host` containing a single
 // `LazyColumn` — the Compose counterpart to the iOS `Form`. Same consolidation as
 // MoreForm / FeatureFlagsForm. A `LazyColumn` virtualizes its items, so the Host is
-// `style={{ flex: 1 }}` (NOT `matchContents`). `colorScheme` forces the Compose
-// MaterialTheme to follow the in-app Light/Dark toggle.
+// `style={{ flex: 1 }}` (NOT `matchContents`). ComposeHost keeps the Compose
+// MaterialTheme on the in-app Light/Dark toggle.
 //
-// Each section flattens to: an optional title `Text`, an optional intro `Text`, a
+// Each section is one list item: an optional title `Text`, an optional intro `Text`, a
 // Material `Card` wrapping ALL its rows (info / status / target / field / action),
 // then an optional footer `Text`. Action rows render as clickable rows inside the
 // card (matching the RN `ListRow` look the screen had), not standalone filled
@@ -16,7 +16,7 @@
 // Compose Material theme.
 
 import { useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
-import { Host } from '@expo/ui';
+import { ComposeHost } from './ComposeHost.android';
 import {
   LazyColumn,
   Card,
@@ -45,6 +45,8 @@ import type {
 } from './SwitcherForm.types';
 
 const ROW_PADDING = padding(spacing[4], spacing[3], spacing[4], spacing[3]);
+// Vertical gap between sections, so each section's card reads as its own group.
+const SECTION_GAP = spacing[5];
 const CHEVRON = '›';
 const CHECK = '✓';
 
@@ -215,50 +217,53 @@ function renderRow(row: SwitcherRow, errorColor: string): ReactNode {
   }
 }
 
-function flattenSection(section: SwitcherSection, errorColor: string): ReactNode[] {
-  const items: ReactNode[] = [];
-  if (section.title) {
-    items.push(
-      <Text key={`${section.key}-title`} style={{ typography: 'titleSmall' }} modifiers={[alpha(0.6)]}>
-        {section.title}
-      </Text>,
-    );
-  }
-  if (section.intro) {
-    items.push(
-      <Text key={`${section.key}-intro`} style={{ typography: 'bodySmall' }} modifiers={[alpha(0.6)]}>
-        {section.intro}
-      </Text>,
-    );
-  }
-  items.push(
-    <Card key={`${section.key}-card`} modifiers={[fillMaxWidth()]}>
-      <Column modifiers={[fillMaxWidth()]}>{section.rows.map((row) => renderRow(row, errorColor))}</Column>
-    </Card>,
+// One LazyColumn item per section, spaced with padding modifiers rather than the
+// LazyColumn's `spacedBy` arrangement, which never reached the device (see
+// MoreForm.android.tsx).
+function renderSection(section: SwitcherSection, errorColor: string, isFirst: boolean) {
+  return (
+    <Column key={section.key} modifiers={[fillMaxWidth(), padding(0, isFirst ? 0 : SECTION_GAP, 0, 0)]}>
+      {section.title ? (
+        <Text
+          style={{ typography: 'titleSmall' }}
+          modifiers={[padding(spacing[1], 0, spacing[1], spacing[2]), alpha(0.6)]}
+        >
+          {section.title}
+        </Text>
+      ) : null}
+      {section.intro ? (
+        <Text
+          style={{ typography: 'bodySmall' }}
+          modifiers={[padding(spacing[1], 0, spacing[1], spacing[3]), alpha(0.6)]}
+        >
+          {section.intro}
+        </Text>
+      ) : null}
+      <Card modifiers={[fillMaxWidth()]}>
+        <Column modifiers={[fillMaxWidth()]}>{section.rows.map((row) => renderRow(row, errorColor))}</Column>
+      </Card>
+      {section.footer ? (
+        <Text
+          style={{ typography: 'bodySmall' }}
+          modifiers={[padding(spacing[1], spacing[3], spacing[1], 0), alpha(0.6)]}
+        >
+          {section.footer}
+        </Text>
+      ) : null}
+    </Column>
   );
-  if (section.footer) {
-    items.push(
-      <Text key={`${section.key}-footer`} style={{ typography: 'bodySmall' }} modifiers={[alpha(0.6)]}>
-        {section.footer}
-      </Text>,
-    );
-  }
-  return items;
 }
 
 export function SwitcherForm({ model }: SwitcherFormProps) {
-  const { brandColors, colorScheme } = useTheme();
-  const items = model.sections.flatMap((section) => flattenSection(section, brandColors.error));
+  const { brandColors } = useTheme();
+  const items = model.sections.map((section, index) => renderSection(section, brandColors.error, index === 0));
 
   return (
-    <Host style={styles.host} colorScheme={colorScheme}>
-      <LazyColumn
-        contentPadding={{ start: spacing[4], top: spacing[4], end: spacing[4], bottom: spacing[10] }}
-        verticalArrangement={{ spacedBy: spacing[3] }}
-      >
+    <ComposeHost style={styles.host}>
+      <LazyColumn contentPadding={{ start: spacing[4], top: spacing[4], end: spacing[4], bottom: spacing[10] }}>
         {items}
       </LazyColumn>
-    </Host>
+    </ComposeHost>
   );
 }
 

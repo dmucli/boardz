@@ -1,6 +1,10 @@
-import { useCallback, useMemo } from 'react';
-import { View, Pressable, StyleSheet } from 'react-native';
+import type { HoldMarkerStyle } from '../../lib/board-render-style';
+import { PressableSurface } from '../PressableSurface';
+import { useCallback, useMemo, type ReactNode } from 'react';
+import { View, StyleSheet } from 'react-native';
 import { useWindowBottomInset } from '../../hooks/use-window-bottom-inset';
+import { useVerticalTabBar } from '../../hooks/use-vertical-tab-bar';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTranslation } from 'react-i18next';
 import type { BoardName, HoldFilterMode, HoldFilterType } from '@boardsesh/shared-schema';
 import { buildHoldFilterOptions } from '@boardsesh/climb-filters';
@@ -15,6 +19,7 @@ import { HoldMarkerShapeSvg } from '../board-renderer/HoldMarkerShape';
 import { getHoldFilterTypeShape } from './hold-filter-visuals';
 
 type HoldFilterPickerProps = {
+  holdStyleOverride?: HoldMarkerStyle;
   boardName: BoardName;
   /** The active brush: the hold type tapping a hold will apply. */
   selectedType: HoldFilterType;
@@ -22,6 +27,8 @@ type HoldFilterPickerProps = {
   /** Whether tapping a hold marks the brush type as included or excluded. */
   applyMode: HoldFilterMode;
   onApplyModeChange: (mode: HoldFilterMode) => void;
+  /** Drawn at the end of the Include / Exclude row (the heatmap toggle). */
+  modeRowAccessory?: ReactNode;
 };
 
 /**
@@ -36,20 +43,30 @@ type HoldFilterPickerProps = {
  */
 export function HoldFilterPicker({
   boardName,
+  holdStyleOverride,
   selectedType,
   onSelectType,
   applyMode,
   onApplyModeChange,
+  modeRowAccessory,
 }: HoldFilterPickerProps) {
   const { t } = useTranslation('climbs');
   const { systemColors } = useTheme();
   const windowInsetBottom = useWindowBottomInset();
+  // While the tab bar is a vertical rail (iPhone Duo, closed or open in landscape)
+  // the accessory stays up over this screen (hiding it collapses the rail), and the
+  // tab's own inset carries it. Everywhere else the accessory is hidden here and
+  // the window inset is the right floor.
+  const verticalTabBar = useVerticalTabBar();
+  const { bottom: tabInsetBottom } = useSafeAreaInsets();
+  const controlsInsetBottom = verticalTabBar ? tabInsetBottom : windowInsetBottom;
+  const storedHoldStyle = useHoldColorOverrides();
   const {
     overrides: holdColorOverrides,
     shapes: holdShapeOverrides,
     brushThickness,
     shapeSize,
-  } = useHoldColorOverrides();
+  } = holdStyleOverride ?? storedHoldStyle;
 
   const options = useMemo(() => buildHoldFilterOptions(boardName, holdColorOverrides), [boardName, holdColorOverrides]);
   const shapeByType = useMemo(() => {
@@ -91,16 +108,21 @@ export function HoldFilterPicker({
     <View
       style={[
         styles.section,
-        { borderTopColor: systemColors.separator, paddingBottom: windowInsetBottom + spacing[3] },
+        { borderTopColor: systemColors.separator, paddingBottom: controlsInsetBottom + spacing[3] },
       ]}
     >
-      <SegmentedControl
-        options={applyModeOptions}
-        selectedKey={applyMode}
-        onSelect={onApplyModeChange}
-        trackColor={systemColors.fill}
-        accessibilityLabel={t('mobile.holdFilter.applyModeLabel')}
-      />
+      <View style={styles.modeRow}>
+        <View style={styles.modeControl}>
+          <SegmentedControl
+            options={applyModeOptions}
+            selectedKey={applyMode}
+            onSelect={onApplyModeChange}
+            trackColor={systemColors.fill}
+            accessibilityLabel={t('mobile.holdFilter.applyModeLabel')}
+          />
+        </View>
+        {modeRowAccessory}
+      </View>
 
       <View style={styles.chipRow}>
         {options.map((option) => {
@@ -116,7 +138,7 @@ export function HoldFilterPicker({
           const markerDiameter = 22 * shapeSize;
           const markerStrokeWidth = Math.max(2, 2 * brushThickness);
           return (
-            <Pressable
+            <PressableSurface
               key={option.type}
               onPress={() => handleSelect(option.type)}
               accessibilityRole="button"
@@ -143,10 +165,10 @@ export function HoldFilterPicker({
                   </View>
                 ) : null}
               </View>
-              <Text variant="caption1" style={styles.chipLabel} numberOfLines={1}>
+              <Text emphasized variant="caption1" numberOfLines={1}>
                 {typeLabels[option.type]}
               </Text>
-            </Pressable>
+            </PressableSurface>
           );
         })}
       </View>
@@ -165,6 +187,14 @@ const styles = StyleSheet.create({
     gap: spacing[3],
     borderTopWidth: StyleSheet.hairlineWidth,
     // borderTopColor applied inline from systemColors.separator (scheme-aware).
+  },
+  modeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing[2],
+  },
+  modeControl: {
+    flex: 1,
   },
   chipRow: {
     flexDirection: 'row',
@@ -191,9 +221,6 @@ const styles = StyleSheet.create({
   },
   excludeIcon: {
     position: 'absolute',
-  },
-  chipLabel: {
-    fontWeight: '600',
   },
   hint: {
     textAlign: 'center',

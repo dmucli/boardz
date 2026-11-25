@@ -1,9 +1,91 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
-import { createElement, forwardRef, useImperativeHandle, type MouseEvent, type ReactNode, type RefObject } from 'react';
+vi.mock('../../../hooks/use-native-root-bar-items', () => ({ useNativeRootBarItems: () => false }));
+vi.mock('../../chrome/use-root-bar-items', () => import('../../../../test/use-root-bar-items-stub'));
+// Screenshot mode only; this suite covers the glass capsules.
+vi.mock('../../chrome/NativeTrailingItemShowcaseAnchor', () => ({ NativeTrailingItemShowcaseAnchor: () => null }));
+// The native bar header reads the stack frame; this suite never reaches it.
+vi.mock('expo-router/react-navigation', () => ({ useFrameSize: () => 402 }));
+vi.mock('../../SheetTopBar', () => ({ SheetTopBar: () => null }));
+vi.mock('../../../hooks/use-native-root-header', () => ({ useNativeRootHeader: () => nativeChrome.enabled }));
+vi.mock('../../../hooks/use-floating-header-controls', () => ({
+  useFloatingHeaderControls: () => nativeChrome.glassGradeRail && ctrl.variant === 'liquidGlass',
+}));
+vi.mock('../../chrome/NativeRootHeader', async () => {
+  // The real title bound, so the centre width below is what UIKit's bar gives the
+  // capsule for the action widths this chrome actually hands the header.
+  const { nativeTitleMaxWidth } = await vi.importActual<typeof import('../../chrome/native-title-bound')>(
+    '../../chrome/native-title-bound',
+  );
+  return {
+    NativeRootHeader: ({
+      scrollEdge,
+      children,
+      floatingContent,
+      onHeightChange,
+      centerContent,
+      centerActionWidths,
+      titleHidden,
+      rightActions,
+    }: {
+      scrollEdge?: unknown;
+      titleHidden?: boolean;
+      centerContent?: ReactNode;
+      rightActions?: ReactNode;
+      centerActionWidths?: { leading: number; trailing: number };
+      children?: ReactNode;
+      // Retain the original overlay slot so reverting production for the regression
+      // control fails on measured containment rather than a missing mocked rail.
+      floatingContent?: ReactNode;
+      onHeightChange: (height: number) => void;
+    }) => {
+      nativeChrome.scrollEdge = scrollEdge;
+      nativeChrome.centerActionWidths = centerActionWidths;
+      nativeChrome.titleHidden = titleHidden;
+      nativeChrome.centerContent = centerContent;
+      return createElement(
+        'div',
+        null,
+        centerContent != null && centerActionWidths
+          ? createElement(
+              'div',
+              {
+                'data-native-center': 'true',
+                'data-max-width': nativeTitleMaxWidth(
+                  nativeChrome.frameWidth,
+                  { left: 0, right: 0 },
+                  centerActionWidths,
+                ),
+              },
+              centerContent,
+            )
+          : null,
+        createElement('div', { 'data-native-trailing': 'true' }, rightActions),
+        createElement(
+          'div',
+          {
+            'data-has-layout': 'true',
+            onClick: () => onHeightChange(nativeChrome.measuredChromeHeight),
+          },
+          children,
+        ),
+        floatingContent,
+      );
+    },
+  };
+});
+vi.mock('../../../hooks/use-device-layout', () => ({
+  useDeviceLayout: () => ({ isPad: ctrl.isPad, widthClass: ctrl.widthClass }),
+}));
+vi.mock('../../../hooks/use-board-angle-options', () => ({ useBoardAngleOptions: () => [30, 40] }));
+vi.mock('../../navigation/AnchoredPopover', () => ({
+  AnchoredPopover: ({ trigger }: { trigger: ReactNode }) => trigger,
+}));
+vi.mock('../../play-drawer/AngleBoardDiagram', () => ({ AngleBoardDiagram: () => null }));
+vi.mock('../../play-drawer/AngleSlider', () => ({ AngleSlider: () => null }));
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, fireEvent, act } from '@testing-library/react';
+import { createElement, type MouseEvent, type ReactNode } from 'react';
 import type { UserBoard } from '@boardsesh/shared-schema';
-import type { SearchHeaderHandle } from '../../SearchHeader';
 
 type BoardLabelFields = Pick<
   UserBoard,
@@ -15,14 +97,41 @@ type BluetoothCtx = {
   connect: () => Promise<boolean>;
   disconnect: () => Promise<void>;
   armUndoWallChangeToast: () => void;
+  ledless?: boolean;
 } | null;
+
+// The UIKit header path (iOS on Liquid Glass), off unless a test turns it on, and
+// the scroll-edge store the native header was handed.
+const nativeChrome = vi.hoisted(() => ({
+  enabled: false,
+  glassGradeRail: false,
+  measuredChromeHeight: 88,
+  scrollEdge: undefined as unknown,
+  centerActionWidths: undefined as { leading: number; trailing: number } | undefined,
+  titleHidden: undefined as boolean | undefined,
+  // The element handed to the header's title slot: a new one is a Stack.Screen options update.
+  centerContent: undefined as unknown,
+  // The native stack's frame: an iPhone 17 Pro.
+  frameWidth: 402,
+}));
 
 const ctrl = vi.hoisted(() => ({
   board: null as BoardLabelFields | null,
   bluetooth: null as BluetoothCtx,
   setBoardAngle: vi.fn(),
   variant: 'liquidGlass' as 'liquidGlass' | 'material',
-  wallClimb: null as { climbUuid: string; name: string } | null,
+  // The iOS 26 tab-bar accessory platter mounts (false on iOS 18 and Material).
+  nativeAccessory: true,
+  isPad: false,
+  widthClass: 'compact' as 'compact' | 'regular',
+  wallClimb: null as { climbUuid: string; name: string; sentAt: string } | null,
+  // The queue head's climb uuid.
+  queueHead: null as string | null,
+  boardId: 1 as number | null,
+  focused: true,
+  // The chrome's focus effects, kept so a test can run one and its cleanup: the
+  // cleanup is what the screen losing focus does.
+  focusEffects: [] as Array<() => void | (() => void)>,
 }));
 const haptics = vi.hoisted(() => ({ light: vi.fn(), selection: vi.fn() }));
 
@@ -30,18 +139,30 @@ type ViewMockProps = {
   children?: ReactNode;
   onLayout?: (event: { nativeEvent: { layout: { height: number } } }) => void;
   pointerEvents?: string;
+  testID?: string;
+  style?: unknown;
+  accessibilityRole?: string;
+  accessibilityLabel?: string;
 };
 vi.mock('react-native', () => ({
+  AppState: { currentState: 'active', addEventListener: () => ({ remove: vi.fn() }) },
+  Platform: { OS: 'ios' },
   Keyboard: { dismiss: vi.fn() },
   Pressable: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
     createElement('button', { onClick: onPress, 'data-scrim': 'true' }, children),
-  View: ({ children, onLayout, pointerEvents }: ViewMockProps) =>
+  View: ({ children, onLayout, pointerEvents, testID, style, accessibilityRole, accessibilityLabel }: ViewMockProps) =>
     createElement(
       'div',
       {
         'data-has-layout': onLayout ? 'true' : 'false',
+        'data-testid': testID,
         'data-pointer': pointerEvents ?? '',
-        onClick: onLayout ? () => onLayout({ nativeEvent: { layout: { height: 88 } } }) : undefined,
+        'data-role': accessibilityRole,
+        'data-a11y-label': accessibilityLabel,
+        'data-style': JSON.stringify(Object.assign({}, ...[style].flat(10).filter(Boolean))),
+        onClick: onLayout
+          ? () => onLayout({ nativeEvent: { layout: { height: nativeChrome.measuredChromeHeight } } })
+          : undefined,
       },
       children,
     ),
@@ -63,7 +184,14 @@ vi.mock('react-native-reanimated', () => ({
   useDerivedValue: () => ({ value: 0 }),
 }));
 
-vi.mock('expo-router', () => ({ useFocusEffect: () => {} }));
+const routerPush = vi.hoisted(() => vi.fn());
+vi.mock('expo-router', () => ({
+  useRouter: () => ({ push: routerPush }),
+  useIsFocused: () => ctrl.focused,
+  useFocusEffect: (effect: () => void | (() => void)) => {
+    ctrl.focusEffects.push(effect);
+  },
+}));
 vi.mock('expo-linear-gradient', () => ({
   LinearGradient: ({ children }: { children?: ReactNode }) =>
     createElement('div', { 'data-gradient': 'true' }, children),
@@ -73,7 +201,35 @@ vi.mock('react-native-safe-area-context', () => ({
 }));
 
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    t: (key: string, options?: { board?: string; count?: number; age?: string }) =>
+      key === 'mobile.listOptions.history'
+        ? `Board history, ${options?.board}`
+        : options?.age !== undefined
+          ? `${key}(${options.age})`
+          : options?.count === undefined
+            ? key
+            : `${key}:${options.count}`,
+  }),
+}));
+
+vi.mock('../../AppMenu', () => ({
+  AppMenu: ({
+    actions,
+    onSelectIndex,
+    accessibilityLabel,
+  }: {
+    actions: Array<{ label: string }>;
+    onSelectIndex: (index: number) => void;
+    accessibilityLabel: string;
+  }) =>
+    createElement(
+      'div',
+      { 'data-menu': accessibilityLabel },
+      actions.map((action, index) =>
+        createElement('button', { key: action.label, onClick: () => onSelectIndex(index) }, action.label),
+      ),
+    ),
 }));
 
 vi.mock('react-native-paper', () => ({
@@ -98,7 +254,11 @@ vi.mock('react-native-paper', () => ({
     }) =>
       createElement(
         'button',
-        { onClick: onPress, 'data-appbar-action': accessibilityLabel ?? '' },
+        {
+          onClick: onPress,
+          'data-appbar-action': accessibilityLabel ?? '',
+          'data-capsule': accessibilityLabel?.includes('•') ? accessibilityLabel : '',
+        },
         typeof icon === 'function' ? icon({ color: '#000', size: 24 }) : icon,
       ),
   },
@@ -136,7 +296,8 @@ vi.mock('react-native-paper', () => ({
   Badge: ({ children }: { children?: ReactNode }) => createElement('span', { 'data-paper-badge': 'true' }, children),
 }));
 
-vi.mock('@boardsesh/board-config', () => ({
+vi.mock('@boardsesh/board-config', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@boardsesh/board-config')>()),
   formatBoardDisplayName: (boardType: string) => `Display:${boardType}`,
 }));
 
@@ -148,6 +309,7 @@ vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({
     variant: ctrl.variant,
     systemColors: {
+      background: '#010203',
       label: '#000',
       fill: '#eee',
       secondaryLabel: '#888',
@@ -157,6 +319,7 @@ vi.mock('../../../providers/theme-provider', () => ({
       tertiaryBackground: '#f5f5f5',
     },
     brandColors: { primary: '#6D28D9', warning: '#FF9500' },
+    selection: { fill: '#SELECTION_WASH' },
   }),
 }));
 
@@ -179,22 +342,30 @@ vi.mock('../../../providers/ble-control-sheet-provider', () => ({
 // The shared lightbulb hook also reads board presence + session state. Inert
 // defaults here so the bulb follows local BLE (boardId null → session fallback,
 // which is false), keeping these tests focused on the chrome layout.
-vi.mock('../../../providers/board-presence-provider', () => ({ useBoardPresenceControls: () => ({ boardId: null }) }));
+vi.mock('../../../providers/board-presence-provider', () => ({
+  useBoardPresenceControls: () => ({ boardId: ctrl.boardId }),
+}));
+// The real Hide store, over the in-memory AsyncStorage stub, so these tests run
+// its "until a different climb goes up" rule and its persistence.
 vi.mock('../../../providers/queue-provider', () => ({
   useQueueSessionControls: () => ({ isSessionWallLit: false, sessionId: null }),
-  useActiveClimbUuid: () => null,
+  useActiveClimbUuid: () => ctrl.queueHead,
 }));
-// No distinct wall climb in these layout tests, so the centre capsule never mounts.
-vi.mock('../../queue-control/use-wall-or-queue-climb', () => ({ useWallClimbIfDistinct: () => ctrl.wallClimb }));
+vi.mock('../../../hooks/use-bottom-accessory', () => ({
+  useTabChrome: () => ({ nativeAccessory: ctrl.nativeAccessory && ctrl.variant === 'liquidGlass' }),
+}));
+// The wall-climb tests set `ctrl.wallClimb`; layout tests leave it null.
+vi.mock('../../queue-control/use-wall-or-queue-climb', () => ({ useLiveWallClimb: () => ctrl.wallClimb }));
 vi.mock('../../../lib/analytics', () => ({ track: vi.fn() }));
 
 vi.mock('../../../theme/tokens', () => ({
-  spacing: { 1: 4, 2: 8, 3: 12, 4: 16 },
+  spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24 },
   shadows: { sm: {} },
 }));
 
 vi.mock('../../../theme/layout', () => ({
-  glassSize: { standard: 48, capsule: 44 },
+  glassSize: { standard: 48, capsule: 44, inline: 44, bar: 38 },
+  TOOLBAR_SIDE_MARGIN: 16,
 }));
 
 vi.mock('../../../theme/colors', () => ({
@@ -280,31 +451,14 @@ vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', { 'data-text': 'true' }, children),
 }));
 
-type SearchHeaderMockProps = {
-  placeholder?: string;
-  initialValue?: string;
-  onChangeText?: (text: string) => void;
-  onFocus?: () => void;
-  onBlur?: () => void;
-};
-vi.mock('../../SearchHeader', () => ({
-  SearchHeader: forwardRef<SearchHeaderHandle, SearchHeaderMockProps>(function SearchHeaderMock(props, ref) {
-    useImperativeHandle(ref, () => ({
-      blur: () => props.onBlur?.(),
-      focus: () => props.onFocus?.(),
-      getText: () => props.initialValue ?? '',
-      setText: (text: string) => props.onChangeText?.(text),
-    }));
-    return createElement('input', {
-      'data-search-field': 'true',
-      'data-placeholder': props.placeholder ?? '',
-      onFocus: props.onFocus,
-      onBlur: props.onBlur,
-    });
-  }),
+vi.mock('../../grade', () => ({
+  GradeRangeRail: ({ recenterKey, glass }: { recenterKey?: number; glass?: boolean }) =>
+    createElement('div', {
+      'data-grade-rail': 'true',
+      'data-glass': String(glass),
+      'data-recenter-key': String(recenterKey),
+    }),
 }));
-
-vi.mock('../../grade', () => ({ GradeRangeRail: () => createElement('div', { 'data-grade-rail': 'true' }) }));
 
 type AngleSelectorMockProps = {
   visible: boolean;
@@ -349,11 +503,48 @@ vi.mock('../../user-drawer/UserAvatarToolbarAction', () => ({
 // marker so this test can assert the wallClimb → capsule wiring (glass
 // centerContent / Material under-app-bar row).
 vi.mock('../../queue-control/WallStatusCapsule', () => ({
-  WallStatusCapsule: ({ climb }: { climb: { climbUuid: string } }) =>
-    createElement('div', { 'data-wall-capsule': climb.climbUuid }),
+  WallStatusCapsule: ({
+    climb,
+    presentation,
+    occurrenceKey,
+    onDismiss,
+  }: {
+    climb: { climbUuid: string };
+    presentation: { kind: string; ageLabel?: string; ageByline?: string };
+    occurrenceKey: string;
+    onDismiss: (occurrenceKey: string) => void;
+  }) =>
+    createElement('button', {
+      'data-wall-capsule': climb.climbUuid,
+      'data-presentation': presentation.kind,
+      'data-age': presentation.ageLabel,
+      'data-age-byline': presentation.ageByline,
+      onClick: () => onDismiss(occurrenceKey),
+    }),
+}));
+// Same for "You have the board": board-held-capsule.test.tsx covers its body.
+vi.mock('../../queue-control/BoardHeldCapsule', () => ({
+  BoardHeldCapsule: ({
+    ledless,
+    dismiss,
+  }: {
+    ledless: boolean;
+    dismiss?: { occurrenceKey: string; onDismiss: (occurrenceKey: string) => void };
+  }) =>
+    createElement('button', {
+      'data-board-held-capsule': ledless ? 'ledless' : 'lit',
+      'data-dismiss': dismiss?.occurrenceKey ?? '',
+      onClick: () => dismiss?.onDismiss(dismiss.occurrenceKey),
+    }),
 }));
 
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { ClimbTopChrome } from '../ClimbTopChrome';
+import { createScrollEdgeBackdrop } from '../../../hooks/use-scroll-edge-backdrop';
+import {
+  hydrateWallCapsuleDismissalsForTests,
+  resetWallCapsuleDismissalsForTests,
+} from '../../../lib/wall-capsule-dismissal-store';
 
 function makeProps(over: Partial<Parameters<typeof ClimbTopChrome>[0]> = {}) {
   return {
@@ -362,13 +553,8 @@ function makeProps(over: Partial<Parameters<typeof ClimbTopChrome>[0]> = {}) {
     onCreate: vi.fn(),
     onOpenBoardDetail: vi.fn(),
     onHeightChange: vi.fn(),
-    searchFieldRef: { current: null } as RefObject<SearchHeaderHandle | null>,
-    searchInitialValue: '',
-    searchPlaceholder: 'Search climbs',
-    onSearchChange: vi.fn(),
-    onSearchFocus: vi.fn(),
-    onSearchBlur: vi.fn(),
     onCloseGrade: vi.fn(),
+    onDismissGradePopover: vi.fn(),
     ...over,
   };
 }
@@ -376,12 +562,16 @@ function makeProps(over: Partial<Parameters<typeof ClimbTopChrome>[0]> = {}) {
 const createAction = (root: HTMLElement) =>
   root.querySelector('[data-pressable="mobile.create.fab.ariaLabel"]') as HTMLButtonElement | null;
 const angleAction = (root: HTMLElement) =>
-  root.querySelector('[data-pressable="mobile.angleSelector.title"]') as HTMLButtonElement | null;
+  root.querySelector('[data-pressable="mobile.angleSelector.buttonAria"]') as HTMLButtonElement | null;
 const lightbulb = (root: HTMLElement) =>
   (root.querySelector('[data-pressable="ble.connectBoard"]') ??
     root.querySelector('[data-pressable="lightControl.disconnect"]')) as HTMLButtonElement | null;
+// The board history capsule. Material's title ("Climbs" over the board) also reads
+// with a "•", so it is excluded by its label.
 const capsule = (root: HTMLElement) =>
-  root.querySelector('[data-capsule]:not([data-capsule=""])') as HTMLButtonElement | null;
+  root.querySelector(
+    '[data-capsule]:not([data-capsule=""]):not([data-pressable^="mobile.nav."])',
+  ) as HTMLButtonElement | null;
 
 const typedBoard: BoardLabelFields = {
   name: '',
@@ -403,14 +593,44 @@ const namedBoard: BoardLabelFields = {
 };
 
 describe('ClimbTopChrome', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     ctrl.board = null;
     ctrl.bluetooth = null;
     ctrl.variant = 'liquidGlass';
+    ctrl.nativeAccessory = true;
+    ctrl.isPad = false;
+    ctrl.widthClass = 'compact';
     ctrl.wallClimb = null;
+    ctrl.queueHead = null;
+    ctrl.boardId = 1;
+    // A running app read its stored Hides long ago; the hydration test resets this.
+    await AsyncStorage.clear();
+    resetWallCapsuleDismissalsForTests();
+    await hydrateWallCapsuleDismissalsForTests();
+    ctrl.focused = true;
+    ctrl.focusEffects.length = 0;
+    routerPush.mockClear();
     ctrl.setBoardAngle.mockClear();
+    nativeChrome.enabled = false;
+    nativeChrome.glassGradeRail = false;
+    nativeChrome.measuredChromeHeight = 88;
+    nativeChrome.scrollEdge = undefined;
+    nativeChrome.centerActionWidths = undefined;
+    nativeChrome.titleHidden = undefined;
+    nativeChrome.centerContent = undefined;
     haptics.light.mockClear();
     haptics.selection.mockClear();
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  // The blur behind the floating filter rows shows only while rows are under
+  // them. The list says so through a store, which reaches the header untouched.
+  it("hands the UIKit header the screen's scroll-edge store", () => {
+    nativeChrome.enabled = true;
+    const scrollEdge = createScrollEdgeBackdrop();
+    render(<ClimbTopChrome {...makeProps({ scrollEdge })} />);
+    expect(nativeChrome.scrollEdge).toBe(scrollEdge);
   });
 
   it('renders no board capsule when there is no active board', () => {
@@ -421,19 +641,19 @@ describe('ClimbTopChrome', () => {
   it('builds a typed-board label from display name, size, and angle', () => {
     ctrl.board = typedBoard;
     const { container } = render(<ClimbTopChrome {...makeProps()} />);
-    expect(capsule(container)?.getAttribute('data-capsule')).toBe('Display:kilter • 12x12 • 40°');
+    expect(capsule(container)?.getAttribute('data-capsule')).toBe('Board history, Display:kilter • 12x12 • 40°');
   });
 
   it('leads with the custom board name when the board is named', () => {
     ctrl.board = namedBoard;
     const { container } = render(<ClimbTopChrome {...makeProps()} />);
-    expect(capsule(container)?.getAttribute('data-capsule')).toBe('Garage Wall • 25°');
+    expect(capsule(container)?.getAttribute('data-capsule')).toBe('Board history, Garage Wall • 25°');
   });
 
   it('omits the angle segment when angle is absent', () => {
     ctrl.board = { ...typedBoard, angle: null as unknown as number };
     const { container } = render(<ClimbTopChrome {...makeProps()} />);
-    expect(capsule(container)?.getAttribute('data-capsule')).toBe('Display:kilter • 12x12');
+    expect(capsule(container)?.getAttribute('data-capsule')).toBe('Board history, Display:kilter • 12x12');
   });
 
   it('hides the create FAB unless canCreate is true', () => {
@@ -451,33 +671,445 @@ describe('ClimbTopChrome', () => {
     expect(onCreate).toHaveBeenCalledTimes(1);
   });
 
-  it('renders the angle selector in the right toolbar group (with the board glyph)', () => {
+  it('shows the angle as a one-tap toolbar button before the history glyph, not a menu row', () => {
     ctrl.board = typedBoard;
     const { container } = render(<ClimbTopChrome {...makeProps({ canCreate: true })} />);
-    expect(angleAction(container)).not.toBeNull();
-    expect(angleAction(container)?.textContent).toBe('40°');
+    const angle = angleAction(container);
+    expect(angle?.textContent).toBe('40°');
+    const history = capsule(container);
+    expect(history?.querySelector('[data-icon="history"]')).not.toBeNull();
+    expect(angle?.compareDocumentPosition(history!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    const menuRows = [...container.querySelectorAll('[data-menu] button')].map((row) => row.textContent);
+    expect(menuRows).toEqual([
+      'mobile.listOptions.myClimbs',
+      'mobile.listOptions.viewOptions',
+      'mobile.boardPresence.switchBoard',
+    ]);
+  });
+
+  it.each([
+    ['an adjustable board', typedBoard, 3],
+    ['a fixed-angle board', { ...typedBoard, isAngleAdjustable: false }, 2],
+    ['no board', null, 1],
+  ] as const)('reserves native slots for angle, history and the menu with %s', (_label, board, slots) => {
+    nativeChrome.enabled = true;
+    ctrl.board = board;
+    render(<ClimbTopChrome {...makeProps()} />);
+    expect(nativeChrome.centerActionWidths?.trailing).toBe(slots * 38);
+  });
+
+  // A fixed-angle wall hides its angle button, and UIKit's bar gives that 38pt
+  // slot to the on-the-wall capsule. Avatar + create lead, zero insets.
+  it.each([
+    ['an adjustable board', typedBoard, { leading: 76, trailing: 114 }, '140'],
+    ['a fixed-angle board', { ...typedBoard, isAngleAdjustable: false }, { leading: 76, trailing: 76 }, '178'],
+  ] as const)(
+    'sizes the native on-the-wall capsule from the real trailing slots with %s',
+    (_label, board, widths, max) => {
+      nativeChrome.enabled = true;
+      ctrl.board = board;
+      ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: new Date().toISOString() };
+      const { container } = render(<ClimbTopChrome {...makeProps({ canCreate: true })} />);
+      expect(nativeChrome.centerActionWidths).toEqual(widths);
+      const center = container.querySelector('[data-native-center]');
+      expect(center?.querySelector('[data-wall-capsule="wall-9"]')).not.toBeNull();
+      expect(center?.getAttribute('data-max-width')).toBe(max);
+      const trailing = container.querySelector<HTMLElement>('[data-native-trailing]')!;
+      expect(angleAction(trailing) == null).toBe(board.isAngleAdjustable === false);
+    },
+  );
+
+  it('gives the capsule exactly the 38pt a fixed-angle wall frees', () => {
+    nativeChrome.enabled = true;
+    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: new Date().toISOString() };
+    const centerWidth = (board: BoardLabelFields) => {
+      ctrl.board = board;
+      const { container, unmount } = render(<ClimbTopChrome {...makeProps({ canCreate: true })} />);
+      const width = Number(container.querySelector('[data-native-center]')?.getAttribute('data-max-width'));
+      unmount();
+      return width;
+    };
+    expect(centerWidth({ ...typedBoard, isAngleAdjustable: false }) - centerWidth(typedBoard)).toBe(38);
   });
 
   it('mounts the "On the wall" capsule (glass centre slot) when a distinct wall climb is live', () => {
     ctrl.board = typedBoard;
-    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes' };
+    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: new Date().toISOString() };
     const { container } = render(<ClimbTopChrome {...makeProps()} />);
     expect(container.querySelector('[data-wall-capsule="wall-9"]')).not.toBeNull();
   });
 
-  it('omits the "On the wall" capsule when there is no distinct wall climb', () => {
+  it.each(['liquidGlass', 'material'] as const)('labels a recent disconnected climb as history on %s', (variant) => {
+    vi.useFakeTimers();
+    vi.setSystemTime('2026-10-31T10:20:00Z');
+    ctrl.variant = variant;
+    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: '2026-10-31T10:00:00Z' };
+    const { container } = render(<ClimbTopChrome {...makeProps()} />);
+    const capsule = container.querySelector('[data-wall-capsule]');
+    expect(capsule?.getAttribute('data-presentation')).toBe('history');
+    expect(capsule?.getAttribute('data-age')).toBe('mobile.boardPresence.litAgoMinutes:20');
+    // The iOS capsule's line under the name.
+    expect(capsule?.getAttribute('data-age-byline')).toBe(
+      'mobile.boardPresence.litAgoByline(mobile.boardPresence.litAgoMinutes:20)',
+    );
+    act(() => {
+      vi.advanceTimersByTime(60_000);
+    });
+    expect(capsule?.getAttribute('data-age')).toBe('mobile.boardPresence.litAgoMinutes:21');
+    expect(capsule?.getAttribute('data-age-byline')).toBe(
+      'mobile.boardPresence.litAgoByline(mobile.boardPresence.litAgoMinutes:21)',
+    );
+  });
+
+  it('expires a mounted history capsule at one hour without another presence event', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime('2026-10-31T10:59:00Z');
+    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: '2026-10-31T10:00:00Z' };
+    const { container } = render(<ClimbTopChrome {...makeProps()} />);
+    expect(container.querySelector('[data-wall-capsule]')).not.toBeNull();
+    act(() => {
+      vi.advanceTimersByTime(60_001);
+    });
+    expect(container.querySelector('[data-wall-capsule]')).toBeNull();
+  });
+
+  it('keeps the capsule hidden until dismissal hydration completes, and after dismissal', async () => {
+    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: new Date().toISOString() };
+    resetWallCapsuleDismissalsForTests();
+    const { container } = render(<ClimbTopChrome {...makeProps()} />);
+    expect(container.querySelector('[data-wall-capsule]')).toBeNull();
+    await act(async () => {});
+    fireEvent.click(container.querySelector('[data-wall-capsule]')!);
+    expect(container.querySelector('[data-wall-capsule]')).toBeNull();
+  });
+
+  it('settles history/live presentation with its climb while the player covers the header', () => {
+    vi.useFakeTimers();
+    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: new Date().toISOString() };
+    const props = makeProps();
+    const { container, rerender } = render(<ClimbTopChrome {...props} />);
+    expect(container.querySelector('[data-wall-capsule]')?.getAttribute('data-presentation')).toBe('history');
+    ctrl.focused = false;
+    rerender(<ClimbTopChrome {...makeProps()} />);
+    ctrl.wallClimb = { climbUuid: 'wall-10', name: 'New climb', sentAt: new Date().toISOString() };
+    ctrl.bluetooth = {
+      isConnected: true,
+      connect: vi.fn(),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      armUndoWallChangeToast: vi.fn(),
+    };
+    rerender(<ClimbTopChrome {...makeProps()} />);
+    expect(container.querySelector('[data-wall-capsule]')?.getAttribute('data-wall-capsule')).toBe('wall-9');
+    expect(container.querySelector('[data-wall-capsule]')?.getAttribute('data-presentation')).toBe('history');
+    ctrl.focused = true;
+    rerender(<ClimbTopChrome {...makeProps()} />);
+    expect(container.querySelector('[data-wall-capsule]')?.getAttribute('data-wall-capsule')).toBe('wall-9');
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(container.querySelector('[data-wall-capsule]')?.getAttribute('data-wall-capsule')).toBe('wall-10');
+    expect(container.querySelector('[data-wall-capsule]')?.getAttribute('data-presentation')).toBe('live');
+  });
+
+  // #7095, QA #147: past an hour with no live link the capsule hides; a live
+  // link keeps it, whatever the age.
+  it('hides the "On the wall" capsule past an hour with no live link, and keeps it with one', () => {
+    ctrl.board = typedBoard;
+    ctrl.wallClimb = {
+      climbUuid: 'wall-9',
+      name: 'Angel Eyes',
+      sentAt: new Date(Date.now() - 61 * 60_000).toISOString(),
+    };
+    const stale = render(<ClimbTopChrome {...makeProps()} />);
+    expect(stale.container.querySelector('[data-wall-capsule]')).toBeNull();
+    stale.unmount();
+    ctrl.bluetooth = {
+      isConnected: true,
+      connect: vi.fn(),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      armUndoWallChangeToast: vi.fn(),
+    };
+    const linked = render(<ClimbTopChrome {...makeProps()} />);
+    expect(linked.container.querySelector('[data-wall-capsule="wall-9"]')).not.toBeNull();
+  });
+
+  it('omits the "On the wall" capsule when there is no wall climb', () => {
     ctrl.board = typedBoard;
     ctrl.wallClimb = null;
     const { container } = render(<ClimbTopChrome {...makeProps()} />);
     expect(container.querySelector('[data-wall-capsule]')).toBeNull();
   });
 
-  it('mounts the "On the wall" capsule under the Material app bar when a wall climb is live', () => {
+  // Owner decision 2026-11-02: under the hour (or with a live link) the climb on
+  // the wall always shows, and only Hide takes it away.
+  describe('always shows the climb on the wall', () => {
+    const connectedBoard: BluetoothCtx = {
+      isConnected: true,
+      connect: vi.fn(),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      armUndoWallChangeToast: vi.fn(),
+    };
+    const lit = (climbUuid: string, minutesAgo = 5) => ({
+      climbUuid,
+      name: climbUuid,
+      sentAt: new Date(Date.now() - minutesAgo * 60_000).toISOString(),
+    });
+    const wallCapsule = (root: HTMLElement) => root.querySelector('[data-wall-capsule]');
+    const heldCapsule = (root: HTMLElement) => root.querySelector('[data-board-held-capsule]');
+
+    it('shows the wall climb when it is your own queue head', () => {
+      ctrl.queueHead = 'wall-9';
+      ctrl.wallClimb = lit('wall-9');
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(wallCapsule(container)?.getAttribute('data-wall-capsule')).toBe('wall-9');
+    });
+
+    it.each(['liquidGlass', 'material'] as const)(
+      'shows your own queue head on the wall with no link on %s (59 minutes old)',
+      (variant) => {
+        ctrl.variant = variant;
+        ctrl.queueHead = 'wall-9';
+        ctrl.wallClimb = lit('wall-9', 59);
+        const { container } = render(<ClimbTopChrome {...makeProps()} />);
+        expect(wallCapsule(container)?.getAttribute('data-presentation')).toBe('history');
+      },
+    );
+
+    it.each([
+      ['Material', { variant: 'material' as const }],
+      ['iOS 18', { nativeAccessory: false }],
+      ['a regular-width iPad', { isPad: true, widthClass: 'regular' as const }],
+    ])('shows it live while this phone holds the link on %s, where there is no held cue', (_layout, layout) => {
+      Object.assign(ctrl, layout);
+      ctrl.bluetooth = connectedBoard;
+      ctrl.queueHead = 'wall-9';
+      ctrl.wallClimb = lit('wall-9', 180);
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(wallCapsule(container)?.getAttribute('data-presentation')).toBe('live');
+      expect(heldCapsule(container)).toBeNull();
+    });
+
+    it('draws it in the held skin with its Hide while you hold the board on iPhone', () => {
+      ctrl.bluetooth = connectedBoard;
+      ctrl.queueHead = 'wall-9';
+      ctrl.wallClimb = lit('wall-9');
+      const { container, rerender } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(wallCapsule(container)).toBeNull();
+      const occurrenceKey = JSON.stringify([1, 'wall-9', ctrl.wallClimb.sentAt]);
+      expect(heldCapsule(container)?.getAttribute('data-dismiss')).toBe(occurrenceKey);
+      fireEvent.click(heldCapsule(container)!);
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      // Hidden means hidden: the bare "You have the board" cue does not stand in.
+      expect(heldCapsule(container)).toBeNull();
+      expect(wallCapsule(container)).toBeNull();
+    });
+
+    // Review: the held capsule draws the queue head without presence, so a feed
+    // drop (or "Turn off all lights") must not bring the hidden climb back in it.
+    it('keeps a hidden climb out of the held skin while the presence feed is down', () => {
+      ctrl.bluetooth = connectedBoard;
+      ctrl.queueHead = 'wall-9';
+      ctrl.wallClimb = lit('wall-9');
+      const { container, rerender } = render(<ClimbTopChrome {...makeProps()} />);
+      fireEvent.click(heldCapsule(container)!);
+      ctrl.wallClimb = null;
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(heldCapsule(container)).toBeNull();
+      expect(wallCapsule(container)).toBeNull();
+      // The feed back with the same climb: still hidden.
+      ctrl.wallClimb = lit('wall-9', 0);
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(heldCapsule(container)).toBeNull();
+      // The climber moves on: the next queue head is drawn, with no Hide while the feed is down.
+      ctrl.wallClimb = null;
+      ctrl.queueHead = 'queue-next';
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(heldCapsule(container)?.getAttribute('data-dismiss')).toBe('');
+    });
+
+    it('keeps the Hide across a cold launch', async () => {
+      ctrl.wallClimb = lit('wall-9');
+      const first = render(<ClimbTopChrome {...makeProps()} />);
+      fireEvent.click(wallCapsule(first.container)!);
+      await act(async () => {});
+      first.unmount();
+      resetWallCapsuleDismissalsForTests();
+      const relaunched = render(<ClimbTopChrome {...makeProps()} />);
+      await act(async () => {});
+      expect(wallCapsule(relaunched.container)).toBeNull();
+    });
+
+    it('builds no new title view when only the queue head moves', () => {
+      nativeChrome.enabled = true;
+      ctrl.queueHead = 'queue-a';
+      ctrl.wallClimb = lit('wall-9');
+      const { rerender } = render(<ClimbTopChrome {...makeProps()} />);
+      const before = nativeChrome.centerContent;
+      expect(before).toBeDefined();
+      ctrl.queueHead = 'queue-b';
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(nativeChrome.centerContent).toBe(before);
+    });
+
+    it('keeps the bare held cue without a Hide while nothing is lit', () => {
+      ctrl.bluetooth = connectedBoard;
+      ctrl.queueHead = 'queue-head';
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(heldCapsule(container)?.getAttribute('data-dismiss')).toBe('');
+    });
+
+    it('stays hidden after Hide until a different climb goes up', () => {
+      const first = lit('wall-9', 3);
+      ctrl.wallClimb = first;
+      const { container, rerender } = render(<ClimbTopChrome {...makeProps()} />);
+      fireEvent.click(wallCapsule(container)!);
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(wallCapsule(container)).toBeNull();
+      // The same climb reported again with a new lit time (a reconnect, the iPad
+      // taking the board, a mirror flip) stays hidden.
+      ctrl.wallClimb = lit('wall-9', 2);
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(wallCapsule(container)).toBeNull();
+      ctrl.wallClimb = lit('wall-10', 1);
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(wallCapsule(container)?.getAttribute('data-wall-capsule')).toBe('wall-10');
+      // Once a different climb went up, the first one coming back shows again.
+      ctrl.wallClimb = lit('wall-9', 0);
+      rerender(<ClimbTopChrome {...makeProps()} />);
+      expect(wallCapsule(container)?.getAttribute('data-wall-capsule')).toBe('wall-9');
+    });
+  });
+
+  describe('"You have the board" capsule', () => {
+    const connectedBoard = (over: Partial<NonNullable<BluetoothCtx>> = {}): BluetoothCtx => ({
+      isConnected: true,
+      connect: vi.fn(),
+      disconnect: vi.fn().mockResolvedValue(undefined),
+      armUndoWallChangeToast: vi.fn(),
+      ...over,
+    });
+
+    it('takes the centre slot while this climber holds the board and the wall shows their climb', () => {
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard();
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      const capsule = container.querySelector('[data-board-held-capsule]');
+      expect(capsule?.getAttribute('data-board-held-capsule')).toBe('lit');
+    });
+
+    it('stays out while the board is free', () => {
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard({ isConnected: false });
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(container.querySelector('[data-board-held-capsule]')).toBeNull();
+    });
+
+    it('gives way to "On the wall" when the wall lights a different climb', () => {
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard();
+      ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: new Date().toISOString() };
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(container.querySelector('[data-wall-capsule="wall-9"]')).not.toBeNull();
+      expect(container.querySelector('[data-board-held-capsule]')).toBeNull();
+    });
+
+    it('is Liquid Glass only: the Material bar keeps its bulb on screen', () => {
+      ctrl.variant = 'material';
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard();
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(container.querySelector('[data-board-held-capsule]')).toBeNull();
+    });
+
+    it('stays out on iOS 18, where the floating bar keeps its bulb on screen', () => {
+      ctrl.nativeAccessory = false;
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard();
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(container.querySelector('[data-board-held-capsule]')).toBeNull();
+    });
+
+    it('stays out on a regular-width iPad, where the accessory platter keeps its bulb on screen', () => {
+      ctrl.isPad = true;
+      ctrl.widthClass = 'regular';
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard({ ledless: true });
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(container.querySelector('[data-board-held-capsule]')).toBeNull();
+    });
+
+    it('keeps the cue on an iPad in a narrow Split View, which has the bottom bar', () => {
+      ctrl.isPad = true;
+      ctrl.widthClass = 'compact';
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard();
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(container.querySelector('[data-board-held-capsule]')).not.toBeNull();
+    });
+
+    it('passes the no-lights flag so the capsule never claims lit LEDs', () => {
+      ctrl.board = typedBoard;
+      ctrl.bluetooth = connectedBoard({ ledless: true });
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(container.querySelector('[data-board-held-capsule]')?.getAttribute('data-board-held-capsule')).toBe(
+        'ledless',
+      );
+    });
+  });
+
+  it('mounts the "On the wall" capsule in the Material app bar\'s title slot, not as a band under it', () => {
     ctrl.variant = 'material';
     ctrl.board = typedBoard;
-    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes' };
+    ctrl.wallClimb = { climbUuid: 'wall-9', name: 'Angel Eyes', sentAt: new Date().toISOString() };
     const { container } = render(<ClimbTopChrome {...makeProps()} />);
-    expect(container.querySelector('[data-wall-capsule="wall-9"]')).not.toBeNull();
+    const pill = container.querySelector('[data-appbar-header] [data-wall-capsule="wall-9"]');
+    expect(pill).not.toBeNull();
+    expect(container.querySelectorAll('[data-wall-capsule]')).toHaveLength(1);
+    const slot = pill?.parentElement;
+    expect(JSON.parse(slot?.getAttribute('data-style') ?? '{}')).toMatchObject({ flex: 1, minWidth: 0 });
+    // TalkBack still reads "Climbs" while the pill shows: the header sits under it
+    // in the same slot and takes no touches.
+    const header = slot?.querySelector('[data-role="header"]');
+    expect(header?.getAttribute('data-a11y-label')).toBe('mobile.nav.climbs');
+    expect(header?.getAttribute('data-pointer')).toBe('none');
+    // Drawn first, so the pill sits on top of it.
+    expect(slot?.firstElementChild).toBe(header);
+  });
+
+  describe('Material create', () => {
+    const appBarCreate = (root: HTMLElement) =>
+      root.querySelector('[data-appbar-action="mobile.create.fab.ariaLabel"]') as HTMLButtonElement | null;
+    const menuRows = (root: HTMLElement) =>
+      [...root.querySelectorAll('[data-menu="mobile.listOptions.title"] button')].map((row) => row.textContent);
+
+    beforeEach(() => {
+      ctrl.variant = 'material';
+      ctrl.board = typedBoard;
+    });
+
+    it("moves + into ⋮'s first row on a compact width, as on iOS", () => {
+      const onCreate = vi.fn();
+      const { container } = render(<ClimbTopChrome {...makeProps({ canCreate: true, onCreate })} />);
+      expect(appBarCreate(container)).toBeNull();
+      expect(menuRows(container)[0]).toBe('mobile.create.fab.ariaLabel');
+      fireEvent.click(container.querySelector('[data-menu="mobile.listOptions.title"] button')!);
+      expect(onCreate).toHaveBeenCalledOnce();
+    });
+
+    it('keeps + in the bar on a regular-width tablet', () => {
+      ctrl.widthClass = 'regular';
+      const onCreate = vi.fn();
+      const { container } = render(<ClimbTopChrome {...makeProps({ canCreate: true, onCreate })} />);
+      expect(menuRows(container)).not.toContain('mobile.create.fab.ariaLabel');
+      fireEvent.click(appBarCreate(container)!);
+      expect(onCreate).toHaveBeenCalledOnce();
+    });
+
+    it('offers create nowhere when the climber cannot create', () => {
+      const { container } = render(<ClimbTopChrome {...makeProps()} />);
+      expect(appBarCreate(container)).toBeNull();
+      expect(menuRows(container)).not.toContain('mobile.create.fab.ariaLabel');
+    });
   });
 
   it('hides the angle selector for fixed-angle boards', () => {
@@ -505,25 +1137,30 @@ describe('ClimbTopChrome', () => {
     expect(haptics.light).toHaveBeenCalledTimes(1);
   });
 
-  it('renders the custom search field without top-row filter chrome', () => {
-    const { container } = render(<ClimbTopChrome {...makeProps()} />);
-    expect(lightbulb(container)).toBeNull();
-    expect(container.querySelector('[data-search-field]')).not.toBeNull();
-    expect(container.querySelector('[data-pressable^="mobile.search.filters"]')).toBeNull();
+  // No search field on any variant: the climb-name search is the Filters sheet's
+  // first row, like the Logbook.
+  it.each([
+    ['fallback Liquid Glass', 'liquidGlass', false],
+    ['native Liquid Glass', 'liquidGlass', true],
+    ['Material', 'material', false],
+  ] as const)('renders no search field on %s', (_label, variant, nativeHeader) => {
+    ctrl.variant = variant;
+    nativeChrome.enabled = nativeHeader;
+    const { container } = render(<ClimbTopChrome {...makeProps({ onOpenFilters: vi.fn() })} />);
+    expect(container.querySelector('input')).toBeNull();
+    expect(container.querySelector('[data-placeholder]')).toBeNull();
   });
 
-  it('renders the Material filter affordance next to the custom search field', () => {
+  it('tells the native header to draw no title: the tab names the screen', () => {
+    nativeChrome.enabled = true;
+    render(<ClimbTopChrome {...makeProps()} />);
+    expect(nativeChrome.titleHidden).toBe(true);
+  });
+
+  it('keeps the Material filter button when the persistent chip row is off', () => {
     ctrl.variant = 'material';
     const { container } = render(<ClimbTopChrome {...makeProps({ onOpenFilters: vi.fn() })} />);
-    expect(container.querySelector('[data-search-field]')).not.toBeNull();
     expect(container.querySelector('[data-glass-icon="filter"][data-label="mobile.search.filters"]')).not.toBeNull();
-  });
-
-  it('native search mode leaves text search in the stack header and does not render filter chrome', () => {
-    const { container } = render(<ClimbTopChrome {...makeProps({ searchMode: 'native' })} />);
-    expect(container.querySelector('[data-search-field]')).toBeNull();
-    expect(container.querySelector('[data-gradepill]')).toBeNull();
-    expect(container.querySelector('[data-pressable^="mobile.search.filters"]')).toBeNull();
   });
 
   // The climbs tab suppresses the top-chrome BLE lightbulb in BOTH variants:
@@ -556,9 +1193,29 @@ describe('ClimbTopChrome', () => {
     expect(lightbulb(container)).toBeNull();
   });
 
-  // The Material angle control moved out of ClimbTopChrome into the persistent filter
-  // chip row (FilterChipRow.android), which this component test doesn't render — the
-  // angle chip is covered by the Android screenshot QA, not here.
+  it.each([false, true])('keeps Material angle beside the avatar with persistent chips %s', (showPersistentChips) => {
+    ctrl.variant = 'material';
+    ctrl.board = typedBoard;
+    const { container } = render(<ClimbTopChrome {...makeProps({ showPersistentChips })} />);
+    const angle = container.querySelector('[data-appbar-action^="mobile.angleSelector"]')!;
+    expect(angle).not.toBeNull();
+    expect(angle.nextElementSibling?.querySelector('[data-role="header"]')).not.toBeNull();
+    expect(container.querySelectorAll('[data-appbar-action^="mobile.angleSelector"]')).toHaveLength(1);
+    fireEvent.click(angle);
+    expect(container.querySelector('[data-angle-selector]')?.getAttribute('data-angle-selector')).toBe('kilter:1:40');
+    fireEvent.click(container.querySelector('[data-angle-selector]')!);
+    expect(ctrl.setBoardAngle).toHaveBeenCalledWith(typedBoard, 45);
+  });
+
+  it.each([
+    ['fixed angle', { ...typedBoard, isAngleAdjustable: false }],
+    ['missing board', null],
+  ] as const)('omits the Material angle action for %s', (_label, board) => {
+    ctrl.variant = 'material';
+    ctrl.board = board;
+    const { container } = render(<ClimbTopChrome {...makeProps()} />);
+    expect(container.querySelector('[data-appbar-action^="mobile.angleSelector"]')).toBeNull();
+  });
 
   // Regression guard for the Android tap-passthrough fix: the Material band must
   // be pointerEvents="auto" (NOT box-none) so RNGH's Android hit-test treats the
@@ -568,7 +1225,7 @@ describe('ClimbTopChrome', () => {
     ctrl.variant = 'material';
     ctrl.board = typedBoard;
     const { container } = render(<ClimbTopChrome {...makeProps()} />);
-    const materialContainer = container.querySelector('[data-has-layout="true"]') as HTMLElement;
+    const materialContainer = container.querySelector('[data-testid="climb-material-chrome"]') as HTMLElement;
     expect(materialContainer).not.toBeNull();
     expect(materialContainer.getAttribute('data-pointer')).toBe('auto');
   });
@@ -582,7 +1239,116 @@ describe('ClimbTopChrome', () => {
     expect(onHeightChange).toHaveBeenCalledWith(88);
   });
 
-  it('renders the Material branch with the board switcher, search, and grade controls', () => {
+  it.each([
+    ['Material', 'material', false],
+    ['fallback Liquid Glass', 'liquidGlass', false],
+    ['native Liquid Glass', 'liquidGlass', true],
+  ] as const)('reserves the disclosed grade row only while open on %s', (_label, variant, nativeHeader) => {
+    ctrl.variant = variant;
+    nativeChrome.enabled = nativeHeader;
+    nativeChrome.glassGradeRail = nativeHeader;
+    const onHeightChange = vi.fn();
+    const props = makeProps({
+      onHeightChange,
+      gradeBound: { minGradeId: 10, maxGradeId: 12 },
+      onGradeChange: vi.fn(),
+      showPersistentChips: true,
+      filterChrome: <span>Persistent filter tokens</span>,
+    });
+    const { container, rerender, getByText } = render(<ClimbTopChrome {...props} />);
+    const measure = () => container.querySelector('[data-has-layout="true"]')!;
+    // The chips render even with no search field above them (Material used to nest
+    // them inside the search branch).
+    const filterTokens = getByText('Persistent filter tokens');
+    expect(container.querySelector('input')).toBeNull();
+    fireEvent.click(measure());
+    expect(onHeightChange).toHaveBeenLastCalledWith(88);
+
+    rerender(<ClimbTopChrome {...props} gradeRailVisible />);
+    const rail = container.querySelector('[data-grade-rail="true"]')!;
+    expect(rail).not.toBeNull();
+    expect(rail.getAttribute('data-glass')).toBe(String(nativeHeader));
+    expect(measure().contains(rail)).toBe(true);
+    expect(measure().contains(filterTokens)).toBe(true);
+    expect(getByText('Persistent filter tokens')).toBe(filterTokens);
+    expect(JSON.parse(rail.parentElement?.getAttribute('data-style') ?? '{}')).not.toHaveProperty('position');
+    // Native onLayout supplies the expanded geometry; jsdom has no Yoga layout.
+    nativeChrome.measuredChromeHeight = 140;
+    fireEvent.click(measure());
+    expect(onHeightChange).toHaveBeenLastCalledWith(140);
+    if (variant === 'liquidGlass') {
+      const railCarrier = container.querySelector('[data-testid="climb-grade-rail"]');
+      expect(railCarrier?.contains(rail)).toBe(true);
+      expect(JSON.parse(railCarrier?.getAttribute('data-style') ?? '{}').backgroundColor).toBe(
+        nativeHeader ? undefined : '#010203',
+      );
+      expect(railCarrier?.contains(getByText('Persistent filter tokens'))).toBe(false);
+    }
+
+    rerender(<ClimbTopChrome {...props} />);
+    expect(container.querySelector('[data-grade-rail="true"]')).toBeNull();
+    expect(getByText('Persistent filter tokens')).toBe(filterTokens);
+    nativeChrome.measuredChromeHeight = 88;
+    fireEvent.click(measure());
+    expect(onHeightChange).toHaveBeenLastCalledWith(88);
+  });
+
+  it('runs the Material chip row and grade rail full-bleed so their own inset is the only gutter', () => {
+    ctrl.variant = 'material';
+    const { container, getByText } = render(
+      <ClimbTopChrome
+        {...makeProps({
+          gradeRailVisible: true,
+          gradeBound: { minGradeId: 10, maxGradeId: 12 },
+          onGradeChange: vi.fn(),
+          showPersistentChips: true,
+          filterChrome: (
+            <>
+              <span>Persistent filter chips</span>
+              <span>Sheet-only filter tokens</span>
+            </>
+          ),
+        })}
+      />,
+    );
+    const styleOf = (element: Element | null | undefined) =>
+      JSON.parse(element?.getAttribute('data-style') ?? '{}') as Record<string, unknown>;
+    const chipCarrier = getByText('Persistent filter chips').parentElement;
+    const railCarrier = container.querySelector('[data-grade-rail="true"]')?.parentElement;
+    expect(getByText('Sheet-only filter tokens').parentElement).toBe(chipCarrier);
+    expect(styleOf(chipCarrier)).not.toHaveProperty('paddingHorizontal');
+    expect(styleOf(railCarrier)).not.toHaveProperty('paddingHorizontal');
+    // The dense chip row is 48dp of chip targets: the carrier pads nothing under
+    // it. Its 8dp gap only separates the chips from the token row, which brings
+    // its own 8dp top (and, from the screen, bottom) inset.
+    expect(styleOf(chipCarrier)).toMatchObject({ gap: 8, paddingBottom: 0 });
+    // No empty filter stack between the bar and the chips: the row follows the bar.
+    expect(chipCarrier?.previousElementSibling?.hasAttribute('data-appbar-header')).toBe(true);
+  });
+
+  it('removes only the grade panel backing when floating native glass is allowed', () => {
+    nativeChrome.glassGradeRail = true;
+    const props = makeProps({
+      gradeRailVisible: true,
+      gradeBound: { minGradeId: undefined, maxGradeId: undefined },
+      onGradeChange: vi.fn(),
+    });
+    const { container, rerender } = render(<ClimbTopChrome {...props} />);
+    expect(container.querySelector('[data-grade-rail]')?.getAttribute('data-glass')).toBe('true');
+    expect(
+      JSON.parse(container.querySelector('[data-testid="climb-grade-rail"]')?.getAttribute('data-style') ?? '{}')
+        .backgroundColor,
+    ).toBeUndefined();
+    nativeChrome.glassGradeRail = false;
+    rerender(<ClimbTopChrome {...props} gradeRecenterKey={1} />);
+    expect(container.querySelector('[data-grade-rail]')?.getAttribute('data-glass')).toBe('false');
+    expect(
+      JSON.parse(container.querySelector('[data-testid="climb-grade-rail"]')?.getAttribute('data-style') ?? '{}')
+        .backgroundColor,
+    ).toBe('#010203');
+  });
+
+  it('renders Material with an empty title slot, separate history and grade controls, and no search field', () => {
     ctrl.variant = 'material';
     ctrl.board = typedBoard;
     const onOpenBoardDetail = vi.fn();
@@ -601,16 +1367,22 @@ describe('ClimbTopChrome', () => {
     );
 
     expect(container.querySelector('[data-gradient]')).toBeNull();
-    // The board switcher replaces the static Appbar.Content subtitle: the board
-    // label shows as the title with a down-caret affordance. Assert the hint too
-    // so this pins the BoardSwitcherButton specifically, not any [data-capsule].
-    const switcher = capsule(container);
-    // The Material board switcher drops the angle from the title (it rides its own
-    // filter chip now), so the label is the board name + size without "• 40°".
-    expect(switcher?.getAttribute('data-capsule')).toBe('Display:kilter • 12x12');
-    expect(switcher?.getAttribute('data-hint')).toBe('mobile.search.boardSwitcherHint');
-    expect(container.querySelector('[data-icon="chevron.down"]')).not.toBeNull();
-    expect(container.querySelector('[data-search-field]')).not.toBeNull();
+    // As on iOS the bar draws no title: no "Climbs", no board switcher (⋮ has
+    // Switch board). TalkBack still reads the screen's name from the empty slot.
+    expect(container.querySelector('[data-pressable^="mobile.nav.climbs"]')).toBeNull();
+    expect(container.querySelector('[data-appbar-content]')).toBeNull();
+    expect(container.textContent).not.toContain('mobile.nav.climbs');
+    const header = container.querySelector('[data-appbar-header] [data-role="header"]');
+    expect(header?.getAttribute('data-a11y-label')).toBe('mobile.nav.climbs');
+    expect(JSON.parse(header?.parentElement?.getAttribute('data-style') ?? '{}')).toMatchObject({
+      flex: 1,
+      minWidth: 0,
+    });
+    expect(container.querySelector('[data-wall-capsule]')).toBeNull();
+    expect(routerPush).not.toHaveBeenCalled();
+    const history = capsule(container);
+    expect(history?.getAttribute('data-capsule')).toBe('Board history, Display:kilter • 12x12 • 40°');
+    expect(container.querySelector('input')).toBeNull();
     const gradeLabel = container.querySelector('[data-pressable="mobile.search.gradeAction"]')?.textContent;
     expect(gradeLabel).toContain('Grade');
     // The resting label is the bare "Grade", not the old "Grade range" placeholder.
@@ -748,5 +1520,44 @@ describe('ClimbTopChrome', () => {
     fireEvent.click(container.querySelector('[data-pressable="mobile.search.gradeAction"]') as HTMLButtonElement);
     expect(onCloseGrade).toHaveBeenCalledTimes(1);
     expect(onOpenGrade).toHaveBeenCalledTimes(1);
+  });
+
+  // Once opened, the grade rail stays on screen until the climber hides it.
+  // Losing focus and focusing search close the transient iPad popover and
+  // nothing else.
+  describe('grade rail persistence', () => {
+    it.each(['liquidGlass', 'material'] as const)(
+      'dismisses the popover, not the rail, when the screen loses focus (%s)',
+      (variant) => {
+        ctrl.variant = variant;
+        ctrl.board = typedBoard;
+        const onCloseGrade = vi.fn();
+        const onDismissGradePopover = vi.fn();
+        render(<ClimbTopChrome {...makeProps({ onCloseGrade, onDismissGradePopover })} />);
+
+        const loseFocus = ctrl.focusEffects.at(-1)?.();
+        expect(onDismissGradePopover).not.toHaveBeenCalled();
+        if (typeof loseFocus === 'function') loseFocus();
+
+        expect(onDismissGradePopover).toHaveBeenCalledTimes(1);
+        expect(onCloseGrade).not.toHaveBeenCalled();
+      },
+    );
+
+    it('hands the Material rail its re-centre key', () => {
+      ctrl.variant = 'material';
+      ctrl.board = typedBoard;
+      const railProps = {
+        gradeRailVisible: true,
+        gradeBound: { minGradeId: 20, maxGradeId: 20 },
+        onGradeChange: vi.fn(),
+      };
+      const { container, rerender } = render(<ClimbTopChrome {...makeProps({ ...railProps, gradeRecenterKey: 3 })} />);
+      const rail = () => container.querySelector('[data-grade-rail="true"]');
+      expect(rail()?.getAttribute('data-recenter-key')).toBe('3');
+
+      rerender(<ClimbTopChrome {...makeProps({ ...railProps, gradeRecenterKey: 4 })} />);
+      expect(rail()?.getAttribute('data-recenter-key')).toBe('4');
+    });
   });
 });

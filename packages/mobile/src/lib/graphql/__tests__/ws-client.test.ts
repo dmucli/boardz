@@ -29,6 +29,10 @@ vi.mock('../../error-reporting', () => ({
 }));
 
 vi.mock('../../env', () => ({ BACKEND_URL: 'https://api.test' }));
+vi.mock('../../client-platform', () => ({ CLIENT_PLATFORM: 'ios' }));
+
+const { CLIENT_IDENTITY } = vi.hoisted(() => ({ CLIENT_IDENTITY: 'boardsesh-mobile/2.6.0 (ios; build 45)' }));
+vi.mock('../../client-identity', () => ({ getClientIdentityHeaderValue: () => CLIENT_IDENTITY }));
 
 type NativeSocketOptions = { headers?: Record<string, string> };
 
@@ -154,14 +158,14 @@ describe('native GraphQL WebSocket transport', () => {
     expect(NativeSocketStub.instances[0]?.options).toEqual({ headers: { origin: '' } });
     expect(ensureFreshTokenMock).toHaveBeenCalledTimes(1);
     expect(ensureFreshTokenMock.mock.invocationCallOrder[0]).toBeLessThan(getAuthTokenMock.mock.invocationCallOrder[0]);
-    expect(params).toEqual({ authToken: 'jwt-token' });
+    expect(params).toEqual({ authToken: 'jwt-token', clientIdentity: CLIENT_IDENTITY, clientPlatform: 'ios' });
   });
 
   it('omits authToken when no token is stored', async () => {
     getAuthTokenMock.mockResolvedValue(null);
     getWsClient();
 
-    await expect(connectionParams()()).resolves.toEqual({});
+    await expect(connectionParams()()).resolves.toEqual({ clientIdentity: CLIENT_IDENTITY, clientPlatform: 'ios' });
   });
 
   it('rejects a handshake superseded while its token is being prepared', async () => {
@@ -318,7 +322,11 @@ describe('native GraphQL WebSocket transport', () => {
     if (!firstSocket) throw new Error('first socket was not created');
     firstSocket.open();
     await vi.waitFor(() => expect(messagesOfType(firstSocket, 'connection_init')).toHaveLength(1));
-    expect(messagesOfType(firstSocket, 'connection_init')[0]?.payload).toEqual({ authToken: 'rejected-token' });
+    expect(messagesOfType(firstSocket, 'connection_init')[0]?.payload).toEqual({
+      authToken: 'rejected-token',
+      clientIdentity: CLIENT_IDENTITY,
+      clientPlatform: 'ios',
+    });
     firstSocket.receive({ type: 'connection_ack' });
     await vi.waitFor(() => expect(messagesOfType(firstSocket, 'subscribe')).toHaveLength(1));
 
@@ -333,7 +341,11 @@ describe('native GraphQL WebSocket transport', () => {
     secondSocket.open();
 
     await vi.waitFor(() => expect(messagesOfType(secondSocket, 'connection_init')).toHaveLength(1));
-    expect(messagesOfType(secondSocket, 'connection_init')[0]?.payload).toEqual({ authToken: 'fresh-token' });
+    expect(messagesOfType(secondSocket, 'connection_init')[0]?.payload).toEqual({
+      authToken: 'fresh-token',
+      clientIdentity: CLIENT_IDENTITY,
+      clientPlatform: 'ios',
+    });
     secondSocket.receive({ type: 'connection_ack' });
     await vi.waitFor(() => expect(messagesOfType(secondSocket, 'subscribe')).toHaveLength(1));
 

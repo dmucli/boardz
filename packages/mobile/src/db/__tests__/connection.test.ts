@@ -46,6 +46,8 @@ import {
 } from '../connection';
 import { noteDatabaseHandleFailure } from '../dead-handle';
 import { isSchemaReady } from '../schema-ready';
+import { isDatabaseInitAttemptRunning, subscribeDatabaseInitAttempt } from '../init-activity';
+import { resetLaunchReloadWindowForTests, setLaunchReloadRequested } from '../../lib/launch-reload-window';
 import { resetDatabaseInitializationForTests } from '../testing';
 import {
   runMigrations,
@@ -60,6 +62,9 @@ import {
   getDownloadedScopeKeys,
   scopeSyncMetaKeys,
   BOARD_DATA_TABLES,
+  assertLocalUserDataOwner,
+  getLocalUserId,
+  stampLocalUserId,
 } from '@boardsesh/offline-sync';
 import { createTestDatabase, type TestSqliteDb } from '@boardsesh/offline-sync/testing';
 import { SPRAY_PHOTO_PENDING_PREFIX } from '../../offline/spray-photo-retry';
@@ -261,6 +266,121 @@ describe('clearUserData', () => {
       expect(await getCheckpoint(db, getCheckpointKey(tableName, 'kilter:1:1'))).not.toBeNull();
     }
     expect(await isScopeDownloadComplete(db, 'kilter:1:1')).toBe(true);
+  });
+
+  // #6545. With the catalogue revalidation pass gone, this wipe is what hands a
+  // phone from one account to the next when no explicit sign-out wiped it: the
+  // sign-outs the climber did not choose, and the owner-stamp recovery in
+  // OfflineSyncBridge, which runs exactly this sequence.
+  it('hands the phone from account A to account B and keeps the downloaded catalogue', async () => {
+    await seedSignedInDevice();
+    await stampLocalUserId(db, 'account-a');
+    // Another account's published climb, and A's own draft: catalogue rows that stay.
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, user_id, is_draft, is_listed) VALUES (?, 'kilter', ?, ?, 1)`,
+      ['published-by-someone', 'someone-else', 0],
+    );
+    await db.runAsync(
+      `INSERT INTO board_climbs (uuid, board_type, user_id, is_draft, is_listed) VALUES (?, 'kilter', ?, ?, 1)`,
+      ['draft-by-a', 'account-a', 1],
+    );
+    // First-ascent credits. climb-1 has no Boardsesh owner: a manufacturer credit,
+    // the same for every viewer. The Boardsesh climb's credit is the one the stats
+    // sync projected for A.
+    await db.runAsync(
+      `UPDATE board_climb_stats SET fa_username = 'manufacturer-fa', fa_at = '2019-01-01T00:00:00Z' WHERE climb_uuid = 'climb-1'`,
+    );
+    await db.runAsync(
+      `INSERT INTO board_climb_stats (board_type, climb_uuid, angle, ascensionist_count, fa_username, fa_at)
+       VALUES ('kilter', 'published-by-someone', 40, 4, 'private-climber', '2026-01-01T00:00:00Z')`,
+    );
+    // A spray wall A could see, with a climb on it and its scope markers.
+    await db.runAsync(`INSERT INTO spray_walls (layout_id, board_uuid, photo_key) VALUES (?, ?, ?)`, [
+      4,
+      'wall-4',
+      'spray-walls/wall-4/photo-1.jpg',
+    ]);
+    await db.runAsync(`INSERT INTO board_climbs (uuid, board_type, layout_id) VALUES (?, 'spray', 4)`, ['spray-climb']);
+    for (const key of scopeSyncMetaKeys('spray:4:4')) {
+      await db.runAsync('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)', [key, '1']);
+    }
+
+    expect(await assertLocalUserDataOwner(db, 'account-b')).toBe('mismatch');
+    await clearUserData(db);
+    await stampLocalUserId(db, 'account-b');
+
+    expect(await getLocalUserId(db)).toBe('account-b');
+    expect(await countRows('spray_walls')).toBe(0);
+    expect(await countRows("board_climbs WHERE board_type = 'spray'")).toBe(0);
+    for (const key of scopeSyncMetaKeys('spray:4:4')) {
+      expect(await db.getFirstAsync('SELECT key FROM sync_meta WHERE key = ?', [key]), key).toBeNull();
+    }
+    expect(await db.getAllAsync("SELECT uuid FROM board_climbs WHERE board_type = 'kilter' ORDER BY uuid")).toEqual([
+      { uuid: 'climb-1' },
+      { uuid: 'draft-by-a' },
+      { uuid: 'published-by-someone' },
+    ]);
+    for (const tableName of BOARD_DATA_TABLES) {
+      expect(await getCheckpoint(db, getCheckpointKey(tableName, 'kilter:1:1')), tableName).not.toBeNull();
+    }
+    expect(await isScopeDownloadComplete(db, 'kilter:1:1')).toBe(true);
+    const credit = (climbUuid: string) =>
+      db.getFirstAsync('SELECT ascensionist_count, fa_username, fa_at FROM board_climb_stats WHERE climb_uuid = ?', [
+        climbUuid,
+      ]);
+    expect(await credit('climb-1')).toEqual({
+      ascensionist_count: 12,
+      fa_username: 'manufacturer-fa',
+      fa_at: '2019-01-01T00:00:00Z',
+    });
+    expect(await credit('published-by-someone')).toEqual({ ascensionist_count: 4, fa_username: null, fa_at: null });
+  });
+});
+
+// What OfflineSyncBridge does with an UNSTAMPED database (#6560 review): a
+// restored backup or a reinstall can carry another climber's synced rows with no
+// stamp. The bridge asks `assertLocalUserDataOwner`, wipes on 'mismatch', then
+// stamps. These run that exact sequence against the real DDL.
+describe('an unstamped database meeting the signed-in account', () => {
+  async function insertTick(uuid: string, userId: string | null): Promise<void> {
+    await db.runAsync(
+      `INSERT INTO boardsesh_ticks (uuid, user_id, board_type, climb_uuid, angle, status) VALUES (?, ?, 'kilter', 'climb-1', 40, 'send')`,
+      [uuid, userId],
+    );
+  }
+
+  async function bridgeHandover(currentUserId: string): Promise<string> {
+    const ownership = await assertLocalUserDataOwner(db, currentUserId);
+    if (ownership === 'mismatch') await clearUserData(db);
+    if (ownership !== 'ok') await stampLocalUserId(db, currentUserId);
+    return ownership;
+  }
+
+  it("wipes another account's ticks instead of claiming them, and keeps the catalogue", async () => {
+    await seedSignedInDevice();
+    await insertTick('tick-by-a', 'account-a');
+
+    expect(await bridgeHandover('account-b')).toBe('mismatch');
+
+    expect(await db.getAllAsync('SELECT uuid FROM boardsesh_ticks')).toEqual([]);
+    expect(await getLocalUserId(db)).toBe('account-b');
+    expect(await countRows('board_climbs')).toBe(1);
+    expect(await isScopeDownloadComplete(db, 'kilter:1:1')).toBe(true);
+  });
+
+  it("keeps the signed-in account's own unsynced ticks and outbox, and stamps", async () => {
+    await insertTick('synced-tick-by-b', 'account-b');
+    await insertTick('offline-tick', null);
+    await enqueue(db, 'boardsesh_ticks', 'create', { climbUuid: 'climb-1' }, 'offline-tick');
+
+    expect(await bridgeHandover('account-b')).toBe('unstamped');
+
+    expect(await db.getAllAsync('SELECT uuid FROM boardsesh_ticks ORDER BY uuid')).toEqual([
+      { uuid: 'offline-tick' },
+      { uuid: 'synced-tick-by-b' },
+    ]);
+    expect(await getPendingCount(db)).toBe(1);
+    expect(await getLocalUserId(db)).toBe('account-b');
   });
 });
 
@@ -477,6 +597,32 @@ describe('initializeDatabase connection PRAGMAs', () => {
     expect(busy?.timeout).toBe(5000);
   });
 
+  // #6689. The launch update gate reads this to hold its reload while the schema
+  // migrations run: on Android a reload leaves an open migration transaction
+  // holding the write lock, and the next runtime could then never migrate.
+  it('reports the setup attempt as running for exactly as long as it runs', async () => {
+    const seen: boolean[] = [];
+    const unsubscribe = subscribeDatabaseInitAttempt(() => seen.push(isDatabaseInitAttemptRunning()));
+    // What the gate would read at the moment each migration transaction opens.
+    const realTransaction = fileDb.withExclusiveTransactionAsync.bind(fileDb);
+    const runningAtEachMigration: boolean[] = [];
+    vi.spyOn(fileDb, 'withExclusiveTransactionAsync').mockImplementation((task) => {
+      runningAtEachMigration.push(isDatabaseInitAttemptRunning());
+      return realTransaction(task);
+    });
+    try {
+      await initializeDatabase(fileDb);
+    } finally {
+      unsubscribe();
+    }
+
+    expect(runningAtEachMigration.length).toBeGreaterThan(0);
+    expect(runningAtEachMigration.every(Boolean)).toBe(true);
+    expect(seen).toEqual([true, false]);
+    expect(isDatabaseInitAttemptRunning()).toBe(false);
+    expect(getDatabaseHandle()).toBe(fileDb);
+  });
+
   it('persists WAL on the file so a fresh connection inherits it', async () => {
     await initializeDatabase(fileDb);
 
@@ -561,6 +707,8 @@ describe('initializeDatabase lock contention (#4104)', () => {
       },
       getFirstAsync: <T>(source: string, ...params: unknown[]): Promise<T | null> =>
         realDb.getFirstAsync<T>(source, ...(params as never[])),
+      getAllAsync: <T>(source: string, ...params: unknown[]): Promise<T[]> =>
+        realDb.getAllAsync<T>(source, ...(params as never[])),
       runAsync: (source: string, ...params: unknown[]) => realDb.runAsync(source, ...(params as never[])),
       withExclusiveTransactionAsync: (task: (txn: unknown) => Promise<void>) =>
         realDb.withExclusiveTransactionAsync(task as never),
@@ -614,6 +762,29 @@ describe('initializeDatabase lock contention (#4104)', () => {
     // minutes (#4314). The unlock is the writer finishing, exactly as everywhere else.
     contended.unlock();
     await vi.advanceTimersByTimeAsync(FIRST_RETRY_DELAY_MS);
+  });
+
+  // #6689. Once the launch update gate has decided to reload, a retry must not
+  // start migrations under it: on Android the reload would leave their write lock
+  // held for the rest of the process.
+  it('starts no retry while a launch reload is requested, and carries on once it clears', async () => {
+    vi.useFakeTimers();
+    try {
+      const contended = createContendedDatabase();
+      await initializeDatabase(contended.db);
+      expect(contended.failures()).toBe(1);
+
+      setLaunchReloadRequested(true);
+      contended.unlock();
+      await vi.advanceTimersByTimeAsync(FIRST_RETRY_DELAY_MS * 4);
+      expect(isDatabaseInitAttemptRunning()).toBe(false);
+      expect(getDatabaseHandle()).toBeNull();
+
+      setLaunchReloadRequested(false);
+      await vi.waitFor(() => expect(getDatabaseHandle()).toBe(contended.db));
+    } finally {
+      resetLaunchReloadWindowForTests();
+    }
   });
 
   it('publishes the handle once a retry wins, instead of staying dead for the session', async () => {
@@ -819,7 +990,51 @@ describe('initializeDatabase lock contention (#4104)', () => {
     expect(getDatabaseHandle()).toBeNull();
     expect(reportErrorMock).toHaveBeenCalledTimes(1);
     const [, context] = reportErrorMock.mock.calls[0];
-    expect(context.tags).toMatchObject({ source: 'offline-sync', kind: 'sqlite-init', phase: 'queue-table' });
+    expect(context.tags).toMatchObject({
+      source: 'offline-sync',
+      kind: 'sqlite-init',
+      phase: 'queue-table',
+      superseded: 'false',
+    });
+    expect(context.extra).toMatchObject({ attempts: TOTAL_ATTEMPTS, retryable: true });
+  });
+
+  it('still reports an exhausted window when a remount lands during the final attempt', async () => {
+    vi.useFakeTimers();
+    const healthy = createContendedDatabase();
+    healthy.unlock();
+
+    // Every attempt is genuine contention — including the last one, which a remount
+    // happens to overlap. A LOCK failure is never refunded (only the closed-handle
+    // artefact is), so the chain runs out of road with `superseded` true. Dropping
+    // the report there hid a fully exhausted window behind an unrelated remount:
+    // offline storage is off for the session and Sentry heard nothing about it.
+    const contended = createContendedDatabase({
+      onFailure: (failureCount) => {
+        if (failureCount === TOTAL_ATTEMPTS) {
+          void initializeDatabase(healthy.db);
+        }
+      },
+    });
+
+    await initializeDatabase(contended.db);
+    await vi.advanceTimersByTimeAsync(WHOLE_LADDER_MS);
+
+    expect(contended.failures()).toBe(TOTAL_ATTEMPTS);
+    expect(getDatabaseHandle()).toBeNull();
+    expect(isSchemaReady()).toBe(false);
+    expect(reportErrorMock).toHaveBeenCalledTimes(1);
+    const [, context] = reportErrorMock.mock.calls[0];
+    // Tagged, not merged: #4314's close criterion reads the clean `superseded:false`
+    // population, so the remount-tangled tail — which can carry a closed-handle
+    // artefact instead of a lock — has to stay separable rather than silently join it.
+    expect(context.tags).toMatchObject({
+      source: 'offline-sync',
+      kind: 'sqlite-init',
+      phase: 'queue-table',
+      sqlite_code: 5,
+      superseded: 'true',
+    });
     expect(context.extra).toMatchObject({ attempts: TOTAL_ATTEMPTS, retryable: true });
   });
 
@@ -1278,6 +1493,7 @@ describe('initializeDatabase lock contention (#4104)', () => {
       return {
         execAsync: fail,
         getFirstAsync: fail,
+        getAllAsync: fail,
         runAsync: fail,
         withExclusiveTransactionAsync: fail,
       } as unknown as SQLiteDatabase;
@@ -1297,6 +1513,7 @@ describe('initializeDatabase lock contention (#4104)', () => {
         },
         getFirstAsync: <T>(source: string, ...params: unknown[]) =>
           realDb.getFirstAsync<T>(source, ...(params as never[])),
+        getAllAsync: <T>(source: string, ...params: unknown[]) => realDb.getAllAsync<T>(source, ...(params as never[])),
         runAsync: (source: string, ...params: unknown[]) => realDb.runAsync(source, ...(params as never[])),
         withExclusiveTransactionAsync: (task: (txn: unknown) => Promise<void>) =>
           realDb.withExclusiveTransactionAsync(task as never),

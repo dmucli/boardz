@@ -26,11 +26,34 @@ vi.mock('../table-config', async () => {
 });
 
 import { pullSync, type SyncProgress, multiRowChunkSize } from '../pull-client';
-import { setSigningOut, setBackgrounded, beginGlobalPurge } from '../../mutation-queue/drainer';
-import { getCheckpoint, setCheckpoint, getCheckpointKey, markScopeDownloadComplete } from '../checkpoints';
+import { setSigningOut, setBackgrounded, beginGlobalPurge, beginScopePurge } from '../../mutation-queue/drainer';
+import {
+  getCheckpoint,
+  setCheckpoint,
+  getCheckpointKey,
+  markScopeDownloadComplete,
+  isScopeDownloadComplete,
+  isScopeDownloadStarted,
+} from '../checkpoints';
 import { TABLE_CONFIGS, USER_DATA_TABLES, BOARD_DATA_TABLES } from '../table-config';
+import { USER_DATA_COMPLETE_KEY } from '../local-user-owner';
+import { triggerSync, isSyncInFlight, __resetSyncSchedulerStateForTests } from '../sync-scheduler';
 
 type SqlCall = { sql: string; params: unknown[] };
+
+/**
+ * The two markers an empty cycle stamps, each in its own transaction since
+ * #5851: deletions coverage and user_data_complete. Transaction and statement
+ * counts below add them explicitly rather than hiding them.
+ */
+const EMPTY_CYCLE_MARKER_TRANSACTIONS = 2;
+/** A board downloading for the first time adds three: its start stamp, its Started marker, its completion. */
+const PENDING_SCOPE_MARKER_TRANSACTIONS = 3;
+const EMPTY_CYCLE_MARKER_KEYS = new Set(['deletions-coverage', USER_DATA_COMPLETE_KEY]);
+const isMarkerWrite = ([sql, params]: unknown[]): boolean =>
+  String(sql).includes('sync_meta') &&
+  Array.isArray(params) &&
+  EMPTY_CYCLE_MARKER_KEYS.has(String((params as unknown[])[0]));
 
 function createMockDb() {
   const sqlCalls: SqlCall[] = [];
@@ -46,6 +69,7 @@ function createMockDb() {
     // The deletion path reads a row's `captureOnDelete` columns before deleting
     // it; null is "no such row", which is what every other table sees.
     getFirstAsync: vi.fn().mockResolvedValue(null),
+    getAllAsync: vi.fn().mockResolvedValue([]),
   };
   const db = {
     runAsync: vi.fn(async (sql: string, params: unknown[]) => {
@@ -118,6 +142,442 @@ describe('pullSync', () => {
     });
   }
 
+  function pausedFetch() {
+    let release!: () => void;
+    let markStarted!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let firstRequest = true;
+    const fetch = vi.fn(async (query: string, variables?: Record<string, unknown>) => {
+      if (firstRequest) {
+        firstRequest = false;
+        markStarted();
+        await blocked;
+      }
+      return graphqlFetch(query, variables);
+    }) as unknown as GraphqlFetchMock;
+    return { fetch, started, release };
+  }
+
+  async function flushPullEntry() {
+    // Coverage/checkpoint reads precede the first request. Flush their finite
+    // await chain so an incorrectly concurrent cycle reaches its network call.
+    for (let turn = 0; turn < 50; turn += 1) await Promise.resolve();
+  }
+
+  it('correlates request and attempt IDs through paged completion', async () => {
+    setupGraphqlFetchForAllTables();
+    const context = { requestId: 'request-original', attemptId: 'attempt-one' };
+    const onScopeDownloadStart = vi.fn();
+    const onScopeDownloadComplete = vi.fn();
+    const onScopeDownloadLifecycle = vi.fn();
+    await pullSync(db, queryClient, graphqlFetch, {
+      enabledBoards: ['spray:9001:9001'],
+      getScopeDownloadContext: () => context,
+      onScopeDownloadStart,
+      onScopeDownloadComplete,
+      onScopeDownloadLifecycle,
+    });
+    expect(onScopeDownloadStart).toHaveBeenCalledWith(expect.objectContaining({ downloadContext: context }));
+    expect(onScopeDownloadComplete).toHaveBeenCalledWith(expect.objectContaining({ downloadContext: context }));
+    expect(onScopeDownloadLifecycle.mock.calls.map(([event]) => event.state)).toEqual(['started', 'completed']);
+  });
+
+  it('explains an owner-readiness no-start without fabricating work', async () => {
+    const onScopeDownloadLifecycle = vi.fn();
+    await pullSync(db, queryClient, graphqlFetch, {
+      enabledBoards: ['spray:9001:9001'],
+      requireOwnedDatabase: true,
+      viewerUserId: 'unclaimed-viewer',
+      getScopeDownloadContext: () => ({ requestId: 'waiting-request', attemptId: 'preparation' }),
+      onScopeDownloadLifecycle,
+    });
+    expect(graphqlFetch).not.toHaveBeenCalled();
+    expect(onScopeDownloadLifecycle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        state: 'deferred',
+        reason: 'owner-unready',
+        stage: 'preparation',
+      }),
+    );
+    expect(onScopeDownloadLifecycle.mock.calls.some(([event]) => event.state === 'started')).toBe(false);
+  });
+
+  it('captures request context before the FIFO wait instead of adopting a re-enable', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const context = { requestId: 'old-request', attemptId: 'queued-attempt' };
+    const onScopeDownloadComplete = vi.fn();
+    const queued = pullSync(db, queryClient, graphqlFetch, {
+      enabledBoards: ['spray:9001:9001'],
+      getScopeDownloadContext: () => context,
+      onScopeDownloadComplete,
+    });
+    context.requestId = 'new-request';
+    first.release();
+    await Promise.all([initial, queued]);
+    expect(onScopeDownloadComplete).toHaveBeenCalledWith(
+      expect.objectContaining({
+        downloadContext: { requestId: 'old-request', attemptId: 'queued-attempt' },
+      }),
+    );
+  });
+
+  it('captures original callback references before a queued caller replaces its options', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const originalStarted = vi.fn();
+    const originalCompleted = vi.fn();
+    const replacement = vi.fn();
+    const options = {
+      enabledBoards: ['spray:9001:9001'],
+      onScopeDownloadStart: originalStarted,
+      onScopeDownloadComplete: originalCompleted,
+    };
+    const queued = pullSync(db, queryClient, graphqlFetch, options);
+    options.onScopeDownloadStart = replacement;
+    options.onScopeDownloadComplete = replacement;
+    first.release();
+    await Promise.all([initial, queued]);
+    expect(originalStarted).toHaveBeenCalledOnce();
+    expect(originalCompleted).toHaveBeenCalledOnce();
+    expect(replacement).not.toHaveBeenCalled();
+  });
+
+  it('reports cached readiness without fabricating another Started', async () => {
+    setupGraphqlFetchForAllTables();
+    vi.mocked(isScopeDownloadComplete).mockResolvedValueOnce(true);
+    const onScopeDownloadStart = vi.fn();
+    const onScopeDownloadLifecycle = vi.fn();
+    const context = { requestId: 'cached-request', attemptId: 'cached-check' };
+    await pullSync(db, queryClient, graphqlFetch, {
+      enabledBoards: ['spray:9001:9001'],
+      getScopeDownloadContext: () => context,
+      onScopeDownloadStart,
+      onScopeDownloadLifecycle,
+    });
+    expect(onScopeDownloadLifecycle).toHaveBeenCalledWith({
+      scopeKey: 'spray:9001:9001',
+      context,
+      state: 'completed',
+      completionSource: 'cached',
+    });
+    expect(onScopeDownloadLifecycle.mock.calls.some(([event]) => event.state === 'started')).toBe(false);
+  });
+
+  it('ignores broken lifecycle sinks without withholding committed completion', async () => {
+    setupGraphqlFetchForAllTables();
+    await expect(
+      pullSync(db, queryClient, graphqlFetch, {
+        enabledBoards: ['spray:9001:9001'],
+        getScopeDownloadContext: () => ({ requestId: 'request', attemptId: 'attempt' }),
+        onScopeDownloadLifecycle: () => {
+          throw new Error('reporter failed');
+        },
+      }),
+    ).resolves.toBeUndefined();
+    expect(markScopeDownloadComplete).toHaveBeenCalled();
+  });
+
+  it('captures and clones download correlation before its FIFO wait', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const context = { requestId: 'request-at-enqueue', batchId: 'batch-at-enqueue' };
+    const getDownloadRequestContext = vi.fn(() => context);
+    const onScopeDownloadStart = vi.fn();
+    const onScopeDownloadComplete = vi.fn();
+    const onScopeDownloadObserved = vi.fn();
+    const queued = pullSync(db, queryClient, graphqlFetch, {
+      enabledBoards: ['spray:9001:9001'],
+      getDownloadRequestContext,
+      onScopeDownloadStart,
+      onScopeDownloadComplete,
+      onScopeDownloadObserved,
+    });
+    expect(getDownloadRequestContext).toHaveBeenCalledExactlyOnceWith('spray:9001:9001');
+    context.requestId = 'replacement-request';
+    context.batchId = 'replacement-batch';
+    first.release();
+    await Promise.all([initial, queued]);
+    for (const reporter of [onScopeDownloadStart, onScopeDownloadComplete, onScopeDownloadObserved]) {
+      expect(reporter).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scopeKey: 'spray:9001:9001',
+          downloadRequest: { requestId: 'request-at-enqueue', batchId: 'batch-at-enqueue' },
+        }),
+      );
+    }
+    expect(getDownloadRequestContext).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps operational attempts and bulk validation requests distinct across the same FIFO wait', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const operational = { requestId: 'operational-request', attemptId: 'attempt-at-enqueue', accountGeneration: 7 };
+    const bulk = { requestId: 'bulk-request', batchId: 'batch-at-enqueue' };
+    const onScopeDownloadStart = vi.fn();
+    const onScopeDownloadComplete = vi.fn();
+    const onScopeDownloadObserved = vi.fn();
+    const onScopeDownloadLifecycle = vi.fn();
+    const queued = pullSync(db, queryClient, graphqlFetch, {
+      enabledBoards: ['spray:9001:9001'],
+      getScopeDownloadContext: () => operational,
+      getDownloadRequestContext: () => bulk,
+      onScopeDownloadStart,
+      onScopeDownloadComplete,
+      onScopeDownloadObserved,
+      onScopeDownloadLifecycle,
+    });
+    operational.requestId = 'replacement-operational';
+    operational.attemptId = 'replacement-attempt';
+    operational.accountGeneration = 8;
+    bulk.requestId = 'replacement-bulk';
+    bulk.batchId = 'replacement-batch';
+    first.release();
+    await Promise.all([initial, queued]);
+    for (const reporter of [onScopeDownloadStart, onScopeDownloadComplete]) {
+      expect(reporter).toHaveBeenCalledWith(
+        expect.objectContaining({
+          downloadContext: { requestId: 'operational-request', attemptId: 'attempt-at-enqueue', accountGeneration: 7 },
+          downloadRequest: { requestId: 'bulk-request', batchId: 'batch-at-enqueue' },
+        }),
+      );
+    }
+    expect(onScopeDownloadObserved).toHaveBeenCalledWith(
+      expect.objectContaining({
+        downloadRequest: { requestId: 'bulk-request', batchId: 'batch-at-enqueue' },
+      }),
+    );
+    expect(onScopeDownloadLifecycle).toHaveBeenCalledWith(
+      expect.objectContaining({
+        context: { requestId: 'operational-request', attemptId: 'attempt-at-enqueue', accountGeneration: 7 },
+        state: 'completed',
+      }),
+    );
+  });
+
+  it('observes an already-complete scope without manufacturing another Started', async () => {
+    setupGraphqlFetchForAllTables();
+    vi.mocked(isScopeDownloadComplete).mockResolvedValue(true);
+    const onScopeDownloadObserved = vi.fn();
+    const onScopeDownloadStart = vi.fn();
+    try {
+      await pullSync(db, queryClient, graphqlFetch, {
+        enabledBoards: ['spray:9001:9001'],
+        getDownloadRequestContext: () => ({ requestId: 'cached-request', batchId: 'batch' }),
+        onScopeDownloadObserved,
+        onScopeDownloadStart,
+      });
+      expect(onScopeDownloadObserved).toHaveBeenCalledExactlyOnceWith({
+        scopeKey: 'spray:9001:9001',
+        complete: true,
+        downloadRequest: { requestId: 'cached-request', batchId: 'batch' },
+      });
+      expect(onScopeDownloadStart).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(isScopeDownloadComplete).mockResolvedValue(false);
+    }
+  });
+
+  it('observes a resumed request even when its legacy Started marker survived cancellation', async () => {
+    setupGraphqlFetchForAllTables();
+    vi.mocked(isScopeDownloadStarted).mockResolvedValue(true);
+    const onScopeDownloadObserved = vi.fn();
+    const onScopeDownloadStart = vi.fn();
+    try {
+      await pullSync(db, queryClient, graphqlFetch, {
+        enabledBoards: ['spray:9001:9001'],
+        getDownloadRequestContext: () => ({ requestId: 're-enabled-request', batchId: 'new-batch' }),
+        onScopeDownloadObserved,
+        onScopeDownloadStart,
+      });
+      expect(onScopeDownloadObserved).toHaveBeenCalledExactlyOnceWith({
+        scopeKey: 'spray:9001:9001',
+        complete: false,
+        downloadRequest: { requestId: 're-enabled-request', batchId: 'new-batch' },
+      });
+      expect(onScopeDownloadStart).not.toHaveBeenCalled();
+      expect(markScopeDownloadComplete).toHaveBeenCalled();
+    } finally {
+      vi.mocked(isScopeDownloadStarted).mockResolvedValue(false);
+    }
+  });
+
+  it('does not let broken download probes and observations interrupt a pull', async () => {
+    setupGraphqlFetchForAllTables();
+    const failTelemetry = (): never => {
+      throw new Error('telemetry unavailable');
+    };
+    await expect(
+      pullSync(db, queryClient, graphqlFetch, {
+        enabledBoards: ['spray:9001:9001'],
+        getDownloadRequestContext: failTelemetry,
+        onScopeDownloadStart: failTelemetry,
+        onScopeDownloadComplete: failTelemetry,
+        onScopeDownloadObserved: failTelemetry,
+      }),
+    ).resolves.toBeUndefined();
+    expect(markScopeDownloadComplete).toHaveBeenCalled();
+  });
+
+  it('serializes a publication pull behind the actual scheduler cycle', async () => {
+    setupGraphqlFetchForAllTables();
+    __resetSyncSchedulerStateForTests();
+    const scheduled = pausedFetch();
+    const publication = pausedFetch();
+    triggerSync(
+      db,
+      queryClient,
+      scheduled.fetch,
+      () => [],
+      async () => {},
+    );
+    await scheduled.started;
+    const refresh = pullSync(db, queryClient, publication.fetch, { enabledBoards: [] });
+    try {
+      await flushPullEntry();
+      expect(publication.fetch).not.toHaveBeenCalled();
+      scheduled.release();
+      await publication.started;
+    } finally {
+      scheduled.release();
+      publication.release();
+      await refresh;
+      await vi.waitFor(() => expect(isSyncInFlight()).toBe(false));
+    }
+  });
+
+  it('awaits each same-database caller and snapshots its queued options and scopes', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const second = pausedFetch();
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const options = { enabledBoards: ['spray:9001:9001'], isOnline: () => true };
+    const refresh = pullSync(db, queryClient, second.fetch, options);
+    options.enabledBoards.length = 0;
+    options.isOnline = () => false;
+    let finished = false;
+    void refresh.then(() => {
+      finished = true;
+    });
+    try {
+      await flushPullEntry();
+      expect(second.fetch).not.toHaveBeenCalled();
+      expect(finished).toBe(false);
+      first.release();
+      await initial;
+      await second.started;
+      expect(finished).toBe(false);
+    } finally {
+      first.release();
+      second.release();
+      await Promise.all([initial, refresh]);
+    }
+    expect(
+      second.fetch.mock.calls.some(
+        ([, variables]) => (variables as Record<string, unknown> | undefined)?.boardType === 'spray',
+      ),
+    ).toBe(true);
+  });
+
+  it('releases the queue after failure without hiding the first caller rejection', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const firstError = new Error('first pull failed');
+    graphqlFetch.mockRejectedValueOnce(firstError);
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    const rejected = expect(initial).rejects.toBe(firstError);
+    await first.started;
+    const next = pullSync(db, queryClient, graphqlFetch, { enabledBoards: [] });
+    first.release();
+    await rejected;
+    await next;
+    expect(graphqlFetch.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it('allows different database handles to pull independently', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const other = pausedFetch();
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const independent = pullSync(createMockDb().db, queryClient, other.fetch, { enabledBoards: [] });
+    await other.started;
+    other.release();
+    await independent;
+    first.release();
+    await initial;
+  });
+
+  it('does no queued database or network work after sign-out finishes', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const staleFetch = vi.fn((query: string, variables?: Record<string, unknown>) =>
+      graphqlFetch(query, variables),
+    ) as unknown as GraphqlFetchMock;
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const queued = pullSync(db, queryClient, staleFetch, { enabledBoards: [] });
+    setSigningOut(true);
+    setSigningOut(false);
+    const sqlCount = sqlCalls.length;
+    const reads = vi.mocked(db.getFirstAsync).mock.calls.length;
+    first.release();
+    await initial;
+    await queued;
+    expect(staleFetch).not.toHaveBeenCalled();
+    expect(sqlCalls).toHaveLength(sqlCount);
+    expect(vi.mocked(db.getFirstAsync).mock.calls).toHaveLength(reads);
+  });
+
+  it('does not resurrect requests enqueued during sign-out after the flag clears', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const staleFetch = vi.fn((query: string, variables?: Record<string, unknown>) =>
+      graphqlFetch(query, variables),
+    ) as unknown as GraphqlFetchMock;
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    setSigningOut(true);
+    const queued = pullSync(db, queryClient, staleFetch, { enabledBoards: [] });
+    setSigningOut(false);
+    first.release();
+    await initial;
+    await queued;
+    expect(staleFetch).not.toHaveBeenCalled();
+  });
+
+  it('skips a board removed while its request waits behind another pull', async () => {
+    setupGraphqlFetchForAllTables();
+    const first = pausedFetch();
+    const initial = pullSync(db, queryClient, first.fetch, { enabledBoards: [] });
+    await first.started;
+    const queued = pullSync(db, queryClient, graphqlFetch, { enabledBoards: ['spray:9001:9001'] });
+    const endPurge = beginScopePurge('spray:9001');
+    endPurge();
+    first.release();
+    await initial;
+    await queued;
+    expect(
+      graphqlFetch.mock.calls.some(
+        ([, variables]) => (variables as Record<string, unknown> | undefined)?.boardType === 'spray',
+      ),
+    ).toBe(false);
+  });
+
   it('applies deletions FIRST, then user data tables, then board data', async () => {
     // Deletions-first is what makes a server-side delete-then-recreate
     // converge: the tombstone removes the old local row before the same
@@ -152,7 +612,10 @@ describe('pullSync', () => {
 
     // Both board tables pulled to their tail → the scope's "initial download
     // complete" marker is written (the gate for local-first reads).
-    expect(markScopeDownloadComplete).toHaveBeenCalledWith(db, 'kilter:1:5');
+    expect(markScopeDownloadComplete).toHaveBeenCalledWith(expect.anything(), 'kilter:1:5');
+    // Inside its own transaction, never an autocommit write on the main
+    // connection (#5851).
+    expect(vi.mocked(markScopeDownloadComplete).mock.calls[0][0]).not.toBe(db);
   });
 
   it('paginates correctly with cursor updates', async () => {
@@ -220,8 +683,8 @@ describe('pullSync', () => {
     // One transaction for the 120-row page — per-batch transactions multiplied
     // commit overhead ~10× across a big board download.
     const transactionCalls = (db.withExclusiveTransactionAsync as ReturnType<typeof vi.fn>).mock.calls;
-    expect(transactionCalls.length).toBe(1);
-    expect(mockTxn.runAsync).toHaveBeenCalledTimes(1);
+    expect(transactionCalls.length).toBe(1 + EMPTY_CYCLE_MARKER_TRANSACTIONS);
+    expect(mockTxn.runAsync.mock.calls.filter((call) => !isMarkerWrite(call))).toHaveLength(1);
   });
 
   it('splits a page into multiple multi-row statements when it exceeds the bind-variable chunk size', async () => {
@@ -278,7 +741,9 @@ describe('pullSync', () => {
     expect(totalRowsInserted).toBe(100);
 
     // Still one exclusive transaction for the whole page, batching or not.
-    expect((db.withExclusiveTransactionAsync as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    expect((db.withExclusiveTransactionAsync as ReturnType<typeof vi.fn>).mock.calls.length).toBe(
+      1 + EMPTY_CYCLE_MARKER_TRANSACTIONS + PENDING_SCOPE_MARKER_TRANSACTIONS,
+    );
   });
 
   it('updates checkpoint after each page', async () => {
@@ -333,6 +798,61 @@ describe('pullSync', () => {
         !(call.sql.includes('sync_meta') && excusedMarkerKeys.has(String(call.params?.[0]))),
     );
     expect(insertCalls).toHaveLength(0);
+  });
+
+  it('refreshes local ticks after initial completion even when no rows changed, once across empty cycles', async () => {
+    setupGraphqlFetchForAllTables();
+    let userDataComplete = false;
+    const completionAtRefresh: boolean[] = [];
+    const readCompletion = async (_sql: string, params: unknown[]) => {
+      if (params[0] === USER_DATA_COMPLETE_KEY) return userDataComplete ? { key: USER_DATA_COMPLETE_KEY } : null;
+      return null;
+    };
+    // The pre-check reads the main connection; the decision and the write happen
+    // in the marker's own transaction (#5851).
+    (db.getFirstAsync as ReturnType<typeof vi.fn>).mockImplementation(readCompletion);
+    mockTxn.getFirstAsync.mockImplementation(readCompletion);
+    mockTxn.runAsync.mockImplementation(async (sql: string, params: unknown[]) => {
+      sqlCalls.push({ sql, params });
+      if (params[0] === USER_DATA_COMPLETE_KEY) userDataComplete = true;
+    });
+    (queryClient.invalidateQueries as ReturnType<typeof vi.fn>).mockImplementation(
+      (filters: { queryKey?: string[] }) => {
+        if (filters.queryKey?.[0] === 'localTicks') completionAtRefresh.push(userDataComplete);
+      },
+    );
+
+    await pullSync(db, queryClient, graphqlFetch);
+    await pullSync(db, queryClient, graphqlFetch);
+
+    expect(completionAtRefresh).toEqual([true]);
+  });
+
+  it('does not mark completion or refresh local ticks when a purge lands during the completion read', async () => {
+    setupGraphqlFetchForAllTables();
+    (db.getFirstAsync as ReturnType<typeof vi.fn>).mockImplementation(async (_sql: string, params: unknown[]) => {
+      if (params[0] === USER_DATA_COMPLETE_KEY) beginGlobalPurge();
+      return null;
+    });
+
+    await pullSync(db, queryClient, graphqlFetch);
+
+    expect(sqlCalls.some((call) => call.params[0] === USER_DATA_COMPLETE_KEY)).toBe(false);
+    const queryInvalidations = queryClient as { invalidateQueries: ReturnType<typeof vi.fn> };
+    expect(queryInvalidations.invalidateQueries.mock.calls).not.toContainEqual([{ queryKey: ['localTicks'] }]);
+  });
+
+  it('does not refresh local ticks when a purge lands during the completion write', async () => {
+    setupGraphqlFetchForAllTables();
+    mockTxn.runAsync.mockImplementation(async (sql: string, params: unknown[]) => {
+      sqlCalls.push({ sql, params });
+      if (params[0] === USER_DATA_COMPLETE_KEY) beginGlobalPurge();
+    });
+
+    await pullSync(db, queryClient, graphqlFetch);
+
+    const queryInvalidations = queryClient as { invalidateQueries: ReturnType<typeof vi.fn> };
+    expect(queryInvalidations.invalidateQueries.mock.calls).not.toContainEqual([{ queryKey: ['localTicks'] }]);
   });
 
   it('seeds the deletions-coverage marker and wipes nothing when the marker is absent', async () => {
@@ -510,8 +1030,10 @@ describe('pullSync', () => {
 
     await pullSync(db, queryClient, graphqlFetch);
 
-    expect((db.withExclusiveTransactionAsync as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
-    expect(mockTxn.runAsync).toHaveBeenCalledTimes(2);
+    expect((db.withExclusiveTransactionAsync as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(
+      1 + EMPTY_CYCLE_MARKER_TRANSACTIONS,
+    );
+    expect(mockTxn.runAsync.mock.calls.filter((call) => !isMarkerWrite(call))).toHaveLength(2);
     expect(setCheckpoint).toHaveBeenNthCalledWith(1, mockTxn, 'checkpoint:deletions', {
       updatedAt: '1970-01-01T00:00:00.000Z',
       syncSeq: '0',
@@ -646,6 +1168,8 @@ describe('pullSync', () => {
 
     expect(invalidatedKeys).toContainEqual(['logbook']);
     expect(invalidatedKeys).toContainEqual(['userTicks']);
+    // Tick rows and the completion transition share one phase refresh.
+    expect(invalidatedKeys.filter((queryKey) => queryKey[0] === 'localTicks')).toHaveLength(1);
   });
 
   it('reports progress via onProgress callback', async () => {
@@ -835,16 +1359,22 @@ describe('pullSync', () => {
     expect(insertCalls[0].params).toContain(JSON.stringify(nestedObject));
   });
 
-  it('invalidates deletion-affected query keys only once per key', async () => {
+  it('invalidates deletion-affected query keys only once per key, across tombstone pages', async () => {
+    let deletionRequestCount = 0;
     graphqlFetch.mockImplementation(async (query: string) => {
       if (query.includes('syncDeletions')) {
-        return makeDeletionsResult(
-          [
-            { tableName: 'boardsesh_ticks', recordId: 'uuid-1', deletedAt: '2024-06-01T00:00:00Z' },
-            { tableName: 'boardsesh_ticks', recordId: 'uuid-2', deletedAt: '2024-06-01T00:00:01Z' },
-          ],
-          false,
-        );
+        deletionRequestCount += 1;
+        // Two pages: a per-page set would invalidate each key twice.
+        return deletionRequestCount === 1
+          ? makeDeletionsResult(
+              [{ tableName: 'boardsesh_ticks', recordId: 'uuid-1', deletedAt: '2024-06-01T00:00:00Z' }],
+              true,
+            )
+          : makeDeletionsResult(
+              [{ tableName: 'boardsesh_ticks', recordId: 'uuid-2', deletedAt: '2024-06-01T00:00:01Z' }],
+              false,
+              { updatedAt: '2024-06-01T00:00:01Z', syncSeq: '2' },
+            );
       }
       for (const config of Object.values(TABLE_CONFIGS)) {
         if (query.includes(config.queryName)) {
@@ -865,11 +1395,11 @@ describe('pullSync', () => {
     const logbookKeyCount = keysFromDeletionPhase.filter((k: string) => k === '["logbook"]').length;
     const userTicksKeyCount = keysFromDeletionPhase.filter((k: string) => k === '["userTicks"]').length;
 
-    expect(logbookKeyCount).toBeGreaterThanOrEqual(1);
-    expect(userTicksKeyCount).toBeGreaterThanOrEqual(1);
+    expect(logbookKeyCount).toBe(1);
+    expect(userTicksKeyCount).toBe(1);
   });
 
-  it('invalidates a committed deletion page before a later page request fails', async () => {
+  it('invalidates a committed deletion page even when a later page request fails', async () => {
     let deletionRequestCount = 0;
     graphqlFetch.mockImplementation(async (query: string) => {
       if (query.includes('syncDeletions')) {

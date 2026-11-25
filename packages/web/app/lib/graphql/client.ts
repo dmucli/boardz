@@ -1,5 +1,8 @@
+import { CLIENT_PLATFORM_HEADER } from '@boardsesh/shared-schema';
 import { type RequestDocument, type Variables, GraphQLClient } from 'graphql-request';
 import { getGraphQLHttpUrl as _getGraphQLHttpUrl } from '@/app/lib/backend-url';
+import { webClientIdentityHeaders } from '@/app/lib/client-identity';
+import { guardedFetch } from '@/app/lib/auth/session-guard';
 
 const DEBUG = process.env.NODE_ENV === 'development';
 
@@ -20,6 +23,8 @@ export function createGraphQLHttpClient(authToken?: string | null): GraphQLClien
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    ...webClientIdentityHeaders(),
+    [CLIENT_PLATFORM_HEADER]: 'web',
   };
 
   if (authToken) {
@@ -30,7 +35,11 @@ export function createGraphQLHttpClient(authToken?: string | null): GraphQLClien
     console.info(`[GraphQL HTTP] Creating client for ${url} (authenticated: ${!!authToken})`);
   }
 
-  return new GraphQLClient(url, { headers });
+  // Server renders already forward their own admitted lease. Browser clients
+  // go through the session guard: a response that lands after the account
+  // changed rejects with SessionSupersededError instead of reaching the caller.
+  if (typeof window === 'undefined') return new GraphQLClient(url, { headers });
+  return new GraphQLClient(url, { headers, fetch: guardedFetch });
 }
 
 /**

@@ -1,7 +1,20 @@
+import type { LaunchUpdateOutcome, LaunchUpdatePhase, LaunchUpdateTrigger } from './launch-update-gate';
+import type { ReleaseContext } from '@boardsesh/shared-schema';
+
+export function buildOtaCanaryProperties(context: Pick<ReleaseContext, 'automaticCanary' | 'canaryCheckedAt'>): {
+  ota_automatic_canary: boolean | null;
+  ota_canary_checked_at: string | null;
+} {
+  return {
+    ota_automatic_canary: context.automaticCanary,
+    ota_canary_checked_at: context.canaryCheckedAt,
+  };
+}
+
 // OTA-adoption telemetry. Mobile-only (web has no OTA), so the event names stay
 // free-string constants rather than entries in @boardsesh/analytics'
 // SHARED_EVENTS (which is for names fired by BOTH platforms). See
-// docs/mobile-ota-updates.md for what each event measures.
+// docs/operations/mobile-ota-updates.md for what each event measures.
 
 // Fired once per launch with the running JS bundle's metadata. The adoption
 // signal: isEmbeddedLaunch === false means the install is running an OTA'd
@@ -13,6 +26,59 @@ export const OTA_UPDATE_STATUS_EVENT = 'OTA Update Status';
 // next launch, which the following launch's OTA Update Status event records).
 // Together they form the published → downloaded → applied funnel.
 export const OTA_UPDATE_DOWNLOADED_EVENT = 'OTA Update Downloaded';
+
+// Fired exactly once per gated cold start by the launch update gate
+// (launch-update-gate.ts): before the reload when the gate reloads onto a fresh
+// bundle, on release otherwise. `duration_ms` against `cap_ms` is how the caps
+// get tuned; `trigger` separates a binary's first launch from an ordinary cold
+// start; `phase_at_release` says whether the gate ended while still waiting on
+// the manifest (`check`), with a download under way or done (`download`), or
+// with neither (`none`), which is what tells a hung manifest request from a
+// slow download among the `timed_out` launches. A launch the gate skips (dev, updates disabled, emergency launch,
+// background launch, the runtime a reload produced) fires nothing.
+export const OTA_LAUNCH_UPDATE_EVENT = 'OTA Launch Update';
+
+export type OtaLaunchUpdateProperties = {
+  outcome: LaunchUpdateOutcome;
+  phase_at_release: LaunchUpdatePhase;
+  duration_ms: number;
+  trigger: LaunchUpdateTrigger;
+  cap_ms: number;
+  ota_runtime_version: string | null;
+  ota_is_embedded: boolean;
+  /**
+   * The previous gated launch asked for a reload and was still running after
+   * the grace (#6689). Null when the marker had not been read yet.
+   */
+  previous_reload_outlived_grace: boolean | null;
+};
+
+export function buildOtaLaunchUpdateProperties(fields: {
+  outcome: LaunchUpdateOutcome;
+  phase: LaunchUpdatePhase;
+  durationMs: number;
+  trigger: LaunchUpdateTrigger;
+  capMs: number;
+  runtimeVersion: string | null | undefined;
+  isEmbeddedLaunch: boolean;
+  previousReloadOutlivedGrace?: boolean | null;
+}): OtaLaunchUpdateProperties {
+  return {
+    outcome: fields.outcome,
+    phase_at_release: fields.phase,
+    duration_ms: Math.max(0, Math.round(fields.durationMs)),
+    trigger: fields.trigger,
+    cap_ms: fields.capMs,
+    ota_runtime_version: fields.runtimeVersion ?? null,
+    ota_is_embedded: fields.isEmbeddedLaunch,
+    previous_reload_outlived_grace: fields.previousReloadOutlivedGrace ?? null,
+  };
+}
+
+// Fired when a climber flips "Get updates early" in More. Props: { enabled }.
+// Only the deliberate flip: the launch sync and a server-side switch-off are
+// silent. Which branch a phone actually runs is `ota_branch` on every event.
+export const EARLY_UPDATES_TOGGLED_EVENT = 'Early Updates Toggled';
 
 // The raw expo-updates constants the status event is built from. Nullable string
 // and Date fields accept `undefined` too so the mapper can run against the

@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
+vi.mock('../ChineseTranslationOnboarding', () => ({ ChineseTranslationOnboarding: () => null }));
+// Existing flow fixtures begin after the privacy choice has settled.
+vi.mock('../../../lib/consent-hooks', () => ({ useConsentSettled: () => true }));
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, cleanup, render, waitFor } from '@testing-library/react';
 import type { OnboardingGateEvaluation } from '../../../lib/onboarding/onboarding-gate-analytics';
+import { clearBoardLinkReplay, setBoardLinkReplay } from '../../../lib/routing/board-link-replay';
+import { setSetting } from '../../../settings/hooks';
 
 // The profile's creation times the suite uses, against a frozen "now". Most
 // cases describe an existing climber, which the first-board picker (#5654)
@@ -168,6 +173,7 @@ describe('OnboardingGate', () => {
     // Default: a plain launch (no cold-start deep link, no notification tap).
     getInitialURLMock.mockResolvedValue(null);
     notificationCtrl.openedFromNotification = false;
+    clearBoardLinkReplay();
     segmentsCtrl.segments = ['(tabs)', 'climbs'];
     profileCtrl.id = undefined;
     profileCtrl.createdAt = OLD_ACCOUNT_CREATED_AT;
@@ -803,7 +809,7 @@ describe('OnboardingGate', () => {
       expect(evaluations()).toEqual([expect.objectContaining({ outcome: 'would_present' })]);
     });
 
-    it('never arms in a screenshot build, which never decides on purpose', async () => {
+    it('keeps the normal decision active even with an old capture flag', async () => {
       vi.useFakeTimers();
       process.env.EXPO_PUBLIC_SCREENSHOT_MODE = '1';
       render(<OnboardingGate />);
@@ -811,7 +817,7 @@ describe('OnboardingGate', () => {
       await act(async () => {
         await vi.advanceTimersByTimeAsync(ONBOARDING_GATE_STALL_MS * 2);
       });
-      expect(evaluations()).toEqual([]);
+      expect(evaluations()).not.toEqual([]);
     });
   });
   // #5654, Marco's call: a brand-new account with no board gets the board picker
@@ -848,6 +854,22 @@ describe('OnboardingGate', () => {
       expect(readShowCountMock).toHaveBeenCalledWith('user-new');
       expect(recordShownMock).toHaveBeenCalledWith('user-new', 1);
       expect(recordShownMock.mock.invocationCallOrder[0]).toBeLessThan(pushMock.mock.invocationCallOrder[0]);
+    });
+
+    // #6289: a climber can start on Home instead of Climbs. Setup is required,
+    // so it still opens over whichever tab the launch picked.
+    it('opens the picker over Home when the climber chose to start there', async () => {
+      setSetting('startupScreen', 'home');
+      segmentsCtrl.segments = ['(tabs)', 'home'];
+      try {
+        render(<OnboardingGate />);
+
+        await waitFor(() => expect(pushMock).toHaveBeenCalledTimes(1));
+        expect(pushMock).toHaveBeenCalledWith(FIRST_BOARD_HREF);
+        expect(decisions()[0]).toMatchObject({ outcome: 'presented', reason: 'new_account', topSegment: '(tabs)' });
+      } finally {
+        setSetting('startupScreen', 'climbs');
+      }
     });
 
     // The decision is what stops the watchdog, so it goes out before the push:
@@ -931,6 +953,61 @@ describe('OnboardingGate', () => {
       expect(readShowCountMock).not.toHaveBeenCalled();
       expect(recordShownMock).not.toHaveBeenCalled();
       expect(pushMock).not.toHaveBeenCalled();
+    });
+
+    // A shared climb tapped while signed out, opened after sign-up (#6027).
+    // The link arrived with the app already open, so there is no launch URL,
+    // and it lands on a board route, which is not a deep-link segment.
+    it('never opens over a shared climb that was opened after sign-in', async () => {
+      segmentsCtrl.segments = ['kilter', '1', '7', '1,20', '40', 'view', 'the-proj'];
+      setBoardLinkReplay(Promise.resolve(true));
+      render(<OnboardingGate />);
+
+      await waitFor(() => expect(decisions()).toHaveLength(1));
+      expect(decisions()[0]).toMatchObject({ outcome: 'skipped', reason: 'replayed_board_link', hadBoard: false });
+      expect(readShowCountMock).not.toHaveBeenCalled();
+      expect(recordShownMock).not.toHaveBeenCalled();
+      expect(pushMock).not.toHaveBeenCalled();
+    });
+
+    it('waits for the stash to be read before it decides', async () => {
+      let resolveReplay: (opened: boolean) => void = () => undefined;
+      setBoardLinkReplay(
+        new Promise<boolean>((resolve) => {
+          resolveReplay = resolve;
+        }),
+      );
+      render(<OnboardingGate />);
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(decisions()).toHaveLength(0);
+      expect(pushMock).not.toHaveBeenCalled();
+
+      await act(async () => {
+        resolveReplay(true);
+      });
+
+      await waitFor(() => expect(decisions()).toHaveLength(1));
+      expect(decisions()[0]).toMatchObject({ outcome: 'skipped', reason: 'replayed_board_link' });
+      expect(pushMock).not.toHaveBeenCalled();
+    });
+
+    it('opens as usual when the sign-in had no stashed link to open', async () => {
+      setBoardLinkReplay(Promise.resolve(false));
+      render(<OnboardingGate />);
+
+      await waitFor(() => expect(decisions()).toHaveLength(1));
+      expect(decisions()[0]).toMatchObject({ outcome: 'presented', reason: 'new_account' });
+      expect(pushMock).toHaveBeenCalledWith(FIRST_BOARD_HREF);
+    });
+
+    it('opens as usual when reading the stash failed', async () => {
+      setBoardLinkReplay(Promise.reject(new Error('storage unavailable')));
+      render(<OnboardingGate />);
+
+      await waitFor(() => expect(decisions()).toHaveLength(1));
+      expect(decisions()[0]).toMatchObject({ outcome: 'presented', reason: 'new_account' });
     });
 
     it('never opens over a deep-link landing', async () => {
@@ -1188,3 +1265,6 @@ describe('OnboardingGate', () => {
     });
   });
 });
+
+import { grantAnalyticsForTest } from '../../../../test/consent-fixture';
+beforeEach(() => grantAnalyticsForTest());

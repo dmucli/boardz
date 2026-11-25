@@ -1,7 +1,7 @@
 export const qaTypeDefs = /* GraphQL */ `
   """
   A tester's verdict on a pull-request preview (crowdsourced QA; see
-  docs/crowdsourced-qa.md).
+  docs/qa/crowdsourced-qa.md).
   """
   enum QaVerdictKind {
     approved
@@ -114,6 +114,7 @@ export const qaTypeDefs = /* GraphQL */ `
   app fills in so the GitHub comment can say what was tested where.
   """
   input SubmitQaVerdictInput {
+    releaseContext: ReleaseContextInput
     prNumber: Int!
     """
     Must equal \`pr-<prNumber>\` — the branch the tester actually ran.

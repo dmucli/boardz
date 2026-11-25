@@ -1,11 +1,12 @@
 'use client';
 
 import { useEffect } from 'react';
+import { useConsent } from '../consent/consent-state-provider';
 import { useSession } from 'next-auth/react';
 import { usePathname } from 'next/navigation';
 import * as Sentry from '@sentry/nextjs';
 import { getAnalyticsAnonymousId, getAnalyticsDistinctId, identify, reset } from '@/app/lib/analytics';
-import { isAdminAnalyticsUrl, isEmbedAnalyticsUrl } from '@/app/lib/analytics-paths';
+import { isAdminAnalyticsUrl, isProductAnalyticsFreeUrl } from '@/app/lib/analytics-paths';
 
 // A throw here would take down the root layout (see the try/catch below), so
 // the failure is swallowed — but swallowing it silently would hide a broken
@@ -24,38 +25,42 @@ let hasReportedIdentityFailure = false;
  * anonymous → authenticated funnel — at which point it silently resolves to
  * nothing while every dashboard looks healthy.
  *
- * Mounted directly under `SessionProviderWrapper` in `app/layout.tsx`: it needs
- * `useSession()` and nothing else, it must run on every route (a person can be
- * created on any page, not just the ones under `SiteChrome`), and it renders
- * nothing. `AnalyticsClient` — the other analytics side-effect component — sits
- * OUTSIDE the session provider and would throw if it called `useSession()`,
- * which is why this is a separate component rather than a few more lines there.
+ * Mounted under ConsentProvider, alongside AnalyticsClient, on every route.
+ * It waits for settled authentication and account consent before identifying.
+ * Keeping identity reconciliation separate from pageviews leaves the account
+ * switch/reset rules in one place.
  *
  * ## Why this is not `reconcileAnalyticsIdentity`
  *
  * Mobile drives the shared reconciler from `@boardsesh/analytics`, and both
- * platforms still agree on the person — both identify with `users.id`, the same
- * value `getPosthogDistinctId()` hands the server-side flag read. What differs
- * is the substrate underneath. Mobile's anonymous identity is a party-profile
- * UUID it owns and can hand to `alias()`; web's is the SDK's own anonymous id,
- * and web therefore needs two behaviours the shared routine cannot express:
+ * platforms agree on the person — both identify with `users.id`, the same
+ * value `getPosthogDistinctId()` hands the server-side flag read — and on the
+ * anonymous id, which is the SDK's own on both. The two routines follow the
+ * same rules. They stay separate because web re-sends `identify()` on every
+ * hard load to guarantee the `email` person property (see the effect below)
+ * and has the admin / embed exclusions, neither of which mobile wants.
  *
- *  - **No `alias()`.** `identify()` already merges the anonymous person into
- *    the authenticated one by sending `$anon_distinct_id`, and PostHog refuses
- *    that merge when the source is already identified. `$create_alias` has no
- *    such protection: firing it while the client is pinned to another user's id
- *    merges two real people, irreversibly. Dropping the call removes the whole
- *    failure class instead of guarding it.
- *  - **Signed out means `reset()` and nothing else.** The shared routine
- *    follows its reset with `identify(anonId)`, which flips the SDK back to
+ *  - **No `alias()`, on either platform.** `identify()` already merges the
+ *    anonymous person into the authenticated one by sending
+ *    `$anon_distinct_id`, and PostHog refuses that merge when the source is
+ *    already identified. `$create_alias` has no such protection: firing it
+ *    while the client is pinned to another user's id merges two real people,
+ *    irreversibly. Dropping the call removes the whole failure class instead of
+ *    guarding it.
+ *  - **Signed out means `reset()` and nothing else, and only when pinned.**
+ *    Following the reset with `identify(anonId)` flips the SDK back to
  *    `PersonMode: 'identified'`, creates a junk identified person per sign-out,
- *    and stamps `$is_identified: true` on every later anonymous event. Letting
- *    the SDK mint its own anonymous id after a reset keeps
- *    `distinctId === anonymousId` a truthful test for "anonymous".
+ *    and stamps `$is_identified: true` on every later anonymous event. Mobile
+ *    did exactly that with its party-profile UUID until #6078, and it split
+ *    returning climbers across two persons (see "Identity-split pitfall" in
+ *    `docs/analytics/growth-metrics.md`). Letting the SDK mint its own anonymous id
+ *    after a reset keeps `distinctId === anonymousId` a truthful test for
+ *    "anonymous".
  */
 export default function AnalyticsIdentity() {
   const { data: session, status } = useSession();
   const pathname = usePathname();
+  const { granted } = useConsent();
 
   const authUserId = session?.user?.id ?? null;
   const authEmail = session?.user?.email ?? null;
@@ -63,13 +68,13 @@ export default function AnalyticsIdentity() {
   useEffect(() => {
     // Reconciling against a half-resolved session would identify the wrong
     // person; `status === 'loading'` is every page load's first render.
-    if (status === 'loading') return;
+    if (status === 'loading' || !granted) return;
     // Admin pages are excluded from analytics wholesale, and /embed/** must
     // capture nothing at all — those are iframe widgets on gym websites whose
     // visitors never saw a consent surface (see analytics-paths.ts). Identity
     // events are as much of a capture as a pageview. `pathname` is in the deps,
     // so navigating off either surface reconciles then.
-    if (pathname && (isAdminAnalyticsUrl(pathname) || isEmbedAnalyticsUrl(pathname))) return;
+    if (pathname && (isAdminAnalyticsUrl(pathname) || isProductAnalyticsFreeUrl(pathname))) return;
 
     try {
       // `null` means no PostHog client (server render, dev, preview, missing
@@ -115,7 +120,7 @@ export default function AnalyticsIdentity() {
         Sentry.captureException(error);
       }
     }
-  }, [status, authUserId, authEmail, pathname]);
+  }, [status, authUserId, authEmail, pathname, granted]);
 
   return null;
 }

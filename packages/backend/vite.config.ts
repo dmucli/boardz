@@ -1,14 +1,34 @@
+import { createRequire } from 'node:module';
 import { defineConfig } from 'vite-plus';
 import { SERIAL_TEST_FILES } from './vitest-serial-files.ts';
 
+// Vite resolves a bare `graphql` import to its `module` field (index.mjs), while
+// `@graphql-tools/schema` and the servers stay externalised on Node's resolution
+// (index.js). Two copies of graphql-js in one process means `execute` rejects the
+// schema as "from another module or realm", so inlined code is pointed at the
+// same CommonJS entry the app actually runs on under tsx.
+const graphqlEntry = createRequire(import.meta.url).resolve('graphql');
+
 export default defineConfig({
   test: {
+    // Preserve mock history from setup and beforeAll when upgrading from Vitest 4.
+    clearMocks: false,
     name: 'backend',
     globals: true,
     environment: 'node',
     include: ['src/**/*.test.ts'],
     // These run one at a time in the backend-serial project (vite.serial.config.ts).
-    exclude: ['**/node_modules/**', '**/dist/**', ...SERIAL_TEST_FILES],
+    // The auth-identities project (vite.auth-identities.config.ts) owns the identity
+    // audit files that use disposable databases.
+    // Authority mapping proofs likewise own disposable databases in their config.
+    exclude: [
+      '**/node_modules/**',
+      '**/dist/**',
+      'src/auth/authority/**',
+      'src/auth/__tests__/identity-audit*.test.ts',
+      ...SERIAL_TEST_FILES,
+    ],
+    alias: [{ find: /^graphql$/, replacement: graphqlEntry }],
     globalSetup: ['./src/__tests__/global-setup.ts'],
     setupFiles: ['./src/__tests__/setup.ts'],
     testTimeout: 10000,

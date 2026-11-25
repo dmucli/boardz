@@ -29,6 +29,7 @@ import {
   CHOOSE_BOARD_FOR_SERIAL,
   REPORT_BOARD_CLIMB,
   REPORT_BOARD_DISCONNECT,
+  REPORT_BOARD_CLEAR,
   RESOLVE_BOARD_CANDIDATES_FOR_SERIAL,
   RESOLVE_BOARD_FOR_CONFIG,
   RESOLVE_BOARD_FOR_SERIAL,
@@ -55,6 +56,7 @@ type BoardPresenceStatsData = { boardPresenceStats: BoardPresenceStats };
 type BoardConnectionData = { boardConnection: BoardConnectionHolder | null };
 type ReportBoardClimbData = { reportBoardClimb: boolean };
 type ReportBoardDisconnectData = { reportBoardDisconnect: boolean };
+type ReportBoardClearData = { reportBoardClear: boolean };
 type ResolveBoardForSerialData = { resolveBoardForSerial: ResolvedBoard };
 type ResolveBoardForUuidData = { resolveBoardForUuid: ResolvedBoard };
 type ResolveBoardForConfigData = { resolveBoardForConfig: ResolvedBoard };
@@ -76,6 +78,12 @@ export type SerialResolveArgs = {
    * above is the route the climber is on, which is not the same fact.
    */
   advertisedBoardType?: string;
+  /**
+   * The board the caller already had selected when the connect landed. Wins
+   * over serial matching when its config matches the connected controller —
+   * see the `resolveBoardCandidatesForSerial` SDL docs.
+   */
+  selectedBoardUuid?: string | null;
 };
 
 /** A GraphQL operation: the query/mutation/subscription string plus variables. */
@@ -129,6 +137,10 @@ export type FullBoardPresenceClient = Required<BoardPresenceClient> & {
  * `execute`/`subscribe`/`onConnected` bound to their own graphql-ws `Client` —
  * see the header comment for why this factory exists.
  */
+function boardReadVariables(boardId: number, boardUuid?: string | null): { boardId: number; boardUuid?: string } {
+  return { boardId, ...(boardUuid ? { boardUuid } : {}) };
+}
+
 export function createBoardPresenceClient(transport: BoardPresenceTransport): FullBoardPresenceClient {
   // Whether ANY `onReconnect` registration made through this factory instance
   // has observed a `connected` event. Factory-level, NOT per-registration, on
@@ -144,23 +156,23 @@ export function createBoardPresenceClient(transport: BoardPresenceTransport): Fu
   // catch-up is safe — the hook's runCatchUp coalesces in-flight requests.
   let everConnected = false;
   return {
-    async fetchRecentHistory(boardId) {
+    async fetchRecentHistory(boardId, boardUuid) {
       const response = await transport.execute<{ boardRecentHistory: BoardPresenceClimb[] }>({
         query: BOARD_RECENT_HISTORY,
-        variables: { boardId },
+        variables: { ...boardReadVariables(boardId, boardUuid), includeAurora: true },
       });
       return response.boardRecentHistory;
     },
     async fetchHistoryPage(boardId, opts) {
       const response = await transport.execute<{ boardHistoryPage: BoardHistoryPage }>({
         query: BOARD_HISTORY_PAGE,
-        variables: { boardId, ...opts },
+        variables: { boardId, ...opts, includeAurora: true },
       });
       return response.boardHistoryPage;
     },
-    subscribeNowPlaying(boardId, onEvent, onError, onComplete) {
+    subscribeNowPlaying(boardId, onEvent, onError, onComplete, boardUuid) {
       return transport.subscribe<BoardNowPlayingData>(
-        { query: BOARD_NOW_PLAYING, variables: { boardId } },
+        { query: BOARD_NOW_PLAYING, variables: { ...boardReadVariables(boardId, boardUuid), includeAurora: true } },
         {
           next: (data) => {
             if (data?.boardNowPlaying) {
@@ -191,10 +203,10 @@ export function createBoardPresenceClient(transport: BoardPresenceTransport): Fu
       });
     },
 
-    async fetchRecentClimbs(boardId) {
+    async fetchRecentClimbs(boardId, boardUuid) {
       const data = await transport.execute<BoardRecentClimbsData>({
         query: BOARD_RECENT_CLIMBS,
-        variables: { boardId },
+        variables: boardReadVariables(boardId, boardUuid),
       });
       return data.boardRecentClimbs ?? [];
     },
@@ -202,23 +214,27 @@ export function createBoardPresenceClient(transport: BoardPresenceTransport): Fu
     async fetchHistory(boardId, opts) {
       const data = await transport.execute<BoardHistoryData>({
         query: BOARD_HISTORY,
-        variables: { boardId, limit: opts?.limit ?? null, before: opts?.before ?? null },
+        variables: {
+          ...boardReadVariables(boardId, opts?.boardUuid),
+          limit: opts?.limit ?? null,
+          before: opts?.before ?? null,
+        },
       });
       return data.boardHistory ?? [];
     },
 
-    async fetchClimbRecentSenders(boardId, climbUuid, angle) {
+    async fetchClimbRecentSenders(boardId, climbUuid, angle, boardUuid) {
       const data = await transport.execute<BoardClimbRecentSendersData>({
         query: BOARD_CLIMB_RECENT_SENDERS,
-        variables: { boardId, climbUuid, angle },
+        variables: { ...boardReadVariables(boardId, boardUuid), climbUuid, angle },
       });
       return data.boardClimbRecentSenders ?? [];
     },
 
-    async fetchStats(boardId) {
+    async fetchStats(boardId, boardUuid) {
       const data = await transport.execute<BoardPresenceStatsData>({
         query: BOARD_PRESENCE_STATS,
-        variables: { boardId },
+        variables: boardReadVariables(boardId, boardUuid),
       });
       return data.boardPresenceStats;
     },
@@ -231,10 +247,10 @@ export function createBoardPresenceClient(transport: BoardPresenceTransport): Fu
       return data.reportBoardClimb === true;
     },
 
-    async fetchConnection(boardId) {
+    async fetchConnection(boardId, boardUuid) {
       const data = await transport.execute<BoardConnectionData>({
         query: BOARD_CONNECTION,
-        variables: { boardId },
+        variables: boardReadVariables(boardId, boardUuid),
       });
       return data.boardConnection ?? null;
     },
@@ -245,6 +261,14 @@ export function createBoardPresenceClient(transport: BoardPresenceTransport): Fu
         variables: { boardId },
       });
       return data.reportBoardDisconnect === true;
+    },
+
+    async reportClear(boardId) {
+      const data = await transport.execute<ReportBoardClearData>({
+        query: REPORT_BOARD_CLEAR,
+        variables: { boardId },
+      });
+      return data.reportBoardClear === true;
     },
 
     async resolveBoardForSerial(args) {

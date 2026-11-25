@@ -2,6 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { onlineManager } from '@tanstack/react-query';
 import type { ClimbSearchInput } from '@boardsesh/shared-schema';
 
+// User registrations have their own integration suite, exercising the real
+// registrar. Keep this catalogue-policy suite independent of those readers.
+vi.mock('../offline-user-operations', () => ({ registerOfflineUserOperations: vi.fn() }));
+vi.mock('../offline-user-read-recovery', () => ({ recordLocalUserRead: vi.fn() }));
+
 // Client-level offline-aware interceptor: routes a registered document to local
 // SQLite when the board is downloaded + filters supported (even online), to the
 // network otherwise (online), and to a per-op empty/null fallback when offline
@@ -30,7 +35,9 @@ const {
   getSimilarClimbsLocal,
   ensureHoldIndex,
   getHoldHeatmapLocalWithCount,
+  fillClimbRevisionNumbersLocal,
 } = vi.hoisted(() => ({
+  fillClimbRevisionNumbersLocal: vi.fn(),
   getHoldHeatmapLocalWithCount: vi.fn(),
   getSimilarClimbsLocal: vi.fn(),
   ensureHoldIndex: vi.fn(),
@@ -50,6 +57,10 @@ const {
   recordOfflineReadUnavailable: vi.fn(),
 }));
 
+// The sign-in generation: `invalidateCredentialSnapshots()` moves it at
+// every sign-in and sign-out. A token refresh does not.
+const privacy = vi.hoisted(() => ({ generation: 0 }));
+vi.mock('../../privacy/privacy-cache', () => ({ getCredentialGeneration: () => privacy.generation }));
 vi.mock('../../../db', () => ({ getDatabaseHandle }));
 vi.mock('../../../db/queries/board-download-status', () => ({
   isBoardDownloadedLocally,
@@ -63,6 +74,7 @@ vi.mock('../../../db/queries/search-climbs-local', () => ({
   isOfflineSearchSupported,
 }));
 vi.mock('../../../db/queries/get-climb-local', () => ({ getClimbLocal }));
+vi.mock('../../../db/queries/climb-revisions-local', () => ({ fillClimbRevisionNumbersLocal }));
 vi.mock('../../../db/queries/get-boardsesh-grade-local', () => ({
   getBoardseshGradeLocal,
   getBoardseshGradesForAnglesLocal,
@@ -71,10 +83,18 @@ vi.mock('../client', () => ({ getHttpClient: () => ({ request }) }));
 vi.mock('../../../db/queries/get-similar-climbs-local', () => ({ getSimilarClimbsLocal }));
 vi.mock('../../../db/queries/get-hold-heatmap-local', () => ({ getHoldHeatmapLocalWithCount }));
 vi.mock('../../../offline/hold-index-parser', () => ({ parseHoldRows: vi.fn() }));
+// Liked climbs (#6002) are user-scoped: the local read needs the climber's own,
+// complete user data, decided by `canServeLocalUserData` for the signed-in id.
+const favoritesGate = vi.hoisted(() => ({
+  canServeLocalUserData: vi.fn(),
+  readLocalUserId: vi.fn(),
+}));
 vi.mock('@boardsesh/offline-sync', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@boardsesh/offline-sync')>()),
   ensureHoldIndex,
+  canServeLocalUserData: favoritesGate.canServeLocalUserData,
 }));
+vi.mock('../../local-user-id', () => ({ readLocalUserId: favoritesGate.readLocalUserId }));
 // The rollup gate itself is covered in @boardsesh/offline-sync; here we assert
 // the interceptor hands it the right LANE for each terminal outcome (#4317).
 vi.mock('../../../offline/offline-usage-signal', () => ({
@@ -91,14 +111,29 @@ vi.mock('../../connectivity/connectivity-store', () => ({
   getConnectivitySnapshot: () => connectivity.snapshot,
 }));
 
-const fakeDb = { tag: 'db' };
+// The owner stamp (`local_user_id` in sync_meta) is the only row the interceptor
+// itself reads; every other sync_meta read answers nothing. No catalogue marker
+// exists anywhere, which is the point (#6545).
+const ownerStamp = vi.hoisted(() => ({ userId: null as string | null }));
+const fakeDb = {
+  tag: 'db',
+  getFirstAsync: async (sql: string, params?: unknown[]) =>
+    sql.includes('sync_meta') && params?.[0] === 'local_user_id' && ownerStamp.userId !== null
+      ? { value: ownerStamp.userId }
+      : null,
+};
 
-import { offlineAwareRequest, registerOfflineOperationForTests } from '../offline-request';
+import {
+  NETWORK_ENRICHMENT_BUDGET_MS,
+  offlineAwareRequest,
+  registerOfflineOperationForTests,
+} from '../offline-request';
 import { setOfflineEngineEnabled, __resetOfflineEngineForTests } from '../../offline-engine';
 import {
   SEARCH_CLIMBS,
   SEARCH_CLIMBS_COUNT,
   GET_CLIMB,
+  GET_SPRAY_CLIMB,
   type SearchClimbsQueryResponse,
   type SearchClimbsCountQueryResponse,
   type GetClimbQueryResponse,
@@ -170,7 +205,10 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  privacy.generation = 0;
+  ownerStamp.userId = null;
   vi.clearAllMocks();
+  favoritesGate.readLocalUserId.mockResolvedValue(undefined);
   connectivity.snapshot = { effectiveOffline: false, reason: null };
   setOfflineEngineEnabled(true);
   getDatabaseHandle.mockReturnValue(fakeDb);
@@ -183,6 +221,11 @@ beforeEach(() => {
   getBoardseshGradesForAnglesLocal.mockResolvedValue([{ angle: 40, ...localGrade }]);
   isClimbLayoutDownloadedLocally.mockResolvedValue(true);
   getClimbStatsHistoryLocal.mockResolvedValue([localStatsEntry]);
+  // The phone holds none of the network climbs unless a test says otherwise:
+  // the fill hands back the array it was given.
+  fillClimbRevisionNumbersLocal.mockImplementation(
+    async (_db: unknown, _boardType: string, climbs: unknown[]) => climbs,
+  );
   request.mockResolvedValue({
     climbStatsHistory: [{ ...localStatsEntry, ascensionistCount: 99 }],
     searchClimbs: { climbs: [{ uuid: 'net' }], hasMore: true, totalCount: 99 },
@@ -274,6 +317,38 @@ describe('offlineAwareRequest — SEARCH_CLIMBS', () => {
   });
 });
 
+describe('offlineAwareRequest — SEARCH_CLIMBS liked climbs (#6002)', () => {
+  const likedInput: ClimbSearchInput = { ...searchInput, onlyFavorited: true };
+
+  beforeEach(() => {
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    favoritesGate.readLocalUserId.mockResolvedValue('me');
+  });
+
+  it("reads Liked locally when the phone holds the climber's complete user data", async () => {
+    setOnline(true);
+    favoritesGate.canServeLocalUserData.mockResolvedValue(true);
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: likedInput });
+    expect(result.searchClimbs.climbs[0].uuid).toBe('local');
+    expect(favoritesGate.canServeLocalUserData).toHaveBeenCalledWith(fakeDb, 'me');
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('asks the network when the local hearts are incomplete or another account’s', async () => {
+    setOnline(true);
+    favoritesGate.canServeLocalUserData.mockResolvedValue(false);
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: likedInput });
+    expect(result.searchClimbs.climbs[0].uuid).toBe('net');
+    expect(searchClimbsLocal).not.toHaveBeenCalled();
+  });
+
+  it('never consults the user-data gate for a search without Liked', async () => {
+    setOnline(true);
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+    expect(favoritesGate.canServeLocalUserData).not.toHaveBeenCalled();
+  });
+});
+
 describe('offlineAwareRequest — SEARCH_CLIMBS_COUNT', () => {
   it('counts locally when downloaded (online)', async () => {
     setOnline(true);
@@ -328,7 +403,77 @@ describe('offlineAwareRequest — SEARCH_CLIMBS_COUNT', () => {
   });
 });
 
+// A spray climb that lost a hold is listed with a badge, so a wall search sends
+// no hold-integrity value at all. The climber's own drafts list sends ANY.
+describe('offlineAwareRequest — spray searches over the network', () => {
+  const sprayInput: ClimbSearchInput = { boardName: 'spray', layoutId: 7, sizeId: 7, setIds: '1', angle: 25 };
+
+  beforeEach(() => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+  });
+
+  it('sends no holdIntegrity on a wall search and a wall count', async () => {
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: sprayInput });
+    expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS, { input: sprayInput });
+    await offlineAwareRequest<SearchClimbsCountQueryResponse>(SEARCH_CLIMBS_COUNT, { input: sprayInput });
+    expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS_COUNT, { input: sprayInput });
+    const sent = request.mock.calls.at(-1)?.[1] as { input: ClimbSearchInput };
+    expect('holdIntegrity' in sent.input).toBe(false);
+  });
+
+  it('drops a value an older caller still builds', async () => {
+    for (const holdIntegrity of ['INTACT', 'BROKEN', 'ANY'] as const) {
+      await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: { ...sprayInput, holdIntegrity } });
+      expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS, { input: sprayInput });
+    }
+  });
+
+  // ANY, not nothing: the current server hides retired climbs from every spray
+  // search without a value, drafts included, and a draft retired by an old full
+  // reset would then be out of reach.
+  it("sends ANY for the climber's drafts, so a draft that lost a hold still lists", async () => {
+    const draftsInput: ClimbSearchInput = { ...sprayInput, onlyDrafts: true };
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: draftsInput });
+    expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS, { input: { ...draftsInput, holdIntegrity: 'ANY' } });
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, {
+      input: { ...draftsInput, holdIntegrity: 'INTACT' },
+    });
+    expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS, { input: { ...draftsInput, holdIntegrity: 'ANY' } });
+  });
+
+  it('keeps a catalogue drafts search free of any value', async () => {
+    const draftsInput: ClimbSearchInput = { ...searchInput, onlyDrafts: true };
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: draftsInput });
+    expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS, { input: draftsInput });
+  });
+
+  it('leaves a catalogue search untouched and drops a stale value from it', async () => {
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+    expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS, { input: searchInput });
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, {
+      input: { ...searchInput, holdIntegrity: 'BROKEN' },
+    });
+    expect(request).toHaveBeenLastCalledWith(SEARCH_CLIMBS, { input: searchInput });
+  });
+
+  it('leaves the local read to apply the rule itself', async () => {
+    ownerStamp.userId = 'me';
+    favoritesGate.readLocalUserId.mockResolvedValue('me');
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: sprayInput });
+    expect(searchClimbsLocal).toHaveBeenCalledWith(fakeDb, sprayInput);
+    expect(request).not.toHaveBeenCalled();
+  });
+});
+
 describe('offlineAwareRequest — GET_CLIMB', () => {
+  it('uses the capability-aware document for legacy spray detail callers only', async () => {
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    const variables = { ...climbVars, boardName: 'spray', sprayWallUuid: 'held-wall' };
+    await offlineAwareRequest<GetClimbQueryResponse>(GET_CLIMB, variables);
+    expect(request).toHaveBeenLastCalledWith(GET_SPRAY_CLIMB, variables);
+  });
   it('reads detail locally when downloaded, without consulting the filter-support gate', async () => {
     setOnline(true);
     isBoardDownloadedLocally.mockResolvedValue(true);
@@ -340,6 +485,7 @@ describe('offlineAwareRequest — GET_CLIMB', () => {
       layoutId: 1,
       angle: 40,
       climbUuid: 'c1',
+      viewerId: null,
     });
     expect(request).not.toHaveBeenCalled();
   });
@@ -381,6 +527,247 @@ describe('offlineAwareRequest — GET_CLIMB', () => {
   });
 });
 
+// #6023. SearchClimbs and GetClimb cannot select `revisionNumber` /
+// `holdsRevisionNumber` while the screenshot fixtures pin their text, so a climb
+// read over the network gets them from the phone's own copy of the climb.
+describe('offlineAwareRequest — climb version numbers on a network answer', () => {
+  const versioned = (climbs: Array<{ uuid: string }>) =>
+    climbs.map((climb) => ({ ...climb, revisionNumber: 4, holdsRevisionNumber: 3 }));
+
+  it('fills a network search page from the phone, in one call for the whole page', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    fillClimbRevisionNumbersLocal.mockImplementation(async (_db, _boardType, climbs) => versioned(climbs));
+
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+
+    expect(fillClimbRevisionNumbersLocal).toHaveBeenCalledTimes(1);
+    expect(fillClimbRevisionNumbersLocal).toHaveBeenCalledWith(fakeDb, 'kilter', [{ uuid: 'net' }]);
+    expect(result.searchClimbs.climbs).toEqual([{ uuid: 'net', revisionNumber: 4, holdsRevisionNumber: 3 }]);
+    // The rest of the server's answer is untouched.
+    expect(result.searchClimbs.hasMore).toBe(true);
+  });
+
+  it('hands back the network response itself when the phone holds none of the climbs', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    const networkResponse = { searchClimbs: { climbs: [{ uuid: 'net' }], hasMore: false } };
+    request.mockResolvedValue(networkResponse);
+
+    expect(await offlineAwareRequest(SEARCH_CLIMBS, { input: searchInput })).toBe(networkResponse);
+  });
+
+  it('fills a network climb detail', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    fillClimbRevisionNumbersLocal.mockImplementation(async (_db, _boardType, climbs) => versioned(climbs));
+
+    const result = await offlineAwareRequest<GetClimbQueryResponse>(GET_CLIMB, climbVars);
+
+    expect(fillClimbRevisionNumbersLocal).toHaveBeenCalledWith(fakeDb, 'kilter', [{ uuid: 'net-detail' }]);
+    expect(result.climb).toEqual({ uuid: 'net-detail', revisionNumber: 4, holdsRevisionNumber: 3 });
+  });
+
+  it('does not ask the phone about a climb the server did not find', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    request.mockResolvedValue({ climb: null });
+
+    const result = await offlineAwareRequest<GetClimbQueryResponse>(GET_CLIMB, climbVars);
+
+    expect(result.climb).toBeNull();
+    expect(fillClimbRevisionNumbersLocal).not.toHaveBeenCalled();
+  });
+
+  it('keeps the network answer when the local read throws, and does not run the local rescue', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    fillClimbRevisionNumbersLocal.mockRejectedValue(new Error('database is locked'));
+
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+
+    expect(result.searchClimbs.climbs).toEqual([{ uuid: 'net' }]);
+    expect(searchClimbsLocal).not.toHaveBeenCalled();
+    expect(recordOfflineRead).not.toHaveBeenCalled();
+  });
+
+  it('keeps the network answer when there is no database handle', async () => {
+    setOnline(true);
+    getDatabaseHandle.mockReturnValue(null);
+
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+
+    expect(result.searchClimbs.climbs).toEqual([{ uuid: 'net' }]);
+    expect(fillClimbRevisionNumbersLocal).not.toHaveBeenCalled();
+  });
+
+  // The network already answered. A busy SQLite file (a snapshot import, a
+  // sync page) must not hold the screen back for a number it can live without.
+  it('hands over the network answer un-enriched when the local read outlasts its budget', async () => {
+    vi.useFakeTimers();
+    try {
+      setOnline(true);
+      isBoardDownloadedLocally.mockResolvedValue(false);
+      let finishLocalRead: (climbs: unknown[]) => void = () => {};
+      fillClimbRevisionNumbersLocal.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            finishLocalRead = resolve;
+          }),
+      );
+
+      let settled: SearchClimbsQueryResponse | undefined;
+      const pending = offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput }).then(
+        (response) => {
+          settled = response;
+          return response;
+        },
+      );
+
+      await vi.advanceTimersByTimeAsync(NETWORK_ENRICHMENT_BUDGET_MS - 1);
+      expect(settled).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await pending;
+      expect(result.searchClimbs.climbs).toEqual([{ uuid: 'net' }]);
+      expect(result.searchClimbs.hasMore).toBe(true);
+
+      // The late read changes nothing and raises nothing.
+      finishLocalRead(versioned([{ uuid: 'net' }]));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(result.searchClimbs.climbs).toEqual([{ uuid: 'net' }]);
+      expect(searchClimbsLocal).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('swallows a local read that rejects after the budget ran out', async () => {
+    vi.useFakeTimers();
+    try {
+      setOnline(true);
+      isBoardDownloadedLocally.mockResolvedValue(false);
+      let failLocalRead: (error: Error) => void = () => {};
+      fillClimbRevisionNumbersLocal.mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            failLocalRead = reject;
+          }),
+      );
+
+      const pending = offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+      await vi.advanceTimersByTimeAsync(NETWORK_ENRICHMENT_BUDGET_MS);
+      expect((await pending).searchClimbs.climbs).toEqual([{ uuid: 'net' }]);
+
+      failLocalRead(new Error('database is locked'));
+      await vi.advanceTimersByTimeAsync(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves no timer behind when the local read answers in time', async () => {
+    vi.useFakeTimers();
+    try {
+      setOnline(true);
+      isBoardDownloadedLocally.mockResolvedValue(false);
+
+      await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('skips the local read outright when the offline engine is off', async () => {
+    setOnline(true);
+    setOfflineEngineEnabled(false);
+
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+
+    expect(result.searchClimbs.climbs).toEqual([{ uuid: 'net' }]);
+    expect(fillClimbRevisionNumbersLocal).not.toHaveBeenCalled();
+    // Not even a handle lookup on behalf of the enrichment.
+    expect(getDatabaseHandle).not.toHaveBeenCalled();
+  });
+
+  // Any registered enrichment, not only the two real ones: whatever it does
+  // wrong, the caller gets the network's own object back.
+  describe('a registered enrichNetworkResponse that fails', () => {
+    type EnrichVars = { boardName: string };
+    type EnrichResponse = { items: string[] };
+    const ENRICH_DOC = 'query EnrichmentFailureProbe { items }';
+    const networkAnswer: EnrichResponse = { items: ['net'] };
+
+    async function requestWithEnrichment(enrichNetworkResponse: () => Promise<EnrichResponse>) {
+      const resolveLocal = vi.fn();
+      const unregister = registerOfflineOperationForTests<EnrichVars, EnrichResponse>({
+        document: ENRICH_DOC,
+        surface: 'search',
+        boardNameOf: ({ boardName }) => boardName,
+        canServeLocal: async () => false,
+        resolveLocal,
+        offlineFallback: () => ({ items: [] }),
+        enrichNetworkResponse,
+      });
+      try {
+        setOnline(true);
+        request.mockResolvedValue(networkAnswer);
+        const result = await offlineAwareRequest<EnrichResponse>(ENRICH_DOC, { boardName: 'kilter' });
+        return { result, resolveLocal };
+      } finally {
+        unregister();
+      }
+    }
+
+    it('returns the raw network answer when it throws synchronously', async () => {
+      const enrich = vi.fn((): Promise<EnrichResponse> => {
+        throw new Error('thrown before any promise existed');
+      });
+
+      const { result, resolveLocal } = await requestWithEnrichment(enrich);
+
+      expect(enrich).toHaveBeenCalledTimes(1);
+      expect(result).toBe(networkAnswer);
+      // Not mistaken for a network failure: no local rescue, no offline lane.
+      expect(resolveLocal).not.toHaveBeenCalled();
+      expect(recordOfflineRead).not.toHaveBeenCalled();
+    });
+
+    it('returns the raw network answer when it rejects', async () => {
+      const enrich = vi.fn(async (): Promise<EnrichResponse> => {
+        throw new Error('database is locked');
+      });
+
+      const { result, resolveLocal } = await requestWithEnrichment(enrich);
+
+      expect(enrich).toHaveBeenCalledTimes(1);
+      expect(result).toBe(networkAnswer);
+      expect(resolveLocal).not.toHaveBeenCalled();
+      expect(recordOfflineRead).not.toHaveBeenCalled();
+    });
+  });
+
+  it('does not touch a local answer: the local readers select the numbers themselves', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+
+    await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+
+    expect(fillClimbRevisionNumbersLocal).not.toHaveBeenCalled();
+  });
+
+  it('leaves operations with no climbs in them alone', async () => {
+    setOnline(true);
+    isBoardTypeDownloadedLocally.mockResolvedValue(false);
+
+    await offlineAwareRequest(BOARDSESH_GRADE, gradeVars);
+
+    expect(fillClimbRevisionNumbersLocal).not.toHaveBeenCalled();
+  });
+});
+
 describe('offlineAwareRequest — empty search results are answers, not misses', () => {
   it('does not retry an empty local SEARCH_CLIMBS result over the network', async () => {
     setOnline(true);
@@ -397,7 +784,7 @@ describe('offlineAwareRequest — BOARDSESH_GRADE', () => {
     setOnline(true);
     const result = await offlineAwareRequest<BoardseshGradeResponse>(BOARDSESH_GRADE, gradeVars);
     expect(result).toEqual({ boardseshGrade: localGrade });
-    expect(getBoardseshGradeLocal).toHaveBeenCalledWith(fakeDb, gradeVars);
+    expect(getBoardseshGradeLocal).toHaveBeenCalledWith(fakeDb, { ...gradeVars, viewerId: null });
     expect(request).not.toHaveBeenCalled();
   });
 
@@ -444,7 +831,7 @@ describe('offlineAwareRequest — BOARDSESH_GRADE', () => {
 });
 
 describe('offlineAwareRequest — BOARDSESH_GRADES_FOR_ANGLES', () => {
-  it('reads all angles locally when the board type is downloaded (online)', async () => {
+  it("reads all angles locally when the climb's layout is downloaded (online)", async () => {
     setOnline(true);
     const result = await offlineAwareRequest<BoardseshGradesForAnglesResponse>(
       BOARDSESH_GRADES_FOR_ANGLES,
@@ -452,20 +839,19 @@ describe('offlineAwareRequest — BOARDSESH_GRADES_FOR_ANGLES', () => {
     );
     expect(result.boardseshGradesForAngles).toHaveLength(1);
     expect(result.boardseshGradesForAngles[0].angle).toBe(40);
-    expect(getBoardseshGradesForAnglesLocal).toHaveBeenCalledWith(fakeDb, gradesForAnglesVars);
+    expect(isClimbLayoutDownloadedLocally).toHaveBeenCalledWith(
+      fakeDb,
+      gradesForAnglesVars.boardName,
+      gradesForAnglesVars.climbUuid,
+      'board_climb_grades',
+    );
+    expect(getBoardseshGradesForAnglesLocal).toHaveBeenCalledWith(fakeDb, { ...gradesForAnglesVars, viewerId: null });
     expect(request).not.toHaveBeenCalled();
   });
 
-  // Deliberate divergence from BOARDSESH_GRADE (see the "retries a local miss"
-  // test above and the registration comment in offline-request.ts): a null single
-  // grade IS retried over the network, but an empty by-angle list is NOT. An empty
-  // list is often correct (MoonBoard / too-few-ascents climbs are never graded),
-  // and neither grade op carries layout/size to distinguish "genuinely ungraded"
-  // from "this scope hasn't synced to this device" — so retrying here would add a
-  // network round trip on every chart open for the common ungraded case. Accepted
-  // consequence: a climb whose grades never synced to this device (cross-scope via
-  // party queue / deep link / similar climbs) can show a grade in the collapsed
-  // view but an empty expanded by-angle chart, until the board's next sync.
+  // Unlike BOARDSESH_GRADE, a null single grade is retried but an empty by-angle
+  // list is not: empty is often correct (too-few-ascents climbs).
+  // The layout gate is what sends unknown uuids to the server.
   it('does not retry an empty local list over the network — an empty result is an answer (no grades)', async () => {
     setOnline(true);
     getBoardseshGradesForAnglesLocal.mockResolvedValue([]);
@@ -479,7 +865,7 @@ describe('offlineAwareRequest — BOARDSESH_GRADES_FOR_ANGLES', () => {
 
   it('returns the empty list when offline with no local data', async () => {
     setOnline(false);
-    isBoardTypeDownloadedLocally.mockResolvedValue(false);
+    isClimbLayoutDownloadedLocally.mockResolvedValue(false);
     const result = await offlineAwareRequest<BoardseshGradesForAnglesResponse>(
       BOARDSESH_GRADES_FOR_ANGLES,
       gradesForAnglesVars,
@@ -488,9 +874,9 @@ describe('offlineAwareRequest — BOARDSESH_GRADES_FOR_ANGLES', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it('falls back to the network when the board type is not downloaded (online)', async () => {
+  it("falls back to the network when the climb's layout is not downloaded (online)", async () => {
     setOnline(true);
-    isBoardTypeDownloadedLocally.mockResolvedValue(false);
+    isClimbLayoutDownloadedLocally.mockResolvedValue(false);
     const result = await offlineAwareRequest<BoardseshGradesForAnglesResponse>(
       BOARDSESH_GRADES_FOR_ANGLES,
       gradesForAnglesVars,
@@ -506,8 +892,8 @@ describe('offlineAwareRequest — CLIMB_STATS_HISTORY', () => {
     setOnline(true);
     const result = await offlineAwareRequest<ClimbStatsHistoryResponse>(CLIMB_STATS_HISTORY, statsHistoryVars);
     expect(result).toEqual({ climbStatsHistory: [localStatsEntry] });
-    expect(isClimbLayoutDownloadedLocally).toHaveBeenCalledWith(fakeDb, 'kilter', 'c1');
-    expect(getClimbStatsHistoryLocal).toHaveBeenCalledWith(fakeDb, statsHistoryVars);
+    expect(isClimbLayoutDownloadedLocally).toHaveBeenCalledWith(fakeDb, 'kilter', 'c1', 'board_climb_stats');
+    expect(getClimbStatsHistoryLocal).toHaveBeenCalledWith(fakeDb, { ...statsHistoryVars, viewerId: null });
     expect(request).not.toHaveBeenCalled();
   });
 
@@ -1258,5 +1644,179 @@ describe('offlineAwareRequest — HOLD_HEATMAP_QUERY (local-only)', () => {
     expect(recordOfflineReadUnavailable).toHaveBeenCalledWith(
       expect.objectContaining({ reason: 'filter_unsupported', surface: 'hold_heatmap' }),
     );
+  });
+});
+
+describe('a sign-in or sign-out while a request is in flight', () => {
+  // `privacy.generation` is the in-memory sign-in generation. With the catalogue
+  // marker gone (#6545) it is the only thing that retires an answer begun under
+  // the previous session.
+  it('discards a network response when the account changes while it is in flight', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    request.mockImplementationOnce(async () => {
+      privacy.generation += 1;
+      return { climb: { uuid: 'previous-session' } };
+    });
+    await expect(offlineAwareRequest(GET_CLIMB, climbVars)).rejects.toMatchObject({
+      name: 'AbortError',
+      message: 'Privacy changed during climb request',
+    });
+    expect(fillClimbRevisionNumbersLocal).not.toHaveBeenCalled();
+  });
+
+  it('discards an answer when the account changes while local network enrichment is pending', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(false);
+    fillClimbRevisionNumbersLocal.mockImplementationOnce(async (_db: unknown, _board: string, climbs: unknown[]) => {
+      privacy.generation += 1;
+      return climbs;
+    });
+    await expect(offlineAwareRequest(SEARCH_CLIMBS, { input: searchInput })).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+  });
+
+  it('does not rescue a request that failed after the account changed', async () => {
+    // Engine off, so the read goes straight to the network; the board IS
+    // downloaded, so only the account change keeps the rescue away.
+    setOnline(true);
+    setOfflineEngineEnabled(false);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    request.mockImplementationOnce(async () => {
+      privacy.generation += 1;
+      throw new Error('old request failed');
+    });
+    await expect(offlineAwareRequest(SEARCH_CLIMBS, { input: searchInput })).rejects.toThrow('old request failed');
+    expect(searchClimbsLocal).not.toHaveBeenCalled();
+  });
+
+  it('returns the fallback for a local result that finishes after the account changed', async () => {
+    setOnline(false);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    searchClimbsLocal.mockImplementationOnce(async () => {
+      privacy.generation += 1;
+      return { climbs: [{ uuid: 'previous-session' }], hasMore: false };
+    });
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+    expect(result.searchClimbs.climbs).toEqual([]);
+  });
+});
+
+// #6545: downloads have no viewer gate. A token refresh, a reconnect or a fresh
+// launch must not stop a downloaded board from answering. If a catalogue marker
+// gate comes back, these go red: nothing in sync_meta would satisfy it.
+describe('downloaded boards answer with no catalogue marker', () => {
+  it('serves a fresh launch offline, with nothing in sync_meta', async () => {
+    setOnline(false);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    expect(await offlineAwareRequest<GetClimbQueryResponse>(GET_CLIMB, climbVars)).toEqual({
+      climb: { uuid: 'local-detail' },
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('serves a fresh launch online, local-first, with nothing in sync_meta', async () => {
+    setOnline(true);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+    expect(result.searchClimbs.climbs).toEqual([{ uuid: 'local' }]);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  // What a token refresh leaves behind (`auth-interceptor.ts` writes the new token
+  // under the same generation): the same account and the same stamp, and still no
+  // marker. The token string itself is not modelled here; nothing reads it.
+  it('keeps answering locally for a stamped account with no marker', async () => {
+    setOnline(false);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    ownerStamp.userId = 'me';
+    favoritesGate.readLocalUserId.mockResolvedValue('me');
+    for (let read = 0; read < 2; read += 1) {
+      expect((await offlineAwareRequest<GetClimbQueryResponse>(GET_CLIMB, climbVars)).climb).toEqual({
+        uuid: 'local-detail',
+      });
+    }
+    expect(getClimbLocal).toHaveBeenCalledTimes(2);
+  });
+
+  // Signing in again as the same account moves the generation
+  // (`storeTokens` → `advanceCredentialGeneration`). The next read is local again.
+  it('answers locally again after the same account signs in again', async () => {
+    setOnline(false);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    ownerStamp.userId = 'me';
+    favoritesGate.readLocalUserId.mockResolvedValue('me');
+    privacy.generation += 1;
+    expect((await offlineAwareRequest<GetClimbQueryResponse>(GET_CLIMB, climbVars)).climb).toEqual({
+      uuid: 'local-detail',
+    });
+  });
+
+  it("asks the detail read for the signed-in account's drafts only", async () => {
+    setOnline(false);
+    isBoardDownloadedLocally.mockResolvedValue(true);
+    favoritesGate.readLocalUserId.mockResolvedValue('me');
+    await offlineAwareRequest(GET_CLIMB, climbVars);
+    await offlineAwareRequest(BOARDSESH_GRADE, gradeVars);
+    await offlineAwareRequest(BOARDSESH_GRADES_FOR_ANGLES, gradesForAnglesVars);
+    await offlineAwareRequest(CLIMB_STATS_HISTORY, statsHistoryVars);
+    expect(getClimbLocal).toHaveBeenCalledWith(fakeDb, expect.objectContaining({ viewerId: 'me' }));
+    expect(getBoardseshGradeLocal).toHaveBeenCalledWith(fakeDb, { ...gradeVars, viewerId: 'me' });
+    expect(getBoardseshGradesForAnglesLocal).toHaveBeenCalledWith(fakeDb, { ...gradesForAnglesVars, viewerId: 'me' });
+    expect(getClimbStatsHistoryLocal).toHaveBeenCalledWith(fakeDb, { ...statsHistoryVars, viewerId: 'me' });
+  });
+});
+
+// The rows on the phone can still belong to the previous account when its
+// sign-out wipe failed or never ran. Until the owner-stamp recovery replaces
+// them, nothing answers locally: local search binds ticks to the stamp.
+describe('rows stamped for another account', () => {
+  beforeEach(() => {
+    ownerStamp.userId = 'previous-account';
+    favoritesGate.readLocalUserId.mockResolvedValue('me');
+    isBoardDownloadedLocally.mockResolvedValue(true);
+  });
+
+  it('returns the offline fallback instead of the local read', async () => {
+    setOnline(false);
+    expect(await offlineAwareRequest(GET_CLIMB, climbVars)).toEqual({ climb: null });
+    expect(getClimbLocal).not.toHaveBeenCalled();
+  });
+
+  it('goes to the network online', async () => {
+    setOnline(true);
+    const result = await offlineAwareRequest<SearchClimbsQueryResponse>(SEARCH_CLIMBS, { input: searchInput });
+    expect(result.searchClimbs.climbs).toEqual([{ uuid: 'net' }]);
+    expect(searchClimbsLocal).not.toHaveBeenCalled();
+  });
+
+  it('does not rescue a failed request from those rows', async () => {
+    setOnline(true);
+    setOfflineEngineEnabled(false);
+    request.mockRejectedValueOnce(new Error('network unavailable'));
+    await expect(offlineAwareRequest(SEARCH_CLIMBS, { input: searchInput })).rejects.toThrow('network unavailable');
+    expect(searchClimbsLocal).not.toHaveBeenCalled();
+  });
+
+  it('keeps a local-only read on its empty fallback', async () => {
+    setOnline(true);
+    expect(
+      await offlineAwareRequest(SIMILAR_CLIMBS_QUERY, { input: { boardType: 'kilter', layoutId: 1, sizeId: 5 } }),
+    ).toEqual({ similarClimbs: [] });
+    expect(getSimilarClimbsLocal).not.toHaveBeenCalled();
+  });
+
+  it('declines while signed out too', async () => {
+    setOnline(false);
+    favoritesGate.readLocalUserId.mockResolvedValue(undefined);
+    expect(await offlineAwareRequest(GET_CLIMB, climbVars)).toEqual({ climb: null });
+    expect(getClimbLocal).not.toHaveBeenCalled();
+  });
+
+  it('answers again once the stamp names the signed-in account', async () => {
+    setOnline(false);
+    ownerStamp.userId = 'me';
+    expect(await offlineAwareRequest(GET_CLIMB, climbVars)).toEqual({ climb: { uuid: 'local-detail' } });
   });
 });

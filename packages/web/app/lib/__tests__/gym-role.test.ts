@@ -22,6 +22,8 @@ function makeGym(overrides?: Partial<Gym>): Gym {
     canGrantAccess: true,
     canClaim: false,
     isClaimed: true,
+    canClaimByDomain: false,
+    listingState: 'RUN_BY_GYM',
     ...overrides,
   };
 }

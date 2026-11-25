@@ -18,6 +18,7 @@ type PressableProps = {
   accessibilityActions?: ReadonlyArray<{ name: string; label?: string }>;
   onAccessibilityAction?: (event: { nativeEvent: { actionName: string } }) => void;
   testID?: string;
+  disabled?: boolean;
 };
 
 const harness = vi.hoisted(() => ({
@@ -25,6 +26,7 @@ const harness = vi.hoisted(() => ({
   settings: {} as Record<string, unknown>,
   reduceMotion: false,
   pressable: null as PressableProps | null,
+  viewer: null as { title: string; onActivate?: () => void } | null,
 }));
 
 vi.mock('react-native', () => ({
@@ -48,7 +50,7 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({
-    systemColors: { label: '#111111', secondaryLabel: '#666666', tertiaryLabel: '#AAAAAA' },
+    systemColors: { label: '#111111', secondaryLabel: '#666666', tertiaryLabel: '#AAAAAA', accent: '#6D28D9' },
     brandColors: { error: '#C81E1E', primary: '#7C3AED' },
   }),
 }));
@@ -61,6 +63,10 @@ vi.mock('../../../lib/clock', () => ({ nowMs: () => harness.nowMs }));
 
 vi.mock('../../../lib/haptics', () => ({ hapticMedium: vi.fn() }));
 
+// The crew pacer line reads the wall-driver rule (the queue and Bluetooth
+// providers); it has its own tests (rest-timer-pacer-caption.test.tsx).
+vi.mock('../RestTimerPacerCaption', () => ({ RestTimerPacerCaption: () => null }));
+
 vi.mock('../../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 3: 12, 4: 16 } }));
 vi.mock('../../../theme/typography', () => ({
   CHROME_LABEL_MAX_FONT_SCALE: 1.2,
@@ -70,6 +76,23 @@ vi.mock('../../../theme/typography', () => ({
 vi.mock('../../Text', () => ({
   Text: ({ children, color, testID }: { children?: ReactNode; color?: string; testID?: string }) =>
     createElement('span', { 'data-text': 'true', 'data-color': color ?? '', 'data-testid': testID }, children),
+}));
+
+vi.mock('../../LargeContentViewer', () => ({
+  LargeContentViewer: ({
+    title,
+    onActivate,
+    testID,
+    children,
+  }: {
+    title: string;
+    onActivate?: () => void;
+    testID?: string;
+    children?: ReactNode;
+  }) => {
+    harness.viewer = { title, onActivate };
+    return createElement('div', { 'data-viewer-title': title, 'data-testid': testID }, children);
+  },
 }));
 
 vi.mock('../../Icon', () => ({
@@ -89,6 +112,7 @@ vi.mock('../../PressableSurface', () => ({
         'data-hint': props.accessibilityHint,
         'data-actions': (props.accessibilityActions ?? []).map((action) => `${action.name}:${action.label}`).join('|'),
         onClick: props.onPress,
+        disabled: props.disabled,
       },
       props.children,
     );
@@ -107,16 +131,51 @@ import {
   noteRestTimerTick,
   pauseRestTimer,
   resetRestTimerStoreForTests,
+  resumeRestTimer,
   getRestTimerState,
 } from '../../../lib/rest-timer-store';
-import { RestTimerHeroClock, RestTimerPill } from '../RestTimerPill';
+import { RestTimerHeroClock, RestTimerPill, WorkoutStartPill } from '../RestTimerPill';
 
 const START_MS = Date.parse('2026-09-11T10:00:00.000Z');
 
+describe('WorkoutStartPill', () => {
+  afterEach(cleanup);
+
+  it.each([false, true])('offers a labeled start with compact=%s before the timer is armed', (compact) => {
+    const onPress = vi.fn();
+    const { getByTestId, queryByTestId } = render(
+      <WorkoutStartPill onPress={onPress} firstClimbName="First climb" compact={compact} />,
+    );
+    const start = getByTestId('workout-start-pill');
+    expect(start.textContent).toContain('mobile.workoutRunner.startWorkout');
+    expect(start.getAttribute('data-hint')).toBe('mobile.workoutRunner.startHint:First climb');
+    expect(queryByTestId('rest-timer-pill-elapsed')).toBeNull();
+    expect(harness.pressable?.onLongPress).toBeUndefined();
+    expect(harness.pressable?.accessibilityActions).toBeUndefined();
+    fireEvent.click(start);
+    expect(onPress).toHaveBeenCalledOnce();
+  });
+
+  it('disables Start and its large-content activation when no workout climb remains', () => {
+    const onPress = vi.fn();
+    const { getByTestId } = render(<WorkoutStartPill onPress={onPress} firstClimbName={null} />);
+    const start = getByTestId('workout-start-pill') as HTMLButtonElement;
+    expect(start.disabled).toBe(true);
+    expect(start.getAttribute('data-hint')).toBe('mobile.workoutRunner.startEmptyHint');
+    expect(harness.viewer?.onActivate).toBeUndefined();
+    fireEvent.click(start);
+    expect(onPress).not.toHaveBeenCalled();
+  });
+});
+
 function advanceSeconds(seconds: number) {
+  advanceMs(seconds * 1000);
+}
+
+function advanceMs(ms: number) {
   act(() => {
-    harness.nowMs += seconds * 1000;
-    vi.advanceTimersByTime(seconds * 1000);
+    harness.nowMs += ms;
+    vi.advanceTimersByTime(ms);
   });
 }
 
@@ -143,6 +202,7 @@ describe('RestTimerPill', () => {
     harness.nowMs = START_MS;
     harness.reduceMotion = false;
     harness.pressable = null;
+    harness.viewer = null;
     harness.settings = { restTimerTargetSeconds: 60, restTimerMode: 'afterTick', restTimerAutoAdvance: false };
   });
 
@@ -166,6 +226,8 @@ describe('RestTimerPill', () => {
       'mobile.restTimer.waitingForTick',
     );
     expect(elapsedColor(container)).toBe('#AAAAAA');
+    expect(harness.viewer?.title).toBe('mobile.restTimer.noTickAria:1m. mobile.restTimer.waitingForTick');
+
     expect(container.querySelector('[data-testid="rest-timer-pill"]')?.getAttribute('data-label')).toBe(
       'mobile.restTimer.noTickAria:1m',
     );
@@ -189,9 +251,9 @@ describe('RestTimerPill', () => {
     const { container } = render(<RestTimerPill onPress={vi.fn()} />);
 
     advanceSeconds(60);
-    // Exactly at zero is not yet over.
+    // Exactly at zero is not yet over: it is the last second of the countdown.
     expect(elapsedText(container)).toBe('0:00');
-    expect(elapsedColor(container)).toBe('#111111');
+    expect(elapsedColor(container)).toBe('#6D28D9');
 
     advanceSeconds(5);
     expect(elapsedText(container)).toBe('-0:05');
@@ -238,6 +300,50 @@ describe('RestTimerPill', () => {
       'mobile.restTimer.pausedAria:0:40',
     );
   });
+
+  it('pauses an every-minute rest past its first beat on the time left in that minute, not a negative', () => {
+    harness.settings = { ...harness.settings, restTimerMode: 'onTheMinute' };
+    act(() => armRestTimer('onTheMinute', harness.nowMs, null));
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+
+    advanceSeconds(230);
+    expect(elapsedText(container)).toBe('0:10');
+    act(() => pauseRestTimer(harness.nowMs));
+    // It read -2:50: the frozen 3:50 since the first beat, against a 1:00 rest.
+    expect(elapsedText(container)).toBe('0:10');
+    expect(elapsedColor(container)).toBe('#666666');
+    expect(container.querySelector('[data-testid="rest-timer-pill"]')?.getAttribute('data-label')).toBe(
+      'mobile.restTimer.pausedAria:0:10',
+    );
+
+    advanceSeconds(45);
+    expect(elapsedText(container)).toBe('0:10');
+
+    // Resume counts on from the same 0:10, so the next beat is 10 s away.
+    act(() => resumeRestTimer(harness.nowMs));
+    expect(elapsedText(container)).toBe('0:10');
+    advanceSeconds(10);
+    expect(elapsedText(container)).toBe('1:00');
+  });
+
+  it.each([false, true])(
+    'enlarges only timer labels and opens the sheet while preserving icon long-press (compact=%s)',
+    (compact) => {
+      armWithTick();
+      const onPress = vi.fn();
+      const { getByTestId } = render(<RestTimerPill onPress={onPress} compact={compact} />);
+      advanceSeconds(30);
+      const viewer = getByTestId('rest-timer-pill-viewer');
+      expect(viewer.getAttribute('data-viewer-title')).toBe('mobile.restTimer.countdownAria:0:30');
+      expect(viewer.querySelector('[data-icon="clock"]')).toBeNull();
+      expect(getByTestId('rest-timer-pill').querySelector('[data-icon="clock"]')).toBeTruthy();
+      act(() => harness.viewer?.onActivate?.());
+      expect(onPress).toHaveBeenCalledTimes(1);
+      act(() => harness.pressable?.onLongPress?.());
+      expect(getRestTimerState().isRunning).toBe(false);
+      expect(onPress).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('opens the sheet on tap', () => {
     const onPress = vi.fn();
@@ -400,6 +506,16 @@ describe('RestTimerHeroClock', () => {
     expect(heroCaption(container)).toBe('mobile.restTimer.queueEnded');
   });
 
+  // Issue #6664: a list's end is not the queue's. The queue is still there,
+  // one tap away on the player's end card, so the caption must not say empty.
+  it('says the list ended, not that the queue is empty, at the end of a list', () => {
+    armWithTick();
+    act(() => noteRestTimerQueueEnded({ listEnded: true }));
+    const { container } = render(<RestTimerHeroClock />);
+
+    expect(heroCaption(container)).toBe('mobile.restTimer.listEnded');
+  });
+
   it('is ONE accessible element carrying the same sentence the pill speaks', () => {
     armWithTick();
     advanceSeconds(30);
@@ -407,6 +523,130 @@ describe('RestTimerHeroClock', () => {
 
     expect(container.querySelector('[data-testid="rest-timer-hero-clock"]')?.getAttribute('data-label')).toBe(
       'mobile.restTimer.countdownAria:1:30. mobile.restTimer.clockCaptionRest:2:00',
+    );
+  });
+});
+
+// The final countdown (#5396): the last seconds of the rest in the brand tint, on
+// the pill, the arm row's clock and the sheet's hero alike. The tint is the only
+// change; nothing animates.
+describe('the final countdown', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    harness.nowMs = START_MS;
+    harness.settings = { restTimerTargetSeconds: 60, restTimerMode: 'afterTick', restTimerAutoAdvance: true };
+  });
+
+  afterEach(() => {
+    cleanup();
+    resetRestTimerStoreForTests();
+    vi.useRealTimers();
+  });
+
+  it('tints the last three seconds of a 1 min rest, through 0:00, then goes red', () => {
+    armWithTick();
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+
+    advanceSeconds(56);
+    expect(elapsedText(container)).toBe('0:04');
+    expect(elapsedColor(container)).toBe('#111111');
+
+    advanceSeconds(1);
+    expect(elapsedText(container)).toBe('0:03');
+    expect(elapsedColor(container)).toBe('#6D28D9');
+
+    advanceSeconds(3);
+    expect(elapsedText(container)).toBe('0:00');
+    expect(elapsedColor(container)).toBe('#6D28D9');
+
+    advanceSeconds(1);
+    expect(elapsedText(container)).toBe('-0:01');
+    expect(elapsedColor(container)).toBe('#C81E1E');
+  });
+
+  it('starts five seconds out on a 3 min rest', () => {
+    harness.settings = { ...harness.settings, restTimerTargetSeconds: 180 };
+    armWithTick();
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+
+    advanceSeconds(174);
+    expect(elapsedText(container)).toBe('0:06');
+    expect(elapsedColor(container)).toBe('#111111');
+    advanceSeconds(1);
+    expect(elapsedText(container)).toBe('0:05');
+    expect(elapsedColor(container)).toBe('#6D28D9');
+  });
+
+  it('flips the digits on the anchor’s second, the instant the countdown cue lands', () => {
+    armWithTick();
+    // Mounted 400 ms into a second: a free 1 s interval would flip every digit
+    // 400 ms after the cue for it.
+    advanceMs(56_400);
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+    expect(elapsedText(container)).toBe('0:04');
+
+    advanceMs(599);
+    expect(elapsedText(container)).toBe('0:04');
+    advanceMs(1);
+    expect(elapsedText(container)).toBe('0:03');
+    advanceMs(1_000);
+    expect(elapsedText(container)).toBe('0:02');
+  });
+
+  it('beats in the final tint every minute on the minute', () => {
+    harness.settings = { ...harness.settings, restTimerMode: 'onTheMinute' };
+    act(() => armRestTimer('onTheMinute', harness.nowMs, null));
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+
+    advanceSeconds(58);
+    expect(elapsedText(container)).toBe('0:02');
+    expect(elapsedColor(container)).toBe('#6D28D9');
+
+    // The beat: a fresh minute, out of the countdown again.
+    advanceSeconds(2);
+    expect(elapsedText(container)).toBe('1:00');
+    expect(elapsedColor(container)).toBe('#111111');
+  });
+
+  it('stays paused, not final, when the climber pauses in the last seconds', () => {
+    armWithTick();
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+
+    advanceSeconds(58);
+    act(() => pauseRestTimer(harness.nowMs));
+    expect(elapsedText(container)).toBe('0:02');
+    expect(elapsedColor(container)).toBe('#666666');
+  });
+
+  it('has no countdown with no rest set', () => {
+    harness.settings = { ...harness.settings, restTimerTargetSeconds: null };
+    armWithTick();
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+
+    advanceSeconds(58);
+    expect(elapsedColor(container)).toBe('#111111');
+  });
+
+  it('tints the sheet’s hero and keeps its rest caption', () => {
+    armWithTick();
+    const { container } = render(<RestTimerHeroClock />);
+
+    advanceSeconds(58);
+    const digits = container.querySelector('[data-testid="rest-timer-hero-digits"]');
+    expect(digits?.textContent).toBe('0:02');
+    expect(digits?.getAttribute('data-color')).toBe('#6D28D9');
+    expect(container.querySelector('[data-testid="rest-timer-hero-caption"]')?.textContent).toBe(
+      'mobile.restTimer.clockCaptionRest:1:00',
+    );
+  });
+
+  it('reads the countdown out as the same sentence, never a live region', () => {
+    armWithTick();
+    const { container } = render(<RestTimerPill onPress={vi.fn()} />);
+
+    advanceSeconds(58);
+    expect(container.querySelector('[data-testid="rest-timer-pill"]')?.getAttribute('data-label')).toBe(
+      'mobile.restTimer.countdownAria:0:02',
     );
   });
 });

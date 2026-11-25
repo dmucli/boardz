@@ -1,12 +1,12 @@
 // @vitest-environment node
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { tFromCatalog } from '@/app/__test-helpers__/i18n-mock';
 
 /**
  * The strip is a server component, so what matters is the FIRST server render:
- * three columns in the HTML a crawler with no JavaScript receives. Rendering
+ * three session cards in the HTML a crawler with no JavaScript receives. Rendering
  * through `renderToStaticMarkup` is that pass.
  *
  * The strip used to carry its own store CTA and this suite asserted it. The page
@@ -31,13 +31,18 @@ vi.mock('react-i18next', () => ({
 vi.mock('@/app/hooks/use-install-platform', () => ({
   useInstallPlatform: () => ({ platform: 'desktop-web', nativeStore: 'ios' }),
 }));
-vi.mock('@/app/lib/static-asset-url', () => ({ resolveStaticAssetUrl: (path: string) => path }));
+vi.mock('@/app/lib/marketing-static-asset-url', () => ({ resolveMarketingStaticAssetUrl: (path: string) => path }));
 
+let mockLocale = 'en-US';
 vi.mock('@/app/lib/i18n/server', () => ({
   getServerTranslation: vi.fn(async () => ({
     t: (key: string) => resolveMarketingKey(key),
-    locale: 'en-US',
+    locale: mockLocale,
   })),
+}));
+
+vi.mock('@/app/components/marketing/marketing-preview-switch', () => ({
+  MarketingPreviewSwitch: () => <div data-testid="preview-switch" />,
 }));
 
 // `next/image` is a client component with its own loader; a plain <img> keeps
@@ -55,7 +60,20 @@ async function renderStrip(): Promise<string> {
 }
 
 describe('HomeFeatureStrip', () => {
-  it('renders three columns, each with a heading and a line of copy', async () => {
+  afterEach(() => {
+    mockLocale = 'en-US';
+  });
+
+  it('hosts the iOS/Android preview switch on the English page', async () => {
+    expect(await renderStrip()).toContain('data-testid="preview-switch"');
+  });
+
+  it('leaves the preview switch in the hero for other locales', async () => {
+    mockLocale = 'de';
+    expect(await renderStrip()).not.toContain('data-testid="preview-switch"');
+  });
+
+  it('renders three session cards, each with a heading and a line of copy', async () => {
     const html = await renderStrip();
 
     expect(html.match(/data-testid="home-feature-column"/g)).toHaveLength(3);
@@ -74,7 +92,7 @@ describe('HomeFeatureStrip', () => {
     expect(html).toContain(resolveMarketingKey('home.features.lead'));
   });
 
-  it('shows a real app capture for all three features', async () => {
+  it('shows a real app capture for all three session features', async () => {
     const html = await renderStrip();
 
     expect(html.match(/<img/g)).toHaveLength(3);

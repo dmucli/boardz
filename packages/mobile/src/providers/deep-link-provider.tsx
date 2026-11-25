@@ -1,10 +1,29 @@
+import { deferConsentDestination } from '../lib/consent-navigation';
+import { useConsentSettled } from '../lib/consent-hooks';
+import { getConsentSnapshot } from '../lib/consent-state';
 import { useCallback, useEffect, useRef, type ReactNode } from 'react';
 import * as Linking from 'expo-linking';
-import { useRouter } from 'expo-router';
+import { useRouter, type Href } from 'expo-router';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { reportHandledError } from '../lib/error-reporting';
 import { isLegacyPreviewLink } from '../lib/legacy-preview-link';
+import { RELAXES_ANONYMOUS_ROUTES } from '../lib/routing/anonymous-auth-gate';
+import { isBoardLinkPath, parseBoardLinkPath } from '../lib/routing/board-deep-link';
+import { clearBoardLinkReplay, setBoardLinkReplay } from '../lib/routing/board-link-replay';
 import { useAuth } from './auth-provider';
+import {
+  parseAppWorkoutId,
+  PENDING_APP_WORKOUT_KEY,
+  readPendingAppWorkout,
+  serializePendingAppWorkout,
+} from '../lib/partner-workout-link';
+import { useAppWorkoutsFlag } from './feature-flags-provider';
+import {
+  parseSessionHistoryExportId,
+  PENDING_SESSION_HISTORY_KEY,
+  readPendingSessionHistory,
+  serializePendingSessionHistory,
+} from '../lib/partner-session-history-link';
 
 // Stash for a join that arrived before the user was signed in. The auth gate
 // (auth-provider) redirects an unauthenticated cold-start to /auth/login and
@@ -12,6 +31,53 @@ import { useAuth } from './auth-provider';
 // and replay it once auth flips to authenticated.
 const PENDING_JOIN_KEY = 'boardsesh_pending_join_session_id';
 const PENDING_LEGACY_PREVIEW_KEY = 'boardsesh_pending_legacy_preview';
+// A board or climb link (`/{board}/…`, `/b/{slug}/…`) that arrived signed out,
+// stored as `{ path, stashedAt }`. Same reason as the join stash, and the path
+// a new climber takes: tap a shared climb, install, sign up, tap it again.
+const PENDING_BOARD_LINK_KEY = 'boardsesh_pending_board_link';
+
+/**
+ * A stashed board link is followed for a day. A join is asked for again on
+ * arrival, so an old one is harmless; a climb link opens straight away, and
+ * landing someone on a climb they tapped last week, at a sign-in they did for
+ * another reason, would read as the app misbehaving.
+ */
+export const PENDING_BOARD_LINK_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+// The launch URL is the same for the life of the process, and this provider
+// remounts on every sign-in and sign-out (the auth gate swaps the tree). Without
+// this, signing out hours after opening the app from a climb link would stash
+// that link again and the next sign-in would land on it. One launch, one stash.
+let handledLaunchBoardUrl: string | null = null;
+let handledLaunchWorkoutUrl: string | null = null;
+let handledLaunchHistoryUrl: string | null = null;
+
+/** Tests only: forget the launch URL, as a new process would. */
+export function resetHandledLaunchBoardUrlForTests(): void {
+  handledLaunchBoardUrl = null;
+  handledLaunchWorkoutUrl = null;
+  handledLaunchHistoryUrl = null;
+}
+
+type PendingBoardLink = { path: string; stashedAt: number };
+
+/** The stored link, or null when the value is not one we wrote or has expired. */
+function readPendingBoardLink(stored: string | null, nowMs: number): string | null {
+  if (!stored) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stored);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const { path, stashedAt } = parsed as Partial<PendingBoardLink>;
+  if (typeof stashedAt !== 'number' || !Number.isFinite(stashedAt)) return null;
+  const ageMs = nowMs - stashedAt;
+  // A negative age is a clock that moved back; treat it as unknown, not fresh.
+  if (ageMs < 0 || ageMs > PENDING_BOARD_LINK_MAX_AGE_MS) return null;
+  return isBoardLinkPath(path) ? path : null;
+}
 
 // Loose UUID-ish guard: 8-4-4-4-12 hex, the shape our session ids take. Rejects
 // obvious garbage (`http`, `..`, empty) before we push a route that would just
@@ -73,8 +139,13 @@ export function parseJoinSessionId(url: string): string | null {
  * Auth survival: a link that arrives while signed out is stashed in AsyncStorage
  * and replayed once `useAuth().isAuthenticated` flips true (the auth gate routes
  * the cold-start to login first). Clears the stash on consume.
+ *
+ * Board and climb links get the auth survival and nothing else: signed in, Expo
+ * Router has already opened the route, so this provider leaves them alone.
  */
 export function DeepLinkProvider({ children }: { children: ReactNode }) {
+  const consentSettled = useConsentSettled();
+  const appWorkoutsEnabled = useAppWorkoutsFlag();
   const router = useRouter();
   const { isAuthenticated } = useAuth();
 
@@ -85,6 +156,7 @@ export function DeepLinkProvider({ children }: { children: ReactNode }) {
 
   const navigateToJoin = useCallback(
     (sessionId: string) => {
+      if (deferConsentDestination(`/join/${sessionId}`)) return;
       // navigate (not push): Expo Router's built-in linking already routes a
       // tapped/launched join link to this modal when authenticated. navigate
       // reuses that existing instance (same route + params) instead of stacking
@@ -97,7 +169,7 @@ export function DeepLinkProvider({ children }: { children: ReactNode }) {
 
   const handleSessionId = useCallback(
     async (sessionId: string) => {
-      if (isAuthenticatedRef.current) {
+      if (isAuthenticatedRef.current && getConsentSnapshot().settled) {
         navigateToJoin(sessionId);
         return;
       }
@@ -114,11 +186,11 @@ export function DeepLinkProvider({ children }: { children: ReactNode }) {
   );
 
   const navigateToLegacyPreviewDestination = useCallback(() => {
-    router.navigate('/changelog');
+    if (!deferConsentDestination('/changelog')) router.navigate('/changelog');
   }, [router]);
 
   const handleLegacyPreview = useCallback(async () => {
-    if (isAuthenticatedRef.current) {
+    if (isAuthenticatedRef.current && getConsentSnapshot().settled) {
       navigateToLegacyPreviewDestination();
       return;
     }
@@ -130,26 +202,85 @@ export function DeepLinkProvider({ children }: { children: ReactNode }) {
     }
   }, [navigateToLegacyPreviewDestination]);
 
+  const handleBoardLink = useCallback(async (url: string, boardPath: string, isLaunchUrl: boolean) => {
+    // The browser app keeps the path itself, as `?next=` on the login URL.
+    if (RELAXES_ANONYMOUS_ROUTES) return;
+    if (isLaunchUrl) {
+      if (handledLaunchBoardUrl === url) return;
+      handledLaunchBoardUrl = url;
+    }
+    // Signed in: Expo Router has already opened the route.
+    if (isAuthenticatedRef.current) return;
+    try {
+      const pendingBoardLink: PendingBoardLink = { path: boardPath, stashedAt: Date.now() };
+      await AsyncStorage.setItem(PENDING_BOARD_LINK_KEY, JSON.stringify(pendingBoardLink));
+    } catch (error) {
+      if (__DEV__) console.warn('[deep-link] failed to stash pending board link', error);
+      reportHandledError(error, { tags: { source: 'deep-link', op: 'stash-pending-board-link' } });
+    }
+  }, []);
+
   const handleUrl = useCallback(
-    (url: string | null) => {
+    (url: string | null, isLaunchUrl: boolean) => {
       if (!url) return;
+      const historyExportId = parseSessionHistoryExportId(url);
+      if (historyExportId) {
+        if (isLaunchUrl && handledLaunchHistoryUrl === url) return;
+        if (isLaunchUrl) handledLaunchHistoryUrl = url;
+        if (!isAuthenticatedRef.current || !getConsentSnapshot().settled) {
+          void AsyncStorage.setItem(PENDING_SESSION_HISTORY_KEY, serializePendingSessionHistory(historyExportId)).catch(
+            (error: unknown) => {
+              reportHandledError(error, { tags: { source: 'deep-link', op: 'stash-session-history' } });
+            },
+          );
+        } else if (!deferConsentDestination(`/history/session/${historyExportId}`)) {
+          router.navigate({ pathname: '/history/session/[exportId]', params: { exportId: historyExportId } });
+        }
+        return;
+      }
+      const workoutId = parseAppWorkoutId(url);
+      if (workoutId) {
+        if (isLaunchUrl && handledLaunchWorkoutUrl === url) return;
+        if (isLaunchUrl) handledLaunchWorkoutUrl = url;
+        if (!appWorkoutsEnabled) {
+          void AsyncStorage.removeItem(PENDING_APP_WORKOUT_KEY).catch((error: unknown) => {
+            reportHandledError(error, { tags: { source: 'deep-link', op: 'discard-disabled-partner-workout' } });
+          });
+          return;
+        }
+        if (!isAuthenticatedRef.current || !getConsentSnapshot().settled) {
+          void AsyncStorage.setItem(PENDING_APP_WORKOUT_KEY, serializePendingAppWorkout(workoutId)).catch(
+            (error: unknown) => {
+              reportHandledError(error, { tags: { source: 'deep-link', op: 'stash-partner-workout' } });
+            },
+          );
+        } else if (!deferConsentDestination(`/w/${workoutId}`)) {
+          router.navigate({ pathname: '/w/[workoutId]', params: { workoutId } });
+        }
+        return;
+      }
       const sessionId = parseJoinSessionId(url);
       if (sessionId) {
         void handleSessionId(sessionId);
         return;
       }
-      if (isLegacyPreviewLink(url)) void handleLegacyPreview();
+      if (isLegacyPreviewLink(url)) {
+        void handleLegacyPreview();
+        return;
+      }
+      const boardPath = parseBoardLinkPath(url);
+      if (boardPath) void handleBoardLink(url, boardPath, isLaunchUrl);
     },
-    [handleLegacyPreview, handleSessionId],
+    [appWorkoutsEnabled, handleBoardLink, handleLegacyPreview, handleSessionId, router],
   );
 
   // Cold start + warm links.
   useEffect(() => {
     let cancelled = false;
     void Linking.getInitialURL().then((url) => {
-      if (!cancelled) handleUrl(url);
+      if (!cancelled) handleUrl(url, true);
     });
-    const subscription = Linking.addEventListener('url', ({ url }) => handleUrl(url));
+    const subscription = Linking.addEventListener('url', ({ url }) => handleUrl(url, false));
     return () => {
       cancelled = true;
       subscription.remove();
@@ -160,7 +291,46 @@ export function DeepLinkProvider({ children }: { children: ReactNode }) {
   // received while signed out that we stashed above). Clears the stash on
   // consume so it fires exactly once.
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (appWorkoutsEnabled && (!isAuthenticated || !consentSettled)) return;
+    let cancelled = false;
+    void (async () => {
+      const stored = await AsyncStorage.getItem(PENDING_APP_WORKOUT_KEY);
+      if (cancelled || !stored) return;
+      await AsyncStorage.removeItem(PENDING_APP_WORKOUT_KEY);
+      if (cancelled || !appWorkoutsEnabled || !isAuthenticatedRef.current || !getConsentSnapshot().settled) return;
+      const workoutId = readPendingAppWorkout(stored);
+      if (workoutId && !deferConsentDestination(`/w/${workoutId}`))
+        router.navigate({ pathname: '/w/[workoutId]', params: { workoutId } });
+    })().catch((error: unknown) => {
+      reportHandledError(error, { tags: { source: 'deep-link', op: 'replay-partner-workout' } });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [appWorkoutsEnabled, isAuthenticated, consentSettled, router]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !consentSettled) return;
+    let cancelled = false;
+    void (async () => {
+      const stored = await AsyncStorage.getItem(PENDING_SESSION_HISTORY_KEY);
+      if (cancelled || !stored) return;
+      await AsyncStorage.removeItem(PENDING_SESSION_HISTORY_KEY);
+      if (cancelled || !isAuthenticatedRef.current || !getConsentSnapshot().settled) return;
+      const exportId = readPendingSessionHistory(stored);
+      if (exportId && !deferConsentDestination(`/history/session/${exportId}`)) {
+        router.navigate({ pathname: '/history/session/[exportId]', params: { exportId } });
+      }
+    })().catch((error: unknown) => {
+      reportHandledError(error, { tags: { source: 'deep-link', op: 'replay-session-history' } });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, consentSettled, router]);
+
+  useEffect(() => {
+    if (!isAuthenticated || !consentSettled) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -178,13 +348,13 @@ export function DeepLinkProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, navigateToJoin]);
+  }, [isAuthenticated, navigateToJoin, consentSettled]);
 
   // Preserve retired /preview/pr-N links through the auth gate. The original
   // route no longer exists, so replay the safe What's New destination after
   // login. Preview selection is available from More and the user drawer.
   useEffect(() => {
-    if (!isAuthenticated) return;
+    if (!isAuthenticated || !consentSettled) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -200,7 +370,43 @@ export function DeepLinkProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [isAuthenticated, navigateToLegacyPreviewDestination]);
+  }, [isAuthenticated, navigateToLegacyPreviewDestination, consentSettled]);
+
+  // Open the board or climb a signed-out link pointed at, once, after sign-in.
+  // The stored path is checked again before it reaches the router: it has to be
+  // one this build would have written, and no older than a day.
+  //
+  // The read is handed to the onboarding gate as a promise (`board-link-replay`)
+  // so the first-board picker is never pushed over the climb it opens.
+  useEffect(() => {
+    if (!isAuthenticated || !consentSettled || RELAXES_ANONYMOUS_ROUTES) {
+      clearBoardLinkReplay();
+      return;
+    }
+    let cancelled = false;
+    const replayed = (async (): Promise<boolean> => {
+      try {
+        const stored = await AsyncStorage.getItem(PENDING_BOARD_LINK_KEY);
+        if (cancelled || !stored) return false;
+        await AsyncStorage.removeItem(PENDING_BOARD_LINK_KEY);
+        const boardPath = readPendingBoardLink(stored, Date.now());
+        if (!boardPath) return false;
+        // No `cancelled` check from here: the stash is already gone, so backing
+        // out now would lose the climb for good. Same as the join replay above.
+        // `boardPath` is a validated app path; typed routes can't know that.
+        if (!deferConsentDestination(boardPath)) router.navigate(boardPath as Href);
+        return true;
+      } catch (error) {
+        if (__DEV__) console.warn('[deep-link] failed to consume pending board link', error);
+        reportHandledError(error, { tags: { source: 'deep-link', op: 'consume-pending-board-link' } });
+        return false;
+      }
+    })();
+    setBoardLinkReplay(replayed);
+    return () => {
+      cancelled = true;
+    };
+  }, [isAuthenticated, router, consentSettled]);
 
   return <>{children}</>;
 }

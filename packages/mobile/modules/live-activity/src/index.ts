@@ -48,6 +48,8 @@ export type NativeBleConnectedEvent = {
 export type NativeBleConnectedDevice = {
   deviceId: string;
   name?: string;
+  /** The configuration successfully paired with this exact peripheral (#7122). */
+  configKey?: string;
   /**
    * Connect-time BLE write diagnostics. Only present on binaries new enough to
    * report them (gate on a field being defined, not just on `getConnectedDevice`
@@ -128,6 +130,10 @@ export type NativeBleConfigureBoardOptions = {
   boardName: string;
   layoutId: number;
   sizeId: number;
+  /** Required by prepared-connection binaries for authorized updates (#7122). */
+  configKey?: string;
+  /** The bound peripheral expected to receive this configuration update. */
+  deviceId?: string;
   apiLevel?: number;
   deviceName?: string;
   colorOverrides?: Record<string, string>;
@@ -153,6 +159,14 @@ export type NativeBleConfigureBoardOptions = {
   appActive?: boolean;
 };
 
+export type NativeBlePrepareBoardConnectionOptions = NativeBleConfigureBoardOptions & { configKey: string };
+
+/**
+ * The app's Bluetooth authorization, as CoreBluetooth reports it before any
+ * manager exists. `notDetermined` means the climber has never been asked.
+ */
+export type NativeBluetoothAuthorization = 'notDetermined' | 'allowedAlways' | 'denied' | 'restricted';
+
 type BoardBleNativeModule = {
   /**
    * Boards this binary's Swift BLE layer can encode and drive natively.
@@ -164,11 +178,41 @@ type BoardBleNativeModule = {
    */
   nativeBoardControlBoards?: string[];
   isAvailable(): Promise<{ available: boolean }>;
+  /**
+   * Synchronous, side-effect free read of the app's Bluetooth authorization
+   * (`CBManager.authorization`). Only on binaries that ask for Bluetooth at the
+   * first scan instead of at launch: gate on
+   * `typeof getBluetoothAuthorization === 'function'` (an OTA JS update can run
+   * against an older binary). Any value outside `NativeBluetoothAuthorization`
+   * means "can't tell". Read it through src/lib/ble/bluetooth-authorization.ts.
+   */
+  getBluetoothAuthorization?(): string;
+  /**
+   * Show the system Bluetooth alert if the climber has never answered it, and
+   * resolve with their answer (same names as `getBluetoothAuthorization`).
+   * Resolves at once when the question was already answered. Same binary gate
+   * as `getBluetoothAuthorization`.
+   */
+  requestBluetoothAuthorization?(): Promise<string>;
   /** An empty `services` array means "scan unfiltered" on newer binaries. */
   startScan(services?: string[]): Promise<void>;
   stopScan(): Promise<void>;
   connect(deviceId: string): Promise<void>;
+  /**
+   * Invalidate the old native pairing before scanning, then stage a new one.
+   * Both prepared-connection methods must exist before using this surface.
+   */
+  prepareBoardConnection?(options: NativeBlePrepareBoardConnectionOptions): Promise<string>;
+  /** Connect only for the attempt returned by prepareBoardConnection (#7122). */
+  connectPreparedBoard?(deviceId: string, preparationToken: string): Promise<void>;
   disconnect(): Promise<void>;
+  /**
+   * Disconnect Bluetooth when driving ends (2.7): free the board but keep the
+   * pairing, so the Live Activity bulb and the next Put on board reconnect to
+   * it. `disconnect()` forgets it. Only on newer binaries: gate on
+   * `typeof disconnectKeepingBoard === 'function'`.
+   */
+  disconnectKeepingBoard?(): Promise<void>;
   /**
    * Resolves the write's transport diagnostics on binaries new enough to
    * report them; older binaries resolve nothing. Treat a nullish result as
@@ -278,8 +322,25 @@ export type LiveActivityStartSessionOptions = {
     relightLabel: string;
     /** Lightbulb action label while a peer holds it / nobody is driving. */
     reconnectLabel: string;
+    /**
+     * That lightbulb's label while a connect is running (`boardConnecting`).
+     * An older binary ignores it.
+     */
+    connectingLabel?: string;
     /** "{{name}} is on the wall" template; Kotlin substitutes holderDisplayName. */
     onWallTemplate: string;
+    /**
+     * The header's line while driving the wall (2.7), "Driving the wall". For
+     * Put on board's timed drive the system draws the countdown beside it; an
+     * open-ended drive has no clock. An older binary ignores it.
+     */
+    lightDrivingLabel?: string;
+    /**
+     * The lit bulb's label while this phone drives: a tap stops driving
+     * (`boardControl` `stopDriving`). Without it (an older bundle) the lit bulb
+     * keeps re-lighting. An older binary ignores it.
+     */
+    stopDrivingLabel?: string;
   };
 };
 
@@ -325,6 +386,22 @@ export type LiveActivityUpdateOptions = {
   androidThumbnailOverlayPath?: string | null;
   androidThumbnailBackgroundPaths?: string[];
   /**
+   * Android-only: the lock screen card's bokeh and grade as JSON (#7327). Absent
+   * means the classic card, so an older bundle and the kill switch both get it.
+   */
+  androidBokehJson?: string;
+  /**
+   * Android-only: no board is remembered for the current config, so the
+   * notification's outline bulb opens the app instead of starting a background
+   * reconnect, which could only end in a board list nobody can see (#7087).
+   */
+  bulbOpensApp?: boolean;
+  /**
+   * Android-only: a connect is running, so the outline bulb reads
+   * `connectingLabel` and a repeat tap visibly isn't lost (#7087).
+   */
+  boardConnecting?: boolean;
+  /**
    * The climber's saved board look — refreshed on every update so a settings
    * change reaches a running activity (startSession is not re-called for it).
    * iOS only; see LiveActivityStartSessionOptions.renderMode.
@@ -333,6 +410,129 @@ export type LiveActivityUpdateOptions = {
 };
 
 export type LiveActivityClimbUpdateOptions = Omit<LiveActivityUpdateOptions, 'queue'>;
+
+/**
+ * What the rest timer is doing, as the Lock Screen / Dynamic Island / Android
+ * notification draws it (#6513). JS owns the state machine and reduces it to
+ * one of these; the native side only decides whether a `running` rest has
+ * passed its deadline, and rolls a fixed-window cadence on to its current
+ * window.
+ *
+ * `queueEnded` is a LIVE clock, exactly like the in-app pill: it carries the
+ * same timing fields as the `running` (or, with no rest length, `countUp`)
+ * snapshot it replaces and keeps counting, past zero too, but is drawn muted
+ * (never the over red) under a "Queue's empty" caption. Only `paused` and
+ * `waiting` are static.
+ */
+export type LiveActivityRestTimerStatus = 'running' | 'paused' | 'waiting' | 'queueEnded' | 'countUp';
+
+export type LiveActivityRestTimerOptions = {
+  sessionId: string;
+  status: LiveActivityRestTimerStatus;
+  /** Epoch ms the current countdown / count-up started from (cycle anchor; beat start for onTheMinute). null while paused or waiting. */
+  startMs: number | null;
+  /** Epoch ms the current rest or beat ends. null for countUp, a queueEnded with no rest length, paused and waiting. */
+  deadlineMs: number | null;
+  /** onTheMinute beat length in seconds; the widget rolls to the next beat at render. null for afterTick. */
+  periodSeconds: number | null;
+  /** The rest-length setting in seconds; null when the length is Off (count-up). */
+  targetSeconds: number | null;
+  /** Frozen display value for paused / waiting: seconds remaining (+) or over (−). null otherwise (queueEnded is live). */
+  frozenSignedSeconds: number | null;
+  /** Android only: localized one-line caption for the current status (Rest, Paused, Log a climb to start, Queue's empty, Since your last climb, Every 1:00). For a running after-tick rest it is the before-the-deadline caption. iOS ignores it. */
+  androidCaption?: string | null;
+  /** Android only: the caption once a running after-tick rest passes its deadline ("Over your rest"). The service swaps to it on its own deadline re-post, while JS is suspended. iOS ignores it. */
+  androidOverCaption?: string | null;
+};
+
+/**
+ * What the wall does with this phone's next pick (2.7), as the Lock Screen,
+ * the Dynamic Island and the Android notification draw it: `off` (previews),
+ * `window` (Put on board's timed drive, Stop driving after, until `endsAtMs`)
+ * or `driving` (an open-ended drive, until the climber stops). Both drives
+ * read "Driving the wall"; only the timed one has a clock.
+ */
+export type LiveActivityLightingMode = 'off' | 'window' | 'driving';
+
+/** Which Stop driving after choice started the timed drive: the general one or the MoonBoard one. */
+export type LiveActivityLightingFamily = 'general' | 'moonboard';
+
+/** JS's drive, sent through `updateLightingWindow`. */
+export type LiveActivityLightingWindowOptions = {
+  sessionId: string;
+  mode: LiveActivityLightingMode;
+  /** Epoch ms the timed drive ends. null outside one. */
+  endsAtMs: number | null;
+  /** The timed drive's length: the iOS ring drains from it, and an iOS lock-screen press renews the drive by it. null outside one. */
+  windowSeconds: number | null;
+  family: LiveActivityLightingFamily | null;
+};
+
+/**
+ * The stored drive as `getLightingWindow` reads it back. `source` says who
+ * wrote it: `app` (JS) or, on iOS only, `lockScreen` (a Lock Screen or Dynamic
+ * Island Next or Previous that lit the wall, written natively while JS may
+ * have been suspended). Optional fields are absent rather than null.
+ */
+export type LiveActivityLightingWindowSnapshot = {
+  sessionId: string;
+  mode: LiveActivityLightingMode;
+  endsAtMs?: number | null;
+  windowSeconds?: number | null;
+  family?: LiveActivityLightingFamily | null;
+  source: 'app' | 'lockScreen';
+  updatedAtMs: number;
+};
+
+/**
+ * Settings › Board's Stop driving after choices, mirrored for the iOS Lock
+ * Screen and Dynamic Island Next / Previous, which start or renew a drive
+ * natively the way `resolveKeepLightingPlan` (src/lib/keep-lighting.ts) would.
+ * Right away (`off`) starts none: the press lights its one climb. iOS only.
+ */
+export type LiveActivityKeepLightingConfig = {
+  /** The general `KeepLightingChoice` ('off' | '30' | '45' | '60' | '120' | '300' | 'until_stopped'). */
+  keepLighting: string;
+  /**
+   * The retired MoonBoard `KeepLightingChoice`. A MoonBoard takes the general
+   * choice, so JS sends `keepLighting` here too. Only a binary from before the
+   * lock-screen press stamp reads it; a later one drops it.
+   */
+  moonboardKeepLighting: string;
+  /** "In a session too". */
+  drivesInSession: boolean;
+  /** A crew is in the session (the roster's crew). */
+  inCrew: boolean;
+  /**
+   * The session's board is a MoonBoard, for an older binary's MoonBoard rule.
+   * JS sends false on every board, so a press follows the general rule. A
+   * later binary drops it and treats `true` from an older bundle the same way.
+   */
+  moonboard: boolean;
+  /** False where a press would not start a drive in the app either. */
+  enabled: boolean;
+  /**
+   * This JS adopts a lock-screen stop, so the bulb may offer Stop driving
+   * while a drive is on the card. An older binary ignores it.
+   */
+  lockScreenStop?: boolean;
+};
+
+/**
+ * The last iOS Lock Screen or Dynamic Island Next / Previous, as
+ * `getLockScreenPress` reads it. The intent stamps it in flight before its
+ * server request and board write, and settles it just before the Darwin post
+ * that becomes `queueNavigate`. A press the party server turns down settles
+ * too, with no `queueNavigate` after: its stamp may cover an earlier press
+ * still writing the board. Epoch ms.
+ */
+export type LiveActivityLockScreenPress = {
+  pressId: string;
+  /** An unsettled press stops counting as in flight here: iOS ended the intent first. */
+  expiresAtMs: number;
+  /** When the press settled; absent while it is in flight. */
+  settledAtMs?: number | null;
+};
 
 export type WidgetMirrorEvent = {
   sessionId: string;
@@ -354,7 +554,8 @@ export type LiveActivityIntentDiagnosticKind =
   | 'nextClimb'
   | 'previousClimb'
   | 'takeControl'
-  | 'reconnectBoard';
+  | 'reconnectBoard'
+  | 'stopDriving';
 
 export type LiveActivityIntentDiagnosticStage =
   | 'entered'
@@ -377,7 +578,9 @@ export type LiveActivityIntentCompletionClass =
   | 'retryableNetworkFailure'
   | 'localNavigationEnabled'
   | 'alreadyAllowed'
-  | 'bleFailure';
+  | 'bleFailure'
+  | 'mirrorNotCommitted'
+  | 'nothingDriving';
 
 export type InterruptedLiveActivityIntentDiagnostic = {
   schemaVersion: 1;
@@ -397,10 +600,14 @@ export type InterruptedLiveActivityIntentDiagnostic = {
  * - `reconnect`: bulb was out (heldByPeer / disconnected) → reconnect to the
  *   last board, taking it back from a peer (Aurora is last-connection-wins).
  * - `reassert`: bulb was lit (connectedByMe) → re-push the current climb to the
- *   wall. iOS drives the equivalent through App Intents, not this event.
+ *   wall.
+ * - `stopDriving`: bulb was lit and this phone was driving when the
+ *   notification was drawn → stop driving (only sent when JS supplied
+ *   `stopDrivingLabel`).
+ * iOS drives the equivalent through App Intents, not this event.
  */
 export type BoardControlEvent = {
-  action: 'reconnect' | 'reassert';
+  action: 'reconnect' | 'reassert' | 'stopDriving';
   correlationId: string;
 };
 
@@ -408,6 +615,7 @@ type LiveActivityNativeModule = {
   supportsMirrorControl?: boolean;
   getPendingMirror?(): Promise<WidgetMirrorEvent | null>;
   acknowledgeMirror?(sessionId: string, sequence: number): Promise<void>;
+  acknowledgeMirrorRequest?(sessionId: string): Promise<void>;
   isAvailable(): Promise<{ available: boolean }>;
   startSession(options: LiveActivityStartSessionOptions): Promise<void>;
   endSession(): Promise<void>;
@@ -417,8 +625,29 @@ type LiveActivityNativeModule = {
   markIntentReactRootMounted?(): Promise<void>;
   /** Optional for OTA compatibility with binaries predating #4077. */
   consumeInterruptedIntentRuns?(): Promise<InterruptedLiveActivityIntentDiagnostic[]>;
+  /** True on binaries that draw the rest timer (#6513). */
+  supportsRestTimer?: boolean;
+  /** Optional for OTA compatibility with binaries predating #6513; `null` clears it. */
+  updateRestTimer?(options: LiveActivityRestTimerOptions | null): Promise<void>;
+  /** True on binaries that draw driving the wall (2.7). */
+  supportsLightingWindow?: boolean;
+  /** Optional for OTA compatibility with binaries predating 2.7; `null` clears it. */
+  updateLightingWindow?(options: LiveActivityLightingWindowOptions | null): Promise<void>;
+  /** Optional for OTA compatibility with binaries predating 2.7; `null` clears it. */
+  updateKeepLightingConfig?(config: LiveActivityKeepLightingConfig | null): Promise<void>;
+  /** Synchronous. Optional for OTA compatibility with binaries predating 2.7. */
+  getLightingWindow?(): LiveActivityLightingWindowSnapshot | null;
+  /** Synchronous. Optional: binaries before the press stamp have none. */
+  getLockScreenPress?(): LiveActivityLockScreenPress | null;
+  /**
+   * True on binaries whose Lock Screen bulb can stop a drive
+   * (`StopDrivingIntent`), which then emit `lockScreenDriveStop`.
+   */
+  supportsLockScreenDriveStop?: boolean;
   addListener(event: 'queueMirror', listener: (payload: WidgetMirrorEvent) => void): EventSubscription;
   addListener(event: 'queueNavigate', listener: (payload: WidgetQueueNavigateEvent) => void): EventSubscription;
+  /** A Lock Screen stop was stored: adopt it from `getLightingWindow`. Carries nothing. */
+  addListener(event: 'lockScreenDriveStop', listener: () => void): EventSubscription;
 };
 
 export const liveActivityNative = requireOptionalNativeModule<LiveActivityNativeModule>('LiveActivity');
@@ -426,7 +655,7 @@ export const liveActivityNative = requireOptionalNativeModule<LiveActivityNative
 // --- SessionPresence native module (Android) ---
 
 // The Android counterpart to the iOS LiveActivity module: a foreground service +
-// ongoing media-style notification that keeps the BLE connection alive in the
+// ongoing custom notification that keeps the BLE connection alive in the
 // background and surfaces Previous/Next session controls. It deliberately
 // mirrors the LiveActivity method names + the queueNavigate event shape so the
 // JS seam (live-activity-plugin) can drive either platform through one selector.
@@ -439,10 +668,42 @@ type SessionPresenceNativeModule = {
   endSession(): Promise<void>;
   updateActivity(options: LiveActivityUpdateOptions): Promise<void>;
   updateActivityClimb(options: LiveActivityClimbUpdateOptions): Promise<void>;
+  /** True on binaries whose notification shows the rest timer (#6513). */
+  supportsRestTimer?: boolean;
+  /** Optional for OTA compatibility with binaries predating #6513; `null` clears it. */
+  updateRestTimer?(options: LiveActivityRestTimerOptions | null): Promise<void>;
+  /** True on binaries that draw driving the wall (2.7). */
+  supportsLightingWindow?: boolean;
+  /**
+   * Optional for OTA compatibility with binaries predating 2.7; `null` clears
+   * it. JS is the only writer here: a notification Previous / Next writes no
+   * drive natively, so there are no settings to mirror either.
+   */
+  updateLightingWindow?(options: LiveActivityLightingWindowOptions | null): Promise<void>;
+  /** Synchronous. Optional for OTA compatibility with binaries predating 2.7. */
+  getLightingWindow?(): LiveActivityLightingWindowSnapshot | null;
+  /**
+   * Resolves after `ms` on a native clock that keeps running while the activity
+   * is paused, when Android stops firing JS timers (#7038). Optional for OTA
+   * compatibility with binaries that predate it; callers fall back to setTimeout.
+   */
+  delay?(ms: number): Promise<void>;
+  /** True on binaries that report a card they could not post as drawn. */
+  supportsNotificationPostFailed?: boolean;
   addListener(event: 'queueMirror', listener: (payload: WidgetMirrorEvent) => void): EventSubscription;
   addListener(event: 'queueNavigate', listener: (payload: WidgetQueueNavigateEvent) => void): EventSubscription;
   // Android-only: lightbulb taps on the ongoing notification (reconnect/reassert).
   addListener(event: 'boardControl', listener: (payload: BoardControlEvent) => void): EventSubscription;
+  addListener(
+    event: 'notificationPostFailed',
+    listener: (payload: NotificationPostFailedEvent) => void,
+  ): EventSubscription;
+};
+
+/** Fixed stage names and an exception class only: never a message or payload value. */
+export type NotificationPostFailedEvent = {
+  stage: string;
+  errorName?: string | null;
 };
 
 export const sessionPresenceNative = requireOptionalNativeModule<SessionPresenceNativeModule>('SessionPresence');

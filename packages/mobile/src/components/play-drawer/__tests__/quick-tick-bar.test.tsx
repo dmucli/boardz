@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
-import { createElement, type ReactNode } from 'react';
+import { createElement, type ReactNode, type Ref } from 'react';
 
 // QuickTickBar is the create sheet's field stack and nothing else — the state,
 // the save path and the analytics all live in useQuickTickForm (tested next
@@ -12,35 +12,118 @@ import { createElement, type ReactNode } from 'react';
 // lifted above every top-level binding in the file.
 const RAIL_TRAIL_INSET = vi.hoisted(() => 24);
 
-type RowProps = { label: string; children?: ReactNode; bleed?: boolean; height?: number; showSeparator?: boolean };
+type RowProps = {
+  label: string;
+  children?: ReactNode;
+  bleed?: boolean;
+  height?: number;
+  showSeparator?: boolean;
+  labelFocusRef?: unknown;
+};
+
+const announceFocus = vi.hoisted(() => vi.fn());
+vi.mock('../use-announce-body-focus', () => ({ useAnnounceBodyFocus: announceFocus }));
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 
 // QuickTickBar now renders one helper line under the grade rail (#4796), which
 // pulls in StyleSheet and the Text primitive. Neither is what this suite tests,
 // and the real react-native module does not transform under it.
+const scrollTracking = vi.hoisted(() => ({
+  keyboardListeners: new Map<string, () => void>(),
+  scrollIntoView: { reveal: vi.fn(), follow: vi.fn(), release: vi.fn() },
+}));
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios', select: (spec: Record<string, unknown>) => spec.ios },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
   StyleSheet: { create: (styles: unknown) => styles },
+  Keyboard: {
+    addListener: (eventName: string, listener: () => void) => {
+      scrollTracking.keyboardListeners.set(eventName, listener);
+      return { remove: () => scrollTracking.keyboardListeners.delete(eventName) };
+    },
+  },
+  View: ({ children, ref, testID }: { children?: ReactNode; ref?: Ref<HTMLDivElement>; testID?: string }) =>
+    createElement('div', { ref, 'data-testid': testID }, children),
+}));
+vi.mock('../../sheet-scroll-into-view', () => ({
+  useSheetScrollIntoView: () => scrollTracking.scrollIntoView,
 }));
 vi.mock('../../Text', () => ({
-  Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+  Text: ({
+    children,
+    variant,
+    color,
+    numberOfLines,
+  }: {
+    children?: ReactNode;
+    variant?: string;
+    color?: string;
+    numberOfLines?: number;
+  }) =>
+    createElement(
+      'span',
+      {
+        'data-variant': variant,
+        'data-color': color,
+        'data-number-of-lines': numberOfLines ?? '',
+      },
+      children,
+    ),
 }));
 vi.mock('../../../providers/theme-provider', () => ({
   useTheme: () => ({ systemColors: { secondaryLabel: 'secondaryLabel' } }),
 }));
+// The real hook reads a feature flag through its provider. A 15-stop table is
+// what matters here; the row's own show/hide rule is the tick family's, tested
+// with TickAngleControl.
+const boardAngles = vi.hoisted(() => ({ current: [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70] }));
+vi.mock('../../../hooks/use-board-angle-options', () => ({ useBoardAngleOptions: () => boardAngles.current }));
 
 // Stub the tick family: each stub records the props it was handed as data
 // attributes, so the wiring is readable from the DOM without a native tree.
 vi.mock('../../tick', () => ({
+  TICK_ANGLE_ROW_HEIGHT: 64,
   TICK_RAIL_ROW_HEIGHT: 60,
+  // A copy of the real rule so the spray case below reads true; the rule itself
+  // is tested in tick/__tests__/tick-angle-control.test.tsx.
+  shouldShowAngleRow: (boardName: string | undefined, angles: number[]) => boardName !== 'spray' && angles.length >= 2,
   TICK_RAIL_TRAIL_INSET: RAIL_TRAIL_INSET,
-  TickFormRow: ({ label, children, bleed, height, showSeparator }: RowProps) =>
+  TickDetailsRow: ({
+    angle,
+    openingAngle,
+    climbedAt,
+    now,
+    dateEdited,
+    onPress,
+  }: {
+    angle: number | null;
+    openingAngle: number;
+    climbedAt: Date;
+    now: Date;
+    dateEdited: boolean;
+    onPress: () => void;
+  }) =>
+    createElement(
+      'button',
+      {
+        'data-testid': 'tick-details-row',
+        'data-angle': String(angle),
+        'data-opening-angle': String(openingAngle),
+        'data-climbed-at': climbedAt.toISOString(),
+        'data-now': now.toISOString(),
+        'data-date-edited': String(dateEdited),
+        onClick: onPress,
+      },
+      createElement('span', { 'data-row-label': 'mobile.tick.detailsLabel' }),
+    ),
+  TickFormRow: ({ label, children, bleed, height, showSeparator, labelFocusRef }: RowProps) =>
     createElement(
       'div',
       {
         'data-row': label,
+        'data-focus-target': String(labelFocusRef != null),
         'data-bleed': String(Boolean(bleed)),
         'data-height': height == null ? '' : String(height),
         'data-separator': String(showSeparator !== false),
@@ -62,6 +145,27 @@ vi.mock('../../tick', () => ({
       'data-date-label': dateAccessibilityLabel,
       'data-time-label': timeAccessibilityLabel,
       onClick: () => onChange(new Date('2025-03-15T12:00:00.000Z')),
+    }),
+  TickAngleControl: ({
+    angles,
+    value,
+    openingValue,
+    onChange,
+    accessibilityLabel,
+  }: {
+    angles: number[];
+    value: number;
+    openingValue?: number;
+    onChange: (angle: number) => void;
+    accessibilityLabel: string;
+  }) =>
+    createElement('button', {
+      'data-testid': 'tick-angle-control',
+      'data-stops': String(angles.length),
+      'data-value': String(value),
+      'data-opening': String(openingValue),
+      'data-aria': accessibilityLabel,
+      onClick: () => onChange(45),
     }),
   TickCountRail: ({ value, onSelect }: { value: number; onSelect: (next: number) => void }) =>
     createElement('button', {
@@ -139,18 +243,25 @@ import type { QuickTickForm } from '../use-quick-tick-form';
 function makeForm(overrides: Partial<QuickTickForm> = {}): QuickTickForm {
   return {
     climbUuid: 'climb-1',
+    boardName: 'kilter',
+    angle: 40,
+    openingAngle: 40,
     tickState: { quality: null, difficulty: undefined, attemptCount: 1 },
     comment: '',
     climbedAt: new Date('2025-06-01T08:00:00.000Z'),
+    climbedAtEdited: false,
     maximumClimbedAtDate: new Date('2025-06-01T08:00:00.000Z'),
     grades: [{ difficultyId: 7, name: 'V5' }] as unknown as QuickTickForm['grades'],
     consensusDifficultyId: 7,
+    firstAscent: false,
+    saveBlockedByGrade: false,
     resolvedGradeName: undefined,
     ascentType: 'send',
     saveLabel: 'playView.tickBar.sendSaveLabel',
     isPending: false,
     lastError: null,
     onQualitySelect: vi.fn(),
+    onAngleSelect: vi.fn(),
     onGradeSelect: vi.fn(),
     onTriesSelect: vi.fn(),
     onCommentChange: vi.fn(),
@@ -174,21 +285,36 @@ function rowLabels(container: HTMLElement): string[] {
 }
 
 describe('QuickTickBar row order', () => {
-  // Rows run least-used at the top to most-used at the bottom so the controls
-  // people actually reach for land in the thumb zone (#4163). The ordering is
-  // driven by measured interaction rates — tries 28%, stars 24%, grade 6.5%,
-  // note 1.4%, date/time under 1% — so pin it down here rather than let a
-  // future edit quietly shuffle it back.
-  it('runs date, grade, stars, tries, note from top to bottom', () => {
+  it('runs tries, stars, grade, angle, date, note from top to bottom', () => {
     const { container } = renderBar();
 
     expect(rowLabels(container)).toEqual([
-      'mobile.tick.dateLabel',
-      'mobile.tick.gradeLabel',
-      'mobile.tick.starsLabel',
       'mobile.tick.triesLabel',
+      'mobile.tick.starsLabel',
+      'mobile.tick.gradeLabel',
+      'mobile.tick.angleLabel',
+      'mobile.tick.dateLabel',
       'mobile.tick.noteLabel',
     ]);
+  });
+
+  it('keeps only the divider beneath quality in the create form', () => {
+    const { container } = renderBar();
+    const dividedRows = Array.from(container.querySelectorAll('[data-row][data-separator="true"]')).map((row) =>
+      row.getAttribute('data-row'),
+    );
+    expect(dividedRows).toEqual(['mobile.tick.starsLabel']);
+  });
+
+  it('omits the complete date/time row when the host requests compact fields', () => {
+    const { container, queryByTestId, rerender } = render(
+      createElement(QuickTickBar, { form: makeForm(), showDate: false }),
+    );
+    expect(queryByTestId('tick-date-row')).toBeNull();
+    expect(rowLabels(container)).not.toContain('mobile.tick.dateLabel');
+    rerender(createElement(QuickTickBar, { form: makeForm(), showDate: true }));
+    expect(queryByTestId('tick-date-row')).toBeTruthy();
+    expect(rowLabels(container)).toContain('mobile.tick.dateLabel');
   });
 
   it('puts date and time on a single row, both fields committing through one handler', () => {
@@ -209,6 +335,156 @@ describe('QuickTickBar row order', () => {
 
     const noteRow = container.querySelector('[data-row="mobile.tick.noteLabel"]');
     expect(noteRow?.getAttribute('data-separator')).toBe('false');
+  });
+
+  it('omits the body note when the sheet pins it with the actions', () => {
+    const { container, queryByTestId } = render(createElement(QuickTickBar, { form: makeForm(), showNote: false }));
+    expect(queryByTestId('tick-note-field')).toBeNull();
+    expect(rowLabels(container)).toEqual([
+      'mobile.tick.triesLabel',
+      'mobile.tick.starsLabel',
+      'mobile.tick.gradeLabel',
+      'mobile.tick.angleLabel',
+      'mobile.tick.dateLabel',
+    ]);
+  });
+});
+
+// #6615: the angle the tick is logged at, editable in the expanded form.
+describe('QuickTickBar angle', () => {
+  it('sits in a 64pt row with no divider, like the grade and date rows around it', () => {
+    const { container } = renderBar();
+
+    const angleRow = container.querySelector('[data-row="mobile.tick.angleLabel"]');
+    expect(angleRow?.getAttribute('data-height')).toBe('64');
+    expect(angleRow?.getAttribute('data-separator')).toBe('false');
+    expect(angleRow?.getAttribute('data-bleed')).toBe('false');
+  });
+
+  it('wires the control to the form angle, the opening angle and the board table', () => {
+    const { getByTestId, form } = renderBar({ angle: 45, openingAngle: 40 });
+
+    const control = getByTestId('tick-angle-control');
+    expect(control.getAttribute('data-value')).toBe('45');
+    expect(control.getAttribute('data-opening')).toBe('40');
+    expect(control.getAttribute('data-stops')).toBe('15');
+    expect(control.getAttribute('data-aria')).toBe('mobile.tick.angleLabel');
+
+    fireEvent.click(control);
+    expect(form.onAngleSelect).toHaveBeenCalledWith(45);
+  });
+
+  it('leaves the angle out of the compact form', () => {
+    const { container, queryByTestId } = render(createElement(QuickTickBar, { form: makeForm(), showAngle: false }));
+
+    expect(queryByTestId('tick-angle-control')).toBeNull();
+    expect(rowLabels(container)).not.toContain('mobile.tick.angleLabel');
+  });
+
+  it('has no angle row on a spray wall', () => {
+    const { container } = renderBar({ boardName: 'spray' });
+
+    expect(rowLabels(container)).not.toContain('mobile.tick.angleLabel');
+  });
+});
+
+// #7343: Android folds Angle and Date behind one summary row.
+describe('QuickTickBar details disclosure', () => {
+  it('stops tracking the unfolded rows once the keyboard comes up', () => {
+    // The note sits in the pinned footer, outside the scroll body. Left
+    // tracking, every keyboard or note-growth resize would drag the body back.
+    scrollTracking.scrollIntoView.release.mockClear();
+    const { getByTestId } = renderDisclosure(true);
+
+    scrollTracking.keyboardListeners.get('keyboardDidShow')?.();
+
+    expect(scrollTracking.scrollIntoView.release).toHaveBeenCalledWith(getByTestId('tick-details-revealed'));
+  });
+
+  function renderDisclosure(open: boolean, overrides: Partial<QuickTickForm> = {}) {
+    const onOpen = vi.fn();
+    const form = makeForm(overrides);
+    const utils = render(createElement(QuickTickBar, { form, showNote: false, detailsDisclosure: { open, onOpen } }));
+    return { ...utils, onOpen, form };
+  }
+
+  it('stands where Angle and Date are, after the grade and its help line', () => {
+    const { container, getByTestId } = renderDisclosure(false);
+
+    expect(rowLabels(container)).toEqual([
+      'mobile.tick.triesLabel',
+      'mobile.tick.starsLabel',
+      'mobile.tick.gradeLabel',
+      'mobile.tick.detailsLabel',
+    ]);
+    const helpLine = Array.from(container.querySelectorAll('span')).find(
+      (node) => node.textContent === 'mobile.tick.gradeHelp',
+    );
+    expect(helpLine?.compareDocumentPosition(getByTestId('tick-details-row'))).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it('summarises the form values and reports the tap', () => {
+    const { getByTestId, onOpen } = renderDisclosure(false, { angle: 45, openingAngle: 40, climbedAtEdited: true });
+    const row = getByTestId('tick-details-row');
+
+    expect(row.getAttribute('data-angle')).toBe('45');
+    expect(row.getAttribute('data-opening-angle')).toBe('40');
+    expect(row.getAttribute('data-date-edited')).toBe('true');
+    expect(row.getAttribute('data-now')).toBe('2025-06-01T08:00:00.000Z');
+
+    fireEvent.click(row);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives the summary no angle on a spray wall', () => {
+    const { getByTestId } = renderDisclosure(false, { boardName: 'spray' });
+
+    expect(getByTestId('tick-details-row').getAttribute('data-angle')).toBe('null');
+  });
+
+  it('gives the summary no angle when the board has fewer than two', () => {
+    boardAngles.current = [40];
+    const { getByTestId } = renderDisclosure(false);
+    boardAngles.current = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70];
+
+    expect(getByTestId('tick-details-row').getAttribute('data-angle')).toBe('null');
+  });
+
+  it('swaps for the Angle and Date rows when open, and moves focus to Angle', () => {
+    announceFocus.mockClear();
+    const { container, queryByTestId } = renderDisclosure(true);
+
+    expect(queryByTestId('tick-details-row')).toBeNull();
+    expect(rowLabels(container)).toEqual([
+      'mobile.tick.triesLabel',
+      'mobile.tick.starsLabel',
+      'mobile.tick.gradeLabel',
+      'mobile.tick.angleLabel',
+      'mobile.tick.dateLabel',
+    ]);
+    expect(announceFocus).toHaveBeenLastCalledWith(expect.anything(), true);
+    expect(container.querySelector('[data-focus-target="true"]')?.getAttribute('data-row')).toBe(
+      'mobile.tick.angleLabel',
+    );
+  });
+
+  it('moves focus to Date when the board has no angle row', () => {
+    const { container } = renderDisclosure(true, { boardName: 'spray' });
+
+    expect(container.querySelector('[data-focus-target="true"]')?.getAttribute('data-row')).toBe(
+      'mobile.tick.dateLabel',
+    );
+  });
+
+  it('leaves focus alone while folded and on platforms with no disclosure', () => {
+    announceFocus.mockClear();
+    renderDisclosure(false);
+    expect(announceFocus).toHaveBeenLastCalledWith(expect.anything(), false);
+
+    announceFocus.mockClear();
+    const { container } = renderBar();
+    expect(announceFocus).toHaveBeenLastCalledWith(expect.anything(), false);
+    expect(container.querySelector('[data-focus-target="true"]')).toBeNull();
   });
 });
 
@@ -254,6 +530,39 @@ describe('QuickTickBar rail rows', () => {
 
     fireEvent.click(rail);
     expect(form.onGradeSelect).toHaveBeenCalledWith(7);
+  });
+});
+
+describe('QuickTickBar first ascent (#5971)', () => {
+  it('says the grade sets the climb\u2019s grade on a first ascent', () => {
+    const { getByText, queryByText } = renderBar({ firstAscent: true });
+    expect(getByText('mobile.tick.firstAscent')).toBeTruthy();
+    expect(queryByText('mobile.tick.gradeHelp')).toBeNull();
+  });
+
+  it('keeps first-ascent help muted and fully wrapping like ordinary help', () => {
+    const firstAscent = renderBar({ firstAscent: true });
+    const firstHelp = firstAscent.getByText('mobile.tick.firstAscent');
+    const firstPresentation = {
+      variant: firstHelp.getAttribute('data-variant'),
+      color: firstHelp.getAttribute('data-color'),
+      numberOfLines: firstHelp.getAttribute('data-number-of-lines'),
+    };
+    expect(firstPresentation).toEqual({ variant: 'caption1', color: 'secondaryLabel', numberOfLines: '' });
+    firstAscent.unmount();
+    const ordinary = renderBar();
+    const ordinaryHelp = ordinary.getByText('mobile.tick.gradeHelp');
+    expect({
+      variant: ordinaryHelp.getAttribute('data-variant'),
+      color: ordinaryHelp.getAttribute('data-color'),
+      numberOfLines: ordinaryHelp.getAttribute('data-number-of-lines'),
+    }).toEqual(firstPresentation);
+  });
+
+  it('keeps the ordinary grade help otherwise', () => {
+    const { queryByText, getByText } = renderBar();
+    expect(queryByText('mobile.tick.firstAscent')).toBeNull();
+    expect(getByText('mobile.tick.gradeHelp')).toBeTruthy();
   });
 });
 

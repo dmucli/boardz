@@ -1,0 +1,708 @@
+import { playlists } from '../schema/app/playlists';
+import { Column, getTableName, is, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
+type ViewerId = string | null | undefined;
+type PrivacyResourceKind = 'board' | 'session';
+
+/** A linked gym suppresses global board discovery, while direct board/radio reads remain independent. */
+export function boardGymListedCondition(gymIdColumn: SQLWrapper): SQL {
+  return sql`NOT EXISTS (SELECT 1 FROM gyms discovery_gym
+    WHERE discovery_gym.id = ${gymIdColumn}
+      AND (discovery_gym.deleted_at IS NOT NULL OR NOT discovery_gym.is_public OR NOT discovery_gym.is_listed))`;
+}
+
+export function approvedFollowerCondition(userIdColumn: SQLWrapper, viewerId: ViewerId): SQL {
+  if (!viewerId) return sql`false`;
+  return sql`EXISTS (SELECT 1 FROM user_follows privacy_follow WHERE privacy_follow.follower_id = ${viewerId} AND privacy_follow.following_id = ${userIdColumn})`;
+}
+export function userActivityVisibilityCondition(userIdColumn: SQLWrapper, viewerId: ViewerId): SQL {
+  return sql`COALESCE((${viewerId ?? null} = ${userIdColumn} OR (NOT EXISTS (
+    SELECT 1 FROM user_profiles privacy_profile WHERE privacy_profile.user_id = ${userIdColumn} AND privacy_profile.is_private = true
+  )) OR ${approvedFollowerCondition(userIdColumn, viewerId)}), false)`;
+}
+
+export function contentVisibilityCondition(
+  entityType: string | SQLWrapper,
+  entityIdColumn: SQLWrapper,
+  userIdColumn: SQLWrapper,
+  viewerId: ViewerId,
+): SQL {
+  const approved = approvedFollowerCondition(userIdColumn, viewerId);
+  // Social columns are enums; content_privacy also supports non-social text types.
+  const entityTypeText = sql`${entityType}::text`;
+  return sql`COALESCE(((${userIdColumn} IS NULL AND NOT EXISTS (SELECT 1 FROM content_privacy orphan_privacy WHERE orphan_privacy.entity_type = ${entityTypeText} AND orphan_privacy.entity_id = ${entityIdColumn})) OR ${viewerId ?? null} = ${userIdColumn} OR EXISTS (
+    SELECT 1 FROM users privacy_owner
+    LEFT JOIN user_profiles privacy_profile ON privacy_profile.user_id = privacy_owner.id
+    LEFT JOIN content_privacy privacy_content ON privacy_content.entity_type = ${entityTypeText}
+      AND privacy_content.entity_id = ${entityIdColumn} AND privacy_content.owner_id = privacy_owner.id
+    WHERE privacy_owner.id = ${userIdColumn} AND CASE
+      WHEN privacy_content.audience = 'only_me' THEN false
+      WHEN privacy_content.audience = 'followers' THEN ${approved}
+      WHEN NOT COALESCE(privacy_profile.is_private, false) THEN true
+      WHEN privacy_content.audience = 'public' AND privacy_content.public_consent_revision = privacy_profile.privacy_revision THEN true
+      ELSE ${approved} END
+  )), false)`;
+}
+
+/**
+ * The playlist uuid inside a `playlist_climb` entity id, or NULL when the id is
+ * not that shape. The id is `<playlistUuid>:<climbUuid>`, or `<playlistUuid>:_all`
+ * for the playlist's general thread; `validateEntityExists` (backend
+ * `social/entity-validation.ts`) rejects any other shape before a comment or
+ * vote is written, and the web and mobile playlist screens build it. A malformed
+ * id names no playlist, so it grants nothing.
+ */
+export function playlistClimbEntityPlaylistUuid(entityIdColumn: SQLWrapper): SQL<string | null> {
+  return sql<string | null>`CASE WHEN (${entityIdColumn})::text ~ '^[^:]+:[^:]+$'
+    THEN split_part((${entityIdColumn})::text, ':', 1) ELSE NULL END`;
+}
+
+/** The climb uuid (or `_all`) inside a well-formed `playlist_climb` entity id, else NULL. */
+export function playlistClimbEntityClimbUuid(entityIdColumn: SQLWrapper): SQL<string | null> {
+  return sql<string | null>`CASE WHEN (${entityIdColumn})::text ~ '^[^:]+:[^:]+$'
+    THEN split_part((${entityIdColumn})::text, ':', 2) ELSE NULL END`;
+}
+
+/**
+ * Where one kind of item keeps its owner: the aliased table(s) holding it, the
+ * match on its id (plus any rule that leaves it ownerless, such as a soft
+ * delete or a non-owner role), and the column naming the owner.
+ */
+type EntityOwnerSource = {
+  from: SQL;
+  item: (entityId: SQLWrapper) => SQL;
+  owner: SQL;
+};
+
+/**
+ * The one definition of who owns an item a comment, like or notification is
+ * about: the tick's climber, the session's host, the climb's setter (its
+ * Boardsesh `user_id`), the playlist's owner, the comment's author, the board's
+ * or gym's owner. A deleted board or gym has no owner here, and a type missing
+ * from this table (a proposal, `beta`, anything unknown) has none at all.
+ *
+ * {@link entityOwnerCondition} asks it "does the viewer own this?" inside a
+ * read, and {@link entityOwnerIdsQuery} asks it "who owns this?" when a new
+ * comment needs its recipients. Both read the same rows, so the owner who may
+ * read every comment on an item and the owner told about a new one cannot
+ * drift apart.
+ *
+ * A proposal has no owner. It is moderation on someone else's climb: its
+ * proposer reads other people's comments on it and hears about its votes and
+ * outcome by the same account rule as everyone else: a private moderator, voter
+ * or later reporter is named to them only if they follow that account.
+ */
+const ENTITY_OWNER_SOURCES = {
+  tick: {
+    from: sql`boardsesh_ticks owner_tick`,
+    item: (entityId) => sql`owner_tick.uuid = ${entityId}`,
+    owner: sql`owner_tick.user_id`,
+  },
+  session: {
+    from: sql`board_sessions owner_session`,
+    item: (entityId) => sql`owner_session.id = ${entityId}`,
+    owner: sql`owner_session.created_by_user_id`,
+  },
+  climb: {
+    from: sql`board_climbs owner_climb`,
+    item: (entityId) => sql`owner_climb.uuid = ${entityId}`,
+    owner: sql`owner_climb.user_id`,
+  },
+  playlist_climb: {
+    from: sql`playlists owner_playlist
+      JOIN playlist_ownership owner_playlist_role ON owner_playlist_role.playlist_id = owner_playlist.id`,
+    item: (entityId) =>
+      sql`owner_playlist.uuid = ${playlistClimbEntityPlaylistUuid(entityId)} AND owner_playlist_role.role = 'owner'`,
+    owner: sql`owner_playlist_role.user_id`,
+  },
+  comment: {
+    from: sql`comments owner_comment`,
+    item: (entityId) => sql`owner_comment.uuid = ${entityId}`,
+    owner: sql`owner_comment.user_id`,
+  },
+  board: {
+    from: sql`user_boards owner_board`,
+    item: (entityId) => sql`owner_board.uuid = ${entityId} AND owner_board.deleted_at IS NULL`,
+    owner: sql`owner_board.owner_id`,
+  },
+  gym: {
+    from: sql`gyms owner_gym`,
+    item: (entityId) => sql`owner_gym.uuid = ${entityId} AND owner_gym.deleted_at IS NULL`,
+    owner: sql`owner_gym.owner_id`,
+  },
+} satisfies Record<string, EntityOwnerSource>;
+
+/** An entity type that has an owner in {@link ENTITY_OWNER_SOURCES}. */
+export type OwnedEntityType = keyof typeof ENTITY_OWNER_SOURCES;
+
+const OWNED_ENTITY_TYPES = Object.keys(ENTITY_OWNER_SOURCES) as OwnedEntityType[];
+
+function isOwnedEntityType(entityType: string): entityType is OwnedEntityType {
+  return Object.hasOwn(ENTITY_OWNER_SOURCES, entityType);
+}
+
+/**
+ * Whether the viewer owns the item a comment, like or notification is about
+ * (see {@link ENTITY_OWNER_SOURCES}). An owner sees every comment and like on
+ * their own item, whatever the commenter's account privacy.
+ *
+ * The entity type is compared as text: social columns are enums, and callers
+ * also pass the non-social types `content_privacy` covers (which own nothing).
+ */
+export function entityOwnerCondition(
+  entityType: string | SQLWrapper,
+  entityIdColumn: SQLWrapper,
+  viewerId: ViewerId,
+): SQL<boolean> {
+  if (!viewerId) return sql<boolean>`false`;
+  // The type names are this module's own constants, so they go in as literals:
+  // the CASE reads exactly as it did when it was written out by hand.
+  const ownerCases = OWNED_ENTITY_TYPES.map((ownedType) => {
+    const source = ENTITY_OWNER_SOURCES[ownedType];
+    return sql`WHEN ${sql.raw(`'${ownedType}'`)} THEN EXISTS (SELECT 1 FROM ${source.from}
+      WHERE ${source.item(entityIdColumn)} AND ${source.owner} = ${viewerId})`;
+  });
+  return sql<boolean>`COALESCE(CASE (${entityType})::text
+    ${sql.join(ownerCases, sql`\n    `)}
+    ELSE false END, false)`;
+}
+
+/**
+ * The owners of one item, as a query returning `owner_id` rows (usually one,
+ * none for an ownerless item; a playlist can name more than one owner). Null for
+ * a type that has no owner, such as a proposal. The same rows
+ * {@link entityOwnerCondition} admits, so a notification goes exactly to the
+ * people the privacy rule treats as the item's owner.
+ */
+export function entityOwnerIdsQuery(entityType: string, entityId: string): SQL | null {
+  if (!isOwnedEntityType(entityType)) return null;
+  const source = ENTITY_OWNER_SOURCES[entityType];
+  return sql`SELECT DISTINCT ${source.owner} AS owner_id FROM ${source.from}
+    WHERE ${source.item(sql`${entityId}`)} AND ${source.owner} IS NOT NULL`;
+}
+
+export function resourceAccessCondition(
+  kind: PrivacyResourceKind,
+  resourceIdColumn: SQLWrapper,
+  viewerId: ViewerId,
+  options: {
+    allowUnlistedLink?: boolean;
+    /**
+     * With `allowUnlistedLink: false`, still treat an unlisted resource as open
+     * where this holds (a listing's "the viewer is already in it"), in the same
+     * single lookup rather than a second access check.
+     */
+    unlistedWhen?: SQL;
+  } = {},
+): SQL {
+  const source =
+    kind === 'board'
+      ? sql`SELECT privacy_board.uuid AS id, privacy_board.owner_id AS owner_id,
+      CASE WHEN privacy_board.owner_id = '00000000-0000-0000-0000-000000000000' THEN 'public' WHEN privacy_board.is_unlisted THEN 'unlisted' WHEN privacy_board.is_public THEN 'public' ELSE 'only_me' END AS audience
+      FROM user_boards privacy_board WHERE privacy_board.deleted_at IS NULL`
+      : sql`SELECT privacy_session.id AS id, privacy_session.created_by_user_id AS owner_id,
+      CASE WHEN privacy_session.is_public THEN 'public' ELSE 'unlisted' END AS audience FROM board_sessions privacy_session`;
+  const audienceIsPublic =
+    options.allowUnlistedLink === false
+      ? options.unlistedWhen
+        ? sql`(COALESCE(privacy_override.audience, privacy_resource.audience) = 'public'
+          OR (COALESCE(privacy_override.audience, privacy_resource.audience) = 'unlisted' AND ${options.unlistedWhen}))`
+        : sql`COALESCE(privacy_override.audience, privacy_resource.audience) = 'public'`
+      : sql`COALESCE(privacy_override.audience, privacy_resource.audience) IN ('public', 'unlisted')`;
+  const resourceCondition = sql`EXISTS (SELECT 1 FROM (${source}) privacy_resource
+    LEFT JOIN resource_privacy privacy_override ON privacy_override.kind = ${kind} AND privacy_override.resource_id = privacy_resource.id
+    LEFT JOIN resource_grants privacy_grant ON privacy_grant.kind = ${kind} AND privacy_grant.resource_id = privacy_resource.id AND privacy_grant.user_id = ${viewerId ?? null}
+    WHERE privacy_resource.id = ${resourceIdColumn} AND (
+      privacy_resource.owner_id = ${viewerId ?? null} OR (
+        COALESCE(privacy_grant.status, 'pending') <> 'revoked' AND (
+          ${audienceIsPublic} OR (
+            COALESCE(privacy_override.audience, privacy_resource.audience) <> 'only_me' AND (
+              privacy_grant.status = 'approved' OR ${kind === 'session' ? sql`(privacy_override.resource_id IS NULL AND EXISTS (SELECT 1 FROM board_session_participants legacy_participant WHERE legacy_participant.session_id = privacy_resource.id AND legacy_participant.user_id = ${viewerId ?? null}))` : sql`false`} OR (
+                (COALESCE(privacy_override.audience, privacy_resource.audience) = 'followers' OR COALESCE(privacy_override.inherit_followers, false))
+                AND ${approvedFollowerCondition(sql`privacy_resource.owner_id`, viewerId)}
+              )
+            )
+          )
+        )
+      )
+    ))`;
+  return resourceCondition;
+}
+
+/**
+ * Whether an item (a tick, a session card) may name the board it happened on:
+ * its name, place, gym or distance. The item's own visibility follows its
+ * author; this decides only the board fields on it. A log is not a link, so an
+ * unlisted board is named only to people who already hold it, and a deleted or
+ * unresolvable board is never named. Pass the item's author to keep their own
+ * logbook naming every wall they climbed on.
+ */
+export function boardIdentityVisibleCondition(
+  boardIdColumn: SQLWrapper,
+  viewerId: ViewerId,
+  authorIdColumn?: SQLWrapper,
+): SQL<boolean> {
+  const viewerIsAuthor = authorIdColumn && viewerId ? sql`${authorIdColumn} = ${viewerId} OR ` : sql``;
+  return sql<boolean>`(${boardIdColumn} IS NOT NULL AND (${viewerIsAuthor}EXISTS (
+    SELECT 1 FROM user_boards privacy_identity_board
+    WHERE privacy_identity_board.id = ${boardIdColumn} AND privacy_identity_board.deleted_at IS NULL
+      AND ${boardGymListedCondition(sql`privacy_identity_board.gym_id`)}
+      AND ${resourceAccessCondition('board', sql`privacy_identity_board.uuid`, viewerId, { allowUnlistedLink: false })}
+  )))`;
+}
+
+/** Every current and legacy board a session names, for location redaction. */
+function sessionBoardReferences(sessionIdColumn: SQLWrapper): SQL {
+  // Match the shared board-path parsers: repeated/leading slashes and an optional
+  // two-letter locale are accepted. Legacy path-only sessions still name a wall.
+  const pathSource = sql`SELECT privacy_path_source.id,
+    regexp_replace(regexp_replace(trim(both '/' from privacy_path_source.board_path), '/+', '/', 'g'), '^[a-z]{2}/', '') AS path
+    FROM board_sessions privacy_path_source`;
+  return sql`(
+      SELECT privacy_parent_session.board_id FROM board_sessions privacy_parent_session
+      WHERE privacy_parent_session.id = ${sessionIdColumn} AND privacy_parent_session.board_id IS NOT NULL
+      UNION SELECT privacy_parent_membership.board_id FROM session_boards privacy_parent_membership
+      WHERE privacy_parent_membership.session_id = ${sessionIdColumn}
+      UNION SELECT privacy_named_board.id FROM (${pathSource}) privacy_named_session
+      LEFT JOIN user_boards privacy_named_board ON privacy_named_board.slug = split_part(privacy_named_session.path, '/', 2)
+        AND privacy_named_board.deleted_at IS NULL
+      WHERE privacy_named_session.id = ${sessionIdColumn} AND split_part(privacy_named_session.path, '/', 1) = 'b'
+      UNION SELECT privacy_spray_board.id FROM (${pathSource}) privacy_spray_session
+      LEFT JOIN spray_walls privacy_spray_wall ON privacy_spray_wall.layout_id = CASE
+        WHEN split_part(privacy_spray_session.path, '/', 2) ~ '^[0-9]{1,18}$'
+        THEN split_part(privacy_spray_session.path, '/', 2)::bigint ELSE NULL END
+        AND privacy_spray_wall.deleted_at IS NULL
+      LEFT JOIN user_boards privacy_spray_board ON privacy_spray_board.uuid = privacy_spray_wall.board_uuid
+        AND privacy_spray_board.deleted_at IS NULL
+      WHERE privacy_spray_session.id = ${sessionIdColumn} AND split_part(privacy_spray_session.path, '/', 1) = 'spray'
+    )`;
+}
+
+/**
+ * Distances and coordinates must respect every referenced board's location policy.
+ * Only a live board that denies the viewer blocks: an unresolvable or soft-deleted
+ * parent has no policy left to enforce, so it never hides the session's own place.
+ * An admin-hidden spray wall withholds its sessions' place from everyone but its
+ * owner, the same spray wall rule that hides the wall itself.
+ */
+export function sessionBoardLocationCondition(sessionIdColumn: SQLWrapper, viewerId: ViewerId): SQL {
+  return sql`NOT EXISTS (
+    SELECT 1 FROM ${sessionBoardReferences(sessionIdColumn)} privacy_parent_refs
+    JOIN user_boards privacy_parent_board ON privacy_parent_board.id = privacy_parent_refs.board_id
+      AND privacy_parent_board.deleted_at IS NULL
+    WHERE NOT ${resourceAccessCondition('board', sql`privacy_parent_board.uuid`, viewerId, { allowUnlistedLink: false })}
+      OR NOT ${resourceLocationCondition(sql`privacy_parent_board.uuid`, viewerId)}
+      OR EXISTS (SELECT 1 FROM spray_walls privacy_hidden_wall
+        WHERE privacy_hidden_wall.board_uuid = privacy_parent_board.uuid
+          AND privacy_hidden_wall.hidden_at IS NOT NULL
+          AND privacy_parent_board.owner_id IS DISTINCT FROM ${viewerId ?? null})
+  )`;
+}
+
+/**
+ * The author's own action on one exact board: a tick there, or a lit climb that
+ * passed the durable dwell gate (`board_climb_events`). Given a session column,
+ * only an action in that session counts; a NULL session (a row that belongs to
+ * no live session) accepts an action in any session. `alias` keeps the two
+ * subqueries' table names unique where several of these nest in one query.
+ */
+function authorActedOnBoardCondition(
+  authorIdColumn: SQLWrapper,
+  boardIdSql: SQL,
+  sessionIdColumn: SQLWrapper | undefined,
+  alias: 'identity_author' | 'anon_own_action',
+): SQL<boolean> {
+  const tick = sql.raw(`${alias}_tick`);
+  const event = sql.raw(`${alias}_event`);
+  const inSession = (table: SQL) =>
+    sessionIdColumn ? sql`AND (${sessionIdColumn} IS NULL OR ${table}.session_id = ${sessionIdColumn})` : sql``;
+  return sql<boolean>`(EXISTS (SELECT 1 FROM boardsesh_ticks ${tick}
+      WHERE ${tick}.board_id = ${boardIdSql} AND ${tick}.user_id = ${authorIdColumn} ${inSession(tick)})
+    OR EXISTS (SELECT 1 FROM board_climb_events ${event}
+      WHERE ${event}.board_id = ${boardIdSql} AND ${event}.user_id = ${authorIdColumn} ${inSession(event)}))`;
+}
+
+/** Names inside a restricted board may be shared with its current approved members. */
+export function restrictedBoardMemberIdentityCondition(
+  authorIdColumn: SQLWrapper,
+  boardIdColumn: SQLWrapper,
+  viewerId: ViewerId,
+  sessionIdColumn?: SQLWrapper,
+): SQL<boolean> {
+  if (!viewerId) return sql<boolean>`false`;
+  return sql<boolean>`EXISTS (SELECT 1 FROM user_boards identity_member_board
+    LEFT JOIN resource_privacy identity_member_policy ON identity_member_policy.kind = 'board'
+      AND identity_member_policy.resource_id = identity_member_board.uuid
+    WHERE identity_member_board.id = (${boardIdColumn})::bigint AND identity_member_board.deleted_at IS NULL
+      AND COALESCE(identity_member_policy.audience, CASE
+        WHEN identity_member_board.owner_id = '00000000-0000-0000-0000-000000000000' THEN 'public'
+        WHEN identity_member_board.is_unlisted THEN 'unlisted'
+        WHEN identity_member_board.is_public THEN 'public' ELSE 'only_me' END) IN ('only_me', 'followers', 'invite_only')
+      AND (identity_member_board.owner_id = ${viewerId} OR EXISTS (
+        SELECT 1 FROM resource_grants identity_member_grant WHERE identity_member_grant.kind = 'board'
+          AND identity_member_grant.resource_id = identity_member_board.uuid
+          AND identity_member_grant.user_id = ${viewerId} AND identity_member_grant.status = 'approved'))
+      AND ${resourceAccessCondition('board', sql`identity_member_board.uuid`, viewerId, { allowUnlistedLink: false })}
+      AND ${authorActedOnBoardCondition(authorIdColumn, sql`identity_member_board.id`, sessionIdColumn, 'identity_author')})`;
+}
+
+/**
+ * Whether a climber shows as anonymous on a board-facing row (wall feed,
+ * presence stats, leaderboard, live roster, Bluetooth holder) projected for
+ * `boardIdColumn`: they chose to stay anonymous on boards they don't own, they
+ * don't own this one, and the viewer is not them. Read-time only, so it is
+ * retroactive and reversible: rows and counts keep the climber. It fails
+ * closed: a board that no longer exists, a board the app made only to climb on
+ * someone else's wall (`is_owned = false`), or none at all (a live session
+ * nothing places on a board yet), is not theirs. Never NULL, so `NOT` of it is
+ * safe.
+ *
+ * In a live session (`sessionIdColumn`) owning the board is not enough: any
+ * member can move a session onto someone's public board. The owner is named
+ * there only after their own tick or durable lit climb on that board in that
+ * session, the same evidence the restricted-board member exception asks for.
+ */
+export function anonymousOnBoardCondition(
+  authorIdColumn: SQLWrapper,
+  boardIdColumn: SQLWrapper,
+  viewerId: ViewerId,
+  sessionIdColumn?: SQLWrapper,
+): SQL<boolean> {
+  const ownActionInSession = sessionIdColumn
+    ? sql`AND (${sessionIdColumn} IS NULL OR ${authorActedOnBoardCondition(authorIdColumn, sql`anon_own_board.id`, sessionIdColumn, 'anon_own_action')})`
+    : sql``;
+  return sql<boolean>`(${authorIdColumn} IS NOT NULL AND ${authorIdColumn} IS DISTINCT FROM ${viewerId ?? null}
+    AND EXISTS (SELECT 1 FROM user_profiles anon_profile
+      WHERE anon_profile.user_id = ${authorIdColumn} AND anon_profile.anonymous_on_foreign_boards)
+    AND NOT ${restrictedBoardMemberIdentityCondition(authorIdColumn, boardIdColumn, viewerId, sessionIdColumn)}
+    AND NOT EXISTS (SELECT 1 FROM user_boards anon_own_board
+      WHERE anon_own_board.id = (${boardIdColumn})::bigint AND anon_own_board.owner_id = ${authorIdColumn}
+        AND anon_own_board.is_owned AND anon_own_board.deleted_at IS NULL ${ownActionInSession}))`;
+}
+
+/**
+ * Whether `userIdSql` belongs to session `sessionIdColumn`: its host, or a
+ * signed-in climber who joined it (`board_session_participants`, written on join
+ * and kept after they leave), with no revoked grant on it. `alias` keeps the
+ * subqueries' table names unique where the viewer's and the climber's tests sit
+ * side by side.
+ */
+function sessionMemberCondition(
+  userIdSql: SQLWrapper,
+  sessionIdColumn: SQLWrapper,
+  alias: 'co_viewer' | 'co_climber',
+): SQL<boolean> {
+  const host = sql.raw(`${alias}_host`);
+  const joined = sql.raw(`${alias}_joined`);
+  const revoked = sql.raw(`${alias}_revoked`);
+  return sql<boolean>`((EXISTS (SELECT 1 FROM board_sessions ${host}
+      WHERE ${host}.id = ${sessionIdColumn} AND ${host}.created_by_user_id = ${userIdSql})
+    OR EXISTS (SELECT 1 FROM board_session_participants ${joined}
+      WHERE ${joined}.session_id = ${sessionIdColumn} AND ${joined}.user_id = ${userIdSql}))
+    AND NOT EXISTS (SELECT 1 FROM resource_grants ${revoked}
+      WHERE ${revoked}.kind = 'session' AND ${revoked}.resource_id = ${sessionIdColumn}
+        AND ${revoked}.user_id = ${userIdSql} AND ${revoked}.status = 'revoked'))`;
+}
+
+/**
+ * Whether the viewer and `climberIdColumn` are fellow members of session
+ * `sessionIdColumn` (#6582, owner decision 2026-10-19: sessions are for friends,
+ * so everyone who joined sees everyone else in it by name). Both are members by
+ * `sessionMemberCondition`, and the viewer can still open the session, so a
+ * member who was removed, or lost access when its audience narrowed to Only me,
+ * stops seeing names. A signed-out viewer never is one. A permanent session
+ * (`is_permanent`) names nobody this way: it behaves like a gym wall, and its
+ * membership has no end.
+ *
+ * Pass a bound session id, and the viewer's half is evaluated once per
+ * statement; pass a column (a page of session cards) and it is checked per row.
+ * Never NULL.
+ */
+export function sessionCoMemberCondition(
+  climberIdColumn: SQLWrapper,
+  sessionIdColumn: SQLWrapper,
+  viewerId: ViewerId,
+): SQL<boolean> {
+  if (!viewerId) return sql<boolean>`false`;
+  return sql<boolean>`(EXISTS (SELECT 1 FROM board_sessions co_member_session
+      WHERE co_member_session.id = ${sessionIdColumn} AND NOT co_member_session.is_permanent)
+    AND ${sessionMemberCondition(sql`${viewerId}::text`, sessionIdColumn, 'co_viewer')}
+    AND ${resourceAccessCondition('session', sessionIdColumn, viewerId)}
+    AND ${sessionMemberCondition(climberIdColumn, sessionIdColumn, 'co_climber')})`;
+}
+
+/**
+ * How far a phone's clock may run from the server's when it stamps a send on
+ * the session's own wall: a tick that far before its climber joined, or after
+ * the session ended, still counts there. Not applied off the session's boards.
+ */
+const SESSION_TICK_CLOCK_GRACE = sql.raw(`interval '10 minutes'`);
+
+/**
+ * Whether a fellow member of the tick's session (`sessionCoMemberCondition`) may
+ * see this tick there: its climb, grade, attempts and result under the climber's
+ * name, never its note or clips. Only a tick logged while its climber was in the
+ * session counts. Reconciliation stamps the session id on a climber's whole run
+ * of ticks with gaps of 8 h or less, on any wall, so the id alone is no
+ * evidence:
+ *
+ * - on one of the session's boards (its primary board or one in
+ *   `session_boards`), it was climbed between the climber joining (`joined_at`,
+ *   or the session's start for its host) and the session's end (now while it is
+ *   still open), give or take `SESSION_TICK_CLOCK_GRACE` for a phone's clock;
+ * - a session on a config path with no board row has only the time window to go
+ *   on, so it gets no grace, and the tick must be on a board of that path's
+ *   board type and layout: `saveTick` files a config-path send under a board of
+ *   that config (the climber's own, the connected wall or the shared feed), so
+ *   a boardless or imported tick, or one from another board model, is not it;
+ * - a tick with no board, or on a board the session never named, fails closed.
+ *
+ * A tick its climber kept to themselves (`only_me`) is never released. Never
+ * NULL.
+ */
+export function sessionCoMemberTickCondition(
+  ticks: { uuid: SQLWrapper; userId: SQLWrapper; sessionId: SQLWrapper; climbedAt: SQLWrapper; boardId: SQLWrapper },
+  viewerId: ViewerId,
+): SQL<boolean> {
+  if (!viewerId) return sql<boolean>`false`;
+  // Timestamps are stored without a zone, written as UTC; LOCALTIMESTAMP is the
+  // same reading `defaultNow()` gives `joined_at`.
+  return sql<boolean>`(${ticks.sessionId} IS NOT NULL
+    AND ${sessionCoMemberCondition(ticks.userId, ticks.sessionId, viewerId)}
+    AND NOT EXISTS (SELECT 1 FROM content_privacy co_tick_privacy
+      WHERE co_tick_privacy.entity_type = 'tick' AND co_tick_privacy.entity_id = ${ticks.uuid}
+        AND co_tick_privacy.owner_id = ${ticks.userId} AND co_tick_privacy.audience = 'only_me')
+    AND EXISTS (SELECT 1 FROM board_sessions co_tick_session
+      CROSS JOIN LATERAL (SELECT
+        LEAST(
+          CASE WHEN co_tick_session.created_by_user_id = ${ticks.userId}
+            THEN COALESCE(co_tick_session.started_at, co_tick_session.created_at) END,
+          (SELECT co_tick_joined.joined_at FROM board_session_participants co_tick_joined
+            WHERE co_tick_joined.session_id = co_tick_session.id AND co_tick_joined.user_id = ${ticks.userId})
+        ) AS joined_at,
+        COALESCE(co_tick_session.ended_at, LOCALTIMESTAMP) AS ended_at,
+        COALESCE(${ticks.boardId} = co_tick_session.board_id OR EXISTS (SELECT 1 FROM session_boards co_tick_board
+          WHERE co_tick_board.session_id = co_tick_session.id AND co_tick_board.board_id = ${ticks.boardId}), false)
+          AS on_session_board,
+        co_tick_session.board_id IS NULL AND NOT EXISTS (SELECT 1 FROM session_boards co_tick_any_board
+          WHERE co_tick_any_board.session_id = co_tick_session.id) AS config_path_only,
+        -- The path's board type and layout, normalised the way sessionBoardReferences
+        -- reads a path (slashes, an optional locale), against the tick's own board.
+        EXISTS (SELECT 1 FROM user_boards co_tick_config_board
+          WHERE co_tick_config_board.id = ${ticks.boardId}
+            AND co_tick_config_board.board_type
+              = split_part(regexp_replace(regexp_replace(trim(both '/' from co_tick_session.board_path), '/+', '/', 'g'), '^[a-z]{2}/', ''), '/', 1)
+            AND co_tick_config_board.layout_id::text
+              = split_part(regexp_replace(regexp_replace(trim(both '/' from co_tick_session.board_path), '/+', '/', 'g'), '^[a-z]{2}/', ''), '/', 2))
+          AS on_path_config
+      ) co_tick_window
+      WHERE co_tick_session.id = ${ticks.sessionId}
+        AND ((co_tick_window.on_session_board
+            AND ${ticks.climbedAt} >= co_tick_window.joined_at - ${SESSION_TICK_CLOCK_GRACE}
+            AND ${ticks.climbedAt} <= co_tick_window.ended_at + ${SESSION_TICK_CLOCK_GRACE})
+          OR (co_tick_window.config_path_only
+            AND co_tick_window.on_path_config
+            AND ${ticks.climbedAt} >= co_tick_window.joined_at
+            AND ${ticks.climbedAt} <= co_tick_window.ended_at))))`;
+}
+
+/** Separate location policy; knowledge of a board UUID alone cannot reveal its address. */
+export function resourceLocationCondition(boardUuid: SQLWrapper, viewerId: ViewerId): SQL {
+  return sql`EXISTS (SELECT 1 FROM user_boards privacy_location_board
+    LEFT JOIN resource_privacy privacy_location_override ON privacy_location_override.kind = 'board'
+      AND privacy_location_override.resource_id = privacy_location_board.uuid
+    LEFT JOIN resource_grants privacy_location_grant ON privacy_location_grant.kind = 'board'
+      AND privacy_location_grant.resource_id = privacy_location_board.uuid AND privacy_location_grant.user_id = ${viewerId ?? null}
+    WHERE privacy_location_board.uuid = ${boardUuid} AND privacy_location_board.deleted_at IS NULL
+      AND (privacy_location_board.owner_id = ${viewerId ?? null} OR (
+        ${resourceAccessCondition('board', sql`privacy_location_board.uuid`, viewerId)} AND CASE
+          COALESCE(privacy_location_override.location_audience, CASE WHEN privacy_location_board.hide_location THEN 'only_me' ELSE 'public' END)
+          WHEN 'public' THEN true
+          WHEN 'followers' THEN ${approvedFollowerCondition(sql`privacy_location_board.owner_id`, viewerId)}
+          WHEN 'members' THEN privacy_location_grant.status = 'approved'
+          ELSE false END
+      )))`;
+}
+
+/**
+ * Published and listed: a climb that is public to everyone, signed in or not,
+ * whoever set it. Parenthesized, so it can be negated or ANDed as it is.
+ *
+ * No account privacy, item audience, follow relation or deleted-account record
+ * is consulted. A list (search, setter pages, feeds, recommendations,
+ * playlists) that has no owner to serve filters on this alone.
+ *
+ * Both tests are two-valued on purpose. `is_draft` is nullable and NULL is not a
+ * draft; `is_listed` is nullable in the schema and only TRUE is listed. Written
+ * `IS NOT TRUE` / `IS TRUE` the predicate is never NULL, so `NOT` of it is its
+ * exact complement and every row is on one side or the other.
+ */
+export function publicClimbCondition(climb: { isDraft: SQLWrapper; isListed: SQLWrapper }): SQL {
+  return sql`(${climb.isDraft} IS NOT TRUE AND ${climb.isListed} IS TRUE)`;
+}
+
+/**
+ * A viewer-aware list: every published, listed climb
+ * ({@link publicClimbCondition}) plus the viewer's own drafts and
+ * unlisted climbs. Spray-wall drafts also qualify when the caller provides
+ * boardType; callers MUST apply the current spray-wall access predicate too.
+ * Catalogue drafts remain owner-only, including ownerless imports.
+ */
+export function ownedOrPublicClimbCondition(
+  climb: { isDraft: SQLWrapper; isListed: SQLWrapper; userId: SQLWrapper; boardType?: SQLWrapper },
+  viewerId: ViewerId,
+): SQL {
+  const sharedSprayDraft = climb.boardType
+    ? sql`(COALESCE(${climb.boardType} = 'spray', false) AND ${climb.isDraft} IS TRUE)`
+    : sql`false`;
+  return sql`(${publicClimbCondition(climb)} OR ${sharedSprayDraft} OR COALESCE(${climb.userId} = ${viewerId ?? null}, false))`;
+}
+
+/**
+ * Read-by-reference draft policy. Published climbs and spray-wall drafts qualify;
+ * catalogue drafts qualify only for their Boardsesh owner. Omitting boardType
+ * retains the conservative owner-only behavior for existing callers.
+ *
+ * Callers MUST separately enforce current spray-wall access, including any held
+ * capability. A board type is not authorization to read a wall. Public snapshot
+ * and discovery exports continue to use the publication-only predicate.
+ * Comparisons are two-valued so NOT is safe even after a nullable outer join.
+ */
+export function climbDraftVisibilityCondition(
+  climb: { isDraft: SQLWrapper; userId: SQLWrapper; boardType?: SQLWrapper },
+  viewerId: ViewerId,
+): SQL {
+  // Wall authorization is deliberately separate: a board type never grants wall access.
+  const sharedSprayDraft = climb.boardType ? sql`COALESCE(${climb.boardType} = 'spray', false)` : sql`false`;
+  return sql`(${climb.isDraft} IS NOT TRUE OR ${sharedSprayDraft} OR COALESCE(${climb.userId} = ${viewerId ?? null}, false))`;
+}
+
+/**
+ * {@link climbDraftVisibilityCondition} for a row keyed by a climb reference
+ * (stats, grades, history, neighbours): readable when the climb it belongs to
+ * is published, is a spray-wall draft, or is the viewer's own catalogue draft.
+ * The caller still enforces current wall access. A missing reference is unreadable.
+ */
+export function climbReferenceReadableCondition(
+  reference: { boardType: SQLWrapper; climbUuid: SQLWrapper },
+  viewerId: ViewerId,
+): SQL {
+  return sql`EXISTS (SELECT 1 FROM board_climbs privacy_reference_climb
+    WHERE privacy_reference_climb.board_type = ${reference.boardType} AND privacy_reference_climb.uuid = ${reference.climbUuid}
+    AND ${climbDraftVisibilityCondition({ userId: sql`privacy_reference_climb.user_id`, isDraft: sql`privacy_reference_climb.is_draft`, boardType: sql`privacy_reference_climb.board_type` }, viewerId)})`;
+}
+
+type FirstAscentStats = {
+  boardType: SQLWrapper;
+  climbUuid: SQLWrapper;
+  angle: SQLWrapper;
+  /** The stored `fa_username`, or `fa_at`: what a manufacturer-authored climb shows. */
+  stored: SQLWrapper;
+};
+
+/**
+ * One half of the first-ascent projection. The name and the date are twin
+ * correlated subqueries with the same WHERE, ORDER BY and LIMIT, so both come
+ * from the SAME picked tick: the earliest send this viewer may read.
+ */
+function privateSafeFirstAscentField(
+  stats: FirstAscentStats,
+  viewerId: ViewerId,
+  field: 'name' | 'at',
+): SQL<string | null> {
+  // Drizzle strips Column table qualifiers inside a single-table SELECT list.
+  // These columns are correlated into nested queries, so keep their scope.
+  const qualify = (column: SQLWrapper): SQLWrapper =>
+    is(column, Column) ? sql`${sql.identifier(getTableName(column.table))}.${sql.identifier(column.name)}` : column;
+  const correlated = {
+    boardType: qualify(stats.boardType),
+    climbUuid: qualify(stats.climbUuid),
+    angle: qualify(stats.angle),
+    stored: qualify(stats.stored),
+  };
+  // A first ascent is its author's activity: the session or wall it happened on
+  // never hides the name, only the author's account and the tick's own audience.
+  const tickVisible = contentVisibilityCondition(
+    'tick',
+    sql`privacy_fa_tick.uuid`,
+    sql`privacy_fa_tick.user_id`,
+    viewerId,
+  );
+  const picked =
+    field === 'name'
+      ? sql`COALESCE(privacy_fa_profile.display_name, privacy_fa_user.name)`
+      : sql`privacy_fa_tick.climbed_at`;
+  // Never expose the stored Boardsesh FA: it can outlive a deleted tick,
+  // account restriction or profile rename while asynchronous recomputation runs,
+  // and the stored date is the earliest send of ANY visibility, so pairing it
+  // with a fallback name would date a send the viewer cannot see.
+  // `is_boardsesh_authored` is kept for this test alone: account deletion
+  // stamps it before the author reference is cleared, so a climb whose author
+  // left still has its credit recomputed from ticks instead of trusting a
+  // stored name that may be the deleted account's.
+  return sql<string | null>`CASE WHEN EXISTS (
+    SELECT 1 FROM board_climbs privacy_fa_owned WHERE privacy_fa_owned.board_type = ${correlated.boardType}
+      AND privacy_fa_owned.uuid = ${correlated.climbUuid}
+      AND (privacy_fa_owned.user_id IS NOT NULL OR privacy_fa_owned.is_boardsesh_authored)
+  ) THEN (
+    SELECT ${picked}
+    FROM boardsesh_ticks privacy_fa_tick
+    JOIN users privacy_fa_user ON privacy_fa_user.id = privacy_fa_tick.user_id
+    LEFT JOIN user_profiles privacy_fa_profile ON privacy_fa_profile.user_id = privacy_fa_tick.user_id
+    WHERE privacy_fa_tick.board_type = ${correlated.boardType} AND privacy_fa_tick.climb_uuid = ${correlated.climbUuid}
+      AND privacy_fa_tick.angle = ${correlated.angle} AND privacy_fa_tick.status IN ('flash', 'send')
+      AND privacy_fa_tick.kilter_detached_at IS NULL
+      AND ${tickVisible}
+    ORDER BY privacy_fa_tick.climbed_at ASC, privacy_fa_tick.id ASC LIMIT 1
+  ) ELSE ${correlated.stored} END`;
+}
+
+/**
+ * First-ascent names are a tick projection, not a climb rule: public numeric
+ * aggregates keep private ticks, but a send is only credited by name to a
+ * viewer who may read that tick. The name is the earliest send THIS viewer may
+ * read, so a hidden first send passes the credit to the next visible one
+ * instead of leaving it blank. Pair it with {@link privateSafeFirstAscentAt},
+ * never with the stored `fa_at`.
+ */
+export function privateSafeFirstAscentName(
+  stats: { boardType: SQLWrapper; climbUuid: SQLWrapper; angle: SQLWrapper; username: SQLWrapper },
+  viewerId: ViewerId,
+): SQL<string | null> {
+  return privateSafeFirstAscentField({ ...stats, stored: stats.username }, viewerId, 'name');
+}
+
+/**
+ * The date of the send {@link privateSafeFirstAscentName} credits: the same
+ * picked tick, so the name and the date always describe one send. A
+ * manufacturer-authored climb keeps its stored `fa_at`, like its stored name.
+ */
+export function privateSafeFirstAscentAt(
+  stats: { boardType: SQLWrapper; climbUuid: SQLWrapper; angle: SQLWrapper; at: SQLWrapper },
+  viewerId: ViewerId,
+): SQL<string | null> {
+  return privateSafeFirstAscentField({ ...stats, stored: stats.at }, viewerId, 'at');
+}
+
+/** Owner/member grants survive account changes; only-me content is owner-only. */
+export function playlistVisibilityCondition(
+  viewerId: string | null | undefined,
+  playlist: { id: SQLWrapper; uuid: SQLWrapper; isPublic: SQLWrapper } = playlists,
+): SQL {
+  return sql`(
+    EXISTS (SELECT 1 FROM playlist_ownership privacy_member
+      WHERE privacy_member.playlist_id = ${playlist.id} AND privacy_member.user_id = ${viewerId ?? null}
+      AND (privacy_member.role = 'owner' OR NOT EXISTS (
+        SELECT 1 FROM content_privacy private_item WHERE private_item.entity_type = 'playlist'
+        AND private_item.entity_id = ${playlist.uuid} AND private_item.audience = 'only_me'
+      )))
+    OR EXISTS (SELECT 1 FROM playlist_ownership playlist_privacy_owner
+      WHERE playlist_privacy_owner.playlist_id = ${playlist.id} AND playlist_privacy_owner.role = 'owner'
+      AND (${playlist.isPublic} OR EXISTS (
+        SELECT 1 FROM content_privacy shared_item WHERE shared_item.entity_type = 'playlist'
+        AND shared_item.entity_id = ${playlist.uuid} AND shared_item.audience <> 'only_me'
+      ))
+      AND ${contentVisibilityCondition('playlist', playlist.uuid, sql`playlist_privacy_owner.user_id`, viewerId)}
+    )
+  )`;
+}
+export const playlistPrivacyCondition = playlistVisibilityCondition;

@@ -1,6 +1,19 @@
 // @vitest-environment jsdom
+vi.mock('../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent, waitFor } from '@testing-library/react';
+import { act, render, fireEvent, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 
 // DeleteAccountScreen drives the App Store-required account-deletion flow, so
@@ -11,6 +24,7 @@ import { createElement, type ReactNode } from 'react';
 // stub the leaf components + providers so this stays a focused unit test.
 
 const ctrl = vi.hoisted(() => ({
+  credentialGeneration: 1,
   infoData: undefined as number | undefined,
   infoLoading: false,
   mutateAsync: vi.fn(),
@@ -20,11 +34,60 @@ const ctrl = vi.hoisted(() => ({
   reportError: vi.fn(),
 }));
 
+vi.mock('../../lib/auth-store', () => ({
+  captureAuthCredentialGeneration: () => ctrl.credentialGeneration,
+  isAuthCredentialGenerationCurrent: (generation: number) => generation === ctrl.credentialGeneration,
+}));
+
 type AnyProps = Record<string, unknown> & { children?: ReactNode };
 
+const keyboard = vi.hoisted(() => ({
+  platform: 'ios',
+  listeners: new Map<string, (event: { endCoordinates: { height: number } }) => void>(),
+}));
+vi.mock('expo-router/react-navigation', () => ({ useHeaderHeight: () => 96 }));
+
 vi.mock('react-native', () => ({
+  Keyboard: {
+    addListener: (name: string, callback: (event: { endCoordinates: { height: number } }) => void) => {
+      keyboard.listeners.set(name, callback);
+      return { remove: () => keyboard.listeners.delete(name) };
+    },
+  },
+  LayoutAnimation: { configureNext: vi.fn() },
+  KeyboardAvoidingView: ({
+    children,
+    behavior,
+    keyboardVerticalOffset,
+  }: {
+    children?: ReactNode;
+    behavior?: string;
+    keyboardVerticalOffset?: number;
+  }) =>
+    createElement(
+      'div',
+      { 'data-keyboard-avoiding': true, 'data-behavior': behavior ?? '', 'data-offset': keyboardVerticalOffset },
+      children,
+    ),
   View: ({ children }: AnyProps) => createElement('div', {}, children),
-  ScrollView: ({ children }: AnyProps) => createElement('div', {}, children),
+  ScrollView: ({
+    children,
+    contentContainerStyle,
+    automaticallyAdjustKeyboardInsets,
+  }: {
+    children?: ReactNode;
+    contentContainerStyle?: unknown;
+    automaticallyAdjustKeyboardInsets?: boolean;
+  }) =>
+    createElement(
+      'div',
+      {
+        'data-scroll-view': true,
+        'data-content-style': JSON.stringify(contentContainerStyle),
+        'data-automatic-keyboard': String(automaticallyAdjustKeyboardInsets),
+      },
+      children,
+    ),
   TextInput: ({ value, onChangeText, editable, placeholder, accessibilityLabel }: AnyProps) =>
     createElement('input', {
       'aria-label': accessibilityLabel as string,
@@ -33,10 +96,20 @@ vi.mock('react-native', () => ({
       disabled: editable === false,
       onChange: (event: { target: { value: string } }) => (onChangeText as (next: string) => void)(event.target.value),
     }),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
   // theme/tokens transitively imports theme/colors, which reads Platform.OS and
   // PlatformColor at module load — provide enough for that to evaluate.
-  Platform: { OS: 'ios', select: (spec: Record<string, unknown>) => spec.ios },
+  Platform: {
+    get OS() {
+      return keyboard.platform;
+    },
+    select: (spec: Record<string, unknown>) => spec.ios,
+  },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
 }));
 
@@ -46,6 +119,7 @@ vi.mock('graphql-request', () => ({ ClientError: class ClientError extends Error
 vi.mock('../../lib/error-reporting', () => ({ reportError: (...args: unknown[]) => ctrl.reportError(...args) }));
 
 vi.mock('../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: {
       label: '#000',
@@ -59,6 +133,9 @@ vi.mock('../../providers/theme-provider', () => ({
   }),
 }));
 vi.mock('../../providers/toast-provider', () => ({ useToast: () => ({ showToast: ctrl.showToast }) }));
+vi.mock('../../hooks/use-bottom-chrome-metrics', () => ({
+  useBottomChromeMetrics: () => ({ scrollBottomPadding: 28 }),
+}));
 vi.mock('../../providers/auth-provider', () => ({ useAuth: () => ({ signOut: ctrl.signOut }) }));
 vi.mock('../../lib/graphql/hooks', () => ({
   useDeleteAccountInfo: () => ({ data: ctrl.infoData, isLoading: ctrl.infoLoading }),
@@ -94,9 +171,15 @@ const CONFIRM_BTN = 'deleteAccount.dialog.confirm';
 const CONFIRM_PLACEHOLDER = 'deleteAccount.dialog.confirmPlaceholder';
 
 beforeEach(() => {
+  ctrl.credentialGeneration = 1;
+  keyboard.platform = 'ios';
+  keyboard.listeners.clear();
   ctrl.infoData = 0;
   ctrl.infoLoading = false;
-  ctrl.mutateAsync.mockReset().mockResolvedValue(true);
+  ctrl.mutateAsync.mockReset().mockResolvedValue({
+    deleted: true,
+    intent: { credentialGeneration: 1, userId: 'owner-a' },
+  });
   ctrl.signOut.mockReset().mockResolvedValue(undefined);
   ctrl.showToast.mockReset();
   ctrl.back.mockReset();
@@ -108,6 +191,39 @@ function typeConfirm(getByPlaceholderText: (text: string) => HTMLElement, value:
 }
 
 describe('DeleteAccountScreen', () => {
+  it('uses header-offset iOS keyboard avoidance without double-counting keyboard insets', () => {
+    const { container } = render(<DeleteAccountScreen />);
+    const avoiding = container.querySelector('[data-keyboard-avoiding]');
+    expect(avoiding?.getAttribute('data-behavior')).toBe('padding');
+    expect(avoiding?.getAttribute('data-offset')).toBe('96');
+    expect(container.querySelector('[data-scroll-view]')?.getAttribute('data-automatic-keyboard')).toBe('undefined');
+    expect(keyboard.listeners.size).toBe(0);
+  });
+
+  it('adds and clears Android keyboard space while preserving bottom chrome', () => {
+    keyboard.platform = 'android';
+    const { container, unmount } = render(<DeleteAccountScreen />);
+    const padding = () => {
+      const styles = JSON.parse(
+        container.querySelector('[data-scroll-view]')?.getAttribute('data-content-style') ?? '[]',
+      ) as { paddingBottom?: number }[];
+      return styles.find((style) => style.paddingBottom !== undefined)?.paddingBottom;
+    };
+    expect(padding()).toBe(44);
+    act(() => keyboard.listeners.get('keyboardDidShow')?.({ endCoordinates: { height: 300 } }));
+    expect(padding()).toBe(344);
+    act(() => keyboard.listeners.get('keyboardDidHide')?.({ endCoordinates: { height: 0 } }));
+    expect(padding()).toBe(44);
+    unmount();
+    expect(keyboard.listeners.size).toBe(0);
+  });
+
+  it('has no Cancel button in the body: back is cancel', () => {
+    const { queryByTestId, getByTestId } = render(<DeleteAccountScreen />);
+    expect(queryByTestId('deleteAccount.dialog.cancel')).toBeNull();
+    expect(getByTestId(CONFIRM_BTN)).not.toBeNull();
+  });
+
   it('enables the confirm button only once "DELETE" is typed exactly', () => {
     const { getByTestId, getByPlaceholderText } = render(<DeleteAccountScreen />);
     const confirm = getByTestId(CONFIRM_BTN) as HTMLButtonElement;
@@ -149,8 +265,73 @@ describe('DeleteAccountScreen', () => {
     typeConfirm(getByPlaceholderText, 'DELETE');
     fireEvent.click(getByTestId(CONFIRM_BTN));
 
-    await waitFor(() => expect(ctrl.signOut).toHaveBeenCalledWith('account_deleted'));
-    expect(ctrl.mutateAsync).toHaveBeenCalledWith({ input: { removeSetterName: true } });
+    await waitFor(() =>
+      expect(ctrl.signOut).toHaveBeenCalledWith('account_deleted', {
+        credentialGeneration: 1,
+        userId: 'owner-a',
+      }),
+    );
+    expect(ctrl.mutateAsync).toHaveBeenCalledWith({ input: { removeSetterName: true }, credentialGeneration: 1 });
+  });
+
+  it('does not sign out when the server did not confirm deletion', async () => {
+    ctrl.mutateAsync.mockResolvedValue({ deleted: false });
+    const { getByTestId, getByPlaceholderText } = render(<DeleteAccountScreen />);
+    typeConfirm(getByPlaceholderText, 'DELETE');
+    fireEvent.click(getByTestId(CONFIRM_BTN));
+
+    await waitFor(() => expect(ctrl.showToast).toHaveBeenCalledWith('deleteAccount.error', 'error'));
+    expect(ctrl.signOut).not.toHaveBeenCalled();
+    expect((getByTestId(CONFIRM_BTN) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('does not sign out B when A deletion succeeds after the credential owner changes', async () => {
+    let finishDeletion: (result: {
+      deleted: true;
+      intent: { credentialGeneration: number; userId: string };
+    }) => void = () => {};
+    ctrl.mutateAsync.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishDeletion = resolve;
+        }),
+    );
+    const { getByTestId, getByPlaceholderText } = render(<DeleteAccountScreen />);
+    typeConfirm(getByPlaceholderText, 'DELETE');
+    fireEvent.click(getByTestId(CONFIRM_BTN));
+    ctrl.credentialGeneration = 2;
+
+    await act(async () => {
+      finishDeletion({ deleted: true, intent: { credentialGeneration: 1, userId: 'owner-a' } });
+    });
+
+    expect(ctrl.signOut).not.toHaveBeenCalled();
+    expect(ctrl.showToast).not.toHaveBeenCalled();
+    expect((getByPlaceholderText(CONFIRM_PLACEHOLDER) as HTMLInputElement).value).toBe('');
+    expect((getByTestId(CONFIRM_BTN) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('discards A deletion error after B takes ownership instead of changing B confirmation', async () => {
+    let rejectDeletion: (error: Error) => void = () => {};
+    ctrl.mutateAsync.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectDeletion = reject;
+        }),
+    );
+    const { getByTestId, getByPlaceholderText } = render(<DeleteAccountScreen />);
+    typeConfirm(getByPlaceholderText, 'DELETE');
+    fireEvent.click(getByTestId(CONFIRM_BTN));
+    ctrl.credentialGeneration = 2;
+
+    await act(async () => {
+      rejectDeletion(new Error('old A request failed'));
+    });
+
+    expect(ctrl.signOut).not.toHaveBeenCalled();
+    expect(ctrl.showToast).not.toHaveBeenCalled();
+    expect(ctrl.reportError).not.toHaveBeenCalled();
+    expect((getByPlaceholderText(CONFIRM_PLACEHOLDER) as HTMLInputElement).value).toBe('');
   });
 
   it('does not show a deletion-failed toast when only the post-delete signOut fails', async () => {

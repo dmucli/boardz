@@ -16,6 +16,14 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { GroupedNotification, GroupedNotificationConnection } from '@boardsesh/shared-schema';
+import { parse, visit } from 'graphql';
+import {
+  GET_NOTIFICATIONS,
+  GET_GROUPED_NOTIFICATIONS,
+  NOTIFICATION_RECEIVED_SUBSCRIPTION,
+} from '@boardsesh/graphql/operations/notifications';
+import { notificationCopy } from '../../../../components/notifications/notification-copy';
+import { sprayImportRoute } from '../../../spray/spray-import-progress';
 
 const requestMock = vi.hoisted(() => vi.fn());
 
@@ -25,11 +33,13 @@ vi.mock('../../use-auth-token', () => ({ useAuthToken: () => ({ data: 'token' })
 import {
   GROUPED_NOTIFICATIONS_QUERY_KEY,
   NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY,
+  useAnswerFollowRequest,
   useGroupedNotifications,
   nextActorsOffset,
   useMarkAllAsRead,
   useMarkGroupAsRead,
 } from '../use-notifications';
+import { APPROVE_FOLLOW_REQUEST, DECLINE_FOLLOW_REQUEST } from '@boardsesh/graphql/operations/privacy';
 
 function makeWrapper() {
   const queryClient = new QueryClient({
@@ -78,6 +88,61 @@ beforeEach(() => {
 });
 
 describe('useGroupedNotifications', () => {
+  it('does not refetch cached notification pages while hidden and catches up on focus', async () => {
+    requestMock.mockResolvedValue({ groupedNotifications: makeConnection(3, false, 7) });
+    const { queryClient, Wrapper } = makeWrapper();
+    queryClient.setQueryData(GROUPED_NOTIFICATIONS_QUERY_KEY, {
+      pages: [makeConnection(3, false, 4)],
+      pageParams: [0],
+    });
+    const hook = renderHook(({ focused }) => useGroupedNotifications(focused), {
+      wrapper: Wrapper,
+      initialProps: { focused: false },
+    });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['notifications'] });
+    });
+    expect(requestMock).not.toHaveBeenCalled();
+    hook.rerender({ focused: true });
+    await waitFor(() => expect(requestMock).toHaveBeenCalledOnce());
+    await waitFor(() => expect(queryClient.getQueryData(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY)).toBe(7));
+    hook.unmount();
+    queryClient.clear();
+  });
+
+  it('requests the completed wall and exact review target over the actual query document', async () => {
+    const completed = makeGroup('completed-detection', {
+      type: 'spray_wall_detection_completed',
+      actorCount: 0,
+      sprayWallName: 'Garage wall',
+      sprayWallUuid: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+      sprayVersionId: '42',
+      sprayResetOfWallUuid: '11111111-2222-4333-8444-555555555555',
+    });
+    requestMock.mockResolvedValue({
+      groupedNotifications: { groups: [completed], totalCount: 1, unreadCount: 1, hasMore: false },
+    });
+    const { Wrapper } = makeWrapper();
+    const { result } = renderHook(() => useGroupedNotifications(), { wrapper: Wrapper });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(requestMock.mock.calls[0][0]).toBe(GET_GROUPED_NOTIFICATIONS);
+    const fetched = result.current.data!.pages[0].groups[0];
+    expect(notificationCopy(fetched, '')).toEqual({
+      textI18nKey: 'items.sprayWallReady',
+      params: { wall: 'Garage wall' },
+    });
+    expect(
+      sprayImportRoute({
+        wallUuid: fetched.sprayWallUuid!,
+        versionId: fetched.sprayVersionId!,
+        resetOfWallUuid: fetched.sprayResetOfWallUuid ?? null,
+      }),
+    ).toEqual({
+      pathname: '/boards/spray/new',
+      params: { resetOf: '11111111-2222-4333-8444-555555555555' },
+    });
+  });
+
   it('offsets the next page by the groups already held, not by the page size', async () => {
     requestMock
       .mockResolvedValueOnce({ groupedNotifications: makeConnection(12, true) })
@@ -116,6 +181,28 @@ describe('useGroupedNotifications', () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     // The bell reads this key, so it settles without its own request.
     expect(queryClient.getQueryData(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY)).toBe(7);
+  });
+});
+
+describe('notification transport review targets', () => {
+  it.each([
+    ['individual feed', GET_NOTIFICATIONS, 'notifications'],
+    ['grouped feed', GET_GROUPED_NOTIFICATIONS, 'groups'],
+    ['live completion event', NOTIFICATION_RECEIVED_SUBSCRIPTION, 'notification'],
+  ])('selects wall copy and exact draft routing fields in the %s', (_surface, document, responseField) => {
+    let selectedFields: string[] = [];
+    visit(parse(document), {
+      Field(field) {
+        if (field.name.value !== responseField || !field.selectionSet) return;
+        const names = field.selectionSet.selections.flatMap((selection) =>
+          selection.kind === 'Field' ? [selection.name.value] : [],
+        );
+        if (names.includes('uuid')) selectedFields = names;
+      },
+    });
+    expect(selectedFields).toEqual(
+      expect.arrayContaining(['sprayWallName', 'sprayWallUuid', 'sprayVersionId', 'sprayResetOfWallUuid']),
+    );
   });
 });
 
@@ -167,6 +254,101 @@ describe('useMarkGroupAsRead', () => {
     });
 
     expect(requestMock.mock.calls[0][1]).toEqual({ type: 'comment_on_tick', entityType: 'tick', entityId: 'T1' });
+  });
+});
+
+describe('useAnswerFollowRequest', () => {
+  const request = (uuid: string, isRead = false) =>
+    makeGroup(uuid, {
+      type: 'follow_request',
+      entityId: `requester-${uuid}`,
+      actors: [{ id: `requester-${uuid}`, displayName: 'Jo', avatarUrl: null }],
+      isRead,
+    });
+
+  it('approves the requester and drops the answered row and its unread mark', async () => {
+    requestMock.mockResolvedValue({ approveFollowRequest: true });
+
+    const { queryClient, Wrapper } = makeWrapper();
+    queryClient.setQueryData(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY, 4);
+    queryClient.setQueryData(GROUPED_NOTIFICATIONS_QUERY_KEY, {
+      pages: [{ groups: [request('a'), makeGroup('b')], totalCount: 2, unreadCount: 4, hasMore: false }],
+      pageParams: [0],
+    });
+
+    const { result } = renderHook(() => useAnswerFollowRequest(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current({ notification: request('a'), answer: 'approve' });
+    });
+
+    expect(requestMock).toHaveBeenCalledWith(APPROVE_FOLLOW_REQUEST, { userId: 'requester-a' });
+    const cached = queryClient.getQueryData<{ pages: GroupedNotificationConnection[] }>(
+      GROUPED_NOTIFICATIONS_QUERY_KEY,
+    );
+    expect(cached?.pages[0].groups.map((group) => group.uuid)).toEqual(['b']);
+    expect(queryClient.getQueryData(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY)).toBe(3);
+  });
+
+  it('refreshes follower lists and profiles after an approval, but not after a decline', async () => {
+    requestMock.mockResolvedValue({ approveFollowRequest: true });
+    const { queryClient, Wrapper } = makeWrapper();
+    const invalidate = vi.spyOn(queryClient, 'invalidateQueries');
+    const { result } = renderHook(() => useAnswerFollowRequest(), { wrapper: Wrapper });
+
+    await act(async () => {
+      await result.current({ notification: request('a'), answer: 'approve' });
+    });
+    const approvedKeys = invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0]);
+    expect(approvedKeys).toEqual(
+      expect.arrayContaining([
+        'privacyFollowRequests',
+        'followers',
+        'following',
+        'publicProfile',
+        'privacyRelationship',
+      ]),
+    );
+
+    invalidate.mockClear();
+    await act(async () => {
+      await result.current({ notification: request('b'), answer: 'decline' });
+    });
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey?.[0])).toEqual(['privacyFollowRequests']);
+  });
+
+  it('declines without touching the badge for a row already read', async () => {
+    requestMock.mockResolvedValue({ declineFollowRequest: true });
+
+    const { queryClient, Wrapper } = makeWrapper();
+    queryClient.setQueryData(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY, 2);
+
+    const { result } = renderHook(() => useAnswerFollowRequest(), { wrapper: Wrapper });
+    await act(async () => {
+      await result.current({ notification: request('a', true), answer: 'decline' });
+    });
+
+    expect(requestMock).toHaveBeenCalledWith(DECLINE_FOLLOW_REQUEST, { userId: 'requester-a' });
+    expect(queryClient.getQueryData(NOTIFICATIONS_UNREAD_COUNT_QUERY_KEY)).toBe(2);
+  });
+
+  it('keeps the row when the server refuses', async () => {
+    requestMock.mockRejectedValue(new Error('offline'));
+
+    const { queryClient, Wrapper } = makeWrapper();
+    queryClient.setQueryData(GROUPED_NOTIFICATIONS_QUERY_KEY, {
+      pages: [{ groups: [request('a')], totalCount: 1, unreadCount: 1, hasMore: false }],
+      pageParams: [0],
+    });
+
+    const { result } = renderHook(() => useAnswerFollowRequest(), { wrapper: Wrapper });
+    await act(async () => {
+      await expect(result.current({ notification: request('a'), answer: 'approve' })).rejects.toThrow('offline');
+    });
+
+    const cached = queryClient.getQueryData<{ pages: GroupedNotificationConnection[] }>(
+      GROUPED_NOTIFICATIONS_QUERY_KEY,
+    );
+    expect(cached?.pages[0].groups.map((group) => group.uuid)).toEqual(['a']);
   });
 });
 

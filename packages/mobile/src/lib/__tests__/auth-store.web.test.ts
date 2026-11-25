@@ -2,9 +2,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   captureAuthCredentialGeneration,
+  captureConfirmedWebAuthIdentity,
   clearTokens,
   getAuthToken,
   subscribeAuthTokenChanges,
+  subscribeAuthCredentialGenerationChanges,
   synchronizeWebSession,
 } from '../auth-store.web';
 
@@ -105,6 +107,33 @@ describe('synchronizeWebSession', () => {
     expect(result.status).toBe('unavailable');
     await expect(getAuthToken()).resolves.toBe('backend-jwe');
   });
+
+  it.each(['session', 'token bridge'] as const)(
+    'keeps accepted B on %s HTTP 503 without rotating its generation',
+    async (unavailableEndpoint) => {
+      fetchMock
+        .mockResolvedValueOnce(jsonResponse({ user: { id: 'user-b' }, authSessionId: 'login-b' }))
+        .mockResolvedValueOnce(authenticatedBridgeResponse('b-jwe', 'user-b', 'login-b'));
+      await synchronizeWebSession();
+      const generation = captureAuthCredentialGeneration();
+      const listener = vi.fn();
+      const unsubscribe = subscribeAuthTokenChanges(listener);
+      if (unavailableEndpoint === 'token bridge') {
+        fetchMock.mockResolvedValueOnce(jsonResponse({ user: { id: 'user-b' }, authSessionId: 'login-b' }));
+      }
+      fetchMock.mockResolvedValueOnce(jsonResponse({ error: 'temporarily unavailable' }, 503));
+      try {
+        const result = await synchronizeWebSession();
+        expect(result.status).toBe('unavailable');
+        expect(captureAuthCredentialGeneration()).toBe(generation);
+        expect(captureConfirmedWebAuthIdentity()).toEqual({ userId: 'user-b', authSessionId: 'login-b' });
+        await expect(getAuthToken()).resolves.toBe('b-jwe');
+        expect(listener).not.toHaveBeenCalled();
+      } finally {
+        unsubscribe();
+      }
+    },
+  );
 
   it('deduplicates concurrent session synchronizations', async () => {
     let resolveSession!: (response: Response) => void;
@@ -307,4 +336,16 @@ describe('synchronizeWebSession', () => {
     await expect(getAuthToken()).resolves.toBeNull();
     unsubscribe();
   });
+});
+
+it('notifies neutral provider generation subscribers synchronously on browser credential withdrawal', async () => {
+  const before = captureAuthCredentialGeneration();
+  const listener = vi.fn();
+  const unsubscribe = subscribeAuthCredentialGenerationChanges(listener);
+  const clearing = clearTokens();
+  expect(listener).toHaveBeenCalledWith(before + 1);
+  await clearing;
+  unsubscribe();
+  await clearTokens();
+  expect(listener).toHaveBeenCalledTimes(1);
 });

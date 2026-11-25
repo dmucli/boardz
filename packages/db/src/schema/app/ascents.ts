@@ -5,6 +5,7 @@ import {
   bigint,
   boolean,
   timestamp,
+  date,
   bigserial,
   index,
   uniqueIndex,
@@ -80,6 +81,12 @@ export const boardseshTicks = pgTable(
       .references(() => users.id, { onDelete: 'cascade' }),
     boardType: text('board_type').notNull(), // 'kilter' or 'tension'
     climbUuid: text('climb_uuid').notNull(),
+    // Which revision of the climb this tick was logged against (#6023): a
+    // `board_climbs.revision_number`. saveTick stamped it for a few days in
+    // October 2026 and no longer does, so it is NULL on every import, every
+    // older tick and every tick saved since. Nothing on the server reads it as
+    // a rule; `syncTicks` and the tick resolvers still return the stored value.
+    climbRevision: integer('climb_revision'),
     angle: integer('angle').notNull(),
     isMirror: boolean('is_mirror').default(false),
 
@@ -117,6 +124,18 @@ export const boardseshTicks = pgTable(
       onDelete: 'set null',
     }),
 
+    // Board identity and gym at acceptance, captured under the board lock.
+    // A captured board with a null gym was unlinked, unlike a legacy unknown.
+    reportingBoardId: bigint('reporting_board_id', { mode: 'number' }),
+    reportingGymId: bigint('reporting_gym_id', { mode: 'number' }),
+    reportingAttribution: text('reporting_attribution').$type<'uuid' | 'presence' | 'session' | 'edit'>(),
+    reportingTimePrecision: text('reporting_time_precision').$type<'instant' | 'day'>(),
+    // Precision only attests to the exact timestamp accepted by the native
+    // writer. An upstream timestamp rewrite may preserve origin='native'.
+    reportingClimbedAt: timestamp('reporting_climbed_at', { mode: 'string' }),
+    reportingDate: date('reporting_date'),
+    reportingDateTimeZone: text('reporting_date_time_zone'),
+
     // Aurora sync tracking - populated by periodic sync job
     auroraType: auroraTableTypeEnum('aurora_type'), // 'ascents' or 'bids'
     auroraId: text('aurora_id'), // UUID in Aurora's system
@@ -147,8 +166,9 @@ export const boardseshTicks = pgTable(
     // Unique index for Aurora sync - allows upsert on aurora_id
     // PostgreSQL unique indexes allow multiple NULLs by default
     auroraIdUnique: uniqueIndex('boardsesh_ticks_aurora_id_unique').on(table.auroraId),
-    // Index for pending sync queries (ticks without aurora_id)
-    syncPendingIdx: index('boardsesh_ticks_sync_pending_idx').on(table.auroraId, table.userId),
+    // No (aurora_id, user_id) index: the pending-push count filters
+    // user_id + board_type + aurora_id IS NULL, which user_board_idx serves
+    // (boardsesh_ticks_sync_pending_idx, 54 MB, was dropped in the C7 cleanup).
     // Unique index for Kilter sync - allows upsert on kilter_id
     kilterIdUnique: uniqueIndex('boardsesh_ticks_kilter_id_unique').on(table.kilterId),
     // Index for pending kilter push queries (ticks without kilter_id)
@@ -162,6 +182,14 @@ export const boardseshTicks = pgTable(
     // Index for board-scoped queries
     boardClimbedAtIdx: index('boardsesh_ticks_board_climbed_at_idx').on(table.boardId, table.climbedAt),
     boardUserIdx: index('boardsesh_ticks_board_user_idx').on(table.boardId, table.userId),
+    // The unbounded coverage query considers native, physically attributed
+    // ticks without exact certified timing. All day-only rows remain in the
+    // superset because their certification also depends on the IANA date.
+    reportingUnboundedIdx: index('boardsesh_ticks_reporting_unbounded_idx').on(table.boardId, table.userId)
+      .where(sql`${table.origin} = 'native'
+        AND ${table.reportingAttribution} IN ('uuid', 'presence', 'session', 'edit')
+        AND (${table.reportingTimePrecision} IS DISTINCT FROM 'instant'
+          OR ${table.reportingClimbedAt} IS DISTINCT FROM ${table.climbedAt})`),
     // Covering index for climb search user tick lookups (ascents/attempts per climb)
     userClimbLookupIdx: index('boardsesh_ticks_user_climb_lookup_idx').on(
       table.userId,

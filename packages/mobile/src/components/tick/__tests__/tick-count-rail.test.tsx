@@ -23,6 +23,7 @@ const rail = vi.hoisted(() => ({
 
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios', select: (options: Record<string, unknown>) => options.ios ?? options.default },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
   StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
   ScrollView: forwardRef(function MockScrollView(
@@ -216,6 +217,39 @@ describe('TickCountRail', () => {
     // Chip 12 starts at 660; centring it in a 300pt viewport wants 536, which
     // snaps DOWN to the nearest chip start (480) so the rail never rests mid-chip.
     expect(rail.scrollTo.mock.calls.at(-1)?.[0]).toEqual({ x: 480, animated: false });
+  });
+
+  it('does not rest at 0 before the content has been measured', () => {
+    renderRail({ value: 12 });
+    const onRailLayout = rail.scrollProps?.onLayout as (event: LayoutEvent) => void;
+    const onContentSizeChange = rail.scrollProps?.onContentSizeChange as (width: number, height: number) => void;
+
+    act(() => {
+      for (const [count, onChipLayout] of rail.chipLayout) {
+        onChipLayout({ nativeEvent: { layout: { x: (count - 1) * CHIP_PITCH, y: 0, width: CHIP_WIDTH, height: 44 } } });
+      }
+    });
+    act(() => onRailLayout({ nativeEvent: { layout: { x: 0, y: 0, width: RAIL_WIDTH, height: 60 } } }));
+
+    expect(rail.scrollTo).not.toHaveBeenCalled();
+
+    act(() => onContentSizeChange(CONTENT_WIDTH, 60));
+
+    expect(rail.scrollTo).toHaveBeenCalledTimes(1);
+    expect(rail.scrollTo).toHaveBeenLastCalledWith({ x: 480, animated: false });
+  });
+
+  it('rests again when the rail narrows before the climber touches it (#7062)', () => {
+    renderRail({ value: 12 });
+    measure();
+    const onRailLayout = rail.scrollProps?.onLayout as (event: LayoutEvent) => void;
+    // Wider than the whole strip: the only rest is 0.
+    act(() => onRailLayout({ nativeEvent: { layout: { x: 0, y: 0, width: CONTENT_WIDTH + 100, height: 60 } } }));
+    expect(rail.scrollTo).toHaveBeenLastCalledWith({ x: 0, animated: false });
+
+    act(() => onRailLayout({ nativeEvent: { layout: { x: 0, y: 0, width: RAIL_WIDTH, height: 60 } } }));
+
+    expect(rail.scrollTo).toHaveBeenLastCalledWith({ x: 480, animated: false });
   });
 
   it('holds its position after the climber has scrolled it, while the count is theirs', () => {

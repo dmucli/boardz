@@ -1,3 +1,4 @@
+import type { ComponentProps } from 'react';
 import { useMemo } from 'react';
 import { StyleSheet, View, type ViewStyle } from 'react-native';
 import type { BoardName } from '@boardsesh/shared-schema';
@@ -53,17 +54,27 @@ function getAccessoryThumbnailBoardSize(boardWidth: number, boardHeight: number,
  * cache key matches the list view's (same filled `_f_` and `_w400_` tokens), so a
  * climb already seen in the list is an instant cache hit. The play-view full-size
  * render uses the stroke-only style (`_s_`) at native width (`_wfull_`) and caches
- * as a separate PNG. See docs/react-native-performance.md §6.
+ * as a separate PNG. See docs/mobile/react-native-performance.md §6.
  */
 export function AccessoryClimbThumbnail({
   climb,
   boardConfig,
   size = ACCESSORY_THUMBNAIL_SLOT_SIZE,
+  renderStyleOverride,
+  onArtReadinessChange,
 }: {
   climb: AccessoryThumbnailClimb;
   boardConfig: BoardConfig | null;
   size?: number;
+  renderStyleOverride?: ComponentProps<typeof BoardImageNative>['renderStyleOverride'];
+  onArtReadinessChange?: ComponentProps<typeof BoardImageNative>['onArtReadinessChange'];
 }) {
+  'use no memo';
+
+  // React Compiler drops the registry token from its inferred render-data
+  // dependencies. Keep the explicit memo below so arriving or withdrawn spray
+  // walls invalidate the thumbnail even when its board props stay unchanged.
+
   // Keyed on the climb's own fields, not the `climb` object: several callers pass
   // a fresh literal every render, which would make an object-keyed memo a
   // guaranteed miss on a bar that re-renders on every queue swipe.
@@ -119,6 +130,8 @@ export function AccessoryClimbThumbnail({
   return (
     <View style={[styles.thumbnailSlot, { width: size, height: size }]}>
       <BoardImageNative
+        renderStyleOverride={renderStyleOverride}
+        onArtReadinessChange={onArtReadinessChange}
         frames={climb.frames}
         boardName={renderBoard.boardName as BoardName}
         layoutId={renderBoard.layoutId}

@@ -3,8 +3,10 @@
 // one filter back to its default. Labels reuse the same builders as the filter
 // summary string (filter-labels.ts) so a filter is never worded two ways.
 //
-// The typed name query is deliberately NOT a token — it lives in the search
-// field itself, where the field's own clear/cancel handles it.
+// The climb-name search is its own token (`buildNameFilterToken`): no list has a
+// search field, the name is typed in the Filters sheet, so the token is where the
+// list shows it and clears it. `getActiveFilterTokens` leaves it out so each
+// caller puts it first.
 //
 // Mobile-only for now: web has no removable-token row and its filter state is a
 // different (URL-param) shape. If web grows one, promote the {key,label,clear}
@@ -18,12 +20,16 @@ import {
   countFilteredHolds,
   flagsToProgress,
   progressToFlags,
+  getClimbTypeFilter,
+  isClimbTypeFilterActive,
   DEFAULT_CLIMB_FILTER_STATE,
   type ClimbFilterState,
   type ClimbBoardFilterState,
 } from '@boardsesh/climb-filters';
 import { buildFilterLabels, buildSortLabel, formatSettersLabel } from './filter-labels';
+import { gradeBoundLabels, type NamedGradeStop } from './grade-stops';
 import type { GradeBound } from '../providers/climb-search-provider';
+import { benchmarkFilterLabel } from './benchmark-term';
 
 export type FilterToken = {
   /** Stable identity for the React key and tests. */
@@ -36,30 +42,55 @@ export type FilterToken = {
 type GetActiveFilterTokensArgs = {
   filters: ClimbFilterState;
   boardFilters: ClimbBoardFilterState;
+  /** Names the benchmark token: Verified on Kilter, Benchmarks elsewhere. */
+  boardName?: string | null;
   grades: Grade[] | undefined;
   t: TFunction<'climbs'>;
   /** Formats a difficulty id in the user's chosen single scale (V or font),
    *  matching how the list rows render grades — keeps the chip from showing the
    *  dual "7a+/V7" string. Falls back to the dual name when it returns null. */
   formatGradeByDifficultyId: (difficultyId: number | null | undefined) => string | null;
+  /** The range rail's stops (`buildGradeRailStops`), so the token names a pick
+   *  exactly as the chip the climber made it from does (#5960): a grouped stop
+   *  reads as the stop ("V0" for 4a to 4c), and a bound that covers only part of
+   *  one names its grade precisely ("V0 / 4A"). See `gradeBoundLabels`. */
+  gradeStops?: readonly NamedGradeStop[];
   patchFilters: (patch: Partial<ClimbFilterState>) => void;
   patchBoardFilters: (patch: Partial<ClimbBoardFilterState>) => void;
   setGrade: (grade: GradeBound) => void;
+  /**
+   * The list's own starting state, which decides when the sort and the climb
+   * type count as set and what their tokens clear back to. The Climbs list's
+   * unless given; a playlist starts with both climb types on, so without this a
+   * fresh playlist would show a "Boulders & routes" token.
+   */
+  defaults?: ClimbFilterState;
 };
+
+/** The climb-name search as a token, or null with no name. Leads the token row. */
+export function buildNameFilterToken(name: string, t: TFunction<'climbs'>, clear: () => void): FilterToken | null {
+  const trimmedName = name.trim();
+  if (trimmedName.length === 0) return null;
+  return { key: 'name', label: t('mobile.filter.nameToken', { name: trimmedName }), clear };
+}
 
 /**
  * One token per active filter, in the same field order as the summary string.
- * Grade is a single token for the whole bound; the name query is excluded.
+ * Grade is a single token for the whole bound; the name query is excluded (see
+ * `buildNameFilterToken`).
  */
 export function getActiveFilterTokens({
   filters,
   boardFilters,
+  boardName,
   grades,
   t,
   formatGradeByDifficultyId,
+  gradeStops,
   patchFilters,
   patchBoardFilters,
   setGrade,
+  defaults = DEFAULT_CLIMB_FILTER_STATE,
 }: GetActiveFilterTokensArgs): FilterToken[] {
   const labels = buildFilterLabels(t);
   const sortLabel = buildSortLabel(t);
@@ -74,29 +105,31 @@ export function getActiveFilterTokens({
   // Grade — only when grades data has loaded, so the label is a real grade name
   // rather than the "#42" id fallback.
   if (grades != null && (filters.minGrade != null || filters.maxGrade != null)) {
-    // Prefer the user's single-scale grade name; fall back to the dual name.
-    const gradeName = (difficultyId: number) =>
-      formatGradeByDifficultyId(difficultyId) ?? getGradeName(difficultyId, grades);
+    // Prefer the rail's own name for each end, then the user's single-scale
+    // grade name; fall back to the dual name.
+    const railLabels = gradeStops
+      ? gradeBoundLabels(gradeStops, { minGradeId: filters.minGrade, maxGradeId: filters.maxGrade })
+      : undefined;
+    const gradeName = (difficultyId: number, railLabel: string | undefined) =>
+      railLabel ?? formatGradeByDifficultyId(difficultyId) ?? getGradeName(difficultyId, grades);
     let label: string;
     if (filters.minGrade != null && filters.maxGrade != null) {
-      // A single selected grade (min == max) reads as the bare grade name, not a range.
-      label =
-        filters.minGrade === filters.maxGrade
-          ? gradeName(filters.minGrade)
-          : labels.gradeRange(gradeName(filters.minGrade), gradeName(filters.maxGrade));
+      // `gradeRange` reads two ends with one label as the bare grade name, which
+      // covers a single grade and a grouped stop whose ids differ.
+      label = labels.gradeRange(
+        gradeName(filters.minGrade, railLabels?.min),
+        gradeName(filters.maxGrade, railLabels?.max),
+      );
     } else if (filters.minGrade != null) {
-      label = labels.gradeMin(gradeName(filters.minGrade));
+      label = labels.gradeMin(gradeName(filters.minGrade, railLabels?.min));
     } else {
-      label = labels.gradeMax(gradeName(filters.maxGrade as number));
+      label = labels.gradeMax(gradeName(filters.maxGrade as number, railLabels?.max));
     }
     tokens.push({ key: 'grade', label, clear: () => setGrade({ minGradeId: undefined, maxGradeId: undefined }) });
   }
 
   // Sort — when either the field or direction differs from the default.
-  if (
-    filters.sortBy !== DEFAULT_CLIMB_FILTER_STATE.sortBy ||
-    filters.sortOrder !== DEFAULT_CLIMB_FILTER_STATE.sortOrder
-  ) {
+  if (filters.sortBy !== defaults.sortBy || filters.sortOrder !== defaults.sortOrder) {
     const label = sortLabel(filters.sortBy);
     if (label) {
       tokens.push({
@@ -104,8 +137,8 @@ export function getActiveFilterTokens({
         label,
         clear: () =>
           patchFilters({
-            sortBy: DEFAULT_CLIMB_FILTER_STATE.sortBy,
-            sortOrder: DEFAULT_CLIMB_FILTER_STATE.sortOrder,
+            sortBy: defaults.sortBy,
+            sortOrder: defaults.sortOrder,
             sortSeed: undefined,
           }),
       });
@@ -196,6 +229,15 @@ export function getActiveFilterTokens({
     });
   }
 
+  // The Liked collection (#6002). Its own token, since it is not a status.
+  if (filters.onlyFavorited) {
+    tokens.push({
+      key: 'liked',
+      label: labels.liked(),
+      clear: () => patchFilters({ onlyFavorited: undefined }),
+    });
+  }
+
   // The four per-user tick flags collapse into one "Your progress" token, so a
   // single Projects selection (showOnlyAttempted + hideCompleted) never reads as
   // two tokens. Clearing resets every progress flag to its default.
@@ -208,13 +250,22 @@ export function getActiveFilterTokens({
     });
   }
 
-  // Climb type — default is boulders-only; a token appears when routes are on or
-  // boulders are off. Clearing returns to the boulders-only default.
-  const bouldersOn = filters.boulders ?? true;
-  const routesOn = filters.routes ?? false;
-  if (bouldersOn !== true || routesOn !== false) {
-    const label = routesOn && !bouldersOn ? t('search.summary.routesOnly') : t('search.summary.bouldersAndRoutes');
-    tokens.push({ key: 'climbType', label, clear: () => patchFilters({ boulders: true, routes: false }) });
+  // Climb type — a token appears when the pick differs from the list's default
+  // (boulders only on the Climbs list, both on a playlist). Clearing returns to
+  // that default.
+  if (isClimbTypeFilterActive(filters, defaults)) {
+    const climbType = getClimbTypeFilter(filters, defaults);
+    const label =
+      climbType === 'routes'
+        ? t('search.summary.routesOnly')
+        : climbType === 'boulders'
+          ? t('search.summary.bouldersOnly')
+          : t('search.summary.bouldersAndRoutes');
+    tokens.push({
+      key: 'climbType',
+      label,
+      clear: () => patchFilters({ boulders: defaults.boulders ?? true, routes: defaults.routes ?? false }),
+    });
   }
 
   // Board-renderer filters: benchmark, hold types, and board region are all
@@ -223,7 +274,7 @@ export function getActiveFilterTokens({
   if (boardFilters.onlyBenchmarks) {
     tokens.push({
       key: 'benchmark',
-      label: t('mobile.filter.benchmark'),
+      label: benchmarkFilterLabel(boardName, t),
       clear: () => patchBoardFilters({ onlyBenchmarks: false }),
     });
   }

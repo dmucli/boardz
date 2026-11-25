@@ -182,6 +182,10 @@ export async function uploadToS3(
      * ASCII — S3 header encoding, not ours.
      */
     metadata?: Record<string, string>;
+    contentDisposition?: string;
+    /** Atomic creation for immutable generated exports. */
+    ifNoneMatch?: '*';
+    abortSignal?: AbortSignal;
   } = {},
 ): Promise<{ key: string }> {
   const client = getS3Client(bucket);
@@ -198,6 +202,8 @@ export async function uploadToS3(
   if (options.contentEncoding) {
     input.ContentEncoding = options.contentEncoding;
   }
+  if (options.contentDisposition) input.ContentDisposition = options.contentDisposition;
+  if (options.ifNoneMatch) input.IfNoneMatch = options.ifNoneMatch;
 
   if (options.metadata && Object.keys(options.metadata).length > 0) {
     input.Metadata = options.metadata;
@@ -208,7 +214,7 @@ export async function uploadToS3(
     input.ACL = acl;
   }
 
-  await client.send(new PutObjectCommand(input));
+  await client.send(new PutObjectCommand(input), { abortSignal: options.abortSignal });
 
   return { key };
 }
@@ -291,7 +297,11 @@ export type S3ObjectBody = {
  * treating a transient read error as "no previous manifest" would drop every
  * other board's entries from the published manifest.
  */
-export async function getFromS3Strict(bucket: StorageBucket, key: string): Promise<S3ObjectBody | null> {
+export async function getFromS3Strict(
+  bucket: StorageBucket,
+  key: string,
+  options: { signal?: AbortSignal } = {},
+): Promise<S3ObjectBody | null> {
   const client = getS3Client(bucket);
 
   try {
@@ -300,6 +310,7 @@ export async function getFromS3Strict(bucket: StorageBucket, key: string): Promi
         Bucket: getConfig(bucket).bucketName,
         Key: key,
       }),
+      { abortSignal: options.signal },
     );
 
     if (!response.Body) {
@@ -346,24 +357,35 @@ export async function getS3ObjectMetadata(
   /** User metadata written at upload time (`x-amz-meta-*`), lower-cased keys. */
   metadata: Record<string, string> | undefined;
 } | null> {
-  const client = getS3Client(bucket);
-
+  // Preserve the existing configuration-error contract for tolerant callers.
+  getS3Client(bucket);
   try {
-    const response = await client.send(
-      new HeadObjectCommand({
-        Bucket: getConfig(bucket).bucketName,
-        Key: key,
-      }),
-    );
+    return await getS3ObjectMetadataStrict(bucket, key);
+  } catch {
+    return null;
+  }
+}
 
+/** Return null only for a missing object; outages must not trigger export generation. */
+export async function getS3ObjectMetadataStrict(
+  bucket: StorageBucket,
+  key: string,
+  options: { signal?: AbortSignal } = {},
+) {
+  const client = getS3Client(bucket);
+  try {
+    const response = await client.send(new HeadObjectCommand({ Bucket: getConfig(bucket).bucketName, Key: key }), {
+      abortSignal: options.signal,
+    });
     return {
       contentType: response.ContentType,
       contentLength: response.ContentLength,
       lastModified: response.LastModified,
       metadata: response.Metadata,
     };
-  } catch {
-    return null;
+  } catch (error) {
+    if (isS3NotFoundError(error)) return null;
+    throw error;
   }
 }
 
@@ -477,7 +499,7 @@ export async function deleteGymPhotosFromS3(gymUuid: string, keepExt?: string): 
  * short enough that a leaked URL out of a screenshot, a log line or a shared
  * debug payload stops working before it is useful to anyone. Photographs of
  * someone's home live in the `private` bucket precisely because `media` is
- * world-readable under guessable keys (`docs/user-media-storage.md`), so the
+ * world-readable under guessable keys (`docs/operations/user-media-storage.md`), so the
  * signature IS the access control and its lifetime is the whole story.
  */
 export const PRESIGNED_URL_TTL_SECONDS = 15 * 60;
@@ -505,10 +527,19 @@ export async function presignGetObject(
   bucket: StorageBucket,
   key: string,
   ttlSeconds: number = PRESIGNED_URL_TTL_SECONDS,
+  options: { contentDisposition?: string } = {},
 ): Promise<PresignedObjectUrl> {
   const client = getS3Client(bucket);
-  const url = await getSignedUrl(client, new GetObjectCommand({ Bucket: getConfig(bucket).bucketName, Key: key }), {
-    expiresIn: ttlSeconds,
-  });
+  const url = await getSignedUrl(
+    client,
+    new GetObjectCommand({
+      Bucket: getConfig(bucket).bucketName,
+      Key: key,
+      ...(options.contentDisposition ? { ResponseContentDisposition: options.contentDisposition } : {}),
+    }),
+    {
+      expiresIn: ttlSeconds,
+    },
+  );
   return { url, expiresAt: new Date(Date.now() + ttlSeconds * 1000).toISOString() };
 }

@@ -1,10 +1,13 @@
-import { memo, type ComponentType, type ReactNode, type RefObject } from 'react';
+import { memo, type ComponentType, type MutableRefObject, type RefObject } from 'react';
 import { View, StyleSheet } from 'react-native';
+import type { GestureType } from 'react-native-gesture-handler';
 import type { SharedValue } from 'react-native-reanimated';
 import type { BoardName } from '@boardsesh/shared-schema';
 import { SwipeBoardCarousel } from './SwipeBoardCarousel';
-import { iosSystemColors } from '../../theme/ios-colors';
-import { useDeferredUntilFrame } from '../../hooks/use-deferred-until-frame';
+import type { SwipePager } from './use-swipe-pager';
+import type { BoardSwapFrame } from './swap-look';
+import { useTheme } from '../../providers/theme-provider';
+import type { ReadyBoardArtIdentity, ReadyBoardArtSnapshot } from '../../lib/board-render/ready-board-art';
 
 type BoardRenderData = {
   boardWidth: number;
@@ -12,11 +15,18 @@ type BoardRenderData = {
 };
 
 type DeferredBoardProps = {
-  /** Closing resets the defer gate; reopening starts with a sized placeholder. */
+  capturePaintedTestID?: string;
+  captureLocalMirrorTestID?: string;
+  /** Only a closed drawer withholds the interactive board. */
   open: boolean;
-  /** The viewport and headers have measured, so the board's flex allocation
-   *  no longer depends on the first-screen fallback dimensions. */
-  layoutReady: boolean;
+  /** Legacy caller hint; artwork mounts independently of measurement readiness. */
+  layoutReady?: boolean;
+  containerSize?: { width: number; height: number };
+  /** Keep the resting board inset while zoom uses the complete column. */
+  restingHorizontalInset?: number;
+  fieldColorOverride?: string;
+  readyBoardArt?: ReadyBoardArtSnapshot;
+  onReadyArtDisplayed?: (art: ReadyBoardArtIdentity & { overlayUri: string; overlayLoadKey: string | null }) => void;
   boardName: BoardName;
   boardRenderData: BoardRenderData;
   layoutId: number;
@@ -33,50 +43,34 @@ type DeferredBoardProps = {
   canSwipePrevious: boolean;
   onSwipeNext: () => void;
   onSwipePrevious: () => void;
+  /** The then-signposts' spoken value and action names for the board. */
+  accessibilityValueText?: string;
+  nextActionLabel?: string;
+  previousActionLabel?: string;
   onResetZoomReady?: (resetZoom: () => void) => void;
   enabled?: boolean;
   scrollRef?: RefObject<ComponentType | undefined | null>;
-  swipeTranslateX?: SharedValue<number>;
-  swipeIsAnimating?: SharedValue<boolean>;
-  /** The hold heatmap, drawn on the current board only. */
-  underOverlay?: ReactNode;
+  /** Shared with the play-drawer header so both swipe as one. See use-swipe-pager. */
+  pager: SwipePager;
+  centerPage: number;
+  /** RNGH ref to the drawer-dismiss Pan, forwarded to the zoomed-only board pan. */
+  dismissRef?: MutableRefObject<GestureType | undefined>;
+  /** Where the board copies its wall-swap frames for the wall button's frost (`StationaryBoardCarousel`). */
+  swapFrameMirror?: SharedValue<BoardSwapFrame | null>;
 };
 
-/**
- * Defers mounting the interactive {@link SwipeBoardCarousel} until one frame
- * after the open drawer's viewport and headers have measured. The carousel mounts
- * 2× `BoardImageNative` plus a pinch/swipe/zoom gesture composition; rendering all
- * of that synchronously when the route commits blocks the present animation for ~0.5–1s (the
- * user-reported stall). A single `requestAnimationFrame` gate lets the sheet
- * animate open immediately over a board-sized placeholder, then mounts the board
- * a frame later — and unlike `runAfterInteractions` a rAF can't be starved by the
- * sub-sheet hosts churning the interaction queue (the old 350ms-fallback stall,
- * which `docs/mobile-sheets-vs-routes.md` explicitly forbids for this).
- *
- * The gate depends on opening and initial layout readiness, not the displayed
- * climb's uuid or subsequent positive dimensions. Swiping to next/prev climbs
- * renders the board immediately with no placeholder flash — the carousel stays
- * mounted across in-drawer swipes.
- *
- * The placeholder fills the board's flex box (`flex: 1`, the same box the
- * contained carousel lays out into) so the first-screen layout is identical
- * whether or not the interactive board has mounted yet — no jump on open.
- */
+/** The persistent current board mounts with the player, before JS layout callbacks. */
 export const DeferredBoard = memo(function DeferredBoard({
   open,
-  layoutReady,
+  layoutReady: _layoutReady,
   boardRenderData,
   ...carouselProps
 }: DeferredBoardProps) {
-  // Let the viewport and header measurements reach layout before mounting the
-  // carousel. Otherwise a cached image can paint at the fallback size and visibly
-  // grow mid-presentation. Readiness stays true across swipes and positive resizes.
-  const ready = useDeferredUntilFrame(open && layoutReady);
-
-  if (!open || !layoutReady || !ready) {
+  const { systemColors } = useTheme();
+  if (!open) {
     return (
       <View
-        style={styles.placeholder}
+        style={[styles.placeholder, { backgroundColor: systemColors.tertiaryFill }]}
         accessibilityElementsHidden
         importantForAccessibility="no-hide-descendants"
         testID="deferred-board-placeholder"
@@ -94,6 +88,5 @@ const styles = StyleSheet.create({
     // rather than a hard gap. No image decode, no gesture handlers — cheap to
     // mount on the present frame. Matches the section skeleton tint used
     // elsewhere in the play drawer.
-    backgroundColor: `${iosSystemColors.systemGray}14`,
   },
 });

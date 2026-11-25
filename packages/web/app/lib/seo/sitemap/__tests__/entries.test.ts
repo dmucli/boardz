@@ -20,10 +20,12 @@ describe('expandLocales', () => {
       'https://www.boardsesh.com/es/playlists/abc',
       'https://www.boardsesh.com/fr/playlists/abc',
       'https://www.boardsesh.com/de/playlists/abc',
+      'https://www.boardsesh.com/it/playlists/abc',
+      'https://www.boardsesh.com/zh-CN/playlists/abc',
     ]);
   });
 
-  it('gives every locale variant the identical five-key alternates map', () => {
+  it('gives every locale variant the identical seven-key alternates map', () => {
     // This is the machine-checkable hreflang-return proof: Search Console's "no
     // return links" error is exactly the case where these maps differ.
     const expected = {
@@ -31,6 +33,8 @@ describe('expandLocales', () => {
       es: 'https://www.boardsesh.com/es/playlists/abc',
       fr: 'https://www.boardsesh.com/fr/playlists/abc',
       de: 'https://www.boardsesh.com/de/playlists/abc',
+      it: 'https://www.boardsesh.com/it/playlists/abc',
+      'zh-CN': 'https://www.boardsesh.com/zh-CN/playlists/abc',
       'x-default': 'https://www.boardsesh.com/playlists/abc',
     };
     for (const entry of entries) {

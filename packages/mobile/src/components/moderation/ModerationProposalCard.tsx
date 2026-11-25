@@ -1,3 +1,5 @@
+import { ClimbActionsPressable } from '../climb-actions/ClimbActionsPressable';
+import type { ClimbActionsTarget } from '../../providers/drawer-host-provider';
 // One row of the moderation feed: the climb, what the crew is asking for, who
 // asked, and — for anyone who can act — the buttons to act with.
 //
@@ -7,15 +9,16 @@
 // every other card mid-sweep) and keeps the screen's `renderItem` deps down to
 // values that never change identity.
 
-import { memo, useCallback, useState } from 'react';
+import { memo, useCallback, useMemo, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { Proposal } from '@boardsesh/shared-schema';
 import { getLayoutDisplayName } from '@boardsesh/profile-stats';
-import { rolesGrantAdminOrLeader, type CommunityRoleScope } from '@boardsesh/community-roles';
+import { rolesGrantAdmin, rolesGrantAdminOrLeader, type CommunityRoleScope } from '@boardsesh/community-roles';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { Card } from '../Card';
+import { StatusPill } from '../StatusPill';
 import { Avatar } from '../Avatar';
 import { Button } from '../Button';
 import { PressableSurface } from '../PressableSurface';
@@ -32,13 +35,13 @@ import {
 import { useVoteOnProposal } from '../../lib/graphql/hooks/use-vote-on-proposal';
 import { useResolveProposal } from '../../lib/graphql/hooks/use-resolve-proposal';
 import { getBoardConfigForPlaylist } from '../../lib/playlists/board-details-for-playlist';
-import { hapticLight, hapticMedium } from '../../lib/haptics';
+import { hapticLight } from '../../lib/haptics';
 import { formatRelativeTime } from '../../lib/format-relative-time';
 import { useTheme } from '../../providers/theme-provider';
 import { useToast } from '../../providers/toast-provider';
 import { useConfirm } from '../../providers/dialog-provider';
 import { useGradeFormat } from '../../hooks/use-grade-format';
-import { spacing, borderRadius } from '../../theme/tokens';
+import { opacity, spacing, borderRadius } from '../../theme/tokens';
 
 /** Portrait board-art cell. Narrower than the feed hero — this is a list row. */
 const THUMBNAIL = { width: 64, height: 80 } as const;
@@ -52,7 +55,7 @@ type ModerationProposalCardProps = {
   /** Outline this card: it is the proposal a notification sent the viewer to. */
   highlighted?: boolean;
   onOpenClimb: (proposal: Proposal) => void;
-  onLongPressClimb: (proposal: Proposal) => void;
+  onLongPressClimb: (proposal: Proposal) => ClimbActionsTarget | null | undefined;
 };
 
 export const ModerationProposalCard = memo(function ModerationProposalCard({
@@ -81,12 +84,13 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
   const progress = voteProgress(proposal);
   const isOpen = proposal.status === 'open';
   const canModerate = rolesGrantAdminOrLeader(roles, proposal.boardType);
+  const canReadReleaseContext = isSignedIn && rolesGrantAdmin(roles, proposal.boardType);
   // The reporter's reason is quoted above the expander AND stored as their first
   // comment, so it is not one of the "more reasons" left to read.
   const extraReasons = extraReasonCount(proposal);
   // A label the formatter can't parse still shows: the raw grade beats a blank.
   const displayGrade = proposal.climbDifficulty
-    ? (formatGrade(proposal.climbDifficulty) ?? proposal.climbDifficulty)
+    ? (formatGrade(proposal.climbDifficulty, proposal.boardType) ?? proposal.climbDifficulty)
     : null;
 
   const handleOpenClimb = useCallback(() => {
@@ -94,10 +98,7 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
     onOpenClimb(proposal);
   }, [onOpenClimb, proposal]);
 
-  const handleLongPressClimb = useCallback(() => {
-    hapticMedium();
-    onLongPressClimb(proposal);
-  }, [onLongPressClimb, proposal]);
+  const menuTarget = useMemo(() => onLongPressClimb(proposal) ?? null, [onLongPressClimb, proposal]);
 
   const handleToggleReasons = useCallback(() => {
     hapticLight();
@@ -166,10 +167,9 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
         {/* The climb block is its own tap target: pressing it previews the climb,
             long-pressing opens the same actions menu every other climb row has.
             The rest of the card stays inert so a vote is never a mis-tap. */}
-        <PressableSurface
+        <ClimbActionsPressable
+          target={menuTarget}
           onPress={handleOpenClimb}
-          onLongPress={handleLongPressClimb}
-          feedback="opacity"
           accessibilityRole="button"
           accessibilityLabel={t('mobile.moderation.openClimb', {
             climb: proposal.climbName ?? t('mobile.moderation.unknownClimb'),
@@ -194,7 +194,7 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
 
             <View style={styles.climbDetails}>
               <View style={styles.nameRow}>
-                <Text variant="subheadline" numberOfLines={2} style={styles.climbName}>
+                <Text emphasized variant="subheadline" numberOfLines={2} style={styles.climbName}>
                   {proposal.climbName ?? t('mobile.moderation.unknownClimb')}
                 </Text>
                 {displayGrade ? (
@@ -212,33 +212,22 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
               {chip || proposal.climbIsHidden ? (
                 <View style={styles.chipRow}>
                   {proposal.climbIsHidden ? (
-                    <View style={[styles.chip, { backgroundColor: systemColors.fill }]}>
-                      <Icon name="visibility.off" size={12} color={systemColors.secondaryLabel} />
-                      <Text variant="caption2" color={systemColors.secondaryLabel}>
-                        {t('mobile.moderation.hiddenChip')}
-                      </Text>
-                    </View>
+                    <StatusPill icon="visibility.off" label={t('mobile.moderation.hiddenChip')} />
                   ) : null}
-                  {chip ? (
-                    <View style={[styles.chip, { backgroundColor: systemColors.fill }]}>
-                      <Text variant="caption2" color={systemColors.secondaryLabel}>
-                        {t(chip.labelI18nKey)}
-                      </Text>
-                    </View>
-                  ) : null}
+                  {chip ? <StatusPill label={t(chip.labelI18nKey)} /> : null}
                 </View>
               ) : null}
             </View>
           </View>
-        </PressableSurface>
+        </ClimbActionsPressable>
 
-        <Text variant="body" style={styles.typeLine}>
+        <Text emphasized variant="body" style={styles.typeLine}>
           {t(typeLine.textI18nKey, typeLine.params)}
         </Text>
 
         <View style={styles.proposerRow}>
           <Avatar uri={proposal.proposerAvatarUrl} name={proposal.proposerDisplayName} size={22} />
-          <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={1} style={styles.flex}>
+          <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={1} style={styles.flex}>
             {proposal.proposerDisplayName ?? t('mobile.moderation.unknownClimber')} ·{' '}
             {formatRelativeTime(proposal.createdAt)}
           </Text>
@@ -253,7 +242,7 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
         {/* Later reporters join an existing proposal and leave their reason as a
             comment, so the count is "how many OTHER people said something" —
             the proposer's own comment is the quote already rendered above. */}
-        {extraReasons > 0 ? (
+        {extraReasons > 0 || (canReadReleaseContext && proposal.commentCount > 0) ? (
           <PressableSurface
             onPress={handleToggleReasons}
             feedback="opacity"
@@ -261,10 +250,12 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
             accessibilityState={{ expanded: reasonsExpanded }}
             style={styles.expander}
           >
-            <Text variant="footnote" color={brandColors.primary}>
-              {t('mobile.moderation.moreReasons', { count: extraReasons })}
+            <Text variant="footnote" color={systemColors.accent}>
+              {extraReasons > 0
+                ? t('mobile.moderation.moreReasons', { count: extraReasons })
+                : tCommon('mobile.reportRelease.title')}
             </Text>
-            <Icon name={reasonsExpanded ? 'chevron.up' : 'chevron.down'} size={12} color={brandColors.primary} />
+            <Icon name={reasonsExpanded ? 'chevron.up' : 'chevron.down'} size={12} color={systemColors.accent} />
           </PressableSurface>
         ) : null}
 
@@ -273,9 +264,10 @@ export const ModerationProposalCard = memo(function ModerationProposalCard({
           proposerId={proposal.proposerId}
           reason={proposal.reason}
           expanded={reasonsExpanded}
+          canReadReleaseContext={canReadReleaseContext}
         />
 
-        <Text variant="caption1" color={systemColors.tertiaryLabel} style={styles.voteLine}>
+        <Text variant="caption1" color={systemColors.secondaryLabel} style={styles.voteLine}>
           {tFeed('proposalVoteBar.votesNeeded', { current: progress.current, required: progress.required })}
           {' · '}
           {t('mobile.moderation.reporters', { count: progress.reporters })}
@@ -347,8 +339,9 @@ const VoteButton = memo(function VoteButton({
   disabled: boolean;
   onPress: () => void;
 }) {
-  const { systemColors, brandColors } = useTheme();
-  const tint = selected ? brandColors.primary : systemColors.secondaryLabel;
+  const { systemColors } = useTheme();
+  // A vote is a toggle you tap, so its on-state keeps the accent (tappable, not status).
+  const tint = selected ? systemColors.accent : systemColors.secondaryLabel;
 
   return (
     <PressableSurface
@@ -360,7 +353,7 @@ const VoteButton = memo(function VoteButton({
       accessibilityState={{ selected, disabled }}
       style={[
         styles.voteButton,
-        { borderColor: selected ? brandColors.primary : systemColors.separator },
+        { borderColor: selected ? systemColors.accent : systemColors.separator },
         disabled ? styles.voteButtonDisabled : undefined,
       ]}
     >
@@ -385,18 +378,10 @@ const styles = StyleSheet.create({
   },
   climbDetails: { flex: 1, gap: spacing[1], justifyContent: 'center' },
   nameRow: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing[2] },
-  climbName: { flex: 1, fontWeight: '600' },
+  climbName: { flex: 1 },
   gradeText: { fontWeight: '700' },
   chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing[1], marginTop: 2 },
-  chip: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    paddingHorizontal: spacing[2],
-    paddingVertical: 2,
-    borderRadius: borderRadius.full,
-  },
-  typeLine: { marginTop: spacing[3], fontWeight: '600' },
+  typeLine: { marginTop: spacing[3] },
   proposerRow: { flexDirection: 'row', alignItems: 'center', gap: spacing[2], marginTop: spacing[2] },
   reason: { marginTop: spacing[2], fontStyle: 'italic' },
   expander: { flexDirection: 'row', alignItems: 'center', gap: spacing[1], marginTop: spacing[2] },
@@ -413,7 +398,7 @@ const styles = StyleSheet.create({
     borderWidth: StyleSheet.hairlineWidth,
     borderRadius: borderRadius.full,
   },
-  voteButtonDisabled: { opacity: 0.5 },
+  voteButtonDisabled: { opacity: opacity.disabled },
   moderatorRow: { flexDirection: 'row', gap: spacing[2], marginTop: spacing[2] },
   flex: { flex: 1 },
 });

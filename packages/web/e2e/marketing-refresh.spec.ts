@@ -32,7 +32,7 @@ const platformBrowsers = [
 ] as const;
 
 for (const browserProfile of platformBrowsers) {
-  test(`${browserProfile.name} receives matching screenshots in server HTML and browser requests`, async ({
+  test(`${browserProfile.name} receives shared HTML and matching screenshots after hydration`, async ({
     browser,
     baseURL,
   }) => {
@@ -57,17 +57,30 @@ for (const browserProfile of platformBrowsers) {
       const response = await page.goto('/');
       const html = await response!.text();
       const oppositePlatform = browserProfile.platform === 'ios' ? 'android' : 'ios';
-      expect(html).toContain(`data-preview-platform="${browserProfile.platform}"`);
-      expect(html).not.toContain(`/images/app/${oppositePlatform}/`);
-      expect(html).not.toContain(encodeURIComponent(`/images/app/${oppositePlatform}/`));
+      // Anonymous English HTML is shared across browsers; lazy captures switch
+      // to the detected platform before the reader scrolls them into view.
+      expect(html).toContain('data-preview-platform="android"');
+      expect(html).not.toContain('/images/app/ios/');
+      expect(html).not.toContain(encodeURIComponent('/images/app/ios/'));
       const screenshots = page.locator('[data-marketing-shot]');
-      await expect(screenshots).toHaveCount(6);
+      // English hero: the demo video replaces the three-phone stack, so only the
+      // feature strip's three shots remain.
+      await expect(screenshots).toHaveCount(3);
+      const showcase = page.locator('figure:has(video)');
+      await expect(showcase).toHaveCount(1);
+      await expect(showcase.locator('img[fetchpriority="high"]')).toHaveCount(1);
+      await expect(showcase.getByRole('button', { name: /^(Pause|Play) demo$/ })).toHaveCount(1);
       for (const screenshot of await screenshots.all()) {
         await screenshot.scrollIntoViewIfNeeded();
         await expect(screenshot).toHaveAttribute('data-preview-platform', browserProfile.platform);
         await expect
-          .poll(() => screenshot.locator('img').evaluate((image: HTMLImageElement) => image.naturalWidth))
-          .toBeGreaterThan(0);
+          .poll(() =>
+            screenshot.locator('img').evaluate((image: HTMLImageElement) => ({
+              loaded: image.naturalWidth > 0,
+              source: decodeURIComponent(image.currentSrc),
+            })),
+          )
+          .toMatchObject({ loaded: true, source: expect.stringContaining(`/images/app/${browserProfile.platform}/`) });
       }
       expect(imageRequests.some((url) => url.includes(`/images/app/${browserProfile.platform}/`))).toBe(true);
       expect(imageRequests.filter((url) => url.includes(`/images/app/${oppositePlatform}/`))).toEqual([]);
@@ -91,6 +104,24 @@ for (const browserProfile of platformBrowsers) {
   });
 }
 
+test('non-English homepages keep the six-shot phone stack and no demo video', async ({ browser, baseURL }) => {
+  const context = await browser.newContext({
+    baseURL,
+    ignoreHTTPSErrors,
+    userAgent: platformBrowsers[3].userAgent,
+    viewport: { width: 1440, height: 1000 },
+  });
+  try {
+    const page = await context.newPage();
+    await page.goto('/de');
+    await expect(page.locator('[data-marketing-shot]')).toHaveCount(6);
+    await expect(page.locator('video')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'iOS', exact: true })).toHaveCount(1);
+  } finally {
+    await context.close();
+  }
+});
+
 test('desktop preview switching persists when navigating to About', async ({ browser, baseURL }) => {
   const context = await browser.newContext({
     baseURL,
@@ -102,12 +133,9 @@ test('desktop preview switching persists when navigating to About', async ({ bro
     const page = await context.newPage();
     await page.goto('/');
     await page.getByRole('button', { name: 'iOS', exact: true }).click();
-    await expect(page.locator('[data-preview-platform="ios"]')).toHaveCount(6);
-    await page.getByTestId('marketing-header').getByRole('link', { name: 'About', exact: true }).click();
+    await expect(page.locator('[data-preview-platform="ios"]')).toHaveCount(3);
+    await page.getByTestId('site-footer').getByRole('link', { name: 'About', exact: true }).click();
     await expect(page).toHaveURL(/\/about$/);
-    await expect(
-      page.getByTestId('marketing-header').getByRole('link', { name: 'About', exact: true }),
-    ).toHaveAttribute('aria-current', 'page');
     await expect(page.locator('[data-marketing-shot="profile"]')).toHaveAttribute('data-preview-platform', 'ios');
     await expect(page.getByRole('button', { name: 'iOS', exact: true })).toHaveAttribute('aria-pressed', 'true');
     await page.getByRole('button', { name: 'Android', exact: true }).click();
@@ -126,13 +154,11 @@ for (const width of [1440, 390]) {
       '/gyms/kilter',
       '/about',
       '/help',
-      '/help/playlists',
       '/help/sessions',
       '/help/finding-climbs',
       '/help/logbook',
-      '/help/climb-actions',
-      '/help/beta-videos',
       '/help/board-and-bluetooth',
+      '/help/spray-walls',
       '/legal',
       '/privacy',
     ]) {
@@ -149,10 +175,17 @@ for (const width of [1440, 390]) {
       }
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - innerWidth);
       expect(overflow, route).toBeLessThanOrEqual(1);
-      await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(17, 10, 32)');
+      await expect(page.locator('body')).toHaveCSS('background-color', 'rgb(14, 14, 14)');
       await expect(page.locator('h1')).toHaveCSS(
         'font-size',
-        route === '/' ? (width === 390 ? '40px' : '64px') : width === 390 ? '32px' : '40px',
+        // /help pages carry the big showcase hero, the same scale as the homepage.
+        route === '/' || route.startsWith('/help')
+          ? width === 390
+            ? '40px'
+            : '64px'
+          : width === 390
+            ? '32px'
+            : '40px',
       );
     }
   });
@@ -183,11 +216,16 @@ test('the compact mobile header keeps the app and account reachable', async ({ p
   await page.setViewportSize({ width: 320, height: 844 });
   await page.goto('/');
   const header = page.getByTestId('marketing-header');
-  await expect(header.getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
-  await header.getByRole('button', { name: 'Open menu', exact: true }).click();
-  const appLink = page.getByRole('menuitem', { name: 'Start climbing', exact: true });
+  const disclosure = header.locator('details');
+  await expect(disclosure).not.toHaveAttribute('open');
+  await disclosure.locator('summary').click();
+  await expect(disclosure.getByRole('link', { name: 'Sign in', exact: true })).toBeVisible();
+  const appLink = disclosure.getByRole('link', { name: 'Start climbing', exact: true });
   await expect(appLink).toBeVisible();
   await expect(appLink).toHaveAttribute('href', /^(https?:\/\/|\/app)/);
+  await disclosure.locator('summary').press('Escape');
+  await expect(disclosure).not.toHaveAttribute('open');
+  await expect(disclosure.locator('summary')).toBeFocused();
 });
 
 for (const width of [320, 390]) {
@@ -301,9 +339,9 @@ for (const width of [320, 390, 430]) {
     for (const feature of await features.all()) {
       // The feature cards are PageCards now. They used to hand-roll surface +
       // radius + padding and NO border, so their bottom edge barely read against
-      // the page (#251B3A on #110A20 is 1.19:1). Pin the edge, not the recipe.
+      // the page (#1E1E1E on #0E0E0E is 1.16:1). Pin the edge, not the recipe.
       await expect(feature).toHaveCSS('border-bottom-width', '1px');
-      await expect(feature).toHaveCSS('border-bottom-color', 'rgba(185, 170, 215, 0.2)');
+      await expect(feature).toHaveCSS('border-bottom-color', 'rgba(255, 255, 255, 0.12)');
       await expect(feature).toHaveCSS('border-radius', '16px');
       await expect(feature.locator('h3')).toHaveCSS('font-size', '24px');
       const paragraph = feature.locator('p');

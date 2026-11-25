@@ -1,5 +1,5 @@
 import { useMemo } from 'react';
-import { useInfiniteQuery, type UseInfiniteQueryResult, type InfiniteData } from '@tanstack/react-query';
+import { useInfiniteQuery, type QueryKey, type UseInfiniteQueryResult, type InfiniteData } from '@tanstack/react-query';
 import {
   GET_PLAYLIST_CLIMBS,
   type GetPlaylistClimbsInput,
@@ -7,12 +7,143 @@ import {
   type PlaylistClimbsResult,
 } from '@boardsesh/graphql/operations/playlists';
 import type { Climb } from '@boardsesh/queue';
-import { usePlaylistsAdapter, type ExecutePlaylistsGraphQL } from './adapter';
+import { useOptionalPlaylistsAdapter, type ExecutePlaylistsGraphQL } from './adapter';
 
 /** Board-scoping fields merged into the per-page query input. Omit for the
  *  all-boards view; supply when a specific board is selected. `playlistId`,
  *  `page`, and `pageSize` are added by the hook. */
-export type PlaylistClimbsBoardInput = Omit<GetPlaylistClimbsInput, 'playlistId' | 'page' | 'pageSize'>;
+export type PlaylistClimbsBoardInput = Omit<GetPlaylistClimbsInput, 'playlistId' | 'page' | 'pageSize' | 'view'>;
+
+/** The sort and filters, as `toPlaylistClimbViewInput` (@boardsesh/climb-filters) builds them. */
+export type PlaylistClimbsView = NonNullable<GetPlaylistClimbsInput['view']>;
+
+/** Where a list's query key holds its board geometry and its view, for `keepPreviousViewResults`. */
+export type ViewQueryKeyLayout = {
+  geometryIndex: number;
+  viewIndex: number;
+};
+
+/** A playlist's key: the geometry after the playlist, board and angle; the view before the refresh key. */
+const PLAYLIST_CLIMBS_KEY_LAYOUT: ViewQueryKeyLayout = { geometryIndex: 4, viewIndex: 5 };
+
+/** What a playlist climbs query key is built from. */
+export type PlaylistClimbsQueryKeyParts = {
+  playlistUuid: string;
+  boardUuid?: string | null;
+  /** The angle the grades resolve at (`activeAngle` in all-boards mode, `angle` for one board). */
+  angle?: number | null;
+  /** The board geometry the request sends (`playlistClimbsGeometryKey`), or null when it sends none. */
+  geometry?: string | null;
+  view?: PlaylistClimbsView;
+  refreshKey?: number;
+};
+
+/**
+ * The React Query key `usePlaylistClimbs` caches one view under, so a screen can
+ * invalidate exactly one view (the playlist's own order, before the editor reads
+ * it) without rebuilding the key by hand. The view is the object itself, which
+ * React Query hashes with its keys sorted, so a re-built view with the same
+ * content keeps the same cache entry. Every segment sits after the playlist
+ * uuid, so `invalidateQueries({ queryKey: ['playlistClimbs', uuid] })` still
+ * clears every view of the playlist.
+ */
+export function playlistClimbsQueryKey({
+  playlistUuid,
+  boardUuid,
+  angle,
+  geometry,
+  view,
+  refreshKey = 0,
+}: PlaylistClimbsQueryKeyParts) {
+  return [
+    'playlistClimbs',
+    playlistUuid,
+    boardUuid ?? 'all',
+    angle ?? null,
+    geometry ?? null,
+    view ?? 'default',
+    refreshKey,
+  ] as const;
+}
+
+/**
+ * The geometry segment of the key: the board, layout, size and hold sets the
+ * request sends (`boardName` / `layoutId` / `sizeId` / `setIds` for one board,
+ * the `active*` fields in all-boards mode), or null when it sends none. A board
+ * keeps its uuid when its size or sets are edited, so without this a request
+ * that reads them (a view's board-only filters) would be served from the old
+ * configuration's cache.
+ */
+export function playlistClimbsGeometryKey(boardInput: PlaylistClimbsBoardInput | undefined): string | null {
+  if (!boardInput) return null;
+  const boardName = boardInput.boardName ?? boardInput.activeBoardName;
+  const layoutId = boardInput.layoutId ?? boardInput.activeLayoutId;
+  const sizeId = boardInput.sizeId ?? boardInput.activeSizeId;
+  const setIds = boardInput.setIds ?? boardInput.activeSetIds;
+  if (layoutId == null && sizeId == null && setIds == null) return null;
+  return [boardName ?? '', layoutId ?? '', sizeId ?? '', setIds ?? ''].join('|');
+}
+
+/**
+ * The angle segment of the key: grades resolve at it, so it must be part of the
+ * key. All-boards mode sends `activeAngle`, specific-board mode sends `angle`.
+ */
+export function playlistClimbsAngleKey(boardInput: PlaylistClimbsBoardInput | undefined): number | null {
+  return boardInput?.activeAngle ?? boardInput?.angle ?? null;
+}
+
+/**
+ * The key `usePlaylistClimbs` uses for these exact options. A screen that needs
+ * to touch one view's cache (the editor marking the playlist's own order stale)
+ * calls this with the options that view's hook call gets (its own `boardInput`,
+ * which for a plain request carries no geometry), so the two never disagree
+ * about the angle or the geometry.
+ */
+export function playlistClimbsQueryKeyFor({
+  playlistUuid,
+  boardUuid,
+  boardInput,
+  view,
+  refreshKey,
+}: Pick<UsePlaylistClimbsOptions, 'playlistUuid' | 'boardUuid' | 'boardInput' | 'view' | 'refreshKey'>) {
+  return playlistClimbsQueryKey({
+    playlistUuid,
+    boardUuid,
+    angle: playlistClimbsAngleKey(boardInput),
+    geometry: playlistClimbsGeometryKey(boardInput),
+    view,
+    refreshKey,
+  });
+}
+
+/**
+ * The `placeholderData` rule: while a new view's first page loads, keep showing
+ * the rows of the same list, board, angle, geometry and refresh under the
+ * previous view, so changing the sort or a filter never flashes an empty list.
+ * Any other difference (another list, board or angle, a refresh) shows nothing
+ * stale. Geometry is a different board only when both requests send it: a plain
+ * request sends none and its rows do not depend on it, so turning a view on or
+ * off keeps the rows up, while an edited size or set list does not.
+ *
+ * `layout` says where the list's key holds the geometry and the view: a
+ * playlist's by default, a smart list's from `smartPlaylistQueryKey`.
+ */
+export function keepPreviousViewResults<TData>(
+  queryKey: QueryKey,
+  previousData: TData | undefined,
+  previousQueryKey: QueryKey | undefined,
+  layout: ViewQueryKeyLayout = PLAYLIST_CLIMBS_KEY_LAYOUT,
+): TData | undefined {
+  if (previousData === undefined || !previousQueryKey) return undefined;
+  if (previousQueryKey.length !== queryKey.length) return undefined;
+  const sameListOnSameBoard = queryKey.every((segment, index) => {
+    if (index === layout.viewIndex) return true;
+    const previousSegment = previousQueryKey[index];
+    if (index === layout.geometryIndex && (segment === null || previousSegment === null)) return true;
+    return segment === previousSegment;
+  });
+  return sameListOnSameBoard ? previousData : undefined;
+}
 
 export type UsePlaylistClimbsOptions = {
   playlistUuid: string;
@@ -23,6 +154,9 @@ export type UsePlaylistClimbsOptions = {
   refreshKey?: number;
   /** Board-scoping query input. When omitted, climbs are fetched all-boards. */
   boardInput?: PlaylistClimbsBoardInput;
+  /** Sort and filters. Omit (or pass undefined) for the playlist's own order:
+   *  the request then carries no `view` at all, exactly as before views. */
+  view?: PlaylistClimbsView;
   /** Page size per page. Defaults to 20. */
   pageSize?: number;
   /** True while the token is still resolving — disables the query until ready.
@@ -56,6 +190,7 @@ export function usePlaylistClimbs({
   boardUuid,
   refreshKey = 0,
   boardInput,
+  view,
   pageSize = 20,
   tokenLoading = false,
   initialData,
@@ -63,24 +198,51 @@ export function usePlaylistClimbs({
   initialDataUpdatedAt = 0,
   executeGraphQL: executeGraphQLOverride,
 }: UsePlaylistClimbsOptions): UsePlaylistClimbsResult {
-  const adapter = usePlaylistsAdapter();
-  const executeGraphQL = executeGraphQLOverride ?? adapter.executeGraphQL;
+  const adapter = useOptionalPlaylistsAdapter();
+  const executeGraphQL = executeGraphQLOverride ?? adapter?.executeGraphQL;
+  if (!executeGraphQL) {
+    throw new Error('usePlaylistClimbs requires an executeGraphQL transport or a PlaylistsAdapterProvider.');
+  }
 
   // The selected angle parameterises the response (grades resolve at it), but a
   // board's UUID is angle-agnostic — so the angle must be its own key segment.
   // Without it, dialing to a new angle on the same board keeps the same key and
   // React Query serves stale grades until staleTime lapses. Covers all-boards
   // mode (activeAngle) and specific-board mode (angle).
-  const angleKey = boardInput?.activeAngle ?? boardInput?.angle ?? null;
+  const angleKey = playlistClimbsAngleKey(boardInput);
+  // The geometry the request sends, so an edited size or set list on the same
+  // board (same uuid) is a new cache entry rather than the old one served fresh.
+  const geometryKey = playlistClimbsGeometryKey(boardInput);
+  const queryKey = useMemo(
+    () => playlistClimbsQueryKey({ playlistUuid, boardUuid, angle: angleKey, geometry: geometryKey, view, refreshKey }),
+    [playlistUuid, boardUuid, angleKey, geometryKey, view, refreshKey],
+  );
+  // A new function whenever anything but the view changes: React Query keeps a
+  // showing placeholder without asking again while this identity holds. The
+  // view segment is the default because the rule never reads it.
+  const placeholderData = useMemo(() => {
+    const keyAroundView: QueryKey = playlistClimbsQueryKey({
+      playlistUuid,
+      boardUuid,
+      angle: angleKey,
+      geometry: geometryKey,
+      refreshKey,
+    });
+    return (
+      previousData: InfiniteData<PlaylistClimbsResult, number> | undefined,
+      previousQuery: { queryKey: QueryKey } | undefined,
+    ) => keepPreviousViewResults(keyAroundView, previousData, previousQuery?.queryKey);
+  }, [playlistUuid, boardUuid, angleKey, geometryKey, refreshKey]);
 
   const query = useInfiniteQuery({
-    queryKey: ['playlistClimbs', playlistUuid, boardUuid ?? 'all', angleKey, refreshKey],
+    queryKey,
     queryFn: async ({ pageParam }) => {
       const input: GetPlaylistClimbsInput = {
         playlistId: playlistUuid,
         page: pageParam,
         pageSize,
         ...boardInput,
+        ...(view ? { view } : {}),
       };
       const response = await executeGraphQL<GetPlaylistClimbsQueryResponse, { input: GetPlaylistClimbsInput }>(
         GET_PLAYLIST_CLIMBS,
@@ -98,6 +260,7 @@ export function usePlaylistClimbs({
       return allPages.length;
     },
     staleTime: 5 * 60 * 1000,
+    placeholderData,
     initialData:
       initialDataApplicable && initialData
         ? {

@@ -1,5 +1,6 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useMemo } from 'react';
-import { View, Pressable, StyleSheet } from 'react-native';
+import { View, StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import * as Haptics from 'expo-haptics';
 import { Text } from '../Text';
@@ -11,6 +12,7 @@ import { useBoardseshGrade, useBoardseshGradesForAngles, useClimbStatsHistory } 
 import { useGradeFormat } from '../../hooks/use-grade-format';
 import { useIsOffline } from '../../hooks/use-is-offline';
 import { useTheme } from '../../providers/theme-provider';
+import { withAlpha } from '../../theme/colors';
 import { iosSystemColors } from '../../theme/ios-colors';
 import { spacing, borderRadius } from '../../theme/tokens';
 import { getBoardCapabilities } from '@boardsesh/board-config';
@@ -49,22 +51,23 @@ const GradeLadderRow = memo(function GradeLadderRow({
   /** Omitted for every rung except the one the app is actually using for you. */
   gradeColor?: string;
 }) {
+  const { systemColors } = useTheme();
   return (
     <View style={styles.ladderRow}>
       <View style={styles.ladderGlyph}>
-        <Icon name={icon} size={16} color={iosSystemColors.systemGray} />
+        <Icon name={icon} size={16} color={systemColors.secondaryLabel} />
       </View>
       <View style={styles.ladderLabel}>
         <Text variant="subheadline">{label}</Text>
         {detail ? (
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {detail}
           </Text>
         ) : null}
       </View>
       <Text
         variant="title3"
-        style={[styles.ladderGrade, { color: gradeColor ?? iosSystemColors.systemGray }]}
+        style={[styles.ladderGrade, { color: gradeColor ?? systemColors.secondaryLabel }]}
         numberOfLines={1}
       >
         {grade}
@@ -91,6 +94,7 @@ const YourGradeBlock = memo(function YourGradeBlock({
   crowdLabel,
   boardSetsTheGrade,
   gradeFormat,
+  boardName,
 }: {
   climbUuid: string;
   angle: number;
@@ -99,14 +103,15 @@ const YourGradeBlock = memo(function YourGradeBlock({
   /** True on Woods/MoonBoard, where the "crowd" number is really the setter's own. */
   boardSetsTheGrade: boolean;
   gradeFormat: GradeDisplayFormat;
+  boardName: string;
 }) {
   const { t } = useTranslation('climbs');
-  const { brandColors } = useTheme();
+  const { systemColors } = useTheme();
   // Falls back to the device's own ticks table while the logbook is unresolved,
   // so the drawer shows the climber's grade offline too — the same grade the
   // on-device search placed this climb by.
   const myGrade = useMyGrade(climbUuid, angle, { localFallback: true });
-  const mine = myGrade.status === 'set' ? renderDifficulty(myGrade.difficultyId, gradeFormat) : null;
+  const mine = myGrade.status === 'set' ? renderDifficulty(myGrade.difficultyId, gradeFormat, boardName) : null;
 
   if (!mine) {
     // Never render the CTA while the logbook is still unknown — it would
@@ -114,8 +119,8 @@ const YourGradeBlock = memo(function YourGradeBlock({
     if (myGrade.status !== 'none') return null;
     return (
       <View style={styles.row}>
-        <Icon name="add.fill" size={20} color={brandColors.primary} />
-        <Text variant="subheadline" color={brandColors.primary} style={styles.flexText}>
+        <Icon name="add.fill" size={20} color={systemColors.accent} />
+        <Text variant="subheadline" color={systemColors.accent} style={styles.flexText}>
           {t('boardseshGrade.yours.emptyBody')}
         </Text>
       </View>
@@ -146,7 +151,7 @@ const YourGradeBlock = memo(function YourGradeBlock({
         />
       ) : null}
       {agrees ? (
-        <Text variant="footnote" color={iosSystemColors.systemGray}>
+        <Text variant="footnote" color={systemColors.secondaryLabel}>
           {t('boardseshGrade.yours.matches')}
         </Text>
       ) : null}
@@ -162,7 +167,7 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
   const { t } = useTranslation('climbs');
   const { t: tCommon } = useTranslation('common');
   const { gradeFormat } = useGradeFormat();
-  const { brandColors } = useTheme();
+  const { brandColors, systemColors } = useTheme();
   // The cheap boolean, not the whole snapshot — see BetaVideosSection: a memo'd
   // drawer section must not re-render on every probe tick.
   const effectiveOffline = useIsOffline();
@@ -197,7 +202,10 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
   // "this board" number and the dumbbell's rings. Loading/error render nothing;
   // the section's own loading/error stays owned by the singular grade above.
   const { data: history } = useClimbStatsHistory(boardName, noCrowdGrade ? null : climbUuid);
-  const crowdBars = useMemo(() => buildAngleGradeBars(history, gradeFormat), [history, gradeFormat]);
+  const crowdBars = useMemo(
+    () => buildAngleGradeBars(history, gradeFormat, boardName),
+    [history, gradeFormat, boardName],
+  );
   const crowdDifficulty = useMemo(
     () => crowdBars.find((bar) => bar.angle === angle)?.difficulty ?? null,
     [crowdBars, angle],
@@ -206,8 +214,8 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
   // The cross-board Boardsesh series per angle → the dumbbell's diamonds.
   const { data: angleRows } = useBoardseshGradesForAngles(boardName, climbUuid, { enabled: !noCrowdGrade });
   const dumbbellRows = useMemo(
-    () => buildDumbbellByAngleModel(angleRows ?? [], crowdBars, gradeFormat),
-    [angleRows, crowdBars, gradeFormat],
+    () => buildDumbbellByAngleModel(angleRows ?? [], crowdBars, gradeFormat, boardName),
+    [angleRows, crowdBars, gradeFormat, boardName],
   );
 
   // The correction only exists for a real cross-board grade with a crowd number
@@ -215,8 +223,8 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
   const correction = useMemo(() => {
     if (view.kind !== 'confirmed' && view.kind !== 'provisional') return null;
     if (!view.universal) return null;
-    return buildCorrection(crowdDifficulty, view.gradeValue, gradeFormat);
-  }, [view, crowdDifficulty, gradeFormat]);
+    return buildCorrection(crowdDifficulty, view.gradeValue, gradeFormat, boardName);
+  }, [view, crowdDifficulty, gradeFormat, boardName]);
 
   const handleRetry = useCallback(() => {
     void Haptics.selectionAsync();
@@ -224,7 +232,7 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
   }, [refetch]);
 
   if (fetchGrade && isLoading) {
-    return <View style={[styles.skeleton, styles.skeletonBlock]} />;
+    return <View style={[styles.skeleton, styles.skeletonBlock, { backgroundColor: systemColors.tertiaryFill }]} />;
   }
 
   // Nothing can reach us and no grade is cached. A tappable "Couldn't load"
@@ -234,7 +242,7 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
   if (fetchGrade && effectiveOffline && !grade) {
     return (
       <View style={styles.row}>
-        <Text variant="subheadline" color={iosSystemColors.systemGray}>
+        <Text variant="subheadline" color={systemColors.secondaryLabel}>
           {tCommon('mobile.connectivity.needsConnection')}
         </Text>
       </View>
@@ -243,17 +251,17 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
 
   if (fetchGrade && isError) {
     return (
-      <Pressable
+      <PressableSurface
         onPress={handleRetry}
         style={styles.row}
         accessibilityRole="button"
         accessibilityLabel={t('boardseshGrade.loadError')}
       >
-        <Icon name="refresh" size={20} color={brandColors.primary} />
-        <Text variant="subheadline" color={brandColors.primary}>
+        <Icon name="refresh" size={20} color={systemColors.accent} />
+        <Text variant="subheadline" color={systemColors.accent}>
           {t('boardseshGrade.loadError')}
         </Text>
-      </Pressable>
+      </PressableSurface>
     );
   }
 
@@ -266,16 +274,16 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
     return (
       <View style={styles.container}>
         <View style={styles.singleHero}>
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('boardseshGrade.moonboardAngle.label')}
           </Text>
-          <Text variant="title1" style={[styles.gradeValue, styles.estimateGrade, { color: view.grade.color }]}>
+          <Text emphasized variant="title1" style={[styles.gradeValue, { color: withAlpha(view.grade.color, 0.75) }]}>
             {`${ESTIMATE_PREFIX}${view.grade.label}`}
           </Text>
         </View>
         <View style={styles.row}>
-          <Icon name="angle" size={18} color={iosSystemColors.systemGray} />
-          <Text variant="footnote" color={iosSystemColors.systemGray} style={styles.flexText}>
+          <Icon name="angle" size={18} color={systemColors.secondaryLabel} />
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.flexText}>
             {view.range
               ? t('boardseshGrade.moonboardAngle.bodyRange', { low: view.range.low, high: view.range.high })
               : t('boardseshGrade.moonboardAngle.body')}
@@ -295,16 +303,16 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
     return (
       <View style={styles.container}>
         <View style={styles.singleHero}>
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('boardseshGrade.moonboardWideAngle.label')}
           </Text>
-          <Text variant="title1" style={[styles.gradeValue, styles.estimateGrade, { color: view.grade.color }]}>
+          <Text emphasized variant="title1" style={[styles.gradeValue, { color: withAlpha(view.grade.color, 0.75) }]}>
             {`${ESTIMATE_PREFIX}${view.grade.label}`}
           </Text>
         </View>
         <View style={styles.row}>
-          <Icon name="angle" size={18} color={iosSystemColors.systemGray} />
-          <Text variant="footnote" color={iosSystemColors.systemGray} style={styles.flexText}>
+          <Icon name="angle" size={18} color={systemColors.secondaryLabel} />
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.flexText}>
             {view.range
               ? t('boardseshGrade.moonboardWideAngle.bodyRange', { low: view.range.low, high: view.range.high })
               : t('boardseshGrade.moonboardWideAngle.body')}
@@ -327,12 +335,17 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
           crowdLabel={null}
           boardSetsTheGrade
           gradeFormat={gradeFormat}
+          boardName={boardName}
         />
         <View style={styles.row}>
-          <Icon name="info" size={20} color={iosSystemColors.systemGray} />
-          <Text variant="subheadline" color={iosSystemColors.systemGray} style={styles.flexText}>
+          <Icon name="info" size={20} color={systemColors.secondaryLabel} />
+          <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.flexText}>
             {/* Literal keys per board — the i18n linter rejects a computed t() key. */}
-            {view.boardName === 'woods' ? t('boardseshGrade.woodsBody') : t('boardseshGrade.moonboardBody')}
+            {view.boardName === 'woods'
+              ? t('boardseshGrade.woodsBody')
+              : view.boardName === 'spray'
+                ? t('boardseshGrade.sprayBody')
+                : t('boardseshGrade.moonboardBody')}
           </Text>
         </View>
       </View>
@@ -349,16 +362,16 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
     return (
       <View style={styles.container}>
         <View style={styles.singleHero}>
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('boardseshGrade.estimate.label')}
           </Text>
-          <Text variant="title1" style={[styles.gradeValue, styles.estimateGrade, { color: view.grade.color }]}>
+          <Text emphasized variant="title1" style={[styles.gradeValue, { color: withAlpha(view.grade.color, 0.75) }]}>
             {`${ESTIMATE_PREFIX}${view.grade.label}`}
           </Text>
         </View>
         <View style={styles.row}>
-          <Icon name="angle" size={18} color={iosSystemColors.systemGray} />
-          <Text variant="footnote" color={iosSystemColors.systemGray} style={styles.flexText}>
+          <Icon name="angle" size={18} color={systemColors.secondaryLabel} />
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.flexText}>
             {view.range
               ? t('boardseshGrade.estimate.bodyRange', { low: view.range.low, high: view.range.high })
               : t('boardseshGrade.estimate.body')}
@@ -370,6 +383,7 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
               rows={dumbbellRows}
               headlineGrade={view.gradeValue}
               gradeFormat={gradeFormat}
+              boardName={boardName}
               accessibilityLabel={t('boardseshGrade.byAngle')}
             />
           </View>
@@ -382,16 +396,16 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
     return (
       <View style={styles.container}>
         <View style={styles.setterHero}>
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('boardseshGrade.setterCall')}
           </Text>
           {view.grade && (
-            <Text variant="title1" style={[styles.gradeValue, styles.setterGrade]}>
+            <Text emphasized variant="title1" style={[styles.gradeValue, { color: systemColors.secondaryLabel }]}>
               {view.grade.label}
             </Text>
           )}
         </View>
-        <Text variant="footnote" color={iosSystemColors.systemGray}>
+        <Text variant="footnote" color={systemColors.secondaryLabel}>
           {t('boardseshGrade.trust.setter')}
         </Text>
       </View>
@@ -410,7 +424,7 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
   const count = view.count;
   // Low/high labels for the trust line. When both bounds round to the same grade
   // there is no real range ("V4–V4"), so we show a single-grade line instead.
-  const band = buildTrustBand(view.gradeLow, view.gradeHigh, heroGrade.label, gradeFormat);
+  const band = buildTrustBand(view.gradeLow, view.gradeHigh, heroGrade.label, gradeFormat, boardName);
   // The all-boards grade shows the two-grade span for a provisional read.
   const everywhereLabel = rangeLabel ?? heroGrade.label;
   // "About ½" for a provisional payoff; "½" when confirmed.
@@ -435,18 +449,19 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
         crowdLabel={correction?.crowd.label ?? null}
         boardSetsTheGrade={false}
         gradeFormat={gradeFormat}
+        boardName={boardName}
       />
       {/* HERO — leads left→right with the cross-board correction. */}
       {!universal ? (
         // Local-only: no cross-board number yet — one centred grade, no comparison.
         <View style={styles.singleHero}>
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('boardseshGrade.hero.thisBoardOnly')}
           </Text>
-          <Text variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
+          <Text emphasized variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
             {everywhereLabel}
           </Text>
-          <Text variant="footnote" color={iosSystemColors.systemGray} style={styles.centered}>
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.centered}>
             {t('boardseshGrade.localOnlyNote')}
           </Text>
         </View>
@@ -454,23 +469,23 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
         // Crowd rounds equal to the cross-board grade: drop the comparison, say so.
         <View style={styles.singleHero}>
           <View style={styles.everywhereValue}>
-            <Text variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
+            <Text emphasized variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
               {everywhereLabel}
             </Text>
             {seal}
           </View>
-          <Text variant="footnote" color={iosSystemColors.systemGray} style={styles.centered}>
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.centered}>
             {t('boardseshGrade.matchesBoard')}
           </Text>
         </View>
       ) : !correction ? (
         // No crowd grade at this angle: show the cross-board grade alone.
         <View style={styles.singleHero}>
-          <Text variant="caption1" color={iosSystemColors.systemGray}>
+          <Text variant="caption1" color={systemColors.secondaryLabel}>
             {t('boardseshGrade.hero.everywhere')}
           </Text>
           <View style={styles.everywhereValue}>
-            <Text variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
+            <Text emphasized variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
               {everywhereLabel}
             </Text>
             {seal}
@@ -481,24 +496,24 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
         // The grey→coloured grades + the single payoff sentence carry the delta.
         <View style={styles.correctionRow}>
           <View style={styles.correctionSide}>
-            <Text variant="caption1" color={iosSystemColors.systemGray}>
+            <Text variant="caption1" color={systemColors.secondaryLabel}>
               {t('boardseshGrade.hero.thisBoard')}
             </Text>
-            <Text variant="title1" style={[styles.gradeValue, styles.crowdGrade]}>
+            <Text emphasized variant="title1" style={[styles.gradeValue, { color: systemColors.secondaryLabel }]}>
               {correction.crowd.label}
             </Text>
           </View>
 
           <View style={styles.correctionArrow}>
-            <Icon name="arrow.right" size={18} color={iosSystemColors.systemGray} />
+            <Icon name="arrow.right" size={18} color={systemColors.secondaryLabel} />
           </View>
 
           <View style={styles.correctionSide}>
-            <Text variant="caption1" color={iosSystemColors.systemGray}>
+            <Text variant="caption1" color={systemColors.secondaryLabel}>
               {t('boardseshGrade.hero.everywhere')}
             </Text>
             <View style={styles.everywhereValue}>
-              <Text variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
+              <Text emphasized variant="largeTitle" style={[styles.gradeValue, { color: heroGrade.color }]}>
                 {everywhereLabel}
               </Text>
               {seal}
@@ -532,7 +547,7 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
       ) : (
         <View style={styles.trustRow}>
           <Icon name="check.small" size={14} color={iosSystemColors.systemGreen} />
-          <Text variant="footnote" color={iosSystemColors.systemGray} style={styles.flexText}>
+          <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.flexText}>
             {band.sameLabel
               ? t('boardseshGrade.trust.confirmedSingle', { count })
               : t('boardseshGrade.trust.confirmedRange', { low: band.low, high: band.high, count })}
@@ -547,6 +562,7 @@ export const BoardseshGradeSection = memo(function BoardseshGradeSection({
             rows={dumbbellRows}
             headlineGrade={view.gradeValue}
             gradeFormat={gradeFormat}
+            boardName={boardName}
             accessibilityLabel={t('boardseshGrade.byAngle')}
           />
         </View>
@@ -572,7 +588,6 @@ const styles = StyleSheet.create({
   },
   gradeValue: {
     fontVariant: ['tabular-nums'],
-    fontWeight: '700',
   },
   // YOUR GRADE — the vertical ladder above the hero
   ladder: {
@@ -616,9 +631,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: spacing[1],
   },
-  crowdGrade: {
-    color: iosSystemColors.systemGray,
-  },
   correctionArrow: {
     alignItems: 'center',
     gap: spacing[1],
@@ -637,14 +649,8 @@ const styles = StyleSheet.create({
   setterHero: {
     gap: spacing[1],
   },
-  setterGrade: {
-    color: iosSystemColors.systemGray,
-  },
   // HERO — projected angle. Keeps the grade colour (colour is content) but sits
   // a size down from a measured grade and never carries the confirmed seal.
-  estimateGrade: {
-    opacity: 0.75,
-  },
   // PAYOFF
   payoffRow: {
     flexDirection: 'row',
@@ -667,7 +673,6 @@ const styles = StyleSheet.create({
   },
   skeleton: {
     borderRadius: borderRadius.md,
-    backgroundColor: `${iosSystemColors.systemGray}14`,
   },
   skeletonBlock: {
     height: spacing[10],

@@ -1,11 +1,16 @@
+import { useNativeRootHeader } from '../../hooks/use-native-root-header';
+import type { ScrollEdgeBackdrop } from '../../hooks/use-scroll-edge-backdrop';
 import { type ReactNode, useCallback } from 'react';
 import { type LayoutChangeEvent, StyleSheet, View } from 'react-native';
+import type { NativeStackNavigationOptions } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useTheme } from '../../providers/theme-provider';
+import { HorizontalSafeAreaApplied, useHorizontalSafeArea } from '../../hooks/use-horizontal-safe-area';
 import { spacing } from '../../theme/tokens';
 import { Text } from '../Text';
 import { ProgressiveBlur } from '../ProgressiveBlur';
 import { TOP_ACTION_SIZE } from './GlassActionToolbar';
+import { NativeRootHeader } from './NativeRootHeader';
 
 const ROW_GUTTER = spacing[4];
 
@@ -26,18 +31,31 @@ type CollapsingLargeTitleHeaderProps = {
   leftActions?: ReactNode;
   /** Glass island(s) anchored to the right of the islands row. */
   rightActions?: ReactNode;
+  /**
+   * Under the UIKit header, native leading bar items that replace `leftActions`
+   * (see `NativeRootHeader`). Ignored by the floating islands.
+   */
+  leftItems?: NativeStackNavigationOptions['unstable_headerLeftItems'];
+  /** Native trailing items, including actions that move onto the iOS side rail. */
+  rightItems?: NativeStackNavigationOptions['unstable_headerRightItems'];
   /** Extra controls rendered below the islands row (e.g. a search or segmented
    *  control row). Measured into the reported chrome height. */
   children?: ReactNode;
+  /** Under the UIKit header, keep the painted band behind `children` instead of
+   *  letting them float over the list (see `NativeRootHeader`). Nothing else
+   *  reads it: the floating islands have always sat over the list. */
+  opaqueControls?: boolean;
+  /** Legacy scroll-edge wiring. Native supplementary controls do not attach a backdrop. */
+  scrollEdge?: ScrollEdgeBackdrop;
 };
 
 /**
  * The board-agnostic floating glass chrome shared across tabs: an always-on
  * progressive blur and a left/right glass-island row. The screen renders its own
  * large in-body title at the top of its scroll content; it simply scrolls away
- * under the blur. Climbs additionally passes `centerTitle` (its filter summary),
- * which sits as a persistent plain title in the centre of the islands row — the
- * one surface that keeps a header title.
+ * under the blur. A screen can pass `centerTitle` (Climbs: an optional filter
+ * summary), which sits as a persistent plain title in the centre of the islands
+ * row.
  */
 export function CollapsingLargeTitleHeader({
   centerTitle,
@@ -45,10 +63,16 @@ export function CollapsingLargeTitleHeader({
   onHeightChange,
   leftActions,
   rightActions,
+  leftItems,
+  rightItems,
   children,
+  opaqueControls,
+  scrollEdge,
 }: CollapsingLargeTitleHeaderProps) {
   const { systemColors } = useTheme();
   const insets = useSafeAreaInsets();
+  const horizontalSafeArea = useHorizontalSafeArea();
+  const nativeHeader = useNativeRootHeader();
 
   // Always-on progressive blur from the top of the screen to just below the
   // islands row; frosts content scrolling under the islands.
@@ -59,45 +83,75 @@ export function CollapsingLargeTitleHeader({
     [onHeightChange],
   );
 
+  if (nativeHeader)
+    return (
+      <NativeRootHeader
+        leftActions={leftActions}
+        leftActionsStandalone={Boolean(leftActions)}
+        leftItems={leftItems}
+        rightItems={rightItems}
+        rightActions={rightActions}
+        centerContent={centerContent}
+        opaqueControls={opaqueControls}
+        scrollEdge={scrollEdge}
+        onHeightChange={onHeightChange}
+      >
+        {children}
+      </NativeRootHeader>
+    );
+
   return (
-    <View pointerEvents="box-none" style={[styles.container, { paddingTop: insets.top }]} onLayout={handleLayout}>
+    <View pointerEvents="box-none" style={styles.container}>
       {/* Always-on progressive glass: a blur from the top of the screen down to
           just below the islands, strongest up top and fading to clear, so content
           frosts out gradually and the status-bar strip reads as glass. */}
       <ProgressiveBlur style={[styles.blur, { height: blurHeight }]} />
-      {/* A standard three-section nav row: left island, a flexible centre that
+      {/* The blur stays full width; the islands and controls clear a side status bar. */}
+      <View
+        pointerEvents="box-none"
+        style={{
+          paddingTop: insets.top,
+          paddingLeft: horizontalSafeArea.left,
+          paddingRight: horizontalSafeArea.right,
+        }}
+        onLayout={handleLayout}
+      >
+        {/* A standard three-section nav row: left island, a flexible centre that
           holds the optional persistent title, right island. The flex centre keeps
           a long title from sliding under the islands — it ellipsizes in the gap
           rather than overlapping them. */}
-      <View pointerEvents="box-none" style={styles.row}>
-        {/* Left island. */}
-        {leftActions}
+        <View pointerEvents="box-none" style={styles.row}>
+          {/* Left island. */}
+          {leftActions}
 
-        {/* Flexible centre: an optional interactive element (Climbs "On the wall"
+          {/* Flexible centre: an optional interactive element (Climbs "On the wall"
             capsule) takes precedence; otherwise the optional persistent plain title
             (Climbs filter summary) — plain text over the progressive blur; otherwise
             the spacer that holds the right island to the edge. `box-none` so the
             capsule stays tappable while empty space falls through. */}
-        <View pointerEvents="box-none" style={styles.centerSection}>
-          {centerContent ??
-            (centerTitle != null ? (
-              <Text
-                variant="headline"
-                numberOfLines={1}
-                ellipsizeMode="tail"
-                color={systemColors.label}
-                style={styles.centerTitle}
-              >
-                {centerTitle}
-              </Text>
-            ) : null)}
+          <View pointerEvents="box-none" style={styles.centerSection}>
+            {centerContent ??
+              (centerTitle != null ? (
+                <Text
+                  emphasized
+                  variant="headline"
+                  numberOfLines={1}
+                  ellipsizeMode="tail"
+                  color={systemColors.label}
+                  style={styles.centerTitle}
+                >
+                  {centerTitle}
+                </Text>
+              ) : null)}
+          </View>
+
+          {/* Right island. */}
+          {rightActions}
         </View>
 
-        {/* Right island. */}
-        {rightActions}
+        {/* Already clear of the side inset; nested columns must not pad again. */}
+        <HorizontalSafeAreaApplied>{children}</HorizontalSafeAreaApplied>
       </View>
-
-      {children}
     </View>
   );
 }
@@ -135,7 +189,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing[2],
   },
   centerTitle: {
-    fontWeight: '600',
     flexShrink: 1,
     textAlign: 'center',
   },

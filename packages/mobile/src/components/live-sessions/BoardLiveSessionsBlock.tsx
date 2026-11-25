@@ -44,12 +44,13 @@ const ACTION_HEIGHT = 44;
 export type BoardLiveSessionsBlockProps = {
   /** The board-presence board id; null renders nothing. */
   boardId: number | null;
+  boardUuid?: string | null;
   /** Who is connected to the board right now, when the sheet knows. */
   holderName: string | null;
   holderUserId: string | null;
   /**
    * Close the sheet and wait for it to settle before routing away: pushing the
-   * native /join modal mid-dismiss is the handoff docs/mobile-sheets-vs-routes.md
+   * native /join modal mid-dismiss is the handoff docs/mobile/mobile-sheets-vs-routes.md
    * warns about. Resolves false when the handoff was aborted.
    */
   onBeforeNavigate?: () => Promise<boolean>;
@@ -59,7 +60,7 @@ type RowProps = {
   card: LiveCardModel;
   nowMs: number;
   viewerUserId: string | null;
-  formatGrade: (grade: string | null | undefined) => string | null;
+  formatGrade: (grade: string | null | undefined, boardName?: string | null) => string | null;
   onPress: (card: LiveCardModel) => void;
 };
 
@@ -75,7 +76,9 @@ const BoardLiveSessionRow = memo(function BoardLiveSessionRow({
   const names = liveNamesCopy(describeLiveNames(card, viewerUserId), t);
   const quiet = isQuietSession(card);
   const elapsed = elapsedParts(card.startedAtMs, nowMs);
-  const grade = card.hardestSendGrade ? (formatGrade(card.hardestSendGrade) ?? card.hardestSendGrade) : null;
+  const grade = card.hardestSendGrade
+    ? (formatGrade(card.hardestSendGrade, card.boardType) ?? card.hardestSendGrade)
+    : null;
   const sends = card.sendCount > 0 ? t('mobile.liveSessions.sends', { count: card.sendCount }) : null;
   const meta = [elapsedShort(elapsed, t), sends].filter((part): part is string => part != null).join(' · ');
   const spoken = [
@@ -111,11 +114,11 @@ const BoardLiveSessionRow = memo(function BoardLiveSessionRow({
       />
       <View style={styles.rowText}>
         <View style={styles.namesRow}>
-          <Text variant="subheadline" color={colors.label} numberOfLines={1} style={[styles.bold, styles.shrink]}>
+          <Text emphasized variant="subheadline" color={colors.label} numberOfLines={1} style={[styles.shrink]}>
             {names.names}
           </Text>
           {names.extra ? (
-            <Text variant="subheadline" color={colors.label} style={[styles.bold, styles.noShrink]}>
+            <Text emphasized variant="subheadline" color={colors.label} style={[styles.noShrink]}>
               {` ${names.extra}`}
             </Text>
           ) : null}
@@ -140,6 +143,7 @@ const BoardLiveSessionRow = memo(function BoardLiveSessionRow({
 
 function BoardLiveSessionsBlockComponent({
   boardId,
+  boardUuid = null,
   holderName,
   holderUserId,
   onBeforeNavigate,
@@ -154,7 +158,7 @@ function BoardLiveSessionsBlockComponent({
   const queueSessionIdRef = useRef(queueSessionId);
   queueSessionIdRef.current = queueSessionId;
 
-  const query = useBoardLiveSessions(boardId, boardId != null);
+  const query = useBoardLiveSessions(boardId, boardId != null, boardUuid);
   const offline = useOfflineQueryState(query);
   const cards = query.data ?? EMPTY_CARDS;
   const hasRows = cards.length > 0;
@@ -256,7 +260,7 @@ function BoardLiveSessionsBlockComponent({
               </View>
             </View>
             <View style={styles.rowText}>
-              <Text variant="subheadline" color={colors.label} style={styles.bold}>
+              <Text emphasized variant="subheadline" color={colors.label}>
                 {t('mobile.liveSessions.board.emptyTitle')}
               </Text>
               <Text variant="footnote" color={colors.meta}>
@@ -272,8 +276,8 @@ function BoardLiveSessionsBlockComponent({
             accessibilityLabel={t('mobile.liveSessions.board.emptyCta')}
             style={[styles.startButton, { backgroundColor: colors.tintFill, borderColor: colors.tintBorder }]}
           >
-            <Icon name="record" size={18} color={colors.primary} />
-            <Text variant="subheadline" color={colors.primary} style={styles.bold}>
+            <Icon name="record" size={18} color={colors.tintInk} />
+            <Text emphasized variant="subheadline" color={colors.tintInk}>
               {t('mobile.liveSessions.board.emptyCta')}
             </Text>
           </PressableSurface>
@@ -347,7 +351,6 @@ const styles = StyleSheet.create({
   },
   shrink: { flexShrink: 1 },
   noShrink: { flexShrink: 0 },
-  bold: { fontWeight: '600' },
   more: {
     paddingHorizontal: spacing[1],
   },

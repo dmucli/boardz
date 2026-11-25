@@ -5,7 +5,12 @@ import { SPRAY_SET, spraySizeIdForLayout } from '@boardsesh/board-config';
 import { aliveHolds, populateDenormalizedColumns } from '@boardsesh/db/queries';
 import * as dbSchema from '@boardsesh/db/schema';
 import { db } from '../../../db/client';
-import { lockWallForWrite, viewerCanWriteSprayClimbs } from '../board/spray-walls';
+import {
+  assertSprayWallNotArchivedUnderLock,
+  lockWallForWrite,
+  sprayWallArchivedError,
+  viewerCanWriteSprayClimbs,
+} from '../board/spray-walls';
 
 /**
  * What `saveClimb` / `updateClimb` have to know that no other board needs.
@@ -19,10 +24,9 @@ import { lockWallForWrite, viewerCanWriteSprayClimbs } from '../board/spray-wall
  *     caller could publish climbs into a stranger's private wall. Note it is
  *     VIEW access, not edit: setting a climb on a gym's spray wall is what a gym
  *     member is there to do, and only the wall's holds are the owner's alone.
- *  2. **A setter grade is required to publish.** `getBoardCapabilities('spray')`
- *     answers `crowdGrade: false`: there is no consensus grade to converge on
- *     because a home wall has a handful of climbers, so a published climb with no
- *     grade would stay ungraded forever.
+ *  2. **No setter grade.** A climb publishes ungraded and its first ascent grades
+ *     it (#5971, `climber-vote-grade.ts` in `@boardsesh/db`). `gradeRequired` is
+ *     kept only for a grade label an older app sends that is not on the scale.
  *  3. **Every hold has to be alive on the current version.** A climb set on a
  *     hold that came off in an earlier reset is a climb nobody can do, and
  *     `missing_hold_count` exists to describe holds that came off AFTER the climb
@@ -42,7 +46,6 @@ export const SPRAY_CLIMB_CODES = {
   holdNotAlive: 'SPRAY_WALL_HOLD_NOT_ALIVE',
   angleMismatch: 'SPRAY_CLIMB_ANGLE_MISMATCH',
   multiFrame: 'SPRAY_CLIMB_MULTI_FRAME',
-  remixParentNotFound: 'SPRAY_REMIX_PARENT_NOT_FOUND',
 } as const;
 
 /** True for the one board type these rules apply to. Keeps the string literal in one place. */
@@ -90,6 +93,12 @@ export type SprayClimbTarget = {
    * just taken out of.
    */
   publishesFeedEvents: boolean;
+  /**
+   * When a reset archived the wall, or null. Read before the write transaction,
+   * for the early refusal in `assertSprayTargetNotArchived`; the deciding read is
+   * `assertSprayWallAcceptsClimbsUnderLock`.
+   */
+  archivedAt: Date | null;
 };
 
 /**
@@ -114,8 +123,25 @@ export async function requireVisibleSprayWall(
   layoutId: number,
   userId: string,
   presentedWallUuid?: string | null,
+  executor: Pick<typeof db, 'select'> = db,
 ): Promise<SprayClimbTarget> {
-  const [row] = await db
+  const target = await findVisibleSprayWall(layoutId, userId, presentedWallUuid, executor);
+  if (!target) {
+    throw new GraphQLError('That spray wall could not be found', {
+      extensions: { code: SPRAY_CLIMB_CODES.wallNotFound },
+    });
+  }
+  return target;
+}
+
+/** `requireVisibleSprayWall` without the throw: null for a wall that does not exist or that the caller cannot see. */
+async function findVisibleSprayWall(
+  layoutId: number,
+  userId: string,
+  presentedWallUuid?: string | null,
+  executor: Pick<typeof db, 'select'> = db,
+): Promise<SprayClimbTarget | null> {
+  const [row] = await executor
     .select({
       wall: dbSchema.sprayWalls,
       board: dbSchema.userBoards,
@@ -135,11 +161,7 @@ export async function requireVisibleSprayWall(
     )
     .limit(1);
 
-  if (!row || !(await viewerCanWriteSprayClimbs(row.wall, row.board, userId, presentedWallUuid))) {
-    throw new GraphQLError('That spray wall could not be found', {
-      extensions: { code: SPRAY_CLIMB_CODES.wallNotFound },
-    });
-  }
+  if (!row || !(await viewerCanWriteSprayClimbs(row.wall, row.board, userId, presentedWallUuid, executor))) return null;
 
   return {
     wallId: row.wall.id,
@@ -149,22 +171,19 @@ export async function requireVisibleSprayWall(
     angle: Number(row.board.angle),
     publishedVersionNumber: row.publishedVersionNumber ?? null,
     publishesFeedEvents: row.board.isPublic && row.wall.hiddenAt == null,
+    archivedAt: row.wall.archivedAt,
   };
 }
 
 /**
- * Refuse a publish with no setter grade.
+ * Refuse a climb write to an archived wall, early, from the pre-transaction read.
  *
- * Drafts are exempt: a draft is a work in progress, and the grade is the last
- * thing a setter decides. `updateClimb`'s draft → publish transition runs the
- * same check, which is why it lives here rather than inline in either resolver.
+ * A fast answer before any work, not the decision: an archive can land between
+ * this read and the write, which is what `assertSprayWallAcceptsClimbsUnderLock`
+ * re-checks under the wall lock.
  */
-export function assertSprayGradeOnPublish(isDraft: boolean, userGrade: string | null | undefined): void {
-  if (isDraft) return;
-  if (userGrade && userGrade.trim().length > 0) return;
-  throw new GraphQLError('A spray wall climb needs your grade before you can publish it', {
-    extensions: { code: SPRAY_CLIMB_CODES.gradeRequired },
-  });
+export function assertSprayTargetNotArchived(target: Pick<SprayClimbTarget, 'archivedAt'>): void {
+  if (target.archivedAt != null) throw sprayWallArchivedError();
 }
 
 /**
@@ -199,6 +218,24 @@ export async function sprayWallMayAnnounceUnderLock(executor: DrizzleExecutor, w
     .where(and(eq(dbSchema.sprayWalls.id, wallId), isNull(dbSchema.sprayWalls.deletedAt)))
     .limit(1);
   return row?.isPublic === true && row.hiddenAt == null;
+}
+
+/**
+ * Refuse a climb write to an archived wall, read UNDER THE WALL LOCK.
+ *
+ * The archive is stamped by the replacing wall's first publish, under this wall's
+ * lock. Checking here, under the same lock, means a `saveClimb` or `updateClimb`
+ * either commits before the archive or sees it — a climb cannot land on a wall
+ * in the instant after it was archived.
+ *
+ * Never for ticks, and never for deleting a draft: those stay allowed on an
+ * archived wall, and the offline drainer dead-letters a refused tick.
+ */
+export async function assertSprayWallAcceptsClimbsUnderLock(
+  executor: Parameters<typeof assertSprayWallNotArchivedUnderLock>[0],
+  wallId: number,
+): Promise<void> {
+  await assertSprayWallNotArchivedUnderLock(executor, wallId);
 }
 
 /**
@@ -347,85 +384,4 @@ export async function populateSprayClimbColumns(
       requiredSetIds: sprayTarget.requiredSetIds,
     })
     .where(and(eq(dbSchema.boardClimbs.uuid, climbUuid), eq(dbSchema.boardClimbs.boardType, boardType)));
-}
-
-/**
- * Record that a climb was remixed from another on the same wall.
- *
- * A remix is an ordinary `saveClimb` — the child is a normal climb with its own
- * ticks, grade and comments — plus this one row, which is the only record of
- * where it came from. The child's screen reads it to link back to the parent's
- * ticks and grade history, and the parent's screen reads it the other way to list
- * what has been remixed off it.
- *
- * Three things are checked, and each is a way the link could lie:
- *
- *  - the parent has to be a SPRAY climb on the SAME wall. A lineage row pointing
- *    at a Kilter climb, or at a climb on somebody else's wall, would render a
- *    "remixed from" link the viewer cannot open and that means nothing.
- *  - the wall has to have a published version. `wall_version_id` is NOT NULL and
- *    says which generation the child was set against; there is no honest value for
- *    a wall that has published nothing, and no climb can be written on one anyway.
- *  - a bad parent is a hard error, not a silently dropped row. The caller asked
- *    for a remix; saving the child with the lineage quietly missing would look
- *    like it worked and leave the link gone forever.
- *
- * Visibility is NOT re-checked here: the caller has already been through
- * `requireVisibleSprayWall` for the wall this climb is being written to, and the
- * parent is on that same wall by the check above. A wall the caller may write
- * climbs to is a wall whose climbs they may see.
- *
- * Runs in the caller's transaction, so a climb never lands without its lineage.
- */
-export async function recordRemixLineage(
-  executor: DrizzleExecutor,
-  target: Pick<SprayClimbTarget, 'wallId' | 'layoutId'>,
-  childUuid: string,
-  parentUuid: string,
-): Promise<void> {
-  const [parent] = await executor
-    .select({ uuid: dbSchema.boardClimbs.uuid })
-    .from(dbSchema.boardClimbs)
-    .where(
-      and(
-        eq(dbSchema.boardClimbs.uuid, parentUuid),
-        eq(dbSchema.boardClimbs.boardType, 'spray'),
-        eq(dbSchema.boardClimbs.layoutId, target.layoutId),
-      ),
-    )
-    .limit(1);
-
-  if (!parent) {
-    throw new GraphQLError('The climb this one is remixed from is not on this wall', {
-      extensions: { code: SPRAY_CLIMB_CODES.remixParentNotFound, parentUuid },
-    });
-  }
-
-  // Under the wall lock, like every other read this file makes to decide a write.
-  // `wall_version_id` says which generation the child was set against, and a
-  // `commitSprayWallVersion` landing between this read and the caller's commit
-  // would leave the lineage row naming a generation that had already been
-  // superseded. `assertSprayHoldsAreAlive` takes the same lock a few lines earlier
-  // in the caller — but only when the climb HAS holds, so relying on that is an
-  // implicit dependency on another function's early return. `pg_advisory_xact_lock`
-  // is re-entrant within a transaction, so taking it again costs nothing.
-  await lockWallForWrite(executor, target.wallId);
-
-  const [wall] = await executor
-    .select({ currentVersionId: dbSchema.sprayWalls.currentVersionId })
-    .from(dbSchema.sprayWalls)
-    .where(and(eq(dbSchema.sprayWalls.id, target.wallId), isNull(dbSchema.sprayWalls.deletedAt)))
-    .limit(1);
-
-  if (wall?.currentVersionId == null) {
-    throw new GraphQLError('This wall has no published photo, so there is nothing to remix against', {
-      extensions: { code: SPRAY_CLIMB_CODES.remixParentNotFound },
-    });
-  }
-
-  await executor.insert(dbSchema.sprayClimbLineage).values({
-    childUuid,
-    parentUuid,
-    wallVersionId: wall.currentVersionId,
-  });
 }

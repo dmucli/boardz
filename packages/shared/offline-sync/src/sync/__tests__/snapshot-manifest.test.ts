@@ -30,7 +30,7 @@ function validEntry(): SnapshotManifestEntry {
 }
 
 function validManifest(): SnapshotManifest {
-  return { formatVersion: 1, generatedAt: '2026-06-01T00:05:00.000Z', entries: [validEntry()] };
+  return { formatVersion: 2, generatedAt: '2026-06-01T00:05:00.000Z', entries: [validEntry()] };
 }
 
 function withEntry(patch: Partial<SnapshotManifestEntry>): unknown {
@@ -45,14 +45,14 @@ describe('parseSnapshotManifest', () => {
 
   it('accepts an empty entries array', () => {
     expect(
-      parseSnapshotManifest({ formatVersion: 1, generatedAt: '2026-06-01T00:05:00.000Z', entries: [] }),
+      parseSnapshotManifest({ formatVersion: 2, generatedAt: '2026-06-01T00:05:00.000Z', entries: [] }),
     ).not.toBeNull();
   });
 
   it('rejects non-ISO timestamps in generatedAt, builtAt, and watermarkUpdatedAt', () => {
     // A corrupted timestamp would otherwise be stored as the resume watermark
     // and pulled from later — reject the whole manifest instead.
-    expect(parseSnapshotManifest({ formatVersion: 1, generatedAt: 'now-ish', entries: [] })).toBeNull();
+    expect(parseSnapshotManifest({ formatVersion: 2, generatedAt: 'now-ish', entries: [] })).toBeNull();
     expect(parseSnapshotManifest(withEntry({ builtAt: 'yesterday' }))).toBeNull();
     expect(parseSnapshotManifest(withEntry({ builtAt: '2026-06-01T00:00:00' }))).toBeNull(); // no Z
     const validTables = validEntry().tables;
@@ -72,7 +72,7 @@ describe('parseSnapshotManifest', () => {
     expect(parseSnapshotManifest(null)).toBeNull();
     expect(parseSnapshotManifest('manifest')).toBeNull();
     expect(parseSnapshotManifest([])).toBeNull();
-    expect(parseSnapshotManifest({ ...validManifest(), formatVersion: 2 })).toBeNull();
+    expect(parseSnapshotManifest({ ...validManifest(), formatVersion: 1 })).toBeNull();
   });
 
   it('rejects fractional layoutId / bytes / schemaVersion / rowCount (integer-strict)', () => {
@@ -92,7 +92,7 @@ describe('parseSnapshotManifest', () => {
     const entry = validEntry();
     delete entry.uncompressedBytes;
     const parsed = parseSnapshotManifest({
-      formatVersion: 1,
+      formatVersion: 2,
       generatedAt: '2026-06-01T00:05:00.000Z',
       entries: [entry],
     });
@@ -144,9 +144,9 @@ describe('parseSnapshotManifest', () => {
 // Backward-compat gate for the additive `grades` block (issue #4310). The
 // validator below is a FROZEN COPY of the predicate that shipped before grades
 // existed, checked in rather than imported, so it keeps testing the old
-// behaviour even as the real one evolves. If a manifest carrying grades ever
-// stops parsing under it, every already-installed binary loses the snapshot
-// fast path the moment the export publishes.
+// behaviour even as the real one evolves. Privacy artifacts deliberately
+// fail this parser: the shipped paged-sync fallback fetches authorized authored
+// rows that an old snapshot importer would otherwise skip permanently.
 function parseWithShippedV1Validator(value: unknown): unknown | null {
   const isRecord = (candidate: unknown): candidate is Record<string, unknown> =>
     typeof candidate === 'object' && candidate !== null && !Array.isArray(candidate);
@@ -231,10 +231,11 @@ describe('parseSnapshotManifest — the optional grades artifact', () => {
     }
   });
 
-  it('parses under the FROZEN shipped v1 validator — no installed binary can choke on it', () => {
+  it('makes shipped v1 clients reject privacy artifacts and fall back to paged sync', () => {
     const manifest = JSON.parse(JSON.stringify(withEntry({ grades: validGradesArtifact() }))) as unknown;
 
-    expect(parseWithShippedV1Validator(manifest)).not.toBeNull();
+    expect(parseWithShippedV1Validator(manifest)).toBeNull();
+    expect(parseWithShippedV1Validator({ ...validManifest(), formatVersion: 1 })).not.toBeNull();
   });
 
   it('keeps the grades artifact OUT of `entries` — a sibling entry would be picked as the whole layout', () => {
@@ -248,5 +249,116 @@ describe('parseSnapshotManifest — the optional grades artifact', () => {
 
     expect(manifest?.entries).toHaveLength(1);
     expect(manifest?.entries[0].tables).not.toHaveProperty('board_climb_grades');
+  });
+});
+
+// The two fields artifact shape 2 adds: `artifactShape` on an entry and
+// `uncompressedBytes` on its grades block. Both are optional and additive, and
+// neither may cost a client its manifest.
+describe('parseSnapshotManifest — artifactShape and the grades decoded size', () => {
+  it('accepts an entry with no artifactShape (every shape-1 entry) and one stamped shape 2', () => {
+    expect(parseSnapshotManifest(validManifest())?.entries[0]).not.toHaveProperty('artifactShape');
+    expect(parseSnapshotManifest(withEntry({ artifactShape: 2 }))?.entries[0].artifactShape).toBe(2);
+  });
+
+  it('rejects an artifactShape that is not a positive integer', () => {
+    for (const corrupt of [0, -1, 1.5, '2', null, true, {}]) {
+      expect(
+        parseSnapshotManifest(withEntry({ artifactShape: corrupt as unknown as number })),
+        JSON.stringify(corrupt),
+      ).toBeNull();
+    }
+  });
+
+  // Deliberately NOT pinned to the shapes this build knows. The import reads an
+  // artifact by table and column name, the same for every shape, so an unknown
+  // one is still a file this client can import. Rejecting it would also make an
+  // export job rolled back across a shape change refuse the manifest it merges.
+  it('accepts a shape number this build has never heard of', () => {
+    expect(parseSnapshotManifest(withEntry({ artifactShape: 3 }))?.entries[0].artifactShape).toBe(3);
+  });
+
+  it('accepts a grades block with and without uncompressedBytes', () => {
+    const withoutSize = parseSnapshotManifest(withEntry({ grades: validGradesArtifact() }));
+    expect(withoutSize?.entries[0].grades).not.toHaveProperty('uncompressedBytes');
+
+    const withSize = parseSnapshotManifest(
+      withEntry({ grades: { ...validGradesArtifact(), uncompressedBytes: 66_801_664 } }),
+    );
+    expect(withSize?.entries[0].grades?.uncompressedBytes).toBe(66_801_664);
+  });
+
+  it('rejects a corrupt grades uncompressedBytes, like the layout entry’s', () => {
+    for (const corrupt of [1.5, -1, '66801664', null]) {
+      const manifest = withEntry({ grades: { ...validGradesArtifact(), uncompressedBytes: corrupt as never } });
+      expect(parseSnapshotManifest(manifest), JSON.stringify(corrupt)).toBeNull();
+    }
+  });
+
+  // A FROZEN COPY of the format-2 entry validator as it stood before these two
+  // fields existed, checked in like the v1 copy above so it keeps describing the
+  // bundles already in the field. They must parse a manifest that carries both
+  // fields: a rejection would drop every one of them to the paged crawl the
+  // moment shape-2 artifacts were published.
+  it('is accepted by the format-2 validator that shipped before the fields existed', () => {
+    const isRecord = (candidate: unknown): candidate is Record<string, unknown> =>
+      typeof candidate === 'object' && candidate !== null && !Array.isArray(candidate);
+    const isInteger = (candidate: unknown): candidate is number =>
+      typeof candidate === 'number' && Number.isInteger(candidate);
+    const isDecimalString = (candidate: unknown): boolean => typeof candidate === 'string' && /^\d+$/.test(candidate);
+    const isIso = (candidate: unknown): boolean =>
+      typeof candidate === 'string' &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/.test(candidate) &&
+      Number.isFinite(Date.parse(candidate));
+    const isTableStats = (candidate: unknown): boolean =>
+      isRecord(candidate) &&
+      isIso(candidate.watermarkUpdatedAt) &&
+      isDecimalString(candidate.watermarkSyncSeq) &&
+      isInteger(candidate.rowCount);
+    const hasArtifactFields = (candidate: Record<string, unknown>): boolean =>
+      typeof candidate.key === 'string' &&
+      typeof candidate.url === 'string' &&
+      isInteger(candidate.bytes) &&
+      (candidate.contentEncoding === 'gzip' || candidate.contentEncoding === 'identity') &&
+      isIso(candidate.builtAt) &&
+      isInteger(candidate.schemaVersion);
+    const isShippedGradesArtifact = (candidate: unknown): boolean => {
+      if (!isRecord(candidate) || !hasArtifactFields(candidate)) return false;
+      const tables = candidate.tables;
+      return isRecord(tables) && isTableStats(tables.board_climb_grades);
+    };
+    const isShippedEntry = (candidate: unknown): boolean => {
+      if (!isRecord(candidate)) return false;
+      if (typeof candidate.boardType !== 'string' || !isInteger(candidate.layoutId) || !hasArtifactFields(candidate)) {
+        return false;
+      }
+      if (
+        candidate.uncompressedBytes !== undefined &&
+        (!isInteger(candidate.uncompressedBytes) || candidate.uncompressedBytes < 0)
+      ) {
+        return false;
+      }
+      if (candidate.grades !== undefined && !isShippedGradesArtifact(candidate.grades)) return false;
+      const tables = candidate.tables;
+      return isRecord(tables) && isTableStats(tables.board_climbs) && isTableStats(tables.board_climb_stats);
+    };
+    const parseWithShippedV2Validator = (candidate: unknown): boolean =>
+      isRecord(candidate) &&
+      candidate.formatVersion === 2 &&
+      isIso(candidate.generatedAt) &&
+      Array.isArray(candidate.entries) &&
+      candidate.entries.every(isShippedEntry);
+
+    const shape2Manifest = JSON.parse(
+      JSON.stringify(
+        withEntry({ artifactShape: 2, grades: { ...validGradesArtifact(), uncompressedBytes: 66_801_664 } }),
+      ),
+    ) as unknown;
+
+    expect(parseWithShippedV2Validator(shape2Manifest)).toBe(true);
+    expect(parseSnapshotManifest(shape2Manifest)).not.toBeNull();
+    // The copy is a real validator, not a rubber stamp.
+    expect(parseWithShippedV2Validator(withEntry({ bytes: 1.5 }))).toBe(false);
+    expect(parseWithShippedV2Validator({ ...validManifest(), formatVersion: 1 })).toBe(false);
   });
 });

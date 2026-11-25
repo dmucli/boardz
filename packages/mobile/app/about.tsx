@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import { Stack, useRouter } from 'expo-router';
 import { ScrollView, StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
@@ -7,15 +7,18 @@ import { Button } from '../src/components/Button';
 import { Icon } from '../src/components/Icon';
 import { PressableSurface } from '../src/components/PressableSurface';
 import { SectionHeader } from '../src/components/SectionHeader';
+import { ShareAppSheet } from '../src/components/ShareAppSheet';
 import { Text } from '../src/components/Text';
 import { useBottomChromeMetrics } from '../src/hooks/use-bottom-chrome-metrics';
 import { useStackScreenOptions } from '../src/hooks/use-stack-screen-options';
+import { track } from '../src/lib/analytics';
 import { openDiscordInvite } from '../src/lib/discord';
 import { openExternalUrl } from '../src/lib/open-url';
 import { openPartnershipsEmail, PARTNERSHIPS_EMAIL } from '../src/lib/partnerships';
+import { APP_SHARE_ACTION_EVENT, type AppShareActionProperties } from '../src/lib/store-links';
 import { useTheme } from '../src/providers/theme-provider';
 import { useToast } from '../src/providers/toast-provider';
-import { borderRadius, spacing } from '../src/theme/tokens';
+import { borderRadius, cardCorners, spacing } from '../src/theme/tokens';
 import type { IconName } from '../src/components/icon-map';
 
 const GITHUB_REPO_URL = 'https://github.com/boardsesh/boardsesh';
@@ -33,6 +36,12 @@ export default function AboutScreen() {
   const bottomChrome = useBottomChromeMetrics();
   const router = useRouter();
   const { showToast } = useToast();
+  const [shareAppOpen, setShareAppOpen] = useState(false);
+  const handleOpenShareApp = useCallback(() => {
+    track(APP_SHARE_ACTION_EVENT, { action: 'open' } satisfies AppShareActionProperties);
+    setShareAppOpen(true);
+  }, []);
+  const handleCloseShareApp = useCallback(() => setShareAppOpen(false), []);
   const handleJoinDiscord = useCallback(() => {
     void openDiscordInvite('about');
   }, []);
@@ -82,6 +91,28 @@ export default function AboutScreen() {
           </Text>
         </View>
 
+        <PressableSurface
+          onPress={handleOpenShareApp}
+          feedback="opacity"
+          opacityTo={0.7}
+          accessibilityRole="button"
+          accessibilityLabel={t('mobile.about.shareApp.link')}
+          style={[styles.linkRow, { backgroundColor: systemColors.secondaryBackground }]}
+        >
+          <View style={[styles.cardIcon, { backgroundColor: systemColors.fill }]}>
+            <Icon name="share" size={22} color={systemColors.accent} />
+          </View>
+          <View style={styles.cardText}>
+            <Text variant="headline" style={styles.cardTitle}>
+              {t('mobile.about.shareApp.link')}
+            </Text>
+            <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.cardBody}>
+              {t('mobile.about.shareApp.linkBody')}
+            </Text>
+          </View>
+          <Icon name="chevron.right" size={16} color={systemColors.secondaryLabel} />
+        </PressableSurface>
+
         <View style={styles.section}>
           <SectionHeader title={t('mobile.about.sectionTitle')} />
           <View style={styles.cardStack}>
@@ -121,7 +152,7 @@ export default function AboutScreen() {
           <Button
             title={t('mobile.about.viewOnGithub')}
             icon="github"
-            size="large"
+            size="small"
             variant="outlined"
             onPress={handleOpenGithub}
             style={styles.partnerButton}
@@ -141,13 +172,17 @@ export default function AboutScreen() {
             {t('mobile.about.partnerBody')}
           </Text>
           <Button
-            title={PARTNERSHIPS_EMAIL}
+            title={t('mobile.about.emailPartners')}
             icon="mail"
-            size="large"
+            size="small"
             variant="outlined"
             onPress={handlePartnerEmail}
             style={styles.partnerButton}
           />
+          {/* The address itself, selectable, for anyone without a mail app. */}
+          <Text variant="footnote" color={systemColors.secondaryLabel} selectable style={styles.partnerAddress}>
+            {PARTNERSHIPS_EMAIL}
+          </Text>
         </View>
 
         <PressableSurface
@@ -172,22 +207,27 @@ export default function AboutScreen() {
           <Icon name="chevron.right" size={16} color={systemColors.secondaryLabel} />
         </PressableSurface>
 
-        <Button title={t('mobile.about.joinDiscord')} icon="open.external" size="large" onPress={handleJoinDiscord} />
+        <Button title={t('mobile.about.joinDiscord')} icon="open.external" onPress={handleJoinDiscord} />
       </ScrollView>
+      {shareAppOpen ? <ShareAppSheet onDismiss={handleCloseShareApp} /> : null}
     </>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
+    width: '100%',
+    maxWidth: 672,
+    alignSelf: 'center',
     flexGrow: 1,
     paddingHorizontal: spacing[4],
     paddingTop: spacing[4],
     gap: spacing[6],
   },
+  // Same corner as the cards below it (one card radius per screen).
   hero: {
     alignItems: 'center',
-    borderRadius: borderRadius.xl,
+    ...cardCorners,
     paddingHorizontal: spacing[5],
     paddingVertical: spacing[8],
   },
@@ -212,7 +252,7 @@ const styles = StyleSheet.create({
   card: {
     flexDirection: 'row',
     alignItems: 'flex-start',
-    borderRadius: borderRadius.lg,
+    ...cardCorners,
     padding: spacing[4],
     gap: spacing[3],
   },
@@ -254,6 +294,9 @@ const styles = StyleSheet.create({
   partnerButton: {
     marginTop: spacing[4],
     alignSelf: 'flex-start',
+  },
+  partnerAddress: {
+    marginTop: spacing[2],
   },
   linkRow: {
     flexDirection: 'row',

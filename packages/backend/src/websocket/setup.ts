@@ -1,3 +1,8 @@
+import {
+  isAddressLookupDocument,
+  sanitizeAddressLookupError,
+  sanitizeAddressLookupResult,
+} from '../graphql/address-lookup-privacy';
 import { WebSocketServer, type WebSocket } from 'ws';
 import type { Server as HttpServer, IncomingMessage } from 'http';
 import { useServer, type Extra as WsExtra } from 'graphql-ws/use/ws';
@@ -6,21 +11,90 @@ import { GraphQLError, parse } from 'graphql';
 import * as Sentry from '@sentry/node';
 import { schema } from '../graphql/index';
 import { createContext, removeContext, getContext } from '../graphql/context';
-import { validateQueryDepth } from '../graphql/query-depth';
+import { validateOperation } from '../graphql/query-validation';
 import { roomManager } from '../services/room-manager';
 import { kilterLiveSync } from '../services/kilter-live-sync';
+import { auroraLiveSync } from '../services/aurora-live-sync';
 import { pubsub } from '../pubsub/index';
-import { validateToken, extractAuthToken, extractControllerApiKey, validateControllerApiKey } from '../middleware/auth';
+import {
+  validateToken,
+  extractAuthToken,
+  extractControllerApiKey,
+  validateControllerApiKey,
+  type AuthResult,
+} from '../middleware/auth';
+import {
+  admitsCredential,
+  AUTH_ADMISSION_BATCH_SIZE,
+  AuthCredentialRefusedError,
+  isAuthAdmissionUnavailable,
+  readHumanSubjectStates,
+} from '../auth/human-admission';
+import { decideCredential, type PresentedCredential, type SubjectCutoffState } from '../auth/credential-cutoffs';
+import { selectSweepBatches } from './admission-sweep-batches';
+import { isBrowserSessionStillLive, readLiveBrowserSessions, type LiveBrowserSessions } from './browser-session-sweep';
 import { isOriginAllowed, isSameOriginUpgrade } from '../handlers/cors';
+import { isApiHost } from '../handlers/api-host';
 import { resolveWebSocketClientIp, resolveWebSocketSocketPeerIp } from './client-ip';
+import { getTrustedClientIp } from '../utils/client-ip';
 import { tryAcquireAnonConnectionSlot, releaseAnonConnectionSlot } from './connection-cap';
-import type { ConnectionContext } from '@boardsesh/shared-schema';
+import {
+  CLIENT_PLATFORM_CONNECTION_PARAM,
+  CLIENT_PLATFORM_HEADER,
+  type ConnectionContext,
+} from '@boardsesh/shared-schema';
+import { CLIENT_IDENTITY_CONNECTION_PARAM, UNKNOWN_CLIENT } from '@boardsesh/shared-schema/client-identity';
+import { recordContextOperation, resolveClientIdentity } from '../services/client-usage';
 import { logger } from '../utils/logger';
+import { recordUserActivity, resolveActivityPlatform, type ActivityPlatform } from '../services/user-activity';
+import { sanitizeAppleAdsGraphqlError } from '../graphql/apple-ads-token-privacy';
+import {
+  isBoardShareTokenDocument,
+  sanitizeBoardShareGraphqlError,
+  sanitizeBoardShareResult,
+} from '../graphql/board-share-token-privacy';
 
 const DEBUG = process.env.NODE_ENV === 'development';
 
 /** Ping interval in milliseconds for detecting dead WebSocket connections. */
 const WS_PING_INTERVAL_MS = 30_000;
+export const WS_HUMAN_ADMISSION_SWEEP_INTERVAL_MS = 1000;
+
+/** Longest header value a connection may log. The sender controls all of them. */
+const MAX_LOGGED_HEADER_LENGTH = 256;
+
+/** `AA:BB:CC:DD:EE:FF`. The field is unauthenticated and `ws` allows a 100 MiB frame. */
+const CONTROLLER_MAC_LENGTH = 17;
+
+function clipHeaderForLog(headerValue: string | string[] | undefined): string | undefined {
+  return (Array.isArray(headerValue) ? headerValue.join(', ') : headerValue)?.slice(0, MAX_LOGGED_HEADER_LENGTH);
+}
+
+/** What a logged GraphQL error keeps: a clipped message, its code and its path. */
+function clipGraphqlErrorForLog(error: GraphQLError): {
+  message: string;
+  code?: unknown;
+  path?: readonly (string | number)[];
+} {
+  return {
+    message: error.message.slice(0, MAX_LOGGED_HEADER_LENGTH),
+    code: error.extensions?.code,
+    path: error.path,
+  };
+}
+
+/**
+ * A copy of a thrown GraphQL error that is safe for graphql-ws to print. The
+ * message is clipped and the source is dropped (its printed excerpt holds the
+ * whole line); locations are copied across so the error stays as useful.
+ */
+function clipThrownGraphqlError(error: GraphQLError): GraphQLError {
+  const clipped = new GraphQLError(error.message.slice(0, MAX_LOGGED_HEADER_LENGTH), {
+    extensions: error.extensions,
+  });
+  Object.defineProperty(clipped, 'locations', { value: error.locations, enumerable: true });
+  return clipped;
+}
 
 /** WebSocket extended with liveness tracking for ping/pong. */
 type AliveWebSocket = {
@@ -47,6 +121,8 @@ const ANON_CONNECTION_CAP_CLOSE_CODE = 4429;
 // Extend Extra type with our custom context
 type CustomExtra = {
   context?: ConnectionContext;
+  /** The client's platform label for the active-user count, read once at connection_init. */
+  activityPlatform?: ActivityPlatform;
   [key: PropertyKey]: unknown;
 } & WsExtra;
 
@@ -71,6 +147,13 @@ export function setupWebSocketServer(httpServer: HttpServer): {
       info: { origin: string; req: IncomingMessage },
       callback: (res: boolean, code?: number, message?: string) => void,
     ) => {
+      // An upgrade skips the HTTP dispatcher, so the API host's route list has
+      // to be enforced here as well. GraphQL subscriptions stay on ws.boardsesh.com.
+      if (isApiHost(info.req.headers.host)) {
+        callback(false, 404, 'Not Found');
+        return;
+      }
+
       const origin = info.origin;
 
       // Allow connections without origin header (e.g., from native apps or direct WebSocket clients)
@@ -94,20 +177,139 @@ export function setupWebSocketServer(httpServer: HttpServer): {
       // (User-Agent + IP) so they can be traced. forwardedFor is forensic only —
       // it is user-controlled and never used for an allow/deny decision.
       logger.warn('[WebSocket] Rejected connection from unauthorized origin', {
-        origin,
-        host: info.req.headers.host,
-        userAgent: info.req.headers['user-agent'],
-        forwardedFor: info.req.headers['x-forwarded-for'],
+        origin: clipHeaderForLog(origin),
+        host: clipHeaderForLog(info.req.headers.host),
+        userAgent: clipHeaderForLog(info.req.headers['user-agent']),
+        forwardedFor: clipHeaderForLog(info.req.headers['x-forwarded-for']),
         remoteAddress: info.req.socket.remoteAddress,
       });
       callback(false, 403, 'Origin not allowed');
     },
   });
 
+  // Raw credentials stay private to this server instance, never in the public
+  // GraphQL context or logs. Admission is rechecked even when crypto is cached.
+  // The stamps let the sweep decide each socket's credential without decrypting it.
+  const humanBindings = new Map<
+    WebSocket,
+    {
+      context: ConnectionContext;
+      token: string;
+      userId: string;
+      credential: PresentedCredential;
+      browserSession?: AuthResult['browserSession'];
+    }
+  >();
+  const closeAdmission = (socket: WebSocket, unavailable: boolean) => {
+    if (socket.readyState === socket.OPEN) {
+      socket.close(
+        unavailable ? 1013 : 4401,
+        unavailable ? 'Authentication is temporarily unavailable' : 'Authentication is required',
+      );
+    }
+  };
+  const checkHumanConnection = async (ctx: ServerContext): Promise<'admitted' | 'denied' | 'unavailable'> => {
+    if (!ctx.extra.context?.isAuthenticated) return 'admitted';
+    const socket = ctx.extra.socket,
+      binding = humanBindings.get(socket);
+    if (!binding) {
+      closeAdmission(socket, true);
+      return 'unavailable';
+    }
+    try {
+      const auth = await validateToken(binding.token);
+      // Never deliver an old operation's result to a replacement context.
+      if (
+        humanBindings.get(socket) !== binding ||
+        getContext(binding.context.connectionId) !== binding.context ||
+        binding.context.userId !== binding.userId
+      )
+        return 'unavailable';
+      if (!auth || auth.userId !== binding.userId) {
+        closeAdmission(socket, false);
+        return 'denied';
+      }
+      return 'admitted';
+    } catch {
+      // graphql-ws treats an operation error as final, so a refused subscription
+      // would never come back. Closing lets the client reconnect and resubscribe.
+      if (humanBindings.get(socket) === binding) closeAdmission(socket, true);
+      return 'unavailable';
+    }
+  };
+  let sweeping = false;
+  let sweepOutageLogged = false;
+  let sweepBatchOffset = 0;
+  const admissionSweep = setInterval(() => {
+    if (sweeping) return;
+    sweeping = true;
+    const captured = [...humanBindings.entries()];
+    const userIds = [...new Set(captured.map(([, binding]) => binding.userId))];
+    const batches: string[][] = [];
+    for (let offset = 0; offset < userIds.length; offset += AUTH_ADMISSION_BATCH_SIZE)
+      batches.push(userIds.slice(offset, offset + AUTH_ADMISSION_BATCH_SIZE));
+    const { roundBatches, nextOffset } = selectSweepBatches(batches, sweepBatchOffset);
+    sweepBatchOffset = nextOffset;
+    let roundFailed = false;
+    // Start batches together: capacity pressure fails unavailable immediately,
+    // rather than accumulating one read deadline per sequential batch.
+    void Promise.all(
+      roundBatches.map(async (requestedIds) => {
+        const requested = new Set(requestedIds);
+        let subjects: ReadonlyMap<string, SubjectCutoffState>;
+        let liveBrowserSessions: LiveBrowserSessions;
+        try {
+          subjects = await readHumanSubjectStates(requestedIds);
+          // Browser access tokens also need their session read: the account
+          // state does not show a session that expired or lost its lineage.
+          liveBrowserSessions = await readLiveBrowserSessions(
+            captured.flatMap(([, binding]) =>
+              requested.has(binding.userId) && binding.browserSession ? [binding.browserSession.sessionId] : [],
+            ),
+          );
+        } catch {
+          // A failed read proves nothing about these accounts, and a primary that
+          // cannot answer cannot commit a deletion or a reset either. Leave them
+          // connected: only a confirmed denial closes a socket.
+          roundFailed = true;
+          return;
+        }
+        const decidedAt = Date.now();
+        for (const [socket, binding] of captured) {
+          if (
+            !requested.has(binding.userId) ||
+            humanBindings.get(socket) !== binding ||
+            getContext(binding.context.connectionId) !== binding.context ||
+            binding.context.userId !== binding.userId
+          )
+            continue;
+          const decision = decideCredential(binding.credential, subjects.get(binding.userId), decidedAt);
+          if (
+            !admitsCredential(decision, 'socket-sweep') ||
+            (binding.browserSession && !isBrowserSessionStillLive(binding, liveBrowserSessions))
+          )
+            closeAdmission(socket, false);
+        }
+      }),
+    ).finally(() => {
+      sweeping = false;
+      if (roundFailed && !sweepOutageLogged) {
+        logger.warn('[ws] admission sweep could not read the primary; keeping connections open');
+      }
+      sweepOutageLogged = roundFailed;
+    });
+  }, WS_HUMAN_ADMISSION_SWEEP_INTERVAL_MS);
+  admissionSweep.unref();
+  wss.once('close', () => {
+    clearInterval(admissionSweep);
+    humanBindings.clear();
+  });
+
   // Use graphql-ws server
   useServer<Record<string, unknown>, CustomExtra>(
     {
       schema,
+      validate: validateOperation,
       // onConnect is called ONCE when client connects and sends ConnectionInit
       onConnect: async (ctx: ServerContext) => {
         // Extract and validate auth token
@@ -118,12 +320,30 @@ export function setupWebSocketServer(httpServer: HttpServer): {
 
         let isAuthenticated = false;
         let authenticatedUserId: string | undefined;
+        let credentialExpiresAt: number | undefined;
+        let presentedCredential: PresentedCredential | undefined;
+        let browserSession: AuthResult['browserSession'];
 
         if (token !== null) {
-          const authResult = await validateToken(token);
+          let authResult;
+          try {
+            authResult = await validateToken(token, { throwOnRefusal: true });
+          } catch (error) {
+            // A refused credential (deleted account, cutoff, malformed stamp)
+            // must not connect anonymously: the app would go on showing a
+            // signed-in climber. 4401 makes it refresh, and the refresh's 401
+            // signs it out. An outage is never a refusal: 1013, try again.
+            const refused = error instanceof AuthCredentialRefusedError;
+            if (!refused && !isAuthAdmissionUnavailable(error)) throw error;
+            closeAdmission(ctx.extra.socket, !refused);
+            return false;
+          }
           if (authResult) {
             isAuthenticated = true;
             authenticatedUserId = authResult.userId;
+            credentialExpiresAt = authResult.credentialExpiresAt;
+            presentedCredential = authResult.credential;
+            browserSession = authResult.browserSession;
             logger.info(`[Auth] Authenticated user: ${authenticatedUserId}`);
           } else {
             // Existing clients expect an expired optional credential to keep
@@ -136,6 +356,7 @@ export function setupWebSocketServer(httpServer: HttpServer): {
         let controllerId: string | undefined;
         let controllerApiKey: string | undefined;
         let controllerMac: string | undefined;
+        let controllerOwnerUserId: string | undefined;
         const connectionParams = ctx.connectionParams as Record<string, unknown> | undefined;
         const extractedControllerApiKey = extractControllerApiKey(connectionParams);
 
@@ -144,13 +365,17 @@ export function setupWebSocketServer(httpServer: HttpServer): {
           if (controllerResult) {
             controllerId = controllerResult.controllerId;
             controllerApiKey = controllerResult.controllerApiKey;
+            // Read-only: lets the key see its owner's private spray walls via
+            // readViewerIdForBoard. Deliberately not authenticatedUserId, so the key
+            // still cannot call mutations or read account data.
+            controllerOwnerUserId = controllerResult.userId ?? undefined;
             logger.info(`[Auth] Authenticated controller: ${controllerId}`);
           }
         }
 
         // Extract controller MAC address from connection params (used as clientId for BLE disconnect logic)
         if (connectionParams?.controllerMac && typeof connectionParams.controllerMac === 'string') {
-          controllerMac = connectionParams.controllerMac;
+          controllerMac = connectionParams.controllerMac.slice(0, CONTROLLER_MAC_LENGTH);
           logger.info(`[Auth] Controller MAC: ${controllerMac}`);
         }
 
@@ -160,16 +385,30 @@ export function setupWebSocketServer(httpServer: HttpServer): {
         const upgradeRequest = ctx.extra.request;
         const clientIp = resolveWebSocketClientIp(upgradeRequest);
         const socketPeerIp = resolveWebSocketSocketPeerIp(upgradeRequest);
+        const trustedClientIp = upgradeRequest ? getTrustedClientIp(upgradeRequest) : undefined;
+
+        // Which client app this is (identification only, gates nothing).
+        // Browsers cannot set headers on the upgrade request, so every platform
+        // sends it as a connectionParam; resolveClientIdentity ignores a
+        // non-string value the same way controllerMac does above.
+        const { clientIdentity, clientIdentityRaw } = resolveClientIdentity(
+          connectionParams?.[CLIENT_IDENTITY_CONNECTION_PARAM],
+        );
 
         // Create context on initial connection with auth info
         const context = createContext({
           isAuthenticated,
           userId: authenticatedUserId,
+          credentialExpiresAt,
           controllerId,
           controllerApiKey,
           controllerMac,
+          controllerOwnerUserId,
           clientIp,
           socketPeerIp,
+          trustedClientIp,
+          clientIdentity,
+          clientIdentityRaw,
         });
 
         // Bound the COUNT of concurrent anonymous sockets per IP (issue #4035).
@@ -198,7 +437,8 @@ export function setupWebSocketServer(httpServer: HttpServer): {
               limit,
               clientIp,
               socketPeerIp,
-              userAgent: upgradeRequest?.headers['user-agent'],
+              userAgent: clipHeaderForLog(upgradeRequest?.headers['user-agent']),
+              client: clientIdentityRaw ?? UNKNOWN_CLIENT,
             });
             removeContext(context.connectionId);
             ctx.extra.socket.close(ANON_CONNECTION_CAP_CLOSE_CODE, 'Too many anonymous connections');
@@ -233,7 +473,10 @@ export function setupWebSocketServer(httpServer: HttpServer): {
         }
 
         await roomManager.registerClient(context.connectionId, undefined, authenticatedUserId);
-        ctx.extra.socket.once('close', () => kilterLiveSync.releaseConnection(context.connectionId));
+        ctx.extra.socket.once('close', () => {
+          kilterLiveSync.releaseConnection(context.connectionId);
+          auroraLiveSync.releaseConnection(context.connectionId);
+        });
 
         // The socket can die while any of the awaits above are in flight, and
         // graphql-ws only runs onDisconnect once the connection is acknowledged
@@ -262,18 +505,36 @@ export function setupWebSocketServer(httpServer: HttpServer): {
         logger.info(`Client connected: ${context.connectionId} (authenticated: ${isAuthenticated})`, {
           connectionId: context.connectionId,
           authenticated: isAuthenticated,
-          userAgent: upgradeRequest?.headers['user-agent'],
-          forwardedFor: upgradeRequest?.headers['x-forwarded-for'],
+          userAgent: clipHeaderForLog(upgradeRequest?.headers['user-agent']),
+          forwardedFor: clipHeaderForLog(upgradeRequest?.headers['x-forwarded-for']),
           remoteAddress: upgradeRequest?.socket?.remoteAddress,
           clientIp,
           // This can match remoteAddress (and a shared Railway edge) in hosted
           // traffic; it is logged separately because it is the header-free
           // identity that backstops a direct-origin caller.
           socketPeerIp,
+          client: clientIdentityRaw ?? UNKNOWN_CLIENT,
         });
 
         // Store context in ctx.extra for access in other hooks
         ctx.extra.context = context;
+        if (isAuthenticated && authenticatedUserId && token && presentedCredential) {
+          humanBindings.set(ctx.extra.socket, {
+            context,
+            token,
+            userId: authenticatedUserId,
+            credential: presentedCredential,
+            ...(browserSession ? { browserSession } : {}),
+          });
+        }
+
+        // First-party active-user count (#2644). Browsers can't set headers on a
+        // WebSocket upgrade, so the connection param comes first; the header is
+        // for native clients that send it on the upgrade request instead.
+        ctx.extra.activityPlatform = resolveActivityPlatform(
+          connectionParams?.[CLIENT_PLATFORM_CONNECTION_PARAM] ?? upgradeRequest?.headers[CLIENT_PLATFORM_HEADER],
+        );
+        if (authenticatedUserId) void recordUserActivity(authenticatedUserId, ctx.extra.activityPlatform);
 
         return true; // Allow connection (both authenticated and unauthenticated)
       },
@@ -300,6 +561,15 @@ export function setupWebSocketServer(httpServer: HttpServer): {
             `[Context] Retrieved context: ${latestContext.connectionId}, sessionId: ${latestContext.sessionId}`,
           );
         }
+        // Per operation, not only at connect: a socket held open past UTC
+        // midnight still counts its climber on the new day. Deduped in memory,
+        // so this is a Set lookup on every operation after the first of the day.
+        if (latestContext.isAuthenticated && latestContext.userId) {
+          void recordUserActivity(latestContext.userId, extra.activityPlatform ?? 'unknown');
+        }
+        // One call per operation, so this is the WebSocket counter for the
+        // per-minute client usage summary (services/client-usage.ts).
+        recordContextOperation(latestContext, 'ws');
         return latestContext;
       },
       onDisconnect: async (ctx: ServerContext, code?: number) => {
@@ -354,33 +624,74 @@ export function setupWebSocketServer(httpServer: HttpServer): {
           releaseAnonConnectionSlot(context.connectionId);
         }
       },
-      onSubscribe: (_ctx: ServerContext, _id: string, payload) => {
+      onSubscribe: async (ctx: ServerContext, _id: string, payload) => {
+        const admission = await checkHumanConnection(ctx);
+        if (admission !== 'admitted')
+          return [
+            new GraphQLError(
+              admission === 'unavailable' ? 'Authentication is temporarily unavailable' : 'Authentication is required',
+              { extensions: { code: admission === 'unavailable' ? 'SERVICE_UNAVAILABLE' : 'UNAUTHENTICATED' } },
+            ),
+          ];
+        // Block this HTTP-only credential before parsing/coercing a document;
+        // graphql-ws otherwise sends its original validation errors to clients.
+        if (payload.query.includes('exchangeAppleAdsAttribution')) {
+          return [new GraphQLError('Apple Ads attribution requires HTTP')];
+        }
         if (DEBUG) {
-          logger.info(`Subscription started: ${payload.operationName || 'anonymous'}`);
+          logger.info(
+            `Subscription started: ${payload.operationName?.slice(0, MAX_LOGGED_HEADER_LENGTH) || 'anonymous'}`,
+          );
         }
 
-        // Validate query depth to prevent DoS via deeply nested subscriptions
+        // Preserve parse-error redaction before graphql-ws performs its normal
+        // parse/validate/context flow with our shared operation limits.
         if (payload.query) {
-          const document = typeof payload.query === 'string' ? parse(payload.query) : payload.query;
-          const depthError = validateQueryDepth(document);
-          if (depthError) {
-            return [new GraphQLError(depthError)];
+          try {
+            parse(payload.query);
+          } catch (error: unknown) {
+            // A thrown parse error escapes into graphql-ws' generic server
+            // logger. Return a safe error before its token-bearing source does.
+            if (error instanceof GraphQLError && isAddressLookupDocument(payload.query)) {
+              return [sanitizeAddressLookupError(error, payload.query)];
+            }
+            if (error instanceof GraphQLError && isBoardShareTokenDocument(payload.query)) {
+              return [sanitizeBoardShareGraphqlError(error, payload.query)];
+            }
+            // graphql-ws prints a thrown error whole with console.error, and a
+            // syntax error echoes client text. Rethrow it clipped: the socket still
+            // closes with 4500, and the code, locations and extensions survive.
+            throw error instanceof GraphQLError ? clipThrownGraphqlError(error) : error;
           }
         }
       },
-      onError: (_ctx: ServerContext, _id: string, _payload, errors) => {
-        logger.error('GraphQL error:', errors);
+      // No admission read per delivery: the sweep closes a deleted account's socket
+      // within a second, and a read here would make every live update wait on the
+      // primary.
+      onNext: (_ctx: ServerContext, _id: string, payload, _executionArgs, result) =>
+        sanitizeAddressLookupResult(sanitizeBoardShareResult(result, payload.query), payload.query),
+      onError: (_ctx: ServerContext, _id: string, payload, errors) => {
+        const safeErrors = errors.map((error) =>
+          sanitizeAddressLookupError(
+            sanitizeBoardShareGraphqlError(sanitizeAppleAdsGraphqlError(error), payload.query),
+            payload.query,
+          ),
+        );
+        logger.error('GraphQL error:', safeErrors.map(clipGraphqlErrorForLog));
         // Only report errors that wrap an internal exception. GraphQLError
         // instances without `originalError` are validation/parse/auth/depth
         // errors triggered by malformed client input — noisy, not actionable.
-        for (const err of errors) {
+        for (const err of safeErrors) {
           if (err instanceof GraphQLError && !err.originalError) continue;
           Sentry.captureException(err, { tags: { source: 'graphql-ws' } });
         }
+        return safeErrors;
       },
       onComplete: (_ctx: ServerContext, _id: string, payload) => {
         if (DEBUG) {
-          logger.info(`Subscription completed: ${payload.operationName || 'anonymous'}`);
+          logger.info(
+            `Subscription completed: ${payload.operationName?.slice(0, MAX_LOGGED_HEADER_LENGTH) || 'anonymous'}`,
+          );
         }
       },
     },
@@ -393,6 +704,7 @@ export function setupWebSocketServer(httpServer: HttpServer): {
   // This interval pings every client; if it doesn't respond before the next ping,
   // the socket is terminated, which triggers onDisconnect and cleans up Redis state.
   wss.on('connection', (ws: WebSocket) => {
+    ws.once('close', () => humanBindings.delete(ws));
     const aliveWs = ws as AliveWebSocket;
     aliveWs.isAlive = true;
     aliveWs.on('pong', () => {

@@ -30,8 +30,9 @@ vi.mock('@/app/lib/url-utils.server', () => ({
   })),
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({
     board_name: 'kilter',
     layout_name: 'Kilter Board Original',
     size_name: '12 x 12',
@@ -45,7 +46,7 @@ vi.mock('@/app/lib/board-utils', () => ({
 // layout function only constructs the element tree — but both must load.
 vi.mock('@/app/components/providers/i18n-provider', () => ({ default: () => null }));
 
-import BoardLayout from '../layout';
+import BoardLayout from '@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/layout';
 
 const layoutProps = {
   params: Promise.resolve({

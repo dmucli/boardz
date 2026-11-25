@@ -19,6 +19,7 @@
  */
 
 import { formatBoardDisplayName, normaliseSetIds } from '@boardsesh/board-config';
+import { SYSTEM_BOARD_OWNER_ID } from '../system-account-constants';
 
 /**
  * The minimal board shape the grouping/selection helpers need. The script
@@ -61,7 +62,7 @@ export type SerialCluster = {
   skipReason: 'distinct-configs' | null;
 };
 
-export const SYSTEM_USER_ID = '00000000-0000-0000-0000-000000000000';
+export const SYSTEM_USER_ID = SYSTEM_BOARD_OWNER_ID;
 
 /**
  * The identity of a board's climbing configuration. Two boards with the same
@@ -185,7 +186,10 @@ export function isGenericBoardName(name: string, boardType: string): boolean {
  * A public survivor may only accept metadata from a public loser. This keeps
  * private gym, coordinate, location-name, and board-name details private.
  */
-export function chooseMetadataDonor(losers: SerialBoardRow[], publicOnly = false): SerialBoardRow | null {
+export function chooseMetadataDonor<Board extends Pick<SerialBoardRow, 'id' | 'ownerId' | 'gymId' | 'isPublic'>>(
+  losers: Board[],
+  publicOnly = false,
+): Board | null {
   const eligibleLosers = publicOnly ? losers.filter((board) => board.isPublic) : losers;
   const withGym = eligibleLosers.filter((board) => board.gymId !== null);
   const donorPool = withGym.length > 0 ? withGym : eligibleLosers;

@@ -18,6 +18,14 @@ export const springs = {
 
   /** Playful overshoot (success states, celebrations). */
   bouncy: { damping: 10, stiffness: 200, mass: 0.7 },
+
+  /**
+   * A page settling after a swipe: critically damped, so it never overshoots.
+   * This is the floor: from a standstill it lands in about 200 ms. A release
+   * hands its speed over through `pagingSpring` (`theme/paging-spring.ts`),
+   * which stiffens it further for a flick and still cannot overshoot.
+   */
+  paging: { damping: 90, stiffness: 2025, mass: 1.0 },
 } as const;
 
 /**
@@ -41,7 +49,7 @@ export const timing = {
   slow: 350,
 } as const;
 
-export type SpringPreset = 'snappy' | 'interactive' | 'gentle' | 'bouncy';
+export type SpringPreset = 'snappy' | 'interactive' | 'gentle' | 'bouncy' | 'paging';
 export type TimingPreset = 'instant' | 'fast' | 'normal' | 'slow';
 
 // Material 3 easing curves as raw cubic-bezier control points — NOT

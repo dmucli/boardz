@@ -11,21 +11,25 @@ import {
   type GetUserAscentsFeedQueryResponse,
   type GetUserGroupedAscentsFeedQueryResponse,
 } from '@boardsesh/graphql/operations';
-import { BOULDER_GRADES } from '@boardsesh/board-constants/boulder-grade-mapping';
+import { getBoulderGradesForBoard } from '@boardsesh/board-constants/boulder-grade-mapping';
 import { useBoardAdapter } from './adapter';
+import type { LogbookEntry } from './logbook-keys';
 
-// Canonical difficulty_id → "6a/V3" display name, the same names the feed
-// resolvers serve. UPDATE_TICK returns only the numeric difficulty, so the
-// write-through derives the paired name to keep patched items internally
-// consistent (grade colors and the day divider's top-grade label read the NAME).
-const GRADE_NAME_BY_DIFFICULTY_ID = new Map<number, string>(
-  BOULDER_GRADES.map((grade) => [grade.difficulty_id, grade.difficulty_name]),
-);
+// Canonical difficulty_id → "6a/V3" display name on the tick's board, the same
+// names the feed resolvers serve (MoonBoard's 16 is "6a/V2"). UPDATE_TICK
+// returns only the numeric difficulty, so the write-through derives the paired
+// name to keep patched items internally consistent (grade colors and the day
+// divider's top-grade label read the NAME).
+function gradeNameForDifficultyId(difficultyId: number, boardType: string): string | null {
+  return (
+    getBoulderGradesForBoard(boardType).find((grade) => grade.difficulty_id === difficultyId)?.difficulty_name ?? null
+  );
+}
 
 // Stats / feed / climb-state caches that derive from a user's ticks. Editing or
 // deleting a tick must refresh all of them. Prefix matching means the bare root
 // key invalidates every variant (e.g. ['userTicks', '<any-userId>']).
-function invalidateTickDependents(queryClient: QueryClient) {
+export function invalidateTickDependents(queryClient: QueryClient) {
   void queryClient.invalidateQueries({ queryKey: ['userTicks'] });
   void queryClient.invalidateQueries({ queryKey: ['userProfileStats'] });
   void queryClient.invalidateQueries({ queryKey: ['userClimbPercentile'] });
@@ -46,6 +50,48 @@ function invalidateTickDependents(queryClient: QueryClient) {
   // refetch (pull-to-refresh, remount past staleTime, or a comment add).
   void queryClient.invalidateQueries({ queryKey: ['sessionGroupedFeed'] });
   void queryClient.invalidateQueries({ queryKey: ['sessionDetail'] });
+  void queryClient.invalidateQueries({ queryKey: ['tickBoardOptions'] });
+  void queryClient.invalidateQueries({ queryKey: ['board'] });
+  void queryClient.invalidateQueries({ queryKey: ['myBoards'] });
+  void queryClient.invalidateQueries({ queryKey: ['boardBySlug'] });
+  void queryClient.invalidateQueries({ queryKey: ['activityFeed'] });
+  void queryClient.invalidateQueries({ queryKey: ['crewFeed'] });
+  void queryClient.invalidateQueries({ queryKey: ['betaLinks'] });
+}
+
+function isLogbookRowsQuery({ queryKey }: { queryKey: readonly unknown[] }): boolean {
+  return queryKey[2] === 'accumulated' || queryKey[2] === 'fetch';
+}
+
+/**
+ * The accumulated logbook merges reads additively, so invalidation alone cannot
+ * remove a deleted tick or replace an edited row. Patch both its rows and the
+ * cached fetch batches, which another mounted reader can merge again later.
+ * Coverage markers are Sets rather than rows and must stay untouched.
+ */
+async function reconcileTickInLogbooks(
+  queryClient: QueryClient,
+  uuid: string,
+  reconcile: (entry: LogbookEntry) => LogbookEntry | null,
+): Promise<void> {
+  const logbookRowsFilter = { queryKey: ['logbook'], predicate: isLogbookRowsQuery };
+  // An older in-flight response must not reintroduce the deleted/edited row
+  // after this write. Cancel before reading the live caches: cancellation can
+  // revert a query to its previous answer.
+  await queryClient.cancelQueries(logbookRowsFilter);
+  for (const [queryKey, entries] of queryClient.getQueriesData<LogbookEntry[]>(logbookRowsFilter)) {
+    if (!entries?.some((entry) => entry.uuid === uuid)) continue;
+    const answerTime = queryClient.getQueryState(queryKey)?.dataUpdatedAt;
+    const reconciled = entries.flatMap((entry) => {
+      if (entry.uuid !== uuid) return [entry];
+      const nextEntry = reconcile(entry);
+      return nextEntry ? [nextEntry] : [];
+    });
+    // Editing one row does not make every other climb in a mixed batch fresh.
+    // useLogbook compares these answer times before filing batch rows under a
+    // single-climb key, so keep the original timestamp with the patched rows.
+    queryClient.setQueryData<LogbookEntry[]>(queryKey, reconciled, { updatedAt: answerTime });
+  }
 }
 
 /** Edit an existing tick (status / date / grade / quality / attempts / comment). */
@@ -59,7 +105,22 @@ export function useUpdateTick() {
       const response = await executeHttp<UpdateTickResponse, UpdateTickVariables>(UPDATE_TICK, variables);
       return response.updateTick;
     },
-    onSuccess: (updatedTick) => {
+    onSuccess: async (updatedTick) => {
+      await reconcileTickInLogbooks(queryClient, updatedTick.uuid, (entry) => ({
+        ...entry,
+        angle: updatedTick.angle,
+        tries: updatedTick.attemptCount,
+        quality: updatedTick.quality,
+        // A new personal rating wins immediately. Clearing an existing one
+        // must also clear its displayed stars; only a row whose raw quality
+        // was already null can carry a known synced-rating fallback here.
+        effectiveQuality: updatedTick.quality ?? (entry.quality === null ? (entry.effectiveQuality ?? null) : null),
+        difficulty: updatedTick.difficulty,
+        comment: updatedTick.comment,
+        climbed_at: updatedTick.climbedAt,
+        is_ascent: updatedTick.status === 'flash' || updatedTick.status === 'send',
+        status: updatedTick.status as LogbookEntry['status'],
+      }));
       // Write-through first so the row is right immediately, then invalidate so
       // the background refetch reconciles anything derived server-side.
       patchTickInAscentFeeds(queryClient, updatedTick);
@@ -91,11 +152,15 @@ function patchTickInAscentFeeds(queryClient: QueryClient, updatedTick: UpdateTic
           quality: updatedTick.quality,
           difficulty: updatedTick.difficulty,
           difficultyName:
-            updatedTick.difficulty != null ? (GRADE_NAME_BY_DIFFICULTY_ID.get(updatedTick.difficulty) ?? null) : null,
+            updatedTick.difficulty != null ? gradeNameForDifficultyId(updatedTick.difficulty, item.boardType) : null,
           isBenchmark: updatedTick.isBenchmark,
           comment: updatedTick.comment,
           climbedAt: updatedTick.climbedAt,
           angle: updatedTick.angle,
+          boardId: updatedTick.boardId,
+          boardDisplayName: updatedTick.boardDisplayName,
+          // A physical-board change invalidates the old rendering dimensions.
+          renderBoard: item.boardId === updatedTick.boardId ? item.renderBoard : null,
         }
       : item;
 
@@ -241,7 +306,8 @@ export function useDeleteTick() {
       });
       return response.deleteTick;
     },
-    onSuccess: (_data, uuid) => {
+    onSuccess: async (_data, uuid) => {
+      await reconcileTickInLogbooks(queryClient, uuid, () => null);
       stripTickFromAscentFeeds(queryClient, uuid);
       invalidateTickDependents(queryClient);
     },

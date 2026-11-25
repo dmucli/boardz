@@ -9,6 +9,9 @@
 //                            that is known to be down
 //   - scheduler wake-ups   → AppState 'active' transitions + connectivity edges
 //   - schema-drift + cycle telemetry → Sentry / PostHog / dev console
+//   - download keep-awake  → every progress frame also feeds the store that
+//                            decides whether a user-started download should
+//                            hold the screen on (issue #4310)
 //
 // RULE: mobile code never imports drainMutationQueue / startSyncScheduler /
 // triggerSync / pullSync from '@boardsesh/offline-sync' directly — always from
@@ -18,7 +21,8 @@
 // run a whole pull cycle offline, reporting a snapshot-bootstrap failure per
 // enabled-but-undownloaded board on the way.
 
-import { AppState, type AppStateStatus } from 'react-native';
+import { AppState, Platform, type AppStateStatus } from 'react-native';
+import { randomUUID } from 'expo-crypto';
 import NetInfo, { type NetInfoState } from '@react-native-community/netinfo';
 import { onlineManager, type QueryClient } from '@tanstack/react-query';
 // The adapter is the one sanctioned importer of the raw engine entry points.
@@ -29,7 +33,11 @@ import {
   triggerSync as triggerSyncCore,
   pullSync as pullSyncCore,
   setBackgrounded,
+  isScopeDownloadComplete,
+  setPullWriteSettledReporter,
+  getSqliteWriteSite,
   type DrainOptions,
+  type OutboxOwnerRefusal,
   type MutationDeadLetterReporter,
   type MutationDeliveryEvent,
   type MutationStatusListenerFailure,
@@ -43,15 +51,21 @@ import {
   type CoverageResetReporter,
   type ScopeDownloadCompleteReporter,
   type ScopeDownloadStartReporter,
+  type ScopeDownloadContext,
+  type ScopeDownloadLifecycleEvent,
   type SchedulerTriggers,
   type SchemaDriftReporter,
+  type SnapshotBootstrapErrorReport,
   type SnapshotBootstrapErrorReporter,
   type SnapshotSource,
   type SyncOptions,
   type SyncProgressSink,
   type AbandonedDownloadInfo,
+  type PullWriteSettledReport,
 } from '@boardsesh/offline-sync';
 import { SHARED_EVENTS, sanitizeErrorForAnalytics } from '@boardsesh/analytics';
+import { publishMutationDeliveryEvent } from './mutation-delivery-store';
+export { subscribeMutationDelivery } from './mutation-delivery-store';
 import { getErrorStatus, isNetworkError, isServerUnavailableError } from '@boardsesh/offline-sync/error-classification';
 import {
   confirmBackendAvailability,
@@ -60,12 +74,99 @@ import {
   subscribeConnectivity as subscribeConnectivityStore,
 } from '../lib/connectivity/connectivity-store';
 import { reportHandledError, addErrorBreadcrumb } from '../lib/error-reporting';
+import { getJsRestartCount } from '../lib/launch-reload-window';
 import { isOfflineEngineEnabled } from '../lib/offline-engine';
+import { captureAuthCredentialGeneration, getAuthToken, isAuthCredentialGenerationCurrent } from '../lib/auth-store';
+import { userIdFromJwt } from '../lib/jwt-user-id';
 import { takeDownloadTrigger } from '../settings';
+import {
+  downloadFunnelProperties,
+  getDownloadRequestContext,
+  observeDownloadScope,
+  recordDownloadCompleted,
+  recordDownloadStarted,
+} from './download-request-telemetry';
 import { track } from '../lib/analytics';
 import { getSyncStatusSnapshot } from '../sync/sync-status';
-import { sprayWallDeletedSink, sprayWallPhotoSink } from './spray-photo-sink';
+import { getDownloadActivityGeneration } from '../sync/download-activity-store';
+import {
+  clearUserStartedDownload,
+  getPendingUserStartedDownloads,
+  noteDownloadProgress,
+  takeDownloadTelemetry,
+} from './download-keep-awake-store';
+import { createSprayWallDeletedSink, sprayWallPhotoSink } from './spray-photo-sink';
 import { holdIndexSyncOptions } from './hold-index-parser';
+import { acknowledgeClimbWrite } from './acknowledge-climb-write';
+import { resolveSprayWallCapability } from './opened-spray-wall-pins';
+import { getDownloadRequest, getDownloadRequests, requestDownload, transitionDownload } from './download-lifecycle';
+import { isDownloadRemovalPending } from './download-removal';
+
+function isDownloadContextCurrent(context: ScopeDownloadContext | undefined): boolean {
+  return context?.accountGeneration === undefined || isAuthCredentialGenerationCurrent(context.accountGeneration);
+}
+
+function downloadLifecycleOptions(): Pick<SyncOptions, 'getScopeDownloadContext' | 'onScopeDownloadLifecycle'> {
+  const generation = getDownloadActivityGeneration();
+  return {
+    getScopeDownloadContext(scopeKey) {
+      if (generation !== getDownloadActivityGeneration()) return undefined;
+      const request = getDownloadRequest(scopeKey);
+      if (!request) return undefined;
+      return {
+        requestId: request.requestId,
+        attemptId: randomUUID(),
+        accountGeneration: captureAuthCredentialGeneration(),
+      };
+    },
+    onScopeDownloadLifecycle(event: ScopeDownloadLifecycleEvent) {
+      if (generation !== getDownloadActivityGeneration() || !isDownloadContextCurrent(event.context)) return;
+      const previous = getDownloadRequest(event.scopeKey);
+      if (previous && isDownloadRemovalPending(previous.requestId)) return;
+      const resumed =
+        event.state === 'started' &&
+        previous?.attemptId !== undefined &&
+        previous.attemptId !== event.context.attemptId;
+      const transitionContext =
+        event.stage === 'preparation'
+          ? { scopeKey: event.scopeKey, requestId: event.context.requestId }
+          : { scopeKey: event.scopeKey, ...event.context };
+      transitionDownload(transitionContext, resumed ? 'resumed' : event.state, {
+        reason: resumed && previous?.state === 'started' ? 'previous-attempt-unresolved' : event.reason,
+        stage: event.stage,
+        completionSource: event.completionSource,
+      });
+    },
+  };
+}
+
+/** Recover observable state, without inventing requests or timing work done before this bundle. */
+async function reconcileDownloadRequests(db: OfflineDatabase, getEnabledBoards: () => string[]): Promise<void> {
+  const generation = getDownloadActivityGeneration();
+  const accountGeneration = captureAuthCredentialGeneration();
+  const enabled = new Set(getEnabledBoards());
+  try {
+    for (const scopeKey of new Set([...enabled, ...getDownloadRequests().map((request) => request.scopeKey)])) {
+      const request = getDownloadRequest(scopeKey);
+      if (!enabled.has(scopeKey)) {
+        if (request && isDownloadRemovalPending(request.requestId)) continue;
+        if (request) transitionDownload(request, 'abandoned', { reason: 'disabled' });
+        continue;
+      }
+      const completed = await isScopeDownloadComplete(db, scopeKey);
+      if (generation !== getDownloadActivityGeneration() || !isAuthCredentialGenerationCurrent(accountGeneration))
+        return;
+      // A disable/re-enable during the read belongs to a different request.
+      if (getDownloadRequest(scopeKey)?.requestId !== request?.requestId || !getEnabledBoards().includes(scopeKey))
+        continue;
+      if (completed && request)
+        transitionDownload(request, 'completed', { completionSource: request.attemptId ? 'recovered' : 'cached' });
+      else if (!completed && !request) requestDownload(scopeKey, 'unknown', 'recovered');
+    }
+  } catch {
+    // Locked/unavailable storage is retried after the next cycle. Never gate sync.
+  }
+}
 
 // Exported so non-drain reporters can record the one dimension that decides
 // whether a failed local write actually lost data: a tick that falls through to
@@ -102,8 +203,6 @@ export async function hasUsableInternetConnection(): Promise<boolean> {
   return isUsableConnection();
 }
 
-const mutationDeliveryListeners = new Set<(event: MutationDeliveryEvent) => void>();
-
 function reportMutationStatusListenerFailure({ error, event }: MutationStatusListenerFailure): void {
   try {
     reportHandledError(error, {
@@ -115,19 +214,8 @@ function reportMutationStatusListenerFailure({ error, event }: MutationStatusLis
   }
 }
 
-export function subscribeMutationDelivery(listener: (event: MutationDeliveryEvent) => void): () => void {
-  mutationDeliveryListeners.add(listener);
-  return () => mutationDeliveryListeners.delete(listener);
-}
-
 function publishMutationDelivery(event: MutationDeliveryEvent): void {
-  for (const listener of mutationDeliveryListeners) {
-    try {
-      listener(event);
-    } catch (error) {
-      reportMutationStatusListenerFailure({ error, event });
-    }
-  }
+  publishMutationDeliveryEvent(event, reportMutationStatusListenerFailure);
 }
 
 // A queued write we will never deliver. Both channels are deliberate: Sentry
@@ -176,6 +264,29 @@ const reportSchemaDrift: SchemaDriftReporter = (drift) => {
   });
 };
 
+// The failure reasons that end a download for good, as opposed to one attempt
+// at it. Each fires at most once per `Offline Board Download Started`.
+const ABANDONED_REASONS: readonly SnapshotBootstrapErrorReport['reason'][] = [
+  'abandoned-removed',
+  'abandoned-signed-out',
+  'abandoned-disabled',
+];
+
+/**
+ * The keep-awake props a download event carries (issue #4310), read from the
+ * store and reset there.
+ *
+ * `suspendedMs` is sent on iOS only. It is the sum of the gaps in a JS timer,
+ * and on iOS a gap means the process was suspended. React Native on Android
+ * stops JS timers when the activity pauses while JS keeps running, so the same
+ * gap there is ordinary work: 60 progress frames 3.5 s apart would read as
+ * 210 s of "suspension". Absent is the honest value off iOS.
+ */
+function downloadKeepAwakeProps(scopeKey: string): { keepAwake: boolean; suspendedMs?: number } {
+  const { keepAwake, suspendedMs } = takeDownloadTelemetry(scopeKey);
+  return Platform.OS === 'ios' ? { keepAwake, suspendedMs } : { keepAwake };
+}
+
 // Offline-download telemetry. Both handlers are wired unconditionally (like
 // reportSchemaDrift above). reportSnapshotBootstrapError is inert without a
 // `snapshotSource` (the engine only calls it from the bootstrap phase, which
@@ -190,6 +301,7 @@ const reportSchemaDrift: SchemaDriftReporter = (drift) => {
 // the network downgrade — and `expected` (set by the engine for transport-shaped
 // failures) forces the warning even when the cause is an unrecognised shape.
 const reportSnapshotBootstrapError: SnapshotBootstrapErrorReporter = ({
+  downloadContext,
   scopeKey,
   stage,
   attempt,
@@ -197,7 +309,10 @@ const reportSnapshotBootstrapError: SnapshotBootstrapErrorReporter = ({
   expected,
   reason,
   aborted,
+  transferCompleted,
+  downloadRequest,
 }) => {
+  if (!isDownloadContextCurrent(downloadContext)) return;
   // The funnel's Failed leg (issue #4316). Sentry alone could never answer "what
   // fraction of downloads fail, and at which stage" — it groups by exception
   // shape, not by scope, and expected transport failures are deliberately
@@ -207,14 +322,26 @@ const reportSnapshotBootstrapError: SnapshotBootstrapErrorReporter = ({
   // `aborted` rides along so a failure-RATE query can exclude the teardowns (a
   // pocketed phone, a board removed elsewhere in the app) that are now reported
   // here for funnel completeness rather than because anything broke.
+  //
+  // The keep-awake props (issue #4310) ride on every report of an attempt, and
+  // `keepAwake` carries forward to the download's next event. The three
+  // `abandoned-*` reports carry neither: no attempt ran, and by the time a
+  // removal or a toggle-off reports, the board has left `syncEnabledBoards`
+  // and the store has dropped its record. A value there would read false for
+  // a download that did hold the screen.
+  const downloadAbandoned = ABANDONED_REASONS.includes(reason);
   track(SHARED_EVENTS.OfflineBoardDownloadFailed, {
+    ...(downloadContext ? { requestId: downloadContext.requestId, attemptId: downloadContext.attemptId } : {}),
+    ...downloadFunnelProperties(scopeKey, downloadRequest),
     scopeKey,
     stage,
     attempt,
     expected,
     reason,
     aborted,
+    ...(transferCompleted === undefined ? {} : { transferCompleted }),
     errorMessage: cause instanceof Error ? cause.message : String(cause),
+    ...(downloadAbandoned ? {} : downloadKeepAwakeProps(scopeKey)),
     offlineEngineEnabled: isOfflineEngineEnabled(),
   });
   // A teardown is not a defect and there are as many of them as there are lock
@@ -350,7 +477,12 @@ export const reportScopeDownloadAbandonedOnDisable = ({ scopeKey }: { scopeKey: 
 // their OWN `IS NOT NULL` filter, NOT `importMs` — the grades retrofit path fires
 // them for an already-bootstrapped scope in a cycle with no whole-layout import,
 // which is the still-crawling population of #4719.
+// `keepAwake` (issue #4310) is always present, `suspendedMs` on iOS only.
+// `suspendedMs` covers this cycle only, like the phases, so `suspendedMs = 0`
+// is the filter for clean-run phase numbers; see the store for how a gap is
+// attributed to a board.
 const reportScopeDownloadComplete: ScopeDownloadCompleteReporter = ({
+  downloadContext,
   scopeKey,
   method,
   durationMs,
@@ -360,8 +492,13 @@ const reportScopeDownloadComplete: ScopeDownloadCompleteReporter = ({
   downloadMs,
   importMs,
   phases,
+  downloadRequest,
 }) => {
+  if (!isDownloadContextCurrent(downloadContext)) return;
+  recordDownloadCompleted(scopeKey, downloadRequest);
   track(SHARED_EVENTS.OfflineBoardDownloadCompleted, {
+    ...(downloadContext ? { requestId: downloadContext.requestId, attemptId: downloadContext.attemptId } : {}),
+    ...downloadFunnelProperties(scopeKey, downloadRequest),
     scopeKey,
     method,
     durationMs,
@@ -387,8 +524,10 @@ const reportScopeDownloadComplete: ScopeDownloadCompleteReporter = ({
     ...(phases.importLockWaitMs === undefined ? {} : { importLockWaitMs: phases.importLockWaitMs }),
     ...(phases.importBatches === undefined ? {} : { importBatches: phases.importBatches }),
     ...(phases.gradesDownloadMs === undefined ? {} : { gradesDownloadMs: phases.gradesDownloadMs }),
+    ...(phases.gradesWaitMs === undefined ? {} : { gradesWaitMs: phases.gradesWaitMs }),
     ...(phases.gradesVerifyMs === undefined ? {} : { gradesVerifyMs: phases.gradesVerifyMs }),
     ...(phases.gradesLockMs === undefined ? {} : { gradesLockMs: phases.gradesLockMs }),
+    ...downloadKeepAwakeProps(scopeKey),
     // Stamped so the funnel stays readable once #4312 bakes the flag on: the
     // engine gate, not the raw flag value.
     offlineEngineEnabled: isOfflineEngineEnabled(),
@@ -399,8 +538,21 @@ const reportScopeDownloadComplete: ScopeDownloadCompleteReporter = ({
 // structurally unmeasurable — a download that is never finished emits nothing at
 // all. The engine guarantees this fires once ever per scope (durable
 // `scope-started:` marker), matching Completed, so the ratio is real.
-const reportScopeDownloadStart: ScopeDownloadStartReporter = ({ scopeKey, pathIntent, artifactBytes }) => {
+const reportScopeDownloadStart: ScopeDownloadStartReporter = ({
+  scopeKey,
+  pathIntent,
+  artifactBytes,
+  downloadContext,
+  downloadRequest,
+}) => {
+  if (!isDownloadContextCurrent(downloadContext)) return;
+  // Disable/re-enable does not purge the cached catalogue. An old queued pull
+  // must not consume the replacement request's persisted attribution.
+  if (downloadContext && getDownloadRequest(scopeKey)?.requestId !== downloadContext.requestId) return;
+  recordDownloadStarted(scopeKey, downloadRequest);
   track(SHARED_EVENTS.OfflineBoardDownloadStarted, {
+    ...(downloadContext ? { requestId: downloadContext.requestId, attemptId: downloadContext.attemptId } : {}),
+    ...downloadFunnelProperties(scopeKey, downloadRequest),
     scopeKey,
     pathIntent,
     artifactBytes,
@@ -431,8 +583,13 @@ function combinedScopeDownloadCompleteReporter(
   onScopeDownloadComplete: ScopeDownloadCompleteReporter | undefined,
   queryClient?: QueryClient,
 ): ScopeDownloadCompleteReporter {
+  const generation = getDownloadActivityGeneration();
   return (info) => {
+    if (generation !== getDownloadActivityGeneration()) return;
     reportScopeDownloadComplete(info);
+    // After the event has read its telemetry: the download is done, so the
+    // screen lock goes back and the store forgets the board.
+    clearUserStartedDownload(info.scopeKey);
     if (queryClient) {
       for (const queryKey of DOWNLOAD_STATE_QUERY_KEYS) {
         void queryClient.invalidateQueries({ queryKey });
@@ -578,7 +735,11 @@ const warnCycleError = (error: unknown) => {
   const errorKind = classifyCycleErrorKind(error, expected, status);
   const phase = progress?.phase ?? null;
   const currentTable = progress?.currentTable ?? null;
-  const errorSignature = `${phase ?? 'unknown'}|${currentTable ?? 'none'}|${errorKind}|${status ?? 'none'}`;
+  // Which sync write lost the SQLite lock, when that is what ended the
+  // cycle (#5851). The stack stops at expo's CodedError, so without this the
+  // statement that lost is a guess.
+  const sqliteWriteSite = getSqliteWriteSite(error);
+  const errorSignature = `${phase ?? 'unknown'}|${currentTable ?? 'none'}|${errorKind}|${status ?? 'none'}|${sqliteWriteSite ?? 'none'}`;
   const now = Date.now();
   const shouldReport =
     errorSignature !== lastCycleErrorSignature || now < lastCycleErrorAt || now - lastCycleErrorAt >= 300_000;
@@ -591,6 +752,12 @@ const warnCycleError = (error: unknown) => {
       status,
       errorKind,
       offlineEngineEnabled: isOfflineEngineEnabled(),
+      // Above zero, this runtime came from a reload; on Android a lock that never
+      // frees after one is a transaction the old runtime left open (#6689).
+      jsRestartCount: getJsRestartCount(),
+      // Absent rather than null when no background write lost the lock, so every
+      // older failure shape is unchanged.
+      ...(sqliteWriteSite ? { sqliteWriteSite } : {}),
     });
     lastCycleErrorSignature = errorSignature;
     lastCycleErrorAt = now;
@@ -606,6 +773,7 @@ const warnCycleError = (error: unknown) => {
         source: 'offline-sync',
         kind: 'cycle',
         phase: progress?.phase ?? 'unknown',
+        ...(sqliteWriteSite ? { sqliteWriteSite } : {}),
       },
       extra: {
         currentTable: progress?.currentTable ?? null,
@@ -628,8 +796,30 @@ export function __resetCycleErrorDedupeForTests(): void {
   lastCycleErrorAt = 0;
 }
 
-// Feeds setBackgrounded() (Sentry BOARDSESH-AN) and the metered-link flag above;
-// call once for the app's lifetime — see OfflineSyncBridge.
+/**
+ * One sync-engine SQLite write lost the lock on its first attempt (#5851). Only
+ * contended writes reach here, so the event's count is the contention rate and
+ * `elapsedMs` is how long the holder really kept the lock. Never throws: the
+ * engine also guards the call, and a broken report must not fail a write.
+ */
+function reportSyncWriteRetried(report: PullWriteSettledReport): void {
+  try {
+    track(SHARED_EVENTS.OfflineSyncWriteRetried, {
+      site: report.site,
+      sizing: report.sizing,
+      attempts: report.attempts,
+      outcome: report.outcome,
+      elapsedMs: report.elapsedMs,
+      jsRestartCount: getJsRestartCount(),
+    });
+  } catch (reportError) {
+    if (__DEV__) console.warn('[Sync] sync write report failed:', reportError);
+  }
+}
+
+// Feeds setBackgrounded() (Sentry BOARDSESH-AN), the metered-link flag above and
+// the sync-write telemetry sink; call once for the app's lifetime — see
+// OfflineSyncBridge.
 export function startBackgroundTracking(): () => void {
   const subscription = AppState.addEventListener('change', (nextState: AppStateStatus) => {
     if (nextState === 'background') setBackgrounded(true);
@@ -638,9 +828,11 @@ export function startBackgroundTracking(): () => void {
   const unsubscribeNetInfo = NetInfo.addEventListener((state) => {
     isConnectionMetered = readMetered(state);
   });
+  const unregisterWriteTelemetry = setPullWriteSettledReporter(reportSyncWriteRetried);
   return () => {
     subscription.remove();
     unsubscribeNetInfo();
+    unregisterWriteTelemetry();
   };
 }
 
@@ -679,15 +871,58 @@ const schedulerTriggers: SchedulerTriggers = {
   },
 };
 
+// A drain that declined because the database still belongs to another account.
+// Reported once per credential generation (#6824): after the first, every tick
+// save in that session would repeat it, but the next sign-in is a new account
+// and gets its own report. The generation moves only on sign-in and sign-out
+// (storeTokens / clearTokens), never on a token refresh, so this is at most one
+// event per sign-in. No ids ride along, only the reason.
+let reportedOtherAccountOutboxGeneration: number | null = null;
+
+function reportOutboxOwnerRefused(reason: OutboxOwnerRefusal): void {
+  // The moment between sign-in and the stamp is ordinary; leave a trail only.
+  addErrorBreadcrumb({ category: 'offline-sync.outbox-owner', message: `Drain declined: ${reason}`, level: 'info' });
+  if (reason !== 'other-account') return;
+  const generation = captureAuthCredentialGeneration();
+  if (reportedOtherAccountOutboxGeneration === generation) return;
+  reportedOtherAccountOutboxGeneration = generation;
+  reportHandledError(new Error('Offline outbox held: the local database belongs to another account'), {
+    level: 'warning',
+    tags: { source: 'offline-sync', kind: 'outbox-owner-hold', reason },
+  });
+}
+
+export function __resetOutboxOwnerReportForTests(): void {
+  reportedOtherAccountOutboxGeneration = null;
+}
+
 export function drainMutationQueue(
   db: OfflineDatabase,
   queryClient: QueryClient,
   graphqlFetch: GraphQLFetch,
-  options?: Partial<DrainOptions>,
+  // The owner check is not a caller's choice: every mobile drain sends with the
+  // token in SecureStore, so every one compares the stamp against that token.
+  options?: Partial<Omit<DrainOptions, 'getSignedInUserId'>>,
 ): Promise<void> {
+  const sourceGeneration = captureAuthCredentialGeneration();
   return drainMutationQueueCore(db, queryClient, graphqlFetch, {
     ...options,
+    beforeMutationAcknowledged: async (mutation, fetch) => {
+      await acknowledgeClimbWrite(db, mutation, fetch);
+      await options?.beforeMutationAcknowledged?.(mutation, fetch);
+    },
     isOnline: options?.isOnline ?? isOnline,
+    // Whose account the server will file these sends under (#6824). The token
+    // the HTTP client attaches, read the same way, so the check and the send
+    // cannot disagree about who is signed in.
+    getSignedInUserId: readSignedInUserId,
+    onOutboxOwnerRefused: (reason) => {
+      try {
+        options?.onOutboxOwnerRefused?.(reason);
+      } finally {
+        reportOutboxOwnerRefused(reason);
+      }
+    },
     // A 5xx is not a reason to burn a queued write's retry budget (#4862): the
     // request was fine, the server was not. The store answers from its backoff
     // ladder when an outage is already known, so this costs a probe only when
@@ -706,10 +941,11 @@ export function drainMutationQueue(
         })),
     onMutationStatusError: options?.onMutationStatusError ?? reportMutationStatusListenerFailure,
     onMutationStatus: (event) => {
+      if (!isAuthCredentialGenerationCurrent(sourceGeneration)) return;
       try {
         options?.onMutationStatus?.(event);
       } finally {
-        publishMutationDelivery(event);
+        if (isAuthCredentialGenerationCurrent(sourceGeneration)) publishMutationDelivery(event);
       }
     },
     // Composed, not defaulted (unlike the reporters above): telemetry for a
@@ -723,6 +959,47 @@ export function drainMutationQueue(
       }
     },
   });
+}
+
+/**
+ * A user-started download whose board is already complete on disk has nothing
+ * left to hold the screen on for. `Offline Board Download Completed` clears the
+ * usual case; this catches the ones that event never fires for: a board turned
+ * off and on again with its rows kept, and an entry left behind by a crash
+ * between the completion marker and the event. Run at the end of each cycle,
+ * one primary-key read per pending download, which is almost always none.
+ */
+async function forgetCompletedUserStartedDownloads(db: OfflineDatabase): Promise<void> {
+  const generation = getDownloadActivityGeneration();
+  try {
+    for (const scopeKey of getPendingUserStartedDownloads()) {
+      const completed = await isScopeDownloadComplete(db, scopeKey);
+      if (generation !== getDownloadActivityGeneration()) return;
+      if (completed) clearUserStartedDownload(scopeKey);
+    }
+  } catch {
+    // A database that cannot answer now is asked again at the end of the next cycle.
+  }
+}
+
+/**
+ * The scheduler's progress sink, with the keep-awake store listening in.
+ *
+ * The store's half is fenced off: the engine calls this from inside a running
+ * cycle, where a throw would read as a failed pull, and holding the screen on
+ * is never worth failing a sync over.
+ */
+function downloadTrackingProgressSink(db: OfflineDatabase, onProgress: SyncProgressSink | undefined): SyncProgressSink {
+  const generation = getDownloadActivityGeneration();
+  return (progress) => {
+    if (generation !== getDownloadActivityGeneration()) return;
+    try {
+      if (noteDownloadProgress(progress) === 'idle') void forgetCompletedUserStartedDownloads(db);
+    } catch (error) {
+      if (__DEV__) console.warn('[Sync] download keep-awake tracking failed:', error);
+    }
+    onProgress?.(progress);
+  };
 }
 
 // A named bag rather than trailing positionals so callers (and their tests)
@@ -739,6 +1016,52 @@ export type SyncRunOptions = {
   snapshotSource?: SnapshotSource;
 };
 
+export type SignedInAccount =
+  | { status: 'signed-in'; userId: string }
+  /** A token is stored but names no user: nothing can ever be matched against it. */
+  | { status: 'no-user-id' }
+  /** No token yet, or credentials changed during the read. Ask again later. */
+  | { status: 'unsettled' };
+
+/**
+ * The signed-in account, from the token in SecureStore: the same token
+ * `authenticatedFetch` attaches to every request the drain and the pull make.
+ * Unsettled when credentials changed while it was read, so a sign-in landing
+ * mid-read is never mistaken for the account that started it.
+ *
+ * Deliberately not `useStoredUserId`'s cached answer (#6824). That query never
+ * goes stale, so an observer mounted on the login screen keeps whatever it read
+ * there: nothing on a fresh install, or the previous account's id from an
+ * expired token the light signed-out launch left in place. The owner claim in
+ * `OfflineSyncBridge`, the drainer and every pull ask this instead.
+ */
+export async function readSignedInAccount(): Promise<SignedInAccount> {
+  const generation = captureAuthCredentialGeneration();
+  const token = await getAuthToken();
+  if (!token || !isAuthCredentialGenerationCurrent(generation)) return { status: 'unsettled' };
+  const userId = userIdFromJwt(token);
+  return userId ? { status: 'signed-in', userId } : { status: 'no-user-id' };
+}
+
+/**
+ * The signed-in account's id, or null while there is none, it is not settled,
+ * or the token cannot be read. Never rejects. For callers that must pin a write
+ * to one account (the workout write, #6903).
+ */
+export async function readSignedInUserIdOrNull(): Promise<string | null> {
+  try {
+    const account = await readSignedInAccount();
+    return account.status === 'signed-in' ? account.userId : null;
+  } catch {
+    return null;
+  }
+}
+
+async function readSignedInUserId(): Promise<string | undefined> {
+  const account = await readSignedInAccount();
+  return account.status === 'signed-in' ? account.userId : undefined;
+}
+
 export function startSyncScheduler(
   db: OfflineDatabase,
   queryClient: QueryClient,
@@ -748,8 +1071,15 @@ export function startSyncScheduler(
   options?: SyncRunOptions,
 ): () => void {
   return startSyncSchedulerCore(db, queryClient, graphqlFetch, getEnabledBoards, drainQueue, schedulerTriggers, {
+    prepareScopeDownloadContexts: () => reconcileDownloadRequests(db, getEnabledBoards),
+    ...downloadLifecycleOptions(),
+    getViewerUserId: readSignedInUserId,
+    getSprayWallUuid: resolveSprayWallCapability,
+    // Pull only into a database stamped for that account (#6824).
+    requireOwnedDatabase: true,
     isOnline,
-    onProgress: options?.onProgress,
+    onProgress: downloadTrackingProgressSink(db, options?.onProgress),
+    getPriorityBoards: getPendingUserStartedDownloads,
     onCycleError: warnCycleError,
     onSchemaDrift: reportSchemaDrift,
     snapshotSource: options?.snapshotSource,
@@ -757,13 +1087,15 @@ export function startSyncScheduler(
     onBootstrapMetadataChanged: options?.onBootstrapMetadataChanged,
     onScopeDownloadComplete: combinedScopeDownloadCompleteReporter(options?.onScopeDownloadComplete, queryClient),
     onScopeDownloadStart: reportScopeDownloadStart,
+    getDownloadRequestContext,
+    onScopeDownloadObserved: observeDownloadScope,
     onCoverageReset: reportCoverageReset,
     onCoverageEvaluated: reportCoverageEvaluated,
     onBootstrapRetryScheduled: reportBootstrapRetryScheduled,
     onBootstrapPathRecovered: reportBootstrapPathRecovered,
     // The wall photo is the one asset a row cannot carry; see spray-photo-sink.ts.
     onDocumentsPulled: sprayWallPhotoSink,
-    onRowsDeleted: sprayWallDeletedSink,
+    onRowsDeleted: createSprayWallDeletedSink(queryClient),
     isOnUnmeteredNetwork,
     // The device-derived holds index (similar climbs + hold heatmap on device),
     // built at the end of each cycle; see hold-index-parser.ts.
@@ -780,8 +1112,15 @@ export function triggerSync(
   options?: SyncRunOptions,
 ): void {
   triggerSyncCore(db, queryClient, graphqlFetch, getEnabledBoards, drainQueue, {
+    prepareScopeDownloadContexts: () => reconcileDownloadRequests(db, getEnabledBoards),
+    ...downloadLifecycleOptions(),
+    getViewerUserId: readSignedInUserId,
+    getSprayWallUuid: resolveSprayWallCapability,
+    // Pull only into a database stamped for that account (#6824).
+    requireOwnedDatabase: true,
     isOnline,
-    onProgress: options?.onProgress,
+    onProgress: downloadTrackingProgressSink(db, options?.onProgress),
+    getPriorityBoards: getPendingUserStartedDownloads,
     onCycleError: warnCycleError,
     onSchemaDrift: reportSchemaDrift,
     snapshotSource: options?.snapshotSource,
@@ -789,13 +1128,15 @@ export function triggerSync(
     onBootstrapMetadataChanged: options?.onBootstrapMetadataChanged,
     onScopeDownloadComplete: combinedScopeDownloadCompleteReporter(options?.onScopeDownloadComplete, queryClient),
     onScopeDownloadStart: reportScopeDownloadStart,
+    getDownloadRequestContext,
+    onScopeDownloadObserved: observeDownloadScope,
     onCoverageReset: reportCoverageReset,
     onCoverageEvaluated: reportCoverageEvaluated,
     onBootstrapRetryScheduled: reportBootstrapRetryScheduled,
     onBootstrapPathRecovered: reportBootstrapPathRecovered,
     // The wall photo is the one asset a row cannot carry; see spray-photo-sink.ts.
     onDocumentsPulled: sprayWallPhotoSink,
-    onRowsDeleted: sprayWallDeletedSink,
+    onRowsDeleted: createSprayWallDeletedSink(queryClient),
     isOnUnmeteredNetwork,
     // The device-derived holds index (similar climbs + hold heatmap on device),
     // built at the end of each cycle; see hold-index-parser.ts.
@@ -803,26 +1144,36 @@ export function triggerSync(
   });
 }
 
-export function pullSync(
+// Not wrapped in downloadTrackingProgressSink on purpose. The one caller
+// (refresh-published-spray-climbs.ts) refreshes a wall after a publish; a board
+// download someone tapped starts through triggerSync or the scheduler, and both
+// feed the screen hold.
+export async function pullSync(
   db: OfflineDatabase,
   queryClient: QueryClient,
   graphqlFetch: GraphQLFetch,
   options?: SyncOptions,
 ): Promise<void> {
   return pullSyncCore(db, queryClient, graphqlFetch, {
+    ...downloadLifecycleOptions(),
     ...options,
+    getSprayWallUuid: options?.getSprayWallUuid ?? resolveSprayWallCapability,
+    viewerUserId: options?.viewerUserId ?? (await readSignedInUserId()),
+    requireOwnedDatabase: true,
     isOnline: options?.isOnline ?? isOnline,
     onSchemaDrift: options?.onSchemaDrift ?? reportSchemaDrift,
     onSnapshotBootstrapError: options?.onSnapshotBootstrapError ?? reportSnapshotBootstrapError,
     onScopeDownloadComplete: combinedScopeDownloadCompleteReporter(options?.onScopeDownloadComplete, queryClient),
     onScopeDownloadStart: options?.onScopeDownloadStart ?? reportScopeDownloadStart,
+    getDownloadRequestContext: options?.getDownloadRequestContext ?? getDownloadRequestContext,
+    onScopeDownloadObserved: options?.onScopeDownloadObserved ?? observeDownloadScope,
     onCoverageReset: options?.onCoverageReset ?? reportCoverageReset,
     onCoverageEvaluated: options?.onCoverageEvaluated ?? reportCoverageEvaluated,
     onBootstrapRetryScheduled: options?.onBootstrapRetryScheduled ?? reportBootstrapRetryScheduled,
     onBootstrapPathRecovered: options?.onBootstrapPathRecovered ?? reportBootstrapPathRecovered,
     isOnUnmeteredNetwork: options?.isOnUnmeteredNetwork ?? isOnUnmeteredNetwork,
     onDocumentsPulled: options?.onDocumentsPulled ?? sprayWallPhotoSink,
-    onRowsDeleted: options?.onRowsDeleted ?? sprayWallDeletedSink,
+    onRowsDeleted: options?.onRowsDeleted ?? createSprayWallDeletedSink(queryClient),
     holdIndex: options?.holdIndex ?? holdIndexSyncOptions,
     // Caller-provided error/drift/coverage reporters keep their existing
     // override semantics; scope completion is the one callback deliberately

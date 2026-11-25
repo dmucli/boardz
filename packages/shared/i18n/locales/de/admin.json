@@ -25,7 +25,50 @@
     "gymClaims": "Hallen-Ansprüche",
     "feedback": "Bug-Reports",
     "gymDuplicates": "Doppelte Hallen",
-    "locationSync": "Standort-Sync-Sperren"
+    "locationSync": "Standort-Sync-Sperren",
+    "sprayWalls": "Trainingsdaten der Spraywalls",
+    "boards": "Registrierte Boards",
+    "buildPlans": "Baupaket-Bestellungen",
+    "partnerApps": "Partner-Apps",
+    "boardReports": "Board-Meldungen"
+  },
+  "buildPlans": {
+    "title": "Baupaket-Bestellungen",
+    "subtitle": "Alle Bestellungen, Gratis-Vorschauen inklusive, neueste zuerst. Lies den Fehler des Generators und stell das Pack wieder in die Warteschlange.",
+    "previewsLastHour_one": "{{count}} Vorschau in der letzten Stunde gezeichnet, von den hier geladenen Bestellungen.",
+    "previewsLastHour_other": "{{count}} Vorschauen in der letzten Stunde gezeichnet, von den hier geladenen Bestellungen.",
+    "backToAdmin": "Zurück zum Admin-Panel",
+    "statusFilter": {
+      "all": "Alle"
+    },
+    "table": {
+      "licence": "Lizenz",
+      "licensee": "Lizenznehmer*in",
+      "tier": "Tarif",
+      "wall": "Wand",
+      "status": "Status",
+      "attempts": "Versuche",
+      "created": "Erstellt",
+      "actions": "Aktionen"
+    },
+    "actions": {
+      "regenerate": "Neu erzeugen"
+    },
+    "confirm": {
+      "title": "Dieses Paket neu erzeugen?",
+      "body": "{{licenceId}} wird unter derselben Lizenz-ID neu erzeugt und ersetzt die Datei, die Käufer*innen herunterladen. Die bezahlte Lizenz bleibt bestehen.",
+      "cancel": "So lassen",
+      "confirm": "Neu erzeugen"
+    },
+    "snackbar": {
+      "regenerated": "Wieder in der Warteschlange",
+      "regenerateFailed": "Das Paket ließ sich nicht neu einreihen"
+    },
+    "empty": "Keine Bestellung passt zu diesen Filtern.",
+    "error": "Die Bestellungen ließen sich nicht laden.",
+    "retry": "Nochmal versuchen",
+    "loadMore": "Mehr laden",
+    "unknown": "Nicht angegeben"
   },
   "feedback": {
     "title": "Bug-Reports & Feedback",
@@ -63,8 +106,9 @@
     "reporter": {
       "anonymous": "Anonym",
       "copyEmail": "E-Mail kopieren",
-      "consentYes": "Kontakt OK",
-      "consentNo": "Keine Zustimmung"
+      "consentYes": "E-Mail erlaubt",
+      "consentNo": "E-Mail abgelehnt",
+      "showReports": "Fehler dieser Person anzeigen"
     },
     "rating": {
       "value": "{{rating}}/5"
@@ -85,7 +129,16 @@
       "userAgent": "User-Agent",
       "screenshots": "Screenshots",
       "screenshotAlt": "Screenshot {{index}}",
-      "resolvedBy": "Erledigt von"
+      "resolvedBy": "Erledigt von",
+      "releaseChannel": "Veröffentlichungskanal",
+      "releaseBranch": "Laufender Branch",
+      "updateId": "Update-ID",
+      "runtimeVersion": "Runtime",
+      "automaticCanary": "Automatische Canary-Version",
+      "canaryYes": "Ja",
+      "canaryNo": "Nein",
+      "canaryUnknown": "Unbekannt",
+      "canaryCheckedAt": "Canary geprüft"
     },
     "empty": "Kein Feedback passt zu diesen Filtern.",
     "error": "Das Feedback ließ sich nicht laden.",
@@ -97,6 +150,26 @@
       "updateFailed": "Der Status ließ sich nicht ändern",
       "emailCopied": "E-Mail kopiert",
       "copyFailed": "Kopieren fehlgeschlagen"
+    },
+    "conversation": {
+      "title": "Unterhaltung",
+      "open": "Unterhaltung lesen",
+      "loadError": "Diese Unterhaltung konnte nicht geladen werden.",
+      "loadOlder": "Ältere Nachrichten laden",
+      "empty": "Antworten auf diese Meldung erscheinen hier.",
+      "staff": "Boardsesh",
+      "reporter": "Meldende Person",
+      "close": "Schließen",
+      "retry": "Erneut versuchen",
+      "latestReply": "Letzte Antwort",
+      "publicNotice": "Antworten werden im verlinkten öffentlichen GitHub-Issue geteilt.",
+      "openGithub": "Auf GitHub antworten",
+      "githubHint": "Um der meldenden Person zu schreiben, setze /reply allein in die erste Zeile eines GitHub-Kommentars. Nur autorisierte Boardsesh-Mitwirkende können diese Nachrichten senden."
+    },
+    "filters": {
+      "reporter": "Konto-ID der meldenden Person",
+      "needsReply": "Antwort ausstehend",
+      "clearReporter": "Alle meldenden Personen anzeigen"
     }
   },
   "retention": {
@@ -154,9 +227,7 @@
       "roleLabel": "Rolle",
       "boardTypeLabel": "Board-Typ (optional)",
       "boardTypeOptions": {
-        "global": "Global (alle Boards)",
-        "kilter": "Kilter",
-        "tension": "Tension"
+        "global": "Global (alle Boards)"
       },
       "roleOptions": {
         "communityLeader": "Community Leader",
@@ -234,6 +305,13 @@
       "disabled": "Automatische Bestätigung ist aus.",
       "saveFailed": "Konnte nicht gespeichert werden. Versuch es nochmal.",
       "loadFailed": "Hallen-Einstellungen konnten nicht geladen werden."
+    },
+    "dailyCap": {
+      "label": "Tageslimit",
+      "description": "Wie viele Ansprüche sich in 24 Stunden über alle Konten hinweg selbst bestätigen dürfen. Darüber hinaus warten sie auf eine Prüfung. Bei 0 geht jeder Anspruch in die Prüfung.",
+      "save": "Limit speichern",
+      "invalid": "Gib eine ganze Zahl von 0 bis 1000 ein.",
+      "saved": "Tageslimit gespeichert."
     }
   },
   "gymClaims": {
@@ -245,6 +323,7 @@
     "retry": "Nochmal versuchen",
     "approve": "Annehmen",
     "deny": "Ablehnen",
+    "claimantHistory": "Konto: {{days}} Tage · Logbuch: {{ticks}} · Betreute Hallen: {{gyms}}",
     "method": {
       "domain": "Domain",
       "admin": "Prüfung"
@@ -252,7 +331,8 @@
     "snackbar": {
       "approved": "Anspruch angenommen — Besitz übertragen",
       "denied": "Anspruch abgelehnt",
-      "failed": "Der Anspruch ließ sich nicht ändern"
+      "failed": "Der Anspruch ließ sich nicht ändern",
+      "superseded": "Diese Halle hat nach dem Anspruch den Besitzer gewechselt. Lehn ihn ab oder nutze unten Hallen-Besitz übertragen."
     },
     "table": {
       "claimant": "Anspruchsteller*in",
@@ -262,7 +342,36 @@
       "date": "Datum",
       "actions": "Aktionen"
     },
-    "loadMore": "Mehr laden"
+    "loadMore": "Mehr laden",
+    "autoApproved": {
+      "heading": "Automatisch bestätigte Ansprüche",
+      "intro": "Jeder hat eine nicht beanspruchte Halle ohne Prüfung übernommen. Zurücknehmen gibt die Halle an die öffentlichen Board-Daten zurück.",
+      "empty": "Bisher wurde kein Anspruch automatisch bestätigt.",
+      "error": "Diese Ansprüche konnten nicht geladen werden. Versuch es noch einmal.",
+      "approvedOn": "Bestätigt am {{date}}",
+      "reverted": "Zurückgenommen",
+      "revert": "Zurücknehmen",
+      "revertAria": "Anspruch von {{claimant}} auf {{gym}} zurücknehmen"
+    },
+    "revert": {
+      "title": "Anspruch von {{claimant}} auf {{gym}} zurücknehmen?",
+      "body": "{{gym}} ist danach wieder nicht beansprucht. {{claimant}} und alle, die seit dem Anspruch als Mitglied oder Redakteur*in hinzugekommen sind, verlieren den Zugang, die Standort-Synchronisierung pflegt den Eintrag wieder, und wir schreiben {{claimant}} eine E-Mail.",
+      "notUndone": "Änderungen an Boards, Kiosks sowie Beschreibung, Öffnungszeiten und Foto der Halle bleiben, wie sie sind. Korrigiere sie von Hand.",
+      "reasonLabel": "Grund (optional)",
+      "confirm": "Anspruch zurücknehmen",
+      "cancel": "Abbrechen",
+      "done": "{{gym}} ist wieder nicht beansprucht.",
+      "missing": "Anspruch {{claimId}} wurde nicht automatisch bestätigt oder existiert nicht mehr. Um eine Halle zurückzugeben, nutze unten Hallen-Besitz übertragen.",
+      "alreadyReverted": "Anspruch {{claimId}} wurde schon zurückgenommen.",
+      "errors": {
+        "notFound": "Dieser Anspruch oder seine Halle existiert nicht mehr.",
+        "notApproved": "Dieser Anspruch ist nicht mehr bestätigt, es gibt also nichts zurückzunehmen.",
+        "notTransferred": "Dieser Anspruch hat die Halle nie übertragen, es gibt also nichts zurückzunehmen. Nutze unten Hallen-Besitz übertragen.",
+        "ownerChanged": "Die Halle hat nach diesem Anspruch den Besitzer gewechselt. Nutze unten Hallen-Besitz übertragen.",
+        "priorOwner": "Dieser Anspruch hat die Halle einer Person abgenommen, nicht den öffentlichen Board-Daten. Nutze unten Hallen-Besitz übertragen, um sie zurückzugeben.",
+        "failed": "Der Anspruch konnte nicht zurückgenommen werden. Versuch es noch einmal."
+      }
+    }
   },
   "gymOwnerReassign": {
     "title": "Hallen-Besitz übertragen",
@@ -428,6 +537,236 @@
     },
     "ownerReports": {
       "note": "Betreiber*innen können Duplikate jetzt auf ihrer Hallenseite melden. Diese Meldungen kommen vorerst als Team-E-Mail, behalte neben dieser Liste also auch das Postfach im Blick."
+    }
+  },
+  "sprayTraining": {
+    "title": "Trainingsdaten der Spraywalls",
+    "statusLabel": "Prüfstatus",
+    "status": {
+      "unreviewed": "Ungeprüft ({{total}})",
+      "approved": "Freigegeben ({{total}})",
+      "rejected": "Abgelehnt ({{total}})"
+    },
+    "empty": "Hier ist nichts",
+    "error": "Die Warteschlange ließ sich nicht laden. Versuch es nochmal.",
+    "retry": "Nochmal versuchen",
+    "loadMore": "Mehr laden",
+    "card": {
+      "open": "Spraywall-Version {{version}} prüfen",
+      "holds": "Griffe: {{total}}",
+      "edited": "Bearbeitet: {{percent}} %",
+      "accepted": "Ungeprüft übernommen: {{percent}} %",
+      "deleted": "Gelöschte Vorschläge: {{total}}"
+    },
+    "kind": {
+      "manual": "Von Hand markiert",
+      "auto": "Gefunden, ungeprüft",
+      "accepted": "Ungeprüft übernommen",
+      "confirmed": "Unsicherer Griff, bestätigt",
+      "edited": "Bearbeitet",
+      "deleted": "Gelöschter Vorschlag",
+      "notShown": "Nie angezeigt"
+    },
+    "reason": {
+      "BAD_HOLDS": "Griffe falsch eingezeichnet",
+      "MISSING_HOLDS": "Griffe fehlen",
+      "PHOTO_QUALITY": "Fotoqualität",
+      "NOT_A_WALL": "Keine Kletterwand",
+      "PEOPLE_OR_PERSONAL_INFO": "Personen oder persönliche Daten",
+      "DUPLICATE": "Duplikat",
+      "OTHER": "Anderer Grund"
+    },
+    "visibility": {
+      "PRIVATE": "Sichtbarkeit: privat",
+      "UNLISTED": "Sichtbarkeit: nur mit Link",
+      "PUBLIC": "Sichtbarkeit: öffentlich"
+    },
+    "review": {
+      "title": "Spraywall, Version {{version}}",
+      "close": "Schließen",
+      "previous": "Vorherige Spraywall",
+      "next": "Nächste Spraywall",
+      "position": "{{current}} von {{total}}",
+      "photoAlt": "Foto einer Spraywall mit markierten Griffen",
+      "noPhoto": "Dieses Foto ist nicht mehr verfügbar.",
+      "photoLoading": "Foto wird geladen",
+      "loadingNext": "Weitere Spraywalls werden geladen",
+      "unmappable": "Griffe, die wir nicht auf dem Foto platzieren konnten: {{total}}",
+      "model": "Grifferkennung: {{version}}",
+      "showMarks": "Markierungen zeigen (H)",
+      "legend": "Legende",
+      "reason": "Ablehnungsgrund",
+      "notes": "Notizen (optional)",
+      "approve": "Freigeben (A)",
+      "reject": "Ablehnen (R)",
+      "backToUnreviewed": "Zurück zu ungeprüft",
+      "shortcuts": "A gibt frei, R lehnt ab, H blendet Markierungen aus, Pfeil links und rechts wechseln die Spraywall."
+    },
+    "snackbar": {
+      "approved": "Freigegeben",
+      "rejected": "Abgelehnt",
+      "reset": "Wieder in der Warteschlange",
+      "failed": "Die Prüfung ließ sich nicht speichern",
+      "notEligible": "Nicht gespeichert. Diese Spraywall ist nicht mehr als Trainingsdaten verfügbar."
+    },
+    "backToAdmin": "Zurück zum Admin",
+    "noAccess": "Dein Admin-Zugang gilt nicht für Spraywalls. Diese Seite braucht Admin-Zugang für Spraywalls oder die ganze Seite."
+  },
+  "boards": {
+    "title": "Registrierte Boards",
+    "description": "Finde und bearbeite registrierte Boards, auch private Boards und Boards ohne verknüpfte Halle.",
+    "backToAdmin": "Zurück zur Verwaltung",
+    "search": "Boards suchen",
+    "searchPlaceholder": "Boardname, UUID, Slug oder Halle",
+    "boardType": "Boardtyp",
+    "allTypes": "Alle Typen",
+    "searchAction": "Suchen",
+    "loading": "Boards werden geladen",
+    "editLoadError": "Dieses Board konnte nicht zum Bearbeiten geladen werden.",
+    "retry": "Erneut versuchen",
+    "backToList": "Alle Boards",
+    "loadError": "Registrierte Boards konnten nicht geladen werden.",
+    "empty": "Keine Boards für diese Suche gefunden.",
+    "owner": "Eigentümer*in: {{name}}",
+    "systemOwner": "Boardsesh",
+    "noGym": "Keine Halle verknüpft",
+    "editNamed": "{{name}} bearbeiten",
+    "results_one": "{{count}} Board",
+    "results_other": "{{count}} Boards",
+    "previous": "Zurück",
+    "next": "Weiter",
+    "visibility": {
+      "public": "Öffentlich",
+      "unlisted": "Nicht gelistet",
+      "private": "Privat"
+    }
+  },
+  "partnerApps": {
+    "title": "Partner-Apps",
+    "description": "Registrierte Apps, verbundene Kletterer*innen und Verbindungslimits.",
+    "limitsHelp": "Die Limits gelten für neue Verbindungen. Niedrigere Limits lassen bestehende Verbindungen weiter funktionieren. Null blockiert neue Verbindungen. Änderungen werden mit deinem Admin-Konto protokolliert.",
+    "search": "App, Herausgeber*in oder Entwickler*in suchen",
+    "searchAction": "Suchen",
+    "app": "App",
+    "developer": "Entwickler*in",
+    "connections": "Verbindungen",
+    "limits": "Limits",
+    "actions": "Aktionen",
+    "activeLimit": "Maximale aktive Verbindungen",
+    "dailyLimit": "Maximale neue Verbindungen pro 24 Stunden",
+    "usage": "{{active}} aktiv · {{recent}} neu in 24 Stunden",
+    "invalidLimit": "Verwende eine ganze Zahl von 0 bis 2147483647.",
+    "save": "Limits speichern",
+    "saved": "Limits gespeichert",
+    "saveError": "Die Limits konnten nicht gespeichert werden. Versuch es erneut.",
+    "loading": "Partner-Apps werden geladen",
+    "loadError": "Partner-Apps konnten nicht geladen werden.",
+    "retry": "Erneut versuchen",
+    "empty": "Keine App passt zu dieser Suche.",
+    "total_one": "{{count}} registrierte App",
+    "total_other": "{{count}} registrierte Apps",
+    "previous": "Vorherige Seite",
+    "next": "Nächste Seite",
+    "active": "Aktiv",
+    "suspended": "Gesperrt"
+  },
+  "boardReports": {
+    "title": "Meldungen zu Boards und Hallen",
+    "backToAdmin": "Zurück zum Admin-Panel",
+    "description": "Meldungen, die sonst niemand bearbeiten kann, und alle, die nach 14 Tagen noch offen sind. Direkt an uns gesendete zuerst, dann die ältesten.",
+    "filters": {
+      "status": "Status",
+      "kind": "Anzeigen",
+      "kindAll": "Boards und Hallen",
+      "kindBoard": "Boards",
+      "kindGym": "Hallen"
+    },
+    "status": {
+      "escalated": "Bei unserem Team",
+      "open": "Bei der Person, die es angelegt hat, oder beim Hallenteam",
+      "fixed": "Behoben",
+      "removed": "Entfernt",
+      "deleted": "Gelöscht",
+      "kept": "Bleibt so",
+      "merged": "Zusammengeführt"
+    },
+    "kind": {
+      "board": "Board",
+      "gym": "Halle"
+    },
+    "chips": {
+      "sentToTeam": "Direkt an uns",
+      "waited": "14 Tage offen"
+    },
+    "meta_one": "{{count}} Person · geöffnet {{age}}",
+    "meta_other": "{{count}} Personen · geöffnet {{age}}",
+    "ageToday": "heute",
+    "ageDays_one": "vor {{count}} Tag",
+    "ageDays_other": "vor {{count}} Tagen",
+    "routedToLine": "Gesendet an: {{recipients}}",
+    "routedTo": {
+      "creator": "die Person, die es angelegt hat",
+      "gymStaff": "das Hallenteam",
+      "admin": "unser Team"
+    },
+    "duplicateOf": "Dasselbe wie {{name}}",
+    "note": "{{name}}: {{note}}",
+    "reporterUnknown": "Gelöschtes Konto",
+    "closedOn": "Geschlossen am {{date}}: {{outcome}}",
+    "actions": {
+      "deleteBoard": "Board löschen",
+      "removeFromGym": "Aus der Halle entfernen",
+      "hideGym": "Halle in der Suche ausblenden",
+      "keep": "So lassen",
+      "mergeGyms": "In Doppelte Hallen zusammenführen",
+      "openGym": "Halle verwalten öffnen"
+    },
+    "confirm": {
+      "deleteTitle": "{{board}} für alle löschen?",
+      "deleteBody": "Es verschwindet für alle, die es gespeichert haben. Eingetragene Begehungen bleiben in den Logbüchern. Die Meldung wird als gelöscht geschlossen.",
+      "removeTitle": "{{board}} aus {{gym}} entfernen?",
+      "removeBody": "Es verschwindet von der Seite, den Kiosken und der Karte der Halle. Die Person, die es angelegt hat, behält es. Die Meldung wird als entfernt geschlossen.",
+      "hideTitle": "{{gym}} in der Suche ausblenden?",
+      "hideBody": "Die Halle erscheint nicht mehr im Hallenverzeichnis und in der Suche. Ihre Seite bleibt über den Link erreichbar. Die Meldung wird als entfernt geschlossen.",
+      "keepTitle": "So lassen?",
+      "keepBody": "Die Meldung wird geschlossen, und alle, die sie gesendet haben, erfahren, dass es so bleibt.",
+      "keepNoteLabel": "Eine Nachricht an sie (optional)",
+      "cancel": "Abbrechen"
+    },
+    "snackbar": {
+      "deleted": "Board gelöscht. Die Meldung ist geschlossen.",
+      "removed": "Aus der Halle entfernt. Die Meldung ist geschlossen.",
+      "hidden": "Halle in der Suche ausgeblendet. Die Meldung ist geschlossen.",
+      "hiddenStillOpen": "Halle in der Suche ausgeblendet, aber die Meldung ist noch offen. Versuch es erneut.",
+      "kept": "Meldung geschlossen.",
+      "failed": "Das hat nicht geklappt. Versuch es erneut."
+    },
+    "empty": "Hier ist nichts.",
+    "error": "Meldungen konnten nicht geladen werden. Versuch es erneut.",
+    "retry": "Nochmal versuchen",
+    "loadMore": "Mehr laden",
+    "tabs": {
+      "reports": "Meldungen",
+      "setupChanges": "Einrichtungen, die Kletterer*innen geändert haben"
+    },
+    "setupChanges": {
+      "description": "Jede Board-Einrichtung, die ein Vorschlag von Kletterer*innen geändert hat, die neuesten zuerst. Das passiert nur in Hallen, die niemand leitet. Rückgängig stellt die alte Einrichtung wieder her, solange das Board noch die vorgeschlagene hat.",
+      "before": "Vorher",
+      "after": "Nachher",
+      "byLine": "Geändert von {{name}} {{when}}",
+      "state": {
+        "live": "Aktiv",
+        "undone": "Rückgängig gemacht",
+        "changedSince": "Seitdem geändert"
+      },
+      "undo": "Rückgängig",
+      "confirmTitle": "Änderung an {{board}} rückgängig machen?",
+      "confirmBody": "Es bekommt für alle wieder {{setup}}. Vorschläge für dieses Board werden die nächsten {{days}} Tage zuerst geprüft.",
+      "undone": "Einrichtung wiederhergestellt.",
+      "changedSinceError": "Seitdem geändert: Das Board hat jetzt eine andere Einrichtung, deshalb lässt sich das nicht rückgängig machen.",
+      "alreadyUndone": "Jemand hat die alte Einrichtung schon wiederhergestellt.",
+      "empty": "Noch hat niemand ein Board geändert.",
+      "error": "Die Änderungen konnten nicht geladen werden. Versuch es erneut."
     }
   }
 }

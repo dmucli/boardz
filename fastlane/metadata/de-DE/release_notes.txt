@@ -1,23 +1,33 @@
-Neu in 2.5:
+Neu in 2.8.0
 
-LÄUFT MIT WOODS, VON VORN BIS HINTEN
+Boardsesh ist jetzt auch auf vereinfachtem Chinesisch verfügbar.
 
-Du hast ein Woods Board? Leg dein 12x12 oder 8x10 an, stöbere durch über 5.000 Boulder mit ihren Match- und Fußregeln und beleuchte jeden davon per Bluetooth. Bau und remixe eigene Boulder auf beiden Größen (der Editor bietet nur Griffe an, die wirklich an deinem Board sind), spiegle einen Boulder und das Board zieht mit, und steuere Zurück, Weiter und Spiegeln vom Sperrbildschirm und der Dynamic Island. Griffe erscheinen im Aura-Look mit schärferen Konturen.
+MEHR MÖGLICHKEITEN ZU TRAINIEREN
 
-ÜBERNIMM DIE WAND, AUCH OHNE LEDS
+Erstelle Workouts mit 4x4, Am Limit und Im Minutentakt, zusätzlich zu Volumen, Pyramide, Leiter und Grad-Fokus. Schau dir Boulder und Pausen vor dem Start an. Pyramiden können auf denselben Bouldern wieder absteigen. Wähle unter Einstellungen > Timer, ob der Countdown vibriert und die Pause auf dem Sperrbildschirm erscheint.
 
-Du kletterst an einem Board ohne LED-Kit? Übernimm die Wand, und die ganze Session folgt dem Boulder, den du zeigst, der Hallen-Bildschirm auch. Schalt die Beleuchtung in den Einstellungen des Boards aus: Ihr wechselt euch weiter ab, dein Winkel bleibt stehen, und Sessions an einer benannten Wand loggst du auch von der Uhr.
+MACH WEITER, WO DU AUFGEHÖRT HAST
 
-SPIEGELN VOM SPERRBILDSCHIRM
+Unter Start findest du deine Kletterwoche, Boulder auf deinem Niveau und Projekte für den nächsten Versuch. Sieh dein letztes Workout und starte eine Session über die Session-Karte. Wähle selbst, welche Bereiche du siehst. Mit aktiviertem Standort findest du in der Board-Auswahl Boards in der Nähe und die Boards deiner Halle. Deine eigenen Boulder findest du unter Entdecken.
 
-Während dein Handy das Board steuert, bekommen Live-Aktivität und Dynamic Island einen Spiegeln-Button neben Zurück, Weiter und der Glühbirne. App, Crew, Vorschaubilder und LEDs folgen dem gespiegelten Boulder, und er bleibt gespiegelt, wenn du die App öffnest.
+Beleuchte deine Spraywall
 
-BEHOBEN
+Verbinde deine Spraywall per WLAN mit WLED. Zeichne Löcher, LEDs und Kabel auf einem zoombaren Foto ein, teste einzelne Griffe und speichere die Einrichtung für deine Crew. Finde Controller in deinem WLAN, stelle die Helligkeit ein und wähle eine automatische Abschaltzeit für die Beleuchtung über WLAN.
 
-- Griffe zeichnen schneller: das Board-Rendering wartet nicht mehr auf den Rest der App.
-- Dein Board bleibt dunkel, bis du es willst. Ein Handy, das Stunden oder Tage später wieder in Reichweite kommt, beleuchtet nicht mehr deinen letzten Boulder. Glühbirne, Widget und Reconnects mitten im Boulder beleuchten das Board weiterhin sofort.
-- Der Boulder-Tab und seine Suche bleiben nicht mehr hängen, nachdem sich mitten in der Session eine Playlist darüber geschlossen hat. Kein App-Neustart mehr, um die Suche zurückzubekommen.
-- Heruntergeladene Boulder bleiben nach einem App-Update aktuell.
-- Die Boulder-Suche schließt sich, ohne dass ein Vorschau-Sheet aufspringt.
+Kompatible Controller mit Boardsesh-Bluetooth-Unterstützung können Boulder auch über Bluetooth beleuchten. Die Installation dieser Unterstützung bleibt eine freiwillige Beta für passende Controller, mit Kompatibilitätsprüfung und gesonderter Zustimmung.
 
-Kostenlos, werbefrei, Open Source.
+FINDE UND TEILE DEINEN NÄCHSTEN BOULDER
+
+Kilters verifizierte Boulder haben einen eigenen Schnellfilter neben Grad. Teile Playlists, Profile, Sessions, Hallen und Boards mit einem beleuchteten Boulder in der Linkvorschau. In Playlist-Kopfzeilen ist Teilen jetzt direkt erreichbar.
+
+BESSER LESBAR, FLÜSSIGER BLÄTTERN
+
+GPU-beschleunigte Board-Darstellung macht die Übergänge zwischen Bouldern auf unterstützten Boards und Geräten flüssiger.
+
+Neue Farben und Layouts geben deinen Bouldern mehr Platz. Text folgt der auf deinem iPhone eingestellten Schriftgröße genauer, und VoiceOver liest nach dem Wischen den neuen Boulder vor. Übergänge beachten Bewegung reduzieren. Lange Bouldernamen scrollen wieder, und die Boulder-Liste bleibt nach einem Wechsel des Gradfilters sichtbar.
+
+VERBINDE TRAININGS-APPS
+
+Öffne Workouts aus kompatiblen Trainings-Apps anderer Anbieter in Boardsesh und erlaube Apps, dein Routenbuch zu lesen. Infos für Entwickler*innen: https://www.boardsesh.com/developers/
+
+Kostenlos, ohne Werbung, Open Source.

@@ -24,15 +24,22 @@ import { publishSocialEvent } from '../../../events';
 import { notifyClimbRevalidated } from '../../../lib/web-revalidate';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
 import { requireAdminOrLeader } from '../social/roles';
-import { deleteClimbDependentRows } from './climb-cleanup';
+import {
+  CLIMB_EDIT_CONFLICT_ERROR_CODE,
+  CLIMB_EDIT_REFUSAL_CODES,
+  climbEditDecisionsAreStale,
+  lockClimbForEdit,
+} from './climb-edit-guard';
+import { deleteClimbDependentRows, deleteClimbReferenceRows } from './climb-cleanup';
+import { withClimbUpdateReceipt, type ClimbUpdateDatabase } from './mutation-receipts';
 import {
   SPRAY_CLIMB_CODES,
   assertSprayAngleMatchesWall,
   assertSprayClimbIsSingleFrame,
-  recordRemixLineage,
   populateSprayClimbColumns,
-  assertSprayGradeOnPublish,
   assertSprayHoldsAreAlive,
+  assertSprayTargetNotArchived,
+  assertSprayWallAcceptsClimbsUnderLock,
   isSprayBoard,
   requireVisibleSprayWall,
   sprayWallMayAnnounceUnderLock,
@@ -69,8 +76,28 @@ import {
   UpdateClimbInputSchema,
 } from '../../../validation/schemas';
 
+/**
+ * How long a published climb stays editable by its setter, on every board.
+ *
+ * Spray walls included: a published climb is something other people have sent
+ * and logged, so after a day it holds still. A spray wall's holds are locked once
+ * it has a published climb, so its climbs no longer need fixing after a reset.
+ */
+const CLIMB_EDIT_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 type SaveClimbArgs = { input: unknown };
 type DeleteDraftClimbArgs = { uuid: unknown; boardType: unknown };
+
+/**
+ * What `updateClimb`'s transaction hands back: the climb's stored revision
+ * numbers, which edits no longer move, and `replayedPublishAt` only when the call
+ * turned out to be a publish that had already landed and so wrote nothing.
+ */
+type UpdateClimbOutcome = {
+  revisionNumber: number;
+  holdsRevisionNumber: number;
+  replayedPublishAt?: string | null;
+};
 
 function generateClimbUuid(): string {
   // Match Aurora-style uppercase UUID without dashes
@@ -97,13 +124,17 @@ async function getUserProfile(userId: string) {
   };
 }
 
-async function resolveDifficultyId(boardType: string, grade?: string | null): Promise<number | null> {
+async function resolveDifficultyId(
+  boardType: string,
+  grade?: string | null,
+  executor: Pick<typeof db, 'select'> = db,
+): Promise<number | null> {
   if (!grade) return null;
   const normalizedGrade = grade.trim().toLowerCase();
   const rawFontPart = normalizedGrade.split('/')[0].trim();
   const fontPart = rawFontPart === '5+' ? '5a' : rawFontPart;
 
-  const [row] = await db
+  const [row] = await executor
     .select({ difficulty: dbSchema.boardDifficultyGrades.difficulty })
     .from(dbSchema.boardDifficultyGrades)
     .where(
@@ -153,10 +184,8 @@ export const climbMutations = {
       ? await requireVisibleSprayWall(validated.layoutId, ctx.userId!, validated.sprayWallUuid)
       : null;
     if (sprayTarget) {
-      // Ahead of every write: a spray wall has no crowd grade to converge on
-      // (`crowdGrade: false`), so a published climb with no setter grade would
-      // stay ungraded forever.
-      assertSprayGradeOnPublish(validated.isDraft, validated.userGrade);
+      // An archived wall is read-only: nothing new is set on it. Early here for a
+      // fast answer; the deciding check runs under the wall lock below.
       // A wall's angle is fixed for its life — it is chosen once at creation and
       // `is_angle_adjustable` is false — so an angle that disagrees with the wall
       // is a client bug, and accepting it would scatter the wall's climbs and
@@ -169,16 +198,8 @@ export const climbMutations = {
       assertSprayClimbIsSingleFrame(validated.framesCount, validated.frames);
     }
 
-    // A remix is a spray-wall idea and `spray_climb_lineage` is a spray table, so
-    // there is nothing a remix of a Kilter climb could write. Rejected rather than
-    // ignored: dropping the field silently would save the climb, report success,
-    // and leave the client believing a link exists that never will — and the
-    // lineage row can only be written once, with the child.
-    if (!sprayTarget && validated.remixOfClimbUuid) {
-      throw new GraphQLError('Only spray wall climbs can be remixed', {
-        extensions: { code: SPRAY_CLIMB_CODES.remixParentNotFound, boardType },
-      });
-    }
+    // `remixOfClimbUuid` is accepted and ignored on every board: remix after a
+    // reset was retired, and no `spray_climb_lineage` row is written any more.
 
     // Woods is code-driven: no board_placements to validate a hold against and
     // no board_product_sizes to derive compatibility from, so the shared
@@ -249,7 +270,8 @@ export const climbMutations = {
 
     const framesCount = validated.framesCount ?? 1;
     const holdEntries = parseFramesToHoldEntries(boardType, validated.frames);
-    const uuid = generateClimbUuid();
+    const uuid = validated.uuid ?? generateClimbUuid();
+    let replayedCreate: SaveClimbResult | undefined;
 
     // Resolved before the transaction so a grade string the scale does not know
     // fails the write rather than silently landing an ungradeable climb. Null for
@@ -260,7 +282,7 @@ export const climbMutations = {
     let sprayMayAnnounce = sprayTarget?.publishesFeedEvents ?? false;
 
     const sprayDifficultyId = sprayTarget ? await resolveDifficultyId(boardType, validated.userGrade) : null;
-    if (sprayTarget && !validated.isDraft && sprayDifficultyId === null) {
+    if (sprayTarget && !validated.isDraft && validated.userGrade && sprayDifficultyId === null) {
       throw new GraphQLError(`"${validated.userGrade}" is not a grade on the Boardsesh scale`, {
         extensions: { code: SPRAY_CLIMB_CODES.gradeRequired },
       });
@@ -281,12 +303,70 @@ export const climbMutations = {
     const gateRuleSignature = buildStoredRuleSignature(boardType, storedCharacteristics, storedDescription);
     const gateSizeId = woodsShape?.sizeId;
     await db.transaction(async (tx) => {
+      if (validated.uuid) {
+        // Serialize retries by the client identity before the duplicate gate.
+        // A replay must not overwrite edits accepted after the original create.
+        await tx.execute(sql`SELECT pg_advisory_xact_lock(hashtextextended(${`climb-create:${uuid}`}, 0))`);
+        const [existing] = await tx
+          .select({
+            userId: dbSchema.boardClimbs.userId,
+            boardType: dbSchema.boardClimbs.boardType,
+            layoutId: dbSchema.boardClimbs.layoutId,
+            createdAt: dbSchema.boardClimbs.createdAt,
+            publishedAt: dbSchema.boardClimbs.publishedAt,
+            synced: dbSchema.boardClimbs.synced,
+            compatibleSizeIds: dbSchema.boardClimbs.compatibleSizeIds,
+          })
+          .from(dbSchema.boardClimbs)
+          .where(eq(dbSchema.boardClimbs.uuid, uuid))
+          .limit(1);
+        if (existing) {
+          if (
+            existing.userId !== ctx.userId ||
+            existing.boardType !== boardType ||
+            existing.layoutId !== validated.layoutId ||
+            (woodsShape && !existing.compatibleSizeIds?.includes(woodsShape.sizeId))
+          ) {
+            throw new GraphQLError('Climb identity is unavailable', { extensions: { code: 'CLIMB_ID_CONFLICT' } });
+          }
+          await tx
+            .insert(dbSchema.climbMutationReceipts)
+            .values({
+              operationKey: `create:${uuid}`,
+              climbUuid: uuid,
+              boardType,
+              userId: ctx.userId!,
+            })
+            .onConflictDoNothing();
+          replayedCreate = {
+            uuid,
+            replayed: true,
+            synced: existing.synced ?? false,
+            createdAt: existing.createdAt,
+            publishedAt: existing.publishedAt,
+          };
+          return;
+        }
+        const [usedIdentity] = await tx
+          .select({ operationKey: dbSchema.climbMutationReceipts.operationKey })
+          .from(dbSchema.climbMutationReceipts)
+          .where(eq(dbSchema.climbMutationReceipts.operationKey, `create:${uuid}`));
+        if (usedIdentity) throw new GraphQLError('Climb not found', { extensions: { code: 'CLIMB_NOT_FOUND' } });
+        const [deleted] = await tx
+          .select({ id: dbSchema.syncDeletions.id })
+          .from(dbSchema.syncDeletions)
+          .where(and(eq(dbSchema.syncDeletions.tableName, 'board_climbs'), eq(dbSchema.syncDeletions.recordId, uuid)))
+          .limit(1);
+        if (deleted) throw new GraphQLError('Climb not found', { extensions: { code: 'CLIMB_NOT_FOUND' } });
+      }
+      if (sprayTarget) assertSprayTargetNotArchived(sprayTarget);
       if (shouldGate) {
         await acquireDuplicateGateLock(tx, boardType, validated.layoutId, gateSignature, {
           ruleSignature: gateRuleSignature,
           sizeId: gateSizeId,
         });
         const existing = await findExactDuplicateMatch({
+          viewerUserId: ctx.userId,
           boardType,
           layoutId: validated.layoutId,
           signature: gateSignature,
@@ -309,6 +389,8 @@ export const climbMutations = {
       // reset committing between them would otherwise let a climb through on a
       // hold that had just come off the wall.
       if (sprayTarget) {
+        // First, so an archived wall is refused as archived rather than on its holds.
+        await assertSprayWallAcceptsClimbsUnderLock(tx, sprayTarget.wallId);
         await assertSprayHoldsAreAlive(
           tx,
           sprayTarget,
@@ -399,13 +481,6 @@ export const climbMutations = {
           .onConflictDoNothing();
       }
 
-      // The remix link, written with the child rather than after it: a lineage row
-      // is the only record of where a remix came from, and a climb that landed
-      // without it would look like an original forever.
-      if (sprayTarget && validated.remixOfClimbUuid) {
-        await recordRemixLineage(tx, sprayTarget, uuid, validated.remixOfClimbUuid);
-      }
-
       // Derive the denormalised columns, then re-assert the spray ones — see
       // `populateSprayClimbColumns` for the INVARIANT and why the order matters.
       await populateSprayClimbColumns(tx, validated.boardType, uuid, sprayTarget);
@@ -421,11 +496,9 @@ export const climbMutations = {
       // before any other write occurs. Matches migration 0096 Step 1, which only
       // backfills rows where is_draft = FALSE, and updateClimb (below) which seeds
       // on draft → publish transition.
-      // Spray seeds the SETTER'S grade into the stats row, because there is no
-      // other place a spray climb's grade can live: the board has
-      // `crowdGrade: false`, so nothing will ever converge on a consensus
-      // difficulty, and `board_climb_stats` is the only table the grade-display
-      // path reads. Drafts get the row too when a grade is present — exactly the
+      // Spray: an older app still sends the setter's grade. It is seeded as a
+      // provisional grade, which the first graded send replaces (#5971,
+      // `climber-vote-grade.ts`). Drafts get the row too when a grade is present — exactly the
       // MoonBoard reasoning: `updateClimb`'s publish-time seed has no grade
       // source to reconstruct from, so skipping it here would lose the grade
       // through draft → publish. Search still filters drafts out by
@@ -467,12 +540,21 @@ export const climbMutations = {
             ],
           });
       }
+      if (validated.uuid) {
+        await tx.insert(dbSchema.climbMutationReceipts).values({
+          operationKey: `create:${uuid}`,
+          climbUuid: uuid,
+          boardType,
+          userId: ctx.userId!,
+        });
+      }
     });
 
     // A feed event carries the climb's name and its wall's layout id to every
     // follower, so firing one for a PRIVATE wall would announce the existence of
     // somebody's home wall to people who cannot open it. Public walls only
     // (epic decision 2026-09-14: private-wall ticks are the owner's logbook).
+    if (replayedCreate) return replayedCreate;
     const mayAnnounce = !sprayTarget || sprayMayAnnounce;
     if (!validated.isDraft && mayAnnounce) {
       await publishSocialEvent({
@@ -549,7 +631,12 @@ export const climbMutations = {
     // with the unified CLIMB_IS_DUPLICATE extension so the frontend's
     // duplicate-UX handler can react the same way across boards.
     if (!isDraft) {
-      const duplicateMatch = await findMoonBoardDuplicateMatch(validated.layoutId, validated.angle, validated.holds);
+      const duplicateMatch = await findMoonBoardDuplicateMatch(
+        validated.layoutId,
+        validated.angle,
+        validated.holds,
+        ctx.userId,
+      );
       if (duplicateMatch) {
         throw new GraphQLError(buildMoonBoardDuplicateError(duplicateMatch.existingClimbName), {
           extensions: {
@@ -563,90 +650,92 @@ export const climbMutations = {
 
     const frames = encodeMoonBoardHoldsToFrames(validated.holds);
 
-    await db.insert(UNIFIED_TABLES.climbs).values({
-      boardType: validated.boardType,
-      uuid,
-      layoutId: validated.layoutId,
-      userId: ctx.userId!,
-      setterId: null,
-      setterUsername: preferredSetter,
-      name: validated.name,
-      description: validated.description ?? '',
-      angle: validated.angle,
-      framesCount: 1,
-      framesPace: 0,
-      frames,
-      isDraft,
-      isListed,
-      createdAt: now,
-      publishedAt,
-      synced: false,
-      syncError: null,
-      characteristics,
+    await db.transaction(async (tx) => {
+      await tx.insert(UNIFIED_TABLES.climbs).values({
+        boardType: validated.boardType,
+        uuid,
+        layoutId: validated.layoutId,
+        userId: ctx.userId!,
+        setterId: null,
+        setterUsername: preferredSetter,
+        name: validated.name,
+        description: validated.description ?? '',
+        angle: validated.angle,
+        framesCount: 1,
+        framesPace: 0,
+        frames,
+        isDraft,
+        isListed,
+        createdAt: now,
+        publishedAt,
+        synced: false,
+        syncError: null,
+        characteristics,
+      });
+
+      const holdRows = buildMoonBoardClimbHoldRows(uuid, validated.holds);
+      if (holdRows.length > 0) {
+        await tx.insert(dbSchema.boardClimbHolds).values(holdRows).onConflictDoNothing();
+      }
+
+      // Seed a stats row so the climb is visible to the global search, which
+      // uses an INNER JOIN against board_climb_stats.
+      //
+      // Drafts: search already filters by `is_draft = false` (create-climb-filters
+      // baseConditions), so a stats row on a draft is not directly search-visible.
+      // The seed is still important when the user supplied a grade — board_climb_stats
+      // is the only place we persist the resolved difficulty, and skipping the row
+      // would lose the grade through draft → publish (updateClimb's stats seed has
+      // no grade source to reconstruct it from). So:
+      //   - draft + grade  → seed the row (preserves grade; search filter masks the draft)
+      //   - draft + no grade → skip the seed (matches saveClimb's gate; updateClimb
+      //                        will create a barebones row at publish time)
+      //   - non-draft + grade → seed with grade (current behaviour)
+      //   - non-draft + no grade → seed barebones (current behaviour)
+      // The uuid is freshly generated per call, so the inserts can never conflict —
+      // both branches use `onConflictDoNothing` for consistency with saveClimb.
+      const difficultyId = await resolveDifficultyId(validated.boardType, validated.userGrade);
+      if (difficultyId !== null) {
+        await tx
+          .insert(dbSchema.boardClimbStats)
+          .values({
+            boardType: validated.boardType,
+            climbUuid: uuid,
+            angle: validated.angle,
+            displayDifficulty: difficultyId,
+            benchmarkDifficulty: validated.isBenchmark ? difficultyId : null,
+            ascensionistCount: 0,
+            difficultyAverage: difficultyId,
+            qualityAverage: null,
+            faUsername: validated.setter || null,
+            faAt: null,
+          })
+          .onConflictDoNothing({
+            target: [
+              dbSchema.boardClimbStats.boardType,
+              dbSchema.boardClimbStats.climbUuid,
+              dbSchema.boardClimbStats.angle,
+            ],
+          });
+      } else if (!isDraft) {
+        await tx
+          .insert(dbSchema.boardClimbStats)
+          .values({
+            boardType: validated.boardType,
+            climbUuid: uuid,
+            angle: validated.angle,
+            ascensionistCount: 0,
+            faUsername: validated.setter || null,
+          })
+          .onConflictDoNothing({
+            target: [
+              dbSchema.boardClimbStats.boardType,
+              dbSchema.boardClimbStats.climbUuid,
+              dbSchema.boardClimbStats.angle,
+            ],
+          });
+      }
     });
-
-    const holdRows = buildMoonBoardClimbHoldRows(uuid, validated.holds);
-    if (holdRows.length > 0) {
-      await db.insert(dbSchema.boardClimbHolds).values(holdRows).onConflictDoNothing();
-    }
-
-    // Seed a stats row so the climb is visible to the global search, which
-    // uses an INNER JOIN against board_climb_stats.
-    //
-    // Drafts: search already filters by `is_draft = false` (create-climb-filters
-    // baseConditions), so a stats row on a draft is not directly search-visible.
-    // The seed is still important when the user supplied a grade — board_climb_stats
-    // is the only place we persist the resolved difficulty, and skipping the row
-    // would lose the grade through draft → publish (updateClimb's stats seed has
-    // no grade source to reconstruct it from). So:
-    //   - draft + grade  → seed the row (preserves grade; search filter masks the draft)
-    //   - draft + no grade → skip the seed (matches saveClimb's gate; updateClimb
-    //                        will create a barebones row at publish time)
-    //   - non-draft + grade → seed with grade (current behaviour)
-    //   - non-draft + no grade → seed barebones (current behaviour)
-    // The uuid is freshly generated per call, so the inserts can never conflict —
-    // both branches use `onConflictDoNothing` for consistency with saveClimb.
-    const difficultyId = await resolveDifficultyId(validated.boardType, validated.userGrade);
-    if (difficultyId !== null) {
-      await db
-        .insert(dbSchema.boardClimbStats)
-        .values({
-          boardType: validated.boardType,
-          climbUuid: uuid,
-          angle: validated.angle,
-          displayDifficulty: difficultyId,
-          benchmarkDifficulty: validated.isBenchmark ? difficultyId : null,
-          ascensionistCount: 0,
-          difficultyAverage: difficultyId,
-          qualityAverage: null,
-          faUsername: validated.setter || null,
-          faAt: null,
-        })
-        .onConflictDoNothing({
-          target: [
-            dbSchema.boardClimbStats.boardType,
-            dbSchema.boardClimbStats.climbUuid,
-            dbSchema.boardClimbStats.angle,
-          ],
-        });
-    } else if (!isDraft) {
-      await db
-        .insert(dbSchema.boardClimbStats)
-        .values({
-          boardType: validated.boardType,
-          climbUuid: uuid,
-          angle: validated.angle,
-          ascensionistCount: 0,
-          faUsername: validated.setter || null,
-        })
-        .onConflictDoNothing({
-          target: [
-            dbSchema.boardClimbStats.boardType,
-            dbSchema.boardClimbStats.climbUuid,
-            dbSchema.boardClimbStats.angle,
-          ],
-        });
-    }
 
     if (!isDraft) {
       await publishSocialEvent({
@@ -674,12 +763,20 @@ export const climbMutations = {
   },
 
   /**
-   * Update an existing climb in-place. Enforces ownership and a 24h edit
-   * window on published climbs. Drafts can be edited indefinitely.
+   * Update an existing climb in-place.
    *
-   * A climb can transition from draft → published via `isDraft: false` —
-   * that sets `publishedAt` to now and starts the 24h clock. The reverse
-   * transition is not allowed (can't un-publish).
+   * Who may edit, and for how long, the same on every board, spray walls
+   * included: only the climb's setter; a draft indefinitely, a published climb
+   * within 24 hours of its first publish. Everyone else gets
+   * `CLIMB_EDIT_NOT_ALLOWED`, an expired window `CLIMB_EDIT_WINDOW_EXPIRED`.
+   *
+   * A climb can transition from draft → published via `isDraft: false`, which
+   * sets `publishedAt` to now and starts the 24h clock. The reverse transition is
+   * not allowed (can't un-publish).
+   *
+   * The edit is made in place. No revision is recorded and `revision_number` /
+   * `holds_revision_number` do not move, so a holds edit leaves the climb's sends,
+   * first ascent and stars as they were (docs/product/spray-walls.md, "Editing a climb").
    */
   updateClimb: async (
     _: unknown,
@@ -698,543 +795,663 @@ export const climbMutations = {
     }
     const boardType = validated.boardType as BoardName;
 
-    // Load the existing row and verify ownership + edit window.
-    const [existing] = await db
-      .select({
-        uuid: dbSchema.boardClimbs.uuid,
-        userId: dbSchema.boardClimbs.userId,
-        isDraft: dbSchema.boardClimbs.isDraft,
-        publishedAt: dbSchema.boardClimbs.publishedAt,
-        createdAt: dbSchema.boardClimbs.createdAt,
-        angle: dbSchema.boardClimbs.angle,
-        layoutId: dbSchema.boardClimbs.layoutId,
-        frames: dbSchema.boardClimbs.frames,
-        framesCount: dbSchema.boardClimbs.framesCount,
-        setterUsername: dbSchema.boardClimbs.setterUsername,
-        characteristics: dbSchema.boardClimbs.characteristics,
-        // Needed to reproduce the rule signature the gate query computes over
-        // this row: a legacy climb whose no_match lives only in the "No match"
-        // description prefix still counts as a no-match climb.
-        description: dbSchema.boardClimbs.description,
-        // The Woods board size. Immutable, and the only record of which of the
-        // two walls the climb's hold ids belong to.
-        compatibleSizeIds: dbSchema.boardClimbs.compatibleSizeIds,
-      })
-      .from(dbSchema.boardClimbs)
-      .where(
-        and(eq(dbSchema.boardClimbs.uuid, validated.uuid), eq(dbSchema.boardClimbs.boardType, validated.boardType)),
-      )
-      .limit(1);
-
-    if (!existing) {
-      throw new Error('Climb not found');
-    }
-
-    if (existing.userId !== ctx.userId!) {
-      throw new Error('You can only update your own climbs');
-    }
-
-    const EDIT_WINDOW_MS = 24 * 60 * 60 * 1000;
-    const currentlyDraft = existing.isDraft === true;
-
-    if (!currentlyDraft) {
-      // Non-draft: only editable within 24h of the first publish.
-      if (!existing.publishedAt) {
-        throw new Error('This climb can no longer be edited');
-      }
-      const publishedMs = Date.parse(existing.publishedAt);
-      if (!Number.isFinite(publishedMs) || Date.now() - publishedMs > EDIT_WINDOW_MS) {
-        throw new Error('The 24 hour edit window has expired');
-      }
-    }
-
-    // Decide the next draft/publish state. We only honor a transition from
-    // draft → published; a publish → draft attempt is silently ignored.
-    let nextIsDraft: boolean;
-    if (validated.isDraft === undefined) {
-      nextIsDraft = existing.isDraft ?? false;
-    } else if (currentlyDraft && validated.isDraft === false) {
-      nextIsDraft = false;
-    } else {
-      nextIsDraft = existing.isDraft ?? false;
-    }
-
-    const transitioningToPublished = currentlyDraft && validated.isDraft === false;
-
-    // Spray: the same view-access resolve `saveClimb` does. It has to run even on
-    // a metadata-only edit — the wall may have been deleted since the climb was
-    // set, and an edit to a climb on a wall the caller can no longer see is not an
-    // edit they should be making.
-    const sprayTarget: SprayClimbTarget | null = isSprayBoard(boardType)
-      ? await requireVisibleSprayWall(existing.layoutId, ctx.userId!, validated.sprayWallUuid)
-      : null;
-
-    const now = new Date().toISOString();
-    const nextPublishedAt = transitioningToPublished ? now : existing.publishedAt;
-
-    // Decide whether this update needs to seed a board_climb_stats row at the
-    // climb's resolved angle, and validate the angle up front. Doing this
-    // BEFORE the board_climbs UPDATE means a malformed-publish attempt fails
-    // cleanly — without it, we'd flip isDraft=false / publishedAt=now and
-    // then throw, leaving a published climb with no stats row (exactly the
-    // broken state this PR is fixing).
-    const resolvedAngle = validated.angle ?? existing.angle;
-    const angleChanged = validated.angle !== undefined && validated.angle !== existing.angle;
-    const shouldSeedStats = !nextIsDraft && (transitioningToPublished || angleChanged);
-    if (shouldSeedStats && resolvedAngle === null) {
-      // board_climbs.angle is nullable in the schema but board_climb_stats.angle
-      // is NOT NULL. angleChanged can't reach this — validated.angle would be
-      // set; this only fires on publish of a draft created without an angle.
-      throw new Error('Cannot publish climb without an angle');
-    }
-
-    // Decided inside the transaction, under the wall lock — see `saveClimb`.
-    let sprayMayAnnounce = sprayTarget?.publishesFeedEvents ?? false;
-
-    // A wall's angle is fixed, so an edit may not move a climb off it either.
-    if (sprayTarget && validated.angle !== undefined) {
-      assertSprayAngleMatchesWall(sprayTarget, validated.angle);
-    }
-
-    // Publishing a spray climb needs a grade, and it may come from EITHER side: the
-    // stats row `saveClimb` seeded when the draft carried a grade, or `userGrade`
-    // on this call for a draft that did not. Accepting only the stored row is what
-    // made an ungraded draft unpublishable forever — `saveClimb` lets a draft
-    // through without a grade on purpose, because the grade is the last thing a
-    // setter decides.
-    let sprayGradeToSeed: number | null = null;
-    if (sprayTarget && transitioningToPublished) {
-      const [gradedStats] = await db
-        .select({ displayDifficulty: dbSchema.boardClimbStats.displayDifficulty })
-        .from(dbSchema.boardClimbStats)
+    const afterCommit: Array<() => void | Promise<void>> = [];
+    const runUpdate = async (database: ClimbUpdateDatabase): Promise<UpdateClimbResult> => {
+      // Load the existing row and verify ownership + edit window.
+      const [existing] = await database
+        .select({
+          uuid: dbSchema.boardClimbs.uuid,
+          userId: dbSchema.boardClimbs.userId,
+          isDraft: dbSchema.boardClimbs.isDraft,
+          publishedAt: dbSchema.boardClimbs.publishedAt,
+          createdAt: dbSchema.boardClimbs.createdAt,
+          angle: dbSchema.boardClimbs.angle,
+          layoutId: dbSchema.boardClimbs.layoutId,
+          frames: dbSchema.boardClimbs.frames,
+          framesCount: dbSchema.boardClimbs.framesCount,
+          setterUsername: dbSchema.boardClimbs.setterUsername,
+          characteristics: dbSchema.boardClimbs.characteristics,
+          // Needed to reproduce the rule signature the gate query computes over
+          // this row: a legacy climb whose no_match lives only in the "No match"
+          // description prefix still counts as a no-match climb.
+          description: dbSchema.boardClimbs.description,
+          // The Woods board size. Immutable, and the only record of which of the
+          // two walls the climb's hold ids belong to.
+          compatibleSizeIds: dbSchema.boardClimbs.compatibleSizeIds,
+        })
+        .from(dbSchema.boardClimbs)
         .where(
-          and(
-            eq(dbSchema.boardClimbStats.boardType, validated.boardType),
-            eq(dbSchema.boardClimbStats.climbUuid, validated.uuid),
-            eq(dbSchema.boardClimbStats.angle, resolvedAngle!),
-          ),
+          and(eq(dbSchema.boardClimbs.uuid, validated.uuid), eq(dbSchema.boardClimbs.boardType, validated.boardType)),
         )
         .limit(1);
 
-      if (gradedStats?.displayDifficulty == null) {
-        assertSprayGradeOnPublish(false, validated.userGrade);
-        sprayGradeToSeed = await resolveDifficultyId(boardType, validated.userGrade);
-        if (sprayGradeToSeed === null) {
-          throw new GraphQLError(`"${validated.userGrade}" is not a grade on the Boardsesh scale`, {
-            extensions: { code: SPRAY_CLIMB_CODES.gradeRequired },
+      if (!existing) {
+        throw new Error('Climb not found');
+      }
+
+      const currentlyDraft = existing.isDraft === true;
+      const callerIsSetter = existing.userId !== null && existing.userId === ctx.userId;
+
+      // Only the setter edits a climb, on every board. Refused before the spray wall
+      // is resolved, so the refusal says nothing about whether a wall exists.
+      if (!callerIsSetter) {
+        throw new GraphQLError('You can only update your own climbs', {
+          extensions: { code: CLIMB_EDIT_REFUSAL_CODES.notAllowed },
+        });
+      }
+
+      // Spray: the setter gets the same view-access resolve `saveClimb` does. It
+      // runs even on a metadata-only edit: the wall may have been deleted since the
+      // climb was set, and an edit to a climb on a wall the caller can no longer see
+      // is not an edit they should be making.
+      const sprayTarget: SprayClimbTarget | null = isSprayBoard(boardType)
+        ? await requireVisibleSprayWall(existing.layoutId, ctx.userId!, validated.sprayWallUuid, database)
+        : null;
+      if (sprayTarget) assertSprayTargetNotArchived(sprayTarget);
+
+      if (!currentlyDraft) {
+        // Published: only editable within 24h of the first publish.
+        if (!existing.publishedAt) {
+          throw new GraphQLError('This climb can no longer be edited', {
+            extensions: { code: CLIMB_EDIT_REFUSAL_CODES.notEditable },
+          });
+        }
+        const publishedMs = Date.parse(existing.publishedAt);
+        if (!Number.isFinite(publishedMs) || Date.now() - publishedMs > CLIMB_EDIT_WINDOW_MS) {
+          throw new GraphQLError('The 24 hour edit window has expired', {
+            extensions: { code: CLIMB_EDIT_REFUSAL_CODES.windowExpired },
           });
         }
       }
-    }
 
-    // A grade EDIT, as opposed to the publish transition above.
-    //
-    // `saveClimb` seeds the setter's grade and the transition re-seeds it, but
-    // neither covers what the editor's picker actually offers most of the time:
-    // reopening a climb inside the edit window and moving the grade. Without this
-    // the mutation returned success, the client showed a "published" toast and
-    // updated its saved baseline, and the stats row kept the old grade — the
-    // climb re-read as whatever it was graded the first time.
-    //
-    // No extra authorization: `updateClimb` has already refused anyone but
-    // `existing.userId`, and on a spray wall the owner of the climb IS its setter.
-    if (sprayTarget && sprayGradeToSeed === null && validated.userGrade != null) {
-      sprayGradeToSeed = await resolveDifficultyId(boardType, validated.userGrade);
-      if (sprayGradeToSeed === null) {
-        throw new GraphQLError(`"${validated.userGrade}" is not a grade on the Boardsesh scale`, {
-          extensions: { code: SPRAY_CLIMB_CODES.gradeRequired },
+      // Decide the next draft/publish state. We only honor a transition from
+      // draft → published; a publish → draft attempt is silently ignored.
+      let nextIsDraft: boolean;
+      if (validated.isDraft === undefined) {
+        nextIsDraft = existing.isDraft ?? false;
+      } else if (currentlyDraft && validated.isDraft === false) {
+        nextIsDraft = false;
+      } else {
+        nextIsDraft = existing.isDraft ?? false;
+      }
+
+      // Only ever true for the setter: everyone else is refused above. The
+      // `climb.created` event at the bottom leans on that when it names the caller
+      // as the actor.
+      const transitioningToPublished = currentlyDraft && validated.isDraft === false;
+
+      const now = new Date().toISOString();
+      const nextPublishedAt = transitioningToPublished ? now : existing.publishedAt;
+
+      // Decide whether this update needs to seed a board_climb_stats row at the
+      // climb's resolved angle, and validate the angle up front. Doing this
+      // BEFORE the board_climbs UPDATE means a malformed-publish attempt fails
+      // cleanly — without it, we'd flip isDraft=false / publishedAt=now and
+      // then throw, leaving a published climb with no stats row (exactly the
+      // broken state this PR is fixing).
+      const resolvedAngle = validated.angle ?? existing.angle;
+      const angleChanged = validated.angle !== undefined && validated.angle !== existing.angle;
+      const shouldSeedStats = !nextIsDraft && (transitioningToPublished || angleChanged);
+      if (shouldSeedStats && resolvedAngle === null) {
+        // board_climbs.angle is nullable in the schema but board_climb_stats.angle
+        // is NOT NULL. angleChanged can't reach this — validated.angle would be
+        // set; this only fires on publish of a draft created without an angle.
+        throw new Error('Cannot publish climb without an angle');
+      }
+
+      // Decided inside the transaction, under the wall lock — see `saveClimb`.
+      let sprayMayAnnounce = sprayTarget?.publishesFeedEvents ?? false;
+
+      // A wall's angle is fixed, so an edit may not move a climb off it either.
+      if (sprayTarget && validated.angle !== undefined) {
+        assertSprayAngleMatchesWall(sprayTarget, validated.angle);
+      }
+
+      // A spray climb publishes without a grade: its first ascent grades it (#5971,
+      // `climber-vote-grade.ts`). An older app still sends the setter's grade on the
+      // publish; it is seeded as a provisional grade the first graded send replaces,
+      // unless the draft already carries one. A `userGrade` on any other edit is
+      // ignored: a published climb's grade changes through a proposal.
+      let sprayGradeToSeed: number | null = null;
+      if (sprayTarget && transitioningToPublished && validated.userGrade) {
+        const [gradedStats] = await database
+          .select({ displayDifficulty: dbSchema.boardClimbStats.displayDifficulty })
+          .from(dbSchema.boardClimbStats)
+          .where(
+            and(
+              eq(dbSchema.boardClimbStats.boardType, validated.boardType),
+              eq(dbSchema.boardClimbStats.climbUuid, validated.uuid),
+              eq(dbSchema.boardClimbStats.angle, resolvedAngle!),
+            ),
+          )
+          .limit(1);
+
+        if (gradedStats?.displayDifficulty == null) {
+          sprayGradeToSeed = await resolveDifficultyId(boardType, validated.userGrade, database);
+          if (sprayGradeToSeed === null) {
+            throw new GraphQLError(`"${validated.userGrade}" is not a grade on the Boardsesh scale`, {
+              extensions: { code: SPRAY_CLIMB_CODES.gradeRequired },
+            });
+          }
+        }
+      }
+
+      // Atomicity envelope: the gate check, the UPDATE on board_climbs, the
+      // denorm column refresh, the holds DELETE+INSERT, and the stats seed all
+      // run inside one transaction. Without this a partial failure mid-sequence
+      // could leave the row published with stale board_climb_holds (a real
+      // data-integrity bug — the search hot path joins against the holds table
+      // for filtering, so out-of-sync rows surface as silently-wrong results).
+      //
+      // The advisory lock taken before the gate read serializes concurrent
+      // publishes of the same hold signature so the gate's TOCTOU race
+      // disappears: two simultaneous draft→publish attempts whose holds collide
+      // now line up behind the lock, and whichever lands second sees the first
+      // through the gate and throws cleanly. Multi-frame climbs and pure
+      // metadata edits don't take the lock (the gate doesn't fire for them).
+      const framesChanged = validated.frames !== undefined && validated.frames !== existing.frames;
+      const nextFrames = validated.frames ?? existing.frames ?? '';
+      const nextFramesCount = validated.framesCount ?? existing.framesCount ?? 1;
+      const nextHoldEntries = parseFramesToHoldEntries(boardType, nextFrames);
+
+      // An edit may not turn a single-frame wall climb into a sequence — same reason
+      // as the create path. Placed here because it needs the post-edit shape.
+      if (sprayTarget) {
+        assertSprayClimbIsSingleFrame(nextFramesCount, nextFrames);
+      }
+
+      // Woods: the board size is fixed at creation and is what makes the hold ids
+      // mean anything, so it comes from the row rather than the request. Re-run the
+      // full rule set over the post-update shape — an edit can add a hold that
+      // doesn't exist on this wall, drop the last start hold, or publish a draft
+      // that never had a finish. Runs BEFORE the UPDATE for the same reason the
+      // angle check does: a rejected edit must leave the row untouched.
+      const woodsSizeId = isWoodsBoard(boardType)
+        ? resolveWoodsUpdateSizeId({
+            storedSizeId: storedWoodsSizeId(existing.compatibleSizeIds),
+            requestedSizeId: validated.sizeId,
+          })
+        : undefined;
+      if (woodsSizeId !== undefined) {
+        validateWoodsClimb({
+          layoutId: existing.layoutId,
+          sizeId: woodsSizeId,
+          angle: resolvedAngle,
+          frames: nextFrames,
+          framesCount: nextFramesCount,
+          framesPace: validated.framesPace,
+          isDraft: nextIsDraft,
         });
       }
-    }
 
-    // Atomicity envelope: the gate check, the UPDATE on board_climbs, the
-    // denorm column refresh, the holds DELETE+INSERT, and the stats seed all
-    // run inside one transaction. Without this a partial failure mid-sequence
-    // could leave the row published with stale board_climb_holds (a real
-    // data-integrity bug — the search hot path joins against the holds table
-    // for filtering, so out-of-sync rows surface as silently-wrong results).
-    //
-    // The advisory lock taken before the gate read serializes concurrent
-    // publishes of the same hold signature so the gate's TOCTOU race
-    // disappears: two simultaneous draft→publish attempts whose holds collide
-    // now line up behind the lock, and whichever lands second sees the first
-    // through the gate and throws cleanly. Multi-frame climbs and pure
-    // metadata edits don't take the lock (the gate doesn't fire for them).
-    const framesChanged = validated.frames !== undefined && validated.frames !== existing.frames;
-    const nextFrames = validated.frames ?? existing.frames ?? '';
-    const nextFramesCount = validated.framesCount ?? existing.framesCount ?? 1;
-    const nextHoldEntries = parseFramesToHoldEntries(boardType, nextFrames);
+      // Build the row's next rule set before the transaction: rules are half the
+      // duplicate key, so a rule-only edit has to re-run the gate, and the gate
+      // needs the values this update is about to store.
+      //
+      // Seeded from the row's EFFECTIVE rules (the stored array, or the legacy
+      // description-derived no_match when there is no array yet) so writing an
+      // explicit array for the first time carries the legacy flag forward instead
+      // of quietly dropping it.
+      let nextCharacteristics =
+        existing.characteristics != null
+          ? [...existing.characteristics]
+          : usesAuroraNoMatchDescription(boardType) && isNoMatchClimb(existing.description)
+            ? [CLIMB_CHARACTERISTICS.NO_MATCH as string]
+            : [];
+      let characteristicsChanged = false;
+      let nextDescription = existing.description ?? '';
 
-    // An edit may not turn a single-frame wall climb into a sequence — same reason
-    // as the create path. Placed here because it needs the post-edit shape.
-    if (sprayTarget) {
-      assertSprayClimbIsSingleFrame(nextFramesCount, nextFrames);
-    }
+      if (validated.description !== undefined) {
+        // Derive no_match from the raw incoming description (may still carry the
+        // Aurora "No match\n" prefix), then strip the prefix from the stored value
+        // so characteristics is the sole source of truth going forward.
+        nextDescription = usesAuroraNoMatchDescription(boardType)
+          ? withNoMatch(validated.description, false)
+          : validated.description;
+        // no_match is an Aurora-family concept — never derive it for the
+        // code-driven boards, where a description starting with "no match" is just
+        // user prose and would otherwise clobber the climb's other tokens.
+        if (usesAuroraNoMatchDescription(boardType)) {
+          nextCharacteristics = withCharacteristic(
+            nextCharacteristics,
+            CLIMB_CHARACTERISTICS.NO_MATCH,
+            isNoMatchClimb(validated.description),
+          );
+          characteristicsChanged = true;
+        }
+      }
 
-    // Woods: the board size is fixed at creation and is what makes the hold ids
-    // mean anything, so it comes from the row rather than the request. Re-run the
-    // full rule set over the post-update shape — an edit can add a hold that
-    // doesn't exist on this wall, drop the last start hold, or publish a draft
-    // that never had a finish. Runs BEFORE the UPDATE for the same reason the
-    // angle check does: a rejected edit must leave the row untouched.
-    const woodsSizeId = isWoodsBoard(boardType)
-      ? resolveWoodsUpdateSizeId({
-          storedSizeId: storedWoodsSizeId(existing.compatibleSizeIds),
-          requestedSizeId: validated.sizeId,
-        })
-      : undefined;
-    if (woodsSizeId !== undefined) {
-      validateWoodsClimb({
-        layoutId: existing.layoutId,
-        sizeId: woodsSizeId,
-        angle: resolvedAngle,
-        frames: nextFrames,
-        framesCount: nextFramesCount,
-        framesPace: validated.framesPace,
-        isDraft: nextIsDraft,
-      });
-    }
-
-    // Build the row's next rule set before the transaction: rules are half the
-    // duplicate key, so a rule-only edit has to re-run the gate, and the gate
-    // needs the values this update is about to store.
-    //
-    // Seeded from the row's EFFECTIVE rules (the stored array, or the legacy
-    // description-derived no_match when there is no array yet) so writing an
-    // explicit array for the first time carries the legacy flag forward instead
-    // of quietly dropping it.
-    let nextCharacteristics =
-      existing.characteristics != null
-        ? [...existing.characteristics]
-        : usesAuroraNoMatchDescription(boardType) && isNoMatchClimb(existing.description)
-          ? [CLIMB_CHARACTERISTICS.NO_MATCH as string]
-          : [];
-    let characteristicsChanged = false;
-    let nextDescription = existing.description ?? '';
-
-    if (validated.description !== undefined) {
-      // Derive no_match from the raw incoming description (may still carry the
-      // Aurora "No match\n" prefix), then strip the prefix from the stored value
-      // so characteristics is the sole source of truth going forward.
-      nextDescription = usesAuroraNoMatchDescription(boardType)
-        ? withNoMatch(validated.description, false)
-        : validated.description;
-      // no_match is an Aurora-family concept — never derive it for the
-      // code-driven boards, where a description starting with "no match" is just
-      // user prose and would otherwise clobber the climb's other tokens.
-      if (usesAuroraNoMatchDescription(boardType)) {
+      // Explicit flags win over the description derivation above, and null/omitted
+      // preserves whatever the row already says — that third state is what stops an
+      // old client, which sends neither field, from clearing a rule it has never
+      // heard of.
+      if (validated.noMatch != null) {
         nextCharacteristics = withCharacteristic(
           nextCharacteristics,
           CLIMB_CHARACTERISTICS.NO_MATCH,
-          isNoMatchClimb(validated.description),
+          validated.noMatch,
         );
         characteristicsChanged = true;
       }
-    }
-
-    // Explicit flags win over the description derivation above, and null/omitted
-    // preserves whatever the row already says — that third state is what stops an
-    // old client, which sends neither field, from clearing a rule it has never
-    // heard of.
-    if (validated.noMatch != null) {
-      nextCharacteristics = withCharacteristic(nextCharacteristics, CLIMB_CHARACTERISTICS.NO_MATCH, validated.noMatch);
-      characteristicsChanged = true;
-    }
-    if (validated.anyFeet != null) {
-      nextCharacteristics = withCharacteristic(nextCharacteristics, CLIMB_CHARACTERISTICS.ANY_FEET, validated.anyFeet);
-      characteristicsChanged = true;
-    }
-    if (validated.characteristics !== undefined) {
-      // Client sends the full desired boolean state of each freely-toggleable
-      // token; anything else already on the row (no_match, any_feet, MoonBoard
-      // method) is left alone. `null` (both toggles off) is equivalent to `[]`
-      // here — the field is nullable because clients send explicit null, not
-      // omission, when nothing is toggled on.
-      const desiredCharacteristics = validated.characteristics ?? [];
-      for (const token of TOGGLEABLE_CLIMB_CHARACTERISTICS) {
-        nextCharacteristics = withCharacteristic(nextCharacteristics, token, desiredCharacteristics.includes(token));
+      if (validated.anyFeet != null) {
+        nextCharacteristics = withCharacteristic(
+          nextCharacteristics,
+          CLIMB_CHARACTERISTICS.ANY_FEET,
+          validated.anyFeet,
+        );
+        characteristicsChanged = true;
       }
-      characteristicsChanged = true;
-    }
-
-    if (characteristicsChanged) {
-      const conflict = findCharacteristicConflict(nextCharacteristics);
-      if (conflict) {
-        throw new GraphQLError(`"${conflict.token}" cannot be combined with "${conflict.conflictsWith}"`, {
-          extensions: { code: 'BAD_USER_INPUT' },
-        });
+      if (validated.characteristics !== undefined) {
+        // Client sends the full desired boolean state of each freely-toggleable
+        // token; anything else already on the row (no_match, any_feet, MoonBoard
+        // method) is left alone. `null` (both toggles off) is equivalent to `[]`
+        // here — the field is nullable because clients send explicit null, not
+        // omission, when nothing is toggled on.
+        const desiredCharacteristics = validated.characteristics ?? [];
+        for (const token of TOGGLEABLE_CLIMB_CHARACTERISTICS) {
+          nextCharacteristics = withCharacteristic(nextCharacteristics, token, desiredCharacteristics.includes(token));
+        }
+        characteristicsChanged = true;
       }
-    }
 
-    // Woods persists `[]` where other boards persist NULL — see saveClimb.
-    const storedCharacteristics =
-      woodsSizeId !== undefined ||
-      nextCharacteristics.length > 0 ||
-      (usesAuroraNoMatchDescription(boardType) && isNoMatchClimb(nextDescription))
-        ? nextCharacteristics
-        : null;
+      if (characteristicsChanged) {
+        const conflict = findCharacteristicConflict(nextCharacteristics);
+        if (conflict) {
+          throw new GraphQLError(`"${conflict.token}" cannot be combined with "${conflict.conflictsWith}"`, {
+            extensions: { code: 'BAD_USER_INPUT' },
+          });
+        }
+      }
 
-    // Both signatures are read off the row as it is and as it will be, not off
-    // the request: the gate query computes its side from the stored columns, so
-    // anything this update doesn't actually write has to be taken from `existing`
-    // or the two sides drift apart on the edits that touch neither field.
-    const previousRuleSignature = buildStoredRuleSignature(boardType, existing.characteristics, existing.description);
-    const nextRuleSignature = buildStoredRuleSignature(
-      boardType,
-      characteristicsChanged ? storedCharacteristics : existing.characteristics,
-      validated.description !== undefined ? nextDescription : existing.description,
-    );
-    const rulesChanged = nextRuleSignature !== previousRuleSignature;
+      // Woods persists `[]` where other boards persist NULL — see saveClimb.
+      const storedCharacteristics =
+        woodsSizeId !== undefined ||
+        nextCharacteristics.length > 0 ||
+        (usesAuroraNoMatchDescription(boardType) && isNoMatchClimb(nextDescription))
+          ? nextCharacteristics
+          : null;
 
-    // A rule-only edit is a real fork of the climb's identity, so it has to face
-    // the gate too: flipping "no match" on can land the climb straight on top of
-    // an existing no-match version of the same holds.
-    const shouldGate =
-      !nextIsDraft && (transitioningToPublished || framesChanged || rulesChanged) && nextFramesCount === 1;
-    const gateSignature = shouldGate ? buildHoldSignature(nextHoldEntries) : '';
+      // Both signatures are read off the row as it is and as it will be, not off
+      // the request: the gate query computes its side from the stored columns, so
+      // anything this update doesn't actually write has to be taken from `existing`
+      // or the two sides drift apart on the edits that touch neither field.
+      const previousRuleSignature = buildStoredRuleSignature(boardType, existing.characteristics, existing.description);
+      const nextRuleSignature = buildStoredRuleSignature(
+        boardType,
+        characteristicsChanged ? storedCharacteristics : existing.characteristics,
+        validated.description !== undefined ? nextDescription : existing.description,
+      );
+      const rulesChanged = nextRuleSignature !== previousRuleSignature;
 
-    await db.transaction(async (tx) => {
-      if (shouldGate) {
-        await acquireDuplicateGateLock(tx, boardType, existing.layoutId, gateSignature, {
-          ruleSignature: nextRuleSignature,
-          sizeId: woodsSizeId,
-        });
-        const existingMatch = await findExactDuplicateMatch({
-          boardType,
-          layoutId: existing.layoutId,
-          signature: gateSignature,
-          ruleSignature: nextRuleSignature,
-          sizeId: woodsSizeId,
-          excludeUuid: validated.uuid,
-          executor: tx,
-        });
-        if (existingMatch) {
-          throw new GraphQLError(buildDuplicateClimbErrorMessage(existingMatch.name), {
-            extensions: {
-              code: CLIMB_DUPLICATE_ERROR_CODE,
-              existingClimbUuid: existingMatch.uuid,
-              existingClimbName: existingMatch.name,
+      // A rule-only edit is a real fork of the climb's identity, so it has to face
+      // the gate too: flipping "no match" on can land the climb straight on top of
+      // an existing no-match version of the same holds.
+      const shouldGate =
+        !nextIsDraft && (transitioningToPublished || framesChanged || rulesChanged) && nextFramesCount === 1;
+      const gateSignature = shouldGate ? buildHoldSignature(nextHoldEntries) : '';
+
+      const outcome = await database.transaction(async (tx): Promise<UpdateClimbOutcome> => {
+        if (shouldGate) {
+          await acquireDuplicateGateLock(tx, boardType, existing.layoutId, gateSignature, {
+            ruleSignature: nextRuleSignature,
+            sizeId: woodsSizeId,
+          });
+          const existingMatch = await findExactDuplicateMatch({
+            viewerUserId: ctx.userId,
+            boardType,
+            layoutId: existing.layoutId,
+            signature: gateSignature,
+            ruleSignature: nextRuleSignature,
+            sizeId: woodsSizeId,
+            excludeUuid: validated.uuid,
+            executor: tx,
+          });
+          if (existingMatch) {
+            throw new GraphQLError(buildDuplicateClimbErrorMessage(existingMatch.name), {
+              extensions: {
+                code: CLIMB_DUPLICATE_ERROR_CODE,
+                existingClimbUuid: existingMatch.uuid,
+                existingClimbName: existingMatch.name,
+              },
+            });
+          }
+        }
+
+        // The same snapshot argument as `saveClimb`: inside the transaction, ahead
+        // of the write, so a reset committing mid-edit cannot leave the climb
+        // pointing at a hold that has come off the wall. Checked on every spray
+        // edit, not only a frames change — a metadata-only edit of a climb whose
+        // holds went away should not be the thing that quietly re-publishes it.
+        if (sprayTarget) {
+          await assertSprayWallAcceptsClimbsUnderLock(tx, sprayTarget.wallId);
+          await assertSprayHoldsAreAlive(
+            tx,
+            sprayTarget,
+            nextHoldEntries.map((entry) => entry.holdId),
+          );
+          // Under the lock — same reason as `saveClimb`.
+          sprayMayAnnounce = await sprayWallMayAnnounceUnderLock(tx, sprayTarget.wallId);
+        }
+
+        // Lock the row and read it as it stands NOW. After the wall lock, never
+        // before it (see `lockClimbForEdit`). `existing` was loaded outside the
+        // transaction, and another edit by the same setter (a second device, a
+        // retry) may have landed since.
+        const beforeEdit = await lockClimbForEdit(tx, boardType, validated.uuid);
+        if (!beforeEdit) {
+          throw new Error('Climb not found');
+        }
+        if (beforeEdit.userId !== ctx.userId) throw new Error('Climb not found or access denied');
+        // Everything decided above (who may edit, whether this publishes, whether
+        // the holds or the rules changed, what the duplicate gate checked) was
+        // decided for the row `existing` held. If another edit committed in
+        // between, those decisions are for a climb that no longer exists: writing
+        // from them could un-publish it, or put old frames back without rewriting
+        // `board_climb_holds`. See `climbEditDecisionsAreStale` for why this is a
+        // refusal and not a recompute.
+        if (climbEditDecisionsAreStale(boardType, existing, beforeEdit)) {
+          // One case is not a conflict: the SAME publish, sent twice (a double tap,
+          // or a retry after a lost response). The first one already landed, so
+          // the row now holds exactly what this request would write. Answer it as
+          // the success it is and write nothing, so there is no second
+          // `climb.created` and `published_at` does not move.
+          //
+          // "The same" is checked field by field against the locked row, for every
+          // field the request carries. Anything that differs falls through to the
+          // refusal. Only the setter can be here: a draft is refused to everyone
+          // else before the transaction opens.
+          const replaysLandedPublish =
+            transitioningToPublished &&
+            !beforeEdit.isDraft &&
+            (validated.name === undefined || validated.name === (beforeEdit.name ?? '')) &&
+            (validated.description === undefined || nextDescription === (beforeEdit.description ?? '')) &&
+            (validated.frames === undefined || validated.frames === (beforeEdit.frames ?? '')) &&
+            (validated.angle === undefined || validated.angle === beforeEdit.angle) &&
+            (validated.framesCount === undefined || validated.framesCount === (beforeEdit.framesCount ?? 1)) &&
+            (validated.framesPace === undefined || validated.framesPace === (beforeEdit.framesPace ?? 0)) &&
+            (!characteristicsChanged ||
+              buildStoredRuleSignature(boardType, storedCharacteristics, nextDescription) ===
+                buildStoredRuleSignature(boardType, beforeEdit.characteristics, beforeEdit.description)) &&
+            (sprayGradeToSeed === null || sprayGradeToSeed === beforeEdit.difficultyId);
+          if (replaysLandedPublish) {
+            return {
+              replayedPublishAt: beforeEdit.publishedAt,
+              revisionNumber: beforeEdit.revisionNumber,
+              holdsRevisionNumber: beforeEdit.holdsRevisionNumber,
+            };
+          }
+          throw new GraphQLError('This climb changed while you were editing it. Reload it and try again.', {
+            extensions: { code: CLIMB_EDIT_CONFLICT_ERROR_CODE },
+          });
+        }
+
+        // Build the update set from provided fields only.
+        const updateSet: Record<string, unknown> = {
+          isDraft: nextIsDraft,
+          isListed: !nextIsDraft,
+          publishedAt: nextPublishedAt,
+        };
+        if (validated.name !== undefined) updateSet.name = validated.name;
+        // The description and the rule array were both resolved above, before the
+        // transaction, so the gate could key on them. Write them only when this
+        // call actually touched them — a metadata-only edit must not rewrite the
+        // characteristics column (and, on MoonBoard, must not disturb the method
+        // token it never asked about).
+        if (validated.description !== undefined) updateSet.description = nextDescription;
+        if (characteristicsChanged) updateSet.characteristics = storedCharacteristics;
+        if (validated.frames !== undefined) updateSet.frames = validated.frames;
+        if (validated.angle !== undefined) updateSet.angle = validated.angle;
+        if (validated.framesCount !== undefined) updateSet.framesCount = validated.framesCount;
+        if (validated.framesPace !== undefined) updateSet.framesPace = validated.framesPace;
+        // Woods writes its own hold fingerprint (nothing downstream can re-derive
+        // it for that board), so an edit that moves the holds has to move it too or
+        // it describes the climb the user replaced. Other boards get theirs from
+        // the Aurora sync and are left alone here.
+        if (woodsSizeId !== undefined && framesChanged) {
+          updateSet.holdFingerprint = fingerprintFromHolds(nextHoldEntries);
+        }
+        // Spray, same reason: nothing downstream can re-derive a wall climb's
+        // fingerprint (there is no Aurora sync to come back for it), so an edit that
+        // moves the holds has to move the fingerprint too or it describes the climb
+        // the user replaced.
+        if (sprayTarget && framesChanged) {
+          updateSet.holdFingerprint = fingerprintFromHolds(nextHoldEntries);
+        }
+
+        await tx
+          .update(dbSchema.boardClimbs)
+          .set(updateSet)
+          .where(
+            and(eq(dbSchema.boardClimbs.uuid, validated.uuid), eq(dbSchema.boardClimbs.boardType, validated.boardType)),
+          );
+
+        // If frames changed we need to refresh the denormalized edge/set columns
+        // so search filters still match, and resync board_climb_holds (which the
+        // duplicate gate and similarity queries read from).
+        if (validated.frames !== undefined) {
+          // See `populateSprayClimbColumns` — same INVARIANT as the create path.
+          await populateSprayClimbColumns(tx, validated.boardType, validated.uuid, sprayTarget);
+
+          if (framesChanged) {
+            const refreshedHolds = nextHoldEntries;
+            await tx
+              .delete(dbSchema.boardClimbHolds)
+              .where(
+                and(
+                  eq(dbSchema.boardClimbHolds.boardType, validated.boardType),
+                  eq(dbSchema.boardClimbHolds.climbUuid, validated.uuid),
+                ),
+              );
+            if (refreshedHolds.length > 0) {
+              await tx
+                .insert(dbSchema.boardClimbHolds)
+                .values(
+                  refreshedHolds.map((entry) => ({
+                    boardType: validated.boardType,
+                    climbUuid: validated.uuid,
+                    holdId: entry.holdId,
+                    frameNumber: entry.frameNumber,
+                    holdState: entry.holdState,
+                  })),
+                )
+                .onConflictDoNothing();
+            }
+
+            // The materialised similar-climbs index scored this climb on the holds
+            // it just gave up, so its own neighbour list is wrong. Drop that list
+            // with the hold rewrite. Its slot in other climbs' lists is left for
+            // the nightly job: the UPDATE above bumped `sync_seq`, and the job
+            // deletes every row naming a changed climb and rewrites the lists it
+            // sat in (docs/data/similar-climbs.md). Deleting those slots here too would
+            // leave gaps only the weekly whole-board scan finds.
+            await tx
+              .delete(dbSchema.boardClimbNeighbors)
+              .where(
+                and(
+                  eq(dbSchema.boardClimbNeighbors.boardType, validated.boardType),
+                  eq(dbSchema.boardClimbNeighbors.climbUuid, validated.uuid),
+                ),
+              );
+
+            // The climb just moved under the wall, so its integrity number now
+            // describes holds it no longer uses. A climb that lost a hold to a
+            // published hold edit, and that its setter re-set onto holds still on
+            // the wall, is fixed by this edit, and nothing else would say so: the
+            // wall-wide recompute only runs when a version publishes.
+            //
+            // Inside the same transaction as the hold rewrite it answers, and after
+            // it, so the count is read off the rows this edit just wrote. The wall
+            // lock is already held: `sprayWallMayAnnounceUnderLock` took it above —
+            // it runs for every spray write — and `pg_advisory_xact_lock` holds to
+            // commit. Not `assertSprayHoldsAreAlive`: that one returns before it
+            // locks when the edit touches no holds.
+            if (sprayTarget) {
+              await recomputeMissingHoldCountForClimb(tx, sprayTarget.wallId, validated.uuid);
+            }
+          }
+        }
+
+        // A draft can already have stats rows (any send logged on it writes one, a
+        // draft sent to a session, say) and can carry Boardsesh grade rows. The
+        // board sync sends a draft's stats and grades only to its owner, so other
+        // devices walked both cursors past those rows. Nothing else moves them
+        // later: the stats cursor trigger (0144) fires only when a column the
+        // device stores changes (0195), and the grade jobs re-stamp `computed_at`
+        // only when a value moves. Re-stamp both on publish, so every device pulls
+        // them now. `DEFAULT` takes the next value of each table's sync_seq
+        // sequence, as an insert does. 0270's membership trigger re-stamps both
+        // today too, but it is left over from #6339's reverted design and is due
+        // to be dropped; this keeps publishing correct for stats and grades
+        // without it.
+        if (transitioningToPublished) {
+          await tx
+            .update(dbSchema.boardClimbStats)
+            .set({ updatedAt: sql`now()`, syncSeq: sql`DEFAULT` })
+            .where(
+              and(
+                eq(dbSchema.boardClimbStats.boardType, validated.boardType),
+                eq(dbSchema.boardClimbStats.climbUuid, validated.uuid),
+              ),
+            );
+          await tx
+            .update(dbSchema.boardClimbGrades)
+            .set({ computedAt: sql`now()`, syncSeq: sql`DEFAULT` })
+            .where(
+              and(
+                eq(dbSchema.boardClimbGrades.boardType, validated.boardType),
+                eq(dbSchema.boardClimbGrades.climbUuid, validated.uuid),
+              ),
+            );
+        }
+
+        // The search hot path INNER JOINs board_climb_stats by (boardType, climbUuid, angle).
+        // Make sure a row exists at the resolved angle whenever the climb is, or just became,
+        // searchable. The old row at the previous angle is left in place — it's harmless
+        // because search filters by exact angle, and removing it would race with concurrent ticks.
+        // The combined check also re-narrows `resolvedAngle` to non-null for TS — we threw
+        // above on (shouldSeedStats && null) so the second clause is the only path through.
+        // The provisional grade an older app sent with the publish.
+        // `onConflictDoUpdate` rather than `DoNothing`: a draft created without a
+        // grade may already HAVE a barebones stats row (a previous angle edit seeds
+        // one), and the grade would otherwise be dropped.
+        if (sprayGradeToSeed !== null && resolvedAngle !== null) {
+          await tx
+            .insert(dbSchema.boardClimbStats)
+            .values({
+              boardType: validated.boardType,
+              climbUuid: validated.uuid,
+              angle: resolvedAngle,
+              displayDifficulty: sprayGradeToSeed,
+              difficultyAverage: sprayGradeToSeed,
+              ascensionistCount: 0,
+              faUsername: existing.setterUsername,
+            })
+            .onConflictDoUpdate({
+              target: [
+                dbSchema.boardClimbStats.boardType,
+                dbSchema.boardClimbStats.climbUuid,
+                dbSchema.boardClimbStats.angle,
+              ],
+              set: { displayDifficulty: sprayGradeToSeed, difficultyAverage: sprayGradeToSeed },
+            });
+        } else if (shouldSeedStats && resolvedAngle !== null) {
+          await tx
+            .insert(dbSchema.boardClimbStats)
+            .values({
+              boardType: validated.boardType,
+              climbUuid: validated.uuid,
+              angle: resolvedAngle,
+              ascensionistCount: 0,
+              faUsername: existing.setterUsername,
+            })
+            .onConflictDoNothing({
+              target: [
+                dbSchema.boardClimbStats.boardType,
+                dbSchema.boardClimbStats.climbUuid,
+                dbSchema.boardClimbStats.angle,
+              ],
+            });
+        }
+
+        // Revision numbers are not moved by an edit any more; hand back the stored
+        // ones, read under the row lock above, which this transaction's UPDATE did
+        // not touch.
+        return { revisionNumber: beforeEdit.revisionNumber, holdsRevisionNumber: beforeEdit.holdsRevisionNumber };
+      });
+
+      // A replayed publish: the first one did the work, announced the climb and
+      // busted the cache. Hand back the state it left.
+      if ('replayedPublishAt' in outcome) {
+        return {
+          uuid: validated.uuid,
+          createdAt: existing.createdAt,
+          publishedAt: outcome.replayedPublishAt,
+          isDraft: false,
+          revisionNumber: outcome.revisionNumber,
+          holdsRevisionNumber: outcome.holdsRevisionNumber,
+        };
+      }
+
+      // Tell the web app to drop the cached climb-view render so the edit
+      // shows up immediately instead of waiting for the 1h TTL.
+      afterCommit.push(() => {
+        void notifyClimbRevalidated(validated.uuid);
+      });
+
+      // On a draft → published transition, announce the new climb so follower
+      // feeds pick it up, the same way saveClimb does.
+      // Public walls only — see the note on `saveClimb`'s event.
+      //
+      // The actor is the caller, which is right because only the setter can edit,
+      // and so publish, a climb.
+      afterCommit.push(async () => {
+        if (transitioningToPublished && (!sprayTarget || sprayMayAnnounce)) {
+          const { displayName, name, avatarUrl } = await getUserProfile(ctx.userId!);
+          const preferredSetter = displayName || name || null;
+          await publishSocialEvent({
+            type: 'climb.created',
+            actorId: ctx.userId!,
+            entityType: 'climb',
+            entityId: validated.uuid,
+            timestamp: Date.now(),
+            metadata: {
+              boardType: validated.boardType,
+              // existing.layoutId came from the SELECT extended in this PR for
+              // the duplicate gate. Use it so follower feeds get the layout
+              // context — the empty-string placeholder was a leftover from
+              // before that column was selectable here.
+              layoutId: existing.layoutId != null ? String(existing.layoutId) : '',
+              climbName: validated.name ?? '',
+              climbUuid: validated.uuid,
+              angle: validated.angle !== undefined ? String(validated.angle) : '',
+              frames: validated.frames ?? '',
+              setterUsername: existing.setterUsername ?? preferredSetter ?? '',
+              setterDisplayName: preferredSetter || '',
+              setterAvatarUrl: avatarUrl || '',
             },
           });
         }
-      }
-
-      // The same snapshot argument as `saveClimb`: inside the transaction, ahead
-      // of the write, so a reset committing mid-edit cannot leave the climb
-      // pointing at a hold that has come off the wall. Checked on every spray
-      // edit, not only a frames change — a metadata-only edit of a climb whose
-      // holds went away should not be the thing that quietly re-publishes it.
-      if (sprayTarget) {
-        await assertSprayHoldsAreAlive(
-          tx,
-          sprayTarget,
-          nextHoldEntries.map((entry) => entry.holdId),
-        );
-        // Under the lock — same reason as `saveClimb`.
-        sprayMayAnnounce = await sprayWallMayAnnounceUnderLock(tx, sprayTarget.wallId);
-      }
-
-      // Build the update set from provided fields only.
-      const updateSet: Record<string, unknown> = {
-        isDraft: nextIsDraft,
-        isListed: !nextIsDraft,
-        publishedAt: nextPublishedAt,
-      };
-      if (validated.name !== undefined) updateSet.name = validated.name;
-      // The description and the rule array were both resolved above, before the
-      // transaction, so the gate could key on them. Write them only when this
-      // call actually touched them — a metadata-only edit must not rewrite the
-      // characteristics column (and, on MoonBoard, must not disturb the method
-      // token it never asked about).
-      if (validated.description !== undefined) updateSet.description = nextDescription;
-      if (characteristicsChanged) updateSet.characteristics = storedCharacteristics;
-      if (validated.frames !== undefined) updateSet.frames = validated.frames;
-      if (validated.angle !== undefined) updateSet.angle = validated.angle;
-      if (validated.framesCount !== undefined) updateSet.framesCount = validated.framesCount;
-      if (validated.framesPace !== undefined) updateSet.framesPace = validated.framesPace;
-      // Woods writes its own hold fingerprint (nothing downstream can re-derive
-      // it for that board), so an edit that moves the holds has to move it too or
-      // it describes the climb the user replaced. Other boards get theirs from
-      // the Aurora sync and are left alone here.
-      if (woodsSizeId !== undefined && framesChanged) {
-        updateSet.holdFingerprint = fingerprintFromHolds(nextHoldEntries);
-      }
-      // Spray, same reason: nothing downstream can re-derive a wall climb's
-      // fingerprint (there is no Aurora sync to come back for it), so an edit that
-      // moves the holds has to move the fingerprint too or it describes the climb
-      // the user replaced.
-      if (sprayTarget && framesChanged) {
-        updateSet.holdFingerprint = fingerprintFromHolds(nextHoldEntries);
-      }
-
-      await tx
-        .update(dbSchema.boardClimbs)
-        .set(updateSet)
-        .where(
-          and(eq(dbSchema.boardClimbs.uuid, validated.uuid), eq(dbSchema.boardClimbs.boardType, validated.boardType)),
-        );
-
-      // If frames changed we need to refresh the denormalized edge/set columns
-      // so search filters still match, and resync board_climb_holds (which the
-      // duplicate gate and similarity queries read from).
-      if (validated.frames !== undefined) {
-        // See `populateSprayClimbColumns` — same INVARIANT as the create path.
-        await populateSprayClimbColumns(tx, validated.boardType, validated.uuid, sprayTarget);
-
-        if (framesChanged) {
-          const refreshedHolds = nextHoldEntries;
-          await tx
-            .delete(dbSchema.boardClimbHolds)
-            .where(
-              and(
-                eq(dbSchema.boardClimbHolds.boardType, validated.boardType),
-                eq(dbSchema.boardClimbHolds.climbUuid, validated.uuid),
-              ),
-            );
-          if (refreshedHolds.length > 0) {
-            await tx
-              .insert(dbSchema.boardClimbHolds)
-              .values(
-                refreshedHolds.map((entry) => ({
-                  boardType: validated.boardType,
-                  climbUuid: validated.uuid,
-                  holdId: entry.holdId,
-                  frameNumber: entry.frameNumber,
-                  holdState: entry.holdState,
-                })),
-              )
-              .onConflictDoNothing();
-          }
-
-          // The materialised similar-climbs index scored this climb on the holds
-          // it just gave up, so its own neighbour list is wrong. Drop that list
-          // with the hold rewrite. Its slot in other climbs' lists is left for
-          // the nightly job: the UPDATE above bumped `sync_seq`, and the job
-          // deletes every row naming a changed climb and rewrites the lists it
-          // sat in (docs/similar-climbs.md). Deleting those slots here too would
-          // leave gaps only the weekly whole-board scan finds.
-          await tx
-            .delete(dbSchema.boardClimbNeighbors)
-            .where(
-              and(
-                eq(dbSchema.boardClimbNeighbors.boardType, validated.boardType),
-                eq(dbSchema.boardClimbNeighbors.climbUuid, validated.uuid),
-              ),
-            );
-
-          // The climb just moved under the wall, so its integrity number now
-          // describes holds it no longer uses. A climber whose problem lost two
-          // holds and who edited it onto two that are still there has fixed it —
-          // but nothing else would ever say so: the wall-wide recompute only runs
-          // when a reset lands, so until somebody reset that wall again the climb
-          // would sit in BROKEN searches wearing a badge for a problem its setter
-          // had already dealt with.
-          //
-          // Inside the same transaction as the hold rewrite it answers, and after
-          // it, so the count is read off the rows this edit just wrote. The wall
-          // lock is already held: `sprayWallMayAnnounceUnderLock` took it above —
-          // it runs for every spray write — and `pg_advisory_xact_lock` holds to
-          // commit. Not `assertSprayHoldsAreAlive`: that one returns before it
-          // locks when the edit touches no holds, which is the same reason
-          // `recordRemixLineage` refuses to lean on it.
-          if (sprayTarget) {
-            await recomputeMissingHoldCountForClimb(tx, sprayTarget.wallId, validated.uuid);
-          }
-        }
-      }
-
-      // The search hot path INNER JOINs board_climb_stats by (boardType, climbUuid, angle).
-      // Make sure a row exists at the resolved angle whenever the climb is, or just became,
-      // searchable. The old row at the previous angle is left in place — it's harmless
-      // because search filters by exact angle, and removing it would race with concurrent ticks.
-      // The combined check also re-narrows `resolvedAngle` to non-null for TS — we threw
-      // above on (shouldSeedStats && null) so the second clause is the only path through.
-      // The grade this call supplied — either the one the publish needs, or a
-      // plain grade edit. `onConflictDoUpdate` rather than `DoNothing`: a draft
-      // created without a grade may already HAVE a barebones stats row (a previous
-      // angle edit seeds one), and leaving it ungraded would publish a spray climb
-      // with no grade after the check above said there was one. The same update is
-      // what lets a setter MOVE the grade of a climb that already has stats.
-      if (sprayGradeToSeed !== null && resolvedAngle !== null) {
-        await tx
-          .insert(dbSchema.boardClimbStats)
-          .values({
-            boardType: validated.boardType,
-            climbUuid: validated.uuid,
-            angle: resolvedAngle,
-            displayDifficulty: sprayGradeToSeed,
-            difficultyAverage: sprayGradeToSeed,
-            ascensionistCount: 0,
-            faUsername: existing.setterUsername,
-          })
-          .onConflictDoUpdate({
-            target: [
-              dbSchema.boardClimbStats.boardType,
-              dbSchema.boardClimbStats.climbUuid,
-              dbSchema.boardClimbStats.angle,
-            ],
-            set: { displayDifficulty: sprayGradeToSeed, difficultyAverage: sprayGradeToSeed },
-          });
-      } else if (shouldSeedStats && resolvedAngle !== null) {
-        await tx
-          .insert(dbSchema.boardClimbStats)
-          .values({
-            boardType: validated.boardType,
-            climbUuid: validated.uuid,
-            angle: resolvedAngle,
-            ascensionistCount: 0,
-            faUsername: existing.setterUsername,
-          })
-          .onConflictDoNothing({
-            target: [
-              dbSchema.boardClimbStats.boardType,
-              dbSchema.boardClimbStats.climbUuid,
-              dbSchema.boardClimbStats.angle,
-            ],
-          });
-      }
-    });
-
-    // Tell the web app to drop the cached climb-view render so the edit
-    // shows up immediately instead of waiting for the 1h TTL.
-    void notifyClimbRevalidated(validated.uuid);
-
-    // On a draft → published transition, announce the new climb so follower
-    // feeds pick it up, the same way saveClimb does.
-    // Public walls only — see the note on `saveClimb`'s event.
-    if (transitioningToPublished && (!sprayTarget || sprayMayAnnounce)) {
-      const { displayName, name, avatarUrl } = await getUserProfile(ctx.userId);
-      const preferredSetter = displayName || name || null;
-      await publishSocialEvent({
-        type: 'climb.created',
-        actorId: ctx.userId,
-        entityType: 'climb',
-        entityId: validated.uuid,
-        timestamp: Date.now(),
-        metadata: {
-          boardType: validated.boardType,
-          // existing.layoutId came from the SELECT extended in this PR for
-          // the duplicate gate. Use it so follower feeds get the layout
-          // context — the empty-string placeholder was a leftover from
-          // before that column was selectable here.
-          layoutId: existing.layoutId != null ? String(existing.layoutId) : '',
-          climbName: validated.name ?? '',
-          climbUuid: validated.uuid,
-          angle: validated.angle !== undefined ? String(validated.angle) : '',
-          frames: validated.frames ?? '',
-          setterUsername: existing.setterUsername ?? preferredSetter ?? '',
-          setterDisplayName: preferredSetter || '',
-          setterAvatarUrl: avatarUrl || '',
-        },
       });
-    }
 
-    return {
-      uuid: validated.uuid,
-      createdAt: existing.createdAt,
-      publishedAt: nextPublishedAt,
-      isDraft: nextIsDraft,
+      return {
+        uuid: validated.uuid,
+        createdAt: existing.createdAt,
+        publishedAt: nextPublishedAt,
+        isDraft: nextIsDraft,
+        // The stored numbers, which edits no longer move. Returned for app
+        // bundles that still select them; saveTick ignores what they send back.
+        revisionNumber: outcome.revisionNumber,
+        holdsRevisionNumber: outcome.holdsRevisionNumber,
+      };
     };
+    const result = validated.clientMutationId
+      ? await withClimbUpdateReceipt(
+          { ...validated, clientMutationId: validated.clientMutationId, userId: ctx.userId! },
+          runUpdate,
+        )
+      : await runUpdate(db);
+    for (const effect of afterCommit) await effect();
+    return result;
   },
 
   /**
@@ -1264,7 +1481,8 @@ export const climbMutations = {
         .where(
           and(eq(dbSchema.boardClimbs.uuid, validatedUuid), eq(dbSchema.boardClimbs.boardType, validatedBoardType)),
         )
-        .limit(1);
+        .limit(1)
+        .for('update');
 
       if (!existing) {
         throw new Error('Climb not found');
@@ -1276,6 +1494,22 @@ export const climbMutations = {
 
       if (existing.isDraft !== true) {
         throw new Error('Published climbs cannot be deleted here');
+      }
+
+      if (validatedBoardType === 'spray') {
+        const [tick] = await tx
+          .select({ uuid: dbSchema.boardseshTicks.uuid })
+          .from(dbSchema.boardseshTicks)
+          .where(
+            and(eq(dbSchema.boardseshTicks.boardType, 'spray'), eq(dbSchema.boardseshTicks.climbUuid, validatedUuid)),
+          )
+          .limit(1);
+        if (tick) {
+          throw new GraphQLError('Somebody has logged this climb, so it stays', {
+            extensions: { code: 'CLIMB_HAS_TICKS' },
+          });
+        }
+        await deleteClimbReferenceRows(tx, validatedBoardType, validatedUuid);
       }
 
       // Clear the rows that have no FK back to board_climbs before deleting

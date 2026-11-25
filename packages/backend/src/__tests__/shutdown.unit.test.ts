@@ -33,8 +33,11 @@ describe('shutdown: closePool wiring', () => {
   it('index.ts imports closePool and closeReadPool from @boardsesh/db/client', () => {
     const source = readSource('src/index.ts');
     expect(source).toContain("import { closePool, closeReadPool } from '@boardsesh/db/client'");
-    expect(source).toContain('await closePool()');
-    expect(source).toContain('await closeReadPool()');
+    expect(source).toContain('await closeDatabasePools(');
+    expect(source).toContain('credential: closeCredentialDatabase');
+    expect(source).toContain('read: closeReadPool');
+    expect(source).toContain('primary: closePool');
+    expect(source).toContain('admission: closeAdmissionPool');
   });
 
   it('index.ts logs when pools are closed', () => {
@@ -44,16 +47,24 @@ describe('shutdown: closePool wiring', () => {
 
   it('index.ts handles pool close errors gracefully', () => {
     const source = readSource('src/index.ts');
-    // closePool should be in a try/catch
-    expect(source).toContain("'Error closing database pools:'");
+    expect(source).toContain("'One or more database pools failed to close'");
   });
 
-  it('index.ts closes read pool before primary pool', () => {
+  it('index.ts delegates pool shutdown to the independently tested owner', () => {
     const source = readCode('src/index.ts');
-    const readIdx = source.indexOf('await closeReadPool()');
-    const primaryIdx = source.indexOf('await closePool()');
-    expect(readIdx).toBeGreaterThanOrEqual(0);
-    expect(readIdx).toBeLessThan(primaryIdx);
+    expect(source).toContain("import { closeDatabasePools } from './shutdown-database-pools'");
+    expect(source).toContain('await closeDatabasePools(');
+  });
+
+  it('index.ts closes the admission pool once the shared pools have closed', () => {
+    // Every authenticated request reads through this pool, so nothing else may
+    // wait on it, and it must come after the HTTP and WebSocket servers.
+    const source = readCode('src/index.ts');
+    expect(source).toContain("import { closeAdmissionPool } from './auth/admission-pool'");
+    const poolIdx = source.indexOf('await closeDatabasePools(');
+    expect(poolIdx).toBeGreaterThan(0);
+    expect(source).toContain('admission: closeAdmissionPool');
+    expect(source.indexOf('await httpServerClosed')).toBeLessThan(poolIdx);
   });
 });
 
@@ -89,25 +100,25 @@ describe('shutdown: ordering', () => {
   it('index.ts shuts down services before closing the pool', () => {
     const source = readCode('src/index.ts');
     const servicesIdx = source.indexOf('shutdownServices');
-    const poolIdx = source.indexOf('closePool()');
+    const poolIdx = source.indexOf('await closeDatabasePools(');
     expect(servicesIdx).toBeLessThan(poolIdx);
   });
 
   it('index.ts closes HTTP/WS before closing the pool', () => {
     const source = readCode('src/index.ts');
     const httpIdx = source.indexOf('httpServer.close');
-    const poolIdx = source.indexOf('closePool()');
+    const poolIdx = source.indexOf('await closeDatabasePools(');
     expect(httpIdx).toBeLessThan(poolIdx);
   });
 });
 
 describe('pool configuration', () => {
   // Was a grep of postgres.ts for the literal `idle_timeout: 30`. #4461 made
-  // both knobs env-derived (`DB_POOL_MAX` / `DB_POOL_IDLE_TIMEOUT_S`, defaults
-  // unchanged), which would have left that grep green-but-meaningless. Assert
-  // on the options postgres-js actually resolved instead — the backend must
-  // keep the pre-#4461 sizing unless someone sets the env vars on it, which
-  // only the Vercel project is expected to do.
+  // both knobs env-derived (`DB_POOL_MAX` / `DB_POOL_IDLE_TIMEOUT_S`), which
+  // would have left that grep green-but-meaningless. Assert on the options
+  // postgres-js actually resolved instead. The backend sets neither env var in
+  // production, so these defaults are its real pool: `max` 5 since the
+  // 2026-09 connection budget (docs/operations/db-connectivity.md), idle 30 s.
   //
   // These overlap `packages/db/src/client/__tests__/postgres.test.ts` on
   // purpose. `packages/db` is not a Vitest project and the only db test CI runs
@@ -134,13 +145,13 @@ describe('pool configuration', () => {
     }
   }
 
-  it('keeps the pre-#4461 pool defaults when the env knobs are unset', async () => {
+  it('uses the connection-budget pool defaults when the env knobs are unset', async () => {
     const { max, idle_timeout: idleTimeout } = await poolOptionsWith({
       DB_POOL_MAX: undefined,
       DB_POOL_IDLE_TIMEOUT_S: undefined,
     });
 
-    expect(max).toBe(10);
+    expect(max).toBe(5);
     expect(idleTimeout).toBe(30);
   });
 
@@ -158,7 +169,7 @@ describe('pool configuration', () => {
     // getClimb issues two sequential statements; a pool of one serialises every
     // front-door render behind a single connection.
     expect((await poolOptionsWith({ DB_POOL_MAX: '1' })).max).toBe(2);
-    expect((await poolOptionsWith({ DB_POOL_MAX: 'abc' })).max).toBe(10);
+    expect((await poolOptionsWith({ DB_POOL_MAX: 'abc' })).max).toBe(5);
   });
 
   it('lets DB_POOL_IDLE_TIMEOUT_S=0 mean "never close an idle connection"', async () => {
@@ -170,7 +181,7 @@ describe('pool configuration', () => {
   it('ships with no statement_timeout startup parameter', async () => {
     // PgBouncer in transaction-pooling mode rejects unknown startup parameters,
     // so enabling this against a pooled URL fails every connection rather than
-    // bounding one query. See docs/db-connectivity.md.
+    // bounding one query. See docs/operations/db-connectivity.md.
     const options = await poolOptionsWith({ DB_STATEMENT_TIMEOUT_MS: undefined });
     expect(options.connection.statement_timeout).toBeUndefined();
   });
@@ -239,13 +250,13 @@ describe('shutdown: stop accepting before the slow teardown', () => {
   it('still awaits the HTTP close before touching the pools', () => {
     const awaitIdx = source.indexOf('await httpServerClosed');
     expect(awaitIdx).toBeGreaterThanOrEqual(0);
-    expect(awaitIdx).toBeLessThan(source.indexOf('await closeReadPool()'));
+    expect(awaitIdx).toBeLessThan(source.indexOf('await closeDatabasePools('));
   });
 
   it('keeps every anchor the ordering assertions depend on', () => {
     // Guards readCode itself: if comment stripping ever ate real code, the
     // indexOf comparisons above would silently compare -1s instead of failing.
-    for (const anchor of ['httpServer.close(', 'wss.close(', 'await httpServerClosed', 'await closeReadPool()']) {
+    for (const anchor of ['httpServer.close(', 'wss.close(', 'await httpServerClosed', 'await closeDatabasePools(']) {
       expect(source).toContain(anchor);
     }
   });

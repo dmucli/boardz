@@ -1,11 +1,16 @@
-/** Automated AI training/search crawlers. Human-triggered unfurlers are separate. */
-export const AI_CRAWLER_TOKENS = [
+/**
+ * Crawlers that collect pages to train AI models. They give nothing back: no
+ * link, no citation, no visit. Blocked at every layer.
+ *
+ * Their search siblings (OAI-SearchBot, Claude-SearchBot, PerplexityBot,
+ * Amzn-SearchBot) were on this list until 2026-11-24 and are now on
+ * CRAWLER_ALLOW_TOKENS: they fetch a page to cite it, with a link, in an AI
+ * answer, which is how the app comparison pages get found. Human-triggered
+ * fetchers (ChatGPT-User and friends) were already allowed.
+ */
+export const AI_TRAINING_CRAWLER_TOKENS = [
   'gptbot',
-  'oai-searchbot',
   'claudebot',
-  'claude-searchbot',
-  'perplexitybot',
-  'amzn-searchbot',
   'amazonbot',
   'bytespider',
   'ccbot',
@@ -51,7 +56,7 @@ export const COST_BLOCKED_CRAWLER_TOKENS = [
  * and the origin fallback in `middleware.ts` — so a token can never be blocked
  * at one layer and allowed at another.
  */
-export const BLOCKED_CRAWLER_TOKENS = [...AI_CRAWLER_TOKENS, ...COST_BLOCKED_CRAWLER_TOKENS] as const;
+export const BLOCKED_CRAWLER_TOKENS = [...AI_TRAINING_CRAWLER_TOKENS, ...COST_BLOCKED_CRAWLER_TOKENS] as const;
 
 /**
  * Search engines, share unfurlers and the operational agents we depend on.
@@ -147,6 +152,12 @@ export const CRAWLER_ALLOW_TOKENS = [
   // the Arduino HTTPClient default UA, `ESP32HTTPClient`, which carries the
   // `httpclient` signature. Flashed devices cannot be patched from here.
   'esp32httpclient',
+  // LZRvision, a laser projector that lights Boardsesh climbs on a spray wall
+  // (docs/boards/wall-devices.md). Its Python client opens the ws /graphql socket, and
+  // the upgrade is a GET, so the `python` signature refused it before the
+  // backend saw its controller key: `Python/3.12 websockets/13.1` got a 403
+  // from Cloudflare on 2026-11-03, where the same handshake with no UA got 101.
+  'lzrvision-projector',
   // A person asked an assistant to open this page. These are fetches on a
   // human's behalf, not crawls, and the origin has let them through since the
   // AI-crawler block (see middleware.test.ts). ChatGPT-User carries
@@ -154,6 +165,16 @@ export const CRAWLER_ALLOW_TOKENS = [
   'chatgpt-user',
   'claude-user',
   'perplexity-user',
+  // AI search crawlers, moved off the block list on 2026-11-24 (owner
+  // decision). They index pages so an AI answer can cite them with a link back:
+  // the same trade a search engine makes. Their training siblings stay blocked
+  // (AI_TRAINING_CRAWLER_TOKENS). Each carries the `bot` signature, so without
+  // an entry the default-deny would still refuse them. None contains a blocked
+  // token as a substring (`claude-searchbot` is not `claudebot`).
+  'oai-searchbot',
+  'claude-searchbot',
+  'perplexitybot',
+  'amzn-searchbot',
   // Not an agent: Cubot is an Android phone brand, and its model string
   // (`CUBOT P50`) lands in real browser and Dalvik UAs. Without this, the
   // `bot` signature would block climbers on those phones.
@@ -196,6 +217,17 @@ export const AUTOMATION_SIGNATURE_TOKENS = [
 ] as const;
 
 /**
+ * The locale segments www serves pages under. Spelled out so this file keeps no
+ * imports, because the Cloudflare apply script loads it directly. A test pins
+ * the list to SUPPORTED_LOCALES.
+ */
+export const LOCALE_PATH_SEGMENTS = ['es', 'fr', 'de', 'it', 'zh-CN'] as const;
+
+function withLocaleForms(paths: readonly string[]): string[] {
+  return paths.flatMap((path) => [path, ...LOCALE_PATH_SEGMENTS.map((localeSegment) => `/${localeSegment}${path}`)]);
+}
+
+/**
  * Paths the default-deny never touches, whatever the UA says.
  *
  * - Health endpoints are polled by our own CI with bare curl
@@ -208,12 +240,32 @@ export const AUTOMATION_SIGNATURE_TOKENS = [
  * - `/.well-known/` holds the app-site-association files the OS fetches. The
  *   fetchers are allow-listed too, but a renamed Apple or Google agent must not
  *   be able to break deep links.
- * - `/api/v1/` (www public read API) and `/v1/partner/` (ws partner API) are
- *   programmatic surfaces: a script or a partner server calling them is the
- *   intended client, and will often send python-requests or Go-http-client.
+ * - `/api/v1/` (www public read API), `/v1/` (partner API) and
+ *   `/api/auth/oauth2/` (OAuth authorize, token and revoke) are programmatic
+ *   surfaces: a script or a partner server calling them is the intended client,
+ *   and will often send python-requests or Go-http-client.
+ * - `/oauth/`, `/developers` (the overview page and everything under it) and
+ *   `/auth/login` are the pages a partner's coding agent or browser test opens
+ *   to connect an app. Those arrive as curl, python-requests or `HeadlessChrome`.
+ *   The default-deny exists for crawl cost, and a sign-in or consent page is not
+ *   where that cost is. www serves these pages under each locale prefix too, so
+ *   they are exempt in every locale form.
  */
-export const AUTOMATION_DEFAULT_DENY_EXEMPT_PATHS = ['/health', '/health/db', '/api/health', '/robots.txt'] as const;
-export const AUTOMATION_DEFAULT_DENY_EXEMPT_PATH_PREFIXES = ['/.well-known/', '/api/v1/', '/v1/partner/'] as const;
+export const AUTOMATION_DEFAULT_DENY_EXEMPT_PATHS: readonly string[] = [
+  '/health',
+  '/health/db',
+  '/api/health',
+  '/robots.txt',
+  '/llms.txt',
+  ...withLocaleForms(['/developers']),
+];
+export const AUTOMATION_DEFAULT_DENY_EXEMPT_PATH_PREFIXES: readonly string[] = [
+  '/.well-known/',
+  '/api/v1/',
+  '/v1/',
+  '/api/auth/oauth2/',
+  ...withLocaleForms(['/oauth/', '/developers/', '/auth/login']),
+];
 
 function includesAny(normalizedUserAgent: string, tokens: readonly string[]): boolean {
   return tokens.some((token) => normalizedUserAgent.includes(token));
@@ -221,7 +273,7 @@ function includesAny(normalizedUserAgent: string, tokens: readonly string[]): bo
 
 function isDefaultDenyExemptPath(pathname: string): boolean {
   return (
-    (AUTOMATION_DEFAULT_DENY_EXEMPT_PATHS as readonly string[]).includes(pathname) ||
+    AUTOMATION_DEFAULT_DENY_EXEMPT_PATHS.includes(pathname) ||
     AUTOMATION_DEFAULT_DENY_EXEMPT_PATH_PREFIXES.some((prefix) => pathname.startsWith(prefix))
   );
 }

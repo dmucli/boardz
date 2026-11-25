@@ -27,6 +27,25 @@
 //     one is moved into place.
 
 import { Directory, File, Paths } from 'expo-file-system';
+import { sprayPrivacyGeneration } from './spray-privacy-generation';
+
+let storeGeneration = 0;
+/**
+ * Moves whenever this store deletes a photo. Readers that remember "this key is
+ * on disk" (`spray-photo-cache.ts`) fold it into their memo key, so nothing this
+ * store reclaims is handed out from a memo afterwards. A write never moves it:
+ * a memo only remembers files that exist.
+ */
+let deleteEpoch = 0;
+
+/** See `deleteEpoch`. */
+export function sprayPhotoStoreEpoch(): number {
+  return deleteEpoch;
+}
+const keyGenerations = new Map<string, number>();
+function writeGeneration(photoKey: string, layoutId?: number): string {
+  return `${sprayPrivacyGeneration(layoutId)}-${storeGeneration}-${keyGenerations.get(photoKey) ?? 0}`;
+}
 
 /** Directory under `Paths.document` holding one file per mirrored wall photo. */
 export const SPRAY_PHOTO_STORE_DIR_NAME = 'spray-wall-photos';
@@ -64,8 +83,8 @@ function storeFile(photoKey: string): File {
   return new File(storeDirectory(), sprayPhotoStoreFileName(photoKey));
 }
 
-function partialFile(photoKey: string): File {
-  return new File(storeDirectory(), `${sprayPhotoStoreFileName(photoKey)}.part`);
+function partialFile(photoKey: string, generation?: string): File {
+  return new File(storeDirectory(), `${sprayPhotoStoreFileName(photoKey)}${generation ? `-${generation}` : ''}.part`);
 }
 
 function deleteQuietly(file: File): void {
@@ -109,7 +128,8 @@ export function tryGetStoredSprayPhotoPathSync(photoKey: string | null | undefin
  * Joining the in-flight promise makes the second caller wait for the first
  * rather than fight it, which is also what it wanted: the same bytes.
  */
-const downloadsInFlight = new Map<string, Promise<string | null>>();
+type PhotoDownload = { photoKey: string; promise: Promise<string | null> };
+const downloadsInFlight = new Map<string, PhotoDownload>();
 
 /**
  * Download a wall photo into the durable store, unless it is already there.
@@ -123,7 +143,18 @@ const downloadsInFlight = new Map<string, Promise<string | null>>();
  * reset fetches exactly one new file. Concurrent calls for one key share a
  * single download — see `downloadsInFlight`.
  */
-export function storeSprayPhoto(photoKey: string, photoUrl: string): Promise<string | null> {
+export function storeSprayPhoto(
+  photoKey: string,
+  photoUrl: string,
+  layoutId?: number,
+  // The renderer's cached copy of the same object, when the climber opened the
+  // wall before downloading it (`findCachedSprayPhotoForObjectKey`). The key is
+  // the identity, so those bytes ARE this photo: copying them saves the
+  // download. A copy that fails falls back to the URL.
+  cachedCopyPath?: string | null,
+): Promise<string | null> {
+  const generation = writeGeneration(photoKey, layoutId);
+  const downloadKey = `${generation}:${photoKey}`;
   const existing = tryGetStoredSprayPhotoPathSync(photoKey);
   if (existing) return Promise.resolve(existing);
 
@@ -135,33 +166,65 @@ export function storeSprayPhoto(photoKey: string, photoUrl: string): Promise<str
   // there is no legitimate payload this rejects.
   if (!photoUrl.startsWith('https://')) return Promise.resolve(null);
 
-  const inFlight = downloadsInFlight.get(photoKey);
+  const inFlight = downloadsInFlight.get(downloadKey);
   // The URL is deliberately not compared: two signatures over the same key are
   // the same picture, and the newer caller wants the bytes, not its own request.
-  if (inFlight) return inFlight;
+  if (inFlight) return inFlight.promise;
 
-  const download = downloadSprayPhoto(photoKey, photoUrl).finally(() => {
-    downloadsInFlight.delete(photoKey);
+  const download = downloadSprayPhoto(photoKey, photoUrl, generation, layoutId, cachedCopyPath).finally(() => {
+    if (downloadsInFlight.get(downloadKey)?.promise === download) downloadsInFlight.delete(downloadKey);
   });
-  downloadsInFlight.set(photoKey, download);
+  downloadsInFlight.set(downloadKey, { photoKey, promise: download });
   return download;
 }
 
-async function downloadSprayPhoto(photoKey: string, photoUrl: string): Promise<string | null> {
+/**
+ * Copy the renderer's cached file into `partial`. `false` on any failure — a
+ * cache file the sweeper or the OS took between the lookup and the copy is the
+ * likely one — after removing whatever the copy left, so the caller can download.
+ */
+async function copyCachedPhoto(cachedCopyPath: string, partial: File): Promise<boolean> {
+  try {
+    await new File(`file://${cachedCopyPath}`).copy(partial);
+    return partial.exists;
+  } catch {
+    deleteQuietly(partial);
+    return false;
+  }
+}
+
+async function downloadSprayPhoto(
+  photoKey: string,
+  photoUrl: string,
+  generation: string,
+  layoutId?: number,
+  cachedCopyPath?: string | null,
+): Promise<string | null> {
   const destination = storeFile(photoKey);
-  const partial = partialFile(photoKey);
+  const partial = partialFile(photoKey, generation);
   try {
     storeDirectory().create({ intermediates: true, idempotent: true });
     // Leftovers from a download this process did not finish: a `.part` was never
     // complete, and there is no destination (the check above said so).
     deleteQuietly(partial);
 
-    const downloaded = await File.downloadFileAsync(photoUrl, partial, { idempotent: true });
+    const copied = cachedCopyPath ? await copyCachedPhoto(cachedCopyPath, partial) : false;
+    const downloaded = copied ? partial : await File.downloadFileAsync(photoUrl, partial, { idempotent: true });
+    // A teardown may have deleted .part while native I/O was still streaming.
+    // Its generation has moved, so the body is discarded; a replacement stages
+    // under its own generation-named .part and never shares this one.
+    if (generation !== writeGeneration(photoKey, layoutId)) {
+      deleteQuietly(partial);
+      return null;
+    }
     downloaded.moveSync(destination);
     return destination.uri.replace(/^file:\/\//, '');
   } catch {
     deleteQuietly(partial);
-    deleteQuietly(destination);
+    if (generation === writeGeneration(photoKey, layoutId)) {
+      deleteEpoch += 1;
+      deleteQuietly(destination);
+    }
     return null;
   }
 }
@@ -180,8 +243,28 @@ async function downloadSprayPhoto(photoKey: string, photoUrl: string): Promise<s
  */
 export function deleteStoredSprayPhoto(photoKey: string | null | undefined): void {
   if (!photoKey) return;
+  // Keep the revoked epoch until sign-out advances storeGeneration. Removing it
+  // here would reset the effective epoch to zero and admit an old completion.
+  keyGenerations.set(photoKey, (keyGenerations.get(photoKey) ?? 0) + 1);
+  deleteEpoch += 1;
   deleteQuietly(storeFile(photoKey));
   deleteQuietly(partialFile(photoKey));
+  try {
+    const directory = storeDirectory();
+    if (!directory.exists) return;
+    const name = sprayPhotoStoreFileName(photoKey);
+    for (const entry of directory.list()) {
+      if (entry.name.startsWith(`${name}-`) && entry.name.endsWith('.part')) {
+        try {
+          entry.delete();
+        } catch {
+          /* A completing download retries removal. */
+        }
+      }
+    }
+  } catch {
+    /* Best effort, like the final file removal. */
+  }
 }
 
 /**
@@ -207,6 +290,14 @@ export function pruneStoredSprayPhotos(liveKeys: Iterable<string>): number {
   for (const key of liveKeys) keepNames.add(sprayPhotoStoreFileName(key));
   if (keepNames.size === 0) return 0;
 
+  // A download still streaming for a key no wall names any more must not move
+  // its body into place after this walk has reclaimed the key.
+  for (const { photoKey } of downloadsInFlight.values()) {
+    if (!keepNames.has(sprayPhotoStoreFileName(photoKey))) {
+      keyGenerations.set(photoKey, (keyGenerations.get(photoKey) ?? 0) + 1);
+    }
+  }
+
   let deleted = 0;
   try {
     const directory = storeDirectory();
@@ -219,8 +310,14 @@ export function pruneStoredSprayPhotos(liveKeys: Iterable<string>): number {
       const keyName = isPartial ? name.slice(0, -'.part'.length) : name;
       if (!isPartial && keepNames.has(keyName)) continue;
       // A `.part` for a live key is a download that may be in flight right now.
-      if (isPartial && keepNames.has(keyName)) continue;
+      if (isPartial) {
+        // writeGeneration appends nonce + four counters. Parse that suffix once
+        // so a directory walk never scans every live key for every partial.
+        const generatedKeyName = /^(.*)-[a-z0-9]+-\d+-\d+-\d+-\d+$/.exec(keyName)?.[1];
+        if (keepNames.has(keyName) || (generatedKeyName != null && keepNames.has(generatedKeyName))) continue;
+      }
       try {
+        deleteEpoch += 1;
         entry.delete();
         deleted += 1;
       } catch {
@@ -242,6 +339,9 @@ export function pruneStoredSprayPhotos(liveKeys: Iterable<string>): number {
  * account — and it would still be there after the rows that name it are gone.
  */
 export function clearStoredSprayPhotos(): void {
+  storeGeneration += 1;
+  deleteEpoch += 1;
+  keyGenerations.clear();
   try {
     const directory = storeDirectory();
     if (directory.exists) directory.delete();

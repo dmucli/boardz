@@ -1,11 +1,13 @@
 import { describe, it, expect } from 'vitest';
 import {
   blePlxErrorCodes,
+  BleWriteDisconnectedError,
   classifyBleFailure,
   classifyBleFailureReason,
   isBleWriteRecoveryFailedError,
   isBleWriteTimeoutError,
   isDisconnectionError,
+  isRetryableAndroidConnectError,
   type BleFailureCategory,
   type BleSendFailureReason,
 } from '../connection-error';
@@ -28,17 +30,21 @@ function bleError(message: string): Error {
 function bleErrorWithCode(
   errorCode: number,
   message: string,
-  extra?: { androidErrorCode?: number; iosErrorCode?: number },
+  extra?: { androidErrorCode?: number | null; iosErrorCode?: number | null; attErrorCode?: number | null },
 ): Error {
   const error = new Error(message) as Error & {
     errorCode: number;
-    androidErrorCode?: number;
-    iosErrorCode?: number;
+    androidErrorCode: number | null;
+    iosErrorCode: number | null;
+    attErrorCode: number | null;
   };
   error.name = 'BleError';
   error.errorCode = errorCode;
-  if (extra?.androidErrorCode !== undefined) error.androidErrorCode = extra.androidErrorCode;
-  if (extra?.iosErrorCode !== undefined) error.iosErrorCode = extra.iosErrorCode;
+  // This is the real ble-plx runtime shape: both properties exist and the
+  // inactive/omitted platform code is null (never an absent property).
+  error.androidErrorCode = extra?.androidErrorCode ?? null;
+  error.iosErrorCode = extra?.iosErrorCode ?? null;
+  error.attErrorCode = extra?.attErrorCode ?? null;
   return error;
 }
 
@@ -49,6 +55,81 @@ describe('classifyBleFailure', () => {
       name: 'DOMException NotFoundError',
       error: new DOMException('No device chosen', 'NotFoundError'),
       expected: 'user_cancelled',
+    },
+    {
+      name: 'Chromium chooser dismissal',
+      error: new DOMException('User cancelled the requestDevice() chooser.', 'NotFoundError'),
+      expected: 'user_cancelled',
+    },
+    {
+      name: 'Brave Web Bluetooth globally disabled',
+      error: new DOMException('Web Bluetooth API globally disabled.', 'NotFoundError'),
+      expected: 'permission_denied',
+    },
+    {
+      name: 'Web Bluetooth disabled by browser policy',
+      error: new DOMException('User or their enterprise policy has disabled Web Bluetooth.', 'NotFoundError'),
+      expected: 'permission_denied',
+    },
+    {
+      name: 'browser denied scan permission',
+      error: new DOMException('User denied the browser permission to scan for Bluetooth devices.', 'NotFoundError'),
+      expected: 'permission_denied',
+    },
+    {
+      name: 'Bluetooth permission blocked',
+      error: new DOMException('Bluetooth permission has been blocked.', 'NotFoundError'),
+      expected: 'permission_denied',
+    },
+    {
+      name: 'browser security restriction',
+      error: new DOMException('Access to the feature bluetooth is disallowed by permissions policy.', 'SecurityError'),
+      expected: 'permission_denied',
+    },
+    {
+      name: 'browser permission denial',
+      error: new DOMException('Permission denied.', 'NotAllowedError'),
+      expected: 'permission_denied',
+    },
+    {
+      name: 'chooser requires a user gesture, not a settings change',
+      error: new DOMException('Must be handling a user gesture to show a permission request.', 'SecurityError'),
+      expected: 'unknown',
+    },
+    {
+      name: 'GATT authorization failure, not a browser settings denial',
+      error: new DOMException('GATT operation not authorized.', 'SecurityError'),
+      expected: 'connect_failed',
+    },
+    {
+      name: 'unknown NotFoundError',
+      error: new DOMException('An unexpected lookup failed.', 'NotFoundError'),
+      expected: 'unknown',
+    },
+    {
+      name: 'NotFoundError for a missing adapter',
+      error: new DOMException('Bluetooth adapter not available.', 'NotFoundError'),
+      expected: 'unavailable',
+    },
+    {
+      name: 'NotFoundError for an unsupported platform',
+      error: new DOMException('Web Bluetooth is not supported on this platform.', 'NotFoundError'),
+      expected: 'unavailable',
+    },
+    {
+      name: 'NotFoundError for a missing service',
+      error: new DOMException('UART service was not found.', 'NotFoundError'),
+      expected: 'service_missing',
+    },
+    {
+      name: 'Chromium service UUID lookup failure',
+      error: new DOMException('No Services matching UUID 1234 found in Device.', 'NotFoundError'),
+      expected: 'service_missing',
+    },
+    {
+      name: 'Chromium characteristic UUID lookup failure',
+      error: new DOMException('No Characteristics matching UUID 1234 found in Service 5678.', 'NotFoundError'),
+      expected: 'service_missing',
     },
     {
       name: 'Device selection cancelled (capacitor picker)',
@@ -412,6 +493,41 @@ describe('classifyBleFailure — ble-plx BleErrorCode (#3608)', () => {
 });
 
 describe('blePlxErrorCodes (#3608)', () => {
+  it('keeps ATT authentication status separate from a native link authentication failure', () => {
+    expect(blePlxErrorCodes(bleErrorWithCode(401, 'write failed', { attErrorCode: 5 }))).toEqual({
+      bleErrorCode: 401,
+      attErrorCode: 5,
+    });
+    expect(blePlxErrorCodes(bleErrorWithCode(201, 'link dropped', { androidErrorCode: 5 }))).toEqual({
+      bleErrorCode: 201,
+      androidErrorCode: 5,
+    });
+  });
+
+  it('preserves numeric diagnostics on a dead-link write without native identifiers or cause text', () => {
+    const original = bleErrorWithCode(401, 'write failed for device private-peripheral-id', { attErrorCode: 5 });
+    const wrapped = new BleWriteDisconnectedError(original);
+
+    expect(isDisconnectionError(wrapped)).toBe(true);
+    expect(classifyBleFailureReason(wrapped)).toBe('disconnected');
+    expect(blePlxErrorCodes(wrapped)).toEqual({ bleErrorCode: 401, attErrorCode: 5 });
+    expect(JSON.stringify(wrapped)).not.toContain('private-peripheral-id');
+    expect(wrapped).not.toHaveProperty('cause');
+    expect(blePlxErrorCodes(new BleWriteDisconnectedError(new Error('unrelated error')))).toEqual({});
+  });
+
+  it('omits non-finite native codes', () => {
+    expect(
+      blePlxErrorCodes(
+        bleErrorWithCode(Number.NaN, 'invalid codes', {
+          androidErrorCode: Number.POSITIVE_INFINITY,
+          iosErrorCode: Number.NEGATIVE_INFINITY,
+          attErrorCode: Number.NaN,
+        }),
+      ),
+    ).toEqual({});
+  });
+
   it('extracts the ble-plx code and the low-level Android GATT status', () => {
     const error = bleErrorWithCode(201, 'Device 5C:F8 was disconnected', { androidErrorCode: 133 });
     expect(blePlxErrorCodes(error)).toEqual({ bleErrorCode: 201, androidErrorCode: 133 });
@@ -437,5 +553,105 @@ describe('blePlxErrorCodes (#3608)', () => {
     cbError.name = 'CBError';
     cbError.errorCode = 7;
     expect(blePlxErrorCodes(cbError)).toEqual({});
+  });
+});
+
+describe('isRetryableAndroidConnectError (#4143)', () => {
+  it.each([200, 201, 205])('allows ble-plx connect code %i with its canonical null Android status', (errorCode) => {
+    expect(isRetryableAndroidConnectError(bleErrorWithCode(errorCode, 'connect failed'))).toBe(true);
+  });
+
+  it.each([200, 201, 205])(
+    'denies explicit user cancellation for connect code %i with null or absent platform fields',
+    (errorCode) => {
+      for (const message of [
+        'Device selection cancelled',
+        'The user cancelled the request',
+        'The user canceled the request',
+      ]) {
+        expect(isRetryableAndroidConnectError(bleErrorWithCode(errorCode, message))).toBe(false);
+
+        const absentPlatformFields = bleErrorWithCode(errorCode, message) as Error & {
+          androidErrorCode?: number | null;
+          iosErrorCode?: number | null;
+        };
+        delete absentPlatformFields.androidErrorCode;
+        delete absentPlatformFields.iosErrorCode;
+        expect(isRetryableAndroidConnectError(absentPlatformFields)).toBe(false);
+      }
+    },
+  );
+
+  it.each(['Operation was cancelled', 'Connection cancelled by peer'])(
+    'does not mistake the technical failure "%s" for a picker dismissal',
+    (message) => {
+      expect(isRetryableAndroidConnectError(bleErrorWithCode(201, message))).toBe(true);
+    },
+  );
+
+  it('also allows an older structural BleError shape which omitted the Android field entirely', () => {
+    const error = bleErrorWithCode(201, 'connect failed') as Error & { androidErrorCode?: number | null };
+    delete error.androidErrorCode;
+    expect(isRetryableAndroidConnectError(error)).toBe(true);
+  });
+
+  it.each([200, 201, 205])('allows ble-plx connect code %i with Android GATT status 133 or 147', (errorCode) => {
+    expect(
+      isRetryableAndroidConnectError(bleErrorWithCode(errorCode, 'connect failed', { androidErrorCode: 133 })),
+    ).toBe(true);
+    expect(
+      isRetryableAndroidConnectError(bleErrorWithCode(errorCode, 'connect failed', { androidErrorCode: 147 })),
+    ).toBe(true);
+  });
+
+  it.each([0, 2, 3, 100, 101, 102, 204, 206, 300, 302, 400, 404])(
+    'denies non-connect or terminal ble-plx code %i',
+    (errorCode) => {
+      expect(isRetryableAndroidConnectError(bleErrorWithCode(errorCode, 'opaque'))).toBe(false);
+      // An allowlisted low-level status cannot turn a non-allowlisted outer
+      // operation into a connect retry.
+      expect(isRetryableAndroidConnectError(bleErrorWithCode(errorCode, 'opaque', { androidErrorCode: 133 }))).toBe(
+        false,
+      );
+    },
+  );
+
+  it.each([0, 1, 8, 19, 22, 62, 257])(
+    'lets a present non-transient Android status %i veto an otherwise allowlisted connect error',
+    (androidErrorCode) => {
+      expect(isRetryableAndroidConnectError(bleErrorWithCode(201, 'disconnected', { androidErrorCode }))).toBe(false);
+    },
+  );
+
+  it('denies a malformed Android status instead of treating it as absent', () => {
+    const error = bleErrorWithCode(201, 'disconnected') as Error & { androidErrorCode: unknown };
+    error.androidErrorCode = '133';
+    expect(isRetryableAndroidConnectError(error)).toBe(false);
+  });
+
+  it('denies a real ble-plx iOS shape even when its outer code is otherwise eligible', () => {
+    expect(isRetryableAndroidConnectError(bleErrorWithCode(201, 'iOS disconnected', { iosErrorCode: 7 }))).toBe(false);
+  });
+
+  it('denies a malformed populated iOS status conservatively', () => {
+    const error = bleErrorWithCode(201, 'iOS disconnected') as Error & { iosErrorCode: unknown };
+    error.iosErrorCode = '7';
+    expect(isRetryableAndroidConnectError(error)).toBe(false);
+  });
+
+  it('requires the real BleError name and numeric outer code', () => {
+    const plainError = new Error('GATT 133') as Error & { errorCode?: unknown; androidErrorCode?: number };
+    plainError.errorCode = 201;
+    plainError.androidErrorCode = 133;
+    expect(isRetryableAndroidConnectError(plainError)).toBe(false);
+
+    plainError.name = 'CBError';
+    expect(isRetryableAndroidConnectError(plainError)).toBe(false);
+
+    plainError.name = 'BleError';
+    plainError.errorCode = '201';
+    expect(isRetryableAndroidConnectError(plainError)).toBe(false);
+    expect(isRetryableAndroidConnectError('GATT 133')).toBe(false);
+    expect(isRetryableAndroidConnectError(null)).toBe(false);
   });
 });

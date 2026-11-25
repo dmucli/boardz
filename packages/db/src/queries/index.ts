@@ -6,6 +6,7 @@ export * from './sync/credential-backoff';
 export * from './sync/credential-fleet-snapshot';
 export * from './sync/weekly-gate';
 export * from './sync/upstream-playlist-owners';
+export * from './sync/deleted-upstream-playlists';
 export * from './sync/claim-credential';
 export * from './sync/provider-sync-control';
 export * from './sync/daemon-lease';
@@ -26,3 +27,8 @@ export * from './util/conflict-guard';
 export * from './spray-walls/index';
 export * from './places/import';
 export * from './background-jobs';
+export * from './spray-walls/import-progress';
+
+export * from './privacy';
+export * from './system-accounts';
+export * from './playlists/index';

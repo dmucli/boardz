@@ -1,24 +1,24 @@
-import { memo, useEffect, useMemo, useRef, type ReactNode } from 'react';
-import { View, Pressable, ScrollView, StyleSheet } from 'react-native';
+import { PressableSurface } from '../PressableSurface';
+import { memo, useCallback, useEffect, useMemo, useRef, type ReactNode } from 'react';
+import { Platform, View, StyleSheet, useWindowDimensions } from 'react-native';
+import { textFontScale } from '../../theme/dynamic-type';
 import type { BoardName } from '@boardsesh/shared-schema';
 import { useTranslation } from 'react-i18next';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
-import { Button } from '../Button';
-import { ButtonSurfaceProvider } from '../Button.surface';
-import { ActionButton, drawerActionBarStyles } from '../drawer-action-bar/DrawerActionBar';
+import { ActionButton, SIZES, drawerActionBarStyles } from '../drawer-action-bar/DrawerActionBar';
+import { BleLightbulbButton } from '../ble/BleLightbulbButton';
+import { useBoardConnectionState } from '../ble/use-board-connection-state';
+import { useBulbDriveTap } from '../queue-control/bar-bulb-tap';
+import { phoneDrivesTheWall } from '../queue-control/bulb-drive-cue';
 import { useTheme } from '../../providers/theme-provider';
-import { hapticSelection } from '../../lib/haptics';
+import { hapticMedium, hapticSelection } from '../../lib/haptics';
 import { useHoldColorOverrides } from '../../lib/hold-color-overrides';
-import { brandColors } from '../../theme/colors';
-import { glassSize } from '../../theme/layout';
 import { spacing, borderRadius } from '../../theme/tokens';
 import { brushRoleColor, getPaintRoles, useBrushRoleLabels, type BrushRole } from './brush-roles';
-import { deriveSaveButtonView } from './save-button-view';
 import { CreateDraftStatusRow, statusRowStyles } from './CreateDraftStatusRow';
 import { useRateLimitedAnnouncer } from './use-rate-limited-announcer';
 import type { DraftStatusView } from './draft-status-view';
-import type { SaveButtonState } from './use-create-climb-screen';
 
 // Looked up dynamically by role below; mark each resolvable key (one per line,
 // namespace-qualified) so the orphan checker keeps them.
@@ -26,6 +26,13 @@ import type { SaveButtonState } from './use-create-climb-screen';
 // i18n-keep climbs.mobile.create.brush.hand
 // i18n-keep climbs.mobile.create.brush.finish
 // i18n-keep climbs.mobile.create.brush.foot
+
+/** The editor's Bluetooth toggle: connect lights the draft, a tap again disconnects. */
+type CreateLightbulb = {
+  connected: boolean;
+  connecting: boolean;
+  onToggle: () => void;
+};
 
 type CreateDrawerActionBarProps = {
   boardName: BoardName;
@@ -47,10 +54,11 @@ type CreateDrawerActionBarProps = {
   currentFrameIndex: number;
   canSetActive: boolean;
   onSetActive: () => void;
-  saveState: SaveButtonState;
-  onSave: () => void;
-  /** True while publishing is selected but the climb has no start or finish hold. */
-  publishBlocked: boolean;
+  /**
+   * The wall's Bluetooth lightbulb. Omitted on a board with no lights to
+   * connect to (a spray wall, #5960), where it could only ever start a connect.
+   */
+  lightbulb?: CreateLightbulb;
   /** The persistent "is my work safe?" line, or null for an empty editor. */
   draftStatus: DraftStatusView | null;
   /** The hold heatmap toggle; omitted → no button. */
@@ -64,17 +72,28 @@ type CreateDrawerActionBarProps = {
    * which always wins.
    */
   heatmapLine?: ReactNode;
+  /**
+   * Why the header's Save is held back right now, when something other than the
+   * climb's own holds holds it (the remix editor's grey rings). It takes the
+   * status line ahead of everything else, so a disabled Save is never mute.
+   */
+  saveBlockedLine?: ReactNode;
 };
 
 /**
  * The create-drawer action bar, built on the shared drawer-action-bar grammar.
  * Row 1 (where the Play Drawer's play controls sit) is the brush chips; row 2 is
- * the editing actions, then set-active and the save state-machine button; under
- * both sits the persistent draft-status line.
+ * the editing tools (undo, redo, clear, heat, set-active, lightbulb), spread
+ * evenly across the row; under both sits the persistent draft-status line.
  *
- * Undo is pinned OUTSIDE the horizontal scroller on the leading edge, the mirror
- * of the trailing pinned pair, so the only recovery from a mis-tap can never
- * scroll out of reach. Redo stays in the scroller.
+ * Save is not here. It is the sheet's confirm, so it sits at the trailing end of
+ * the header (docs/mobile/mobile-sheets-vs-routes.md, "Where actions go"). Without the
+ * pill the row holds at most six 44dp icon buttons: 264dp plus 32dp of side
+ * padding is 296dp, which fits a 320pt screen because the row drops the shared
+ * 8dp gap (5 x 8 more would be 336dp) and lets space-between spread the tools.
+ * So the horizontal scroller that used to
+ * keep Save on screen went with it. The lightbulb moved here from the header,
+ * where it took 44pt from the name field.
  *
  * Frame editing is NOT here. Duplicate and Delete frame moved to the route slot
  * under the board, which labels them in words — an unlabelled `copy` glyph
@@ -95,17 +114,21 @@ export const CreateDrawerActionBar = memo(function CreateDrawerActionBar({
   currentFrameIndex,
   canSetActive,
   onSetActive,
-  saveState,
-  onSave,
-  publishBlocked,
+  lightbulb,
   draftStatus,
   onToggleHeatmap,
   heatmapActive = false,
   heatmapBusy = false,
   heatmapLine = null,
+  saveBlockedLine = null,
 }: CreateDrawerActionBarProps) {
   const { t } = useTranslation('climbs');
-  const { systemColors, brandColors: schemeBrandColors } = useTheme();
+  const { systemColors, brandColors: schemeBrandColors, selection, radii } = useTheme();
+  const { fontScale } = useWindowDimensions();
+  const brushMinWidth =
+    fontScale > 1.3
+      ? Math.max(spacing[4] * 5, spacing[12] * textFontScale('caption1', fontScale, Platform.OS))
+      : spacing[12];
   const roleLabels = useBrushRoleLabels();
   const { overrides: holdColorOverrides } = useHoldColorOverrides();
   // One voice for this whole surface, so a status transition and a frame
@@ -161,12 +184,12 @@ export const CreateDrawerActionBar = memo(function CreateDrawerActionBar({
   };
 
   return (
-    <View style={drawerActionBarStyles.container}>
+    <View style={[drawerActionBarStyles.container, { borderTopColor: systemColors.separator }]}>
       <View style={styles.brushRow}>
         {roleChips.map(({ role, label, color }) => {
           const selected = selectedBrush === role;
           return (
-            <Pressable
+            <PressableSurface
               key={role}
               onPress={() => handleSelect(role)}
               accessibilityRole="button"
@@ -174,38 +197,55 @@ export const CreateDrawerActionBar = memo(function CreateDrawerActionBar({
               accessibilityState={{ selected }}
               style={[
                 styles.chip,
-                { backgroundColor: systemColors.fill },
-                selected && { borderColor: color, borderWidth: 2 },
+                { minWidth: brushMinWidth },
+                { backgroundColor: selected ? selection.fill : systemColors.tertiaryFill, borderRadius: radii.button },
+                selected && { borderColor: selection.checkmark },
               ]}
             >
-              <View style={[styles.swatch, { backgroundColor: color }]} />
-              <Text variant="caption1" style={styles.chipLabel} numberOfLines={1}>
+              <View style={styles.marker} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
+                <View style={[styles.swatch, { backgroundColor: color }]} />
+                {selected ? (
+                  <View style={styles.selectionMark}>
+                    <Icon name="check.small" size={10} color={selection.checkmark} maxFontSizeMultiplier={1} />
+                  </View>
+                ) : null}
+              </View>
+              <Text emphasized variant="caption1" style={styles.brushLabel}>
                 {label}
               </Text>
-            </Pressable>
+            </PressableSurface>
           );
         })}
-        <Pressable
+        <PressableSurface
           onPress={() => handleSelect('OFF')}
           accessibilityRole="button"
           accessibilityLabel={t('mobile.create.brush.erase')}
           accessibilityState={{ selected: selectedBrush === 'OFF' }}
           style={[
             styles.chip,
-            { backgroundColor: systemColors.fill },
-            selectedBrush === 'OFF' && { borderColor: systemColors.label, borderWidth: 2 },
+            { minWidth: brushMinWidth },
+            {
+              backgroundColor: selectedBrush === 'OFF' ? selection.fill : systemColors.tertiaryFill,
+              borderRadius: radii.button,
+            },
+            selectedBrush === 'OFF' && { borderColor: selection.checkmark },
           ]}
         >
-          <Icon name="eraser" size={18} color={systemColors.label} />
-          <Text variant="caption1" style={styles.chipLabel} numberOfLines={1}>
+          <View style={styles.marker} accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
+            <Icon maxFontSizeMultiplier={1} name="eraser" size={16} color={systemColors.label} />
+            {selectedBrush === 'OFF' ? (
+              <View style={styles.selectionMark}>
+                <Icon name="check.small" size={10} color={selection.checkmark} maxFontSizeMultiplier={1} />
+              </View>
+            ) : null}
+          </View>
+          <Text emphasized variant="caption1" style={styles.brushLabel}>
             {t('mobile.create.brush.erase')}
           </Text>
-        </Pressable>
+        </PressableSurface>
       </View>
 
-      <View style={[drawerActionBarStyles.rowSecondary, styles.rowSecondaryWithStatus]}>
-        {/* Pinned outside the scroller: undo has to stay reachable on a
-            multi-frame climb, where the editing cluster is wider than the row. */}
+      <View style={[drawerActionBarStyles.rowSecondary, styles.toolRow]} testID="create-tool-row">
         <ActionButton
           size="sm"
           iconName="undo"
@@ -213,60 +253,44 @@ export const CreateDrawerActionBar = memo(function CreateDrawerActionBar({
           disabled={!canUndo}
           accessibilityLabel={t('mobile.create.actions.undo')}
         />
-
-        {/* RN views don't shrink, so with no wrap and no scroll a crowded row used
-            to push Save clean off the right edge. The scroller takes the row's
-            leftover width in place of the shared `spacer`, so Set Active and Save
-            hold the same position whatever it contains. Kept now that the frame
-            controls have gone: the brush count is board-dependent and the row
-            still has to survive a large Dynamic Type setting. */}
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          keyboardShouldPersistTaps="handled"
-          style={styles.actionScroll}
-          contentContainerStyle={styles.actionScrollContent}
-        >
+        <ActionButton
+          size="sm"
+          iconName="redo"
+          onPress={onRedo}
+          disabled={!canRedo}
+          accessibilityLabel={t('mobile.create.actions.redo')}
+        />
+        {/* Keeps the trash can: now that it empties holds and nothing else, the
+            glyph is honest. An eraser would collide with the Erase BRUSH chip
+            59dp above — one glyph meaning both a mode and a command. */}
+        <ActionButton
+          size="sm"
+          iconName="delete"
+          onPress={onClearHolds}
+          accessibilityLabel={t('mobile.create.actions.clear')}
+        />
+        {/* Where the climbs on this board already go, drawn on the holds not
+            yet painted. */}
+        {onToggleHeatmap ? (
           <ActionButton
             size="sm"
-            iconName="redo"
-            onPress={onRedo}
-            disabled={!canRedo}
-            accessibilityLabel={t('mobile.create.actions.redo')}
+            iconName={heatmapActive ? 'flame.fill' : 'flame'}
+            onPress={onToggleHeatmap}
+            active={heatmapActive}
+            activeColor={schemeBrandColors.primary}
+            busy={heatmapActive && heatmapBusy}
+            checked={heatmapActive}
+            accessibilityLabel={t('mobile.heatmap.toggle')}
+            // The heat follows the brush, so the brush is what it is showing.
+            accessibilityValueText={
+              heatmapActive
+                ? selectedBrush === 'OFF'
+                  ? t('mobile.create.brush.erase')
+                  : roleLabels[selectedBrush]
+                : undefined
+            }
           />
-          {/* Keeps the trash can: now that it empties holds and nothing else, the
-              glyph is honest. An eraser would collide with the Erase BRUSH chip
-              59dp above — one glyph meaning both a mode and a command. */}
-          <ActionButton
-            size="sm"
-            iconName="delete"
-            onPress={onClearHolds}
-            accessibilityLabel={t('mobile.create.actions.clear')}
-          />
-          {/* Where the climbs on this board already go, drawn on the holds not
-              yet painted. */}
-          {onToggleHeatmap ? (
-            <ActionButton
-              size="sm"
-              iconName={heatmapActive ? 'flame.fill' : 'flame'}
-              onPress={onToggleHeatmap}
-              active={heatmapActive}
-              activeColor={schemeBrandColors.primary}
-              busy={heatmapActive && heatmapBusy}
-              checked={heatmapActive}
-              accessibilityLabel={t('mobile.heatmap.toggle')}
-              // The heat follows the brush, so the brush is what it is showing.
-              accessibilityValueText={
-                heatmapActive
-                  ? selectedBrush === 'OFF'
-                    ? t('mobile.create.brush.erase')
-                    : roleLabels[selectedBrush]
-                  : undefined
-              }
-            />
-          ) : null}
-        </ScrollView>
-
+        ) : null}
         {/* Not a play glyph: this pushes the climb into the queue, which lights
             it on a connected wall. The transport above the brush row is what
             plays the route. `flash` is the flashed-ascent glyph elsewhere and
@@ -279,16 +303,23 @@ export const CreateDrawerActionBar = memo(function CreateDrawerActionBar({
           accessibilityLabel={t('mobile.create.actions.setActive')}
           accessibilityHint={canSetActive ? undefined : t('mobile.create.actions.setActiveHint')}
         />
-        <SaveButton saveState={saveState} onSave={onSave} publishBlocked={publishBlocked} />
+        {/* Last, beside Set Active: both are about the wall. A stateful toggle
+            climbers reach for often, so a tool here rather than a ••• row. */}
+        {lightbulb ? <CreateBoardLightbulb lightbulb={lightbulb} /> : null}
       </View>
 
       {/* Always rendered, even with nothing to say — see CreateDraftStatusRow.
           While the heat is on its line takes the same box, unless the draft has
-          something urgent to say. */}
-      {heatmapLine && draftStatus?.tone !== 'error' && draftStatus?.tone !== 'warning' ? (
+          something urgent to say. "What a publish still needs" is not urgent
+          (`yieldsToHeatmap`): it is up for most of an ordinary spray session,
+          and it is still announced from the offscreen row below. */}
+      {saveBlockedLine || (heatmapLine && !statusOutranksHeatmap(draftStatus)) ? (
         <>
-          <View style={statusRowStyles.row} testID="create-heatmap-line">
-            {heatmapLine}
+          <View
+            style={statusRowStyles.row}
+            testID={saveBlockedLine ? 'create-save-blocked-line' : 'create-heatmap-line'}
+          >
+            {saveBlockedLine ?? heatmapLine}
           </View>
           {/* Still mounted, out of sight and out of the layout, so autosave
               transitions keep being announced while the heat line has the slot. */}
@@ -307,52 +338,66 @@ export const CreateDrawerActionBar = memo(function CreateDrawerActionBar({
   );
 });
 
-function SaveButton({
-  saveState,
-  onSave,
-  publishBlocked,
-}: {
-  saveState: SaveButtonState;
-  onSave: () => void;
-  publishBlocked: boolean;
-}) {
-  const { t } = useTranslation('climbs');
-  const view = deriveSaveButtonView(saveState, t);
-
+/**
+ * The editor's lightbulb. While this phone drives the wall (a timed drive left
+ * running, or Always drive the wall's) a tap stops driving and keeps the link,
+ * as every bulb does (owner, 2026-11-03; `useBulbDriveTap`), and the bulb says
+ * "Stop driving". With no drive it connects or hangs up, as before.
+ */
+function CreateBoardLightbulb({ lightbulb }: { lightbulb: CreateLightbulb }) {
+  const { t: tSettings } = useTranslation('settings');
+  const { t: tCommon } = useTranslation('common');
+  const { inAppBoardConnection, localConnected, ledless } = useBoardConnectionState();
+  const { driving, takeTap } = useBulbDriveTap({
+    drivesTheWall: phoneDrivesTheWall({ inAppBoardConnection, localConnected, ledless }),
+    linked: localConnected,
+    control: 'create_climb',
+  });
+  const { onToggle } = lightbulb;
+  const handlePress = useCallback(() => {
+    // A stop buzzes light on its own; a dropped tap (just after a stop) does nothing.
+    if (takeTap()) return;
+    hapticMedium();
+    onToggle();
+  }, [takeTap, onToggle]);
+  let accessibilityLabel = lightbulb.connected ? tCommon('lightControl.disconnect') : tSettings('ble.connectBoard');
+  if (driving) accessibilityLabel = tSettings('ble.barControl.stopDrivingLabel');
   return (
-    <ButtonSurfaceProvider surface="content">
-      <Button
-        title={view.title}
-        icon={view.icon ?? undefined}
-        variant="filled"
-        size="small"
-        // The only sub-44 control on this surface (Compose sizes a small filled
-        // button at 40), shoulder to shoulder with 44dp icon buttons. Floor it.
-        minHeight={glassSize.inline}
-        // Success keeps the static green fill (white-legible in both schemes; the
-        // lifted dark success tint would fail white-on-fill). For the default tint
-        // we pass nothing so the filled Button uses its own scheme-aware
-        // `primaryFill` (lifts to #7C3AED in dark), matching every other CTA.
-        tintColor={view.tint === 'success' ? brandColors.success : undefined}
-        // A blocked publish disables the button; the status line directly below
-        // names the missing requirement, so it is never mute.
-        disabled={view.disabled || publishBlocked}
-        onPress={onSave}
-      />
-    </ButtonSurfaceProvider>
+    <BleLightbulbButton
+      isConnected={lightbulb.connected}
+      isScanning={lightbulb.connecting}
+      onPress={handlePress}
+      accessibilityLabel={accessibilityLabel}
+      accessibilityTapHint={driving ? tSettings('ble.barControl.stopDrivingHint') : undefined}
+      scanningAccessibilityHint={tSettings('ble.scanning')}
+      writingAccessibilityHint={tSettings('ble.writing')}
+      haptic="none"
+      size={SIZES.sm.icon}
+      containerSize={SIZES.sm.dim}
+    />
   );
+}
+
+/** A failed save or "nothing is being stored" beats the heat line; a publish hint does not. */
+function statusOutranksHeatmap(status: DraftStatusView | null): boolean {
+  if (status === null) return false;
+  if (status.tone === 'muted') return false;
+  return status.yieldsToHeatmap !== true;
 }
 
 const styles = StyleSheet.create({
   brushRow: {
     flexDirection: 'row',
     alignItems: 'stretch',
+    flexWrap: 'wrap',
     paddingHorizontal: spacing[4],
     paddingTop: spacing[3],
     gap: spacing[2],
   },
   chip: {
     flex: 1,
+    minWidth: spacing[12],
+    minHeight: spacing[12],
     alignItems: 'center',
     justifyContent: 'center',
     gap: spacing[1],
@@ -362,17 +407,18 @@ const styles = StyleSheet.create({
     borderColor: 'transparent',
     borderWidth: 2,
   },
-  swatch: {
-    width: 18,
-    height: 18,
-    borderRadius: 9,
-  },
-  chipLabel: {
-    fontWeight: '600',
-  },
-  // The status row carries the bar's bottom padding, so the line sits 4dp under
-  // the Save pill rather than a full gap below it.
-  rowSecondaryWithStatus: {
+  marker: { width: 32, height: spacing[4], alignItems: 'center', justifyContent: 'center' },
+  selectionMark: { position: 'absolute', end: -spacing[1], top: 0 },
+  brushLabel: { textAlign: 'center' },
+  swatch: { width: spacing[4], height: spacing[4], borderRadius: borderRadius.full },
+  // Up to six tools spread across the width. `gap: 0` overrides rowSecondary's
+  // 8dp: with it, six tools need 336dp and the last one clips at 320pt.
+  // space-between does the spacing instead. The status row carries the bar's
+  // bottom padding, so the line sits 4dp under the tools rather than a full gap
+  // below them.
+  toolRow: {
+    gap: 0,
+    justifyContent: 'space-between',
     paddingBottom: spacing[1],
   },
   offscreenStatus: {
@@ -380,14 +426,5 @@ const styles = StyleSheet.create({
     height: 0,
     overflow: 'hidden',
     opacity: 0,
-  },
-  actionScroll: {
-    // Claims the row's leftover width so the trailing Set Active + Save pair is
-    // pinned; anything that doesn't fit scrolls inside here, not off-screen.
-    flex: 1,
-  },
-  actionScrollContent: {
-    alignItems: 'center',
-    gap: spacing[2],
   },
 });

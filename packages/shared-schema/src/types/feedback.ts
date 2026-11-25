@@ -1,3 +1,5 @@
+import type { ReleaseContext, ReleaseContextInput } from './release-context';
+
 export type AppFeedbackPlatform = 'ios' | 'android' | 'web';
 export type AppFeedbackSource = 'prompt' | 'drawer-feedback' | 'shake-bug' | 'drawer-bug';
 /**
@@ -23,6 +25,7 @@ export type FeedbackContextInput = {
 };
 
 export type SubmitAppFeedbackInput = {
+  releaseContext?: ReleaseContextInput | null;
   rating?: number | null;
   comment?: string | null;
   platform: AppFeedbackPlatform;
@@ -85,6 +88,7 @@ export type AppFeedbackContext = {
 
 /** A feedback row enriched for the admin dashboard. */
 export type AppFeedbackReport = {
+  releaseContext?: ReleaseContext | null;
   id: string;
   source: AppFeedbackSource;
   rating?: number | null;
@@ -96,6 +100,9 @@ export type AppFeedbackReport = {
   contactConsent?: boolean | null;
   createdAt: string;
   status: AppFeedbackStatus;
+  lastMessageAt?: string | null;
+  lastMessagePreview?: string | null;
+  needsReply: boolean;
   resolvedAt?: string | null;
   resolvedBy?: string | null;
   githubIssueNumber?: number | null;
@@ -110,6 +117,8 @@ export type AppFeedbackReport = {
 };
 
 export type AdminAppFeedbackInput = {
+  reporterId?: string | null;
+  needsReply?: boolean | null;
   type?: AppFeedbackTypeFilter | null;
   status?: AppFeedbackStatus | null;
   platform?: string | null;
@@ -136,3 +145,37 @@ export type UpdateAppFeedbackStatusInput = {
   id: string;
   status: AppFeedbackStatus;
 };
+
+/** Reporter-safe support surfaces: excludes identity and diagnostic/admin fields. */
+export type AppBugReport = {
+  id: string;
+  comment?: string | null;
+  createdAt: string;
+  status: AppFeedbackStatus;
+  screenshotUrls: string[];
+  githubIssueNumber?: number | null;
+  githubIssueUrl?: string | null;
+  canReply: boolean;
+  lastMessageAt?: string | null;
+  lastMessagePreview?: string | null;
+};
+export type AppBugReportMessage = {
+  id: string;
+  reportId: string;
+  body: string;
+  authorRole: 'reporter' | 'staff';
+  deliveryStatus: 'pending' | 'sent' | 'failed';
+  createdAt: string;
+};
+export type AppBugReportsInput = { limit?: number | null; after?: string | null };
+export type AppBugReportMessagesInput = { reportId: string; limit?: number | null; before?: string | null };
+export type SendAppBugReportMessageInput = { reportId: string; body: string; clientMutationId: string };
+export type AppBugReportConnection = { reports: AppBugReport[]; hasMore: boolean; endCursor?: string | null };
+export type AppBugReportMessageConnection = {
+  messages: AppBugReportMessage[];
+  hasMore: boolean;
+  endCursor?: string | null;
+};
+
+/** Owner-scoped cache invalidation; contains no report or message content. */
+export type AppBugReportChangedEvent = { reportId: string };

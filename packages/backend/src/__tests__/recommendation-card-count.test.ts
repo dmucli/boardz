@@ -150,6 +150,32 @@ describe('countRecommendationCardClimbs', () => {
 
     expect(setMock.mock.calls[0][0]).toMatch(/^rec-count:v1:RECOMMENDED_AT_LEVEL:kilter:1:10:1,20:40:\d+-\d+$/);
   });
+
+  it('shares no catalog half for a spray wall, whose visibility depends on the viewer', async () => {
+    const spray: BoardTarget = { ...TARGET, boardType: 'spray' };
+
+    expect(await countRecommendationCardClimbs('RECOMMENDED_CROWD_FAVORITES', spray, 'user-1', tx)).toBe(284);
+
+    expect(getMock).not.toHaveBeenCalled();
+    expect(setMock).not.toHaveBeenCalled();
+    expect(state.executed).toHaveLength(1);
+  });
+});
+
+describe('recommendation catalogue filter', () => {
+  it('applies no account or item audience to a published, listed climb', () => {
+    for (const query of [
+      buildRecommendationRefsSql(paramsFor('RECOMMENDED_FRESH'), 0, 10),
+      buildRecommendationCountSql(paramsFor('RECOMMENDED_FRESH', { excludeUserId: null })),
+      buildRecommendationSentOverlapSql(paramsFor('RECOMMENDED_FRESH'), 'user-1'),
+    ]) {
+      const rendered = render(query);
+      expect(rendered).not.toContain('content_privacy');
+      expect(rendered).not.toContain('user_profiles');
+      expect(rendered).toContain('bc.is_listed = true');
+      expect(rendered).toContain('bc.is_draft = false');
+    }
+  });
 });
 
 describe('recommendationCountCacheKey', () => {

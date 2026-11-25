@@ -78,19 +78,20 @@ export const HELP_CLIPS = [
   {
     name: 'long-press-climb-actions',
     source: 'long-press-climb-actions',
+    poster: 4,
+    // Recorded from main 3b1d9be90c, 2026-11-02; hold and row more button.
     description: 'Press and hold a climb row until the actions sheet rises.',
   },
   {
     name: 'swipe-row-queue-playlist',
     source: 'swipe-row-queue-playlist',
-    // The first frame is the same climbs list the long-press clip opens on; 3 s
-    // in, the first swipe has landed and the "Climb added to queue" toast is up.
-    poster: 3,
+    poster: 4,
     description: 'Swipe a climb row to reveal queue and playlist actions.',
   },
   {
     name: 'remove-from-playlist',
     source: 'remove-from-playlist',
+    poster: 7,
     description: 'Take a climb back out of a playlist.',
   },
   {
@@ -111,17 +112,32 @@ export const HELP_CLIPS = [
   {
     name: 'grade-range-tap',
     source: 'grade-range-tap',
-    description: 'Tap two grades on the grade rail to set a range.',
+    description: 'Tap two grades in quick succession on the grade row to set a range.',
   },
   {
     name: 'preview-browsing',
     source: 'preview-browsing',
+    poster: 8,
     description: 'Browse the next climb without losing the one on the wall.',
+  },
+  {
+    name: 'wall-swipe-to-drive',
+    source: 'wall-swipe-to-drive',
+    poster: 5,
+    description: 'Swipe the wall button left to drive, change climbs, then tap to stop driving.',
+  },
+  {
+    name: 'put-on-board-timed-drive',
+    source: 'put-on-board-timed-drive',
+    poster: 8,
+    description: 'Tap Put on board, watch the timed drive, change climbs, then tap to stop.',
   },
   {
     name: 'start-playlist-queue',
     source: 'start-playlist-queue',
-    description: 'Start a playlist and watch it fill the queue.',
+    poster: 5,
+    // Header Play on the compatible local list, then Cancel opens its preview.
+    description: 'Press playlist Play with Up next filled: Start playlist? appears, then Cancel opens a preview.',
   },
 ] as const satisfies readonly HelpClipEntry[];
 

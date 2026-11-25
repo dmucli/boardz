@@ -1,163 +1,51 @@
-import { type ReactNode, useCallback, useMemo, useState } from 'react';
-import {
-  type ColorValue,
-  type LayoutChangeEvent,
-  type NativeScrollEvent,
-  type NativeSyntheticEvent,
-  Pressable,
-  View,
-  StyleSheet,
-} from 'react-native';
-import Animated, {
-  Extrapolation,
-  interpolate,
-  runOnJS,
-  useAnimatedReaction,
-  useAnimatedStyle,
-  useSharedValue,
-} from 'react-native-reanimated';
-import { LinearGradient } from 'expo-linear-gradient';
-import { useRouter } from 'expo-router';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { FlashList } from '@shopify/flash-list';
-import { Appbar } from 'react-native-paper';
-import { useTranslation } from 'react-i18next';
-import type { BoardName, Climb as SchemaClimb } from '@boardsesh/shared-schema';
 import type { Climb } from '@boardsesh/queue';
-import { Text } from '../Text';
-import { Icon } from '../Icon';
-import { type IconName } from '../icon-map';
-import { ActivityIndicator } from '../ActivityIndicator';
-import { ClimbListRow } from '../ClimbListRow';
-import { ClimbListRowSkeleton } from '../ClimbListRowSkeleton';
-import { THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH } from '../climb-list-thumbnail-metrics';
-import { GlassIconButton } from '../GlassIconButton';
-import { ProgressiveBlur } from '../ProgressiveBlur';
-import { Button } from '../Button';
-import { PlaylistEditClimbRow, type PlaylistEditRowBoard } from './PlaylistEditClimbRow';
-import { usePlaylistDrag } from './use-playlist-drag';
-import { PlaylistBoardBackdrop } from './PlaylistBoardBackdrop';
-import { screenshotModeLoadMore } from '../../lib/screenshot-mode';
-import { buildHeroGradient } from './playlist-gradient';
-import { resolvePlaylistEmojiIcon } from './playlist-icon';
-import { PLAYLIST_COLORS, normalizePlaylistColor } from './playlist-colors';
-import { withAlpha } from '../../theme/colors';
-import { toQueueClimb, toSchemaClimb } from '../../lib/climb-types';
+import type { BoardName, Climb as SchemaClimb } from '@boardsesh/shared-schema';
+import { useNavigation, useRouter } from 'expo-router';
+import { useCallback, useMemo, type ReactNode } from 'react';
+import { useTranslation } from 'react-i18next';
+import { useWindowDimensions, View } from 'react-native';
+import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
+import { useTypographyStyles } from '../../hooks/use-typography-styles';
+import { useClimbRowDisplay, useClimbRowField } from '../../lib/climb-row-display-preference';
 import { climbToQueueItem } from '../../lib/climb-to-queue-item';
-import { useDrawerHost } from '../../providers/drawer-host-provider';
-import { useQueueActions } from '../../providers/queue-provider';
-import type { PlaylistRenderBoard, PlaylistBoardBanner } from '../../lib/playlists/use-playlist-render-board';
+import { toQueueClimb, toSchemaClimb } from '../../lib/climb-types';
 import {
   getPlaylistRenderBoardTarget,
   resolvePlaylistClimbRenderBoard,
 } from '../../lib/playlists/playlist-climb-render-board';
+import type { PlaylistRenderBoard } from '../../lib/playlists/use-playlist-render-board';
+import { ClimbProgressProvider, type ClimbProgressTarget } from '../../providers/climb-progress-provider';
+import { useDrawerHost } from '../../providers/drawer-host-provider';
+import { useQueueActions } from '../../providers/queue-provider';
 import { useTheme } from '../../providers/theme-provider';
-import { selectByVariant } from '../../theme/variants';
-import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
-import { glassSize } from '../../theme/layout';
-import { iosSystemColors } from '../../theme/ios-colors';
-import { spacing, borderRadius } from '../../theme/tokens';
-
-/** Bottom scrim that keeps white title/meta legible across the palette (amber
- *  and green included) without per-colour luminance branching. */
-const HERO_SCRIM_COLORS = ['transparent', 'transparent', 'rgba(0, 0, 0, 0.28)'] as const;
-const HERO_SCRIM_LOCATIONS = [0, 0.45, 1] as const;
-const GRADIENT_START = { x: 0, y: 0 } as const;
-const GRADIENT_END = { x: 1, y: 1 } as const;
-/** Nav-bar height (below the status-bar inset) for the collapsed header — tall
- *  enough to contain the floating FABs (which sit `spacing[1]` below the inset),
- *  so they're centered in the bar rather than poking out under it. */
-const NAV_BAR_HEIGHT = glassSize.standard + spacing[1] * 2;
-/** Rows of skeleton placeholder shown while the first page loads. */
+import { ActiveAwareClimbListRow } from '../ActiveAwareClimbListRow';
+import { ClimbListRowSkeleton } from '../ClimbListRowSkeleton';
+import { Icon } from '../Icon';
+import { PressableSurface } from '../PressableSurface';
+import { Text } from '../Text';
+import { useClimbListThumbnailSize } from '../climb-list-thumbnail-metrics';
+import {
+  climbRowReorderHeight,
+  climbRowSeparatorInset,
+  DEFAULT_CLIMB_ROW_SURFACE,
+  type ClimbRowReorderRow,
+} from '../climb-row-layout';
+import type { WindowAnchorPoint } from '../navigation/AnchoredPopover.types';
+import { PlaylistBoardBackdrop } from './PlaylistBoardBackdrop';
+import { PlaylistDetailPresentation, type PlaylistDetailViewProps } from './PlaylistDetailPresentation';
+import { PlaylistEditClimbRow, type PlaylistEditRowBoard } from './PlaylistEditClimbRow';
+import { createStyles } from './playlist-detail-styles';
+import { usePlaylistDrag } from './use-playlist-drag';
+export type {
+  PlaylistDetailEmptyAction,
+  PlaylistDetailEmptyState,
+  PlaylistDetailFilterAction,
+  PlaylistDetailHero,
+  PlaylistDetailViewProps,
+} from './PlaylistDetailPresentation';
 const SKELETON_ROW_COUNT = 8;
-
-/** Optional richer empty state (Material branch only). When omitted, the
- *  Material branch falls back to the same generic icon + `emptyMessage` the
- *  glass branch uses, so non-liked playlists keep their existing copy. */
-export type PlaylistDetailEmptyState = {
-  /** Semantic icon name (e.g. `favorite` for the liked-climbs surface). */
-  icon: IconName;
-  /** Headline (already translated). */
-  title: string;
-  /** Supporting line under the headline (already translated). */
-  supporting?: string;
-};
-
-/** Optional CTA button under the empty state, shown in both variants. */
-export type PlaylistDetailEmptyAction = {
-  /** Already-translated button label. */
-  label: string;
-  /** Leading icon on the button. */
-  icon?: IconName;
-  onPress: () => void;
-};
-
-export type PlaylistDetailHero = {
-  name: string;
-  climbCount: number;
-  color?: string;
-  icon?: string;
-  /** Playlist description, shown under the hero row. */
-  description?: string;
-  /** Secondary line under the climb count (e.g. the smart-playlist creator). */
-  subtitle?: string;
-  /** Already-translated follower-count line (public playlists). */
-  followerLabel?: string;
-  /** Board for the optional frosted board backdrop behind the hero square. */
-  boardType?: string;
-  layoutId?: number | null;
-  showBoardBackdrop?: boolean;
-};
-
-export type PlaylistDetailViewProps = {
-  hero: PlaylistDetailHero;
-  climbs: Climb[];
-  /** Preferred active board for climb rows. Compatible rows render against it;
-   *  incompatible rows resolve their own board config and are dimmed. */
-  renderBoard: PlaylistRenderBoard | null;
-  /** Set when the playlist belongs to a board other than the active one (or
-   *  there is no active board). A switch-board banner shows above the list and
-   *  activate-all is disabled; row taps still open the drawer so it can explain
-   *  incompatibility. */
-  boardBanner?: PlaylistBoardBanner | null;
-  /** True while the first page loads (hero still renders; list shows a spinner). */
-  isLoading: boolean;
-  /** True while a subsequent page loads (trailing spinner). */
-  isFetchingNextPage: boolean;
-  hasNextPage: boolean;
-  fetchNextPage: () => void;
-  /** Activate a tapped climb (wires the queue + opens the play drawer). */
-  onActivateClimb: (climb: Climb) => void;
-  /** Already-resolved empty-list copy (callers translate with a static key). */
-  emptyMessage: string;
-  /** Richer Material-branch empty state (e.g. the liked-climbs heart prompt).
-   *  Glass branch ignores this and keeps `emptyMessage`. */
-  emptyState?: PlaylistDetailEmptyState;
-  /** Optional CTA under the empty state (e.g. "Add climbs" on an owner's empty
-   *  playlist). Rendered in BOTH variants; omit for a message-only empty state. */
-  emptyAction?: PlaylistDetailEmptyAction;
-  /** Floating top-right controls (follow / pin / more) over the hero, given the
-   *  current collapse state so a control can swap to its compact icon form once
-   *  the colour header bar takes over. The back FAB on the left is always
-   *  rendered; absent here = a back-only top bar. */
-  actions?: (collapsed: boolean) => ReactNode;
-  /** Owner edit mode: rows swap to the reorder/remove treatment, tap-to-activate
-   *  is disabled, and pagination is paused (the host passes a frozen list). */
-  editMode?: boolean;
-  /** Move a climb to a new 0-based index in the (loaded) list. */
-  onReorderClimb?: (climbUuid: string, newIndex: number) => void;
-  /** Remove a climb from the playlist (the host confirms + mutates). */
-  onRemoveClimb?: (climbUuid: string) => void;
-  /** In edit mode, a cog next to the playlist name opens the edit-details sheet. */
-  onEditDetails?: () => void;
-  /** Extra content rendered inside `ListHeaderComponent`, below the hero and the
-   *  board-mismatch banner. Stays inside the existing FlashList header so no
-   *  second scroll container is introduced. */
-  headerSlot?: ReactNode;
-};
-
-const noopReorder = (_climbUuid: string, _newIndex: number) => {};
-const noopRemove = (_climbUuid: string) => {};
+const noopReorder = () => {};
+const noopRemove = () => {};
 
 type ResolvedPlaylistClimbRow =
   | {
@@ -170,131 +58,27 @@ type ResolvedPlaylistClimbRow =
       kind: 'unrenderable';
     };
 
-/**
- * Shared hero + paginated climb list for the playlist-detail and
- * smart-playlist-detail screens. Renders the colour/emoji hero, then a FlashList
- * of `ClimbListRow`s rendered from `renderBoard`, paginating via
- * `fetchNextPage` as the list nears its end.
- *
- * `renderBoard` is the user's active board for the common case. Rows whose
- * climbs do not fit that board render against their own board config and are
- * dimmed; the play drawer owns the incompatibility message when opened.
- *
- * Two presentations: the Liquid Glass variant keeps the full-bleed gradient hero
- * with white text and floating FABs; the Material 3 variant swaps in a Paper
- * `Appbar.Header` over a tonal hero band. Both share the scroll math, FlashList,
- * list state, and row rendering — only the hero chrome + state visuals branch.
- */
-export function PlaylistDetailView({
-  hero,
-  climbs,
-  renderBoard,
-  boardBanner,
-  isLoading,
-  isFetchingNextPage,
-  hasNextPage,
-  fetchNextPage,
-  onActivateClimb,
-  emptyMessage,
-  emptyState,
-  emptyAction,
-  actions,
-  editMode = false,
-  onReorderClimb,
-  onRemoveClimb,
-  onEditDetails,
-  headerSlot,
-}: PlaylistDetailViewProps) {
-  const { t } = useTranslation('playlists');
-  const { t: tCommon } = useTranslation('common');
-  const { systemColors, brandColors, variant } = useTheme();
+export function PlaylistDetailView(props: PlaylistDetailViewProps) {
+  const { climbs, renderBoard, onActivateClimb, editMode = false, onReorderClimb, onRemoveClimb, hero } = props;
+  const { fontScale } = useWindowDimensions();
+  const { textStyles } = useTheme();
+  const rowDisplay = useClimbRowDisplay();
   const bottomChrome = useBottomChromeMetrics();
-  const insets = useSafeAreaInsets();
   const router = useRouter();
-  const listPaddingBottom = bottomChrome.scrollBottomPadding;
-  const isMaterial = selectByVariant(variant, { material: true, liquidGlass: false });
-  const heroEmojiIcon = resolvePlaylistEmojiIcon(hero.icon);
-
-  // Scroll offset + measured hero-banner height drive the collapsed colour header
-  // bar (the playlist colour + centered name) that fades in once the hero scrolls
-  // off the top — the Apple Music album-header idiom. The Material branch reuses
-  // the same math to fade its app-bar title in as the hero band scrolls away.
-  const scrollY = useSharedValue(0);
-  const heroBannerHeight = useSharedValue(0);
-  const headerBarHeight = insets.top + NAV_BAR_HEIGHT;
-  const handleScroll = useCallback(
-    (event: NativeSyntheticEvent<NativeScrollEvent>) => {
-      scrollY.value = event.nativeEvent.contentOffset.y;
-    },
-    [scrollY],
-  );
-  const handleHeroLayout = useCallback(
-    (event: LayoutChangeEvent) => {
-      heroBannerHeight.value = event.nativeEvent.layout.height;
-    },
-    [heroBannerHeight],
-  );
-  const headerBarStyle = useAnimatedStyle(() => {
-    const banner = heroBannerHeight.value;
-    if (banner <= 0) return { opacity: 0 };
-    // Fully opaque once the banner's bottom edge reaches the bar's bottom.
-    const threshold = Math.max(1, banner - headerBarHeight);
-    return { opacity: interpolate(scrollY.value, [threshold - 24, threshold], [0, 1], Extrapolation.CLAMP) };
-  });
-
-  // `collapsed` flips when the colour header bar takes over, so action FABs (e.g.
-  // follow) can swap to their compact icon form. On Material it drives the app-bar
-  // title fade-in.
-  const [collapsed, setCollapsed] = useState(false);
-  useAnimatedReaction(
-    () => {
-      const banner = heroBannerHeight.value;
-      return banner > 0 && scrollY.value >= banner - headerBarHeight;
-    },
-    (isCollapsed, wasCollapsed) => {
-      if (isCollapsed !== wasCollapsed) runOnJS(setCollapsed)(isCollapsed);
-    },
-  );
-  const actionNode = actions?.(collapsed);
-
-  const loadNextPage = useCallback(() => {
-    if (hasNextPage && !isFetchingNextPage) fetchNextPage();
-  }, [hasNextPage, isFetchingNextPage, fetchNextPage]);
-  // One page in screenshot mode — the same cap `screenshotModeNextPageParam`
-  // applies to the app's own infinite queries, but from the consumer side:
-  // both lists behind this view (`usePlaylistClimbs`, `useSmartPlaylist`) live
-  // in the renderer-agnostic `@boardsesh/playlists-react`, which web also
-  // consumes and which must not read a mobile build flag. `screenshotModeLoadMore`
-  // is the same wrapper Discover and the profile beta shelf use, and it returns
-  // one shared no-op, so a screenshot build hands the list a stable identity.
-  const handleEndReached = useMemo(() => screenshotModeLoadMore(loadNextPage), [loadNextPage]);
-
+  const navigation = useNavigation();
   // Stable per-row activate handler so the memoized `ClimbListRow`s aren't handed
   // a fresh closure each render — every renderItem rebuild (e.g. when the sticky
   // header `collapsed` flips during scroll) would otherwise re-render every row.
-  const { openClimbActions, openAddToPlaylist } = useDrawerHost();
-  const { addToQueue } = useQueueActions();
+  const { getClimbActions, openAddToPlaylist } = useDrawerHost();
+  const { playNext } = useQueueActions();
   const handleActivate = useCallback((tapped: SchemaClimb) => onActivateClimb(toQueueClimb(tapped)), [onActivateClimb]);
-  const handleAddToQueue = useCallback(
+  // A row's right swipe is Play next, the same as in search (#6772).
+  const handlePlayNext = useCallback(
     (climb: SchemaClimb) => {
-      void addToQueue(climbToQueueItem(climb));
+      void playNext({ item: climbToQueueItem(climb) });
     },
-    [addToQueue],
+    [playNext],
   );
-
-  // Activate-all only needs to know whether the board-switch banner is present;
-  // row taps still open the drawer so it can explain incompatible climbs.
-  const disableActivateAll = !!boardBanner;
-
-  // Activate-all: queue the playlist from the top. Reuses the same row-tap path
-  // (which seeds the suggestion source from the whole list), so swiping the play
-  // drawer walks the playlist. No-op on an empty list or while the switch-board
-  // banner is shown.
-  const handleActivateAll = useCallback(() => {
-    if (disableActivateAll) return;
-    const first = climbs[0];
-    if (first) onActivateClimb(first);
-  }, [disableActivateAll, climbs, onActivateClimb]);
 
   // List-level drag-to-reorder for edit mode. Always instantiated (hooks can't be
   // conditional); only the edit rows wire up its handles. `isDragging` locks the
@@ -332,23 +116,55 @@ export function PlaylistDetailView({
     return resolvedRows;
   }, [climbs, renderBoard]);
 
-  // Long press → reaction menu, using the row's resolved render board (a playlist can
+  const editRowHeight = useMemo(() => {
+    if (!editMode) return undefined;
+    const rowShapes: ClimbRowReorderRow[] = [];
+    for (const climb of climbs) {
+      const resolved = resolvedRowsByClimbUuid.get(climb.uuid);
+      const statsAngle = 'statsAngle' in climb ? climb.statsAngle : null;
+      rowShapes.push({
+        supportsMirroring: false,
+        unrenderable: resolved?.kind === 'unrenderable',
+        hasSetAngleMarker:
+          resolved?.kind === 'renderable' &&
+          typeof statsAngle === 'number' &&
+          statsAngle !== resolved.renderBoard.angle,
+      });
+    }
+    return climbRowReorderHeight({
+      rows: rowShapes,
+      display: rowDisplay,
+      surface: { ...DEFAULT_CLIMB_ROW_SURFACE, showAscentStatus: false },
+      fontScale,
+      typeScale: textStyles,
+    });
+  }, [editMode, climbs, resolvedRowsByClimbUuid, rowDisplay, fontScale, textStyles]);
+
+  const progressTargets = useMemo<ClimbProgressTarget[]>(() => {
+    const targets: ClimbProgressTarget[] = [];
+    for (const [climbUuid, row] of resolvedRowsByClimbUuid) {
+      if (row.kind === 'renderable') targets.push({ boardName: row.renderBoard.boardName as BoardName, climbUuid });
+    }
+    return targets;
+  }, [resolvedRowsByClimbUuid]);
+
+  // Long press → climb menu, using the row's resolved render board (a playlist can
   // mix boards, so this isn't always the active board).
   const handleOpenActions = useCallback(
     (tapped: SchemaClimb) => {
       const resolved = resolvedRowsByClimbUuid.get(tapped.uuid);
       if (!resolved || resolved.kind !== 'renderable') return;
       const { boardName, layoutId, sizeId, setIds, angle } = resolved.renderBoard;
-      openClimbActions(tapped, { boardName, layoutId, sizeId, setIds, angle });
+      return getClimbActions(tapped, { boardName, layoutId, sizeId, setIds, angle });
     },
-    [openClimbActions, resolvedRowsByClimbUuid],
+    [getClimbActions, resolvedRowsByClimbUuid],
   );
   const handleOpenPlaylist = useCallback(
-    (climb: SchemaClimb) => {
+    (climb: SchemaClimb, anchorPoint?: WindowAnchorPoint) => {
       const resolved = resolvedRowsByClimbUuid.get(climb.uuid);
       if (!resolved || resolved.kind !== 'renderable') return;
       const { boardName, layoutId, sizeId, setIds, angle } = resolved.renderBoard;
-      openAddToPlaylist(climb, { boardName, layoutId, sizeId, setIds, angle });
+      openAddToPlaylist(climb, { boardName, layoutId, sizeId, setIds, angle }, anchorPoint);
     },
     [openAddToPlaylist, resolvedRowsByClimbUuid],
   );
@@ -359,7 +175,14 @@ export function PlaylistDetailView({
       if (!resolvedRow) return null;
 
       if (resolvedRow.kind === 'unrenderable') {
-        return <UnrenderablePlaylistClimbRow climb={item} editMode={editMode} onRemove={onRemoveClimb ?? noopRemove} />;
+        return (
+          <UnrenderablePlaylistClimbRow
+            climb={item}
+            editMode={editMode}
+            minimumHeight={editRowHeight}
+            onRemove={onRemoveClimb ?? noopRemove}
+          />
+        );
       }
 
       if (editMode) {
@@ -369,14 +192,16 @@ export function PlaylistDetailView({
             board={resolvedRow.editBoard}
             rowIndex={index}
             drag={dragControls}
+            minimumHeight={editRowHeight}
             onRemove={onRemoveClimb ?? noopRemove}
             onReorder={onReorderClimb ?? noopReorder}
           />
         );
       }
 
+      // The climb you last had up is highlighted, as in the Climbs list (#6671 QA).
       return (
-        <ClimbListRow
+        <ActiveAwareClimbListRow
           climb={toSchemaClimb(item)}
           boardName={resolvedRow.renderBoard.boardName as BoardName}
           layoutId={resolvedRow.renderBoard.layoutId}
@@ -385,443 +210,78 @@ export function PlaylistDetailView({
           angle={resolvedRow.renderBoard.angle}
           onPress={handleActivate}
           onOpenActions={handleOpenActions}
-          onAddToQueue={handleAddToQueue}
+          onPlayNext={handlePlayNext}
           onOpenPlaylist={handleOpenPlaylist}
           unsupported={resolvedRow.incompatible}
+          showProgress
         />
       );
     },
     [
       resolvedRowsByClimbUuid,
       editMode,
+      editRowHeight,
       dragControls,
       onRemoveClimb,
       onReorderClimb,
       handleActivate,
       handleOpenActions,
-      handleAddToQueue,
+      handlePlayNext,
       handleOpenPlaylist,
     ],
   );
 
-  // Cog shown beside the playlist name only in edit mode — opens the
-  // edit-details sheet (name / colour / icon / visibility). Tinted to match the
-  // hero text of the current variant (white on glass, label on Material).
-  const renderEditDetailsCog = (color: ColorValue) =>
-    editMode && onEditDetails ? (
-      <Pressable
-        onPress={onEditDetails}
-        hitSlop={8}
-        accessibilityRole="button"
-        accessibilityLabel={t('editClimbs.editDetailsAria')}
-        style={styles.heroCog}
-      >
-        <Icon name="settings" size={22} color={color} />
-      </Pressable>
-    ) : null;
-
-  const baseColor = normalizePlaylistColor(hero.color) ?? PLAYLIST_COLORS[0];
-
-  // Shared list state visuals. The first-page load renders skeleton rows (a far
-  // better "shape of what's coming" cue than a bare spinner). Empty + footer are
-  // shared; the empty body is variant-aware below.
-  const listEmptyComponent = isLoading ? (
-    <View style={styles.skeletonList}>
-      {SKELETON_PLACEHOLDERS.map((key) => (
-        <ClimbListRowSkeleton key={key} />
+  const onBack = useCallback(() => router.back(), [router]);
+  const setHeaderOptions = useCallback(
+    (options: Record<string, unknown>) => navigation.setOptions(options),
+    [navigation],
+  );
+  const wrapList = useCallback(
+    (list: ReactNode) => (
+      <ClimbProgressProvider targets={progressTargets} enabled={!editMode}>
+        {list}
+      </ClimbProgressProvider>
+    ),
+    [progressTargets, editMode],
+  );
+  return (
+    <PlaylistDetailPresentation
+      {...props}
+      renderItem={renderItem}
+      isDragging={isDragging}
+      listPaddingBottom={bottomChrome.scrollBottomPadding}
+      onBack={onBack}
+      setHeaderOptions={setHeaderOptions}
+      wrapList={wrapList}
+      loadingRows={SKELETON_PLACEHOLDERS.map((key) => (
+        <ClimbListRowSkeleton key={key} showProgress={!editMode} />
       ))}
-    </View>
-  ) : isMaterial ? (
-    <MaterialEmptyState
-      icon={emptyState?.icon ?? 'playlist'}
-      title={emptyState?.title ?? emptyMessage}
-      supporting={emptyState?.supporting}
-      action={emptyAction}
-      titleColor={systemColors.label}
-      supportingColor={systemColors.secondaryLabel}
+      boardBackdrop={
+        hero.boardType ? <PlaylistBoardBackdrop boardType={hero.boardType} layoutId={hero.layoutId} /> : undefined
+      }
     />
-  ) : (
-    <View style={styles.stateContainer}>
-      <Icon name="playlist" size={44} color={iosSystemColors.systemGray4} />
-      <Text variant="subheadline" style={styles.emptyText}>
-        {emptyMessage}
-      </Text>
-      {emptyAction ? (
-        <Button
-          title={emptyAction.label}
-          onPress={emptyAction.onPress}
-          size="medium"
-          icon={emptyAction.icon}
-          style={styles.emptyActionButton}
-        />
-      ) : null}
-    </View>
-  );
-
-  const listFooterComponent = isFetchingNextPage ? (
-    <View style={styles.footer}>
-      <ActivityIndicator size="small" />
-    </View>
-  ) : null;
-
-  // Switch-board banner shown when the playlist's board differs from the active
-  // one. Sits inside the list header so it scrolls with the hero in both variants.
-  const bannerNode = boardBanner ? <BoardMismatchBanner banner={boardBanner} systemColors={systemColors} /> : null;
-
-  // ── Material 3 branch ───────────────────────────────────────────────────────
-  if (isMaterial) {
-    const accent = brandColors.primary;
-    return (
-      <View style={[styles.container, { backgroundColor: systemColors.background }]}>
-        <FlashList
-          data={climbs}
-          renderItem={renderItem}
-          keyExtractor={keyExtractor}
-          extraData={editMode}
-          scrollEnabled={!isDragging}
-          onEndReached={handleEndReached}
-          onEndReachedThreshold={0.5}
-          onScroll={handleScroll}
-          scrollEventThrottle={16}
-          contentContainerStyle={{ paddingBottom: listPaddingBottom }}
-          ListHeaderComponent={
-            <>
-              <View onLayout={handleHeroLayout} style={styles.materialHero}>
-                <View
-                  style={[
-                    styles.materialHeroBand,
-                    { paddingTop: headerBarHeight + spacing[4], backgroundColor: systemColors.secondaryBackground },
-                  ]}
-                >
-                  <View style={[styles.materialHeroEmojiCircle, { backgroundColor: systemColors.tertiaryBackground }]}>
-                    {heroEmojiIcon ? (
-                      <Text style={styles.materialHeroEmoji} allowFontScaling={false}>
-                        {heroEmojiIcon}
-                      </Text>
-                    ) : (
-                      <Icon name="tag" size={36} color={systemColors.secondaryLabel} />
-                    )}
-                  </View>
-                  <View style={styles.materialHeroNameRow}>
-                    <Text variant="title2" numberOfLines={2} color={systemColors.label} style={styles.materialHeroName}>
-                      {hero.name}
-                    </Text>
-                    {renderEditDetailsCog(systemColors.label)}
-                  </View>
-                  <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.materialHeroMeta}>
-                    {t('detail.climbCount', { count: hero.climbCount })}
-                  </Text>
-                  {hero.followerLabel ? (
-                    <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.materialHeroMeta}>
-                      {hero.followerLabel}
-                    </Text>
-                  ) : null}
-                </View>
-                {hero.description || hero.subtitle ? (
-                  <View style={styles.heroBelow}>
-                    {hero.description ? (
-                      <Text variant="footnote" numberOfLines={3} color={systemColors.secondaryLabel}>
-                        {hero.description}
-                      </Text>
-                    ) : null}
-                    {hero.subtitle ? (
-                      <Text variant="footnote" numberOfLines={1} color={systemColors.tertiaryLabel}>
-                        {hero.subtitle}
-                      </Text>
-                    ) : null}
-                  </View>
-                ) : null}
-              </View>
-              {bannerNode}
-              {headerSlot}
-            </>
-          }
-          ListFooterComponent={listFooterComponent}
-          ListEmptyComponent={listEmptyComponent}
-        />
-
-        {/* Collapsing M3 top app bar — sits over the hero band; its title fades in
-            as the band scrolls under it, then the band's name is hidden behind. */}
-        <Appbar.Header
-          statusBarHeight={insets.top}
-          mode="small"
-          style={[styles.materialAppbar, { backgroundColor: systemColors.secondaryBackground }]}
-        >
-          <Appbar.BackAction
-            onPress={() => router.back()}
-            color={systemColors.label as string}
-            rippleColor={withAlpha(accent, 0.16)}
-            accessibilityLabel={tCommon('ariaLabels.back')}
-          />
-          <Animated.View style={[styles.materialAppbarTitle, headerBarStyle]}>
-            <Appbar.Content title={hero.name} titleStyle={styles.materialAppbarTitleText} />
-          </Animated.View>
-          {/* Owner / follow / pin controls. The app bar is always present on Material,
-              so we ask for the compact icon form (`actions(true)`) — `GlassIconButton`
-              routes to a Paper `IconButton` here, fitting the bar. */}
-          {actions?.(true)}
-          {climbs.length > 0 && !boardBanner && !editMode ? (
-            <Appbar.Action
-              icon="play"
-              color={accent as string}
-              rippleColor={withAlpha(accent, 0.16)}
-              onPress={handleActivateAll}
-              accessibilityLabel={t('detail.activateAll')}
-            />
-          ) : null}
-        </Appbar.Header>
-      </View>
-    );
-  }
-
-  // ── Liquid Glass branch ──────────────────────────────────────────────────────
-  const gradient = buildHeroGradient(hero.color);
-  const showBackdrop = !!(hero.showBoardBackdrop && hero.boardType);
-  // With the board backdrop on, drop the gradient to a translucent wash so the
-  // blurred board ghosts through; otherwise it's the opaque colour banner.
-  const gradientColors = showBackdrop
-    ? ([
-        withAlpha(gradient.colors[0], 0.82),
-        withAlpha(gradient.colors[1], 0.82),
-        withAlpha(gradient.colors[2], 0.82),
-      ] as [string, string, string])
-    : gradient.colors;
-
-  const header = (
-    <View style={styles.hero}>
-      {/* Full-bleed colour banner running up under the (transparent) header,
-          replacing the small colour square. White text + a bottom scrim keep it
-          legible across every palette colour and arbitrary user hex. */}
-      {/* Clear the floating back + action FABs that sit over the banner top. */}
-      <View
-        onLayout={handleHeroLayout}
-        style={[styles.heroBanner, { paddingTop: insets.top + spacing[12] + spacing[2], backgroundColor: baseColor }]}
-      >
-        {showBackdrop && hero.boardType ? (
-          <PlaylistBoardBackdrop boardType={hero.boardType} layoutId={hero.layoutId} />
-        ) : null}
-        <LinearGradient
-          pointerEvents="none"
-          colors={gradientColors}
-          locations={gradient.locations}
-          start={GRADIENT_START}
-          end={GRADIENT_END}
-          style={StyleSheet.absoluteFill}
-        />
-        <LinearGradient
-          pointerEvents="none"
-          colors={HERO_SCRIM_COLORS}
-          locations={HERO_SCRIM_LOCATIONS}
-          start={GRADIENT_START}
-          end={GRADIENT_END}
-          style={StyleSheet.absoluteFill}
-        />
-        <View style={styles.heroBannerContent}>
-          {heroEmojiIcon ? (
-            <Text style={styles.heroEmoji} allowFontScaling={false}>
-              {heroEmojiIcon}
-            </Text>
-          ) : (
-            <Icon name="tag" size={40} color={iosSystemColors.white} />
-          )}
-          <View style={styles.heroNameRow}>
-            <Text
-              variant="title2"
-              numberOfLines={2}
-              color={iosSystemColors.white}
-              style={[styles.heroName, styles.heroNameFlex]}
-            >
-              {hero.name}
-            </Text>
-            {renderEditDetailsCog(iosSystemColors.white)}
-          </View>
-          <Text variant="subheadline" color={iosSystemColors.white} style={styles.heroBannerMeta}>
-            {t('detail.climbCount', { count: hero.climbCount })}
-          </Text>
-          {hero.followerLabel ? (
-            <Text variant="footnote" color={iosSystemColors.white} style={styles.heroBannerMeta}>
-              {hero.followerLabel}
-            </Text>
-          ) : null}
-        </View>
-      </View>
-      {hero.description || hero.subtitle ? (
-        <View style={styles.heroBelow}>
-          {hero.description ? (
-            <Text variant="footnote" numberOfLines={3} style={styles.heroDescription}>
-              {hero.description}
-            </Text>
-          ) : null}
-          {hero.subtitle ? (
-            <Text variant="footnote" numberOfLines={1} style={styles.heroSubtitle}>
-              {hero.subtitle}
-            </Text>
-          ) : null}
-        </View>
-      ) : null}
-    </View>
-  );
-
-  return (
-    <View style={styles.container}>
-      {/* Paints the status-bar / dynamic-island strip in the playlist colour so it
-          is never the bare screen background — even on the first frame before the
-          list lays its full-bleed hero out behind the island. */}
-      <View pointerEvents="none" style={[styles.islandFill, { height: insets.top, backgroundColor: baseColor }]} />
-      <FlashList
-        data={climbs}
-        renderItem={renderItem}
-        keyExtractor={keyExtractor}
-        extraData={editMode}
-        scrollEnabled={!isDragging}
-        onEndReached={handleEndReached}
-        onEndReachedThreshold={0.5}
-        onScroll={handleScroll}
-        scrollEventThrottle={16}
-        // The hero banner is full-bleed and runs up behind the status bar / dynamic
-        // island, owning the top inset itself (paddingTop above). Both props are
-        // needed so iOS doesn't inset the content down on the first frame (which
-        // would briefly expose the screen background behind the island).
-        contentInsetAdjustmentBehavior="never"
-        automaticallyAdjustContentInsets={false}
-        contentContainerStyle={{ paddingBottom: listPaddingBottom }}
-        ListHeaderComponent={
-          <>
-            {header}
-            {bannerNode}
-            {headerSlot}
-          </>
-        }
-        ListFooterComponent={listFooterComponent}
-        ListEmptyComponent={listEmptyComponent}
-      />
-
-      {/* Collapsed header bar — a progressive blur (matching the tabs' chrome)
-          carrying the centered name, fading in once the hero scrolls off. Sits
-          below the floating FABs. */}
-      <Animated.View
-        pointerEvents="none"
-        style={[styles.headerBar, { height: headerBarHeight, paddingTop: insets.top }, headerBarStyle]}
-      >
-        <ProgressiveBlur style={StyleSheet.absoluteFill} />
-        <View style={styles.headerBarRow}>
-          <Text variant="headline" numberOfLines={1} color={systemColors.label} style={styles.headerBarTitle}>
-            {hero.name}
-          </Text>
-        </View>
-      </Animated.View>
-
-      {/* Floating top bar over the gradient hero — replaces the native header.
-          Back chevron on the left, optional follow/pin/more on the right. */}
-      <View pointerEvents="box-none" style={[styles.topBar, { paddingTop: insets.top + spacing[1] }]}>
-        <GlassIconButton
-          iconName="back"
-          iconColor={systemColors.label}
-          onPress={() => router.back()}
-          accessibilityLabel={tCommon('ariaLabels.back')}
-          fallbackColor={systemColors.fill}
-        />
-        {actionNode ? (
-          <View pointerEvents="box-none" style={styles.topBarActions}>
-            {actionNode}
-          </View>
-        ) : null}
-      </View>
-    </View>
   );
 }
-
-/** Centered Material empty state: tonal icon + headline + supporting copy, plus
- *  an optional CTA. */
-function MaterialEmptyState({
-  icon,
-  title,
-  supporting,
-  action,
-  titleColor,
-  supportingColor,
-}: {
-  icon: IconName;
-  title: string;
-  supporting?: string;
-  action?: PlaylistDetailEmptyAction;
-  titleColor: ColorValue;
-  supportingColor: ColorValue;
-}) {
-  return (
-    <View style={styles.stateContainer}>
-      <View accessibilityRole="image" accessibilityLabel={title}>
-        <Icon name={icon} size={48} color={supportingColor} />
-      </View>
-      <Text variant="headline" color={titleColor} style={styles.materialEmptyTitle}>
-        {title}
-      </Text>
-      {supporting ? (
-        <Text variant="subheadline" color={supportingColor} style={styles.materialEmptySupporting}>
-          {supporting}
-        </Text>
-      ) : null}
-      {action ? (
-        <Button
-          title={action.label}
-          onPress={action.onPress}
-          size="medium"
-          icon={action.icon}
-          style={styles.emptyActionButton}
-        />
-      ) : null}
-    </View>
-  );
-}
-
-/** Switch-board banner for a playlist whose board differs from the active one:
- *  a board glyph + the prompt, then a filled CTA into `/boards`. */
-function BoardMismatchBanner({
-  banner,
-  systemColors,
-}: {
-  banner: PlaylistBoardBanner;
-  systemColors: {
-    secondaryBackground: ColorValue;
-    label: ColorValue;
-    secondaryLabel: ColorValue;
-    separator: ColorValue;
-  };
-}) {
-  return (
-    <View
-      style={[
-        styles.banner,
-        { backgroundColor: systemColors.secondaryBackground, borderColor: systemColors.separator },
-      ]}
-    >
-      <View style={styles.bannerRow}>
-        <Icon name="boards.fill" size={22} color={systemColors.secondaryLabel} />
-        <View style={styles.bannerText}>
-          <Text variant="subheadline" color={systemColors.label} style={styles.bannerTitle}>
-            {banner.title}
-          </Text>
-          <Text variant="footnote" color={systemColors.secondaryLabel}>
-            {banner.subtitle}
-          </Text>
-        </View>
-      </View>
-      <Button title={banner.cta} onPress={banner.onPress} size="medium" style={styles.bannerButton} />
-    </View>
-  );
-}
-
 function UnrenderablePlaylistClimbRow({
   climb,
   editMode,
   onRemove,
+  minimumHeight,
 }: {
   climb: Climb;
   editMode: boolean;
   onRemove: (climbUuid: string) => void;
+  minimumHeight?: number;
 }) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('playlists');
   const { systemColors, opacity } = useTheme();
+  // This row stands among climb rows, so it follows their thumbnail switch: with
+  // thumbnails off it has no thumbnail-sized frame and its text starts at the
+  // gutter, like theirs.
+  const hasThumbnail = useClimbRowField('thumbnail');
+  // The cell its neighbours draw (one column here, so 76×96).
+  const thumbnailSize = useClimbListThumbnailSize();
   const subtitle = t('detail.unrenderableClimb.subtitle');
   const accessibilityLabel = `${climb.name}. ${subtitle}`;
 
@@ -832,20 +292,27 @@ function UnrenderablePlaylistClimbRow({
   return (
     <View style={styles.unrenderableOuter}>
       <View
-        style={[styles.unrenderableRow, { backgroundColor: systemColors.background }]}
+        style={[
+          styles.unrenderableRow,
+          { backgroundColor: systemColors.background },
+          minimumHeight === undefined ? null : { minHeight: minimumHeight },
+        ]}
         accessible={!editMode}
         accessibilityRole={editMode ? undefined : 'text'}
         accessibilityLabel={editMode ? undefined : accessibilityLabel}
       >
         <View style={[styles.unrenderableContent, { opacity: opacity.disabled }]}>
-          <View
-            style={[
-              styles.unrenderableThumbnail,
-              { backgroundColor: systemColors.secondaryBackground, borderColor: systemColors.separator },
-            ]}
-          >
-            <Icon name="warning" size={24} color={systemColors.secondaryLabel} />
-          </View>
+          {hasThumbnail ? (
+            <View
+              style={[
+                styles.unrenderableThumbnail,
+                thumbnailSize,
+                { backgroundColor: systemColors.secondaryBackground, borderColor: systemColors.separator },
+              ]}
+            >
+              <Icon name="warning" size={24} color={systemColors.secondaryLabel} />
+            </View>
+          ) : null}
           <View style={styles.unrenderableText}>
             <Text variant="body" numberOfLines={1} color={systemColors.label} style={styles.unrenderableTitle}>
               {climb.name}
@@ -856,282 +323,31 @@ function UnrenderablePlaylistClimbRow({
           </View>
         </View>
         {editMode ? (
-          <Pressable
+          <PressableSurface
             onPress={handleRemove}
             hitSlop={8}
             accessibilityRole="button"
             accessibilityLabel={t('editClimbs.removeAria', { name: climb.name })}
             style={({ pressed }) => [styles.unrenderableRemove, pressed && styles.unrenderablePressed]}
           >
-            <Icon name="minus.circle" size={24} color={iosSystemColors.systemRed} />
-          </Pressable>
+            <Icon name="minus.circle" size={24} color={systemColors.error} />
+          </PressableSurface>
         ) : null}
       </View>
-      <View style={[styles.unrenderableSeparator, { backgroundColor: systemColors.separator }]} />
+      <View
+        style={[
+          styles.unrenderableSeparator,
+          {
+            marginStart: climbRowSeparatorInset(hasThumbnail, undefined, thumbnailSize.width),
+            backgroundColor: systemColors.separator,
+          },
+        ]}
+      />
     </View>
   );
-}
-
-function keyExtractor(item: Climb) {
-  return item.uuid;
 }
 
 // Hoisted stable keys for the first-page skeleton rows — never reorder, so index
 // keys are fine and avoid allocating an array on every render. Exported so the
 // route-level early-return skeletons share the same count (no drift from this view).
 export const SKELETON_PLACEHOLDERS = Array.from({ length: SKELETON_ROW_COUNT }, (_, index) => `skeleton-${index}`);
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  islandFill: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-  },
-  headerBar: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    zIndex: 1,
-    overflow: 'hidden',
-  },
-  headerBarRow: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    // Keep the centered name clear of the back / action FABs at the edges.
-    paddingHorizontal: 64,
-  },
-  headerBarTitle: {
-    fontWeight: '600',
-  },
-  topBar: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    zIndex: 2,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: spacing[4],
-  },
-  topBarActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-  },
-  hero: {
-    marginBottom: spacing[2],
-  },
-  heroBanner: {
-    borderBottomLeftRadius: borderRadius.xl,
-    borderBottomRightRadius: borderRadius.xl,
-    overflow: 'hidden',
-    paddingBottom: spacing[5],
-  },
-  heroBannerContent: {
-    paddingHorizontal: spacing[4],
-  },
-  heroEmoji: {
-    fontSize: 52,
-    lineHeight: 60,
-    marginBottom: spacing[2],
-  },
-  heroName: {
-    textShadowColor: 'rgba(0, 0, 0, 0.35)',
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 3,
-  },
-  heroNameRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-  },
-  heroNameFlex: {
-    flexShrink: 1,
-  },
-  heroCog: {
-    width: 32,
-    height: 32,
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexShrink: 0,
-  },
-  heroBannerMeta: {
-    marginTop: 2,
-    opacity: 0.85,
-  },
-  heroBelow: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[4],
-    paddingBottom: spacing[5],
-    gap: 2,
-  },
-  heroSubtitle: {
-    opacity: 0.5,
-  },
-  heroDescription: {
-    opacity: 0.7,
-  },
-  // ── Material hero ──────────────────────────────────────────────────────────
-  materialAppbar: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    zIndex: 2,
-    elevation: 0,
-  },
-  // Wraps Appbar.Content so the title can fade in (opacity-animated) as the hero
-  // band scrolls under the bar, without animating the back / play actions.
-  materialAppbarTitle: {
-    flex: 1,
-  },
-  materialAppbarTitleText: {
-    fontSize: 18,
-    fontWeight: '600',
-  },
-  materialHero: {
-    marginBottom: spacing[2],
-  },
-  materialHeroBand: {
-    alignItems: 'center',
-    paddingHorizontal: spacing[5],
-    paddingBottom: spacing[6],
-    borderBottomLeftRadius: borderRadius.xl,
-    borderBottomRightRadius: borderRadius.xl,
-  },
-  materialHeroEmojiCircle: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginBottom: spacing[3],
-  },
-  materialHeroEmoji: {
-    fontSize: 36,
-    lineHeight: 44,
-  },
-  materialHeroNameRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing[2],
-  },
-  materialHeroName: {
-    textAlign: 'center',
-    flexShrink: 1,
-  },
-  materialHeroMeta: {
-    marginTop: 2,
-    textAlign: 'center',
-  },
-  materialEmptyTitle: {
-    textAlign: 'center',
-  },
-  materialEmptySupporting: {
-    textAlign: 'center',
-  },
-  emptyActionButton: {
-    marginTop: spacing[4],
-  },
-  banner: {
-    marginHorizontal: spacing[4],
-    marginTop: spacing[2],
-    marginBottom: spacing[2],
-    padding: spacing[4],
-    borderRadius: borderRadius.lg,
-    borderWidth: StyleSheet.hairlineWidth,
-    gap: spacing[3],
-  },
-  bannerRow: {
-    flexDirection: 'row',
-    alignItems: 'flex-start',
-    gap: spacing[3],
-  },
-  bannerText: {
-    flex: 1,
-    gap: 2,
-  },
-  bannerTitle: {
-    fontWeight: '600',
-    marginBottom: 2,
-  },
-  bannerButton: {
-    alignSelf: 'flex-start',
-  },
-  footer: {
-    paddingVertical: 20,
-    alignItems: 'center',
-  },
-  skeletonList: {
-    paddingTop: spacing[2],
-  },
-  stateContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingTop: 80,
-    paddingHorizontal: 32,
-    gap: 12,
-  },
-  emptyText: {
-    opacity: 0.5,
-    textAlign: 'center',
-  },
-  unrenderableOuter: {
-    position: 'relative',
-    overflow: 'hidden',
-  },
-  unrenderableRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: spacing[2],
-    paddingVertical: spacing[2],
-    gap: spacing[2],
-  },
-  unrenderableContent: {
-    flex: 1,
-    minWidth: 0,
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[3],
-  },
-  unrenderableThumbnail: {
-    width: THUMBNAIL_WIDTH,
-    height: THUMBNAIL_HEIGHT,
-    borderRadius: borderRadius.md,
-    borderWidth: StyleSheet.hairlineWidth,
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexShrink: 0,
-  },
-  unrenderableText: {
-    flex: 1,
-    minWidth: 0,
-    gap: 2,
-  },
-  unrenderableTitle: {
-    fontWeight: '600',
-  },
-  unrenderableRemove: {
-    width: 44,
-    height: 44,
-    alignItems: 'center',
-    justifyContent: 'center',
-    flexShrink: 0,
-  },
-  unrenderablePressed: {
-    opacity: 0.6,
-  },
-  unrenderableSeparator: {
-    height: StyleSheet.hairlineWidth,
-    marginLeft: THUMBNAIL_WIDTH + spacing[2] + spacing[3],
-  },
-});

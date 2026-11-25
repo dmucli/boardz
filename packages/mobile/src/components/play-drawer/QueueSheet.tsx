@@ -1,20 +1,22 @@
-import { forwardRef, useCallback, useImperativeHandle, useMemo, useRef, useState } from 'react';
-import { View, Pressable, Platform, StyleSheet } from 'react-native';
-import { BottomSheetModal } from '@expo/ui/community/bottom-sheet';
+import { QueueSheetView } from './QueueSheetView';
+
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react';
+import { StyleSheet, View } from 'react-native';
+
+import { BottomSheetModal } from '../sheet-presentation';
 import { useManagedSheet, type DismissAndWaitResult } from '../../providers/sheet-presentation-provider';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useTranslation } from 'react-i18next';
 import type { Climb, ClimbQueueItem, PlaylistSuggestionSource } from '@boardsesh/queue';
-import { QueueSheetHeader } from './QueueSheetHeader';
-import { QueueList } from './QueueList';
-import { Text } from '../Text';
+import { QueueListBody, type QueueListBodyHandle } from './QueueListBody';
 import type { QueueItemRowBoard } from '../QueueItemRow';
-import { usePlaylistSuggestionSource, useQueueData, useQueueActions } from '../../providers/queue-provider';
-import { useTheme } from '../../providers/theme-provider';
-import { hapticMedium, hapticWarning } from '../../lib/haptics';
-import { brandColors } from '../../theme/colors';
-import { iosSystemColors } from '../../theme/ios-colors';
-import { spacing } from '../../theme/tokens';
+import { useQueueData } from '../../providers/queue-provider';
+
+import { usePrivacyScopedState } from '../../hooks/use-privacy-scoped-state';
+import { sanitizeQueueSnapshot } from '../../lib/queue-privacy';
+
+import { useLogAscentSheetHost } from '../tick/use-log-ascent-sheet-host';
+import type { QueueHistoryTickHandler } from './use-queue-sheet-handlers';
+import { getCredentialGeneration } from '../../lib/privacy/privacy-cache';
+import type { ClimbActionsTarget } from '../../providers/drawer-host-provider';
 
 type QueueSheetProps = {
   board: QueueItemRowBoard;
@@ -25,10 +27,10 @@ type QueueSheetProps = {
    *  no longer needs this to unmount, so callers may omit it. */
   onDismissed?: () => void;
   onClimbPress: (item: ClimbQueueItem) => void;
-  /** Long press a queue row → open the climb reaction menu. */
-  onOpenActions?: (item: ClimbQueueItem) => void;
+  /** Resolve the row's native menu target. */
+  onOpenActions?: (item: ClimbQueueItem) => ClimbActionsTarget | null | undefined;
   onSuggestionPress: (climb: Climb, source: PlaylistSuggestionSource) => void;
-  onTickHistory: (item: ClimbQueueItem) => void;
+  onTickHistory: QueueHistoryTickHandler;
 };
 
 /**
@@ -41,26 +43,29 @@ export type QueueSheetHandle = {
   dismiss: () => void;
   /** Dismiss and resolve only after the native animation settles. */
   dismissAndWait: () => Promise<DismissAndWaitResult>;
+  /** Layout-only close: keep an open Tick intact, then fold once it finishes.
+   * Passing false withdraws the request when the layout changes back. */
+  dismissWhenUncovered: (requested: boolean) => void;
 };
 
 export const QueueSheet = forwardRef<QueueSheetHandle, QueueSheetProps>(function QueueSheet(
   { board, onClose, onDismissed, onClimbPress, onOpenActions, onSuggestionPress, onTickHistory },
   ref,
 ) {
-  const { t } = useTranslation('session');
-  const insets = useSafeAreaInsets();
-  const { systemColors, sheet } = useTheme();
   const sheetRef = useRef<BottomSheetModal>(null);
-
-  const { removeFromQueue, clearQueue, reorderQueue } = useQueueActions();
-  const playlistSuggestionSource = usePlaylistSuggestionSource();
+  const bodyRef = useRef<QueueListBodyHandle>(null);
+  const resetTickRef = useRef<() => void>(() => {});
+  const tickOpenRequest = useRef(0);
+  useEffect(
+    () => () => {
+      tickOpenRequest.current += 1;
+    },
+    [],
+  );
   const liveQueueData = useQueueData();
 
-  const [isEditMode, setIsEditMode] = useState(false);
-  const [showHistory, setShowHistory] = useState(true);
-  const [showFullHistory, setShowFullHistory] = useState(false);
-  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [isDragging, setIsDragging] = useState(false);
+  const [dismissWhenUncovered, setDismissWhenUncovered] = useState(false);
   // Tracks whether the sheet is currently presented so the list only
   // auto-scrolls to the current item on a real open (not on background mounts).
   const [isPresented, setIsPresented] = useState(false);
@@ -73,38 +78,64 @@ export const QueueSheet = forwardRef<QueueSheetHandle, QueueSheetProps>(function
   // path both read active.
   const [isActive, setIsActive] = useState(false);
 
-  const snapPoints = useMemo(() => ['70%', '95%'], []);
-
   // Both QueueSheet instances (root + /play copy, PR #3337) stay mounted the whole
   // session. Freeze the hidden one's queue data to a referentially stable snapshot
   // so it bails out of the memoized QueueList instead of rebuilding
   // buildQueueListModel on every queue nav elsewhere; the visible sheet tracks live.
   // Derive-during-render (compiler-safe) — no ref writes, no effect lag.
   const activeOrPresented = isActive || isPresented;
-  const [snapshot, setSnapshot] = useState(liveQueueData);
+  const [snapshot, setSnapshot] = usePrivacyScopedState(liveQueueData);
   if (activeOrPresented && snapshot !== liveQueueData) setSnapshot(liveQueueData);
-  const { queue, currentClimbQueueItem } = snapshot;
-
-  const currentItemUuid = currentClimbQueueItem?.uuid ?? null;
-
-  const resetState = useCallback(() => {
-    setIsEditMode(false);
-    setSelectedItems(new Set());
-    setShowFullHistory(false);
-  }, []);
+  const { queue, currentClimbQueueItem, historyCount } = snapshot ?? sanitizeQueueSnapshot(liveQueueData);
 
   // The modal's dismiss animation has actually SETTLED (coordinator: header
   // request, backdrop, or pan-down). Reset local UI state; the sheet stays
   // mounted (imperative model) and is re-presented on the next open.
   const handleFullyDismissed = useCallback(() => {
+    tickOpenRequest.current += 1;
+    resetTickRef.current();
     setIsActive(false);
-    resetState();
+    bodyRef.current?.reset();
     onDismissed?.();
-  }, [resetState, onDismissed]);
+  }, [onDismissed]);
 
   // Present/dismiss route through the coordinator so they never overlap another
   // sheet's transition (the iOS UIKit deadlock).
-  const managed = useManagedSheet({ sheetRef, onFullyDismissed: handleFullyDismissed });
+  const invalidateTickRequest = useCallback(() => {
+    tickOpenRequest.current += 1;
+  }, []);
+  const managed = useManagedSheet({
+    sheetRef,
+    onFullyDismissed: handleFullyDismissed,
+    onDisplaced: invalidateTickRequest,
+  });
+  const {
+    openLogAscent,
+    reset: resetTick,
+    sheet: tickSheet,
+    hasRequest: hasTickRequest,
+  } = useLogAscentSheetHost(`queue-tick:${managed.sheetId}`, managed.sheetId);
+  resetTickRef.current = resetTick;
+  useEffect(() => {
+    if (!dismissWhenUncovered || hasTickRequest) return;
+    invalidateTickRequest();
+    managed.handle.dismiss();
+  }, [dismissWhenUncovered, hasTickRequest, invalidateTickRequest, managed.handle]);
+  const handleTickHistory = useCallback(
+    async (item: ClimbQueueItem) => {
+      const request = ++tickOpenRequest.current;
+      const credentialGeneration = getCredentialGeneration();
+      const outcome = await managed.waitForPresentation();
+      if (
+        outcome.status !== 'presented' ||
+        request !== tickOpenRequest.current ||
+        credentialGeneration !== getCredentialGeneration()
+      )
+        return;
+      onTickHistory(item, openLogAscent);
+    },
+    [managed.waitForPresentation, onTickHistory, openLogAscent],
+  );
 
   // Track presented state off the native onChange (index >= 0 = a real snap) so
   // it stays correct even when the COORDINATOR re-presents this sheet after a
@@ -113,185 +144,69 @@ export const QueueSheet = forwardRef<QueueSheetHandle, QueueSheetProps>(function
   // (no auto-scroll to the current climb on a re-present).
   const handleSheetChange = useCallback(
     (index: number) => {
+      if (index < 0) invalidateTickRequest();
       managed.onChange(index);
       setIsPresented(index >= 0);
     },
-    [managed],
+    [managed, invalidateTickRequest],
   );
 
   useImperativeHandle(
     ref,
     () => ({
       present: () => {
+        setDismissWhenUncovered(false);
         setIsActive(true);
         managed.handle.present();
       },
       dismiss: () => {
+        invalidateTickRequest();
         managed.handle.dismiss();
       },
-      dismissAndWait: () => managed.handle.dismissAndWait(),
+      dismissAndWait: () => {
+        invalidateTickRequest();
+        return managed.handle.dismissAndWait();
+      },
+      dismissWhenUncovered: setDismissWhenUncovered,
     }),
-    [managed.handle],
+    [managed.handle, invalidateTickRequest],
   );
 
-  const handleToggleEditMode = useCallback(() => {
-    setIsEditMode((prev) => {
-      if (prev) {
-        setSelectedItems(new Set());
-      }
-      return !prev;
-    });
-  }, []);
-
-  const handleToggleHistory = useCallback(() => {
-    setShowHistory((prev) => !prev);
-  }, []);
-
-  const handleShowFullHistory = useCallback(() => {
-    setShowFullHistory(true);
-  }, []);
-
-  const handleToggleSelect = useCallback((uuid: string) => {
-    setSelectedItems((prev) => {
-      const next = new Set(prev);
-      if (next.has(uuid)) {
-        next.delete(uuid);
-      } else {
-        next.add(uuid);
-      }
-      return next;
-    });
-  }, []);
-
-  const handleClearAll = useCallback(() => {
-    hapticWarning();
-    clearQueue();
-    setIsEditMode(false);
-    setSelectedItems(new Set());
-  }, [clearQueue]);
-
-  const handleBulkRemove = useCallback(() => {
-    hapticMedium();
-    for (const uuid of selectedItems) {
-      removeFromQueue(uuid);
-    }
-    setSelectedItems(new Set());
-    setIsEditMode(false);
-  }, [selectedItems, removeFromQueue]);
-
-  const handleRemove = useCallback(
-    (uuid: string) => {
-      removeFromQueue(uuid);
-    },
-    [removeFromQueue],
-  );
-
-  const viewOnlyMode = queue.length === 0;
-
-  return (
-    <BottomSheetModal
-      ref={sheetRef}
-      index={0}
-      snapPoints={snapPoints}
-      enablePanDownToClose
-      // Freeze the sheet pan while a row is being dragged so scroll-to-expand
-      // never fights the reorder gesture.
-      enableContentPanningGesture={!isDragging}
-      enableHandlePanningGesture={!isDragging}
-      onChange={handleSheetChange}
-      onFullyDismissed={managed.onFullyDismissed}
-      handleIndicatorStyle={sheet.handleStyle}
-      style={styles.sheet}
-    >
-      <QueueSheetHeader
-        isEditMode={isEditMode}
-        showHistory={showHistory}
-        selectedCount={selectedItems.size}
-        queueCount={queue.length}
-        viewOnlyMode={viewOnlyMode}
-        onToggleEditMode={handleToggleEditMode}
-        onToggleHistory={handleToggleHistory}
-        onClose={onClose}
-        onClearAll={handleClearAll}
-      />
-
-      <QueueList
-        queue={queue}
-        currentItemUuid={currentItemUuid}
+  const sheetContent = (
+    <View style={styles.content}>
+      <QueueListBody
+        ref={bodyRef}
         board={board}
-        isEditMode={isEditMode}
-        showHistory={showHistory}
-        showFullHistory={showFullHistory}
-        selectedItems={selectedItems}
-        playlistSuggestionSource={playlistSuggestionSource}
+        queue={queue}
+        currentClimbQueueItem={currentClimbQueueItem}
+        historyCount={historyCount}
         active={isPresented}
-        autoScrollOnMount={isPresented}
-        onToggleSelect={handleToggleSelect}
+        presentation="sheet"
+        onClose={onClose}
         onClimbPress={onClimbPress}
         onOpenActions={onOpenActions}
-        onRemove={handleRemove}
-        onShowFullHistory={handleShowFullHistory}
-        onTickHistory={onTickHistory}
         onSuggestionPress={onSuggestionPress}
-        reorderQueue={reorderQueue}
+        onTickHistory={handleTickHistory}
         onDraggingChange={setIsDragging}
       />
+      {/* This Host belongs to the queue's presented view controller. A sibling
+        beside QueueSheet would still present from under the player. */}
+      {tickSheet}
+    </View>
+  );
 
-      {isEditMode && selectedItems.size > 0 && (
-        <View
-          style={[
-            styles.bulkBar,
-            {
-              paddingBottom: insets.bottom + spacing[3],
-              backgroundColor: systemColors.background,
-              borderTopColor: systemColors.separator,
-            },
-          ]}
-        >
-          <Pressable
-            onPress={handleBulkRemove}
-            accessibilityRole="button"
-            accessibilityLabel={t('queueDrawer.removeItems', { count: selectedItems.size })}
-            style={styles.bulkButton}
-          >
-            <Text variant="headline" color={iosSystemColors.white}>
-              {t('queueDrawer.removeItems', { count: selectedItems.size })}
-            </Text>
-          </Pressable>
-        </View>
-      )}
-    </BottomSheetModal>
+  return (
+    <QueueSheetView
+      ref={sheetRef}
+      isDragging={isDragging}
+      onChange={handleSheetChange}
+      onFullyDismissed={managed.onFullyDismissed}
+    >
+      {sheetContent}
+    </QueueSheetView>
   );
 });
 
 const styles = StyleSheet.create({
-  sheet: {
-    ...Platform.select({
-      ios: {
-        shadowColor: '#000',
-        shadowOffset: { width: 0, height: -4 },
-        shadowOpacity: 0.1,
-        shadowRadius: 12,
-      },
-      android: {
-        elevation: 16,
-      },
-    }),
-  },
-  bulkBar: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[3],
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  bulkButton: {
-    backgroundColor: brandColors.error,
-    borderRadius: 12,
-    paddingVertical: spacing[3],
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
+  content: { flex: 1 },
 });

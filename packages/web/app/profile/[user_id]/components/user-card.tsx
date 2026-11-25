@@ -36,7 +36,7 @@ export default function UserCard({ userId, profile, isOwnProfile, onProfileUpdat
           </MuiAvatar>
           <div className={styles.profileDetails}>
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
-              <Typography variant="h6" component="h4" className={styles.displayName}>
+              <Typography variant="h6" component="h1" className={styles.displayName}>
                 {displayName}
               </Typography>
               {!isOwnProfile && (
@@ -57,17 +57,19 @@ export default function UserCard({ userId, profile, isOwnProfile, onProfileUpdat
                 />
               )}
             </Box>
-            <FollowerCount
-              userId={userId}
-              followerCount={profile.followerCount}
-              followingCount={profile.followingCount}
-            />
+            {profile.canViewActivity !== false && (
+              <FollowerCount
+                userId={userId}
+                followerCount={profile.followerCount}
+                followingCount={profile.followingCount}
+              />
+            )}
             {isOwnProfile && (
               <Typography variant="body2" component="span" color="text.secondary">
                 {profile.email}
               </Typography>
             )}
-            {instagramUrl && (
+            {instagramUrl && profile.canViewActivity !== false && (
               <a
                 href={instagramUrl.startsWith('http') ? instagramUrl : `https://${instagramUrl}`}
                 target="_blank"

@@ -15,12 +15,16 @@ type GraphqlErrorLike = {
   } | null;
 };
 
+function isGraphqlErrorLike(error: unknown): error is GraphqlErrorLike {
+  return error !== null && typeof error === 'object';
+}
+
 function getGraphqlErrors(error: unknown): GraphqlErrorLike[] {
   if (!error || typeof error !== 'object') return [];
   const response = (error as { response?: { errors?: GraphqlErrorLike[] } }).response;
-  if (Array.isArray(response?.errors)) return response.errors;
+  if (Array.isArray(response?.errors)) return response.errors.filter(isGraphqlErrorLike);
   const graphqlErrors = (error as { graphqlErrors?: GraphqlErrorLike[] }).graphqlErrors;
-  return Array.isArray(graphqlErrors) ? graphqlErrors : [];
+  return Array.isArray(graphqlErrors) ? graphqlErrors.filter(isGraphqlErrorLike) : [];
 }
 
 export function extractGraphqlMessage(error: unknown): string | null {
@@ -41,13 +45,37 @@ export function extractGraphqlCode(error: unknown): string | null {
   return typeof code === 'string' ? code : null;
 }
 
+/** Read structured server backpressure without inspecting messages or request variables. */
+export function readGraphqlRateLimit(error: unknown): {
+  operation: string | null;
+  retryAfterSeconds: number | null;
+} | null {
+  if (!error || typeof error !== 'object') return null;
+  const record = error as {
+    extensions?: GraphqlErrorLike['extensions'];
+    response?: { errors?: unknown };
+    graphqlErrors?: unknown;
+  };
+  const candidates = [
+    record.extensions,
+    ...(Array.isArray(record.response?.errors)
+      ? record.response.errors.filter(isGraphqlErrorLike).map((graphqlError) => graphqlError.extensions)
+      : []),
+    ...(Array.isArray(record.graphqlErrors)
+      ? record.graphqlErrors.filter(isGraphqlErrorLike).map((graphqlError) => graphqlError.extensions)
+      : []),
+  ];
+  const extensions = candidates.find((candidate) => candidate?.code === 'RATE_LIMITED');
+  if (!extensions) return null;
+  const delay = extensions.retryAfterSeconds;
+  return {
+    operation: typeof extensions.operation === 'string' ? extensions.operation : null,
+    retryAfterSeconds: typeof delay === 'number' && Number.isFinite(delay) && delay >= 0 ? delay : null,
+  };
+}
+
 export function isGraphqlRateLimitedError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
-
-  const directExtensions = (error as { extensions?: GraphqlErrorLike['extensions'] }).extensions;
-  if (directExtensions?.code === 'RATE_LIMITED') return true;
-
-  return getGraphqlErrors(error).some((graphqlError) => graphqlError.extensions?.code === 'RATE_LIMITED');
+  return readGraphqlRateLimit(error) !== null;
 }
 
 const GRAPHQL_VALIDATION_FAILED = 'GRAPHQL_VALIDATION_FAILED';
@@ -169,12 +197,88 @@ export function isSprayWallVisibilityOwnerOnlyError(error: unknown): boolean {
   );
 }
 
+/**
+ * `extensions.code` values the spray API refuses a write with because of where
+ * the wall stands in its reset lifecycle (`docs/product/spray-walls.md`, "Archive and
+ * reset"). `resetRetired` comes from a later backend release; mapping it now
+ * means the copy is in place the day it arrives.
+ */
+export const SPRAY_WALL_LIFECYCLE_CODES = {
+  /** The wall is archived: nothing new can be set on it, and its holds cannot change. */
+  archived: 'SPRAY_WALL_ARCHIVED',
+  /** An old client called the retired in-place reset. */
+  resetRetired: 'SPRAY_WALL_RESET_RETIRED',
+  /** Only the wall's owner may reset it. */
+  resetOwnerOnly: 'SPRAY_WALL_RESET_OWNER_ONLY',
+  /** The wall has never been published, so there is nothing to reset. */
+  resetSourceUnpublished: 'SPRAY_WALL_RESET_SOURCE_UNPUBLISHED',
+  /** The owner already keeps the maximum number of archived walls. */
+  archiveLimitReached: 'SPRAY_WALL_ARCHIVE_LIMIT_REACHED',
+} as const;
+
+export type SprayWallLifecycleRefusal = keyof typeof SPRAY_WALL_LIFECYCLE_CODES;
+
+const LIFECYCLE_REFUSAL_BY_CODE = new Map<string, SprayWallLifecycleRefusal>(
+  (Object.entries(SPRAY_WALL_LIFECYCLE_CODES) as [SprayWallLifecycleRefusal, string][]).map(([refusal, code]) => [
+    code,
+    refusal,
+  ]),
+);
+
+/**
+ * Which lifecycle refusal a failed spray write was, or null for anything else.
+ *
+ * Matched on the code, never on the message text. Reads the code off an error
+ * that carries `extensions` itself (`GraphQLOperationError` lifts the first
+ * coded error's extensions onto itself) and off a raw graphql-request error.
+ */
+export function sprayWallLifecycleRefusal(error: unknown): SprayWallLifecycleRefusal | null {
+  if (!error || typeof error !== 'object') return null;
+  const lifted = (error as { extensions?: { code?: unknown } | null }).extensions?.code;
+  const code = typeof lifted === 'string' ? lifted : extractGraphqlCode(error);
+  return code ? (LIFECYCLE_REFUSAL_BY_CODE.get(code) ?? null) : null;
+}
+
+/**
+ * The refusal that means this device's picture of the wall is out of date: it
+ * was archived since the wall was last read. The caller refreshes the wall
+ * (`refreshSprayWall`) so the screen catches up.
+ */
+export function sprayWallRefusalMeansStaleWall(refusal: SprayWallLifecycleRefusal | null): boolean {
+  return refusal === 'archived';
+}
+
+/**
+ * The wall's photo fails the generated-look quality gate, so the server will
+ * not store a `wall-crop` / `hold-cutouts` background for it.
+ */
+export function isSprayWallArtNotAvailableError(error: unknown): boolean {
+  return getGraphqlErrors(error).some(
+    (graphqlError) => graphqlError.extensions?.code === 'SPRAY_WALL_ART_NOT_AVAILABLE',
+  );
+}
+
+/** Why the server refused a generated look (`extensions.reason`): `no-pins`, `keystone`, `small-frame`, … */
+export function readSprayWallArtRefusalReason(error: unknown): string | null {
+  const refusal = getGraphqlErrors(error).find(
+    (graphqlError) => graphqlError.extensions?.code === 'SPRAY_WALL_ART_NOT_AVAILABLE',
+  );
+  const reason = refusal?.extensions?.reason;
+  return typeof reason === 'string' ? reason : null;
+}
+
 // The board-mutation rejections clients branch on are parsed in
 // @boardsesh/graphql so web and mobile read the same shapes. Re-exported here so
 // board screens keep a single import for GraphQL error handling.
 export {
   isDuplicateBoardError,
   readDuplicateBoardError,
+  readExistingWallsError,
+  readUnknownBoardConfigError,
   isBoardLimitError,
+  isBoardRemovedByGymError,
+  isSystemBoardDeleteInsteadError,
   type DuplicateBoardError,
+  type ExistingWallErrorCandidate,
+  type UnknownBoardConfigField,
 } from '@boardsesh/graphql/errors';

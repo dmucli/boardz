@@ -1,132 +1,520 @@
 // @vitest-environment jsdom
-//
-// The three states this hook has to tell apart, and the frame between two of
-// them.
-//
-// `registerRenderData` writes to a module-level map, so it cannot run in a
-// `useMemo` — which means there is one render where the payload has arrived and
-// the registry has not been told yet. Reporting that frame as "unavailable"
-// flashes a "this wall has no photo to edit yet" screen before the editor
-// appears; reporting a payload that genuinely CANNOT be drawn as "loading" hangs
-// a spinner forever. The verdict is therefore keyed on the payload, and this file
-// is what stops a future refactor collapsing it back to a boolean.
-import { describe, expect, it, vi, beforeEach } from 'vitest';
-import { renderHook, waitFor } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { act, cleanup, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { useDiscardSprayWallDraft } from '../use-create-spray-wall';
+import type { SprayWallRenderData } from '@boardsesh/graphql/generated/graphql';
 
 const requestMock = vi.hoisted(() => vi.fn());
-const registerRenderDataMock = vi.hoisted(() => vi.fn());
-const invalidateMock = vi.hoisted(() => vi.fn(() => Promise.resolve()));
-
+const invalidateMock = vi.hoisted(() => vi.fn(async () => {}));
+const retryMock = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock('../../graphql/client', () => ({ getHttpClient: () => ({ request: requestMock }) }));
+vi.mock('../../connectivity/connectivity-store', () => ({ retryConnectivityNow: retryMock }));
+// The real cleanup also erases files; here it only has to withdraw the wall.
+vi.mock('../spray-privacy-cleanup', async () => {
+  const { unregisterSprayWall: withdraw } = await import('../spray-wall-registry');
+  return { clearSprayWallPrivateCaches: (layoutId: number) => withdraw(layoutId) };
+});
 vi.mock('../spray-wall-loader', () => ({
-  registerRenderData: registerRenderDataMock,
   invalidateSprayWallRenderData: invalidateMock,
+  primeSprayWallLook: vi.fn(),
+  mapSprayWallRenderData: (layoutId: number, payload: SprayWallRenderData, versionId: number, receivedAtMs: number) => {
+    if (!payload.photo.width || !payload.photo.height) return null;
+    return {
+      layoutId,
+      wallUuid: payload.wall.uuid,
+      version: payload.versionNumber,
+      versionId,
+      photoWidth: payload.photo.width,
+      photoHeight: payload.photo.height,
+      photoUrl: payload.photo.url,
+      photoThumbUrl: null,
+      photoExpiresAt: payload.photo.expiresAt,
+      holds: payload.holds,
+      angle: 40,
+      renderSettings: null,
+      viewerCanEdit: payload.wall.viewerCanEdit === true,
+      registeredAtMs: receivedAtMs,
+    };
+  },
 }));
+import {
+  prefetchSprayWallDraft,
+  sprayWallDraftQueryKey,
+  useKeepSprayDraftRegistered,
+  useSprayWallDraft,
+} from '../use-spray-wall-draft';
+import {
+  clearSprayWallRegistry,
+  getSprayWall,
+  registerSprayWall,
+  resetSprayWallViewerAccess,
+  setSprayWallPrivacyCleanup,
+  sprayWallViewerCanEdit,
+  unregisterSprayWall,
+  withdrawAllSprayWalls,
+} from '../spray-wall-registry';
 
-import { useSprayWallDraft } from '../use-spray-wall-draft';
-
-const RENDER_DATA = {
-  versionNumber: 3,
-  homography: [1, 0, 0, 0, 1, 0, 0, 0, 1],
-  photo: { url: 'u', thumbUrl: null, width: 900, height: 1200, expiresAt: 'later' },
-  holds: [],
-  wall: { uuid: 'wall-1' },
-};
-
-function wrapper({ children }: { children: ReactNode }) {
-  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
+const LAYOUT_ID = 4001;
+function payload(versionId = '30', initial = false) {
+  return {
+    versionNumber: 3,
+    homography: [1, 0, 0, 0, 1, 0, 0, 0, 1],
+    photo: {
+      url: `https://private.example/${versionId}.jpg?signature=1`,
+      thumbUrl: null,
+      width: 900,
+      height: 1200,
+      expiresAt: 'later',
+    },
+    holds: [{ id: 7, cx: 1, cy: 2, r: 3 }],
+    wall: {
+      uuid: 'wall-1',
+      viewerCanEdit: true,
+      currentVersion: initial ? null : { id: '20', number: 2 },
+      versions: [{ id: versionId, number: 3, status: 'DRAFT' }],
+    },
+  };
 }
-
+let client: QueryClient;
+function wrapper({ children }: { children: ReactNode }) {
+  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+}
+function registerPublished() {
+  registerSprayWall(LAYOUT_ID, {
+    wallUuid: 'wall-1',
+    version: 2,
+    versionId: 20,
+    angle: 40,
+    photoWidth: 1200,
+    photoHeight: 1600,
+    photoUrl: 'published-photo',
+    photoThumbUrl: null,
+    photoExpiresAt: 'later',
+    holds: [{ id: 99, cx: 90, cy: 80, r: 7 }],
+  });
+}
 beforeEach(() => {
+  clearSprayWallRegistry();
   requestMock.mockReset();
-  registerRenderDataMock.mockReset();
   invalidateMock.mockClear();
+  retryMock.mockClear();
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+});
+afterEach(() => {
+  cleanup();
+  client.clear();
+  clearSprayWallRegistry();
 });
 
-describe('useSprayWallDraft', () => {
-  it('never reports the wall unavailable on the frame its payload lands', async () => {
-    // The flash. `isUnavailable` must not be true at ANY point on the way from
-    // loading to ready, because the screen renders a hard error on it.
-    requestMock.mockResolvedValue({ sprayWallRenderData: RENDER_DATA });
-    registerRenderDataMock.mockReturnValue(true);
+describe('draft render ownership', () => {
+  it('requires fresh same-version holds before trusting a primed cache on reentry', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    await prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30');
+    let finishRead: ((response: { sprayWallRenderData: ReturnType<typeof payload> }) => void) | undefined;
+    requestMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30', { requireFreshEntry: true }), {
+      wrapper,
+    });
+    expect(result.current.wall).toBeNull();
+    expect(result.current.isLoading).toBe(true);
+    const fresh = payload();
+    fresh.holds.push({ id: 8, cx: 40, cy: 50, r: 6 });
+    await act(async () => finishRead?.({ sprayWallRenderData: fresh }));
+    await waitFor(() => expect(result.current.wall?.holds).toHaveLength(2));
+    expect(requestMock).toHaveBeenCalledTimes(2);
+  });
 
-    const seen: { isLoading: boolean; isUnavailable: boolean }[] = [];
+  it('keeps a failed fresh-entry read blocked even when cached geometry is available', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    await prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30');
+    requestMock.mockRejectedValueOnce(new Error('offline'));
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30', { requireFreshEntry: true }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.isStalled).toBe(true));
+    expect(result.current.wall).toBeNull();
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+  });
+
+  it('keeps verified geometry during a later photo-refresh failure', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30', { requireFreshEntry: true }), {
+      wrapper,
+    });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    requestMock.mockRejectedValueOnce(new Error('offline'));
+    await act(async () => result.current.refreshPhotoUrls());
+    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(2));
+    expect(result.current.wall?.versionId).toBe(30);
+    expect(result.current.isStalled).toBe(false);
+  });
+
+  it('retains cached look previews without requiring a hold-recovery read', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    await prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30');
+    requestMock.mockRejectedValue(new Error('offline'));
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    expect(result.current.wall?.versionId).toBe(30);
+    expect(result.current.isLoading).toBe(false);
+    expect(requestMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps a reset locally without replacing published photo or holds', async () => {
+    registerPublished();
+    const published = getSprayWall(LAYOUT_ID);
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    expect(result.current.wall?.photoUrl).toContain('/30.jpg');
+    expect(getSprayWall(LAYOUT_ID)).toBe(published);
+    expect(getSprayWall(LAYOUT_ID)?.holds[0]?.id).toBe(99);
+  });
+
+  it('keeps refreshed draft holds local', async () => {
+    registerPublished();
+    const published = getSprayWall(LAYOUT_ID);
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    const updated = payload();
+    updated.holds[0]!.cx = 500;
+    requestMock.mockResolvedValue({ sprayWallRenderData: updated });
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: sprayWallDraftQueryKey('wall-1', 3) });
+    });
+    await waitFor(() => expect(result.current.wall?.holds[0]?.cx).toBe(500));
+    expect(getSprayWall(LAYOUT_ID)).toBe(published);
+  });
+
+  // #5911: the hold editor swaps this in once it zooms past 3x.
+  it('hands over the full-resolution photo URL with the wall', async () => {
+    requestMock.mockResolvedValue({
+      sprayWallRenderData: { ...payload(), photoFullUrl: 'https://private.example/30-full.jpg?signature=1' },
+    });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    expect(result.current.photoFullUrl).toBe('https://private.example/30-full.jpg?signature=1');
+  });
+
+  // Walls uploaded before #5911 have no full copy; the editor keeps the base.
+  it('answers no full-resolution photo for a wall without one', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: { ...payload(), photoFullUrl: null } });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    expect(result.current.photoFullUrl).toBeNull();
+  });
+
+  // The same gates that withhold the wall withhold its sharper photo.
+  it('withholds the full-resolution photo of a row it rejects', async () => {
+    requestMock.mockResolvedValue({
+      sprayWallRenderData: { ...payload('31'), photoFullUrl: 'https://private.example/31-full.jpg?signature=1' },
+    });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.isUnavailable).toBe(true));
+    expect(result.current.photoFullUrl).toBeNull();
+  });
+
+  // A lapsed signature is refreshed in the background, never as a reload.
+  it('refreshes the photo URLs without going back to loading', async () => {
+    requestMock.mockResolvedValue({
+      sprayWallRenderData: { ...payload(), photoFullUrl: 'https://private.example/30-full.jpg?signature=1' },
+    });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    requestMock.mockResolvedValue({
+      sprayWallRenderData: { ...payload(), photoFullUrl: 'https://private.example/30-full.jpg?signature=2' },
+    });
+    const loadingSeen: boolean[] = [];
+    act(() => result.current.refreshPhotoUrls());
+    loadingSeen.push(result.current.isLoading);
+    await waitFor(() => expect(result.current.photoFullUrl).toContain('signature=2'));
+    loadingSeen.push(result.current.isLoading);
+    expect(loadingSeen).toEqual([false, false]);
+    expect(result.current.wall?.versionId).toBe(30);
+  });
+
+  it('rejects a refetch that resolves a reused number to a replacement row', async () => {
+    registerPublished();
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('31') });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.isUnavailable).toBe(true));
+    expect(result.current.wall).toBeNull();
+    expect(getSprayWall(LAYOUT_ID)?.versionId).toBe(20);
+  });
+
+  it('does not reuse a discarded draft query when its number is reused', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('30') });
+    await prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30');
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('31') });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '31'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(31));
+    expect(requestMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('registers an initial unpublished draft for the look carousel', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.versionId).toBe(30));
+  });
+
+  it('never reports unavailable on the frame a valid draft payload lands', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const seen: boolean[] = [];
     const { result } = renderHook(
       () => {
-        const state = useSprayWallDraft(4001, 'wall-1', 3);
-        seen.push({ isLoading: state.isLoading, isUnavailable: state.isUnavailable });
-        return state;
+        const draft = useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30');
+        seen.push(draft.isUnavailable);
+        return draft;
       },
       { wrapper },
     );
-
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(result.current.isUnavailable).toBe(false);
-    expect(result.current.homography).toEqual(RENDER_DATA.homography);
-    expect(seen.some((state) => state.isUnavailable)).toBe(false);
-  });
-
-  it('reports a payload the registry refuses as unavailable, not as loading forever', async () => {
-    // No readable photo size, or a homography with no inverse. A spinner here
-    // would never stop.
-    requestMock.mockResolvedValue({ sprayWallRenderData: RENDER_DATA });
-    registerRenderDataMock.mockReturnValue(false);
-
-    const { result } = renderHook(() => useSprayWallDraft(4001, 'wall-1', 3), { wrapper });
-
-    await waitFor(() => expect(result.current.isUnavailable).toBe(true));
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
     expect(result.current.isLoading).toBe(false);
+    expect(seen).not.toContain(true);
   });
 
-  it('reports a version that does not resolve as unavailable', async () => {
-    requestMock.mockResolvedValue({ sprayWallRenderData: null });
+  it('withdraws local draft state when the account changes', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    act(() => {
+      resetSprayWallViewerAccess();
+    });
+    expect(result.current.wall).toBeNull();
+    expect(result.current.isUnavailable).toBe(true);
+  });
 
-    const { result } = renderHook(() => useSprayWallDraft(4001, 'wall-1', 3), { wrapper });
-
+  it('discards an old draft response that lands after sign-out, without reading again', async () => {
+    let completeOld!: (response: unknown) => void;
+    requestMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        completeOld = resolve;
+      }),
+    );
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(1));
+    act(() => withdrawAllSprayWalls());
+    await act(async () => {
+      completeOld({ sprayWallRenderData: payload('30', true) });
+    });
     await waitFor(() => expect(result.current.isUnavailable).toBe(true));
-    expect(registerRenderDataMock).not.toHaveBeenCalled();
-    expect(result.current.homography).toBeNull();
+    expect(result.current.wall).toBeNull();
+    expect(requestMock).toHaveBeenCalledTimes(1);
+    expect(getSprayWall(LAYOUT_ID)).toBeNull();
   });
 
-  it('asks for the version by NUMBER — without it the server answers the published one', async () => {
-    requestMock.mockResolvedValue({ sprayWallRenderData: RENDER_DATA });
-    registerRenderDataMock.mockReturnValue(true);
-
-    const { result } = renderHook(() => useSprayWallDraft(4001, 'wall-1', 3), { wrapper });
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-
-    expect(requestMock.mock.calls[0][1]).toEqual({ uuid: 'wall-1', version: 3 });
+  it('reads again after a single-wall removal leaves its payload behind', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.draft).toBe(true));
+    expect(requestMock).toHaveBeenCalledTimes(1);
+    // No loader is installed here, so the cached payload survives the removal,
+    // stamped with the removal generation it was read under.
+    act(() => unregisterSprayWall(LAYOUT_ID));
+    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    expect(result.current.isUnavailable).toBe(false);
+    await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.versionId).toBe(30));
+    // Once per removal: the fresh read is current, so nothing reads a third time.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requestMock).toHaveBeenCalledTimes(2);
   });
 
-  it('fetches nothing until it has been told which wall and which version', () => {
-    const { result } = renderHook(() => useSprayWallDraft(4001, null, null), { wrapper });
+  it('reads a stale payload again only once per removal', async () => {
+    let calls = 0;
+    requestMock.mockImplementation(async () => {
+      calls += 1;
+      // The second read is itself overtaken by another removal of the wall.
+      if (calls === 2) unregisterSprayWall(LAYOUT_ID);
+      return { sprayWallRenderData: payload() };
+    });
+    renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(client.isFetching()).toBe(0));
+    act(() => unregisterSprayWall(LAYOUT_ID));
+    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(3));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requestMock).toHaveBeenCalledTimes(3);
+  });
+
+  it('reads once more under the new account after an account change, and registers that answer', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+    renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.draft).toBe(true));
+    const fresh = payload('30', true);
+    fresh.photo.url = 'https://private.example/30.jpg?signature=new-account';
+    requestMock.mockResolvedValue({ sprayWallRenderData: fresh });
+    // Sign-in on the same session: the viewer generation moves, the session does not.
+    act(() => {
+      resetSprayWallViewerAccess();
+    });
+    expect(getSprayWall(LAYOUT_ID)?.viewerCanEdit).toBe(false);
+    await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.photoUrl).toContain('signature=new-account'));
+    expect(getSprayWall(LAYOUT_ID)?.viewerCanEdit).toBe(true);
+    expect(sprayWallViewerCanEdit('spray', LAYOUT_ID)).toBe(true);
+    // Stamped 0 only for a payload read under another viewer generation.
+    expect(getSprayWall(LAYOUT_ID)?.registeredAtMs).toBeGreaterThan(0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(requestMock).toHaveBeenCalledTimes(2);
+  });
+
+  describe('a draft the server stops vouching for', () => {
+    afterEach(() => setSprayWallPrivacyCleanup(() => {}));
+
+    it('withdraws the registered draft, files included, when a refetch comes back null', async () => {
+      const privacyCleanup = vi.fn();
+      setSprayWallPrivacyCleanup(privacyCleanup);
+      requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+      const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+      await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.draft).toBe(true));
+      requestMock.mockResolvedValue({ sprayWallRenderData: null });
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: sprayWallDraftQueryKey('wall-1', 3, '30') });
+      });
+      await waitFor(() => expect(getSprayWall(LAYOUT_ID)).toBeNull());
+      expect(privacyCleanup).toHaveBeenCalledWith(LAYOUT_ID);
+      expect(result.current.wall).toBeNull();
+    });
+
+    it('withdraws the registered draft when its number now names another row', async () => {
+      requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+      renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+      await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.draft).toBe(true));
+      requestMock.mockResolvedValue({ sprayWallRenderData: payload('31', true) });
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: sprayWallDraftQueryKey('wall-1', 3, '30') });
+      });
+      await waitFor(() => expect(getSprayWall(LAYOUT_ID)).toBeNull());
+    });
+
+    it('keeps the registered draft through a refetch that fails', async () => {
+      requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+      renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+      await waitFor(() => expect(getSprayWall(LAYOUT_ID)?.draft).toBe(true));
+      const held = getSprayWall(LAYOUT_ID);
+      requestMock.mockRejectedValue(new Error('network unavailable'));
+      await act(async () => {
+        await client.invalidateQueries({ queryKey: sprayWallDraftQueryKey('wall-1', 3, '30') });
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(getSprayWall(LAYOUT_ID)).toBe(held);
+    });
+  });
+
+  it('does not refresh an old editor’s wall when sign-out and unmount happen together', async () => {
+    registerPublished();
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const { result, unmount } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    act(() => {
+      withdrawAllSprayWalls();
+      unmount();
+    });
+    expect(invalidateMock).not.toHaveBeenCalled();
+  });
+
+  it('puts the published wall back when a reset editor closes', async () => {
+    registerPublished();
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const { result, unmount } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    unmount();
+    expect(invalidateMock).toHaveBeenCalledWith(client, 'wall-1', LAYOUT_ID);
+  });
+
+  it('shows unavailable for an unreadable photo and never fetches without an id', async () => {
+    const unreadable = payload();
+    unreadable.photo.width = 0;
+    requestMock.mockResolvedValue({ sprayWallRenderData: unreadable });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.isUnavailable).toBe(true));
+    requestMock.mockClear();
+    renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, null), { wrapper });
     expect(requestMock).not.toHaveBeenCalled();
-    // And says neither loading nor unavailable — it has not been asked anything.
-    expect(result.current.isLoading).toBe(false);
-    expect(result.current.isUnavailable).toBe(false);
   });
 
-  it('puts the published generation back on teardown', async () => {
-    requestMock.mockResolvedValue({ sprayWallRenderData: RENDER_DATA });
-    registerRenderDataMock.mockReturnValue(true);
-
-    const { result, unmount } = renderHook(() => useSprayWallDraft(4001, 'wall-1', 3), { wrapper });
-    await waitFor(() => expect(result.current.isLoading).toBe(false));
-    expect(invalidateMock).not.toHaveBeenCalled();
-
-    unmount();
-    // A surface that outlives the editor must not be left drawing an unpublished
-    // photo, nor served a payload cached from before this session's writes.
-    expect(invalidateMock).toHaveBeenCalledTimes(1);
-    expect(invalidateMock.mock.calls[0].slice(1)).toEqual(['wall-1', 4001]);
+  it('holds only an initial draft in the registry, never a published-wall reset', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    await prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30');
+    registerPublished();
+    renderHook(() => useKeepSprayDraftRegistered(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    expect(getSprayWall(LAYOUT_ID)?.versionId).toBe(20);
   });
 
-  it('does not touch the registry on teardown when it never had a wall', () => {
-    const { unmount } = renderHook(() => useSprayWallDraft(4001, null, null), { wrapper });
-    unmount();
-    expect(invalidateMock).not.toHaveBeenCalled();
+  it('does not turn the published registration of a just-published draft back into a draft', async () => {
+    // The cached payload still says DRAFT with nothing published; the registry
+    // already holds the published version under the same row id.
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+    await prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30');
+    registerSprayWall(LAYOUT_ID, {
+      wallUuid: 'wall-1',
+      version: 3,
+      versionId: 30,
+      angle: 40,
+      photoWidth: 1200,
+      photoHeight: 1600,
+      photoUrl: 'published-photo',
+      photoThumbUrl: null,
+      photoExpiresAt: 'later',
+      holds: [{ id: 99, cx: 90, cy: 80, r: 7 }],
+    });
+    const published = getSprayWall(LAYOUT_ID);
+    renderHook(() => useKeepSprayDraftRegistered(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    expect(getSprayWall(LAYOUT_ID)).toBe(published);
+    expect(getSprayWall(LAYOUT_ID)?.draft).toBeUndefined();
+  });
+
+  it('does not reinstate an initial draft after wall removal', async () => {
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload('30', true) });
+    await prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30');
+    renderHook(() => useKeepSprayDraftRegistered(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    expect(getSprayWall(LAYOUT_ID)?.versionId).toBe(30);
+    act(() => unregisterSprayWall(LAYOUT_ID));
+    expect(getSprayWall(LAYOUT_ID)).toBeNull();
+  });
+});
+
+describe('draft read recovery', () => {
+  it('shows a stalled read and retries after checking connectivity', async () => {
+    requestMock.mockRejectedValueOnce(new Error('network unavailable'));
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.isStalled).toBe(true));
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    act(() => result.current.retry());
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+    expect(retryMock).toHaveBeenCalledTimes(1);
+    expect(result.current.isStalled).toBe(false);
+  });
+
+  it('releases a failed prefetch so the mounted editor can read again', async () => {
+    requestMock.mockRejectedValueOnce(new Error('network unavailable'));
+    await expect(prefetchSprayWallDraft(client, LAYOUT_ID, 'wall-1', 3, '30')).resolves.toBeUndefined();
+    requestMock.mockResolvedValue({ sprayWallRenderData: payload() });
+    const { result } = renderHook(() => useSprayWallDraft(LAYOUT_ID, 'wall-1', 3, '30'), { wrapper });
+    await waitFor(() => expect(result.current.wall?.versionId).toBe(30));
+  });
+});
+
+describe('initial wall discard', () => {
+  it('withdraws initial geometry and draft queries after Start over succeeds', async () => {
+    registerPublished();
+    client.setQueryData(sprayWallDraftQueryKey('wall-1', 3, '30'), { sprayWallRenderData: payload('30', true) });
+    requestMock.mockResolvedValue({});
+    const { result } = renderHook(() => useDiscardSprayWallDraft(), { wrapper });
+    await act(async () => {
+      await result.current.mutateAsync({ wallUuid: 'wall-1', versionId: '30', layoutId: LAYOUT_ID });
+    });
+    expect(getSprayWall(LAYOUT_ID)).toBeNull();
+    expect(client.getQueryData(sprayWallDraftQueryKey('wall-1', 3, '30'))).toBeUndefined();
   });
 });

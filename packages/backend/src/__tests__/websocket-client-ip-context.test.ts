@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createServer, type Server } from 'node:http';
+import { inspect } from 'node:util';
 import { WebSocket } from 'ws';
 import type { RawData, WebSocketServer } from 'ws';
+import type { ConnectionContext } from '@boardsesh/shared-schema';
 
 /**
  * End-to-end cover for issue #2863: the real `setupWebSocketServer` must put a
@@ -15,8 +17,49 @@ import type { RawData, WebSocketServer } from 'ws';
  */
 
 const { createdContexts } = vi.hoisted(() => ({
-  createdContexts: [] as { connectionId: string; clientIp?: string; socketPeerIp?: string }[],
+  createdContexts: [] as Pick<
+    ConnectionContext,
+    | 'connectionId'
+    | 'clientIp'
+    | 'socketPeerIp'
+    | 'trustedClientIp'
+    | 'clientIdentity'
+    | 'clientIdentityRaw'
+    | 'userId'
+    | 'isAuthenticated'
+    | 'controllerId'
+    | 'controllerOwnerUserId'
+  >[],
 }));
+
+// One known controller key; every other key is unknown, like a real lookup miss.
+const DEVICE_KEY = 'wall-device-test-key';
+vi.mock('../middleware/auth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../middleware/auth')>();
+  return {
+    ...actual,
+    validateControllerApiKey: vi.fn(async (apiKey: string) =>
+      apiKey === DEVICE_KEY
+        ? {
+            controllerId: 'wall-device-controller',
+            controllerApiKey: apiKey,
+            userId: 'wall-device-owner',
+            boardName: 'kilter',
+            layoutId: 1,
+            sizeId: 10,
+            setIds: '1',
+          }
+        : null,
+    ),
+  };
+});
+
+// graphql-ws checks returned errors with instanceof. Match its external Node
+// constructor instead of Vite's separate graphql/index.mjs module instance.
+vi.mock('graphql', async () => {
+  const { createRequire } = await import('node:module');
+  return createRequire(import.meta.url)('graphql') as typeof import('graphql');
+});
 
 vi.mock('../services/room-manager', () => ({
   roomManager: {
@@ -40,6 +83,9 @@ vi.mock('../graphql/context', async (importOriginal) => {
 });
 
 import { setupWebSocketServer } from '../websocket/setup';
+import { createYogaInstance } from '../graphql/yoga';
+import { getClientUsageSnapshotForTests, stopClientUsageReporter } from '../services/client-usage';
+import { logger } from '../utils/logger';
 
 const GRAPHQL_TRANSPORT_WS = 'graphql-transport-ws';
 
@@ -89,13 +135,23 @@ describe('WebSocket connection context client IP', () => {
     createdContexts.length = 0;
   });
 
-  /** Connect with forged upgrade headers and resolve the context onConnect built. */
+  /**
+   * Connect with forged upgrade headers (and an optional connection_init
+   * payload) and resolve the context onConnect built.
+   */
   async function connectAndReadContext(
     headers: Record<string, string>,
-  ): Promise<{ connectionId: string; clientIp?: string; socketPeerIp?: string }> {
+    connectionParams?: Record<string, unknown>,
+  ): Promise<(typeof createdContexts)[number]> {
     await new Promise<void>((resolve, reject) => {
       const socket = new WebSocket(webSocketUrl, GRAPHQL_TRANSPORT_WS, { headers });
-      socket.once('open', () => socket.send(JSON.stringify({ type: 'connection_init' })));
+      socket.once('open', () =>
+        socket.send(
+          JSON.stringify(
+            connectionParams ? { type: 'connection_init', payload: connectionParams } : { type: 'connection_init' },
+          ),
+        ),
+      );
       socket.once('message', (message) => {
         const payload = JSON.parse(decodeMessage(message)) as { type?: unknown };
         if (payload.type !== 'connection_ack') {
@@ -121,6 +177,25 @@ describe('WebSocket connection context client IP', () => {
 
     expect(context.clientIp).toBe('203.0.113.7');
     expect(context.socketPeerIp).toBe('127.0.0.1');
+  });
+
+  it('puts a trusted limit key beside clientIp: no cf-connecting-ip from a non-edge peer, IPv6 as its /64', async () => {
+    const spoofed = await connectAndReadContext({
+      'cf-connecting-ip': '203.0.113.7',
+      'x-forwarded-for': '198.51.100.9, 198.51.100.20',
+    });
+    // Loopback stands in for the private ingress, whose appended hop counts.
+    // That hop is no Cloudflare edge, so its cf-connecting-ip is not believed.
+    expect(spoofed.clientIp).toBe('203.0.113.7');
+    expect(spoofed.trustedClientIp).toBe('198.51.100.20');
+    // Through a Cloudflare edge hop, the edge's header is the key.
+    const throughEdge = await connectAndReadContext({
+      'cf-connecting-ip': '203.0.113.7',
+      'x-forwarded-for': '172.68.1.1',
+    });
+    expect(throughEdge.trustedClientIp).toBe('203.0.113.7');
+    const ipv6 = await connectAndReadContext({ 'x-forwarded-for': '2001:db8:51:7::beef' });
+    expect(ipv6.trustedClientIp).toBe('2001:db8:51:7::/64');
   });
 
   it('keys on the last forwarded hop, ignoring an attacker-prefixed entry', async () => {
@@ -159,4 +234,211 @@ describe('WebSocket connection context client IP', () => {
     expect(first.socketPeerIp).toBe('127.0.0.1');
     expect(second.socketPeerIp).toBe(first.socketPeerIp);
   });
+
+  it('puts the connectionParams client identity on the created context', async () => {
+    const context = await connectAndReadContext({}, { clientIdentity: 'boardsesh-mobile-web/2.6.0 (web)' });
+
+    expect(context.clientIdentity).toEqual({ name: 'boardsesh-mobile-web', version: '2.6.0', platform: 'web' });
+    expect(context.clientIdentityRaw).toBe('boardsesh-mobile-web/2.6.0 (web)');
+  });
+
+  it("carries a controller key's owner as read-only identity, never as the signed-in user", async () => {
+    const context = await connectAndReadContext({}, { controllerApiKey: DEVICE_KEY });
+
+    expect(context.controllerId).toBe('wall-device-controller');
+    expect(context.controllerOwnerUserId).toBe('wall-device-owner');
+    // The key must not log the device in: mutations, the queue and account
+    // reads all key on userId / isAuthenticated.
+    expect(context.userId).toBeUndefined();
+    expect(context.isAuthenticated).toBe(false);
+  });
+
+  it('gives an unknown controller key no owner', async () => {
+    const context = await connectAndReadContext({}, { controllerApiKey: 'not-a-real-key' });
+
+    expect(context.controllerId).toBeUndefined();
+    expect(context.controllerOwnerUserId).toBeUndefined();
+    expect(context.userId).toBeUndefined();
+  });
+
+  it('ignores a non-string client identity param', async () => {
+    const context = await connectAndReadContext({}, { clientIdentity: { name: 'boardsesh-mobile', version: '2.6.0' } });
+
+    expect(context.clientIdentity).toBeUndefined();
+    expect(context.clientIdentityRaw).toBeUndefined();
+  });
+
+  it('keeps an unparseable identity raw-only and still connects', async () => {
+    const context = await connectAndReadContext({}, { clientIdentity: 'definitely not valid' });
+
+    expect(context.clientIdentity).toBeUndefined();
+    expect(context.clientIdentityRaw).toBe('definitely not valid');
+  });
+
+  it('does not read the identity from an upgrade header', async () => {
+    const context = await connectAndReadContext({ 'x-boardsesh-client': 'boardsesh-web/1.0.0' });
+
+    expect(context.clientIdentity).toBeUndefined();
+  });
+
+  it('counts each WebSocket operation against the connection client', async () => {
+    stopClientUsageReporter();
+    await new Promise<void>((resolve, reject) => {
+      const socket = new WebSocket(webSocketUrl, GRAPHQL_TRANSPORT_WS);
+      socket.once('open', () =>
+        socket.send(JSON.stringify({ type: 'connection_init', payload: { clientIdentity: 'boardsesh-web/1.4.2' } })),
+      );
+      socket.on('message', (message) => {
+        const payload = JSON.parse(decodeMessage(message)) as { type?: unknown };
+        if (payload.type === 'connection_ack') {
+          socket.send(JSON.stringify({ id: 'op-1', type: 'subscribe', payload: { query: '{ __typename }' } }));
+        } else if (payload.type === 'complete') {
+          socket.close(1000);
+          resolve();
+        } else if (payload.type === 'error') {
+          reject(new Error(`Operation failed: ${decodeMessage(message)}`));
+        }
+      });
+      socket.once('error', reject);
+    });
+
+    expect(getClientUsageSnapshotForTests()).toEqual([
+      { clientName: 'boardsesh-web', clientVersion: '1.4.2', transport: 'ws', operations: 1 },
+    ]);
+    stopClientUsageReporter();
+  });
+
+  it('rejects a malformed Apple Ads document before its token reaches errors or logs', async () => {
+    const sentinelToken = 'private-adservices-token-sentinel';
+    const loggedErrors = vi.spyOn(logger, 'error');
+    try {
+      const response = await new Promise<string>((resolve, reject) => {
+        const socket = new WebSocket(webSocketUrl, GRAPHQL_TRANSPORT_WS);
+        socket.once('open', () => socket.send(JSON.stringify({ type: 'connection_init' })));
+        socket.on('message', (message) => {
+          const messageText = decodeMessage(message);
+          const payload = JSON.parse(messageText) as { type?: unknown };
+          if (payload.type === 'connection_ack') {
+            socket.send(
+              JSON.stringify({
+                id: 'private-token-operation',
+                type: 'subscribe',
+                payload: {
+                  query: `mutation { exchangeAppleAdsAttribution(token: "${sentinelToken}", consent: {`,
+                },
+              }),
+            );
+          } else if (payload.type === 'error') {
+            socket.close(1000);
+            resolve(messageText);
+          }
+        });
+        socket.once('error', reject);
+        socket.once('close', () => reject(new Error('Socket closed before the fixed attribution rejection')));
+      });
+      expect(response).toContain('Apple Ads attribution requires HTTP');
+      expect(response).not.toContain(sentinelToken);
+      expect(JSON.stringify(loggedErrors.mock.calls)).not.toContain(sentinelToken);
+    } finally {
+      loggedErrors.mockRestore();
+    }
+  });
+  it.each([
+    ['query', 'boardShareLinkPreview', '{ name }'],
+    ['mutation', 'redeemBoardShareLink', '{ boardUuid slug }'],
+  ] as const)(
+    'sanitizes %s %s coercion, validation and parse errors over real WebSockets',
+    async (operation, field, selection) => {
+      const token = 'Ab3_dE-fGhIjKlMnOpQrSt';
+      const loggedErrors = vi.spyOn(logger, 'error');
+      const serverErrors = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const documents = [
+        {
+          query: `${operation} Share($token: String!) { ${field}(token: $token) ${selection} }`,
+          variables: { token: [token] },
+        },
+        { query: `${operation} { ${field}(token: ["${token}"]) ${selection} }` },
+        { query: `${operation} { ${field}(token: "${token}") {` },
+      ];
+      try {
+        for (const document of documents) {
+          const response = await sendBoardShareOperation(document);
+          expect(response).toContain('Board share link request could not be processed');
+          expect(response).not.toContain(token);
+        }
+        expect(inspect(loggedErrors.mock.calls, { depth: 20 })).not.toContain(token);
+        expect(inspect(serverErrors.mock.calls, { depth: 20 })).not.toContain(token);
+      } finally {
+        loggedErrors.mockRestore();
+        serverErrors.mockRestore();
+      }
+    },
+  );
+  it("passes the share resolver's own error whole over real WebSockets", async () => {
+    // Signed out, so the resolver itself refuses: an execution error with a
+    // path, raised after the token parsed. It keeps its message and path.
+    const token = 'Ab3_dE-fGhIjKlMnOpQrSt';
+    const response = await sendBoardShareOperation({
+      query: 'mutation Share($token: String!) { redeemBoardShareLink(token: $token) { boardUuid slug } }',
+      variables: { token },
+    });
+    expect(response).toContain('Authentication required');
+    expect(response).toContain('"path":["redeemBoardShareLink"]');
+    expect(response).not.toContain('Board share link request could not be processed');
+    expect(response).not.toContain(token);
+  });
+
+  it.each([
+    [
+      'deep named fragment',
+      `{ __type(name: "Query") { ...Deep } }
+      fragment Deep on __Type { ${'ofType { '.repeat(9)}name${' }'.repeat(9)} }`,
+      'Query depth limit of 10',
+    ],
+    [
+      'expensive aliases',
+      `{ ${Array.from({ length: 5001 }, (_, index) => `field${index}: __typename`).join(' ')} }`,
+      'Query Cost limit of 5000',
+    ],
+    [
+      'fragment cycle',
+      '{ __type(name: "Query") { ...Cycle } } fragment Cycle on __Type { ofType { ...Cycle } }',
+      'Cannot spread fragment "Cycle" within itself',
+    ],
+  ])('rejects %s equally on real HTTP and WebSocket transports', async (_label, query, expectedError) => {
+    const httpResponse = await createYogaInstance().fetch('http://localhost/graphql', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query }),
+    });
+    const httpResult = (await httpResponse.json()) as { errors: { message: string }[] };
+    const socketResult = JSON.parse(await sendBoardShareOperation({ query })) as {
+      type: string;
+      payload: { message: string }[];
+    };
+    expect(socketResult.type).toBe('error');
+    const socketErrors = socketResult.payload.map((error) => error.message);
+    expect(socketErrors).toEqual(httpResult.errors.map((error) => error.message));
+    expect(socketErrors).toEqual(expect.arrayContaining([expect.stringContaining(expectedError)]));
+  });
+
+  /** Subscribe once on a fresh signed-out socket and resolve the first error or result frame. */
+  function sendBoardShareOperation(document: { query: string; variables?: Record<string, unknown> }) {
+    return new Promise<string>((resolve, reject) => {
+      const socket = new WebSocket(webSocketUrl, GRAPHQL_TRANSPORT_WS);
+      socket.once('open', () => socket.send(JSON.stringify({ type: 'connection_init' })));
+      socket.on('message', (message) => {
+        const messageText = decodeMessage(message);
+        const payload = JSON.parse(messageText) as { type?: unknown };
+        if (payload.type === 'connection_ack') {
+          socket.send(JSON.stringify({ id: 'board-share-token-operation', type: 'subscribe', payload: document }));
+        } else if (payload.type === 'error' || payload.type === 'next') {
+          socket.close(1000);
+          resolve(messageText);
+        }
+      });
+      socket.once('error', reject);
+      socket.once('close', () => reject(new Error('Socket closed before the board-share response')));
+    });
+  }
 });

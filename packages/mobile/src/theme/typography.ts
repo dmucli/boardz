@@ -67,6 +67,16 @@ export const textStyles = {
     fontWeight: '400',
     lineHeight: 13,
   },
+  /**
+   * Every top-bar and header button label: Cancel, Done, Save, Clear all. A bar
+   * item on iOS is body-sized (17/22); the prominent confirm sets 600 on top.
+   * See `theme/top-bar.ts` and docs/design/mobile-chrome.md, "Top-bar buttons".
+   */
+  label: {
+    fontSize: 17,
+    fontWeight: '400',
+    lineHeight: 22,
+  },
 } as const satisfies Record<string, TypeStyle>;
 
 /**
@@ -78,7 +88,7 @@ export const textStyles = {
  *
  *   largeTitle → headlineMedium · title1 → headlineSmall · title2 → titleLarge
  *   headline → titleMedium · body/callout → bodyLarge · subheadline → bodyMedium
- *   footnote → bodySmall · caption1/caption2 → labelSmall
+ *   footnote → bodySmall · caption1/caption2 → labelSmall · label → labelLarge
  */
 export const materialTextStyles = {
   largeTitle: {
@@ -136,6 +146,12 @@ export const materialTextStyles = {
     fontWeight: '500',
     lineHeight: 16,
   },
+  /** M3 labelLarge, the type of every button and top app bar action. */
+  label: {
+    fontSize: 14,
+    fontWeight: '500',
+    lineHeight: 20,
+  },
 } as const satisfies Record<keyof typeof textStyles, TypeStyle>;
 
 /**
@@ -151,20 +167,75 @@ export const textStylesByVariant = {
 
 export type TextVariant = keyof typeof textStyles;
 
+type FontWeight = NonNullable<TextStyle['fontWeight']>;
+
+/**
+ * The emphasized weight of each style, for `<Text emphasized>`: the bold title in
+ * a shelf header, the name in a row, a value that needs to stand out. Use it
+ * instead of a `fontWeight` override, so emphasis is the same everywhere.
+ *
+ * Liquid Glass follows the HIG Typography table's "Emphasized weight" column:
+ * Bold for Large Title, Title 1 and Title 2; Semibold for every other style.
+ * Our display titles are already bold (a brand choice, see above), so for them
+ * emphasis keeps the weight they have.
+ */
+export const emphasizedWeights = {
+  largeTitle: '700',
+  title1: '700',
+  title2: '700',
+  title3: '600',
+  headline: '600',
+  body: '600',
+  callout: '600',
+  subheadline: '600',
+  footnote: '600',
+  caption1: '600',
+  caption2: '600',
+  label: '600',
+} as const satisfies Record<TextVariant, FontWeight>;
+
+/**
+ * Material's emphasized weights, from the M3 Expressive "emphasized" type styles
+ * (Compose Material 3 `TypeScaleTokens`): Medium (500) for the display, headline,
+ * title large and body roles; Bold (700) for title medium, title small and every
+ * label role. Each key takes the weight of the M3 role it maps to (see
+ * `materialTextStyles`); `title3` is titleLarge set in medium, so it stays 500.
+ */
+export const materialEmphasizedWeights = {
+  largeTitle: '500',
+  title1: '500',
+  title2: '500',
+  title3: '500',
+  headline: '700',
+  body: '500',
+  callout: '500',
+  subheadline: '500',
+  footnote: '500',
+  caption1: '700',
+  caption2: '700',
+  label: '700',
+} as const satisfies Record<TextVariant, FontWeight>;
+
+/** Emphasized weights resolved per UI variant, read by `Text`. */
+export const emphasizedWeightsByVariant = {
+  liquidGlass: emphasizedWeights,
+  material: materialEmphasizedWeights,
+} as const satisfies Record<'liquidGlass' | 'material', Record<TextVariant, FontWeight>>;
+
 /**
  * Max Dynamic Type multiplier for labels inside fixed-height glass chrome — the
  * queue capsule and the iOS 26 bottom-accessory / now-playing-style rows, whose
- * height is pinned to the `glassSize` ladder. The global `Text` default (1.5×)
- * clips the single-line climb name + grade against those rigid heights, so cap
- * them at 1.2× — still meaningfully larger for low-vision users, but it fits the
- * platter. Surfaces that can grow with their content keep the 1.5× default.
+ * height is pinned to the `glassSize` ladder. Uncapped `Text` would clip the
+ * single-line climb name + grade against those rigid heights. Their labels
+ * cap at 1.2× and use Large Content Viewer at accessibility sizes. Surfaces
+ * that can grow with their content keep the uncapped default.
  */
 export const CHROME_LABEL_MAX_FONT_SCALE = 1.2;
 
 /**
  * Max Dynamic Type multiplier for the rest-timer sheet's hero clock. Higher than
  * the chrome cap (the sheet grows with its content, so the digits can afford to
- * get bigger) but not the global 1.5×: at 34pt the widest reading the clock can
+ * get bigger) but stays bounded: at 34pt the widest reading the clock can
  * produce is a signed hour-long overrun, `-1:02:34`, and 1.5× puts that past the
  * width of a 375pt screen. 1.3× keeps the longest string on one line on the
  * narrowest phone we support.

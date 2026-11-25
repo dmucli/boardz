@@ -15,22 +15,25 @@
 import { memo, useMemo } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
-import type { Comment } from '@boardsesh/shared-schema';
+import type { Comment, ReleaseContext } from '@boardsesh/shared-schema';
 import { Text } from '../Text';
 import { ActivityIndicator } from '../ActivityIndicator';
 import { useComments } from '../../lib/graphql/hooks/use-social';
 import { useTheme } from '../../providers/theme-provider';
 import { spacing } from '../../theme/tokens';
 import { formatRelativeTime } from '../../lib/format-relative-time';
+import { useProposalReportReleaseContexts } from '../../lib/graphql/hooks/use-proposal-report-release-contexts';
+import { ReportReleaseContextDetails } from './ReportReleaseContextDetails';
 
 type ProposalReasonsListProps = {
   proposalUuid: string;
   /** Who opened the proposal — their first comment is the quoted reason. */
-  proposerId: string;
+  proposerId: string | null;
   /** The proposal's own reason, already rendered above this list. */
   reason?: string | null;
   /** The card's expander. False keeps the query unfired. */
   expanded: boolean;
+  canReadReleaseContext?: boolean;
 };
 
 export const ProposalReasonsList = memo(function ProposalReasonsList({
@@ -38,10 +41,21 @@ export const ProposalReasonsList = memo(function ProposalReasonsList({
   proposerId,
   reason,
   expanded,
+  canReadReleaseContext = false,
 }: ProposalReasonsListProps) {
   const { t } = useTranslation('climbs');
   const { systemColors } = useTheme();
   const { data, isPending, isError } = useComments('proposal', proposalUuid, expanded);
+  const reportReleaseContexts = useProposalReportReleaseContexts(proposalUuid, expanded && canReadReleaseContext);
+  const releaseContextByComment = useMemo(
+    () => new Map(reportReleaseContexts?.map((report) => [report.commentUuid, report.releaseContext])),
+    [reportReleaseContexts],
+  );
+  const proposerComment = data?.comments.find(
+    (comment) => !comment.isDeleted && comment.userId === proposerId && comment.body === reason,
+  );
+  const proposerReleaseContext =
+    proposerComment && canReadReleaseContext ? releaseContextByComment.get(proposerComment.uuid) : undefined;
 
   const comments = useMemo(() => {
     const loaded = data?.comments ?? [];
@@ -73,10 +87,10 @@ export const ProposalReasonsList = memo(function ProposalReasonsList({
     );
   }
 
-  if (comments.length === 0) {
+  if (comments.length === 0 && !proposerReleaseContext) {
     return (
       <View style={styles.state}>
-        <Text variant="footnote" color={systemColors.tertiaryLabel}>
+        <Text variant="footnote" color={systemColors.secondaryLabel}>
           {t('mobile.moderation.noReasons')}
         </Text>
       </View>
@@ -88,25 +102,37 @@ export const ProposalReasonsList = memo(function ProposalReasonsList({
     // the screen's FlashList, and a virtualised list inside a virtualised list
     // is the one thing the perf playbook forbids outright.
     <View style={styles.list}>
+      <ReportReleaseContextDetails releaseContext={proposerReleaseContext} />
       {comments.map((comment) => (
-        <ReasonRow key={comment.uuid} comment={comment} />
+        <ReasonRow
+          key={comment.uuid}
+          comment={comment}
+          releaseContext={canReadReleaseContext ? releaseContextByComment.get(comment.uuid) : undefined}
+        />
       ))}
     </View>
   );
 });
 
-const ReasonRow = memo(function ReasonRow({ comment }: { comment: Comment }) {
+const ReasonRow = memo(function ReasonRow({
+  comment,
+  releaseContext,
+}: {
+  comment: Comment;
+  releaseContext?: ReleaseContext;
+}) {
   const { t } = useTranslation('climbs');
   const { systemColors } = useTheme();
 
   return (
     <View style={[styles.row, { borderLeftColor: systemColors.separator }]}>
-      <Text variant="caption1" color={systemColors.tertiaryLabel} numberOfLines={1}>
+      <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={1}>
         {comment.userDisplayName ?? t('mobile.moderation.unknownClimber')} · {formatRelativeTime(comment.createdAt)}
       </Text>
       <Text variant="footnote" color={systemColors.secondaryLabel}>
         {comment.body ?? ''}
       </Text>
+      <ReportReleaseContextDetails releaseContext={releaseContext} />
     </View>
   );
 });
@@ -114,5 +140,5 @@ const ReasonRow = memo(function ReasonRow({ comment }: { comment: Comment }) {
 const styles = StyleSheet.create({
   state: { paddingTop: spacing[2] },
   list: { marginTop: spacing[2], gap: spacing[2] },
-  row: { borderLeftWidth: 2, paddingLeft: spacing[3], gap: 2 },
+  row: { borderLeftWidth: 2, paddingStart: spacing[3], gap: 2 },
 });

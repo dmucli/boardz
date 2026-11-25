@@ -1,7 +1,12 @@
 import type { OfflineDatabase, QueryInvalidator } from '../database';
 import type { GraphQLFetch } from './handlers';
 import { processMutation } from './handlers';
-import { peekPending, markCompleted, recordFailure, markDeadLetter } from './queue';
+import {
+  observeOfflineWriteAttemptFailure,
+  observeOfflineWriteLocalRecovery,
+  observeOfflineWriteServerResponse,
+} from './delivery-journal';
+import { peekPending, markCompleted, recordFailure, markDeadLetter, type PendingMutation } from './queue';
 import {
   isGraphQLEmptyResponseError,
   isRetryable,
@@ -9,11 +14,14 @@ import {
   isServerUnavailableError,
   isServerFailureSignal,
   getErrorStatus,
+  isClimbReferenceToDeletedClimb,
 } from './error-classification';
 import { isDatabaseLockedError } from '../db/lock-errors';
 import { runLocalWriteWithRetry } from '../db/write-retry';
 import { invalidateKeysForTable } from '../sync/invalidate-keys';
+import { createInvalidationBatch, type InvalidationBatch } from '../sync/invalidation-batch';
 import { parseQueueTimestamp } from './queue-timestamps';
+import { getLocalUserId } from '../sync/local-user-owner';
 
 // Module-level singletons (drain flag, sign-out guard, wipe epoch): correct as
 // long as exactly one app runtime consumes this package per JS context — the
@@ -288,6 +296,8 @@ export type MutationDeliveryEvent = {
   tableName: string;
   operation: string;
   idempotencyKey: string;
+  /** Shared entity identity when several queued writes refer to one climb. */
+  entityKey?: string;
   status: 'acknowledged' | 'dead_letter';
 };
 
@@ -335,6 +345,13 @@ export type MutationDeadLetterInfo = {
 
 export type MutationDeadLetterReporter = (info: MutationDeadLetterInfo) => void;
 
+/**
+ * Why a drain sent nothing because the outbox is not provably the signed-in
+ * account's (#6824). `unstamped` is the ordinary moment between sign-in and the
+ * stamp; `other-account` is the one the guard exists for.
+ */
+export type OutboxOwnerRefusal = 'no-signed-in-user' | 'unstamped' | 'other-account';
+
 export type DrainOptions = {
   /** Injectable sleep for deterministic tests. Defaults to setTimeout. */
   sleep?: (ms: number) => Promise<void>;
@@ -354,6 +371,29 @@ export type DrainOptions = {
    * packages/mobile/src/offline/offline-sync-adapter.ts; tests pass a literal.
    */
   isOnline: () => boolean;
+  /**
+   * The account the requests this drain sends will be filed under: on mobile,
+   * the user id in the token the HTTP client is about to attach. REQUIRED, for
+   * the same reason as `isOnline`: a default either way is wrong for someone.
+   *
+   * The outbox has no owner column, and the server takes the owner of a
+   * replayed write from the token, never from the payload (`saveTick` stores
+   * the tick under `ctx.userId`). So the drain sends only when the database's
+   * owner stamp names this account (`isLocalDataStampedFor`). Anything else
+   * (no account, an unclaimed database, somebody else's stamp) sends nothing,
+   * charges no retry and leaves every row exactly as it was (#6824): a drain
+   * after the account claims the device delivers them.
+   *
+   * Resolve the id from the credential itself, not from a cache that can
+   * outlive it.
+   */
+  getSignedInUserId: () => Promise<string | null | undefined>;
+  /**
+   * Observational: the drain declined because of the owner check above. Must
+   * not throw (a throw is swallowed). The mobile adapter reports
+   * `other-account` once per process.
+   */
+  onOutboxOwnerRefused?: (reason: OutboxOwnerRefusal) => void;
   /**
    * Called when a mutation fails with a server-side failure signal (5xx or the
    * masked INTERNAL_SERVER_ERROR shape the backend serves over HTTP 200).
@@ -379,6 +419,8 @@ export type DrainOptions = {
    * idempotency key is the entity UUID for tick creates.
    */
   onMutationStatus?: (event: MutationDeliveryEvent) => void;
+  /** Reconcile canonical climb data before releasing its queued dependents. */
+  beforeMutationAcknowledged?: (mutation: PendingMutation, graphqlFetch: GraphQLFetch) => Promise<void>;
   /** Platform-owned telemetry for a throwing delivery callback. */
   onMutationStatusError?: (failure: MutationStatusListenerFailure) => void;
   /**
@@ -417,6 +459,25 @@ function notifyDeadLetter(options: DrainOptions, info: MutationDeadLetterInfo): 
   }
 }
 
+function notifyOutboxOwnerRefused(options: DrainOptions, reason: OutboxOwnerRefusal): void {
+  try {
+    options.onOutboxOwnerRefused?.(reason);
+  } catch (reportingError) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.warn('[MutationQueue] outbox-owner reporter failed:', reportingError);
+    }
+  }
+}
+
+/** Null when the outbox is provably the signed-in account's. See `getSignedInUserId`. */
+async function outboxOwnerRefusal(db: OfflineDatabase, options: DrainOptions): Promise<OutboxOwnerRefusal | null> {
+  const signedInUserId = await options.getSignedInUserId();
+  if (!signedInUserId) return 'no-signed-in-user';
+  const stampedUserId = await getLocalUserId(db);
+  if (stampedUserId === null) return 'unstamped';
+  return stampedUserId === signedInUserId ? null : 'other-account';
+}
+
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -428,7 +489,7 @@ function backoffDelay(attempt: number, baseDelayMs: number, maxDelayMs: number):
   return Math.floor(Math.random() * exponential);
 }
 
-function invalidateForTable(queryClient: QueryInvalidator, tableName: string): void {
+function queueInvalidationForTable(invalidations: InvalidationBatch, tableName: string): void {
   const keys = invalidateKeysForTable(tableName);
   if (!keys) {
     // table_name is a plain string, so a NEW mutation type missing from the
@@ -442,9 +503,7 @@ function invalidateForTable(queryClient: QueryInvalidator, tableName: string): v
     }
     return;
   }
-  for (const key of keys) {
-    queryClient.invalidateQueries({ queryKey: key });
-  }
+  invalidations.add(keys);
 }
 
 function formatError(error: unknown): string {
@@ -493,8 +552,32 @@ export async function drainMutationQueue(
   // the CURRENT token per request — a drain tail that outlives the account
   // switch would post the old user's writes into the new user's account.
   const startEpoch = _globalWipeEpoch;
+  // Hold one batch for the whole invocation, including retry passes. Delivery
+  // callbacks still fire per row; query reads wait until bookkeeping settles.
+  const invalidations = createInvalidationBatch({
+    invalidateQueries(filters) {
+      // Earlier rows still need to be marked stale when a later send is
+      // interrupted, but teardown must not start new network or SQLite reads.
+      // Check each call: an invalidation callback can itself begin teardown.
+      return queryClient.invalidateQueries(
+        _isBackgrounded || _isSigningOut || _globalWipeEpoch !== startEpoch
+          ? { ...filters, refetchType: 'none' }
+          : filters,
+      );
+    },
+  });
 
   try {
+    // Before the first peek, and inside the latch so a concurrent trigger
+    // cannot slip a send past it. A refusal returns here: nothing was read off
+    // the queue, so no row is charged a retry or marked failed. The loop's own
+    // epoch check below covers a wipe that lands during these awaits.
+    const ownerRefusal = await outboxOwnerRefusal(db, options);
+    if (ownerRefusal !== null) {
+      notifyOutboxOwnerRefused(options, ownerRefusal);
+      return;
+    }
+
     while (true) {
       if (_isSigningOut || _globalWipeEpoch !== startEpoch || _isBackgrounded) break;
       const batch = await peekPending(db, 10);
@@ -519,6 +602,22 @@ export async function drainMutationQueue(
             networkStop = true; // reuse the "end cycle now" path
             break;
           }
+          if (mutation.delivery_id) {
+            try {
+              await observeOfflineWriteServerResponse(db, mutation.id);
+            } catch {
+              // Evidence gaps remain unknown; they never become server rejections.
+            }
+          }
+          if (_isSigningOut || _globalWipeEpoch !== startEpoch || _isBackgrounded) {
+            networkStop = true;
+            break;
+          }
+          await options.beforeMutationAcknowledged?.(mutation, graphqlFetch);
+          if (_isSigningOut || _globalWipeEpoch !== startEpoch || _isBackgrounded) {
+            networkStop = true;
+            break;
+          }
           // The send has landed; this DELETE is the only thing standing between
           // the server's acceptance and the row being cleared. Losing the
           // single-writer lock here (a snapshot import, a VACUUM, a concurrent
@@ -532,16 +631,48 @@ export async function drainMutationQueue(
           // is no read-then-upgrade inside a deferred transaction for SQLite to
           // skip the busy handler on. So the ladder below is a second chance
           // after a real wait, not the only one.
-          await runLocalWriteWithRetry(() => markCompleted(db, mutation.id));
-          invalidateForTable(queryClient, mutation.table_name);
+          let localFinalizationRecovered = false;
+          await runLocalWriteWithRetry(() => markCompleted(db, mutation.id), {
+            onSettled: (outcome) => {
+              localFinalizationRecovered = outcome.recovered;
+            },
+          });
+          if (
+            mutation.delivery_id &&
+            localFinalizationRecovered &&
+            !_isSigningOut &&
+            _globalWipeEpoch === startEpoch &&
+            !_isBackgrounded
+          ) {
+            try {
+              await observeOfflineWriteLocalRecovery(db, mutation.id);
+            } catch {
+              // The saved write stays saved if its recovery evidence cannot be recorded.
+            }
+          }
+          queueInvalidationForTable(invalidations, mutation.table_name);
           notifyMutationStatus(options, {
             tableName: mutation.table_name,
             operation: mutation.operation,
             idempotencyKey: mutation.idempotency_key,
+            ...(mutation.entity_key != null ? { entityKey: mutation.entity_key } : {}),
             status: 'acknowledged',
           });
         } catch (error: unknown) {
           const errorMessage = formatError(error);
+          if (
+            mutation.delivery_id &&
+            !_isSigningOut &&
+            _globalWipeEpoch === startEpoch &&
+            !_isBackgrounded &&
+            !isDatabaseLockedError(error)
+          ) {
+            try {
+              await observeOfflineWriteAttemptFailure(db, mutation.id);
+            } catch {
+              // Publication/retry diagnostics cannot change mutation classification.
+            }
+          }
 
           if (isGraphQLEmptyResponseError(error)) {
             // A 2xx response with no usable GraphQL body is ambiguous: the
@@ -635,19 +766,38 @@ export async function drainMutationQueue(
             break;
           }
 
+          if (isClimbReferenceToDeletedClimb(mutation.table_name, mutation.operation, error)) {
+            // A favourite or playlist add whose climb its setter has deleted
+            // (#5960). Nothing is left to write and no retry can change that, so
+            // clear the row as delivered: a dead letter would sit in the "needs
+            // retry" list with a Retry that can never work. The next pull drops
+            // the local copy through the climb's tombstone.
+            await runLocalWriteWithRetry(() => markCompleted(db, mutation.id));
+            queueInvalidationForTable(invalidations, mutation.table_name);
+            notifyMutationStatus(options, {
+              tableName: mutation.table_name,
+              operation: mutation.operation,
+              idempotencyKey: mutation.idempotency_key,
+              ...(mutation.entity_key != null ? { entityKey: mutation.entity_key } : {}),
+              status: 'acknowledged',
+            });
+            continue;
+          }
+
           if (isRetryable(error)) {
             // One atomic UPDATE bumps the retry and, when the bumped count hits
             // max_retries, flips to dead_letter — no window where the row is
             // exhausted-but-still-pending.
             const { status, retryCount } = await recordFailure(db, mutation.id, errorMessage);
-            // The row may have just flipped to dead_letter; refresh the pending
-            // badges either way (an extra COUNT requery is harmless).
-            invalidateForTable(queryClient, mutation.table_name);
+            // The row may have just flipped to dead_letter; queue the pending
+            // badges for refresh either way when this drain ends.
+            queueInvalidationForTable(invalidations, mutation.table_name);
             if (status === 'dead_letter') {
               notifyMutationStatus(options, {
                 tableName: mutation.table_name,
                 operation: mutation.operation,
                 idempotencyKey: mutation.idempotency_key,
+                ...(mutation.entity_key != null ? { entityKey: mutation.entity_key } : {}),
                 status,
               });
               notifyDeadLetter(options, {
@@ -674,11 +824,12 @@ export async function drainMutationQueue(
             // deterministic key (favorites, follows) a dead letter owns that key
             // until something revives it (#4331).
             await markDeadLetter(db, mutation.id, errorMessage);
-            invalidateForTable(queryClient, mutation.table_name);
+            queueInvalidationForTable(invalidations, mutation.table_name);
             notifyMutationStatus(options, {
               tableName: mutation.table_name,
               operation: mutation.operation,
               idempotencyKey: mutation.idempotency_key,
+              ...(mutation.entity_key != null ? { entityKey: mutation.entity_key } : {}),
               status: 'dead_letter',
             });
             notifyDeadLetter(options, {
@@ -720,7 +871,14 @@ export async function drainMutationQueue(
       retryAttempts = 0;
     }
   } finally {
-    _isDraining = false;
+    try {
+      // Flush earlier bookkeeping even if a later send, peek, or write failed.
+      invalidations.flush();
+    } finally {
+      // Keep reentrant drain callbacks blocked throughout the flush, and always
+      // release the latch even if a cache invalidator throws synchronously.
+      _isDraining = false;
+    }
   }
 }
 

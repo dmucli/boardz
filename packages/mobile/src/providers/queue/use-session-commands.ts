@@ -1,4 +1,6 @@
-import { useCallback, useRef } from 'react';
+import { clearActivePartnerWorkout, rememberPartnerWorkout } from '../../lib/pending-workout-store';
+import { useCallback, useContext, useRef } from 'react';
+import { QueryClientContext } from '@tanstack/react-query';
 import { buildSessionBoardPath } from '../../lib/boards/session-board-path';
 import { execute } from '@boardsesh/graphql-client';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
@@ -7,9 +9,12 @@ import type { ClimbQueueItem, PlaylistSuggestionSource, QueueAction, QueueState 
 import type { SessionSummary, UserBoard } from '@boardsesh/shared-schema';
 import { getHttpClient } from '../../lib/graphql/client';
 import { getStoredActiveBoard } from '../../lib/active-board-store';
+import { getActiveBoardWriteGeneration } from '../../lib/graphql/use-active-board';
 import { getWsClient } from '../../lib/graphql/ws-client';
+import { clampSyncedQueue } from './now-slot-server';
 import {
   CREATE_SESSION,
+  CREATE_PARTNER_WORKOUT_SESSION,
   END_SESSION,
   type CreateSessionMutationResponse,
   type EndSessionMutationResponse,
@@ -23,11 +28,14 @@ import {
   setStoredSessionVisibility,
 } from '../../lib/session-store';
 import { clearStoredQueueSnapshot } from '../../lib/queue-snapshot-store';
+import { seedEndedSessionCaches } from '../../lib/session-end-cache';
 import { track } from '../../lib/analytics';
 import { reportError, reportHandledError } from '../../lib/error-reporting';
 import { extractGraphqlMessage, isGraphqlRateLimitedError } from '../../lib/graphql/extract-error-message';
+import { getCredentialGeneration } from '../../lib/privacy/privacy-cache';
+import { toClimbQueueItem } from '../../lib/queue-conversion';
 import type { ToastVariant } from '../../components/Toast';
-import type { StartSessionConfig } from './queue-contexts';
+import type { EndSessionOptions, StartSessionConfig } from './queue-contexts';
 
 type UseSessionCommandsParams = {
   showToast: (message: string, variant?: ToastVariant, duration?: number) => void;
@@ -35,7 +43,13 @@ type UseSessionCommandsParams = {
   stateRef: React.RefObject<QueueState>;
   ensureJoined: (sessionIdToJoin: string) => Promise<unknown>;
   /** `mutations.setQueue` — the party-sync seed used by createSessionWithConfig. */
-  setQueueMutation: (queue: ClimbQueueItem[], currentClimbQueueItem?: ClimbQueueItem | null) => Promise<void>;
+  setQueueMutation: (
+    queue: ClimbQueueItem[],
+    currentClimbQueueItem?: ClimbQueueItem | null,
+    historyCount?: number | null,
+  ) => Promise<void>;
+  /** F3 now-slot mode as last set (the join ran the probe); picks the seed clamp. */
+  nowSlotModeRef: React.RefObject<boolean>;
   /**
    * Holds the id of a session whose local-queue seed threw. Set here on seed
    * failure and read by useSessionRealtime, which then refuses to let the empty
@@ -45,13 +59,12 @@ type UseSessionCommandsParams = {
   seedFailedSessionIdRef: React.RefObject<string | null>;
   setSessionId: React.Dispatch<React.SetStateAction<string | null>>;
   sessionIdRef: React.RefObject<string | null>;
+  /** Starts a fresh playlist-send lane before the active room changes. */
+  onSessionContextChanging: () => void;
   dispatch: React.Dispatch<QueueAction>;
   setPlaylistSuggestionSourceState: React.Dispatch<React.SetStateAction<PlaylistSuggestionSource | null>>;
-  /** Single-flight guard for resyncQueueFromServer — cleared at the clearSession teardown boundary. */
-  resyncInFlightRef: React.RefObject<boolean>;
-  resyncPendingRef: React.RefObject<boolean>;
   /** Raw active-board setter (useSetActiveBoard), NOT the ref-wrapped one. */
-  setActiveBoard: (board: UserBoard) => Promise<void>;
+  setActiveBoard: (board: UserBoard, isOperationCurrent?: () => boolean) => Promise<boolean>;
   /** Shared with the session-realtime SessionEnded handler; owned by the provider. */
   locallyEndingSessionIdRef: React.RefObject<string | null>;
   suppressedRemoteEndSessionIdRef: React.RefObject<string | null>;
@@ -59,16 +72,19 @@ type UseSessionCommandsParams = {
 
 type SessionCommands = {
   createSessionWithConfig: (config?: StartSessionConfig) => Promise<string | null>;
-  joinSession: (sessionId: string, opts: { boardPath: string; userBoard: UserBoard }) => Promise<void>;
-  endSession: (options?: { notes?: string }) => Promise<SessionSummary | null>;
+  joinSession: (
+    sessionId: string,
+    opts: { boardPath: string; userBoard: UserBoard; isOperationCurrent?: () => boolean },
+  ) => Promise<boolean>;
+  endSession: (options?: EndSessionOptions) => Promise<SessionSummary | null>;
   clearSession: (options?: { notifyServer?: boolean }) => Promise<void>;
 };
 
 /**
  * The explicit session-lifecycle commands: create (Start button), join
  * (party mode), end, and clear (local teardown). `sessionCreationRef` is owned
- * internally (only createSessionWithConfig reads it); the leave-guard refs and
- * resync-flag refs are provider-owned shared state passed in.
+ * internally (only createSessionWithConfig reads it); the leave-guard refs are
+ * provider-owned shared state passed in.
  */
 export function useSessionCommands({
   showToast,
@@ -76,13 +92,13 @@ export function useSessionCommands({
   stateRef,
   ensureJoined,
   setQueueMutation,
+  nowSlotModeRef,
   seedFailedSessionIdRef,
   setSessionId,
   sessionIdRef,
+  onSessionContextChanging,
   dispatch,
   setPlaylistSuggestionSourceState,
-  resyncInFlightRef,
-  resyncPendingRef,
   setActiveBoard,
   locallyEndingSessionIdRef,
   suppressedRemoteEndSessionIdRef,
@@ -90,17 +106,30 @@ export function useSessionCommands({
   // Single-flight + coalesce guard for concurrent Start taps. Only this callback
   // reads it, so it lives here rather than in the provider body.
   const sessionCreationRef = useRef<Promise<string | null> | null>(null);
+  // Read off the context directly (as useSessionRealtime does) so the hook
+  // still renders without a QueryClientProvider; endSession then skips the
+  // summary cache write.
+  const queryClient = useContext(QueryClientContext);
 
   // Explicit session creation — the Start button (PreSessionView) and nothing
   // else. Sessions are never created lazily: the solo queue lives locally
   // (queue-snapshot-store) until the user starts or joins one, matching web.
   const createSessionWithConfig = useCallback(
     async (config?: StartSessionConfig): Promise<string | null> => {
-      if (sessionIdRef.current) return sessionIdRef.current;
-      if (sessionCreationRef.current) return sessionCreationRef.current;
+      if (sessionIdRef.current) return config?.appWorkoutSeed ? null : sessionIdRef.current;
+      if (sessionCreationRef.current) return config?.appWorkoutSeed ? null : sessionCreationRef.current;
 
       const createPromise = (async () => {
+        const initialSessionId = sessionIdRef.current;
+        const credentialGeneration = getCredentialGeneration();
+        const boardGeneration = getActiveBoardWriteGeneration();
+        const isPartnerScopeCurrent = () =>
+          !config?.appWorkoutSeed ||
+          (credentialGeneration === getCredentialGeneration() &&
+            getActiveBoardWriteGeneration() === boardGeneration &&
+            sessionIdRef.current === initialSessionId);
         const activeBoard = await getStoredActiveBoard();
+        if (!isPartnerScopeCurrent()) return null;
         if (!activeBoard) {
           // The Start button is gated on the React Query copy of the active board;
           // if the stored board is somehow missing, fail loudly so the user knows
@@ -112,25 +141,49 @@ export function useSessionCommands({
         const boardPath = buildSessionBoardPath(activeBoard);
 
         try {
-          const response = await getHttpClient().request<CreateSessionMutationResponse>(CREATE_SESSION, {
-            input: {
-              boardPath,
-              latitude: 0,
-              longitude: 0,
-              discoverable: config?.discoverable ?? false,
-              ...(config?.name ? { name: config.name } : {}),
-              ...(config?.goal ? { goal: config.goal } : {}),
-              ...(config?.color ? { color: config.color } : {}),
-              ...(config?.isPermanent ? { isPermanent: config.isPermanent } : {}),
-              // Absent means public server-side. Sending the key only for a
-              // private session keeps the default Start input identical to what
-              // older backends accept.
-              ...(config?.isPublic === false ? { isPublic: false } : {}),
+          const response = await getHttpClient().request<CreateSessionMutationResponse>(
+            config?.appWorkoutSeed ? CREATE_PARTNER_WORKOUT_SESSION : CREATE_SESSION,
+            {
+              input: {
+                boardPath,
+                ...(config?.appWorkoutId ? { appWorkoutId: config.appWorkoutId } : {}),
+                ...(config?.appWorkoutSeed ? { appWorkoutSeed: config.appWorkoutSeed } : {}),
+                latitude: 0,
+                longitude: 0,
+                discoverable: config?.discoverable ?? false,
+                ...(config?.name ? { name: config.name } : {}),
+                ...(config?.audience ? { audience: config.audience } : {}),
+                ...(config?.goal ? { goal: config.goal } : {}),
+                ...(config?.color ? { color: config.color } : {}),
+                ...(config?.isPermanent ? { isPermanent: config.isPermanent } : {}),
+                // Absent means public server-side. Sending the key only for a
+                // private session keeps the default Start input identical to what
+                // older backends accept.
+                ...(config?.isPublic === false ? { isPublic: false } : {}),
+              },
             },
-          });
+          );
           const newId = response.createSession.id;
-          sessionIdRef.current = newId;
+          if (config?.appWorkoutId && credentialGeneration === getCredentialGeneration()) {
+            // The server committed even if the climber switched room during the request.
+            await rememberPartnerWorkout(newId, config.appWorkoutId);
+          }
+          if (!isPartnerScopeCurrent()) return null;
+          const winningQueue = config?.appWorkoutSeed ? response.createSession.queueState : null;
+          if (config?.appWorkoutSeed && !winningQueue)
+            throw new Error('Partner session response omitted its committed queue');
+          const winningItems = winningQueue?.queue.map(toClimbQueueItem);
+          const winningCurrent = winningQueue?.currentClimbQueueItem
+            ? toClimbQueueItem(winningQueue.currentClimbQueueItem)
+            : null;
+          // Partner Start remains retryable until all awaited storage work has
+          // completed. A concurrent join must retain its own session context.
+          if (!config?.appWorkoutSeed) {
+            if (sessionIdRef.current !== newId) onSessionContextChanging();
+            sessionIdRef.current = newId;
+          }
           await setStoredSessionId(newId);
+          if (!isPartnerScopeCurrent()) return null;
           // Device provenance: this phone STARTED the party, as opposed to
           // joining one. The in-session exit UI leads with End here and with
           // Leave everywhere else, which is the whole point of #3502 — the
@@ -143,25 +196,62 @@ export function useSessionCommands({
           } catch (provenanceError) {
             if (__DEV__) console.warn('[queue] created-session provenance write failed', provenanceError);
           }
+          if (!isPartnerScopeCurrent()) return null;
           // What the creator chose, so the in-session switch can show it while
           // the `session` query still returns null (empty roster right after
           // Start). Best-effort like the provenance above: losing it only hides
           // the switch until the server can answer.
           try {
-            await setStoredSessionVisibility(newId, config?.isPublic !== false);
+            await setStoredSessionVisibility(
+              newId,
+              config?.appWorkoutSeed ? response.createSession.isPublic : config?.isPublic !== false,
+            );
           } catch (visibilityError) {
             if (__DEV__) console.warn('[queue] session visibility write failed', visibilityError);
           }
+          if (!isPartnerScopeCurrent()) return null;
           // Seed the session with the locally-built queue BEFORE setSessionId
           // mounts the queueUpdates subscription — the subscription's FullSync
           // for an empty room would wipe the local queue via INITIAL_QUEUE_DATA.
           // SET_QUEUE is connection-scoped, so JOIN first (the subscription
           // effect's later eager ensureJoined hits the tracker cache).
-          const { queue, currentClimbQueueItem } = stateRef.current;
-          if (queue.length > 0 || currentClimbQueueItem) {
+          const { queue, currentClimbQueueItem, historyCount } = stateRef.current;
+          if (config?.appWorkoutSeed) {
+            // The server won the initial preview and solo seed atomically. A retry
+            // must hydrate that winner and never seed/append this render's preview.
+            if (!winningQueue || !winningItems) throw new Error('Partner queue was not validated');
+            try {
+              await clearStoredQueueSnapshot();
+            } catch (cleanupError) {
+              // The SQL seed already owns the queue; local cleanup cannot undo
+              // a committed Start or leave its session ref half-installed.
+              reportHandledError(cleanupError, { tags: { source: 'startSessionSeedCleanup' } });
+            }
+            if (!isPartnerScopeCurrent()) return null;
+            onSessionContextChanging();
+            sessionIdRef.current = newId;
+            dispatch({
+              type: 'INITIAL_QUEUE_DATA',
+              serverSequence: winningQueue.sequence,
+              payload: {
+                sessionId: newId,
+                queue: winningItems,
+                currentClimbQueueItem: winningCurrent,
+                historyCount: winningQueue.historyCount ?? null,
+              },
+            });
+          } else if (queue.length > 0 || currentClimbQueueItem) {
             try {
               await ensureJoined(newId);
-              await setQueueMutation(queue, currentClimbQueueItem ?? undefined);
+              // Clamped like the local setQueue (#6673): the queue can pass the
+              // cap one track swipe at a time, and `Mutation.setQueue` throws on
+              // a longer payload, which would leave the room empty. The FullSync
+              // that follows brings the local queue down to the same window.
+              // The join above ran the F3 server probe, so the clamp follows it
+              // (501 in now-slot mode, 500 in legacy) and the solo line goes up
+              // with the seed.
+              const seedPayload = clampSyncedQueue(queue, currentClimbQueueItem, historyCount, nowSlotModeRef.current);
+              await setQueueMutation(seedPayload.queue, currentClimbQueueItem ?? undefined, seedPayload.historyCount);
               // Queue ownership moved to the session — drop the local snapshot
               // so a stale copy can't resurrect after the session ends. Only on
               // a successful seed: if seeding failed, the snapshot is the sole
@@ -188,6 +278,23 @@ export function useSessionCommands({
           });
           return newId;
         } catch (error) {
+          if (config?.appWorkoutId) {
+            const errors = (
+              error as { response?: { errors?: { extensions?: { reason?: string; code?: string } }[] } } | null
+            )?.response?.errors;
+            if (errors?.some((entry) => entry.extensions?.reason === 'APP_WORKOUT_PERMANENT_SESSION')) {
+              showToast(t('partnerWorkouts.personalSessionRequired'), 'error');
+              return null;
+            }
+            // The card refetches expected workout conflicts and offers Resume
+            // for a previous committed Start rather than treating it as a crash.
+            if (
+              errors?.some((entry) =>
+                ['CONFLICT', 'NOT_FOUND', 'BAD_USER_INPUT'].includes(entry.extensions?.code ?? ''),
+              )
+            )
+              return null;
+          }
           if (isGraphqlRateLimitedError(error)) {
             showToast(t('mobile.queue.rateLimited'), 'error');
             return null;
@@ -216,61 +323,76 @@ export function useSessionCommands({
           const devMessage = __DEV__ ? extractGraphqlMessage(error) : null;
           showToast(devMessage ?? t('mobile.queue.sessionCreateError'), 'error');
           return null;
-        } finally {
-          sessionCreationRef.current = null;
         }
       })();
 
       sessionCreationRef.current = createPromise;
-      return createPromise;
+      try {
+        return await createPromise;
+      } finally {
+        // Includes board lookup failures and early scope/missing-board returns.
+        if (sessionCreationRef.current === createPromise) sessionCreationRef.current = null;
+      }
     },
-    [ensureJoined, setQueueMutation, showToast, t],
+    [ensureJoined, onSessionContextChanging, setQueueMutation, showToast, t],
   );
 
-  const clearSession = useCallback(async (options?: { notifyServer?: boolean }) => {
-    // When the user intentionally leaves a session (switching into another via
-    // the join-confirm dialog), tell the backend so peers see them leave NOW —
-    // the driver/presence release shouldn't wait on the 60s disconnect grace
-    // timer. Best-effort and BEFORE we reset local state, so the WS registration
-    // for the old session is still alive: a failed/timed-out leave degrades to
-    // the prior disconnect-grace behavior. Default false keeps every other
-    // caller (remote SessionEnded, endSession) unchanged. Mirrors web's
-    // sendLeaveOnCleanup in use-session-lifecycle.ts.
-    if (options?.notifyServer && sessionIdRef.current) {
-      try {
-        await execute(getWsClient(), { query: LEAVE_SESSION }, 5000);
-      } catch (error) {
-        if (__DEV__) console.warn('[queue] leaveSession on switch failed', error);
+  const clearSession = useCallback(
+    async (options?: { notifyServer?: boolean }) => {
+      const sessionToClear = sessionIdRef.current;
+      const activeBoardGeneration = getActiveBoardWriteGeneration();
+      // This callback only resets the mutation lane. Solo queues also have
+      // pending content writes, so invalidate them before LEAVE can await I/O.
+      onSessionContextChanging();
+      // When the user intentionally leaves a session (switching into another via
+      // the join-confirm dialog), tell the backend so peers see them leave NOW —
+      // the driver/presence release shouldn't wait on the 60s disconnect grace
+      // timer. Best-effort and BEFORE we reset local state, so the WS registration
+      // for the old session is still alive: a failed/timed-out leave degrades to
+      // the prior disconnect-grace behavior. Default false keeps every other
+      // caller (remote SessionEnded, endSession) unchanged. Mirrors web's
+      // sendLeaveOnCleanup in use-session-lifecycle.ts.
+      if (options?.notifyServer && sessionIdRef.current) {
+        try {
+          await execute(getWsClient, { query: LEAVE_SESSION }, 5000);
+        } catch (error) {
+          if (__DEV__) console.warn('[queue] leaveSession on switch failed', error);
+        }
       }
-    }
-    // A resync fetch that never settles (hung connection) would leave the
-    // single-flight guard stuck true; a mounted provider carries that across a
-    // session switch and would block every future resync. Reset at the teardown
-    // boundary so the next session always starts clean.
-    resyncInFlightRef.current = false;
-    // Same for the coalesced-rerun flag: a pending rerun belongs to the old
-    // session and must not fire a fetch into the next one.
-    resyncPendingRef.current = false;
-    // Any pending seed-failure guard belongs to the session we're tearing down
-    // (it's keyed by id, so a stale value can't match the next session anyway —
-    // this just keeps the ref tidy).
-    seedFailedSessionIdRef.current = null;
-    sessionIdRef.current = null;
-    setSessionId(null);
-    dispatch({
-      type: 'INITIAL_QUEUE_DATA',
-      payload: { queue: [], currentClimbQueueItem: null },
-    });
-    setPlaylistSuggestionSourceState(null);
-    await clearStoredSessionId();
-    // Provenance belongs to the session we're tearing down. It's keyed by
-    // session id so a stale value could never match the next one anyway —
-    // this just keeps the store tidy.
-    await clearStoredCreatedSessionId();
-  }, []);
+      // A new room or board selected while LEAVE was in flight owns the state
+      // now; an old removal must not clear that newer selection.
+      if (sessionIdRef.current !== sessionToClear || getActiveBoardWriteGeneration() !== activeBoardGeneration) return;
+      const snapshotRemoval = clearStoredQueueSnapshot();
+      if (sessionToClear)
+        void clearActivePartnerWorkout(sessionToClear).catch((error: unknown) => {
+          reportHandledError(error, { tags: { source: 'partner-workout', op: 'clear-session' } });
+        });
+      // Any pending seed-failure guard belongs to the session we're tearing down
+      // (it's keyed by id, so a stale value can't match the next session anyway —
+      // this just keeps the ref tidy).
+      seedFailedSessionIdRef.current = null;
+      sessionIdRef.current = null;
+      setSessionId(null);
+      dispatch({
+        type: 'INITIAL_QUEUE_DATA',
+        payload: { queue: [], currentClimbQueueItem: null },
+      });
+      setPlaylistSuggestionSourceState(null);
+      // Await removal instead of relying on the debounced solo save: an
+      // immediate relaunch after deleting a board must not restore its climb.
+      await snapshotRemoval;
+      // Teardown assigned null above; any non-null room now belongs to a
+      // newer join, even if it happens to reuse the old room ID.
+      if (sessionIdRef.current !== null || getActiveBoardWriteGeneration() !== activeBoardGeneration) return;
+      // Enqueue both removals before yielding. Session-store serializes them
+      // with new joins/starts, so a newer session's persisted identity wins.
+      await Promise.all([clearStoredSessionId(), clearStoredCreatedSessionId()]);
+    },
+    [onSessionContextChanging],
+  );
 
   const endSession = useCallback(
-    async (options?: { notes?: string }): Promise<SessionSummary | null> => {
+    async (options?: EndSessionOptions): Promise<SessionSummary | null> => {
       const currentSessionId = sessionIdRef.current;
       if (!currentSessionId) return null;
 
@@ -280,6 +402,15 @@ export function useSessionCommands({
 
       try {
         locallyEndingSessionIdRef.current = currentSessionId;
+        // After the ref, so a remote SessionEnded arriving during the wait is
+        // suppressed exactly as one arriving during the mutation is.
+        if (options?.beforeEnd) {
+          try {
+            await options.beforeEnd(currentSessionId);
+          } catch (error) {
+            reportHandledError(error, { tags: { source: 'endSession', kind: 'before-end' } });
+          }
+        }
         const response = await getHttpClient().request<EndSessionMutationResponse>(END_SESSION, {
           sessionId: currentSessionId,
           // Device IANA zone so the backend can export wall-clock local times
@@ -287,6 +418,9 @@ export function useSessionCommands({
           timezone: getDeviceTimezone(),
           ...(trimmedNotes ? { notes: trimmedNotes } : {}),
         });
+        // The summary screen reads this cache next; without the write it can
+        // show the copy cached at the start of the session (#6903).
+        if (queryClient && response.endSession) await seedEndedSessionCaches(queryClient, response.endSession);
         await clearSession();
         locallyEndingSessionIdRef.current = null;
         suppressedRemoteEndSessionIdRef.current = null;
@@ -330,27 +464,40 @@ export function useSessionCommands({
         return null;
       }
     },
-    [clearSession, showToast, t],
+    [clearSession, queryClient, showToast, t],
   );
 
   const joinSession = useCallback(
-    async (sessionToJoin: string, opts: { boardPath: string; userBoard: UserBoard }) => {
+    async (
+      sessionToJoin: string,
+      opts: { boardPath: string; userBoard: UserBoard; isOperationCurrent?: () => boolean },
+    ): Promise<boolean> => {
+      const isOperationCurrent = opts.isOperationCurrent ?? (() => true);
+      if (!isOperationCurrent()) return false;
       // Idempotent against double-tap / re-entrant deep links.
-      if (sessionIdRef.current === sessionToJoin) return;
+      if (sessionIdRef.current === sessionToJoin) return true;
       // Switch the active board to the session's board FIRST (and persist it) so
       // the session effect's JOIN_SESSION reads the correct boardPath and the
       // whole tree (BLE wrapper, BoardProvider, climb list, play drawer) renders
       // on the joined board. Unlike startSession (which reads the active board to
       // build the new session's path), joinSession writes it from the session.
-      await setActiveBoard(opts.userBoard);
+      const activeBoardSet = await setActiveBoard(opts.userBoard, isOperationCurrent);
+      if (!activeBoardSet || !isOperationCurrent()) return false;
+      // Claim session publication synchronously only while the originating
+      // account and mounted Join operation still own this continuation.
+      // Start a new serialized playlist-send lane only after the active-board
+      // write was accepted for this still-current join operation.
+      onSessionContextChanging();
       sessionIdRef.current = sessionToJoin;
       setSessionId(sessionToJoin);
       await setStoredSessionId(sessionToJoin);
+      if (!isOperationCurrent()) return false;
       // The session's FullSync replaces the local queue — drop the solo
       // snapshot so a stale copy can't resurrect on a later cold start.
       await clearStoredQueueSnapshot();
+      return isOperationCurrent();
     },
-    [setActiveBoard],
+    [onSessionContextChanging, setActiveBoard],
   );
 
   return { createSessionWithConfig, joinSession, endSession, clearSession };

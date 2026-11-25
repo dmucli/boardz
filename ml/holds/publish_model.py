@@ -26,7 +26,7 @@ objects are served with a one-year immutable cache and a client holding the old
 bytes would fail the new manifest's checksum.
 
 Env vars (mirrors packages/backend/src/storage/bucket-config.ts's MEDIA_* prefix;
-see docs/user-media-storage.md):
+see docs/operations/user-media-storage.md):
 
     MEDIA_S3_BUCKET_NAME          selects real-upload mode
     MEDIA_AWS_ENDPOINT_URL        (or MEDIA_AWS_ENDPOINT_URL_S3)
@@ -78,12 +78,20 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 EVAL_KEYS = ("sprayEvalF1", "weightedCorrectionsPerHold", "gestureSavings")
 
 # eval.py writes its own vocabulary, not the manifest's: box F1 lives at
-# `box.f1` and the weighted correction rate at `correction_rate_micro` (see
-# ml/holds/eval.py's results dict). --eval-json is normally handed exactly that
-# file, so each manifest key also knows the dotted path to read it from.
+# `box.f1`, the weighted correction rate (2·miss + FP per hold) at
+# `weighted_correction_rate_micro` and the release gate's number at
+# `gesture_savings` (see ml/holds/eval.py's results dict). --eval-json is
+# normally handed exactly that file, so each manifest key also knows the dotted
+# path to read it from.
+#
+# weightedCorrectionsPerHold used to be read from the UNWEIGHTED
+# correction_rate_micro. There is deliberately no fallback to it: an older
+# eval.py file still publishes, just without weightedCorrectionsPerHold, rather
+# than with an unweighted number under a weighted name.
 EVAL_SOURCE_PATHS: dict[str, tuple[str, ...]] = {
     "sprayEvalF1": ("box", "f1"),
-    "weightedCorrectionsPerHold": ("correction_rate_micro",),
+    "weightedCorrectionsPerHold": ("weighted_correction_rate_micro",),
+    "gestureSavings": ("gesture_savings",),
 }
 
 
@@ -212,7 +220,7 @@ def read_media_bucket_config(env: dict[str, str] | None = None) -> MediaBucketCo
         raise SystemExit(
             "MEDIA_S3_BUCKET_NAME is set but " + " and ".join(missing) + " "
             + ("is" if len(missing) == 1 else "are")
-            + " missing. Set every MEDIA_* variable together (docs/user-media-storage.md)."
+            + " missing. Set every MEDIA_* variable together (docs/operations/user-media-storage.md)."
         )
 
     endpoint_url = _read_trimmed(env, "MEDIA_AWS_ENDPOINT_URL") or _read_trimmed(env, "MEDIA_AWS_ENDPOINT_URL_S3")
@@ -330,7 +338,15 @@ def resolve_training(args: argparse.Namespace) -> dict[str, Any]:
         "epochs": args.epochs,
         "trainedOn": args.trained_on,
         "date": args.date,
+        "userWallsExportId": args.user_walls_export,
     }
+    if args.checkpoint:
+        checkpoint = Path(args.checkpoint)
+        if not checkpoint.is_file():
+            raise SystemExit(f"--checkpoint: no file at {checkpoint}")
+        # The next retrain fine-tunes from this checkpoint; its hash in the
+        # manifest is how that run proves it started from the shipped model.
+        overrides["checkpointSha256"] = sha256_file(checkpoint)
     for key, value in overrides.items():
         if value is not None:
             training[key] = value
@@ -758,6 +774,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trained-on", choices=["m5-max-mps", "cpu"], help="hardware the training run used")
     parser.add_argument("--date", help="ISO date the export was trained/produced, e.g. 2026-09-15")
     parser.add_argument(
+        "--user-walls-export",
+        help=(
+            "exportId of the user-walls export the run trained on (data/user_walls.py fetch prints it); "
+            "recorded as training.userWallsExportId so a model can be traced to the walls behind it"
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint",
+        help=(
+            "the PyTorch checkpoint (.pth) export.py turned into these weights; its sha256 is recorded as "
+            "training.checkpointSha256 so a later fine-tune can prove it starts from the shipped model"
+        ),
+    )
+    parser.add_argument(
         "--training-json", help="JSON file with the whole 'training' object; the flags above override its keys when also given"
     )
     parser.add_argument(
@@ -822,7 +852,7 @@ def main(argv: list[str] | None = None) -> int:
     if not dry_run and bucket is None:
         raise SystemExit(
             "no MEDIA_* R2 env vars found; pass --dry-run explicitly, or set MEDIA_S3_BUCKET_NAME / "
-            "MEDIA_AWS_ACCESS_KEY_ID / MEDIA_AWS_SECRET_ACCESS_KEY (docs/user-media-storage.md)"
+            "MEDIA_AWS_ACCESS_KEY_ID / MEDIA_AWS_SECRET_ACCESS_KEY (docs/operations/user-media-storage.md)"
         )
 
     print(json.dumps(manifest, indent=2))

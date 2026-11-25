@@ -8,13 +8,15 @@
 // Backed by AsyncStorage (non-secret UI state) via the shared preference store.
 
 import { getPreference, setPreference, removePreference, removePreferencesMatching } from './preference-store';
-import { sprayCacheToken } from './spray/spray-wall-registry';
+import { sprayAuthoringToken, sprayVersionToken } from './spray/spray-wall-registry';
 import type { UserStorageOwner } from './user-storage-owner';
 
 /** Which authoring mode wrote this slot. Diagnostic only — the key decides. */
 export type CreateClimbDraftOrigin = 'new' | 'edit' | 'fork';
 
 export type CreateClimbDraft = {
+  /** Stable spray identity allocated before an explicit save can reach storage or network. */
+  pendingClimbUuid?: string;
   /**
    * JSON.stringify of the editor's active-frame LitUpHoldsMap. Kept for
    * backward compatibility — `framesJson` below is the full route and takes
@@ -44,13 +46,6 @@ export type CreateClimbDraft = {
    *  back-compat reason: a slot written before this rule existed restores with the
    *  board's default (feet on the marked holds). */
   anyFeet?: boolean;
-  /**
-   * The setter's own grade as a difficulty id on the shared Boardsesh scale, on
-   * a board that publishes with one (a spray wall). Optional for the same
-   * back-compat reason as the flags above, and absent is the honest value: a
-   * draft may sit ungraded, because the grade is the last thing a setter decides.
-   */
-  setterGradeDifficultyId?: number | null;
   /**
    * Whether the setter has switched this climb into route mode. Route-ness is
    * otherwise inferred from `frames.length > 1`, which cannot express the state
@@ -87,6 +82,8 @@ export type CreateClimbDraft = {
 };
 
 const KEY_PREFIX = 'boardsesh_create_climb_draft:';
+// Only aliases for the currently authorized wall/version are eligible to migrate.
+const legacyDraftKeys = new Map<string, string>();
 
 /**
  * Stable per-board key of the form
@@ -96,10 +93,9 @@ const KEY_PREFIX = 'boardsesh_create_climb_draft:';
  * "commercial" (bolt-on) hold sets — leaving it out lets a draft from one set
  * restore hold IDs that don't exist in the current set.
  *
- * A spray wall folds its VERSION in through `sprayCacheToken` (empty for every
- * catalogue board). A reset replaces the wall's holds under an unchanged
- * layout/size, so without it a draft painted on the old generation would restore
- * onto the new photo with hold ids that are no longer on the wall.
+ * A spray wall uses its immutable wall UUID. Publishing more holds keeps the
+ * slot; resetting creates a different wall/layout. Current-version legacy slots
+ * migrate on their first read, with the old copy retained until deliberate clear.
  */
 export function createClimbDraftKey(config: {
   boardName: string;
@@ -108,8 +104,16 @@ export function createClimbDraftKey(config: {
   setIds: string;
   angle: number;
 }): string {
-  const spray = sprayCacheToken(config.boardName, config.layoutId);
-  return `${config.boardName}:${config.layoutId}:${config.sizeId}${spray}:${config.setIds}:${config.angle}`;
+  const spray = sprayAuthoringToken(config.boardName, config.layoutId);
+  const boardKey = `${config.boardName}:${config.layoutId}:${config.sizeId}${spray}:${config.setIds}:${config.angle}`;
+  if (config.boardName === 'spray' && spray !== '-sw0') {
+    const legacyToken = sprayVersionToken(config.boardName, config.layoutId);
+    legacyDraftKeys.set(
+      boardKey,
+      `${config.boardName}:${config.layoutId}:${config.sizeId}${legacyToken}:${config.setIds}:${config.angle}`,
+    );
+  }
+  return boardKey;
 }
 
 /**
@@ -128,7 +132,10 @@ export function createClimbEditDraftKey(boardType: string, uuid: string): string
  * restorable from a plain creator mount after the app is killed.
  */
 export function createClimbForkDraftKey(boardKey: string): string {
-  return `fork:${boardKey}`;
+  const forkKey = `fork:${boardKey}`;
+  const legacyKey = legacyDraftKeys.get(boardKey);
+  if (legacyKey) legacyDraftKeys.set(forkKey, `fork:${legacyKey}`);
+  return forkKey;
 }
 
 /**
@@ -161,8 +168,19 @@ function isCreateClimbDraft(value: unknown): value is CreateClimbDraft {
 
 /** Returns the saved working draft for this board, or null if none/invalid. */
 export async function loadDraft(boardKey: string, _owner?: UserStorageOwner | null): Promise<CreateClimbDraft | null> {
+  const legacyKey = legacyDraftKeys.get(boardKey);
   const stored = await getPreference<unknown>(storageKey(boardKey));
-  return isCreateClimbDraft(stored) ? stored : null;
+  if (isCreateClimbDraft(stored)) return stored;
+  if (!legacyKey) return null;
+  const legacyDraft = await getPreference<unknown>(storageKey(legacyKey));
+  if (!isCreateClimbDraft(legacyDraft)) return null;
+  try {
+    await setPreference(storageKey(boardKey), legacyDraft);
+  } catch {
+    // A destination write failure must not turn a successfully read legacy
+    // draft into an empty editor. Its existing durable copy remains available.
+  }
+  return legacyDraft;
 }
 
 /** Persists the current working draft for this board (overwrites any prior). */
@@ -176,27 +194,14 @@ export async function saveDraft(
 
 /** Drops the working draft for this board (after save, clear, or empty form). */
 export async function clearDraft(boardKey: string, _owner?: UserStorageOwner | null): Promise<void> {
+  const legacyKey = legacyDraftKeys.get(boardKey);
   await removePreference(storageKey(boardKey));
+  if (legacyKey) await removePreference(storageKey(legacyKey));
 }
 
-/**
- * Drops the working drafts a spray wall left behind at earlier versions.
- *
- * `createClimbDraftKey` folds the wall version in, so a reset moves the slot and
- * the old one is orphaned: a payload of holds that are no longer on the wall,
- * sitting in AsyncStorage with nothing that would ever read or remove it. Keyed
- * on the wall's layout id, so this never touches another wall or a catalogue
- * board — the prefix ends at the layout, and `-sv<version>` is what varies after
- * it.
- *
- * Best-effort: losing the sweep costs a few kilobytes, so it is never awaited on
- * a path the climber is waiting for.
- */
-export function clearSupersededSprayDrafts(layoutId: number, currentVersionToken: string): Promise<void> {
-  const wallPrefix = `${KEY_PREFIX}spray:${layoutId}:${layoutId}`;
-  return removePreferencesMatching(
-    (key) => key.startsWith(wallPrefix) && !key.startsWith(`${wallPrefix}${currentVersionToken}:`),
-  );
+/** Kept for older callers; maintenance must never erase recoverable work. */
+export function clearSupersededSprayDrafts(_layoutId: number, _currentVersionToken: string): Promise<void> {
+  return Promise.resolve();
 }
 
 /** Drops every locally saved create-climb draft for the departing account. */

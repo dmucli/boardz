@@ -28,7 +28,11 @@ import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DEFAULT_MOBILE_DIR = resolve(REPO_ROOT, 'packages', 'mobile');
-const SUPPORTED_SENTRY_REACT_NATIVE_VERSION = '7.11.0';
+// Audit the official Expo uploader's pairing and Debug ID contract before adding
+// a version. Main and frozen release anchors must keep their own installed SDK.
+// The audited 8.35 delegated uploader preserves bundle.map pairing,
+// debugId -> debug_id, Hermes Debug ID references, and nonzero CLI exits.
+const SUPPORTED_SENTRY_REACT_NATIVE_VERSIONS = ['7.11.0', '8.24.0', '8.32.0', '8.33.0', '8.35.0'];
 const VALID_DEBUG_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export type MobilePlatform = 'ios' | 'android';
@@ -38,7 +42,7 @@ type JsonObject = Record<string, unknown>;
 type SpawnUploader = (
   executable: string,
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv; stdio: 'inherit' },
+  options: { cwd: string; env: NodeJS.ProcessEnv; stdio: 'inherit'; timeout: number; killSignal: 'SIGTERM' },
 ) => { status: number | null; error?: Error };
 
 export interface UploadSourceMapsOptions {
@@ -51,6 +55,30 @@ export interface UploadSourceMapsOptions {
 export interface UploadSourceMapsDependencies {
   resolveUploader?: (mobileDir: string) => string;
   spawnUploader?: SpawnUploader;
+  /** Waits before each retry of a nonzero uploader exit. Defaults to SOURCE_MAP_UPLOAD_RETRY_DELAYS_MS. */
+  retryDelaysMs?: readonly number[];
+  sleepSync?: (milliseconds: number) => void;
+  attemptTimeoutMs?: number;
+}
+
+/**
+ * Sentry answered 504 mid-upload on two production deploys 15 minutes apart
+ * (runs 41466306839 and 41468592705, 2026-11-02), which left those OTAs without
+ * symbolicated stacks and turned the deploy red. Uploads are keyed by Debug ID,
+ * so sending the same bundle again is safe.
+ */
+export const SOURCE_MAP_UPLOAD_RETRY_DELAYS_MS = [15_000, 45_000] as const;
+
+/**
+ * Those two failing attempts ran 9m51s and 8m46s before the 504, while healthy
+ * uploads took 5 s to 4m46s across the surrounding deploys. Cutting an attempt
+ * at 8 minutes leaves room to retry: three attempts plus both waits come to
+ * 25 minutes, inside the upload steps' 30-minute ceiling.
+ */
+export const SOURCE_MAP_UPLOAD_ATTEMPT_TIMEOUT_MS = 8 * 60_000;
+
+function blockFor(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
 export interface ValidatedSourceMapArtifact {
@@ -297,7 +325,7 @@ export function validateSourceMapOutput(
       const executableLabel = type === 'bundle' ? 'Primary OTA bundle' : 'Metadata-declared executable asset';
       throw new Error(
         `${executableLabel} requires an exact adjacent source map at ${relativeSourceMapPath}. ` +
-          'The installed Sentry 7.11 uploader cannot safely group an independently named map.',
+          'The installed Sentry Expo uploader cannot safely group an independently named map.',
       );
     }
     const sourceMapPath = assertRegularFileWithoutSymbolicLinks(realOutputDir, relativeSourceMapPath, 'Source map');
@@ -348,15 +376,42 @@ export function resolveInstalledSentryUploader(mobileDirInput: string): string {
     );
   }
   const sentryPackage = parseJsonObject(sentryPackageJsonPath, '@sentry/react-native package.json');
-  if (sentryPackage.version !== SUPPORTED_SENTRY_REACT_NATIVE_VERSION) {
+  if (
+    typeof sentryPackage.version !== 'string' ||
+    !SUPPORTED_SENTRY_REACT_NATIVE_VERSIONS.includes(sentryPackage.version)
+  ) {
     throw new Error(
-      `Unsupported @sentry/react-native version ${String(sentryPackage.version)}; expected ${SUPPORTED_SENTRY_REACT_NATIVE_VERSION}.`,
+      `Unsupported @sentry/react-native version ${String(sentryPackage.version)}; audited versions: ${SUPPORTED_SENTRY_REACT_NATIVE_VERSIONS.join(', ')}.`,
     );
   }
   const packageRoot = realpathSync(dirname(sentryPackageJsonPath));
   const uploaderPath = join(packageRoot, 'scripts', 'expo-upload-sourcemaps.js');
   if (!existsSync(uploaderPath) || !statSync(uploaderPath).isFile()) {
     throw new Error(`Official Sentry Expo source-map uploader is missing: ${uploaderPath}`);
+  }
+  // The audited 8.x SDKs keep the entrypoint but delegate to a separate package. Check it
+  // from the SDK's dependency graph, including pnpm's isolated linker, before
+  // letting a workflow publish an OTA whose maps cannot be uploaded.
+  if (
+    sentryPackage.version === '8.24.0' ||
+    sentryPackage.version === '8.32.0' ||
+    sentryPackage.version === '8.33.0' ||
+    sentryPackage.version === '8.35.0'
+  ) {
+    const requireFromSentry = createRequire(sentryPackageJsonPath);
+    try {
+      const delegatedUploaderPath = requireFromSentry.resolve('@sentry/expo-upload-sourcemaps/cli.js');
+      if (!statSync(delegatedUploaderPath).isFile()) {
+        throw new Error('Delegated uploader is not a file.');
+      }
+    } catch (error) {
+      if (isJsonObject(error) && (error.code === 'MODULE_NOT_FOUND' || error.code === 'ENOENT')) {
+        throw new Error(
+          'Official Sentry Expo source-map uploader dependency @sentry/expo-upload-sourcemaps is missing.',
+        );
+      }
+      throw error;
+    }
   }
   return existingPathWithin(packageRoot, uploaderPath, 'Official Sentry uploader');
 }
@@ -405,16 +460,33 @@ export function uploadMobileSourceMaps(
     // Sentry ships this uploader as a Node/CommonJS entrypoint. GitHub runners
     // and local vp installs provide Node, so keep the uploader runtime explicit
     // and identical on both paths.
-    const uploadResult = spawnUploader('node', [uploaderPath, stagingDirectory], {
-      cwd: temporaryWorkingDirectory,
-      env: uploaderEnvironment,
-      stdio: 'inherit',
-    });
-    if (uploadResult.error) {
-      throw new Error(`Could not start the official Sentry uploader: ${uploadResult.error.message}`);
-    }
-    if (uploadResult.status !== 0) {
-      throw new Error(`Official Sentry uploader failed with exit code ${uploadResult.status ?? 'unknown'}.`);
+    const retryDelaysMs = dependencies.retryDelaysMs ?? SOURCE_MAP_UPLOAD_RETRY_DELAYS_MS;
+    const sleepSync = dependencies.sleepSync ?? blockFor;
+    const attemptTimeoutMs = dependencies.attemptTimeoutMs ?? SOURCE_MAP_UPLOAD_ATTEMPT_TIMEOUT_MS;
+    const attempts = retryDelaysMs.length + 1;
+    for (let attempt = 1; ; attempt += 1) {
+      const uploadResult = spawnUploader('node', [uploaderPath, stagingDirectory], {
+        cwd: temporaryWorkingDirectory,
+        env: uploaderEnvironment,
+        stdio: 'inherit',
+        timeout: attemptTimeoutMs,
+        killSignal: 'SIGTERM',
+      });
+      const timedOut = (uploadResult.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT';
+      // A missing node binary or uploader fails the same way every time.
+      if (uploadResult.error && !timedOut) {
+        throw new Error(`Could not start the official Sentry uploader: ${uploadResult.error.message}`);
+      }
+      if (uploadResult.status === 0 && !timedOut) break;
+      const outcome = timedOut
+        ? `timed out after ${attemptTimeoutMs / 60_000} minutes`
+        : `failed with exit code ${uploadResult.status ?? 'unknown'}`;
+      if (attempt >= attempts) throw new Error(`Official Sentry uploader ${outcome}.`);
+      const delayMs = retryDelaysMs[attempt - 1]!;
+      console.warn(
+        `[mobile:upload-sourcemaps] Uploader ${outcome} on attempt ${attempt} of ${attempts}; retrying in ${delayMs / 1000}s.`,
+      );
+      sleepSync(delayMs);
     }
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });

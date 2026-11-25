@@ -40,6 +40,9 @@ function makeTick(overrides: Partial<SessionDetailTick> = {}): SessionDetailTick
 }
 
 describe('sessionTickToClimb', () => {
+  it('counts multi-frame tick routes', () => {
+    expect(sessionTickToClimb(makeTick({ frames: 'p1r15,p2r15' }))?.framesCount).toBe(2);
+  });
   it('returns null without frames (falls back to the plain text row)', () => {
     expect(sessionTickToClimb(makeTick({ frames: null }))).toBeNull();
   });
@@ -77,6 +80,16 @@ describe('sessionTickToClimb', () => {
     const climb = sessionTickToClimb(makeTick({ frames: 'p1', isMirror: true, isNoMatch: true }));
     expect(climb?.mirrored).toBe(true);
     expect(climb?.is_no_match).toBe(true);
+  });
+
+  // #5245 review: the session row's attribute cluster reads characteristics for
+  // the campus / any-feet / no-kickboard badges, so the mapper must carry it.
+  it('carries characteristics onto the row, and null (not []) when the tick has none', () => {
+    const withRules = sessionTickToClimb(makeTick({ frames: 'p1', characteristics: ['campus', 'no_kickboard'] }));
+    expect(withRules?.characteristics).toEqual(['campus', 'no_kickboard']);
+
+    const unrecorded = sessionTickToClimb(makeTick({ frames: 'p1' }));
+    expect(unrecorded?.characteristics).toBeNull();
   });
 
   it('keeps the community star average hidden by defaulting quality_average to "0"', () => {

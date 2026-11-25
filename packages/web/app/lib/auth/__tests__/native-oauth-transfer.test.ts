@@ -1,5 +1,13 @@
+import { createHmac } from 'node:crypto';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vite-plus/test';
-import { issueNativeOAuthTransferToken, verifyNativeOAuthTransferToken } from '../native-oauth-transfer';
+vi.mock('server-only', () => ({}));
+import {
+  issueNativeOAuthTransferToken,
+  nativeOAuthTransferSpentMarker,
+  verifyNativeOAuthTransferToken,
+  issueNativeOAuthAttempt,
+  verifyNativeOAuthAttempt,
+} from '../native-oauth-transfer';
 
 describe('native OAuth transfer token', () => {
   beforeEach(() => {
@@ -19,10 +27,112 @@ describe('native OAuth transfer token', () => {
       nextPath: '/settings',
     });
 
-    expect(verifyNativeOAuthTransferToken(token)).toEqual({
-      userId: 'user_123',
-      nextPath: '/settings',
+    expect(verifyNativeOAuthTransferToken(token)).toEqual({ generation: 0, userId: 'user_123', nextPath: '/settings' });
+  });
+
+  it('signs the supplied login generation without introducing authentication age', () => {
+    const transfer = issueNativeOAuthTransferToken({
+      userId: 'transfer-generation-fixture',
+      nextPath: '/',
+      generation: 5,
     });
+    const claims = JSON.parse(Buffer.from(transfer.split('.')[0], 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(claims.gen).toBe(5);
+    expect(claims).not.toHaveProperty('auth_time');
+    expect(verifyNativeOAuthTransferToken(transfer)).toEqual({
+      generation: 5,
+      userId: 'transfer-generation-fixture',
+      nextPath: '/',
+    });
+    const legacy = issueNativeOAuthTransferToken({ userId: 'transfer-generation-fixture', nextPath: '/' });
+    const legacyClaims = JSON.parse(Buffer.from(legacy.split('.')[0], 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(legacyClaims.gen).toBe(0);
+  });
+
+  it('carries the source SID without an account-creation receipt or fresh authentication age', () => {
+    const transfer = issueNativeOAuthTransferToken({
+      userId: 'transfer-source-fixture',
+      authSessionId: 'source-session-fixture',
+      generation: 5,
+      nextPath: '/',
+    });
+    const claims = JSON.parse(Buffer.from(transfer.split('.')[0], 'base64url').toString('utf8')) as Record<
+      string,
+      unknown
+    >;
+    expect(claims.authSessionId).toBe('source-session-fixture');
+    expect(claims.gen).toBe(5);
+    expect(claims).not.toHaveProperty('auth_time');
+    expect(claims).not.toHaveProperty('accountCreation');
+  });
+
+  it.each([-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1])('refuses invalid generation %s', (generation) => {
+    expect(() =>
+      issueNativeOAuthTransferToken({ userId: 'transfer-generation-fixture', nextPath: '/', generation }),
+    ).toThrow('Invalid native OAuth transfer generation');
+  });
+
+  it('keeps a creation receipt bound to its signed user, provider, session and attempt', () => {
+    const userId = '602c83bf-e090-4c90-9f7e-08ca0b6b5dad';
+    const accountCreation = {
+      userId,
+      accountCreated: true,
+      provider: 'google' as const,
+      createdAt: '2026-04-03T12:00:00.000Z',
+    };
+    const options = {
+      userId,
+      nextPath: '/',
+      accountCreation,
+      authSessionId: 'login-1',
+      attemptId: 'a'.repeat(32),
+      provider: 'google' as const,
+    };
+    const credentialProof = {
+      version: 1,
+      userId,
+      authSessionId: 'login-1',
+      generation: 0,
+      authenticatedAt: null,
+      linkGuarded: false,
+    };
+    expect(verifyNativeOAuthTransferToken(issueNativeOAuthTransferToken(options))).toEqual({
+      generation: 0,
+      userId,
+      nextPath: '/',
+      accountCreation,
+      credentialProof,
+    });
+    expect(
+      verifyNativeOAuthTransferToken(issueNativeOAuthTransferToken({ ...options, userId: 'another-user' })),
+    ).toEqual({
+      generation: 0,
+      userId: 'another-user',
+      nextPath: '/',
+      credentialProof: { ...credentialProof, userId: 'another-user' },
+    });
+    expect(verifyNativeOAuthTransferToken(issueNativeOAuthTransferToken({ ...options, provider: 'apple' }))).toEqual({
+      generation: 0,
+      userId,
+      nextPath: '/',
+      credentialProof,
+    });
+  });
+
+  it('validates the signed anonymous attempt without treating it as a login token', () => {
+    const attemptId = 'a'.repeat(32);
+    const token = issueNativeOAuthAttempt({ attemptId, provider: 'apple' });
+    expect(verifyNativeOAuthAttempt(token)).toEqual({ attemptId, provider: 'apple', startedAt: Date.now() });
+    expect(verifyNativeOAuthTransferToken(token)).toBeNull();
+    expect(verifyNativeOAuthAttempt(`${token}x`)).toBeNull();
+    vi.setSystemTime(new Date('2026-04-03T12:02:01Z'));
+    expect(verifyNativeOAuthAttempt(token)).toBeNull();
   });
 
   it('normalizes unsafe paths to root', () => {
@@ -31,10 +141,7 @@ describe('native OAuth transfer token', () => {
       nextPath: 'https://evil.example',
     });
 
-    expect(verifyNativeOAuthTransferToken(token)).toEqual({
-      userId: 'user_123',
-      nextPath: '/',
-    });
+    expect(verifyNativeOAuthTransferToken(token)).toEqual({ generation: 0, userId: 'user_123', nextPath: '/' });
   });
 
   it('rejects expired tokens', () => {
@@ -66,6 +173,63 @@ describe('native OAuth transfer token', () => {
     expect(verifyNativeOAuthTransferToken(`${token}.extra`)).toBeNull();
   });
 
+  it.each([
+    ['one trailing NUL', (signature: string) => `${signature}\u0000`],
+    ['two trailing NULs', (signature: string) => `${signature}\u0000\u0000`],
+    ['base64 padding', (signature: string) => `${signature}=`],
+    ['a trailing space', (signature: string) => `${signature} `],
+    ['a trailing newline', (signature: string) => `${signature}\n`],
+    ['the standard base64 alphabet', (signature: string) => Buffer.from(signature, 'base64url').toString('base64')],
+  ])('refuses a signature respelled with %s', (_label, respell) => {
+    const token = issueNativeOAuthTransferToken({ userId: 'user_123', nextPath: '/' });
+    const [payload, signature] = token.split('.');
+    const respelled = `${payload}.${respell(signature)}`;
+    expect(respelled).not.toBe(token);
+    expect(verifyNativeOAuthTransferToken(respelled)).toBeNull();
+    expect(nativeOAuthTransferSpentMarker(respelled)).toBeNull();
+  });
+
+  it('refuses a payload segment that is not unpadded base64url', () => {
+    const token = issueNativeOAuthTransferToken({ userId: 'user_123', nextPath: '/' });
+    const [payload] = token.split('.');
+    for (const respelledPayload of [`${payload}=`, ` ${payload}`, `${payload}\u0000`]) {
+      const signature = createHmac('sha256', 'test-nextauth-secret').update(respelledPayload).digest('base64url');
+      expect(verifyNativeOAuthTransferToken(`${respelledPayload}.${signature}`)).toBeNull();
+    }
+  });
+
+  it('refuses a signed token whose lifetime exceeds the issuer cap', () => {
+    const now = Math.floor(Date.now() / 1000);
+    const sign = (claims: Record<string, unknown>) => {
+      const payload = Buffer.from(JSON.stringify(claims)).toString('base64url');
+      return `${payload}.${createHmac('sha256', 'test-nextauth-secret').update(payload).digest('base64url')}`;
+    };
+    expect(verifyNativeOAuthTransferToken(sign({ userId: 'u', nextPath: '/', iat: now, exp: now + 125 }))).toEqual({
+      generation: 0,
+      userId: 'u',
+      nextPath: '/',
+    });
+    expect(verifyNativeOAuthTransferToken(sign({ userId: 'u', nextPath: '/', iat: now, exp: now + 126 }))).toBeNull();
+    expect(verifyNativeOAuthTransferToken(sign({ userId: 'u', nextPath: '/', iat: now, exp: now }))).toBeNull();
+  });
+
+  it('derives one spent marker per token, expiring after the token can no longer verify', () => {
+    const token = issueNativeOAuthTransferToken({ userId: 'user_123', nextPath: '/' });
+    const marker = nativeOAuthTransferSpentMarker(token);
+    expect(marker).not.toBeNull();
+    expect(nativeOAuthTransferSpentMarker(token)).toEqual(marker);
+    // The backend's expired replay-record cleanup deletes every row under this prefix.
+    expect(marker?.identifier).toBe(`ba03-web-auth:${marker?.token}`);
+    expect(marker?.token).toMatch(/^[0-9a-f]{64}$/);
+    // 120 s life + 5 s skew + 5 min margin.
+    expect(marker?.expires.toISOString()).toBe('2026-04-03T12:07:05.000Z');
+
+    vi.setSystemTime(new Date('2026-04-03T12:00:01Z'));
+    const next = issueNativeOAuthTransferToken({ userId: 'user_123', nextPath: '/' });
+    expect(nativeOAuthTransferSpentMarker(next)?.token).not.toBe(marker?.token);
+    expect(nativeOAuthTransferSpentMarker(`${token}x`)).toBeNull();
+  });
+
   it('rejects tokens with empty segments', () => {
     expect(verifyNativeOAuthTransferToken('.')).toBeNull();
     expect(verifyNativeOAuthTransferToken('.sig')).toBeNull();
@@ -81,10 +245,7 @@ describe('native OAuth transfer token', () => {
     // Rewind time by 4 seconds — iat is 4s in the future, within tolerance
     vi.setSystemTime(new Date('2026-04-03T11:59:56Z'));
 
-    expect(verifyNativeOAuthTransferToken(token)).toEqual({
-      userId: 'user_123',
-      nextPath: '/feed',
-    });
+    expect(verifyNativeOAuthTransferToken(token)).toEqual({ generation: 0, userId: 'user_123', nextPath: '/feed' });
   });
 
   it('accepts tokens up to 5 seconds after exp (clock skew)', () => {
@@ -96,10 +257,7 @@ describe('native OAuth transfer token', () => {
     // Advance time to 4 seconds past expiry (120s TTL + 4s = 124s)
     vi.setSystemTime(new Date('2026-04-03T12:02:04Z'));
 
-    expect(verifyNativeOAuthTransferToken(token)).toEqual({
-      userId: 'user_123',
-      nextPath: '/feed',
-    });
+    expect(verifyNativeOAuthTransferToken(token)).toEqual({ generation: 0, userId: 'user_123', nextPath: '/feed' });
   });
 
   it('rejects tokens more than 5 seconds after exp', () => {
@@ -136,5 +294,121 @@ describe('native OAuth transfer token', () => {
     vi.unstubAllEnvs();
 
     expect(verifyNativeOAuthTransferToken(token)).toBeNull();
+  });
+  it('preserves source SID, generation and old authentication time without treating transfer iat as a login', () => {
+    const authenticatedAt = '2026-04-03T11:00:00.000Z';
+    const proof = {
+      version: 1 as const,
+      userId: 'synthetic-source',
+      authSessionId: 'source-login',
+      generation: 4,
+      authenticatedAt,
+      linkGuarded: true,
+    };
+    const token = issueNativeOAuthTransferToken({
+      userId: proof.userId,
+      nextPath: '/settings',
+      generation: 9,
+      credentialProof: proof,
+    });
+    const payload = JSON.parse(Buffer.from(token.split('.')[0], 'base64url').toString('utf8')) as {
+      authSessionId: string;
+      gen: number;
+      auth_time: number;
+      iat: number;
+    };
+    expect(payload.authSessionId).toBe(proof.authSessionId);
+    expect(payload.gen).toBe(4);
+    expect(payload.auth_time).toBe(Date.parse(authenticatedAt) / 1000);
+    expect(payload.auth_time).toBeLessThan(payload.iat);
+    expect(verifyNativeOAuthTransferToken(token)?.credentialProof).toEqual(proof);
+    expect(() =>
+      issueNativeOAuthTransferToken({ userId: 'other-owner', nextPath: '/', credentialProof: proof }),
+    ).toThrow();
+  });
+
+  it('retains unknown login ancestry through signed trusted-proof transfer serialization', () => {
+    const proof = {
+      version: 1 as const,
+      userId: 'historical-owner',
+      authSessionId: 'historical-child',
+      generation: 0,
+      authenticatedAt: null,
+      linkGuarded: false,
+      requiresAccountCutoff: true as const,
+    };
+    const token = issueNativeOAuthTransferToken({ userId: proof.userId, nextPath: '/', credentialProof: proof });
+    expect(verifyNativeOAuthTransferToken(token)?.credentialProof).toEqual(proof);
+  });
+});
+
+describe('signed transfer compatibility and proof completeness', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-03T12:00:00Z'));
+    vi.stubEnv('NEXTAUTH_SECRET', 'owned-transfer-completeness-fixture');
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+  });
+
+  function signedClaims(claims: Record<string, unknown>): string {
+    const encoded = Buffer.from(
+      JSON.stringify({
+        userId: 'signed-source',
+        nextPath: '/',
+        iat: Math.floor(Date.now() / 1000),
+        exp: Math.floor(Date.now() / 1000) + 120,
+        ...claims,
+      }),
+    ).toString('base64url');
+    return `${encoded}.${createHmac('sha256', 'owned-transfer-completeness-fixture').update(encoded).digest('base64url')}`;
+  }
+
+  it.each([
+    { claims: {}, generation: 0 },
+    { claims: { gen: 7 }, generation: 7 },
+  ])(
+    'inherits generation-only legacy bytes without inventing age or a complete proof: $generation',
+    ({ claims, generation }) => {
+      expect(verifyNativeOAuthTransferToken(signedClaims(claims))).toEqual({
+        userId: 'signed-source',
+        nextPath: '/',
+        generation,
+      });
+    },
+  );
+  it('carries source SID without an analytics receipt and inherits unknown age', () => {
+    const token = issueNativeOAuthTransferToken({
+      userId: 'signed-source',
+      nextPath: '/',
+      generation: 7,
+      authSessionId: 'stable-source',
+    });
+    expect(verifyNativeOAuthTransferToken(token)).toEqual({
+      userId: 'signed-source',
+      nextPath: '/',
+      generation: 7,
+      credentialProof: {
+        version: 1,
+        userId: 'signed-source',
+        authSessionId: 'stable-source',
+        generation: 7,
+        authenticatedAt: null,
+        linkGuarded: false,
+      },
+    });
+  });
+  it.each([-1, 1.5, '7', null, Number.MAX_SAFE_INTEGER + 1])('refuses invalid signed legacy generation %s', (gen) => {
+    expect(verifyNativeOAuthTransferToken(signedClaims({ gen }))).toBeNull();
+  });
+  it.each([
+    { gen: 3, auth_time: 1775214000 },
+    { gen: 3, link_guarded: true },
+    { authSessionId: 'source', auth_time: 1775214000 },
+    { authSessionId: 'source', link_guarded: true },
+  ])('refuses partial freshness claims without a complete signed source: %j', (claims) => {
+    expect(verifyNativeOAuthTransferToken(signedClaims(claims))).toBeNull();
   });
 });

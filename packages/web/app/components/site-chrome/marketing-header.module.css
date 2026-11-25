@@ -8,7 +8,7 @@
   align-items: center;
   gap: var(--spacing-6);
   height: var(--global-header-height);
-  padding: 0 max(var(--spacing-8), calc((100% - 1200px) / 2 + var(--spacing-8)));
+  padding: 0 max(var(--page-gutter), calc((100% - var(--page-wide)) / 2 + var(--page-gutter)));
   padding-top: var(--safe-area-inset-top);
   background: color-mix(in srgb, var(--semantic-background) 88%, transparent);
   -webkit-backdrop-filter: blur(20px);
@@ -33,10 +33,13 @@
   align-items: center;
 }
 
+/* The current page: the label ink with a 2px foreground-violet underline. No
+   pill and no bar, so the header's one filled violet stays the page's CTA. */
 .nav a[aria-current='page'] {
   color: var(--neutral-900);
   text-decoration: underline;
   text-decoration-color: var(--color-primary);
+  text-decoration-thickness: 2px;
   text-underline-offset: 6px;
 }
 
@@ -152,5 +155,77 @@
   .header {
     gap: var(--spacing-1);
     padding-inline: var(--spacing-4);
+  }
+}
+
+.phoneInstall.phoneInstall {
+  display: none;
+}
+.accountSlot {
+  display: flex;
+  align-items: center;
+}
+@media (max-width: 599px) {
+  .phoneInstall.phoneInstall {
+    display: inline-flex;
+    margin-left: auto;
+    /* The global button list (index.css) plus the fade. Showing: visible at
+       once, then the fade in. */
+    transition:
+      opacity var(--motion-normal) var(--ease-standard),
+      visibility 0s,
+      background-color var(--motion-normal) var(--ease-standard),
+      border-color var(--motion-normal) var(--ease-standard),
+      color var(--motion-normal) var(--ease-standard);
+  }
+  .accountSlot {
+    display: none;
+  }
+  .header {
+    gap: var(--spacing-1);
+  }
+}
+
+/*
+ * The phone's "Get the app" steps aside while one of the page's own store badges
+ * is on screen (`HeaderPhoneInstall`, `useStoreBadgeOnScreen`). Hidden, not
+ * removed: `visibility: hidden` keeps the slot's width, so the header never
+ * shifts, and takes the link out of the tab order and the accessibility tree.
+ * Hiding fades out first, then turns visibility off.
+ *
+ * Never while the link has keyboard focus (`:not(:focus-visible)`): hiding a
+ * focused element drops focus to <body>, so a badge scrolling into view would
+ * throw a keyboard user back to the top of the page. It hides once focus
+ * moves on. A browser without `:focus-visible` drops the rule and keeps the
+ * link showing, as it did before.
+ *
+ * Two rules, not one selector list: a browser without `:has()` drops a whole
+ * list it cannot parse, and the hook's answer must still apply there.
+ */
+.phoneInstall.phoneInstall[data-store-badge-on-screen='yes']:not(:focus-visible) {
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity var(--motion-normal) var(--ease-standard),
+    visibility 0s linear var(--motion-normal);
+}
+
+/* Before the hook has answered (server HTML, hydration, the first observer
+   report), guess from the markup: a badge in <main> hides the link. The home
+   page's hero badge is on screen at the top, so the link must never paint there
+   and then leave. A page whose only badge is far down shows it a beat late.
+   With JavaScript off, or a hydration that fails, the guess is never replaced
+   and the link stays hidden on every page with a badge in <main>. Accepted:
+   that page shows its own badge, which is the same store link. */
+:root:has(main a[data-store-badge]) .phoneInstall.phoneInstall:not([data-store-badge-on-screen]):not(:focus-visible) {
+  opacity: 0;
+  visibility: hidden;
+  transition: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .phoneInstall.phoneInstall,
+  .phoneInstall.phoneInstall[data-store-badge-on-screen='yes']:not(:focus-visible) {
+    transition: none;
   }
 }

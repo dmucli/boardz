@@ -1,29 +1,17 @@
-import { useEffect, useRef, useSyncExternalStore } from 'react';
+import { useEffect, useRef } from 'react';
 import { StyleSheet, View, type ViewStyle } from 'react-native';
 import Animated, { FadeIn, FadeOut } from 'react-native-reanimated';
 import { Snackbar } from 'react-native-paper';
-import { useSegments } from 'expo-router';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Text } from './Text';
 import { Icon } from './Icon';
 import type { IconName } from './icon-map';
 import { blendOpaque, withAlpha } from '../theme/colors';
 import { borderRadius, spacing } from '../theme/tokens';
-import {
-  MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT,
-  MATERIAL_TAB_BAR_HEIGHT,
-  REST_TIMER_RESERVE,
-  TAB_BAR_HEIGHT,
-  TOOLBAR_RESERVE,
-} from '../theme/layout';
-import type { UiVariant } from '../theme/resolve-ui-variant';
-import { isTabsRoute, isTopLevelTabRoute } from '../lib/route-segments';
-import { useNativeTabContentInsetBottom } from '../lib/native-tab-content-inset-store';
-import { useConnectivityBannerHeight } from '../lib/connectivity-banner-inset-store';
-import { getRestTimerState, subscribeRestTimer } from '../lib/rest-timer-store';
 import { useTheme } from '../providers/theme-provider';
-import { createVariantComponent, selectByVariant } from '../theme/variants';
-import { isBottomAccessoryAvailable, useNativeTabBar } from '../hooks/use-bottom-accessory';
+import { createVariantComponent } from '../theme/variants';
+import { usePublishedToastBottomOffset } from '../lib/toast-offset-store';
+import { TabBarHideFollower } from './navigation/TabBarHideFollower';
 
 export type ToastVariant = 'success' | 'error' | 'info' | 'warning';
 
@@ -57,81 +45,21 @@ const VARIANT_CONFIG: Record<ToastVariant, { icon: IconName; colorKey: 'success'
  */
 export const Toast = createVariantComponent('Toast', { liquidGlass: ToastGlass, material: ToastMaterial });
 
-// Same selector-hoisting as use-bottom-chrome-metrics: one stable snapshot
-// getter so a toast subscribes once and re-renders only when `armed` flips,
-// never on the pill's 1 Hz countdown.
-const getRestTimerArmed = () => getRestTimerState().armed;
-const getRestTimerArmedServerSnapshot = () => false;
-
 /**
- * On JS-tab screens, reserve the worst-case queue toolbar height so a toast never
- * covers current-climb controls. NativeTabs folds its own bar/accessory into the
- * safe-area inset, and off-tab screens use the ordinary safe-area gap. Shared by
- * both variants — ToastProvider sits above QueueProvider, so this must stay
- * independent from queue context.
+ * Where a toast floats, as `ToastOffsetPublisher` computed it from the shared
+ * bottom-chrome metrics (see that file for the rules). Toasts render from
+ * ToastProvider, above BottomChromeMetricsProvider, so the value arrives
+ * through a module store. Before the first publish, sit on the root inset.
  */
-function useToastBottomOffset(uiVariant: UiVariant) {
+function useToastBottomOffset(): number {
+  const published = usePublishedToastBottomOffset();
   const insets = useSafeAreaInsets();
-  const segments = useSegments();
-  // Use the same canonical predicate that selects NativeTabs in the tab layout.
-  // The UI variant alone is insufficient: Liquid Glass falls back to the JS bar
-  // on older iOS versions, Android, and tablets.
-  const usesNativeTabBar = useNativeTabBar();
-  const nativeBottomAccessoryAvailable = isBottomAccessoryAvailable();
-  const toolbarReserve = selectByVariant(uiVariant, {
-    material: MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT,
-    liquidGlass: TOOLBAR_RESERVE,
-  });
-  // ToastProvider sits above QueueProvider, so it cannot read current-climb state
-  // from computeBottomChromeMetrics and conservatively reserves the JS queue bar.
-  // NativeTabs folds the bar (and BottomAccessory) into the IN-TAB inset only —
-  // this hook reads the ROOT provider (home indicator alone), so it clears the
-  // native chrome via the measurement NativeTabContentInsetProbe publishes; see
-  // the sampling-point contract in bottom-chrome-metrics.ts. Pre-measurement
-  // fallback reconstructs the bar from the root inset, but cannot include the
-  // accessory (no climb state up here) — a pre-publish toast may briefly sit
-  // behind the accessory platter, transient by design. If a native tab bar is
-  // available but its BottomAccessory export is not, the JS PersistentQueueBar
-  // takes over on top-level tab routes; preserve that toolbar reserve without
-  // adding the native tab bar a second time. Pushed tab routes never render
-  // PersistentQueueBar, so they keep only the native chrome clearance. Material
-  // and the Liquid Glass JS fallback still need both explicit terms because
-  // their tab/queue bars are outside every UIKit safe-area inset.
-  const measuredTabContentInsetBottom = useNativeTabContentInsetBottom();
-  // The connectivity banner (issue #4862) floats above the bottom chrome on
-  // EVERY route, tabs or not, so it is added to all three branches below — a
-  // toast that lands behind the "no signal" card is the one message the climber
-  // most needs to read. `0` while no banner is showing. Read from the module
-  // store rather than useBottomChromeMetrics for the same reason as the in-tab
-  // inset above: ToastProvider sits above BottomChromeMetricsProvider.
-  const connectivityBannerHeight = useConnectivityBannerHeight();
-  // The rest-timer pill (issue #5378) floats between the queue chrome and the
-  // banner while the timer is armed, and it is PERSISTENT — a toast landing on
-  // top of a running countdown covers the one control the climber is watching.
-  // Same reserve term and same gating as computeBottomChromeMetrics (armed AND
-  // inside the tabs), read from the module store because ToastProvider sits above
-  // BottomChromeMetricsProvider. A fixed constant, so unlike the banner there is
-  // nothing to measure. This hook has no sidebar awareness (it already reserves
-  // the JS tab bar on iPad too), so the iPad shell over-reserves by 54pt while
-  // armed — the same conservative direction as the rest of this function.
-  const restTimerArmed = useSyncExternalStore(subscribeRestTimer, getRestTimerArmed, getRestTimerArmedServerSnapshot);
-  const restTimerReserve = restTimerArmed ? REST_TIMER_RESERVE : 0;
-  const tabBarHeight = selectByVariant(uiVariant, { material: MATERIAL_TAB_BAR_HEIGHT, liquidGlass: TAB_BAR_HEIGHT });
-  // Off-tab routes reserve nothing for the pill, matching the `insideTabs` gate
-  // in computeBottomChromeMetrics: the pill rides the queue chrome, which is not
-  // on screen here.
-  if (!isTabsRoute(segments)) return insets.bottom + spacing[3] + connectivityBannerHeight;
-  if (usesNativeTabBar) {
-    const jsQueueReserve = !nativeBottomAccessoryAvailable && isTopLevelTabRoute(segments) ? toolbarReserve : 0;
-    const nativeChromeBottom = measuredTabContentInsetBottom ?? insets.bottom + TAB_BAR_HEIGHT;
-    return nativeChromeBottom + jsQueueReserve + restTimerReserve + spacing[2] + connectivityBannerHeight;
-  }
-  return insets.bottom + tabBarHeight + toolbarReserve + restTimerReserve + spacing[2] + connectivityBannerHeight;
+  return published ?? insets.bottom + spacing[2];
 }
 
 function ToastMaterial({ toast, onDismiss }: ToastProps) {
-  const { systemColors, colorScheme, brandColors, variant: uiVariant } = useTheme();
-  const bottomOffset = useToastBottomOffset(uiVariant);
+  const { systemColors, colorScheme, brandColors } = useTheme();
+  const bottomOffset = useToastBottomOffset();
   const config = VARIANT_CONFIG[toast.variant];
   const variantColor = brandColors[config.colorKey];
 
@@ -158,31 +86,33 @@ function ToastMaterial({ toast, onDismiss }: ToastProps) {
   );
 
   return (
-    <Snackbar
-      visible
-      onDismiss={() => onDismiss(toast.id)}
-      duration={toast.duration}
-      wrapperStyle={wrapperStyle}
-      style={{ backgroundColor }}
-    >
-      {/* role + assertive live region sit on our content node, not the Snackbar
+    <TabBarHideFollower>
+      <Snackbar
+        visible
+        onDismiss={() => onDismiss(toast.id)}
+        duration={toast.duration}
+        wrapperStyle={wrapperStyle}
+        style={{ backgroundColor }}
+      >
+        {/* role + assertive live region sit on our content node, not the Snackbar
           root (Paper owns that and sets its own polite region). The glass path
           puts them on its container; here the content View is the equivalent
           announced node, so TalkBack reads the message assertively either way. */}
-      <View style={styles.materialContent} accessibilityRole="alert" accessibilityLiveRegion="assertive">
-        <Icon name={config.icon} size={18} color={variantColor} />
-        <Text variant="subheadline" color={systemColors.label} style={styles.message} numberOfLines={2}>
-          {toast.message}
-        </Text>
-      </View>
-    </Snackbar>
+        <View style={styles.materialContent} accessibilityRole="alert" accessibilityLiveRegion="assertive">
+          <Icon name={config.icon} size={18} color={variantColor} />
+          <Text variant="subheadline" color={systemColors.label} style={styles.message} numberOfLines={2}>
+            {toast.message}
+          </Text>
+        </View>
+      </Snackbar>
+    </TabBarHideFollower>
   );
 }
 
 // Liquid Glass / HIG toast.
 function ToastGlass({ toast, onDismiss }: ToastProps) {
-  const { systemColors, colorScheme, brandColors, variant: uiVariant } = useTheme();
-  const bottomOffset = useToastBottomOffset(uiVariant);
+  const { systemColors, colorScheme, brandColors } = useTheme();
+  const bottomOffset = useToastBottomOffset();
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const config = VARIANT_CONFIG[toast.variant];
   const variantColor = brandColors[config.colorKey];
@@ -200,25 +130,27 @@ function ToastGlass({ toast, onDismiss }: ToastProps) {
   const tintColor = withAlpha(variantColor, colorScheme === 'dark' ? 0.24 : 0.15);
 
   return (
-    <Animated.View
-      entering={FadeIn.duration(200)}
-      exiting={FadeOut.duration(200)}
-      style={[
-        styles.container,
-        {
-          bottom: bottomOffset,
-          backgroundColor: systemColors.secondaryBackground,
-        },
-      ]}
-      accessibilityRole="alert"
-      accessibilityLiveRegion="assertive"
-    >
-      <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: tintColor }]} />
-      <Icon name={config.icon} size={18} color={variantColor} />
-      <Text variant="subheadline" color={systemColors.label} style={styles.message} numberOfLines={2}>
-        {toast.message}
-      </Text>
-    </Animated.View>
+    <TabBarHideFollower>
+      <Animated.View
+        entering={FadeIn.duration(200)}
+        exiting={FadeOut.duration(200)}
+        style={[
+          styles.container,
+          {
+            bottom: bottomOffset,
+            backgroundColor: systemColors.secondaryBackground,
+          },
+        ]}
+        accessibilityRole="alert"
+        accessibilityLiveRegion="assertive"
+      >
+        <View pointerEvents="none" style={[StyleSheet.absoluteFill, { backgroundColor: tintColor }]} />
+        <Icon name={config.icon} size={18} color={variantColor} />
+        <Text variant="subheadline" color={systemColors.label} style={styles.message} numberOfLines={2}>
+          {toast.message}
+        </Text>
+      </Animated.View>
+    </TabBarHideFollower>
   );
 }
 

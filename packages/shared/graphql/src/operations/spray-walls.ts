@@ -1,4 +1,9 @@
 import { gql } from 'graphql-request';
+import { BOARD_FIELDS } from './boards';
+import type { SprayWallPhoto, SprayWallReportReason } from '../generated/graphql';
+import type { ReleaseContext, ReleaseContextInput } from '@boardsesh/shared-schema';
+
+export type { SprayWallReportReason } from '../generated/graphql';
 
 /**
  * Spray wall operations, shared by web and mobile.
@@ -60,7 +65,7 @@ const SPRAY_WALL_HOLD_FIELDS = `
  * carry fifty versions, each of which costs two presigned signatures to build.
  * Ask for the history with `SPRAY_WALL_WITH_VERSIONS` on the screen that shows it.
  */
-const SPRAY_WALL_FIELDS = `
+const SPRAY_WALL_ENTITY_FIELDS = `
   uuid
   layoutId
   sizeId
@@ -72,6 +77,15 @@ const SPRAY_WALL_FIELDS = `
   # Only ever non-null for the OWNER — a hidden wall does not resolve for anybody
   # else — so a client can render the notice off its presence alone (SW-17).
   hiddenAt
+  # The wall's stored look is deliberately absent: see GET_SPRAY_WALL_LOOK. So
+  # is its archive state: see GET_SPRAY_WALL_ARCHIVE, for the same reason.
+  currentVersion {
+    ${SPRAY_WALL_VERSION_FIELDS}
+  }
+`;
+
+const SPRAY_WALL_FIELDS = `
+  ${SPRAY_WALL_ENTITY_FIELDS}
   board {
     uuid
     slug
@@ -84,6 +98,7 @@ const SPRAY_WALL_FIELDS = `
     isPublic
     isUnlisted
     hasLeds
+    litByWallDevice
     isAngleAdjustable
     ownerId
     ownerDisplayName
@@ -91,8 +106,30 @@ const SPRAY_WALL_FIELDS = `
     gymName
     canEdit
   }
-  currentVersion {
-    ${SPRAY_WALL_VERSION_FIELDS}
+`;
+
+/**
+ * What the add-a-wall wizard's details step prefills from, beyond the shared
+ * fragment: the visibility parked for the first publish (owner only) and the
+ * wall's location. The second `board` selection merges with the fragment's.
+ *
+ * Only the wizard's resume read and its details save select these. A backend
+ * that does not know `pendingVisibility` (or the new `updateSprayWall` input
+ * fields) fails the WHOLE operation at validation, it does not leave the field
+ * out, so they stay out of the shared fragment, out of Edit board's update and
+ * out of the post-publish visibility repair: an old backend must never fail a
+ * publish that has already landed. The backend half (#6494) ships first.
+ */
+const SPRAY_WALL_DETAILS_FIELDS = `
+  pendingVisibility {
+    isPublic
+    isUnlisted
+  }
+  board {
+    locationName
+    latitude
+    longitude
+    hideLocation
   }
 `;
 
@@ -104,10 +141,23 @@ export const GET_SPRAY_WALL = gql`
   }
 `;
 
+/** Resolve a shared wall and the complete board entity needed for route adoption. */
+export const GET_SPRAY_WALL_FOR_LINK = gql`
+  query GetSprayWallForLink($uuid: ID!) {
+    sprayWall(uuid: $uuid) {
+      ${SPRAY_WALL_ENTITY_FIELDS}
+      board {
+        ${BOARD_FIELDS}
+      }
+    }
+  }
+`;
+
 export const GET_SPRAY_WALL_WITH_VERSIONS = gql`
   query GetSprayWallWithVersions($uuid: ID!) {
     sprayWall(uuid: $uuid) {
       ${SPRAY_WALL_FIELDS}
+      ${SPRAY_WALL_DETAILS_FIELDS}
       versions {
         ${SPRAY_WALL_VERSION_FIELDS}
       }
@@ -116,12 +166,54 @@ export const GET_SPRAY_WALL_WITH_VERSIONS = gql`
 `;
 
 export const GET_SPRAY_WALL_BY_LAYOUT = gql`
-  query GetSprayWallByLayout($layoutId: Int!) {
-    sprayWallByLayout(layoutId: $layoutId) {
+  query GetSprayWallByLayout($layoutId: Int!, $sprayWallUuid: String) {
+    sprayWallByLayout(layoutId: $layoutId, sprayWallUuid: $sprayWallUuid) {
       ${SPRAY_WALL_FIELDS}
     }
   }
 `;
+
+/** Board-picker photos, without loading or registering a wall's hold geometry. */
+export const GET_SPRAY_WALL_THUMBNAIL = gql`
+  query GetSprayWallThumbnail($uuid: ID!, $includeDrafts: Boolean!) {
+    sprayWall(uuid: $uuid) {
+      uuid
+      layoutId
+      currentVersion {
+        id
+        photo {
+          url
+          width
+          height
+          expiresAt
+        }
+      }
+      versions @include(if: $includeDrafts) {
+        id
+        photo {
+          url
+          width
+          height
+          expiresAt
+        }
+      }
+    }
+  }
+`;
+
+export type SprayWallThumbnailVersion = {
+  id: string;
+  photo: Pick<SprayWallPhoto, 'url' | 'width' | 'height' | 'expiresAt'> | null;
+};
+
+export type GetSprayWallThumbnailQueryResponse = {
+  sprayWall: {
+    uuid: string;
+    layoutId: number;
+    currentVersion: SprayWallThumbnailVersion | null;
+    versions?: SprayWallThumbnailVersion[];
+  } | null;
+};
 
 export const GET_SPRAY_WALL_RENDER_DATA = gql`
   query GetSprayWallRenderData($uuid: ID!, $version: Int) {
@@ -138,6 +230,98 @@ export const GET_SPRAY_WALL_RENDER_DATA = gql`
       }
       wall {
         ${SPRAY_WALL_FIELDS}
+      }
+    }
+  }
+`;
+
+/**
+ * A wall's LED setup, separate from `SPRAY_WALL_FIELDS` for the reason
+ * `GET_SPRAY_WALL_LOOK` gives: an older backend fails this operation alone, and
+ * costs the phone only a refresh. It keeps the copy it already has.
+ */
+export const GET_SPRAY_WALL_LED_SETUP = gql`
+  query GetSprayWallLedSetup($boardUuid: ID!) {
+    sprayWallLedSetup(boardUuid: $boardUuid) {
+      viewerCanEdit
+      setup {
+        boardUuid
+        controllerType
+        controllerUrl
+        enabled
+        brightness
+        autoOffMinutes
+        layout
+        updatedAt
+      }
+    }
+  }
+`;
+
+export type SprayWallLedSetupData = {
+  boardUuid: string;
+  controllerType: string;
+  controllerUrl: string;
+  enabled: boolean;
+  brightness: number;
+  autoOffMinutes: number;
+  layout: unknown;
+  updatedAt: string;
+};
+
+export type GetSprayWallLedSetupQueryVariables = { boardUuid: string };
+export type GetSprayWallLedSetupQueryResponse = {
+  sprayWallLedSetup: { viewerCanEdit: boolean; setup: SprayWallLedSetupData | null } | null;
+};
+
+export const SAVE_SPRAY_WALL_LED_SETUP = gql`
+  mutation SaveSprayWallLedSetup($input: SaveSprayWallLedSetupInput!) {
+    saveSprayWallLedSetup(input: $input) {
+      boardUuid
+      updatedAt
+    }
+  }
+`;
+
+export type SaveSprayWallLedSetupMutationVariables = {
+  input: {
+    boardUuid: string;
+    controllerType?: string;
+    controllerUrl?: string;
+    enabled?: boolean;
+    brightness?: number;
+    autoOffMinutes?: number;
+    layout?: unknown;
+  };
+};
+export type SaveSprayWallLedSetupMutationResponse = {
+  saveSprayWallLedSetup: { boardUuid: string; updatedAt: string };
+};
+
+/**
+ * Draft reads verify the immutable row id even when a discarded number is reused.
+ *
+ * The one read that asks for `photoFullUrl` (#5911): the hold editor swaps it in
+ * once it zooms past 3x. The climb view's `GET_SPRAY_WALL_RENDER_DATA` leaves it
+ * out, so the render path never pays for a second signature it would not use.
+ */
+export const GET_SPRAY_WALL_DRAFT_RENDER_DATA = gql`
+  query GetSprayWallDraftRenderData($uuid: ID!, $version: Int) {
+    sprayWallRenderData(uuid: $uuid, version: $version) {
+      versionNumber
+      boardWidth
+      boardHeight
+      homography
+      photo {
+        ${SPRAY_WALL_PHOTO_FIELDS}
+      }
+      photoFullUrl
+      holds {
+        ${SPRAY_WALL_HOLD_FIELDS}
+      }
+      wall {
+        ${SPRAY_WALL_FIELDS}
+        versions { id number status }
       }
     }
   }
@@ -221,7 +405,45 @@ export const CREATE_SPRAY_WALL = gql`
 `;
 
 /**
- * Rename, share, re-gym or re-angle a wall.
+ * How many published and draft climbs use each hold. The hold editor asks before
+ * it saves a removal or a move, so it can warn that published climbs will lose a
+ * hold.
+ */
+export const GET_SPRAY_WALL_HOLD_USAGE = gql`
+  query GetSprayWallHoldUsage($wallUuid: ID!, $holdIds: [Int!]!) {
+    sprayWallHoldUsage(wallUuid: $wallUuid, holdIds: $holdIds) {
+      holdId
+      publishedClimbCount
+      draftClimbCount
+    }
+  }
+`;
+
+/** Distinct climbs affected by the whole removal, including saves above 500 holds. */
+export const GET_SPRAY_WALL_HOLD_USAGE_SUMMARY = gql`
+  query GetSprayWallHoldUsageSummary($wallUuid: ID!, $holdIds: [Int!]!) {
+    sprayWallHoldUsageSummary(wallUuid: $wallUuid, holdIds: $holdIds) {
+      publishedClimbCount
+      draftClimbCount
+    }
+  }
+`;
+
+/**
+ * Start a reset: clone the wall's settings into a new, unfinished wall. The owner
+ * photographs and marks it in the add-wall wizard, and its first publish archives
+ * the old wall. Calling it again before then returns the same clone.
+ */
+export const RESET_SPRAY_WALL = gql`
+  mutation ResetSprayWall($input: ResetSprayWallInput!) {
+    resetSprayWall(input: $input) {
+      ${SPRAY_WALL_FIELDS}
+    }
+  }
+`;
+
+/**
+ * Rename, share, re-gym, re-place or re-angle a wall.
  *
  * Sharing is the point: a wall is created PRIVATE, so without this one it could
  * never be shown to anybody. The angle is only accepted while the wall has no
@@ -231,6 +453,156 @@ export const UPDATE_SPRAY_WALL = gql`
   mutation UpdateSprayWall($input: UpdateSprayWallInput!) {
     updateSprayWall(input: $input) {
       ${SPRAY_WALL_FIELDS}
+    }
+  }
+`;
+
+/**
+ * The add-a-wall wizard's details save: the same mutation, answering with what
+ * the details step re-reads (`SPRAY_WALL_DETAILS_FIELDS`), so the step's
+ * baseline is the server's answer rather than what was sent.
+ */
+export const UPDATE_SPRAY_WALL_DETAILS = gql`
+  mutation UpdateSprayWallDetails($input: UpdateSprayWallInput!) {
+    updateSprayWall(input: $input) {
+      ${SPRAY_WALL_FIELDS}
+      ${SPRAY_WALL_DETAILS_FIELDS}
+    }
+  }
+`;
+
+/**
+ * The wall's stored default look (`{ mode, boardsesh }`), or null.
+ *
+ * Its own query rather than a field on `SPRAY_WALL_FIELDS`. The app and the
+ * backend ship on different trains, and a field the backend does not have yet
+ * fails validation for the WHOLE operation it sits in. In the shared fragment it
+ * broke creating, loading and drawing every wall at once; out here, a backend
+ * without it costs only the look, which reads as "no stored look".
+ */
+export const GET_SPRAY_WALL_LOOK = gql`
+  query GetSprayWallLook($uuid: ID!) {
+    sprayWall(uuid: $uuid) {
+      uuid
+      renderSettings
+    }
+  }
+`;
+
+/**
+ * Where the wall stands in a reset (`docs/product/spray-walls.md`, "Archive and reset"):
+ * when a reset archived it, the wall it was cloned from, and the published wall
+ * that replaced it.
+ *
+ * Its own query, never part of `SPRAY_WALL_FIELDS`, for the reason
+ * `GET_SPRAY_WALL_LOOK` gives: a field the backend does not serve fails
+ * validation for the WHOLE operation, so an app that reached a phone before the
+ * backend (or a backend rolled back under it) would load no wall at all. Out
+ * here, a backend without the fields costs only this answer, and the app reads
+ * the wall as live. The server still refuses every write an archived wall does
+ * not allow.
+ */
+export const GET_SPRAY_WALL_ARCHIVE = gql`
+  query GetSprayWallArchive($uuid: ID!) {
+    sprayWall(uuid: $uuid) {
+      uuid
+      archivedAt
+      resetOfWallUuid
+      replacedByWallUuid
+    }
+  }
+`;
+
+/** The answer of `GET_SPRAY_WALL_ARCHIVE`. */
+export type SprayWallArchiveFields = {
+  uuid: string;
+  archivedAt?: string | null;
+  resetOfWallUuid?: string | null;
+  replacedByWallUuid?: string | null;
+};
+
+export type GetSprayWallArchiveQueryResponse = { sprayWall: SprayWallArchiveFields | null };
+
+/**
+ * The owner's walls with only what My Boards' Archived section and the add-a-wall
+ * resume check read: no current version, so no presigned photo URLs for every
+ * wall the owner ever had. Fail-soft like `GET_SPRAY_WALL_ARCHIVE`: on a backend
+ * without the archive fields the query fails on its own, the Archived section is
+ * simply absent, and the resume check offers what it always did.
+ */
+export const GET_MY_SPRAY_WALL_LIFECYCLE = gql`
+  query GetMySprayWallLifecycle {
+    mySprayWalls {
+      uuid
+      layoutId
+      archivedAt
+      resetOfWallUuid
+      board {
+        uuid
+        name
+      }
+    }
+  }
+`;
+
+/** One row of `GET_MY_SPRAY_WALL_LIFECYCLE`. */
+export type SprayWallLifecycleRow = {
+  uuid: string;
+  layoutId: number;
+  archivedAt?: string | null;
+  resetOfWallUuid?: string | null;
+  board: { uuid: string; name: string } | null;
+};
+
+export type GetMySprayWallLifecycleQueryResponse = { mySprayWalls: SprayWallLifecycleRow[] };
+
+/**
+ * One version's generated wall looks and its photo-quality verdict. Its own
+ * query for the reason `GET_SPRAY_WALL_LOOK` gives: a backend without
+ * `sprayWallArt` costs only the art, and the wall draws on its photo.
+ */
+export const GET_SPRAY_WALL_ART = gql`
+  query GetSprayWallArt($uuid: ID!, $version: Int) {
+    sprayWallArt(uuid: $uuid, version: $version) {
+      versionNumber
+      recipe
+      status
+      width
+      height
+      quality {
+        stretch
+        verdict
+        reason
+        frameShortEdge
+      }
+      crop {
+        url
+        thumbUrl
+        width
+        height
+        expiresAt
+      }
+      cutout {
+        url
+        thumbUrl
+        width
+        height
+        expiresAt
+      }
+    }
+  }
+`;
+
+/**
+ * Store the wall's default look (`{ mode, boardsesh }`), or clear it with
+ * `renderSettings: null`. Same edit gate as `UPDATE_SPRAY_WALL`. Selects only
+ * the look, for the reason `GET_SPRAY_WALL_LOOK` gives.
+ */
+export const SET_SPRAY_WALL_RENDER_SETTINGS = gql`
+  mutation SetSprayWallRenderSettings($input: SetSprayWallRenderSettingsInput!) {
+    setSprayWallRenderSettings(input: $input) {
+      uuid
+      renderSettings
     }
   }
 `;
@@ -281,89 +653,148 @@ export const DELETE_SPRAY_WALL = gql`
   }
 `;
 
-// ---------------------------------------------------------------------------
-// Resets (SW-12 / SW-13)
-//
-// Three documents for three very different acts. `PROPOSE_SPRAY_WALL_RESET` is a
-// QUERY and writes nothing at all, so the compare screen may re-ask as often as
-// the owner changes their mind. `COMMIT_SPRAY_WALL_VERSION` is the one call that
-// lands a new generation of the wall. `REMIX_CLIMB` writes nothing either — it
-// hands back a starting point, and the child is saved as an ordinary climb.
-// ---------------------------------------------------------------------------
-
 /**
- * What a reset would do, computed and thrown away.
+ * Where the holds a spray climb lost used to be. The remix editor draws a grey
+ * ring at each one, and the climber taps it away before Save comes back.
  *
- * `detections` are already in the wall's CANONICAL frame — the client maps them
- * through the draft version's own homography before sending, because the server
- * never warps an image and never re-runs detection. The draft must carry anchors
- * or this is refused with `SPRAY_WALL_ANCHORS_REQUIRED`: from version 2 on, the
- * four corners are the only thing that says where the new photograph's pixels
- * sit in the frame version 1 defined.
+ * Same arguments as `GetClimb`: `Climb.lostHolds` resolves off the climb row
+ * that query returns and decides the wall's visibility itself, so a stranger
+ * gets `[]`, never an error. A single-climb read; a list must not select
+ * `lostHolds`.
  */
-export const PROPOSE_SPRAY_WALL_RESET = gql`
-  query ProposeSprayWallReset($input: ProposeSprayWallResetInput!) {
-    proposeSprayWallReset(input: $input) {
-      versionNumber
-      kept {
-        holdId
-        detectionIndex
-        confidence
+export const GET_CLIMB_LOST_HOLDS = gql`
+  query GetClimbLostHolds(
+    $boardName: String!
+    $layoutId: Int!
+    $sizeId: Int!
+    $setIds: String!
+    $angle: Int!
+    $climbUuid: ID!
+  ) {
+    climb(
+      boardName: $boardName
+      layoutId: $layoutId
+      sizeId: $sizeId
+      setIds: $setIds
+      angle: $angle
+      climbUuid: $climbUuid
+    ) {
+      uuid
+      lostHolds {
+        id
+        cx
+        cy
+        r
+        outline
       }
-      removed
-      added
-      lowConfidence
-      climbsAffected
-      movesSuggested {
-        movedFromHoldId
-        detectionIndex
-        distance
-      }
-      aspectMismatch
     }
   }
 `;
 
-/**
- * Apply the reviewed decisions and publish the draft, in one transaction.
- *
- * Every decision is re-validated under the wall lock against the wall as it is
- * NOW, so a proposal the owner sat on while another editor published is rejected
- * rather than applied.
- */
-export const COMMIT_SPRAY_WALL_VERSION = gql`
-  mutation CommitSprayWallVersion($input: CommitSprayWallVersionInput!) {
-    commitSprayWallVersion(input: $input) {
-      version {
-        ${SPRAY_WALL_VERSION_FIELDS}
-      }
-      keptCount
-      removedCount
-      addedCount
-      climbsChanged
+export type GetClimbLostHoldsQueryVariables = {
+  boardName: string;
+  layoutId: number;
+  sizeId: number;
+  setIds: string;
+  angle: number;
+  climbUuid: string;
+};
+
+/** One lost hold, in the wall's canonical frame. */
+export type ClimbLostHold = {
+  id: number;
+  cx: number;
+  cy: number;
+  r: number;
+  outline: number[] | null;
+};
+
+export type GetClimbLostHoldsQueryResponse = {
+  climb: { uuid: string; lostHolds: ClimbLostHold[] | null } | null;
+};
+
+/** Reports never accept free text; duplicate reports preserve the first reason. */
+export const REPORT_SPRAY_WALL = gql`
+  mutation ReportSprayWall($input: ReportSprayWallInput!) {
+    reportSprayWall(input: $input) {
+      status
     }
   }
 `;
 
-/**
- * A remix starting point: the parent's frames with the holds it has lost taken
- * out, plus the successors the reset review linked for them.
- *
- * `sprayWallUuid` carries the share-link capability — send it whenever the
- * viewer reached the wall by its uuid rather than by owning it, or a crew holding
- * an unlisted wall's link could set climbs on it and not remix one.
- */
-export const REMIX_CLIMB = gql`
-  query RemixClimb($parentUuid: ID!, $sprayWallUuid: ID) {
-    remixClimb(parentUuid: $parentUuid, sprayWallUuid: $sprayWallUuid) {
-      parentUuid
-      parentName
+/** Admin-only previews include private and hidden walls; never persist photo URLs. */
+export const GET_SPRAY_WALL_REPORTS = gql`
+  query GetSprayWallReports($uuid: ID) {
+    sprayWallReports(uuid: $uuid) {
+      releaseContext {
+        channel
+        branch
+        updateId
+        runtimeVersion
+        isEmbeddedLaunch
+        automaticCanary
+        canaryCheckedAt
+      }
+      id
+      wallUuid
+      wallName
       layoutId
-      angle
-      frames
-      lostHoldIds
-      keptHoldIds
-      suggestedHoldIds
+      reason
+      hidden
+      createdAt
+      photo {
+        ${SPRAY_WALL_PHOTO_FIELDS}
+      }
     }
   }
 `;
+
+/** Either review outcome clears every pending report for this wall. */
+export const SET_SPRAY_WALL_HIDDEN = gql`
+  mutation SetSprayWallHidden($input: SetSprayWallHiddenInput!) {
+    setSprayWallHidden(input: $input) {
+      uuid
+      layoutId
+      hidden
+      hiddenAt
+    }
+  }
+`;
+
+export type SprayWallPhotoData = Required<Pick<SprayWallPhoto, 'url' | 'thumbUrl' | 'width' | 'height' | 'expiresAt'>>;
+
+export type SprayWallReportData = {
+  releaseContext?: ReleaseContext | null;
+  id: string;
+  wallUuid: string;
+  wallName: string;
+  layoutId: number;
+  reason: SprayWallReportReason;
+  hidden: boolean;
+  createdAt: string;
+  photo: SprayWallPhotoData | null;
+};
+
+export type ReportSprayWallMutationVariables = {
+  input: { wallUuid: string; reason: SprayWallReportReason; releaseContext?: ReleaseContextInput | null };
+};
+
+export type ReportSprayWallMutationResponse = {
+  reportSprayWall: { status: 'CREATED' | 'ALREADY_REPORTED' };
+};
+
+export type GetSprayWallReportsQueryVariables = {
+  uuid?: string | null;
+};
+
+export type GetSprayWallReportsQueryResponse = {
+  sprayWallReports: SprayWallReportData[];
+};
+
+export type SetSprayWallHiddenMutationVariables = {
+  input: { uuid: string; hidden: boolean };
+};
+
+export type SetSprayWallHiddenMutationResponse = {
+  setSprayWallHidden: { uuid: string; layoutId: number; hidden: boolean; hiddenAt: string | null };
+};

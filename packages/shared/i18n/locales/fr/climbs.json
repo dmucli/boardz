@@ -9,8 +9,7 @@
     "following": "Abonnements",
     "allSetters": "Tous les ouvreurs",
     "followingClimbs": "Blocs des personnes que je suis",
-    "playlistSubtitle": "Tous les blocs sur cette board · Les plus récents d’abord",
-    "signIn": "Connecte-toi pour suivre cet ouvreur",
+    "playlistSubtitleSort": "Tous les blocs sur cette board · {{sort}}",
     "syncNeeded": "Connecte-toi pour synchroniser tes abonnements et les ouvreurs associés.",
     "followError": "Impossible de modifier cet abonnement. Réessaie.",
     "loadError": "Impossible de charger ces blocs.",
@@ -26,26 +25,31 @@
   "sends_other": "{{formattedCount}} croix",
   "metadata": {
     "list": {
-      "title": "Blocs {{boardName}} à {{angle}}°",
-      "description": "Parcourez les blocs sur {{boardName}} à {{angle}}°",
+      "title": "Blocs sur {{boardName}} à {{angle}}°",
+      "description": "Les blocs les plus enchaînés sur {{boardName}} à {{angle}}°. Choisis-en un et allume-le sur ta board avec Boardsesh.",
       "fallbackTitle": "Blocs",
       "fallbackDescription": "Parcourez les blocs",
-      "paginatedTitle": "Blocs {{boardName}} à {{angle}}° — Page {{page}}"
+      "paginatedTitle": "Blocs sur {{boardName}} à {{angle}}° — Page {{page}}",
+      "ogTitle": "Blocs sur {{name}} à {{angle}}°",
+      "ogDescription": "Choisis-en un, allume-le et fais la croix."
     },
     "view": {
-      "title": "{{climbName}} - {{grade}}",
-      "description": "{{climbName}} - {{grade}} par {{setter}}. Qualité : {{quality}}/5. Enchaînements : {{ascents}}",
+      "title": "{{climbName}}, {{grade}} sur {{boardName}} à {{angle}}°",
+      "titleUngraded": "{{climbName}}, bloc sur {{boardName}} à {{angle}}°",
+      "descriptionLead": "{{climbName}} est un {{grade}} sur {{layoutName}} à {{angle}}°, ouvert par {{setter}}.",
+      "descriptionLeadNoSetter": "{{climbName}} est un {{grade}} sur {{layoutName}} à {{angle}}°.",
+      "descriptionLeadUngraded": "{{climbName}} est un bloc sur {{layoutName}} à {{angle}}°, ouvert par {{setter}}.",
+      "descriptionLeadUngradedNoSetter": "{{climbName}} est un bloc sur {{layoutName}} à {{angle}}°.",
+      "descriptionSendsRated_one": "{{ascents}} croix, note de {{quality}} sur 5.",
+      "descriptionSendsRated_other": "{{ascents}} croix, note de {{quality}} sur 5.",
+      "descriptionSends_one": "{{ascents}} croix.",
+      "descriptionSends_other": "{{ascents}} croix.",
+      "descriptionRated": "Note de {{quality}} sur 5.",
+      "descriptionCta": "Allume-le sur ta board avec Boardsesh.",
       "imageAlt": "{{climbName}} - {{grade}} sur la board {{boardName}}",
+      "imageAltUngraded": "{{climbName}} sur la board {{boardName}}",
       "fallbackTitle": "Bloc",
-      "fallbackDescription": "Voir les détails du bloc et les vidéos de beta",
-      "seoHeading": "{{climbName}} — {{grade}}",
-      "seoSummary": "Bloc {{boardName}} {{layoutName}}",
-      "seoSetterSuffix": " ouvert par {{setter}}",
-      "seoAscentsSuffix": ". {{ascents}} enchaînements enregistrés"
-    },
-    "import": {
-      "title": "Importer des blocs",
-      "description": "Importez des blocs MoonBoard depuis des captures d'écran"
+      "fallbackDescription": "Voir les détails du bloc et les vidéos de beta"
     }
   },
   "list": {
@@ -54,12 +58,30 @@
       "heading": "Blocs {{boardName}} à {{angle}}°",
       "intro": "Tous les blocs ouverts sur cette configuration {{boardName}} à {{angle}}°, les plus grimpés en premier. Ouvrez-en un pour voir la board, la cotation à chaque inclinaison et la beta.",
       "empty": "Aucun bloc sur cette board pour l’instant.",
-      "cta": "Grimper sur cette board",
+      "cta": {
+        "getAppHelper": "Allume n’importe lequel sur ta {{board}}.",
+        "openInBrowser": "Ouvrir dans ton navigateur",
+        "openInBrowserMobile": "Ou ouvre la liste dans ton navigateur"
+      },
       "pagination": {
         "aria": "Pagination",
         "previous": "Page précédente",
         "next": "Page suivante",
         "pageLabel": "Page {{page}}"
+      },
+      "climbsHeading": "Les plus grimpés à {{angle}}°",
+      "stage": {
+        "caption": "Premier de la liste : {{climb}}",
+        "captionLaterPage": "Premier de cette page : {{climb}}"
+      },
+      "qr": {
+        "title": "Scanne pour ouvrir cette liste sur ton téléphone",
+        "imageLabel": "QR code qui ouvre les blocs {{boardName}} à {{angle}}° sur ton téléphone"
+      },
+      "angles": {
+        "label": "La même board, d’autres inclinaisons",
+        "stop": "{{angle}}°",
+        "linkAria": "{{angle}}°, blocs {{boardName}}"
       }
     }
   },
@@ -76,11 +98,8 @@
     },
     "summary": {
       "routesOnly": "Voies uniquement",
+      "bouldersOnly": "Blocs uniquement",
       "bouldersAndRoutes": "Blocs et voies"
-    },
-    "holds": {
-      "include": "Inclure",
-      "exclude": "Exclure"
     }
   },
   "actions": {
@@ -129,6 +148,7 @@
     "title": "Grade Boardsesh",
     "moonboardBody": "Nous n'avons pas encore de données de cotation communautaires pour le MoonBoard. Enregistre tes croix Moon sur Boardsesh pour aider à la débloquer.",
     "woodsBody": "Nous n'avons pas encore de données de cotation communautaires pour le Woods Board. Enregistre tes croix sur le Woods pour aider à la débloquer.",
+    "sprayBody": "Sur une Spraywall, la crew cote chaque bloc. La première ascension fixe la cotation, puis la cotation de chaque grimpeur la fait évoluer.",
     "loadError": "Impossible de charger le grade pour le moment.",
     "byAngle": "Sa difficulté selon l'angle",
     "summaryLocal": "local",
@@ -208,32 +228,28 @@
   },
   "createClimbForm": {
     "draftBadge": "Brouillon",
-    "namePlaceholder": "Nom du bloc",
     "descriptionPlaceholder": "Ajoutez du beta ou des notes sur votre bloc...",
     "dismiss": "Ignorer",
     "cannotOpen": {
       "boardCannotAuthor": "Tu ne peux pas encore ouvrir de blocs sur cette board.",
       "boardConfigIncomplete": "Les détails de la board sont manquants ou invalides. Choisis à nouveau la board pour ouvrir ton bloc.",
       "noUsableBoard": "Choisis d'abord une board, puis ouvre ton bloc.",
-      "boardTypeUnsupported": "Cette version de l'app ne permet pas encore d'ouvrir des blocs sur cette board. Choisis une autre board."
+      "boardTypeUnsupported": "Cette version de l'app ne permet pas encore d'ouvrir des blocs sur cette board. Choisis une autre board.",
+      "wallArchived": "Ce Spraywall est archivé. Ses blocs et ses croix restent, mais on ne peut plus y ouvrir de bloc."
     },
     "alerts": {
       "publishDuplicateNamed": "Cette configuration de prises correspond à « {{name}} ». Activez Brouillon pour l'enregistrer sans la publier, ou changez une prise.",
       "publishDuplicateUnnamed": "Cette configuration de prises correspond à un bloc existant. Activez Brouillon pour l'enregistrer sans le publier, ou changez une prise.",
       "viewMatchingClimb": "Voir le bloc correspondant",
-      "saveFailedFallback": "Échec de l'enregistrement du bloc. Veuillez réessayer."
+      "saveFailedFallback": "Échec de l'enregistrement du bloc. Veuillez réessayer.",
+      "editConflict": "Ce bloc a changé ailleurs. Rouvre-le pour voir la dernière version.",
+      "editNotAllowed": "Tu ne peux pas modifier ce bloc. Seul son ouvreur ou son ouvreuse le peut.",
+      "editWindowExpired": "Ce bloc a été publié il y a plus de 24 heures, il ne peut plus être modifié.",
+      "editNotEditable": "Ce bloc ne peut plus être modifié.",
+      "localRefreshFailed": "Voie enregistrée. La liste téléchargée n’a pas été actualisée. Reconnecte-toi pour l’actualiser."
     },
     "fields": {
       "description": "Description (optionnelle)"
-    },
-    "holds": {
-      "start": "Départ",
-      "hand": "Main",
-      "finish": "Arrivée",
-      "total": "Total"
-    },
-    "validation": {
-      "needsStartFinish": "Un bloc valide nécessite au moins 1 prise de départ et 1 prise d'arrivée"
     }
   },
   "draftsDrawer": {
@@ -252,67 +268,17 @@
       "error": "Impossible de supprimer ce brouillon. Réessayez."
     }
   },
-  "holdTypePicker": {
-    "toolbarAriaLabel": "Type de prise",
-    "applyModeAriaLabel": "Appliquer comme inclure ou exclure",
-    "clear": "Effacer",
-    "searchHelp": "Sélectionnez un ou plusieurs types de prise, puis touchez ailleurs pour fermer le sélecteur",
-    "includeAriaSuffix": "inclure",
-    "excludeAriaSuffix": "exclure",
-    "states": {
-      "starting": "Départ",
-      "hand": "Milieu",
-      "finish": "Arrivée",
-      "foot": "Pied",
-      "any": "Toutes"
-    }
-  },
-  "moonboardImport": {
-    "picker": {
-      "title": "Choisissez votre MoonBoard",
-      "hint": "Choisissez la board et l'angle depuis lesquels vous importez, puis déposez vos captures d'écran.",
-      "angleOption": "{{angle}}°"
-    },
-    "card": {
-      "skipping": "Ignoré",
-      "duplicate": "Ignoré : existe déjà",
-      "duplicateNamed": "Ignoré : existe déjà sous le nom « {{name}} »",
-      "removeAction": "Retirer",
-      "removeDescription": "Ce bloc ne sera pas importé."
-    },
-    "bulk": {
-      "title": "Importer des blocs MoonBoard - {{layoutName}} @ {{angle}}°",
-      "loginRequired": "Connectez-vous pour enregistrer les blocs",
-      "loginRequiredTitle": "Connexion requise",
-      "loginRequiredBody": "Connectez-vous pour enregistrer les blocs dans la base de données.",
-      "logIn": "Se connecter",
-      "uploadPrompt": "Cliquez ou glissez vos captures d'écran ici",
-      "uploadHelp": "Compatible avec les captures de l'app MoonBoard. Déposez plusieurs fichiers pour un import en masse.",
-      "processing": "Traitement des captures...",
-      "checkingDuplicates": "On compare les blocs importés aux problèmes MoonBoard existants...",
-      "reviewBeforeSaving": "Vérifiez les blocs ci-dessous. Vous pouvez en modifier ou en retirer avant d'enregistrer.",
-      "saveAll": "Tout enregistrer ({{count}})",
-      "clearAndRestart": "Tout effacer et recommencer",
-      "contributeImages": "Partagez des images pour améliorer la précision de l'OCR",
-      "tryAgain": "Réessayer",
-      "saveFailed": "Impossible d'enregistrer les blocs. Réessayez."
-    }
-  },
-  "moonboardEditModal": {
-    "title": "Modifier le bloc",
-    "nameLabel": "Nom du bloc",
-    "nameRequired": "Donnez-lui un nom",
-    "save": "Enregistrer les modifications",
-    "setter": "Ouvreur : {{setter}}",
-    "grade": "Cotation : {{grade}}",
-    "angle": "Inclinaison : {{angle}}°",
-    "unknown": "Inconnu"
-  },
   "mobile": {
+    "listOptions": {
+      "title": "Options de la liste de blocs",
+      "viewOptions": "Options d’affichage",
+      "history": "Historique de la board, {{board}}",
+      "historyTitle": "Historique de la board",
+      "historyHint": "Voir les blocs qui ont été allumés sur ce mur",
+      "myClimbs": "Mes blocs"
+    },
     "moderation": {
       "title": "Modération",
-      "moreSectionTitle": "Communauté",
-      "moreRowSubtitle": "Vote sur les blocs signalés et les changements de cotation",
       "pinnedFromNotification": "Depuis ta notification",
       "hiddenChip": "Masqué",
       "supersededChip": "Remplacée",
@@ -377,8 +343,8 @@
         "subtitle": "Essayez d'ajuster les paramètres de votre board"
       },
       "unsetWall": {
-        "title": "Personne n’a encore ouvert sur ce mur",
-        "subtitle": "Choisis tes prises, donne-lui un nom, et le mur a son premier bloc.",
+        "title": "Personne n’a encore ouvert sur ce Spraywall",
+        "subtitle": "Choisis tes prises, donne-lui un nom, et le Spraywall a son premier bloc.",
         "cta": "Ouvrir le premier bloc"
       },
       "noMatches": {
@@ -403,22 +369,30 @@
       "boardRestoreFailed": {
         "title": "Impossible de retrouver ta board",
         "description": "Réessaie pour retrouver tes blocs."
+      },
+      "recovery": {
+        "scope": "{{board}} · {{angle}}°",
+        "filters": "Filtres actifs : {{filters}}",
+        "removeHint": "Retire un filtre pour réessayer. Tout le reste est conservé.",
+        "openFilters": "Ajuster les filtres"
       }
     },
     "detail": {
       "notFound": "Bloc introuvable",
+      "boardNotFound": "Cette board n'existe plus ou n'est pas partagée avec toi.",
       "backToHome": "Retour à l'accueil"
     },
     "logAscent": {
       "errorMessage": "Impossible de sauvegarder votre ascension. Veuillez réessayer.",
       "offlineErrorMessage": "Impossible d'enregistrer votre ascension hors ligne. Le stockage du téléphone était occupé, réessayez dans un instant.",
-      "savedToast": "Tick enregistré"
+      "savedToast": "Tick enregistré",
+      "climbDeletedMessage": "Ce bloc a été supprimé."
     },
     "tick": {
       "dateLabel": "Date",
       "timeLabel": "Heure",
       "gradeLabel": "Ma cotation",
-      "gradeHelp": "La cotation que tu verras sur ce bloc à partir de maintenant. Pas besoin de l'avoir enchaîné.",
+      "gradeHelp": "La cotation affichée pour toi sur ce bloc. Pas besoin de l’avoir enchaîné.",
       "starsLabel": "Étoiles",
       "triesLabel": "Essais",
       "noteLabel": "Note",
@@ -426,6 +400,14 @@
       "noteAria": "Note de la croix",
       "statusLabel": "Statut",
       "angleLabel": "Angle",
+      "detailsLabel": "Détails",
+      "detailsNow": "Maintenant",
+      "detailsToday": "Aujourd'hui {{time}}",
+      "detailsAria": "Détails : {{angle}}, {{when}}. Ouvre les commandes pour modifier l'angle et la date.",
+      "detailsAriaNoAngle": "Détails : {{when}}. Ouvre les commandes pour modifier la date.",
+      "detailsAngleAria": "angle de {{angle}} degrés",
+      "detailsAngleChangedAria": "angle modifié à {{angle}} degrés",
+      "detailsDateChangedAria": "date modifiée : {{when}}",
       "attempt": "Essai",
       "save": "Enregistrer",
       "deleteRow": "Supprimer cette croix",
@@ -442,7 +424,8 @@
       "logAscentAria": "Enregistrer : {{status}}",
       "setTriesAria_one": "Mettre {{count}} essai",
       "setTriesAria_other": "Mettre {{count}} essais",
-      "moreTriesAria": "Un essai de plus"
+      "moreTriesAria": "Un essai de plus",
+      "firstAscent": "Première ascension : fixe la cotation du bloc pour enregistrer une croix."
     },
     "filter": {
       "climbType": {
@@ -474,28 +457,38 @@
       "popularity": "Popularité",
       "collection": {
         "label": "Collection",
-        "any": "Toutes"
-      },
-      "holdIntegrity": {
-        "label": "Prises",
         "any": "Toutes",
-        "intact": "Intacts seulement",
-        "broken": "Prises perdues"
+        "liked": "Aimées"
       },
-      "pin": "Épingler comme raccourci",
-      "unpin": "Retirer des raccourcis",
+      "pinChip": "Épingler {{name}} dans la rangée du haut",
+      "unpinChip": "Retirer {{name}} de la rangée du haut",
+      "recentDescription": "Tes 10 dernières recherches s'afficheront ici.",
+      "ratingAtLeast": "{{count}}★+",
+      "quickFiltersLink": "Filtres rapides",
+      "quickFiltersFooter": "Choisis les filtres affichés dans la rangée du haut, et leur ordre.",
       "established2plus": "Établies 2+",
       "benchmark": "Benchmarks",
+      "verified": "Vérifiés",
+      "verifiedDescription": "Les blocs vérifiés sont choisis par Kilter avec des grimpeurs et des ouvreurs.",
+      "onlyBenchmarks": "Blocs benchmark uniquement",
+      "onlyVerified": "Blocs vérifiés uniquement",
       "showCount_one": "Voir {{count}} voie",
       "showCount_other": "Voir {{count}} voies",
-      "countNote": "Chaque bloc compte une fois, pas une fois par angle.",
+      "close": "Fermer les filtres",
+      "matchingCount_one": "{{count, number}} bloc",
+      "matchingCount_other": "{{count, number}} blocs",
       "sort": {
+        "position": "Ordre de la playlist",
+        "added": "Ajoutés récemment",
         "ascents": "Ascensions",
         "quality": "Qualité",
         "difficulty": "Difficulté",
         "name": "Nom",
         "popular": "Populaires",
         "creation": "Plus récentes",
+        "recentlyLiked": "Aimées récemment",
+        "recentlyClimbed": "Grimpées récemment",
+        "mostTries": "Plus d'essais",
         "random": "Aléatoire",
         "reshuffle": "Mélanger à nouveau"
       },
@@ -503,6 +496,32 @@
       "sortOrder": {
         "asc": "Croissant",
         "desc": "Décroissant"
+      },
+      "sortDirection": {
+        "difficulty": {
+          "asc": "Plus faciles d'abord",
+          "desc": "Plus durs d'abord"
+        },
+        "added": {
+          "desc": "Plus récents d'abord",
+          "asc": "Plus anciens d'abord"
+        },
+        "creation": {
+          "desc": "Plus récents d'abord",
+          "asc": "Plus anciens d'abord"
+        },
+        "quality": {
+          "desc": "Mieux notés d'abord",
+          "asc": "Moins bien notés d'abord"
+        },
+        "ascents": {
+          "desc": "Plus de croix d'abord",
+          "asc": "Moins de croix d'abord"
+        },
+        "name": {
+          "asc": "De A à Z",
+          "desc": "De Z à A"
+        }
       },
       "status": {
         "drafts": "Brouillons",
@@ -537,17 +556,23 @@
       "betaVideos": "Avec vidéo de beta uniquement",
       "betaVideosShort": "🎥 Beta",
       "betaVideosDescription": "Uniquement les voies avec une vidéo de beta",
+      "boardFit": {
+        "label": "Adaptés à ma board",
+        "switch": "Seulement les blocs adaptés à ma board",
+        "description": "Masque les blocs ouverts pour une autre board ou une autre taille."
+      },
       "otherAngles": "Autres angles",
       "otherAnglesDescription": "Affiche les blocs ouverts à un autre angle",
       "searchSetters": "Rechercher des ouvreurs",
       "noSetters": "Aucun ouvreur",
       "clearAll": "Tout effacer",
+      "nameToken": "« {{name}} »",
       "drafts": "Mes brouillons",
-      "popularityUnrepeated": "Non répétés"
+      "popularityUnrepeated": "Non répétés",
+      "wallDrafts": "Brouillons"
     },
     "search": {
       "recentFilters": "Récents",
-      "clearRecent": "Effacer",
       "gradeRange": "{{min}}–{{max}}",
       "gradeMin": "{{grade}}+",
       "gradeMax": "≤{{grade}}",
@@ -567,8 +592,6 @@
       "gradeAction": "Définir la plage de cotation",
       "gradeOpenHint": "Ouvre le sélecteur de cotation",
       "gradeCloseHint": "Ferme le sélecteur de cotation",
-      "boardSwitcherHint": "Ouvre le sélecteur de board",
-      "allClimbs": "Toutes les voies",
       "clearRecentSearches": "Effacer les recherches récentes",
       "chips": {
         "filtersWithCount": "Filtres · {{count}}",
@@ -585,19 +608,27 @@
       "rangeFilterAria": "{{grade}} est dans la plage de cotations sélectionnée",
       "anyGradeAria": "Toutes les cotations sélectionnées",
       "clearFilterAria": "Effacer le filtre de cotation",
-      "closeAria": "Fermer le sélecteur de cotation",
-      "rangeHint": "Touchez une autre cotation pour créer une plage",
+      "rangeHoldHint": "Appuie longuement pour créer une plage avec la cotation sélectionnée",
       "setLogGradeAria": "Enregistrer la cotation {{grade}}",
       "selectedLogGradeAria": "Cotation {{grade}} sélectionnée pour le carnet",
       "consensusGradeAria": "{{grade}}, cotation consensus"
     },
+    "angleRail": {
+      "any": "Toutes",
+      "setFilterAria": "Filtrer par inclinaison de {{angle}} degrés",
+      "selectedFilterAria": "Filtre d'inclinaison de {{angle}} degrés sélectionné",
+      "rangeFilterAria": "L'inclinaison de {{angle}} degrés est dans la plage sélectionnée",
+      "anyAngleAria": "Toutes les inclinaisons sélectionnées",
+      "clearFilterAria": "Effacer le filtre d'inclinaison",
+      "rangeHoldHint": "Appuie longuement pour créer une plage avec l'inclinaison sélectionnée"
+    },
     "climbRow": {
-      "addToQueue": "Ajouter à la file",
       "toggleFavorite": "Basculer favori",
       "favorited": "Favori",
       "share": "Partager le bloc",
       "moreActions": "Plus d'actions",
       "projectFallback": "Projet",
+      "directionStatus": "{{direction}} : {{status}}",
       "ascentStatus": {
         "flash": "Flashé",
         "send": "Enchaîné",
@@ -608,13 +639,26 @@
       "anyFeet": "Pieds libres",
       "noKickboard": "Sans KB",
       "benchmark": "Benchmark",
+      "verified": "Bloc vérifié",
       "method": {
         "footless": "Sans pieds",
         "footlessKickboard": "Sans pieds + KB",
         "noKickboard": "Sans KB"
       },
       "setAngleMarker": "ouvert à {{angle}}°",
-      "setAngleMarkerAria": "La cotation et les croix sont à {{angle}} degrés"
+      "setAngleMarkerAria": "La cotation et les croix sont à {{angle}} degrés",
+      "communityGradeAria": "Cotation de la communauté {{grade}}",
+      "frameCount_one": "{{count}} image",
+      "frameCount_other": "{{count}} images",
+      "progress": {
+        "flashed": "Flashé",
+        "sent": "Enchaîné",
+        "sentTimes": "Enchaîné ×{{count}}",
+        "tries_one": "{{count}} essai",
+        "tries_other": "{{count}} essais",
+        "today": "aujourd’hui",
+        "daysAgo": "{{count}} j"
+      }
     },
     "climbRules": {
       "matchingAllowed": "Deux mains par prise autorisées",
@@ -628,29 +672,29 @@
     },
     "report": {
       "title": "Signaler le bloc",
-      "close": "Fermer le signalement",
       "kind": {
         "label": "Qu'est-ce qui cloche ?",
-        "hide": "Masquer ce bloc",
+        "hide": "Voter pour masquer",
         "grade": "La cotation est fausse",
-        "hideHint": "Bloc bidon, doublon ou infaisable. Assez de signalements et il est masqué pour tout le monde.",
+        "hideHint": "Bloc bidon, doublon ou infaisable. Ton signalement compte pour un vote. Quand assez de monde est d'accord, il est masqué pour tout le monde.",
         "gradeHint": "Choisis la cotation qu'il mérite selon toi."
       },
       "sameGrade": "C'est déjà la cotation actuelle",
       "reasonPlaceholder": "Explique à la crew pourquoi (10 caractères minimum)",
       "reasonAria": "Motif du signalement",
-      "reasonRemaining": "Encore {{count}} caractères",
+      "reasonRemaining_one": "Encore 1 caractère pour envoyer",
+      "reasonRemaining_other": "Encore {{count}} caractères pour envoyer",
       "reasonCount": "{{count}}/500",
-      "submit": "Envoyer le signalement",
+      "submit": "Envoyer",
       "submitError": "Impossible d'envoyer ton signalement",
       "toast": {
-        "reported": "Signalé. {{current}} votes sur {{required}} pour le masquer",
+        "reported": "Signalé. {{current}} votes sur {{required}} pour le masquer pour tout le monde",
         "reportedGrade": "Changement de cotation proposé. La crew vote dessus",
-        "alreadyReported": "Tu as déjà signalé ce bloc"
+        "alreadyReported": "Tu as déjà signalé ce bloc",
+        "gradeChanged": "Cotation changée"
       }
     },
     "hidden": {
-      "short": "masqué",
       "chip": "Masqué",
       "banner": "Masqué par la communauté"
     },
@@ -659,19 +703,20 @@
       "chip_other": "{{count}} prises en moins",
       "chipAria_one": "{{count}} prise n'est plus sur le mur",
       "chipAria_other": "{{count}} prises ne sont plus sur le mur",
-      "banner_one": "{{count}} prise de ce bloc n'est plus là",
-      "banner_other": "{{count}} prises de ce bloc ne sont plus là",
-      "bannerBody": "Remixe-le avec ce qu'il y a sur le mur maintenant.",
-      "remix": "Remixer"
+      "banner": "Ce bloc a perdu une prise. Remixe-le avec les prises qui sont sur le mur maintenant.",
+      "remix": "Remixer",
+      "editorHint_one": "Retire la prise grise pour enregistrer",
+      "editorHint_other": "Retire les prises grises pour enregistrer"
     },
     "climbActions": {
-      "preview": "Aperçu",
       "playNext": "Mettre juste après",
-      "copyLink": "Copier le lien",
-      "linkCopied": "Lien copié",
+      "playNextActiveHint": "Ce bloc est déjà actif. Consulte un autre bloc pour le mettre juste après.",
+      "playLast": "Mettre à la fin",
+      "replayFromHere": "Reprendre d'ici",
       "nameCopied": "Nom copié",
       "copyNameError": "Impossible de copier le nom",
       "copyNameHint": "Appuie longuement pour copier le nom",
+      "copyName": "Copier le nom",
       "tick": "Enregistrer une croix",
       "addBetaVideo": "Ajouter une vidéo beta",
       "openInApp": "Ouvrir dans l'app Aurora",
@@ -679,8 +724,23 @@
       "edit": "Modifier la voie",
       "editEntry": "Modifier l'entrée du carnet",
       "report": "Signaler le bloc",
-      "closeOverlay": "Fermer les actions de la voie",
-      "openQueue": "Ouvrir la file"
+      "changeGrade": "Changer la cotation",
+      "openQueue": "Ouvrir la file",
+      "deleteClimb": {
+        "row": "Supprimer le bloc",
+        "title": "Supprimer ce bloc ?",
+        "message": "Il disparaît du Spraywall pour tout le monde, avec ses commentaires. Impossible d'annuler.",
+        "confirm": "Supprimer",
+        "cancel": "Le garder",
+        "success": "Bloc supprimé.",
+        "hasTicks": "Quelqu'un a déjà fait la croix sur ce bloc, il reste donc sur le Spraywall.",
+        "pendingTick": "Tu as une croix sur ce bloc en attente de synchronisation, il reste donc.",
+        "notFound": "Ce bloc n'existe plus.",
+        "notAllowed": "Seuls les blocs d'un Spraywall peuvent être supprimés.",
+        "archived": "Ce Spraywall est archivé, ses blocs restent tels quels.",
+        "offline": "Tu es hors ligne. Supprimer un bloc demande une connexion.",
+        "error": "Impossible de supprimer le bloc. Réessaie."
+      }
     },
     "create": {
       "brush": {
@@ -722,6 +782,7 @@
       "settings": {
         "draftLabel": "Enregistrer comme brouillon",
         "draftDescription": "Les brouillons restent privés jusqu’à publication.",
+        "draftDescriptionApps": "Les brouillons restent non listés jusqu’à publication. Les apps connectées par les personnes qui en notent un peuvent quand même le voir.",
         "noMatchLabel": "Une main par prise",
         "noMatchDescription": "Les mains ne peuvent pas se rejoindre sur la même prise",
         "noKickboardLabel": "Sans kickboard",
@@ -729,7 +790,9 @@
         "campusLabel": "Campus (sans pieds)",
         "campusDescription": "Mains seulement, sans les pieds",
         "anyFeetLabel": "Pieds libres",
-        "anyFeetDescription": "Les pieds peuvent utiliser n’importe quelle prise, pas seulement les prises marquées"
+        "anyFeetDescription": "Les pieds peuvent utiliser n’importe quelle prise, pas seulement les prises marquées",
+        "wallDraftDescription": "Toute personne ayant accès à ce Spraywall peut grimper tes brouillons enregistrés.",
+        "wallDraftDescriptionApps": "Toute personne ayant accès à ce Spraywall peut grimper tes brouillons enregistrés. Les apps connectées par les personnes qui en notent un peuvent aussi le voir."
       },
       "drafts": {
         "holds_one": "{{count}} prise",
@@ -747,7 +810,8 @@
         "ariaLabel": "Créer une voie"
       },
       "header": {
-        "newClimb": "Nouvelle voie"
+        "newClimb": "Nouvelle voie",
+        "nameRequired": "Donne-lui un nom pour enregistrer"
       },
       "save": {
         "idle": "Enregistrer",
@@ -755,15 +819,20 @@
         "saving": "Enregistrement…",
         "done": "Enregistré",
         "draftToast": "Brouillon enregistré",
-        "publishedToast": "Voie publiée"
+        "publishedToast": "Voie publiée",
+        "needsHold": "Ajoute une prise pour enregistrer",
+        "beforeLogging": "Enregistre ce bloc avant de le noter."
       },
       "autosave": {
         "onDevice": "Brouillon enregistré sur ce téléphone",
         "inAccount": "Brouillon enregistré sur votre compte",
+        "onDevicePublish": "Enregistré sur ce téléphone",
+        "inAccountPublish": "Enregistré sur votre compte",
         "unsyncedEdits": "Les dernières modifications sont uniquement sur ce téléphone",
         "notStored": "Connectez-vous pour garder ce brouillon",
         "saveFailed": "Impossible d'enregistrer sur votre compte. Touchez Enregistrer pour réessayer.",
-        "keptToast": "Brouillon gardé sur ce téléphone. Rouvrez l'éditeur pour la terminer."
+        "keptToast": "Brouillon gardé sur ce téléphone. Rouvrez l'éditeur pour la terminer.",
+        "waitingToSync": "Enregistré sur cet appareil · En attente de synchronisation"
       },
       "newClimb": {
         "confirm": {
@@ -773,8 +842,7 @@
         }
       },
       "publish": {
-        "blocked": "Ajoute une prise de départ et une prise d'arrivée pour publier",
-        "gradeBlocked": "Choisis ta cotation pour publier"
+        "blocked": "Ajoute une prise de départ et une prise d'arrivée pour publier"
       },
       "wallSizeMismatch": "Sélectionne ce format de Woods comme pan actif pour l’allumer.",
       "routeMenu": {
@@ -783,10 +851,14 @@
         "makeBoulder": "Convertir en bloc",
         "makeBoulderBlocked": "Convertir en bloc — supprime d'abord les images"
       },
-      "grade": {
-        "label": "Ta cotation",
-        "required": "Nécessaire pour publier",
-        "optional": "Facultatif sur un brouillon"
+      "holds": {
+        "add": "Ajouter des prises",
+        "hint": "Il manque une prise ? Ajoute-la, puis reviens à ce bloc.",
+        "opening": "Ouverture de l’éditeur de prises…",
+        "openFailed": "Ton bloc n’a pas pu être enregistré sur cet appareil. Réessaie avant d’ajouter des prises.",
+        "missing_one": "{{count}} prise sélectionnée n’est plus sur ce Spraywall. Ton bloc est conservé.",
+        "missing_other": "{{count}} prises sélectionnées ne sont plus sur ce Spraywall. Ton bloc est conservé.",
+        "removeMissing": "Retirer les prises manquantes"
       }
     },
     "holdFilter": {
@@ -863,7 +935,6 @@
         "grade": "Les prises violettes reviennent dans les blocs plus durs, les jaunes dans les plus faciles"
       },
       "wholeBoard": "Toute la board",
-      "holdPicksSkipped": "{{summary}} · choix de prises ignorés hors ligne",
       "wholeBoardHint": "Compte tous les blocs de la board",
       "useFiltersHint": "Compte seulement les blocs qui passent tes filtres",
       "filterUnsupported": "La carte de chaleur ne peut pas suivre ces filtres hors ligne. Touche la puce pour voir toute la board.",
@@ -873,6 +944,26 @@
       "downloadLine": "Télécharge {{name}} pour voir quelles prises servent",
       "download": "Télécharger",
       "unavailable": "La carte de chaleur n'est pas disponible pour le moment."
+    },
+    "project": {
+      "chip": "Projet"
+    },
+    "boardAccessibility": {
+      "summary": "Board : {{starting}} prises de départ, {{hand}} de main, {{finish}} de fin, {{foot}} de pied.",
+      "adjustHint": "Balayez vers le haut ou le bas pour changer de bloc.",
+      "next": "Bloc suivant",
+      "previous": "Bloc précédent",
+      "hold": "Prise {{id}}, {{role}}",
+      "unlit": "éteinte",
+      "paintHint": "Touchez pour peindre avec le pinceau sélectionné. Les actions permettent de choisir un rôle.",
+      "chooseRole": "Choisir le rôle de la prise",
+      "showList": "Choisir des prises dans une liste",
+      "showBoard": "Revenir au board"
+    },
+    "activeHolds": {
+      "title": "Prises actives",
+      "a11yGroup": "{{role}} : {{holds}}",
+      "empty": "Ce bloc n’allume aucune prise."
     }
   },
   "frontDoor": {
@@ -882,74 +973,169 @@
       "board": "{{boardName}}",
       "list": "Blocs à {{angle}}°"
     },
+    "hero": {
+      "gradeForSearch": ", {{grade}}",
+      "unnamedClimb": "Bloc {{board}} sans nom",
+      "qualityAria": "Noté {{quality}} sur 5",
+      "setBy": "ouvert par {{setter}}",
+      "boardAtAngle": "{{board}} à {{angle}}°"
+    },
     "boardImageAlt": "{{climbName}} allumé sur la board {{boardName}} {{layoutName}} à {{angle}}°",
+    "legend": {
+      "aria": "Prises de ce bloc",
+      "start_one": "{{formattedCount}} départ",
+      "start_other": "{{formattedCount}} départs",
+      "hand_one": "{{formattedCount}} main",
+      "hand_other": "{{formattedCount}} mains",
+      "finish_one": "{{formattedCount}} fin",
+      "finish_other": "{{formattedCount}} fins",
+      "foot_one": "{{formattedCount}} pied",
+      "foot_other": "{{formattedCount}} pieds"
+    },
     "setterLink": "Plus de blocs de {{setter}}",
     "facts": {
-      "grade": "Cotation",
       "setter": "Ouvreur",
-      "ascents": "Croix",
-      "quality": "Qualité",
-      "angle": "Inclinaison",
       "board": "Board",
-      "firstAscent": "Première ascension",
+      "firstAscent": "Première ascension à {{angle}}°",
       "firstAscentUnknown": "Non renseignée",
       "unknown": "Inconnu",
       "angleValue": "{{angle}}°",
-      "qualityValue": "{{quality}} sur 5",
-      "firstAscentValue": "{{setter}}, {{date}}"
+      "firstAscentValue": "{{setter}}, {{date}}",
+      "qualityAtAngle": "Qualité à {{angle}}°"
     },
     "setterNotes": {
       "heading": "Notes de l’ouvreur"
     },
+    "about": {
+      "heading": "À propos de ce bloc",
+      "intro": "{{climbName}} est un {{grade}} sur la {{board}} à {{angle}}°.",
+      "introWithSetter": "{{climbName}} est un {{grade}} sur la {{board}} à {{angle}}°, ouvert par {{setter}}.",
+      "introUngraded": "{{climbName}} est un bloc sur la {{board}} à {{angle}}°.",
+      "introUngradedWithSetter": "{{climbName}} est un bloc sur la {{board}} à {{angle}}°, ouvert par {{setter}}.",
+      "firstAscent": "{{climber}} a fait la première ascension à {{angle}}° le {{date}}.",
+      "gradeRange": "Il est coté {{easiest}} à {{easiestAngle}}° et {{hardest}} à {{hardestAngle}}°.",
+      "sendsHere_one": "{{formattedCount}} croix enregistrée à cette inclinaison.",
+      "sendsHere_other": "{{formattedCount}} croix enregistrées à cette inclinaison."
+    },
     "angles": {
-      "heading": "Le même bloc à d’autres inclinaisons",
-      "link": "{{angle}}° · {{grade}}",
-      "current": "{{angle}}° · {{grade}} — vous y êtes"
+      "heading": "Cotations à chaque inclinaison",
+      "colAngle": "Inclinaison",
+      "colGrade": "Cotation",
+      "colSends": "Croix",
+      "colQuality": "Qualité",
+      "thisPage": "cette page",
+      "linkName": "{{climbName}} à {{angle}}°",
+      "notRated": "Pas noté",
+      "total_one": "{{formattedCount}} croix enregistrée sur {{angleCount}} inclinaisons",
+      "total_other": "{{formattedCount}} croix enregistrées sur {{angleCount}} inclinaisons"
     },
     "beta": {
       "heading": "Vidéos de beta",
       "empty": "Aucune beta filmée pour l’instant.",
-      "unavailable": "La beta n’a pas chargé cette fois. Recharge la page pour réessayer."
+      "unavailable": "La beta n’a pas chargé cette fois. Recharge la page pour réessayer.",
+      "headingCount_one": "Beta · {{count}} vidéo",
+      "headingCount_other": "Beta · {{count}} vidéos"
+    },
+    "app": {
+      "heading": "Ce que t’apporte l’app",
+      "lead": "Gratuite sur iPhone et Android. Tout marche sur ta board dès ce soir.",
+      "beta": {
+        "title": "La beta tout de suite",
+        "body": "Quand quelqu’un ajoute une vidéo de beta, elle apparaît sur le bloc pour tout le monde aussitôt."
+      },
+      "wall": {
+        "title": "Vois ce qui est allumé sur la board",
+        "body": "Tout le monde à la board voit le bloc allumé en ce moment et ceux allumés avant lui, en direct.",
+        "alt": "Boardsesh affichant le bloc allumé sur la board au-dessus de la liste des blocs"
+      },
+      "boards": {
+        "title": "Toutes tes boards, une seule app",
+        "body": "Une app pour toutes tes boards. Compatible avec Kilter, Tension, MoonBoard et d’autres.",
+        "alt": "Boardsesh sur une board Kilter, un Spraywall et une board Tension"
+      },
+      "logbook": {
+        "title": "Un seul carnet",
+        "body": "Toutes tes croix, de toutes tes boards, au même endroit.",
+        "link": "Importe ton carnet",
+        "alt": "Tes croix et ta progression sur toutes tes boards dans le profil Boardsesh"
+      },
+      "workouts": {
+        "title": "Entraînements",
+        "body": "Des 4×4 et des séances de volume à ton niveau, avec un minuteur intégré.",
+        "alt": "Préparation d’une séance de volume en V2 dans Boardsesh"
+      }
     },
     "community": {
-      "heading": "Communauté"
+      "heading": "Commentaires et votes de cotation",
+      "signIn": "Connecte-toi pour participer",
+      "show": "Voir les commentaires"
     },
     "similar": {
+      "nearbyHeading": "D’autres blocs sur {{layout}} autour du {{grade}} à {{angle}}°",
+      "nearbyUnavailable": "Ces blocs n’ont pas chargé.",
       "heading": "Des blocs dans le même esprit",
-      "unavailable": "Les blocs similaires n’ont pas chargé. Rechargement en cours…"
+      "unavailable": "Les blocs similaires n’ont pas chargé. Rechargement en cours…",
+      "allAtAngle": "Tous les blocs {{board}} à {{angle}}°"
     },
     "cta": {
-      "climbThis": "Grimper ce bloc",
-      "ariaLabel": "Ouvrir {{climbName}} dans l’app Boardsesh",
-      "helper": "Ouvre l’app, allume les prises, enregistre la croix."
+      "getAppHelper": "Allume ce bloc sur ta {{board}} et fais la croix.",
+      "openInBrowser": "Ouvrir dans ton navigateur",
+      "openInBrowserMobile": "Ou ouvre-le dans ton navigateur"
+    },
+    "qr": {
+      "title": "Scanne pour ouvrir ce bloc sur ton téléphone",
+      "body": "Gratuit sur iPhone et Android.",
+      "imageLabel": "QR code qui ouvre {{climbName}} sur ton téléphone"
+    },
+    "stickyBar": {
+      "free": "Gratuit",
+      "cta": "Installer l’app",
+      "dismiss": "Masquer cette barre",
+      "ctaAriaIos": "Installer l’app depuis l’App Store",
+      "ctaAriaAndroid": "Installer l’app depuis Google Play"
     }
   },
   "spray": {
     "unknownGrade": "Sans cotation",
     "unknownSetter": "un ouvreur inconnu",
     "heading": "{{climbName}} — {{grade}}",
-    "summary": "Sur {{wallName}}, un mur de pan à {{angle}}° avec {{holdCount}} prises.",
-    "setterLine": "Ouvert par {{setter}}. {{ascents}} croix enregistrées.",
-    "ascentsLine": "{{ascents}} croix enregistrées.",
+    "summary": "Sur {{wallName}}, un Spraywall à {{angle}}° avec {{holdCount}} prises.",
+    "setterLine": "Ouvert par {{setter}}. {{senders}}",
+    "sendersLine_one": "{{formattedCount}} personne a enregistré une croix.",
+    "sendersLine_many": "{{formattedCount}} personnes ont enregistré une croix.",
+    "sendersLine_other": "{{formattedCount}} personnes ont enregistré une croix.",
     "setterNotesHeading": "Notes de l’ouvreur",
     "keepLookingHeading": "Continue à chercher",
     "setterLink": "Plus de blocs de {{setter}}",
-    "gymsLink": "Trouver une salle avec des murs",
+    "gymsLink": "Trouver une salle avec des Spraywalls",
     "homeLink": "Accueil Boardsesh",
-    "photoAlt": "{{climbName}}, {{grade}}, allumé sur le mur de pan {{wallName}}",
-    "noPhoto": "Ce mur n’a pas encore de photo à montrer.",
+    "photoAlt": "{{climbName}}, {{grade}}, allumé sur le Spraywall {{wallName}}",
+    "noPhoto": "Ce Spraywall n’a pas encore de photo à montrer.",
     "metadata": {
-      "title": "{{climbName}} {{grade}} sur {{wallName}} | Mur de pan",
-      "description": "{{climbName}}, {{grade}}, sur le mur de pan {{wallName}} à {{angle}}°, ouvert par {{setter}}. Vois les prises sur la photo du mur."
+      "title": "{{climbName}} {{grade}} sur {{wallName}} | Spraywall",
+      "description": "{{climbName}}, {{grade}}, sur le Spraywall {{wallName}} à {{angle}}°, ouvert par {{setter}}. Vois les prises sur la photo du Spraywall."
     },
     "wall": {
-      "summary": "Un mur de pan à {{angle}}° avec {{holdCount}} prises.",
-      "photoAlt": "Le mur de pan {{wallName}}",
-      "openInApp": "Ouvre ce mur dans l’app Boardsesh pour voir ses blocs, ouvrir les tiens et enregistrer tes croix.",
+      "summary": "Un Spraywall à {{angle}}° avec {{holdCount}} prises.",
+      "photoAlt": "Le Spraywall {{wallName}}",
+      "openInApp": "Ouvre ce Spraywall dans l’app Boardsesh pour voir ses blocs, ouvrir les tiens et enregistrer tes croix.",
+      "openButton": "Ouvrir dans l’app",
+      "haveApp": "Tu as déjà Boardsesh ?",
+      "install": {
+        "helper": "Pas encore l’app ? Installe-la et grimpe sur ce Spraywall.",
+        "scanAgain": "Tu viens de l’installer ? Scanne à nouveau le code pour ouvrir ce Spraywall."
+      },
       "metadata": {
-        "title": "{{wallName}} | Mur de pan",
-        "description": "{{wallName}}, un mur de pan à {{angle}}°. Vois le mur et ouvre-le dans l’app Boardsesh."
+        "title": "{{wallName}} | Spraywall",
+        "description": "{{wallName}}, un Spraywall à {{angle}}°. Vois le Spraywall et ouvre-le dans l’app Boardsesh.",
+        "ogTitle": "{{wallName}} · Spraywall",
+        "ogDescription_one": "Un Spraywall à {{angle}}° avec {{count}} prise. Découvre le Spraywall et essaie ce qui est ouvert.",
+        "ogDescription_other": "Un Spraywall à {{angle}}° avec {{count}} prises. Découvre le Spraywall et essaie ce qui est ouvert."
       }
+    },
+    "install": {
+      "heading": "Prends l’app",
+      "body": "Note tes croix sur ce Spraywall et ouvre tes propres blocs."
     }
   }
 }

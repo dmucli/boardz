@@ -2,8 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { once } from 'node:events';
-import { access, mkdir, readdir, rm } from 'node:fs/promises';
+import { access, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import sharp from 'sharp';
 
 const validateTokenMock = vi.hoisted(() => vi.fn());
 
@@ -13,11 +14,25 @@ vi.mock('../middleware/auth', () => ({
 
 const { handleAvatarUpload, getAvatarsDir } = await import('../handlers/avatars');
 const { handleStaticAvatar } = await import('../handlers/static');
-const { parseSizeParam } = await import('../lib/image-resize');
+const { parseSizeParam, reencodeUploadedImage } = await import('../lib/image-resize');
+const { overPixelCapPng } = await import('./helpers/upload-images');
 
 const USER_ID = '11111111-1111-4111-8111-111111111111';
-const JPEG_BYTES = Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x43, 0xff, 0xd9]);
-const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// Real, decodable images: the handler stores sharp's re-encode, so bytes sharp
+// cannot read are refused.
+const JPEG_BYTES = Buffer.from(
+  await sharp({ create: { width: 4, height: 4, channels: 3, background: '#7c3aed' } })
+    .jpeg()
+    .toBuffer(),
+);
+const PNG_BYTES = Buffer.from(
+  await sharp({ create: { width: 4, height: 4, channels: 4, background: '#7c3aed80' } })
+    .png()
+    .toBuffer(),
+);
+// What the handler writes to disk for each upload above.
+const STORED_JPEG_BYTES = await reencodeUploadedImage(JPEG_BYTES, 'image/jpeg');
+const STORED_PNG_BYTES = await reencodeUploadedImage(PNG_BYTES, 'image/png');
 
 async function startAvatarServer(): Promise<{ baseUrl: string; server: Server }> {
   const server = createServer((req, res) => {
@@ -102,7 +117,7 @@ describe('avatar upload routes', () => {
 
       expect(staticResponse.status).toBe(200);
       expect(staticResponse.headers.get('content-type')).toBe('image/jpeg');
-      expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(JPEG_BYTES);
+      expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(STORED_JPEG_BYTES);
     } finally {
       await closeServer(server);
     }
@@ -122,7 +137,7 @@ describe('avatar upload routes', () => {
 
       const staticResponse = await fetch(`${baseUrl}${pngBody.avatarUrl}`);
       expect(staticResponse.status).toBe(200);
-      expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(PNG_BYTES);
+      expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(STORED_PNG_BYTES);
 
       // The stale .jpg from the first upload must be cleaned up.
       await expect(access(path.join(getAvatarsDir(), `${USER_ID}.jpg`))).rejects.toThrow();
@@ -145,7 +160,7 @@ describe('avatar upload routes', () => {
         expect(await emptyResponse.json()).toEqual({ error: 'Uploaded file is empty' });
         const preserved = await fetch(`${baseUrl}${avatarUrl}`);
         expect(preserved.status).toBe(200);
-        expect(Buffer.from(await preserved.arrayBuffer())).toEqual(JPEG_BYTES);
+        expect(Buffer.from(await preserved.arrayBuffer())).toEqual(STORED_JPEG_BYTES);
         expect((await readdir(getAvatarsDir())).filter((filename) => filename.startsWith(USER_ID))).toEqual([
           `${USER_ID}.jpg`,
         ]);
@@ -184,6 +199,120 @@ describe('avatar upload routes', () => {
     }
   });
 
+  it('rejects an empty file part and leaves the existing avatar alone', async () => {
+    validateTokenMock.mockResolvedValue({ userId: USER_ID });
+    const { baseUrl, server } = await startAvatarServer();
+    try {
+      const jpegResponse = await uploadAvatar(baseUrl, new Blob([JPEG_BYTES], { type: 'image/jpeg' }), 'avatar.jpg');
+      expect(jpegResponse.status).toBe(200);
+      const jpegBody = (await jpegResponse.json()) as { avatarUrl?: string };
+
+      const emptyResponse = await uploadAvatar(baseUrl, new Blob([], { type: 'image/png' }), 'avatar.png');
+
+      expect(emptyResponse.status).toBe(400);
+      expect((await emptyResponse.json()) as { error?: string }).toEqual({ error: 'Uploaded file is empty' });
+
+      // Nothing new written, and the avatar the stored URL points at survives.
+      await expect(access(path.join(getAvatarsDir(), `${USER_ID}.png`))).rejects.toThrow();
+      const staticResponse = await fetch(`${baseUrl}${jpegBody.avatarUrl}`);
+      expect(staticResponse.status).toBe(200);
+      expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(STORED_JPEG_BYTES);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('rejects bytes that contradict the declared image type and keeps the existing avatar', async () => {
+    validateTokenMock.mockResolvedValue({ userId: USER_ID });
+    const { baseUrl, server } = await startAvatarServer();
+    try {
+      const jpegResponse = await uploadAvatar(baseUrl, new Blob([JPEG_BYTES], { type: 'image/jpeg' }), 'avatar.jpg');
+      expect(jpegResponse.status).toBe(200);
+      const jpegBody = (await jpegResponse.json()) as { avatarUrl?: string };
+
+      const htmlPayload = Buffer.from('<!doctype html><script>alert(1)</script>', 'latin1');
+      const htmlResponse = await uploadAvatar(baseUrl, new Blob([htmlPayload], { type: 'image/jpeg' }), 'avatar.jpg');
+
+      expect(htmlResponse.status).toBe(400);
+      expect((await htmlResponse.json()) as { error?: string }).toEqual({
+        error: 'File contents do not match the declared image type',
+      });
+
+      // The HTML never overwrote the stored JPEG, and no other file appeared.
+      const staticResponse = await fetch(`${baseUrl}${jpegBody.avatarUrl}`);
+      expect(staticResponse.status).toBe(200);
+      expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(STORED_JPEG_BYTES);
+      const userFiles = (await readdir(getAvatarsDir())).filter((fileName) => fileName.startsWith(USER_ID));
+      expect(userFiles).toEqual([`${USER_ID}.jpg`]);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('rejects a real PNG declared as image/jpeg', async () => {
+    validateTokenMock.mockResolvedValue({ userId: USER_ID });
+    const { baseUrl, server } = await startAvatarServer();
+    try {
+      const response = await uploadAvatar(baseUrl, new Blob([PNG_BYTES], { type: 'image/jpeg' }), 'avatar.jpg');
+
+      expect(response.status).toBe(400);
+      expect((await response.json()) as { error?: string }).toEqual({
+        error: 'File contents do not match the declared image type',
+      });
+      await expect(access(path.join(getAvatarsDir(), `${USER_ID}.jpg`))).rejects.toThrow();
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('refuses a small PNG whose pixels exceed the decode cap (400) and writes nothing', async () => {
+    validateTokenMock.mockResolvedValue({ userId: USER_ID });
+    const { baseUrl, server } = await startAvatarServer();
+    try {
+      const response = await uploadAvatar(baseUrl, new Blob([overPixelCapPng()], { type: 'image/png' }), 'avatar.png');
+
+      expect(response.status).toBe(400);
+      expect((await response.json()) as { error?: string }).toEqual({ error: 'File is not a readable image' });
+      await expect(access(path.join(getAvatarsDir(), `${USER_ID}.png`))).rejects.toThrow();
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('writes a re-encode to disk, not a payload appended after a real JPEG', async () => {
+    validateTokenMock.mockResolvedValue({ userId: USER_ID });
+    const { baseUrl, server } = await startAvatarServer();
+    try {
+      const payloadMarker = '<script>avatar-payload</script>';
+      const smuggled = Buffer.concat([JPEG_BYTES, Buffer.from(payloadMarker.repeat(2000), 'latin1')]);
+      const response = await uploadAvatar(baseUrl, new Blob([smuggled], { type: 'image/jpeg' }), 'avatar.jpg');
+
+      expect(response.status).toBe(200);
+      const written = await readFile(path.join(getAvatarsDir(), `${USER_ID}.jpg`));
+      expect(written.includes(payloadMarker)).toBe(false);
+      expect(written).toEqual(STORED_JPEG_BYTES);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('serves 404 (uncacheable) for a zero-byte avatar file instead of an empty 200', async () => {
+    validateTokenMock.mockResolvedValue({ userId: USER_ID });
+    const { baseUrl, server } = await startAvatarServer();
+    try {
+      await mkdir(getAvatarsDir(), { recursive: true });
+      await writeFile(path.join(getAvatarsDir(), `${USER_ID}.jpg`), Buffer.alloc(0));
+
+      const staticResponse = await fetch(`${baseUrl}/static/avatars/${USER_ID}.jpg`);
+
+      expect(staticResponse.status).toBe(404);
+      expect(staticResponse.headers.get('cache-control')).toBe('no-store');
+      expect(staticResponse.headers.get('x-content-type-options')).toBe('nosniff');
+    } finally {
+      await closeServer(server);
+    }
+  });
+
   it('a failed replacement upload preserves the existing avatar (write-first, clean-after)', async () => {
     validateTokenMock.mockResolvedValue({ userId: USER_ID });
     const { baseUrl, server } = await startAvatarServer();
@@ -203,7 +332,7 @@ describe('avatar upload routes', () => {
         // The previously uploaded avatar the stored avatarUrl points at must survive.
         const staticResponse = await fetch(`${baseUrl}${jpegBody.avatarUrl}`);
         expect(staticResponse.status).toBe(200);
-        expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(JPEG_BYTES);
+        expect(Buffer.from(await staticResponse.arrayBuffer())).toEqual(STORED_JPEG_BYTES);
       } finally {
         await rm(blockingDir, { recursive: true, force: true });
       }

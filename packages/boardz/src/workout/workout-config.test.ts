@@ -25,7 +25,8 @@ describe('plannedGrades', () => {
 
   it('builds a warm-up from the grades below the target and nothing else', () => {
     const grades = plannedGrades(defaultConfig('warmUp', SIX_B), moonboardGrades);
-    expect(grades).toEqual([14, 15, 16, 17]);
+    // Moon's scale skips 5b and 5c (14, 15), so 5+ (13) takes two climbs.
+    expect(grades).toEqual([13, 13, 16, 17]);
   });
 
   it('puts every on-the-minute and limit climb at the working grade', () => {
@@ -39,7 +40,7 @@ describe('plannedGrades', () => {
 
   it('adds the warm-up in front of the main set when asked', () => {
     const grades = plannedGrades({ ...defaultConfig('gradeFocus', SIX_B), climbs: 2, warmUp: true }, moonboardGrades);
-    expect(grades).toEqual([14, 15, 16, 17, 18, 18]);
+    expect(grades).toEqual([13, 13, 16, 17, 18, 18]);
   });
 
   it('keeps a pyramid on grades the board has climbs at', () => {

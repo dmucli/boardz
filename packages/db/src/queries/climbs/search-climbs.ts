@@ -6,12 +6,11 @@ import { withSerialPlan } from '../util/serial-plan';
 import { isClimbPopularityReady } from './climb-popularity';
 import {
   createClimbFilters,
-  effectiveDifficultySql,
   gradeInRangeSql,
-  gradeValueSql,
   personalGradeColumnSql,
   type PersonalGradeJoinTarget,
 } from './create-climb-filters';
+import { climbSortColumns, directedSortSql, randomSortKeySql } from './sort-expressions';
 import {
   boardClimbStatsAtSetAngle,
   effectiveStatsColumn,
@@ -30,6 +29,7 @@ import {
   type ClimbRow,
   type ClimbSearchResult,
 } from './types';
+import { MAX_SEARCH_PAGE } from './search-limits';
 
 // Runtime shape of a search row. postgres.js returns numeric/bigint columns as
 // JS strings (no `types` parser is configured), so the ROUND(...::numeric) and
@@ -61,10 +61,13 @@ type RawSelectResult = {
   // integer[] comes back as a real JS number array; NULL for a climb whose
   // denormalised columns haven't been populated (drafts, legacy rows).
   compatible_size_ids: number[] | null;
+  required_set_ids: number[] | null;
   // Spray walls only: how many of the climb's holds a reset has taken off the
   // wall. NULL on every catalogue board, and on a spray row the recompute has
   // never touched — both mean intact.
   missing_hold_count: number | null;
+  revision_number: number | null;
+  holds_revision_number: number | null;
   // doublePrecision COALESCE comes back as a real JS number (like benchmark_difficulty);
   // confidence is text. Both null when the climb has no board_climb_grades row at this angle.
   boardsesh_difficulty: number | null;
@@ -109,7 +112,7 @@ function mapResultToClimbRow(result: RawSelectResult, params: BoardRouteParams, 
     // row whose `angle` moved would re-anchor and refetch on every render.
     statsAngle: result.stats_angle ?? null,
     ascensionist_count: Number(result.ascensionist_count || 0),
-    difficulty: getGradeLabel(toIntegerOrNull(result.difficulty_id)),
+    difficulty: getGradeLabel(toIntegerOrNull(result.difficulty_id), params.board_name),
     quality_average: result.quality_average?.toString() || '0',
     stars: getClimbStars(result.quality_average),
     difficulty_error: result.difficulty_error?.toString() || '0',
@@ -124,7 +127,10 @@ function mapResultToClimbRow(result: RawSelectResult, params: BoardRouteParams, 
     framesCount: result.frames_count ?? null,
     framesPace: result.frames_pace ?? null,
     compatibleSizeIds: result.compatible_size_ids ?? null,
+    requiredSetIds: result.required_set_ids ?? null,
     missingHoldCount: result.missing_hold_count ?? null,
+    revisionNumber: result.revision_number ?? null,
+    holdsRevisionNumber: result.holds_revision_number ?? null,
     // COALESCE(universal_grade, local_grade) is doublePrecision → real JS number, but
     // coerce defensively so a stringly-typed driver value can't string-concatenate.
     boardseshDifficulty: result.boardsesh_difficulty == null ? null : Number(result.boardsesh_difficulty),
@@ -140,14 +146,7 @@ type TransactionDb = Parameters<Parameters<DbInstance['transaction']>[0]>[0];
 type SearchDb = DbInstance | TransactionDb;
 export type StatsDrivenSort = 'ascents' | 'quality';
 
-/**
- * Upper bound on the page index. 500 pages × the 100-row pageSize cap is a 50k-row
- * worst-case OFFSET on the index-ordered path — bounded and cheap; legitimate UI
- * paging never approaches it. The API layer rejects pages past this; the shared
- * query clamps as a backstop for SSR/direct callers that bypass that validation,
- * so a crafted `page=10_000_000` can't force an OFFSET-200M serial scan per request.
- */
-export const MAX_SEARCH_PAGE = 500;
+export { MAX_SEARCH_PAGE };
 
 export function clampSearchPage(page: number | undefined): number {
   if (!Number.isFinite(page)) return 0;
@@ -462,9 +461,12 @@ export function statsDrivenClimbFields() {
     // and the playlist rows judge size compatibility client-side, and on Woods
     // that is the only signal that separates the 8x10 from the 12x12.
     compatible_size_ids: boardClimbs.compatibleSizeIds,
+    required_set_ids: boardClimbs.requiredSetIds,
     // Carried on every search row so a spray list can badge a climb that lost a
     // hold without a second round trip — the badge is on the row, not the detail.
     missing_hold_count: boardClimbs.missingHoldCount,
+    revision_number: boardClimbs.revisionNumber,
+    holds_revision_number: boardClimbs.holdsRevisionNumber,
   };
 }
 
@@ -570,7 +572,10 @@ async function joinGradesToRankedPage(
       frames_count: rankedPage.frames_count,
       frames_pace: rankedPage.frames_pace,
       compatible_size_ids: rankedPage.compatible_size_ids,
+      required_set_ids: rankedPage.required_set_ids,
       missing_hold_count: rankedPage.missing_hold_count,
+      revision_number: rankedPage.revision_number,
+      holds_revision_number: rankedPage.holds_revision_number,
       // Boardsesh grade at the searched angle, for the page's rows only.
       boardsesh_difficulty: sql<
         number | null
@@ -660,7 +665,7 @@ async function selectPageWithGradesJoined(
 
 /**
  * The popular sort once the board's `board_climb_popularity` build has finished
- * (C9 in docs/postgres-query-costs.md).
+ * (C9 in docs/operations/postgres-query-costs.md).
  *
  * The order is:
  *
@@ -944,45 +949,23 @@ async function runStandardSearch(
   // whether the feature is on for this search.
   const personalGradeJoin = filters.getPersonalGradeJoin();
 
-  // Under the Boardsesh source the sort keys on the grade the row is labelled
-  // with, the same value the grade-range filter reads (issue #5643). The upstream
-  // sort is unchanged: no fallback, so stats-less climbs keep sorting last.
-  const crowdDifficultySort =
-    searchParams.gradeSource === 'boardsesh'
-      ? gradeValueSql(statsCol('displayDifficulty'), 'boardsesh')
-      : sql`ROUND(${statsCol('displayDifficulty')}::numeric, 0)`;
-
+  // The sort keys are shared with a playlist's view (./sort-expressions), so the
+  // two lists rank a climb the same way. `popular` is untouched: it already sums
+  // ascents across every angle, so it was never angle-blind in the way the
+  // cross-angle fix addresses.
   const allowedSortColumns: Record<string, ReturnType<typeof sql>> = {
-    // `popular` is untouched: it already sums ascents across every angle, so it was
-    // never angle-blind in the way this fix addresses.
-    ascents: sql`${statsCol('ascensionistCount')}`,
-    // With personal grades on the difficulty sort orders by COALESCE(my clamped
-    // grade, the crowd sort above) — so a climb the climber re-graded to V10
-    // lands among the V10s instead of staying with the V0s (#4828). Climbs they
-    // never graded keep their crowd position, so the list is one ordered
-    // sequence, not two interleaved ones.
-    difficulty: personalGradeJoin ? effectiveDifficultySql(crowdDifficultySort) : crowdDifficultySort,
-    name: sql`${boardClimbs.name}`,
-    quality: sql`${statsCol('qualityAverage')}`,
-    creation: sql`${boardClimbs.createdAt}`,
+    ...climbSortColumns({
+      crossAngle,
+      gradeSource: searchParams.gradeSource,
+      personalGrades: personalGradeJoin !== null,
+    }),
     ...(popularCountsSubquery ? { popular: sql`${popularCountsSubquery.totalAscensionistCount}` } : {}),
   };
 
   const sortColumn = allowedSortColumns[sortBy] || sql`${boardClimbs.createdAt}`;
 
-  // Random sort: hash the uuid with a per-search seed so one shuffle is stable
-  // across OFFSET-paginated pages, while a new seed reshuffles. Empty seed falls
-  // back to a constant salt (md5 is never NULL, so pagination is still stable).
-  //
-  // Perf: md5(uuid || seed) is non-SARGable — no index satisfies it, so this is a
-  // full scan + sort of the filtered set (the whole board when unfiltered). That's
-  // inherent to "shuffle everything"; the LIMIT keeps the returned rows small but
-  // the sort still touches every matching row. It bypasses the SSR cache (see the
-  // web cachedSearchClimbs guard), so each request re-sorts. Acceptable at current
-  // catalog sizes; if it ever bites, gate on a filter threshold or a sampling
-  // strategy (e.g. TABLESAMPLE / a precomputed random column) rather than md5.
-  const randomOrderExpr =
-    sortBy === 'random' ? sql`md5(${boardClimbs.uuid} || ${searchParams.sortSeed || 'boardsesh'})` : null;
+  // Random sort: see `randomSortKeySql` for the seed and the cost.
+  const randomOrderExpr = sortBy === 'random' ? randomSortKeySql(searchParams.sortSeed) : null;
 
   const whereConditions = [
     ...filters.getClimbWhereConditions(),
@@ -1029,9 +1012,12 @@ async function runStandardSearch(
     // and the playlist rows judge size compatibility client-side, and on Woods
     // that is the only signal that separates the 8x10 from the 12x12.
     compatible_size_ids: boardClimbs.compatibleSizeIds,
+    required_set_ids: boardClimbs.requiredSetIds,
     // Carried on every search row so a spray list can badge a climb that lost a
     // hold without a second round trip — the badge is on the row, not the detail.
     missing_hold_count: boardClimbs.missingHoldCount,
+    revision_number: boardClimbs.revisionNumber,
+    holds_revision_number: boardClimbs.holdsRevisionNumber,
     // Boardsesh grade at the searched angle (params.angle). Surfaced flattened so
     // list rows carry it without a per-climb boardseshGrade round-trip.
     boardsesh_difficulty: sql<
@@ -1044,11 +1030,7 @@ async function runStandardSearch(
     ...(personalGradeJoin ? { my_difficulty: sql<number | string | null>`${personalGradeColumnSql()}` } : {}),
   };
 
-  const orderByClause = randomOrderExpr
-    ? sql`${randomOrderExpr} ASC`
-    : sortOrder === 'asc'
-      ? sql`${sortColumn} ASC NULLS FIRST`
-      : sql`${sortColumn} DESC NULLS LAST`;
+  const orderByClause = randomOrderExpr ? sql`${randomOrderExpr} ASC` : directedSortSql(sortColumn, sortOrder);
 
   // Stats-presence key, used ONLY by the stats-driven fallback (issue #1971). It
   // pins every climb that has a board_climb_stats row at this angle ahead of every

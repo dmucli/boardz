@@ -1,6 +1,9 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR } from '@boardsesh/shared-schema/sync-error-codes';
-import { SHARED_SYNC_COOLDOWN_CURSOR } from '@boardsesh/db/queries';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  AMBIGUOUS_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR,
+  FOREIGN_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR,
+} from '@boardsesh/shared-schema/sync-error-codes';
+import { SHARED_SYNC_COOLDOWN_CURSOR, StaleLinkGenerationError } from '@boardsesh/db/queries';
 import { AuroraRequestError } from '../api/errors';
 import {
   CredentialSyncError,
@@ -11,6 +14,7 @@ import {
 } from './sync-runner';
 import type { AuroraBoardName } from '../api/types';
 import type { AuroraLocationBoardName } from '../sync/locations-sync';
+import type { SyncUserDataOptions } from '../sync/user-sync';
 import type { CredentialRecord, SyncErrorContext } from './types';
 
 type SyncRunnerPrivates = {
@@ -48,7 +52,7 @@ const {
   mockEncrypt,
   mockSignIn,
   mockSyncUserData,
-  mockHasForeignOwnedCircuitPlaylists,
+  mockGetCircuitPlaylistOwnershipConflictState,
   mockSyncSharedData,
   mockSyncAuroraBoardLocations,
   mockCrawlGymWalls,
@@ -64,7 +68,7 @@ const {
   mockEncrypt: vi.fn(),
   mockSignIn: vi.fn(),
   mockSyncUserData: vi.fn(),
-  mockHasForeignOwnedCircuitPlaylists: vi.fn(),
+  mockGetCircuitPlaylistOwnershipConflictState: vi.fn(),
   mockSyncSharedData: vi.fn(),
   mockSyncAuroraBoardLocations: vi.fn(),
   mockCrawlGymWalls: vi.fn(),
@@ -104,7 +108,7 @@ vi.mock('@boardsesh/crypto', () => ({
 
 vi.mock('../sync/user-sync', () => ({
   syncUserData: mockSyncUserData,
-  hasForeignOwnedCircuitPlaylists: mockHasForeignOwnedCircuitPlaylists,
+  getCircuitPlaylistOwnershipConflictState: mockGetCircuitPlaylistOwnershipConflictState,
 }));
 
 vi.mock('../sync/shared-sync', () => ({
@@ -130,18 +134,29 @@ vi.mock('../api/aurora-client', () => ({
   },
 }));
 
+function refusalRunner(current: CredentialRecord, onLog?: (message: string) => void) {
+  const lock = vi.fn(() => ({ limit: () => Promise.resolve([{ id: 1n, ...current }]) }));
+  const write = vi.fn(() => ({ where: () => Promise.resolve() }));
+  const tx = {
+    select: () => ({ from: () => ({ where: () => ({ for: lock }) }) }),
+    update: () => ({ set: write }),
+  };
+  const runner = new SyncRunner({ transaction: (callback) => callback(tx as never), onLog });
+  return { runner, lock, write };
+}
+
 describe('SyncRunner login failure handling', () => {
   beforeEach(() => {
     mockDecrypt.mockReset();
     mockEncrypt.mockReset();
     mockSignIn.mockReset();
     mockSyncUserData.mockReset();
-    mockHasForeignOwnedCircuitPlaylists.mockReset();
+    mockGetCircuitPlaylistOwnershipConflictState.mockReset();
 
     mockDecrypt.mockImplementation((value: string) => `decrypted-${value}`);
     mockEncrypt.mockReturnValue('encrypted-token');
     mockSyncUserData.mockResolvedValue({});
-    mockHasForeignOwnedCircuitPlaylists.mockResolvedValue(false);
+    mockGetCircuitPlaylistOwnershipConflictState.mockResolvedValue('none');
     process.env.DATABASE_URL = 'postgres://test:test@localhost:5432/test';
   });
 
@@ -234,9 +249,8 @@ describe('SyncRunner login failure handling', () => {
   });
 
   it('marks the first invalid credential failure as an error', async () => {
-    const runner = new SyncRunner();
+    const { runner, lock, write } = refusalRunner(createCredential());
     const runnerPrivates = runner as unknown as SyncRunnerPrivates;
-    const updateCredentialStatus = vi.spyOn(runnerPrivates, 'updateCredentialStatus').mockResolvedValue(undefined);
 
     mockSignIn.mockRejectedValue(
       new AuroraRequestError({
@@ -252,23 +266,20 @@ describe('SyncRunner login failure handling', () => {
       'Login failed: Invalid username or password',
     );
 
-    expect(updateCredentialStatus).toHaveBeenCalledWith(
-      'user-123',
-      'decoy',
-      'error',
-      'Login failed: Invalid username or password',
-      undefined,
-      {
+    expect(lock).toHaveBeenCalledWith('update');
+    expect(write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        syncStatus: 'error',
+        syncError: 'Login failed: Invalid username or password',
         credentialFailureCount: 1,
         lastCredentialFailureAt: expect.any(Date),
-      },
+      }),
     );
   });
 
-  it('expires credentials after the second invalid credential failure', async () => {
-    const runner = new SyncRunner();
+  it('counts a live refusal committed after the routine snapshot and expires at two', async () => {
+    const { runner, lock, write } = refusalRunner(createCredential({ credentialFailureCount: 1 }));
     const runnerPrivates = runner as unknown as SyncRunnerPrivates;
-    const updateCredentialStatus = vi.spyOn(runnerPrivates, 'updateCredentialStatus').mockResolvedValue(undefined);
 
     mockSignIn.mockRejectedValue(
       new AuroraRequestError({
@@ -280,21 +291,36 @@ describe('SyncRunner login failure handling', () => {
       }),
     );
 
-    await expect(runnerPrivates.syncSingleCredential(createCredential({ credentialFailureCount: 1 }))).rejects.toThrow(
+    await expect(runnerPrivates.syncSingleCredential(createCredential({ credentialFailureCount: 0 }))).rejects.toThrow(
       'Login failed: Invalid username or password (expired after 2 failed credential attempts; reconnect to resume sync)',
     );
 
-    expect(updateCredentialStatus).toHaveBeenCalledWith(
-      'user-123',
-      'decoy',
-      'expired',
-      'Login failed: Invalid username or password (expired after 2 failed credential attempts; reconnect to resume sync)',
-      undefined,
-      {
+    expect(lock).toHaveBeenCalledWith('update');
+    expect(write).toHaveBeenCalledWith(
+      expect.objectContaining({
+        syncStatus: 'expired',
+        syncError:
+          'Login failed: Invalid username or password (expired after 2 failed credential attempts; reconnect to resume sync)',
         credentialFailureCount: 2,
         lastCredentialFailureAt: expect.any(Date),
-      },
+      }),
     );
+  });
+
+  it('discards a refused login after a live refresh without recording a failure on the new token', async () => {
+    const snapshot = createCredential({ auroraToken: 'previous', credentialFailureCount: 1 });
+    const current = { ...snapshot };
+    const { runner, lock, write } = refusalRunner(current);
+    const recordSyncFailure = vi.spyOn(runner as unknown as SyncRunnerPrivates, 'recordSyncFailure');
+    mockSignIn.mockImplementationOnce(() => {
+      current.auroraToken = 'replacement';
+      current.credentialFailureCount = 0;
+      throw new AuroraRequestError({ code: 'invalid_credentials', message: 'Refused login', status: 422 });
+    });
+    await expect(runner.syncCredential(snapshot)).rejects.toBeInstanceOf(StaleLinkGenerationError);
+    expect(lock).toHaveBeenCalledWith('update');
+    expect(write).not.toHaveBeenCalled();
+    expect(recordSyncFailure).not.toHaveBeenCalled();
   });
 
   it('clears credential failure counters after a successful login', async () => {
@@ -328,7 +354,59 @@ describe('SyncRunner login failure handling', () => {
     });
   });
 
-  it('surfaces the duplicate-account sync_error CODE when circuits were skipped, without failing the cycle (#3526)', async () => {
+  it('routes non-fatal circuit write diagnostics through the configured onError callback', async () => {
+    const observedErrors: Array<{ error: Error; context: SyncErrorContext }> = [];
+    const runner = new SyncRunner({
+      onError: (error, context) => observedErrors.push({ error, context }),
+    });
+    const runnerPrivates = runner as unknown as SyncRunnerPrivates;
+
+    vi.spyOn(runnerPrivates, 'updateStoredToken').mockResolvedValue(undefined);
+    vi.spyOn(runnerPrivates, 'updateCredentialStatus').mockResolvedValue(undefined);
+    vi.spyOn(runnerPrivates, 'maybeRunSharedSync').mockResolvedValue(undefined);
+    mockSignIn.mockResolvedValue({ token: 'fresh-token', user_id: 42 });
+    mockSyncUserData.mockImplementation(
+      async (
+        _client: unknown,
+        _boardType: unknown,
+        _token: unknown,
+        _auroraUserId: unknown,
+        _userId: unknown,
+        options: SyncUserDataOptions,
+      ) => {
+        expect(options.logError).toEqual(expect.any(Function));
+        options.logError?.(
+          JSON.stringify({
+            level: 'error',
+            event: 'aurora_circuit_playlist_malformed_payload',
+            boardType: 'decoy',
+            rejectedCount: 1,
+          }),
+        );
+        return {};
+      },
+    );
+
+    await runnerPrivates.syncSingleCredential(createCredential({ syncStatus: 'active', consecutiveFailures: 3 }));
+
+    expect(observedErrors).toHaveLength(1);
+    expect(JSON.parse(observedErrors[0]?.error.message ?? 'null')).toEqual({
+      level: 'error',
+      event: 'aurora_circuit_playlist_malformed_payload',
+      boardType: 'decoy',
+      rejectedCount: 1,
+    });
+    expect(observedErrors[0]?.context).toEqual({
+      userId: 'user-123',
+      board: 'decoy',
+      boardType: 'decoy',
+      syncStatus: 'active',
+      consecutiveFailures: 3,
+      quarantined: false,
+    });
+  });
+
+  it('surfaces the foreign-owner sync_error code without failing the cycle (#3526)', async () => {
     // Only the circuits were refused — the Aurora account is linked to another
     // Boardsesh user who owns the playlists. Everything else synced, so the
     // credential stays 'active' (a failed status would stop the daemon
@@ -343,7 +421,7 @@ describe('SyncRunner login failure handling', () => {
     vi.spyOn(runnerPrivates, 'maybeRunSharedSync').mockResolvedValue(undefined);
 
     mockSignIn.mockResolvedValue({ token: 'fresh-token', user_id: 42 });
-    mockHasForeignOwnedCircuitPlaylists.mockResolvedValue(true);
+    mockGetCircuitPlaylistOwnershipConflictState.mockResolvedValue('foreign');
 
     await runnerPrivates.syncSingleCredential(createCredential());
 
@@ -351,10 +429,10 @@ describe('SyncRunner login failure handling', () => {
     expect(status).toBe('active');
     // A code, not a sentence: `es` / `fr` users get their own wording, and a
     // raw English string here is exactly what the board card can't localise.
-    expect(syncErrorCode).toBe(DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR);
+    expect(syncErrorCode).toBe(FOREIGN_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR);
   });
 
-  it('keeps the sync_error on a later cycle where Aurora returned no circuits at all (#3526)', async () => {
+  it('persists the ambiguous-owner state when Aurora returns no circuit delta (#3526)', async () => {
     // Aurora's user sync is incremental: once the watermark has advanced, a
     // cycle where nothing changed upstream carries no circuit rows. Deriving
     // the flag from "what did this cycle refuse" would clear the message right
@@ -370,12 +448,12 @@ describe('SyncRunner login failure handling', () => {
     // No circuits in this delta at all...
     mockSyncUserData.mockResolvedValue({ circuits: { synced: 0 } });
     // ...but the duplicate link is still there in the data.
-    mockHasForeignOwnedCircuitPlaylists.mockResolvedValue(true);
+    mockGetCircuitPlaylistOwnershipConflictState.mockResolvedValue('ambiguous');
 
     await runnerPrivates.syncSingleCredential(createCredential());
 
     const [, , , syncErrorCode] = updateCredentialStatus.mock.calls[0];
-    expect(syncErrorCode).toBe(DUPLICATE_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR);
+    expect(syncErrorCode).toBe(AMBIGUOUS_BOARD_ACCOUNT_CIRCUITS_SYNC_ERROR);
   });
 
   it('still marks the cycle successful when the duplicate-owner check itself fails (#3526)', async () => {
@@ -392,7 +470,9 @@ describe('SyncRunner login failure handling', () => {
     vi.spyOn(runnerPrivates, 'maybeRunSharedSync').mockResolvedValue(undefined);
 
     mockSignIn.mockResolvedValue({ token: 'fresh-token', user_id: 42 });
-    mockHasForeignOwnedCircuitPlaylists.mockRejectedValue(new Error('relation "board_circuits" does not exist'));
+    mockGetCircuitPlaylistOwnershipConflictState.mockRejectedValue(
+      new Error('relation "board_circuits" does not exist'),
+    );
 
     // Must not throw — the cycle succeeded.
     await expect(runnerPrivates.syncSingleCredential(createCredential())).resolves.toBeUndefined();
@@ -415,7 +495,7 @@ describe('SyncRunner login failure handling', () => {
 
     mockSignIn.mockResolvedValue({ token: 'fresh-token', user_id: 42 });
     mockSyncUserData.mockResolvedValue({ circuits: { synced: 3 } });
-    mockHasForeignOwnedCircuitPlaylists.mockResolvedValue(false);
+    mockGetCircuitPlaylistOwnershipConflictState.mockResolvedValue('none');
 
     await runnerPrivates.syncSingleCredential(createCredential());
 
@@ -975,9 +1055,10 @@ describe('SyncRunner.recordInvalidCredentialFailure quarantine event', () => {
 
   it('logs a QUARANTINED event only when the credential expires (2nd failure)', async () => {
     const secondFailureLogs: string[] = [];
-    const secondRunner = new SyncRunner({ onLog: (msg) => secondFailureLogs.push(msg) });
+    const { runner: secondRunner } = refusalRunner(createCredential({ credentialFailureCount: 1 }), (msg) =>
+      secondFailureLogs.push(msg),
+    );
     const secondPrivates = secondRunner as unknown as SyncRunnerPrivates;
-    vi.spyOn(secondPrivates, 'updateCredentialStatus').mockResolvedValue(undefined);
 
     const secondResult = await secondPrivates.recordInvalidCredentialFailure(
       createCredential({ credentialFailureCount: 1 }),
@@ -995,9 +1076,8 @@ describe('SyncRunner.recordInvalidCredentialFailure quarantine event', () => {
 
     // First failure (count 0 → 1): still 'error', no quarantine event.
     const firstFailureLogs: string[] = [];
-    const firstRunner = new SyncRunner({ onLog: (msg) => firstFailureLogs.push(msg) });
+    const { runner: firstRunner } = refusalRunner(createCredential(), (msg) => firstFailureLogs.push(msg));
     const firstPrivates = firstRunner as unknown as SyncRunnerPrivates;
-    vi.spyOn(firstPrivates, 'updateCredentialStatus').mockResolvedValue(undefined);
 
     const firstResult = await firstPrivates.recordInvalidCredentialFailure(
       createCredential({ credentialFailureCount: 0 }),
@@ -1576,5 +1656,56 @@ describe('SyncRunner daemon switch and claim', () => {
     const outcome = await runner.syncCredential(donorCredential());
 
     expect(outcome).toMatchObject({ status: 'error', transient: true, retryAfterMs: 90_000 });
+  });
+});
+
+describe('the daemon pool honours DB_POOL_MAX', () => {
+  // postgres.js connects on the first query, so building the pool opens nothing.
+  type PoolPrivates = {
+    getClient: () => { client: { options: { max: number }; end: () => Promise<void> } | null };
+  };
+  const previousPoolMax = process.env.DB_POOL_MAX;
+
+  afterEach(() => {
+    if (previousPoolMax === undefined) delete process.env.DB_POOL_MAX;
+    else process.env.DB_POOL_MAX = previousPoolMax;
+  });
+
+  async function poolMaxWith(poolMax: string | undefined): Promise<number> {
+    if (poolMax === undefined) delete process.env.DB_POOL_MAX;
+    else process.env.DB_POOL_MAX = poolMax;
+    process.env.DATABASE_URL = process.env.DATABASE_URL ?? 'postgres://test:test@localhost:5432/test';
+    const { client } = (new SyncRunner() as unknown as PoolPrivates).getClient();
+    if (!client) throw new Error('A runner without an injected database owns its pool');
+    try {
+      return client.options.max;
+    } finally {
+      await client.end();
+    }
+  }
+
+  it('keeps five connections when DB_POOL_MAX is unset', async () => {
+    expect(await poolMaxWith(undefined)).toBe(5);
+  });
+
+  it('takes DB_POOL_MAX, so the connection budget can cap the daemon at 3', async () => {
+    expect(await poolMaxWith('3')).toBe(3);
+  });
+
+  it('clamps DB_POOL_MAX to the shared two-connection floor', async () => {
+    expect(await poolMaxWith('1')).toBe(2);
+  });
+
+  it('keeps five when DB_POOL_MAX is not a number', async () => {
+    expect(await poolMaxWith('three')).toBe(5);
+  });
+
+  it('caps DB_POOL_MAX at 100, so a typo cannot exhaust the heap', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(await poolMaxWith('100000')).toBe(100);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

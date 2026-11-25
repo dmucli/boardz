@@ -10,7 +10,8 @@ import { useTheme } from '../../providers/theme-provider';
 import { selectByVariant } from '../../theme/variants';
 import { useNativeGlass } from '../../hooks/use-native-glass';
 import { hapticLight } from '../../lib/haptics';
-import { spacing, shadows } from '../../theme/tokens';
+import { opacity, spacing, shadows } from '../../theme/tokens';
+import { TabBarHideFollower } from '../navigation/TabBarHideFollower';
 
 const CAPSULE_HEIGHT = 52;
 const CAPSULE_RADIUS = CAPSULE_HEIGHT / 2;
@@ -31,6 +32,8 @@ type SessionStartFabProps = {
   disabled?: boolean;
   loading?: boolean;
   testID?: string;
+  /** Identifier on the actionable native control, separate from its layout wrapper. */
+  actionTestID?: string;
   /** Bottom offset from the screen edge — the host computes the variant-correct value
    *  once (so the FAB and the host's list reservation can't drift) and passes it here. */
   bottomOffset: number;
@@ -68,6 +71,7 @@ export function SessionStartFab({
   disabled,
   loading,
   testID,
+  actionTestID,
   bottomOffset,
   onHeightChange,
 }: SessionStartFabProps) {
@@ -80,30 +84,42 @@ export function SessionStartFab({
     [onHeightChange],
   );
 
+  // Follows the Android nav bar down when it hides on scroll, like the
+  // MiniPlayer card it sits above.
   return (
-    <View
-      testID={testID}
-      pointerEvents="box-none"
-      onLayout={onHeightChange ? handleLayout : undefined}
-      style={[styles.container, { bottom: bottomOffset }]}
-    >
-      {selectByVariant(variant, {
-        material: (
-          <FAB
-            icon={iconMap[icon].android}
-            label={label}
-            onPress={onPress}
-            disabled={disabled}
-            loading={loading}
-            variant="primary"
-            mode="elevated"
-          />
-        ),
-        liquidGlass: (
-          <StartGlassCapsule label={label} icon={icon} onPress={onPress} disabled={disabled} loading={loading} />
-        ),
-      })}
-    </View>
+    <TabBarHideFollower>
+      <View
+        testID={testID}
+        pointerEvents="box-none"
+        onLayout={onHeightChange ? handleLayout : undefined}
+        style={[styles.container, { bottom: bottomOffset }]}
+      >
+        {selectByVariant(variant, {
+          material: (
+            <FAB
+              testID={actionTestID}
+              icon={iconMap[icon].android}
+              label={label}
+              onPress={onPress}
+              disabled={disabled}
+              loading={loading}
+              variant="primary"
+              mode="elevated"
+            />
+          ),
+          liquidGlass: (
+            <StartGlassCapsule
+              testID={actionTestID}
+              label={label}
+              icon={icon}
+              onPress={onPress}
+              disabled={disabled}
+              loading={loading}
+            />
+          ),
+        })}
+      </View>
+    </TabBarHideFollower>
   );
 }
 
@@ -119,12 +135,14 @@ function StartGlassCapsule({
   onPress,
   disabled,
   loading,
+  testID,
 }: {
   label: string;
   icon: IconName;
   onPress: () => void;
   disabled?: boolean;
   loading?: boolean;
+  testID?: string;
 }) {
   const { brandColors, systemColors } = useTheme();
   const nativeGlass = useNativeGlass();
@@ -138,6 +156,7 @@ function StartGlassCapsule({
 
   return (
     <PressableSurface
+      testID={testID}
       onPress={handlePress}
       feedback="scale"
       scaleTo={0.96}
@@ -147,7 +166,7 @@ function StartGlassCapsule({
       accessibilityLabel={label}
       style={[
         styles.capsule,
-        { opacity: disabled ? 0.5 : 1 },
+        { opacity: disabled ? opacity.disabled : 1 },
         !nativeGlass && shadows.sm,
         !nativeGlass && { borderWidth: StyleSheet.hairlineWidth, borderColor: systemColors.separator },
       ]}

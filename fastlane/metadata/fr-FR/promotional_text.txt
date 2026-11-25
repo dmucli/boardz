@@ -1,1 +1,1 @@
-Télécharge une board et grimpe sans réseau. Et la cotation Boardsesh : un chiffre qui se lit pareil sur Kilter, Tension et MoonBoard, à partir de vraies croix.
+Entraîne-toi en 4x4, retrouve tes projets et allume ton Spraywall avec WLED. Un carnet pour tes boards, une file partagée avec ton crew.

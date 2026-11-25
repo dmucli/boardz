@@ -3,7 +3,7 @@ name: Mobile OTA Preview (Per-PR Branch)
 # Publishes a PR's JS bundle to its own self-hosted OTA branch `pr-<number>` so
 # anyone on a compatible store / TestFlight binary can load it through Test a PR
 # preview in More or the user drawer. Native config keeps the `production` channel fixed;
-# `pr-<number>` is only the eoas upload branch. See docs/mobile-ota-updates.md.
+# `pr-<number>` is only the eoas upload branch. See docs/operations/mobile-ota-updates.md.
 #
 # ─── SECURITY — READ BEFORE EDITING ──────────────────────────────────────────────
 # EOO_TOKEN is the app-scoped expo-open-ota publish key, so ANY job holding it can
@@ -31,7 +31,8 @@ name: Mobile OTA Preview (Per-PR Branch)
 #   * The `/ota-preview` COMMENT path runs the DEFAULT-BRANCH (main) copy of this file
 #     (issue_comment events always use the default branch), so its repository-
 #     permission gate is NOT PR-editable. An accepted comment creates a second,
-#     trusted default-branch workflow_dispatch run inside the PR lifecycle lane.
+#     trusted default-branch workflow_dispatch run inside the PR lifecycle lane,
+#     which hands the publish to a sandbox run in the same lane (below).
 #     A manual workflow_dispatch can run the copy on whichever ref the dispatcher
 #     picks; dispatch itself requires repository write access. Either way a FORK is
 #     previewed safely after a live permission check.
@@ -40,6 +41,15 @@ name: Mobile OTA Preview (Per-PR Branch)
 #     relevant paths auto-publishes. The environment can add a reviewer checkpoint,
 #     but it is not a hard wall against a malicious insider, who already holds the
 #     repo's secrets via other workflows.
+#   * A DEFAULT-BRANCH run never executes PR code. Comment, refresh and manual
+#     dispatches run on `main`, and whatever a main run writes to Actions storage
+#     is readable by every branch and PR. So the gate turns their publish into
+#     `handoff`, which re-dispatches this file on a throwaway
+#     `ci-sandbox/ota-preview/pr-<n>/<run id>` branch at the same trusted commit
+#     (scripts/lib/ci-sandbox.cjs). Only that run, or a same-repo PR's own
+#     pull_request run, checks out and executes PR code; `sandbox-cleanup` deletes
+#     the branch afterwards. scripts/__tests__/untrusted-code-workflow-guard.test.ts
+#     fails any default-branch workflow that runs a computed checkout unreviewed.
 #   * `^pr-[1-9][0-9]*$` guards every branch mutation (defense-in-depth, not the control).
 #
 # Fork PRs are SKIPPED here (no secrets). A separate metadata-only
@@ -103,14 +113,15 @@ env:
   EXPO_PUBLIC_SENTRY_DSN: https://f55e6626faf787ae5291ad75b010ea14@o4510644927660032.ingest.us.sentry.io/4510644930150400
   EXPO_PUBLIC_POSTHOG_KEY: ${{ vars.NEXT_PUBLIC_POSTHOG_KEY }}
   # Manifest base for the offline snapshot bootstrap (bundle-only, no fingerprint
-  # effect). Public Tigris bucket; keep in sync with SNAPSHOT_PUBLIC_BASE_URL in
-  # export-board-snapshots.yml.
-  EXPO_PUBLIC_SNAPSHOT_BASE_URL: https://boardsesh-board-snapshots.t3.tigrisfiles.io/board-snapshots/v1-gzip
+  # effect). Public R2 host; keep in sync with SNAPSHOT_PUBLIC_BASE_URL in
+  # blackheathdc-ansible/inventories/boardsesh_workers.yml (batch defaults).
+  # Cutover: docs/data/board-snapshots.md#batch-worker-owner-export-board-snapshots-family.
+  EXPO_PUBLIC_SNAPSHOT_BASE_URL: https://snapshots.boardsesh.com/board-snapshots/v1-gzip
   EXPO_UPDATES_URL: ${{ vars.EXPO_UPDATES_URL }}
   # Pin RN's fetch as the global `fetch` (not expo/fetch), which crashes Hermes by
   # tearing down JSI promises off-thread (Sentry 7595562195). Bundle-only flag — it
   # doesn't enter the resolved config, so it never moves the fingerprint. Kept in
-  # lockstep with the other mobile fingerprint workflows. See docs/mobile-ota-updates.md.
+  # lockstep with the other mobile fingerprint workflows. See docs/operations/mobile-ota-updates.md.
   EXPO_PUBLIC_USE_RN_FETCH: '1'
   # Preview-only tag: pr-<number> OTA bundles report `environment: preview` to BOTH
   # Sentry and PostHog, so testers' crashes and product events stay out of the
@@ -143,32 +154,53 @@ jobs:
        github.event.comment.body == '/ota-preview')
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Reads PR metadata and can dispatch this same trusted default-branch
+    # Reads PR/deployment metadata and can dispatch this same trusted default-branch
     # workflow after a comment passes the live repository-permission check.
     permissions:
       actions: write
       contents: read
+      deployments: read
       pull-requests: read
     outputs:
-      action: ${{ steps.decide.outputs.action }}
+      action: ${{ steps.reuse.outputs.reuse == 'true' && 'reuse' || steps.decide.outputs.action }}
       pr_number: ${{ steps.decide.outputs.pr_number }}
       branch: ${{ steps.decide.outputs.branch }}
       fork_skip: ${{ steps.decide.outputs.fork_skip }}
       cleanup_reason: ${{ steps.decide.outputs.cleanup_reason }}
-      # Whether this revision can shrink the set of platforms the preview branch
-      # serves — the only thing the pre-publish reset exists to reconcile. See the
-      # native-fingerprint predicate below.
-      needs_reset: ${{ steps.decide.outputs.needs_reset }}
+      # A new revision, native inputs, changed preview bases, or an incomplete/unverifiable prior
+      # deployment can leave stale runtime variants on the mutable preview branch.
+      needs_reset: ${{ steps.pin.outputs.needs_reset }}
       # The head SHA captured HERE, in the secret-free gate, is the exact commit the
       # publish job checks out — pinning it closes the TOCTOU where a fork could push
       # after the maintainer gate but before the publish checkout of the moving
       # refs/pull/<n>/head (which runs with EOO_TOKEN).
       head_sha: ${{ steps.decide.outputs.head_sha }}
+      source_base_sha: ${{ steps.pin.outputs.source_base_sha }}
+      source_base_ref: ${{ steps.pin.outputs.source_base_ref }}
+      main_sha: ${{ steps.pin.outputs.main_sha }}
     steps:
+      # Budget: GITHUB_TOKEN allows 1,000 REST calls/hour for the whole repo, shared by
+      # every workflow. An app installation token has its own, larger budget (#7659).
+      # Falls back to GITHUB_TOKEN if the app is not configured.
+      - name: Check out app input policy
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts
+          persist-credentials: false
+
+      - name: Mint API token
+        id: api_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
       - name: Decide action + resolve PR
         id: decide
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const repoFull = `${context.repo.owner}/${context.repo.repo}`;
             let action = 'skip';
@@ -183,20 +215,8 @@ jobs:
             // directly; for comment / dispatch we resolve it via the API below.
             let headSha = '';
 
-            const affectsMobilePreview = (path) =>
-              path.startsWith('packages/mobile/') ||
-              path.startsWith('packages/shared/') ||
-              path.startsWith('packages/board-constants/') ||
-              path.startsWith('packages/shared-schema/') ||
-              path.startsWith('patches/') ||
-              path === 'package.json' ||
-              path === 'pnpm-lock.yaml' ||
-              path === 'pnpm-workspace.yaml' ||
-              path === 'scripts/mobile-publish.ts' ||
-              path === 'scripts/lib/mobile-publish-retry.ts' ||
-              path === 'scripts/lib/ota-branch-probe.ts' ||
-              path === 'scripts/lib/eoas.ts' ||
-              path === '.github/workflows/mobile-ota-preview.yml';
+            const { nativeAppAffectingPaths } =
+              await import(`${process.env.GITHUB_WORKSPACE}/scripts/lib/app-build-inputs.mjs`);
 
             // Paths that can move the native fingerprint, and therefore turn a
             // platform native-only mid-PR. Mirrors the native-input globs the
@@ -207,6 +227,11 @@ jobs:
               // Declares the extra fingerprint sources and the autolinking hook, and
               // hashes itself, so editing it moves runtimeVersion on its own.
               path === 'packages/mobile/fingerprint.config.js' ||
+              // Hashed files the app config names (fingerprint:generate --debug).
+              path === 'packages/mobile/eas.json' ||
+              path === 'packages/mobile/assets/icon.png' ||
+              path === 'packages/mobile/assets/splash-icon.png' ||
+              path === 'packages/mobile/assets/adaptive-icon.png' ||
               // @bacons/apple-targets Xcode extensions (the widget) — native by
               // definition, and prebuilt into the iOS project.
               path.startsWith('packages/mobile/targets/') ||
@@ -220,14 +245,10 @@ jobs:
               path === 'pnpm-lock.yaml' ||
               path === 'pnpm-workspace.yaml';
 
-            // Also decides whether the preview branch has to be reset before this
-            // revision publishes. The reset exists for ONE case: a revision that turns
-            // native-only stops publishing a platform, leaving that platform's previous
-            // update surfable and stale. A revision that cannot move the fingerprint
-            // always republishes every platform the last one did, so its new update
-            // simply supersedes the old — deleting the branch first would only take a
-            // live preview away from whoever is testing it for the length of a publish
-            // (~13 minutes). Anything unresolved keeps the old unconditional reset.
+            // Native changes can stop a platform from publishing and leave its old
+            // update surfable. The pin step combines this conservative PR-file signal
+            // with durable deployment context: a new revision, changed bases, or an
+            // incomplete previous attempt reset before publishing runtime variants.
             const hasMobileChanges = async (number) => {
               const files = await github.paginate(github.rest.pulls.listFiles, {
                 owner: context.repo.owner,
@@ -235,8 +256,12 @@ jobs:
                 pull_number: Number(number),
                 per_page: 100,
               });
-              needsReset = files.some((file) => affectsNativeFingerprint(file.filename));
-              return files.some((file) => affectsMobilePreview(file.filename));
+              if (files.length >= 3000) throw new Error('PR exceeds the complete changed-file listing limit. Split the PR.');
+              const paths = files.flatMap((file) => [file.filename, file.previous_filename].filter(Boolean));
+              needsReset = paths.some(affectsNativeFingerprint);
+              const inputs = nativeAppAffectingPaths(paths);
+              core.info(`Native preview inputs: ${inputs.join(', ') || '(none; skipping build)'}`);
+              return inputs.length > 0;
             };
 
             if (context.eventName === 'pull_request') {
@@ -329,8 +354,19 @@ jobs:
               }
             }
 
+            // A run on the default branch (comment, refresh and manual dispatches)
+            // writes entries every branch and PR reads, so it must never execute PR
+            // code. Only a pull_request run (PR-scoped) or a ci-sandbox dispatch
+            // publishes; anywhere else the `handoff` job re-dispatches this workflow
+            // on a throwaway sandbox branch at the same trusted commit.
+            // Keep the prefix in step with scripts/lib/ci-sandbox.cjs.
+            const sandboxPrefix = `refs/heads/ci-sandbox/ota-preview/pr-${prNumber}/`;
+            const onSandbox = Boolean(prNumber) && context.ref.startsWith(sandboxPrefix) &&
+              /^[1-9][0-9]*$/.test(context.ref.slice(sandboxPrefix.length));
+            if (action === 'publish' && context.eventName !== 'pull_request' && !onSandbox) action = 'handoff';
+
             const branch = prNumber ? `pr-${prNumber}` : '';
-            core.info(`event=${context.eventName} action=${action} branch=${branch || '(none)'} head_sha=${headSha || '(none)'} fork_skip=${forkSkip} needs_reset=${needsReset}`);
+            core.info(`event=${context.eventName} ref=${context.ref} action=${action} branch=${branch || '(none)'} head_sha=${headSha || '(none)'} fork_skip=${forkSkip} needs_reset=${needsReset}`);
             core.setOutput('action', action);
             core.setOutput('pr_number', String(prNumber));
             core.setOutput('branch', branch);
@@ -339,8 +375,136 @@ jobs:
             core.setOutput('needs_reset', String(needsReset));
             core.setOutput('head_sha', headSha);
 
+      - name: Pin the main preview base
+        id: pin
+        if: steps.decide.outputs.action == 'publish'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ steps.decide.outputs.pr_number }}
+          HEAD_SHA: ${{ steps.decide.outputs.head_sha }}
+          PR_NATIVE_RESET: ${{ steps.decide.outputs.needs_reset }}
+        with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
+          script: |
+            const { data: pr } = await github.rest.pulls.get({ ...context.repo, pull_number: Number(process.env.PR_NUMBER) });
+            if (pr.state !== 'open' || pr.head.sha !== process.env.HEAD_SHA) throw new Error('Preview head moved before base pinning.');
+            const { data: main } = await github.rest.repos.getBranch({ ...context.repo, branch: 'main' });
+            const bases = {
+              version: 2,
+              mainSha: main.commit.sha,
+              sourceBaseRef: pr.base.ref,
+              sourceBaseSha: pr.base.sha,
+            };
+            const task = `ota-preview-pr-${process.env.PR_NUMBER}`;
+            // Inspect every publish, including coalesced PR events. Refresh dispatch
+            // flags are not durable and cannot prove which runtimes remain surfable.
+            const { data: deployments } = await github.rest.repos.listDeployments({
+              ...context.repo, environment: 'pr-preview', task, per_page: 1,
+            });
+            if (!Array.isArray(deployments)) throw new Error('Preview deployment history is unreadable.');
+            const previous = deployments[0];
+            let previousStatus = '';
+            if (previous && Number.isSafeInteger(previous.id) && previous.id > 0) {
+              const { data: statuses } = await github.rest.repos.listDeploymentStatuses({
+                ...context.repo, deployment_id: previous.id, per_page: 1,
+              });
+              if (!Array.isArray(statuses)) throw new Error('Preview deployment status is unreadable.');
+              previousStatus = statuses[0]?.state ?? '';
+            }
+            let previousPayload = previous?.payload;
+            if (typeof previousPayload === 'string') {
+              try { previousPayload = JSON.parse(previousPayload); } catch { previousPayload = null; }
+            }
+            const previousBases = previousPayload && typeof previousPayload === 'object' && !Array.isArray(previousPayload)
+              ? previousPayload.otaPreviewBases : null;
+            const baseKeys = ['version', 'mainSha', 'sourceBaseRef', 'sourceBaseSha'];
+            const validBases = previousBases && typeof previousBases === 'object' && !Array.isArray(previousBases) &&
+              Object.keys(previousBases).length === baseKeys.length &&
+              baseKeys.every((key) => Object.hasOwn(previousBases, key)) &&
+              previousBases.version === 2 &&
+              typeof previousBases.mainSha === 'string' && /^[0-9a-f]{40}$/.test(previousBases.mainSha) &&
+              typeof previousBases.sourceBaseRef === 'string' && previousBases.sourceBaseRef.length > 0 &&
+              typeof previousBases.sourceBaseSha === 'string' && /^[0-9a-f]{40}$/.test(previousBases.sourceBaseSha);
+            const sameBases = validBases && baseKeys.every((key) => previousBases[key] === bases[key]);
+            const sameDeployment = previous?.environment === 'pr-preview' && previous.task === task &&
+              previous.description === `OTA preview pr-${process.env.PR_NUMBER}` &&
+              previous.transient_environment === true && previous.production_environment === false;
+            // Even JS-only revisions can conflict on one base or fail one upload.
+            // Clear every older revision first so omitted variants cannot stay surfable.
+            const sameRevision = previous?.sha === pr.head.sha;
+            const nativeReset = process.env.PR_NATIVE_RESET !== 'false';
+            const needsReset = nativeReset || !sameDeployment || !sameRevision || !sameBases || previousStatus !== 'success';
+            core.info(`needs_reset=${needsReset} native_reset=${nativeReset} same_deployment=${sameDeployment} same_revision=${sameRevision} same_bases=${Boolean(sameBases)} previous_status=${previousStatus || '(none)'}`);
+            core.setOutput('needs_reset', String(needsReset));
+            core.setOutput('source_base_sha', bases.sourceBaseSha);
+            core.setOutput('source_base_ref', bases.sourceBaseRef);
+            core.setOutput('main_sha', bases.mainSha);
+            // Only automatic pushes can reuse; an explicit request always retries publication.
+            const canCheckReuse = context.eventName === 'pull_request' && !nativeReset &&
+              sameDeployment && sameBases && previousStatus === 'success';
+            core.setOutput('reuse_candidate', canCheckReuse
+              ? JSON.stringify({ deployment: previous, status: previousStatus }) : '');
+
+      - name: Set up the reuse verifier
+        if: steps.pin.outputs.reuse_candidate != ''
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22.x'
+
+      - name: Keep a verified unchanged preview
+        id: reuse
+        if: steps.pin.outputs.reuse_candidate != ''
+        env:
+          OTA_REUSE_CANDIDATE: ${{ steps.pin.outputs.reuse_candidate }}
+          HEAD_SHA: ${{ steps.decide.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.decide.outputs.pr_number }}
+          MAIN_SHA: ${{ steps.pin.outputs.main_sha }}
+          SOURCE_BASE_SHA: ${{ steps.pin.outputs.source_base_sha }}
+          SOURCE_BASE_REF: ${{ steps.pin.outputs.source_base_ref }}
+          GH_TOKEN: ${{ steps.api_token.outputs.token || github.token }}
+        run: node --experimental-strip-types scripts/mobile-ota-preview-reuse.ts
+
+  # ── Default-branch runs never execute PR code. Re-dispatch this workflow on a
+  # fresh `ci-sandbox/ota-preview/pr-<n>/<run id>` branch at the same trusted commit;
+  # that run publishes, and everything it writes stays scoped to the throwaway ref.
+  # Trusted job: no OTA secrets, and only the immutable workflow commit's helper.
+  handoff:
+    needs: gate
+    if: needs.gate.outputs.action == 'handoff'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      # GITHUB_TOKEN only, not the App token (#7659): a sandbox branch created or
+      # deleted with GITHUB_TOKEN starts no `on: push` / `on: create` runs, an App token would.
+      - name: Check out the sandbox helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/lib/ci-sandbox.cjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Hand the publish to a sandbox branch
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+        with:
+          script: |
+            const { handOffToSandbox } = require(`${process.env.GITHUB_WORKSPACE}/scripts/lib/ci-sandbox.cjs`);
+            await handOffToSandbox({
+              github, context, core,
+              workflowKey: 'ota-preview',
+              workflowFile: 'mobile-ota-preview.yml',
+              prNumber: process.env.PR_NUMBER,
+              inputs: { pr: process.env.PR_NUMBER },
+              sha: context.sha,
+            });
+
   # ── Say so BEFORE the branch disappears. A reset takes the preview offline for the
-  # length of a publish (~13 min); with no notice that reads as "the preview is gone",
+  # length of both builds (usually 20–30 min); without notice that reads as "the preview is gone",
   # and the usual reaction — re-dispatching the workflow by hand — only opens a second
   # hole. Trusted job: no OTA secrets, no checkout, no PR-author code. It writes the
   # same sticky marker `announce` owns, so the final result overwrites this notice.
@@ -354,13 +518,24 @@ jobs:
       pull-requests: write
       issues: write
     steps:
+      # Budget: GITHUB_TOKEN allows 1,000 REST calls/hour for the whole repo, shared by
+      # every workflow. An app installation token has its own, larger budget (#7659).
+      # Falls back to GITHUB_TOKEN if the app is not configured.
+      - name: Mint API token
+        id: api_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
       - name: Note that the preview branch is rebuilding
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           BRANCH: ${{ needs.gate.outputs.branch }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const branch = process.env.BRANCH;
             const prNumber = Number(process.env.PR_NUMBER);
@@ -387,9 +562,9 @@ jobs:
               marker,
               `### 📱 OTA preview — \`${branch}\``,
               '',
-              `🔄 Rebuilding **\`${branch}\`** from commit \`${sha}\`. This commit changes native ` +
-                `configuration, so the branch is reset before republishing and is **unavailable for ` +
-                `roughly 12 minutes**.`,
+              `🔄 Rebuilding **\`${branch}\`** from commit \`${sha}\`. The PR revision, native inputs, preview bases, or previous ` +
+                `build state need a fresh compatibility check, so the branch is reset once before all runtime variants ` +
+                `and is **unavailable while both bases build (usually 20–30 minutes)**.`,
               '',
               `It comes back on its own — don't re-run this workflow, which would start the wait over. ` +
                 `This comment is replaced with the result.`,
@@ -402,14 +577,11 @@ jobs:
   # ── Reconcile the mutable pr-N branch before publishing this revision. The
   # management delete runs without a checkout, install, or PR-authored code and
   # completes before the token-bearing publisher starts. This removes stale
-  # platform updates when a newer revision becomes native-only.
+  # runtime variants before a new revision or changed native inputs/bases publish.
   #
-  # It runs ONLY when the gate saw a path that can move the native fingerprint. A
-  # JS-only revision republishes every platform the previous one did, so the new
-  # update supersedes the old one in place and the branch never goes away — the
-  # delete would otherwise strand whoever is testing the preview for the length of
-  # a publish. The gate defaults needs_reset to true, so anything it could not
-  # resolve still resets.
+  # A retry keeps the branch only when the latest successful deployment records
+  # exactly the same PR revision and base context. Missing, changed, malformed, or incomplete
+  # deployment evidence resets conservatively, including after partial publication.
   reset:
     needs: gate
     if: needs.gate.outputs.action == 'publish' && needs.gate.outputs.needs_reset == 'true'
@@ -420,13 +592,47 @@ jobs:
       # Every request queues behind an in-flight mutation. The outer lifecycle
       # lane also queues so a remote publish is never interrupted mid-request.
       cancel-in-progress: false
+    # deployments: write only marks the previous record stale; no PR code runs here.
     permissions:
       contents: read
+      deployments: write
       pull-requests: read
     environment: ota-preview-unattended
     steps:
+      # Budget: GITHUB_TOKEN allows 1,000 REST calls/hour for the whole repo, shared by
+      # every workflow. An app installation token has its own, larger budget (#7659).
+      # Falls back to GITHUB_TOKEN if the app is not configured.
+      - name: Mint API token
+        id: api_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
+      # The delete below wipes what the latest deployment says is live. If this run
+      # then dies before `publish` creates a new deployment, that old `success`
+      # would tell the base-push refresh the preview is intact. Mark it first; a
+      # failure here stops before the delete, so record and branch never disagree.
+      - name: Mark the previous preview record stale
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+        with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
+          script: |
+            const task = `ota-preview-pr-${process.env.PR_NUMBER}`;
+            const { data: deployments } = await github.rest.repos.listDeployments({
+              ...context.repo, environment: 'pr-preview', task, per_page: 1,
+            });
+            if (!Array.isArray(deployments)) throw new Error('Preview deployment history is unreadable.');
+            const latest = deployments[0];
+            if (!latest) return core.info('No previous preview record to mark.');
+            await github.rest.repos.createDeploymentStatus({ ...context.repo,
+              deployment_id: latest.id, state: 'error', description: 'Reset, republish pending',
+            });
+
       - name: Reset preview branch before publish
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           BRANCH: ${{ needs.gate.outputs.branch }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
@@ -436,6 +642,7 @@ jobs:
           OTA_ADMIN_PASSWORD: ${{ secrets.OTA_ADMIN_PASSWORD }}
           OTA_APP_ID: '007e6fd7-f200-448c-9449-8d48ba5d51fc'
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const branch = process.env.BRANCH;
             if (!/^pr-[1-9][0-9]*$/.test(branch || '')) {
@@ -497,8 +704,8 @@ jobs:
   # admin credentials are never in scope while PR-author code runs.
   publish:
     needs: [gate, reset]
-    # `reset` is skipped for a JS-only revision, and a skipped `needs` job would
-    # otherwise skip this one too. Keep the edge (publish must still queue behind an
+    # `reset` is skipped for a same-revision retry with matching successful deployment
+    # context, and a skipped `needs` job would otherwise skip this one too. Keep the edge (publish must still queue behind an
     # in-flight reset via the shared mutation lane) but accept 'skipped' alongside
     # 'success'. A reset that FAILED still blocks: the branch state is then unknown.
     if: >-
@@ -510,7 +717,7 @@ jobs:
     # job killed mid-backoff dies by timeout instead of reporting `s3-slowdown`.
     # Derived and enforced in mobile-ota-publish-workflow.test.ts from the ladder
     # in scripts/lib/mobile-publish-retry.ts.
-    timeout-minutes: 165
+    timeout-minutes: 330
     concurrency:
       group: mobile-ota-preview-mutation-${{ needs.gate.outputs.pr_number }}
       cancel-in-progress: false
@@ -519,6 +726,7 @@ jobs:
     # NO issues / pull-requests write — those stay on trusted announce / cleanup.
     permissions:
       contents: read
+      actions: read
       deployments: write
       pull-requests: read
     environment: ota-preview
@@ -534,32 +742,34 @@ jobs:
     # from PR-author context. `published` is 'true' iff ≥1 platform actually shipped.
     outputs:
       branch: ${{ needs.gate.outputs.branch }}
-      published: ${{ steps.publish_ios.outcome == 'success' || steps.publish_android.outcome == 'success' }}
+      published: ${{ steps.candidates.outputs.published }}
       # The exact commit this job checked out and published — the gate-captured SHA end
       # to end (not a fresh re-resolution). The announce comment surfaces it.
       head_sha: ${{ needs.gate.outputs.head_sha }}
       deployment_id: ${{ steps.deploy.outputs.deployment_id }}
-      verdict_ios: ${{ steps.compat.outputs.verdict_ios }}
-      verdict_android: ${{ steps.compat.outputs.verdict_android }}
-      outcome_ios: ${{ steps.publish_ios.outcome }}
-      outcome_android: ${{ steps.publish_android.outcome }}
-      # A preview is only offered to a binary whose runtimeVersion matches EXACTLY,
-      # so the announce comment names the fingerprint it targeted and what main is on.
-      fingerprint_ios: ${{ steps.compat.outputs.fingerprint_ios }}
-      fingerprint_android: ${{ steps.compat.outputs.fingerprint_android }}
-      base_fingerprint_ios: ${{ steps.compat.outputs.base_fingerprint_ios }}
-      base_fingerprint_android: ${{ steps.compat.outputs.base_fingerprint_android }}
-      behind_main: ${{ steps.behind.outputs.behind_main }}
+      summary: ${{ steps.candidates.outputs.summary }}
+      failed: ${{ steps.candidates.outputs.failed }}
     steps:
+      # Budget: GITHUB_TOKEN allows 1,000 REST calls/hour for the whole repo, shared by
+      # every workflow. An app installation token has its own, larger budget (#7659).
+      # Falls back to GITHUB_TOKEN if the app is not configured.
+      - name: Mint API token
+        id: api_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
       # A manual request can wait behind another branch mutation. Re-check the
       # gate's pinned SHA before any deployment or PR-code execution so a queued
       # stale request cannot republish an older commit.
       - name: Reject a stale queued publish
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -580,20 +790,34 @@ jobs:
 
       - name: Start deployment (preview building)
         id: deploy
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           BRANCH: ${{ needs.gate.outputs.branch }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           # The commit the gate pinned — the SAME one the checkout below uses. No fresh
           # github.rest.pulls.get here: re-resolving could pick up a post-gate push.
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          MAIN_SHA: ${{ needs.gate.outputs.main_sha }}
+          SOURCE_BASE_REF: ${{ needs.gate.outputs.source_base_ref }}
+          SOURCE_BASE_SHA: ${{ needs.gate.outputs.source_base_sha }}
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const headSha = process.env.HEAD_SHA;
             const dep = await github.rest.repos.createDeployment({
               owner: context.repo.owner, repo: context.repo.repo,
               ref: headSha,
               environment: 'pr-preview',
+              task: `ota-preview-pr-${process.env.PR_NUMBER}`,
+              payload: {
+                otaPreviewRunId: context.runId,
+                otaPreviewBases: {
+                  version: 2,
+                  mainSha: process.env.MAIN_SHA,
+                  sourceBaseRef: process.env.SOURCE_BASE_REF,
+                  sourceBaseSha: process.env.SOURCE_BASE_SHA,
+                },
+              },
               auto_merge: false,
               required_contexts: [],
               transient_environment: true,
@@ -611,170 +835,175 @@ jobs:
               description: `Publishing ${process.env.BRANCH}…`,
             });
 
-      - name: Checkout PR head (pinned to the gate-captured SHA)
-        uses: actions/checkout@v4
+      - name: Check out trusted preview tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # Pin to the EXACT commit the secret-free gate captured — NOT the moving
-          # refs/pull/<n>/head, which a fork could advance after the maintainer gate but
-          # before this checkout (this job holds EOO_TOKEN). The commit is fetchable in
-          # the base repo for any PR (fork or not).
+          # Same-repository PRs already run author code with the publish key;
+          # their pinned tooling also lets changes to this pipeline test themselves.
+          # Fork/manual dispatch tooling stays on trusted default-branch code.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && needs.gate.outputs.head_sha || github.event.repository.default_branch }}
+          path: tooling
+          persist-credentials: false
+
+      - name: Checkout PR head (pinned to the gate-captured SHA)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
           ref: ${{ needs.gate.outputs.head_sha }}
-          # This job then runs PR-author code (vp install, app.config execSync). Don't
-          # leave a write-capable GITHUB_TOKEN in .git/config for it to reach; the
-          # baseline fetch of public origin/main below works unauthenticated.
+          path: source
           persist-credentials: false
           fetch-depth: 0
           fetch-tags: true
 
-      - uses: voidzero-dev/setup-vp@v1
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
+          working-directory: tooling
+          run-install: false
 
-      - name: Install dependencies (PR tree)
-        run: vp install --frozen-lockfile
-
-      # Materialize origin/main as a sibling worktree so the OTA-compat check can diff
-      # the PR fingerprint against main (per platform) and skip publishing a platform
-      # that is a native change (undeliverable to any shipped binary).
-      - name: Materialize origin/main baseline
-        run: |
-          git fetch origin main --depth=1
-          git worktree add "$RUNNER_TEMP/main-baseline" origin/main
-
-      - name: Install dependencies (main baseline)
-        working-directory: ${{ runner.temp }}/main-baseline
-        run: vp install --frozen-lockfile
-
-      # Writes packages/mobile/.env (the 8 EXPO_PUBLIC_* vars — same as the production
-      # publish) into both trees and emits verdict_ios / verdict_android. No maps key
-      # here: the diff-vs-main verdict is invariant to it (mirrors mobile-ota-check.yml).
-      - name: Resolve OTA compatibility (and write .env)
-        id: compat
-        run: |
-          vp run check:mobile-ota-compat -- --write-env --base-dir "$RUNNER_TEMP/main-baseline"
-
-      # `native-change-required` has two causes that need OPPOSITE fixes, and the
-      # fingerprint pair alone can't tell them apart: the PR may ADD native code (only
-      # a store build can carry it), or it may merely be BEHIND a native change that
-      # already landed on main (a rebase republishes it). Containment answers that for
-      # free — the baseline fetch above already put origin/main in this repo. The
-      # shallow main is fine: we only ask whether its tip is in the PR's history.
-      - name: Detect whether the PR is behind main
-        id: behind
-        run: |
-          # --is-ancestor answers 0 (contained), 1 (not contained) or >1 on a real
-          # error. Keep those three apart: folding an error into "not contained"
-          # would tell a genuinely native PR to rebase, which is the opposite of
-          # what it needs. `unknown` falls back to the generic message.
-          set +e
-          git merge-base --is-ancestor origin/main HEAD
-          ancestry=$?
-          set -e
-          case "$ancestry" in
-            0) behind=false ;;
-            1) behind=true ;;
-            *) behind=unknown
-               echo "::warning::Could not determine whether this PR is behind main (git exit $ancestry)." ;;
-          esac
-          echo "behind_main=$behind" >> "$GITHUB_OUTPUT"
-
-      # A PR that moves the eoas pin (an xprem upgrade) publishes with a CLI the live
-      # server does not run yet, and since 3.2.0 the two sides share no upload
-      # protocol across versions. The server only rolls when that PR merges, so a
-      # preview cannot work before then: skip it with a notice instead of failing.
-      - name: Skip when this PR moves the eoas pin ahead of the live server
-        id: eoas_pin
-        run: |
-          # Quote-style agnostic, and fail closed: an unreadable pin must not let
-          # a preview publish against a server it may not speak to.
-          pin() { grep -oE "EOAS_PACKAGE_SPEC *= *['\"]eoas@[^'\"]+" "$1/scripts/lib/eoas.ts" | grep -oE "eoas@.+" | head -1; }
-          pr_pin=$(pin .)
-          main_pin=$(pin "$RUNNER_TEMP/main-baseline")
-          if [ -z "$pr_pin" ] || [ -z "$main_pin" ]; then
-            echo "::error::Could not read EOAS_PACKAGE_SPEC from scripts/lib/eoas.ts (PR: '$pr_pin', main: '$main_pin')."
-            exit 1
-          fi
-          if [ "$pr_pin" != "$main_pin" ]; then
-            echo "::notice::This PR changes the eoas pin ($main_pin -> $pr_pin). The live OTA server moves only when it merges, so no preview is published."
-            echo "moved=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "moved=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # V3 control-plane: `eoas publish` creates the pr-<n> branch. iOS
-      # WITHOUT GOOGLE_MAPS_API_KEY (Apple
-      # Maps), Android WITH it — the per-platform split that keeps each published
-      # fingerprint equal to its shipped binary (matches mobile-ota-production.yml). A
-      # native-change platform is skipped.
-      # `mobile:publish` verifies its own work for a `pr-<n>` branch: it re-asks
-      # `/branch_lists` — the same unauthenticated question the in-app picker asks —
-      # and fails when the branch it just uploaded is not being offered. It resolves
-      # the runtimeVersion to probe with ITSELF, inside the step, because only the
-      # step's own env produces the right hash: GOOGLE_MAPS_API_KEY below is an
-      # Android-only fingerprint input, so the compat step (which has no key) resolves
-      # a DIFFERENT Android hash. Passing that one in failed a healthy publish in run
-      # 34796068541. Nothing new is needed here.
-      - name: Publish iOS OTA
-        id: publish_ios
-        if: steps.compat.outputs.verdict_ios != 'native-change-required' && steps.eoas_pin.outputs.moved != 'true'
+      # Neither the publisher key nor maps key exists while dependencies or
+      # app.config execute in the candidate and corresponding baseline trees.
+      - name: Rebase and compare the pinned main preview candidate
         env:
-          EOO_TOKEN: ${{ secrets.EOO_TOKEN }}
-        run: vp run mobile:publish -- --channel "$BRANCH" --platform ios
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          SOURCE_BASE_SHA: ${{ needs.gate.outputs.source_base_sha }}
+          SOURCE_BASE_REF: ${{ needs.gate.outputs.source_base_ref }}
+          MAIN_SHA: ${{ needs.gate.outputs.main_sha }}
+        run: |
+          git -C source fetch origin "$SOURCE_BASE_SHA" "$MAIN_SHA"
+          node --experimental-strip-types tooling/scripts/mobile-ota-preview-candidates.ts prepare \
+            "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/preview-candidates" "$RUNNER_TEMP/preview-artifacts"
 
-      - name: Publish Android OTA
-        id: publish_android
-        if: steps.compat.outputs.verdict_android != 'native-change-required' && steps.eoas_pin.outputs.moved != 'true'
+      - name: Reject a stale prepared publish
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+        with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
+          script: |
+            const { data: currentPr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: Number(process.env.PR_NUMBER),
+            });
+            if (currentPr.state !== 'open' || currentPr.head.sha !== process.env.HEAD_SHA) {
+              core.setFailed('Prepared preview is stale: the PR closed or its head changed while candidates built.');
+            }
+
+      # Only automatic, same-repository PR runs share a store, and only with
+      # earlier successful runs of this same PR. Fork/manual/sandbox runs stay
+      # cold. Production never selects these artifacts; its HMAC key stays there.
+      # Hash the replayed candidate (not the tooling checkout) and its .env.
+      - name: Key the preview Metro cache
+        id: metro_preview_key
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
+        run: >-
+          node --experimental-strip-types tooling/scripts/ci/metro-preview-cache.ts key
+          "$RUNNER_TEMP/preview-candidates/candidates/main"
+
+      - name: Find this PR's previous Metro cache
+        id: metro_preview_find
+        if: steps.metro_preview_key.outputs.store_artifact != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          METRO_STORE_ARTIFACT: ${{ steps.metro_preview_key.outputs.store_artifact }}
+        run: node --experimental-strip-types tooling/scripts/ci/metro-preview-cache.ts select
+
+      - name: Download the preview Metro cache
+        id: metro_preview_download
+        if: steps.metro_preview_find.outputs.artifact_id != '' && steps.metro_preview_find.outputs.run_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          artifact-ids: ${{ steps.metro_preview_find.outputs.artifact_id }}
+          run-id: ${{ steps.metro_preview_find.outputs.run_id }}
+          github-token: ${{ github.token }}
+          merge-multiple: true
+          path: ${{ runner.temp }}/metro-preview-download
+
+      - name: Prepare the preview Metro store
+        id: metro_preview_unpack
+        if: steps.metro_preview_key.outputs.store_artifact != ''
+        continue-on-error: true
+        run: >-
+          node --experimental-strip-types tooling/scripts/ci/metro-preview-cache.ts unpack
+          "$RUNNER_TEMP/metro-preview-download/metro-cache.tar" "$RUNNER_TEMP/metro-preview"
+
+      - name: Publish compatible preview runtime variants
+        id: candidates
+        env:
+          # Only validated files (or a newly initialized empty store) reach Metro.
+          # Keep TMPDIR step-local so compatibility/native environments stay intact.
+          TMPDIR: ${{ steps.metro_preview_unpack.outputs.store_ready == 'true' && format('{0}/metro-preview', runner.temp) || runner.temp }}
           EOO_TOKEN: ${{ secrets.EOO_TOKEN }}
           GOOGLE_MAPS_API_KEY: ${{ secrets.GOOGLE_MAPS_API_KEY }}
-        run: vp run mobile:publish -- --channel "$BRANCH" --platform android
+          DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          SOURCE_BASE_SHA: ${{ needs.gate.outputs.source_base_sha }}
+          SOURCE_BASE_REF: ${{ needs.gate.outputs.source_base_ref }}
+          MAIN_SHA: ${{ needs.gate.outputs.main_sha }}
+        run: |
+          node --experimental-strip-types tooling/scripts/mobile-ota-preview-candidates.ts publish \
+            "$GITHUB_WORKSPACE/source" "$RUNNER_TEMP/preview-candidates" "$RUNNER_TEMP/preview-artifacts"
 
-      # Record authoritative full-SHA state before this job releases the shared
-      # mutation lane. The fork reconciler reads this deployment, never a
-      # forgeable PR comment, when deciding whether a delayed synchronize event
-      # may delete the branch. `always()` also closes out install/publish failures.
+      - name: Pack the preview Metro cache
+        id: metro_preview_pack
+        if: steps.candidates.outputs.published == 'true' && steps.metro_preview_unpack.outputs.store_ready == 'true'
+        continue-on-error: true
+        run: >-
+          node --experimental-strip-types tooling/scripts/ci/metro-preview-cache.ts pack
+          "$RUNNER_TEMP/metro-preview" "$RUNNER_TEMP/metro-preview-upload/metro-cache.tar"
+
+      - name: Save this PR's Metro cache
+        if: steps.metro_preview_pack.outputs.archive_ready == 'true'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ steps.metro_preview_key.outputs.store_artifact }}
+          path: ${{ runner.temp }}/metro-preview-upload/metro-cache.tar
+          retention-days: 7
+          compression-level: 1
+          if-no-files-found: error
+
+      - name: Archive the frozen preview receipt
+        if: always() && steps.candidates.outputs.published == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mobile-ota-preview-receipt
+          path: ${{ runner.temp }}/preview-artifacts/receipt.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Archive generated preview source
+        if: always() && steps.candidates.outputs.published == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mobile-ota-preview-source
+          path: ${{ runner.temp }}/preview-artifacts/*.bundle
+          retention-days: 7
+          if-no-files-found: error
+
       - name: Finalize authoritative deployment state
         if: always() && steps.deploy.outputs.deployment_id != ''
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
-          BRANCH: ${{ needs.gate.outputs.branch }}
           DEPLOYMENT_ID: ${{ steps.deploy.outputs.deployment_id }}
-          VERDICT_IOS: ${{ steps.compat.outputs.verdict_ios }}
-          VERDICT_ANDROID: ${{ steps.compat.outputs.verdict_android }}
-          OUTCOME_IOS: ${{ steps.publish_ios.outcome }}
-          OUTCOME_ANDROID: ${{ steps.publish_android.outcome }}
-          EOAS_PIN_MOVED: ${{ steps.eoas_pin.outputs.moved }}
+          PUBLISHED: ${{ steps.candidates.outputs.published }}
+          FAILED: ${{ steps.candidates.outputs.failed }}
+          CANDIDATE_OUTCOME: ${{ steps.candidates.outcome }}
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
-            const anyPublished =
-              process.env.OUTCOME_IOS === 'success' || process.env.OUTCOME_ANDROID === 'success';
-            const anyFailed =
-              process.env.OUTCOME_IOS === 'failure' || process.env.OUTCOME_ANDROID === 'failure';
-            const nativeSkip =
-              process.env.VERDICT_IOS === 'native-change-required' ||
-              process.env.VERDICT_ANDROID === 'native-change-required';
-            const nativeOnly = !anyPublished && !anyFailed && nativeSkip;
-            const pinMoved = !anyPublished && !anyFailed && process.env.EOAS_PIN_MOVED === 'true';
-            const state = anyPublished ? 'success' : nativeOnly || pinMoved ? 'inactive' : 'failure';
-            const description = anyPublished
-              ? `OTA branch ${process.env.BRANCH} ready`
-              : nativeOnly
-                ? `${process.env.BRANCH}: native change — no OTA preview`
-                : pinMoved
-                  ? `${process.env.BRANCH}: OTA server upgrade — no preview until merge`
-                  : `OTA preview ${process.env.BRANCH} failed`;
-            await github.rest.repos.createDeploymentStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              deployment_id: Number(process.env.DEPLOYMENT_ID),
-              state,
-              description,
+            const failed = process.env.FAILED === 'true' || process.env.CANDIDATE_OUTCOME !== 'success';
+            const state = failed ? 'failure' : process.env.PUBLISHED === 'true' ? 'success' : 'inactive';
+            await github.rest.repos.createDeploymentStatus({ ...context.repo,
+              deployment_id: Number(process.env.DEPLOYMENT_ID), state,
+              description: failed ? 'OTA preview failed' : state === 'success' ? 'OTA runtime variants ready' : 'No compatible preview candidate',
             });
 
-      # Only the production branch asks mobile:publish to retain external maps
-      # in dist. PR previews use pr-N branches, so they neither keep nor upload
-      # source maps; never provide SENTRY_AUTH_TOKEN to this PR-author-code job.
+      # Source bundles contain committed files only, without generated .env,
+      # exports or source maps. SENTRY_AUTH_TOKEN never reaches PR execution.
 
   # ── Sticky comment + deployment status. Needs only the default GITHUB_TOKEN (no OTA
   # secrets); runs even when nothing shipped (native-only) or the publish failed, so
@@ -795,26 +1024,29 @@ jobs:
       issues: write
       deployments: write
     steps:
+      # Budget: GITHUB_TOKEN allows 1,000 REST calls/hour for the whole repo, shared by
+      # every workflow. An app installation token has its own, larger budget (#7659).
+      # Falls back to GITHUB_TOKEN if the app is not configured.
+      - name: Mint API token
+        id: api_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
       - name: Announce preview on the PR
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           BRANCH: ${{ needs.publish.outputs.branch }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.publish.outputs.head_sha }}
           DEPLOYMENT_ID: ${{ needs.publish.outputs.deployment_id }}
-          VERDICT_IOS: ${{ needs.publish.outputs.verdict_ios }}
-          VERDICT_ANDROID: ${{ needs.publish.outputs.verdict_android }}
-          OUTCOME_IOS: ${{ needs.publish.outputs.outcome_ios }}
-          OUTCOME_ANDROID: ${{ needs.publish.outputs.outcome_android }}
-          FINGERPRINT_IOS: ${{ needs.publish.outputs.fingerprint_ios }}
-          FINGERPRINT_ANDROID: ${{ needs.publish.outputs.fingerprint_android }}
-          BASE_FINGERPRINT_IOS: ${{ needs.publish.outputs.base_fingerprint_ios }}
-          BASE_FINGERPRINT_ANDROID: ${{ needs.publish.outputs.base_fingerprint_android }}
-          BEHIND_MAIN: ${{ needs.publish.outputs.behind_main }}
-          # 'false' means the branch was NOT reset before this publish, so a revision
-          # that ships nothing leaves the previous revision's bundle in place.
+          PUBLISHED: ${{ needs.publish.outputs.published }}
+          SUMMARY: ${{ needs.publish.outputs.summary }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
           NEEDS_RESET: ${{ needs.gate.outputs.needs_reset }}
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const branch = process.env.BRANCH;
             const prNumber = Number(process.env.PR_NUMBER);
@@ -831,121 +1063,24 @@ jobs:
               return;
             }
 
-            // A skip has two causes needing opposite fixes: the PR ADDS native code
-            // (only a store build carries it), or the PR is merely BEHIND a native
-            // change already on main (a rebase republishes it). Saying "needs a
-            // TestFlight build" for the second sends the author down the wrong path.
-            //
-            // They can also BOTH be true, and containment cannot separate that case:
-            // telling those apart needs the merge-base's own fingerprint, a third
-            // resolve costing another `vp install` on every mobile PR. So the
-            // behind-main wording promises only that rebasing is the next step, not
-            // that it is sufficient — after the rebase this same check re-runs and
-            // says "needs a TestFlight/Play build" if a native delta really remains.
-            const behindMain = process.env.BEHIND_MAIN === 'true';
-            // success | skipped (native change) | failure | (didn't run)
-            const cell = (outcome, verdict) => {
-              if (outcome === 'success') return `✅ published \`${sha}\``;
-              if (verdict === 'native-change-required') {
-                return behindMain
-                  ? '⚠️ behind a native change on `main` — rebase, then re-check'
-                  : '⚠️ native change — needs a TestFlight/Play build';
-              }
-              // A failing publish step now has a second cause worth naming: the upload
-              // succeeded but the server does not offer the branch to this
-              // runtimeVersion, so the picker would show nothing. The publisher prints
-              // which platform and hash it probed; keep the cell short and point at it.
-              if (outcome === 'failure') return '❌ publish failed or not surfable (see the run log)';
-              return '—';
-            };
-            const iosCell = cell(process.env.OUTCOME_IOS, process.env.VERDICT_IOS);
-            const androidCell = cell(process.env.OUTCOME_ANDROID, process.env.VERDICT_ANDROID);
-            // The runtimeVersion the preview targets. A branch is offered only to a
-            // binary whose fingerprint matches EXACTLY, so when a picker looks empty
-            // this pair is the first thing to compare.
-            const fingerprintCell = (own, base) => {
-              const mine = own || '—';
-              const theirs = base || '—';
-              // Two unresolved hashes are equal but tell you nothing — rendering that
-              // as "matches main" would invent a reassurance out of a failed resolve.
-              if (mine === '—') return '`—` (unresolved)';
-              return mine === theirs ? `\`${mine}\` (matches \`main\`)` : `\`${mine}\` · main \`${theirs}\``;
-            };
-            const iosFingerprint = fingerprintCell(process.env.FINGERPRINT_IOS, process.env.BASE_FINGERPRINT_IOS);
-            const androidFingerprint = fingerprintCell(
-              process.env.FINGERPRINT_ANDROID,
-              process.env.BASE_FINGERPRINT_ANDROID,
-            );
-            const anyPublished =
-              process.env.OUTCOME_IOS === 'success' || process.env.OUTCOME_ANDROID === 'success';
-            const anyFailed =
-              process.env.OUTCOME_IOS === 'failure' || process.env.OUTCOME_ANDROID === 'failure';
-            const nativeSkip =
-              process.env.VERDICT_IOS === 'native-change-required' ||
-              process.env.VERDICT_ANDROID === 'native-change-required';
-            // nativeOnly: nothing shipped, nothing errored — the skip is a legitimate
-            // native change, not a failure, so don't flag it red.
-            const nativeOnly = !anyPublished && !anyFailed && nativeSkip;
-            // A JS-only revision skips the pre-publish reset, so when it ships nothing
-            // the branch keeps serving the last revision that did publish. Testers must
-            // not read an unchanged switcher entry as "this commit is live".
-            const staleNote =
-              !anyPublished && process.env.NEEDS_RESET === 'false'
-                ? ` **\`${branch}\` still serves the last revision that published**, not this commit.`
-                : '';
-            let headline;
-            let deployState;
-            let deployDesc;
-            if (anyPublished) {
-              headline =
-                `This PR is live on the OTA branch **\`${branch}\`** from commit \`${sha}\` (the exact SHA the ` +
-                `gate pinned). Anyone on a compatible TestFlight / App Store build can load it without a new build:`;
-              deployState = 'success';
-              deployDesc = `OTA branch ${branch} ready`;
-            } else if (nativeOnly && behindMain) {
-              headline =
-                `No \`${branch}\` preview was published: this PR is **behind a native change on \`main\`**, so ` +
-                `its bundle targets a fingerprint no current build runs. Rebase onto \`main\` and push. If this ` +
-                `PR adds no native code of its own, that republishes the preview against the fingerprint ` +
-                `testers are on; if it does, this check will then say so and it needs a TestFlight/Play build.` +
-                staleNote;
-              deployState = 'inactive';
-              deployDesc = `${branch}: behind a native change on main — rebase, then re-check`;
-            } else if (nativeOnly) {
-              headline =
-                `This PR is a **native change**, so it can't ride OTA — ship a TestFlight/Play build to test it. ` +
-                `No \`${branch}\` preview was published.` + staleNote;
-              deployState = 'inactive';
-              deployDesc = `${branch}: native change — no OTA preview`;
-            } else {
-              headline = `Couldn't publish an OTA preview for this PR.`;
-              deployState = 'failure';
-              deployDesc = `OTA preview ${branch} failed`;
-            }
-            const howto = anyPublished
-              ? ['',
-                 `In Boardsesh, open **More → Previews → Test a PR preview** (also in the user drawer), ` +
-                   `then select **\`${branch}\`**. When done, open the test plan under **More → Previews** ` +
-                   `and choose **Leave preview**.`,
-                 '<sub>The server may take up to 15 seconds to refresh the branch list after publishing.</sub>',
-                 '']
-              : [''];
-
-            const body = [
-              marker,
-              `### 📱 OTA preview — \`${branch}\``,
-              '',
-              headline,
-              ...howto,
-              '| Platform | Status | Fingerprint |',
-              '| --- | --- | --- |',
-              `| iOS | ${iosCell} | ${iosFingerprint} |`,
-              `| Android | ${androidCell} | ${androidFingerprint} |`,
-              '',
-              '<sub>Delivers only to a build whose fingerprint matches this commit (a JS-only change vs ' +
-                '`main`). A native change can\'t ride OTA — ship a TestFlight/Play build. A fingerprint that ' +
-                'no longer matches `main` means the preview is invisible to current builds until this PR is ' +
-                'rebased. Closing the PR removes the branch.</sub>',
+            let candidates = [];
+            try { candidates = JSON.parse(process.env.SUMMARY || '[]'); } catch { /* failed before result collection */ }
+            const rows = candidates.flatMap((candidate) => ['ios', 'android'].map((platform) => {
+              const result = candidate.platforms[platform];
+              const state = candidate.status === 'conflict' ? 'rebase conflict' : candidate.status === 'failed' ? 'preparation failed' : result?.status || 'not published';
+              const runtime = result?.receipt?.runtimeVersion || result?.fingerprint;
+              return `| ${candidate.targetRef} | ${platform} | ${state} | ${runtime ? `\`${runtime}\`` : '—'} |`;
+            }));
+            const headline = process.env.PUBLISHED === 'true'
+              ? `Preview of \`${sha}\` is ready on **\`${branch}\`**. Each variant includes the latest pinned base plus this PR's commits.`
+              : `No preview of \`${sha}\` was published. ${process.env.NEEDS_RESET === 'true' ? 'The previous branch was cleared before building.' : 'The branch retains only variants already published for this same revision and base context.'}`;
+            const body = [marker, `### 📱 OTA preview — \`${branch}\``, '', headline,
+              ...(process.env.PUBLISH_RESULT !== 'success' ? ['Some candidates failed; see the Actions run for details.'] : []),
+              ...(process.env.NEEDS_RESET === 'false' ? ['Skipped or omitted runtimes may retain variants already published for this same revision and base context; published rows below attest this attempt.'] : []),
+              '', 'Open **More → Previews → Test a PR preview**, then choose the PR. Your installed runtime selects the matching variant.', '',
+              '| Base | Platform | Status | Runtime |', '| --- | --- | --- | --- |', ...rows, '',
+              'Conflicting rebases and native changes skip that target. When bases share a runtime, the PR’s actual target wins.',
+              'Closing the PR removes every runtime variant.',
             ].join('\n');
 
             const comments = await github.paginate(github.rest.issues.listComments, {
@@ -970,20 +1105,6 @@ jobs:
               await github.rest.issues.createComment({
                 owner: context.repo.owner, repo: context.repo.repo, issue_number: prNumber, body,
               });
-            }
-
-            const deploymentId = process.env.DEPLOYMENT_ID;
-            if (deploymentId) {
-              try {
-                await github.rest.repos.createDeploymentStatus({
-                  owner: context.repo.owner, repo: context.repo.repo,
-                  deployment_id: Number(deploymentId),
-                  state: deployState,
-                  description: deployDesc,
-                });
-              } catch (error) {
-                core.warning(`Could not update deployment status: ${error.message}`);
-              }
             }
 
   # ── Tear down pr-<number> when the PR closes. Runs NO PR-author code with a secret
@@ -1017,14 +1138,25 @@ jobs:
       HAS_OTA_ADMIN: ${{ secrets.OTA_ADMIN_PASSWORD != '' }}
       BRANCH: ${{ needs.gate.outputs.branch }}
     steps:
+      # Budget: GITHUB_TOKEN allows 1,000 REST calls/hour for the whole repo, shared by
+      # every workflow. An app installation token has its own, larger budget (#7659).
+      # Falls back to GITHUB_TOKEN if the app is not configured.
+      - name: Mint API token
+        id: api_token
+        continue-on-error: true
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ vars.OTA_PUSH_APP_ID }}
+          private-key: ${{ secrets.OTA_PUSH_APP_PRIVATE_KEY }}
       - name: Reject a stale cleanup decision
         id: fresh
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
           HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
           CLEANUP_REASON: ${{ needs.gate.outputs.cleanup_reason }}
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const { data: pr } = await github.rest.pulls.get({
               owner: context.repo.owner,
@@ -1045,14 +1177,14 @@ jobs:
           fi
 
       - name: Checkout base (trusted main — NOT PR head)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ github.event.repository.default_branch }}
 
-      - uses: voidzero-dev/setup-vp@v1
+      - uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1
         with:
           node-version: '22.x'
-          cache: true
+          cache: false
 
       # No `vp install`: ota-preview-cleanup.ts is dependency-free (node built-ins only).
       # Skipping the workspace install keeps this most-sensitive job (admin creds in
@@ -1073,7 +1205,7 @@ jobs:
 
       - name: Mark preview removed (deployment + comment)
         if: always() && steps.fresh.outcome == 'success'
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           BRANCH: ${{ needs.gate.outputs.branch }}
           PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
@@ -1082,6 +1214,7 @@ jobs:
           # wording so we don't claim "Removed" when the delete was skipped or failed.
           DELETE_OUTCOME: ${{ steps.delete.outcome }}
         with:
+          github-token: ${{ steps.api_token.outputs.token || github.token }}
           script: |
             const branch = process.env.BRANCH;
             const prNumber = Number(process.env.PR_NUMBER);
@@ -1154,3 +1287,31 @@ jobs:
             } catch (error) {
               core.warning(`Could not update sticky comment: ${error.message}`);
             }
+
+  # ── Remove this run's own sandbox branch once every job above has finished. A
+  # no-op on any other ref. A sandbox replaced while still pending never reaches
+  # this job; the next handoff for the same PR prunes it.
+  sandbox-cleanup:
+    needs: [gate, notify, reset, publish, announce, cleanup]
+    if: always() && startsWith(github.ref, 'refs/heads/ci-sandbox/ota-preview/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      # GITHUB_TOKEN only, not the App token (#7659): a sandbox branch created or
+      # deleted with GITHUB_TOKEN starts no `on: push` / `on: create` runs, an App token would.
+      - name: Check out the sandbox helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/lib/ci-sandbox.cjs
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Delete this run's sandbox branch
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            const { deleteOwnSandbox } = require(`${process.env.GITHUB_WORKSPACE}/scripts/lib/ci-sandbox.cjs`);
+            await deleteOwnSandbox({ github, context, core, workflowKey: 'ota-preview' });

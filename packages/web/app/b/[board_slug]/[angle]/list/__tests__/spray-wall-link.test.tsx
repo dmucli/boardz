@@ -1,4 +1,5 @@
 // @vitest-environment node
+import React from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import type { SearchRequestPagination } from '@/app/lib/types';
 
@@ -6,7 +7,7 @@ import type { SearchRequestPagination } from '@/app/lib/types';
  * `/b/{slug}/{angle}/list` on a spray wall: where its share link lands, and what
  * the `?wall=` capability does and does not open.
  *
- * The route must never reach `getBoardDetailsForBoard` for a wall — there is no
+ * The route must never reach `getBoardImageDetailsForBoard` for a wall — there is no
  * catalogue row to resolve and it throws, which would be a 500 on a URL the gym
  * page links to.
  */
@@ -46,7 +47,11 @@ function boardFor(visibility: 'public' | 'unlisted' | 'private') {
   };
 }
 
-const resolveBoardBySlug = vi.fn(async (_slug: string) => boardFor('unlisted'));
+const resolveBoardBySlug = vi.fn(async (_slug: string, _wallUuid?: string) => boardFor('unlisted'));
+
+vi.mock('@/app/lib/backend-url', () => ({
+  getPublicBackendHttpUrl: () => 'https://ws.boardsesh.com',
+}));
 
 vi.mock('@/app/lib/board-slug-utils', () => ({
   resolveBoardBySlug,
@@ -59,11 +64,12 @@ vi.mock('@/app/lib/board-slug-utils', () => ({
   })),
 }));
 
-const getBoardDetailsForBoard = vi.fn(() => {
+const getBoardImageDetailsForBoard = vi.fn(() => {
   throw new Error('the catalogue has no size row for a spray wall');
 });
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: () => getBoardDetailsForBoard(),
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: () => getBoardImageDetailsForBoard(),
 }));
 
 const fetchFrontDoorListPage = vi.fn();
@@ -96,13 +102,29 @@ const fetchSprayWallPageData = vi.fn(async (_wallUuid: string): Promise<typeof W
 // client, and which photograph a wall shows is pinned next door in
 // `spray-view.test.tsx`. What this file is about is who gets to see the page.
 const resolveSprayPhotoUrl = vi.fn(() => 'https://media.example/photo.jpg');
-vi.mock('@/app/lib/spray/spray-wall-render-data.server', () => ({ resolveSprayPhotoUrl, fetchSprayWallPageData }));
+// No generated look by default: the page draws the photo.
+const fetchSprayWallArtChoice = vi.fn(async (_wallUuid: string, _versionNumber: number) => null);
+const resolveSprayArtUrl = vi.fn(() => null);
+vi.mock('@/app/lib/spray/spray-wall-render-data.server', () => ({
+  resolveSprayPhotoUrl,
+  fetchSprayWallPageData,
+  fetchSprayWallArtChoice,
+  resolveSprayArtUrl,
+}));
 
 vi.mock('@/app/components/climb-front-door/static-list-front-door', () => ({ default: () => null }));
 vi.mock('@/app/components/spray-wall/spray-wall-front-door', () => ({ default: () => null }));
 
-const { default: BoardSlugListPage, generateMetadata } = await import('../page');
-const { default: SprayWallListPage, resolveSprayWallAccess } = await import('../spray-wall-view');
+const { default: BoardSlugListPage, generateMetadata } = await import('@/app/(site)/b/[board_slug]/[angle]/list/page');
+const { default: SprayWallListPage } = await import('../spray-wall-view');
+const { default: QrLandingTracker } = await import('@/app/components/climb-front-door/qr-landing-tracker');
+const { default: StaticListFrontDoor } = await import('@/app/components/climb-front-door/static-list-front-door');
+
+/** The page's top-level elements: a fragment's children, or the one element. */
+function topLevelElements(page: React.ReactElement<{ children?: React.ReactNode }>): React.ReactElement[] {
+  return React.Children.toArray(page.props.children).filter(React.isValidElement);
+}
+const { resolveSprayWallAccess } = await import('@/app/lib/spray/spray-visibility');
 
 type ListSearchParams = SearchRequestPagination & { wall?: string | string[] };
 
@@ -148,11 +170,58 @@ describe('the /b/{slug}/{angle}/list route on a spray wall', () => {
     // the page — so the assertions here are about routing, and the cases below
     // call the branch itself.
     const element = await BoardSlugListPage(propsWith(WALL_UUID));
+    const wallBranch = topLevelElements(element).find((child) => child.type === SprayWallListPage);
 
-    expect(element.type).toBe(SprayWallListPage);
-    expect(element.props).toEqual({ board: boardFor('unlisted'), wallParam: WALL_UUID });
-    expect(getBoardDetailsForBoard).not.toHaveBeenCalled();
+    expect(wallBranch?.props).toEqual({ board: boardFor('unlisted'), wallParam: WALL_UUID });
+    expect(getBoardImageDetailsForBoard).not.toHaveBeenCalled();
     expect(fetchFrontDoorListPage).not.toHaveBeenCalled();
+  });
+
+  it("counts a scan of the wall's printed code, naming the board type and nothing else (#4415)", async () => {
+    const element = await BoardSlugListPage(propsWith(WALL_UUID));
+    const tracker = topLevelElements(element).find((child) => child.type === QrLandingTracker);
+
+    // The tracker gets no slug, no name and no uuid: `Board QR Scanned` names no wall.
+    expect(tracker?.props).toEqual({ kind: 'board', boardType: 'spray' });
+  });
+
+  it('counts a scan on a catalogue board list too', async () => {
+    resolveBoardBySlug.mockResolvedValueOnce({ ...boardFor('public'), boardType: 'kilter', slug: 'the-kilter' });
+    fetchFrontDoorListPage.mockResolvedValueOnce({ boardDetails: {}, climbs: [], hasMore: false, preloadUrls: [] });
+
+    const element = await BoardSlugListPage({
+      params: Promise.resolve({ board_slug: 'the-kilter', angle: '40' }),
+      searchParams: Promise.resolve({} as ListSearchParams),
+    });
+    const children = topLevelElements(element);
+
+    expect(children.find((child) => child.type === QrLandingTracker)?.props).toEqual({
+      kind: 'board',
+      boardType: 'kilter',
+    });
+    expect(children.some((child) => child.type === StaticListFrontDoor)).toBe(true);
+  });
+
+  it('presents the capability to the backend, because a slug alone opens no unlisted wall', async () => {
+    // `boardBySlug` answers an anonymous caller `null` for an unlisted wall unless
+    // `wallUuid` names it. A lookup on the slug alone 404'd every share link.
+    await BoardSlugListPage(propsWith(WALL_UUID));
+    await generateMetadata(propsWith(WALL_UUID));
+
+    expect(resolveBoardBySlug).toHaveBeenCalledTimes(2);
+    expect(resolveBoardBySlug).toHaveBeenNthCalledWith(1, 'garage-wall', WALL_UUID);
+    expect(resolveBoardBySlug).toHaveBeenNthCalledWith(2, 'garage-wall', WALL_UUID);
+  });
+
+  it('presents no capability for a repeated param, or for none', async () => {
+    await BoardSlugListPage({
+      params: Promise.resolve({ board_slug: 'garage-wall', angle: '40' }),
+      searchParams: Promise.resolve({ wall: [WALL_UUID, OTHER_WALL_UUID] } as ListSearchParams),
+    });
+    await BoardSlugListPage(propsWith());
+
+    expect(resolveBoardBySlug).toHaveBeenNthCalledWith(1, 'garage-wall', undefined);
+    expect(resolveBoardBySlug).toHaveBeenNthCalledWith(2, 'garage-wall', undefined);
   });
 
   it('asks for no indexation, and emits no canonical for a capability URL', async () => {
@@ -162,6 +231,70 @@ describe('the /b/{slug}/{angle}/list route on a spray wall', () => {
 
     expect(metadata.robots).toEqual({ index: false, follow: true });
     expect(metadata.alternates?.canonical).toBeUndefined();
+  });
+});
+
+describe('the wall page metadata', () => {
+  it("names the wall only for a request the page would render, never the owner's private one", async () => {
+    // The owner's own lookup returns a private or unlisted row without a uuid; the
+    // title must not name a wall the body refuses.
+    for (const [visibility, wall] of [
+      ['unlisted', undefined],
+      ['unlisted', OTHER_WALL_UUID],
+      ['private', WALL_UUID],
+    ] as const) {
+      resolveBoardBySlug.mockResolvedValue(boardFor(visibility));
+      const metadata = await generateMetadata(propsWith(wall));
+      // `createBoardContentPageMetadata` wraps the title as `{ absolute }`.
+      expect(JSON.stringify(metadata.title)).toContain('metadata.list.fallbackTitle');
+      expect(metadata.robots).toEqual({ index: false, follow: true });
+    }
+
+    resolveBoardBySlug.mockResolvedValue(boardFor('unlisted'));
+    expect(JSON.stringify((await generateMetadata(propsWith(WALL_UUID))).title)).toContain('spray.wall.metadata.title');
+  });
+});
+
+function imageUrlOf(metadata: Awaited<ReturnType<typeof generateMetadata>>): string | undefined {
+  const images = metadata.openGraph?.images as Array<{ url: string }> | undefined;
+  return images?.[0]?.url;
+}
+
+describe('the wall share preview', () => {
+  it('gives a public wall with a public photo the backend place card, on its slug alone', async () => {
+    resolveBoardBySlug.mockResolvedValue(boardFor('public'));
+
+    const metadata = await generateMetadata(propsWith(WALL_UUID));
+
+    expect(imageUrlOf(metadata)).toMatch(
+      /^https:\/\/ws\.boardsesh\.com\/og\/place\?kind=board&slug=garage-wall&v=[0-9a-f]{12}-[0-9a-z]+$/,
+    );
+    expect(metadata.openGraph?.title).toBe('spray.wall.metadata.ogTitle');
+    expect(metadata.openGraph?.description).toBe('spray.wall.metadata.ogDescription');
+    expect(metadata.robots).toEqual({ index: false, follow: true });
+  });
+
+  it('keeps an unlisted wall on the generic card, so its capability and photo stay out of the preview', async () => {
+    resolveBoardBySlug.mockResolvedValue(boardFor('unlisted'));
+
+    const metadata = await generateMetadata(propsWith(WALL_UUID));
+
+    expect(imageUrlOf(metadata)).toBe('/opengraph-image');
+    expect(JSON.stringify(metadata)).not.toContain(WALL_UUID);
+    expect(JSON.stringify(metadata)).not.toContain('presigned');
+    expect(fetchSprayWallPageData).not.toHaveBeenCalled();
+  });
+
+  it('keeps a public wall with no public photo copy on the generic card, which the backend would 404', async () => {
+    resolveBoardBySlug.mockResolvedValue(boardFor('public'));
+    fetchSprayWallPageData.mockResolvedValue({
+      ...WALL_DATA,
+      wall: { ...WALL_DATA.wall, publicPhotoUrl: null },
+    } as never);
+
+    const metadata = await generateMetadata(propsWith());
+
+    expect(imageUrlOf(metadata)).toBe('/opengraph-image');
   });
 });
 
@@ -192,6 +325,8 @@ describe('the wall branch itself', () => {
     expect(fetchSprayWallPageData).toHaveBeenCalledWith(WALL_UUID);
     // The public copy, never the presigned one: this page is shared and cached.
     expect(resolveSprayPhotoUrl).toHaveBeenCalledWith(WALL_DATA, true);
+    // The generated look is asked for the version the page draws.
+    expect(fetchSprayWallArtChoice).toHaveBeenCalledWith(WALL_UUID, WALL_DATA.versionNumber);
   });
 
   it('404s a wall the backend will not hand over', async () => {

@@ -1,3 +1,6 @@
+import { AccessibleTextInput as TextInput } from '../AccessibleTextInput';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { PressableSurface } from '../PressableSurface';
 // The fields every board has, whatever kind of board it is (epic #5346, SW-09).
 //
 // Extracted from `BoardForm.tsx` rather than copied, because a spray wall needs
@@ -16,23 +19,29 @@
 // builder they touch, so `useBoardBuilder` and `useSprayWallBuilder` both satisfy
 // them structurally without either importing the other.
 
-import { useCallback, useEffect, type ComponentProps } from 'react';
-import { Pressable, StyleSheet, TextInput } from 'react-native';
+import { useCallback, useEffect, useMemo, type ComponentProps } from 'react';
+import { Platform, StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
+import { OwnPublicGymWarning } from './OwnPublicGymWarning';
 import { useTheme } from '../../providers/theme-provider';
-import { useDeviceLocation } from '../../lib/use-device-location';
+import { useDeviceLocation, type LocationStatus } from '../../lib/use-device-location';
+import { canOpenAppSettings, openAppSettings } from '../../lib/open-app-settings';
+import { announceQueued } from '../../lib/announce-queued';
 import { SwitchRow } from '../SwitchRow';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { Button } from '../Button';
-import type { PickedGym } from './GymPickerSheet';
+import { SegmentedControl } from '../SegmentedControl';
+import { sprayWallVisibility, type SprayWallVisibility } from '../../lib/spray/spray-share';
+import { sprayVisibilityHint } from '../spray-wall/spray-details-model';
+import type { PickedGym } from '../../lib/boards/gym-pick-handoff';
 import { spacing, borderRadius } from '../../theme/tokens';
 
 /**
  * A gym as the picker hands it back and both builders hold it.
  *
  * Re-exported rather than re-declared: the builders' `setSelectedGym` has to
- * accept exactly what `GymPickerSheet.onSelect` produces, and a second
+ * accept exactly what the gym picker hands back (`GymPick`), and a second
  * structurally-identical declaration is a type that drifts the first time the
  * picker learns a new field.
  */
@@ -57,10 +66,13 @@ export type BoardVisibilityBuilder = {
   setLocationName: (next: string) => void;
   coords: { latitude: number; longitude: number } | null;
   setCoords: (next: { latitude: number; longitude: number } | null) => void;
+  /** The board's gym, for the location hint and the own-public-gym warning. */
+  selectedGym?: { uuid: string } | null;
 };
 
 /** Uppercase caption above a field group. Exported so both forms label alike. */
 export function SectionLabel({ children }: { children: string }) {
+  const styles = useTypographyStyles(createStyles);
   const { systemColors } = useTheme();
   return (
     <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.sectionLabel}>
@@ -71,6 +83,7 @@ export function SectionLabel({ children }: { children: string }) {
 
 /** Themed text input for a builder's form fields (name / location / serial). */
 export function BuilderTextInput({ style, ...props }: ComponentProps<typeof TextInput>) {
+  const styles = useTypographyStyles(createStyles);
   const { systemColors } = useTheme();
   return (
     <TextInput
@@ -101,21 +114,24 @@ export function BoardIdentityFields({
   builder,
   namePlaceholder,
   onOpenGymPicker,
+  gymLocked = false,
+  gymLockedHint,
 }: {
   builder: BoardIdentityBuilder;
   /** Shown while the name is blank — usually the auto-generated default. */
   namePlaceholder: string;
   /**
-   * Open the gym picker.
-   *
-   * The SHEET itself is the host's, deliberately: it has to be a sibling of the
-   * host's ScrollView, not a descendant of it, or it inherits the scroller's
-   * clipping and its pan. This component only draws the row that asks for it.
+   * Open the gym picker: the host pushes `/boards/gym-picker` and takes the
+   * answer back (`useGymPickerRoute`). This component only draws the row that
+   * asks for it.
    */
   onOpenGymPicker: () => void;
+  /** The gym was picked earlier in the add-a-board wizard: shown, not changeable here. */
+  gymLocked?: boolean;
+  /** What a screen reader says about the locked gym: where it was picked, and how to pick another. */
+  gymLockedHint?: string;
 }) {
   const { t } = useTranslation('boards');
-  const { systemColors } = useTheme();
 
   return (
     <>
@@ -126,11 +142,75 @@ export function BoardIdentityFields({
         placeholder={namePlaceholder}
         accessibilityLabel={t('mobile.custom.name')}
         maxLength={100}
+        // A board name is a proper noun ("Garage", "The Cave"); autocorrect
+        // rewrote it and spell-check underlined it in red (#5960).
+        autoCorrect={false}
+        spellCheck={false}
         returnKeyType="done"
       />
 
+      <BoardGymField
+        selectedGym={builder.selectedGym}
+        onOpenGymPicker={onOpenGymPicker}
+        locked={gymLocked && builder.selectedGym !== null}
+        lockedHint={gymLockedHint}
+      />
+    </>
+  );
+}
+
+/**
+ * The gym row on its own, labelled: `BoardIdentityFields` draws it under the
+ * name, and the add-a-wall wizard's details step puts it under "More".
+ */
+export function BoardGymField({
+  selectedGym,
+  onOpenGymPicker,
+  locked = false,
+  lockedHint,
+}: {
+  selectedGym: { name: string } | null;
+  /** Open the gym picker. The host pushes it, as for `BoardIdentityFields`. */
+  onOpenGymPicker: () => void;
+  /**
+   * The gym the add-a-board wizard's earlier step picked: the row names it with
+   * a lock and opens nothing. Going back a step is how to pick another.
+   */
+  locked?: boolean;
+  /** Overrides the locked row's spoken hint (a gym page's entry has no step to go back to). */
+  lockedHint?: string;
+}) {
+  const styles = useTypographyStyles(createStyles);
+  const { t } = useTranslation('boards');
+  const { systemColors } = useTheme();
+
+  if (locked && selectedGym) {
+    return (
+      <>
+        <SectionLabel>{t('mobile.create.gym')}</SectionLabel>
+        <View
+          accessible
+          accessibilityLabel={`${t('mobile.create.gym')}, ${selectedGym.name}`}
+          accessibilityHint={lockedHint ?? t('mobile.addWizard.gymLockedHint')}
+          style={[
+            styles.gymRow,
+            { backgroundColor: systemColors.secondaryBackground, borderColor: systemColors.separator },
+          ]}
+          testID="board-gym-locked"
+        >
+          <Text variant="body" color={systemColors.label} numberOfLines={1} style={styles.gymRowLabel}>
+            {selectedGym.name}
+          </Text>
+          <Icon name="lock" size={16} color={systemColors.tertiaryLabel} />
+        </View>
+      </>
+    );
+  }
+
+  return (
+    <>
       <SectionLabel>{t('mobile.create.gym')}</SectionLabel>
-      <Pressable
+      <PressableSurface
         onPress={onOpenGymPicker}
         accessibilityRole="button"
         accessibilityLabel={t('mobile.create.gym')}
@@ -144,16 +224,133 @@ export function BoardIdentityFields({
       >
         <Text
           variant="body"
-          color={builder.selectedGym ? systemColors.label : systemColors.secondaryLabel}
+          color={selectedGym ? systemColors.label : systemColors.secondaryLabel}
           numberOfLines={1}
           style={styles.gymRowLabel}
         >
-          {builder.selectedGym?.name ?? t('mobile.create.gymNone')}
+          {selectedGym?.name ?? t('mobile.create.gymNone')}
         </Text>
         <Icon name="chevron.right" size={16} color={systemColors.tertiaryLabel} />
-      </Pressable>
+      </PressableSurface>
     </>
   );
+}
+
+/**
+ * Who can see a spray wall, as one three-way control with a hint for each
+ * answer.
+ *
+ * A wall's visibility is two flags on the board row, but two switches for them
+ * made "Public AND Unlisted" reachable, a state nobody means to pick, and the
+ * Unlisted switch had no hint at all (#5960). Edit board and the add-a-wall
+ * wizard both draw this, so the two never disagree. Writing the pair
+ * exclusively keeps the round trip honest: public wins on read.
+ */
+export function SprayWallVisibilityField({
+  builder,
+}: {
+  builder: Pick<BoardVisibilityBuilder, 'isPublic' | 'setIsPublic' | 'isUnlisted' | 'setIsUnlisted'>;
+}) {
+  const styles = useTypographyStyles(createStyles);
+  const { t } = useTranslation('boards');
+  const { systemColors } = useTheme();
+  const visibility = sprayWallVisibility(builder);
+  const { setIsPublic, setIsUnlisted } = builder;
+  const onSelect = useCallback(
+    (next: SprayWallVisibility) => {
+      setIsPublic(next === 'public');
+      setIsUnlisted(next === 'unlisted');
+    },
+    [setIsPublic, setIsUnlisted],
+  );
+  const options = useMemo(
+    () => [
+      { key: 'private' as const, label: t('mobile.sprayVisibility.private') },
+      { key: 'unlisted' as const, label: t('mobile.sprayVisibility.unlisted') },
+      { key: 'public' as const, label: t('mobile.sprayVisibility.public') },
+    ],
+    [t],
+  );
+
+  return (
+    <>
+      <SectionLabel>{t('mobile.sprayVisibility.label')}</SectionLabel>
+      <SegmentedControl<SprayWallVisibility>
+        options={options}
+        selectedKey={visibility}
+        onSelect={onSelect}
+        accessibilityLabel={t('mobile.sprayVisibility.label')}
+      />
+      <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.visibilityHint}>
+        {sprayVisibilityHint(visibility, t)}
+      </Text>
+    </>
+  );
+}
+
+/**
+ * The owner's "Help train hold finding" switch (SW-20, #5471), drawn beside the
+ * control that says who sees the wall because it is the other answer to "who
+ * sees my photo": under the three-way visibility control, or directly above the
+ * audience control where the privacy rollout has replaced it (`BoardForm`).
+ * Owner only: each caller decides that and leaves this out otherwise.
+ *
+ * Controlled, with the error slot inline: the edit screen is a modal route and a
+ * toast would draw behind it (`toast-provider.tsx`).
+ */
+export function SprayTrainingConsentField({
+  value,
+  onValueChange,
+  disabled = false,
+  errorMessage = null,
+}: {
+  value: boolean;
+  onValueChange: (next: boolean) => void;
+  disabled?: boolean;
+  errorMessage?: string | null;
+}) {
+  const styles = useTypographyStyles(createStyles);
+  const { t } = useTranslation('boards');
+  const { systemColors } = useTheme();
+  // `accessibilityLiveRegion` below is Android-only, so VoiceOver is told, and
+  // only VoiceOver: TalkBack reads the live region and would hear it twice (the
+  // toast provider's rule). Keyed on the message, which the caller clears when
+  // the next flip starts, so a second refusal in the same words is said again.
+  useEffect(() => {
+    if (errorMessage && Platform.OS === 'ios') announceQueued(errorMessage);
+  }, [errorMessage]);
+  return (
+    <>
+      <SwitchRow
+        label={t('mobile.sprayTraining.label')}
+        description={t('mobile.sprayTraining.description')}
+        wrapDescription
+        value={value}
+        onValueChange={onValueChange}
+        disabled={disabled}
+      />
+      {errorMessage ? (
+        <Text
+          variant="footnote"
+          color={systemColors.error}
+          style={styles.visibilityHint}
+          accessibilityRole="alert"
+          accessibilityLiveRegion="polite"
+        >
+          {errorMessage}
+        </Text>
+      ) : null}
+    </>
+  );
+}
+
+/**
+ * What to say under "Use my location" after the tap. A denial or a failed fix
+ * used to leave the button looking exactly as it did before (#5960).
+ */
+export function locationRequestFeedback(status: LocationStatus): 'denied' | 'unavailable' | null {
+  if (status === 'denied' || status === 'unavailable') return status;
+  return null;
 }
 
 /**
@@ -165,29 +362,30 @@ export function BoardIdentityFields({
  */
 export function BoardVisibilityFields({
   builder,
-  publicHint,
   hideVisibilitySwitches = false,
 }: {
   builder: BoardVisibilityBuilder;
-  /** Overrides the default "public" caption — a wall is private by default and says so. */
-  publicHint?: string;
   /**
    * Drop the public / unlisted switches, leaving only the location rows.
    *
    * For a caller that expresses the same three states through one control: two
    * independent booleans make "unlisted AND public" reachable, which is a state
    * nobody means to pick, and two controls for it can disagree with each other.
-   * `BoardForm` uses this on a spray wall, where a segmented control sits up in
-   * the main form beside the name and the gym.
+   * Both spray callers use this and draw `SprayWallVisibilityField` instead.
    */
   hideVisibilitySwitches?: boolean;
 }) {
   const { t } = useTranslation('boards');
   const { setCoords } = builder;
-  const location = useDeviceLocation();
+  const { systemColors } = useTheme();
+  // Re-asks after a denial: the row offers Open Settings, and a climber who
+  // comes back having allowed location gets it from one more tap.
+  const location = useDeviceLocation({ retryAfterDenial: true });
   const requestLocation = location.request;
+  const locationFeedback = locationRequestFeedback(location.status);
   const onUseMyLocation = useCallback(() => void requestLocation(), [requestLocation]);
   const onClearLocation = useCallback(() => setCoords(null), [setCoords]);
+  const onOpenSettings = useCallback(() => void openAppSettings(), []);
 
   useEffect(() => {
     if (location.coords) setCoords(location.coords);
@@ -199,7 +397,7 @@ export function BoardVisibilityFields({
         <>
           <SwitchRow
             label={t('mobile.create.public')}
-            description={publicHint ?? t('mobile.create.publicHint')}
+            description={t('mobile.create.publicHint')}
             value={builder.isPublic}
             onValueChange={builder.setIsPublic}
           />
@@ -210,11 +408,15 @@ export function BoardVisibilityFields({
           />
         </>
       )}
+      {/* The switch always governs the board's own place. A viewer it is hidden
+          from still sees a public gym's listed location, which the hint says. */}
       <SwitchRow
         label={t('mobile.create.hideLocation')}
+        description={builder.selectedGym ? t('mobile.create.gymLocationHint') : undefined}
         value={builder.hideLocation}
         onValueChange={builder.setHideLocation}
       />
+      <OwnPublicGymWarning gymUuid={builder.selectedGym?.uuid} />
 
       <SectionLabel>{t('mobile.create.location')}</SectionLabel>
       <BuilderTextInput
@@ -229,35 +431,57 @@ export function BoardVisibilityFields({
       {builder.coords ? (
         <Button title={t('mobile.create.clearLocation')} variant="text" onPress={onClearLocation} role="destructive" />
       ) : (
-        <Button title={t('mobile.create.useMyLocation')} variant="text" onPress={onUseMyLocation} />
+        <Button
+          title={t('mobile.create.useMyLocation')}
+          variant="text"
+          onPress={onUseMyLocation}
+          loading={location.status === 'loading'}
+        />
       )}
+      {!builder.coords && locationFeedback ? (
+        <>
+          <Text variant="footnote" color={systemColors.secondaryLabel} accessibilityLiveRegion="polite">
+            {locationFeedback === 'denied'
+              ? t('mobile.create.locationDeniedHint')
+              : t('mobile.create.locationUnavailableHint')}
+          </Text>
+          {locationFeedback === 'denied' && canOpenAppSettings() ? (
+            <Button title={t('mobile.firstBoard.openSettings')} variant="text" onPress={onOpenSettings} />
+          ) : null}
+        </>
+      ) : null}
     </>
   );
 }
 
-const styles = StyleSheet.create({
-  sectionLabel: {
-    marginTop: spacing[3],
-    marginBottom: spacing[1],
-    textTransform: 'uppercase',
-  },
-  input: {
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    borderRadius: borderRadius.lg,
-    borderWidth: StyleSheet.hairlineWidth,
-    fontSize: 17,
-  },
-  gymRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    borderRadius: borderRadius.md,
-    borderWidth: StyleSheet.hairlineWidth,
-  },
-  gymRowLabel: {
-    flex: 1,
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    sectionLabel: {
+      marginTop: spacing[3],
+      marginBottom: spacing[1],
+      textTransform: 'uppercase',
+    },
+    input: {
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      borderRadius: borderRadius.lg,
+      borderWidth: StyleSheet.hairlineWidth,
+      fontSize: textStyles.body.fontSize,
+    },
+    gymRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing[2],
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      borderRadius: borderRadius.md,
+      borderWidth: StyleSheet.hairlineWidth,
+    },
+    gymRowLabel: {
+      flex: 1,
+    },
+    visibilityHint: {
+      marginTop: spacing[2],
+      lineHeight: 18,
+    },
+  });

@@ -4,36 +4,15 @@ import React from 'react';
 import Box from '@mui/material/Box';
 import Typography from '@mui/material/Typography';
 import { useTranslation } from 'react-i18next';
-import { helpClip, type HelpClipName } from '@/app/lib/help-clips';
-import frame from '@/app/components/marketing/marketing-screenshot.module.css';
+import { useAutoplayVideo } from '@/app/hooks/use-autoplay-video';
+import { helpClip, helpWalkthrough, type HelpClipName, type HelpWalkthroughName } from '@/app/lib/help-clips';
+import shot from './help-screenshot.module.css';
 import styles from './help-clip.module.css';
-
-/**
- * Whether the reader has asked their system for less motion.
- *
- * `null` until the client has looked, which is the state the server renders:
- * neither autoplay nor controls, just the poster in its frame. Resolving it on
- * the server is impossible and guessing it wrong is the expensive direction —
- * a looping video that starts itself is exactly what the setting exists to stop.
- */
-function usePrefersReducedMotion(): boolean | null {
-  const [prefersReducedMotion, setPrefersReducedMotion] = React.useState<boolean | null>(null);
-
-  React.useEffect(() => {
-    const query = window.matchMedia('(prefers-reduced-motion: reduce)');
-    const read = () => setPrefersReducedMotion(query.matches);
-    read();
-    query.addEventListener('change', read);
-    return () => query.removeEventListener('change', read);
-  }, []);
-
-  return prefersReducedMotion;
-}
 
 /**
  * A short silent screen recording with its caption.
  *
- * Same frame, measure and caption as `HelpScreenshot`, because the two land in
+ * Same bezel, measure and caption as `HelpScreenshot`, because the two land in
  * the same rows: a clip is only used where the thing being taught is a gesture
  * — a long press, a swipe, a drag — that a still cannot hold.
  *
@@ -43,53 +22,14 @@ function usePrefersReducedMotion(): boolean | null {
 export function HelpClip({ name, alt, caption }: { name: HelpClipName; alt: string; caption: string }) {
   const { t } = useTranslation('marketing');
   const clip = helpClip(name);
-  const videoRef = React.useRef<HTMLVideoElement>(null);
-  const prefersReducedMotion = usePrefersReducedMotion();
-  const [autoplayRefused, setAutoplayRefused] = React.useState(false);
-  const [inView, setInView] = React.useState(false);
-
-  // A guide page carries three or four clips. Playing them all on mount would
-  // download and decode every loop at once, most of them below the fold, and
-  // defeat preload="metadata". Each clip plays only while it is near the
-  // viewport and pauses when it scrolls away.
-  React.useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (typeof IntersectionObserver === 'undefined') {
-      setInView(true);
-      return;
-    }
-    const observer = new IntersectionObserver(
-      (entries) => {
-        for (const entry of entries) setInView(entry.isIntersecting);
-      },
-      { rootMargin: '200px 0px' },
-    );
-    observer.observe(video);
-    return () => observer.disconnect();
-  }, []);
-
-  React.useEffect(() => {
-    const video = videoRef.current;
-    if (!video || prefersReducedMotion === null) return;
-    if (prefersReducedMotion || !inView) {
-      video.pause();
-      return;
-    }
-    // Autoplay can still be refused — a battery-saver tab, a browser that wants
-    // a gesture first. The controls the catch reveals are the same fallback the
-    // reduced-motion reader gets, so the clip is never a dead rectangle.
-    void video.play().catch(() => setAutoplayRefused(true));
-  }, [prefersReducedMotion, inView]);
-
-  const showsControls = prefersReducedMotion === true || autoplayRefused;
+  const { videoRef, showsControls } = useAutoplayVideo();
 
   return (
     <Box component="figure" className={styles.figure}>
-      <Box className={frame.frame}>
+      <Box className={shot.bezel}>
         <video
           ref={videoRef}
-          className={styles.video}
+          className={`${shot.screen} ${styles.video}`}
           poster={clip.poster}
           width={clip.width}
           height={clip.height}
@@ -115,6 +55,51 @@ export function HelpClip({ name, alt, caption }: { name: HelpClipName; alt: stri
           {t('help.clip.playHint')}
         </Typography>
       ) : null}
+    </Box>
+  );
+}
+
+/** A longer walkthrough shows a poster and controls without autoplay or looping. */
+export function HelpWalkthrough({ name, alt }: { name: HelpWalkthroughName; alt: string }) {
+  const { t } = useTranslation('marketing');
+  const { portrait, landscape } = helpWalkthrough(name);
+
+  return (
+    <Box component="figure" className={`${styles.figure} ${styles.walkthroughFigure}`}>
+      <Box className={`${shot.bezel} ${styles.landscapeFrame}`}>
+        <video
+          className={`${shot.screen} ${styles.video} ${styles.landscapeVideo}`}
+          poster={landscape.poster}
+          width={landscape.width}
+          height={landscape.height}
+          aria-label={alt}
+          muted
+          playsInline
+          preload="none"
+          controls
+        >
+          <source src={landscape.mp4} type="video/mp4" />
+          <source src={landscape.webm} type="video/webm" />
+          {t('help.clip.unsupported')}
+        </video>
+      </Box>
+      <Box className={`${shot.bezel} ${styles.portraitFrame}`}>
+        <video
+          className={`${shot.screen} ${styles.video} ${styles.portraitVideo}`}
+          poster={portrait.poster}
+          width={portrait.width}
+          height={portrait.height}
+          aria-label={alt}
+          muted
+          playsInline
+          preload="none"
+          controls
+        >
+          <source src={portrait.mp4} type="video/mp4" />
+          <source src={portrait.webm} type="video/webm" />
+          {t('help.clip.unsupported')}
+        </video>
+      </Box>
     </Box>
   );
 }

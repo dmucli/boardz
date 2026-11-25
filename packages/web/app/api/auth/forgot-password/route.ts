@@ -4,9 +4,19 @@ import { eq } from 'drizzle-orm';
 import { z } from 'zod';
 import { getDb } from '@/app/lib/db/db';
 import * as schema from '@/app/lib/db/schema';
+import { soleAccount } from '@boardsesh/auth-protocol/account-email';
+import { findAccountsByEmail, lockAccountEmailSnapshot } from '@boardsesh/db/queries/account-email';
 import { sendPasswordResetEmail } from '@boardsesh/email';
 import { checkRateLimit, getClientIp } from '@/app/lib/auth/rate-limiter';
 import { getPasswordResetIdentifier, hashResetToken, consistentDelay } from '@/app/lib/auth/password-reset';
+import { AuthBackendUnavailableError, webPasswordMode } from '@/app/lib/auth/password-command-client.server';
+import {
+  forgotPasswordWithCommand,
+  passwordRecoveryUnavailableResponse,
+} from '@/app/lib/auth/password-recovery-command.server';
+import { withEmailVerificationPrivacy } from '@/app/lib/auth/email-verification-response.server';
+import { stagedPasswordClientKey } from '@/app/lib/auth/trusted-client-ip.server';
+import { LEGACY_PASSWORD_RESET_LIFETIME_MS } from '@/app/lib/auth/legacy-link-account';
 
 const forgotPasswordSchema = z.object({
   email: z.string().email('Invalid email address'),
@@ -15,11 +25,17 @@ const forgotPasswordSchema = z.object({
 const MIN_RESPONSE_TIME_MS = 1500;
 
 export async function POST(request: NextRequest) {
+  return withEmailVerificationPrivacy(await handleForgotPassword(request));
+}
+
+async function handleForgotPassword(request: NextRequest) {
   const startTime = Date.now();
   const genericMessage = 'If an account exists for this email, a reset link will be sent.';
+  let staged = false;
 
   try {
-    const clientIp = getClientIp(request);
+    // The staged budget is shared by every caller, so its key must not be forgeable.
+    const clientIp = stagedPasswordClientKey(request) ?? getClientIp(request);
     // NOTE: checkRateLimit is in-memory and not shared across serverless instances.
     // This provides best-effort protection only. Add Redis/Upstash rate limiting
     // before relying on this as a production security control.
@@ -38,7 +54,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const body = await request.json();
+    staged = webPasswordMode() === 'backend-staging';
+    const body: unknown = await request.json();
+    if (staged) {
+      const response = await forgotPasswordWithCommand(request, body);
+      await consistentDelay(startTime, MIN_RESPONSE_TIME_MS);
+      return response;
+    }
     const validationResult = forgotPasswordSchema.safeParse(body);
 
     if (!validationResult.success) {
@@ -46,37 +68,28 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: validationResult.error.issues[0].message }, { status: 400 });
     }
 
-    const { email } = validationResult.data;
     const db = getDb();
 
-    const user = await db
-      .select({ id: schema.users.id })
-      .from(schema.users)
-      .where(eq(schema.users.email, email))
-      .limit(1);
+    // Any capitalisation reaches the account, but only one account: an address
+    // several accounts share is answered like an unknown one.
+    const account = soleAccount(await findAccountsByEmail(db, validationResult.data.email));
 
-    if (user.length === 0) {
+    // OAuth-only accounts have no password to reset.
+    if (!account || account.passwordHash === null) {
       await consistentDelay(startTime, MIN_RESPONSE_TIME_MS);
       return NextResponse.json({ message: genericMessage }, { status: 200 });
     }
 
-    const hasCredentials = await db
-      .select({ userId: schema.userCredentials.userId })
-      .from(schema.userCredentials)
-      .where(eq(schema.userCredentials.userId, user[0].id))
-      .limit(1);
-
-    if (hasCredentials.length === 0) {
-      await consistentDelay(startTime, MIN_RESPONSE_TIME_MS);
-      return NextResponse.json({ message: genericMessage }, { status: 200 });
-    }
-
+    // The link and its token carry the address as stored, so reset-password
+    // finds this same row by exact match.
+    const { email } = account;
     const token = crypto.randomUUID();
     const tokenHash = hashResetToken(token);
-    const expires = new Date(Date.now() + 60 * 60 * 1000);
+    const expires = new Date(Date.now() + LEGACY_PASSWORD_RESET_LIFETIME_MS);
     const identifier = getPasswordResetIdentifier(email);
 
-    await db.transaction(async (tx) => {
+    const issued = await db.transaction(async (tx) => {
+      if (!(await lockAccountEmailSnapshot(tx, account))) return false;
       await tx.delete(schema.verificationTokens).where(eq(schema.verificationTokens.identifier, identifier));
 
       // Store the hash, not the raw token — raw token is only in the email link.
@@ -85,7 +98,12 @@ export async function POST(request: NextRequest) {
         token: tokenHash,
         expires,
       });
+      return true;
     });
+    if (!issued) {
+      await consistentDelay(startTime, MIN_RESPONSE_TIME_MS);
+      return NextResponse.json({ message: genericMessage }, { status: 200 });
+    }
 
     // `?.trim() ||`, not `??`: Dockerfile.web's runner stage declares
     // `ENV BASE_URL=$BASE_URL`, which is the EMPTY STRING in an image built
@@ -99,12 +117,12 @@ export async function POST(request: NextRequest) {
     // ("account exists but email failed" vs "no account").
     try {
       await sendPasswordResetEmail(email, token, baseUrl);
-    } catch (emailError) {
+    } catch {
       // Swallow so the response stays generic (no user enumeration), but surface
       // the failure to Sentry — a misconfigured SMTP credential would otherwise
       // fail silently for every user with no signal in observability tooling.
-      console.error('Failed to send password reset email:', emailError);
-      Sentry.captureException(emailError, {
+      console.error('Password recovery email delivery failed');
+      Sentry.captureException(new Error('Password recovery email delivery failed'), {
         tags: { area: 'auth', flow: 'forgot-password', phase: 'send-email' },
       });
     }
@@ -112,7 +130,11 @@ export async function POST(request: NextRequest) {
     await consistentDelay(startTime, MIN_RESPONSE_TIME_MS);
     return NextResponse.json({ message: genericMessage }, { status: 200 });
   } catch (error) {
-    console.error('Forgot password error:', error);
+    if (staged || error instanceof AuthBackendUnavailableError) {
+      await consistentDelay(startTime, MIN_RESPONSE_TIME_MS);
+      return passwordRecoveryUnavailableResponse();
+    }
+    console.error('Forgot password request failed');
     await consistentDelay(startTime, MIN_RESPONSE_TIME_MS);
     return NextResponse.json({ error: 'Failed to process password reset request' }, { status: 500 });
   }

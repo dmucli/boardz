@@ -1,9 +1,10 @@
+import { usePrivacySettings } from '../../src/lib/graphql/hooks/use-privacy';
 import { useCallback, useMemo, useRef, useState } from 'react';
 import { Alert, View, StyleSheet } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { useTranslation } from 'react-i18next';
 import { toBoardName } from '@boardsesh/board-config';
-import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { SHARED_EVENTS, sprayWallResetStarted } from '@boardsesh/analytics';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import {
   useBoard,
@@ -16,6 +17,7 @@ import { useActiveBoard, useSetActiveBoard } from '../../src/lib/graphql/use-act
 import {
   extractGraphqlMessage,
   isBoardLimitError,
+  isBoardRemovedByGymError,
   isDuplicateBoardError,
   isSprayWallVisibilityOwnerOnlyError,
   readDuplicateBoardError,
@@ -32,8 +34,22 @@ import { Icon } from '../../src/components/Icon';
 import { Button } from '../../src/components/Button';
 import { ActivityIndicator } from '../../src/components/ActivityIndicator';
 import { useTheme } from '../../src/providers/theme-provider';
-import { iosSystemColors } from '../../src/theme/ios-colors';
 import { spacing } from '../../src/theme/tokens';
+import { sprayResetWizardHref } from '../../src/lib/spray/spray-routes';
+import { confirmSprayWallReset } from '../../src/lib/spray/confirm-spray-wall-reset';
+import { trackSprayEvent } from '../../src/lib/spray/spray-telemetry';
+import { useSprayWallIsArchived } from '../../src/lib/spray/use-spray-wall-archive';
+import { useViewerUserId } from '../../src/hooks/use-viewer-user-id';
+import { viewerOwnsSprayWall } from '../../src/components/board-discovery/spray-detail-rows';
+import { SprayWallBackgroundPicker } from '../../src/components/spray-wall/SprayWallBackgroundPicker';
+import { SprayWallTrainingConsentRow } from '../../src/components/spray-wall/SprayWallTrainingConsentRow';
+import { SprayWallLedSection } from '../../src/components/spray-wall/SprayWallLedSection';
+import { useSprayWallBackgroundEditor } from '../../src/components/spray-wall/use-spray-wall-background-editor';
+import { sprayArtRefusalMessageKey } from '../../src/components/spray-wall/spray-background-gate';
+import { WhoCanEditBoard } from '../../src/components/report-problem/WhoCanEdit';
+import { waitingReports } from '../../src/components/report-problem/report-review-model';
+import { useBoardReports } from '../../src/lib/graphql/hooks/use-directory-reports';
+import { useToast } from '../../src/providers/toast-provider';
 
 export default function EditBoard() {
   const router = useRouter();
@@ -57,7 +73,7 @@ export default function EditBoard() {
   if (!board || !boardName) {
     return (
       <View style={[styles.centered, { backgroundColor: systemColors.background }]}>
-        <Icon name="error" size={40} color={iosSystemColors.systemGray} />
+        <Icon name="error" size={40} color={systemColors.secondaryLabel} />
         <Text variant="headline" style={styles.stateTitle}>
           {t('mobile.edit.notFound')}
         </Text>
@@ -73,20 +89,12 @@ export default function EditBoard() {
 
   // The edit affordance is only shown when the viewer can edit, but a direct
   // deep-link can still land here. The server rejects the save regardless, so
-  // show a clear "no access" state instead of a form that can only fail.
+  // say who can change this board and what the climber can do instead: report
+  // a problem, claim the gym, or go back.
   if (!board.canEdit) {
     return (
-      <View style={[styles.centered, { backgroundColor: systemColors.background }]}>
-        <Icon name="lock" size={40} color={iosSystemColors.systemGray} />
-        <Text variant="headline" style={styles.stateTitle}>
-          {t('mobile.edit.noAccess')}
-        </Text>
-        <Button
-          title={t('mobile.edit.back')}
-          variant="outlined"
-          onPress={() => router.back()}
-          style={styles.stateButton}
-        />
+      <View style={[styles.flex, { backgroundColor: systemColors.background }]}>
+        <WhoCanEditBoard board={board} onBack={() => router.back()} />
       </View>
     );
   }
@@ -97,7 +105,16 @@ export default function EditBoard() {
 }
 
 function EditBoardForm({ board }: { board: UserBoard }) {
+  const { data: privacySettings } = usePrivacySettings();
   const router = useRouter();
+  // Opened from a report's "Fix the setup": a save that changes the setup
+  // closes the report server-side, so the toast says the reporters hear.
+  const { fromReport } = useLocalSearchParams<{ fromReport?: string }>();
+  const { showToast } = useToast();
+  // The reports waiting before the save, to tell afterwards whether the save
+  // closed any: the server only closes `wrong_setup` reports, and only when a
+  // setup field changed.
+  const { data: reportsBeforeSave, refetch: refetchReports } = useBoardReports(board.uuid, fromReport === '1');
   const { isAuthenticated } = useAuth();
   const { t } = useTranslation('boards');
 
@@ -133,6 +150,46 @@ function EditBoardForm({ board }: { board: UserBoard }) {
   // is what decides where visibility is saved.
   const isSprayWall = toBoardName(board.boardType) === 'spray';
 
+  // What the wall is drawn on: its photo, or a generated look. Anyone who may
+  // edit the wall may change it (the same gate as its look).
+  const backgroundEditor = useSprayWallBackgroundEditor({
+    wallUuid: board.uuid,
+    layoutId: board.layoutId,
+    enabled: isSprayWall,
+  });
+  const saveBackground = backgroundEditor.save;
+  const backgroundChanged = backgroundEditor.changed;
+
+  // "Reset wall with a new photo" for a photo too skewed to draw a look from.
+  // It is a reset like every other: the owner's alone (the server refuses
+  // anyone else), never on an archived wall, and behind the same confirm as the
+  // board sheet's. The owner is the profile's id, falling back to the one the
+  // signed token carries, as the sheet reads it.
+  const viewerUserId = useViewerUserId();
+  const wallArchived = useSprayWallIsArchived(board.boardType, board.layoutId);
+  const viewerOwnsWall = isSprayWall && viewerOwnsSprayWall(board, viewerUserId);
+  const canResetWall = viewerOwnsWall && !wallArchived;
+  const resetPendingRef = useRef(false);
+  const openRetake = useCallback(() => {
+    if (resetPendingRef.current) return;
+    resetPendingRef.current = true;
+    void (async () => {
+      try {
+        const confirmed = await confirmSprayWallReset({
+          title: t('sprayResetConfirm.title'),
+          body: t('sprayResetConfirm.body'),
+          start: t('sprayResetConfirm.start'),
+          cancel: t('sprayResetConfirm.cancel'),
+        });
+        if (!confirmed) return;
+        trackSprayEvent(sprayWallResetStarted('board_edit'));
+        router.push(sprayResetWizardHref(board.uuid));
+      } finally {
+        resetPendingRef.current = false;
+      }
+    })();
+  }, [router, board.uuid, t]);
+
   const seed = useMemo<BoardBuilderSeed>(() => {
     const seedBoardName = toBoardName(board.boardType)!;
     return {
@@ -148,6 +205,7 @@ function EditBoardForm({ board }: { board: UserBoard }) {
       hideLocation: board.hideLocation,
       isAngleAdjustable: board.isAngleAdjustable,
       hasLeds: board.hasLeds,
+      litByWallDevice: board.litByWallDevice,
       locationName: board.locationName ?? undefined,
       latitude: board.latitude ?? undefined,
       longitude: board.longitude ?? undefined,
@@ -167,12 +225,14 @@ function EditBoardForm({ board }: { board: UserBoard }) {
   const defaultName = useMemo(
     () =>
       formatDefaultBoardName({
-        userName: profile?.displayName,
+        // The board OWNER's name: an admin or gym staff member editing
+        // somebody's board must not rename it after themselves (#5960).
+        userName: board.ownerDisplayName ?? profile?.displayName,
         boardName: builder.boardName,
         layoutName: builder.rawLayoutName,
         size: selectedSize,
       }),
-    [profile?.displayName, builder.boardName, builder.rawLayoutName, selectedSize],
+    [board.ownerDisplayName, profile?.displayName, builder.boardName, builder.rawLayoutName, selectedSize],
   );
 
   const [submitting, setSubmitting] = useState(false);
@@ -203,8 +263,12 @@ function EditBoardForm({ board }: { board: UserBoard }) {
       // guard would fire on a save that changed nothing but the name.
       const nextIsPublic = builder.isPublic;
       const nextIsUnlisted = builder.isUnlisted;
-      const visibilityChanged = isSprayWall && (nextIsPublic !== board.isPublic || nextIsUnlisted !== board.isUnlisted);
-      if (isSprayWall) {
+      const visibilityChanged =
+        !privacySettings?.enabled &&
+        isSprayWall &&
+        (nextIsPublic !== board.isPublic || nextIsUnlisted !== board.isUnlisted);
+      if (privacySettings?.enabled) delete input.hideLocation;
+      if (isSprayWall || privacySettings?.enabled) {
         delete input.isPublic;
         delete input.isUnlisted;
       }
@@ -225,17 +289,30 @@ function EditBoardForm({ board }: { board: UserBoard }) {
         let visibilityApplied = false;
         if (visibilityChanged) {
           try {
-            await updateSprayWall.mutateAsync({
-              uuid: board.uuid,
-              isPublic: nextIsPublic,
-              isUnlisted: nextIsUnlisted,
-            });
+            await updateSprayWall.mutateAsync({ uuid: board.uuid, isPublic: nextIsPublic, isUnlisted: nextIsUnlisted });
             visibilityApplied = true;
           } catch (error) {
-            visibilityError = isSprayWallVisibilityOwnerOnlyError(error)
-              ? t('mobile.sprayVisibility.ownerOnlyError')
-              : (extractGraphqlMessage(error) ?? t('mobile.sprayVisibility.updateError'));
+            if (isSprayWallVisibilityOwnerOnlyError(error)) {
+              visibilityError = t('mobile.sprayVisibility.ownerOnlyError');
+            } else {
+              visibilityError = extractGraphqlMessage(error) ?? t('mobile.sprayVisibility.updateError');
+            }
           }
+        }
+
+        // The background is part of the wall's look, its own mutation again.
+        // Saved whatever happened to visibility above, and its refusal is said
+        // beside that one rather than swallowed by it.
+        if (isSprayWall && backgroundChanged) {
+          const saved = await saveBackground();
+          const backgroundError =
+            saved.outcome === 'refused'
+              ? t(`sprayBackground.${sprayArtRefusalMessageKey(saved.reason)}`)
+              : saved.outcome === 'failed'
+                ? t('sprayBackground.saveFailed')
+                : null;
+          if (backgroundError)
+            visibilityError = visibilityError ? `${visibilityError} ${backgroundError}` : backgroundError;
         }
 
         // `UpdateBoardInput` carries no gym, so a changed gym is its own mutation.
@@ -249,7 +326,11 @@ function EditBoardForm({ board }: { board: UserBoard }) {
             await linkBoardToGym.mutateAsync({ boardUuid: board.uuid, gymUuid: nextGymUuid });
             gymLinked = true;
           } catch (error) {
-            gymLinkError = extractGraphqlMessage(error) ?? t('mobile.gymPicker.linkError');
+            // The gym's staff took this board off their listing, and only they
+            // can put it back: say so in the climber's language.
+            gymLinkError = isBoardRemovedByGymError(error)
+              ? t('gymBoards.removedByGymError')
+              : (extractGraphqlMessage(error) ?? t('mobile.gymPicker.linkError'));
           }
         }
 
@@ -280,6 +361,15 @@ function EditBoardForm({ board }: { board: UserBoard }) {
           setUpdateError(visibilityError ?? gymLinkError);
           setSubmitting(false);
           return;
+        }
+        if (fromReport === '1') {
+          const waitingBefore = reportsBeforeSave ? waitingReports(reportsBeforeSave).length : null;
+          let reportsClosed = false;
+          if (waitingBefore !== null) {
+            const { data: reportsAfterSave } = await refetchReports();
+            reportsClosed = !!reportsAfterSave && waitingReports(reportsAfterSave).length < waitingBefore;
+          }
+          showToast(t(reportsClosed ? 'reportReview.fixedToast' : 'reportReview.savedToast'), 'success');
         }
         router.back();
         // Navigated away on success — leave `submitting` set (unmounting).
@@ -344,6 +434,7 @@ function EditBoardForm({ board }: { board: UserBoard }) {
       board.gymUuid,
       board.boardType,
       board.isPublic,
+      privacySettings?.enabled,
       board.isUnlisted,
       isSprayWall,
       updateSprayWall,
@@ -358,6 +449,12 @@ function EditBoardForm({ board }: { board: UserBoard }) {
       setActiveBoard,
       router,
       t,
+      backgroundChanged,
+      saveBackground,
+      fromReport,
+      reportsBeforeSave,
+      refetchReports,
+      showToast,
     ],
   );
   handleUpdateRef.current = handleUpdate;
@@ -373,11 +470,33 @@ function EditBoardForm({ board }: { board: UserBoard }) {
       lockedConfig={lockedConfig}
       lockedConfigReason={configLock ?? undefined}
       currentBoardUuid={board.uuid}
+      sprayLedSection={
+        isSprayWall && !wallArchived ? (
+          <SprayWallLedSection wallUuid={board.uuid} disabled={submitting} canInstall={viewerOwnsWall} />
+        ) : undefined
+      }
+      sprayTrainingSection={viewerOwnsWall ? <SprayWallTrainingConsentRow wallUuid={board.uuid} isOwner /> : undefined}
+      sprayBackgroundSection={
+        isSprayWall ? (
+          <SprayWallBackgroundPicker
+            gate={backgroundEditor.gate}
+            art={backgroundEditor.art}
+            value={backgroundEditor.value}
+            onChange={backgroundEditor.onChange}
+            disabled={submitting}
+            onRetakePhoto={canResetWall ? openRetake : undefined}
+            previewSource={backgroundEditor.previewSource}
+          />
+        ) : undefined
+      }
     />
   );
 }
 
 const styles = StyleSheet.create({
+  flex: {
+    flex: 1,
+  },
   centered: {
     flex: 1,
     alignItems: 'center',

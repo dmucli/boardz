@@ -9,7 +9,7 @@ import { useTheme } from '../../providers/theme-provider';
 // userId is the profile to open on tap; it's nullable because some rosters
 // include unauthenticated connections (e.g. session presence), which have no
 // linked profile. PressableAvatar degrades those to a plain, non-tappable avatar.
-type Participant = { userId?: string | null; displayName?: string | null; avatarUrl?: string | null };
+type Participant = { userId?: string | null; displayName?: string | null; avatarUrl?: string | null; testID?: string };
 
 type AvatarGroupProps = {
   participants: Participant[];
@@ -53,13 +53,14 @@ export function AvatarGroup({
   const renderAvatar = (participant: Participant | undefined) =>
     interactive ? (
       <PressableAvatar
+        testID={participant?.testID}
         userId={participant?.userId}
         uri={participant?.avatarUrl}
         name={participant?.displayName}
         size={size}
       />
     ) : (
-      <Avatar uri={participant?.avatarUrl} name={participant?.displayName} size={size} />
+      <Avatar testID={participant?.testID} uri={participant?.avatarUrl} name={participant?.displayName} size={size} />
     );
 
   const isHighlighted = (participant: Participant | undefined): boolean =>
@@ -89,7 +90,7 @@ export function AvatarGroup({
             isHighlighted(participant) && styles.onTop,
             {
               borderColor: ringFor(participant),
-              marginLeft: index === 0 ? 0 : -overlap,
+              marginStart: index === 0 ? 0 : -overlap,
               borderRadius: size / 2,
             },
           ]}
@@ -106,7 +107,7 @@ export function AvatarGroup({
               width: size,
               height: size,
               borderRadius: size / 2,
-              marginLeft: shown.length === 0 ? 0 : -overlap,
+              marginStart: shown.length === 0 ? 0 : -overlap,
               borderColor: separatorRing,
             },
           ]}

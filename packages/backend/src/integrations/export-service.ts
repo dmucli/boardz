@@ -3,14 +3,17 @@
 // retry path (resolver-driven), and the fire-and-forget auto-sync fan-out
 // triggered when a session ends.
 
-import { and, eq, inArray, lt, or } from 'drizzle-orm';
+import { and, eq, exists, inArray, lt, or } from 'drizzle-orm';
+import { QueryBuilder } from 'drizzle-orm/pg-core';
 import type { SessionSummary, SessionParticipant, IntegrationExportResult } from '@boardsesh/shared-schema';
 import { db } from '../db/client';
-import { integrationCredentials, integrationExports } from '@boardsesh/db/schema';
+import { boardseshTicks, integrationCredentials, integrationExports } from '@boardsesh/db/schema';
+import { generateSessionSummary } from '../graphql/resolvers/sessions/session-summary';
 import { getProvider, providerDbToEnum, SUPPORTED_PROVIDERS, type ProviderName } from './registry';
 import { getFreshAccessToken, recordSyncSuccess, type IntegrationCredentialRow } from './credentials';
 import { IntegrationHttpError } from './strava';
 import type { SessionActivityInput } from './types';
+import { loadExportWorkout, type ExportWorkout } from './export-workout';
 import { logger } from '../utils/logger';
 import { utcIsoToLocalWallClock } from '../utils/timezone';
 
@@ -20,9 +23,16 @@ const EXPORT_SESSION_TYPE = 'party';
 // mid-upload) and may be taken over by a retry.
 const PENDING_CLAIM_TAKEOVER_MS = 10 * 60 * 1000;
 
-/** Build the Strava activity name: "Kilter Board session — 3 sends". */
-function buildActivityName(boardPath: string | null | undefined, sends: number): string {
-  const label = boardLabel(boardPath);
+/**
+ * Build the Strava activity name: "Kilter Board session — 3 sends", or the
+ * workout's main block when the session followed one, "4x4 at V4 — 13 sends".
+ */
+function buildActivityName(
+  boardPath: string | null | undefined,
+  sends: number,
+  workout: ExportWorkout | null | undefined,
+): string {
+  const label = workout?.title ?? boardLabel(boardPath);
   const sendWord = sends === 1 ? 'send' : 'sends';
   return `${label} — ${sends} ${sendWord}`;
 }
@@ -43,15 +53,21 @@ function formatGradeDistribution(summary: SessionSummary): string {
 
 /**
  * Render the session summary into the activity payload from one participant's
- * perspective. The activity name uses that participant's own send count.
+ * perspective. The activity name uses that participant's own send count. A
+ * workout (#6903) names the activity and leads the description.
  */
 export function buildSessionActivity(
   summary: SessionSummary,
   boardPath: string | null | undefined,
   participant: SessionParticipant,
   timezone?: string | null,
+  workout?: ExportWorkout | null,
 ): SessionActivityInput {
   const descriptionLines: string[] = [];
+
+  if (workout) {
+    descriptionLines.push(workout.line);
+  }
 
   if (summary.hardestClimb) {
     descriptionLines.push(`Hardest: ${summary.hardestClimb.climbName} (${summary.hardestClimb.grade})`);
@@ -80,7 +96,7 @@ export function buildSessionActivity(
   }
 
   return {
-    name: buildActivityName(boardPath, participant.sends),
+    name: buildActivityName(boardPath, participant.sends, workout),
     description: descriptionLines.join('\n'),
     startDateLocal,
     elapsedSeconds,
@@ -330,7 +346,13 @@ export async function syncPartySessionForUser(
     flashes: 0,
     attempts: 0,
   };
-  const activity = buildSessionActivity(summary, boardPath, participant, options.timezone);
+  const activity = buildSessionActivity(
+    summary,
+    boardPath,
+    participant,
+    options.timezone,
+    await loadExportWorkoutSafely(sessionId, userId),
+  );
 
   let accessToken: string;
   try {
@@ -367,6 +389,23 @@ export async function syncPartySessionForUser(
 }
 
 /**
+ * The workout to name on the activity, or null. Best effort: a failure here
+ * exports the session with today's text rather than failing the upload (the
+ * export claim is already held).
+ */
+async function loadExportWorkoutSafely(sessionId: string, userId: string): Promise<ExportWorkout | null> {
+  try {
+    return await loadExportWorkout(sessionId, userId);
+  } catch (error) {
+    logger.warn(
+      `[Integrations] could not read the workout for session ${sessionId}, user ${userId}; exporting without it:`,
+      error instanceof Error ? error.message : error,
+    );
+    return null;
+  }
+}
+
+/**
  * Fire-and-forget fan-out: when a session ends, upload it for every
  * participant with ANY supported integration connected and auto-sync on (one
  * activity per connected provider per participant). Never throws; one user's
@@ -374,17 +413,15 @@ export async function syncPartySessionForUser(
  */
 export async function autoSyncSessionToIntegrations(
   sessionId: string,
-  summary: SessionSummary | null,
   boardPath: string | null | undefined,
   timezone?: string | null,
 ): Promise<void> {
-  if (!summary) return;
-  if (!summary.participants || summary.participants.length === 0) return;
-  if (!summary.startedAt || !summary.endedAt) return;
-
-  const participantUserIds = summary.participants.map((entry) => entry.userId).filter(Boolean);
-  if (participantUserIds.length === 0) return;
-
+  // An anonymous summary omits private participants and private sessions.
+  // Their own connected integration is still authorized by their auto-sync opt-in.
+  const participantTicks = new QueryBuilder()
+    .select({ id: boardseshTicks.id })
+    .from(boardseshTicks)
+    .where(and(eq(boardseshTicks.sessionId, sessionId), eq(boardseshTicks.userId, integrationCredentials.userId)));
   const credentialRows = await db
     .select()
     .from(integrationCredentials)
@@ -393,13 +430,17 @@ export async function autoSyncSessionToIntegrations(
         inArray(integrationCredentials.provider, [...SUPPORTED_PROVIDERS]),
         eq(integrationCredentials.autoSyncEnabled, true),
         eq(integrationCredentials.status, 'active'),
-        inArray(integrationCredentials.userId, participantUserIds),
+        exists(participantTicks),
       ),
     );
 
   for (const credRow of credentialRows) {
     const provider = credRow.provider as ProviderName;
     try {
+      // Reauthorize for this recipient, so one participant's private climb
+      // details never become another participant's exported activity.
+      const summary = await generateSessionSummary(sessionId, credRow.userId);
+      if (!summary?.startedAt || !summary.endedAt) continue;
       await syncPartySessionForUser(provider, credRow.userId, sessionId, summary, boardPath, { timezone });
     } catch (error) {
       logger.error(

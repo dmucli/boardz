@@ -2,7 +2,14 @@
 import { describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
-import { anchorGlyphForIcon, isMenuActionSelectable, resolveMenuAction, resolveMenuActions } from '../AppMenu.logic';
+import {
+  paletteRowCount,
+  androidAnchorIcon,
+  anchorGlyphForIcon,
+  isMenuActionSelectable,
+  resolveMenuAction,
+  resolveMenuActions,
+} from '../AppMenu.logic';
 import type { AppMenuAction } from '../AppMenu.types';
 
 // AppMenu's per-platform rendering is native (@expo/ui SwiftUI `Menu` / Compose
@@ -79,6 +86,22 @@ describe('AppMenu.logic — resolveMenuActions', () => {
   });
 });
 
+describe('AppMenu.logic — dividers', () => {
+  it('opens a group with a divider above the row that asks for one', () => {
+    const resolved = resolveMenuActions([{ label: 'Queue' }, { label: 'Playlist', dividerBefore: true }]);
+    expect(resolved.map((action) => action.dividerBefore)).toEqual([false, true]);
+  });
+
+  it('never draws one above the first row, where there is no group to close', () => {
+    expect(resolveMenuActions([{ label: 'Queue', dividerBefore: true }])[0]?.dividerBefore).toBe(false);
+  });
+
+  it('adds no row: a divider takes no index', () => {
+    const actions: AppMenuAction[] = [{ label: 'A' }, { label: 'B', dividerBefore: true }, { label: 'C' }];
+    expect(resolveMenuActions(actions)).toHaveLength(actions.length);
+  });
+});
+
 describe('AppMenu.logic — isMenuActionSelectable', () => {
   const RESOLVED = resolveMenuActions([{ label: 'Undo' }, { label: 'Save', disabled: true }]);
 
@@ -111,6 +134,22 @@ describe('AppMenu.logic — anchorGlyphForIcon', () => {
 
   it('falls back to the horizontal ellipsis for an icon with no text stand-in', () => {
     expect(anchorGlyphForIcon('settings')).toBe('⋯');
+  });
+
+  it('draws a + for the plus anchor', () => {
+    expect(anchorGlyphForIcon('plus')).toBe('+');
+  });
+});
+
+describe('AppMenu.logic — androidAnchorIcon', () => {
+  it.each([
+    { iconName: 'more', expected: 'more_vert' },
+    { iconName: 'more.actions', expected: 'more_vert' },
+    { iconName: 'more.vertical', expected: 'more_vert' },
+    { iconName: 'plus', expected: 'add' },
+    { iconName: 'settings', expected: null },
+  ] as const)('$iconName → $expected', ({ iconName, expected }) => {
+    expect(androidAnchorIcon(iconName)).toBe(expected);
   });
 });
 
@@ -172,6 +211,25 @@ describe('AppMenu stub — interaction contract', () => {
     expect(onSelectIndex).toHaveBeenCalledWith(2);
   });
 
+  it('draws a divider between groups and still reports each row by its own index', () => {
+    const onSelectIndex = vi.fn();
+    const { container, getByText } = render(
+      createElement(AppMenu, {
+        label: 'My crew',
+        actions: [
+          { label: 'Queue', dividerBefore: true },
+          { label: 'Playlist', dividerBefore: true },
+          { label: 'Share' },
+        ],
+        onSelectIndex,
+      }),
+    );
+    expect(container.querySelectorAll('hr')).toHaveLength(1);
+    expect(container.querySelector('hr')?.nextElementSibling?.textContent).toBe('Playlist');
+    fireEvent.click(getByText('Share'));
+    expect(onSelectIndex).toHaveBeenCalledWith(2);
+  });
+
   it('takes an icon anchor with no label, naming it by its required accessibilityLabel', () => {
     const { container, getByLabelText } = render(
       createElement(AppMenu, {
@@ -186,5 +244,18 @@ describe('AppMenu stub — interaction contract', () => {
     expect(anchor.textContent).toBe('');
     // The rows are unaffected by which anchor the menu wears.
     expect(container.querySelectorAll('button[data-role="button"]').length).toBe(ACTIONS.length + 1);
+  });
+});
+
+describe('AppMenu.logic — paletteRowCount', () => {
+  const row = (palette?: true): AppMenuAction => ({ label: 'x', palette });
+  it('counts the leading run, capped at 3', () => {
+    expect(paletteRowCount([row(true), row(true), row(true), row(true)])).toBe(3);
+    expect(paletteRowCount([row(true), row(true), row()])).toBe(2);
+  });
+  it('is 0 for a lone row, a run not at the top, or no palette rows', () => {
+    expect(paletteRowCount([row(true), row()])).toBe(0);
+    expect(paletteRowCount([row(), row(true), row(true)])).toBe(0);
+    expect(paletteRowCount([row(), row()])).toBe(0);
   });
 });

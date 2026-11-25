@@ -1,4 +1,9 @@
 export const climbTypeDefs = /* GraphQL */ `
+  enum DraftScope {
+    OWN
+    WALL
+  }
+
   """
   A climbing problem/route on an interactive training board.
   Contains all information needed to display and light up the climb on the board.
@@ -76,25 +81,39 @@ export const climbTypeDefs = /* GraphQL */ `
     apart (see canAddClimbToBoard rule 5).
     """
     compatibleSizeIds: [Int!]
+    "Hold-set IDs required by the climb, derived from its frame placements. Null means unknown; an empty list requires no sets."
+    requiredSetIds: [Int!]
     """
     How many of this climb's holds are no longer on the wall.
 
     Spray walls only — null on every catalogue board, where holds do not come off.
-    0 is an intact climb; anything higher is a climb that survived a reset minus
-    some holds, which stays findable, gets a badge and can be remixed. Materialised
-    on \`board_climbs\` rather than joined, because the offline mirror has no
-    \`board_climb_holds\` table to join through.
+    0 is an intact climb; anything higher is a climb that lost holds when the
+    owner edited the wall's holds (or to an old in-place reset). It stays listed,
+    gets a badge and can be remixed, with \`lostHolds\` drawing the missing holds.
+    Materialised on \`board_climbs\` rather than joined, because the offline mirror
+    has no \`board_climb_holds\` table to join through.
     """
     missingHoldCount: Int
     """
+    The climb's stored revision number. Edits no longer move it, so it is 1 for
+    almost every climb and frozen at its last value for the few edited before
+    revision history was retired. The server no longer uses it. Null on a fetch
+    path that does not project the column.
+    """
+    revisionNumber: Int
+    """
+    The revision at which this climb's holds last changed, as stored. Edits no
+    longer move it and the server no longer compares ticks against it.
+    """
+    holdsRevisionNumber: Int
+    """
     The holds this climb was set on that are no longer on the wall, carrying the
     geometry they had while they were — so a client can draw ghost rings where
-    they used to be and the climber can see what the reset took.
+    they used to be and the climber can see what came off.
 
     Spray walls only: null on every catalogue board, where holds do not come off,
-    and null on a climb that has lost nothing, so the common case costs no query.
-    An empty list means the climb's holds are all still there but the server did
-    look.
+    and null when the climb's count is unknown. An empty list for a climb that has
+    lost nothing (no query), or for a wall the viewer may not see.
 
     Coordinates are the wall's canonical frame — the same frame
     \`SprayWallRenderData.holds\` uses — so the two sets draw on one photo without
@@ -111,8 +130,8 @@ export const climbTypeDefs = /* GraphQL */ `
 
   ANY is the default and adds no filter at all. INTACT keeps climbs that have lost
   nothing; BROKEN keeps only the ones that have. Meaningful on spray walls, where a
-  reset takes holds off the wall; on a catalogue board every climb is INTACT, so
-  BROKEN there is an empty result rather than an error.
+  hold edit (or an old reset) takes holds off the wall; on a catalogue board every
+  climb is INTACT, so BROKEN there is an empty result rather than an error.
   """
   enum HoldIntegrityFilter {
     ANY
@@ -176,8 +195,12 @@ export const climbTypeDefs = /* GraphQL */ `
     boardseshConfidence: String
     "Product sizes this climb fits on. Round-tripped through the queue so a party peer on a different-sized wall can tell the climb doesn't fit theirs — on Woods the two sizes' hold ids overlap, so this is the only signal that separates them."
     compatibleSizeIds: [Int!]
+    "Hold-set IDs required by the climb, derived from its frame placements. Null means unknown; an empty list requires no sets."
+    requiredSetIds: [Int!]
     "How many of this climb's holds are no longer on the wall after a spray-wall reset. Round-tripped through the queue because a broken climb stays queueable and stays playable, and the peer showing it has to be able to say so — a queued row that dropped this would be the one surface pretending the climb was whole. Null on every catalogue board."
     missingHoldCount: Int
+    "The climb's revision as the queueing client read it (\`Climb.revisionNumber\`). Round-tripped through the queue so whoever logs a queued climb can say which revision was on the wall without a refetch. Null from a client that predates the field."
+    revisionNumber: Int
   }
 
   # ============================================
@@ -281,6 +304,10 @@ export const climbTypeDefs = /* GraphQL */ `
     useMyGrades: Boolean
     "Show only the user's draft climbs (requires auth)"
     onlyDrafts: Boolean
+    "OWN lists personal drafts; WALL lists all drafts on an accessible spray wall."
+    draftScope: DraftScope
+    "Show only climbs the user has hearted on this board. A heart belongs to the climb, not to an angle, so it matches at every angle. Signed out returns no climbs. (requires auth)"
+    onlyFavorited: Boolean
     "Show only unclimbed projects (climbs with 0 ascents)"
     projectsOnly: Boolean
     "Keep only intact climbs, only climbs that have lost a hold, or everything (the default)."
@@ -366,5 +393,51 @@ export const climbTypeDefs = /* GraphQL */ `
     faUsername: String
     faAt: String
     syncSeq: String!
+  }
+
+  "Who made an edit to a climb."
+  type ClimbRevisionEditor {
+    id: ID!
+    displayName: String
+    avatarUrl: String
+  }
+
+  """
+  One state a published climb has been in: the climb as it stood after an edit.
+
+  The highest-numbered revision is always the climb as it is now. Revision 1 is
+  the climb as it was first published. A climb nobody has edited has no
+  revisions at all. Numbers are not always consecutive: past 50 revisions the
+  oldest edits are dropped (revision 1 is always kept).
+
+  Read-only. A revision cannot be restored, queued or lit up.
+  """
+  type ClimbRevision {
+    revisionNumber: Int!
+    "True for the newest revision, which matches the live climb."
+    isCurrent: Boolean!
+    "When the edit was made. For revision 1, when the climb was published."
+    createdAt: String!
+    name: String
+    description: String
+    frames: String
+    angle: Int
+    "The setter grade at this revision. Spray walls only; null on every other board."
+    difficultyId: Int
+    """
+    What this revision changed against the one before it: any of name,
+    description, holds, grade, angle, rules. Empty for revision 1.
+    """
+    changes: [String!]!
+    "Who made the edit. Null when that account has since been deleted."
+    editor: ClimbRevisionEditor
+    "True when the editor is the climb's setter, false for a spray wall's editor."
+    editedBySetter: Boolean!
+    """
+    Spray walls only: the wall version (photo) this revision was drawn on, to pass
+    as sprayWallRenderData's version. Null on every other board, and on a first
+    revision whose version could not be worked out.
+    """
+    sprayWallVersionNumber: Int
   }
 `;

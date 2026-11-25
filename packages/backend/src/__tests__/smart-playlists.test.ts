@@ -2,29 +2,49 @@ import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import * as dbSchema from '@boardsesh/db/schema';
 import { playlistQueries } from '../graphql/resolvers/playlists/queries';
+import { sqlText } from '@boardsesh/db/test-utils';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
 
-const { mockDb, eqSpy, notInArraySpy, resolveTargetMock, selectRefsMock, countRefsMock, cardCountMock } = vi.hoisted(
-  () => {
-    const mockDb = {
-      execute: vi.fn(),
-      select: vi.fn(),
-      insert: vi.fn(),
-      delete: vi.fn(),
-      update: vi.fn(),
-    };
-    return {
-      mockDb,
-      eqSpy: vi.fn(),
-      notInArraySpy: vi.fn(),
-      resolveTargetMock: vi.fn(),
-      selectRefsMock: vi.fn(),
-      countRefsMock: vi.fn(),
-      cardCountMock: vi.fn(),
-    };
-  },
-);
+/** A fragment as Postgres receives it, column and table names included. */
+function renderedSql(fragment: unknown): string {
+  return new PgDialect().sqlToQuery(fragment as SQL).sql;
+}
+
+const {
+  mockDb,
+  eqSpy,
+  notInArraySpy,
+  resolveTargetMock,
+  selectRefsMock,
+  countRefsMock,
+  cardCountMock,
+  activityAccessMock,
+} = vi.hoisted(() => {
+  const mockDb = {
+    execute: vi.fn(),
+    select: vi.fn(),
+    insert: vi.fn(),
+    delete: vi.fn(),
+    update: vi.fn(),
+  };
+  return {
+    mockDb,
+    eqSpy: vi.fn(),
+    notInArraySpy: vi.fn(),
+    resolveTargetMock: vi.fn(),
+    selectRefsMock: vi.fn(),
+    countRefsMock: vi.fn(),
+    cardCountMock: vi.fn(),
+    activityAccessMock: vi.fn(),
+  };
+});
 
 vi.mock('../db/client', () => ({ db: mockDb }));
+vi.mock('../services/privacy', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../services/privacy')>()),
+  canViewUserActivity: activityAccessMock,
+}));
 
 // Recommendation helpers are exercised by their own DB-backed paths; here we mock
 // them so the logbook-playlist + counts tests don't need to stub the catalog
@@ -63,6 +83,7 @@ vi.mock('../db/queries/util/table-select', () => ({
       name: 'name',
       description: 'description',
       frames: 'frames',
+      userId: 'userId',
     },
     climbStats: {
       climbUuid: 'climbUuid',
@@ -119,6 +140,7 @@ function makeChain(resolveValue: unknown = []) {
       return chain;
     });
   }
+  // oxlint-disable-next-line unicorn/no-thenable -- Drizzle query builders are intentionally awaitable.
   chain.then = (resolve: (value: unknown) => unknown) => Promise.resolve(resolveValue).then(resolve);
   return { chain, calls };
 }
@@ -161,6 +183,7 @@ describe('smartPlaylist resolver', () => {
     // drain between tests — clearAllMocks only resets call history, leaving
     // unused queued return values to leak into the next test.
     vi.resetAllMocks();
+    activityAccessMock.mockResolvedValue(true);
   });
 
   it('FIVE_STARS uses LIMIT/OFFSET for pagination and only returns the requested page', async () => {
@@ -238,18 +261,21 @@ describe('smartPlaylist resolver', () => {
     expect(pageCalls.groupBy.length).toBe(1);
   });
 
-  it('PROJECTS uses a NOT EXISTS scoped by both board_type and climb_uuid', async () => {
+  it('PROJECTS groups the logbook per (board_type, climb_uuid) and keeps the climbs never sent', async () => {
     const ctx = makeCtx();
 
     mockDb.select.mockReturnValueOnce(makeChain([USER_ROW]).chain);
 
-    // No separate sent-subquery select — the NOT EXISTS lives inside the
-    // where() arg as a sql`` fragment. Just three top-level selects:
-    // user lookup, page query, count query.
+    // The page and the count each build the per-climb subquery first, then
+    // select from it: five selects with the user lookup. Which climbs come out
+    // is asserted against a real database in climb-edit-in-place.test.ts.
+    const { chain: pageProjectsChain, calls: pageProjectsCalls } = makeChain([]);
+    mockDb.select.mockReturnValueOnce(pageProjectsChain);
     const { chain: pageChain, calls: pageCalls } = makeChain([]);
     mockDb.select.mockReturnValueOnce(pageChain);
-    const { chain: countChain, calls: countCalls } = makeChain([{ count: 0 }]);
-    mockDb.select.mockReturnValueOnce(countChain);
+    const { chain: countProjectsChain, calls: countProjectsCalls } = makeChain([]);
+    mockDb.select.mockReturnValueOnce(countProjectsChain);
+    mockDb.select.mockReturnValueOnce(makeChain([{ count: 0 }]).chain);
 
     await playlistQueries.smartPlaylist(
       null,
@@ -259,50 +285,34 @@ describe('smartPlaylist resolver', () => {
       ctx,
     );
 
-    // Both page and count call where() exactly once with a composed condition
-    // that includes the NOT EXISTS sentinel. Stringifying the sql fragment so
-    // the test can assert on its shape without coupling to drizzle's AST.
-    expect(pageCalls.where.length).toBe(1);
-    expect(countCalls.where.length).toBe(1);
-
-    // The NOT EXISTS SQL fragment must reference both board_type and climb_uuid
-    // — that is the joint-scoping fix for the UUID-collision bug. Drizzle
-    // serialises the sql template's `queryChunks` so we can inspect them.
-    const renderSql = (whereArg: unknown): string => {
-      // drizzle wraps the fragment as `{ queryChunks: [...] }`. Recurse for nested.
-      const seen = new WeakSet<object>();
-      const walk = (node: unknown): string => {
-        if (node === null || node === undefined) return '';
-        if (typeof node === 'string') return node;
-        if (typeof node !== 'object') return '';
-        if (seen.has(node)) return '';
-        seen.add(node);
-        const obj = node as Record<string, unknown>;
-        if (Array.isArray(obj.queryChunks)) {
-          return (obj.queryChunks as unknown[]).map(walk).join(' ');
-        }
-        if (Array.isArray((obj as { value?: unknown[] }).value)) {
-          return (obj.value as unknown[]).map(walk).join(' ');
-        }
-        return Object.values(obj).map(walk).join(' ');
-      };
-      return walk(whereArg);
-    };
-    for (const calls of [pageCalls, countCalls]) {
-      const rendered = renderSql(calls.where[0][0]);
-      // Inner subquery aliases boardsesh_ticks as `sent` and references the
-      // outer scope by bare `boardsesh_ticks.<col>`. Pin both halves of the
-      // correlation so a future Drizzle interpolation regression can't
-      // silently turn the subquery into `sent.x = sent.x` (always-true) or
-      // `boardsesh_ticks.x = boardsesh_ticks.x` (no correlation at all).
-      expect(rendered.toUpperCase()).toMatch(/NOT EXISTS/);
-      expect(rendered).toMatch(/FROM\s+boardsesh_ticks\s+AS\s+sent/i);
-      expect(rendered).toMatch(/sent\.board_type\s*=\s*boardsesh_ticks\.board_type/i);
-      expect(rendered).toMatch(/sent\.climb_uuid\s*=\s*boardsesh_ticks\.climb_uuid/i);
-      expect(rendered).toMatch(/sent\.status\s+IN\s*\(\s*'flash'\s*,\s*'send'\s*\)/i);
+    for (const calls of [pageProjectsCalls, countProjectsCalls]) {
+      // The user's ticks, grouped on BOTH columns: a sent Kilter climb must not
+      // stand in for a Tension climb that shares its uuid. The climb is the
+      // tick's canonical one, read through its catalog alias row (#6809).
+      expect(calls.from[0][0]).toBe(dbSchema.boardseshTicks);
+      expect(calls.leftJoin).toHaveLength(1);
+      expect(calls.leftJoin[0][0]).toBe(dbSchema.boardClimbAliases);
+      expect(calls.groupBy[0]).toHaveLength(2);
+      expect(renderedSql(calls.groupBy[0][0])).toBe(
+        'COALESCE("board_climb_aliases"."canonical_uuid", "boardsesh_ticks"."climb_uuid")',
+      );
+      expect(calls.groupBy[0][1]).toBe(dbSchema.boardseshTicks.boardType);
+      // No flash or send among the group's ticks.
+      expect(calls.having).toHaveLength(1);
+      expect(sqlText(calls.having[0][0])).toMatch(/NOT bool_or\(\s*IN \('flash', 'send'\)\)/);
+      expect(calls.as[0]).toEqual(['projects']);
+      // The climb row is not joined, only probed by the tick privacy rule (a
+      // listed or own climb behind the canonical uuid), so the page and the
+      // count skip a tick the hydrator would drop (#6661). That rule is
+      // stricter than the hydrator's readable rule, so no second probe runs.
+      const where = renderedSql(calls.where[0][0]);
+      expect(where).toContain('"privacy_tick_climb"');
+      expect(where).not.toContain('privacy_reference_climb');
     }
+    expect(pageCalls.leftJoin).toHaveLength(0);
+    expect(pageCalls.limit[0]).toEqual([20]);
+    expect(pageCalls.offset[0]).toEqual([0]);
 
-    // Sanity: notInArray is no longer used anywhere (we replaced it with NOT EXISTS).
     expect(notInArraySpy).not.toHaveBeenCalled();
   });
 
@@ -320,7 +330,8 @@ describe('smartPlaylist resolver', () => {
     ]);
     mockDb.select.mockReturnValueOnce(pageChain);
     // count query
-    mockDb.select.mockReturnValueOnce(makeChain([{ count: 7 }]).chain);
+    const { chain: countChain, calls: countCalls } = makeChain([{ count: 7 }]);
+    mockDb.select.mockReturnValueOnce(countChain);
     // hydrate (called with refs array)
     mockDb.select.mockReturnValueOnce(makeChain([]).chain);
 
@@ -354,6 +365,14 @@ describe('smartPlaylist resolver', () => {
       ([col, val]) => col === dbSchema.userFavorites.boardName && val === 'kilter',
     );
     expect(boardFilters.length).toBeGreaterThanOrEqual(2);
+    for (const calls of [pageCalls, countCalls]) {
+      const rendered = sqlText(calls.where[0][0]);
+      // The draft rule on the liked climb, and no audience: a published climb
+      // is public whoever set it.
+      expect(rendered).toContain('privacy_reference_climb');
+      expect(rendered).toContain('privacy_reference_climb.is_draft IS NOT TRUE');
+      expect(rendered).not.toContain('content_privacy');
+    }
   });
 
   it('LIKED_CLIMBS without boardName does not filter by board (cross-board view)', async () => {
@@ -380,7 +399,7 @@ describe('smartPlaylist resolver', () => {
 
   it('throws when user does not exist', async () => {
     const ctx = makeCtx();
-    mockDb.select.mockReturnValueOnce(makeChain([]).chain);
+    activityAccessMock.mockResolvedValue(false);
 
     await expect(
       playlistQueries.smartPlaylist(
@@ -390,7 +409,7 @@ describe('smartPlaylist resolver', () => {
         },
         ctx,
       ),
-    ).rejects.toThrow('User not found');
+    ).rejects.toThrow('Playlist not found');
   });
 
   it('is callable without authentication (public)', async () => {
@@ -408,6 +427,15 @@ describe('smartPlaylist resolver', () => {
       ctx,
     );
     expect(result.meta.userId).toBe('user-123');
+  });
+
+  it('hides a private logbook from an unapproved viewer before loading metadata or climbs', async () => {
+    activityAccessMock.mockResolvedValue(false);
+    await expect(
+      playlistQueries.smartPlaylist(null, { input: { type: 'FIVE_STARS', userId: 'private-owner' } }, makeCtx()),
+    ).rejects.toThrow('Playlist not found');
+    expect(activityAccessMock).toHaveBeenCalledWith('user-123', 'private-owner');
+    expect(mockDb.select).not.toHaveBeenCalled();
   });
 
   it('RECOMMENDED_* returns an empty result for a non-owner without any user lookup', async () => {
@@ -589,6 +617,7 @@ function countsSqlArg() {
 describe('mySmartPlaylistCounts resolver', () => {
   beforeEach(() => {
     vi.resetAllMocks();
+    mockDb.select.mockReturnValue(makeChain([]).chain);
   });
 
   it('requires authentication', async () => {
@@ -615,6 +644,7 @@ describe('mySmartPlaylistCounts resolver', () => {
       { type: 'MOST_REPEATED', count: 3 },
       { type: 'PROJECTS', count: 5 },
       { type: 'LIKED_CLIMBS', count: 0 },
+      { type: 'CREATED_CLIMBS', count: 0 },
     ]);
     // The guard plus the CTE — still one roundtrip for all four counts.
     expect(mockDb.execute).toHaveBeenCalledTimes(2);
@@ -637,6 +667,7 @@ describe('mySmartPlaylistCounts resolver', () => {
       { type: 'MOST_REPEATED', count: 2 },
       { type: 'PROJECTS', count: 3 },
       { type: 'LIKED_CLIMBS', count: 0 },
+      { type: 'CREATED_CLIMBS', count: 0 },
     ]);
   });
 
@@ -651,6 +682,7 @@ describe('mySmartPlaylistCounts resolver', () => {
       { type: 'MOST_REPEATED', count: 0 },
       { type: 'PROJECTS', count: 0 },
       { type: 'LIKED_CLIMBS', count: 0 },
+      { type: 'CREATED_CLIMBS', count: 0 },
     ]);
   });
 
@@ -668,27 +700,36 @@ describe('mySmartPlaylistCounts resolver', () => {
     expect(result).toContainEqual({ type: 'LIKED_CLIMBS', count: 12 });
   });
 
-  it('CTE scopes the sent-climbs check by both board_type and climb_uuid', async () => {
-    // Pin the joint-scoping fix: a kilter send must NOT exclude a tension
-    // climb sharing the same UUID from the projects count. The pure SQL of
-    // the CTE is what enforces this, so this test asserts on the SQL string
-    // rather than on db result rows.
+  it('CTE counts projects per (board_type, climb_uuid)', async () => {
+    // Pin the joint scoping: a kilter send must NOT exclude a tension climb
+    // sharing the same UUID from the projects count. The pure SQL of the CTE is
+    // what enforces this, so this test asserts on the SQL string rather than on
+    // db result rows.
     const ctx = makeCtx();
     queueCountsRows([]);
 
     await playlistQueries.mySmartPlaylistCounts(null, undefined, ctx);
 
     expect(mockDb.execute).toHaveBeenCalledTimes(2);
-    const rendered = (countsSqlArg()?.queryChunks ?? [])
-      .map((chunk) => (typeof chunk === 'string' ? chunk : ((chunk as { value?: string }).value ?? '')))
-      .join(' ');
+    const rendered = sqlText(countsSqlArg());
 
-    // sent CTE projects (climb_uuid, board_type) — not just climb_uuid.
-    expect(rendered).toMatch(/SELECT\s+DISTINCT\s+climb_uuid,\s+board_type\s+FROM\s+base/i);
-    // projects CTE checks NOT EXISTS with both columns matched.
-    expect(rendered.toUpperCase()).toContain('NOT EXISTS');
-    expect(rendered).toMatch(/sent\.climb_uuid\s*=\s*base\.climb_uuid/i);
-    expect(rendered).toMatch(/sent\.board_type\s*=\s*base\.board_type/i);
+    expect(rendered).toMatch(
+      /SELECT DISTINCT climb_uuid, board_type\s+FROM base\s+WHERE status IN \('flash', 'send'\)/,
+    );
+    expect(rendered).toMatch(/sent\.climb_uuid = base\.climb_uuid\s+AND sent\.board_type = base\.board_type/);
+    // The cards read the list header's membership (#6808): the canonical climb
+    // through its alias row, the tick privacy rule (which needs a listed or
+    // own climb row) and the spray-wall rules; the hearts the readable rule.
+    const withNames = renderedSql(countsSqlArg());
+    expect(withNames).toContain(
+      'WITH base AS (select COALESCE("board_climb_aliases"."canonical_uuid", "boardsesh_ticks"."climb_uuid") as "climb_uuid"',
+    );
+    expect(withNames).toMatch(/left join "board_climb_aliases"/);
+    expect(withNames).toContain('"privacy_tick_climb"');
+    expect(withNames).toMatch(
+      /"user_favorites"\."user_id" = \$\d+ and EXISTS \(SELECT 1 FROM board_climbs privacy_reference_climb/,
+    );
+    expect(withNames).toContain('spray_walls');
   });
 
   it('appends RECOMMENDED_* counts when a board resolves', async () => {
@@ -716,6 +757,6 @@ describe('mySmartPlaylistCounts resolver', () => {
 
     const result = await playlistQueries.mySmartPlaylistCounts(null, undefined, ctx);
     expect(result.some((entry) => entry.type.startsWith('RECOMMENDED_'))).toBe(false);
-    expect(result).toHaveLength(4);
+    expect(result).toHaveLength(5);
   });
 });

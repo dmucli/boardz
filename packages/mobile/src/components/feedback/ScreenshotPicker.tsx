@@ -41,11 +41,7 @@ export function ScreenshotPicker({ uris, onChange, disabled = false }: Screensho
 
   const handlePick = async () => {
     try {
-      const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
-      if (!permission.granted) {
-        showToast(t('screenshots.permissionDenied'), 'warning');
-        return;
-      }
+      // No library permission request: the system picker needs none (#5957).
       const result = await ImagePicker.launchImageLibraryAsync({
         mediaTypes: ['images'],
         allowsMultipleSelection: true,
@@ -109,14 +105,14 @@ export function ScreenshotPicker({ uris, onChange, disabled = false }: Screensho
             style={[styles.addTile, { borderColor: systemColors.separator, backgroundColor: systemColors.fill }]}
           >
             <Icon name="plus" size={20} color={systemColors.secondaryLabel} />
-            <Text variant="caption2" color={systemColors.secondaryLabel} numberOfLines={1}>
+            <Text variant="caption2" color={systemColors.secondaryLabel}>
               {t('screenshots.addLabel')}
             </Text>
           </PressableSurface>
         ) : null}
       </View>
 
-      <Text variant="footnote" color={systemColors.secondaryLabel} numberOfLines={2}>
+      <Text variant="footnote" color={systemColors.secondaryLabel}>
         {t('screenshots.publicWarning')}
       </Text>
     </View>
@@ -154,7 +150,8 @@ const styles = StyleSheet.create({
   },
   addTile: {
     width: THUMBNAIL_SIZE,
-    height: THUMBNAIL_SIZE,
+    minHeight: THUMBNAIL_SIZE,
+    paddingVertical: spacing[2],
     borderRadius: borderRadius.md,
     borderWidth: StyleSheet.hairlineWidth,
     alignItems: 'center',

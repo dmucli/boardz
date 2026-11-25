@@ -1,15 +1,17 @@
 import { toFlatFrames } from '@boardsesh/board-constants/hold-states';
 import { BOARD_FIELD_COLORS } from '@boardsesh/board-look';
+import { BOARD_RENDER_VERSION } from '@boardsesh/board-render/version';
 import type { BoardName } from '@boardsesh/shared-schema';
 import { BACKEND_URL } from './env';
+import type { SprayWallVisibility } from './spray/spray-share';
 
 // Fallback builder for the backend og:image URL, used only when the page will
 // not tell us its own card (see `readAdvertisedCard`).
 //
-// Kept local rather than pulling in @boardsesh/board-render, whose graph drags
-// the WASM renderer + sharp into the mobile bundle — far heavier than assembling
-// a query string warrants. The backend canonicalises set_ids (sort + dedupe)
-// before keying its caches, so this URL and web's collapse to the same entry.
+// Only the generated /version leaf comes from @boardsesh/board-render. It has
+// no imports, keeping the board catalogue and server graph outside this builder.
+// The backend canonicalises set_ids (sort + dedupe) before keying its caches,
+// so this URL and web's collapse to the same entry.
 //
 // It carries NO climb identity (`n`/`g`/`s`/`angle`), because the app cannot
 // reproduce what www advertises: the angle there is `selectCanonicalClimbAngle`,
@@ -17,8 +19,8 @@ import { BACKEND_URL } from './env';
 // same climb served at /25/, /40/ and /50/ all advertise `angle=40` — so there
 // is no local arithmetic that arrives at it.
 //
-// So this warms the per-board `ogBase` (the backdrop with the board photos
-// composited, keyed on board config and render size, NOT on the climb) and not
+// So this warms the per-board `ogBase` (board photos and framing, keyed on
+// board config and render size, NOT on the climb) and not
 // the card an unfurler actually asks for. It is still issued first, because the
 // backdrop is shared and the real card's render turns from a `miss` into a
 // `base-hit` once it lands — but the page's own og:image is what actually gets
@@ -29,14 +31,10 @@ export function buildOgImageUrl(args: {
   sizeId: number;
   setIds: string;
   frames: string | null | undefined;
+  /** A spray wall's visibility; ignored for every catalogue board. */
+  sprayVisibility?: SprayWallVisibility | null;
 }): string | null {
-  // A spray wall's holds and photo live in `spray_wall_holds` and the private
-  // bucket, and the backend's OG renderer only knows the bundled catalogue
-  // geometry — so `/og/climb` cannot draw a wall today, and warming it would
-  // cache a blank card under the very URL the unfurler is about to ask for.
-  // Teaching the renderer the wall is SW-16's job (the public-wall share card);
-  // until then the link still shares, it just unfurls without a picture.
-  if (args.boardName === 'spray') return null;
+  if (args.boardName === 'spray') return buildSprayOgImageUrl(args.layoutId, args.frames, args.sprayVisibility);
   const flatFrames = toFlatFrames(args.frames, args.boardName as BoardName);
   // The backend rejects an empty frames string (a blank board would cache as a
   // real card), so there is nothing to warm without frames.
@@ -58,8 +56,82 @@ export function buildOgImageUrl(args: {
     // climber just looked at are quieted by the same wash.
     'render_mode=aura',
     `field_color=${encodeURIComponent(BOARD_FIELD_COLORS.dark)}`,
+    `v=${BOARD_RENDER_VERSION}`,
   ].join('&');
   return `${BACKEND_URL}/og/climb?${query}`;
+}
+
+// A spray wall's card (SW-16), byte-for-byte the URL www's `buildSprayOgImageUrl`
+// puts in the page's og:image — same params, same order, same encoding — so this
+// warms the very entry the unfurler asks for rather than a near-miss.
+//
+// Public walls only. `/og/climb` answers 404 for an unlisted or private wall by
+// design (its photo sits in the private bucket, and the page advertises no card),
+// so there is nothing to warm, and an unknown visibility is treated the same way.
+// A wall's size id is its layout id and its one synthetic hold set is 1.
+function buildSprayOgImageUrl(
+  layoutId: number,
+  frames: string | null | undefined,
+  visibility: SprayWallVisibility | null | undefined,
+): string | null {
+  if (visibility !== 'public') return null;
+  const flatFrames = toFlatFrames(frames, 'spray');
+  if (!flatFrames) return null;
+  const query = [
+    'board_name=spray',
+    `layout_id=${layoutId}`,
+    `size_id=${layoutId}`,
+    'set_ids=1',
+    `frames=${encodeURIComponent(flatFrames)}`,
+    'format=jpeg',
+    `v=${BOARD_RENDER_VERSION}`,
+  ].join('&');
+  return `${BACKEND_URL}/og/climb?${query}`;
+}
+
+// The share cards for everything that is not a climb (docs/web/og-climb.md, "The
+// share-card family"). www puts a data token (`v`) on the URL it advertises,
+// which the app cannot compute; the backend ignores it and keys its byte cache on
+// the card's drawn data, so the token-free URL renders exactly the bytes the
+// advertised one will. Each takes a public id or slug only: no invite token or
+// wall capability is ever part of a card URL.
+export function buildPlaylistOgImageUrl(playlistUuid: string): string {
+  return `${BACKEND_URL}/og/playlist?uuid=${encodeURIComponent(playlistUuid)}`;
+}
+
+export function buildSetterOgImageUrl(username: string): string {
+  return `${BACKEND_URL}/og/setter?username=${encodeURIComponent(username)}`;
+}
+
+export function buildProfileOgImageUrl(userId: string): string {
+  return `${BACKEND_URL}/og/profile?user_id=${encodeURIComponent(userId)}`;
+}
+
+export function buildPlaceOgImageUrl(kind: 'gym' | 'board', slug: string): string {
+  return `${BACKEND_URL}/og/place?kind=${kind}&slug=${encodeURIComponent(slug)}`;
+}
+
+/** Daily feed groups use the web card rather than the backend session renderer. */
+export function buildSessionRecapOgImageUrl(sessionId: string): string | null {
+  if (sessionId.startsWith('daily:')) return null;
+  return `${BACKEND_URL}/og/session?sessionId=${encodeURIComponent(sessionId)}`;
+}
+
+export function buildSessionInviteOgImageUrl(sessionId: string): string {
+  return `${BACKEND_URL}/og/session?sessionId=${encodeURIComponent(sessionId)}&variant=join`;
+}
+
+// The card endpoints a page may advertise. Anything else on BACKEND_URL (the
+// GraphQL endpoint, an upload route) is not a card and is never fetched.
+const OG_CARD_PATH_PATTERN = /^\/og\/(?:climb|playlist|session|profile|setter|place)\?/;
+
+function isBackendCardUrl(url: string): boolean {
+  return url.startsWith(`${BACKEND_URL}/`) && OG_CARD_PATH_PATTERN.test(url.slice(BACKEND_URL.length));
+}
+
+// The same card with or without www's data token: `v` never changes the bytes.
+function withoutVersionParam(url: string): string {
+  return url.replace(/([?&])v=[^&]*(&|$)/, (_whole, separator: string, next: string) => (next ? separator : ''));
 }
 
 // The card the unfurler will ask for, read from the page that advertises it.
@@ -121,9 +193,10 @@ export function extractOgImageUrl(html: string): string | null {
     const content = META_CONTENT_PATTERN.exec(tag);
     if (!content?.[1]) continue;
     const url = decodeHtmlAttribute(content[1]);
-    // Only ever fetch our own backend. The page is ours, but a prewarm that
-    // follows whatever a response puts in og:image is a request forwarder.
-    if (!url.startsWith(`${BACKEND_URL}/`)) continue;
+    // Only ever fetch our own backend's card endpoints. The page is ours, but a
+    // prewarm that follows whatever a response puts in og:image is a request
+    // forwarder.
+    if (!isBackendCardUrl(url)) continue;
     return url;
   }
   return null;
@@ -174,12 +247,17 @@ export async function prewarmShareCaches(pageUrl: string, fallbackOgImageUrl: st
   // warming on that would leave the backend idle for the whole download — and
   // the sheet is open the entire time, so the reader can send before any of it
   // lands. This request shares the per-board `ogBase` with the real card (the
-  // backdrop with the board photos composited, keyed on board config, not on
+  // board photos and framing, keyed on board config, not on
   // the climb), so it turns the real card's render from a `miss` into a
   // `base-hit` whoever asks for it first.
   const backdrop = fallbackOgImageUrl ? warm(fallbackOgImageUrl) : Promise.resolve();
 
   const advertised = await readAdvertisedCard(pageUrl);
-  if (advertised) await warm(advertised);
+  // A public spray wall's fallback IS the advertised card, and a family card's
+  // fallback is the advertised one minus its token, so either is already in
+  // flight; a second request would only queue behind the first.
+  const alreadyWarming =
+    !!advertised && !!fallbackOgImageUrl && withoutVersionParam(advertised) === withoutVersionParam(fallbackOgImageUrl);
+  if (advertised && !alreadyWarming) await warm(advertised);
   await backdrop;
 }

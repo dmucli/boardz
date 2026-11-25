@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render } from '@testing-library/react';
-import { createElement, type ReactNode } from 'react';
+import { createElement, useLayoutEffect, type ReactNode } from 'react';
 
 type ViewMockProps = { children?: ReactNode; testID?: string };
 const platform = vi.hoisted(() => ({ os: 'ios' as 'ios' | 'web' }));
-const imageEvents = vi.hoisted(() => ({ loadCallbacks: [] as Array<() => void> }));
+const imageEvents = vi.hoisted(() => ({
+  loadCallbacks: [] as Array<() => void>,
+  displayCallbacks: [] as Array<() => void>,
+}));
 
 vi.mock('react-native', () => ({
   Platform: {
@@ -25,6 +28,7 @@ vi.mock('expo-image', () => ({
     recyclingKey,
     cachePolicy,
     onLoad,
+    onDisplay,
     onError,
   }: {
     source: { uri: string };
@@ -33,9 +37,11 @@ vi.mock('expo-image', () => ({
     recyclingKey?: string;
     cachePolicy?: string;
     onLoad?: () => void;
+    onDisplay?: () => void;
     onError?: (event: { error: string }) => void;
   }) => {
-    if (onLoad) imageEvents.loadCallbacks.push(onLoad);
+    if (onLoad && source.uri.endsWith('.png')) imageEvents.loadCallbacks.push(onLoad);
+    if (onDisplay && source.uri.endsWith('.png')) imageEvents.displayCallbacks.push(onDisplay);
     return createElement('img', {
       src: source.uri,
       'data-testid': testID ?? 'expo-image',
@@ -56,11 +62,33 @@ import { LayeredClimbImage } from '../LayeredClimbImage';
 import { BoardArtVisibilityContext } from '../board-art-visibility-context';
 
 describe('LayeredClimbImage', () => {
+  it('reports background and overlay decode failures without swallowing overlay recovery', () => {
+    const onArtError = vi.fn();
+    const onOverlayError = vi.fn();
+    const { getAllByTestId } = render(
+      createElement(LayeredClimbImage, {
+        overlayUri: 'file:///holds.png',
+        overlayLoadKey: 'attempt-1',
+        backgroundPaths: ['/board.webp'],
+        onArtError,
+        onOverlayError,
+      }),
+    );
+    const layers = getAllByTestId('expo-image');
+    fireEvent.error(layers[0]);
+    expect(onArtError).toHaveBeenCalledOnce();
+    expect(onOverlayError).not.toHaveBeenCalled();
+    fireEvent.error(layers[1]);
+    expect(onArtError).toHaveBeenCalledTimes(2);
+    expect(onOverlayError).toHaveBeenCalledWith({ error: 'mock image failure' }, 'attempt-1');
+  });
+
   beforeEach(() => {
     // The expo-image mock records every mounted overlay's onLoad; tests that
     // replay queued native events index into this list, so it must start empty
     // regardless of which tests rendered an Image before them.
     imageEvents.loadCallbacks.length = 0;
+    imageEvents.displayCallbacks.length = 0;
   });
 
   // Per-tap surfaces (the create editor) re-render on every paint, and
@@ -77,6 +105,61 @@ describe('LayeredClimbImage', () => {
       };
       return props;
     }
+
+    function CachedFrame({ uri, board }: { uri: string | null; board: string }) {
+      useLayoutEffect(() => {
+        if (uri) imageEvents.loadCallbacks.at(-1)?.();
+      }, [uri, board]);
+      return createElement(LayeredClimbImage, {
+        ...paintOverlay(uri ?? ''),
+        overlayUri: uri,
+        retainPreviousOverlayFor: board,
+      });
+    }
+
+    it('retains the first cached load received before passive effects', () => {
+      const { container, rerender } = render(
+        createElement(CachedFrame, { uri: 'file:///first-cached.png', board: 'board-a' }),
+      );
+      rerender(createElement(CachedFrame, { uri: null, board: 'board-a' }));
+      expect(container.querySelector('img[src="file:///first-cached.png"]')).not.toBeNull();
+    });
+
+    it('preserves an early load for the new board instead of the previous board', () => {
+      const { container, rerender } = render(
+        createElement(CachedFrame, { uri: 'file:///old-board.png', board: 'board-a' }),
+      );
+      rerender(createElement(CachedFrame, { uri: 'file:///new-board.png', board: 'board-b' }));
+      rerender(createElement(CachedFrame, { uri: null, board: 'board-b' }));
+      expect(container.querySelector('img[src="file:///new-board.png"]')).not.toBeNull();
+      expect(container.querySelector('img[src="file:///old-board.png"]')).toBeNull();
+    });
+
+    it.each(['first:0', 'replacement:0'])(
+      'keeps current retention after an old same-URI load with current key %s',
+      (currentLoadKey) => {
+        const uri = 'file:///shared-board.png';
+        const { container, rerender } = render(
+          createElement(
+            LayeredClimbImage,
+            paintOverlay(uri, {
+              overlayLoadKey: 'first:0',
+              retainPreviousOverlayFor: 'board-a',
+            }),
+          ),
+        );
+        const oldLoad = imageEvents.loadCallbacks.at(-1);
+        const current = paintOverlay(uri, {
+          overlayLoadKey: currentLoadKey,
+          retainPreviousOverlayFor: 'board-b',
+        });
+        rerender(createElement(LayeredClimbImage, current));
+        act(() => imageEvents.loadCallbacks.at(-1)?.());
+        act(() => oldLoad?.());
+        rerender(createElement(LayeredClimbImage, { ...current, overlayUri: null }));
+        expect(container.querySelector('img[src="file:///shared-board.png"]')).not.toBeNull();
+      },
+    );
 
     it('holds the last painted overlay while the next one renders', () => {
       const { container, rerender } = render(createElement(LayeredClimbImage, paintOverlay('file:///a.png')));
@@ -339,6 +422,147 @@ describe('LayeredClimbImage', () => {
     expect(container.querySelector('img[src="file:///overlay.png"]')?.getAttribute('data-transition')).toBe('150');
   });
 
+  // A row that mounts onto a climb nobody has rendered yet used to show the bare
+  // board first and the holds a moment later. `revealWithOverlay` holds the
+  // photo back until the holds are on the layer.
+  describe('revealWithOverlay', () => {
+    const PLACEHOLDER = '[data-testid="layered-climb-image-reveal-placeholder"]';
+    function stack(extraProps: Record<string, unknown>) {
+      return createElement(LayeredClimbImage, {
+        overlayUri: null,
+        overlayLoadKey: null,
+        backgroundPaths: ['/bundled/kilter.webp'],
+        revealPlaceholderColor: '#333',
+        ...extraProps,
+      });
+    }
+
+    it('covers the stack until the overlay has painted', () => {
+      const props = { revealWithOverlay: 'each-climb', recyclingKey: 'climb-a' };
+      const { container, rerender } = render(stack(props));
+      expect(container.querySelector(PLACEHOLDER)).toBeTruthy();
+      // The photo still mounts underneath: it has to load to be ready.
+      expect(container.querySelector('img[src="file:///bundled/kilter.webp"]')).toBeTruthy();
+
+      rerender(stack({ ...props, overlayUri: 'file:///a.png', overlayLoadKey: 'a' }));
+      expect(container.querySelector(PLACEHOLDER)).toBeTruthy();
+
+      act(() => {
+        fireEvent.load(container.querySelector('img[src="file:///a.png"]')!);
+      });
+      expect(container.querySelector(PLACEHOLDER)).toBeNull();
+    });
+
+    // The reveal is the transition. A cross-fade starting at onLoad would show
+    // the bare board after all, for the length of the fade.
+    it('does not cross-fade an overlay it is holding the stack back for', () => {
+      const awaited = {
+        revealWithOverlay: 'each-climb',
+        recyclingKey: 'climb-a',
+        overlayUri: 'file:///a.png',
+        overlayLoadKey: 'a',
+      };
+      const { container } = render(stack(awaited));
+      expect(container.querySelector('img[src="file:///a.png"]')!.getAttribute('data-transition')).toBe('0');
+    });
+
+    it('covers nothing when the caller does not ask to wait', () => {
+      const { container } = render(stack({ recyclingKey: 'climb-a' }));
+      expect(container.querySelector(PLACEHOLDER)).toBeNull();
+    });
+
+    it('shows the photo on its own once the overlay is overdue, so a failed render still looks like a board', () => {
+      vi.useFakeTimers();
+      try {
+        const { container } = render(stack({ revealWithOverlay: 'each-climb', recyclingKey: 'climb-a' }));
+        expect(container.querySelector(PLACEHOLDER)).toBeTruthy();
+        act(() => {
+          vi.advanceTimersByTime(599);
+        });
+        expect(container.querySelector(PLACEHOLDER)).toBeTruthy();
+        act(() => {
+          vi.advanceTimersByTime(2);
+        });
+        expect(container.querySelector(PLACEHOLDER)).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("re-covers a recycled row for the next climb in 'each-climb' mode", () => {
+      const first = {
+        revealWithOverlay: 'each-climb',
+        recyclingKey: 'climb-a',
+        overlayUri: 'file:///a.png',
+        overlayLoadKey: 'a',
+      };
+      const { container, rerender } = render(stack(first));
+      act(() => {
+        fireEvent.load(container.querySelector('img[src="file:///a.png"]')!);
+      });
+      expect(container.querySelector(PLACEHOLDER)).toBeNull();
+
+      // Recycled onto a climb whose overlay is still rendering.
+      rerender(stack({ revealWithOverlay: 'each-climb', recyclingKey: 'climb-b' }));
+      expect(container.querySelector(PLACEHOLDER)).toBeTruthy();
+    });
+
+    it("keeps the photo up across climbs in 'first-paint' mode", () => {
+      const first = {
+        revealWithOverlay: 'first-paint',
+        recyclingKey: 'climb-a',
+        overlayUri: 'file:///a.png',
+        overlayLoadKey: 'a',
+      };
+      const { container, rerender } = render(stack(first));
+      expect(container.querySelector(PLACEHOLDER)).toBeTruthy();
+      act(() => {
+        fireEvent.load(container.querySelector('img[src="file:///a.png"]')!);
+      });
+      expect(container.querySelector(PLACEHOLDER)).toBeNull();
+
+      // A swipe to the next climb, overlay not rendered yet: the wall stays.
+      rerender(stack({ revealWithOverlay: 'first-paint', recyclingKey: 'climb-b' }));
+      expect(container.querySelector(PLACEHOLDER)).toBeNull();
+    });
+
+    // The play board opens onto a prewarmed climb (nothing to wait for, so the
+    // caller passes no mode), then swipes to one that is not rendered yet.
+    it("never covers a 'first-paint' stack that has already been on screen", () => {
+      const { container, rerender } = render(
+        stack({ recyclingKey: 'climb-a', overlayUri: 'file:///a.png', overlayLoadKey: 'a' }),
+      );
+      expect(container.querySelector(PLACEHOLDER)).toBeNull();
+
+      rerender(stack({ revealWithOverlay: 'first-paint', recyclingKey: 'climb-b' }));
+      expect(container.querySelector(PLACEHOLDER)).toBeNull();
+    });
+
+    it('ignores a late load from the previous climb while the new overlay is still out', () => {
+      const first = {
+        revealWithOverlay: 'each-climb',
+        recyclingKey: 'climb-a',
+        overlayUri: 'file:///a.png',
+        overlayLoadKey: 'a',
+      };
+      const { container, rerender } = render(stack(first));
+      const staleLoad = imageEvents.loadCallbacks.at(-1)!;
+
+      rerender(
+        stack({
+          revealWithOverlay: 'each-climb',
+          recyclingKey: 'climb-b',
+          overlayUri: 'file:///b.png',
+          overlayLoadKey: 'b',
+        }),
+      );
+      act(() => {
+        staleLoad();
+      });
+      expect(container.querySelector(PLACEHOLDER)).toBeTruthy();
+    });
+  });
+
   it('swaps the holds overlay instantly when suppressOverlayTransition is set (no end-of-swipe flash)', () => {
     const { container } = render(
       createElement(LayeredClimbImage, {
@@ -407,6 +631,90 @@ describe('LayeredClimbImage', () => {
     expect(onOverlayError).toHaveBeenCalledWith({ error: 'mock image failure' }, '1:0');
   });
 
+  describe('onOverlayMounted', () => {
+    it('reports the image inside the commit that mounts it, before anything the image fires can be heard', () => {
+      const onOverlayMounted = vi.fn();
+      const reportsSeenInTheCommit: number[] = [];
+      // A parent's layout effect runs after its children's and before every
+      // passive effect, so it sees exactly what the commit itself reported.
+      function Surface() {
+        useLayoutEffect(() => {
+          reportsSeenInTheCommit.push(onOverlayMounted.mock.calls.length);
+        });
+        return createElement(LayeredClimbImage, {
+          overlayUri: 'file:///overlay.png',
+          overlayLoadKey: '1:0',
+          backgroundPaths: [],
+          onOverlayMounted,
+        });
+      }
+
+      render(createElement(Surface));
+
+      expect(reportsSeenInTheCommit).toEqual([1]);
+      expect(onOverlayMounted).toHaveBeenCalledExactlyOnceWith('1:0');
+    });
+
+    it('reports one image replacing another as the new one, with no "nothing is mounted" in between', () => {
+      const onOverlayMounted = vi.fn();
+      const { rerender } = render(
+        createElement(LayeredClimbImage, {
+          overlayUri: 'file:///overlay.png',
+          overlayLoadKey: '1:0',
+          backgroundPaths: [],
+          onOverlayMounted,
+        }),
+      );
+
+      rerender(
+        createElement(LayeredClimbImage, {
+          overlayUri: 'file:///overlay-next.png',
+          overlayLoadKey: '2:0',
+          backgroundPaths: [],
+          onOverlayMounted,
+        }),
+      );
+
+      // A consumer that hears "nothing" forgets what it knew, including an
+      // `onLoad` for the new image that arrived ahead of this report.
+      expect(onOverlayMounted.mock.calls).toEqual([['1:0'], ['2:0']]);
+    });
+
+    it('reports a render that arrives after the first paint without a second "nothing is mounted"', () => {
+      const onOverlayMounted = vi.fn();
+      const { rerender } = render(
+        createElement(LayeredClimbImage, { overlayUri: null, backgroundPaths: [], onOverlayMounted }),
+      );
+
+      rerender(
+        createElement(LayeredClimbImage, {
+          overlayUri: 'file:///overlay.png',
+          overlayLoadKey: '1:0',
+          backgroundPaths: [],
+          onOverlayMounted,
+        }),
+      );
+
+      expect(onOverlayMounted.mock.calls).toEqual([[null], ['1:0']]);
+    });
+
+    it('says nothing is mounted when the component goes away', () => {
+      const onOverlayMounted = vi.fn();
+      const { unmount } = render(
+        createElement(LayeredClimbImage, {
+          overlayUri: 'file:///overlay.png',
+          overlayLoadKey: '1:0',
+          backgroundPaths: [],
+          onOverlayMounted,
+        }),
+      );
+
+      unmount();
+
+      expect(onOverlayMounted.mock.calls).toEqual([['1:0'], [null]]);
+    });
+  });
+
   it('does not expose the painted anchor for a queued load from a replaced overlay generation', () => {
     const onOverlayLoad = vi.fn();
     const { container, rerender } = render(
@@ -439,6 +747,11 @@ describe('LayeredClimbImage', () => {
     expect(onOverlayLoad).toHaveBeenCalledExactlyOnceWith('1:0');
 
     act(() => imageEvents.loadCallbacks[1]?.());
+
+    expect(container.querySelector('[data-testid="play-drawer-board-overlay"]')).toBeNull();
+    act(() => imageEvents.displayCallbacks[0]?.());
+    expect(container.querySelector('[data-testid="play-drawer-board-overlay"]')).toBeNull();
+    act(() => imageEvents.displayCallbacks[1]?.());
 
     expect(container.querySelector('[data-testid="play-drawer-board-overlay"]')).toBeTruthy();
     expect(onOverlayLoad).toHaveBeenLastCalledWith('2:0');

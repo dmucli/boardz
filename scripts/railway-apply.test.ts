@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it, vi } from 'vitest';
 
+import { OBSERVE_COUNTRY_HEADER_NAME } from '../infra/cloudflare/config';
+
 import {
   CANONICAL_WEB_ORIGIN,
   CLICKHOUSE_IMAGE,
@@ -16,8 +18,10 @@ import {
   CLICKHOUSE_VOLUME_USAGE_LIMIT_PERCENT,
   INVENTORY_SERVICES,
   OTA_BASE_URL,
+  OTA_CDN_BASE_URL,
   OTA_CONTAINER_PORT,
   OTA_HEALTHCHECK_PATH,
+  OTA_GEOIP_COUNTRY_HEADER,
   OTA_IMAGE,
   OTA_IMAGE_REPOSITORY,
   OTA_POSTGRES_SERVICE_NAME,
@@ -27,7 +31,7 @@ import {
   PLACEHOLDER_PATTERN,
   POSTGRES_PRIMARY_SERVICE_NAME,
   WEB_SERVICE_NAME,
-  desiredRailwayState,
+  railwayStateForHosting,
 } from '../infra/railway/config';
 import type { ServiceDesired } from '../infra/railway/config';
 import {
@@ -79,6 +83,8 @@ import {
   waitForDeployment,
 } from './railway-apply';
 
+const desiredRailwayState = railwayStateForHosting('railway');
+
 /**
  * A value that is unmistakable in any output. Every secret-safety assertion looks
  * for this string rather than for a plausible-looking DSN, so a leak cannot hide
@@ -93,6 +99,11 @@ const OTA_CACHE_VARS = {
   REDIS_PORT: '6379',
   REDIS_PASSWORD: 'test-redis-password',
   CACHE_KEY_PREFIX: 'boardsesh-ota',
+};
+
+const OTA_GEOIP_VARS = {
+  TRUST_GEOIP_HEADERS: 'true',
+  GEOIP_HEADER_COUNTRY: OTA_GEOIP_COUNTRY_HEADER,
 };
 
 /** The live value of an OWNED variable. The plan may print the declared value; never this one. */
@@ -772,6 +783,31 @@ describe('diffServiceVars', () => {
     expect(diffServiceVars(OTA, otaLive(OTA_CACHE_VARS), PLAN_OPTIONS)).toEqual([]);
   });
 
+  it('requires Cloudflare country-header trust and the exact host-scoped header name', () => {
+    const missing = liveState({
+      variables: variablesWithOta(otaVariables({ TRUST_GEOIP_HEADERS: null, GEOIP_HEADER_COUNTRY: null })),
+    });
+    expect(diffServiceVars(OTA, missing, PLAN_OPTIONS).map((change) => change.summary)).toEqual([
+      `${OTA_SERVICE_NAME}: TRUST_GEOIP_HEADERS must be "true"`,
+      `${OTA_SERVICE_NAME}: GEOIP_HEADER_COUNTRY must be "${OTA_GEOIP_COUNTRY_HEADER}"`,
+    ]);
+
+    const wrong = liveState({
+      variables: variablesWithOta(otaVariables({ TRUST_GEOIP_HEADERS: 'false', GEOIP_HEADER_COUNTRY: 'CF-IPCountry' })),
+    });
+    expect(diffServiceVars(OTA, wrong, PLAN_OPTIONS).map((change) => change.summary)).toEqual([
+      `${OTA_SERVICE_NAME}: TRUST_GEOIP_HEADERS must be "true"`,
+      `${OTA_SERVICE_NAME}: GEOIP_HEADER_COUNTRY must be "${OTA_GEOIP_COUNTRY_HEADER}"`,
+    ]);
+  });
+
+  it('accepts the exact Observe country-header configuration', () => {
+    expect(OTA_GEOIP_COUNTRY_HEADER).toBe(OBSERVE_COUNTRY_HEADER_NAME);
+    expect(
+      diffServiceVars(OTA, liveState({ variables: variablesWithOta(otaVariables(OTA_GEOIP_VARS)) }), PLAN_OPTIONS),
+    ).toEqual([]);
+  });
+
   it('reports each missing Redis connection variable', () => {
     const summaries = diffServiceVars(
       OTA,
@@ -889,6 +925,50 @@ describe('diffServiceVars', () => {
       ]),
     );
   });
+
+  it('treats an absent or set WEB_DATABASE_URL as converged and never prints it', () => {
+    const webDatabaseUrl = 'postgresql://boardsesh_web:not-printed@db.example:5432/main';
+    const variables = convergedVariables();
+    expect(diffServiceVars(WEB, liveState({ variables }), PLAN_OPTIONS)).toEqual([]);
+    variables[WEB_SERVICE_NAME] = { ...variables[WEB_SERVICE_NAME], WEB_DATABASE_URL: webDatabaseUrl };
+    expect(diffServiceVars(WEB, liveState({ variables }), PLAN_OPTIONS)).toEqual([]);
+  });
+
+  it('reports a placeholder WEB_DATABASE_URL as blocked, never as something to write', () => {
+    const variables = convergedVariables();
+    variables[WEB_SERVICE_NAME] = { ...variables[WEB_SERVICE_NAME], WEB_DATABASE_URL: '<web-database-url>' };
+    const changes = diffServiceVars(WEB, liveState({ variables }), PLAN_OPTIONS);
+    expect(changes).toEqual([
+      expect.objectContaining({
+        summary: `${WEB_SERVICE_NAME}: WEB_DATABASE_URL is placeholder`,
+        target: { serviceName: WEB_SERVICE_NAME, varName: 'WEB_DATABASE_URL' },
+        blocked: true,
+      }),
+    ]);
+    expect(JSON.stringify(changes)).not.toContain('<web-database-url>');
+  });
+
+  it.each(['off', 'hold', 'allowlist', 'open'])('accepts PARTNER_OAUTH_MODE=%s on the web', (mode) => {
+    const variables = convergedVariables();
+    variables[WEB_SERVICE_NAME] = { ...variables[WEB_SERVICE_NAME], PARTNER_OAUTH_MODE: mode };
+    expect(diffServiceVars(WEB, liveState({ variables }), PLAN_OPTIONS)).toEqual([]);
+  });
+
+  it.each(['allowlst', 'enabled', 'Allowlist'])(
+    'reports a PARTNER_OAUTH_MODE other than the four exact values (%s), without printing it',
+    (mode) => {
+      const variables = convergedVariables();
+      variables[WEB_SERVICE_NAME] = { ...variables[WEB_SERVICE_NAME], PARTNER_OAUTH_MODE: mode };
+      const changes = diffServiceVars(WEB, liveState({ variables }), PLAN_OPTIONS);
+      expect(JSON.stringify(changes)).not.toContain(mode);
+      expect(changes).toEqual([
+        expect.objectContaining({
+          summary: expect.stringContaining('PARTNER_OAUTH_MODE must be absent or "off" or "hold"'),
+          blocked: true,
+        }),
+      ]);
+    },
+  );
 
   it('requires a canonical NEXTAUTH_URL or BASE_URL without printing the live URL', () => {
     const wrongOrigin = 'https://attacker.example';
@@ -1045,10 +1125,13 @@ describe('buildPlan', () => {
   });
 
   it('covers every table xprem creates, so none grows unbounded unnoticed', () => {
-    // The five tables in xprem's two ClickHouse migrations. A new one appearing
-    // upstream should fail here rather than quietly accumulate forever.
+    // The seven tables in xprem's ClickHouse migrations at v3.2.6. This list is
+    // typed in by hand, so it cannot see a table a later version adds: read the
+    // new migrations on every bump and add the table here and in config.ts.
     expect(CLICKHOUSE_RETENTION.map((table) => table.table).sort()).toEqual([
       'device_health_events',
+      'error_groups',
+      'error_occurrences',
       'observe_logs',
       'observe_metrics',
       'update_health_segment_snapshots',
@@ -2252,7 +2335,7 @@ async function runCli(
   for (const [key, value] of Object.entries(env)) process.env[key] = value;
 
   try {
-    const code = await main(argv, dependencies);
+    const code = await main(argv, { desired: desiredRailwayState, ...dependencies });
     return { code, error: null, output: captured.lines.join('\n'), calls: stub.calls };
   } catch (error) {
     return { code: null, error: error as Error, output: captured.lines.join('\n'), calls: stub.calls };
@@ -2362,6 +2445,24 @@ describe('serving deployment identity', () => {
     } else {
       expect(output).toContain('No rollback target');
     }
+  });
+});
+
+describe('homelab ownership fence', () => {
+  it('does not repair or query retained OTA services after ownership transfers', async () => {
+    const stub = railwayStub({
+      missingInstances: [OTA_SERVICE_NAME, CLICKHOUSE_SERVICE_NAME, OTA_POSTGRES_SERVICE_NAME],
+    });
+    const { code, error, output, calls } = await runCli(
+      ['--apply'],
+      stub,
+      { CLICKHOUSE_URL: 'not-a-valid-url' },
+      { desired: railwayStateForHosting('homelab') },
+    );
+    expect(error).toBeNull();
+    expect(code).toBe(0);
+    expect(output).not.toContain('ClickHouse volume');
+    expect(calls.filter((call) => /\bmutation\b/.test(call.query))).toEqual([]);
   });
 });
 
@@ -2517,6 +2618,59 @@ describe('apply mode', () => {
       value: OTA_BASE_URL,
     });
     expect(output).not.toContain(WRONG_OWNED_VALUE);
+  });
+
+  it('refuses to point clients at a host that does not answer, before any write', async () => {
+    // xprem stays healthy while redirecting every asset to a dead host, so the
+    // post-deploy probe cannot catch this. BASE_URL has drifted too, to prove
+    // the refusal comes before the first write and not after it.
+    const stub = railwayStub({
+      variables: variablesWithOta(otaVariables({ CDN_BASE_URL: null, BASE_URL: WRONG_OWNED_VALUE })),
+    });
+    const probed: string[] = [];
+    const { code, calls, error } = await runCli(
+      ['--apply', '--no-wait'],
+      stub,
+      {},
+      {
+        probePreflightUrl: async (url) => {
+          probed.push(url);
+          return 'getaddrinfo ENOTFOUND';
+        },
+      },
+    );
+    expect(code).toBeNull();
+    expect(error?.message).toContain('Refusing to set CDN_BASE_URL');
+    expect(error?.message).toContain('ENOTFOUND');
+    expect(probed).toEqual([`${OTA_CDN_BASE_URL}/`]);
+    expect(callsMatching(calls, 'variableUpsert')).toHaveLength(0);
+    expect(callsMatching(calls, 'serviceInstanceDeployV2(')).toHaveLength(0);
+  });
+
+  it('sets the redirect variable once its host answers', async () => {
+    const stub = railwayStub({ variables: variablesWithOta(otaVariables({ CDN_BASE_URL: null })) });
+    const answered = await runCli(['--apply', '--no-wait'], stub, {}, { probePreflightUrl: async () => null });
+    expect(answered.error).toBeNull();
+    expect(callsMatching(answered.calls, 'variableUpsert').map((call) => call.variables.input)).toEqual([
+      expect.objectContaining({ serviceId: OTA_SERVICE_ID, name: 'CDN_BASE_URL', value: OTA_CDN_BASE_URL }),
+    ]);
+  });
+
+  it('never probes the host when the redirect variable is already set', async () => {
+    const probed: string[] = [];
+    const converged = await runCli(
+      ['--apply'],
+      railwayStub(),
+      {},
+      {
+        probePreflightUrl: async (url) => {
+          probed.push(url);
+          return 'unreachable';
+        },
+      },
+    );
+    expect(converged.code).toBe(0);
+    expect(probed).toEqual([]);
   });
 
   it('writes a supplied secret without ever printing it', async () => {

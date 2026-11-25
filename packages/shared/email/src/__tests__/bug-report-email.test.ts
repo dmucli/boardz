@@ -72,6 +72,21 @@ describe('sendBugReportIssueEmail', () => {
     expect(mail.text).toContain(ISSUE_URL);
   });
 
+  it.each([
+    'reporter@privaterelay.appleid.com',
+    'another@PRIVATERELAY.APPLEID.COM',
+    'climber@icloud.com',
+    'climber@privaterelay.appleid.com.example.com',
+  ])('sends to recipient %s', async (to) => {
+    process.env.SMTP_USER = 'smtp-user@example.com';
+    process.env.SMTP_PASSWORD = 'secret';
+
+    await sendBugReportIssueEmail({ to, issueUrl: ISSUE_URL, issueNumber: 7 });
+
+    expect(sendMail).toHaveBeenCalledOnce();
+    expect(sendMail).toHaveBeenCalledWith(expect.objectContaining({ to }));
+  });
+
   it('never throws when the transport rejects', async () => {
     process.env.SMTP_USER = 'smtp-user@example.com';
     process.env.SMTP_PASSWORD = 'secret';

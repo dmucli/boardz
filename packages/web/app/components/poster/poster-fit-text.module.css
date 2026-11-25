@@ -1,0 +1,9 @@
+/* Paired with `poster-fit-text.tsx`. While the component measures how many
+ * lines a step takes, the clamp is lifted so the measurement sees every line;
+ * the step's own clamp comes back as soon as the attribute is removed. The
+ * doubled class outranks a caller's `.name[data-fit-step]` rule. */
+.fitText.fitText[data-fit-measuring] {
+  display: block;
+  -webkit-line-clamp: unset;
+  line-clamp: none;
+}

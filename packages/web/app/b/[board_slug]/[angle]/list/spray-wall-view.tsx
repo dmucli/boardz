@@ -5,8 +5,19 @@ import type { ResolvedBoard } from '@/app/lib/board-slug-utils';
 import SprayWallFrontDoor from '@/app/components/spray-wall/spray-wall-front-door';
 import { getServerTranslation } from '@/app/lib/i18n/server';
 import { createBoardContentPageMetadata } from '@/app/lib/seo/metadata';
-import { resolveSprayWallVisibility } from '@/app/lib/spray/spray-visibility';
-import { fetchSprayWallPageData, resolveSprayPhotoUrl } from '@/app/lib/spray/spray-wall-render-data.server';
+import {
+  readWallCapability,
+  resolveSprayWallAccess,
+  resolveSprayWallVisibility,
+} from '@/app/lib/spray/spray-visibility';
+import { buildOgContentVersion, buildOgFamilyImageUrl } from '@/app/lib/seo/og-family';
+import { buildNativeBoardListUrl } from '@/app/lib/native-app-link';
+import {
+  fetchSprayWallArtChoice,
+  fetchSprayWallPageData,
+  resolveSprayArtUrl,
+  resolveSprayPhotoUrl,
+} from '@/app/lib/spray/spray-wall-render-data.server';
 
 /**
  * Redeeming a wall's share link on the web.
@@ -29,6 +40,12 @@ import { fetchSprayWallPageData, resolveSprayPhotoUrl } from '@/app/lib/spray/sp
  * | unlisted | 404 | renders | 404 |
  * | private | 404 | 404 | 404 |
  *
+ * The rule itself is `resolveSprayWallAccess` in `@/app/lib/spray/spray-visibility`,
+ * shared with the climb page. Before it runs, the page passes the param to
+ * `resolveBoardBySlug` as `wallUuid`: the backend refuses an anonymous caller an
+ * unlisted wall's row on the slug alone, because a slug is derived from the
+ * wall's name and so is a guess.
+ *
  * A public wall needs no capability and its share link carries none, which is why
  * it renders on the clean URL. A private wall refuses everyone, its owner
  * included: the app is where an owner reads their own wall, and www puts a shared
@@ -41,44 +58,66 @@ import { fetchSprayWallPageData, resolveSprayPhotoUrl } from '@/app/lib/spray/sp
  * shard is catalogue-only).
  */
 
-/** The share-link capability, as it appears in the query string. */
-export const WALL_CAPABILITY_PARAM = 'wall';
-
-export type SprayWallAccess = 'render' | 'refuse';
-
 /**
- * Whether this request may see the wall, from the board row and the param alone.
+ * `generateMetadata` for the spray branch of `/b/{slug}/{angle}/list`.
  *
- * No round trip: a private wall is refused before anything asks the backend about
- * it, so the request never produces a signal that the wall exists.
+ * A refused request gets the list page's generic fallback, not the wall's name:
+ * the title must say nothing the page body would refuse to show.
  */
-export function resolveSprayWallAccess(
-  board: Pick<ResolvedBoard, 'uuid' | 'isPublic' | 'isUnlisted'>,
+export async function buildSprayWallListMetadata(
+  board: ResolvedBoard,
   wallParam: string | string[] | undefined,
-): SprayWallAccess {
-  const visibility = resolveSprayWallVisibility(board);
-  if (visibility === 'private') return 'refuse';
-  if (visibility === 'public') {
-    // A public wall is world-readable, so a param is not needed — but a WRONG one
-    // is still refused rather than ignored, because a link carrying somebody
-    // else's uuid is a mistake worth surfacing as "not here" instead of quietly
-    // showing a different wall than the sender meant.
-    return wallParam === undefined || wallParam === board.uuid ? 'render' : 'refuse';
-  }
-  return wallParam === board.uuid ? 'render' : 'refuse';
-}
-
-/** `generateMetadata` for the spray branch of `/b/{slug}/{angle}/list`. */
-export async function buildSprayWallListMetadata(board: ResolvedBoard): Promise<Metadata> {
+): Promise<Metadata> {
   const { t, locale } = await getServerTranslation('climbs');
 
+  if (resolveSprayWallAccess(board, wallParam) === 'refuse') {
+    return createBoardContentPageMetadata({
+      title: t('metadata.list.fallbackTitle'),
+      description: t('metadata.list.fallbackDescription'),
+      locale,
+      robots: { index: false, follow: true },
+    });
+  }
+
+  const title = t('spray.wall.metadata.title', { wallName: board.name });
+  const description = t('spray.wall.metadata.description', { wallName: board.name, angle: board.angle });
+  // Always, for every wall. See the docblock above: the URL a shared wall is
+  // read at carries a capability, so there is no clean twin to canonicalise to.
+  const robots = { index: false, follow: true };
+
+  // Only a public wall gets a card, and only when it has a public photo copy:
+  // the backend draws that copy and 404s anything else. An unlisted wall keeps
+  // the generic site card, so its capability never reaches an image URL and its
+  // photo, which lives behind short-lived signatures, never reaches a preview.
+  // The read is anonymous and the page body makes the same one.
+  const wallData =
+    resolveSprayWallVisibility(board) === 'public' ? await fetchSprayWallPageData(board.uuid).catch(() => null) : null;
+  if (!wallData?.wall.publicPhotoUrl) {
+    return createBoardContentPageMetadata({ title, description, locale, robots });
+  }
+
+  const imageUrl = buildOgFamilyImageUrl(
+    'place',
+    { kind: 'board', slug: board.slug },
+    buildOgContentVersion(
+      board.name,
+      board.angle,
+      wallData.versionNumber,
+      wallData.wall.holdCount,
+      wallData.wall.publicPhotoUrl,
+    ),
+  );
   return createBoardContentPageMetadata({
-    title: t('spray.wall.metadata.title', { wallName: board.name }),
-    description: t('spray.wall.metadata.description', { wallName: board.name, angle: board.angle }),
+    title,
+    description,
+    ogTitle: t('spray.wall.metadata.ogTitle', { wallName: board.name }),
+    ogDescription: t('spray.wall.metadata.ogDescription', {
+      angle: board.angle,
+      count: wallData.wall.holdCount,
+    }),
     locale,
-    // Always, for every wall. See the docblock above: the URL a shared wall is
-    // read at carries a capability, so there is no clean twin to canonicalise to.
-    robots: { index: false, follow: true },
+    robots,
+    ...(imageUrl ? { imagePath: imageUrl } : {}),
   });
 }
 
@@ -96,12 +135,18 @@ export default async function SprayWallListPage({
   // Null here is a wall the backend will not hand over — soft-deleted, or with
   // nothing published yet. Same answer as a refused capability.
   if (!wallData) notFound();
+  const art = await fetchSprayWallArtChoice(board.uuid, wallData.versionNumber);
 
   return (
     <SprayWallFrontDoor
       wallData={wallData}
       photoUrl={resolveSprayPhotoUrl(wallData, board.isPublic)}
+      art={art}
+      artUrl={resolveSprayArtUrl(wallData.wall.uuid, art)}
       angle={board.angle}
+      // The capability rides along when the page was opened with one; the check
+      // above has already matched it to this wall.
+      appLink={buildNativeBoardListUrl(board.slug, board.angle, readWallCapability(wallParam))}
     />
   );
 }

@@ -20,6 +20,8 @@ export type HelpClipName =
   | 'zone-filter-drag'
   | 'grade-range-tap'
   | 'preview-browsing'
+  | 'wall-swipe-to-drive'
+  | 'put-on-board-timed-drive'
   | 'start-playlist-queue';
 
 export type HelpClipSources = {
@@ -47,5 +49,32 @@ export function helpClip(name: HelpClipName): HelpClipSources {
     poster: resolveStaticAssetUrl(`/images/help/clips/${name}.webp`),
     width: CLIP_WIDTH,
     height: CLIP_HEIGHT,
+  };
+}
+
+/** Longer walkthroughs are cut for both desktop and phone viewing. */
+export type HelpWalkthroughName = 'spray-walls-walkthrough' | 'spray-holds-editor';
+
+export type HelpWalkthroughSources = {
+  portrait: HelpClipSources;
+  landscape: HelpClipSources;
+};
+
+export function helpWalkthrough(name: HelpWalkthroughName): HelpWalkthroughSources {
+  return {
+    portrait: {
+      mp4: resolveStaticAssetUrl(`/videos/help/${name}.mp4`),
+      webm: resolveStaticAssetUrl(`/videos/help/${name}.webm`),
+      poster: resolveStaticAssetUrl(`/images/help/clips/${name}.webp`),
+      width: 720,
+      height: 1280,
+    },
+    landscape: {
+      mp4: resolveStaticAssetUrl(`/videos/help/${name}-landscape.mp4`),
+      webm: resolveStaticAssetUrl(`/videos/help/${name}-landscape.webm`),
+      poster: resolveStaticAssetUrl(`/images/help/clips/${name}-landscape.webp`),
+      width: 1280,
+      height: 720,
+    },
   };
 }

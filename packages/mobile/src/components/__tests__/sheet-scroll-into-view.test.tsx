@@ -1,4 +1,9 @@
 // @vitest-environment jsdom
+vi.mock('../use-ios-sheet-background-style', () => ({ useIosSheetBackgroundStyle: () => undefined }));
+vi.mock('../../hooks/use-accessible-input-style', () => ({
+  useAccessibleInputStyle: (style: unknown) => style,
+  useBrandInputColors: () => undefined,
+}));
 //
 // #5665: with the keyboard up, the logbook edit sheet's Note field sat under the
 // keyboard. Nothing scrolled the sheet body to the focused field, and nothing
@@ -33,8 +38,10 @@ type NativeSheetMockProps = { children?: ReactNode; onChange?: (index: number) =
 // stars 56 + tries 60 = 352, plus the note row's 4pt `alignTop` inset.
 const NOTE_TOP = 356;
 const NOTE_HEIGHT = 64;
-// Body height at the 80% detent (595 column - 56 header - 140 footer) and with
-// the keyboard up at the 92% detent (see TickNoteField's derivation).
+// Body height at the 80% detent (595 column - 56 header - 140 footer) and a
+// tight keyboard-up body: 162 is the 92% detent's body from before the footer
+// dropped its window inset under the keyboard (TickNoteField now derives 196).
+// The smaller number is the harder case for the reveal maths.
 const BODY_AT_REST = 399;
 const BODY_KEYBOARD_UP = 162;
 const CONTENT_HEIGHT = 540;
@@ -44,7 +51,7 @@ const NOTE_REVEALED = 270;
 const native = vi.hoisted(() => ({
   scrollTo: vi.fn(),
   snapToIndex: vi.fn(),
-  hapticMedium: vi.fn(),
+  hapticSelection: vi.fn(),
   probeLayout: vi.fn(),
   sheetOnChange: null as null | ((index: number) => void),
   contentView: { tag: 'content-view' },
@@ -103,7 +110,9 @@ vi.mock('react-native', () => ({
     select: (options: { ios?: unknown }) => options.ios,
   },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  KeyboardAvoidingView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+  // The keyboard padding arrives here as a body onLayout; no keyboard events needed.
+  Keyboard: { addListener: () => ({ remove: () => {} }), isVisible: () => false, metrics: () => undefined },
+  LayoutAnimation: { configureNext: () => {} },
   useWindowDimensions: () => ({ width: 390, height: 844 }),
   StyleSheet: {
     create: (styles: Record<string, unknown>) => styles,
@@ -117,7 +126,7 @@ vi.mock('react-native-safe-area-context', () => ({
   useSafeAreaInsets: () => ({ top: 44, bottom: 34, left: 0, right: 0 }),
 }));
 
-vi.mock('../../lib/haptics', () => ({ hapticMedium: () => native.hapticMedium() }));
+vi.mock('../../lib/haptics', () => ({ hapticSelection: () => native.hapticSelection() }));
 
 // The #3922 probe is dev-only; stub it so its body `onLayout` is observable.
 vi.mock('../sheet-detent-probe', () => ({
@@ -136,6 +145,8 @@ vi.mock('../../theme/tokens', () => ({ spacing: { 2: 8, 3: 12, 4: 16, 6: 24 } })
 
 vi.mock('../../providers/theme-provider', () => ({
   useTheme: () => ({
+    variant: 'liquidGlass',
+    m3: { outline: '#ddd' },
     systemColors: { secondaryBackground: '#fff', separator: '#ccc', fill: '#eee', label: '#000' },
     brandColors: { primary: '#6D28D9' },
     borderRadius: { lg: 12 },
@@ -185,7 +196,7 @@ beforeEach(() => {
   native.scrollTo.mockClear();
   native.snapToIndex.mockReset();
   native.snapToIndex.mockImplementation((index: number) => native.sheetOnChange?.(index));
-  native.hapticMedium.mockClear();
+  native.hapticSelection.mockClear();
   native.probeLayout.mockClear();
   native.sheetOnChange = null;
   native.measuredRelativeTo = [];
@@ -209,8 +220,9 @@ describe('revealScrollOffset', () => {
     expect(revealScrollOffset({ ...base, viewportHeight: BODY_KEYBOARD_UP, currentOffset: 400 })).toBe(NOTE_TOP);
   });
 
-  // An iPhone 13 mini with the keyboard up: 812 - 50 - 24 = 738 x 0.92 = 679,
-  // less 336 keyboard, 56 header, 140 footer = ~147pt of body.
+  // A body too short for the 160pt note plus its margin. An iPhone 13 mini
+  // with the keyboard up shows 812 - 50 - 24 = 738 x 0.92 = 679, less 336
+  // keyboard, 56 header, 106 footer = ~181pt; larger text sizes shrink it to here.
   const SMALL_PHONE_BODY = 147;
 
   it('drops the margin first when a long note and its margin do not fit', () => {
@@ -253,15 +265,18 @@ describe.each([
 ] as const)('%s + TickNoteField', (_name, SheetComponent) => {
   it('raises the sheet to its keyboard detent on focus, without the drag haptic', () => {
     renderNoteSheet(SheetComponent);
+    // Resting open at the first detent, so the snap below is a detent CHANGE.
+    dragSheetTo(0);
     focusNote();
     expect(native.snapToIndex).toHaveBeenCalledWith(1);
-    expect(native.hapticMedium).not.toHaveBeenCalled();
+    expect(native.hapticSelection).not.toHaveBeenCalled();
   });
 
   it('still gives a climber-driven detent change its haptic', () => {
     renderNoteSheet(SheetComponent);
+    dragSheetTo(0);
     dragSheetTo(1);
-    expect(native.hapticMedium).toHaveBeenCalledTimes(1);
+    expect(native.hapticSelection).toHaveBeenCalledTimes(1);
   });
 
   it('scrolls the note clear of the footer once the keyboard shrinks the body', () => {

@@ -1,10 +1,33 @@
-import { db } from '../../db/client';
+import { GraphQLError } from 'graphql';
+import {
+  resolveLockedSessionBoardId,
+  resolveSessionBoardId,
+  SESSION_BOARD_LOCK_TIMEOUT_MS,
+} from '../session-board-binding';
+import { lockActiveBoardForWrite } from '../board-reference-lock';
+import type { DbTransaction } from '../../db/after-commit';
+import { publishSessionBoardPathChanged } from '../session-wall-refresh';
+import {
+  notifyResourcePrivacyChanged,
+  projectSessionBoardPath,
+  sessionsVisibleUserIds,
+} from '../board-session-privacy';
+import { requireResourceAccess, resourceAccessCondition, sessionBoardLocationCondition } from '../privacy';
+import { db, runWithDatabaseTransaction } from '../../db/client';
 import { sessions, type Session } from '../../db/schema';
-import { userBoards } from '@boardsesh/db/schema/app';
-import { eq, and, gt, gte, lt, lte, ne, isNull, sql } from 'drizzle-orm';
+import { sessionBoards } from '@boardsesh/db/schema/app';
+import { eq, and, asc, gt, gte, lt, lte, ne, sql, getTableColumns } from 'drizzle-orm';
 import { haversineDistance, getBoundingBox, DEFAULT_SEARCH_RADIUS_METERS } from '../../utils/geo';
 import type { DiscoverableSession, LiveSession, RoomManagerDeps } from './types';
 import { logger } from '../../utils/logger';
+import type { PartnerDatabase } from '../../auth/partner/tables';
+import {
+  lockSessionAppWorkouts,
+  lockSessionAppWorkoutUsers,
+  completeSessionAppWorkouts,
+} from '../public-api/workout-lifecycle';
+import { lockAppWorkoutSession, type AppWorkoutRow } from '../public-api/workouts';
+import { reportCompletedAppWorkouts } from '../public-api/workout-telemetry';
 import { hasLiveConnectionsOrSessionKey, readSessionLiveness } from './session-liveness';
 
 /**
@@ -13,7 +36,7 @@ import { hasLiveConnectionsOrSessionKey, readSessionLiveness } from './session-l
  * `board_sessions` also holds inferred sessions (`origin = 'inferred'`), which are
  * reconstructed from tick timing and are over before they exist. They have no board
  * path and nothing to join, so every live-session loader scopes them out here rather
- * than leaving each caller to remember. See `docs/inferred-sessions.md`.
+ * than leaving each caller to remember. See `docs/data/inferred-sessions.md`.
  */
 const isLiveSessionRow = eq(sessions.origin, 'explicit');
 
@@ -42,46 +65,77 @@ export async function getSessionById(sessionId: string): Promise<LiveSession | n
   return result[0] ? toLiveSession(result[0]) : null;
 }
 
-/**
- * Update the session's stored boardPath. Returns the previous value when
- * the update actually mutated state, or `null` when the row was already
- * at `boardPath` (idempotent no-op). Throws when the session row doesn't
- * exist — distinguishing "not found" from "unchanged" lets the caller
- * publish `SessionBoardPathChanged` strictly on real transitions instead
- * of overloading `null` across both meanings.
- *
- * **Not atomic.** Two queries: SELECT the existing boardPath, then UPDATE
- * if it differs. Two concurrent callers can both read the same prior
- * value and both publish `SessionBoardPathChanged`. We accept this because
- * the event is idempotent on the client (`router.replace` to the same URL
- * is a no-op) and the realistic write pressure is one angle-selector tap
- * at a time per device. If a future caller can't tolerate double-publish,
- * tighten to a single-statement CTE
- * (`UPDATE sessions SET boardPath = $2, ... FROM (SELECT boardPath AS prev FROM sessions WHERE id = $1) sub WHERE id = $1 AND sub.prev <> $2 RETURNING sub.prev`)
- * or use Redis-backed CAS the same way `setSessionBoardSerialAndReturnPrevious`
- * does. The concurrent double-publish path is pinned in
- * `wall-confirm-and-board-serial.test.ts`'s `setSessionBoardPath` block.
- */
-export async function updateSessionBoardPathIfChanged(sessionId: string, boardPath: string): Promise<string | null> {
-  // Read-then-write — simpler than a CTE and matches the
-  // setSessionBoardSerialAndReturnPrevious shape elsewhere. See the outer
-  // JSDoc for the non-atomicity contract this consciously accepts.
-  const existing = await db
-    .select({ boardPath: sessions.boardPath })
-    .from(sessions)
-    .where(eq(sessions.id, sessionId))
-    .limit(1);
-  if (existing.length === 0) {
-    // Resolvers should reach the helper only after `requireSessionMember`,
-    // which already throws when the row is missing. Reaching this branch
-    // means a race between leave/sweep and the boardPath write — surface
-    // it explicitly rather than returning `null` (the "unchanged" signal).
-    throw new Error(`updateSessionBoardPathIfChanged: session ${sessionId} not found`);
+/** Change the path and its durable privacy parents in the same transaction. */
+export async function updateSessionBoardPathIfChanged(
+  sessionId: string,
+  boardPath: string,
+  viewerId?: string | null,
+  changedByParticipantId: string | null = null,
+): Promise<string | null> {
+  const transition = await runWithDatabaseTransaction(async (executor) => {
+    const tx = executor as unknown as DbTransaction;
+    const [snapshot] = await tx
+      .select({ boardPath: sessions.boardPath, boardId: sessions.boardId })
+      .from(sessions)
+      .where(eq(sessions.id, sessionId));
+    if (!snapshot) throw new Error(`updateSessionBoardPathIfChanged: session ${sessionId} not found`);
+    const boardId = await resolveSessionBoardId(boardPath, viewerId, sessionId);
+    const previousPathBoardId =
+      snapshot.boardId ?? (await resolveSessionBoardId(snapshot.boardPath ?? '', viewerId, sessionId));
+    // A session is readable only through every wall it references. Prior wall
+    // activity stays capped when the party moves to another wall.
+    const parents = [
+      ...new Set([snapshot.boardId, previousPathBoardId, boardId].filter((id): id is number => id !== null)),
+    ];
+    for (const parentId of [...parents].sort((first, second) => first - second)) {
+      if (!(await lockActiveBoardForWrite(tx, { id: parentId }, { lockTimeoutMs: SESSION_BOARD_LOCK_TIMEOUT_MS })))
+        throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+    }
+    // Board-before-session matches tick writers. Recheck the snapshot after
+    // taking the session lock so a concurrent wall move cannot supply access.
+    const [existing] = await tx
+      .select({ boardPath: sessions.boardPath, boardId: sessions.boardId })
+      .from(sessions)
+      .where(eq(sessions.id, sessionId))
+      .for('update');
+    if (!existing || existing.boardPath !== snapshot.boardPath || existing.boardId !== snapshot.boardId)
+      throw new GraphQLError('This session changed. Retry the session action.', { extensions: { code: 'CONFLICT' } });
+    if ((await resolveSessionBoardId(boardPath, viewerId, sessionId)) !== boardId)
+      throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+    await requireResourceAccess('session', sessionId, viewerId);
+    if (existing.boardPath === boardPath && existing.boardId === boardId) return null;
+    if (parents.length)
+      await tx
+        .insert(sessionBoards)
+        .values(parents.map((parentId) => ({ sessionId, boardId: parentId })))
+        .onConflictDoNothing();
+    await tx.update(sessions).set({ boardPath, boardId, lastActivity: new Date() }).where(eq(sessions.id, sessionId));
+    return {
+      previous: existing.boardPath,
+      parentChanged: existing.boardId !== boardId || previousPathBoardId !== boardId,
+    };
+  });
+  if (!transition) return null;
+  // Viewers who lost the session through the new wall are refused on their
+  // next read, and their live streams end at their next event. A move to
+  // another wall changes identity projections for opted-in climbers, even when
+  // both walls are public, so connected peers re-project their roster and
+  // queue. An angle change keeps the wall: peers only apply the path.
+  // Published before the preview's fallible reads.
+  publishSessionBoardPathChanged(sessionId, boardPath, changedByParticipantId, transition.parentChanged);
+  if (transition.parentChanged) {
+    // The move has committed, and a retry would find the path already stored,
+    // so a failed kiosk refresh is logged rather than failing the move.
+    try {
+      await notifyResourcePrivacyChanged('session', sessionId);
+    } catch (error) {
+      logger.error('[SessionDiscovery] kiosk preview refresh failed after a committed wall move', {
+        sessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
-  const previous = existing[0].boardPath;
-  if (previous === boardPath) return null;
-  await db.update(sessions).set({ boardPath, lastActivity: new Date() }).where(eq(sessions.id, sessionId));
-  return previous;
+  return transition.previous;
 }
 
 /**
@@ -101,41 +155,14 @@ export async function createDiscoverableSession(
 ): Promise<Session> {
   const now = new Date();
 
-  // Auto-resolve boardId from slug paths (e.g., "/b/my-home-wall")
-  let boardId: number | null = null;
-  const slugMatch = boardPath.match(/^\/b\/([^/]+)/);
-  if (slugMatch) {
-    const boardRows = await db
-      .select({ id: userBoards.id })
-      .from(userBoards)
-      .where(and(eq(userBoards.slug, slugMatch[1]), isNull(userBoards.deletedAt)))
-      .limit(1);
-    if (boardRows[0]) {
-      boardId = boardRows[0].id;
-    }
-  }
+  return runWithDatabaseTransaction(async (executor) => {
+    const tx = executor as unknown as DbTransaction;
+    const boardId = await resolveLockedSessionBoardId(tx, boardPath, userId);
 
-  const result = await db
-    .insert(sessions)
-    .values({
-      id: sessionId,
-      boardPath,
-      latitude,
-      longitude,
-      discoverable: true,
-      createdByUserId: userId,
-      name: name || null,
-      lastActivity: now,
-      goal: goal || null,
-      isPermanent: isPermanent || false,
-      color: color || null,
-      startedAt: now,
-      boardId,
-      isPublic,
-    })
-    .onConflictDoUpdate({
-      target: sessions.id,
-      set: {
+    const result = await tx
+      .insert(sessions)
+      .values({
+        id: sessionId,
         boardPath,
         latitude,
         longitude,
@@ -149,11 +176,35 @@ export async function createDiscoverableSession(
         startedAt: now,
         boardId,
         isPublic,
-      },
-    })
-    .returning();
+      })
+      .onConflictDoUpdate({
+        target: sessions.id,
+        set: {
+          boardPath,
+          latitude,
+          longitude,
+          discoverable: true,
+          createdByUserId: userId,
+          name: name || null,
+          lastActivity: now,
+          goal: goal || null,
+          isPermanent: isPermanent || false,
+          color: color || null,
+          startedAt: now,
+          boardId,
+          isPublic,
+        },
+        setWhere: and(
+          eq(sessions.createdByUserId, userId),
+          eq(sessions.boardPath, boardPath),
+          sql`${sessions.boardId} IS NOT DISTINCT FROM ${boardId}`,
+        ),
+      })
+      .returning();
 
-  return result[0];
+    if (!result[0]) throw new GraphQLError('Session not found', { extensions: { code: 'NOT_FOUND' } });
+    return result[0];
+  });
 }
 
 /**
@@ -165,6 +216,7 @@ export async function findNearbySessions(
   latitude: number,
   longitude: number,
   radiusMeters: number = DEFAULT_SEARCH_RADIUS_METERS,
+  viewerId?: string,
 ): Promise<DiscoverableSession[]> {
   const box = getBoundingBox(latitude, longitude, radiusMeters);
 
@@ -174,6 +226,9 @@ export async function findNearbySessions(
     .where(
       and(
         eq(sessions.discoverable, true),
+        // Nearby is discovery: an unlisted session's link never lists it.
+        resourceAccessCondition('session', sessions.id, viewerId, { allowUnlistedLink: false }),
+        sessionBoardLocationCondition(sessions.id, viewerId),
         ne(sessions.status, 'ended'),
         gte(sessions.latitude, box.minLat),
         lte(sessions.latitude, box.maxLat),
@@ -198,33 +253,41 @@ export async function findNearbySessions(
     sessionsWithDistance.map(({ session }) => session.id),
   );
 
-  const result: DiscoverableSession[] = [];
-  for (const { session, distance } of sessionsWithDistance) {
+  const liveSessions = sessionsWithDistance.flatMap(({ session, distance }) => {
     const liveness = livenessBySession.get(session.id);
-    if (!liveness || !hasLiveConnectionsOrSessionKey(liveness)) {
-      continue;
-    }
-    const { participantCount } = liveness;
+    return liveness && hasLiveConnectionsOrSessionKey(liveness)
+      ? [{ session, distance, participantCount: liveness.participantCount }]
+      : [];
+  });
+  // The host is named by their account, and stays anonymous when they chose to
+  // and the session's board is not theirs (or nothing places it on one yet).
+  // One query for every host on the page.
+  const visibleHosts = await sessionsVisibleUserIds(
+    liveSessions.map(({ session }) => ({ session, userIds: [session.createdByUserId] })),
+    viewerId,
+  );
 
-    result.push({
+  return Promise.all(
+    liveSessions.map(async ({ session, distance, participantCount }, index): Promise<DiscoverableSession> => ({
       id: session.id,
       name: session.name,
-      boardPath: session.boardPath,
-      latitude: session.latitude,
-      longitude: session.longitude,
+      // A deleted or renamed named board's slug is not this viewer's to read,
+      // and a nearby listing is discovery: an unlisted gym's walls stay unnamed.
+      boardPath: await projectSessionBoardPath(session.boardPath, viewerId, { discovery: true }),
+      latitude: 0,
+      longitude: 0,
       createdAt: session.createdAt,
-      createdByUserId: session.createdByUserId,
+      createdByUserId:
+        session.createdByUserId && visibleHosts[index].has(session.createdByUserId) ? session.createdByUserId : null,
       participantCount,
-      distance,
+      distance: Math.ceil(distance / 1000) * 1000,
       isActive: true,
       goal: session.goal || null,
       isPublic: session.isPublic,
       isPermanent: session.isPermanent,
       color: session.color || null,
-    });
-  }
-
-  return result;
+    })),
+  );
 }
 
 /**
@@ -234,12 +297,23 @@ export async function getUserSessions(userId: string): Promise<LiveSession[]> {
   const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
   const result = await db
-    .select()
+    .select({ ...getTableColumns(sessions), locationVisible: sessionBoardLocationCondition(sessions.id, userId) })
     .from(sessions)
-    .where(and(eq(sessions.createdByUserId, userId), gt(sessions.createdAt, sevenDaysAgo), isLiveSessionRow))
+    .where(
+      and(
+        eq(sessions.createdByUserId, userId),
+        gt(sessions.createdAt, sevenDaysAgo),
+        isLiveSessionRow,
+        resourceAccessCondition('session', sessions.id, userId),
+      ),
+    )
     .orderBy(sessions.lastActivity);
 
-  return result.map(toLiveSession).filter((session): session is LiveSession => session !== null);
+  return result
+    .map(({ locationVisible, ...session }) =>
+      toLiveSession(locationVisible ? session : { ...session, latitude: null, longitude: null }),
+    )
+    .filter((session): session is LiveSession => session !== null);
 }
 
 /**
@@ -271,7 +345,21 @@ export async function endSession(deps: RoomManagerDeps, sessionId: string): Prom
 
   // Mark as ended in Postgres
   const now = new Date();
-  await db.update(sessions).set({ status: 'ended', lastActivity: now, endedAt: now }).where(eq(sessions.id, sessionId));
+  const completedWorkouts = await db.transaction(async (tx) => {
+    const transaction = tx as unknown as PartnerDatabase;
+    const workouts = await lockSessionAppWorkouts(transaction, sessionId);
+    const ended = await tx
+      .update(sessions)
+      .set({ status: 'ended', lastActivity: now, endedAt: now })
+      .where(and(eq(sessions.id, sessionId), ne(sessions.status, 'ended')))
+      .returning({ id: sessions.id });
+    if (ended.length) {
+      await completeSessionAppWorkouts(transaction, workouts, 'completed', now);
+      return workouts;
+    }
+    return [];
+  });
+  await reportCompletedAppWorkouts(completedWorkouts, 'completed');
 
   // Remove from memory
   sessionsMap.delete(sessionId);
@@ -306,7 +394,8 @@ const INACTIVITY_SWEEP_LOCK_KEY = 19551850;
  * lock for this tick.
  */
 export async function endStaleInactiveSessions(thresholdMs: number): Promise<string[]> {
-  return db.transaction(async (tx) => {
+  const completedWorkouts: AppWorkoutRow[] = [];
+  const endedSessionIds = await db.transaction(async (tx) => {
     const lockResult = await tx.execute<{ locked: boolean }>(
       sql`SELECT pg_try_advisory_xact_lock(${INACTIVITY_SWEEP_LOCK_KEY}) AS locked`,
     );
@@ -318,9 +407,9 @@ export async function endStaleInactiveSessions(thresholdMs: number): Promise<str
     // endedAt mirrors the existing lastActivity so session duration reflects
     // when the user actually stopped, not when the sweep ran. lastActivity is
     // left untouched so the column keeps recording last-evidence going forward.
-    const result = await tx
-      .update(sessions)
-      .set({ status: 'ended', endedAt: sql`${sessions.lastActivity}` })
+    const candidates = await tx
+      .select({ id: sessions.id })
+      .from(sessions)
       .where(
         and(
           eq(sessions.status, 'active'),
@@ -333,10 +422,36 @@ export async function endStaleInactiveSessions(thresholdMs: number): Promise<str
           isLiveSessionRow,
         ),
       )
-      .returning({ id: sessions.id });
+      .orderBy(asc(sessions.id))
+      .limit(100);
+    const result: Array<{ id: string }> = [];
+    // Take every session fence before any user/connection lock. Otherwise a
+    // later session could wait for an End holding its fence and awaiting a
+    // connection that an earlier session in this batch already holds.
+    for (const candidate of candidates) await lockAppWorkoutSession(tx as unknown as PartnerDatabase, candidate.id);
+    await lockSessionAppWorkoutUsers(
+      tx as unknown as PartnerDatabase,
+      candidates.map((candidate) => candidate.id),
+    );
+    for (const candidate of candidates) {
+      const transaction = tx as unknown as PartnerDatabase;
+      const workouts = await lockSessionAppWorkouts(transaction, candidate.id);
+      const [ended] = await tx
+        .update(sessions)
+        .set({ status: 'ended', endedAt: sql`${sessions.lastActivity}` })
+        .where(and(eq(sessions.id, candidate.id), eq(sessions.status, 'active'), lt(sessions.lastActivity, cutoff)))
+        .returning({ id: sessions.id, endedAt: sessions.endedAt });
+      if (ended) {
+        await completeSessionAppWorkouts(transaction, workouts, 'auto_closed', ended.endedAt ?? new Date());
+        completedWorkouts.push(...workouts);
+        result.push({ id: ended.id });
+      }
+    }
     if (result.length > 0) {
       logger.info(`[RoomManager] Auto-ended ${result.length} inactive session(s)`);
     }
     return result.map((row) => row.id);
   });
+  await reportCompletedAppWorkouts(completedWorkouts, 'auto_closed');
+  return endedSessionIds;
 }

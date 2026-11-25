@@ -41,7 +41,9 @@ export type CrewFeedResult = { items: CrewFeedItem[]; cursor: string | null; has
  * The board configuration a logged climb should be drawn on (GraphQL
  * `RenderBoardConfig`). Resolved server-side against the climber's own boards —
  * see `resolveRenderBoard` in `@boardsesh/board-config` for the ladder. Null on
- * payloads that don't resolve it; clients then fall back to the layout default.
+ * payloads that don't resolve it; clients then fall back to the layout default,
+ * except for Woods, where null means the climb has no known size and clients draw
+ * a plain tile (the two sizes number their holds from separate origins).
  */
 export type RenderBoardConfig = {
   layoutId: number;
@@ -64,6 +66,10 @@ export type FollowingAscentFeedItem = {
   status: string;
   attemptCount: number;
   quality?: number;
+  // Raw quality, or the climber's synced star rating for this climb and angle
+  // when the tick has none. Sends and flashes only; null when the resolver
+  // doesn't compute it.
+  effectiveQuality?: number | null;
   difficulty?: number;
   difficultyName?: string;
   isBenchmark: boolean;
@@ -77,6 +83,10 @@ export type FollowingAscentFeedItem = {
   upvotes?: number | null;
   downvotes?: number | null;
   commentCount?: number | null;
+  // `boardsesh_ticks.climb_revision` and the climb's `revision_number` now.
+  // Populated by followingClimbAscents only.
+  climbRevision?: number | null;
+  climbCurrentRevision?: number | null;
 };
 
 export type AscentFeedItem = {
@@ -110,9 +120,29 @@ export type AscentFeedItem = {
   qualityAverage?: number | null;
   isBenchmark: boolean;
   isNoMatch: boolean;
+  // Structured climb characteristics (e.g. 'no_match', 'method_footless').
+  // Decode with the CLIMB_CHARACTERISTICS helpers (isNoMatch / getMoonBoardMethod).
+  characteristics?: string[] | null;
   comment: string;
   climbedAt: string;
   frames?: string | null;
+  // `boardsesh_ticks.climb_revision` and the climb's `revision_number` now. A
+  // log on a lower revision than the current one was made on an earlier version
+  // of the climb. Null/undefined means unknown.
+  climbRevision?: number | null;
+  climbCurrentRevision?: number | null;
+};
+
+export type UserLoggedSettersInput = {
+  boardTypes?: string[];
+  layoutIds?: number[];
+  search?: string;
+  limit?: number;
+};
+
+export type LoggedSetter = {
+  setterUsername: string;
+  tickCount: number;
 };
 
 export type AscentFeedInput = {
@@ -129,6 +159,8 @@ export type AscentFeedInput = {
   minAngle?: number;
   maxAngle?: number;
   benchmarkOnly?: boolean;
+  minQuality?: number;
+  setterUsernames?: string[];
   sortBy?:
     | 'recent'
     | 'hardest'
@@ -157,8 +189,68 @@ export type FollowingClimbAscentsInput = {
   climbUuid: string;
 };
 
+export type FollowingClimbAscentsAngleCount = {
+  angle: number;
+  climberCount: number;
+  senderCount: number;
+};
+
+export type FollowingClimbAscentsSummary = {
+  climberCount: number;
+  senderCount: number;
+  /** One entry per angle that has a log, ascending. */
+  byAngle: FollowingClimbAscentsAngleCount[];
+};
+
 export type FollowingClimbAscentsResult = {
+  /** The 100 newest logs. Counts come from `summary`, never from this length. */
   items: FollowingAscentFeedItem[];
+  hasMore: boolean;
+  summary: FollowingClimbAscentsSummary;
+};
+
+export type ClimbLogsInput = {
+  boardType: string;
+  climbUuid: string;
+  /** Only logs at this angle. Left out means every angle. */
+  angle?: number | null;
+  withNotes?: boolean | null;
+  sendsOnly?: boolean | null;
+  /** Signed-in callers only: drops their own logs and logs by people they follow. */
+  excludeFollowed?: boolean | null;
+  /** One row per climber: their newest log that passes the other filters. */
+  latestPerClimber?: boolean | null;
+  limit?: number | null;
+  cursor?: string | null;
+};
+
+export type ClimbLogItem = {
+  uuid: string;
+  userId: string;
+  userDisplayName?: string | null;
+  userAvatarUrl?: string | null;
+  climbUuid: string;
+  boardType: string;
+  angle: number;
+  isMirror: boolean;
+  status: string;
+  attemptCount: number;
+  quality?: number | null;
+  effectiveQuality?: number | null;
+  difficulty?: number | null;
+  comment: string;
+  climbedAt: string;
+  // `boardsesh_ticks.climb_revision` and the climb's `revision_number` now. A
+  // log on a lower revision than the current one was made on an earlier version
+  // of the climb. Null/undefined means unknown.
+  climbRevision?: number | null;
+  climbCurrentRevision?: number | null;
+};
+
+export type ClimbLogsResult = {
+  items: ClimbLogItem[];
+  cursor?: string | null;
+  hasMore: boolean;
 };
 
 export type ActivityFeedItemType = 'ascent' | 'new_climb' | 'comment' | 'proposal_approved' | 'session_summary';
@@ -264,6 +356,9 @@ export type SessionFeedTickHighlight = {
   isMirror: boolean;
   isBenchmark: boolean;
   isNoMatch: boolean;
+  // Structured climb characteristics (e.g. 'no_match', 'method_footless').
+  // Decode with the CLIMB_CHARACTERISTICS helpers (isNoMatch / getMoonBoardMethod).
+  characteristics?: string[] | null;
   comment?: string | null;
   frames?: string | null;
   setterUsername?: string | null;
@@ -330,6 +425,9 @@ export type SessionDetailTick = {
   isMirror: boolean;
   isBenchmark: boolean;
   isNoMatch: boolean;
+  // Structured climb characteristics (e.g. 'no_match', 'method_footless').
+  // Decode with the CLIMB_CHARACTERISTICS helpers (isNoMatch / getMoonBoardMethod).
+  characteristics?: string[] | null;
   comment?: string | null;
   frames?: string | null;
   setterUsername?: string | null;

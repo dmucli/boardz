@@ -8,28 +8,31 @@ import { GitHub, GroupOutlined, FavoriteBorderOutlined, ApiOutlined, RocketLaunc
 import { useTranslation } from 'react-i18next';
 import LocaleLink from '@/app/components/i18n/locale-link';
 import { PageShell, PageSection, Prose } from '@/app/components/ui/page-shell';
-import { MarketingScreenshot, MarketingPreviewSwitch } from '@/app/components/marketing/marketing-screenshot';
+import TrustFaq from '@/app/components/marketing/trust-faq';
+import { MarketingScreenshot } from '@/app/components/marketing/marketing-screenshot';
+import { MarketingPreviewSwitch } from '@/app/components/marketing/marketing-preview-switch';
 import styles from './about.module.css';
+import type { DeveloperDocsState } from '@/app/lib/developer-apps/docs-access';
 
-export default function AboutContent() {
+export default function AboutContent({
+  developerDocsState = 'unavailable',
+}: {
+  developerDocsState?: DeveloperDocsState;
+}) {
   const { t } = useTranslation('marketing');
   return (
     <PageShell title={t('about.hero.title')} lead={t('about.hero.subtitle')} width="wide">
       <Box className={styles.story}>
-        {/* The old "Our Vision" said the same thing the landing page says, in the
-            same words. This is the part only About can tell: what the problem
-            actually was, and what happened when it bit. The Aurora outage is
-            written up properly on /aurora-migration — link to it rather than
-            re-litigate someone else's dispute on a marketing page. */}
         <PageSection title={t('about.story.title')} icon={<RocketLaunchOutlined />} className={styles.vision}>
           <Prose>{t('about.story.p1')}</Prose>
           <Prose>{t('about.story.p2')}</Prose>
           <Prose>
-            <MuiLink component={LocaleLink} href="/aurora-migration">
+            <MuiLink component={LocaleLink} href="/bring-your-logbook#old-kilter-app">
               {t('about.story.link')}
             </MuiLink>
           </Prose>
         </PageSection>
+
         <Box component="figure" className={styles.preview}>
           <Typography component="figcaption" className={styles.caption}>
             {t('about.profile.title')}
@@ -38,7 +41,6 @@ export default function AboutContent() {
           <MarketingScreenshot
             shot="profile"
             alt={t('about.profile.shotAlt')}
-            preload
             className={styles.screenshot}
             sizes="(max-width: 760px) 240px, 280px"
           />
@@ -91,13 +93,22 @@ export default function AboutContent() {
 
         <PageSection title={t('about.api.title')} icon={<ApiOutlined />} className={styles.projectSection}>
           <Prose>{t('about.api.body')}</Prose>
-          <Prose>
-            <MuiLink component={LocaleLink} href="/docs">
-              {t('about.api.cta')}
-            </MuiLink>
-          </Prose>
+          <Prose>{t(`about.api.status.${developerDocsState}`)}</Prose>
+          {developerDocsState !== 'unavailable' ? (
+            <Prose>
+              <MuiLink component={LocaleLink} href="/developers">
+                {t('about.api.cta')}
+              </MuiLink>
+            </Prose>
+          ) : null}
         </PageSection>
       </Box>
+
+      <TrustFaq />
+
+      <PageSection title={t('funding.title')}>
+        <Prose>{t('funding.body')}</Prose>
+      </PageSection>
 
       <PageSection title={t('about.community.title')} icon={<FavoriteBorderOutlined />} className={styles.community}>
         <Prose>{t('about.community.body')}</Prose>

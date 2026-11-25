@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { VEIL_TUNING } from '@boardsesh/board-art-geometry';
 
 // The store hydrates from AsyncStorage once per JS lifetime, so every case that
@@ -26,17 +26,20 @@ const {
   EDITING_VEIL_OPACITY,
   _resetBoardRenderSettingsForTests,
   boardFieldColorForScheme,
+  boardLookForRender,
   buildBoardRenderSignature,
   loadBoardRenderSettings,
   requestedBoardRenderMode,
   resolveEffectiveRenderSettings,
   resolveVeilOpacity,
+  sanitizeBoardRenderDefault,
   sanitizeBoardRenderSettings,
   setBoardRenderModePreference,
   setBoardRenderSettingsPreference,
   setBoardseshRenderFieldPreference,
   resetBoardRenderSettings,
 } = await import('../board-render-settings');
+const { ACCESSIBILITY_OWNED_BOARDSESH_FIELDS } = await import('../board-render-presets');
 
 type BoardseshRenderSettings = typeof DEFAULT_BOARDSESH_RENDER_SETTINGS;
 type BoardRenderSettings = typeof DEFAULT_BOARD_RENDER_SETTINGS;
@@ -172,6 +175,16 @@ describe('sanitizeBoardRenderSettings', () => {
 
     expect(sanitizeBoardRenderSettings(chosen)).toEqual(chosen);
   });
+
+  it('keeps the outline mark and its stroke alpha through a round-trip', () => {
+    // `outline` must survive the sanitiser, or a climber who picked Aura Outline
+    // would silently land back on the glow. `fillOpacity` is the outline
+    // stroke's alpha, so it must survive unchanged too.
+    const outline = settingsWith({ markStyle: 'outline', fillOpacity: 0.9, glowReach: 0.5, glowFalloff: 'soft' });
+    const sanitized = sanitizeBoardRenderSettings(outline);
+    expect(sanitized).toEqual(outline);
+    expect(sanitizeBoardRenderSettings(JSON.parse(JSON.stringify(sanitized)))).toEqual(outline);
+  });
 });
 
 describe('persistence', () => {
@@ -263,6 +276,147 @@ describe('resolveEffectiveRenderSettings', () => {
   });
 });
 
+describe('a board default (a spray wall’s stored look)', () => {
+  // Off every shipped default on purpose, so a test that silently fell back to
+  // the viewer's own (default) bundle could not pass by coincidence.
+  const wallLook = {
+    mode: 'aura' as const,
+    boardsesh: {
+      ...DEFAULT_BOARDSESH_RENDER_SETTINGS,
+      markStyle: 'outline' as const,
+      glowReach: 0.5,
+      fillOpacity: 0.9,
+    },
+  };
+  const classicWall = { mode: 'classic' as const, boardsesh: DEFAULT_BOARDSESH_RENDER_SETTINGS };
+
+  it('wins over a mode the viewer picked, because onboarding makes nearly everyone pick one', () => {
+    // The opt-out is the caller's: a climber who chose their own look on spray
+    // walls gets no board default passed in at all.
+    const viewer = settingsWith({ glowReach: 1.5 }, 'aura');
+    const effective = resolveEffectiveRenderSettings(viewer, true, classicWall);
+    expect(effective.mode).toBe('classic');
+    expect(effective.boardsesh).toEqual(classicWall.boardsesh);
+    expect(requestedBoardRenderMode(viewer, classicWall)).toBe('classic');
+
+    const classicViewer = settingsWith({}, 'classic');
+    const onWall = resolveEffectiveRenderSettings(classicViewer, true, wallLook);
+    expect(onWall.mode).toBe('aura');
+    expect(onWall.boardsesh.markStyle).toBe('outline');
+    expect(requestedBoardRenderMode(classicViewer, wallLook)).toBe('aura');
+  });
+
+  it('is passed for a real surface, and left out for an opt-out, a preview card and the heatmap', () => {
+    const base = { storedLook: wallLook, useOwnLook: false, hasSettingsOverride: false, hasMarkStyleOverride: false };
+    expect(boardLookForRender(base)).toBe(wallLook);
+    expect(boardLookForRender({ ...base, useOwnLook: true })).toBeNull();
+    expect(boardLookForRender({ ...base, hasSettingsOverride: true })).toBeNull();
+    expect(boardLookForRender({ ...base, hasMarkStyleOverride: true })).toBeNull();
+    expect(boardLookForRender({ ...base, storedLook: null })).toBeNull();
+  });
+
+  it("is the viewer's own look when no board default is passed (opted out, or a preview)", () => {
+    const viewer = settingsWith({ glowReach: 1.5 }, 'aura');
+    expect(resolveEffectiveRenderSettings(viewer, true, null).boardsesh).toBe(viewer.boardsesh);
+    expect(requestedBoardRenderMode(settingsWith({}, 'classic'), null)).toBe('classic');
+  });
+
+  it("supplies both the mode and the knobs to a viewer on 'default'", () => {
+    const effective = resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true, wallLook);
+    expect(effective.mode).toBe('aura');
+    expect(effective.boardsesh).toEqual(wallLook.boardsesh);
+
+    expect(resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true, classicWall).mode).toBe('classic');
+    expect(requestedBoardRenderMode(DEFAULT_BOARD_RENDER_SETTINGS, classicWall)).toBe('classic');
+  });
+
+  it('moves the cache signature with the board default, so the two looks never share a PNG', () => {
+    const plain = buildBoardRenderSignature(
+      resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true),
+      DARK_FIELD,
+      0.6,
+    );
+    const walled = buildBoardRenderSignature(
+      resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true, wallLook),
+      DARK_FIELD,
+      0.6,
+    );
+    expect(walled).not.toBe(plain);
+    expect(walled).toContain('marks-outline');
+  });
+
+  it('still forces classic when the renderer cannot draw the board default', () => {
+    const effective = resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, false, wallLook);
+    expect(effective.mode).toBe('classic');
+    expect(effective.rendererAvailable).toBe(false);
+  });
+
+  it("keeps a viewer's role glyphs on over a board look that has them off", () => {
+    // The same floor a preset pick respects: glyphs are the only non-colour
+    // channel a colour-blind climber has. The field list is pinned so a new
+    // accessibility-owned field cannot be added to the presets without here.
+    expect(ACCESSIBILITY_OWNED_BOARDSESH_FIELDS).toEqual(['roleGlyphs']);
+    const viewer = { mode: 'default' as const, boardsesh: { ...DEFAULT_BOARDSESH_RENDER_SETTINGS, roleGlyphs: true } };
+    const effective = resolveEffectiveRenderSettings(viewer, true, wallLook);
+    expect(effective.boardsesh.roleGlyphs).toBe(true);
+    expect(effective.boardsesh.markStyle).toBe('outline');
+  });
+
+  it("is today's behaviour when absent", () => {
+    for (const absent of [null, undefined]) {
+      const effective = resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true, absent);
+      expect(effective).toEqual(resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true));
+      expect(effective.mode).toBe('aura');
+      expect(requestedBoardRenderMode(DEFAULT_BOARD_RENDER_SETTINGS, absent)).toBe('aura');
+    }
+  });
+
+  it('treats a malformed or legacy board default as absent rather than throwing', () => {
+    const malformed: unknown[] = [
+      { mode: 'boardsesh', boardsesh: DEFAULT_BOARDSESH_RENDER_SETTINGS },
+      { mode: 'default', boardsesh: DEFAULT_BOARDSESH_RENDER_SETTINGS },
+      { mode: 'aura' },
+      { mode: 'classic', boardsesh: 'outline' },
+      { boardsesh: DEFAULT_BOARDSESH_RENDER_SETTINGS },
+      'aura',
+      42,
+      [],
+    ];
+    const baseline = resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true);
+    for (const value of malformed) {
+      const boardDefault = value as BoardRenderSettings;
+      expect(() => resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true, boardDefault)).not.toThrow();
+      expect(resolveEffectiveRenderSettings(DEFAULT_BOARD_RENDER_SETTINGS, true, boardDefault)).toEqual(baseline);
+      expect(requestedBoardRenderMode(DEFAULT_BOARD_RENDER_SETTINGS, boardDefault)).toBe('aura');
+    }
+  });
+});
+
+describe('sanitizeBoardRenderDefault', () => {
+  it('keeps a well-formed value, clamping its knobs like a stored preference', () => {
+    const sanitized = sanitizeBoardRenderDefault({
+      mode: 'aura',
+      boardsesh: { ...DEFAULT_BOARDSESH_RENDER_SETTINGS, glowReach: 99, markStyle: 'outline' },
+    });
+    expect(sanitized?.mode).toBe('aura');
+    expect(sanitized?.boardsesh.glowReach).toBe(BOARD_RENDER_SETTING_BOUNDS.glowReach.max);
+    expect(sanitized?.boardsesh.markStyle).toBe('outline');
+  });
+
+  it('fills a partial bundle from the shipped defaults', () => {
+    expect(sanitizeBoardRenderDefault({ mode: 'classic', boardsesh: {} })).toEqual({
+      mode: 'classic',
+      boardsesh: DEFAULT_BOARDSESH_RENDER_SETTINGS,
+    });
+  });
+
+  it('answers null for anything that is not a real default', () => {
+    for (const value of [null, undefined, 'aura', 7, [], {}, { mode: 'default', boardsesh: {} }, { mode: 'aura' }]) {
+      expect(sanitizeBoardRenderDefault(value)).toBeNull();
+    }
+  });
+});
+
 describe('the editing-surface veil', () => {
   it("is off — an editing board gets Aura's glow on an unwashed wall", () => {
     expect(EDITING_VEIL_OPACITY).toBe(VEIL_SETTING_OPACITY.off);
@@ -317,6 +471,13 @@ describe('buildBoardRenderSignature', () => {
     // light-mode overlay reused in dark mode would show an unquieted wall.
     expect(boardseshSignature({}, 0)).toBe('mode-boardsesh.veil-off');
     expect(boardseshSignature({}, 0)).not.toBe(boardseshSignature({}, 0.6));
+  });
+
+  it('gives the outline mark its own cache key', () => {
+    // Without the token an outline render would share a PNG with the glow
+    // render of the same climb, and whichever drew first is what both show.
+    expect(boardseshSignature({ markStyle: 'outline' })).toContain('marks-outline');
+    expect(boardseshSignature({ markStyle: 'outline' })).not.toBe(boardseshSignature({}));
   });
 
   it('is deterministic for the same settings', () => {
@@ -415,53 +576,5 @@ describe('buildBoardRenderSignature', () => {
     expect(boardseshSignature({ veil: 'strong' }, 0.6)).toBe(
       boardseshSignature({ veil: 'custom', veilOpacity: 0.6 }, 0.6),
     );
-  });
-});
-
-describe('screenshot builds pin the drawing', () => {
-  const originalScreenshotMode = process.env.EXPO_PUBLIC_SCREENSHOT_MODE;
-  const originalRenderMode = process.env.EXPO_PUBLIC_SCREENSHOT_RENDER_MODE;
-
-  afterEach(() => {
-    if (originalScreenshotMode === undefined) delete process.env.EXPO_PUBLIC_SCREENSHOT_MODE;
-    else process.env.EXPO_PUBLIC_SCREENSHOT_MODE = originalScreenshotMode;
-    if (originalRenderMode === undefined) delete process.env.EXPO_PUBLIC_SCREENSHOT_RENDER_MODE;
-    else process.env.EXPO_PUBLIC_SCREENSHOT_RENDER_MODE = originalRenderMode;
-    vi.resetModules();
-  });
-
-  // The store set exists to show the shipped look; a preference file surviving a
-  // reinstall (or a default moving) must not be able to change what it shoots.
-  it('ignores a stored preference and asks for Aura', async () => {
-    storage.set(STORAGE_KEY, JSON.stringify({ mode: 'classic' }));
-    process.env.EXPO_PUBLIC_SCREENSHOT_MODE = '1';
-    vi.resetModules();
-
-    const { loadBoardRenderSettings: loadPinned } = await import('../board-render-settings');
-
-    expect((await loadPinned()).mode).toBe('aura');
-  });
-
-  it('shoots the classic look when the run asks for it', async () => {
-    process.env.EXPO_PUBLIC_SCREENSHOT_MODE = '1';
-    process.env.EXPO_PUBLIC_SCREENSHOT_RENDER_MODE = 'classic';
-    vi.resetModules();
-
-    const { loadBoardRenderSettings: loadPinned } = await import('../board-render-settings');
-
-    expect((await loadPinned()).mode).toBe('classic');
-  });
-
-  // `default` is the stored value that MEANS "whatever the app draws"; this is the
-  // storage layer, so it is what an unusable override has to land on.
-  // `requestedBoardRenderMode` is what turns it into a drawing.
-  it('stores the app default for a render mode it does not recognise', async () => {
-    process.env.EXPO_PUBLIC_SCREENSHOT_MODE = '1';
-    process.env.EXPO_PUBLIC_SCREENSHOT_RENDER_MODE = 'shimmer';
-    vi.resetModules();
-
-    const { loadBoardRenderSettings: loadPinned } = await import('../board-render-settings');
-
-    expect((await loadPinned()).mode).toBe('default');
   });
 });

@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 
-import { TABLE_CONFIGS, BOARD_DATA_TABLES, USER_DATA_TABLES } from '../table-config';
+import {
+  TABLE_CONFIGS,
+  BOARD_DATA_TABLES,
+  USER_DATA_TABLES,
+  refreshColumnsFor,
+  refreshRevisionFor,
+} from '../table-config';
 
 /**
  * Pins the two halves of the spray-wall sync contract that nothing else can
@@ -72,7 +78,7 @@ describe('captureOnDelete', () => {
   });
 
   it('is declared for spray_walls, whose row is the only thing that names its photo', () => {
-    expect([...(TABLE_CONFIGS.spray_walls.captureOnDelete ?? [])]).toEqual(['layout_id', 'photo_key']);
+    expect([...(TABLE_CONFIGS.spray_walls.captureOnDelete ?? [])]).toEqual(['layout_id', 'board_uuid', 'photo_key']);
   });
 });
 
@@ -90,5 +96,41 @@ describe('board_climbs.missing_hold_count', () => {
     // downloaded catalogue to fetch it.
     expect(config.refreshRevision).toBe(1);
     expect(config.refreshColumns).toEqual(['is_hidden']);
+  });
+});
+
+describe('climb revision columns (#6023)', () => {
+  it('are synced on both tables', () => {
+    expect(TABLE_CONFIGS.boardsesh_ticks.localColumns).toContain('climb_revision');
+    expect(TABLE_CONFIGS.board_climbs.localColumns).toContain('revision_number');
+    expect(TABLE_CONFIGS.board_climbs.localColumns).toContain('holds_revision_number');
+  });
+
+  it('do NOT bump the refresh revision or join the refresh columns', () => {
+    // An edited climb is re-delivered by the cursor because the edit bumps its
+    // `sync_seq`; everything else is on revision 1, where NULL and 1 stamp the
+    // same tick. A bump would re-crawl every downloaded catalogue for nothing.
+    expect(TABLE_CONFIGS.board_climbs.refreshRevision).toBe(1);
+    expect(TABLE_CONFIGS.board_climbs.refreshColumns).toEqual(['is_hidden']);
+  });
+});
+
+describe('board_climbs.retired_by_reset (#6024)', () => {
+  it('is synced', () => {
+    expect(TABLE_CONFIGS.board_climbs.localColumns).toContain('retired_by_reset');
+  });
+
+  it('replays and requires the column on spray scopes only, never on a catalogue', () => {
+    // Only a full spray reset sets the flag. A spray replay backfills rows an
+    // older bundle dropped it from; the same on Kilter would re-crawl every
+    // downloaded catalogue to write NULLs.
+    expect(refreshRevisionFor('board_climbs', 'spray')).toBe(3);
+    expect(refreshRevisionFor('board_climbs', 'kilter')).toBe(1);
+    expect(refreshRevisionFor('board_climb_stats', 'spray')).toBe(1);
+    expect(refreshRevisionFor('board_climb_grades', 'spray')).toBe(1);
+    expect(refreshRevisionFor('board_climb_stats', 'kilter')).toBeUndefined();
+    expect(refreshRevisionFor('board_climb_grades', 'kilter')).toBeUndefined();
+    expect(refreshColumnsFor('board_climbs', 'spray')).toEqual(['is_hidden', 'retired_by_reset']);
+    expect(refreshColumnsFor('board_climbs', 'kilter')).toEqual(['is_hidden']);
   });
 });

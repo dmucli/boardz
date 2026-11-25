@@ -43,6 +43,15 @@ vi.mock('../db/client', () => {
 });
 
 vi.mock('../services/analytics/live-activity', () => analyticsMocks);
+// Transport/analytics tests keep authorization in the real-DB APNs suite.
+vi.mock('../services/privacy', () => ({
+  canAccessResource: async () => true,
+}));
+vi.mock('../services/board-session-privacy', () => ({
+  canReadClimbContent: async () => true,
+  sessionVisibleUserIds: async (userIds: readonly (string | null | undefined)[]) =>
+    new Set(userIds.filter((userId): userId is string => !!userId)),
+}));
 
 async function loadApnsModule(): Promise<typeof import('../services/apns')> {
   vi.resetModules();
@@ -104,7 +113,6 @@ describe('APNs analytics instrumentation', () => {
     );
 
     expect(analyticsMocks.trackLiveActivityPushDelivery).toHaveBeenCalledWith({
-      userId: 'user-1',
       sessionId: SESSION_ID,
       event: 'update',
       source: 'registration',
@@ -150,7 +158,6 @@ describe('APNs analytics instrumentation', () => {
     );
 
     expect(analyticsMocks.trackLiveActivityPushDelivery).toHaveBeenCalledWith({
-      userId: 'user-1',
       sessionId: SESSION_ID,
       event: 'update',
       source: 'registration',
@@ -161,7 +168,6 @@ describe('APNs analytics instrumentation', () => {
       elapsedMs: expect.any(Number),
     });
     expect(analyticsMocks.trackLiveActivityPushDelivery).toHaveBeenCalledWith({
-      userId: 'user-2',
       sessionId: SESSION_ID,
       event: 'update',
       source: 'registration',
@@ -228,7 +234,6 @@ describe('APNs analytics instrumentation', () => {
 
     expect(analyticsMocks.trackLiveActivityPushDelivery).toHaveBeenCalledWith(
       expect.objectContaining({
-        userId: 'user-1',
         sessionId: SESSION_ID,
         event: 'end',
         source: 'event',
@@ -249,7 +254,6 @@ describe('APNs analytics instrumentation', () => {
       }),
     );
     expect(analyticsMocks.trackLiveActivityEnded).toHaveBeenCalledWith({
-      userId: 'user-1',
       sessionId: SESSION_ID,
       reason: 'session-ended',
       tokenCount: 2,

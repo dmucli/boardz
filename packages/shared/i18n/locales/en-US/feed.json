@@ -22,6 +22,60 @@
         "everyone": "Everyone",
         "findGym": "Find a gym near you",
         "hint": "Switches whose climbs you see"
+      },
+      "sections": {
+        "week": {
+          "title": "This week",
+          "sessions_one": "{{count}} session",
+          "sessions_other": "{{count}} sessions",
+          "sends_one": "{{count}} send",
+          "sends_other": "{{count}} sends",
+          "hardest": "Hardest this week {{grade}}",
+          "weeksRunning_one": "{{count}} week running",
+          "weeksRunning_other": "{{count}} weeks running",
+          "recordFirstGrade": "New: your first {{grade}}",
+          "recordHardestFlash": "New: your hardest flash, {{grade}}",
+          "recordClimb": "{{record}} · {{climb}}",
+          "empty": "Log a send to start your week",
+          "dayClimbed": "{{day}}, climbed",
+          "openRecord": "Open {{climb}}"
+        },
+        "session": {
+          "startTitle": "Start a session",
+          "startBody": "Pick a workout or just climb",
+          "running": "Session running",
+          "open": "Open session",
+          "lastWorkoutToday": "Last workout · Today",
+          "lastWorkoutYesterday": "Last workout · Yesterday",
+          "lastWorkoutOn": "Last workout · {{day}}",
+          "lastWorkoutSends_one": "{{count}} send",
+          "lastWorkoutSends_other": "{{count}} sends"
+        },
+        "projects": {
+          "title": "Back to your projects",
+          "tries_one": "{{count}} try",
+          "tries_other": "{{count}} tries",
+          "seeAll": "See all",
+          "unknownClimb": "Unknown climb"
+        },
+        "playlists": {
+          "title": "At your level, unsent",
+          "all": "All playlists"
+        },
+        "empty": {
+          "title": "Your Home is empty",
+          "body": "Turn sections back on to see your board, your session or your crew."
+        },
+        "beta": {
+          "title": "Fresh beta",
+          "titleBoard": "Fresh beta on this board",
+          "empty": "No beta videos yet",
+          "error": "Couldn't load beta videos.",
+          "offline": "No signal. Fresh beta shows up again when you're back online.",
+          "offlineMode": "Offline mode is on. Fresh beta shows up again when you turn it off.",
+          "unknownClimb": "Unknown climb",
+          "openClimb": "Open {{climb}}"
+        }
       }
     },
     "liveSessions": {

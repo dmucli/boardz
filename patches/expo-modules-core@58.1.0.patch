@@ -1,0 +1,142 @@
+diff --git a/android/src/main/java/expo/modules/kotlin/views/ExpoViewCommandReceiver.kt b/android/src/main/java/expo/modules/kotlin/views/ExpoViewCommandReceiver.kt
+new file mode 100644
+index 0000000..e2001a5
+--- /dev/null
++++ b/android/src/main/java/expo/modules/kotlin/views/ExpoViewCommandReceiver.kt
+@@ -0,0 +1,16 @@
++package expo.modules.kotlin.views
++
++/**
++ * Lets an Expo view receive Fabric view commands, such as the ones Reanimated's
++ * `dispatchCommand` sends from a UI-thread worklet. The view manager wrappers
++ * forward every command to a view that implements this interface; without it
++ * React Native drops the command, because the wrappers have no delegate.
++ */
++interface ExpoViewCommandReceiver {
++  /**
++   * [args] holds the command's arguments as `ReadableArray.toArrayList()` gives
++   * them: numbers are Doubles. Returns true when the view handled the command,
++   * false to fall through to React Native.
++   */
++  fun receiveViewCommand(commandId: String, args: List<Any?>): Boolean
++}
+diff --git a/android/src/main/java/expo/modules/kotlin/views/GroupViewManagerWrapper.kt b/android/src/main/java/expo/modules/kotlin/views/GroupViewManagerWrapper.kt
+index b3440d8..9b42247 100644
+--- a/android/src/main/java/expo/modules/kotlin/views/GroupViewManagerWrapper.kt
++++ b/android/src/main/java/expo/modules/kotlin/views/GroupViewManagerWrapper.kt
+@@ -2,6 +2,7 @@ package expo.modules.kotlin.views
+ 
+ import android.view.View
+ import android.view.ViewGroup
++import com.facebook.react.bridge.ReadableArray
+ import com.facebook.react.uimanager.ReactStylesDiffMap
+ import com.facebook.react.uimanager.StateWrapper
+ import com.facebook.react.uimanager.ThemedReactContext
+@@ -53,6 +54,16 @@ class GroupViewManagerWrapper(
+     return props
+   }
+ 
++  // Fabric delivers view commands (e.g. Reanimated's dispatchCommand) here; without a
++  // delegate React Native drops them. Views opt in through ExpoViewCommandReceiver.
++  override fun receiveCommand(view: ViewGroup, commandId: String, args: ReadableArray?) {
++    val receiver = view as? ExpoViewCommandReceiver
++    if (receiver != null && receiver.receiveViewCommand(commandId, args?.toArrayList() ?: emptyList())) {
++      return
++    }
++    super.receiveCommand(view, commandId, args)
++  }
++
+   override fun onDropViewInstance(view: ViewGroup) {
+     super.onDropViewInstance(view)
+     viewWrapperDelegate.onDestroy(view)
+diff --git a/android/src/main/java/expo/modules/kotlin/views/SimpleViewManagerWrapper.kt b/android/src/main/java/expo/modules/kotlin/views/SimpleViewManagerWrapper.kt
+index 1a15d12..cf7f556 100644
+--- a/android/src/main/java/expo/modules/kotlin/views/SimpleViewManagerWrapper.kt
++++ b/android/src/main/java/expo/modules/kotlin/views/SimpleViewManagerWrapper.kt
+@@ -1,6 +1,7 @@
+ package expo.modules.kotlin.views
+ 
+ import android.view.View
++import com.facebook.react.bridge.ReadableArray
+ import com.facebook.react.uimanager.ReactStylesDiffMap
+ import com.facebook.react.uimanager.SimpleViewManager
+ import com.facebook.react.uimanager.StateWrapper
+@@ -51,6 +52,16 @@ class SimpleViewManagerWrapper(
+     return props
+   }
+ 
++  // Fabric delivers view commands (e.g. Reanimated's dispatchCommand) here; without a
++  // delegate React Native drops them. Views opt in through ExpoViewCommandReceiver.
++  override fun receiveCommand(view: View, commandId: String, args: ReadableArray?) {
++    val receiver = view as? ExpoViewCommandReceiver
++    if (receiver != null && receiver.receiveViewCommand(commandId, args?.toArrayList() ?: emptyList())) {
++      return
++    }
++    super.receiveCommand(view, commandId, args)
++  }
++
+   override fun onDropViewInstance(view: View) {
+     super.onDropViewInstance(view)
+     viewWrapperDelegate.onDestroy(view)
+diff --git a/ios/Core/AppContext.swift b/ios/Core/AppContext.swift
+index 61b1168..a1f0e34 100644
+--- a/ios/Core/AppContext.swift
++++ b/ios/Core/AppContext.swift
+@@ -42,6 +42,10 @@ public class AppContext: NSObject, EXAppContextProtocol, @unchecked Sendable {
+    */
+   private var isModuleRegistryInitialized: Bool = false
+ 
++  // Runtime teardown can precede ARC deallocation when another runtime or an
++  // asynchronous operation still retains this context.
++  private var hasPostedAppContextDestroys = false
++
+   /**
+    The legacy module registry with modules written in the old-fashioned way.
+    */
+@@ -664,8 +668,10 @@ public class AppContext: NSObject, EXAppContextProtocol, @unchecked Sendable {
+     sharedObjectRegistry.clear()
+     classRegistry.clear()
+ 
+-    for module in moduleRegistry {
+-      module.releaseJavaScriptObject()
++    if isModuleRegistryInitialized {
++      for module in moduleRegistry {
++        module.releaseJavaScriptObject()
++      }
+     }
+   }
+ 
+@@ -754,9 +760,22 @@ public class AppContext: NSObject, EXAppContextProtocol, @unchecked Sendable {
+       // Otherwise the JSCRuntime asserts may fail on deallocation.
+       releaseRuntimeObjects()
+     }
++    postAppContextDestroysOnce()
+     _runtime = nil
+   }
+ 
++  private func postAppContextDestroysOnce() {
++    guard !hasPostedAppContextDestroys else {
++      return
++    }
++    // Set the guard before callbacks: listeners and _runtime.didSet can reenter
++    // destroy(). Do not force the lazy registry to initialize during teardown.
++    hasPostedAppContextDestroys = true
++    if isModuleRegistryInitialized {
++      moduleRegistry.post(event: .appContextDestroys)
++    }
++  }
++
+   /**
+    Cleans things up before deallocation.
+    */
+@@ -772,9 +791,7 @@ public class AppContext: NSObject, EXAppContextProtocol, @unchecked Sendable {
+     // Post an event to the registry only if it was already created.
+     // If we let it to lazy-load here, that would crash since the module registry
+     // has a weak reference to the app context which is being deallocated.
+-    if isModuleRegistryInitialized {
+-      moduleRegistry.post(event: .appContextDestroys)
+-    }
++    postAppContextDestroysOnce()
+   }
+ 
+   @objc

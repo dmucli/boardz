@@ -1,0 +1,141 @@
+name: Mobile Store Videos
+
+on:
+  workflow_run:
+    workflows: [Mobile Store Draft Submission]
+    types: [completed]
+    # Draft runs report main as head_branch. Their title and source artifact
+    # identify main; a branches filter would drop version-only releases.
+  workflow_dispatch:
+    inputs:
+      variants:
+        type: string
+        default: all
+        description: 'Page variants to record, render and publish: all, or a comma list of default, kilter, tension, moonboard, spray.'
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  source:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (vars.STORE_VIDEOS_ENABLED == 'true' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.display_title == 'Mobile Store Draft (main)' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      open: ${{ steps.source_gate.outputs.open }}
+      version: ${{ steps.source_gate.outputs.version }}
+      source_sha: ${{ steps.source_gate.outputs.source_sha }}
+    steps:
+      - name: Checkout trusted workflow tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/store-videos-gate.ts
+            scripts/lib/mobile-release-version.ts
+            scripts/lib/mobile-release-policy.ts
+            scripts/lib/release-tags.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - name: Find the successful iOS draft source
+        if: github.event_name == 'workflow_run'
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          count="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$DRAFT_RUN_ID/artifacts" --jq '[.artifacts[] | select(.name == "store-video-source" and .expired == false)] | length')"
+          if [ "$count" -eq 1 ]; then
+            echo 'found=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::notice::No successful iOS draft source; skipping store video recording.'
+          fi
+      - name: Download the exact draft source
+        if: steps.source.outputs.found == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: store-video-source
+          path: ${{ runner.temp }}/store-video-source
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Skip a closed or superseded release before dependencies or environment approval
+        if: github.event_name == 'workflow_dispatch' || steps.source.outputs.found == 'true'
+        id: source_gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_DRAFT_SOURCE: ${{ steps.source.outputs.found }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$HAS_DRAFT_SOURCE" = true ]; then args+=("$RUNNER_TEMP/store-video-source/source.json"); fi
+          node --experimental-strip-types scripts/store-videos-gate.ts gate "${args[@]}" --source-only
+
+  editable:
+    needs: source
+    if: needs.source.outputs.open == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    environment: Production
+    outputs:
+      open: ${{ steps.draft.outputs.open }}
+      version: ${{ steps.draft.outputs.version }}
+      source_sha: ${{ steps.draft.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/store-videos-gate.ts
+            scripts/lib/mobile-release-version.ts
+            scripts/lib/mobile-release-policy.ts
+            scripts/lib/release-tags.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+      - name: Retain the automatic run's exact draft source
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: store-video-source
+          path: ${{ runner.temp }}/store-video-source
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Require an editable App Store version and recheck the release
+        id: draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+          HAS_DRAFT_SOURCE: ${{ github.event_name == 'workflow_run' }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$HAS_DRAFT_SOURCE" = true ]; then args+=("$RUNNER_TEMP/store-video-source/source.json"); fi
+          node --experimental-strip-types scripts/store-videos-gate.ts gate "${args[@]}"
+
+  pipeline:
+    needs: editable
+    if: needs.editable.outputs.open == 'true'
+    uses: ./.github/workflows/mobile-store-videos-pipeline.yml
+    with:
+      source_sha: ${{ needs.editable.outputs.source_sha }}
+      version: ${{ needs.editable.outputs.version }}
+      # Automatic runs have no inputs and keep the full five-variant matrix.
+      variants: ${{ inputs.variants || 'all' }}
+    secrets: inherit

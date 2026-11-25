@@ -75,6 +75,12 @@
   "gymPage": {
     "metaTitle": "Kletterhalle {{gymName}}",
     "metaDescription": "Sieh dir die Boards und die Live-Wand von {{gymName}} auf Boardsesh an.",
+    "metaTitleName": "{{gymName}}",
+    "metaTitleLocation": "{{gymName}}, {{location}}",
+    "metaTitleBoards": "{{venue}}: {{boards}}",
+    "metaBoardAngle": "{{board}} mit {{angle}}°",
+    "metaDescriptionBoards": "{{venue}} bietet {{boards}}. Sieh, was an der Wand leuchtet, und öffne die Boulder in Boardsesh.",
+    "metaDescriptionLocation": "{{gymName}} ({{location}}). Sieh dir die Boards und die Live-Wand auf Boardsesh an.",
     "breadcrumbHome": "Boardsesh",
     "breadcrumbGyms": "Hallen",
     "manageGym": "Halle verwalten",
@@ -87,14 +93,13 @@
     "visitWebsite": "Website besuchen",
     "install": {
       "heading": "Hol dir die App für diese Wand",
-      "body": "Beleuchte die Boards in {{gymName}} vom Handy aus und logg jede Begehung.",
-      "googlePlay": "Jetzt bei Google Play",
-      "appStore": "Laden im App Store"
+      "body": "Beleuchte die Boards in {{gymName}} vom Handy aus und logg jede Begehung."
     },
     "noBoardsYet": "Hier sind noch keine Boards gelistet.",
     "explorePlaylists": "Sieh, was Kletterer*innen zusammenstellen",
-    "claimTitle": "Ist das deine Halle?",
-    "claimBody": "Übernimm sie und steuere die Boards, den Auftritt und das, was an der Wand läuft.",
+    "startDiscussion": "Diskussion starten",
+    "claimTitle": "Du betreust diese Halle?",
+    "claimBody": "Beanspruch sie, um Boards zu korrigieren, Öffnungszeiten einzutragen und die Wand auf einen TV zu bringen. Kostenlos.",
     "claimCta": "Diese Halle übernehmen",
     "claimCtaSignedOut": "Anmelden und übernehmen",
     "claimPendingTitle": "Dein Anspruch wird geprüft",
@@ -137,12 +142,52 @@
       "printAction": "Poster drucken",
       "backToGym": "Zurück zur Halle"
     },
-    "sprayWallsHeading": "Spray Walls",
-    "sprayWallCount_one": "{{count}} Wand",
-    "sprayWallCount_other": "{{count}} Wände",
-    "sprayWallsIntro": "Die Spray Walls dieser Halle, Griff für Griff. Öffne eine und sieh, was dort geschraubt wurde.",
+    "sprayWallsHeading": "Spraywalls",
+    "sprayWallCount_one": "{{count}} Spraywall",
+    "sprayWallCount_other": "{{count}} Spraywalls",
+    "sprayWallsIntro": "Die Spraywalls dieser Halle, Griff für Griff. Öffne eine und sieh, was dort geschraubt wurde.",
     "sprayWallPhotoAlt": "Foto von {{wallName}}",
-    "sprayWallMeta": "{{angle}}° · {{holds}} Griffe"
+    "sprayWallMeta": "{{angle}}° · {{holds}} Griffe",
+    "ogTitle": "{{gymName}} · {{boards}}",
+    "ogDescriptionOneType": "{{board}} bei {{gymName}}. Sieh dir an, was geschraubt ist, und trag deine Begehungen ein.",
+    "ogDescriptionManyTypes": "{{boards}} bei {{gymName}}. Sieh dir an, was geschraubt ist, und trag deine Begehungen ein.",
+    "ogDescriptionNoBoards": "Hier sind noch keine Boards eingetragen. Du kletterst hier? Übernimm die Halle und trag sie ein.",
+    "openMaps": "{{gymName}} auf der Karte öffnen",
+    "mapsLocation": "Karte öffnen",
+    "boardAngle": "{{configuration}} · {{angle}}°",
+    "seeClimbs": "Boulder ansehen",
+    "popularClimbHeading": "Der am häufigsten geloggte Boulder an diesem Board",
+    "popularClimbBody": "Aus öffentlichen Begehungen und Flashs, die hier geloggt wurden. Wiederholungen zählen mit."
+  },
+  "boardPoster": {
+    "metaTitle": "QR-Poster für {{boardName}}",
+    "fallbackTitle": "QR-Poster",
+    "metaDescription": "Ein druckfertiger QR-Code. Scann ihn, um die Boulder hier zu sehen und deine Begehungen einzutragen.",
+    "scanStep": "Scann den Code mit deiner Kamera",
+    "openSource": "Boardsesh ist kostenlos und Open Source.",
+    "printedOn": "Gedruckt: {{monthYear}}",
+    "layoutLabel": "Poster-Layout",
+    "layouts": {
+      "photo": "Poster mit Foto",
+      "plain": "Schlichtes Poster",
+      "cards": "Karten"
+    },
+    "unlistedNotice": "Wer diesen Code scannt, kann die Spraywall öffnen.",
+    "spray": {
+      "headline": "Diese Spraywall ist auf Boardsesh",
+      "pickStep": "Such dir einen Boulder auf dem Foto aus",
+      "logStep": "Trag deine Begehung ein oder schraub deinen eigenen",
+      "justInstalled": "Gerade installiert? Scann noch mal, um diese Spraywall zu öffnen.",
+      "backAction": "Zurück zur Spraywall"
+    },
+    "led": {
+      "headline": "Dieses Board ist auf Boardsesh",
+      "pickStep": "Such dir einen Boulder aus und beleuchte ihn am Board",
+      "logStep": "Getoppt? Trag deine Begehung ein",
+      "justInstalled": "Gerade installiert? Scann noch mal, um dieses Board zu öffnen.",
+      "compatibility": "Funktioniert mit {{boardBrand}}.",
+      "backAction": "Zurück zum Board"
+    }
   },
   "manage": {
     "welcome": {
@@ -161,8 +206,8 @@
           "body": "Füg Logo und Farben hinzu"
         },
         "boards": {
-          "title": "Verknüpf deine Boards",
-          "body": "Häng die Wände deiner Halle rein"
+          "title": "Boards prüfen",
+          "body": "Korrigier oder entferne, was nicht an deinen Wänden hängt"
         },
         "members": {
           "title": "Hol deine Crew dazu",
@@ -172,7 +217,6 @@
     },
     "title": "{{gymName}} verwalten",
     "backToGym": "Zurück zur Hallenseite",
-    "accessDenied": "Du hast keine Berechtigung, diese Halle zu verwalten.",
     "tabs": {
       "kiosks": "Kioske",
       "branding": "Branding",
@@ -182,27 +226,6 @@
       "overview": "Überblick",
       "profile": "Profil",
       "comments": "Kommentare"
-    },
-    "insights": {
-      "subtitle": "Wie deine Boards diese Woche im Vergleich zur letzten liefen.",
-      "uniqueClimbers": "Kletterer*innen",
-      "ascents": "Begehungen",
-      "busiestDay": "Stärkster Tag",
-      "byDay": "Begehungen pro Tag",
-      "byDayAria": "Begehungen pro Wochentag",
-      "topClimbs": "Woran gerade alle arbeiten",
-      "noTopClimbs": "Diese Woche noch keine Begehungen eingetragen.",
-      "unnamedClimb": "Boulder ohne Namen",
-      "ascentsCount_one": "{{count}} Begehung",
-      "ascentsCount_other": "{{count}} Begehungen",
-      "deltaUp": "+{{count}} zur Vorwoche",
-      "deltaDown": "−{{count}} zur Vorwoche",
-      "deltaFlat": "Wie in der Vorwoche",
-      "loadError": "Die Zahlen dieser Woche kamen nicht durch.",
-      "empty": {
-        "title": "Diese Woche keine Begehungen",
-        "body": "Zeit, die Wand neu zu schrauben? Sobald hier jemand eine Begehung einträgt, siehst du, wer da war und woran alle arbeiten."
-      }
     },
     "navGuard": {
       "title": "Ungespeicherte Änderungen verwerfen?",
@@ -271,26 +294,21 @@
     },
     "boards": {
       "heading": "Boards in dieser Halle",
-      "description": "Verknüpf die Boards, die dir gehören, damit sie auf deiner Hallenseite und in den Kiosken auftauchen.",
+      "description": "Diese Boards haben Kletterer*innen und öffentliche Board-Daten hier eingetragen. Korrigier die falschen und entferne die, die nicht an deinen Wänden hängen.",
       "addBoard": "Board hinzufügen",
       "empty": "Noch keine Boards verknüpft. Füg eins hinzu, dann geht's los.",
       "loadError": "Die Boards dieser Halle kamen nicht durch.",
-      "unlink": "Trennen",
-      "onlyOwnerCanUnlink": "Nur wem das Board gehört, kann es trennen",
-      "readOnlyHint": "Nur Inhaber*innen oder Admins der Halle können Boards verknüpfen.",
-      "unlinkTitle": "Dieses Board trennen?",
-      "unlinkBody": "\"{{name}}\" taucht dann nicht mehr auf der Seite und in den Kiosken dieser Halle auf. Du kannst sie jederzeit wieder verknüpfen.",
-      "unlinkConfirm": "Trennen",
+      "readOnlyHint": "Inhaber*innen und Admins tragen eigene Boards ein und löschen die synchronisierten. Du kannst Boards entfernen, die Kletternde angelegt haben, und Boards in der Nähe deiner Halle hinzufügen.",
+      "askAdminToDelete": "Bitte eine*n Inhaber*in oder Admin, dieses Board zu löschen.",
       "cancel": "Abbrechen",
       "linked": "Board verknüpft.",
       "linkFailed": "Das Board ließ sich nicht verknüpfen.",
-      "unlinked": "Board getrennt.",
-      "unlinkFailed": "Das Board ließ sich nicht trennen.",
       "visibility": {
         "public": "Öffentlich",
         "unlisted": "Nicht gelistet",
         "private": "Privat"
       },
+      "printPoster": "Poster drucken",
       "addDialog": {
         "title": "Eines deiner Boards hinzufügen",
         "body": "Wähl ein Board, das dir gehört, und verknüpf es mit dieser Halle.",
@@ -300,8 +318,8 @@
         "close": "Schließen"
       },
       "strays": {
-        "heading": "Boards, die dir gehören könnten",
-        "description": "Die stehen bei deiner Halle oder sind von einem zusammengeführten Eintrag abgefallen. Häng die dran, die hierher gehören.",
+        "heading": "Boards in der Nähe deiner Halle",
+        "description": "Die stehen weniger als 150 m von deiner Halle entfernt oder stammen aus einem zusammengeführten Eintrag. Füg die hinzu, die an deinen Wänden hängen.",
         "reasonMerged": "Stand auf einem zusammengeführten Eintrag",
         "reasonNearby": "{{meters}} m entfernt",
         "reasonNearbyGeneric": "Gleich um die Ecke",
@@ -316,7 +334,9 @@
         "empty": "Gerade nichts Loses. Jedes Board in der Nähe deiner Halle steht schon in deinem Eintrag.",
         "loadError": "Konnte nicht nach herrenlosen Boards suchen.",
         "retry": "Nochmal versuchen"
-      }
+      },
+      "back": "Alle Boards",
+      "editLoadError": "Dieses Board konnte nicht zum Bearbeiten geladen werden."
     },
     "presets": {
       "single": "Eine Wand",
@@ -337,6 +357,12 @@
       "createFailed": "Der Kiosk ließ sich nicht anlegen."
     },
     "editor": {
+      "appearance": {
+        "label": "Darstellung",
+        "light": "Hell",
+        "dark": "Dunkel",
+        "description": "Wähl, wie dieser Bildschirm aussieht. Andere Kioske behalten ihre eigene Darstellung."
+      },
       "back": "Alle Kioske",
       "save": "Layout speichern",
       "saved": "Kiosk gespeichert.",
@@ -402,8 +428,8 @@
           "body": "Füg Logo und Markenfarben hinzu"
         },
         "boards": {
-          "title": "Verknüpf deine Boards",
-          "body": "Häng die Wände deiner Halle rein"
+          "title": "Boards prüfen",
+          "body": "Korrigier oder entferne, was nicht an deinen Wänden hängt"
         },
         "members": {
           "title": "Hol deine Crew dazu",
@@ -441,6 +467,19 @@
     "comments": {
       "intro": "Antworte im Kommentar-Thread deiner Halle, ohne die Konsole zu verlassen.",
       "heading": "Was deine Crew sagt"
+    },
+    "aiAssistants": {
+      "title": "KI-Assistenten",
+      "body": "Verwalte deine Hallen mit ChatGPT oder Claude. Verbinde dein Boardsesh-Konto einmal.",
+      "connect": "Assistenten verbinden",
+      "connections": "Verbindungen verwalten",
+      "checking": "Verbindungen werden geprüft…",
+      "connected": "Ein Assistent ist verbunden",
+      "paused": "Der Zugriff des Assistenten ist pausiert",
+      "notConnected": "Noch kein Assistent verbunden",
+      "statusUnavailable": "Prüfe deine Verbindungen in den Einstellungen",
+      "pilotBody": "Der Zugang ist aktuell nur auf Einladung möglich. Warte auf eine Einladung von Boardsesh, bevor du dich zum Verbinden anmeldest.",
+      "pilotDetails": "Infos zum Pilotzugang lesen"
     }
   },
   "branding": {

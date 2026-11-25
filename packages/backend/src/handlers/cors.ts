@@ -278,9 +278,21 @@ export function applyCorsHeaders(req: IncomingMessage, res: ServerResponse): boo
   // Content-Encoding is needed for the PostHog batch endpoint — posthog-js
   // gzips the payload when CompressionStream is available, and the browser
   // lists "content-encoding" in the preflight's Access-Control-Request-Headers.
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Content-Encoding');
+  // X-Boardsesh-Platform labels a request web/ios/android for the first-party
+  // active-user count (CLIENT_PLATFORM_HEADER, #2644). X-Boardsesh-Client
+  // identifies the app. X-Boardsesh-Analytics-Consent marks consented PostHog
+  // capture, the only proxied traffic that keeps the visitor IP
+  // (ANALYTICS_CONSENT_HEADER). Browser clients need all three allowed for preflight.
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization, Content-Encoding, X-Boardsesh-Platform, X-Boardsesh-Client, X-Boardsesh-Analytics-Consent',
+  );
 
   if (req.method === 'OPTIONS') {
+    // Let browsers reuse a preflight for 10 minutes (Chrome caps it at 2 h).
+    // Without it Chrome keeps one for 5 s, so every www page load that asks for
+    // the consent region paid an extra OPTIONS round trip.
+    res.setHeader('Access-Control-Max-Age', '600');
     res.writeHead(200);
     res.end();
     return false; // Signal that response was sent

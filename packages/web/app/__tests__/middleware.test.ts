@@ -1,11 +1,19 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from 'vite-plus/test';
+import { readdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { NextRequest } from 'next/server';
 import { CLIMB_SESSION_COOKIE } from '@/app/lib/climb-session-cookie';
 import { DEFAULT_LOCALE, LOCALE_COOKIE, LOCALE_HEADER } from '@/app/lib/i18n/config';
 import { PATHNAME_HEADER } from '@/app/lib/request-pathname-header';
 
-const { getClimbViewPageCacheTTL, getListPageCacheTTL, hasUserSpecificFilters } =
-  await import('@/app/lib/list-page-cache');
+const {
+  getClimbViewPageCacheTTL,
+  getListPageCacheTTL,
+  hasUserSpecificFilters,
+  isBoardPosterRequest,
+  isSprayWallCapabilityRequest,
+} = await import('@/app/lib/list-page-cache');
 const { middleware, config } = await import('@/middleware');
 
 function sp(params: Record<string, string> = {}): URLSearchParams {
@@ -31,8 +39,8 @@ describe('blocked crawler origin rejection', () => {
 
   it.each([
     'GPTBot/1.4',
-    'Claude-SearchBot/1.0',
-    'AMZN-SEARCHBOT/0.1',
+    'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; ClaudeBot/1.0; +claudebot@anthropic.com)',
+    'Mozilla/5.0 (compatible; Amazonbot/0.1; +https://developer.amazon.com/support/amazonbot)',
     // Blocked on cost, not on what it does with the content: 36% of www
     // requests on 2026-09-10 against 3.6% for real browsers, on the climb-view
     // SSR path. See COST_BLOCKED_CRAWLER_TOKENS in app/lib/crawler-policy.ts.
@@ -64,6 +72,12 @@ describe('blocked crawler origin rejection', () => {
     'facebookexternalhit/1.1',
     'ChatGPT-User/1.0',
     'Claude-User/1.0',
+    // AI search crawlers: they cite pages with a link, so they crawl like a search
+    // engine (2026-11-24). Their training siblings are rejected above.
+    'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; OAI-SearchBot/1.0; +https://openai.com/searchbot',
+    'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Claude-SearchBot/1.0; +searchbot@anthropic.com)',
+    'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; PerplexityBot/1.0; +https://perplexity.ai/perplexitybot)',
+    'Mozilla/5.0 (compatible; Amzn-SearchBot/0.1)',
     'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ChatGPT-User/1.0; +https://openai.com/bot',
     'SentryUptimeBot/1.0 (+http://docs.sentry.io/product/alerts/uptime-monitoring/)',
     'boardsesh-production-smoke/1.0',
@@ -141,6 +155,7 @@ describe('blocked crawler origin rejection outside production', () => {
 });
 
 const TTL_24H = 86400;
+const TTL_15M = 900;
 const LEGACY_LIST = '/kilter/original/12x12-square/screw_bolt/40/list';
 const SLUG_LIST = '/b/kilter-original-12x12/40/list';
 // View pages, all three URL shapes that resolve to the same climb.
@@ -175,11 +190,16 @@ describe('getListPageCacheTTL', () => {
 
     // Slug format: /b/[board_slug]/[angle]/list
     it('matches slug format list page', () => {
-      expect(getListPageCacheTTL(SLUG_LIST, sp())).toBe(TTL_24H);
+      expect(getListPageCacheTTL(SLUG_LIST, sp())).toBe(TTL_15M);
     });
 
     it('matches slug format with different slug', () => {
-      expect(getListPageCacheTTL('/b/tension-two-wall-12x12/30/list', sp())).toBe(TTL_24H);
+      expect(getListPageCacheTTL('/b/tension-two-wall-12x12/30/list', sp())).toBe(TTL_15M);
+    });
+
+    // MoonBoard and Woods stats are live, so their edge copy matches the 15 minute data cache (#6803).
+    it.each(['moonboard', 'woods', 'MoonBoard'])('uses the 15 minute TTL for %s list pages', (board) => {
+      expect(getListPageCacheTTL(`/${board}/1/2/3,4/40/list`, sp())).toBe(TTL_15M);
     });
 
     it('rejects slug path with too few segments (/b/list)', () => {
@@ -218,11 +238,15 @@ describe('getListPageCacheTTL', () => {
     });
 
     it('caches with name search', () => {
-      expect(getListPageCacheTTL(SLUG_LIST, sp({ name: 'benchmark' }))).toBe(TTL_24H);
+      expect(getListPageCacheTTL(LEGACY_LIST, sp({ name: 'benchmark' }))).toBe(TTL_24H);
     });
 
     it('caches with minAscents', () => {
-      expect(getListPageCacheTTL(SLUG_LIST, sp({ minAscents: '5' }))).toBe(TTL_24H);
+      expect(getListPageCacheTTL(LEGACY_LIST, sp({ minAscents: '5' }))).toBe(TTL_24H);
+    });
+
+    it('caches slug-tree filtered searches at the 15 minute TTL', () => {
+      expect(getListPageCacheTTL(SLUG_LIST, sp({ name: 'benchmark', minAscents: '5' }))).toBe(TTL_15M);
     });
   });
 
@@ -316,6 +340,10 @@ describe('getClimbViewPageCacheTTL', () => {
 
     it('matches the numeric view format (so its redirect is cacheable)', () => {
       expect(getClimbViewPageCacheTTL(NUMERIC_VIEW, sp())).toBe(TTL_24H);
+    });
+
+    it('never caches the numeric spray climb redirect', () => {
+      expect(getClimbViewPageCacheTTL('/spray/229/229/1/40/view/climb-uuid', sp())).toBeNull();
     });
 
     it('matches the tension board view', () => {
@@ -441,6 +469,17 @@ function makeRequest(url: string): NextRequest {
   return new NextRequest(new URL(url, 'http://localhost:3000'));
 }
 
+const SPRAY_WALL_UUID = '0144249a-3a8c-47c2-8c1e-54c0c572fe02';
+
+/** Every `app/api/v1/<name>` directory that is a literal segment, not `[board_name]`. */
+function listStaticApiV1Families(): string[] {
+  const apiV1Root = resolve(dirname(fileURLToPath(import.meta.url)), '..', 'api', 'v1');
+  return readdirSync(apiV1Root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith('[') && entry.name !== '__tests__')
+    .map((entry) => entry.name)
+    .sort();
+}
+
 describe('middleware matcher config', () => {
   it('pins the exact matcher entries', () => {
     // Vercel bills/logs per invocation — this literal is the whole point of
@@ -504,6 +543,33 @@ describe('middleware /api/v1 board validation', () => {
 
   it.each(['angles', 'grades'])('passes through the %s special segment without board validation', (segment) => {
     const response = middleware(makeRequest(`/api/v1/${segment}`));
+    expect(response.status).toBe(200);
+  });
+
+  // The middleware decides nothing about a wall: whether it is public, unlisted
+  // or private is the route's backend read to answer, and it answers the same
+  // 404 for a private wall as for no wall. All the middleware can do is let the
+  // request reach the route, for every wall alike.
+  it.each([
+    ['photo', `/api/v1/spray-walls/${SPRAY_WALL_UUID}/photo`],
+    ['flattened art', `/api/v1/spray-walls/${SPRAY_WALL_UUID}/photo?look=wall-crop`],
+    ['hold-only art', `/api/v1/spray-walls/${SPRAY_WALL_UUID}/photo?look=hold-cutouts`],
+  ])("lets a spray wall's %s request reach its route", (_image, url) => {
+    const response = middleware(makeRequest(url));
+    expect(response.status).toBe(200);
+    // The route answers `no-store` itself on every branch. The middleware must
+    // not hand the CDN a window over the top of it: the redirect points at a
+    // signature that expires in fifteen minutes.
+    expect(response.headers.get('CDN-Cache-Control')).toBeNull();
+    expect(response.headers.get('Vercel-CDN-Cache-Control')).toBeNull();
+  });
+
+  // The bug this guards against: `spray-walls` shipped as a route family
+  // beside `[board_name]` and the board-name check 404'd every request to it
+  // for six weeks. Any static directory under /api/v1 is a route family that is
+  // not a board, so each one has to get through.
+  it.each(listStaticApiV1Families())('lets the /api/v1/%s route family through the board-name check', (family) => {
+    const response = middleware(makeRequest(`/api/v1/${family}/x`));
     expect(response.status).toBe(200);
   });
 });
@@ -711,6 +777,14 @@ describe('middleware cache headers on list pages', () => {
     );
   });
 
+  it('sets a 15 minute CDN cache on Woods list pages', () => {
+    const response = middleware(makeRequest('/woods/1/2/3,4/40/list'));
+    expect(response.headers.get('Vercel-CDN-Cache-Control')).toBe(
+      `s-maxage=${TTL_15M}, stale-while-revalidate=${TTL_15M}`,
+    );
+    expect(response.headers.get('CDN-Cache-Control')).toBe(`s-maxage=${TTL_15M}, stale-while-revalidate=${TTL_15M}`);
+  });
+
   it('still sets cache headers when vercel-flag-overrides cookie is present', () => {
     const req = makeRequest(LEGACY_LIST);
     req.cookies.set('vercel-flag-overrides', 'some-override');
@@ -778,6 +852,122 @@ describe('middleware cache headers on climb view pages', () => {
       expect(response.headers.has('CDN-Cache-Control')).toBe(false);
     },
   );
+});
+
+describe('middleware cache headers on legacy spray climb redirects', () => {
+  it.each([
+    '/spray/229/229/1/40/view/CEA229E4A8D84644B7DF7BC6F8A47222',
+    '/spray/229/229/1/40/view/climb-uuid?wall=11111111-1111-4111-8111-111111111111',
+    '/fr/spray/229/229/1/40/view/climb-uuid',
+    '/fr/spray/229/229/1/40/view/climb-uuid?wall=11111111-1111-4111-8111-111111111111',
+  ])('leaves the handler no-store headers intact on %s', (url) => {
+    const response = middleware(makeRequest(url));
+    // Next preserves middleware headers ahead of route-handler headers. Spray
+    // is absent from the catalogue cache allowlist, so the redirect's no-store
+    // headers must reach the outgoing response without a conflicting TTL.
+    expect(response.headers.has('Cache-Control')).toBe(false);
+    expect(response.headers.has('CDN-Cache-Control')).toBe(false);
+    expect(response.headers.has('Vercel-CDN-Cache-Control')).toBe(false);
+  });
+});
+
+// An unlisted spray wall answers 200 only while it stays unlisted and unhidden,
+// and 404 while www is ahead of the backend. Neither may be pinned at the edge.
+describe('middleware cache headers on a spray wall share link (?wall=)', () => {
+  it.each([
+    ['wall list', '/b/garage-wall/40/list?wall=11111111-1111-4111-8111-111111111111'],
+    ['climb view', `${SLUG_VIEW}?wall=11111111-1111-4111-8111-111111111111`],
+    ['localized climb view', `/fr${SLUG_VIEW}?wall=11111111-1111-4111-8111-111111111111`],
+    ['bare board hop', '/b/garage-wall?wall=11111111-1111-4111-8111-111111111111'],
+  ])('sends no-store on the %s', (_shape, url) => {
+    const response = middleware(makeRequest(url));
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(response.headers.get('CDN-Cache-Control')).toBe('no-store');
+    expect(response.headers.get('Vercel-CDN-Cache-Control')).toBe('no-store');
+  });
+
+  it('keeps caching the same pages without the param', () => {
+    const response = middleware(makeRequest(SLUG_VIEW));
+    expect(response.headers.get('CDN-Cache-Control')).toBe(
+      `s-maxage=${TTL_24H}, stale-while-revalidate=${TTL_24H * 7}`,
+    );
+  });
+
+  it('gives the TTL helpers no window for a capability URL either', () => {
+    const withWall = new URLSearchParams({ wall: '11111111-1111-4111-8111-111111111111' });
+    expect(getListPageCacheTTL('/b/garage-wall/40/list', withWall)).toBeNull();
+    expect(getClimbViewPageCacheTTL('/b/garage-wall/40/view/some-climb', withWall)).toBeNull();
+  });
+});
+
+// The printable board poster prints the board's visibility as of the request,
+// and an unlisted wall's poster URL carries its capability (#4415).
+describe('middleware cache headers on the board poster (/poster/b/...)', () => {
+  it.each([
+    ['public board poster', '/poster/b/main-kilter'],
+    ['poster with a layout', '/poster/b/main-kilter?layout=cards'],
+    ['unlisted wall poster', '/poster/b/garage-wall?wall=11111111-1111-4111-8111-111111111111'],
+    ['localized poster', '/es/poster/b/garage-wall?wall=11111111-1111-4111-8111-111111111111'],
+  ])('sends no-store on the %s', (_shape, url) => {
+    const response = middleware(makeRequest(url));
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(response.headers.get('CDN-Cache-Control')).toBe('no-store');
+    expect(response.headers.get('Vercel-CDN-Cache-Control')).toBe('no-store');
+  });
+
+  it('treats every poster path as a poster, with or without a capability', () => {
+    expect(isBoardPosterRequest('/poster/b/main-kilter')).toBe(true);
+    expect(isBoardPosterRequest('/poster')).toBe(false);
+    expect(isBoardPosterRequest('/b/main-kilter')).toBe(false);
+  });
+
+  it('leaves the spray capability rule to /b/ links that carry ?wall=', () => {
+    const withWall = new URLSearchParams({ wall: '11111111-1111-4111-8111-111111111111' });
+    expect(isSprayWallCapabilityRequest('/poster/b/main-kilter', withWall)).toBe(false);
+    expect(isSprayWallCapabilityRequest('/b/main-kilter', withWall)).toBe(true);
+  });
+});
+
+// A home board's share link carries an explicit-Join capability. A reset has to
+// bite on the next request, and no shared cache may key on the token.
+describe('middleware cache headers on a home board share link (?invite=)', () => {
+  const TOKEN = 'Ab3_dE-fGhIjKlMnOpQrSt';
+  it.each([
+    ['bare board hop', `/b/the-garage?invite=${TOKEN}`],
+    ['localized bare hop', `/es/b/the-garage?invite=${TOKEN}`],
+    ['list page', `/b/the-garage/40/list?invite=${TOKEN}`],
+    ['malformed token', '/b/the-garage/40/list?invite=x'],
+    ['sign-in callback', `/auth/login?callbackUrl=${encodeURIComponent(`/b/the-garage?invite=${TOKEN}`)}`],
+    [
+      'localized sign-in callback',
+      `/es/auth/login?callbackUrl=${encodeURIComponent(`/es/b/the-garage?invite=${TOKEN}`)}`,
+    ],
+    [
+      'nested auth callback',
+      `/auth/native-start?callbackUrl=${encodeURIComponent(`/auth/login?callbackUrl=${encodeURIComponent(`/b/the-garage?invite=${TOKEN}`)}`)}`,
+    ],
+  ])('sends no-store on the %s', (_shape, url) => {
+    const response = middleware(makeRequest(url));
+    expect(response.headers.get('Cache-Control')).toBe('private, no-store');
+    expect(response.headers.get('CDN-Cache-Control')).toBe('no-store');
+    expect(response.headers.get('Vercel-CDN-Cache-Control')).toBe('no-store');
+    expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
+  });
+
+  it('protects the sticky-locale redirect carrying an invite callback', () => {
+    const request = makeRequest(`/auth/login?callbackUrl=${encodeURIComponent(`/b/the-garage?invite=${TOKEN}`)}`);
+    request.cookies.set(LOCALE_COOKIE, 'es');
+    const response = middleware(request);
+    expect(response.status).toBe(307);
+    expect(response.headers.get('Referrer-Policy')).toBe('no-referrer');
+    expect(response.headers.get('CDN-Cache-Control')).toBe('no-store');
+  });
+
+  it('gives the TTL helpers no window for a share link either', () => {
+    const withInvite = new URLSearchParams({ invite: TOKEN });
+    expect(getListPageCacheTTL('/b/the-garage/40/list', withInvite)).toBeNull();
+    expect(getClimbViewPageCacheTTL('/b/the-garage/40/view/some-climb', withInvite)).toBeNull();
+  });
 });
 
 // A crawler that persists cookies (observed in production logs) acquires
@@ -907,6 +1097,75 @@ describe('middleware forwards the routing pathname header', () => {
   });
 });
 
+describe('English-only app guide routing', () => {
+  it('keeps a French language preference through an English guide visit and return', () => {
+    const frenchBoards = middleware(makeRequest('/fr/boards'));
+    const frenchPreference = frenchBoards.cookies.get(LOCALE_COOKIE);
+    expect(frenchPreference?.value).toBe('fr');
+
+    const guideAlias = makeRequest('/es/apps/kilter?ref=test&tag=one&tag=two');
+    guideAlias.cookies.set(LOCALE_COOKIE, frenchPreference!.value);
+    const redirect = middleware(guideAlias);
+    expect(redirect.status).toBe(307);
+    expect(redirect.headers.get('location')).toBe('http://localhost:3000/apps/kilter?ref=test&tag=one&tag=two');
+    expect(redirect.headers.has('set-cookie')).toBe(false);
+
+    const englishGuide = makeRequest(redirect.headers.get('location')!);
+    englishGuide.cookies.set(LOCALE_COOKIE, frenchPreference!.value);
+    englishGuide.headers.set(LOCALE_HEADER, 'es');
+    const guide = middleware(englishGuide);
+    expect(guide.status).toBe(200);
+    expect(guide.headers.has('location')).toBe(false);
+    expect(guide.headers.has('x-middleware-rewrite')).toBe(false);
+    expect(guide.headers.has('set-cookie')).toBe(false);
+    expect(guide.headers.get(`x-middleware-request-${LOCALE_HEADER}`)).toBe(DEFAULT_LOCALE);
+    expect(guide.headers.get(`x-middleware-request-${PATHNAME_HEADER}`)).toBe('/apps/kilter');
+
+    const returnToBoards = makeRequest('/boards');
+    returnToBoards.cookies.set(LOCALE_COOKIE, frenchPreference!.value);
+    const localizedReturn = middleware(returnToBoards);
+    expect(localizedReturn.status).toBe(307);
+    expect(localizedReturn.headers.get('location')).toBe('http://localhost:3000/fr/boards');
+    expect(frenchBoards.headers.get(`x-middleware-request-${LOCALE_HEADER}`)).toBe('fr');
+  });
+
+  it.each(['/apps', '/apps/unknown', '/compare/spray-wall-apps'])(
+    'takes /fr%s to its unprefixed route in one redirect, preserving the query',
+    (path) => {
+      const query = '?ref=a%26b&session=unchanged';
+      const alias = makeRequest(`/fr${path}${query}`);
+      alias.cookies.set(LOCALE_COOKIE, 'fr');
+      const redirect = middleware(alias);
+      expect(redirect.status).toBe(307);
+      expect(redirect.headers.get('location')).toBe(`http://localhost:3000${path}${query}`);
+      expect(redirect.headers.has('set-cookie')).toBe(false);
+
+      const canonical = makeRequest(redirect.headers.get('location')!);
+      canonical.cookies.set(LOCALE_COOKIE, 'fr');
+      const response = middleware(canonical);
+      expect(response.headers.has('location')).toBe(false);
+      expect(response.headers.has('set-cookie')).toBe(false);
+      expect(response.headers.get(`x-middleware-request-${PATHNAME_HEADER}`)).toBe(path);
+    },
+  );
+
+  it.each(['/app', '/apps-plus', '/developers/apps', '/compare/spray-wall-apps-other'])(
+    'keeps the normal locale rewrite for /fr%s',
+    (path) => {
+      const response = middleware(makeRequest(`/fr${path}`));
+      expect(response.headers.get('x-middleware-rewrite')).toBe(`http://localhost:3000${path}`);
+      expect(response.cookies.get(LOCALE_COOKIE)?.value).toBe('fr');
+    },
+  );
+
+  it('applies capability privacy headers to a guide alias redirect', () => {
+    const response = middleware(makeRequest('/fr/apps?invite=private'));
+    expect(response.status).toBe(307);
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('cdn-cache-control')).toBe('no-store');
+  });
+});
+
 // --- Cross-subdomain auth CORS for the standalone Expo-web app ---
 
 function makeCorsRequest(url: string, options: { origin?: string; method?: string } = {}): NextRequest {
@@ -954,6 +1213,46 @@ describe('middleware cross-subdomain auth CORS', () => {
     const response = middleware(makeCorsRequest('/api/auth/csrf', { origin: preview }));
 
     expect(response.headers.get('Access-Control-Allow-Origin')).toBe(preview);
+  });
+
+  it.each(['/api/auth/session', '/api/internal/ws-auth', '/api/auth/providers-config'])(
+    'allows credentialed reads from the flat PR app on %s',
+    (path) => {
+      const preview = 'https://pr-123.boardsesh.com';
+      const response = middleware(makeCorsRequest(path, { origin: preview }));
+
+      expect(response.headers.get('Access-Control-Allow-Origin')).toBe(preview);
+      expect(response.headers.get('Access-Control-Allow-Credentials')).toBe('true');
+      expect(response.headers.get('Vary')).toContain('Origin');
+    },
+  );
+
+  it('allows a flat PR app credentials preflight', () => {
+    const preview = 'https://pr-123.boardsesh.com';
+    const response = middleware(
+      makeCorsRequest('/api/auth/callback/credentials', { origin: preview, method: 'OPTIONS' }),
+    );
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe(preview);
+    expect(response.headers.get('Access-Control-Allow-Credentials')).toBe('true');
+    expect(response.headers.get('Access-Control-Allow-Methods')).toContain('POST');
+  });
+
+  it.each([
+    'http://pr-123.boardsesh.com',
+    'https://pr-0.boardsesh.com',
+    'https://pr-0123.boardsesh.com',
+    'https://pr-example.boardsesh.com',
+    'https://pr-123.boardsesh.com.evil.com',
+    'https://evil-pr-123.boardsesh.com',
+    'https://pr-123.boardsesh.com:8443',
+    'https://pr-123.boardsesh.com/path',
+  ])('does not grant credentialed CORS to %s', (origin) => {
+    const response = middleware(makeCorsRequest('/api/auth/session', { origin }));
+
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+    expect(response.headers.get('Access-Control-Allow-Credentials')).toBeNull();
   });
 
   it.each(['/api/auth/register', '/api/auth/forgot-password', '/api/auth/reset-password'])(
@@ -1011,5 +1310,76 @@ describe('middleware cross-subdomain auth CORS', () => {
     const response = middleware(makeCorsRequest('/api/auth/session'));
 
     expect(response.headers.get('Access-Control-Allow-Origin')).toBeNull();
+  });
+});
+
+describe('anonymous marketing HTML caching', () => {
+  it.each(['/', '/apps', '/apps/kilter', '/apps/aurora', '/apps/moonboard', '/apps/woods', '/compare/spray-wall-apps'])(
+    'marks %s cacheable and varies protected request fields',
+    (pathname) => {
+      const response = middleware(new NextRequest(`https://www.boardsesh.com${pathname}`));
+      expect(response.headers.get('cache-control')).toBe('public, max-age=0, s-maxage=300, stale-while-revalidate=300');
+      expect(response.headers.get('cdn-cache-control')).toBe('s-maxage=300, stale-while-revalidate=300');
+      const vary = response.headers.get('vary')?.toLowerCase();
+      expect(vary).toContain('cookie');
+      expect(vary).toContain('authorization');
+      expect(vary).toContain('rsc');
+    },
+  );
+  it.each<Record<string, string>>([
+    { cookie: '__Secure-next-auth.session-token.0=secret' },
+    { cookie: '__Secure-boardsesh.session_token=secret' },
+    { cookie: '__Secure-boardsesh.bridged_session_token=secret' },
+    { authorization: 'Bearer secret' },
+    { rsc: '1' },
+    { 'next-router-prefetch': '1' },
+  ])('bypasses credential and router variants %j', (headers) => {
+    const response = middleware(new NextRequest('https://www.boardsesh.com/apps/kilter', { headers }));
+    expect(response.headers.get('cdn-cache-control')).toBe('no-store');
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+  });
+  it('does not cache a saved-language redirect or its localized homepage', () => {
+    const redirect = middleware(
+      new NextRequest('https://www.boardsesh.com/', { headers: { cookie: `${LOCALE_COOKIE}=es` } }),
+    );
+    expect(redirect.status).toBe(307);
+    expect(redirect.headers.get('cdn-cache-control')).toBe('no-store');
+    expect(redirect.headers.get('cache-control')).toBe('private, no-store');
+    const localized = middleware(new NextRequest('https://www.boardsesh.com/es/'));
+    expect(localized.headers.get('cdn-cache-control')).toBe('no-store');
+    expect(localized.headers.get('cache-control')).toBe('private, no-store');
+  });
+  it('keeps guide aliases and unknown guides outside the public cache', () => {
+    for (const pathname of ['/es/apps/kilter', '/apps/no-such-guide', '/apps/kilter?utm_source=test']) {
+      const response = middleware(new NextRequest(`https://www.boardsesh.com${pathname}`));
+      expect(response.headers.get('cdn-cache-control')).toBe('no-store');
+      expect(response.headers.get('cache-control')).toBe('private, no-store');
+    }
+  });
+});
+
+describe('prerendered locale homepage routing', () => {
+  it.each(['es', 'fr', 'de', 'it'])('keeps /%s on its own static route and preserves the locale cookie', (locale) => {
+    const response = middleware(makeRequest(`/${locale}`));
+    expect(response.status).toBe(200);
+    expect(response.headers.has('x-middleware-rewrite')).toBe(false);
+    expect(response.headers.get(`x-middleware-request-${LOCALE_HEADER}`)).toBe(locale);
+    expect(response.cookies.get(LOCALE_COOKIE)?.value).toBe(locale);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('cdn-cache-control')).toBe('no-store');
+  });
+
+  it.each(['/fr/de', '/es/fr/', '/de/it'])('rejects a nested locale homepage alias %s', (pathname) => {
+    const response = middleware(makeRequest(pathname));
+    expect(response.status).toBe(404);
+    expect(response.headers.get('X-Robots-Tag')).toContain('noindex');
+    expect(response.headers.has('x-middleware-rewrite')).toBe(false);
+  });
+
+  it('keeps the session redirect outside the static marketing cache', () => {
+    const response = middleware(makeRequest('/?session=shared-session'));
+    expect(response.status).toBe(307);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('cdn-cache-control')).toBe('no-store');
   });
 });

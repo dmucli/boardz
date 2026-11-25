@@ -151,7 +151,7 @@ export const ClimbModerationStatus = memo(function ClimbModerationStatus({
         <View style={styles.block}>
           <View style={styles.titleRow}>
             <Icon name="visibility.off" size={16} color={systemColors.secondaryLabel} />
-            <Text variant="subheadline" style={styles.titleText}>
+            <Text emphasized variant="subheadline" style={styles.titleText}>
               {t('mobile.community.moderation.hiddenTitle')}
             </Text>
           </View>
@@ -219,8 +219,8 @@ export const ClimbModerationStatus = memo(function ClimbModerationStatus({
             <Icon name="people" size={16} color={systemColors.secondaryLabel} />
             <Text variant="footnote">
               {t('mobile.community.moderation.openGrade', {
-                from: formatGrade(proposal.currentValue) ?? proposal.currentValue,
-                to: formatGrade(proposal.proposedValue) ?? proposal.proposedValue,
+                from: formatGrade(proposal.currentValue, boardName) ?? proposal.currentValue,
+                to: formatGrade(proposal.proposedValue, boardName) ?? proposal.proposedValue,
                 current: proposal.weightedUpvotes,
                 required: proposal.requiredUpvotes,
               })}
@@ -242,7 +242,7 @@ const styles = StyleSheet.create({
   container: {
     gap: spacing[3],
     borderLeftWidth: 2,
-    paddingLeft: spacing[3],
+    paddingStart: spacing[3],
   },
   block: {
     gap: spacing[1],
@@ -254,7 +254,6 @@ const styles = StyleSheet.create({
     minWidth: 0,
   },
   titleText: {
-    fontWeight: '600',
     flexShrink: 1,
   },
   reasonList: {

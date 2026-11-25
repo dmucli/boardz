@@ -1,23 +1,33 @@
-Nouveautés de la version 2.5 :
+Nouveautés de la version 2.8.0
 
-COMPATIBLE WOODS, DE BOUT EN BOUT
+Boardsesh est maintenant disponible en chinois simplifié.
 
-Tu as une Woods Board ? Ajoute ta 12x12 ou ta 8x10, parcours plus de 5 000 blocs avec leurs règles de mains et de pieds, et allume n'importe lequel en Bluetooth. Ouvre et remixe tes propres blocs sur l'une ou l'autre taille (l'éditeur ne propose que les prises vraiment présentes sur ton mur), mets un bloc en miroir et le mur suit, et pilote Précédent, Suivant et Miroir depuis l'écran verrouillé et la Dynamic Island. Les prises s'affichent avec le look Aura et des contours plus nets.
+PLUS DE FAÇONS DE T’ENTRAÎNER
 
-PRENDS LE MUR, MÊME SANS LED
+Crée des entraînements 4x4, À la limite et À la minute, en plus de Volume, Pyramide, Échelle et Cotation ciblée. Prévisualise les blocs et les repos avant de commencer. Les pyramides peuvent redescendre sur les mêmes blocs. Choisis les vibrations du décompte et l’affichage du repos sur l’écran verrouillé dans Paramètres > Minuteurs.
 
-Tu grimpes sur une board sans kit LED ? Prends le mur : toute la session suit le bloc que tu mets, et l'écran de la salle aussi. Désactive l'Éclairage dans les réglages de la board : le tour de rôle continue, ton angle reste en place, et les sessions sur un mur nommé se loguent aussi depuis la montre.
+REPRENDS LÀ OÙ TU EN ÉTAIS
 
-MIROIR DEPUIS L'ÉCRAN VERROUILLÉ
+L’accueil réunit ta semaine de grimpe, des blocs à ton niveau et des projets à réessayer. Consulte ton dernier entraînement et lance une séance depuis la carte Session. Choisis les sections que tu vois. Avec la localisation activée, le sélecteur rapproche les boards à proximité et celles de ta salle. Retrouve tes propres blocs dans Découvrir.
 
-Quand ton téléphone pilote la board, l'activité en direct et la Dynamic Island ont un bouton Miroir à côté de Précédent, Suivant et l'ampoule. L'app, ton crew, les vignettes et les LED suivent le bloc en miroir, et il l'est encore quand tu ouvres l'app.
+Allume ton Spraywall
 
-CORRIGÉ
+Connecte ton Spraywall à WLED en Wi-Fi. Place les trous, les LED et le câble sur une photo zoomable, teste chaque prise et garde la configuration pour ton crew. Trouve les contrôleurs sur ton Wi-Fi, règle la luminosité et choisis une extinction automatique pour l’éclairage en Wi-Fi.
 
-- Les prises s'affichent plus vite : le rendu de la board n'attend plus le reste de l'app.
-- Ta board reste éteinte tant que tu ne demandes rien. Un téléphone qui repasse à portée des heures ou des jours plus tard ne rallume plus ton dernier bloc. L'ampoule, le widget et les reconnexions en plein bloc l'allument toujours instantanément.
-- L'onglet Blocs et sa recherche ne restent plus figés après la fermeture d'une playlist par-dessus en pleine session. Plus besoin de forcer la fermeture de l'app pour retrouver la recherche.
-- Les blocs téléchargés restent à jour après une mise à jour de l'app.
-- Fermer la recherche de blocs ne fait plus surgir une feuille d'aperçu.
+Les contrôleurs compatibles avec le support Bluetooth de Boardsesh peuvent aussi allumer les blocs en Bluetooth. L’installation de ce support reste une bêta facultative pour les contrôleurs compatibles, avec vérifications de compatibilité et consentement séparé.
+
+TROUVE ET PARTAGE TON PROCHAIN BLOC
+
+Les blocs Vérifiés de Kilter ont leur propre filtre rapide à côté de Cotation. Partage playlists, profils, séances, salles et boards avec un bloc allumé dans l’aperçu du lien. Le bouton Partager est à portée de main dans l’en-tête des playlists.
+
+PLUS LISIBLE, PLUS FLUIDE
+
+Le rendu des boards accéléré par GPU rend les transitions entre blocs plus fluides sur les boards et appareils compatibles.
+
+Les couleurs et les mises en page renouvelées laissent plus de place à tes blocs. Le texte suit mieux la taille choisie sur ton iPhone et VoiceOver annonce le nouveau bloc après un balayage. Les transitions respectent Réduire les animations. Les noms longs défilent à nouveau et changer le filtre de cotation garde la liste des blocs à l’écran.
+
+CONNECTE TES APPLIS D’ENTRAÎNEMENT
+
+Ouvre dans Boardsesh les entraînements d’applis tierces compatibles et autorise les applis à lire ton carnet. Informations pour les développeurs : https://www.boardsesh.com/developers/
 
 Gratuit, sans pub, open source.

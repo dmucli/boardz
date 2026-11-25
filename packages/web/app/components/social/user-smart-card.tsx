@@ -21,6 +21,7 @@ import { getDifficultyMapping, sortGrades } from '@/app/profile/[user_id]/utils/
 import { V_GRADE_COLORS, FONT_GRADE_COLORS, getGradeColorWithOpacity } from '@/app/lib/grade-colors';
 import { useGradeFormat } from '@/app/hooks/use-grade-format';
 import styles from './user-smart-card.module.css';
+import { guardedFetch } from '@/app/lib/auth/session-guard';
 
 type UserSmartCardProps = {
   userId: string;
@@ -83,7 +84,7 @@ export default function UserSmartCard({ userId, refreshKey = 0 }: UserSmartCardP
     setLoading(true);
     try {
       const [profileRes, statsData] = await Promise.all([
-        fetch(`/api/internal/profile/${userId}`).then((r) => (r.ok ? r.json() : null)),
+        guardedFetch(`/api/internal/profile/${userId}`).then((r) => (r.ok ? r.json() : null)),
         (async () => {
           try {
             const client = createGraphQLHttpClient(null);
@@ -119,9 +120,10 @@ export default function UserSmartCard({ userId, refreshKey = 0 }: UserSmartCardP
 
   const gradeBars = useMemo(() => {
     if (!rawStats) return [];
-    const mapping = getDifficultyMapping(gradeFormat);
     const gradeAgg: Record<string, number> = {};
     for (const layout of rawStats.layoutStats) {
+      // Per layout's board: MoonBoard's 6A buckets under V2.
+      const mapping = getDifficultyMapping(gradeFormat, layout.boardType);
       for (const gc of layout.gradeCounts) {
         const num = parseInt(gc.grade, 10);
         if (isNaN(num)) continue;

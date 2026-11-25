@@ -8,6 +8,9 @@ import { spacing } from '../../theme/tokens';
 type SetterNotesSectionProps = {
   /** The raw `board_climbs.description` as it came off the wire. */
   description: string | null | undefined;
+  contentEnabled?: boolean;
+  onHeaderLayout?: (height: number) => void;
+  onToggle?: (expanded: boolean) => void;
 };
 
 /**
@@ -20,20 +23,40 @@ type SetterNotesSectionProps = {
  *
  * The text is user-written, so it goes on screen verbatim — never through `t()`.
  */
-export function SetterNotesSection({ description }: SetterNotesSectionProps) {
+export function SetterNotesSection({
+  description,
+  contentEnabled = true,
+  onHeaderLayout,
+  onToggle,
+}: SetterNotesSectionProps) {
   const { t } = useTranslation('climbs');
   const notes = getDisplayDescription(description);
 
   if (!notes) return null;
+  // Collapsed, the header shows the first line the setter wrote: often the beta itself.
+  const firstLine =
+    notes
+      .split('\n')
+      .find((line) => line.trim())
+      ?.trim() ?? null;
 
   // `persistKey` is deliberately climb-agnostic, like every sibling section here
   // (logbook, community, similarClimbs): collapsing the notes is a standing
   // "I don't want to see these" preference, not a per-climb one.
   return (
-    <CollapsibleSection title={t('mobile.setterNotes.title')} defaultExpanded persistKey="setterNotes">
-      <Text variant="subheadline" style={styles.notes} selectable>
-        {notes}
-      </Text>
+    <CollapsibleSection
+      title={t('mobile.setterNotes.title')}
+      summary={firstLine}
+      defaultExpanded
+      persistKey="setterNotes"
+      onHeaderLayout={onHeaderLayout}
+      onToggle={onToggle}
+    >
+      {contentEnabled && (
+        <Text variant="subheadline" style={styles.notes} selectable>
+          {notes}
+        </Text>
+      )}
     </CollapsibleSection>
   );
 }

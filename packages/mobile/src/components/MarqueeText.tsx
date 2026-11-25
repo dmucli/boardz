@@ -64,12 +64,21 @@ type MarqueeTextProps = {
   textStyle?: StyleProp<TextStyle>;
   maxFontSizeMultiplier?: number;
   /**
-   * Lines for the non-scrolling fallback (name fits, not active, or Reduce Motion).
+   * Lines for a label that will not scroll (not active, or Reduce Motion).
    * Defaults to 1 (tail-ellipsis) for the fixed-height bars. A roomy surface like
    * the play-drawer header passes 2 so a Reduce-Motion user still reads the whole
-   * name (wrapped) instead of a truncation.
+   * name (wrapped) instead of a truncation. An active label with motion on
+   * stays on one line: it scrolls or shrinks once measured.
    */
   fallbackLines?: number;
+  /**
+   * Shrink the type down to this scale (0.9 = 90%) instead of scrolling when
+   * that fits the whole label (#7017). A name a few points too long would
+   * otherwise scroll by those few points, and at rest at the far end its first
+   * glyph sits clipped under the edge ("ɹrain from the Brain"). Off when left
+   * out: the label scrolls past `MIN_OVERFLOW_PX`.
+   */
+  shrinkToFitScale?: number;
 };
 
 export const MarqueeText = memo(function MarqueeText({
@@ -81,13 +90,23 @@ export const MarqueeText = memo(function MarqueeText({
   textStyle,
   maxFontSizeMultiplier,
   fallbackLines = 1,
+  shrinkToFitScale,
 }: MarqueeTextProps) {
   const reduceMotion = useReduceMotion();
   const [clipWidth, setClipWidth] = useState(0);
   const [contentWidth, setContentWidth] = useState(0);
 
   const overflow = contentWidth - clipWidth;
-  const shouldScroll = active && !reduceMotion && clipWidth > 0 && overflow > MIN_OVERFLOW_PX;
+  // Close enough to shrink into place: the whole label shows, first glyph included.
+  const shrinksToFit =
+    shrinkToFitScale !== undefined && clipWidth > 0 && overflow > 0 && clipWidth / contentWidth >= shrinkToFitScale;
+  const shouldScroll = active && !reduceMotion && clipWidth > 0 && overflow > MIN_OVERFLOW_PX && !shrinksToFit;
+  // The wrap is for a label that will never scroll. One that scrolls or shrinks
+  // still passes through the fallback for a frame whenever its room narrows,
+  // because the widths it picks from are a layout behind: wrapping there made
+  // the play-drawer header a line taller for that frame, and the board under
+  // it resized and snapped back after every swipe to a long name.
+  const fallbackNumberOfLines = active && !reduceMotion ? 1 : fallbackLines;
 
   const onClipLayout = useCallback((event: LayoutChangeEvent) => {
     const width = Math.round(event.nativeEvent.layout.width);
@@ -121,6 +140,16 @@ export const MarqueeText = memo(function MarqueeText({
         </Text>
       </View>
 
+      {/* With shrink-to-fit on, the copy shown is picked from the clip's width,
+          so the clip's width must not depend on the copy. Where the clip hugs
+          its content (the play-drawer header) each copy sizes it differently:
+          the shrunk copy lays out a few points inside the room it was fitted
+          to, the plain copy at its unrounded width. Either switch flips the
+          pick back, every frame: the name flickers and never scrolls (#7253).
+          This strut claims the whole name's width under every copy, so the
+          clip is always min(room, name width). */}
+      {shrinkToFitScale !== undefined ? <View style={[styles.widthStrut, { width: contentWidth }]} /> : null}
+
       {shouldScroll ? (
         <MarqueeScroller overflow={overflow}>
           {/* Pin to the full measured width and clip (don't ellipsize): otherwise
@@ -137,11 +166,23 @@ export const MarqueeText = memo(function MarqueeText({
             {children}
           </Text>
         </MarqueeScroller>
+      ) : shrinksToFit ? (
+        <Text
+          variant={variant}
+          color={color}
+          numberOfLines={1}
+          adjustsFontSizeToFit
+          minimumFontScale={shrinkToFitScale}
+          maxFontSizeMultiplier={maxFontSizeMultiplier}
+          style={textStyle}
+        >
+          {children}
+        </Text>
       ) : (
         <Text
           variant={variant}
           color={color}
-          numberOfLines={fallbackLines}
+          numberOfLines={fallbackNumberOfLines}
           ellipsizeMode="tail"
           maxFontSizeMultiplier={maxFontSizeMultiplier}
           style={textStyle}
@@ -202,6 +243,10 @@ const styles = StyleSheet.create({
     // Unclamp the measurer so the single-line text reports its true width (see
     // MEASURE_MAX_WIDTH). It's opacity-0 and clipped, so the width is inert.
     width: MEASURE_MAX_WIDTH,
+  },
+  // In flow but zero-height: it sets the clip's content width and nothing else.
+  widthStrut: {
+    height: 0,
   },
   scrollRow: {
     flexDirection: 'row',

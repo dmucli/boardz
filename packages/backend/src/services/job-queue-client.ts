@@ -1,5 +1,12 @@
 import { PgBoss, type Db } from 'pg-boss';
-import { logger } from '../utils/logger';
+import { WORKER_JOB_QUEUE_POOL_OPTIONS } from '@boardsesh/db/background-jobs';
+import { reportJobQueueError } from './job-queue-errors';
+
+// Defined beside the hold detector's queue code, which needs the same deadline.
+export {
+  WORKER_JOB_QUEUE_QUERY_TIMEOUT_MS,
+  WORKER_JOB_QUEUE_STATEMENT_TIMEOUT_MS,
+} from '@boardsesh/db/background-jobs';
 
 export async function assertQueuePrimary(database: Db): Promise<void> {
   const result = await database.executeSql(
@@ -53,6 +60,42 @@ export async function assertWorkerPrivileges(database: Db): Promise<void> {
   }
 }
 
+/**
+ * pg-boss background timers, slowed to what our queues need (docs/operations/db-connectivity.md,
+ * "pg-boss timers"). Every backend replica runs these, and each tick races the
+ * other replicas for the single `pgboss.version` row, so a faster tick costs
+ * lock waits, not just a cheap UPDATE.
+ *
+ * - `flowIntervalSeconds` 3600: the flow gate resolves `boss.flow()` / job
+ *   dependencies. Nothing uses them (no `.flow(` in the repo, and
+ *   `pgboss.job_dependency` is empty in production), so the 5 s default was
+ *   about 52k no-op UPDATEs a day. A future flow user must lower this back,
+ *   or children unblock up to an hour late.
+ * - `cronMonitorIntervalSeconds` 45: the maximum pg-boss 12 accepts (a larger
+ *   value throws in the constructor). The timekeeper still matches every
+ *   occurrence in the preceding 60 s, so per-minute crons do not skip.
+ * - `monitorIntervalSeconds` 120: the queue-stats aggregate seq-scans
+ *   `pgboss.job_common`. Job expiry and missed-heartbeat checks ride the same
+ *   pass, and that pass only runs on a 60 s supervise tick once 120 s have
+ *   passed, so a job whose worker died is failed 2 to 3 min late instead of
+ *   1 to 2 (spray detection's 30 s heartbeat included).
+ */
+export const JOB_QUEUE_TIMER_OPTIONS = {
+  flowIntervalSeconds: 3600,
+  cronMonitorIntervalSeconds: 45,
+  monitorIntervalSeconds: 120,
+} as const;
+
+/**
+ * Poll interval for the backend's maintenance workers (the reconcile crons and
+ * the detection dead-letter queue). The crons get one job a minute, so the 2 s
+ * default was 30 fetches per replica for every job. The dead-letter queue only
+ * gets a job when a detection exhausts its retries, and marking that detection
+ * failed up to 30 s later adds little to a path that already spent over a
+ * minute on three backed-off retries.
+ */
+export const MAINTENANCE_POLLING_INTERVAL_SECONDS = 30;
+
 /** Shared connection factory. Only the backend owns scheduling/supervision. */
 export function createJobQueueClient(options: {
   connectionString: string;
@@ -71,15 +114,16 @@ export function createJobQueueClient(options: {
     connectionString: options.connectionString,
     max: options.poolSize,
     connectionTimeoutMillis: 10_000,
+    ...(options.owner === 'worker' ? WORKER_JOB_QUEUE_POOL_OPTIONS : {}),
     migrate: options.owner === 'backend' && options.testBootstrap === true,
     schedule: options.owner === 'backend',
     supervise: options.owner === 'backend',
     // Owner migrations maintain indexes; restricted runtimes never perform DDL.
     reindex: false,
+    ...JOB_QUEUE_TIMER_OPTIONS,
   });
-  instance.on('error', () => {
-    // Driver errors can contain credentials/SQL. Emit a bounded operational error.
-    logger.error('[job-queue] connection or execution failed', new Error('JOB_QUEUE_ERROR'));
+  instance.on('error', (error: unknown) => {
+    reportJobQueueError(error, { owner: options.owner, poolSize: options.poolSize });
   });
   return instance;
 }

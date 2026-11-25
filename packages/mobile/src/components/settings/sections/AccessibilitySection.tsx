@@ -1,14 +1,16 @@
+import { PressableSurface } from '../../PressableSurface';
+import { MEDIUM_LARGE_SNAP_POINTS, LARGE_SNAP_POINTS } from '../../sheet-snap-points';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CvdType } from '../../../lib/color-contrast-oracle';
-import { Pressable, StyleSheet, View, type ColorValue } from 'react-native';
+import { StyleSheet, View, type ColorValue } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
 import { toBoardName } from '@boardsesh/board-config';
 import type { BoardName } from '@boardsesh/shared-schema';
-import { Button } from '../../Button';
 import { Icon } from '../../Icon';
 import { ListRow } from '../../ListRow';
 import { ModalSheet } from '../../ModalSheet';
+import { SheetTopBar } from '../../SheetTopBar';
 import { SectionHeader } from '../../SectionHeader';
 import { SegmentedControl } from '../../SegmentedControl';
 import { SwitchRow } from '../../SwitchRow';
@@ -34,7 +36,6 @@ import type { BoardseshRenderSettings } from '../../../lib/board-render-settings
 import { OkhslColorPicker } from '../OkhslColorPicker';
 import { MarkerMultiplierSlider } from '../MarkerMultiplierSlider';
 import {
-  DEFAULT_HOLD_COLOR_SIGNATURE,
   DEFAULT_HOLD_BRUSH_THICKNESS,
   DEFAULT_HOLD_MARKER_SHAPE,
   DEFAULT_HOLD_SHAPE_SIZE,
@@ -47,6 +48,7 @@ import {
   getDefaultHoldRoleColor,
   getEffectiveHoldRoleColor,
   getEffectiveHoldRoleShape,
+  hasStoredHoldMarkerChoices,
   normalizeBrushThickness,
   normalizeHoldShapeSize,
   useHoldColorOverrides,
@@ -54,7 +56,7 @@ import {
   type HoldColorOverrides,
   type HoldMarkerShape,
 } from '../../../lib/hold-color-overrides';
-import { borderRadius, spacing } from '../../../theme/tokens';
+import { borderRadius, cardCorners, spacing } from '../../../theme/tokens';
 
 type ColorMode = 'default' | 'user';
 
@@ -196,6 +198,7 @@ export function AccessibilitySection({
   const boardName = boardNameFromActiveBoard(activeBoard?.boardType);
   const {
     overrides,
+    markerOverrides,
     shapes,
     brushThickness,
     shapeSize,
@@ -204,7 +207,6 @@ export function AccessibilitySection({
     setBrushThickness,
     setShapeSize,
     resetOverrides,
-    renderSignature,
   } = useHoldColorOverrides();
   // The live colours, for the mirror below. Same reason `useBoardLookSettings`
   // keeps one: the store write is async, so a second save made before React
@@ -224,9 +226,10 @@ export function AccessibilitySection({
   // that answer took. Classic is certain in exactly two cases: they chose it, or
   // the installed binary cannot draw the other one.
   const isClassic = requestedMode === 'classic' || boardseshRendererAvailable === false;
-  // renderSignature is buildHoldRenderOverrideSignature(markerOverrides), so this
-  // alone is equivalent to hasHoldMarkerOverrides(markerOverrides).
-  const hasMarkerOverrides = renderSignature !== DEFAULT_HOLD_COLOR_SIGNATURE;
+  // The climber's own choices, not what is drawn: with Differentiate Without
+  // Color on, the drawn shapes differ from circles without anyone choosing them,
+  // and Reset must not offer to undo the OS.
+  const hasMarkerOverrides = hasStoredHoldMarkerChoices(markerOverrides);
   // One source of truth for "which palette am I on", read by both the rail and
   // (through `roleColors` below) the verdict.
   const matchedPaletteId = matchingCvdPaletteId(overrides);
@@ -251,7 +254,7 @@ export function AccessibilitySection({
   const verdict = useMemo(() => verdictLine(t, evaluateRoleSeparation(roleColors)), [roleColors, t]);
 
   const handleSaveRole = useCallback(
-    (role: HoldColorOverrideRole, color: string | null, shape: HoldMarkerShape) => {
+    (role: HoldColorOverrideRole, color: string | null, shape?: HoldMarkerShape) => {
       setRoleMarkerOverride(role, color, shape);
       // The ONE manual colour edit in the app, so the one place the climber's own
       // colours get remembered. A palette apply deliberately does not mirror
@@ -313,7 +316,7 @@ export function AccessibilitySection({
 
       <View style={styles.section}>
         <SectionHeader title={t('mobile.settings.boardLook.accessibility.title')} />
-        <View style={[styles.card, styles.cardPadded, { backgroundColor: systemColors.secondaryBackground }]}>
+        <View style={[styles.card, styles.cardPadded, { backgroundColor: systemColors.secondaryGroupedBackground }]}>
           <SwitchRow
             label={t('mobile.settings.boardLook.accessibility.roleGlyphs.label')}
             description={t('mobile.settings.boardLook.accessibility.roleGlyphs.note')}
@@ -325,16 +328,7 @@ export function AccessibilitySection({
 
       <View style={styles.section}>
         <SectionHeader title={t('mobile.settings.accessibility.markersTitle')} />
-        {!isClassic ? (
-          <Text
-            variant="footnote"
-            color={systemColors.secondaryLabel}
-            style={[styles.description, styles.classicOnlyNote]}
-          >
-            {t('mobile.settings.boardLook.accessibility.classicOnlyNote')}
-          </Text>
-        ) : null}
-        <View style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}>
+        <View style={[styles.card, { backgroundColor: systemColors.secondaryGroupedBackground }]}>
           {HOLD_COLOR_OVERRIDE_ROLES.map((role) => {
             const roleOverride = overrides[role];
             const roleShape = getEffectiveHoldRoleShape(role, shapes);
@@ -347,7 +341,7 @@ export function AccessibilitySection({
               ? t('mobile.settings.accessibility.rowSubtitle', { colorMode: modeLabel, shape: shapeLabel })
               : modeLabel;
             const swatchColor = getEffectiveHoldRoleColor(boardName, role, overrides);
-            const hasRoleOverride = !!roleOverride || roleShape !== DEFAULT_HOLD_MARKER_SHAPE;
+            const hasRoleOverride = !!roleOverride || markerOverrides.shapes[role] !== undefined;
             return (
               <ListRow
                 key={role}
@@ -411,12 +405,22 @@ export function AccessibilitySection({
             </>
           ) : null}
         </View>
+        {/* A footer, not a note above the card: it qualifies the rows it sits under. */}
+        {!isClassic ? (
+          <Text
+            variant="footnote"
+            color={systemColors.secondaryLabel}
+            style={[styles.description, styles.classicOnlyNote]}
+          >
+            {t('mobile.settings.boardLook.accessibility.classicOnlyNote')}
+          </Text>
+        ) : null}
         {hasMarkerOverrides ? (
-          <Pressable accessibilityRole="button" onPress={handleResetMarkers} style={styles.resetButton}>
+          <PressableSurface accessibilityRole="button" onPress={handleResetMarkers} style={styles.resetButton}>
             <Text variant="footnote" color={systemColors.accent}>
               {t('mobile.settings.accessibility.resetAll')}
             </Text>
-          </Pressable>
+          </PressableSurface>
         ) : null}
       </View>
 
@@ -456,7 +460,7 @@ type HoldColorPickerSheetProps = {
   shapeSize: number;
   /** Classic only — Boardsesh draws the lit hold's own silhouette, so there's no shape to pick. */
   showShapePicker: boolean;
-  onSave: (role: HoldColorOverrideRole, color: string | null, shape: HoldMarkerShape) => void;
+  onSave: (role: HoldColorOverrideRole, color: string | null, shape?: HoldMarkerShape) => void;
   onClose: () => void;
 };
 
@@ -475,6 +479,7 @@ function HoldColorPickerSheet({
   const [mode, setMode] = useState<ColorMode>('default');
   const [userColor, setUserColor] = useState<string>('#00ff00');
   const [shape, setShape] = useState<HoldMarkerShape>(DEFAULT_HOLD_MARKER_SHAPE);
+  const [shapeChosen, setShapeChosen] = useState(false);
   const [seedCounter, setSeedCounter] = useState(0);
   // Tracks the closed->open transition so the fields re-seed each time the picker
   // opens; the ModalSheet is driven declaratively off `role != null`.
@@ -494,6 +499,7 @@ function HoldColorPickerSheet({
       setMode(currentColor ? 'user' : 'default');
       setUserColor(seedColor);
       setShape(currentShape);
+      setShapeChosen(false);
       setSeedCounter((value) => value + 1);
     }
     wasOpenRef.current = role != null;
@@ -514,18 +520,28 @@ function HoldColorPickerSheet({
 
   const handleSave = useCallback(() => {
     if (!role) return;
-    onSave(role, mode === 'default' ? null : userColor, shape);
-  }, [mode, onSave, role, shape, userColor]);
+    onSave(role, mode === 'default' ? null : userColor, showShapePicker && shapeChosen ? shape : undefined);
+  }, [mode, onSave, role, shape, shapeChosen, showShapePicker, userColor]);
 
-  const footer = <Button title={t('mobile.settings.accessibility.save')} onPress={handleSave} size="large" />;
+  const header = (
+    <SheetTopBar
+      title={role ? labelForRole(t, role) : t('mobile.settings.accessibility.title')}
+      leading={{ kind: 'cancel', onPress: onClose }}
+      trailing={{
+        kind: 'confirm',
+        label: t('mobile.settings.accessibility.save'),
+        onPress: handleSave,
+        prominent: true,
+      }}
+    />
+  );
 
   return (
-    <ModalSheet visible={role != null} snapPoints={['95%']} onClose={onClose} footer={footer} scrollable>
+    <ModalSheet visible={role != null} snapPoints={LARGE_SNAP_POINTS} onClose={onClose} header={header} scrollable>
       <View style={styles.pickerBody}>
         <View style={styles.pickerHeader}>
           <MarkerSwatch color={previewColor} shape={shape} size={shapeSize} />
           <View style={styles.pickerTitleColumn}>
-            <Text variant="headline">{role ? labelForRole(t, role) : t('mobile.settings.accessibility.title')}</Text>
             <Text variant="footnote" color={systemColors.secondaryLabel}>
               {t('mobile.settings.accessibility.pickerSubtitle')}
             </Text>
@@ -557,12 +573,15 @@ function HoldColorPickerSheet({
               {HOLD_MARKER_SHAPES.map((option) => {
                 const selected = shape === option;
                 return (
-                  <Pressable
+                  <PressableSurface
                     key={option}
                     accessibilityRole="button"
                     accessibilityState={{ selected }}
                     accessibilityLabel={labelForShape(t, option)}
-                    onPress={() => setShape(option)}
+                    onPress={() => {
+                      setShape(option);
+                      setShapeChosen(true);
+                    }}
                     style={[
                       styles.shapeButton,
                       {
@@ -576,7 +595,7 @@ function HoldColorPickerSheet({
                     <Text variant="caption1" color={systemColors.label} style={styles.shapeLabel} numberOfLines={2}>
                       {labelForShape(t, option)}
                     </Text>
-                  </Pressable>
+                  </PressableSurface>
                 );
               })}
             </View>
@@ -615,15 +634,25 @@ function BrushThicknessSheet({ open, value, shapeSize, onSave, onClose }: BrushT
     onClose();
   }, [draftValue, onClose, onSave]);
 
-  const footer = <Button title={t('mobile.settings.accessibility.brush.save')} onPress={handleSave} size="large" />;
+  const header = (
+    <SheetTopBar
+      title={t('mobile.settings.accessibility.brush.title')}
+      leading={{ kind: 'cancel', onPress: onClose }}
+      trailing={{
+        kind: 'confirm',
+        label: t('mobile.settings.accessibility.brush.save'),
+        onPress: handleSave,
+        prominent: true,
+      }}
+    />
+  );
 
   return (
-    <ModalSheet visible={open} snapPoints={['48%', '80%']} onClose={onClose} footer={footer} scrollable>
+    <ModalSheet visible={open} snapPoints={MEDIUM_LARGE_SNAP_POINTS} onClose={onClose} header={header} scrollable>
       <View style={styles.pickerBody}>
         <View style={styles.pickerHeader}>
           <MarkerSwatch color={systemColors.accent} shape="circle" thickness={draftValue} size={shapeSize} />
           <View style={styles.pickerTitleColumn}>
-            <Text variant="headline">{t('mobile.settings.accessibility.brush.title')}</Text>
             <Text variant="footnote" color={systemColors.secondaryLabel}>
               {t('mobile.settings.accessibility.brush.subtitle')}
             </Text>
@@ -673,15 +702,25 @@ function ShapeSizeSheet({ open, value, brushThickness, onSave, onClose }: ShapeS
     onClose();
   }, [draftValue, onClose, onSave]);
 
-  const footer = <Button title={t('mobile.settings.accessibility.size.save')} onPress={handleSave} size="large" />;
+  const header = (
+    <SheetTopBar
+      title={t('mobile.settings.accessibility.size.title')}
+      leading={{ kind: 'cancel', onPress: onClose }}
+      trailing={{
+        kind: 'confirm',
+        label: t('mobile.settings.accessibility.size.save'),
+        onPress: handleSave,
+        prominent: true,
+      }}
+    />
+  );
 
   return (
-    <ModalSheet visible={open} snapPoints={['48%', '80%']} onClose={onClose} footer={footer} scrollable>
+    <ModalSheet visible={open} snapPoints={MEDIUM_LARGE_SNAP_POINTS} onClose={onClose} header={header} scrollable>
       <View style={styles.pickerBody}>
         <View style={styles.pickerHeader}>
           <MarkerSwatch color={systemColors.accent} shape="diamond" thickness={brushThickness} size={draftValue} />
           <View style={styles.pickerTitleColumn}>
-            <Text variant="headline">{t('mobile.settings.accessibility.size.title')}</Text>
             <Text variant="footnote" color={systemColors.secondaryLabel}>
               {t('mobile.settings.accessibility.size.subtitle')}
             </Text>
@@ -720,7 +759,7 @@ const styles = StyleSheet.create({
     gap: spacing[1],
   },
   card: {
-    borderRadius: borderRadius.lg,
+    ...cardCorners,
     overflow: 'hidden',
     marginHorizontal: spacing[4],
   },

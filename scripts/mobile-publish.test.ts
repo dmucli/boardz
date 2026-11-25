@@ -25,6 +25,7 @@ import {
   selfHostedPublishModeLabel,
   selfHostedPublishSuccessMessages,
   shouldAllowDirtyTree,
+  authorizePublishRuntime,
 } from './mobile-publish';
 
 // The repo's Next global.d.ts augments NodeJS.ProcessEnv to require NODE_ENV, so
@@ -112,6 +113,21 @@ describe('mobile publish argument routing', () => {
     expect(args).toContain('--dumpSourcemap');
     expect(args).toContain('dist');
     expect(args).toContain('pr-staging');
+  });
+
+  it('retains a preview export only for its optional boot receipt, without sourcemaps or relaxing the clean-tree check', () => {
+    const defaultArgs = buildSelfHostedEoasArgs('pr-6131', 'android', 'preview');
+    expect(defaultArgs).not.toContain('--outputDir');
+    const receiptArgs = buildSelfHostedEoasArgs('pr-6131', 'android', 'preview', {
+      retainExport: true,
+      allowDirtyTree: true,
+    });
+    expect(receiptArgs.slice(receiptArgs.indexOf('--outputDir'), receiptArgs.indexOf('--outputDir') + 2)).toEqual([
+      '--outputDir',
+      'dist',
+    ]);
+    expect(receiptArgs).not.toContain('--dumpSourcemap');
+    expect(receiptArgs).not.toContain('--disableRepositoryCheck');
   });
 
   it('keeps the EAS preview command arguments unchanged', () => {
@@ -318,7 +334,8 @@ describe('resolving the runtimeVersion a publish targeted', () => {
       const runtimeVersion = resolvePublishedRuntimeVersion('ios', env, runner as unknown as typeof execFileSync);
       expect(runtimeVersion).toBeNull();
       expect(warning).toHaveBeenCalledWith(expect.stringContaining('could not confirm a stable runtimeVersion'));
-      const fetchImpl = vi.fn<typeof fetch>();
+      // Vitest's mock loses fetch's callable overloads; retain the declared API.
+      const fetchImpl = vi.fn<typeof fetch>() as unknown as typeof fetch;
       await expect(
         verifyPreviewBranchIsSurfable(
           'pr-5417',
@@ -343,6 +360,47 @@ describe('resolving the runtimeVersion a publish targeted', () => {
     expect(runsInGithubActions({ GITHUB_ACTIONS: 'true' })).toBe(true);
     expect(runsInGithubActions({ CI: '1' })).toBe(false);
     expect(runsInGithubActions({})).toBe(false);
+  });
+});
+
+describe('guarded publish runtime', () => {
+  const fingerprint = 'a'.repeat(40);
+  it('independently resolves without overrides and freezes the authorized runtime for the upload', () => {
+    const input = processEnv({
+      GITHUB_ACTIONS: 'true',
+      OTA_EXPECT_RUNTIME_VERSION: fingerprint,
+      EXPO_UPDATES_FINGERPRINT_OVERRIDE: 'b'.repeat(40),
+      GOOGLE_MAPS_API_KEY: 'maps-key',
+    });
+    const resolver = vi.fn((_platform: OtaPublishPlatform, rawEnv: NodeJS.ProcessEnv) => {
+      expect(rawEnv.EXPO_UPDATES_FINGERPRINT_OVERRIDE).toBeUndefined();
+      expect(rawEnv.OTA_EXPECT_RUNTIME_VERSION).toBeUndefined();
+      expect(rawEnv.GOOGLE_MAPS_API_KEY).toBe('maps-key');
+      return fingerprint;
+    });
+    const authorized = authorizePublishRuntime('android', input, resolver);
+    expect(authorized.EXPO_UPDATES_FINGERPRINT_OVERRIDE).toBe(fingerprint);
+    expect(authorized.OTA_EXPECT_RUNTIME_VERSION).toBeUndefined();
+    expect(input.EXPO_UPDATES_FINGERPRINT_OVERRIDE).toBe('b'.repeat(40));
+  });
+
+  it.each([null, 'b'.repeat(40)])('blocks publication when independent resolver returns %s', (resolved) => {
+    expect(() =>
+      authorizePublishRuntime(
+        'ios',
+        processEnv({ GITHUB_ACTIONS: 'true', OTA_EXPECT_RUNTIME_VERSION: fingerprint }),
+        () => resolved,
+      ),
+    ).toThrow(/changed or could not be confirmed/);
+  });
+
+  it('requires CI and a full runtime when an expected hash is supplied', () => {
+    expect(() => authorizePublishRuntime('ios', processEnv({ OTA_EXPECT_RUNTIME_VERSION: fingerprint }))).toThrow();
+    expect(() =>
+      authorizePublishRuntime('ios', processEnv({ GITHUB_ACTIONS: 'true', OTA_EXPECT_RUNTIME_VERSION: 'unknown' })),
+    ).toThrow();
+    const unchanged = processEnv({});
+    expect(authorizePublishRuntime('ios', unchanged)).toBe(unchanged);
   });
 });
 

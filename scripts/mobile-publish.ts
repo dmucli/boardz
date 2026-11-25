@@ -25,6 +25,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { recordPreviewPlatformReceipt } from './lib/ota-preview-boot-receipt';
 import { EOAS_PACKAGE_SPEC, SELF_HOSTED_UPLOAD_RATE_PER_SECOND } from './lib/eoas';
 import {
   publishPlatformsSequentially,
@@ -163,7 +164,7 @@ export function buildSelfHostedEoasArgs(
   branchName: string,
   platform: OtaPublishPlatform,
   updateMessage: string,
-  options: { allowDirtyTree?: boolean } = {},
+  options: { allowDirtyTree?: boolean; retainExport?: boolean } = {},
 ): string[] {
   // eoas aborts on a dirty tree before it ever reads the commit. Skipping that
   // check is what lets the workflow publish the regenerated changelog from an
@@ -184,7 +185,9 @@ export function buildSelfHostedEoasArgs(
         '--outputDir',
         'dist',
       ]
-    : [];
+    : options.retainExport === true
+      ? ['--outputDir', 'dist']
+      : [];
   return [
     EOAS_PACKAGE_SPEC,
     'publish',
@@ -306,6 +309,25 @@ export function resolvePublishedRuntimeVersion(
   return null;
 }
 
+/** Validate the guard's exact runtime independently, then freeze it through export/upload retries. */
+export function authorizePublishRuntime(
+  platform: OtaPublishPlatform,
+  env: NodeJS.ProcessEnv,
+  resolver: typeof resolvePublishedRuntimeVersion = resolvePublishedRuntimeVersion,
+): NodeJS.ProcessEnv {
+  const expected = env.OTA_EXPECT_RUNTIME_VERSION;
+  if (!expected) return env;
+  if (!runsInGithubActions(env) || !/^[0-9a-f]{40}$/.test(expected)) {
+    throw new Error('An expected publish runtime requires a full fingerprint in GitHub Actions.');
+  }
+  const rawEnv = { ...env };
+  delete rawEnv.EXPO_UPDATES_FINGERPRINT_OVERRIDE;
+  delete rawEnv.OTA_EXPECT_RUNTIME_VERSION;
+  const resolved = resolver(platform, rawEnv);
+  if (resolved !== expected) throw new Error(`The ${platform} publish runtime changed or could not be confirmed.`);
+  return { ...rawEnv, EXPO_UPDATES_FINGERPRINT_OVERRIDE: resolved };
+}
+
 /**
  * Ask the update server whether `branchName` is actually being offered to this
  * platform — the same `/branch_lists` question the in-app picker asks.
@@ -404,13 +426,13 @@ async function publishToSelfHostedBranch(
     console.error(
       '[mobile:publish] e.g. https://updates.boardsesh.com/manifest). eoas derives the upload host from it.',
     );
-    console.error('[mobile:publish] See docs/mobile-ota-updates.md.');
+    console.error('[mobile:publish] See docs/operations/mobile-ota-updates.md.');
     return 1;
   }
   if (!process.env.EOO_TOKEN) {
     console.error('[mobile:publish] --channel requires EOO_TOKEN (an app-scoped expo-open-ota API key).');
     console.error('[mobile:publish] The V3 control-plane server rejects Expo tokens; mint a key in the dashboard');
-    console.error('[mobile:publish] and set EOO_TOKEN locally / in CI. See docs/mobile-ota-updates.md.');
+    console.error('[mobile:publish] and set EOO_TOKEN locally / in CI. See docs/operations/mobile-ota-updates.md.');
     return 1;
   }
 
@@ -420,7 +442,7 @@ async function publishToSelfHostedBranch(
   // update). We deliberately do NOT pass --channel: in eoas@3 it's a DEPRECATED
   // client-side no-op — it only sets RELEASE_CHANNEL during config resolution; it
   // is NOT sent to the server, does NOT create a channel, and does NOT drive
-  // rollouts. Production's channel→branch mapping is a one-time dashboard action;
+  // rollouts. Production's channel→branch mapping is declared in infra/ota/config.ts;
   // per-PR previews use branch surfing. Progressive rollouts are branch + runtimeVersion scoped
   // (--rollout-percentage targets a branch's runtimeVersion), not channel scoped.
   // EOAS_PACKAGE_SPEC pins the CLI to the deployed server's version; the two
@@ -464,6 +486,10 @@ async function publishToSelfHostedBranch(
   // no shipped binary runs (@expo/fingerprint is not deterministic across macOS and
   // Linux), so the check is skipped there rather than answered wrongly.
   const verifiable = PREVIEW_BRANCH_PATTERN.test(branchName) && runsInGithubActions();
+  const previewReceiptPath = process.env.OTA_PREVIEW_RECEIPT_PATH;
+  if (previewReceiptPath && (!verifiable || requestedSelfHostedPlatforms(platform).length !== 1)) {
+    throw new Error('Preview receipts require one preview platform in GitHub Actions.');
+  }
   const runtimeVersions = new Map<OtaPublishPlatform, string | null>();
   const runtimeVersionFor = (target: OtaPublishPlatform): string | null => {
     if (!verifiable) return null;
@@ -490,8 +516,10 @@ async function publishToSelfHostedBranch(
 
   const platforms = requestedSelfHostedPlatforms(platform);
   const outcomes = await publishPlatformsSequentially(platforms, async (requestedPlatform) => {
+    const publishEnv = authorizePublishRuntime(requestedPlatform, platformEnvFor(requestedPlatform));
     const eoasArgs = buildSelfHostedEoasArgs(branchName, requestedPlatform, updateMessage, {
       allowDirtyTree: shouldAllowDirtyTree(),
+      retainExport: Boolean(previewReceiptPath),
     });
     console.log('');
     console.log(`[mobile:publish] Running ${requestedPlatform}: vp dlx ${eoasArgs.join(' ')}`);
@@ -502,9 +530,11 @@ async function publishToSelfHostedBranch(
         command: 'vp',
         args: ['dlx', ...eoasArgs],
         cwd: MOBILE_DIR,
-        env: platformEnvFor(requestedPlatform),
+        env: publishEnv,
       },
-      { confirmPublished },
+      {
+        confirmPublished,
+      },
     );
   });
 
@@ -524,6 +554,21 @@ async function publishToSelfHostedBranch(
     if (!passed) return 1;
   }
 
+  if (previewReceiptPath) {
+    const target = platforms[0];
+    const runtimeVersion = runtimeVersionFor(target);
+    if (!runtimeVersion) throw new Error('Cannot attest preview without the publisher runtime version.');
+    const commitHash = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT_DIR, encoding: 'utf8' }).trim();
+    await recordPreviewPlatformReceipt({
+      platform: target,
+      runtimeVersion,
+      branch: branchName,
+      commitHash,
+      exportDir: resolve(MOBILE_DIR, 'dist'),
+      manifestUrl: serverUrl,
+      outPath: previewReceiptPath,
+    });
+  }
   for (const line of selfHostedPublishSuccessMessages(branchName)) console.log(line);
   return 0;
 }

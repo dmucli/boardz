@@ -1,4 +1,11 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleBottomSheetTextInput', async () => {
+  const { BottomSheetTextInput } = await import('@expo/ui/community/bottom-sheet');
+  return { AccessibleBottomSheetTextInput: BottomSheetTextInput };
+});
+const confirmDiscard = vi.hoisted(() => vi.fn(async () => false));
+vi.mock('../../../providers/dialog-provider', () => ({ useConfirm: () => confirmDiscard }));
+vi.mock('../../../lib/announce-queued', () => ({ announceQueued: vi.fn() }));
 import { it, expect, vi, beforeEach } from 'vitest';
 import { render, renderHook, fireEvent, act } from '@testing-library/react';
 import { createElement, createRef, useSyncExternalStore, Profiler, useState, type ReactNode } from 'react';
@@ -15,14 +22,20 @@ vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
 
-type ModalSheetMockProps = { children?: ReactNode; visible?: boolean; onClose?: () => void };
-const nativeSheet = vi.hoisted(() => ({ close: undefined as (() => void) | undefined }));
+type ModalSheetMockProps = {
+  children?: ReactNode;
+  header?: ReactNode;
+  visible?: boolean;
+  onClose?: () => void | Promise<void>;
+};
+const nativeSheet = vi.hoisted(() => ({ close: undefined as (() => void | Promise<void>) | undefined }));
 vi.mock('../../ModalSheet', () => ({
-  ModalSheet: ({ children, visible, onClose }: ModalSheetMockProps) => {
+  ModalSheet: ({ children, header, visible, onClose }: ModalSheetMockProps) => {
     nativeSheet.close = onClose;
-    return createElement('div', { 'data-modal-sheet': String(visible) }, children);
+    return createElement('div', { 'data-modal-sheet': String(visible) }, header, children);
   },
 }));
+vi.mock('../../SheetTopBar', async () => (await import('../../../test/sheet-top-bar-stub')).sheetTopBarModule);
 
 type TextMockProps = { children?: ReactNode };
 vi.mock('../../Text', () => ({
@@ -103,6 +116,14 @@ vi.mock('../../../providers/auth-provider', () => ({
 const request = vi.hoisted(() => vi.fn().mockResolvedValue({ submitAppFeedback: true }));
 vi.mock('../../../lib/graphql/client', () => ({ getHttpClient: () => ({ request }) }));
 vi.mock('expo-application', () => ({ nativeApplicationVersion: '2.5.0', nativeBuildVersion: '1' }));
+const releaseContext = vi.hoisted(() => ({
+  channel: 'production',
+  branch: 'production',
+  updateId: 'running-before-upload',
+  runtimeVersion: 'runtime-1',
+  isEmbeddedLaunch: false,
+}));
+vi.mock('../../../lib/release-context', () => ({ readMobileReleaseContext: () => ({ ...releaseContext }) }));
 
 const metadata = vi.hoisted(() => ({
   pathname: '/home',
@@ -215,7 +236,9 @@ function mountFeedback(initialVisible = false) {
 }
 
 beforeEach(() => {
+  confirmDiscard.mockReset().mockResolvedValue(false);
   request.mockReset().mockResolvedValue({ submitAppFeedback: true });
+  releaseContext.updateId = 'running-before-upload';
   uploadFeedbackScreenshots.mockReset().mockResolvedValue(['screenshot-key']);
   closeRequested.mockClear();
   showToast.mockClear();
@@ -225,7 +248,7 @@ beforeEach(() => {
   metadata.boardName = 'kilter';
 });
 
-it('unsubscribes while closed, keeps drafts, and does not reopen after native dismissal', async () => {
+it('keeps dirty feedback open on cancelled dismissal and clears only a confirmed discard', async () => {
   const { onRender, getByText, getByPlaceholderText, container } = mountFeedback();
   expect(metadata.subscriptions).toBe(0);
   const closedRenders = onRender.mock.calls.length;
@@ -239,7 +262,17 @@ it('unsubscribes while closed, keeps drafts, and does not reopen after native di
   fireEvent.change(getByPlaceholderText('feedbackForm.bugPlaceholder'), {
     target: { value: 'Keep this draft on close' },
   });
-  act(() => nativeSheet.close?.());
+  await act(async () => {
+    fireEvent.click(container.querySelector('[data-testid="sheet-top-bar-leading"]')!);
+  });
+  expect(metadata.subscriptions).toBe(3);
+  expect((getByPlaceholderText('feedbackForm.bugPlaceholder') as HTMLInputElement).value).toBe(
+    'Keep this draft on close',
+  );
+  confirmDiscard.mockResolvedValueOnce(true);
+  await act(async () => {
+    fireEvent.click(container.querySelector('[data-testid="sheet-top-bar-leading"]')!);
+  });
   expect(metadata.subscriptions).toBe(0);
   expect(container.querySelector('[data-modal-sheet="false"]')).not.toBeNull();
   act(() => {
@@ -248,9 +281,7 @@ it('unsubscribes while closed, keeps drafts, and does not reopen after native di
   });
   expect(container.querySelector('[data-modal-sheet="false"]')).not.toBeNull();
   fireEvent.click(getByText('Open feedback'));
-  expect((getByPlaceholderText('feedbackForm.bugPlaceholder') as HTMLInputElement).value).toBe(
-    'Keep this draft on close',
-  );
+  expect((getByPlaceholderText('feedbackForm.bugPlaceholder') as HTMLInputElement).value).toBe('');
 });
 
 it('reads current board, route, session, and queue after a dismissed screenshot upload', async () => {
@@ -273,7 +304,9 @@ it('reads current board, route, session, and queue after a dismissed screenshot 
   fireEvent.click(container.querySelector('[data-screenshot-picker]')!);
   fireEvent.click(container.querySelector('[data-button="feedbackDialog.submitBug"]')!);
   expect(uploadFeedbackScreenshots).toHaveBeenCalledTimes(1);
-  act(() => nativeSheet.close?.());
+  await act(async () => {
+    await nativeSheet.close?.();
+  });
   expect(metadata.subscriptions).toBe(3);
   act(() => {
     metadata.pathname = '/climbs';
@@ -284,6 +317,7 @@ it('reads current board, route, session, and queue after a dismissed screenshot 
   });
   // Queue-only change: no metadata render publishes a new reader closure.
   metadata.climbUuid = 'queue-only-latest';
+  releaseContext.updateId = 'running-at-submission';
   await act(async () => {
     finishUpload(['screenshot-key']);
   });
@@ -293,6 +327,7 @@ it('reads current board, route, session, and queue after a dismissed screenshot 
       boardName: 'tension',
       screenshotKeys: ['screenshot-key'],
       context: { url: '/climbs', sessionId: 'session-after', climbUuid: 'queue-only-latest' },
+      releaseContext: { ...releaseContext, updateId: 'running-at-submission' },
     },
   });
   expect(metadata.subscriptions).toBe(3);
@@ -311,7 +346,8 @@ it('retains attachments and draft after an upload failure and allows retry', asy
   });
   fireEvent.click(container.querySelector('[data-screenshot-picker]')!);
   fireEvent.click(container.querySelector('[data-button="feedbackDialog.submitBug"]')!);
-  await vi.waitFor(() => expect(showToast).toHaveBeenCalledWith('screenshots.uploadFailed', 'error'));
+  await vi.waitFor(() => expect(document.body.textContent).toContain('screenshots.uploadFailed'));
+  expect(showToast).not.toHaveBeenCalledWith('screenshots.uploadFailed', 'error');
   expect(request).not.toHaveBeenCalled();
   expect(container.querySelector('[data-screenshot-picker="file:///shot-0.jpg"]')).not.toBeNull();
   fireEvent.click(container.querySelector('[data-button="feedbackDialog.submitBug"]')!);
@@ -337,4 +373,21 @@ it('refuses submission before metadata is mounted instead of filing stale contex
     ).rejects.toThrow('Feedback metadata is not ready');
   });
   expect(request).not.toHaveBeenCalled();
+});
+
+it.each(['prompt', 'drawer-feedback'] as const)('attaches the running release to %s ratings', async (source) => {
+  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+  const { result } = renderHook(
+    () =>
+      useSubmitMobileAppFeedback({
+        current: () => ({ activeBoard: null, currentClimbQueueItem: null, sessionId: null, pathname: '/home' }),
+      }),
+    {
+      wrapper: ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+      ),
+    },
+  );
+  await act(() => result.current.mutateAsync({ source, rating: 4, comment: null }));
+  expect(request.mock.calls[0][1]).toMatchObject({ input: { source, rating: 4, releaseContext } });
 });

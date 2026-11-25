@@ -1,3 +1,4 @@
+import { parseFramesSegments } from '@boardsesh/board-constants/hold-states';
 import type { Climb, RenderBoardConfig } from '@boardsesh/shared-schema';
 
 /**
@@ -17,6 +18,12 @@ export type TickLike = {
   isBenchmark: boolean;
   isMirror: boolean;
   isNoMatch: boolean;
+  /**
+   * Structured matching/feet rules (see decodeClimbRules). Absent on payloads
+   * that don't carry it — the play drawer falls back to `isNoMatch` for the
+   * no-match glyph but shows "not recorded" for Woods' explicit rules line.
+   */
+  characteristics?: string[] | null;
   boardType: string;
   layoutId?: number | null;
   /**
@@ -40,6 +47,7 @@ export function tickToClimb(tick: TickLike): Climb | null {
     uuid: tick.climbUuid,
     name: tick.climbName ?? tick.climbUuid,
     frames: tick.frames,
+    framesCount: parseFramesSegments(tick.frames).length,
     angle: tick.angle,
     ascensionist_count: 0,
     difficulty: tick.difficultyName ?? '',
@@ -50,6 +58,7 @@ export function tickToClimb(tick: TickLike): Climb | null {
     benchmark_difficulty: tick.isBenchmark ? (tick.difficultyName ?? null) : null,
     mirrored: tick.isMirror,
     is_no_match: tick.isNoMatch,
+    characteristics: tick.characteristics ?? null,
     boardType: tick.boardType,
     layoutId: tick.layoutId,
   };

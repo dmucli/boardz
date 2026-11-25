@@ -70,5 +70,142 @@
   "crossBoardLogbook": {
     "headline": "Alle deine Boards.\nEin Routenbuch.",
     "description": "Deine Begehungen und Sessions von allen Boards an einem Ort."
+  },
+  "storeBoards": {
+    "headline": "Eine App für\nalle deine Boards",
+    "description": "Ein Routenbuch für jedes Board."
+  },
+  "storeCrew": {
+    "headline": "Deine Crew.\nEine Warteschlange.",
+    "description": "Fügt gemeinsam Boulder hinzu und wählt den nächsten.",
+    "emphasis": "Warteschlange."
+  },
+  "storeSpray": {
+    "headline": "Deine Spraywall\nist auch dabei.",
+    "description": "Erstelle Boulder auf dem Foto deiner Spraywall.",
+    "emphasis": "dabei."
+  },
+  "storeMoreBoards": {
+    "headline": "Mehr Boards.\nDieselbe App.",
+    "description": "Auch mit Touchstone und So iLL kompatibel.",
+    "emphasis": "App."
+  },
+  "storeIsland": {
+    "headline": "Boulder wechseln.\nMit Dynamic Island.",
+    "description": "Wechsle den Boulder, ohne die App zu öffnen.",
+    "emphasis": "Dynamic Island."
+  },
+  "cppOtherBoards": {
+    "headline": "Eine App für alle deine Boards",
+    "description": "Alle deine Routenbücher an einem Ort"
+  },
+  "cppSearch": {
+    "headline": "Finde dein\nnächstes Projekt",
+    "description": "Filtere nach Grad und blende Begehungen aus."
+  },
+  "cppLogbook": {
+    "headline": "Jede Begehung,\njeder Versuch",
+    "description": "Nach Tagen gruppiert, mit deinem Topgrad."
+  },
+  "cppQueue": {
+    "headline": "Freunde wählen\nden nächsten",
+    "description": "Alle reihen vom eigenen Handy ein."
+  },
+  "cppWorkout": {
+    "headline": "Trainiere mit\neinem Plan",
+    "description": "Boulder passend zu deinem Zielgrad."
+  },
+  "cppStatus": {
+    "headline": "Sieh, was gerade\nleuchtet",
+    "description": "Zeigt jeden über Boardsesh beleuchteten Boulder."
+  },
+  "cppIsland": {
+    "headline": "Nächster Boulder\naus jeder App",
+    "description": "Direkt in der Dynamic Island."
+  },
+  "cppKiosk": {
+    "headline": "Lass es am\nBoard liegen",
+    "description": "Zeigt den beleuchteten Boulder, Display bleibt an."
+  },
+  "cppKilterGrade": {
+    "headline": "Kilter-Boulder\nin deinem Grad",
+    "description": "Wähle Grad und Winkel, dann beleuchte ihn."
+  },
+  "cppKilterLayouts": {
+    "headline": "Unterstützt Kilter",
+    "description": "Wir können auch dein bisheriges Routenbuch für dich importieren."
+  },
+  "cppKilterLogbookImport": {
+    "headline": "Kilter-Verlauf\nimportieren",
+    "description": "Auch deine alten Begehungen und Versuche."
+  },
+  "cppMoonboardGrade": {
+    "headline": "MoonBoard\nin deinem Grad",
+    "description": "Wähle den Grad, beleuchte den Boulder."
+  },
+  "cppMoonboardLogbook": {
+    "headline": "Jede Begehung,\njeder Versuch",
+    "description": "Hol dein Routenbuch per CSV-Export rein."
+  },
+  "cppMoonboardSets": {
+    "headline": "Unterstützt MoonBoard",
+    "description": "Wir können dein bisheriges Routenbuch per CSV-Export importieren."
+  },
+  "cppSprayHolds": {
+    "headline": "Griffe vom Foto\nvorgeschlagen",
+    "description": "Den Rest korrigierst du direkt im Foto."
+  },
+  "cppSprayOtherBoards": {
+    "headline": "Hallen-Boards,\nein Routenbuch",
+    "description": "Auch Begehungen von Kilter, Tension und MoonBoard.",
+    "emphasis": "ein Routenbuch"
+  },
+  "cppSprayProjects": {
+    "headline": "Zurück zu\ndeinen Projekten",
+    "description": "Boulder, an denen du dran bist, noch nicht getoppt."
+  },
+  "cppSpraySetting": {
+    "headline": "Setz an deiner\nSpraywall",
+    "description": "Tippe Griffe auf dem Foto deiner Wand an.",
+    "emphasis": "Spraywall"
+  },
+  "cppSprayWalls": {
+    "headline": "Unterstützt Spraywalls",
+    "description": "Setze Boulder auf Fotos deiner eigenen Wände."
+  },
+  "cppSprayWorkout": {
+    "headline": "Trainiere mit\neinem Plan",
+    "description": "Sobald deine Wand Boulder mit Grad hat."
+  },
+  "cppTensionLayouts": {
+    "headline": "Unterstützt Tension",
+    "description": "Wir können auch dein bisheriges Routenbuch für dich importieren."
+  },
+  "cppTensionLogbookImport": {
+    "headline": "Tension-Verlauf\nimportieren",
+    "description": "Deine bisherigen Begehungen an einem Ort."
+  },
+  "cppTensionMirrorBoard": {
+    "headline": "Boulder am\nTension 2 Mirror",
+    "description": "Für dein symmetrisches Board."
+  },
+  "cppTensionQueue": {
+    "headline": "Tension klettern\nmit Freunden",
+    "description": "Alle reihen vom eigenen Handy ein.",
+    "emphasis": "Freunden"
+  },
+  "cppTensionSearch": {
+    "headline": "Direkt zu\ndeinem Grad",
+    "description": "Dann blende getoppte Boulder aus."
+  },
+  "storeLiveActivity": {
+    "headline": "Nächster Boulder.\nAußerhalb der App.",
+    "description": "Wechsle den Boulder, ohne die App zu öffnen.",
+    "emphasis": "Außerhalb der App."
+  },
+  "cppLiveActivity": {
+    "headline": "Nächster Boulder.\nAußerhalb der App.",
+    "description": "Wechsle den Boulder, ohne die App zu öffnen.",
+    "emphasis": "Außerhalb der App."
   }
 }

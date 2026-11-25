@@ -1,5 +1,9 @@
+import { opacity } from '../../theme/tokens';
+import { Text } from '../Text';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { PressableSurface } from '../PressableSurface';
 import { useEffect, useState } from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 import Svg, { Path } from 'react-native-svg';
 import { useTranslation } from 'react-i18next';
 import { webApiUrl } from '../../lib/env';
@@ -90,6 +94,7 @@ function AppleIcon({ color }: { color: string }) {
 }
 
 export function OAuthProviderButtons({ disabled, onSignIn, providers }: OAuthProviderButtonsProps) {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('auth');
   const theme = useTheme();
   const appleBackground = theme.colorScheme === 'dark' ? '#FFFFFF' : '#000000';
@@ -111,16 +116,16 @@ export function OAuthProviderButtons({ disabled, onSignIn, providers }: OAuthPro
         <Text style={[styles.discoveryErrorText, { color: theme.systemColors.secondaryLabel }]}>
           {t('nativeStart.providerDiscoveryError')}
         </Text>
-        <Pressable
+        <PressableSurface
           accessibilityRole="button"
           accessibilityLabel={t('nativeStart.retryProviders')}
           disabled={disabled}
           onPress={providers.retry}
         >
-          <Text style={[styles.retryLabel, { color: theme.systemColors.accent }]}>
+          <Text emphasized style={[styles.retryLabel, { color: theme.systemColors.accent }]}>
             {t('nativeStart.retryProviders')}
           </Text>
-        </Pressable>
+        </PressableSurface>
       </View>
     );
   }
@@ -128,7 +133,7 @@ export function OAuthProviderButtons({ disabled, onSignIn, providers }: OAuthPro
   return (
     <View style={styles.buttons}>
       {providers.google ? (
-        <Pressable
+        <PressableSurface
           accessibilityRole="button"
           accessibilityLabel={t('login.providers.google')}
           disabled={disabled}
@@ -141,11 +146,13 @@ export function OAuthProviderButtons({ disabled, onSignIn, providers }: OAuthPro
           ]}
         >
           <GoogleLogo />
-          <Text style={[styles.googleLabel, { color: googleColors.label }]}>{t('login.providers.google')}</Text>
-        </Pressable>
+          <Text emphasized style={[styles.googleLabel, { color: googleColors.label }]}>
+            {t('login.providers.google')}
+          </Text>
+        </PressableSurface>
       ) : null}
       {providers.apple ? (
-        <Pressable
+        <PressableSurface
           accessibilityRole="button"
           accessibilityLabel={t('login.providers.apple')}
           disabled={disabled}
@@ -158,43 +165,44 @@ export function OAuthProviderButtons({ disabled, onSignIn, providers }: OAuthPro
           ]}
         >
           <AppleIcon color={appleForeground} />
-          <Text style={[styles.appleLabel, { color: appleForeground }]}>{t('login.providers.apple')}</Text>
-        </Pressable>
+          <Text emphasized style={[styles.appleLabel, { color: appleForeground }]}>
+            {t('login.providers.apple')}
+          </Text>
+        </PressableSurface>
       ) : null}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
-  buttons: { gap: 12 },
-  loadingButtons: { gap: 12, minHeight: 112 },
-  providerButton: {
-    width: '100%',
-    height: 50,
-    borderRadius: 4,
-    borderWidth: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 12,
-  },
-  googleLabel: {
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  appleLabel: {
-    fontSize: 15,
-    fontWeight: '600',
-  },
-  loadingButton: {
-    width: '100%',
-    height: 50,
-    borderRadius: 4,
-    opacity: 0.45,
-  },
-  discoveryError: { alignItems: 'center', gap: 8 },
-  discoveryErrorText: { fontSize: 14, textAlign: 'center' },
-  retryLabel: { fontSize: 15, fontWeight: '600' },
-  disabled: { opacity: 0.5 },
-  pressed: { opacity: 0.8 },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    buttons: { gap: 12 },
+    loadingButtons: { gap: 12, minHeight: 112 },
+    providerButton: {
+      width: '100%',
+      height: 50,
+      borderRadius: 4,
+      borderWidth: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 12,
+    },
+    googleLabel: {
+      fontSize: textStyles.subheadline.fontSize,
+    },
+    appleLabel: {
+      fontSize: textStyles.subheadline.fontSize,
+    },
+    loadingButton: {
+      width: '100%',
+      height: 50,
+      borderRadius: 4,
+      opacity: 0.45,
+    },
+    discoveryError: { alignItems: 'center', gap: 8 },
+    discoveryErrorText: { fontSize: textStyles.subheadline.fontSize, textAlign: 'center' },
+    retryLabel: { fontSize: textStyles.subheadline.fontSize },
+    disabled: { opacity: opacity.disabled },
+    pressed: { opacity: 0.8 },
+  });

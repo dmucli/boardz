@@ -1,3 +1,12 @@
+import { assertNativeRevocationActivationConfiguration } from './auth/authority/native-revocation-configuration';
+import { assertWebSessionWriterActivationConfiguration } from './auth/current-store/web-session-configuration';
+import { assertBrowserSessionModeConfiguration } from './auth/authority/browser-session-mode';
+import { assertAccountGuessLimitConfiguration } from './auth/password-guess-limit';
+import { handleCurrentStoreWebSignOut } from './handlers/current-store-web-signout';
+import { handleCurrentStoreWebSession } from './handlers/current-store-web-session';
+import { handleProviderSecurity } from './handlers/provider-security';
+import { handleFirstPassword } from './handlers/first-password';
+import { handleControllerPreview } from './handlers/controller-preview';
 import { createServer, type IncomingMessage, type ServerResponse } from 'http';
 import { createServer as createHttpsServer } from 'https';
 import { readFileSync } from 'node:fs';
@@ -7,6 +16,17 @@ import { roomManager } from './services/room-manager';
 import { redisClientManager } from './redis/client';
 import { eventBroker, NotificationWorker } from './events/index';
 import { initCors, applyCorsHeaders } from './handlers/cors';
+import { rejectApiHostRequest } from './handlers/api-host';
+import {
+  createMalformedRequestRecorder,
+  dropUnfinishedResponse,
+  guardRequestHandler,
+  parseRequestUrl,
+  refuseMalformedRequest,
+} from './handlers/request-guard';
+import { createPartnerAuthHandler } from './handlers/partner-auth';
+import { createPublicApiHandler } from './handlers/public-api/router';
+import { createGymMcpHandler } from './mcp/gyms/transport';
 import { handleDatabaseHealthCheck, handleHealthCheck } from './handlers/health';
 import { recordDbConnectRetry } from './services/db-health';
 import { handleSessionJoin } from './handlers/join';
@@ -14,6 +34,7 @@ import { handleAvatarUpload } from './handlers/avatars';
 import { handleGymLogoUpload } from './handlers/gym-logos';
 import { handleGymPhotoDelete, handleGymPhotoUpload } from './handlers/gym-photos';
 import { handleSprayWallPhotoUpload } from './handlers/spray-wall-photos';
+import { handleGithubFeedbackWebhook } from './handlers/github-feedback-webhook';
 import { handleFeedbackScreenshotUpload } from './handlers/feedback-screenshots';
 import {
   handleStaticAvatar,
@@ -25,6 +46,13 @@ import { staticPathToMediaRedirect } from './lib/media-url';
 import { getMediaPublicBaseUrl } from './storage/s3';
 import { handleRobotsTxt } from './handlers/robots';
 import { handleOgClimb } from './handlers/og-climb';
+import {
+  handleOgPlace,
+  handleOgPlaylist,
+  handleOgProfile,
+  handleOgSession,
+  handleOgSetter,
+} from './handlers/og-family';
 import { handleBoardRender, isBoardRenderPath } from './handlers/board-render';
 import { handleBoardGeometry, isBoardGeometryPath } from './handlers/board-geometry';
 import { initBoardRenderer } from './services/board-render';
@@ -33,6 +61,10 @@ import { handleOcrTestDataUpload } from './handlers/ocr-test-data';
 import { handleSprayWallTestDataUpload } from './handlers/spray-wall-test-data';
 import { handlePosthogProxy } from './handlers/posthog';
 import { handleUserDataExport, handleUserDataExportDownload } from './handlers/user-data-export';
+import { handleCncArtUpload } from './handlers/cnc-art-upload';
+import { handleCncStripeWebhook } from './handlers/cnc-stripe-webhook';
+import { handleCncWorkerApi } from './handlers/cnc-worker';
+import { handleCncPackDownload, handleCncPackPreviewImage } from './handlers/cnc-download';
 import { pruneSyncDeletions } from './services/sync-deletions-prune';
 import { handleAuroraCredentials, handleAuroraCredentialsUnsynced } from './handlers/aurora-credentials';
 import { handleAuroraImport } from './handlers/aurora-import';
@@ -63,6 +95,12 @@ import {
   stopRefreshTokenCleanup,
 } from './handlers/native-auth';
 import { handleApnsStats } from './handlers/apns-stats';
+import { handleCurrentStoreWebAuth } from './handlers/current-store-web-auth';
+import { handleGuessLimitCommand } from './handlers/guess-limit-commands';
+import { GUESS_LIMIT_PREFIX } from '@boardsesh/auth-protocol';
+import { handleCurrentStoreWebOAuth } from './handlers/current-store-web-oauth';
+import { handleCurrentStoreBatchSystemUsers } from './handlers/current-store-batch-system-users';
+import { handleCurrentStoreLocationSync } from './handlers/current-store-location-sync';
 import { handleIntegrationOAuthStart, handleIntegrationOAuthCallback } from './handlers/integrations-oauth';
 import { createYogaInstance } from './graphql/yoga';
 import { setupWebSocketServer } from './websocket/setup';
@@ -79,12 +117,18 @@ import { startApnsStaleTokenCleanup, stopApnsStaleTokenCleanup } from './service
 import { buildContentStateFromQueueState } from './services/apns/content-state';
 import { allocateBoardPresenceSeq, resolveBoardHolder } from './graphql/resolvers/board-presence/shared';
 import { kilterLiveSync } from './services/kilter-live-sync';
+import { auroraLiveSync } from './services/aurora-live-sync';
 import { registerBoardQueuePreviewHook } from './services/board-queue-preview';
 import { logger, setInstanceIdProvider } from './utils/logger';
 import { startBackendMemoryMonitoring } from './services/memory-monitor';
+import { startClientUsageReporter, stopClientUsageReporter } from './services/client-usage';
+import { startPublicApiUsageReporter, stopPublicApiUsageReporter } from './services/public-api-usage';
+import { readPartnerOAuthMode } from './auth/partner/mode';
 import { isClientAbortError } from './utils/http-errors';
 import { setDbConnectObserver } from '@boardsesh/db/client';
+import { captureFixedSystemOwnerOrderMode } from '@boardsesh/db/fixed-system-owner-order';
 import { isProductionSentryEnvironment, resolveSentryEnvironment } from '@boardsesh/db/client/config';
+import { warnIfCheckoutBypassEnabled } from './services/cnc/checkout-bypass';
 import type { QueueEvent } from '@boardsesh/shared-schema';
 
 /**
@@ -114,7 +158,16 @@ async function dispatchLiveActivityForSession(sessionId: string): Promise<void> 
   sendLiveActivityUpdate(sessionId, contentState);
 }
 
-export async function startServer(): Promise<ServerResources> {
+export async function startServer(options: { host?: string } = {}): Promise<ServerResources> {
+  assertNativeRevocationActivationConfiguration();
+  assertWebSessionWriterActivationConfiguration();
+  assertBrowserSessionModeConfiguration();
+  assertAccountGuessLimitConfiguration();
+  // A typo in this mode would otherwise turn every adopted writer (account
+  // deletion, spray publish, gym merge, stray attach) into a quiet 503, one
+  // request at a time. Refuse to serve instead, so the deploy fails visibly.
+  captureFixedSystemOwnerOrderMode();
+
   // Surface database connect retries. `warn`, not `error`: SentryWinstonTransport
   // is constructed with `level: 'error'` (utils/sentry-transport.ts:80), so a
   // warn stays log-only and cannot double-report alongside the
@@ -342,14 +395,37 @@ export async function startServer(): Promise<ServerResources> {
   // Create GraphQL Yoga instance
   const yoga = createYogaInstance();
 
+  const malformedRequests = createMalformedRequestRecorder();
+
+  // Both read PARTNER_OAUTH_MODE once. A request can never change it.
+  const handlePartnerAuth = createPartnerAuthHandler();
+  const handlePublicApi = createPublicApiHandler();
+  const handleGymMcp = createGymMcpHandler();
+
   /**
    * Custom request handler that routes requests to appropriate handlers
    */
   async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+    const url = parseRequestUrl(req);
+    if (!url) {
+      refuseMalformedRequest(res);
+      malformedRequests.record();
+      return;
+    }
     const pathname = url.pathname;
 
     try {
+      // Partner OAuth's exact routes and the public /v1 API on
+      // api.boardsesh.com. With the mode off, the default, both answer false
+      // for everything.
+      if (await handlePartnerAuth(req, res)) return;
+      if (await handlePublicApi(req, res)) return;
+      if (await handleGymMcp(req, res)) return;
+
+      // api.boardsesh.com answers only its own route list, so this stays ahead
+      // of every route below.
+      if (rejectApiHostRequest(req, res, pathname)) return;
+
       // Health check endpoint
       if (pathname === '/health' && req.method === 'GET') {
         await handleHealthCheck(req, res);
@@ -374,6 +450,38 @@ export async function startServer(): Promise<ServerResources> {
       // process warms WASM + caches rendered bytes in memory).
       if (pathname === '/og/climb' && (req.method === 'GET' || req.method === 'OPTIONS')) {
         await handleOgClimb(req, res, url);
+        return;
+      }
+
+      // Share-card family: playlist, session, profile and setter cards, rendered through the same
+      // pipeline as the climb card but answered from the database on every request.
+      if (pathname === '/og/playlist' && ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '')) {
+        await handleOgPlaylist(req, res, url);
+        return;
+      }
+
+      if (pathname === '/og/session' && ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '')) {
+        await handleOgSession(req, res, url);
+        return;
+      }
+
+      if (pathname === '/og/profile' && ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '')) {
+        await handleOgProfile(req, res, url);
+        return;
+      }
+
+      if (pathname === '/og/setter' && ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '')) {
+        await handleOgSetter(req, res, url);
+        return;
+      }
+
+      if (pathname === '/og/place' && ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '')) {
+        await handleOgPlace(req, res, url);
+        return;
+      }
+
+      if (pathname === '/render/controller-preview' && ['GET', 'HEAD', 'OPTIONS'].includes(req.method || '')) {
+        await handleControllerPreview(req, res, url);
         return;
       }
 
@@ -453,7 +561,10 @@ export async function startServer(): Promise<ServerResources> {
 
       // PostHog analytics reverse proxy — forwards /api/posthog/* to https://us.i.posthog.com/*
       // so ad-blockers that target *.posthog.com don't drop our events.
-      if (pathname.startsWith('/api/posthog/') && (req.method === 'POST' || req.method === 'OPTIONS')) {
+      if (
+        pathname.startsWith('/api/posthog/') &&
+        (req.method === 'POST' || req.method === 'GET' || req.method === 'OPTIONS')
+      ) {
         await handlePosthogProxy(req, res, url);
         return;
       }
@@ -469,6 +580,63 @@ export async function startServer(): Promise<ServerResources> {
 
       if (pathname === '/api/user-data-export/download' && (req.method === 'GET' || req.method === 'OPTIONS')) {
         await handleUserDataExportDownload(req, res, url);
+        return;
+      }
+
+      // Stripe webhook for CNC build packs. Deliberately no CORS and no bearer
+      // token: the only caller is Stripe, and the `stripe-signature` header
+      // over the raw body is the authentication. 404s when Stripe is not
+      // configured rather than accepting unverifiable bodies. The method check
+      // is the handler's — it answers 405, which is the honest code for a GET
+      // to a route that exists, and it is covered by a test.
+      if (pathname === '/api/github/feedback-webhook') {
+        await handleGithubFeedbackWebhook(req, res);
+        return;
+      }
+
+      if (pathname === '/api/cnc/stripe/webhook') {
+        await handleCncStripeWebhook(req, res);
+        return;
+      }
+
+      // Buyer artwork upload. CORS-enabled and Bearer-authenticated: the
+      // configurator posts a multipart body to it from the browser, the same
+      // shape the gym image uploads use. Registered BEFORE the worker prefix
+      // only for readability — the paths do not overlap.
+      if (pathname === '/api/cnc/art' && (req.method === 'POST' || req.method === 'OPTIONS')) {
+        await handleCncArtUpload(req, res);
+        return;
+      }
+
+      // The pack generator's job API: claim, heartbeat, complete, fail and the
+      // art-asset stream. One prefix rather than five exact matches because the
+      // paths are parameterised (`:orderId`, `:assetId`); `handleCncWorkerApi`
+      // owns the dispatch. Bearer CNC_WORKER_SECRET on every route, and 404s
+      // wholesale when that secret is unset. Deliberately no CORS: no browser
+      // calls any of it.
+      if (pathname.startsWith('/api/cnc/worker/')) {
+        await handleCncWorkerApi(req, res, url);
+        return;
+      }
+
+      // Authenticated build-pack download. CORS-enabled for the Bearer path —
+      // the app calls it cross-origin — and it also accepts a short-lived
+      // `?token=` grant for a plain browser navigation.
+      if (/^\/api\/cnc\/packs\/[^/]+\/download$/.test(pathname) && (req.method === 'GET' || req.method === 'OPTIONS')) {
+        await handleCncPackDownload(req, res, url);
+        return;
+      }
+
+      // One watermarked preview sheet. Its own route rather than a `kind` on
+      // the download above because it is the only thing here a browser fetches
+      // as an `<img src>`: it answers `image/png` with a private hour-long
+      // cache, where every other route in this family is a `no-store`
+      // attachment.
+      if (
+        /^\/api\/cnc\/packs\/[^/]+\/preview\/[^/]+$/.test(pathname) &&
+        (req.method === 'GET' || req.method === 'OPTIONS')
+      ) {
+        await handleCncPackPreviewImage(req, res, url);
         return;
       }
 
@@ -642,6 +810,52 @@ export async function startServer(): Promise<ServerResources> {
         return;
       }
 
+      // Default-off service commands. Browser cookies do not authorize them.
+      if (pathname.startsWith('/api/internal/auth/current-store/location-sync/v1/')) {
+        await handleCurrentStoreLocationSync(req, res);
+        return;
+      }
+      if (pathname.startsWith('/api/internal/auth/current-store/provider-security/v1/')) {
+        await handleProviderSecurity(req, res);
+        return;
+      }
+      if (pathname.startsWith(GUESS_LIMIT_PREFIX + '/')) {
+        await handleGuessLimitCommand(req, res);
+        return;
+      }
+      if (pathname.startsWith('/api/internal/auth/current-store/first-password/v1/')) {
+        await handleFirstPassword(req, res);
+        return;
+      }
+      if (pathname.startsWith('/api/internal/auth/current-store/batch-system-users/v1/')) {
+        await handleCurrentStoreBatchSystemUsers(req, res);
+        return;
+      }
+      if (pathname === '/api/internal/auth/current-store/signout') {
+        await handleCurrentStoreWebSignOut(req, res);
+        return;
+      }
+      if (pathname.startsWith('/api/internal/auth/current-store/web-session/v1/')) {
+        await handleCurrentStoreWebSession(req, res);
+        return;
+      }
+      if (pathname.startsWith('/api/internal/auth/current-store/web-oauth/v1/')) {
+        await handleCurrentStoreWebOAuth(req, res);
+        return;
+      }
+      if (
+        pathname === '/api/internal/auth/current-store/register' ||
+        pathname === '/api/internal/auth/current-store/password' ||
+        pathname === '/api/internal/auth/current-store/verify-email' ||
+        pathname === '/api/internal/auth/current-store/resend-verification' ||
+        pathname === '/api/internal/auth/current-store/forgot-password' ||
+        pathname === '/api/internal/auth/current-store/reset-password' ||
+        pathname === '/api/internal/auth/current-store/set-password'
+      ) {
+        await handleCurrentStoreWebAuth(req, res);
+        return;
+      }
+
       // Native auth endpoints for React Native mobile app
       if (pathname === '/auth/native/exchange' && (req.method === 'POST' || req.method === 'OPTIONS')) {
         await handleNativeAuthExchange(req, res);
@@ -706,6 +920,13 @@ export async function startServer(): Promise<ServerResources> {
         // Apply CORS for GraphQL requests
         if (!applyCorsHeaders(req, res)) return;
 
+        // Yoga builds its URL as `http://<Host><target>`, which an absolute-form
+        // target turns into an invalid URL and a 500 carrying a stack trace. It
+        // reads `originalUrl` first, so `req.url` stays as sent: the region trust
+        // check in utils/flag-country.ts compares it to the path Cloudflare clears
+        // that header on, and a rewrite would make other forms pass as that path.
+        if (!req.url?.startsWith('/')) Object.assign(req, { originalUrl: url.pathname + url.search });
+
         // Yoga handles the request and writes directly to the response
         await yoga.handle(req, res);
         return;
@@ -723,13 +944,17 @@ export async function startServer(): Promise<ServerResources> {
         })
       ) {
         logger.info('Request aborted by client', { method: req.method, url: req.url });
+        // An upstream reset carries the same codes, with the client still waiting.
+        dropUnfinishedResponse(res);
         return;
       }
       logger.error('Request handler error:', error);
-      if (!res.headersSent) {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Internal server error' }));
+      if (res.headersSent) {
+        dropUnfinishedResponse(res);
+        return;
       }
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Internal server error' }));
     }
   }
 
@@ -742,17 +967,21 @@ export async function startServer(): Promise<ServerResources> {
   const certFile = process.env.DEV_HTTPS_CERT_FILE;
   const keyFile = process.env.DEV_HTTPS_KEY_FILE;
   const tlsEnabled = !!(certFile && keyFile);
+  const requestListener = guardRequestHandler(handleRequest);
   const httpServer = tlsEnabled
-    ? createHttpsServer({ cert: readFileSync(certFile!), key: readFileSync(keyFile!) }, handleRequest)
-    : createServer(handleRequest);
+    ? createHttpsServer({ cert: readFileSync(certFile!), key: readFileSync(keyFile!) }, requestListener)
+    : createServer(requestListener);
 
   // Setup WebSocket server for GraphQL subscriptions (includes ping/pong heartbeat)
   const { wss, pingInterval } = setupWebSocketServer(httpServer);
 
   // Track intervals for cleanup
-  const intervals: NodeJS.Timeout[] = [pingInterval];
+  const intervals: NodeJS.Timeout[] = [pingInterval, malformedRequests.flushTimer];
 
   logger.info(`Boardsesh Backend starting on port ${PORT}...`);
+  // Dev-only Stripe bypass. Loud, once, at boot: a stack that hands out
+  // licensed packs without a payment must never be a surprise.
+  warnIfCheckoutBypassEnabled();
   // Whether this process reports to the production Sentry/PostHog projects is
   // inferred, not configured (see @boardsesh/db/client/config), so say the answer
   // out loud at boot: a developer chasing a missing event shouldn't have to guess
@@ -767,38 +996,52 @@ export async function startServer(): Promise<ServerResources> {
   // Start HTTP server (WebSocket server is attached to it)
   const httpScheme = tlsEnabled ? 'https' : 'http';
   const wsScheme = tlsEnabled ? 'wss' : 'ws';
-  httpServer.listen(PORT, () => {
+  httpServer.listen({ port: PORT, host: options.host }, () => {
+    const boundAddress = httpServer.address();
+    const boundHost =
+      boundAddress && typeof boundAddress === 'object' ? boundAddress.address : (options.host ?? '0.0.0.0');
+    const urlHost = boundHost.includes(':') ? `[${boundHost}]` : boundHost;
     logger.info(`Boardsesh Backend is running on port ${PORT}${tlsEnabled ? ' (TLS)' : ''}`);
-    logger.info(`  GraphQL HTTP: ${httpScheme}://0.0.0.0:${PORT}/graphql`);
-    logger.info(`  GraphQL WS: ${wsScheme}://0.0.0.0:${PORT}/graphql`);
-    logger.info(`  Health check: ${httpScheme}://0.0.0.0:${PORT}/health`);
-    logger.info(`  Database health: ${httpScheme}://0.0.0.0:${PORT}/health/db`);
-    logger.info(`  Join session: ${httpScheme}://0.0.0.0:${PORT}/join/:sessionId`);
-    logger.info(`  Avatar upload: ${httpScheme}://0.0.0.0:${PORT}/api/avatars`);
-    logger.info(`  Avatar files: ${httpScheme}://0.0.0.0:${PORT}/static/avatars/`);
-    logger.info(`  Gym logo upload: ${httpScheme}://0.0.0.0:${PORT}/api/gym-logos`);
-    logger.info(`  Gym logo files: ${httpScheme}://0.0.0.0:${PORT}/static/gym-logos/`);
-    logger.info(`  Gym photo upload: ${httpScheme}://0.0.0.0:${PORT}/api/gym-photos`);
-    logger.info(`  Gym photo files: ${httpScheme}://0.0.0.0:${PORT}/static/gym-photos/`);
-    logger.info(`  OCR test data: ${httpScheme}://0.0.0.0:${PORT}/api/ocr-test-data`);
-    logger.info(`  Spray wall test data: ${httpScheme}://0.0.0.0:${PORT}/api/spray-wall-test-data`);
-    logger.info(`  PostHog proxy: ${httpScheme}://0.0.0.0:${PORT}/api/posthog/*`);
-    logger.info(`  User data export: ${httpScheme}://0.0.0.0:${PORT}/api/user-data-export`);
-    logger.info(`  Aurora credentials: ${httpScheme}://0.0.0.0:${PORT}/api/aurora-credentials`);
-    logger.info(`  Aurora import: ${httpScheme}://0.0.0.0:${PORT}/api/aurora-import`);
-    logger.info(`  MoonBoard import: ${httpScheme}://0.0.0.0:${PORT}/api/moonboard-import`);
-    logger.info(`  Kilter credential OAuth: ${httpScheme}://0.0.0.0:${PORT}/board-credentials/kilter/start`);
-    logger.info(`  Kilter credential password: ${httpScheme}://0.0.0.0:${PORT}/api/board-credentials/kilter/password`);
-    logger.info(`  Widget navigate: ${httpScheme}://0.0.0.0:${PORT}/api/widget/navigate`);
-    logger.info(`  Widget take-control: ${httpScheme}://0.0.0.0:${PORT}/api/widget/take-control`);
-    logger.info(`  Native auth exchange: ${httpScheme}://0.0.0.0:${PORT}/auth/native/exchange`);
-    logger.info(`  Native auth credentials: ${httpScheme}://0.0.0.0:${PORT}/auth/native/credentials`);
-    logger.info(`  Native auth register: ${httpScheme}://0.0.0.0:${PORT}/auth/native/register`);
-    logger.info(`  Native auth oauth: ${httpScheme}://0.0.0.0:${PORT}/auth/native/oauth`);
-    logger.info(`  Native auth refresh: ${httpScheme}://0.0.0.0:${PORT}/auth/native/refresh`);
-    logger.info(`  Native auth revoke: ${httpScheme}://0.0.0.0:${PORT}/auth/native/revoke`);
-    logger.info(`  Integration OAuth start: ${httpScheme}://0.0.0.0:${PORT}/integrations/:provider/start`);
-    logger.info(`  Integration OAuth callback: ${httpScheme}://0.0.0.0:${PORT}/integrations/:provider/callback`);
+    logger.info(`  GraphQL HTTP: ${httpScheme}://${urlHost}:${PORT}/graphql`);
+    logger.info(`  GraphQL WS: ${wsScheme}://${urlHost}:${PORT}/graphql`);
+    logger.info(`  Health check: ${httpScheme}://${urlHost}:${PORT}/health`);
+    logger.info(`  Database health: ${httpScheme}://${urlHost}:${PORT}/health/db`);
+    logger.info(`  Join session: ${httpScheme}://${urlHost}:${PORT}/join/:sessionId`);
+    logger.info(`  Avatar upload: ${httpScheme}://${urlHost}:${PORT}/api/avatars`);
+    logger.info(`  Avatar files: ${httpScheme}://${urlHost}:${PORT}/static/avatars/`);
+    logger.info(`  Gym logo upload: ${httpScheme}://${urlHost}:${PORT}/api/gym-logos`);
+    logger.info(`  Gym logo files: ${httpScheme}://${urlHost}:${PORT}/static/gym-logos/`);
+    logger.info(`  Gym photo upload: ${httpScheme}://${urlHost}:${PORT}/api/gym-photos`);
+    logger.info(`  Gym photo files: ${httpScheme}://${urlHost}:${PORT}/static/gym-photos/`);
+    logger.info(`  OCR test data: ${httpScheme}://${urlHost}:${PORT}/api/ocr-test-data`);
+    logger.info(`  Spray wall test data: ${httpScheme}://${urlHost}:${PORT}/api/spray-wall-test-data`);
+    logger.info(`  PostHog proxy: ${httpScheme}://${urlHost}:${PORT}/api/posthog/*`);
+    logger.info(`  User data export: ${httpScheme}://${urlHost}:${PORT}/api/user-data-export`);
+    logger.info(`  CNC worker API: ${httpScheme}://${urlHost}:${PORT}/api/cnc/worker/claim`);
+    logger.info(`  CNC pack download: ${httpScheme}://${urlHost}:${PORT}/api/cnc/packs/:licenceId/download`);
+    logger.info(`  CNC preview image: ${httpScheme}://${urlHost}:${PORT}/api/cnc/packs/:licenceId/preview/:name`);
+    logger.info(`  CNC artwork upload: ${httpScheme}://${urlHost}:${PORT}/api/cnc/art`);
+    logger.info(`  Aurora credentials: ${httpScheme}://${urlHost}:${PORT}/api/aurora-credentials`);
+    logger.info(`  Aurora import: ${httpScheme}://${urlHost}:${PORT}/api/aurora-import`);
+    logger.info(`  MoonBoard import: ${httpScheme}://${urlHost}:${PORT}/api/moonboard-import`);
+    logger.info(`  Kilter credential OAuth: ${httpScheme}://${urlHost}:${PORT}/board-credentials/kilter/start`);
+    logger.info(
+      `  Kilter credential password: ${httpScheme}://${urlHost}:${PORT}/api/board-credentials/kilter/password`,
+    );
+    logger.info(`  Widget navigate: ${httpScheme}://${urlHost}:${PORT}/api/widget/navigate`);
+    logger.info(`  Widget take-control: ${httpScheme}://${urlHost}:${PORT}/api/widget/take-control`);
+    logger.info(`  Native auth exchange: ${httpScheme}://${urlHost}:${PORT}/auth/native/exchange`);
+    logger.info(`  Native auth credentials: ${httpScheme}://${urlHost}:${PORT}/auth/native/credentials`);
+    logger.info(`  Native auth register: ${httpScheme}://${urlHost}:${PORT}/auth/native/register`);
+    logger.info(`  Native auth oauth: ${httpScheme}://${urlHost}:${PORT}/auth/native/oauth`);
+    logger.info(`  Native auth refresh: ${httpScheme}://${urlHost}:${PORT}/auth/native/refresh`);
+    logger.info(`  Native auth revoke: ${httpScheme}://${urlHost}:${PORT}/auth/native/revoke`);
+    logger.info(`  Integration OAuth start: ${httpScheme}://${urlHost}:${PORT}/integrations/:provider/start`);
+    logger.info(`  Integration OAuth callback: ${httpScheme}://${urlHost}:${PORT}/integrations/:provider/callback`);
+
+    // Once-a-minute per-client operation summary (services/client-usage.ts).
+    startClientUsageReporter();
+    if (readPartnerOAuthMode() !== 'off') startPublicApiUsageReporter();
 
     // Popular board configs have no boot step: a pg-boss job refreshes them
     // (services/popular-board-configs.ts), so a deploy costs the database
@@ -832,6 +1075,7 @@ export async function startServer(): Promise<ServerResources> {
   async function shutdownServices(): Promise<void> {
     eventBroker.shutdown();
     await kilterLiveSync.shutdown().catch((error: unknown) => logger.warn('[KilterLive] Shutdown failed', { error }));
+    await auroraLiveSync.shutdown().catch((error: unknown) => logger.warn('[AuroraLive] Shutdown failed', { error }));
 
     // Detach the board-queue-preview producer first: it clears any pending
     // debounce timers, so no preview publish can race the Redis/DB teardown
@@ -846,6 +1090,13 @@ export async function startServer(): Promise<ServerResources> {
     if (apnsInstanceConfigInterval !== null) {
       clearInterval(apnsInstanceConfigInterval);
       apnsInstanceConfigInterval = null;
+    }
+
+    try {
+      stopClientUsageReporter();
+      stopPublicApiUsageReporter();
+    } catch (error) {
+      logger.error('[Server] Error stopping client usage reporter:', error);
     }
 
     try {

@@ -1,10 +1,20 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vite-plus/test';
 import type { Session } from 'next-auth';
+import { ABSENT_PASSWORD_HASH } from '@boardsesh/auth-protocol/password-hash';
+import { findAccountsByEmail } from '@boardsesh/db/queries/account-email';
+import type { StoredAccount } from '@/app/test-utils/account-email-lookup';
 import { authOptions } from '../auth-options';
 
-const { mockAdapterCreateUser, mockAdapterUpdateUser } = vi.hoisted(() => ({
+const lookup = vi.hoisted(() => ({ stored: [] as StoredAccount[] }));
+vi.mock('@boardsesh/db/queries/account-email', async () => {
+  const { fakeAccountEmailLookup } = await import('@/app/test-utils/account-email-lookup');
+  return fakeAccountEmailLookup(() => lookup.stored);
+});
+
+const { mockAdapterCreateUser, mockAdapterUpdateUser, mockAdapterGetUser } = vi.hoisted(() => ({
   mockAdapterCreateUser: vi.fn(),
   mockAdapterUpdateUser: vi.fn(),
+  mockAdapterGetUser: vi.fn(),
 }));
 
 // Mock server-only before any imports
@@ -23,13 +33,13 @@ vi.mock('@auth/drizzle-adapter', () => ({
   DrizzleAdapter: vi.fn(() => ({
     createUser: mockAdapterCreateUser,
     updateUser: mockAdapterUpdateUser,
+    getUser: mockAdapterGetUser,
   })),
 }));
 
 // Mock OAuth providers — only present in the array; we test callbacks, not provider config
 vi.mock('next-auth/providers/google', () => ({ default: vi.fn(() => ({ id: 'google' })) }));
 vi.mock('next-auth/providers/apple', () => ({ default: vi.fn(() => ({ id: 'apple' })) }));
-vi.mock('next-auth/providers/facebook', () => ({ default: vi.fn(() => ({ id: 'facebook' })) }));
 // Preserve `id` and `authorize` so tests can retrieve them from authOptions.providers
 vi.mock('next-auth/providers/credentials', () => ({
   default: vi.fn((opts: { id?: string; authorize?: unknown }) => ({
@@ -40,8 +50,10 @@ vi.mock('next-auth/providers/credentials', () => ({
 
 // Mock native-oauth transfer verification
 const mockVerifyNativeOAuthTransferToken = vi.fn();
+const mockNativeOAuthTransferSpentMarker = vi.fn();
 vi.mock('../native-oauth-transfer', () => ({
   verifyNativeOAuthTransferToken: (...args: unknown[]) => mockVerifyNativeOAuthTransferToken(...args),
+  nativeOAuthTransferSpentMarker: (...args: unknown[]) => mockNativeOAuthTransferSpentMarker(...args),
 }));
 
 // Mock bcrypt
@@ -55,6 +67,10 @@ vi.mock('bcryptjs', () => ({
 
 // --- DB mock ---
 // We need to be able to swap return values per-test, so keep a mutable reference.
+type MockInsertChain = { onConflictDoNothing: () => unknown };
+const mockDbInsertValues = vi.fn((_values?: unknown): MockInsertChain => ({
+  onConflictDoNothing: vi.fn().mockResolvedValue(undefined),
+}));
 const mockDbUpdate = vi.fn();
 const mockDbSet = vi.fn();
 const mockDbUpdateWhere = vi.fn();
@@ -65,6 +81,7 @@ const mockDbLimit = vi.fn();
 
 vi.mock('@/app/lib/db/db', () => ({
   getDb: () => ({
+    insert: () => ({ values: mockDbInsertValues }),
     update: (...args: unknown[]) => mockDbUpdate(...args),
     select: (...args: unknown[]) => mockDbSelect(...args),
   }),
@@ -84,6 +101,10 @@ vi.mock('@/app/lib/db/schema', () => ({
     passwordHash: 'userCredentials.passwordHash',
   },
   userProfiles: {},
+  authSubjectCutoffs: {
+    userId: 'authSubjectCutoffs.userId',
+    generation: 'authSubjectCutoffs.generation',
+  },
 }));
 
 // Import after mocks are registered
@@ -91,7 +112,11 @@ vi.mock('@/app/lib/db/schema', () => ({
 // Helper to grab the signIn callback
 type SignInParams = Parameters<NonNullable<NonNullable<typeof authOptions.callbacks>['signIn']>>[0];
 
-async function callSignIn(params: Partial<SignInParams>) {
+type SignInTestParams = Omit<Partial<SignInParams>, 'profile'> & {
+  profile?: NonNullable<SignInParams['profile']> & { email_verified?: boolean | string };
+};
+
+async function callSignIn(params: SignInTestParams) {
   const cb = authOptions.callbacks?.signIn;
   if (!cb) throw new Error('signIn callback not defined');
   return cb(params as SignInParams);
@@ -122,31 +147,28 @@ describe('authOptions.callbacks.signIn', () => {
   // -------------------------------------------------------------------------
 
   describe('OAuth profiles without an email', () => {
-    it.each(['google', 'apple', 'facebook'] as const)(
-      'rejects %s before any database create or update',
-      async (provider) => {
-        const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    it.each(['google', 'apple'] as const)('rejects %s before any database create or update', async (provider) => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-        const result = await callSignIn({
-          user: { id: `${provider}-profile-id`, email: null, name: 'No Email' },
-          account: { provider, type: 'oauth', providerAccountId: `${provider}-account-id` },
-        });
+      const result = await callSignIn({
+        user: { id: `${provider}-profile-id`, email: null, name: 'No Email' },
+        account: { provider, type: 'oauth', providerAccountId: `${provider}-account-id` },
+      });
 
-        expect(result).toBe('/auth/error?error=OAuthEmailRequired');
-        expect(mockDbUpdate).not.toHaveBeenCalled();
-        expect(mockDbSelect).not.toHaveBeenCalled();
-        expect(mockAdapterCreateUser).not.toHaveBeenCalled();
-        expect(mockAdapterUpdateUser).not.toHaveBeenCalled();
-        expect(warnSpy).toHaveBeenCalledOnce();
-        expect(JSON.parse(String(warnSpy.mock.calls[0]?.[0]))).toEqual({
-          event: 'oauth_sign_in_rejected',
-          provider,
-          error_code: 'OAuthEmailRequired',
-        });
+      expect(result).toBe('/auth/error?error=OAuthEmailRequired');
+      expect(mockDbUpdate).not.toHaveBeenCalled();
+      expect(mockDbSelect).not.toHaveBeenCalled();
+      expect(mockAdapterCreateUser).not.toHaveBeenCalled();
+      expect(mockAdapterUpdateUser).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledOnce();
+      expect(JSON.parse(String(warnSpy.mock.calls[0]?.[0]))).toEqual({
+        event: 'oauth_sign_in_rejected',
+        provider,
+        error_code: 'OAuthEmailRequired',
+      });
 
-        warnSpy.mockRestore();
-      },
-    );
+      warnSpy.mockRestore();
+    });
 
     it.each([undefined, '', '   '])('also rejects a non-usable email value (%s)', async (email) => {
       const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -186,9 +208,10 @@ describe('authOptions.callbacks.signIn', () => {
       warnSpy.mockRestore();
     });
 
-    it.each(['google', 'apple', 'facebook'] as const)(
+    it.each(['google', 'apple'] as const)(
       'keeps an existing linked %s account working when the raw provider profile omits email',
       async (provider) => {
+        mockDbLimit.mockResolvedValue([{ userId: 'linked-user' }]);
         const result = await callSignIn({
           // NextAuth resolves a linked account before signIn and supplies the
           // stored user here; the raw provider profile may omit email later.
@@ -204,11 +227,86 @@ describe('authOptions.callbacks.signIn', () => {
     );
   });
 
+  describe('unverified browser fallback cannot link an occupied email', () => {
+    beforeEach(() => {
+      lookup.stored = [{ id: 'existing-owner', email: 'Existing@Example.test' }];
+    });
+
+    afterEach(() => {
+      lookup.stored = [];
+    });
+
+    it.each([
+      ['google', false],
+      ['google', undefined],
+      ['apple', false],
+      ['apple', 'false'],
+      ['facebook', undefined],
+    ] as const)('refuses an unlinked %s claim with assertion %s', async (provider, assertion) => {
+      expect(
+        await callSignIn({
+          user: { id: 'unlinked-profile', email: 'existing@example.test' },
+          account: { provider, type: 'oauth', providerAccountId: 'unlinked-subject' },
+          profile: { email_verified: assertion },
+        }),
+      ).toBe(false);
+      expect(mockDbUpdate).not.toHaveBeenCalled();
+      expect(mockAdapterCreateUser).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['google', true],
+      ['apple', 'true'],
+    ] as const)('allows a verified %s claim to use the existing owner', async (provider, assertion) => {
+      expect(
+        await callSignIn({
+          user: { id: 'unlinked-profile', email: 'existing@example.test' },
+          account: { provider, type: 'oauth', providerAccountId: 'unlinked-subject' },
+          profile: { email_verified: assertion },
+        }),
+      ).toBe(true);
+    });
+
+    it('keeps a returning linked subject signed in without a new email assertion', async () => {
+      mockDbLimit.mockResolvedValue([{ userId: 'existing-owner' }]);
+      expect(
+        await callSignIn({
+          user: { id: 'existing-owner', email: 'Existing@Example.test' },
+          account: { provider: 'google', type: 'oauth', providerAccountId: 'linked-subject' },
+          profile: {},
+        }),
+      ).toBe(true);
+    });
+
+    it('refuses a subject linked to a different owner', async () => {
+      mockDbLimit.mockResolvedValue([{ userId: 'different-owner' }]);
+      expect(
+        await callSignIn({
+          user: { id: 'existing-owner', email: 'Existing@Example.test' },
+          account: { provider: 'google', type: 'oauth', providerAccountId: 'other-subject' },
+          profile: { email_verified: false },
+        }),
+      ).toBe(false);
+      expect(mockDbUpdate).not.toHaveBeenCalled();
+    });
+
+    it('refuses an unverified unlinked subject even before an address becomes occupied', async () => {
+      expect(
+        await callSignIn({
+          user: { id: 'new-profile', email: 'free@example.test' },
+          account: { provider: 'google', type: 'oauth', providerAccountId: 'new-subject' },
+          profile: { email_verified: false },
+        }),
+      ).toBe(false);
+    });
+  });
+
   describe('OAuth provider (google)', () => {
     it('marks email as verified for new user and returns true', async () => {
       const result = await callSignIn({
         user: { id: 'user-1', email: 'user@example.com', name: 'Test' },
         account: { provider: 'google', type: 'oauth', providerAccountId: 'g-123' },
+        profile: { email_verified: true },
       });
 
       expect(result).toBe(true);
@@ -220,6 +318,7 @@ describe('authOptions.callbacks.signIn', () => {
       const result = await callSignIn({
         user: { id: '', email: 'user@example.com', name: 'Test', emailVerified: null },
         account: { provider: 'google', type: 'oauth', providerAccountId: 'g-456' },
+        profile: { email_verified: true },
       });
 
       expect(result).toBe(true);
@@ -233,6 +332,7 @@ describe('authOptions.callbacks.signIn', () => {
       const result = await callSignIn({
         user: { id: 'user-1', email: 'user@example.com' },
         account: { provider: 'google', type: 'oauth', providerAccountId: 'g-789' },
+        profile: { email_verified: true },
       });
 
       expect(result).toBe(true);
@@ -246,6 +346,7 @@ describe('authOptions.callbacks.signIn', () => {
       await callSignIn({
         user: { id: 'user-1', email: 'user@example.com' },
         account: { provider: 'google', type: 'oauth', providerAccountId: 'g-101' },
+        profile: { email_verified: true },
       });
 
       expect(isNull).toHaveBeenCalledWith('users.emailVerified');
@@ -257,6 +358,7 @@ describe('authOptions.callbacks.signIn', () => {
       const result = await callSignIn({
         user: { id: 'user-2', email: 'apple@example.com' },
         account: { provider: 'apple', type: 'oauth', providerAccountId: 'a-123' },
+        profile: { email_verified: true },
       });
 
       expect(result).toBe(true);
@@ -264,15 +366,32 @@ describe('authOptions.callbacks.signIn', () => {
     });
   });
 
-  describe('OAuth provider (facebook)', () => {
-    it('marks email as verified and returns true', async () => {
-      const result = await callSignIn({
-        user: { id: 'user-3', email: 'fb@example.com' },
-        account: { provider: 'facebook', type: 'oauth', providerAccountId: 'fb-123' },
-      });
+  describe('removed Facebook provider', () => {
+    it.each([null, 'fb@example.com'])(
+      'refuses new or returning Facebook callbacks without any identity writes (%s)',
+      async (email) => {
+        mockDbLimit.mockResolvedValue([{ userId: 'stored-facebook-owner' }]);
+        expect(
+          await callSignIn({
+            user: { id: 'stored-facebook-owner', email },
+            account: { provider: 'facebook', type: 'oauth', providerAccountId: 'stored-facebook-subject' },
+            profile: { email_verified: true },
+          }),
+        ).toBe(false);
+        expect(mockDbSelect).not.toHaveBeenCalled();
+        expect(mockDbUpdate).not.toHaveBeenCalled();
+        expect(mockDbInsertValues).not.toHaveBeenCalled();
+        expect(mockAdapterCreateUser).not.toHaveBeenCalled();
+        expect(mockAdapterUpdateUser).not.toHaveBeenCalled();
+      },
+    );
 
-      expect(result).toBe(true);
-      expect(mockDbUpdate).toHaveBeenCalledTimes(1);
+    it('never configures Facebook even when credentials remain in the environment', async () => {
+      vi.stubEnv('FACEBOOK_CLIENT_ID', 'configured-id');
+      vi.stubEnv('FACEBOOK_CLIENT_SECRET', 'configured-secret');
+      vi.resetModules();
+      const { authOptions: configured } = await import('../auth-options');
+      expect(configured.providers.map((provider) => provider.id)).not.toContain('facebook');
     });
   });
 
@@ -367,6 +486,18 @@ describe('authOptions.callbacks.signIn', () => {
 
       expect(result).toBe(true);
     });
+
+    it('reads the verification stamp by the signed-in ID, never by an address another account can share', async () => {
+      vi.stubEnv('EMAIL_VERIFICATION_ENABLED', 'true');
+      mockDbLimit.mockResolvedValue([{ id: 'user-1', email: 'Shared@example.com', emailVerified: new Date() }]);
+
+      await callSignIn({
+        user: { id: 'user-1', email: 'Shared@example.com' },
+        account: { provider: 'credentials', type: 'credentials', providerAccountId: 'cred-123' },
+      });
+
+      expect(mockDbWhere).toHaveBeenCalledWith({ _type: 'eq', col: 'users.id', val: 'user-1' });
+    });
   });
 });
 
@@ -455,6 +586,20 @@ describe('authOptions.callbacks.session', () => {
     expect(result.user?.id).toBe('user-42');
   });
 
+  it('exposes only the signed generation, including zero for historic cookies', async () => {
+    const signed = await callSession({
+      session: { user: { id: 'generation-fixture' }, authGeneration: 99, expires: '2099-01-01' },
+      token: { sub: 'generation-fixture', gen: 5 },
+    });
+    expect(signed.authGeneration).toBe(5);
+    const historic = await callSession({
+      session: { user: { id: 'generation-fixture' }, expires: '2099-01-01' },
+      token: { sub: 'generation-fixture' },
+    });
+    expect(historic.authGeneration).toBe(0);
+    expect(mockDbSelect).not.toHaveBeenCalled();
+  });
+
   it('exposes the stable login generation from the JWT', async () => {
     const result = await callSession({
       session: {
@@ -494,10 +639,52 @@ describe('authOptions.callbacks.jwt', () => {
     expect(result.authSessionId).toBe('login-generation-1');
   });
 
-  it('seeds preexisting JWTs from their standard jti', async () => {
+  it.each([true, false])('records exact OAuth account creation=%s from the adapter result', async (isNewUser) => {
+    const userId = '602c83bf-e090-4c90-9f7e-08ca0b6b5dad';
+    const createdAt = new Date('2026-10-10T00:00:00.000Z');
+    // The sign-in reads its cutoff generation first (no row), then the creation time.
+    mockDbLimit.mockResolvedValueOnce([]).mockResolvedValueOnce([{ createdAt }]).mockResolvedValueOnce([]);
+    const result = await callJwt({
+      token: { sub: userId },
+      user: { id: userId },
+      account: { provider: 'apple', type: 'oauth', providerAccountId: 'apple-sub' },
+      isNewUser,
+    });
+    expect(result.nativeOAuthCreationProof).toEqual({
+      authSessionId: result.authSessionId,
+      provider: 'apple',
+      signedInAt: expect.any(Number),
+      accountCreation: { userId, provider: 'apple', accountCreated: isNewUser, createdAt: createdAt.toISOString() },
+    });
+  });
+
+  it('clears previous signup proof when a later login has no exact creation result', async () => {
+    const userId = '602c83bf-e090-4c90-9f7e-08ca0b6b5dad';
+    const result = await callJwt({
+      token: {
+        sub: userId,
+        authSessionId: 'old-session',
+        nativeOAuthCreationProof: {
+          authSessionId: 'old-session',
+          provider: 'apple',
+          signedInAt: Date.now(),
+          accountCreation: { userId, provider: 'apple', accountCreated: true, createdAt: '2026-10-10T00:00:00.000Z' },
+        },
+      },
+      user: { id: userId },
+      account: { provider: 'apple', type: 'oauth', providerAccountId: 'apple-sub' },
+    });
+    expect(result.nativeOAuthCreationProof).toBeUndefined();
+    expect(result.authSessionId).not.toBe('old-session');
+  });
+
+  it('retains unknown login ancestry when a preexisting JWT takes its rolling jti as a public SID', async () => {
     const result = await callJwt({ token: { sub: 'user-1', jti: 'existing-jti' } });
 
     expect(result.authSessionId).toBe('existing-jti');
+    expect(result.legacy_no_sid).toBe(true);
+    expect((await callJwt({ token: result })).legacy_no_sid).toBe(true);
+    expect(result.auth_time).toBeUndefined();
   });
 
   it('creates a login generation when the JWT has no prior identifier', async () => {
@@ -505,6 +692,54 @@ describe('authOptions.callbacks.jwt', () => {
 
     expect(result.authSessionId).toEqual(expect.any(String));
     expect(result.authSessionId).not.toBe('');
+    expect(result.legacy_no_sid).toBe(true);
+  });
+
+  it('clears unknown historical ancestry only after a new authenticated sign-in', async () => {
+    const result = await callJwt({
+      token: { sub: 'user-1', authSessionId: 'historical-child', legacy_no_sid: true },
+      user: { id: 'user-1' },
+      account: { provider: 'credentials', type: 'credentials', providerAccountId: 'user-1' },
+    });
+    expect(result.legacy_no_sid).toBeUndefined();
+    expect(result.authSessionId).not.toBe('historical-child');
+    expect(result.auth_time).toEqual(expect.any(Number));
+  });
+
+  it('ignores hostile client session updates that try to replace historical ancestry and authentication claims', async () => {
+    const result = await callJwt({
+      token: { sub: 'user-1', authSessionId: 'historical-child', legacy_no_sid: true, gen: 0 },
+      trigger: 'update',
+      session: {
+        legacy_no_sid: false,
+        authSessionId: 'forged-stable-login',
+        gen: 999,
+        auth_time: Math.floor(Date.now() / 1000),
+      },
+    });
+    expect(result).toMatchObject({ authSessionId: 'historical-child', legacy_no_sid: true, gen: 0 });
+    expect(result.auth_time).toBeUndefined();
+  });
+
+  it('inherits historical ancestry from a trusted backend proof for an existing OAuth actor', async () => {
+    const result = await callJwt({
+      token: { sub: 'user-1' },
+      user: {
+        id: 'user-1',
+        webCredentialProof: {
+          version: 1,
+          userId: 'user-1',
+          authSessionId: 'historical-child',
+          generation: 0,
+          authenticatedAt: null,
+          linkGuarded: false,
+          requiresAccountCutoff: true,
+        },
+      },
+      account: { provider: 'google', type: 'oauth', providerAccountId: 'provider-subject' },
+    });
+    expect(result).toMatchObject({ authSessionId: 'historical-child', legacy_no_sid: true, gen: 0 });
+    expect(result.auth_time).toBeUndefined();
   });
 
   // Profile-claim caching (the perf change): the jwt callback fetches
@@ -530,7 +765,8 @@ describe('authOptions.callbacks.jwt', () => {
 
     const result = await callJwt({ token: { sub: 'new-user' }, user: { id: 'new-user', email: 'new@example.com' } });
 
-    expect(mockDbSelect).toHaveBeenCalledTimes(1);
+    // One read for the sign-in's cutoff generation, one for the profile.
+    expect(mockDbSelect).toHaveBeenCalledTimes(2);
     expect(result.profileAvatarUrl).toBeNull();
     expect(result.profileDisplayName).toBeNull();
     expect(result.profileClaimsRefreshedAt).toEqual(expect.any(Number));
@@ -643,13 +879,11 @@ function getNativeOAuthProvider(): CredentialProviderLike {
 }
 
 describe('CredentialsProvider.authorize — email/password', () => {
+  const storedUser = { id: 'user-1', email: 'user@example.com', name: 'Test', image: null };
+
   beforeEach(() => {
     vi.clearAllMocks();
-
-    mockDbSelect.mockReturnValue({ from: mockDbFrom });
-    mockDbFrom.mockReturnValue({ where: mockDbWhere });
-    mockDbWhere.mockReturnValue({ limit: mockDbLimit });
-    mockDbLimit.mockResolvedValue([]);
+    lookup.stored = [];
   });
 
   it('returns null when credentials are missing', async () => {
@@ -670,45 +904,118 @@ describe('CredentialsProvider.authorize — email/password', () => {
     expect(result).toBeNull();
   });
 
-  it('returns null when user is not found', async () => {
-    // First select (users lookup) → empty
-    mockDbLimit.mockResolvedValue([]);
-
-    const provider = getEmailCredentialsProvider();
-    const result = await provider.authorize?.({ email: 'notfound@example.com', password: 'pass' });
-    expect(result).toBeNull();
-  });
-
-  it('returns null when user has no password (OAuth-only account)', async () => {
-    // First select (users) → user found; second select (userCredentials) → empty
-    mockDbLimit
-      .mockResolvedValueOnce([{ id: 'user-1', email: 'user@example.com', name: 'Test', image: null }])
-      .mockResolvedValueOnce([]);
-
-    const provider = getEmailCredentialsProvider();
-    const result = await provider.authorize?.({
-      email: 'user@example.com',
-      password: 'mypassword',
-    });
-    expect(result).toBeNull();
-  });
-
-  it('returns null when password is incorrect', async () => {
-    mockDbLimit
-      .mockResolvedValueOnce([{ id: 'user-1', email: 'user@example.com', name: 'Test', image: null }])
-      .mockResolvedValueOnce([{ userId: 'user-1', passwordHash: '$2a$12$hashed' }]);
+  // An unknown address, an OAuth-only account, an address several accounts share
+  // in other capitals and a wrong password must cost the same: one query, then
+  // one bcrypt comparison at the stored cost. Answering any of them sooner tells
+  // a caller which addresses have accounts.
+  it.each([
+    ['an unknown address', [], ABSENT_PASSWORD_HASH],
+    ['an account with no password (OAuth only)', [{ ...storedUser, passwordHash: null }], ABSENT_PASSWORD_HASH],
+    ['a wrong password', [{ ...storedUser, passwordHash: '$2a$12$hashed' }], '$2a$12$hashed'],
+    [
+      'an address two accounts share in other capitals',
+      [
+        { ...storedUser, id: 'upper', email: 'USER@example.com', passwordHash: '$2a$12$upper' },
+        { ...storedUser, id: 'title', email: 'User@example.com', passwordHash: '$2a$12$title' },
+      ],
+      ABSENT_PASSWORD_HASH,
+    ],
+  ])('rejects %s after one query and one bcrypt comparison', async (_case, rows: StoredAccount[], comparedHash) => {
+    lookup.stored = rows;
     mockBcryptCompare.mockResolvedValue(false);
 
     const provider = getEmailCredentialsProvider();
-    const result = await provider.authorize?.({ email: 'user@example.com', password: 'wrongpass' });
+    const result = await provider.authorize?.({ email: 'user@example.com', password: 'submitted' });
+
     expect(result).toBeNull();
+    expect(findAccountsByEmail).toHaveBeenCalledTimes(1);
+    expect(mockDbSelect).not.toHaveBeenCalled();
+    expect(mockBcryptCompare).toHaveBeenCalledTimes(1);
+    expect(mockBcryptCompare).toHaveBeenCalledWith('submitted', comparedHash);
+  });
+
+  it('never signs in an account with no password, even if the stand-in comparison passed', async () => {
+    lookup.stored = [{ ...storedUser, passwordHash: null }];
+    mockBcryptCompare.mockResolvedValue(true);
+
+    const provider = getEmailCredentialsProvider();
+    expect(await provider.authorize?.({ email: 'user@example.com', password: 'submitted' })).toBeNull();
+  });
+
+  it('never signs in either account of an ambiguous address, even if the stand-in comparison passed', async () => {
+    lookup.stored = [
+      { ...storedUser, id: 'upper', email: 'USER@example.com', passwordHash: '$2a$12$upper' },
+      { ...storedUser, id: 'title', email: 'User@example.com', passwordHash: '$2a$12$title' },
+    ];
+    mockBcryptCompare.mockResolvedValue(true);
+
+    const provider = getEmailCredentialsProvider();
+    expect(await provider.authorize?.({ email: 'user@example.com', password: 'submitted' })).toBeNull();
+  });
+
+  describe('a mixed-case stored address (BA-02)', () => {
+    const mixedCase = { id: 'mixed', email: 'Mixed.Case@Example.test', name: 'Mixed', image: null };
+
+    it.each([
+      ['exactly as stored', 'Mixed.Case@Example.test'],
+      ['in lowercase', 'mixed.case@example.test'],
+      ['in capitals', 'MIXED.CASE@EXAMPLE.TEST'],
+    ])('signs in when the climber types it %s', async (_case, typed) => {
+      lookup.stored = [{ ...mixedCase, passwordHash: '$2a$12$mixed' }];
+      mockBcryptCompare.mockImplementation(async (password: string, hash: string) => {
+        return password === 'correctpass' && hash === '$2a$12$mixed';
+      });
+
+      const provider = getEmailCredentialsProvider();
+      const result = await provider.authorize?.({ email: typed, password: 'correctpass' });
+
+      expect(result).toEqual(mixedCase);
+      expect(mockBcryptCompare).toHaveBeenCalledTimes(1);
+    });
+
+    it('signs in the group member typed exactly as stored and compares only its password', async () => {
+      lookup.stored = [
+        { ...mixedCase, passwordHash: '$2a$12$mixed' },
+        { ...mixedCase, id: 'sibling', email: 'mixed.case@example.test', passwordHash: '$2a$12$sibling' },
+      ];
+      mockBcryptCompare.mockResolvedValue(true);
+
+      const provider = getEmailCredentialsProvider();
+      const result = await provider.authorize?.({ email: 'mixed.case@example.test', password: 'pw' });
+
+      expect(result).toEqual({ ...mixedCase, id: 'sibling', email: 'mixed.case@example.test' });
+      expect(mockBcryptCompare.mock.calls).toEqual([['pw', '$2a$12$sibling']]);
+    });
+  });
+
+  describe('rows storing the very same text', () => {
+    const twins: StoredAccount[] = [
+      { ...storedUser, id: 'twin-a', passwordHash: '$2a$12$a' },
+      { ...storedUser, id: 'twin-b', passwordHash: '$2a$12$b' },
+    ];
+
+    it('signs in the one whose password matches', async () => {
+      lookup.stored = twins;
+      mockBcryptCompare.mockImplementation(async (_password: string, hash: string) => hash === '$2a$12$b');
+
+      const provider = getEmailCredentialsProvider();
+      const result = await provider.authorize?.({ email: 'user@example.com', password: 'pw' });
+
+      expect(result).toEqual({ ...storedUser, id: 'twin-b' });
+    });
+
+    it('refuses when the password matches both, rather than picking one', async () => {
+      lookup.stored = twins;
+      mockBcryptCompare.mockResolvedValue(true);
+
+      const provider = getEmailCredentialsProvider();
+      expect(await provider.authorize?.({ email: 'user@example.com', password: 'pw' })).toBeNull();
+    });
   });
 
   it('returns user object when credentials are valid', async () => {
     const user = { id: 'user-1', email: 'user@example.com', name: 'Test User', image: null };
-    mockDbLimit
-      .mockResolvedValueOnce([user])
-      .mockResolvedValueOnce([{ userId: 'user-1', passwordHash: '$2a$12$hashed' }]);
+    lookup.stored = [{ ...user, passwordHash: '$2a$12$hashed' }];
     mockBcryptCompare.mockResolvedValue(true);
 
     const provider = getEmailCredentialsProvider();
@@ -732,13 +1039,26 @@ describe('CredentialsProvider.authorize — email/password', () => {
 // =============================================================================
 
 describe('CredentialsProvider.authorize — native-oauth', () => {
+  const spentMarker = { identifier: 'ba03-web-auth:abc', token: 'abc', expires: new Date('2026-04-03T12:07:05Z') };
+  const mockClaimReturning = vi.fn();
+
   beforeEach(() => {
     vi.clearAllMocks();
+
+    mockNativeOAuthTransferSpentMarker.mockReturnValue(spentMarker);
+    mockClaimReturning.mockResolvedValue([{ token: spentMarker.token }]);
+    mockDbInsertValues.mockImplementation(() => ({
+      onConflictDoNothing: vi.fn(() => ({ returning: mockClaimReturning })),
+    }));
 
     mockDbSelect.mockReturnValue({ from: mockDbFrom });
     mockDbFrom.mockReturnValue({ where: mockDbWhere });
     mockDbWhere.mockReturnValue({ limit: mockDbLimit });
     mockDbLimit.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    mockDbInsertValues.mockImplementation(() => ({ onConflictDoNothing: vi.fn().mockResolvedValue(undefined) }));
   });
 
   it('returns null when transferToken is missing', async () => {
@@ -783,7 +1103,31 @@ describe('CredentialsProvider.authorize — native-oauth', () => {
       email: 'user@example.com',
       name: 'Test',
       image: '/img.png',
+      nativeOAuthSourceGeneration: 0,
     });
+    expect(mockDbInsertValues).toHaveBeenCalledWith(spentMarker);
+  });
+
+  it('refuses a transfer token that was already spent', async () => {
+    const user = { id: 'user-1', email: 'user@example.com', name: 'Test', image: '/img.png' };
+    mockVerifyNativeOAuthTransferToken.mockReturnValue({ userId: 'user-1', nextPath: '/feed' });
+    mockDbLimit.mockResolvedValue([user]);
+    mockClaimReturning.mockResolvedValue([]);
+
+    const provider = getNativeOAuthProvider();
+    expect(await provider.authorize?.({ transferToken: 'valid.token' })).toBeNull();
+    expect(mockDbInsertValues).toHaveBeenCalledWith(spentMarker);
+  });
+
+  it('refuses when no spent marker can be derived', async () => {
+    const user = { id: 'user-1', email: 'user@example.com', name: 'Test', image: '/img.png' };
+    mockVerifyNativeOAuthTransferToken.mockReturnValue({ userId: 'user-1', nextPath: '/feed' });
+    mockDbLimit.mockResolvedValue([user]);
+    mockNativeOAuthTransferSpentMarker.mockReturnValue(null);
+
+    const provider = getNativeOAuthProvider();
+    expect(await provider.authorize?.({ transferToken: 'valid.token' })).toBeNull();
+    expect(mockDbInsertValues).not.toHaveBeenCalled();
   });
 });
 
@@ -827,6 +1171,24 @@ describe('authOptions.callbacks.redirect', () => {
   it('allows a numbered app preview origin', async () => {
     const previewCallback = 'https://7.app.boardsesh.com/app';
     expect(await callRedirect({ url: previewCallback, baseUrl: BASE_URL })).toBe(previewCallback);
+  });
+
+  it('returns Google and Apple sign-in to the flat PR app origin and original route', async () => {
+    const previewCallback = 'https://pr-123.boardsesh.com/auth/callback?next=%2Fclimbs';
+    expect(await callRedirect({ url: previewCallback, baseUrl: BASE_URL })).toBe(previewCallback);
+  });
+
+  it.each([
+    'http://pr-123.boardsesh.com/climbs',
+    'https://pr-0.boardsesh.com/climbs',
+    'https://pr-0123.boardsesh.com/climbs',
+    'https://pr-example.boardsesh.com/climbs',
+    'https://pr-123.boardsesh.com.evil.com/climbs',
+    'https://evil-pr-123.boardsesh.com/climbs',
+    'https://pr-123.boardsesh.com:8443/climbs',
+    'https://pr-123.boardsesh.com@evil.com/climbs',
+  ])('refuses an untrusted preview callback %s', async (url) => {
+    expect(await callRedirect({ url, baseUrl: BASE_URL })).toBe(BASE_URL);
   });
 
   it('coerces a disallowed cross-origin url to baseUrl (open-redirect guard)', async () => {
@@ -988,5 +1350,97 @@ describe('auth-options module side effect — canonical NEXTAUTH_URL', () => {
     await import('../auth-options');
 
     expect(process.env.NEXTAUTH_URL).toBe('http://localhost:3000');
+  });
+});
+
+// =============================================================================
+// Adapter — NextAuth's provider sign-in links and creates by email (BA-02)
+// =============================================================================
+
+describe('authOptions.adapter — one account per address in any capitalisation', () => {
+  type AdapterUserInput = Extract<
+    Parameters<NonNullable<NonNullable<typeof authOptions.adapter>['createUser']>>[0],
+    { id: string }
+  >;
+  const adapter = () => {
+    const configured = authOptions.adapter;
+    if (!configured?.getUserByEmail || !configured.createUser) throw new Error('adapter not wrapped');
+    return { getUserByEmail: configured.getUserByEmail, createUser: configured.createUser };
+  };
+  const providerProfile = (email: string): AdapterUserInput => ({
+    id: 'provider-profile',
+    email,
+    name: 'Provider Climber',
+    emailVerified: null,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    lookup.stored = [];
+    mockAdapterGetUser.mockImplementation(async (id: string) => ({ id, email: 'stored', emailVerified: null }));
+    mockAdapterCreateUser.mockImplementation(async (user: AdapterUserInput) => ({ ...user, id: 'created' }));
+  });
+
+  // NextAuth lowercases the provider email before it asks.
+  it('links a Google or Apple sign-in to the account that stores its email in capitals', async () => {
+    lookup.stored = [{ id: 'mixed', email: 'Mixed.Case@Example.test' }];
+
+    await adapter().getUserByEmail('mixed.case@example.test');
+
+    expect(mockAdapterGetUser).toHaveBeenCalledWith('mixed');
+  });
+
+  it('links to the account storing the address exactly when a sibling has other capitals', async () => {
+    lookup.stored = [
+      { id: 'mixed', email: 'Mixed.Case@Example.test' },
+      { id: 'lower', email: 'mixed.case@example.test' },
+    ];
+
+    await adapter().getUserByEmail('mixed.case@example.test');
+
+    expect(mockAdapterGetUser).toHaveBeenCalledWith('lower');
+  });
+
+  it('names nobody for an address several accounts share in other capitals', async () => {
+    lookup.stored = [
+      { id: 'title', email: 'Shared@Example.test' },
+      { id: 'upper', email: 'SHARED@EXAMPLE.TEST' },
+    ];
+
+    expect(await adapter().getUserByEmail('shared@example.test')).toBeNull();
+    expect(mockAdapterGetUser).not.toHaveBeenCalled();
+  });
+
+  it('refuses to create another account for an address any account already holds', async () => {
+    lookup.stored = [
+      { id: 'title', email: 'Shared@Example.test' },
+      { id: 'upper', email: 'SHARED@EXAMPLE.TEST' },
+    ];
+
+    await expect(adapter().createUser(providerProfile('shared@example.test'))).rejects.toThrow();
+    expect(mockAdapterCreateUser).not.toHaveBeenCalled();
+  });
+
+  it('creates a new account with the normalized address', async () => {
+    await adapter().createUser(providerProfile('New.Climber@Example.test'));
+
+    expect(mockAdapterCreateUser).toHaveBeenCalledWith(
+      expect.objectContaining({ email: 'new.climber@example.test', name: 'Provider Climber' }),
+    );
+  });
+});
+
+describe('OAuth registration privacy rollout', () => {
+  it.each(['0', '1'])('creates a public account with privacy controls enabled=%s', async (flag) => {
+    vi.stubEnv('BOARDSESH_PRIVACY_ENABLED', flag);
+    try {
+      await authOptions.events?.createUser?.({
+        user: { id: 'oauth-rollout-user', email: 'rollout@example.com' },
+      });
+      // Only the user id: the column defaults make the account public.
+      expect(mockDbInsertValues).toHaveBeenLastCalledWith({ userId: 'oauth-rollout-user' });
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

@@ -3,7 +3,11 @@
 // invalidate validation results without resetting or bypassing queued storage
 // generations.
 
+import { subscribeToCredentialChanges } from '../privacy/privacy-cache';
+
 const initiallyValidatedUuids = new Set<string>();
+// A credential change retires validated permissions without retiring the mounted account tree.
+subscribeToCredentialChanges(() => initiallyValidatedUuids.clear());
 let validationCacheEpoch = 0;
 
 export function hasInitiallyValidatedActiveBoardUuid(boardUuid: string): boolean {

@@ -50,8 +50,9 @@ vi.mock('@/app/lib/url-utils.server', () => ({
   })),
 }));
 
-vi.mock('@/app/lib/board-utils', () => ({
-  getBoardDetailsForBoard: vi.fn(() => ({ board_name: 'kilter' })),
+vi.mock('@/app/lib/board-image-details', async () => ({
+  ...(await vi.importActual<typeof import('@/app/lib/board-image-details')>('@/app/lib/board-image-details')),
+  getBoardImageDetailsForBoard: vi.fn(() => ({ board_name: 'kilter' })),
 }));
 
 vi.mock('@/app/lib/url-utils', () => ({
@@ -87,7 +88,7 @@ vi.mock('@/app/lib/seo/metadata', () => ({
 
 import { notFound } from 'next/navigation';
 import { getClimb } from '@/app/lib/data/queries';
-import ClimbViewPage from '../page';
+import ClimbViewPage from '@/app/(site)/[board_name]/[layout_id]/[size_id]/[set_ids]/[angle]/view/[climb_uuid]/page';
 import { DbReadTimeoutError } from '@/app/lib/db/read-deadline';
 
 const props = {

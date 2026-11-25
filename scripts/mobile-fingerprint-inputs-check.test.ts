@@ -40,9 +40,30 @@ function completeSources(platform: 'ios' | 'android'): FingerprintSource[] {
     },
     {
       type: 'dir',
+      filePath: 'targets',
+      overrideHashKey: 'iosAppleTargets',
+      hash: 'targets-hash',
+    },
+    {
+      type: 'dir',
       filePath: '../../patches',
       overrideHashKey: 'rootPatchedDependencies',
       hash: 'patch-hash',
+    },
+    // The two config plugins whose file bodies carry a native guarantee. Both
+    // platforms must hash them — see the expectedPluginSources comment in
+    // mobile-fingerprint-inputs-check.ts.
+    {
+      type: 'file',
+      filePath: 'plugins/with-android-minify.js',
+      hash: 'minify-plugin-hash',
+      reasons: ['expoConfigPlugins'],
+    },
+    {
+      type: 'file',
+      filePath: 'plugins/with-android-sentry-proguard-uuid.js',
+      hash: 'proguard-uuid-plugin-hash',
+      reasons: ['expoConfigPlugins'],
     },
   ];
 }
@@ -55,7 +76,7 @@ describe('validateFingerprintSources', () => {
   it('reports null native directories and missing config/patch sources', () => {
     const sources = completeSources('ios').filter(
       (source) =>
-        !['boardseshFingerprintConfig', 'iosInfoPlistLocales', 'rootPatchedDependencies'].includes(
+        !['boardseshFingerprintConfig', 'iosInfoPlistLocales', 'iosAppleTargets', 'rootPatchedDependencies'].includes(
           String(source.overrideHashKey),
         ),
     );
@@ -66,6 +87,7 @@ describe('validateFingerprintSources', () => {
       expect.stringContaining('1/1 autolinked native directories have null hashes'),
       'ios: expected exactly one boardseshFingerprintConfig source, found 0',
       'ios: expected exactly one iosInfoPlistLocales source, found 0',
+      'ios: expected exactly one iosAppleTargets source, found 0',
       'ios: expected exactly one rootPatchedDependencies source, found 0',
     ]);
   });
@@ -77,6 +99,29 @@ describe('validateFingerprintSources', () => {
     expect(validateFingerprintSources('android', sources)).toEqual([
       'android: expected exactly one expoAutolinkingConfig:android contents source, found 2',
       'android: expected exactly one rncoreAutolinkingConfig:android contents source, found 0',
+    ]);
+  });
+
+  it('rejects an Expo config that still hashes the marketing version or build numbers', () => {
+    const hashedConfig = { name: 'Boardsesh', ios: { bundleIdentifier: 'com.boardsesh.app' }, android: {} };
+    const skipped = [
+      ...completeSources('ios'),
+      { type: 'contents', id: 'expoConfig', contents: JSON.stringify(hashedConfig), hash: 'expo-config' },
+    ];
+    expect(validateFingerprintSources('ios', skipped)).toEqual([]);
+
+    const leaking = [
+      ...completeSources('ios'),
+      {
+        type: 'contents',
+        id: 'expoConfig',
+        contents: JSON.stringify({ ...hashedConfig, version: '2.6.0', android: { versionCode: 7 } }),
+        hash: 'expo-config',
+      },
+    ];
+    expect(validateFingerprintSources('ios', leaking)).toEqual([
+      expect.stringContaining('expoConfig still hashes version;'),
+      expect.stringContaining('expoConfig still hashes android.versionCode;'),
     ]);
   });
 });

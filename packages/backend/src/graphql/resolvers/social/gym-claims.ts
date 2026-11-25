@@ -1,19 +1,30 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { eq, ne, gt, or, and, isNull, desc, count } from 'drizzle-orm';
+import { eq, ne, gt, gte, or, and, isNull, desc, asc, count, sql, inArray, lte } from 'drizzle-orm';
 import { GraphQLError } from 'graphql';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
-import { isClaimableDomain, emailDomainMatchesWebsite } from '@boardsesh/gym-claim';
-import { db } from '../../../db/client';
+import { isClaimableDomain, emailDomainMatchesWebsite, GYM_RUN_BY_STAFF_CODE } from '@boardsesh/gym-claim';
+import { db, deferDatabaseEffect } from '../../../db/client';
+import { afterCommit, transactionWithAfterCommit, type DbTransaction } from '../../../db/after-commit';
 import * as dbSchema from '@boardsesh/db/schema';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
 import { requireAdmin } from './roles';
 import { gymClaimAutoApproveEnabled } from './community-settings';
 import { userCanEditGym } from './gyms';
+import { gymIdsRunByStaff } from './gym-run-by-staff';
 import { createGymManageAccessNotification } from './gym-notifications';
+import {
+  autoApprovedClaimCondition,
+  firstFailedAutoApproveGuard,
+  lockAutoApprovals,
+  type AutoApproveGuard,
+} from './gym-claim-guardrails';
+import { sendDirectoryNotices, type PendingDirectoryNotice } from './directory-reports/notices';
+import { boardIsNotArchivedSprayWall } from '../board/spray-wall-listing';
 import {
   RequestGymClaimInputSchema,
   ReviewGymClaimInputSchema,
   PendingGymClaimsInputSchema,
+  AutoApprovedGymClaimsInputSchema,
 } from '../../../validation/schemas';
 import { SYSTEM_BOARD_OWNER_ID } from '../board-presence/shared';
 import {
@@ -21,11 +32,30 @@ import {
   sendGymClaimAdminNotification,
   sendGymClaimApprovedEmail,
   sendGymClaimDeniedEmail,
+  sendGymClaimExpiredEmail,
   sendGymClaimOwnershipLostEmail,
 } from '../../../email/email-service';
 import { logger } from '../../../utils/logger';
+import { resourceAccessCondition } from '../../../services/privacy';
 
 const CLAIM_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * An admin-review claim nobody decided within this many days expires: the
+ * hourly sweep marks it `expired` and tells the claimant
+ * (docs/product/gym-claims.md). Domain claims expire on their own 24-hour token.
+ */
+export const ADMIN_CLAIM_EXPIRY_DAYS = 30;
+
+/**
+ * Only admin-review claims filed on or after this instant expire. Claims filed
+ * before the expiry shipped stay `pending` for a person to review, so the first
+ * sweep after the deploy doesn't expire the whole backlog at once and email
+ * every one of those claimants (docs/product/gym-claims.md).
+ */
+export const GYM_CLAIM_EXPIRY_STARTS_AT = '2026-11-24T00:00:00Z';
 
 /**
  * How many gyms one account may have waiting on review at once. The unique index
@@ -39,6 +69,13 @@ export const MAX_PENDING_CLAIMS_PER_USER = 10;
 
 /** `extensions.code` on the cap rejection, so clients can branch without scraping the message. */
 export const GYM_CLAIM_LIMIT_CODE = 'GYM_CLAIM_LIMIT_REACHED';
+
+/**
+ * `extensions.code` when the claim is older than the gym's current ownership —
+ * someone already decided who owns this gym after the claim was filed, so
+ * applying it now would silently reverse that decision.
+ */
+export const GYM_CLAIM_SUPERSEDED_CODE = 'GYM_CLAIM_SUPERSEDED';
 
 /**
  * A claim that is genuinely still live: `pending` AND not past its expiry.
@@ -64,6 +101,7 @@ export function hashClaimToken(token: string): string {
 }
 
 type ClaimApplied = {
+  gymId: number;
   gymName: string;
   gymUuid: string;
   /** Slug for a friendly manage URL; null for slug-less (legacy) gyms — fall back to the UUID. */
@@ -71,43 +109,173 @@ type ClaimApplied = {
   claimantUserId: string;
   claimEmail: string | null;
   priorOwnerId: string | null;
+  /** False when the claimant already owned the gym: the approval only closed their claim. */
+  didTransfer: boolean;
 };
+
+/**
+ * Why an apply did not happen. `superseded` is its own outcome rather than a
+ * flavour of "not applied" because the two need opposite handling: a not-applied
+ * claim is already resolved or the gym is gone (nothing left to do), while a
+ * superseded admin claim stays `pending` for a human to deny or resolve.
+ * Superseded domain claims expire so their claimant can request a fresh link.
+ */
+export type ApplyGymClaimResult =
+  | { outcome: 'applied'; applied: ClaimApplied }
+  | { outcome: 'superseded' }
+  | { outcome: 'not_applied' }
+  /** Auto-approval only: a guard failed on the re-check under the lock. The claim stays `pending`. */
+  | { outcome: 'not_eligible'; guard: AutoApproveGuard };
+
+/**
+ * Has anyone decided who owns this gym since `claim` was filed?
+ *
+ * Exactly two code paths move `gyms.owner_id` — this function's own transfer and
+ * `reassignGymOwner` — and both leave a dated record: an admin handover writes a
+ * `gym_owner_reassignments` row, and an approved claim writes an immutable
+ * `gym_claim_ownership_decisions` row recording whether ownership actually
+ * changed.
+ * Filing, approval and handover hold the same gym row lock and stamp the database
+ * clock AFTER acquiring it. Transaction-start timestamps cannot order these
+ * events: a transaction may wait behind a claim that was filed after it began.
+ * Approved legacy claims with no decision row remain unknown; their resolution
+ * time conservatively blocks newer claims rather than guessing whether they
+ * transferred ownership.
+ *
+ * Anything newer than the claim means applying it now would reverse a decision
+ * somebody made with more information than the claim carries.
+ */
+async function ownershipMovedSinceClaim(
+  tx: Parameters<Parameters<typeof db.transaction>[0]>[0],
+  gymUuid: string,
+  claim: typeof dbSchema.gymClaims.$inferSelect,
+): Promise<boolean> {
+  // Compare in Postgres, retaining microseconds that the JS Date mapper drops.
+  const filedAt = tx
+    .select({ filedAt: dbSchema.gymClaims.createdAt })
+    .from(dbSchema.gymClaims)
+    .where(eq(dbSchema.gymClaims.id, claim.id));
+  const [reassignment] = await tx
+    .select({ id: dbSchema.gymOwnerReassignments.id })
+    .from(dbSchema.gymOwnerReassignments)
+    .where(
+      and(eq(dbSchema.gymOwnerReassignments.gymUuid, gymUuid), gt(dbSchema.gymOwnerReassignments.createdAt, filedAt)),
+    )
+    .limit(1);
+  if (reassignment) return true;
+
+  const [approvedSince] = await tx
+    .select({ id: dbSchema.gymClaims.id })
+    .from(dbSchema.gymClaims)
+    .leftJoin(
+      dbSchema.gymClaimOwnershipDecisions,
+      eq(dbSchema.gymClaimOwnershipDecisions.claimId, dbSchema.gymClaims.id),
+    )
+    .where(
+      and(
+        eq(dbSchema.gymClaims.gymId, claim.gymId),
+        ne(dbSchema.gymClaims.id, claim.id),
+        eq(dbSchema.gymClaims.status, 'approved'),
+        or(
+          // A post-migration decision row distinguishes a transfer from a
+          // current-owner no-op. Its UUID is the gym that actually changed,
+          // unaffected by a later merge that moves the claim row.
+          and(
+            eq(dbSchema.gymClaimOwnershipDecisions.didTransfer, true),
+            eq(dbSchema.gymClaimOwnershipDecisions.gymUuid, gymUuid),
+            gt(dbSchema.gymClaimOwnershipDecisions.decidedAt, filedAt),
+          ),
+          // No row means history predates the marker or is otherwise unknown.
+          // Keep that case conservative; do not backfill every old approval as
+          // an actual transfer because some are known no-ops.
+          and(isNull(dbSchema.gymClaimOwnershipDecisions.claimId), gt(dbSchema.gymClaims.updatedAt, filedAt)),
+        ),
+      ),
+    )
+    .limit(1);
+  return approvedSince !== undefined;
+}
 
 /**
  * Apply a claim: transfer gym ownership to the claimant. The pending row is
  * flipped to `approved` atomically first — if another transaction already
  * resolved it (double-clicked verify link, concurrent admin approval), this
- * returns null and does nothing, so the transfer + emails happen exactly once.
- * A real prior owner (not the system/import user) is kept on as a gym admin and
- * reported back so they can be notified. Returns null if the gym vanished.
+ * returns `not_applied` and does nothing, so the transfer + emails happen
+ * exactly once. A real prior owner (not the system/import user) is kept on as a
+ * gym admin and reported back so they can be notified. Also `not_applied` if
+ * the gym vanished.
+ *
+ * A claim older than the gym's current ownership returns `superseded` without
+ * changing the gym or its memberships. Approving it would move ownership
+ * back to the claimant, demote whoever an admin chose to a membership row, mail
+ * them "someone verified they manage this gym" (false for a handover), and
+ * re-stamp `syncFrozenAt`, which `reassignGymOwner` goes out of its way to leave
+ * alone. Admin claims stay `pending` for the existing Deny path. Domain claims
+ * expire because that queue cannot review them; the verification page explains
+ * the ownership change and the claimant can immediately request a fresh link.
  *
  * `requireCurrentOwnerId` narrows the apply to a gym still owned by that user —
  * the auto-approval path passes the system import user so it can only ever hand
  * over an unclaimed listing. The gym is re-checked here, inside the transaction
  * and before the claim row is flipped, so a rejected apply leaves the claim
  * `pending` for a human to review.
+ *
+ * `autoApprove` is the unattended path. It takes the auto-approval advisory
+ * lock before anything else (so lock order is always: that lock, then the gym
+ * row) and re-checks every guard under it, so two claims on different gyms
+ * can't both pass the daily cap or the one-per-account rule. A failed guard
+ * returns `not_eligible` and leaves the claim `pending`.
  */
 export async function applyGymClaim(
   claim: typeof dbSchema.gymClaims.$inferSelect,
-  opts: { reviewerId?: string; requireCurrentOwnerId?: string } = {},
-): Promise<ClaimApplied | null> {
-  const { reviewerId, requireCurrentOwnerId } = opts;
+  opts: { reviewerId?: string; requireCurrentOwnerId?: string; autoApprove?: boolean } = {},
+): Promise<ApplyGymClaimResult> {
+  const { reviewerId, requireCurrentOwnerId, autoApprove = false } = opts;
   return db.transaction(async (tx) => {
+    if (autoApprove) await lockAutoApprovals(tx);
     const [gym] = await tx
       .select()
       .from(dbSchema.gyms)
       .where(and(eq(dbSchema.gyms.id, claim.gymId), isNull(dbSchema.gyms.deletedAt)))
-      .limit(1);
-    if (!gym) return null;
-    if (requireCurrentOwnerId !== undefined && gym.ownerId !== requireCurrentOwnerId) return null;
+      .limit(1)
+      .for('update');
+    if (!gym) return { outcome: 'not_applied' };
+    if (requireCurrentOwnerId !== undefined && gym.ownerId !== requireCurrentOwnerId) {
+      return { outcome: 'not_applied' };
+    }
+
+    // Only a claim that would actually move the gym can undo someone's decision.
+    // When the claimant already owns it — an admin who handed the gym straight
+    // to them rather than working the queue — the transfer block below is a
+    // no-op, so approving is how that claim finally gets an outcome. Refusing it
+    // would strand the row with Deny (and its "sorry, no" email) as the only way
+    // out, for the person who was in fact given the gym.
+    //
+    // The gym lock serializes this decision with handovers and claim filing.
+    // Keep the owner-guarded UPDATE and explicit throw below as a final guard:
+    // it is that throw, not a zero-row UPDATE itself, that rolls back the claim.
+    if (gym.ownerId !== claim.claimantUserId && (await ownershipMovedSinceClaim(tx, gym.uuid, claim))) {
+      if (claim.method === 'domain') {
+        await tx
+          .update(dbSchema.gymClaims)
+          .set({ status: 'expired', updatedAt: sql`clock_timestamp()` })
+          .where(and(eq(dbSchema.gymClaims.id, claim.id), eq(dbSchema.gymClaims.status, 'pending')));
+      }
+      return { outcome: 'superseded' };
+    }
+
+    if (autoApprove) {
+      const guard = await firstFailedAutoApproveGuard(tx, claim);
+      if (guard) return { outcome: 'not_eligible', guard };
+    }
 
     // Claim the pending row atomically; 0 rows means someone else already resolved it.
     const flipped = await tx
       .update(dbSchema.gymClaims)
-      .set({ status: 'approved', reviewedBy: reviewerId ?? null, updatedAt: new Date() })
+      .set({ status: 'approved', reviewedBy: reviewerId ?? null, updatedAt: sql`clock_timestamp()` })
       .where(and(eq(dbSchema.gymClaims.id, claim.id), eq(dbSchema.gymClaims.status, 'pending')))
       .returning({ id: dbSchema.gymClaims.id });
-    if (flipped.length === 0) return null;
+    if (flipped.length === 0) return { outcome: 'not_applied' };
 
     const priorOwnerId = gym.ownerId;
     const claimantId = claim.claimantUserId;
@@ -118,11 +286,10 @@ export async function applyGymClaim(
         .update(dbSchema.gyms)
         // Taking ownership is a strong human-curation signal — freeze the gym so
         // the location sync stops reshaping the listing the new owner now controls.
-        .set({ ownerId: claimantId, syncFrozenAt: new Date(), updatedAt: new Date() })
-        // The gym was read above without a row lock, so re-assert the owner we
-        // based this decision on. A concurrent transfer means our read is stale:
-        // throw to roll the whole transaction back (claim flip included) rather
-        // than overwrite the winner.
+        .set({ ownerId: claimantId, syncFrozenAt: sql`clock_timestamp()`, updatedAt: sql`clock_timestamp()` })
+        // Re-assert the owner even with the row lock. If a future caller changes
+        // ownership inside this transaction, explicitly throw on zero rows to
+        // roll back the claim flip rather than overwrite that change.
         .where(and(eq(dbSchema.gyms.id, gym.id), eq(dbSchema.gyms.ownerId, priorOwnerId)))
         .returning({ id: dbSchema.gyms.id });
       if (transferred.length === 0) {
@@ -148,13 +315,31 @@ export async function applyGymClaim(
         .where(and(eq(dbSchema.gymMembers.gymId, gym.id), eq(dbSchema.gymMembers.userId, claimantId)));
     }
 
-    return {
-      gymName: gym.name,
+    // Keep an immutable account of what this approval did while the same gym
+    // row lock is held. `updatedAt` remains the ordinary claim-resolution audit
+    // timestamp; it is not treated as a transfer unless this event says so.
+    // `previousOwnerId` is what lets an admin revert the claim: only a claim
+    // that took the gym from SYSTEM can be handed back to it.
+    await tx.insert(dbSchema.gymClaimOwnershipDecisions).values({
+      claimId: claim.id,
       gymUuid: gym.uuid,
-      gymSlug: gym.slug,
-      claimantUserId: claimantId,
-      claimEmail: claim.claimEmail,
-      priorOwnerId: notifyPriorOwnerId,
+      didTransfer: priorOwnerId !== claimantId,
+      decidedAt: sql`clock_timestamp()`,
+      previousOwnerId: priorOwnerId,
+    });
+
+    return {
+      outcome: 'applied',
+      applied: {
+        gymId: gym.id,
+        gymName: gym.name,
+        gymUuid: gym.uuid,
+        gymSlug: gym.slug,
+        claimantUserId: claimantId,
+        claimEmail: claim.claimEmail,
+        priorOwnerId: notifyPriorOwnerId,
+        didTransfer: priorOwnerId !== claimantId,
+      },
     };
   });
 }
@@ -204,6 +389,92 @@ async function notifyClaimApplied(result: ClaimApplied): Promise<void> {
       error,
     );
   }
+  try {
+    await notifyBoardCreatorsOfClaim(result);
+  } catch (error) {
+    logger.warn(`[GymClaim] Gym ${result.gymUuid} was claimed, but telling its board creators failed:`, error);
+  }
+}
+
+/**
+ * `gym_claimed_with_your_board`: everyone whose own board is listed at a gym
+ * that was just claimed hears about it, because the new owner can now edit
+ * those boards and take them off the listing
+ * (docs/product/gym-board-governance.md, decision 1). One notice per creator,
+ * naming their oldest board there; the notice's entity is the gym.
+ *
+ * Only boards the new owner can read count: a private board they can't see
+ * gives them no power over it, and a notice would tell its creator someone
+ * looked. Synced boards have no creator to tell, and the claimant's own boards
+ * are theirs already. One query finds them all.
+ *
+ * Runs after the transfer commits, and only while the `directory-reports` flag
+ * is on (`sendDirectoryNotices`). Best effort: the caller swallows a failure.
+ */
+async function notifyBoardCreatorsOfClaim(applied: ClaimApplied): Promise<void> {
+  // Nothing changed hands, so nobody gained power over anyone's board.
+  if (!applied.didTransfer) return;
+  const boards = await db
+    .select({ id: dbSchema.userBoards.id, ownerId: dbSchema.userBoards.ownerId })
+    .from(dbSchema.userBoards)
+    .where(
+      and(
+        eq(dbSchema.userBoards.gymId, applied.gymId),
+        isNull(dbSchema.userBoards.deletedAt),
+        ne(dbSchema.userBoards.ownerId, SYSTEM_BOARD_OWNER_ID),
+        ne(dbSchema.userBoards.ownerId, applied.claimantUserId),
+        boardIsNotArchivedSprayWall(),
+        resourceAccessCondition('board', dbSchema.userBoards.uuid, applied.claimantUserId),
+      ),
+    )
+    .orderBy(asc(dbSchema.userBoards.id));
+  const oldestBoardByCreator = new Map<string, number>();
+  for (const board of boards) {
+    if (!oldestBoardByCreator.has(board.ownerId)) oldestBoardByCreator.set(board.ownerId, board.id);
+  }
+  const notices: PendingDirectoryNotice[] = [...oldestBoardByCreator].map(([recipientId, boardId]) => ({
+    recipientId,
+    type: 'gym_claimed_with_your_board',
+    target: { kind: 'gym', gymId: applied.gymId, gymUuid: applied.gymUuid },
+    boardId,
+  }));
+  await sendDirectoryNotices(db, notices);
+}
+
+/**
+ * The in-app `gym_claim_denied` notice, for every way a claim ends without the
+ * gym: an admin's Deny, the 30-day expiry and a revert. Its copy ("We couldn't
+ * confirm you run {gym}. Reply to our email if we got it wrong.") fits all
+ * three; the email that goes with each says which it was. Only while the
+ * `directory-reports` flag is on.
+ */
+export async function sendClaimDeniedNotice(
+  executor: Parameters<typeof sendDirectoryNotices>[0],
+  claim: Pick<dbSchema.GymClaim, 'claimantUserId' | 'gymId'>,
+): Promise<void> {
+  const [gym] = await executor
+    .select({ uuid: dbSchema.gyms.uuid })
+    .from(dbSchema.gyms)
+    .where(eq(dbSchema.gyms.id, claim.gymId))
+    .limit(1);
+  if (!gym) return;
+  await sendDirectoryNotices(executor, [
+    {
+      recipientId: claim.claimantUserId,
+      type: 'gym_claim_denied',
+      target: { kind: 'gym', gymId: claim.gymId, gymUuid: gym.uuid },
+    },
+  ]);
+}
+
+/** The gym's slug, or its uuid for a slug-less gym: what the claim pages put in `?gym=`. */
+async function loadGymRef(gymId: number): Promise<string | null> {
+  const [gym] = await db
+    .select({ uuid: dbSchema.gyms.uuid, slug: dbSchema.gyms.slug })
+    .from(dbSchema.gyms)
+    .where(eq(dbSchema.gyms.id, gymId))
+    .limit(1);
+  return gym ? gym.slug || gym.uuid : null;
 }
 
 /**
@@ -211,11 +482,17 @@ async function notifyClaimApplied(result: ClaimApplied): Promise<void> {
  * ownership. Token-gated (no session) — the token is the credential. Used by the
  * backend REST verify route.
  */
-export async function verifyGymClaimByToken(
-  token: string,
-): Promise<
+export async function verifyGymClaimByToken(token: string): Promise<
   | { ok: true; gymName: string; gymSlug: string | null; gymUuid: string }
-  | { ok: false; reason: 'invalid' | 'expired' | 'used' }
+  | {
+      ok: false;
+      reason: 'invalid' | 'expired' | 'used' | 'superseded';
+      /**
+       * The gym's slug (or uuid) when the token named a claim, so the error page
+       * can link back to it. Absent for an unknown token: it names no gym.
+       */
+      gymRef?: string | null;
+    }
 > {
   if (!token) return { ok: false, reason: 'invalid' };
   const tokenHash = hashClaimToken(token);
@@ -227,31 +504,56 @@ export async function verifyGymClaimByToken(
     .limit(1);
 
   if (!claim) return { ok: false, reason: 'invalid' };
-  if (claim.status !== 'pending') return { ok: false, reason: 'used' };
+  if (claim.status !== 'pending') return { ok: false, reason: 'used', gymRef: await loadGymRef(claim.gymId) };
   if (claim.expiresAt && claim.expiresAt.getTime() < Date.now()) {
     await db
       .update(dbSchema.gymClaims)
       .set({ status: 'expired', updatedAt: new Date() })
       .where(and(eq(dbSchema.gymClaims.id, claim.id), eq(dbSchema.gymClaims.status, 'pending')));
-    return { ok: false, reason: 'expired' };
+    return { ok: false, reason: 'expired', gymRef: await loadGymRef(claim.gymId) };
   }
 
   const result = await applyGymClaim(claim);
-  if (!result) return { ok: false, reason: 'used' };
-  await notifyClaimApplied(result);
-  return { ok: true, gymName: result.gymName, gymSlug: result.gymSlug, gymUuid: result.gymUuid };
+  // Domain claims cannot enter the admin queue. applyGymClaim expired this one
+  // atomically, so the page's instruction to request a new link works now.
+  if (result.outcome === 'superseded') {
+    logger.warn(`[GymClaim] Domain claim ${claim.id} on gym ${claim.gymId} was superseded and expired`);
+    return { ok: false, reason: 'superseded', gymRef: await loadGymRef(claim.gymId) };
+  }
+  if (result.outcome !== 'applied') return { ok: false, reason: 'used', gymRef: await loadGymRef(claim.gymId) };
+  const { applied } = result;
+  await notifyClaimApplied(applied);
+  return { ok: true, gymName: applied.gymName, gymSlug: applied.gymSlug, gymUuid: applied.gymUuid };
 }
 
+/** Why a claim was left for review instead of approving itself. Logged; never shown to the claimant. */
+export type AutoApproveStop =
+  | AutoApproveGuard
+  | 'disabled'
+  | 'rate_limited'
+  | 'not_unclaimed'
+  | 'superseded'
+  | 'not_applied'
+  | 'failed';
+
+export type AutoApproveResult =
+  | { applied: ClaimApplied; stoppedBy: null }
+  | { applied: null; stoppedBy: AutoApproveStop };
+
 /**
- * Auto-approve an admin-review claim when the admin setting is on AND the gym is
- * still owned by the system import user — an unclaimed location-sync listing
- * nobody has taken. Claims that would displace a real person are deliberately
- * left in the queue for a human, so turning the setting on can't be used to take
- * a gym away from its owner.
+ * Auto-approve an admin-review claim when the admin setting is on, the gym is
+ * still owned by the system import user (an unclaimed location-sync listing
+ * nobody has taken) and every guard passes (`gym-claim-guardrails.ts`,
+ * docs/product/gym-claims.md). Claims that would displace a real person are
+ * deliberately left in the queue for a human, so turning the setting on can't
+ * be used to take a gym away from its owner.
  *
- * Returns the applied claim, or null when auto-approval didn't happen (setting
- * off, gym owned by someone, or the claim was resolved concurrently) — in which
- * case the caller falls through to the normal review queue.
+ * Order: the setting, the per-account rate limit, the gym still unclaimed, the
+ * guards, then `applyGymClaim` with `autoApprove`, which takes the advisory
+ * lock and checks the guards again under it.
+ *
+ * Returns the applied claim, or why it stopped. A stopped claim falls through
+ * to the normal review queue.
  *
  * Auto-approval is an optimisation over that queue, never a precondition for it,
  * so a failure to apply must not fail the request: the claim row is already
@@ -268,14 +570,23 @@ export async function verifyGymClaimByToken(
  * this one", not "reject the request": the claim stays queued for a human.
  *
  * Auto-approved rows are recognisable as `method='admin' AND status='approved'
- * AND reviewed_by IS NULL`; there's no dedicated column, so no migration.
+ * AND reviewed_by IS NULL` (`revoked` once reverted); there's no dedicated
+ * column. The approval time is the claim's `gym_claim_ownership_decisions` row.
  */
-async function tryAutoApproveAdminClaim(
+export async function tryAutoApproveAdminClaim(
   ctx: ConnectionContext,
   gym: typeof dbSchema.gyms.$inferSelect,
   claim: typeof dbSchema.gymClaims.$inferSelect,
-): Promise<ClaimApplied | null> {
-  if (!(await gymClaimAutoApproveEnabled())) return null;
+): Promise<AutoApproveResult> {
+  const stop = (stoppedBy: AutoApproveStop): AutoApproveResult => {
+    // Claim id and reason only: no account, gym or note in the log. The cap
+    // is a warning, so a day that hits it shows up in the logs.
+    const message = '[GymClaim] Claim left for review instead of approving itself';
+    if (stoppedBy === 'daily_cap_reached') logger.warn(message, { claimId: claim.id, stoppedBy });
+    else logger.info(message, { claimId: claim.id, stoppedBy });
+    return { applied: null, stoppedBy };
+  };
+  if (!(await gymClaimAutoApproveEnabled())) return { applied: null, stoppedBy: 'disabled' };
 
   try {
     // Tighter than requestGymClaim's own limit: each pass here can hand over a
@@ -284,18 +595,25 @@ async function tryAutoApproveAdminClaim(
     // Redis bucket on `${userId}:gymClaimAutoApprove` applies on top of the
     // tier-1 in-process one.
     await applyRateLimit(ctx, 3, 'gymClaimAutoApprove');
+  } catch {
+    return stop('rate_limited');
+  }
+  if (gym.ownerId !== SYSTEM_BOARD_OWNER_ID) return stop('not_unclaimed');
 
-    const result = await applyGymClaim(claim, { requireCurrentOwnerId: SYSTEM_BOARD_OWNER_ID });
-    if (result) {
-      logger.info(
-        `[GymClaim] Auto-approved claim ${claim.id} on gym ${gym.uuid} for user ${claim.claimantUserId} (unclaimed listing)`,
-      );
-    }
-    return result;
+  try {
+    const guard = await firstFailedAutoApproveGuard(db, claim);
+    if (guard) return stop(guard);
+
+    const result = await applyGymClaim(claim, { requireCurrentOwnerId: SYSTEM_BOARD_OWNER_ID, autoApprove: true });
+    if (result.outcome === 'superseded') return stop('superseded');
+    if (result.outcome === 'not_eligible') return stop(result.guard);
+    if (result.outcome !== 'applied') return stop('not_applied');
+    logger.info('[GymClaim] Claim approved itself (unclaimed listing)', { claimId: claim.id });
+    return { applied: result.applied, stoppedBy: null };
   } catch (error) {
     // Pass the Error itself, not `.message` — winston serializes the stack.
-    logger.warn(`[GymClaim] Auto-approval of claim ${claim.id} on gym ${gym.uuid} failed; leaving it queued:`, error);
-    return null;
+    logger.warn(`[GymClaim] Auto-approval of claim ${claim.id} failed; leaving it queued:`, error);
+    return { applied: null, stoppedBy: 'failed' };
   }
 }
 
@@ -327,6 +645,16 @@ async function replacePendingClaim(
   values: typeof dbSchema.gymClaims.$inferInsert,
 ): Promise<typeof dbSchema.gymClaims.$inferSelect> {
   return db.transaction(async (tx) => {
+    // A claim filed during a handover must see that handover commit before it
+    // establishes its own place in the ownership timeline. Always lock gym
+    // before claim rows, matching applyGymClaim and reassignGymOwner.
+    const [gym] = await tx
+      .select({ id: dbSchema.gyms.id })
+      .from(dbSchema.gyms)
+      .where(and(eq(dbSchema.gyms.id, values.gymId), isNull(dbSchema.gyms.deletedAt)))
+      .limit(1)
+      .for('update');
+    if (!gym) throw new Error('Gym not found.');
     await tx
       .delete(dbSchema.gymClaims)
       .where(
@@ -336,7 +664,10 @@ async function replacePendingClaim(
           eq(dbSchema.gymClaims.status, 'pending'),
         ),
       );
-    const [inserted] = await tx.insert(dbSchema.gymClaims).values(values).returning();
+    const [inserted] = await tx
+      .insert(dbSchema.gymClaims)
+      .values({ ...values, createdAt: sql`clock_timestamp()` })
+      .returning();
     // A successful INSERT ... RETURNING always yields a row, but the destructure
     // is typed as possibly-undefined and the caller feeds this straight into
     // applyGymClaim. Fail here rather than forward an undefined claim.
@@ -456,6 +787,127 @@ export const gymClaimFieldResolvers = {
   },
 };
 
+/**
+ * What tells a gym manager from a prankster in the review queue
+ * (docs/product/gym-claims.md): how many climbs each claimant has logged and
+ * which live gyms they already own or admin. Three grouped reads for the whole
+ * page, never one per row.
+ */
+async function loadClaimantHistory(
+  claimantIds: readonly string[],
+): Promise<{ tickCounts: Map<string, number>; gymsHeld: Map<string, Set<number>> }> {
+  const tickCounts = new Map<string, number>();
+  const gymsHeld = new Map<string, Set<number>>();
+  if (claimantIds.length === 0) return { tickCounts, gymsHeld };
+  const liveGym = and(isNull(dbSchema.gyms.deletedAt), isNull(dbSchema.gyms.mergedIntoGymId));
+  const [ticks, owned, administered] = await Promise.all([
+    db
+      .select({ userId: dbSchema.boardseshTicks.userId, count: sql<number>`count(*)::int` })
+      .from(dbSchema.boardseshTicks)
+      .where(inArray(dbSchema.boardseshTicks.userId, [...claimantIds]))
+      .groupBy(dbSchema.boardseshTicks.userId),
+    db
+      .select({ userId: dbSchema.gyms.ownerId, gymId: dbSchema.gyms.id })
+      .from(dbSchema.gyms)
+      .where(and(inArray(dbSchema.gyms.ownerId, [...claimantIds]), liveGym)),
+    db
+      .select({ userId: dbSchema.gymMembers.userId, gymId: dbSchema.gymMembers.gymId })
+      .from(dbSchema.gymMembers)
+      .innerJoin(dbSchema.gyms, eq(dbSchema.gyms.id, dbSchema.gymMembers.gymId))
+      .where(
+        and(inArray(dbSchema.gymMembers.userId, [...claimantIds]), eq(dbSchema.gymMembers.role, 'admin'), liveGym),
+      ),
+  ]);
+  for (const row of ticks) tickCounts.set(row.userId, row.count);
+  for (const row of [...owned, ...administered]) {
+    const held = gymsHeld.get(row.userId) ?? new Set<number>();
+    held.add(row.gymId);
+    gymsHeld.set(row.userId, held);
+  }
+  return { tickCounts, gymsHeld };
+}
+
+/**
+ * Admin-review claims nobody decided within {@link ADMIN_CLAIM_EXPIRY_DAYS}
+ * days expire, if they were filed on or after
+ * {@link GYM_CLAIM_EXPIRY_STARTS_AT}. A step of the hourly directory-report
+ * sweep (`services/directory-report-sweep.ts`): each claim is expired in its own
+ * transaction, which writes the claimant's in-app `gym_claim_denied` notice
+ * (flag permitting) and, once committed, emails them. Reads what is due, so a
+ * missed hour or a second runner changes nothing twice. Returns how many
+ * expired; a claim that fails is counted in `failures` and tried next hour.
+ */
+export async function expireStaleAdminClaims(now: Date, failures: { count: number }, batchSize = 200): Promise<number> {
+  const cutoff = new Date(now.getTime() - ADMIN_CLAIM_EXPIRY_DAYS * DAY_MS);
+  const due = await db
+    .select({ id: dbSchema.gymClaims.id })
+    .from(dbSchema.gymClaims)
+    .where(
+      and(
+        eq(dbSchema.gymClaims.status, 'pending'),
+        eq(dbSchema.gymClaims.method, 'admin'),
+        gte(dbSchema.gymClaims.createdAt, new Date(GYM_CLAIM_EXPIRY_STARTS_AT)),
+        lte(dbSchema.gymClaims.createdAt, cutoff),
+      ),
+    )
+    .orderBy(asc(dbSchema.gymClaims.createdAt), asc(dbSchema.gymClaims.id))
+    .limit(batchSize);
+  let expired = 0;
+  for (const { id } of due) {
+    try {
+      const didExpire = await transactionWithAfterCommit(async (tx) => {
+        const [claim] = await tx
+          .update(dbSchema.gymClaims)
+          .set({ status: 'expired', updatedAt: now })
+          .where(and(eq(dbSchema.gymClaims.id, id), eq(dbSchema.gymClaims.status, 'pending')))
+          .returning();
+        if (!claim) return false;
+        await sendClaimDeniedNotice(tx, claim);
+        emailClaimantAfterCommit(tx, claim, sendGymClaimExpiredEmail);
+        return true;
+      });
+      if (didExpire) expired += 1;
+    } catch (error) {
+      failures.count += 1;
+      logger.error('[GymClaim] Could not expire a claim', {
+        claimId: id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  if (expired > 0) logger.info('[GymClaim] Expired claims nobody reviewed', { count: expired });
+  return expired;
+}
+
+/**
+ * Once `tx` commits, email the claimant about their claim with `send` (one of
+ * the best-effort claim emails, which never throw). Their account email, or the
+ * address a domain claim was verified at.
+ */
+export function emailClaimantAfterCommit(
+  tx: DbTransaction,
+  claim: Pick<dbSchema.GymClaim, 'claimantUserId' | 'claimEmail' | 'gymId'>,
+  send: (email: string, gymName: string) => Promise<void>,
+): void {
+  afterCommit(tx, () => {
+    void (async () => {
+      try {
+        const [gym] = await db
+          .select({ name: dbSchema.gyms.name })
+          .from(dbSchema.gyms)
+          .where(eq(dbSchema.gyms.id, claim.gymId))
+          .limit(1);
+        const email = claim.claimEmail ?? (await loadUserEmail(claim.claimantUserId));
+        if (gym && email) await send(email, gym.name);
+      } catch (error) {
+        logger.warn('[GymClaim] Could not email a claimant about their claim', {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    })();
+  });
+}
+
 export const socialGymClaimQueries = {
   pendingGymClaims: async (_: unknown, { input }: { input?: unknown }, ctx: ConnectionContext) => {
     await requireAdmin(ctx);
@@ -485,15 +937,19 @@ export const socialGymClaimQueries = {
         avatarUrl: dbSchema.userProfiles.avatarUrl,
         userName: dbSchema.users.name,
         userImage: dbSchema.users.image,
+        accountCreatedAt: dbSchema.users.createdAt,
       })
       .from(dbSchema.gymClaims)
       .innerJoin(dbSchema.gyms, eq(dbSchema.gymClaims.gymId, dbSchema.gyms.id))
       .leftJoin(dbSchema.users, eq(dbSchema.gymClaims.claimantUserId, dbSchema.users.id))
       .leftJoin(dbSchema.userProfiles, eq(dbSchema.gymClaims.claimantUserId, dbSchema.userProfiles.userId))
       .where(pendingAdminClaims)
-      .orderBy(desc(dbSchema.gymClaims.createdAt))
+      .orderBy(desc(dbSchema.gymClaims.createdAt), asc(dbSchema.gymClaims.id))
       .limit(limit)
       .offset(offset);
+
+    const history = await loadClaimantHistory([...new Set(rows.map((row) => row.claimantUserId))]);
+    const now = Date.now();
 
     const claims = rows.map((row) => ({
       id: String(row.id),
@@ -507,6 +963,93 @@ export const socialGymClaimQueries = {
       claimEmail: row.claimEmail,
       message: row.message,
       createdAt: row.createdAt.toISOString(),
+      claimantAccountAgeDays: row.accountCreatedAt
+        ? Math.max(0, Math.floor((now - row.accountCreatedAt.getTime()) / DAY_MS))
+        : null,
+      claimantTickCount: history.tickCounts.get(row.claimantUserId) ?? 0,
+      claimantGymsHeld: history.gymsHeld.get(row.claimantUserId)?.size ?? 0,
+    }));
+
+    return { claims, totalCount, hasMore: offset + rows.length < totalCount };
+  },
+
+  /**
+   * Claims that approved themselves and moved their gym, newest first: the
+   * admin's revert list (docs/product/gym-claims.md). Reverted ones stay in it,
+   * marked `revoked`, so the daily digest's link to one still lands somewhere.
+   */
+  autoApprovedGymClaims: async (_: unknown, { input }: { input?: unknown }, ctx: ConnectionContext) => {
+    await requireAdmin(ctx);
+    const { limit, offset, claimId } = validateInput(AutoApprovedGymClaimsInputSchema, input || {}, 'input');
+
+    const autoApproved = and(
+      autoApprovedClaimCondition(['approved', 'revoked']),
+      eq(dbSchema.gymClaimOwnershipDecisions.didTransfer, true),
+      claimId ? eq(dbSchema.gymClaims.id, claimId) : undefined,
+    );
+
+    const [countResult] = await db
+      .select({ count: count() })
+      .from(dbSchema.gymClaims)
+      .innerJoin(
+        dbSchema.gymClaimOwnershipDecisions,
+        eq(dbSchema.gymClaimOwnershipDecisions.claimId, dbSchema.gymClaims.id),
+      )
+      .where(autoApproved);
+    const totalCount = Number(countResult?.count || 0);
+
+    const rows = await db
+      .select({
+        id: dbSchema.gymClaims.id,
+        gymUuid: dbSchema.gyms.uuid,
+        gymName: dbSchema.gyms.name,
+        claimantUserId: dbSchema.gymClaims.claimantUserId,
+        method: dbSchema.gymClaims.method,
+        status: dbSchema.gymClaims.status,
+        claimEmail: dbSchema.gymClaims.claimEmail,
+        message: dbSchema.gymClaims.message,
+        createdAt: dbSchema.gymClaims.createdAt,
+        approvedAt: dbSchema.gymClaimOwnershipDecisions.decidedAt,
+        displayName: dbSchema.userProfiles.displayName,
+        avatarUrl: dbSchema.userProfiles.avatarUrl,
+        userName: dbSchema.users.name,
+        userImage: dbSchema.users.image,
+        accountCreatedAt: dbSchema.users.createdAt,
+      })
+      .from(dbSchema.gymClaims)
+      .innerJoin(
+        dbSchema.gymClaimOwnershipDecisions,
+        eq(dbSchema.gymClaimOwnershipDecisions.claimId, dbSchema.gymClaims.id),
+      )
+      .innerJoin(dbSchema.gyms, eq(dbSchema.gymClaims.gymId, dbSchema.gyms.id))
+      .leftJoin(dbSchema.users, eq(dbSchema.gymClaims.claimantUserId, dbSchema.users.id))
+      .leftJoin(dbSchema.userProfiles, eq(dbSchema.gymClaims.claimantUserId, dbSchema.userProfiles.userId))
+      .where(autoApproved)
+      .orderBy(desc(dbSchema.gymClaimOwnershipDecisions.decidedAt), desc(dbSchema.gymClaims.id))
+      .limit(limit)
+      .offset(offset);
+
+    const history = await loadClaimantHistory([...new Set(rows.map((row) => row.claimantUserId))]);
+    const now = Date.now();
+
+    const claims = rows.map((row) => ({
+      id: String(row.id),
+      gymUuid: row.gymUuid,
+      gymName: row.gymName,
+      claimantUserId: row.claimantUserId,
+      claimantDisplayName: row.displayName || row.userName || undefined,
+      claimantAvatarUrl: row.avatarUrl || row.userImage || undefined,
+      method: row.method,
+      status: row.status,
+      claimEmail: row.claimEmail,
+      message: row.message,
+      createdAt: row.createdAt.toISOString(),
+      approvedAt: row.approvedAt.toISOString(),
+      claimantAccountAgeDays: row.accountCreatedAt
+        ? Math.max(0, Math.floor((now - row.accountCreatedAt.getTime()) / DAY_MS))
+        : null,
+      claimantTickCount: history.tickCounts.get(row.claimantUserId) ?? 0,
+      claimantGymsHeld: history.gymsHeld.get(row.claimantUserId)?.size ?? 0,
     }));
 
     return { claims, totalCount, hasMore: offset + rows.length < totalCount };
@@ -547,6 +1090,19 @@ export const socialGymClaimMutations = {
     if (await userCanEditGym(gym, userId)) {
       throw new Error('You already have edit access to this gym, so you cannot file an ownership claim here.');
     }
+    // Nobody claims a gym its staff run (`listingState` RUN_BY_GYM): its owner
+    // holds an approved claim or got it from our team, so a second claim would
+    // only reopen a decision already made. Both clients hide the claim there;
+    // this is the same rule for an old build or a hand-made request. A dispute
+    // goes through Report a problem, which reaches our team.
+    if ((await gymIdsRunByStaff([gym.id])).has(gym.id)) {
+      throw new GraphQLError(
+        "This gym is run by its staff. If that's wrong, report a problem and our team will look.",
+        {
+          extensions: { code: GYM_RUN_BY_STAFF_CODE },
+        },
+      );
+    }
 
     const claimantName = await loadClaimantName(userId);
     const existingPending = await findPendingClaim(gym.id, userId);
@@ -561,9 +1117,9 @@ export const socialGymClaimMutations = {
       // leader is display-only here — otherwise that person could point it at a
       // domain they control and a second account of theirs would self-verify in.
       // Checked before the email match so a prober can't learn whether their
-      // address would have matched.
-      // TODO(#4018): both claim dialogs still offer the email form on an
-      // un-vouched gym, so this refusal only surfaces after submit.
+      // address would have matched. The read-side `computeCanClaimByDomain`
+      // helper mirrors these website conditions to choose the claim form
+      // (#4018); this mutation retains enforcement and this refusal order.
       if (!gym.websiteVouchedByOwner) {
         throw new Error(
           "This gym's website hasn't been confirmed by the gym's owner, so we can't verify you by email. Request admin review instead.",
@@ -597,23 +1153,27 @@ export const socialGymClaimMutations = {
         expiresAt: new Date(Date.now() + CLAIM_TOKEN_TTL_MS),
       });
 
-      try {
-        await sendGymClaimVerificationEmail(validatedInput.claimEmail, token, gym.name, claimantName);
-      } catch (error) {
-        // The token row is already committed; if the send fails (SMTP down),
-        // drop it so a retry isn't blocked by the dedup check for 24h.
-        await db
-          .delete(dbSchema.gymClaims)
-          .where(
-            and(
-              eq(dbSchema.gymClaims.gymId, gym.id),
-              eq(dbSchema.gymClaims.claimantUserId, userId),
-              eq(dbSchema.gymClaims.status, 'pending'),
-              eq(dbSchema.gymClaims.method, 'domain'),
-            ),
-          );
-        throw error;
-      }
+      await deferDatabaseEffect(async () => {
+        try {
+          await sendGymClaimVerificationEmail(validatedInput.claimEmail!, token, gym.name, claimantName);
+        } catch (error) {
+          // A delegated mutation may still roll back after this resolver
+          // returns. Send only after its commit and remove only this token on
+          // delivery failure, never a newer retry's replacement claim.
+          await db
+            .delete(dbSchema.gymClaims)
+            .where(
+              and(
+                eq(dbSchema.gymClaims.gymId, gym.id),
+                eq(dbSchema.gymClaims.claimantUserId, userId),
+                eq(dbSchema.gymClaims.status, 'pending'),
+                eq(dbSchema.gymClaims.method, 'domain'),
+                eq(dbSchema.gymClaims.tokenHash, hashClaimToken(token)),
+              ),
+            );
+          throw error;
+        }
+      });
       return { status: 'email_sent', email: validatedInput.claimEmail };
     }
 
@@ -622,9 +1182,9 @@ export const socialGymClaimMutations = {
     // auto-approval, so a claim queued before the setting was turned on can still
     // go through when the claimant asks again.
     if (existingPending?.method === 'admin') {
-      const autoApplied = await tryAutoApproveAdminClaim(ctx, gym, existingPending);
-      if (autoApplied) {
-        await notifyClaimApplied(autoApplied);
+      const autoApproval = await tryAutoApproveAdminClaim(ctx, gym, existingPending);
+      if (autoApproval.applied) {
+        await notifyClaimApplied(autoApproval.applied);
         return { status: 'approved' };
       }
       return { status: 'admin_review' };
@@ -643,19 +1203,21 @@ export const socialGymClaimMutations = {
       message: validatedInput.message ?? null,
     });
 
-    const autoApplied = await tryAutoApproveAdminClaim(ctx, gym, queuedClaim);
-    if (autoApplied) {
-      await notifyClaimApplied(autoApplied);
+    const autoApproval = await tryAutoApproveAdminClaim(ctx, gym, queuedClaim);
+    if (autoApproval.applied) {
+      await notifyClaimApplied(autoApproval.applied);
       return { status: 'approved' };
     }
 
-    await notifyAdminOfQueuedClaim({
-      gymName: gym.name,
-      gymUuid: gym.uuid,
-      claimantName,
-      message: validatedInput.message ?? null,
-      pendingClaimCount: otherPendingClaims + 1,
-    });
+    await deferDatabaseEffect(() =>
+      notifyAdminOfQueuedClaim({
+        gymName: gym.name,
+        gymUuid: gym.uuid,
+        claimantName,
+        message: validatedInput.message ?? null,
+        pendingClaimCount: otherPendingClaims + 1,
+      }),
+    );
 
     return { status: 'admin_review' };
   },
@@ -714,28 +1276,50 @@ export const socialGymClaimMutations = {
           void sendGymClaimDeniedEmail(claimantEmail, claimedGym.name);
         }
       }
+      // The same outcome in the app, for a claimant who never opens the email.
+      // Best effort: the deny is committed.
+      try {
+        await sendClaimDeniedNotice(db, claim);
+      } catch (error) {
+        logger.warn(`[GymClaim] Claim ${claim.id} was denied, but the in-app notice failed:`, error);
+      }
       return true;
     }
 
-    // Both ways this can fail mean the same thing to the reviewer — the claim
-    // wasn't applied — so fold them into one message. `applyGymClaim` returns
-    // null when the gym is gone or the claim was already resolved, and throws
-    // when a concurrent transfer beat us to the guarded UPDATE; letting that
-    // throw escape would hand the admin an internal message instead.
-    let result: ClaimApplied | null;
+    // Two of the ways this can fail mean the same thing to the reviewer — the
+    // claim wasn't applied — so fold them into one message. `applyGymClaim`
+    // returns `not_applied` when the gym is gone or the claim was already
+    // resolved, and throws when a concurrent transfer beat us to the guarded
+    // UPDATE; letting that throw escape would hand the admin an internal
+    // message instead. `superseded` is deliberately NOT folded in — see below.
+    let result: ApplyGymClaimResult;
     try {
       result = await applyGymClaim(claim, { reviewerId: adminUserId });
     } catch (error) {
       logger.warn(`[GymClaim] Manual approval of claim ${claim.id} lost an ownership race:`, error);
-      result = null;
+      result = { outcome: 'not_applied' };
     }
 
-    if (!result) {
+    // Raised outside the catch above on purpose: this one is not "the claim
+    // wasn't applied, try again", it is a decision the reviewer has to make.
+    // Somebody already settled who owns this gym after the claim was filed, so
+    // approving would hand it back and undo them. Deny it, or move ownership on
+    // purpose with the handover panel next to the queue.
+    if (result.outcome === 'superseded') {
+      logger.warn(
+        `[GymClaim] Refused approval of claim ${claim.id} on gym ${claim.gymId}: ownership moved after it was filed`,
+      );
+      throw new GraphQLError('This gym changed hands after the claim was filed.', {
+        extensions: { code: GYM_CLAIM_SUPERSEDED_CODE },
+      });
+    }
+
+    if (result.outcome !== 'applied') {
       // The gym was removed, or the claim was resolved concurrently — don't
       // report a success the admin panel would show as "approved".
       throw new Error('Could not approve this claim — the gym may have been removed or it was already resolved');
     }
-    await notifyClaimApplied(result);
+    await notifyClaimApplied(result.applied);
     return true;
   },
 };

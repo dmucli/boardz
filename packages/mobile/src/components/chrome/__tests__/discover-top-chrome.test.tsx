@@ -1,4 +1,28 @@
 // @vitest-environment jsdom
+vi.mock('../../../hooks/use-native-root-bar-items', () => ({ useNativeRootBarItems: () => false }));
+vi.mock('../use-root-bar-items', () => import('../../../../test/use-root-bar-items-stub'));
+// Screenshot mode only; this suite covers the glass capsules.
+vi.mock('../NativeTrailingItemShowcaseAnchor', () => ({ NativeTrailingItemShowcaseAnchor: () => null }));
+// Only the iOS 26 iPhone bar draws the list actions; this suite never reaches it.
+vi.mock('../ClimbListBoardActions', () => ({
+  ClimbListBoardActions: () => null,
+  climbListBoardActionCount: () => 0,
+}));
+// The native bar header reads the stack frame; this suite never reaches it.
+vi.mock('expo-router/react-navigation', () => ({ useFrameSize: () => 402 }));
+vi.mock('../../SheetTopBar', () => ({ SheetTopBar: () => null }));
+vi.mock('../../../hooks/use-native-root-header', () => ({ useNativeRootHeader: () => false }));
+vi.mock('../../chrome/NativeRootHeader', () => ({ NativeRootHeader: () => null }));
+vi.mock('../../../hooks/use-device-layout', () => ({
+  useDeviceLayout: () => ({ isPad: false, widthClass: 'compact' }),
+}));
+vi.mock('../../../hooks/use-board-angle-options', () => ({ useBoardAngleOptions: () => [30, 40] }));
+vi.mock('../../navigation/AnchoredPopover', () => ({
+  AnchoredPopover: ({ trigger }: { trigger: ReactNode }) => trigger,
+}));
+vi.mock('../../play-drawer/AngleBoardDiagram', () => ({ AngleBoardDiagram: () => null }));
+vi.mock('../../play-drawer/AngleSlider', () => ({ AngleSlider: () => null }));
+vi.mock('../../../lib/boards/use-set-board-angle', () => ({ useSetBoardAngle: () => vi.fn() }));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -28,6 +52,7 @@ type ViewMockProps = {
   onLayout?: (event: { nativeEvent: { layout: { height: number } } }) => void;
 };
 vi.mock('react-native', () => ({
+  Platform: { OS: 'ios' },
   View: ({ children, onLayout }: ViewMockProps) =>
     createElement(
       'div',
@@ -110,7 +135,7 @@ vi.mock('../../../hooks/use-native-glass', () => ({ useNativeGlass: () => false 
 vi.mock('../../../hooks/use-effective-surface-mode', () => ({ useEffectiveSurfaceMode: () => 'blur' }));
 vi.mock('../../../lib/haptics', () => ({ hapticLight: haptics.light }));
 vi.mock('../../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 4: 16 }, shadows: { sm: {} } }));
-vi.mock('../../../theme/layout', () => ({ glassSize: { standard: 48, capsule: 44 } }));
+vi.mock('../../../theme/layout', () => ({ glassSize: { standard: 48, capsule: 44, inline: 44, bar: 38 } }));
 
 vi.mock('../../GlassSurface', () => ({ GlassSurface: () => createElement('div', { 'data-glass': 'true' }) }));
 

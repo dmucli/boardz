@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,7 +29,10 @@ vi.mock('../../lib/chunk-load-recovery', () => recovery);
 vi.mock('react-native', () => ({
   Platform: { OS: 'web' },
   PlatformColor: (colorName: string) => colorName,
-  StyleSheet: { create: (styles: unknown) => styles },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+  },
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   Pressable: ({
     children,
@@ -128,12 +144,15 @@ describe('ChunkLoadErrorScreen', () => {
 describe('root ErrorBoundary wiring', () => {
   // Rendering app/_layout.tsx pulls in every provider; the branch is one line,
   // so pin it at the source instead.
-  const layoutSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), '../../../app/_layout.tsx'), 'utf8');
+  const layoutSource = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '../../application-root.tsx'),
+    'utf8',
+  );
 
   it('sends chunk failures to ChunkLoadErrorScreen before the generic crash screen', () => {
     const boundary = layoutSource.slice(layoutSource.indexOf('export function ErrorBoundary('));
     const body = boundary.slice(0, boundary.indexOf('\n}\n'));
     expect(body).toMatch(/if \(isChunkLoadError\(error\)\) return <ChunkLoadErrorScreen error=\{error\} \/>;/);
-    expect(body).toMatch(/return <CrashScreen error=\{error\} retry=\{retry\} \/>;/);
+    expect(body).toMatch(/<CrashScreen error=\{error\} retry=\{retry\} \/>/);
   });
 });

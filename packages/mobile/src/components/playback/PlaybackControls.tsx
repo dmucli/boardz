@@ -1,5 +1,14 @@
+import { Pressable } from 'react-native';
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { View, Pressable, ScrollView, StyleSheet, type ColorValue, type LayoutChangeEvent } from 'react-native';
+import {
+  View,
+  ScrollView,
+  StyleSheet,
+  type ColorValue,
+  type LayoutChangeEvent,
+  type ScrollViewInstance,
+} from 'react-native';
 import Animated, {
   FadeIn,
   FadeOut,
@@ -12,14 +21,14 @@ import Animated, {
 } from 'react-native-reanimated';
 import { useTranslation } from 'react-i18next';
 import { Text } from '../Text';
+import { LargeContentViewer } from '../LargeContentViewer';
 import { Icon } from '../Icon';
 import { GlassCluster } from '../GlassCluster';
 import { ValuePill } from '../ValuePill';
 import { ValueSlider } from '../ValueSlider';
 import type { IconName } from '../icon-map';
 import { useTheme } from '../../providers/theme-provider';
-import { hapticLight, hapticSelection, hapticSuccess } from '../../lib/haptics';
-import { withAlpha } from '../../theme/colors';
+import { hapticLight, hapticSelection } from '../../lib/haptics';
 import { glassSize } from '../../theme/layout';
 import { spacing, borderRadius } from '../../theme/tokens';
 import { springs, timing } from '../../theme/animations';
@@ -179,13 +188,13 @@ const FrameChip = memo(function FrameChip({
   label: string;
   onSeek: (index: number) => void;
 }) {
-  const { systemColors, brandColors, radii } = useTheme();
+  const { systemColors, selection, radii } = useTheme();
   const handlePress = useCallback(() => {
     hapticSelection();
     onSeek(index);
   }, [index, onSeek]);
   return (
-    <Pressable
+    <PressableSurface
       onPress={handlePress}
       // 32dp chip + 6dp of slop on each edge = the 44dp touch floor, without
       // widening the 32dp strip row the card's height budget is built on.
@@ -197,18 +206,18 @@ const FrameChip = memo(function FrameChip({
         styles.frameChip,
         {
           borderRadius: radii.button,
-          backgroundColor: selected ? withAlpha(brandColors.primary, 0.32) : systemColors.fill,
+          backgroundColor: selected ? selection.fill : systemColors.fill,
         },
       ]}
     >
       <Text
         variant="footnote"
-        color={selected ? brandColors.primary : systemColors.secondaryLabel}
+        color={selected ? selection.text : systemColors.secondaryLabel}
         style={[styles.frameChipDigit, selected && styles.frameChipDigitSelected]}
       >
         {index + 1}
       </Text>
-    </Pressable>
+    </PressableSurface>
   );
 });
 
@@ -244,7 +253,7 @@ function FrameStrip({
 }) {
   const { brandColors, systemColors } = useTheme();
   const { t } = useTranslation('session');
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useRef<ScrollViewInstance>(null);
   const [viewportWidth, setViewportWidth] = useState(0);
 
   const handleViewportLayout = useCallback((event: LayoutChangeEvent) => {
@@ -298,19 +307,21 @@ function FrameStrip({
       </View>
 
       {wallStateLabel ? (
-        <Text
-          variant="caption1"
-          color={systemColors.secondaryLabel}
-          numberOfLines={1}
-          // Capped below the 1.5 default: this row is a fixed 32dp inside a card
-          // that clips, and caption1's 16dp line box at 1.5 plus 8dp of padding
-          // is exactly 32 with nothing spare. The reader's copy of this chip, in
-          // the transport row, keeps the full range.
-          maxFontSizeMultiplier={1.2}
-          style={[styles.wallStateChip, { backgroundColor: systemColors.fill }]}
-        >
-          {wallStateLabel}
-        </Text>
+        <LargeContentViewer title={wallStateLabel}>
+          <Text
+            variant="caption1"
+            color={systemColors.secondaryLabel}
+            numberOfLines={1}
+            // Capped below the 1.5 default: this row is a fixed 32dp inside a card
+            // that clips, and caption1's 16dp line box at 1.5 plus 8dp of padding
+            // is exactly 32 with nothing spare. The reader's copy of this chip, in
+            // the transport row, keeps the full range.
+            maxFontSizeMultiplier={1.2}
+            style={[styles.wallStateChip, { backgroundColor: systemColors.fill }]}
+          >
+            {wallStateLabel}
+          </Text>
+        </LargeContentViewer>
       ) : null}
     </View>
   );
@@ -368,7 +379,7 @@ function FrameEditPair({
 
   return (
     <View style={[styles.framePair, { backgroundColor: systemColors.fill }]} testID="playback-frame-edit-pair">
-      <Pressable
+      <PressableSurface
         onPress={handleAdd}
         // Asymmetric on purpose. Nothing reaches UP: the frame chips sit 8dp
         // above with 6dp of their own slop, and a chip tap that slid into a
@@ -381,11 +392,11 @@ function FrameEditPair({
         testID="playback-add-frame"
       >
         <Icon name="plus" size={20} color={systemColors.secondaryLabel} />
-      </Pressable>
+      </PressableSurface>
 
       <View style={[styles.framePairDivider, { backgroundColor: systemColors.separator }]} />
 
-      <Pressable
+      <PressableSurface
         onPress={handleDelete}
         disabled={!canDelete}
         hitSlop={{ top: 0, bottom: 6, left: 0, right: 4 }}
@@ -407,7 +418,7 @@ function FrameEditPair({
         testID="playback-delete-frame"
       >
         <Icon name="minus" size={20} color={canDelete ? systemColors.secondaryLabel : systemColors.tertiaryLabel} />
-      </Pressable>
+      </PressableSurface>
     </View>
   );
 }
@@ -545,8 +556,8 @@ export function PlaybackControls({
     const wasPlaying = wasPlayingRef.current;
     wasPlayingRef.current = isPlaying;
     if (!isPlaying && wasPlaying && atLastFrame) {
-      // Reached the end of the route — a small celebratory beat.
-      hapticSuccess();
+      // Reached the end of the route — a small celebratory beat. Visual only:
+      // playback ended by itself, so no haptic (HIG "Playing haptics").
       playPulse.value = withSequence(withTiming(1.22, { duration: timing.instant }), withSpring(1, springs.bouncy));
     } else {
       playPulse.value = withSequence(withTiming(1.12, { duration: timing.instant }), withSpring(1, springs.snappy));
@@ -594,7 +605,7 @@ export function PlaybackControls({
     <View
       style={[
         styles.container,
-        // Scheme-resolved, not the static light `iosSystemColors.separator` this
+        // Scheme-resolved, not the static light iOS separator constant this
         // used to hardcode — that value is a dark translucent grey and vanished
         // against the card's own dark fill, so the card had no edge at night.
         { backgroundColor: systemColors.tertiaryBackground, borderColor: systemColors.separator },
@@ -649,7 +660,9 @@ export function PlaybackControls({
               accessibilityRole="text"
               accessibilityLabel={t('playView.frameCounterA11y', { index: frameIndex + 1, total: frameCount })}
             >
-              <Text style={[styles.counterCurrent, { color: systemColors.label }]}>{frameIndex + 1}</Text>
+              <Text emphasized style={[{ color: systemColors.label }]}>
+                {frameIndex + 1}
+              </Text>
               <Text style={{ color: systemColors.secondaryLabel }}>{` / ${frameCount}`}</Text>
             </Text>
           )}
@@ -850,9 +863,6 @@ const styles = StyleSheet.create({
   },
   counter: {
     fontVariant: ['tabular-nums'],
-  },
-  counterCurrent: {
-    fontWeight: '600',
   },
   wallStateChip: {
     paddingHorizontal: spacing[2],

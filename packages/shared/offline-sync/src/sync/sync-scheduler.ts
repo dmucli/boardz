@@ -2,6 +2,7 @@ import type { OfflineDatabase, QueryInvalidator } from '../database';
 import {
   pullSync,
   type SyncProgress,
+  type SyncOptions,
   type SchemaDriftReporter,
   type BootstrapMetadataChangedReporter,
   type ScopeDownloadCompleteReporter,
@@ -27,6 +28,7 @@ import { purgeNamespaceForScopeKey } from '../offline-board-key';
 export type SyncProgressSink = (progress: SyncProgress) => void;
 
 const FOREGROUND_DEBOUNCE_MS = 2000;
+const DOWNLOAD_CONTEXT_PREPARATION_TIMEOUT_MS = 1000;
 
 type GraphqlFetch = <T>(query: string, variables?: Record<string, unknown>) => Promise<T>;
 
@@ -54,6 +56,17 @@ export type SchedulerTriggers = {
 };
 
 export type SchedulerOptions = {
+  /** Restore request correlation before pullSync captures its immutable context. Observational only. */
+  prepareScopeDownloadContexts?: () => Promise<void>;
+  getScopeDownloadContext?: SyncOptions['getScopeDownloadContext'];
+  onScopeDownloadLifecycle?: SyncOptions['onScopeDownloadLifecycle'];
+  viewerUserId?: SyncOptions['viewerUserId'];
+  /** Threaded through to pullSync's SyncOptions — see its doc (#6824). */
+  requireOwnedDatabase?: SyncOptions['requireOwnedDatabase'];
+  /** Resolve secure-store credentials once for each cycle, after its queued writes drain. */
+  getViewerUserId?: () => Promise<SyncOptions['viewerUserId']>;
+  getPriorityBoards?: SyncOptions['getPriorityBoards'];
+  getSprayWallUuid?: SyncOptions['getSprayWallUuid'];
   onProgress?: SyncProgressSink;
   /**
    * Threaded through to pullSync's SyncOptions. Omitted → pullSync assumes
@@ -79,6 +92,8 @@ export type SchedulerOptions = {
   /** Threaded through to pullSync's SyncOptions — see ScopeDownloadCompleteInfo. */
   onScopeDownloadComplete?: ScopeDownloadCompleteReporter;
   onScopeDownloadStart?: ScopeDownloadStartReporter;
+  getDownloadRequestContext?: SyncOptions['getDownloadRequestContext'];
+  onScopeDownloadObserved?: SyncOptions['onScopeDownloadObserved'];
   /** Threaded through to pullSync's SyncOptions — see CoverageResetInfo. */
   onCoverageReset?: CoverageResetReporter;
   /** Threaded through to pullSync's SyncOptions — see CoverageEvaluatedInfo. */
@@ -172,8 +187,28 @@ async function runSync(request: SyncRunRequest): Promise<void> {
   try {
     // Push first so the subsequent pull reflects our own just-flushed writes.
     await drainQueue();
+    const viewerUserId = options?.getViewerUserId ? await options.getViewerUserId() : options?.viewerUserId;
+    if (options?.prepareScopeDownloadContexts) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          options.prepareScopeDownloadContexts(),
+          new Promise<void>((resolve) => {
+            timeout = setTimeout(resolve, DOWNLOAD_CONTEXT_PREPARATION_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        // An unavailable telemetry store must not prevent the pull.
+      } finally {
+        if (timeout !== undefined) clearTimeout(timeout);
+      }
+    }
     await pullSync(db, queryClient, graphqlFetch, {
+      viewerUserId,
+      requireOwnedDatabase: options?.requireOwnedDatabase,
       enabledBoards: getEnabledBoards(),
+      getPriorityBoards: options?.getPriorityBoards,
+      getSprayWallUuid: options?.getSprayWallUuid,
       isOnline: options?.isOnline,
       onProgress: options?.onProgress,
       onSchemaDrift: options?.onSchemaDrift,
@@ -182,6 +217,10 @@ async function runSync(request: SyncRunRequest): Promise<void> {
       onBootstrapMetadataChanged: options?.onBootstrapMetadataChanged,
       onScopeDownloadComplete: options?.onScopeDownloadComplete,
       onScopeDownloadStart: options?.onScopeDownloadStart,
+      getScopeDownloadContext: options?.getScopeDownloadContext,
+      onScopeDownloadLifecycle: options?.onScopeDownloadLifecycle,
+      getDownloadRequestContext: options?.getDownloadRequestContext,
+      onScopeDownloadObserved: options?.onScopeDownloadObserved,
       onCoverageReset: options?.onCoverageReset,
       onCoverageEvaluated: options?.onCoverageEvaluated,
       onBootstrapRetryScheduled: options?.onBootstrapRetryScheduled,

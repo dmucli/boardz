@@ -179,6 +179,59 @@ describe('createSetCurrentClimbCoalescer', () => {
     expect(onDrainError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
   });
 
+  // The drained call's own promise resolved when it superseded the head, so the
+  // sink is the only place that can say WHICH move never landed.
+  it('hands onDrainError the drained call’s args', async () => {
+    const first = deferred();
+    let sendCount = 0;
+    const sendArgs = vi.fn(async (_args: SetCurrentClimbArgs) => {
+      sendCount += 1;
+      if (sendCount === 1) await first.promise;
+      if (sendCount === 2) throw new Error('drain failed');
+    });
+    const onDrainError = vi.fn();
+    const coalescer = createSetCurrentClimbCoalescer({ sendArgs, onDrainError });
+
+    const firstEnqueue = coalescer.enqueue({ item: makeItem('a'), correlationId: 'corr-a' });
+    await Promise.resolve();
+    await coalescer.enqueue({ item: makeItem('b'), shouldAddToQueue: true, correlationId: 'corr-b' });
+    first.resolve();
+    await firstEnqueue;
+
+    expect(onDrainError).toHaveBeenCalledWith(expect.any(Error), {
+      item: makeItem('b'),
+      shouldAddToQueue: true,
+      correlationId: 'corr-b',
+    });
+  });
+
+  it('keeps sending later activations when the drain-error sink throws', async () => {
+    const first = deferred();
+    let sendCount = 0;
+    const sendArgs = vi.fn(async (_args: SetCurrentClimbArgs) => {
+      sendCount += 1;
+      if (sendCount === 1) await first.promise;
+      if (sendCount === 2) throw new Error('drain failed');
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const coalescer = createSetCurrentClimbCoalescer({
+      sendArgs,
+      onDrainError: () => {
+        throw new Error('sink bug');
+      },
+    });
+
+    const firstEnqueue = coalescer.enqueue({ item: makeItem('a') });
+    await Promise.resolve();
+    await coalescer.enqueue({ item: makeItem('b') });
+    first.resolve();
+    await firstEnqueue;
+    await coalescer.enqueue({ item: makeItem('c') });
+
+    expect(sendArgs.mock.calls.map(([args]) => args.item?.uuid)).toEqual(['a', 'b', 'c']);
+    consoleError.mockRestore();
+  });
+
   it('returns to idle state after drain so a later enqueue starts fresh', async () => {
     const sendArgs = vi.fn(async (_args: SetCurrentClimbArgs) => {});
     const coalescer = createSetCurrentClimbCoalescer({ sendArgs });
@@ -351,6 +404,32 @@ describe('createSetCurrentClimbCoalescer — drained-then-rejected recovery', ()
     expect(onDrainError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
   });
 
+  // Mobile holds a lost slot back while it waits to re-send the move: an ADD
+  // landing before the rejoin snapshot is read would spoil it (#6783 QA).
+  it('skips its deferred queue-add when onDrainError claims it, and fires it when the sink throws', async () => {
+    const claimed = harness('reject');
+    claimed.onDrainError.mockReturnValue(true);
+    const claimedEnqueue = claimed.coalescer.enqueue({ item: makeItem('a') });
+    await Promise.resolve();
+    await claimed.coalescer.enqueue({ item: makeItem('b'), shouldAddToQueue: true });
+    claimed.first.resolve();
+    await claimedEnqueue;
+    expect(claimed.sendDeferredQueueAdd).not.toHaveBeenCalled();
+
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const throwing = harness('reject');
+    throwing.onDrainError.mockImplementation(() => {
+      throw new Error('sink bug');
+    });
+    const throwingEnqueue = throwing.coalescer.enqueue({ item: makeItem('a') });
+    await Promise.resolve();
+    await throwing.coalescer.enqueue({ item: makeItem('b'), shouldAddToQueue: true });
+    throwing.first.resolve();
+    await throwingEnqueue;
+    expect(throwing.sendDeferredQueueAdd).toHaveBeenCalledTimes(1);
+    consoleError.mockRestore();
+  });
+
   it('does not await the deferred add (a backing-off ADD must not wedge the drain)', async () => {
     // A rate-limited ADD can sit in the transport's back-off for seconds.
     const { first, sendArgs, sendDeferredQueueAdd, coalescer } = harness(
@@ -486,5 +565,103 @@ describe('createSetCurrentClimbCoalescer — drained-then-rejected recovery', ()
     // And the drained copy is recovered here. Both paths firing for one item is
     // acceptable: the server skips a duplicate uuid.
     expect(sendDeferredQueueAdd).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('createSetCurrentClimbCoalescer — F3 placement', () => {
+  it('carries placement through to sendArgs', async () => {
+    const sendArgs = vi.fn(async (_args: SetCurrentClimbArgs) => {});
+    const coalescer = createSetCurrentClimbCoalescer({ sendArgs });
+
+    await coalescer.enqueue({ item: makeItem('a'), shouldAddToQueue: false, placement: 'STEP' });
+
+    expect(sendArgs).toHaveBeenCalledWith(
+      { item: makeItem('a'), shouldAddToQueue: false, placement: 'STEP' },
+      undefined,
+    );
+  });
+
+  it('now-slot mode: three fast opens fire no deferred add for the superseded middle one', async () => {
+    const first = deferred();
+    const calls: SetCurrentClimbArgs[] = [];
+    const sendArgs = vi.fn(async (args: SetCurrentClimbArgs) => {
+      calls.push(args);
+      if (calls.length === 1) await first.promise;
+    });
+    const sendDeferredQueueAdd = vi.fn(async (_item: ClimbQueueItem) => {});
+    const coalescer = createSetCurrentClimbCoalescer({ sendArgs, sendDeferredQueueAdd });
+
+    const firstEnqueue = coalescer.enqueue({ item: makeItem('a'), shouldAddToQueue: false, placement: 'NOW' });
+    await Promise.resolve();
+    await coalescer.enqueue({ item: makeItem('b'), shouldAddToQueue: false, placement: 'NOW' });
+    await coalescer.enqueue({ item: makeItem('c'), shouldAddToQueue: false, placement: 'NOW' });
+    first.resolve();
+    await firstEnqueue;
+
+    expect(calls.map((call) => call.item?.uuid)).toEqual(['a', 'c']);
+    expect(sendDeferredQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it('now-slot mode: a drained open that rejects fires no deferred add either', async () => {
+    const first = deferred();
+    let callCount = 0;
+    const sendArgs = vi.fn(async () => {
+      callCount += 1;
+      if (callCount === 1) await first.promise;
+      else throw new Error('RATE_LIMITED');
+    });
+    const sendDeferredQueueAdd = vi.fn(async (_item: ClimbQueueItem) => {});
+    const onDrainError = vi.fn();
+    const coalescer = createSetCurrentClimbCoalescer({ sendArgs, sendDeferredQueueAdd, onDrainError });
+
+    const firstEnqueue = coalescer.enqueue({ item: makeItem('a'), shouldAddToQueue: false, placement: 'NOW' });
+    await Promise.resolve();
+    await coalescer.enqueue({ item: makeItem('b'), shouldAddToQueue: false, placement: 'NOW' });
+    first.resolve();
+    await firstEnqueue;
+
+    expect(onDrainError).toHaveBeenCalledTimes(1);
+    expect(sendDeferredQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it('even an open sent with shouldAddToQueue: true and a placement fires no deferred add', async () => {
+    const first = deferred();
+    let callCount = 0;
+    const sendArgs = vi.fn(async () => {
+      callCount += 1;
+      if (callCount === 1) await first.promise;
+    });
+    const sendDeferredQueueAdd = vi.fn(async (_item: ClimbQueueItem) => {});
+    const coalescer = createSetCurrentClimbCoalescer({ sendArgs, sendDeferredQueueAdd });
+
+    const firstEnqueue = coalescer.enqueue({ item: makeItem('a'), placement: 'NOW' });
+    await Promise.resolve();
+    await coalescer.enqueue({ item: makeItem('b'), shouldAddToQueue: true, placement: 'NOW' });
+    await coalescer.enqueue({ item: makeItem('c'), placement: 'NOW' });
+    first.resolve();
+    await firstEnqueue;
+
+    expect(sendDeferredQueueAdd).not.toHaveBeenCalled();
+  });
+
+  it('legacy mode keeps the old residual: a superseded queue-adding open still fires its deferred add', async () => {
+    const first = deferred();
+    let callCount = 0;
+    const sendArgs = vi.fn(async () => {
+      callCount += 1;
+      if (callCount === 1) await first.promise;
+    });
+    const sendDeferredQueueAdd = vi.fn(async (_item: ClimbQueueItem) => {});
+    const coalescer = createSetCurrentClimbCoalescer({ sendArgs, sendDeferredQueueAdd });
+
+    const firstEnqueue = coalescer.enqueue({ item: makeItem('a'), shouldAddToQueue: true });
+    await Promise.resolve();
+    await coalescer.enqueue({ item: makeItem('b'), shouldAddToQueue: true });
+    await coalescer.enqueue({ item: makeItem('c'), shouldAddToQueue: true });
+    first.resolve();
+    await firstEnqueue;
+
+    expect(sendDeferredQueueAdd).toHaveBeenCalledTimes(1);
+    expect(sendDeferredQueueAdd.mock.calls[0][0].uuid).toBe('b');
   });
 });

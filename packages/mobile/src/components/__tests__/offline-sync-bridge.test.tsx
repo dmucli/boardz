@@ -1,21 +1,42 @@
+vi.mock('../../offline/offline-write-publisher', () => ({ startOfflineWriteDeliveryPublisher: () => () => {} }));
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, render, waitFor } from '@testing-library/react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, QueryObserver, onlineManager, type QueryKey } from '@tanstack/react-query';
+const useNotificationUpdatesMock = vi.hoisted(() => vi.fn());
+const bindDownloadOwnerMock = vi.hoisted(() => vi.fn());
+const resetDownloadLifecycleMock = vi.hoisted(() => vi.fn());
+vi.mock('../../offline/download-lifecycle', () => ({
+  setDownloadLifecycleOwner: bindDownloadOwnerMock,
+  resetDownloadLifecycle: resetDownloadLifecycleMock,
+  getDownloadRequests: () => [],
+  transitionDownload: vi.fn(),
+}));
+vi.mock('../../notifications/use-notification-updates', async () => {
+  const { useEffect } = await import('react');
+  return {
+    useNotificationUpdates: (authenticated: boolean, accountId: string | null) => {
+      useEffect(() => {
+        useNotificationUpdatesMock(authenticated, accountId);
+      }, [authenticated, accountId]);
+    },
+  };
+});
 const loadFollowedAuthorsMock = vi.hoisted(() =>
   vi.fn(async (_userId: string) => ({ setterUsernames: [], users: [] })),
 );
-vi.mock('../../lib/graphql/hooks/use-followed-authors', () => ({
+vi.mock('../../lib/graphql/hooks/use-followed-authors', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../lib/graphql/hooks/use-followed-authors')>()),
   useFollowedAuthors: () => ({}),
   loadFollowedAuthors: loadFollowedAuthorsMock,
-  AUTHOR_QUERY_KEYS: ['followedAuthors', 'setterStats'],
 }));
 
 // The analytics barrel reaches posthog-react-native; stub it so the module scan
-// never parses it. The two flag readers are what FeatureFlagsProvider itself
+// never parses it. The three flag readers are what FeatureFlagsProvider itself
 // imports from here.
 vi.mock('../../lib/analytics', () => ({
-  readPosthogFeatureFlags: () => ({}),
+  readPosthogFeatureFlagSnapshot: () => ({ flags: {}, payloads: {} }),
+  readPosthogFeatureFlagsRequestId: () => undefined,
   subscribePosthogFeatureFlags: () => () => {},
 }));
 
@@ -29,6 +50,19 @@ vi.mock('../../lib/analytics-offline-engine-state', () => ({
 // Native offline mode is baked on. The bridge still owns auth/schema lifecycle,
 // scheduler teardown, progress wiring, and notifications.
 
+// Nothing in the bridge's graph imports react-native today. The stub is here so a
+// foreground listener someone adds (the shape the removed catalogue pass had)
+// receives the test's 'active' event instead of failing to import.
+const appState = vi.hoisted(() => ({ listeners: new Set<(state: string) => void>() }));
+vi.mock('react-native', () => ({
+  AppState: {
+    currentState: 'active',
+    addEventListener: (_type: string, listener: (state: string) => void) => {
+      appState.listeners.add(listener);
+      return { remove: () => appState.listeners.delete(listener) };
+    },
+  },
+}));
 const startSyncSchedulerStop = vi.fn();
 const startSyncSchedulerMock = vi.fn(() => startSyncSchedulerStop);
 const notifyBootstrapMetadataChangedMock = vi.hoisted(() => vi.fn());
@@ -40,6 +74,12 @@ vi.mock('../../sync', () => ({
 }));
 
 const drainMutationQueueMock = vi.fn(async (..._args: unknown[]) => {});
+// The account in the stored token: what the owner claim reads (#6824), never the
+// cached `useStoredUserId` answer.
+type SignedInAccountStub = { status: 'signed-in'; userId: string } | { status: 'no-user-id' } | { status: 'unsettled' };
+const readSignedInAccountMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<SignedInAccountStub> => ({ status: 'signed-in', userId: 'user-1' })),
+);
 const startBackgroundTrackingStop = vi.fn();
 const startBackgroundTrackingMock = vi.fn(() => startBackgroundTrackingStop);
 // The scheduler + drain bindings live in the adapter (which statically imports
@@ -48,6 +88,7 @@ vi.mock('../../offline/offline-sync-adapter', () => ({
   startSyncScheduler: (...args: unknown[]) => startSyncSchedulerMock(...(args as [])),
   drainMutationQueue: (...args: unknown[]) => drainMutationQueueMock(...args),
   startBackgroundTracking: () => startBackgroundTrackingMock(),
+  readSignedInAccount: () => readSignedInAccountMock(),
 }));
 
 // A stable sentinel so tests can assert the bridge passes THIS reference
@@ -97,8 +138,10 @@ vi.mock('../../hooks/use-current-user-id', () => ({
   useStoredUserId: () => ({ userId: storedUserId, isLoading: false }),
 }));
 
+const reportHandledErrorMock = vi.hoisted(() => vi.fn());
 vi.mock('../../lib/error-reporting', () => ({
   reportError: vi.fn(),
+  reportHandledError: reportHandledErrorMock,
 }));
 
 // The gauge itself is unit-tested in offline/__tests__/outbox-telemetry.test.ts;
@@ -107,20 +150,46 @@ const recoverAndReportOutboxOnceMock = vi.hoisted(() => vi.fn(async (..._args: u
 vi.mock('../../offline/outbox-telemetry', () => ({
   recoverAndReportOutboxOnce: recoverAndReportOutboxOnceMock,
 }));
-
-// Stub the settings barrel so the static import graph never pulls
-// react-native-mmkv (its react-native Flow entry breaks Rolldown's scan).
-vi.mock('../../settings', () => ({
-  getSetting: vi.fn(() => []),
+// Another launch-time writer (it clears the markers it reports). Stubbed so the
+// launch-gate case can see when it runs.
+const sweepDelistedDownloadTerminalsMock = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => {}));
+// The owner-stamp wipe closes the previous account's download funnels without
+// an event (#6563). Its own behaviour is pinned against the real DDL in
+// abandoned-download-terminals.test.ts; here, only when the bridge reaches it.
+const forgetAbandonedDownloadsMock = vi.hoisted(() => vi.fn(async (..._args: unknown[]) => {}));
+vi.mock('../../offline/abandoned-download-terminals', () => ({
+  sweepDelistedDownloadTerminals: sweepDelistedDownloadTerminalsMock,
+  forgetAbandonedDownloads: forgetAbandonedDownloadsMock,
 }));
 
-const setupNotificationHandlersMock = vi.fn(() => vi.fn());
-vi.mock('../../notifications', () => ({
-  setupNotificationHandlers: (...args: unknown[]) => setupNotificationHandlersMock(...(args as [])),
+// Stub the settings barrel so the static import graph never pulls
+// react-native-mmkv (its react-native Flow entry breaks Rolldown's scan). The
+// two writers are the owner-stamp wipe's per-account reset (#6563).
+const setSettingMock = vi.hoisted(() => vi.fn());
+const clearOfflineBoardsMock = vi.hoisted(() => vi.fn());
+// The owned-wall pin record, cleared last so the pin can turn the signed-in
+// account's own walls back on after the reset.
+const clearOwnedSprayWallPinsMock = vi.hoisted(() => vi.fn());
+vi.mock('../../settings', () => ({
+  getSetting: vi.fn(() => []),
+  setSetting: setSettingMock,
+  clearOfflineBoards: clearOfflineBoardsMock,
+  clearOwnedSprayWallPins: clearOwnedSprayWallPinsMock,
+}));
+// "Last synced 5 minutes ago" is the third thing that reset forgets.
+const resetSyncStatusMock = vi.hoisted(() => vi.fn());
+vi.mock('../../sync/sync-status', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../sync/sync-status')>()),
+  resetSyncStatus: resetSyncStatusMock,
 }));
 
 vi.mock('../../lib/graphql/client', () => ({
   getOfflineSyncHttpClient: () => ({ request: vi.fn() }),
+  getHttpClient: () => ({ request: vi.fn() }),
+}));
+vi.mock('../../db', () => ({
+  getDatabaseHandle: () => null,
+  clearUserData: (...args: unknown[]) => clearUserDataMock(...args),
 }));
 
 const snapshotBaseUrlConfigured = vi.hoisted(() => ({ value: true }));
@@ -128,9 +197,35 @@ vi.mock('../../lib/env', () => ({
   isSnapshotBaseUrlConfigured: () => snapshotBaseUrlConfigured.value,
 }));
 
-const fakeDb = { tag: 'db' };
+// Records every SQLite call the bridge makes on its database, so a writer that
+// nobody stubbed is seen instead of throwing silently inside the bridge's own
+// try/catch (#6689).
+const sqliteCalls: string[] = [];
+const SQLITE_METHODS = new Set([
+  'withExclusiveTransactionAsync',
+  'runAsync',
+  'execAsync',
+  'getFirstAsync',
+  'getAllAsync',
+  'prepareAsync',
+]);
+const fakeDb: { tag: string } = new Proxy(
+  { tag: 'db' },
+  {
+    get(target, property, receiver) {
+      if (typeof property === 'string' && SQLITE_METHODS.has(property)) {
+        return async () => {
+          sqliteCalls.push(property);
+          return property === 'getAllAsync' ? [] : null;
+        };
+      }
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  },
+);
+let providedDatabase = fakeDb;
 vi.mock('expo-sqlite', () => ({
-  useSQLiteContext: () => fakeDb,
+  useSQLiteContext: () => providedDatabase,
 }));
 
 vi.mock('expo-router', () => ({
@@ -168,20 +263,41 @@ import { OfflineSyncBridge, OfflineEngineFlagSync } from '../offline-sync-bridge
 import { FeatureFlagsProvider, type FeatureFlags } from '../../providers/feature-flags-provider';
 import { isOfflineEngineEnabled, __resetOfflineEngineForTests } from '../../lib/offline-engine';
 import { setSchemaReady, __resetSchemaReadyForTests } from '../../db/schema-ready';
+import { invalidateCredentialSnapshots } from '../../lib/privacy/privacy-cache';
+import { LaunchReadyProvider } from '../../providers/launch-ready-context';
+import { resetLaunchReloadWindowForTests, setLaunchReloadRequested } from '../../lib/launch-reload-window';
+
+// What `useLaunchReady()` answers: auth, fonts and the launch update gate have all
+// resolved. Mutable so the launch-gate case can hold it false (#6689).
+let launchReady = true;
 
 function Harness({ flags, queryClient }: { flags: FeatureFlags; queryClient: QueryClient }) {
   return (
-    <QueryClientProvider client={queryClient}>
-      <FeatureFlagsProvider flags={flags}>
-        <OfflineEngineFlagSync />
-        <OfflineSyncBridge />
-      </FeatureFlagsProvider>
-    </QueryClientProvider>
+    <LaunchReadyProvider ready={launchReady}>
+      <QueryClientProvider client={queryClient}>
+        <FeatureFlagsProvider flags={flags}>
+          <OfflineEngineFlagSync />
+          <OfflineSyncBridge />
+        </FeatureFlagsProvider>
+      </QueryClientProvider>
+    </LaunchReadyProvider>
   );
 }
 
 function makeQueryClient() {
   return new QueryClient({ defaultOptions: { queries: { retry: false } } });
+}
+
+function observeCachedQuery(queryClient: QueryClient, queryKey: QueryKey) {
+  const fetch = vi.fn(async () => 'cached');
+  const observer = new QueryObserver(queryClient, {
+    queryKey,
+    queryFn: fetch,
+    initialData: 'cached',
+    staleTime: Infinity,
+  });
+  const unsubscribe = observer.subscribe(() => {});
+  return { fetch, unsubscribe, observer };
 }
 
 // Just the flag-sync component — no scheduler, no async drain — so the
@@ -229,11 +345,19 @@ beforeEach(() => {
   startSyncSchedulerMock.mockReturnValue(startSyncSchedulerStop);
   getPendingCountMock.mockResolvedValue(0);
   isAuthenticated = true;
+  launchReady = true;
+  sqliteCalls.length = 0;
+  resetLaunchReloadWindowForTests();
+  providedDatabase = fakeDb;
   storedUserId = 'user-1';
   assertLocalUserDataOwnerMock.mockClear();
   assertLocalUserDataOwnerMock.mockResolvedValue('ok');
   stampLocalUserIdMock.mockClear();
-  clearUserDataMock.mockClear();
+  readSignedInAccountMock.mockReset();
+  readSignedInAccountMock.mockResolvedValue({ status: 'signed-in', userId: 'user-1' });
+  clearUserDataMock.mockReset();
+  clearUserDataMock.mockResolvedValue(undefined);
+  reportHandledErrorMock.mockClear();
   clearStoredSprayPhotosMock.mockClear();
   beginGlobalPurgeMock.mockClear();
   snapshotBaseUrlConfigured.value = true;
@@ -251,6 +375,227 @@ afterEach(() => {
 // that survives a sign-out wipe that did not finish (a locked database — #4314 —
 // or a crash mid-sign-out). Without it, every user-scoped local read on the next
 // account reads the previous climber's data.
+// #6545. The owner-stamp wipe and the sign-out wipes are the only account
+// boundaries. Nothing the same signed-in account goes through may purge, wipe or
+// restart the downloads: not a token refresh (new token, same credential
+// generation), not signing in again (the generation moves), not a reconnect.
+describe('OfflineSyncBridge — the same account keeps its downloads', () => {
+  afterEach(() => {
+    onlineManager.setOnline(true);
+  });
+
+  async function renderSignedIn() {
+    const queryClient = makeQueryClient();
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledOnce());
+    // The owner effect's last step: everything it does for a matching stamp is done.
+    await waitFor(() => expect(loadFollowedAuthorsMock).toHaveBeenCalled());
+    return { view, queryClient };
+  }
+
+  function expectNoCull() {
+    expect(beginGlobalPurgeMock).not.toHaveBeenCalled();
+    expect(clearUserDataMock).not.toHaveBeenCalled();
+    // The same account keeps its offline selection, its board names and its
+    // sync status (#6563): only another account's data is reset.
+    expect(setSettingMock).not.toHaveBeenCalled();
+    expect(clearOfflineBoardsMock).not.toHaveBeenCalled();
+    expect(resetSyncStatusMock).not.toHaveBeenCalled();
+    expect(forgetAbandonedDownloadsMock).not.toHaveBeenCalled();
+    expect(clearOwnedSprayWallPinsMock).not.toHaveBeenCalled();
+    expect(clearStoredSprayPhotosMock).not.toHaveBeenCalled();
+    expect(stampLocalUserIdMock).not.toHaveBeenCalled();
+    expect(startSyncSchedulerStop).not.toHaveBeenCalled();
+    expect(startSyncSchedulerMock).toHaveBeenCalledOnce();
+  }
+
+  it('starts no purge on a token refresh', async () => {
+    const { view, queryClient } = await renderSignedIn();
+    // A refresh stores a new token under the same generation and the same
+    // account: the bridge sees the same inputs again.
+    view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await act(async () => {});
+    expectNoCull();
+  });
+
+  it('starts no purge when the same account signs in again', async () => {
+    await renderSignedIn();
+    // `storeTokens` → `advanceCredentialGeneration` moves the generation.
+    await act(async () => {
+      invalidateCredentialSnapshots();
+    });
+    expectNoCull();
+  });
+
+  it('starts no purge on a reconnect', async () => {
+    await renderSignedIn();
+    await act(async () => {
+      onlineManager.setOnline(false);
+    });
+    await act(async () => {
+      onlineManager.setOnline(true);
+    });
+    expectNoCull();
+  });
+
+  it('starts no purge when the app comes back to the foreground', async () => {
+    await renderSignedIn();
+    for (const state of ['background', 'active']) {
+      await act(async () => {
+        for (const listener of appState.listeners) listener(state);
+      });
+    }
+    expectNoCull();
+  });
+
+  // A dead-handle recovery (#5410) publishes a new connection. The scheduler
+  // moves to it; nothing is purged, wiped or re-stamped.
+  it('starts no purge when a new database handle is published', async () => {
+    const { view, queryClient } = await renderSignedIn();
+    const republished = { tag: 'db-republished' };
+    providedDatabase = republished;
+    view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(assertLocalUserDataOwnerMock).toHaveBeenLastCalledWith(republished, 'user-1'));
+    await waitFor(() => expect(loadFollowedAuthorsMock).toHaveBeenCalledTimes(2));
+    expect((startSyncSchedulerMock.mock.calls[1] as unknown[])[0]).toBe(republished);
+    expect(beginGlobalPurgeMock).not.toHaveBeenCalled();
+    expect(clearUserDataMock).not.toHaveBeenCalled();
+    expect(clearStoredSprayPhotosMock).not.toHaveBeenCalled();
+    expect(stampLocalUserIdMock).not.toHaveBeenCalled();
+  });
+});
+
+// #6824. The outbox records no owner, and the server files a replayed write under
+// the token that sends it. Everything that drains or reports the outbox waits
+// for the owner claim: `ok`, or the wipe and the new stamp done.
+describe('OfflineSyncBridge — nothing drains before the owner claim', () => {
+  it('starts the scheduler, the sweep and the outbox recovery only after the wipe and the new stamp', async () => {
+    let settleOwnership: (ownership: string) => void = () => {};
+    assertLocalUserDataOwnerMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          settleOwnership = resolve;
+        }),
+    );
+    render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
+    await waitFor(() => expect(assertLocalUserDataOwnerMock).toHaveBeenCalled());
+    await act(async () => {});
+    expect(startSyncSchedulerMock).not.toHaveBeenCalled();
+    expect(sweepDelistedDownloadTerminalsMock).not.toHaveBeenCalled();
+    expect(recoverAndReportOutboxOnceMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      settleOwnership('mismatch');
+    });
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledOnce());
+    await waitFor(() => expect(sweepDelistedDownloadTerminalsMock).toHaveBeenCalledOnce());
+    await waitFor(() => expect(recoverAndReportOutboxOnceMock).toHaveBeenCalledOnce());
+    const stampedAt = stampLocalUserIdMock.mock.invocationCallOrder[0];
+    const ledgerBoundAt = bindDownloadOwnerMock.mock.invocationCallOrder.at(-1);
+    expect(ledgerBoundAt).toBeGreaterThan(stampedAt);
+    expect(startSyncSchedulerMock.mock.invocationCallOrder[0]).toBeGreaterThan(ledgerBoundAt ?? 0);
+    expect(resetDownloadLifecycleMock.mock.invocationCallOrder[0]).toBeLessThan(ledgerBoundAt ?? 0);
+    expect(clearUserDataMock.mock.invocationCallOrder[0]).toBeLessThan(stampedAt);
+    expect(startSyncSchedulerMock.mock.invocationCallOrder[0]).toBeGreaterThan(stampedAt);
+    expect(sweepDelistedDownloadTerminalsMock.mock.invocationCallOrder[0]).toBeGreaterThan(stampedAt);
+    expect(recoverAndReportOutboxOnceMock.mock.invocationCallOrder[0]).toBeGreaterThan(stampedAt);
+  });
+
+  it('holds all three for the session when the wipe fails, and reports it once', async () => {
+    assertLocalUserDataOwnerMock.mockResolvedValue('mismatch');
+    clearUserDataMock.mockRejectedValue(new Error('database is locked'));
+    const queryClient = makeQueryClient();
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await waitFor(() => expect(reportHandledErrorMock).toHaveBeenCalledOnce());
+    // A re-render, or a foreground, does not retry it: the previous account's
+    // rows are still on disk. A second attempt would fail the same way anyway.
+    view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await act(async () => {
+      for (const listener of appState.listeners) listener('active');
+    });
+    await act(async () => {});
+    expect(clearUserDataMock).toHaveBeenCalledOnce();
+
+    expect(stampLocalUserIdMock).not.toHaveBeenCalled();
+    expect(startSyncSchedulerMock).not.toHaveBeenCalled();
+    expect(sweepDelistedDownloadTerminalsMock).not.toHaveBeenCalled();
+    expect(recoverAndReportOutboxOnceMock).not.toHaveBeenCalled();
+    expect(reportHandledErrorMock).toHaveBeenCalledOnce();
+    expect(reportHandledErrorMock.mock.calls[0][1]).toEqual({
+      level: 'warning',
+      tags: { source: 'offline-sync', op: 'owner-claim-hold', reason: 'wipe-failed' },
+    });
+  });
+
+  it('holds all three when the token names nobody', async () => {
+    readSignedInAccountMock.mockResolvedValue({ status: 'no-user-id' });
+    render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
+    await waitFor(() => expect(reportHandledErrorMock).toHaveBeenCalledOnce());
+    await act(async () => {});
+
+    expect(assertLocalUserDataOwnerMock).not.toHaveBeenCalled();
+    expect(startSyncSchedulerMock).not.toHaveBeenCalled();
+    expect(sweepDelistedDownloadTerminalsMock).not.toHaveBeenCalled();
+    expect(recoverAndReportOutboxOnceMock).not.toHaveBeenCalled();
+    expect(reportHandledErrorMock.mock.calls[0][1]).toEqual({
+      level: 'warning',
+      tags: { source: 'offline-sync', op: 'owner-claim-hold', reason: 'no-user-id' },
+    });
+  });
+
+  it('runs a claim that failed without deciding anything again on the next foreground', async () => {
+    assertLocalUserDataOwnerMock.mockRejectedValueOnce(new Error('disk I/O error'));
+    render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
+    await waitFor(() => expect(assertLocalUserDataOwnerMock).toHaveBeenCalledOnce());
+    await act(async () => {});
+    expect(startSyncSchedulerMock).not.toHaveBeenCalled();
+    expect(reportHandledErrorMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      for (const listener of appState.listeners) listener('active');
+    });
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledOnce());
+    expect(assertLocalUserDataOwnerMock).toHaveBeenCalledTimes(2);
+    expect(reportHandledErrorMock).not.toHaveBeenCalled();
+  });
+
+  it('runs it again when the connection comes back, too', async () => {
+    readSignedInAccountMock.mockResolvedValueOnce({ status: 'unsettled' });
+    render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
+    await waitFor(() => expect(readSignedInAccountMock).toHaveBeenCalledOnce());
+    await act(async () => {});
+    expect(startSyncSchedulerMock).not.toHaveBeenCalled();
+
+    await act(async () => {
+      onlineManager.setOnline(false);
+    });
+    await act(async () => {
+      onlineManager.setOnline(true);
+    });
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledOnce());
+  });
+
+  it('starts over after a sign-out: the next sign-in waits for its own claim', async () => {
+    const queryClient = makeQueryClient();
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledOnce());
+
+    isAuthenticated = false;
+    view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await waitFor(() => expect(startSyncSchedulerStop).toHaveBeenCalledOnce());
+
+    // The same account and connection sign in again, and this time the check
+    // has not answered yet.
+    assertLocalUserDataOwnerMock.mockImplementation(() => new Promise(() => {}));
+    isAuthenticated = true;
+    view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await waitFor(() => expect(assertLocalUserDataOwnerMock).toHaveBeenCalledTimes(2));
+    await act(async () => {});
+    expect(startSyncSchedulerMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe('OfflineSyncBridge — local user-data owner stamp', () => {
   it('claims a never-stamped device for the signed-in climber', async () => {
     assertLocalUserDataOwnerMock.mockResolvedValue('unstamped');
@@ -275,6 +620,54 @@ describe('OfflineSyncBridge — local user-data owner stamp', () => {
     expect(beginGlobalPurgeMock.mock.invocationCallOrder[0]).toBeLessThan(
       clearUserDataMock.mock.invocationCallOrder[0],
     );
+  });
+
+  // #6563. No sign-out ran for the previous account (its session expired while
+  // the app was closed, or the keychain read failed), so this recovery is the
+  // only place its offline selection, board names and sync status can be reset.
+  it("resets the previous account's downloaded boards, board names and sync status on that recovery", async () => {
+    assertLocalUserDataOwnerMock.mockResolvedValue('mismatch');
+    render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
+    await waitFor(() => expect(stampLocalUserIdMock).toHaveBeenCalledTimes(1));
+
+    expect(setSettingMock).toHaveBeenCalledTimes(1);
+    expect(setSettingMock).toHaveBeenCalledWith('syncEnabledBoards', []);
+    expect(clearOfflineBoardsMock).toHaveBeenCalledTimes(1);
+    expect(resetSyncStatusMock).toHaveBeenCalledTimes(1);
+    // Its unfinished downloads are closed silently, BEFORE the list empties, so
+    // the launch sweep cannot report them on this account.
+    expect(forgetAbandonedDownloadsMock).toHaveBeenCalledTimes(1);
+    expect(forgetAbandonedDownloadsMock.mock.invocationCallOrder[0]).toBeLessThan(
+      setSettingMock.mock.invocationCallOrder[0],
+    );
+    // After the purge epoch, and before the row wipe's await, so a sync cycle
+    // starting during the wipe reads an empty list.
+    expect(beginGlobalPurgeMock.mock.invocationCallOrder[0]).toBeLessThan(
+      forgetAbandonedDownloadsMock.mock.invocationCallOrder[0],
+    );
+    expect(setSettingMock.mock.invocationCallOrder[0]).toBeLessThan(clearUserDataMock.mock.invocationCallOrder[0]);
+    // The pin record goes last, after the rows, so the pin re-runs on a list the
+    // wipe has finished with.
+    expect(clearOwnedSprayWallPinsMock).toHaveBeenCalledTimes(1);
+    expect(clearUserDataMock.mock.invocationCallOrder[0]).toBeLessThan(
+      clearOwnedSprayWallPinsMock.mock.invocationCallOrder[0],
+    );
+    // Then the device is claimed for the signed-in climber.
+    expect(clearOwnedSprayWallPinsMock.mock.invocationCallOrder[0]).toBeLessThan(
+      stampLocalUserIdMock.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('resets no offline settings when it claims a never-stamped device', async () => {
+    assertLocalUserDataOwnerMock.mockResolvedValue('unstamped');
+    render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
+    await waitFor(() => expect(stampLocalUserIdMock).toHaveBeenCalledTimes(1));
+
+    expect(setSettingMock).not.toHaveBeenCalled();
+    expect(clearOfflineBoardsMock).not.toHaveBeenCalled();
+    expect(resetSyncStatusMock).not.toHaveBeenCalled();
+    expect(forgetAbandonedDownloadsMock).not.toHaveBeenCalled();
+    expect(clearOwnedSprayWallPinsMock).not.toHaveBeenCalled();
   });
 
   it('deletes the stored wall photographs on that same recovery', async () => {
@@ -304,7 +697,7 @@ describe('OfflineSyncBridge — local user-data owner stamp', () => {
     isAuthenticated = false;
     storedUserId = undefined;
     render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
-    await waitFor(() => expect(setupNotificationHandlersMock).toHaveBeenCalled());
+    await waitFor(() => expect(useNotificationUpdatesMock).toHaveBeenCalled());
     expect(assertLocalUserDataOwnerMock).not.toHaveBeenCalled();
     expect(stampLocalUserIdMock).not.toHaveBeenCalled();
   });
@@ -326,7 +719,7 @@ describe('OfflineSyncBridge — baked-on native engine', () => {
 
   it('sets up notification handlers', async () => {
     render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
-    await waitFor(() => expect(setupNotificationHandlersMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(useNotificationUpdatesMock).toHaveBeenCalledTimes(1));
   });
 
   it('stops the scheduler on unmount', async () => {
@@ -379,13 +772,66 @@ describe('OfflineSyncBridge — baked-on native engine', () => {
   });
 });
 
+// #6689. Until the launch update gate resolves it may reload this runtime, and
+// on Android a reload does not close the old runtime's SQLite connections. A
+// write transaction open at that moment keeps the write lock until the process
+// dies, so every tick and sync write after it fails for the whole session. No
+// writer may start before the launch has settled.
+describe('OfflineSyncBridge — waits for the launch to settle', () => {
+  it('starts no SQLite writer while a launch reload is still possible, then starts each once', async () => {
+    launchReady = false;
+    const queryClient = makeQueryClient();
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await act(async () => {});
+
+    expect(startSyncSchedulerMock).not.toHaveBeenCalled();
+    expect(recoverAndReportOutboxOnceMock).not.toHaveBeenCalled();
+    expect(sweepDelistedDownloadTerminalsMock).not.toHaveBeenCalled();
+    expect(assertLocalUserDataOwnerMock).not.toHaveBeenCalled();
+    expect(loadFollowedAuthorsMock).not.toHaveBeenCalled();
+    expect(sqliteCalls).toEqual([]);
+    // Not a writer: the backgrounding guard still starts at once.
+    expect(startBackgroundTrackingMock).toHaveBeenCalledOnce();
+
+    launchReady = true;
+    view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledOnce());
+    await waitFor(() => expect(loadFollowedAuthorsMock).toHaveBeenCalledOnce());
+    expect(recoverAndReportOutboxOnceMock).toHaveBeenCalledOnce();
+    expect(sweepDelistedDownloadTerminalsMock).toHaveBeenCalledOnce();
+    expect(assertLocalUserDataOwnerMock).toHaveBeenCalledOnce();
+  });
+
+  // The gate gives a reload 5 s, then opens the app with it still outstanding; on
+  // Android it can land later. Writers wait out the gate's extra margin too.
+  it('keeps every writer waiting while a launch reload is still outstanding', async () => {
+    setLaunchReloadRequested(true);
+    const queryClient = makeQueryClient();
+    render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await act(async () => {});
+
+    expect(startSyncSchedulerMock).not.toHaveBeenCalled();
+    expect(recoverAndReportOutboxOnceMock).not.toHaveBeenCalled();
+    expect(sweepDelistedDownloadTerminalsMock).not.toHaveBeenCalled();
+    expect(assertLocalUserDataOwnerMock).not.toHaveBeenCalled();
+    expect(sqliteCalls).toEqual([]);
+
+    await act(async () => {
+      setLaunchReloadRequested(false);
+    });
+    await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledOnce());
+    expect(recoverAndReportOutboxOnceMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe('OfflineSyncBridge — auth gating', () => {
   it('signed out: no scheduler, no leftover drain, no sync traffic at all', async () => {
     isAuthenticated = false;
     render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
     // Notifications and background tracking still set up — they are
     // auth-independent effects.
-    await waitFor(() => expect(setupNotificationHandlersMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(useNotificationUpdatesMock).toHaveBeenCalledTimes(1));
     expect(startBackgroundTrackingMock).toHaveBeenCalledTimes(1);
     expect(startSyncSchedulerMock).not.toHaveBeenCalled();
     expect(getPendingCountMock).not.toHaveBeenCalled();
@@ -399,7 +845,7 @@ describe('OfflineSyncBridge — legacy flag changes', () => {
     const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
     const { rerender } = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
     await waitFor(() => expect(startSyncSchedulerMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['setterStats'] }));
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalled());
     invalidateSpy.mockClear();
 
     rerender(<Harness flags={FLAG_OFF} queryClient={queryClient} />);
@@ -443,7 +889,7 @@ describe('OfflineSyncBridge — outbox backlog gauge', () => {
     // all rather than the backlog it could not read.
     setSchemaReady(false);
     render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
-    await waitFor(() => expect(setupNotificationHandlersMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(useNotificationUpdatesMock).toHaveBeenCalledTimes(1));
     expect(recoverAndReportOutboxOnceMock).not.toHaveBeenCalled();
 
     act(() => setSchemaReady(true));
@@ -457,6 +903,243 @@ describe('OfflineSyncBridge — outbox backlog gauge', () => {
 // migrations never ran — no board_climb_grades, no characteristics column. Both
 // the sync effect writes, so it has to wait.
 describe('OfflineSyncBridge — schema readiness gating', () => {
+  it('retries only Following catalogue reads after the owner warm-up', async () => {
+    const queryClient = makeQueryClient();
+    const catalogueRoots = ['searchClimbs', 'infiniteSearchClimbs', 'searchClimbsCount', 'setterStats'];
+    const ordinaryQueries = catalogueRoots.flatMap((root) => [
+      observeCachedQuery(queryClient, [root, { boardName: 'kilter', layoutId: 1 }]),
+      observeCachedQuery(queryClient, [root, { boardName: 'kilter', layoutId: 1, onlyFollowedAuthors: false }]),
+    ]);
+    const followingQueries = catalogueRoots.map((root) =>
+      observeCachedQuery(queryClient, [
+        root,
+        { boardName: 'kilter', layoutId: 1, onlyFollowedAuthors: true },
+        'user-1',
+      ]),
+    );
+    const feedQueries = ['crewFeed', 'followingClimbLogs', 'climbLogs', 'climbLogsPreview'].map((root) =>
+      observeCachedQuery(queryClient, [root, 'user-1']),
+    );
+    const observedQueries = [...ordinaryQueries, ...followingQueries, ...feedQueries];
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    try {
+      await waitFor(() => {
+        for (const query of followingQueries) expect(query.fetch).toHaveBeenCalledTimes(1);
+      });
+      for (const query of [...ordinaryQueries, ...feedQueries]) {
+        expect(query.fetch).not.toHaveBeenCalled();
+        expect(query.observer.getCurrentResult().isStale).toBe(false);
+      }
+    } finally {
+      view.unmount();
+      for (const query of observedQueries) query.unsubscribe();
+      queryClient.clear();
+    }
+  });
+
+  it('reopens a gated Following read when unchanged authors become locally ready', async () => {
+    setSchemaReady(false);
+    assertLocalUserDataOwnerMock.mockResolvedValue('missing');
+    const queryClient = makeQueryClient();
+    const cachedAuthors = { setterUsernames: [], users: [] };
+    queryClient.setQueryData(['followedAuthors', 'user-1'], cachedAuthors);
+    let localAuthorsReady = false;
+    loadFollowedAuthorsMock.mockImplementationOnce(async () => {
+      localAuthorsReady = true;
+      return { setterUsernames: [], users: [] };
+    });
+    const followingFetch = vi.fn(async () => {
+      if (!localAuthorsReady) throw new Error('Followed authors need an online sync');
+      return 'following-climbs';
+    });
+    const followingObserver = new QueryObserver(queryClient, {
+      queryKey: ['infiniteSearchClimbs', { onlyFollowedAuthors: true }, 'user-1'],
+      queryFn: followingFetch,
+      staleTime: Infinity,
+    });
+    const unsubscribe = followingObserver.subscribe(() => {});
+    const ordinaryQuery = observeCachedQuery(queryClient, ['infiniteSearchClimbs', { boardName: 'kilter' }]);
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    try {
+      await waitFor(() => expect(followingObserver.getCurrentResult().isError).toBe(true));
+      expect(loadFollowedAuthorsMock).not.toHaveBeenCalled();
+      act(() => setSchemaReady(true));
+      await waitFor(() => expect(followingObserver.getCurrentResult().data).toBe('following-climbs'));
+      expect(stampLocalUserIdMock).toHaveBeenCalledTimes(1);
+      expect(followingFetch).toHaveBeenCalledTimes(3);
+      expect(queryClient.getQueryData(['followedAuthors', 'user-1'])).toBe(cachedAuthors);
+      expect(ordinaryQuery.fetch).toHaveBeenCalledOnce();
+    } finally {
+      view.unmount();
+      unsubscribe();
+      ordinaryQuery.unsubscribe();
+      queryClient.clear();
+    }
+  });
+
+  it('restores empty ordinary offline results after late schema readiness even if authors fail', async () => {
+    setSchemaReady(false);
+    let localCatalogueReady = false;
+    loadFollowedAuthorsMock.mockRejectedValueOnce(new Error('Offline author request failed'));
+    const queryClient = makeQueryClient();
+    const roots = ['searchClimbs', 'infiniteSearchClimbs', 'searchClimbsCount', 'setterStats'];
+    const ordinaryQueries = roots.map((root) => {
+      const fetch = vi.fn(async () => (localCatalogueReady ? ['downloaded-climb'] : []));
+      const observer = new QueryObserver(queryClient, {
+        queryKey: [root, { boardName: 'kilter' }],
+        queryFn: fetch,
+        staleTime: Infinity,
+      });
+      return { fetch, observer, unsubscribe: observer.subscribe(() => {}) };
+    });
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    try {
+      await waitFor(() => {
+        for (const query of ordinaryQueries) expect(query.observer.getCurrentResult().data).toEqual([]);
+      });
+      act(() => {
+        localCatalogueReady = true;
+        setSchemaReady(true);
+      });
+      await waitFor(() => {
+        for (const query of ordinaryQueries) {
+          expect(query.observer.getCurrentResult().data).toEqual(['downloaded-climb']);
+          expect(query.fetch).toHaveBeenCalledTimes(2);
+        }
+      });
+      expect(loadFollowedAuthorsMock).toHaveBeenCalledOnce();
+      expect(stampLocalUserIdMock).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      for (const query of ordinaryQueries) query.unsubscribe();
+      queryClient.clear();
+    }
+  });
+
+  it('restores personal-filter results after stamping before an author request fails', async () => {
+    assertLocalUserDataOwnerMock.mockResolvedValue('unstamped');
+    let stampedOwner = false;
+    stampLocalUserIdMock.mockImplementationOnce(async () => {
+      stampedOwner = true;
+    });
+    loadFollowedAuthorsMock.mockRejectedValueOnce(new Error('Offline author request failed'));
+    const queryClient = makeQueryClient();
+    const fetch = vi.fn(async () => (stampedOwner ? ['my-attempted-climb'] : []));
+    const observer = new QueryObserver(queryClient, {
+      queryKey: ['infiniteSearchClimbs', { boardName: 'kilter', showOnlyAttempted: true }],
+      queryFn: fetch,
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    await waitFor(() => expect(observer.getCurrentResult().data).toEqual([]));
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    try {
+      await waitFor(() => expect(observer.getCurrentResult().data).toEqual(['my-attempted-climb']));
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(loadFollowedAuthorsMock).toHaveBeenCalledOnce();
+    } finally {
+      view.unmount();
+      unsubscribe();
+      queryClient.clear();
+    }
+  });
+
+  it('retries ordinary reads after the database handle is replaced', async () => {
+    const queryClient = makeQueryClient();
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    await waitFor(() => expect(loadFollowedAuthorsMock).toHaveBeenCalledOnce());
+    const fetch = vi.fn(async () => (providedDatabase === fakeDb ? [] : ['recovered-climb']));
+    const observer = new QueryObserver(queryClient, {
+      queryKey: ['searchClimbs', { boardName: 'kilter' }],
+      queryFn: fetch,
+      staleTime: Infinity,
+      initialData: [],
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    try {
+      providedDatabase = { tag: 'replacement' };
+      view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+      await waitFor(() => expect(observer.getCurrentResult().data).toEqual(['recovered-climb']));
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(stampLocalUserIdMock).not.toHaveBeenCalled();
+    } finally {
+      view.unmount();
+      unsubscribe();
+      queryClient.clear();
+    }
+  });
+
+  it('rejects a late initial result captured before stamping', async () => {
+    assertLocalUserDataOwnerMock.mockResolvedValue('unstamped');
+    let stampedOwner = false;
+    let finishOldRead!: (climbs: string[]) => void;
+    stampLocalUserIdMock.mockImplementationOnce(async () => {
+      stampedOwner = true;
+    });
+    const queryClient = makeQueryClient();
+    const fetch = vi.fn(async () => {
+      if (stampedOwner) return ['my-attempted-climb'];
+      return new Promise<string[]>((resolve) => {
+        finishOldRead = resolve;
+      });
+    });
+    const observer = new QueryObserver(queryClient, {
+      queryKey: ['searchClimbs', { boardName: 'kilter', showOnlyAttempted: true }],
+      queryFn: fetch,
+      staleTime: Infinity,
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    try {
+      await waitFor(() => expect(observer.getCurrentResult().data).toEqual(['my-attempted-climb']));
+      await act(async () => finishOldRead([]));
+      expect(observer.getCurrentResult().data).toEqual(['my-attempted-climb']);
+      expect(fetch).toHaveBeenCalledTimes(2);
+    } finally {
+      view.unmount();
+      unsubscribe();
+      queryClient.clear();
+    }
+  });
+
+  it('retains an owner recovery retry across a canceled preparation', async () => {
+    assertLocalUserDataOwnerMock.mockResolvedValueOnce('unstamped');
+    let finishStamp!: () => void;
+    let stampedOwner = false;
+    stampLocalUserIdMock.mockImplementationOnce(() => {
+      stampedOwner = true;
+      return new Promise<void>((resolve) => {
+        finishStamp = resolve;
+      });
+    });
+    const queryClient = makeQueryClient();
+    const fetch = vi.fn(async () => (stampedOwner ? ['my-attempted-climb'] : []));
+    const observer = new QueryObserver(queryClient, {
+      queryKey: ['searchClimbs', { boardName: 'kilter', showOnlyAttempted: true }],
+      queryFn: fetch,
+      staleTime: Infinity,
+      initialData: [],
+    });
+    const unsubscribe = observer.subscribe(() => {});
+    const view = render(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+    try {
+      await waitFor(() => expect(stampLocalUserIdMock).toHaveBeenCalledOnce());
+      isAuthenticated = false;
+      view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+      await act(async () => finishStamp());
+      expect(fetch).not.toHaveBeenCalled();
+      isAuthenticated = true;
+      view.rerender(<Harness flags={FLAG_ON} queryClient={queryClient} />);
+      await waitFor(() => expect(observer.getCurrentResult().data).toEqual(['my-attempted-climb']));
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(stampLocalUserIdMock).toHaveBeenCalledOnce();
+    } finally {
+      view.unmount();
+      unsubscribe();
+      queryClient.clear();
+    }
+  });
+
   it('warms authors after schema readiness and owner stamping despite a fresh cached query', async () => {
     setSchemaReady(false);
     assertLocalUserDataOwnerMock.mockResolvedValue('missing');
@@ -485,14 +1168,14 @@ describe('OfflineSyncBridge — schema readiness gating', () => {
 
     // Notifications are readiness-independent, so waiting on them proves the effects
     // have flushed rather than merely not run yet.
-    await waitFor(() => expect(setupNotificationHandlersMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(useNotificationUpdatesMock).toHaveBeenCalledTimes(1));
     expect(startSyncSchedulerMock).not.toHaveBeenCalled();
   });
 
   it('starts the scheduler exactly once when readiness lands late', async () => {
     setSchemaReady(false);
     render(<Harness flags={FLAG_ON} queryClient={makeQueryClient()} />);
-    await waitFor(() => expect(setupNotificationHandlersMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(useNotificationUpdatesMock).toHaveBeenCalledTimes(1));
 
     // A retry won seconds after launch.
     act(() => setSchemaReady(true));

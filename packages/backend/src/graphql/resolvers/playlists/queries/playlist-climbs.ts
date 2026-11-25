@@ -1,14 +1,33 @@
-import { eq, and, asc, sql } from 'drizzle-orm';
-import { type ConnectionContext, type Climb, type BoardName, SUPPORTED_BOARDS } from '@boardsesh/shared-schema';
-import { isSizeScopedBoard, parseSetIds } from '@boardsesh/board-config';
+import { eq, and, asc, desc, sql, type SQL } from 'drizzle-orm';
+import {
+  type ConnectionContext,
+  type BoardName,
+  type PlaylistClimbViewInput,
+  SUPPORTED_BOARDS,
+} from '@boardsesh/shared-schema';
+import { parseSetIds } from '@boardsesh/board-config';
 import { db } from '../../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
-import { sprayClimbVisibilityCondition } from '@boardsesh/db/queries';
-import { validateInput } from '../../shared/helpers';
+import {
+  climbDraftVisibilityCondition,
+  playlistBoardScopeConditions,
+  sprayClimbVisibilityCondition,
+} from '@boardsesh/db/queries';
+import { applyRateLimit, validateInput } from '../../shared/helpers';
 import { GetPlaylistClimbsInputSchema } from '../../../../validation/schemas';
 import { UNIFIED_TABLES, isValidBoardName } from '../../../../db/queries/util/table-select';
 import { verifyPlaylistAccess } from '../helpers/enrichment';
 import { hydrateClimbsByRefs, type HydrateClimbsOptions } from '../helpers/hydrate-climbs';
+import {
+  activeBoardFromFields,
+  allBoardsHydrateOptions,
+  fetchPlaylistView,
+  paginateResults,
+  type PlaylistPage,
+  type PlaylistRefRow,
+  type PlaylistViewOrder,
+  type PlaylistViewSource,
+} from '../helpers/playlist-view';
 
 export type PlaylistClimbsInput = {
   playlistId: string;
@@ -21,14 +40,32 @@ export type PlaylistClimbsInput = {
   // angle instead of the added-at / most-ascents fallback.
   activeBoardName?: string;
   activeAngle?: number;
+  // All-boards mode only: the rest of the active board, for the view's
+  // active-board filters (progress, liked, tall, holds, board fit…).
+  activeLayoutId?: number;
+  activeSizeId?: number;
+  activeSetIds?: string;
+  // Sort and filters. Omitted means the playlist's own order, unfiltered, and
+  // exactly the queries this resolver ran before views existed.
+  view?: PlaylistClimbViewInput;
   page?: number;
   pageSize?: number;
 };
 
-function paginateResults<T>(results: T[], pageSize: number) {
-  const hasMore = results.length > pageSize;
-  return { items: hasMore ? results.slice(0, pageSize) : results, hasMore };
-}
+/** The board-scoping fields of the input, the only part the scope builders read. */
+type PlaylistBoardInput = Pick<
+  PlaylistClimbsInput,
+  | 'boardName'
+  | 'layoutId'
+  | 'sizeId'
+  | 'setIds'
+  | 'angle'
+  | 'activeBoardName'
+  | 'activeAngle'
+  | 'activeLayoutId'
+  | 'activeSizeId'
+  | 'activeSetIds'
+>;
 
 /**
  * Build the climb join conditions for specific-board mode (board type, layout,
@@ -38,11 +75,18 @@ function paginateResults<T>(results: T[], pageSize: number) {
 function buildSpecificBoardClimbJoinConditions(
   tables: typeof UNIFIED_TABLES,
   boardName: BoardName,
-  input: PlaylistClimbsInput,
+  input: PlaylistBoardInput,
   viewerUserId: string | null | undefined,
 ) {
   const climbJoinConditions = [
     eq(tables.climbs.uuid, dbSchema.playlistClimbs.climbUuid),
+    // The draft rule: a playlist anyone can open must not substitute its own
+    // visibility for a draft's, which is its owner's alone. A published climb
+    // shows whoever set it, unlisted included.
+    climbDraftVisibilityCondition(
+      { boardType: tables.climbs.boardType, userId: tables.climbs.userId, isDraft: tables.climbs.isDraft },
+      viewerUserId,
+    ),
     eq(tables.climbs.boardType, boardName),
     // A PUBLIC playlist would otherwise substitute its own visibility for the wall's:
     // add a private spray wall's climb to one and anybody who can open the playlist
@@ -53,49 +97,70 @@ function buildSpecificBoardClimbJoinConditions(
     ),
   ];
 
-  if (input.layoutId != null) {
-    climbJoinConditions.push(eq(tables.climbs.layoutId, input.layoutId));
-  }
-
-  // Size-scope the join only for boards that actually have size variants.
-  // MoonBoard has one fixed product size, so its climbs carry NULL
-  // `compatible_size_ids` — and `sizeId = ANY(NULL)` is NULL, never true, which
-  // silently dropped every MoonBoard row from this join (#3891). `isSizeScopedBoard`
-  // is the one guard for that; the sibling call sites are the main climb search
-  // (`create-climb-filters.ts`) and the sync pull (`sync/queries.ts`). Array
-  // containment (`@>`) rather than `= ANY` so the existing
-  // board_climbs_compatible_size_ids_idx GIN index applies, matching those callers.
-  if (input.sizeId != null && isSizeScopedBoard(boardName)) {
-    climbJoinConditions.push(sql`${tables.climbs.compatibleSizeIds} @> ARRAY[${input.sizeId}]::int[]`);
-  }
-
-  // Hold-set scoping, the same `required_set_ids <@ selected sets` containment the
-  // main climb search applies (`create-climb-filters.ts`). Dropping the broken size
-  // predicate for MoonBoard is what finally let MoonBoard rows through this join, and
-  // MoonBoard is exactly the board whose optional wooden / screw-on add-on sets are
-  // encoded in `required_set_ids` — without this, a wall built without those sets
-  // hands the play drawer climbs it cannot light in full.
-  //
-  // NULL is tolerated on every board here, where search only tolerates it for
-  // MoonBoard and drafts: `required_set_ids` is denormalised and backfilled
-  // asynchronously, and a playlist is a list the climber curated by hand. Missing
-  // provenance should not make one of their own climbs disappear — only a climb we
-  // positively know needs an uninstalled set is dropped. The blast radius of the
-  // more permissive choice is small: in prod (2026-07-31) 1,223 of 408,035 Kilter
-  // climbs (0.30%) and 776 of 153,370 Tension climbs (0.51%) still have a NULL
-  // `required_set_ids`, so at most half a percent of Aurora playlist rows keep the
-  // pre-#3891 behaviour, versus every one of them disappearing on a backfill lag.
-  const selectedSetIds = input.setIds == null ? [] : parseSetIds(input.setIds);
-  if (selectedSetIds.length > 0) {
-    climbJoinConditions.push(
-      sql`(${tables.climbs.requiredSetIds} IS NULL OR ${tables.climbs.requiredSetIds} <@ ARRAY[${sql.join(
-        selectedSetIds.map((setId) => sql`${setId}`),
-        sql`, `,
-      )}]::int[])`,
-    );
-  }
+  // Layout, size and hold-set scope — `playlistBoardScopeConditions` explains
+  // the MoonBoard size guard (#3891) and why a NULL `required_set_ids` passes
+  // here. Shared with the view's "fits the active board" gate, so the two
+  // cannot disagree about what fits.
+  climbJoinConditions.push(
+    ...playlistBoardScopeConditions({
+      boardName,
+      layoutId: input.layoutId,
+      sizeId: input.sizeId,
+      setIds: input.setIds == null ? [] : parseSetIds(input.setIds),
+    }),
+  );
 
   return climbJoinConditions;
+}
+
+function requireBoardName(boardName: string | undefined): BoardName {
+  if (boardName == null || !isValidBoardName(boardName)) {
+    throw new Error(`Invalid board name: ${String(boardName)}. Must be one of: ${SUPPORTED_BOARDS.join(', ')}`);
+  }
+  return boardName;
+}
+
+/**
+ * Specific-board hydration: the caller's angle is the wall the user is standing
+ * at, so it applies to every row and is reported back verbatim. Without one,
+ * fall back per row to the climb's added-at angle, mirroring the all-boards path.
+ */
+function specificBoardHydrateOptions(
+  input: PlaylistBoardInput,
+  boardName: BoardName,
+  items: ReadonlyArray<Pick<PlaylistRefRow, 'climbUuid' | 'playlistAngle'>>,
+): HydrateClimbsOptions {
+  if (input.angle != null) return { wallAngle: input.angle };
+  const angleOverrides = new Map<string, number | null>();
+  for (const row of items) {
+    angleOverrides.set(`${boardName}:${row.climbUuid}`, row.playlistAngle ?? null);
+  }
+  return { angleOverrides };
+}
+
+/**
+ * All-boards visibility, applied BEFORE offset/limit and on the COUNT too. The
+ * hydrate step drops an inaccessible spray climb, so filtering only there left
+ * pages short (a 20-row page arriving with 17) and the count inflated by rows the
+ * caller can never reach. The specific-board path applies the same rules in its
+ * join for the same reason.
+ */
+function allBoardsWhereConditions(playlistId: bigint, viewerUserId: string | null | undefined): SQL[] {
+  return [
+    eq(dbSchema.playlistClimbs.playlistId, playlistId),
+    climbDraftVisibilityCondition(
+      {
+        boardType: dbSchema.boardClimbs.boardType,
+        userId: dbSchema.boardClimbs.userId,
+        isDraft: dbSchema.boardClimbs.isDraft,
+      },
+      viewerUserId,
+    ),
+    sprayClimbVisibilityCondition(
+      { boardType: UNIFIED_TABLES.climbs.boardType, layoutId: UNIFIED_TABLES.climbs.layoutId },
+      viewerUserId,
+    ),
+  ];
 }
 
 /**
@@ -121,11 +186,8 @@ async function fetchSpecificBoardClimbs(
   page: number,
   pageSize: number,
   viewerUserId: string | null | undefined,
-): Promise<{ climbs: Climb[]; totalCount: number; hasMore: boolean }> {
-  const boardName = input.boardName as BoardName;
-  if (!isValidBoardName(boardName)) {
-    throw new Error(`Invalid board name: ${String(boardName)}. Must be one of: ${SUPPORTED_BOARDS.join(', ')}`);
-  }
+): Promise<PlaylistPage> {
+  const boardName = requireBoardName(input.boardName);
 
   const tables = UNIFIED_TABLES;
   const climbJoinConditions = buildSpecificBoardClimbJoinConditions(tables, boardName, input, viewerUserId);
@@ -152,23 +214,9 @@ async function fetchSpecificBoardClimbs(
 
   const { items, hasMore } = paginateResults(refRows, pageSize);
 
-  // The caller's angle is the wall the user is standing at, so it applies to
-  // every row and is reported back verbatim. Without one, fall back per row to
-  // the climb's added-at angle, mirroring the all-boards path.
-  let hydrateOptions: HydrateClimbsOptions;
-  if (input.angle != null) {
-    hydrateOptions = { wallAngle: input.angle };
-  } else {
-    const angleOverrides = new Map<string, number | null>();
-    for (const row of items) {
-      angleOverrides.set(`${boardName}:${row.climbUuid}`, row.playlistAngle ?? null);
-    }
-    hydrateOptions = { angleOverrides };
-  }
-
   const climbs = await hydrateClimbsByRefs(
     items.map((row) => ({ climbUuid: row.climbUuid, boardType: boardName })),
-    { ...hydrateOptions, viewerUserId },
+    { ...specificBoardHydrateOptions(input, boardName, items), viewerUserId },
   );
 
   return { climbs, totalCount, hasMore };
@@ -204,27 +252,14 @@ async function fetchAllBoardsClimbs(
   page: number,
   pageSize: number,
   viewerUserId: string | null | undefined,
-): Promise<{ climbs: Climb[]; totalCount: number; hasMore: boolean }> {
+): Promise<PlaylistPage> {
   const tables = UNIFIED_TABLES;
 
   const [countResult] = await db
     .select({ count: sql<number>`count(*)::int` })
     .from(dbSchema.playlistClimbs)
     .innerJoin(tables.climbs, eq(tables.climbs.uuid, dbSchema.playlistClimbs.climbUuid))
-    .where(
-      and(
-        eq(dbSchema.playlistClimbs.playlistId, playlistId),
-        // BEFORE offset/limit, and on the COUNT too. The hydrate step drops an
-        // inaccessible spray climb, so filtering only there left pages short (a
-        // 20-row page arriving with 17) and the count inflated by rows the caller
-        // can never reach. The specific-board path applies it in the join for the
-        // same reason.
-        sprayClimbVisibilityCondition(
-          { boardType: tables.climbs.boardType, layoutId: tables.climbs.layoutId },
-          viewerUserId,
-        ),
-      ),
-    );
+    .where(and(...allBoardsWhereConditions(playlistId, viewerUserId)));
 
   const totalCount = countResult?.count ?? 0;
 
@@ -236,43 +271,103 @@ async function fetchAllBoardsClimbs(
     })
     .from(dbSchema.playlistClimbs)
     .innerJoin(tables.climbs, eq(tables.climbs.uuid, dbSchema.playlistClimbs.climbUuid))
-    .where(
-      and(
-        eq(dbSchema.playlistClimbs.playlistId, playlistId),
-        // BEFORE offset/limit, and on the COUNT too. The hydrate step drops an
-        // inaccessible spray climb, so filtering only there left pages short (a
-        // 20-row page arriving with 17) and the count inflated by rows the caller
-        // can never reach. The specific-board path applies it in the join for the
-        // same reason.
-        sprayClimbVisibilityCondition(
-          { boardType: tables.climbs.boardType, layoutId: tables.climbs.layoutId },
-          viewerUserId,
-        ),
-      ),
-    )
+    .where(and(...allBoardsWhereConditions(playlistId, viewerUserId)))
     .orderBy(asc(dbSchema.playlistClimbs.position), asc(dbSchema.playlistClimbs.addedAt))
     .limit(pageSize + 1)
     .offset(page * pageSize);
 
   const { items, hasMore } = paginateResults(refRows, pageSize);
 
-  // Climbs on the active board render their grade at the user's selected angle;
-  // every other climb keeps its added-at angle (most-ascents when null). The
-  // hydrator drops back to most-ascents if a climb has no stats at the override
-  // angle, so the selected angle never blanks a grade.
-  const { activeBoardName, activeAngle } = input;
-  const angleOverrides = new Map<string, number | null>();
-  for (const row of items) {
-    const useActiveAngle = activeBoardName != null && activeAngle != null && row.boardType === activeBoardName;
-    angleOverrides.set(`${row.boardType}:${row.climbUuid}`, useActiveAngle ? activeAngle : (row.playlistAngle ?? null));
-  }
-
   const climbs = await hydrateClimbsByRefs(
     items.map((row) => ({ climbUuid: row.climbUuid, boardType: row.boardType })),
-    { angleOverrides, viewerUserId },
+    { ...allBoardsHydrateOptions(input, items), viewerUserId },
   );
 
   return { climbs, totalCount, hasMore };
+}
+
+// ---------------------------------------------------------------------------
+// Views (#6651): the playlist's rows as a `PlaylistViewSource`, for the shared
+// view builder in `helpers/playlist-view.ts`.
+// ---------------------------------------------------------------------------
+
+/**
+ * A playlist's own orders: `position` (then added-at) as the owner arranged it,
+ * `added` the time each climb was added. Both end on `playlist_climbs.id`,
+ * which is unique.
+ */
+const PLAYLIST_ORDER: PlaylistViewOrder = {
+  own: (direction) => {
+    const directed = direction === 'desc' ? desc : asc;
+    const playlistRows = dbSchema.playlistClimbs;
+    return [directed(playlistRows.position), directed(playlistRows.addedAt), directed(playlistRows.id)];
+  },
+  added: (direction) => {
+    const directed = direction === 'asc' ? asc : desc;
+    return [directed(dbSchema.playlistClimbs.addedAt), directed(dbSchema.playlistClimbs.id)];
+  },
+  unique: [asc(dbSchema.playlistClimbs.id)],
+};
+
+/** The playlist-row half of every playlist source: its rows, their columns and orders. */
+const PLAYLIST_ROWS = {
+  rows: dbSchema.playlistClimbs,
+  refColumns: {
+    climbUuid: sql<string>`${dbSchema.playlistClimbs.climbUuid}`,
+    playlistAngle: sql<number | null>`${dbSchema.playlistClimbs.angle}`,
+  },
+  order: PLAYLIST_ORDER,
+} satisfies Partial<PlaylistViewSource>;
+
+/**
+ * One request's board scope as a view source: the same join and visibility the
+ * playlist-order path uses (so a view only narrows), the angle each row
+ * displays, and the board the active-board filters read.
+ */
+export function specificBoardScope(
+  playlistId: bigint,
+  input: PlaylistBoardInput,
+  viewerUserId: string | null | undefined,
+): PlaylistViewSource {
+  const boardName = requireBoardName(input.boardName);
+  return {
+    ...PLAYLIST_ROWS,
+    climbJoin: and(...buildSpecificBoardClimbJoinConditions(UNIFIED_TABLES, boardName, input, viewerUserId))!,
+    where: eq(dbSchema.playlistClimbs.playlistId, playlistId),
+    // The hydrator's rule, as SQL: the wall angle for every row, or each row's
+    // added-at angle when the caller sent none.
+    preferredAngle: input.angle != null ? sql`${input.angle}::int` : sql`${dbSchema.playlistClimbs.angle}`,
+    activeBoard: {
+      boardName,
+      layoutId: input.layoutId ?? null,
+      sizeId: input.sizeId ?? null,
+      setIds: input.setIds == null ? [] : parseSetIds(input.setIds),
+      angle: input.angle ?? null,
+    },
+    hydrateOptions: (items) => specificBoardHydrateOptions(input, boardName, items),
+  };
+}
+
+export function allBoardsScope(
+  playlistId: bigint,
+  input: PlaylistBoardInput,
+  viewerUserId: string | null | undefined,
+): PlaylistViewSource {
+  const { activeAngle } = input;
+  const activeBoard = activeBoardFromFields(input);
+  return {
+    ...PLAYLIST_ROWS,
+    climbJoin: eq(UNIFIED_TABLES.climbs.uuid, dbSchema.playlistClimbs.climbUuid),
+    where: and(...allBoardsWhereConditions(playlistId, viewerUserId))!,
+    // `allBoardsHydrateOptions` as SQL: the active angle on the active board's
+    // type, the added-at angle everywhere else.
+    preferredAngle:
+      activeBoard != null && activeAngle != null
+        ? sql`CASE WHEN ${UNIFIED_TABLES.climbs.boardType} = ${activeBoard.boardName} THEN ${activeAngle}::int ELSE ${dbSchema.playlistClimbs.angle} END`
+        : sql`${dbSchema.playlistClimbs.angle}`,
+    activeBoard,
+    hydrateOptions: (items) => allBoardsHydrateOptions(input, items),
+  };
 }
 
 /**
@@ -284,21 +379,37 @@ async function fetchAllBoardsClimbs(
  * playlist-wide count here would ignore the board/layout/size scoping the
  * specific-board branch imposes and could report more than `climbs` could
  * ever page through.
+ *
+ * Without a `view` this runs exactly the queries it ran before views existed.
  */
 export const playlistClimbs = async (
   _: unknown,
   { input }: { input: PlaylistClimbsInput },
   ctx: ConnectionContext,
-): Promise<{ climbs: Climb[]; totalCount: number; hasMore: boolean }> => {
-  validateInput(GetPlaylistClimbsInputSchema, input, 'input');
+): Promise<PlaylistPage> => {
+  const parsedInput = validateInput(GetPlaylistClimbsInputSchema, input, 'input');
 
   const page = input.page ?? 0;
   const pageSize = input.pageSize ?? 20;
 
+  // A view sorts the whole playlist before it pages, and the play drawer pages
+  // it as the climber swipes: the same cadence and budget as searchClimbs, and
+  // charged before any database work, as there.
+  if (parsedInput.view) await applyRateLimit(ctx, 120, 'playlist-climbs-view');
+
   // Verify access (throws if denied)
   const playlistId = await verifyPlaylistAccess(input.playlistId, ctx.userId ?? null);
 
-  return input.boardName
-    ? fetchSpecificBoardClimbs(playlistId, input, page, pageSize, ctx.userId)
-    : fetchAllBoardsClimbs(playlistId, input, page, pageSize, ctx.userId);
+  if (!parsedInput.view) {
+    // The raw input on purpose: this is the pre-view path, byte for byte, and
+    // its fetchers read only fields the schema passes through unchanged.
+    return input.boardName
+      ? fetchSpecificBoardClimbs(playlistId, input, page, pageSize, ctx.userId)
+      : fetchAllBoardsClimbs(playlistId, input, page, pageSize, ctx.userId);
+  }
+
+  const scope = parsedInput.boardName
+    ? specificBoardScope(playlistId, parsedInput, ctx.userId)
+    : allBoardsScope(playlistId, parsedInput, ctx.userId);
+  return fetchPlaylistView(scope, parsedInput.view, page, pageSize, ctx.userId);
 };

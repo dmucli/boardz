@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { ONBOARDING_TIP_ACCESSORY_KEY } from '@boardsesh/key-value-storage';
@@ -7,12 +7,13 @@ import { hasSeenTip, markTipSeen } from '../../lib/onboarding/onboarding-storage
 import { useStickyAccessoryPresence } from '../../hooks/use-sticky-accessory-presence';
 import { useBottomChromeMetrics } from '../../hooks/use-bottom-chrome-metrics';
 import { spacing } from '../../theme/tokens';
+import { TabBarHideFollower } from '../navigation/TabBarHideFollower';
 
 /**
- * One-time tip teaching that the bottom accessory bar (the current-climb / queue
- * platter) always mirrors what's on the board. It fires the first time a current
- * climb exists — i.e. the first time the accessory bar is on screen — and never
- * again.
+ * One-time tip teaching what the bottom accessory bar (the MiniPlayer) holds:
+ * the last climb the climber opened, a preview included, until the queue
+ * moves on to another climb (owner decision A, `useBarClimb`). It fires the first
+ * time the accessory bar is on screen and never again.
  *
  * On iOS 26 Liquid Glass the accessory is a UIKit-hosted native platter
  * (`NativeTabs.BottomAccessory`), which a JS tip can't attach to; everywhere else
@@ -31,16 +32,17 @@ export function AccessoryOnboardingTip() {
   const hasCurrentClimb = useStickyAccessoryPresence();
   const bottomChrome = useBottomChromeMetrics();
   const [tipVisible, setTipVisible] = useState(false);
+  const dismissedRef = useRef(false);
 
   // Arm the tip the first time the accessory bar is on screen (a current climb
   // exists) AND it hasn't been seen. `hasSeenTip` returns true on a read error, so
   // a flaky store never nags. Re-checks whenever presence flips true so a climb
   // appearing later in the session still triggers it once.
   useEffect(() => {
-    if (!hasCurrentClimb) return;
+    if (!hasCurrentClimb || dismissedRef.current) return;
     let cancelled = false;
     void hasSeenTip(ONBOARDING_TIP_ACCESSORY_KEY).then((seen) => {
-      if (!cancelled && !seen) setTipVisible(true);
+      if (!cancelled && !dismissedRef.current && !seen) setTipVisible(true);
     });
     return () => {
       cancelled = true;
@@ -48,8 +50,10 @@ export function AccessoryOnboardingTip() {
   }, [hasCurrentClimb]);
 
   const dismissTip = useCallback(() => {
+    dismissedRef.current = true;
     setTipVisible(false);
-    void markTipSeen(ONBOARDING_TIP_ACCESSORY_KEY);
+    // A failed write must not restore the overlay during this app launch.
+    void markTipSeen(ONBOARDING_TIP_ACCESSORY_KEY).catch(() => undefined);
   }, []);
 
   // Tie the tip to the bar it points at: it floats only while a bar is actually on
@@ -62,18 +66,21 @@ export function AccessoryOnboardingTip() {
   if (!tipVisible || !hasCurrentClimb || !barVisible) return null;
 
   return (
-    <View
-      pointerEvents="box-none"
-      style={[styles.overlay, { bottom: bottomChrome.floatingControlBottom + spacing[2] }]}
-    >
-      <OnboardingTipBanner
-        text={t('mobile.onboarding.tips.accessory')}
-        dismissLabel={t('actions.close')}
-        onDismiss={dismissTip}
-        icon="chevron.down"
-        solid
-      />
-    </View>
+    <TabBarHideFollower zIndex={100}>
+      <View
+        pointerEvents="box-none"
+        style={[styles.overlay, { bottom: bottomChrome.floatingControlBottom + spacing[2] }]}
+      >
+        <OnboardingTipBanner
+          text={t('mobile.onboarding.tips.accessory')}
+          dismissLabel={t('actions.close')}
+          onDismiss={dismissTip}
+          onPress={dismissTip}
+          icon="chevron.down"
+          solid
+        />
+      </View>
+    </TabBarHideFollower>
   );
 }
 

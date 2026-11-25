@@ -1,0 +1,55 @@
+vi.mock('../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
+import { describe, it, expect, vi } from 'vitest';
+
+vi.mock('react-native', () => ({
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: <T>(styles: T): T => styles,
+    hairlineWidth: 0.5,
+  },
+  Platform: { OS: 'ios', select: () => undefined },
+  PlatformColor: (name: string) => name,
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
+}));
+import { CLIMB_ROW_GUTTER, climbListRowStyles, climbRowSeparatorInsetStyle } from '../climb-list-row-styles';
+import { climbListThumbnailSize } from '../climb-list-thumbnail-metrics';
+
+// HIG Layout: 16pt side margins on iPhone; M3 Lists: 16dp item padding. The row
+// used 8pt, so the thumbnails sat closer to the edge than every header above.
+describe('climb list row margins', () => {
+  it('pads the row 16pt on both sides', () => {
+    expect(CLIMB_ROW_GUTTER).toBe(16);
+    expect(climbListRowStyles.contentRow.paddingHorizontal).toBe(16);
+  });
+
+  it('starts the separator at the text column, after the gutter, thumbnail and gap', () => {
+    expect(climbRowSeparatorInsetStyle(true, climbListThumbnailSize(1).width)).toEqual({ marginLeft: 16 + 76 + 12 });
+    expect(climbRowSeparatorInsetStyle(true, climbListThumbnailSize(2).width)).toEqual({ marginLeft: 16 + 88 + 12 });
+  });
+
+  it('starts the separator at the gutter on a row without a thumbnail, whatever the cell', () => {
+    expect(climbRowSeparatorInsetStyle(false, 76)).toEqual({ marginLeft: 16 });
+    expect(climbRowSeparatorInsetStyle(false, 88)).toEqual({ marginLeft: 16 });
+  });
+
+  it('hands every row the same style object for the same inset', () => {
+    expect(climbRowSeparatorInsetStyle(true, 88)).toBe(climbRowSeparatorInsetStyle(true, 88));
+    expect(climbRowSeparatorInsetStyle(false, 76)).toBe(climbRowSeparatorInsetStyle(false, 88));
+  });
+
+  it('leaves the hairline itself without an inset', () => {
+    expect(climbListRowStyles.separator).toEqual({ height: 0.5 });
+  });
+});

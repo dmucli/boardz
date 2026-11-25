@@ -20,26 +20,34 @@
 //     explicit Start button / an explicit join, never lazily here).
 // Party / best-effort actions (confirmClimbOnWall, reportWallDisconnect,
 // setSessionBoardSerial, setSessionBoardPath) no-op on BOTH platforms when
-// there is no active session.
+// there is no active session. So does setSessionRestCadence, which instead of
+// swallowing errors hands them back: its callers decide what a lost write means
+// for the wall (#5382).
 
 import type { Client, RateLimitRetryEvent } from '@boardsesh/graphql-client';
 import { execute } from '@boardsesh/graphql-client';
 import type { ClimbQueueItemInput } from '@boardsesh/shared-schema';
-import { createSetCurrentClimbCoalescer } from '@boardsesh/queue-runtime';
+import type { CurrentClimbPlacement } from '@boardsesh/queue';
+import type { SessionRestCadenceInput, SetSessionRestCadencePayload } from '@boardsesh/shared-schema/generated';
+import { createSetCurrentClimbCoalescer, type SetCurrentClimbArgs } from '@boardsesh/queue-runtime';
 import {
   ADD_QUEUE_ITEM,
   REMOVE_QUEUE_ITEM,
   REORDER_QUEUE_ITEM,
   SET_CURRENT_CLIMB,
+  SET_CURRENT_CLIMB_NOW_SLOT,
   MIRROR_CURRENT_CLIMB,
   PUBLISH_PLAYBACK_STATE,
   SET_QUEUE,
+  SET_QUEUE_NOW_SLOT,
   SET_QUEUE_WITH_BASELINE,
+  SET_QUEUE_WITH_BASELINE_NOW_SLOT,
   REPLACE_QUEUE_ITEM,
   CONFIRM_CLIMB_ON_WALL,
   REPORT_WALL_DISCONNECT,
   SET_SESSION_BOARD_SERIAL,
   SET_SESSION_BOARD_PATH,
+  SET_SESSION_REST_CADENCE,
 } from '@boardsesh/graphql/operations/queue-session';
 
 export type PublishPlaybackStateInput = {
@@ -65,6 +73,14 @@ export type PublishPlaybackStateInput = {
 
 const NOT_CONNECTED = 'Not connected to session';
 
+/** Per-call transport options for `setSessionRestCadence`. */
+export type SessionRestCadenceSendOptions = {
+  /** Give up after this long (the holder's FIRE waits 2 s, then lets the beat go). */
+  timeoutMs?: number;
+  /** Re-send on RATE_LIMITED. Off for a FIRE: a beat claimed late is no use. */
+  retryWhenRateLimited?: boolean;
+};
+
 /**
  * Does this failure mean the server doesn't know `setQueue`'s `baselineSequence`
  * argument yet (#3933)?
@@ -80,6 +96,34 @@ function isUnknownBaselineArgumentError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
   if (!message.includes('baselineSequence')) return false;
   return /unknown argument|graphql_validation_failed|is not defined/i.test(message);
+}
+
+/**
+ * The names an F3 `_NOW_SLOT` document carries that a backend without F3 does
+ * not know (docs/product/current-climb-outside-queue.md, section 2).
+ */
+const NOW_SLOT_SCHEMA_NAMES = [
+  'placement',
+  'CurrentClimbPlacement',
+  'historyCount',
+  'initialHistoryCount',
+  'currentChangedAt',
+];
+
+/**
+ * Did a backend without the F3 fields reject a `_NOW_SLOT` document at
+ * validation time? graphql-js reports `Unknown argument "placement" ...`,
+ * `Unknown type "CurrentClimbPlacement".` or `Cannot query field
+ * "historyCount" ...` before any resolver runs, with no `extensions.code`, so
+ * this has to match the message. As narrow as `isUnknownBaselineArgumentError`:
+ * one of the F3 names AND a validation-shaped phrase, so a genuine server error
+ * is never mistaken for deploy skew and retried. Exported so the mobile join
+ * (which runs its own document) applies the same rule.
+ */
+export function isNowSlotValidationError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  if (!NOW_SLOT_SCHEMA_NAMES.some((name) => message.includes(name))) return false;
+  return /unknown argument|unknown type|cannot query field|graphql_validation_failed|is not defined/i.test(message);
 }
 
 /**
@@ -154,12 +198,39 @@ export type QueueMutationsDeps<TItem> = {
   /** Sink for swallowed transport errors (best-effort actions + coalescer drains). */
   onBestEffortError?: (action: BestEffortAction, error: unknown) => void;
   /**
+   * A drained `setCurrentClimb` rejected. A call that superseded an earlier one
+   * resolves at once and is sent later from the coalescer's drain loop, so its
+   * caller never sees this failure; this hands it over with the call's own args
+   * (item, shouldAddToQueue, correlationId) so the caller can tell WHICH move
+   * never landed. Fires after `onBestEffortError('setCurrentClimb', …)`. Return
+   * `true` when the caller re-sends a lost `shouldAddToQueue` slot itself; the
+   * coalescer then skips its own deferred queue-add (#3936). Mobile uses it to
+   * re-send a move that missed the session during a reconnect, and holds the
+   * slot back until then.
+   */
+  onSetCurrentClimbDrainError?: (error: unknown, args: SetCurrentClimbArgs<TItem>) => boolean | void;
+  /**
    * Notified when a queue mutation is throttled and `execute` is backing off to
    * retry it (not on the final give-up). Web wires a debounced "catching up"
    * snackbar here so a burst of buffered adds replaying on reconnect reads as
    * pacing, not failure (#2655). Fires per mutation, per retry attempt.
    */
   onRateLimited?: (event: RateLimitRetryEvent) => void;
+  /**
+   * F3 now-slot mode, read at SEND time (after the session join, which runs the
+   * server probe): true when the `queue-now-slot` flag is on and the connected
+   * backend serves the Now slot fields. Then a request that carries `placement`
+   * or `historyCount` goes out on the `_NOW_SLOT` document; otherwise every call
+   * uses today's documents and sends neither. Absent (web) means always legacy.
+   */
+  shouldUseNowSlotDocuments?: () => boolean;
+  /**
+   * The backend rejected a `_NOW_SLOT` document at validation time (a rollback
+   * past the F3 backend, with the request already in flight on the old socket).
+   * The caller marks the connection legacy; the request is then retried once on
+   * the legacy document.
+   */
+  onNowSlotDocumentsRejected?: (error: unknown) => void;
 };
 
 export type QueueMutationsActions<TItem> = {
@@ -173,7 +244,20 @@ export type QueueMutationsActions<TItem> = {
    * makes the echoed event a safe no-op.
    */
   reorderQueueItem: (uuid: string, oldIndex: number, newIndex: number) => Promise<void>;
-  setCurrentClimb: (item: TItem | null, shouldAddToQueue?: boolean, correlationId?: string) => Promise<void>;
+  /**
+   * `placement` (F3) is optional and trailing, so every other importer keeps
+   * compiling unchanged. It is sent only on the `_NOW_SLOT` document; a request
+   * that carries it and goes out on the legacy document (mode off at send time,
+   * or the validation fallback) is sent as a legacy open, `shouldAddToQueue:
+   * true`, so a backend without F3 inserts a missing climb instead of storing
+   * an orphan.
+   */
+  setCurrentClimb: (
+    item: TItem | null,
+    shouldAddToQueue?: boolean,
+    correlationId?: string,
+    placement?: CurrentClimbPlacement,
+  ) => Promise<void>;
   /**
    * Is the climber's LATEST intent for `uuid` "drop it" — set by a per-item
    * `removeQueueItem` or by a wholesale `setQueue` replace that discarded a
@@ -209,7 +293,11 @@ export type QueueMutationsActions<TItem> = {
    * peers stay in sync. Best-effort; no-op in solo (no active session).
    */
   publishPlaybackState: (input: PublishPlaybackStateInput) => Promise<void>;
-  setQueue: (queue: TItem[], currentClimbQueueItem?: TItem | null) => Promise<void>;
+  /**
+   * `historyCount` (F3) is sent only on the `_NOW_SLOT` documents, same rule as
+   * `setCurrentClimb`'s `placement`.
+   */
+  setQueue: (queue: TItem[], currentClimbQueueItem?: TItem | null, historyCount?: number | null) => Promise<void>;
   replaceQueueItem: (uuid: string, item: TItem) => Promise<void>;
   /**
    * Tell the backend this client just relayed `climbUuid` to the wall over BLE
@@ -236,6 +324,17 @@ export type QueueMutationsActions<TItem> = {
    * for instant feedback. Best-effort; no-op in solo.
    */
   setSessionBoardPath: (boardPath: string) => Promise<void>;
+  /**
+   * Change the session's shared rest clock (#5382). Resolves null when there is
+   * no session (solo stays local), and THROWS on a transport or server error:
+   * a FIRE that never landed must not move the wall, and the caller decides
+   * whether to skip the beat or repair the clock. `applied: false` in the reply
+   * means the change did not land; the reply's clock is the server's truth.
+   */
+  setSessionRestCadence: (
+    input: SessionRestCadenceInput,
+    options?: SessionRestCadenceSendOptions,
+  ) => Promise<SetSessionRestCadencePayload | null>;
 };
 
 export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): QueueMutationsActions<TItem> {
@@ -247,8 +346,42 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
     ensureReady,
     getBaselineSequence,
     onBestEffortError,
+    onSetCurrentClimbDrainError,
     onRateLimited,
+    shouldUseNowSlotDocuments,
+    onNowSlotDocumentsRejected,
   } = deps;
+
+  const nowSlotDocumentsEnabled = () => shouldUseNowSlotDocuments?.() === true;
+
+  /**
+   * Run `nowSlotOperation` when now-slot mode is on, else `legacyOperation`.
+   * A validation error naming an F3 field marks the connection legacy and
+   * retries once on the legacy document; any other error propagates.
+   */
+  async function runWithNowSlotFallback<TData = unknown>(
+    client: Client,
+    nowSlotOperation: { query: string; variables?: Record<string, unknown> } | null,
+    legacyOperation: () => Promise<TData>,
+  ): Promise<TData> {
+    if (nowSlotOperation && nowSlotDocumentsEnabled()) {
+      try {
+        return await runMutation<TData>(client, nowSlotOperation);
+      } catch (error) {
+        if (!isNowSlotValidationError(error)) throw error;
+        onNowSlotDocumentsRejected?.(error);
+      }
+    }
+    return legacyOperation();
+  }
+
+  function setCurrentClimbVariables(args: SetCurrentClimbArgs<TItem>): Record<string, unknown> {
+    return {
+      item: args.item ? toQueueItemInput(args.item) : null,
+      shouldAddToQueue: args.shouldAddToQueue,
+      correlationId: args.correlationId,
+    };
+  }
 
   type Ready = { client: Client; sessionId: string };
 
@@ -322,6 +455,18 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
     if (addCandidateUuids.length > ADD_CANDIDATE_MEMORY) addCandidateUuids.shift();
   }
 
+  // A rate-limit retry re-reads the live client, so a wait that spans a
+  // dispose (offline mode on) does not resend on the dead one, which would
+  // open a socket no later dispose closes. While offline mode is on the live
+  // client is the inert one, and the retry fails cleanly (#6766). Every send
+  // hands `execute` this getter, never the captured client itself. The
+  // `?? captured` fallback is the signed-out / not-yet-built guard, not the
+  // offline-mode one: with no live client the retry goes to the client the
+  // send started on and fails there as it did before.
+  function liveClient(captured: Client): () => Client {
+    return () => getClient() ?? captured;
+  }
+
   // Every queue mutation goes through here so the shared `execute` retry loop
   // (bounded back-off on RATE_LIMITED) and the `onRateLimited` notifier apply
   // uniformly — no per-call-site wiring.
@@ -329,10 +474,18 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
     client: Client,
     operation: { query: string; variables?: Record<string, unknown> },
   ): Promise<TData> {
-    // Only pass options when there's something to inject, so callers/tests that
-    // assert the two-arg `execute(client, op)` shape stay green.
-    return onRateLimited ? execute<TData>(client, operation, { onRateLimited }) : execute<TData>(client, operation);
+    // With no notifier, execute's own default timeout and retry options apply.
+    return onRateLimited
+      ? execute<TData>(liveClient(client), operation, { onRateLimited })
+      : execute<TData>(liveClient(client), operation);
   }
+
+  // Mobile's `ensureReady` runs JOIN_SESSION on whichever client is current
+  // when the join goes out, so every mobile send reads the client again AFTER
+  // it. A client read before the await can have been disposed while the join
+  // ran (offline mode on → off), and graphql-ws opens a fresh, never-joined
+  // socket for an operation started on a disposed client: "Must be in a
+  // session", on a socket the next offline-mode cut does not close either.
 
   // Core mutating actions. Web (no ensureReady) THROWS when disconnected;
   // mobile (ensureReady) silently no-ops by returning null. `allowCreate`
@@ -350,7 +503,8 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
     if (!allowCreate && !captured) return null;
     const sessionId = await ensureReady(captured);
     if (!sessionId) return null;
-    return { client, sessionId };
+    const joinedClient = getClient();
+    return joinedClient ? { client: joinedClient, sessionId } : null;
   }
 
   // Party / best-effort actions: no-op on BOTH platforms when there's no active
@@ -361,7 +515,8 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
     if (!client || !captured) return null;
     if (!ensureReady) return { client, sessionId: captured };
     const sessionId = await ensureReady(captured);
-    return sessionId ? { client, sessionId } : null;
+    const joinedClient = getClient();
+    return sessionId && joinedClient ? { client: joinedClient, sessionId } : null;
   }
 
   // Serialize-and-supersede SET_CURRENT_CLIMB. `getContext` snapshots the
@@ -375,7 +530,7 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
       // mobile never does, and must not lazily create a session just to send a
       // null — so only the ensureReady (mobile) path short-circuits on null.
       if (ensureReady && !args.item) return;
-      const client = getClient();
+      let client = getClient();
       if (!client) {
         if (ensureReady) return;
         throw new Error(NOT_CONNECTED);
@@ -389,22 +544,32 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
         const sessionId = await ensureReady(capturedSessionId);
         if (!sessionId) return;
         if (capturedSessionId !== null && getSessionId() !== capturedSessionId) return;
+        client = getClient();
+        if (!client) return;
       } else if (!capturedSessionId || getSessionId() !== capturedSessionId) {
         // Web: already-joined, never creates — a missing OR flipped captured
         // session is fatal (throws), unlike mobile which lazily creates above.
         throw new Error(NOT_CONNECTED);
       }
-      await runMutation(client, {
-        query: SET_CURRENT_CLIMB,
-        variables: {
-          item: args.item ? toQueueItemInput(args.item) : null,
-          shouldAddToQueue: args.shouldAddToQueue,
-          correlationId: args.correlationId,
-        },
-      });
+      const variables = setCurrentClimbVariables(args);
+      const sendClient = client;
+      await runWithNowSlotFallback(
+        sendClient,
+        args.placement === undefined
+          ? null
+          : { query: SET_CURRENT_CLIMB_NOW_SLOT, variables: { ...variables, placement: args.placement } },
+        () =>
+          runMutation(sendClient, {
+            query: SET_CURRENT_CLIMB,
+            // A placement-carrying open on the legacy document is a legacy open:
+            // a backend without F3 must insert a missing climb, never store an orphan.
+            variables:
+              args.placement === undefined ? variables : { ...variables, shouldAddToQueue: args.item !== null },
+          }),
+      );
     },
     sendDeferredQueueAdd: async (item, capturedSessionId) => {
-      const client = getClient();
+      let client = getClient();
       if (!client || !capturedSessionId || getSessionId() !== capturedSessionId) return;
       if (ensureReady) {
         // capturedSessionId is concrete, so this only joins — but honour a null
@@ -412,6 +577,8 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
         // than fire an ADD against a dead session, mirroring the sendArgs path.
         const sessionId = await ensureReady(capturedSessionId);
         if (!sessionId) return;
+        client = getClient();
+        if (!client) return;
       }
       const input = toQueueItemInput(item);
       // Read the position AFTER the session guards (a dead-session bail costs
@@ -447,7 +614,10 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
       // peek-promotion) without the coalescer knowing which one ran.
       await runMutation(client, { query: ADD_QUEUE_ITEM, variables: { item: input, position } });
     },
-    onDrainError: (error) => onBestEffortError?.('setCurrentClimb', error),
+    onDrainError: (error, args) => {
+      onBestEffortError?.('setCurrentClimb', error);
+      return onSetCurrentClimbDrainError?.(error, args) === true;
+    },
     onDeferredQueueAddError: (error) => onBestEffortError?.('addQueueItem', error),
   });
 
@@ -480,7 +650,7 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
       await runMutation(ready.client, { query: REORDER_QUEUE_ITEM, variables: { uuid, oldIndex, newIndex } });
     },
 
-    setCurrentClimb: async (item, shouldAddToQueue, correlationId) => {
+    setCurrentClimb: async (item, shouldAddToQueue, correlationId, placement) => {
       // Only an activation that carries a queue-add can ever produce a deferred
       // ADD, so only those uuids need tracking for the wholesale-replace diff.
       // Such an activation is also the climber asking for the climb back, so it
@@ -497,7 +667,11 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
       if (!ensureReady && (!getClient() || !getSessionId())) {
         throw new Error(NOT_CONNECTED);
       }
-      await coalescer.enqueue({ item, shouldAddToQueue, correlationId });
+      await coalescer.enqueue(
+        placement === undefined
+          ? { item, shouldAddToQueue, correlationId }
+          : { item, shouldAddToQueue, correlationId, placement },
+      );
     },
 
     wasUuidExplicitlyRemoved: (uuid) => removedUuids.has(uuid),
@@ -523,7 +697,7 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
       }
     },
 
-    setQueue: async (queue, currentClimbQueueItem) => {
+    setQueue: async (queue, currentClimbQueueItem, historyCount) => {
       const queueInputs = queue.map(toQueueItemInput);
       // Read the baseline SYNCHRONOUSLY, before any await, so it describes what
       // the caller knew when it handed over this payload (#3933). Reading it
@@ -564,23 +738,31 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
         queue: queueInputs,
         currentClimbQueueItem: currentClimbQueueItem ? toQueueItemInput(currentClimbQueueItem) : undefined,
       };
-      if (baselineSequence !== null) {
-        try {
-          await runMutation(ready.client, {
-            query: SET_QUEUE_WITH_BASELINE,
-            variables: { ...variables, baselineSequence },
-          });
-          return;
-        } catch (error) {
-          // A backend that predates the `baselineSequence` argument rejects the
-          // whole document at validation time. That is a deploy-skew artefact,
-          // not a user error — retry once on the legacy document so nobody's
-          // Clear button or playlist activation hard-fails during a rollout.
-          // Any other failure (rate limit, transport, auth) propagates.
-          if (!isUnknownBaselineArgumentError(error)) throw error;
+      const nowSlotOperation =
+        historyCount == null
+          ? null
+          : baselineSequence !== null
+            ? { query: SET_QUEUE_WITH_BASELINE_NOW_SLOT, variables: { ...variables, baselineSequence, historyCount } }
+            : { query: SET_QUEUE_NOW_SLOT, variables: { ...variables, historyCount } };
+      await runWithNowSlotFallback(ready.client, nowSlotOperation, async () => {
+        if (baselineSequence !== null) {
+          try {
+            await runMutation(ready.client, {
+              query: SET_QUEUE_WITH_BASELINE,
+              variables: { ...variables, baselineSequence },
+            });
+            return;
+          } catch (error) {
+            // A backend that predates the `baselineSequence` argument rejects the
+            // whole document at validation time. That is a deploy-skew artefact,
+            // not a user error — retry once on the legacy document so nobody's
+            // Clear button or playlist activation hard-fails during a rollout.
+            // Any other failure (rate limit, transport, auth) propagates.
+            if (!isUnknownBaselineArgumentError(error)) throw error;
+          }
         }
-      }
-      await runMutation(ready.client, { query: SET_QUEUE, variables });
+        await runMutation(ready.client, { query: SET_QUEUE, variables });
+      });
     },
 
     replaceQueueItem: async (uuid, item) => {
@@ -630,6 +812,22 @@ export function createQueueMutations<TItem>(deps: QueueMutationsDeps<TItem>): Qu
       } catch (error) {
         onBestEffortError?.('setSessionBoardPath', error);
       }
+    },
+
+    setSessionRestCadence: async (input, options = {}) => {
+      const ready = await resolveCurrent();
+      if (!ready) return null;
+      const { timeoutMs, retryWhenRateLimited = true } = options;
+      const result = await execute<{ setSessionRestCadence: SetSessionRestCadencePayload }>(
+        liveClient(ready.client),
+        { query: SET_SESSION_REST_CADENCE, variables: { input } },
+        {
+          ...(timeoutMs === undefined ? {} : { timeoutMs }),
+          ...(retryWhenRateLimited ? {} : { rateLimitRetries: 0 }),
+          ...(onRateLimited ? { onRateLimited } : {}),
+        },
+      );
+      return result.setSessionRestCadence;
     },
   };
 }

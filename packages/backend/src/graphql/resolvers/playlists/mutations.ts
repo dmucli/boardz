@@ -1,3 +1,4 @@
+import { setContentPrivacy } from '../../../services/privacy';
 import { eq, and, asc, inArray, sql } from 'drizzle-orm';
 import { GraphQLError } from 'graphql';
 import { v4 as uuidv4 } from 'uuid';
@@ -21,6 +22,12 @@ import { getPlaylistFollowStats } from './queries';
 import { verifyPlaylistAccess } from './helpers/enrichment';
 import { computePlaylistReorderWrites } from './helpers/reorder';
 import { logger } from '../../../utils/logger';
+import { lockSprayClimbAgainstDelete } from '../climbs/spray-climb-lock';
+import {
+  acquireUpstreamPlaylistLock,
+  recordDeletedUpstreamPlaylist,
+  refreshPlaylistGradeSummariesFor,
+} from '@boardsesh/db/queries';
 
 type ClimbBoardScope = { boardType: string; layoutId: number };
 
@@ -88,6 +95,24 @@ function climbFitsPlaylistBoard(
 ): boolean {
   if (climbScope.boardType !== playlistScope.boardType) return false;
   return playlistScope.layoutId === null || climbScope.layoutId === playlistScope.layoutId;
+}
+
+/**
+ * Bring the playlist's grade band up to date after its climbs changed, so the
+ * card and Discover's grade filter see the change now instead of after the
+ * daily job. After the write commits and outside its transaction: a failure
+ * here is logged, never surfaced, because the climb was added or removed and
+ * the daily job repairs the summary (docs/data/playlist-grade-summaries.md).
+ */
+async function refreshGradeSummaryAfterClimbChange(playlistId: bigint): Promise<void> {
+  try {
+    await refreshPlaylistGradeSummariesFor(db, [playlistId]);
+  } catch (error) {
+    logger.error('[PlaylistGradeSummaries] Could not refresh after a climb change', {
+      playlistId: playlistId.toString(),
+      error,
+    });
+  }
 }
 
 function playlistResult(playlist: dbSchema.Playlist, climbCount: number): Record<string, unknown> {
@@ -161,7 +186,7 @@ export const playlistMutations = {
           layoutId: validatedInput.layoutId,
           name: validatedInput.name,
           description: validatedInput.description || null,
-          isPublic: false, // Always private initially
+          isPublic: validatedInput.privacy?.audience === 'public',
           color: validatedInput.color || null,
           icon: validatedInput.icon || null,
           createdAt: now,
@@ -181,6 +206,15 @@ export const playlistMutations = {
         createdAt: now,
       });
 
+      if (validatedInput.privacy)
+        await setContentPrivacy(
+          tx,
+          userId,
+          'playlist',
+          uuid,
+          validatedInput.privacy.audience,
+          validatedInput.privacy.privacyRevision,
+        );
       return insertedPlaylist;
     });
 
@@ -256,12 +290,47 @@ export const playlistMutations = {
     if (validatedInput.color !== undefined) updateData.color = validatedInput.color || null;
     if (validatedInput.icon !== undefined) updateData.icon = validatedInput.icon || null;
 
-    // Update playlist
-    const [updated] = await db
-      .update(dbSchema.playlists)
-      .set(updateData)
-      .where(eq(dbSchema.playlists.id, playlistId))
-      .returning();
+    if (validatedInput.privacy) updateData.isPublic = validatedInput.privacy.audience === 'public';
+    const [updated] = await db.transaction(async (tx) => {
+      const [currentOwner] = await tx
+        .select({ userId: dbSchema.playlistOwnership.userId, isPublic: dbSchema.playlists.isPublic })
+        .from(dbSchema.playlistOwnership)
+        .innerJoin(dbSchema.playlists, eq(dbSchema.playlists.id, dbSchema.playlistOwnership.playlistId))
+        .where(
+          and(
+            eq(dbSchema.playlistOwnership.playlistId, playlistId),
+            eq(dbSchema.playlistOwnership.userId, userId),
+            eq(dbSchema.playlistOwnership.role, 'owner'),
+          ),
+        )
+        .for('update');
+      if (!currentOwner) throw new Error('Playlist not found or access denied');
+      if (!validatedInput.privacy && validatedInput.isPublic === false && currentOwner.isPublic) {
+        // An old client's Public -> Private switch withdraws explicit public
+        // consent too. Keep restrictive policies and legacy collaborator access;
+        // omitted/unchanged booleans must not reinterpret a newer audience.
+        await tx
+          .delete(dbSchema.contentPrivacy)
+          .where(
+            and(
+              eq(dbSchema.contentPrivacy.entityType, 'playlist'),
+              eq(dbSchema.contentPrivacy.entityId, validatedInput.playlistId),
+              eq(dbSchema.contentPrivacy.ownerId, userId),
+              eq(dbSchema.contentPrivacy.audience, 'public'),
+            ),
+          );
+      }
+      if (validatedInput.privacy)
+        await setContentPrivacy(
+          tx,
+          userId,
+          'playlist',
+          validatedInput.playlistId,
+          validatedInput.privacy.audience,
+          validatedInput.privacy.privacyRevision,
+        );
+      return tx.update(dbSchema.playlists).set(updateData).where(eq(dbSchema.playlists.id, playlistId)).returning();
+    });
 
     // Get climb count and follow stats
     const climbCount = await db
@@ -318,7 +387,11 @@ export const playlistMutations = {
 
     // Check ownership
     const ownership = await db
-      .select({ id: dbSchema.playlists.id })
+      .select({
+        id: dbSchema.playlists.id,
+        kilterId: dbSchema.playlists.kilterId,
+        auroraId: dbSchema.playlists.auroraId,
+      })
       .from(dbSchema.playlistOwnership)
       .innerJoin(dbSchema.playlists, eq(dbSchema.playlists.id, dbSchema.playlistOwnership.playlistId))
       .where(
@@ -334,8 +407,51 @@ export const playlistMutations = {
       throw new Error('Playlist not found or you do not have permission to delete it');
     }
 
-    // Delete playlist (cascade will handle ownership and climbs)
-    await db.delete(dbSchema.playlists).where(eq(dbSchema.playlists.id, ownership[0].id));
+    const target = ownership[0];
+
+    // A playlist built in Boardsesh has no upstream circuit to come back from,
+    // and no pull can give it one (Kilter adoption needs an aurora_id already).
+    // Circuit push-back (#3525) would stamp a kilter_id onto these rows; when
+    // it ships, this shortcut has to take the locked path below instead.
+    // Cascade handles ownership and climbs.
+    if (target.kilterId === null && target.auroraId === null) {
+      await db.delete(dbSchema.playlists).where(eq(dbSchema.playlists.id, target.id));
+      return true;
+    }
+
+    // A mirrored circuit (#7240): the Kilter stream re-sends every circuit
+    // every 5 minutes and an Aurora circuit comes back when it changes, so a
+    // bare delete is undone by the next sync. Record the upstream ids in the
+    // same transaction as the delete, so there is never a moment where the
+    // row is gone and the circuit writers don't know to skip it.
+    await db.transaction(async (tx) => {
+      // The circuit writers' per-user lock: a sync mid-batch finishes before
+      // this delete, or starts after it and sees the recorded ids.
+      await acquireUpstreamPlaylistLock(tx, userId);
+
+      // Re-read under the lock. Kilter adoption may have stamped a kilter_id
+      // onto a legacy aurora_id row since the read above, and recording only
+      // the aurora_id would let the Kilter circuit insert a fresh twin.
+      const [current] = await tx
+        .select({
+          boardType: dbSchema.playlists.boardType,
+          kilterId: dbSchema.playlists.kilterId,
+          auroraId: dbSchema.playlists.auroraId,
+        })
+        .from(dbSchema.playlists)
+        .where(eq(dbSchema.playlists.id, target.id))
+        .for('update');
+      // Gone already (a Kilter REMOVE for this circuit landed first).
+      if (!current) return;
+
+      await recordDeletedUpstreamPlaylist(tx, {
+        userId,
+        boardType: current.boardType,
+        kilterId: current.kilterId,
+        auroraId: current.auroraId,
+      });
+      await tx.delete(dbSchema.playlists).where(eq(dbSchema.playlists.id, target.id));
+    });
 
     return true;
   },
@@ -435,6 +551,16 @@ export const playlistMutations = {
     const maxInsertAttempts = 2;
     const { playlistClimb, wasAlreadyInPlaylist } = await db.transaction(
       async (tx) => {
+        // A spray playlist only takes spray climbs (the guard above), and a
+        // spray climb can be hard-deleted by its setter (`deleteClimb`, #5960).
+        // The fail-open lookup above ran outside this transaction, so hold the
+        // climb until this insert commits, or refuse with CLIMB_NOT_FOUND (the
+        // drainer dead-letters it). Without this, an add drained after the
+        // delete leaves a row that the playlist's climb count includes but no
+        // climb list can show. Catalogue playlists stay fail-open.
+        if (ownership[0].boardType === 'spray') {
+          await lockSprayClimbAgainstDelete(tx, validatedInput.climbUuid);
+        }
         for (let attempt = 0; attempt < maxInsertAttempts; attempt += 1) {
           const maxPosition = await tx
             .select({ max: sql<number>`coalesce(max(${dbSchema.playlistClimbs.position}), -1)` })
@@ -491,6 +617,8 @@ export const playlistMutations = {
       },
       { isolationLevel: 'read committed' },
     );
+
+    if (!wasAlreadyInPlaylist) await refreshGradeSummaryAfterClimbChange(playlistId);
 
     return {
       id: playlistClimb.id.toString(),
@@ -563,6 +691,7 @@ export const playlistMutations = {
     // changed, so a no-op remove doesn't bump it.
     if (removed) {
       await db.update(dbSchema.playlists).set({ updatedAt: new Date() }).where(eq(dbSchema.playlists.id, playlistId));
+      await refreshGradeSummaryAfterClimbChange(playlistId);
     }
 
     return removed;
@@ -738,22 +867,7 @@ export const playlistMutations = {
     const validatedInput = validateInput(FollowPlaylistInputSchema, input, 'input');
     const userId = ctx.userId!;
 
-    // Verify playlist exists and is public
-    const [playlist] = await db
-      .select({
-        uuid: dbSchema.playlists.uuid,
-        isPublic: dbSchema.playlists.isPublic,
-      })
-      .from(dbSchema.playlists)
-      .where(eq(dbSchema.playlists.uuid, validatedInput.playlistUuid))
-      .limit(1);
-
-    if (!playlist) {
-      throw new Error('Playlist not found');
-    }
-    if (!playlist.isPublic) {
-      throw new Error('Cannot follow a private playlist');
-    }
+    await verifyPlaylistAccess(validatedInput.playlistUuid, userId);
 
     await db
       .insert(dbSchema.playlistFollows)

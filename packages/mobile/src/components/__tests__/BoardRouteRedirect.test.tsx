@@ -13,6 +13,7 @@ import type { BoardRouteStatus } from '../../lib/routing/use-board-route-target'
 const LOGIN_HREF = vi.hoisted(() => '/auth/login?next=%2Fb%2Fthe-gym%2F40%2Flist');
 
 const analytics = vi.hoisted(() => ({ track: vi.fn() }));
+const qrScans = vi.hoisted(() => ({ track: vi.fn() }));
 const routeStatus = vi.hoisted(() => ({ current: 'resolving' as BoardRouteStatus }));
 // The kill switch, as the component reads it. `true` = feature on.
 const anonymousClimbView = vi.hoisted(() => ({ enabled: true, seen: [] as (boolean | undefined)[] }));
@@ -25,7 +26,11 @@ const router = vi.hoisted(() => ({ replace: vi.fn() }));
 // The hand-off callback the hook holds. A successful hand-off never becomes a
 // status — the real hook navigates the screen away in the same batch — so this
 // is the only handle a test has on the `resolved` leg.
-const handoff = vi.hoisted(() => ({ current: null as (() => void) | null }));
+const joinConfirm = vi.hoisted(() => vi.fn(async () => true));
+const boardJoin = vi.hoisted(() => ({ current: null as ((boardName: string) => Promise<boolean>) | null }));
+const handoff = vi.hoisted(() => ({
+  current: null as ((handedOff: { boardType: string | null }) => void) | null,
+}));
 // Whatever `onlineManager` reports when the not-found lands. An offline
 // not-found is the transient state a reconnect heals, not a dead link.
 const connectivity = vi.hoisted(() => ({ isOnline: true }));
@@ -45,6 +50,7 @@ vi.mock('expo-router', () => ({
 }));
 
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('../../providers/dialog-provider', () => ({ useConfirm: () => joinConfirm }));
 vi.mock('../../providers/theme-provider', () => ({ useTheme: () => ({ systemColors: { secondaryLabel: '#888' } }) }));
 
 vi.mock('../ActivityIndicator', () => ({
@@ -58,6 +64,7 @@ vi.mock('../Button', () => ({
 }));
 
 vi.mock('../../lib/analytics', () => ({ track: analytics.track }));
+vi.mock('../../lib/board-qr-scan', () => ({ trackBoardQrScan: qrScans.track }));
 vi.mock('../../lib/routing/anonymous-auth-gate', () => ({
   buildLoginHrefWithReturn: () => LOGIN_HREF,
 }));
@@ -72,8 +79,16 @@ vi.mock('../AnonymousClimbView', () => ({
   },
 }));
 vi.mock('../../lib/routing/use-board-route-target', () => ({
-  useBoardRouteTarget: (_target: unknown, options?: { onHandedOff?: () => void; anonymousClimbEnabled?: boolean }) => {
+  useBoardRouteTarget: (
+    _target: unknown,
+    options?: {
+      onHandedOff?: (handedOff: { boardType: string | null }) => void;
+      anonymousClimbEnabled?: boolean;
+      confirmBoardJoin?: (boardName: string) => Promise<boolean>;
+    },
+  ) => {
     handoff.current = options?.onHandedOff ?? null;
+    boardJoin.current = options?.confirmBoardJoin ?? null;
     anonymousClimbView.seen.push(options?.anonymousClimbEnabled);
     return routeStatus.current === 'anonymous-climb' && anonymousResult.climbHasLanded
       ? {
@@ -89,7 +104,7 @@ vi.mock('../../lib/routing/use-board-route-target', () => ({
 const ANONYMOUS_CLIMB = { uuid: '0A1B2C3D4E5F60718293A4B5C6D7E8F9', name: 'Crimpy Thing' } as unknown as Climb;
 const ANONYMOUS_BOARD_CONFIG = { boardName: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,20', angle: 40 };
 
-const { BoardRouteHandoff, BoardRouteRedirect } = await import('../BoardRouteRedirect');
+const { BoardRouteHandoff, BoardRouteRedirect, boardRouteSubject } = await import('../BoardRouteRedirect');
 
 const CLIMB_TARGET = {
   kind: 'climb',
@@ -135,6 +150,16 @@ describe('BoardRouteRedirect', () => {
     expect(queryByTestId('spinner')).toBeNull();
   });
 
+  // #5960: a deleted spray wall's share link said "Climb not found".
+  it('names a board, not a climb, when a board link is dead', () => {
+    const { getByText, queryByText } = render(
+      createElement(BoardRouteRedirect, { status: 'not-found' as BoardRouteStatus, subject: 'board' }),
+    );
+
+    expect(getByText('mobile.detail.boardNotFound')).toBeTruthy();
+    expect(queryByText('mobile.detail.notFound')).toBeNull();
+  });
+
   // Web only in practice: the signed-out visitor goes to login carrying the path
   // so the climb survives the round trip. The claim under test is that the
   // component forwards the gate's href unchanged — it must not rebuild one.
@@ -153,7 +178,7 @@ describe('Board Route Handoff event', () => {
   /** Fire the hand-off the way the real hook does: from inside its effect. */
   function handOff() {
     if (!handoff.current) throw new Error('the hook was never handed an onHandedOff callback');
-    act(() => handoff.current?.());
+    act(() => handoff.current?.({ boardType: 'kilter' }));
   }
 
   // The success leg never arrives as a status: the hand-off effect navigates the
@@ -365,5 +390,103 @@ describe('BoardRouteHandoff anonymous climb', () => {
     render(createElement(BoardRouteHandoff, { target: CLIMB_TARGET }));
 
     expect(anonymousClimbView.seen.at(-1)).toBe(false);
+  });
+});
+
+// A printed code that opened the app (#4415). Counted only once the board has
+// opened: a dead link or a bounce to login is not a scan that landed.
+describe('Board QR Scanned', () => {
+  const SLUG_LIST_TARGET = { kind: 'slug-list', slug: 'garage', angle: null } as BoardRouteTarget;
+
+  function handOff(boardType: string | null) {
+    if (!handoff.current) throw new Error('the hook was never handed an onHandedOff callback');
+    act(() => handoff.current?.({ boardType }));
+  }
+
+  it('counts the scan once the hand-off opens the board, with its type', () => {
+    render(createElement(BoardRouteHandoff, { target: SLUG_LIST_TARGET, qrMedium: 'board' }));
+    expect(qrScans.track).not.toHaveBeenCalled();
+
+    handOff('spray');
+
+    expect(qrScans.track).toHaveBeenCalledTimes(1);
+    // The URL is the dedupe key and never leaves the phone.
+    expect(qrScans.track).toHaveBeenCalledWith('board', 'spray', '/b/garage');
+    // The route's own funnel event still fires alongside it.
+    expect(analytics.track).toHaveBeenCalledWith(SHARED_EVENTS.BoardRouteHandoff, {
+      kind: 'slug-list',
+      status: 'resolved',
+      source: 'deep-link',
+    });
+  });
+
+  it('counts once when the hand-off is reported twice', () => {
+    render(createElement(BoardRouteHandoff, { target: SLUG_LIST_TARGET, qrMedium: 'kiosk' }));
+    handOff('kilter');
+    handOff('kilter');
+
+    expect(qrScans.track).toHaveBeenCalledTimes(1);
+  });
+
+  it('counts nothing for an open that did not come off a code', () => {
+    render(createElement(BoardRouteHandoff, { target: SLUG_LIST_TARGET, qrMedium: null }));
+    handOff('kilter');
+
+    expect(qrScans.track).not.toHaveBeenCalled();
+  });
+
+  it.each(['not-found', 'auth-required', 'resolving'] as const)('counts nothing while the route is %s', (status) => {
+    routeStatus.current = status;
+
+    render(createElement(BoardRouteHandoff, { target: SLUG_LIST_TARGET, qrMedium: 'board' }));
+
+    expect(qrScans.track).not.toHaveBeenCalled();
+  });
+});
+
+describe('boardRouteSubject', () => {
+  it('reads a list link as a board and a climb link as a climb', () => {
+    expect(boardRouteSubject({ kind: 'slug-list', slug: 'garage', angle: 40 } as BoardRouteTarget)).toBe('board');
+    expect(boardRouteSubject({ ...CLIMB_TARGET, kind: 'list' } as BoardRouteTarget)).toBe('board');
+    expect(boardRouteSubject(CLIMB_TARGET)).toBe('climb');
+    expect(boardRouteSubject(SLUG_CLIMB_TARGET)).toBe('climb');
+    expect(boardRouteSubject(null)).toBe('climb');
+  });
+});
+
+describe('BoardRouteHandoff dead end', () => {
+  it('names the board for a dead board link', () => {
+    routeStatus.current = 'not-found';
+    const { getByText } = render(
+      createElement(BoardRouteHandoff, {
+        target: { kind: 'slug-list', slug: 'garage', angle: 40 } as BoardRouteTarget,
+      }),
+    );
+    expect(getByText('mobile.detail.boardNotFound')).toBeTruthy();
+  });
+
+  it('names the climb for a dead climb link', () => {
+    routeStatus.current = 'not-found';
+    const { getByText } = render(createElement(BoardRouteHandoff, { target: CLIMB_TARGET }));
+    expect(getByText('mobile.detail.notFound')).toBeTruthy();
+  });
+});
+
+describe('share link Join prompt', () => {
+  it('passes an explicit confirm showing the board name and member-name disclosure', async () => {
+    render(
+      createElement(BoardRouteHandoff, {
+        target: { kind: 'slug-list', slug: 'garage', angle: null },
+        inviteToken: 'Ab3_dE-fGhIjKlMnOpQrSt',
+      }),
+    );
+    expect(joinConfirm).not.toHaveBeenCalled();
+    await boardJoin.current!('Friends Garage');
+    expect(joinConfirm).toHaveBeenCalledWith({
+      title: 'boardShareLink.joinHeading',
+      message: 'boardShareLink.joinBody',
+      confirmLabel: 'boardShareLink.join',
+      cancelLabel: 'boardShareLink.cancel',
+    });
   });
 });

@@ -1,4 +1,20 @@
 // @vitest-environment jsdom
+vi.mock('../../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
+vi.mock('../../../src/providers/queue-provider', () => ({
+  useQueueActions: () => ({ clearSession: vi.fn(async () => {}) }),
+}));
 //
 // Regression cover for #3897: with no signal the board picker used to render its
 // "No boards yet — create one" empty state. `myBoards` is a plain network query and
@@ -45,7 +61,6 @@ const state = vi.hoisted(() => ({
     isError: false,
     isRefetching: false,
   },
-  popular: { configs: [] as unknown[] },
 }));
 
 const board = (overrides: Partial<UserBoard> & { uuid: string; name: string }): UserBoard =>
@@ -68,12 +83,63 @@ vi.mock('react-native', () => ({
   ScrollView: ({ children }: Children) => createElement('div', null, children),
   Pressable: ({ children, onPress }: Children & { onPress?: () => void }) =>
     createElement('button', { onClick: onPress, type: 'button' }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
+vi.mock('../../../src/lib/spray/use-spray-import-progress', () => ({
+  useSprayImportProgress: (boards: unknown[]) => ({ boards, stale: false, unfinishedWallUuids: new Set<string>() }),
+}));
+
+const navigationMock = vi.hoisted(() => ({ setOptions: vi.fn() }));
 vi.mock('expo-router', () => ({
   useRouter: () => routerMock,
   useLocalSearchParams: () => ({}),
+  useIsFocused: () => true,
+  useNavigation: () => navigationMock,
+}));
+
+// The In range slot's scan, and the sections built on it, as stand-ins: their
+// own suites cover them (use-picker-board-scan, picker-top-view, InRangeSection).
+const scanCtrl = vi.hoisted(() => ({ focused: null as boolean | null }));
+vi.mock('../../../src/components/board-discovery/use-picker-board-scan', () => ({
+  usePickerBoardScan: (options: { focused: boolean }) => {
+    scanCtrl.focused = options.focused;
+    return {
+      phase: 'hidden',
+      rows: [],
+      lookup: 'none',
+      listenedLongEnough: () => true,
+      start: vi.fn(),
+      stop: vi.fn(),
+      openSettings: vi.fn(),
+      retryLookup: vi.fn(),
+    };
+  },
+}));
+vi.mock('../../../src/components/board-discovery/use-in-range-location-hint', () => ({
+  useInRangeLocationHint: () => null,
+}));
+vi.mock('../../../src/components/board-discovery/InRangeSection', () => ({
+  InRangeSection: () => createElement('div', { 'data-testid': 'in-range' }),
+}));
+vi.mock('../../../src/components/board-discovery/AddBoardMenu', () => ({ AddBoardMenu: () => null }));
+vi.mock('../../../src/components/board-discovery/NearbyReservedSlot', () => ({
+  NearbyReservedSlot: ({ searching, children }: { searching: boolean; children?: ReactNode }) =>
+    searching ? createElement('div', { 'data-testid': 'near-you-placeholder' }) : children,
+}));
+vi.mock('../../../src/components/location/LocationAskCard', () => ({
+  LocationAskCard: ({ permission }: { permission: string }) =>
+    createElement('div', { 'data-testid': 'location-banner', 'data-permission': permission }),
+}));
+vi.mock('../../../src/components/board-discovery/DiscoveryBoardArt', () => ({ DiscoveryBoardArt: () => null }));
+vi.mock('../../../src/lib/boards/pending-board-recognition', () => ({
+  setPendingBoardRecognition: vi.fn(),
+  clearPendingBoardRecognition: vi.fn(),
+  consumePendingBoardRecognition: vi.fn(async () => {}),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -92,16 +158,11 @@ vi.mock('react-i18next', () => ({
         'mobile.offline.pickerEmptyBody': 'Boards you make available offline show up here.',
         'mobile.offline.pickerQueuedNotice': "{{name}} is queued — it downloads the moment you're back online.",
         'mobile.discovery.yourBoardsTitle': 'Your boards',
-        'mobile.discovery.popularTitle': 'Popular',
-        'mobile.discovery.create': 'Create a board',
-        // Short form, tile only — "Create board" truncates in an 84 dp tile.
-        'mobile.discovery.createTile': 'Create',
-        'mobile.discovery.findNearby': 'Find nearby',
-        'mobile.discovery.bluetooth': 'Bluetooth',
-        'mobile.discovery.findGym': 'Find a gym',
+        'mobile.discovery.nearbyTitle': 'Near you',
+        'mobile.discovery.nearbyMap': 'Map',
+        'mobile.addBoard.setUp': 'Set up a board',
+        'mobile.addBoard.sprayWall': 'Add a Spraywall',
         'mobile.boardSwitchError': 'Could not switch board',
-        'mobile.manage.edit': 'Edit',
-        'mobile.manage.done': 'Done',
         'myBoards.title': 'Manage boards',
       };
       const template = map[key] ?? key;
@@ -124,19 +185,24 @@ vi.mock('@boardsesh/offline-sync', () => ({
 }));
 
 vi.mock('../../../src/lib/graphql/hooks', () => ({
+  useBoard: () => ({ data: undefined }),
   useMyBoards: () => ({ ...state.myBoards, refetch: vi.fn() }),
-  usePopularBoardConfigs: () => ({ data: state.popular }),
   useNearbyBoards: () => ({ data: undefined, isLoading: false }),
+  useGymBoards: () => ({ data: undefined }),
   useProfile: () => ({ data: { id: 'me' } }),
   useDeleteBoard: () => ({ mutateAsync: vi.fn(), isPending: false, variables: undefined }),
   useUnfollowBoard: () => ({ mutateAsync: vi.fn(), isPending: false, variables: undefined }),
+  useLinkBoardToGym: () => ({ mutateAsync: vi.fn() }),
+  useDetachBoardFromGym: () => ({ mutateAsync: vi.fn() }),
   usePinBoard: () => ({ mutate: vi.fn() }),
 }));
 
 vi.mock('../../../src/lib/graphql/use-active-board', () => ({
+  getActiveBoardWriteGeneration: () => 0,
   useActiveBoard: () => ({ data: state.activeBoard }),
   useSetActiveBoard: () => setActiveBoardMock,
-  useClearActiveBoard: () => vi.fn(),
+  useClearActiveBoardIfCurrentGeneration: () => vi.fn(),
+  useSetActiveBoardIfCurrentGeneration: () => vi.fn(),
 }));
 
 vi.mock('../../../src/hooks/use-current-user-id', () => ({
@@ -149,7 +215,15 @@ vi.mock('../../../src/lib/board-discovery/use-adopt-found-board', () => ({
 }));
 
 vi.mock('../../../src/lib/use-device-location', () => ({
-  useDeviceLocation: () => ({ status: 'idle', coords: undefined, request: vi.fn() }),
+  useDeviceLocation: () => ({
+    status: 'idle',
+    permission: 'granted',
+    permissionChecked: true,
+    coords: undefined,
+    request: vi.fn(),
+    requestIfAllowed: vi.fn(async () => {}),
+    refresh: vi.fn(async () => false),
+  }),
 }));
 
 // Keep the activation/link decision real while replacing credential and preference I/O.
@@ -168,6 +242,7 @@ vi.mock('../../../src/providers/auth-provider', () => ({
 vi.mock('../../../src/providers/toast-provider', () => ({ useToast: () => toastMock }));
 vi.mock('../../../src/providers/dialog-provider', () => ({ useConfirm: () => vi.fn(async () => true) }));
 vi.mock('../../../src/providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     brandColors: { primary: '#6D28D9' },
     systemColors: { tertiaryLabel: '#999' },
@@ -203,11 +278,12 @@ vi.mock('../../../src/offline/use-confirm-board-download', () => ({
   useConfirmBoardDownload: () => ({ confirmAndDownload: confirmAndDownloadMock, armWithoutConfirm: vi.fn() }),
 }));
 vi.mock('../../../src/providers/feature-flags-provider', () => ({
+  useDirectoryReportsEnabled: () => false,
+  useFeatureFlagsResolved: () => true,
   useFeatureFlag: () => false,
   useOfflineDownloadsEnabled: () => true,
-  // The spray-wall tile is behind its own flag (epic #5346, SW-09). Off here so
-  // these cases keep describing the board row they were written for.
-  useSprayWallsEnabled: () => false,
+  usePickerAutoScanEnabled: () => true,
+  useAddBoardWizardEnabled: () => false,
 }));
 vi.mock('../../../src/offline/use-downloaded-scope-keys', () => ({
   useDownloadedScopeKeys: () => ({ data: state.downloadedScopeKeys }),
@@ -222,6 +298,7 @@ vi.mock('../../../src/offline/use-remember-downloaded-boards', () => ({
 }));
 
 vi.mock('../../../src/theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 5: 20, 8: 32 },
 }));
 vi.mock('../../../src/theme/ios-colors', () => ({
@@ -240,51 +317,86 @@ vi.mock('../../../src/components/Button', () => ({
 vi.mock('../../../src/components/ActivityIndicator', () => ({
   ActivityIndicator: () => createElement('div', { 'data-testid': 'spinner' }),
 }));
+vi.mock('../../../src/components/report-problem/use-report-problem', () => ({
+  useReportProblemHost: () => ({ openReport: vi.fn(), sheet: null }),
+}));
+vi.mock('../../../src/components/report-problem/ReportReviewSheet', () => ({ ReportReviewSheet: () => null }));
+vi.mock('../../../src/components/board-discovery/BoardDetailSheet', () => ({ BoardDetailSheet: () => null }));
+
+// The Velvet shelf pieces, as plain markup: a section, its title, and its action
+// as a button named for what it opens.
+vi.mock('../../../src/components/ShelfHeader', async () => {
+  const { createElement: h } = await import('react');
+  type ShelfProps = {
+    title: string;
+    action?: { label: string; accessibilityLabel?: string; onPress: () => void };
+    children?: ReactNode;
+  };
+  return {
+    SHELF_SECTION_GAP: 28,
+    ShelfSection: ({ title, action, children }: ShelfProps) =>
+      h(
+        'section',
+        null,
+        h('span', null, title),
+        action
+          ? h('button', { type: 'button', onClick: action.onPress }, action.accessibilityLabel ?? action.label)
+          : null,
+        children,
+      ),
+  };
+});
+vi.mock('../../../src/components/EmptyState', async () => {
+  const { createElement: h } = await import('react');
+  return {
+    EmptyState: ({ title, body, actions }: { title: string; body?: string; actions?: ReactNode }) =>
+      h('div', null, h('span', null, title), body ? h('span', null, body) : null, actions),
+  };
+});
+vi.mock('../../../src/components/TextAction', async () => {
+  const { createElement: h } = await import('react');
+  return {
+    TextAction: ({ label, onPress }: { label: string; onPress: () => void }) =>
+      h('button', { type: 'button', onClick: onPress }, label),
+    textActionOverhang: () => ({ top: 4, bottom: 20 }),
+  };
+});
+// Your boards and the offline list are rows now; the suite drives them as it
+// drives the carousels, through the same stand-in.
+vi.mock('../../../src/components/board-discovery/BoardRowList', async () => {
+  const { BoardCarousel } = await import('../../../src/components/board-discovery/BoardCarousel');
+  return { BoardRowList: BoardCarousel };
+});
 vi.mock('../../../src/components/board-discovery/BoardCarousel', () => ({
   BoardCarousel: ({
     items,
     onSelect,
-    onDownload,
-    actionFor,
-    onAction,
+    menuCapabilities,
+    onMenuAction,
   }: {
     items: CarouselItem[];
     onSelect: (item: CarouselItem) => void;
-    onDownload?: (item: CarouselItem) => void;
-    actionFor?: (item: CarouselItem) => string | null;
-    onAction?: (item: CarouselItem) => void;
+    menuCapabilities?: { canDownload: boolean };
+    onMenuAction?: (item: CarouselItem, action: 'download', via: 'menu_button') => void;
   }) =>
     createElement(
       'div',
-      { 'data-testid': 'carousel', 'data-has-actions': onAction === undefined ? 'no' : 'yes' },
+      { 'data-testid': 'carousel', 'data-has-actions': onMenuAction === undefined ? 'no' : 'yes' },
       items.map((item) =>
         createElement('span', { key: item.key }, [
           createElement('button', { key: 'select', type: 'button', onClick: () => onSelect(item) }, item.title),
-          actionFor && onAction
+          // Only the Your Boards carousel offers it; the menu's Download for
+          // offline is what fires the board-card accept event.
+          menuCapabilities?.canDownload && onMenuAction
             ? createElement(
                 'button',
-                { key: 'action', type: 'button', onClick: () => onAction(item) },
-                `${actionFor(item) ?? 'none'} ${item.title}`,
-              )
-            : null,
-          // Only the Your Boards carousel is handed one; the download glyph is
-          // what fires the board-card accept event.
-          onDownload
-            ? createElement(
-                'button',
-                { key: 'download', type: 'button', onClick: () => onDownload(item) },
+                { key: 'download', type: 'button', onClick: () => onMenuAction(item, 'download', 'menu_button') },
                 `download ${item.title}`,
               )
             : null,
         ]),
       ),
     ),
-}));
-vi.mock('../../../src/components/board-discovery/BoardModeCard', () => ({
-  BoardModeCard: ({ label }: { label: string }) => createElement('div', { 'data-mode-card': label }, label),
-}));
-vi.mock('../../../src/components/board-discovery/BluetoothQuickstartSheet', () => ({
-  BluetoothQuickstartSheet: () => createElement('div', { 'data-testid': 'ble-sheet' }),
 }));
 // First-board mode (#5654) has its own suite, index-first-board.test.tsx.
 vi.mock('../../../src/components/board-discovery/FirstBoardChoice', () => ({ FirstBoardChoice: () => null }));
@@ -304,8 +416,14 @@ beforeEach(() => {
   state.offlineCatalog = null;
   state.activeBoard = undefined;
   state.myBoards = { data: undefined, isLoading: false, isError: false, isRefetching: false };
-  state.popular = { configs: [] };
+  scanCtrl.focused = null;
 });
+
+/** The header's trailing item as the screen last set it, or null. */
+function headerPlusSet(): boolean {
+  const options = navigationMock.setOptions.mock.calls.at(-1)?.[0] as { headerRight?: unknown } | undefined;
+  return typeof options?.headerRight === 'function';
+}
 
 describe('board picker with no usable network list', () => {
   it('lists the downloaded board and switches to it on tap', async () => {
@@ -450,9 +568,9 @@ describe('board picker with no usable network list', () => {
   });
 
   // Every board action on this screen is a server mutation, so the offline branch
-  // offers none of them — and no Edit control either, since there is nothing
-  // behind it that could succeed.
-  it('offers no per-card action and no Edit control on the offline branch', () => {
+  // draws plain cards with no menu, since there is nothing behind one that
+  // could succeed.
+  it('offers no card menu on the offline branch', () => {
     state.isOffline = true;
     state.connectivityReason = 'device_offline';
     state.offlineCards = [downloadedBoard];
@@ -544,22 +662,6 @@ describe('board picker with no usable network list', () => {
       isError: false,
       isRefetching: false,
     };
-    state.popular = {
-      configs: [
-        {
-          boardType: 'kilter',
-          layoutId: 8,
-          sizeId: 17,
-          setIds: [20, 21],
-          setNames: ['Bolt ons'],
-          climbCount: 1,
-          totalAscents: 1,
-          boardCount: 1,
-          displayName: 'Kilter Original',
-          sizeName: '12 x 12',
-        },
-      ],
-    };
     // Downloaded snapshots exist, but online they must not change anything.
     state.offlineCards = [downloadedBoard];
     state.downloadedScopeKeys = ['kilter:8:17'];
@@ -567,11 +669,26 @@ describe('board picker with no usable network list', () => {
     render(createElement(BoardSelection));
 
     expect(screen.getByRole('button', { name: 'Network board' })).toBeTruthy();
-    expect(screen.getByText('Popular')).toBeTruthy();
     expect(screen.queryByText("No signal — here are the boards you've downloaded.")).toBeNull();
-    // All four discovery mode cards, including the two that need a connection.
-    for (const label of ['Find nearby', 'Bluetooth', 'Find a gym', 'Create']) {
-      expect(document.querySelector(`[data-mode-card="${label}"]`)).toBeTruthy();
-    }
+    // Everything that needs a connection: the In range slot, Near you and the +.
+    expect(screen.getByTestId('in-range')).toBeTruthy();
+    expect(screen.getByText('Near you')).toBeTruthy();
+    expect(headerPlusSet()).toBe(true);
+    expect(scanCtrl.focused).toBe(true);
+  });
+
+  // Offline there is no In range slot to fill and nothing behind the + that
+  // could work, so the scan stays off and the top bar stays bare.
+  it('neither scans nor offers the + on the offline branch', () => {
+    state.isOffline = true;
+    state.connectivityReason = 'device_offline';
+    state.offlineCards = [downloadedBoard];
+    state.downloadedScopeKeys = ['kilter:8:17'];
+
+    render(createElement(BoardSelection));
+
+    expect(screen.queryByTestId('in-range')).toBeNull();
+    expect(scanCtrl.focused).toBe(false);
+    expect(headerPlusSet()).toBe(false);
   });
 });

@@ -1,46 +1,82 @@
+import { assertLegacyIdentityWriterAllowed } from '../auth/current-store/identity-writer-gate';
+import {
+  captureIdentityAuthority,
+  revalidateIdentityAuthority,
+  type IdentityAuthorityReceipt,
+} from '../auth/authority/router';
+import { authenticateIdentityPassword } from '../auth/authority/password-verification';
+import {
+  createWatchPairCapability,
+  parseWatchPairCapability,
+  WATCH_PAIR_CAPABILITY_TTL_SECONDS,
+} from '../auth/watch-pairing-capability';
+import { watchPairingMode } from '../auth/watch-pairing-configuration';
+import { nativeSessionRequiresAccountCutoff, UNKNOWN_WEB_NATIVE_SESSION_PREFIX } from '../auth/native-session-ancestry';
+import {
+  currentNativeRevocationMode,
+  parseNativeRevocationMode,
+} from '../auth/authority/native-revocation-configuration';
+import { legacyBridgeMode } from '../auth/authority/bridge';
+import { readAuthTimeClaim } from '@boardsesh/auth-protocol/auth-time';
+import { cleanupNativeRefreshRows } from '../auth/authority/native-refresh-retention';
+import { bindNativeRefreshSession } from '../auth/authority/native-session';
+import { revokeNativeCredentials } from '../auth/authority/native-revocation';
+import { identityMirrorMode } from '../auth/authority/mirror-configuration';
 import type { IncomingMessage, ServerResponse } from 'http';
 import crypto from 'crypto';
 import { SignJWT, createRemoteJWKSet, jwtVerify } from 'jose';
-import { compare, hash } from 'bcryptjs';
-import { eq, and, isNull, lt, or, isNotNull, sql } from 'drizzle-orm';
-import { mobileRefreshTokens, users, userCredentials, accounts, userProfiles } from '@boardsesh/db/schema/auth';
+import { parseAccountCreationReceipt, type AccountCreationReceipt } from '@boardsesh/analytics';
+import { eq, and, isNull, DrizzleQueryError, sql } from 'drizzle-orm';
+import type { DbInstance } from '@boardsesh/db/client';
+import { normalizeAccountEmail, soleAccount } from '@boardsesh/auth-protocol/account-email';
+import { findAccountHoldersByEmail } from '@boardsesh/db/queries/account-email';
+import { mobileRefreshTokens, users, accounts, userProfiles, authSessionDenials } from '@boardsesh/db/schema/auth';
 import { db } from '../db/client';
 import { redisClientManager } from '../redis/client';
 import { applyCorsHeaders } from './cors';
-import { validateToken } from '../middleware/auth';
+import { validateHttpAuthToken } from './auth-admission';
+import {
+  admitsCredential,
+  AuthAdmissionUnavailableError,
+  AuthSubjectDeniedError,
+  isAuthAdmissionUnavailable,
+  isHumanSubjectActive,
+  PasswordProofStaleError,
+  requireHumanSubjectForIssuance,
+  lockPasswordProofAuthority,
+  type PasswordProof,
+} from '../auth/human-admission';
+import { decideCredential, type SubjectCutoffState } from '../auth/credential-cutoffs';
 import { logger } from '../utils/logger';
-
-/**
- * Fixed dummy bcrypt hash used to keep the credentials handler's response
- * time roughly constant for unknown emails / OAuth-only users. Without it,
- * an attacker could enumerate registered accounts by timing the response.
- * The plaintext is irrelevant — `compare` always returns false against it.
- */
-const DUMMY_PASSWORD_HASH = '$2b$10$CwTycUXWue0Thq9StjUM0uJ8/oQbk1Ec7T0p/7K8nXfRzC2VyM4dy';
+import { getPostgresErrorCode } from '../utils/postgres-errors';
+import {
+  currentStoreNativeRegistrationConfiguration,
+  currentStoreNativeOAuthConfiguration,
+} from '../auth/current-store/authority-configuration';
+import {
+  boundSignInLockWaits,
+  transactionSettings,
+  type WebPasswordAuthority,
+} from '../auth/current-store/command-context';
+import { CurrentStoreFoundationError, lockIdentityManifest } from '../auth/current-store/foundation-context';
+import { insertReservedPasswordIdentity } from '../auth/current-store/reserved-password-registration';
+import { withNativeDeviceToken } from '../auth/device-token';
+import { passwordGuessLimiter, type PasswordGuessAdmission } from '../auth/password-guess-limit';
+import { NATIVE_V1_DEVICE_TOKEN_HEADER } from '@boardsesh/auth-protocol/native-v1';
+import {
+  resolveReservedNativeOAuthIdentity,
+  resolveNativeOAuthDisplayName as resolveDisplayName,
+  type NativeOAuthProvider as OAuthProvider,
+  type VerifiedNativeOAuthIdentity as VerifiedOAuthIdentity,
+} from '../auth/current-store/native-oauth-identity';
+import {
+  parseCurrentStorePasswordRegistration,
+  prepareCurrentStorePasswordRegistration,
+  insertCurrentStorePasswordIdentity,
+} from '../auth/current-store/password-identity';
 
 /** Generic error returned for all credential validation failures. */
 const INVALID_CREDENTIALS_ERROR = 'Invalid email or password';
-
-/**
- * Bound duplicate-by-case password checks so malformed legacy account groups
- * cannot turn one rate-limited login attempt into unbounded bcrypt work. The
- * current production maximum is six; leave headroom while account cleanup and
- * a case-insensitive unique index remain separate work.
- */
-const MAX_CREDENTIAL_CANDIDATES = 8;
-
-/**
- * Registration field bounds — mirror the web register route's Zod schema
- * (packages/web/app/api/auth/register/route.ts) so both signup paths accept
- * exactly the same inputs. The email regex is the same lax shape the web/mobile
- * client validators use: it rejects nothing the server would otherwise accept.
- */
-const REGISTER_EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-const PASSWORD_MIN_LENGTH = 8;
-const PASSWORD_MAX_LENGTH = 128;
-const NAME_MAX_LENGTH = 100;
-/** bcrypt cost factor — matches the web register route. */
-const BCRYPT_COST = 12;
 
 // Transfer tokens are short-lived (120s) and exchanged between our own
 // servers, so 5s tolerance is sufficient. Long-lived JWTs use 60s in
@@ -82,7 +118,10 @@ const JWT_AUDIENCE = 'boardsesh-mobile';
 const consumedTransferTokens = new Map<string, number>();
 
 /** TTL for consumed token entries (125s — slightly longer than the 120s token TTL). */
-const CONSUMED_TOKEN_TTL_SECONDS = 125;
+// At most 125 signed seconds + two 5-second verification tolerances, plus
+// 60 seconds of clock offset in each replica, is 255 seconds. Five minutes
+// also covers whole-second rounding and scheduling margin across replicas.
+const CONSUMED_TOKEN_TTL_SECONDS = 5 * 60;
 const CONSUMED_TOKEN_TTL_MS = CONSUMED_TOKEN_TTL_SECONDS * 1000;
 
 /** Cleanup interval for expired consumed token entries. */
@@ -118,15 +157,16 @@ async function markTokenConsumed(tokenSignature: string): Promise<'consumed' | '
     try {
       const { publisher } = redisClientManager.getClients();
       const redisKey = `${CONSUMED_TOKEN_REDIS_PREFIX}${tokenSignature}`;
-      // SET key "1" NX EX 125 — returns "OK" if set, null if key already existed
+      // Keep the replay key beyond the latest accepted signed expiry plus skew.
       const result = await publisher.set(redisKey, '1', 'EX', CONSUMED_TOKEN_TTL_SECONDS, 'NX');
       return result === 'OK' ? 'consumed' : 'replay';
-    } catch (error) {
+    } catch {
       // Redis failure: fall through to in-memory map so the endpoint stays available.
-      logger.warn('[NativeAuth] Redis SET NX failed for consumed token, falling back to in-memory:', error);
+      logger.warn('[NativeAuth] Redis replay store unavailable', { code: 'REDIS_REPLAY_WRITE_UNAVAILABLE' });
     }
   }
 
+  if (legacyBridgeMode(process.env) === 'on') return 'overloaded';
   // In-memory fallback (single-instance only)
   if (consumedTransferTokens.has(tokenSignature)) {
     return 'replay';
@@ -145,7 +185,7 @@ async function markTokenConsumed(tokenSignature: string): Promise<'consumed' | '
 
 /**
  * Check if a transfer token signature has already been consumed (read-only check).
- * Used for the early-reject path before verifying the HMAC.
+ * Used for the early-reject path after verifying the HMAC, before the account lookup.
  */
 async function isTokenConsumed(tokenSignature: string): Promise<boolean> {
   if (redisClientManager.isRedisConnected()) {
@@ -154,18 +194,19 @@ async function isTokenConsumed(tokenSignature: string): Promise<boolean> {
       const redisKey = `${CONSUMED_TOKEN_REDIS_PREFIX}${tokenSignature}`;
       const result = await publisher.exists(redisKey);
       return result === 1;
-    } catch (error) {
-      logger.warn('[NativeAuth] Redis EXISTS failed for consumed token, falling back to in-memory:', error);
+    } catch {
+      logger.warn('[NativeAuth] Redis replay check unavailable', { code: 'REDIS_REPLAY_READ_UNAVAILABLE' });
     }
   }
   return consumedTransferTokens.has(tokenSignature);
 }
 
 // ---------------------------------------------------------------------------
-// IP-based rate limiting for auth endpoints
+// Per-instance auth rate limiting (IP or presented-refresh digest)
 //
 // Per-instance only — with N backend instances the effective limit is
-// AUTH_RATE_LIMIT_MAX × N per IP. Redis-backed rate limiting would add
+// AUTH_RATE_LIMIT_MAX × N per bucket: IP for other rate-limited auth endpoints,
+// or SHA-256 of the presented refresh secret. Redis-backed limiting would add
 // a round-trip to every auth request for marginal benefit given that
 // the high-risk replay path is already Redis-backed (SET NX EX).
 // ---------------------------------------------------------------------------
@@ -175,50 +216,67 @@ type AuthRateLimitEntry = {
   resetAt: number;
 };
 
-/** Rate limit state per IP address. */
+/** IP bucket state for rate-limited non-refresh auth endpoints. */
 const authRateLimitMap = new Map<string, AuthRateLimitEntry>();
 
-/** Maximum auth requests per IP per minute. */
+/** Only secrets found in the refresh table can occupy these bounded buckets. */
+const refreshRateLimitMap = new Map<string, AuthRateLimitEntry>();
+
+/** Missing secrets cannot consume the capacity reserved for existing clients. */
+const invalidRefreshRateLimitMap = new Map<string, AuthRateLimitEntry>();
+let invalidRefreshCapacityRetryAt = 0;
+
+/** Maximum requests per IP or refresh-digest bucket per minute. */
 const AUTH_RATE_LIMIT_MAX = 10;
 
 /** Rate limit window in milliseconds (1 minute). */
 const AUTH_RATE_LIMIT_WINDOW_MS = 60_000;
 
-/** Max entries before triggering early eviction. */
+/** Maximum entries in each map before eviction or capacity refusal. */
 const MAX_RATE_LIMIT_ENTRIES = 50_000;
 
+/** A full invalid-input map must not trigger 50,000-entry scans per request. */
+const INVALID_REFRESH_CAPACITY_RECHECK_MS = 1000;
+
 /** Evict expired entries from the rate limit map. */
-function evictExpiredRateLimitEntries(): void {
+function evictExpiredRateLimitEntries(entries: Map<string, AuthRateLimitEntry>): void {
   const now = Date.now();
-  for (const [ipAddress, entry] of authRateLimitMap) {
-    if (now > entry.resetAt) authRateLimitMap.delete(ipAddress);
+  for (const [bucketKey, entry] of entries) {
+    if (now >= entry.resetAt) entries.delete(bucketKey);
   }
 }
 
 // Periodically clean up expired rate limit entries.
-const rateLimitEvictionHandle = setInterval(evictExpiredRateLimitEntries, AUTH_RATE_LIMIT_WINDOW_MS);
+const rateLimitEvictionHandle = setInterval(() => {
+  evictExpiredRateLimitEntries(authRateLimitMap);
+  evictExpiredRateLimitEntries(refreshRateLimitMap);
+  evictExpiredRateLimitEntries(invalidRefreshRateLimitMap);
+}, AUTH_RATE_LIMIT_WINDOW_MS);
 if (typeof rateLimitEvictionHandle.unref === 'function') rateLimitEvictionHandle.unref();
 
 /**
- * Check if an IP address has exceeded the auth endpoint rate limit.
+ * Check one per-instance IP or SHA-256 refresh-digest quota bucket.
  * Returns the number of seconds until the limit resets, or null if allowed.
  * Returns -1 if the rate limit map is full and cannot accept new entries
  * (callers should respond with 503).
  */
-function checkAuthRateLimit(ipAddress: string): number | null {
+function checkAuthRateLimit(bucketKey: string, entries = authRateLimitMap): number | null {
   const now = Date.now();
-  const entry = authRateLimitMap.get(ipAddress);
+  const entry = entries.get(bucketKey);
 
-  if (!entry || now > entry.resetAt) {
-    // New entry — check map bounds before inserting
-    if (!entry && authRateLimitMap.size >= MAX_RATE_LIMIT_ENTRIES) {
-      evictExpiredRateLimitEntries();
-      if (authRateLimitMap.size >= MAX_RATE_LIMIT_ENTRIES) {
-        logger.warn(`[NativeAuth] Rate limit map full (${authRateLimitMap.size} entries)`);
+  if (!entry || now >= entry.resetAt) {
+    if (!entry && entries.size >= MAX_RATE_LIMIT_ENTRIES) {
+      if (entries === invalidRefreshRateLimitMap && now < invalidRefreshCapacityRetryAt) return -1;
+      evictExpiredRateLimitEntries(entries);
+      if (entries === invalidRefreshRateLimitMap) {
+        invalidRefreshCapacityRetryAt = now + INVALID_REFRESH_CAPACITY_RECHECK_MS;
+      }
+      if (entries.size >= MAX_RATE_LIMIT_ENTRIES) {
+        logger.warn('[NativeAuth] Rate limit capacity reached');
         return -1;
       }
     }
-    authRateLimitMap.set(ipAddress, { count: 1, resetAt: now + AUTH_RATE_LIMIT_WINDOW_MS });
+    entries.set(bucketKey, { count: 1, resetAt: now + AUTH_RATE_LIMIT_WINDOW_MS });
     return null;
   }
 
@@ -230,14 +288,25 @@ function checkAuthRateLimit(ipAddress: string): number | null {
   return null;
 }
 
+function respondRefreshRateLimit(res: ServerResponse, retryAfter: number | null): boolean {
+  if (retryAfter === null) return false;
+  if (retryAfter === -1) {
+    sendJson(res, 503, { error: 'Service temporarily overloaded' });
+    return true;
+  }
+  res.setHeader('Retry-After', String(retryAfter));
+  sendJson(res, 429, { error: `Rate limit exceeded. Try again in ${retryAfter} seconds.` });
+  return true;
+}
+
 /**
  * Extract the client IP from an incoming request.
  *
  * Uses `req.socket.remoteAddress` exclusively. X-Forwarded-For is user-controlled
  * and trusting its leftmost entry lets attackers bypass the rate limiter by
  * spoofing arbitrary IPs. Behind a reverse proxy (e.g. Railway), remoteAddress
- * is the proxy IP, which means all clients share one rate-limit bucket — overly
- * permissive but not bypassable.
+ * is the proxy IP, which means sign-ins share one rate-limit bucket. Refresh
+ * uses a separate bucket keyed by the hash of its presented secret.
  */
 function getClientIp(req: IncomingMessage): string {
   return req.socket.remoteAddress ?? 'unknown';
@@ -290,38 +359,58 @@ type TransferPayload = {
   nextPath: string;
   iat: number;
   exp: number;
+  accountCreation?: unknown;
+  gen?: unknown;
+  auth_time?: unknown;
+  link_guarded?: unknown;
+  legacy_no_sid?: unknown;
+  authSessionId?: unknown;
+  attemptId?: unknown;
+  provider?: unknown;
 };
 
-function verifyTransferToken(token: string): { userId: string } | null {
-  const secret = process.env.NEXTAUTH_SECRET;
-  if (!secret) {
-    logger.warn('[NativeAuth] NEXTAUTH_SECRET not configured');
-    return null;
-  }
+/** One token segment: unpadded base64url, the only alphabet our signer writes. */
+const TRANSFER_TOKEN_SEGMENT = /^[A-Za-z0-9_-]+$/;
 
+/**
+ * The signed payload segment of a transfer token whose signature matches, and
+ * the signature this server computed for it. Only the exact form the web signer
+ * writes passes: two unpadded base64url segments, a signature of the expected
+ * length. The replay key is the computed signature, so a token is spent once
+ * however a caller spells it. Claims (expiry included) are not read here.
+ */
+function authenticateTransferToken(token: string): { encodedPayload: string; replayKey: string } | null {
   const parts = token.split('.');
-  if (parts.length !== 2 || !parts[0] || !parts[1]) {
-    return null;
-  }
+  if (parts.length !== 2) return null;
   const [encodedPayload, signature] = parts;
+  if (!TRANSFER_TOKEN_SEGMENT.test(encodedPayload) || !TRANSFER_TOKEN_SEGMENT.test(signature)) return null;
+
+  const secret = process.env.NEXTAUTH_SECRET;
+  if (!secret) throw new AuthAdmissionUnavailableError();
 
   const expectedSignature = crypto.createHmac('sha256', secret).update(encodedPayload).digest('base64url');
 
-  const sigBuffer = Buffer.from(signature);
-  const expectedSigBuffer = Buffer.from(expectedSignature);
+  const sigBuffer = Buffer.from(signature, 'utf8');
+  const expectedSigBuffer = Buffer.from(expectedSignature, 'utf8');
 
-  // Pad both buffers to the same length so the comparison is always
-  // constant-time — no length oracle, no JIT short-circuit.
-  const maxLen = Math.max(sigBuffer.length, expectedSigBuffer.length);
-  const paddedSig = Buffer.alloc(maxLen);
-  const paddedExpected = Buffer.alloc(maxLen);
-  sigBuffer.copy(paddedSig);
-  expectedSigBuffer.copy(paddedExpected);
-
-  if (!crypto.timingSafeEqual(paddedSig, paddedExpected)) {
+  // The length of an HMAC-SHA256 signature is public (43 characters), so a
+  // different length is refused outright; equal lengths compare in constant time.
+  if (sigBuffer.length !== expectedSigBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedSigBuffer)) {
     return null;
   }
+  return { encodedPayload, replayKey: expectedSignature };
+}
 
+/** Reads the claims of a payload segment `authenticateTransferToken` accepted. */
+function verifyTransferClaims(encodedPayload: string): {
+  userId: string;
+  generation: number;
+  authSessionId: string | null;
+  authenticatedAt: Date | null;
+  accountCreation?: AccountCreationReceipt;
+  requiresAccountCutoff: boolean;
+  validUntil: number;
+} | null {
   let payload: TransferPayload;
   try {
     payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8')) as TransferPayload;
@@ -331,9 +420,13 @@ function verifyTransferToken(token: string): { userId: string } | null {
 
   const now = Math.floor(Date.now() / 1000);
   if (
+    typeof payload.userId !== 'string' ||
     !payload.userId ||
-    !payload.exp ||
-    !payload.iat ||
+    payload.userId.length > 256 ||
+    !Number.isSafeInteger(payload.exp) ||
+    !Number.isSafeInteger(payload.iat) ||
+    payload.exp <= payload.iat ||
+    payload.iat <= 0 ||
     payload.exp < now - CLOCK_SKEW_TOLERANCE_SECONDS ||
     payload.iat > now + CLOCK_SKEW_TOLERANCE_SECONDS
   ) {
@@ -346,29 +439,249 @@ function verifyTransferToken(token: string): { userId: string } | null {
     return null;
   }
 
-  return { userId: payload.userId };
+  const receipt = parseAccountCreationReceipt(payload.accountCreation);
+  const accountCreation =
+    receipt?.userId === payload.userId &&
+    receipt.provider === payload.provider &&
+    typeof payload.authSessionId === 'string' &&
+    payload.authSessionId.length > 0 &&
+    typeof payload.attemptId === 'string' &&
+    /^[0-9a-f]{32}$/.test(payload.attemptId)
+      ? receipt
+      : undefined;
+  const generation = payload.gen ?? 0;
+  if (typeof generation !== 'number' || !Number.isSafeInteger(generation) || generation < 0) return null;
+  if (
+    payload.authSessionId !== undefined &&
+    (typeof payload.authSessionId !== 'string' || !payload.authSessionId.trim() || payload.authSessionId.length > 256)
+  )
+    return null;
+  if (payload.legacy_no_sid !== undefined && payload.legacy_no_sid !== true) return null;
+  const sourceSessionId = typeof payload.authSessionId === 'string' ? payload.authSessionId : null;
+  const inheritedAncestry = sourceSessionId === null ? true : nativeSessionRequiresAccountCutoff(sourceSessionId);
+  if (inheritedAncestry === null) return null;
+  const authenticationTime = readAuthTimeClaim(payload.auth_time, Date.now());
+  const authenticatedAt =
+    payload.link_guarded === true && authenticationTime !== null && authenticationTime <= payload.iat
+      ? new Date(authenticationTime * 1000)
+      : null;
+  return {
+    userId: payload.userId,
+    generation,
+    authSessionId: sourceSessionId,
+    requiresAccountCutoff: payload.legacy_no_sid === true || inheritedAncestry,
+    // The installed verifier compares integer seconds with an inclusive
+    // tolerance. Reject at the first millisecond outside that same window.
+    validUntil: (payload.exp + CLOCK_SKEW_TOLERANCE_SECONDS + 1) * 1000,
+    authenticatedAt,
+    ...(accountCreation ? { accountCreation } : {}),
+  };
+}
+
+function accountCreationReceipt(
+  userId: string,
+  accountCreated: boolean,
+  provider: AccountCreationReceipt['provider'],
+  createdAt: Date,
+): AccountCreationReceipt | undefined {
+  if (!(createdAt instanceof Date) || !Number.isFinite(createdAt.getTime())) return undefined;
+  return { userId, accountCreated, provider, createdAt: createdAt.toISOString() };
 }
 
 // ---------------------------------------------------------------------------
 // Token generation helpers
 // ---------------------------------------------------------------------------
 
+type RefreshStamps = Pick<
+  typeof mobileRefreshTokens.$inferSelect,
+  'subjectGeneration' | 'nativeGeneration' | 'authenticatedAt' | 'sessionId' | 'expiresAt'
+>;
+
+/**
+ * What a new token pair descends from. Every reader decides the stamps by
+ * `decideCredential` (BA-04 PR 2).
+ */
+type NativeCredentialOrigin =
+  /**
+   * A proof this request checked: password, provider token, transfer token or
+   * watch code. `authenticatedAt` is when a password or provider proof passed;
+   * null for a transfer token or watch code, which carry a sign-in made elsewhere.
+   * `passwordProof` is what bcrypt checked, compared again under the user lock.
+   */
+  | { readonly kind: 'sign-in'; readonly authenticatedAt: Date | null; readonly passwordProof?: PasswordProof }
+  /** The refresh row this request consumed, under the same user lock. */
+  | { readonly kind: 'refresh'; readonly parent: RefreshStamps }
+  /** A legacy UID-only pending code is valid only before staged authority/cutoffs exist. */
+  | { readonly kind: 'legacy-pairing' }
+  | {
+      readonly kind: 'transfer';
+      readonly generation: number;
+      readonly authSessionId: string | null;
+      readonly authenticatedAt: Date | null;
+      readonly requiresAccountCutoff: boolean;
+      /** Only a native source is bound to native sign-out; web handoff remains independent. */
+      readonly nativeGeneration?: number;
+      readonly capabilityExpiresAt?: number;
+    };
+
+type CredentialStamps = {
+  subjectGeneration: number;
+  nativeGeneration: number;
+  authenticatedAt: Date | null;
+  sessionId: string;
+};
+
+/** A sign-in fresh at this request, for a proof made by this request. */
+function signedInNow(): NativeCredentialOrigin {
+  return { kind: 'sign-in', authenticatedAt: new Date() };
+}
+
+const LEGACY_PAIRING_WITHOUT_SOURCE: NativeCredentialOrigin = { kind: 'legacy-pairing' };
+
+function legacyPairingStateAllowed(subject: SubjectCutoffState): boolean {
+  return subject.generation === 0 && subject.nativeGeneration === 0 && subject.deniedSessionKeys.size === 0;
+}
+
+/** Preflight only: no Redis request runs inside this short eligibility transaction. */
+async function preflightLegacyPairing(userId: string): Promise<void> {
+  await db.transaction(async (transaction) => {
+    await transactionSettings(transaction);
+    const manifest = await lockIdentityManifest(transaction);
+    if (manifest?.phase === 'enforced') throw new AuthAdmissionUnavailableError();
+    const subject = await requireHumanSubjectForIssuance(transaction, userId);
+    if (!legacyPairingStateAllowed(subject)) throw new AuthAdmissionUnavailableError();
+  });
+}
+
+function credentialStamps(origin: NativeCredentialOrigin, generations: SubjectCutoffState): CredentialStamps {
+  if (origin.kind === 'sign-in' || origin.kind === 'legacy-pairing') {
+    return {
+      subjectGeneration: generations.generation,
+      nativeGeneration: generations.nativeGeneration,
+      authenticatedAt: origin.kind === 'sign-in' ? origin.authenticatedAt : null,
+      sessionId: crypto.randomUUID(),
+    };
+  }
+  if (origin.kind === 'transfer')
+    return {
+      subjectGeneration: origin.generation,
+      nativeGeneration: generations.nativeGeneration,
+      authenticatedAt: origin.authenticatedAt,
+      sessionId: `${origin.requiresAccountCutoff ? UNKNOWN_WEB_NATIVE_SESSION_PREFIX : ''}${crypto.randomUUID()}`,
+    };
+  // Copy, never re-read: a child is never newer than its parent. A row from
+  // before the stamps stands for generation 0, so its child is stamped 0, and
+  // an unknown sign-in time stays unknown.
+  const { parent } = origin;
+  return {
+    subjectGeneration: parent.subjectGeneration ?? 0,
+    nativeGeneration: parent.nativeGeneration ?? 0,
+    authenticatedAt: parent.authenticatedAt ?? null,
+    sessionId: parent.sessionId ?? crypto.randomUUID(),
+  };
+}
+
+/**
+ * `lockedState` is the state a caller already read under this transaction's user
+ * lock (the refresh path), so the lock and its read are not taken twice.
+ */
 async function generateTokenPair(
   userId: string,
-  txOrDb: { insert: typeof db.insert } = db,
+  transaction: Parameters<Parameters<DbInstance['transaction']>[0]>[0],
+  origin: NativeCredentialOrigin,
+  lockedState?: SubjectCutoffState,
 ): Promise<{
   jwt: string;
   refreshToken: string;
   expiresAt: string;
+  userId: string;
 }> {
+  const assertOriginActive = () => {
+    if (
+      origin.kind === 'transfer' &&
+      origin.capabilityExpiresAt !== undefined &&
+      Date.now() >= origin.capabilityExpiresAt
+    )
+      throw new AuthSubjectDeniedError();
+  };
+  assertOriginActive();
+  let generations = lockedState;
+  if (!generations) {
+    const passwordProof = origin.kind === 'sign-in' ? origin.passwordProof : undefined;
+    // A password sign-in gives up on a held user row after 250 ms and answers
+    // 503, which the app retries; issuance that must win keeps 4 s.
+    await transactionSettings(transaction);
+    if (passwordProof) {
+      await lockPasswordProofAuthority(transaction, passwordProof);
+      await boundSignInLockWaits(transaction);
+    }
+    if (origin.kind === 'legacy-pairing') {
+      const manifest = await lockIdentityManifest(transaction);
+      if (manifest?.phase === 'enforced') throw new AuthSubjectDeniedError();
+    }
+    generations = await requireHumanSubjectForIssuance(transaction, userId, passwordProof);
+  }
+  if (origin.kind === 'legacy-pairing' && !legacyPairingStateAllowed(generations)) throw new AuthSubjectDeniedError();
+  if (origin.kind === 'transfer') {
+    assertOriginActive();
+    if (
+      origin.generation !== generations.generation ||
+      (origin.nativeGeneration !== undefined && origin.nativeGeneration !== generations.nativeGeneration)
+    )
+      throw new AuthSubjectDeniedError();
+    if (origin.authSessionId) {
+      const [denial] = await transaction
+        .select()
+        .from(authSessionDenials)
+        .where(eq(authSessionDenials.sessionId, origin.authSessionId));
+      if (denial) throw new AuthSubjectDeniedError();
+    }
+  }
+  if (origin.kind === 'refresh') {
+    // A child copies its parent's stamps, so a parent from before a reset or an
+    // app sign-out would mint a pair every reader refuses, and the app would
+    // loop refresh -> 401. Refuse the parent instead: a 401 here signs the app out.
+    // Every cutoff writer locks `users` FOR UPDATE first, and this issuer holds
+    // KEY SHARE, so no cutoff commits between this read and the child's insert.
+    const { parent } = origin;
+    const decision = decideCredential(
+      {
+        kind: 'native-refresh',
+        subjectGeneration: parent.subjectGeneration,
+        nativeGeneration: parent.nativeGeneration,
+        authenticatedAt: parent.authenticatedAt,
+      },
+      generations,
+      Date.now(),
+    );
+    if (!admitsCredential(decision, 'refresh')) throw new AuthSubjectDeniedError();
+  }
   const signingSecret = getSigningSecret();
-  if (!signingSecret) {
-    throw new Error('NEXTAUTH_SECRET is not configured');
+  if (!signingSecret) throw new AuthAdmissionUnavailableError();
+  const stamps = credentialStamps(origin, generations);
+  if (nativeSessionRequiresAccountCutoff(stamps.sessionId) === null) throw new AuthSubjectDeniedError();
+  if (origin.kind === 'refresh') {
+    // The parent stays readable through rollback; the canonical binding is additive.
+    const parentExpiresAt = origin.parent.expiresAt;
+    await bindNativeRefreshSession(
+      transaction,
+      userId,
+      stamps,
+      parentExpiresAt,
+      new Date(),
+      currentNativeRevocationMode(),
+    );
   }
 
-  // Generate JWT
+  // Generate JWT. Clients read only `sub`; the stamps are for the server.
   const jwtExpiresAt = new Date(Date.now() + JWT_EXPIRY_MS);
-  const jwt = await new SignJWT({ sub: userId })
+  const jwt = await new SignJWT({
+    sub: userId,
+    gen: stamps.subjectGeneration,
+    ngen: stamps.nativeGeneration,
+    sid: stamps.sessionId,
+    ...(stamps.authenticatedAt ? { auth_time: Math.floor(stamps.authenticatedAt.getTime() / 1000) } : {}),
+  })
     .setProtectedHeader({ alg: 'HS256', typ: 'JWT' })
     .setIssuedAt()
     .setIssuer(JWT_ISSUER)
@@ -380,17 +693,42 @@ async function generateTokenPair(
   const refreshToken = crypto.randomBytes(32).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
 
-  await txOrDb.insert(mobileRefreshTokens).values({
+  await transaction.insert(mobileRefreshTokens).values({
     userId,
     tokenHash,
     expiresAt: new Date(Date.now() + REFRESH_TOKEN_EXPIRY_MS),
+    ...stamps,
   });
 
+  assertOriginActive();
   return {
+    userId,
     jwt,
     refreshToken,
     expiresAt: jwtExpiresAt.toISOString(),
   };
+}
+
+async function issueTokenPair(userId: string, origin: NativeCredentialOrigin) {
+  return db.transaction((transaction) => generateTokenPair(userId, transaction, origin));
+}
+
+function respondNativeAdmissionFailure(response: ServerResponse, error: unknown): boolean {
+  if (error instanceof AuthSubjectDeniedError) {
+    sendJson(response, 401, { error: 'Account is not available' });
+    return true;
+  }
+  if (isAuthAdmissionUnavailable(error) || isNativeAuthInfrastructureFailure(error)) {
+    sendJson(response, 503, { error: 'Authentication is temporarily unavailable' });
+    return true;
+  }
+  return false;
+}
+
+/** Keep the reserved writers' existing infrastructure messages and safe logs. */
+function respondReservedNativeAdmissionFailure(response: ServerResponse, error: unknown): boolean {
+  if (!(error instanceof AuthSubjectDeniedError) && !isAuthAdmissionUnavailable(error)) return false;
+  return respondNativeAdmissionFailure(response, error);
 }
 
 // ---------------------------------------------------------------------------
@@ -438,32 +776,57 @@ export async function handleNativeAuthExchange(req: IncomingMessage, res: Server
     return;
   }
 
-  // Extract the signature before verification so we can check for replay
-  const tokenParts = transferToken.split('.');
-  if (tokenParts.length !== 2 || !tokenParts[1]) {
+  // Check the HMAC signature, then replay, then the claims: a spent token stays
+  // 409 after it expires. Replay prevention keys on the signature this server
+  // computed, never on the bytes the caller sent.
+  let authenticated: ReturnType<typeof authenticateTransferToken>;
+  try {
+    authenticated = authenticateTransferToken(transferToken);
+  } catch (error) {
+    if (respondNativeAdmissionFailure(res, error)) return;
+    throw error;
+  }
+  if (!authenticated) {
+    logger.warn('[NativeAuth] Transfer token verification failed');
     sendJson(res, 401, { error: 'Invalid or expired transfer token' });
     return;
   }
-  const tokenSignature = tokenParts[1];
+  const { replayKey } = authenticated;
 
-  // Check if this transfer token has already been consumed (replay prevention)
-  if (await isTokenConsumed(tokenSignature)) {
+  if (await isTokenConsumed(replayKey)) {
     logger.warn('[NativeAuth] Transfer token replay attempt detected');
     sendJson(res, 409, { error: 'Transfer token has already been used' });
     return;
   }
 
-  // Verify the HMAC transfer token
-  const verified = verifyTransferToken(transferToken);
+  let verified: ReturnType<typeof verifyTransferClaims>;
+  try {
+    verified = verifyTransferClaims(authenticated.encodedPayload);
+  } catch (error) {
+    if (respondNativeAdmissionFailure(res, error)) return;
+    throw error;
+  }
   if (!verified) {
     logger.warn('[NativeAuth] Transfer token verification failed');
     sendJson(res, 401, { error: 'Invalid or expired transfer token' });
     return;
   }
 
+  // Do not consume the one-shot transfer capability during a known authority
+  // outage. The real issuer checks again under the user lock in its transaction.
+  try {
+    if (!(await isHumanSubjectActive(verified.userId))) {
+      sendJson(res, 401, { error: 'Account is not available' });
+      return;
+    }
+  } catch (error) {
+    if (!respondNativeAdmissionFailure(res, error)) sendJson(res, 500, { error: 'Internal server error' });
+    return;
+  }
+
   // Atomically mark the token as consumed. If another request consumed it
   // between the EXISTS check above and now, markTokenConsumed returns 'replay'.
-  const consumeResult = await markTokenConsumed(tokenSignature);
+  const consumeResult = await markTokenConsumed(replayKey);
   if (consumeResult === 'replay') {
     logger.warn('[NativeAuth] Transfer token replay attempt detected (race)');
     sendJson(res, 409, { error: 'Transfer token has already been used' });
@@ -476,11 +839,26 @@ export async function handleNativeAuthExchange(req: IncomingMessage, res: Server
   }
 
   try {
-    const tokenPair = await generateTokenPair(verified.userId);
-    logger.info(`[NativeAuth] Token exchange successful for user ${verified.userId}`);
-    sendJson(res, 200, tokenPair);
+    const tokenPair = await issueTokenPair(verified.userId, {
+      kind: 'transfer',
+      generation: verified.generation,
+      authSessionId: verified.authSessionId,
+      authenticatedAt: verified.authenticatedAt,
+      requiresAccountCutoff: verified.requiresAccountCutoff,
+      capabilityExpiresAt: verified.validUntil,
+    });
+    logger.info('[NativeAuth] Token exchange successful');
+    sendJson(
+      res,
+      200,
+      await withNativeDeviceToken({
+        ...tokenPair,
+        ...(verified.accountCreation ? { accountCreation: verified.accountCreation } : {}),
+      }),
+    );
   } catch (error) {
-    logger.error('[NativeAuth] Token generation failed:', error);
+    if (respondNativeAdmissionFailure(res, error)) return;
+    logger.error('[NativeAuth] Token generation failed', { code: 'TOKEN_ISSUANCE_FAILED' });
     sendJson(res, 500, { error: 'Internal server error' });
   }
 }
@@ -530,71 +908,63 @@ export async function handleNativeAuthCredentials(req: IncomingMessage, res: Ser
     return;
   }
 
-  // Normalize the email to match how NextAuth's adapter stores it.
-  const normalizedEmail = email.trim().toLowerCase();
+  // The per-account guess limit (#7656): before the compare, the same for a
+  // known and an unknown address. Its refusal is the 429 the IP limit already
+  // answers, so released apps handle it.
+  let guess: PasswordGuessAdmission;
+  try {
+    const presentedDeviceToken = req.headers[NATIVE_V1_DEVICE_TOKEN_HEADER];
+    guess = await passwordGuessLimiter().admit({
+      email,
+      deviceToken: typeof presentedDeviceToken === 'string' ? presentedDeviceToken : undefined,
+    });
+  } catch {
+    // The limiter fails open by itself; this only guards a programming error.
+    guess = { outcome: 'proceed', settle: async () => {} };
+  }
+  if (guess.outcome === 'refused') {
+    res.setHeader('Retry-After', String(guess.retryAfterSeconds));
+    sendJson(res, 429, { error: `Rate limit exceeded. Try again in ${guess.retryAfterSeconds} seconds.` });
+    return;
+  }
+  let verdict: 'accepted' | 'rejected' | 'no_verdict' = 'no_verdict';
 
   try {
-    // Legacy web accounts may retain mixed-case emails, and users.email is not
-    // currently unique case-insensitively. Load every exact case-insensitive
-    // match so duplicate-by-case accounts can each authenticate with their own
-    // password. Using LOWER rather than ILIKE avoids treating valid email
-    // characters such as `_` as pattern wildcards.
-    const credentialCandidates = await db
-      .select({
-        userId: users.id,
-        passwordHash: userCredentials.passwordHash,
-      })
-      .from(users)
-      .innerJoin(userCredentials, eq(userCredentials.userId, users.id))
-      .where(sql`LOWER(${users.email}) = ${normalizedEmail}`)
-      .limit(MAX_CREDENTIAL_CANDIDATES + 1);
-
-    if (credentialCandidates.length === 0) {
-      // Unknown emails and OAuth-only accounts take one dummy comparison and
-      // return the same generic response.
-      await compare(password, DUMMY_PASSWORD_HASH);
+    const authenticatedUser = await authenticateIdentityPassword(db, email, password);
+    if (!authenticatedUser) {
+      verdict = 'rejected';
       sendJson(res, 401, { error: INVALID_CREDENTIALS_ERROR });
       return;
     }
+    // The password was right: it never uses up a guess, whatever happens next.
+    verdict = 'accepted';
 
-    if (credentialCandidates.length > MAX_CREDENTIAL_CANDIDATES) {
-      // Keep oversized groups bounded while matching the work performed for
-      // the largest supported group, so the limit sentinel is not observable
-      // through a sudden drop to one bcrypt comparison.
-      await Promise.all(
-        credentialCandidates
-          .slice(0, MAX_CREDENTIAL_CANDIDATES)
-          .map((candidate) => compare(password, candidate.passwordHash)),
-      );
-      sendJson(res, 401, { error: INVALID_CREDENTIALS_ERROR });
-      return;
-    }
-
-    // Check every available hash. Aside from supporting duplicate-by-case
-    // accounts, avoiding an early exit keeps success timing independent of a
-    // matching candidate's position in the result set.
-    const passwordMatchResults = await Promise.all(
-      credentialCandidates.map((candidate) => compare(password, candidate.passwordHash)),
-    );
-    const matchingCredentialIndexes = passwordMatchResults.reduce<number[]>((indexes, passwordMatches, index) => {
-      if (passwordMatches) indexes.push(index);
-      return indexes;
-    }, []);
-
-    // Duplicate-by-case accounts can share a password. Without an unambiguous
-    // match there is no safe account to issue the session for.
-    if (matchingCredentialIndexes.length !== 1) {
-      sendJson(res, 401, { error: INVALID_CREDENTIALS_ERROR });
-      return;
-    }
-
-    const authenticatedUserId = credentialCandidates[matchingCredentialIndexes[0]].userId;
-    const tokenPair = await generateTokenPair(authenticatedUserId);
-    logger.info(`[NativeAuth] Credentials sign-in successful for user ${authenticatedUserId}`);
-    sendJson(res, 200, tokenPair);
+    const authenticatedUserId = authenticatedUser.userId;
+    // Issue only if the hash and generation bcrypt checked are still the
+    // account's under the user lock: a check that passed just before a reset
+    // must not mint a credential after it (BA-04 section 4).
+    const tokenPair = await issueTokenPair(authenticatedUserId, {
+      kind: 'sign-in',
+      authenticatedAt: new Date(),
+      passwordProof: {
+        passwordHash: authenticatedUser.passwordHash,
+        generation: authenticatedUser.generation,
+        ...(authenticatedUser.authorityReceipt ? { authorityReceipt: authenticatedUser.authorityReceipt } : {}),
+      },
+    });
+    logger.info('[NativeAuth] Credentials sign-in successful');
+    const accountCreation = accountCreationReceipt(authenticatedUserId, false, 'email', authenticatedUser.createdAt);
+    sendJson(res, 200, await withNativeDeviceToken({ ...tokenPair, ...(accountCreation ? { accountCreation } : {}) }));
   } catch (error) {
-    logger.error('[NativeAuth] Credentials sign-in failed:', error);
+    if (error instanceof PasswordProofStaleError) {
+      sendJson(res, 401, { error: INVALID_CREDENTIALS_ERROR });
+      return;
+    }
+    if (respondNativeAdmissionFailure(res, error)) return;
+    logger.error('[NativeAuth] Credentials sign-in failed', { code: 'PASSWORD_SIGNIN_FAILED' });
     sendJson(res, 500, { error: 'Internal server error' });
+  } finally {
+    await guess.settle(verdict);
   }
 }
 
@@ -607,7 +977,7 @@ export async function handleNativeAuthCredentials(req: IncomingMessage, res: Ser
 // app logs the user straight in (no web browser, no email round-trip) — the same
 // auto-login behaviour the native OAuth and credentials handlers already have.
 //
-// Email verification: the backend can't send a verification email, and
+// Email verification: this adapter does not deliver verification email, and
 // handleNativeAuthCredentials never checks emailVerified, so the new user is
 // auto-logged-in on the device regardless. We still honour
 // EMAIL_VERIFICATION_ENABLED for the stored emailVerified value, mirroring the
@@ -618,7 +988,11 @@ export async function handleNativeAuthCredentials(req: IncomingMessage, res: Ser
 // When the flag is off (the default), accounts are created verified.
 // ---------------------------------------------------------------------------
 
-export async function handleNativeAuthRegister(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleNativeAuthRegister(
+  req: IncomingMessage,
+  res: ServerResponse,
+  database: DbInstance = db,
+): Promise<void> {
   if (!applyCorsHeaders(req, res)) return;
 
   if (req.method !== 'POST') {
@@ -653,82 +1027,56 @@ export async function handleNativeAuthRegister(req: IncomingMessage, res: Server
     return;
   }
 
-  const { email, password, name } = body as Record<string, unknown>;
-
-  // Email: present, a string, and matching the lax client-side shape. Validate
-  // against the trimmed/lowercased form so a trailing space can't sneak past.
-  if (typeof email !== 'string' || email.trim().length === 0) {
-    sendJson(res, 400, { error: 'email and password are required' });
-    return;
-  }
-  const normalizedEmail = email.trim().toLowerCase();
-  if (!REGISTER_EMAIL_REGEX.test(normalizedEmail)) {
-    sendJson(res, 400, { error: 'Invalid email address' });
+  const validation = parseCurrentStorePasswordRegistration(body as Record<string, unknown>);
+  if (!validation.ok) {
+    sendJson(res, 400, { error: validation.error });
     return;
   }
 
-  // Password: present, a string, within bounds (mirrors the web Zod schema).
-  if (typeof password !== 'string' || password.length === 0) {
-    sendJson(res, 400, { error: 'email and password are required' });
+  let configuration: ReturnType<typeof currentStoreNativeRegistrationConfiguration>;
+  try {
+    configuration = currentStoreNativeRegistrationConfiguration();
+  } catch {
+    logger.warn('[NativeAuth] Reserved registration unavailable', { category: 'configuration' });
+    sendJson(res, 503, { error: 'Service temporarily unavailable' });
     return;
   }
-  if (password.length < PASSWORD_MIN_LENGTH) {
-    sendJson(res, 400, { error: 'Password must be at least 8 characters' });
+  if (configuration.mode === 'reserved-staging') {
+    await handleReservedNativeRegistration(res, database, configuration.authority, validation.registration);
     return;
-  }
-  if (password.length > PASSWORD_MAX_LENGTH) {
-    sendJson(res, 400, { error: 'Password must be less than 128 characters' });
-    return;
-  }
-
-  // Name: optional. An empty/whitespace-only string is treated as absent; the
-  // display name then falls back to the email local-part (matches web).
-  let trimmedName: string | undefined;
-  if (name !== undefined && name !== null) {
-    if (typeof name !== 'string') {
-      sendJson(res, 400, { error: 'name must be a string' });
-      return;
-    }
-    const candidate = name.trim();
-    if (candidate.length > NAME_MAX_LENGTH) {
-      sendJson(res, 400, { error: 'Name must be less than 100 characters' });
-      return;
-    }
-    if (candidate.length > 0) trimmedName = candidate;
   }
 
   try {
-    // Pre-check keeps the clean 409 message without relying on a DB constraint
-    // (users.email currently has no unique index — see the catch below).
-    const existingRows = await db.select().from(users).where(eq(users.email, normalizedEmail)).limit(1);
-    if (existingRows[0]) {
+    // Fail fast before bcrypt only. The write transaction below takes the shared
+    // gate and checks the manifest again before its first lock or write, inside
+    // insertCurrentStorePasswordIdentity, and holds the gate until it commits: a
+    // switch landing during bcrypt is seen there and nothing is written.
+    await database.transaction(assertLegacyIdentityWriterAllowed);
+    const prepared = await prepareCurrentStorePasswordRegistration(database, validation.registration);
+    if (!prepared) {
       sendJson(res, 409, {
         error: 'An account with this email already exists. Please sign in with your existing account.',
       });
       return;
     }
 
-    const passwordHash = await hash(password, BCRYPT_COST);
     // Mirror web: unverified when the verification gate is on, verified otherwise.
     const emailVerificationEnabled = process.env.EMAIL_VERIFICATION_ENABLED === 'true';
 
-    const result = await db.transaction(async (tx) => {
-      const newUserId = crypto.randomUUID();
-      await tx.insert(users).values({
-        id: newUserId,
-        email: normalizedEmail,
-        name: trimmedName ?? normalizedEmail.split('@')[0],
-        emailVerified: emailVerificationEnabled ? null : new Date(),
-      });
-      await tx.insert(userCredentials).values({ userId: newUserId, passwordHash });
-      // Mirror the web createUser event: every user gets a profile row.
-      await tx.insert(userProfiles).values({ userId: newUserId }).onConflictDoNothing();
-      const tokenPair = await generateTokenPair(newUserId, tx);
-      return { userId: newUserId, tokenPair };
+    const origin = signedInNow();
+    const result = await database.transaction(async (tx) => {
+      const identity = await insertCurrentStorePasswordIdentity(tx, prepared, emailVerificationEnabled);
+      const tokenPair = await generateTokenPair(identity.userId, tx, origin);
+      await assertLegacyIdentityWriterAllowed(tx);
+      return {
+        userId: identity.userId,
+        tokenPair,
+        accountCreation: accountCreationReceipt(identity.userId, true, 'email', identity.createdAt),
+      };
     });
 
-    logger.info(`[NativeAuth] Registration successful for user ${result.userId}`);
-    sendJson(res, 201, result.tokenPair);
+    logger.info('[NativeAuth] Registration successful');
+    sendJson(res, 201, await withNativeDeviceToken({ ...result.tokenPair, accountCreation: result.accountCreation }));
   } catch (error) {
     // Race: a concurrent request created this email between the pre-check and
     // insert. PostgreSQL unique-violation code is '23505'. NOTE: users.email has
@@ -739,8 +1087,101 @@ export async function handleNativeAuthRegister(req: IncomingMessage, res: Server
       sendJson(res, 409, { error: 'An account with this email already exists' });
       return;
     }
-    logger.error('[NativeAuth] Registration failed:', error);
+    if (respondNativeAdmissionFailure(res, error)) return;
+    logger.error('[NativeAuth] Registration failed', { code: 'REGISTRATION_FAILED' });
     sendJson(res, 500, { error: 'Internal server error' });
+  }
+}
+
+const nativeAuthDriverCodes = new Set([
+  'CONNECT_TIMEOUT',
+  'CONNECTION_CLOSED',
+  'CONNECTION_ENDED',
+  'CONNECTION_DESTROYED',
+  'ECONNREFUSED',
+  'ECONNRESET',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+]);
+
+function isNativeAuthInfrastructureFailure(error: unknown): boolean {
+  const code = getPostgresErrorCode(error);
+  return (
+    error instanceof CurrentStoreFoundationError ||
+    error instanceof DrizzleQueryError ||
+    (code !== undefined && (/^[0-9A-Z]{5}$/.test(code) || nativeAuthDriverCodes.has(code)))
+  );
+}
+
+async function handleReservedNativeRegistration(
+  response: ServerResponse,
+  database: DbInstance,
+  authorityInput: WebPasswordAuthority,
+  registration: Parameters<typeof prepareCurrentStorePasswordRegistration>[1],
+) {
+  const configuredAuthority = { ...authorityInput };
+  const capturedRegistration = { ...registration };
+  try {
+    // Validate authority before even an exact-email precheck can report409.
+    // Bcrypt remains outside the global manifest's locked transaction.
+    const receipt = await database.transaction(async (transaction) => {
+      await transactionSettings(transaction);
+      return captureIdentityAuthority(transaction, configuredAuthority);
+    });
+    const authority = { ...configuredAuthority, expectedWriterEpoch: receipt.epoch };
+    const prepared = await prepareCurrentStorePasswordRegistration(database, capturedRegistration);
+    const origin = signedInNow();
+    const result = await database.transaction(async (transaction) => {
+      await transactionSettings(transaction);
+      const inserted = await insertReservedPasswordIdentity(
+        transaction,
+        authority,
+        {
+          email: capturedRegistration.email,
+          prepared,
+          emailVerificationEnabled: authority.emailVerificationEnabled,
+        },
+        receipt,
+      );
+      if (inserted.outcome === 'exists') return inserted;
+      const { identity } = inserted;
+      // This remains the installed native issuer, bound to the identity's tx.
+      const tokenPair = await generateTokenPair(identity.userId, transaction, origin);
+      await revalidateIdentityAuthority(transaction, receipt);
+      return {
+        outcome: 'created' as const,
+        tokenPair,
+        accountCreation: accountCreationReceipt(identity.userId, true, 'email', identity.createdAt),
+      };
+    });
+    if (result.outcome === 'exists') {
+      sendJson(response, 409, {
+        error: 'An account with this email already exists. Please sign in with your existing account.',
+      });
+      return;
+    }
+    logger.info('[NativeAuth] Reserved registration successful', { category: 'created' });
+    sendJson(
+      response,
+      201,
+      await withNativeDeviceToken({ ...result.tokenPair, accountCreation: result.accountCreation }),
+    );
+  } catch (error) {
+    if (respondReservedNativeAdmissionFailure(response, error)) return;
+    const unavailable = isNativeAuthInfrastructureFailure(error);
+    // Never pass the original query/error/cause/parameters into logs or Sentry.
+    // This branch returns before the unchanged legacy raw-error handler.
+    if (unavailable) {
+      logger.warn('[NativeAuth] Reserved registration unavailable', { category: 'authority-or-database' });
+      sendJson(response, 503, { error: 'Service temporarily unavailable' });
+    } else {
+      logger.error('[NativeAuth] Reserved registration failed', new Error('Native registration internal failure'));
+      sendJson(response, 500, { error: 'Internal server error' });
+    }
   }
 }
 
@@ -751,8 +1192,8 @@ export async function handleNativeAuthRegister(req: IncomingMessage, res: Server
 // @react-native-google-signin) and posts the provider's identity token here.
 // We verify the token against the provider's JWKS, then find-or-create the
 // Boardsesh user and issue our own mobile JWT pair. Account linking is by the
-// provider's stable `sub`, falling back to email — mirroring the web
-// NextAuth `allowDangerousEmailAccountLinking: true` behaviour.
+// provider's stable `sub`. Legacy mode retains its email-link fallback;
+// explicitly staged resolution reserves new keys and rejects email-only links.
 // ---------------------------------------------------------------------------
 
 /** Apple's bundle identifier — the `aud` claim on Apple identity tokens. */
@@ -773,8 +1214,6 @@ const GOOGLE_ISSUERS = ['https://accounts.google.com', 'accounts.google.com'];
 const appleJwks = createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
 const googleJwks = createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'));
 
-type OAuthProvider = 'apple' | 'google';
-
 type ForwardedName = { firstName?: string; lastName?: string };
 
 /**
@@ -782,12 +1221,24 @@ type ForwardedName = { firstName?: string; lastName?: string };
  * provider's stable per-user id (used for account linking); `email` may be
  * absent on Apple resubmissions (handled by the sub lookup).
  */
-type VerifiedOAuthIdentity = {
-  sub: string;
-  email: string | null;
-  emailVerified: boolean;
-  name: string | null;
-};
+type NativeOAuthVerification =
+  | { status: 'verified'; identity: VerifiedOAuthIdentity }
+  | { status: 'invalid' }
+  | { status: 'unavailable' };
+
+const invalidNativeOAuthCodes = new Set([
+  'ERR_JWT_CLAIM_VALIDATION_FAILED',
+  'ERR_JWT_EXPIRED',
+  'ERR_JWS_SIGNATURE_VERIFICATION_FAILED',
+  'ERR_JWS_INVALID',
+  'ERR_JWT_INVALID',
+  'ERR_JOSE_ALG_NOT_ALLOWED',
+]);
+
+/** JWT payload typings do not validate an arbitrary runtime subject. */
+function validStagedNativeSubject(subject: unknown): subject is string {
+  return typeof subject === 'string' && subject.trim().length > 0 && Buffer.byteLength(subject, 'utf8') <= 1024;
+}
 
 /**
  * The configured Google OAuth client IDs. Any of the iOS / Android / Web
@@ -823,17 +1274,22 @@ function verifyNonce(rawNonce: string | undefined, payloadNonce: unknown): boole
 
 /**
  * Verify a provider identity token against the provider's JWKS and extract the
- * claims we need. Returns null on any verification failure (bad signature,
- * wrong issuer/audience, expired, nonce mismatch). Network-free in tests when
- * `jose.jwtVerify` is mocked.
+ * claims we need. Staging separates authoritative invalid-token failures from
+ * required-key/configuration uncertainty and logs only fixed categories.
+ * Legacy callers retain the current failure response and diagnostics.
  */
 async function verifyProviderIdentityToken(
   provider: OAuthProvider,
   identityToken: string,
   nonce?: string,
-): Promise<VerifiedOAuthIdentity | null> {
+  staged = false,
+): Promise<NativeOAuthVerification> {
   try {
     if (provider === 'apple') {
+      if (staged && !APPLE_BUNDLE_ID.trim()) {
+        logger.warn('[NativeAuth] OAuth verification unavailable', { category: 'provider-configuration' });
+        return { status: 'unavailable' };
+      }
       const { payload } = await jwtVerify(identityToken, appleJwks, {
         issuer: APPLE_ISSUER,
         audience: APPLE_BUNDLE_ID,
@@ -841,51 +1297,59 @@ async function verifyProviderIdentityToken(
         // also advertises a weaker/asymmetric-confusable alg can't be selected.
         algorithms: ['RS256'],
         clockTolerance: 60,
+        ...(staged ? { requiredClaims: ['exp'] } : {}),
       });
-      if (!payload.sub || !verifyNonce(nonce, payload.nonce)) return null;
+      if (!payload.sub || (staged && !validStagedNativeSubject(payload.sub)) || !verifyNonce(nonce, payload.nonce))
+        return { status: 'invalid' };
       return {
-        sub: payload.sub,
-        email: typeof payload.email === 'string' ? payload.email : null,
-        emailVerified: payload.email_verified === true || payload.email_verified === 'true',
-        // Apple never returns the name in the token — it's delivered once, in
-        // the authorization response, and forwarded by the client separately.
-        name: null,
+        status: 'verified',
+        identity: {
+          sub: payload.sub,
+          email: typeof payload.email === 'string' ? payload.email : null,
+          emailVerified: payload.email_verified === true || payload.email_verified === 'true',
+          // Apple never returns the name in the token — it's delivered once, in
+          // the authorization response, and forwarded by the client separately.
+          name: null,
+        },
       };
     }
 
     const audiences = getGoogleAudiences();
     if (audiences.length === 0) {
-      logger.error('[NativeAuth] No Google client IDs configured — cannot verify Google token');
-      return null;
+      if (staged) logger.warn('[NativeAuth] OAuth verification unavailable', { category: 'provider-configuration' });
+      else logger.error('[NativeAuth] No Google client IDs configured — cannot verify Google token');
+      return { status: staged ? 'unavailable' : 'invalid' };
     }
     const { payload } = await jwtVerify(identityToken, googleJwks, {
       issuer: GOOGLE_ISSUERS,
       audience: audiences,
       algorithms: ['RS256'],
       clockTolerance: 60,
+      ...(staged ? { requiredClaims: ['exp'] } : {}),
     });
-    if (!payload.sub || !verifyNonce(nonce, payload.nonce)) return null;
+    if (!payload.sub || (staged && !validStagedNativeSubject(payload.sub)) || !verifyNonce(nonce, payload.nonce))
+      return { status: 'invalid' };
     return {
-      sub: payload.sub,
-      email: typeof payload.email === 'string' ? payload.email : null,
-      emailVerified: payload.email_verified === true || payload.email_verified === 'true',
-      name: typeof payload.name === 'string' ? payload.name : null,
+      status: 'verified',
+      identity: {
+        sub: payload.sub,
+        email: typeof payload.email === 'string' ? payload.email : null,
+        emailVerified: payload.email_verified === true || payload.email_verified === 'true',
+        name: typeof payload.name === 'string' ? payload.name : null,
+      },
     };
   } catch (error) {
-    logger.warn('[NativeAuth] OAuth identity token verification failed:', error);
-    return null;
+    if (staged) {
+      const code = getPostgresErrorCode(error);
+      const status = code !== undefined && invalidNativeOAuthCodes.has(code) ? 'invalid' : 'unavailable';
+      logger.warn('[NativeAuth] OAuth verification rejected', {
+        category: status === 'invalid' ? 'invalid-token' : 'provider-unavailable',
+      });
+      return { status };
+    }
+    logger.warn('[NativeAuth] OAuth identity token verification failed', { code: 'OAUTH_PROOF_REJECTED' });
+    return { status: 'invalid' };
   }
-}
-
-/** Build a display name from the forwarded Apple name or the Google token. */
-function resolveDisplayName(identity: VerifiedOAuthIdentity, forwardedName: ForwardedName | undefined): string | null {
-  if (forwardedName) {
-    const parts = [forwardedName.firstName, forwardedName.lastName].filter(
-      (part): part is string => typeof part === 'string' && part.trim().length > 0,
-    );
-    if (parts.length > 0) return parts.join(' ').trim();
-  }
-  return identity.name;
 }
 
 /** Narrow an unknown `name` field from the request body to ForwardedName. */
@@ -899,64 +1363,101 @@ function parseForwardedName(value: unknown): ForwardedName | undefined {
 }
 
 type FindOrCreateResult =
-  | { status: 'ok'; tokenPair: { jwt: string; refreshToken: string; expiresAt: string }; userId: string }
-  | { status: 'no_email' };
+  | {
+      status: 'ok';
+      tokenPair: Awaited<ReturnType<typeof generateTokenPair>>;
+      userId: string;
+      accountCreation?: AccountCreationReceipt;
+    }
+  | { status: 'no_email' }
+  | { status: 'conflict' };
 
 /**
  * Resolve the Boardsesh user for a verified identity and mint a token pair,
  * all inside one transaction:
  *   1. Existing `accounts` row for (provider, sub) → that user.
- *   2. Else a `users` row matching the normalized email → link it (insert the
- *      accounts row; mark email verified when the provider asserts it).
- *   3. Else create the user + profile + accounts link.
- * Apple resubmissions omit the email but always resolve via step 1.
+ *   2. Else the one `users` row the email names under the BA-02 rule (stored
+ *      exactly as the normalized address, else the single row storing it in
+ *      other capitals) → link it (insert the accounts row; mark email verified
+ *      when the provider asserts it).
+ *   3. Else, when no row holds the address in any capitalisation, create the
+ *      user + profile + accounts link, storing the normalized address.
+ * An address that is taken but names no single linkable account (several
+ * capitalisations, two rows with the same text, or an unverified provider
+ * email) is a conflict: no link and no new account. Apple resubmissions omit the email but always resolve via step 1.
  */
 async function findOrCreateOAuthUser(
   provider: OAuthProvider,
   identity: VerifiedOAuthIdentity,
   forwardedName: ForwardedName | undefined,
+  origin: NativeCredentialOrigin,
+  database: DbInstance = db,
 ): Promise<FindOrCreateResult> {
-  return db.transaction(async (tx) => {
+  // This legacy auto-link writer lacks the staged gate/reservation protocol.
+  // Refuse it even when called directly rather than through the mode parser.
+  if (identityMirrorMode() === 'on') throw new Error('AUTH_IDENTITY_MIRROR refuses legacy native OAuth writes');
+  return database.transaction(async (tx) => {
+    await transactionSettings(tx);
+    await assertLegacyIdentityWriterAllowed(tx);
     // 1. Link by the provider's stable subject id.
     const linkedRows = await tx
-      .select({ userId: accounts.userId })
+      .select({ userId: accounts.userId, createdAt: users.createdAt })
       .from(accounts)
+      .innerJoin(users, eq(users.id, accounts.userId))
       .where(and(eq(accounts.provider, provider), eq(accounts.providerAccountId, identity.sub)))
       .limit(1);
     const linked = linkedRows[0];
     if (linked) {
-      const tokenPair = await generateTokenPair(linked.userId, tx);
-      return { status: 'ok', tokenPair, userId: linked.userId };
+      const tokenPair = await generateTokenPair(linked.userId, tx, origin);
+      return {
+        status: 'ok',
+        tokenPair,
+        userId: linked.userId,
+        accountCreation: accountCreationReceipt(linked.userId, false, provider, linked.createdAt),
+      };
     }
 
-    const normalizedEmail = identity.email ? identity.email.trim().toLowerCase() : null;
+    const normalizedEmail = identity.email ? normalizeAccountEmail(identity.email) : null;
+    const holders = normalizedEmail ? await findAccountHoldersByEmail(tx, normalizedEmail) : null;
 
     // 2. Link by email — ONLY when the provider asserts the email is verified.
     // This is the security boundary NextAuth's allowDangerousEmailAccountLinking
     // leaves to the provider: auto-linking an *unverified* provider email to an
     // existing account would let anyone able to mint a token for an arbitrary
     // email claim take over that account. Apple always verifies (real or relay);
-    // Google's email_verified is almost always true. An unverified email falls
-    // through to creation, which anchors on the provider sub instead.
-    if (normalizedEmail && identity.emailVerified) {
-      const matchedRows = await tx
-        .select({ id: users.id, emailVerified: users.emailVerified })
-        .from(users)
-        .where(eq(users.email, normalizedEmail))
+    // Google's email_verified is almost always true.
+    const matched = holders && identity.emailVerified ? soleAccount(holders) : null;
+    if (matched) {
+      await transactionSettings(tx);
+      await requireHumanSubjectForIssuance(tx, matched.id);
+      await tx
+        .insert(accounts)
+        .values({ userId: matched.id, type: 'oauth', provider, providerAccountId: identity.sub })
+        .onConflictDoNothing();
+      // The insert does nothing when a concurrent sign-in linked this subject
+      // first. Confirm who owns the link now; never mint for an unconfirmed owner.
+      const [link] = await tx
+        .select({ userId: accounts.userId })
+        .from(accounts)
+        .where(and(eq(accounts.provider, provider), eq(accounts.providerAccountId, identity.sub)))
         .limit(1);
-      const matched = matchedRows[0];
-      if (matched) {
-        await tx
-          .insert(accounts)
-          .values({ userId: matched.id, type: 'oauth', provider, providerAccountId: identity.sub })
-          .onConflictDoNothing();
-        if (!matched.emailVerified) {
-          await tx.update(users).set({ emailVerified: new Date() }).where(eq(users.id, matched.id));
-        }
-        const tokenPair = await generateTokenPair(matched.id, tx);
-        return { status: 'ok', tokenPair, userId: matched.id };
+      if (link?.userId !== matched.id) return { status: 'conflict' };
+      if (!matched.emailVerified) {
+        await tx.update(users).set({ emailVerified: new Date() }).where(eq(users.id, matched.id));
       }
+      const tokenPair = await generateTokenPair(matched.id, tx, origin);
+      return {
+        status: 'ok',
+        tokenPair,
+        userId: matched.id,
+        accountCreation: accountCreationReceipt(matched.id, false, provider, matched.createdAt),
+      };
     }
+
+    // The address is taken but names no single account to link (several
+    // capitalisations, two rows with the same text, or an unverified provider
+    // email): another account for it would add to a shared address.
+    if (holders && holders.kind !== 'none') return { status: 'conflict' };
 
     // 3. Create. Email is NOT NULL on `users`; Apple/Google both return an
     // email on first authorization (Apple's relay address when hidden), so a
@@ -967,21 +1468,33 @@ async function findOrCreateOAuthUser(
     }
 
     const newUserId = crypto.randomUUID();
+    const createdAt = new Date();
     await tx.insert(users).values({
       id: newUserId,
+      createdAt,
       email: normalizedEmail,
       name: resolveDisplayName(identity, forwardedName),
       emailVerified: identity.emailVerified ? new Date() : null,
     });
-    // Mirror the web `createUser` event: every user gets a profile row.
+    // Mirror the web `createUser` event: every user gets a profile row. New
+    // accounts start public (the column defaults); Private is opt-in.
     await tx.insert(userProfiles).values({ userId: newUserId }).onConflictDoNothing();
     await tx.insert(accounts).values({ userId: newUserId, type: 'oauth', provider, providerAccountId: identity.sub });
-    const tokenPair = await generateTokenPair(newUserId, tx);
-    return { status: 'ok', tokenPair, userId: newUserId };
+    const tokenPair = await generateTokenPair(newUserId, tx, origin);
+    return {
+      status: 'ok',
+      tokenPair,
+      userId: newUserId,
+      accountCreation: accountCreationReceipt(newUserId, true, provider, createdAt),
+    };
   });
 }
 
-export async function handleNativeAuthOAuth(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleNativeAuthOAuth(
+  req: IncomingMessage,
+  res: ServerResponse,
+  database: DbInstance = db,
+): Promise<void> {
   if (!applyCorsHeaders(req, res)) return;
 
   if (req.method !== 'POST') {
@@ -1031,24 +1544,156 @@ export async function handleNativeAuthOAuth(req: IncomingMessage, res: ServerRes
     return;
   }
 
-  const identity = await verifyProviderIdentityToken(provider, identityToken, nonce);
-  if (!identity) {
+  let configuration: ReturnType<typeof currentStoreNativeOAuthConfiguration>;
+  try {
+    configuration = currentStoreNativeOAuthConfiguration();
+  } catch {
+    logger.warn('[NativeAuth] Reserved OAuth unavailable', { category: 'configuration' });
+    sendJson(res, 503, { error: 'Service temporarily unavailable' });
+    return;
+  }
+  const staged = configuration.mode === 'reserved-staging';
+  let receipt: IdentityAuthorityReceipt | undefined;
+  if (configuration.mode === 'reserved-staging') {
+    try {
+      receipt = await database.transaction(async (transaction) => {
+        await transactionSettings(transaction);
+        return captureIdentityAuthority(transaction, configuration.authority);
+      });
+    } catch (error) {
+      reportReservedNativeOAuthFailure(res, error);
+      return;
+    }
+  }
+  const verified = await verifyProviderIdentityToken(provider, identityToken, nonce, staged);
+  if (verified.status === 'invalid') {
     sendJson(res, 401, { error: 'Invalid or expired identity token' });
+    return;
+  }
+  if (verified.status === 'unavailable') {
+    sendJson(res, 503, { error: 'Service temporarily unavailable' });
+    return;
+  }
+  const { identity } = verified;
+  const origin = signedInNow();
+  if (configuration.mode === 'reserved-staging') {
+    if (!receipt) {
+      reportReservedNativeOAuthFailure(res, new CurrentStoreFoundationError('STALE_AUTHORITY'));
+      return;
+    }
+    await handleReservedNativeOAuth(
+      res,
+      database,
+      configuration.authority,
+      provider,
+      identity,
+      parseForwardedName(name),
+      origin,
+      receipt,
+    );
     return;
   }
 
   try {
-    const result = await findOrCreateOAuthUser(provider, identity, parseForwardedName(name));
+    const result = await findOrCreateOAuthUser(provider, identity, parseForwardedName(name), origin, database);
     if (result.status === 'no_email') {
       logger.warn(`[NativeAuth] ${provider} sign-in for a new account without an email — rejecting`);
       sendJson(res, 401, { error: 'An email is required to create an account' });
       return;
     }
-    logger.info(`[NativeAuth] ${provider} sign-in successful for user ${result.userId}`);
-    sendJson(res, 200, result.tokenPair);
+    if (result.status === 'conflict') {
+      logger.warn(`[NativeAuth] ${provider} sign-in names no single account for its email — rejecting`);
+      sendJson(res, 409, {
+        error: 'This sign-in method is not linked to that account. Use your existing sign-in method.',
+      });
+      return;
+    }
+    logger.info('[NativeAuth] Provider sign-in successful', { provider });
+    sendJson(
+      res,
+      200,
+      await withNativeDeviceToken({
+        ...result.tokenPair,
+        ...(result.accountCreation ? { accountCreation: result.accountCreation } : {}),
+      }),
+    );
   } catch (error) {
-    logger.error('[NativeAuth] OAuth sign-in failed:', error);
+    if (respondNativeAdmissionFailure(res, error)) return;
+    logger.error('[NativeAuth] OAuth sign-in failed', { code: 'OAUTH_SIGNIN_FAILED' });
     sendJson(res, 500, { error: 'Internal server error' });
+  }
+}
+
+function reportReservedNativeOAuthFailure(response: ServerResponse, error: unknown) {
+  if (respondReservedNativeAdmissionFailure(response, error)) return;
+  if (isNativeAuthInfrastructureFailure(error)) {
+    logger.warn('[NativeAuth] Reserved OAuth unavailable', { category: 'authority-or-database' });
+    sendJson(response, 503, { error: 'Service temporarily unavailable' });
+  } else {
+    logger.error('[NativeAuth] Reserved OAuth failed', new Error('Native OAuth internal failure'));
+    sendJson(response, 500, { error: 'Internal server error' });
+  }
+}
+
+async function handleReservedNativeOAuth(
+  response: ServerResponse,
+  database: DbInstance,
+  authorityInput: WebPasswordAuthority,
+  provider: OAuthProvider,
+  identity: VerifiedOAuthIdentity,
+  name: ForwardedName | undefined,
+  origin: NativeCredentialOrigin,
+  receiptInput: IdentityAuthorityReceipt,
+) {
+  const receipt = Object.freeze({ ...receiptInput });
+  const authority = { ...authorityInput, expectedWriterEpoch: receipt.epoch };
+  try {
+    const result = await database.transaction(async (transaction) => {
+      await transactionSettings(transaction);
+      await revalidateIdentityAuthority(transaction, receipt);
+      const resolved = await resolveReservedNativeOAuthIdentity(
+        transaction,
+        authority,
+        provider,
+        identity,
+        name,
+        receipt,
+      );
+      await revalidateIdentityAuthority(transaction, receipt);
+      if (resolved.outcome !== 'linked' && resolved.outcome !== 'created') return resolved;
+      const tokenPair = await generateTokenPair(resolved.userId, transaction, origin);
+      await revalidateIdentityAuthority(transaction, receipt);
+      return {
+        outcome: 'ok' as const,
+        tokenPair,
+        accountCreation: accountCreationReceipt(
+          resolved.userId,
+          resolved.outcome === 'created',
+          provider,
+          resolved.createdAt,
+        ),
+      };
+    });
+    if (result.outcome === 'conflict') {
+      sendJson(response, 409, {
+        error: 'This sign-in method is not linked to that account. Use your existing sign-in method.',
+      });
+    } else if (result.outcome === 'no_email') {
+      sendJson(response, 401, { error: 'An email is required to create an account' });
+    } else if (result.outcome === 'deleted') {
+      sendJson(response, 401, { error: 'Account is not available' });
+    } else {
+      sendJson(
+        response,
+        200,
+        await withNativeDeviceToken({
+          ...result.tokenPair,
+          ...(result.accountCreation ? { accountCreation: result.accountCreation } : {}),
+        }),
+      );
+    }
+  } catch (error) {
+    reportReservedNativeOAuthFailure(response, error);
   }
 }
 
@@ -1061,19 +1706,6 @@ export async function handleNativeAuthRefresh(req: IncomingMessage, res: ServerR
 
   if (req.method !== 'POST') {
     sendJson(res, 405, { error: 'Method not allowed' });
-    return;
-  }
-
-  // Rate limit by IP
-  const clientIp = getClientIp(req);
-  const retryAfter = checkAuthRateLimit(clientIp);
-  if (retryAfter === -1) {
-    sendJson(res, 503, { error: 'Service temporarily overloaded' });
-    return;
-  }
-  if (retryAfter !== null) {
-    res.setHeader('Retry-After', String(retryAfter));
-    sendJson(res, 429, { error: `Rate limit exceeded. Try again in ${retryAfter} seconds.` });
     return;
   }
 
@@ -1099,8 +1731,51 @@ export async function handleNativeAuthRefresh(req: IncomingMessage, res: ServerR
 
   const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
 
+  // Throttle known digests before database work, without charging devices behind
+  // one proxy to a shared IP bucket. A new digest must first be classified by a
+  // non-locking lookup: arbitrary missing secrets cannot fill client capacity.
+  const bucketKey = `refresh:${tokenHash}`;
+  const existingBuckets = refreshRateLimitMap.has(bucketKey)
+    ? refreshRateLimitMap
+    : invalidRefreshRateLimitMap.has(bucketKey)
+      ? invalidRefreshRateLimitMap
+      : undefined;
+  if (existingBuckets && respondRefreshRateLimit(res, checkAuthRateLimit(bucketKey, existingBuckets))) {
+    return;
+  }
+
+  let result:
+    | { status: 401; error: string }
+    | { status: 200; tokenPair: Awaited<ReturnType<typeof generateTokenPair>> };
   try {
-    const result = await db.transaction(async (tx) => {
+    // A non-locking hint is not token admission. Acquire the user lock before
+    // touching refresh rows, then recheck the exact hash/UID and current state.
+    const [hint] = await db
+      .select({ userId: mobileRefreshTokens.userId })
+      .from(mobileRefreshTokens)
+      .where(eq(mobileRefreshTokens.tokenHash, tokenHash))
+      .limit(1);
+    if (
+      !existingBuckets &&
+      respondRefreshRateLimit(
+        res,
+        checkAuthRateLimit(bucketKey, hint ? refreshRateLimitMap : invalidRefreshRateLimitMap),
+      )
+    ) {
+      return;
+    }
+    if (!hint) {
+      sendJson(res, 401, { error: 'Invalid refresh token' });
+      return;
+    }
+    result = await db.transaction(async (tx) => {
+      await transactionSettings(tx);
+      await tx.execute(sql`SELECT pg_advisory_xact_lock_shared(6975, 2)`);
+      // The user lock first, then the generations in a statement of its own. A
+      // reset or deletion that committed while this waited is seen here, and none
+      // can commit before this does: each takes users FOR UPDATE, which this
+      // KEY SHARE excludes. The parent is decided against these generations.
+      const lockedState = await requireHumanSubjectForIssuance(tx, hint.userId);
       // Atomically revoke the token and return it in a single query.
       // This prevents TOCTOU races: if two concurrent requests present the same
       // refresh token, only one will get the row back — the other gets an empty
@@ -1108,7 +1783,13 @@ export async function handleNativeAuthRefresh(req: IncomingMessage, res: ServerR
       const revokedRows = await tx
         .update(mobileRefreshTokens)
         .set({ revokedAt: new Date() })
-        .where(and(eq(mobileRefreshTokens.tokenHash, tokenHash), isNull(mobileRefreshTokens.revokedAt)))
+        .where(
+          and(
+            eq(mobileRefreshTokens.tokenHash, tokenHash),
+            eq(mobileRefreshTokens.userId, hint.userId),
+            isNull(mobileRefreshTokens.revokedAt),
+          ),
+        )
         .returning();
 
       const revokedToken = revokedRows[0];
@@ -1120,21 +1801,35 @@ export async function handleNativeAuthRefresh(req: IncomingMessage, res: ServerR
         return { status: 401 as const, error: 'Refresh token expired' };
       }
 
-      const tokenPair = await generateTokenPair(revokedToken.userId, tx);
-      return { status: 200 as const, tokenPair, userId: revokedToken.userId };
+      const tokenPair = await generateTokenPair(
+        revokedToken.userId,
+        tx,
+        { kind: 'refresh', parent: revokedToken },
+        lockedState,
+      );
+      return { status: 200 as const, tokenPair };
     });
-
-    if (result.status !== 200) {
-      sendJson(res, result.status, { error: result.error });
+  } catch (error) {
+    // These typed refusals originate inside the transaction and roll it back.
+    if (error instanceof AuthSubjectDeniedError || isAuthAdmissionUnavailable(error)) {
+      respondNativeAdmissionFailure(res, error);
       return;
     }
-
-    logger.info(`[NativeAuth] Token refresh successful for user ${result.userId}`);
-    sendJson(res, 200, result.tokenPair);
-  } catch (error) {
-    logger.error('[NativeAuth] Token refresh failed:', error);
-    sendJson(res, 500, { error: 'Internal server error' });
+    // A lost COMMIT acknowledgement can leave the rotation outcome unknown.
+    // Keep this body distinct from the known pre-consumption admission refusal;
+    // updated watches must not infer that an uncertain secret is safe to reuse.
+    logger.warn('[NativeAuth] Token refresh unavailable');
+    sendJson(res, 503, { error: 'Token refresh is temporarily unavailable' });
+    return;
   }
+
+  // Publication happens after commit, outside the rollback/unavailable catch.
+  if (result.status !== 200) {
+    sendJson(res, result.status, { error: result.error });
+    return;
+  }
+  logger.info('[NativeAuth] Token refresh successful');
+  sendJson(res, 200, await withNativeDeviceToken(result.tokenPair));
 }
 
 // ---------------------------------------------------------------------------
@@ -1176,33 +1871,20 @@ export async function handleNativeAuthRevoke(req: IncomingMessage, res: ServerRe
   const tokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
 
   try {
-    // Look up the token to find the user. Only non-revoked tokens are valid
-    // for initiating a full sign-out.
-    const matchingRows = await db
-      .update(mobileRefreshTokens)
-      .set({ revokedAt: new Date() })
-      .where(and(eq(mobileRefreshTokens.tokenHash, tokenHash), isNull(mobileRefreshTokens.revokedAt)))
-      .returning({ userId: mobileRefreshTokens.userId });
-
-    const matchedToken = matchingRows[0];
-
+    const matchedToken = await revokeNativeCredentials(db, tokenHash, currentNativeRevocationMode());
     if (!matchedToken) {
       sendJson(res, 401, { error: 'Invalid refresh token' });
       return;
     }
 
-    // Revoke ALL remaining non-revoked tokens for this user (full sign-out).
-    // The token we just revoked above is already covered, but the WHERE clause
-    // filters on revokedAt IS NULL so it's a no-op for that row.
-    await db
-      .update(mobileRefreshTokens)
-      .set({ revokedAt: new Date() })
-      .where(and(eq(mobileRefreshTokens.userId, matchedToken.userId), isNull(mobileRefreshTokens.revokedAt)));
-
-    logger.info(`[NativeAuth] All tokens revoked for user ${matchedToken.userId}`);
+    logger.info('[NativeAuth] Native credentials revoked');
     sendJson(res, 200, { revoked: true });
   } catch (error) {
-    logger.error('[NativeAuth] Token revocation failed:', error);
+    if (error instanceof AuthSubjectDeniedError) {
+      sendJson(res, 401, { error: 'Invalid refresh token' });
+      return;
+    }
+    logger.error('[NativeAuth] Token revocation failed', { code: 'NATIVE_REVOCATION_FAILED' });
     sendJson(res, 500, { error: 'Internal server error' });
   }
 }
@@ -1224,7 +1906,7 @@ export async function handleNativeAuthRevoke(req: IncomingMessage, res: ServerRe
 // ---------------------------------------------------------------------------
 
 /** Pairing-code lifetime — long enough to read off a phone and type on a watch. */
-const WATCH_PAIR_CODE_TTL_SECONDS = 300;
+const WATCH_PAIR_CODE_TTL_SECONDS = WATCH_PAIR_CAPABILITY_TTL_SECONDS;
 
 /** Pairing-code length in characters. */
 const WATCH_PAIR_CODE_LENGTH = 8;
@@ -1286,7 +1968,17 @@ export async function handleWatchPairCode(req: IncomingMessage, res: ServerRespo
     return;
   }
   const token = headerValue.slice(7).trim();
-  const auth = token ? await validateToken(token) : null;
+  const pairingEnvironment = { ...process.env };
+  let mode: ReturnType<typeof watchPairingMode>;
+  try {
+    mode = watchPairingMode(pairingEnvironment);
+  } catch {
+    sendJson(res, 503, { error: 'Service temporarily unavailable' });
+    return;
+  }
+  const admission = token ? await validateHttpAuthToken(token, res) : { available: true as const, auth: null };
+  if (!admission.available) return;
+  const auth = admission.auth;
   if (!auth) {
     sendJson(res, 401, { error: 'Unauthorized' });
     return;
@@ -1302,17 +1994,38 @@ export async function handleWatchPairCode(req: IncomingMessage, res: ServerRespo
 
   try {
     const { publisher } = redisClientManager.getClients();
+    if (mode === 'legacy') await preflightLegacyPairing(auth.userId);
+    const bound =
+      mode === 'source-bound-staging'
+        ? await createWatchPairCapability(auth, token, pairingEnvironment.NEXTAUTH_SECRET ?? '')
+        : null;
+    if (mode === 'source-bound-staging' && !bound) {
+      sendJson(res, 401, { error: 'Unauthorized' });
+      return;
+    }
+    const contents = bound?.contents ?? auth.userId;
+    const ttlSeconds = bound?.ttlSeconds ?? WATCH_PAIR_CODE_TTL_SECONDS;
     let code: string | null = null;
     for (let attempt = 0; attempt < WATCH_PAIR_CODE_MAX_ATTEMPTS; attempt++) {
       const candidate = generatePairingCode();
       // SET NX so a rare collision with a live code doesn't overwrite it.
-      const stored = await publisher.set(
-        `${WATCH_PAIR_CODE_REDIS_PREFIX}${candidate}`,
-        auth.userId,
-        'EX',
-        WATCH_PAIR_CODE_TTL_SECONDS,
-        'NX',
-      );
+      if (bound && bound.capability.expiresAt <= Date.now()) {
+        sendJson(res, 401, { error: 'Unauthorized' });
+        return;
+      }
+      const stored = bound
+        ? await publisher.set(
+            `${WATCH_PAIR_CODE_REDIS_PREFIX}${candidate}`,
+            contents,
+            'PXAT',
+            bound.capability.expiresAt,
+            'NX',
+          )
+        : await publisher.set(`${WATCH_PAIR_CODE_REDIS_PREFIX}${candidate}`, contents, 'EX', ttlSeconds, 'NX');
+      if (bound && bound.capability.expiresAt <= Date.now()) {
+        sendJson(res, 401, { error: 'Unauthorized' });
+        return;
+      }
       if (stored === 'OK') {
         code = candidate;
         break;
@@ -1325,11 +2038,12 @@ export async function handleWatchPairCode(req: IncomingMessage, res: ServerRespo
       return;
     }
 
-    const expiresAt = new Date(Date.now() + WATCH_PAIR_CODE_TTL_SECONDS * 1000).toISOString();
-    logger.info(`[WatchPair] Issued pairing code for user ${auth.userId}`);
+    const expiresAt = new Date(bound?.capability.expiresAt ?? Date.now() + ttlSeconds * 1000).toISOString();
+    logger.info('[WatchPair] Issued pairing code');
     sendJson(res, 200, { code, expiresAt });
   } catch (error) {
-    logger.error('[WatchPair] Failed to issue pairing code:', error);
+    if (respondNativeAdmissionFailure(res, error)) return;
+    logger.error('[WatchPair] Failed to issue pairing code', { code: 'WATCH_CODE_ISSUANCE_FAILED' });
     sendJson(res, 500, { error: 'Internal server error' });
   }
 }
@@ -1361,6 +2075,16 @@ export async function handleWatchPair(req: IncomingMessage, res: ServerResponse)
     return;
   }
 
+  const pairingEnvironment = { ...process.env };
+  let staged: boolean;
+  try {
+    staged =
+      watchPairingMode(pairingEnvironment) === 'source-bound-staging' ||
+      parseNativeRevocationMode(pairingEnvironment) === 'generation';
+  } catch {
+    sendJson(res, 503, { error: 'Service temporarily unavailable' });
+    return;
+  }
   let body: unknown;
   try {
     const raw = await readBody(req);
@@ -1397,18 +2121,59 @@ export async function handleWatchPair(req: IncomingMessage, res: ServerResponse)
 
   try {
     const { publisher } = redisClientManager.getClients();
-    // GETDEL: atomic read-and-delete so a code can only be redeemed once.
-    const userId = await publisher.getdel(`${WATCH_PAIR_CODE_REDIS_PREFIX}${normalized}`);
-    if (!userId) {
+    const pendingContents = await publisher.get(`${WATCH_PAIR_CODE_REDIS_PREFIX}${normalized}`);
+    const capability = pendingContents ? parseWatchPairCapability(pendingContents) : null;
+    const legacyUserId =
+      pendingContents && !pendingContents.startsWith('{') && !staged && pendingContents.length <= 256
+        ? pendingContents
+        : null;
+    const pendingUserId = capability?.userId ?? legacyUserId;
+    if (!pendingContents || !pendingUserId || !(await isHumanSubjectActive(pendingUserId))) {
+      sendJson(res, 401, { error: 'Invalid or expired pairing code' });
+      return;
+    }
+    // Admission awaited the primary. An expired/replaced code must not let
+    // this older request consume a newer owner's capability at the same key.
+    let userId: unknown;
+    try {
+      userId = await publisher.eval(
+        "local owner = redis.call('GET', KEYS[1]); if owner == ARGV[1] then redis.call('DEL', KEYS[1]); return owner end; return false",
+        1,
+        `${WATCH_PAIR_CODE_REDIS_PREFIX}${normalized}`,
+        pendingContents,
+      );
+    } catch {
+      // Redis errors can retain command arguments. Keep them out of logs and
+      // never restore a claim after an uncertain atomic command outcome.
+      throw new AuthAdmissionUnavailableError();
+    }
+    if (!userId || userId !== pendingContents) {
       sendJson(res, 401, { error: 'Invalid or expired pairing code' });
       return;
     }
 
-    const tokenPair = await generateTokenPair(userId);
-    logger.info(`[WatchPair] Pairing successful for user ${userId}`);
+    // Redis consumption is terminal even if the primary rejects this source.
+    // Never restore a capability after a denied or uncertain mint.
+    const tokenPair = await issueTokenPair(
+      pendingUserId,
+      capability
+        ? {
+            kind: 'transfer',
+            generation: capability.source.generation,
+            authSessionId: capability.source.authSessionId,
+            authenticatedAt:
+              capability.source.authenticatedAt === null ? null : new Date(capability.source.authenticatedAt * 1000),
+            requiresAccountCutoff: capability.source.requiresAccountCutoff,
+            ...(capability.source.kind === 'native' ? { nativeGeneration: capability.source.nativeGeneration } : {}),
+            capabilityExpiresAt: capability.expiresAt,
+          }
+        : LEGACY_PAIRING_WITHOUT_SOURCE,
+    );
+    logger.info('[WatchPair] Pairing successful');
     sendJson(res, 200, tokenPair);
   } catch (error) {
-    logger.error('[WatchPair] Pairing failed:', error);
+    if (respondNativeAdmissionFailure(res, error)) return;
+    logger.error('[WatchPair] Pairing failed', { code: 'WATCH_PAIRING_FAILED' });
     sendJson(res, 500, { error: 'Internal server error' });
   }
 }
@@ -1426,25 +2191,13 @@ const REVOKED_TOKEN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 let refreshTokenCleanupHandle: ReturnType<typeof setInterval> | null = null;
 
 async function runRefreshTokenCleanup(): Promise<void> {
-  const revokedCutoff = new Date(Date.now() - REVOKED_TOKEN_RETENTION_MS);
-  const now = new Date();
   try {
-    const result = await db
-      .delete(mobileRefreshTokens)
-      .where(
-        or(
-          // Revoked tokens older than 7 days
-          and(isNotNull(mobileRefreshTokens.revokedAt), lt(mobileRefreshTokens.revokedAt, revokedCutoff)),
-          // Expired tokens
-          lt(mobileRefreshTokens.expiresAt, now),
-        ),
-      )
-      .returning({ id: mobileRefreshTokens.id });
-    if (result.length > 0) {
-      logger.info(`[NativeAuth Cleanup] Removed ${String(result.length)} expired/revoked refresh token(s)`);
+    const removedCount = await cleanupNativeRefreshRows(db);
+    if (removedCount > 0) {
+      logger.info(`[NativeAuth Cleanup] Removed ${String(removedCount)} expired/revoked refresh token(s)`);
     }
-  } catch (error) {
-    logger.error('[NativeAuth Cleanup] Failed to remove expired refresh tokens:', error);
+  } catch {
+    logger.error('[NativeAuth Cleanup] Failed to remove expired refresh tokens', { code: 'REFRESH_CLEANUP_FAILED' });
   }
 }
 
@@ -1458,15 +2211,15 @@ export function startRefreshTokenCleanup(): void {
 
   // Run once shortly after startup, then on the regular interval.
   const initialDelay = setTimeout(() => {
-    runRefreshTokenCleanup().catch((error) => {
-      logger.error('[NativeAuth Cleanup] Initial tick failed:', error);
+    runRefreshTokenCleanup().catch(() => {
+      logger.error('[NativeAuth Cleanup] Initial tick failed', { code: 'REFRESH_CLEANUP_INITIAL_FAILED' });
     });
   }, 60 * 1000);
   if (typeof initialDelay.unref === 'function') initialDelay.unref();
 
   refreshTokenCleanupHandle = setInterval(() => {
-    runRefreshTokenCleanup().catch((error) => {
-      logger.error('[NativeAuth Cleanup] Tick failed:', error);
+    runRefreshTokenCleanup().catch(() => {
+      logger.error('[NativeAuth Cleanup] Tick failed', { code: 'REFRESH_CLEANUP_TICK_FAILED' });
     });
   }, REFRESH_TOKEN_CLEANUP_INTERVAL_MS);
 
@@ -1487,6 +2240,9 @@ export function stopRefreshTokenCleanup(): void {
 /** Reset the in-memory rate limit and consumed token maps. Test-only. */
 export function __resetNativeAuthStateForTests(): void {
   authRateLimitMap.clear();
+  refreshRateLimitMap.clear();
+  invalidRefreshRateLimitMap.clear();
+  invalidRefreshCapacityRetryAt = 0;
   consumedTransferTokens.clear();
 }
 
@@ -1503,6 +2259,22 @@ export function __fillRateLimitMapForTests(count: number): void {
   const futureReset = Date.now() + AUTH_RATE_LIMIT_WINDOW_MS;
   for (let i = 0; i < count; i++) {
     authRateLimitMap.set(`test-ip-${String(i)}`, { count: 1, resetAt: futureReset });
+  }
+}
+
+/** Fill only refresh capacity with non-expired entries. Test-only. */
+export function __fillRefreshRateLimitMapForTests(count: number): void {
+  const futureReset = Date.now() + AUTH_RATE_LIMIT_WINDOW_MS;
+  for (let index = 0; index < count; index++) {
+    refreshRateLimitMap.set(`refresh:test-${String(index)}`, { count: 1, resetAt: futureReset });
+  }
+}
+
+/** Fill only missing-secret capacity with non-expired entries. Test-only. */
+export function __fillInvalidRefreshRateLimitMapForTests(count: number): void {
+  const futureReset = Date.now() + AUTH_RATE_LIMIT_WINDOW_MS;
+  for (let index = 0; index < count; index++) {
+    invalidRefreshRateLimitMap.set(`refresh:invalid-test-${String(index)}`, { count: 1, resetAt: futureReset });
   }
 }
 

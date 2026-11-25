@@ -1,12 +1,16 @@
 /**
- * The standing inventory oracle for issue #1889 (REST surface audit: 38
- * routes classified after the board renderer moved to Railway in #4715, the
- * Railway healthcheck route landed in #3798, and the hold-heatmap route and
- * its prewarm cron were retired).
+ * The standing inventory oracle for issue #1889 (REST surface audit: 40
+ * routes in total, classified after the board renderer moved to Railway in
+ * #4715, the Railway healthcheck route landed in #3798, and the hold-heatmap
+ * route and its prewarm cron were retired). The staged browser routes went
+ * with #7596: the renewal, the two canonical coordinator facades, the five
+ * first-password browser facades, the three expired-binding recovery
+ * facades, the six provider Settings facades, the four browser-password
+ * facades and the provider sign-in ACK.
  *
  * A classification table living only in an issue body or a doc goes stale the
  * moment a route is added or removed without anyone re-reading it — exactly
- * what happened to `docs/web-reposition.md`'s mobile-consumer list and its
+ * what happened to `docs/web/web-reposition.md`'s mobile-consumer list and its
  * `join`/`controllers`/`favorites` row before this PR. This test makes the
  * audit executable: it walks `packages/web/app/api/**` off disk and asserts
  * SET EQUALITY, in both directions, against the pinned verdict map below.
@@ -23,8 +27,8 @@
  *
  * This file reads the API tree with readdirSync at run time, so nothing
  * relates it to a route-file diff in test-default's `--changed` run. It is
- * run unfiltered by the `rest-surface` job in .github/workflows/ci.yml —
- * without that job the guarantees above only hold post-merge on main.
+ * run unfiltered by the `rest-surface` step of the `guards` job in
+ * .github/workflows/ci.yml — without that step the guarantees above only hold post-merge on main.
  *
  * `keep-external` = published surface with no in-repo runtime caller by
  * design (an ESP32 firmware target, a documented `/api/v1/*` route, a
@@ -44,7 +48,7 @@ const API_ROOT = join(WEB_ROOT, 'app', 'api');
 type Verdict = 'keep-external' | 'keep-caller';
 
 const VERDICTS: Record<string, Verdict> = {
-  // --- /api/auth/* (8) — session/OAuth/registration, called by www and by
+  // --- /api/auth/* (12) — session/OAuth/registration, called by www and by
   // the mobile app's web auth path (and, for resend-verification, the native
   // store fleet too via the plain app/auth/register.tsx). ---
   'app/api/auth/[...nextauth]/route.ts': 'keep-caller',
@@ -55,6 +59,17 @@ const VERDICTS: Record<string, Verdict> = {
   'app/api/auth/resend-verification/route.ts': 'keep-caller',
   'app/api/auth/verify-email/route.ts': 'keep-caller',
   'app/api/auth/native/callback/route.ts': 'keep-caller',
+  // Browser-context attempt cookie binds genuine creation proof to the current
+  // OAuth flow. NextAuth owns this HttpOnly cookie, so this bridge stays on www.
+  'app/api/auth/native/attempt/route.ts': 'keep-caller',
+  // Provider link, unlink and reauthentication under the browser session mode
+  // (#7596 B5e1); 404 with the mode unset. Called by www's own pages.
+  'app/api/auth/provider-security/[...step]/route.ts': 'keep-caller',
+  // The forced re-sign-in's start and its same-account return check (#7596
+  // B5e1); 404 with the browser session mode unset. Called by www's own page.
+  'app/api/auth/reauthenticate/[action]/route.ts': 'keep-caller',
+  // First password for Apple-only accounts (#7596 B5e2); 404 with the mode unset.
+  'app/api/auth/first-password/[...step]/route.ts': 'keep-caller',
 
   // --- /api/health (1) — Railway's healthcheck target (railway.web.toml).
   // Polled by the platform on every deploy and periodically after; nothing
@@ -69,10 +84,13 @@ const VERDICTS: Record<string, Verdict> = {
   // NODE_ENV=development) — the only machine-readable way to confirm which
   // QA notes a running dev server started with.
   'app/api/internal/dev-metadata/route.ts': 'keep-external',
+  // Dev-only translation catalog editor (404s outside NODE_ENV=development),
+  // called by components/i18n/dev-translation-editor.tsx.
+  'app/api/internal/dev-translations/route.ts': 'keep-caller',
   // Cron targets. Their only trigger is a scheduler outside the web app — no
   // in-repo code ever calls them, which is the intended steady state, not
   // evidence of deadness. All three now fire from the Railway scheduler
-  // (packages/scheduler, docs/scheduler.md), which is why none of them appears
+  // (packages/scheduler, docs/backend/scheduler.md), which is why none of them appears
   // in packages/web/vercel.json any more; `classifies every scheduler cron
   // target as an external surface` pins that below.
   'app/api/internal/cleanup/route.ts': 'keep-external',
@@ -97,17 +115,20 @@ const VERDICTS: Record<string, Verdict> = {
   'app/api/internal/feature-flags/route.ts': 'keep-caller',
 
   // --- /api/og/* (5) ---
-  // Legacy og:image redirect shim (307 -> the Railway renderer) kept
-  // for every already-shared HTML page and crawler cache from before the
-  // OG-card migration to the backend (see docs/og-climb.md). New metadata
-  // never emits it — no in-repo caller by design.
+  // Legacy og:image redirect shims (307 -> the backend renderer) kept
+  // for every already-shared HTML page and crawler cache from before each
+  // card moved to the backend (see docs/web/og-climb.md). New metadata never
+  // emits them — no in-repo caller by design.
   'app/api/og/climb/route.tsx': 'keep-external',
-  'app/api/og/playlist/route.tsx': 'keep-caller',
-  'app/api/og/profile/route.tsx': 'keep-caller',
+  'app/api/og/playlist/route.tsx': 'keep-external',
+  'app/api/og/profile/route.tsx': 'keep-external',
+  'app/api/og/setter/route.tsx': 'keep-external',
+  // The same shim for a real session, but it still draws the card for a
+  // `daily:` feed group, which the backend refuses, and the session and join
+  // pages for those groups still advertise it.
   'app/api/og/session/route.tsx': 'keep-caller',
-  'app/api/og/setter/route.tsx': 'keep-caller',
 
-  // --- /api/v1/* (11) — published in the OpenAPI doc rendered at the
+  // --- /api/v1/* (10) — published in the OpenAPI doc rendered at the
   // indexable, sitemapped /docs and served as a crawlable /openapi.json.
   // "No in-repo caller" is the intended steady state of a published API. ---
   'app/api/v1/[board_name]/grades/route.ts': 'keep-external',
@@ -249,8 +270,10 @@ describe('REST surface inventory (issue #1889)', () => {
   });
 
   it('counts exactly the audited surface', () => {
-    // Guards the headline number in issue #1889 itself — a change here means
-    // the issue body needs a fresh audit pass, not a quiet reclassification.
-    expect(derived.size).toBe(38);
+    // Keep the original #1889 audit plus explicit later deltas reconciled. The
+    // staged browser routes it once counted went with #7596; the closed audit
+    // stays historical. #7596 B5e1 added the forced re-sign-in route and the
+    // provider-security route; B5e2 the first-password route.
+    expect(derived.size).toBe(43);
   });
 });

@@ -10,6 +10,7 @@ import {
   resolveCommentRecipients,
   resolveVoteRecipients,
   resolveFollowRecipient,
+  resolveFollowRequestRecipient,
   resolveProposalVoteRecipients,
   resolveProposalApprovalRecipients,
   resolveProposalRejectionRecipients,
@@ -20,6 +21,7 @@ import {
   resolveClimbCreatedSubscriptionRecipients,
 } from './recipient-resolution';
 import { logger } from '../utils/logger';
+import { writeFollowRequestNotification } from './follow-request-notifications';
 import { climbStatsJoinConditions, resolvedClimbAngleSql } from '../db/queries/util/climb-stats-join';
 import {
   fanoutCommentFeedItems,
@@ -29,6 +31,73 @@ import {
 } from './feed-fanout';
 import { resolveClimbNoMatch } from '../graphql/resolvers/shared/helpers';
 import crypto from 'crypto';
+import { canViewUserActivity } from '../services/privacy';
+import { canReadSocialEntity, canSeeActorOnEntity } from '../graphql/resolvers/shared/activity-privacy';
+
+/**
+ * A notification that still goes out, stored with no actor, when the recipient
+ * may not see who acted. A report on the recipient's own climb reads "Someone
+ * reported your climb": a proposal has no owner, so a private reporter stays
+ * unnamed to the setter, but the setter still hears that their climb was
+ * reported (#6385). A new climb is not one: who set a published, listed climb
+ * is public with it, so it always names its setter (#6418).
+ */
+export function notifiesWithoutActor(type: string): boolean {
+  return type === 'proposal_on_your_climb';
+}
+
+/** Whether a notification goes out and, if it does, the actor it stores (null: unnamed). */
+export type NotificationActorDecision = { send: false } | { send: true; storedActorId: string | null };
+
+/**
+ * Whether a notification may reach this recipient, and who it names. Both
+ * writers ask this before they store or push anything: the notification worker,
+ * and the inline fallback `publishSocialEvent` takes when the broker is not up.
+ * So a recipient who may not see an actor is never shown them live in either
+ * mode (#6558). The inbox applies the same rules again when it is read, through
+ * `notificationPrivacyCondition`.
+ *
+ * Never sent to the actor themselves.
+ */
+export async function resolveNotificationActor(
+  recipientId: string,
+  actorId: string,
+  type: NotificationType,
+  entityType: string | null,
+  entityId: string,
+  commentUuid?: string,
+): Promise<NotificationActorDecision> {
+  // Guard: don't notify yourself
+  if (recipientId === actorId) return { send: false };
+
+  // A follower is telling the recipient about themselves, so the recipient
+  // seeing their name is the point, whatever the actor's own activity privacy
+  // says. Follow requests are written by handleFollowRequested, not here.
+  if (type === 'new_follower') return { send: true, storedActorId: actorId };
+
+  // The owner of the item hears about every comment and like on it, private
+  // commenters included: `canReadSocialEntity` admits the owner of a
+  // commented item, and `canSeeActorOnEntity` the owner of a liked one.
+  // On a published, listed climb its author is public with it, so a new
+  // climb names its setter's account to every recipient. Any other row about
+  // a climb is activity and keeps its actor's account privacy, the author's
+  // own included.
+  const canSeeActor = commentUuid
+    ? await canReadSocialEntity('comment', commentUuid, recipientId, 'listed')
+    : entityType
+      ? await canSeeActorOnEntity(entityType, entityId, actorId, recipientId, type)
+      : await canViewUserActivity(recipientId, actorId);
+  // An inbox is a list: nothing about an unlisted climb reaches anyone but
+  // its owner, the same test notificationPrivacyCondition reads with.
+  if (entityType && !(await canReadSocialEntity(entityType, entityId, recipientId, 'listed'))) {
+    return { send: false };
+  }
+  if (canSeeActor) return { send: true, storedActorId: actorId };
+  // A report on the recipient's own climb goes out unnamed. Anything else
+  // about a hidden actor is not sent.
+  if (!notifiesWithoutActor(type)) return { send: false };
+  return { send: true, storedActorId: null };
+}
 
 /**
  * Whether the proposal behind this event is a `hide`.
@@ -76,6 +145,9 @@ export class NotificationWorker {
           break;
         case 'follow.created':
           await this.handleFollowCreated(event);
+          break;
+        case 'follow.requested':
+          await this.handleFollowRequested(event);
           break;
         case 'ascent.logged':
           await this.handleAscentLogged(event);
@@ -163,6 +235,8 @@ export class NotificationWorker {
   }
 
   private async handleFollowCreated(event: SocialEvent): Promise<void> {
+    // The owner approved this follow themselves; they need no notification of it.
+    if (event.metadata.fromFollowRequestApproval === 'true') return;
     const recipient = resolveFollowRecipient(event.metadata);
     if (!recipient) return;
 
@@ -183,6 +257,30 @@ export class NotificationWorker {
       null,
       event.entityId,
     );
+  }
+
+  /**
+   * A follow request to a private account. One row per requester (entityId is
+   * the requester) and at most one per pair: inside the dedup window a new
+   * request re-shows the existing row, after it the old row is replaced, so a
+   * cancel and a later re-request never leave two rows (or two unread). The
+   * write is serialized per pair (see writeFollowRequestNotification). The row
+   * stays visible only while the request is pending: see
+   * notificationPrivacyCondition.
+   *
+   * No actor-visibility check, unlike createAndPublishNotification: the
+   * requester is introducing themselves, so the recipient seeing their name is
+   * the point, even when the requester's own account is private.
+   */
+  private async handleFollowRequested(event: SocialEvent): Promise<void> {
+    const recipient = resolveFollowRequestRecipient(event.metadata);
+    if (!recipient) return;
+
+    const uuid = await writeFollowRequestNotification(event.actorId, recipient.recipientId);
+    if (!uuid) return;
+
+    const enriched = await this.enrichNotification(uuid, event.actorId, 'follow_request', null, event.actorId);
+    pubsub.publishNotificationEvent(recipient.recipientId, { notification: enriched });
   }
 
   private async handleAscentLogged(event: SocialEvent): Promise<void> {
@@ -362,22 +460,40 @@ export class NotificationWorker {
     });
   }
 
+  /**
+   * Whether this notification was already written. With `intervalMinutes`, a
+   * matching row inside that window counts (votes, follows, proposals). With
+   * `commentId` instead, a row about the same comment counts whenever it was
+   * written: one comment is one notification per recipient and type.
+   */
   private async isDuplicate(
     actorId: string,
     recipientId: string,
     type: NotificationType,
     entityId: string,
-    intervalMinutes: number,
+    intervalMinutes: number | null,
+    commentId?: number,
   ): Promise<boolean> {
+    // A type that can be stored without its actor also matches a row stored
+    // that way: the actor was hidden from this recipient, so a NULL row is the
+    // same notification. Every such type names one actor per entity (a
+    // proposal has one proposer), so this cannot swallow a second person.
+    // Other types never match NULL: a NULL there is a deleted account, not
+    // this actor.
+    const sameActor = notifiesWithoutActor(type)
+      ? sql`(actor_id = ${actorId} OR actor_id IS NULL)`
+      : sql`actor_id = ${actorId}`;
+    const sameComment = commentId === undefined ? sql`` : sql` AND comment_id = ${commentId}`;
+    const recent =
+      intervalMinutes === null ? sql`` : sql` AND created_at > NOW() - make_interval(mins => ${intervalMinutes})`;
     const rows = await executeRows<unknown>(
       db,
       sql`
       SELECT 1 FROM notifications
-      WHERE actor_id = ${actorId}
+      WHERE ${sameActor}
         AND recipient_id = ${recipientId}
         AND type = ${type}
-        AND entity_id = ${entityId}
-        AND created_at > NOW() - make_interval(mins => ${intervalMinutes})
+        AND entity_id = ${entityId}${sameComment}${recent}
       LIMIT 1
     `,
     );
@@ -392,8 +508,9 @@ export class NotificationWorker {
     entityId: string,
     commentUuid?: string,
   ): Promise<void> {
-    // Guard: don't notify yourself
-    if (recipientId === actorId) return;
+    const actorDecision = await resolveNotificationActor(recipientId, actorId, type, entityType, entityId, commentUuid);
+    if (!actorDecision.send) return;
+    const { storedActorId } = actorDecision;
 
     const uuid = crypto.randomUUID();
 
@@ -408,11 +525,19 @@ export class NotificationWorker {
       commentId = comment?.id;
     }
 
+    // The broker acknowledges an event only after its whole handler, feed
+    // fan-out included, and redelivers it otherwise. A comment notification
+    // already written for this recipient means this is that redelivery.
+    // Comment types never store a hidden actor, so the actor matches as is.
+    if (commentId !== undefined && (await this.isDuplicate(actorId, recipientId, type, entityId, null, commentId))) {
+      return;
+    }
+
     // Persist notification
     await db.insert(dbSchema.notifications).values({
       uuid,
       recipientId,
-      actorId,
+      actorId: storedActorId,
       type,
       entityType: entityType as dbSchema.SocialEntityType | null,
       entityId,
@@ -420,7 +545,7 @@ export class NotificationWorker {
     });
 
     // Enrich for real-time delivery
-    const enriched = await this.enrichNotification(uuid, actorId, type, entityType, entityId, commentUuid);
+    const enriched = await this.enrichNotification(uuid, storedActorId, type, entityType, entityId, commentUuid);
 
     // Push to connected WS clients via PubSub
     pubsub.publishNotificationEvent(recipientId, { notification: enriched });
@@ -428,24 +553,26 @@ export class NotificationWorker {
 
   private async enrichNotification(
     uuid: string,
-    actorId: string,
+    actorId: string | null,
     type: NotificationType,
     entityType: string | null,
     entityId: string,
     commentUuid?: string,
   ) {
-    // Fetch actor profile
-    const [actor] = await db
-      .select({
-        name: dbSchema.users.name,
-        image: dbSchema.users.image,
-        displayName: dbSchema.userProfiles.displayName,
-        avatarUrl: dbSchema.userProfiles.avatarUrl,
-      })
-      .from(dbSchema.users)
-      .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
-      .where(eq(dbSchema.users.id, actorId))
-      .limit(1);
+    // Fetch actor profile. No actor: a report whose reporter stays unnamed.
+    const [actor] = actorId
+      ? await db
+          .select({
+            name: dbSchema.users.name,
+            image: dbSchema.users.image,
+            displayName: dbSchema.userProfiles.displayName,
+            avatarUrl: dbSchema.userProfiles.avatarUrl,
+          })
+          .from(dbSchema.users)
+          .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
+          .where(eq(dbSchema.users.id, actorId))
+          .limit(1)
+      : [];
 
     // Fetch comment body preview if applicable
     let commentBody: string | undefined;

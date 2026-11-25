@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { beforeEach, describe, it, expect, vi } from 'vitest';
 import { render, fireEvent } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -12,8 +25,12 @@ const typeScale = vi.hoisted(() => ({ current: 1 }));
 
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  StyleSheet: { create: (styles: unknown) => styles },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+  },
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
   // The header drops its second grade line above a 1.3 font scale rather than
   // clamping Dynamic Type. Controllable so that branch is testable.
@@ -35,7 +52,6 @@ vi.mock('react-native', () => ({
       children,
     ),
 }));
-vi.mock('../../Icon', () => ({ Icon: () => null }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('@boardsesh/board-constants/grade-colors', () => ({
   getGradeColor: () => '#abcdef',
@@ -45,13 +61,28 @@ vi.mock('../../../lib/format-climb-stats', () => ({
   formatSends: (count: number) => `${count} sends`,
   formatQuality: (value: string) => value,
 }));
+vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
+  useTheme: () => ({ systemColors: { secondaryLabel: 'secondaryLabel' } }),
+}));
 vi.mock('../../Text', () => ({
-  Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+  // The setter is a nested Text in the link colour (no `color`); the stats line
+  // around it is the secondary grey. Surfaced so a peek can be compared.
+  Text: ({
+    children,
+    color,
+    accessibilityRole,
+  }: {
+    children?: ReactNode;
+    color?: string;
+    accessibilityRole?: string;
+  }) => createElement('span', { 'data-color': color ?? 'label', 'data-role': accessibilityRole }, children),
 }));
 // MarqueeText (the scrolling climb-name label) has its own unit test; here it's a
 // plain text node so the long-press wrapper + name lookup work without Reanimated.
 vi.mock('../../MarqueeText', () => ({
-  MarqueeText: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
+  MarqueeText: ({ children, shrinkToFitScale }: { children?: ReactNode; shrinkToFitScale?: number }) =>
+    createElement('span', { 'data-shrink-to-fit': shrinkToFitScale }, children),
 }));
 vi.mock('../../DrawerHeader', () => ({
   // Render the center column so the name Pressable is in the tree, and the
@@ -76,8 +107,12 @@ vi.mock('../../DrawerHeader', () => ({
 }));
 vi.mock('../../ClimbAttributeIcons', () => ({ ClimbAttributeIcons: () => createElement('i', null) }));
 // The real Icon pulls in react-native-vector-icons, which this suite's
-// `react-native` stub can't satisfy — and the grade glyphs are not what it tests.
+// `react-native` stub can't satisfy. Keep marker names visible for grade assertions.
 vi.mock('../../Icon', () => ({ Icon: ({ name }: { name: string }) => createElement('i', { 'data-icon': name }) }));
+
+// The real chip reads the theme provider, which this suite does not stand up.
+vi.mock('../../DraftChip', () => ({ DraftChip: () => createElement('i', { 'data-chip': 'draft' }) }));
+vi.mock('../../ProjectChip', () => ({ ProjectChip: () => createElement('i', { 'data-chip': 'project' }) }));
 
 import { PlayDrawerHeader } from '../PlayDrawerHeader';
 
@@ -98,17 +133,65 @@ describe('PlayDrawerHeader long-press copy', () => {
     expect(onLongPressName).toHaveBeenCalledTimes(1);
   });
 
-  it('renders the name without an interactive press target on the peek header (no handler)', () => {
+  it('renders the name without an interactive press target when there is no handler', () => {
     const { getByLabelText, getByText } = render(createElement(PlayDrawerHeader, baseProps));
     expect(getByText('Hueco Madness')).toBeTruthy();
-    // The Pressable is disabled when no handler is supplied (swipe "peek" header).
     expect((getByLabelText('name-pressable') as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+// The swipe's incoming header used to be drawn disabled (50%, 38% on Material)
+// and its setter grey, then both snapped to full strength when the swipe
+// committed, 83–150 ms after the climb had landed on an iPhone 17 Pro.
+describe('PlayDrawerHeader swipe peek', () => {
+  const withSetter = { ...baseProps, ascensionistCount: 737, setterUsername: 'briancarlson' };
+
+  it('draws the peek name at full strength, never with the disabled look', () => {
+    const { getByLabelText } = render(createElement(PlayDrawerHeader, { ...withSetter, peek: true }));
+    // PressableSurface dims only a disabled surface.
+    expect((getByLabelText('name-pressable') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('draws the setter exactly as the committed header does, so the commit changes nothing', () => {
+    // The innermost span that names the setter: the link on its own, or the
+    // whole grey stats line when the setter is printed as part of it.
+    const setterSpan = (props: object) => {
+      const { container, unmount } = render(createElement(PlayDrawerHeader, { ...withSetter, ...props }));
+      const span = [...container.querySelectorAll('span')]
+        .filter((node) => node.textContent?.includes('briancarlson'))
+        .find(
+          (node) => ![...node.querySelectorAll('span')].some((child) => child.textContent?.includes('briancarlson')),
+        )!;
+      const drawn = {
+        text: span.textContent,
+        color: span.dataset.color,
+        parentColor: span.parentElement?.dataset.color,
+      };
+      unmount();
+      return { span, drawn };
+    };
+    const committed = setterSpan({ onPressSetter: vi.fn(), onLongPressName: vi.fn() });
+    const peek = setterSpan({ peek: true });
+    expect(peek.drawn).toEqual(committed.drawn);
+    // Still not a link a screen reader could reach: the peek takes no action.
+    expect(peek.span.dataset.role).toBeUndefined();
+    expect(committed.span.dataset.role).toBe('link');
   });
 });
 
 // #4796 / #4828: the drawer header is the screen you hand your partner to show
 // them the beta, so an unlabelled headline number that is actually your private
 // opinion has to say whose it is.
+// #7017 bug 2: a name a few points too long scrolled by those points, and at
+// rest its first glyph sat clipped ("ɹrain from the Brain"). It shrinks into
+// place instead; the marquee's own test covers the rule.
+describe('PlayDrawerHeader name fit', () => {
+  it('lets the name shrink to 90% before it scrolls, so its first glyph shows', () => {
+    const { getByText } = render(createElement(PlayDrawerHeader, baseProps));
+    expect(getByText(baseProps.name).getAttribute('data-shrink-to-fit')).toBe('0.9');
+  });
+});
+
 describe('PlayDrawerHeader personal grade', () => {
   beforeEach(() => {
     typeScale.current = 1;
@@ -153,5 +236,25 @@ describe('PlayDrawerHeader personal grade', () => {
   it('pins the trailing flank so the centred name stops re-measuring per climb', () => {
     const { container } = render(createElement(PlayDrawerHeader, baseProps));
     expect(container.querySelector('[data-trailing-min-width]')?.getAttribute('data-trailing-min-width')).toBe('72');
+  });
+});
+
+// #5954: a draft is left out of the Climbs list, so the drawer has to say why the
+// climb in front of you is not in it.
+describe('PlayDrawerHeader draft chip', () => {
+  it('marks a draft beside the name', () => {
+    const { container } = render(createElement(PlayDrawerHeader, { ...baseProps, isDraft: true }));
+    expect(container.querySelector('[data-chip="draft"]')).not.toBeNull();
+  });
+
+  it('leaves a published climb unmarked, and one that does not say', () => {
+    expect(
+      render(createElement(PlayDrawerHeader, { ...baseProps, isDraft: false })).container.querySelector(
+        '[data-chip="draft"]',
+      ),
+    ).toBeNull();
+    expect(
+      render(createElement(PlayDrawerHeader, baseProps)).container.querySelector('[data-chip="draft"]'),
+    ).toBeNull();
   });
 });

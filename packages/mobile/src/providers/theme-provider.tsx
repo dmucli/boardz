@@ -7,6 +7,7 @@ import {
   UI_VARIANT_KEY,
   isUiVariantPreference,
   type UiVariantPreference,
+  type KeyValueStorage,
 } from '@boardsesh/key-value-storage';
 import {
   iosSystemColors,
@@ -15,11 +16,13 @@ import {
   androidFallbackColors,
   materialSurfaces,
   materialSurfaceContainers,
+  tertiaryFillFallback,
+  tertiaryGroupedBackgroundFallback,
   type MaterialSurfaceContainers,
 } from '../theme/colors';
-import { iosDarkColors, iosLightColors } from '../theme/ios-colors';
 import { textStylesByVariant, type TextVariant, type TypeStyle } from '../theme/typography';
 import { buildPaperTheme } from '../theme/paper-theme';
+import { NeutralRippleInkContext } from '../theme/neutral-ripple-context';
 import type { MD3Theme } from 'react-native-paper';
 import {
   spacing,
@@ -38,20 +41,21 @@ import {
   resolveActionColors,
   resolveChartColors,
   resolveHeatRamp,
+  resolveSelectionColors,
+  resolveStatusColors,
+  resolveSurfaces,
   sectionCaptionByVariant,
   type ActionColors,
   type ChartColors,
   type HeatRamp,
   type SectionCaption,
+  type SelectionColors,
+  type StatusColors,
+  type Surfaces,
 } from '../theme/variants/variant-tokens';
 import { variantFeatures, type VariantFeatures } from '../theme/variants/variant-features';
 import { secureStorePreferences } from '../lib/preferences/secure-store-adapter';
 import { assertNever } from '../lib/assert-never';
-import {
-  SCREENSHOT_THEME_OVERRIDE,
-  SCREENSHOT_VARIANT_PREFERENCE,
-  screenshotModeStaticColor,
-} from '../lib/screenshot-mode';
 import { syncDocumentAppearance } from '../lib/theme/document-appearance';
 
 type ColorScheme = 'light' | 'dark';
@@ -73,6 +77,21 @@ type ResolvedSystemColors = {
   secondaryBackground: string | OpaqueColorValue;
   tertiaryBackground: string | OpaqueColorValue;
   groupedBackground: string | OpaqueColorValue;
+  /**
+   * The card on a `groupedBackground` page: iOS `secondarySystemGroupedBackground`
+   * (white in light, #1C1C1E in dark), the colour a SwiftUI Form draws its rows on,
+   * so a hand-built settings page matches the native ones beside it. Android and
+   * Material reuse `secondaryBackground`, which already sits a step above their
+   * grouped page.
+   */
+  secondaryGroupedBackground: string | OpaqueColorValue;
+  /**
+   * A block inside that card, such as a warning: iOS
+   * `tertiarySystemGroupedBackground` (#F2F2F7 in light, #2C2C2E in dark).
+   * `tertiaryBackground` is white in light, the same as the card, so it can't be
+   * used there. Android and Material use `tertiaryGroupedBackgroundFallback`.
+   */
+  tertiaryGroupedBackground: string | OpaqueColorValue;
   elevatedSurface: string | OpaqueColorValue;
   label: string | OpaqueColorValue;
   secondaryLabel: string | OpaqueColorValue;
@@ -80,12 +99,24 @@ type ResolvedSystemColors = {
   separator: string | OpaqueColorValue;
   fill: string | OpaqueColorValue;
   /**
-   * Interactive-accent foreground (links, active tab, edit·copy·open). iOS uses
-   * Apple's link blue; Android/Material use the brand violet, lifted to #A78BFA
-   * in dark so it clears AA on near-black. Replaces the static
-   * `iosSystemColors.systemBlue` for foreground use.
+   * Interactive-accent foreground (links, checkmarks, active tab, edit·copy·open).
+   * The brand violet on every platform and variant — the same tint the @expo/ui
+   * controls use — lifted to #9784FF in dark so it clears AA on near-black. HIG
+   * Color: one tint for every interactive element.
    */
   accent: string | OpaqueColorValue;
+  /**
+   * Error / destructive foreground. iOS Liquid Glass uses `systemRed`, which
+   * adapts to dark mode and Increase Contrast; Android and Material use the M3
+   * `error` role (the same `brandColors.error` the Paper theme maps).
+   */
+  error: string | OpaqueColorValue;
+  /**
+   * Fill for LARGE shapes (grouped cards, section backgrounds): iOS
+   * `tertiarySystemFill`, a step lighter than `fill`, which Apple reserves for
+   * small controls. Android/Material use a fainter version of the violet fill.
+   */
+  tertiaryFill: string | OpaqueColorValue;
 };
 
 type Theme = {
@@ -124,7 +155,7 @@ type Theme = {
   /**
    * MD3 colour roles (the full Paper palette: primaryContainer, secondaryContainer,
    * tertiaryContainer, onSurfaceVariant, outlineVariant, and the `elevation`
-   * level0–5 surface-tint ladder) for the current colour scheme. Only meaningful
+   * level0–5 Graphite container ladder) for the current colour scheme. Only meaningful
    * on the Material variant — Material-branch app components read these so they
    * match the Paper components without re-deriving roles; Liquid Glass never reads
    * it. Note: react-native-paper 5.15 predates MD3's `surfaceContainer*` tone
@@ -132,7 +163,7 @@ type Theme = {
    */
   m3: MD3Theme['colors'];
   /**
-   * M3 tonal surface-container ramp ({lowest,low,base,high,highest}) for the
+   * M3 tonal surface-container ramp ({lowest,low,base,high,level4,highest}) for the
    * current colour scheme. Material surfaces read a role here to express depth by
    * TONE (the canonical M3 mechanism); pair with `materialElevation` for the cast.
    * Only meaningful on Material — Liquid Glass never reads it.
@@ -152,6 +183,24 @@ type Theme = {
    */
   actionColors: ActionColors;
   /**
+   * Page grounds (Velvet Send v2): `plain` for a page of content, `grouped` for a
+   * page of inset-grouped rows, each `{ page, card, tile }`. iOS system
+   * backgrounds on Liquid Glass (they step up in a sheet on their own), the
+   * fallback or Graphite ladder elsewhere. See `Surfaces` in variant-tokens.ts.
+   */
+  surfaces: Surfaces;
+  /**
+   * The selected or current item (Velvet Send v2): `label` text, an `accent`
+   * checkmark, and the brand fill as the row wash (13% light, 20% dark: the
+   * Climbs list's current-climb look). Selection is never violet text.
+   */
+  selection: SelectionColors;
+  /**
+   * A status that can't be tapped (Velvet Send v2): a `tertiaryFill` pill with
+   * `secondaryLabel` text.
+   */
+  status: StatusColors;
+  /**
    * Plain-string colour palette for chart libraries (gifted-charts) that reject
    * PlatformColor. Mirrors `systemColors` but is always hex/rgba.
    */
@@ -162,7 +211,7 @@ type Theme = {
    */
   heatRamp: HeatRamp;
   /**
-   * Opaque ground for form sheets (`surface="solid"`). MUST be a plain string —
+   * Opaque ground every Android and web sheet paints (`useSheetBackgroundStyle`). MUST be a plain string —
    * @expo/ui reads `backgroundStyle.backgroundColor` with `typeof === 'string'`
    * and silently drops a PlatformColor, handing you glass back with no error.
    */
@@ -208,28 +257,22 @@ export function useAppColorScheme(): ColorScheme {
  * androidFallbackColors light/dark map.
  */
 function resolveSystemColors(colorScheme: ColorScheme, variant: UiVariant): ResolvedSystemColors {
+  const brand = resolveBrandColors(colorScheme);
   switch (variant) {
     // Material variant: M3 tonal surfaces on every platform — including iOS 26
     // hardware when the user explicitly chose Material. Drawn opaque (no glass),
     // so we don't use PlatformColor here.
     case 'material':
-      return { ...materialSurfaces[colorScheme] };
+      return {
+        ...materialSurfaces[colorScheme],
+        secondaryGroupedBackground: materialSurfaces[colorScheme].secondaryBackground,
+        tertiaryGroupedBackground: tertiaryGroupedBackgroundFallback(materialSurfaces[colorScheme], colorScheme),
+        error: brand.error,
+        tertiaryFill: tertiaryFillFallback[variant][colorScheme],
+      };
     case 'liquidGlass': {
       if (Platform.OS === 'ios' && iosSystemColors) {
-        // PlatformColor values adapt automatically on iOS — return as-is,
-        // except `separator`: it's a translucent native tone that composites
-        // against whatever paints behind it, and resolves against the native
-        // trait collection ThemeProvider only syncs from a post-mount effect
-        // (see `screenshotModeStaticColor`'s docstring). Screenshot mode
-        // swaps it for the opaque static hairline so it can't still be
-        // settling on the very first captured frame.
-        return {
-          ...(iosSystemColors as ResolvedSystemColors),
-          separator: screenshotModeStaticColor<string | OpaqueColorValue>(
-            iosSystemColors.separator,
-            colorScheme === 'dark' ? iosDarkColors.separator : iosLightColors.separator,
-          ),
-        };
+        return iosSystemColors as ResolvedSystemColors;
       }
       // Android: resolve from the single source of truth for fallback colors.
       const fallback = colorScheme === 'dark' ? androidFallbackColors.dark : androidFallbackColors.light;
@@ -238,6 +281,8 @@ function resolveSystemColors(colorScheme: ColorScheme, variant: UiVariant): Reso
         secondaryBackground: fallback.secondaryBackground,
         tertiaryBackground: fallback.tertiaryBackground,
         groupedBackground: fallback.groupedBackground,
+        secondaryGroupedBackground: fallback.secondaryBackground,
+        tertiaryGroupedBackground: tertiaryGroupedBackgroundFallback(fallback, colorScheme),
         elevatedSurface: fallback.elevatedSurface,
         label: fallback.label,
         secondaryLabel: fallback.secondaryLabel,
@@ -245,6 +290,8 @@ function resolveSystemColors(colorScheme: ColorScheme, variant: UiVariant): Reso
         separator: fallback.separator,
         fill: fallback.fill,
         accent: fallback.accent,
+        error: brand.error,
+        tertiaryFill: tertiaryFillFallback[variant][colorScheme],
       };
     }
     // A new UiVariant must declare how its system colours resolve.
@@ -263,29 +310,21 @@ function resolveBrandColors(colorScheme: ColorScheme): ResolvedBrandColors {
 
 type ThemeProviderProps = {
   children: ReactNode;
+  initialTheme?: ThemeOverride;
+  initialVariant?: UiVariantPreference;
+  /** Null keeps appearance in memory, for previews and embedded surfaces. */
+  preferences?: KeyValueStorage | null;
 };
 
-export function ThemeProvider({ children }: ThemeProviderProps) {
+export function ThemeProvider({
+  children,
+  initialTheme = Platform.OS === 'web' ? 'dark' : 'system',
+  initialVariant = 'auto',
+  preferences = secureStorePreferences,
+}: ThemeProviderProps) {
   const deviceColorScheme = useColorScheme();
-  // Native starts on `system`, matching the OS. Web starts dark so a fresh
-  // browser session matches the deployed app's dark shell before preference
-  // hydration completes. A saved light/dark/system choice still replaces this
-  // launch default once IndexedDB resolves. Screenshot mode remains pinned to
-  // its explicit fixture value so captures cannot flip mid-run.
-  const [themeOverride, setThemeOverrideState] = useState<ThemeOverride>(
-    process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1'
-      ? SCREENSHOT_THEME_OVERRIDE
-      : Platform.OS === 'web'
-        ? 'dark'
-        : 'system',
-  );
-  // `'auto'` until SecureStore hydrates — same value as a brand-new user, so the
-  // first paint resolves to the platform default (Liquid Glass on iOS 26,
-  // Material elsewhere) via the synchronous capability check, no flash. Locked
-  // in screenshot mode for the same reason as the theme override.
-  const [uiVariantPreference, setUiVariantPreferenceState] = useState<UiVariantPreference>(
-    process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1' ? SCREENSHOT_VARIANT_PREFERENCE : 'auto',
-  );
+  const [themeOverride, setThemeOverrideState] = useState<ThemeOverride>(initialTheme);
+  const [uiVariantPreference, setUiVariantPreferenceState] = useState<UiVariantPreference>(initialVariant);
   // Guards the hydration effect against stomping a user choice that lands
   // before the SecureStore read resolves (a tap on a settings toggle can
   // beat the keychain read on a cold launch).
@@ -293,12 +332,9 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
   const hasUserChosenVariantRef = useRef(false);
 
   useEffect(() => {
-    // Screenshot mode pins the theme + variant to fixed values, so skip the
-    // SecureStore reads entirely — otherwise a saved override could flip the
-    // look between the first paint and the capture.
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return;
+    if (preferences === null) return;
     let cancelled = false;
-    secureStorePreferences
+    preferences
       .get<ThemeOverride>(THEME_OVERRIDE_KEY)
       .then((value) => {
         if (cancelled || hasUserChosenRef.current) return;
@@ -309,7 +345,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
         // Keep the platform launch default rather than crashing: dark on web,
         // system-following on native.
       });
-    secureStorePreferences
+    preferences
       .get<UiVariantPreference>(UI_VARIANT_KEY)
       .then((value) => {
         if (cancelled || hasUserChosenVariantRef.current) return;
@@ -321,7 +357,7 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [preferences]);
 
   // Drive the native Appearance so the override actually flips iOS
   // `PlatformColor` (which follows the native trait collection, not our JS
@@ -340,32 +376,38 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
     return deviceColorScheme === 'dark' ? 'dark' : 'light';
   }, [themeOverride, deviceColorScheme]);
 
-  const setThemeOverride = useCallback(async (next: ThemeOverride) => {
-    hasUserChosenRef.current = true;
-    setThemeOverrideState(next);
-    try {
-      await secureStorePreferences.set(THEME_OVERRIDE_KEY, next);
-    } catch (error) {
-      // Storage write failed (rare); leave the in-memory state on the user's
-      // pick so the session reflects it, and log so we notice if this happens
-      // consistently. Reverting on write failure would be worse — the toggle
-      // would visibly snap back, which the user reads as a broken UI.
-      // eslint-disable-next-line no-console
-      console.warn('[theme-provider] Failed to persist theme override', error);
-    }
-  }, []);
+  const setThemeOverride = useCallback(
+    async (next: ThemeOverride) => {
+      hasUserChosenRef.current = true;
+      setThemeOverrideState(next);
+      try {
+        await preferences?.set(THEME_OVERRIDE_KEY, next);
+      } catch (error) {
+        // Storage write failed (rare); leave the in-memory state on the user's
+        // pick so the session reflects it, and log so we notice if this happens
+        // consistently. Reverting on write failure would be worse — the toggle
+        // would visibly snap back, which the user reads as a broken UI.
+        // eslint-disable-next-line no-console
+        console.warn('[theme-provider] Failed to persist theme override', error);
+      }
+    },
+    [preferences],
+  );
 
-  const setUiVariant = useCallback(async (next: UiVariantPreference) => {
-    hasUserChosenVariantRef.current = true;
-    setUiVariantPreferenceState(next);
-    try {
-      await secureStorePreferences.set(UI_VARIANT_KEY, next);
-    } catch (error) {
-      // See setThemeOverride — keep the in-memory pick on write failure.
-      // eslint-disable-next-line no-console
-      console.warn('[theme-provider] Failed to persist UI variant', error);
-    }
-  }, []);
+  const setUiVariant = useCallback(
+    async (next: UiVariantPreference) => {
+      hasUserChosenVariantRef.current = true;
+      setUiVariantPreferenceState(next);
+      try {
+        await preferences?.set(UI_VARIANT_KEY, next);
+      } catch (error) {
+        // See setThemeOverride — keep the in-memory pick on write failure.
+        // eslint-disable-next-line no-console
+        console.warn('[theme-provider] Failed to persist UI variant', error);
+      }
+    },
+    [preferences],
+  );
 
   // 'auto' follows the platform aesthetic: Liquid Glass on every iPhone (the blur
   // fallback covers iOS < 26), Material on Android. Read Platform.OS inside the memo
@@ -420,7 +462,11 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
         accent: resolvedSystemColors.accent,
         brandSuccess: resolvedBrandColors.success,
         brandPrimary: resolvedBrandColors.primary,
+        error: resolvedSystemColors.error,
       }),
+      surfaces: resolveSurfaces(resolvedSystemColors),
+      selection: resolveSelectionColors(resolvedSystemColors, resolvedBrandColors.primaryFill, colorScheme),
+      status: resolveStatusColors(resolvedSystemColors),
       chartColors: resolvedChartColors,
       heatRamp: resolveHeatRamp(colorScheme),
       sheetSurface: resolvedChartColors.secondaryBackground,
@@ -436,10 +482,16 @@ export function ThemeProvider({ children }: ThemeProviderProps) {
     }
   }, [colorScheme, theme.systemColors.background]);
 
+  // Material ripples are a grey onSurface state layer on the Graphite surfaces;
+  // Liquid Glass keeps the legacy brand ripple (null).
+  const neutralRippleInk = variant === 'material' ? m3Colors.onSurface : null;
+
   // React 19 context provider syntax (Expo SDK 53+ / React 19)
   return (
     <ThemeContext value={theme}>
-      <ColorSchemeContext value={colorScheme}>{children}</ColorSchemeContext>
+      <ColorSchemeContext value={colorScheme}>
+        <NeutralRippleInkContext value={neutralRippleInk}>{children}</NeutralRippleInkContext>
+      </ColorSchemeContext>
     </ThemeContext>
   );
 }

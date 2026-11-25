@@ -44,7 +44,7 @@ describe('computeBoardRenderVersion', () => {
   });
 
   it('matches the committed constant', () => {
-    // The same gate as the `board-render-version` CI job, run again here so a
+    // The same gate as the `board-render-version` CI guard step, run again here so a
     // stale constant is a red test locally and not only in CI.
     expect(BOARD_RENDER_VERSION).toBe(computeBoardRenderVersion(REPO_ROOT));
   });
@@ -77,6 +77,21 @@ describe('computeBoardRenderVersion', () => {
     const after = computeBoardRenderVersion(scratchTree({ geometryShard: 'module.exports = { outlines: {1:[0]} };' }));
     expect(after).not.toBe(before);
   });
+
+  it.each([
+    'packages/shared/frosted-bokeh/src/index.ts',
+    'packages/shared/frosted-bokeh/assets/grain.png',
+    'packages/shared/board-render/src/frosted-bokeh.ts',
+    'packages/shared/board-render/src/og-card.ts',
+    'packages/backend/src/services/spray-og-card.ts',
+  ])('moves when share-card pixels change in %s', (relativePath) => {
+    const scratchRoot = scratchTree({ geometryShard: 'module.exports = {};' });
+    const before = computeBoardRenderVersion(scratchRoot);
+    const pixelInput = path.join(scratchRoot, relativePath);
+    const original = readFileSync(pixelInput);
+    writeFileSync(pixelInput, Buffer.concat([original, Buffer.from('\nchanged-render-input')]));
+    expect(computeBoardRenderVersion(scratchRoot)).not.toBe(before);
+  });
 });
 
 describe('OPAQUE_RENDER_INPUTS', () => {
@@ -85,6 +100,11 @@ describe('OPAQUE_RENDER_INPUTS', () => {
     expect(OPAQUE_RENDER_INPUTS).toContain('packages/board-renderer/wasm/pkg/board_renderer_wasm.js');
     expect(OPAQUE_RENDER_INPUTS).toContain('packages/shared/board-render/src/pipeline.ts');
     expect(OPAQUE_RENDER_INPUTS).toContain('packages/shared/board-render/src/background.ts');
+  });
+
+  it('hashes the app icon the climb card draws beside the wordmark', () => {
+    expect(OPAQUE_RENDER_INPUTS).toContain('packages/shared/board-render/src/og-family.ts');
+    expect(OPAQUE_RENDER_INPUTS).toContain('packages/shared/board-render/assets/og-app-icon.png');
   });
 
   it('does not hash inputs the catalogue projection already covers', () => {

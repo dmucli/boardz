@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Client, Sink } from 'graphql-ws';
 import { execute } from '../execute';
-import { GraphQLOperationError } from '../errors';
+import { GraphQLOperationError, GraphQLTransportClosedError } from '../errors';
 
 type FakeClient = Client & {
   emit: (payload: Parameters<NonNullable<Sink['next']>>[0]) => void;
@@ -65,6 +65,24 @@ describe('execute', () => {
     client.emitError([{ message: 'boom', extensions: { code: 'NOPE' } }]);
     await expect(promise).rejects.toBeInstanceOf(GraphQLOperationError);
     await expect(promise).rejects.toMatchObject({ extensions: { code: 'NOPE' } });
+  });
+
+  // graphql-ws hands the sink the socket's close event once it stops retrying.
+  // It used to become Error('[object Object]'); keep the code instead.
+  it('rejects with GraphQLTransportClosedError when error() is a close event', async () => {
+    const client = makeFakeClient();
+    const promise = execute(client, { query: 'mutation Foo { ok }' });
+    client.emitError({ code: 4500, reason: 'Internal server error', wasClean: true });
+    await expect(promise).rejects.toBeInstanceOf(GraphQLTransportClosedError);
+    await expect(promise).rejects.toMatchObject({ code: 4500, reason: 'Internal server error' });
+  });
+
+  it('keeps the code of graphql-ws\u2019s own TerminatedCloseEvent, an Error subclass', async () => {
+    const client = makeFakeClient();
+    const promise = execute(client, { query: 'mutation Foo { ok }' });
+    const terminated = Object.assign(new Error('4499: Terminated'), { code: 4499, reason: 'Terminated' });
+    client.emitError(terminated);
+    await expect(promise).rejects.toMatchObject({ name: 'GraphQLTransportClosedError', code: 4499 });
   });
 
   it('rejects with a wrapped Error when error() is an unknown shape', async () => {
@@ -244,5 +262,41 @@ describe('execute — rate-limit retry (#2655)', () => {
       { timeoutMs: 50, sleep: immediateSleep, rateLimitJitterMs: 0 },
     );
     expect(result).toEqual({ ok: true });
+  });
+});
+
+describe('execute — client getter (#6766)', () => {
+  it('reads a getter again for the retry after a rate-limit wait', async () => {
+    // Offline mode can dispose the first client while the retry waits. A
+    // disposed graphql-ws client still opens a new socket for a new operation,
+    // so the retry must go out on whichever client is current by then.
+    const first = makeScriptedClient([rateLimited(1)]);
+    const replacement = makeScriptedClient([{ kind: 'data', data: { ok: true } }]);
+    const clientsInOrder = [first.client, replacement.client];
+    const getClient = vi.fn(() => clientsInOrder.shift() ?? replacement.client);
+
+    const result = await execute<{ ok: boolean }>(
+      getClient,
+      { query: 'mutation Foo { ok }' },
+      { sleep: immediateSleep, rateLimitJitterMs: 0 },
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(getClient).toHaveBeenCalledTimes(2);
+    expect(first.subscribeSpy).toHaveBeenCalledTimes(1);
+    expect(replacement.subscribeSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps sending on a plain client for every attempt', async () => {
+    const { client, subscribeSpy } = makeScriptedClient([rateLimited(1), { kind: 'data', data: { ok: true } }]);
+
+    const result = await execute<{ ok: boolean }>(
+      client,
+      { query: 'mutation Foo { ok }' },
+      { sleep: immediateSleep, rateLimitJitterMs: 0 },
+    );
+
+    expect(result).toEqual({ ok: true });
+    expect(subscribeSpy).toHaveBeenCalledTimes(2);
   });
 });

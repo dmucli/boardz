@@ -8,6 +8,7 @@ import type {
   SocialEntityType,
   Comment,
 } from '@boardsesh/shared-schema';
+import { DIRECTORY_NOTICE_FIELDS } from './directory-reports';
 
 // ============================================
 // Notification Queries
@@ -31,6 +32,10 @@ export const GET_NOTIFICATIONS = gql`
         proposalUuid
         proposalType
         proposalValue
+        sprayWallName
+        sprayWallUuid
+        sprayVersionId
+        sprayResetOfWallUuid
         isRead
         createdAt
       }
@@ -63,6 +68,7 @@ export const GET_GROUPED_NOTIFICATIONS = gql`
         climbAngle
         climbFrames
         climbCompatibleSizeIds
+        climbCharacteristics
         threadEntityType
         threadEntityId
         proposalUuid
@@ -70,6 +76,11 @@ export const GET_GROUPED_NOTIFICATIONS = gql`
         proposalValue
         setterUsername
         gymName
+        sprayWallName
+        sprayWallUuid
+        sprayVersionId
+        sprayResetOfWallUuid
+        ${DIRECTORY_NOTICE_FIELDS}
         isRead
         createdAt
       }
@@ -154,6 +165,10 @@ export const NOTIFICATION_RECEIVED_SUBSCRIPTION = `
         proposalType
         proposalValue
         gymName
+        sprayWallName
+        sprayWallUuid
+        sprayVersionId
+        sprayResetOfWallUuid
         isRead
         createdAt
       }

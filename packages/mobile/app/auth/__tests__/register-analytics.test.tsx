@@ -1,8 +1,24 @@
 // @vitest-environment jsdom
+vi.mock('../../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('expo-router/react-navigation', () => ({ useHeaderHeight: () => 0 }));
+vi.mock('../../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { grantAnalyticsForTest } from '../../../test/consent-fixture';
+import { invalidateConsentAccount, updateConsentState } from '../../../src/lib/consent-state';
 
 const analytics = vi.hoisted(() => ({ track: vi.fn(), setPersonProperties: vi.fn() }));
 const auth = vi.hoisted(() => ({ register: vi.fn() }));
@@ -11,7 +27,7 @@ const oauth = vi.hoisted(() => ({
   signIn: vi.fn(async () => ({ success: true }) as unknown),
   setError: null as ((message: string | null) => void) | null,
 }));
-const platform = vi.hoisted(() => ({ os: 'android' as 'android' | 'web' }));
+const platform = vi.hoisted(() => ({ os: 'android' as 'android' | 'ios' | 'web' }));
 const fetchMock = vi.hoisted(() => vi.fn());
 
 vi.stubGlobal('fetch', fetchMock);
@@ -29,8 +45,7 @@ vi.mock('../../../src/lib/analytics', () => ({
   track: analytics.track,
   setPersonProperties: analytics.setPersonProperties,
 }));
-// The real hook waits for the profile before tracking (login-analytics.test.tsx
-// covers that). Tracking straight away keeps these assertions on one stream.
+// The browser keeps screen-owned success; native success belongs to AuthProvider.
 vi.mock('../../../src/lib/login-analytics', () => ({
   useTrackLoginSucceeded: () => (properties: Record<string, unknown>) => analytics.track('Login Succeeded', properties),
 }));
@@ -47,6 +62,7 @@ vi.mock('../../../src/lib/auth', () => ({ isGoogleSignInConfigured: () => true }
 vi.mock('../../../src/lib/error-reporting', () => ({ reportError: vi.fn() }));
 vi.mock('../../../src/lib/haptics', () => ({ hapticLight: vi.fn() }));
 vi.mock('../../../src/providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({ colorScheme: 'light', systemColors: {}, radii: { button: 10 } }),
 }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
@@ -73,7 +89,10 @@ vi.mock('react-native', () => ({
   Pressable: ({ children, onPress }: { children?: ReactNode; onPress?: () => void }) =>
     createElement('button', { onClick: onPress }, children),
   ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-  StyleSheet: { create: (styles: unknown) => styles },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: unknown) => styles,
+  },
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
 }));
@@ -105,6 +124,7 @@ vi.mock('../../../src/components/Text', () => ({
 import RegisterScreen from '../register';
 
 beforeEach(() => {
+  grantAnalyticsForTest();
   analytics.track.mockClear();
   analytics.setPersonProperties.mockClear();
   auth.register.mockReset();
@@ -134,26 +154,74 @@ async function fillAndSubmit() {
 }
 
 describe('RegisterScreen analytics', () => {
-  it('fires SignupCompleted + first-touch person properties alongside LoginSucceeded on success', async () => {
+  it('does not infer native creation when missing proof later resolves an account', async () => {
+    auth.register.mockImplementation(async () => {
+      invalidateConsentAccount();
+      return { success: true };
+    });
+    await fillAndSubmit();
+    expect(analytics.setPersonProperties).not.toHaveBeenCalled();
+    expect(analytics.track.mock.calls.filter(([event]) => event === SHARED_EVENTS.SignupCompleted)).toHaveLength(0);
+    await act(async () => {
+      updateConsentState({ authSettled: true, accountResolved: true, accountId: 'new-user', sdkReady: true });
+    });
+    const conversions = analytics.track.mock.calls.filter(([event]) => event === SHARED_EVENTS.SignupCompleted);
+    expect(conversions).toHaveLength(0);
+    expect(analytics.setPersonProperties).not.toHaveBeenCalled();
+  });
+
+  it.each(['android', 'ios'] as const)('keeps %s signup creation unknown without a server receipt', async (os) => {
+    platform.os = os;
     auth.register.mockResolvedValue({ success: true });
 
     await fillAndSubmit();
 
-    await waitFor(() =>
-      expect(analytics.track).toHaveBeenCalledWith(SHARED_EVENTS.LoginSucceeded, {
-        auth_method: 'credentials',
-        flow: 'native',
-        is_registration: true,
-        screen: 'register',
-      }),
+    expect(auth.register).toHaveBeenCalledOnce();
+    expect(auth.register).toHaveBeenCalledWith('new@example.com', 'supersecure1', undefined);
+    expect(analytics.track.mock.calls.filter(([event]) => event === SHARED_EVENTS.LoginSucceeded)).toHaveLength(0);
+    expect(analytics.track.mock.calls.filter(([event]) => event === SHARED_EVENTS.SignupCompleted)).toHaveLength(0);
+    expect(analytics.setPersonProperties).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    null,
+    {},
+    {
+      userId: '602c83bf-e090-4c90-9f7e-000000000080',
+      accountCreated: true,
+      provider: 'email',
+      createdAt: 'invalid-timestamp',
+    },
+  ])('does not infer native creation from invalid metadata %j', async (accountCreation) => {
+    auth.register.mockResolvedValue({ success: true, accountCreation });
+
+    await fillAndSubmit();
+
+    expect(analytics.track.mock.calls.filter(([event]) => event === SHARED_EVENTS.SignupCompleted)).toHaveLength(0);
+    expect(analytics.setPersonProperties).not.toHaveBeenCalled();
+  });
+
+  it('preserves the browser email-registration conversion without native receipt metadata', async () => {
+    platform.os = 'web';
+    auth.register.mockResolvedValue({ success: true });
+
+    await fillAndSubmit();
+
+    expect(analytics.track).toHaveBeenCalledWith(
+      SHARED_EVENTS.SignupCompleted,
+      { auth_method: 'credentials', provider: 'email', flow: 'web' },
+      { timestamp: expect.any(Date) },
     );
-    expect(analytics.track).toHaveBeenCalledWith(SHARED_EVENTS.SignupCompleted, {
-      auth_method: 'credentials',
-      flow: 'native',
-    });
     expect(analytics.setPersonProperties).toHaveBeenCalledWith(undefined, {
       signup_at: expect.any(String),
       signup_auth_method: 'credentials',
+    });
+    expect(analytics.track).toHaveBeenCalledWith(SHARED_EVENTS.LoginSucceeded, {
+      auth_method: 'credentials',
+      provider: 'email',
+      flow: 'web',
+      is_registration: true,
+      screen: 'register',
     });
   });
 
@@ -179,11 +247,16 @@ describe('RegisterScreen analytics', () => {
     await fillAndSubmit();
 
     await waitFor(() =>
-      expect(analytics.track).toHaveBeenCalledWith(SHARED_EVENTS.SignupCompleted, {
-        auth_method: 'credentials',
-        flow: 'web',
-        requires_verification: true,
-      }),
+      expect(analytics.track).toHaveBeenCalledWith(
+        SHARED_EVENTS.SignupCompleted,
+        {
+          auth_method: 'credentials',
+          provider: 'email',
+          flow: 'web',
+          requires_verification: true,
+        },
+        { timestamp: expect.any(Date) },
+      ),
     );
     expect(analytics.track).not.toHaveBeenCalledWith(SHARED_EVENTS.LoginSucceeded, expect.any(Object));
     expect(analytics.track).not.toHaveBeenCalledWith(SHARED_EVENTS.LoginFailed, expect.any(Object));
@@ -244,7 +317,7 @@ describe('RegisterScreen analytics', () => {
     expect(screen.queryByText('login.toasts.checkEmail')).toBeNull();
   });
 
-  it('reports a native anonymous registration with the native analytics flow', async () => {
+  it('keeps native anonymous registration creation unknown without proof', async () => {
     platform.os = 'android';
     auth.register.mockResolvedValue({
       success: true,
@@ -255,25 +328,16 @@ describe('RegisterScreen analytics', () => {
 
     await fillAndSubmit();
 
-    await waitFor(() =>
-      expect(analytics.track).toHaveBeenCalledWith(SHARED_EVENTS.SignupCompleted, {
-        auth_method: 'credentials',
-        flow: 'native',
-        requires_verification: false,
-      }),
-    );
+    expect(analytics.track.mock.calls.filter(([event]) => event === SHARED_EVENTS.SignupCompleted)).toHaveLength(0);
+    expect(analytics.setPersonProperties).not.toHaveBeenCalled();
     expect(analytics.track).not.toHaveBeenCalledWith(SHARED_EVENTS.LoginSucceeded, expect.any(Object));
     expect(analytics.track).not.toHaveBeenCalledWith(SHARED_EVENTS.LoginFailed, expect.any(Object));
     expect(screen.getByText('login.toasts.loginAfterCreate')).toBeTruthy();
   });
 
   it('does not fire SignupCompleted through the OAuth sign-in path', async () => {
-    // register.tsx has exactly one SignupCompleted call site: the credentials
-    // onSubmit() success branch. OAuth registration goes through
-    // useNativeOAuthSignIn (already tagged is_registration: true on
-    // LoginSucceeded there, tested separately in
-    // use-native-oauth-sign-in.test.tsx) and must not also fire SignupCompleted
-    // — matching web, which has no OAuth-signup-distinct event either.
+    // Verified native creations are published by AuthProvider. Tapping an OAuth
+    // option must not add another screen-owned signup conversion.
     render(createElement(RegisterScreen));
 
     await act(async () => {

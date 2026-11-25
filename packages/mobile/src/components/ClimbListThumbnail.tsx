@@ -1,20 +1,72 @@
-import React from 'react';
-import { View, StyleSheet } from 'react-native';
+import type { BoardRenderStyle } from '../lib/board-render-style';
+import React, { useCallback, useEffect, useRef, type MutableRefObject } from 'react';
+import { PixelRatio, View, StyleSheet } from 'react-native';
 import type { BoardName } from '@boardsesh/shared-schema';
 import { useNativeClimbRender } from '../hooks/use-native-climb-render';
+import { isBoardArtInMemory, warmBoardArtMemory } from '../lib/board-render/warm-board-art-memory';
+import { useTheme } from '../providers/theme-provider';
 import { borderRadius } from '../theme/tokens';
 import { LayeredClimbImage } from './LayeredClimbImage';
-import { THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH } from './climb-list-thumbnail-metrics';
+import {
+  climbListThumbnailRenderWidth,
+  sizedThumbnailRenderWidth,
+  useClimbListThumbnailSize,
+} from './climb-list-thumbnail-metrics';
+import type { ReadyBoardArtSource } from '../lib/board-render/ready-board-art';
+
+type ClimbListThumbnailPrewarmProps = {
+  frames: string;
+  boardName: BoardName;
+  layoutId: number;
+  sizeId: number;
+  setIds: string;
+};
 
 /**
- * Portrait dimensions of the list thumbnail cell. Exported so ClimbListRow
- * can size its wrapper and align the row separator to the thumbnail's right
- * edge from a single source of truth. Portrait (not square) so the portrait
- * board image fills the cell instead of letterboxing to ~40px wide.
+ * Renders a list thumbnail's holds overlay before its row exists, and decodes it
+ * into expo-image's memory cache. Draws nothing.
+ *
+ * A row that mounts onto a climb nobody has rendered yet shows the bare board
+ * until the native render, the PNG decode and a cross-fade have all finished —
+ * the "board first, holds flash in later" a fast scroll is full of. The climbs
+ * list mounts one of these for each loaded climb just outside the viewport, so
+ * by the time the row arrives the overlay is an index hit and a memory-cache
+ * hit, and it paints with the board.
+ *
+ * `prefetch` puts the render at the scheduler's idle-only rank: it never takes a
+ * slot from a thumbnail somebody can already see.
  */
-export { THUMBNAIL_HEIGHT, THUMBNAIL_WIDTH };
+export const ClimbListThumbnailPrewarm = React.memo(function ClimbListThumbnailPrewarm({
+  frames,
+  boardName,
+  layoutId,
+  sizeId,
+  setIds,
+}: ClimbListThumbnailPrewarmProps) {
+  const { width: cellWidth } = useClimbListThumbnailSize();
+  const { overlayUri } = useNativeClimbRender({
+    frames,
+    boardName,
+    layoutId,
+    sizeId,
+    setIds,
+    // Must match ClimbListThumbnail's call exactly, or this warms a PNG no row
+    // ever looks up.
+    filledStyle: true,
+    renderWidth: climbListThumbnailRenderWidth(cellWidth, PixelRatio.get()),
+    prefetch: true,
+  });
+  useEffect(() => {
+    // Rows just above the viewport were on screen a moment ago and are usually
+    // still decoded; nothing to ask for then.
+    if (overlayUri && !isBoardArtInMemory(overlayUri)) warmBoardArtMemory([overlayUri]);
+  }, [overlayUri]);
+  return null;
+});
 
 type ClimbListThumbnailProps = {
+  climbUuid?: string;
+  readyBoardArtRef?: MutableRefObject<ReadyBoardArtSource | null>;
   frames: string;
   boardName: BoardName;
   layoutId: number;
@@ -22,16 +74,20 @@ type ClimbListThumbnailProps = {
   setIds: string;
   mirrored?: boolean;
   /**
-   * Override the fixed 76×96 list cell. The session feed hero passes a larger
-   * size (~100×128); ClimbListRow omits it and keeps the default. The internal
-   * render width scales with `width` so the enlarged cell stays crisp.
+   * Override the list cell. The session feed hero passes a larger size
+   * (84×104); ClimbListRow omits it and takes the list's cell
+   * (`useClimbListThumbnailSize`: 76×96, or 88×112 in two columns). The
+   * internal render width scales with `width` so the enlarged cell stays crisp.
    */
   size?: { width: number; height: number };
+  onArtDisplayed?: () => void;
+  renderStyleOverride?: BoardRenderStyle;
+  onArtError?: (error: unknown) => void;
 };
 
 /**
  * Layered climb thumbnail for the list view. Wraps the shared
- * LayeredClimbImage stack in a fixed 76×96 portrait cell (override via `size`)
+ * LayeredClimbImage stack in the list's portrait cell (override via `size`)
  * with rounded corners, using the filled hold style so the lit climb reads as
  * solid dots against the board photo at this small size.
  *
@@ -41,6 +97,8 @@ type ClimbListThumbnailProps = {
  * pattern.
  */
 const ClimbListThumbnail = React.memo(function ClimbListThumbnail({
+  climbUuid,
+  readyBoardArtRef,
   frames,
   boardName,
   layoutId,
@@ -48,35 +106,126 @@ const ClimbListThumbnail = React.memo(function ClimbListThumbnail({
   setIds,
   mirrored,
   size,
+  onArtDisplayed,
+  renderStyleOverride,
+  onArtError,
 }: ClimbListThumbnailProps) {
-  const cellWidth = size?.width ?? THUMBNAIL_WIDTH;
-  const cellHeight = size?.height ?? THUMBNAIL_HEIGHT;
-  const { overlayUri, overlayLoadKey, onOverlayLoad, onOverlayError, backgroundPaths, missingBackgroundCount } =
-    useNativeClimbRender({
-      frames,
-      boardName,
-      layoutId,
-      sizeId,
-      setIds,
-      filledStyle: true,
-      // Render the overlay + resolve the background at ~5× the cell width (≥400px,
-      // covering the default 76px cell at up to ~3× DPR and a ~100px hero cell at
-      // ~4×) so expo-image never has to downscale a ~1080px source on the main
-      // thread while scrolling.
-      renderWidth: Math.max(400, Math.round(cellWidth * 5)),
-    });
+  const { systemColors } = useTheme();
+  const listCell = useClimbListThumbnailSize();
+  const cell = size ?? listCell;
+  const {
+    overlayUri,
+    overlayLoadKey,
+    overlayImmediate,
+    overlayUnavailable,
+    onOverlayLoad,
+    onOverlayError,
+    backgroundPaths,
+    missingBackgroundCount,
+    backgroundsLoading,
+    backgroundBaseColor,
+    artworkIdentity,
+    getReadyBoardArtSnapshot,
+  } = useNativeClimbRender({
+    frames,
+    boardName,
+    layoutId,
+    sizeId,
+    setIds,
+    filledStyle: true,
+    renderStyleOverride,
+    renderWidth: size
+      ? sizedThumbnailRenderWidth(size.width)
+      : climbListThumbnailRenderWidth(listCell.width, PixelRatio.get()),
+  });
+
+  useEffect(() => {
+    if (missingBackgroundCount > 0 && !backgroundsLoading) {
+      onArtError?.(new Error('Board background artwork unavailable'));
+    } else if (frames.length > 0 && overlayUnavailable) {
+      onArtError?.(new Error('Climb hold overlay unavailable'));
+    }
+  }, [missingBackgroundCount, backgroundsLoading, overlayUnavailable, frames, onArtError]);
+
+  // Rendered when the row took this climb (a revisit, or a row the list warmed
+  // ahead of the scroll) is not enough on its own: on a hard flick the row can
+  // mount before the warm-up's decode has finished, and the view then shows the
+  // bare board for the frames its own decode takes.
+  const overlayPaintsWithBoard = overlayImmediate && isBoardArtInMemory(overlayUri);
+  const displayIdentity = JSON.stringify([
+    climbUuid,
+    artworkIdentity,
+    mirrored,
+    overlayUri,
+    overlayLoadKey,
+    backgroundPaths,
+    backgroundsLoading,
+    missingBackgroundCount,
+    overlayUnavailable,
+  ]);
+  const displayedRef = useRef<{ identity: string; loadKey: string | null; notified: boolean }>({
+    identity: displayIdentity,
+    loadKey: null,
+    notified: false,
+  });
+  if (displayedRef.current.identity !== displayIdentity)
+    displayedRef.current = { identity: displayIdentity, loadKey: null, notified: false };
+  const artworkAvailable =
+    !backgroundsLoading &&
+    missingBackgroundCount === 0 &&
+    backgroundPaths.length > 0 &&
+    (frames.length === 0 || (!!overlayUri && !overlayUnavailable));
+  // Layer display events alone can describe an empty or partial stack. Only
+  // the strict readiness signal confirms that all required layers painted.
+  const handleArtReadinessChange = useCallback(
+    (ready: boolean) => {
+      const displayed = displayedRef.current;
+      if (!ready || !artworkAvailable || displayed.identity !== displayIdentity || displayed.notified) return;
+      displayed.notified = true;
+      onArtDisplayed?.();
+    },
+    [artworkAvailable, displayIdentity, onArtDisplayed],
+  );
+  if (readyBoardArtRef) {
+    readyBoardArtRef.current = {
+      read: () => {
+        if (!climbUuid || !artworkAvailable || displayedRef.current.identity !== displayIdentity) return undefined;
+        return getReadyBoardArtSnapshot(climbUuid, mirrored ?? false, displayedRef.current.loadKey);
+      },
+    };
+  }
 
   return (
-    <View style={[styles.container, size ? { width: cellWidth, height: cellHeight } : null]}>
+    <View style={[styles.container, cell]}>
       <LayeredClimbImage
+        onArtError={onArtError}
+        onArtReadinessChange={handleArtReadinessChange}
+        overlayRequired={frames.length > 0}
         overlayUri={overlayUri}
         overlayLoadKey={overlayLoadKey}
+        displayIdentity={displayIdentity}
+        onArtDisplayed={(loadKey) => {
+          if (displayedRef.current.identity === displayIdentity) {
+            displayedRef.current.loadKey = loadKey;
+          }
+        }}
         onOverlayLoad={onOverlayLoad}
         onOverlayError={onOverlayError}
         backgroundPaths={backgroundPaths}
+        baseColor={backgroundBaseColor}
         missingBackgroundCount={missingBackgroundCount}
         mirrored={mirrored}
         recyclingKey={frames}
+        // Rendered AND decoded: it is on the layer the frame the row mounts, so a
+        // cross-fade from nothing would only put the bare board on screen.
+        suppressOverlayTransition={overlayPaintsWithBoard}
+        // Anything else — not rendered yet, or rendered but still to be decoded —
+        // holds the whole thumbnail back until its holds have painted. Never for
+        // an overlay that is not coming.
+        revealWithOverlay={
+          frames.length > 0 && !overlayPaintsWithBoard && !overlayUnavailable ? 'each-climb' : undefined
+        }
+        revealPlaceholderColor={systemColors.fill}
       />
     </View>
   );
@@ -85,9 +234,8 @@ const ClimbListThumbnail = React.memo(function ClimbListThumbnail({
 export { ClimbListThumbnail };
 
 const styles = StyleSheet.create({
+  // Sized at the call site: the caller's `size`, or the list's cell.
   container: {
-    width: THUMBNAIL_WIDTH,
-    height: THUMBNAIL_HEIGHT,
     borderRadius: borderRadius.md,
     overflow: 'hidden',
   },

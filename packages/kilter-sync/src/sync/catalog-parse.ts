@@ -5,6 +5,15 @@ import { type HoldTuple } from './fingerprint';
 const KILTER_BOARD = 'kilter' as const;
 
 /**
+ * Ingest guard for a Grips difficulty id/average: valid grade ids are ~10-33,
+ * so treat a missing value or a ≤ 1 placeholder (id 1 doesn't exist; 0 is
+ * `Number(null)`) as "no grade" → null.
+ */
+export function guardDifficulty(difficulty: number | null | undefined): number | null {
+  return difficulty != null && difficulty > 1 ? difficulty : null;
+}
+
+/**
  * One hold in a Kilter Grips `climb_concat`:
  *
  *   h{holeId} p{roleCode} [s{startFrame}] [e{endFrame}]
@@ -82,7 +91,7 @@ export type GripsDecodeResult =
  * Aurora catalog's own `frames` strings for the climbs present in both gives
  * 141/141 semantic parity on multi-frame climbs (78 of them byte-identical;
  * the rest differ only where Aurora re-states a frame as an absolute snapshot
- * instead of a delta). See docs/kilter-sync.md.
+ * instead of a delta). See docs/data/kilter-sync.md.
  *
  * Multi-frame output sorts each frame's tokens by placement id, which is the
  * Aurora catalog's own convention and what makes those 78 byte-identical.

@@ -14,7 +14,9 @@
 # inside each slot.
 #
 # Google Play wants metadata_path/android/<locale>/images/phoneScreenshots/*.png,
-# so we stage the captured phone screenshots into that fastlane supply layout.
+# so we stage the captured phone screenshots into that fastlane supply layout. The
+# Play listing lanes then commit through fastlane/lib/play_listing.rb, not supply,
+# so a listing push can never cancel a release that is in review.
 
 require "fileutils"
 require "tmpdir"
@@ -25,7 +27,7 @@ default_platform(:ios)
 REPO_ROOT = File.expand_path("..", __dir__)
 APPLE_SCREENSHOTS_ROOT = File.join(REPO_ROOT, "app-stores", "apple", "screenshots")
 GOOGLE_SCREENSHOTS_DIR = File.join(REPO_ROOT, "app-stores", "google", "screenshots", "pixel-2")
-EXPECTED_DELIVER_LOCALES = ["en-US", "es-ES", "es-MX", "fr-FR", "de-DE"].freeze
+EXPECTED_DELIVER_LOCALES = ["en-US", "es-ES", "es-MX", "fr-FR", "de-DE", "it"].freeze
 SUPPLY_LOCALE = "en-US"
 
 APP_IDENTIFIER = "com.boardsesh.app"
@@ -70,27 +72,102 @@ def asc_api_key
   )
 end
 
-# True when App Store Connect has a version deliver can edit (Prepare for
-# Submission / a rejected state), false when there is none, so the `metadata` and
-# `screenshots` lanes can skip instead of letting deliver retry "Cannot find edit
-# app store version" for ~20 minutes. Requires the Spaceship token to already be
-# set (asc_api_key / app_store_connect_api_key set it by default). On ANY
-# uncertainty — app not found, credentials/API error — it returns true so deliver
-# still runs; this never suppresses a legitimate push, it only avoids the
-# pointless retry loop when we're certain there's nothing to edit. Mirrors
-# deliver's own lookup (App#get_edit_app_store_version, which returns nil when no
-# version is editable).
-def editable_app_store_version_present?
+# The App Store version deliver would edit (Prepare for Submission / a rejected
+# state), nil when there is none, or :unknown when App Store Connect could not be
+# asked. Mirrors deliver's own lookup (App#get_edit_app_store_version), with one
+# difference: that lookup also returns a version WAITING_FOR_REVIEW, and once a
+# merge-back has submitted a version (mobile-store-submit.yml) a listing or
+# screenshot push must not touch it, so that state counts as nothing to edit.
+# Requires the Spaceship token to already be set (asc_api_key /
+# app_store_connect_api_key set it by default).
+def editable_app_store_version
   require "spaceship"
   app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
   if app.nil?
-    UI.important("App #{APP_IDENTIFIER} not found on App Store Connect; letting deliver decide.")
-    return true
+    UI.important("App #{APP_IDENTIFIER} not found on App Store Connect; not pushing anything to it.")
+    return :unknown
   end
-  !app.get_edit_app_store_version.nil?
+  edit_version = app.get_edit_app_store_version
+  return nil if edit_version.nil?
+  state = edit_version.app_version_state || edit_version.app_store_state
+  if state == "WAITING_FOR_REVIEW"
+    UI.important("App Store version #{edit_version.version_string} is waiting for review; not changing its listing or screenshots.")
+    return nil
+  end
+  edit_version
 rescue => error
-  UI.important("Could not check for an editable App Store version (#{error.message}); proceeding with deliver.")
-  true
+  UI.important("Could not check for an editable App Store version (#{error.message}); not pushing. Rerun once App Store Connect answers.")
+  :unknown
+end
+
+# True when App Store Connect has a version deliver can edit, false when there is
+# none, so the `screenshots` lane can skip instead of letting deliver retry
+# "Cannot find edit app store version" for ~20 minutes (the `metadata` lane makes
+# the same check on the version it reads). When the check itself fails it also
+# returns false: deliver's own lookup would include a version waiting for review,
+# and since the merge-back submission sends versions for review unattended, a
+# push must not run blind. A skipped push is one rerun.
+def editable_app_store_version_present?
+  edit_version = editable_app_store_version
+  !edit_version.nil? && edit_version != :unknown
+end
+
+# Settings on an App Store version that deliver's metadata step rewrites from an
+# option, so a listing-text push must hand deliver what App Store Connect already
+# holds (#7225). Each entry: the deliver option, the Spaceship read, what it is
+# called in the run summary, and what it is called in an error.
+#
+# deliver's phased_release option defaults to false, not
+# nil (fastlane 2.241.2, deliver/lib/deliver/options.rb). Its metadata step
+# leaves each setting alone only when the option is nil: false deletes the
+# version's phased release, and true creates one
+# (UploadMetadata#upload, "Update phased release", in
+# deliver/lib/deliver/upload_metadata.rb). An explicit nil falls back to that
+# false default (FastlaneCore::Configuration#fetch), so passing what is already
+# there keeps it. Rating reset requests have no public API relationship; the
+# Deliverfile supplies a genuine nil so deliver never reads or changes them.
+# Calls with skip_metadata: true return before that step and need nothing.
+DELIVER_VERSION_SETTINGS = [
+  { option: :phased_release, fetch: :fetch_app_store_version_phased_release, label: "Phased release", noun: "a phased release" }
+].freeze
+
+# Whether the App Store version has the given DELIVER_VERSION_SETTINGS entry.
+#
+# App Store Connect answers "none" with `data: null`, which Spaceship raises as a
+# RuntimeError "No data" (Spaceship::ConnectAPI::Models.parse); an empty answer
+# comes back as nil. deliver reads both as none, and so does this. Any other
+# failure stops the push: reading it as none would let deliver delete a setting
+# its own read can see.
+def app_store_version_setting_on?(version, setting)
+  !version.public_send(setting.fetch(:fetch)).nil?
+rescue => error
+  return false if error.instance_of?(RuntimeError) && error.message == "No data"
+  UI.user_error!("Could not read whether App Store version #{version.version_string} has #{setting.fetch(:noun)} (#{error.message}); not pushing listing text, because deliver would remove one this lane cannot see. Rerun once App Store Connect answers.")
+end
+
+# App Store version states in which a version is not out yet: being prepared,
+# sent back by Apple or by us, queued for or in review, or approved and waiting
+# to be released. deliver's version check (App#ensure_version!) renames the
+# editable version to whatever version it is asked to draft, so drafting 2.7.1
+# while 2.7.0 is editable would quietly turn the 2.7.0 someone is about to
+# submit into 2.7.1. An approved 2.7.0 is not editable, but the next version
+# still waits until it is released. The list lives in
+# lib/app_store_version_states.rb, shared with the merge-back submission's
+# status check so both agree on what holds the next version.
+require File.join(REPO_ROOT, "fastlane", "lib", "app_store_version_states")
+require File.join(REPO_ROOT, "fastlane", "lib", "screenshot_upload")
+OPEN_APP_STORE_VERSION_STATES = BoardseshAppStoreVersionStates::OPEN
+
+# The open iOS versions (raw appStoreVersions resources) carrying a version
+# string other than `version`, described as "2.7.0 (PREPARE_FOR_SUBMISSION)".
+def other_open_app_store_versions(app_store_versions, version)
+  app_store_versions.filter_map do |resource|
+    attributes = resource.fetch("attributes", {})
+    state = attributes["appVersionState"] || attributes["appStoreState"]
+    next unless attributes["platform"] == "IOS" && OPEN_APP_STORE_VERSION_STATES.include?(state)
+    next if attributes["versionString"] == version
+    "#{attributes['versionString']} (#{state})"
+  end
 end
 
 # Hand a resolved number back to the calling GitHub Actions step via the step's
@@ -149,6 +226,11 @@ def screenshot_manifest
 
     reference_devices.each do |device_slug|
       expected_names = manifest.fetch(reference_locale).fetch(device_slug).map { |path| File.basename(path) }
+      if locale == "it" && device_slug.start_with?("iphone-")
+        # Italian uses its native session capture until a physical Live Activity
+        # fixture is reviewed. Every other filename still matches exactly.
+        expected_names = expected_names.map { |name| name == "07-live-activity.png" ? "07-session-detail.png" : name }.sort
+      end
       actual_names = devices.fetch(device_slug).map { |path| File.basename(path) }
       if actual_names != expected_names
         UI.user_error!("Screenshot files for #{locale}/#{device_slug} do not match #{reference_locale}/#{device_slug}.")
@@ -165,14 +247,27 @@ def staged_filename(device_slug, png_path)
   staged == basename ? "#{device_slug}-#{basename}" : staged
 end
 
-# A precautionary retry for the store screenshot uploads. App Store Connect throws
-# sporadic 500s (Spaceship::InternalServerError) that deliver only auto-retries on
-# 503, so a single bad gateway response would otherwise fail the whole upload (seen
-# in run 27719803749). Retries ONLY transient server-side errors (5xx / timeout /
-# temporary) with a short linear backoff; a real failure (bad credentials, a
-# rejected screenshot) is re-raised on the first attempt rather than looped on.
-# Both deliver (sync_screenshots) and supply (sync_image_upload) run in sync mode,
-# so a retried upload reconciles against the staged files instead of duplicating.
+def screenshot_upload_manifest
+  locales = BoardseshScreenshotUpload.parse_locales(ENV["ASC_SCREENSHOT_LOCALES"])
+  if locales
+    BoardseshScreenshotUpload.manifest(root: ENV["ASC_SCREENSHOT_PATH"], locales: locales)
+  else
+    UI.user_error!("ASC_SCREENSHOT_PATH requires an explicit ASC_SCREENSHOT_LOCALES scope.") unless ENV["ASC_SCREENSHOT_PATH"].to_s.empty?
+    screenshot_manifest
+  end
+rescue BoardseshScreenshotUpload::Error => error
+  UI.user_error!(error.message)
+end
+
+# A precautionary retry for the App Store screenshot upload. App Store Connect
+# throws sporadic 500s (Spaceship::InternalServerError) that deliver only
+# auto-retries on 503, so a single bad gateway response would otherwise fail the
+# whole upload (seen in run 27719803749). Retries ONLY transient server-side errors
+# (5xx / timeout / temporary) with a short linear backoff; a real failure (bad
+# credentials, a rejected screenshot) is re-raised on the first attempt rather than
+# looped on. deliver runs with sync_screenshots, so a retried upload reconciles
+# against the staged files instead of duplicating. The Play lanes do not retry: an
+# ambiguous commit there is never repeated blindly, and a rerun reconciles.
 TRANSIENT_UPLOAD_ERROR = /5\d\d|server error|timed?\s?out|timeout|temporar|try again|connection reset|bad gateway|service unavailable|internal server/i
 
 def with_upload_retries(max_attempts: 3, base_sleep: 30)
@@ -191,37 +286,220 @@ def with_upload_retries(max_attempts: 3, base_sleep: 30)
   end
 end
 
-# supply resolves a SINGLE release in the target track (default: production)
-# before it uploads listing metadata / images / screenshots — even though those
-# are app-global, not release-specific (perform_upload_meta -> fetch_track_and_release!).
-# When the production track holds more than one release (a staged or halted
-# rollout, or a new release still in review alongside the live one) it aborts with
-# "More than one release found in this track. Please specify with the :version_code
-# option to select a release." Pin it to the highest production version code so the
-# resolution is unambiguous; the app-global listing applies the same either way,
-# and skip_upload_changelogs means the selected release itself is never touched.
-# Returns nil when the track can't be read (or is empty), leaving a single-release
-# track to resolve on its own.
-def play_production_version_code(json_key_data)
-  codes = Array(
-    google_play_track_version_codes(
-      package_name: APP_IDENTIFIER,
-      json_key_data: json_key_data,
-      track: "production"
-    )
-  ).map(&:to_i)
-  return nil if codes.empty?
-  UI.message("Pinning the production version_code to #{codes.max} so supply can resolve a single release.")
-  codes.max
-rescue => error
-  UI.important("Could not read production version codes (#{error.message}); uploading without an explicit version_code.")
-  nil
+# Push the committed Play listing parts (listing, images, screenshots) through one
+# review-protected edit of our own; see fastlane/lib/play_listing.rb for why
+# supply's commit is not used. metadata_path is a supply-style tree
+# (<locale>/*.txt, <locale>/images/...).
+def push_play_listing(parts:, metadata_path: ANDROID_METADATA_DIR)
+  require File.join(REPO_ROOT, "fastlane", "lib", "play_listing")
+  credential = ENV["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] || ENV["GOOGLE_PLAY_JSON_KEY"]
+  service = -> { BoardseshAndroidRelease.service(json_key_data: credential) }
+  receipt = BoardseshPlayListing::Runner.new(service: service, metadata_path: metadata_path, parts: parts).run
+  receipt.fetch("changes").each { |change| UI.message(change) }
+  UI.success("Committed the Play #{parts.join(' + ')} for #{receipt.fetch('languages').join(', ')} with review protection.")
+  receipt
+rescue BoardseshPlayListing::Error, BoardseshAndroidRelease::Error => error
+  UI.user_error!(error.message)
 end
 
 platform :ios do
+  desc "Export the signed archive and upload to TestFlight with the existing export options"
+  lane :testflight do
+    %w[ARCHIVE_PATH EXPORT_OPTIONS_PLIST EXPORT_PATH].each do |name|
+      UI.user_error!("Missing #{name}") if ENV.fetch(name).empty?
+    end
+    archive = File.expand_path(ENV.fetch("ARCHIVE_PATH"), REPO_ROOT)
+    export_options = File.expand_path(ENV.fetch("EXPORT_OPTIONS_PLIST"), REPO_ROOT)
+    export_path = File.expand_path(ENV.fetch("EXPORT_PATH"), REPO_ROOT)
+    key_id = ENV.fetch("APP_STORE_CONNECT_API_KEY_ID")
+    issuer_id = ENV.fetch("APP_STORE_CONNECT_ISSUER_ID")
+    UI.user_error!("Missing App Store Connect key ID or issuer ID") if key_id.empty? || issuer_id.empty?
+    UI.user_error!("Invalid App Store Connect key ID") unless key_id.match?(/\A[A-Za-z0-9]+\z/)
+    key_path = File.expand_path("~/.private_keys/AuthKey_#{key_id}.p8")
+    UI.user_error!("Missing signed Xcode archive") unless Dir.exist?(archive)
+    UI.user_error!("Missing Xcode export options") unless File.file?(export_options)
+    UI.user_error!("Missing App Store Connect private key") unless File.file?(key_path)
+    sh("xcodebuild", "-exportArchive", "-archivePath", archive,
+      "-exportOptionsPlist", export_options, "-exportPath", export_path,
+      "-allowProvisioningUpdates", "-authenticationKeyPath", key_path,
+      "-authenticationKeyID", key_id, "-authenticationKeyIssuerID", issuer_id)
+  end
+
+  desc "Submit an exact uploaded build to the Discord Users TestFlight group with its test notes"
+  lane :distribute_testflight do |options|
+    require "json"
+    require File.join(REPO_ROOT, "fastlane", "lib", "testflight_distribution")
+    require "spaceship"
+    version = (options[:version] || ENV["RELEASE_VERSION"]).to_s
+    build_number = (options[:build_number] || ENV["IOS_BUILD_NUMBER"]).to_s
+    notes = BoardseshTestflightDistribution.read_notes(options[:notes_path] || ENV["TESTFLIGHT_NOTES_PATH"], root: REPO_ROOT)
+    BoardseshTestflightDistribution.validate_inputs!(version: version, build_number: build_number, notes: notes)
+    api_key = asc_api_key
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    receipt = BoardseshTestflightDistribution::Runner.new(
+      app: app, version: version, build_number: build_number, notes: notes,
+      find_builds: -> { Spaceship::ConnectAPI::Build.all(app_id: app.id, version: version, build_number: build_number, platform: "IOS") },
+      distribute: ->(distribution_options) { upload_to_testflight(api_key: api_key, **distribution_options) }
+    ).run
+    output_path = ENV["TESTFLIGHT_DISTRIBUTION_OUTPUT"]
+    File.write(output_path, JSON.pretty_generate(receipt) + "\n") if output_path && !output_path.empty?
+    summary = BoardseshTestflightDistribution.summary(receipt)
+    UI.success(summary)
+    emit_step_summary(summary)
+    receipt
+  rescue BoardseshTestflightDistribution::Error => error
+    UI.user_error!(error.message)
+  end
+
+  desc "Plan or submit the exact reviewed app/CPP snapshot without changing store content"
+  lane :review_submission do |options|
+    require File.join(REPO_ROOT, "fastlane", "lib", "store_review_submission")
+    require "spaceship"
+    selected = (options[:surfaces] || "default").to_s.split(",").map(&:strip)
+    manifest = JSON.parse(File.read(File.join(REPO_ROOT, "app-stores", "apple", "custom-product-pages.json")))
+    BoardseshStoreReview::Runner.validate_selection!(
+      selected: selected, manifest: manifest, cpp_review_context_version_id: ENV["CPP_REVIEW_CONTEXT_VERSION_ID"]
+    )
+    asc_api_key
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    UI.user_error!("App not found for review submission") unless app
+    client = BoardseshStoreReview::Client.new(token: -> { Spaceship::ConnectAPI.token.refresh! if Spaceship::ConnectAPI.token.expired?; Spaceship::ConnectAPI.token.text })
+    audit = -> do
+      BoardseshStoreAudit::Apple.new(
+        client: client, app_id: app.id, version: ENV.fetch("RELEASE_VERSION"),
+        build_number: ENV.fetch("IOS_BUILD_NUMBER"), cpp_targets: manifest.fetch("targets").select { |target, _config| selected.include?(target) },
+        locales: EXPECTED_DELIVER_LOCALES, cpp_locales: manifest.fetch("locales").values.flatten, display_types: manifest.fetch("devices").values.uniq
+      ).run
+    end
+    # MANUAL unless asked: only the automatic merge-back submission
+    # (mobile-store-submit.yml) passes release_type:AFTER_APPROVAL.
+    result = BoardseshStoreReview::Runner.new(
+      client: client, audit: audit, manifest: manifest, metadata_root: APPLE_METADATA_DIR, selected: selected,
+      cpp_review_context_version_id: ENV["CPP_REVIEW_CONTEXT_VERSION_ID"], release_type: (options[:release_type] || "MANUAL").to_s
+    ).run(action: (options[:action] || "plan").to_s, expected_sha256: ENV["REVIEW_SNAPSHOT_SHA256"])
+    File.write(ENV.fetch("STORE_REVIEW_OUTPUT"), JSON.pretty_generate(result) + "\n")
+    UI.success("Review #{result.fetch('action')}: snapshot #{result.fetch('snapshotSha256')}")
+  rescue BoardseshStoreReview::Error, BoardseshASC::Error => error
+    UI.user_error!(error.message)
+  end
+
+  desc "Read back the exact iOS release, listing text and ordered default/CPP screenshots"
+  lane :audit do |options|
+    require File.join(REPO_ROOT, "fastlane", "lib", "store_audit")
+    manifest = JSON.parse(File.read(File.join(REPO_ROOT, "app-stores", "apple", "custom-product-pages.json")))
+    # surfaces:default limits the audit to the app version itself (the automatic
+    # merge-back submission's readiness check); the default audits every CPP too.
+    surfaces = (options[:surfaces] || "all").to_s
+    UI.user_error!("surfaces must be all or default") unless %w[all default].include?(surfaces)
+    cpp_targets = surfaces == "default" ? {} : manifest.fetch("targets")
+    asc_api_key
+    require "spaceship"
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    UI.user_error!("App not found for store audit") unless app
+    client = BoardseshASC::Client.new(token: -> { Spaceship::ConnectAPI.token.refresh! if Spaceship::ConnectAPI.token.expired?; Spaceship::ConnectAPI.token.text })
+    report = BoardseshStoreAudit::Apple.new(
+      client: client, app_id: app.id, version: ENV.fetch("RELEASE_VERSION"),
+      build_number: ENV.fetch("IOS_BUILD_NUMBER"), cpp_targets: cpp_targets,
+      locales: EXPECTED_DELIVER_LOCALES, cpp_locales: manifest.fetch("locales").values.flatten, display_types: manifest.fetch("devices").values.uniq
+    ).run
+    BoardseshStoreAudit.write_report(ENV.fetch("STORE_AUDIT_OUTPUT"), report)
+    UI.success("iOS release identity verified; audit report includes #{report.fetch('readinessIssues').length} asset readiness issue(s).")
+  end
+
+  desc "GET-only: whether one iOS version can be submitted now (pending, done, deferred, blocked, superseded)"
+  lane :submission_status do
+    require File.join(REPO_ROOT, "fastlane", "lib", "store_submission_status")
+    version = ENV.fetch("RELEASE_VERSION")
+    asc_api_key
+    require "spaceship"
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    UI.user_error!("App #{APP_IDENTIFIER} not found on App Store Connect") unless app
+    client = BoardseshASC::Client.new(token: -> { Spaceship::ConnectAPI.token.refresh! if Spaceship::ConnectAPI.token.expired?; Spaceship::ConnectAPI.token.text })
+    versions = client.list("/v1/apps/#{app.id}/appStoreVersions?filter[platform]=IOS&limit=200")
+    current = BoardseshStoreSubmissionStatus.ios(versions, version)
+    expected_build = ENV["IOS_BUILD_NUMBER"]
+    attached_build = nil
+    if expected_build && BoardseshStoreSubmissionStatus::BUILD_BOUND_STATES.include?(current.fetch("state"))
+      version_id = current.fetch("versionId")
+      unless version_id.is_a?(String) && version_id.match?(/\A[A-Za-z0-9-]{1,128}\z/)
+        raise BoardseshStoreSubmissionStatus::Error, "Attached iOS version has no valid identity"
+      end
+      build = client.request("GET", "/v1/appStoreVersions/#{version_id}/build").fetch("data")
+      if build
+        unless build.is_a?(Hash) && build["type"] == "builds" && build["id"].is_a?(String) && build["id"].match?(/\A[A-Za-z0-9-]{1,128}\z/)
+          raise BoardseshStoreSubmissionStatus::Error, "Attached iOS build has no valid identity"
+        end
+        prerelease = client.request("GET", "/v1/builds/#{build.fetch('id')}/preReleaseVersion").fetch("data")
+        unless prerelease.is_a?(Hash) && prerelease["type"] == "preReleaseVersions"
+          raise BoardseshStoreSubmissionStatus::Error, "Attached iOS build has no prerelease identity"
+        end
+        attached_build = {
+          "versionId" => version_id, "buildNumber" => build.dig("attributes", "version"),
+          "marketingVersion" => prerelease.dig("attributes", "version"), "platform" => prerelease.dig("attributes", "platform")
+        }
+      end
+    end
+    status = BoardseshStoreSubmissionStatus.ios(versions, version, expected_build: expected_build, attached_build: attached_build)
+    File.write(ENV.fetch("STORE_SUBMISSION_STATUS_OUTPUT"), JSON.pretty_generate(status) + "\n")
+    UI.message("iOS #{version}: #{status.fetch('status')}. #{status.fetch('reason')}")
+  rescue BoardseshStoreSubmissionStatus::Error, BoardseshASC::Error => error
+    UI.user_error!(error.message)
+  end
+
+  desc "Plan, create empty drafts, stage assets, upload, or submit board-specific custom product pages"
+  lane :cpp do |options|
+    require File.join(REPO_ROOT, "fastlane", "lib", "custom_product_pages")
+    require "spaceship"
+    action = (options[:action] || "plan").to_s
+    target = (options[:target] || "all").to_s
+    UI.user_error!("CPP action must be plan, create, stage-assets, upload, or submit") unless %w[plan create stage-assets upload submit].include?(action)
+    manifest_bytes = File.read(File.join(REPO_ROOT, "app-stores", "apple", "custom-product-pages.json"))
+    manifest = JSON.parse(manifest_bytes)
+    retained_source = {
+      receipt_path: ENV.fetch("ASC_CPP_RETAINED_RECEIPT", ""), expected_sha256: ENV.fetch("ASC_CPP_RETAINED_RECEIPT_SHA256", ""),
+      capture_contract_ref: ENV.fetch("ASC_CPP_CAPTURE_CONTRACT_REF", ""), replay_run_id: ENV.fetch("ASC_CPP_RETAINED_REPLAY_RUN_ID", "")
+    }
+    if retained_source.values.any? { |value| !value.empty? }
+      UI.user_error!("Retained CPP source is restricted to one stage-assets target") unless action == "stage-assets" && target != "all"
+      BoardseshCPP.verify_retained_source(repo_root: REPO_ROOT, manifest: manifest, target: target, **retained_source)
+    else
+      retained_source = nil
+    end
+    asc_api_key
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    UI.user_error!("App #{APP_IDENTIFIER} not found on App Store Connect") unless app
+    keyword_mapping_json = ENV.fetch("ASC_CPP_KEYWORD_IDS_JSON", "{}").strip
+    keyword_ids = %w[create stage-assets].include?(action) ? {} : JSON.parse(keyword_mapping_json.empty? ? "{}" : keyword_mapping_json)
+    client = BoardseshCPP::Client.new(token: -> { Spaceship::ConnectAPI.token.refresh! if Spaceship::ConnectAPI.token.expired?; Spaceship::ConnectAPI.token.text })
+    results = BoardseshCPP::Runner.new(
+      client: client, repo_root: REPO_ROOT, manifest: manifest, manifest_sha256: Digest::SHA256.hexdigest(manifest_bytes), app_id: app.id,
+      keyword_ids: keyword_ids, retained_source: retained_source, log: ->(message) { UI.message(message) }
+    ).run(target: target, action: action)
+    results.each do |result|
+      line = "CPP #{result.fetch('target')}: #{result.fetch('action')} | #{result['state'] || 'new page'} | #{result['url'] || 'URL available after creation'}"
+      UI.message(line)
+      emit_step_summary(line)
+      if action == "plan"
+        UI.message("CPP_PLAN_JSON #{JSON.generate(result)}")
+        result.fetch("diagnostics").each { |diagnostic| emit_step_summary("- #{result.fetch('target')}: #{diagnostic}") }
+      end
+      if action == "create"
+        UI.message("CPP_CREATE_JSON #{JSON.generate(result)}")
+        emit_step_summary("#{result.fetch('referenceName')} | app #{result.fetch('appId')} | page #{result.fetch('pageId')} | #{result.fetch('publication')}")
+      end
+      emit_step_summary(result.fetch("publication")) if action == "stage-assets"
+    end
+    plan_output = ENV["ASC_CPP_PLAN_OUTPUT"]
+    File.write(plan_output, JSON.pretty_generate(results) + "\n") if action == "plan" && plan_output && !plan_output.empty?
+    create_output = ENV["ASC_CPP_CREATE_OUTPUT"]
+    File.write(create_output, JSON.pretty_generate(results) + "\n") if action == "create" && create_output && !create_output.empty?
+  rescue BoardseshCPP::Error, JSON::ParserError, KeyError => error
+    UI.user_error!(error.message)
+  end
+
   desc "Upload App Store screenshots to App Store Connect (no binary, no metadata, no review)"
   lane :screenshots do
-    manifest = screenshot_manifest
+    manifest = screenshot_upload_manifest
 
     staging_dir = Dir.mktmpdir("asc-screenshots-")
     begin
@@ -238,7 +516,7 @@ platform :ios do
         UI.message("Staged #{staged_count} screenshot(s) into #{locale_dir}")
       end
 
-      api_key = app_store_connect_api_key(
+      app_store_connect_api_key(
         key_id: ENV.fetch("APP_STORE_CONNECT_API_KEY_ID"),
         issuer_id: ENV.fetch("APP_STORE_CONNECT_ISSUER_ID"),
         key_filepath: ENV.fetch("ASC_KEY_PATH"),
@@ -253,27 +531,31 @@ platform :ios do
       # Without this guard the upload grinds through deliver's ~20-minute "Cannot find edit
       # app store version" backoff ladder AFTER the ~30-minute capture matrix has already run
       # — wasted either way, but at least this saves the finalize step itself.
-      unless editable_app_store_version_present?
+      edit_version = editable_app_store_version
+      if edit_version.nil? || edit_version == :unknown
+        unless ENV["ASC_SCREENSHOT_LOCALES"].to_s.empty?
+          UI.user_error!("No verified editable iOS App Store version; selected-language screenshots were not uploaded. Prepare the release version in App Store Connect, then rerun.")
+        end
         UI.important("No editable App Store version in 'Prepare for Submission' — nothing for deliver to attach screenshots to. Skipping the upload; re-run once a version is editable.")
         emit_step_summary("**Skipped:** no editable App Store version — no iOS screenshots uploaded.")
         next
       end
+      unless ENV["ASC_SCREENSHOT_LOCALES"].to_s.empty?
+        expected_version = mobile_app_version
+        if edit_version.version_string != expected_version
+          UI.user_error!("Editable iOS App Store version is #{edit_version.version_string}, expected #{expected_version}; selected-language screenshots were not uploaded.")
+        end
+      end
 
+      require "deliver/sync_screenshots"
+      require "deliver/loader"
+      screenshots = Deliver::Loader.load_app_screenshots(staging_dir, false)
       with_upload_retries do
-        upload_to_app_store(
-          api_key: api_key,
-          app_identifier: "com.boardsesh.app",
-          screenshots_path: staging_dir,
-          skip_binary_upload: true,
-          skip_metadata: true,
-          skip_app_version_update: true,
-          overwrite_screenshots: true,
-          sync_screenshots: true,
-          submit_for_review: false,
-          run_precheck_before_submit: false,
-          # force: true is mandatory in CI — without it deliver opens an HTML
-          # preview in a browser and blocks until timeout.
-          force: true
+        BoardseshScreenshotUpload.sync(
+          version: edit_version,
+          locales: manifest.keys,
+          screenshots: screenshots,
+          sync_class: Deliver::SyncScreenshots
         )
       end
     ensure
@@ -282,10 +564,41 @@ platform :ios do
   end
 
   desc "Upload App Store listing text + What's New to the editable version (no binary, no screenshots, no review)"
-  lane :metadata do
+  lane :metadata do |options|
+    if ENV.key?("DELIVER_RESET_RATINGS")
+      UI.user_error!("Remove DELIVER_RESET_RATINGS before pushing listing text; this lane must leave the owner's rating reset request unchanged.")
+    end
+    preservation_config = File.join(REPO_ROOT, "fastlane", "Deliverfile")
+    # The official action runs from the repository root and loads this first.
+    # A Fastfile-only execution must not restore deliver's false default.
+    unless File.file?(preservation_config)
+      UI.user_error!("The checked-in fastlane/Deliverfile must be loaded before pushing listing text; refusing to change the owner's rating reset request.")
+    end
+    expected_version = options[:expected_version].to_s
+    unless expected_version.empty? || expected_version.match?(/\A\d+\.\d+\.\d+\z/)
+      UI.user_error!("expected_version must be x.y.z")
+    end
     # asc_api_key also sets Spaceship::ConnectAPI.token (set_spaceship_token
     # defaults to true), which the editable-version pre-flight below relies on.
     api_key = asc_api_key
+
+    # deliver edits whichever version is editable, whatever app.config.ts says.
+    # The automatic merge-back submission names the version it is about to submit,
+    # and this refuses unless that exact version is the one deliver would edit.
+    # Nothing editable means it is already submitted or in a review draft (deliver
+    # cannot edit either), so that is a skip, not a failure: a rerun stays green.
+    edit_version = editable_app_store_version
+    unless expected_version.empty?
+      UI.user_error!("Could not read the editable App Store version; not pushing listing text.") if edit_version == :unknown
+      if edit_version.nil?
+        UI.important("No editable App Store version (#{expected_version} may already be submitted or in a review draft); not pushing listing text.")
+        emit_step_summary("**Skipped:** no editable App Store version #{expected_version}; listing text not pushed.")
+        next
+      end
+      unless edit_version.version_string == expected_version
+        UI.user_error!("The editable App Store version is #{edit_version.version_string}, expected #{expected_version}; not pushing listing text.")
+      end
+    end
 
     # deliver (skip_app_version_update: true) can only write listing text onto the
     # *editable* App Store version — the one in "Prepare for Submission" (or a
@@ -295,11 +608,31 @@ platform :ios do
     # backoff ladder and then fails — which used to burn the whole metadata job's
     # time budget. Skip cleanly when there's nothing to edit; the text lands on the
     # next run once a version is editable (and it's pushed again at release time).
-    unless editable_app_store_version_present?
+    if edit_version.nil? || edit_version == :unknown
       UI.important("No editable App Store version in 'Prepare for Submission' — nothing for deliver to edit. Skipping the listing-text upload; it will be pushed once a version is editable.")
       emit_step_summary("**Skipped:** no editable App Store version — no iOS listing text uploaded.")
       next
     end
+
+    # Keep the version's phased release as App Store Connect has it. Left out,
+    # the option defaults to false and deliver deletes what the owner turned on.
+    # It is read before the upload, so one turned on in App Store
+    # Connect while the push runs is still deleted; the release docs say so.
+    keep_settings = DELIVER_VERSION_SETTINGS.to_h do |setting|
+      on = app_store_version_setting_on?(edit_version, setting)
+      note =
+        if on
+          "#{setting.fetch(:label)}: on for #{edit_version.version_string}; the listing push keeps it on."
+        else
+          "#{setting.fetch(:label)}: none on #{edit_version.version_string}; the listing push leaves it off."
+        end
+      UI.message(note)
+      emit_step_summary(note)
+      [setting.fetch(:option), on]
+    end
+    rating_reset_note = "Rating reset: unchanged; listing text does not read or update reset requests."
+    UI.message(rating_reset_note)
+    emit_step_summary(rating_reset_note)
 
     upload_to_app_store(
       api_key: api_key,
@@ -308,6 +641,7 @@ platform :ios do
       skip_binary_upload: true,
       skip_screenshots: true,
       skip_metadata: false,
+      phased_release: keep_settings.fetch(:phased_release),
       # Only edit the current editable version's text; never create or retitle a version.
       skip_app_version_update: true,
       submit_for_review: false,
@@ -352,6 +686,24 @@ platform :ios do
     UI.user_error!("Invalid RELEASE_VERSION: #{version}") unless version.match?(/^\d+\.\d+\.\d+$/)
     UI.user_error!("Invalid IOS_BUILD_NUMBER: #{build_number}") unless build_number.match?(/^\d+$/) && build_number.to_i.positive?
 
+    require "spaceship"
+    require File.join(REPO_ROOT, "fastlane", "lib", "asc_client")
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    UI.user_error!("App #{APP_IDENTIFIER} not found on App Store Connect") if app.nil?
+
+    # Draft only once every other version is out (see
+    # OPEN_APP_STORE_VERSION_STATES), so deliver never renames one. Read straight
+    # from the API with that state list, so the guard does not depend on which
+    # states deliver's own lookup treats as editable. The workflow step is
+    # continue-on-error and warns.
+    client = BoardseshASC::Client.new(token: -> { Spaceship::ConnectAPI.token.refresh! if Spaceship::ConnectAPI.token.expired?; Spaceship::ConnectAPI.token.text })
+    other_open = other_open_app_store_versions(
+      client.list("/v1/apps/#{app.id}/appStoreVersions?filter[platform]=IOS&limit=200"), version
+    )
+    unless other_open.empty?
+      UI.user_error!("App Store Connect already has an unreleased iOS version #{other_open.join(', ')}. Refusing to draft #{version} until it is out. An editable version would be renamed to #{version} by deliver; an approved one has to be released before the next version is drafted. Release, submit or remove it, then re-run this draft.")
+    end
+
     # Create the App Store version if it doesn't exist, leaving it in 'Prepare
     # for Submission' (a DRAFT). No screenshots/metadata here (owned by the
     # screenshots/metadata lanes); crucially submit_for_review: false, so a human
@@ -369,6 +721,9 @@ platform :ios do
       build_number: build_number,
       skip_binary_upload: true,
       skip_screenshots: true,
+      # Also skips deliver's phased-release and rating-reset step
+      # (UploadMetadata#upload returns first thing), so a draft never removes
+      # either; see DELIVER_VERSION_SETTINGS before turning metadata on here.
       skip_metadata: true,
       submit_for_review: false,
       automatic_release: false,
@@ -384,9 +739,6 @@ platform :ios do
     # (app_version + build_version, select_latest: false), bounded so a build
     # Apple never processes fails the job instead of hanging it. The ios job's
     # timeout-minutes in mobile-store-draft.yml must stay above this bound.
-    require "spaceship"
-    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
-    UI.user_error!("App #{APP_IDENTIFIER} not found on App Store Connect") if app.nil?
     build = FastlaneCore::BuildWatcher.wait_for_build_processing_to_be_complete(
       app_id: app.id,
       platform: Spaceship::ConnectAPI::Platform::IOS,
@@ -414,9 +766,111 @@ platform :ios do
     edit_version.select_build(build_id: build.id)
     UI.success("Prepared a draft App Store version #{version} with build #{build_number} attached.")
   end
+
+  desc "Read Apple creative specs, plan, upload, or assign reviewed creative assets"
+  lane :creatives do |options|
+    require File.join(REPO_ROOT, "fastlane", "lib", "creative_assets")
+    require "spaceship"
+    action = (options[:action] || "plan").to_s
+    variant = (options[:variant] || "all").to_s
+    asc_api_key
+    app = Spaceship::ConnectAPI::App.find(APP_IDENTIFIER)
+    UI.user_error!("App #{APP_IDENTIFIER} not found on App Store Connect") unless app
+    client = BoardseshASC::Client.new(token: -> { Spaceship::ConnectAPI.token.refresh! if Spaceship::ConnectAPI.token.expired?; Spaceship::ConnectAPI.token.text })
+    results = BoardseshCreatives::Runner.new(
+      client: client, repo_root: REPO_ROOT, app_id: app.id,
+      manifest: JSON.parse(File.read(File.join(REPO_ROOT, "app-stores", "apple", "creative-assets.json"))),
+      cpp_manifest: JSON.parse(File.read(File.join(REPO_ROOT, "app-stores", "apple", "custom-product-pages.json")))
+    ).run(action: action, variant: variant, allow_live: options[:allow_live].to_s == "true", allow_replace: options[:allow_replace].to_s == "true")
+    UI.message(JSON.pretty_generate(results))
+    output = ENV["ASC_CREATIVES_OUTPUT"]
+    File.write(output, JSON.pretty_generate(results) + "\n") if output && !output.empty?
+    emit_step_summary("Creative assets: #{action}, #{variant}; asset review and ASC Preview remain required.")
+  rescue BoardseshCreatives::Error, JSON::ParserError, KeyError => error
+    UI.user_error!(error.message)
+  end
 end
 
 platform :android do
+  desc "Upload one built AAB to internal and open testing in one review-protected edit"
+  lane :upload_beta do |options|
+    require File.join(REPO_ROOT, "fastlane", "lib", "android_release")
+    aab_pattern = options[:aab] || ENV.fetch("ANDROID_AAB_PATH")
+    aabs = Dir.glob(File.expand_path(aab_pattern, REPO_ROOT))
+    UI.user_error!("Expected exactly one AAB matching the upload path") unless aabs.length == 1
+    version_code = options[:version_code] || ENV.fetch("ANDROID_VERSION_CODE")
+    version = options[:version] || ENV.fetch("BOARDSESH_MOBILE_VERSION")
+    metadata_path = File.expand_path(options[:metadata_path] || ANDROID_METADATA_DIR, REPO_ROOT)
+    credential = ENV["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] || ENV["GOOGLE_PLAY_JSON_KEY"]
+    service = -> { BoardseshAndroidRelease.service(json_key_data: credential) }
+    replace_review_code = options[:replace_beta_review_version_code] || ENV["REPLACE_BETA_REVIEW_VERSION_CODE"]
+    review_preflight = unless replace_review_code.to_s.empty?
+      -> do
+        require "open3"
+        stdout, _stderr, status = Open3.capture3(
+          { "REPLACE_BETA_REVIEW_VERSION_CODE" => replace_review_code.to_s,
+            "GOOGLE_PLAY_SERVICE_ACCOUNT_JSON" => credential },
+          "vp", "exec", "node", "--import", "tsx",
+          File.join(REPO_ROOT, "scripts", "mobile-store-android-review-pending.ts"), "--commit-behavior",
+          chdir: REPO_ROOT)
+        unless status.success?
+          raise BoardseshAndroidRelease::Error, "Replacement beta review preflight failed; check the exact beta review and production review state"
+        end
+        stdout.strip
+      end
+    end
+    report = BoardseshAndroidRelease::Runner.new(service: service, aab: aabs.first,
+      version_code: version_code, version: version, metadata_path: metadata_path,
+      replace_beta_review_version_code: replace_review_code, review_preflight: review_preflight).run
+    UI.message(JSON.pretty_generate(report))
+    File.write(options[:output], JSON.pretty_generate(report) + "\n") if options[:output]
+  rescue BoardseshAndroidRelease::Error => error
+    UI.user_error!(error.message)
+  end
+
+  desc "Audit exact Android release lifecycle without creating a Play edit"
+  lane :audit do |options|
+    ENV["ANDROID_VERSION_CODE"] = (options[:version_code] || ENV.fetch("ANDROID_VERSION_CODE")).to_s
+    ENV["ANDROID_TRACK"] = (options[:track] || "beta").to_s
+    ENV["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] ||= ENV["GOOGLE_PLAY_JSON_KEY"]
+    ENV["STORE_AUDIT_OUTPUT"] = options[:output] || File.join(Dir.mktmpdir("play-audit-"), "audit.json")
+    Dir.chdir(REPO_ROOT) do
+      sh("vp", "exec", "node", "--import", "tsx", File.join(REPO_ROOT, "scripts", "mobile-store-android-audit.ts"))
+    end
+    UI.message("Release lifecycle receipt: #{ENV.fetch('STORE_AUDIT_OUTPUT')}")
+  end
+
+  desc "Plan or submit one exact published internal build to open testing (beta)"
+  lane :beta do |options|
+    version_code = (options[:version_code] || ENV["ANDROID_VERSION_CODE"]).to_s
+    unless version_code.match?(/\A[1-9]\d*\z/)
+      UI.user_error!("Provide version_code:<exact Android versionCode>")
+    end
+    ENV["ANDROID_VERSION_CODE"] = version_code
+    ENV["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] ||= ENV["GOOGLE_PLAY_JSON_KEY"]
+    command = ["vp", "exec", "node", "--import", "tsx", File.join(REPO_ROOT, "scripts", "mobile-store-android-beta.ts")]
+    command << "--apply" if options[:apply].to_s == "true"
+    Dir.chdir(REPO_ROOT) { sh(*command) }
+  end
+
+  desc "Plan or release one exact published internal build to production (rollout 1-100, default 100)"
+  lane :production do |options|
+    version_code = (options[:version_code] || ENV["ANDROID_VERSION_CODE"]).to_s
+    unless version_code.match?(/\A[1-9]\d*\z/)
+      UI.user_error!("Provide version_code:<exact Android versionCode>")
+    end
+    rollout = (options[:rollout] || ENV["ANDROID_ROLLOUT_PERCENT"] || "100").to_s
+    unless rollout.match?(/\A(100|[1-9]\d?)\z/)
+      UI.user_error!("rollout must be a whole percent from 1 to 100")
+    end
+    ENV["ANDROID_VERSION_CODE"] = version_code
+    ENV["ANDROID_ROLLOUT_PERCENT"] = rollout
+    ENV["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] ||= ENV["GOOGLE_PLAY_JSON_KEY"]
+    command = ["vp", "exec", "node", "--import", "tsx", File.join(REPO_ROOT, "scripts", "mobile-store-android-production.ts")]
+    command << "--apply" if options[:apply].to_s == "true"
+    Dir.chdir(REPO_ROOT) { sh(*command) }
+  end
+
   desc "Upload Play Store phone screenshots to Google Play (no binary, no text metadata)"
   lane :screenshots do
     unless Dir.exist?(GOOGLE_SCREENSHOTS_DIR)
@@ -439,95 +893,34 @@ platform :android do
       pngs.each { |png| FileUtils.cp(png, File.join(phone_dir, File.basename(png))) }
       UI.message("Staged #{pngs.length} Play phone screenshot(s) into #{phone_dir}")
 
-      json_key_data = ENV.fetch("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
-      version_code = play_production_version_code(json_key_data)
-      with_upload_retries do
-        upload_to_play_store(
-          package_name: APP_IDENTIFIER,
-          json_key_data: json_key_data,
-          version_code: version_code,
-          metadata_path: metadata_dir,
-          skip_upload_apk: true,
-          skip_upload_aab: true,
-          skip_upload_metadata: true,
-          skip_upload_changelogs: true,
-          skip_upload_images: true,
-          skip_upload_screenshots: false,
-          sync_image_upload: true,
-          # See the comment on the `metadata` lane: never let fastlane silently
-          # swallow Google's "send these for review" rejection. A green run must
-          # mean the screenshots are actually queued for review, not stranded
-          # unsubmitted in the Play Console.
-          rescue_changes_not_sent_for_review: false,
-          timeout: 300
-        )
-      end
+      # Synced by SHA-256 like supply's sync_image_upload, so an unchanged set is a
+      # no-op. One review-protected commit: a pending review fails the upload
+      # instead of being cancelled. No automatic retry: rerunning reconciles.
+      push_play_listing(parts: ["screenshots"], metadata_path: metadata_dir)
     ensure
       FileUtils.remove_entry(staging_dir) if staging_dir && Dir.exist?(staging_dir)
     end
   end
 
+  # The listing lanes commit with changesNotSentForReview=false and never retry
+  # with it set to true. Google rejects some listing-only edits with "Please set
+  # the query parameter changesNotSentForReview to true"; supply's default rescue
+  # used to recommit that silently, leaving the change in the Play Console as
+  # "ready to send for review" while CI showed green (why the live listing once
+  # kept the old icon and copy). A failure there is the signal to send it by hand.
   desc "Upload Play Store listing text (title + short/full description) — no binary, no changelog, no images"
   lane :metadata do
-    json_key_data = ENV.fetch("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
-    upload_to_play_store(
-      package_name: APP_IDENTIFIER,
-      json_key_data: json_key_data,
-      version_code: play_production_version_code(json_key_data),
-      metadata_path: ANDROID_METADATA_DIR,
-      skip_upload_apk: true,
-      skip_upload_aab: true,
-      skip_upload_metadata: false,
-      # "What's new" ships with the AAB at release time (whatsNewDirectory in
-      # android-apk-rn.yml, sourced from changelogs/default.txt), so leave the
-      # release notes untouched here.
-      skip_upload_changelogs: true,
-      skip_upload_images: true,
-      skip_upload_screenshots: true,
-      # Do NOT let fastlane silently swallow Google's review gate. By default
-      # supply commits with changes_not_sent_for_review: false (i.e. "send these
-      # for review"), but Google rejects a listing-only edit (no AAB) with
-      # "Please set the query parameter changesNotSentForReview to true". The
-      # fastlane default rescue_changes_not_sent_for_review: true catches that,
-      # silently re-commits with changesNotSentForReview=true, and prints
-      # "Successfully finished the upload" — so CI is green while the changes sit
-      # in the Play Console as "ready to send for review" and never publish (the
-      # exact reason the live listing kept showing the old icon/copy). Setting it
-      # false makes that case fail loudly so we see Google's real response on the
-      # next run instead of a false green.
-      rescue_changes_not_sent_for_review: false,
-      timeout: 300
-    )
+    # "What's new" ships with the AAB at release time (upload_beta reads
+    # changelogs/default.txt), so release notes are not touched here.
+    push_play_listing(parts: ["listing"])
   end
 
   desc "Upload Play Store listing images (high-res icon, feature graphic) — no binary, no text, no screenshots"
   lane :images do
-    json_key_data = ENV.fetch("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
-    upload_to_play_store(
-      package_name: APP_IDENTIFIER,
-      json_key_data: json_key_data,
-      version_code: play_production_version_code(json_key_data),
-      metadata_path: ANDROID_METADATA_DIR,
-      skip_upload_apk: true,
-      skip_upload_aab: true,
-      skip_upload_metadata: true,
-      skip_upload_changelogs: true,
-      # Upload the app images present under <locale>/images/ (icon.png 512x512,
-      # featureGraphic.png 1024x500 when added).
-      skip_upload_images: false,
-      # Phone screenshots are owned by the screenshots lane; leave them alone.
-      skip_upload_screenshots: true,
-      # supply never deletes app images, so committing just icon.png updates the
-      # icon and leaves any live feature graphic untouched. sync_image_upload only
-      # toggles a sha256 skip-if-unchanged for images, so it's deliberately
-      # omitted (don't flip it on: for screenshots, false means delete-all-then-
-      # reupload, which is why the screenshots lane sets it true).
-      # See the comment on the `metadata` lane: surface Google's "send for
-      # review" rejection instead of silently committing changes that never
-      # publish.
-      rescue_changes_not_sent_for_review: false,
-      timeout: 300
-    )
+    # Uploads the images present under <locale>/images/ (icon.png 512x512,
+    # featureGraphic.png 1024x500). Each upload replaces that one image type and
+    # leaves the others alone; phone screenshots belong to the screenshots lane.
+    push_play_listing(parts: ["images"])
   end
 
   desc "Print the next Android versionCode (sideload floor raised to the Play ceiling, never below it)"
@@ -545,7 +938,7 @@ platform :android do
     # 190, and Android then rejects every sideload upgrade with
     # INSTALL_FAILED_VERSION_DOWNGRADE (190 < 2_000_285). The Play query may only
     # RAISE the number above this floor, never lower it. See
-    # docs/android-sideload-build.md.
+    # docs/operations/android-sideload-build.md.
     fallback = ENV["VERSION_CODE_FALLBACK"].to_s
     floor = fallback.empty? ? nil : fallback.to_i
 
@@ -597,36 +990,20 @@ platform :android do
 
   desc "Prepare a DRAFT production release for one exact tagged build (no review submission, no rollout)"
   lane :draft_submission do
-    json_key_data = ENV.fetch("GOOGLE_PLAY_SERVICE_ACCOUNT_JSON")
     version = ENV.fetch("RELEASE_VERSION")
     version_code = ENV.fetch("ANDROID_VERSION_CODE")
     UI.user_error!("Invalid RELEASE_VERSION: #{version}") unless version.match?(/^\d+\.\d+\.\d+$/)
     UI.user_error!("Invalid ANDROID_VERSION_CODE: #{version_code}") unless version_code.match?(/^\d+$/) && version_code.to_i.positive?
+    ENV["GOOGLE_PLAY_SERVICE_ACCOUNT_JSON"] ||= ENV["GOOGLE_PLAY_JSON_KEY"]
 
-    # Promote the exact internal-track release (uploaded by android-apk-rn.yml)
-    # to a production release in DRAFT status — never sent for review; a human
-    # rolls it out. A plain `track: production` with every upload skipped is a
-    # no-op in supply (no version codes → update_track is never called, and the
-    # metadata skip flags short-circuit perform_upload_meta), so this goes
-    # through supply's promote_track: select the internal release carrying this
-    # versionCode and copy it to production with track_promote_release_status.
-    # No AAB upload (the binary already exists on internal); no text/images/
-    # screenshots (owned by the metadata/images/screenshots lanes).
-    upload_to_play_store(
-      package_name: APP_IDENTIFIER,
-      json_key_data: json_key_data,
-      track: "internal",
-      track_promote_to: "production",
-      track_promote_release_status: "draft",
-      version_code: version_code.to_i,
-      skip_upload_apk: true,
-      skip_upload_aab: true,
-      skip_upload_metadata: true,
-      skip_upload_changelogs: true,
-      skip_upload_images: true,
-      skip_upload_screenshots: true,
-      timeout: 300
-    )
-    UI.success("Prepared a draft production release for versionCode #{version_code}, promoted from internal.")
+    # Copies the exact internal-track release (uploaded by android-apk-rn.yml) to
+    # production as a draft, in one edit committed with ERROR_IF_IN_REVIEW, so it
+    # can never cancel a review. Never sent for review and never rolled out: the
+    # merge-back submission (mobile-store-submit.yml) or Android Production Release
+    # does that. No AAB upload, no text, images or screenshots.
+    Dir.chdir(REPO_ROOT) do
+      sh("vp", "exec", "node", "--import", "tsx", File.join(REPO_ROOT, "scripts", "mobile-store-android-draft.ts"))
+    end
+    UI.success("Prepared a draft production release for versionCode #{version_code}, from internal.")
   end
 end

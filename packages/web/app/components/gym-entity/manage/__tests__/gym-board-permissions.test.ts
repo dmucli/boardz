@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vite-plus/test';
-import { canManageGymBoards, canUnlinkBoard, linkableBoards } from '../gym-board-permissions';
+import { canManageGymBoards, linkableBoards } from '../gym-board-permissions';
 
 const GYM_UUID = 'gym-1';
 const OWNER = 'user-owner';
@@ -20,17 +20,6 @@ describe('canManageGymBoards', () => {
 
   it('denies a signed-out viewer', () => {
     expect(canManageGymBoards({ ownerId: OWNER, myRole: 'admin' }, null)).toBe(false);
-  });
-});
-
-describe('canUnlinkBoard', () => {
-  it('allows the board owner', () => {
-    expect(canUnlinkBoard({ ownerId: OWNER }, OWNER)).toBe(true);
-  });
-
-  it('denies everyone else, including gym admins', () => {
-    expect(canUnlinkBoard({ ownerId: OWNER }, OTHER)).toBe(false);
-    expect(canUnlinkBoard({ ownerId: OWNER }, null)).toBe(false);
   });
 });
 

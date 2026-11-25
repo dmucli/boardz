@@ -1,6 +1,9 @@
 import { triggerWebCron } from './trigger-web-cron';
 import { refreshGymActivityStats } from './refresh-gym-activity-stats';
+import { refreshSitemapSetters } from './refresh-sitemap-setters';
 import { purgeSprayWallPhotos } from './purge-spray-wall-photos';
+import { purgeUserActivity, snapshotActiveUsers } from './active-users';
+import { exportSprayTraining } from './export-spray-training';
 import type { JobDefinition } from './types';
 
 /**
@@ -70,6 +73,36 @@ const GYM_ACTIVITY_REFRESH_TIMEOUT_MS = 900_000;
  */
 const SPRAY_PHOTO_PURGE_TIMEOUT_MS = 600_000;
 
+/**
+ * The active-user snapshot is six `count(DISTINCT user_id)` reads over at most
+ * 30 days of `user_activity_days` (one row per signed-in climber per day per
+ * platform) through its `day` index, and the retention purge deletes about one
+ * day's rows. Both finish in seconds; ten minutes is headroom for a cold,
+ * contended primary, short enough that a wedged backend can't hold the run
+ * until the next day's tick.
+ */
+const ACTIVE_USERS_TIMEOUT_MS = 600_000;
+
+/**
+ * The spray training export copies every approved version's `photo_key` inside
+ * the private bucket and writes a few JSON files, one object at a time. That
+ * key is the BASE photo: at most 2048 px on its long side, re-encoded as JPEG
+ * on upload (`handlers/spray-wall-photos.ts` in the backend), never the
+ * full-resolution copy. Its database reads are bounded by the approved set,
+ * which an admin builds by hand.
+ *
+ * Fifteen minutes is the ceiling this job is allowed, not the time a run has.
+ * The request ends sooner. On the default backend URL it passes through the
+ * Cloudflare proxy, whose origin cap is 100 seconds (a 524, which is not
+ * retried); on any URL, Node's own `fetch` gives up after 300 seconds without
+ * response headers. Either way the job reports a failed run while the backend
+ * keeps writing, up to its own 12-minute deadline; a run that passes that
+ * writes no manifest, so the half-written export is ignored by the ML fetch
+ * and deleted by the next run. docs/backend/scheduler.md, "Spray wall training
+ * export", has the table and where the 100 seconds comes from.
+ */
+const SPRAY_TRAINING_EXPORT_TIMEOUT_MS = 900_000;
+
 export const JOBS: readonly JobDefinition[] = [
   {
     name: 'cleanup',
@@ -98,7 +131,7 @@ export const JOBS: readonly JobDefinition[] = [
   // (`git show 98ef8e32b -- packages/web/vercel.json`), so by the time the crons
   // moved to the scheduler there was nothing left in `vercel.json` to carry
   // over. #4648 republishes the surface and brings the same slot back here.
-  // docs/sitemap.md's runbook used to call for a separate one-shot Railway cron
+  // docs/web/sitemap.md's runbook used to call for a separate one-shot Railway cron
   // service — this is that service, except it already exists, already has a
   // Sentry monitor, and already has a disable switch.
   //
@@ -125,6 +158,16 @@ export const JOBS: readonly JobDefinition[] = [
     // `/health/jobs`.
     sentryMonitor: true,
     run: triggerWebCron('/api/internal/refresh-sitemap-climbs'),
+  },
+
+  {
+    name: 'refresh-sitemap-setters',
+    // Keep the bounded setter scan off the climb refresh's six-hourly tick.
+    schedule: '10 */6 * * *',
+    timezone: 'UTC',
+    timeoutMs: 120_000,
+    // The backend's transaction-scoped advisory lock makes overlaps benign.
+    run: refreshSitemapSetters,
   },
 
   // Overlap-safe, which JobDefinition requires: the rebuild takes
@@ -162,6 +205,70 @@ export const JOBS: readonly JobDefinition[] = [
     timezone: 'UTC',
     timeoutMs: SPRAY_PHOTO_PURGE_TIMEOUT_MS,
     run: purgeSprayWallPhotos,
+  },
+
+  // First-party active users (#2644, docs/analytics/analytics-consent.md): yesterday's
+  // DAU and the trailing WAU/MAU from `user_activity_days`, sent to PostHog as
+  // one aggregate event. Counted whatever climbers' analytics consent, which is
+  // why it is the canonical MAU in docs/analytics/growth-metrics.md.
+  //
+  // Overlap-safe, which JobDefinition requires: the counts are reads, and the
+  // event's uuid is derived from the day, so a second send collapses into the
+  // first in PostHog.
+  {
+    name: 'snapshot-active-users',
+    // 00:20 UTC: yesterday is complete, and twenty minutes clear of the
+    // 00:00 sitemap refresh so the two never start on the same tick.
+    schedule: '20 0 * * *',
+    // Load-bearing: "yesterday" is a UTC day, and so is the schedule.
+    timezone: 'UTC',
+    timeoutMs: ACTIVE_USERS_TIMEOUT_MS,
+    run: snapshotActiveUsers,
+  },
+
+  // Retention for `user_activity_days`: rows older than 60 days go. Daily,
+  // so the table never holds more than a day past the window.
+  //
+  // Overlap-safe, which JobDefinition requires: a second run finds nothing
+  // older than the cutoff and deletes nothing.
+  {
+    name: 'purge-user-activity',
+    // 07:30 UTC — after the 07:00 spray wall photo purge rather than alongside it.
+    schedule: '30 7 * * *',
+    // Load-bearing for the same reason as every row above: a container's local
+    // zone is not guaranteed to be UTC.
+    timezone: 'UTC',
+    timeoutMs: ACTIVE_USERS_TIMEOUT_MS,
+    run: purgeUserActivity,
+  },
+
+  // The spray wall training set (SW-20, #5471). Every six hours, because the
+  // promise to a climber who switches "Help train hold finding" off is that
+  // their wall leaves every stored export within 24 hours, and each run retires
+  // before it writes. Once a day would leave that promise no slack: a switch
+  // flipped a second after the run read the walls waits the full 24 hours, and
+  // one failed run makes it 48. At six hours it survives two failed runs in a
+  // row.
+  //
+  // Four runs a day cost little. A run that finds nothing stale and nothing
+  // changed reads the approved set and the stored exports' manifests (two
+  // exports are kept), then answers `skipped: true` without downloading a
+  // photo or writing an object.
+  //
+  // Overlap-safe, which JobDefinition requires: the mutation holds a lease row
+  // for the whole run, so a second run meeting a first writes nothing (and this
+  // job reports it as a failure, so a stuck run is seen).
+  {
+    name: 'export-spray-training',
+    // 02:00, 08:00, 14:00 and 20:00 UTC, clear of every other job's tick. The
+    // 08:00 one is an hour after the 07:00 photo purge, so a wall purged today
+    // is already photo-less (and so ineligible) when that run reads it.
+    schedule: '0 2,8,14,20 * * *',
+    // Load-bearing for the same reason as every row above: a container's local
+    // zone is not guaranteed to be UTC.
+    timezone: 'UTC',
+    timeoutMs: SPRAY_TRAINING_EXPORT_TIMEOUT_MS,
+    run: exportSprayTraining,
   },
 ];
 

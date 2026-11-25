@@ -9,6 +9,7 @@ import type { Gym } from '@boardsesh/shared-schema';
 // whole "counts" half rests on one unasserted line of JSX.
 
 vi.mock('server-only', () => ({}));
+vi.mock('@/app/lib/server-board-discovery', () => ({ getBoardDiscovery: vi.fn(async () => []) }));
 
 class NotFoundSignal extends Error {}
 class RedirectSignal extends Error {}
@@ -31,7 +32,7 @@ vi.mock('@/app/lib/analytics', () => ({ track: vi.fn() }));
 const executeAuthenticatedGraphQL = vi.hoisted(() => vi.fn());
 vi.mock('@/app/lib/graphql/server-graphql', () => ({ executeAuthenticatedGraphQL }));
 
-const GymPage = (await import('../page')).default;
+const GymPage = (await import('@/app/(site)/gym/[gym_slug]/page')).default;
 // Imported, not mocked: `page.tsx` resolves the same module instance, so element
 // type identity is enough to find them in the returned tree.
 const GymQrLandingTracker = (await import('../gym-qr-landing-tracker')).default;
@@ -116,6 +117,26 @@ describe('gym page QR landing', () => {
 
     expect(ctas).toHaveLength(1);
     expect(ctas[0]?.props).toMatchObject({ gymSlug: 'landing-cta' });
+  });
+
+  it('tells the install CTA about the scan, so its store links can say qr', async () => {
+    // The tracker strips `src` and `medium` from the address bar on mount, so
+    // the CTA cannot read them itself: the server has to hand the medium over.
+    executeAuthenticatedGraphQL.mockResolvedValue({ gymBySlug: gym('landing-scan') });
+
+    const ctas = findAll(await renderPage('landing-scan', { src: 'qr', medium: 'poster' }), GymInstallCta);
+
+    expect(ctas[0]?.props).toMatchObject({ gymSlug: 'landing-scan', qrMedium: 'poster' });
+  });
+
+  it('tells the install CTA there was no scan on an ordinary visit', async () => {
+    executeAuthenticatedGraphQL.mockResolvedValue({ gymBySlug: gym('landing-plain') });
+
+    const plainVisit = findAll(await renderPage('landing-plain', {}), GymInstallCta);
+    const badMedium = findAll(await renderPage('landing-plain', { src: 'qr', medium: 'billboard' }), GymInstallCta);
+
+    expect(plainVisit[0]?.props).toMatchObject({ qrMedium: null });
+    expect(badMedium[0]?.props).toMatchObject({ qrMedium: null });
   });
 
   it('falls back to the URL slug when the gym has an empty slug', async () => {

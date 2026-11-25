@@ -1,21 +1,44 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 
-// Minimal RN surface. The horizontal ScrollView renders as a tagged div so the
-// tests can assert which controls ride the scroller and which stay pinned
-// outside it — the whole point of the row's layout.
+// Minimal RN surface.
 type PressMockProps = { children?: ReactNode; onPress?: () => void; accessibilityLabel?: string };
 const announceSpy = vi.hoisted(() => vi.fn());
 vi.mock('react-native', () => ({
-  View: ({ children, testID }: { children?: ReactNode; testID?: string }) =>
-    createElement('div', { 'data-testid': testID }, children),
+  Platform: { OS: 'ios' },
+  useWindowDimensions: () => ({ width: 390, height: 844, fontScale: 1 }),
+  View: ({ children, testID, style }: { children?: ReactNode; testID?: string; style?: unknown }) => {
+    // Flattened so a test can read the row's resolved gap.
+    const flat = [style]
+      .flat(2)
+      .reduce<Record<string, unknown>>(
+        (merged, part) => (part && typeof part === 'object' ? { ...merged, ...part } : merged),
+        {},
+      );
+    return createElement('div', { 'data-testid': testID, 'data-gap': flat.gap }, children);
+  },
   Pressable: ({ children, onPress, accessibilityLabel }: PressMockProps) =>
     createElement('button', { onClick: onPress, 'data-label': accessibilityLabel }, children),
-  ScrollView: ({ children, horizontal }: { children?: ReactNode; horizontal?: boolean }) =>
-    createElement('div', { 'data-scroll': 'true', 'data-horizontal': horizontal ? 'true' : 'false' }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
   AccessibilityInfo: { announceForAccessibility: announceSpy },
 }));
 
@@ -26,18 +49,6 @@ vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => k
 vi.mock('../../Icon', () => ({ Icon: ({ name }: { name?: string }) => createElement('span', { 'data-icon': name }) }));
 vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
-}));
-vi.mock('../../Button', () => ({
-  Button: ({ title, disabled, minHeight }: { title?: string; disabled?: boolean; minHeight?: number }) =>
-    createElement('button', {
-      'data-save-button': 'true',
-      'data-title': title,
-      'data-min-height': minHeight,
-      disabled,
-    }),
-}));
-vi.mock('../../Button.surface', () => ({
-  ButtonSurfaceProvider: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
 }));
 vi.mock('../../drawer-action-bar/DrawerActionBar', () => ({
   ActionButton: ({
@@ -60,23 +71,56 @@ vi.mock('../../drawer-action-bar/DrawerActionBar', () => ({
       'data-active-color': activeColor,
       'data-value': accessibilityValueText,
     }),
-  drawerActionBarStyles: { container: {}, rowSecondary: {}, spacer: {} },
+  SIZES: { lg: { dim: 56, icon: 28 }, sm: { dim: 44, icon: 22 } },
+  drawerActionBarStyles: { container: {}, rowSecondary: { gap: 8 }, spacer: {} },
+}));
+vi.mock('../../ble/BleLightbulbButton', () => ({
+  BleLightbulbButton: ({
+    isConnected,
+    containerSize,
+    accessibilityLabel,
+  }: {
+    isConnected: boolean;
+    containerSize?: number;
+    accessibilityLabel: string;
+  }) =>
+    createElement('button', {
+      'data-action': 'lightbulb',
+      'data-connected': String(isConnected),
+      'data-size': containerSize,
+      'data-label': accessibilityLabel,
+    }),
 }));
 vi.mock('../brush-roles', () => ({
   brushRoleColor: () => '#00FF00',
   getPaintRoles: () => ['STARTING', 'HAND', 'FINISH', 'FOOT'],
   useBrushRoleLabels: () => ({ STARTING: 'Start', HAND: 'Hand', FINISH: 'Finish', FOOT: 'Foot' }),
 }));
-vi.mock('../../../lib/haptics', () => ({ hapticSelection: vi.fn() }));
+vi.mock('../../../lib/haptics', () => ({ hapticSelection: vi.fn(), hapticMedium: vi.fn(), hapticLight: vi.fn() }));
+// The bulb's drive reading; its taps are create-bulb-stops-drive.test.tsx's.
+vi.mock('../../ble/use-board-connection-state', () => ({
+  useBoardConnectionState: () => ({ inAppBoardConnection: 'disconnected', localConnected: false, ledless: false }),
+}));
+vi.mock('../../../lib/analytics-wall-control', () => ({
+  trackDriveModeStarted: vi.fn(),
+  trackDriveModeEnded: vi.fn(),
+  trackWallControlTapped: vi.fn(),
+}));
 vi.mock('../../../lib/hold-color-overrides', () => ({ useHoldColorOverrides: () => ({ overrides: {} }) }));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
-    systemColors: { fill: '#EFEFF0', label: '#000000', secondaryLabel: '#5B5563' },
+    selection: { fill: '#EDE5FF', checkmark: '#5B22F2' },
+    radii: { button: 10 },
+    systemColors: { tertiaryFill: '#EAEAEA', fill: '#EFEFF0', label: '#000000', secondaryLabel: '#5B5563' },
     brandColors: { warning: '#B45309', error: '#C81E1E', primary: '#A78BFA' },
   }),
 }));
-vi.mock('../../../theme/colors', () => ({ brandColors: { primary: '#6D28D9', success: '#047857' } }));
-vi.mock('../../../theme/tokens', () => ({ spacing: { 1: 4, 2: 8, 3: 12, 4: 16 }, borderRadius: { md: 8 } }));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 6: 24, 8: 32, 12: 48 },
+  borderRadius: { md: 8 },
+}));
 
 import { CreateDrawerActionBar } from '../CreateDrawerActionBar';
 import { ANNOUNCE_MIN_INTERVAL_MS } from '../use-rate-limited-announcer';
@@ -96,21 +140,15 @@ const baseProps = {
   currentFrameIndex: 0,
   canSetActive: true,
   onSetActive: vi.fn(),
-  saveState: 'ready' as const,
-  onSave: vi.fn(),
-  publishBlocked: false,
   draftStatus: null as DraftStatusView | null,
 };
 
-function renderBar(frameCount: number, overrides: Partial<typeof baseProps> = {}) {
+function renderBar(frameCount: number, overrides: Partial<Parameters<typeof CreateDrawerActionBar>[0]> = {}) {
   const { container } = render(createElement(CreateDrawerActionBar, { ...baseProps, frameCount, ...overrides }));
   return {
     container,
     statusRow: container.querySelector('[data-testid="create-draft-status-row"]') as HTMLElement,
-    scroller: container.querySelector('[data-scroll="true"]') as HTMLElement,
-    undo: container.querySelector('[data-action="undo"]') as HTMLElement,
-    setActive: container.querySelector('[data-action="queue"]') as HTMLElement,
-    save: container.querySelector('[data-save-button="true"]') as HTMLElement,
+    toolRow: container.querySelector('[data-testid="create-tool-row"]') as HTMLElement,
   };
 }
 
@@ -119,16 +157,39 @@ describe('CreateDrawerActionBar', () => {
     announceSpy.mockClear();
   });
 
-  it('pins Set Active and Save outside the scrolling editing cluster', () => {
-    const { scroller, setActive, save } = renderBar(1);
+  it('carries the editing tools and no Save, which is the header confirm', () => {
+    // Save moved to the trailing end of the header (top bar everywhere); this
+    // row is tools only, spread evenly with no scroller.
+    const { toolRow, container } = renderBar(1, {
+      onToggleHeatmap: vi.fn(),
+      lightbulb: { connected: false, connecting: false, onToggle: vi.fn() },
+    });
+    const actions = Array.from(toolRow.querySelectorAll('[data-action]')).map((node) =>
+      node.getAttribute('data-action'),
+    );
+    expect(actions).toEqual(['undo', 'redo', 'delete', 'flame', 'queue', 'lightbulb']);
+    expect(container.textContent).not.toContain('mobile.create.save');
+  });
 
-    expect(scroller.getAttribute('data-horizontal')).toBe('true');
-    expect(setActive).toBeTruthy();
-    expect(save).toBeTruthy();
-    expect(scroller.contains(setActive)).toBe(false);
-    expect(scroller.contains(save)).toBe(false);
-    // The editing actions are the part allowed to scroll.
-    expect(scroller.querySelector('[data-action="redo"]')).toBeTruthy();
+  // #5960: the creator's bulb only starts a Bluetooth connect, and a spray wall
+  // has no lights, so the drawer passes no `lightbulb` there.
+  it('draws the bulb as a 44dp tool beside Set Active on a board with lights', () => {
+    const { toolRow } = renderBar(1, { lightbulb: { connected: true, connecting: false, onToggle: vi.fn() } });
+    const bulb = toolRow.querySelector('[data-action="lightbulb"]');
+    expect(bulb?.getAttribute('data-size')).toBe('44');
+    expect(bulb?.getAttribute('data-connected')).toBe('true');
+    expect(bulb?.previousElementSibling?.getAttribute('data-action')).toBe('queue');
+  });
+
+  it('drops the shared 8dp gap so six tools fit 320pt', () => {
+    // 6 x 44 + 32 padding = 296dp; the inherited gap would add 40 and clip the bulb.
+    const { toolRow } = renderBar(1);
+    expect(toolRow.getAttribute('data-gap')).toBe('0');
+  });
+
+  it('leaves the bulb out when the board has nothing to light', () => {
+    const { toolRow } = renderBar(1);
+    expect(toolRow.querySelector('[data-action="lightbulb"]')).toBeNull();
   });
 
   it('holds no frame controls at all — the route slot under the board owns those', () => {
@@ -144,18 +205,6 @@ describe('CreateDrawerActionBar', () => {
       expect(container.querySelector('[data-action="skip.previous"]')).toBeNull();
       expect(container.querySelector('[data-action="skip.next"]')).toBeNull();
     }
-  });
-
-  it('pins undo outside the scroller so recovery survives a crowded row', () => {
-    // Nine 44dp controls need ~460dp and the scroller has ~261dp, so undo used to
-    // scroll off the left edge the moment a climb had a second frame — putting the
-    // only recovery from a mis-tap out of reach exactly when the row got crowded.
-    const { scroller, undo } = renderBar(3);
-
-    expect(undo).toBeTruthy();
-    expect(scroller.contains(undo)).toBe(false);
-    // Redo is the one that may scroll.
-    expect(scroller.querySelector('[data-action="redo"]')).toBeTruthy();
   });
 
   it('keeps the trash glyph for Clear holds, and no longer carries a plus', () => {
@@ -176,22 +225,16 @@ describe('CreateDrawerActionBar', () => {
     expect(container.querySelector('[data-action="plus"]')).toBeNull();
   });
 
-  it('floors the Save pill at the 44dp touch target', () => {
-    // Compose sizes a small filled button at 40 — the only sub-floor control on
-    // this surface, shoulder to shoulder with 44dp icon buttons.
-    const { save } = renderBar(1);
-    expect(save.getAttribute('data-min-height')).toBe('44');
-  });
-
-  it('disables Save while a publish is blocked, and renders the reason under it', () => {
-    const { save, container } = renderBar(1, {
-      publishBlocked: true,
+  it('renders the reason a remix holds Save back in the status line', () => {
+    const { container } = renderBar(1, {
+      saveBlockedLine: createElement('span', null, 'mobile.lostHolds.editorHint'),
       draftStatus: { text: 'mobile.create.publish.blocked', tone: 'warning', announce: true },
     });
 
-    expect((save as HTMLButtonElement).disabled).toBe(true);
-    // A disabled button must never be mute.
-    expect(container.textContent).toContain('mobile.create.publish.blocked');
+    // A disabled Save (in the header) must never be mute.
+    expect(container.querySelector('[data-testid="create-save-blocked-line"]')?.textContent).toContain(
+      'mobile.lostHolds.editorHint',
+    );
   });
 
   it('renders no status TEXT for an empty editor, but still holds the row', () => {
@@ -217,16 +260,6 @@ describe('CreateDrawerActionBar', () => {
     expect(empty.statusRow).toBeTruthy();
     expect(withStatus.statusRow).toBeTruthy();
     expect(withStatus.statusRow.textContent).toContain('mobile.create.autosave.onDevice');
-  });
-
-  it('keeps Set Active and Save pinned even on a route', () => {
-    // The scroller used to clip its own controls once a climb had a second
-    // frame. Now that frame editing has left it entirely, the trailing pair
-    // still has to hold its position at any frame count.
-    const { scroller, setActive, save } = renderBar(3);
-
-    expect(scroller.contains(setActive)).toBe(false);
-    expect(scroller.contains(save)).toBe(false);
   });
 
   it('speaks the new count when a frame is ADDED, and stays silent on navigation', () => {
@@ -290,8 +323,8 @@ describe('CreateDrawerActionBar', () => {
   it('labels Set Active with a queue glyph, not a play glyph', () => {
     // A play glyph on a button that does not play is half of "the play button
     // doesn't work"; `flash` is the flashed-ascent glyph elsewhere in the app.
-    const { setActive } = renderBar(3);
-    expect(setActive).toBeTruthy();
+    const { toolRow } = renderBar(3);
+    expect(toolRow.querySelector('[data-action="queue"]')).toBeTruthy();
     expect(document.querySelector('[data-action="play.circle"]')).toBeNull();
   });
 
@@ -319,6 +352,37 @@ describe('CreateDrawerActionBar', () => {
     expect(heatLine?.textContent).toBe('heat legend');
     // The autosave row stays mounted (for its announcements), outside the heat line's box.
     expect(heatLine?.querySelector('[data-testid="create-draft-status-row"]')).toBeNull();
+  });
+
+  it('keeps the heat line up while the status only says what a publish still needs', () => {
+    // On a spray wall Save publishes by default, so this hint is up from the
+    // first hold until the climb has a start and a finish (#5954 review).
+    for (const text of ['mobile.create.publish.blocked']) {
+      const { container, unmount } = render(
+        createElement(CreateDrawerActionBar, {
+          ...baseProps,
+          draftStatus: { text, tone: 'warning', announce: true, yieldsToHeatmap: true },
+          heatmapLine: createElement('span', null, 'heat legend'),
+        }),
+      );
+      const heatLine = container.querySelector('[data-testid="create-heatmap-line"]');
+      expect(heatLine?.textContent).toBe('heat legend');
+      // Still mounted, outside the heat line's box, so the hint is announced.
+      expect(container.querySelector('[data-testid="create-draft-status-row"]')?.textContent).toContain(text);
+      expect(heatLine?.querySelector('[data-testid="create-draft-status-row"]')).toBeNull();
+      unmount();
+    }
+  });
+
+  it('still lets a warning that is not a publish hint win over the heat line', () => {
+    const { container } = render(
+      createElement(CreateDrawerActionBar, {
+        ...baseProps,
+        draftStatus: { text: 'mobile.create.autosave.notStored', tone: 'warning', announce: true },
+        heatmapLine: createElement('span', null, 'heat legend'),
+      }),
+    );
+    expect(container.querySelector('[data-testid="create-heatmap-line"]')).toBeNull();
   });
 
   it('lets an urgent draft status win over the heat line', () => {

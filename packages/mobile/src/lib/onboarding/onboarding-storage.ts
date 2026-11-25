@@ -112,11 +112,6 @@ export async function clearBoardRevealTipPending(): Promise<void> {
 
 /** Whether a one-shot just-in-time tip has already been shown. */
 export async function hasSeenTip(key: string): Promise<boolean> {
-  // Screenshot mode: report every just-in-time tip as already seen so an
-  // onboarding banner (accessory bar / progress / workout / crew) never overlays
-  // a captured store screen. A fresh screenshot install would otherwise fire them
-  // on the first shot. Folds to a dead branch (and strips) in normal builds.
-  if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return true;
   try {
     return (await secureStorePreferences.get<boolean>(key)) === true;
   } catch {
@@ -127,4 +122,9 @@ export async function hasSeenTip(key: string): Promise<boolean> {
 /** Mark a one-shot just-in-time tip as shown so it never fires again. */
 export async function markTipSeen(key: string): Promise<void> {
   await secureStorePreferences.set(key, true);
+}
+
+/** Forget that a one-shot tip was shown, so it can fire again (Replay walkthrough). */
+export async function clearTipSeen(key: string): Promise<void> {
+  await secureStorePreferences.remove(key);
 }

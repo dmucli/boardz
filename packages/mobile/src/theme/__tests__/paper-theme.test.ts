@@ -11,39 +11,105 @@ vi.mock('react-native-paper', () => ({
 
 import { buildPaperTheme } from '../paper-theme';
 
+/** WCAG 2 contrast ratio between two `#RRGGBB` colours. */
+function contrastRatio(foreground: string, background: string): number {
+  const luminance = (hex: string) => {
+    const [red, green, blue] = [1, 3, 5].map((offset) => {
+      const channel = parseInt(hex.slice(offset, offset + 2), 16) / 255;
+      return channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  };
+  const [lighter, darker] = [luminance(foreground), luminance(background)].sort((first, second) => second - first);
+  return (lighter + 0.05) / (darker + 0.05);
+}
+
 describe('buildPaperTheme', () => {
-  it('maps the brand + material surfaces onto MD3 roles (light)', () => {
+  it('maps the brand + Graphite surfaces onto MD3 roles (light)', () => {
     const theme = buildPaperTheme('light');
-    expect(theme.colors.primary).toBe('#6D28D9');
+    expect(theme.colors.primary).toBe('#5B22F2');
     expect(theme.colors.onPrimary).toBe('#FFFFFF');
-    expect(theme.colors.background).toBe('#F3EFFA'); // materialSurfaces.light.background
+    expect(theme.colors.background).toBe('#F2F2F2'); // materialSurfaces.light.background
     expect(theme.colors.surface).toBe('#FFFFFF'); // secondaryBackground
     expect(theme.colors.error).toBe('#C81E1E');
-    // The five elevation levels are now DISTINCT, monotonic surface-tint tones
-    // (not all collapsed onto one `elevatedSurface`), so Paper's elevated
-    // components tier instead of looking identical.
-    const { level0, level1, level2, level3, level4, level5 } = theme.colors.elevation;
-    expect(level0).toBe('transparent');
-    expect(new Set([level1, level2, level3, level4, level5]).size).toBe(5);
-    // The two grade stat tiles use the brand-violet primary/secondary containers
-    // (not the vestigial amber tertiary), so they read as one tonal family.
-    expect(theme.colors.primaryContainer).toContain('109, 40, 217'); // brand violet #6D28D9
-    expect(theme.colors.secondaryContainer).toContain('109, 40, 217');
-    // Container ink is an explicit dark violet — not the near-white `onSurface`,
-    // which was illegible on the (dark-scheme) container.
+    expect(theme.colors.onError).toBe('#FFFFFF');
+    // Elevation levels 1–5 are the container steps low → highest, distinct and
+    // falling in light.
+    expect(theme.colors.elevation).toEqual({
+      level0: 'transparent',
+      level1: '#EAEAEA',
+      level2: '#E4E4E4',
+      level3: '#DFDFDF',
+      level4: '#DCDCDC',
+      level5: '#D9D9D9',
+    });
+    // Opaque violet tonal containers: the selected/current state keeps the brand.
+    expect(theme.colors.primaryContainer).toBe('#E1E0FF');
+    expect(theme.colors.secondaryContainer).toBe('#DEDDFC');
+    // Container ink is an explicit dark violet, not the grey `onSurface`.
     expect(theme.colors.onPrimaryContainer).toBe('#21005D');
     expect(theme.colors.onSecondaryContainer).toBe('#21005D');
     // `surfaceVariant` is a real toned container (filled text fields were
     // invisible when it aliased `#FFFFFF`).
-    expect(theme.colors.surfaceVariant).not.toBe('#FFFFFF');
-    // `outline` (form border) is distinct from `outlineVariant` (faint divider).
-    expect(theme.colors.outline).not.toBe(theme.colors.outlineVariant);
+    expect(theme.colors.surfaceVariant).toBe('#E4E4E4');
+    // `outline` (form border) is a fixed grey, distinct from the faint divider.
+    expect(theme.colors.outline).toBe('#7A7A7A');
+    expect(theme.colors.outlineVariant).toBe('rgba(0, 0, 0, 0.12)');
+    // The mint tertiary keeps its dark ink in both schemes.
+    expect(theme.colors.onTertiary).toBe('#16111F');
   });
 
-  it('uses the dark tonal surfaces for the dark scheme', () => {
+  it('uses the dark Graphite surfaces for the dark scheme', () => {
     const theme = buildPaperTheme('dark');
-    expect(theme.colors.background).toBe('#15101E');
-    expect(theme.colors.surface).toBe('#221A33');
+    expect(theme.colors.background).toBe('#0E0E0E');
+    expect(theme.colors.surface).toBe('#1E1E1E');
+    expect(theme.colors.surfaceVariant).toBe('#1A1A1A');
+    expect(theme.colors.outline).toBe('#8A8A8A');
+    expect(theme.colors.outlineVariant).toBe('rgba(255, 255, 255, 0.12)');
+    expect(theme.colors.elevation).toEqual({
+      level0: 'transparent',
+      level1: '#161616',
+      level2: '#1A1A1A',
+      level3: '#262626',
+      level4: '#2A2A2A',
+      level5: '#2E2E2E',
+    });
+    expect(theme.colors.onTertiary).toBe('#16111F');
+  });
+
+  it('gives the dark error fill a dark ink, since white on #F87171 is 2.77:1', () => {
+    const theme = buildPaperTheme('dark');
+    expect(theme.colors.error).toBe('#F87171');
+    expect(theme.colors.onError).toBe('#1B1B1B');
+  });
+
+  it('uses the foreground tint for dark primary, with dark ink on top', () => {
+    const theme = buildPaperTheme('dark');
+    // Not the fill-only #7855FF: primary colours text (tab labels, text buttons).
+    expect(theme.colors.primary).toBe('#9784FF');
+    expect(theme.colors.onPrimary).toBe('#2E0077');
+    // `secondary` stays violet: it is the active nav label.
+    expect(theme.colors.secondary).toBe('#9784FF');
+    expect(theme.colors.onSecondary).toBe('#2E0077');
+    // Opaque tonal containers with a light violet ink.
+    expect(theme.colors.primaryContainer).toBe('#483A8E');
+    expect(theme.colors.secondaryContainer).toBe('#34276B');
+    expect(theme.colors.onPrimaryContainer).toBe('#E1E0FF');
+    expect(theme.colors.onSecondaryContainer).toBe('#E1E0FF');
+  });
+
+  // Material's tertiary is the mint spark's own container (not Paper's baseline
+  // pink) with AA-legible ink. "Lit" never reads it: the wall pill fills with `live`.
+  it.each([
+    ['light', '#0F9F86', '#C5EEE2', '#00231C'],
+    ['dark', '#3EE6C1', '#005747', '#C5EEE2'],
+  ] as const)('gives the mint tertiary a legible tonal container (%s)', (scheme, spark, container, ink) => {
+    const theme = buildPaperTheme(scheme);
+    expect(theme.colors.tertiary).toBe(spark);
+    expect(contrastRatio(theme.colors.onTertiary, theme.colors.tertiary)).toBeGreaterThanOrEqual(4.5);
+    expect(theme.colors.tertiaryContainer).toBe(container);
+    expect(theme.colors.onTertiaryContainer).toBe(ink);
+    expect(contrastRatio(theme.colors.onTertiaryContainer, theme.colors.tertiaryContainer)).toBeGreaterThanOrEqual(4.5);
   });
 
   it('passes a provided dynamic palette straight through (Material You hook)', () => {

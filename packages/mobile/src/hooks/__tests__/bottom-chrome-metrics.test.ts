@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import { computeBottomChromeMetrics } from '../bottom-chrome-metrics';
+import { computeBottomChromeMetrics, trackExpandedTabContentInset } from '../bottom-chrome-metrics';
 import {
-  MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT,
+  MATERIAL_MINI_PLAYER_CARD_RESERVE,
   MATERIAL_TAB_BAR_HEIGHT,
   NATIVE_BOTTOM_ACCESSORY_HEIGHT,
   REST_TIMER_PILL_HEIGHT,
@@ -37,6 +37,47 @@ const IN_TAB_INFERRED_BAR_INSET = ROOT_WINDOW_INSET + TAB_BAR_HEIGHT;
 const SYNTHETIC_ROOT_INSET = 100;
 
 describe('computeBottomChromeMetrics', () => {
+  it.each(['material', 'liquidGlass'] as const)('reserves the desktop card beside the pane on %s', (uiVariant) => {
+    const metrics = computeBottomChromeMetrics({
+      uiVariant,
+      usesNativeTabBar: false,
+      insetsBottom: 12,
+      insideTabs: true,
+      onAccessorySurface: true,
+      hasCurrentClimb: true,
+      nativeAccessoryPresented: false,
+      usesSidebar: true,
+      sidebarMiniPlayer: true,
+    });
+    expect(metrics.jsQueueToolbarVisible).toBe(true);
+    expect(metrics.jsQueueReserve).toBe(MATERIAL_MINI_PLAYER_CARD_RESERVE);
+    expect(metrics.tabBarHeight).toBe(0);
+    expect(metrics.tabBarBottom).toBe(12);
+    expect(metrics.contentColumnLeft).toBe(96);
+    expect(metrics.contentColumnRight).toBe(0);
+    expect(metrics.scrollBottomPadding).toBe(12 + MATERIAL_MINI_PLAYER_CARD_RESERVE);
+    expect(metrics.fixedFooterBottom).toBe(MATERIAL_MINI_PLAYER_CARD_RESERVE);
+  });
+
+  it.each([
+    { hasCurrentClimb: false, onAccessorySurface: true },
+    { hasCurrentClimb: true, onAccessorySurface: false },
+  ])('leaves no desktop card reserve when hidden: %j', (visibility) => {
+    const metrics = computeBottomChromeMetrics({
+      uiVariant: 'material',
+      usesNativeTabBar: false,
+      insetsBottom: 0,
+      insideTabs: true,
+      nativeAccessoryPresented: false,
+      usesSidebar: true,
+      sidebarMiniPlayer: true,
+      ...visibility,
+    });
+    expect(metrics.jsQueueToolbarVisible).toBe(false);
+    expect(metrics.jsQueueReserve).toBe(0);
+    expect(metrics.scrollBottomPadding).toBe(0);
+  });
+
   it('reserves nothing extra outside the tabs group', () => {
     const metrics = computeBottomChromeMetrics({
       uiVariant: 'liquidGlass',
@@ -76,7 +117,7 @@ describe('computeBottomChromeMetrics', () => {
 
   it('clears the JS Material tab bar for Liquid Glass on a non-capable device', () => {
     // Older iPhone / Android on Liquid Glass: the variant is liquidGlass (floating
-    // island queue chrome → TOOLBAR_RESERVE) but the rendered bar is the 80dp JS
+    // island queue chrome → TOOLBAR_RESERVE) but the rendered bar is the 64dp JS
     // MaterialTabBar, which sits in flow rather than overlaying content.
     const metrics = computeBottomChromeMetrics({
       uiVariant: 'liquidGlass',
@@ -96,7 +137,7 @@ describe('computeBottomChromeMetrics', () => {
     expect(metrics.fixedFooterBottom).toBe(TOOLBAR_RESERVE);
   });
 
-  it('reserves the docked Material bar when the JS toolbar is visible', () => {
+  it('reserves the Material MiniPlayer card and its gap when the JS toolbar is visible', () => {
     const metrics = computeBottomChromeMetrics({
       uiVariant: 'material',
       usesNativeTabBar: false,
@@ -107,11 +148,13 @@ describe('computeBottomChromeMetrics', () => {
       nativeAccessoryPresented: false,
     });
     expect(metrics.jsQueueToolbarVisible).toBe(true);
-    expect(metrics.jsQueueReserve).toBe(MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT);
-    // Material clears its taller M3 nav bar (80) — not the iOS 49.
-    expect(metrics.scrollBottomPadding).toBe(MATERIAL_TAB_BAR_HEIGHT + MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT);
-    expect(metrics.floatingControlBottom).toBe(MATERIAL_TAB_BAR_HEIGHT + MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT);
-    expect(metrics.fixedFooterBottom).toBe(MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT);
+    expect(metrics.jsQueueReserve).toBe(MATERIAL_MINI_PLAYER_CARD_RESERVE);
+    // The 48dp card plus the 8dp gap it floats above the tab bar.
+    expect(MATERIAL_MINI_PLAYER_CARD_RESERVE).toBe(48);
+    // Material clears its taller M3 short nav bar (64) — not the iOS 49.
+    expect(metrics.scrollBottomPadding).toBe(MATERIAL_TAB_BAR_HEIGHT + MATERIAL_MINI_PLAYER_CARD_RESERVE);
+    expect(metrics.floatingControlBottom).toBe(MATERIAL_TAB_BAR_HEIGHT + MATERIAL_MINI_PLAYER_CARD_RESERVE);
+    expect(metrics.fixedFooterBottom).toBe(MATERIAL_MINI_PLAYER_CARD_RESERVE);
   });
 
   it('anchors every native-tab offset to the measured in-tab inset, including the 139pt accessory anchor (#3973)', () => {
@@ -137,6 +180,111 @@ describe('computeBottomChromeMetrics', () => {
     expect(metrics.floatingControlBottom).toBe(IN_TAB_MEASURED_ACCESSORY_INSET);
     expect(metrics.fixedFooterBottom).toBe(IN_TAB_MEASURED_ACCESSORY_INSET);
     expect(metrics.preSessionFooterBottom).toBe(IN_TAB_MEASURED_ACCESSORY_INSET);
+  });
+
+  describe('phone split (iPhone Duo open in landscape, tab bar as a side rail)', () => {
+    // INFERRED: the Duo's landscape home indicator, and an in-tab inset that holds
+    // it plus the accessory spanning the bottom of the split, with no bar below.
+    const DUO_ROOT_INSET = 21;
+    const DUO_IN_TAB_ACCESSORY_INSET = DUO_ROOT_INSET + NATIVE_BOTTOM_ACCESSORY_HEIGHT;
+    const splitInputs = {
+      uiVariant: 'liquidGlass' as const,
+      usesNativeTabBar: true,
+      insetsBottom: DUO_ROOT_INSET,
+      insideTabs: true,
+      onAccessorySurface: true,
+      hasCurrentClimb: true,
+      nativeAccessoryPresented: true,
+      tabBarAtBottom: false,
+    };
+
+    it('keeps the accessory presented and clears it, with no floating JS bar', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...splitInputs,
+        measuredTabContentInsetBottom: DUO_IN_TAB_ACCESSORY_INSET,
+      });
+      expect(metrics.nativeAccessoryPresented).toBe(true);
+      expect(metrics.nativeAccessoryVisible).toBe(true);
+      expect(metrics.jsQueueToolbarVisible).toBe(false);
+      expect(metrics.tabBarHeight).toBe(0);
+      expect(metrics.scrollBottomPadding).toBe(DUO_IN_TAB_ACCESSORY_INSET);
+      expect(metrics.floatingControlBottom).toBe(DUO_IN_TAB_ACCESSORY_INSET);
+    });
+
+    it('leaves the side rail out of the reconstruction, so lists get no 49pt dead band', () => {
+      const unmeasured = computeBottomChromeMetrics({ ...splitInputs, measuredTabContentInsetBottom: null });
+      expect(unmeasured.scrollBottomPadding).toBe(DUO_ROOT_INSET + NATIVE_BOTTOM_ACCESSORY_HEIGHT);
+      // The default still reserves a bottom bar, byte-for-byte.
+      const bottomBar = computeBottomChromeMetrics({
+        ...splitInputs,
+        tabBarAtBottom: undefined,
+        measuredTabContentInsetBottom: null,
+      });
+      expect(bottomBar.scrollBottomPadding).toBe(DUO_ROOT_INSET + TAB_BAR_HEIGHT + NATIVE_BOTTOM_ACCESSORY_HEIGHT);
+    });
+  });
+
+  describe('native iPad (UIKit sidebar or top tab bar, accessory along the bottom)', () => {
+    // INFERRED: an iPad's home indicator, and an in-tab inset that holds it plus
+    // the accessory, with no tab bar below (it is the sidebar, or sits at the top).
+    const IPAD_ROOT_INSET = 20;
+    const IPAD_IN_TAB_ACCESSORY_INSET = IPAD_ROOT_INSET + NATIVE_BOTTOM_ACCESSORY_HEIGHT;
+    const ipadInputs = {
+      uiVariant: 'liquidGlass' as const,
+      usesNativeTabBar: true,
+      insetsBottom: IPAD_ROOT_INSET,
+      insideTabs: true,
+      onAccessorySurface: true,
+      hasCurrentClimb: true,
+      nativeAccessoryPresented: true,
+      usesSidebar: false,
+      tabBarAtBottom: false,
+    };
+
+    it("clears the accessory with the tab's own inset: the last row and Session's Start button", () => {
+      const metrics = computeBottomChromeMetrics({
+        ...ipadInputs,
+        measuredTabContentInsetBottom: IPAD_IN_TAB_ACCESSORY_INSET,
+      });
+      expect(metrics.nativeAccessoryVisible).toBe(true);
+      expect(metrics.jsQueueToolbarVisible).toBe(false);
+      expect(metrics.tabBarHeight).toBe(0);
+      expect(metrics.scrollBottomPadding).toBe(IPAD_IN_TAB_ACCESSORY_INSET);
+      expect(metrics.preSessionFooterBottom).toBe(IPAD_IN_TAB_ACCESSORY_INSET);
+      expect(metrics.inSessionListBottom).toBe(IPAD_IN_TAB_ACCESSORY_INSET);
+    });
+
+    it('reconstructs the accessory, and no bottom bar, before the inset is measured', () => {
+      const metrics = computeBottomChromeMetrics({ ...ipadInputs, measuredTabContentInsetBottom: null });
+      expect(metrics.scrollBottomPadding).toBe(IPAD_ROOT_INSET + NATIVE_BOTTOM_ACCESSORY_HEIGHT);
+      expect(metrics.preSessionFooterBottom).toBe(IPAD_ROOT_INSET + NATIVE_BOTTOM_ACCESSORY_HEIGHT);
+    });
+
+    it('floors every anchor at the accessory if UIKit leaves it out of the tab inset', () => {
+      // A measured inset holding only the home indicator must not let a docked
+      // footer, the rest pill or a floating control sink under the MiniPlayer.
+      const metrics = computeBottomChromeMetrics({
+        ...ipadInputs,
+        measuredTabContentInsetBottom: IPAD_ROOT_INSET,
+        restTimerArmed: true,
+      });
+      const accessoryTop = IPAD_ROOT_INSET + NATIVE_BOTTOM_ACCESSORY_HEIGHT;
+      expect(metrics.tabBarBottom).toBe(accessoryTop);
+      expect(metrics.preSessionFooterBottom).toBe(accessoryTop + REST_TIMER_RESERVE);
+      expect(metrics.fixedFooterBottom).toBe(accessoryTop + REST_TIMER_RESERVE);
+      expect(metrics.restTimerBottom).toBe(accessoryTop + TOOLBAR_GAP_ABOVE_TABBAR);
+      expect(metrics.floatingControlBottom).toBe(accessoryTop + REST_TIMER_RESERVE);
+    });
+
+    it('stacks the rest pill one gap above the accessory', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...ipadInputs,
+        measuredTabContentInsetBottom: IPAD_IN_TAB_ACCESSORY_INSET,
+        restTimerArmed: true,
+      });
+      expect(metrics.restTimerBottom).toBe(IPAD_IN_TAB_ACCESSORY_INSET + TOOLBAR_GAP_ABOVE_TABBAR);
+      expect(metrics.scrollBottomPadding).toBe(IPAD_IN_TAB_ACCESSORY_INSET + REST_TIMER_RESERVE);
+    });
   });
 
   it('hides the bar but keeps tab-bar clearance on a pushed sub-route (Material)', () => {
@@ -467,6 +615,79 @@ describe('computeBottomChromeMetrics', () => {
     });
   });
 
+  describe('iOS 18 iPhone: native tab bar without the bottom accessory', () => {
+    // The combination the HIG Tab bars fix introduced: NativeTabs is the bar, but
+    // the climb rides the floating JS queue bar because UIKit has no accessory
+    // below iOS 26. The native bar overlays content, so the tray, toasts, FABs and
+    // the last list row must all clear the in-tab inset PLUS the tray, once each.
+    const ios18 = (overrides: Partial<Parameters<typeof computeBottomChromeMetrics>[0]> = {}) =>
+      computeBottomChromeMetrics({
+        uiVariant: 'liquidGlass',
+        usesNativeTabBar: true,
+        insetsBottom: ROOT_WINDOW_INSET,
+        insideTabs: true,
+        onAccessorySurface: true,
+        hasCurrentClimb: true,
+        nativeAccessoryPresented: false,
+        ...overrides,
+      });
+
+    it('floats the JS tray directly above the native bar', () => {
+      const metrics = ios18();
+      expect(metrics.tabBarHeight).toBe(TAB_BAR_HEIGHT);
+      // Unmeasured: reconstructed from the root inset + the 49pt bar, no accessory.
+      expect(metrics.tabBarBottom).toBe(ROOT_WINDOW_INSET + TAB_BAR_HEIGHT);
+      expect(floatingContextBarBottom(metrics.tabBarBottom)).toBe(
+        ROOT_WINDOW_INSET + TAB_BAR_HEIGHT + TOOLBAR_GAP_ABOVE_TABBAR,
+      );
+      expect(metrics.nativeAccessoryReserve).toBe(0);
+    });
+
+    it('clears bar + tray for lists, floating controls, footers and both session bottoms', () => {
+      const metrics = ios18({ measuredTabContentInsetBottom: IN_TAB_INFERRED_BAR_INSET });
+      const clearance = IN_TAB_INFERRED_BAR_INSET + TOOLBAR_RESERVE;
+      expect(metrics.scrollBottomPadding).toBe(clearance);
+      expect(metrics.floatingControlBottom).toBe(clearance);
+      expect(metrics.fixedFooterBottom).toBe(clearance);
+      expect(metrics.inSessionListBottom).toBe(clearance);
+      expect(metrics.preSessionFooterBottom).toBe(clearance);
+    });
+
+    it('drops the tray reserve but keeps the native bar when no climb is current', () => {
+      const metrics = ios18({ hasCurrentClimb: false, measuredTabContentInsetBottom: IN_TAB_INFERRED_BAR_INSET });
+      expect(metrics.jsQueueToolbarVisible).toBe(false);
+      expect(metrics.scrollBottomPadding).toBe(IN_TAB_INFERRED_BAR_INSET);
+      expect(metrics.floatingControlBottom).toBe(IN_TAB_INFERRED_BAR_INSET);
+    });
+
+    it('keeps the native bar clearance on a pushed sub-route, where the tray is gone', () => {
+      const metrics = ios18({ onAccessorySurface: false, measuredTabContentInsetBottom: IN_TAB_INFERRED_BAR_INSET });
+      expect(metrics.jsQueueToolbarVisible).toBe(false);
+      expect(metrics.scrollBottomPadding).toBe(IN_TAB_INFERRED_BAR_INSET);
+    });
+
+    it('never counts the 49pt bar twice when the measurement arrives', () => {
+      // The JS bar fallback ADDS its height to the root inset; the native bar is
+      // already inside the measured in-tab inset. Mixing the two paths is the
+      // #4089 failure shape.
+      const metrics = ios18({ measuredTabContentInsetBottom: IN_TAB_INFERRED_BAR_INSET });
+      expect(metrics.tabBarBottom).toBe(IN_TAB_INFERRED_BAR_INSET);
+      expect(metrics.tabBarBottom).not.toBe(IN_TAB_INFERRED_BAR_INSET + TAB_BAR_HEIGHT);
+    });
+
+    it('stacks the rest pill and the banner above the tray', () => {
+      const metrics = ios18({
+        measuredTabContentInsetBottom: IN_TAB_INFERRED_BAR_INSET,
+        restTimerArmed: true,
+        connectivityBannerHeight: 40,
+      });
+      const trayTop = IN_TAB_INFERRED_BAR_INSET + TOOLBAR_RESERVE;
+      expect(metrics.restTimerBottom).toBe(trayTop + TOOLBAR_GAP_ABOVE_TABBAR);
+      expect(metrics.connectivityBannerBottom).toBe(trayTop + REST_TIMER_RESERVE);
+      expect(metrics.floatingControlBottom).toBe(trayTop + REST_TIMER_RESERVE + 40);
+    });
+  });
+
   describe('pre-session Start capsule clears the floating queue tray (#3967)', () => {
     // The tray band is rebuilt from `floatingContextBarBottom` — the SAME function
     // `ActiveContextBar` positions itself with — rather than from
@@ -492,7 +713,7 @@ describe('computeBottomChromeMetrics', () => {
       return floatingContextBarBottom(metrics.tabBarBottom) + glassSize.hero - screenFloorAboveWindow;
     };
 
-    it('clears the tray on an iOS < 26 / non-glass-capable iPhone', () => {
+    it('clears the tray on the JS bar (Liquid Glass forced on Android)', () => {
       const metrics = computeBottomChromeMetrics({
         uiVariant: 'liquidGlass',
         usesNativeTabBar: false,
@@ -504,6 +725,30 @@ describe('computeBottomChromeMetrics', () => {
       });
       expect(metrics.jsQueueToolbarVisible).toBe(true);
       expect(metrics.preSessionFooterBottom).toBeGreaterThanOrEqual(trayTopAboveScreenFloor(metrics, false));
+    });
+
+    // iOS 18 iPhone: the native UIKit bar with no BottomAccessory, so the JS tray
+    // floats above the NATIVE bar. Covered measured and unmeasured, on a Face ID
+    // phone and a home-button SE (root inset 0, where the 49pt bar is everything).
+    it.each([
+      ['Face ID, measured', ROOT_WINDOW_INSET, IN_TAB_INFERRED_BAR_INSET],
+      ['Face ID, unmeasured', ROOT_WINDOW_INSET, null],
+      ['home button, measured', 0, TAB_BAR_HEIGHT],
+      ['home button, unmeasured', 0, null],
+    ] as const)('clears the tray over the iOS 18 native bar (%s)', (_label, insetsBottom, measured) => {
+      const metrics = computeBottomChromeMetrics({
+        uiVariant: 'liquidGlass',
+        usesNativeTabBar: true,
+        insetsBottom,
+        insideTabs: true,
+        onAccessorySurface: true,
+        hasCurrentClimb: true,
+        nativeAccessoryPresented: false,
+        measuredTabContentInsetBottom: measured,
+      });
+      expect(metrics.jsQueueToolbarVisible).toBe(true);
+      expect(metrics.nativeAccessoryVisible).toBe(false);
+      expect(metrics.preSessionFooterBottom).toBeGreaterThanOrEqual(trayTopAboveScreenFloor(metrics, true));
     });
 
     it('clears the tray on an iPad in a narrow split (sidebar without the detail pane)', () => {
@@ -1080,7 +1325,7 @@ describe('computeBottomChromeMetrics', () => {
         restTimerArmed: true,
       });
 
-      expect(armed.fixedFooterBottom).toBe(MATERIAL_ACTIVE_CONTEXT_BAR_HEIGHT + REST_TIMER_RESERVE);
+      expect(armed.fixedFooterBottom).toBe(MATERIAL_MINI_PLAYER_CARD_RESERVE + REST_TIMER_RESERVE);
       expect(armed.inSessionListBottom).toBe(armed.fixedFooterBottom);
       expect(armed.preSessionFooterBottom).toBe(armed.fixedFooterBottom);
     });
@@ -1137,6 +1382,182 @@ describe('computeBottomChromeMetrics', () => {
       expect(metrics.jsQueueToolbarVisible).toBe(true);
       expect(metrics.preSessionFooterBottom).toBeGreaterThanOrEqual(pillTopAboveScreenFloor);
       expect(metrics.inSessionListBottom).toBeGreaterThanOrEqual(pillTopAboveScreenFloor);
+    });
+  });
+
+  describe('expanded-bar floor for list padding (bar re-expanding at the end of a list)', () => {
+    // DEVICE_VERIFIED (iPhone 17 Pro, iOS 26.5, Discover › playlist, a climb
+    // selected): the in-tab inset reads 83 with the bar minimized and 139 with it
+    // expanded. The platter is drawn on this pushed route, so 139 is the expanded
+    // bar plus the MiniPlayer even though the route is not an accessory surface.
+    const PUSHED_MINIMIZED_INSET = 83;
+    const PUSHED_EXPANDED_INSET = 139;
+    const pushedInputs = {
+      uiVariant: 'liquidGlass' as const,
+      usesNativeTabBar: true,
+      insetsBottom: ROOT_WINDOW_INSET,
+      insideTabs: true,
+      onAccessorySurface: false,
+      hasCurrentClimb: true,
+      nativeAccessoryPresented: false,
+    };
+
+    it('pads lists for the expanded bar while the bar is minimized', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...pushedInputs,
+        measuredTabContentInsetBottom: PUSHED_MINIMIZED_INSET,
+        expandedTabContentInsetBottom: PUSHED_EXPANDED_INSET,
+      });
+      expect(metrics.scrollBottomPadding).toBe(PUSHED_EXPANDED_INSET);
+      // Floating controls still follow the live bar down.
+      expect(metrics.floatingControlBottom).toBe(PUSHED_MINIMIZED_INSET);
+      expect(metrics.tabBarBottom).toBe(PUSHED_MINIMIZED_INSET);
+    });
+
+    it('stacks the rest pill reserve on top of the expanded floor', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...pushedInputs,
+        measuredTabContentInsetBottom: PUSHED_MINIMIZED_INSET,
+        expandedTabContentInsetBottom: PUSHED_EXPANDED_INSET,
+        restTimerArmed: true,
+      });
+      expect(metrics.scrollBottomPadding).toBe(PUSHED_EXPANDED_INSET + REST_TIMER_RESERVE);
+    });
+
+    it('adds nothing where the platter was never drawn (#3776 dead gap stays fixed)', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...pushedInputs,
+        measuredTabContentInsetBottom: IN_TAB_INFERRED_BAR_INSET,
+        expandedTabContentInsetBottom: IN_TAB_INFERRED_BAR_INSET,
+      });
+      expect(metrics.scrollBottomPadding).toBe(IN_TAB_INFERRED_BAR_INSET);
+    });
+
+    it('rejects an expanded reading below the window inset', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...pushedInputs,
+        measuredTabContentInsetBottom: PUSHED_MINIMIZED_INSET,
+        expandedTabContentInsetBottom: ROOT_WINDOW_INSET - 1,
+      });
+      expect(metrics.scrollBottomPadding).toBe(PUSHED_MINIMIZED_INSET);
+    });
+
+    it('ignores the floor off the native tab bar, where the JS bars sit outside every UIKit inset', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...pushedInputs,
+        uiVariant: 'material',
+        usesNativeTabBar: false,
+        expandedTabContentInsetBottom: PUSHED_EXPANDED_INSET,
+      });
+      expect(metrics.scrollBottomPadding).toBe(ROOT_WINDOW_INSET + MATERIAL_TAB_BAR_HEIGHT);
+    });
+  });
+
+  describe('trackExpandedTabContentInset', () => {
+    // Each call is one render: (previous, key, the store's current reading, the
+    // store's publish count). On device a new key arrives one render BEFORE the
+    // probe publishes the new shape's inset, still carrying the old reading.
+    const ROOT = '(tabs)/discover|climb';
+
+    it('keeps the largest reading published under one key', () => {
+      const start = trackExpandedTabContentInset(null, ROOT, 139, 4);
+      expect(start.bottom).toBeNull();
+      const minimized = trackExpandedTabContentInset(start, ROOT, 83, 5);
+      const expanded = trackExpandedTabContentInset(minimized, ROOT, 139, 6);
+      const minimizedAgain = trackExpandedTabContentInset(expanded, ROOT, 83, 7);
+      expect(minimized.bottom).toBe(83);
+      expect(minimizedAgain.bottom).toBe(139);
+      // Unchanged state comes back as the same object, so a ref holding it is stable.
+      expect(minimizedAgain).toBe(expanded);
+    });
+
+    it('ignores re-renders that carry no new publish', () => {
+      const start = trackExpandedTabContentInset(null, ROOT, 139, 4);
+      expect(trackExpandedTabContentInset(start, ROOT, 139, 4)).toBe(start);
+      expect(trackExpandedTabContentInset(start, ROOT, null, 5)).toBe(start);
+    });
+
+    it.each([
+      ['a push to a route without the platter', '(tabs)/discover/all|climb', 83],
+      ['clearing the climb', '(tabs)/discover|none', 83],
+      ['a rotation', '(tabs)/discover|climb|1376x1032', 76],
+    ])("starts over on %s without keeping the old shape's inset", (_label, nextKey, nextInset) => {
+      let state = trackExpandedTabContentInset(null, ROOT, 139, 1);
+      state = trackExpandedTabContentInset(state, ROOT, 139, 2);
+      expect(state.bottom).toBe(139);
+      // The key flips first; the store still holds the old 139.
+      state = trackExpandedTabContentInset(state, nextKey, 139, 2);
+      expect(state.bottom).toBeNull();
+      // Then the probe publishes the new shape's inset.
+      state = trackExpandedTabContentInset(state, nextKey, nextInset, 3);
+      expect(state.bottom).toBe(nextInset);
+    });
+
+    it('starts empty', () => {
+      expect(trackExpandedTabContentInset(null, 'home', null, 0).bottom).toBeNull();
+    });
+  });
+
+  describe('content column for root overlays (the rest pill)', () => {
+    const nativeTabInputs = {
+      uiVariant: 'liquidGlass' as const,
+      usesNativeTabBar: true,
+      insideTabs: true,
+      onAccessorySurface: true,
+      hasCurrentClimb: true,
+      nativeAccessoryPresented: true,
+      tabBarAtBottom: false,
+      restTimerArmed: true,
+    };
+
+    it('insets by the native iPad sidebar in landscape', () => {
+      // DEVICE_VERIFIED (iPad Pro 13-inch, iPadOS 27.0, landscape): in-tab insets
+      // { left: 280, right: 0, bottom: 20 }.
+      const metrics = computeBottomChromeMetrics({
+        ...nativeTabInputs,
+        insetsBottom: 20,
+        measuredTabContentInsetLeft: 280,
+        measuredTabContentInsetRight: 0,
+      });
+      expect(metrics.contentColumnLeft).toBe(280);
+      expect(metrics.contentColumnRight).toBe(0);
+    });
+
+    it('insets by the iPhone Duo rail when closed', () => {
+      // DEVICE_VERIFIED (iPhone Duo, iOS 27.1, closed): in-tab insets
+      // { left: 0, right: 84, bottom: 34 }.
+      const metrics = computeBottomChromeMetrics({
+        ...nativeTabInputs,
+        insetsBottom: 34,
+        measuredTabContentInsetLeft: 0,
+        measuredTabContentInsetRight: 84,
+      });
+      expect(metrics.contentColumnLeft).toBe(0);
+      expect(metrics.contentColumnRight).toBe(84);
+    });
+
+    it('spans the window before a measurement and off the native tab bar', () => {
+      expect(computeBottomChromeMetrics({ ...nativeTabInputs, insetsBottom: 34 }).contentColumnLeft).toBe(0);
+      const material = computeBottomChromeMetrics({
+        ...nativeTabInputs,
+        uiVariant: 'material',
+        usesNativeTabBar: false,
+        insetsBottom: 34,
+        measuredTabContentInsetLeft: 280,
+        measuredTabContentInsetRight: 84,
+      });
+      expect(material.contentColumnLeft).toBe(0);
+      expect(material.contentColumnRight).toBe(0);
+    });
+
+    it('spans the window on the JS sidebar shell, where no pill renders', () => {
+      const metrics = computeBottomChromeMetrics({
+        ...nativeTabInputs,
+        insetsBottom: 20,
+        usesSidebar: true,
+        measuredTabContentInsetLeft: 280,
+      });
+      expect(metrics.contentColumnLeft).toBe(0);
     });
   });
 });

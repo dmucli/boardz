@@ -6,6 +6,11 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
+    "./apple-ads-attribution": {
+      "types": "./src/apple-ads-attribution.ts",
+      "import": "./src/apple-ads-attribution.ts",
+      "default": "./src/apple-ads-attribution.ts"
+    },
     ".": {
       "types": "./src/index.ts",
       "import": "./src/index.ts",
@@ -30,6 +35,11 @@
       "types": "./src/sync-error-codes.ts",
       "import": "./src/sync-error-codes.ts",
       "default": "./src/sync-error-codes.ts"
+    },
+    "./client-identity": {
+      "types": "./src/client-identity.ts",
+      "import": "./src/client-identity.ts",
+      "default": "./src/client-identity.ts"
     },
     "./app-origins": {
       "types": "./src/app-origins.ts",

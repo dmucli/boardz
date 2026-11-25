@@ -1,4 +1,6 @@
+import { canAccessResource, requireResourceAccess } from '../../../services/privacy';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
+import { UNKNOWN_CLIENT } from '@boardsesh/shared-schema/client-identity';
 import { GraphQLError } from 'graphql';
 import { checkRateLimit, RateLimitError } from '../../../utils/rate-limiter';
 import { checkRateLimitRedis } from '../../../utils/redis-rate-limiter';
@@ -64,6 +66,11 @@ export const RATE_LIMIT_CONFIRM_CLIMB_ON_WALL_OP = 'confirmClimbOnWall';
 export const RATE_LIMIT_CONFIRM_CLIMB_ON_WALL = 600;
 export const RATE_LIMIT_SET_QUEUE_OP = 'setQueue';
 export const RATE_LIMIT_SET_QUEUE = 300;
+// setSessionRestCadence (#5382) gets its own bucket so a runaway rest timer can
+// never starve climb switching. A crew's clock sees a tick per climb, a fire per
+// rest and the odd pause or settings edit: a few calls a minute per climber.
+export const RATE_LIMIT_REST_CADENCE_OP = 'restCadence';
+export const RATE_LIMIT_REST_CADENCE = 240;
 
 /**
  * The TCP-peer bucket is a coarse direct-origin abuse backstop. Railway and
@@ -75,6 +82,21 @@ const ANONYMOUS_SOCKET_PEER_RATE_LIMIT_MULTIPLIER = 5;
 // Keep every Redis tier for one operation on the same window; changing this
 // means changing the windowMs passed to both calls below together.
 const RATE_LIMIT_WINDOW_MS = 60_000;
+
+/**
+ * Code on the refusal `requireSession` / `requireSessionWithReconnectGrace`
+ * throw: the operation's connection is not bound to a session. Clients branch
+ * on it (`isNotInSessionError` in @boardsesh/graphql-client); servers before it
+ * existed sent the same message with no code, so clients keep a message
+ * fallback and the message stays as it is.
+ */
+export const SESSION_REQUIRED_CODE = 'SESSION_REQUIRED';
+
+function sessionRequiredError(connectionId: string): GraphQLError {
+  return new GraphQLError(`Must be in a session to perform this operation (connectionId: ${connectionId})`, {
+    extensions: { code: SESSION_REQUIRED_CODE },
+  });
+}
 
 /**
  * Helper to require a session context.
@@ -90,7 +112,7 @@ export function requireSession(ctx: ConnectionContext): string {
       connectionId: ctx.connectionId,
       reason: 'no-session-id' satisfies SessionMembershipDenialReason,
     });
-    throw new Error(`Must be in a session to perform this operation (connectionId: ${ctx.connectionId})`);
+    throw sessionRequiredError(ctx.connectionId);
   }
   return ctx.sessionId;
 }
@@ -176,7 +198,7 @@ export async function requireSessionWithReconnectGrace(
   logger.warn('[Auth] requireSessionWithReconnectGrace failed after grace window', {
     connectionId: ctx.connectionId,
   });
-  throw new Error(`Must be in a session to perform this operation (connectionId: ${ctx.connectionId})`);
+  throw sessionRequiredError(ctx.connectionId);
 }
 
 /**
@@ -268,6 +290,7 @@ export async function requireSessionMember(
   // Durable membership fast-path (authenticated WS connections only). See the
   // JSDoc above for why this short-circuits the retry loop.
   if (ctx.transport !== 'http' && ctx.userId && (await isDurableSessionMember(ctx.userId, sessionId))) {
+    await requireResourceAccess('session', sessionId, ctx.userId);
     return;
   }
 
@@ -275,6 +298,7 @@ export async function requireSessionMember(
     // First check local context (fast path for same-instance)
     const latestCtx = getContext(ctx.connectionId);
     if (latestCtx?.sessionId === sessionId) {
+      await requireResourceAccess('session', sessionId, ctx.userId);
       return; // Success - session matches locally
     }
 
@@ -286,6 +310,7 @@ export async function requireSessionMember(
     if (distributedState) {
       const isInSession = await distributedState.isConnectionInSession(ctx.connectionId, sessionId);
       if (isInSession) {
+        await requireResourceAccess('session', sessionId, ctx.userId);
         return; // Success - session matches in distributed state
       }
     }
@@ -306,10 +331,15 @@ export async function requireSessionMember(
   if (distributedState) {
     const isInSession = await distributedState.isConnectionInSession(ctx.connectionId, sessionId);
     if (isInSession) {
+      await requireResourceAccess('session', sessionId, ctx.userId);
       return; // Success via distributed state
     }
   }
 
+  // A first JOIN may create the durable session while a subscription waits.
+  // Check its current policy before any success or membership-error response,
+  // rather than rejecting that legitimate creation race before the retry loop.
+  await requireResourceAccess('session', sessionId, ctx.userId);
   if (!finalCtx?.sessionId) {
     // Benign, high-volume race (stale subscriber / anonymous reconnect / slow
     // join). Logged at `debug` so it stays out of prod error/warn dashboards
@@ -375,6 +405,7 @@ export async function requireSessionMember(
  * error).
  */
 export async function isSessionMember(ctx: ConnectionContext, sessionId: string): Promise<boolean> {
+  if (!(await canAccessResource('session', sessionId, ctx.userId))) return false;
   // HTTP requests are stateless — never in the local context map, never in
   // distributed state — so the connection-based checks can't match; skip
   // straight to the durable record.
@@ -515,6 +546,16 @@ export async function applyRateLimit(ctx: ConnectionContext, limit?: number, ope
     }
   } catch (error) {
     if (error instanceof RateLimitError) {
+      // Attribution only: `client` says which app hit the limit. The bucket
+      // keys above deliberately ignore it, so one user's budget is shared
+      // across every app they use.
+      logger.warn('[rate-limit] rejected', {
+        operation,
+        client: ctx.clientIdentityRaw ?? UNKNOWN_CLIENT,
+        userId: ctx.userId,
+        clientIp: ctx.clientIp,
+        transport: ctx.transport,
+      });
       throw new GraphQLError(error.message, {
         extensions: { code: 'RATE_LIMITED', operation, retryAfterSeconds: error.retryAfterSeconds },
       });

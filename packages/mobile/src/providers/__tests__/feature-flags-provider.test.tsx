@@ -9,6 +9,7 @@ import {
   useBoardseshGradeEnabled,
   useFeatureFlag,
   useFeatureFlags,
+  useGpuClimbOverlayEnabled,
   useOfflineDownloadProgressEnabled,
   useOfflineDownloadsEnabled,
   useSnapshotBootstrapEnabled,
@@ -50,6 +51,66 @@ describe('FeatureFlagsProvider', () => {
     const wrapper = ({ children }: { children: ReactNode }) => <FeatureFlagsProvider>{children}</FeatureFlagsProvider>;
     const { result } = renderHook(() => useFeatureFlags(), { wrapper });
     expect(result.current).toEqual({});
+  });
+
+  it('ships GPU rendering without flags or a development build, ignoring old experiment overrides', () => {
+    vi.stubGlobal('__DEV__', false);
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '0');
+    try {
+      setFeatureFlagOverride('gpu-climb-overlay-experiment', false);
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <FeatureFlagsProvider flags={{ 'gpu-climb-overlay-experiment': false }}>{children}</FeatureFlagsProvider>
+      );
+      const { result } = renderHook(() => useGpuClimbOverlayEnabled(), { wrapper });
+      expect(result.current).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('keeps GPU availability independent of capture configuration', () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    try {
+      const { result } = renderHook(() => useGpuClimbOverlayEnabled());
+      expect(result.current).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('applies live global disables to the shipped Homewall path', () => {
+    let enabled = true;
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <FeatureFlagsProvider flags={{ 'aura-gpu-enabled': enabled }}>{children}</FeatureFlagsProvider>
+    );
+    const { result, rerender } = renderHook(() => useGpuClimbOverlayEnabled('kilter', 8), { wrapper });
+    expect(result.current).toBe(true);
+    enabled = false;
+    rerender();
+    expect(result.current).toBe(false);
+  });
+
+  it('requires an explicit family policy in addition to a true flag', () => {
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <FeatureFlagsProvider
+        flags={{ 'aura-gpu-enabled': true }}
+        payloads={{
+          'aura-gpu-enabled': { version: 1, enabledFamilies: ['tension'], disabledFamilies: ['kilter'] },
+        }}
+      >
+        {children}
+      </FeatureFlagsProvider>
+    );
+    const { result } = renderHook(
+      () => ({
+        tension: useGpuClimbOverlayEnabled('tension', 1),
+        kilter: useGpuClimbOverlayEnabled('kilter', 8),
+        woods: useGpuClimbOverlayEnabled('woods', 1),
+      }),
+      { wrapper },
+    );
+    expect(result.current).toEqual({ tension: true, kilter: false, woods: false });
   });
 
   it('exposes flags passed via the `flags` prop', () => {

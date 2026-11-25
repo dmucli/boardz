@@ -20,7 +20,6 @@ vi.mock('react-i18next', () => ({
     i18n: { language: 'en-US' },
   }),
 }));
-vi.mock('@/app/components/board-renderer/board-renderer', () => ({ default: () => <div data-testid="board-art" /> }));
 
 const gymAnchors = () =>
   screen.getAllByRole('link').filter((anchor) => anchor.getAttribute('href')?.startsWith('/gym/'));
@@ -29,7 +28,7 @@ describe('PopularBoardRail physical identity', () => {
   it('links the board name and app action to the same named installation', () => {
     render(<PopularBoardRail boards={[discoveryBoard()]} />);
     expect(screen.getByRole('link', { name: 'Training room Kilter' }).getAttribute('href')).toBe('/b/northside-kilter');
-    expect(screen.getByRole('link', { name: 'Open this board' }).getAttribute('href')).toBe(
+    expect(screen.getByRole('link', { name: 'Climb on this board' }).getAttribute('href')).toBe(
       `${APP_URL}/b/northside-kilter/40/list`,
     );
     expect(screen.getByRole('link', { name: 'Northside Boulders' }).getAttribute('href')).toBe(
@@ -50,17 +49,16 @@ describe('PopularBoardRail physical identity', () => {
       />,
     );
     expect(screen.getByRole('link', { name: 'Southside Kilter' }).getAttribute('href')).toBe('/b/southside-kilter');
-    expect(screen.getAllByRole('link', { name: 'Open this board' }).map((link) => link.getAttribute('href'))).toEqual([
-      `${APP_URL}/b/northside-kilter/40/list`,
-      `${APP_URL}/b/southside-kilter/40/list`,
-    ]);
+    expect(
+      screen.getAllByRole('link', { name: 'Climb on this board' }).map((link) => link.getAttribute('href')),
+    ).toEqual([`${APP_URL}/b/northside-kilter/40/list`, `${APP_URL}/b/southside-kilter/40/list`]);
   });
 
   it('retains a named board when its artwork is unsupported', () => {
     render(<PopularBoardRail boards={[discoveryBoard({ boardType: 'future-board', layoutId: 99999 })]} />);
     expect(screen.getByRole('link', { name: 'Training room Kilter' })).toBeTruthy();
-    expect(screen.queryByTestId('board-art')).toBeNull();
-    expect(screen.getByRole('img', { name: 'Board preview: Training room Kilter' })).toBeTruthy();
+    expect(screen.getByRole('img', { name: 'Board preview: Training room Kilter' }).querySelector('img')).toBeNull();
+    expect(screen.getByText('future-board')).toBeTruthy();
   });
 
   it('labels the selected snapshot and uses its angle without claiming a live feed', () => {
@@ -75,7 +73,7 @@ describe('PopularBoardRail physical identity', () => {
     );
     expect(screen.getByText('Kilter · 35°')).toBeTruthy();
     expect(screen.getByText('Selected climb: Night shift')).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'Open this board' }).getAttribute('href')).toBe(
+    expect(screen.getByRole('link', { name: 'Climb on this board' }).getAttribute('href')).toBe(
       `${APP_URL}/b/northside-kilter/35/list`,
     );
     expect(screen.getByText(/Previews are snapshots, not live updates/)).toBeTruthy();

@@ -1,3 +1,4 @@
+import { climbReferenceReadableCondition } from '../privacy';
 import { sql, type SQLWrapper } from 'drizzle-orm';
 import { boardClimbNeighbors, boardClimbs, boardClimbStats, boardDifficultyGrades } from '../../schema/index';
 import { rowsOf } from '../util/rows';
@@ -5,7 +6,7 @@ import { rowsOf } from '../util/rows';
 /**
  * Materialised similar climbs (`board_climb_neighbors`): the pure scoring core
  * the nightly job runs, and the read path the `similarClimbs` resolver serves
- * non-admin callers from. Design and runbook: docs/similar-climbs.md.
+ * non-admin callers from. Design and runbook: docs/data/similar-climbs.md.
  */
 
 /** Neighbours kept per climb. The play drawer asks for 12, the web strip for 10. */
@@ -194,6 +195,7 @@ export type MaterializedSimilarClimb = {
   qualityAverage: number | null;
   ascensionistCount: number | null;
   compatibleSizeIds: number[];
+  requiredSetIds?: number[] | null;
   characteristics: string[] | null;
   similarity: number;
   sharedHoldCount: number;
@@ -202,6 +204,7 @@ export type MaterializedSimilarClimb = {
 };
 
 export type MaterializedSimilarClimbsArgs = {
+  viewerUserId?: string;
   boardType: string;
   layoutId: number;
   climbUuid: string;
@@ -223,6 +226,7 @@ type MaterializedRow = {
   layout_id: number;
   frames: string | null;
   compatible_size_ids: number[] | null;
+  required_set_ids: number[] | null;
   characteristics: string[] | null;
   difficulty_name: string | null;
   quality_average: number | string | null;
@@ -244,7 +248,7 @@ type MaterializedRow = {
  */
 export async function getMaterializedSimilarClimbs(
   executor: ExecuteConnection,
-  { boardType, layoutId, climbUuid, threshold, limit, sizeId, statsAngle }: MaterializedSimilarClimbsArgs,
+  { boardType, layoutId, climbUuid, threshold, limit, sizeId, statsAngle, viewerUserId }: MaterializedSimilarClimbsArgs,
 ): Promise<MaterializedSimilarClimb[]> {
   const safeThreshold = Math.max(0, Math.min(1, threshold));
   const safeLimit = Math.max(1, Math.min(200, limit));
@@ -259,6 +263,7 @@ export async function getMaterializedSimilarClimbs(
       ${boardClimbs.layoutId} AS layout_id,
       ${boardClimbs.frames} AS frames,
       ${boardClimbs.compatibleSizeIds} AS compatible_size_ids,
+      ${boardClimbs.requiredSetIds} AS required_set_ids,
       ${boardClimbs.characteristics} AS characteristics,
       ${boardDifficultyGrades.boulderName} AS difficulty_name,
       ${boardClimbStats.qualityAverage} AS quality_average,
@@ -285,6 +290,7 @@ export async function getMaterializedSimilarClimbs(
       AND ${boardClimbs.isListed} IS NOT FALSE
       AND ${boardClimbs.isHidden} = FALSE
       ${sizeId !== undefined ? sql`AND COALESCE(${boardClimbs.compatibleSizeIds}, '{}'::int[]) @> ARRAY[${sizeId}]::int[]` : sql``}
+      AND ${climbReferenceReadableCondition({ boardType: sql`${boardType}`, climbUuid: sql`${climbUuid}` }, viewerUserId)}
       AND ${similarity} >= ${safeThreshold}
     ORDER BY similarity DESC, COALESCE(${boardClimbStats.ascensionistCount}, 0) DESC, ${boardClimbs.uuid} ASC
     LIMIT ${safeLimit}
@@ -301,6 +307,7 @@ export async function getMaterializedSimilarClimbs(
     qualityAverage: row.quality_average == null ? null : Number(row.quality_average),
     ascensionistCount: row.ascensionist_count == null ? null : Number(row.ascensionist_count),
     compatibleSizeIds: row.compatible_size_ids ?? [],
+    requiredSetIds: row.required_set_ids ?? null,
     // `?? null`, not `?? []`: null is a climb whose rules were never recorded,
     // which the Woods drawer prints differently from "default rules" (#5214).
     characteristics: row.characteristics ?? null,

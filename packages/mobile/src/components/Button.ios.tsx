@@ -6,7 +6,8 @@
 //                  and EVERY iOS version — the brand CTA never goes translucent, so
 //                  it can't wash out over board art or in near-black dark mode, and
 //                  it never touches the iOS-26 `#available` glass gate.
-//   outlined/    → glass-as-guest: a neutral Liquid Glass capsule on an opaque
+//   outlined/    → glass-as-guest: a neutral Liquid Glass capsule, label-coloured
+//                  text (never violet, #7695), on an opaque
 //   tonal          surface on iOS 26 (`buttonStyle('glass')`); an EXPLICIT
 //                  `bordered` fallback on iOS < 26 (we branch on
 //                  `useGlassCapability()` rather than trusting @expo/ui's implicit
@@ -26,10 +27,12 @@ import { Host } from '@expo/ui';
 import { Button as SwiftUIButton, HStack, Image, ProgressView, Text } from '@expo/ui/swift-ui';
 import {
   accessibilityLabel as accessibilityLabelModifier,
+  accessibilityIdentifier,
   buttonBorderShape,
   buttonStyle,
   controlSize,
   disabled as disabledModifier,
+  dynamicTypeSize,
   font,
   foregroundStyle,
   frame,
@@ -37,19 +40,23 @@ import {
   type ModifierConfig,
 } from '@expo/ui/swift-ui/modifiers';
 import { useGlassCapability } from '../hooks/use-glass-capability';
+import { useBoldText } from '../hooks/use-bold-text';
 import { useTheme } from '../providers/theme-provider';
 import { brandAccentColor } from '../theme/expo-ui-modifiers';
 import { overlays } from '../theme/tokens';
-import { buttonFillAxes, buttonMatchContents, makeButtonPressHandler } from './Button.logic';
+import {
+  buttonFillAxes,
+  buttonLabelWeight,
+  buttonMatchContents,
+  dynamicTypeSizeCap,
+  iosControlSize,
+  makeButtonPressHandler,
+  resolveButtonMaxFontScale,
+  resolveIosButtonStyle,
+} from './Button.logic';
 import { useButtonSurface } from './Button.surface';
 import { iconMap } from './icon-map';
 import type { ButtonProps, ButtonSize } from './Button.types';
-
-const CONTROL_SIZE: Record<ButtonSize, 'small' | 'regular' | 'large'> = {
-  small: 'small',
-  medium: 'regular',
-  large: 'large',
-};
 
 const TEXT_STYLE: Record<ButtonSize, 'footnote' | 'callout' | 'body'> = {
   small: 'footnote',
@@ -71,10 +78,13 @@ export function Button({
   minHeight = 44,
   over,
   role = 'default',
+  maxFontSizeMultiplier,
+  ignoreContainerSafeArea = false,
   testID,
   style,
 }: ButtonProps) {
-  const { brandColors, radii, colorScheme } = useTheme();
+  const { brandColors, radii, colorScheme, systemColors } = useTheme();
+  const boldText = useBoldText();
   const supportsGlass = useGlassCapability();
   const surfaceFromContext = useButtonSurface();
   const effectiveOver = over ?? surfaceFromContext;
@@ -89,32 +99,35 @@ export function Button({
   // content (label/icon/spinner) colour. Destructive lets SwiftUI's `role` paint
   // the system red, so we skip the explicit tint/foregroundStyle there — an
   // explicit colour would defeat the red.
-  let styleModifier: ModifierConfig;
+  const nativeStyle = resolveIosButtonStyle({
+    variant,
+    overContent: effectiveOver === 'content',
+    supportsGlass: supportsGlass && effectiveOver !== 'glass',
+  });
+  // One source for the drawn style, so the label weight below can't disagree
+  // with what SwiftUI paints.
+  const styleModifier: ModifierConfig = buttonStyle(nativeStyle);
   let fillTint: string | undefined;
   let contentColor: string;
   if (variant === 'filled') {
-    styleModifier = buttonStyle('borderedProminent');
     fillTint = fillColor;
     contentColor = brandColors.onPrimary;
   } else if (variant === 'text') {
-    styleModifier = buttonStyle('borderless');
     fillTint = undefined;
     contentColor = effectiveOver === 'content' ? overlays.onScrim : accentColor;
+  } else if (effectiveOver === 'content') {
+    // outlined / tonal over board art: a solid scrim capsule.
+    fillTint = overlays.scrim;
+    contentColor = overlays.onScrim;
+  } else if (supportsGlass && effectiveOver !== 'glass') {
+    // Neutral glass with a neutral label (#7695): violet stays for links,
+    // status and selection, so the secondary button never reads as a link.
+    fillTint = undefined;
+    contentColor = tintColor ?? (systemColors.label as string);
   } else {
-    // outlined / tonal — the middle tier.
-    if (effectiveOver === 'content') {
-      styleModifier = buttonStyle('borderedProminent');
-      fillTint = overlays.scrim;
-      contentColor = overlays.onScrim;
-    } else if (supportsGlass) {
-      styleModifier = buttonStyle('glass');
-      fillTint = undefined; // neutral glass; the brand reads via the label colour
-      contentColor = accentColor;
-    } else {
-      styleModifier = buttonStyle('bordered');
-      fillTint = accentColor;
-      contentColor = accentColor;
-    }
+    // `bordered`, tinted with the label colour: a neutral capsule, as on glass.
+    fillTint = tintColor ?? (systemColors.label as string);
+    contentColor = tintColor ?? (systemColors.label as string);
   }
 
   // Which axes the caller sized for us: a positive `flex`/`width: '100%'` across,
@@ -126,18 +139,35 @@ export function Button({
     ...(fills.height ? { maxHeight: Infinity } : {}),
   };
 
+  const labelFont = font({
+    textStyle: TEXT_STYLE[size],
+    weight: boldText
+      ? buttonLabelWeight(nativeStyle) === 'semibold'
+        ? 'bold'
+        : 'medium'
+      : buttonLabelWeight(nativeStyle),
+  });
   const modifiers: ModifierConfig[] = [
     styleModifier,
     buttonBorderShape('roundedRectangle', radii.button),
-    controlSize(CONTROL_SIZE[size]),
-    font({ textStyle: TEXT_STYLE[size], weight: 'semibold' }),
+    controlSize(iosControlSize(size, style)),
+    labelFont,
     frame({ minHeight, ...fillFrame }),
     disabledModifier(disabled || loading),
     accessibilityLabelModifier(accessibilityLabel ?? title),
+    ...(testID ? [accessibilityIdentifier(testID)] : []),
+    // Content reaches the full AX range; fixed chrome opts into its own cap.
+    dynamicTypeSize({ max: dynamicTypeSizeCap(resolveButtonMaxFontScale(maxFontSizeMultiplier)) }),
   ];
   if (!isDestructive) {
-    if (fillTint) modifiers.push(tint(fillTint));
-    modifiers.push(foregroundStyle(contentColor));
+    if (variant === 'text') {
+      // A fixed foreground keeps disabled text accent-coloured. Tint lets the
+      // native borderless style draw its disabled label, as Settings does.
+      modifiers.push(tint(contentColor));
+    } else {
+      if (fillTint) modifiers.push(tint(fillTint));
+      modifiers.push(foregroundStyle(contentColor));
+    }
   }
 
   // The spinner follows the content colour, except destructive (whose content is
@@ -150,16 +180,17 @@ export function Button({
   // that overlaps it. Keyboard avoidance belongs to the React Native layout
   // (the sheets' KeyboardAvoidingView), not to each button: a per-button inset
   // only squeezes the label, and glass and borderedProminent respond to that
-  // squeeze differently. That is the suspected cause of the tick sheet's
-  // Attempt sitting lower than Flash with the keyboard up (#5663, unproven on
-  // a device). React Native does not fully clear the keyboard everywhere yet:
-  // at the tick sheet's 65% detent the action row still sits ~4pt under the
-  // keyboard edge until #5772 raises the sheet to 92% on note focus. With this
-  // prop that sliver is covered instead of re-laid-out.
+  // squeeze differently (#5663).
+  //
+  // `"all"` (opt-in, `ignoreContainerSafeArea`): a host that mounts while it
+  // is scrolled above the top of the screen also takes the container's
+  // safe-area inset and keeps it, so its label draws below its own frame once
+  // it scrolls back. Seen on a button in the Climbs list header that mounted
+  // while the list was scrolled, on an iPhone SE simulator.
   return (
     <Host
       matchContents={buttonMatchContents(style)}
-      ignoreSafeArea="keyboard"
+      ignoreSafeArea={ignoreContainerSafeArea ? 'all' : 'keyboard'}
       colorScheme={colorScheme}
       style={style}
       testID={testID}
@@ -172,7 +203,10 @@ export function Button({
           {loading ? (
             <ProgressView modifiers={[tint(spinnerColor)]} />
           ) : icon ? (
-            <Image systemName={iconMap[icon].ios} />
+            // The label's own font, so the symbol is sized by the button's size
+            // and Dynamic Type, as a SwiftUI Label is. Without one, @expo/ui
+            // draws every symbol at a fixed 24pt.
+            <Image systemName={iconMap[icon].ios} modifiers={[labelFont]} />
           ) : null}
           <Text>{title}</Text>
         </HStack>

@@ -1,4 +1,4 @@
-import { and, eq, desc, sql } from 'drizzle-orm';
+import { and, eq, desc, asc, sql } from 'drizzle-orm';
 import type {
   ConnectionContext,
   NewClimbFeedInput,
@@ -40,6 +40,9 @@ export const newClimbSubscriptionResolvers = {
         return { items: [], totalCount: 0, hasMore: false };
       }
 
+      // A published, listed climb is public whoever set it, and so is who set
+      // it: every viewer gets the account's name and avatar, a private
+      // account's included.
       const climbs = await db
         .select({
           uuid: dbSchema.boardClimbs.uuid,
@@ -51,9 +54,8 @@ export const newClimbSubscriptionResolvers = {
           angle: resolvedClimbAngleSql,
           frames: dbSchema.boardClimbs.frames,
           createdAt: dbSchema.boardClimbs.createdAt,
-          setterDisplayName: sql<
-            string | null
-          >`COALESCE(${dbSchema.userProfiles.displayName}, ${dbSchema.users.name}, ${dbSchema.boardClimbs.setterUsername})`,
+          setterDisplayName: sql<string | null>`COALESCE(${dbSchema.userProfiles.displayName}, ${dbSchema.users.name},
+            ${dbSchema.boardClimbs.setterUsername})`,
           setterAvatarUrl: sql<string | null>`COALESCE(${dbSchema.userProfiles.avatarUrl}, ${dbSchema.users.image})`,
           difficultyName: dbSchema.boardDifficultyGrades.boulderName,
         })
@@ -85,7 +87,7 @@ export const newClimbSubscriptionResolvers = {
             eq(dbSchema.boardClimbs.isListed, true),
           ),
         )
-        .orderBy(desc(dbSchema.boardClimbs.createdAt))
+        .orderBy(desc(dbSchema.boardClimbs.createdAt), asc(dbSchema.boardClimbs.uuid))
         .limit(limit)
         .offset(offset);
 

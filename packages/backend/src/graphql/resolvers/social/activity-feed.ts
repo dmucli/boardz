@@ -1,15 +1,38 @@
-import { eq, and, desc, sql, or, isNull } from 'drizzle-orm';
+import { eq, and, desc, sql, or, isNull, inArray } from 'drizzle-orm';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
-import { sprayClimbVisibilityCondition, sprayReferenceVisibilityCondition } from '@boardsesh/db/queries';
+import {
+  sprayClimbVisibilityCondition,
+  sprayReferenceClimbExistsCondition,
+  sprayReferenceVisibilityCondition,
+} from '@boardsesh/db/queries';
 import { withSerialPlan } from '@boardsesh/db/queries';
 import { requireAuthenticated, validateInput, resolveClimbNoMatch } from '../shared/helpers';
 import { ActivityFeedInputSchema } from '../../../validation/schemas';
 import { encodeCursor, decodeCursor } from '../../../utils/feed-cursor';
+import { anonymousOnBoardUserIds, canAccessResource, visibleBoardIdentityUuids } from '../../../services/privacy';
+import { redactBoardIdentity } from '../../../services/board-session-privacy';
+import {
+  entityActorVisibilityCondition,
+  socialEntityPrivacyCondition,
+  commentPrivacyCondition,
+  tickPrivacyCondition,
+} from '../shared/activity-privacy';
 
-function mapFeedItemToGraphQL(row: typeof dbSchema.feedItems.$inferSelect, commentCount = 0) {
+/** The climb uuid a feed row's metadata names, if any. Follows and sessions name none. */
+function feedRowClimbUuid(row: typeof dbSchema.feedItems.$inferSelect): string | null {
+  const climbUuid = row.metadata?.climbUuid;
+  return typeof climbUuid === 'string' && climbUuid.length > 0 ? climbUuid : null;
+}
+
+function mapFeedItemToGraphQL(
+  row: typeof dbSchema.feedItems.$inferSelect,
+  commentCount = 0,
+  liveNoMatchByClimbUuid: ReadonlyMap<string, boolean> = new Map(),
+) {
   const meta = row.metadata || {};
+  const climbUuid = feedRowClimbUuid(row);
   return {
     id: String(row.id),
     type: row.type,
@@ -31,7 +54,9 @@ function mapFeedItemToGraphQL(row: typeof dbSchema.feedItems.$inferSelect, comme
     commentBody: (meta.commentBody as string) ?? null,
     isMirror: (meta.isMirror as boolean) ?? null,
     isBenchmark: (meta.isBenchmark as boolean) ?? null,
-    isNoMatch: (meta.isNoMatch as boolean) ?? null,
+    // The live climb's rule, not the one written at fan-out (#5263). The
+    // snapshot is only the fallback for a row whose climb is gone.
+    isNoMatch: (climbUuid ? liveNoMatchByClimbUuid.get(climbUuid) : undefined) ?? (meta.isNoMatch as boolean) ?? null,
     difficulty: (meta.difficulty as number) ?? null,
     difficultyName: (meta.difficultyName as string) ?? null,
     quality: (meta.quality as number) ?? null,
@@ -42,7 +67,10 @@ function mapFeedItemToGraphQL(row: typeof dbSchema.feedItems.$inferSelect, comme
   };
 }
 
-async function getCommentCountMap(rows: (typeof dbSchema.feedItems.$inferSelect)[]): Promise<Map<string, number>> {
+async function getCommentCountMap(
+  rows: (typeof dbSchema.feedItems.$inferSelect)[],
+  viewerId: string,
+): Promise<Map<string, number>> {
   const countableRows = rows.filter((row) => row.entityType === 'tick' || row.entityType === 'climb');
   if (countableRows.length === 0) return new Map();
 
@@ -56,6 +84,7 @@ async function getCommentCountMap(rows: (typeof dbSchema.feedItems.$inferSelect)
     .where(
       and(
         isNull(dbSchema.comments.deletedAt),
+        commentPrivacyCondition(viewerId),
         or(
           ...countableRows.map((row) =>
             and(eq(dbSchema.comments.entityType, row.entityType), eq(dbSchema.comments.entityId, row.entityId)),
@@ -66,6 +95,34 @@ async function getCommentCountMap(rows: (typeof dbSchema.feedItems.$inferSelect)
     .groupBy(dbSchema.comments.entityType, dbSchema.comments.entityId);
 
   return new Map(commentRows.map((row) => [`${row.entityType}:${row.entityId}`, Number(row.commentCount)]));
+}
+
+/**
+ * The current no-match rule of every climb a page of feed rows names.
+ *
+ * `feed_items.metadata` is written once at fan-out and never refreshed, so its
+ * `isNoMatch` keeps whatever the rule was then: rows fanned out before #5261 read
+ * the description alone, and a setter can change the rule afterwards. Same
+ * read-time treatment as `activityFeed`'s hidden-climb gate, but after the page is cut:
+ * at most one primary-key probe per row, so the feed query's plan is untouched.
+ */
+async function getLiveNoMatchMap(rows: (typeof dbSchema.feedItems.$inferSelect)[]): Promise<Map<string, boolean>> {
+  const climbUuids = [...new Set(rows.map(feedRowClimbUuid).filter((uuid): uuid is string => uuid !== null))];
+  if (climbUuids.length === 0) return new Map();
+
+  const climbs = await db
+    .select({
+      uuid: dbSchema.boardClimbs.uuid,
+      boardType: dbSchema.boardClimbs.boardType,
+      characteristics: dbSchema.boardClimbs.characteristics,
+      description: dbSchema.boardClimbs.description,
+    })
+    .from(dbSchema.boardClimbs)
+    .where(inArray(dbSchema.boardClimbs.uuid, climbUuids));
+
+  return new Map(
+    climbs.map((climb) => [climb.uuid, resolveClimbNoMatch(climb.boardType, climb.characteristics, climb.description)]),
+  );
 }
 
 type TickJoinRow = {
@@ -141,7 +198,26 @@ export const activityFeedQueries = {
     const limit = validatedInput.limit ?? 20;
 
     // Build base conditions
-    const conditions = [eq(dbSchema.feedItems.recipientId, myUserId)];
+    const conditions = [
+      eq(dbSchema.feedItems.recipientId, myUserId),
+      // A row names its actor only to a viewer who may see that account's
+      // activity, except a `new_climb` row naming the author of that published,
+      // listed climb, who is public with it: a setter name's followers see its
+      // new climbs whoever set them. The climb's draft rule and spray-wall rule
+      // are in socialEntityPrivacyCondition below.
+      entityActorVisibilityCondition(
+        dbSchema.feedItems.entityType,
+        dbSchema.feedItems.entityId,
+        dbSchema.feedItems.actorId,
+        myUserId,
+        dbSchema.feedItems.type,
+      ),
+      // A feed is discovery: a comment on an unlisted session reaches only the
+      // people who would see that session listed, never its link holders.
+      socialEntityPrivacyCondition(dbSchema.feedItems.entityType, dbSchema.feedItems.entityId, myUserId, {
+        discovery: true,
+      }),
+    ];
 
     // Rows fanned out before a climb was hidden by the community still sit in
     // feed_items; every tick / climb / proposal row carries the climb's uuid in
@@ -177,7 +253,28 @@ export const activityFeedQueries = {
       ),
     );
 
+    // The reference form passes a row whose climb has gone, and a spray climb
+    // does go: `deleteDraftClimb` and account deletion hard-delete a draft. A
+    // comment on a proposal fans out with the climb's name, frames and layout id
+    // in its metadata and no wall or draft check (`getProposalContextMetadata`),
+    // so after the delete that row reached a follower who could never see the
+    // wall (#5981). Keyed on the row's OWN board type here, because that is what
+    // says "spray" once the climb cannot. A row with no climb uuid (a follow, a
+    // session) and every row on another board pass through.
+    conditions.push(
+      sql`(
+        ${dbSchema.feedItems.metadata}->>'climbUuid' IS NULL
+        OR ${sprayReferenceClimbExistsCondition({
+          boardType: sql`${dbSchema.feedItems.metadata}->>'boardType'`,
+          climbUuid: sql`${dbSchema.feedItems.metadata}->>'climbUuid'`,
+        })}
+      )`,
+    );
+
     if (validatedInput.boardUuid) {
+      // A feed for one wall is that wall's activity: it needs the wall itself.
+      if (!(await canAccessResource('board', validatedInput.boardUuid, myUserId)))
+        return { items: [], cursor: null, hasMore: false };
       conditions.push(eq(dbSchema.feedItems.boardUuid, validatedInput.boardUuid));
     }
 
@@ -206,9 +303,22 @@ export const activityFeedQueries = {
 
     const hasMore = rows.length > limit;
     const resultRows = hasMore ? rows.slice(0, limit) : rows;
-    const commentCountMap = await getCommentCountMap(resultRows);
+    const [commentCountMap, liveNoMatchByClimbUuid, visibleBoardUuids] = await Promise.all([
+      getCommentCountMap(resultRows, myUserId),
+      getLiveNoMatchMap(resultRows),
+      // Each row follows its author; the wall it names is shown only to people
+      // who may see that wall.
+      visibleBoardIdentityUuids(
+        resultRows.map((row) => row.boardUuid),
+        myUserId,
+      ),
+    ]);
     const items = resultRows.map((row) =>
-      mapFeedItemToGraphQL(row, commentCountMap.get(`${row.entityType}:${row.entityId}`) ?? 0),
+      mapFeedItemToGraphQL(
+        redactBoardIdentity(row, !!row.boardUuid && visibleBoardUuids.has(row.boardUuid)),
+        commentCountMap.get(`${row.entityType}:${row.entityId}`) ?? 0,
+        liveNoMatchByClimbUuid,
+      ),
     );
 
     let nextCursor: string | null = null;
@@ -230,10 +340,14 @@ export const activityFeedQueries = {
     const limit = validatedInput.limit ?? 20;
 
     // Build conditions - only successful ascents for trending
-    const conditions = [sql`${dbSchema.boardseshTicks.status} IN ('flash', 'send')`];
+    const conditions = [
+      sql`${dbSchema.boardseshTicks.status} IN ('flash', 'send')`,
+      tickPrivacyCondition(ctx.isAuthenticated ? ctx.userId : null),
+    ];
 
     // Board filter: require an active board and scope to ticks recorded for it.
     let layoutIdFilter: number | null = null;
+    let boardIdFilter: number | null = null;
     if (validatedInput.boardUuid) {
       const board = await db
         .select({
@@ -246,13 +360,18 @@ export const activityFeedQueries = {
         .limit(1)
         .then((rows) => rows[0]);
 
-      if (!board) {
+      // A wall's trending list is the wall's activity, so it needs the wall.
+      if (
+        !board ||
+        !(await canAccessResource('board', validatedInput.boardUuid, ctx.isAuthenticated ? ctx.userId : null))
+      ) {
         return { items: [], cursor: null, hasMore: false };
       }
 
       conditions.push(eq(dbSchema.boardseshTicks.boardId, board.id));
       conditions.push(eq(dbSchema.boardseshTicks.boardType, board.boardType));
       layoutIdFilter = board.layoutId;
+      boardIdFilter = board.id;
     }
 
     if (layoutIdFilter !== null) {
@@ -345,7 +464,23 @@ export const activityFeedQueries = {
 
     const hasMore = results.length > limit;
     const resultRows = hasMore ? results.slice(0, limit) : results;
-    const items = resultRows.map(mapTickRowToFeedItem);
+    // A wall's trending list is board-facing: a climber who stays anonymous on
+    // boards they don't own keeps the send here without name, avatar or note
+    // when this wall is not theirs. One query for the page.
+    const anonymousActors =
+      boardIdFilter === null
+        ? new Set<string>()
+        : await anonymousOnBoardUserIds(
+            resultRows.map((row) => row.tick.userId),
+            { boardId: boardIdFilter },
+            ctx.isAuthenticated ? ctx.userId : null,
+          );
+    const items = resultRows.map((row) => {
+      const item = mapTickRowToFeedItem(row);
+      return anonymousActors.has(row.tick.userId)
+        ? { ...item, actorId: null, actorDisplayName: null, actorAvatarUrl: null, comment: null }
+        : item;
+    });
 
     let nextCursor: string | null = null;
     if (hasMore && resultRows.length > 0) {

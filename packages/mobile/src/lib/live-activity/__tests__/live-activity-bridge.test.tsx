@@ -4,6 +4,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ClimbQueueItem } from '@boardsesh/queue';
 import type { WidgetMirrorEvent } from '../../../../modules/live-activity/src/index';
 import { LiveActivityBridge } from '../live-activity-bridge';
+import { resetLastPickForTests, setLastPick } from '../../last-pick-store';
+import {
+  enterDriveMode,
+  getDriveMode,
+  getLastDriveModeExitReason,
+  markDriveLive,
+  resetDriveModeForTests,
+} from '../../../components/play-drawer/drive-mode-store';
+
+const transport = vi.hoisted(() => ({ javascript: false }));
+vi.mock('../../ble/transport-runtime', () => ({
+  bluetoothTransport: () => (transport.javascript ? { widgetCommandDelivery: 'javascript' } : undefined),
+}));
+beforeEach(() => {
+  transport.javascript = false;
+});
 
 type QueueNavigateEvent = {
   action: 'next' | 'previous';
@@ -12,7 +28,7 @@ type QueueNavigateEvent = {
 };
 
 type BoardControlEvent = {
-  action: 'reconnect' | 'reassert';
+  action: 'reconnect' | 'reassert' | 'stopDriving';
   correlationId: string;
 };
 
@@ -25,7 +41,7 @@ function makeItem(index: number): ClimbQueueItem {
 
 const queue = vi.hoisted(() => ({
   sessionId: 'session-1' as string | null,
-  mirrorCurrentClimb: vi.fn(),
+  mirrorCurrentClimb: vi.fn(async (): Promise<boolean> => true),
   dispatchWidgetMirror: vi.fn(async () => true),
   dispatchWidgetNavigation: vi.fn(),
   state: {
@@ -35,13 +51,24 @@ const queue = vi.hoisted(() => ({
   },
 }));
 
+const platform = vi.hoisted(() => ({ android: true }));
+
+const card = vi.hoisted(() => ({
+  enabled: true,
+  useClimbWallGlow: vi.fn((..._args: unknown[]): unknown => null),
+}));
+
 const widget = vi.hoisted(() => ({
   mirrorListener: null as null | ((event: WidgetMirrorEvent) => void),
   pendingMirror: vi.fn(async (): Promise<WidgetMirrorEvent | null> => null),
   acknowledgeMirror: vi.fn(async () => {}),
+  acknowledgeMirrorRequest: vi.fn(async () => {}),
   listener: null as null | ((event: QueueNavigateEvent) => void),
   boardControlListener: null as null | ((event: BoardControlEvent) => void),
-  useLiveActivity: vi.fn(),
+  postFailedListener: null as null | ((event: { stage: string; errorName?: string | null }) => void),
+  captureToSentry: vi.fn(),
+  useLiveActivity: vi.fn((_args: unknown) => ({ activityStartCount: 0 })),
+  updateRestTimer: vi.fn(async (_options: unknown) => {}),
 }));
 
 // Stand-in for the bluetooth context the lightbulb tap drives.
@@ -55,6 +82,7 @@ const bt = vi.hoisted(() => ({
   reassertWall: vi.fn(),
   reconnectSerialForCurrentBoard: 'serial-123' as string | null,
   reconnectDeviceIdForCurrentBoard: null as string | null,
+  nativeBoardForgets: 0,
 }));
 
 const boardState = vi.hoisted(() => ({
@@ -102,6 +130,16 @@ vi.mock('react-i18next', () => ({
 
 vi.mock('../../analytics', () => ({ track: analytics.track }));
 
+vi.mock('../../sentry', () => ({ captureToSentry: widget.captureToSentry }));
+
+vi.mock('../../../providers/feature-flags-provider', () => ({
+  useAndroidNotificationCardEnabled: () => card.enabled,
+}));
+
+vi.mock('../../../components/queue-control/use-climb-wall-glow', () => ({
+  useClimbWallGlow: (...args: unknown[]) => card.useClimbWallGlow(...args),
+}));
+
 vi.mock('../../../providers/queue-provider', () => ({
   useQueue: () => ({
     state: queue.state,
@@ -116,7 +154,7 @@ vi.mock('../../../components/ble/use-board-connection-state', () => ({
   useBoardConnectionState: () => ({
     bluetooth: boardState.hasBluetooth ? bt : null,
     localConnected: boardState.boardConnection === 'connectedByMe',
-    pending: false,
+    pending: bt.loading,
     sessionId: queue.sessionId,
     boardConnection: boardState.boardConnection,
     // Deliberately divergent from `boardConnection`: on a wall with no LED light
@@ -151,9 +189,16 @@ vi.mock('../use-live-activity', () => ({
   useLiveActivity: (args: unknown) => widget.useLiveActivity(args),
 }));
 
+// The keep-lighting leaf has its own tests; keep it out of the bridge's.
+vi.mock('../live-activity-lighting', () => ({ LiveActivityLightingSync: () => null }));
+
 vi.mock('../live-activity-plugin', () => ({
+  // The rest timer leaf has its own tests; keep it quiet here.
+  sessionPresenceSupportsRestTimer: false,
+  updateLiveActivityRestTimer: widget.updateRestTimer,
   getPendingWidgetMirror: widget.pendingMirror,
   acknowledgeWidgetMirror: widget.acknowledgeMirror,
+  acknowledgeWidgetMirrorRequest: widget.acknowledgeMirrorRequest,
   addWidgetMirrorListener: (listener: (event: WidgetMirrorEvent) => void) => {
     widget.mirrorListener = listener;
     return () => {
@@ -172,7 +217,15 @@ vi.mock('../live-activity-plugin', () => ({
       widget.boardControlListener = null;
     };
   },
-  isAndroidSessionPresence: true,
+  addNotificationPostFailedListener: (listener: (event: { stage: string; errorName?: string | null }) => void) => {
+    widget.postFailedListener = listener;
+    return () => {
+      widget.postFailedListener = null;
+    };
+  },
+  get isAndroidSessionPresence() {
+    return platform.android;
+  },
 }));
 
 const climbItem = makeItem(0);
@@ -185,6 +238,7 @@ describe('LiveActivityBridge widget navigation (always-live)', () => {
   const threeItemQueue = [makeItem(0), makeItem(1), makeItem(2)];
 
   beforeEach(() => {
+    platform.android = true;
     queue.sessionId = 'session-1';
     queue.state = { serverSequence: 4, queue: threeItemQueue, currentClimbQueueItem: threeItemQueue[0] };
     queue.dispatchWidgetNavigation.mockClear();
@@ -200,8 +254,94 @@ describe('LiveActivityBridge widget navigation (always-live)', () => {
     bt.armUndoWallChangeToast.mockClear();
     bt.reassertWall.mockClear();
     bt.reconnectSerialForCurrentBoard = 'serial-123';
+    bt.reconnectDeviceIdForCurrentBoard = null;
+    bt.loading = false;
+    bt.nativeBoardForgets = 0;
     bleProbe.nativeBleSupportsBoard.mockReturnValue(true);
     renderSettings.mode = 'aura';
+  });
+
+  // Owner decision A: the MiniPlayer shows the climber's last pick, but the
+  // Lock Screen / Live Activity keeps showing the wall's climb (the queue's current).
+  it('keeps the Lock Screen on the queue’s current while the bar shows a last pick', () => {
+    setLastPick({
+      item: threeItemQueue[2],
+      suggestionSource: null,
+      commitOptions: undefined,
+      mirrored: false,
+      currentAtPick: threeItemQueue[0].uuid,
+      wallAtPick: null,
+      pickedAt: 0,
+    });
+    try {
+      renderBridge();
+      expect(widget.useLiveActivity).toHaveBeenLastCalledWith(
+        expect.objectContaining({ currentClimbQueueItem: threeItemQueue[0] }),
+      );
+    } finally {
+      resetLastPickForTests();
+    }
+  });
+
+  function lastCardJson(): string | undefined {
+    const args = widget.useLiveActivity.mock.lastCall?.[0] as { androidBokehJson?: string };
+    return args.androidBokehJson;
+  }
+
+  it('hands the Android card its grade, angle and glow', () => {
+    card.enabled = true;
+    const climb = { uuid: 'c', difficulty: '6c/V5', angle: 40, frames: 'p1r1' };
+    queue.state = { ...queue.state, currentClimbQueueItem: { uuid: 'q', climb } as unknown as ClimbQueueItem };
+    card.useClimbWallGlow.mockReturnValue({
+      key: 'k',
+      boardWidth: 100,
+      boardHeight: 200,
+      holds: [{ x: 10, y: 10, color: '#00FF00' }],
+    });
+
+    renderBridge();
+
+    expect(JSON.parse(lastCardJson() ?? '{}')).toMatchObject({ gradeLabel: 'V5', angleLabel: '40°' });
+    expect((JSON.parse(lastCardJson() ?? '{}') as { collapsed: unknown[] }).collapsed).toHaveLength(1);
+  });
+
+  it('sends no payload once the kill switch is on, and skips the glow work', () => {
+    card.enabled = false;
+    card.useClimbWallGlow.mockClear();
+
+    renderBridge();
+
+    expect(lastCardJson()).toBeUndefined();
+    expect(card.useClimbWallGlow).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), false);
+    card.enabled = true;
+  });
+
+  it('sends no payload on iOS, which draws its own card', () => {
+    platform.android = false;
+    card.useClimbWallGlow.mockClear();
+
+    renderBridge();
+
+    expect(lastCardJson()).toBeUndefined();
+    expect(card.useClimbWallGlow).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), false);
+  });
+
+  it('reports a card the service could not post, with only the stage and error class', () => {
+    widget.captureToSentry.mockClear();
+    const { unmount } = renderBridge();
+
+    act(() => widget.postFailedListener?.({ stage: 'thumbnail', errorName: 'RuntimeException' }));
+
+    expect(widget.captureToSentry).toHaveBeenCalledTimes(1);
+    const [error, context] = widget.captureToSentry.mock.calls[0] as [Error, unknown];
+    expect(error.message).toBe('Android session notification post failed');
+    expect(context).toEqual({
+      tags: { source: 'session-presence-post', stage: 'thumbnail' },
+      extra: { errorName: 'RuntimeException' },
+    });
+
+    unmount();
+    expect(widget.postFailedListener).toBeNull();
   });
 
   it('passes connectedByMe + enables widget navigation when this device holds the board', () => {
@@ -279,6 +419,68 @@ describe('LiveActivityBridge widget navigation (always-live)', () => {
     );
   });
 
+  // #7087: with no remembered board, a background reconnect could only end in
+  // the board list on a paused activity, so the Android bulb opens the app.
+  it('tells the Android notification bulb to open the app when no board is remembered', () => {
+    boardState.boardConnection = 'disconnected';
+    bt.reconnectSerialForCurrentBoard = null;
+    bt.reconnectDeviceIdForCurrentBoard = null;
+    renderBridge();
+
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(
+      expect.objectContaining({ boardConnection: 'disconnected', bulbOpensApp: true, boardConnecting: false }),
+    );
+  });
+
+  it('keeps the background reconnect for a remembered Aurora serial or MoonBoard device id', () => {
+    boardState.boardConnection = 'disconnected';
+    renderBridge();
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(expect.objectContaining({ bulbOpensApp: false }));
+
+    bt.reconnectSerialForCurrentBoard = null;
+    bt.reconnectDeviceIdForCurrentBoard = 'moon-device';
+    renderBridge();
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(expect.objectContaining({ bulbOpensApp: false }));
+  });
+
+  it('marks the Android notification bulb as connecting while a connect runs', () => {
+    boardState.boardConnection = 'disconnected';
+    bt.loading = true;
+    renderBridge();
+
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(expect.objectContaining({ boardConnecting: true }));
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        androidNotification: expect.objectContaining({ connectingLabel: 'mobile.session.notification.connecting' }),
+      }),
+    );
+  });
+
+  it('pins both bulb flags to false on iOS, where ActivityKit draws its own bulb', () => {
+    platform.android = false;
+    boardState.boardConnection = 'disconnected';
+    bt.reconnectSerialForCurrentBoard = null;
+    bt.loading = true;
+    renderBridge();
+
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(
+      expect.objectContaining({ bulbOpensApp: false, boardConnecting: false }),
+    );
+  });
+
+  // The iOS card reads native's pairing only when it redraws: each native
+  // forget of the board the app kept must reach useLiveActivity as a change.
+  it('hands iOS the count of native forgets so the card redraws, and Android none', () => {
+    platform.android = false;
+    bt.nativeBoardForgets = 2;
+    renderBridge();
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(expect.objectContaining({ nativePairingRevision: 2 }));
+
+    platform.android = true;
+    renderBridge();
+    expect(widget.useLiveActivity).toHaveBeenLastCalledWith(expect.objectContaining({ nativePairingRevision: 0 }));
+  });
+
   it('navigates to the absolute index the widget reports (not a relative step)', () => {
     renderBridge();
 
@@ -289,7 +491,9 @@ describe('LiveActivityBridge widget navigation (always-live)', () => {
     // Maps currentIndex → queue[currentIndex] and forwards the correlationId so
     // the racing CurrentClimbChanged echo is suppressed by the reducer.
     expect(queue.dispatchWidgetNavigation).toHaveBeenCalledTimes(1);
-    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledWith(threeItemQueue[1], 'widget-navigate');
+    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledWith(threeItemQueue[1], 'widget-navigate', {
+      sendMutation: true,
+    });
   });
 
   it('does not double-advance: a single tap dispatches exactly one absolute move', () => {
@@ -300,7 +504,29 @@ describe('LiveActivityBridge widget navigation (always-live)', () => {
     });
 
     expect(queue.dispatchWidgetNavigation).toHaveBeenCalledTimes(1);
-    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledWith(threeItemQueue[0], 'widget-navigate');
+    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledWith(threeItemQueue[0], 'widget-navigate', {
+      sendMutation: true,
+    });
+  });
+
+  it('keeps iOS navigation local because its native intent already publishes', () => {
+    platform.android = false;
+    renderBridge();
+    act(() => {
+      widget.listener?.({ action: 'next', currentIndex: 1, correlationId: 'ios-native' });
+    });
+    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledExactlyOnceWith(threeItemQueue[1], 'ios-native');
+  });
+
+  it('uses the absolute target even when the server echo selected it first', () => {
+    queue.state.currentClimbQueueItem = threeItemQueue[1];
+    renderBridge();
+    act(() => {
+      widget.listener?.({ action: 'next', currentIndex: 1, correlationId: 'android-native' });
+    });
+    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledExactlyOnceWith(threeItemQueue[1], 'android-native', {
+      sendMutation: true,
+    });
   });
 
   it('ignores out-of-range indices instead of wrapping or crashing', () => {
@@ -337,7 +563,9 @@ describe('LiveActivityBridge widget navigation (always-live)', () => {
       widget.listener?.({ action: 'next', currentIndex: 1, correlationId: 'widget-navigate' });
     });
 
-    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledWith(threeItemQueue[1], 'widget-navigate');
+    expect(queue.dispatchWidgetNavigation).toHaveBeenCalledWith(threeItemQueue[1], 'widget-navigate', {
+      sendMutation: true,
+    });
     expect(widget.useLiveActivity).toHaveBeenCalledWith(
       expect.objectContaining({
         widgetNavigationAllowed: true,
@@ -393,6 +621,11 @@ describe('LiveActivityBridge lightbulb (boardControl)', () => {
           relightLabel: 'mobile.session.notification.relight',
           reconnectLabel: 'mobile.session.notification.reconnect',
           onWallTemplate: 'mobile.session.notification.onWall',
+          // The header's line while driving the wall (2.7), timed or
+          // open-ended. Left out, Android falls back to English.
+          lightDrivingLabel: 'mobile.session.notification.drivingTheWall',
+          // The lit bulb while driving: a tap stops driving.
+          stopDrivingLabel: 'mobile.session.notification.stopDriving',
         }),
       }),
     );
@@ -471,7 +704,54 @@ describe('LiveActivityBridge lightbulb (boardControl)', () => {
 
     expect(bt.armUndoWallChangeToast).not.toHaveBeenCalled();
     expect(bt.reassertWall).toHaveBeenCalledTimes(1);
+    // No connect of its own behind it, so nothing carries to a later link.
+    expect(bt.reassertWall).toHaveBeenCalledWith();
     expect(bt.connect).not.toHaveBeenCalled();
+  });
+
+  describe('stopDriving (the lit bulb while this phone drives)', () => {
+    beforeEach(() => resetDriveModeForTests());
+
+    function liveDrive(windowMs: number | null, now = Date.now()) {
+      enterDriveMode({
+        startedBy: 'tap',
+        sessionId: 'session-1',
+        boardId: 7,
+        windowMs,
+        windowSetting: windowMs === null ? null : 'putOnBoardKeepsLighting',
+        now,
+      });
+      markDriveLive({ now });
+    }
+
+    it('stops a live drive as the frosted button does, without re-lighting', () => {
+      liveDrive(45_000);
+      renderBridge();
+      act(() => {
+        widget.boardControlListener?.({ action: 'stopDriving', correlationId: 'bulb-stop' });
+      });
+      expect(getDriveMode()).toBeNull();
+      expect(getLastDriveModeExitReason()).toBe('stopped');
+      expect(bt.reassertWall).not.toHaveBeenCalled();
+      expect(bt.connect).not.toHaveBeenCalled();
+    });
+
+    it('re-lights when the drive was already over: nothing drives, or the time ran out on the wall clock', () => {
+      renderBridge();
+      act(() => {
+        widget.boardControlListener?.({ action: 'stopDriving', correlationId: 'bulb-none' });
+      });
+      expect(bt.reassertWall).toHaveBeenCalledTimes(1);
+      expect(getLastDriveModeExitReason()).toBeNull();
+
+      // Android paused JS timers: the drive's end passed, the watcher never fired.
+      liveDrive(45_000, Date.now() - 60_000);
+      act(() => {
+        widget.boardControlListener?.({ action: 'stopDriving', correlationId: 'bulb-over' });
+      });
+      expect(bt.reassertWall).toHaveBeenCalledTimes(2);
+      expect(getLastDriveModeExitReason()).toBeNull();
+    });
   });
 
   it('is a no-op (no throw) when no board is selected', () => {
@@ -518,6 +798,35 @@ describe('LiveActivityBridge session-presence gating', () => {
         isSessionActive: true,
       }),
     );
+  });
+
+  it('drives widget navigation through the party path in a normal build', () => {
+    renderBridge();
+
+    expect(widget.useLiveActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ isSessionActive: true, isPartySession: true }),
+    );
+  });
+
+  it('routes widget commands through JS only for an explicitly installed external transport', () => {
+    transport.javascript = true;
+    renderBridge();
+    expect(widget.useLiveActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ isSessionActive: true, isPartySession: false }),
+    );
+  });
+
+  it('preserves party authorization regardless of retired capture flags', () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    try {
+      renderBridge();
+
+      expect(widget.useLiveActivity).toHaveBeenCalledWith(
+        expect.objectContaining({ isSessionActive: true, isPartySession: true }),
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });
 
@@ -591,6 +900,8 @@ describe('mirror controls', () => {
     queue.dispatchWidgetMirror.mockClear();
     queue.dispatchWidgetMirror.mockResolvedValue(true);
     widget.acknowledgeMirror.mockClear();
+    widget.acknowledgeMirrorRequest.mockClear();
+    queue.mirrorCurrentClimb.mockResolvedValue(true);
     widget.pendingMirror.mockResolvedValue(null);
   });
   const tap = { kind: 'request', sessionId: 'session-1', queueItemUuid: 'queue-item-0', mirrored: true } as const;
@@ -602,6 +913,35 @@ describe('mirror controls', () => {
       widget.mirrorListener?.(tap);
     });
     expect(queue.mirrorCurrentClimb).toHaveBeenCalledWith(true, 'queue-item-0');
+    expect(widget.acknowledgeMirrorRequest).toHaveBeenCalledWith('session-1');
+  });
+  it('keeps a parked tap alive while the board link is still coming back', async () => {
+    // A cold launch replays the tap before Bluetooth reconnects. Acknowledging
+    // it there would lose it, so it stays parked for the next handover.
+    boardState.boardConnection = 'disconnected';
+    render(<LiveActivityBridge boardName="tension" layoutId={1} sizeId={1} setIds="1" />);
+    await act(async () => {
+      widget.mirrorListener?.(tap);
+    });
+    expect(queue.mirrorCurrentClimb).not.toHaveBeenCalled();
+    expect(widget.acknowledgeMirrorRequest).not.toHaveBeenCalled();
+  });
+  it('keeps a parked tap alive when the replayed mutation fails', async () => {
+    queue.mirrorCurrentClimb.mockResolvedValue(false);
+    render(<LiveActivityBridge boardName="tension" layoutId={1} sizeId={1} setIds="1" />);
+    await act(async () => {
+      widget.mirrorListener?.(tap);
+    });
+    expect(queue.mirrorCurrentClimb).toHaveBeenCalledWith(true, 'queue-item-0');
+    expect(widget.acknowledgeMirrorRequest).not.toHaveBeenCalled();
+  });
+  it('retires a parked tap once the queue has moved past its slot', async () => {
+    render(<LiveActivityBridge boardName="tension" layoutId={1} sizeId={1} setIds="1" />);
+    await act(async () => {
+      widget.mirrorListener?.({ ...tap, queueItemUuid: 'old-slot' });
+    });
+    expect(queue.mirrorCurrentClimb).not.toHaveBeenCalled();
+    expect(widget.acknowledgeMirrorRequest).toHaveBeenCalledWith('session-1');
   });
   it.each(['heldByPeer', 'disconnected'] as const)('drops a tap after ownership changes to %s', async (connection) => {
     boardState.boardConnection = connection;

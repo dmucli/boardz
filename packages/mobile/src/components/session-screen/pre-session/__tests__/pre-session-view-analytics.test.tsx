@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
-import { act, render, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { DEFAULT_PYRAMID_OPTIONS, DEFAULT_VOLUME_OPTIONS, type WorkoutRun } from '@boardsesh/playlist-generator';
 import type { GeneratorSelection } from '../GeneratorPickerCard';
+import { DEFAULT_WORKOUT_FILTERS, NO_WORKOUT, singleBlockSelection } from '../workout-blocks';
 
 const analytics = vi.hoisted(() => ({ track: vi.fn() }));
 const navigation = vi.hoisted(() => ({ push: vi.fn(), navigate: vi.fn() }));
@@ -11,7 +13,7 @@ const errors = vi.hoisted(() => ({ reportError: vi.fn(), showToast: vi.fn() }));
 
 const queue = vi.hoisted(() => ({
   startSession: vi.fn(async () => 'session-1' as string | null),
-  appendGeneratedSession: vi.fn(),
+  appendQueueItems: vi.fn(),
 }));
 
 const drawer = vi.hoisted(() => ({ openPlayDrawer: vi.fn() }));
@@ -27,10 +29,10 @@ const activeBoard = vi.hoisted(() => ({
 }));
 
 // The preview hook is mocked so the test controls the queued/planned counts. The
-// generator-on Start path reads `toQueueItems()` (queued) and `plannedCount`.
+// generator-on Start path reads `toStagedQueueItems()` (queued + stages) and `plannedCount`.
 const previewItems = vi.hoisted(() => [
-  { uuid: 'c1', climb: { uuid: 'x' } },
-  { uuid: 'c2', climb: { uuid: 'y' } },
+  { uuid: 'c1', climb: { uuid: 'x', angle: 40 } },
+  { uuid: 'c2', climb: { uuid: 'y', angle: 40 } },
 ]);
 const previewRows = vi.hoisted(() =>
   previewItems.map((item, index) => ({
@@ -38,6 +40,27 @@ const previewRows = vi.hoisted(() =>
     slot: { grade: 10, section: 'main', index },
   })),
 );
+const previewRun = vi.hoisted((): WorkoutRun => ({
+  stages: [{ id: 'stage-main', kind: 'volume', itemUuids: ['c1', 'c2'] }],
+}));
+// What Start captures with the run for the server's copy (#6903).
+const previewClimbs = {
+  c1: { climbUuid: 'x', angle: 40 },
+  c2: { climbUuid: 'y', angle: 40 },
+};
+const workoutRunStore = vi.hoisted(() => ({ prepareWorkoutRun: vi.fn() }));
+vi.mock('../../../../lib/workout-run-store', () => workoutRunStore);
+// #6903: the workout's server copy, queued at Start / Add a block.
+const workoutOutbox = vi.hoisted(() => ({ enqueueSessionWorkoutWrite: vi.fn(async () => 'queued') }));
+vi.mock('../../../../offline/session-workout-outbox', () => workoutOutbox);
+vi.mock('@tanstack/react-query', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@tanstack/react-query')>()),
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
+}));
+// Whether a run arms the timer is pinned in rest-timer-effective.test.ts; here,
+// only that Start hands it the run it just stored.
+const restTimerEffective = vi.hoisted(() => ({ armRestTimerForWorkout: vi.fn(() => false) }));
+vi.mock('../../../../lib/rest-timer-effective', () => restTimerEffective);
 const preview = vi.hoisted(() => ({
   result: {
     items: previewRows as unknown[],
@@ -46,8 +69,9 @@ const preview = vi.hoisted(() => ({
     plannedCount: 3,
     plannedSlots: previewRows.map((preview) => preview.slot),
     regenerate: vi.fn(),
+    shuffle: vi.fn(),
     refreshSlot: vi.fn(),
-    toQueueItems: () => previewItems,
+    toStagedQueueItems: () => ({ items: previewItems, run: previewRun }),
   },
 }));
 
@@ -86,6 +110,7 @@ vi.mock('../../../../lib/analytics', () => ({ track: analytics.track }));
 // colors.ts if the shared module runner evaluates it under this mock.
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   StyleSheet: { create: (styles: unknown) => styles, hairlineWidth: 1 },
@@ -105,6 +130,7 @@ vi.mock('react-native-reanimated', () => ({
 
 vi.mock('expo-router', () => ({ useRouter: () => navigation, useIsFocused: () => screenState.isFocused }));
 vi.mock('../../../../lib/error-reporting', () => ({ reportError: errors.reportError }));
+vi.mock('../../../../hooks/use-phone-split', () => ({ usePhoneSplit: () => false }));
 
 vi.mock('@shopify/flash-list', () => ({
   FlashList: ({
@@ -137,6 +163,24 @@ vi.mock('../../../Button', () => ({
 vi.mock('../../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
+vi.mock('../../../PressableSurface', () => ({
+  PressableSurface: ({
+    children,
+    onPress,
+    disabled,
+    accessibilityLabel,
+  }: {
+    children?: ReactNode;
+    onPress?: () => void;
+    disabled?: boolean;
+    accessibilityLabel?: string;
+  }) => createElement('button', { onClick: onPress, disabled, 'aria-label': accessibilityLabel }, children),
+}));
+vi.mock('../../../Icon', () => ({ Icon: () => null }));
+vi.mock('../../../../lib/haptics', () => ({ hapticSelection: vi.fn() }));
+vi.mock('../../../../hooks/use-grade-format', () => ({
+  useGradeFormat: () => ({ formatGradeByDifficultyId: (difficultyId: number) => `G${difficultyId}` }),
+}));
 vi.mock('../../../Card', () => ({
   Card: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
 }));
@@ -151,12 +195,18 @@ vi.mock('../../SessionStartFab', () => ({
   },
 }));
 vi.mock('../../../../providers/theme-provider', () => ({
-  useTheme: () => ({ systemColors: {}, features: { inBodyLargeTitle: false, filtersInTopChrome: false } }),
+  useTheme: () => ({
+    systemColors: {},
+    brandColors: {},
+    opacity: { disabled: 0.5 },
+    features: { inBodyLargeTitle: false, filtersInTopChrome: false },
+    textStyles: { footnote: { fontSize: 13, lineHeight: 18 } },
+  }),
 }));
 vi.mock('../../../../lib/graphql/use-active-board', () => ({ useActiveBoard: () => activeBoard }));
 vi.mock('../../../../providers/auth-provider', () => ({ useAuth: () => ({ isAuthenticated: true }) }));
 vi.mock('../../../../providers/queue-provider', () => ({
-  useQueueActions: () => ({ startSession: queue.startSession, appendGeneratedSession: queue.appendGeneratedSession }),
+  useQueueActions: () => ({ startSession: queue.startSession, appendQueueItems: queue.appendQueueItems }),
   useQueueSessionId: () => ({ sessionId: screenState.sessionId }),
   useQueueLiveStats: () => ({ sessionUsers: [] }),
 }));
@@ -181,8 +231,9 @@ vi.mock('../../../../hooks/use-bottom-chrome-metrics', () => ({
 }));
 vi.mock('../../../../hooks/use-native-glass', () => ({ useNativeGlass: () => false }));
 vi.mock('../../../../theme/tokens', () => ({ spacing: { 2: 8, 3: 12, 4: 16 }, borderRadius: { lg: 16 } }));
-vi.mock('../BoardSummaryCard', () => ({ BoardSummaryCard: () => null }));
+vi.mock('../../../boards/BoardSummaryCard', () => ({ BoardSummaryCard: () => null }));
 vi.mock('../WorkoutPreviewRow', () => ({ WorkoutPreviewRow: () => null }));
+vi.mock('../WorkoutPreviewSectionHeading', () => ({ WorkoutPreviewSectionHeading: () => null }));
 vi.mock('../use-workout-preview', () => ({ useWorkoutPreview: () => preview.result }));
 vi.mock('../GeneratorPickerCard', () => ({
   GeneratorPickerCard: ({ onChange }: { onChange: (selection: GeneratorSelection) => void }) => {
@@ -211,7 +262,10 @@ beforeEach(() => {
   errors.showToast.mockClear();
   queue.startSession.mockClear();
   queue.startSession.mockResolvedValue('session-1');
-  queue.appendGeneratedSession.mockClear();
+  queue.appendQueueItems.mockClear();
+  workoutRunStore.prepareWorkoutRun.mockClear();
+  workoutOutbox.enqueueSessionWorkoutWrite.mockClear();
+  restTimerEffective.armRestTimerForWorkout.mockClear();
   screenState.sessionId = null;
   screenState.isFocused = true;
   activeBoard.data = { boardType: 'kilter', layoutId: 8, sizeId: 21, setIds: '1,2', angle: 40 };
@@ -219,11 +273,117 @@ beforeEach(() => {
   preview.result.status = 'ready';
   preview.result.refreshingUuids = new Set<string>();
   preview.result.plannedSlots = previewRows.map((preview) => preview.slot);
+  preview.result.shuffle.mockReset();
   picker.onChange = null;
   startButton.onPress = null;
   visibilityRow.isPublic = null;
   visibilityRow.disabled = false;
   visibilityRow.onChange = null;
+});
+
+// One Volume block on loose filters, as the generator-on Start path needs.
+function volumeSelection(): GeneratorSelection {
+  return singleBlockSelection(
+    {
+      ...DEFAULT_VOLUME_OPTIONS,
+      targetGrade: 10,
+      minAscents: 0,
+      minRating: 0,
+      climbBias: 'any',
+    },
+    'block-volume',
+  );
+}
+
+function selectWorkout() {
+  act(() => picker.onChange?.(singleBlockSelection({ ...DEFAULT_VOLUME_OPTIONS, targetGrade: 10 }, 'block-volume')));
+}
+
+describe('PreSessionView Shuffle during Start', () => {
+  it('ignores Shuffle while creation is pending and queues the displayed climbs', async () => {
+    const creation = Promise.withResolvers<string | null>();
+    queue.startSession.mockReturnValueOnce(creation.promise);
+    const screen = render(createElement(PreSessionView));
+    selectWorkout();
+
+    const shuffleButton = screen.getByLabelText('mobile.session.preWorkoutPreviewShuffleAccessibilityLabel');
+    fireEvent.click(shuffleButton);
+    expect(preview.result.shuffle).toHaveBeenCalledTimes(1);
+    preview.result.shuffle.mockClear();
+
+    await act(async () => startButton.onPress?.());
+    expect(queue.appendQueueItems).not.toHaveBeenCalled();
+    fireEvent.click(shuffleButton);
+    expect(preview.result.shuffle).not.toHaveBeenCalled();
+    expect(shuffleButton).toHaveProperty('disabled', true);
+    expect(preview.result.items).toEqual(previewRows);
+
+    await act(async () => creation.resolve('session-1'));
+    expect(queue.appendQueueItems).toHaveBeenCalledExactlyOnceWith(previewItems);
+  });
+
+  it.each(['null', 'reject'] as const)('allows Shuffle again after a %s creation failure', async (failure) => {
+    const creation = Promise.withResolvers<string | null>();
+    queue.startSession.mockReturnValueOnce(creation.promise);
+    const screen = render(createElement(PreSessionView));
+    selectWorkout();
+
+    await act(async () => startButton.onPress?.());
+    const shuffleButton = screen.getByLabelText('mobile.session.preWorkoutPreviewShuffleAccessibilityLabel');
+    expect(shuffleButton).toHaveProperty('disabled', true);
+    await act(async () => {
+      if (failure === 'null') creation.resolve(null);
+      else creation.reject(new Error('Session unavailable'));
+    });
+
+    expect(shuffleButton).toHaveProperty('disabled', false);
+    fireEvent.click(shuffleButton);
+    expect(preview.result.shuffle).toHaveBeenCalledTimes(1);
+    expect(queue.appendQueueItems).not.toHaveBeenCalled();
+    expect(navigation.navigate).not.toHaveBeenCalled();
+  });
+
+  it('shows the prepared workout on the same tab once creation and queue preparation settle', async () => {
+    const creation = Promise.withResolvers<string | null>();
+    queue.startSession.mockReturnValueOnce(creation.promise);
+    const screen = render(createElement(SessionScreen));
+    selectWorkout();
+
+    await act(async () => startButton.onPress?.());
+    screenState.sessionId = 'session-1';
+    screen.rerender(createElement(SessionScreen));
+    expect(screen.queryByText('Live session settings')).toBeNull();
+    await act(async () => creation.resolve('session-1'));
+
+    expect(navigation.navigate).not.toHaveBeenCalled();
+    expect(queue.appendQueueItems).toHaveBeenCalledExactlyOnceWith(previewItems);
+    expect(workoutRunStore.prepareWorkoutRun).toHaveBeenCalledExactlyOnceWith('session-1', previewRun, previewClimbs);
+    expect(workoutOutbox.enqueueSessionWorkoutWrite).toHaveBeenCalledWith('session-1', expect.anything());
+    expect(restTimerEffective.armRestTimerForWorkout).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('mobile.session.preWorkoutPreviewShuffleAccessibilityLabel')).toBeNull();
+    expect(screen.getByText('Live session settings')).toBeTruthy();
+  });
+});
+
+describe('PreSessionView analytics with climbs from a nearby grade', () => {
+  it('counts the rows that borrowed from a nearby grade in "Session Queue Generated"', async () => {
+    // The second row's grade ran short, so its climb came from one grade down.
+    preview.result.items = [
+      previewRows[0],
+      { ...previewRows[1], slot: { ...previewRows[1].slot, grade: 9 }, borrowedFrom: { plannedGrade: 10 } },
+    ];
+    render(createElement(PreSessionView));
+    act(() => {
+      picker.onChange?.(volumeSelection());
+    });
+
+    await act(async () => startButton.onPress?.());
+
+    expect(analytics.track).toHaveBeenCalledWith(
+      'Session Queue Generated',
+      expect.objectContaining({ savedCount: 2, phase: 'pre_session', substitutedCount: 1 }),
+    );
+  });
 });
 
 describe('PreSessionView analytics', () => {
@@ -232,26 +392,12 @@ describe('PreSessionView analytics', () => {
 
     // Flip the generator on so handleStart takes the generate branch.
     act(() => {
-      picker.onChange?.({
-        type: 'on',
-        options: {
-          type: 'volume',
-          targetGrade: 10,
-          warmUp: 'none',
-          mainSetClimbs: 20,
-          mainSetVariability: 0,
-          minAscents: 0,
-          minRating: 0,
-          onlyTallClimbs: false,
-          onlyWideClimbs: false,
-          climbBias: 'any',
-        },
-      });
+      picker.onChange?.(volumeSelection());
     });
 
     await act(async () => {
       startButton.onPress?.();
-      // Let the async handleStart chain (startSession → appendGeneratedSession
+      // Let the async handleStart chain (startSession → appendQueueItems
       // → track) settle.
       await Promise.resolve();
       await Promise.resolve();
@@ -259,31 +405,149 @@ describe('PreSessionView analytics', () => {
     await waitFor(() =>
       expect(analytics.track).toHaveBeenCalledWith('Session Queue Generated', {
         workoutType: 'volume',
+        workoutTypes: 'volume',
         boardName: 'kilter',
         angle: 40,
         // 2 climbs queued out of a 3-slot plan → 1 short.
         savedCount: 2,
         failedCount: 1,
+        stageCount: 1,
+        phase: 'pre_session',
+        substitutedCount: 0,
       }),
     );
 
     // Preview items queued behind the live queue; the provider decides the
-    // current climb (it stays put unless nothing is active).
-    expect(queue.appendGeneratedSession).toHaveBeenCalledTimes(1);
-    expect(queue.appendGeneratedSession).toHaveBeenCalledWith(previewItems);
-    expect(navigation.navigate).toHaveBeenCalledExactlyOnceWith('/(tabs)/climbs');
-    expect(queue.appendGeneratedSession.mock.invocationCallOrder[0]).toBeLessThan(
-      navigation.navigate.mock.invocationCallOrder[0],
-    );
+    // current climb stays put, including when nothing is active.
+    expect(queue.appendQueueItems).toHaveBeenCalledTimes(1);
+    expect(queue.appendQueueItems).toHaveBeenCalledWith(previewItems);
+    expect(navigation.navigate).not.toHaveBeenCalled();
     expect(analytics.track).toHaveBeenCalledWith('Session Queue Generated', {
       workoutType: 'volume',
+      workoutTypes: 'volume',
       boardName: 'kilter',
       angle: 40,
       // 2 climbs queued out of a 3-slot plan → 1 short.
       savedCount: 2,
       failedCount: 1,
+      stageCount: 1,
+      phase: 'pre_session',
+      substitutedCount: 0,
     });
+    // The run is kept on the phone for the session that just started.
+    expect(workoutRunStore.prepareWorkoutRun).toHaveBeenCalledExactlyOnceWith('session-1', previewRun, previewClimbs);
+    // Pacing waits for the explicit Start workout action in the pill/card.
+    expect(restTimerEffective.armRestTimerForWorkout).not.toHaveBeenCalled();
   });
+
+  it('reports every block of a multi-block workout and stores its multi-stage run', async () => {
+    const multiStageRun: WorkoutRun = {
+      stages: [
+        { id: 'stage-warm', kind: 'warmUp', itemUuids: ['c1'] },
+        { id: 'stage-pyramid', kind: 'pyramid', itemUuids: ['c2'] },
+      ],
+    };
+    const singleStageQueueItems = preview.result.toStagedQueueItems;
+    preview.result.toStagedQueueItems = () => ({ items: previewItems, run: multiStageRun });
+    try {
+      render(createElement(PreSessionView));
+      act(() =>
+        picker.onChange?.({
+          ...NO_WORKOUT,
+          blocks: [
+            { id: 'block-warm', kind: 'warmUp', warmUpType: 'standard', filters: DEFAULT_WORKOUT_FILTERS },
+            {
+              id: 'block-1',
+              kind: 'workout',
+              options: { ...DEFAULT_PYRAMID_OPTIONS, targetGrade: 10 },
+              filters: DEFAULT_WORKOUT_FILTERS,
+            },
+            {
+              id: 'block-2',
+              kind: 'workout',
+              options: { ...DEFAULT_VOLUME_OPTIONS, targetGrade: 8 },
+              filters: DEFAULT_WORKOUT_FILTERS,
+            },
+            {
+              id: 'block-3',
+              kind: 'workout',
+              options: { ...DEFAULT_PYRAMID_OPTIONS, targetGrade: 12 },
+              filters: DEFAULT_WORKOUT_FILTERS,
+            },
+          ],
+        }),
+      );
+
+      await act(async () => startButton.onPress?.());
+
+      expect(analytics.track).toHaveBeenCalledWith('Session Queue Generated', {
+        // The first workout block's type stays the headline type; the list keeps the warm-up.
+        workoutType: 'pyramid',
+        workoutTypes: 'warmUp,pyramid,volume,pyramid',
+        boardName: 'kilter',
+        angle: 40,
+        savedCount: 2,
+        failedCount: 1,
+        stageCount: 2,
+        phase: 'pre_session',
+        substitutedCount: 0,
+      });
+      expect(workoutRunStore.prepareWorkoutRun).toHaveBeenCalledExactlyOnceWith(
+        'session-1',
+        multiStageRun,
+        previewClimbs,
+      );
+    } finally {
+      preview.result.toStagedQueueItems = singleStageQueueItems;
+    }
+  });
+
+  // A 4x4 queues each set once, however many reps it takes: every queued climb
+  // is one planned slot, and a slot with no climb counts as failed.
+  it.each([
+    { plannedCount: 3, failedCount: 1 },
+    { plannedCount: 2, failedCount: 0 },
+    // Never below zero, whatever the counts say.
+    { plannedCount: 1, failedCount: 0 },
+  ])(
+    'reports the queued sets as saved and $failedCount of $plannedCount planned slots as failed',
+    async ({ plannedCount, failedCount }) => {
+      const fourByFourRun: WorkoutRun = {
+        stages: [
+          {
+            id: 'stage-four',
+            kind: 'fourByFour',
+            itemUuids: previewItems.map((item) => item.uuid),
+            pacing: {
+              mode: 'afterTick',
+              restSeconds: 0,
+              advanceOn: 'set',
+              sets: { repsPerSet: 4, restBetweenSetsSeconds: 180 },
+            },
+          },
+        ],
+      };
+      const singleStageQueueItems = preview.result.toStagedQueueItems;
+      const singleStagePlannedCount = preview.result.plannedCount;
+      preview.result.plannedCount = plannedCount;
+      preview.result.toStagedQueueItems = () => ({ items: previewItems, run: fourByFourRun });
+      try {
+        render(createElement(PreSessionView));
+        act(() => picker.onChange?.(singleBlockSelection({ ...DEFAULT_PYRAMID_OPTIONS, targetGrade: 10 }, 'b')));
+
+        await act(async () => startButton.onPress?.());
+
+        expect(queue.appendQueueItems).toHaveBeenCalledExactlyOnceWith(previewItems);
+        expect(analytics.track).toHaveBeenCalledWith(
+          'Session Queue Generated',
+          expect.objectContaining({ savedCount: 2, failedCount, stageCount: 1 }),
+        );
+      } finally {
+        preview.result.toStagedQueueItems = singleStageQueueItems;
+        preview.result.plannedCount = singleStagePlannedCount;
+      }
+    },
+  );
 
   it('does not replace the queue or fire when the generator is off', async () => {
     render(createElement(PreSessionView));
@@ -293,7 +557,7 @@ describe('PreSessionView analytics', () => {
     });
     await waitFor(() => expect(queue.startSession).toHaveBeenCalled());
 
-    expect(queue.appendGeneratedSession).not.toHaveBeenCalled();
+    expect(queue.appendQueueItems).not.toHaveBeenCalled();
     expect(analytics.track).not.toHaveBeenCalledWith('Session Queue Generated', expect.anything());
     expect(navigation.navigate).toHaveBeenCalledExactlyOnceWith('/(tabs)/climbs');
   });
@@ -303,21 +567,7 @@ describe('PreSessionView analytics', () => {
     render(createElement(PreSessionView));
 
     act(() => {
-      picker.onChange?.({
-        type: 'on',
-        options: {
-          type: 'volume',
-          targetGrade: 10,
-          warmUp: 'none',
-          mainSetClimbs: 20,
-          mainSetVariability: 0,
-          minAscents: 0,
-          minRating: 0,
-          onlyTallClimbs: false,
-          onlyWideClimbs: false,
-          climbBias: 'any',
-        },
-      });
+      picker.onChange?.(volumeSelection());
     });
 
     await act(async () => {
@@ -326,7 +576,7 @@ describe('PreSessionView analytics', () => {
     });
 
     expect(queue.startSession).not.toHaveBeenCalled();
-    expect(queue.appendGeneratedSession).not.toHaveBeenCalled();
+    expect(queue.appendQueueItems).not.toHaveBeenCalled();
     expect(navigation.navigate).not.toHaveBeenCalled();
   });
 });
@@ -353,7 +603,7 @@ describe('PreSessionView Start navigation', () => {
     await act(async () => startButton.onPress?.());
 
     expect(navigation.navigate).not.toHaveBeenCalled();
-    expect(queue.appendGeneratedSession).not.toHaveBeenCalled();
+    expect(queue.appendQueueItems).not.toHaveBeenCalled();
   });
 
   it('stays on Session and shows the error when creation rejects', async () => {
@@ -410,27 +660,11 @@ describe('SessionScreen Start handoff', () => {
   it('keeps a created session visible if queue preparation fails', async () => {
     const creation = Promise.withResolvers<string | null>();
     queue.startSession.mockReturnValueOnce(creation.promise);
-    queue.appendGeneratedSession.mockImplementationOnce(() => {
+    queue.appendQueueItems.mockImplementationOnce(() => {
       throw new Error('Queue unavailable');
     });
     const screen = render(createElement(SessionScreen));
-    act(() =>
-      picker.onChange?.({
-        type: 'on',
-        options: {
-          type: 'volume',
-          targetGrade: 10,
-          warmUp: 'none',
-          mainSetClimbs: 20,
-          mainSetVariability: 0,
-          minAscents: 0,
-          minRating: 0,
-          onlyTallClimbs: false,
-          onlyWideClimbs: false,
-          climbBias: 'any',
-        },
-      }),
-    );
+    act(() => picker.onChange?.(volumeSelection()));
     await act(async () => startButton.onPress?.());
     screenState.sessionId = 'session-1';
     screen.rerender(createElement(SessionScreen));
@@ -537,3 +771,31 @@ describe('PreSessionView "Show this session live" switch', () => {
     expect(analytics.track).not.toHaveBeenCalledWith('Session Visibility Changed', expect.anything());
   });
 });
+
+// This suite exercises the existing flow before the server privacy rollout.
+vi.mock('../../../../lib/graphql/hooks/use-privacy', () => ({ usePrivacySettings: () => ({ data: undefined }) }));
+vi.mock('../../../privacy/PublicationAudiencePicker', () => ({
+  PublicationAudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../../privacy/ContentAudienceControl', () => ({
+  ContentAudienceControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../../privacy/ResourcePrivacyControl', () => ({
+  ResourcePrivacyControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../../privacy/AudiencePicker', () => ({
+  AudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../../../privacy/use-publication-audience', () => ({
+  usePublicationAudience: () => ({
+    enabled: false,
+    isPrivate: false,
+    audience: 'public',
+    publication: undefined,
+    chooseAudience: () => {},
+  }),
+}));

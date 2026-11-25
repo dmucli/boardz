@@ -1,0 +1,648 @@
+# frozen_string_literal: true
+
+require "minitest/autorun"
+require "tmpdir"
+require "fileutils"
+require_relative "../lib/creative_assets"
+
+class CreativeAssetsTest < Minitest::Test
+  class FakeApple
+    attr_reader :writes, :uploads, :assets, :placements, :reads
+    attr_accessor :live, :supported, :versions, :destinations_available
+
+    def initialize
+      @writes, @uploads, @assets, @placements = [], [], [], []
+      @reads = []
+      @supported = true
+      @live = false
+      @destinations_available = true
+    end
+
+    def list(path)
+      @reads << path
+      raise "Upload unexpectedly read a placement destination" if !@destinations_available && path.match?(/appStoreVersion|appCustomProductPage|\/placements\?/)
+      case path
+      when "/v1/appAssetLibraryRefData"
+        [{ "attributes" => { "placementTypes" => BoardseshCreatives::PLACEMENTS.map { |placement, type| { "placementTypeId" => @supported ? type : "unsupported", "specMappings" => [{ "placementGroupId" => "creative", "specs" => [placement] }, { "placementGroupId" => "DEFAULT_PROFILE", "specs" => [placement] }] } } } }]
+      when /appStoreVersions\?/
+        @versions || [{ "id" => "version", "attributes" => { "appStoreState" => @live ? "READY_FOR_DISTRIBUTION" : "PREPARE_FOR_SUBMISSION", "createdDate" => "2026-10-01T00:00:00Z" } }]
+      when /appStoreVersionLocalizations\?/
+        %w[en-US es-ES es-MX fr-FR de-DE].map { |locale| { "id" => locale, "attributes" => { "locale" => locale } } }
+      when %r{/appAssetLibraries/library/(images|videos)}
+        type = path.include?("/images") ? "appAssetLibraryImages" : "appAssetLibraryVideos"
+        @assets.select { |asset| asset["type"] == type }
+      when %r{/v1/(appStoreVersionLocalizations|appCustomProductPageLocalizations)/([^/]+)/placements}
+        type, id = path.split("/")[2, 2]
+        relation = type == "appStoreVersionLocalizations" ? "appStoreVersionLocalization" : "appCustomProductPageLocalization"
+        query = URI.decode_www_form(URI(path).query).to_h
+        raise "Missing included placement linkage" unless query.fetch("include").split(",").sort == ["image", "video", relation].sort
+        @placements.select { |placement| placement.dig("relationships", relation, "data", "id") == id }
+      when %r{/v1/(appAssetLibraryImages|appAssetLibraryVideos)/([^/]+)/placements}
+        # Live reverse listings can be empty even when the destination has a placement.
+        []
+      else
+        raise "Unexpected GET list #{path}"
+      end
+    end
+
+    def request(method, path, body = nil)
+      return { "data" => { "type" => "appAssetLibraries", "id" => "library" } } if method == "GET" && path == "/v1/apps/app/assetLibrary"
+      @writes << [method, path, body]
+      if method == "POST" && path == "/v1/appAssetLibraryPlacements"
+        placement = body.fetch("data").merge("id" => "placement-#{@placements.length}")
+        @placements << placement
+        return { "data" => placement }
+      end
+      if method == "DELETE"
+        @placements.reject! { |placement| path.end_with?("/#{placement['id']}") }
+        return {}
+      end
+      payload = body.fetch("data")
+      if method == "POST"
+        asset = Marshal.load(Marshal.dump(payload)).merge("id" => "asset-#{@assets.length}")
+        asset["attributes"].merge!("state" => "AWAITING_UPLOAD", "uploadOperations" => [{ "offset" => 0, "length" => asset.dig("attributes", "fileSize") }])
+        @assets << asset
+      else
+        asset = @assets.find { |entry| entry["id"] == payload["id"] }
+        asset["attributes"]["state"] = "UPLOAD_COMPLETE"
+      end
+      { "data" => asset }
+    end
+
+    def upload(_operation, path)
+      @uploads << path
+    end
+  end
+
+  class FakeCppApple < FakeApple
+    attr_accessor :cpp_state
+
+    def list(path)
+      case path
+      when %r{\A/v1/apps/app/appCustomProductPages\?}
+        [{ "id" => "kilter-page", "attributes" => { "name" => "Boardsesh Kilter" } }]
+      when %r{\A/v1/appCustomProductPages/kilter-page/appCustomProductPageVersions\?}
+        [{ "id" => "kilter-version", "attributes" => { "state" => @cpp_state || "PREPARE_FOR_SUBMISSION" } }]
+      when %r{\A/v1/appCustomProductPageVersions/kilter-version/appCustomProductPageLocalizations\?}
+        %w[en-US es-ES es-MX fr-FR de-DE].map { |locale| { "id" => "cpp-#{locale}", "attributes" => { "locale" => locale } } }
+      else
+        super
+      end
+    end
+  end
+
+  def setup
+    @root = File.realpath(Dir.mktmpdir("creative-assets-test"))
+    @client = FakeApple.new
+    @manifest = { "locales" => { "en-US" => ["en-US"], "es" => %w[es-ES es-MX], "fr" => ["fr-FR"], "de" => ["de-DE"] }, "variants" => { "default" => { "assets" => [] } } }
+    @manifest.fetch("locales").each_key do |locale|
+      BoardseshCreatives::PLACEMENTS.each_key do |placement|
+        file = "#{locale}-#{placement}.#{placement == 'header' ? 'png' : 'mp4'}"
+        bytes = placement == "header" ? "\x89PNG\r\n\x1a\n".b + [13].pack("N") + "IHDR" + [3840, 1646].pack("NN") + [8, 2, 0, 0, 0].pack("C*") : "native-video-#{locale}"
+        File.binwrite(File.join(@root, file), bytes)
+        sha = Digest::SHA256.hexdigest(bytes)
+        proof_file = "#{locale}-#{placement}-proof.json"
+        output = { "file" => file, "sha256" => sha, "placement" => placement }
+        report = { "variant" => "default", "locale" => locale, "sources" => [{ "framesSha256" => "a" * 64, "marksSha256" => "b" * 64 }] }
+        report[placement == "header" ? "assets" : "video"] = placement == "header" ? [output] : output
+        File.write(File.join(@root, proof_file), JSON.generate(report))
+        @manifest["variants"]["default"]["assets"] << { "locale" => locale, "placement" => placement, "file" => file, "sha256" => sha, "placementGroup" => "creative", "specId" => placement, "provenance" => proof_file, "provenanceSha256" => Digest::SHA256.file(File.join(@root, proof_file)).hexdigest }
+      end
+    end
+    @probe = ->(_path) { { "streams" => [{ "codec_type" => "video", "codec_name" => "h264", "profile" => "High", "width" => 1920, "height" => 1280, "pix_fmt" => "yuv420p", "level" => 50, "avg_frame_rate" => "30/1" }], "format" => { "duration" => "15" } } }
+  end
+
+  def teardown
+    FileUtils.remove_entry(@root)
+  end
+
+  def runner
+    BoardseshCreatives::Runner.new(client: @client, repo_root: @root, manifest: @manifest, app_id: "app", cpp_manifest: {}, probe: @probe)
+  end
+
+  def upload_processed_assets
+    runner.run(action: "upload")
+    @client.assets.each { |asset| asset["attributes"]["state"] = "PREPARE_FOR_SUBMISSION" }
+  end
+
+  def use_kilter_manifest
+    config = @manifest.fetch("variants").delete("default")
+    @manifest.fetch("variants")["kilter"] = config
+    config.fetch("assets").each do |asset|
+      path = File.join(@root, asset.fetch("provenance"))
+      proof = JSON.parse(File.read(path))
+      proof["variant"] = "kilter"
+      File.write(path, JSON.generate(proof))
+      asset["provenanceSha256"] = Digest::SHA256.file(path).hexdigest
+    end
+  end
+
+  def test_search_only_update_preserves_header_placements
+    upload_processed_assets
+    runner.run(action: "place")
+    headers = @client.placements.select { |entry| entry.dig("attributes", "placementType") == "PRODUCT_PAGE_HEADER_ASSET" }
+    @client.writes.clear
+    @manifest["variants"]["default"]["assets"].select! { |entry| entry["placement"] == "search-results" }
+    assert_equal 5, runner.run(action: "place", placement: "search").length
+    assert_empty @client.writes
+    assert_equal headers, @client.placements.select { |entry| entry.dig("attributes", "placementType") == "PRODUCT_PAGE_HEADER_ASSET" }
+  end
+
+  def test_search_only_rejects_a_named_header_only_variant_before_writes
+    header_only = Marshal.load(Marshal.dump(@manifest.fetch("variants").fetch("default")))
+    header_only.fetch("assets").select! { |asset| asset["placement"] == "header" }
+    @manifest.fetch("variants")["kilter"] = header_only
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload", variant: "default,kilter", placement: "search") }
+    assert_match(/Unfinalized creative variants: kilter/, error.message)
+    assert_empty @client.writes
+  end
+
+  def test_all_pages_search_run_skips_pages_without_a_search_video
+    header_only = Marshal.load(Marshal.dump(@manifest.fetch("variants").fetch("default")))
+    header_only.fetch("assets").select! { |asset| asset["placement"] == "header" }
+    @manifest.fetch("variants")["kilter"] = header_only
+    @manifest.fetch("variants")["spray"] = { "cpp" => "spray", "assets" => [] }
+    results = runner.run(action: "upload", placement: "search")
+    assert_equal 5, results.length
+    assert results.all? { |result| result.fetch("variant") == "default" }
+    @manifest.fetch("variants").fetch("default")["assets"] = []
+    assert_equal "pending", runner.run(action: "plan", placement: "search").first.fetch("action")
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload", placement: "search") }
+  end
+
+  def test_search_only_places_new_search_videos_without_touching_headers
+    upload_processed_assets
+    runner.run(action: "place")
+    headers = @client.placements.select { |entry| entry.dig("attributes", "placementType") == "PRODUCT_PAGE_HEADER_ASSET" }
+    @client.placements.reject! { |entry| entry.dig("attributes", "placementType") == "APP_STORE_SEARCH_RESULTS_ASSET" }
+    @client.writes.clear
+    assert_equal 5, runner.run(action: "place", placement: "search").length
+    assert_equal 5, @client.writes.length
+    assert @client.writes.all? { |method, _path, body| method == "POST" && body.dig("data", "attributes", "placementType") == "APP_STORE_SEARCH_RESULTS_ASSET" }
+    assert_equal headers, @client.placements.select { |entry| entry.dig("attributes", "placementType") == "PRODUCT_PAGE_HEADER_ASSET" }
+  end
+
+  def test_plan_is_read_only_and_spanish_maps_to_both_storefronts
+    results = runner.run
+    assert_equal 10, results.length
+    assert_empty @client.writes
+    assert_equal %w[es-ES es-MX], results.select { |entry| entry["placement"] == "header" && entry["locale"].start_with?("es") }.map { |entry| entry["locale"] }
+  end
+
+  def test_upload_deduplicates_spanish_and_reuses_uploaded_assets
+    runner.run(action: "upload")
+    assert_equal 8, @client.assets.length
+    assert_equal 8, @client.uploads.length
+    assert_equal 16, @client.writes.length
+    @client.writes.clear
+    runner.run(action: "upload")
+    assert_empty @client.writes
+    assert_equal "00:00:00:00", @client.assets.find { |asset| asset["type"] == "appAssetLibraryVideos" }.dig("attributes", "previewFrameTimeCode")
+  end
+
+  def test_place_is_idempotent_and_uses_localization_relationship
+    upload_processed_assets
+    runner.run(action: "place")
+    assert_equal 10, @client.placements.length
+    assert @client.placements.all? { |placement| placement.dig("relationships", "appStoreVersionLocalization", "data", "type") == "appStoreVersionLocalizations" }
+    @client.writes.clear
+    assert runner.run(action: "place").all? { |result| result["action"] == "unchanged" }
+    assert_empty @client.writes
+  end
+
+  def test_existing_destination_placements_are_reused_when_reverse_lists_are_empty
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.placements.each { |placement| placement["attributes"]["state"] = "PARENT_PREPARE_FOR_SUBMISSION" }
+    @client.reads.clear
+    @client.writes.clear
+    results = runner.run(action: "place")
+    assert results.all? { |result| result.fetch("action") == "unchanged" && result.fetch("placementState") == "PARENT_PREPARE_FOR_SUBMISSION" }
+    assert_empty @client.writes
+    placement_reads = @client.reads.select { |path| path.include?("/placements?") }
+    assert_equal 5, placement_reads.length
+    assert placement_reads.all? { |path| path.start_with?("/v1/appStoreVersionLocalizations/") }
+  end
+
+  def test_owned_destination_replacement_needs_approval
+    upload_processed_assets
+    runner.run(action: "place")
+    previous = Marshal.load(Marshal.dump(@client.assets.first))
+    previous["id"] = "previous-owned-header"
+    previous["attributes"]["fileName"] = "default-header-en-US-#{'f' * 12}.png"
+    @client.assets << previous
+    @client.placements.first["relationships"]["image"]["data"]["id"] = previous.fetch("id")
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_includes error.message, "allow_replace:true"
+    assert_empty @client.writes
+    runner.run(action: "place", allow_replace: true)
+    assert_equal %w[DELETE POST], @client.writes.map(&:first)
+  end
+
+  def test_foreign_destination_placement_is_never_deleted_even_with_replacement_approval
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.placements.first["relationships"]["image"]["data"]["id"] = "foreign-not-in-creative-library"
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", allow_replace: true) }
+    assert_includes error.message, "unowned placement"
+    assert_empty @client.writes
+  end
+
+  def test_duplicate_destination_slot_blocks_every_write
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.placements << Marshal.load(Marshal.dump(@client.placements.last)).merge("id" => "duplicate")
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_includes error.message, "Multiple placements"
+    assert_empty @client.writes
+  end
+
+  def test_missing_asset_linkage_blocks_every_write
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.placements.last["relationships"].delete("video")
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_includes error.message, "missing or ambiguous asset linkage"
+    assert_empty @client.writes
+  end
+
+  def test_incorrect_destination_linkage_blocks_every_write
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.placements.last["relationships"]["appStoreVersionLocalization"]["data"]["type"] = "appCustomProductPageLocalizations"
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_includes error.message, "Unexpected creative placement destination"
+    assert_empty @client.writes
+  end
+
+  def test_ambiguous_asset_linkage_blocks_every_write
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.placements.last["relationships"]["image"] = { "data" => { "type" => "appAssetLibraryImages", "id" => "other-image" } }
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_includes error.message, "missing or ambiguous asset linkage"
+    assert_empty @client.writes
+  end
+
+  def test_live_default_response_reuses_header_and_search_assignments
+    upload_processed_assets
+    @manifest["locales"] = { "en-US" => ["en-US"] }
+    @manifest["variants"]["default"]["assets"].select! { |asset| asset.fetch("locale") == "en-US" }
+    install_live_placement_fixture("default", "appStoreVersionLocalization", "en-US")
+    @client.writes.clear
+    results = runner.run(action: "place")
+    assert_equal 2, results.length
+    assert results.all? { |result| result.fetch("action") == "unchanged" && result.fetch("placementState") == "ACTIVE" }
+    assert_empty @client.writes
+  end
+
+  def test_live_cpp_response_reuses_search_assignment
+    @client = FakeCppApple.new
+    use_kilter_manifest
+    upload_processed_assets
+    @manifest["locales"] = { "en-US" => ["en-US"] }
+    @manifest["variants"]["kilter"]["assets"].select! { |asset| asset.fetch("locale") == "en-US" && asset.fetch("placement") == "search-results" }
+    install_live_placement_fixture("cpp", "appCustomProductPageLocalization", "cpp-en-US")
+    @client.writes.clear
+    cpp = { "targets" => { "kilter" => { "referenceName" => "Boardsesh Kilter" } } }
+    cpp_runner = BoardseshCreatives::Runner.new(client: @client, repo_root: @root, manifest: @manifest, app_id: "app", cpp_manifest: cpp, probe: @probe)
+    results = cpp_runner.run(action: "place", placement: "search")
+    assert_equal 1, results.length
+    assert_equal "unchanged", results.first.fetch("action")
+    assert_equal "ACTIVE", results.first.fetch("placementState")
+    assert_empty @client.writes
+  end
+
+  # Keep Apple's full response shape; substitute only this test's local identities.
+  def install_live_placement_fixture(name, relationship, destination_id)
+    fixture = JSON.parse(File.read(File.join(__dir__, "fixtures", "creative-placements", "#{name}.json")))
+    @client.placements.replace(fixture.fetch("response").fetch("data"))
+    @client.placements.each { |placement| placement.fetch("relationships").fetch(relationship).fetch("data")["id"] = destination_id }
+    @manifest.fetch("variants").each_value do |variant|
+      variant.fetch("assets").each do |entry|
+        entry["placementGroup"] = "DEFAULT_PROFILE"
+        placement = @client.placements.find { |candidate| candidate.dig("attributes", "placementType") == BoardseshCreatives::PLACEMENTS.fetch(entry.fetch("placement")) }
+        relation = entry.fetch("placement") == "header" ? "image" : "video"
+        local_asset = @client.assets.find { |asset| asset.dig("attributes", "fileName").end_with?("#{entry.fetch('sha256')[0, 12]}.#{relation == 'image' ? 'png' : 'mp4'}") }
+        local_asset["id"] = placement.fetch("relationships").fetch(relation).fetch("data").fetch("id")
+      end
+    end
+  end
+
+  def test_changed_placement_requires_deletion_approval
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.writes.clear
+    @client.placements.first["relationships"]["image"]["data"]["id"] = @client.assets[2]["id"]
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_empty @client.writes
+  end
+
+  def test_unsupported_refdata_blocks_before_writes
+    @client.supported = false
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_hash_tampering_blocks_entire_upload
+    File.write(File.join(@root, "de-search-results.mp4"), "changed")
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_missing_locale_blocks_entire_upload
+    @manifest["variants"]["default"]["assets"].pop
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_bound_marketing_version_refuses_a_newer_train_before_any_placement
+    upload_processed_assets
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "newer", "attributes" => { "versionString" => "2.7.0", "appStoreState" => "PREPARE_FOR_SUBMISSION" } }]
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", placement: "search") }
+    assert_includes error.message, "marketing version 2.6.0"
+    assert_empty @client.writes
+  end
+
+  def test_bound_marketing_version_places_only_matching_editable_version
+    upload_processed_assets
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "matching", "attributes" => { "versionString" => "2.6.0", "appStoreState" => "PREPARE_FOR_SUBMISSION" } }, { "id" => "other", "attributes" => { "versionString" => "2.7.0", "appStoreState" => "PREPARE_FOR_SUBMISSION" } }]
+    @client.writes.clear
+    assert_equal 5, runner.run(action: "place", placement: "search").length
+    assert_includes @client.reads, "/v1/appStoreVersions/matching/appStoreVersionLocalizations?limit=200"
+    refute_includes @client.reads, "/v1/appStoreVersions/other/appStoreVersionLocalizations?limit=200"
+  end
+
+  def test_bound_live_version_needs_approval_and_does_not_choose_newer_editable_train
+    upload_processed_assets
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "matching-live", "attributes" => { "versionString" => "2.6.0", "appStoreState" => "READY_FOR_DISTRIBUTION", "createdDate" => "2026-10-01T00:00:00Z" } }, { "id" => "newer", "attributes" => { "versionString" => "2.7.0", "appStoreState" => "PREPARE_FOR_SUBMISSION" } }]
+    @client.writes.clear
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", placement: "search") }
+    assert_empty @client.writes
+    assert_equal 5, runner.run(action: "place", placement: "search", allow_live: true).length
+    assert_includes @client.reads, "/v1/appStoreVersions/matching-live/appStoreVersionLocalizations?limit=200"
+  end
+
+  def test_cpp_only_bound_manifest_checks_app_train_before_placement
+    use_kilter_manifest
+    runner.run(action: "upload", placement: "search")
+    @client.assets.each { |asset| asset["attributes"]["state"] = "PREPARE_FOR_SUBMISSION" }
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "newer", "attributes" => { "versionString" => "2.7.0", "appStoreState" => "PREPARE_FOR_SUBMISSION" } }]
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", variant: "kilter", placement: "search") }
+    assert_includes error.message, "marketing version 2.6.0"
+    assert_empty @client.writes
+  end
+
+  def test_modern_app_version_state_places_the_matching_editable_train
+    upload_processed_assets
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "modern-draft", "attributes" => { "versionString" => "2.6.0", "appVersionState" => "PREPARE_FOR_SUBMISSION" } }]
+    @client.writes.clear
+    assert_equal 5, runner.run(action: "place", placement: "search").length
+    assert_includes @client.reads, "/v1/appStoreVersions/modern-draft/appStoreVersionLocalizations?limit=200"
+  end
+
+  def test_cpp_only_bound_manifest_places_while_matching_app_waits_for_review
+    @client = FakeCppApple.new
+    use_kilter_manifest
+    cpp = { "targets" => { "kilter" => { "referenceName" => "Boardsesh Kilter" } } }
+    cpp_runner = BoardseshCreatives::Runner.new(client: @client, repo_root: @root, manifest: @manifest, app_id: "app", cpp_manifest: cpp, probe: @probe)
+    cpp_runner.run(action: "upload", placement: "search")
+    @client.assets.each { |asset| asset["attributes"]["state"] = "PREPARE_FOR_SUBMISSION" }
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "matching-waiting", "attributes" => { "versionString" => "2.6.0", "appVersionState" => "WAITING_FOR_REVIEW" } }]
+    @client.writes.clear
+
+    result = cpp_runner.run(action: "place", variant: "kilter", placement: "search")
+    assert_equal 5, result.length
+    assert_equal 5, @client.placements.length
+    assert @client.placements.all? { |placement| placement.dig("relationships", "appCustomProductPageLocalization", "data", "type") == "appCustomProductPageLocalizations" }
+    refute @client.reads.any? { |path| path.include?("/appStoreVersionLocalizations?") }
+
+    @client.writes.clear
+    @client.versions = [{ "id" => "newer", "attributes" => { "versionString" => "2.7.0", "appVersionState" => "PREPARE_FOR_SUBMISSION" } }]
+    error = assert_raises(BoardseshCreatives::Error) { cpp_runner.run(action: "place", variant: "kilter", placement: "search") }
+    assert_includes error.message, "marketing version 2.6.0"
+    assert_empty @client.writes
+
+    @client.versions = [{ "id" => "matching-waiting", "attributes" => { "versionString" => "2.6.0", "appVersionState" => "WAITING_FOR_REVIEW" } }]
+    @client.cpp_state = "APPROVED"
+    error = assert_raises(BoardseshCreatives::Error) { cpp_runner.run(action: "place", variant: "kilter", placement: "search") }
+    assert_includes error.message, "editable CPP version"
+    assert_empty @client.writes
+    assert_equal 5, cpp_runner.run(action: "place", variant: "kilter", placement: "search", allow_live: true).length
+  end
+
+  def test_default_and_all_bound_placements_reject_submitted_app_even_with_live_approval
+    upload_processed_assets
+    @manifest["marketingVersion"] = "2.6.0"
+    %w[WAITING_FOR_REVIEW IN_REVIEW].each do |state|
+      @client.versions = [{ "id" => "matching-submitted", "attributes" => { "versionString" => "2.6.0", "appVersionState" => state, "appStoreState" => "PREPARE_FOR_SUBMISSION" } }]
+      %w[default all].each do |variant|
+        @client.writes.clear
+        assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", variant: variant, placement: "search", allow_live: true) }
+        assert_empty @client.writes
+        assert_empty @client.placements
+      end
+    end
+  end
+
+  def test_modern_live_state_keeps_live_approval_required_when_legacy_state_differs
+    upload_processed_assets
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "modern-live", "attributes" => { "versionString" => "2.6.0", "appVersionState" => "READY_FOR_DISTRIBUTION", "appStoreState" => "PREPARE_FOR_SUBMISSION", "createdDate" => "2026-10-01T00:00:00Z" } }]
+    @client.writes.clear
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", placement: "search") }
+    assert_empty @client.writes
+    assert_equal 5, runner.run(action: "place", placement: "search", allow_live: true).length
+    assert_includes @client.reads, "/v1/appStoreVersions/modern-live/appStoreVersionLocalizations?limit=200"
+  end
+
+  def test_live_version_requires_explicit_option
+    @client.live = true
+    upload_processed_assets
+    @client.writes.clear
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_empty @client.writes
+    assert_equal 10, runner.run(action: "plan", allow_live: true).length
+    assert_equal 10, runner.run(action: "place", allow_live: true).length
+  end
+
+  def test_upload_needs_no_version_localization_or_placement_access
+    @client.destinations_available = false
+    runner.run(action: "upload")
+    assert_equal 8, @client.uploads.length
+    assert_equal 8, @client.assets.length
+    @client.writes.clear
+    assert runner.run(action: "upload").all? { |result| result["action"] == "unchanged" }
+    assert_empty @client.writes
+  end
+
+  def test_cpp_upload_needs_no_cpp_version_localization_or_manifest_target
+    use_kilter_manifest
+    @client.destinations_available = false
+    runner.run(action: "upload")
+    assert_equal 8, @client.uploads.length
+    assert @client.assets.all? { |asset| asset.dig("attributes", "fileName").start_with?("kilter-") }
+  end
+
+  def test_processing_asset_blocks_entire_placement_batch
+    %w[UPLOAD_COMPLETE COMPLETE].each do |state|
+      upload_processed_assets
+      @client.assets.last["attributes"]["state"] = state
+      @client.writes.clear
+      error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+      assert_includes error.message, state
+      assert_includes error.message, "PREPARE_FOR_SUBMISSION"
+      assert_empty @client.writes
+      assert_empty @client.placements
+    end
+  end
+
+  def test_processing_asset_blocks_earlier_placement_replacement
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.assets.last["attributes"]["state"] = "UPLOAD_COMPLETE"
+    previous_asset = Marshal.load(Marshal.dump(@client.assets.first))
+    previous_asset["id"] = "previous-owned-header"
+    previous_asset["attributes"]["fileName"] = "default-header-en-US-#{'f' * 12}.png"
+    @client.assets << previous_asset
+    @client.placements.first["relationships"]["image"]["data"]["id"] = previous_asset.fetch("id")
+    original_placements = Marshal.load(Marshal.dump(@client.placements))
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", allow_replace: true) }
+    assert_includes error.message, "UPLOAD_COMPLETE"
+    assert_empty @client.writes
+    assert_equal original_placements, @client.placements
+  end
+
+  def test_latest_live_version_is_selected_among_historical_versions
+    @client.versions = [
+      { "id" => "older", "attributes" => { "appStoreState" => "READY_FOR_SALE", "createdDate" => "2025-12-31T23:59:59Z" } },
+      { "id" => "current", "attributes" => { "appStoreState" => "READY_FOR_DISTRIBUTION", "createdDate" => "2026-10-01T00:00:00Z" } },
+      { "id" => "historical", "attributes" => { "appStoreState" => "READY_FOR_SALE", "createdDate" => "2026-05-01T00:00:00Z" } }
+    ]
+    upload_processed_assets
+    @client.reads.clear
+    runner.run(action: "place", allow_live: true)
+    localization_reads = @client.reads.select { |path| path.include?("/appStoreVersionLocalizations?") }
+    refute_empty localization_reads
+    assert localization_reads.all? { |path| path.start_with?("/v1/appStoreVersions/current/") }
+    assert_equal 10, @client.placements.length
+  end
+
+  def test_uncertain_live_dates_block_all_placement_writes
+    [nil, "not-a-date", "2026-10-01T00:00:00", "2026-02-30T00:00:00Z", "2026-10-01T00:00:00Z"].each do |uncertain_date|
+      @client.versions = [
+        { "id" => "current", "attributes" => { "appStoreState" => "READY_FOR_DISTRIBUTION", "createdDate" => "2026-10-01T00:00:00Z" } },
+        { "id" => "other", "attributes" => { "appStoreState" => "READY_FOR_SALE", "createdDate" => uncertain_date } }
+      ]
+      upload_processed_assets
+      @client.writes.clear
+      assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", allow_live: true) }
+      assert_empty @client.writes
+      assert_empty @client.placements
+    end
+  end
+
+  def test_level_four_video_is_rejected
+    @probe = ->(_path) { { "streams" => [{ "codec_type" => "video", "codec_name" => "h264", "profile" => "High", "width" => 1920, "height" => 1280, "pix_fmt" => "yuv420p", "level" => 40, "avg_frame_rate" => "30/1" }], "format" => { "duration" => "15" } } }
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_audio_video_is_rejected_before_upload
+    valid_probe = @probe
+    @probe = ->(path) { result = valid_probe.call(path); result["streams"] << { "codec_type" => "audio" }; result }
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_failed_placement_is_not_successfully_unchanged
+    upload_processed_assets
+    runner.run(action: "place")
+    @client.placements.last["attributes"]["state"] = "FAILED"
+    @client.writes.clear
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_empty @client.writes
+  end
+
+  def test_late_failed_asset_blocks_before_any_write
+    runner.run(action: "upload")
+    @client.assets.shift
+    @client.assets.last["attributes"]["state"] = "FAILED"
+    @client.writes.clear
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_changed_provenance_blocks_upload
+    File.write(File.join(@root, "de-search-results-proof.json"), "{}")
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_media_rehash_cannot_reuse_stale_provenance
+    file = File.join(@root, "de-search-results.mp4")
+    File.write(file, "overwritten native video")
+    @manifest["variants"]["default"]["assets"].last["sha256"] = Digest::SHA256.file(file).hexdigest
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_empty @client.writes
+  end
+
+  def test_cpp_placements_bind_to_cpp_localizations_in_every_store_locale
+    @client = FakeCppApple.new
+    use_kilter_manifest
+    cpp = { "targets" => { "kilter" => { "referenceName" => "Boardsesh Kilter" } } }
+    cpp_runner = BoardseshCreatives::Runner.new(client: @client, repo_root: @root, manifest: @manifest, app_id: "app", cpp_manifest: cpp, probe: @probe)
+    cpp_runner.run(action: "upload")
+    @client.assets.each { |asset| asset["attributes"]["state"] = "PREPARE_FOR_SUBMISSION" }
+    cpp_runner.run(action: "place")
+    assert_equal 10, @client.placements.length
+    assert @client.placements.all? { |placement| placement.dig("relationships", "appCustomProductPageLocalization", "data", "type") == "appCustomProductPageLocalizations" }
+    refute @client.placements.any? { |placement| placement.fetch("relationships").key?("appStoreVersionLocalization") }
+    @client.writes.clear
+    @client.reads.clear
+    assert cpp_runner.run(action: "place").all? { |result| result.fetch("action") == "unchanged" }
+    assert_empty @client.writes
+    assert_equal 5, @client.reads.count { |path| path.start_with?("/v1/appCustomProductPageLocalizations/") && path.include?("/placements?") }
+  end
+
+  def test_comma_list_reconciles_only_shipped_variants_and_rejects_bad_lists
+    @manifest.fetch("variants")["spray"] = { "cpp" => "spray", "assets" => [] }
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload", variant: "default,spray", placement: "search") }
+    assert_match(/Unfinalized creative variants: spray/, error.message)
+    ["default,default", "default,", ",default", "default,kilterx", ""].each do |variant|
+      assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload", variant: variant, placement: "search") }
+    end
+    assert_empty @client.writes
+    assert_equal 5, runner.run(action: "upload", variant: "default", placement: "search").length
+    @client.assets.each { |asset| asset["attributes"]["state"] = "PREPARE_FOR_SUBMISSION" }
+    @manifest["marketingVersion"] = "2.6.0"
+    @client.versions = [{ "id" => "newer", "attributes" => { "versionString" => "2.7.0", "appStoreState" => "PREPARE_FOR_SUBMISSION" } }]
+    @client.writes.clear
+    error = assert_raises(BoardseshCreatives::Error) { runner.run(action: "place", variant: "default", placement: "search") }
+    assert_includes error.message, "marketing version 2.6.0"
+    assert_empty @client.writes
+  end
+
+  def test_pending_manifest_is_not_an_upload_success
+    @manifest.fetch("variants").fetch("default")["assets"] = []
+    assert_equal "pending", runner.run(action: "plan").first.fetch("action")
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "upload") }
+    assert_raises(BoardseshCreatives::Error) { runner.run(action: "place") }
+    assert_empty @client.writes
+  end
+end

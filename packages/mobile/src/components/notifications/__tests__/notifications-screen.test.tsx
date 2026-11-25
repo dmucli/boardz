@@ -21,14 +21,18 @@ const fetchNextPage = vi.hoisted(() => vi.fn());
 const refetch = vi.hoisted(() => vi.fn());
 const markGroupMutate = vi.hoisted(() => vi.fn());
 const markAllMutate = vi.hoisted(() => vi.fn());
+const answerFollowRequest = vi.hoisted(() => vi.fn());
+const undoSetupChange = vi.hoisted(() => vi.fn());
 const openPlayDrawer = vi.hoisted(() => vi.fn());
 const openClimbInPlayDrawer = vi.hoisted(() => vi.fn());
 
 // Mutable slices each test dials in.
 const state = vi.hoisted(() => ({
   query: null as unknown as Query,
+  focused: true,
   unreadCount: 0,
   offline: { isOffline: false, isBlocked: false, reason: null as null | 'offline' | 'error' },
+  setupSuggestions: false,
 }));
 
 // The FlashList props the screen last handed down, so the perf test can compare
@@ -54,9 +58,11 @@ vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => k
 // `useRouter` hands back one stable object, matching expo-router: its
 // implementation returns the module-level imperative api, not a fresh handle.
 const routerMock = vi.hoisted(() => ({ push: vi.fn() }));
+const groupedEnabled = vi.hoisted(() => vi.fn());
 
 vi.mock('expo-router', () => ({
   useNavigation: () => navMock,
+  useIsFocused: () => state.focused,
   useRouter: () => routerMock,
 }));
 
@@ -103,12 +109,16 @@ vi.mock('@shopify/flash-list', () => ({
 }));
 
 vi.mock('../../../lib/graphql/hooks/use-notifications', () => ({
-  useGroupedNotifications: () => state.query,
+  useGroupedNotifications: (enabled: boolean) => {
+    groupedEnabled(enabled);
+    return state.query;
+  },
   useUnreadNotificationCount: () => state.unreadCount,
   // Stable objects: an unstable `mutate` would churn the nav callback and, with
   // it, `renderItem` — which is exactly what the perf test measures.
   useMarkGroupAsRead: () => ({ mutate: markGroupMutate }),
   useMarkAllAsRead: () => ({ mutate: markAllMutate }),
+  useAnswerFollowRequest: () => answerFollowRequest,
 }));
 
 vi.mock('../../../hooks/use-offline-query-state', () => ({ useOfflineQueryState: () => state.offline }));
@@ -134,12 +144,23 @@ const activeBoardMock = vi.hoisted(() => ({
 vi.mock('../../../lib/graphql/use-active-board', () => ({ useActiveBoard: () => activeBoardMock }));
 vi.mock('../../../providers/drawer-host-provider', () => ({ useDrawerHost: () => ({ openPlayDrawer }) }));
 vi.mock('../../../lib/open-climb-in-play-drawer', () => ({ openClimbInPlayDrawer }));
-vi.mock('../../../providers/feature-flags-provider', () => ({ useClimbModerationEnabled: () => true }));
+vi.mock('../../../providers/feature-flags-provider', () => ({
+  useClimbModerationEnabled: () => true,
+  useDirectoryReportsEnabled: () => true,
+  useDirectorySetupSuggestionsEnabled: () => state.setupSuggestions,
+}));
+// Its confirm and mutation have their own suite; the screen only hands it on.
+vi.mock('../use-undo-setup-change', () => ({ useUndoSetupChange: () => undoSetupChange }));
 
 vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
 vi.mock('../../Icon', () => ({ Icon: ({ name }: { name: string }) => createElement('span', { 'data-icon': name }) }));
+// The shared header action; its own look is covered by header-action-buttons.test.
+vi.mock('../../HeaderActionButtons', () => ({
+  HeaderTrailingButton: ({ label, onPress, prominent }: { label: string; onPress: () => void; prominent?: boolean }) =>
+    createElement('button', { onClick: onPress, 'data-header-action': prominent ? 'prominent' : 'plain' }, label),
+}));
 vi.mock('../../ActivityIndicator', () => ({
   ActivityIndicator: () => createElement('div', { 'data-spinner': 'true' }),
 }));
@@ -164,10 +185,28 @@ vi.mock('../NotificationRow', () => ({
   NotificationRow: ({
     notification,
     onPress,
+    onAnswerFollowRequest,
+    onUndoSetupChange,
   }: {
     notification: GroupedNotification;
     onPress: (notification: GroupedNotification) => void;
-  }) => createElement('button', { 'data-row': notification.uuid, onClick: () => onPress(notification) }),
+    onAnswerFollowRequest?: (input: { notification: GroupedNotification; answer: 'approve' | 'decline' }) => void;
+    onUndoSetupChange?: (notification: GroupedNotification) => void;
+  }) =>
+    createElement(
+      'div',
+      null,
+      createElement('button', { 'data-row': notification.uuid, onClick: () => onPress(notification) }),
+      onAnswerFollowRequest
+        ? createElement('button', {
+            'data-approve': notification.uuid,
+            onClick: () => onAnswerFollowRequest({ notification, answer: 'approve' }),
+          })
+        : null,
+      onUndoSetupChange
+        ? createElement('button', { 'data-undo': notification.uuid, onClick: () => onUndoSetupChange(notification) })
+        : null,
+    ),
 }));
 
 import NotificationsScreen from '../NotificationsScreen';
@@ -218,8 +257,10 @@ function lastHeaderRight(): unknown {
 beforeEach(() => {
   vi.clearAllMocks();
   state.query = makeQuery();
+  state.focused = true;
   state.unreadCount = 0;
   state.offline = { isOffline: false, isBlocked: false, reason: null };
+  state.setupSuggestions = false;
   list.renderItem = null;
   list.keyExtractor = null;
   list.getItemType = null;
@@ -229,6 +270,15 @@ beforeEach(() => {
 });
 
 describe('NotificationsScreen states', () => {
+  it('disables its list query while hidden and enables it when focused', () => {
+    state.focused = false;
+    const { rerender } = render(<NotificationsScreen />);
+    expect(groupedEnabled).toHaveBeenLastCalledWith(false);
+    state.focused = true;
+    rerender(<NotificationsScreen />);
+    expect(groupedEnabled).toHaveBeenLastCalledWith(true);
+  });
+
   it('renders the empty copy when the list came back empty', () => {
     const { container, queryByText } = render(<NotificationsScreen />);
     expect(queryByText('empty')).not.toBeNull();
@@ -273,7 +323,13 @@ describe('NotificationsScreen mark all as read', () => {
     state.unreadCount = 3;
     state.query = makeQuery({ data: { pages: [{ groups: [makeNotification()], hasMore: false, unreadCount: 3 }] } });
     render(<NotificationsScreen />);
-    expect(lastHeaderRight()).toBeTypeOf('function');
+    const headerRight = lastHeaderRight();
+    expect(headerRight).toBeTypeOf('function');
+    // The shared plain header action (label colour, label type), not ad-hoc text.
+    const action = render(<>{(headerRight as () => ReactNode)()}</>).getByText('markAllRead');
+    expect(action.getAttribute('data-header-action')).toBe('plain');
+    fireEvent.click(action);
+    expect(markAllMutate).toHaveBeenCalledTimes(1);
   });
 
   it('withholds the action while the count has resolved but the list has not', () => {
@@ -428,13 +484,18 @@ describe('NotificationsScreen row taps', () => {
 });
 
 describe('NotificationsScreen thread rows', () => {
-  // The regression this guards: these five types used to mark themselves read
+  // The regression this guards: the first five types used to mark themselves read
   // and go NOWHERE, because the resolver never gave them a climbUuid and the
   // climb branch was the only fallback.
   const threadCases = [
     { type: 'comment_on_tick', threadEntityType: 'tick', threadEntityId: 'tick-9' },
     { type: 'comment_reply', threadEntityType: 'session', threadEntityId: 'session-2' },
     { type: 'comment_on_climb', threadEntityType: 'climb', threadEntityId: 'climb-4' },
+    // The owner rows (#6385) open the thread on the owner's item.
+    { type: 'comment_on_session', threadEntityType: 'session', threadEntityId: 'session-2' },
+    { type: 'comment_on_playlist', threadEntityType: 'playlist_climb', threadEntityId: 'playlist-1:_all' },
+    { type: 'comment_on_board', threadEntityType: 'board', threadEntityId: 'board-1' },
+    { type: 'comment_on_gym', threadEntityType: 'gym', threadEntityId: 'gym-1' },
     { type: 'vote_on_tick', threadEntityType: 'tick', threadEntityId: 'tick-9' },
     // A vote names the COMMENT; the resolver walks it to the thread it sits in,
     // which is what the row must open.
@@ -649,7 +710,93 @@ describe('NotificationsScreen follower rows', () => {
   });
 });
 
+describe('NotificationsScreen follow request rows', () => {
+  const request = () =>
+    makeNotification({
+      uuid: 'request-1',
+      type: 'follow_request',
+      entityId: 'requester-1',
+      actors: [{ id: 'requester-1', displayName: 'Jo', avatarUrl: null }],
+    });
+
+  it("opens the requester's profile", () => {
+    state.query = makeQuery({ data: { pages: [{ groups: [request()], hasMore: false, unreadCount: 1 }] } });
+
+    const { container } = render(<NotificationsScreen />);
+    fireEvent.click(container.querySelector('[data-row="request-1"]')!);
+
+    expect(routerMock.push).toHaveBeenCalledWith({ pathname: '/users/[userId]', params: { userId: 'requester-1' } });
+  });
+
+  it('hands the row the answer handler, which approves through the hook', () => {
+    const notification = request();
+    state.query = makeQuery({ data: { pages: [{ groups: [notification], hasMore: false, unreadCount: 1 }] } });
+
+    const { container } = render(<NotificationsScreen />);
+    fireEvent.click(container.querySelector('[data-approve="request-1"]')!);
+
+    expect(answerFollowRequest).toHaveBeenCalledWith({ notification, answer: 'approve' });
+  });
+
+  it('pools follow request rows apart from plain and board-art rows', () => {
+    const plainRow = makeNotification({ uuid: 'plain' });
+    const requestRow = request();
+    state.query = makeQuery({ data: { pages: [{ groups: [requestRow, plainRow], hasMore: false, unreadCount: 1 }] } });
+
+    render(<NotificationsScreen />);
+
+    expect(list.getItemType!(requestRow)).toBe('followRequest');
+    expect(list.getItemType!(requestRow)).not.toBe(list.getItemType!(plainRow));
+  });
+});
+
+describe("NotificationsScreen climbers' setup changes", () => {
+  const change = () =>
+    makeNotification({
+      uuid: 'change-1',
+      type: 'board_setup_changed_by_climber',
+      entityType: 'board',
+      entityId: 'board-1',
+      actors: [],
+    });
+
+  it('hands the row Undo while the setup flag is on', () => {
+    state.setupSuggestions = true;
+    const notification = change();
+    state.query = makeQuery({ data: { pages: [{ groups: [notification], hasMore: false, unreadCount: 1 }] } });
+
+    const { container } = render(<NotificationsScreen />);
+    fireEvent.click(container.querySelector('[data-undo="change-1"]')!);
+
+    expect(undoSetupChange).toHaveBeenCalledWith(notification);
+    expect(list.getItemType!(notification)).toBe('setupChange');
+  });
+
+  it('keeps Undo off the row while the flag is off, and the row still opens the board', () => {
+    state.query = makeQuery({ data: { pages: [{ groups: [change()], hasMore: false, unreadCount: 1 }] } });
+
+    const { container } = render(<NotificationsScreen />);
+    expect(container.querySelector('[data-undo="change-1"]')).toBeNull();
+    fireEvent.click(container.querySelector('[data-row="change-1"]')!);
+
+    expect(routerMock.push).toHaveBeenCalledWith({ pathname: '/boards', params: { board: 'board-1', details: '1' } });
+  });
+});
+
 describe('NotificationsScreen pagination', () => {
+  it('does not load another page while hidden or refreshing', () => {
+    state.query = makeQuery({ hasNextPage: true });
+    state.focused = false;
+    const { rerender } = render(<NotificationsScreen />);
+    list.onEndReached?.();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+    state.focused = true;
+    state.query = makeQuery({ hasNextPage: true, isRefetching: true, fetchStatus: 'fetching' });
+    rerender(<NotificationsScreen />);
+    list.onEndReached?.();
+    expect(fetchNextPage).not.toHaveBeenCalled();
+  });
+
   it('fetches exactly one page per end-reach', () => {
     state.query = makeQuery({
       data: { pages: [{ groups: [makeNotification()], hasMore: true, unreadCount: 0 }] },

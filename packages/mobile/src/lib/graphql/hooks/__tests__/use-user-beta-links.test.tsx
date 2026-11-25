@@ -18,6 +18,12 @@ vi.mock('../../client', () => ({
 // hooks. useUserBetaLinks touches none of them, so stub the heavy re-exports so
 // the barrel parses under the node/jsdom transform (mirrors use-recent-beta-links).
 vi.mock('react-native', () => ({}));
+// The barrel reaches the sync adapter; pagination does not use native credentials.
+vi.mock('../../../auth-store', () => ({
+  getAuthToken: async () => null,
+  captureAuthCredentialGeneration: () => 1,
+  isAuthCredentialGenerationCurrent: () => true,
+}));
 vi.mock('../use-infinite-search-climbs', () => ({ useInfiniteSearchClimbs: vi.fn() }));
 vi.mock('../use-similar-climbs', () => ({ useSimilarClimbs: vi.fn() }));
 vi.mock('../use-beta-link-preview', () => ({ useBetaLinkPreview: vi.fn() }));
@@ -37,6 +43,7 @@ vi.mock('../use-social', () => ({
   useAddComment: vi.fn(),
 }));
 vi.mock('../use-session-detail', () => ({ useSessionDetail: vi.fn(), useSessionPreview: vi.fn() }));
+vi.mock('../use-delete-account', () => ({ useDeleteAccountInfo: vi.fn(), useDeleteAccount: vi.fn() }));
 vi.mock('../use-integrations', () => ({
   useIntegrationStatuses: vi.fn(),
   useDisconnectIntegration: vi.fn(),

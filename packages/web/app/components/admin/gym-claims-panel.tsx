@@ -30,6 +30,25 @@ import {
 } from '@boardsesh/graphql/operations';
 import type { GymClaim } from '@boardsesh/shared-schema';
 
+type GraphqlErrorLike = { extensions?: { code?: unknown } | null };
+
+/**
+ * The `extensions.code` the backend tags a rejected review with, read the same
+ * way the handover panel next door reads its own codes. Only one code needs its
+ * own line today: a claim the gym's ownership has already moved past, where the
+ * fix is to deny it or run a deliberate handover — not to retry.
+ */
+function failureCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  const response = (error as { response?: { errors?: GraphqlErrorLike[] } }).response;
+  const graphqlErrors = Array.isArray(response?.errors) ? response.errors : [];
+  for (const graphqlError of graphqlErrors) {
+    const code = graphqlError.extensions?.code;
+    if (typeof code === 'string') return code;
+  }
+  return null;
+}
+
 export default function GymClaimsPanel() {
   const { t } = useTranslation('admin');
   const { token } = useWsAuthToken();
@@ -81,10 +100,16 @@ export default function GymClaimsPanel() {
         await client.request<ReviewGymClaimMutationResponse, ReviewGymClaimMutationVariables>(REVIEW_GYM_CLAIM, {
           input: { claimId, decision },
         });
-        setClaims((prev) => prev.filter((c) => c.id !== claimId));
+        setClaims((prev) => prev.filter((claim) => claim.id !== claimId));
         setSnackbar(decision === 'approve' ? t('gymClaims.snackbar.approved') : t('gymClaims.snackbar.denied'));
-      } catch {
-        setSnackbar(t('gymClaims.snackbar.failed'));
+      } catch (err) {
+        // A superseded claim is still pending and Deny is the next action, so
+        // the row deliberately stays in the table.
+        setSnackbar(
+          failureCode(err) === 'GYM_CLAIM_SUPERSEDED'
+            ? t('gymClaims.snackbar.superseded')
+            : t('gymClaims.snackbar.failed'),
+        );
       } finally {
         setPendingId(null);
       }
@@ -132,7 +157,18 @@ export default function GymClaimsPanel() {
                     <Avatar src={claim.claimantAvatarUrl || undefined} sx={{ width: 28, height: 28, fontSize: 12 }}>
                       {claim.claimantDisplayName?.[0]?.toUpperCase()}
                     </Avatar>
-                    <Typography variant="body2">{claim.claimantDisplayName || claim.claimantUserId}</Typography>
+                    <Box>
+                      <Typography variant="body2">{claim.claimantDisplayName || claim.claimantUserId}</Typography>
+                      {claim.claimantAccountAgeDays != null && (
+                        <Typography variant="caption" color="text.secondary">
+                          {t('gymClaims.claimantHistory', {
+                            days: claim.claimantAccountAgeDays,
+                            ticks: claim.claimantTickCount ?? 0,
+                            gyms: claim.claimantGymsHeld ?? 0,
+                          })}
+                        </Typography>
+                      )}
+                    </Box>
                   </Box>
                 </TableCell>
                 <TableCell>{claim.gymName}</TableCell>
@@ -207,7 +243,9 @@ export default function GymClaimsPanel() {
         </Box>
       )}
 
-      <Snackbar open={!!snackbar} autoHideDuration={3000} onClose={() => setSnackbar('')} message={snackbar} />
+      {/* 4s to match the two sibling admin panels — the rejection lines here are
+          a sentence of instruction, not a one-word confirmation. */}
+      <Snackbar open={!!snackbar} autoHideDuration={4000} onClose={() => setSnackbar('')} message={snackbar} />
     </Box>
   );
 }

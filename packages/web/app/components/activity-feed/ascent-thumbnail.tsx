@@ -2,11 +2,9 @@
 
 import React, { useMemo } from 'react';
 import LocaleLink from '@/app/components/i18n/locale-link';
-import type { BoardDetails, BoardName } from '@/app/lib/types';
+import type { BoardImageDetails, BoardName } from '@/app/lib/types';
 import BoardImageLayers from '@/app/components/board-renderer/board-image-layers';
-import BoardCanvasRenderer from '@/app/components/board-renderer/board-canvas-renderer';
-import { useCanvasRendererReady } from '@/app/lib/board-render-worker/worker-manager';
-import { getBoardDetailsForBoard } from '@/app/lib/board-utils';
+import { getBoardImageDetailsForBoard } from '@/app/lib/board-image-details';
 import { getDefaultBoardConfig } from '@/app/lib/default-board-configs';
 import type { RenderBoardConfig } from '@boardsesh/shared-schema';
 import { constructClimbViewUrlWithSlugs, constructClimbViewUrl, tryConstructSlugViewUrl } from '@/app/lib/url-utils';
@@ -23,7 +21,8 @@ type AscentThumbnailProps = {
   /**
    * The board this ascent should be drawn on, resolved server-side — the board
    * it was climbed on, or the closest one the climber has. Falls back to the
-   * layout default when absent (feeds that don't resolve it).
+   * layout default when absent (feeds that don't resolve it). Woods has no
+   * default: null there means the climb has no known size, so no thumbnail.
    */
   renderBoard?: RenderBoardConfig | null;
   /** When provided, renders as a <button> instead of the climb-view <Link>. */
@@ -41,17 +40,19 @@ const AscentThumbnail: React.FC<AscentThumbnailProps> = ({
   renderBoard,
   onClick,
 }) => {
-  const canvasReady = useCanvasRendererReady();
   // Memoize board details to avoid recomputing on every render
-  const boardDetails = useMemo<BoardDetails | null>(() => {
+  const boardDetails = useMemo<BoardImageDetails | null>(() => {
     if (!layoutId) return null;
 
     const boardName = boardType as BoardName;
+    // Woods sizes number holds from separate origins: with no resolved board the
+    // 12x12 guess would draw different holds, so draw nothing instead.
+    if (!renderBoard && boardName === 'woods') return null;
     const config = renderBoard ?? getDefaultBoardConfig(boardName, layoutId);
     if (!config) return null;
 
     try {
-      return getBoardDetailsForBoard({
+      return getBoardImageDetailsForBoard({
         board_name: boardName,
         layout_id: renderBoard?.layoutId ?? layoutId,
         size_id: config.sizeId,
@@ -97,6 +98,8 @@ const AscentThumbnail: React.FC<AscentThumbnailProps> = ({
       );
     }
 
+    // Never Woods without a renderBoard: boardDetails is null for that case, so
+    // the early return above already left.
     const config = renderBoard ?? getDefaultBoardConfig(boardType as BoardName, layoutId);
     return constructClimbViewUrl(
       {
@@ -121,32 +124,15 @@ const AscentThumbnail: React.FC<AscentThumbnailProps> = ({
     height: '100%',
   };
 
-  let thumbnailContent: React.ReactNode;
-  if (canvasReady && frames) {
-    thumbnailContent = (
-      <BoardCanvasRenderer
-        boardDetails={boardDetails}
-        frames={frames}
-        mirrored={isMirror}
-        thumbnail
-        style={thumbnailStyle}
-      />
-    );
-  } else if (frames) {
-    thumbnailContent = (
-      <BoardImageLayers
-        boardDetails={boardDetails}
-        frames={frames}
-        mirrored={isMirror}
-        thumbnail
-        style={thumbnailStyle}
-      />
-    );
-  } else {
-    thumbnailContent = (
-      <BoardImageLayers boardDetails={boardDetails} mirrored={isMirror} thumbnail style={thumbnailStyle} />
-    );
-  }
+  const thumbnailContent = (
+    <BoardImageLayers
+      boardDetails={boardDetails}
+      frames={frames ?? undefined}
+      mirrored={isMirror}
+      thumbnail
+      style={thumbnailStyle}
+    />
+  );
 
   if (onClick) {
     return (

@@ -1,3 +1,6 @@
+import { alias } from 'drizzle-orm/pg-core';
+import { betaPrivacyCondition } from '../shared/activity-privacy';
+import { canViewUserActivity, visibleBoardIdentityIds } from '../../../services/privacy';
 import { GraphQLError } from 'graphql';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
@@ -280,6 +283,26 @@ function makeLimiter(concurrency: number): <T>(task: () => Promise<T>) => Promis
   };
 }
 
+/**
+ * A beta link follows its author; the board it was filmed on is named only to
+ * people who may see that board, and to the beta's author. One query per page.
+ */
+async function withVisibleBetaBoards<T extends { boardId: number | null }>(
+  items: readonly T[],
+  viewerId: string | null | undefined,
+  authorOf: (item: T) => string | null = () => null,
+): Promise<T[]> {
+  const visible = await visibleBoardIdentityIds(
+    items.map((item) => item.boardId),
+    viewerId,
+  );
+  return items.map((item) =>
+    item.boardId == null || visible.has(item.boardId) || (!!viewerId && authorOf(item) === viewerId)
+      ? item
+      : { ...item, boardId: null },
+  );
+}
+
 async function enrichRowSafe(row: Row): Promise<BetaLinkResult | null> {
   if (isKayaClimbUrl(row.link)) return null;
   if (isInstagramUrl(row.link)) return enrichRow(row, INSTAGRAM_ENRICH);
@@ -302,7 +325,8 @@ type CachedRecentBetaLinkRow = {
   is_listed: boolean | null;
   created_at: string | null;
   tick_uuid: string | null;
-  board_id: number | null;
+  board_id: number | string | null;
+  created_by_user_id: string | null;
   climb_name: string | null;
   layout_id: number | null;
 };
@@ -327,7 +351,10 @@ function recentBetaLinksCacheKey(scopeKey: string, generation: string): string {
  * Run the actual CTE that powers the home strip. Scope predicates must be
  * inside the CTE, before the per-user ranking and total limit.
  */
-async function runRecentBetaLinksQuery(scope: RecentBetaLinksScope): Promise<CachedRecentBetaLinkRow[]> {
+async function runRecentBetaLinksQuery(
+  scope: RecentBetaLinksScope,
+  viewerId?: string | null,
+): Promise<CachedRecentBetaLinkRow[]> {
   const result = await db.execute<CachedRecentBetaLinkRow>(sql`
     WITH scoped AS (
       SELECT
@@ -341,12 +368,14 @@ async function runRecentBetaLinksQuery(scope: RecentBetaLinksScope): Promise<Cac
         bl.created_at,
         bl.tick_uuid,
         bl.board_id,
+        bl.created_by_user_id,
         bc.name AS climb_name,
         bc.layout_id AS layout_id
       FROM ${dbSchema.boardBetaLinks} bl
       LEFT JOIN ${dbSchema.boardClimbs} bc
         ON bc.board_type = bl.board_type AND bc.uuid = bl.climb_uuid
       WHERE bl.is_listed = true
+        AND ${betaPrivacyCondition(viewerId, alias(dbSchema.boardBetaLinks, 'bl'))}
         AND bl.thumbnail IS NOT NULL
         AND bl.thumbnail LIKE ${`${STATIC_THUMBNAIL_PREFIX}%`}
         ${scope.boardType ? sql`AND bl.board_type = ${scope.boardType}` : sql``}
@@ -360,7 +389,7 @@ async function runRecentBetaLinksQuery(scope: RecentBetaLinksScope): Promise<Cac
         ) AS user_rank
       FROM scoped
     )
-    SELECT board_type, climb_uuid, link, foreign_username, angle, thumbnail, is_listed, created_at, tick_uuid, board_id, climb_name, layout_id
+    SELECT board_type, climb_uuid, link, foreign_username, angle, thumbnail, is_listed, created_at, tick_uuid, board_id, created_by_user_id, climb_name, layout_id
     FROM ranked
     WHERE foreign_username IS NULL OR user_rank <= ${HOME_PER_USER_CAP}
     ORDER BY created_at DESC
@@ -558,10 +587,17 @@ export const betaLinkQueries = {
     const rows = await db
       .select()
       .from(dbSchema.boardBetaLinks)
-      .where(and(eq(dbSchema.boardBetaLinks.boardType, boardType), eq(dbSchema.boardBetaLinks.climbUuid, climbUuid)));
+      .where(
+        and(
+          eq(dbSchema.boardBetaLinks.boardType, boardType),
+          eq(dbSchema.boardBetaLinks.climbUuid, climbUuid),
+          betaPrivacyCondition(ctx?.userId),
+        ),
+      );
 
     const limit = makeLimiter(ENRICH_CONCURRENCY);
-    const enriched = await Promise.all(rows.map((row) => limit(() => enrichRowSafe(row))));
+    const visibleRows = await withVisibleBetaBoards(rows, ctx?.userId, (row) => row.createdByUserId);
+    const enriched = await Promise.all(visibleRows.map((row) => limit(() => enrichRowSafe(row))));
 
     return enriched.filter((r): r is BetaLinkResult => r !== null);
   },
@@ -651,8 +687,46 @@ export const betaLinkQueries = {
 
     const scope: RecentBetaLinksScope = { boardType: boardType ?? null, layoutId: layoutId ?? null };
 
-    const cached = await getCachedRecentBetaLinks(scope);
+    // Shared snapshots are candidates only. Reauthorize against current rows on
+    // every response; a privacy change must take effect before cache expiry.
+    const candidates = await getCachedRecentBetaLinks(scope);
+    const visible = candidates.length
+      ? await db
+          .select({
+            boardType: dbSchema.boardBetaLinks.boardType,
+            climbUuid: dbSchema.boardBetaLinks.climbUuid,
+            link: dbSchema.boardBetaLinks.link,
+          })
+          .from(dbSchema.boardBetaLinks)
+          .where(
+            and(
+              or(
+                ...candidates.map((candidate) =>
+                  and(
+                    eq(dbSchema.boardBetaLinks.boardType, candidate.board_type),
+                    eq(dbSchema.boardBetaLinks.climbUuid, candidate.climb_uuid),
+                    eq(dbSchema.boardBetaLinks.link, candidate.link),
+                  ),
+                ),
+              ),
+              eq(dbSchema.boardBetaLinks.isListed, true),
+              isNotNull(dbSchema.boardBetaLinks.thumbnail),
+              like(dbSchema.boardBetaLinks.thumbnail, `${STATIC_THUMBNAIL_PREFIX}%`),
+              betaPrivacyCondition(ctx?.userId),
+            ),
+          )
+      : [];
+    const allowed = new Set(visible.map((row) => JSON.stringify([row.boardType, row.climbUuid, row.link])));
+    const authorized = candidates.filter((row) =>
+      allowed.has(JSON.stringify([row.board_type, row.climb_uuid, row.link])),
+    );
+    // Refill before limiting; hidden items must not crowd visible items out.
+    const cached =
+      authorized.length < Math.min(candidates.length, cappedLimit) || ctx?.userId
+        ? await runRecentBetaLinksQuery(scope, ctx?.userId)
+        : authorized;
 
+    const authorsByLink = new Map<BetaLinkResult, string | null>();
     const filtered: RecentBetaLinkResult[] = [];
     for (const r of cached) {
       if (isKayaClimbUrl(r.link)) continue;
@@ -669,15 +743,21 @@ export const betaLinkQueries = {
           isListed: r.is_listed,
           createdAt: r.created_at,
           tickUuid: r.tick_uuid ?? null,
-          boardId: r.board_id ?? null,
+          boardId: r.board_id == null ? null : Number(r.board_id),
         },
         climbName: r.climb_name,
         boardType: r.board_type,
         layoutId: r.layout_id ?? null,
       });
+      authorsByLink.set(filtered[filtered.length - 1].betaLink, r.created_by_user_id);
       if (filtered.length >= cappedLimit) break;
     }
-    return filtered;
+    const betaLinks = await withVisibleBetaBoards(
+      filtered.map((item) => item.betaLink),
+      ctx?.userId,
+      (item) => authorsByLink.get(item) ?? null,
+    );
+    return filtered.map((item, index) => ({ ...item, betaLink: betaLinks[index] }));
   },
 
   // Powers the profile-page "Their beta" slider. Returns videos this user
@@ -686,16 +766,14 @@ export const betaLinkQueries = {
   // surface videos someone else uploaded that point at this user's IG —
   // intentional. Pre-cached thumbnails only; no live enrichment.
   //
-  // Intentionally **public**: anyone (including unauthenticated callers)
-  // can enumerate a user's beta videos by userId. The data surfaces on
-  // the public profile page already; the resolver doesn't expose anything
-  // the page doesn't. If we ever add a "private profile" mode, gate this
-  // resolver there.
+  // Account and item audiences apply before resolving links to this profile,
+  // including externally imported links matched through its Instagram handle.
   userBetaLinks: async (
     _: unknown,
     { userId, limit, offset }: { userId: string; limit?: number | null; offset?: number | null },
     ctx: ConnectionContext,
   ): Promise<RecentBetaLinkResult[]> => {
+    if (!(await canViewUserActivity(ctx?.userId, userId))) return [];
     const cappedLimit = Math.min(Math.max(limit ?? USER_BETA_LINKS_DEFAULT_LIMIT, 1), USER_BETA_LINKS_MAX_LIMIT);
     // Offset paging: the client advances by `limit` per page and infers
     // hasMore from a full page coming back. The post-fetch KayaClimb filter
@@ -737,6 +815,7 @@ export const betaLinkQueries = {
       )
       .where(
         and(
+          betaPrivacyCondition(ctx?.userId),
           eq(dbSchema.boardBetaLinks.isListed, true),
           isNotNull(dbSchema.boardBetaLinks.thumbnail),
           like(dbSchema.boardBetaLinks.thumbnail, `${STATIC_THUMBNAIL_PREFIX}%`),
@@ -761,13 +840,17 @@ export const betaLinkQueries = {
       .offset(safeOffset)
       .limit(cappedLimit);
 
-    return rows
-      .filter((r) => !isKayaClimbUrl(r.betaLink.link))
-      .map((r) => ({
-        betaLink: passthroughResult(r.betaLink),
-        climbName: r.climbName,
-        boardType: r.betaLink.boardType,
-        layoutId: r.layoutId ?? null,
-      }));
+    const listed = rows.filter((r) => !isKayaClimbUrl(r.betaLink.link));
+    const betaLinks = await withVisibleBetaBoards(
+      listed.map((r) => r.betaLink),
+      ctx?.userId,
+      (betaLink) => betaLink.createdByUserId,
+    );
+    return listed.map((r, index) => ({
+      betaLink: passthroughResult(betaLinks[index]),
+      climbName: r.climbName,
+      boardType: r.betaLink.boardType,
+      layoutId: r.layoutId ?? null,
+    }));
   },
 };

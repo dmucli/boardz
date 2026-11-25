@@ -1,18 +1,22 @@
+import { GraphQLError } from 'graphql';
 import type { ConnectionContext, BoardQueuePreview } from '@boardsesh/shared-schema';
 import { pubsub } from '../../../pubsub/index';
+import { db } from '../../../db/client';
 import { createEagerAsyncIterator } from '../shared/async-iterators';
 import { withSubscriptionCleanup } from '../shared/managed-subscription';
 import { applyRateLimit } from '../shared/helpers';
-import { requireAnonReadableBoard } from './shared';
-import { getBoardQueuePreviewSnapshot } from '../../../services/board-queue-preview';
+import { requireReadablePresenceBoard, isBoardAnonReadable } from './shared';
+import { sprayStreamGate } from '../climbs/spray-read-access';
+import { buildEmptyBoardQueuePreview, getBoardQueuePreviewSnapshot } from '../../../services/board-queue-preview';
 
 export const boardQueuePreviewQueries = {
   /**
    * Redacted "Up next" snapshot of the party-session queue bound to a shared
    * board, for anonymous public displays (gym kiosks).
    *
-   * Auth-optional. `requireAnonReadableBoard` hides private boards from
-   * anonymous viewers behind the same NOT_FOUND as a missing board. The
+   * Auth-optional. `requireReadablePresenceBoard` hides a board the viewer may
+   * not read behind the same NOT_FOUND as a missing board: the board id alone is
+   * the no-link reading, and an Unlisted board needs its uuid (`boardUuid`). The
    * double privacy gate (anon-readable board AND `isPublic` active session —
    * including the deliberately widened `is_public` semantics) plus the
    * binding resolution (Redis reverse key → newest-active DB fallback) and
@@ -23,7 +27,7 @@ export const boardQueuePreviewQueries = {
    */
   boardQueuePreview: async (
     _: unknown,
-    { boardId }: { boardId: number },
+    { boardId, boardUuid }: { boardId: number; boardUuid?: string | null },
     ctx: ConnectionContext,
   ): Promise<BoardQueuePreview | null> => {
     // 30/min, parity with boardNowPlaying — the snapshot does DB work
@@ -35,8 +39,10 @@ export const boardQueuePreviewQueries = {
     // For anonymous viewers this already ran the exact `isBoardAnonReadable`
     // query gate 1 needs; pass the verification down so the snapshot doesn't
     // repeat it (logged-in viewers verified nothing — gate 1 still runs).
-    const anonReadableVerified = await requireAnonReadableBoard(boardId, ctx.userId);
-    return getBoardQueuePreviewSnapshot(boardId, { anonReadableVerified });
+    // One row read: the anon gate plus a spray wall's own rule (private and
+    // hidden = owner only).
+    const { anonReadableVerified } = await requireReadablePresenceBoard(boardId, ctx.userId, boardUuid);
+    return getBoardQueuePreviewSnapshot(boardId, { anonReadableVerified, boardUuid });
   },
 };
 
@@ -50,23 +56,25 @@ export const boardQueuePreviewSubscriptions = {
    * channel subscribe before we compute the seed snapshot, so a producer
    * publish landing during setup queues in the iterator instead of being
    * dropped (pub/sub has no replay — the seed is the only initial state a
-   * kiosk gets). A publish that lands between the subscribe and the seed
-   * compute can deliver a snapshot slightly older than the seed right after
-   * it; accepted — snapshots are self-contained and the next mutation's
-   * publish converges (same accepted race as boardNowPlaying's backfill).
+   * kiosk gets). Buffered publishes only trigger a fresh authorized snapshot;
+   * their copied content cannot bypass a restriction applied after publication.
    */
   boardQueuePreview: {
     subscribe: withSubscriptionCleanup(async function* (
       lifetime,
       _: unknown,
-      { boardId }: { boardId: number },
+      { boardId, boardUuid }: { boardId: number; boardUuid?: string | null },
       ctx: ConnectionContext,
     ) {
       // 30/min, parity with boardNowPlaying (the seed does DB work). Anon WS
       // callers are keyed per-connection — see the query resolver's note.
       await applyRateLimit(ctx, 30, 'boardQueuePreview');
       // Same gate-1 dedup as the query resolver (see its comment).
-      const anonReadableVerified = await requireAnonReadableBoard(boardId, ctx.userId);
+      const { anonReadableVerified, board } = await requireReadablePresenceBoard(boardId, ctx.userId, boardUuid);
+      // Re-checked per event, like `boardNowPlaying`: a wall going private or
+      // hidden mid-stream has to end a stream that is already open. Null (no
+      // cost) for every board that is not a spray wall.
+      const gate = sprayStreamGate(board?.boardType, board?.layoutId, ctx.userId, boardUuid, db);
 
       const boardKey = String(boardId);
 
@@ -81,13 +89,35 @@ export const boardQueuePreviewSubscriptions = {
       const eagerIterator = asyncIterable[Symbol.asyncIterator]();
 
       try {
-        const seed = await getBoardQueuePreviewSnapshot(boardId, { anonReadableVerified });
+        const seed = await getBoardQueuePreviewSnapshot(boardId, { anonReadableVerified, boardUuid });
+        // The seed lookup is async, so the wall can go private or hidden while it
+        // runs: re-check before yielding it, exactly as for every live event.
+        if (seed && gate && !(await gate())) return;
         if (seed) {
           yield { boardQueuePreview: seed };
         }
 
         for (let result = await eagerIterator.next(); !result.done; result = await eagerIterator.next()) {
-          yield { boardQueuePreview: result.value };
+          // Withdraw the last snapshot before closing, so the kiosk does not
+          // keep showing its last rendered queue.
+          try {
+            await requireReadablePresenceBoard(boardId, ctx.userId, boardUuid);
+          } catch (error) {
+            if (error instanceof GraphQLError && ['NOT_FOUND', 'FORBIDDEN'].includes(String(error.extensions.code))) {
+              yield { boardQueuePreview: buildEmptyBoardQueuePreview(boardId) };
+              return;
+            }
+            throw error;
+          }
+          if (!(await isBoardAnonReadable(boardId)) || (gate && !(await gate()))) {
+            yield { boardQueuePreview: buildEmptyBoardQueuePreview(boardId) };
+            return;
+          }
+          // A buffered event may predate a restriction or board hand-off.
+          // Treat it as a wake-up, never as permission to deliver its copy.
+          // Empty snapshots also clear older clients when a session is withdrawn.
+          const refreshed = await getBoardQueuePreviewSnapshot(boardId, { boardUuid });
+          yield { boardQueuePreview: refreshed ?? buildEmptyBoardQueuePreview(boardId) };
         }
       } finally {
         // The lifetime wrapper closes immediately on disconnect, even during

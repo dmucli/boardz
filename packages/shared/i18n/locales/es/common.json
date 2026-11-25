@@ -11,7 +11,6 @@
     "cancel": "Cancelar",
     "clear": "Borrar",
     "delete": "Eliminar",
-    "edit": "Editar",
     "close": "Cerrar",
     "back": "Atrás",
     "done": "Listo",
@@ -37,16 +36,17 @@
     "statistics": "Estadísticas",
     "sessions": "Sesiones",
     "createdClimbs": "Bloques creados",
-    "auroraMigration": "Trae tu logbook",
     "startClimbing": "Empieza a escalar",
     "signIn": "Iniciar sesión",
     "nav": {
       "gyms": "Rocódromos",
       "playlists": "Listas",
-      "about": "Sobre nosotros",
-      "help": "Ayuda"
+      "help": "Ayuda",
+      "boards": "Plafones",
+      "spray": "Spraywalls"
     },
-    "navLabel": "Navegación principal"
+    "navLabel": "Navegación principal",
+    "getApp": "Consigue la app"
   },
   "share": {
     "profileTitle": "Perfil de escalada de {{name}}",
@@ -56,7 +56,7 @@
     "shareFailed": "No se pudo compartir"
   },
   "myBoards": {
-    "title": "Gestionar tus plafones"
+    "title": "Tus plafones"
   },
   "myGyms": {
     "roleOwner": "Propietario",
@@ -80,12 +80,15 @@
       "finishTesting": "Terminar de probar #{{prNumber}}",
       "testPlan": "Plan de pruebas #{{prNumber}}",
       "badge": "QA"
-    }
+    },
+    "accountTitle": "Cuenta",
+    "myBugReports": "Tus informes de errores"
   },
   "qa": {
     "shared": {
       "backOnProduction": "De vuelta en producción en la próxima actualización",
-      "leaveFailed": "No se pudo desactivar esta vista previa — inténtalo de nuevo"
+      "leaveFailed": "No se pudo desactivar esta vista previa — inténtalo de nuevo",
+      "backOnEarlyUpdates": "Vuelves a las actualizaciones anticipadas la próxima vez que abras la app"
     },
     "pick": {
       "title": "Prueba un PR",
@@ -102,9 +105,7 @@
       "crashedChip": "Se cerró al abrir",
       "nothingNewToast": "No hay nada nuevo para el #{{prNumber}} en esta versión — su próxima publicación se aplicará al reabrir",
       "stagingTitle": "Pruebas",
-      "stagingBody": "Prueba la próxima actualización antes de que llegue a producción.",
       "productionTitle": "Producción",
-      "productionBody": "Recibirás las actualizaciones públicas; esta versión puede seguir hasta que haya otra nueva.",
       "stagingNextLaunch": "Pruebas seleccionado: la próxima actualización se aplicará al reabrir",
       "productionNextLaunch": "Producción seleccionada; esta versión puede seguir hasta una actualización nueva",
       "buildingChip": "Compilando",
@@ -117,7 +118,9 @@
       "noMatchBody": "Nada de lo publicado para esta versión coincide con «{{query}}».",
       "trySurfAction": "Probar igualmente el #{{prNumber}}",
       "trySurfHint": "Puede que no tenga una preview que esta versión pueda cargar.",
-      "notServableToast": "No hay preview del #{{prNumber}} para esta versión — quizá necesite un rebase sobre main"
+      "notServableToast": "No hay preview del #{{prNumber}} para esta versión — quizá necesite un rebase sobre main",
+      "earlyUpdatesTitle": "Actualizaciones anticipadas",
+      "earlyUpdatesNextLaunch": "Las actualizaciones anticipadas vuelven la próxima vez que abras la app"
     },
     "brief": {
       "screenTitle": "Qué probar",
@@ -138,7 +141,7 @@
       "verdictGroupLabel": "Veredicto",
       "approvePlaceholder": "¿Algo que valga la pena anotar? (opcional)",
       "declinePlaceholder": "¿Qué salió mal? Los pasos ayudan.",
-      "submitLabel": "Enviar veredicto",
+      "submitLabel": "Enviar",
       "leaveLabel": "Salir de la vista previa sin comentarios",
       "submitError": "No se pudo enviar el veredicto — inténtalo de nuevo",
       "notOnPreview": "Estás en producción — no hay nada sobre lo que dar un veredicto.",
@@ -154,7 +157,6 @@
     "attachedCount_one": "{{count}} captura de pantalla adjunta",
     "attachedCount_other": "{{count}} capturas de pantalla adjuntas",
     "publicWarning": "Las capturas que adjuntes se publican en GitHub y las ve cualquiera.",
-    "permissionDenied": "Boardsesh necesita acceso a tus fotos para adjuntar una captura de pantalla.",
     "pickFailed": "No se pudo leer esa captura de pantalla; elige otra.",
     "uploadFailed": "No se pudieron subir las capturas de pantalla; tu informe sigue aquí."
   },
@@ -212,7 +214,8 @@
       "delete": "No se pudo eliminar el comentario",
       "reply": "No se pudo publicar la respuesta",
       "loadReplies": "No se pudieron cargar las respuestas"
-    }
+    },
+    "signInToSuggestGrade": "Inicia sesión para proponer un grado"
   },
   "vote": {
     "upvote": "Voto positivo",
@@ -268,10 +271,12 @@
     "unfollow": "Dejar de seguir"
   },
   "betaVideos": {
-    "empty": "Sin vídeos de beta todavía"
-  },
-  "moonboardImport": {
-    "removeConfirmTitle": "¿Quitar este bloque?"
+    "empty": "Sin vídeos de beta todavía",
+    "openClimb": "Ver {{climb}} y su beta",
+    "openVideo": "Ver la beta de {{creator}} en {{platform}}",
+    "watchOn": "Ver beta en {{platform}}",
+    "watch": "Ver la beta",
+    "showAll": "Ver los {{total}} vídeos"
   },
   "board": {
     "resetZoom": "Restablecer zoom"
@@ -281,9 +286,35 @@
       "viewProfile": "Ver el perfil de {{name}}",
       "thisClimber": "este escalador"
     },
+    "a11y": {
+      "clearSearch": "Borrar la búsqueda",
+      "opensOutsideApp": "Se abre fuera de Boardsesh"
+    },
     "settings": {
       "title": "Ajustes",
-      "library": "Biblioteca",
+      "pages": {
+        "general": {
+          "title": "General"
+        },
+        "board": {
+          "title": "Plafón"
+        },
+        "climbs": {
+          "title": "Bloques y grados"
+        },
+        "home": {
+          "title": "Inicio"
+        },
+        "earlyAccess": {
+          "title": "Acceso anticipado"
+        },
+        "developer": {
+          "title": "Desarrollo"
+        },
+        "timers": {
+          "title": "Temporizadores"
+        }
+      },
       "development": "Desarrollo",
       "dev": {
         "forceServerUnreachable": "Forzar servidor no disponible",
@@ -293,7 +324,6 @@
       "metroServersSubtitle": "Cambia entre bundlers de Tailnet",
       "boardLook": {
         "title": "Aspecto del plafón",
-        "rowSubtitleShort": "Cómo se ve tu plafón, además de colores y formas",
         "rendererUnavailable": {
           "title": "Actualiza la app",
           "body": "Esta versión todavía no puede dibujar el aspecto Aura. Actualiza Boardsesh para desbloquearlo — por ahora tu plafón se ve en modo Clásico."
@@ -311,6 +341,7 @@
           "aura": "Aura",
           "auraBold": "Aura intensa",
           "auraSubtle": "Aura sutil",
+          "auraOutline": "Aura contorno",
           "modernClassic": "Clásico moderno",
           "maxContrast": "Máximo contraste",
           "descriptions": {
@@ -319,6 +350,7 @@
             "modernClassic": "Los círculos de siempre, sobre un muro atenuado.",
             "maxContrast": "El lavado más fuerte y presas rellenas.",
             "auraBold": "Un brillo más amplio y duro que se ve desde lejos.",
+            "auraOutline": "Un contorno sólido en cada presa, con un brillo ceñido.",
             "classic": "Los marcadores circulares de siempre.",
             "custom": "Ajusta cada parte del aspecto a tu gusto."
           },
@@ -374,12 +406,16 @@
             "options": {
               "glow": "Resplandor",
               "glowFill": "Resplandor + relleno",
-              "fill": "Relleno"
+              "fill": "Relleno",
+              "outline": "Contorno"
             }
           },
           "fillOpacity": {
             "title": "Intensidad del relleno",
             "value": "{{value}}%"
+          },
+          "outlineOpacity": {
+            "title": "Intensidad del contorno"
           },
           "softDisc": {
             "label": "Disco suave",
@@ -403,6 +439,7 @@
         },
         "accessibility": {
           "title": "Accesibilidad",
+          "pageTitle": "Colores y formas de las presas",
           "classicOnlyNote": "La forma, el grosor y el tamaño del marcador solo se aplican al renderizado Clásico. En Boardsesh, la silueta de la propia presa encendida es la forma — activa los glifos de rol de abajo para tener una pista basada en formas.",
           "roleGlyphs": {
             "label": "Glifos de rol",
@@ -448,8 +485,25 @@
             "body": "Los glifos de rol ponen una forma en cada presa encendida, para que inicio, mano, final y pie se distingan sin color. Los LED de tu plafón no cambian.",
             "apply": "Activar glifos de rol"
           },
+          "differentiateWithoutColor": {
+            "title": "«Diferenciar sin color» está activado"
+          },
           "dismiss": "Ahora no",
           "dismissAccessibility": "Descartar esta sugerencia"
+        },
+        "sprayWalls": {
+          "title": "Spraywalls",
+          "useOwnLook": "Usar mi aspecto en los Spraywalls",
+          "footer": "Los Spraywalls muestran el aspecto que eligió su creador para la foto. Actívalo para ver tu propio aspecto en ellos."
+        },
+        "moonboard": {
+          "title": "MoonBoard",
+          "gridLabels": "Letras y números de la cuadrícula",
+          "footer": "Muestra de la A a la K y los números de fila alrededor del plafón, para que puedas nombrar presas como F5."
+        },
+        "gpuAcceleration": {
+          "title": "Aceleración por GPU",
+          "description": "Dibuja las presas iluminadas con el chip gráfico del móvil. Desactívala si el plafón parpadea o va a tirones."
         }
       },
       "accessibility": {
@@ -537,7 +591,6 @@
       },
       "storage": {
         "title": "Almacenamiento",
-        "rowLabel": "Gestionar almacenamiento",
         "rowSubtitle": "Mira cuánto ocupan tus descargas y libera lo que no necesitas",
         "intro": "Los plafones que descargas ocupan espacio en este teléfono. Libera los que no estás escalando.",
         "offNote": "Las descargas sin conexión están desactivadas ahora mismo. Aun así puedes liberar lo que ya está en este teléfono.",
@@ -553,7 +606,7 @@
         "keptOffline": "Guardado sin conexión",
         "notKeptOffline": "Ya no se guarda sin conexión — sigue ocupando espacio",
         "estimateNote": "Los tamaños son aproximados. Dos tamaños del mismo diseño comparten sus vías, así que no suman el total.",
-        "remove": "Quitar",
+        "tapToRemove": "Pulsa un plafón para quitarlo de este móvil.",
         "removeAria": "Quitar {{name}} de este teléfono",
         "cancel": "Cancelar",
         "removeTitle": "¿Quitar {{name}}?",
@@ -570,6 +623,8 @@
         "errorTitle": "No se pudo medir tus descargas",
         "errorSubtitle": "Algo impidió leer lo que hay en este teléfono.",
         "errorRetry": "Inténtalo de nuevo",
+        "downgradeTitle": "El almacenamiento sin conexión está en pausa",
+        "downgradeSubtitle": "Este teléfono tiene una versión de la app más antigua que la que guardó tus datos. Tus plafones descargados y los encadenes pendientes de sincronizar siguen en este teléfono y vuelven con la próxima actualización.",
         "cachedImagesHeader": "Imágenes en caché",
         "cachedImagesArtLabel": "Dibujo del plafón",
         "cachedImagesPhotosLabel": "Fotos",
@@ -596,11 +651,6 @@
         "both": "Ambos"
       },
       "displayOptions": {
-        "title": "Visualización",
-        "playlistTags": "Mostrar etiquetas de playlist",
-        "playlistTagsDescription": "Mira en qué playlists está cada bloque, directamente en la lista.",
-        "quickActionsButton": "Mostrar botón de acciones rápidas",
-        "quickActionsButtonDescription": "Añade un botón ⋮ a cada bloque que abre cola, encadene, listas y más. Siempre puedes mantener pulsado en su lugar.",
         "boardseshGrades": "Mostrar grados Boardsesh",
         "boardseshGradesDescription": "Grados calculados a partir de encadenes reales en varios plafones. El grado del setter se mantiene hasta que haya suficientes encadenes.",
         "personalGrades": "Usar mis grados",
@@ -626,15 +676,13 @@
         "contributeTitle": "Ayuda a traducir Boardsesh",
         "contributeSubtitle": "Las traducciones las mantiene la comunidad. Abre los archivos de {{language}} en GitHub para corregir o añadir una frase."
       },
-      "diagnostics": {
-        "title": "Privacidad",
-        "recording": "Ayúdanos a mejorar",
-        "recordingDescription": "Envía grabaciones de sesión anónimas y enmascaradas para que corrijamos errores más rápido. Lo que escribes y tus fotos quedan ocultos. Desactívalo cuando quieras."
+      "startup": {
+        "title": "Abrir la app en",
+        "footer": "Se aplica la próxima vez que abras la app. Los enlaces, las notificaciones y la configuración inicial te siguen llevando a su destino."
       },
-      "integrations": {
-        "title": "Aplicaciones conectadas",
-        "subtitle": "Apple Health y Strava",
-        "subtitleWithStrava": "Cuentas de plafón, Apple Health, Strava"
+      "diagnostics": {
+        "recording": "Compartir grabaciones de sesión",
+        "recordingDescription": "Graba tu pantalla en la app para que veamos cómo ocurre un error. Lo que escribes y tus fotos quedan ocultos. Actívalo mientras reproduces un problema para soporte y luego desactívalo."
       },
       "syncIssues": {
         "title": "Problemas de sincronización",
@@ -652,6 +700,9 @@
         "failedMessage_other": "{{count}} cambios no se pudieron sincronizar y al cerrar sesión se borran. Cancela y pulsa Reintentar sincronización primero si quieres conservarlos.",
         "confirm": "Cerrar sesión",
         "cancel": "Cancelar",
+        "downgradeMessage": "Este teléfono espera una actualización de la app para poder abrir tus datos sin conexión. Si otra persona inicia sesión aquí antes de esa actualización, se pierden los encadenes que aún esperan sincronizarse en este teléfono.",
+        "downgradeConfirm": "Cerrar sesión igualmente",
+        "downgradeCancel": "Seguir con la sesión",
         "failureTitle": "No se confirmó el cierre de sesión",
         "failure": "Boardsesh no pudo confirmar el cierre de sesión. Vuelve a conectarte y cierra sesión de nuevo antes de dejar este dispositivo."
       },
@@ -663,6 +714,231 @@
         "pickSubtitle": "Prueba un cambio antes de que salga y cuéntanos qué tal",
         "testPlanTitle": "Plan de pruebas #{{prNumber}}",
         "testPlanSubtitle": "Qué probar en la vista previa que tienes abierta"
+      },
+      "earlyUpdates": {
+        "sectionTitle": "Actualizaciones de la app",
+        "title": "Recibe las actualizaciones antes",
+        "offSubtitle": "Funciones nuevas en cuanto están listas, antes que nadie",
+        "onSubtitle": "Recibes las actualizaciones anticipadas",
+        "waitingSubtitle": "Activado, a la espera de la próxima actualización anticipada",
+        "leavingSubtitle": "Desactivado. Las actualizaciones normales vuelven cuando la siguiente esté lista para este teléfono.",
+        "testingBody": "Hay una vista previa fijada en este teléfono. Sal de ella primero y luego cambia esto.",
+        "footer": "Las actualizaciones anticipadas pueden traer algún fallo de vez en cuando. Los cambios se aplican la próxima vez que abras la app.",
+        "joinDeferred": "No hay conexión con el servidor de actualizaciones. Lo intentaremos la próxima vez que abras la app; las actualizaciones anticipadas empiezan la vez siguiente.",
+        "leaveDeferred": "Todavía no se puede volver. Lo intentaremos la próxima vez que abras la app."
+      },
+      "climbDrawer": {
+        "description": "Elige qué ves debajo del bloque y en qué orden.",
+        "settingsFooter": "Elige qué ves debajo del bloque. Para cambiar el orden, abre el menú ⋯ de un bloque y elige Opciones de vista.",
+        "loading": "Cargando opciones de vista…",
+        "hideAll": "Ocultar todo",
+        "showAll": "Mostrar todo",
+        "restoreDefaults": "Restablecer valores predeterminados",
+        "sections": {
+          "activeHolds": "Presas activas",
+          "logbook": "Logbook",
+          "climberLogs": "Registros de escaladores",
+          "setterNotes": "Notas del setter",
+          "betaVideos": "Vídeos de beta",
+          "boardseshGrade": "Grado Boardsesh",
+          "community": "Comunidad",
+          "similarClimbs": "Bloques similares"
+        },
+        "sheetTitle": "Opciones de vista",
+        "groupTitle": "Debajo del bloque",
+        "footer": "Los cambios se aplican al momento. Oculta todo para ver solo el bloque, sin desplazamiento vertical.",
+        "tabs": {
+          "sections": "Debajo del bloque",
+          "buttons": "Botones",
+          "miniPlayer": "Mini reproductor"
+        }
+      },
+      "sectionLayout": {
+        "moveUp": "Subir {{section}}",
+        "moveDown": "Bajar {{section}}",
+        "moved": "{{section}}, {{position}} de {{count}}"
+      },
+      "homeSections": {
+        "groupTitle": "En Inicio",
+        "customize": "Personalizar Inicio",
+        "description": "Elige qué muestra Inicio y en qué orden. Enfocado muestra tu plafón, tu sesión y tus listas.",
+        "settingsFooter": "Elige qué muestra Inicio y en qué orden. Personalizar Inicio, en el propio Inicio, cambia la misma lista.",
+        "footer": "Los cambios se aplican al momento y solo en este teléfono. No cambian quién puede ver tu escalada.",
+        "showAll": "Mostrar todo",
+        "focused": "Enfocado",
+        "restoreDefaults": "Restablecer valores predeterminados",
+        "sections": {
+          "week": "Esta semana",
+          "board": "Tu plafón",
+          "session": "Sesión",
+          "projects": "Tus proyectos",
+          "playlists": "A tu nivel",
+          "climbingNow": "Escalando ahora",
+          "beta": "Beta reciente",
+          "feed": "Feed"
+        },
+        "descriptions": {
+          "week": "Sesiones, encadenes y semanas seguidas",
+          "board": "Explora bloques o cambia de plafón",
+          "session": "Tu último entrenamiento, o empieza una sesión",
+          "projects": "Bloques que probaste y aún no encadenaste",
+          "playlists": "A tu nivel, Joyas ocultas y Novedades",
+          "climbingNow": "Sesiones en directo a las que unirte",
+          "beta": "Vídeos de beta nuevos para tu plafón",
+          "feed": "Sesiones y bloques nuevos de tu crew. Siempre al final."
+        },
+        "presets": {
+          "default": "Predeterminado",
+          "custom": "Personalizado"
+        }
+      },
+      "climbList": {
+        "title": "Lista de bloques",
+        "picture": "Imagen",
+        "underName": "Bajo el nombre",
+        "yourClimbing": "Tu escalada",
+        "actions": "Acciones",
+        "layout": {
+          "title": "Columnas",
+          "one": "Una columna",
+          "two": "Dos columnas",
+          "footer": "Las dos columnas aparecen cuando la lista tiene sitio, como en un iPad en horizontal."
+        },
+        "gradesTitle": "Grados",
+        "previewFooter": "Ejemplo. Los encadenes, guardados y etiquetas aparecen en los bloques que los tienen.",
+        "gradeFooter": "Elige el grado principal en Ajustes → Bloques y grados.",
+        "personalFooter": "Las marcas personales y listas requieren iniciar sesión y se cargan con conexión.",
+        "presetsLabel": "Configuración rápida",
+        "presets": {
+          "namesOnly": "Solo nombres",
+          "textOnly": "Solo texto",
+          "default": "Predeterminado",
+          "everything": "Todo",
+          "custom": "Personalizado"
+        },
+        "fields": {
+          "thumbnail": "Imagen del plafón",
+          "communityGrade": "Grado de la comunidad",
+          "sends": "Encadenes",
+          "rating": "Valoración",
+          "setter": "Equipador",
+          "sentMark": "Marca de encadene",
+          "playlistTags": "Mostrar etiquetas de playlist",
+          "quickActions": "Mostrar botón de acciones rápidas",
+          "progress": "Mi progreso"
+        },
+        "sampleName": "Proyecto de tarde",
+        "sampleSetter": "equipador",
+        "samplePlaylistOne": "Proyectos",
+        "samplePlaylistTwo": "Calentamiento",
+        "playlistTagsDescription": "Mira en qué playlists está cada bloque, directamente en la lista.",
+        "quickActionsDescription": "Añade un botón ⋮ a cada bloque que abre cola, encadene, listas y más. Siempre puedes mantener pulsado en su lugar."
+      },
+      "playerButtons": {
+        "title": "Botones",
+        "description": "Elige hasta cuatro botones alrededor de Registrar, su orden y dónde van.",
+        "position": {
+          "label": "Posición",
+          "below": "Debajo del plafón",
+          "above": "Encima del plafón",
+          "footer": "Registrar y Luz del plafón siempre mantienen su sitio."
+        },
+        "previousNext": "Anterior y siguiente",
+        "previousNextDescription": "Muestra flechas junto a Registrar en lugar de dos botones de acción. Deslizar el plafón sigue cambiando de bloque.",
+        "buttons": {
+          "mirror": "Espejo",
+          "favorite": "Favorito",
+          "angle": "Ángulo",
+          "playNext": "Poner a continuación",
+          "share": "Compartir",
+          "queue": "Cola"
+        },
+        "mirrorDescription": "Solo en plafones que se espejean",
+        "angleDescription": "Solo en plafones con ángulo ajustable",
+        "fixed": {
+          "previous": "Anterior",
+          "next": "Siguiente",
+          "log": "Registrar",
+          "boardLight": "Luz del plafón"
+        },
+        "footer": "Sin flechas, aparecen hasta cuatro botones activos alrededor de Registrar. Si hay más disponibles para este plafón, aparecen el primero y los tres últimos. Con flechas, solo aparecen el primero y el último. El resto, y los que ocultes, están en el menú ⋯.",
+        "settingsFooter": "Para cambiar el orden, abre el menú ⋯ de un bloque y elige Opciones de vista.",
+        "previewLabel": "Vista previa, {{position}}: {{buttons}}",
+        "boardControl": {
+          "label": "Control del plafón",
+          "wallButton": "Botón del muro",
+          "lightbulb": "Bombilla",
+          "footer": "Los dos controles conectan, encienden el bloque y muestran quién tiene el plafón. Con el plafón conectado, mantén pulsado para las opciones. Lee la etiqueta del botón del muro: Estás al mando del plafón significa que cada bloque que elijas se enciende; tócala para dejar el mando. Tu móvil sigue conectado salvo que Desconectar el Bluetooth al dejar el mando esté activado. Si el mando tiene límite de tiempo, un reloj junto a la etiqueta y el esmerilado que se encoge muestran cuándo termina. La bombilla queda arriba a la derecha."
+        }
+      },
+      "climbView": {
+        "title": "Vista del bloque",
+        "valueDefault": "Predeterminada",
+        "valueCustom": "Personalizada"
+      },
+      "quickFilters": {
+        "title": "Filtros rápidos",
+        "valueDefault": "Predeterminados",
+        "valueCustom": "Personalizados",
+        "climbsTitle": "Bloques",
+        "climbsFooter": "Aparecen sobre la lista de Bloques, en este orden. Un filtro que actives se añade al final.",
+        "playlistsTitle": "Listas",
+        "playlistsFooter": "Aparecen sobre cada playlist, playlist inteligente y página de un setter, en este orden.",
+        "restoreDefaults": "Restablecer valores predeterminados",
+        "footer": "Los cambios se aplican al momento y solo en este teléfono. Todos los filtros siguen en Filtros."
+      },
+      "timers": {
+        "restTitle": "Descanso",
+        "restLength": "Descanso",
+        "restLengthOff": "Desactivado",
+        "modeLabel": "Cadencia",
+        "modeAfterTick": "Tras cada bloque",
+        "modeEvery": "Cada {{length}}",
+        "modeOnTheMinute": "Ritmo fijo",
+        "modeAfterTickHint": "Tu descanso vuelve a empezar cada vez que registras un intento o un encadene.",
+        "modeOnTheMinuteHint": "Ventanas fijas desde que lo activas. Registrar intentos o encadenes nunca reinicia el reloj.",
+        "autoAdvance": "Pasar al siguiente bloque",
+        "autoAdvanceHint": "Lo enciende en el plafón por ti, solo con Boardsesh abierto.",
+        "autoAdvanceBlocked": "Solo quien tiene el plafón puede mover la cola.",
+        "autoAdvanceNeedsLength": "Elige una duración de descanso para mover la cola automáticamente.",
+        "cuesTitle": "Avisos",
+        "cuesFooter": "Desactivados, sigues recibiendo una vibración de aviso antes de que el plafón avance solo.",
+        "countdownCues": "Cuenta atrás de los últimos segundos",
+        "countdownCuesHint": "Una vibración en cada uno de los últimos segundos, para que estés en las presas cuando se encienda el siguiente bloque.",
+        "sound": "Sonido",
+        "soundHint": "Reproduce un tono con los avisos. Suena aunque el móvil esté en silencio y no corta tu música.",
+        "lockScreen": "Mostrar en la pantalla de bloqueo",
+        "lockScreenHint": "Mira cómo baja tu descanso sin abrir la app.",
+        "rogueTitle": "Temporizador del rocódromo",
+        "rogueFooter": "Vincula un temporizador Rogue a un plafón y su cronómetro vuelve a empezar con tu descanso: al registrar un bloque, cuando la cola avanza y en cada ventana del ritmo fijo. Solo lo controla el móvil conectado al plafón.",
+        "rogueNotPaired": "Sin vincular",
+        "roguePairHint": "Vincula un temporizador a este plafón",
+        "rogueChangeHint": "Vincula otro temporizador a este plafón",
+        "rogueRemove": "Quitar el temporizador de {{board}}",
+        "rogueNoBoardsTitle": "Aún no tienes un plafón propio",
+        "rogueNoBoards": "Añade tu propio plafón para vincularle un temporizador.",
+        "rogueConnected": "Conectado",
+        "rogueConnecting": "Conectando…",
+        "rogueUnreachable": "No se encuentra. Comprueba que esté encendido y cerca.",
+        "rogueSaveFailed": "No se pudo guardar el temporizador. Inténtalo de nuevo."
+      },
+      "miniPlayer": {
+        "title": "Mini reproductor",
+        "description": "La barra sobre las pestañas guarda el último bloque que abriste. Tócala para volver a abrirlo; Luz del plafón lo pone en el plafón.",
+        "buttons": {
+          "next": "Bloque siguiente",
+          "previous": "Bloque anterior",
+          "wallDisplay": "Pantalla de muro"
+        },
+        "fixedNote": "Luz del plafón siempre está, junto a Registrar. Registrar va siempre al final, bajo tu pulgar.",
+        "footer": "En el teléfono la barra tiene sitio para uno de estos junto a Luz del plafón y Registrar: el primero que esté activado.",
+        "open": "Abierta",
+        "collapsed": "Reducida",
+        "previewLabel": "Vista previa, barra {{shape}}: {{buttons}}",
+        "footerWide": "En una pantalla ancha la barra muestra tantos de estos como le caben: ganan los primeros de la lista.",
+        "shapeOpen": "abierta",
+        "shapeCollapsed": "reducida",
+        "more": "Más"
       }
     },
     "sendRecovery": {
@@ -685,15 +961,36 @@
       "openBody": "El proyecto es open source para que los escaladores puedan reportar fallos, pedir funciones y ayudar a decidir lo siguiente.",
       "independentBody": "Boardsesh no está afiliado ni respaldado por Aurora Climbing, Kilter, Tension, Moon Climbing ni ningún fabricante de plafones.",
       "viewOnGithub": "Ver en GitHub",
+      "emailPartners": "Escríbenos",
       "joinDiscord": "Únete a Discord",
       "partnerTitle": "Colabora oficialmente con nosotros",
       "partnerBody": "Boardsesh funciona con Kilter, Tension y MoonBoard desde fuera. Si fabricas plafones y quieres crear algo oficial juntos, nos encantaría hablar.",
       "acknowledgementsLink": "Agradecimientos",
-      "acknowledgementsLinkBody": "Las personas detrás de Boardsesh"
+      "acknowledgementsLinkBody": "Las personas detrás de Boardsesh",
+      "shareApp": {
+        "link": "Comparte Boardsesh",
+        "linkBody": "Código QR para los móviles de tu grupo",
+        "title": "Comparte Boardsesh",
+        "body": "Que tu grupo escanee esto con la cámara del móvil para bajarse la app.",
+        "appStore": "App Store",
+        "googlePlay": "Google Play",
+        "storeToggleLabel": "Tienda",
+        "qrLabelIos": "Código QR de Boardsesh en la App Store",
+        "qrLabelAndroid": "Código QR de Boardsesh en Google Play",
+        "copyLink": "Copiar enlace",
+        "share": "Compartir",
+        "copied": "Enlace copiado",
+        "copyFailed": "No se ha podido copiar el enlace",
+        "messageCopied": "Mensaje copiado",
+        "messageCopyFailed": "No se ha podido copiar el mensaje",
+        "message": "Bájate Boardsesh para tus sesiones de plafón.\niPhone: {{iosUrl}}\nAndroid: {{androidUrl}}"
+      }
     },
     "acknowledgements": {
       "title": "Agradecimientos",
       "intro": "Boardsesh existe gracias a quienes lo construyen, lo apoyan y aguantan que no pare de hablar de plafones. Gracias.",
+      "openSourceRootsTitle": "Orígenes de código abierto",
+      "openSourceRootsBody": "Empecé con un fork de Climbdex. A medida que crecía la idea, abrí un repositorio propio para Boardsesh. Climbdex y BoardLib sentaron las bases de cómo importamos los bloques. Gracias a Luke Emery-Fertitta por crear ambos proyectos.",
       "contributorsTitle": "Colaboradores",
       "contributorsBody": "Todas las personas que han aportado código, arreglos e ideas en GitHub.",
       "sponsorsTitle": "Patrocinadores",
@@ -723,46 +1020,56 @@
     "onboarding": {
       "replaySection": "Tutorial",
       "replayTitle": "Repetir el tutorial",
-      "replaySubtitle": "Vuelve a ver el tutorial",
       "replayError": "No se pudo abrir el tutorial. Inténtalo de nuevo.",
       "prompt": {
         "title": "Mira lo que está encendido en tu muro, en directo",
-        "body": "Sigue el plafón de tu rocódromo y Boardsesh te muestra lo que está encendido ahora mismo: quién lo encendió, el grado, quién lo montó y los encadenes recientes. No tienes que abrir nada; está ahí.",
-        "footnote": "Además, sesiones con tu peña, el generador de entrenos y el registro de encadenes, cuando estés en un muro.",
+        "body": "Sigue el plafón de tu rocódromo para ver qué está encendido ahora, quién lo montó y los encadenes recientes.",
+        "footnote": "Las sesiones en grupo, los entrenamientos y el registro de encadenes llegan cuando estés en un muro.",
         "continue": "Elegir mi plafón"
       },
       "board": {
         "title": "¿En qué plafón escalas?",
-        "body": "Cada plafón guarda su propio historial. Elige el que escalas y verás lo que ha encadenado el resto de gente que está en él.",
-        "offlineHint": "Toca la flecha para guardar un plafón en este móvil. Se abre al instante y sigue funcionando aunque falle el wifi del rocódromo.",
+        "body": "Cada plafón guarda su propio historial. Elige el tuyo para ver qué encadena todo el mundo en él.",
+        "offlineHint": "Elige un plafón y te ofreceremos guardarlo en este móvil. Funciona sin el wifi del rocódromo.",
         "findAnother": "Buscar otro plafón",
         "findFirst": "Buscar mi plafón",
-        "offlineSkip": "Ahora no",
-        "downloadAria": "Guardar {{name}} en este móvil"
+        "offlineSkip": "Ahora no"
       },
-      "boardRevealTip": "Toca para ver lo que otros usuarios de Boardsesh han mandado al muro.",
-      "quickActionsTip": "Mantén pulsado un bloque para acciones rápidas como cola, encadene y listas.",
+      "boardRevealTip": "Toca el reloj para ver qué se ha encendido aquí.",
+      "quickActionsTip": "Mantén pulsado un bloque para ponerlo en la cola, registrarlo o añadirlo a una lista.",
       "tips": {
-        "workout": "Móntate un entreno: Volumen, Pirámide, Escalera o Grado fijo. Fija un grado, previsualiza las vías y mándalas pegada a pegada.",
-        "crew": "¿Escalas con gente? Abre una sesión y compartid una cola: cualquiera manda la siguiente vía, sin ir pasando el móvil.",
-        "record": "Tus encadenes salen aquí en Progreso: reparto de grados y tu vía más dura. Importa tu logbook de Kilter y Tension desde Aurora para empezar con tu historial.",
-        "accessory": "La barra de abajo siempre muestra lo que hay en el muro. Cambia de vía desde ahí.",
-        "climbsTab": "Para volver a tus bloques, toca la lupa de la barra de pestañas."
+        "workout": "Móntate un entrenamiento: elige un estilo y un grado, y a escalar.",
+        "crew": "¿Escalas con gente? Abre una sesión y comparte una sola cola.",
+        "record": "Progreso muestra tus encadenes en gráficas. Importa tu logbook de Kilter o Tension para llenarlo.",
+        "accessory": "La barra de abajo guarda el último bloque que abriste. Tócala para volver a abrirlo.",
+        "previewFirst": {
+          "title": "Toca un bloque para ver su vista previa. Poner en el plafón lo enciende.",
+          "windowSeconds": "Durante {{seconds}} segundos después de encender cada bloque, cada bloque que elijas también se enciende.",
+          "windowMinute": "Durante 1 minuto después de encender cada bloque, cada bloque que elijas también se enciende.",
+          "windowMinutes": "Durante {{minutes}} minutos después de encender cada bloque, cada bloque que elijas también se enciende.",
+          "untilStop": "Después, cada bloque que elijas se enciende hasta que pares.",
+          "frost": "El botón esmerilado significa que cada bloque que elijas se enciende. Deslízalo a la izquierda para seguir encendiendo hasta que pares. Tócalo para parar.",
+          "frostScreenReader": "Cuando el botón dice Estás al mando del plafón, cada bloque que elijas se enciende. Usa la acción Encender cada bloque para seguir encendiendo hasta que pares. Toca el botón para parar.",
+          "frostOpenEnded": "El botón esmerilado significa que cada bloque que elijas se enciende. Deslízalo a la izquierda para empezar. Tócalo para parar.",
+          "frostOpenEndedScreenReader": "Cuando el botón dice Estás al mando del plafón, cada bloque que elijas se enciende. Usa la acción Encender cada bloque para empezar. Toca el botón para parar.",
+          "settings": "Ajustes de iluminación",
+          "done": "Entendido",
+          "close": "Cerrar consejo"
+        }
       },
       "link": {
         "title": "Trae contigo tus encadenes de {{boardName}}",
-        "body": "Tu cuenta de {{boardName}} y Boardsesh son independientes, aunque uses el mismo correo. Vincula tu cuenta para sincronizar los encadenes disponibles con tu logbook. El tiempo de sincronización y el historial disponible varían.",
+        "body": "Tu cuenta de {{boardName}} es independiente de Boardsesh. Vincúlala para traer tus encadenes a tu logbook.",
         "footnote": "Para vincular necesitas tu usuario de {{boardName}}, no tu correo.",
         "continue": "Vincular mi cuenta de {{boardName}}",
         "skip": "Ahora no",
-        "skipHint": "Puedes hacerlo cuando quieras en Ajustes › Apps conectadas."
+        "skipHint": "Hazlo cuando quieras en Ajustes › Aplicaciones conectadas."
       }
     },
     "nav": {
       "home": "Inicio",
       "boards": "Plafones",
       "climbs": "Bloques",
-      "wall": "En el muro",
       "profile": "Perfil",
       "holdFilter": "Tipos de presa",
       "zoneFilter": "Zona del muro",
@@ -770,9 +1077,9 @@
     },
     "changelog": {
       "title": "Novedades",
-      "intro": "Últimas mejoras y correcciones, las más recientes primero.",
-      "currentBuild": "Estás en la versión del {{date}}",
-      "currentBuildVersion": "Estás en la versión {{version}}",
+      "intro": "Últimos cambios",
+      "currentBuild": "Actualizado {{date}}",
+      "currentBuildVersion": "Versión {{version}}",
       "category": {
         "new": "Nuevo",
         "improved": "Mejorado",
@@ -801,7 +1108,36 @@
       "checkError": {
         "title": "No se pudo buscar actualizaciones",
         "message": "Algo salió mal al obtener la última versión. Inténtalo de nuevo en un rato."
+      },
+      "updates": {
+        "regular": "Versión estable",
+        "canary": "Versión canary",
+        "canaryBody": "Selección automática para este despliegue. Los informes incluyen tu versión.",
+        "statusUnknown": "No se pudo confirmar el estado del despliegue.",
+        "early": "Actualizaciones anticipadas",
+        "staging": "Versión de pruebas",
+        "preview": "Vista previa de la PR #{{prNumber}}",
+        "native": "Versión instalada",
+        "other": "Versión {{channel}}",
+        "changeRelease": "Versión",
+        "testPreview": "Probar una vista previa de PR",
+        "finishTesting": "Terminar las pruebas de la PR #{{prNumber}}",
+        "options": "Opciones de actualización",
+        "earlyUpdatesHelp": "Las actualizaciones anticipadas pueden tener fallos. Los cambios se aplican al volver a abrir la app."
+      },
+      "previewFirstSpotlight": {
+        "title": "Explora bloques sin encender el plafón",
+        "tap": "Toca un bloque para ver su vista previa. Poner en el plafón lo enciende, y tus siguientes elecciones también. Elige cuánto tiempo en Ajustes › Plafón.",
+        "swipe": "Desliza el botón del plafón a la izquierda para encender cada bloque que elijas. Tócalo para parar.",
+        "back": "Toca la flecha de arriba a la izquierda para cerrar una vista previa.",
+        "cta": "Mira cómo funciona",
+        "dismiss": "Entendido"
       }
+    },
+    "launchUpdate": {
+      "checking": "Buscando actualizaciones",
+      "installing": "Instalando la última actualización",
+      "firstLaunchHint": "Solo la primera vez que abres la app. Tarda unos segundos."
     },
     "connectivity": {
       "serverDown": {
@@ -848,6 +1184,36 @@
       "errorTitle": "No hemos podido cargarlo",
       "errorBody": "No ha llegado. Vuelve a intentarlo.",
       "retry": "Reintentar"
+    },
+    "storePrompt": {
+      "title": "Consigue la app de Boardsesh",
+      "body": "Enciende tu plafón y registra cada encadene, incluso sin conexión.",
+      "googlePlay": "Disponible en Google Play",
+      "appStore": "Descárgala en el App Store",
+      "dismiss": "Ahora no"
+    },
+    "reportRelease": {
+      "title": "Detalles de la versión",
+      "channel": "Canal",
+      "branch": "Rama",
+      "updateId": "ID de actualización",
+      "runtimeVersion": "Runtime",
+      "automaticCanary": "Canary automático",
+      "embedded": "Paquete integrado",
+      "checkedAt": "Canary comprobado",
+      "yes": "Sí",
+      "no": "No",
+      "unknown": "Desconocido"
+    },
+    "supportAsks": {
+      "accountRow": "Apoya Boardsesh",
+      "cardTitle": "Ayuda a construir Boardsesh",
+      "cardBody": "Boardsesh es gratis para quien escala. El apoyo mensual paga el tiempo que lleva construirlo.",
+      "giveMonthly": "Aportar cada mes",
+      "giveOnce": "Aportar una vez",
+      "hideCard": "Ocultar esta tarjeta",
+      "settingTitle": "Mostrar peticiones de apoyo",
+      "settingFooter": "Una fila «Apoya Boardsesh» en Cuenta y una tarjeta en Inicio la primera semana de cada mes."
     }
   },
   "lightControl": {
@@ -858,6 +1224,7 @@
   },
   "bluetooth": {
     "boardNotFound": "No se encontró tu plafón. Asegúrate de que esté encendido y cerca; y si otro teléfono está conectado, desconéctalo allí primero.",
+    "boardSwitchConnectFailed": "Cambiaste de plafón, pero no se pudo conectar con el nuevo. Acércate a él e inténtalo de nuevo.",
     "connectFailed": "No se pudo conectar. Acércate al plafón e inténtalo de nuevo.",
     "serviceMissing": "Conectado, pero el plafón no respondió. Reinícialo e inténtalo de nuevo.",
     "unavailable": "El Bluetooth está apagado. Actívalo para conectar con tu plafón.",
@@ -883,28 +1250,60 @@
     "fallbackCta": "Abrir la página de la tienda"
   },
   "footer": {
-    "tagline": "Tus plafones. Una app. Cambia de plafón sin cambiar de app.",
+    "tagline": "Tus plafones. Una app. Gratis para tu próxima sesión.",
     "navLabel": "Pie de página",
-    "trademarkNote": "Compatible con Kilter, Tension y MoonBoard. Sin relación con Aurora Climbing ni Moon Climbing.",
+    "trademarkNote": "Compatible con los plafones {{boards}}. Boardsesh es independiente y no está creado ni respaldado por ningún fabricante, incluido Aurora Climbing. Las marcas pertenecen a sus titulares.",
+    "storeTrademarks": "Apple y el logotipo de Apple son marcas comerciales de Apple Inc., registradas en EE. UU. y otros países. App Store es una marca de servicio de Apple Inc. Google Play y el logotipo de Google Play son marcas comerciales de Google LLC.",
     "links": {
-      "home": "Inicio",
       "about": "Sobre nosotros",
       "support": "Apoya Boardsesh",
       "help": "Ayuda",
-      "docs": "Documentación",
       "playlists": "Listas",
       "auroraMigration": "Trae tu logbook",
       "legal": "Aviso legal",
       "privacy": "Privacidad",
-      "gymsKilter": "Rocódromos con un plafón Kilter",
-      "gymsTension": "Rocódromos con un plafón Tension",
-      "gymsMoonboard": "Rocódromos con un MoonBoard",
-      "gyms": "Todos los rocódromos y muros"
+      "gyms": "Todos los rocódromos"
     },
-    "groups": {
-      "findAGym": "Encuentra un rocódromo",
-      "explore": "Explora",
-      "smallPrint": "Letra pequeña"
-    }
+    "groups": {},
+    "journeys": {
+      "climb": "Escala",
+      "walls": "Para salas",
+      "project": "Proyecto",
+      "help": "Ayuda",
+      "supportedBoards": "Plafones compatibles",
+      "setupSpray": "Configura tu Spraywall",
+      "claimGym": "Reclama tu rocódromo",
+      "partners": "Colaboradores y fabricantes",
+      "source": "Código fuente",
+      "roadmap": "Próximos pasos",
+      "discord": "Discord",
+      "developers": "Desarrolladores",
+      "bluetooth": "¿No se conecta el plafón?",
+      "reportBug": "Informa de un error",
+      "appGuides": "Guías de apps para plafones (en inglés)"
+    },
+    "openBrowser": "Ábrelo en el navegador"
+  },
+  "unsavedChanges": {
+    "title": "¿Descartar los cambios?",
+    "message": "Tus cambios no se guardarán.",
+    "discard": "Descartar cambios",
+    "keepEditing": "Seguir editando"
+  },
+  "undoDelete": {
+    "removed": "Registro eliminado",
+    "removedMany": "{{count}} registros eliminados",
+    "undo": "Deshacer",
+    "cancelled": "Eliminación cancelada. Tu registro se ha conservado."
+  },
+  "chineseTranslation": {
+    "title": "Ayúdanos con el chino de escalada",
+    "body": "Te damos la bienvenida a Boardsesh en chino simplificado. Usamos IA para traducir la app y algunos términos de escalada pueden sonar poco naturales.",
+    "terms": "¿Cómo llamas a un encadenamiento, un flash, la beta o un Spraywall? Ayúdanos a elegir las palabras que usan quienes escalan.",
+    "invitation": "Comparte tus sugerencias en nuestro formulario de Google. Es opcional y puedes volver a encontrarlo en Ajustes → General → Ayudar a traducir.",
+    "openForm": "Ayudar con los términos de escalada",
+    "continue": "Continuar a Boardsesh",
+    "formPending": "Nuestro formulario de terminología aún no está listo. Puedes colaborar desde Ayudar a traducir en Ajustes → General.",
+    "formDescription": "Rellena nuestro formulario de Google para ayudarnos a elegir términos de escalada naturales en chino."
   }
 }

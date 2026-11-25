@@ -7,14 +7,14 @@
 // a null session id and `RestTimerSessionSync` binds it when the session appears.
 // So this never has to wait for a session to exist.
 
-import { useCallback } from 'react';
+import { useCallback, type ReactNode } from 'react';
 import { StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { Card } from '../Card';
 import { SwitchRow } from '../SwitchRow';
 import { useQueueSessionId } from '../../providers/queue-provider';
 import { useRestTimerArmed } from '../../hooks/use-rest-timer';
-import { getSetting } from '../../settings';
+import { getEffectiveRestPacing } from '../../hooks/use-effective-rest-pacing';
 import { nowMs } from '../../lib/clock';
 import { armRestTimer, disarmRestTimer } from '../../lib/rest-timer-store';
 import {
@@ -23,6 +23,8 @@ import {
   RestTimerLengthControl,
 } from '../queue-control/RestTimerSheet';
 import { spacing } from '../../theme/tokens';
+import { ShowcaseAnchorView } from '../../lib/showcase-anchor';
+import { RestTimerCrewNote } from '../queue-control/RestTimerCrewNote';
 
 /**
  * The arm switch plus, once armed, the controls a climber sets a session up
@@ -31,9 +33,11 @@ import { spacing } from '../../theme/tokens';
  * 3:00") gets set up, and without the choice here the timer could only ever run
  * "after each send", restarting on every attempt. Changing it re-arms the live
  * timer — the section itself handles that.
+ *
+ * In a crew the switch drives the session's shared clock (#5382): turning it on
+ * or off does so for everyone, and a crewmate's clock turns it on here.
  */
 export function RestTimerArmRow() {
-  const { t } = useTranslation('session');
   const armed = useRestTimerArmed();
   const { sessionId } = useQueueSessionId();
 
@@ -43,41 +47,69 @@ export function RestTimerArmRow() {
         disarmRestTimer();
         return;
       }
-      // `getSetting` rather than `useSetting`: the cadence is read once, at the
-      // moment of arming, and subscribing here would re-render the Record tab's
-      // list header for a preference this row does not display.
-      armRestTimer(getSetting('restTimerMode'), nowMs(), sessionId);
+      // The non-React read rather than the hook: the cadence is read once, at
+      // the moment of arming, and subscribing here would re-render the Record
+      // tab's list header for a preference this row does not display.
+      armRestTimer(getEffectiveRestPacing().mode, nowMs(), sessionId);
     },
     [sessionId],
   );
 
   return (
+    <RestTimerArmRowView
+      armed={armed}
+      onArm={handleArm}
+      note={<RestTimerCrewNote placement="armRow" />}
+      controls={
+        <>
+          <RestTimerLengthControl />
+          <RestTimerCadenceSection />
+          <RestTimerAutoAdvanceRow />
+        </>
+      }
+    />
+  );
+}
+export function RestTimerArmRowView({
+  armed,
+  onArm,
+  note,
+  controls,
+}: {
+  armed: boolean;
+  onArm: (armed: boolean) => void;
+  note?: ReactNode;
+  controls?: ReactNode;
+}) {
+  const { t } = useTranslation('session');
+  return (
     <Card>
-      {/* No clock above the switch. This card is where you TURN THE TIMER ON;
+      <View style={styles.cardBleed}>
+        {/* No clock above the switch. This card is where you TURN THE TIMER ON;
           the running count belongs to the pill that floats over every tab, and a
           second copy sitting above its own on/off switch just competed with it. */}
-      <SwitchRow
-        label={t('mobile.restTimer.armLabel')}
-        description={t('mobile.restTimer.armDescription')}
-        value={armed}
-        onValueChange={handleArm}
-      />
-      {armed ? (
-        <View style={styles.controls}>
-          {/* `inset={false}`: the length and cadence blocks pull back out
-              through the card's own 16pt padding, then re-apply the gutter
-              themselves, so the rest slider spans the card's content width and
-              the cadence header lines up with the Rest label. */}
-          <RestTimerLengthControl inset={false} />
-          <RestTimerCadenceSection inset={false} />
-          <RestTimerAutoAdvanceRow />
-        </View>
-      ) : null}
+        <ShowcaseAnchorView name="rest-timer">
+          <SwitchRow
+            label={t('mobile.restTimer.armLabel')}
+            description={t('mobile.restTimer.armDescription')}
+            value={armed}
+            onValueChange={onArm}
+          />
+        </ShowcaseAnchorView>
+        {/* In a crew the switch is the crew's (#5382): it turns the shared clock on or off. */}
+        {note}
+        {armed ? <View style={styles.controls}>{controls}</View> : null}
+      </View>
     </Card>
   );
 }
 
 const styles = StyleSheet.create({
+  // All controls own the same gutter; cancel the Card's inset once for the
+  // whole group, rather than bleeding only the length and cadence blocks.
+  cardBleed: {
+    marginHorizontal: -spacing[4],
+  },
   // Only a small top margin: the cadence SectionHeader brings its own top
   // padding and each SwitchRow its own vertical padding, so a gap here would
   // just double those seams.

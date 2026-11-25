@@ -24,7 +24,7 @@ vi.mock('@/app/lib/graphql/client', () => ({
 
 vi.stubGlobal('fetch', fetchMock);
 
-import { resolveBoardBySlug, type ResolvedBoard } from '../board-slug-utils';
+import { resolveBoardBySlug, resolveBoardBySlugAsStranger, type ResolvedBoard } from '../board-slug-utils';
 import { SSR_BACKEND_FETCH_TIMEOUT_MS } from '../ssr-fetch-deadline';
 
 const publicBoard: ResolvedBoard = {
@@ -67,7 +67,7 @@ describe('resolveBoardBySlug', () => {
     getServerAuthTokenMock.mockResolvedValue(undefined);
   });
 
-  it('shares public anonymous lookups without sending an authorization header', async () => {
+  it('reauthorizes public anonymous lookups without sending an authorization header', async () => {
     fetchMock.mockResolvedValueOnce(graphQlResponse(publicBoard));
 
     await expect(resolveBoardBySlug(publicBoard.slug)).resolves.toEqual(publicBoard);
@@ -75,11 +75,13 @@ describe('resolveBoardBySlug', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [, requestInit] = fetchMock.mock.calls[0];
     expect(new Headers(requestInit?.headers).get('Authorization')).toBeNull();
+    // SSR of /b/<slug> names www as the calling client.
+    expect(new Headers(requestInit?.headers).get('x-boardsesh-client')).toBe('boardsesh-web/0.1.0 (server)');
     expect(requestInit).toMatchObject({
       method: 'POST',
-      next: { revalidate: 300 },
+      cache: 'no-store',
     });
-    expect(requestInit).not.toHaveProperty('cache');
+    expect(requestInit).not.toHaveProperty('next');
   });
 
   it('keeps an anonymously masked private lookup as not found', async () => {
@@ -89,7 +91,7 @@ describe('resolveBoardBySlug', () => {
 
     const [, requestInit] = fetchMock.mock.calls[0];
     expect(new Headers(requestInit?.headers).get('Authorization')).toBeNull();
-    expect(requestInit).toMatchObject({ next: { revalidate: 300 } });
+    expect(requestInit).toMatchObject({ cache: 'no-store' });
   });
 
   it('forwards the session token for private boards and disables shared caching', async () => {
@@ -100,6 +102,7 @@ describe('resolveBoardBySlug', () => {
 
     const [, requestInit] = fetchMock.mock.calls[0];
     expect(new Headers(requestInit?.headers).get('Authorization')).toBe('Bearer signed-session-token');
+    expect(new Headers(requestInit?.headers).get('x-boardsesh-client')).toBe('boardsesh-web/0.1.0 (server)');
     expect(requestInit).toMatchObject({ cache: 'no-store' });
     expect(requestInit).not.toHaveProperty('next');
   });
@@ -115,8 +118,53 @@ describe('resolveBoardBySlug', () => {
     const [, authenticatedRequest] = fetchMock.mock.calls[0];
     const [, anonymousRequest] = fetchMock.mock.calls[1];
     expect(authenticatedRequest).toMatchObject({ cache: 'no-store' });
-    expect(anonymousRequest).toMatchObject({ next: { revalidate: 300 } });
+    expect(anonymousRequest).toMatchObject({ cache: 'no-store' });
     expect(new Headers(anonymousRequest?.headers).get('Authorization')).toBeNull();
+  });
+
+  // A spray wall's share link carries `?wall=<uuid>`. The backend opens an
+  // unlisted wall only when that uuid reaches it as `wallUuid`.
+  it('sends the wall capability only when the request carried one', async () => {
+    fetchMock.mockResolvedValueOnce(graphQlResponse(publicBoard)).mockResolvedValueOnce(graphQlResponse(publicBoard));
+
+    await resolveBoardBySlug(publicBoard.slug);
+    await resolveBoardBySlug(publicBoard.slug, privateBoard.uuid);
+
+    const plainBody = JSON.parse(fetchMock.mock.calls[0][1]?.body as string) as { query: string; variables: object };
+    const wallBody = JSON.parse(fetchMock.mock.calls[1][1]?.body as string) as { query: string; variables: object };
+    expect(plainBody.variables).toEqual({ slug: publicBoard.slug });
+    expect(plainBody.query).not.toContain('wallUuid');
+    expect(wallBody.variables).toEqual({ slug: publicBoard.slug, wallUuid: privateBoard.uuid });
+    expect(wallBody.query).toContain('boardBySlug(slug: $slug, wallUuid: $wallUuid)');
+  });
+
+  it('asks again without the capability when the backend predates it, instead of a 500', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ errors: [{ message: 'Unknown argument "wallUuid" on field "Query.boardBySlug".' }] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        ),
+      )
+      .mockResolvedValueOnce(graphQlResponse(publicBoard));
+
+    await expect(resolveBoardBySlug(publicBoard.slug, privateBoard.uuid)).resolves.toEqual(publicBoard);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const retryBody = JSON.parse(fetchMock.mock.calls[1][1]?.body as string) as { variables: object };
+    expect(retryBody.variables).toEqual({ slug: publicBoard.slug });
+  });
+
+  it('still throws any other GraphQL error on a lookup that carried the capability', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ errors: [{ message: 'read deadline exceeded' }], data: { boardBySlug: null } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    await expect(resolveBoardBySlug(publicBoard.slug, privateBoard.uuid)).rejects.toThrow(/GraphQL errors/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   // Every caller turns `null` into `notFound()`, and Vercel CDN-caches a 404 for
@@ -180,10 +228,43 @@ describe('resolveBoardBySlug', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     const [, anonymousRequest] = fetchMock.mock.calls[0];
     const [, authenticatedRequest] = fetchMock.mock.calls[1];
-    expect(anonymousRequest).toMatchObject({ next: { revalidate: 300 } });
+    expect(anonymousRequest).toMatchObject({ cache: 'no-store' });
     expect(new Headers(anonymousRequest?.headers).get('Authorization')).toBeNull();
     expect(authenticatedRequest).toMatchObject({ cache: 'no-store' });
     expect(authenticatedRequest).not.toHaveProperty('next');
     expect(new Headers(authenticatedRequest?.headers).get('Authorization')).toBe('Bearer signed-session-token');
+  });
+});
+
+// What the board share card is gated on: the board as a stranger holding only
+// its slug sees it. A signed-in viewer's token must never reach this read, or a
+// follower's page would advertise a card the backend answers 404 for.
+describe('resolveBoardBySlugAsStranger', () => {
+  beforeEach(() => {
+    fetchMock.mockReset();
+    getServerAuthTokenMock.mockReset();
+  });
+
+  it("leaves a signed-in viewer's token off the lookup", async () => {
+    getServerAuthTokenMock.mockResolvedValue('signed-session-token');
+    fetchMock.mockResolvedValueOnce(graphQlResponse(null));
+
+    await expect(resolveBoardBySlugAsStranger(privateBoard.slug)).resolves.toBeNull();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, requestInit] = fetchMock.mock.calls[0];
+    expect(new Headers(requestInit?.headers).get('Authorization')).toBeNull();
+    const body = JSON.parse(requestInit?.body as string) as { variables: object };
+    expect(body.variables).toEqual({ slug: privateBoard.slug });
+  });
+
+  it("is the page's own anonymous read when there is no viewer", async () => {
+    getServerAuthTokenMock.mockResolvedValue(undefined);
+    fetchMock.mockResolvedValueOnce(graphQlResponse(publicBoard));
+
+    await expect(resolveBoardBySlugAsStranger(publicBoard.slug)).resolves.toEqual(publicBoard);
+
+    const [, requestInit] = fetchMock.mock.calls[0];
+    expect(new Headers(requestInit?.headers).get('Authorization')).toBeNull();
   });
 });

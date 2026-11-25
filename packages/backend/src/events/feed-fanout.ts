@@ -1,10 +1,12 @@
 import type { SocialEvent } from '@boardsesh/shared-schema';
 import type { SocialEntityType } from '@boardsesh/db/schema';
+import { acquireUserTickMutationLock } from '@boardsesh/db/queries';
 import { db } from '../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { and, eq, or } from 'drizzle-orm';
 import { buildFeedItemMetadata } from './feed-metadata';
 import { resolveClimbNoMatch } from '../graphql/resolvers/shared/helpers';
+import { sprayWallMayAnnounceByLayout } from '../graphql/resolvers/shared/spray-wall-announce';
 import { climbStatsJoinConditions, resolvedClimbAngleSql } from '../db/queries/util/climb-stats-join';
 
 export { buildFeedItemMetadata } from './feed-metadata';
@@ -23,7 +25,10 @@ function feedRowIdentityKey(row: Pick<FeedInsertRow, 'recipientId' | 'type' | 'e
   return JSON.stringify([row.recipientId, row.type, row.entityType, row.entityId]);
 }
 
-async function insertFeedRows(rows: FeedInsertRow[]): Promise<void> {
+async function insertFeedRows(
+  rows: FeedInsertRow[],
+  database: Pick<typeof db, 'select' | 'insert'> = db,
+): Promise<void> {
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += FANOUT_BATCH_SIZE) {
     const batchByIdentity = new Map<string, FeedInsertRow>();
     for (const row of rows.slice(rowIndex, rowIndex + FANOUT_BATCH_SIZE)) {
@@ -33,7 +38,7 @@ async function insertFeedRows(rows: FeedInsertRow[]): Promise<void> {
     const batch = [...batchByIdentity.values()];
     if (batch.length === 0) continue;
 
-    const existingRows = await db
+    const existingRows = await database
       .select({
         recipientId: dbSchema.feedItems.recipientId,
         type: dbSchema.feedItems.type,
@@ -56,7 +61,7 @@ async function insertFeedRows(rows: FeedInsertRow[]): Promise<void> {
 
     const existingKeys = new Set(existingRows.map(feedRowIdentityKey));
     const insertRows = batch.filter((row) => !existingKeys.has(feedRowIdentityKey(row)));
-    if (insertRows.length > 0) await db.insert(dbSchema.feedItems).values(insertRows);
+    if (insertRows.length > 0) await database.insert(dbSchema.feedItems).values(insertRows);
   }
 }
 
@@ -227,6 +232,14 @@ async function getCommentContextMetadata(
     if (!tickContext) return {};
     if (tickContext.climbIsDraft === true || tickContext.climbIsListed === false) return null;
 
+    // #6032: the tick's own board type is authoritative even when the climb row
+    // is gone, and a spray tick whose climb was hard-deleted answers false
+    // inside the helper — no wall, no announce. Same rule `saveClimb` and
+    // `saveTick` apply before they publish.
+    if (tickContext.boardType === 'spray' && !(await sprayWallMayAnnounceByLayout(tickContext.layoutId))) {
+      return null;
+    }
+
     return {
       climbUuid: tickContext.climbUuid,
       boardType: tickContext.boardType,
@@ -273,6 +286,12 @@ async function getCommentContextMetadata(
 
     if (!climbContext) return {};
     if (climbContext.isDraft === true || climbContext.isListed === false) return null;
+
+    // #6032, same rule as the tick branch: the wall can flip private between the
+    // comment being written (which did check visibility) and this fan-out.
+    if (climbContext.boardType === 'spray' && !(await sprayWallMayAnnounceByLayout(climbContext.layoutId))) {
+      return null;
+    }
 
     return {
       climbName: climbContext.climbName,
@@ -323,7 +342,7 @@ async function buildCommentMetadata(event: SocialEvent): Promise<Record<string, 
   };
 }
 
-async function getProposalContextMetadata(proposalUuid: string): Promise<Record<string, unknown>> {
+async function getProposalContextMetadata(proposalUuid: string): Promise<Record<string, unknown> | null> {
   const [proposalContext] = await db
     .select({
       proposalType: dbSchema.climbProposals.type,
@@ -336,6 +355,11 @@ async function getProposalContextMetadata(proposalUuid: string): Promise<Record<
       setterUsername: dbSchema.boardClimbs.setterUsername,
       description: dbSchema.boardClimbs.description,
       characteristics: dbSchema.boardClimbs.characteristics,
+      // LEFT JOIN → null when the climb row is gone. `climbExists` is what
+      // tells "joined, and the climb is a draft" from "no climb row to judge".
+      climbExists: dbSchema.boardClimbs.uuid,
+      isDraft: dbSchema.boardClimbs.isDraft,
+      isListed: dbSchema.boardClimbs.isListed,
     })
     .from(dbSchema.climbProposals)
     .leftJoin(
@@ -349,6 +373,21 @@ async function getProposalContextMetadata(proposalUuid: string): Promise<Record<
     .limit(1);
 
   if (!proposalContext) return {};
+
+  // #6032: a proposal on a draft, or on the climb of a wall that may not
+  // announce, must not fan its climb name / frames / layout id into the feed
+  // table of people who cannot see the wall. The read side already hides these
+  // rows (#5981/#6034 + `activityFeed`'s visibility fold), but the row is still
+  // WRITTEN with the private data in its metadata. Same convention as the tick
+  // and climb branches of `getCommentContextMetadata`: null means skip.
+  if (proposalContext.climbExists && (proposalContext.isDraft === true || proposalContext.isListed === false)) {
+    return null;
+  }
+  // A missing climb row answers false inside the helper (no wall, nothing to
+  // announce), so a spray proposal on a hard-deleted climb skips fan-out too.
+  if (proposalContext.boardType === 'spray' && !(await sprayWallMayAnnounceByLayout(proposalContext.layoutId))) {
+    return null;
+  }
 
   return {
     proposalType: proposalContext.proposalType,
@@ -367,11 +406,14 @@ async function getProposalContextMetadata(proposalUuid: string): Promise<Record<
   };
 }
 
-async function buildProposalApprovedMetadata(event: SocialEvent): Promise<Record<string, unknown>> {
+async function buildProposalApprovedMetadata(event: SocialEvent): Promise<Record<string, unknown> | null> {
   const [actorMetadata, proposalMetadata] = await Promise.all([
     getActorMetadata(event.actorId),
     getProposalContextMetadata(event.entityId),
   ]);
+  // #6032: the proposal's climb may not be fanned out (draft, or a spray wall
+  // that may not announce). Null from the metadata builder means "write nothing".
+  if (proposalMetadata === null) return null;
 
   return {
     ...buildFeedItemMetadata(event),
@@ -394,20 +436,33 @@ export async function fanoutFeedItems(event: SocialEvent): Promise<void> {
     ...(await getActorMetadata(event.actorId)),
   };
 
-  const allRows = uniqueRecipientIds(followerIds, event.actorId).map((recipientId) => ({
-    recipientId,
-    actorId: event.actorId,
-    type: 'ascent' as const,
-    entityType: 'tick' as SocialEntityType,
-    entityId: event.entityId,
-    // boardUuid is intentionally null when a climb isn't associated with a user board.
-    // Board-scoped feed filtering simply won't match these items — they still appear
-    // in the unfiltered "All" feed.
-    boardUuid: event.metadata.boardUuid || null,
-    metadata,
-  }));
+  // An ascent event can arrive after the climber corrects its board. Serialize
+  // with edit/delete and read the current association rather than resurrecting
+  // the event's old board in freshly inserted feed copies.
+  await db.transaction(async (tx) => {
+    await acquireUserTickMutationLock(tx, event.actorId);
+    const [tick] = await tx
+      .select({ uuid: dbSchema.boardseshTicks.uuid, boardUuid: dbSchema.userBoards.uuid })
+      .from(dbSchema.boardseshTicks)
+      .leftJoin(dbSchema.userBoards, eq(dbSchema.userBoards.id, dbSchema.boardseshTicks.boardId))
+      .where(and(eq(dbSchema.boardseshTicks.uuid, event.entityId), eq(dbSchema.boardseshTicks.userId, event.actorId)))
+      .limit(1);
+    if (!tick) return;
+    const allRows = uniqueRecipientIds(followerIds, event.actorId).map((recipientId) => ({
+      recipientId,
+      actorId: event.actorId,
+      type: 'ascent' as const,
+      entityType: 'tick' as SocialEntityType,
+      entityId: event.entityId,
+      // boardUuid is intentionally null when a climb isn't associated with a user board.
+      // Board-scoped feed filtering simply won't match these items — they still appear
+      // in the unfiltered "All" feed.
+      boardUuid: tick.boardUuid,
+      metadata,
+    }));
 
-  await insertFeedRows(allRows);
+    await insertFeedRows(allRows, tx);
+  });
 }
 
 /**
@@ -470,6 +525,7 @@ export async function fanoutProposalApprovedFeedItems(event: SocialEvent): Promi
   if (recipientIds.length === 0) return;
 
   const metadata = await buildProposalApprovedMetadata(event);
+  if (!metadata) return;
 
   const rows = recipientIds.map((recipientId) => ({
     recipientId,

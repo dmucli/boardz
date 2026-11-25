@@ -1,9 +1,12 @@
-import { View, Pressable, StyleSheet } from 'react-native';
+import { PressableSurface } from '../PressableSurface';
+import { View, StyleSheet } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { Text } from '../Text';
 import { Icon } from '../Icon';
 import { useTheme } from '../../providers/theme-provider';
 import { spacing, borderRadius } from '../../theme/tokens';
+
+const BANNER_MARGIN_TOP = spacing[2];
 
 type DuplicateBannerProps = {
   name: string | null;
@@ -18,7 +21,7 @@ type DuplicateBannerProps = {
  */
 export function DuplicateBanner({ name, onView, onDismiss }: DuplicateBannerProps) {
   const { t } = useTranslation('climbs');
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors } = useTheme();
   return (
     <View style={[styles.banner, { backgroundColor: systemColors.fill }]}>
       <View style={styles.bannerText}>
@@ -28,18 +31,18 @@ export function DuplicateBanner({ name, onView, onDismiss }: DuplicateBannerProp
             : t('createClimbForm.alerts.publishDuplicateUnnamed')}
         </Text>
         {onView ? (
-          <Pressable onPress={onView} accessibilityRole="button">
-            <Text variant="footnote" color={brandColors.primary}>
+          <PressableSurface onPress={onView} accessibilityRole="button">
+            <Text variant="footnote" color={systemColors.accent}>
               {t('createClimbForm.alerts.viewMatchingClimb')}
             </Text>
-          </Pressable>
+          </PressableSurface>
         ) : null}
       </View>
       {/* 16dp glyph + hitSlop 8 was a 32dp effective target, under the 44 floor.
           14 lands it at 44 without moving anything visually. */}
-      <Pressable onPress={onDismiss} accessibilityRole="button" hitSlop={14}>
+      <PressableSurface onPress={onDismiss} accessibilityRole="button" hitSlop={14}>
         <Icon name="close" size={16} color={systemColors.secondaryLabel} />
-      </Pressable>
+      </PressableSurface>
     </View>
   );
 }
@@ -47,7 +50,7 @@ export function DuplicateBanner({ name, onView, onDismiss }: DuplicateBannerProp
 const styles = StyleSheet.create({
   banner: {
     marginHorizontal: spacing[4],
-    marginTop: spacing[2],
+    marginTop: BANNER_MARGIN_TOP,
     padding: spacing[3],
     borderRadius: borderRadius.md,
     flexDirection: 'row',

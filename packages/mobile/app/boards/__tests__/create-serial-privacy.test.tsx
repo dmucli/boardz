@@ -1,5 +1,5 @@
-vi.mock('../../../src/lib/onboarding/use-onboarding-link-offer', () => ({ useOnboardingLinkOffer: () => () => false }));
 // @vitest-environment jsdom
+vi.mock('../../../src/lib/onboarding/use-onboarding-link-offer', () => ({ useOnboardingLinkOffer: () => () => false }));
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -43,6 +43,11 @@ function board(overrides: Partial<UserBoard>): UserBoard {
   } as unknown as UserBoard;
 }
 
+// Whether Back landed on a wizard step is the hook's own suite
+// (use-stepped-back-in-wizard.test.ts); here every report goes out at once.
+vi.mock('../../../src/lib/boards/use-stepped-back-in-wizard', () => ({
+  useSteppedBackInWizard: () => (report: () => void) => report(),
+}));
 vi.mock('expo-router', () => ({
   useRouter: () => routerMock,
   useLocalSearchParams: () => ({}),
@@ -60,7 +65,21 @@ vi.mock('../../../src/lib/graphql/hooks', () => ({
   usePopularBoardConfigs: () => ({ data: undefined }),
   fetchBoardByUuid: fetchBoardByUuidMock,
   fetchBoardsBySerialNumbers: fetchBoardsBySerialNumbersMock,
+  useGym: () => ({ data: undefined }),
 }));
+
+vi.mock('../../../src/providers/feature-flags-provider', () => ({
+  useAddBoardWizardEnabled: () => false,
+  useDirectoryReportsEnabled: () => false,
+}));
+vi.mock('../../../src/components/report-problem/use-report-problem', () => ({
+  useReportProblemHost: () => ({ openReport: vi.fn(), sheet: null, isOpen: false }),
+}));
+vi.mock('../../../src/providers/sheet-presentation-provider', () => ({
+  dismissManagedSheetAndWait: async () => ({ status: 'dismissed' }),
+}));
+vi.mock('../../../src/components/board-discovery/DiscoveryBoardArt', () => ({ DiscoveryBoardArt: () => null }));
+vi.mock('../../../src/components/board-discovery/ExistingWallsSheet', () => ({ ExistingWallsSheet: () => null }));
 
 vi.mock('../../../src/lib/graphql/use-active-board', () => ({
   useSetActiveBoard: () => setActiveBoardMock,
@@ -81,13 +100,20 @@ vi.mock('../../../src/lib/onboarding/onboarding-storage', () => ({
 }));
 vi.mock('../../../src/lib/error-reporting', () => ({ reportError: vi.fn() }));
 
+vi.mock('../../../src/providers/dialog-provider', () => ({ useConfirm: () => async () => true }));
+
 vi.mock('../../../src/providers/auth-provider', () => ({
   useAuth: () => ({ isAuthenticated: true }),
 }));
 
 vi.mock('../../../src/lib/analytics', () => ({ track: trackMock }));
 
-vi.mock('@boardsesh/board-config', () => ({ toBoardName: (value: string) => value }));
+vi.mock('@boardsesh/board-config', () => ({
+  toBoardName: (value: string) => value,
+  boardSetupLabelParts: () => ({ layout: null, size: null, sets: [], angle: null }),
+  parseSetIds: (setIds: string) => setIds.split(',').filter(Boolean).map(Number),
+  findUnknownSetupField: () => null,
+}));
 vi.mock('../../../src/lib/boards/board-config-preset', () => ({ presetBoardConfig: () => null }));
 
 vi.mock('../../../src/lib/haptics', () => ({ hapticSelection: vi.fn() }));
@@ -105,6 +131,8 @@ vi.mock('../../../src/components/board-discovery/use-board-builder', () => ({
 
 vi.mock('../../../src/components/board-discovery/board-builder-labels', () => ({
   formatDefaultBoardName: () => 'My wall',
+  formatGymBoardName: () => 'Gym wall',
+  boardTypeLabel: (boardName: string) => boardName,
 }));
 
 vi.mock('../../../src/components/board-discovery/BoardForm', () => ({
@@ -222,3 +250,7 @@ describe('create-board serial reuse privacy', () => {
     expect(screen.getByTestId('error').textContent).toBe('mobile.create.createError');
   });
 });
+
+vi.mock('../../../src/lib/graphql/hooks/use-privacy', () => ({
+  usePrivacySettings: () => ({ data: { enabled: false, isPrivate: false } }),
+}));

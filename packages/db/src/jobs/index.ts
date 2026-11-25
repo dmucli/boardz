@@ -6,6 +6,8 @@
 export * from './types';
 export {
   runRefreshRecommendations,
+  describeBandFailure,
+  refreshCohortPlaylistBand,
   posthogConfigFromEnvironment,
   POSTHOG_DEFAULT_HOST,
   POSTHOG_DEFAULT_PROJECT_ID,
@@ -57,3 +59,16 @@ export {
   type RefreshMoonboardWideAngleEstimatesParams,
   type RefreshMoonboardWideAngleEstimatesResult,
 } from './refresh-moonboard-wide-angle-estimates';
+// Weekly spray-wall health roll-up (issue #6062): read-only aggregates for
+// the backend's `Spray Wall Health Weekly` event.
+export {
+  computeSprayWallHealth,
+  foldSprayWallHealth,
+  resolveHealthWeek,
+  SprayWallHealthInputError,
+  type ComputeSprayWallHealthOptions,
+  type SprayWallHealthMetrics,
+  type SprayWallHealthRows,
+  type SprayWallHealthRun,
+  type SprayWallRosterRow,
+} from './spray-wall-health';

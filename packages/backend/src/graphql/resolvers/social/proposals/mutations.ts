@@ -11,17 +11,21 @@ import {
   ReportClimbInputSchema,
 } from '../../../../validation/schemas';
 import { logger } from '../../../../utils/logger';
+import { enrichReleaseContext } from '../../../../services/mobile-release-status';
 import { publishSocialEvent } from '../../../../events/index';
 import { notifyClimbRevalidated } from '../../../../lib/web-revalidate';
 import { requireAdminOrLeader, getUserVoteWeight } from '../roles';
 import { insertComment, publishCommentAddedLive } from '../comments';
 import { enrichProposal } from './enrichment';
-import { applyProposalEffect, revertProposalEffect } from './effects';
+import { proposalClimbVisibilityCondition } from './privacy';
+import { applyProposalEffect, publishVoteGradedClimbStats, revertProposalEffect } from './effects';
 import { setterOverrideCommunityStatus, freezeClimb } from './setter-overrides';
 import {
   addWeightedUpvote,
   assertAngleForType,
+  assertSprayProposalAllowed,
   assertNotFrozen,
+  assertNotHidingOwnClimb,
   findOpenProposal,
   flipVoteToUpvote,
   insertProposalWithProposerVote,
@@ -56,8 +60,10 @@ export const socialProposalMutations = {
       throw new Error('A reason of at least 10 characters is required for hide proposals');
     }
 
-    const target = await loadTargetClimb(climbUuid, boardType);
+    const target = await loadTargetClimb(climbUuid, boardType, proposerId);
+    assertNotHidingOwnClimb(type, target, proposerId);
     await assertNotFrozen(climbUuid, angle ?? null, boardType);
+    await assertSprayProposalAllowed({ climbUuid, boardType, type, proposedValue });
 
     const currentValue = await resolveCurrentValue({
       type,
@@ -102,7 +108,7 @@ export const socialProposalMutations = {
       publishCommentAddedLive('proposal', proposal.uuid, comment);
     }
 
-    await runAutoApproval(proposal, proposerId);
+    await runAutoApproval(proposal, proposerId, { filedByActor: true });
     publishProposalCreated(proposal, proposerId);
 
     return enrichProposal(proposal, proposerId);
@@ -116,10 +122,19 @@ export const socialProposalMutations = {
     const { proposalUuid, value } = validated;
     const userId = ctx.userId!;
 
+    // A uuid is not access: the voter must be able to read the climb, the same
+    // rule the proposal listings apply. A draft, a climb whose setter's privacy
+    // hides it, or a spray wall the voter cannot see reads as not found, so the
+    // returned proposal (reason included) never reaches them.
     const [proposal] = await db
       .select()
       .from(dbSchema.climbProposals)
-      .where(eq(dbSchema.climbProposals.uuid, proposalUuid))
+      .where(
+        and(
+          eq(dbSchema.climbProposals.uuid, proposalUuid),
+          proposalClimbVisibilityCondition(dbSchema.climbProposals, userId),
+        ),
+      )
       .limit(1);
 
     if (!proposal) {
@@ -200,8 +215,12 @@ export const socialProposalMutations = {
     // The schema guarantees a grade label on the grade path.
     const proposedValue = kind === 'hide' ? 'true' : proposedGrade!;
 
-    const target = await loadTargetClimb(climbUuid, boardType);
+    const target = await loadTargetClimb(climbUuid, boardType, reporterId);
+    assertNotHidingOwnClimb(type, target, reporterId);
     await assertNotFrozen(climbUuid, angle, boardType);
+    await assertSprayProposalAllowed({ climbUuid, boardType, type, proposedValue });
+
+    const releaseContext = await enrichReleaseContext(validated.releaseContext, ctx.clientIdentity?.platform);
 
     const outcome = await withProposalLock(climbUuid, type, async (tx) => {
       const openProposal = await findOpenProposal({ climbUuid, boardType, type, angle, proposedValue, executor: tx });
@@ -250,6 +269,7 @@ export const socialProposalMutations = {
               entityType: 'proposal',
               entityId: openProposal.uuid,
               body: reason,
+              releaseContext,
               executor: tx,
             });
         return { status: 'added' as const, proposal: openProposal, comment };
@@ -282,6 +302,7 @@ export const socialProposalMutations = {
         entityType: 'proposal',
         entityId: created.uuid,
         body: reason,
+        releaseContext,
         executor: tx,
       });
       return { status: 'created' as const, proposal: created, comment };
@@ -306,7 +327,9 @@ export const socialProposalMutations = {
     // sits at threshold with nobody left to carry it over. The tally is
     // idempotent and the status flip is guarded on `status = 'open'` under the
     // proposal lock, so a duplicate report can never approve twice.
-    await runAutoApproval(outcome.proposal, reporterId);
+    // A report is the reporter filing the change, so a spray wall owner's grade
+    // report applies at once (#5971) whether it opened the proposal or joined it.
+    await runAutoApproval(outcome.proposal, reporterId, { filedByActor: true });
 
     if (outcome.status === 'created') {
       publishProposalCreated(outcome.proposal, reporterId);
@@ -375,6 +398,7 @@ export const socialProposalMutations = {
 
     if (status === 'approved') {
       void notifyClimbRevalidated(proposal.climbUuid);
+      publishVoteGradedClimbStats(proposal);
     }
 
     const eventType = status === 'approved' ? 'proposal.approved' : 'proposal.rejected';
@@ -426,6 +450,7 @@ export const socialProposalMutations = {
       await tx.delete(dbSchema.climbProposals).where(eq(dbSchema.climbProposals.id, proposal.id));
     });
     void notifyClimbRevalidated(proposal.climbUuid);
+    publishVoteGradedClimbStats(proposal);
 
     // Publish deleted event
     publishSocialEvent({

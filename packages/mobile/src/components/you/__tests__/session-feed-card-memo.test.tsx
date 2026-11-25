@@ -1,13 +1,20 @@
 // @vitest-environment jsdom
+vi.mock('../../climb-actions/ClimbActionsPressable', () => import('../../../../test/climb-menu-stub'));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render } from '@testing-library/react';
+import { fireEvent, render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
-import type { SessionFeedItem } from '@boardsesh/shared-schema';
+import type { Climb, SessionFeedItem } from '@boardsesh/shared-schema';
+import type { BoardConfig } from '../../../providers/drawer-host-provider';
+import { climbMenuTestState } from '../../../../test/climb-menu-stub';
 
 // Count how many times SessionFeedCard's body actually runs. The body renders a
 // `Card` exactly once, so a counter in the Card mock is a faithful proxy: if
 // React.memo bails an identical-props re-render, this must NOT bump.
 const renderCounter = vi.hoisted(() => ({ count: 0 }));
+const heroMocks = vi.hoisted(() => ({
+  getClimbActions: vi.fn((climb: Climb, boardConfig: BoardConfig) => ({ climb, boardConfig })),
+  tickToClimb: vi.fn(() => null as unknown),
+}));
 
 vi.mock('react-native', () => {
   const passthrough =
@@ -16,6 +23,7 @@ vi.mock('react-native', () => {
       createElement(tag, null, children);
   return {
     Platform: { OS: 'ios' },
+    DynamicColorIOS: (appearances: { light: string }) => appearances.light,
     PlatformColor: (name: string) => name,
     View: passthrough('div'),
     StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
@@ -54,15 +62,20 @@ vi.mock('../../../providers/toast-provider', () => ({
 }));
 
 vi.mock('../../../providers/drawer-host-provider', () => ({
-  useDrawerHost: () => ({ openClimbActions: vi.fn() }),
+  useDrawerHost: () => ({ getClimbActions: heroMocks.getClimbActions }),
 }));
 
 vi.mock('../../../lib/haptics', () => ({ hapticLight: vi.fn(), hapticMedium: vi.fn() }));
 
 vi.mock('../../../lib/beta-video-url', () => ({ mapBetaLink: () => null }));
 vi.mock('../../../lib/open-external-link', () => ({ openValidatedUrl: vi.fn() }));
-vi.mock('../../../lib/playlists/board-details-for-playlist', () => ({ getBoardConfigForPlaylist: () => null }));
-vi.mock('../../../lib/tick-to-climb', () => ({ tickToClimb: () => null }));
+// The real `renderBoardToPlaylistConfig`, so the test cannot drift from it
+// (a server-resolved renderBoard wins; Woods with none draws a plain tile).
+vi.mock('../../../lib/playlists/board-details-for-playlist', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../../lib/playlists/board-details-for-playlist')>()),
+  getBoardConfigForPlaylist: () => null,
+}));
+vi.mock('../../../lib/tick-to-climb', () => ({ tickToClimb: heroMocks.tickToClimb }));
 
 vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
@@ -75,10 +88,11 @@ vi.mock('../../Card', () => ({
   },
 }));
 vi.mock('../../PressableSurface', () => ({
-  PressableSurface: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
+  PressableSurface: ({ children, onLongPress }: { children?: ReactNode; onLongPress?: () => void }) =>
+    createElement('div', { 'data-pressable': 'true', onContextMenu: onLongPress }, children),
 }));
 vi.mock('../../ClimbListThumbnail', () => ({
-  ClimbListThumbnail: () => createElement('div', { 'data-thumb': 'true' }),
+  ClimbListThumbnail: ({ sizeId }: { sizeId: number }) => createElement('div', { 'data-thumb': String(sizeId) }),
 }));
 vi.mock('../AvatarGroup', () => ({ AvatarGroup: () => createElement('div', { 'data-avatars': 'true' }) }));
 vi.mock('../FeedSocialRow', () => ({ FeedSocialRow: () => createElement('div', { 'data-social': 'true' }) }));
@@ -119,6 +133,12 @@ function makeSession(overrides: Partial<SessionFeedItem> = {}): SessionFeedItem 
 const onOpenComments = vi.fn();
 const onPress = vi.fn();
 const onOpenClimb = vi.fn();
+
+beforeEach(() => {
+  heroMocks.getClimbActions.mockClear();
+  climbMenuTestState.commands = [];
+  climbMenuTestState.openedRows = null;
+});
 
 describe('SessionFeedCard React.memo', () => {
   beforeEach(() => {
@@ -171,5 +191,99 @@ describe('SessionFeedCard React.memo', () => {
     // A new object (buildVoteSummaryMap mints one only when the vote actually moved).
     rerender(<SessionFeedCard {...props} voteSummary={{ upvotes: 4, userVote: 1 }} />);
     expect(renderCounter.count).toBe(2);
+  });
+});
+
+describe('SessionFeedCard hero board art', () => {
+  it('draws the hardest send on the server-resolved renderBoard, not the layout default', () => {
+    const hardestSend = {
+      boardType: 'woods',
+      layoutId: 1,
+      frames: 'p1r1',
+      renderBoard: { layoutId: 1, sizeId: 1, setIds: [1] },
+      status: 'send',
+      attemptCount: 1,
+    } as unknown as SessionFeedItem['hardestSend'];
+    const { container } = render(
+      <SessionFeedCard
+        session={makeSession({ hardestSend, boardTypes: ['woods'] })}
+        onOpenComments={onOpenComments}
+        onPress={onPress}
+        onOpenClimb={onOpenClimb}
+      />,
+    );
+    // An 8x10 climb (sizeId 1) must not be drawn on the 12x12 (sizeId 2).
+    expect(container.querySelector('[data-thumb]')?.getAttribute('data-thumb')).toBe('1');
+  });
+
+  it('pins the hero native menu and direct commands to the server-resolved renderBoard', () => {
+    const climb = { uuid: 'c1' };
+    heroMocks.tickToClimb.mockReturnValue(climb);
+    heroMocks.getClimbActions.mockClear();
+    const hardestSend = {
+      boardType: 'woods',
+      layoutId: 1,
+      angle: 40,
+      frames: 'p1r1',
+      renderBoard: { layoutId: 1, sizeId: 1, setIds: [1] },
+      status: 'send',
+      attemptCount: 1,
+    } as unknown as SessionFeedItem['hardestSend'];
+    const { container } = render(
+      <SessionFeedCard
+        session={makeSession({ hardestSend, boardTypes: ['woods'] })}
+        onOpenComments={onOpenComments}
+        onPress={onPress}
+        onOpenClimb={onOpenClimb}
+      />,
+    );
+    expect(heroMocks.getClimbActions).toHaveBeenCalledExactlyOnceWith(
+      climb,
+      expect.objectContaining({ boardName: 'woods', sizeId: 1, setIds: '1', angle: 40 }),
+    );
+    const row = container.querySelector('[data-climb-actions-body]')!;
+    fireEvent.contextMenu(row);
+    expect(climbMenuTestState.openedRows?.map((action) => action.id)).toEqual(['share']);
+    expect(climbMenuTestState.commands).toEqual([]);
+    fireEvent.doubleClick(row);
+    expect(climbMenuTestState.commands).toEqual([
+      {
+        id: 'share',
+        target: {
+          climb,
+          boardConfig: { boardName: 'woods', layoutId: 1, sizeId: 1, setIds: '1', angle: 40 },
+        },
+      },
+    ]);
+    expect(onOpenClimb).not.toHaveBeenCalled();
+    heroMocks.tickToClimb.mockReturnValue(null);
+  });
+
+  it('draws no board art and opens no actions for a Woods send with no renderBoard', () => {
+    heroMocks.tickToClimb.mockReturnValue({ uuid: 'c1' });
+    heroMocks.getClimbActions.mockClear();
+    const hardestSend = {
+      boardType: 'woods',
+      layoutId: 1,
+      angle: 40,
+      frames: 'p1r1',
+      renderBoard: null,
+      status: 'send',
+      attemptCount: 1,
+    } as unknown as SessionFeedItem['hardestSend'];
+    const { container } = render(
+      <SessionFeedCard
+        session={makeSession({ hardestSend, boardTypes: ['woods'] })}
+        onOpenComments={onOpenComments}
+        onPress={onPress}
+        onOpenClimb={onOpenClimb}
+      />,
+    );
+    // No size known, so no 12x12 guess: the card still renders, without the art.
+    expect(container.querySelector('[data-card]')).not.toBeNull();
+    expect(container.querySelector('[data-thumb]')).toBeNull();
+    expect(container.querySelector('[data-native-climb-menu]')).toBeNull();
+    expect(heroMocks.getClimbActions).not.toHaveBeenCalled();
+    heroMocks.tickToClimb.mockReturnValue(null);
   });
 });

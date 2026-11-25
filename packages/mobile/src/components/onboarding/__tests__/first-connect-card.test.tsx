@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 //
 // The connect-step test's Climbs card (#5654, PR 7, treatment only). The copy is
 // the en-US catalog itself, so a renamed or missing key fails here instead of
@@ -26,7 +39,9 @@ const storeCtrl = vi.hoisted(() => ({
     cardDismissedThisLaunch: false,
   },
 }));
-const flagsCtrl = vi.hoisted(() => ({ enabled: true }));
+const flagsCtrl = vi.hoisted(() => ({ enabled: true, swipeToDrive: true }));
+const settingsCtrl = vi.hoisted(() => ({ alwaysDrive: false, drivesInSession: true }));
+const sessionCtrl = vi.hoisted(() => ({ crew: false }));
 const bluetoothMocks = vi.hoisted(() => ({
   // The hook's own connect (`useLightbulbControl().connect`): it logs Board
   // Connect Tapped, arms the undo toast and relights the remembered board; its
@@ -50,7 +65,10 @@ vi.mock('react-native', () => ({
     accessibilityLabel,
   }: Children & { onPress?: () => void; accessibilityLabel?: string }) =>
     createElement('button', { type: 'button', onClick: onPress, 'aria-label': accessibilityLabel }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+  },
   AccessibilityInfo: { announceForAccessibility: announceMock },
 }));
 
@@ -76,8 +94,27 @@ vi.mock('../../Text', () => ({
 }));
 vi.mock('../../Icon', () => ({ Icon: ({ name }: { name: string }) => createElement('i', { 'data-icon': name }) }));
 vi.mock('../../Button', () => ({
-  Button: ({ title, onPress, loading }: { title: string; onPress: () => void; loading?: boolean }) =>
-    createElement('button', { type: 'button', onClick: onPress, 'data-loading': String(Boolean(loading)) }, title),
+  Button: ({
+    title,
+    onPress,
+    loading,
+    ignoreContainerSafeArea,
+  }: {
+    title: string;
+    onPress: () => void;
+    loading?: boolean;
+    ignoreContainerSafeArea?: boolean;
+  }) =>
+    createElement(
+      'button',
+      {
+        type: 'button',
+        onClick: onPress,
+        'data-loading': String(Boolean(loading)),
+        'data-ignore-container-safe-area': String(Boolean(ignoreContainerSafeArea)),
+      },
+      title,
+    ),
 }));
 vi.mock('../../ble/use-lightbulb-control', () => ({
   useLightbulbControl: (options: unknown) => {
@@ -106,8 +143,18 @@ vi.mock('../../../lib/onboarding/first-connect-store', () => ({
 }));
 vi.mock('../../../providers/feature-flags-provider', () => ({
   useFirstConnectCtaEnabled: () => flagsCtrl.enabled,
+  useWallSwipeToDriveEnabled: () => flagsCtrl.swipeToDrive,
 }));
+vi.mock('../../../settings', () => ({
+  useSetting: (key: string) => {
+    if (key === 'alwaysDrive') return [settingsCtrl.alwaysDrive, vi.fn()];
+    if (key === 'putOnBoardDrivesInSession') return [settingsCtrl.drivesInSession, vi.fn()];
+    throw new Error(`unexpected setting ${key}`);
+  },
+}));
+vi.mock('../../../providers/queue-provider', () => ({ useIsCrewSession: () => sessionCtrl.crew }));
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     variant: 'liquidGlass',
     systemColors: { secondaryLabel: '#666', secondaryBackground: '#eee' },
@@ -115,7 +162,11 @@ vi.mock('../../../providers/theme-provider', () => ({
     m3SurfaceContainers: { high: '#ddd' },
   }),
 }));
-vi.mock('../../../theme/tokens', () => ({ borderRadius: { lg: 12 }, spacing: { 1: 4, 2: 8, 3: 12 } }));
+vi.mock('../../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
+  borderRadius: { lg: 12 },
+  spacing: { 1: 4, 2: 8, 3: 12 },
+}));
 
 const { FirstConnectCard, useFirstConnectCardExpected } = await import('../FirstConnectCard');
 
@@ -143,6 +194,10 @@ describe('FirstConnectCard', () => {
       cardDismissedThisLaunch: false,
     };
     flagsCtrl.enabled = true;
+    flagsCtrl.swipeToDrive = true;
+    settingsCtrl.alwaysDrive = false;
+    settingsCtrl.drivesInSession = true;
+    sessionCtrl.crew = false;
     lightbulbCtrl.pressAction = 'connect';
     lightbulbCtrl.pending = false;
     lightbulbCtrl.holderIsAuthoritative = false;
@@ -166,10 +221,65 @@ describe('FirstConnectCard', () => {
     renderCard();
 
     expect(screen.getByRole('heading').textContent).toBe('Light climbs on Kilter at Blocs');
-    expect(screen.getByText('Connect this phone to the board, then tap any climb to light it.')).toBeTruthy();
+    expect(screen.getByText('Connect this phone, tap a climb, then tap Put on board.')).toBeTruthy();
     expect(screen.getByText('Connect')).toBeTruthy();
     expect(screen.getByText('This wall has no lights')).toBeTruthy();
     expect(screen.getByLabelText('Not now')).toBeTruthy();
+  });
+
+  // Always drive the wall on: this phone drives the wall once connected, so every
+  // pick lights; off (the default) a tap opens a preview, so the card names Put
+  // on board.
+  it('says every pick lights while Always drive the wall is on', () => {
+    settingsCtrl.alwaysDrive = true;
+    renderCard();
+
+    expect(screen.getByText('Connect this phone to the board and every climb you pick lights.')).toBeTruthy();
+    expect(screen.queryByText(/Put on board/)).toBeNull();
+  });
+
+  // The swipe flag is driving's kill switch: off, nothing drives, so the card names Put on board.
+  it('names Put on board with the swipe flag off, Always drive the wall on or not', () => {
+    settingsCtrl.alwaysDrive = true;
+    flagsCtrl.swipeToDrive = false;
+    renderCard();
+
+    expect(screen.getByText('Connect this phone, tap a climb, then tap Put on board.')).toBeTruthy();
+  });
+
+  // In a crew Always drive the wall drives only with In a session too on.
+  it.each([
+    [false, 'Connect this phone, tap a climb, then tap Put on board.'],
+    [true, 'Connect this phone to the board and every climb you pick lights.'],
+  ])('in a crew with In a session too %s, says what lights', (drivesInSession, body) => {
+    settingsCtrl.alwaysDrive = true;
+    settingsCtrl.drivesInSession = drivesInSession;
+    sessionCtrl.crew = true;
+    renderCard();
+
+    expect(screen.getByText(body)).toBeTruthy();
+  });
+
+  // A MoonBoard follows In a session too like every board.
+  it('names Put on board on a MoonBoard in a crew with In a session too off', () => {
+    settingsCtrl.alwaysDrive = true;
+    settingsCtrl.drivesInSession = false;
+    sessionCtrl.crew = true;
+    render(<FirstConnectCard boardName="MoonBoard at home" boardHasLights />);
+
+    expect(screen.getByText('Connect this phone, tap a climb, then tap Put on board.')).toBeTruthy();
+  });
+
+  // The card can mount while Climbs is scrolled, and an iOS button host that
+  // mounts off screen keeps the safe-area inset on its label.
+  it('opts both buttons out of the container safe area', () => {
+    const { container } = renderCard();
+
+    const buttons = [...container.querySelectorAll('button[data-loading]')];
+    expect(buttons).toHaveLength(2);
+    for (const button of buttons) {
+      expect(button.getAttribute('data-ignore-container-safe-area')).toBe('true');
+    }
   });
 
   it('counts this launch against its two', () => {
@@ -240,7 +350,7 @@ describe('FirstConnectCard', () => {
 
     // Outcome-neutral: a false covers a dismissed picker and a denied
     // permission as well as a board out of range, so no "move closer".
-    expect(screen.getByText("Not connected to Kilter at Blocs yet. Try again when you're ready.")).toBeTruthy();
+    expect(screen.getByText('Not connected to Kilter at Blocs yet. Try again.')).toBeTruthy();
     expect(screen.queryByText(/closer/i)).toBeNull();
     await act(async () => {
       fireEvent.click(screen.getByText('Try again'));

@@ -30,13 +30,27 @@ import {
   restoreBootstrapRetryBudget,
   shouldSkipPagedPull,
   spendUserRequest,
-  writeBootstrapRetryState,
+  writeBootstrapRetryRows,
   type BootstrapFailureKind,
   type BootstrapRetryState,
 } from '../bootstrap-retry';
 import { SnapshotArtifactTruncatedError, SnapshotBackgroundTransferInterruptedError } from '../snapshot-bootstrap';
+import { SnapshotTransferError } from '../snapshot-transfer-failure';
 import { runMigrations } from '../../db/migrations';
 import { createTestDatabase, type TestSqliteDb } from '../../testing/sqlite-test-db';
+import type { OfflineDatabase } from '../../database';
+import { runPullWrite } from '../pull-write';
+
+/** A retry state committed the way the engine commits one (#5851): rows in their own write transaction. */
+function writeRetryState(
+  database: OfflineDatabase,
+  scopeKey: string,
+  retryState: BootstrapRetryState,
+): Promise<BootstrapRetryState> {
+  return runPullWrite(database, (transaction) => writeBootstrapRetryRows(transaction, scopeKey, retryState), {
+    site: 'test-seed',
+  });
+}
 
 const NOW = 1_800_000_000_000;
 const MINUTE = 60_000;
@@ -110,6 +124,27 @@ describe('classifyBootstrapFailure', () => {
     expect(classifyBootstrapFailure({ cause: new Error('insufficient disk space'), stage: 'download' })).toBe(
       'structural-device',
     );
+  });
+
+  it.each([
+    new Error('Unable to download a file: Connection reset'),
+    new Error('Unable to download a file: Failed to connect to snapshots.boardsesh.com/104.21.81.90:443'),
+    new Error('Unable to download a file: Software caused connection abort'),
+    new SnapshotTransferError('http-range', 'server returned HTTP 416', { cause: new Error('HTTP 416') }),
+  ])('bounds observed transfer failures without consuming the structural budget: %o', (cause) => {
+    let current = state();
+    for (let attempt = 1; attempt <= MAX_TRANSPORT_DOWNLOAD_FAILURES; attempt += 1) {
+      const failureKind = classifyBootstrapFailure({ cause, stage: 'download' });
+      expect(failureKind).toBe('transport');
+      current = burn(current, failureKind);
+      expect(current.transportFailures).toBe(attempt);
+      expect(current.structuralFailures).toBe(0);
+      expect(isTerminal(current)).toBe(attempt === MAX_TRANSPORT_DOWNLOAD_FAILURES);
+    }
+    expect(shouldSkipPagedPull({ retryState: current, hasBoardCheckpoint: false, now: NOW })).toBe(false);
+    const recovered = clearTransportFailures(current);
+    expect(recovered.transportFailures).toBe(0);
+    expect(recovered.retryAfter).toBeNull();
   });
 });
 
@@ -347,6 +382,17 @@ describe('evaluateBootstrapEligibility', () => {
     expect(evaluate({ isBootstrapDone: true })).toMatchObject({ eligible: false, reason: 'bootstrap-done' });
   });
 
+  it('allows an explicit faster retry after an artifact import, while keeping completed scopes settled', () => {
+    const requested = state({ userRequested: true });
+    expect(evaluate({ isBootstrapDone: true, hasBoardCheckpoint: true, retryState: requested })).toEqual({
+      eligible: true,
+      kind: 'heal-over-partial',
+    });
+    expect(
+      evaluate({ isBootstrapDone: true, isScopeComplete: true, hasBoardCheckpoint: true, retryState: requested }),
+    ).toMatchObject({ eligible: false, reason: 'scope-complete' });
+  });
+
   it('holds a scope until its scheduled retry, then admits it', () => {
     const cooling = state({ transportFailures: 1, hasPriorSnapshotFailure: true, retryAfter: NOW + 1 });
     expect(evaluate({ retryState: cooling })).toMatchObject({ eligible: false, reason: 'cooling-down' });
@@ -542,7 +588,7 @@ describe('bootstrap-retry persistence', () => {
       false,
     );
     expect(migratedFromLegacy).toBe(true);
-    const written = await writeBootstrapRetryState(db, 'kilter:1:5', burn(migrated, 'structural-artifact'));
+    const written = await writeRetryState(db, 'kilter:1:5', burn(migrated, 'structural-artifact'));
 
     expect(await readMeta('bootstrap-retry:kilter:1:5')).not.toBeNull();
     // One structural failure spent, not yet terminal, so the legacy view is 1.
@@ -555,7 +601,7 @@ describe('bootstrap-retry persistence', () => {
   it('mirrors a terminal scope as the legacy cap so an old bundle also gives up', async () => {
     let current = state();
     for (let failure = 0; failure < MAX_BOOTSTRAP_ATTEMPTS; failure += 1) current = burn(current, 'structural-device');
-    await writeBootstrapRetryState(db, 'kilter:1:5', current);
+    await writeRetryState(db, 'kilter:1:5', current);
     expect(await readMeta('bootstrap-attempts:kilter:1:5')).toBe(String(MAX_BOOTSTRAP_ATTEMPTS));
   });
 
@@ -567,7 +613,7 @@ describe('bootstrap-retry persistence', () => {
     // structuralFailures and settle the scope again — the confirmed retry lost.
     let settled = state();
     for (let failure = 0; failure < MAX_BOOTSTRAP_ATTEMPTS; failure += 1) settled = burn(settled, 'structural-device');
-    await writeBootstrapRetryState(db, 'kilter:1:5', settled);
+    await writeRetryState(db, 'kilter:1:5', settled);
     const jsonBefore = await readMeta('bootstrap-retry:kilter:1:5');
 
     // Fails the SECOND statement inside the transaction (the legacy mirror),
@@ -594,7 +640,7 @@ describe('bootstrap-retry persistence', () => {
     } as unknown as TestSqliteDb;
 
     await expect(
-      writeBootstrapRetryState(failingLegacyWrite, 'kilter:1:5', clearRetryStateForUserRequest(settled)),
+      writeRetryState(failingLegacyWrite, 'kilter:1:5', clearRetryStateForUserRequest(settled)),
     ).rejects.toThrow('disk I/O error');
 
     // Neither row moved: the scope is still settled, not half-retried.
@@ -605,7 +651,7 @@ describe('bootstrap-retry persistence', () => {
   });
 
   it('folds back failures an older bundle counted while it was rolled back', async () => {
-    await writeBootstrapRetryState(db, 'kilter:1:5', state({ hasPriorSnapshotFailure: true }));
+    await writeRetryState(db, 'kilter:1:5', state({ hasPriorSnapshotFailure: true }));
     // A rolled-back bundle runs and bumps only the legacy counter it knows about.
     await db.runAsync('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)', [
       'bootstrap-attempts:kilter:1:5',
@@ -623,7 +669,7 @@ describe('bootstrap-retry persistence', () => {
   });
 
   it('round-trips a persisted state without laundering anything', async () => {
-    const written = await writeBootstrapRetryState(
+    const written = await writeRetryState(
       db,
       'kilter:1:5',
       state({
@@ -654,7 +700,7 @@ describe('bootstrap-retry persistence', () => {
     // concluded from the same failure charged structurally.
     let locked = state();
     for (let failure = 0; failure < MAX_BOOTSTRAP_LOCK_FAILURES; failure += 1) locked = burn(locked, 'database-locked');
-    const written = await writeBootstrapRetryState(db, 'kilter:1:5', locked);
+    const written = await writeRetryState(db, 'kilter:1:5', locked);
     expect(await getBootstrapAttempts(db, 'kilter:1:5')).toBe(MAX_BOOTSTRAP_ATTEMPTS);
 
     const { state: reread } = await readBootstrapRetryState(db, 'kilter:1:5', { now: NOW, random: noJitter }, false);
@@ -711,7 +757,7 @@ describe('bootstrap-retry persistence', () => {
   it('restoreBootstrapRetryBudget revives a settled scope and drops its slow-path caption', async () => {
     let current = state();
     for (let failure = 0; failure < MAX_BOOTSTRAP_ATTEMPTS; failure += 1) current = burn(current, 'structural-device');
-    await writeBootstrapRetryState(db, 'kilter:1:5', current);
+    await writeRetryState(db, 'kilter:1:5', current);
     await db.runAsync('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)', [
       'bootstrap-paged-fallback:kilter:1:5',
       '1',
@@ -738,5 +784,72 @@ describe('bootstrap-retry persistence', () => {
         now: NOW,
       }).eligible,
     ).toBe(true);
+  });
+
+  /**
+   * The real database behind a recorder: statements the MAIN connection ran, and
+   * each transaction's statements in order. Transactions still run on their own
+   * file-backed connection, so every row lands for real.
+   */
+  function recordingDatabase() {
+    const mainWrites: string[] = [];
+    const transactions: string[][] = [];
+    const recorded = {
+      execAsync: (source: string) => db.execAsync(source),
+      runAsync: (source: string, params: string[]) => {
+        mainWrites.push(source);
+        return db.runAsync(source, params);
+      },
+      getFirstAsync: (source: string, params: string[]) => db.getFirstAsync(source, params),
+      getAllAsync: (source: string, params: string[]) => db.getAllAsync(source, params),
+      withExclusiveTransactionAsync: (task: (txn: TestSqliteDb) => Promise<void>) =>
+        db.withExclusiveTransactionAsync(async (txn) => {
+          const statements: string[] = [];
+          transactions.push(statements);
+          await task({
+            execAsync: (source: string) => {
+              statements.push(source);
+              return txn.execAsync(source);
+            },
+            runAsync: (source: string, params: string[]) => {
+              statements.push(source);
+              return txn.runAsync(source, params);
+            },
+            getFirstAsync: (source: string, params: string[]) => {
+              statements.push(source);
+              return txn.getFirstAsync(source, params);
+            },
+            getAllAsync: (source: string, params: string[]) => {
+              statements.push(source);
+              return txn.getAllAsync(source, params);
+            },
+          } as unknown as TestSqliteDb);
+        }),
+    } as unknown as TestSqliteDb;
+    return { db: recorded, mainWrites, transactions };
+  }
+
+  it('restores a budget in ONE foreground-sized transaction that also clears the caption (#5851)', async () => {
+    let current = state();
+    for (let failure = 0; failure < MAX_BOOTSTRAP_ATTEMPTS; failure += 1) current = burn(current, 'structural-device');
+    await writeRetryState(db, 'kilter:1:5', current);
+    await db.runAsync('INSERT OR REPLACE INTO sync_meta (key, value) VALUES (?, ?)', [
+      'bootstrap-paged-fallback:kilter:1:5',
+      '1',
+    ]);
+    const recording = recordingDatabase();
+
+    await restoreBootstrapRetryBudget(recording.db, 'kilter:1:5');
+
+    // The climber is waiting on the Download confirm: the tap ladder's 2.5 s, not
+    // the background ladder's three 5 s waits.
+    expect(recording.transactions).toHaveLength(1);
+    const [statements] = recording.transactions;
+    expect(statements.slice(0, 3)).toEqual(['PRAGMA busy_timeout = 2500', 'COMMIT', 'BEGIN IMMEDIATE']);
+    // Read under the same lock it writes under, and the caption goes with it.
+    expect(statements.some((statement) => statement.startsWith('SELECT key, value FROM sync_meta'))).toBe(true);
+    expect(statements).toContain('DELETE FROM sync_meta WHERE key = ?');
+    expect(recording.mainWrites).toEqual([]);
+    expect(await readMeta('bootstrap-paged-fallback:kilter:1:5')).toBeNull();
   });
 });

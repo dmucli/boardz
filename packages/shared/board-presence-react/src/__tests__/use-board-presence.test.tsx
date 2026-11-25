@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, render, renderHook, waitFor } from '@testing-library/react';
 import type {
   BoardConnectionHolder,
@@ -6,7 +6,7 @@ import type {
   BoardPresenceEvent,
   BoardPresenceStats,
 } from '@boardsesh/shared-schema';
-import { useBoardPresence } from '../use-board-presence';
+import { isBoardReadDenied, useBoardPresence } from '../use-board-presence';
 import {
   BoardPresenceProvider,
   useBoardPresenceActions,
@@ -14,14 +14,32 @@ import {
   useBoardPresenceFeed,
   useBoardPresenceHasClimb,
   useBoardPresenceWallClimb,
+  useBoardPresenceClearedClimbUuid,
+  useBoardPresenceClient,
 } from '../board-presence-provider';
 import type { BoardPresenceClient } from '../types';
+import { useBoardHistoryPagination } from '../use-board-history-pagination';
+import { useBoardClimbRecentSenders } from '../use-board-climb-recent-senders';
+import { BOARD_HISTORY_WINDOW_MS } from '@boardsesh/board-presence';
+
+// What the shared graphql-client subscribe wrapper hands an error sink: an
+// Error carrying the server's GraphQL errors (`GraphQLOperationError`).
+const graphqlOperationError = (code: string, message: string) =>
+  Object.assign(new Error(message), {
+    name: 'GraphQLOperationError',
+    extensions: { code },
+    graphqlErrors: [{ message, extensions: { code } }],
+  });
+const NOT_FOUND_ERROR = graphqlOperationError('NOT_FOUND', 'Board not found');
+const RATE_LIMITED_ERROR = graphqlOperationError('RATE_LIMITED', 'Rate limit exceeded. Try again in 30 seconds.');
 
 // Build a BoardPresenceClimb with only the fields the reducer/hook care about.
+const TEST_NOW = Date.parse('2026-11-24T12:00:00.000Z');
+
 const climb = (climbUuid: string, seq: number, overrides: Partial<BoardPresenceClimb> = {}): BoardPresenceClimb => ({
   climbUuid,
   seq,
-  sentAt: new Date(seq * 1000).toISOString(),
+  sentAt: new Date(TEST_NOW - 1_000_000 + seq * 1000).toISOString(),
   name: `Climb ${climbUuid}`,
   angle: 40,
   ...overrides,
@@ -34,7 +52,7 @@ const setEvent = (presenceClimb: BoardPresenceClimb): BoardPresenceEvent => ({
 
 const clearEvent = (seq: number): BoardPresenceEvent => ({
   __typename: 'BoardClimbCleared',
-  clearedAt: new Date(seq * 1000).toISOString(),
+  clearedAt: new Date(TEST_NOW - 1_000_000 + seq * 1000).toISOString(),
   seq,
 });
 
@@ -132,6 +150,7 @@ function makeClient() {
 
   const reportClimb = vi.fn(async () => true);
   const reportDisconnect = vi.fn(async () => true);
+  const reportClear = vi.fn(async () => true);
   // Captured separately so assertions reference the bound mock directly
   // (referencing `client.fetchX` trips the unbound-method lint).
   const fetchRecentClimbs = vi.fn((boardId: number) => pushDeferred(recentByBoard, boardId).promise);
@@ -168,6 +187,7 @@ function makeClient() {
     fetchConnection,
     reportClimb,
     reportDisconnect,
+    reportClear,
     onReconnect,
     resolveBoardForSerial: vi.fn(),
   };
@@ -177,6 +197,7 @@ function makeClient() {
     unsubscribe,
     reportClimb,
     reportDisconnect,
+    reportClear,
     fetchRecentClimbs,
     fetchStats,
     fetchConnection,
@@ -223,7 +244,10 @@ function makeClient() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.spyOn(Date, 'now').mockReturnValue(TEST_NOW);
 });
+
+afterEach(() => vi.restoreAllMocks());
 
 describe('useBoardPresence — null inputs', () => {
   it('stays inert with a null boardId', () => {
@@ -253,7 +277,10 @@ describe('useBoardPresence — Kilter current climb', () => {
   it('keeps the newest display across mixed backfill, native backfill, and live events without reporting it', async () => {
     const harness = makeClient();
     const native = climb('native', 1);
-    const imported = climb('kilter', 100, { source: 'kilter', sentAt: new Date(2000).toISOString() });
+    const imported = climb('kilter', 100, {
+      source: 'kilter',
+      sentAt: new Date(TEST_NOW - 1_000_000 + 2000).toISOString(),
+    });
     harness.client.fetchRecentHistory = vi.fn(async () => [imported, native]);
     const { result } = renderHook(() => useBoardPresence(1, harness.client));
     await waitFor(() => expect(result.current.currentClimb).toEqual(imported));
@@ -262,13 +289,16 @@ describe('useBoardPresence — Kilter current climb', () => {
     });
     expect(result.current.currentClimb).toEqual(imported);
 
-    const nextNative = climb('new-native', 2, { sentAt: new Date(3000).toISOString() });
+    const nextNative = climb('new-native', 2, { sentAt: new Date(TEST_NOW - 1_000_000 + 3000).toISOString() });
     act(() => harness.emit(setEvent(nextNative)));
     expect(result.current.currentClimb).toEqual(nextNative);
     act(() => harness.emit({ __typename: 'BoardHistoryUpdated', climbs: [imported], seq: 100 }));
     expect(result.current.currentClimb).toEqual(nextNative);
 
-    const nextImport = climb('new-kilter', 101, { source: 'kilter', sentAt: new Date(4000).toISOString() });
+    const nextImport = climb('new-kilter', 101, {
+      source: 'kilter',
+      sentAt: new Date(TEST_NOW - 1_000_000 + 4000).toISOString(),
+    });
     act(() => harness.emit({ __typename: 'BoardHistoryUpdated', climbs: [nextImport, imported], seq: 101 }));
     expect(result.current.currentClimb).toEqual(nextImport);
     expect(result.current.history).toEqual([nextImport, nextNative, imported, native]);
@@ -279,7 +309,10 @@ describe('useBoardPresence — Kilter current climb', () => {
   it('recovers the latest Kilter display on reconnect without stale native backfill overriding it', async () => {
     const harness = makeClient();
     const native = climb('native', 1);
-    const imported = climb('kilter', 100, { source: 'kilter', sentAt: new Date(2000).toISOString() });
+    const imported = climb('kilter', 100, {
+      source: 'kilter',
+      sentAt: new Date(TEST_NOW - 1_000_000 + 2000).toISOString(),
+    });
     const fetchRecentHistory = vi.fn().mockResolvedValueOnce([native]).mockResolvedValue([imported, native]);
     harness.client.fetchRecentHistory = fetchRecentHistory;
     const { result } = renderHook(() => useBoardPresence(1, harness.client));
@@ -631,6 +664,83 @@ describe('useBoardPresence — reconnect / foreground / manual catch-up', () => 
     expect(onCatchUp).toHaveBeenCalledWith({ reason: 'manual', recoveredThroughSeqDelta: 3 });
   });
 
+  it('keeps a newer live release while an older holder snapshot waits for history', async () => {
+    const { harness, view } = await mountSeeded();
+    act(() => view.result.current.refresh());
+    await act(async () => {
+      await harness.resolveConnection(1, holder({ userId: 'seed' }));
+    });
+
+    act(() => harness.emit(connectionEvent(2, null)));
+    expect(view.result.current.holder).toBeNull();
+
+    await act(async () => {
+      await harness.resolveRecent(1, [climb('newer', 3), climb('first', 1)]);
+      await harness.resolveStats(1, { ...emptyStats, climbsSentCount: 2 });
+    });
+
+    expect(view.result.current.currentClimb?.seq).toBe(3);
+    expect(view.result.current.holder).toBeNull();
+    expect(view.result.current.lastConnectionSeq).toBe(3);
+    expect(view.result.current.lastHolderChangeSeq).toBe(2);
+  });
+
+  it('accepts a delayed holder release after catch-up history advances past its sequence', async () => {
+    const { harness, view } = await mountSeeded();
+    act(() => view.result.current.refresh());
+    await act(async () => {
+      await harness.resolveConnection(1, holder({ userId: 'seed' }));
+      await harness.resolveRecent(1, [climb('newer', 3), climb('first', 1)]);
+      await harness.resolveStats(1, { ...emptyStats, climbsSentCount: 2 });
+    });
+    expect(view.result.current.holder?.userId).toBe('seed');
+    expect(view.result.current.currentClimb?.seq).toBe(3);
+
+    // The history response raced ahead of this live holder event. Its climb
+    // sequence must not make an older holder snapshot authoritative through 3.
+    act(() => harness.emit(connectionEvent(2, null)));
+
+    expect(view.result.current.holder).toBeNull();
+    expect(view.result.current.lastConnectionSeq).toBe(3);
+  });
+
+  it('still repairs a missed holder when no live holder event intervenes', async () => {
+    const { harness, view } = await mountSeeded();
+    act(() => view.result.current.refresh());
+    await act(async () => {
+      await harness.resolveConnection(1, holder({ userId: 'new-holder' }));
+      await harness.resolveRecent(1, [climb('newer', 3), climb('first', 1)]);
+      await harness.resolveStats(1, { ...emptyStats, climbsSentCount: 2 });
+    });
+
+    expect(view.result.current.holder?.userId).toBe('new-holder');
+    expect(view.result.current.currentClimb?.seq).toBe(3);
+    expect(view.result.current.lastConnectionSeq).toBe(3);
+    expect(view.result.current.lastHolderChangeSeq).toBe(3);
+  });
+
+  it('keeps a delayed pre-take holder event below the repaired takeover cursor', async () => {
+    const { harness, view } = await mountSeeded();
+    act(() => view.result.current.refresh());
+    await act(async () => {
+      await harness.resolveConnection(1, holder({ userId: 'seed' }));
+      await harness.resolveRecent(1, [climb('newer', 13), climb('first', 1)]);
+      await harness.resolveStats(1, { ...emptyStats, climbsSentCount: 2 });
+    });
+    const connectionSeqAtTake = view.result.current.lastConnectionSeq;
+    expect(connectionSeqAtTake).toBe(13);
+
+    act(() => harness.emit(connectionEvent(2, holder({ userId: 'earlier-peer' }))));
+    expect(view.result.current.holder?.userId).toBe('earlier-peer');
+    expect(view.result.current.lastConnectionSeq).toBe(connectionSeqAtTake);
+    expect(view.result.current.lastHolderChangeSeq > connectionSeqAtTake).toBe(false);
+
+    act(() => harness.emit(connectionEvent(14, holder({ userId: 'later-peer' }))));
+    expect(view.result.current.holder?.userId).toBe('later-peer');
+    expect(view.result.current.lastConnectionSeq).toBe(14);
+    expect(view.result.current.lastHolderChangeSeq > connectionSeqAtTake).toBe(true);
+  });
+
   it('refresh("foreground") reports the foreground reason', async () => {
     const onCatchUp = vi.fn();
     const { harness, view } = await mountSeeded(onCatchUp);
@@ -667,6 +777,41 @@ describe('useBoardPresence — reconnect / foreground / manual catch-up', () => 
     });
 
     expect(onCatchUp).toHaveBeenCalledWith({ reason: 'reconnect', recoveredThroughSeqDelta: 0 });
+  });
+
+  // Board plan item 8: the drive's watcher asks "did someone take the board
+  // after sequence N", and a catch-up moves `lastConnectionSeq` through every
+  // stats event it repaired even when the holder is the same.
+  it('moves lastHolderChangeSeq on a holder push and a changed read, never on a catch-up that reads the same holder', async () => {
+    const { harness, view } = await mountSeeded();
+    const current = () => view.result.current;
+    expect(current().lastHolderChangeSeq).toBe(0);
+
+    act(() => harness.emit(connectionEvent(2, holder({ userId: 'sam', displayName: 'Sam' }))));
+    expect(current().lastConnectionSeq).toBe(2);
+    expect(current().lastHolderChangeSeq).toBe(2);
+
+    // A tick on the board: its stats event is one past the newest climb.
+    act(() => harness.emit(statsEvent(3, { climbsSentCount: 2 })));
+    act(() => current().refresh('foreground'));
+    await act(async () => {
+      await harness.resolveRecent(1, [climb('first', 1)]);
+      await harness.resolveStats(1, { ...emptyStats, climbsSentCount: 2 });
+      await harness.resolveConnection(1, holder({ userId: 'sam', displayName: 'Sam' }));
+    });
+    expect(current().lastConnectionSeq).toBe(3);
+    expect(current().lastHolderChangeSeq).toBe(2);
+
+    // A missed hand-off that only a catch-up reveals still counts.
+    act(() => harness.emit(statsEvent(4, { climbsSentCount: 3 })));
+    act(() => current().refresh('foreground'));
+    await act(async () => {
+      await harness.resolveRecent(1, [climb('first', 1)]);
+      await harness.resolveStats(1, { ...emptyStats, climbsSentCount: 3 });
+      await harness.resolveConnection(1, holder({ userId: 'alex', displayName: 'Alex' }));
+    });
+    expect(current().holder?.userId).toBe('alex');
+    expect(current().lastHolderChangeSeq).toBe(4);
   });
 
   it('unsubscribes the reconnect listener on unmount', () => {
@@ -852,6 +997,98 @@ describe('useBoardPresence — actions', () => {
     const { result } = renderHook(() => useBoardPresence(null, null));
     await expect(result.current.reportDisconnect()).resolves.toBe(false);
   });
+
+  it('reportClear forwards the active boardId to the client', async () => {
+    const harness = makeClient();
+    const { result } = renderHook(() => useBoardPresence(3, harness.client));
+
+    let accepted = false;
+    await act(async () => {
+      accepted = await result.current.reportClear();
+    });
+
+    expect(accepted).toBe(true);
+    expect(harness.reportClear).toHaveBeenCalledWith(3);
+  });
+
+  it('reportClear resolves false when inert or when the client cannot clear', async () => {
+    const { result: inert } = renderHook(() => useBoardPresence(null, null));
+    await expect(inert.current.reportClear()).resolves.toBe(false);
+
+    const harness = makeClient();
+    delete harness.client.reportClear;
+    const { result } = renderHook(() => useBoardPresence(3, harness.client));
+    await expect(result.current.reportClear()).resolves.toBe(false);
+  });
+});
+
+describe('useBoardPresence — Turn off all lights (#7015)', () => {
+  const clearOf = (seq: number, climbUuid: string | null): BoardPresenceEvent => ({
+    __typename: 'BoardClimbCleared',
+    clearedAt: new Date(TEST_NOW - 1_000_000 + seq * 1000).toISOString(),
+    seq,
+    climbUuid,
+  });
+
+  it('stops naming the climb on the wall when the holder turns the lights off, and keeps the send in history', async () => {
+    const harness = makeClient();
+    const { result } = renderHook(() => useBoardPresence(1, harness.client));
+    const angelEyes = climb('angel-eyes', 5);
+    act(() => harness.emit(setEvent(angelEyes)));
+    expect(result.current.currentClimb).toEqual(angelEyes);
+
+    act(() => harness.emit(clearOf(6, 'angel-eyes')));
+
+    expect(result.current.currentClimb).toBeNull();
+    expect(result.current.clearedClimbUuid).toBe('angel-eyes');
+    expect(result.current.history).toEqual([angelEyes]);
+  });
+
+  it('keeps a late joiner dark when the replayed clear beats the history backfill', async () => {
+    const harness = makeClient();
+    const { result } = renderHook(() => useBoardPresence(1, harness.client));
+    act(() => harness.emit(clearOf(6, 'angel-eyes')));
+    await act(async () => {
+      await harness.resolveRecent(1, [climb('angel-eyes', 5), climb('older', 4)]);
+    });
+
+    expect(result.current.currentClimb).toBeNull();
+    expect(result.current.clearedClimbUuid).toBe('angel-eyes');
+    expect(result.current.history).toHaveLength(2);
+  });
+
+  it('lets a relit climb take the wall back', async () => {
+    const harness = makeClient();
+    const { result } = renderHook(() => useBoardPresence(1, harness.client));
+    act(() => harness.emit(setEvent(climb('angel-eyes', 5))));
+    act(() => harness.emit(clearOf(6, 'angel-eyes')));
+    act(() => harness.emit(setEvent(climb('angel-eyes', 7))));
+
+    expect(result.current.currentClimb?.climbUuid).toBe('angel-eyes');
+    expect(result.current.clearedClimbUuid).toBeNull();
+  });
+
+  it('exposes the cleared climb through a narrow provider context', async () => {
+    const harness = makeClient();
+    const snapshots: Array<string | null> = [];
+    function ClearedConsumer() {
+      snapshots.push(useBoardPresenceClearedClimbUuid());
+      return null;
+    }
+    render(
+      <BoardPresenceProvider boardId={1} client={harness.client}>
+        <ClearedConsumer />
+      </BoardPresenceProvider>,
+    );
+    act(() => harness.emit(setEvent(climb('angel-eyes', 5))));
+    act(() => harness.emit(clearOf(6, 'angel-eyes')));
+    await waitFor(() => expect(snapshots.at(-1)).toBe('angel-eyes'));
+    const rendersAfterClear = snapshots.length;
+
+    // Holder churn leaves the cleared climb as it is: no re-render.
+    act(() => harness.emit(connectionEvent(7, holder())));
+    expect(snapshots).toHaveLength(rendersAfterClear);
+  });
 });
 
 describe('useBoardPresence — connection holder', () => {
@@ -920,6 +1157,75 @@ describe('useBoardPresence — connection holder', () => {
 });
 
 describe('BoardPresenceProvider — split contexts', () => {
+  it('expires retained history on foreground without changing the live hero, holder or sequence', async () => {
+    const harness = makeClient();
+    const pagedClimb = climb('paged', 0);
+    harness.client.fetchHistoryPage = vi.fn(async () => ({ entries: [pagedClimb], nextCursor: null }));
+    let feed: ReturnType<typeof useBoardPresenceFeed> | undefined;
+    let current: ReturnType<typeof useBoardPresenceCurrent> | undefined;
+    let actions: ReturnType<typeof useBoardPresenceActions> | undefined;
+    let pagination: ReturnType<typeof useBoardHistoryPagination> | undefined;
+    function Reader() {
+      feed = useBoardPresenceFeed();
+      current = useBoardPresenceCurrent();
+      actions = useBoardPresenceActions();
+      pagination = useBoardHistoryPagination();
+      return null;
+    }
+    await act(async () => {
+      render(
+        <BoardPresenceProvider boardId={1} client={harness.client}>
+          <Reader />
+        </BoardPresenceProvider>,
+      );
+    });
+    const liveClimb = climb('still-lit', 1);
+    act(() => {
+      harness.emit(setEvent(liveClimb));
+      harness.emit(connectionEvent(2, holder()));
+    });
+    expect(feed?.history).toEqual([liveClimb]);
+    expect(pagination?.olderHistory).toEqual([pagedClimb]);
+    const beforeExpiry = current;
+    vi.mocked(Date.now).mockReturnValue(TEST_NOW + BOARD_HISTORY_WINDOW_MS + 1);
+    act(() => actions?.refresh('foreground'));
+    expect(feed?.history).toEqual([]);
+    expect(pagination?.olderHistory).toEqual([]);
+    expect(current).toBe(beforeExpiry);
+    expect(current?.currentClimb).toEqual(liveClimb);
+    expect(current?.holder).toEqual(holder());
+    expect(current?.lastConnectionSeq).toBe(2);
+  });
+
+  it('keeps a cleared wall dark when its retained history expires', () => {
+    const harness = makeClient();
+    let feed: ReturnType<typeof useBoardPresenceFeed> | undefined;
+    let current: ReturnType<typeof useBoardPresenceCurrent> | undefined;
+    let actions: ReturnType<typeof useBoardPresenceActions> | undefined;
+    function Reader() {
+      feed = useBoardPresenceFeed();
+      current = useBoardPresenceCurrent();
+      actions = useBoardPresenceActions();
+      return null;
+    }
+    render(
+      <BoardPresenceProvider boardId={1} client={harness.client}>
+        <Reader />
+      </BoardPresenceProvider>,
+    );
+    act(() => {
+      harness.emit(setEvent(climb('cleared', 1)));
+      harness.emit(clearEvent(2));
+    });
+    const beforeExpiry = current;
+    vi.mocked(Date.now).mockReturnValue(TEST_NOW + BOARD_HISTORY_WINDOW_MS + 1);
+    act(() => actions?.refresh('foreground'));
+    expect(feed?.history).toEqual([]);
+    expect(current).toBe(beforeExpiry);
+    expect(current?.currentClimb).toBeNull();
+    expect(current?.clearedClimbUuid).toBe('cleared');
+  });
+
   it('keeps action-only consumers stable when current/feed state changes', async () => {
     const harness = makeClient();
     const renderCounts = { actions: 0, current: 0, feed: 0 };
@@ -1066,5 +1372,304 @@ describe('BoardPresenceProvider — split contexts', () => {
     });
     await waitFor(() => expect(wallClimbSnapshots.at(-1)?.climbUuid).toBe('wall-2'));
     expect(wallClimbRenderCount).toBeGreaterThan(rendersAfterClimb);
+  });
+});
+
+it('withdraws same-channel state and rejects old seeds/events after the held UUID is removed', async () => {
+  const harness = makeClient();
+  const { result, rerender } = renderHook(
+    ({ boardUuid }) => useBoardPresence(9, harness.client, undefined, boardUuid),
+    { initialProps: { boardUuid: 'held-link' as string | null } },
+  );
+  expect(harness.fetchRecentClimbs).toHaveBeenLastCalledWith(9, 'held-link');
+  expect(harness.fetchStats).toHaveBeenLastCalledWith(9, 'held-link');
+  const retiredEvent = harness.subscribeNowPlaying.mock.calls[0][1];
+  act(() => harness.emit(setEvent(climb('linked-current', 5))));
+  expect(result.current.currentClimb?.climbUuid).toBe('linked-current');
+  rerender({ boardUuid: null });
+  expect(result.current.currentClimb).toBeNull();
+  expect(result.current.history).toEqual([]);
+  expect(result.current.holder).toBeNull();
+  expect(harness.fetchRecentClimbs).toHaveBeenLastCalledWith(9);
+  await act(async () => {
+    retiredEvent(setEvent(climb('retired-event', 6)));
+    await harness.resolveRecent(9, [climb('retired-seed', 7)]);
+    await harness.resolveConnection(9, holder());
+  });
+  expect(result.current.currentClimb).toBeNull();
+  expect(result.current.history).toEqual([]);
+  expect(result.current.holder).toBeNull();
+  await act(async () => {
+    await harness.resolveRecent(9, [climb('current-public', 1)]);
+  });
+  expect(result.current.history.map((entry) => entry.climbUuid)).toEqual(['current-public']);
+});
+
+it.each(['complete', 'error'] as const)(
+  'retires loaded and pending wall caches on terminal subscription %s',
+  async (terminal) => {
+    const harness = makeClient();
+    const pendingPage = deferred<BoardPresenceClimb[]>();
+    const fetchHistory = vi
+      .fn()
+      .mockResolvedValueOnce([climb('private-page', 1)])
+      .mockReturnValueOnce(pendingPage.promise);
+    const client: BoardPresenceClient = {
+      ...harness.client,
+      fetchHistory,
+      fetchClimbRecentSenders: vi.fn(async () => [
+        { userId: 'private-user', displayName: 'Private Name', avatarUrl: null, lastSentAt: '2026-10-12T00:00:00Z' },
+      ]),
+    };
+    const snapshot: {
+      page: ReturnType<typeof useBoardHistoryPagination> | null;
+      senders: ReturnType<typeof useBoardClimbRecentSenders> | null;
+      feed: ReturnType<typeof useBoardPresenceFeed> | null;
+      current: ReturnType<typeof useBoardPresenceCurrent> | null;
+      reader: ReturnType<typeof useBoardPresenceClient> | null;
+    } = { page: null, senders: null, feed: null, current: null, reader: null };
+    function PrivateWallSurface() {
+      snapshot.page = useBoardHistoryPagination(1);
+      snapshot.senders = useBoardClimbRecentSenders({ climbUuid: 'private-climb', angle: 40 });
+      snapshot.feed = useBoardPresenceFeed();
+      snapshot.current = useBoardPresenceCurrent();
+      snapshot.reader = useBoardPresenceClient();
+      return null;
+    }
+    render(
+      <BoardPresenceProvider boardId={9} boardUuid="held-link" client={client}>
+        <PrivateWallSurface />
+      </BoardPresenceProvider>,
+    );
+    await act(async () => {
+      harness.emit(setEvent(climb('private-current', 3)));
+      await harness.resolveRecent(9, [climb('private-backfill', 2)]);
+    });
+    act(() => snapshot.page?.loadOlder());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(snapshot.page?.olderHistory).toHaveLength(1);
+    expect(snapshot.senders?.senders[0]?.displayName).toBe('Private Name');
+    act(() => snapshot.page?.loadOlder());
+    expect(fetchHistory).toHaveBeenCalledTimes(2);
+    act(() => {
+      if (terminal === 'complete') harness.emitComplete();
+      else harness.emitError(NOT_FOUND_ERROR);
+    });
+    expect(snapshot.current?.currentClimb).toBeNull();
+    expect(snapshot.feed?.history).toEqual([]);
+    expect(snapshot.page?.olderHistory).toEqual([]);
+    expect(snapshot.senders?.senders).toEqual([]);
+    expect(snapshot.reader?.client).toBeNull();
+    await act(async () => {
+      pendingPage.resolve([climb('retired-page', 0)]);
+      await pendingPage.promise;
+      await harness.resolveConnection(9, holder());
+      await harness.resolveStats(9, emptyStats);
+      harness.emit(setEvent(climb('retired-event', 4)));
+    });
+    expect(snapshot.current?.currentClimb).toBeNull();
+    expect(snapshot.current?.holder).toBeNull();
+    expect(snapshot.feed?.stats).toBeNull();
+    expect(snapshot.page?.olderHistory).toEqual([]);
+  },
+);
+
+it.each([
+  ['a transport failure (graphql-ws giving up reconnecting)', [new Error('Socket closed after 10 retries')]],
+  ['a non-denial server error followed by completion', [RATE_LIMITED_ERROR, 'complete']],
+] as const)('keeps the loaded wall, pages and refresh through %s', async (_case, steps) => {
+  const harness = makeClient();
+  const fetchHistory = vi.fn().mockResolvedValue([climb('older-page', 1)]);
+  const client: BoardPresenceClient = { ...harness.client, fetchHistory };
+  const snapshot: {
+    page: ReturnType<typeof useBoardHistoryPagination> | null;
+    feed: ReturnType<typeof useBoardPresenceFeed> | null;
+    current: ReturnType<typeof useBoardPresenceCurrent> | null;
+    reader: ReturnType<typeof useBoardPresenceClient> | null;
+    actions: ReturnType<typeof useBoardPresenceActions> | null;
+  } = { page: null, feed: null, current: null, reader: null, actions: null };
+  function WallSurface() {
+    snapshot.page = useBoardHistoryPagination(1);
+    snapshot.feed = useBoardPresenceFeed();
+    snapshot.current = useBoardPresenceCurrent();
+    snapshot.reader = useBoardPresenceClient();
+    snapshot.actions = useBoardPresenceActions();
+    return null;
+  }
+  render(
+    <BoardPresenceProvider boardId={9} boardUuid="held-link" client={client}>
+      <WallSurface />
+    </BoardPresenceProvider>,
+  );
+  await act(async () => {
+    harness.emit(setEvent(climb('on-the-wall', 3)));
+    await harness.resolveRecent(9, [climb('backfill', 2)]);
+  });
+  act(() => snapshot.page?.loadOlder());
+  await act(async () => {
+    await Promise.resolve();
+  });
+  expect(snapshot.page?.olderHistory).toHaveLength(1);
+
+  act(() => {
+    for (const step of steps) {
+      if (step === 'complete') harness.emitComplete();
+      else harness.emitError(step);
+    }
+  });
+  expect(snapshot.current?.isLive).toBe(false);
+  expect(snapshot.current?.currentClimb?.climbUuid).toBe('on-the-wall');
+  expect(snapshot.feed?.history.map((entry) => entry.climbUuid)).toContain('backfill');
+  expect(snapshot.page?.olderHistory).toHaveLength(1);
+  expect(snapshot.reader?.client).toBe(client);
+  const fetchesBeforeRefresh = harness.fetchRecentClimbs.mock.calls.length;
+  act(() => snapshot.actions?.refresh());
+  expect(harness.fetchRecentClimbs.mock.calls.length).toBe(fetchesBeforeRefresh + 1);
+});
+
+it.each([
+  ['a GraphQLOperationError carrying NOT_FOUND', NOT_FOUND_ERROR, true],
+  [
+    'a raw GraphQLError[] carrying NOT_FOUND',
+    [{ message: 'Board not found', extensions: { code: 'NOT_FOUND' } }],
+    true,
+  ],
+  ['a rate-limited result', RATE_LIMITED_ERROR, false],
+  ['a plain transport Error', new Error('Board not found'), false],
+  ['a socket close event', { code: 1006, reason: '' }, false],
+] as const)('isBoardReadDenied reads %s as %s', (_case, error, denied) => {
+  expect(isBoardReadDenied(error)).toBe(denied);
+});
+
+it('keeps the live reader and loaded wall data through an ordinary transport reconnect', async () => {
+  const harness = makeClient();
+  const snapshot: {
+    current: ReturnType<typeof useBoardPresenceCurrent> | null;
+    reader: ReturnType<typeof useBoardPresenceClient> | null;
+  } = { current: null, reader: null };
+  function WallSurface() {
+    snapshot.current = useBoardPresenceCurrent();
+    snapshot.reader = useBoardPresenceClient();
+    return null;
+  }
+  render(
+    <BoardPresenceProvider boardId={9} boardUuid="held-link" client={harness.client}>
+      <WallSurface />
+    </BoardPresenceProvider>,
+  );
+  act(() => harness.emit(setEvent(climb('still-on-wall', 1))));
+  const readerBeforeReconnect = snapshot.reader?.client;
+  act(() => harness.triggerReconnect());
+  expect(snapshot.current?.isLive).toBe(true);
+  expect(snapshot.current?.currentClimb?.climbUuid).toBe('still-on-wall');
+  expect(snapshot.reader?.client).toBe(readerBeforeReconnect);
+  expect(harness.fetchRecentClimbs).toHaveBeenCalledTimes(2);
+  await act(async () => {
+    await harness.resolveRecent(9, [climb('still-on-wall', 1)]);
+    await harness.resolveRecent(9, [climb('after-reconnect', 2)]);
+  });
+  expect(snapshot.current?.currentClimb?.climbUuid).toBe('still-on-wall');
+  act(() => harness.emit(setEvent(climb('after-reconnect', 2))));
+  expect(snapshot.current?.currentClimb?.climbUuid).toBe('after-reconnect');
+  expect(snapshot.current?.isLive).toBe(true);
+});
+
+describe('terminal subscription recovery (#2713)', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('backs off, ignores retired callbacks, and preserves loaded history', () => {
+    vi.useFakeTimers();
+    const harness = makeClient();
+    const { result, unmount } = renderHook(() => useBoardPresence(1, harness.client));
+    act(() => harness.emit(setEvent(climb('loaded', 10))));
+    const retiredHandler = harness.subscribeNowPlaying.mock.calls[0][1];
+    const retiredComplete = harness.subscribeNowPlaying.mock.calls[0][3];
+    act(() => harness.emitError(new Error('offline')));
+    expect(result.current.isLive).toBe(false);
+    expect(result.current.currentClimb?.climbUuid).toBe('loaded');
+    act(() => vi.advanceTimersByTime(999));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(1);
+    act(() => vi.advanceTimersByTime(1));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(2);
+    act(() => {
+      retiredComplete?.();
+      retiredHandler(setEvent(climb('stale', 100)));
+    });
+    expect(result.current.isDenied).toBe(false);
+    expect(result.current.currentClimb?.climbUuid).toBe('loaded');
+    act(() => harness.emitError(new Error('still offline')));
+    act(() => vi.advanceTimersByTime(1999));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(2);
+    act(() => vi.advanceTimersByTime(1));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(3);
+    act(() => harness.emit(setEvent(climb('recovered', 11))));
+    expect(result.current.currentClimb?.climbUuid).toBe('recovered');
+    act(() => harness.emitError(new Error('new outage')));
+    act(() => vi.advanceTimersByTime(1000));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(4);
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(['manual', 'foreground', 'reconnect'] as const)('retries immediately on %s', (reason) => {
+    vi.useFakeTimers();
+    const harness = makeClient();
+    const { result, unmount } = renderHook(() => useBoardPresence(1, harness.client));
+    act(() => harness.emitError(new Error('offline')));
+    act(() => {
+      if (reason === 'reconnect') harness.triggerReconnect();
+      else result.current.refresh(reason);
+    });
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(2);
+    act(() => vi.advanceTimersByTime(1000));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(2);
+    unmount();
+  });
+
+  it('handles synchronous failures and stops after access denial', () => {
+    vi.useFakeTimers();
+    const harness = makeClient();
+    harness.subscribeNowPlaying.mockImplementationOnce(() => {
+      throw new Error('offline');
+    });
+    const { result, unmount } = renderHook(() => useBoardPresence(1, harness.client));
+    expect(result.current.isLive).toBe(false);
+    act(() => vi.advanceTimersByTime(1000));
+    act(() => harness.emitError(NOT_FOUND_ERROR));
+    expect(result.current.isDenied).toBe(true);
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(2);
+    unmount();
+  });
+
+  it('caps repeated failures at thirty seconds', () => {
+    vi.useFakeTimers();
+    const harness = makeClient();
+    const { unmount } = renderHook(() => useBoardPresence(1, harness.client));
+    for (const delay of [1000, 2000, 4000, 8000, 16000, 30000, 30000]) {
+      const attempts = harness.subscribeNowPlaying.mock.calls.length;
+      act(() => harness.emitError(new Error('offline')));
+      act(() => vi.advanceTimersByTime(delay - 1));
+      expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(attempts);
+      act(() => vi.advanceTimersByTime(1));
+      expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(attempts + 1);
+    }
+    unmount();
+  });
+
+  it('cancels retries when switching boards', () => {
+    vi.useFakeTimers();
+    const harness = makeClient();
+    const { rerender, unmount } = renderHook(({ boardId }) => useBoardPresence(boardId, harness.client), {
+      initialProps: { boardId: 1 },
+    });
+    act(() => harness.emitError(new Error('offline')));
+    rerender({ boardId: 2 });
+    act(() => vi.advanceTimersByTime(60_000));
+    expect(harness.subscribeNowPlaying).toHaveBeenCalledTimes(2);
+    expect(harness.getSubscribedBoardId()).toBe(2);
+    unmount();
   });
 });

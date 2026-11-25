@@ -1,9 +1,26 @@
+import type { WebCredentialProof } from '@boardsesh/auth-protocol';
 import type { DefaultSession } from 'next-auth';
+import type { AccountCreationReceipt } from '@boardsesh/analytics';
+
+export type NativeOAuthCreationProof = {
+  authSessionId: string;
+  provider: 'apple' | 'google';
+  signedInAt: number;
+  accountCreation: AccountCreationReceipt;
+};
 
 declare module 'next-auth' {
+  interface User {
+    webCredentialProof?: WebCredentialProof;
+    /** Signed legacy transfer generation; unknown authentication age stays unknown. */
+    nativeOAuthSourceGeneration?: number;
+  }
   // eslint-disable-next-line typescript/consistent-type-definitions
   interface Session {
+    /** Signed login generation; renewal never substitutes the primary generation. */
+    authGeneration?: number;
     authSessionId?: string;
+    nativeOAuthCreationProof?: NativeOAuthCreationProof;
     user: {
       id: string;
     } & DefaultSession['user'];
@@ -14,6 +31,19 @@ declare module 'next-auth/jwt' {
   // eslint-disable-next-line typescript/consistent-type-definitions
   interface JWT {
     authSessionId?: string;
+    /** Renewal assigned a SID to a historical cookie with unknown login ancestry. */
+    legacy_no_sid?: true;
+    nativeOAuthCreationProof?: NativeOAuthCreationProof;
+    // Epoch seconds of the sign-in that produced this cookie. Absent on cookies
+    // from before the claim and on native transfer sign-ins: age unknown.
+    auth_time?: number;
+    // auth_subject_cutoffs.generation read when this login signed in, 0 with no
+    // row. A rotation keeps it; a cookie from before the claim gets 0, the only
+    // generation it can have been signed in under. Not read yet (BA-04 PR 2).
+    gen?: number;
+    // Set beside auth_time only by a sign-in made while OAuth account links were
+    // guarded (PARTNER_OAUTH_MODE not off). Partner consent requires it.
+    link_guarded?: true;
     // Cached userProfiles claims so the `session` callback doesn't run a DB
     // query on every /api/auth/session read. `null` means "fetched, but the
     // profile has none" (distinct from `undefined` = never fetched yet).

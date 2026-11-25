@@ -2,22 +2,30 @@ import type { IncomingMessage, ServerResponse } from 'http';
 import { z } from 'zod';
 import type { MoonBoardImportProgressEvent } from '@boardsesh/shared-schema';
 import { applyCorsHeaders } from './cors';
-import { validateToken } from '../middleware/auth';
+import { validateHttpAuthToken } from './auth-admission';
 import { db } from '../db/client';
 import { importMoonBoardExportData } from '../services/moonboard-import';
 import { logger } from '../utils/logger';
 
 const MAX_IMPORT_BODY_BYTES = 25 * 1024 * 1024;
 
-const moonBoardExportLogRowSchema = z.object({
-  lineNumber: z.number().int().positive(),
-  problemId: z.number().int().positive(),
-  grade: z.string().min(1),
-  tries: z.string().min(1),
-  attempts: z.number().int().min(0),
-  rating: z.number().int().min(1).max(5).nullable(),
-  date: z.string().min(1),
-});
+const moonBoardExportLogRowSchema = z
+  .object({
+    lineNumber: z.number().int().positive(),
+    problemId: z.number().int().positive().optional(),
+    name: z.string().min(1).max(200).optional(),
+    setter: z.string().min(1).max(200).optional(),
+    setup: z.string().min(1).max(100).optional(),
+    angle: z.number().int().min(0).max(90).optional(),
+    isBenchmark: z.boolean().optional(),
+    comment: z.string().max(2000).optional(),
+    grade: z.string().min(1),
+    tries: z.string().min(1),
+    attempts: z.number().int().min(0),
+    rating: z.number().int().min(1).max(5).nullable(),
+    date: z.string().min(1),
+  })
+  .refine((row) => row.problemId != null || row.name != null, { message: 'problemId or name is required' });
 
 const requestSchema = z.object({
   data: z.object({
@@ -50,7 +58,9 @@ async function authenticate(req: IncomingMessage, res: ServerResponse): Promise<
     return null;
   }
 
-  const authResult = await validateToken(token);
+  const admission = await validateHttpAuthToken(token, res);
+  if (!admission.available) return null;
+  const authResult = admission.auth;
   if (!authResult) {
     sendJson(res, 401, { error: 'Invalid or expired token' });
     return null;

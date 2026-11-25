@@ -1,23 +1,30 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { catalogSnapshotBoardTypeFilter } from '../src/catalog-snapshot.js';
 import {
+  artifactSelectSql,
   booleanToPg,
   buildColumnPlans,
   castExpression,
   CATALOG_LOAD_ORDER,
   DEFERRED_CATALOG_TABLES,
+  deriveHoldRows,
   encodeCopyField,
   encodeCopyRow,
   HOLD_COLUMN_PLANS,
   holdRowsForClimb,
   jsonArrayToPgArray,
   looksGzipCompressed,
+  mapSqliteRows,
   parseArgs,
   readerFor,
+  sqliteColumns,
   STATS_ACCOUNTING_PLANS,
+  verifyArtifact,
   type PgColumn,
 } from './load-board-snapshots.js';
 
@@ -266,10 +273,57 @@ describe('catalogue load order', () => {
   });
 });
 
+describe('artifactSelectSql', () => {
+  // Artifacts built before the exporter filtered spray still carry private
+  // spray-wall rows. A rebuilt image must not load them.
+  it('skips spray rows from an artifact that still carries them', () => {
+    const workDir = mkdtempSync(join(tmpdir(), 'artifact-select-'));
+    const artifact = new DatabaseSync(join(workDir, 'catalog.db'));
+    try {
+      artifact.exec('CREATE TABLE board_layouts (board_type TEXT, id INTEGER, name TEXT)');
+      artifact.exec("INSERT INTO board_layouts VALUES ('kilter', 1, 'Original'), ('spray', 7, 'Private garage wall')");
+      const selectSql = artifactSelectSql('board_layouts', sqliteColumns(artifact, 'board_layouts'));
+      assert.deepEqual(
+        artifact
+          .prepare(selectSql)
+          .all()
+          .map((row) => ({ ...row })),
+        [{ board_type: 'kilter', id: 1, name: 'Original' }],
+      );
+    } finally {
+      artifact.close();
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  });
+
+  it('reads a table without a board_type column unfiltered', () => {
+    assert.equal(
+      artifactSelectSql('snapshot_meta', ['table_name', 'row_count']),
+      'SELECT table_name, row_count FROM snapshot_meta',
+    );
+  });
+});
+
+describe('catalogSnapshotBoardTypeFilter', () => {
+  it('builds the spray filter for a bare or table-qualified column', () => {
+    assert.equal(catalogSnapshotBoardTypeFilter('board_type'), "board_type NOT IN ('spray')");
+    assert.equal(
+      catalogSnapshotBoardTypeFilter('board_layouts.board_type'),
+      "board_layouts.board_type NOT IN ('spray')",
+    );
+  });
+
+  it('refuses a column reference that is not a plain identifier', () => {
+    for (const unsafe of ['', 'board_type; DROP TABLE board_layouts', "board_type OR '1'='1'", 'a.b.c', 'Board_Type']) {
+      assert.throws(() => catalogSnapshotBoardTypeFilter(unsafe), /unsafe column reference/);
+    }
+  });
+});
+
 describe('parseArgs', () => {
   it('defaults to the public snapshot host with catalogue and holds enabled', () => {
     const options = parseArgs([]);
-    assert.equal(options.snapshotBaseUrl, 'https://boardsesh-board-snapshots.t3.tigrisfiles.io');
+    assert.equal(options.snapshotBaseUrl, 'https://snapshots.boardsesh.com');
     assert.equal(options.skipCatalog, false);
     assert.equal(options.skipHolds, false);
   });
@@ -407,5 +461,183 @@ describe('positional hold plans', () => {
       HOLD_COLUMN_PLANS.map((plan) => plan.name),
       ['board_type', 'climb_uuid', 'hold_id', 'frame_number', 'hold_state'],
     );
+  });
+});
+
+// The export publishes artifacts in one of two storage shapes
+// (docs/data/board-snapshots.md, "Artifact shape"): shape 1 is rowid tables with the
+// device's secondary indexes, in the order rows arrived; shape 2 is the same
+// tables WITHOUT ROWID with no secondary index, vacuumed into key order. The
+// loader has to read either. This package cannot import the export job, so the
+// two files below are built from DDL written out by hand in the shapes the
+// export emits; the round trip through the real export is a manual check
+// recorded with the change that introduced shape 2.
+describe('reading an artifact in either shape', () => {
+  type ArtifactShape = 1 | 2;
+
+  const climbs = [
+    // Deliberately not in uuid order: shape 1 keeps this order, shape 2 does not.
+    { uuid: 'climb-m', name: 'Middle', frames: 'p1143r12p1144r13', sizes: '[10,11]', listed: 1 },
+    { uuid: 'climb-z', name: 'Last', frames: 'p1145r14', sizes: '[10]', listed: 0 },
+    { uuid: 'climb-a', name: 'First', frames: '', sizes: null, listed: 1 },
+  ];
+  const stats = [
+    { climbUuid: 'climb-z', angle: 40, ascents: 12, quality: 2.5 },
+    { climbUuid: 'climb-a', angle: 45, ascents: null, quality: null },
+    { climbUuid: 'climb-a', angle: 40, ascents: 3, quality: 1.5 },
+  ];
+
+  function buildArtifact(filePath: string, shape: ArtifactShape, recordedClimbCount = climbs.length): void {
+    const tableSuffix = shape === 2 ? ' WITHOUT ROWID' : '';
+    const artifact = new DatabaseSync(filePath);
+    try {
+      artifact.exec(`CREATE TABLE IF NOT EXISTS board_climbs (
+  uuid TEXT PRIMARY KEY,
+  board_type TEXT,
+  layout_id INTEGER,
+  name TEXT,
+  frames TEXT,
+  is_listed INTEGER,
+  compatible_size_ids TEXT
+)${tableSuffix};`);
+      artifact.exec(`CREATE TABLE IF NOT EXISTS board_climb_stats (
+  board_type TEXT NOT NULL,
+  climb_uuid TEXT NOT NULL,
+  angle INTEGER NOT NULL,
+  ascensionist_count INTEGER,
+  quality_average REAL,
+  PRIMARY KEY (board_type, climb_uuid, angle)
+)${tableSuffix};`);
+      // Added by ALTER after the CREATE, as the client migrations do.
+      artifact.exec('ALTER TABLE board_climbs ADD COLUMN is_hidden INTEGER;');
+      if (shape === 1) {
+        artifact.exec('CREATE INDEX idx_climbs_search ON board_climbs (board_type, layout_id, is_listed);');
+        artifact.exec('CREATE INDEX idx_stats_lookup ON board_climb_stats (board_type, climb_uuid, angle);');
+      }
+      artifact.exec(
+        'CREATE TABLE snapshot_meta (table_name TEXT PRIMARY KEY, row_count INTEGER, watermark_updated_at TEXT);',
+      );
+      const insertClimb = artifact.prepare(
+        `INSERT INTO board_climbs (uuid, board_type, layout_id, name, frames, is_listed, compatible_size_ids, is_hidden)
+         VALUES (?, 'kilter', 1, ?, ?, ?, ?, 0)`,
+      );
+      for (const climb of climbs) insertClimb.run(climb.uuid, climb.name, climb.frames, climb.listed, climb.sizes);
+      const insertStat = artifact.prepare(
+        `INSERT INTO board_climb_stats (board_type, climb_uuid, angle, ascensionist_count, quality_average)
+         VALUES ('kilter', ?, ?, ?, ?)`,
+      );
+      for (const stat of stats) insertStat.run(stat.climbUuid, stat.angle, stat.ascents, stat.quality);
+      const insertMeta = artifact.prepare('INSERT INTO snapshot_meta (table_name, row_count) VALUES (?, ?)');
+      insertMeta.run('board_climbs', recordedClimbCount);
+      insertMeta.run('board_climb_stats', stats.length);
+      // Metadata only: names no table, and the loader must not go looking for one.
+      insertMeta.run('sync_deletions', 0);
+      if (shape === 2) artifact.exec('VACUUM');
+    } finally {
+      artifact.close();
+    }
+  }
+
+  function withArtifact<T>(shape: ArtifactShape, read: (artifact: DatabaseSync) => T, recordedClimbCount?: number): T {
+    const dir = mkdtempSync(join(tmpdir(), 'loader-artifact-shape-'));
+    const filePath = join(dir, 'artifact.db');
+    try {
+      buildArtifact(filePath, shape, recordedClimbCount);
+      // Read-only, exactly as the loader opens a downloaded artifact.
+      const artifact = new DatabaseSync(filePath, { readOnly: true });
+      try {
+        return read(artifact);
+      } finally {
+        artifact.close();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const climbPgColumns: PgColumn[] = [
+    column('uuid', 'text', 'text', 'text'),
+    column('board_type', 'text', 'text', 'text'),
+    column('layout_id', 'integer', 'integer', 'int4'),
+    column('name', 'text', 'text', 'text'),
+    column('frames', 'text', 'text', 'text'),
+    column('is_listed', 'boolean', 'boolean', 'bool'),
+    column('is_hidden', 'boolean', 'boolean', 'bool'),
+    column('compatible_size_ids', 'integer[]', 'ARRAY', '_int4'),
+  ];
+  const statsPgColumns: PgColumn[] = [
+    column('board_type', 'text', 'text', 'text'),
+    column('climb_uuid', 'text', 'text', 'text'),
+    column('angle', 'integer', 'integer', 'int4'),
+    column('ascensionist_count', 'bigint', 'bigint', 'int8'),
+    column('quality_average', 'double precision', 'double precision', 'float8'),
+  ];
+
+  /** Every row the loader would COPY for a table, as encoded field lists. */
+  function loadedRows(artifact: DatabaseSync, table: string, pgColumns: PgColumn[]): string[] {
+    const artifactColumns = sqliteColumns(artifact, table);
+    const plans = buildColumnPlans(pgColumns, artifactColumns, table);
+    return [...mapSqliteRows(artifact, `SELECT ${artifactColumns.join(', ')} FROM ${table}`, plans)].map((fields) =>
+      encodeCopyRow(fields),
+    );
+  }
+
+  it('passes the integrity gate for both shapes', () => {
+    for (const shape of [1, 2] as const) {
+      withArtifact(shape, (artifact) => assert.doesNotThrow(() => verifyArtifact(artifact, `shape ${shape}`)));
+    }
+  });
+
+  it('still catches a short table in a shape-2 artifact', () => {
+    withArtifact(
+      2,
+      (artifact) =>
+        assert.throws(() => verifyArtifact(artifact, 'short'), /board_climbs has 3 rows, snapshot_meta says 4/),
+      climbs.length + 1,
+    );
+  });
+
+  it('finds the same columns in both shapes, ALTER-added ones included', () => {
+    const shape1Columns = withArtifact(1, (artifact) => sqliteColumns(artifact, 'board_climbs'));
+    const shape2Columns = withArtifact(2, (artifact) => sqliteColumns(artifact, 'board_climbs'));
+    assert.deepEqual(shape2Columns, shape1Columns);
+    assert.ok(shape2Columns.includes('is_hidden'));
+  });
+
+  it('reads the same climbs and stats from both shapes, in whatever order each stores them', () => {
+    const shape1 = withArtifact(1, (artifact) => ({
+      climbs: loadedRows(artifact, 'board_climbs', climbPgColumns),
+      stats: loadedRows(artifact, 'board_climb_stats', statsPgColumns),
+    }));
+    const shape2 = withArtifact(2, (artifact) => ({
+      climbs: loadedRows(artifact, 'board_climbs', climbPgColumns),
+      stats: loadedRows(artifact, 'board_climb_stats', statsPgColumns),
+    }));
+
+    // The load is an `INSERT ... ON CONFLICT DO NOTHING` of a set, so the order
+    // rows come back in is not part of the contract. The rows themselves are.
+    assert.deepEqual([...shape2.climbs].sort(), [...shape1.climbs].sort());
+    assert.deepEqual([...shape2.stats].sort(), [...shape1.stats].sort());
+    assert.equal(shape2.climbs.length, climbs.length);
+    assert.equal(shape2.stats.length, stats.length);
+    assert.ok(
+      shape2.climbs.includes(
+        encodeCopyRow(['climb-m', 'kilter', '1', 'Middle', 'p1143r12p1144r13', 't', 'f', '{10,11}']),
+      ),
+    );
+    assert.ok(shape2.stats.includes(encodeCopyRow(['kilter', 'climb-a', '45', null, null])));
+  });
+
+  it('derives the same hold rows from both shapes', () => {
+    const shape1Holds = withArtifact(1, (artifact) =>
+      [...deriveHoldRows(artifact)].map((fields) => encodeCopyRow(fields)),
+    );
+    const shape2Holds = withArtifact(2, (artifact) =>
+      [...deriveHoldRows(artifact)].map((fields) => encodeCopyRow(fields)),
+    );
+
+    assert.deepEqual([...shape2Holds].sort(), [...shape1Holds].sort());
+    // Two holds on climb-m, one on climb-z, none for the climb with no frames.
+    assert.equal(shape2Holds.length, 3);
   });
 });

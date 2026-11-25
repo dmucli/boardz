@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { Grade } from '@boardsesh/shared-schema';
 import { getFilterSummary, buildClimbFilterSummary } from '../filter-summary';
+import { buildGradeRailStops } from '../grade-stops';
 import { DEFAULT_FILTERS, type ClimbFilters } from '../climb-filter-types';
 
 const mockGrades: Grade[] = [
@@ -57,6 +58,39 @@ describe('getFilterSummary', () => {
   it('shows grade range when both min and max are set', () => {
     const filters: ClimbFilters = { ...DEFAULT_FILTERS, minGrade: 5, maxGrade: 15 };
     expect(getFilterSummary(filters, '', mockGrades, mockT)).toBe('V2–V6');
+  });
+
+  // The range rail draws grades that read the same as one chip, so one pick can
+  // set two ids. With the rail's stops a summary names it as the chip does.
+  describe('with the rail stops given', () => {
+    const sharedScale: Grade[] = [
+      { difficultyId: 10, name: '4a/V0' },
+      { difficultyId: 11, name: '4b/V0' },
+      { difficultyId: 12, name: '4c/V0' },
+      { difficultyId: 15, name: '5c/V2' },
+    ];
+    const stops = buildGradeRailStops(sharedScale, 'v-grade');
+    const summaryOf = (minGrade: number, maxGrade: number) =>
+      getFilterSummary({ ...DEFAULT_FILTERS, minGrade, maxGrade }, '', sharedScale, mockT, stops);
+
+    it('reads a grouped stop as one grade', () => {
+      expect(summaryOf(10, 12)).toBe('V0');
+    });
+
+    it('reads a range across whole stops by its stop labels', () => {
+      expect(summaryOf(10, 15)).toBe('V0–V2');
+    });
+
+    it('names a bound that covers only part of a group precisely', () => {
+      expect(summaryOf(10, 10)).toBe('V0 / 4A');
+      expect(summaryOf(11, 12)).toBe('V0 / 4B–V0 / 4C');
+      expect(summaryOf(11, 15)).toBe('V0 / 4B–V2');
+    });
+
+    it('keeps the raw scale names without the stops', () => {
+      const filters: ClimbFilters = { ...DEFAULT_FILTERS, minGrade: 10, maxGrade: 12 };
+      expect(getFilterSummary(filters, '', sharedScale, mockT)).toBe('4a/V0–4c/V0');
+    });
   });
 
   it('shows a single grade name when min and max are the same grade', () => {

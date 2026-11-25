@@ -1,23 +1,37 @@
 name: Production Deploy Watchdog
 
-# Keeps the `production-deploy` concurrency group moving.
+# Keeps two concurrency groups moving, one matrix job each:
 #
-# production-deploy.yml sets `cancel-in-progress: false` so a deploy that is
-# mid-migration is never killed. GitHub extends that same protection to a run
+#   production-deploy      production-deploy.yml on main
+#   mobile-ota-production  mobile-ota-production.yml on every branch
+#
+# Both workflows set `cancel-in-progress: false` so a run that is mid-migration
+# or mid-publish is never killed. GitHub extends that same protection to a run
 # that is doing nothing at all — a job parked in the `waiting` state on the
-# Production environment gate holds the group for up to 30 days. Every later
-# push to main then queues as `pending`, GitHub keeps only the newest one, and
-# nothing ships. The wedge is silent, too: the parked run never fails, so
-# production-deploy's own notify-failure never fires.
+# Production environment gate holds the group for up to 30 days. On
+# production-deploy every later push to main then queues as `pending`, GitHub
+# keeps only the newest one, and nothing ships. On the OTA lane (`queue: max`)
+# every later publish queues behind it: in October 2026 one run parked on its
+# notify-train-deployment job for 27 hours with 40 runs behind it. The wedge is
+# silent, too: the parked run never fails, so no failure notification fires.
 #
-# This watchdog cancels a run that has held the group without executing
-# anything, which hands the group to the queued run behind it, and says so in
-# Discord. See scripts/production-deploy-watchdog.mjs for the decision rules.
+# production-deploy: cancel after 45 minutes without job progress, or six hours
+# holding the group even with an executing job; redispatch once per head SHA
+# when cancelling empties the group.
+# mobile-ota-production: cancel only a run with a job waiting at an environment
+# gate, nothing executing, and 45 minutes without job progress. No age ceiling
+# (an executing publish is never killed). A cancelled run is not re-dispatched
+# (`queue: max` keeps every pending run), except the work nothing queued would
+# redo, once each: a native build's republish that was cancelled on main. OTA_LANE_REDISPATCH=off posts
+# those as commands instead.
+# Both: give ordinary cancellation five minutes, then force-cancel and verify
+# completion before reporting recovery. See scripts/production-deploy-watchdog.mjs
+# for the decision rules.
 
 on:
   schedule:
-    # Every 15 minutes: with the script's 45-minute stall threshold, a wedge is
-    # broken within about an hour instead of sitting until someone notices.
+    # Evaluate the 45-minute idle / six-hour active limits every 15 minutes.
+    # GitHub schedule delays can postpone enforcement. Cancellation is verified.
     - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
@@ -32,7 +46,16 @@ concurrency:
 
 jobs:
   watchdog:
+    name: watchdog (${{ matrix.lane }})
     runs-on: ubuntu-latest
+    # One job per lane rather than two steps in one job: each lane's cancel
+    # ladder can spend its whole eight-minute budget, and two of those would not
+    # fit the ten-minute timeout below. fail-fast off so a red lane never
+    # cancels the other lane's check.
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [production-deploy, mobile-ota-production]
     # Deliberately NOT `environment: Production`. The gate this job exists to
     # break is on that environment — running under it would park the watchdog
     # exactly like the run it is meant to free. That also means it can only read
@@ -44,20 +67,25 @@ jobs:
     # same silent stall it exists to break.
     timeout-minutes: 10
     permissions:
-      actions: write # cancel a stalled run, dispatch the replacement
+      actions: write # cancel a stalled run, dispatch a replacement (production-deploy, OTA recovery)
       contents: read
     steps:
       - uses: actions/checkout@v6
 
-      - name: Look for a stalled production deploy
+      - name: Look for a stalled run in the lane
         id: watchdog
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DISCORD_FILE: ${{ runner.temp }}/production-deploy-watchdog-discord.txt
+          LANE: ${{ matrix.lane }}
+          DISCORD_FILE: ${{ runner.temp }}/${{ matrix.lane }}-watchdog-discord.txt
           # A schedule trigger has no `inputs`, so this reads as empty there; the
           # fallback makes that an explicit "false" rather than something the
           # shell has to infer from an empty expansion.
           DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          # Incident off switch for the OTA lane's re-dispatches:
+          # `gh variable set OTA_LANE_REDISPATCH --body off` keeps the cancels
+          # but posts each re-dispatch as a command. production-deploy ignores it.
+          OTA_LANE_REDISPATCH: ${{ vars.OTA_LANE_REDISPATCH }}
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" = "true" ]; then
@@ -66,16 +94,18 @@ jobs:
             set --
           fi
           # github.sha is main's head on both triggers, which is the commit the
-          # watchdog re-dispatches for when cancelling empties the group.
+          # production-deploy lane re-dispatches for when cancelling empties the
+          # group. The OTA lane ignores it.
           # Piped through tee so the report reaches the log and the job summary
           # whether the script succeeds or fails.
           node scripts/production-deploy-watchdog.mjs \
+            --lane "$LANE" \
             --head "$GITHUB_SHA" \
             --discord-file "$DISCORD_FILE" \
             "$@" \
             2>&1 | tee "$RUNNER_TEMP/watchdog.log" && watchdog_status=0 || watchdog_status=$?
           {
-            echo '### Production deploy watchdog'
+            echo "### Watchdog: $LANE"
             echo ''
             echo '```'
             cat "$RUNNER_TEMP/watchdog.log"
@@ -84,14 +114,15 @@ jobs:
           exit "$watchdog_status"
 
       - name: Notify Discord
-        if: steps.watchdog.outputs.notify == 'true'
+        if: always() && steps.watchdog.outputs.notify == 'true'
         env:
           DISCORD_DEPLOY_WEBHOOK: ${{ secrets.DISCORD_DEPLOY_WEBHOOK }}
-          DISCORD_FILE: ${{ runner.temp }}/production-deploy-watchdog-discord.txt
+          LANE: ${{ matrix.lane }}
+          DISCORD_FILE: ${{ runner.temp }}/${{ matrix.lane }}-watchdog-discord.txt
         run: |
           set -euo pipefail
           if [ -z "${DISCORD_DEPLOY_WEBHOOK:-}" ]; then
-            echo "::warning::The watchdog acted on a stalled production deploy but DISCORD_DEPLOY_WEBHOOK is not readable here — see the job summary."
+            echo "::warning::The watchdog acted on a stalled run in the $LANE lane but DISCORD_DEPLOY_WEBHOOK is not readable here — see the job summary."
             exit 0
           fi
           # allowed_mentions.parse=[] blocks @everyone/@here/role/user pings from

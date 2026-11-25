@@ -1,3 +1,5 @@
+import { cppStorySourceSha256, createCppStoryCapture } from '../lib/cpp-story-provenance';
+import { cppStoryCaptures } from '../lib/mobile-visual-stories';
 /// <reference types="node" />
 
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -6,14 +8,24 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import sharp from 'sharp';
 import { afterEach, describe, expect, it } from 'vitest';
-import { IOS_SCREENSHOT_DEVICES, deviceSlug } from '../mobile-screenshots';
-import { frameComposition, frameDirectory, frameScreenshot, main, parseFrameArguments } from '../frame-screenshots';
+import { IOS_STORE_SCREENSHOT_DEVICES, deviceSlug } from '../mobile-screenshots';
+import {
+  frameComposition,
+  frameDirectory,
+  frameScreenshot,
+  main,
+  parseFrameArguments,
+  renderShowcaseText,
+} from '../frame-screenshots';
+import { CPP_TARGETS, readCppPage } from '../lib/screenshot-cpp';
 import { ACCEPTED_SIZES, readPngDimensions } from '../assert-screenshot-dimensions';
 import { readPngSizesRecursively, findContentOffenders } from '../assert-screenshot-content';
 import { decideProbeScope } from '../screenshot-probe-scope';
 import {
   PRESENTATION_MANIFEST,
   CAPTION_IDS,
+  CAPTION_LOCALES,
+  IOS_CAMPAIGN_CAPTURE_NAMES,
   STORE_CAPTION_LOCALES,
   captionLocaleForStore,
   readCaptionCatalog,
@@ -22,6 +34,7 @@ import {
   screenshotCaptions,
   sha256Screenshot,
   sha256ScreenshotSources,
+  validateScreenshotBoardLabels,
 } from '../lib/screenshot-presentation';
 
 const directories: string[] = [];
@@ -34,9 +47,400 @@ afterEach(() => {
   for (const path of directories.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
+describe('wall showcase detail', () => {
+  it('magnifies the current-climb card rather than the empty presenting header', async () => {
+    const width = 400;
+    const height = 870;
+    const card = { left: 24, top: 245, width: 352, height: 84 };
+    const source = await sharp({ create: { width, height, channels: 3, background: '#000000' } })
+      .composite([
+        {
+          input: Buffer.from(
+            `<svg width="${card.width}" height="${card.height}"><rect width="100%" height="100%" fill="#00ff00"/></svg>`,
+          ),
+          left: card.left,
+          top: card.top,
+        },
+      ])
+      .png()
+      .toBuffer();
+    const framed = await frameComposition(
+      [source],
+      { headline: 'On the wall', description: 'Climb together' },
+      'store-wall',
+    );
+    const { data: pixels, info } = await sharp(framed).removeAlpha().raw().toBuffer({ resolveWithObject: true });
+    // The full phone is necessarily scaled down. A separate band at least 75%
+    // of the canvas width proves the actual card was also lifted into the detail.
+    let widestCardRow = 0;
+    for (let row = 0; row < info.height; row++) {
+      let greenPixels = 0;
+      for (let column = 0; column < info.width; column++) {
+        const offset = (row * info.width + column) * info.channels;
+        if (pixels[offset] < 10 && pixels[offset + 1] > 245 && pixels[offset + 2] < 10) greenPixels++;
+      }
+      widestCardRow = Math.max(widestCardRow, greenPixels);
+    }
+    expect(widestCardRow).toBeGreaterThan(width * 0.75);
+  });
+});
+
+describe('board-specific CPP openings', () => {
+  const devices = Object.keys(ACCEPTED_SIZES);
+  const headlineByTarget = {
+    kilter: 'Supports Kilter',
+    tension: 'Supports Tension',
+    moonboard: 'Supports MoonBoard',
+    spray: 'Supports spray walls',
+  };
+
+  it('leads every target and device with its own trio, then three other board families', () => {
+    for (const target of CPP_TARGETS) {
+      const page = readCppPage(target);
+      expect(page.heroBoards.every((board) => board.family === target)).toBe(true);
+      expect(new Set(page.otherBoards.map((board) => board.family)).size).toBe(3);
+      expect(page.otherBoards.every((board) => board.family !== target)).toBe(true);
+      for (const device of devices) {
+        const recipes = page.recipes[device.startsWith('ipad-') ? 'ipad' : 'phone'];
+        expect(recipes).toHaveLength(9);
+        expect(recipes.slice(0, 2).map((recipe) => recipe.layout)).toEqual(['store-boards', 'store-boards']);
+        expect(recipes[0].sources).toEqual(
+          target === 'kilter' ? ['hero-2.png', 'hero-1.png', 'hero-3.png'] : ['hero-1.png', 'hero-2.png', 'hero-3.png'],
+        );
+        expect(recipes[1].sources).toEqual(['other-1.png', 'other-2.png', 'other-3.png']);
+        expect(recipes[1].caption).toBe('cppOtherBoards');
+        const captions = readCaptionCatalog('en-US');
+        expect(captions[recipes[0].caption].headline).toBe(headlineByTarget[target]);
+        expect(captions[recipes[1].caption]).toEqual({
+          headline: 'One app for all your boards',
+          description: 'All your logbooks in one place',
+        });
+        expect(recipes.some((recipe) => recipe.caption === 'board')).toBe(false);
+      }
+    }
+    expect(readCppPage('spray').heroBoards.map((board) => board.selector)).toEqual([
+      "Liz's Wall",
+      "Cherry's Wall",
+      'The Bowlo',
+    ]);
+  });
+
+  it('keeps the existing seven feature scenes in order for phones and iPads', () => {
+    for (const device of devices) {
+      const island = device.startsWith('ipad-') ? 'cppKiosk' : 'cppIsland';
+      const expected = {
+        kilter: [
+          'cppKilterGrade',
+          'cppKilterLogbookImport',
+          'cppQueue',
+          device.startsWith('ipad-') ? 'cppKiosk' : 'cppLiveActivity',
+          'cppSearch',
+          'cppWorkout',
+          'cppStatus',
+        ],
+        tension: [
+          'cppTensionQueue',
+          'cppTensionLogbookImport',
+          device.startsWith('ipad-') ? 'cppKiosk' : 'cppLiveActivity',
+          'cppTensionSearch',
+          'cppTensionMirrorBoard',
+          'cppWorkout',
+          'cppStatus',
+        ],
+        moonboard: [
+          'cppMoonboardGrade',
+          'cppQueue',
+          island,
+          'cppSearch',
+          'cppMoonboardLogbook',
+          'cppWorkout',
+          'cppStatus',
+        ],
+        spray: [
+          'cppSpraySetting',
+          'cppQueue',
+          'cppSprayProjects',
+          'cppLogbook',
+          'cppSprayHolds',
+          'cppSearch',
+          'cppSprayWorkout',
+        ],
+      };
+      for (const target of CPP_TARGETS) {
+        const page = readCppPage(target);
+        const recipes = page.recipes[device.startsWith('ipad-') ? 'ipad' : 'phone'];
+        expect(recipes.slice(2).map((recipe) => recipe.caption)).toEqual(expected[target]);
+      }
+    }
+  });
+
+  it('keeps Tension Live Activity tied to its phone fixture without reusing Island or Kilter sources', () => {
+    const page = readCppPage('tension');
+    const phone = page.recipes.phone[4];
+    expect(phone.output).toBe('04-live-activity.png');
+    expect(phone.layout).toBe('store-live-activity');
+    expect(phone.sources).toEqual([]);
+    expect(phone.liveActivity).toEqual({ boardFamily: 'tension' });
+    expect(page.recipes.phone.some((recipe) => recipe.sources.includes('08-island.png'))).toBe(false);
+    expect(page.recipes.phone.some((recipe) => recipe.liveActivity?.boardFamily === 'kilter')).toBe(false);
+    expect(page.recipes.ipad.some((recipe) => recipe.liveActivity !== undefined)).toBe(false);
+    expect(page.recipes.ipad[4].sources).toEqual(['08-kiosk.png']);
+  });
+
+  it('localizes both opening captions, qualifies MoonBoard CSV import, and never promises spray imports', () => {
+    const otherHeadlines = {
+      'en-US': 'One app for all your boards',
+      es: 'Una app para todos tus plafones',
+      fr: 'Une app pour toutes tes boards',
+      de: 'Eine App für alle deine Boards',
+    };
+    for (const locale of ['en-US', 'es', 'fr', 'de'] as const) {
+      const catalog = readCaptionCatalog(locale);
+      for (const target of CPP_TARGETS) {
+        const page = readCppPage(target);
+        const first = catalog[page.recipes.phone[0].caption];
+        expect(first.headline.trim()).not.toBe('');
+        expect(first.description.trim()).not.toBe('');
+        expect(catalog[page.recipes.phone[1].caption].headline).toBe(otherHeadlines[locale]);
+        if (target === 'moonboard') expect(first.description).toContain('CSV');
+        if (target === 'spray') expect(first.description).not.toMatch(/import|CSV/i);
+        if (target === 'kilter' || target === 'tension') expect(first.description).toMatch(/import/i);
+      }
+    }
+    expect(readCaptionCatalog('en-US').cppKilterLayouts.description).toBe(
+      'We can also import your existing logbook for you',
+    );
+    expect(readCaptionCatalog('en-US').cppTensionLayouts.description).toBe(
+      'We can also import your existing logbook for you',
+    );
+    expect(readCaptionCatalog('en-US').storeBoards).toEqual({
+      headline: 'One app for all your boards',
+      description: 'One logbook for every board.',
+    });
+  });
+});
+
+describe('CPP trio board labels', () => {
+  it('matches each label to its source slot and keeps Kilter Original in the center', () => {
+    for (const target of CPP_TARGETS) {
+      const page = readCppPage(target);
+      for (const recipes of Object.values(page.recipes)) {
+        for (const recipe of recipes.filter((candidate) => candidate.layout === 'store-boards')) {
+          const expected = recipe.sources.map((filename) => {
+            const [family, slot] = filename.replace('.png', '').split('-');
+            return (family === 'hero' ? page.heroBoards : page.otherBoards)[Number(slot) - 1].selector;
+          });
+          expect(recipe.boardLabels).toEqual(expected);
+          expect(validateScreenshotBoardLabels(recipe.boardLabels, recipe.layout, recipe.sources.length)).toEqual(
+            expected,
+          );
+          if (target === 'kilter' && recipe.sources.includes('hero-1.png')) {
+            expect(recipe.boardLabels?.[1]).toBe('Kilter Original 12x12');
+          }
+        }
+      }
+    }
+  });
+
+  it('preserves unlabeled default and Android pixels byte for byte', async () => {
+    const raw = await sharp({ create: { width: 1320, height: 2868, channels: 3, background: '#164c39' } })
+      .png()
+      .toBuffer();
+    const caption = readCaptionCatalog('en-US').storeBoards;
+    const original = await frameComposition([raw, raw, raw], caption, 'store-boards', true);
+    expect(await frameComposition([raw, raw, raw], caption, 'store-boards', true, { boardLabels: undefined })).toEqual(
+      original,
+    );
+    const android = await frameComposition([raw], caption, 'screen');
+    expect(await frameComposition([raw], caption, 'screen', false, { boardLabels: undefined })).toEqual(android);
+  });
+
+  it('rejects blank names, missing labels, the wrong layout, and overflowing labels', async () => {
+    const raw = await sharp({ create: { width: 1320, height: 2868, channels: 3, background: '#164c39' } })
+      .png()
+      .toBuffer();
+    const caption = readCaptionCatalog('en-US').storeBoards;
+    for (const boardLabels of [
+      ['Kilter', 'MoonBoard'],
+      ['Kilter', ' ', 'Tension'],
+    ]) {
+      await expect(frameComposition([raw, raw, raw], caption, 'store-boards', true, { boardLabels })).rejects.toThrow(
+        'three nonblank names',
+      );
+    }
+    await expect(
+      frameComposition([raw], caption, 'screen', true, { boardLabels: ['Kilter', 'MoonBoard', 'Tension'] }),
+    ).rejects.toThrow('source trio');
+    await expect(
+      frameComposition([raw, raw], caption, 'store-boards', true, {
+        boardLabels: ['Kilter', 'MoonBoard', 'Tension'],
+      }),
+    ).rejects.toThrow('source trio');
+    await expect(
+      frameComposition([raw, raw, raw], caption, 'store-boards', true, {
+        boardLabels: ['Kilter '.repeat(100), 'MoonBoard', 'Tension'],
+      }),
+    ).rejects.toThrow('labels overflow');
+  });
+
+  it.each(Object.keys(ACCEPTED_SIZES))(
+    'keeps the bottom of each complete native capture above the label footer on %s',
+    async (device) => {
+      const markerColors = ['#b03040', '#20a0d0', '#e0a030'];
+      const { width, height } = ACCEPTED_SIZES[device][0];
+      const captures = await Promise.all(
+        markerColors.map((color) =>
+          sharp(
+            Buffer.from(
+              `<svg width="${width}" height="${height}" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#164c39"/><rect y="${Math.floor(height * 0.94)}" width="100%" height="${Math.ceil(height * 0.06)}" fill="${color}"/></svg>`,
+            ),
+          )
+            .png()
+            .toBuffer(),
+        ),
+      );
+      const recipe = readCppPage('kilter').recipes[device.startsWith('ipad-') ? 'ipad' : 'phone'].find(
+        (candidate) => candidate.caption === 'cppKilterLayouts',
+      )!;
+      const framed = await frameComposition(
+        captures,
+        readCaptionCatalog('en-US')[recipe.caption],
+        recipe.layout,
+        true,
+        {
+          boardLabels: recipe.boardLabels,
+        },
+      );
+      const reduced = await sharp(framed).resize({ width: 300, kernel: 'nearest' }).raw().toBuffer();
+      for (const color of markerColors) {
+        const expected = [1, 3, 5].map((offset) => Number.parseInt(color.slice(offset, offset + 2), 16));
+        let hits = 0;
+        for (let pixel = 0; pixel < reduced.length; pixel += 3) {
+          if (expected.every((channel, index) => reduced[pixel + index] === channel)) hits++;
+        }
+        expect(hits, `${device} must retain the ${color} native footer`).toBeGreaterThan(3);
+      }
+    },
+  );
+
+  it.each(Object.keys(ACCEPTED_SIZES))(
+    'fits complete panels and ordered labels on %s in every locale',
+    async (device) => {
+      const { width, height } = ACCEPTED_SIZES[device][0];
+      const raw = await sharp({ create: { width, height, channels: 3, background: '#164c39' } })
+        .png()
+        .toBuffer();
+      for (const locale of ['en-US', 'es', 'fr', 'de'] as const) {
+        for (const target of CPP_TARGETS) {
+          const page = readCppPage(target);
+          for (const recipe of page.recipes[device.startsWith('ipad-') ? 'ipad' : 'phone'].filter(
+            (candidate) => candidate.layout === 'store-boards',
+          )) {
+            const labels = recipe.boardLabels!;
+            const caption = readCaptionCatalog(locale)[recipe.caption];
+            const framed = await frameComposition([raw, raw, raw], caption, recipe.layout, true, {
+              boardLabels: labels,
+            });
+            expect(readPngDimensions(framed)).toEqual({ width, height });
+            const wide = width > height;
+            const regionLeft = wide ? width * 0.42 : Math.round(width * 0.06);
+            const regionWidth = wide ? width * 0.52 : width - regionLeft * 2;
+            const labelSize = Math.round(Math.min(width, height) * (wide ? 0.02 : 0.025));
+            const cellWidth = Math.floor(regionWidth / 3);
+            const padding = Math.round(labelSize * 0.4);
+            const renderedLabels = await Promise.all(
+              labels.map((label) =>
+                renderShowcaseText(label, labelSize, cellWidth - padding * 2, '#FFFFFF', { bold: true }),
+              ),
+            );
+            const footerHeight = Math.max(...renderedLabels.map((label) => label.info.height));
+            const footerTop = Math.floor(height * 0.94 - footerHeight);
+            // The footer contains the three exact names in source order, and no
+            // native panel pixels. Native captures stay entirely above this band.
+            for (const [index, label] of renderedLabels.entries()) {
+              const left = Math.round(regionLeft + (index + 0.5) * cellWidth - label.info.width / 2);
+              const footer = await sharp(framed)
+                .extract({ left, top: footerTop, width: label.info.width, height: label.info.height })
+                .raw()
+                .toBuffer();
+              const mask = await sharp(label.data).ensureAlpha().raw().toBuffer();
+              let opaqueInk = 0;
+              for (let pixel = 0; pixel < mask.length / 4; pixel++) {
+                if (mask[pixel * 4 + 3] !== 255) continue;
+                opaqueInk++;
+                expect(footer[pixel * 3]).toBeGreaterThan(180);
+                expect(footer[pixel * 3 + 1]).toBeGreaterThan(180);
+                expect(footer[pixel * 3 + 2]).toBeGreaterThan(180);
+              }
+              expect(opaqueInk).toBeGreaterThan(0);
+            }
+            const footerPixels = await sharp(framed)
+              .extract({
+                left: Math.round(regionLeft),
+                top: footerTop,
+                width: Math.floor(regionWidth),
+                height: footerHeight,
+              })
+              .raw()
+              .toBuffer();
+            let nativePixels = 0;
+            for (let pixel = 0; pixel < footerPixels.length; pixel += 3) {
+              if (footerPixels[pixel] === 22 && footerPixels[pixel + 1] === 76 && footerPixels[pixel + 2] === 57)
+                nativePixels++;
+            }
+            expect(nativePixels).toBe(0);
+          }
+        }
+      }
+    },
+    120_000,
+  );
+});
+
 describe('store screenshot presentation', () => {
+  it('frames CPP view stories with explicit source and pixel provenance', async () => {
+    const input = directory();
+    const output = directory();
+    const device = 'iphone-16-pro';
+    const size = ACCEPTED_SIZES[device][0];
+    const pixels = Buffer.alloc(size.width * size.height * 3, 57);
+    randomBytes(size.width * 64 * 3).copy(pixels);
+    const raw = await sharp(pixels, { raw: { ...size, channels: 3 } })
+      .png()
+      .toBuffer();
+    for (const capture of cppStoryCaptures(readCppPage('spray'), 'phone'))
+      writeFileSync(join(input, capture.name + '.png'), raw);
+    const storyCapture = createCppStoryCapture(
+      {
+        target: 'spray',
+        sourceSha256: cppStorySourceSha256(),
+        locale: 'en-US',
+        device,
+        theme: 'dark',
+        variant: 'liquidGlass',
+        renderMode: 'classic',
+      },
+      input,
+    );
+    writeFileSync(join(input, 'cpp-capture.json'), JSON.stringify(storyCapture));
+    const saved = await frameDirectory({ platform: 'ios', cpp: 'spray', device, locale: 'en-US', input, output });
+    expect(saved).toHaveLength(9);
+    // The general presentation reader intentionally returns only image metadata;
+    // the CPP publication gate reads and validates its own provenance envelope.
+    const manifest = JSON.parse(
+      readFileSync(join(output, PRESENTATION_MANIFEST), 'utf8'),
+    ) as import('../lib/screenshot-presentation').PresentationManifest;
+    expect(manifest.cpp?.storyCapture).toEqual(storyCapture);
+    expect(manifest.cpp).not.toHaveProperty('fixtureSha256');
+    storyCapture.captures[0].storyId = 'player--kilter';
+    writeFileSync(join(input, 'cpp-capture.json'), JSON.stringify(storyCapture));
+    await expect(
+      frameDirectory({ platform: 'ios', cpp: 'spray', device, locale: 'en-US', input, output }),
+    ).rejects.toThrow('provenance changed');
+  }, 30_000);
+
   it('maps every device in the actual store capture matrix', () => {
-    for (const device of IOS_SCREENSHOT_DEVICES) {
+    for (const device of IOS_STORE_SCREENSHOT_DEVICES) {
       expect(Object.keys(screenshotCaptions('ios', deviceSlug(device.name))).length).toBeGreaterThan(0);
     }
   });
@@ -46,6 +450,52 @@ describe('store screenshot presentation', () => {
     expect(captionLocaleForStore('android', '')).toBe('en-US');
     expect(() => captionLocaleForStore('ios', 'it-IT')).toThrow('No screenshot captions');
   });
+
+  it.each([
+    { appLocale: 'it', storeLocale: 'it' },
+    { appLocale: 'zh-CN', storeLocale: 'zh-Hans' },
+  ] as const)(
+    'maps $appLocale to Apple $storeLocale without borrowing physical fixtures',
+    ({ appLocale, storeLocale }) => {
+      expect(captionLocaleForStore('ios', storeLocale)).toBe(appLocale);
+      expect(Object.keys(readCaptionCatalog(appLocale))).toEqual(CAPTION_IDS);
+      const recipes = resolveScreenshotRecipes('ios', 'iphone-16-pro-max', IOS_CAMPAIGN_CAPTURE_NAMES, appLocale);
+      expect(recipes).toHaveLength(9);
+      expect(recipes.every((recipe) => !recipe.liveActivity && recipe.sources.length > 0)).toBe(true);
+      expect(recipes[7]).toEqual({
+        output: '07-session-detail.png',
+        caption: 'session',
+        layout: 'screen',
+        sources: ['04-session-detail.png'],
+      });
+      expect(resolveScreenshotRecipes('ios', 'iphone-16-pro-max', IOS_CAMPAIGN_CAPTURE_NAMES)[7].liveActivity).toEqual({
+        boardFamily: 'kilter',
+      });
+    },
+  );
+
+  it('frames the Italian phone campaign with localized session pixels and provenance', async () => {
+    const input = directory();
+    const output = directory();
+    const size = ACCEPTED_SIZES['iphone-16-pro'][0];
+    const pixels = Buffer.alloc(size.width * size.height * 3, 57);
+    randomBytes(size.width * 64 * 3).copy(pixels);
+    const raw = await sharp(pixels, { raw: { ...size, channels: 3 } })
+      .png()
+      .toBuffer();
+    for (const name of IOS_CAMPAIGN_CAPTURE_NAMES) writeFileSync(join(input, name), raw);
+    const saved = await frameDirectory({ platform: 'ios', device: 'iphone-16-pro', locale: 'it', input, output });
+    expect(saved).toHaveLength(9);
+    const manifest = readPresentationManifest(output);
+    expect(manifest.locale).toBe('it');
+    const session = manifest.files['07-session-detail.png'];
+    expect(readFileSync(join(output, '07-session-detail.png'))).toEqual(
+      await frameComposition([raw], readCaptionCatalog('it').session, 'screen', true),
+    );
+    expect(session.rawSha256).toBe(sha256Screenshot(raw));
+    expect(Object.values(manifest.files).every((entry) => !entry.liveActivity)).toBe(true);
+    expect(readPngDimensions(readFileSync(join(output, '07-session-detail.png')))).toEqual(size);
+  }, 60_000);
 
   it('canonicalizes composite source names and field order without ignoring changed provenance', () => {
     const sources = {
@@ -176,10 +626,11 @@ describe('store screenshot presentation', () => {
   );
 
   it('enlarges only the captured wall rail and preserves the complete local selection screen', async () => {
+    // Match the current-climb content below the header in the 1080×1920 story capture.
     const raw = await sharp(
       Buffer.from(`<svg width="1080" height="1920" xmlns="http://www.w3.org/2000/svg">
       <rect width="1080" height="1920" fill="#164c39"/>
-      <rect y="270" width="1080" height="148" fill="#e69a32"/>
+      <rect y="420" width="1080" height="170" fill="#e69a32"/>
       <rect y="1525" width="1080" height="125" fill="#ac3478"/>
       <rect y="1856" width="1080" height="64" fill="#3269e6"/>
     </svg>`),
@@ -518,26 +969,31 @@ describe('store screenshot presentation', () => {
     expect(Object.keys(manifest.files)).toEqual(names);
     const first = names[0];
     expect(readFileSync(join(output, shard, first))).toEqual(
-      await frameScreenshot(raw, readCaptionCatalog('es')[screenshotCaptions('ios', device)[first]]),
+      await frameComposition([raw], readCaptionCatalog('es')[screenshotCaptions('ios', device)[first]], 'screen', true),
     );
   }, 60_000);
 
-  it.each(['en-US', 'es', 'fr', 'de'] as const)(
-    'fits every %s caption in every store device shape',
-    async (locale) => {
+  // One test per locale and shape keeps each case within the CI time budget.
+  const captionShapes = [{ width: 1080, height: 1920 }, ...Object.values(ACCEPTED_SIZES).map((sizes) => sizes[0])];
+  it.each(
+    CAPTION_LOCALES.flatMap((locale) =>
+      captionShapes.map((size) => ({ locale, size, shape: `${size.width}x${size.height}` })),
+    ),
+  )(
+    'fits every $locale caption in the $shape store shape',
+    async ({ locale, size }) => {
       const catalog = readCaptionCatalog(locale);
       expect(Object.keys(catalog)).toEqual([...CAPTION_IDS]);
-      const dimensions = [{ width: 1080, height: 1920 }, ...Object.values(ACCEPTED_SIZES).map((sizes) => sizes[0])];
-      for (const size of dimensions) {
-        const raw = await sharp({ create: { ...size, channels: 3, background: '#164c39' } })
-          .png()
-          .toBuffer();
-        for (const caption of Object.values(catalog)) {
+      const raw = await sharp({ create: { ...size, channels: 3, background: '#164c39' } })
+        .png()
+        .toBuffer();
+      await Promise.all(
+        Object.values(catalog).map(async (caption) => {
           const framed = await frameScreenshot(raw, caption);
           expect(readPngDimensions(framed)).toEqual(size);
           expect((await sharp(framed).metadata()).hasAlpha).toBe(false);
-        }
-      }
+        }),
+      );
     },
     120_000,
   );
@@ -656,6 +1112,8 @@ describe('store screenshot presentation', () => {
     const recipes = resolveScreenshotRecipes('ios', 'ipad-pro-13-inch-m5', names);
     expect(resolveScreenshotRecipes('ios', 'ipad-pro-11-inch-m5', names)).toEqual(recipes);
     expect(resolveScreenshotRecipes('ios', 'ipad-pro-13-inch-m5', [...names].reverse())).toEqual(recipes);
+    expect(recipes[0].caption).toBe('storeBoards');
+    expect(readCaptionCatalog('en-US')[recipes[0].caption].headline).toBe('One app for all your boards');
     expect(recipes.map(({ output }) => output)).toEqual([
       '00-wall-kiosk.png',
       '01-wall-status.png',
@@ -664,14 +1122,17 @@ describe('store screenshot presentation', () => {
       '04-workout-generator.png',
       '05-profile.png',
     ]);
-    // The browse capture carries the wall column; nothing else stands in for it,
-    // and it is the only capture that feeds two frames.
+    // The current landscape browse screen has no trailing wall column.
+    // Keep its full native capture and the established upload filename.
     expect(recipes[1]).toEqual({
       output: '01-wall-status.png',
-      caption: 'wallStatus',
-      layout: 'wall-column',
+      caption: 'climbs',
+      layout: 'screen',
       sources: ['02-climbs.png'],
     });
+    for (const locale of CAPTION_LOCALES) {
+      expect(resolveScreenshotRecipes('ios', 'ipad-pro-13-inch-m5', names, locale)).toEqual(recipes);
+    }
     expect(recipes.filter((recipe) => recipe.sources.includes('02-climbs.png'))).toHaveLength(1);
     for (const missing of names) {
       expect(() =>
@@ -686,6 +1147,32 @@ describe('store screenshot presentation', () => {
       'Incomplete or unknown',
     );
   });
+
+  it('frames the complete Italian iPad browse screen with its own source provenance', async () => {
+    const input = directory();
+    const output = directory();
+    const size = ACCEPTED_SIZES['ipad-pro-13-inch-m5'][0];
+    const pixels = Buffer.alloc(size.width * size.height * 3, 57);
+    randomBytes(size.width * 64 * 3).copy(pixels);
+    const raw = await sharp(pixels, { raw: { ...size, channels: 3 } })
+      .png()
+      .toBuffer();
+    for (const name of Object.keys(screenshotCaptions('ios', 'ipad-pro-13-inch-m5'))) {
+      writeFileSync(join(input, name), raw);
+    }
+    const saved = await frameDirectory({ platform: 'ios', device: 'ipad-pro-13-inch-m5', locale: 'it', input, output });
+    expect(saved).toHaveLength(6);
+    const browse = readFileSync(join(output, '01-wall-status.png'));
+    expect(browse).toEqual(await frameComposition([raw], readCaptionCatalog('it').climbs, 'screen', true));
+    expect(readPngDimensions(browse)).toEqual(size);
+    const manifest = readPresentationManifest(output);
+    expect(manifest.locale).toBe('it');
+    expect(manifest.files['01-wall-status.png']).toEqual({
+      rawBytes: raw.length,
+      rawSha256: sha256Screenshot(raw),
+      framedSha256: sha256Screenshot(browse),
+    });
+  }, 60_000);
 
   it('leaves the iPhone and Android recipes untouched by the iPad campaign', () => {
     const phone = Object.keys(screenshotCaptions('ios', 'iphone-16-pro-max'));
@@ -709,7 +1196,7 @@ describe('store screenshot presentation', () => {
     )
       .png()
       .toBuffer();
-    const framed = await frameComposition([raw], readCaptionCatalog('en-US').wallKiosk, 'screen');
+    const framed = await frameComposition([raw], readCaptionCatalog('en-US').wallKiosk, 'screen', true);
     expect(readPngDimensions(framed)).toEqual({ width: 2752, height: 2064 });
     const { data } = await sharp(framed).raw().toBuffer({ resolveWithObject: true });
     const capture = (x: number, y: number) => {
@@ -745,7 +1232,7 @@ describe('store screenshot presentation', () => {
       .png()
       .toBuffer();
     for (const locale of ['en-US', 'es', 'fr', 'de'] as const) {
-      const framed = await frameComposition([raw], readCaptionCatalog(locale).wallStatus, 'wall-column');
+      const framed = await frameComposition([raw], readCaptionCatalog(locale).wallStatus, 'wall-column', true);
       const { data } = await sharp(framed).raw().toBuffer({ resolveWithObject: true });
       // Widest horizontal run of the "on the wall" band, per side of the canvas.
       let widest = 0;
@@ -806,7 +1293,7 @@ describe('store screenshot presentation', () => {
         const longest = campaign
           .map((id) => catalog[id])
           .reduce((worst, caption) => (caption.headline.length > worst.headline.length ? caption : worst));
-        const framed = await frameScreenshot(raw, longest);
+        const framed = await frameComposition([raw], longest, 'screen', true);
         expect(readPngDimensions(framed)).toEqual(size);
       }
     }

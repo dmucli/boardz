@@ -1,3 +1,4 @@
+import { grantAnalyticsForTest } from '../../../test/consent-fixture';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const preferenceStore = vi.hoisted(() => ({
@@ -35,6 +36,7 @@ const setPreferenceMock = vi.mocked(setPreference);
 const reportErrorMock = vi.mocked(reportError);
 
 beforeEach(() => {
+  grantAnalyticsForTest();
   preferenceStore.values.clear();
   analytics.track.mockClear();
   analytics.setPersonProperties.mockClear();
@@ -281,4 +283,97 @@ describe('maybeFetchAndAttachInstallReferrer', () => {
     expect(analytics.track).not.toHaveBeenCalled();
     expect(reportErrorMock).toHaveBeenCalledWith(rejection);
   });
+});
+
+it('reads nothing from Play before Allow, then reads and publishes once after a grant', async () => {
+  const { updateConsentState, getConsentSnapshot } = await import('../consent-state');
+  updateConsentState({ record: { ...getConsentSnapshot().record!, analytics: 'denied' } });
+  const fetchNative = vi.fn(async () => ({
+    installReferrer: 'utm_source=gym&utm_campaign=pilot',
+    referrerClickTimestampSeconds: 100,
+    installBeginTimestampSeconds: 200,
+  }));
+  await maybeFetchAndAttachInstallReferrer(fetchNative);
+  // ePrivacy Art. 5(3): no read of the device-held referrer without consent.
+  expect(fetchNative).not.toHaveBeenCalled();
+  expect(getPreferenceMock).not.toHaveBeenCalled();
+  expect(analytics.track).not.toHaveBeenCalled();
+  expect(analytics.setPersonProperties).not.toHaveBeenCalled();
+  expect(preferenceStore.values.has('installReferrerResult')).toBe(false);
+  expect(preferenceStore.values.has('installReferrerFetched')).toBe(false);
+  grantAnalyticsForTest();
+  await maybeFetchAndAttachInstallReferrer(fetchNative);
+  await maybeFetchAndAttachInstallReferrer(fetchNative);
+  expect(fetchNative).toHaveBeenCalledOnce();
+  expect(analytics.track).toHaveBeenCalledOnce();
+  expect(analytics.setPersonProperties).toHaveBeenCalledOnce();
+});
+it('reads nothing from Play on the region default, then reads and publishes after an explicit Allow', async () => {
+  const { updateConsentState, getConsentSnapshot } = await import('../consent-state');
+  // Analytics is on (outside the prompt regions, confirmed this launch), but not by the climber's own Allow.
+  updateConsentState({ record: { ...getConsentSnapshot().record!, basis: 'region_default' }, regionConfirmed: true });
+  const fetchNative = vi.fn(async () => ({
+    installReferrer: 'utm_source=gym&utm_campaign=pilot',
+    referrerClickTimestampSeconds: 100,
+    installBeginTimestampSeconds: 200,
+  }));
+  await maybeFetchAndAttachInstallReferrer(fetchNative);
+  // Reading the referrer is attribution access in its own right (ePrivacy Art. 5(3)).
+  expect(fetchNative).not.toHaveBeenCalled();
+  expect(getPreferenceMock).not.toHaveBeenCalled();
+  expect(preferenceStore.values.has('installReferrerFetched')).toBe(false);
+  expect(analytics.track).not.toHaveBeenCalled();
+  expect(analytics.setPersonProperties).not.toHaveBeenCalled();
+  expect(preferenceStore.values.has('installReferrerPublished')).toBe(false);
+
+  grantAnalyticsForTest();
+  await maybeFetchAndAttachInstallReferrer(fetchNative);
+  expect(analytics.track).toHaveBeenCalledOnce();
+  expect(analytics.setPersonProperties).toHaveBeenCalledOnce();
+});
+it('a native referrer fetch finishing after withdrawal never publishes', async () => {
+  let finishFetch:
+    | ((result: {
+        installReferrer: string;
+        referrerClickTimestampSeconds: number;
+        installBeginTimestampSeconds: number;
+      }) => void)
+    | undefined;
+  const fetchNative = vi.fn(
+    () =>
+      new Promise<{
+        installReferrer: string;
+        referrerClickTimestampSeconds: number;
+        installBeginTimestampSeconds: number;
+      }>((resolve) => {
+        finishFetch = resolve;
+      }),
+  );
+  const fetching = maybeFetchAndAttachInstallReferrer(fetchNative);
+  await vi.waitFor(() => expect(fetchNative).toHaveBeenCalledOnce());
+  const { updateConsentState, getConsentSnapshot } = await import('../consent-state');
+  updateConsentState({ record: { ...getConsentSnapshot().record!, analytics: 'denied' } });
+  finishFetch?.({
+    installReferrer: 'utm_source=gym',
+    referrerClickTimestampSeconds: 100,
+    installBeginTimestampSeconds: 200,
+  });
+  await fetching;
+  expect(analytics.track).not.toHaveBeenCalled();
+  expect(analytics.setPersonProperties).not.toHaveBeenCalled();
+});
+it('does not read the referrer when consent is withdrawn during the stored-flag read', async () => {
+  const fetchNative = vi.fn(async () => ({
+    installReferrer: 'utm_source=gym',
+    referrerClickTimestampSeconds: 100,
+    installBeginTimestampSeconds: 200,
+  }));
+  const { updateConsentState, getConsentSnapshot } = await import('../consent-state');
+  getPreferenceMock.mockImplementationOnce(async () => {
+    updateConsentState({ record: { ...getConsentSnapshot().record!, analytics: 'denied' } });
+    return null;
+  });
+  await maybeFetchAndAttachInstallReferrer(fetchNative);
+  expect(fetchNative).not.toHaveBeenCalled();
+  expect(preferenceStore.values.has('installReferrerFetched')).toBe(false);
 });

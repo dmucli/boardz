@@ -9,6 +9,11 @@
       "types": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./presentation": {
+      "types": "./src/presentation.ts",
+      "import": "./src/presentation.ts",
+      "default": "./src/presentation.ts"
     }
   },
   "scripts": {
@@ -20,7 +25,7 @@
     "@boardsesh/shared-schema": "workspace:*"
   },
   "devDependencies": {
-    "@testing-library/react": "^16.3.2",
+    "@testing-library/react": "^16.3.3",
     "@types/react": "^19.2.18",
     "jsdom": "^28.1.0",
     "react": "^19.2.8",

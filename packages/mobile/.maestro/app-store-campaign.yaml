@@ -1,0 +1,417 @@
+# Deprecated live-route commands: retained only as the capture filename inventory.
+# Use vp run mobile:screenshots -- --flow <name>; its story runner ignores these commands.
+# Do not execute this file directly with Maestro.
+appId: com.boardsesh.app
+name: multiboard App Store campaign sources
+---
+# Campaign capture: the orchestrator requires the verified seven-board
+# replay scenario before launching. Slots: Kilter, Tension, MoonBoard, Woods,
+# Decoy, Grasshopper, spray. Keep existing sources for provenance/reframing.
+# The orchestrator inlines this flow before rendering orientation placeholders.
+# A reused simulator may restore the previous wall. Select the fixture's primary
+# board before any Home/Discover/Profile sources, and wait for its own results.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- openLink: com.boardsesh.app://climbs?screenshotBoardIndex=0
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible: '.*Lightest Pair of Shorts.*'
+    timeout: 90000
+- openLink: com.boardsesh.app://home
+- runFlow: app-store.yaml
+
+# Dismiss the previous player before selecting another wall.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=2&screenshotDrive=1
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'play-drawer-board-overlay'
+    timeout: 90000
+- waitForAnimationToEnd:
+    timeout: 30000
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^store-driving-.+$'
+    timeout: 60000
+- takeScreenshot: 10-moonboard-board-view
+
+# Dismiss the previous player before selecting another wall.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=3&screenshotDrive=1
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'play-drawer-board-overlay'
+    timeout: 90000
+- waitForAnimationToEnd:
+    timeout: 30000
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^store-driving-.+$'
+    timeout: 60000
+- takeScreenshot: 11-woods-board-view
+
+# Dismiss the previous player before selecting another wall.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=4&screenshotDrive=1
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'play-drawer-board-overlay'
+    timeout: 90000
+- waitForAnimationToEnd:
+    timeout: 30000
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^store-driving-.+$'
+    timeout: 60000
+- takeScreenshot: 12-decoy-board-view
+
+# Dismiss the previous player before selecting another wall.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=5&screenshotDrive=1
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'play-drawer-board-overlay'
+    timeout: 90000
+- waitForAnimationToEnd:
+    timeout: 30000
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^store-driving-.+$'
+    timeout: 60000
+- takeScreenshot: 13-grasshopper-board-view
+
+# Dismiss the previous player before selecting another wall.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=6
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'play-drawer-board-overlay'
+    timeout: 90000
+- waitForAnimationToEnd:
+    timeout: 30000
+- assertVisible: '.*Black Pearl.*'
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- takeScreenshot: 14-spray-board-view
+
+# Browse a different climb while the real seeded wall state remains visible.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://climbs?screenshotBoardIndex=0
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible: '.*Guessing Games.*'
+    timeout: 90000
+- tapOn: '.*Guessing Games.*'
+- extendedWaitUntil:
+    visible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- tapOn: ${SCREENSHOT_CLOSE_LABEL}
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_WALL_STATUS_LABEL}
+    timeout: 60000
+- extendedWaitUntil:
+    visible:
+      id: '^climbs-capture-settled$'
+    timeout: 60000
+- waitForAnimationToEnd
+- takeScreenshot: 16-wall-status
+
+# Replay the recorded crew in the real native queue UI. Labels follow app locale;
+# climb/session names are fixture content and intentionally are not translated.
+# Close the queue sheet, then the player when present. Keep the loaded native
+# client connected to Metro while moving between the capture's app screens.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://join/${SCREENSHOT_SHARED_SESSION_ID}
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_JOIN_LABEL}
+    timeout: 60000
+- tapOn: ${SCREENSHOT_JOIN_LABEL}
+- extendedWaitUntil:
+    visible: 'Friday board crew'
+    timeout: 60000
+# Open through the established board route.
+- openLink: com.boardsesh.app://home
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'home-screen'
+    timeout: 90000
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=0
+- tapOn:
+    text: 'Open'
+    optional: true
+- extendedWaitUntil:
+    visible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- extendedWaitUntil:
+    visible: ${SCREENSHOT_QUEUE_LABEL}
+    timeout: 60000
+- tapOn: ${SCREENSHOT_QUEUE_LABEL}
+- swipe:
+    start: "50%,54%"
+    end: "50%,15%"
+    duration: 700
+- extendedWaitUntil:
+    visible: ".*${SCREENSHOT_QUEUE_TITLE}.*"
+    timeout: 60000
+- extendedWaitUntil:
+    visible: '.*Wax On.*'
+    timeout: 60000
+- waitForAnimationToEnd
+- takeScreenshot: 15-crew-queue
+
+# The Live Activity screenshot is supplied at composition time from the reviewed
+# physical iPhone capture in app-stores/apple/live-activity-captures/. CI cannot
+# reliably start or capture ActivityKit with the simulator replay client. Keep
+# that native card separate from these full-screen app captures; it is never a
+# fabricated widget or a relabeled simulator screenshot. Local regeneration is
+# documented in docs/marketing/live-activity-creative-captures.md with its provenance.

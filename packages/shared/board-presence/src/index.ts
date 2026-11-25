@@ -2,8 +2,18 @@
 // works in any JS runtime. The React wrapper (useReducer bound to the presence
 // subscription) lives in a separate `@boardsesh/board-presence-react` package.
 
-export { boardPresenceReducer, initialBoardPresenceState, HISTORY_CAP } from './reducer';
-export { compareBoardHistoryEntries, mergeBoardHistory, boardHistoryEntryKey } from './history';
+export { boardPresenceReducer, initialBoardPresenceState, HISTORY_CAP, selectClearedClimbUuid } from './reducer';
+export {
+  compareBoardHistoryEntries,
+  mergeBoardHistory,
+  boardHistoryEntryKey,
+  isImportedBoardClimb,
+  isNativeBoardClimb,
+  isSupportedBoardClimb,
+  BOARD_HISTORY_WINDOW_MS,
+  boardHistoryExpiresAt,
+  filterRecentBoardHistory,
+} from './history';
 
 export { mapBoardPresenceEnvelopeToAction } from './map-envelope';
 
@@ -12,3 +22,5 @@ export type { BoardPresenceState, BoardPresenceAction } from './types';
 export { rankSessionClimbers } from './session-ranking';
 
 export type { RankedSessionClimber, SessionRankingOptions } from './session-ranking';
+
+export { presentAuroraClimb, resolveBoardPresenceAngle, withAuroraActionOrientation } from './presentation';

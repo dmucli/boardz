@@ -9,8 +9,7 @@
     "following": "Siguiendo",
     "allSetters": "Todos los setters",
     "followingClimbs": "Bloques de personas que sigo",
-    "playlistSubtitle": "Todos los bloques de este plafón · Más recientes primero",
-    "signIn": "Inicia sesión para seguir a este setter",
+    "playlistSubtitleSort": "Todos los bloques de este plafón · {{sort}}",
     "syncNeeded": "Conéctate para sincronizar a quienes sigues y sus setters vinculados.",
     "followError": "No se pudo actualizar. Inténtalo de nuevo.",
     "loadError": "No se pudieron cargar estos bloques.",
@@ -27,25 +26,30 @@
   "metadata": {
     "list": {
       "title": "Bloques de {{boardName}} a {{angle}}°",
-      "description": "Explora bloques en {{boardName}} a {{angle}}°",
+      "description": "Los bloques más encadenados en {{boardName}} a {{angle}}°. Elige uno e ilumínalo en tu plafón con Boardsesh.",
       "fallbackTitle": "Bloques",
       "fallbackDescription": "Explora bloques",
-      "paginatedTitle": "Bloques de {{boardName}} a {{angle}}° — Página {{page}}"
+      "paginatedTitle": "Bloques de {{boardName}} a {{angle}}° — Página {{page}}",
+      "ogTitle": "Bloques en {{name}} a {{angle}}°",
+      "ogDescription": "Elige uno, enciéndelo y registra el encadene."
     },
     "view": {
-      "title": "{{climbName}} - {{grade}}",
-      "description": "{{climbName}} - {{grade}} de {{setter}}. Calidad: {{quality}}/5. Encadenes: {{ascents}}",
+      "title": "{{climbName}}, {{grade}} en {{boardName}} a {{angle}}°",
+      "titleUngraded": "{{climbName}}, bloque en {{boardName}} a {{angle}}°",
+      "descriptionLead": "{{climbName}} es un {{grade}} en {{layoutName}} a {{angle}}°, de {{setter}}.",
+      "descriptionLeadNoSetter": "{{climbName}} es un {{grade}} en {{layoutName}} a {{angle}}°.",
+      "descriptionLeadUngraded": "{{climbName}} es un bloque en {{layoutName}} a {{angle}}°, de {{setter}}.",
+      "descriptionLeadUngradedNoSetter": "{{climbName}} es un bloque en {{layoutName}} a {{angle}}°.",
+      "descriptionSendsRated_one": "{{ascents}} encadene, valoración {{quality}} de 5.",
+      "descriptionSendsRated_other": "{{ascents}} encadenes, valoración {{quality}} de 5.",
+      "descriptionSends_one": "{{ascents}} encadene.",
+      "descriptionSends_other": "{{ascents}} encadenes.",
+      "descriptionRated": "Valoración {{quality}} de 5.",
+      "descriptionCta": "Ilumínalo en tu plafón con Boardsesh.",
       "imageAlt": "{{climbName}} - {{grade}} en plafón {{boardName}}",
+      "imageAltUngraded": "{{climbName}} en plafón {{boardName}}",
       "fallbackTitle": "Bloque",
-      "fallbackDescription": "Mira los detalles del bloque y vídeos de beta",
-      "seoHeading": "{{climbName}} — {{grade}}",
-      "seoSummary": "Bloque {{boardName}} {{layoutName}}",
-      "seoSetterSuffix": " creado por {{setter}}",
-      "seoAscentsSuffix": ". {{ascents}} encadenes registrados"
-    },
-    "import": {
-      "title": "Importar bloques",
-      "description": "Importa bloques de MoonBoard desde capturas de pantalla"
+      "fallbackDescription": "Mira los detalles del bloque y vídeos de beta"
     }
   },
   "list": {
@@ -54,12 +58,30 @@
       "heading": "Bloques de {{boardName}} a {{angle}}°",
       "intro": "Todos los bloques montados en esta configuración de {{boardName}} a {{angle}}°, los más escalados primero. Entra en cualquiera para ver el plafón, el grado en cada ángulo y la beta.",
       "empty": "Todavía no hay bloques en este plafón.",
-      "cta": "Escala en este plafón",
+      "cta": {
+        "getAppHelper": "Ilumina cualquiera de ellos en tu {{board}}.",
+        "openInBrowser": "Ábrela en el navegador",
+        "openInBrowserMobile": "O abre la lista en el navegador"
+      },
       "pagination": {
         "aria": "Paginación",
         "previous": "Página anterior",
         "next": "Página siguiente",
         "pageLabel": "Página {{page}}"
+      },
+      "climbsHeading": "Más escalados a {{angle}}°",
+      "stage": {
+        "caption": "Primero de la lista: {{climb}}",
+        "captionLaterPage": "Primero de esta página: {{climb}}"
+      },
+      "qr": {
+        "title": "Escanea para abrir esta lista en tu móvil",
+        "imageLabel": "Código QR que abre los bloques de {{boardName}} a {{angle}}° en tu móvil"
+      },
+      "angles": {
+        "label": "El mismo plafón, otros ángulos",
+        "stop": "{{angle}}°",
+        "linkAria": "{{angle}}°, bloques de {{boardName}}"
       }
     }
   },
@@ -72,15 +94,12 @@
   },
   "search": {
     "placeholders": {
-      "climbs": "Busca bloques..."
+      "climbs": "Buscar bloques..."
     },
     "summary": {
       "routesOnly": "Solo vías",
+      "bouldersOnly": "Solo bloques",
       "bouldersAndRoutes": "Bloques y vías"
-    },
-    "holds": {
-      "include": "Incluir",
-      "exclude": "Excluir"
     }
   },
   "actions": {
@@ -129,6 +148,7 @@
     "title": "Grado Boardsesh",
     "moonboardBody": "Aún no tenemos datos de grado de la comunidad para MoonBoard. Registra tus encadenes en Moon con Boardsesh para ayudar a desbloquearlo.",
     "woodsBody": "Aún no tenemos datos de grado de la comunidad para el Woods Board. Registra tus encadenes en el plafón Woods con Boardsesh para ayudar a desbloquearlo.",
+    "sprayBody": "En un Spraywall, el grupo gradúa cada bloque. El primer ascenso fija el grado y el grado de cada escalador lo va ajustando.",
     "loadError": "No se pudo cargar el grado ahora mismo.",
     "byAngle": "Cómo cuesta según el ángulo",
     "summaryLocal": "local",
@@ -202,32 +222,28 @@
   },
   "createClimbForm": {
     "draftBadge": "Borrador",
-    "namePlaceholder": "Nombre del bloque",
     "descriptionPlaceholder": "Añade beta o notas sobre tu bloque...",
     "dismiss": "Descartar",
     "cannotOpen": {
       "boardCannotAuthor": "Todavía no puedes montar bloques en este plafón.",
       "boardConfigIncomplete": "Los datos del plafón faltan o no son válidos. Vuelve a elegir el plafón para montar tu bloque.",
       "noUsableBoard": "Elige un plafón primero y luego monta tu bloque.",
-      "boardTypeUnsupported": "Esta versión de la app todavía no permite montar bloques en ese plafón. Elige otro plafón."
+      "boardTypeUnsupported": "Esta versión de la app todavía no permite montar bloques en ese plafón. Elige otro plafón.",
+      "wallArchived": "Este Spraywall está archivado. Sus bloques y encadenes se quedan, pero ya no se puede montar nada nuevo en él."
     },
     "alerts": {
       "publishDuplicateNamed": "Este patrón de presas coincide con \"{{name}}\". Activa Borrador para guardarlo sin publicar, o cambia una presa.",
       "publishDuplicateUnnamed": "Este patrón de presas coincide con un bloque existente. Activa Borrador para guardarlo sin publicar, o cambia una presa.",
       "viewMatchingClimb": "Ver bloque coincidente",
-      "saveFailedFallback": "No se pudo guardar el bloque. Inténtalo de nuevo."
+      "saveFailedFallback": "No se pudo guardar el bloque. Inténtalo de nuevo.",
+      "editConflict": "Este bloque ha cambiado en otro sitio. Vuelve a abrirlo para ver la última versión.",
+      "editNotAllowed": "No puedes editar este bloque. Solo puede hacerlo quien lo montó.",
+      "editWindowExpired": "Este bloque se publicó hace más de 24 horas y ya no se puede editar.",
+      "editNotEditable": "Este bloque ya no se puede editar.",
+      "localRefreshFailed": "Vía guardada. No se pudo actualizar la lista descargada. Reconéctate para actualizarla."
     },
     "fields": {
       "description": "Descripción (opcional)"
-    },
-    "holds": {
-      "start": "Salida",
-      "hand": "Mano",
-      "finish": "Final",
-      "total": "Total"
-    },
-    "validation": {
-      "needsStartFinish": "Un bloque válido necesita al menos 1 presa de salida y 1 de final"
     }
   },
   "draftsDrawer": {
@@ -246,62 +262,6 @@
       "error": "No se pudo eliminar ese borrador. Inténtalo de nuevo."
     }
   },
-  "holdTypePicker": {
-    "toolbarAriaLabel": "Tipo de presa",
-    "applyModeAriaLabel": "Aplicar como incluir o excluir",
-    "clear": "Borrar",
-    "searchHelp": "Selecciona uno o más tipos de presa, luego toca en cualquier otra parte para cerrar el selector",
-    "includeAriaSuffix": "incluir",
-    "excludeAriaSuffix": "excluir",
-    "states": {
-      "starting": "Salida",
-      "hand": "Media",
-      "finish": "Final",
-      "foot": "Pie",
-      "any": "Cualquiera"
-    }
-  },
-  "moonboardImport": {
-    "picker": {
-      "title": "Elige tu MoonBoard",
-      "hint": "Elige el plafón y el ángulo desde los que importas y luego suelta tus capturas de pantalla.",
-      "angleOption": "{{angle}}°"
-    },
-    "card": {
-      "skipping": "Omitiendo",
-      "duplicate": "Omitiendo: ya existe",
-      "duplicateNamed": "Omitiendo: ya existe como \"{{name}}\"",
-      "removeAction": "Quitar",
-      "removeDescription": "Este bloque no se importará."
-    },
-    "bulk": {
-      "title": "Importar bloques de MoonBoard - {{layoutName}} @ {{angle}}°",
-      "loginRequired": "Inicia sesión para guardar bloques",
-      "loginRequiredTitle": "Inicio de sesión requerido",
-      "loginRequiredBody": "Inicia sesión para guardar bloques en la base de datos.",
-      "logIn": "Iniciar sesión",
-      "uploadPrompt": "Toca o arrastra capturas de pantalla a esta zona",
-      "uploadHelp": "Compatible con capturas de la app de MoonBoard. Suelta varios archivos para importar en lote.",
-      "processing": "Procesando capturas...",
-      "checkingDuplicates": "Comprobando los bloques importados con problemas de MoonBoard existentes...",
-      "reviewBeforeSaving": "Revisa los bloques de abajo. Puedes editar o quitar cualquiera antes de guardar.",
-      "saveAll": "Guardar todos ({{count}})",
-      "clearAndRestart": "Limpiar y empezar de nuevo",
-      "contributeImages": "Contribuir con imágenes para mejorar la precisión del OCR",
-      "tryAgain": "Reintentar",
-      "saveFailed": "No se pudieron guardar los bloques. Inténtalo de nuevo."
-    }
-  },
-  "moonboardEditModal": {
-    "title": "Editar bloque",
-    "nameLabel": "Nombre del bloque",
-    "nameRequired": "Introduce un nombre",
-    "save": "Guardar cambios",
-    "setter": "Aperturista: {{setter}}",
-    "grade": "Grado: {{grade}}",
-    "angle": "Ángulo: {{angle}}°",
-    "unknown": "Desconocido"
-  },
   "similarClimbs": {
     "loadError": "No se pudieron cargar los bloques similares.",
     "emptyDefault": "Aún no hay bloques similares.",
@@ -309,10 +269,16 @@
     "untitledClimb": "Bloque sin título"
   },
   "mobile": {
+    "listOptions": {
+      "title": "Opciones de la lista de bloques",
+      "viewOptions": "Opciones de vista",
+      "history": "Historial del plafón, {{board}}",
+      "historyTitle": "Historial del plafón",
+      "historyHint": "Mira los bloques que se han iluminado en este muro",
+      "myClimbs": "Mis bloques"
+    },
     "moderation": {
       "title": "Moderación",
-      "moreSectionTitle": "Comunidad",
-      "moreRowSubtitle": "Vota bloques reportados y cambios de grado",
       "pinnedFromNotification": "De tu notificación",
       "hiddenChip": "Oculto",
       "supersededChip": "Sustituida",
@@ -377,8 +343,8 @@
         "subtitle": "Intenta ajustar la configuración de tu plafón"
       },
       "unsetWall": {
-        "title": "Nadie ha montado nada en este plafón",
-        "subtitle": "Elige tus presas, ponle nombre y el plafón ya tiene su primer bloque.",
+        "title": "Nadie ha montado nada en este Spraywall",
+        "subtitle": "Elige tus presas, ponle nombre y el Spraywall ya tiene su primer bloque.",
         "cta": "Monta el primer bloque"
       },
       "noMatches": {
@@ -403,22 +369,30 @@
       "boardRestoreFailed": {
         "title": "No se pudo recuperar tu plafón",
         "description": "Inténtalo de nuevo para volver a tus bloques."
+      },
+      "recovery": {
+        "scope": "{{board}} · {{angle}}°",
+        "filters": "Filtros activos: {{filters}}",
+        "removeHint": "Quita un filtro para volver a intentarlo. Todo lo demás se mantiene.",
+        "openFilters": "Ajustar filtros"
       }
     },
     "detail": {
       "notFound": "Bloque no encontrado",
+      "boardNotFound": "Este plafón ya no existe o no está compartido contigo.",
       "backToHome": "Volver al inicio"
     },
     "logAscent": {
       "errorMessage": "No se pudo guardar tu ascenso. Inténtalo de nuevo.",
       "offlineErrorMessage": "No se pudo guardar tu ascenso sin conexión. El almacenamiento del teléfono estaba ocupado; inténtalo de nuevo en un momento.",
-      "savedToast": "Encadene guardado"
+      "savedToast": "Encadene guardado",
+      "climbDeletedMessage": "Este bloque se ha eliminado."
     },
     "tick": {
       "dateLabel": "Fecha",
       "timeLabel": "Hora",
       "gradeLabel": "Mi grado",
-      "gradeHelp": "El grado que verás en este bloque a partir de ahora. No hace falta encadenarlo.",
+      "gradeHelp": "El grado que ves tú en este bloque. No hace falta encadenarlo.",
       "starsLabel": "Estrellas",
       "triesLabel": "Intentos",
       "noteLabel": "Nota",
@@ -426,6 +400,14 @@
       "noteAria": "Nota del encadene",
       "statusLabel": "Estado",
       "angleLabel": "Ángulo",
+      "detailsLabel": "Detalles",
+      "detailsNow": "Ahora",
+      "detailsToday": "Hoy {{time}}",
+      "detailsAria": "Detalles: {{angle}}, {{when}}. Abre los controles para cambiar el ángulo y la fecha.",
+      "detailsAriaNoAngle": "Detalles: {{when}}. Abre los controles para cambiar la fecha.",
+      "detailsAngleAria": "ángulo de {{angle}} grados",
+      "detailsAngleChangedAria": "ángulo cambiado a {{angle}} grados",
+      "detailsDateChangedAria": "fecha cambiada a {{when}}",
       "attempt": "Intento",
       "save": "Guardar",
       "deleteRow": "Eliminar este encadene",
@@ -442,7 +424,8 @@
       "logAscentAria": "Registrar {{status}}",
       "setTriesAria_one": "Marcar {{count}} intento",
       "setTriesAria_other": "Marcar {{count}} intentos",
-      "moreTriesAria": "Un intento más"
+      "moreTriesAria": "Un intento más",
+      "firstAscent": "Primer ascenso: fija el grado del bloque para registrar un encadene."
     },
     "filter": {
       "climbType": {
@@ -474,28 +457,38 @@
       "popularity": "Popularidad",
       "collection": {
         "label": "Colección",
-        "any": "Cualquiera"
+        "any": "Cualquiera",
+        "liked": "Favoritos"
       },
-      "holdIntegrity": {
-        "label": "Presas",
-        "any": "Todas",
-        "intact": "Solo intactos",
-        "broken": "Presas perdidas"
-      },
-      "pin": "Fijar como atajo",
-      "unpin": "Quitar de los atajos",
+      "pinChip": "Fijar {{name}} en la fila superior",
+      "unpinChip": "Quitar {{name}} de la fila superior",
+      "recentDescription": "Tus últimas 10 búsquedas aparecerán aquí.",
+      "ratingAtLeast": "{{count}}★+",
+      "quickFiltersLink": "Filtros rápidos",
+      "quickFiltersFooter": "Elige qué filtros se muestran en la fila superior y en qué orden.",
       "established2plus": "Establecido 2+",
       "benchmark": "Benchmarks",
+      "verified": "Verificados",
+      "verifiedDescription": "Los bloques verificados los elige Kilter con escaladores y setters.",
+      "onlyBenchmarks": "Solo bloques benchmark",
+      "onlyVerified": "Solo bloques verificados",
       "showCount_one": "Ver {{count}} vía",
       "showCount_other": "Ver {{count}} vías",
-      "countNote": "Cada bloque cuenta una vez, no una por ángulo.",
+      "close": "Cerrar filtros",
+      "matchingCount_one": "{{count, number}} bloque",
+      "matchingCount_other": "{{count, number}} bloques",
       "sort": {
+        "position": "Orden de la playlist",
+        "added": "Añadidos recientemente",
         "ascents": "Ascensos",
         "quality": "Calidad",
         "difficulty": "Dificultad",
         "name": "Nombre",
         "popular": "Populares",
         "creation": "Más recientes",
+        "recentlyLiked": "Favoritos recientes",
+        "recentlyClimbed": "Escalados recientemente",
+        "mostTries": "Más intentos",
         "random": "Aleatorio",
         "reshuffle": "Mezclar de nuevo"
       },
@@ -503,6 +496,32 @@
       "sortOrder": {
         "asc": "Ascendente",
         "desc": "Descendente"
+      },
+      "sortDirection": {
+        "difficulty": {
+          "asc": "Más fáciles primero",
+          "desc": "Más difíciles primero"
+        },
+        "added": {
+          "desc": "Más recientes primero",
+          "asc": "Más antiguos primero"
+        },
+        "creation": {
+          "desc": "Más recientes primero",
+          "asc": "Más antiguos primero"
+        },
+        "quality": {
+          "desc": "Mejor valorados primero",
+          "asc": "Peor valorados primero"
+        },
+        "ascents": {
+          "desc": "Más encadenes primero",
+          "asc": "Menos encadenes primero"
+        },
+        "name": {
+          "asc": "De la A a la Z",
+          "desc": "De la Z a la A"
+        }
       },
       "status": {
         "drafts": "Borradores",
@@ -537,17 +556,23 @@
       "betaVideos": "Solo con vídeos de beta",
       "betaVideosShort": "🎥 Beta",
       "betaVideosDescription": "Solo vías con un vídeo de beta",
+      "boardFit": {
+        "label": "Encaja en mi plafón",
+        "switch": "Solo bloques que encajan en mi plafón",
+        "description": "Oculta los bloques de otro plafón o de otro tamaño."
+      },
       "otherAngles": "Otros ángulos",
       "otherAnglesDescription": "Muestra bloques montados en otro ángulo",
       "searchSetters": "Buscar equipadores",
       "noSetters": "Sin equipadores",
       "clearAll": "Borrar todo",
+      "nameToken": "«{{name}}»",
       "drafts": "Mis borradores",
-      "popularityUnrepeated": "Sin repetir"
+      "popularityUnrepeated": "Sin repetir",
+      "wallDrafts": "Borradores"
     },
     "search": {
       "recentFilters": "Recientes",
-      "clearRecent": "Borrar",
       "gradeRange": "{{min}}–{{max}}",
       "gradeMin": "{{grade}}+",
       "gradeMax": "≤{{grade}}",
@@ -567,8 +592,6 @@
       "gradeAction": "Ajustar el rango de grado",
       "gradeOpenHint": "Abre el selector de grado",
       "gradeCloseHint": "Cierra el selector de grado",
-      "boardSwitcherHint": "Abre el selector de plafón",
-      "allClimbs": "Todas las vías",
       "clearRecentSearches": "Borrar búsquedas recientes",
       "chips": {
         "filtersWithCount": "Filtros · {{count}}",
@@ -585,19 +608,27 @@
       "rangeFilterAria": "{{grade}} está en el rango de grados seleccionado",
       "anyGradeAria": "Cualquier grado seleccionado",
       "clearFilterAria": "Borrar filtro de grado",
-      "closeAria": "Cerrar selector de grado",
-      "rangeHint": "Toca otro grado para crear un rango",
+      "rangeHoldHint": "Mantén pulsado para crear un rango con el grado seleccionado",
       "setLogGradeAria": "Guardar grado {{grade}} en el registro",
       "selectedLogGradeAria": "Grado {{grade}} seleccionado para el registro",
       "consensusGradeAria": "{{grade}}, grado de consenso"
     },
+    "angleRail": {
+      "any": "Cualquiera",
+      "setFilterAria": "Filtrar por ángulo de {{angle}} grados",
+      "selectedFilterAria": "Filtro de ángulo de {{angle}} grados seleccionado",
+      "rangeFilterAria": "El ángulo de {{angle}} grados está en el rango seleccionado",
+      "anyAngleAria": "Cualquier ángulo seleccionado",
+      "clearFilterAria": "Borrar filtro de ángulo",
+      "rangeHoldHint": "Mantén pulsado para crear un rango con el ángulo seleccionado"
+    },
     "climbRow": {
-      "addToQueue": "Añadir a la cola",
       "toggleFavorite": "Alternar favorito",
       "favorited": "Favorito",
       "share": "Compartir bloque",
       "moreActions": "Más acciones",
       "projectFallback": "Proyecto",
+      "directionStatus": "{{direction}}: {{status}}",
       "ascentStatus": {
         "flash": "Flasheado",
         "send": "Encadenado",
@@ -608,13 +639,26 @@
       "anyFeet": "Pies libres",
       "noKickboard": "Sin repisa",
       "benchmark": "Benchmark",
+      "verified": "Bloque verificado",
       "method": {
         "footless": "Sin pies",
         "footlessKickboard": "Sin pies + KB",
         "noKickboard": "Sin KB"
       },
       "setAngleMarker": "montado en {{angle}}°",
-      "setAngleMarkerAria": "La dificultad y las repeticiones son de {{angle}} grados"
+      "setAngleMarkerAria": "La dificultad y las repeticiones son de {{angle}} grados",
+      "communityGradeAria": "Grado de la comunidad {{grade}}",
+      "frameCount_one": "{{count}} cuadro",
+      "frameCount_other": "{{count}} cuadros",
+      "progress": {
+        "flashed": "Flasheado",
+        "sent": "Encadenado",
+        "sentTimes": "Encadenado ×{{count}}",
+        "tries_one": "{{count}} intento",
+        "tries_other": "{{count}} intentos",
+        "today": "hoy",
+        "daysAgo": "{{count}} d"
+      }
     },
     "climbRules": {
       "matchingAllowed": "Se puede igualar",
@@ -628,29 +672,29 @@
     },
     "report": {
       "title": "Reportar bloque",
-      "close": "Cerrar el reporte",
       "kind": {
         "label": "¿Qué falla?",
-        "hide": "Ocultar este bloque",
+        "hide": "Votar para ocultar",
         "grade": "El grado está mal",
-        "hideHint": "Basura, duplicado o inescalable. Con suficientes reportes se oculta para todo el mundo.",
+        "hideHint": "Basura, duplicado o inescalable. Tu reporte es un voto. Cuando suficiente gente coincida, se oculta para todo el mundo.",
         "gradeHint": "Elige el grado que crees que merece."
       },
       "sameGrade": "Ese ya es el grado actual",
       "reasonPlaceholder": "Cuéntale al grupo por qué (mínimo 10 caracteres)",
       "reasonAria": "Motivo del reporte",
-      "reasonRemaining": "Faltan {{count}} caracteres",
+      "reasonRemaining_one": "Añade 1 carácter más para enviar",
+      "reasonRemaining_other": "Añade {{count}} caracteres más para enviar",
       "reasonCount": "{{count}}/500",
-      "submit": "Enviar reporte",
+      "submit": "Enviar",
       "submitError": "No se pudo enviar tu reporte",
       "toast": {
-        "reported": "Reportado. {{current}} de {{required}} votos para ocultarlo",
+        "reported": "Reportado. {{current}} de {{required}} votos para ocultarlo para todo el mundo",
         "reportedGrade": "Cambio de grado propuesto. Ahora vota el grupo",
-        "alreadyReported": "Ya habías reportado este bloque"
+        "alreadyReported": "Ya habías reportado este bloque",
+        "gradeChanged": "Grado cambiado"
       }
     },
     "hidden": {
-      "short": "oculto",
       "chip": "Oculto",
       "banner": "Oculto por la comunidad"
     },
@@ -659,19 +703,20 @@
       "chip_other": "Faltan {{count}} presas",
       "chipAria_one": "{{count}} presa ya no está en el muro",
       "chipAria_other": "{{count}} presas ya no están en el muro",
-      "banner_one": "Falta {{count}} presa de este bloque",
-      "banner_other": "Faltan {{count}} presas de este bloque",
-      "bannerBody": "Remézclalo con lo que hay ahora en el muro.",
-      "remix": "Remezclar"
+      "banner": "A este bloque le falta una presa. Remézclalo con las presas que hay ahora en el muro.",
+      "remix": "Remezclar",
+      "editorHint_one": "Quita la presa gris para guardar",
+      "editorHint_other": "Quita las presas grises para guardar"
     },
     "climbActions": {
-      "preview": "Vista previa",
       "playNext": "Poner a continuación",
-      "copyLink": "Copiar enlace",
-      "linkCopied": "Enlace copiado",
+      "playNextActiveHint": "Este bloque ya está activo. Busca otro bloque para ponerlo a continuación.",
+      "playLast": "Poner al final",
+      "replayFromHere": "Repetir desde aquí",
       "nameCopied": "Nombre copiado",
       "copyNameError": "No se pudo copiar el nombre",
       "copyNameHint": "Mantén pulsado para copiar el nombre",
+      "copyName": "Copiar nombre",
       "tick": "Registrar un encadene",
       "addBetaVideo": "Añadir vídeo de beta",
       "openInApp": "Abrir en la app Aurora",
@@ -679,8 +724,23 @@
       "edit": "Editar vía",
       "editEntry": "Editar registro",
       "report": "Reportar bloque",
-      "closeOverlay": "Cerrar acciones de la vía",
-      "openQueue": "Abrir la cola"
+      "changeGrade": "Cambiar grado",
+      "openQueue": "Abrir la cola",
+      "deleteClimb": {
+        "row": "Eliminar bloque",
+        "title": "¿Eliminar este bloque?",
+        "message": "Desaparece del Spraywall para todos, con sus comentarios. No se puede deshacer.",
+        "confirm": "Eliminar",
+        "cancel": "Conservarlo",
+        "success": "Bloque eliminado.",
+        "hasTicks": "Alguien ya registró este bloque, así que se queda en el plafón.",
+        "pendingTick": "Tienes una ascensión de este bloque esperando a sincronizarse, así que se queda.",
+        "notFound": "Este bloque ya no existe.",
+        "notAllowed": "Solo se pueden eliminar bloques de un Spraywall.",
+        "archived": "Este Spraywall está archivado, así que sus bloques se quedan como están.",
+        "offline": "Estás sin conexión. Para eliminar un bloque necesitas conexión.",
+        "error": "No se pudo eliminar el bloque. Inténtalo de nuevo."
+      }
     },
     "create": {
       "brush": {
@@ -722,6 +782,7 @@
       "settings": {
         "draftLabel": "Guardar como borrador",
         "draftDescription": "Los borradores quedan privados hasta que los publiques.",
+        "draftDescriptionApps": "Los borradores quedan sin listar hasta que los publiques. Las apps conectadas por quien registre uno pueden verlo igualmente.",
         "noMatchLabel": "Sin igualar",
         "noMatchDescription": "No se pueden igualar las manos en la misma presa",
         "noKickboardLabel": "Sin repisa inferior",
@@ -729,7 +790,9 @@
         "campusLabel": "Campus (sin pies)",
         "campusDescription": "Solo manos, sin apoyar los pies",
         "anyFeetLabel": "Pies libres",
-        "anyFeetDescription": "Los pies pueden usar cualquier presa, no solo las marcadas"
+        "anyFeetDescription": "Los pies pueden usar cualquier presa, no solo las marcadas",
+        "wallDraftDescription": "Quienes tengan acceso a este Spraywall pueden escalar tus borradores guardados.",
+        "wallDraftDescriptionApps": "Quienes tengan acceso a este Spraywall pueden escalar tus borradores guardados. Las apps conectadas por quien registre uno también pueden verlo."
       },
       "drafts": {
         "holds_one": "{{count}} presa",
@@ -747,7 +810,8 @@
         "ariaLabel": "Crear una vía"
       },
       "header": {
-        "newClimb": "Nueva vía"
+        "newClimb": "Nueva vía",
+        "nameRequired": "Ponle nombre para guardar"
       },
       "save": {
         "idle": "Guardar",
@@ -755,15 +819,20 @@
         "saving": "Guardando…",
         "done": "Guardado",
         "draftToast": "Borrador guardado",
-        "publishedToast": "Vía publicada"
+        "publishedToast": "Vía publicada",
+        "needsHold": "Añade una presa para guardar",
+        "beforeLogging": "Guarda este bloque antes de registrarlo."
       },
       "autosave": {
         "onDevice": "Borrador guardado en este teléfono",
         "inAccount": "Borrador guardado en tu cuenta",
+        "onDevicePublish": "Guardado en este teléfono",
+        "inAccountPublish": "Guardado en tu cuenta",
         "unsyncedEdits": "Los últimos cambios están solo en este teléfono",
         "notStored": "Inicia sesión para guardar este borrador",
         "saveFailed": "No se pudo guardar en tu cuenta. Toca Guardar para reintentar.",
-        "keptToast": "Borrador guardado en este teléfono. Vuelve a abrir el editor para terminarla."
+        "keptToast": "Borrador guardado en este teléfono. Vuelve a abrir el editor para terminarla.",
+        "waitingToSync": "Guardado en este dispositivo · Pendiente de sincronizar"
       },
       "newClimb": {
         "confirm": {
@@ -773,8 +842,7 @@
         }
       },
       "publish": {
-        "blocked": "Añade una presa de salida y una de final para publicar",
-        "gradeBlocked": "Elige tu grado para publicar"
+        "blocked": "Añade una presa de salida y una de final para publicar"
       },
       "wallSizeMismatch": "Cambia tu plafón activo a este tamaño de Woods para iluminarlo.",
       "routeMenu": {
@@ -783,10 +851,14 @@
         "makeBoulder": "Convertir en bloque",
         "makeBoulderBlocked": "Convertir en bloque — elimina primero los fotogramas"
       },
-      "grade": {
-        "label": "Tu grado",
-        "required": "Necesario para publicar",
-        "optional": "Opcional en un borrador"
+      "holds": {
+        "add": "Añadir presas",
+        "hint": "¿Falta una presa? Añádela y vuelve a este bloque.",
+        "opening": "Abriendo el editor de presas…",
+        "openFailed": "No se pudo guardar tu bloque en este dispositivo. Vuelve a intentarlo antes de añadir presas.",
+        "missing_one": "{{count}} presa seleccionada ya no está en este Spraywall. Tu bloque se conserva.",
+        "missing_other": "{{count}} presas seleccionadas ya no están en este Spraywall. Tu bloque se conserva.",
+        "removeMissing": "Quitar las presas que faltan"
       }
     },
     "holdFilter": {
@@ -863,7 +935,6 @@
         "grade": "Las presas moradas salen en bloques más difíciles; las amarillas, en más fáciles"
       },
       "wholeBoard": "Todo el plafón",
-      "holdPicksSkipped": "{{summary}} · selección de presas omitida sin conexión",
       "wholeBoardHint": "Cuenta todos los bloques del plafón",
       "useFiltersHint": "Cuenta solo los bloques que cumplen tus filtros",
       "filterUnsupported": "El mapa de calor no puede seguir estos filtros sin conexión. Toca el chip para ver todo el plafón.",
@@ -873,6 +944,26 @@
       "downloadLine": "Descarga {{name}} para ver qué presas se usan",
       "download": "Descargar",
       "unavailable": "El mapa de calor no está disponible ahora mismo."
+    },
+    "project": {
+      "chip": "Proyecto"
+    },
+    "boardAccessibility": {
+      "summary": "Plafón: {{starting}} presas de inicio, {{hand}} de mano, {{finish}} de final, {{foot}} de pie.",
+      "adjustHint": "Desliza arriba o abajo para cambiar de bloque.",
+      "next": "Siguiente bloque",
+      "previous": "Bloque anterior",
+      "hold": "Presa {{id}}, {{role}}",
+      "unlit": "apagada",
+      "paintHint": "Toca para pintar con el pincel seleccionado. Las acciones permiten elegir un tipo.",
+      "chooseRole": "Elegir tipo de presa",
+      "showList": "Elegir presas de una lista",
+      "showBoard": "Volver al plafón"
+    },
+    "activeHolds": {
+      "title": "Presas activas",
+      "a11yGroup": "{{role}}: {{holds}}",
+      "empty": "Este bloque no ilumina ninguna presa."
     }
   },
   "frontDoor": {
@@ -882,74 +973,169 @@
       "board": "{{boardName}}",
       "list": "Bloques a {{angle}}°"
     },
+    "hero": {
+      "gradeForSearch": ", {{grade}}",
+      "unnamedClimb": "Bloque de {{board}} sin nombre",
+      "qualityAria": "Valoración de {{quality}} sobre 5",
+      "setBy": "creado por {{setter}}",
+      "boardAtAngle": "{{board}} a {{angle}}°"
+    },
     "boardImageAlt": "{{climbName}} iluminado en el plafón {{boardName}} {{layoutName}} a {{angle}}°",
+    "legend": {
+      "aria": "Presas de este bloque",
+      "start_one": "{{formattedCount}} de inicio",
+      "start_other": "{{formattedCount}} de inicio",
+      "hand_one": "{{formattedCount}} de mano",
+      "hand_other": "{{formattedCount}} de mano",
+      "finish_one": "{{formattedCount}} final",
+      "finish_other": "{{formattedCount}} finales",
+      "foot_one": "{{formattedCount}} de pie",
+      "foot_other": "{{formattedCount}} de pie"
+    },
     "setterLink": "Más bloques de {{setter}}",
     "facts": {
-      "grade": "Grado",
       "setter": "Setter",
-      "ascents": "Encadenes",
-      "quality": "Calidad",
-      "angle": "Ángulo",
       "board": "Plafón",
-      "firstAscent": "Primer encadene",
+      "firstAscent": "Primer encadene a {{angle}}°",
       "firstAscentUnknown": "Sin registrar",
       "unknown": "Desconocido",
       "angleValue": "{{angle}}°",
-      "qualityValue": "{{quality}} de 5",
-      "firstAscentValue": "{{setter}}, {{date}}"
+      "firstAscentValue": "{{setter}}, {{date}}",
+      "qualityAtAngle": "Calidad a {{angle}}°"
     },
     "setterNotes": {
       "heading": "Notas del setter"
     },
+    "about": {
+      "heading": "Sobre este bloque",
+      "intro": "{{climbName}} es un {{grade}} en el {{board}} a {{angle}}°.",
+      "introWithSetter": "{{climbName}} es un {{grade}} en el {{board}} a {{angle}}°, creado por {{setter}}.",
+      "introUngraded": "{{climbName}} es un bloque en el {{board}} a {{angle}}°.",
+      "introUngradedWithSetter": "{{climbName}} es un bloque en el {{board}} a {{angle}}°, creado por {{setter}}.",
+      "firstAscent": "{{climber}} hizo el primer encadene a {{angle}}° el {{date}}.",
+      "gradeRange": "Se escala como {{easiest}} a {{easiestAngle}}° y como {{hardest}} a {{hardestAngle}}°.",
+      "sendsHere_one": "{{formattedCount}} encadene registrado en este ángulo.",
+      "sendsHere_other": "{{formattedCount}} encadenes registrados en este ángulo."
+    },
     "angles": {
-      "heading": "El mismo bloque en otros ángulos",
-      "link": "{{angle}}° · {{grade}}",
-      "current": "{{angle}}° · {{grade}} — estás aquí"
+      "heading": "Grados en cada ángulo",
+      "colAngle": "Ángulo",
+      "colGrade": "Grado",
+      "colSends": "Encadenes",
+      "colQuality": "Calidad",
+      "thisPage": "esta página",
+      "linkName": "{{climbName}} a {{angle}}°",
+      "notRated": "Sin valorar",
+      "total_one": "{{formattedCount}} encadene registrado en {{angleCount}} ángulos",
+      "total_other": "{{formattedCount}} encadenes registrados en {{angleCount}} ángulos"
     },
     "beta": {
       "heading": "Vídeos de beta",
       "empty": "Todavía nadie ha grabado beta.",
-      "unavailable": "La beta no cargó esta vez. Recarga la página para volver a intentarlo."
+      "unavailable": "La beta no cargó esta vez. Recarga la página para volver a intentarlo.",
+      "headingCount_one": "Beta · {{count}} vídeo",
+      "headingCount_other": "Beta · {{count}} vídeos"
+    },
+    "app": {
+      "heading": "Lo que tienes en la app",
+      "lead": "Gratis en iPhone y Android. Todo funciona en tu plafón esta misma noche.",
+      "beta": {
+        "title": "Beta al momento",
+        "body": "Cuando alguien enlaza un vídeo de beta, aparece en el bloque para todos al momento."
+      },
+      "wall": {
+        "title": "Mira qué hay en el plafón",
+        "body": "Todos en el plafón ven qué bloque está iluminado ahora y cuáles lo estuvieron antes, en directo.",
+        "alt": "Boardsesh mostrando el bloque iluminado en el plafón encima de la lista de bloques"
+      },
+      "boards": {
+        "title": "Todos tus plafones, una app",
+        "body": "Una app para todos tus plafones. Funciona con Kilter, Tension, MoonBoard y más.",
+        "alt": "Boardsesh en un Kilter Board, un Spraywall y un Tension Board"
+      },
+      "logbook": {
+        "title": "Un solo logbook",
+        "body": "Cada encadene de cada plafón, en un solo sitio.",
+        "link": "Trae tu logbook",
+        "alt": "Encadenes y progreso de todos tus plafones en el perfil de Boardsesh"
+      },
+      "workouts": {
+        "title": "Entrenamientos",
+        "body": "4×4 y sesiones de volumen a tu grado, con temporizador incluido.",
+        "alt": "Preparando un entrenamiento de volumen en V2 en Boardsesh"
+      }
     },
     "community": {
-      "heading": "Comunidad"
+      "heading": "Comentarios y votos de grado",
+      "signIn": "Inicia sesión para participar",
+      "show": "Ver comentarios"
     },
     "similar": {
+      "nearbyHeading": "Más bloques de {{layout}} de grado cercano a {{grade}} a {{angle}}°",
+      "nearbyUnavailable": "Estos bloques no cargaron.",
       "heading": "Bloques parecidos a este",
-      "unavailable": "Los bloques parecidos no cargaron. Volviendo a intentarlo…"
+      "unavailable": "Los bloques parecidos no cargaron. Volviendo a intentarlo…",
+      "allAtAngle": "Todos los bloques de {{board}} a {{angle}}°"
     },
     "cta": {
-      "climbThis": "Escala este bloque",
-      "ariaLabel": "Abre {{climbName}} en la app de Boardsesh",
-      "helper": "Abre la app, ilumina las presas y registra el encadene."
+      "getAppHelper": "Ilumina este bloque en tu {{board}} y apunta el encadene.",
+      "openInBrowser": "Ábrelo en el navegador",
+      "openInBrowserMobile": "O ábrelo en el navegador"
+    },
+    "qr": {
+      "title": "Escanea para abrir este bloque en tu móvil",
+      "body": "Gratis en iPhone y Android.",
+      "imageLabel": "Código QR que abre {{climbName}} en tu móvil"
+    },
+    "stickyBar": {
+      "free": "Gratis",
+      "cta": "Descarga la app",
+      "dismiss": "Ocultar esta barra",
+      "ctaAriaIos": "Descarga la app en la App Store",
+      "ctaAriaAndroid": "Descarga la app en Google Play"
     }
   },
   "spray": {
     "unknownGrade": "Sin grado",
     "unknownSetter": "un equipador desconocido",
     "heading": "{{climbName}} — {{grade}}",
-    "summary": "En {{wallName}}, un plafón de spray a {{angle}}° con {{holdCount}} presas.",
-    "setterLine": "Equipado por {{setter}}. {{ascents}} ascensiones registradas.",
-    "ascentsLine": "{{ascents}} ascensiones registradas.",
+    "summary": "En {{wallName}}, un Spraywall a {{angle}}° con {{holdCount}} presas.",
+    "setterLine": "Equipado por {{setter}}. {{senders}}",
+    "sendersLine_one": "{{formattedCount}} persona ha registrado un encadene.",
+    "sendersLine_many": "{{formattedCount}} personas han registrado un encadene.",
+    "sendersLine_other": "{{formattedCount}} personas han registrado un encadene.",
     "setterNotesHeading": "Notas del equipador",
     "keepLookingHeading": "Sigue buscando",
     "setterLink": "Más bloques de {{setter}}",
     "gymsLink": "Encuentra un rocódromo con plafones",
     "homeLink": "Inicio de Boardsesh",
-    "photoAlt": "{{climbName}}, {{grade}}, iluminado en el plafón de spray {{wallName}}",
-    "noPhoto": "Este plafón aún no tiene foto que mostrar.",
+    "photoAlt": "{{climbName}}, {{grade}}, iluminado en el Spraywall {{wallName}}",
+    "noPhoto": "Este Spraywall aún no tiene foto que mostrar.",
     "metadata": {
-      "title": "{{climbName}} {{grade}} en {{wallName}} | Plafón de spray",
-      "description": "{{climbName}}, {{grade}}, en el plafón de spray {{wallName}} a {{angle}}°, equipado por {{setter}}. Mira las presas sobre la foto del plafón."
+      "title": "{{climbName}} {{grade}} en {{wallName}} | Spraywall",
+      "description": "{{climbName}}, {{grade}}, en el Spraywall {{wallName}} a {{angle}}°, equipado por {{setter}}. Mira las presas sobre la foto del Spraywall."
     },
     "wall": {
-      "summary": "Un plafón de spray a {{angle}}° con {{holdCount}} presas.",
-      "photoAlt": "El plafón de spray {{wallName}}",
-      "openInApp": "Abre este plafón en la app de Boardsesh para ver sus bloques, equipar los tuyos y registrar tus ascensiones.",
+      "summary": "Un Spraywall a {{angle}}° con {{holdCount}} presas.",
+      "photoAlt": "El Spraywall {{wallName}}",
+      "openInApp": "Abre este Spraywall en la app de Boardsesh para ver sus bloques, equipar los tuyos y registrar tus ascensiones.",
+      "openButton": "Abrir en la app",
+      "haveApp": "¿Ya tienes Boardsesh?",
+      "install": {
+        "helper": "¿Aún no tienes la app? Descárgala y escala en este Spraywall.",
+        "scanAgain": "¿Acabas de instalarla? Vuelve a escanear el código para abrir este Spraywall."
+      },
       "metadata": {
-        "title": "{{wallName}} | Plafón de spray",
-        "description": "{{wallName}}, un plafón de spray a {{angle}}°. Mira el plafón y ábrelo en la app de Boardsesh."
+        "title": "{{wallName}} | Spraywall",
+        "description": "{{wallName}}, un Spraywall a {{angle}}°. Mira el Spraywall y ábrelo en la app de Boardsesh.",
+        "ogTitle": "{{wallName}} · Spraywall",
+        "ogDescription_one": "Un Spraywall a {{angle}}° con {{count}} presa. Mira el Spraywall y prueba lo que hay montado.",
+        "ogDescription_other": "Un Spraywall a {{angle}}° con {{count}} presas. Mira el Spraywall y prueba lo que hay montado."
       }
+    },
+    "install": {
+      "heading": "Consigue la app",
+      "body": "Registra tus encadenes en este Spraywall y equipa tus propios bloques."
     }
   }
 }

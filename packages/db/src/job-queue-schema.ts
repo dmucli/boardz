@@ -1,6 +1,7 @@
 import { PgBoss } from 'pg-boss';
 import {
   SPRAY_DETECTION_QUEUE,
+  SPRAY_DETECTION_COMPLETION_QUEUE,
   SPRAY_DETECTION_DEAD_QUEUE,
   SPRAY_DETECTION_RECONCILE_QUEUE,
   SPRAY_DETECTION_JOB_OPTIONS,
@@ -37,7 +38,7 @@ const POPULAR_BOARD_CONFIGS_REFRESH_QUEUE_OPTIONS = {
 
 /**
  * The backend's hourly `board_climb_popularity` refresh (the popular sort's
- * ranking table, docs/climb-popularity.md). Lives here because the migrator
+ * ranking table, docs/data/climb-popularity.md). Lives here because the migrator
  * creates the queue.
  */
 export const CLIMB_POPULARITY_REFRESH_QUEUE = 'climb-popularity-refresh';
@@ -56,6 +57,120 @@ const CLIMB_POPULARITY_REFRESH_QUEUE_OPTIONS = {
   retryDelay: 300,
 } as const;
 
+/**
+ * The backend's daily `playlist_grade_summaries` refresh (the grade band on
+ * playlist cards and Discover's grade filter, docs/data/playlist-grade-summaries.md).
+ * Lives here because the migrator creates the queue.
+ */
+export const PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE = 'playlist-grade-summary-refresh';
+
+/**
+ * `exclusive`: one job queued or running, so the daily cron and the one-off
+ * backfill a fresh table asks for collapse to one run. The handler stops
+ * starting new 50-playlist chunks after 1,500 s, well under this expiry, so
+ * pg-boss never starts a second copy beside a live one.
+ */
+const PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE_OPTIONS = {
+  policy: 'exclusive',
+  expireInSeconds: 1_800,
+  retryLimit: 2,
+  retryDelay: 300,
+} as const;
+
+/**
+ * The backend's PostHog person erasure (docs/analytics/analytics-consent.md, "Erasure").
+ * Two jobs per deleted account or per withdrawal (15 minutes and 7 days after
+ * it), enqueued in the transaction that records it. Lives here because the
+ * migrator creates the queue.
+ */
+export const POSTHOG_PERSON_DELETION_QUEUE = 'posthog-person-deletion';
+
+/**
+ * Twelve tries with doubling, jittered delays capped at six hours cover a
+ * PostHog outage of about a day: pg-boss waits `retryDelay * 2^n * (1 + rand) / 2`
+ * before retry n, so 60 to 120 s, then 2 to 4 min, ... then 6 h. All twelve
+ * take 26.5 to 32.5 hours.
+ *
+ * A job (the account id, a reason, a pass and the anonymous ids discovered for
+ * it, nothing else) waits up to 14 days past its start time while queued or
+ * between retries (`retentionSeconds`, stated here). Each pass is two jobs: a
+ * discovery and the delete step it queues. The backend registers no worker until it holds the erasure
+ * key, so 14 days is how long a missing key can go unnoticed before jobs are
+ * lost. A job is kept 7 days after it completes or fails (`deleteAfterSeconds`)
+ * so an operator can retry a failed erasure by hand.
+ *
+ * Pinned by posthog-person-deletion-enqueue.test.ts.
+ */
+export const POSTHOG_PERSON_DELETION_QUEUE_OPTIONS = {
+  retryLimit: 12,
+  retryDelay: 60,
+  retryBackoff: true,
+  retryDelayMax: 6 * 60 * 60,
+  expireInSeconds: 120,
+  retentionSeconds: 14 * 24 * 60 * 60,
+  deleteAfterSeconds: 7 * 24 * 60 * 60,
+} as const;
+
+/**
+ * Completed jobs of the once-a-minute crons (the two reconcilers and pg-boss's
+ * own `__pgboss__send-it` dispatcher) are kept 1 day, not pg-boss's 7-day
+ * default. The queue-stats monitor seq-scans this table on every pass.
+ */
+export const CRON_JOB_DELETE_AFTER_SECONDS = 24 * 60 * 60;
+
+/**
+ * The backend's hourly partner OAuth retention sweep (docs/integrations/integration-platform.md,
+ * "Retention sweep"). Lives here because the migrator creates the queue.
+ */
+export const PARTNER_OAUTH_SWEEP_QUEUE = 'partner-oauth-sweep';
+export const PARTNER_CONNECTION_NOTICES_QUEUE = 'partner-connection-notices';
+export const APP_WORKOUT_EXPIRY_QUEUE = 'app-workout-expiry';
+export const SESSION_INACTIVITY_QUEUE = 'session-inactivity';
+export const PARTNER_WEBHOOK_DELIVERY_QUEUE = 'partner-webhook-delivery';
+export const PARTNER_WEBHOOK_MAINTENANCE_QUEUE = 'partner-webhook-maintenance';
+
+const PARTNER_CONNECTION_NOTICES_OPTIONS = {
+  policy: 'exclusive',
+  expireInSeconds: 300,
+  retryLimit: 3,
+  retryDelay: 60,
+  retryBackoff: true,
+} as const;
+
+/**
+ * `exclusive`: one run queued or running across every replica. A run stops
+ * starting batches after 30 s, far under this expiry, so pg-boss never starts a
+ * second copy beside a live one (a second copy would still be safe: the sweep
+ * skips every row another transaction holds). A failed run is retried once; the
+ * next hour's run covers anything it left.
+ */
+const PARTNER_OAUTH_SWEEP_QUEUE_OPTIONS = {
+  policy: 'exclusive',
+  expireInSeconds: 600,
+  retryLimit: 1,
+  retryDelay: 300,
+} as const;
+
+/**
+ * The backend's hourly directory-report sweep (docs/product/directory-reports.md):
+ * the seven-day reminder, the fourteen-day hand-off to the admin queue, and the
+ * admin's daily digest email. Lives here because the migrator creates the queue.
+ */
+export const DIRECTORY_REPORT_SWEEP_QUEUE = 'directory-report-sweep';
+
+/**
+ * `exclusive`: one run queued or running across every replica. A run touches a
+ * few rows and sends at most one email, well under this expiry. A failed run is
+ * retried once; the next hour's run covers anything it left, because every step
+ * reads what is due rather than what changed since the last run.
+ */
+const DIRECTORY_REPORT_SWEEP_QUEUE_OPTIONS = {
+  policy: 'exclusive',
+  expireInSeconds: 600,
+  retryLimit: 1,
+  retryDelay: 300,
+} as const;
+
 type TablePrivilege = 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE';
 
 /** One GRANT on a `public` table, optionally limited to some columns. */
@@ -71,6 +186,23 @@ export type WorkerTableGrant = {
  * appliers touch (`apply-user-logbook.ts`, aurora `user-sync.ts`, kilter
  * `user-sync.ts`, and the stats recompute they both call).
  */
+/**
+ * What the stats recompute reads for the spray climbers'-vote grade (#5971,
+ * `climb-stats/climber-vote-grade.ts`): the approved community grade at the
+ * key and the board's grade scale it is matched against. Every role that runs
+ * the recompute needs it. The recompute only names these tables when a key is
+ * a spray key, so a Kilter or Aurora recompute keeps working on a worker that
+ * starts before the migrator has granted them.
+ */
+const RECOMPUTE_VOTE_GRADE_GRANTS: readonly WorkerTableGrant[] = [
+  {
+    table: 'climb_community_status',
+    privileges: ['SELECT'],
+    columns: ['board_type', 'climb_uuid', 'angle', 'community_grade'],
+  },
+  { table: 'board_difficulty_grades', privileges: ['SELECT'], columns: ['board_type', 'difficulty', 'boulder_name'] },
+];
+
 const PROVIDER_SYNC_WRITE: readonly TablePrivilege[] = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
 const PROVIDER_SYNC_GRANTS: readonly WorkerTableGrant[] = [
   // Status, token and failure bookkeeping on the credential; the link
@@ -103,11 +235,16 @@ const PROVIDER_SYNC_GRANTS: readonly WorkerTableGrant[] = [
   { table: 'playlists', privileges: PROVIDER_SYNC_WRITE },
   { table: 'playlist_climbs', privileges: PROVIDER_SYNC_WRITE },
   { table: 'playlist_ownership', privileges: PROVIDER_SYNC_WRITE },
+  // The circuits the climber deleted in Boardsesh, which both circuit writers
+  // skip (#7240). Read only: the backend records them on delete and clears
+  // them on unlink.
+  { table: 'user_deleted_upstream_playlists', privileges: ['SELECT'] },
   // Written by the boardsesh_ticks and playlist* delete triggers (offline sync tombstones).
   { table: 'sync_deletions', privileges: ['INSERT'] },
   // The stats keys a page or flush still owes a recompute: marked (upsert) in
   // the page transaction, locked, recomputed and deleted in the batch after it.
   { table: 'climb_stats_recompute_pending', privileges: PROVIDER_SYNC_WRITE },
+  ...RECOMPUTE_VOTE_GRADE_GRANTS,
 ];
 
 const CATALOG_WRITE: readonly TablePrivilege[] = ['SELECT', 'INSERT', 'UPDATE'];
@@ -157,6 +294,9 @@ const ROUTINE_PROVIDER_EXTRA_GRANTS: readonly WorkerTableGrant[] = [
   { table: 'user_boards', privileges: CATALOG_WRITE },
   { table: 'location_sync_gym_sources', privileges: CATALOG_WRITE },
   { table: 'kilter_wall_sources', privileges: CATALOG_WRITE },
+  // Read only: Kilter's Verified pass refuses to run until the frozen Aurora
+  // grades exist. Nothing writes to this table after its migration.
+  { table: 'kilter_aurora_benchmarks', privileges: ['SELECT'] },
   // Read only: the physical gym match weighs a candidate by its claims,
   // members, followers and comments before adopting it.
   { table: 'gym_claims', privileges: ['SELECT'] },
@@ -197,9 +337,18 @@ const CLIMB_STATS_SELF_HEAL_GRANTS: readonly WorkerTableGrant[] = [
       'kilter_id',
       'kilter_synced_at',
       'kilter_detached_at',
+      // Unused since the holds-epoch rule was removed (#6023); a worker image
+      // from before that still reads it. Goes when the column is dropped.
+      'climb_revision',
     ],
   },
-  { table: 'board_climbs', privileges: ['SELECT'], columns: ['uuid', 'board_type', 'user_id'] },
+  {
+    table: 'board_climbs',
+    privileges: ['SELECT'],
+    // `holds_revision_number`: unused since the holds-epoch rule was removed
+    // (#6023), kept for a worker image from before that. Goes with the column.
+    columns: ['uuid', 'board_type', 'user_id', 'holds_revision_number'],
+  },
   { table: 'board_climb_stats', privileges: ['SELECT', 'INSERT', 'UPDATE'] },
   // Pending keys a stopped worker left behind: read `FOR UPDATE SKIP LOCKED`
   // (which needs UPDATE), recomputed, deleted. The tick scan's recompute also
@@ -208,6 +357,227 @@ const CLIMB_STATS_SELF_HEAL_GRANTS: readonly WorkerTableGrant[] = [
   // The first ascensionist's crown: COALESCE(display_name, name).
   { table: 'users', privileges: ['SELECT'], columns: ['id', 'name'] },
   { table: 'user_profiles', privileges: ['SELECT'], columns: ['user_id', 'display_name'] },
+  ...RECOMPUTE_VOTE_GRADE_GRANTS,
+];
+
+/** Personal archives: selected climbing and delivery fields, with no credentials or catalogue writes. */
+const USER_DATA_EXPORT_GRANTS: readonly WorkerTableGrant[] = [
+  { table: 'users', privileges: ['SELECT'], columns: ['id', 'name', 'email', 'created_at'] },
+  {
+    table: 'offline_write_deliveries',
+    privileges: ['SELECT'],
+    columns: [
+      'user_id',
+      'delivery_id',
+      'table_name',
+      'operation',
+      'queued_at',
+      'client_state',
+      'server_accepted_at',
+      'server_rejected_at',
+      'reconciled_reported_at',
+    ],
+  },
+  // The shared spray visibility predicate reads only access-control fields.
+  { table: 'spray_walls', privileges: ['SELECT'], columns: ['board_uuid', 'layout_id', 'deleted_at', 'hidden_at'] },
+  {
+    table: 'user_boards',
+    privileges: ['SELECT'],
+    columns: ['uuid', 'owner_id', 'gym_id', 'is_public', 'is_unlisted', 'deleted_at'],
+  },
+  {
+    table: 'resource_privacy',
+    privileges: ['SELECT'],
+    columns: ['kind', 'resource_id', 'audience', 'inherit_followers'],
+  },
+  { table: 'resource_grants', privileges: ['SELECT'], columns: ['kind', 'resource_id', 'user_id', 'status'] },
+  { table: 'user_follows', privileges: ['SELECT'], columns: ['follower_id', 'following_id'] },
+  { table: 'gym_members', privileges: ['SELECT'], columns: ['gym_id', 'user_id'] },
+  {
+    table: 'boardsesh_ticks',
+    privileges: ['SELECT'],
+    columns: [
+      'id',
+      'uuid',
+      'user_id',
+      'board_type',
+      'climb_uuid',
+      'angle',
+      'status',
+      'attempt_count',
+      'quality',
+      'difficulty',
+      'comment',
+      'is_mirror',
+      'is_benchmark',
+      'board_id',
+      'session_id',
+      'origin',
+      'climbed_at',
+      'created_at',
+      'updated_at',
+    ],
+  },
+  {
+    table: 'board_climbs',
+    privileges: ['SELECT'],
+    columns: [
+      'uuid',
+      'board_type',
+      'user_id',
+      'name',
+      'layout_id',
+      'frames',
+      'frames_count',
+      'frames_pace',
+      'angle',
+      'created_at',
+      'updated_at',
+      'is_draft',
+      'is_listed',
+      'description',
+      'characteristics',
+    ],
+  },
+  { table: 'board_climb_aliases', privileges: ['SELECT'], columns: ['board_type', 'alias_uuid', 'canonical_uuid'] },
+  { table: 'board_difficulty_grades', privileges: ['SELECT'], columns: ['board_type', 'difficulty', 'boulder_name'] },
+  {
+    table: 'user_favorites',
+    privileges: ['SELECT'],
+    columns: ['id', 'user_id', 'board_name', 'climb_uuid', 'angle', 'created_at', 'updated_at'],
+  },
+  {
+    table: 'playlists',
+    privileges: ['SELECT'],
+    columns: [
+      'id',
+      'uuid',
+      'board_type',
+      'layout_id',
+      'name',
+      'color',
+      'icon',
+      'description',
+      'is_public',
+      'created_at',
+      'updated_at',
+    ],
+  },
+  { table: 'playlist_ownership', privileges: ['SELECT'], columns: ['playlist_id', 'user_id', 'role'] },
+  {
+    table: 'playlist_climbs',
+    privileges: ['SELECT'],
+    columns: ['id', 'playlist_id', 'climb_uuid', 'angle', 'position', 'added_at', 'updated_at'],
+  },
+];
+
+/**
+ * What `spray-wall-art` reads and writes: one version's photo key, frame and
+ * pins, the wall's canonical frame, the holds alive at that version, and the
+ * version's `art` column, which is the only thing it writes. No owner,
+ * visibility or public-copy column: the job renders what the backend queued
+ * and decides nothing about who may see it.
+ */
+/**
+ * What `reclaim-logbook-snapshots` reads and writes: a snapshot's identity and
+ * expiry, claimed `FOR UPDATE SKIP LOCKED` (which needs an UPDATE grant), and
+ * the rows it deletes. Column grants keep tick/session chunk payloads and a snapshot's
+ * binding out of reach; the job never needs them.
+ */
+const LOGBOOK_SNAPSHOT_RECLAIM_GRANTS: readonly WorkerTableGrant[] = [
+  { table: 'logbook_snapshots', privileges: ['SELECT'], columns: ['id', 'expires_at'] },
+  { table: 'logbook_snapshots', privileges: ['UPDATE'], columns: ['expires_at'] },
+  { table: 'logbook_snapshots', privileges: ['DELETE'] },
+  { table: 'logbook_snapshot_chunks', privileges: ['SELECT'], columns: ['snapshot_id', 'chunk_index'] },
+  { table: 'logbook_snapshot_chunks', privileges: ['DELETE'] },
+  { table: 'logbook_snapshot_session_chunks', privileges: ['SELECT'], columns: ['snapshot_id', 'chunk_index'] },
+  { table: 'logbook_snapshot_session_chunks', privileges: ['DELETE'] },
+];
+
+/**
+ * What `prune-logbook-changes` reads and writes: a change row's position and
+ * age, claimed `FOR UPDATE SKIP LOCKED` (which needs UPDATE on one column), the
+ * rows it deletes, and the retention watermark. Never whose logbook a row
+ * belongs to (`user_id`), which tick/session it names, its removal flag, or the feed generation.
+ */
+const LOGBOOK_CHANGE_PRUNE_GRANTS: readonly WorkerTableGrant[] = [
+  { table: 'logbook_changes', privileges: ['SELECT'], columns: ['seq', 'txid', 'created_at'] },
+  { table: 'logbook_changes', privileges: ['UPDATE'], columns: ['created_at'] },
+  { table: 'logbook_changes', privileges: ['DELETE'] },
+  { table: 'logbook_session_changes', privileges: ['SELECT'], columns: ['seq', 'txid', 'created_at'] },
+  { table: 'logbook_session_changes', privileges: ['UPDATE'], columns: ['created_at'] },
+  { table: 'logbook_session_changes', privileges: ['DELETE'] },
+  {
+    table: 'logbook_change_watermark',
+    privileges: ['SELECT'],
+    columns: ['id', 'pruned_through_txid', 'pruned_through_seq'],
+  },
+  {
+    table: 'logbook_change_watermark',
+    privileges: ['UPDATE'],
+    columns: ['pruned_through_txid', 'pruned_through_seq', 'updated_at'],
+  },
+];
+
+const SPRAY_WALL_ART_GRANTS: readonly WorkerTableGrant[] = [
+  {
+    table: 'spray_walls',
+    privileges: ['SELECT'],
+    columns: ['id', 'board_uuid', 'reference_width', 'reference_height', 'deleted_at'],
+  },
+  {
+    table: 'spray_wall_versions',
+    privileges: ['SELECT'],
+    columns: [
+      'id',
+      'wall_id',
+      'version_number',
+      'status',
+      'photo_key',
+      'photo_width',
+      'photo_height',
+      'anchors',
+      'homography',
+      'art',
+    ],
+  },
+  { table: 'spray_wall_versions', privileges: ['UPDATE'], columns: ['art'] },
+  // `aliveHolds` reads every hold column; geometry, colour and provenance only.
+  { table: 'spray_wall_holds', privileges: ['SELECT'] },
+];
+
+/**
+ * What `community-monthly-stats` reads on top of the rest of the batch list:
+ * the monthly community recap (lighting and sending totals, new accounts, the
+ * top public gyms and the top climbers). Read-only. Each entry adds only the
+ * columns the batch list does not already grant; a column-level GRANT adds to
+ * what the login holds, so a table may appear here and above.
+ */
+const COMMUNITY_MONTHLY_STATS_GRANTS: readonly WorkerTableGrant[] = [
+  // Only Boardsesh's own LED writes count as lighting; imported displays
+  // (`source <> 'boardsesh'`) are history, not activity.
+  { table: 'board_climb_events', privileges: ['SELECT'], columns: ['source'] },
+  // ENUMERABLE_GYM_BOARDS: a gym ranks only on its public, listed boards. The
+  // spray-wall half of the tick privacy rule reads the same flag.
+  { table: 'user_boards', privileges: ['SELECT'], columns: ['is_unlisted'] },
+  // The gym ranking's rows: identity for the join, the public name and slug
+  // the dashboard links, and the two flags that keep a private or deleted gym
+  // out. No owner, contact, address or coordinates.
+  { table: 'gyms', privileges: ['SELECT'], columns: ['id', 'name', 'slug', 'is_public', 'is_listed', 'deleted_at'] },
+  // The tick privacy rule finds a tick's own audience in content_privacy by
+  // the tick's uuid. Still no comments, sessions or media.
+  { table: 'boardsesh_ticks', privileges: ['SELECT'], columns: ['uuid'] },
+  // New accounts per month. Never the account name, email or image: a ranked
+  // climber is named by their display name only.
+  { table: 'users', privileges: ['SELECT'], columns: ['created_at'] },
+  // A ranked climber's chosen name, and their opt-out from being named on
+  // boards they don't own. Never avatar or social links.
+  { table: 'user_profiles', privileges: ['SELECT'], columns: ['display_name', 'anonymous_on_foreign_boards'] },
+  // The spray-wall half of the tick privacy rule, for a signed-out reader:
+  // whether a wall is public, unlisted or neither. With no viewer the rule
+  // names no follow, grant or membership table (sprayResourceVisibility), so
+  // none of those is granted.
+  { table: 'resource_privacy', privileges: ['SELECT'], columns: ['kind', 'resource_id', 'audience'] },
 ];
 
 /**
@@ -219,19 +589,69 @@ const CLIMB_STATS_SELF_HEAL_GRANTS: readonly WorkerTableGrant[] = [
  * ship later add their lists in the PR that ships them.
  */
 export const WORKER_ROLE_DATA_GRANTS: Record<BackgroundWorkerRole, readonly WorkerTableGrant[]> = {
+  'cnc-interactive': [
+    { table: 'cnc_computations', privileges: ['SELECT'] },
+    { table: 'cnc_computations', privileges: ['UPDATE'], columns: ['status', 'result', 'error_code'] },
+  ],
+  'cnc-generation': [
+    { table: 'cnc_orders', privileges: ['SELECT'] },
+    {
+      table: 'cnc_orders',
+      privileges: ['UPDATE'],
+      columns: [
+        'status',
+        'attempts',
+        'claim_token',
+        'worker_id',
+        'claimed_at',
+        'heartbeat_at',
+        'last_error',
+        'updated_at',
+        'generated_at',
+        'zip_key',
+        'zip_size_bytes',
+        'zip_sha256',
+        'fingerprint_manifest',
+        'preview_zip_key',
+        'preview_zip_size_bytes',
+        'preview_generated_at',
+        'preview_keys',
+        'previews_generated',
+      ],
+    },
+    { table: 'cnc_art_assets', privileges: ['SELECT'] },
+  ],
   // aurora-user-sync, kilter-user-sync.
   'interactive-import': PROVIDER_SYNC_GRANTS,
   // provider-routine-cycle (a user sync), aurora-shared-sync,
   // kilter-catalog-sync, moonboard-locations-sync.
   'routine-provider': [...PROVIDER_SYNC_GRANTS, ...ROUTINE_PROVIDER_EXTRA_GRANTS],
-  // climb-stats-self-heal.
-  'maintenance-delivery': CLIMB_STATS_SELF_HEAL_GRANTS,
+  // climb-stats-self-heal, user-data-export, spray-wall-art, reclaim-logbook-snapshots,
+  // prune-logbook-changes.
+  'maintenance-delivery': [
+    ...CLIMB_STATS_SELF_HEAL_GRANTS,
+    ...USER_DATA_EXPORT_GRANTS,
+    ...SPRAY_WALL_ART_GRANTS,
+    ...LOGBOOK_SNAPSHOT_RECLAIM_GRANTS,
+    ...LOGBOOK_CHANGE_PRUNE_GRANTS,
+  ],
   // refresh-recommendations, refresh-hold-features, refresh-climb-grades,
-  // refresh-climb-neighbors, export-board-snapshots.
+  // refresh-climb-neighbors, export-board-snapshots, spray-wall-health,
+  // community-monthly-stats.
   batch: [
+    // Public recommendation cohorts must apply current account/item privacy.
+    // No private profile text or follower identities are read by this job.
+    { table: 'user_profiles', privileges: ['SELECT'], columns: ['user_id', 'is_private', 'privacy_revision'] },
+    {
+      table: 'content_privacy',
+      privileges: ['SELECT'],
+      columns: ['entity_type', 'entity_id', 'owner_id', 'audience', 'public_consent_revision'],
+    },
     // Catalog and history the jobs scan.
     { table: 'board_climbs', privileges: ['SELECT'] },
     { table: 'board_climb_stats', privileges: ['SELECT'] },
+    // Plays refresh owns only this server-side count; never grades or sync cursors.
+    { table: 'board_climb_stats', privileges: ['UPDATE'], columns: ['play_count'] },
     { table: 'board_climb_holds', privileges: ['SELECT'] },
     { table: 'board_placements', privileges: ['SELECT'] },
     { table: 'board_holes', privileges: ['SELECT'] },
@@ -258,13 +678,44 @@ export const WORKER_ROLE_DATA_GRANTS: Record<BackgroundWorkerRole, readonly Work
         'climbed_at',
       ],
     },
-    { table: 'user_boards', privileges: ['SELECT'], columns: ['id', 'gym_id'] },
+    // Which gym a tick's board belongs to, plus the columns the weekly
+    // spray-wall health roll-up folds its roster from (#6062): identity for
+    // the join, ownership for the second-climber split, visibility flags for
+    // the stock counts. Never names, locations, settings or coordinates.
+    {
+      table: 'user_boards',
+      privileges: ['SELECT'],
+      columns: ['id', 'gym_id', 'uuid', 'owner_id', 'board_type', 'is_public', 'created_at', 'deleted_at', 'slug'],
+    },
+    // The spray-wall fleet the health roll-up counts: the wall roster (join
+    // key, layout for climbs, hold stock, deletion/hide state), the reset
+    // history, and the report queue. No photos, no versions' payloads.
+    {
+      table: 'spray_walls',
+      privileges: ['SELECT'],
+      columns: ['id', 'board_uuid', 'layout_id', 'hold_count', 'deleted_at', 'hidden_at'],
+    },
+    { table: 'spray_wall_versions', privileges: ['SELECT'], columns: ['wall_id', 'status', 'published_at'] },
+    { table: 'spray_wall_reports', privileges: ['SELECT'], columns: ['wall_id', 'created_at'] },
+    // "Lit" for a wall with no LEDs (board_climb_events): the weekly roll-up's
+    // lighting side. Only the board/climb/user columns the aggregates group
+    // by, and the confirmation time the window filters on.
+    {
+      table: 'board_climb_events',
+      privileges: ['SELECT'],
+      columns: ['board_id', 'board_type', 'climb_uuid', 'user_id', 'confirmed_at', 'angle', 'seq', 'source'],
+    },
     // The recommendations job's writes.
     { table: 'board_setter_stats', privileges: ['SELECT', 'INSERT', 'UPDATE'] },
     { table: 'board_climb_send_stats', privileges: ['SELECT', 'INSERT', 'DELETE'] },
     { table: 'playlists', privileges: ['SELECT', 'INSERT', 'UPDATE'] },
     { table: 'playlist_ownership', privileges: ['SELECT', 'INSERT'] },
     { table: 'playlist_climbs', privileges: ['SELECT', 'INSERT', 'DELETE'] },
+    // The generated playlists' grade bands, recomputed when the job swaps their
+    // climbs (refreshPlaylistGradeSummariesFor: upsert, delete). Granted with
+    // the table's own migration, so a worker image that ships the recompute
+    // can't start ahead of the grant (docs/backend/background-workers.md).
+    { table: 'playlist_grade_summaries', privileges: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] },
     // Written by the playlist_climbs delete trigger (offline sync tombstones).
     { table: 'sync_deletions', privileges: ['INSERT'] },
     { table: 'board_climb_stats_history', privileges: ['SELECT', 'INSERT'] },
@@ -291,7 +742,7 @@ export const WORKER_ROLE_DATA_GRANTS: Record<BackgroundWorkerRole, readonly Work
     // catalogue artifact reads every CATALOG_SNAPSHOT_TABLES entry. Its deletion
     // replay observer also needs pg_read_all_stats, a predefined role this
     // migrator cannot grant: the admin grants it when provisioning the login
-    // (docs/background-workers.md).
+    // (docs/backend/background-workers.md).
     { table: 'board_products', privileges: ['SELECT'] },
     { table: 'board_layouts', privileges: ['SELECT'] },
     { table: 'board_product_sizes', privileges: ['SELECT'] },
@@ -300,9 +751,9 @@ export const WORKER_ROLE_DATA_GRANTS: Record<BackgroundWorkerRole, readonly Work
     { table: 'board_kits', privileges: ['SELECT'] },
     { table: 'board_difficulty_grades', privileges: ['SELECT'] },
     { table: 'board_attempts', privileges: ['SELECT'] },
-    // Every column except the three the catalogue drops
-    // (CATALOG_SNAPSHOT_EXCLUDED_COLUMNS: who attached a link, and to which tick
-    // and wall). The catalogue lists columns through information_schema.columns,
+    // Origin columns let the exporter exclude user-attached links from the
+    // immutable public catalogue. CATALOG_SNAPSHOT_EXCLUDED_COLUMNS also drops
+    // those columns from the output. The catalogue lists columns through information_schema.columns,
     // which shows only granted ones, so a new column must be added here or the
     // export silently leaves it out; job-queue-roles-snapshots.test.ts compares the
     // restricted column lists with the owner's.
@@ -320,8 +771,12 @@ export const WORKER_ROLE_DATA_GRANTS: Record<BackgroundWorkerRole, readonly Work
         'created_at',
         'shortcode',
         'video_identity',
+        'created_by_user_id',
+        'tick_uuid',
+        'board_id',
       ],
     },
+    ...COMMUNITY_MONTHLY_STATS_GRANTS,
   ],
 };
 
@@ -466,6 +921,41 @@ export async function initializeJobQueueSchema(
     // pg-boss 12.33's scheduler creates this queue at runtime. Pre-create it
     // under the owner so scheduler startup needs DML, never schema CREATE.
     await boss.createQueue('__pgboss__send-it', { partition: false });
+    await boss.updateQueue('__pgboss__send-it', { deleteAfterSeconds: CRON_JOB_DELETE_AFTER_SECONDS });
+    await boss.createQueue(SPRAY_DETECTION_COMPLETION_QUEUE, {
+      partition: false,
+      retryLimit: 10,
+      retryDelay: 30,
+      retryBackoff: true,
+    });
+    await boss.createQueue('feedback-github-comment', {
+      partition: false,
+      retryLimit: 20,
+      retryDelay: 60,
+      retryBackoff: true,
+      retryDelayMax: 300,
+    });
+    await boss.createQueue('feedback-github-issue', {
+      partition: false,
+      retryLimit: 20,
+      retryDelay: 60,
+      retryBackoff: true,
+      retryDelayMax: 300,
+    });
+    await boss.createQueue('feedback-github-inbound', {
+      partition: false,
+      retryLimit: 20,
+      retryDelay: 60,
+      retryBackoff: true,
+      retryDelayMax: 300,
+    });
+    await boss.createQueue('notification-push-delivery', {
+      partition: false,
+      retryLimit: 20,
+      retryDelay: 60,
+      retryBackoff: true,
+      retryDelayMax: 300,
+    });
     await boss.createQueue(SPRAY_DETECTION_DEAD_QUEUE, { partition: false });
     await boss.createQueue(SPRAY_DETECTION_QUEUE, { partition: false, ...SPRAY_DETECTION_JOB_OPTIONS });
     await boss.updateQueue(SPRAY_DETECTION_QUEUE, SPRAY_DETECTION_JOB_OPTIONS);
@@ -473,6 +963,12 @@ export async function initializeJobQueueSchema(
       partition: false,
       policy: 'singleton',
       expireInSeconds: 120,
+      deleteAfterSeconds: CRON_JOB_DELETE_AFTER_SECONDS,
+    });
+    // createQueue leaves an existing queue's options alone, so update the
+    // retention when the owner initializes an already-installed queue too.
+    await boss.updateQueue(SPRAY_DETECTION_RECONCILE_QUEUE, {
+      deleteAfterSeconds: CRON_JOB_DELETE_AFTER_SECONDS,
     });
     await boss.createQueue(POPULAR_BOARD_CONFIGS_REFRESH_QUEUE, {
       partition: false,
@@ -486,6 +982,55 @@ export async function initializeJobQueueSchema(
     });
     const { policy: _climbPopularityPolicy, ...mutableClimbPopularityOptions } = CLIMB_POPULARITY_REFRESH_QUEUE_OPTIONS;
     await boss.updateQueue(CLIMB_POPULARITY_REFRESH_QUEUE, mutableClimbPopularityOptions);
+    await boss.createQueue(PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE, {
+      partition: false,
+      ...PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE_OPTIONS,
+    });
+    const { policy: _playlistGradePolicy, ...mutablePlaylistGradeOptions } =
+      PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE_OPTIONS;
+    await boss.updateQueue(PLAYLIST_GRADE_SUMMARY_REFRESH_QUEUE, mutablePlaylistGradeOptions);
+    await boss.createQueue(POSTHOG_PERSON_DELETION_QUEUE, {
+      partition: false,
+      ...POSTHOG_PERSON_DELETION_QUEUE_OPTIONS,
+    });
+    await boss.updateQueue(POSTHOG_PERSON_DELETION_QUEUE, POSTHOG_PERSON_DELETION_QUEUE_OPTIONS);
+    await boss.createQueue(PARTNER_OAUTH_SWEEP_QUEUE, {
+      partition: false,
+      ...PARTNER_OAUTH_SWEEP_QUEUE_OPTIONS,
+    });
+    const { policy: _partnerSweepPolicy, ...mutablePartnerSweepOptions } = PARTNER_OAUTH_SWEEP_QUEUE_OPTIONS;
+    await boss.updateQueue(PARTNER_OAUTH_SWEEP_QUEUE, mutablePartnerSweepOptions);
+    await boss.createQueue(DIRECTORY_REPORT_SWEEP_QUEUE, {
+      partition: false,
+      ...DIRECTORY_REPORT_SWEEP_QUEUE_OPTIONS,
+    });
+    const { policy: _directorySweepPolicy, ...mutableDirectorySweepOptions } = DIRECTORY_REPORT_SWEEP_QUEUE_OPTIONS;
+    await boss.updateQueue(DIRECTORY_REPORT_SWEEP_QUEUE, mutableDirectorySweepOptions);
+    await boss.createQueue(PARTNER_CONNECTION_NOTICES_QUEUE, {
+      partition: false,
+      ...PARTNER_CONNECTION_NOTICES_OPTIONS,
+    });
+    const { policy: _connectionNoticePolicy, ...mutableNoticeOptions } = PARTNER_CONNECTION_NOTICES_OPTIONS;
+    await boss.updateQueue(PARTNER_CONNECTION_NOTICES_QUEUE, mutableNoticeOptions);
+    for (const queue of [APP_WORKOUT_EXPIRY_QUEUE, SESSION_INACTIVITY_QUEUE, PARTNER_WEBHOOK_MAINTENANCE_QUEUE]) {
+      await boss.createQueue(queue, {
+        partition: false,
+        policy: 'exclusive',
+        expireInSeconds: 300,
+        retryLimit: 2,
+        retryDelay: 60,
+      });
+      await boss.updateQueue(queue, { expireInSeconds: 300, retryLimit: 2, retryDelay: 60 });
+    }
+    const webhookDeliveryOptions = {
+      retryLimit: 9,
+      retryDelay: 120,
+      retryBackoff: true,
+      retryDelayMax: 32_000,
+      expireInSeconds: 30,
+    };
+    await boss.createQueue(PARTNER_WEBHOOK_DELIVERY_QUEUE, { partition: false, ...webhookDeliveryOptions });
+    await boss.updateQueue(PARTNER_WEBHOOK_DELIVERY_QUEUE, webhookDeliveryOptions);
     // Family queues are stately. A queue created under an earlier policy keeps
     // it (pg-boss cannot change a policy), which is why these are new names
     // rather than the retired `background-probe-<role>` queues.
@@ -502,6 +1047,7 @@ export async function initializeJobQueueSchema(
       ...BACKGROUND_JOB_QUEUE_OPTIONS,
       expireInSeconds: 120,
       policy: 'singleton' as const,
+      deleteAfterSeconds: CRON_JOB_DELETE_AFTER_SECONDS,
     };
     await boss.createQueue(BACKGROUND_JOB_RECONCILE_QUEUE, { partition: false, ...reconcileOptions });
     const { policy: _reconcilePolicy, ...mutableReconcileOptions } = reconcileOptions;

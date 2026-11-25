@@ -11,8 +11,14 @@
  * when they represent a real older wall state that has not been recorded yet.
  */
 
-import type { BoardPresenceClimb } from '@boardsesh/shared-schema';
-import { compareBoardDisplayTimes, mergeBoardHistory } from './history';
+import type { BoardConnectionHolder, BoardPresenceClimb } from '@boardsesh/shared-schema';
+import {
+  compareBoardDisplayTimes,
+  isImportedBoardClimb,
+  isNativeBoardClimb,
+  isSupportedBoardClimb,
+  mergeBoardHistory,
+} from './history';
 import type { BoardPresenceState, BoardPresenceAction } from './types';
 
 /** Newest-first history is capped so a long session can't grow unbounded. */
@@ -24,11 +30,23 @@ export const initialBoardPresenceState: BoardPresenceState = {
   history: [],
   lastSeq: 0,
   lastClearedAt: null,
+  lastClearedClimbUuid: null,
   stats: null,
   lastStatsSeq: 0,
   holder: null,
+  lastConnectionWireSeq: 0,
   lastConnectionSeq: 0,
+  lastHolderChangeSeq: 0,
 };
+
+/**
+ * Whether a catch-up read back the holder presence already had: both free, or
+ * both held by the same account, or both anonymous (which can't be told apart).
+ */
+function isSameHolder(previous: BoardConnectionHolder | null, next: BoardConnectionHolder | null): boolean {
+  if (previous === null || next === null) return previous === next;
+  return (previous.userId ?? null) === (next.userId ?? null);
+}
 
 /** True when an entry with the same `(climbUuid, seq)` is already in history. */
 function historyHasEntry(history: BoardPresenceClimb[], climb: BoardPresenceClimb): boolean {
@@ -74,11 +92,13 @@ function updateWallFromHistory(
   lastClearedAt = state.lastClearedAt,
 ): BoardPresenceState {
   const native =
-    history.find((climb) => climb.source !== 'kilter' && climb.seq === lastSeq) ??
-    (state.currentClimb?.source !== 'kilter' && state.currentClimb?.seq === lastSeq ? state.currentClimb : null);
+    history.find((climb) => isNativeBoardClimb(climb) && climb.seq === lastSeq) ??
+    (state.currentClimb && isNativeBoardClimb(state.currentClimb) && state.currentClimb.seq === lastSeq
+      ? state.currentClimb
+      : null);
   const imported = history.find(
     (climb) =>
-      climb.source === 'kilter' &&
+      isImportedBoardClimb(climb) &&
       Number.isFinite(Date.parse(climb.sentAt)) &&
       (lastClearedAt === null ||
         (Number.isFinite(Date.parse(lastClearedAt)) && compareBoardDisplayTimes(climb.sentAt, lastClearedAt) > 0)),
@@ -103,18 +123,32 @@ function updateWallFromHistory(
   };
 }
 
+/**
+ * The climb a "Turn off all lights" left dark, while nothing has been lit since;
+ * `null` once anything is on the wall again, or when no clear was seen. Keyed on
+ * the climb rather than "the wall is dark" so a peer whose queue moves ahead of
+ * the presence echo isn't told its new climb is dark.
+ */
+export function selectClearedClimbUuid(state: BoardPresenceState): string | null {
+  return state.currentClimb === null ? state.lastClearedClimbUuid : null;
+}
+
 export function boardPresenceReducer(state: BoardPresenceState, action: BoardPresenceAction): BoardPresenceState {
   switch (action.type) {
     case 'MERGE_HISTORY': {
       const history = mergeHistory(state.history, action.payload);
       const lastSeq = action.payload.reduce(
-        (highest, climb) => (climb.source === 'kilter' ? highest : Math.max(highest, climb.seq)),
+        (highest, climb) => (isNativeBoardClimb(climb) ? Math.max(highest, climb.seq) : highest),
         state.lastSeq,
       );
       return updateWallFromHistory(state, history, lastSeq);
     }
     case 'APPLY_CLIMB_SET': {
       const incomingClimb = action.payload;
+      if (!isSupportedBoardClimb(incomingClimb)) return state;
+      if (isImportedBoardClimb(incomingClimb)) {
+        return updateWallFromHistory(state, mergeHistory(state.history, [incomingClimb]), state.lastSeq);
+      }
 
       // A stale native set can fill history, but cannot regress native wall state.
       if (incomingClimb.seq <= state.lastSeq) {
@@ -129,11 +163,16 @@ export function boardPresenceReducer(state: BoardPresenceState, action: BoardPre
       if (action.payload.seq <= state.lastSeq) return state;
       // Import arrival order cannot tell whether Kilter displayed a climb before
       // or after this clear. Keep its timestamp even after a later native set.
-      return updateWallFromHistory(state, state.history, action.payload.seq, action.payload.clearedAt);
+      const cleared = updateWallFromHistory(state, state.history, action.payload.seq, action.payload.clearedAt);
+      // A replayed clear can land before the history backfill, when nothing is
+      // current yet, so the server names the climb; an older server doesn't, and
+      // the climb that was current is the best guess.
+      const lastClearedClimbUuid = action.payload.climbUuid ?? state.currentClimb?.climbUuid ?? null;
+      return cleared.lastClearedClimbUuid === lastClearedClimbUuid ? cleared : { ...cleared, lastClearedClimbUuid };
     }
 
     case 'BACKFILL_HISTORY': {
-      const backfill = action.payload.filter((climb) => climb.source !== 'kilter');
+      const backfill = action.payload.filter((climb) => isNativeBoardClimb(climb));
       if (backfill.length === 0) return state;
       const history = mergeHistory(state.history, backfill);
       const lastSeq = backfill.reduce((highest, climb) => Math.max(highest, climb.seq), state.lastSeq);
@@ -184,13 +223,15 @@ export function boardPresenceReducer(state: BoardPresenceState, action: BoardPre
       // with climb + stats events, so a stale/duplicate push (out-of-order Redis
       // fan-out) is ignored. The highest-seq holder wins; `holder: null` frees
       // the board.
-      if (action.payload.seq <= state.lastConnectionSeq) {
+      if (action.payload.seq <= state.lastConnectionWireSeq) {
         return state;
       }
       return {
         ...state,
         holder: action.payload.holder,
-        lastConnectionSeq: action.payload.seq,
+        lastConnectionWireSeq: action.payload.seq,
+        lastConnectionSeq: Math.max(state.lastConnectionSeq, action.payload.seq),
+        lastHolderChangeSeq: Math.max(state.lastHolderChangeSeq, action.payload.seq),
       };
     }
 
@@ -209,13 +250,22 @@ export function boardPresenceReducer(state: BoardPresenceState, action: BoardPre
     }
 
     case 'REFRESH_CONNECTION': {
-      if (action.payload.upToSeq < state.lastConnectionSeq) {
-        return state;
+      if (action.payload.startedAtSeq < state.lastConnectionWireSeq) {
+        // The holder read is stale, but completed history still advances the
+        // boundary a later local take/drive captures. It is not a holder change.
+        const lastConnectionSeq = Math.max(state.lastConnectionSeq, action.payload.upToSeq);
+        return lastConnectionSeq === state.lastConnectionSeq ? state : { ...state, lastConnectionSeq };
       }
+      // The holder snapshot cannot outrank a live holder event received since
+      // its request started. Public progress still covers the repaired history.
       return {
         ...state,
         holder: action.payload.holder,
-        lastConnectionSeq: action.payload.upToSeq,
+        lastConnectionWireSeq: Math.max(state.lastConnectionWireSeq, action.payload.startedAtSeq),
+        lastConnectionSeq: Math.max(state.lastConnectionSeq, action.payload.upToSeq),
+        lastHolderChangeSeq: isSameHolder(state.holder, action.payload.holder)
+          ? state.lastHolderChangeSeq
+          : Math.max(state.lastHolderChangeSeq, action.payload.upToSeq),
       };
     }
 

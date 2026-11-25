@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi } from 'vitest';
 import { render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -18,7 +31,11 @@ vi.mock('react-native', () => ({
     onPress?: () => void;
     accessibilityLabel?: string;
   }) => createElement('button', { onClick: onPress, 'data-label': accessibilityLabel ?? '' }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, absoluteFill: {} },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    absoluteFill: {},
+  },
 }));
 
 vi.mock('react-native-reanimated', () => ({
@@ -64,7 +81,11 @@ vi.mock('react-native-paper', () => ({
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string) => key,
+    // Resolve the plural suffix the way i18next would, so a case can tell
+    // `added_one` from `added_other` — with a bare passthrough the count would
+    // be invisible and the plural assertions below would pass vacuously.
+    t: (key: string, options?: { count?: number }) =>
+      typeof options?.count === 'number' ? `${key}_${options.count === 1 ? 'one' : 'other'}` : key,
   }),
 }));
 
@@ -73,11 +94,13 @@ vi.mock('../Text', () => ({
 }));
 vi.mock('../../theme/colors', () => ({ brandColors: { primary: '#6D28D9' } }));
 vi.mock('../../theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   borderRadius: { lg: 12 },
   spacing: { 2: 8, 3: 12, 4: 16 },
   shadowColor: '#000',
 }));
 vi.mock('../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     variant: ctrl.variant,
     brandColors: { primary: '#6D28D9' },
@@ -100,7 +123,7 @@ describe('QueueAddedSnackbar', () => {
     expect(snackbar).not.toBeNull();
     expect(snackbar?.getAttribute('data-visible')).toBe('true');
     expect(snackbar?.getAttribute('data-duration')).toBe('4000'); // default duration mapped
-    expect(snackbar?.textContent).toContain('mobile.queueSnackbar.added');
+    expect(snackbar?.textContent).toContain('mobile.queueSnackbar.added_one');
     const action = container.querySelector('[data-action]');
     expect(action?.textContent).toBe('mobile.queueSnackbar.open');
     expect(action?.getAttribute('data-action-label')).toBe('mobile.queueSnackbar.openAria');
@@ -131,7 +154,7 @@ describe('QueueAddedSnackbar', () => {
     const animated = container.querySelector('[data-animated]');
     expect(animated).not.toBeNull();
     expect(animated?.getAttribute('data-role')).toBe('alert');
-    expect(container.textContent).toContain('mobile.queueSnackbar.added');
+    expect(container.textContent).toContain('mobile.queueSnackbar.added_one');
     expect(container.querySelector('[data-paper-snackbar]')).toBeNull();
     // The "Open" Pressable routes to onOpen.
     const openButton = container.querySelector('[data-label="mobile.queueSnackbar.openAria"]') as HTMLElement;
@@ -152,8 +175,8 @@ describe('QueueAddedSnackbar', () => {
     ctrl.variant = 'material';
     const { container } = render(<QueueAddedSnackbar {...base} queueAdded={{ kind: 'playNext' }} />);
     const snackbar = container.querySelector('[data-paper-snackbar]');
-    expect(snackbar?.textContent).toContain('mobile.queueSnackbar.playingNext');
-    expect(snackbar?.textContent).not.toContain('mobile.queueSnackbar.added');
+    expect(snackbar?.textContent).toContain('mobile.queueSnackbar.playingNext_one');
+    expect(snackbar?.textContent).not.toContain('mobile.queueSnackbar.added_one');
     // The Open affordance is unchanged by the copy swap.
     expect(container.querySelector('[data-action]')?.textContent).toBe('mobile.queueSnackbar.open');
   });
@@ -161,23 +184,40 @@ describe('QueueAddedSnackbar', () => {
   it('shows the Play next copy on Liquid Glass when kind is playNext', () => {
     ctrl.variant = 'liquidGlass';
     const { container } = render(<QueueAddedSnackbar {...base} queueAdded={{ kind: 'playNext' }} />);
-    expect(container.textContent).toContain('mobile.queueSnackbar.playingNext');
-    expect(container.textContent).not.toContain('mobile.queueSnackbar.added');
+    expect(container.textContent).toContain('mobile.queueSnackbar.playingNext_one');
+    expect(container.textContent).not.toContain('mobile.queueSnackbar.added_one');
     expect(container.querySelector('[data-label="mobile.queueSnackbar.openAria"]')).not.toBeNull();
   });
 
   it.each(['material', 'liquidGlass'] as const)('defaults to the added copy on %s', (variant) => {
     ctrl.variant = variant;
     const { container } = render(<QueueAddedSnackbar {...base} />);
-    expect(container.textContent).toContain('mobile.queueSnackbar.added');
+    expect(container.textContent).toContain('mobile.queueSnackbar.added_one');
     expect(container.textContent).not.toContain('mobile.queueSnackbar.playingNext');
   });
 
-  // `count` is carried for #4673's plural and must not disturb this feature's copy.
-  it.each(['material', 'liquidGlass'] as const)('ignores an unused count on %s', (variant) => {
+  // A whole playlist's Play next (#6772) says how many climbs are now up next.
+  it.each(['material', 'liquidGlass'] as const)('pluralises the Play next copy on a bulk count on %s', (variant) => {
     ctrl.variant = variant;
     const { container } = render(<QueueAddedSnackbar {...base} queueAdded={{ kind: 'playNext', count: 3 }} />);
-    expect(container.textContent).toContain('mobile.queueSnackbar.playingNext');
+    expect(container.textContent).toContain('mobile.queueSnackbar.playingNext_other');
+    expect(container.textContent).not.toContain('mobile.queueSnackbar.playingNext_one');
+  });
+
+  // A whole playlist's Play last passes a count too.
+  it.each(['material', 'liquidGlass'] as const)('pluralises the added copy on a bulk count on %s', (variant) => {
+    ctrl.variant = variant;
+    const { container } = render(<QueueAddedSnackbar {...base} queueAdded={{ kind: 'added', count: 12 }} />);
+    expect(container.textContent).toContain('mobile.queueSnackbar.added_other');
+    expect(container.textContent).not.toContain('mobile.queueSnackbar.added_one');
+  });
+
+  // A single add passes no count at all; it must keep the exact wording every
+  // add path has always shown, not fall through to a plural.
+  it.each(['material', 'liquidGlass'] as const)('keeps the singular for a count of one on %s', (variant) => {
+    ctrl.variant = variant;
+    const { container } = render(<QueueAddedSnackbar {...base} queueAdded={{ kind: 'added', count: 1 }} />);
+    expect(container.textContent).toContain('mobile.queueSnackbar.added_one');
   });
 
   it('auto-dismisses via timer on the Liquid Glass variant', () => {

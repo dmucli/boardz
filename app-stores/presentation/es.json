@@ -70,5 +70,142 @@
   "crossBoardLogbook": {
     "headline": "Todos tus plafones.\nUn logbook.",
     "description": "Tus encadenes y sesiones de todos tus plafones, juntos."
+  },
+  "storeBoards": {
+    "headline": "Una app para\ntus plafones",
+    "description": "Un logbook para todos tus plafones."
+  },
+  "storeCrew": {
+    "headline": "Tu grupo.\nUna cola.",
+    "description": "Añadid bloques juntos y elegid el siguiente.",
+    "emphasis": "cola."
+  },
+  "storeSpray": {
+    "headline": "Tu Spraywall,\ntambién.",
+    "description": "Crea bloques sobre la foto de tu Spraywall.",
+    "emphasis": "también."
+  },
+  "storeMoreBoards": {
+    "headline": "Más plafones.\nLa misma app.",
+    "description": "También compatible con Touchstone y So iLL.",
+    "emphasis": "app."
+  },
+  "storeIsland": {
+    "headline": "El siguiente bloque,\nen Dynamic Island.",
+    "description": "Cambia de bloque sin abrir la app.",
+    "emphasis": "Dynamic Island."
+  },
+  "cppOtherBoards": {
+    "headline": "Una app para todos tus plafones",
+    "description": "Todos tus logbooks en un solo lugar"
+  },
+  "cppSearch": {
+    "headline": "Encuentra tu\npróximo proyecto",
+    "description": "Filtra por grado y oculta tus encadenes."
+  },
+  "cppLogbook": {
+    "headline": "Cada encadene\ny cada intento",
+    "description": "Agrupado por día, con tu grado máximo."
+  },
+  "cppQueue": {
+    "headline": "Tus amigos eligen\nel siguiente",
+    "description": "Cada uno añade a la cola desde su móvil."
+  },
+  "cppWorkout": {
+    "headline": "Entrena con\nun plan",
+    "description": "Bloques elegidos para tu grado objetivo."
+  },
+  "cppStatus": {
+    "headline": "Mira qué está\niluminado ya",
+    "description": "Muestra cualquier bloque iluminado con Boardsesh."
+  },
+  "cppIsland": {
+    "headline": "Siguiente bloque\ndesde otra app",
+    "description": "Justo en la Dynamic Island."
+  },
+  "cppKiosk": {
+    "headline": "Déjalo junto\nal plafón",
+    "description": "Muestra el bloque iluminado y no se apaga."
+  },
+  "cppKilterGrade": {
+    "headline": "Bloques Kilter\na tu grado",
+    "description": "Elige grado y ángulo, e ilumínalo."
+  },
+  "cppKilterLayouts": {
+    "headline": "Compatible con Kilter",
+    "description": "También podemos importar tu logbook por ti."
+  },
+  "cppKilterLogbookImport": {
+    "headline": "Trae tu logbook\nde Kilter",
+    "description": "Tus encadenes e intentos pasados también."
+  },
+  "cppMoonboardGrade": {
+    "headline": "MoonBoard\na tu grado",
+    "description": "Elige un grado e ilumina tu bloque."
+  },
+  "cppMoonboardLogbook": {
+    "headline": "Cada encadene\ny cada intento",
+    "description": "Trae tu logbook desde un CSV exportado."
+  },
+  "cppMoonboardSets": {
+    "headline": "Compatible con MoonBoard",
+    "description": "También podemos importar tu logbook desde un CSV exportado."
+  },
+  "cppSprayHolds": {
+    "headline": "Presas sugeridas\ndesde una foto",
+    "description": "Tú corriges el resto, sobre la misma foto."
+  },
+  "cppSprayOtherBoards": {
+    "headline": "Otros plafones,\nmismo logbook",
+    "description": "Y tus encadenes de Kilter, Tension, MoonBoard.",
+    "emphasis": "mismo logbook"
+  },
+  "cppSprayProjects": {
+    "headline": "Vuelve a tus\nproyectos",
+    "description": "Bloques trabajados que aún no has encadenado."
+  },
+  "cppSpraySetting": {
+    "headline": "Monta en tu\nmuro de spray",
+    "description": "Toca presas sobre la foto de tu muro.",
+    "emphasis": "muro de spray"
+  },
+  "cppSprayWalls": {
+    "headline": "Compatible con muros de spray",
+    "description": "Monta bloques sobre las fotos de tus propios muros."
+  },
+  "cppSprayWorkout": {
+    "headline": "Entrena con\nun plan",
+    "description": "Cuando tu muro ya tenga bloques con grado."
+  },
+  "cppTensionLayouts": {
+    "headline": "Compatible con Tension",
+    "description": "También podemos importar tu logbook por ti."
+  },
+  "cppTensionLogbookImport": {
+    "headline": "Trae tu logbook\nde Tension",
+    "description": "Tus encadenes pasados, en un solo logbook."
+  },
+  "cppTensionMirrorBoard": {
+    "headline": "Escala en\nTension 2 Mirror",
+    "description": "Compatible con tu plafón simétrico."
+  },
+  "cppTensionQueue": {
+    "headline": "Escala Tension\ncon amigos",
+    "description": "Cada uno añade a la cola desde su móvil.",
+    "emphasis": "amigos"
+  },
+  "cppTensionSearch": {
+    "headline": "Directo a\ntu grado",
+    "description": "Y oculta los que ya encadenaste."
+  },
+  "storeLiveActivity": {
+    "headline": "Siguiente bloque.\nFuera de la app.",
+    "description": "Cambia de bloque sin abrir la app.",
+    "emphasis": "Fuera de la app."
+  },
+  "cppLiveActivity": {
+    "headline": "Siguiente bloque.\nFuera de la app.",
+    "description": "Cambia de bloque sin abrir la app.",
+    "emphasis": "Fuera de la app."
   }
 }

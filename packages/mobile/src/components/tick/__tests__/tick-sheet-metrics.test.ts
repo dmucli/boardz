@@ -15,12 +15,16 @@ import {
   EDIT_TICK_SNAP_POINTS,
   TICK_ACTION_HEIGHT,
   TICK_ACTION_LABEL_HEIGHT,
+  TICK_ACTION_MAX_FONT_SCALE,
   TICK_ANGLE_ROW_HEIGHT,
   TICK_CONTROL_ORIGIN,
+  TICK_DETAILS_ROW_HEIGHT,
   TICK_GUTTER,
   TICK_HEADER_HEIGHT,
   TICK_LABEL_GAP,
   TICK_LABEL_MIN_WIDTH,
+  TICK_MATERIAL_LABEL_GAP,
+  TICK_MATERIAL_LABEL_MIN_WIDTH,
   TICK_RAIL_ROW_HEIGHT,
   TICK_ROW_HEIGHT,
   tickActionHeight,
@@ -35,6 +39,15 @@ describe('tick sheet metrics', () => {
     expect(TICK_CONTROL_ORIGIN).toBe(TICK_GUTTER + TICK_LABEL_MIN_WIDTH + TICK_LABEL_GAP);
   });
 
+  it('keeps the Material label column on the same control seam', () => {
+    expect(TICK_GUTTER + TICK_MATERIAL_LABEL_MIN_WIDTH + TICK_MATERIAL_LABEL_GAP).toBe(TICK_CONTROL_ORIGIN);
+    expect(TICK_CONTROL_ORIGIN).toBe(84);
+  });
+
+  it('holds the details row at the 48dp Material touch target', () => {
+    expect(TICK_DETAILS_ROW_HEIGHT).toBeGreaterThanOrEqual(48);
+  });
+
   it('keeps every row at or above the 44pt touch floor', () => {
     for (const height of [
       TICK_ROW_HEIGHT,
@@ -47,8 +60,9 @@ describe('tick sheet metrics', () => {
     }
   });
 
-  it('sizes the action bar off the app-wide hero action height', () => {
-    expect(TICK_ACTION_HEIGHT).toBe(glassSize.hero);
+  it('sizes the action bar at the standard 48pt control, not the 56pt hero', () => {
+    expect(TICK_ACTION_HEIGHT).toBe(glassSize.standard);
+    expect(TICK_ACTION_HEIGHT).toBe(48);
   });
 
   it('gives both sheets a rest detent below a shared keyboard detent', () => {
@@ -56,7 +70,8 @@ describe('tick sheet metrics', () => {
       expect(snapPoints).toHaveLength(2);
       expect(snapPoints.every((snapPoint) => snapPoint.endsWith('%'))).toBe(true);
       expect(percentToNumber(snapPoints[0])).toBeLessThan(percentToNumber(snapPoints[1]));
-      expect(snapPoints[1]).toBe('92%');
+      expect(snapPoints[0]).toBe('50%');
+      expect(snapPoints[1]).toBe('90%');
     }
   });
 });
@@ -66,19 +81,26 @@ describe('tick sheet metrics', () => {
 // to hold at every text scale: a button that only sometimes carries a height
 // would flip `Host`'s `matchContents` mid-life, and nothing else sizes that axis.
 describe('tickActionHeight', () => {
-  it('is the hero height at the default text size', () => {
+  it('is the standard height at the default text size', () => {
     expect(tickActionHeight(1)).toBe(TICK_ACTION_HEIGHT);
   });
 
-  it('never goes below the hero floor, however small the text', () => {
+  it('never goes below the floor, however small the text', () => {
     expect(tickActionHeight(0.85)).toBe(TICK_ACTION_HEIGHT);
   });
 
   it('grows by the label line alone, not by the whole button', () => {
-    // A native button's padding does not scale, so doubling the text adds one
-    // more line — not another 56pt.
-    expect(tickActionHeight(2)).toBe(TICK_ACTION_HEIGHT + TICK_ACTION_LABEL_HEIGHT);
-    expect(tickActionHeight(3)).toBe(TICK_ACTION_HEIGHT + TICK_ACTION_LABEL_HEIGHT * 2);
+    // A native button's padding does not scale, so 1.2x text adds a fifth of a
+    // line, not a fifth of the button.
+    expect(tickActionHeight(1.2)).toBe(Math.round(TICK_ACTION_HEIGHT + TICK_ACTION_LABEL_HEIGHT * 0.2));
+  });
+
+  it('stops growing at the Dynamic Type cap the buttons are held to', () => {
+    expect(TICK_ACTION_MAX_FONT_SCALE).toBe(1.3);
+    const capped = Math.round(TICK_ACTION_HEIGHT + TICK_ACTION_LABEL_HEIGHT * (TICK_ACTION_MAX_FONT_SCALE - 1));
+    expect(tickActionHeight(1.3)).toBe(capped);
+    expect(tickActionHeight(2)).toBe(capped);
+    expect(tickActionHeight(3)).toBe(capped);
   });
 
   it('is a whole number of points at an awkward scale', () => {

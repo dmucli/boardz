@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../../hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, fireEvent, waitFor } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -20,7 +33,16 @@ const analytics = vi.hoisted(() => ({ track: vi.fn() }));
 type ChildrenProps = { children?: ReactNode };
 vi.mock('react-native', () => ({
   View: ({ children }: ChildrenProps) => createElement('div', {}, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles },
+  Pressable: ({
+    children,
+    onPress,
+    accessibilityLabel,
+  }: ChildrenProps & { onPress?: () => void; accessibilityLabel?: string }) =>
+    createElement('button', { 'data-button': accessibilityLabel, onClick: onPress }, children),
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+  },
   TextInput: ({
     value,
     onChangeText,
@@ -53,8 +75,16 @@ vi.mock('react-i18next', () => ({
 }));
 
 vi.mock('../../../providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
-    systemColors: { secondaryLabel: '#888', fill: '#eee', label: '#000', tertiaryLabel: '#aaa' },
+    systemColors: {
+      secondaryLabel: '#888',
+      fill: '#eee',
+      label: '#000',
+      tertiaryLabel: '#aaa',
+      secondaryBackground: '#fff',
+      accent: '#609',
+    },
     brandColors: { error: '#c00' },
   }),
 }));
@@ -63,7 +93,8 @@ vi.mock('../../../lib/graphql/hooks', () => ({ useUpdateSession: () => updateSes
 vi.mock('../../../lib/session-comment-draft-store', () => draftStore);
 vi.mock('../../../lib/analytics', () => analytics);
 vi.mock('../../../theme/tokens', () => ({
-  spacing: { 1: 4, 2: 8, 3: 12 },
+  opacity: { disabled: 0.5 },
+  spacing: { 1: 4, 2: 8, 3: 12, 4: 16 },
   borderRadius: { lg: 12 },
 }));
 
@@ -114,10 +145,14 @@ describe('SessionRecapCard', () => {
     expect(button(container, 'summary.addRecap')).toBeNull();
   });
 
-  it('shows the add-a-recap button when empty and editable', () => {
+  it('opens the editor through the grouped add-a-recap action', () => {
     const { container } = render(<SessionRecapCard sessionId="s1" notes={null} editable />);
     expect(button(container, 'summary.addRecap')).not.toBeNull();
     expect(textInput(container)).toBeNull();
+    expect(container.querySelector('[data-icon="plus"]')).not.toBeNull();
+    expect(container.querySelector('[data-icon="chevron.right"]')).not.toBeNull();
+    fireEvent.click(button(container, 'summary.addRecap')!);
+    expect(textInput(container)).not.toBeNull();
   });
 
   it('renders nothing when empty and not editable', () => {

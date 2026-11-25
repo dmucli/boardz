@@ -22,6 +22,23 @@ const hook = vi.hoisted(() => ({
 }));
 
 const router = vi.hoisted(() => ({ back: vi.fn() }));
+// The latest actions the screen handed its native header.
+const headerActions = vi.hoisted(() => ({
+  current: null as null | {
+    leading?: { kind: string; onPress: () => void } | null;
+    trailing?: { label: string; onPress: () => void } | null;
+  },
+}));
+// The workout data (#6903) has its own suites; these sessions carry no workout.
+vi.mock('../../../../src/components/session/workout/use-session-workout-view', () => ({
+  useSessionWorkoutView: () => undefined,
+  useSessionWorkoutHeadlines: () => new Map(),
+}));
+vi.mock('../../../../src/hooks/use-header-actions', () => ({
+  useHeaderActions: (actions: typeof headerActions.current) => {
+    headerActions.current = actions;
+  },
+}));
 const routeParams = vi.hoisted(() => ({
   current: { sessionId: 'session-1' } as { sessionId: string; reviewCandidate?: string },
 }));
@@ -69,6 +86,7 @@ vi.mock('../../../../src/lib/store-review', () => ({
 
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (name: string) => name,
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
@@ -95,6 +113,11 @@ vi.mock('../../../../src/components/Text', () => ({
 vi.mock('../../../../src/components/Icon', () => ({ Icon: () => createElement('i', null) }));
 vi.mock('../../../../src/components/Avatar', () => ({ Avatar: () => createElement('div', null) }));
 vi.mock('../../../../src/components/SectionHeader', () => ({ SectionHeader: () => createElement('div', null) }));
+// The workout pieces (#6903) have their own suites; a plain session never draws them.
+vi.mock('../../../../src/components/session/workout/WorkoutSummarySection', () => ({
+  WorkoutSummarySection: () => null,
+}));
+vi.mock('../../../../src/components/session/workout/WorkoutSyncingNote', () => ({ WorkoutSyncingNote: () => null }));
 vi.mock('../../../../src/components/Separator', () => ({ Separator: () => createElement('div', null) }));
 vi.mock('../../../../src/components/Card', () => ({
   Card: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
@@ -151,6 +174,7 @@ function setSummary(partial: Partial<SummaryResult>) {
 describe('SessionSummaryScreen settled error/empty state', () => {
   beforeEach(() => {
     router.back.mockClear();
+    headerActions.current = null;
     routeParams.current = { sessionId: 'session-1' };
     storeReview.maybeRequestSessionStoreReview.mockReset();
     storeReview.maybeRequestSessionStoreReview.mockResolvedValue(false);
@@ -161,20 +185,22 @@ describe('SessionSummaryScreen settled error/empty state', () => {
     vi.useRealTimers();
   });
 
-  it('shows a spinner while the summary is still loading', () => {
+  it('shows a spinner while the summary is still loading, with the close already in the header', () => {
     setSummary({ isPending: true, isFetching: true });
-    const { queryByText, getByTestId } = render(<SessionSummaryScreen />);
+    const { getByTestId } = render(<SessionSummaryScreen />);
     expect(getByTestId('spinner')).toBeTruthy();
-    expect(queryByText('summary.done')).toBeNull();
+    expect(headerActions.current?.leading?.kind).toBe('close');
+    expect(headerActions.current?.trailing).toBeUndefined();
   });
 
-  it('shows a Done button (not an endless spinner) when the query errors', () => {
+  it('shows Retry and a header close (not an endless spinner) when the query errors', () => {
     setSummary({ isError: true });
     const { queryByTestId, getByText } = render(<SessionSummaryScreen />);
     expect(queryByTestId('spinner')).toBeNull();
-    expect(getByText('summary.done')).toBeTruthy();
     expect(getByText('summary.retry')).toBeTruthy();
-    fireEvent.click(getByText('summary.done'));
+    expect(headerActions.current?.leading?.kind).toBe('close');
+    expect(headerActions.current?.trailing).toBeUndefined();
+    act(() => headerActions.current?.leading?.onPress());
     expect(router.back).toHaveBeenCalledOnce();
   });
 
@@ -183,7 +209,8 @@ describe('SessionSummaryScreen settled error/empty state', () => {
     const { queryByTestId, getByText } = render(<SessionSummaryScreen />);
     expect(queryByTestId('spinner')).toBeNull();
     expect(getByText('summary.loadErrorTitle')).toBeTruthy();
-    expect(getByText('summary.done')).toBeTruthy();
+    expect(headerActions.current?.leading?.kind).toBe('close');
+    expect(headerActions.current?.trailing).toBeUndefined();
   });
 
   it('retry triggers refetch', () => {

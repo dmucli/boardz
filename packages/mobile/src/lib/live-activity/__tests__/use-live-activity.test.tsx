@@ -7,6 +7,8 @@ import type { ClimbQueueItem } from '@boardsesh/queue';
 // vitest's node/jsdom env (untransformed RN-native source), so stub it.
 vi.mock('react-native', () => ({ Platform: { OS: 'android' } }));
 
+vi.mock('../../sentry', () => ({ captureToSentry: vi.fn() }));
+
 vi.mock('../../auth-store', () => ({
   getAuthToken: vi.fn().mockResolvedValue('token-123'),
 }));
@@ -126,6 +128,61 @@ describe('useLiveActivity start-failure contract', () => {
     vi.restoreAllMocks();
   });
 
+  it.each(['initial', 'queue', 'climb'] as const)('contains a rejected %s update', async (source) => {
+    vi.useFakeTimers();
+    try {
+      plugin.startLiveActivitySession.mockResolvedValue(undefined);
+      const props = activeProps({ queue: [queueItem, nextQueueItem] });
+      if (source === 'initial') plugin.updateLiveActivity.mockRejectedValueOnce(new Error('native decoder'));
+      const { rerender, unmount } = render(<Harness {...props} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      if (source === 'queue') {
+        plugin.updateLiveActivity.mockRejectedValueOnce(new Error('native decoder'));
+        rerender(<Harness {...props} boardConnection="heldByPeer" />);
+      }
+      if (source === 'climb') {
+        plugin.updateLiveActivityClimb.mockRejectedValueOnce(new Error('native decoder'));
+        rerender(<Harness {...props} currentClimbQueueItem={nextQueueItem} />);
+      }
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(plugin.endLiveActivitySession).not.toHaveBeenCalled();
+      const nativeUpdate = source === 'climb' ? plugin.updateLiveActivityClimb : plugin.updateLiveActivity;
+      const attempts = nativeUpdate.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(nativeUpdate).toHaveBeenCalledTimes(attempts + 1);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels a pending notification retry when the session unmounts', async () => {
+    vi.useFakeTimers();
+    try {
+      plugin.startLiveActivitySession.mockResolvedValue(undefined);
+      plugin.updateLiveActivity.mockRejectedValue(new Error('native decoder'));
+      const { unmount } = render(<Harness {...activeProps()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1);
+      unmount();
+      expect(vi.getTimerCount()).toBe(0);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('sends the initial update once the session starts', async () => {
     plugin.startLiveActivitySession.mockResolvedValue(undefined);
 
@@ -139,6 +196,38 @@ describe('useLiveActivity start-failure contract', () => {
     expect(plugin.updateLiveActivity).toHaveBeenCalledWith(
       expect.objectContaining({ climbName: 'Test Climb', currentIndex: 0, totalClimbs: 1 }),
     );
+  });
+
+  it('counts each successful start so the rest timer can re-send after one (#6513)', async () => {
+    plugin.startLiveActivitySession.mockResolvedValue(undefined);
+    const seen: number[] = [];
+    function CountingHarness(props: HookProps) {
+      seen.push(useLiveActivity(props).activityStartCount);
+      return null;
+    }
+
+    const props = activeProps();
+    const { rerender } = render(<CountingHarness {...props} />);
+    expect(seen[0]).toBe(0);
+    await waitFor(() => expect(seen.at(-1)).toBe(1));
+
+    // End, then start again (a board switch): a second count.
+    rerender(<CountingHarness {...props} isSessionActive={false} />);
+    rerender(<CountingHarness {...props} />);
+    await waitFor(() => expect(seen.at(-1)).toBe(2));
+  });
+
+  it('does not count a start that failed', async () => {
+    plugin.startLiveActivitySession.mockRejectedValue(new Error('ActivityKit said no'));
+    const seen: number[] = [];
+    function CountingHarness(props: HookProps) {
+      seen.push(useLiveActivity(props).activityStartCount);
+      return null;
+    }
+
+    render(<CountingHarness {...activeProps()} />);
+    await waitFor(() => expect(plugin.endLiveActivitySession).toHaveBeenCalled());
+    expect(seen.every((count) => count === 0)).toBe(true);
   });
 
   it("threads the climber's saved board look through start and updates, and pushes on a toggle", async () => {
@@ -165,6 +254,56 @@ describe('useLiveActivity start-failure contract', () => {
     expect(plugin.endLiveActivitySession).not.toHaveBeenCalled();
   });
 
+  // #7087: the Android notification bulb opens the app with no remembered board,
+  // and reads "Connecting…" while a connect runs. Neither may restart the session.
+  it("sends the Android bulb's open-app and connecting flags, and pushes when a connect starts and ends", async () => {
+    plugin.startLiveActivitySession.mockResolvedValue(undefined);
+    const props = activeProps({ boardConnection: 'disconnected', bulbOpensApp: true });
+    const { rerender } = render(<Harness {...props} />);
+
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1));
+    expect(plugin.updateLiveActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ bulbOpensApp: true, boardConnecting: false }),
+    );
+    plugin.updateLiveActivity.mockClear();
+
+    rerender(<Harness {...props} boardConnecting />);
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1));
+    expect(plugin.updateLiveActivity).toHaveBeenCalledWith(
+      expect.objectContaining({ bulbOpensApp: true, boardConnecting: true }),
+    );
+    plugin.updateLiveActivity.mockClear();
+
+    rerender(<Harness {...props} boardConnecting={false} />);
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1));
+    expect(plugin.updateLiveActivity).toHaveBeenCalledWith(expect.objectContaining({ boardConnecting: false }));
+    expect(plugin.startLiveActivitySession).toHaveBeenCalledTimes(1);
+    expect(plugin.endLiveActivitySession).not.toHaveBeenCalled();
+  });
+
+  // The iOS card offers "Tap to reconnect" only while native pairs a board, and
+  // reads that pairing only when it redraws. When native forgets the board the
+  // app kept, one push redraws it; the revision itself never reaches native.
+  it('pushes one full update when native forgets the kept board, without a restart', async () => {
+    plugin.startLiveActivitySession.mockResolvedValue(undefined);
+    const props = activeProps({ boardConnection: 'disconnected' });
+    const { rerender } = render(<Harness {...props} nativePairingRevision={0} />);
+
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1));
+    plugin.updateLiveActivity.mockClear();
+    plugin.updateLiveActivityClimb.mockClear();
+
+    rerender(<Harness {...props} nativePairingRevision={1} />);
+
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1));
+    expect(plugin.updateLiveActivity).toHaveBeenCalledWith(
+      expect.not.objectContaining({ nativePairingRevision: expect.anything() }),
+    );
+    expect(plugin.updateLiveActivityClimb).not.toHaveBeenCalled();
+    expect(plugin.startLiveActivitySession).toHaveBeenCalledTimes(1);
+    expect(plugin.endLiveActivitySession).not.toHaveBeenCalled();
+  });
+
   it('refreshes an Android thumbnail when its generation changes at the same path', async () => {
     plugin.startLiveActivitySession.mockResolvedValue(undefined);
     const props = activeProps({
@@ -183,6 +322,56 @@ describe('useLiveActivity start-failure contract', () => {
       expect.objectContaining({ androidThumbnailOverlayPath: 'file:///cache/overlay.png' }),
     );
     expect(plugin.updateLiveActivityClimb).not.toHaveBeenCalled();
+  });
+
+  it('sends the Android card payload and pushes when the kill switch removes it', async () => {
+    plugin.startLiveActivitySession.mockResolvedValue(undefined);
+    const props = activeProps({ androidBokehJson: '{"expanded":[]}' });
+    const { rerender } = render(<Harness {...props} />);
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalled());
+    expect(plugin.updateLiveActivity).toHaveBeenLastCalledWith(
+      expect.objectContaining({ androidBokehJson: '{"expanded":[]}' }),
+    );
+    plugin.updateLiveActivity.mockClear();
+    plugin.updateLiveActivityClimb.mockClear();
+
+    rerender(<Harness {...props} androidBokehJson={undefined} />);
+
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalledTimes(1));
+    expect(plugin.updateLiveActivity).toHaveBeenCalledWith(expect.objectContaining({ androidBokehJson: undefined }));
+    expect(plugin.updateLiveActivityClimb).not.toHaveBeenCalled();
+  });
+
+  // #7026: the notification service strips `file://` and hands the rest to
+  // BitmapFactory.decodeFile, so a percent-encoded `%2C` names a file that does
+  // not exist and the artwork slot stays black. The validator still sees the
+  // hook's own URI; only what crosses to native is decoded.
+  it('hands the Android notification decoded file paths, after validating the original URI', async () => {
+    plugin.startLiveActivitySession.mockResolvedValue(undefined);
+    const encodedOverlay = 'file:///data/user/0/app/cache/board-thumbnails/v16_f_w384_moonboard_2_1_1%2C2%2C3_ab.png';
+    const validateAndroidThumbnailOverlay = vi
+      .fn<(path: string | null, loadKey: string | null) => string | null>()
+      .mockImplementation((path) => path);
+    render(
+      <Harness
+        {...activeProps({
+          androidThumbnailOverlayPath: encodedOverlay,
+          androidThumbnailOverlayLoadKey: '1:0',
+          validateAndroidThumbnailOverlay,
+          androidThumbnailBackgroundPaths: ['/data/user/0/app/cache/Exponent%20Asset-ab.webp'],
+        })}
+      />,
+    );
+
+    await waitFor(() => expect(plugin.updateLiveActivity).toHaveBeenCalled());
+    expect(validateAndroidThumbnailOverlay).toHaveBeenCalledWith(encodedOverlay, '1:0');
+    expect(plugin.updateLiveActivity).toHaveBeenCalledWith(
+      expect.objectContaining({
+        androidThumbnailOverlayPath:
+          'file:///data/user/0/app/cache/board-thumbnails/v16_f_w384_moonboard_2_1_1,2,3_ab.png',
+        androidThumbnailBackgroundPaths: ['/data/user/0/app/cache/Exponent Asset-ab.webp'],
+      }),
+    );
   });
 
   it('revalidates the Android overlay immediately before a later notification push', async () => {

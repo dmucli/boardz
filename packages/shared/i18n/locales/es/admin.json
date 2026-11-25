@@ -51,9 +51,7 @@
       "roleLabel": "Rol",
       "boardTypeLabel": "Tipo de plafón (opcional)",
       "boardTypeOptions": {
-        "global": "Global (todos los plafones)",
-        "kilter": "Kilter",
-        "tension": "Tension"
+        "global": "Global (todos los plafones)"
       },
       "roleOptions": {
         "communityLeader": "Líder de comunidad",
@@ -131,6 +129,13 @@
       "disabled": "Aprobación automática desactivada.",
       "saveFailed": "No se pudo guardar. Inténtalo de nuevo.",
       "loadFailed": "No se pudieron cargar los ajustes de rocódromos."
+    },
+    "dailyCap": {
+      "label": "Límite diario",
+      "description": "Cuántas reclamaciones pueden aprobarse solas en 24 horas, sumando todas las cuentas. Pasado el límite, esperan revisión. Con 0, todas van a revisión.",
+      "save": "Guardar límite",
+      "invalid": "Escribe un número entero de 0 a 1000.",
+      "saved": "Límite diario guardado."
     }
   },
   "nav": {
@@ -138,7 +143,50 @@
     "gymClaims": "Reclamaciones de rocódromos",
     "feedback": "Reportes de errores",
     "gymDuplicates": "Rocódromos duplicados",
-    "locationSync": "Bloqueos de sincronización de ubicaciones"
+    "locationSync": "Bloqueos de sincronización de ubicaciones",
+    "sprayWalls": "Datos de entrenamiento de Spraywalls",
+    "boards": "Plafones registrados",
+    "buildPlans": "Pedidos de packs de construcción",
+    "partnerApps": "Aplicaciones asociadas",
+    "boardReports": "Reportes de plafones"
+  },
+  "buildPlans": {
+    "title": "Pedidos de packs de construcción",
+    "subtitle": "Todos los pedidos, vistas previas gratis incluidas, del más nuevo al más antiguo. Lee el error del generador y vuelve a poner el pack en cola.",
+    "previewsLastHour_one": "{{count}} vista previa dibujada en la última hora, de los pedidos cargados aquí.",
+    "previewsLastHour_other": "{{count}} vistas previas dibujadas en la última hora, de los pedidos cargados aquí.",
+    "backToAdmin": "Volver al panel",
+    "statusFilter": {
+      "all": "Todos"
+    },
+    "table": {
+      "licence": "Licencia",
+      "licensee": "Titular",
+      "tier": "Tarifa",
+      "wall": "Muro",
+      "status": "Estado",
+      "attempts": "Intentos",
+      "created": "Creado",
+      "actions": "Acciones"
+    },
+    "actions": {
+      "regenerate": "Regenerar"
+    },
+    "confirm": {
+      "title": "¿Volver a generar este pack?",
+      "body": "{{licenceId}} se vuelve a generar con el mismo id de licencia y sustituye al archivo que descarga el comprador. Conserva la licencia que pagó.",
+      "cancel": "Dejarlo como está",
+      "confirm": "Volver a generar"
+    },
+    "snackbar": {
+      "regenerated": "De vuelta en la cola",
+      "regenerateFailed": "No se pudo volver a encolar ese pack"
+    },
+    "empty": "Ningún pedido coincide con estos filtros.",
+    "error": "No se pudieron cargar los pedidos.",
+    "retry": "Reintentar",
+    "loadMore": "Cargar más",
+    "unknown": "No indicado"
   },
   "feedback": {
     "title": "Errores y comentarios",
@@ -176,8 +224,9 @@
     "reporter": {
       "anonymous": "Anónimo",
       "copyEmail": "Copiar correo",
-      "consentYes": "Contacto permitido",
-      "consentNo": "Sin consentimiento"
+      "consentYes": "Correo permitido",
+      "consentNo": "Correo rechazado",
+      "showReports": "Ver los errores de esta persona"
     },
     "rating": {
       "value": "{{rating}}/5"
@@ -198,7 +247,16 @@
       "userAgent": "Agente de usuario",
       "screenshots": "Capturas de pantalla",
       "screenshotAlt": "Captura de pantalla {{index}}",
-      "resolvedBy": "Resuelto por"
+      "resolvedBy": "Resuelto por",
+      "releaseChannel": "Canal de publicación",
+      "releaseBranch": "Rama en ejecución",
+      "updateId": "ID de actualización",
+      "runtimeVersion": "Runtime",
+      "automaticCanary": "Canary automático",
+      "canaryYes": "Sí",
+      "canaryNo": "No",
+      "canaryUnknown": "Desconocido",
+      "canaryCheckedAt": "Canary comprobado"
     },
     "empty": "Ningún comentario coincide con estos filtros.",
     "error": "No se pudieron cargar los comentarios.",
@@ -210,6 +268,26 @@
       "updateFailed": "No se pudo actualizar el estado",
       "emailCopied": "Correo copiado",
       "copyFailed": "No se pudo copiar"
+    },
+    "conversation": {
+      "title": "Conversación",
+      "open": "Leer conversación",
+      "loadError": "No se ha podido cargar esta conversación.",
+      "loadOlder": "Cargar mensajes anteriores",
+      "empty": "Las respuestas a este informe aparecerán aquí.",
+      "staff": "Boardsesh",
+      "reporter": "Persona que informó",
+      "close": "Cerrar",
+      "retry": "Reintentar",
+      "latestReply": "Última respuesta",
+      "publicNotice": "Las respuestas se comparten en la incidencia pública de GitHub enlazada.",
+      "openGithub": "Responder en GitHub",
+      "githubHint": "Para escribir a la persona que informó, escribe /reply en la primera línea de un comentario de GitHub, sin añadir nada más en esa línea. Solo los colaboradores autorizados de Boardsesh pueden enviar estos mensajes."
+    },
+    "filters": {
+      "reporter": "ID de la cuenta que informó",
+      "needsReply": "Pendiente de respuesta",
+      "clearReporter": "Mostrar todas las personas"
     }
   },
   "retention": {
@@ -245,6 +323,7 @@
     "retry": "Reintentar",
     "approve": "Aprobar",
     "deny": "Rechazar",
+    "claimantHistory": "Cuenta: {{days}} días · Registro: {{ticks}} · Rocódromos que gestiona: {{gyms}}",
     "method": {
       "domain": "Dominio",
       "admin": "Revisión"
@@ -252,7 +331,8 @@
     "snackbar": {
       "approved": "Reclamación aprobada: propiedad transferida",
       "denied": "Reclamación rechazada",
-      "failed": "No se pudo actualizar la reclamación"
+      "failed": "No se pudo actualizar la reclamación",
+      "superseded": "Este rocódromo cambió de manos después de presentarse la reclamación. Recházala o usa Cambiar la propiedad de un rocódromo más abajo."
     },
     "table": {
       "claimant": "Solicitante",
@@ -262,7 +342,36 @@
       "date": "Fecha",
       "actions": "Acciones"
     },
-    "loadMore": "Cargar más"
+    "loadMore": "Cargar más",
+    "autoApproved": {
+      "heading": "Reclamaciones aprobadas solas",
+      "intro": "Cada una se quedó con un rocódromo sin reclamar sin pasar por revisión. Revertir devuelve el rocódromo a los datos públicos de plafones.",
+      "empty": "Todavía no se ha aprobado sola ninguna reclamación.",
+      "error": "No se pudieron cargar estas reclamaciones. Inténtalo de nuevo.",
+      "approvedOn": "Aprobada el {{date}}",
+      "reverted": "Revertida",
+      "revert": "Revertir",
+      "revertAria": "Revertir la reclamación de {{claimant}} sobre {{gym}}"
+    },
+    "revert": {
+      "title": "¿Revertir la reclamación de {{claimant}} sobre {{gym}}?",
+      "body": "{{gym}} vuelve a estar sin reclamar. {{claimant}} y quien se haya añadido como miembro o editor desde la reclamación pierden el acceso, la sincronización de ubicaciones vuelve a ocuparse de la ficha y avisamos a {{claimant}} por correo.",
+      "notUndone": "Los cambios en los plafones, los kioscos y la descripción, el horario y la foto del rocódromo se quedan como están. Corrígelos a mano.",
+      "reasonLabel": "Motivo (opcional)",
+      "confirm": "Revertir reclamación",
+      "cancel": "Cancelar",
+      "done": "{{gym}} vuelve a estar sin reclamar.",
+      "missing": "La reclamación {{claimId}} no se aprobó sola, o ya no existe. Para devolver un rocódromo, usa Cambiar la propiedad de un rocódromo más abajo.",
+      "alreadyReverted": "La reclamación {{claimId}} ya se revirtió.",
+      "errors": {
+        "notFound": "Esa reclamación o su rocódromo ya no existen.",
+        "notApproved": "Esta reclamación ya no está aprobada, así que no hay nada que revertir.",
+        "notTransferred": "Esta reclamación nunca movió el rocódromo, así que revertir no tiene nada que deshacer. Usa Cambiar la propiedad de un rocódromo más abajo.",
+        "ownerChanged": "El rocódromo cambió de manos después de esta reclamación. Usa Cambiar la propiedad de un rocódromo más abajo.",
+        "priorOwner": "Esta reclamación le quitó el rocódromo a una persona, no a los datos públicos de plafones. Usa Cambiar la propiedad de un rocódromo más abajo para devolverlo.",
+        "failed": "No se pudo revertir la reclamación. Inténtalo de nuevo."
+      }
+    }
   },
   "gymOwnerReassign": {
     "title": "Cambiar la propiedad de un rocódromo",
@@ -428,6 +537,236 @@
     },
     "ownerReports": {
       "note": "Los propietarios ahora pueden señalar duplicados desde la página de su rocódromo. Por ahora esos reportes llegan por correo al equipo, así que revisa la bandeja junto a esta cola."
+    }
+  },
+  "sprayTraining": {
+    "title": "Datos de entrenamiento de Spraywalls",
+    "statusLabel": "Estado de revisión",
+    "status": {
+      "unreviewed": "Sin revisar ({{total}})",
+      "approved": "Aprobados ({{total}})",
+      "rejected": "Rechazados ({{total}})"
+    },
+    "empty": "No hay nada aquí",
+    "error": "No se pudo cargar la cola. Inténtalo de nuevo.",
+    "retry": "Reintentar",
+    "loadMore": "Cargar más",
+    "card": {
+      "open": "Revisar la versión {{version}} del Spraywall",
+      "holds": "Presas: {{total}}",
+      "edited": "Editadas: {{percent}} %",
+      "accepted": "Aceptadas sin revisar: {{percent}} %",
+      "deleted": "Sugerencias borradas: {{total}}"
+    },
+    "kind": {
+      "manual": "Marcada a mano",
+      "auto": "Encontrada, sin revisar",
+      "accepted": "Aceptada sin revisar",
+      "confirmed": "Dudosa, confirmada",
+      "edited": "Editada",
+      "deleted": "Sugerencia borrada",
+      "notShown": "Nunca mostrada"
+    },
+    "reason": {
+      "BAD_HOLDS": "Presas mal dibujadas",
+      "MISSING_HOLDS": "Faltan presas",
+      "PHOTO_QUALITY": "Calidad de la foto",
+      "NOT_A_WALL": "No es un muro de escalada",
+      "PEOPLE_OR_PERSONAL_INFO": "Personas o datos personales",
+      "DUPLICATE": "Duplicada",
+      "OTHER": "Otro motivo"
+    },
+    "visibility": {
+      "PRIVATE": "Visibilidad: privado",
+      "UNLISTED": "Visibilidad: solo con enlace",
+      "PUBLIC": "Visibilidad: público"
+    },
+    "review": {
+      "title": "Versión {{version}} del Spraywall",
+      "close": "Cerrar",
+      "previous": "Spraywall anterior",
+      "next": "Spraywall siguiente",
+      "position": "{{current}} de {{total}}",
+      "photoAlt": "Foto de un Spraywall con las presas marcadas",
+      "noPhoto": "Esta foto ya no está disponible.",
+      "photoLoading": "Cargando la foto",
+      "loadingNext": "Cargando más Spraywalls",
+      "unmappable": "Presas que no pudimos situar en la foto: {{total}}",
+      "model": "Detector de presas: {{version}}",
+      "showMarks": "Mostrar marcas (H)",
+      "legend": "Leyenda",
+      "reason": "Motivo del rechazo",
+      "notes": "Notas (opcional)",
+      "approve": "Aprobar (A)",
+      "reject": "Rechazar (R)",
+      "backToUnreviewed": "Volver a sin revisar",
+      "shortcuts": "A aprueba, R rechaza, H oculta las marcas, las flechas izquierda y derecha cambian de Spraywall."
+    },
+    "snackbar": {
+      "approved": "Aprobado",
+      "rejected": "Rechazado",
+      "reset": "De vuelta en la cola sin revisar",
+      "failed": "No se pudo guardar la revisión",
+      "notEligible": "No se guardó. Este Spraywall ya no está disponible como datos de entrenamiento."
+    },
+    "backToAdmin": "Volver a admin",
+    "noAccess": "Tu rol de admin no cubre los Spraywalls. Esta página necesita acceso de admin de Spraywalls o de todo el sitio."
+  },
+  "boards": {
+    "title": "Plafones registrados",
+    "description": "Busca y edita plafones registrados, incluidos los privados y los que no tienen un rocódromo asociado.",
+    "backToAdmin": "Volver a administración",
+    "search": "Buscar plafones",
+    "searchPlaceholder": "Nombre del plafón, UUID, slug o rocódromo",
+    "boardType": "Tipo de plafón",
+    "allTypes": "Todos los tipos",
+    "searchAction": "Buscar",
+    "loading": "Cargando plafones",
+    "editLoadError": "No se ha podido cargar este plafón para editarlo.",
+    "retry": "Reintentar",
+    "backToList": "Todos los plafones",
+    "loadError": "No se han podido cargar los plafones registrados.",
+    "empty": "Ningún plafón coincide con esta búsqueda.",
+    "owner": "Propietario: {{name}}",
+    "systemOwner": "Boardsesh",
+    "noGym": "Sin rocódromo asociado",
+    "editNamed": "Editar {{name}}",
+    "results_one": "{{count}} plafón",
+    "results_other": "{{count}} plafones",
+    "previous": "Anterior",
+    "next": "Siguiente",
+    "visibility": {
+      "public": "Público",
+      "unlisted": "No listado",
+      "private": "Privado"
+    }
+  },
+  "partnerApps": {
+    "title": "Aplicaciones asociadas",
+    "description": "Aplicaciones registradas, escaladores conectados y límites de conexiones.",
+    "limitsHelp": "Los límites se aplican a las conexiones nuevas. Reducir un límite mantiene las conexiones existentes. Cero bloquea las conexiones nuevas. Los cambios se registran con tu cuenta de administrador.",
+    "search": "Buscar aplicación, editor o desarrollador",
+    "searchAction": "Buscar",
+    "app": "Aplicación",
+    "developer": "Desarrollador",
+    "connections": "Conexiones",
+    "limits": "Límites",
+    "actions": "Acciones",
+    "activeLimit": "Máximo de conexiones activas",
+    "dailyLimit": "Máximo de conexiones nuevas por 24 horas",
+    "usage": "{{active}} activas · {{recent}} nuevas en 24 horas",
+    "invalidLimit": "Usa un número entero de 0 a 2147483647.",
+    "save": "Guardar límites",
+    "saved": "Límites guardados",
+    "saveError": "No se han podido guardar los límites. Inténtalo de nuevo.",
+    "loading": "Cargando aplicaciones asociadas",
+    "loadError": "No se han podido cargar las aplicaciones asociadas.",
+    "retry": "Reintentar",
+    "empty": "Ninguna aplicación coincide con esta búsqueda.",
+    "total_one": "{{count}} aplicación registrada",
+    "total_other": "{{count}} aplicaciones registradas",
+    "previous": "Página anterior",
+    "next": "Página siguiente",
+    "active": "Activa",
+    "suspended": "Suspendida"
+  },
+  "boardReports": {
+    "title": "Reportes de plafones y rocódromos",
+    "backToAdmin": "Volver al panel",
+    "description": "Reportes que nadie más puede resolver y cualquier reporte abierto desde hace 14 días. Primero los que nos llegan directamente, luego los más antiguos.",
+    "filters": {
+      "status": "Estado",
+      "kind": "Mostrar",
+      "kindAll": "Plafones y rocódromos",
+      "kindBoard": "Plafones",
+      "kindGym": "Rocódromos"
+    },
+    "status": {
+      "escalated": "Con nuestro equipo",
+      "open": "Con quien lo añadió o el equipo del rocódromo",
+      "fixed": "Corregido",
+      "removed": "Quitado",
+      "deleted": "Eliminado",
+      "kept": "Se queda como está",
+      "merged": "Fusionado"
+    },
+    "kind": {
+      "board": "Plafón",
+      "gym": "Rocódromo"
+    },
+    "chips": {
+      "sentToTeam": "Nos llegó directamente",
+      "waited": "Abierto 14 días"
+    },
+    "meta_one": "{{count}} persona · abierto {{age}}",
+    "meta_other": "{{count}} personas · abierto {{age}}",
+    "ageToday": "hoy",
+    "ageDays_one": "hace {{count}} día",
+    "ageDays_other": "hace {{count}} días",
+    "routedToLine": "Enviado a: {{recipients}}",
+    "routedTo": {
+      "creator": "quien lo añadió",
+      "gymStaff": "el equipo del rocódromo",
+      "admin": "nuestro equipo"
+    },
+    "duplicateOf": "Igual que {{name}}",
+    "note": "{{name}}: {{note}}",
+    "reporterUnknown": "Cuenta eliminada",
+    "closedOn": "Cerrado el {{date}}: {{outcome}}",
+    "actions": {
+      "deleteBoard": "Eliminar plafón",
+      "removeFromGym": "Quitar del rocódromo",
+      "hideGym": "Ocultar rocódromo de la búsqueda",
+      "keep": "Dejar como está",
+      "mergeGyms": "Fusionar en Rocódromos duplicados",
+      "openGym": "Abrir Gestionar rocódromo"
+    },
+    "confirm": {
+      "deleteTitle": "¿Eliminar {{board}} para todos?",
+      "deleteBody": "Desaparece para todos los que lo guardaron. Los encadenes registrados se quedan en sus diarios. El reporte se cierra como eliminado.",
+      "removeTitle": "¿Quitar {{board}} de {{gym}}?",
+      "removeBody": "Desaparece de la página, los kioscos y el mapa del rocódromo. Quien lo añadió lo conserva. El reporte se cierra como quitado.",
+      "hideTitle": "¿Ocultar {{gym}} de la búsqueda?",
+      "hideBody": "Deja de aparecer en el directorio de rocódromos y en la búsqueda. Su página sigue disponible para quien tenga el enlace. El reporte se cierra como quitado.",
+      "keepTitle": "¿Dejarlo como está?",
+      "keepBody": "El reporte se cierra y quienes lo enviaron sabrán que se mantuvo.",
+      "keepNoteLabel": "Una nota para ellos (opcional)",
+      "cancel": "Cancelar"
+    },
+    "snackbar": {
+      "deleted": "Plafón eliminado. El reporte está cerrado.",
+      "removed": "Quitado del rocódromo. El reporte está cerrado.",
+      "hidden": "Rocódromo oculto de la búsqueda. El reporte está cerrado.",
+      "hiddenStillOpen": "Rocódromo oculto de la búsqueda, pero el reporte sigue abierto. Inténtalo de nuevo.",
+      "kept": "Reporte cerrado.",
+      "failed": "No se pudo completar. Inténtalo de nuevo."
+    },
+    "empty": "No hay nada aquí.",
+    "error": "No se pudieron cargar los reportes. Inténtalo de nuevo.",
+    "retry": "Reintentar",
+    "loadMore": "Cargar más",
+    "tabs": {
+      "reports": "Reportes",
+      "setupChanges": "Cambios de configuración de escaladores"
+    },
+    "setupChanges": {
+      "description": "Cada configuración de plafón que cambió la sugerencia de un escalador, las más nuevas primero. Solo pasa en rocódromos que nadie gestiona. Deshacer recupera la configuración anterior mientras el plafón siga con la del escalador.",
+      "before": "Antes",
+      "after": "Después",
+      "byLine": "Cambiado por {{name}} {{when}}",
+      "state": {
+        "live": "Activo",
+        "undone": "Deshecho",
+        "changedSince": "Cambiado después"
+      },
+      "undo": "Deshacer",
+      "confirmTitle": "¿Deshacer el cambio en {{board}}?",
+      "confirmBody": "Vuelve a {{setup}} para todos. Las sugerencias para este plafón se revisan primero durante los próximos {{days}} días.",
+      "undone": "Configuración recuperada.",
+      "changedSinceError": "Cambiado después: el plafón tiene ahora otra configuración, así que esto no se puede deshacer.",
+      "alreadyUndone": "Alguien ya recuperó la configuración anterior.",
+      "empty": "Ningún escalador ha cambiado un plafón todavía.",
+      "error": "No se pudieron cargar los cambios de configuración. Inténtalo de nuevo."
     }
   }
 }

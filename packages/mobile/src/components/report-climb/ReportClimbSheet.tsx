@@ -1,3 +1,5 @@
+import { MEDIUM_LARGE_SNAP_POINTS } from '../sheet-snap-points';
+import { useUnsavedSheetGuard } from '../../hooks/use-unsaved-sheet-guard';
 // "Report climb" — the climber-facing half of community moderation. One form,
 // two kinds: hide the climb (junk, duplicate, unclimbable) or argue its grade.
 // Either way the server opens a proposal, joins the open one, or tells us this
@@ -17,15 +19,13 @@ import type { BoardName, Climb } from '@boardsesh/shared-schema';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { ModalSheet } from '../ModalSheet';
 import { Text } from '../Text';
-import { Icon } from '../Icon';
-import { Button } from '../Button';
-import { PressableSurface } from '../PressableSurface';
+import { SheetTopBar } from '../SheetTopBar';
 import { SegmentedControl } from '../SegmentedControl';
 import { ClimbPreviewCard } from '../ClimbPreviewCard';
 import { GradeSingleSelectRail } from '../grade';
 import { TickNoteField } from '../tick';
 import { useReportClimb } from '../../lib/graphql/hooks/use-report-climb';
-import { useGrades } from '../../lib/graphql/hooks';
+import { useGrades, useProfile } from '../../lib/graphql/hooks';
 import { extractGraphqlMessage } from '../../lib/graphql/extract-error-message';
 import { useTheme } from '../../providers/theme-provider';
 import { useToast } from '../../providers/toast-provider';
@@ -38,6 +38,7 @@ import {
   reportToastCopy,
   type ReportKind,
 } from './report-climb-form';
+import { getDifficultyIdForGradeName } from '../../lib/grade-label';
 
 type ReportClimbSheetProps = {
   visible: boolean;
@@ -54,7 +55,7 @@ type ReportClimbSheetProps = {
   onFullyDismissed?: () => void;
 };
 
-const SNAP_POINTS = ['62%', '88%'];
+const SNAP_POINTS = MEDIUM_LARGE_SNAP_POINTS;
 
 export function ReportClimbSheet({
   visible,
@@ -70,7 +71,13 @@ export function ReportClimbSheet({
   const { t } = useTranslation('climbs');
   const { systemColors, brandColors } = useTheme();
   const { showToast } = useToast();
-  const [kind, setKind] = useState<ReportKind>('hide');
+  const [chosenKind, setKind] = useState<ReportKind>('hide');
+  // Your own climb (only a spray wall offers Report there, #5971) is reported to
+  // change its grade, never to hide it: the sheet locks to grade and hides the
+  // segmented control. The server refuses a self-hide too.
+  const { data: profile } = useProfile();
+  const ownClimb = !!profile?.id && climb?.userId === profile.id;
+  const kind: ReportKind = ownClimb ? 'grade' : chosenKind;
   const [reason, setReason] = useState('');
   // `TickNoteField` has no maxLength prop; the server bound is 500, enforced here.
   const handleChangeReason = useCallback((next: string) => setReason(next.slice(0, REASON_MAX)), []);
@@ -80,6 +87,14 @@ export function ReportClimbSheet({
   const [pickedDifficultyId, setPickedDifficultyId] = useState<number | null>(null);
 
   const { mutate: sendReport, reset: resetReport, isPending, error: reportError } = useReportClimb();
+
+  const guard = useUnsavedSheetGuard({
+    visible: visible && !!climb,
+    dirty: reason.length > 0 || pickedDifficultyId !== null || (!ownClimb && chosenKind !== 'hide'),
+    busy: isPending,
+    onClose,
+    scope: climb?.uuid,
+  });
 
   const { data: grades } = useGrades(boardName, visible && kind === 'grade');
 
@@ -107,17 +122,22 @@ export function ReportClimbSheet({
 
   const currentGradeName = climb?.difficulty ?? null;
   const gradeList = useMemo(() => grades ?? [], [grades]);
-  const currentGrade = useMemo(
-    () => gradeList.find((grade) => grade.name === currentGradeName) ?? null,
-    [gradeList, currentGradeName],
-  );
+  const currentGrade = useMemo(() => {
+    // Match by id too, so a differently-spelled label for the same grade still
+    // lands on its chip (MoonBoard's 16 was "6a/V3" before it became "6a/V2").
+    const currentDifficultyId = getDifficultyIdForGradeName(currentGradeName);
+    return (
+      gradeList.find((grade) => grade.name === currentGradeName || grade.difficultyId === currentDifficultyId) ?? null
+    );
+  }, [gradeList, currentGradeName]);
   const selectedDifficultyId = pickedDifficultyId ?? currentGrade?.difficultyId ?? null;
   const selectedGradeName = useMemo(
     () => gradeList.find((grade) => grade.difficultyId === selectedDifficultyId)?.name ?? null,
     [gradeList, selectedDifficultyId],
   );
 
-  const isSameGrade = kind === 'grade' && !!selectedGradeName && selectedGradeName === currentGradeName;
+  const isSameGrade =
+    kind === 'grade' && selectedDifficultyId != null && selectedDifficultyId === currentGrade?.difficultyId;
 
   const kindOptions = useMemo(
     () => [
@@ -154,7 +174,7 @@ export function ReportClimbSheet({
       {
         onSuccess: (result) => {
           track(SHARED_EVENTS.ClimbReported, { kind, boardType: boardName, status: result.status });
-          void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+          // The success toast plays the haptic.
           const copy = reportToastCopy(result.status, kind, result.proposal);
           resetForm();
           // Toast AFTER the close request: a toast raised while the sheet is up
@@ -175,39 +195,20 @@ export function ReportClimbSheet({
   const submitDisabled = !built?.ok || isPending;
 
   const header = (
-    <View style={styles.header}>
-      <Text variant="title3" style={styles.headerTitle}>
-        {t('mobile.report.title')}
-      </Text>
-      <PressableSurface
-        onPress={onClose}
-        feedback="opacity"
-        hitSlop={8}
-        accessibilityRole="button"
-        accessibilityLabel={t('mobile.report.close')}
-        style={styles.closeButton}
-      >
-        <Icon name="close" size={20} color={systemColors.secondaryLabel} />
-      </PressableSurface>
-    </View>
-  );
-
-  const footer = (
-    <View style={styles.footer}>
-      {errorMessage ? (
-        <Text variant="footnote" color={brandColors.error}>
-          {errorMessage}
-        </Text>
-      ) : null}
-      <Button
-        title={t('mobile.report.submit')}
-        onPress={handleSubmit}
-        variant="filled"
-        size="large"
-        disabled={submitDisabled}
-        loading={isPending}
-      />
-    </View>
+    <SheetTopBar
+      title={t('mobile.report.title')}
+      leading={{ kind: 'cancel', onPress: guard.requestClose }}
+      trailing={{
+        kind: 'confirm',
+        label: t('mobile.report.submit'),
+        onPress: handleSubmit,
+        disabled: submitDisabled,
+        loading: isPending,
+        prominent: true,
+      }}
+      error={errorMessage}
+      reserveErrorSlot
+    />
   );
 
   return (
@@ -215,12 +216,13 @@ export function ReportClimbSheet({
       visible={visible && !!climb}
       snapPoints={SNAP_POINTS}
       scrollable
-      surface="solid"
       androidContentSized
-      onClose={onClose}
+      onDisplaced={onClose}
+      onClose={guard.requestClose}
+      onRequestClose={guard.requestClose}
+      enablePanDownToClose={guard.enablePanDownToClose}
       onFullyDismissed={handleFullyDismissed}
       header={header}
-      footer={footer}
     >
       {climb ? (
         <ClimbPreviewCard
@@ -234,13 +236,15 @@ export function ReportClimbSheet({
       ) : null}
 
       <View style={styles.body}>
-        <SegmentedControl
-          options={kindOptions}
-          selectedKey={kind}
-          onSelect={handleSelectKind}
-          accessibilityLabel={t('mobile.report.kind.label')}
-          tint={brandColors.primaryFill}
-        />
+        {ownClimb ? null : (
+          <SegmentedControl
+            options={kindOptions}
+            selectedKey={kind}
+            onSelect={handleSelectKind}
+            accessibilityLabel={t('mobile.report.kind.label')}
+            tint={brandColors.primaryFill}
+          />
+        )}
         <Text variant="footnote" color={systemColors.secondaryLabel}>
           {kind === 'hide' ? t('mobile.report.kind.hideHint') : t('mobile.report.kind.gradeHint')}
         </Text>
@@ -251,6 +255,7 @@ export function ReportClimbSheet({
               grades={gradeList}
               selectedDifficultyId={selectedDifficultyId}
               consensusDifficultyId={currentGrade?.difficultyId ?? null}
+              boardName={boardName}
               onSelect={handleSelectGrade}
               allowClear={false}
               colorway="selection"
@@ -268,9 +273,10 @@ export function ReportClimbSheet({
         {/* The shared tick note field, not a raw input: it caps itself at 160pt
             because the iOS keyboard-up sheet body is only ~162pt — a field
             taller than the visible body can never scroll fully into view, and
-            the pinned Send bar ends up over it (QA-declined on #5188). Its vertical
+            the Send action's bar ends up over it (QA-declined on #5188). Its vertical
             padding is load-bearing on Android (#4642); see the component. */}
         <TickNoteField
+          submitBehavior="newline"
           value={reason}
           onChangeText={handleChangeReason}
           placeholder={t('mobile.report.reasonPlaceholder')}
@@ -287,24 +293,6 @@ export function ReportClimbSheet({
 }
 
 const styles = StyleSheet.create({
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    gap: spacing[3],
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[2],
-  },
-  headerTitle: {
-    flex: 1,
-    fontWeight: '700',
-  },
-  closeButton: {
-    width: 36,
-    height: 36,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
   body: {
     paddingHorizontal: spacing[4],
     paddingTop: spacing[3],
@@ -316,8 +304,5 @@ const styles = StyleSheet.create({
   },
   counter: {
     marginTop: -spacing[2],
-  },
-  footer: {
-    gap: spacing[2],
   },
 });

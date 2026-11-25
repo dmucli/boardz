@@ -26,6 +26,14 @@ const SOURCE_ROOTS = [join(__dirname, '..'), join(__dirname, '..', '..', 'app')]
  * `useSprayWallToken`, each with the reason it cannot be the bug above.
  */
 const EXEMPT: Record<string, string> = {
+  'src/components/GpuClimbOverlay.stories.tsx':
+    'Development-only parity fixtures pin Kilter Homewall; this story never accepts a spray wall or runtime board selection.',
+  'src/components/board-motion-lab/LabStage.tsx':
+    'Board motion lab (testers only). Draws its own catalogue board fixtures; spray walls are left out of the lab, so no wall reaches it.',
+  'src/components/board-motion-lab/fixtures.ts':
+    'Board motion lab fixtures. Not React, and only catalogue boards; spray walls are left out of the lab.',
+  'src/components/board-motion-lab/screen.tsx':
+    'Board motion lab (testers only). Reads geometry for its own catalogue board fixtures; spray walls are left out of the lab.',
   'src/lib/board-details.ts': 'Defines it. Already folds `sprayCacheToken` into its own memo key.',
   'src/lib/background-image-cache.ts': 'Not React. Called from the render hook, which subscribes for it.',
   'src/lib/create-board-holds.ts': 'Not React. Calls `ensureSprayWallLoaded` itself and keys its memo on the token.',
@@ -33,6 +41,8 @@ const EXEMPT: Record<string, string> = {
     'Not React. Calls `ensureSprayWallLoaded` itself and keys its memo on the token.',
   'src/hooks/use-native-climb-render.ts':
     'Subscribes with its own `useSyncExternalStore` over `sprayCacheToken` — the hook would be a second one.',
+  'src/hooks/use-synthetic-spray-wall-preview.ts':
+    'Subscribes with its own `useSyncExternalStore` over `sprayCacheToken`, and must NOT ask the loader: the wall it draws is an unpublished draft, and `ensureSprayWallLoaded` fetches the published version.',
   'src/providers/bluetooth-provider.tsx': 'LED control. A spray wall has no LEDs, so no wall reaches it.',
   'src/components/ble/DeviceCard.tsx': 'LED control. A spray wall has no LEDs, so no wall reaches it.',
 };
@@ -71,6 +81,9 @@ describe('spray render surfaces', () => {
         if (!IMPORTS_RENDER_DATA.test(source)) continue;
 
         const relative = repoRelative(file);
+        // Isolated stories render supplied geometry; they neither load nor follow
+        // the signed-in user's spray registry. Keep every production surface checked.
+        if (relative.startsWith('src/dev/') || relative.endsWith('.stories.tsx')) continue;
         if (relative in EXEMPT) continue;
         if (source.includes('useSprayWallToken')) continue;
 

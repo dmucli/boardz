@@ -1,5 +1,5 @@
 import type { Client } from 'graphql-ws';
-import { GraphQLOperationError, parseRateLimitError } from './errors';
+import { GraphQLOperationError, GraphQLTransportClosedError, isLikeCloseEvent, parseRateLimitError } from './errors';
 import { getOperationName } from './operation-name';
 import {
   MUTATION_TIMEOUT_MS,
@@ -8,6 +8,14 @@ import {
   RATE_LIMIT_MAX_WAIT_MS,
   RATE_LIMIT_RETRY_JITTER_MS,
 } from './constants';
+
+/**
+ * The client `execute` sends on: either a client, or a getter it calls again
+ * for every attempt. Pass a getter when the client can be replaced while an
+ * attempt waits out a rate limit. A disposed graphql-ws client still opens a
+ * fresh socket for each new operation, and no later dispose owns that socket.
+ */
+export type ClientSource = Client | (() => Client);
 
 /** Payload handed to `onRateLimited` before each rate-limit retry wait. */
 export type RateLimitRetryEvent = {
@@ -69,11 +77,15 @@ function computeRateLimitWait(retryAfterSeconds: number | null, options: Require
  * quiet path for reconnect bursts (e.g. offline-reconciliation replaying
  * buffered adds) — the throttled request did no work, so re-sending is safe.
  *
+ * `client` may be a getter. It is read again for every attempt, including each
+ * attempt after a rate-limit wait, so a retry goes out on the client that is
+ * current then, not on one that was disposed during the wait.
+ *
  * Back-compat: the third arg may be a plain `timeoutMs` number (legacy callers)
  * or an `ExecuteOptions` object.
  */
 export function execute<TData = unknown, TVariables = Record<string, unknown>>(
-  client: Client,
+  client: ClientSource,
   operation: { query: string; variables?: TVariables },
   timeoutOrOptions: number | ExecuteOptions = MUTATION_TIMEOUT_MS,
 ): Promise<TData> {
@@ -98,7 +110,8 @@ export function execute<TData = unknown, TVariables = Record<string, unknown>>(
         fn();
       }
 
-      unsubscribe = client.subscribe<TData>(
+      const attemptClient = typeof client === 'function' ? client() : client;
+      unsubscribe = attemptClient.subscribe<TData>(
         { query: operation.query, variables: operation.variables as Record<string, unknown> },
         {
           next: (data) => {
@@ -118,6 +131,12 @@ export function execute<TData = unknown, TVariables = Record<string, unknown>>(
               // too, otherwise fall back to a generic Error.
               if (Array.isArray(err) && err.length > 0 && typeof err[0]?.message === 'string') {
                 reject(new GraphQLOperationError(err));
+              } else if (isLikeCloseEvent(err)) {
+                // graphql-ws gave up on the socket and handed over its close
+                // event. Keep the code so a caller can tell a lost transport
+                // from a server answer. Checked before `instanceof Error`:
+                // graphql-ws's own TerminatedCloseEvent is an Error subclass.
+                reject(new GraphQLTransportClosedError(err.code, err.reason));
               } else if (err instanceof Error) {
                 reject(err);
               } else {

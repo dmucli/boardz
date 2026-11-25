@@ -53,6 +53,10 @@ const ALTER_ADDED_COLUMNS: { version: number; table: string; column: string }[] 
   { version: 2, table: 'board_climbs', column: 'characteristics' },
   { version: 5, table: 'board_climbs', column: 'is_hidden' },
   { version: 7, table: 'board_climbs', column: 'missing_hold_count' },
+  { version: 11, table: 'boardsesh_ticks', column: 'climb_revision' },
+  { version: 11, table: 'board_climbs', column: 'revision_number' },
+  { version: 11, table: 'board_climbs', column: 'holds_revision_number' },
+  { version: 12, table: 'board_climbs', column: 'retired_by_reset' },
 ];
 
 async function rollBackAlterColumnsAbove(
@@ -66,6 +70,40 @@ async function rollBackAlterColumnsAbove(
 }
 
 describe('runMigrations', () => {
+  it('adds indexed outbox dependencies without changing older queued writes or artifact compatibility', async () => {
+    const database = createTestDatabase();
+    try {
+      for (const migration of MIGRATIONS.filter((entry) => entry.version <= 13)) {
+        for (const statement of migration.statements) await database.execAsync(statement);
+      }
+      await database.execAsync(`CREATE TABLE schema_version (id INTEGER PRIMARY KEY, version INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (1, 13);
+        INSERT INTO pending_mutations (table_name, operation, payload, idempotency_key)
+        VALUES ('boardsesh_ticks', 'create', '{"climbUuid":"existing"}', 'queued-before-update');`);
+      await runMigrations(database);
+      expect(
+        await database.getFirstAsync(
+          'SELECT idempotency_key, payload, entity_key, depends_on_key FROM pending_mutations',
+        ),
+      ).toEqual({
+        idempotency_key: 'queued-before-update',
+        payload: '{"climbUuid":"existing"}',
+        entity_key: null,
+        depends_on_key: null,
+      });
+      const indexes = await database.getAllAsync<{ name: string }>('PRAGMA index_list(pending_mutations)');
+      expect(indexes.map((index) => index.name)).toEqual(
+        expect.arrayContaining(['idx_pending_mutations_entity', 'idx_pending_mutations_dependency']),
+      );
+      expect(ARTIFACT_SCHEMA_VERSION).toBe(12);
+      expect(LATEST_SCHEMA_VERSION).toBeGreaterThan(13);
+      await runMigrations(database);
+      expect(await database.getFirstAsync('SELECT COUNT(*) AS count FROM pending_mutations')).toEqual({ count: 1 });
+    } finally {
+      database.close();
+    }
+  });
+
   it.each([0, 4])('matches every sync column and primary key after upgrading schema v%i', async (version) => {
     const database = createTestDatabase();
     try {
@@ -148,7 +186,11 @@ describe('runMigrations', () => {
       "INSERT INTO boardsesh_ticks (uuid, board_type, climb_uuid, angle, status) VALUES ('keep-me', 'kilter', 'climb-1', 40, 'sent')",
     );
 
-    await expect(runMigrations(db)).resolves.toBeUndefined();
+    await expect(runMigrations(db)).resolves.toEqual({
+      status: 'compatible',
+      storedVersion: LATEST_SCHEMA_VERSION,
+      supportedVersion: LATEST_SCHEMA_VERSION,
+    });
 
     const survivor = await db.getFirstAsync<{ uuid: string }>(
       "SELECT uuid FROM boardsesh_ticks WHERE uuid = 'keep-me'",
@@ -281,6 +323,7 @@ describe('runMigrations', () => {
     const upgradedDb = createTestDatabase();
     await runMigrations(upgradedDb);
     await upgradedDb.execAsync('DROP TABLE spray_walls');
+    await rollBackAlterColumnsAbove(upgradedDb, 7);
     await upgradedDb.runAsync('UPDATE schema_version SET version = 7 WHERE id = 1');
     await runMigrations(upgradedDb);
     expect(await listTables(upgradedDb)).toContain('spray_walls');
@@ -324,6 +367,7 @@ describe('runMigrations', () => {
     await upgradedDb.runAsync(
       "INSERT INTO board_climbs (uuid, board_type, layout_id, frames, sync_seq) VALUES ('kept', 'kilter', 1, 'p1r12', 3)",
     );
+    await rollBackAlterColumnsAbove(upgradedDb, 9);
     await upgradedDb.runAsync('UPDATE schema_version SET version = 9 WHERE id = 1');
     await runMigrations(upgradedDb);
     await assertHoldsSchema(upgradedDb);
@@ -332,7 +376,112 @@ describe('runMigrations', () => {
     });
     expect(
       (await upgradedDb.getFirstAsync<{ version: number }>('SELECT version FROM schema_version WHERE id = 1'))?.version,
-    ).toBe(10);
+    ).toBe(LATEST_SCHEMA_VERSION);
+  });
+
+  it('v11 adds the climb revision columns as nullable, and leaves rows already on disk NULL', async () => {
+    // Existing install stamped at v10, with a climb and a tick pulled before the
+    // columns existed. Neither row has been told its revision, so both read NULL
+    // (unknown), never the server's default of 1.
+    const upgradedDb = createTestDatabase();
+    await runMigrations(upgradedDb);
+    await rollBackAlterColumnsAbove(upgradedDb, 10);
+    await upgradedDb.runAsync(
+      "INSERT INTO board_climbs (uuid, board_type, layout_id, frames, sync_seq) VALUES ('kept', 'kilter', 1, 'p1r12', 3)",
+    );
+    await upgradedDb.runAsync(
+      `INSERT INTO boardsesh_ticks (uuid, user_id, board_type, climb_uuid, angle, status, attempt_count, climbed_at, created_at, updated_at)
+       VALUES ('tick-1', 'user-1', 'kilter', 'kept', 40, 'send', 1, '2026-10-01T10:00:00.000Z', '2026-10-01T10:00:00.000Z', '2026-10-01T10:00:00.000Z')`,
+    );
+    await upgradedDb.runAsync('UPDATE schema_version SET version = 10 WHERE id = 1');
+    await runMigrations(upgradedDb);
+
+    expect(
+      await upgradedDb.getFirstAsync(
+        "SELECT revision_number, holds_revision_number FROM board_climbs WHERE uuid = 'kept'",
+      ),
+    ).toEqual({ revision_number: null, holds_revision_number: null });
+    expect(await upgradedDb.getFirstAsync("SELECT climb_revision FROM boardsesh_ticks WHERE uuid = 'tick-1'")).toEqual({
+      climb_revision: null,
+    });
+    expect(
+      (await upgradedDb.getFirstAsync<{ version: number }>('SELECT version FROM schema_version WHERE id = 1'))?.version,
+    ).toBe(LATEST_SCHEMA_VERSION);
+  });
+
+  it('v12 adds board_climbs.retired_by_reset as nullable, and leaves rows already on disk NULL (#6024)', async () => {
+    // NULL reads as not retired in the local search, so a climb pulled before
+    // this column existed stays in a wall's default list until a full reset
+    // re-delivers it.
+    const upgradedDb = createTestDatabase();
+    await runMigrations(upgradedDb);
+    await rollBackAlterColumnsAbove(upgradedDb, 11);
+    expect(await tableColumns(upgradedDb, 'board_climbs')).not.toContain('retired_by_reset');
+    await upgradedDb.runAsync(
+      "INSERT INTO board_climbs (uuid, board_type, layout_id, frames, sync_seq) VALUES ('kept', 'spray', 7, 'p1r12', 3)",
+    );
+    await upgradedDb.runAsync('UPDATE schema_version SET version = 11 WHERE id = 1');
+    await runMigrations(upgradedDb);
+
+    expect(await upgradedDb.getFirstAsync("SELECT retired_by_reset FROM board_climbs WHERE uuid = 'kept'")).toEqual({
+      retired_by_reset: null,
+    });
+    expect(
+      (await upgradedDb.getFirstAsync<{ version: number }>('SELECT version FROM schema_version WHERE id = 1'))?.version,
+    ).toBe(LATEST_SCHEMA_VERSION);
+  });
+
+  it('v13 adds the ascents ranking index on stats, on fresh and on v12-stamped databases', async () => {
+    type IndexRow = { tbl_name: string; sql: string };
+    const rankingIndex = (database: ReturnType<typeof createTestDatabase>) =>
+      database.getFirstAsync<IndexRow>(
+        "SELECT tbl_name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_stats_ascents'",
+      );
+    const assertRankingIndex = async (database: ReturnType<typeof createTestDatabase>) => {
+      const index = await rankingIndex(database);
+      expect(index?.tbl_name).toBe('board_climb_stats');
+      // The column order, both DESC keys and the predicate are the contract: the
+      // climb list's ranked walk names this index, reads it front to back, and
+      // has to repeat the predicate word for word to be allowed to.
+      expect(index?.sql).toContain(
+        '(board_type, angle, ascensionist_count DESC, climb_uuid DESC) WHERE ascensionist_count > 0',
+      );
+    };
+
+    const freshDb = createTestDatabase();
+    await runMigrations(freshDb);
+    await assertRankingIndex(freshDb);
+
+    // Existing install stamped at v12 with a download already on disk: the
+    // migration indexes the rows that are there, and touches none of them.
+    const upgradedDb = createTestDatabase();
+    await runMigrations(upgradedDb);
+    await upgradedDb.execAsync('DROP INDEX idx_stats_ascents;');
+    await upgradedDb.execAsync(`
+      INSERT INTO board_climb_stats (board_type, climb_uuid, angle, ascensionist_count) VALUES
+        ('kilter', 'b', 40, 7), ('kilter', 'a', 40, 7), ('kilter', 'c', 40, 90), ('kilter', 'd', 40, NULL),
+        ('kilter', 'f', 40, 0), ('kilter', 'c', 45, 1), ('tension', 'e', 40, 500);
+    `);
+    await upgradedDb.runAsync('UPDATE schema_version SET version = 12 WHERE id = 1');
+    expect(await rankingIndex(upgradedDb)).toBeNull();
+    await runMigrations(upgradedDb);
+
+    await assertRankingIndex(upgradedDb);
+    expect(
+      await upgradedDb.getAllAsync(
+        `SELECT climb_uuid, ascensionist_count FROM board_climb_stats INDEXED BY idx_stats_ascents
+         WHERE board_type = 'kilter' AND angle = 40 AND ascensionist_count > 0
+         ORDER BY ascensionist_count DESC, climb_uuid DESC`,
+      ),
+    ).toEqual([
+      { climb_uuid: 'c', ascensionist_count: 90 },
+      { climb_uuid: 'b', ascensionist_count: 7 },
+      { climb_uuid: 'a', ascensionist_count: 7 },
+    ]);
+    expect(await upgradedDb.getFirstAsync('SELECT COUNT(*) AS total FROM board_climb_stats')).toEqual({ total: 7 });
+    expect(
+      (await upgradedDb.getFirstAsync<{ version: number }>('SELECT version FROM schema_version WHERE id = 1'))?.version,
+    ).toBe(LATEST_SCHEMA_VERSION);
   });
 
   it('keeps the device-only holds index tables out of SCHEMA_STATEMENTS', () => {
@@ -392,13 +541,20 @@ describe('runMigrations', () => {
 });
 
 describe('ARTIFACT_SCHEMA_VERSION', () => {
-  it('is the last migration that changed an artifact table: v7, missing_hold_count', () => {
-    expect(ARTIFACT_SCHEMA_VERSION).toBe(7);
+  it('is the last migration that changed an artifact table: v12, the full-reset retired flag', () => {
+    expect(ARTIFACT_SCHEMA_VERSION).toBe(12);
   });
 
   it('is not moved by device-only migrations (v8 spray_walls, v9 followed authors, v10 holds index)', () => {
-    expect(LATEST_SCHEMA_VERSION).toBeGreaterThan(ARTIFACT_SCHEMA_VERSION);
     expect(artifactSchemaVersion(MIGRATIONS.filter((migration) => migration.version <= 7))).toBe(7);
+    expect(artifactSchemaVersion(MIGRATIONS.filter((migration) => migration.version <= 10))).toBe(7);
+  });
+
+  it('is not moved by v13, whose index on board_climb_stats is a device-only statement', () => {
+    const ranking = MIGRATIONS.find((migration) => migration.version === 13);
+    expect(ranking?.statements.join(' ')).toMatch(/\bboard_climb_stats\b/);
+    expect(artifactSchemaVersion(MIGRATIONS.filter((migration) => migration.version <= 12))).toBe(12);
+    expect(artifactSchemaVersion(MIGRATIONS.filter((migration) => migration.version <= 13))).toBe(12);
   });
 
   it('moves when a migration changes an artifact table, and ignores device-only statements', () => {

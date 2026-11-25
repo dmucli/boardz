@@ -40,7 +40,8 @@ export const HexColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/, 'Colour must
  * Rejecting other schemes (javascript:, data:, http:) matters because the logo
  * renders as an `<img src>` on the kiosk/embed surfaces.
  */
-const STATIC_GYM_LOGO_PATH_REGEX = /^\/static\/gym-logos\/[0-9a-f-]{36}\.(jpg|jpeg|png|gif|webp)(\?v=[\w-]+)?$/i;
+const STATIC_GYM_LOGO_PATH_REGEX =
+  /^\/static\/gym-logos\/[0-9a-f-]{36}(?:\.[0-9a-f-]{36})?\.(jpg|jpeg|png|gif|webp)(\?v=[\w-]+)?$/i;
 
 function isValidHttpsUrl(value: string): boolean {
   try {
@@ -78,7 +79,8 @@ export const GymLogoUrlSchema = z
  * upload would have 400'd on the follow-up updateGym and orphaned the object it
  * had just stored.
  */
-const STATIC_GYM_PHOTO_PATH_REGEX = /^\/static\/gym-photos\/[0-9a-f-]{36}\.(jpg|jpeg|png|gif|webp)(\?v=[\w-]+)?$/i;
+const STATIC_GYM_PHOTO_PATH_REGEX =
+  /^\/static\/gym-photos\/[0-9a-f-]{36}(?:\.[0-9a-f-]{36})?\.(jpg|jpeg|png|gif|webp)(\?v=[\w-]+)?$/i;
 
 export const GymPhotoUrlSchema = z
   .string()
@@ -98,11 +100,35 @@ export const GymPhotoUrlSchema = z
 export const GymHoursSchema = z.string().max(GYM_HOURS_MAX_LENGTH, 'Opening hours too long');
 
 /**
+ * Cap on `CreateGymInput.duplicateCheck.acknowledgedGymUuids`. createGym's
+ * duplicate check reads this many similar gyms, so a climber who acknowledges
+ * them round by round (five a refusal) can always name every one. The web
+ * client keeps the most recent this-many it was shown.
+ */
+export const MAX_ACKNOWLEDGED_GYM_UUIDS = 50;
+
+/**
+ * createGym's duplicate check. Absent (or null) means REJECT_IF_FOUND: unlike
+ * createBoard's opt-in wall check, every gym create is checked, because a
+ * second listing of a real gym splits its boards, followers and claim.
+ */
+export const GymDuplicateCheckSchema = z.object({
+  mode: z.enum(['REJECT_IF_FOUND', 'CONFIRMED_SEPARATE']),
+  acknowledgedGymUuids: z
+    .array(UUIDSchema)
+    .max(MAX_ACKNOWLEDGED_GYM_UUIDS, `At most ${MAX_ACKNOWLEDGED_GYM_UUIDS} acknowledged gyms`)
+    .nullish(),
+});
+
+/**
  * Create gym input validation schema
  */
 export const CreateGymInputSchema = z.object({
-  name: z.string().min(1, 'Gym name cannot be empty').max(100, 'Gym name too long'),
+  // Trimmed before the length checks, so "  " is empty and the stored name,
+  // the slug and the duplicate check all see the same text.
+  name: z.string().trim().min(1, 'Gym name cannot be empty').max(100, 'Gym name too long'),
   description: z.string().max(500, 'Description too long').optional(),
+  hours: GymHoursSchema.optional(),
   address: z.string().max(300, 'Address too long').optional(),
   website: GymWebsiteSchema.optional(),
   contactEmail: z.string().email('Invalid email').max(200).optional(),
@@ -110,8 +136,10 @@ export const CreateGymInputSchema = z.object({
   latitude: LatitudeSchema.optional(),
   longitude: LongitudeSchema.optional(),
   isPublic: z.boolean().optional(),
+  isListed: z.boolean().optional(),
   imageUrl: GymPhotoUrlSchema.optional(),
   boardUuid: UUIDSchema.optional(),
+  duplicateCheck: GymDuplicateCheckSchema.nullish(),
 });
 
 /**
@@ -130,6 +158,7 @@ export const UpdateGymInputSchema = z.object({
   latitude: LatitudeSchema.optional().nullable(),
   longitude: LongitudeSchema.optional().nullable(),
   isPublic: z.boolean().optional(),
+  isListed: z.boolean().optional(),
   imageUrl: GymPhotoUrlSchema.optional().nullable(),
   logoUrl: GymLogoUrlSchema.optional().nullable(),
   brandPrimaryColor: HexColorSchema.optional().nullable(),
@@ -182,11 +211,34 @@ export const ReviewGymClaimInputSchema = z.object({
 });
 
 /**
+ * Take back an approved gym claim (global admin). A blank reason is no reason.
+ */
+export const RevertGymClaimInputSchema = z.object({
+  claimId: z.coerce.number().int().positive(),
+  reason: z
+    .string()
+    .trim()
+    .max(GYM_CLAIM_MESSAGE_MAX_LENGTH, 'Reason too long')
+    .nullish()
+    .transform((reason) => reason || null),
+});
+
+/**
  * Pending gym claims list input validation schema (admin)
  */
 export const PendingGymClaimsInputSchema = z.object({
   limit: z.number().int().min(1).max(50).optional().default(20),
   offset: z.number().int().min(0).optional().default(0),
+});
+
+/**
+ * Claims that approved themselves (admin). `claimId` narrows it to the one the
+ * daily digest's revert link names.
+ */
+export const AutoApprovedGymClaimsInputSchema = z.object({
+  limit: z.number().int().min(1).max(50).optional().default(20),
+  offset: z.number().int().min(0).optional().default(0),
+  claimId: z.coerce.number().int().positive().nullish(),
 });
 
 /**
@@ -218,6 +270,7 @@ export const FollowGymInputSchema = z.object({
  */
 export const MyGymsInputSchema = z.object({
   includeFollowed: z.boolean().optional(),
+  includeManaged: z.boolean().optional(),
   limit: z.number().int().min(1).max(50).optional().default(20),
   offset: z.number().int().min(0).optional().default(0),
 });
@@ -251,6 +304,7 @@ export const SearchGymsInputSchema = z.object({
   // slug predicate decision for every existing caller (mobile's useNearbyGyms,
   // the gym picker) instead of leaving their rendered SQL byte-identical.
   requireSlug: z.boolean().optional(),
+  requireLocation: z.boolean().optional(),
   prioritizeClaimed: z.boolean().optional(),
   latitude: z.number().min(-90).max(90).optional(),
   longitude: z.number().min(-180).max(180).optional(),
@@ -296,6 +350,8 @@ export const LinkBoardToGymInputSchema = z.object({
 export const AttachBoardToGymInputSchema = z.object({
   gymUuid: UUIDSchema,
   boardUuid: UUIDSchema,
+  allowSourceGymMerge: z.boolean().optional(),
+  expectedCurrentGymUuid: UUIDSchema.nullable().optional(),
 });
 
 /**
@@ -314,7 +370,22 @@ export const DetachBoardFromGymInputSchema = z.object({
  */
 export const GymStatsInputSchema = z.object({
   gymUuid: UUIDSchema,
-  period: z.enum(['week', 'month']).optional().default('week'),
+  boardUuid: UUIDSchema.nullish(),
+  period: z
+    .enum(['week', 'month', 'quarter'])
+    .nullish()
+    .transform((period) => period ?? 'week'),
+});
+
+export const SetGymReportingTimeZoneInputSchema = z.object({
+  gymUuid: UUIDSchema,
+  timeZone: z.string().trim().min(1).max(96).nullish(),
+});
+
+export const SetGymReportingBoardAliasInputSchema = z.object({
+  gymUuid: UUIDSchema,
+  boardUuid: UUIDSchema,
+  rootBoardUuid: UUIDSchema.nullish(),
 });
 
 /**
@@ -341,6 +412,8 @@ export const OrphanGymsInputSchema = z.object({
 export const MergeGymsInputSchema = z.object({
   canonicalGymUuid: UUIDSchema,
   duplicateGymUuids: z.array(UUIDSchema).min(1, 'Pick at least one duplicate').max(50),
+  // Internal administrative callers can retain their rationale in the merge audit.
+  reason: z.string().trim().min(10).max(1000).optional(),
   // Explicit acknowledgement required to keep a SYSTEM listing as the survivor
   // over a user-owned or claim-approved duplicate (an inverted pre-selection).
   allowSystemCanonicalOverride: z.boolean().optional().default(false),

@@ -1,0 +1,182 @@
+import { describe, expect, it } from 'vitest';
+import { resolveEditTap, type SprayEditTapResult, type SprayEditorTool } from '../spray-edit-tap';
+
+type Row = [label: string, tool: SprayEditorTool, hitId: number | null, selectedId: number | null, SprayEditTapResult];
+
+describe('resolveEditTap', () => {
+  // Rest mode, one row per line of the interaction table: an unselected ring
+  // (ON, OFF or maybe — the role does not change the answer), the selected
+  // ring, and bare wall with and without a selection.
+  it.each<Row>([
+    ['an unselected ring, nothing selected', 'edit', 4, null, 'select'],
+    ['an unselected ring, another selected', 'edit', 4, 7, 'select'],
+    ['a local (negative-id) ring', 'edit', -3, null, 'select'],
+    ['the selected ring', 'edit', 7, 7, 'toggle'],
+    ['the selected local ring', 'edit', -3, -3, 'toggle'],
+    ['bare wall with a selection', 'edit', null, 7, 'deselect'],
+    ['bare wall with nothing selected', 'edit', null, null, 'bareWallHint'],
+  ])('rest: %s', (_label, tool, hitId, selectedId, expected) => {
+    expect(resolveEditTap({ tool, hitId, selectedId })).toBe(expected);
+  });
+
+  it.each<Row>([
+    ['a second ring', 'join', 4, 7, 'merge'],
+    ['the hold being joined', 'join', 7, 7, 'none'],
+    ['bare wall', 'join', null, 7, 'none'],
+    ['a ring with nothing selected', 'join', 4, null, 'none'],
+  ])('join: %s', (_label, tool, hitId, selectedId, expected) => {
+    expect(resolveEditTap({ tool, hitId, selectedId })).toBe(expected);
+  });
+
+  it.each<Row>([
+    ['trace on a ring', 'trace', 4, 7, 'none'],
+    ['trace on bare wall', 'trace', null, 7, 'none'],
+    ['refine on a ring', 'refine', 4, 7, 'none'],
+    ['refine on bare wall', 'refine', null, 7, 'none'],
+    ['add on a ring', 'add', 4, null, 'none'],
+    ['add on bare wall', 'add', null, null, 'none'],
+  ])('other tools ignore stray taps: %s', (_label, tool, hitId, selectedId, expected) => {
+    expect(resolveEditTap({ tool, hitId, selectedId })).toBe(expected);
+  });
+
+  it('a double tap on a ring is select then toggle', () => {
+    const first = resolveEditTap({ tool: 'edit', hitId: 4, selectedId: null });
+    expect(first).toBe('select');
+    // The screen selects on the first, so the second sees it selected.
+    expect(resolveEditTap({ tool: 'edit', hitId: 4, selectedId: 4 })).toBe('toggle');
+  });
+
+  it('never answers a bare-wall tap with anything that adds a hold', () => {
+    const answers = (['edit', 'join', 'trace', 'add', 'refine'] as const).flatMap((tool) =>
+      [null, 7].map((selectedId) => resolveEditTap({ tool, hitId: null, selectedId })),
+    );
+    expect(answers.every((answer) => answer !== 'select' && answer !== 'toggle' && answer !== 'merge')).toBe(true);
+  });
+
+  type PencilRow = [label: string, hitId: number | null, selectedId: number | null, SprayEditTapResult];
+
+  it.each<PencilRow>([
+    ['a ring, nothing selected', 4, null, 'toggle'],
+    ['a ring, another selected', 4, 7, 'toggle'],
+    ['the selected ring', 7, 7, 'toggle'],
+    ['bare wall, nothing selected', null, null, 'addHold'],
+    ['bare wall with a selection', null, 7, 'addHold'],
+  ])('a Pencil tap on %s', (_label, hitId, selectedId, expected) => {
+    // The Pencil's rule does not depend on "Pencil only", which is about fingers.
+    for (const pencilOnly of [false, true]) {
+      expect(resolveEditTap({ tool: 'edit', hitId, selectedId, input: 'pencil', pencilOnly })).toBe(expected);
+    }
+  });
+
+  it.each<PencilRow>([
+    ['a ring, nothing selected', 4, null, 'select'],
+    ['a ring, another selected', 4, 7, 'select'],
+    ['the selected ring', 7, 7, 'none'],
+    ['bare wall with a selection', null, 7, 'deselect'],
+    ['bare wall, nothing selected', null, null, 'none'],
+  ])('a finger tap with Pencil only on: %s', (_label, hitId, selectedId, expected) => {
+    expect(resolveEditTap({ tool: 'edit', hitId, selectedId, input: 'finger', pencilOnly: true })).toBe(expected);
+  });
+
+  it('a Pencil tap in Join still only takes the second hold', () => {
+    expect(resolveEditTap({ tool: 'join', hitId: 4, selectedId: 7, input: 'pencil' })).toBe('merge');
+    expect(resolveEditTap({ tool: 'join', hitId: null, selectedId: 7, input: 'pencil' })).toBe('none');
+  });
+
+  it('never lets a finger change the wall with Pencil only on', () => {
+    const answers = [null, 4, 7].flatMap((hitId) =>
+      [null, 7].map((selectedId) =>
+        resolveEditTap({ tool: 'edit', hitId, selectedId, input: 'finger', pencilOnly: true }),
+      ),
+    );
+    expect(answers.some((answer) => answer === 'toggle' || answer === 'addHold')).toBe(false);
+  });
+
+  it('only puts the picked ring down for a tap past the photo’s edge', () => {
+    // The zoomed photo fills the screen; the dark band round it is not wall.
+    for (const input of ['finger', 'pencil'] as const) {
+      for (const pencilOnly of [false, true]) {
+        // A ring hit there (its outline poking past the edge) still does nothing.
+        for (const hitId of [null, 4, 7]) {
+          expect(resolveEditTap({ tool: 'edit', hitId, selectedId: 7, input, pencilOnly, onPhoto: false })).toBe(
+            'deselect',
+          );
+          expect(resolveEditTap({ tool: 'edit', hitId, selectedId: null, input, pencilOnly, onPhoto: false })).toBe(
+            'none',
+          );
+        }
+      }
+    }
+  });
+
+  it('never adds, joins or hints off the photo, whatever the tool', () => {
+    for (const tool of ['edit', 'trace', 'join', 'add', 'refine'] as const) {
+      for (const input of ['finger', 'pencil'] as const) {
+        const answer = resolveEditTap({ tool, hitId: 4, selectedId: 7, input, onPhoto: false });
+        expect(['deselect', 'none']).toContain(answer);
+        const bare = resolveEditTap({ tool, hitId: null, selectedId: null, input, onPhoto: false });
+        expect(bare).toBe('none');
+      }
+    }
+  });
+
+  describe('the pick step of Trace, Refine and Join', () => {
+    const holdModes = ['trace', 'refine', 'join'] as const;
+
+    it.each(holdModes)('%s: a tap on an ON ring makes it the hold, without switching it', (tool) => {
+      expect(resolveEditTap({ tool, hitId: 4, selectedId: null, picking: true, hitIsOn: true })).toBe('pickTarget');
+    });
+
+    it.each(holdModes)('%s: a tap on an OFF ring or a maybe asks for it on first', (tool) => {
+      expect(resolveEditTap({ tool, hitId: 4, selectedId: null, picking: true, hitIsOn: false })).toBe('pickNeedsOn');
+    });
+
+    it.each(holdModes)('%s: bare wall and the dark band do nothing', (tool) => {
+      expect(resolveEditTap({ tool, hitId: null, selectedId: null, picking: true })).toBe('none');
+      expect(resolveEditTap({ tool, hitId: 4, selectedId: null, picking: true, onPhoto: false })).toBe('none');
+    });
+
+    it('treats a Pencil tap and a Pencil-only finger the same as a finger', () => {
+      for (const input of ['finger', 'pencil'] as const) {
+        for (const pencilOnly of [false, true]) {
+          expect(
+            resolveEditTap({
+              tool: 'trace',
+              hitId: 4,
+              selectedId: null,
+              picking: true,
+              hitIsOn: true,
+              input,
+              pencilOnly,
+            }),
+          ).toBe('pickTarget');
+          expect(
+            resolveEditTap({
+              tool: 'join',
+              hitId: 4,
+              selectedId: null,
+              picking: true,
+              hitIsOn: false,
+              input,
+              pencilOnly,
+            }),
+          ).toBe('pickNeedsOn');
+        }
+      }
+    });
+
+    it('never answers with anything that changes the wall', () => {
+      const answers = holdModes.flatMap((tool) =>
+        [null, 4].flatMap((hitId) =>
+          [true, false].map((hitIsOn) => resolveEditTap({ tool, hitId, selectedId: null, picking: true, hitIsOn })),
+        ),
+      );
+      expect(answers.every((answer) => ['pickTarget', 'pickNeedsOn', 'none'].includes(answer))).toBe(true);
+    });
+
+    it('is ignored by Select and Add, which have no pick step', () => {
+      expect(resolveEditTap({ tool: 'edit', hitId: 4, selectedId: null, picking: true })).toBe('select');
+      expect(resolveEditTap({ tool: 'add', hitId: 4, selectedId: null, picking: true })).toBe('none');
+    });
+  });
+});

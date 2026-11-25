@@ -1,9 +1,10 @@
-import { eq } from 'drizzle-orm';
+import { canAccessResourceWithoutLink } from './privacy';
+import { and, desc, eq, inArray, isNotNull } from 'drizzle-orm';
 import type { BoardQueuePreview } from '@boardsesh/shared-schema';
 import { db } from '../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { pubsub } from '../pubsub';
-import { isBoardAnonReadable } from '../graphql/resolvers/board-presence/shared';
+import { isBoardAnonReadable, followBoardMergeChain } from '../graphql/resolvers/board-presence/shared';
 
 /**
  * Board-queue-preview tombstone + the session-visibility (gate 2) helpers.
@@ -32,7 +33,10 @@ export async function readBoardSessionPreviewGate(sessionId: string): Promise<Bo
     .from(dbSchema.boardSessions)
     .where(eq(dbSchema.boardSessions.id, sessionId))
     .limit(1);
-  return session ?? null;
+  return session
+    ? // A kiosk is a public listing: an unlisted session's link never reaches it.
+      { ...session, isPublic: session.isPublic && (await canAccessResourceWithoutLink('session', sessionId, null)) }
+    : null;
 }
 
 /** Whether this session may be previewed on public displays (gate 2). */
@@ -54,6 +58,96 @@ export function buildEmptyBoardQueuePreview(boardId: number): BoardQueuePreview 
     queueLength: 0,
     updatedAt: new Date().toISOString(),
   };
+}
+
+/** Public-only admin merges attest which former identities may retain a live preview binding.
+ * Old CLI merges carry no such privacy proof. Only direct, recent attestations
+ * on the current canonical row qualify; a later merge chain fails closed.
+ */
+export async function readAttestedMergedPreviewSources(canonicalBoardId: number) {
+  const [canonical] = await db
+    .select({ uuid: dbSchema.userBoards.uuid })
+    .from(dbSchema.userBoards)
+    .where(eq(dbSchema.userBoards.id, canonicalBoardId))
+    .limit(1);
+  if (!canonical) return [];
+  const events = await db
+    .select({ details: dbSchema.boardModerationEvents.details })
+    .from(dbSchema.boardModerationEvents)
+    .where(
+      and(
+        eq(dbSchema.boardModerationEvents.boardId, canonicalBoardId),
+        eq(dbSchema.boardModerationEvents.action, 'edited_by_staff'),
+      ),
+    )
+    .orderBy(desc(dbSchema.boardModerationEvents.id))
+    .limit(100);
+  const sourceUuids = [
+    ...new Set(
+      events.flatMap(({ details }) =>
+        details?.mutation === 'mergeDuplicateBoards' && details.merge?.canonicalBoardUuid === canonical.uuid
+          ? details.merge.duplicateBoardUuids
+          : [],
+      ),
+    ),
+  ];
+  if (!sourceUuids.length || sourceUuids.length > 100) return [];
+  const sources = await db
+    .select({
+      id: dbSchema.userBoards.id,
+      uuid: dbSchema.userBoards.uuid,
+      ownerId: dbSchema.userBoards.ownerId,
+      policy: dbSchema.resourcePrivacy,
+    })
+    .from(dbSchema.userBoards)
+    .leftJoin(
+      dbSchema.resourcePrivacy,
+      and(
+        eq(dbSchema.resourcePrivacy.kind, 'board'),
+        eq(dbSchema.resourcePrivacy.resourceId, dbSchema.userBoards.uuid),
+      ),
+    )
+    .where(
+      and(
+        eq(dbSchema.userBoards.isUnlisted, false),
+        inArray(dbSchema.userBoards.uuid, sourceUuids),
+        isNotNull(dbSchema.userBoards.deletedAt),
+        eq(dbSchema.userBoards.mergedIntoBoardUuid, canonical.uuid),
+      ),
+    );
+  return sources
+    .filter(
+      ({ ownerId, policy }) =>
+        !policy ||
+        (policy.ownerId === ownerId &&
+          policy.audience === 'public' &&
+          policy.locationAudience === 'public' &&
+          !policy.inheritFollowers),
+    )
+    .map(({ id, uuid }) => ({ id, uuid }));
+}
+
+/** Only explicit board merges may redirect a stale preview binding. Ordinary deletes stay silent. */
+export async function resolveMergedSessionPreviewBoardId(
+  sessionId: string,
+  originalBoardId: number,
+): Promise<number | null> {
+  const [original] = await db
+    .select({ deletedAt: dbSchema.userBoards.deletedAt, mergedIntoBoardUuid: dbSchema.userBoards.mergedIntoBoardUuid })
+    .from(dbSchema.userBoards)
+    .where(eq(dbSchema.userBoards.id, originalBoardId))
+    .limit(1);
+  if (!original?.deletedAt || !original.mergedIntoBoardUuid) return null;
+  const canonical = await followBoardMergeChain(original.mergedIntoBoardUuid);
+  if (!canonical || canonical.id === originalBoardId) return null;
+  const [session] = await db
+    .select({ boardId: dbSchema.boardSessions.boardId })
+    .from(dbSchema.boardSessions)
+    .where(eq(dbSchema.boardSessions.id, sessionId))
+    .limit(1);
+  if (!session || (session.boardId !== null && session.boardId !== canonical.id)) return null;
+  const sources = await readAttestedMergedPreviewSources(canonical.id);
+  return sources.some((source) => source.id === originalBoardId) ? canonical.id : null;
 }
 
 /**
@@ -96,7 +190,14 @@ export async function publishBoardQueuePreviewTombstoneForSession(sessionId: str
   const boundSessionId = await pubsub.getBoardSession(boardId);
   if (boundSessionId !== sessionId) return;
 
-  if (!(await isBoardAnonReadable(Number(boardId)))) return;
+  if (!(await isBoardAnonReadable(Number(boardId)))) {
+    const canonicalBoardId = await resolveMergedSessionPreviewBoardId(sessionId, Number(boardId));
+    if (canonicalBoardId === null || (await isPublicActiveSession(sessionId))) return;
+    // Loaded only after a merge, keeping the RoomManager/tombstone import graph acyclic.
+    const { republishBoardQueuePreviewForBoard } = await import('./board-queue-preview');
+    await republishBoardQueuePreviewForBoard(canonicalBoardId);
+    return;
+  }
   if (await isPublicActiveSession(sessionId)) return;
 
   pubsub.publishBoardQueuePreview(boardId, buildEmptyBoardQueuePreview(Number(boardId)));

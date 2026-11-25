@@ -9,8 +9,8 @@ const offlineStateCtrl = vi.hoisted(() => ({ state: 'off' as string }));
 const carouselCtrl = vi.hoisted(() => ({
   items: [] as { key: string; title: string }[],
   onSelect: null as ((item: { key: string }) => void) | null,
-  onDownload: null as ((item: { key: string }) => void) | null,
-  downloadLabelFor: null as ((item: { key: string; title: string }) => string) | null,
+  menuCapabilities: null as Record<string, boolean> | null,
+  onMenuAction: null as ((item: { key: string }, action: string, via: string) => void) | null,
 }));
 
 vi.mock('react-native', () => ({
@@ -18,6 +18,7 @@ vi.mock('react-native', () => ({
   ScrollView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
   Platform: { OS: 'ios', select: (spec: Record<string, unknown>) => spec.ios },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (color: string) => color,
   BackHandler: {
     addEventListener: (_event: string, handler: () => boolean) => {
@@ -35,27 +36,40 @@ vi.mock('react-native-safe-area-context', () => ({ useSafeAreaInsets: () => ({ t
 vi.mock('../../Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
-vi.mock('../../GlassSurface', () => ({
-  GlassSurface: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
-}));
 vi.mock('../../ActivityIndicator', () => ({
   ActivityIndicator: () => createElement('div', { 'data-testid': 'spinner' }),
 }));
-vi.mock('../../Button', () => ({
-  Button: ({ title, onPress }: { title: string; onPress: () => void }) =>
-    createElement('button', { onClick: onPress }, title),
+vi.mock('../../SheetTopBar', () => ({
+  // The top bar stub: its leading and trailing actions as clickable buttons.
+  SheetTopBar: ({
+    leading,
+    trailing,
+  }: {
+    leading?: { label?: string; onPress: () => void };
+    trailing?: { label: string; onPress: () => void };
+  }) =>
+    createElement(
+      'div',
+      null,
+      leading
+        ? createElement('button', { 'data-button': leading.label, onClick: leading.onPress }, leading.label)
+        : null,
+      trailing
+        ? createElement('button', { 'data-button': trailing.label, onClick: trailing.onPress }, trailing.label)
+        : null,
+    ),
 }));
 vi.mock('../../board-discovery/BoardCarousel', () => ({
   BoardCarousel: (props: {
     items: { key: string; title: string }[];
     onSelect: (item: { key: string }) => void;
-    onDownload?: (item: { key: string }) => void;
-    downloadLabelFor?: (item: { key: string; title: string }) => string;
+    menuCapabilities?: Record<string, boolean>;
+    onMenuAction?: (item: { key: string }, action: string, via: string) => void;
   }) => {
     carouselCtrl.items = props.items;
     carouselCtrl.onSelect = props.onSelect;
-    carouselCtrl.onDownload = props.onDownload ?? null;
-    carouselCtrl.downloadLabelFor = props.downloadLabelFor ?? null;
+    carouselCtrl.menuCapabilities = props.menuCapabilities ?? null;
+    carouselCtrl.onMenuAction = props.onMenuAction ?? null;
     return createElement('div', { 'data-testid': 'carousel' });
   },
 }));
@@ -76,7 +90,6 @@ vi.mock('../../../lib/onboarding/use-onboarding-copy', () => ({
     findAnother: 'Find another board',
     findFirst: 'Find my board',
     offlineSkip: 'Skip for now',
-    downloadLabelFor: (name: string) => `Keep ${name} on this phone`,
   }),
 }));
 
@@ -97,7 +110,6 @@ const BOARDS = [board('board-1', 'Klimmuur'), board('board-2', 'Sterk')];
 
 function renderStep(overrides: Partial<OnboardingBoardStepProps> = {}) {
   const props: OnboardingBoardStepProps = {
-    accentColor: '#6D28D9',
     bodyColor: '#888888',
     backgroundColor: '#ffffff',
     boards: BOARDS,
@@ -106,7 +118,6 @@ function renderStep(overrides: Partial<OnboardingBoardStepProps> = {}) {
     currentUserId: 'user-a',
     onSkipUnusable: null,
     onSelect: vi.fn(),
-    onDownload: vi.fn(),
     onFindBoard: vi.fn(),
     ...overrides,
   };
@@ -125,7 +136,8 @@ describe('OnboardingBoardStep', () => {
     offlineStateCtrl.state = 'off';
     carouselCtrl.items = [];
     carouselCtrl.onSelect = null;
-    carouselCtrl.onDownload = null;
+    carouselCtrl.menuCapabilities = null;
+    carouselCtrl.onMenuAction = null;
     cleanup();
   });
 
@@ -161,17 +173,23 @@ describe('OnboardingBoardStep', () => {
     expect(props.onSelect).not.toHaveBeenCalled();
   });
 
-  it('offers a per-card download, labelled with the board it would save', () => {
-    const { props } = renderStep();
+  // Onboarding cards carry no menu: no ⋯, no hold, no download before the pick.
+  // The download is offered once the board is bound (OnboardingBoardRoute).
+  it('draws plain cards with no menu', () => {
+    renderStep();
 
-    expect(carouselCtrl.downloadLabelFor?.({ key: 'board-1', title: 'Klimmuur' })).toBe('Keep Klimmuur on this phone');
-    carouselCtrl.onDownload?.({ key: 'board-1' });
-    expect(props.onDownload).toHaveBeenCalledWith(BOARDS[0]);
+    expect(carouselCtrl.menuCapabilities).toBeNull();
+    expect(carouselCtrl.onMenuAction).toBeNull();
   });
 
-  it('hides the download glyph where the engine cannot run', () => {
-    renderStep({ offlineDownloadsEnabled: false });
-    expect(carouselCtrl.onDownload).toBeNull();
+  it('says the download comes after the pick, where the engine can run', () => {
+    const { getByText } = renderStep();
+    expect(getByText('Keep it on your phone.')).toBeTruthy();
+  });
+
+  it('drops that line where the engine cannot run', () => {
+    const { queryByText } = renderStep({ offlineDownloadsEnabled: false });
+    expect(queryByText('Keep it on your phone.')).toBeNull();
   });
 
   describe('with boards to choose from', () => {
@@ -215,7 +233,8 @@ describe('OnboardingBoardStep', () => {
       const onSkipUnusable = vi.fn();
       const { container, getByText } = renderStep({ boards: [], onSkipUnusable });
 
-      expect(buttonTitles(container)).toEqual(['Find my board', 'Skip for now']);
+      // Leading decline, then the trailing picker.
+      expect(buttonTitles(container)).toEqual(['Skip for now', 'Find my board']);
       fireEvent.click(getByText('Skip for now'));
       expect(onSkipUnusable).toHaveBeenCalled();
     });

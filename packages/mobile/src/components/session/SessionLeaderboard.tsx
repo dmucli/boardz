@@ -15,7 +15,7 @@ import { spacing, borderRadius } from '../../theme/tokens';
 import { useTheme } from '../../providers/theme-provider';
 import { useGradeFormat } from '../../hooks/use-grade-format';
 import { useBoardseshGradesActive } from '../../hooks/use-display-grade';
-import { resolveCrowdDifficultyId, GRADE_BY_ID, clampDifficultyId } from '../../lib/boardsesh-grade-display';
+import { resolveCrowdDifficultyId, getBoulderGradeById, clampDifficultyId } from '../../lib/boardsesh-grade-display';
 
 type SessionLeaderboardProps = {
   participants: SessionFeedParticipant[];
@@ -23,7 +23,7 @@ type SessionLeaderboardProps = {
   ticks: SessionDetailTick[];
 };
 
-type Hardest = { difficulty: number; name: string | null };
+type Hardest = { difficulty: number; name: string | null; boardType: string };
 
 /**
  * Per-climber leaderboard for multi-user sessions: ranked by sends (then flashes,
@@ -34,7 +34,7 @@ type Hardest = { difficulty: number; name: string | null };
 export function SessionLeaderboard({ participants, ticks }: SessionLeaderboardProps) {
   const { t } = useTranslation('session');
   const { t: tYou } = useTranslation('you');
-  const { brandColors } = useTheme();
+  const { brandColors, chartColors } = useTheme();
   const boardseshActive = useBoardseshGradesActive();
 
   // Each climber's hardest grade (max difficulty among their sends/flashes).
@@ -49,10 +49,10 @@ export function SessionLeaderboard({ participants, ticks }: SessionLeaderboardPr
       const difficulty = tick.difficulty ?? crowdDifficulty ?? -1;
       const name =
         crowdDifficulty != null
-          ? (GRADE_BY_ID.get(clampDifficultyId(crowdDifficulty))?.difficulty_name ?? null)
+          ? (getBoulderGradeById(clampDifficultyId(crowdDifficulty), tick.boardType)?.difficulty_name ?? null)
           : (tick.difficultyName ?? null);
       const prev = best.get(tick.userId);
-      if (!prev || difficulty > prev.difficulty) best.set(tick.userId, { difficulty, name });
+      if (!prev || difficulty > prev.difficulty) best.set(tick.userId, { difficulty, name, boardType: tick.boardType });
     }
     return best;
   }, [ticks, boardseshActive]);
@@ -86,7 +86,9 @@ export function SessionLeaderboard({ participants, ticks }: SessionLeaderboardPr
           showSeparator
           trailing={
             <View style={styles.trailing}>
-              {entry.hardest?.name ? <HardestPill grade={entry.hardest.name} /> : null}
+              {entry.hardest?.name ? (
+                <HardestPill grade={entry.hardest.name} boardType={entry.hardest.boardType} />
+              ) : null}
               <View style={styles.chips}>
                 {entry.participant.sends > 0 && (
                   <Chip icon="tick" label={`${entry.participant.sends}`} tint={brandColors.success} />
@@ -95,7 +97,7 @@ export function SessionLeaderboard({ participants, ticks }: SessionLeaderboardPr
                   <Chip icon="flash" label={`${entry.participant.flashes}`} tint={brandColors.warning} />
                 )}
                 {entry.participant.attempts > 0 && (
-                  <Chip icon="circle" label={`${entry.participant.attempts}`} tint={iosSystemColors.systemGray} />
+                  <Chip icon="circle" label={`${entry.participant.attempts}`} tint={chartColors.secondaryLabel} />
                 )}
               </View>
             </View>
@@ -114,7 +116,7 @@ function RankAvatar({ participant, isLeader }: { participant: SessionFeedPartici
       <Avatar uri={participant.avatarUrl} name={participant.displayName} size={32} />
       {isLeader ? (
         <View style={[styles.crownBadge, { backgroundColor: brandColors.accent }]}>
-          <Icon name="crown" size={10} color={iosSystemColors.white} />
+          <Icon name="crown.fill" size={10} color={iosSystemColors.white} />
         </View>
       ) : null}
     </View>
@@ -122,13 +124,13 @@ function RankAvatar({ participant, isLeader }: { participant: SessionFeedPartici
 }
 
 /** Quiet grade-tinted pill showing a climber's hardest grade. */
-function HardestPill({ grade }: { grade: string }) {
+function HardestPill({ grade, boardType }: { grade: string; boardType: string }) {
   const { formatGrade } = useGradeFormat();
   const gradeColor = gradeBadgeColor(grade);
-  const displayGrade = formatGrade(grade) ?? grade;
+  const displayGrade = formatGrade(grade, boardType) ?? grade;
   return (
     <View style={[styles.hardestPill, { backgroundColor: withAlpha(gradeColor, 0.15) }]}>
-      <Text variant="caption1" color={gradeColor} style={styles.hardestText}>
+      <Text variant="caption1" color={gradeColor} numeric style={styles.hardestText}>
         {displayGrade}
       </Text>
     </View>
@@ -139,7 +141,7 @@ function Chip({ icon, label, tint }: { icon: IconName; label: string; tint: stri
   return (
     <View style={[styles.chip, { backgroundColor: withAlpha(tint, 0.15) }]}>
       <Icon name={icon} size={11} color={tint} />
-      <Text variant="caption1" color={tint} style={styles.chipLabel}>
+      <Text variant="caption1" color={tint} numeric style={styles.chipLabel}>
         {label}
       </Text>
     </View>

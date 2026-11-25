@@ -332,13 +332,19 @@ export const boardClimbs = pgTable(
     hiddenAt: timestamp('hidden_at'),
     createdAt: text('created_at'),
     // Timestamp of the first non-draft save. Null while the climb is still a
-    // draft. Used by the create-climb form to gate the post-publish edit window
-    // (users can continue tweaking a published climb for 24h).
+    // draft. An edit never moves it. On the catalogue boards it gates the
+    // post-publish edit window (the setter can keep tweaking a published climb
+    // for 24h). A spray wall has no window: the setter, or anyone who can edit
+    // the wall, can edit a published climb at any time. Either way each edit is
+    // kept in `board_climb_revisions`, whose revision 1 is dated to this.
     publishedAt: text('published_at'),
     synced: boolean('synced').default(true).notNull(),
     syncError: text('sync_error'),
     // Boardsesh user who created this climb locally (null for Aurora-synced climbs)
     userId: text('user_id').references(() => users.id, { onDelete: 'set null' }),
+    // Account deletion clears userId. Preserve origin so retained public app
+    // climbs never enter immutable vendor snapshots or trust cached FA names.
+    isBoardseshAuthored: boolean('is_boardsesh_authored').default(false).notNull(),
     // Denormalized: which hold sets does this climb require? (from climb_holds → placements)
     requiredSetIds: integer('required_set_ids').array(),
     // Denormalized: which product_size IDs can display this climb? (from edge comparison)
@@ -355,9 +361,11 @@ export const boardClimbs = pgTable(
     // 'method_footless', 'method_footless_kickboard', 'method_no_kickboard'
     // (see @boardsesh/shared-schema CLIMB_CHARACTERISTICS). Internal reads/filters
     // use this array; the description prefix stays only as the Aurora wire format.
-    // A GIN index (board_climbs_characteristics_idx) is created in a custom
-    // migration — like compatible_size_ids' GIN index (migration 0073), kept out
-    // of the schema so drizzle-kit generate never emits a destructive diff for it.
+    // The rule matcher filters COALESCE(characteristics, legacy Aurora
+    // description fallback) with array containment, so a plain-column GIN
+    // index does not match that expression. Migration 0135 built the
+    // board_climbs_characteristics_idx GIN index; production never scanned it,
+    // and migration 0250 removes it.
     characteristics: text('characteristics').array(),
     // Spray walls only: how many of this climb's holds have come off the wall
     // (`spray_wall_holds.removed_version_id IS NOT NULL`). NULL on every other
@@ -365,13 +373,43 @@ export const boardClimbs = pgTable(
     // derived because climb integrity has to be filterable in the mobile SQLite
     // mirror too, and that mirror carries no `board_climb_holds` table to join.
     // Recomputed per wall by `recomputeMissingHoldCounts` (SW-04) whenever a
-    // reset commits.
+    // wall version publishes, which is when a hold edit's removal lands.
     missingHoldCount: integer('missing_hold_count'),
+    // Spray walls only: the climb lost at least one hold in a reset its owner
+    // marked as a FULL reset (`spray_wall_versions.is_full_reset`), so the wall's
+    // climb list hides it by default (#6024). Derived, like `missingHoldCount`,
+    // and recomputed by the same two functions: a climb edited onto holds still
+    // on the wall drops back to false on its own. NULL means "never computed" and
+    // reads as not retired, which is every catalogue climb.
+    retiredByReset: boolean('retired_by_reset'),
+    // The climb's revision (#6023): the highest `revision_number` it had in
+    // `board_climb_revisions` when edits still recorded revisions, or 1. Nothing
+    // writes it any more (revision history was retired), so it is frozen at its
+    // stored value. No server query reads it as a rule; it is still sent to
+    // clients (search rows, `syncClimbs`) until the column is dropped.
+    revisionNumber: integer('revision_number').notNull().default(1),
+    // The revision at which the holds last changed (frames or frame count),
+    // frozen with `revisionNumber`. The server rule that compared a tick's
+    // revision with it ("holds epoch") was removed, and migration 0263 set any
+    // value above 1 back to 1 because the app still makes that comparison. The
+    // column is only passed through to clients until it is dropped.
+    holdsRevisionNumber: integer('holds_revision_number').notNull().default(1),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
     syncSeq: bigserial('sync_seq', { mode: 'number' }).notNull(),
   },
   (table) => ({
-    boardTypeIdx: index('board_climbs_board_type_idx').on(table.boardType),
+    // Layout-scoped reads (sitemap board configs, catalogue counts) and any
+    // whole-board range scan. Created in migration 0025, dropped from the schema
+    // in 0067 but never from production, where it carries ~560k scans a week;
+    // declared again (IF NOT EXISTS) so a future generate cannot drop it. It
+    // also replaces the old single-column board_climbs_board_type_idx.
+    layoutFilterIdx: index('board_climbs_layout_filter_idx').on(
+      table.boardType,
+      table.layoutId,
+      table.isListed,
+      table.isDraft,
+      table.framesCount,
+    ),
     // Leading board_type: every syncClimbs pull filters on it before walking
     // the (updated_at, sync_seq) cursor, so a per-board pull is one range scan.
     syncCursorIdx: index('board_climbs_sync_cursor_idx').on(table.boardType, table.updatedAt, table.syncSeq),
@@ -400,8 +438,19 @@ export const boardClimbs = pgTable(
     userIdIdx: index('board_climbs_user_id_idx')
       .on(table.userId)
       .where(sql`${table.userId} IS NOT NULL AND ${table.isDraft} = false`),
+    // Personal archives include drafts as well as published climbs.
+    userExportIdx: index('board_climbs_user_export_idx')
+      .on(table.userId, table.boardType)
+      .where(sql`${table.userId} IS NOT NULL`),
     // Index for climb name lookups (used by JSON import to resolve names to UUIDs)
     nameIdx: index('board_climbs_name_idx').on(table.boardType, table.name),
+    // The climbs whose holds were ever moved by an edit (#6023). No query reads
+    // this index since the holds-epoch rule was removed; it stays declared so
+    // the schema matches the database, and goes with `holdsRevisionNumber`.
+    // Built out-of-band in production (see the migration's header).
+    holdsMovedIdx: index('board_climbs_holds_moved_idx')
+      .on(table.boardType, table.uuid, table.holdsRevisionNumber)
+      .where(sql`${table.holdsRevisionNumber} > 1`),
     // Note: a GIN index on compatible_size_ids already exists from migration 0073
     // (board_climbs_compatible_size_ids_idx); the recommendation size filter uses
     // `compatible_size_ids @> ARRAY[sizeId]` so it can use that existing index.
@@ -681,10 +730,15 @@ export const boardClimbStats = pgTable(
     // (Historically upstream was split into aurora_/kilter_ columns for the two
     // Kilter backends; migration 0141 folded them into GREATEST(aurora, kilter) and
     // dropped the kilter column.)
-    // Keep it as a regular column (not GENERATED) so the custom covering indexes
-    // (board_climb_stats_ascents_covering_idx, migration 0068; the v2 variant with
-    // climb_uuid as a trailing key column, migration 0122) keep working.
+    // Keep it as a regular column (not GENERATED) so the custom covering index
+    // (board_climb_stats_ascents_covering_v2_idx, migration 0122, with climb_uuid
+    // as a trailing key column) keeps working. The v1 index from 0068 was a
+    // strict prefix of it and is removed in migration 0250.
     ascensionistCount: bigint('ascensionist_count', { mode: 'number' }),
+    // Estimated native board selections lasting at least 30 seconds, per angle.
+    // Server-only until the API/offline contract ships; do not advance the stats
+    // sync cursor when this hourly materialized count changes.
+    playCount: bigint('play_count', { mode: 'number' }).notNull().default(0),
     upstreamAscensionistCount: bigint('upstream_ascensionist_count', { mode: 'number' }),
     boardseshAscensionistCount: bigint('boardsesh_ascensionist_count', { mode: 'number' }),
     difficultyAverage: doublePrecision('difficulty_average'),
@@ -757,6 +811,10 @@ export const boardClimbStats = pgTable(
   },
   (table) => ({
     pk: primaryKey({ columns: [table.boardType, table.climbUuid, table.angle] }),
+    positivePlayCountIdx: index('board_climb_stats_positive_play_count_idx')
+      .on(table.boardType, table.climbUuid, table.angle)
+      .where(sql`${table.playCount} > 0`),
+    playCountNonnegativeCheck: check('board_climb_stats_play_count_nonnegative', sql`${table.playCount} >= 0`),
     // Leading board_type: every syncClimbStats pull filters on it before walking
     // the (updated_at, sync_seq) cursor, so a per-board pull is one range scan.
     syncCursorIdx: index('board_climb_stats_sync_cursor_idx').on(table.boardType, table.updatedAt, table.syncSeq),
@@ -842,6 +900,25 @@ export const boardClimbStatsHistory = pgTable(
   },
   (table) => ({
     boardTypeClimbIdx: index('board_climb_stats_history_lookup_idx').on(table.boardType, table.climbUuid, table.angle),
+  }),
+);
+
+// The benchmark grades Aurora published for Kilter climbs, frozen as they stood
+// before Kilter's Verified list took over `board_climb_stats.benchmark_difficulty`
+// (#2493). Kept on purpose as the record to compare with Kilter's own
+// `officialKilterDifficulty`, which matches it almost row for row. One migration
+// created and filled this table, and nothing writes to it afterwards. No foreign
+// key to `board_climbs`, so a climb's record outlives the climb.
+export const kilterAuroraBenchmarks = pgTable(
+  'kilter_aurora_benchmarks',
+  {
+    climbUuid: text('climb_uuid').notNull(),
+    angle: integer('angle').notNull(),
+    benchmarkDifficulty: doublePrecision('benchmark_difficulty').notNull(),
+    capturedAt: timestamp('captured_at').defaultNow().notNull(),
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.climbUuid, table.angle] }),
   }),
 );
 

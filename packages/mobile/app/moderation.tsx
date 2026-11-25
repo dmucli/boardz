@@ -4,7 +4,7 @@
 // notification from either tab, and the play drawer's Community section — and
 // the last one is why the route lives at the root. `/play` is itself a root
 // `transparentModal`, so a push aimed at a tab stack lands BENEATH the player:
-// a dead tap and a screen nobody can reach (docs/mobile-sheets-vs-routes.md,
+// a dead tap and a screen nobody can reach (docs/mobile/mobile-sheets-vs-routes.md,
 // "Pushing a route from INSIDE a modal route"). A root `modal` card presents
 // above whatever is already open, so one route serves all three.
 //
@@ -19,11 +19,11 @@
 // Keeping the gate in the screen also covers any future host of it.
 
 import { Stack, router, useLocalSearchParams } from 'expo-router';
-import { Pressable } from 'react-native';
 import { useTranslation } from 'react-i18next';
-import { Icon } from '../src/components/Icon';
+import { HeaderLeadingButton } from '../src/components/HeaderActionButtons';
 import { ModerationFeedScreen } from '../src/components/moderation/ModerationFeedScreen';
 import { useStackScreenOptions } from '../src/hooks/use-stack-screen-options';
+import { holdUntilLaunchReady } from '../src/components/launch-update/hold-until-launch-ready';
 
 type Params = {
   /** Proposal to scroll to and outline (from a notification or the play drawer). */
@@ -32,13 +32,13 @@ type Params = {
   boardType?: string;
 };
 
-export default function ModerationRoute() {
+function ModerationRoute() {
   const params = useLocalSearchParams<Params>();
   const { t } = useTranslation('common');
   const { t: tClimbs } = useTranslation('climbs');
   // Variant-aware header from the shared hook, the same way about/changelog/scout
-  // title themselves: a transparent blur header on Liquid Glass, an opaque M3 app
-  // bar on Material.
+  // title themselves: a transparent header on Liquid Glass, an opaque M3 app bar
+  // on Material.
   const screenOptions = useStackScreenOptions();
 
   return (
@@ -51,15 +51,12 @@ export default function ModerationRoute() {
           // Same call the boards picker makes: a modal reached from three
           // different surfaces needs a visible way out, not only the iOS
           // swipe-down.
-          headerLeft: ({ tintColor }) => (
-            <Pressable
+          headerLeft: () => (
+            <HeaderLeadingButton
+              kind="close"
               onPress={() => router.back()}
-              hitSlop={8}
-              accessibilityRole="button"
               accessibilityLabel={t('ariaLabels.close')}
-            >
-              <Icon name="close" size={22} color={tintColor} />
-            </Pressable>
+            />
           ),
         }}
       />
@@ -71,3 +68,8 @@ export default function ModerationRoute() {
     </>
   );
 }
+
+// iOS presents this route as a native modal, above the launch update
+// placeholder, and a URL can open it on a cold start. Held until launch is
+// ready so a gate reload cannot land mid-tap (#6006).
+export default holdUntilLaunchReady(ModerationRoute, { header: 'visible' });

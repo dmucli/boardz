@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
+vi.mock('../use-ios-sheet-background-style', () => ({ useIosSheetBackgroundStyle: () => undefined }));
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent } from '@testing-library/react';
-import { createElement, forwardRef, type ReactNode, type Ref } from 'react';
+import { act, render, fireEvent } from '@testing-library/react';
+import { createElement, forwardRef, useImperativeHandle, useState, type ReactNode, type Ref } from 'react';
 
 // LogAscentSheet wraps `onClose` in a `handleClose` that fires
 // `Quick Tick Dismissed` unless the just-closed tick was actually saved
@@ -11,13 +12,27 @@ import { createElement, forwardRef, type ReactNode, type Ref } from 'react';
 // `onChange`), and a successful save (simulated through the stubbed form hook).
 //
 // The sheet chrome is ModalSheet now, so the #3330 detent bound is re-derived
-// through it: the column-bearing view is ModalSheet's KeyboardAvoidingView, and
-// the detent tests below assert its height at each snap point exactly as they
-// used to assert the hand-rolled column's.
+// through it: the column-bearing view is ModalSheet's chrome column, and the
+// detent tests below assert its height at each snap point exactly as they used
+// to assert the hand-rolled column's. The keyboard tests drive that column's and
+// the action bar's bottom padding through the mocked Keyboard events.
 
 // Mutable so a test can flip the platform; reset in beforeEach. The iOS branch
 // is the one that pins a numeric column height (useSheetColumnStyle).
 const platformMock = vi.hoisted(() => ({ OS: 'ios' as 'ios' | 'android', Version: '26.1' as string }));
+type KeyboardListener = (event: {
+  endCoordinates?: { height: number; screenY: number; width: number };
+  duration?: number;
+}) => void;
+const keyboardListeners = vi.hoisted(() => new Map<string, KeyboardListener>());
+const dimensions = vi.hoisted(() => ({ width: 390, height: 844, fontScale: 1 }));
+const safeInsets = vi.hoisted(() => ({ top: 44, bottom: 34, left: 0, right: 0 }));
+const language = vi.hoisted(() => ({ resolvedLanguage: 'en-US' }));
+const layoutHandlers = vi.hoisted(
+  () => new Map<string, (event: { nativeEvent: { layout: { height: number } } }) => void>(),
+);
+const nativeMeasurements = vi.hoisted(() => [] as { testID: string; deliver: (height: number) => void }[]);
+const sheetControls = vi.hoisted(() => ({ snapToIndex: vi.fn() }));
 
 // Captures what LogAscentSheet handed the form hook, so the climb/board
 // plumbing can be asserted without running the real hook (tested next door in
@@ -30,6 +45,15 @@ const formInput = vi.hoisted(() => ({
     savedRef?: { current: boolean };
   },
 }));
+// The angle the stubbed form reports the climber has picked. `null` = untouched,
+// so the form reads the opening angle, as the real hook does.
+const pickedAngle = vi.hoisted(() => ({ current: null as number | null }));
+
+type SwipeConfig = {
+  onMoveShouldSetPanResponder: (event: unknown, gesture: { dx: number; dy: number }) => boolean;
+  onPanResponderGrant: () => void;
+};
+const swipeHandlers = vi.hoisted(() => new Map<string, SwipeConfig>());
 
 vi.mock('react-native', () => ({
   Platform: {
@@ -43,12 +67,55 @@ vi.mock('react-native', () => ({
       platformMock.OS === 'ios' ? options.ios : options.android,
   },
   // Serialised so a test can read the style a view was handed.
-  View: ({ children, style, testID }: { children?: ReactNode; style?: unknown; testID?: string }) =>
-    createElement('div', { 'data-style': JSON.stringify(style ?? null), 'data-testid': testID }, children),
-  // ModalSheet's single in-flow child once a header or footer is present — the
-  // view that carries the detent bound.
-  KeyboardAvoidingView: ({ children, style }: { children?: ReactNode; style?: unknown }) =>
-    createElement('div', { 'data-style': JSON.stringify(style ?? null), 'data-testid': 'sheet-column' }, children),
+  View: forwardRef(
+    (
+      {
+        children,
+        style,
+        testID,
+        onLayout,
+        swipeConfig,
+      }: {
+        children?: ReactNode;
+        style?: unknown;
+        testID?: string;
+        onLayout?: (event: { nativeEvent: { layout: { height: number } } }) => void;
+        swipeConfig?: SwipeConfig;
+      },
+      ref: Ref<unknown>,
+    ) => {
+      if (testID && onLayout) layoutHandlers.set(testID, onLayout);
+      if (testID && swipeConfig) swipeHandlers.set(testID, swipeConfig);
+      else if (testID) swipeHandlers.delete(testID);
+      const measuredHeight = flattenStyle(style).height;
+      useImperativeHandle(
+        ref,
+        () => ({
+          measure: (callback: (left: number, top: number, width: number, height: number) => void) => {
+            if (testID) nativeMeasurements.push({ testID, deliver: (height) => callback(0, 0, 0, height) });
+          },
+          // The native sheet's 16pt content offset is local, not a screen y.
+          measureInWindow: (callback: (x: number, y: number, width: number, height: number) => void) => {
+            if (testID === 'sheet-chrome-column' && measuredHeight > 0) {
+              callback(0, 16, dimensions.width, measuredHeight);
+            }
+          },
+        }),
+        [testID, measuredHeight],
+      );
+      return createElement('div', { 'data-style': JSON.stringify(style ?? null), 'data-testid': testID }, children);
+    },
+  ),
+  Keyboard: {
+    addListener: (eventName: string, listener: KeyboardListener) => {
+      keyboardListeners.set(eventName, listener);
+      return { remove: () => keyboardListeners.delete(eventName) };
+    },
+    isVisible: () => false,
+    metrics: () => undefined,
+  },
+  LayoutAnimation: { configureNext: vi.fn() },
+  PanResponder: { create: (swipeConfig: SwipeConfig) => ({ panHandlers: { swipeConfig } }) },
   Pressable: ({
     children,
     accessibilityLabel,
@@ -74,11 +141,11 @@ vi.mock('react-native', () => ({
       return style as Record<string, unknown>;
     },
   },
-  useWindowDimensions: () => ({ width: 390, height: 844 }),
+  useWindowDimensions: () => dimensions,
 }));
 
 vi.mock('react-native-safe-area-context', () => ({
-  useSafeAreaInsets: () => ({ top: 44, bottom: 34, left: 0, right: 0 }),
+  useSafeAreaInsets: () => safeInsets,
 }));
 
 // Stub BottomSheetModal: renders extra buttons that invoke the `onChange` prop —
@@ -86,8 +153,15 @@ vi.mock('react-native-safe-area-context', () => ({
 // sheet settling on its taller (keyboard-extended) detent.
 vi.mock('@expo/ui/community/bottom-sheet', () => ({
   BottomSheetModal: forwardRef(
-    ({ children, onChange }: { children?: ReactNode; onChange?: (index: number) => void }, _ref: Ref<unknown>) =>
-      createElement('div', null, [
+    (
+      {
+        children,
+        onChange,
+        snapPoints,
+      }: { children?: ReactNode; onChange?: (index: number) => void; snapPoints?: (string | number)[] },
+      _ref: Ref<unknown>,
+    ) =>
+      createElement('div', { 'data-testid': 'native-sheet', 'data-snap-points': JSON.stringify(snapPoints) }, [
         createElement('button', {
           key: 'pandown',
           'data-testid': 'simulate-pandown',
@@ -98,6 +172,11 @@ vi.mock('@expo/ui/community/bottom-sheet', () => ({
           'data-testid': 'simulate-expand',
           onClick: () => onChange?.(1),
         }),
+        createElement('button', {
+          key: 'collapse',
+          'data-testid': 'simulate-collapse',
+          onClick: () => onChange?.(0),
+        }),
         children,
       ]),
   ),
@@ -106,7 +185,7 @@ vi.mock('@expo/ui/community/bottom-sheet', () => ({
   BottomSheetView: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
 }));
 
-vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key, i18n: language }) }));
 
 // Isolate from the real presentation coordinator (covered by its own test);
 // forward straight to the `onClose` ModalSheet was given — a -1 onChange stands
@@ -117,7 +196,7 @@ vi.mock('../../providers/sheet-presentation-provider', () => ({
       if (index === -1) onClose?.();
     },
     onFullyDismissed: vi.fn(),
-    handle: { present: vi.fn(), dismiss: vi.fn(), close: vi.fn() },
+    handle: { present: vi.fn(), dismiss: vi.fn(), close: vi.fn(), snapToIndex: sheetControls.snapToIndex },
   }),
 }));
 
@@ -129,7 +208,7 @@ vi.mock('../../providers/theme-provider', () => ({
   }),
 }));
 
-vi.mock('../../lib/haptics', () => ({ hapticMedium: vi.fn() }));
+vi.mock('../../lib/haptics', () => ({ hapticMedium: vi.fn(), hapticSelection: vi.fn() }));
 vi.mock('../../theme/tokens', () => ({ spacing: new Proxy({}, { get: () => 0 }) }));
 
 // The tick chrome, stubbed down to the props LogAscentSheet is responsible for
@@ -137,8 +216,47 @@ vi.mock('../../theme/tokens', () => ({ spacing: new Proxy({}, { get: () => 0 }) 
 // run against the shipped CREATE_TICK_SNAP_POINTS rather than a copy.
 vi.mock('../tick', async () => {
   const metrics = await vi.importActual<typeof import('../tick/tick-sheet-metrics')>('../tick/tick-sheet-metrics');
+  const swipe = await vi.importActual<typeof import('../tick/use-swipe-up-to-open')>('../tick/use-swipe-up-to-open');
   return {
     ...metrics,
+    useSwipeUpToOpen: swipe.useSwipeUpToOpen,
+    TickFormRow: ({ children, testID }: { children?: ReactNode; testID?: string }) =>
+      createElement('div', { 'data-testid': testID }, children),
+    TickCountRail: () => createElement('span', null, 'tries'),
+    TickAngleControl: ({ value }: { value: number }) =>
+      createElement('span', { 'data-testid': 'tick-angle-value' }, value),
+    // A copy of the real rule; the rule itself is tested in
+    // tick/__tests__/tick-angle-control.test.tsx.
+    shouldShowAngleRow: (boardName: string | undefined, angles: number[]) =>
+      boardName !== 'spray' && angles.length >= 2,
+    TickDateRow: ({ value, onChange }: { value: Date; onChange: (next: Date) => void }) =>
+      createElement(
+        'button',
+        {
+          'data-testid': 'tick-date-value',
+          'data-date-value': value.toISOString(),
+          onClick: () => onChange(new Date('2025-03-15T12:00:00.000Z')),
+        },
+        'date',
+      ),
+    TickDetailsRow: ({
+      angle,
+      openingAngle,
+      dateEdited,
+      onPress,
+    }: {
+      angle: number | null;
+      openingAngle: number;
+      dateEdited: boolean;
+      onPress: () => void;
+    }) =>
+      createElement('button', {
+        'data-testid': 'tick-details-row',
+        'data-angle': String(angle),
+        'data-opening-angle': String(openingAngle),
+        'data-date-edited': String(dateEdited),
+        onClick: onPress,
+      }),
     TickSheetHeader: ({
       title,
       subtitle,
@@ -164,19 +282,23 @@ vi.mock('../tick', async () => {
       primary,
       secondary,
       error,
+      note,
     }: {
-      primary: { title: string; onPress: () => void; accessibilityLabel?: string };
+      primary: { title: string; onPress: () => void; accessibilityLabel?: string; disabled?: boolean };
       secondary?: { title: string; onPress: () => void; accessibilityLabel?: string };
       error?: string | null;
+      note?: ReactNode;
     }) =>
       createElement(
         'div',
         { 'data-testid': 'tick-action-bar', 'data-error': error ?? '' },
+        note,
         createElement('button', {
           key: 'primary',
           'data-testid': 'simulate-save-success',
           'data-label': primary.accessibilityLabel,
           'data-title': primary.title,
+          'data-disabled': String(primary.disabled ?? false),
           onClick: primary.onPress,
         }),
         secondary
@@ -189,6 +311,27 @@ vi.mock('../tick', async () => {
             })
           : null,
       ),
+    TickNoteField: ({
+      value,
+      onChangeText,
+      compact,
+      onFocus,
+      accessibilityLabel,
+    }: {
+      value: string;
+      onChangeText: (next: string) => void;
+      compact?: boolean;
+      onFocus?: () => void;
+      accessibilityLabel: string;
+    }) =>
+      createElement('textarea', {
+        'data-testid': 'tick-note',
+        'data-compact': String(compact),
+        'aria-label': accessibilityLabel,
+        value,
+        onFocus,
+        onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => onChangeText(event.currentTarget.value),
+      }),
   };
 });
 
@@ -199,27 +342,42 @@ vi.mock('../play-drawer/use-quick-tick-form', () => ({
   useQuickTickForm: (input: {
     climbUuid: string;
     baseAscensionistCount: number;
+    boardName: string;
+    angle: number;
     onDismiss: () => void;
     savedRef?: { current: boolean };
   }) => {
     formInput.current = input;
+    const [comment, setComment] = useState('');
+    const [climbedAt, setClimbedAt] = useState(new Date('2025-06-01T08:00:00.000Z'));
+    const [climbedAtEdited, setClimbedAtEdited] = useState(false);
     return {
+      boardName: input.boardName,
+      angle: pickedAngle.current ?? input.angle,
+      openingAngle: input.angle,
       tickState: { quality: null, difficulty: undefined, attemptCount: 1 },
-      comment: '',
-      climbedAt: new Date('2025-06-01T08:00:00.000Z'),
+      comment,
+      climbedAt,
+      climbedAtEdited,
       maximumClimbedAtDate: new Date('2025-06-01T08:00:00.000Z'),
       grades: [],
       consensusDifficultyId: undefined,
+      firstAscent: input.boardName === 'spray' && input.baseAscensionistCount === 0,
+      saveBlockedByGrade: input.boardName === 'spray' && input.baseAscensionistCount === 0,
       resolvedGradeName: undefined,
       ascentType: 'send',
       saveLabel: 'playView.tickBar.sendSaveLabel',
       isPending: false,
       lastError: null,
       onQualitySelect: vi.fn(),
+      onAngleSelect: vi.fn(),
       onGradeSelect: vi.fn(),
       onTriesSelect: vi.fn(),
-      onCommentChange: vi.fn(),
-      onClimbedAtChange: vi.fn(),
+      onCommentChange: setComment,
+      onClimbedAtChange: (next: Date) => {
+        setClimbedAtEdited(true);
+        setClimbedAt(next);
+      },
       onFutureAdjusted: vi.fn(),
       onSave: () => {
         if (input.savedRef) input.savedRef.current = true;
@@ -230,9 +388,13 @@ vi.mock('../play-drawer/use-quick-tick-form', () => ({
   },
 }));
 
-vi.mock('../play-drawer/QuickTickBar', () => ({
-  QuickTickBar: () => createElement('div', { 'data-testid': 'tick-fields' }),
-}));
+// Calls `findNodeHandle`, which the react-native mock above leaves out. Which row
+// gets the focus is pinned in quick-tick-bar.test.tsx.
+vi.mock('../play-drawer/use-announce-body-focus', () => ({ useAnnounceBodyFocus: vi.fn() }));
+
+vi.mock('../Text', () => ({ Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children) }));
+vi.mock('../StarRating', () => ({ StarRating: () => createElement('span', null, 'stars') }));
+vi.mock('../grade', () => ({ GradeSingleSelectRail: () => createElement('span', null, 'grade') }));
 
 vi.mock('@boardsesh/analytics', () => ({
   SHARED_EVENTS: { QuickTickDismissed: 'Quick Tick Dismissed' },
@@ -240,6 +402,7 @@ vi.mock('@boardsesh/analytics', () => ({
 vi.mock('../../lib/analytics', () => ({ track: vi.fn() }));
 
 import { LogAscentSheet } from '../LogAscentSheet';
+import { SheetPresentationContext } from '../sheet-presentation-context';
 import { track } from '../../lib/analytics';
 
 function renderSheet(overrides: Partial<Parameters<typeof LogAscentSheet>[0]> = {}) {
@@ -262,19 +425,36 @@ function renderSheet(overrides: Partial<Parameters<typeof LogAscentSheet>[0]> = 
 }
 
 // The sheet's single in-flow child — the column the scroll body and the pinned
-// action bar are laid out inside. Owned by ModalSheet now (the mocked
-// KeyboardAvoidingView), addressed by testID rather than by position.
+// action bar are laid out inside. Owned by ModalSheet now, addressed by testID
+// rather than by position. Flattened: with the keyboard up it is a style array.
+function flattenStyle(style: unknown): Record<string, number> {
+  if (Array.isArray(style)) return Object.assign({}, ...style.map(flattenStyle));
+  return (style ?? {}) as Record<string, number>;
+}
 function columnStyle(container: HTMLElement): Record<string, number> {
-  const column = container.querySelector('[data-testid="sheet-column"]');
+  const column = container.querySelector('[data-testid="sheet-chrome-column"]');
   if (!column) throw new Error('sheet column not rendered');
-  return JSON.parse(column.getAttribute('data-style') ?? 'null');
+  return flattenStyle(JSON.parse(column.getAttribute('data-style') ?? 'null'));
+}
+// The pinned footer bar ModalSheet wraps around the stubbed TickActionBar.
+function footerPaddingBottom(container: HTMLElement): number | undefined {
+  const bar = container.querySelector('[data-testid="tick-action-bar"]');
+  return flattenStyle(JSON.parse(bar?.parentElement?.getAttribute('data-style') ?? 'null')).paddingBottom;
 }
 
 beforeEach(() => {
+  keyboardListeners.clear();
+  layoutHandlers.clear();
+  nativeMeasurements.length = 0;
+  Object.assign(dimensions, { width: 390, height: 844, fontScale: 1 });
+  Object.assign(safeInsets, { top: 44, bottom: 34, left: 0, right: 0 });
+  language.resolvedLanguage = 'en-US';
   platformMock.OS = 'ios';
   platformMock.Version = '26.1';
   formInput.current = null;
+  pickedAngle.current = null;
   vi.mocked(track).mockClear();
+  sheetControls.snapToIndex.mockClear();
 });
 
 describe('LogAscentSheet dismiss tracking', () => {
@@ -393,6 +573,162 @@ describe('LogAscentSheet header', () => {
     expect(header.getAttribute('data-title')).toBe('mobile.tick.fallbackTitle');
     expect(header.getAttribute('data-subtitle')).toBe('mobile.tick.angleMeta');
   });
+
+  it('says "consensus" only once somebody has sent it (#5960 C7)', () => {
+    const { getByTestId, unmount } = renderSheet({ consensusGradeName: 'V2', baseAscensionistCount: 0 });
+    expect(getByTestId('tick-header').getAttribute('data-subtitle')).toBe('mobile.tick.angleMeta');
+    unmount();
+
+    const sent = renderSheet({ consensusGradeName: 'V2', baseAscensionistCount: 1 });
+    expect(sent.getByTestId('tick-header').getAttribute('data-subtitle')).toBe('mobile.tick.consensusMeta');
+  });
+
+  // #6615: the consensus belongs to the angle the sheet opened at.
+  it('names only the angle once the climber picks another one', () => {
+    pickedAngle.current = 45;
+    const { getByTestId } = renderSheet({ consensusGradeName: 'V2', baseAscensionistCount: 1, angle: 40 });
+    expect(getByTestId('tick-header').getAttribute('data-subtitle')).toBe('mobile.tick.angleMeta');
+  });
+});
+
+describe('LogAscentSheet angle row (#6615)', () => {
+  it('keeps the angle in the expanded form only, on iOS', () => {
+    const { getByTestId, queryByTestId } = renderSheet();
+    expect(queryByTestId('tick-row-angle')).toBeNull();
+
+    fireEvent.click(getByTestId('simulate-expand'));
+    expect(getByTestId('tick-row-angle')).toBeTruthy();
+    expect(getByTestId('tick-angle-value').textContent).toBe('40');
+  });
+
+  it('folds the angle behind the details row on Android and keeps its value', () => {
+    platformMock.OS = 'android';
+    const { getByTestId, queryByTestId } = renderSheet();
+    expect(queryByTestId('tick-row-angle')).toBeNull();
+
+    fireEvent.click(getByTestId('tick-details-row'));
+    expect(getByTestId('tick-row-angle')).toBeTruthy();
+    expect(getByTestId('tick-angle-value').textContent).toBe('40');
+    expect(queryByTestId('tick-details-row')).toBeNull();
+  });
+});
+
+describe('LogAscentSheet Android details fold (#7343)', () => {
+  const sheetProps = {
+    onClose: vi.fn(),
+    climbUuid: 'climb-1',
+    boardName: 'kilter',
+    angle: 40,
+    isMirror: false,
+    isBenchmark: false,
+    baseAscensionistCount: 10,
+    layoutId: 7,
+  };
+
+  it.each(['tick-form-fields', 'tick-sheet-swipe-header'])('opens the fold on a swipe up on %s', (surface) => {
+    platformMock.OS = 'android';
+    const { getByTestId, queryByTestId } = renderSheet();
+    const swipe = swipeHandlers.get(surface);
+
+    expect(swipe?.onMoveShouldSetPanResponder({}, { dx: 2, dy: -40 })).toBe(true);
+    act(() => swipe?.onPanResponderGrant());
+
+    expect(queryByTestId('tick-details-row')).toBeNull();
+    expect(getByTestId('tick-row-angle')).toBeTruthy();
+    expect(getByTestId('tick-row-date')).toBeTruthy();
+  });
+
+  it('stops listening for the swipe once the fold is open', () => {
+    platformMock.OS = 'android';
+    const { getByTestId } = renderSheet();
+
+    fireEvent.click(getByTestId('tick-details-row'));
+
+    expect(swipeHandlers.has('tick-form-fields')).toBe(false);
+    expect(swipeHandlers.has('tick-sheet-swipe-header')).toBe(false);
+  });
+
+  it('does not take the swipe on iOS, which has its detents', () => {
+    platformMock.OS = 'ios';
+    renderSheet();
+
+    expect(swipeHandlers.has('tick-form-fields')).toBe(false);
+    expect(swipeHandlers.has('tick-sheet-swipe-header')).toBe(false);
+  });
+
+  it('stays open through the onChange(0) Android fires when the sheet settles', () => {
+    platformMock.OS = 'android';
+    const { getByTestId } = renderSheet();
+
+    fireEvent.click(getByTestId('tick-details-row'));
+    fireEvent.click(getByTestId('simulate-collapse'));
+
+    expect(getByTestId('tick-row-angle')).toBeTruthy();
+    expect(getByTestId('tick-row-date')).toBeTruthy();
+  });
+
+  it('folds again on the next present, and the summary carries the changed angle', () => {
+    platformMock.OS = 'android';
+    const { getByTestId, queryByTestId, rerender } = render(
+      createElement(LogAscentSheet, { ...sheetProps, visible: true }),
+    );
+
+    fireEvent.click(getByTestId('tick-details-row'));
+    pickedAngle.current = 45;
+    rerender(createElement(LogAscentSheet, { ...sheetProps, visible: false }));
+    rerender(createElement(LogAscentSheet, { ...sheetProps, visible: true }));
+
+    expect(queryByTestId('tick-row-angle')).toBeNull();
+    expect(getByTestId('tick-details-row').getAttribute('data-angle')).toBe('45');
+    expect(getByTestId('tick-details-row').getAttribute('data-opening-angle')).toBe('40');
+  });
+
+  it('reports an edited date to the summary after it folds again', () => {
+    platformMock.OS = 'android';
+    const { getByTestId, rerender } = render(createElement(LogAscentSheet, { ...sheetProps, visible: true }));
+    expect(getByTestId('tick-details-row').getAttribute('data-date-edited')).toBe('false');
+
+    fireEvent.click(getByTestId('tick-details-row'));
+    fireEvent.click(getByTestId('tick-date-value'));
+    rerender(createElement(LogAscentSheet, { ...sheetProps, visible: false }));
+    rerender(createElement(LogAscentSheet, { ...sheetProps, visible: true }));
+
+    expect(getByTestId('tick-details-row').getAttribute('data-date-edited')).toBe('true');
+  });
+
+  it('keeps the same note input, with its text, across unfolding', () => {
+    platformMock.OS = 'android';
+    const { getByTestId } = renderSheet();
+    const noteBefore = getByTestId('tick-note') as HTMLTextAreaElement;
+    fireEvent.change(noteBefore, { target: { value: 'Heel on the left' } });
+
+    fireEvent.click(getByTestId('tick-details-row'));
+
+    expect(getByTestId('tick-note')).toBe(noteBefore);
+    expect(noteBefore.value).toBe('Heel on the left');
+    expect(noteBefore.getAttribute('data-compact')).toBe('false');
+  });
+
+  it('shows no details row on iOS, folded or expanded', () => {
+    const { getByTestId, queryByTestId } = renderSheet();
+    expect(queryByTestId('tick-details-row')).toBeNull();
+
+    fireEvent.click(getByTestId('simulate-expand'));
+    expect(queryByTestId('tick-details-row')).toBeNull();
+    expect(getByTestId('tick-row-angle')).toBeTruthy();
+  });
+});
+
+describe('LogAscentSheet first ascent (#5971)', () => {
+  it('disables Send while a first-ascent send is missing its grade', () => {
+    const { getByTestId } = renderSheet({ boardName: 'spray', baseAscensionistCount: 0 });
+    expect(getByTestId('simulate-save-success').getAttribute('data-disabled')).toBe('true');
+  });
+
+  it('leaves Send enabled on an ordinary tick', () => {
+    const { getByTestId } = renderSheet({ boardName: 'kilter', baseAscensionistCount: 0 });
+    expect(getByTestId('simulate-save-success').getAttribute('data-disabled')).toBe('false');
+  });
 });
 
 // The form is a scroll body with a pinned Attempt/Send row, which only holds
@@ -402,29 +738,29 @@ describe('LogAscentSheet header', () => {
 // (#3330). The window here is 844 with a 44pt top inset, so the iOS 26 base is
 // 844 − 44 − 24 = 776; a detent is round(776 × fraction) − 20pt of chrome.
 describe('LogAscentSheet detent bound', () => {
-  it('pins the column to the 65% create detent on iOS instead of letting it flex to content', () => {
+  it('pins the column to the 50% medium detent on iOS instead of letting it flex to content', () => {
     const { container } = renderSheet();
 
-    expect(columnStyle(container)).toEqual({ height: 484 });
+    expect(columnStyle(container)).toEqual({ height: 368 });
   });
 
-  it('grows the column when the sheet settles on the taller 92% detent', () => {
+  it('grows the column when the sheet settles on the taller 90% large detent', () => {
     const { container, getByTestId } = renderSheet();
 
     fireEvent.click(getByTestId('simulate-expand'));
 
-    expect(columnStyle(container)).toEqual({ height: 694 });
+    expect(columnStyle(container)).toEqual({ height: 678 });
   });
 
   it('drops back to the shortest detent on close, so the next present starts bounded', () => {
-    // PlayDrawer keeps this host mounted, so a stale 92% height would survive
+    // PlayDrawer keeps this host mounted, so a stale 90% height would survive
     // into the next present and push the action bar past the first detent.
     const { container, getByTestId } = renderSheet();
 
     fireEvent.click(getByTestId('simulate-expand'));
     fireEvent.click(getByTestId('simulate-pandown'));
 
-    expect(columnStyle(container)).toEqual({ height: 484 });
+    expect(columnStyle(container)).toEqual({ height: 368 });
   });
 
   it('caps the column at window − topInset − chrome on Android (content-fitting path, #4720)', () => {
@@ -443,8 +779,518 @@ describe('LogAscentSheet detent bound', () => {
     const { getByTestId } = renderSheet();
 
     const body = getByTestId('sheet-body');
-    expect(body.querySelector('[data-testid="tick-fields"]')).toBeTruthy();
+    expect(body.querySelector('[data-testid="tick-primary-fields"]')).toBeTruthy();
     expect(body.querySelector('[data-testid="tick-action-bar"]')).toBeNull();
     expect(getByTestId('tick-action-bar')).toBeTruthy();
+  });
+});
+
+function reportLayout(testID: string, height: number) {
+  const onLayout = layoutHandlers.get(testID);
+  if (!onLayout) throw new Error(`missing native layout callback: ${testID}`);
+  act(() => onLayout({ nativeEvent: { layout: { height } } }));
+}
+function reportCompactMeasurements(header = 56, body = 116, footer = 180) {
+  reportLayout('sheet-header', header);
+  reportLayout('tick-form-fields', body);
+  reportLayout('sheet-footer', footer);
+}
+function nativeSnapPoints(getByTestId: (id: string) => HTMLElement): (string | number)[] {
+  return JSON.parse(getByTestId('native-sheet').getAttribute('data-snap-points') ?? '[]') as (string | number)[];
+}
+
+describe('LogAscentSheet compact visible fields at the opening detent (#6503)', () => {
+  it('keeps tries/stars before grade/help inside the measured compact form', () => {
+    const { getByTestId, container } = renderSheet();
+    const primary = getByTestId('tick-primary-fields');
+    expect(
+      Array.from(primary.querySelectorAll('[data-testid^="tick-row-"]')).map((row) => row.getAttribute('data-testid')),
+    ).toEqual(['tick-row-tries', 'tick-row-stars']);
+    expect(
+      Array.from(getByTestId('sheet-body').querySelectorAll('[data-testid^="tick-row-"]')).map((row) =>
+        row.getAttribute('data-testid'),
+      ),
+    ).toEqual(['tick-row-tries', 'tick-row-stars', 'tick-row-grade']);
+    reportCompactMeasurements(56, 116, 230);
+    expect(columnStyle(container).height).toBe(402);
+    expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+  });
+
+  it('fits the compact form including grade and audience above the pinned actions', () => {
+    const { getByTestId, container } = renderSheet();
+    const measuredForm = getByTestId('tick-form-fields');
+    for (const testID of ['tick-row-tries', 'tick-row-stars', 'tick-row-grade', 'tick-privacy']) {
+      expect(measuredForm.contains(getByTestId(testID))).toBe(true);
+    }
+    expect(measuredForm.contains(getByTestId('tick-action-bar'))).toBe(false);
+    expect(measuredForm.textContent).toContain('mobile.tick.gradeHelp');
+    reportCompactMeasurements(56, 330, 230);
+    expect(nativeSnapPoints(getByTestId)).toEqual([636, '90%']);
+    expect(columnStyle(container).height).toBe(616);
+    // Audience/helper copy can wrap independently of the primary controls.
+    reportLayout('tick-form-fields', 360);
+    expect(nativeSnapPoints(getByTestId)).toEqual([666, '90%']);
+    expect(columnStyle(container).height).toBe(646);
+    expect(getByTestId('tick-note').getAttribute('data-compact')).toBe('true');
+  });
+
+  it('includes required first-ascent help in the measured form', () => {
+    const { getByTestId } = renderSheet({ boardName: 'spray', baseAscensionistCount: 0 });
+    expect(getByTestId('tick-form-fields').textContent).toContain('mobile.tick.firstAscent');
+    reportCompactMeasurements(56, 380, 180);
+    expect(nativeSnapPoints(getByTestId)).toEqual([636, '90%']);
+  });
+
+  it('keeps date/time in the expanded form and preserves the edited date across detents', () => {
+    const { getByTestId, queryByTestId } = renderSheet();
+    expect(queryByTestId('tick-row-date')).toBeNull();
+    fireEvent.click(getByTestId('simulate-expand'));
+    expect(getByTestId('tick-date-value').getAttribute('data-date-value')).toBe('2025-06-01T08:00:00.000Z');
+    fireEvent.click(getByTestId('tick-date-value'));
+    fireEvent.click(getByTestId('simulate-collapse'));
+    expect(queryByTestId('tick-row-date')).toBeNull();
+    fireEvent.click(getByTestId('simulate-expand'));
+    expect(getByTestId('tick-date-value').getAttribute('data-date-value')).toBe('2025-03-15T12:00:00.000Z');
+  });
+
+  it('folds date/time behind the details row on Android and keeps its value', () => {
+    platformMock.OS = 'android';
+    const { getByTestId, queryByTestId } = renderSheet();
+    expect(queryByTestId('tick-row-date')).toBeNull();
+
+    fireEvent.click(getByTestId('tick-details-row'));
+    expect(getByTestId('tick-row-date')).toBeTruthy();
+    expect(getByTestId('tick-date-value').getAttribute('data-date-value')).toBe('2025-06-01T08:00:00.000Z');
+  });
+
+  it('ignores expanded body measurements and rejects stale callbacks after returning to compact', () => {
+    const { getByTestId } = renderSheet();
+    reportCompactMeasurements(56, 330, 230);
+    expect(nativeSnapPoints(getByTestId)).toEqual([636, '90%']);
+    const oldCompactLayout = layoutHandlers.get('tick-form-fields');
+    fireEvent.click(getByTestId('simulate-expand'));
+    const expandedLayout = layoutHandlers.get('tick-form-fields');
+    const expandedMeasure = nativeMeasurements
+      .filter((measurement) => measurement.testID === 'tick-form-fields')
+      .at(-1);
+    expect(expandedMeasure).toBeDefined();
+    reportLayout('tick-form-fields', 500);
+    expect(nativeSnapPoints(getByTestId)).toEqual([636, '90%']);
+    fireEvent.click(getByTestId('simulate-collapse'));
+    act(() => {
+      oldCompactLayout?.({ nativeEvent: { layout: { height: 500 } } });
+      expandedLayout?.({ nativeEvent: { layout: { height: 500 } } });
+      expandedMeasure?.deliver(500);
+    });
+    expect(nativeSnapPoints(getByTestId)).toEqual([636, '90%']);
+    // The current compact generation requests a fresh native measurement.
+    const compactMeasure = nativeMeasurements.filter((measurement) => measurement.testID === 'tick-form-fields').at(-1);
+    expect(compactMeasure).not.toBe(expandedMeasure);
+    act(() => compactMeasure?.deliver(340));
+    expect(nativeSnapPoints(getByTestId)).toEqual([646, '90%']);
+  });
+
+  it('opens immediately at medium and keeps medium when the measured controls fit', () => {
+    const { getByTestId, container } = renderSheet();
+    expect(nativeSnapPoints(getByTestId)).toEqual(['50%', '90%']);
+    reportLayout('sheet-header', 56);
+    reportLayout('tick-form-fields', 116);
+    expect(nativeSnapPoints(getByTestId)).toEqual(['50%', '90%']);
+    reportLayout('sheet-footer', 180);
+    expect(columnStyle(container).height).toBe(368);
+    expect(nativeSnapPoints(getByTestId)).toEqual(['50%', '90%']);
+  });
+
+  it('fits a short iPhone and caps large-text content below the unchanged large detent', () => {
+    dimensions.height = 667;
+    const { getByTestId, container } = renderSheet();
+    reportCompactMeasurements();
+    expect(columnStyle(container).height).toBe(352);
+    expect(nativeSnapPoints(getByTestId)).toEqual([372, '90%']);
+    reportLayout('tick-form-fields', 600);
+    expect(nativeSnapPoints(getByTestId)).toEqual([538, '90%']);
+    expect(columnStyle(container).height).toBe(518);
+    fireEvent.click(getByTestId('simulate-expand'));
+    expect(columnStyle(container).height).toBe(519);
+    expect(nativeSnapPoints(getByTestId)).toHaveLength(2);
+  });
+
+  it('normalizes keyboard footer padding and rejects expanded-note measurements', () => {
+    const { getByTestId, container } = renderSheet();
+    reportCompactMeasurements(56, 116, 230);
+    expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+    reportLayout('sheet-keyboard-host', 418);
+    act(() =>
+      keyboardListeners.get('keyboardWillChangeFrame')?.({
+        endCoordinates: { height: 336, screenY: 508, width: 390 },
+        duration: 250,
+      }),
+    );
+    reportLayout('sheet-keyboard-host', 82); // Compact column bottom 418 minus keyboard 336.
+    reportLayout('sheet-footer', 196); // Same composer, now without its 34pt window inset.
+    expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+    fireEvent.click(getByTestId('simulate-expand'));
+    reportLayout('sheet-footer', 500); // Expanded note must never become the opening height.
+    fireEvent.click(getByTestId('simulate-collapse'));
+    expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+    expect(columnStyle(container).height).toBe(402);
+  });
+
+  it.each(['width', 'fontScale', 'locale'] as const)('invalidates stale %s measurements', (changed) => {
+    const { getByTestId, rerender } = renderSheet();
+    reportCompactMeasurements(56, 116, 230);
+    expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+    if (changed === 'width') dimensions.width = 320;
+    if (changed === 'fontScale') dimensions.fontScale = 2;
+    if (changed === 'locale') language.resolvedLanguage = 'de';
+    rerender(
+      createElement(LogAscentSheet, {
+        visible: true,
+        onClose: vi.fn(),
+        climbUuid: 'climb-1',
+        boardName: 'kilter',
+        angle: 40,
+        isMirror: false,
+        isBenchmark: false,
+        baseAscensionistCount: 10,
+      }),
+    );
+    expect(nativeSnapPoints(getByTestId)).toEqual(['50%', '90%']);
+    reportCompactMeasurements(56, 160, 230);
+    expect(nativeSnapPoints(getByTestId)).toEqual([466, '90%']);
+  });
+
+  it.each(['width', 'fontScale', 'locale'] as const)(
+    'remeasures unchanged native regions after %s changes without remounting controls',
+    (changed) => {
+      const { getByTestId, rerender } = renderSheet();
+      reportCompactMeasurements(56, 116, 230);
+      const note = getByTestId('tick-note');
+      const tries = getByTestId('tick-row-tries');
+      const stars = getByTestId('tick-row-stars');
+      nativeMeasurements.length = 0;
+      if (changed === 'width') dimensions.width = 320;
+      if (changed === 'fontScale') dimensions.fontScale = 1.2;
+      if (changed === 'locale') language.resolvedLanguage = 'de';
+      rerender(
+        createElement(LogAscentSheet, {
+          visible: true,
+          onClose: vi.fn(),
+          climbUuid: 'climb-1',
+          boardName: 'kilter',
+          angle: 40,
+          isMirror: false,
+          isBenchmark: false,
+          baseAscensionistCount: 10,
+        }),
+      );
+      expect(nativeSnapPoints(getByTestId)).toEqual(['50%', '90%']);
+      expect(nativeMeasurements.map((measurement) => measurement.testID).sort()).toEqual([
+        'sheet-footer',
+        'sheet-header',
+        'tick-form-fields',
+      ]);
+      // No onLayout event: native geometry remained identical, so only the
+      // imperative replay can refill the invalidated cache.
+      act(() => {
+        for (const measurement of nativeMeasurements.splice(0)) {
+          measurement.deliver(
+            { 'sheet-header': 56, 'sheet-footer': 230, 'tick-form-fields': 116 }[measurement.testID] ?? 0,
+          );
+        }
+      });
+      expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+      expect(getByTestId('tick-note')).toBe(note);
+      expect(getByTestId('tick-row-tries')).toBe(tries);
+      expect(getByTestId('tick-row-stars')).toBe(stars);
+      expect(nativeMeasurements).toHaveLength(0);
+    },
+  );
+
+  it('rejects a late compact footer measurement delivered after expansion', () => {
+    const { getByTestId } = renderSheet();
+    reportCompactMeasurements(56, 116, 230);
+    const oldCompactFooterLayout = layoutHandlers.get('sheet-footer');
+    fireEvent.click(getByTestId('simulate-expand'));
+    act(() => oldCompactFooterLayout?.({ nativeEvent: { layout: { height: 500 } } }));
+    fireEvent.click(getByTestId('simulate-collapse'));
+    expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+  });
+
+  it('ignores late native measurements captured before a geometry change', () => {
+    const { getByTestId, rerender } = renderSheet();
+    reportCompactMeasurements(56, 116, 230);
+    const staleHeaderLayout = layoutHandlers.get('sheet-header');
+    dimensions.width = 320;
+    rerender(
+      createElement(LogAscentSheet, {
+        visible: true,
+        onClose: vi.fn(),
+        climbUuid: 'climb-1',
+        boardName: 'kilter',
+        angle: 40,
+        isMirror: false,
+        isBenchmark: false,
+        baseAscensionistCount: 10,
+      }),
+    );
+    reportCompactMeasurements(56, 160, 230);
+    act(() => staleHeaderLayout?.({ nativeEvent: { layout: { height: 999 } } }));
+    expect(nativeSnapPoints(getByTestId)).toEqual([466, '90%']);
+  });
+
+  it('rejects an old compact measurement after expanding and returning to compact', () => {
+    const { getByTestId } = renderSheet();
+    reportCompactMeasurements(56, 116, 230);
+    const oldCompactFooterLayout = layoutHandlers.get('sheet-footer');
+    fireEvent.click(getByTestId('simulate-expand'));
+    fireEvent.click(getByTestId('simulate-collapse'));
+    act(() => oldCompactFooterLayout?.({ nativeEvent: { layout: { height: 500 } } }));
+    expect(nativeSnapPoints(getByTestId)).toEqual([422, '90%']);
+  });
+
+  it('rejects old geometry callbacks after returning to the original width', () => {
+    const { getByTestId, rerender } = renderSheet();
+    reportCompactMeasurements(56, 116, 230);
+    const oldHeaderLayout = layoutHandlers.get('sheet-header');
+    const rerenderSheet = () =>
+      rerender(
+        createElement(LogAscentSheet, {
+          visible: true,
+          onClose: vi.fn(),
+          climbUuid: 'climb-1',
+          boardName: 'kilter',
+          angle: 40,
+          isMirror: false,
+          isBenchmark: false,
+          baseAscensionistCount: 10,
+        }),
+      );
+    dimensions.width = 320;
+    rerenderSheet();
+    dimensions.width = 390;
+    rerenderSheet();
+    expect(nativeSnapPoints(getByTestId)).toEqual(['50%', '90%']);
+    reportCompactMeasurements(56, 160, 230);
+    act(() => oldHeaderLayout?.({ nativeEvent: { layout: { height: 999 } } }));
+    expect(nativeSnapPoints(getByTestId)).toEqual([466, '90%']);
+  });
+
+  it('recomputes viewport bounds and resting insets without waiting for another content layout', () => {
+    const { getByTestId, rerender, container } = renderSheet();
+    reportCompactMeasurements(56, 116, 230);
+    dimensions.height = 600;
+    safeInsets.bottom = 20;
+    rerender(
+      createElement(LogAscentSheet, {
+        visible: true,
+        onClose: vi.fn(),
+        climbUuid: 'climb-1',
+        boardName: 'kilter',
+        angle: 40,
+        isMirror: false,
+        isBenchmark: false,
+        baseAscensionistCount: 10,
+      }),
+    );
+    expect(nativeSnapPoints(getByTestId)).toEqual([408, '90%']);
+    expect(columnStyle(container).height).toBe(388);
+    dimensions.height = 1000;
+    rerender(
+      createElement(LogAscentSheet, {
+        visible: true,
+        onClose: vi.fn(),
+        climbUuid: 'climb-1',
+        boardName: 'kilter',
+        angle: 40,
+        isMirror: false,
+        isBenchmark: false,
+        baseAscensionistCount: 10,
+      }),
+    );
+    expect(nativeSnapPoints(getByTestId)).toEqual(['50%', '90%']);
+  });
+
+  it('keeps Android content fitting after measurements', () => {
+    platformMock.OS = 'android';
+    const { getByTestId, container } = renderSheet();
+    reportCompactMeasurements(56, 500, 230);
+    expect(nativeSnapPoints(getByTestId)).toEqual([]);
+    expect(columnStyle(container)).toEqual({ maxHeight: 780 });
+  });
+});
+
+describe('LogAscentSheet pinned comment', () => {
+  it('shows a compact comment outside the scrolling body at the medium detent', () => {
+    const { getByTestId } = renderSheet();
+    const note = getByTestId('tick-note');
+    expect(note.getAttribute('data-compact')).toBe('true');
+    expect(getByTestId('sheet-body').contains(note)).toBe(false);
+    expect(getByTestId('tick-action-bar').contains(note)).toBe(true);
+    expect(getByTestId('tick-action-bar').firstElementChild).toBe(note);
+    expect(getByTestId('sheet-body').querySelector('[data-testid="tick-row-note"]')).toBeNull();
+  });
+
+  it('keeps the typed comment and focused input while expanding and collapsing', () => {
+    const { getByTestId, onClose } = renderSheet();
+    const note = getByTestId('tick-note') as HTMLTextAreaElement;
+    act(() => note.focus());
+    fireEvent.change(note, { target: { value: 'Left heel\nThen match' } });
+    fireEvent.click(getByTestId('simulate-expand'));
+    expect(getByTestId('tick-note')).toBe(note);
+    expect(note.getAttribute('data-compact')).toBe('false');
+    expect(document.activeElement).toBe(note);
+    expect(note.value).toBe('Left heel\nThen match');
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(getByTestId('simulate-collapse'));
+    expect(getByTestId('tick-note')).toBe(note);
+    expect(note.getAttribute('data-compact')).toBe('true');
+    expect(note.value).toBe('Left heel\nThen match');
+  });
+
+  it('requests the large detent on comment focus through the managed handle', () => {
+    const { getByTestId } = renderSheet();
+    fireEvent.focus(getByTestId('tick-note'));
+    expect(sheetControls.snapToIndex).toHaveBeenCalledWith(1);
+  });
+
+  it('does not snap an already expanded or Android content-sized sheet', () => {
+    const expanded = renderSheet();
+    fireEvent.click(expanded.getByTestId('simulate-expand'));
+    fireEvent.focus(expanded.getByTestId('tick-note'));
+    expect(sheetControls.snapToIndex).not.toHaveBeenCalled();
+    expanded.unmount();
+
+    platformMock.OS = 'android';
+    const android = renderSheet();
+    expect(android.getByTestId('tick-note').getAttribute('data-compact')).toBe('false');
+    fireEvent.focus(android.getByTestId('tick-note'));
+    expect(sheetControls.snapToIndex).not.toHaveBeenCalled();
+  });
+
+  it('keeps expanded sizing while dismissing, then resets on a fresh present', () => {
+    const { getByTestId, rerender } = renderSheet();
+    fireEvent.click(getByTestId('simulate-expand'));
+    fireEvent.click(getByTestId('simulate-pandown'));
+    expect(getByTestId('tick-note').getAttribute('data-compact')).toBe('false');
+    const props = {
+      onClose: vi.fn(),
+      climbUuid: 'climb-1',
+      boardName: 'kilter',
+      angle: 40,
+      isMirror: false,
+      isBenchmark: false,
+      baseAscensionistCount: 10,
+    };
+    rerender(createElement(LogAscentSheet, { ...props, visible: false }));
+    rerender(createElement(LogAscentSheet, { ...props, visible: true }));
+    expect(getByTestId('tick-note').getAttribute('data-compact')).toBe('true');
+  });
+});
+
+// The user-reported bug: typing a note left the Attempt / Save bar half under
+// the keyboard. Native host shrinkage must lift the column and the bar must drop
+// its window inset (spacing is mocked to 0 here, so the bar's padding IS the
+// inset it still owes).
+describe('LogAscentSheet keyboard', () => {
+  it('lifts the action bar fully above the iOS keyboard, then settles back on the inset', () => {
+    const { container, getByTestId } = renderSheet();
+    fireEvent.click(getByTestId('simulate-expand'));
+    expect(footerPaddingBottom(container)).toBe(34);
+    reportLayout('sheet-keyboard-host', 694); // Local y 16 plus expanded column 678.
+
+    act(() =>
+      keyboardListeners.get('keyboardWillChangeFrame')?.({
+        endCoordinates: { height: 336, screenY: 508, width: 390 },
+        duration: 250,
+      }),
+    );
+    expect(columnStyle(container)).toEqual({ height: 678 });
+    reportLayout('sheet-keyboard-host', 358);
+    expect(columnStyle(container)).toEqual({ height: 678, paddingBottom: 336 });
+    expect(footerPaddingBottom(container)).toBe(0);
+
+    act(() =>
+      keyboardListeners.get('keyboardWillHide')?.({
+        endCoordinates: { height: 336, screenY: 844, width: 390 },
+        duration: 250,
+      }),
+    );
+    expect(columnStyle(container)).toEqual({ height: 678 });
+    expect(footerPaddingBottom(container)).toBe(34);
+  });
+
+  it('does not listen for the keyboard while the sheet is closed', () => {
+    renderSheet({ visible: false });
+    expect(keyboardListeners.size).toBe(0);
+  });
+
+  it('pads by keyboard + navigation bar on Android, where the IME height leaves the bar out', () => {
+    platformMock.OS = 'android';
+    const { container } = renderSheet();
+
+    act(() =>
+      keyboardListeners.get('keyboardDidShow')?.({ endCoordinates: { height: 280, screenY: 564, width: 390 } }),
+    );
+    expect(columnStyle(container)).toEqual({ maxHeight: 780, paddingBottom: 280 + 34 });
+    expect(footerPaddingBottom(container)).toBe(0);
+
+    act(() => keyboardListeners.get('keyboardDidHide')?.({}));
+    expect(columnStyle(container)).toEqual({ maxHeight: 780 });
+    expect(footerPaddingBottom(container)).toBe(34);
+  });
+});
+// This suite exercises the existing flow before the server privacy rollout.
+vi.mock('../../lib/graphql/hooks/use-privacy', () => ({ usePrivacySettings: () => ({ data: undefined }) }));
+vi.mock('../privacy/PublicationAudiencePicker', () => ({
+  PublicationAudiencePicker: () => createElement('button', { 'data-testid': 'tick-privacy' }, 'audience'),
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/ContentAudienceControl', () => ({
+  ContentAudienceControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/ResourcePrivacyControl', () => ({
+  ResourcePrivacyControl: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/AudiencePicker', () => ({
+  AudiencePicker: () => null,
+  SESSION_AUDIENCES: ['public', 'followers', 'invite_only'],
+}));
+vi.mock('../privacy/use-publication-audience', () => ({
+  usePublicationAudience: () => ({
+    enabled: false,
+    isPrivate: false,
+    audience: 'public',
+    publication: undefined,
+    chooseAudience: () => {},
+  }),
+}));
+
+describe('LogAscentSheet fixed dialog content', () => {
+  it('shows the complete form and full note without a detent or focus expansion', () => {
+    const { getByTestId } = render(
+      createElement(
+        SheetPresentationContext,
+        { value: { mode: 'dialog', supportsDetents: false } },
+        createElement(LogAscentSheet, {
+          visible: true,
+          onClose: vi.fn(),
+          climbUuid: 'climb-1',
+          boardName: 'kilter',
+          angle: 40,
+          isMirror: false,
+          isBenchmark: false,
+          baseAscensionistCount: 10,
+          layoutId: 7,
+        }),
+      ),
+    );
+    expect(getByTestId('tick-row-angle')).toBeTruthy();
+    expect(getByTestId('tick-note').getAttribute('data-compact')).toBe('false');
+    fireEvent.focus(getByTestId('tick-note'));
+    expect(sheetControls.snapToIndex).not.toHaveBeenCalled();
   });
 });

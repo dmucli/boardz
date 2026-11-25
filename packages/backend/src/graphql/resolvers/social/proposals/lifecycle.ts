@@ -3,16 +3,18 @@ import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 import { executeRows } from '@boardsesh/db/client';
 import { db } from '../../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
-import { getGradeLabel } from '@boardsesh/db/queries';
+import { climbDraftVisibilityCondition, getGradeLabel, sprayClimbVisibilityCondition } from '@boardsesh/db/queries';
 import { logger } from '../../../../utils/logger';
 import { publishSocialEvent } from '../../../../events/index';
 import { notifyClimbRevalidated } from '../../../../lib/web-revalidate';
 import { getUserVoteWeight } from '../roles';
 import { resolveCommunitySetting } from '../community-settings';
-import { applyProposalEffect } from './effects';
+import { applyProposalEffect, publishVoteGradedClimbStats } from './effects';
 import { checkAutoApproval, resolveApprovalThreshold } from './grade-analysis';
 import { assertClimbBoardType } from './climb-board-type';
 import crypto from 'crypto';
+import { GraphQLError } from 'graphql';
+import { SPRAY_WALL_ARCHIVED_CODE, SPRAY_WALL_ARCHIVED_MESSAGE } from '../../../../services/spray-wall-archive';
 
 /**
  * Proposal lifecycle helpers.
@@ -40,13 +42,16 @@ export type ProposalTypeName = ProposalRow['type'];
 /**
  * The climb a proposal targets, reduced to what the lifecycle needs: the stored
  * board type (to fence client-declared scope), whether the community has hidden
- * it, and who owns/set it.
+ * it, who owns/set it, and the draft/listing flags the visibility gate reads
+ * before it lets a proposal through.
  */
 export type TargetClimb = {
   boardType: string;
   isHidden: boolean;
   userId: string | null;
   setterId: number | null;
+  isDraft: boolean | null;
+  isListed: boolean | null;
 };
 
 /**
@@ -89,10 +94,28 @@ export function normalizeAngleForType(type: ProposalTypeName, angle: number | nu
  * has to be checked against the stored climb before it is used as a proposal key
  * — proposal rows have no FK back to `board_climbs`, so a Kilter UUID declared
  * as Grasshopper would otherwise smuggle -5° into them.
+ *
+ * The visibility half of the gate lives here too, so both doors — `createProposal`
+ * and `reportClimb` — pass through exactly one rule:
+ *
+ *  - a SPRAY climb on a wall the caller cannot see yields no row and therefore the
+ *    same "Climb not found" a missing climb gives. A proposal is a write onto a
+ *    climb, and "Climb not found" vs "wall not visible" would otherwise be an
+ *    existence oracle for a private wall's uuid — the read side deliberately
+ *    refuses to distinguish them;
+ *  - a DRAFT or UNLISTED climb belongs to its setter alone, on every board type,
+ *    exactly as `validateEntityExists` rules for comments (`social/entity-validation.ts`).
+ *    `insertComment` inside these mutations does NOT re-run that check, so the gate
+ *    has to be here or a stranger's hide proposal would open a thread on somebody's
+ *    unpublished work.
+ *
+ * Proposals carry no wall-uuid input, so there is no unlisted capability on this
+ * path — same as comments, whose gate also omits it.
  */
 export async function loadTargetClimb(
   climbUuid: string,
   boardType: string,
+  viewerUserId: string,
   executor: ProposalExecutor = db,
 ): Promise<TargetClimb> {
   const [climb] = await executor
@@ -101,9 +124,27 @@ export async function loadTargetClimb(
       isHidden: dbSchema.boardClimbs.isHidden,
       userId: dbSchema.boardClimbs.userId,
       setterId: dbSchema.boardClimbs.setterId,
+      isDraft: dbSchema.boardClimbs.isDraft,
+      isListed: dbSchema.boardClimbs.isListed,
     })
     .from(dbSchema.boardClimbs)
-    .where(eq(dbSchema.boardClimbs.uuid, climbUuid))
+    .where(
+      and(
+        eq(dbSchema.boardClimbs.uuid, climbUuid),
+        climbDraftVisibilityCondition(
+          {
+            boardType: dbSchema.boardClimbs.boardType,
+            isDraft: dbSchema.boardClimbs.isDraft,
+            userId: dbSchema.boardClimbs.userId,
+          },
+          viewerUserId,
+        ),
+        sprayClimbVisibilityCondition(
+          { boardType: dbSchema.boardClimbs.boardType, layoutId: dbSchema.boardClimbs.layoutId },
+          viewerUserId,
+        ),
+      ),
+    )
     .limit(1);
 
   if (!climb) {
@@ -111,7 +152,75 @@ export async function loadTargetClimb(
   }
   assertClimbBoardType(climb.boardType, boardType);
 
+  // Same message as a missing climb, on purpose — see the doc comment above.
+  if ((climb.isDraft === true || climb.isListed === false) && climb.userId !== viewerUserId) {
+    throw new Error('Climb not found');
+  }
+
   return climb;
+}
+
+/** `extensions.code` of a spray grade proposal whose label is not on the spray scale. */
+export const SPRAY_GRADE_NOT_ON_SCALE_CODE = 'SPRAY_GRADE_NOT_ON_SCALE';
+
+/**
+ * The spray-only refusals a new proposal gets, before anything is written (#5971):
+ *
+ *  - a grade, benchmark or classic proposal on a climb of an ARCHIVED wall. An
+ *    archived wall is read-only (#6181), and an approved grade would re-grade
+ *    it. A hide report still lands: it is moderation, not a change to the wall;
+ *  - a grade whose label is not on the spray scale. The proposal schema takes
+ *    any board's labels (MoonBoard's 6a/V2, say), and the spray grade rule
+ *    matches the label against spray's own scale, so an unknown label would be
+ *    approved and then change nothing.
+ */
+export async function assertSprayProposalAllowed(
+  params: { climbUuid: string; boardType: string; type: ProposalTypeName; proposedValue: string },
+  executor: ProposalExecutor = db,
+): Promise<void> {
+  const { climbUuid, boardType, type, proposedValue } = params;
+  if (boardType !== 'spray' || type === 'hide') return;
+
+  const [wall] = await executor
+    .select({ archivedAt: dbSchema.sprayWalls.archivedAt })
+    .from(dbSchema.boardClimbs)
+    .innerJoin(dbSchema.sprayWalls, eq(dbSchema.sprayWalls.layoutId, dbSchema.boardClimbs.layoutId))
+    .where(and(eq(dbSchema.boardClimbs.uuid, climbUuid), eq(dbSchema.boardClimbs.boardType, 'spray')))
+    .limit(1);
+  if (wall?.archivedAt != null) {
+    throw new GraphQLError(SPRAY_WALL_ARCHIVED_MESSAGE, { extensions: { code: SPRAY_WALL_ARCHIVED_CODE } });
+  }
+
+  if (type !== 'grade') return;
+  const [onScale] = await executor
+    .select({ difficulty: dbSchema.boardDifficultyGrades.difficulty })
+    .from(dbSchema.boardDifficultyGrades)
+    .where(
+      and(
+        eq(dbSchema.boardDifficultyGrades.boardType, 'spray'),
+        // The same match the grade rule makes (climber-vote-grade.ts).
+        sql`LOWER(${dbSchema.boardDifficultyGrades.boulderName}) = LOWER(TRIM(${proposedValue}))`,
+      ),
+    )
+    .limit(1);
+  if (!onScale) {
+    throw new GraphQLError(`${proposedValue} is not a spray wall grade`, {
+      extensions: { code: SPRAY_GRADE_NOT_ON_SCALE_CODE },
+    });
+  }
+}
+
+/**
+ * Refuse a hide proposal filed by the climb's own setter (#5971).
+ *
+ * A spray wall lets a setter report their own climb, because a grade proposal is
+ * how its grade changes there. Hiding your own climb is not what that door is
+ * for: it would cast the setter's weighted vote against their own work.
+ */
+export function assertNotHidingOwnClimb(type: ProposalTypeName, target: TargetClimb, userId: string): void {
+  if (type === 'hide' && target.userId != null && target.userId === userId) {
+    throw new Error("You can't report your own climb to hide it");
+  }
 }
 
 /** Refuse new proposals on a climb an admin has frozen. */
@@ -173,7 +282,7 @@ export async function resolveCurrentValue(params: {
             LIMIT 1
           `,
         );
-        currentValue = getGradeLabel(statsRows[0]?.difficulty_id ?? null) || 'Unknown';
+        currentValue = getGradeLabel(statsRows[0]?.difficulty_id ?? null, boardType) || 'Unknown';
       } catch {
         currentValue = 'Unknown';
       }
@@ -370,7 +479,61 @@ export async function flipVoteToUpvote(
  * counting reads through the `db` singleton, so a pending vote in an
  * uncommitted transaction would be invisible to it.
  */
-export async function runAutoApproval(proposal: ProposalRow, actorId: string): Promise<ProposalRow> {
+/**
+ * Is `userId` the owner of the spray wall this climb is on?
+ *
+ * Board climbs → `spray_walls` by the wall's layout → the wall's `user_boards`
+ * row. False for a climb on any other board, which has no wall, and for a wall
+ * that is deleted or archived.
+ */
+export async function isSprayWallOwnerOfClimb(
+  climbUuid: string,
+  userId: string,
+  executor: ProposalExecutor = db,
+): Promise<boolean> {
+  const [owned] = await executor
+    .select({ ownerId: dbSchema.userBoards.ownerId })
+    .from(dbSchema.boardClimbs)
+    .innerJoin(dbSchema.sprayWalls, eq(dbSchema.sprayWalls.layoutId, dbSchema.boardClimbs.layoutId))
+    .innerJoin(dbSchema.userBoards, eq(dbSchema.userBoards.uuid, dbSchema.sprayWalls.boardUuid))
+    .where(
+      and(
+        eq(dbSchema.boardClimbs.uuid, climbUuid),
+        eq(dbSchema.boardClimbs.boardType, 'spray'),
+        eq(dbSchema.userBoards.ownerId, userId),
+        // A deleted or archived wall is no live wall to own (#6181): no instant approval.
+        isNull(dbSchema.userBoards.deletedAt),
+        isNull(dbSchema.sprayWalls.deletedAt),
+        isNull(dbSchema.sprayWalls.archivedAt),
+      ),
+    )
+    .limit(1);
+  return owned != null;
+}
+
+/**
+ * A grade proposal the wall OWNER files on a spray climb applies at once (#5971):
+ * a home wall has a handful of climbers, and the owner is the one who knows it.
+ * Everyone else, the climb's setter included, goes through the vote.
+ *
+ * Only for a proposal the actor is filing (`createProposal`, `reportClimb`), never
+ * for a vote on someone else's: `filedByActor` says which.
+ */
+async function ownerFiledSprayGrade(
+  proposal: ProposalRow,
+  actorId: string,
+  filedByActor: boolean,
+  executor: ProposalExecutor,
+): Promise<boolean> {
+  if (!filedByActor || proposal.type !== 'grade' || proposal.boardType !== 'spray') return false;
+  return isSprayWallOwnerOfClimb(proposal.climbUuid, actorId, executor);
+}
+
+export async function runAutoApproval(
+  proposal: ProposalRow,
+  actorId: string,
+  options: { filedByActor?: boolean } = {},
+): Promise<ProposalRow> {
   // The threshold is resolved BEFORE the lock is taken. `resolveCommunitySetting`
   // reads through the `db` singleton, so resolving it inside the locked
   // transaction would check out a second pool connection while holding one —
@@ -382,7 +545,9 @@ export async function runAutoApproval(proposal: ProposalRow, actorId: string): P
   // in one transaction: counted outside it, a voter toggling off between the
   // count and the flip could approve a proposal that is no longer at threshold.
   const approved = await withProposalLock(proposal.climbUuid, proposal.type, async (tx) => {
-    const shouldApprove = await checkAutoApproval(proposal.id, required, tx);
+    const shouldApprove =
+      (await ownerFiledSprayGrade(proposal, actorId, options.filedByActor === true, tx)) ||
+      (await checkAutoApproval(proposal.id, required, tx));
     if (!shouldApprove) return null;
 
     const [row] = await tx
@@ -403,6 +568,7 @@ export async function runAutoApproval(proposal: ProposalRow, actorId: string): P
   proposal.resolvedAt = approved.resolvedAt;
 
   void notifyClimbRevalidated(proposal.climbUuid);
+  publishVoteGradedClimbStats(proposal);
 
   publishSocialEvent({
     type: 'proposal.approved',

@@ -1,17 +1,23 @@
 import { type ReactNode } from 'react';
-import { View, StyleSheet, type ViewStyle } from 'react-native';
+import { View, StyleSheet, type AccessibilityState, type ViewStyle } from 'react-native';
 import { Text } from './Text';
 import { Icon } from './Icon';
 import { PressableSurface } from './PressableSurface';
 import { hapticLight } from '../lib/haptics';
 import { useTheme } from '../providers/theme-provider';
-import { iosSystemColors } from '../theme/ios-colors';
 
 type ListRowProps = {
   title: string;
   subtitle?: string;
   leading?: ReactNode;
   trailing?: ReactNode;
+  /**
+   * Where `trailing` sits. `'end'` (the default) is beside the title, on one
+   * line that never wraps. `'below'` gives it its own full-width line under the
+   * title, for actions that must stay reachable when long labels (German) or
+   * large text sizes would otherwise squeeze the title away and clip a button.
+   */
+  trailingPlacement?: 'end' | 'below';
   showChevron?: boolean;
   onPress?: () => void;
   haptic?: boolean;
@@ -22,6 +28,9 @@ type ListRowProps = {
   accessibilityHint?: string;
   /** Let the subtitle wrap onto more lines instead of truncating to one. */
   wrapSubtitle?: boolean;
+  /** e.g. `{ busy: true, disabled: true }` while the row's action is in flight. */
+  accessibilityState?: AccessibilityState;
+  testID?: string;
 };
 
 export function ListRow({
@@ -29,6 +38,7 @@ export function ListRow({
   subtitle,
   leading,
   trailing,
+  trailingPlacement = 'end',
   showChevron = false,
   onPress,
   haptic = true,
@@ -38,6 +48,8 @@ export function ListRow({
   accessibilityLabel,
   accessibilityHint,
   wrapSubtitle = false,
+  accessibilityState,
+  testID,
 }: ListRowProps) {
   const { systemColors } = useTheme();
 
@@ -55,15 +67,21 @@ export function ListRow({
             {title}
           </Text>
           {subtitle && (
-            <Text variant="subheadline" style={styles.subtitle} numberOfLines={wrapSubtitle ? undefined : 1}>
+            <Text
+              tone="secondary"
+              variant="subheadline"
+              style={styles.subtitle}
+              numberOfLines={wrapSubtitle ? undefined : 1}
+            >
               {subtitle}
             </Text>
           )}
+          {trailing && trailingPlacement === 'below' ? <View style={styles.trailingBelow}>{trailing}</View> : null}
         </View>
-        {trailing && <View style={styles.trailing}>{trailing}</View>}
+        {trailing && trailingPlacement === 'end' ? <View style={styles.trailing}>{trailing}</View> : null}
         {showChevron && (
           <View style={styles.chevron}>
-            <Icon name="chevron.right" size={14} color={iosSystemColors.systemGray4} />
+            <Icon name="chevron.right" size={14} color={systemColors.tertiaryLabel} />
           </View>
         )}
       </View>
@@ -71,7 +89,7 @@ export function ListRow({
         <View
           style={[
             styles.separator,
-            { marginLeft: separatorInset + (leading ? 48 : 0), backgroundColor: systemColors.separator },
+            { marginStart: separatorInset + (leading ? 48 : 0), backgroundColor: systemColors.separator },
           ]}
         />
       )}
@@ -81,12 +99,14 @@ export function ListRow({
   if (onPress) {
     return (
       <PressableSurface
+        testID={testID}
         onPress={handlePress}
         feedback="opacity"
         opacityTo={0.7}
         accessibilityRole="button"
         accessibilityLabel={accessibilityLabel ?? title}
         accessibilityHint={accessibilityHint}
+        accessibilityState={accessibilityState}
         style={[styles.container, style]}
       >
         {content}
@@ -94,7 +114,11 @@ export function ListRow({
     );
   }
 
-  return <View style={[styles.container, style]}>{content}</View>;
+  return (
+    <View testID={testID} style={[styles.container, style]}>
+      {content}
+    </View>
+  );
 }
 
 const styles = StyleSheet.create({
@@ -109,7 +133,7 @@ const styles = StyleSheet.create({
     minHeight: 44,
   },
   leading: {
-    marginRight: 12,
+    marginEnd: 12,
     width: 32,
     alignItems: 'center',
     justifyContent: 'center',
@@ -119,14 +143,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   subtitle: {
-    opacity: 0.6,
     marginTop: 2,
   },
   trailing: {
-    marginLeft: 8,
+    marginStart: 8,
+  },
+  trailingBelow: {
+    marginTop: 8,
   },
   chevron: {
-    marginLeft: 4,
+    marginStart: 4,
   },
   separator: {
     // backgroundColor is applied inline from systemColors.separator so it

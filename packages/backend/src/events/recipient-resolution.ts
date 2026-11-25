@@ -1,4 +1,6 @@
 import { eq, and, ne } from 'drizzle-orm';
+import { executeRows } from '@boardsesh/db/client';
+import { entityOwnerIdsQuery, NON_HUMAN_USER_IDS, type OwnedEntityType } from '@boardsesh/db/queries';
 import { db } from '../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import type { NotificationType } from '@boardsesh/db/schema';
@@ -9,8 +11,50 @@ export type RecipientInfo = {
 };
 
 /**
- * Resolve recipients for a comment event.
- * Returns the entity owner and/or parent comment author.
+ * The notification an item's owner gets for a comment on it, by the commented
+ * item's entity type. Typed over every owned entity type, so a type added to
+ * the owner table fails typecheck here until it has a notification. A comment's
+ * own author is the one exception: they hear about replies through
+ * `comment_reply`. A proposal has no owner, so it is not here.
+ */
+const COMMENT_ON_OWNED_ITEM: Record<Exclude<OwnedEntityType, 'comment'>, NotificationType> = {
+  tick: 'comment_on_tick',
+  session: 'comment_on_session',
+  climb: 'comment_on_climb',
+  playlist_climb: 'comment_on_playlist',
+  board: 'comment_on_board',
+  gym: 'comment_on_gym',
+};
+const commentOnOwnedItemType = new Map<string, NotificationType>(Object.entries(COMMENT_ON_OWNED_ITEM));
+
+/**
+ * Everyone who owns an item, read from the same owner definition the privacy
+ * rule uses (`entityOwnerIdsQuery`): the tick's climber, the session's host,
+ * the climb's Boardsesh setter (`board_climbs.user_id`; an Aurora-only
+ * `setter_id` names no Boardsesh account here), the playlist's owner, the
+ * live board's or gym's owner.
+ *
+ * Accounts nobody signs in to are dropped (`NON_HUMAN_USER_IDS`): the system
+ * catalogue account, which holds unclaimed synced gyms and the walls a deleted
+ * account hands over, and the job account that owns generated recommendation
+ * playlists. Nobody reads their inbox, and a row there would only keep other
+ * climbers' activity against an account. They stay owners for reads
+ * (`entityOwnerCondition`); they just get no notifications.
+ */
+async function resolveEntityOwnerIds(entityType: string, entityId: string): Promise<string[]> {
+  const ownerQuery = entityOwnerIdsQuery(entityType, entityId);
+  if (!ownerQuery) return [];
+  const owners = await executeRows<{ owner_id: string }>(db, ownerQuery);
+  return owners.map((owner) => owner.owner_id).filter((ownerId) => !NON_HUMAN_USER_IDS.has(ownerId));
+}
+
+/**
+ * Resolve recipients for a comment event: the owner of the commented item, and
+ * for a reply the author of the comment it answers.
+ *
+ * Since #6356 an item's owner reads every comment on it, so every owned item
+ * notifies its owner (#6385). The worker still checks each recipient, and a
+ * private commenter passes for the owner because the owner may read them.
  */
 export async function resolveCommentRecipients(
   entityType: string,
@@ -35,26 +79,16 @@ export async function resolveCommentRecipients(
     }
   }
 
-  // Notify the entity owner
-  if (entityType === 'tick') {
-    const [tick] = await db
-      .select({ userId: dbSchema.boardseshTicks.userId })
-      .from(dbSchema.boardseshTicks)
-      .where(eq(dbSchema.boardseshTicks.uuid, entityId))
-      .limit(1);
-
-    if (tick) {
-      recipients.push({
-        recipientId: tick.userId,
-        notificationType: 'comment_on_tick',
-      });
+  // Notify the item's owner(s)
+  const ownerNotificationType = commentOnOwnedItemType.get(entityType);
+  if (ownerNotificationType) {
+    for (const ownerId of await resolveEntityOwnerIds(entityType, entityId)) {
+      recipients.push({ recipientId: ownerId, notificationType: ownerNotificationType });
     }
   }
 
-  // For climb comments, we don't have a single owner to notify
-  // (climbs are set by Aurora users, not boardsesh users)
-
-  // Deduplicate: if the parent comment author IS the tick owner, only send one notification
+  // One notification per person: a reply to the owner's own comment reaches
+  // them once, as the reply. The commenter is dropped later, by the writer.
   const seen = new Set<string>();
   return recipients.filter((r) => {
     if (seen.has(r.recipientId)) return false;
@@ -310,6 +344,19 @@ export function resolveFollowRecipient(metadata: Record<string, string>): Recipi
   return {
     recipientId: followedUserId,
     notificationType: 'new_follower',
+  };
+}
+
+/**
+ * Resolve the recipient of a follow request: the private account's owner.
+ */
+export function resolveFollowRequestRecipient(metadata: Record<string, string>): RecipientInfo | null {
+  const recipientUserId = metadata.recipientUserId;
+  if (!recipientUserId) return null;
+
+  return {
+    recipientId: recipientUserId,
+    notificationType: 'follow_request',
   };
 }
 

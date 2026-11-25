@@ -75,6 +75,12 @@
   "gymPage": {
     "metaTitle": "Rocódromo {{gymName}}",
     "metaDescription": "Mira los plafones y el muro en directo de {{gymName}} en Boardsesh.",
+    "metaTitleName": "{{gymName}}",
+    "metaTitleLocation": "{{gymName}}, {{location}}",
+    "metaTitleBoards": "{{venue}}: {{boards}}",
+    "metaBoardAngle": "{{board}} a {{angle}}°",
+    "metaDescriptionBoards": "{{venue}} tiene {{boards}}. Mira qué está iluminado en el muro y abre los bloques en Boardsesh.",
+    "metaDescriptionLocation": "{{gymName}} ({{location}}). Mira los plafones y el muro en directo en Boardsesh.",
     "breadcrumbHome": "Boardsesh",
     "breadcrumbGyms": "Rocódromos",
     "manageGym": "Gestionar rocódromo",
@@ -87,14 +93,13 @@
     "visitWebsite": "Visitar el sitio web",
     "install": {
       "heading": "Consigue la app para este muro",
-      "body": "Enciende los plafones de {{gymName}} desde el móvil y registra cada encadene.",
-      "googlePlay": "Disponible en Google Play",
-      "appStore": "Descárgala en el App Store"
+      "body": "Enciende los plafones de {{gymName}} desde el móvil y registra cada encadene."
     },
     "noBoardsYet": "Aún no hay plafones aquí.",
     "explorePlaylists": "Mira las playlists que monta la gente",
-    "claimTitle": "¿Es tuyo este rocódromo?",
-    "claimBody": "Reclámalo para gestionar los plafones, la marca y lo que se ve en el muro.",
+    "startDiscussion": "Iniciar la conversación",
+    "claimTitle": "¿Gestionas este rocódromo?",
+    "claimBody": "Reclámalo para corregir plafones, añadir tu horario y poner la pared en una TV. Es gratis.",
     "claimCta": "Reclamar este rocódromo",
     "claimCtaSignedOut": "Inicia sesión y reclámalo",
     "claimPendingTitle": "Tu solicitud está en revisión",
@@ -137,12 +142,52 @@
       "printAction": "Imprimir este póster",
       "backToGym": "Volver al rocódromo"
     },
-    "sprayWallsHeading": "Plafones spray",
-    "sprayWallCount_one": "{{count}} plafón",
-    "sprayWallCount_other": "{{count}} plafones",
-    "sprayWallsIntro": "Los plafones spray de este centro, presa a presa. Abre uno para ver lo que se ha montado en él.",
+    "sprayWallsHeading": "Spraywalls",
+    "sprayWallCount_one": "{{count}} Spraywall",
+    "sprayWallCount_other": "{{count}} Spraywalls",
+    "sprayWallsIntro": "Los Spraywalls de este centro, presa a presa. Abre uno para ver lo que se ha montado en él.",
     "sprayWallPhotoAlt": "Foto de {{wallName}}",
-    "sprayWallMeta": "{{angle}}° · {{holds}} presas"
+    "sprayWallMeta": "{{angle}}° · {{holds}} presas",
+    "ogTitle": "{{gymName}} · {{boards}}",
+    "ogDescriptionOneType": "Plafón {{board}} en {{gymName}}. Mira qué bloques hay y registra tus encadenes.",
+    "ogDescriptionManyTypes": "Plafones {{boards}} en {{gymName}}. Mira qué bloques hay y registra tus encadenes.",
+    "ogDescriptionNoBoards": "Todavía no hay plafones en este rocódromo. ¿Escalas aquí? Reclama el rocódromo y añádelos.",
+    "openMaps": "Abrir {{gymName}} en el mapa",
+    "mapsLocation": "Abrir mapa",
+    "boardAngle": "{{configuration}} · {{angle}}°",
+    "seeClimbs": "Ver los bloques",
+    "popularClimbHeading": "El bloque más registrado en este plafón",
+    "popularClimbBody": "Según los encadenes y flashes públicos registrados aquí. Las repeticiones cuentan."
+  },
+  "boardPoster": {
+    "metaTitle": "Póster QR de {{boardName}}",
+    "fallbackTitle": "Póster QR",
+    "metaDescription": "Un código QR listo para imprimir. Los escaladores lo escanean para ver los bloques de aquí y registrar sus encadenes.",
+    "scanStep": "Escanea el código con la cámara",
+    "openSource": "Boardsesh es gratis y de código abierto.",
+    "printedOn": "Impreso en {{monthYear}}",
+    "layoutLabel": "Diseño del póster",
+    "layouts": {
+      "photo": "Póster con foto",
+      "plain": "Póster sencillo",
+      "cards": "Tarjetas"
+    },
+    "unlistedNotice": "Cualquiera que escanee esto puede abrir el Spraywall.",
+    "spray": {
+      "headline": "Este Spraywall está en Boardsesh",
+      "pickStep": "Elige un bloque en la foto",
+      "logStep": "Registra tu encadene o equipa el tuyo",
+      "justInstalled": "¿Acabas de instalar la app? Escanea otra vez para abrir este Spraywall.",
+      "backAction": "Volver al Spraywall"
+    },
+    "led": {
+      "headline": "Este plafón está en Boardsesh",
+      "pickStep": "Elige un bloque y enciéndelo en el plafón",
+      "logStep": "¿Encadenado? Registra tu encadene",
+      "justInstalled": "¿Acabas de instalar la app? Escanea otra vez para abrir este plafón.",
+      "compatibility": "Compatible con {{boardBrand}}.",
+      "backAction": "Volver al plafón"
+    }
   },
   "manage": {
     "welcome": {
@@ -161,8 +206,8 @@
           "body": "Añade tu logo y tus colores"
         },
         "boards": {
-          "title": "Vincula tus plafones",
-          "body": "Conecta los muros de tu rocódromo"
+          "title": "Revisa tus plafones",
+          "body": "Corrige o quita los que no estén en tus muros"
         },
         "members": {
           "title": "Invita a tu equipo",
@@ -172,7 +217,6 @@
     },
     "title": "Gestionar {{gymName}}",
     "backToGym": "Volver a la página del rocódromo",
-    "accessDenied": "No tienes permiso para gestionar este rocódromo.",
     "tabs": {
       "kiosks": "Kioscos",
       "branding": "Marca",
@@ -182,27 +226,6 @@
       "overview": "Resumen",
       "profile": "Perfil",
       "comments": "Comentarios"
-    },
-    "insights": {
-      "subtitle": "Cómo fueron tus plafones esta semana frente a la anterior.",
-      "uniqueClimbers": "Escaladores",
-      "ascents": "Encadenes",
-      "busiestDay": "Día más activo",
-      "byDay": "Encadenes por día",
-      "byDayAria": "Encadenes por día de la semana",
-      "topClimbs": "Lo que todos están proyectando",
-      "noTopClimbs": "Aún no hay encadenes esta semana.",
-      "unnamedClimb": "Bloque sin nombre",
-      "ascentsCount_one": "{{count}} encadene",
-      "ascentsCount_other": "{{count}} encadenes",
-      "deltaUp": "+{{count}} frente a la semana pasada",
-      "deltaDown": "−{{count}} frente a la semana pasada",
-      "deltaFlat": "Igual que la semana pasada",
-      "loadError": "No se pudieron cargar los datos de esta semana.",
-      "empty": {
-        "title": "Sin encadenes esta semana",
-        "body": "¿Toca renovar el muro? En cuanto los escaladores registren un encadene aquí, verás quién vino y qué están proyectando."
-      }
     },
     "navGuard": {
       "title": "¿Descartar los cambios sin guardar?",
@@ -271,26 +294,21 @@
     },
     "boards": {
       "heading": "Plafones de este rocódromo",
-      "description": "Vincula los plafones que posees para que aparezcan en la página de tu rocódromo y en los kioscos.",
+      "description": "Estos plafones los pusieron aquí escaladores y datos públicos de plafones. Corrige los que estén mal y quita los que no estén en tus muros.",
       "addBoard": "Añadir un plafón",
       "empty": "Aún no hay plafones vinculados. Añade uno para empezar.",
       "loadError": "No se pudieron cargar los plafones de este rocódromo.",
-      "unlink": "Desvincular",
-      "onlyOwnerCanUnlink": "Solo el propietario del plafón puede desvincularlo",
-      "readOnlyHint": "Solo el propietario del rocódromo o un administrador puede vincular plafones.",
-      "unlinkTitle": "¿Desvincular este plafón?",
-      "unlinkBody": "«{{name}}» dejará de aparecer en la página y los kioscos de este rocódromo. Puedes volver a vincularlo cuando quieras.",
-      "unlinkConfirm": "Desvincular",
+      "readOnlyHint": "El propietario y los administradores añaden sus propios plafones y eliminan los sincronizados. Tú puedes quitar los plafones que añadieron otros escaladores y añadir los que estén cerca de tu rocódromo.",
+      "askAdminToDelete": "Pídele a un propietario o administrador que elimine este.",
       "cancel": "Cancelar",
       "linked": "Plafón vinculado.",
       "linkFailed": "No se pudo vincular el plafón.",
-      "unlinked": "Plafón desvinculado.",
-      "unlinkFailed": "No se pudo desvincular el plafón.",
       "visibility": {
         "public": "Público",
         "unlisted": "No listado",
         "private": "Privado"
       },
+      "printPoster": "Imprimir póster",
       "addDialog": {
         "title": "Añade uno de tus plafones",
         "body": "Elige un plafón que poseas para vincularlo a este rocódromo.",
@@ -300,8 +318,8 @@
         "close": "Cerrar"
       },
       "strays": {
-        "heading": "Plafones que podrían ser tuyos",
-        "description": "Están en tu rocódromo o quedaron sueltos tras fusionar una ficha. Añade los que te correspondan.",
+        "heading": "Plafones cerca de tu rocódromo",
+        "description": "Están a menos de 150 m de tu rocódromo o vienen de una ficha fusionada. Añade los que estén en tus muros.",
         "reasonMerged": "Estaba en una ficha fusionada",
         "reasonNearby": "a {{meters}} m",
         "reasonNearbyGeneric": "Justo al lado",
@@ -316,7 +334,9 @@
         "empty": "Nada suelto por ahora. Todos los plafones cerca de tu rocódromo ya están en tu ficha.",
         "loadError": "No se pudieron buscar plafones sueltos.",
         "retry": "Reintentar"
-      }
+      },
+      "back": "Todos los plafones",
+      "editLoadError": "No se ha podido cargar este plafón para editarlo."
     },
     "presets": {
       "single": "Muro único",
@@ -337,6 +357,12 @@
       "createFailed": "No se pudo crear el kiosco."
     },
     "editor": {
+      "appearance": {
+        "label": "Apariencia",
+        "light": "Claro",
+        "dark": "Oscuro",
+        "description": "Elige el aspecto de esta pantalla. Los demás kioscos conservan su propia apariencia."
+      },
       "back": "Todos los kioscos",
       "save": "Guardar diseño",
       "saved": "Kiosco guardado.",
@@ -402,8 +428,8 @@
           "body": "Añade tu logo y los colores de tu marca"
         },
         "boards": {
-          "title": "Vincula tus plafones",
-          "body": "Conecta los muros de tu rocódromo"
+          "title": "Revisa tus plafones",
+          "body": "Corrige o quita los que no estén en tus muros"
         },
         "members": {
           "title": "Invita a tu equipo",
@@ -441,6 +467,19 @@
     "comments": {
       "intro": "Responde al hilo de comentarios de tu rocódromo sin salir de la consola.",
       "heading": "Lo que dice tu equipo"
+    },
+    "aiAssistants": {
+      "title": "Asistentes de IA",
+      "body": "Gestiona tus rocódromos con ChatGPT o Claude. Conecta tu cuenta de Boardsesh una sola vez.",
+      "connect": "Conecta un asistente",
+      "connections": "Gestiona las conexiones",
+      "checking": "Comprobando las conexiones…",
+      "connected": "Hay un asistente conectado",
+      "paused": "El acceso del asistente está en pausa",
+      "notConnected": "Aún no hay ningún asistente conectado",
+      "statusUnavailable": "Comprueba tus conexiones en Ajustes",
+      "pilotBody": "Las conexiones con asistentes están en una prueba piloto solo por invitación. Espera una invitación de Boardsesh antes de iniciar sesión para conectar.",
+      "pilotDetails": "Lee cómo acceder a la prueba"
     }
   },
   "branding": {

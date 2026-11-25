@@ -1,3 +1,4 @@
+import { canReadSocialEntity } from '../shared/activity-privacy';
 import { eq, and, isNull } from 'drizzle-orm';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
@@ -13,6 +14,7 @@ export async function validateEntityExists(
   entityId: string,
   viewerUserId?: string,
 ): Promise<void> {
+  if (!(await canReadSocialEntity(entityType, entityId, viewerUserId))) throw new Error('Content not available');
   switch (entityType) {
     case 'climb': {
       const [climb] = await db
@@ -21,6 +23,7 @@ export async function validateEntityExists(
           userId: dbSchema.boardClimbs.userId,
           isDraft: dbSchema.boardClimbs.isDraft,
           isListed: dbSchema.boardClimbs.isListed,
+          boardType: dbSchema.boardClimbs.boardType,
         })
         .from(dbSchema.boardClimbs)
         .where(
@@ -42,7 +45,8 @@ export async function validateEntityExists(
       if (!climb) {
         throw new Error('Climb not found');
       }
-      if ((climb.isDraft === true || climb.isListed === false) && climb.userId !== viewerUserId) {
+      const sharedSprayDraft = climb.boardType === 'spray' && climb.isDraft === true;
+      if (!sharedSprayDraft && (climb.isDraft === true || climb.isListed === false) && climb.userId !== viewerUserId) {
         throw new Error('Climb not found');
       }
       break;

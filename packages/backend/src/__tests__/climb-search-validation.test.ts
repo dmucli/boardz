@@ -11,6 +11,16 @@ const base = {
   angle: 40,
 };
 
+describe('shared spray draft scope', () => {
+  it('accepts wall drafts only on spray walls and keeps the own scope compatible', () => {
+    expect(
+      ClimbSearchInputSchema.safeParse({ ...base, boardName: 'spray', onlyDrafts: true, draftScope: 'WALL' }).success,
+    ).toBe(true);
+    expect(ClimbSearchInputSchema.safeParse({ ...base, onlyDrafts: true, draftScope: 'WALL' }).success).toBe(false);
+    expect(ClimbSearchInputSchema.safeParse({ ...base, onlyDrafts: true, draftScope: 'OWN' }).success).toBe(true);
+  });
+});
+
 describe('ClimbSearchInputSchema page bound', () => {
   it('accepts pages up to MAX_SEARCH_PAGE', () => {
     expect(ClimbSearchInputSchema.safeParse({ ...base, page: 0 }).success).toBe(true);
@@ -68,6 +78,20 @@ describe('ClimbSearchInputSchema personal rating filters (#2645)', () => {
 
   it('leaves both filters optional', () => {
     expect(ClimbSearchInputSchema.safeParse(base).success).toBe(true);
+  });
+});
+
+describe('ClimbSearchInputSchema onlyFavorited (#6077)', () => {
+  it('accepts a boolean, rejects anything else, and stays optional', () => {
+    expect(ClimbSearchInputSchema.safeParse({ ...base, onlyFavorited: true }).success).toBe(true);
+    expect(ClimbSearchInputSchema.safeParse({ ...base, onlyFavorited: false }).success).toBe(true);
+    expect(ClimbSearchInputSchema.safeParse({ ...base, onlyFavorited: 'true' }).success).toBe(false);
+    expect(ClimbSearchInputSchema.parse(base).onlyFavorited).toBeUndefined();
+  });
+
+  it('survives parsing and reaches the search params', () => {
+    const parsed = ClimbSearchInputSchema.parse({ ...base, onlyFavorited: true });
+    expect(mapSearchInputToParams(parsed).onlyFavorited).toBe(true);
   });
 });
 

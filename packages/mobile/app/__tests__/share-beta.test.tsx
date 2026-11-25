@@ -1,4 +1,17 @@
 // @vitest-environment jsdom
+vi.mock('../../src/components/AccessibleTextInput', async () => {
+  const { TextInput } = await import('react-native');
+  return { AccessibleTextInput: TextInput };
+});
+vi.mock('../../src/hooks/use-bold-text', () => ({ useBoldText: () => false }));
+vi.mock('../../src/components/PressableSurface', async () => {
+  const { Pressable } = await import('react-native');
+  const { createElement } = await import('react');
+  return {
+    PressableSurface: (props: React.ComponentProps<typeof Pressable>) =>
+      createElement(Pressable, { ...props, onPress: props.disabled ? undefined : props.onPress }),
+  };
+});
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render } from '@testing-library/react';
 import { createElement, type ReactNode } from 'react';
@@ -63,6 +76,11 @@ function makeAscent(uuid: string, climbUuid = `climb-${uuid}`): AscentFeedItem {
   };
 }
 
+// The launch hold is covered by its own suite; here the screen renders as is.
+vi.mock('../../src/components/launch-update/hold-until-launch-ready', () => ({
+  holdUntilLaunchReady: <Screen,>(Screen: Screen) => Screen,
+}));
+
 vi.mock('react-native', () => ({
   View: ({ children }: { children?: ReactNode }) => createElement('div', null, children),
   TextInput: ({
@@ -88,7 +106,11 @@ vi.mock('react-native', () => ({
     onPress?: () => void;
     accessibilityLabel?: string;
   }) => createElement('button', { type: 'button', onClick: onPress, 'aria-label': accessibilityLabel }, children),
-  StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
+  StyleSheet: {
+    flatten: (style: unknown) => Object.assign({}, ...[style].flat(10).filter(Boolean)),
+    create: (styles: Record<string, unknown>) => styles,
+    hairlineWidth: 1,
+  },
 }));
 
 vi.mock('expo-router', () => ({
@@ -149,6 +171,7 @@ vi.mock('expo-haptics', () => ({
 }));
 
 vi.mock('../../src/providers/theme-provider', () => ({
+  useOptionalTheme: () => null,
   useTheme: () => ({
     systemColors: {
       background: '#fff',
@@ -182,14 +205,6 @@ vi.mock('../../src/lib/graphql/hooks', () => ({
   useBetaLinkPreview: () => ({ data: { caption: state.caption, thumbnail: null }, isLoading: false }),
 }));
 
-// The screenshot-mode link resolver. It returns '' outside a capture build and
-// its request dead-strips there, but the module still has to resolve under the
-// test's module mocks, and stubbing it keeps the GraphQL client out of this
-// screen's tests entirely.
-vi.mock('../../src/hooks/use-screenshot-own-beta-link', () => ({
-  useScreenshotOwnBetaLink: () => '',
-}));
-
 vi.mock('../../src/lib/graphql/extract-error-message', () => ({
   extractGraphqlMessage: (error: unknown) => (error instanceof Error ? error.message : null),
 }));
@@ -197,6 +212,7 @@ vi.mock('../../src/lib/graphql/extract-error-message', () => ({
 vi.mock('../../src/lib/analytics', () => ({ track }));
 
 vi.mock('../../src/theme/tokens', () => ({
+  opacity: { disabled: 0.5 },
   spacing: { 1: 4, 2: 8, 3: 12, 4: 16, 5: 20, 6: 24, 8: 32 },
   borderRadius: { sm: 4, md: 8 },
 }));
@@ -215,6 +231,20 @@ vi.mock('../../src/components/Button', () => ({
 
 vi.mock('../../src/components/Icon', () => ({
   Icon: ({ name }: { name: string }) => createElement('i', { 'data-icon': name }),
+}));
+
+vi.mock('../../src/components/ChromeIconButton', () => ({
+  ChromeIconButton: ({
+    icon,
+    onPress,
+    accessibilityLabel,
+  }: {
+    icon: string;
+    onPress: () => void;
+    accessibilityLabel: string;
+  }) =>
+    createElement('button', { type: 'button', onClick: onPress, 'aria-label': accessibilityLabel, 'data-icon': icon }),
+  useChromeIconButtonSize: () => 44,
 }));
 
 vi.mock('../../src/components/ActivityIndicator', () => ({

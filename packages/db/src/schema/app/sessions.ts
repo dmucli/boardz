@@ -12,6 +12,7 @@ import {
   primaryKey,
   uniqueIndex,
   pgEnum,
+  uuid,
   check,
 } from 'drizzle-orm/pg-core';
 import { sql } from 'drizzle-orm';
@@ -34,7 +35,7 @@ import { userBoards } from './boards';
  * `total_attempts` differently. One table means none of that can come back.
  *
  * Every live-session path must therefore scope itself to `origin = 'explicit'` — the
- * auto-end sweep, the join guard, the leader checks. See `docs/inferred-sessions.md`.
+ * auto-end sweep, the join guard, the leader checks. See `docs/data/inferred-sessions.md`.
  */
 export const sessionOriginEnum = pgEnum('session_origin', ['explicit', 'inferred']);
 
@@ -43,6 +44,8 @@ export const boardSessions = pgTable(
   'board_sessions',
   {
     id: text('id').primaryKey(),
+    // Opaque history/export identity; unlike id, never accepted as an invite.
+    exportId: uuid('export_id').defaultRandom().notNull().unique(),
     // Null for inferred sessions: they are reconstructed from ticks that may span
     // several boards, so there is no one path to record. Only two places read this
     // off the row — the Strava export and `updateSessionBoardPathIfChanged` — and
@@ -178,6 +181,8 @@ export const boardSessionQueues = pgTable('board_session_queues', {
   version: integer('version').default(1).notNull(),
   // Sequence number for event ordering (separate from version used for optimistic locking)
   sequence: integer('sequence').default(0).notNull(),
+  /** Only consulted at version 1 for an atomic partner Start; later queue versions use ordinary restore rules. */
+  initialHistoryCount: integer('initial_history_count'),
   updatedAt: timestamp('updated_at').defaultNow().notNull(),
 });
 

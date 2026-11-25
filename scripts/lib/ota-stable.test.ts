@@ -1,0 +1,367 @@
+import { describe, expect, it } from 'vitest';
+import {
+  decideStable,
+  initialStableState,
+  parseStableState,
+  qualifyCandidate,
+  releaseCycleDate,
+  refreshAfterOwnFinish,
+} from './ota-stable';
+import type { StableRelease } from './ota-stable';
+
+import { candidateFixture, activeFixture, healthFixture, baselineIds } from '../__tests__/helpers/ota-stable-fixtures';
+
+describe('daily release decisions', () => {
+  it('catches up after qualification at any hour, once per 22:00 UTC release cycle', () => {
+    const state = { ...initialStableState(), candidate: candidateFixture() };
+    expect(decideStable(state, new Date('2026-10-08T21:59:59Z'), []).action).toBe('start');
+    state.lastStartedDate = '2026-10-07';
+    expect(decideStable(state, new Date('2026-10-08T21:59:59Z'), []).action).toBe('hold');
+    expect(decideStable(state, new Date('2026-10-08T22:00:00Z'), []).action).toBe('start');
+    state.lastStartedDate = '2026-10-08';
+    expect(decideStable(state, new Date('2026-10-08T22:37:00Z'), []).action).toBe('hold');
+    expect(decideStable(state, new Date('2026-10-09T00:01:00Z'), []).action).toBe('hold');
+    expect(decideStable(state, new Date('2026-10-09T21:59:59Z'), []).action).toBe('hold');
+    expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), []).action).toBe('start');
+    expect(releaseCycleDate(new Date('2026-10-09T00:01:00Z'))).toBe('2026-10-08');
+  });
+  it('manual start bypasses cadence without bypassing qualification', () => {
+    const state = { ...initialStableState(), candidate: candidateFixture(), lastStartedDate: '2026-10-08' };
+    const now = new Date('2026-10-09T09:31:00Z');
+    expect(decideStable(state, now, [], 'start').action).toBe('start');
+    state.candidate.qaPassed = false;
+    expect(decideStable(state, now, [], 'start').action).toBe('hold');
+  });
+  it('forced completion bypasses timers and health only for an explicit or recorded force', () => {
+    const state = { ...initialStableState(), active: activeFixture() };
+    const now = new Date('2026-10-08T22:01:00Z');
+    expect(decideStable(state, now, []).action).toBe('hold');
+    expect(decideStable(state, now, [], 'force-release').action).toBe('finish');
+    state.active.forceRelease = true;
+    expect(decideStable(state, now, []).action).toBe('finish');
+    state.active.phase = 'reverting';
+    expect(decideStable(state, now, [], 'force-release').action).toBe('hold');
+    expect(decideStable(state, now, []).action).toBe('revert');
+  });
+  it.each(['missing', 'failed', 'cancelled', 'skipped'])(
+    'rejects a %s blocking gate even with passed output',
+    (result) => {
+      const candidate = candidateFixture();
+      const qualified = qualifyCandidate(candidate, {
+        receipt: candidate.receipt,
+        sha: candidate.receipt.commitHash,
+        bootSha: candidate.receipt.commitHash,
+        branch: 'pr-stable-candidate',
+        smokeResult: result,
+        bootResult: 'success',
+        smokePassed: 'true',
+        bootPassed: 'true',
+      });
+      expect(qualified.qaPassed).toBe(false);
+      expect(
+        decideStable({ ...initialStableState(), candidate: qualified }, new Date('2026-10-08T22:00:00Z'), []).action,
+      ).toBe('hold');
+    },
+  );
+  it('rejects a gate for different bytes, branch or either SHA', () => {
+    const candidate = candidateFixture();
+    const proof = {
+      receipt: candidate.receipt,
+      sha: candidate.receipt.commitHash,
+      bootSha: candidate.receipt.commitHash,
+      branch: 'pr-stable-candidate',
+      smokeResult: 'success',
+      bootResult: 'success',
+      smokePassed: 'true',
+      bootPassed: 'true',
+    };
+    for (const patch of [
+      { branch: 'pr-staging' },
+      { sha: 'f'.repeat(40) },
+      { bootSha: 'f'.repeat(40) },
+      {
+        receipt: {
+          ...candidate.receipt,
+          platforms: {
+            ...candidate.receipt.platforms,
+            ios: { ...candidate.receipt.platforms.ios, bundleSha256: 'f'.repeat(64) },
+          },
+        },
+      },
+    ]) {
+      expect(() => qualifyCandidate(candidate, { ...proof, ...patch })).toThrow('exact frozen');
+    }
+  });
+  it('requires explicit true outputs from both gates', () => {
+    const candidate = candidateFixture();
+    expect(
+      qualifyCandidate(candidate, {
+        receipt: candidate.receipt,
+        sha: candidate.receipt.commitHash,
+        bootSha: candidate.receipt.commitHash,
+        branch: 'pr-stable-candidate',
+        smokeResult: 'success',
+        bootResult: 'success',
+        smokePassed: 'true',
+        bootPassed: '',
+      }).qaPassed,
+    ).toBe(false);
+  });
+  it('delayed ticks move only one step and insufficient valid evidence ramps no further than 50%', () => {
+    const active = activeFixture();
+    const state = { ...initialStableState(), active };
+    expect(decideStable(state, new Date('2026-10-09T12:00:00Z'), healthFixture('insufficient-evidence'))).toMatchObject(
+      { action: 'raise', percentage: 10 },
+    );
+    active.percentage = 50;
+    active.stepSince = '2026-10-09T10:00:00Z';
+    expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), healthFixture('insufficient-evidence')).action).toBe(
+      'hold',
+    );
+  });
+  it('waits four hours at each step', () => {
+    const state = { ...initialStableState(), active: activeFixture() };
+    expect(decideStable(state, new Date('2026-10-09T01:59:59Z'), healthFixture()).action).toBe('hold');
+    expect(decideStable(state, new Date('2026-10-09T02:00:00Z'), healthFixture())).toMatchObject({
+      action: 'raise',
+      percentage: 10,
+    });
+  });
+  it('finishes at any hour after twenty total and eight final-step hours', () => {
+    const active = { ...activeFixture(), percentage: 50, stepSince: '2026-10-09T14:00:00Z' };
+    const state = { ...initialStableState(), active };
+    expect(decideStable(state, new Date('2026-10-09T21:59:59Z'), healthFixture()).action).toBe('hold');
+    expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), healthFixture()).action).toBe('finish');
+    expect(decideStable(state, new Date('2026-10-10T01:00:00Z'), healthFixture()).action).toBe('finish');
+    active.stepSince = '2026-10-09T14:01:00Z';
+    expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), healthFixture()).action).toBe('hold');
+    active.stepSince = '2026-10-09T10:00:00Z';
+    active.startedAt = '2026-10-09T03:00:00Z';
+    expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), healthFixture()).action).toBe('hold');
+  });
+  it('missing, malformed and one-platform health never progress', () => {
+    const state = { ...initialStableState(), active: activeFixture() };
+    const health = healthFixture();
+    expect(decideStable(state, new Date('2026-10-09T08:00:00Z'), health.slice(0, 1)).action).toBe('hold');
+    health[0].canary = null;
+    expect(decideStable(state, new Date('2026-10-09T08:00:00Z'), health).action).toBe('hold');
+    health[0].canary = { devicesOnUpdate: 1, successfulDevices: Number.NaN, faultyDevices: 0 };
+    expect(decideStable(state, new Date('2026-10-09T08:00:00Z'), health).action).toBe('hold');
+  });
+  it.each(['ios', 'android'] as const)(
+    'requires actual health only from the changed side when %s is unchanged',
+    (unchanged) => {
+      const active = activeFixture();
+      active.unchangedPlatforms = { [unchanged]: baselineIds[unchanged] };
+      delete active.updateIds[unchanged];
+      const changedHealth = healthFixture().filter((entry) => entry.rollout.platform !== unchanged);
+      const state = { ...initialStableState(), active };
+      expect(decideStable(state, new Date('2026-10-09T02:00:00Z'), changedHealth)).toMatchObject({
+        action: 'raise',
+        percentage: 10,
+      });
+      expect(decideStable(state, new Date('2026-10-09T02:00:00Z'), [])).toMatchObject({ action: 'hold' });
+      expect(
+        decideStable(
+          state,
+          new Date('2026-10-09T02:00:00Z'),
+          healthFixture().filter((entry) => entry.rollout.platform === unchanged),
+        ),
+      ).toMatchObject({ action: 'hold' });
+      active.percentage = 50;
+      active.stepSince = '2026-10-09T10:00:00Z';
+      expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), changedHealth)).toMatchObject({ action: 'finish' });
+      changedHealth[0].judgement.verdict = 'insufficient-evidence';
+      expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), changedHealth)).toMatchObject({ action: 'hold' });
+      changedHealth[0].judgement.verdict = 'unhealthy';
+      expect(decideStable(state, new Date('2026-10-09T22:00:00Z'), changedHealth)).toMatchObject({ action: 'revert' });
+    },
+  );
+  describe('a changed platform with no fleet to judge (#6524)', () => {
+    // iOS 2.6.0 live and healthy; Android 2.6.0 still a Play draft, so its runtime has almost no devices.
+    const soaked = () => ({ ...activeFixture(), percentage: 50, stepSince: '2026-10-09T10:00:00Z' });
+    const window = new Date('2026-10-09T22:00:00Z');
+    const fleetlessAndroid = (canary = { devicesOnUpdate: 0, successfulDevices: 0, faultyDevices: 0 }) => {
+      const health = healthFixture();
+      health[1]!.judgement.verdict = 'insufficient-evidence';
+      health[1]!.canary = canary;
+      health[1]!.control = { devicesOnUpdate: 1, successfulDevices: 1, faultyDevices: 0 };
+      health[1]!.canaryIssues = { updateIssues: 0, runtimeIssues: 0, source: 'snapshots' };
+      return health;
+    };
+
+    it('finishes the healthy platform and names the fleetless one', () => {
+      const decision = decideStable({ ...initialStableState(), active: soaked() }, window, fleetlessAndroid());
+      expect(decision).toMatchObject({ action: 'finish', reason: expect.stringContaining('android has no fleet') });
+      expect(decision.reason).toContain('1 device(s) on its canary and control');
+    });
+
+    it('still needs the full soak while tolerating delayed checks', () => {
+      const state = { ...initialStableState(), active: soaked() };
+      expect(decideStable(state, new Date('2026-10-09T21:00:00Z'), fleetlessAndroid()).action).toBe('finish');
+      state.active.stepSince = '2026-10-09T15:00:00Z';
+      expect(decideStable(state, window, fleetlessAndroid()).action).toBe('hold');
+    });
+
+    it('holds when the fleetless canary has a faulty device', () => {
+      const health = fleetlessAndroid({ devicesOnUpdate: 2, successfulDevices: 1, faultyDevices: 1 });
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('hold');
+    });
+
+    it('holds once the runtime reaches the no-fleet cap without a verdict', () => {
+      const health = fleetlessAndroid({ devicesOnUpdate: 3, successfulDevices: 3, faultyDevices: 0 });
+      health[1]!.control = { devicesOnUpdate: 2, successfulDevices: 2, faultyDevices: 0 };
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('hold');
+      health[1]!.control = { devicesOnUpdate: 1, successfulDevices: 1, faultyDevices: 0 };
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('finish');
+    });
+
+    it('holds when the fleetless canary reports launch or JS issues', () => {
+      const health = fleetlessAndroid();
+      health[1]!.canaryIssues = { updateIssues: 1, runtimeIssues: 0, source: 'snapshots' };
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('hold');
+      health[1]!.canaryIssues = null;
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('hold');
+      health[1]!.canaryIssues = { updateIssues: 0, runtimeIssues: 0, source: 'state' };
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('hold');
+    });
+
+    it('finishes the remaining fleetless platform after iOS already completed', () => {
+      const active: StableRelease = { ...soaked(), phase: 'finishing', completedPlatforms: { ios: baselineIds.ios } };
+      const health = fleetlessAndroid();
+      health[0]!.rollout.percentage = 100;
+      expect(decideStable({ ...initialStableState(), active }, window, health)).toMatchObject({
+        action: 'finish',
+        reason: expect.stringContaining('android has no fleet'),
+      });
+    });
+
+    it('never finishes when no platform is healthy', () => {
+      const health = fleetlessAndroid();
+      health[0]!.judgement.verdict = 'insufficient-evidence';
+      health[0]!.canary = { devicesOnUpdate: 0, successfulDevices: 0, faultyDevices: 0 };
+      health[0]!.control = { devicesOnUpdate: 0, successfulDevices: 0, faultyDevices: 0 };
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('hold');
+    });
+
+    it('holds a lone changed platform that is fleetless', () => {
+      const active = soaked();
+      active.unchangedPlatforms = { ios: baselineIds.ios };
+      delete active.updateIds.ios;
+      const health = fleetlessAndroid().filter((entry) => entry.rollout.platform === 'android');
+      expect(decideStable({ ...initialStableState(), active }, window, health).action).toBe('hold');
+    });
+
+    it('holds when the fleetless platform has malformed or missing control counts', () => {
+      const health = fleetlessAndroid();
+      health[1]!.control = null;
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('hold');
+    });
+
+    it('still reverts when the other platform is unhealthy', () => {
+      const health = fleetlessAndroid();
+      health[0]!.judgement.verdict = 'unhealthy';
+      expect(decideStable({ ...initialStableState(), active: soaked() }, window, health).action).toBe('revert');
+    });
+
+    it('resumes a recorded finish with a fleetless platform', () => {
+      const active: StableRelease = { ...soaked(), phase: 'finishing' };
+      expect(decideStable({ ...initialStableState(), active }, window, fleetlessAndroid())).toMatchObject({
+        action: 'finish',
+        reason: expect.stringContaining('android has no fleet'),
+      });
+    });
+  });
+  it('unhealthy evidence reverts even before the timer expires', () => {
+    expect(
+      decideStable(
+        { ...initialStableState(), active: activeFixture() },
+        new Date('2026-10-08T22:01:00Z'),
+        healthFixture('unhealthy'),
+      ).action,
+    ).toBe('revert');
+  });
+  it('does not claim to revert a platform already finished to 100%', () => {
+    const active: StableRelease = {
+      ...activeFixture(),
+      phase: 'finishing',
+      completedPlatforms: { ios: baselineIds.ios },
+    };
+    expect(
+      decideStable({ ...initialStableState(), active }, new Date('2026-10-09T22:00:00Z'), healthFixture('unhealthy')),
+    ).toMatchObject({ action: 'hold', reason: expect.stringContaining('manual recovery') });
+    active.completedPlatforms = {};
+    const health = healthFixture('unhealthy');
+    health[0].rollout.percentage = 100;
+    expect(decideStable({ ...initialStableState(), active }, new Date('2026-10-09T22:00:00Z'), health).action).toBe(
+      'hold',
+    );
+  });
+  it('rejects expired and previously rejected candidates', () => {
+    const state = { ...initialStableState(), candidate: candidateFixture() };
+    expect(decideStable(state, new Date('2026-11-09T22:00:00Z'), []).action).toBe('hold');
+    state.rejectedCommit = state.candidate.receipt.commitHash;
+    expect(decideStable(state, new Date('2026-10-08T22:00:00Z'), []).action).toBe('hold');
+  });
+});
+describe('checkpoint validation and baseline refresh', () => {
+  it('loads legacy absent maps while strictly refusing malformed or overlapping unchanged ownership', () => {
+    const active = activeFixture();
+    const { unchangedPlatforms: _ignored, ...legacy } = active;
+    expect(parseStableState({ ...initialStableState(), active: legacy }).active?.unchangedPlatforms).toEqual({});
+    for (const unchangedPlatforms of [null, { ios: '31' }, { ios: baselineIds.ios }, { other: baselineIds.ios }]) {
+      expect(() => parseStableState({ ...initialStableState(), active: { ...active, unchangedPlatforms } })).toThrow();
+    }
+    const mixed = { ...active, updateIds: { android: '32' }, unchangedPlatforms: { ios: baselineIds.ios } };
+    expect(parseStableState({ ...initialStableState(), active: mixed }).active).toEqual(mixed);
+    expect(() =>
+      parseStableState({
+        ...initialStableState(),
+        active: { ...mixed, unchangedPlatforms: { ios: baselineIds.android } },
+      }),
+    ).toThrow('captured baseline');
+    expect(() => parseStableState({ ...initialStableState(), active: { ...mixed, updateIds: {} } })).toThrow(
+      'owned platform',
+    );
+    expect(() =>
+      parseStableState({ ...initialStableState(), active: { ...mixed, completedPlatforms: { ios: baselineIds.ios } } }),
+    ).toThrow('unchanged platform');
+    expect(() =>
+      parseStableState({
+        ...initialStableState(),
+        active: { ...mixed, updateIds: {}, unchangedPlatforms: baselineIds },
+      }),
+    ).toThrow('entirely unchanged');
+  });
+  it('round trips and rejects malformed ownership before a write', () => {
+    const state = { ...initialStableState(), active: activeFixture() };
+    expect(parseStableState(state)).toEqual(state);
+    for (const patch of [
+      { percentage: '5' },
+      { updateIds: { ios: '31' } },
+      { pendingPercentage: 100 },
+      { completedPlatforms: { ios: baselineIds.ios } },
+      { forceRelease: 'true' },
+    ]) {
+      expect(() => parseStableState({ ...state, active: { ...state.active, ...patch } })).toThrow();
+    }
+  });
+  it('retains exact partial-ramp percentages only for a recorded forced finish', () => {
+    const state = {
+      ...initialStableState(),
+      active: { ...activeFixture(), phase: 'finishing' as const, pendingPercentage: 10, forceRelease: true },
+    };
+    expect(parseStableState(state)).toEqual(state);
+    expect(() => parseStableState({ ...state, active: { ...state.active, forceRelease: false } })).toThrow(
+      'Only a ramp or forced finish',
+    );
+  });
+  it('refreshes only the baseline this controller just replaced', () => {
+    const candidate = candidateFixture();
+    const active = activeFixture();
+    const ids = { ios: '33333333-3333-3333-3333-333333333333', android: '44444444-4444-4444-4444-444444444444' };
+    expect(refreshAfterOwnFinish(candidate, active, ids).receipt.baselineProductionUpdateIds).toEqual(ids);
+    const changed = { ...candidate, receipt: { ...candidate.receipt, baselineProductionUpdateIds: ids } };
+    expect(() => refreshAfterOwnFinish(changed, active, ids)).toThrow('independent');
+  });
+});

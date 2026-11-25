@@ -16,7 +16,6 @@ import type {
   PopularBoardConfigsInput,
   CreateBoardInput,
   SessionSummary,
-  PublicUserProfile,
   FollowConnection,
   TickStatus,
   SessionUser,
@@ -31,53 +30,15 @@ import type {
   UpsertHoldOutlineOverrideInput,
   DeleteHoldOutlineOverrideInput,
 } from '@boardsesh/shared-schema';
+import { BOARD_FIELDS } from '@boardsesh/graphql/operations/boards';
+import type { ClimbQueueItem } from '@boardsesh/queue';
+import type { SessionWorkoutPlan } from '@boardsesh/workout-summary';
 import type { SubscriptionQueueItem } from '../queue-conversion';
+export { GET_SPRAY_CLIMB } from '@boardsesh/graphql/operations/climb-search';
 
 // ============================================
 // Field Fragments (string interpolation, not GQL fragments)
 // ============================================
-
-const BOARD_FIELDS = `
-  uuid
-  slug
-  ownerId
-  ownerDisplayName
-  ownerAvatarUrl
-  boardType
-  layoutId
-  sizeId
-  setIds
-  name
-  description
-  locationName
-  latitude
-  longitude
-  isPublic
-  isUnlisted
-  hideLocation
-  isOwned
-  angle
-  isAngleAdjustable
-  hasLeds
-  createdAt
-  layoutName
-  sizeName
-  sizeDescription
-  setNames
-  totalAscents
-  uniqueClimbers
-  followerCount
-  commentCount
-  isFollowedByMe
-  gymId
-  gymUuid
-  gymName
-  distanceMeters
-  serialNumber
-  timerName
-  canEdit
-  isPinnedByMe
-`;
 
 const CLIMB_SEARCH_FIELDS = `
   uuid
@@ -188,27 +149,6 @@ export type UpdateProfileMutationResponse = {
   updateProfile: UserProfile;
 };
 
-export const GET_PUBLIC_PROFILE = gql`
-  query GetPublicProfile($userId: ID!) {
-    publicProfile(userId: $userId) {
-      id
-      displayName
-      avatarUrl
-      followerCount
-      followingCount
-      isFollowedByMe
-    }
-  }
-`;
-
-export type GetPublicProfileQueryVariables = {
-  userId: string;
-};
-
-export type GetPublicProfileQueryResponse = {
-  publicProfile: PublicUserProfile | null;
-};
-
 // ============================================
 // Board Configuration Queries
 // ============================================
@@ -271,21 +211,12 @@ export type GetMyBoardsQueryResponse = {
   myBoards: UserBoardConnection;
 };
 
-export const GET_BOARD = gql`
-  query GetBoard($boardUuid: ID!) {
-    board(boardUuid: $boardUuid) {
-      ${BOARD_FIELDS}
-    }
-  }
-`;
-
-export type GetBoardQueryVariables = {
-  boardUuid: string;
-};
-
-export type GetBoardQueryResponse = {
-  board: UserBoard | null;
-};
+// GetBoard lives in the shared package; there is one document for every caller.
+export {
+  GET_BOARD,
+  type GetBoardQueryVariables,
+  type GetBoardQueryResponse,
+} from '@boardsesh/graphql/operations/boards';
 
 export const SEARCH_BOARDS = gql`
   query SearchBoards($input: SearchBoardsInput!) {
@@ -458,6 +389,7 @@ export const GET_CLIMB = gql`
 `;
 
 export type GetClimbQueryVariables = {
+  sprayWallUuid?: string;
   boardName: string;
   layoutId: number;
   sizeId: number;
@@ -556,7 +488,18 @@ export const CREATE_SESSION = gql`
   }
 `;
 
+export type AppWorkoutInitialSeed = {
+  queue: ClimbQueueItem[];
+  currentClimbQueueItem: ClimbQueueItem | null;
+  historyCount?: number;
+  plan: Array<{ index: number; climbUuids: string[] }>;
+  sessionPlan: SessionWorkoutPlan;
+};
+
 export type CreateSessionInput = {
+  appWorkoutId?: string;
+  appWorkoutSeed?: AppWorkoutInitialSeed;
+  audience?: 'public' | 'unlisted' | 'followers' | 'invite_only';
   boardPath: string;
   latitude: number;
   longitude: number;
@@ -587,6 +530,12 @@ export type CreateSessionMutationResponse = {
     isPermanent: boolean;
     color: string | null;
     startedAt: string;
+    queueState?: {
+      sequence: number;
+      queue: SubscriptionQueueItem[];
+      currentClimbQueueItem: SubscriptionQueueItem | null;
+      historyCount?: number | null;
+    } | null;
   };
 };
 
@@ -678,6 +627,11 @@ export type GetNearbySessionsQueryResponse = {
 // host, board, and participant count before the user commits to joining. The
 // `session` query does not join the session — joining happens via JOIN_SESSION
 // once the user confirms (see QueueProvider.joinSession).
+//
+// The screenshot fixtures were recorded before `isPermanent` was selected here;
+// replay fills it from what each set recorded (`replayCompatibleFixtureResponse`
+// in scripts/lib/screenshot-fixtures.ts). Any other change to this document
+// still needs a re-record.
 export const GET_SESSION = gql`
   query GetSession($sessionId: ID!) {
     session(sessionId: $sessionId) {
@@ -687,6 +641,7 @@ export const GET_SESSION = gql`
       color
       goal
       isPublic
+      isPermanent
       startedAt
       endedAt
       users {
@@ -713,6 +668,12 @@ export type SessionPreview = {
   goal: string | null;
   /** Shown in live-session listings. The creator flips it from the Record tab. */
   isPublic: boolean;
+  /**
+   * A gym's always-on session. Its members are not named to each other by
+   * membership (`sessionCoMemberCondition`): names follow each climber's
+   * privacy settings, so the join screen drops its "everyone sees your name" line.
+   */
+  isPermanent: boolean;
   startedAt: string | null;
   endedAt: string | null;
   users: SessionUser[];
@@ -792,6 +753,10 @@ export type GetSessionQueueStateQueryResponse = {
       stateHashOrdered?: string | null;
       queue: SubscriptionQueueItem[];
       currentClimbQueueItem: SubscriptionQueueItem | null;
+      /** F3: selected only by GET_SESSION_QUEUE_STATE_NOW_SLOT. */
+      historyCount?: number | null;
+      currentChangedAt?: string | null;
+      currentChangedBy?: string | null;
     } | null;
   } | null;
 };
@@ -1156,6 +1121,27 @@ export const SESSION_UPDATES_SUBSCRIPTION = `
         durationMinutes
         goal
       }
+      ... on SessionRestCadenceChanged {
+        restCadence {
+          mode
+          targetSeconds
+          autoAdvance
+          autoAdvanceOnce
+          advanceOn
+          source
+          isRunning
+          anchorAt
+          pausedElapsedSeconds
+          lastFiredBeatAt
+          lastTickQueueItemUuid
+          lastTickStatus
+          setByParticipantId
+        }
+        revision
+        serverNow
+        isSnapshot
+        action
+      }
     }
   }
 `;
@@ -1181,12 +1167,52 @@ export type SessionLiveStatsEvent = {
   goal?: string | null;
 };
 
+/**
+ * The crew's shared rest clock as `SessionRestCadenceChanged.restCadence`
+ * carries it (#5382). Instants are server epoch ms as decimal strings; `mode`,
+ * `advanceOn` and `source` are open strings, so a value this app does not know
+ * means the clock is unsupported here (lib/crew-rest-cadence.ts).
+ */
+export type SessionRestCadenceWire = {
+  mode: string;
+  targetSeconds?: number | null;
+  autoAdvance: boolean;
+  /** Move the wall once more, then wait (a 4x4 set rest). Null from a server that predates it: false. */
+  autoAdvanceOnce?: boolean | null;
+  advanceOn: string;
+  source: string;
+  isRunning: boolean;
+  anchorAt?: string | null;
+  pausedElapsedSeconds: number;
+  lastFiredBeatAt?: string | null;
+  lastTickQueueItemUuid?: string | null;
+  lastTickStatus?: string | null;
+  tickAcceptedAt?: string | null;
+  tickAcceptanceId?: string | null;
+  setByParticipantId?: string | null;
+};
+
+/** `SessionRestCadenceChanged`, from the subscription or a `setSessionRestCadence` reply. */
+export type SessionRestCadenceChangeWire = {
+  restCadence?: SessionRestCadenceWire | null;
+  revision: number;
+  serverNow: string;
+  isSnapshot: boolean;
+  action?: string | null;
+};
+
 // Envelope for the session-updates subscription. Fields specific to events the
 // mobile app reacts to are optional so a plain `__typename` + field check
 // narrows cleanly without a brittle discriminated union; events we don't handle
 // fall through the guard. Extend as more event handling lands.
 export type SessionUpdateEvent = {
   __typename: string;
+  // SessionRestCadenceChanged — the crew rest clock (SessionRestCadenceChangeWire)
+  restCadence?: SessionRestCadenceWire | null;
+  revision?: number;
+  serverNow?: string;
+  isSnapshot?: boolean;
+  action?: string | null;
   // SessionBoardPathChanged / SessionNameChanged
   boardPath?: string;
   changedByParticipantId?: string | null;
@@ -1290,6 +1316,20 @@ export const SUBSCRIPTION_QUEUE_ITEM_FIELDS = `
   suggested
 `;
 
+/** Partner creation commits its complete first queue before this response is exposed. */
+export const CREATE_PARTNER_WORKOUT_SESSION = gql`
+  mutation CreatePartnerWorkoutSession($input: CreateSessionInput!) {
+    createSession(input: $input) {
+      id name boardPath goal isPublic isPermanent color startedAt
+      queueState {
+        sequence historyCount
+        queue { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+        currentClimbQueueItem { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+      }
+    }
+  }
+`;
+
 // QueueItemAdded.item is ClimbQueueItem! and CurrentClimbChanged.item is
 // ClimbQueueItem — GraphQL rejects overlapping field selections with
 // differing nullability across union members ('Fields "item" conflict ...
@@ -1364,6 +1404,80 @@ export const QUEUE_UPDATES_SUBSCRIPTION = `
   }
 `;
 
+// F3 (#6666): the same subscription selecting the Now slot fields in
+// `FullSync.state`. Sent only in now-slot mode (the `queue-now-slot` flag and
+// the per-connect server probe); today's document above stays for legacy mode
+// and is never edited in place, because selecting an unknown field is a
+// validation error against a backend without F3. Deleted in the F3 cleanup PR.
+export const QUEUE_UPDATES_SUBSCRIPTION_NOW_SLOT = `
+  subscription QueueUpdatesNowSlot($sessionId: ID!) {
+    queueUpdates(sessionId: $sessionId) {
+      __typename
+      ... on FullSync {
+        sequence
+        state {
+          sequence
+          stateHash
+          stateHashOrdered
+          historyCount
+          currentChangedAt
+          queue { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+          currentClimbQueueItem { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+        }
+      }
+      ... on QueueItemAdded {
+        sequence
+        stateHash
+        stateHashOrdered
+        addedItem: item { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+        position
+        clientId
+      }
+      ... on QueueItemRemoved {
+        sequence
+        stateHash
+        stateHashOrdered
+        uuid
+        clientId
+      }
+      ... on QueueReordered {
+        sequence
+        stateHash
+        stateHashOrdered
+        uuid
+        oldIndex
+        newIndex
+      }
+      ... on CurrentClimbChanged {
+        sequence
+        stateHash
+        stateHashOrdered
+        currentItem: item { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+        clientId
+        correlationId
+      }
+      ... on ClimbMirrored {
+        sequence
+        stateHash
+        stateHashOrdered
+        mirroredUuid: uuid
+        mirrored
+      }
+      ... on PlaybackStateChanged {
+        sequence
+        climbUuid
+        frameIndex
+        frameCount
+        isPlaying
+        speed
+        paceMs
+        anchorTimestamp
+        clientId
+      }
+    }
+  }
+`;
+
 // Authoritative queue snapshot for the active session. Fetched over the HTTP
 // transport (it's a query, not a subscription) after a queue mutation fails, so
 // the local optimistic delta is reconciled against the server immediately
@@ -1376,6 +1490,25 @@ export const GET_SESSION_QUEUE_STATE = gql`
         sequence
         stateHash
         stateHashOrdered
+        queue { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+        currentClimbQueueItem { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
+      }
+    }
+  }
+`;
+
+// F3 (#6666): the HTTP resync snapshot with the Now slot fields, so a resync
+// with nothing current keeps History as History. Now-slot mode only, beside
+// today's document, for the same reason as QUEUE_UPDATES_SUBSCRIPTION_NOW_SLOT.
+export const GET_SESSION_QUEUE_STATE_NOW_SLOT = gql`
+  query GetSessionQueueStateNowSlot($sessionId: ID!) {
+    session(sessionId: $sessionId) {
+      queueState {
+        sequence
+        stateHash
+        stateHashOrdered
+        historyCount
+        currentChangedAt
         queue { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
         currentClimbQueueItem { ${SUBSCRIPTION_QUEUE_ITEM_FIELDS} }
       }

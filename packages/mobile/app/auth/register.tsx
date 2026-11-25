@@ -1,8 +1,11 @@
+import { useHeaderHeight } from 'expo-router/react-navigation';
+import { useTypographyStyles, type TypographyScale } from '../../src/hooks/use-typography-styles';
+import { PressableSurface } from '../../src/components/PressableSurface';
 import { useState } from 'react';
-import { KeyboardAvoidingView, Platform, Pressable, ScrollView, StyleSheet, View } from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, View } from 'react-native';
 import { Stack, useRouter } from 'expo-router';
 import { useTranslation } from 'react-i18next';
-import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { SHARED_EVENTS, loginProviderProperties } from '@boardsesh/analytics';
 import { classifyNativeAuthFailureReason } from '../../src/lib/native-auth-analytics';
 import { validateRegisterFields, isValid, type RegisterFieldErrors } from '../../src/lib/auth-validation';
 import { useAuth } from '../../src/providers/auth-provider';
@@ -12,6 +15,7 @@ import { AuthFieldset } from '../../src/components/AuthFieldset';
 import { Button } from '../../src/components/Button';
 import { Text } from '../../src/components/Text';
 import { track, setPersonProperties } from '../../src/lib/analytics';
+import { createConsentBoundAnalyticsRunner } from '../../src/lib/consent-bound-analytics';
 import { useTrackLoginSucceeded } from '../../src/lib/login-analytics';
 import { webApiUrl } from '../../src/lib/env';
 import { reportError } from '../../src/lib/error-reporting';
@@ -22,6 +26,8 @@ import { readPostLoginReturnHref } from '../../src/lib/routing/anonymous-auth-ga
 type FieldKey = 'name' | 'email' | 'password';
 
 export default function RegisterScreen() {
+  const headerHeight = useHeaderHeight();
+  const styles = useTypographyStyles(createStyles);
   const { register } = useAuth();
   const { t } = useTranslation('auth');
   const theme = useTheme();
@@ -108,21 +114,42 @@ export default function RegisterScreen() {
     setFormError(null);
     setSubmitting(true);
     const authFlow = Platform.OS === 'web' ? 'web' : 'native';
-    track(SHARED_EVENTS.LoginAttempted, { auth_method: 'credentials', flow: authFlow, is_registration: true });
+    track(SHARED_EVENTS.LoginAttempted, {
+      ...loginProviderProperties('credentials'),
+      flow: authFlow,
+      is_registration: true,
+    });
     try {
       const result = await register(trimmedEmail, values.password, values.name.trim() || undefined);
       if (result.success) {
-        setPersonProperties(undefined, {
-          signup_at: new Date().toISOString(),
-          signup_auth_method: 'credentials',
-        });
+        const signedUpAt = new Date();
+        const captureWhenReady = createConsentBoundAnalyticsRunner();
+        // The auth provider owns verified receipts, including OAuth creations.
+        // The browser registration endpoint independently proves email creation.
+        // Native responses without a valid receipt leave creation unknown.
+        const hasCreationReceipt = 'accountCreation' in result && result.accountCreation !== undefined;
+        const useLegacyWebSignup = Platform.OS === 'web' && !hasCreationReceipt;
+        if (useLegacyWebSignup)
+          captureWhenReady(() => {
+            setPersonProperties(undefined, {
+              signup_at: signedUpAt.toISOString(),
+              signup_auth_method: 'credentials',
+            });
+          });
 
         if (result.authenticated === false) {
-          track(SHARED_EVENTS.SignupCompleted, {
-            auth_method: 'credentials',
-            flow: authFlow,
-            requires_verification: result.requiresVerification,
-          });
+          if (useLegacyWebSignup)
+            captureWhenReady(() =>
+              track(
+                SHARED_EVENTS.SignupCompleted,
+                {
+                  ...loginProviderProperties('credentials'),
+                  flow: authFlow,
+                  requires_verification: result.requiresVerification,
+                },
+                { timestamp: signedUpAt },
+              ),
+            );
           const verificationEmailNeedsResend =
             Platform.OS === 'web' && result.requiresVerification && 'emailSent' in result && result.emailSent === false;
           setRegistrationNextStep(
@@ -135,13 +162,21 @@ export default function RegisterScreen() {
           return;
         }
 
-        trackLoginSucceeded({
-          auth_method: 'credentials',
-          flow: authFlow,
-          is_registration: true,
-          screen: 'register',
-        });
-        track(SHARED_EVENTS.SignupCompleted, { auth_method: 'credentials', flow: authFlow });
+        if (Platform.OS === 'web')
+          trackLoginSucceeded({
+            ...loginProviderProperties('credentials'),
+            flow: authFlow,
+            is_registration: true,
+            screen: 'register',
+          });
+        if (useLegacyWebSignup)
+          captureWhenReady(() =>
+            track(
+              SHARED_EVENTS.SignupCompleted,
+              { ...loginProviderProperties('credentials'), flow: authFlow },
+              { timestamp: signedUpAt },
+            ),
+          );
         // AuthProvider flips isAuthenticated and the auth-group Redirect lands the
         // new user in the app — same auto-login path as signInWithCredentials.
         return;
@@ -149,7 +184,7 @@ export default function RegisterScreen() {
 
       const failureReason = classifyNativeAuthFailureReason(result, 'credentials');
       track(SHARED_EVENTS.LoginFailed, {
-        auth_method: 'credentials',
+        ...loginProviderProperties('credentials'),
         flow: authFlow,
         failure_reason: failureReason,
         failure_detail: result.error,
@@ -175,7 +210,7 @@ export default function RegisterScreen() {
       }
     } catch (registerError) {
       track(SHARED_EVENTS.LoginFailed, {
-        auth_method: 'credentials',
+        ...loginProviderProperties('credentials'),
         flow: authFlow,
         failure_reason: 'exception',
         is_registration: true,
@@ -222,7 +257,11 @@ export default function RegisterScreen() {
   return (
     <>
       <Stack.Screen options={{ headerShown: true, title: t('login.tabs.signUp') }} />
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
+      <KeyboardAvoidingView
+        keyboardVerticalOffset={headerHeight}
+        style={{ flex: 1 }}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
         <ScrollView
           // The stack header is transparent + blurred on iOS; inset the form
           // below it (and the status bar) instead of drawing under it.
@@ -259,12 +298,7 @@ export default function RegisterScreen() {
                   ) : null}
                 </>
               ) : null}
-              <Button
-                title={t('login.submit.signIn')}
-                onPress={() => router.replace(signInHref)}
-                variant="text"
-                size="large"
-              />
+              <Button title={t('login.submit.signIn')} onPress={() => router.replace(signInHref)} variant="text" />
             </View>
           ) : (
             <>
@@ -382,16 +416,16 @@ export default function RegisterScreen() {
                 </Text>
                 {/* replace (not back) so a deep-link straight to /auth/register still
                 lands on login rather than no-op'ing on an empty back stack. */}
-                <Pressable
+                <PressableSurface
                   onPress={() => router.replace(signInHref)}
                   hitSlop={{ top: 12, bottom: 12, left: 8, right: 8 }}
                   style={styles.footerLinkHit}
                   accessibilityRole="link"
                 >
-                  <Text variant="subheadline" color={theme.systemColors.accent} style={styles.footerLink}>
+                  <Text emphasized variant="subheadline" color={theme.systemColors.accent}>
                     {t('login.submit.signIn')}
                   </Text>
-                </Pressable>
+                </PressableSurface>
               </View>
             </>
           )}
@@ -401,32 +435,43 @@ export default function RegisterScreen() {
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flexGrow: 1, justifyContent: 'flex-start', padding: 24 },
-  intro: { marginBottom: 24 },
-  dividerRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginVertical: 24,
-    gap: 12,
-  },
-  dividerLine: {
-    flex: 1,
-    height: StyleSheet.hairlineWidth,
-  },
-  form: { gap: 12 },
-  submitButton: { alignSelf: 'stretch', marginTop: 4 },
-  errorText: { color: '#FF3B30', marginTop: 4 },
-  oauthErrorText: { marginTop: 12 },
-  successContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12, padding: 24 },
-  successText: { fontSize: 17, textAlign: 'center', lineHeight: 26 },
-  footer: {
-    flexDirection: 'row',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginTop: 24,
-  },
-  footerLink: { fontWeight: '600' },
-  // Keeps the tappable area at the 44pt/48dp minimum.
-  footerLinkHit: { minHeight: 44, justifyContent: 'center' },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    container: {
+      width: '100%',
+      maxWidth: 672,
+      alignSelf: 'center',
+      flexGrow: 1,
+      justifyContent: 'flex-start',
+      padding: 24,
+    },
+    intro: { marginBottom: 24 },
+    dividerRow: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      marginVertical: 24,
+      gap: 12,
+    },
+    dividerLine: {
+      flex: 1,
+      height: StyleSheet.hairlineWidth,
+    },
+    form: { gap: 12 },
+    submitButton: { alignSelf: 'stretch', marginTop: 4 },
+    errorText: { color: '#FF3B30', marginTop: 4 },
+    oauthErrorText: { marginTop: 12 },
+    successContainer: { flex: 1, justifyContent: 'center', alignItems: 'center', gap: 12, padding: 24 },
+    successText: { fontSize: textStyles.body.fontSize, textAlign: 'center', lineHeight: textStyles.body.lineHeight },
+    footer: {
+      flexDirection: 'row',
+      // A long translation ("Noch kein Konto? Registrieren") drops the link onto
+      // its own line instead of running off the screen (HIG Localization: leave
+      // room for text that grows).
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      alignItems: 'center',
+      marginTop: 24,
+    },
+    // Keeps the tappable area at the 44pt/48dp minimum.
+    footerLinkHit: { minHeight: 44, justifyContent: 'center' },
+  });

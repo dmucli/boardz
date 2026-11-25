@@ -1,6 +1,5 @@
 import { SwitchRow } from '../SwitchRow';
-import { setSessionRecordingEnabled } from '../../lib/analytics';
-import { useSessionRecordingPreference } from '../../lib/session-recording-preference';
+import { useSessionRecordingToggle } from './use-session-recording-toggle';
 
 type SessionRecordingSwitchRowProps = {
   label: string;
@@ -8,20 +7,14 @@ type SessionRecordingSwitchRowProps = {
 };
 
 export function SessionRecordingSwitchRow({ label, description }: SessionRecordingSwitchRowProps) {
-  const { enabled: sessionRecordingEnabled, setEnabled: setSessionRecordingPreference } =
-    useSessionRecordingPreference();
-
+  const { value, disabled, onValueChange } = useSessionRecordingToggle();
   return (
     <SwitchRow
       label={label}
       description={description}
-      value={sessionRecordingEnabled}
-      onValueChange={(next) => {
-        // Persist the choice and apply it live: start/stop the PostHog
-        // recording immediately rather than waiting for the next launch.
-        setSessionRecordingPreference(next);
-        setSessionRecordingEnabled(next);
-      }}
+      value={value}
+      disabled={disabled}
+      onValueChange={onValueChange}
     />
   );
 }

@@ -1,15 +1,20 @@
 /// <reference types="node" />
 
+import { createHash } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
 import {
   FIXTURE_PATHS,
+  MISSING_CLIMB_VIEW_PATH,
   WWW_CHECKS,
   finalVerdict,
   originFailure,
   parseBaseUrl,
+  readSmokeBody,
   shouldStopSmokeSuite,
   type SmokeResponse,
 } from './production-smoke';
+import { CLIMB_VIEW_PATH_SEGMENT, LIST_PAGE_PATH_SUFFIX, SETTER_PATH_SEGMENT } from '../infra/cloudflare/config';
 
 // The assertions are the whole product here: the runner is a retry loop, but
 // the check table is what decides whether a broken deploy is caught. These
@@ -46,7 +51,7 @@ const SHARD_LOCS = {
   static: 'https://www.boardsesh.com/sitemaps/static.xml',
   boards: 'https://www.boardsesh.com/sitemaps/boards.xml',
   playlists: 'https://www.boardsesh.com/sitemaps/playlists.xml',
-  climbs: 'https://www.boardsesh.com/sitemaps/climbs/1.xml',
+  climbs: 'https://www.boardsesh.com/sitemaps/climbs/1.xml.gz',
 } as const;
 
 /** A `<sitemapindex>` listing exactly the shards named, in order. */
@@ -62,6 +67,25 @@ function indexBody(...shards: (keyof typeof SHARD_LOCS)[]): string {
  */
 const CLIMBS_FROM_STORE = { 'x-sitemap-climbs-source': 'store' };
 
+describe('gzip sitemap smoke transport', () => {
+  const compressedUrl = 'https://www.boardsesh.com/sitemaps/climbs/1.xml.gz';
+
+  it('decodes gzip files without relying on HTTP content encoding', async () => {
+    const xml = '<urlset><url><loc>https://www.boardsesh.com/</loc></url></urlset>';
+    const compressed = new Response(new Uint8Array(gzipSync(xml)), {
+      headers: { 'Content-Type': 'application/gzip', 'Cache-Control': 'private, no-store' },
+    });
+    expect(await readSmokeBody(compressed, compressedUrl)).toBe(xml);
+  });
+
+  it('rejects a corrupt gzip download and preserves retryable error responses', async () => {
+    await expect(readSmokeBody(new Response('broken gzip'), compressedUrl)).rejects.toThrow();
+    expect(await readSmokeBody(new Response('temporarily unavailable', { status: 503 }), compressedUrl)).toBe(
+      'temporarily unavailable',
+    );
+  });
+});
+
 describe('www production smoke checks', () => {
   it('covers the surfaces other systems depend on', () => {
     const paths = WWW_CHECKS.filter((check) => !check.fixtureEnvVar).map((check) => check.path);
@@ -70,7 +94,7 @@ describe('www production smoke checks', () => {
         '/',
         '/robots.txt',
         '/sitemap.xml',
-        '/sitemaps/climbs/1.xml',
+        '/sitemaps/climbs/1.xml.gz',
         // Both `expectsUrls` shard routes get a check of their own. `boards.xml`
         // in particular is the only hard signal left on the boards surface once
         // the index check can excuse a declared degradation.
@@ -93,7 +117,7 @@ describe('www production smoke checks', () => {
     // `X-Sitemap-Climbs-Source`, where `live` is a correct answer that costs a
     // full rebuild per request. Both are the server saying so on the response.
     const withDegradation = WWW_CHECKS.filter((check) => check.degradation).map((check) => check.path);
-    expect(withDegradation).toEqual(['/sitemap.xml', '/sitemaps/climbs/1.xml']);
+    expect(withDegradation).toEqual(['/sitemap.xml', '/sitemaps/climbs/1.xml.gz']);
   });
 
   it('buys the climb shard a request budget longer than its 51 s fallback', () => {
@@ -109,7 +133,17 @@ describe('www production smoke checks', () => {
     // a slow answer is a state the check reports on, not a symptom.
     expect(
       WWW_CHECKS.filter((candidate) => candidate.timeoutMs !== undefined).map((candidate) => candidate.path),
-    ).toEqual(['/sitemaps/climbs/1.xml']);
+    ).toEqual(['/sitemaps/climbs/1.xml.gz']);
+  });
+
+  it('rejects a rendered homepage whose compressed HTML exceeds the mobile budget', () => {
+    const excessPayload = Array.from({ length: 5000 }, (_, index) =>
+      createHash('sha256').update(String(index)).digest('hex'),
+    ).join('');
+    expect(
+      checkNamed('homepage').assert(response({ body: `<h1>Boardsesh</h1><script>${excessPayload}</script>` })),
+    ).toContain('homepage gzip HTML exceeds');
+    expect(checkNamed('homepage').assert(response())).toBeNull();
   });
 
   it('rejects a homepage that 200s with a spinner-only shell', () => {
@@ -368,54 +402,57 @@ describe('www production smoke checks', () => {
     expect(check.degradation?.(fromLiveScan)).toMatch(/refresh-sitemap-climbs/);
   });
 
-  it('requires cacheable XML from the climb shard at either origin', () => {
-    // The check used to string-compare the whole header against Vercel's
-    // downstream form, so pointing this smoke at a Railway origin failed on a
-    // header that was exactly right. Directives, not strings — and the set of
-    // tolerated ones widened with the flip, because the published shard runs on
-    // `s-maxage=21600, stale-while-revalidate=604800` where the withdrawn one
-    // ran on `must-revalidate`.
+  it('requires a privacy-filtered gzip sitemap without cached publication consent', () => {
     const check = checkNamed('climb sitemap shard');
     const healthy = response({
       status: 200,
-      contentType: 'application/xml',
+      contentType: 'application/gzip',
       body: '<urlset><url><loc>https://www.boardsesh.com/kilter/original/12x12-square/screw_bolt/40/view/x</loc></url></urlset>',
-      headers: { ...CLIMBS_FROM_STORE, 'cache-control': 'public, s-maxage=21600, stale-while-revalidate=604800' },
+      headers: { ...CLIMBS_FROM_STORE, 'cache-control': 'private, no-store' },
     });
     expect(check.assert(healthy)).toBeNull();
-    // What an edge that consumes `s-maxage` as a private instruction forwards.
+    // Whitespace, order and casing do not change the directive contract.
     expect(
-      check.assert({
-        ...healthy,
-        headers: { ...CLIMBS_FROM_STORE, 'cache-control': 'public, max-age=0, must-revalidate' },
-      }),
-    ).toBeNull();
-    // Whitespace and casing are the header's business, not the contract's.
-    expect(
-      check.assert({ ...healthy, headers: { ...CLIMBS_FROM_STORE, 'cache-control': ' Public,  S-MaxAge=21600' } }),
+      check.assert({ ...healthy, headers: { ...CLIMBS_FROM_STORE, 'cache-control': ' No-Store,  Private ' } }),
     ).toBeNull();
 
-    // The withdrawn shape. A 410 here means the deploy lost the switch.
-    expect(check.assert({ ...healthy, status: 410 })).toMatch(/200/);
-    // A shard that rendered nothing is a regressed query, not an empty surface —
-    // the summary already said there were items on this page.
+    for (const status of [404, 410, 503]) {
+      expect(check.assert({ ...healthy, status })).toMatch(/200/);
+    }
+    expect(check.assert({ ...healthy, contentType: 'text/html' })).toMatch(/gzip/);
     expect(check.assert({ ...healthy, body: '<urlset></urlset>' })).toMatch(/loc/);
-    expect(check.assert({ ...healthy, headers: { ...CLIMBS_FROM_STORE, 'cache-control': 'no-store' } })).toMatch(
-      /no-store/,
-    );
-    expect(
-      check.assert({ ...healthy, headers: { ...CLIMBS_FROM_STORE, 'cache-control': 'private, max-age=60' } }),
-    ).toMatch(/public/);
-    // Cacheable by anything, forever, with nothing to revalidate against. It
-    // carries `public`, so a required-directives check alone would pass a shard
-    // that had lost its entire CDN window.
-    expect(check.assert({ ...healthy, headers: { ...CLIMBS_FROM_STORE, 'cache-control': 'public' } })).toMatch(
-      /s-maxage/,
-    );
-    expect(
-      check.assert({ ...healthy, headers: { ...CLIMBS_FROM_STORE, 'cache-control': 'public, must-revalidate' } }),
-    ).toMatch(/s-maxage/);
-    expect(check.assert({ ...healthy, headers: { 'cache-control': 'public, s-maxage=21600' } })).toMatch(
+    expect(check.assert({ ...healthy, body: '<loc>wrong root</loc>' })).toMatch(/urlset/);
+
+    for (const header of [
+      '',
+      'no-store',
+      'private',
+      'private, no-store=1',
+      'private=foo, no-store',
+      'public, s-maxage=21600, stale-while-revalidate=604800',
+    ]) {
+      expect(check.assert({ ...healthy, headers: { ...CLIMBS_FROM_STORE, 'cache-control': header } }), header).toMatch(
+        /expected cache-control/,
+      );
+    }
+    // Even a response carrying both required directives must reject any public
+    // or freshness caching instruction, including the former CDN contract.
+    for (const directive of [
+      'public',
+      's-maxage=21600',
+      'max-age=0',
+      'stale-while-revalidate=604800',
+      'must-revalidate',
+    ]) {
+      expect(
+        check.assert({
+          ...healthy,
+          headers: { ...CLIMBS_FROM_STORE, 'cache-control': `private, no-store, ${directive}` },
+        }),
+        directive,
+      ).toMatch(/unexpected directive/);
+    }
+    expect(check.assert({ ...healthy, headers: { 'cache-control': 'private, no-store' } })).toMatch(
       /x-sitemap-climbs-source/,
     );
 
@@ -499,6 +536,67 @@ describe('www production smoke checks', () => {
       ).toMatch(/error shell/);
       expect(check.assert(response({ body: `<html>${'x'.repeat(5000)}</html>` }))).toBeNull();
     }
+  });
+
+  describe('a missing climb view 404s without a CDN cache TTL', () => {
+    const check = checkNamed('missing climb view');
+    const NEXT_ERROR_CACHE_CONTROL = 'private, no-cache, no-store, max-age=0, must-revalidate';
+    const guardedNotFound = (headers: Record<string, string> = {}) =>
+      response({
+        status: 404,
+        body: '<h1>404</h1><h2>This page could not be found.</h2>',
+        headers: { 'cache-control': NEXT_ERROR_CACHE_CONTROL, 'cdn-cache-control': 'no-store', ...headers },
+      });
+
+    it('asks for a URL the edge has never stored', () => {
+      const [path, query] = check.path.split('?');
+      expect(path).toBe(MISSING_CLIMB_VIEW_PATH);
+      // A key per run: a fixed URL would let a pre-deploy cached 404 answer.
+      expect(query).toMatch(/^smoke-run=[0-9a-z]+$/);
+    });
+
+    it('stays off the paths the www managed challenge covers', () => {
+      // boardsesh:climb-view-challenge challenges every `/list` and `/setter/`
+      // path on www, and this smoke's User-Agent is not allowlisted, so the
+      // 30-minute run would read a challenge page instead of the 404.
+      const [path] = check.path.split('?');
+      expect(path.endsWith(LIST_PAGE_PATH_SUFFIX)).toBe(false);
+      expect(path).not.toContain(SETTER_PATH_SEGMENT);
+      expect(path).toContain(CLIMB_VIEW_PATH_SEGMENT);
+    });
+
+    it('passes the guarded 404, from the origin or through Cloudflare', () => {
+      expect(check.assert(guardedNotFound())).toBeNull();
+      expect(check.assert(guardedNotFound({ 'cf-cache-status': 'BYPASS' }))).toBeNull();
+    });
+
+    it('fails the 404 that carried the list TTL on 2026-11-22', () => {
+      const failure = check.assert(
+        guardedNotFound({
+          'cdn-cache-control': 's-maxage=86400, stale-while-revalidate=604800',
+          'cf-cache-status': 'HIT',
+        }),
+      );
+      expect(failure).toMatch(/s-maxage=86400/);
+      expect(failure).toMatch(/cf-cache-status: HIT/);
+    });
+
+    it('fails when the header is gone, since the guard is then invisible', () => {
+      expect(check.assert(response({ status: 404, headers: { 'cache-control': NEXT_ERROR_CACHE_CONTROL } }))).toMatch(
+        /no cdn-cache-control header/,
+      );
+    });
+
+    it('fails a shared TTL in Cache-Control', () => {
+      expect(check.assert(guardedNotFound({ 'cache-control': 'public, s-maxage=86400' }))).toMatch(
+        /cache-control carries s-maxage=86400/,
+      );
+    });
+
+    it('fails when the page renders, or errors instead of 404ing', () => {
+      expect(check.assert({ ...guardedNotFound(), status: 200 })).toMatch(/expected HTTP 404, got 200/);
+      expect(check.assert({ ...guardedNotFound(), status: 500 })).toMatch(/expected HTTP 404, got 500/);
+    });
   });
 
   it('skips fixture-backed checks rather than failing when the fixture is unset', () => {

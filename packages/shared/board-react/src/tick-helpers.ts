@@ -1,9 +1,11 @@
+import type { TickReportingTimeInput } from '@boardsesh/shared-schema';
 import type { LogbookEntry, TickStatus } from './logbook-keys';
 
 // Options for saving a tick. `quality` / `difficulty` accept `null` so call
 // sites can pass an explicit "no rating" without juggling undefined — both
 // the optimistic cache entry and the GraphQL input treat null as absent.
 export type SaveTickOptions = {
+  privacy?: { audience: 'public' | 'followers' | 'only_me'; privacyRevision: number };
   climbUuid: string;
   angle: number;
   isMirror: boolean;
@@ -14,6 +16,7 @@ export type SaveTickOptions = {
   isBenchmark: boolean;
   comment: string;
   climbedAt: string;
+  reportingTime?: TickReportingTimeInput;
   sessionId?: string;
   layoutId?: number;
   /**

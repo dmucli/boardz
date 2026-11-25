@@ -1,4 +1,4 @@
-// The create drawer's vertical budget, extracted so the arithmetic can be
+// The New climb editor's vertical budget, extracted so the arithmetic can be
 // asserted rather than eyeballed on a device.
 //
 // It is worth pinning: the board is the surface, and every dp reserved here is
@@ -7,18 +7,20 @@
 // of the board on a small phone — and neither error was visible from the code.
 
 /**
- * Space the header, action bar, draft-status line, sheet handle and safe areas
- * need, so the board is sized to leave them on screen at the peek.
+ * Space the top bar, action bar, draft-status line and safe areas need, so the
+ * board leaves the tools on screen without scrolling.
  *
- * Derived from the peek formula rather than guessed. Every term, with where it
- * comes from, so the sum can be re-checked without a device:
+ * Every term, with where it comes from, so the sum can be re-checked without a
+ * device. It was derived for the old bottom-sheet drawer's peek; the editor is
+ * a full-height modal now, and the sheet-only terms carry over as the iOS
+ * pageSheet's own top gap and slack:
  *
- * - 24 — the native sheet's drag-grabber reserve (`NATIVE_HANDLE_RESERVE`)
- * - 8  — the ScrollView's `contentContainerStyle` paddingTop
- * - 68 — the header row (12 padding x 2 + a 44dp control, `minHeight: 56` floor)
+ * - 24 — the gap an iOS pageSheet leaves above itself (was the drawer's grabber)
+ * - 8  — slack (was the drawer scroll's paddingTop)
+ * - 68 — the top bar (12 padding x 2 + a 44dp control, `minHeight: 56` floor)
  * - 8  — `boardSection`'s marginTop, above the board itself
  * - 158 — the action bar: 70 brush row + 56 action row + 32 status line
- * - 12 — the peek's own reveal, so a hint of the below-fold form shows
+ * - 12 — a hint of the form below the tools (was the peek's reveal)
  * - 12 — deliberate slack, absorbing a taller locale or one Dynamic Type step
  *
  * = 290. Six measured terms and one buffer; the buffer is listed so the column
@@ -28,6 +30,8 @@
  * screen, in every state. Erring high is cheap but it is not free.
  */
 export const ABOVE_FOLD_CHROME = 290;
+/** Initial compact action bar budget; live layout replaces it for translated or larger text. */
+export const CREATE_ACTION_BAR_HEIGHT = 158;
 
 /**
  * The route transport card, which carries the whole route control set: marginTop
@@ -35,7 +39,7 @@ export const ABOVE_FOLD_CHROME = 290;
  * 44dp transport row.
  *
  * A contract with `PlaybackControls`' strip mode — if the rendered card and this
- * number disagree, the peek drifts against the real content height.
+ * number disagree, the board is sized against the wrong content height.
  *
  * The strip row is exactly one chip tall. It was 44 while a labelled "+ Add
  * frame" `Button` sat in it: `Button` sizes itself from `minHeight` and exposes
@@ -51,9 +55,8 @@ export const PLAYBACK_TRANSPORT_RESERVE = 116;
 
 /**
  * Floor on the board's height. A board this small is already unusable, so
- * reaching it means the reserves above are lying about what fits — the sheet
- * then wants a taller peek than `MAX_PEEK_FRACTION` allows and clamps, dropping
- * real controls below the fold. Pinned by a test at the smallest phone we
+ * reaching it means the reserves above are lying about what fits, and real
+ * controls get pushed below the fold. Pinned by a test at the smallest phone we
  * support so it stays unreachable.
  */
 export const MIN_BOARD_HEIGHT = 200;
@@ -62,10 +65,14 @@ export type BoardBudget = {
   windowHeight: number;
   /** Top safe-area inset. */
   insetTop: number;
-  /** Bottom safe-area inset, as the sheet sees it. */
+  /** Bottom safe-area inset, as the modal sees it. */
   insetBottom: number;
   /** Whether the route transport is on screen — a boulder pays nothing for it. */
   showRouteTransport: boolean;
+  /** Save-blocking missing-hold notice only. Secondary actions never reduce the wall. */
+  missingHoldsHeight?: number;
+  /** Measured brush, tool and status rows; large text can grow all three. */
+  actionBarHeight?: number;
 };
 
 /** Height budget left for the board once the drawer's fixed chrome is reserved. */
@@ -73,6 +80,12 @@ export function computeBoardMaxHeight(budget: BoardBudget): number {
   const routeSlotReserve = budget.showRouteTransport ? PLAYBACK_TRANSPORT_RESERVE : 0;
   return Math.max(
     MIN_BOARD_HEIGHT,
-    budget.windowHeight - budget.insetTop - budget.insetBottom - ABOVE_FOLD_CHROME - routeSlotReserve,
+    budget.windowHeight -
+      budget.insetTop -
+      budget.insetBottom -
+      ABOVE_FOLD_CHROME -
+      ((budget.actionBarHeight ?? CREATE_ACTION_BAR_HEIGHT) - CREATE_ACTION_BAR_HEIGHT) -
+      routeSlotReserve -
+      (budget.missingHoldsHeight ?? 0),
   );
 }

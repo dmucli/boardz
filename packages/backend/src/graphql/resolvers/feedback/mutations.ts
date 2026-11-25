@@ -13,6 +13,8 @@ import { reportGithubMirrorDrop } from '../../../services/github-mirror-report';
 import { screenshotPublicUrls } from '../../../services/feedback-screenshot-urls';
 import { loadFeedbackReport } from './queries';
 import { logger } from '../../../utils/logger';
+import { pubsub } from '../../../pubsub';
+import { enrichReleaseContext } from '../../../services/mobile-release-status';
 
 export const feedbackMutations = {
   submitAppFeedback: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext): Promise<boolean> => {
@@ -28,7 +30,9 @@ export const feedbackMutations = {
     const setIds = validated.setIds ?? null;
     const angle = validated.angle ?? null;
     const contactConsent = validated.contactConsent ?? null;
-    const context = normalizeContext(validated.context);
+    const releaseContext = await enrichReleaseContext(validated.releaseContext, validated.platform);
+    const feedbackContext = normalizeContext(validated.context);
+    const context = releaseContext ? { ...feedbackContext, releaseContext } : feedbackContext;
     // Stored as the keys the client sent, not as URLs: the public base is a
     // deploy-time detail, and a CDN domain change must not strand every row
     // written before it.
@@ -69,6 +73,7 @@ export const feedbackMutations = {
     // a 3h23m window. Guard on row existence — a missing returned row means a
     // DB-layer problem, not our contract, so skip the side effect.
     if (row) {
+      if (isBugReport && userId) pubsub.publishAppBugReportChanged(userId, { reportId: String(row.id) });
       void (async () => {
         try {
           const outcome = await createFeedbackGithubIssue({
@@ -84,6 +89,7 @@ export const feedbackMutations = {
             setIds,
             angle,
             context,
+            releaseContext,
             contactConsent,
             screenshotUrls: screenshotPublicUrls(screenshotKeys),
           });
@@ -98,8 +104,9 @@ export const feedbackMutations = {
             // not affect the already-committed feedback row.
             await db
               .update(dbSchema.appFeedback)
-              .set({ githubIssueNumber: issue.number, githubIssueUrl: issue.htmlUrl })
+              .set({ githubIssueNumber: issue.number, githubIssueUrl: issue.htmlUrl, githubIssueState: 'open' })
               .where(eq(dbSchema.appFeedback.id, row.id));
+            if (userId) pubsub.publishAppBugReportChanged(userId, { reportId: String(row.id) });
 
             if (contactConsent && userId) {
               const [reporter] = await db
@@ -178,7 +185,7 @@ function normalizeContext(input: FeedbackContextInput | null | undefined): Feedb
   if (!input) return null;
   const out: FeedbackContext = {};
   for (const [k, v] of Object.entries(input) as Array<[keyof FeedbackContext, unknown]>) {
-    if (typeof v === 'string' && v.length > 0) {
+    if (k !== 'releaseContext' && typeof v === 'string' && v.length > 0) {
       out[k] = v;
     }
   }

@@ -1,12 +1,24 @@
-import React, { useEffect, useRef, useState, type ReactNode } from 'react';
-import { Platform, View, StyleSheet } from 'react-native';
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentProps,
+  type ReactNode,
+} from 'react';
+import { Platform, View, StyleSheet, type ColorValue } from 'react-native';
 import { Image } from 'expo-image';
 import type { ImageErrorEventData } from 'expo-image';
 import { useIsAppBackgrounded } from '../lib/app-visibility';
 import { useBoardArtVisible } from './board-art-visibility-context';
+import { noteBoardArtInMemory } from '../lib/board-render/warm-board-art-memory';
 
 type LayeredClimbImageProps = {
   overlayUri: string | null;
+  /** Live drawing in the same mirrored/layered stack; ready means presented. */
+  liveOverlay?: { node: ReactNode; identity: string; displayed: boolean };
   /**
    * Generation + per-consumer attempt identity. React's key must change when a
    * missing overlay is regenerated at the same URI: Android expo-image does not
@@ -14,6 +26,17 @@ type LayeredClimbImageProps = {
    */
   overlayLoadKey?: string | null;
   onOverlayLoad?: (loadKey: string | null) => void;
+  onOverlayDisplay?: (loadKey: string | null) => void;
+  /** Every current background and overlay has received native onDisplay. */
+  onArtDisplayed?: (loadKey: string | null) => void;
+  onArtError?: (error: unknown) => void;
+  /** Whether this exact mounted stack has displayed every required native layer. */
+  onArtReadinessChange?: (ready: boolean) => void;
+  /** False only for an empty climb or an explicitly unavailable holds overlay. */
+  overlayRequired?: boolean;
+  /** Keep only this identity's displayed holds until its replacement displays. */
+  retainDisplayedOverlayFor?: string;
+  displayIdentity?: string;
   onOverlayError?: (event: ImageErrorEventData, loadKey: string | null) => void;
   /**
    * Report whether an overlay `<Image>` is MOUNTED: its load key while one is,
@@ -26,6 +49,13 @@ type LayeredClimbImageProps = {
    */
   onOverlayMounted?: (mountedLoadKey: string | null) => void;
   backgroundPaths: string[];
+  /**
+   * A solid colour painted under the background images. For a background that
+   * is transparent by design — a spray wall's "Holds only" look is cut-out
+   * holds on nothing — so one image reads right on the light and the dark
+   * field. Left out, nothing is painted, as before.
+   */
+  baseColor?: string;
   /**
    * Number of background layers the cache couldn't resolve. Each missing
    * layer is rendered as a visible neutral-gray block so the bug is
@@ -52,11 +82,31 @@ type LayeredClimbImageProps = {
   suppressOverlayTransition?: boolean;
   recyclingKey?: string;
   /**
+   * Keep the board photo hidden until the holds overlay has painted, so the two
+   * arrive together instead of "bare board, then the holds flash in".
+   *
+   * - `'each-climb'` re-hides whenever `recyclingKey` changes. For a recycled
+   *   list row, where every climb change is a different picture.
+   * - `'first-paint'` hides only until the first overlay this instance paints.
+   *   For the play board: a swipe to the next climb must keep the photo up.
+   *
+   * Leave it unset when the overlay is already rendered (the hook's
+   * `overlayImmediate`) or cannot come at all (no frames, no renderer): there is
+   * nothing to wait for. If no overlay paints within `OVERLAY_REVEAL_TIMEOUT_MS`
+   * the photo is shown anyway, so a failed render still looks like a board.
+   */
+  revealWithOverlay?: 'each-climb' | 'first-paint';
+  /** Solid block drawn in place of the stack while `revealWithOverlay` holds it back. */
+  revealPlaceholderColor?: ColorValue;
+  /**
    * testID for the holds-overlay layer. Only rendered once the async overlay PNG
    * is ready, so screenshot/e2e flows can anchor on "the lit climb has rendered"
    * (the full-size play view sets this; thumbnails leave it unset).
    */
   overlayTestID?: string;
+  /** Capture identity exposed only after every current image has displayed. */
+  paintedTestID?: string;
+  paintedExtraTestID?: string;
   /**
    * Opt into keeping the last overlay that actually painted mounted underneath
    * while the next one renders, by passing the identity of the board it belongs
@@ -83,6 +133,15 @@ type LayeredClimbImageProps = {
    */
   underOverlay?: ReactNode;
   /**
+   * Drawn ABOVE the holds overlay, for marks the overlay must not wash: the
+   * MoonBoard grid labels, which the dark-mode veil faded to 2.25:1 when they sat
+   * in the background stack (issue #6234). Pointer-transparent, held back with
+   * the rest of the stack while `revealWithOverlay` waits, and kept out of the
+   * paint bookkeeping (`onArtDisplayed`, `paintedTestID`): it is decoration, not
+   * the climb.
+   */
+  aboveOverlay?: ReactNode;
+  /**
    * Drawn in place of the overlay while no overlay has ever painted — i.e. when
    * the native renderer is missing entirely (Expo Go, a binary that predates it)
    * and `overlayUri` would stay null forever. Lets a surface that MUST show its
@@ -91,10 +150,51 @@ type LayeredClimbImageProps = {
   emptyOverlayFallback?: ReactNode;
 };
 
+/**
+ * How long `revealWithOverlay` waits for the holds before showing the photo on
+ * its own. A thumbnail render plus decode is well under 150ms on a 2021 phone,
+ * so this only ever fires for a render that failed or is stuck in a long queue.
+ */
+const OVERLAY_REVEAL_TIMEOUT_MS = 600;
+
 export function backgroundImageUri(path: string): string {
   if (Platform.OS === 'web' || path.includes('://')) return path;
   return `file://${path}`;
 }
+
+type NativeImageToken = { displayed: boolean };
+
+type NativeImageLayerProps = ComponentProps<typeof Image> & {
+  nativeDisplayIdentity: string;
+  onNativeMounted: (identity: string, token: NativeImageToken) => () => void;
+  onNativeDisplayed: (identity: string, token: NativeImageToken) => boolean;
+};
+
+/** A token belongs to this mounted native image, not to a cached path or capture label. */
+const NativeImageLayer = React.memo(function NativeImageLayer({
+  nativeDisplayIdentity,
+  onNativeMounted,
+  onNativeDisplayed,
+  onDisplay,
+  ...imageProps
+}: NativeImageLayerProps) {
+  // A layout-effect replay retains this native Image. Its display event does
+  // not repeat, so keep the displayed bit with the instance's exact token.
+  // A ref also survives Fast Refresh invalidating memo caches.
+  const tokenRef = useRef({ identity: nativeDisplayIdentity, token: { displayed: false } });
+  if (tokenRef.current.identity !== nativeDisplayIdentity)
+    tokenRef.current = { identity: nativeDisplayIdentity, token: { displayed: false } };
+  const { token } = tokenRef.current;
+  useLayoutEffect(() => onNativeMounted(nativeDisplayIdentity, token), [nativeDisplayIdentity, onNativeMounted, token]);
+  return (
+    <Image
+      {...imageProps}
+      onDisplay={() => {
+        if (onNativeDisplayed(nativeDisplayIdentity, token)) onDisplay?.();
+      }}
+    />
+  );
+});
 
 /**
  * The shared 2-layer climb image stack used by both the list thumbnail
@@ -111,18 +211,32 @@ export function backgroundImageUri(path: string): string {
 const LayeredClimbImage = React.memo(function LayeredClimbImage({
   overlayUri,
   overlayLoadKey,
+  liveOverlay,
   onOverlayLoad,
+  onOverlayDisplay,
+  onArtDisplayed,
+  onArtError,
+  onArtReadinessChange,
+  overlayRequired = true,
+  retainDisplayedOverlayFor,
+  displayIdentity,
   onOverlayError,
   onOverlayMounted,
   backgroundPaths,
+  baseColor,
   missingBackgroundCount = 0,
   mirrored,
   dimBackground,
   suppressOverlayTransition,
   recyclingKey,
+  revealWithOverlay,
+  revealPlaceholderColor,
   overlayTestID,
+  paintedTestID,
+  paintedExtraTestID,
   retainPreviousOverlayFor,
   underOverlay,
+  aboveOverlay,
   emptyOverlayFallback,
 }: LayeredClimbImageProps) {
   const shouldShowEmptyFallback = backgroundPaths.length === 0 && missingBackgroundCount === 0;
@@ -131,17 +245,10 @@ const LayeredClimbImage = React.memo(function LayeredClimbImage({
   // painted, not when the <Image> first mounts. expo-image reports "visible" to
   // Maestro the moment it's in the tree (even with a cached source, before the
   // pixels land), so anchoring on the raw <Image> let a screenshot fire on a
-  // blank drawer. Gating on onLoad makes the anchor mean "the lit board is on
+  // blank drawer. Gating on onDisplay makes the anchor mean "the lit board is on
   // screen".
-  const [overlayPainted, setOverlayPainted] = useState(false);
-  // Native image events can already be queued when React replaces an overlay.
-  // Keep the currently rendered attempt in a ref so an old image cannot expose
-  // the screenshot anchor after the replacement reset it. The recovery owner
-  // still receives the captured key below and independently rejects stale cache
-  // events; this guard owns the component-local painted marker.
-  const latestOverlayAttemptRef = useRef({ uri: overlayUri, loadKey: overlayLoadKey ?? null });
-  latestOverlayAttemptRef.current = { uri: overlayUri, loadKey: overlayLoadKey ?? null };
-
+  const [paintedOverlayIdentity, setPaintedOverlayIdentity] = useState<string | null>(null);
+  const [paintedAttempt, setPaintedAttempt] = useState<{ identity: string } | null>(null);
   // Drop the decoded board-art bitmaps whenever this surface is hidden: render an
   // empty stack so expo-image releases their GPU textures + native-heap bitmaps
   // (the views stay mounted, so without this they pin ~100 MB+ that raises the OS
@@ -153,56 +260,272 @@ const LayeredClimbImage = React.memo(function LayeredClimbImage({
   const isBackgrounded = useIsAppBackgrounded();
   const boardArtVisible = useBoardArtVisible();
   const hidden = isBackgrounded || !boardArtVisible;
+  const visibilityEpochRef = useRef({ hidden, epoch: 0 });
+  if (visibilityEpochRef.current.hidden !== hidden)
+    visibilityEpochRef.current = { hidden, epoch: visibilityEpochRef.current.epoch + 1 };
+  const visibilityEpoch = visibilityEpochRef.current.epoch;
+  const displayAttempt = JSON.stringify(
+    paintedTestID === undefined
+      ? [
+          overlayUri,
+          overlayLoadKey,
+          liveOverlay?.identity,
+          recyclingKey,
+          displayIdentity,
+          backgroundPaths,
+          visibilityEpoch,
+        ]
+      : [
+          overlayUri,
+          overlayLoadKey,
+          liveOverlay?.identity,
+          recyclingKey,
+          displayIdentity,
+          backgroundPaths,
+          visibilityEpoch,
+          paintedTestID,
+          mirrored ?? false,
+        ],
+  );
+  const nativeOverlaySourceIdentity = JSON.stringify([overlayUri, overlayLoadKey, recyclingKey, visibilityEpoch]);
+  const [nativeOverlayAttempt, setNativeOverlayAttempt] = useState({
+    sourceIdentity: nativeOverlaySourceIdentity,
+    generation: 0,
+  });
+  if (nativeOverlayAttempt.sourceIdentity !== nativeOverlaySourceIdentity) {
+    // A -> B -> A creates a new native image even if B never displayed. Advance
+    // before committing its children, so an old A display cannot own the new A.
+    // React state keeps an abandoned render from advancing this generation.
+    setNativeOverlayAttempt({
+      sourceIdentity: nativeOverlaySourceIdentity,
+      generation: nativeOverlayAttempt.generation + 1,
+    });
+  }
+  const nativeOverlayIdentity = JSON.stringify([nativeOverlaySourceIdentity, nativeOverlayAttempt.generation]);
+  // Queued callbacks keep the board/attempt they came from, even when a later
+  // board reuses its URI and load key. Recovery still receives the captured key;
+  // this guard owns only the local reveal, retention and screenshot marker.
+  const overlayAttempt = JSON.stringify([nativeOverlayIdentity, retainPreviousOverlayFor, retainDisplayedOverlayFor]);
+  const latestOverlayAttemptRef = useRef(overlayAttempt);
+  latestOverlayAttemptRef.current = overlayAttempt;
+  const overlayPainted = liveOverlay ? liveOverlay.displayed : paintedOverlayIdentity === nativeOverlayIdentity;
+  const nativeBackgroundIdentity = (path: string) =>
+    JSON.stringify(['background', backgroundImageUri(path), visibilityEpoch]);
+  const mountedNativeLayersRef = useRef(new Map<string, { token: NativeImageToken; displayed: boolean }>());
+  const displayedAttemptRef = useRef({
+    identity: displayAttempt,
+    nativeOverlayIdentity,
+    reported: false,
+  });
+  if (
+    displayedAttemptRef.current.identity !== displayAttempt ||
+    displayedAttemptRef.current.nativeOverlayIdentity !== nativeOverlayIdentity
+  ) {
+    displayedAttemptRef.current = {
+      identity: displayAttempt,
+      nativeOverlayIdentity,
+      reported: false,
+    };
+  }
+  const onNativeMounted = useCallback((identity: string, token: NativeImageToken) => {
+    mountedNativeLayersRef.current.set(identity, { token, displayed: token.displayed });
+    displayedAttemptRef.current.reported = false;
+    return () => {
+      if (mountedNativeLayersRef.current.get(identity)?.token !== token) return;
+      mountedNativeLayersRef.current.delete(identity);
+      displayedAttemptRef.current.reported = false;
+    };
+  }, []);
+  const onNativeDisplayed = useCallback((identity: string, token: NativeImageToken) => {
+    const layer = mountedNativeLayersRef.current.get(identity);
+    if (visibilityEpochRef.current.hidden || layer?.token !== token) return false;
+    layer.displayed = true;
+    token.displayed = true;
+    return true;
+  }, []);
+  const actualLayersDisplayed = () =>
+    (liveOverlay
+      ? liveOverlay.displayed
+      : mountedNativeLayersRef.current.get(nativeOverlayIdentity)?.displayed === true) &&
+    backgroundPaths.every(
+      (path) => mountedNativeLayersRef.current.get(nativeBackgroundIdentity(path))?.displayed === true,
+    );
+  const artReadinessRef = useRef<() => boolean>(() => false);
+  const artReadinessCallbackRef = useRef(onArtReadinessChange);
+  artReadinessCallbackRef.current = onArtReadinessChange;
+  const reportArtDisplayed = () => {
+    artReadinessCallbackRef.current?.(artReadinessRef.current());
+    const current = displayedAttemptRef.current;
+    if (
+      hidden ||
+      current.identity !== displayAttempt ||
+      current.reported ||
+      missingBackgroundCount > 0 ||
+      !actualLayersDisplayed()
+    )
+      return;
+    current.reported = true;
+    if (paintedTestID) setPaintedAttempt({ identity: displayAttempt });
+    onArtDisplayed?.(overlayLoadKey ?? null);
+  };
+  const reportArtDisplayedRef = useRef(reportArtDisplayed);
+  reportArtDisplayedRef.current = reportArtDisplayed;
+  // Retargeting a recycled row can retain exactly the same native images.
+  // Those views do not emit another display event merely for a new UUID.
+  useEffect(() => {
+    reportArtDisplayedRef.current();
+  }, [displayAttempt, missingBackgroundCount, liveOverlay?.displayed]);
   // The last overlay that reported onLoad, kept only while retention is opted
   // into. Decorative: it never feeds the load-key accounting or the testID anchor.
   const [retainedOverlay, setRetainedOverlay] = useState<{ uri: string; identity: string } | null>(null);
-  // While hidden, reset the overlay-painted anchor so it re-gates on the next
-  // real onLoad after this shows again, not before the lit board.
+  const [displayedOverlay, setDisplayedOverlay] = useState<{
+    uri: string;
+    identity: string;
+    nativeIdentity: string;
+  } | null>(null);
+  // Hidden surfaces release their native images; returning needs a new display.
   useEffect(() => {
     if (!hidden) return;
-    setOverlayPainted(false);
+    setPaintedOverlayIdentity(null);
     // A retained frame must not survive the surface being hidden: coming back
     // would paint the stale holds under a render that has not happened yet.
     setRetainedOverlay(null);
+    setDisplayedOverlay(null);
   }, [hidden]);
-  // Different board — the retained frame belongs to a wall that is no longer here.
+  // A cached load may arrive before this passive effect. Keep a frame already
+  // loaded for the new board while dropping the previous board's holds.
   useEffect(() => {
-    setRetainedOverlay(null);
+    setRetainedOverlay((previous) => (previous?.identity === retainPreviousOverlayFor ? previous : null));
   }, [retainPreviousOverlayFor]);
-
   useEffect(() => {
-    setOverlayPainted(false);
-  }, [overlayUri, overlayLoadKey]);
+    // A cached image may display before passive effects. Preserve a display
+    // already reported for this identity rather than erase its only event.
+    setDisplayedOverlay((previous) => (previous?.identity === retainDisplayedOverlayFor ? previous : null));
+  }, [retainDisplayedOverlayFor]);
+
   // Mirror the exact condition the overlay `<Image>` below renders under, so a
   // consumer waiting on a paint learns the instant there is nothing left to
   // paint — the app backgrounding, or this tab's board art being released while
-  // the component stays mounted. The cleanup covers unmount as well.
+  // the component stays mounted.
+  //
+  // A layout effect, so the report is made inside the commit that mounts the
+  // image. A decoded image can fire `onLoad` within the frame, ahead of any
+  // passive effect; the consumer would then hear the answer before it knew
+  // there was an image to answer for. One image replacing another is reported
+  // as the new one and nothing else: "nothing is mounted" in between would
+  // be false.
   const overlayMountedKey = !hidden && overlayUri ? (overlayLoadKey ?? null) : null;
   const overlayImageMounted = !hidden && !!overlayUri;
-  useEffect(() => {
+  useLayoutEffect(() => {
     onOverlayMounted?.(overlayImageMounted ? overlayMountedKey : null);
-    return () => onOverlayMounted?.(null);
   }, [onOverlayMounted, overlayImageMounted, overlayMountedKey]);
+  // Unmount, or a consumer that is no longer listening. A new callback
+  // identity counts as that: the old one hears `null`, the new one hears the
+  // image above as freshly mounted, and a watch that had been answered starts
+  // again. `useNativeClimbRender` keeps one identity for its whole life so
+  // that this never happens to an image that has already painted.
+  //
+  // Both effects take an effect that runs again to mean an image that mounted
+  // again. That does not hold under an `<Activity>` or a Suspense boundary
+  // that hides this subtree: React runs layout effects again on the reveal
+  // while the native image stays where it was and fires nothing, and a play
+  // surface would be reported for a paint that is not coming. Nothing wraps
+  // one in either today.
+  useLayoutEffect(() => () => onOverlayMounted?.(null), [onOverlayMounted]);
+  // What `revealWithOverlay` has already let through. `key` is the climb for
+  // 'each-climb' and a constant for 'first-paint', so one comparison serves both.
+  const [revealed, setRevealed] = useState<{ key: string | null } | null>(null);
+  const revealIdentity = revealWithOverlay === 'each-climb' ? (recyclingKey ?? null) : null;
+  // 'first-paint' is about the instance, not the climb: once this stack has been
+  // on screen at all — because an overlay painted, or because the first climb's
+  // overlay was already rendered and the caller never asked to wait — a later
+  // climb must not blank it.
+  const everShownRef = useRef(false);
+  const awaitingOverlay =
+    revealWithOverlay === 'each-climb'
+      ? revealed === null || revealed.key !== revealIdentity
+      : revealWithOverlay === 'first-paint' && revealed === null && !everShownRef.current;
+  if (!awaitingOverlay && !hidden) everShownRef.current = true;
+  const hasBackgrounds = backgroundPaths.length > 0;
+  artReadinessRef.current = () =>
+    !hidden &&
+    !awaitingOverlay &&
+    missingBackgroundCount === 0 &&
+    hasBackgrounds &&
+    (!overlayRequired ||
+      (liveOverlay
+        ? liveOverlay.displayed
+        : mountedNativeLayersRef.current.get(nativeOverlayIdentity)?.displayed === true)) &&
+    backgroundPaths.every(
+      (path) => mountedNativeLayersRef.current.get(nativeBackgroundIdentity(path))?.displayed === true,
+    );
+  // `displayAttempt` already serialises the background paths; `hasBackgrounds`
+  // is listed so the deps name every value the readiness check closes over.
+  useLayoutEffect(() => {
+    onArtReadinessChange?.(artReadinessRef.current());
+    return () => onArtReadinessChange?.(false);
+  }, [
+    displayAttempt,
+    missingBackgroundCount,
+    overlayRequired,
+    onArtReadinessChange,
+    awaitingOverlay,
+    hasBackgrounds,
+    liveOverlay?.displayed,
+  ]);
+  useEffect(() => {
+    if (liveOverlay?.displayed && revealWithOverlay) {
+      setRevealed((previous) => (previous?.key === revealIdentity ? previous : { key: revealIdentity }));
+    }
+    reportArtDisplayedRef.current();
+  }, [liveOverlay?.displayed, revealWithOverlay, revealIdentity, awaitingOverlay]);
+  useEffect(() => {
+    if (!awaitingOverlay) return;
+    const timer = setTimeout(() => setRevealed({ key: revealIdentity }), OVERLAY_REVEAL_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [awaitingOverlay, revealIdentity]);
+  const concealed = awaitingOverlay ? styles.concealed : null;
+  const displayedBridge =
+    retainDisplayedOverlayFor != null &&
+    displayedOverlay?.identity === retainDisplayedOverlayFor &&
+    displayedOverlay.nativeIdentity !== nativeOverlayIdentity
+      ? displayedOverlay.uri
+      : null;
   const bridgeOverlay =
-    retainPreviousOverlayFor != null &&
+    displayedBridge ??
+    (retainPreviousOverlayFor != null &&
     retainedOverlay?.identity === retainPreviousOverlayFor &&
     retainedOverlay.uri !== overlayUri
       ? retainedOverlay.uri
-      : null;
+      : null);
+  const baseLayerStyle = useMemo(
+    () => (baseColor ? [styles.layer, { backgroundColor: baseColor }] : null),
+    [baseColor],
+  );
   if (hidden) {
     return <View style={[styles.stack, mirrored && styles.mirrored]} />;
   }
 
   return (
     <View style={[styles.stack, mirrored && styles.mirrored]}>
+      {baseLayerStyle && backgroundPaths.length > 0 && (
+        <View
+          testID="layered-climb-image-base"
+          style={concealed ? [baseLayerStyle, concealed] : baseLayerStyle}
+          pointerEvents="none"
+        />
+      )}
       {shouldShowEmptyFallback && (
         <View testID="layered-climb-image-empty-fallback" style={[styles.layer, styles.emptyLayer]} />
       )}
       {backgroundPaths.map((path) => (
-        <Image
+        <NativeImageLayer
           key={path}
+          nativeDisplayIdentity={nativeBackgroundIdentity(path)}
+          onNativeMounted={onNativeMounted}
+          onNativeDisplayed={onNativeDisplayed}
           source={{ uri: backgroundImageUri(path) }}
-          style={styles.layer}
+          style={concealed ? [styles.layer, concealed] : styles.layer}
           contentFit="contain"
           // `memory`, not `memory-disk`: every layer in this stack is already a
           // file on disk that we own (bundled board photos, the renderer's
@@ -217,6 +540,12 @@ const LayeredClimbImage = React.memo(function LayeredClimbImage({
           // backgrounds for the list, native-res for the play view — so
           // there's nothing large to downscale; the CALayer scales to fit.
           allowDownscaling={false}
+          onError={(event) => onArtError?.(event)}
+          onLoad={() => noteBoardArtInMemory(backgroundImageUri(path))}
+          onDisplay={() => {
+            noteBoardArtInMemory(backgroundImageUri(path));
+            reportArtDisplayedRef.current();
+          }}
         />
       ))}
       {missingBackgroundCount > 0 &&
@@ -228,7 +557,7 @@ const LayeredClimbImage = React.memo(function LayeredClimbImage({
         Array.from({ length: missingBackgroundCount }, (_, layerIndex) => (
           <View
             key={`missing-${layerIndex}`}
-            style={[styles.layer, styles.missingLayer]}
+            style={[styles.layer, styles.missingLayer, concealed]}
             accessibilityLabel="Missing background layer"
           />
         ))}
@@ -240,7 +569,7 @@ const LayeredClimbImage = React.memo(function LayeredClimbImage({
           per-tap surface never blanks. Decorative only — no onLoad/onError, no
           recyclingKey, no testID — so it cannot disturb the live overlay's
           exact-attempt accounting. */}
-      {bridgeOverlay && (
+      {bridgeOverlay && !liveOverlay && (
         <Image
           key={`retained-${bridgeOverlay}`}
           source={{ uri: bridgeOverlay }}
@@ -254,18 +583,38 @@ const LayeredClimbImage = React.memo(function LayeredClimbImage({
       )}
       {/* No overlay has ever painted and none is coming (no native renderer):
           let the caller draw the holds itself rather than showing none. */}
-      {!overlayUri && !bridgeOverlay && emptyOverlayFallback}
+      {!overlayUri && !bridgeOverlay && !liveOverlay && emptyOverlayFallback}
+      {/* A live drawable must be visible to report presentation. Concealing it
+          until that callback would prevent the callback that reveals it. */}
+      {liveOverlay ? (
+        <View style={styles.layer} pointerEvents="none">
+          {liveOverlay.node}
+        </View>
+      ) : null}
       {overlayUri && (
-        <Image
+        <NativeImageLayer
           key={overlayLoadKey ?? overlayUri}
+          nativeDisplayIdentity={nativeOverlayIdentity}
+          onNativeMounted={onNativeMounted}
+          onNativeDisplayed={onNativeDisplayed}
           source={{ uri: overlayUri }}
-          style={styles.layer}
+          style={concealed ? [styles.layer, concealed] : styles.layer}
           contentFit="contain"
           recyclingKey={recyclingKey}
           cachePolicy="memory"
           // Forced instant while retaining: a hold erased on this tap would
           // otherwise stay visible on the bridge layer for the whole fade.
-          transition={suppressOverlayTransition || retainPreviousOverlayFor != null ? 0 : 150}
+          // ...and instant while the stack is held back: the reveal is the
+          // transition, and a fade starting at `onLoad` would put the bare
+          // board on screen after all.
+          transition={
+            suppressOverlayTransition ||
+            retainPreviousOverlayFor != null ||
+            retainDisplayedOverlayFor != null ||
+            awaitingOverlay
+              ? 0
+              : 150
+          }
           // Overlay PNG is rasterized at the surface size (small for the
           // list/accessory, native for play) so no main-thread downscale
           // is needed — skip expo-image's resample.
@@ -273,24 +622,82 @@ const LayeredClimbImage = React.memo(function LayeredClimbImage({
           onLoad={() => {
             const emittingLoadKey = overlayLoadKey ?? null;
             const latestAttempt = latestOverlayAttemptRef.current;
-            if (retainPreviousOverlayFor != null && latestAttempt.uri === overlayUri) {
+            // `cachePolicy="memory"`: the decoded overlay is in memory from here
+            // on, so the next surface to mount it can paint it straight away.
+            noteBoardArtInMemory(overlayUri);
+            // The holds are on the layer now: let the photo through with them.
+            // Guarded like the marker below, so a late event from the previous
+            // climb's image cannot reveal a row whose own overlay is still out.
+            if (revealWithOverlay != null && latestAttempt === overlayAttempt) {
+              setRevealed((previous) => (previous?.key === revealIdentity ? previous : { key: revealIdentity }));
+            }
+            if (retainPreviousOverlayFor != null && latestAttempt === overlayAttempt) {
               setRetainedOverlay((previous) =>
                 previous?.uri === overlayUri && previous.identity === retainPreviousOverlayFor
                   ? previous
                   : { uri: overlayUri, identity: retainPreviousOverlayFor },
               );
             }
-            if (overlayTestID && latestAttempt.uri === overlayUri && latestAttempt.loadKey === emittingLoadKey) {
-              setOverlayPainted(true);
-            }
             onOverlayLoad?.(emittingLoadKey);
           }}
-          onError={(event) => onOverlayError?.(event, overlayLoadKey ?? null)}
+          onDisplay={() => {
+            const emittingLoadKey = overlayLoadKey ?? null;
+            const latestAttempt = latestOverlayAttemptRef.current;
+            if (
+              hidden ||
+              displayedAttemptRef.current.nativeOverlayIdentity !== nativeOverlayIdentity ||
+              latestAttempt !== overlayAttempt
+            )
+              return;
+            noteBoardArtInMemory(overlayUri, emittingLoadKey?.split(':')[0]);
+            if (retainDisplayedOverlayFor != null) {
+              setDisplayedOverlay((previous) =>
+                previous?.nativeIdentity === nativeOverlayIdentity && previous.identity === retainDisplayedOverlayFor
+                  ? previous
+                  : { uri: overlayUri, identity: retainDisplayedOverlayFor, nativeIdentity: nativeOverlayIdentity },
+              );
+            }
+            if (overlayTestID) setPaintedOverlayIdentity(nativeOverlayIdentity);
+            onOverlayDisplay?.(emittingLoadKey);
+            reportArtDisplayedRef.current();
+          }}
+          onError={(event) => {
+            onOverlayError?.(event, overlayLoadKey ?? null);
+            onArtError?.(event);
+          }}
         />
       )}
+      {aboveOverlay ? (
+        <View
+          testID="layered-climb-image-above-overlay"
+          style={concealed ? [styles.layer, concealed] : styles.layer}
+          pointerEvents="none"
+        >
+          {aboveOverlay}
+        </View>
+      ) : null}
+      {awaitingOverlay && revealPlaceholderColor ? (
+        <View
+          testID="layered-climb-image-reveal-placeholder"
+          style={[styles.layer, styles.revealPlaceholder, { backgroundColor: revealPlaceholderColor }]}
+        />
+      ) : null}
       {/* Screenshot/e2e anchor — see overlayPainted above. Transparent, full-bleed
           (so it has on-screen bounds Maestro can see), and pointer-transparent. */}
       {overlayTestID && overlayPainted && <View testID={overlayTestID} style={styles.layer} pointerEvents="none" />}
+      {paintedTestID &&
+        !hidden &&
+        (overlayUri || liveOverlay) &&
+        backgroundPaths.length > 0 &&
+        missingBackgroundCount === 0 &&
+        displayedAttemptRef.current.reported &&
+        actualLayersDisplayed() &&
+        paintedAttempt?.identity === displayAttempt && (
+          <>
+            <View testID={paintedTestID} style={styles.layer} pointerEvents="none" />
+            {paintedExtraTestID && <View testID={paintedExtraTestID} style={styles.layer} pointerEvents="none" />}
+          </>
+        )}
     </View>
   );
 });
@@ -329,5 +736,13 @@ const styles = StyleSheet.create({
   },
   mirrored: {
     transform: [{ scaleX: -1 }],
+  },
+  // Hidden, not unmounted: the images still load, which is what ends the wait.
+  concealed: {
+    opacity: 0,
+  },
+  // Same weight as the skeleton row's thumbnail block (ClimbListRowSkeleton).
+  revealPlaceholder: {
+    opacity: 0.55,
   },
 });

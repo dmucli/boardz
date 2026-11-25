@@ -1,3 +1,6 @@
+# Deprecated live-route commands: retained only as the capture filename inventory.
+# Use vp run mobile:screenshots -- --flow <name>; its story runner ignores these commands.
+# Do not execute this file directly with Maestro.
 appId: com.boardsesh.app
 name: app-store screenshots
 ---
@@ -95,6 +98,11 @@ name: app-store screenshots
     id: 'live-sessions-error'
 - assertNotVisible:
     id: 'live-sessions-offline'
+# The live rail can succeed while Recent sessions renders an error or skeleton.
+- extendedWaitUntil:
+    visible:
+      id: 'session-feed-card'
+    timeout: 90000
 - takeScreenshot: 02-home
 
 # Discover — the playlist library (smart "Your Picks" + saved playlists). The dialog was
@@ -157,11 +165,15 @@ name: app-store screenshots
 - tapOn:
     text: 'Open'
     optional: true
+- extendedWaitUntil:
+    visible:
+      id: '^climbs-capture-settled$'
+    timeout: 60000
 - waitForAnimationToEnd
 - takeScreenshot: 03-climbs
 
-# Workout generator — the Record screen with a workout pre-selected (volume): target
-# grade, warm-up, set config + the generated preview queue.
+# Workout generator — the Record screen with one Volume block pre-selected: its open
+# card (type, target grade, counts) + the generated preview queue.
 - openLink: com.boardsesh.app://record
 - tapOn:
     text: 'Open'
@@ -194,18 +206,26 @@ name: app-store screenshots
 
 # NOTE: this flow is iPhone-only. iPad deep links don't navigate on the simulator
 # (the scheme-confirm dialog swallows the openurl), so iPad captures — including the
-# On the Wall kiosk — run from app-store-ipad.yaml via sidebar taps, which the
+# Wall display kiosk — run from app-store-ipad.yaml via native taps, which the
 # orchestrator selects for iPad devices (iosSourceFlowFile).
 
 # Board view — the signature feature: the wall with holds lit. The screenshot-mode param
 # auto-opens the first climb's play drawer (no coordinate tap). LAST, because the play
 # drawer overlays the app and would bleed into later shots.
-- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotDrive=1
 - tapOn:
     text: 'Open'
     optional: true
 - waitForAnimationToEnd
 - waitForAnimationToEnd
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^store-driving-.+$'
+    timeout: 60000
 - takeScreenshot: 00-board-view
 
 # Board view on the second pinned wall (SCREENSHOT_BOARDS[1], the Tension Board 2) — a
@@ -213,10 +233,36 @@ name: app-store screenshots
 # screenshotBoardIndex=1 switches the active board to that wall before opening its first
 # climb. LAST too (also opens the play drawer). Slot 03 was the reserved party shot,
 # which the main flow never captured.
-- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=1
+# Dismiss the first player so its painted marker cannot satisfy the next capture.
+- repeat:
+    times: 2
+    commands:
+      - runFlow:
+          when:
+            visible: ${SCREENSHOT_CLOSE_LABEL}
+          commands:
+            - tapOn: ${SCREENSHOT_CLOSE_LABEL}
+            - waitForAnimationToEnd
+- extendedWaitUntil:
+    notVisible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 60000
+- extendedWaitUntil:
+    notVisible:
+      id: 'play-drawer-board-overlay'
+    timeout: 60000
+- openLink: com.boardsesh.app://climbs?screenshotOpenFirst=1&screenshotBoardIndex=1&screenshotDrive=1
 - tapOn:
     text: 'Open'
     optional: true
 - waitForAnimationToEnd
 - waitForAnimationToEnd
+- extendedWaitUntil:
+    visible:
+      id: '^cpp-climb-painted-.+$'
+    timeout: 90000
+- extendedWaitUntil:
+    visible:
+      id: '^store-driving-.+$'
+    timeout: 60000
 - takeScreenshot: 01-board-view-2

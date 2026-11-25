@@ -1,6 +1,7 @@
 /// <reference types="node" />
 
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 
 import { DRIZZLE_DIR, JOURNAL_PATH, parseJournal } from '../lib/drizzle-migrations';
@@ -32,7 +33,7 @@ import { DRIZZLE_DIR, JOURNAL_PATH, parseJournal } from '../lib/drizzle-migratio
  *   ALTER FUNCTION <name>() SET search_path = public, pg_catalog;
  *
  * Never edit an applied migration — the ledger holds the hash of the file as it
- * ran (`docs/db-migrations.md`, "The recorded baseline").
+ * ran (`docs/operations/db-migrations.md`, "The recorded baseline").
  */
 
 /**
@@ -212,7 +213,7 @@ const CREATE_FUNCTION_SEARCH_PATH_RE = new RegExp(
 const CREATE_FUNCTION_UNSAFE_CONFIGURATION_RE =
   /\b(?:RESET\s+(?:ALL\b|"search_path"(?=\s|$)|search_path\b)|SET\s+SCHEMA\b|(?:SET|RESET)\s+U&")/i;
 
-function createFunctionPinsPrescribedSearchPath(statement: string): boolean {
+function createFunctionPinsPrescribedSearchPath(statement: string, reviewedCatalogOnly = false): boolean {
   if (CREATE_FUNCTION_UNSAFE_CONFIGURATION_RE.test(statement)) return false;
 
   let effectiveSearchPath: string | undefined;
@@ -221,8 +222,31 @@ function createFunctionPinsPrescribedSearchPath(statement: string): boolean {
       effectiveSearchPath = match[3];
     }
   }
-  return effectiveSearchPath?.replace(/\s+/g, '').toLowerCase() === 'public,pg_catalog';
+  const normalized = effectiveSearchPath?.replace(/\s+/g, '').toLowerCase();
+  return normalized === 'public,pg_catalog' || (reviewedCatalogOnly && normalized === 'pg_catalog');
 }
+
+// These security-definer functions qualify every public relation and use
+// pg_catalog alone. Pin each complete migration and its expected function names.
+// Trusting a name or sanitized header would hide later unqualified dependencies.
+const REVIEWED_LIFECYCLE_MIGRATION_SHA256 = '4299773d153d91534002be3e51f643e71f427535274924349d3ff0b28ce7c73c';
+const REVIEWED_GYM_ALIAS_MIGRATION_SHA256 = '6cc723ef6dde8dc732ed30bb01d2d88e5ba7f199f608265156e1813c4159b1e8';
+const REVIEWED_SPRAY_EXPOSURE_MIGRATION_SHA256 = 'c9ed55b21dea08152b91df28fbc8018b1c55f0ccaadc37bcfbd409961179e529';
+const REVIEWED_SPRAY_EXPOSURE_FUNCTIONS = [
+  'spray_exposure_board_change',
+  'spray_exposure_wall_change',
+  'spray_exposure_version_change',
+  'spray_exposure_policy_change',
+  'spray_exposure_climb_change',
+];
+const REVIEWED_CATALOG_ONLY_MIGRATIONS = new Map([
+  [REVIEWED_SPRAY_EXPOSURE_MIGRATION_SHA256, new Set(REVIEWED_SPRAY_EXPOSURE_FUNCTIONS)],
+  [
+    REVIEWED_LIFECYCLE_MIGRATION_SHA256,
+    new Set(['partner_account_deletion_events', 'partner_connection_lifecycle_events']),
+  ],
+  [REVIEWED_GYM_ALIAS_MIGRATION_SHA256, new Set(['revoke_gym_reporting_aliases_on_board_move'])],
+]);
 
 /**
  * Fold migration sources, in order, into a final pinned/unpinned verdict per
@@ -240,6 +264,9 @@ export function foldMigrationSources(sources: Iterable<string>): Map<string, boo
   const pinned = new Map<string, boolean>();
 
   for (const source of sources) {
+    const reviewedCatalogOnlyFunctions = REVIEWED_CATALOG_ONLY_MIGRATIONS.get(
+      createHash('sha256').update(source).digest('hex'),
+    );
     for (const statement of topLevelStatements(source)) {
       const created = CREATE_FUNCTION_RE.exec(statement);
       if (created !== null) {
@@ -256,7 +283,7 @@ export function foldMigrationSources(sources: Iterable<string>): Map<string, boo
         // identity, so requiring a literal empty `()` here would miss them.
         const createsTrigger = RETURNS_TRIGGER_RE.test(definition);
         if (name !== undefined && (pinned.has(name) || createsTrigger)) {
-          pinned.set(name, createFunctionPinsPrescribedSearchPath(statement));
+          pinned.set(name, createFunctionPinsPrescribedSearchPath(statement, reviewedCatalogOnlyFunctions?.has(name)));
         }
         continue;
       }
@@ -323,7 +350,7 @@ export function foldMigrationSources(sources: Iterable<string>): Map<string, boo
 
 /**
  * Read the migrations IN JOURNAL ORDER. Journal order is what actually runs
- * (`docs/db-migrations.md`: order comes from `when`, and a `.sql` with no
+ * (`docs/operations/db-migrations.md`: order comes from `when`, and a `.sql` with no
  * journal entry is inert), so a `readdir` sweep would be the wrong sequence and
  * would also count orphans.
  */
@@ -385,6 +412,58 @@ describe('the pin requires public then pg_catalog, and nothing else', () => {
       'LANGUAGE plpgsql;',
     ].join('\n');
   const createTriggerWithPins = (...clauses: string[]) => createTriggerWithAttributes(clauses, []);
+
+  it('accepts catalog-only paths only in the complete reviewed lifecycle migration', () => {
+    const reviewed = migrationSources().find(
+      (source) => createHash('sha256').update(source).digest('hex') === REVIEWED_LIFECYCLE_MIGRATION_SHA256,
+    );
+    expect(reviewed).toBeDefined();
+    expect(unpinnedIn(foldMigrationSources([reviewed!]))).toEqual([]);
+    for (const source of [
+      reviewed!.replace('UPDATE public.app_workouts', 'UPDATE app_workouts'),
+      reviewed!.replace('SET search_path = pg_catalog', 'SET search_path = pg_catalog, public'),
+      `${reviewed}\nCREATE OR REPLACE FUNCTION public.partner_connection_lifecycle_events() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$ BEGIN RETURN NEW; END; $$;`,
+    ])
+      expect(unpinnedIn(foldMigrationSources([source]))).toContain('partner_connection_lifecycle_events');
+    expect(
+      unpinnedIn(
+        foldMigrationSources([reviewed!, 'ALTER FUNCTION public.partner_connection_lifecycle_events() RESET ALL;']),
+      ),
+    ).toContain('partner_connection_lifecycle_events');
+  });
+
+  it('pins the complete catalog-only gym alias migration and rejects changed dependencies', () => {
+    const reviewed = migrationSources().find(
+      (source) => createHash('sha256').update(source).digest('hex') === REVIEWED_GYM_ALIAS_MIGRATION_SHA256,
+    );
+    expect(reviewed).toBeDefined();
+    expect(unpinnedIn(foldMigrationSources([reviewed!]))).toEqual([]);
+    expect(
+      unpinnedIn(
+        foldMigrationSources([
+          reviewed!.replace('UPDATE public.gym_reporting_board_aliases', 'UPDATE gym_reporting_board_aliases'),
+        ]),
+      ),
+    ).toEqual(['revoke_gym_reporting_aliases_on_board_move']);
+  });
+
+  it('pins the exact spray exposure migration, including helpers and attachment predicates', () => {
+    const reviewed = migrationSources().find(
+      (source) => createHash('sha256').update(source).digest('hex') === REVIEWED_SPRAY_EXPOSURE_MIGRATION_SHA256,
+    );
+    expect(reviewed).toBeDefined();
+    expect(unpinnedIn(foldMigrationSources([reviewed!]))).toEqual([]);
+    for (const modified of [
+      reviewed!.replace('hashtextextended(', 'pg_catalog.hashtextextended('),
+      reviewed!.replace('WHEN (NEW.board_type', 'WHEN (OLD.board_type'),
+      reviewed!.replace('INSERT INTO public.spray_exposure_invalidations', 'INSERT INTO spray_exposure_invalidations'),
+    ]) {
+      expect(modified).not.toBe(reviewed);
+      expect(unpinnedIn(foldMigrationSources([modified])).sort()).toEqual(
+        [...REVIEWED_SPRAY_EXPOSURE_FUNCTIONS].sort(),
+      );
+    }
+  });
 
   it.each([
     ['an empty path', "SET search_path = ''"],

@@ -1,3 +1,4 @@
+import { AccessibleBottomSheetTextInput as BottomSheetTextInput } from '../AccessibleBottomSheetTextInput';
 // One note field for both tick sheets. A single styled `TextInput`, never a
 // bordered wrapper `View` around a `flex: 1` input.
 //
@@ -15,17 +16,22 @@
 // `resolveFlexibleLength`, so the old child resolved to ~26pt, and a 20pt line
 // fits in 26pt). Either way the padding is what changed the rendering, so the
 // test next door pins it (#4642).
-import React, { useCallback, useRef, useState } from 'react';
-import { StyleSheet, type TextInput } from 'react-native';
-import { BottomSheetTextInput } from '@expo/ui/community/bottom-sheet';
+import React, { useCallback, useState } from 'react';
+import { StyleSheet } from 'react-native';
+
 import { useTheme } from '../../providers/theme-provider';
-import { useSheetScrollIntoView } from '../sheet-scroll-into-view';
+import { selectByVariant } from '../../theme/variants/select-by-variant';
 
 type TickNoteFieldProps = {
   value: string;
   onChangeText: (next: string) => void;
   placeholder: string;
   accessibilityLabel: string;
+  /** One visible line at the medium detent without replacing the native input. */
+  compact?: boolean;
+  onFocus?: () => void;
+  /** Reports retain Return for paragraphs; tick comments use Done. */
+  submitBehavior?: 'blurAndSubmit' | 'newline';
 };
 
 export const TickNoteField = React.memo(function TickNoteField({
@@ -33,42 +39,29 @@ export const TickNoteField = React.memo(function TickNoteField({
   onChangeText,
   placeholder,
   accessibilityLabel,
+  compact = false,
+  onFocus,
+  submitBehavior = 'blurAndSubmit',
 }: TickNoteFieldProps) {
-  const { systemColors, brandColors, borderRadius, spacing, textStyles } = useTheme();
+  const { systemColors, brandColors, borderRadius, spacing, textStyles, variant, m3 } = useTheme();
   const [focused, setFocused] = useState(false);
-  const inputRef = useRef<TextInput>(null);
-  const focusedRef = useRef(false);
-  // Keeps the note above the pinned footer while the keyboard is up. Neither
-  // tick sheet scrolled it into view on its own, and the edit sheet's note sat
-  // under the keyboard (#5665). `null` outside a scrollable sheet.
-  const scrollIntoView = useSheetScrollIntoView();
-
   const handleFocus = useCallback(() => {
-    focusedRef.current = true;
     setFocused(true);
-    if (inputRef.current) scrollIntoView?.reveal(inputRef.current);
-  }, [scrollIntoView]);
+    onFocus?.();
+  }, [onFocus]);
   const handleBlur = useCallback(() => {
-    focusedRef.current = false;
     setFocused(false);
-    if (inputRef.current) scrollIntoView?.release(inputRef.current);
-  }, [scrollIntoView]);
-  // A new line grows the field (up to its maxHeight), so scroll again to keep
-  // its bottom edge in view. `follow`, not `reveal`: typing never moves the
-  // sheet's detent.
-  const handleContentSizeChange = useCallback(() => {
-    if (focusedRef.current && inputRef.current) scrollIntoView?.follow(inputRef.current);
-  }, [scrollIntoView]);
+  }, []);
 
   return (
     <BottomSheetTextInput
-      ref={inputRef}
       multiline
+      returnKeyType={submitBehavior === 'newline' ? undefined : 'done'}
+      submitBehavior={submitBehavior}
       value={value}
       onChangeText={onChangeText}
       onFocus={handleFocus}
       onBlur={handleBlur}
-      onContentSizeChange={handleContentSizeChange}
       placeholder={placeholder}
       // `secondaryLabel`, not `tertiaryLabel`: on iOS the tertiary label is a
       // ~30%-alpha PlatformColor, which composites to 1.73:1 against the opaque
@@ -79,19 +72,24 @@ export const TickNoteField = React.memo(function TickNoteField({
       style={[
         textStyles.subheadline,
         styles.input,
+        compact ? styles.compactInput : null,
         {
           borderRadius: borderRadius.lg,
           paddingHorizontal: spacing[3],
           paddingVertical: spacing[2],
-          backgroundColor: systemColors.fill,
+          // Material draws an outlined field: the border below is the whole box,
+          // so it takes M3's `outline`, which clears 3:1 where `separator` doesn't.
+          backgroundColor: selectByVariant(variant, { material: 'transparent', liquidGlass: systemColors.fill }),
           // A real edge at rest, not `transparent` — an unfocused field with no
           // visible boundary reads as decoration rather than somewhere to
           // type. `borderWidth` is unchanged either way, so focus recolours the
-          // edge instead of resizing the box. `separator` is the only border
-          // role the design system has here, and it clears WCAG 1.4.11's 3:1 in
+          // edge instead of resizing the box. On Liquid Glass `separator` is the
+          // only border role the design system has, and it clears WCAG 1.4.11's 3:1 in
           // neither scheme: ~1.9:1 in dark, ~1.6:1 in light, so dark is the
           // BETTER of the two rather than the worst case — tracked in #4722.
-          borderColor: focused ? brandColors.primary : systemColors.separator,
+          borderColor: focused
+            ? brandColors.primary
+            : selectByVariant(variant, { material: m3.outline, liquidGlass: systemColors.separator }),
           color: systemColors.label,
         },
       ]}
@@ -117,26 +115,13 @@ const styles = StyleSheet.create({
     // (7 x 20 + 16 padding + 2 border = 158, 2pt spare) — +67% on the old
     // ceiling, so a long note stays one glance rather than a blind scroll.
     //
-    // iOS is the tighter of the two and the real bound on this number: its
-    // keyboard-up visible body is 162pt. Derived, not measured, on the
-    // reference device the detent test pins (`log-ascent-sheet.test.tsx`:
-    // window 844 - top inset 44 - iOS-26 card gap 24 = base 776). The '92%'
-    // keyboard detent gives a 694pt column; KAV `behavior="padding"` takes 336
-    // for the keyboard, leaving 358; less the 56pt header and the 140pt
-    // footer = 162. The footer is 140 and NOT 106 because
-    // `useWindowBottomInset()` keeps returning the published 34pt window inset
-    // while the keyboard is up — nothing in the app zeroes it on keyboard show
-    // (`hooks/use-window-bottom-inset.ts`). An earlier draft assumed that inset
-    // collapsed, read the body as ~196pt, and set 180 — which overflows the
-    // real body by 18pt. A field taller than the visible body can never scroll
-    // fully into view, so anyone raising this ceiling has to re-check that
-    // inset first, not just the detent.
-    //
-    // Anything longer scrolls the sheet body, which at least moves visibly.
-    // Detent VALUES are unchanged: the body is scrollable under a pinned
-    // footer, so the extra height costs the Attempt/Send bar nothing (the
-    // derivations in `tick-sheet-metrics.ts` do carry the taller note row).
+    // Longer comments scroll inside the field. The create sheet pins it with
+    // Attempt/Send; the edit sheet keeps it in its scrolling form body.
     maxHeight: 160,
     textAlignVertical: 'top',
+  },
+  compactInput: {
+    minHeight: 44,
+    maxHeight: 44,
   },
 });

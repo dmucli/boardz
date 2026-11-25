@@ -10,26 +10,42 @@ import {
   type ReactNode,
 } from 'react';
 import { useTranslation } from 'react-i18next';
+import { resolveCurrentClimbMoverFace } from '../lib/current-climb-mover';
 import {
   queueReducer,
   initialState,
+  heldHistoryCount,
   createQueueSyncCoordinator,
   generateClientId,
   playlistSuggestionSourceMatches,
+  samePlaylistTrackResume,
+  withPlaylistTrackResume,
+  withPlaylistTrackPlace,
+  withoutLookOffWall,
   getQueueBoardKey,
   isPlaylistPeekQueueItemUuid,
   decideAdd,
   deriveAcceptedConfigs,
-  isClimbOnReachableBoard,
   planPlayNext,
   playNextInsertPosition,
+  withoutListWalkFlag,
+  MAX_SYNCED_QUEUE_ITEMS,
+  findPlaylistClimbIndex,
+  placeOnWall,
+  reorderAcrossLine,
 } from '@boardsesh/queue';
 import type {
-  Climb,
+  ClimbAuthoredPatch,
+  CurrentClimbPlacement,
+  HistoryCopyRule,
+  NowSlotRewrite,
   QueueSearchParams,
   ClimbQueueItem,
   PlaylistSuggestionSource,
+  PlaylistTrackResume,
   QueueAddPlacement,
+  QueueState,
+  QueueAction,
   SetCurrentClimbOptions,
 } from '@boardsesh/queue';
 import {
@@ -39,22 +55,28 @@ import {
   type QueueSyncGate,
 } from '@boardsesh/queue-runtime';
 import { useQueueMutations, type PublishPlaybackStateInput } from '@boardsesh/queue-react';
+// The subpath, not the barrel: provider suites whole-module-mock the barrel.
+import { isNowSlotValidationError } from '@boardsesh/queue-react/create-queue-mutations';
 import type { QueueItemAttribution } from '@boardsesh/queue-react/queue-item-input';
 import type { PlaybackStateChangedEvent, SessionUser } from '@boardsesh/shared-schema';
-import { execute, isRateLimitedError } from '@boardsesh/graphql-client';
-import {
-  canAddClimbToBoard,
-  classifyClimbBoardCompatibility,
-  toBoardName,
-  type ActiveBoardForCompatibility,
-} from '@boardsesh/board-config';
+import { execute, isNotInSessionError, isRateLimitedError, isTransportClosedError } from '@boardsesh/graphql-client';
+import { classifyClimbBoardCompatibility } from '@boardsesh/board-config';
 import { buildSessionBoardPath } from '../lib/boards/session-board-path';
-import { SHARED_EVENTS } from '@boardsesh/analytics';
-import { JOIN_SESSION, UPDATE_USERNAME } from '@boardsesh/graphql/operations/queue-session';
+import { SHARED_EVENTS, boardTypeProperty } from '@boardsesh/analytics';
+import { JOIN_SESSION, JOIN_SESSION_NOW_SLOT, UPDATE_USERNAME } from '@boardsesh/graphql/operations/queue-session';
 import { getWsClient } from '../lib/graphql/ws-client';
+import { subscribeWsConnectionEnded } from '../lib/graphql/ws-client-lifecycle';
 import { getHttpClient } from '../lib/graphql/client';
+import { sanitizeQueueSnapshot } from '../lib/queue-privacy';
+import { invalidateStoredQueueSnapshot } from '../lib/queue-snapshot-store';
+import { nowMs } from '../lib/clock';
+import { invalidateRestTimerControlIntent } from '../lib/rest-timer-foreground-state';
+import { noteOwnMove } from '../lib/relay-receipt';
+import { restoreRemovedQueueItems, type QueueContentSnapshot } from '../lib/queue-undo';
+import { getCredentialGeneration, subscribeToCredentialChanges } from '../lib/privacy/privacy-cache';
 import {
   GET_SESSION_QUEUE_STATE,
+  GET_SESSION_QUEUE_STATE_NOW_SLOT,
   type SessionLiveStatsEvent,
   type GetSessionQueueStateQueryResponse,
 } from '../lib/graphql/operations';
@@ -62,21 +84,26 @@ import { getStoredActiveBoard } from '../lib/active-board-store';
 import { useActiveBoard, useSetActiveBoard } from '../lib/graphql/use-active-board';
 import {
   anchoredSuggestionSource,
-  findPreviousQueueItemWithSuggestions,
+  resolveUpNextCommitResume,
+  selectPreviousQueueItemWithSuggestions,
   selectNextQueueItemWithSuggestions,
   shouldDefaultToBrowse,
 } from '@boardsesh/play-view';
-import { useSharedSessionBrowseEnabled } from './feature-flags-provider';
+import { useQueueNowSlotEnabled, useSharedSessionBrowseEnabled } from './feature-flags-provider';
+import {
+  clampSyncedQueue,
+  isAttributionValidationError,
+  probeQueueServerCapabilities,
+  reportQueueServerProbe,
+} from './queue/now-slot-server';
+import { buildSessionQueueStateQuery } from '@boardsesh/graphql/operations/queue-session';
 import { useReachableBoardKeys } from './queue/use-reachable-board-keys';
+import { reachableClimbPredicate, toActiveBoardCompatibilityConfig } from './queue/active-board-compatibility';
 import { toClimbQueueItem } from '../lib/queue-conversion';
 import { getPlaylistRenderBoardTarget } from '../lib/playlists/playlist-climb-render-board';
 import { resolveCommittableQueueItem, toQueueItemWireInput, isClimbResolved } from '../lib/climb-to-queue-item';
 import { track, registerRenderSuperProperties } from '../lib/analytics';
-import {
-  requestedBoardRenderMode,
-  resolveEffectiveRenderSettings,
-  useBoardRenderSettings,
-} from '../lib/board-render-settings';
+import { resolveEffectiveRenderSettings, useBoardRenderSettings } from '../lib/board-render-settings';
 import {
   getBoardseshRendererSupport,
   getBoardseshSupportRevision,
@@ -91,6 +118,8 @@ import {
   QueueContext,
   QueueSessionControlContext,
   QueueSessionIdContext,
+  QueueSessionBoardPathContext,
+  QueueRestoredContext,
   QueueLiveStatsContext,
   QueueSharedSessionContext,
   QueueActiveClimbContext,
@@ -109,15 +138,19 @@ import {
   type QueueActionsContextValue,
   type QueuePlaylistSuggestionContextValue,
   type QueueReorderSource,
+  type QueueClearSource,
+  type WidgetNavigationOptions,
+  type NextClimbCaller,
 } from './queue/queue-contexts';
-import {
-  createBoardFeedSuggestionSource,
-  normalizeBoardSuggestionSource,
-} from '../lib/playlists/board-feed-suggestion-source';
+import { createBoardFeedSuggestionSource } from '../lib/playlists/board-feed-suggestion-source';
+import { createBoardSuggestionCompatibilityCache } from './queue/board-suggestion-compatibility-cache';
 import { useCrossBoardAddGate } from './queue/use-cross-board-add-gate';
 import { useQueueRegrade } from './queue/use-queue-regrade';
+import { useQueueClimbWriteDelivery } from './queue/use-queue-climb-write-delivery';
 import { useQueueResolveClimbs } from './queue/use-queue-resolve-climbs';
+import { useQueueClimbReads } from './queue/use-queue-climb-reads';
 import { useQueuePersistence } from './queue/use-queue-persistence';
+import { useCurrentChangeClock } from './queue/use-current-change-clock';
 import { useSessionCommands } from './queue/use-session-commands';
 import {
   useSessionRealtime,
@@ -133,29 +166,19 @@ export {
   useQueueSessionId,
   useQueueLiveStats,
   useIsSharedSession,
+  useIsCrewSession,
   useActiveClimbUuid,
   useHasActiveClimb,
   useQueueData,
   useQueueActions,
+  useQueueRestored,
   usePlaylistSuggestionSource,
 } from './queue/queue-contexts';
-export type { StartSessionConfig, QueueReorderSource } from './queue/queue-contexts';
+export type { StartSessionConfig, QueueReorderSource, QueueClearSource } from './queue/queue-contexts';
 
-/**
- * The board identity the compatibility helpers need, or undefined when we can't
- * name the active board (an unrecognised `boardType`, or none picked yet).
- *
- * Identity only — board name + layout. A same-layout different-size climb still
- * renders on its own board, so neither the add gate nor the swipe skip should
- * act on it; hold-id and size containment stay in `canAddClimbToBoard`.
- * `undefined` fails open everywhere it is used.
- */
-function toActiveBoardCompatibilityConfig(
-  activeBoard: { boardType: string; layoutId: number } | null | undefined,
-): ActiveBoardForCompatibility | undefined {
-  if (!activeBoard) return undefined;
-  const activeBoardName = toBoardName(activeBoard.boardType);
-  return activeBoardName ? { boardName: activeBoardName, layoutId: activeBoard.layoutId } : undefined;
+/** The skip-notice latch's key: which queue entries a forward run walked past. */
+function skippedItemsKey(skippedItems: readonly ClimbQueueItem[]): string {
+  return skippedItems.map((queueItem) => queueItem.uuid).join('|');
 }
 
 // A party-session queue/wall mutation that fails because the backend throttled
@@ -189,6 +212,132 @@ const defaultSearchParams: QueueSearchParams = {};
 // Stable empty Set so the no-session case never publishes a fresh identity.
 const EMPTY_USER_ID_SET: ReadonlySet<string> = new Set<string>();
 
+type QueueMutationOrigin = {
+  generation: number;
+  sessionId: string | null;
+  authenticatedUserId: string | null;
+};
+
+type QueueResyncFlight = { pending: boolean };
+
+/**
+ * What a local open did in now-slot mode (F3): the placement it was sent with,
+ * the `placeOnWall` row it took (the `Set Active Climb` telemetry), and the
+ * entry it resolved to — an existing queue entry when the climb was already
+ * queued, else the fresh item.
+ */
+type NowSlotOpen = {
+  placement: CurrentClimbPlacement;
+  rewrite: NowSlotRewrite;
+  resolvedItem: ClimbQueueItem;
+};
+
+/** The rows that only move the pointer, so a throttled send self-heals as before. */
+const POINTER_REWRITES: ReadonlySet<NowSlotRewrite> = new Set(['none', 'next', 'step']);
+
+/** What moved the wall, on `Set Active Climb`: a pick's own trigger, or a Next / Previous step. */
+type SetActiveClimbTrigger = NonNullable<SetCurrentClimbOptions['trigger']> | 'next' | 'previous' | NextClimbCaller;
+
+/**
+ * Where a Next or Previous found its climb (`Set Active Climb` `navSource`):
+ * a list climb minted from the track (`peek`), a queued entry that carries the
+ * list on (`list`), a queued climb played between list climbs (`up_next`), or
+ * the plain queue walk with no track (`queue`).
+ */
+type QueueStepSource = 'up_next' | 'list' | 'peek' | 'queue';
+
+function queueStepSource(
+  walkedSource: PlaylistSuggestionSource | null,
+  converted: boolean,
+  trackResume: PlaylistTrackResume | null | undefined,
+): QueueStepSource {
+  if (converted) return 'peek';
+  if (!walkedSource) return 'queue';
+  // A step onto the list clears the resume (null); a step into or along Up
+  // next sets it or leaves it as it was.
+  return trackResume === null ? 'list' : 'up_next';
+}
+
+function listIndexOf(walkedSource: PlaylistSuggestionSource | null, item: ClimbQueueItem): number | null {
+  const listIndex = walkedSource ? findPlaylistClimbIndex(walkedSource, item.climb.uuid) : -1;
+  return listIndex >= 0 ? listIndex : null;
+}
+
+/** The `Set Active Climb` properties only a Next or Previous carries. */
+type QueueStepProperties = {
+  navSource: QueueStepSource;
+  /** The climb's place on the track walked, null off it. */
+  listIndex: number | null;
+  fromQueueItemUuid: string | null;
+  toQueueItemUuid: string;
+};
+
+/**
+ * Run the server's placement rule on the local state (`placeOnWall`, never
+ * trims). `historyCopy` is the phone's own choice for a climb only History
+ * holds: a tap reuses that entry, a forward step puts up a fresh copy. The
+ * entry it resolves to is what the reducer and the server then place.
+ */
+function placeLocally(
+  state: Pick<QueueState, 'queue' | 'currentClimbQueueItem' | 'historyCount'>,
+  item: ClimbQueueItem,
+  placement: CurrentClimbPlacement,
+  historyCopy: HistoryCopyRule,
+): NowSlotOpen {
+  const placed = placeOnWall(state, item, placement, undefined, historyCopy);
+  return { placement, rewrite: placed.rewrite, resolvedItem: placed.currentClimbQueueItem ?? item };
+}
+
+function queueMutationOriginKey(origin: QueueMutationOrigin): string {
+  return JSON.stringify([origin.generation, origin.sessionId, origin.authenticatedUserId]);
+}
+
+// A setCurrentClimb that never reached the session. Either the server refused
+// it because the connection it arrived on had not re-joined yet (after a socket
+// drop graphql-ws re-sends an in-flight mutation on the fresh socket, and it can
+// beat that socket's JOIN_SESSION), or graphql-ws gave up on the socket before
+// an answer came. Neither says the crew's wall disagrees with this phone's: the
+// move just has not landed. A re-send waits for the live stream's FullSync to
+// show that nothing happened in the session since this phone last heard from it
+// (same sequence, still on a climb it moved off), so a move that did land and
+// was then undone by a crewmate, or a crewmate's newer move, is not overwritten.
+function moveMissedTheSession(error: unknown): boolean {
+  return isNotInSessionError(error) || isTransportClosedError(error);
+}
+
+/** One failed setCurrentClimb, as `handleSetCurrentClimbFailure` needs it. */
+type SetCurrentClimbFailure = {
+  item: ClimbQueueItem;
+  shouldAddToQueue: boolean;
+  correlationId: string;
+  /** The account, room and queue generation the send was aimed at. */
+  origin: QueueMutationOrigin;
+  /** The server sequence this phone had applied when the move was sent. */
+  sentAtSequence: number | undefined;
+  /** Sent from the coalescer's drain loop: its caller's promise had long resolved. */
+  drained: boolean;
+  /**
+   * F3: the open reshaped this phone's queue (a move, a dedupe, an insert)
+   * rather than only moving the pointer, so a lost send leaves a shape the
+   * server never stored.
+   */
+  reshapedLocally: boolean;
+};
+
+/** Where a setCurrentClimb send was aimed, kept by correlation id. */
+type MoveSend = Pick<SetCurrentClimbFailure, 'origin' | 'sentAtSequence' | 'reshapedLocally'>;
+
+/** Sends whose origin a drained failure may still need; older ones are long settled. */
+const MAX_TRACKED_MOVE_SENDS = 16;
+
+/**
+ * How long a move that missed the session waits for the live snapshot that
+ * releases its re-send. A reconnect normally delivers it in about a second;
+ * past this the move is given up the old way (resync, "out of sync" notice),
+ * well inside the 30 s correlation TTL that would otherwise drop it silently.
+ */
+const MOVE_RESEND_WAIT_MS = 20_000;
+
 /**
  * How long a peer must stay on the roster before their presence turns the
  * climber's gestures into browsing.
@@ -204,9 +353,96 @@ export const SHARED_SESSION_DWELL_MS = 3_000;
 
 export function QueueProvider({ children }: { children: ReactNode }) {
   const authTransportRevision = useAuthTransportRevision();
-  const [state, dispatch] = useReducer(queueReducer, defaultSearchParams, initialState);
+  const [state, reducerDispatch] = useReducer(queueReducer, defaultSearchParams, initialState);
+  // The #4979 hold's clock (docs/product/current-climb-outside-queue.md, section 6): when
+  // the current climb last became a different climb. The Bluetooth auto-sender
+  // reads it to keep a stale climb off the wall on connect. `dispatch` is the
+  // reducer's, reseeding the clock from every FullSync's `currentChangedAt` on
+  // the way through, so no dispatch site can forget it.
+  const {
+    clock: lastCurrentChange,
+    seedCurrentChange,
+    dispatch,
+  } = useCurrentChangeClock(state.currentClimbQueueItem?.uuid ?? null, reducerDispatch);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const sessionIdRef = useRef<string | null>(null);
+  // F3 now-slot mode (docs/product/current-climb-outside-queue.md, section 7). Solo it
+  // is the `queue-now-slot` flag; in a session it is the flag AND the
+  // per-connect server probe, decided at each join (so a flag change
+  // mid-session takes effect on the next join or reconnect). `nowSlotModeRef`
+  // is the mode last dispatched to the reducer, read synchronously by every
+  // sender so the local placement and the document set always agree with it.
+  const nowSlotFlagEnabled = useQueueNowSlotEnabled();
+  const nowSlotFlagRef = useRef(nowSlotFlagEnabled);
+  nowSlotFlagRef.current = nowSlotFlagEnabled;
+  const nowSlotModeRef = useRef(false);
+  // The probe's answer for the current connection: null before the first
+  // probe (or with the flag off), false for a backend without F3.
+  const nowSlotServerRef = useRef<boolean | null>(null);
+  const attributionServerRef = useRef(false);
+  const setNowSlotMode = useCallback((enabled: boolean) => {
+    nowSlotModeRef.current = enabled;
+    dispatch({ type: 'SET_NOW_SLOT_MODE', payload: enabled });
+  }, []);
+  // Playlist appends share one serialized wire lane. The generation is bumped
+  // by explicit queue/session/account intent so queued work can be abandoned
+  // before it reaches a different room or overwrites a newer queue decision.
+  const queueMutationGenerationRef = useRef(0);
+  const queueMutationTailRef = useRef<Promise<void>>(Promise.resolve());
+  const resyncFlightsByOriginRef = useRef(new Map<string, QueueResyncFlight>());
+  // What the server holds differs from this phone's queue in two ways the lane
+  // knows about, and every positional send waiting on it is re-read against
+  // both before it goes (`serverIndexIn`):
+  // - a lane add that failed: the climb is still here, the server never took it
+  // - a lane removal not yet sent: the climb is gone here, the server still has it
+  const laneFailedAddUuidsRef = useRef(new Set<string>());
+  const laneUnsentRemovalUuidsRef = useRef(new Set<string>());
+  const authenticatedUserIdRef = useRef<string | null>(null);
+  const lastKnownAuthenticatedUserIdRef = useRef<string | null>(null);
+  const lastObservedAuthenticationRef = useRef<boolean | null>(null);
+  const invalidateQueuedQueueMutations = useCallback(() => {
+    queueMutationGenerationRef.current += 1;
+    resyncFlightsByOriginRef.current.clear();
+    laneFailedAddUuidsRef.current.clear();
+    laneUnsentRemovalUuidsRef.current.clear();
+  }, []);
+  // A real origin switch gets an independent lane. A request already on the
+  // old lane may still settle, but its generation fence prevents it from sending
+  // more work or reconciling into the new room. In particular, a hung old-room
+  // request must not hold the new room's playlist behind its promise tail.
+  const resetQueueMutationLane = useCallback(() => {
+    queueMutationGenerationRef.current += 1;
+    queueMutationTailRef.current = Promise.resolve();
+    resyncFlightsByOriginRef.current.clear();
+    laneFailedAddUuidsRef.current.clear();
+    laneUnsentRemovalUuidsRef.current.clear();
+  }, []);
+  // The transport owns bounded attempts and rate-limit retries. Keep the lane
+  // waiting for that promise; racing it against another deadline would let its
+  // abandoned retry remove a climb AFTER a later Undo restored it.
+  const enqueueQueueMutation = useCallback((operation: () => Promise<void>): Promise<void> => {
+    const nextOperation = queueMutationTailRef.current.then(operation, operation);
+    queueMutationTailRef.current = nextOperation.catch(() => undefined);
+    return nextOperation;
+  }, []);
+  const captureQueueMutationOrigin = useCallback(
+    (): QueueMutationOrigin => ({
+      generation: queueMutationGenerationRef.current,
+      sessionId: sessionIdRef.current,
+      authenticatedUserId: authenticatedUserIdRef.current,
+    }),
+    [],
+  );
+  const isQueueMutationOriginCurrent = useCallback(
+    (origin: QueueMutationOrigin) =>
+      origin.generation === queueMutationGenerationRef.current &&
+      origin.sessionId === sessionIdRef.current &&
+      // A queue write started while the authenticated profile was still
+      // loading remains valid when that first identity resolves. Once known,
+      // account changes always bump the generation above.
+      (origin.authenticatedUserId === null || origin.authenticatedUserId === authenticatedUserIdRef.current),
+    [],
+  );
   // Live session analytics + presence. liveStats is pushed over `sessionUpdates`
   // (SessionStatsUpdated); the roster is seeded from JOIN_SESSION and kept
   // current via UserJoined/UserLeft/UserPresenceChanged.
@@ -242,19 +478,10 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // stamps `changedByParticipantId` with the originator's participant id).
   const participantIdRef = useRef<string | null>(null);
   const unsubscribeRef = useRef<(() => void) | null>(null);
-  // Single-flight guard for resyncQueueFromServer: a failed mutation in a party
-  // session refetches the authoritative queue, but several deltas can fail in a
-  // burst (e.g. clearQueue removes N items, the WS is down). Coalesce them into
-  // one in-flight fetch so we don't hammer the server or thrash the reducer.
-  const resyncInFlightRef = useRef(false);
-  // Coalesce-then-rerun-once companion to the single-flight guard above: a
-  // resync requested while a fetch is already in flight may reflect a
-  // mutation the in-flight snapshot predates (e.g. the trailing removals of a
-  // clearQueue burst). Dropping it outright would apply the older snapshot,
-  // re-baseline the gate to it, and leave the watchdog blind (local hash ==
-  // tracked snapshot hash) — so remember the request and run exactly one more
-  // fetch after the current one settles.
-  const resyncPendingRef = useRef(false);
+  // Coalesce resyncs per captured account/room/intent origin. A burst in one
+  // origin gets one trailing read, while a newly active account or queue intent
+  // can reconcile without waiting for an obsolete request to settle. Flight
+  // identity keeps an older finally block from clearing newer cleanup state.
   // Set by the session effect to a hook that tears down + restarts the joined
   // WS subscriptions (its startJoinedSubscriptions closure). Used by
   // resyncQueueFromServer as the fallback when the HTTP snapshot is
@@ -270,6 +497,11 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // through this ref so it always evaluates against the CURRENT session's
   // gate rather than one captured in a stale closure.
   const queueSyncGateRef = useRef<QueueSyncGate | null>(null);
+  // True once the queueUpdates stream on the bound connection has delivered its
+  // opening FullSync, false from every socket close until the next one. Past
+  // that point every change in the session reaches this phone as a live event.
+  // useSessionRealtime owns the writes.
+  const queueStreamLiveRef = useRef(false);
 
   // A current-climb change whose broadcast was skipped because the target climb
   // was still unresolved (a thin peer item advanced onto by next/previousClimb —
@@ -293,6 +525,45 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // fire time closes that window; the effect-based clear stays as a backstop.
   const pendingUnsyncedCurrentRef = useRef<{ queueItemUuid: string; sessionId: string | null } | null>(null);
 
+  // The origin and send-time sequence of each recent setCurrentClimb send, by
+  // correlation id. A send the coalescer drained fails long after its caller's
+  // promise resolved, so this is where its failure handler finds them.
+  const moveSendsRef = useRef(new Map<string, MoveSend>());
+  // A move whose send missed the session and waits to be re-sent (see
+  // handleSetCurrentClimbFailure). The re-send effect fires it once the reducer
+  // marks the unconfirmed move `ready`. `queueAdds` are slots that never reached
+  // the crew: the move's own (when it added one) and any a superseded lost send
+  // added. They go out once the re-send has, or once the move is given up, and
+  // not before: a new slot landing first moves the session's sequence on, and
+  // the reducer would then read the rejoin snapshot as "something happened".
+  const moveResendRef = useRef<{
+    correlationId: string;
+    /** The climb the move put on the wall. */
+    itemUuid: string;
+    origin: QueueMutationOrigin;
+    /** The last sequence applied when it was parked: did the session move it since? */
+    parkedAtSequence: number | undefined;
+    queueAdds: ClimbQueueItem[];
+  } | null>(null);
+  // Gives up a move still waiting for its re-send after MOVE_RESEND_WAIT_MS.
+  // Set only while moveResendRef holds that move.
+  const moveResendFallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The correlation id of the last move re-sent. moveResendRef is empty once
+  // the re-send is out, so this is what stops a second send of it.
+  const resentMoveCorrelationIdRef = useRef<string | null>(null);
+  useEffect(
+    () => () => {
+      if (moveResendFallbackTimerRef.current) clearTimeout(moveResendFallbackTimerRef.current);
+    },
+    [],
+  );
+  // The mutations factory is built before the failure handler exists, so its
+  // drained-failure hook reaches the handler through this ref.
+  // Returns whether it took over a lost queue-add, so the coalescer skips its own.
+  const handleSetCurrentClimbFailureRef = useRef<(error: unknown, failure: SetCurrentClimbFailure) => boolean>(
+    () => false,
+  );
+
   // The active board is the angle source of truth. Read it here so the
   // self-healing re-grade effect can compare each queued climb's display angle
   // to the live angle, and so inbound SessionBoardPathChanged events can write
@@ -304,6 +575,31 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   setActiveBoardRef.current = setActiveBoard;
   const stateRef = useRef(state);
   stateRef.current = state;
+  // Does the server hold this climb, as far as the lane knows? Called from a
+  // lane send, once every earlier send on the lane has landed: a climb here is
+  // there unless its lane add failed, and a climb gone from here is still there
+  // while its lane removal waits. Peers' changes are not seen, as with every
+  // send.
+  const isOnServer = useCallback((queueItemUuid: string, liveUuids: ReadonlySet<string>) => {
+    if (laneFailedAddUuidsRef.current.has(queueItemUuid)) return false;
+    return liveUuids.has(queueItemUuid) || laneUnsentRemovalUuidsRef.current.has(queueItemUuid);
+  }, []);
+  // Where `uuid` sits on the SERVER, read off `order`, an order this phone had
+  // when the climber acted: the climbs ahead of it that the server holds now.
+  // A climb removed since went straight out, so the server has dropped it too.
+  // -1 when `uuid` is not in `order`.
+  const serverIndexIn = useCallback(
+    (order: readonly ClimbQueueItem[], uuid: string): number => {
+      const liveUuids = new Set(stateRef.current.queue.map((queueItem) => queueItem.uuid));
+      let index = 0;
+      for (const queueItem of order) {
+        if (queueItem.uuid === uuid) return index;
+        if (isOnServer(queueItem.uuid, liveUuids)) index += 1;
+      }
+      return -1;
+    },
+    [isOnServer],
+  );
   // Playlist suggestion source lives in provider state, NOT the reducer: the
   // reducer clears its suggestion field on full server syncs (INITIAL_QUEUE_DATA
   // / UPDATE_QUEUE), which would wipe the source the moment activation
@@ -361,18 +657,34 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // to a climb on the list and the track is live again.
   const currentClimbItemForSource = state.currentClimbQueueItem;
   const currentClimbForSource = currentClimbItemForSource?.climb;
+  const boardSuggestionCompatibilityCache = useMemo(createBoardSuggestionCompatibilityCache, []);
+  const anchoredSourceForBoard = useMemo(
+    () => anchoredSuggestionSource(rawPlaylistSuggestionSource, currentClimbItemForSource),
+    [rawPlaylistSuggestionSource, currentClimbItemForSource],
+  );
+  // Resolve the target each render: catalogue targets are stable, while spray
+  // resets/grant changes produce a new target through the registry's token.
+  const suggestionCompatibilityTarget =
+    anchoredSourceForBoard && activeBoard && anchoredSourceForBoard.boardKey === activeBoardKey
+      ? getPlaylistRenderBoardTarget({
+          boardName: activeBoard.boardType,
+          layoutId: activeBoard.layoutId,
+          sizeId: activeBoard.sizeId,
+          setIds: activeBoard.setIds,
+          angle: activeBoard.angle,
+        })
+      : null;
+  const suggestionCredentialEpoch = getCredentialGeneration();
   const playlistSuggestionSource = useMemo(() => {
-    const anchored = anchoredSuggestionSource(rawPlaylistSuggestionSource, currentClimbItemForSource);
+    const anchored = anchoredSourceForBoard;
     if (!anchored || !activeBoard || activeBoardKey == null) return anchored;
     if (anchored.boardKey !== activeBoardKey) return null;
-    const target = getPlaylistRenderBoardTarget({
-      boardName: activeBoard.boardType,
-      layoutId: activeBoard.layoutId,
-      sizeId: activeBoard.sizeId,
-      setIds: activeBoard.setIds,
-      angle: activeBoard.angle,
-    });
-    const normalized = normalizeBoardSuggestionSource(anchored, (climb) => canAddClimbToBoard(climb, target).ok);
+    if (!suggestionCompatibilityTarget) return anchored;
+    const normalized = boardSuggestionCompatibilityCache.normalize(
+      anchored,
+      suggestionCompatibilityTarget,
+      suggestionCredentialEpoch,
+    );
     // Old mixed snapshots can also have a foreign current climb. Preserve its
     // position as an anchor, never as a successor, so the surviving list is reachable.
     if (
@@ -391,7 +703,15 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       });
     }
     return normalized;
-  }, [rawPlaylistSuggestionSource, activeBoard, activeBoardKey, currentClimbItemForSource, currentClimbForSource]);
+  }, [
+    anchoredSourceForBoard,
+    activeBoard,
+    activeBoardKey,
+    currentClimbForSource,
+    boardSuggestionCompatibilityCache,
+    suggestionCompatibilityTarget,
+    suggestionCredentialEpoch,
+  ]);
   const playlistSuggestionSourceRef = useRef<PlaylistSuggestionSource | null>(null);
   playlistSuggestionSourceRef.current = playlistSuggestionSource;
 
@@ -444,7 +764,73 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // ref because the joinTracker is memoized once (empty deps) and its execute
   // closure must read the latest value — mirrors web's usernameRef/avatarUrlRef
   // in persistent-session/hooks/session-connection-ports.ts.
-  const { profile: partyProfile, username: partyUsername, avatarUrl: partyAvatarUrl } = usePartyProfile();
+  const {
+    username: partyUsername,
+    avatarUrl: partyAvatarUrl,
+    authenticatedUserId,
+    isAuthenticated,
+  } = usePartyProfile();
+  const previousAuthentication = lastObservedAuthenticationRef.current;
+  const lastKnownAuthenticatedUserId = lastKnownAuthenticatedUserIdRef.current;
+  if (previousAuthentication !== null && previousAuthentication !== isAuthenticated) {
+    resetQueueMutationLane();
+  }
+  if (isAuthenticated && authenticatedUserId) {
+    if (lastKnownAuthenticatedUserId && lastKnownAuthenticatedUserId !== authenticatedUserId) {
+      resetQueueMutationLane();
+    }
+    lastKnownAuthenticatedUserIdRef.current = authenticatedUserId;
+    authenticatedUserIdRef.current = authenticatedUserId;
+  } else if (isAuthenticated) {
+    // Profile queries can briefly go empty during a same-account refresh. Keep
+    // the last stable identity so ordinary token/profile refreshes don't look
+    // like an account switch.
+    authenticatedUserIdRef.current = lastKnownAuthenticatedUserIdRef.current;
+  } else {
+    lastKnownAuthenticatedUserIdRef.current = null;
+    authenticatedUserIdRef.current = null;
+  }
+  lastObservedAuthenticationRef.current = isAuthenticated;
+  const subscribeToQueuePrivacy = useCallback(
+    (notify: () => void) =>
+      subscribeToCredentialChanges(() => {
+        // Imperative readers and delayed mutation callbacks must lose the copied
+        // payload before React's next commit. Keep list order and current selection.
+        resetQueueMutationLane();
+        invalidateStoredQueueSnapshot();
+        const snapshot = { ...sanitizeQueueSnapshot(stateRef.current), currentChangedBy: null };
+        attributionServerRef.current = false;
+        stateRef.current = snapshot;
+        playlistSuggestionSourceRef.current = null;
+        boardSuggestionCompatibilityCache.clear();
+        pendingUnsyncedCurrentRef.current = null;
+        dispatch({ type: 'UPDATE_QUEUE', payload: snapshot });
+        setPlaylistSuggestionSourceState(null);
+        setLiveStats(null);
+        setSessionRuntimeState(createEmptySessionRuntimeState());
+        notify();
+      }),
+    [resetQueueMutationLane, boardSuggestionCompatibilityCache],
+  );
+  const credentialGeneration = useSyncExternalStore(
+    subscribeToQueuePrivacy,
+    getCredentialGeneration,
+    getCredentialGeneration,
+  );
+  const undoScopeIdentity = JSON.stringify([
+    sessionId,
+    activeBoardKey,
+    isAuthenticated,
+    authenticatedUserIdRef.current,
+  ]);
+  const undoScopeIdentityRef = useRef({ identity: undoScopeIdentity, revision: 0 });
+  if (undoScopeIdentityRef.current.identity !== undoScopeIdentity) {
+    undoScopeIdentityRef.current = { identity: undoScopeIdentity, revision: undoScopeIdentityRef.current.revision + 1 };
+  }
+  // A switch away and back still retires an already queued Undo.
+  const undoScope = JSON.stringify([undoScopeIdentity, undoScopeIdentityRef.current.revision, credentialGeneration]);
+  const undoScopeRef = useRef(undoScope);
+  undoScopeRef.current = undoScope;
   const identityRef = useRef<{ username: string | undefined; avatarUrl: string | undefined }>({
     username: partyUsername,
     avatarUrl: partyAvatarUrl,
@@ -456,12 +842,15 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   const announcedIdentityRef = useRef<{ username: string | undefined; avatarUrl: string | undefined } | null>(null);
 
   // The attribution this device stamps onto a queue item IT introduces, or null
-  // while signed out / before the party profile resolves. Assigned during render
+  // while signed out / before the authenticated account profile resolves.
+  // Assigned during render
   // (same pattern as identityRef) so the queue callbacks — memoized on
   // `mutations`, not on identity — always read the latest.
   //
-  // Requires BOTH a profile id and a non-empty username: an anonymous phone must
-  // not push a blank-named avatar onto every peer's queue row.
+  // Backend privacy checks resolve addedByUser.id against users.id. The device
+  // party-profile UUID is only local identity and must never author queue rows.
+  // Wait for the signed-in account ID and a non-blank display name; do not borrow
+  // a remembered account or device ID during hydration or sign-out.
   //
   // Assigned during render, so there is a window between a session join landing
   // a new `clientId` and the next render where a stamp would carry
@@ -470,10 +859,10 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // clientId field is absent. Same trade the other during-render refs here make.
   const selfAttributionRef = useRef<QueueItemAttribution | null>(null);
   selfAttributionRef.current =
-    partyProfile?.id && partyUsername
+    isAuthenticated && authenticatedUserId && partyUsername?.trim()
       ? {
           addedBy: sessionRuntimeStateRef.current.clientId || null,
-          addedByUser: { id: partyProfile.id, username: partyUsername, avatarUrl: partyAvatarUrl ?? null },
+          addedByUser: { id: authenticatedUserId, username: partyUsername, avatarUrl: partyAvatarUrl ?? null },
         }
       : null;
 
@@ -517,10 +906,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   const reachableBoardKeys = useReachableBoardKeys(activeBoard);
   // One stable identity per roster, because this feeds the forward-selection
   // memo that decides the next swipe target.
-  const isReachableClimb = useMemo(() => {
-    if (reachableBoardKeys.size === 0) return undefined;
-    return (climb: Climb) => isClimbOnReachableBoard(climb, reachableBoardKeys);
-  }, [reachableBoardKeys]);
+  const isReachableClimb = useMemo(() => reachableClimbPredicate(reachableBoardKeys), [reachableBoardKeys]);
   const isReachableClimbRef = useRef(isReachableClimb);
   isReachableClimbRef.current = isReachableClimb;
   const reachableBoardKeysRef = useRef(reachableBoardKeys);
@@ -541,57 +927,17 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // does not itself TRIGGER the capability probe. In practice that never
   // matters: a board is always rendering (list thumbnails, the play view)
   // well before a climb becomes "active" here, and that render is what starts
-  // the probe. `renderSettingsPending` below covers the cold-start window
-  // where it hasn't answered yet.
-  const { settings: boardRenderSettings, loaded: boardRenderSettingsLoaded } = useBoardRenderSettings();
+  // the probe.
+  const { settings: boardRenderSettings } = useBoardRenderSettings();
   const boardseshSupportTick = useSyncExternalStore(
     subscribeToBoardseshSupport,
     getBoardseshSupportRevision,
     getBoardseshSupportRevision,
   );
-  const { effectiveRenderSettings, renderSettingsPending } = useMemo(() => {
+  const effectiveRenderSettings = useMemo(() => {
     void boardseshSupportTick;
-    const rendererSupport = getBoardseshRendererSupport();
-    return {
-      effectiveRenderSettings: resolveEffectiveRenderSettings(boardRenderSettings, rendererSupport === true),
-      // "We cannot yet say which drawing this climber is looking at." Two
-      // sources, both cold-start-only and both self-clearing:
-      //  - the climber's own stored settings haven't come back from
-      //    AsyncStorage, so a stored `boardsesh` still reads as `default`;
-      //  - the mode being asked for IS `boardsesh` but the capability probe
-      //    has not answered (`null`), which resolves to `classic` for safety.
-      // Reported on `Board Render Failed` and the board-look step events, so a
-      // render whose mode is still unresolved would be filed under the wrong
-      // drawing — the screenshot log below waits this out for the same reason.
-      renderSettingsPending:
-        !boardRenderSettingsLoaded ||
-        (rendererSupport === null && requestedBoardRenderMode(boardRenderSettings) === 'aura'),
-    };
-  }, [boardRenderSettings, boardRenderSettingsLoaded, boardseshSupportTick]);
-  // Screenshot builds: state which drawing the capture is actually going to get.
-  // The probe can veto Aura on a binary too old to draw it, and the fallback is
-  // silent — without this line a whole store set comes back in the classic look
-  // and nobody notices until the listing is live.
-  // `findScreenshotRenderProblems` (scripts/mobile-screenshots.ts) reads this out
-  // of the captured log and fails the run. Dead-strips in normal builds.
-  //
-  // Deduped on the message rather than latched to the first one: if anything ever
-  // moved the resolved mode after the first settled frame, latching would leave
-  // the log describing a drawing the capture didn't use, and the gate reads every
-  // one of these lines — so a late change has to be able to produce a second.
-  const lastLoggedRenderMode = useRef<string | null>(null);
-  useEffect(() => {
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE !== '1') return;
-    if (renderSettingsPending) return;
-    const probe = getBoardseshRendererSupport();
-    const message =
-      `[screenshot] render mode: ${effectiveRenderSettings.mode} ` +
-      `(requested ${requestedBoardRenderMode(boardRenderSettings)}, ` +
-      `probe ${probe === null ? 'unanswered' : probe ? 'ok' : 'unavailable'})`;
-    if (message === lastLoggedRenderMode.current) return;
-    lastLoggedRenderMode.current = message;
-    console.log(message);
-  }, [effectiveRenderSettings, renderSettingsPending, boardRenderSettings]);
+    return resolveEffectiveRenderSettings(boardRenderSettings, getBoardseshRendererSupport() === true);
+  }, [boardRenderSettings, boardseshSupportTick]);
 
   // Registered as PostHog super properties so every board-render event —
   // `Board Render Failed`, the board-look step pair — reads the same resolved
@@ -617,12 +963,25 @@ export function QueueProvider({ children }: { children: ReactNode }) {
           return buildSessionBoardPath(activeBoard);
         },
         execute: async ({ sessionId: sid, boardPath }) => {
+          const joinCredentialGeneration = getCredentialGeneration();
           // Snapshot identity at the moment we build the payload. If the profile
           // resolves while JOIN is in flight, we must record the values we
           // actually sent — not identityRef.current's newer ones — so the
           // re-announce effect still fires UPDATE_USERNAME for the new identity.
           const sentIdentity = { username: identityRef.current.username, avatarUrl: identityRef.current.avatarUrl };
-          const result = await execute<{
+          // F3: probe this connection before the join, and fix the session's
+          // mode for it. The tracker re-runs this on every reconnect (a deploy
+          // or rollback drops the socket), so a rolled-back backend is caught
+          // there. With the flag off nothing is probed and the mode is legacy.
+          // The probe and the join both read the live client (#6766): one read
+          // before an await can be disposed by the time the send goes out.
+          const capabilities = await probeQueueServerCapabilities(getWsClient);
+          attributionServerRef.current = capabilities.attribution;
+          const nowSlotServer = nowSlotFlagRef.current ? capabilities.nowSlot : null;
+          nowSlotServerRef.current = nowSlotServer;
+          if (nowSlotServer !== null) reportQueueServerProbe(nowSlotServer, 'probe');
+          setNowSlotMode(nowSlotFlagRef.current && nowSlotServer === true);
+          type JoinSessionResponse = {
             joinSession?: {
               participantId?: string | null;
               clientId?: string | null;
@@ -631,15 +990,32 @@ export function QueueProvider({ children }: { children: ReactNode }) {
               boardPath?: string | null;
               users?: SessionUser[] | null;
             };
-          }>(getWsClient(), {
-            query: JOIN_SESSION,
-            variables: {
-              sessionId: sid,
-              boardPath,
-              username: sentIdentity.username,
-              avatarUrl: sentIdentity.avatarUrl,
-            },
-          });
+          };
+          const joinVariables = {
+            sessionId: sid,
+            boardPath,
+            username: sentIdentity.username,
+            avatarUrl: sentIdentity.avatarUrl,
+          };
+          const runJoin = (query: string) =>
+            execute<JoinSessionResponse>(getWsClient, { query, variables: joinVariables });
+          let result: JoinSessionResponse;
+          if (nowSlotModeRef.current) {
+            try {
+              result = await runJoin(JOIN_SESSION_NOW_SLOT);
+            } catch (joinError) {
+              // The narrow fallback (section 2): a backend that answered the
+              // probe but rejects the document marks this connection legacy.
+              if (!isNowSlotValidationError(joinError)) throw joinError;
+              nowSlotServerRef.current = false;
+              reportQueueServerProbe(false, 'validation-error');
+              setNowSlotMode(false);
+              result = await runJoin(JOIN_SESSION);
+            }
+          } else {
+            result = await runJoin(JOIN_SESSION);
+          }
+          if (joinCredentialGeneration !== getCredentialGeneration()) throw new Error('Queue authorization changed');
           // Remember what we announced so the re-announce effect only fires if
           // the identity changes after this join (profile loaded late / edited).
           announcedIdentityRef.current = sentIdentity;
@@ -668,12 +1044,17 @@ export function QueueProvider({ children }: { children: ReactNode }) {
           return result;
         },
       }),
-    [],
+    [setNowSlotMode],
   );
   const ensureJoined = useCallback(
     (sessionIdToJoin: string) => joinTracker.ensureJoined(sessionIdToJoin),
     [joinTracker],
   );
+  // A join belongs to the connection it ran on. The realtime engine bumps the
+  // epoch on closes of the client it is bound to, but a mutation's
+  // `ensureJoined` can run while the engine is parked and bound to nothing.
+  // Every end of the shared connection retires the cached join.
+  useEffect(() => subscribeWsConnectionEnded(() => joinTracker.bumpEpoch()), [joinTracker]);
 
   // Re-announce identity to the session when it changes after we've joined.
   // JOIN_SESSION already carries the profile in the common case; this covers the
@@ -688,7 +1069,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     const announced = announcedIdentityRef.current;
     if (announced && announced.username === partyUsername && announced.avatarUrl === partyAvatarUrl) return;
     const pending = { username: partyUsername, avatarUrl: partyAvatarUrl };
-    void execute(getWsClient(), { query: UPDATE_USERNAME, variables: pending })
+    void execute(getWsClient, { query: UPDATE_USERNAME, variables: pending })
       .then(() => {
         announcedIdentityRef.current = pending;
       })
@@ -715,6 +1096,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   useEffect(() => () => coordinator.dispose(), [coordinator]);
 
   useEffect(() => {
+    if (sessionIdRef.current !== sessionId) resetQueueMutationLane();
     sessionIdRef.current = sessionId;
     // Backstop clear on any session change — start, join, leave, or a direct A→B
     // switch (#3868). The primary guard is the re-broadcast effect's synchronous
@@ -722,7 +1104,16 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     // this passive-effect clear can't fire before an already-pending re-broadcast
     // effect flushes, so it's defence-in-depth, not the race fix.
     pendingUnsyncedCurrentRef.current = null;
-  }, [sessionId]);
+  }, [resetQueueMutationLane, sessionId]);
+
+  // Solo, now-slot mode is the flag alone. In a session the join decides it
+  // (above), after its probe, so this leaves a live session's mode alone.
+  useEffect(() => {
+    if (sessionId) return;
+    nowSlotServerRef.current = null;
+    attributionServerRef.current = false;
+    setNowSlotMode(nowSlotFlagEnabled);
+  }, [nowSlotFlagEnabled, sessionId, setNowSlotMode]);
 
   // showToast and t aren't stable callbacks — capture via refs so the WS
   // subscription effect doesn't tear down & re-subscribe on locale change
@@ -789,6 +1180,16 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     // at or below the baseline and so is never resurrected. Null before the
     // first applied event — the server then keeps its legacy overwrite.
     getBaselineSequence: () => queueSyncGateRef.current?.getLastSequence() ?? null,
+    // F3: the `_NOW_SLOT` documents only in now-slot mode on a connection whose
+    // probe found the fields. Read at send time, after the join ran the probe.
+    shouldUseNowSlotDocuments: () => nowSlotModeRef.current && nowSlotServerRef.current === true,
+    // A validation error naming an F3 field (a rollback past the F3 backend with
+    // the request in flight): this connection is legacy until the next probe.
+    onNowSlotDocumentsRejected: () => {
+      nowSlotServerRef.current = false;
+      reportQueueServerProbe(false, 'validation-error');
+      setNowSlotMode(false);
+    },
     // Best-effort sync failures (coalescer drains for setCurrent / superseded
     // queue-adds) must not alarm: the local reducer already applied the change
     // and the WS subscription reconciles. Dev-log only — a user-facing "Action
@@ -805,6 +1206,21 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       if (action === 'setSessionBoardPath') {
         reportHandledError(error, { tags: { source: 'queue-sync', op: 'set-board-path' } });
       }
+    },
+    // A move that superseded an earlier one and then failed from the drain
+    // loop. Its caller never hears of it, so this is the only way to learn the
+    // climber's latest move missed the session (a reconnect, #6783 QA).
+    onSetCurrentClimbDrainError: (error, { item, shouldAddToQueue, correlationId }) => {
+      if (!item || !correlationId) return false;
+      const send = moveSendsRef.current.get(correlationId);
+      if (!send) return false;
+      return handleSetCurrentClimbFailureRef.current(error, {
+        item,
+        shouldAddToQueue: shouldAddToQueue === true,
+        correlationId,
+        ...send,
+        drained: true,
+      });
     },
   });
 
@@ -840,9 +1256,26 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     },
     [mutations],
   );
+  // F3: the line the solo save writes. Before the flag resolves the mode reads
+  // as legacy and keeps no line, so a save in that window writes the line the
+  // restore is holding for the mode instead of dropping it from disk.
+  const savedHistoryCount = useMemo(
+    () =>
+      state.historyCount ??
+      heldHistoryCount({
+        queue: state.queue,
+        currentClimbQueueItem: state.currentClimbQueueItem,
+        heldHistoryLine: state.heldHistoryLine,
+      }),
+    [state.historyCount, state.queue, state.currentClimbQueueItem, state.heldHistoryLine],
+  );
   // Solo-queue persistence: cold-start restore (explicit session first, then the
   // local snapshot) + the debounced solo snapshot save. See useQueuePersistence.
-  useQueuePersistence({
+  // `queueRestored` is the restore landing, for QueueRestoredContext.
+  const { restored: queueRestored } = useQueuePersistence({
+    authenticatedUserId,
+    identityReady: !isAuthenticated || !!authenticatedUserId,
+    credentialGeneration,
     dispatch,
     sessionIdRef,
     setSessionId,
@@ -850,6 +1283,9 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     sessionId,
     queue: state.queue,
     currentClimbQueueItem: state.currentClimbQueueItem,
+    historyCount: savedHistoryCount,
+    lastCurrentChange,
+    seedCurrentChange,
     playlistSuggestionSource,
     setPlaylistSuggestionSourceState,
     activeBoardSettled: !isActiveBoardPending,
@@ -864,13 +1300,13 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     stateRef,
     ensureJoined,
     setQueueMutation: mutations.setQueue,
+    nowSlotModeRef,
     seedFailedSessionIdRef,
     setSessionId,
     sessionIdRef,
+    onSessionContextChanging: resetQueueMutationLane,
     dispatch,
     setPlaylistSuggestionSourceState,
-    resyncInFlightRef,
-    resyncPendingRef,
     setActiveBoard,
     locallyEndingSessionIdRef,
     suppressedRemoteEndSessionIdRef,
@@ -887,118 +1323,173 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // local queue IS the source of truth). The fetch itself failing is swallowed:
   // we tried, the reducer keeps the optimistic state, and the next successful
   // mutation or reconnect FullSync reconciles. Returns whether a refresh ran.
-  const resyncQueueFromServer = useCallback(async (): Promise<boolean> => {
-    const activeSessionId = sessionIdRef.current;
-    if (!activeSessionId) return false;
-    if (resyncInFlightRef.current) {
-      // Coalesce-then-rerun-once: this request may reflect a mutation the
-      // in-flight fetch's snapshot predates (see resyncPendingRef). The
-      // `finally` below runs exactly one trailing fetch for the whole burst.
-      resyncPendingRef.current = true;
-      return false;
-    }
-    resyncInFlightRef.current = true;
-
-    // Fallback when the HTTP snapshot is unavailable: restart the joined WS
-    // subscriptions instead. The HTTP `session` query returns
-    // `queueState: null` for callers that fail the session-membership check,
-    // and anonymous HTTP callers ALWAYS fail it (membership lives on the WS
-    // connection, which HTTP requests don't carry) — so for anonymous
-    // participants this fetch can never succeed and gap/drift recovery would
-    // silently stop converging. The WS connection IS a member, and a
-    // resubscribe's guaranteed initial FullSync heals state and re-baselines
-    // the gate through the normal subscription path. At most one restart per
-    // resync request, and it can't loop: the restart itself never requests a
-    // resync, and clearing the pending flag stops the trailing rerun from
-    // chaining into another doomed fetch (the FullSync supersedes whatever
-    // that rerun could return anyway).
-    const fallbackToSubscriptionRestart = () => {
-      resyncPendingRef.current = false;
-      restartJoinedSubscriptionsRef.current?.();
-    };
-
-    try {
-      const response = await getHttpClient().request<GetSessionQueueStateQueryResponse>(GET_SESSION_QUEUE_STATE, {
-        sessionId: activeSessionId,
-      });
-      // The session may have ended (or we switched sessions) while the fetch was
-      // in flight — only apply when it's still the active one.
-      if (sessionIdRef.current !== activeSessionId) return false;
-      const queueState = response.session?.queueState;
-      if (!queueState) {
-        fallbackToSubscriptionRestart();
+  const resyncQueueFromServer = useCallback(
+    async (requestedOrigin: QueueMutationOrigin = captureQueueMutationOrigin()): Promise<boolean> => {
+      const origin = requestedOrigin;
+      const activeSessionId = origin.sessionId;
+      if (!activeSessionId || !isQueueMutationOriginCurrent(origin)) return false;
+      const originKey = queueMutationOriginKey(origin);
+      const existingFlight = resyncFlightsByOriginRef.current.get(originKey);
+      if (existingFlight) {
+        // This snapshot may predate another failure in the same origin. Coalesce
+        // it into one trailing read after this request settles.
+        existingFlight.pending = true;
         return false;
       }
-      // A slow snapshot can resolve AFTER a rejoin FullSync already
-      // re-baselined the gate to newer state — applying it would regress
-      // both the queue and the gate baseline backwards. Same server, so a
-      // higher sequence is strictly fresher: skip the apply/re-baseline and
-      // report success (the newer FullSync already did the refreshing). A
-      // pending trailing rerun still runs — it fetches a fresh snapshot that
-      // passes this guard, covering a resync requested after that FullSync.
-      const lastTrackedSequence = queueSyncGateRef.current?.getLastSequence() ?? -1;
-      if (queueState.sequence < lastTrackedSequence) {
-        if (__DEV__) {
-          console.info(
-            '[queue] skipping stale resync snapshot',
-            `snapshot=${queueState.sequence} tracked=${lastTrackedSequence}`,
-          );
+      const flight: QueueResyncFlight = { pending: false };
+      resyncFlightsByOriginRef.current.set(originKey, flight);
+      const ownsFlight = () => resyncFlightsByOriginRef.current.get(originKey) === flight;
+      const mayApplyResult = () => ownsFlight() && isQueueMutationOriginCurrent(origin);
+
+      // Fallback when the HTTP snapshot is unavailable: restart the joined WS
+      // subscriptions instead. The HTTP `session` query returns
+      // `queueState: null` for callers that fail the session-membership check,
+      // and anonymous HTTP callers ALWAYS fail it (membership lives on the WS
+      // connection, which HTTP requests don't carry) — so for anonymous
+      // participants this fetch can never succeed and gap/drift recovery would
+      // silently stop converging. The WS connection IS a member, and a
+      // resubscribe's guaranteed initial FullSync heals state and re-baselines
+      // the gate through the normal subscription path. At most one restart per
+      // resync request, and it can't loop: the restart itself never requests a
+      // resync, and clearing the pending flag stops the trailing rerun from
+      // chaining into another doomed fetch (the FullSync supersedes whatever
+      // that rerun could return anyway).
+      const fallbackToSubscriptionRestart = () => {
+        if (!mayApplyResult()) return;
+        flight.pending = false;
+        restartJoinedSubscriptionsRef.current?.();
+      };
+
+      try {
+        // F3: in now-slot mode the snapshot carries the line, so a resync with
+        // nothing current keeps History as History. A backend that rejects the
+        // document falls back to today's, like every other `_NOW_SLOT` request.
+        const requestSnapshot = async (nowSlot: boolean) => {
+          const legacyDocument = nowSlot ? GET_SESSION_QUEUE_STATE_NOW_SLOT : GET_SESSION_QUEUE_STATE;
+          if (!attributionServerRef.current) {
+            return getHttpClient().request<GetSessionQueueStateQueryResponse>(legacyDocument, {
+              sessionId: activeSessionId,
+            });
+          }
+          try {
+            return await getHttpClient().request<GetSessionQueueStateQueryResponse>(
+              buildSessionQueueStateQuery({ nowSlot, attribution: true }),
+              { sessionId: activeSessionId },
+            );
+          } catch (snapshotError) {
+            if (!mayApplyResult() || !isAttributionValidationError(snapshotError)) throw snapshotError;
+            // HTTP can land on an older replica than the WebSocket probe.
+            // Disable only attribution, preserving the independent now-slot mode.
+            attributionServerRef.current = false;
+            return getHttpClient().request<GetSessionQueueStateQueryResponse>(legacyDocument, {
+              sessionId: activeSessionId,
+            });
+          }
+        };
+        let response: GetSessionQueueStateQueryResponse;
+        if (nowSlotModeRef.current && nowSlotServerRef.current === true) {
+          try {
+            response = await requestSnapshot(true);
+          } catch (snapshotError) {
+            if (!isNowSlotValidationError(snapshotError)) throw snapshotError;
+            // Same bookkeeping as a rejected mutation: this connection is legacy
+            // until the next probe, so the snapshot below (no line) lands in a
+            // legacy reducer instead of reading as "History is empty".
+            nowSlotServerRef.current = false;
+            reportQueueServerProbe(false, 'validation-error');
+            setNowSlotMode(false);
+            response = await requestSnapshot(false);
+          }
+        } else {
+          response = await requestSnapshot(false);
         }
+        // Account, room or queue intent can change while the HTTP request waits.
+        // Check the captured origin before any state, sync-gate or fallback effect.
+        if (!mayApplyResult()) return false;
+        const queueState = response.session?.queueState;
+        if (!queueState) {
+          fallbackToSubscriptionRestart();
+          return false;
+        }
+        // A slow snapshot can resolve AFTER a rejoin FullSync already
+        // re-baselined the gate to newer state — applying it would regress
+        // both the queue and the gate baseline backwards. Same server, so a
+        // higher sequence is strictly fresher: skip the apply/re-baseline and
+        // report success (the newer FullSync already did the refreshing). A
+        // pending trailing rerun still runs — it fetches a fresh snapshot that
+        // passes this guard, covering a resync requested after that FullSync.
+        const lastTrackedSequence = queueSyncGateRef.current?.getLastSequence() ?? -1;
+        if (queueState.sequence < lastTrackedSequence) {
+          if (__DEV__) {
+            console.info(
+              '[queue] skipping stale resync snapshot',
+              `snapshot=${queueState.sequence} tracked=${lastTrackedSequence}`,
+            );
+          }
+          return true;
+        }
+        // The authoritative snapshot resets the current climb — drop any deferred
+        // re-broadcast (#3868) so a late hydrate can't re-assert a climb the server
+        // no longer has as current.
+        if (!mayApplyResult()) return false;
+        pendingUnsyncedCurrentRef.current = null;
+        // The server's own queue replaces ours, so a failed add it is missing
+        // is missing here too, and one it did take is no longer a gap.
+        laneFailedAddUuidsRef.current.clear();
+        dispatch({
+          type: 'INITIAL_QUEUE_DATA',
+          serverSequence: queueState.sequence,
+          payload: {
+            queue: queueState.queue.map(toClimbQueueItem),
+            currentClimbQueueItem: queueState.currentClimbQueueItem
+              ? toClimbQueueItem(queueState.currentClimbQueueItem)
+              : null,
+            // A server snapshot of this room: the reducer keeps a move of ours
+            // the snapshot predates instead of putting the wall back.
+            sessionId: activeSessionId,
+            historyCount: queueState.historyCount ?? null,
+            // The #4979 hold's clock reseeds from it, like a subscribe FullSync.
+            currentChangedAt: queueState.currentChangedAt ?? null,
+            currentChangedBy: queueState.currentChangedBy ?? null,
+          },
+        });
+        // Re-baseline the sync gate to this snapshot's authoritative
+        // sequence/hash — an HTTP resync applies state exactly like a
+        // reconnect FullSync (it replaces state with the server's current
+        // snapshot), so feed the gate a synthetic FullSync rather than
+        // `gate.reset()`. reset() would zero `lastSequence` back to null, and
+        // per evaluateIncoming a null lastSequence unconditionally applies the
+        // NEXT delta regardless of its sequence — so a stale/superseded event
+        // still in flight from before this resync could slip past the
+        // dedup/gap check and corrupt the just-fetched state. Feeding the real
+        // sequence/hash keeps that protection intact immediately.
+        queueSyncGateRef.current?.evaluateIncoming({
+          __typename: 'FullSync',
+          sequence: queueState.sequence,
+          stateHash: queueState.stateHash,
+          stateHashOrdered: queueState.stateHashOrdered ?? null,
+        });
         return true;
-      }
-      // The authoritative snapshot resets the current climb — drop any deferred
-      // re-broadcast (#3868) so a late hydrate can't re-assert a climb the server
-      // no longer has as current.
-      pendingUnsyncedCurrentRef.current = null;
-      dispatch({
-        type: 'INITIAL_QUEUE_DATA',
-        serverSequence: queueState.sequence,
-        payload: {
-          queue: queueState.queue.map(toClimbQueueItem),
-          currentClimbQueueItem: queueState.currentClimbQueueItem
-            ? toClimbQueueItem(queueState.currentClimbQueueItem)
-            : null,
-        },
-      });
-      // Re-baseline the sync gate to this snapshot's authoritative
-      // sequence/hash — an HTTP resync applies state exactly like a
-      // reconnect FullSync (it replaces state with the server's current
-      // snapshot), so feed the gate a synthetic FullSync rather than
-      // `gate.reset()`. reset() would zero `lastSequence` back to null, and
-      // per evaluateIncoming a null lastSequence unconditionally applies the
-      // NEXT delta regardless of its sequence — so a stale/superseded event
-      // still in flight from before this resync could slip past the
-      // dedup/gap check and corrupt the just-fetched state. Feeding the real
-      // sequence/hash keeps that protection intact immediately.
-      queueSyncGateRef.current?.evaluateIncoming({
-        __typename: 'FullSync',
-        sequence: queueState.sequence,
-        stateHash: queueState.stateHash,
-        stateHashOrdered: queueState.stateHashOrdered ?? null,
-      });
-      return true;
-    } catch (error) {
-      if (__DEV__) console.warn('[queue] resyncQueueFromServer failed', error);
-      reportHandledError(error, { tags: { source: 'queue-sync', op: 'resync' } });
-      // Same membership rationale as the null-queueState branch — an errored
-      // query can't reconcile anything, but a resubscribe's FullSync can.
-      // Skip when the session changed mid-flight (the new session effect owns
-      // its own subscriptions).
-      if (sessionIdRef.current === activeSessionId) {
+      } catch (error) {
+        if (!mayApplyResult()) return false;
+        if (__DEV__) console.warn('[queue] resyncQueueFromServer failed', error);
+        reportHandledError(error, { tags: { source: 'queue-sync', op: 'resync' } });
+        // Same membership rationale as the null-queueState branch — an errored
+        // query can't reconcile anything, but a resubscribe's FullSync can.
         fallbackToSubscriptionRestart();
+        return false;
+      } finally {
+        // Only the flight that still owns this origin may clear it or launch its
+        // coalesced retry. An older origin must not tear down a newer request.
+        if (ownsFlight()) {
+          const shouldRerun = flight.pending && isQueueMutationOriginCurrent(origin);
+          resyncFlightsByOriginRef.current.delete(originKey);
+          if (shouldRerun) void resyncQueueFromServerRef.current(origin);
+        }
       }
-      return false;
-    } finally {
-      resyncInFlightRef.current = false;
-      // Trailing rerun for requests coalesced during this fetch (exactly one
-      // — the rerun clears the flag before fetching, and anything that lands
-      // during the rerun re-queues behind it the same way).
-      if (resyncPendingRef.current) {
-        resyncPendingRef.current = false;
-        void resyncQueueFromServerRef.current();
-      }
-    }
-  }, []);
+    },
+    [captureQueueMutationOrigin, isQueueMutationOriginCurrent],
+  );
   const resyncQueueFromServerRef = useRef(resyncQueueFromServer);
   resyncQueueFromServerRef.current = resyncQueueFromServer;
 
@@ -1007,6 +1498,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // angle-follow, and the 60s hash watchdog. See useSessionRealtime.
   useSessionRealtime({
     authTransportRevision,
+    credentialGeneration,
     sessionId,
     dispatch,
     coordinator,
@@ -1017,6 +1509,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     stateRef,
     seedFailedSessionIdRef,
     reSeedQueueRef,
+    nowSlotModeRef,
     activeBoardRef,
     setActiveBoardRef,
     showToastRef,
@@ -1025,6 +1518,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     playbackEventListenersRef,
     unsubscribeRef,
     queueSyncGateRef,
+    queueStreamLiveRef,
     restartJoinedSubscriptionsRef,
     resyncQueueFromServerRef,
     setLiveStats,
@@ -1035,6 +1529,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     setParticipantId,
     locallyEndingSessionIdRef,
     suppressedRemoteEndSessionIdRef,
+    attributionServerRef,
   });
 
   // After a queue mutation fails in a party session, reconcile against the
@@ -1051,13 +1546,18 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // only yanked the climber off the boulder they just picked. When that
   // throttled call also carried a queue-add it recovers the content half
   // through recoverThrottledQueueAdd below — and falls back here if even that
-  // re-send fails. `reorderQueue` never reaches this path at all — it rolls
-  // back locally instead.
-  const resyncQueueAfterMutationFailure = useCallback(async () => {
-    if (!sessionIdRef.current) return;
-    const refreshed = await resyncQueueFromServerRef.current();
-    if (refreshed) showToast(t('mobile.queue.outOfSyncRefreshed'), 'error');
-  }, [showToast, t]);
+  // re-send fails. `reorderQueue` rolls back locally instead, and lands here
+  // only when the queue changed while its move waited on the lane.
+  const resyncQueueAfterMutationFailure = useCallback(
+    async (origin: QueueMutationOrigin) => {
+      if (!origin.sessionId || !isQueueMutationOriginCurrent(origin)) return;
+      const refreshed = await resyncQueueFromServerRef.current(origin);
+      if (refreshed && isQueueMutationOriginCurrent(origin)) {
+        showToast(t('mobile.queue.outOfSyncRefreshed'), 'error');
+      }
+    },
+    [isQueueMutationOriginCurrent, showToast, t],
+  );
 
   // Failure handler for the four queue-CONTENT mutations (add/remove/clear/setQueue).
   // A throttled one shows TWO toasts by design (#3929): the pacing hint now, and
@@ -1066,11 +1566,12 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // Not showQueueMutationErrorToast: that also fires `actionFailed` on every
   // non-throttle error, and these syncs must stay silent when offline (#2763).
   const reconcileFailedContentMutation = useCallback(
-    (error: unknown) => {
-      if (sessionIdRef.current && isRateLimitedError(error)) showToast(t('mobile.queue.rateLimited'), 'error');
-      void resyncQueueAfterMutationFailure();
+    (error: unknown, origin: QueueMutationOrigin) => {
+      if (!isQueueMutationOriginCurrent(origin)) return;
+      if (origin.sessionId && isRateLimitedError(error)) showToast(t('mobile.queue.rateLimited'), 'error');
+      void resyncQueueAfterMutationFailure(origin);
     },
-    [resyncQueueAfterMutationFailure, showToast, t],
+    [isQueueMutationOriginCurrent, resyncQueueAfterMutationFailure, showToast, t],
   );
 
   const confirmClimbOnWall = useCallback((climbUuid: string) => mutations.confirmClimbOnWall(climbUuid), [mutations]);
@@ -1082,16 +1583,22 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // handler — no need to set isSessionWallLit here.
   const reportWallDisconnect = useCallback(() => mutations.reportWallDisconnect(), [mutations]);
 
+  const climbReads = useQueueClimbReads({ activeBoard, credentialGeneration });
+
   // Self-healing re-grade: refetch angle-specific grades for queued climbs and
   // the displayed playlist peek whenever the active angle drifts. See useQueueRegrade.
   useQueueRegrade({
+    credentialGeneration,
     activeBoard,
     queue: state.queue,
+    historyCount: state.historyCount,
     currentClimbQueueItem: state.currentClimbQueueItem,
     playlistSuggestionSourceRef,
     playlistSuggestionSource,
+    rawPlaylistSuggestionSource,
     dispatch,
     setPlaylistSuggestionSourceState,
+    climbReads,
   });
 
   // Self-healing resolve: a partially-synced peer item (or a snapshot restored
@@ -1099,7 +1606,15 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // Re-fetch it by uuid at the live angle and patch it in place so the row shows
   // the real name/grade/thumbnail instead of an "Unknown Climb" placeholder. See
   // useQueueResolveClimbs (#2527).
-  useQueueResolveClimbs({ activeBoard, queue: state.queue, dispatch });
+  useQueueResolveClimbs({
+    activeBoard,
+    queue: state.queue,
+    historyCount: state.historyCount,
+    currentClimbQueueItem: state.currentClimbQueueItem,
+    credentialGeneration,
+    dispatch,
+    climbReads,
+  });
 
   // The reducer raises `needsResync` when it filters corrupted (null) items out
   // of a server FullSync/UPDATE_QUEUE — the local queue is now known-stale.
@@ -1116,6 +1631,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // safe to run after an await on the cross-board prompt.
   const commitQueueAdd = useCallback(
     (rawItem: ClimbQueueItem, placement: QueueAddPlacement = 'end') => {
+      const origin = captureQueueMutationOrigin();
       // Whoever tapped "add" owns this climb — stamp identity before the dispatch
       // so the local queue and the broadcast carry the same object (#3995).
       const item = attributeNewItem(rawItem);
@@ -1124,9 +1640,14 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       // can't leave the position stale. The same number then goes to the local
       // dispatch AND the broadcast, so this client and its peers can't disagree
       // about where the climb landed. `undefined` means append.
+      const queueBeforeAdd = stateRef.current.queue;
       const position =
         placement === 'next'
-          ? playNextInsertPosition(stateRef.current.queue, stateRef.current.currentClimbQueueItem)
+          ? playNextInsertPosition(
+              queueBeforeAdd,
+              stateRef.current.currentClimbQueueItem,
+              stateRef.current.historyCount,
+            )
           : undefined;
       // Optimistic local dispatch is the source of truth for the user's queue.
       // The server echoes this item via the WS subscription, but
@@ -1154,16 +1675,51 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       // never a peer placeholder. The re-broadcast vectors that need guarding are
       // setCurrentClimb (next/previousClimb can land on an unhydrated peer item)
       // and setQueue (whole-queue replace) — see #2527.
-      mutations.addQueueItem(item, position).catch((error) => {
+      const reconcileFailedAdd = (error: unknown) => {
+        if (!isQueueMutationOriginCurrent(origin)) return;
         if (__DEV__) console.warn('[queue] addQueueItem sync failed', error);
         // In a party session the add never reached peers — reconcile against the
         // server so this client doesn't silently diverge. Solo is a true no-op.
-        reconcileFailedContentMutation(error);
-      });
+        reconcileFailedContentMutation(error, origin);
+      };
+      if (position === undefined) {
+        // An append commutes with every other queued write, so it goes now.
+        mutations.addQueueItem(item, position).catch(reconcileFailedAdd);
+      } else {
+        // A positional add does not: its index counts climbs this phone has
+        // queued but may not have sent yet. A Play next swiped while a
+        // whole-list Play next is still draining would otherwise land among the
+        // list's climbs on the server, and the hash watchdog would then copy
+        // that order back here. Waiting on the serial lane sends it after them.
+        // Its slot is re-read at send time too: a climb ahead of it that the
+        // climber removed while it waited is already gone from the server.
+        const queueWithAdd = [...queueBeforeAdd.slice(0, position), item, ...queueBeforeAdd.slice(position)];
+        void enqueueQueueMutation(async () => {
+          if (!isQueueMutationOriginCurrent(origin)) return;
+          // Removed while it waited: sending now would bring it back for the crew.
+          if (mutations.wasUuidExplicitlyRemoved(item.uuid)) return;
+          try {
+            await mutations.addQueueItem(item, serverIndexIn(queueWithAdd, item.uuid));
+            laneFailedAddUuidsRef.current.delete(item.uuid);
+          } catch (error) {
+            if (isQueueMutationOriginCurrent(origin)) laneFailedAddUuidsRef.current.add(item.uuid);
+            reconcileFailedAdd(error);
+          }
+        });
+      }
       // Surface the "Climb added to queue · Open" snackbar for every add path.
       showQueueAddedSnackbar({ kind: placement === 'next' ? 'playNext' : 'added' });
     },
-    [attributeNewItem, mutations, reconcileFailedContentMutation, showQueueAddedSnackbar],
+    [
+      attributeNewItem,
+      captureQueueMutationOrigin,
+      enqueueQueueMutation,
+      isQueueMutationOriginCurrent,
+      mutations,
+      reconcileFailedContentMutation,
+      serverIndexIn,
+      showQueueAddedSnackbar,
+    ],
   );
 
   /**
@@ -1177,6 +1733,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
    */
   const addToQueue = useCallback(
     async (rawItem: ClimbQueueItem, options?: { placement?: QueueAddPlacement }): Promise<'added' | 'cancelled'> => {
+      if (credentialGeneration !== getCredentialGeneration()) return 'cancelled';
       const activeBoard = activeBoardRef.current;
       const activeConfig = toActiveBoardCompatibilityConfig(activeBoard);
       // `stateRef.current` is reassigned during render, so between a dispatch
@@ -1203,7 +1760,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
           climbLayoutId: decision.climbLayoutId,
           activeBoardName: activeBoard?.boardType,
         });
-        if (result.outcome === 'cancel') return 'cancelled';
+        if (credentialGeneration !== getCredentialGeneration() || result.outcome === 'cancel') return 'cancelled';
         if (result.outcome === 'switch') {
           // The queue followed them onto the new board, so peers must too — a
           // local-only switch would leave the session's board path (and every
@@ -1224,11 +1781,12 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       commitQueueAdd(rawItem, options?.placement ?? 'end');
       return 'added';
     },
-    [commitQueueAdd, requestCrossBoardAdd, setSessionBoardPath],
+    [commitQueueAdd, requestCrossBoardAdd, setSessionBoardPath, credentialGeneration],
   );
 
   const removeFromQueue = useCallback(
     (uuid: string) => {
+      const origin = captureQueueMutationOrigin();
       const removedItem = stateRef.current.queue.find((queueItem) => queueItem.uuid === uuid);
       // Same best-effort model as addToQueue: the reducer already removed the
       // item locally; the server mutation only syncs it to an existing session
@@ -1247,55 +1805,241 @@ export function QueueProvider({ children }: { children: ReactNode }) {
         removedBy: 'self',
       });
       mutations.removeQueueItem(uuid).catch((error) => {
+        if (!isQueueMutationOriginCurrent(origin)) return;
         if (__DEV__) console.warn('[queue] removeQueueItem sync failed', error);
         // The remove never reached peers in a party session — reconcile so the
         // dropped item doesn't linger on peers (or come back here). Solo no-ops.
-        reconcileFailedContentMutation(error);
+        reconcileFailedContentMutation(error, origin);
       });
     },
-    [mutations, reconcileFailedContentMutation],
+    [captureQueueMutationOrigin, isQueueMutationOriginCurrent, mutations, reconcileFailedContentMutation],
   );
 
   const reorderQueue = useCallback(
     (uuid: string, oldIndex: number, newIndex: number, options?: { source?: QueueReorderSource }) => {
-      // Optimistic local reorder; the reducer re-validates uuid-at-oldIndex so
-      // the server's QueueReordered echo is a safe no-op.
+      const origin = captureQueueMutationOrigin();
       const previousQueue = stateRef.current.queue;
       const previousCurrent = stateRef.current.currentClimbQueueItem;
-      dispatch({ type: 'DELTA_REORDER_QUEUE_ITEM', payload: { uuid, oldIndex, newIndex } });
+      const previousHistoryCount = stateRef.current.historyCount;
+      // The reducer re-validates uuid-at-oldIndex and ignores a move that fails
+      // it. Nothing moved here then, so nothing goes to the crew either.
+      if (
+        oldIndex < 0 ||
+        newIndex < 0 ||
+        oldIndex >= previousQueue.length ||
+        newIndex >= previousQueue.length ||
+        previousQueue[oldIndex].uuid !== uuid
+      ) {
+        return;
+      }
+      // F3: with nothing current, an Up next entry dragged above the line is
+      // held at the head of Up next (the rule the resolver applies too). The
+      // clamped index is the move made here, so the indexes read off it for the
+      // server below describe the same move.
+      const targetIndex = nowSlotModeRef.current
+        ? (reorderAcrossLine(stateRef.current, oldIndex, newIndex)?.newIndex ?? newIndex)
+        : newIndex;
+      const reorderedQueue = [...previousQueue];
+      const [movedItem] = reorderedQueue.splice(oldIndex, 1);
+      reorderedQueue.splice(targetIndex, 0, movedItem);
+      // Optimistic local reorder. While this phone is in step with the server,
+      // the QueueReordered echo is a no-op thanks to the same uuid-at-oldIndex
+      // check. When its indexes were stale, the server sends a FullSync of its
+      // own order instead (#6792).
+      dispatch({ type: 'DELTA_REORDER_QUEUE_ITEM', payload: { uuid, oldIndex, newIndex: targetIndex } });
       track(SHARED_EVENTS.QueueReordered, {
         boardName: activeBoardRef.current?.boardType,
         layoutId: activeBoardRef.current?.layoutId,
         oldIndex,
-        newIndex,
+        newIndex: targetIndex,
         partyMode: sessionIdRef.current !== null,
         reorderedBy: 'self',
         source: options?.source ?? 'drag',
       });
-      mutations.reorderQueueItem(uuid, oldIndex, newIndex).catch((error) => {
-        if (__DEV__) console.warn('[queue] reorderQueueItem sync failed; rolling back', error);
-        // Unlike add/remove (idempotent, converge on next sync), a failed reorder
-        // would leave this client's order silently diverged from peers. Roll back
-        // to the pre-reorder order — that matches the server, which never applied
-        // the move — and surface the failure.
-        dispatch({ type: 'UPDATE_QUEUE', payload: { queue: previousQueue, currentClimbQueueItem: previousCurrent } });
-        showQueueMutationErrorToast(error, t, showToast);
+      // The wire move carries indexes. The server finds the climb by uuid
+      // (#6792), but it still places it at `newIndex` (clamped to the tail),
+      // so the indexes must describe the server's queue, not this phone's. They differ while the
+      // lane drains: a whole-list Play next puts every climb here at once but
+      // on the server one send at a time. So the move waits its turn on the
+      // lane and reads both indexes at send time (`serverIndexIn`), when every
+      // earlier send from this phone has landed.
+      void enqueueQueueMutation(async () => {
+        if (!isQueueMutationOriginCurrent(origin)) return;
+        // Gone, or never reached the server: there is nothing there to move.
+        const liveUuids = new Set(stateRef.current.queue.map((queueItem) => queueItem.uuid));
+        if (!isOnServer(uuid, liveUuids)) return;
+        const wireOldIndex = serverIndexIn(previousQueue, uuid);
+        const wireNewIndex = serverIndexIn(reorderedQueue, uuid);
+        if (wireOldIndex === wireNewIndex) return;
+        try {
+          await mutations.reorderQueueItem(uuid, wireOldIndex, wireNewIndex);
+        } catch (error) {
+          if (!isQueueMutationOriginCurrent(origin)) return;
+          if (__DEV__) console.warn('[queue] reorderQueueItem sync failed; rolling back', error);
+          // Unlike add/remove (idempotent, converge on next sync), a failed reorder
+          // would leave this client's order silently diverged from peers. Roll back
+          // to the pre-reorder order — that matches the server, which never applied
+          // the move — and surface the failure. Only while the queue is still
+          // exactly what this move left: anything the climber did since would be
+          // lost, so then the server's queue is fetched instead.
+          showQueueMutationErrorToast(error, t, showToast);
+          const live = stateRef.current;
+          const untouchedSince =
+            live.queue.length === reorderedQueue.length &&
+            live.queue.every((queueItem, index) => queueItem.uuid === reorderedQueue[index].uuid);
+          if (untouchedSince) {
+            dispatch({
+              type: 'UPDATE_QUEUE',
+              payload: {
+                queue: previousQueue,
+                currentClimbQueueItem: live.currentClimbQueueItem,
+                // The line the move left from, while the wall is still where it
+                // was; otherwise the current climb places it.
+                historyCount:
+                  live.currentClimbQueueItem?.uuid === previousCurrent?.uuid ? previousHistoryCount : live.historyCount,
+              },
+            });
+          } else {
+            void resyncQueueAfterMutationFailure(origin);
+          }
+        }
       });
     },
-    [mutations, showToast, t],
+    [
+      mutations,
+      showToast,
+      t,
+      captureQueueMutationOrigin,
+      enqueueQueueMutation,
+      isQueueMutationOriginCurrent,
+      isOnServer,
+      resyncQueueAfterMutationFailure,
+      serverIndexIn,
+    ],
+  );
+
+  const applyQueueSnapshot = useCallback(
+    (
+      queue: ClimbQueueItem[],
+      currentClimbQueueItem: ClimbQueueItem | null | undefined,
+      origin: QueueMutationOrigin,
+      deferredSnapshot?: () => QueueContentSnapshot | null,
+      // F3 now-slot mode: the payload's line. Null derives it (the reducer from
+      // the current climb, the server from its stored History, section 3). A
+      // deferred snapshot that carries its own line (Undo) wins over this.
+      historyCount: number | null = null,
+    ) => {
+      const commitSnapshot = (snapshot: QueueContentSnapshot) => {
+        pendingUnsyncedCurrentRef.current = null;
+        const line = snapshot.historyCount !== undefined ? snapshot.historyCount : historyCount;
+        const existingUuids = new Set(stateRef.current.queue.map((queueItem) => queueItem.uuid));
+        const attributedQueue = snapshot.queue.map((item) => attributeNewItem(item, existingUuids));
+        const attributedCurrent = snapshot.currentClimbQueueItem
+          ? (attributedQueue.find((item) => item.uuid === snapshot.currentClimbQueueItem?.uuid) ??
+            attributeNewItem(snapshot.currentClimbQueueItem, existingUuids))
+          : null;
+        dispatch({
+          type: 'UPDATE_QUEUE',
+          payload: { queue: attributedQueue, currentClimbQueueItem: attributedCurrent, historyCount: line },
+        });
+        return {
+          queue: attributedQueue.filter((item) => isClimbResolved(item.climb)),
+          current: attributedCurrent && isClimbResolved(attributedCurrent.climb) ? attributedCurrent : undefined,
+          // The wire payload leaves unresolved entries out, so its line counts
+          // only the resolved History entries.
+          historyCount:
+            line === null ? null : attributedQueue.slice(0, line).filter((item) => isClimbResolved(item.climb)).length,
+        };
+      };
+      // Ordinary replacements stay optimistic. Undo waits until its removals
+      // finish, then composes from live state immediately before setQueue reads
+      // the server baseline. Crew changes during that wait stay in the payload.
+      const optimistic = deferredSnapshot
+        ? null
+        : commitSnapshot({ queue, currentClimbQueueItem: currentClimbQueueItem ?? null });
+      void enqueueQueueMutation(async () => {
+        if (!isQueueMutationOriginCurrent(origin)) return;
+        const snapshot = deferredSnapshot?.();
+        if (deferredSnapshot && !snapshot) return;
+        const prepared = snapshot ? commitSnapshot(snapshot) : optimistic;
+        if (!prepared) return;
+        try {
+          await mutations.setQueue(prepared.queue, prepared.current, prepared.historyCount);
+        } catch (error) {
+          if (!isQueueMutationOriginCurrent(origin)) return;
+          if (__DEV__) console.warn('[queue] setQueue sync failed', error);
+          reconcileFailedContentMutation(error, origin);
+        }
+      });
+    },
+    [attributeNewItem, enqueueQueueMutation, isQueueMutationOriginCurrent, mutations, reconcileFailedContentMutation],
+  );
+
+  /**
+   * Rewrite a list walk's queue slot (`suggested`) as queued on purpose, here
+   * and for the crew (#7247). The walk reads a flagged climb on its own list as
+   * the list, never as Up next, so a Play next that kept the flag would be
+   * walked past. One item-level write by uuid on the lane: the server swaps
+   * that slot under its version check and leaves every other slot, the order
+   * and the climb on the wall as they stand, so a crewmate's Next or reorder in
+   * the same moment is never undone (a whole-queue `setQueue` built now would).
+   */
+  const dropListWalkFlag = useCallback(
+    (uuid: string) => {
+      const origin = captureQueueMutationOrigin();
+      const flagged = stateRef.current.queue.find((queueItem) => queueItem.uuid === uuid);
+      if (!flagged || flagged.suggested !== true) return;
+      dispatch({ type: 'DELTA_REPLACE_QUEUE_ITEM', payload: { uuid, item: withoutListWalkFlag(flagged) } });
+      void enqueueQueueMutation(async () => {
+        if (!isQueueMutationOriginCurrent(origin)) return;
+        // The slot as this phone holds it at send time (hydrated, regraded or
+        // mirrored since), so the swap carries nothing older. Gone, never on
+        // the server, or still a placeholder: nothing to swap, and a
+        // placeholder must never reach the crew (#2527).
+        const live = stateRef.current.queue.find((queueItem) => queueItem.uuid === uuid);
+        const liveUuids = new Set(stateRef.current.queue.map((queueItem) => queueItem.uuid));
+        if (!live || !isOnServer(uuid, liveUuids) || !isClimbResolved(live.climb)) return;
+        try {
+          await mutations.replaceQueueItem(uuid, withoutListWalkFlag(live));
+        } catch (error) {
+          if (!isQueueMutationOriginCurrent(origin)) return;
+          if (__DEV__) console.warn('[queue] replaceQueueItem sync failed', error);
+          // The crew still has the flag. Reconcile against the server rather
+          // than leave this phone walking a queue nobody else has. Solo no-ops.
+          reconcileFailedContentMutation(error, origin);
+        }
+      });
+    },
+    [
+      captureQueueMutationOrigin,
+      enqueueQueueMutation,
+      isOnServer,
+      isQueueMutationOriginCurrent,
+      mutations,
+      reconcileFailedContentMutation,
+    ],
   );
 
   /**
    * Jump a climb to the slot right behind the one on the wall.
    *
-   * Three shapes, decided by `planPlayNext` against live state:
+   * The shapes, decided by `planPlayNext` against live state:
    * - not queued yet → a positional add (the cross-board gate still runs first,
    *   and `commitQueueAdd` re-derives the index after it, so a prompt that sat
    *   open while the queue moved can't land the climb in a stale slot)
    * - queued elsewhere → a MOVE, never a duplicate: a second copy would leave
-   *   the crew deleting the stale one by hand
-   * - already up next (or already on the wall) → no mutation, but still confirm.
-   *   Silence would read as a dead button.
+   *   the crew deleting the stale one by hand. A slot a list walk put in the
+   *   queue (`suggested`) also drops the flag (`dropListWalkFlag`): a reorder
+   *   keeps it, and swipes would walk past the climb as part of the list (#7247)
+   * - in History with nothing current (F3) → one whole-queue replace that pulls
+   *   it to the head of Up next and lowers the line; no single reorder can
+   *   (see `planPlayNext`)
+   * - already up next but flagged by a list walk (as an older build left it) →
+   *   only the flag goes
+   * - already up next (or its own queue slot is on the wall) → no mutation,
+   *   but still confirm. Silence would read as a dead button.
+   * - the climb on the wall, named by climb only (a list row's swipe) → a
+   *   repeat copy right behind it.
    */
   const playNext = useCallback(
     async ({
@@ -1305,113 +2049,381 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       item: ClimbQueueItem;
       queueItemUuid?: string;
     }): Promise<'added' | 'moved' | 'unchanged' | 'cancelled'> => {
-      const plan = planPlayNext(stateRef.current.queue, stateRef.current.currentClimbQueueItem, {
-        queueItemUuid,
-        climbUuid: item.climb.uuid,
-      });
+      const plan = planPlayNext(
+        stateRef.current.queue,
+        stateRef.current.currentClimbQueueItem,
+        { queueItemUuid, climbUuid: item.climb.uuid },
+        stateRef.current.historyCount,
+      );
 
       if (plan.kind === 'move') {
         reorderQueue(plan.uuid, plan.oldIndex, plan.newIndex, { source: 'play-next' });
+        if (plan.dropListWalkFlag) dropListWalkFlag(plan.uuid);
         showQueueAddedSnackbar({ kind: 'playNext' });
         return 'moved';
       }
 
-      if (plan.kind === 'unchanged') {
+      if (plan.kind === 'unflag') {
+        // Already at the head of Up next, where the walk passed it: no reorder.
+        dropListWalkFlag(plan.uuid);
+        showQueueAddedSnackbar({ kind: 'playNext' });
+        return 'moved';
+      }
+
+      if (plan.kind === 'replace') {
+        track(SHARED_EVENTS.QueueReordered, {
+          boardName: activeBoardRef.current?.boardType,
+          layoutId: activeBoardRef.current?.layoutId,
+          oldIndex: plan.oldIndex,
+          newIndex: plan.historyCount,
+          partyMode: sessionIdRef.current !== null,
+          reorderedBy: 'self',
+          source: 'play-next',
+        });
+        applyQueueSnapshot(
+          plan.queue,
+          stateRef.current.currentClimbQueueItem,
+          captureQueueMutationOrigin(),
+          undefined,
+          plan.historyCount,
+        );
+        showQueueAddedSnackbar({ kind: 'playNext' });
+        return 'moved';
+      }
+
+      // The climb on the wall, asked for by climb rather than by its queue slot
+      // (a list row's swipe): "play this next" can only mean "again", so a
+      // fresh copy goes right behind it and the toast tells the truth. From its
+      // own queue slot there is nothing to do, and the menus hide the action.
+      if (plan.kind === 'unchanged' && !(plan.reason === 'is-current' && queueItemUuid === undefined)) {
         showQueueAddedSnackbar({ kind: 'playNext' });
         return 'unchanged';
       }
 
       return addToQueue(item, { placement: 'next' });
     },
-    [addToQueue, reorderQueue, showQueueAddedSnackbar],
+    [
+      addToQueue,
+      applyQueueSnapshot,
+      captureQueueMutationOrigin,
+      dropListWalkFlag,
+      reorderQueue,
+      showQueueAddedSnackbar,
+    ],
   );
 
-  const clearQueue = useCallback(() => {
-    const itemsToRemove = stateRef.current.queue;
-    // A whole-queue clear supersedes any deferred current re-broadcast (#3868).
-    pendingUnsyncedCurrentRef.current = null;
-    dispatch({ type: 'CLEAR_QUEUE' });
-    track(SHARED_EVENTS.QueueCleared, { layoutId: activeBoardRef.current?.layoutId, totalCount: itemsToRemove.length });
-    setPlaylistSuggestionSourceState(null);
-    // If any per-item remove fails in a party session, the cleared items may
-    // still live on peers — reconcile once against the server (single-flight
-    // coalesces the burst) and tell the user we refreshed. Solo: the local
-    // clear is authoritative, so resync no-ops and no toast fires.
-    void Promise.allSettled(itemsToRemove.map((item) => mutations.removeQueueItem(item.uuid))).then((results) => {
-      const rejectedRemovals = results.filter(
-        (result): result is PromiseRejectedResult => result.status === 'rejected',
-      );
-      if (rejectedRemovals.length === 0) return;
-      // A clear fires N per-item removes and the limiter typically rejects only
-      // the tail, so prefer a throttled reason over the first one — otherwise an
-      // unrelated early failure would swallow the pacing hint.
-      const throttledRemoval = rejectedRemovals.find((rejected) => isRateLimitedError(rejected.reason));
-      reconcileFailedContentMutation((throttledRemoval ?? rejectedRemovals[0]).reason);
-    });
-  }, [mutations, reconcileFailedContentMutation]);
+  // The wire half of a multi-item removal (clear, bulk remove). There is no
+  // bulk-remove mutation, so it fans out per item, queued behind any send
+  // already on the lane so the server sees the climber's order.
+  //
+  // ONE AT A TIME, for the reason `appendQueueItems` gives: each remove lands in
+  // the backend's single-key Redis CAS with three retries and no backoff, so N
+  // concurrent removes mostly exhaust their retries, the reconcile below resyncs,
+  // and the "removed" climbs come back — while the Undo snackbar still says
+  // they're gone. A failure doesn't stop the rest: each later item still goes,
+  // in order.
+  //
+  // If any remove fails in a party session, the items may still live on peers —
+  // reconcile once against the server and tell the user we refreshed. Solo: the
+  // local removal is authoritative, so resync no-ops and no toast fires.
+  const sendRemovalsOnLane = useCallback(
+    (itemsToRemove: readonly ClimbQueueItem[], origin: QueueMutationOrigin) => {
+      // Still on the server until each remove goes, which a move or Play next
+      // queued ahead of them must count (`serverIndexIn`).
+      const unsentRemovals = laneUnsentRemovalUuidsRef.current;
+      for (const item of itemsToRemove) unsentRemovals.add(item.uuid);
+      void enqueueQueueMutation(async () => {
+        const failures: unknown[] = [];
+        for (const item of itemsToRemove) {
+          if (!isQueueMutationOriginCurrent(origin)) return;
+          try {
+            await mutations.removeQueueItem(item.uuid);
+          } catch (error) {
+            if (!isQueueMutationOriginCurrent(origin)) return;
+            if (__DEV__) console.warn('[queue] removeQueueItem sync failed', error);
+            failures.push(error);
+          } finally {
+            unsentRemovals.delete(item.uuid);
+          }
+        }
+        if (!isQueueMutationOriginCurrent(origin)) return;
+        if (failures.length === 0) return;
+        // The limiter typically rejects only the tail, so prefer a throttled
+        // reason over the first one — otherwise an unrelated early failure
+        // would swallow the pacing hint.
+        const throttledFailure = failures.find((error) => isRateLimitedError(error));
+        reconcileFailedContentMutation(throttledFailure ?? failures[0], origin);
+      });
+    },
+    [enqueueQueueMutation, isQueueMutationOriginCurrent, mutations, reconcileFailedContentMutation],
+  );
+
+  const clearQueue = useCallback(
+    (options?: { source?: QueueClearSource }) => {
+      const itemsToRemove = stateRef.current.queue;
+      // Clear is a new queue intent. Cancel this provider's unsent appends, then
+      // enqueue the removals behind any already-active send so the server observes
+      // the same order as the climber's intent.
+      invalidateQueuedQueueMutations();
+      const origin = captureQueueMutationOrigin();
+      // A whole-queue clear supersedes any deferred current re-broadcast (#3868).
+      pendingUnsyncedCurrentRef.current = null;
+      dispatch({ type: 'CLEAR_QUEUE' });
+      track(SHARED_EVENTS.QueueCleared, {
+        layoutId: activeBoardRef.current?.layoutId,
+        totalCount: itemsToRemove.length,
+        source: options?.source ?? 'edit',
+      });
+      setPlaylistSuggestionSourceState(null);
+      sendRemovalsOnLane(itemsToRemove, origin);
+    },
+    [captureQueueMutationOrigin, invalidateQueuedQueueMutations, sendRemovalsOnLane],
+  );
+
+  // Remove several climbs at once (the queue sheet's edit-mode bulk remove).
+  // Unlike N calls to `removeFromQueue`, the wire sends ride the serialized
+  // queue lane, so a later `setQueue` — the sheet's Undo — is guaranteed to
+  // reach the server AFTER these removes instead of racing them and being
+  // deleted by a late one. One reconcile for the batch, like `clearQueue`.
+  //
+  // Trade-off, kept on purpose: these removes wait behind whatever is already
+  // on the lane (a playlist append still draining), where `removeFromQueue`
+  // sends at once. Unlike `clearQueue` this does NOT invalidate the queued work:
+  // that would cancel the unsent adds of climbs the climber KEPT, which then
+  // never reach the crew. A pending add of a climb removed here still goes out
+  // first and the remove follows it, so the crew ends in the right state, one
+  // round-trip later. The transport bounds each attempt and its retry count.
+  const removeQueueItems = useCallback(
+    (uuids: readonly string[]) => {
+      const targets = new Set(uuids);
+      const itemsToRemove = stateRef.current.queue.filter((queueItem) => targets.has(queueItem.uuid));
+      if (itemsToRemove.length === 0) return;
+      const origin = captureQueueMutationOrigin();
+      const partyMode = countDistinctSessionUsers(sessionRuntimeStateRef.current?.users) > 1;
+      for (const removedItem of itemsToRemove) {
+        dispatch({ type: 'DELTA_REMOVE_QUEUE_ITEM', payload: { uuid: removedItem.uuid } });
+        track(SHARED_EVENTS.ClimbRemovedFromQueue, {
+          climbUuid: removedItem.climb.uuid,
+          queueItemUuid: removedItem.uuid,
+          boardName: activeBoardRef.current?.boardType,
+          layoutId: activeBoardRef.current?.layoutId,
+          partyMode,
+          removedBy: 'self',
+        });
+      }
+      sendRemovalsOnLane(itemsToRemove, origin);
+    },
+    [captureQueueMutationOrigin, sendRemovalsOnLane],
+  );
 
   // Replace the whole queue in one shot: optimistic local UPDATE_QUEUE (the
   // source of truth for the user's queue) + SET_QUEUE sync that no-ops in solo
   // and broadcasts to party peers when a session exists. In party mode a sync
   // failure would leave peers on the old queue, so reconcile like other failed
   // session mutations.
+  //
+  // Clamped to MAX_SYNCED_QUEUE_ITEMS as a backstop: `Mutation.setQueue` THROWS
+  // on a longer payload (see packages/shared/queue/src/limits.ts). The window
+  // keeps the current climb. Callers that can say what fit clamp first (the
+  // playlist replace toasts it); this only stops a caller of `setQueue` that
+  // forgot from sending a payload the server refuses. The session seed and
+  // re-seed push the live queue themselves and clamp it the same way.
   const setQueue = useCallback(
-    (queue: ClimbQueueItem[], currentClimbQueueItem?: ClimbQueueItem | null) => {
-      // A whole-queue replace sets its own current; it supersedes any deferred
-      // current re-broadcast (#3868).
-      pendingUnsyncedCurrentRef.current = null;
-      // Stamp BEFORE the dispatch, and feed the same array to both the local
-      // reducer and the broadcast — otherwise this device's own queue would show
-      // no author while peers saw one (#3995). The membership check reads
-      // `stateRef.current.queue`, which is still the pre-dispatch queue here, so
-      // a climb the crew already had keeps whoever queued it.
-      const existingUuids = new Set(stateRef.current.queue.map((queueItem) => queueItem.uuid));
-      const attributedQueue = queue.map((item) => attributeNewItem(item, existingUuids));
-      const attributedCurrent = currentClimbQueueItem
-        ? (attributedQueue.find((item) => item.uuid === currentClimbQueueItem.uuid) ??
-          attributeNewItem(currentClimbQueueItem, existingUuids))
-        : currentClimbQueueItem;
-      dispatch({
-        type: 'UPDATE_QUEUE',
-        payload: { queue: attributedQueue, currentClimbQueueItem: attributedCurrent ?? null },
-      });
-      // Keep the full queue locally, but never broadcast a placeholder/thin item
-      // to peers (#2527): drop unresolved items from the wire payload (they can't
-      // form a valid ClimbInput and peers can't render them). useQueueResolveClimbs
-      // hydrates any resolvable item in place; a later mutation re-syncs the real
-      // one. An unresolved current climb is likewise not sent as current.
-      const syncableQueue = attributedQueue.filter((item) => isClimbResolved(item.climb));
-      const syncableCurrent =
-        attributedCurrent && isClimbResolved(attributedCurrent.climb) ? attributedCurrent : undefined;
-      mutations.setQueue(syncableQueue, syncableCurrent).catch((error) => {
-        if (__DEV__) console.warn('[queue] setQueue sync failed', error);
-        reconcileFailedContentMutation(error);
-      });
+    (queue: ClimbQueueItem[], currentClimbQueueItem?: ClimbQueueItem | null, historyCount = 0) => {
+      if (credentialGeneration !== getCredentialGeneration()) return;
+      // A replace's payload is all Up next when nothing is current (line 0)
+      // unless the caller keeps History (a playlist loaded into Up next); the
+      // clamp follows the server probe (now-slot mode keeps the climb on the
+      // wall out of the count, legacy keeps 500 entries in all).
+      const syncable = clampSyncedQueue(queue, currentClimbQueueItem, historyCount, nowSlotModeRef.current);
+      invalidateQueuedQueueMutations();
+      applyQueueSnapshot(
+        syncable.queue,
+        currentClimbQueueItem,
+        captureQueueMutationOrigin(),
+        undefined,
+        syncable.historyCount,
+      );
     },
-    [attributeNewItem, mutations, reconcileFailedContentMutation],
+    [applyQueueSnapshot, captureQueueMutationOrigin, invalidateQueuedQueueMutations, credentialGeneration],
   );
 
-  // Stable live read of the queue + current climb (see QueueContextValue). Reads
-  // stateRef so callers get the latest without subscribing to state re-renders.
+  const restoreQueueItems = useCallback(
+    (before: QueueContentSnapshot, removedUuids: ReadonlySet<string>, scope: string) => {
+      const isCurrent = () => scope === undoScopeRef.current && credentialGeneration === getCredentialGeneration();
+      if (!isCurrent()) return;
+      const origin = captureQueueMutationOrigin();
+      applyQueueSnapshot(before.queue, before.currentClimbQueueItem, origin, () => {
+        if (!isCurrent()) return null;
+        // A removal failure may have a pre-Undo HTTP snapshot still in flight.
+        // Retire its ownership when this queued restore applies, so neither it
+        // nor a coalesced trailing read can overwrite Undo. Keep the mutation
+        // generation intact: pending appends of climbs we kept must still send.
+        // Initial profile resolution keeps older null-identity origins valid;
+        // retire those flights too, without cancelling any queued wire writes.
+        resyncFlightsByOriginRef.current.clear();
+        return restoreRemovedQueueItems(before, removedUuids, {
+          queue: stateRef.current.queue,
+          currentClimbQueueItem: stateRef.current.currentClimbQueueItem,
+          historyCount: stateRef.current.historyCount ?? null,
+        });
+      });
+    },
+    [applyQueueSnapshot, captureQueueMutationOrigin, credentialGeneration],
+  );
+
+  // Stable live read of the queue + current climb and masked playlist source.
+  // Action-only consumers get the latest without subscribing to state renders.
   const getQueueSnapshot = useCallback(
-    () => ({ queue: stateRef.current.queue, currentClimbQueueItem: stateRef.current.currentClimbQueueItem }),
+    () => ({
+      sessionId: sessionIdRef.current,
+      queue: stateRef.current.queue,
+      currentClimbQueueItem: stateRef.current.currentClimbQueueItem,
+      historyCount: stateRef.current.historyCount ?? null,
+      playlistSuggestionSource: playlistSuggestionSourceRef.current,
+    }),
     [],
   );
 
-  // Queue a generated session behind whatever the climber already has going,
-  // instead of replacing it. Leaving the current pointer alone is what keeps the
-  // BLE auto-sender (it writes state.currentClimbQueueItem) from repainting the
-  // wall out from under someone mid-project, and appending rather than replacing
-  // keeps their hand-queued climbs. Only when nothing is current do we open on
-  // the session's first climb. Mirrors web's start-sesh-drawer.
-  const appendGeneratedSession = useCallback(
-    (items: ClimbQueueItem[]) => {
-      // Nothing generated: don't broadcast a SET_QUEUE that changes nothing.
-      if (items.length === 0) return;
+  // Add a batch next to whatever the climber already has going, instead of
+  // replacing it. Leaving the current pointer alone is what keeps the BLE
+  // auto-sender (it writes state.currentClimbQueueItem) from repainting the wall
+  // out from under someone mid-project, and adding rather than replacing keeps
+  // their hand-queued climbs. Mirrors web's start-sesh-drawer.
+  //
+  // `placement` picks where the batch lands, in batch order: `'end'` (the
+  // default) at the bottom of Up next, `'next'` at the top of it, in the slot a
+  // single Play next takes (`playNextInsertPosition`), derived once here from
+  // live state. Unlike a single Play next, a batch never MOVES a climb that is
+  // already queued: it is a list going in as copies, the same as the append.
+  //
+  // `activateFirstWhenIdle` is the workout generator's contract — "start me on
+  // the first climb of the session I just generated" — and defaults OFF, because
+  // the other caller is the playlist Play next / Play last rows, where taking the
+  // wall is exactly what the climber asked us not to do. It can only FILL an
+  // empty pointer; it never moves one that is already set.
+  //
+  // Returns how many items actually landed, after the clamp below, so the caller
+  // can confirm an honest count.
+  const appendQueueItems = useCallback(
+    (items: ClimbQueueItem[], options?: { activateFirstWhenIdle?: boolean; placement?: QueueAddPlacement }): number => {
+      if (credentialGeneration !== getCredentialGeneration()) return 0;
+      // Nothing to append: don't broadcast a SET_QUEUE that changes nothing.
+      if (items.length === 0) return 0;
       const { queue, currentClimbQueueItem } = stateRef.current;
-      setQueue([...queue, ...items], currentClimbQueueItem ?? items[0]);
+      // `Mutation.setQueue` THROWS on a payload longer than MAX_SYNCED_QUEUE_ITEMS
+      // rather than truncating it, and an append is the one write that can cross
+      // that line by addition — so clamp here and report what fit. Note the cap is
+      // measured against the LOCAL queue: the server's copy can be longer if a
+      // concurrent-add merge re-appended peer climbs on top of a full payload
+      // (see the follow-up filed with this change).
+      const remainingCapacity = MAX_SYNCED_QUEUE_ITEMS - queue.length;
+      if (remainingCapacity <= 0) return 0;
+      const appended = items.length > remainingCapacity ? items.slice(0, remainingCapacity) : items;
+
+      const nextCurrent = currentClimbQueueItem ?? (options?.activateFirstWhenIdle ? appended[0] : null);
+      // The first landing slot, or undefined for an append. Read against the
+      // pointer as it stands before this call: an idle queue that the batch's
+      // own first climb is about to take is still "nothing current", so a
+      // Play next batch starts at the head either way.
+      const insertPosition =
+        options?.placement === 'next' ? playNextInsertPosition(queue, currentClimbQueueItem) : undefined;
+      const origin = captureQueueMutationOrigin();
+      if (nextCurrent) {
+        const nextQueue =
+          insertPosition === undefined
+            ? [...queue, ...appended]
+            : [...queue.slice(0, insertPosition), ...appended, ...queue.slice(insertPosition)];
+        applyQueueSnapshot(nextQueue, nextCurrent, origin);
+        return appended.length;
+      }
+
+      // Nothing is current and the caller did not ask to take the wall. A
+      // wholesale `setQueue` cannot express "leave the current climb alone": the
+      // resolver reads an absent pointer as a CLEAR and writes null into session
+      // state for the whole crew (queue/mutations.ts setQueue →
+      // roomManager.updateQueueState). An additive action must never be able to
+      // blank a peer's wall, not even through a stale local mirror, so this batch
+      // goes out as per-item adds instead — ADD_QUEUE_ITEM carries no pointer at
+      // all, so the invariant holds by construction. (`clearQueue` fans out
+      // per-item too, but for a different reason: there is no bulk-clear
+      // mutation. What is borrowed from it is the reconcile shape below.)
+      //
+      // Attribution set hoisted once: `attributeNewItem` otherwise rescans the
+      // whole queue per item, and this is the caller its `existingUuids`
+      // parameter was written for — a playlist can hand over the entire board
+      // list.
+      const existingUuids = new Set(queue.map((queueItem) => queueItem.uuid));
+      const attributedItems = appended.map((item) => attributeNewItem(item, existingUuids));
+      // A Play next batch takes consecutive slots from `insertPosition`, so it
+      // keeps the list's order at the head of Up next. The same index goes to
+      // the local dispatch and the wire, as in `commitQueueAdd`, so this phone
+      // and its peers agree on where each climb landed.
+      const positionAt = (index: number) => (insertPosition === undefined ? undefined : insertPosition + index);
+      attributedItems.forEach((item, index) => {
+        dispatch({ type: 'DELTA_ADD_QUEUE_ITEM', payload: { item, position: positionAt(index) } });
+      });
+      // Drain the wire sends ONE AT A TIME. Every addQueueItem lands in the
+      // backend's `withQueueVersionRetry` around a single-key Redis CAS, with a
+      // 3-attempt ceiling and no backoff or jitter — so firing N of them at once
+      // means each attempt wins with roughly 1/N probability and most of a batch
+      // exhausts its retries. Three things would break at once: peers receive a
+      // fraction of the playlist, they receive it in CAS-resolution order rather
+      // than playlist order (no `position` is sent — the server appends), and the
+      // ordered-hash watchdog then collapses THIS device's queue to whatever
+      // landed, losing climbs the snackbar already confirmed. Sequential sends
+      // are uncontended and arrive in order; the local queue is already correct,
+      // so the latency is invisible.
+      void enqueueQueueMutation(async () => {
+        const failures: unknown[] = [];
+        // Counts the climbs the server has taken at the head, so a skipped
+        // (removed) or failed climb doesn't leave a gap in the positions of the
+        // ones after it. A single positional add or a move waits behind this
+        // drain on the same lane (`commitQueueAdd`, `reorderQueue`), so nothing
+        // else from this phone lands among these slots while it runs.
+        let sentCount = 0;
+        for (const item of attributedItems) {
+          if (!isQueueMutationOriginCurrent(origin)) return;
+          // A later per-item removal is an explicit user choice even if it
+          // landed while this item was waiting behind an earlier append.
+          if (mutations.wasUuidExplicitlyRemoved(item.uuid)) continue;
+          try {
+            await mutations.addQueueItem(item, positionAt(sentCount));
+            // Only a climb the server took moves the next one along. A failed
+            // send leaves its slot empty on the server, so the next climb takes it.
+            sentCount += 1;
+            laneFailedAddUuidsRef.current.delete(item.uuid);
+          } catch (error) {
+            if (!isQueueMutationOriginCurrent(origin)) return;
+            // Still in this phone's queue but not the server's: a move queued
+            // behind this drain must not count it (`serverIndexIn`).
+            laneFailedAddUuidsRef.current.add(item.uuid);
+            if (__DEV__) console.warn('[queue] appendQueueItems addQueueItem sync failed', error);
+            failures.push(error);
+          }
+        }
+        if (!isQueueMutationOriginCurrent(origin)) return;
+        if (failures.length === 0) return;
+        // ONE reconcile for the batch, not one per item: each call can toast and
+        // kick a resync, so 30 failed adds would be 30 toasts. Prefer a throttled
+        // reason over the first — a burst typically only trips the limiter at the
+        // tail, and an unrelated early failure would otherwise swallow the pacing
+        // hint. Same rule as `clearQueue`.
+        const throttledFailure = failures.find((error) => isRateLimitedError(error));
+        reconcileFailedContentMutation(throttledFailure ?? failures[0], origin);
+      });
+      return appended.length;
     },
-    [setQueue],
+    [
+      credentialGeneration,
+      applyQueueSnapshot,
+      attributeNewItem,
+      captureQueueMutationOrigin,
+      enqueueQueueMutation,
+      isQueueMutationOriginCurrent,
+      mutations,
+      reconcileFailedContentMutation,
+    ],
   );
 
   // A throttled setCurrentClimb that carried `shouldAddToQueue` lost two
@@ -1431,21 +2443,17 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   //   gone, wholesale sync   -> unpositioned ADD (server appends; the crew still
   //                             gets the climb instead of nobody getting it)
   const recoverThrottledQueueAdd = useCallback(
-    async (item: ClimbQueueItem, activationSessionId: string | null) => {
+    async (item: ClimbQueueItem, origin: QueueMutationOrigin) => {
       // Capture the session this slot belongs to. Every leg below runs after an
       // await, and the undo leg in particular can wake up in a DIFFERENT session
       // (the climber ended this one and joined another while the add was backing
       // off) — a remove aimed at that session is aimed at the wrong crew's queue.
       // Same discipline the coalescer applies to its own deferred sends.
-      const recoverySessionId = sessionIdRef.current;
-      if (!recoverySessionId) return;
-      // The activation was issued into a different room than the one we're in
-      // now: the throttled setCurrentClimb sat in back-off while the climber
-      // left and joined elsewhere. Re-sending here would append the OLD room's
-      // climb to the NEW crew's queue. `activationSessionId` is snapshotted by
-      // dispatchSetCurrent at issue time — the live ref is useless for this,
-      // because it is read fresh on entry and so always agrees with itself.
-      if (recoverySessionId !== activationSessionId) return;
+      const recoverySessionId = origin.sessionId;
+      if (!recoverySessionId || !isQueueMutationOriginCurrent(origin)) return;
+      // `origin` was captured when the activation started. The live session ref
+      // can point to a different room after this mutation's rate-limit backoff.
+      // Keep every recovery and compensation step behind that same origin fence.
       // Position the re-send where the optimistic insert actually landed
       // (insert-after-current, #2217) so peers see the same order we do. The
       // server clamps an out-of-range position to an append.
@@ -1471,7 +2479,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
         // this client really has diverged. Fall back to the same reconciliation
         // every other content mutation uses — a refreshed queue beats one
         // that's permanently local-only.
-        void resyncQueueAfterMutationFailure();
+        if (isQueueMutationOriginCurrent(origin)) void resyncQueueAfterMutationFailure(origin);
         return;
       }
       // The add can sit in `execute`'s rate-limit back-off for seconds. If the
@@ -1481,7 +2489,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       // leave a climb nobody asked for. Only while we're still in the session
       // the add went to: after a session swap the local queue describes the new
       // room, and its lack of this item says nothing about the old one.
-      if (sessionIdRef.current !== recoverySessionId) return;
+      if (!isQueueMutationOriginCurrent(origin)) return;
       if (stateRef.current.queue.some((queueItem) => queueItem.uuid === item.uuid)) return;
       // Absence alone is not intent (#4009). A wholesale sync wipes the slot
       // locally while the add lands server-side, and undoing on that reading
@@ -1492,10 +2500,265 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       if (!mutations.wasUuidExplicitlyRemoved(item.uuid)) return;
       mutations.removeQueueItem(item.uuid).catch((error) => {
         if (__DEV__) console.warn('[queue] undoing a resurrected queue-add failed', error);
-        void resyncQueueAfterMutationFailure();
+        if (isQueueMutationOriginCurrent(origin)) void resyncQueueAfterMutationFailure(origin);
       });
     },
-    [mutations, resyncQueueAfterMutationFailure],
+    [isQueueMutationOriginCurrent, mutations, resyncQueueAfterMutationFailure],
+  );
+
+  // Forget the pending re-send and its fallback timer: both are empty from here.
+  const forgetPendingResend = useCallback(() => {
+    moveResendRef.current = null;
+    if (moveResendFallbackTimerRef.current) {
+      clearTimeout(moveResendFallbackTimerRef.current);
+      moveResendFallbackTimerRef.current = null;
+    }
+  }, []);
+
+  // Hand the queue slots a pending re-send was holding back to their own
+  // recovery, and forget it. Called when the move is given up before its
+  // re-send (a newer move, a crewmate's move, the TTL, a room change) and right
+  // after the re-send goes out.
+  const releasePendingResend = useCallback(() => {
+    const pending = moveResendRef.current;
+    if (!pending) return;
+    forgetPendingResend();
+    for (const queueAdd of pending.queueAdds) void recoverThrottledQueueAdd(queueAdd, pending.origin);
+  }, [forgetPendingResend, recoverThrottledQueueAdd]);
+
+  // Re-send a slot a lost send added, unless a move's re-send is still pending:
+  // then it waits with that move (see moveResendRef).
+  const queueOrRecoverMoveAdd = useCallback(
+    (item: ClimbQueueItem, origin: QueueMutationOrigin) => {
+      const pending = moveResendRef.current;
+      if (pending) {
+        pending.queueAdds.push(item);
+        return;
+      }
+      void recoverThrottledQueueAdd(item, origin);
+    },
+    [recoverThrottledQueueAdd],
+  );
+
+  // Every way a setCurrentClimb can fail, for both the call's own rejection and
+  // a drained send (see onSetCurrentClimbDrainError).
+  //
+  // A send that MISSED the session (moveMissedTheSession) is not a divergence:
+  // the server never ran it, so nobody's wall moved. Resyncing there pulled the
+  // wall back to the previous climb under the climber and toasted "out of sync"
+  // (#6783 QA, a backend deploy mid-session). Instead:
+  //   - the climber's latest move is re-sent once, after the live stream's
+  //     snapshot proves nothing happened in the session since (the reducer
+  //     marks the unconfirmed move `ready`, the effect below sends it), or
+  //     given up the old way if that snapshot does not come in time;
+  //   - an older send, already superseded on screen, changes nothing; only a
+  //     queue slot it added still needs to reach the crew (see moveResendRef);
+  //   - a send whose move a snapshot or a crewmate's move already retired
+  //     needs no resync either (the wall shows the session's climb), only the
+  //     "out of sync" toast that resync would have shown.
+  // Every other failure, and a re-send that fails again, keeps the behaviour it
+  // always had, after retiring the move so the next snapshot is the truth.
+  const handleSetCurrentClimbFailure = useCallback(
+    (
+      error: unknown,
+      {
+        item,
+        shouldAddToQueue,
+        correlationId,
+        origin,
+        sentAtSequence,
+        drained,
+        reshapedLocally,
+      }: SetCurrentClimbFailure,
+    ): boolean => {
+      if (!isQueueMutationOriginCurrent(origin)) return false;
+      const { unconfirmedMove, currentClimbQueueItem, serverSequence } = stateRef.current;
+      const isLatestSend = unconfirmedMove?.correlationId === correlationId;
+      const missedTheSession = origin.sessionId !== null && moveMissedTheSession(error);
+      if (missedTheSession) {
+        // A chain too long to compare with a snapshot (movedOffTruncated) has
+        // nothing to wait for: every snapshot wins, so it is given up the old
+        // way below rather than undone without a word.
+        if (
+          unconfirmedMove &&
+          isLatestSend &&
+          unconfirmedMove.resend === 'none' &&
+          !unconfirmedMove.movedOffTruncated
+        ) {
+          // A move still waiting for its own re-send is history now; its slots
+          // go out on their own.
+          releasePendingResend();
+          moveResendRef.current = {
+            correlationId,
+            itemUuid: item.uuid,
+            origin,
+            parkedAtSequence: serverSequence,
+            // The re-send carries the add itself; this is in case it never goes.
+            // A drained one's too: the coalescer leaves it to us (see the
+            // return below), because its own re-send would land before the
+            // rejoin snapshot is read.
+            queueAdds: shouldAddToQueue ? [item] : [],
+          };
+          // The wait starts now: keep the echo's correlation id alive past it.
+          coordinator.trackPendingMutation(correlationId);
+          dispatch({
+            type: 'UNCONFIRMED_MOVE_NOT_SENT',
+            payload: {
+              correlationId,
+              // Once the bound connection's stream has opened with a FullSync,
+              // every crewmate's move reaches this phone live, and one would
+              // already have retired the move. Before that, wait for it.
+              serverViewIsLive: queueStreamLiveRef.current,
+            },
+          });
+          if (moveResendFallbackTimerRef.current) clearTimeout(moveResendFallbackTimerRef.current);
+          // Only a move that can wait gets here: the branch above leaves out a
+          // truncated chain (movedOffTruncated). Every snapshot wins against
+          // one, so it would be retired before this fires, and this fallback,
+          // the only resync on this path, would then never run. Keep that rule
+          // in the branch condition; "gives a lost move up at once when its
+          // chain is too long to compare" pins it.
+          moveResendFallbackTimerRef.current = setTimeout(() => {
+            moveResendFallbackTimerRef.current = null;
+            const waiting = stateRef.current.unconfirmedMove;
+            if (waiting?.correlationId !== correlationId || waiting.resend !== 'awaiting-snapshot') return;
+            if (!isQueueMutationOriginCurrent(origin)) return;
+            // The session never came back for it: the old reconciliation, late.
+            dispatch({ type: 'UNCONFIRMED_MOVE_DROPPED', payload: { correlationId } });
+            void resyncQueueAfterMutationFailure(origin);
+          }, MOVE_RESEND_WAIT_MS);
+          return shouldAddToQueue;
+        }
+        // A newer send (of this climb or another) is on its way: this send's
+        // pointer half is moot, so no resync and no toast.
+        const supersededByNewerSend = !isLatestSend && unconfirmedMove != null;
+        // No newer send, and the record is gone with the wall on another climb.
+        // The wall already shows what the session holds, so no resync either.
+        const wallMovedOff = unconfirmedMove == null && currentClimbQueueItem?.uuid !== item.uuid;
+        if (supersededByNewerSend || wallMovedOff) {
+          // A slot it added still has to reach the crew, held back while a
+          // re-send is pending. A drained one's too, instead of the coalescer.
+          if (shouldAddToQueue) queueOrRecoverMoveAdd(item, origin);
+          // A snapshot or a crewmate's move retired the record before this
+          // failure arrived: the wall went back without a tap, so say so, as
+          // the resync this replaced did. A server change is the one way the
+          // sequence moves on; without one, this climber moved the wall again
+          // without a send (an unresolved climb), and that needs no word.
+          if (wallMovedOff && serverSequence !== sentAtSequence) {
+            showToast(t('mobile.queue.outOfSyncRefreshed'), 'error');
+          }
+          return shouldAddToQueue;
+        }
+      }
+      // This move is not coming. Stop protecting it so the next snapshot wins.
+      if (isLatestSend) dispatch({ type: 'UNCONFIRMED_MOVE_DROPPED', payload: { correlationId } });
+      // A drained send has always been best-effort: the coalescer re-sends its
+      // queue-add, and the hash watchdog reconciles the pointer.
+      if (drained) return false;
+      // A slot a lost send added would otherwise vanish in the resync below.
+      if (missedTheSession && shouldAddToQueue) void recoverThrottledQueueAdd(item, origin);
+      // A throttled POINTER move is not a divergence: the rate-limit gate
+      // throws before the resolver runs, so the server still holds the climb
+      // it held a moment ago and the next activation (or any peer's
+      // broadcast) re-establishes it. Resyncing here would yank the user back
+      // to the previous boulder mid-swipe and fire another query into the
+      // limiter that just throttled us — which is what #2763 was reported as
+      // ("the connection fails every time we try to switch boulders"). Show
+      // the gentle "slow down" toast instead and leave the local pointer put.
+      const throttled = isRateLimitedError(error);
+      // F3: a throttled open that reshaped the array can't rely on "the
+      // pointer self-heals": the local queue holds a shape the server never
+      // stored. It resyncs like any failed write. Only a pure pointer move
+      // keeps the gentle toast below.
+      if (sessionIdRef.current && (!throttled || reshapedLocally)) {
+        // Any other party-session failure means peers really did diverge —
+        // reconcile against the server (and toast that we refreshed).
+        void resyncQueueAfterMutationFailure(origin);
+        return false;
+      }
+      // Throttled while ALSO adding a fresh climb to the queue: the pointer
+      // half self-heals, the new slot doesn't. Re-send it on its own so the
+      // content change isn't stranded locally (solo no-ops — its queue is
+      // authoritative and there's no server to fall behind).
+      if (throttled && shouldAddToQueue) {
+        void recoverThrottledQueueAdd(item, origin);
+      }
+      // Solo (no server to reconcile) and the rate-limited party case both
+      // land here: toast only, no resync.
+      showQueueMutationErrorToast(error, t, showToast);
+      return false;
+    },
+    [
+      coordinator,
+      isQueueMutationOriginCurrent,
+      queueOrRecoverMoveAdd,
+      recoverThrottledQueueAdd,
+      releasePendingResend,
+      resyncQueueAfterMutationFailure,
+      showToast,
+      t,
+    ],
+  );
+  handleSetCurrentClimbFailureRef.current = handleSetCurrentClimbFailure;
+
+  // Send one SET_CURRENT_CLIMB, from a fresh activation or a re-send. In F3
+  // now-slot mode it carries the open's `placement`; legacy mode sends exactly
+  // today's call, with no trailing placement.
+  const sendCurrentClimb = useCallback(
+    (
+      item: ClimbQueueItem,
+      shouldAddToQueue: boolean,
+      correlationId: string,
+      origin: QueueMutationOrigin,
+      nowSlot?: { placement?: CurrentClimbPlacement; reshapedLocally?: boolean },
+    ) => {
+      const placement = nowSlot?.placement;
+      const reshapedLocally = nowSlot?.reshapedLocally === true;
+      // The server ignores `shouldAddToQueue` under placement; sending false
+      // keeps the coalescer from ever firing a deferred add (section 7).
+      const sentShouldAddToQueue = placement ? false : shouldAddToQueue;
+      // (Re)start the echo's TTL: a re-send's echo can come well after the
+      // first send's window opened.
+      coordinator.trackPendingMutation(correlationId);
+      // #7014: this item's echo is never a crewmate's relay, even as a FullSync.
+      noteOwnMove(item.uuid);
+      const sentAtSequence = stateRef.current.serverSequence;
+      const sends = moveSendsRef.current;
+      sends.delete(correlationId);
+      sends.set(correlationId, { origin, sentAtSequence, reshapedLocally });
+      if (sends.size > MAX_TRACKED_MOVE_SENDS) {
+        const oldest = sends.keys().next().value;
+        if (oldest !== undefined) sends.delete(oldest);
+      }
+      const sent = placement
+        ? mutations.setCurrentClimb(item, false, correlationId, placement)
+        : mutations.setCurrentClimb(item, shouldAddToQueue, correlationId);
+      sent.then(
+        () => {
+          // The open went out on today's document after all (a backend without
+          // F3 rejected the `_NOW_SLOT` one, or the join's probe answered "no"
+          // while it waited). That server did a plain pointer move, and its echo
+          // carries our own correlation id, so nothing else would undo the
+          // reshape here before the 60 s watchdog. Converge now, silently: the
+          // climber did nothing wrong.
+          if (!reshapedLocally || !sessionIdRef.current || !isQueueMutationOriginCurrent(origin)) return;
+          if (nowSlotModeRef.current && nowSlotServerRef.current === true) return;
+          void resyncQueueFromServerRef.current(origin);
+        },
+        (error: unknown) => {
+          handleSetCurrentClimbFailure(error, {
+            item,
+            shouldAddToQueue: sentShouldAddToQueue,
+            correlationId,
+            origin,
+            sentAtSequence,
+            drained: false,
+            reshapedLocally,
+          });
+        },
+      );
+    },
+    [coordinator, handleSetCurrentClimbFailure, isQueueMutationOriginCurrent, mutations],
   );
 
   // Optimistic local dispatch + correlated SET_CURRENT_CLIMB mutation. The
@@ -1508,14 +2771,30 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       shouldAddToQueue: boolean,
       playlistSuggestionSource?: PlaylistSuggestionSource | null,
       insertAfterCurrent?: boolean,
-    ) => {
+      suppliedCorrelationId?: string,
+      requestedPlacement?: CurrentClimbPlacement,
+      historyCopy: HistoryCopyRule = 'reuse',
+      keepQueue = false,
+    ): NowSlotOpen | null => {
+      if (credentialGeneration !== getCredentialGeneration()) return null;
       // Activating a climb that isn't in the queue yet (shouldAddToQueue, or the
       // playlist peek minted in nextClimb) introduces it — stamp it before the
       // dispatch so state and broadcast agree. Navigating onto an item already in
       // the queue is a no-op here: attributeNewItem sees the uuid and leaves it
       // alone, so stepping through the crew's queue never re-authors it (#3995).
-      const item = attributeNewItem(rawItem);
-      const correlationId = coordinator.generateCorrelationId();
+      const attributedItem = attributeNewItem(rawItem);
+      // F3 now-slot mode: run the server's placement rule locally first. A climb
+      // already in the queue resolves to that entry (no copy), and the resolved
+      // entry is what the reducer and the server both receive, with `placement`.
+      // The server ignores `shouldAddToQueue` under placement; sending false
+      // keeps the coalescer from ever firing a deferred add (section 7).
+      const nowSlotMode = nowSlotModeRef.current;
+      const placement = nowSlotMode ? (requestedPlacement ?? 'NOW') : undefined;
+      const nowSlotOpen = placement ? placeLocally(stateRef.current, attributedItem, placement, historyCopy) : null;
+      const item = nowSlotOpen?.resolvedItem ?? attributedItem;
+      const correlationId = suppliedCorrelationId ?? coordinator.generateCorrelationId();
+      // Skip the broadcast for an unresolved climb (#2527), see below.
+      const broadcasts = isClimbResolved(item.climb);
       dispatch({
         type: 'DELTA_UPDATE_CURRENT_CLIMB',
         // playlistSuggestionSource is client-only state — when present the
@@ -1530,7 +2809,12 @@ export function QueueProvider({ children }: { children: ReactNode }) {
         // room's — the ordered-hash watchdog would flag drift and resync the
         // leftovers straight back. List-first swipes (#4829) don't need the
         // prune for correctness, so it runs solo-only; in a session the crew's
-        // queue stays exactly as the server holds it.
+        // queue stays exactly as the server holds it. It also skips a step
+        // along a list that keeps the queue as Next does (`keepQueue`, decided
+        // in setCurrentClimb, #7227).
+        // sessionId: the room this move is sent to, so the reducer keeps it
+        // through a snapshot of that room that predates it. Only when a
+        // mutation really goes out (resolved climb, in a session).
         payload: {
           item,
           shouldAddToQueue,
@@ -1538,7 +2822,12 @@ export function QueueProvider({ children }: { children: ReactNode }) {
           correlationId,
           playlistSuggestionSource,
           insertAfterCurrent,
-          pruneSuggestedAfterCurrent: sessionIdRef.current == null,
+          pruneSuggestedAfterCurrent: sessionIdRef.current == null && !keepQueue,
+          sessionId: broadcasts ? (sessionIdRef.current ?? undefined) : undefined,
+          placement,
+          // Solo, the phone trims History itself; in a session only the server
+          // does (section 5), so a session outside the percent can't drift.
+          capHistory: sessionIdRef.current == null,
         },
       });
       // Skip the broadcast for an unresolved climb (#2527) — a placeholder
@@ -1549,50 +2838,99 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       // correlation is tracked since no server echo will arrive. Remember the slot
       // AND the session it belongs to so the re-broadcast effect fires once it
       // hydrates while still current, but only back into the same room (#3868).
-      if (!isClimbResolved(item.climb)) {
+      if (!broadcasts) {
         if (__DEV__) console.warn('[queue] skipping setCurrentClimb sync for an unresolved climb. See #2527.');
         pendingUnsyncedCurrentRef.current = { queueItemUuid: item.uuid, sessionId: sessionIdRef.current };
-        return;
+        return nowSlotOpen;
       }
       // A real broadcast supersedes any deferred one — drop it so a late hydrate
       // of the previously-skipped slot can't re-broadcast an item we've moved off.
       pendingUnsyncedCurrentRef.current = null;
-      coordinator.trackPendingMutation(correlationId);
-      // The room this activation is aimed at. A throttled setCurrentClimb can
-      // sit in back-off long enough for the climber to leave and join another
-      // session, so the recovery below needs the id from HERE — by the time it
-      // runs, the live ref may already point at the new room (#4009).
-      const activationSessionId = sessionIdRef.current;
-      mutations.setCurrentClimb(item, shouldAddToQueue, correlationId).catch((error: unknown) => {
-        // A throttled POINTER move is not a divergence: the rate-limit gate
-        // throws before the resolver runs, so the server still holds the climb
-        // it held a moment ago and the next activation (or any peer's
-        // broadcast) re-establishes it. Resyncing here would yank the user back
-        // to the previous boulder mid-swipe and fire another query into the
-        // limiter that just throttled us — which is what #2763 was reported as
-        // ("the connection fails every time we try to switch boulders"). Show
-        // the gentle "slow down" toast instead and leave the local pointer put.
-        const throttled = isRateLimitedError(error);
-        if (sessionIdRef.current && !throttled) {
-          // Any other party-session failure means peers really did diverge —
-          // reconcile against the server (and toast that we refreshed).
-          void resyncQueueAfterMutationFailure();
-          return;
-        }
-        // Throttled while ALSO adding a fresh climb to the queue: the pointer
-        // half self-heals, the new slot doesn't. Re-send it on its own so the
-        // content change isn't stranded locally (solo no-ops — its queue is
-        // authoritative and there's no server to fall behind).
-        if (throttled && shouldAddToQueue) {
-          void recoverThrottledQueueAdd(item, activationSessionId);
-        }
-        // Solo (no server to reconcile) and the rate-limited party case both
-        // land here: toast only, no resync.
-        showQueueMutationErrorToast(error, t, showToast);
+      // The account, room and queue generation this activation is aimed at. A
+      // throttled setCurrentClimb can sit in back-off long enough for the
+      // climber to change origin before recovery runs (#4009).
+      sendCurrentClimb(item, shouldAddToQueue, correlationId, captureQueueMutationOrigin(), {
+        placement,
+        // F3: an open that reshaped the array (a move, a dedupe, an insert)
+        // rather than just moving the pointer.
+        reshapedLocally: nowSlotOpen !== null && !POINTER_REWRITES.has(nowSlotOpen.rewrite),
       });
+      return nowSlotOpen;
     },
-    [attributeNewItem, coordinator, mutations, recoverThrottledQueueAdd, resyncQueueAfterMutationFailure, showToast, t],
+    [credentialGeneration, attributeNewItem, captureQueueMutationOrigin, coordinator, sendCurrentClimb],
   );
+
+  // Re-send a move whose send missed the session, once the reducer says the
+  // live stream's snapshot shows nothing happened since (`resend: 'ready'`).
+  // One re-send per move: it goes out with the move's own correlation id, so
+  // its echo is suppressed like the original's, and the reducer moves the
+  // record to `resent` before it leaves.
+  const moveAwaitingResend = state.unconfirmedMove;
+  useEffect(() => {
+    const pending = moveResendRef.current;
+    // The move a re-send was waiting for is gone (a newer move, a crewmate's
+    // move, the TTL, the fallback): it will not be re-sent, so its slots go out
+    // on their own now.
+    if (pending && moveAwaitingResend?.correlationId !== pending.correlationId) {
+      // Was it the session that undid it (a snapshot taken over it, a
+      // crewmate's move), rather than this climber's own next move or edit?
+      // Then the wall just went back without a tap: say so, as the resync this
+      // replaced did. A server change is the one way the sequence moves on.
+      const { serverSequence, currentClimbQueueItem } = stateRef.current;
+      const undoneBySession =
+        !moveAwaitingResend &&
+        currentClimbQueueItem?.uuid !== pending.itemUuid &&
+        serverSequence !== pending.parkedAtSequence &&
+        isQueueMutationOriginCurrent(pending.origin);
+      releasePendingResend();
+      if (undoneBySession) showToast(t('mobile.queue.outOfSyncRefreshed'), 'error');
+      return;
+    }
+    if (moveAwaitingResend?.resend !== 'ready') return;
+    const { correlationId } = moveAwaitingResend;
+    // Already on its way: this run only saw a commit that predates the
+    // reducer's `resent`. Never a second send.
+    if (resentMoveCorrelationIdRef.current === correlationId) return;
+    // The wall's own copy of the climb: anything done to it locally since the
+    // first send (a mirror, a hydrate) goes with it. The record only lives
+    // while that climb is current, so this is always the move's climb.
+    const current = stateRef.current.currentClimbQueueItem;
+    if (
+      !pending ||
+      pending.correlationId !== correlationId ||
+      pending.origin.sessionId !== moveAwaitingResend.sessionId ||
+      !isQueueMutationOriginCurrent(pending.origin) ||
+      credentialGeneration !== getCredentialGeneration() ||
+      current?.uuid !== moveAwaitingResend.itemUuid
+    ) {
+      // The room, account or queue intent changed while it waited. The move
+      // belongs to that origin; let the next snapshot decide.
+      forgetPendingResend();
+      dispatch({ type: 'UNCONFIRMED_MOVE_DROPPED', payload: { correlationId } });
+      return;
+    }
+    resentMoveCorrelationIdRef.current = correlationId;
+    dispatch({ type: 'UNCONFIRMED_MOVE_RESENT', payload: { correlationId } });
+    // In now-slot mode it goes with the move's own placement; the server places
+    // it the way the reducer replayed it on the snapshot.
+    sendCurrentClimb(current, moveAwaitingResend.shouldAddToQueue, correlationId, pending.origin, {
+      placement: moveAwaitingResend.placement,
+      reshapedLocally: moveAwaitingResend.placement !== undefined,
+    });
+    // The re-send carries the move's own add; anything a superseded lost send
+    // added goes now. From here nothing is pending: the ref and timer are empty.
+    pending.queueAdds = pending.queueAdds.filter((queueAdd) => queueAdd.uuid !== current.uuid);
+    releasePendingResend();
+  }, [
+    moveAwaitingResend,
+    forgetPendingResend,
+    isQueueMutationOriginCurrent,
+    credentialGeneration,
+    releasePendingResend,
+    sendCurrentClimb,
+    showToast,
+    t,
+  ]);
 
   // Re-broadcast the current climb once a deferred thin item hydrates (#3868).
   // dispatchSetCurrent skips the broadcast when it lands on an unresolved climb
@@ -1604,9 +2942,12 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // peer-held wall LED link (which follows THEIR local current, updated solely by
   // our broadcast) to advance. Without it they stay on the old climb until the
   // next navigation.
+  const pendingUnsyncedCurrent = pendingUnsyncedCurrentRef.current;
   useEffect(() => {
-    const pending = pendingUnsyncedCurrentRef.current;
-    if (!pending) return;
+    const pending = pendingUnsyncedCurrent;
+    // An older passive effect must not retire a newer activation that has not
+    // committed yet (for example during cold-start persistence completion).
+    if (!pending || pending !== pendingUnsyncedCurrentRef.current) return;
     // Room changed since we deferred (a session join/switch/leave). Read
     // sessionIdRef, not `sessionId` state: joinSession / createSessionWithConfig
     // write the ref synchronously before setSessionId, so this pending effect can
@@ -1640,18 +2981,76 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     // deferral ref, no-ops in solo via the shared coalescer, and reuses the same
     // failure handling. shouldAddToQueue is false: the slot is already queued.
     dispatchSetCurrent(current, false);
-  }, [state.currentClimbQueueItem, dispatchSetCurrent]);
+  }, [state.currentClimbQueueItem, dispatchSetCurrent, pendingUnsyncedCurrent]);
 
-  const setCurrentClimb = useCallback(
-    (item: ClimbQueueItem, options?: SetCurrentClimbOptions) => {
-      // Source is client-only provider state (see note above) — set it whenever
-      // the caller passes options. Activation passes a source; a fresh
-      // climb-list/search open passes null to clear playlist context; re-opening
-      // the current climb passes nothing, leaving the source intact.
-      if (options) setPlaylistSuggestionSourceState(options.playlistSuggestionSource);
+  /**
+   * Store where the list picks up after a step into or out of Up next (#6777).
+   * A walk that steps from a list climb into the queue records that list climb
+   * on the track, and stepping back onto the list clears it (keeping it as the
+   * track's `detour`, for Previous to retrace): that is what keeps the list's
+   * place while queued climbs play, and what tells the player to say
+   * "Up next · 1 of 3" instead of the list's name.
+   *
+   * Written onto the held track only while it is still the one the step walked
+   * (same list, tap and board), so a track replaced meanwhile is left alone.
+   * The same render batch commits it with the current climb, so there is no
+   * render in which the queued climb is current and the track has gone dormant.
+   *
+   * `steppedOffQueueItemUuid` is the climb the step leaves: stepping back onto
+   * the list, the detour records it as the last Up next climb played (#7227),
+   * so a look's Previous later retraces from it.
+   */
+  const storeTrackResume = useCallback(
+    (
+      walkedSource: PlaylistSuggestionSource | null,
+      trackResume: PlaylistTrackResume | null | undefined,
+      steppedOffQueueItemUuid?: string,
+    ) => {
+      if (trackResume === undefined || !walkedSource) return;
+      if (samePlaylistTrackResume(walkedSource.resume, trackResume)) return;
+      if (credentialGeneration !== getCredentialGeneration()) return;
+      setPlaylistSuggestionSourceState((held) =>
+        held && playlistSuggestionSourceMatches(held, walkedSource)
+          ? withPlaylistTrackResume(held, trackResume, steppedOffQueueItemUuid)
+          : held,
+      );
+    },
+    [credentialGeneration],
+  );
+
+  /**
+   * `Set Active Climb`: a pick (`setCurrentClimb`) or a Next / Previous step
+   * moved the wall. A step carries `trigger` `next` / `previous` /
+   * `rest_timer` and the `QueueStepProperties`, so a "Next went somewhere odd"
+   * report can be read from the data: which way the walk went and which
+   * `placeOnWall` row it took.
+   */
+  const trackSetActiveClimb = useCallback(
+    (
+      item: ClimbQueueItem,
+      nowSlotOpen: NowSlotOpen | null,
+      trigger: SetActiveClimbTrigger | null,
+      step?: QueueStepProperties,
+    ) => {
+      // `dispatchSetCurrent` bails on a stale credential generation (sign-out,
+      // account switch); a step that moved nothing must not be reported.
+      if (credentialGeneration !== getCredentialGeneration()) return;
+      // A spray wall's layout id is minted per wall, so `layoutId` cannot say
+      // "spray". The board type can, and it is one of nine values. It is the
+      // CLIMB's board, the same thing `Tick Logged` reports: a spray climb
+      // opened from a shared link while a Kilter is the active board is a spray
+      // climb, and a new account with no board bound yet still has one to name.
+      // The active board is the fallback for a climb that does not carry one.
+      const climbBoardType = boardTypeProperty(item.climb.boardType);
       track(SHARED_EVENTS.SetActiveClimb, {
         climbUuid: item.climb.uuid,
         layoutId: activeBoardRef.current?.layoutId,
+        ...(climbBoardType.boardType ? climbBoardType : boardTypeProperty(activeBoardRef.current?.boardType)),
+        // `climb_saved` when the create screen queued a climb it just saved,
+        // null when a climber chose the climb. Saving is not climbing, and
+        // `next`, `previous` and `rest_timer` are steps, not picks, so the
+        // spray-wall activation measure leaves out all four.
+        trigger,
         source: 'mobile',
         // Which crew's wall just moved, and how many people were watching it.
         // The preview-first work turns this event into the ONE deliberate act
@@ -1662,7 +3061,47 @@ export function QueueProvider({ children }: { children: ReactNode }) {
         // stamped on Climb Added to Queue rather than raw connection rows.
         sessionId: sessionIdRef.current,
         participantCount: countDistinctSessionUsers(sessionRuntimeStateRef.current?.users),
+        // F3: which placement row the local open took (`insert`,
+        // `dedupe-up-next`, ...). The only signal for the solo no-copy fix,
+        // since a solo open never reaches the server.
+        nowSlotMode: nowSlotOpen !== null,
+        rewrite: nowSlotOpen?.rewrite ?? null,
+        placement: nowSlotOpen?.placement ?? null,
+        ...step,
       });
+    },
+    [credentialGeneration],
+  );
+
+  const setCurrentClimb = useCallback(
+    (item: ClimbQueueItem, options?: SetCurrentClimbOptions) => {
+      if (credentialGeneration !== getCredentialGeneration()) return;
+      invalidateRestTimerControlIntent();
+      // Source is client-only provider state (see note above) — set it whenever
+      // the caller passes options. Activation passes a source; a fresh
+      // climb-list/search open passes null to clear playlist context; re-opening
+      // the current climb passes nothing, leaving the source intact. A look's
+      // mark (`lookOffWall`, #7227) says how a preview began: it decides only
+      // whether this commit keeps the queue (below), and the list goes up
+      // without it.
+      const walkedSource = options?.playlistSuggestionSource;
+      const trackSource = walkedSource ? withoutLookOffWall(walkedSource) : walkedSource;
+      if (trackSource !== undefined) {
+        setPlaylistSuggestionSourceState(trackSource);
+      }
+      // A look that walked from the current climb went up on the wall (#6777).
+      // Read before the dispatch, against the climb still current: Up next on
+      // the held track keeps the list's place, as Next stepping into Up next
+      // does, and the list's own next climb (the walk's peek) keeps the list.
+      if (options?.keepWalkedTrack) {
+        const { queue, currentClimbQueueItem } = stateRef.current;
+        const heldTrack = playlistSuggestionSourceRef.current;
+        const trackResume = resolveUpNextCommitResume(queue, currentClimbQueueItem, heldTrack, item, {
+          walkedPeek: options.walkedPeek === true,
+        });
+        if (trackResume === undefined) setPlaylistSuggestionSourceState(null);
+        else storeTrackResume(heldTrack, trackResume);
+      }
       // Activating a climb slots it right after the current climb (issue #2217),
       // pushing the current climb into history — matching the local "set climb
       // active" intent instead of bumping the new climb to the bottom. Fresh-uuid
@@ -1671,18 +3110,83 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       // current climb is already the queue tail, so insert-after-current is
       // equivalent to append there and the "queue grows 1..10, 1..10" pass
       // (driven by findNextQueueItemWithSuggestions anchoring on the current
-      // climb) is preserved.
-      dispatchSetCurrent(item, true, options?.playlistSuggestionSource, true);
+      // climb) is preserved. In now-slot mode (F3) the open goes through
+      // `placeOnWall` instead: a queued climb moves into Now, never copied.
+      // A step along a list (`keepQueue`, #7227) leaves the queue as Next does,
+      // with no prune after it, for a look off the climb on the wall (its list
+      // says so, whichever way the look went: on through Up next, or back up
+      // the list), for a climb already queued, and for a walk that went through
+      // Up next (the list holds a `resume` or a `detour`). The prune would drop
+      // the Up next the look walked past or played, a workout's queued climbs
+      // among them. A list tap's climb, or a peek along a list opened that way,
+      // still prunes as before.
+      const keepsQueue =
+        options?.keepQueue === true &&
+        (walkedSource?.lookOffWall === true ||
+          Boolean(walkedSource?.resume ?? walkedSource?.detour) ||
+          stateRef.current.queue.some(({ uuid }) => uuid === item.uuid));
+      const currentUuidBeforeOpen = stateRef.current.currentClimbQueueItem?.uuid ?? null;
+      const nowSlotOpen = dispatchSetCurrent(
+        item,
+        true,
+        trackSource,
+        true,
+        undefined,
+        options?.placement,
+        options?.historyCopy,
+        keepsQueue,
+      );
+      // #4979: opening the climb that is already current (a re-tap, or a list
+      // row for the same climb, which now-slot mode dedupes onto it) leaves the
+      // uuid alone, so the clock would not move and a stale-climb hold would
+      // keep the wall dark. The open is the climber asking for this climb, so
+      // it restarts the clock; the auto-sender sees the young clock and lights.
+      const openedQueueItemUuid = nowSlotOpen ? nowSlotOpen.resolvedItem.uuid : item.uuid;
+      if (currentUuidBeforeOpen !== null && openedQueueItemUuid === currentUuidBeforeOpen) {
+        seedCurrentChange(currentUuidBeforeOpen, nowMs());
+      }
+      trackSetActiveClimb(item, nowSlotOpen, options?.trigger ?? null);
     },
-    [dispatchSetCurrent],
+    [dispatchSetCurrent, credentialGeneration, seedCurrentChange, storeTrackResume, trackSetActiveClimb],
   );
+
+  // The editor saved a climb that is already in the queue. See the reducer's
+  // REFRESH_AUTHORED_CLIMB for why this is not folded into setCurrentClimb.
+  const refreshAuthoredClimb = useCallback(
+    (climbUuid: string, patch: ClimbAuthoredPatch) => {
+      if (credentialGeneration !== getCredentialGeneration()) return;
+      dispatch({ type: 'REFRESH_AUTHORED_CLIMB', payload: { climbUuid, patch } });
+    },
+    [credentialGeneration],
+  );
+  const refreshDeliveredClimb = useCallback(
+    (climbUuid: string, patch: ClimbAuthoredPatch) => {
+      if (credentialGeneration !== getCredentialGeneration()) return;
+      refreshAuthoredClimb(climbUuid, patch);
+      const current = stateRef.current.currentClimbQueueItem;
+      if (current?.climb.uuid === climbUuid) {
+        // The first party write may have arrived before the offline create.
+        setCurrentClimb({ ...current, climb: { ...current.climb, ...patch } }, { trigger: 'climb_saved' });
+      }
+    },
+    [credentialGeneration, refreshAuthoredClimb, setCurrentClimb],
+  );
+  useQueueClimbWriteDelivery(refreshDeliveredClimb);
 
   // One skip run gets one notice. A held swipe can fire nextClimb twice for the
   // same current item before the dispatch commits — that is one run — so latch
-  // it here and clear the latch whenever the current climb changes, which is the
-  // only thing that makes a genuinely new run possible. (Keying the latch on the
-  // item swiped away FROM would go silent on forward-back-forward, and would
-  // collapse every no-current-climb run onto one key.)
+  // it. The latch remembers WHICH climbs the run skipped and where the swipe
+  // landed, and comes off whenever the current climb moves anywhere else: a
+  // swipe back, a tap in the queue sheet, a crewmate's open. That re-arms
+  // forward-back-forward. (Keying the latch on the item swiped away FROM would
+  // go silent there, and would collapse every no-current-climb run onto one
+  // key.)
+  //
+  // Why the skipped set and the landing, not just "the current climb changed":
+  // in now-slot mode a Next onto Up next[k] moves only that climb into the Now
+  // slot, so the climbs it walked past stay at the head of Up next and the next
+  // Next walks past the very same ones. That is still the same run, and the
+  // climber already heard about it. A run that skips a different set is news.
   //
   // The latch is also what makes it safe that the forward selection is computed
   // TWICE per swipe against two different snapshots: `forwardSelection` below is
@@ -1692,9 +3196,11 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // disagree in the window between a dispatch and its commit, so whichever
   // reaches a skip run first reports it and the other stays quiet.
   const currentQueueItemUuid = state.currentClimbQueueItem?.uuid;
-  const skipRunReportedForCurrentRef = useRef(false);
+  const skipRunLatchRef = useRef<{ skippedKey: string; landedQueueItemUuid: string | null } | null>(null);
   useEffect(() => {
-    skipRunReportedForCurrentRef.current = false;
+    const latch = skipRunLatchRef.current;
+    if (latch && latch.landedQueueItemUuid !== null && latch.landedQueueItemUuid === currentQueueItemUuid) return;
+    skipRunLatchRef.current = null;
   }, [currentQueueItemUuid]);
 
   const trackClimbsSkippedOnBoard = useCallback(
@@ -1723,9 +3229,14 @@ export function QueueProvider({ children }: { children: ReactNode }) {
    * run that skipped nothing reports nothing.
    */
   const reportClimbsSkippedOnBoardSwitch = useCallback(
-    (skippedItems: ClimbQueueItem[], landedOn: ClimbQueueItem | null) => {
-      if (skippedItems.length === 0 || skipRunReportedForCurrentRef.current) return;
-      skipRunReportedForCurrentRef.current = true;
+    (skippedItems: ClimbQueueItem[], landedOn: ClimbQueueItem | null, landedQueueItemUuid: string | null) => {
+      if (skippedItems.length === 0) return;
+      const skippedKey = skippedItemsKey(skippedItems);
+      const reportedBefore = skipRunLatchRef.current?.skippedKey === skippedKey;
+      // Re-pointed at the new landing either way, so the commit it causes keeps
+      // the latch on.
+      skipRunLatchRef.current = { skippedKey, landedQueueItemUuid };
+      if (reportedBefore) return;
       trackClimbsSkippedOnBoard(skippedItems, landedOn, 'swipe');
       showToast(
         tSettings('boardConfigMismatch.skippedOnBoardSwitchToast', {
@@ -1760,8 +3271,17 @@ export function QueueProvider({ children }: { children: ReactNode }) {
         playlistSuggestionSource,
         toActiveBoardCompatibilityConfig(activeBoard),
         isReachableClimb,
+        undefined,
+        state.historyCount,
       ),
-    [state.queue, state.currentClimbQueueItem, playlistSuggestionSource, activeBoard, isReachableClimb],
+    [
+      state.queue,
+      state.currentClimbQueueItem,
+      state.historyCount,
+      playlistSuggestionSource,
+      activeBoard,
+      isReachableClimb,
+    ],
   );
   useEffect(() => {
     const { item, skippedItems } = forwardSelection;
@@ -1772,7 +3292,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     if (deadEndReportedBoardKeyRef.current === activeBoardKey) return;
     deadEndReportedBoardKeyRef.current = activeBoardKey;
     // A swipe from here can add nothing to this; don't let it repeat the news.
-    skipRunReportedForCurrentRef.current = true;
+    skipRunLatchRef.current = { skippedKey: skippedItemsKey(skippedItems), landedQueueItemUuid: null };
     trackClimbsSkippedOnBoard(skippedItems, null, 'queue_dead_end');
     showToast(
       tSettings('boardConfigMismatch.queueOffBoardToast', {
@@ -1783,77 +3303,182 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     );
   }, [forwardSelection, activeBoardKey, showToast, tSettings, trackClimbsSkippedOnBoard]);
 
-  const nextClimb = useCallback(() => {
-    const { queue, currentClimbQueueItem } = stateRef.current;
-    const activeConfig = toActiveBoardCompatibilityConfig(activeBoardRef.current);
-    const { item: nextItem, skippedItems } = selectNextQueueItemWithSuggestions(
-      queue,
-      currentClimbQueueItem,
-      playlistSuggestionSourceRef.current,
-      activeConfig,
-      isReachableClimbRef.current,
-    );
-    // Reported before the bail-out: a swipe that skipped everything and landed
-    // nowhere is exactly when the climber most needs to know why. (The gesture
-    // is normally disabled in that state — see the dead-end effect above — but
-    // the Next button and the widget path can still land here.)
-    reportClimbsSkippedOnBoardSwitch(skippedItems, nextItem);
-    if (!nextItem) return;
-    // Mirror web: a transient `playlist-peek:<uuid>` must never reach the WS
-    // mutation (toQueueItemInput sends item.uuid verbatim). The laundering lives
-    // in `resolveCommittableQueueItem` so the play drawer's commit button —
-    // which can now pin a peek while browsing a shared session — applies exactly
-    // the same rule. A converted peek was never in the queue, so it has to be
-    // added; a real item is already there.
-    const { item, converted } = resolveCommittableQueueItem(nextItem);
-    // New suggestions must match the server's insertion immediately after current.
-    dispatchSetCurrent(item, converted, undefined, converted);
-  }, [dispatchSetCurrent, reportClimbsSkippedOnBoardSwitch]);
+  const nextClimb = useCallback(
+    (caller?: NextClimbCaller) => {
+      const { queue, currentClimbQueueItem, historyCount } = stateRef.current;
+      const activeConfig = toActiveBoardCompatibilityConfig(activeBoardRef.current);
+      const walkedSource = playlistSuggestionSourceRef.current;
+      // Up next first, then the list (#6777): the same selection the drawer, the
+      // rest timer and the workout runner make, so all of them land here.
+      const {
+        item: nextItem,
+        skippedItems,
+        trackResume,
+      } = selectNextQueueItemWithSuggestions(
+        queue,
+        currentClimbQueueItem,
+        walkedSource,
+        activeConfig,
+        isReachableClimbRef.current,
+        undefined,
+        historyCount,
+      );
+      // Mirror web: a transient `playlist-peek:<uuid>` must never reach the WS
+      // mutation (toQueueItemInput sends item.uuid verbatim). The laundering lives
+      // in `resolveCommittableQueueItem` so the play drawer's commit button —
+      // which can now pin a peek while browsing a shared session — applies exactly
+      // the same rule. A converted peek was never in the queue, so it has to be
+      // added; a real item is already there.
+      const committable = nextItem ? resolveCommittableQueueItem(nextItem) : null;
+      // Reported before the bail-out: a swipe that skipped everything and landed
+      // nowhere is exactly when the climber most needs to know why. (The gesture
+      // is normally disabled in that state — see the dead-end effect above — but
+      // the Next button and the widget path can still land here.)
+      reportClimbsSkippedOnBoardSwitch(skippedItems, nextItem, committable?.item.uuid ?? null);
+      if (!committable) return;
+      if (caller !== 'rest_timer') invalidateRestTimerControlIntent();
+      const { item, converted } = committable;
+      storeTrackResume(walkedSource, trackResume, currentClimbQueueItem?.uuid);
+      // New suggestions must match the server's insertion immediately after current.
+      // In now-slot mode it is a NOW: a track peek goes on the wall at the Now
+      // slot (History once you move on), and an already-queued neighbour moves
+      // instead of being copied. A climb only History holds goes up as a fresh
+      // copy (`fresh`) unless it is the entry right behind, the one Previous
+      // just left: reusing an entry from an hour ago would rewrite History and
+      // walk the climbs after it again with their old entries.
+      const nowSlotOpen = dispatchSetCurrent(item, converted, undefined, converted, undefined, 'NOW', 'fresh');
+      trackSetActiveClimb(item, nowSlotOpen, caller ?? 'next', {
+        navSource: queueStepSource(walkedSource, converted, trackResume),
+        listIndex: listIndexOf(walkedSource, item),
+        fromQueueItemUuid: currentClimbQueueItem?.uuid ?? null,
+        toQueueItemUuid: nowSlotOpen?.resolvedItem.uuid ?? item.uuid,
+      });
+    },
+    [dispatchSetCurrent, reportClimbsSkippedOnBoardSwitch, storeTrackResume, trackSetActiveClimb],
+  );
 
   const previousClimb = useCallback(() => {
-    const { queue, currentClimbQueueItem } = stateRef.current;
-    // Mirrors nextClimb: swipes are list-first (issue #4829), so backward
-    // navigation can land on a playlist peek too — mint it into a real queue
-    // item before it reaches the WS mutation.
-    const prevItem = findPreviousQueueItemWithSuggestions(
+    const { queue, currentClimbQueueItem, historyCount } = stateRef.current;
+    // Mirrors nextClimb: on a list (issue #4829) backward navigation can land on
+    // a playlist peek too — mint it into a real queue item before it reaches the
+    // WS mutation. It retraces the walk (#6777): back through the Up next climbs
+    // played, then onto the list climb they were played from.
+    // The board only decides which queue entry stands for the list's previous
+    // climb, so a climb from another layout between two of the list's climbs
+    // can't make the swipe add a copy (#6664). Same inputs as nextClimb.
+    const walkedSource = playlistSuggestionSourceRef.current;
+    const { item: prevItem, trackResume } = selectPreviousQueueItemWithSuggestions(
       queue,
       currentClimbQueueItem,
-      playlistSuggestionSourceRef.current,
+      walkedSource,
+      undefined,
+      toActiveBoardCompatibilityConfig(activeBoardRef.current),
+      isReachableClimbRef.current,
+      historyCount,
     );
     if (!prevItem) return;
+    invalidateRestTimerControlIntent();
     const { item, converted } = resolveCommittableQueueItem(prevItem);
+    // No stepped-off climb: Previous clears a resume only when it lands on the
+    // list entry the walk left, and a detour is never read from there.
+    storeTrackResume(walkedSource, trackResume);
     // Match nextClimb and the server: suggestions insert immediately after current.
-    dispatchSetCurrent(item, converted, undefined, converted);
-  }, [dispatchSetCurrent]);
-
-  // Optimistic dispatch for widget Next/Previous taps. The native widget intent
-  // already sent the server mutation (HTTP /api/widget/navigate or the WS
-  // fallback), so we only update the local reducer with the absolute item and
-  // register the correlationId for echo suppression — no fresh JS mutation, and
-  // no relative advance that could double-step against the racing broadcast.
-  const dispatchWidgetNavigation = useCallback((item: ClimbQueueItem, correlationId: string) => {
-    dispatch({
-      type: 'DELTA_UPDATE_CURRENT_CLIMB',
-      payload: { item, shouldAddToQueue: false, correlationId },
+    // In now-slot mode: from a list climb it is a NOW (the list's previous
+    // climb, or the last Up next climb of a detour, goes up at the Now slot and
+    // the climb you left joins History); playing Up next or with no track it
+    // walks the queue (STEP), so the climb you left becomes Up next[0]
+    // (decision 2).
+    const onTrack =
+      walkedSource !== null &&
+      currentClimbQueueItem?.climb?.uuid !== undefined &&
+      findPlaylistClimbIndex(walkedSource, currentClimbQueueItem.climb.uuid) >= 0;
+    const nowSlotOpen = dispatchSetCurrent(item, converted, undefined, converted, undefined, onTrack ? 'NOW' : 'STEP');
+    trackSetActiveClimb(item, nowSlotOpen, 'previous', {
+      navSource: queueStepSource(walkedSource, converted, trackResume),
+      listIndex: listIndexOf(walkedSource, item),
+      fromQueueItemUuid: currentClimbQueueItem?.uuid ?? null,
+      toQueueItemUuid: nowSlotOpen?.resolvedItem.uuid ?? item.uuid,
     });
-  }, []);
+  }, [dispatchSetCurrent, storeTrackResume, trackSetActiveClimb]);
+
+  // Select the absolute native target so a racing server echo cannot double-step.
+  // iOS publishes natively; Android forwards the event for JS to publish.
+  const dispatchWidgetNavigation = useCallback(
+    (item: ClimbQueueItem, correlationId: string, options?: WidgetNavigationOptions) => {
+      // The widget steps the queue by index. Where that is the step Next or
+      // Previous would take on a list (into Up next, or back onto the list), the
+      // track keeps its place the same way (#6777), so the player still knows
+      // where the list picks up once the phone is back in hand.
+      const { queue, currentClimbQueueItem } = stateRef.current;
+      const walkedSource = playlistSuggestionSourceRef.current;
+      if (walkedSource && currentClimbQueueItem) {
+        const activeConfig = toActiveBoardCompatibilityConfig(activeBoardRef.current);
+        const forward = selectNextQueueItemWithSuggestions(
+          queue,
+          currentClimbQueueItem,
+          walkedSource,
+          activeConfig,
+          isReachableClimbRef.current,
+        );
+        const backward =
+          forward.item?.uuid === item.uuid
+            ? null
+            : selectPreviousQueueItemWithSuggestions(
+                queue,
+                currentClimbQueueItem,
+                walkedSource,
+                undefined,
+                activeConfig,
+                isReachableClimbRef.current,
+              );
+        const steppedOff = currentClimbQueueItem.uuid;
+        if (forward.item?.uuid === item.uuid) storeTrackResume(walkedSource, forward.trackResume, steppedOff);
+        else if (backward?.item?.uuid === item.uuid) storeTrackResume(walkedSource, backward.trackResume, steppedOff);
+      }
+      // The native step itself is a STEP in now-slot mode: a pointer move onto
+      // History's last entry or Up next[0], exactly what the server does with
+      // native's own placement-less request.
+      if (options?.sendMutation) {
+        dispatchSetCurrent(item, false, undefined, undefined, correlationId, 'STEP');
+        return;
+      }
+      dispatch({
+        type: 'DELTA_UPDATE_CURRENT_CLIMB',
+        payload: { item, shouldAddToQueue: false, correlationId, placement: 'STEP' },
+      });
+    },
+    [dispatchSetCurrent, storeTrackResume],
+  );
 
   const mirrorRequestRef = useRef(false);
+  /**
+   * Resolves true only when the server accepted the orientation. A widget tap
+   * replayed from the lock screen is retired on that answer, so a refused or
+   * failed attempt has to be distinguishable from a successful one — a toast
+   * alone would let an offline retry be thrown away.
+   */
   const mirrorCurrentClimb = useCallback(
     async (mirrored: boolean, queueItemUuid: string) => {
-      if (
-        !sessionIdRef.current ||
-        stateRef.current.currentClimbQueueItem?.uuid !== queueItemUuid ||
-        mirrorRequestRef.current
-      )
-        return;
+      if (stateRef.current.currentClimbQueueItem?.uuid !== queueItemUuid || mirrorRequestRef.current) return false;
+      if (sessionIdRef.current === null) {
+        const action: QueueAction = {
+          type: 'DELTA_MIRROR_CURRENT_CLIMB',
+          payload: { mirrored, mirroredUuid: queueItemUuid },
+        };
+        // Imperative Tick/navigation calls in the same event must see this tap.
+        stateRef.current = queueReducer(stateRef.current, action);
+        dispatch(action);
+        return true;
+      }
       mirrorRequestRef.current = true;
       try {
         await mutations.mirrorCurrentClimb(mirrored, queueItemUuid);
         // Subscription confirmation normally arrives first; refresh also covers a lost echo.
         await resyncQueueFromServerRef.current();
+        return true;
       } catch (error) {
         showQueueMutationErrorToast(error, t, showToast);
+        return false;
       } finally {
         mirrorRequestRef.current = false;
       }
@@ -1888,23 +3513,41 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // When the track the climber is currently walking was selected. Only the
   // dormancy event below reads it, to say how long the track stayed live (#5402).
   const suggestionSourceSelectedAtRef = useRef<number | null>(null);
-  const setPlaylistSuggestionSource = useCallback((source: PlaylistSuggestionSource | null) => {
-    suggestionSourceSelectedAtRef.current = source ? Date.now() : null;
-    setPlaylistSuggestionSourceState(source);
-  }, []);
+  const setPlaylistSuggestionSource = useCallback(
+    (source: PlaylistSuggestionSource | null) => {
+      if (credentialGeneration !== getCredentialGeneration()) return;
+      suggestionSourceSelectedAtRef.current = source ? Date.now() : null;
+      setPlaylistSuggestionSourceState(source);
+    },
+    [credentialGeneration],
+  );
 
   // No-op unless the incoming source matches the active one (same playlist +
   // activated climb + board) — so a late async refresh can't clobber a newer
-  // activation. Mirrors the reducer's REFRESH semantics.
-  const refreshPlaylistSuggestionSource = useCallback((source: PlaylistSuggestionSource) => {
-    setPlaylistSuggestionSourceState((current) =>
-      playlistSuggestionSourceMatches(current, source) ? source : current,
-    );
-  }, []);
+  // activation. Mirrors the reducer's REFRESH semantics. Says whether it took
+  // the source, so a caller waiting on the refresh knows its track is the one
+  // the climber walks (#6664).
+  const refreshPlaylistSuggestionSource = useCallback(
+    (source: PlaylistSuggestionSource): boolean => {
+      const sameAccount = credentialGeneration === getCredentialGeneration();
+      // The refresh is built from the list, not from the walk: it keeps the
+      // held track's place in Up next and its last detour (#6777), or the list
+      // would forget where to pick up while a queued climb plays, and Previous
+      // what it came back from.
+      setPlaylistSuggestionSourceState((current) =>
+        sameAccount && current && playlistSuggestionSourceMatches(current, source)
+          ? withPlaylistTrackPlace(source, current)
+          : current,
+      );
+      return sameAccount && playlistSuggestionSourceMatches(playlistSuggestionSourceRef.current, source);
+    },
+    [credentialGeneration],
+  );
 
-  // Moving off the list hands swipes back to the queue. Swipes are list-first
-  // (issue #4829): while the current climb is in `playlistSuggestionSource.climbs`
-  // next/previous walk that ordered list. Plenty of things move the current climb
+  // Moving off the list hands swipes back to the queue. While the current climb
+  // is in `playlistSuggestionSource.climbs` (issue #4829), or a queued climb plays
+  // Up next in the middle of the list (#6777, the track's `resume`), next/previous
+  // walk Up next and then that ordered list. Plenty of things move the current climb
   // without going through `setCurrentClimb` — a crew member's CurrentClimbChanged,
   // a widget Next/Previous tap, or joining a session already parked on a climb.
   //
@@ -1919,6 +3562,25 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     (input: PublishPlaybackStateInput) => mutations.publishPlaybackState(input),
     [mutations],
   );
+  // The crew rest clock's one write path (#5382): the publisher and the
+  // auto-advance scheduler send through here, so the call joins the session first.
+  const setSessionRestCadence = useCallback<QueueActionsContextValue['setSessionRestCadence']>(
+    (input, options) => mutations.setSessionRestCadence(input, options),
+    [mutations],
+  );
+
+  // Replay from here (F3, decision 8): offered on a History row only in
+  // now-slot mode and only while a climb is current. With nothing current a
+  // STEP would mean `move-history`, the same as the plain tap, and in legacy
+  // mode the plain tap already does the pointer move.
+  const findReplayFromHereItem = useCallback((queueItemUuid: string): ClimbQueueItem | null => {
+    if (!nowSlotModeRef.current) return null;
+    const { queue, currentClimbQueueItem } = stateRef.current;
+    if (!currentClimbQueueItem) return null;
+    const currentIndex = queue.findIndex((queueItem) => queueItem.uuid === currentClimbQueueItem.uuid);
+    const rowIndex = queue.findIndex((queueItem) => queueItem.uuid === queueItemUuid);
+    return rowIndex >= 0 && rowIndex < currentIndex ? queue[rowIndex] : null;
+  }, []);
 
   // Stable action bundle. Split out of contextValue so consumers that only need
   // to dispatch (the climb list's addToQueue) can subscribe via useQueueActions()
@@ -1930,12 +3592,16 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       addToQueue,
       playNext,
       removeFromQueue,
+      removeQueueItems,
+      restoreQueueItems,
       reorderQueue,
       clearQueue,
       setQueue,
       getQueueSnapshot,
-      appendGeneratedSession,
+      findReplayFromHereItem,
+      appendQueueItems,
       setCurrentClimb,
+      refreshAuthoredClimb,
       nextClimb,
       previousClimb,
       dispatchWidgetNavigation,
@@ -1953,17 +3619,22 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       setSessionBoardSerial,
       subscribeToPlaybackEvents,
       publishPlaybackState,
+      setSessionRestCadence,
     }),
     [
       addToQueue,
       playNext,
       removeFromQueue,
+      removeQueueItems,
+      restoreQueueItems,
       reorderQueue,
       clearQueue,
       setQueue,
       getQueueSnapshot,
-      appendGeneratedSession,
+      findReplayFromHereItem,
+      appendQueueItems,
       setCurrentClimb,
+      refreshAuthoredClimb,
       nextClimb,
       previousClimb,
       dispatchWidgetNavigation,
@@ -1981,6 +3652,7 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       setSessionBoardSerial,
       subscribeToPlaybackEvents,
       publishPlaybackState,
+      setSessionRestCadence,
     ],
   );
 
@@ -1993,9 +3665,10 @@ export function QueueProvider({ children }: { children: ReactNode }) {
       lastConnectedBoardSerial,
       participantId,
       isSessionWallLit,
+      lastCurrentChange,
       ...actionsValue,
     }),
-    [state, sessionId, lastConnectedBoardSerial, participantId, isSessionWallLit, actionsValue],
+    [state, sessionId, lastConnectedBoardSerial, participantId, isSessionWallLit, lastCurrentChange, actionsValue],
   );
 
   // Active-climb selector: identity changes ONLY when the active climb uuid
@@ -2014,15 +3687,40 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   // pair. The reducer spreads state on every update, so these two references
   // survive session/wall-lit/roster bookkeeping — the play drawer and queue
   // sheets subscribe here and stop re-rendering on that unrelated churn.
+  // Project roster identity here: a stats push must not wake the player merely
+  // because it recreated the roster. Only the named mover's face can change it.
+  const currentMover = resolveCurrentClimbMoverFace({
+    currentChangedBy: state.currentChangedBy,
+    participantId: sessionRuntimeState.participantId,
+    sessionUsers,
+  });
+  const currentMoverName = currentMover?.username ?? null;
+  const currentMoverAvatarUrl = currentMover?.avatarUrl ?? null;
   const queueDataValue = useMemo<QueueDataContextValue>(
-    () => ({ queue: state.queue, currentClimbQueueItem: state.currentClimbQueueItem }),
-    [state.queue, state.currentClimbQueueItem],
+    () => ({
+      queue: state.queue,
+      currentClimbQueueItem: state.currentClimbQueueItem,
+      currentChangedBy: state.currentChangedBy ?? null,
+      currentClimbMover:
+        currentMoverName === null ? null : { username: currentMoverName, avatarUrl: currentMoverAvatarUrl },
+      historyCount: state.historyCount ?? null,
+      nowSlotMode: state.nowSlotMode ?? false,
+    }),
+    [
+      state.queue,
+      state.currentClimbQueueItem,
+      state.currentChangedBy,
+      state.historyCount,
+      state.nowSlotMode,
+      currentMoverName,
+      currentMoverAvatarUrl,
+    ],
   );
 
   // SessionId-only selector: identity changes only when a session starts/ends,
   // so structural readers (tab layout, board adapter, session screen) stop
   // re-rendering the navigation tree on every queue mutation.
-  const sessionIdValue = useMemo<QueueSessionIdContextValue>(() => ({ sessionId }), [sessionId]);
+  const sessionIdValue = useMemo<QueueSessionIdContextValue>(() => ({ sessionId, undoScope }), [sessionId, undoScope]);
 
   // Live analytics + presence: the ≤1/2s party push recreates only this small
   // value, re-rendering only SessionScreen + InSessionView.
@@ -2079,8 +3777,14 @@ export function QueueProvider({ children }: { children: ReactNode }) {
     const timer = setTimeout(() => setCrewDwellElapsed(true), SHARED_SESSION_DWELL_MS);
     return () => clearTimeout(timer);
   }, [crewPresentNow, crewHoldingNow]);
-  const isSharedSession = sharedBrowseEnabled && crewHoldingNow && crewDwellElapsed;
-  const sharedSessionValue = useMemo<QueueSharedSessionContextValue>(() => ({ isSharedSession }), [isSharedSession]);
+  // The crew itself, flag or no flag: who may move the wall must not depend on a
+  // gesture rollout (see `isCrewSession` on the context).
+  const isCrewSession = crewHoldingNow && crewDwellElapsed;
+  const isSharedSession = sharedBrowseEnabled && isCrewSession;
+  const sharedSessionValue = useMemo<QueueSharedSessionContextValue>(
+    () => ({ isSharedSession, isCrewSession }),
+    [isSharedSession, isCrewSession],
+  );
 
   const playlistSuggestionValue = useMemo<QueuePlaylistSuggestionContextValue>(
     () => ({ playlistSuggestionSource }),
@@ -2131,21 +3835,27 @@ export function QueueProvider({ children }: { children: ReactNode }) {
   return (
     <QueueSessionControlContext.Provider value={sessionControlValue}>
       <QueueSessionIdContext.Provider value={sessionIdValue}>
-        <QueueLiveStatsContext.Provider value={liveStatsValue}>
-          <QueueSharedSessionContext.Provider value={sharedSessionValue}>
-            <QueueActionsContext.Provider value={actionsValue}>
-              <QueuePlaylistSuggestionContext.Provider value={playlistSuggestionValue}>
-                <QueueActiveClimbContext.Provider value={activeClimbValue}>
-                  <QueueHasActiveClimbContext.Provider value={hasActiveClimbValue}>
-                    <QueueDataContext.Provider value={queueDataValue}>
-                      <QueueContext.Provider value={contextValue}>{children}</QueueContext.Provider>
-                    </QueueDataContext.Provider>
-                  </QueueHasActiveClimbContext.Provider>
-                </QueueActiveClimbContext.Provider>
-              </QueuePlaylistSuggestionContext.Provider>
-            </QueueActionsContext.Provider>
-          </QueueSharedSessionContext.Provider>
-        </QueueLiveStatsContext.Provider>
+        <QueueSessionBoardPathContext.Provider value={sessionId ? sessionRuntimeState.boardPath : ''}>
+          <QueueLiveStatsContext.Provider value={liveStatsValue}>
+            <QueueSharedSessionContext.Provider value={sharedSessionValue}>
+              <QueueActionsContext.Provider value={actionsValue}>
+                <QueuePlaylistSuggestionContext.Provider value={playlistSuggestionValue}>
+                  <QueueActiveClimbContext.Provider value={activeClimbValue}>
+                    <QueueHasActiveClimbContext.Provider value={hasActiveClimbValue}>
+                      <QueueDataContext.Provider value={queueDataValue}>
+                        <QueueContext.Provider value={contextValue}>
+                          <QueueRestoredContext.Provider value={queueRestored}>
+                            {children}
+                          </QueueRestoredContext.Provider>
+                        </QueueContext.Provider>
+                      </QueueDataContext.Provider>
+                    </QueueHasActiveClimbContext.Provider>
+                  </QueueActiveClimbContext.Provider>
+                </QueuePlaylistSuggestionContext.Provider>
+              </QueueActionsContext.Provider>
+            </QueueSharedSessionContext.Provider>
+          </QueueLiveStatsContext.Provider>
+        </QueueSessionBoardPathContext.Provider>
       </QueueSessionIdContext.Provider>
     </QueueSessionControlContext.Provider>
   );

@@ -1,12 +1,27 @@
 // @vitest-environment jsdom
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+// Delivery metadata is covered by offline-write-context.test.ts; keep these unit tests native-free.
+vi.mock('../../../../offline/offline-write-context', () => ({
+  readOfflineWriteRelease: () => ({
+    platform: 'ios',
+    appVersion: null,
+    runtimeVersion: null,
+    updateId: null,
+    isEmbedded: null,
+    branch: null,
+  }),
+  enqueueMeasuredMutation: async (...args: Parameters<typeof import('@boardsesh/offline-sync').enqueue>) =>
+    (await import('@boardsesh/offline-sync')).enqueue(...args),
+}));
+
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import type { ReactNode } from 'react';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, type InfiniteData } from '@tanstack/react-query';
 import {
   FOLLOW_USER,
   GET_BULK_VOTE_SUMMARIES,
   GET_FOLLOWERS,
+  GET_FOLLOWING,
   SEARCH_USERS,
   UNFOLLOW_USER,
 } from '@boardsesh/graphql/operations';
@@ -23,7 +38,7 @@ vi.mock('../../client', () => ({
   getHttpClient: () => ({ request: requestMock }),
 }));
 
-import { useBulkVoteSummaries, useFollowers, useSearchUsers, useToggleUserFollow } from '../use-social';
+import { useBulkVoteSummaries, useFollowers, useFollowing, useSearchUsers, useToggleUserFollow } from '../use-social';
 
 function makeWrapper() {
   const queryClient = new QueryClient({
@@ -75,7 +90,37 @@ beforeEach(() => {
   requestMock.mockReset();
 });
 
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe('useFollowers', () => {
+  it('finishes its native request into the cache after the screen unmounts', async () => {
+    // As before account views: native keys carry no account, and sign-out
+    // clears the whole cache. The read hands the transport no signal, so
+    // nothing the screen does can abort it.
+    let complete!: (response: { followers: FollowConnection }) => void;
+    requestMock.mockImplementation(
+      () => new Promise<{ followers: FollowConnection }>((resolve) => (complete = resolve)),
+    );
+    const { queryClient, Wrapper } = makeWrapper();
+    const { unmount } = renderHook(() => useFollowers('profile-user'), { wrapper: Wrapper });
+    await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(1));
+    expect(requestMock.mock.calls[0]).toHaveLength(2);
+    expect(queryClient.getQueryCache().getAll()[0].queryKey).toEqual(['followers', 'profile-user']);
+
+    unmount();
+    await act(async () => {
+      complete({ followers: makeFollowConnection(0) });
+    });
+    await waitFor(() =>
+      expect(
+        queryClient.getQueryData<InfiniteData<FollowConnection>>(['followers', 'profile-user'])?.pages[0].users,
+      ).toHaveLength(30),
+    );
+    queryClient.clear();
+  });
+
   it('advances offset pagination by the accumulated user count', async () => {
     requestMock.mockImplementation((_query: unknown, variables: { input: { offset: number } }) =>
       Promise.resolve({ followers: makeFollowConnection(variables.input.offset) }),
@@ -104,6 +149,46 @@ describe('useFollowers', () => {
     expect(requestMock).toHaveBeenLastCalledWith(GET_FOLLOWERS, {
       input: { userId: 'profile-user', limit: 30, offset: 60 },
     });
+  });
+});
+
+describe('people readers in screenshot mode', () => {
+  // #7552 removed the one-page screenshot cap from these three readers, so a
+  // screenshot capture pages them like any other build.
+  it('pages followers, following and search past the first page', async () => {
+    vi.stubEnv('EXPO_PUBLIC_SCREENSHOT_MODE', '1');
+    requestMock.mockImplementation((query: unknown, variables: { input: { offset: number } }) => {
+      if (query === GET_FOLLOWERS) return Promise.resolve({ followers: makeFollowConnection(variables.input.offset) });
+      if (query === GET_FOLLOWING) return Promise.resolve({ following: makeFollowConnection(variables.input.offset) });
+      return Promise.resolve({ searchUsers: makeSearchConnection(variables.input.offset) });
+    });
+    const { Wrapper } = makeWrapper();
+
+    const { result } = renderHook(
+      () => ({
+        followers: useFollowers('profile-user'),
+        following: useFollowing('profile-user'),
+        search: useSearchUsers('ma'),
+      }),
+      { wrapper: Wrapper },
+    );
+
+    await waitFor(() => {
+      for (const reader of Object.values(result.current)) expect(reader.hasNextPage).toBe(true);
+    });
+    await act(async () => {
+      await Promise.all(Object.values(result.current).map((reader) => reader.fetchNextPage()));
+    });
+
+    await waitFor(() => {
+      for (const reader of Object.values(result.current)) expect(reader.data?.pages).toHaveLength(2);
+    });
+    for (const document of [GET_FOLLOWERS, GET_FOLLOWING, SEARCH_USERS]) {
+      const offsets = (requestMock.mock.calls as [unknown, { input: { offset: number } }][])
+        .filter(([query]) => query === document)
+        .map(([, variables]) => variables.input.offset);
+      expect(offsets).toEqual([0, 30]);
+    }
   });
 });
 

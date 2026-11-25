@@ -1,13 +1,31 @@
+import { boardGymListedCondition } from '@boardsesh/db/queries';
+import { z } from 'zod';
+import { BoardNameSchema, normalizeSerial } from '../../../validation/schemas/primitives';
+import { commentPrivacyCondition, tickPrivacyCondition } from '../shared/activity-privacy';
+import {
+  canAccessBoard,
+  canAccessResource,
+  canAccessResourceWithoutLink,
+  effectiveBoardAudience,
+  legacyResourceAudience,
+  legacyLocationAudience,
+  canViewActivityIdentity,
+  canViewResourceLocation,
+  resourceAccessCondition,
+  resourceLocationCondition,
+  visibleActivityUserIds,
+} from '../../../services/privacy';
 import { v4 as uuidv4 } from 'uuid';
-import { eq, ne, and, count, isNull, isNotNull, sql, ilike, or, asc, desc, inArray, like } from 'drizzle-orm';
+import { eq, ne, and, count, isNull, isNotNull, sql, ilike, or, asc, desc, inArray, like, type SQL } from 'drizzle-orm';
 import { GraphQLError } from 'graphql';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { normaliseSetIds } from '@boardsesh/board-config';
 import { rowsFromResult } from '@boardsesh/db/client';
+import { readSprayWallImportProgress } from '@boardsesh/db/queries';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
-import { resolveBoardBySlug } from '../shared/board-lookup';
+import { resolveBoardLinkBySlug } from '../shared/board-lookup';
 import { consensusDifficultyExpr } from '../shared/sql-expressions';
 import {
   CreateBoardInputSchema,
@@ -18,6 +36,7 @@ import {
   PinBoardInputSchema,
   RecordBoardOpenedInputSchema,
   SearchBoardsInputSchema,
+  PublicSprayWallsInputSchema,
   PopularBoardConfigsInputSchema,
   SerialNumberLookupSchema,
   RecordBoardSerialInputSchema,
@@ -25,12 +44,30 @@ import {
   BOARD_ANGLE_VALIDATION_MESSAGE,
   isBoardAngleSupported,
 } from '../../../validation/schemas';
-import { generateUniqueGymSlug, requireBoardGymLinkAccess, userCanEditGym } from './gyms';
+import { generateUniqueGymSlug, requireBoardGymLinkAccess, resolveCanonicalGymByUuid, userCanEditGym } from './gyms';
 import { resolveAutoGymForBoard } from './gym-matching';
+import {
+  loadProjectionGym,
+  loadProjectionGyms,
+  projectBoardLocation,
+} from '../../../services/board-location-projection';
 import { findBlockingDuplicate, type BoardLocation } from './board-duplicates';
+import { assertNoExistingWalls, collectWallScope, type WallScope } from './existing-wall-check';
 import { assertBoardCapNotReached } from './board-limits';
 import { syncLocationGeography } from './location-geography';
-import { getUserCommunityRoles, hasAdminOrLeader, rolesGrantAdminOrLeader } from './roles';
+import { getUserCommunityRoles, rolesGrantAdminOrLeader, requireAdmin, type CommunityRoleScope } from './roles';
+import { rolesGrantAdmin } from '@boardsesh/community-roles';
+import { gymClaimProbationEndsAt, gymClaimProbationError, loadGymClaimProbations } from './gym-claim-guardrails';
+import type { BoardModerationActorRole, BoardModerationEventDetails } from '@boardsesh/db/schema';
+import {
+  recordBoardModerationEvent,
+  recordStaffBoardEdit,
+  viewerGymManagerRole,
+  type ModerationExecutor,
+} from './board-moderation-events';
+import { onBoardDeleted } from './directory-reports/lifecycle';
+import { transactionWithAfterCommit, type DbTransaction } from '../../../db/after-commit';
+import { loadBoardReportFlags } from './directory-reports/read';
 import {
   SYSTEM_BOARD_OWNER_ID,
   followBoardMergeChain,
@@ -44,7 +81,7 @@ import { logger } from '../../../utils/logger';
 import { isUniqueViolation } from '../../../utils/postgres-errors';
 import { getPopularConfigs } from '../../../services/popular-board-configs';
 import { lockAndAssertBoardSerialAvailable } from '../board-serial-write-lock';
-import { listableSprayWallCondition } from '../board/spray-wall-listing';
+import { listableSprayWallCondition, ownedUnfinishedSprayWallCondition } from '../board/spray-wall-listing';
 
 // ============================================
 // Helpers
@@ -126,15 +163,18 @@ type DuplicateBoardCandidate = {
  *
  * `excludeBoardId` is the row being edited — a board must never block itself.
  */
-async function findOwnedBlockingDuplicate(opts: {
-  ownerId: string;
-  boardType: string;
-  layoutId: number;
-  sizeId: number;
-  incoming: BoardLocation & { setIds: string };
-  excludeBoardId?: number;
-}): Promise<DuplicateBoardCandidate | undefined> {
-  const ownedWithConfig = await db
+export async function findOwnedBlockingDuplicate(
+  opts: {
+    ownerId: string;
+    boardType: string;
+    layoutId: number;
+    sizeId: number;
+    incoming: BoardLocation & { setIds: string };
+    excludeBoardId?: number;
+  },
+  executor: Pick<typeof db, 'select'> = db,
+): Promise<DuplicateBoardCandidate | undefined> {
+  const ownedWithConfig = await executor
     .select({
       uuid: dbSchema.userBoards.uuid,
       slug: dbSchema.userBoards.slug,
@@ -244,34 +284,203 @@ export async function resolveBoardFromPath(
   return candidates.find((candidate) => normaliseSetIds(candidate.setIds) === targetSetIds)?.id ?? null;
 }
 
+type BoardEditExecutor = ModerationExecutor;
+
 /**
- * Whether a user owns or is an admin member of a gym. Used to authorize editing
- * a board through its linked gym (gym owners/admins may fix the gym's boards).
+ * Whether a user owns or is an admin member of a live gym. Used to authorize
+ * editing a board through its linked gym (gym owners/admins may fix the gym's
+ * boards) and, on SYSTEM boards only, deleting it.
  */
-async function viewerCanAdminGym(gymId: number, userId: string): Promise<boolean> {
-  const [ownedGym] = await db
-    .select({ id: dbSchema.gyms.id })
+async function viewerCanAdminGym(gymId: number, userId: string, executor: BoardEditExecutor = db): Promise<boolean> {
+  return (await viewerGymManagerRole(gymId, userId, executor)) !== null;
+}
+
+/**
+ * Who may delete a board (docs/product/gym-board-governance.md, decision 1):
+ * - its creator;
+ * - the owner or an admin of its live linked gym, on a SYSTEM (synced) board
+ *   only. A climber's board at the gym is theirs: staff take it off the
+ *   listing with `detachBoardFromGym` instead. Not while the gym is in its
+ *   14-day claim probation (docs/product/gym-claims.md): that refusal carries
+ *   `GYM_CLAIM_PROBATION`;
+ * - a global admin, on any board, probation or not.
+ *
+ * A non-owner must also be able to read the board: gym management and admin
+ * status never reveal a private board by UUID. Returns the role used, which
+ * the caller records on a non-owner delete. Callers run it again inside the
+ * delete's transaction, against the locked row, so authority revoked while the
+ * delete waited is not used.
+ *
+ * `viewerMayDeleteBoard` is the same rule over pre-loaded authority, for
+ * `UserBoard.canDelete`. Change both together.
+ * A matching receipt may skip visibility for an already-deleted row only;
+ * its current actor authority and claim probation still apply.
+ */
+export async function requireBoardDeleteAccess(
+  userId: string,
+  board: Pick<typeof dbSchema.userBoards.$inferSelect, 'uuid' | 'ownerId' | 'gymId'> & { deletedAt?: Date | null },
+  executor: BoardEditExecutor = db,
+  options: { deletedReceiptReplay?: boolean } = {},
+): Promise<BoardModerationActorRole> {
+  if (board.ownerId === userId) return 'board_owner';
+  const actorRole = await boardDeleteAuthority(userId, board, executor);
+  if (!actorRole) {
+    throw new Error('Not authorized to delete this board');
+  }
+  if (
+    !(options.deletedReceiptReplay && board.deletedAt != null) &&
+    !(await canAccessResource('board', board.uuid, userId, executor))
+  ) {
+    throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+  }
+  return actorRole;
+}
+
+async function boardDeleteAuthority(
+  userId: string,
+  board: Pick<typeof dbSchema.userBoards.$inferSelect, 'ownerId' | 'gymId'>,
+  executor: BoardEditExecutor,
+): Promise<BoardModerationActorRole | null> {
+  if (board.ownerId === SYSTEM_BOARD_OWNER_ID && board.gymId != null) {
+    const gymRole = await viewerGymManagerRole(board.gymId, userId, executor);
+    if (gymRole) {
+      const probationEndsAt = await gymClaimProbationEndsAt(board.gymId, executor);
+      if (probationEndsAt === null) return gymRole;
+      if (rolesGrantAdmin(await getUserCommunityRoles(userId, executor), null)) return 'global_admin';
+      throw gymClaimProbationError(probationEndsAt);
+    }
+  }
+  if (rolesGrantAdmin(await getUserCommunityRoles(userId, executor), null)) return 'global_admin';
+  return null;
+}
+
+type BoardPermissionFacts = Pick<typeof dbSchema.userBoards.$inferSelect, 'ownerId' | 'gymId' | 'deletedAt'>;
+
+/** `requireBoardDeleteAccess`'s rule for a board the viewer can already read. */
+function viewerMayDeleteBoard(
+  board: BoardPermissionFacts,
+  viewerId: string,
+  authority: ViewerGymAuthority,
+  viewerRoles: readonly CommunityRoleScope[],
+): boolean {
+  if (board.deletedAt != null) return false;
+  if (board.ownerId === viewerId) return true;
+  if (
+    board.ownerId === SYSTEM_BOARD_OWNER_ID &&
+    board.gymId != null &&
+    authority.managedGymIds.has(board.gymId) &&
+    !authority.probationGymIds.has(board.gymId)
+  ) {
+    return true;
+  }
+  return rolesGrantAdmin(viewerRoles, null);
+}
+
+/**
+ * Whether the viewer can take this board off its gym's listing: its creator
+ * (with `linkBoardToGym`, gym null) or anyone who passes `requireGymEditAccess`
+ * for the board's gym (with `detachBoardFromGym`). A synced (SYSTEM) board is
+ * deleted, not removed, so only a global admin may remove one; the rule
+ * `detachBoardFromGym` enforces.
+ */
+function viewerMayRemoveBoardFromGym(
+  board: BoardPermissionFacts,
+  viewerId: string,
+  authority: ViewerGymAuthority,
+  viewerRoles: readonly CommunityRoleScope[],
+): boolean {
+  if (board.deletedAt != null || board.gymId == null) return false;
+  if (board.ownerId === viewerId) return true;
+  if (!authority.editableGymIds.has(board.gymId)) return false;
+  return board.ownerId !== SYSTEM_BOARD_OWNER_ID || rolesGrantAdmin(viewerRoles, null);
+}
+
+/** The viewer's relationship to each live gym among a set of board links. */
+type ViewerGymRow = { id: number; ownerId: string; memberRole: string | null };
+
+type ViewerGymAuthority = {
+  /** Live gyms the viewer owns or admins: board edit, and delete of SYSTEM boards. */
+  managedGymIds: Set<number>;
+  /** Live gyms that pass `requireGymEditAccess` for the viewer: detach. */
+  editableGymIds: Set<number>;
+  /** Of the managed gyms, those in claim probation: no delete of SYSTEM boards there. */
+  probationGymIds: Set<number>;
+};
+
+const NO_GYM_AUTHORITY = (): ViewerGymAuthority => ({
+  managedGymIds: new Set<number>(),
+  editableGymIds: new Set<number>(),
+  probationGymIds: new Set<number>(),
+});
+
+/** One query: the viewer's ownership and membership role at each live gym. */
+async function loadViewerGymRows(
+  gymIds: readonly number[],
+  viewerId: string,
+  executor: BoardEditExecutor = db,
+): Promise<ViewerGymRow[]> {
+  if (gymIds.length === 0) return [];
+  return executor
+    .select({ id: dbSchema.gyms.id, ownerId: dbSchema.gyms.ownerId, memberRole: dbSchema.gymMembers.role })
     .from(dbSchema.gyms)
-    .where(and(eq(dbSchema.gyms.id, gymId), eq(dbSchema.gyms.ownerId, userId), isNull(dbSchema.gyms.deletedAt)))
-    .limit(1);
-
-  if (ownedGym) return true;
-
-  const [adminMembership] = await db
-    .select({ role: dbSchema.gymMembers.role })
-    .from(dbSchema.gymMembers)
-    .innerJoin(dbSchema.gyms, eq(dbSchema.gyms.id, dbSchema.gymMembers.gymId))
-    .where(
-      and(
-        eq(dbSchema.gymMembers.gymId, gymId),
-        eq(dbSchema.gymMembers.userId, userId),
-        eq(dbSchema.gymMembers.role, 'admin'),
-        isNull(dbSchema.gyms.deletedAt),
-      ),
+    .leftJoin(
+      dbSchema.gymMembers,
+      and(eq(dbSchema.gymMembers.gymId, dbSchema.gyms.id), eq(dbSchema.gymMembers.userId, viewerId)),
     )
-    .limit(1);
+    .where(and(inArray(dbSchema.gyms.id, [...gymIds]), isNull(dbSchema.gyms.deletedAt)));
+}
 
-  return !!adminMembership;
+/**
+ * Gym authority for a whole list of boards without a query per row. Mirrors
+ * `requireGymEditAccess`: owner, gym admin or editor, or a community admin or
+ * leader whose role is global or scoped to a board type live at the gym. The
+ * covering-role read runs only for a viewer holding a scoped role.
+ */
+async function resolveViewerGymAuthority(
+  gymRows: readonly ViewerGymRow[],
+  viewerId: string,
+  viewerRoles: readonly CommunityRoleScope[],
+  executor: BoardEditExecutor = db,
+): Promise<ViewerGymAuthority> {
+  const managedGymIds = new Set<number>();
+  const editableGymIds = new Set<number>();
+  const liveGymIds = [...new Set(gymRows.map((row) => row.id))];
+  for (const row of gymRows) {
+    const isOwner = row.ownerId === viewerId;
+    if (isOwner || row.memberRole === 'admin') managedGymIds.add(row.id);
+    if (isOwner || row.memberRole === 'admin' || row.memberRole === 'editor') editableGymIds.add(row.id);
+  }
+  // One read for every managed gym, only when the viewer manages any.
+  const probationGymIds = new Set((await loadGymClaimProbations([...managedGymIds], executor)).keys());
+  if (liveGymIds.length === 0) return { managedGymIds, editableGymIds, probationGymIds };
+
+  if (rolesGrantAdminOrLeader([...viewerRoles], null)) {
+    for (const gymId of liveGymIds) editableGymIds.add(gymId);
+    return { managedGymIds, editableGymIds, probationGymIds };
+  }
+  const scopedBoardTypes = [
+    ...new Set(
+      viewerRoles.flatMap((role) =>
+        role.boardType !== null && rolesGrantAdminOrLeader([role], role.boardType) ? [role.boardType] : [],
+      ),
+    ),
+  ];
+  if (scopedBoardTypes.length > 0) {
+    const coveredGyms = await executor
+      .selectDistinct({ gymId: dbSchema.userBoards.gymId })
+      .from(dbSchema.userBoards)
+      .where(
+        and(
+          inArray(dbSchema.userBoards.gymId, liveGymIds),
+          inArray(dbSchema.userBoards.boardType, scopedBoardTypes),
+          isNull(dbSchema.userBoards.deletedAt),
+        ),
+      );
+    for (const { gymId } of coveredGyms) {
+      if (gymId != null) editableGymIds.add(gymId);
+    }
+  }
+  return { managedGymIds, editableGymIds, probationGymIds };
 }
 
 /**
@@ -285,9 +494,31 @@ function boardIsRoleEditable(board: { isPublic: boolean; ownerId: string }): boo
 }
 
 /**
- * Authorize editing a board: the caller must be the board owner, a community
- * admin/leader for the board's type (public/catalog boards only), or the
- * owner/admin of the board's linked gym. Throws when none apply.
+ * Whether this user may edit a board: the board owner, a community admin/leader
+ * for the board's type (public/catalog boards only), or the owner/admin of the
+ * board's linked gym.
+ *
+ * The rule itself, non-throwing. `requireBoardEditAccess` is this plus a throw,
+ * so the two cannot drift. `updateClimb` reads it to decide whether somebody who
+ * is not a spray climb's setter may still edit it (#5955).
+ */
+export async function canEditBoard(
+  userId: string,
+  board: Pick<typeof dbSchema.userBoards.$inferSelect, 'ownerId' | 'isPublic' | 'boardType' | 'gymId'>,
+  executor: BoardEditExecutor = db,
+): Promise<boolean> {
+  if (board.ownerId === userId) return true;
+  if (
+    boardIsRoleEditable(board) &&
+    rolesGrantAdminOrLeader(await getUserCommunityRoles(userId, executor), board.boardType)
+  )
+    return true;
+  if (board.gymId != null && (await viewerCanAdminGym(board.gymId, userId, executor))) return true;
+  return false;
+}
+
+/**
+ * Authorize editing a board, by `canEditBoard`'s rule. Throws when it refuses.
  *
  * Exported so the spray wall API uses this rule UNCHANGED rather than growing a
  * second one (epic decision 2026-09-14: ownership grants editing a wall, with no
@@ -298,25 +529,67 @@ function boardIsRoleEditable(board: { isPublic: boolean; ownerId: string }): boo
 export async function requireBoardEditAccess(
   ctx: ConnectionContext,
   board: typeof dbSchema.userBoards.$inferSelect,
+  executor: BoardEditExecutor = db,
 ): Promise<void> {
-  const userId = ctx.userId!;
-
-  if (board.ownerId === userId) return;
-  if (boardIsRoleEditable(board) && (await hasAdminOrLeader(userId, board.boardType))) return;
-  if (board.gymId != null && (await viewerCanAdminGym(board.gymId, userId))) return;
-
+  if (await canEditBoard(ctx.userId!, board, executor)) return;
   throw new Error('Not authorized to update this board');
+}
+
+/** Batch edit gate for progress polling; missing/revoked boards are omitted. */
+export async function filterEditableBoards(
+  boards: Array<typeof dbSchema.userBoards.$inferSelect>,
+  userId: string,
+): Promise<Array<typeof dbSchema.userBoards.$inferSelect>> {
+  const nonOwnedBoards = boards.filter((board) => board.ownerId !== userId);
+  if (nonOwnedBoards.length === 0) return boards;
+  const gymIds = [...new Set(nonOwnedBoards.flatMap((board) => (board.gymId !== null ? [board.gymId] : [])))];
+  const [roles, editableGyms] = await Promise.all([
+    getUserCommunityRoles(userId),
+    gymIds.length > 0
+      ? db
+          .selectDistinct({ id: dbSchema.gyms.id })
+          .from(dbSchema.gyms)
+          .leftJoin(
+            dbSchema.gymMembers,
+            and(
+              eq(dbSchema.gymMembers.gymId, dbSchema.gyms.id),
+              eq(dbSchema.gymMembers.userId, userId),
+              eq(dbSchema.gymMembers.role, 'admin'),
+            ),
+          )
+          .where(
+            and(
+              inArray(dbSchema.gyms.id, gymIds),
+              isNull(dbSchema.gyms.deletedAt),
+              or(eq(dbSchema.gyms.ownerId, userId), isNotNull(dbSchema.gymMembers.id)),
+            ),
+          )
+      : Promise.resolve([]),
+  ]);
+  const editableGymIds = new Set(editableGyms.map((gym) => gym.id));
+  return boards.filter(
+    (board) =>
+      board.ownerId === userId ||
+      (boardIsRoleEditable(board) && rolesGrantAdminOrLeader(roles, board.boardType)) ||
+      (board.gymId !== null && editableGymIds.has(board.gymId)),
+  );
 }
 
 /**
  * The single gate for exposing a board's numeric presence-channel id
- * (userBoards.id, the `UserBoard.boardId` field feeding boardNowPlaying):
- * public boards expose it to everyone; private boards only to viewers with
- * board-level edit access. Every surface returning a UserBoard MUST use this —
- * a diverging inline computation could leak a private board's live channel.
+ * (userBoards.id, the `UserBoard.boardId` field feeding boardNowPlaying). Every
+ * surface returning a UserBoard MUST use this.
+ *
+ * The id is a sequential bigserial, so it opens nothing by itself: each
+ * presence read keyed on it takes the no-link reading unless the caller also
+ * presents the board's uuid. Exposing it to a viewer who may read the board is
+ * what lets that viewer's client reach the board's presence at all, so a board
+ * a viewer reached by its link (an Unlisted board saved with `is_public =
+ * false` included) exposes it to them. `viewerMayRead` is true on every path
+ * that already passed `canAccessResource` for this viewer.
  */
-function boardPresenceChannelId(board: { id: number; isPublic: boolean }, canEdit: boolean): number | null {
-  return board.isPublic || canEdit ? board.id : null;
+function boardPresenceChannelId(board: { id: number }, viewerMayRead: boolean, canEdit: boolean): number | null {
+  return viewerMayRead || canEdit ? board.id : null;
 }
 
 /**
@@ -340,9 +613,10 @@ async function resolveBoardFollowingMerges(
 }
 
 /**
- * Enrich a board row with computed fields (counts, names, follow status).
+ * Enrich a board row with computed fields (counts, names, follow status). The
+ * caller has already checked the viewer may read the board.
  */
-async function enrichBoard(
+export async function enrichBoard(
   board: typeof dbSchema.userBoards.$inferSelect,
   authenticatedUserId?: string,
   distanceMeters?: number | null,
@@ -355,8 +629,8 @@ async function enrichBoard(
     commentStatsResult,
     followCheckResult,
     gymInfoResult,
-    canEditByRole,
-    canEditByGym,
+    viewerRoles,
+    viewerGymRows,
     pinResult,
   ] = await Promise.all([
     // Get owner profile
@@ -398,6 +672,7 @@ async function enrichBoard(
           eq(dbSchema.comments.entityType, 'board'),
           eq(dbSchema.comments.entityId, board.uuid),
           isNull(dbSchema.comments.deletedAt),
+          commentPrivacyCondition(authenticatedUserId),
         ),
       ),
 
@@ -411,22 +686,17 @@ async function enrichBoard(
           )
       : Promise.resolve([]),
 
-    // Get gym info if board is linked to a gym
-    board.gymId
-      ? db
-          .select({ uuid: dbSchema.gyms.uuid, name: dbSchema.gyms.name })
-          .from(dbSchema.gyms)
-          .where(and(eq(dbSchema.gyms.id, board.gymId), isNull(dbSchema.gyms.deletedAt)))
-          .limit(1)
-      : Promise.resolve([]),
+    // The board's gym: its link, and the place a viewer the board's own
+    // location is hidden from sees instead when the gym is public.
+    loadProjectionGym(board.gymId),
 
-    // Whether the viewer is a community admin/leader for this board type
-    authenticatedUserId ? hasAdminOrLeader(authenticatedUserId, board.boardType) : Promise.resolve(false),
+    // The viewer's community roles (edit, delete and covering-role checks)
+    authenticatedUserId ? getUserCommunityRoles(authenticatedUserId) : Promise.resolve([]),
 
-    // Whether the viewer owns/admins the board's linked gym
+    // The viewer's standing at the board's linked gym
     authenticatedUserId && board.gymId != null
-      ? viewerCanAdminGym(board.gymId, authenticatedUserId)
-      : Promise.resolve(false),
+      ? loadViewerGymRows([board.gymId], authenticatedUserId)
+      : Promise.resolve([]),
 
     // Whether the viewer pinned this board.
     authenticatedUserId
@@ -444,31 +714,60 @@ async function enrichBoard(
       : Promise.resolve([]),
   ]);
 
+  const [showLocation, showOwner] = await Promise.all([
+    canViewResourceLocation(board.uuid, authenticatedUserId),
+    canViewActivityIdentity(board.ownerId, authenticatedUserId),
+  ]);
   const ownerInfo = ownerResult[0];
   const tickStats = tickStatsResult[0];
   const followerStats = followerStatsResult[0];
   const commentStats = commentStatsResult[0];
   const isFollowedByMe = Number(followCheckResult[0]?.count || 0) > 0;
-  const gymInfo = (gymInfoResult as Array<{ uuid: string; name: string }>)[0];
+  const location = projectBoardLocation(board, gymInfoResult, showLocation);
+  const gymAuthority = authenticatedUserId
+    ? await resolveViewerGymAuthority(viewerGymRows, authenticatedUserId, viewerRoles)
+    : NO_GYM_AUTHORITY();
   const canEdit = authenticatedUserId
-    ? board.ownerId === authenticatedUserId || (canEditByRole && boardIsRoleEditable(board)) || canEditByGym
+    ? board.ownerId === authenticatedUserId ||
+      (rolesGrantAdminOrLeader(viewerRoles, board.boardType) && boardIsRoleEditable(board)) ||
+      (board.gymId != null && gymAuthority.managedGymIds.has(board.gymId))
+    : false;
+  // The delete gate's read check is `canAccessResource`. Callers let this
+  // viewer read the row through `canAccessBoard`, which also admits a member of
+  // a live session on a home wall, so a non-owner the rule admits (gym staff on
+  // a synced board, a global admin) takes that check too: one query, only then.
+  const canDelete =
+    authenticatedUserId != null &&
+    viewerMayDeleteBoard(board, authenticatedUserId, gymAuthority, viewerRoles) &&
+    (board.ownerId === authenticatedUserId || (await canAccessResource('board', board.uuid, authenticatedUserId)));
+  const canRemoveFromGym = authenticatedUserId
+    ? viewerMayRemoveBoardFromGym(board, authenticatedUserId, gymAuthority, viewerRoles)
     : false;
 
+  const sprayImport =
+    canEdit && isSprayBoardType(board.boardType)
+      ? ((await readSprayWallImportProgress(db, [board.uuid]))[0] ?? null)
+      : null;
+  // Waiting reports the viewer can act on, and whether they reported it
+  // (docs/product/directory-reports.md).
+  const reportFlags = (await loadBoardReportFlags([board], authenticatedUserId, viewerRoles)).get(board.id);
+
   return {
+    sprayImport,
     uuid: board.uuid,
     slug: board.slug,
-    ownerId: board.ownerId,
-    ownerDisplayName: ownerInfo?.displayName || ownerInfo?.name || undefined,
-    ownerAvatarUrl: ownerInfo?.avatarUrl || ownerInfo?.image || undefined,
+    ownerId: showOwner ? board.ownerId : null,
+    ownerDisplayName: showOwner ? ownerInfo?.displayName || ownerInfo?.name || undefined : undefined,
+    ownerAvatarUrl: showOwner ? ownerInfo?.avatarUrl || ownerInfo?.image || undefined : undefined,
     boardType: board.boardType,
     layoutId: Number(board.layoutId),
     sizeId: Number(board.sizeId),
     setIds: board.setIds,
     name: board.name,
     description: board.description,
-    locationName: board.locationName,
-    latitude: board.latitude,
-    longitude: board.longitude,
+    locationName: location.locationName,
+    latitude: location.latitude,
+    longitude: location.longitude,
     isPublic: board.isPublic,
     isUnlisted: board.isUnlisted,
     hideLocation: board.hideLocation,
@@ -476,6 +775,7 @@ async function enrichBoard(
     angle: Number(board.angle),
     isAngleAdjustable: board.isAngleAdjustable,
     hasLeds: board.hasLeds,
+    litByWallDevice: board.litByWallDevice,
     createdAt: board.createdAt.toISOString(),
     // Computed name fields (TODO: resolve from board-specific layout/size/set tables if needed)
     layoutName: null,
@@ -487,15 +787,23 @@ async function enrichBoard(
     followerCount: Number(followerStats?.count || 0),
     commentCount: Number(commentStats?.count || 0),
     isFollowedByMe,
-    gymId: board.gymId ?? null,
-    boardId: boardPresenceChannelId(board, canEdit),
-    gymUuid: gymInfo?.uuid ?? null,
-    gymName: gymInfo?.name ?? null,
-    distanceMeters: distanceMeters ?? null,
+    gymId: location.gymId,
+    // Every caller gated this row on `canAccessResource` before enriching it.
+    boardId: boardPresenceChannelId(board, true, canEdit),
+    gymUuid: location.gymUuid,
+    gymName: location.gymName,
+    gymIsListed: gymInfoResult?.isListed ?? null,
+    // A distance is measured from the board's own coordinates, so it goes only
+    // where those may.
+    distanceMeters: location.source === 'own' ? (distanceMeters ?? null) : null,
     serialNumber: board.serialNumber ?? null,
     timerName: board.timerName ?? null,
     canEdit,
+    canDelete,
+    canRemoveFromGym,
     isPinnedByMe: pinResult.length > 0,
+    openReportCount: reportFlags?.openReportCount ?? null,
+    viewerHasOpenReport: reportFlags?.viewerHasOpenReport ?? null,
   };
 }
 
@@ -508,7 +816,22 @@ async function enrichBoard(
 export async function enrichBoards(
   boards: Array<{ board: typeof dbSchema.userBoards.$inferSelect; distanceMeters?: number | null }>,
   authenticatedUserId?: string,
+  options: {
+    allowUnlistedLink?: boolean;
+    /**
+     * Who the ACCESS filter reads as, when that differs from the viewer: a wall
+     * device's key reads its owner's private board (`readViewerIdForBoard`), yet
+     * every viewer-projected field below (canEdit, follows, pins, location,
+     * owner identity, spray import) stays on `authenticatedUserId`. Defaults to
+     * `authenticatedUserId`.
+     */
+    accessUserId?: string;
+  } = {},
 ) {
+  const checkAccess = options.allowUnlistedLink === false ? canAccessResourceWithoutLink : canAccessResource;
+  const accessUserId = options.accessUserId ?? authenticatedUserId;
+  const access = await Promise.all(boards.map(({ board }) => checkAccess('board', board.uuid, accessUserId)));
+  boards = boards.filter((_, index) => access[index]);
   if (boards.length === 0) return [];
 
   const boardIds = boards.map((b) => b.board.id);
@@ -516,143 +839,102 @@ export async function enrichBoards(
   const ownerIds = [...new Set(boards.map((b) => b.board.ownerId))];
   const gymIds = [...new Set(boards.map((b) => b.board.gymId).filter((id): id is number => id != null))];
 
-  const [
-    ownerRows,
-    tickRows,
-    followerRows,
-    commentRows,
-    followRows,
-    gymRows,
-    viewerRoles,
-    ownedGymRows,
-    adminGymRows,
-    pinRows,
-  ] = await Promise.all([
-    // Batch owner profiles
-    db
-      .select({
-        userId: dbSchema.users.id,
-        name: dbSchema.users.name,
-        image: dbSchema.users.image,
-        displayName: dbSchema.userProfiles.displayName,
-        avatarUrl: dbSchema.userProfiles.avatarUrl,
-      })
-      .from(dbSchema.users)
-      .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
-      .where(inArray(dbSchema.users.id, ownerIds)),
+  const [ownerRows, tickRows, followerRows, commentRows, followRows, gymRows, viewerRoles, viewerGymRows, pinRows] =
+    await Promise.all([
+      // Batch owner profiles
+      db
+        .select({
+          userId: dbSchema.users.id,
+          name: dbSchema.users.name,
+          image: dbSchema.users.image,
+          displayName: dbSchema.userProfiles.displayName,
+          avatarUrl: dbSchema.userProfiles.avatarUrl,
+        })
+        .from(dbSchema.users)
+        .leftJoin(dbSchema.userProfiles, eq(dbSchema.users.id, dbSchema.userProfiles.userId))
+        .where(inArray(dbSchema.users.id, ownerIds)),
 
-    // Batch tick stats per board
-    db
-      .select({
-        boardId: dbSchema.boardseshTicks.boardId,
-        totalAscents: count(),
-        uniqueClimbers: sql<number>`COUNT(DISTINCT ${dbSchema.boardseshTicks.userId})`,
-      })
-      .from(dbSchema.boardseshTicks)
-      .where(
-        and(
-          inArray(dbSchema.boardseshTicks.boardId, boardIds),
-          or(eq(dbSchema.boardseshTicks.status, 'flash'), eq(dbSchema.boardseshTicks.status, 'send')),
-        ),
-      )
-      .groupBy(dbSchema.boardseshTicks.boardId),
+      // Batch tick stats per board
+      db
+        .select({
+          boardId: dbSchema.boardseshTicks.boardId,
+          totalAscents: count(),
+          uniqueClimbers: sql<number>`COUNT(DISTINCT ${dbSchema.boardseshTicks.userId})`,
+        })
+        .from(dbSchema.boardseshTicks)
+        .where(
+          and(
+            inArray(dbSchema.boardseshTicks.boardId, boardIds),
+            or(eq(dbSchema.boardseshTicks.status, 'flash'), eq(dbSchema.boardseshTicks.status, 'send')),
+          ),
+        )
+        .groupBy(dbSchema.boardseshTicks.boardId),
 
-    // Batch follower counts per board
-    db
-      .select({
-        boardUuid: dbSchema.boardFollows.boardUuid,
-        count: count(),
-      })
-      .from(dbSchema.boardFollows)
-      .where(inArray(dbSchema.boardFollows.boardUuid, boardUuids))
-      .groupBy(dbSchema.boardFollows.boardUuid),
+      // Batch follower counts per board
+      db
+        .select({
+          boardUuid: dbSchema.boardFollows.boardUuid,
+          count: count(),
+        })
+        .from(dbSchema.boardFollows)
+        .where(inArray(dbSchema.boardFollows.boardUuid, boardUuids))
+        .groupBy(dbSchema.boardFollows.boardUuid),
 
-    // Batch comment counts per board
-    db
-      .select({
-        entityId: dbSchema.comments.entityId,
-        count: count(),
-      })
-      .from(dbSchema.comments)
-      .where(
-        and(
-          eq(dbSchema.comments.entityType, 'board'),
-          inArray(dbSchema.comments.entityId, boardUuids),
-          isNull(dbSchema.comments.deletedAt),
-        ),
-      )
-      .groupBy(dbSchema.comments.entityId),
+      // Batch comment counts per board
+      db
+        .select({
+          entityId: dbSchema.comments.entityId,
+          count: count(),
+        })
+        .from(dbSchema.comments)
+        .where(
+          and(
+            eq(dbSchema.comments.entityType, 'board'),
+            inArray(dbSchema.comments.entityId, boardUuids),
+            isNull(dbSchema.comments.deletedAt),
+            commentPrivacyCondition(authenticatedUserId),
+          ),
+        )
+        .groupBy(dbSchema.comments.entityId),
 
-    // Batch follow status for authenticated user
-    authenticatedUserId
-      ? db
-          .select({ boardUuid: dbSchema.boardFollows.boardUuid })
-          .from(dbSchema.boardFollows)
-          .where(
-            and(
-              eq(dbSchema.boardFollows.userId, authenticatedUserId),
-              inArray(dbSchema.boardFollows.boardUuid, boardUuids),
-            ),
-          )
-      : Promise.resolve([]),
+      // Batch follow status for authenticated user
+      authenticatedUserId
+        ? db
+            .select({ boardUuid: dbSchema.boardFollows.boardUuid })
+            .from(dbSchema.boardFollows)
+            .where(
+              and(
+                eq(dbSchema.boardFollows.userId, authenticatedUserId),
+                inArray(dbSchema.boardFollows.boardUuid, boardUuids),
+              ),
+            )
+        : Promise.resolve([]),
 
-    // Batch gym info
-    gymIds.length > 0
-      ? db
-          .select({ id: dbSchema.gyms.id, uuid: dbSchema.gyms.uuid, name: dbSchema.gyms.name })
-          .from(dbSchema.gyms)
-          .where(and(inArray(dbSchema.gyms.id, gymIds), isNull(dbSchema.gyms.deletedAt)))
-      : Promise.resolve([]),
+      // Batch gym info: the link, and the place shown instead of a hidden one.
+      loadProjectionGyms(gymIds),
 
-    // Viewer's community roles — fetched once, applied per board by board type
-    authenticatedUserId ? getUserCommunityRoles(authenticatedUserId) : Promise.resolve([]),
+      // Viewer's community roles — fetched once, applied per board by board type
+      authenticatedUserId ? getUserCommunityRoles(authenticatedUserId) : Promise.resolve([]),
 
-    // Gyms (among the referenced ones) the viewer owns — grants edit on their boards
-    authenticatedUserId && gymIds.length > 0
-      ? db
-          .select({ id: dbSchema.gyms.id })
-          .from(dbSchema.gyms)
-          .where(
-            and(
-              inArray(dbSchema.gyms.id, gymIds),
-              eq(dbSchema.gyms.ownerId, authenticatedUserId),
-              isNull(dbSchema.gyms.deletedAt),
-            ),
-          )
-      : Promise.resolve([]),
+      // The viewer's standing at every referenced live gym: one query.
+      authenticatedUserId ? loadViewerGymRows(gymIds, authenticatedUserId) : Promise.resolve([]),
 
-    // Gyms (among the referenced ones) the viewer is an admin member of
-    authenticatedUserId && gymIds.length > 0
-      ? db
-          .select({ gymId: dbSchema.gymMembers.gymId })
-          .from(dbSchema.gymMembers)
-          .innerJoin(dbSchema.gyms, eq(dbSchema.gyms.id, dbSchema.gymMembers.gymId))
-          .where(
-            and(
-              inArray(dbSchema.gymMembers.gymId, gymIds),
-              eq(dbSchema.gymMembers.userId, authenticatedUserId),
-              eq(dbSchema.gymMembers.role, 'admin'),
-              isNull(dbSchema.gyms.deletedAt),
-            ),
-          )
-      : Promise.resolve([]),
-
-    // Boards the viewer has pinned. Kept here rather than joined into each
-    // caller's query so every surface that returns a UserBoard reports the
-    // pin, not just myBoards.
-    authenticatedUserId
-      ? db
-          .select({ boardUuid: dbSchema.userBoardActivity.boardUuid })
-          .from(dbSchema.userBoardActivity)
-          .where(
-            and(
-              inArray(dbSchema.userBoardActivity.boardUuid, boardUuids),
-              eq(dbSchema.userBoardActivity.userId, authenticatedUserId),
-              isNotNull(dbSchema.userBoardActivity.pinnedAt),
-            ),
-          )
-      : Promise.resolve([]),
-  ]);
+      // Boards the viewer has pinned. Kept here rather than joined into each
+      // caller's query so every surface that returns a UserBoard reports the
+      // pin, not just myBoards.
+      authenticatedUserId
+        ? db
+            .select({ boardUuid: dbSchema.userBoardActivity.boardUuid })
+            .from(dbSchema.userBoardActivity)
+            .where(
+              and(
+                inArray(dbSchema.userBoardActivity.boardUuid, boardUuids),
+                eq(dbSchema.userBoardActivity.userId, authenticatedUserId),
+                isNotNull(dbSchema.userBoardActivity.pinnedAt),
+              ),
+            )
+        : Promise.resolve([]),
+    ]);
 
   // Index results for O(1) lookups
   const ownerMap = new Map(ownerRows.map((r) => [r.userId, r]));
@@ -661,64 +943,176 @@ export async function enrichBoards(
   const commentMap = new Map(commentRows.map((r) => [r.entityId, Number(r.count)]));
   const followedSet = new Set(followRows.map((r) => r.boardUuid));
   const pinnedSet = new Set(pinRows.map((r) => r.boardUuid));
-  const gymMap = new Map(gymRows.map((r) => [r.id, r]));
-  // Gym ids the viewer can edit boards through (owns the gym OR is an admin member)
-  const editableGymIds = new Set<number>([
-    ...(ownedGymRows as Array<{ id: number }>).map((row) => row.id),
-    ...(adminGymRows as Array<{ gymId: number }>).map((row) => row.gymId),
-  ]);
+  const gymMap = gymRows;
+  // Managed gyms grant board edit (and delete of SYSTEM boards); editable gyms
+  // grant removing a board from the listing.
+  const gymAuthority = authenticatedUserId
+    ? await resolveViewerGymAuthority(viewerGymRows, authenticatedUserId, viewerRoles)
+    : NO_GYM_AUTHORITY();
+  const boardEditGymIds = gymAuthority.managedGymIds;
 
-  return boards.map(({ board, distanceMeters }) => {
-    const owner = ownerMap.get(board.ownerId);
-    const ticks = tickMap.get(board.id);
-    const gym = board.gymId ? gymMap.get(board.gymId) : undefined;
-    const canEdit = authenticatedUserId
-      ? board.ownerId === authenticatedUserId ||
-        (rolesGrantAdminOrLeader(viewerRoles, board.boardType) && boardIsRoleEditable(board)) ||
-        (board.gymId != null && editableGymIds.has(board.gymId))
-      : false;
+  const editableSprayWallUuids = authenticatedUserId
+    ? boards
+        .filter(
+          ({ board }) =>
+            isSprayBoardType(board.boardType) &&
+            (board.ownerId === authenticatedUserId ||
+              (rolesGrantAdminOrLeader(viewerRoles, board.boardType) && boardIsRoleEditable(board)) ||
+              (board.gymId != null && boardEditGymIds.has(board.gymId))),
+        )
+        .map(({ board }) => board.uuid)
+    : [];
+  const sprayImportByWall = new Map(
+    (await readSprayWallImportProgress(db, editableSprayWallUuids)).map((progress) => [progress.wallUuid, progress]),
+  );
+  // Waiting reports the viewer can act on, for every board in two reads.
+  const reportFlagsByBoard = await loadBoardReportFlags(
+    boards.map(({ board }) => board),
+    authenticatedUserId,
+    viewerRoles,
+  );
 
+  return Promise.all(
+    boards.map(async ({ board, distanceMeters }) => {
+      const [showLocation, showOwner] = await Promise.all([
+        canViewResourceLocation(board.uuid, authenticatedUserId),
+        canViewActivityIdentity(board.ownerId, authenticatedUserId),
+      ]);
+      const owner = ownerMap.get(board.ownerId);
+      const ticks = tickMap.get(board.id);
+      const location = projectBoardLocation(board, board.gymId ? gymMap.get(board.gymId) : null, showLocation);
+      const canEdit = authenticatedUserId
+        ? board.ownerId === authenticatedUserId ||
+          (rolesGrantAdminOrLeader(viewerRoles, board.boardType) && boardIsRoleEditable(board)) ||
+          (board.gymId != null && boardEditGymIds.has(board.gymId))
+        : false;
+      // `boards` passed the access filter above, so the delete gate's read
+      // check holds already, unless that filter read as someone else (a wall
+      // device's owner): then only the viewer's own board counts.
+      const canDelete =
+        authenticatedUserId && (accessUserId === authenticatedUserId || board.ownerId === authenticatedUserId)
+          ? viewerMayDeleteBoard(board, authenticatedUserId, gymAuthority, viewerRoles)
+          : false;
+      const canRemoveFromGym = authenticatedUserId
+        ? viewerMayRemoveBoardFromGym(board, authenticatedUserId, gymAuthority, viewerRoles)
+        : false;
+
+      return {
+        sprayImport: canEdit ? (sprayImportByWall.get(board.uuid) ?? null) : null,
+        uuid: board.uuid,
+        slug: board.slug,
+        ownerId: showOwner ? board.ownerId : null,
+        ownerDisplayName: showOwner ? owner?.displayName || owner?.name || undefined : undefined,
+        ownerAvatarUrl: showOwner ? owner?.avatarUrl || owner?.image || undefined : undefined,
+        boardType: board.boardType,
+        layoutId: Number(board.layoutId),
+        sizeId: Number(board.sizeId),
+        setIds: board.setIds,
+        name: board.name,
+        description: board.description,
+        locationName: location.locationName,
+        latitude: location.latitude,
+        longitude: location.longitude,
+        isPublic: board.isPublic,
+        isUnlisted: board.isUnlisted,
+        hideLocation: board.hideLocation,
+        isOwned: board.isOwned,
+        angle: Number(board.angle),
+        isAngleAdjustable: board.isAngleAdjustable,
+        hasLeds: board.hasLeds,
+        litByWallDevice: board.litByWallDevice,
+        createdAt: board.createdAt.toISOString(),
+        layoutName: null,
+        sizeName: null,
+        sizeDescription: null,
+        setNames: null,
+        totalAscents: Number(ticks?.totalAscents || 0),
+        uniqueClimbers: Number(ticks?.uniqueClimbers || 0),
+        followerCount: followerMap.get(board.uuid) || 0,
+        commentCount: commentMap.get(board.uuid) || 0,
+        isFollowedByMe: followedSet.has(board.uuid),
+        gymId: location.gymId,
+        // `boards` was filtered on `canAccessResource` at the top of this function.
+        boardId: boardPresenceChannelId(board, true, canEdit),
+        gymUuid: location.gymUuid,
+        gymName: location.gymName,
+        gymIsListed: board.gymId ? (gymMap.get(board.gymId)?.isListed ?? null) : null,
+        // Measured from the board's own coordinates: only where those may go.
+        distanceMeters: location.source === 'own' ? (distanceMeters ?? null) : null,
+        serialNumber: board.serialNumber ?? null,
+        timerName: board.timerName ?? null,
+        canEdit,
+        canDelete,
+        canRemoveFromGym,
+        isPinnedByMe: pinnedSet.has(board.uuid),
+        openReportCount: reportFlagsByBoard.get(board.id)?.openReportCount ?? null,
+        viewerHasOpenReport: reportFlagsByBoard.get(board.id)?.viewerHasOpenReport ?? null,
+      };
+    }),
+  );
+}
+
+/** The serial is observed hardware, not a capability to hidden board metadata. */
+async function projectAnonymousSerialBoards(boards: Array<typeof dbSchema.userBoards.$inferSelect>) {
+  const nameable = await Promise.all(boards.map((board) => canAccessResourceWithoutLink('board', board.uuid, null)));
+  const locationVisible = await Promise.all(
+    boards.map(async (board, boardIndex) => (nameable[boardIndex] ? canViewResourceLocation(board.uuid, null) : false)),
+  );
+  const projectionGyms = await loadProjectionGyms(boards.map((board) => board.gymId));
+  return boards.map((board, boardIndex) => {
+    const canName = nameable[boardIndex];
     return {
-      uuid: board.uuid,
-      slug: board.slug,
-      ownerId: board.ownerId,
-      ownerDisplayName: owner?.displayName || owner?.name || undefined,
-      ownerAvatarUrl: owner?.avatarUrl || owner?.image || undefined,
+      // A controller serial is geometry, never an Unlisted link capability.
+      uuid: canName ? board.uuid : '',
+      slug: canName ? board.slug : '',
+      ownerId: '',
+      ownerDisplayName: null,
+      ownerAvatarUrl: null,
       boardType: board.boardType,
       layoutId: Number(board.layoutId),
       sizeId: Number(board.sizeId),
       setIds: board.setIds,
-      name: board.name,
-      description: board.description,
-      locationName: board.locationName,
-      latitude: board.latitude,
-      longitude: board.longitude,
+      name: canName ? board.name : board.boardType,
+      description: canName ? board.description : null,
+      // The board's own name when its location is shown, else a public gym's.
+      locationName: canName
+        ? projectBoardLocation(board, board.gymId ? projectionGyms.get(board.gymId) : null, locationVisible[boardIndex])
+            .locationName
+        : null,
+      latitude: null,
+      longitude: null,
       isPublic: board.isPublic,
       isUnlisted: board.isUnlisted,
       hideLocation: board.hideLocation,
-      isOwned: board.isOwned,
+      isOwned: false,
       angle: Number(board.angle),
       isAngleAdjustable: board.isAngleAdjustable,
       hasLeds: board.hasLeds,
+      litByWallDevice: board.litByWallDevice,
       createdAt: board.createdAt.toISOString(),
       layoutName: null,
       sizeName: null,
       sizeDescription: null,
       setNames: null,
-      totalAscents: Number(ticks?.totalAscents || 0),
-      uniqueClimbers: Number(ticks?.uniqueClimbers || 0),
-      followerCount: followerMap.get(board.uuid) || 0,
-      commentCount: commentMap.get(board.uuid) || 0,
-      isFollowedByMe: followedSet.has(board.uuid),
-      gymId: board.gymId ?? null,
-      boardId: boardPresenceChannelId(board, canEdit),
-      gymUuid: gym?.uuid ?? null,
-      gymName: gym?.name ?? null,
-      distanceMeters: distanceMeters ?? null,
+      totalAscents: 0,
+      uniqueClimbers: 0,
+      followerCount: 0,
+      commentCount: 0,
+      isFollowedByMe: false,
+      gymId: null,
+      // Anonymous caller: a serial is not the board's link, so only a
+      // listed public board exposes its channel here.
+      boardId: boardPresenceChannelId(board, canName, false),
+      gymUuid: null,
+      gymName: null,
+      distanceMeters: null,
       serialNumber: board.serialNumber ?? null,
-      timerName: board.timerName ?? null,
-      canEdit,
-      isPinnedByMe: pinnedSet.has(board.uuid),
+      timerName: null,
+      canEdit: false,
+      canDelete: false,
+      canRemoveFromGym: false,
+      // Anonymous caller: no identity, so nothing can be pinned.
+      isPinnedByMe: false,
     };
   });
 }
@@ -727,24 +1121,232 @@ export async function enrichBoards(
 // Queries
 // ============================================
 
+/**
+ * Which of a gym's boards a viewer may see listed, shared by `gymBoards` and the
+ * gym share card so a card can never name a board the gym page would not.
+ * The caller adds which gym.
+ */
+function gymBoardListingConditions(viewerId: string | undefined, canEdit: boolean): SQL[] {
+  const conditions: SQL[] = [
+    isNull(dbSchema.userBoards.deletedAt),
+    // Enumerating a gym is not possession of each unlisted board's link.
+    // Board owners and explicit grants still pass this independent gate.
+    resourceAccessCondition('board', dbSchema.userBoards.uuid, viewerId, { allowUnlistedLink: false }),
+    // A spray wall with nothing published yet is a board nobody can climb on —
+    // not even for the gym's admins, who do see the private rows below. Its
+    // owner sees it, so they can go and finish it (SW-14).
+    listableSprayWallCondition(viewerId),
+  ];
+  // Non-editors (including anonymous) only see the gym's publicly LISTED
+  // boards — isPublic AND NOT isUnlisted, mirroring searchBoards (unlisted =
+  // reachable by direct link only, never enumerated). The leaderboard embed
+  // relies on this to enumerate boards without auth.
+  if (!canEdit) {
+    conditions.push(eq(dbSchema.userBoards.isPublic, true));
+    conditions.push(eq(dbSchema.userBoards.isUnlisted, false));
+  }
+  return conditions;
+}
+
+/** Most distinct (type, angle) pairs a gym card reads. More than a card could name. */
+const GYM_CARD_BOARD_VARIANTS_LIMIT = 40;
+
+/**
+ * The boards a stranger can see at this gym, as distinct (type, angle) pairs. What
+ * `gymBoards` lists anonymously, without its rate-limit bucket or board enrichment.
+ */
+export async function readGymBoardsForStranger(gymUuid: string): Promise<{ boardType: string; angle: number }[]> {
+  return db
+    .selectDistinct({ boardType: dbSchema.userBoards.boardType, angle: dbSchema.userBoards.angle })
+    .from(dbSchema.userBoards)
+    .innerJoin(dbSchema.gyms, eq(dbSchema.gyms.id, dbSchema.userBoards.gymId))
+    .where(and(eq(dbSchema.gyms.uuid, gymUuid), ...gymBoardListingConditions(undefined, false)))
+    .orderBy(dbSchema.userBoards.boardType, dbSchema.userBoards.angle)
+    .limit(GYM_CARD_BOARD_VARIANTS_LIMIT);
+}
+
+/** Shared search predicates keep the public directory and app search in sync. */
+async function searchBoardPage(
+  validatedInput: z.infer<typeof SearchBoardsInputSchema>,
+  ctx: Pick<ConnectionContext, 'userId' | 'isAuthenticated'>,
+) {
+  const { query, boardType, boardTypes, layoutIds, sizeIds, angles, latitude, longitude, radiusKm } = validatedInput;
+  const limit = validatedInput.limit ?? 20;
+  const offset = validatedInput.offset ?? 0;
+  const useProximity = latitude !== undefined && longitude !== undefined;
+
+  if (useProximity) {
+    // PostGIS proximity search path using Drizzle query builder
+    const radiusMeters = (radiusKm ?? 1) * 1000;
+    const lon = Number(longitude);
+    const lat = Number(latitude);
+
+    const userPoint = sql`ST_MakePoint(${lon}, ${lat})::geography`;
+    // "location" is a PostGIS geography column added via raw migration, not in the Drizzle schema
+    const locationCol = sql`${dbSchema.userBoards}.location`;
+    const distanceMeters = sql<number>`ST_Distance(${locationCol}, ${userPoint})`.as('distance_meters');
+
+    // Build shared WHERE conditions
+    const conditions = [
+      eq(dbSchema.userBoards.isPublic, true),
+      boardGymListedCondition(dbSchema.userBoards.gymId),
+      resourceAccessCondition('board', dbSchema.userBoards.uuid, ctx.userId),
+      eq(dbSchema.userBoards.isUnlisted, false),
+      isNull(dbSchema.userBoards.deletedAt),
+      // A wall can carry `is_public` before it has a published photo — the flag
+      // and the first publish are two separate moments — and search must not
+      // offer a board with no holds on it (SW-14).
+      listableSprayWallCondition(ctx.isAuthenticated ? ctx.userId : undefined),
+      sql`${locationCol} IS NOT NULL`,
+      sql`ST_DWithin(${locationCol}, ${userPoint}, ${radiusMeters})`,
+      resourceLocationCondition(dbSchema.userBoards.uuid, ctx.userId),
+    ];
+
+    if (boardType) {
+      conditions.push(eq(dbSchema.userBoards.boardType, boardType));
+    }
+    if (boardTypes && boardTypes.length > 0) {
+      conditions.push(inArray(dbSchema.userBoards.boardType, boardTypes));
+    }
+    if (layoutIds && layoutIds.length > 0) {
+      conditions.push(inArray(dbSchema.userBoards.layoutId, layoutIds));
+    }
+    if (sizeIds && sizeIds.length > 0) {
+      conditions.push(inArray(dbSchema.userBoards.sizeId, sizeIds));
+    }
+    if (angles && angles.length > 0) {
+      conditions.push(inArray(dbSchema.userBoards.angle, angles));
+    }
+    if (query) {
+      const escapedQuery = query.replace(/[%_\\]/g, '\\$&');
+      conditions.push(
+        or(
+          ilike(dbSchema.userBoards.name, `%${escapedQuery}%`),
+          and(
+            resourceLocationCondition(dbSchema.userBoards.uuid, ctx.userId),
+            ilike(dbSchema.userBoards.locationName, `%${escapedQuery}%`),
+          ),
+        )!,
+      );
+    }
+
+    const whereClause = and(...conditions);
+
+    const [countResult] = await db.select({ count: count() }).from(dbSchema.userBoards).where(whereClause);
+
+    const totalCount = Number(countResult?.count || 0);
+
+    const boards = await db
+      .select({
+        board: dbSchema.userBoards,
+        distanceMeters,
+      })
+      .from(dbSchema.userBoards)
+      .where(whereClause)
+      // id: total order for OFFSET paging
+      .orderBy(sql`distance_meters ASC`, asc(dbSchema.userBoards.id))
+      .limit(limit)
+      .offset(offset);
+
+    const enrichedBoards = await enrichBoards(
+      boards.map(({ board, distanceMeters: dist }) => ({ board, distanceMeters: dist })),
+      ctx.isAuthenticated ? ctx.userId : undefined,
+    );
+
+    return {
+      boards: enrichedBoards,
+      totalCount,
+      hasMore: offset + enrichedBoards.length < totalCount,
+    };
+  }
+
+  // Text-only search path (no proximity)
+  const conditions = [
+    eq(dbSchema.userBoards.isPublic, true),
+    boardGymListedCondition(dbSchema.userBoards.gymId),
+    resourceAccessCondition('board', dbSchema.userBoards.uuid, ctx.userId),
+    eq(dbSchema.userBoards.isUnlisted, false),
+    isNull(dbSchema.userBoards.deletedAt),
+    // Same rule as the proximity path above: a public wall with nothing
+    // published is not a result (SW-14).
+    listableSprayWallCondition(ctx.isAuthenticated ? ctx.userId : undefined),
+  ];
+
+  if (boardType) {
+    conditions.push(eq(dbSchema.userBoards.boardType, boardType));
+  }
+
+  if (boardTypes && boardTypes.length > 0) {
+    conditions.push(inArray(dbSchema.userBoards.boardType, boardTypes));
+  }
+
+  if (layoutIds && layoutIds.length > 0) {
+    conditions.push(inArray(dbSchema.userBoards.layoutId, layoutIds));
+  }
+
+  if (sizeIds && sizeIds.length > 0) {
+    conditions.push(inArray(dbSchema.userBoards.sizeId, sizeIds));
+  }
+
+  if (angles && angles.length > 0) {
+    conditions.push(inArray(dbSchema.userBoards.angle, angles));
+  }
+
+  if (query) {
+    // Escape SQL LIKE wildcards to prevent wildcard injection
+    const escapedQuery = query.replace(/[%_\\]/g, '\\$&');
+    conditions.push(
+      or(
+        ilike(dbSchema.userBoards.name, `%${escapedQuery}%`),
+        and(
+          resourceLocationCondition(dbSchema.userBoards.uuid, ctx.userId),
+          ilike(dbSchema.userBoards.locationName, `%${escapedQuery}%`),
+        ),
+      )!,
+    );
+  }
+
+  const whereClause = and(...conditions);
+
+  const [countResult] = await db.select({ count: count() }).from(dbSchema.userBoards).where(whereClause);
+
+  const totalCount = Number(countResult?.count || 0);
+
+  const boards = await db
+    .select()
+    .from(dbSchema.userBoards)
+    .where(whereClause)
+    // id: total order for OFFSET paging
+    .orderBy(desc(dbSchema.userBoards.createdAt), asc(dbSchema.userBoards.id))
+    .limit(limit)
+    .offset(offset);
+
+  const enrichedBoards = await enrichBoards(
+    boards.map((b) => ({ board: b })),
+    ctx.isAuthenticated ? ctx.userId : undefined,
+  );
+
+  return {
+    boards: enrichedBoards,
+    totalCount,
+    hasMore: offset + boards.length < totalCount,
+  };
+}
+
 export const socialBoardQueries = {
   /**
    * Get a board by UUID.
    *
-   * Anonymous callers only reach boards that pass `isRowAnonReadable` (public,
-   * or system-owned). A private board reads as `null` — the exact same response
-   * as a board that doesn't exist, so a uuid holder can't confirm one exists.
-   * That closes the kiosk dereference: a kiosk's `layout` JSON deliberately
-   * carries slot boardUuids, and those must not resolve to a private board's
-   * name.
+   * The uuid is the board's link, so the board's policy decides with the link
+   * reading (`canAccessResource`): Public and Unlisted open for anyone holding
+   * it, signed in or not; Followers and Invite-only need the viewer's standing.
+   * A board the viewer may not read is `null` — the exact same response as a
+   * board that doesn't exist, so a uuid holder can't confirm one exists. That
+   * closes the kiosk dereference: a kiosk's `layout` JSON deliberately carries
+   * slot boardUuids, and those must not resolve to a private board's name.
    *
-   * Deliberately ANON-ONLY, unlike the gym reads. A logged-in caller keeps
-   * membership-free access to any active board, matching
-   * `requireAnonReadableBoard` and the rest of the board-presence family.
-   * Authenticated non-owner access is load-bearing: a climber connecting to a
-   * gym's private board over BLE resolves it by uuid through here, and
-   * `boardsBySerialNumbers` already serves private boards to any signed-in
-   * caller.
+   * A merged-away uuid redirects to its survivor, and stays a link only when one
+   * owner holds both boards; otherwise the survivor gets the no-link reading.
    */
   board: async (_: unknown, { boardUuid }: { boardUuid: string }, ctx: ConnectionContext) => {
     validateInput(UUIDSchema, boardUuid, 'boardUuid');
@@ -757,43 +1359,66 @@ export const socialBoardQueries = {
     if (!board) return null;
     const canonical = board.deletedAt ? await resolveBoardFollowingMerges(board) : board;
     if (!canonical) return null;
+    const uuidIsLink = !board.deletedAt || board.ownerId === canonical.ownerId;
     const viewerId = ctx.isAuthenticated ? ctx.userId : undefined;
-    // Gate before enrichment so a masked anonymous read never runs the
-    // owner/count/follow lookups for a board it isn't allowed to see.
+    // Gate before enrichment so a masked read never runs the owner/count/follow
+    // lookups for a board it isn't allowed to see.
     //
-    // A spray wall takes the wall's own rule INSTEAD of the anonymous mask, not
-    // after it. The mask refuses every non-public board to an anonymous caller,
-    // which is right for a piece of gym furniture and wrong here in both
-    // directions: it let a signed-in stranger into a PRIVATE wall (that is what
-    // the capability check below closes), and it kept an anonymous caller out of
-    // an UNLISTED one — even though the uuid they presented is the entire claim,
-    // 122 unguessable bits, and `sprayWall(uuid)` hands them the same wall. One
-    // rule per key: a uuid is a capability whether or not you are signed in.
-    if (isSprayBoardType(canonical.boardType)) {
-      if (!(await sprayBoardRowIsReadable(canonical, viewerId, 'capability'))) return null;
-    } else if (!viewerId && !isRowAnonReadable(canonical)) {
+    // A spray wall also takes the wall's own rule. One rule per key: a uuid is a
+    // capability whether or not you are signed in, so an UNLISTED wall opens for
+    // an anonymous caller too (122 unguessable bits, the same wall
+    // `sprayWall(uuid)` hands them), and a PRIVATE wall stays with its owner.
+    if (isSprayBoardType(canonical.boardType) && !(await sprayBoardRowIsReadable(canonical, viewerId, 'capability')))
       return null;
-    }
+    if (!(await canAccessBoard(canonical.uuid, viewerId, uuidIsLink ? canonical.uuid : null))) return null;
     return enrichBoard(canonical, viewerId);
   },
 
   /**
    * Get a board by slug (for URL routing).
    *
-   * This follows the same anonymous-only mask as `board(boardUuid)`: direct
-   * private-board links keep working for signed-in climbers, while anonymous
-   * requests cannot disclose a private board through the shared web cache.
+   * A home board's `/b/<slug>` path is its link, read the same way as
+   * `board(boardUuid)`: Public and Unlisted open for anyone holding it, signed
+   * in or not, and Followers and Invite-only need the viewer's standing. The
+   * slug is derived from the board's name, so Unlisted means "not listed", not
+   * "secret". A slug reached through a merge tombstone is the link only when
+   * one owner holds both boards (see `resolveBoardLinkBySlug`); a reused slug
+   * never opens another owner's Unlisted board.
+   *
+   * `wallUuid` is a spray wall's share link (`/b/{slug}/...?wall=<uuid>`). The
+   * slug alone is a guess, so it never opens an unlisted wall; the uuid is the
+   * capability `sprayWall(uuid)` and `board(boardUuid)` already honour. It counts
+   * only when it is the uuid of the row the slug resolved to. Without that
+   * pairing, one leaked uuid would open every wall behind any slug. Then the wall
+   * takes the `'capability'` rule, exactly as `board(boardUuid)` would: unlisted
+   * and not hidden opens for anyone, private stays with its owner and gym. A
+   * wrong uuid is ignored rather than refused, so the answer is the same as a
+   * request without one and says nothing about which slugs are unlisted walls.
    */
-  boardBySlug: async (_: unknown, { slug }: { slug: string }, ctx: ConnectionContext) => {
+  boardBySlug: async (
+    _: unknown,
+    { slug, wallUuid }: { slug: string; wallUuid?: string | null },
+    ctx: ConnectionContext,
+  ) => {
     const viewerId = ctx.isAuthenticated ? ctx.userId : undefined;
-    const canonical = await resolveBoardBySlug(slug);
-    if (!canonical) return null;
-    // Same anonymous mask as the active path and `board(boardUuid)`: following a
-    // tombstone must not disclose a private survivor to an anonymous caller.
-    if (!viewerId && !isRowAnonReadable(canonical)) return null;
-    // A spray wall's slug is derived from the wall's NAME, so it is a guess and
-    // not a capability: no unlisted exemption here, unlike `board(boardUuid)`.
-    if (!(await sprayBoardRowIsReadable(canonical, viewerId, 'enumerable'))) return null;
+    const resolved = await resolveBoardLinkBySlug(slug);
+    if (!resolved) return null;
+    const { board: canonical, slugIsLink } = resolved;
+    if (isSprayBoardType(canonical.boardType)) {
+      if (typeof wallUuid === 'string' && wallUuid === canonical.uuid) {
+        if (!(await sprayBoardRowIsReadable(canonical, viewerId, 'capability'))) return null;
+        if (!(await canAccessResource('board', canonical.uuid, viewerId))) return null;
+        return enrichBoard(canonical, viewerId);
+      }
+      // A spray wall's slug is derived from the wall's NAME and, unlike a home
+      // board's, was never its link: the wall's enumerable rule and the no-link
+      // reading, behind the legacy anonymous mask.
+      if (!viewerId && !isRowAnonReadable(canonical)) return null;
+      if (!(await sprayBoardRowIsReadable(canonical, viewerId, 'enumerable'))) return null;
+      if (!(await canAccessResourceWithoutLink('board', canonical.uuid, viewerId))) return null;
+      return enrichBoard(canonical, viewerId);
+    }
+    if (!(await canAccessBoard(canonical.uuid, viewerId, slugIsLink ? canonical.uuid : null))) return null;
     return enrichBoard(canonical, viewerId);
   },
 
@@ -839,22 +1464,7 @@ export const socialBoardQueries = {
       throw new GraphQLError('Gym not found', { extensions: { code: 'NOT_FOUND' } });
     }
 
-    const conditions = [
-      eq(dbSchema.userBoards.gymId, gym.id),
-      isNull(dbSchema.userBoards.deletedAt),
-      // A spray wall with nothing published yet is a board nobody can climb on —
-      // not even for the gym's admins, who do see the private rows below. Its
-      // owner sees it, so they can go and finish it (SW-14).
-      listableSprayWallCondition(viewerId),
-    ];
-    // Non-editors (including anonymous) only see the gym's publicly LISTED
-    // boards — isPublic AND NOT isUnlisted, mirroring searchBoards (unlisted =
-    // reachable by direct link only, never enumerated). The leaderboard embed
-    // relies on this to enumerate boards without auth.
-    if (!canEdit) {
-      conditions.push(eq(dbSchema.userBoards.isPublic, true));
-      conditions.push(eq(dbSchema.userBoards.isUnlisted, false));
-    }
+    const conditions = [eq(dbSchema.userBoards.gymId, gym.id), ...gymBoardListingConditions(viewerId, canEdit)];
 
     const boards = await db
       .select()
@@ -885,7 +1495,10 @@ export const socialBoardQueries = {
    * Searches all boards (including unlisted/non-public) so BLE device
    * discovery can resolve any board regardless of visibility.
    * No auth required (BLE scan-before-login), but rate-limited.
-   * Unauthenticated callers receive stripped responses (no GPS/owner data).
+   * Unauthenticated callers receive stripped responses: no owner data and
+   * never the board's own coordinates. For a board whose location is hidden,
+   * the `UserBoard` field resolvers fill in a public gym's name, coordinates
+   * and uuid (projectBoardLocation); the board's own place never leaves.
    */
   boardsBySerialNumbers: async (
     _: unknown,
@@ -922,64 +1535,84 @@ export const socialBoardQueries = {
         ),
       );
 
-    // Unauthenticated callers get an allowlisted response built directly from
-    // the DB rows — skip enrichBoards entirely (no owner/stats/follow queries).
-    // Public boards include UGC fields; non-public boards get config only.
-    if (!ctx.isAuthenticated) {
-      return boards.map((board) => {
-        return {
-          uuid: board.uuid,
-          slug: board.slug,
-          ownerId: '',
-          ownerDisplayName: null,
-          ownerAvatarUrl: null,
-          boardType: board.boardType,
-          layoutId: Number(board.layoutId),
-          sizeId: Number(board.sizeId),
-          setIds: board.setIds,
-          name: board.isPublic ? board.name : board.boardType,
-          description: board.isPublic ? board.description : null,
-          locationName: board.isPublic ? board.locationName : null,
-          latitude: null,
-          longitude: null,
-          isPublic: board.isPublic,
-          isUnlisted: board.isUnlisted,
-          hideLocation: board.hideLocation,
-          isOwned: false,
-          angle: Number(board.angle),
-          isAngleAdjustable: board.isAngleAdjustable,
-          hasLeds: board.hasLeds,
-          createdAt: board.createdAt.toISOString(),
-          layoutName: null,
-          sizeName: null,
-          sizeDescription: null,
-          setNames: null,
-          totalAscents: 0,
-          uniqueClimbers: 0,
-          followerCount: 0,
-          commentCount: 0,
-          isFollowedByMe: false,
-          gymId: null,
-          // Anonymous caller: no edit access, so only public boards expose it.
-          boardId: boardPresenceChannelId(board, false),
-          gymUuid: null,
-          gymName: null,
-          distanceMeters: null,
-          serialNumber: board.serialNumber ?? null,
-          timerName: board.timerName ?? null,
-          canEdit: false,
-          // Anonymous caller: no identity, so nothing can be pinned.
-          isPinnedByMe: false,
-        };
-      });
-    }
+    // Keep the existing geometry-only fallback for hidden controllers.
+    if (!ctx.isAuthenticated) return projectAnonymousSerialBoards(boards);
 
     const enriched = await enrichBoards(
       boards.map((board) => ({ board })),
       ctx.userId,
+      { allowUnlistedLink: false },
     );
 
     return enriched;
+  },
+
+  observedBoardSerialMatches: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
+    await applyRateLimit(ctx, 20, 'observedBoardSerialMatches');
+    const observed = validateInput(
+      z
+        .array(
+          z.object({
+            boardType: BoardNameSchema,
+            observedSerialNumber: z.string().trim().min(1).max(64).transform(normalizeSerial),
+          }),
+        )
+        .min(1)
+        .max(20),
+      input,
+      'input',
+    );
+    const unique = [
+      ...new Map(observed.map((entry) => [`${entry.boardType}\0${entry.observedSerialNumber}`, entry])).values(),
+    ];
+    const rows = await db
+      .select()
+      .from(dbSchema.userBoards)
+      .where(
+        and(
+          isNull(dbSchema.userBoards.deletedAt),
+          or(
+            ...unique.map((entry) =>
+              and(
+                eq(dbSchema.userBoards.boardType, entry.boardType),
+                eq(dbSchema.userBoards.serialNumber, entry.observedSerialNumber),
+              ),
+            ),
+          ),
+        ),
+      );
+    const candidatesByUuid = new Map<
+      string,
+      | Awaited<ReturnType<typeof projectAnonymousSerialBoards>>[number]
+      | Awaited<ReturnType<typeof enrichBoards>>[number]
+    >();
+    if (!ctx.isAuthenticated) {
+      const projected = await projectAnonymousSerialBoards(rows);
+      rows.forEach((board, index) => candidatesByUuid.set(board.uuid, projected[index]));
+    } else {
+      const visibility = await Promise.all(
+        rows.map((board) => canAccessResourceWithoutLink('board', board.uuid, ctx.userId)),
+      );
+      const readable = rows.filter((_, index) => visibility[index]);
+      const hidden = rows.filter((_, index) => !visibility[index]);
+      const [enriched, projected] = await Promise.all([
+        enrichBoards(
+          readable.map((board) => ({ board })),
+          ctx.userId,
+          { allowUnlistedLink: false },
+        ),
+        projectAnonymousSerialBoards(hidden),
+      ]);
+      enriched.forEach((board) => candidatesByUuid.set(board.uuid, board));
+      hidden.forEach((board, index) => candidatesByUuid.set(board.uuid, projected[index]));
+    }
+    return unique.map((entry) => ({
+      ...entry,
+      candidates: rows
+        .filter((board) => board.boardType === entry.boardType && board.serialNumber === entry.observedSerialNumber)
+        .map((board) => candidatesByUuid.get(board.uuid))
+        .filter((board) => board !== undefined),
+    }));
   },
 
   /**
@@ -1002,6 +1635,15 @@ export const socialBoardQueries = {
       throw new Error('Authentication required to perform this operation');
     }
 
+    // The pointer can name a board the caller only reached by its serial (a
+    // connect auto-binds to the one board carrying it). A serial is not that
+    // board's link, so its uuid and slug come back only to a caller who may read
+    // it without the link (owner, approved grant, follower inheritance, Public);
+    // anyone else keeps the recorded configuration alone.
+    const linkedBoardNameable = and(
+      isNotNull(dbSchema.userBoards.id),
+      resourceAccessCondition('board', dbSchema.userBoards.uuid, userId, { allowUnlistedLink: false }),
+    );
     const rows = await db
       .select({
         serialNumber: dbSchema.userBoardSerials.serialNumber,
@@ -1011,8 +1653,10 @@ export const socialBoardQueries = {
         setIds: dbSchema.userBoardSerials.setIds,
         apiLevel: dbSchema.userBoardSerials.apiLevel,
         updatedAt: dbSchema.userBoardSerials.updatedAt,
-        boardUuid: dbSchema.userBoardSerials.boardUuid,
-        boardSlug: dbSchema.userBoards.slug,
+        boardUuid: sql<
+          string | null
+        >`CASE WHEN ${linkedBoardNameable} THEN ${dbSchema.userBoardSerials.boardUuid} ELSE NULL END`,
+        boardSlug: sql<string | null>`CASE WHEN ${linkedBoardNameable} THEN ${dbSchema.userBoards.slug} ELSE NULL END`,
       })
       .from(dbSchema.userBoardSerials)
       .leftJoin(
@@ -1039,7 +1683,11 @@ export const socialBoardQueries = {
   /**
    * Get current user's boards (owned + followed)
    */
-  myBoards: async (_: unknown, { input }: { input?: { limit?: number; offset?: number } }, ctx: ConnectionContext) => {
+  myBoards: async (
+    _: unknown,
+    { input }: { input?: { limit?: number; offset?: number; includeUnfinishedSprayWalls?: boolean | null } },
+    ctx: ConnectionContext,
+  ) => {
     requireAuthenticated(ctx);
     const validatedInput = validateInput(MyBoardsInputSchema, input || {}, 'input');
     const userId = ctx.userId!;
@@ -1060,13 +1708,29 @@ export const socialBoardQueries = {
     const matchCondition = followedCondition ? or(ownerCondition, followedCondition)! : ownerCondition;
     // In the WHERE the COUNT and the paged read share, never a post-filter:
     // dropping rows from the page alone would leave the count promising results
-    // the last page does not have. `userId` is the owner escape, so the caller's
-    // own half-built walls stay in their list (SW-14).
-    const whereClause = and(matchCondition, isNull(dbSchema.userBoards.deletedAt), listableSprayWallCondition(userId));
+    // the last page does not have. Board pickers require a published generation
+    // (#6040); My Boards and Manage opt in to the viewer's own unfinished walls so
+    // they can show import progress. Nobody else's unfinished wall and no
+    // archived wall is ever listed, flag or not.
+    const ownedUnfinishedSprayWall = ownedUnfinishedSprayWallCondition(userId);
+    const publishedOrNotSpray = listableSprayWallCondition(userId, { requirePublished: true });
+
+    const includeUnfinished = validatedInput.includeUnfinishedSprayWalls === true;
+    const whereClause = and(
+      matchCondition,
+      isNull(dbSchema.userBoards.deletedAt),
+      includeUnfinished ? or(publishedOrNotSpray, ownedUnfinishedSprayWall)! : publishedOrNotSpray,
+    );
 
     const [countResult] = await db.select({ count: count() }).from(dbSchema.userBoards).where(whereClause);
 
     const totalCount = Number(countResult?.count || 0);
+
+    // Unpublished owned walls must stay on the first page while being imported,
+    // even when the caller already has twenty pinned/recently opened boards.
+    // They are only listed with the opt-in, so only then is the lead key added.
+    // Published resets retain the normal pin/recency order below.
+    const importsFirst = includeUnfinished ? [desc(ownedUnfinishedSprayWall)] : [];
 
     // Ordering (issue #4884): pinned boards first, then the ones you actually
     // used, most recent first, and only then the ones you have never opened.
@@ -1099,6 +1763,7 @@ export const socialBoardQueries = {
       )
       .where(whereClause)
       .orderBy(
+        ...importsFirst,
         // Pinned first. `pinned_at IS NULL` sorts false (pinned) before true.
         sql`${dbSchema.userBoardActivity.pinnedAt} IS NULL`,
         // Oldest pin leads, so pinning a second board never reshuffles the first.
@@ -1140,157 +1805,15 @@ export const socialBoardQueries = {
   searchBoards: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
     await applyRateLimit(ctx, 20, 'searchBoards');
     const validatedInput = validateInput(SearchBoardsInputSchema, input, 'input');
-    const { query, boardType, boardTypes, layoutIds, sizeIds, latitude, longitude, radiusKm } = validatedInput;
-    const limit = validatedInput.limit ?? 20;
-    const offset = validatedInput.offset ?? 0;
-    const useProximity = latitude !== undefined && longitude !== undefined;
+    return searchBoardPage(validatedInput, ctx);
+  },
 
-    if (useProximity) {
-      // PostGIS proximity search path using Drizzle query builder
-      const radiusMeters = (radiusKm ?? 1) * 1000;
-      const lon = Number(longitude);
-      const lat = Number(latitude);
-
-      const userPoint = sql`ST_MakePoint(${lon}, ${lat})::geography`;
-      // "location" is a PostGIS geography column added via raw migration, not in the Drizzle schema
-      const locationCol = sql`${dbSchema.userBoards}.location`;
-      const distanceMeters = sql<number>`ST_Distance(${locationCol}, ${userPoint})`.as('distance_meters');
-
-      // Build shared WHERE conditions
-      const conditions = [
-        eq(dbSchema.userBoards.isPublic, true),
-        eq(dbSchema.userBoards.isUnlisted, false),
-        isNull(dbSchema.userBoards.deletedAt),
-        // A wall can carry `is_public` before it has a published photo — the flag
-        // and the first publish are two separate moments — and search must not
-        // offer a board with no holds on it (SW-14).
-        listableSprayWallCondition(ctx.isAuthenticated ? ctx.userId : undefined),
-        sql`${locationCol} IS NOT NULL`,
-        sql`ST_DWithin(${locationCol}, ${userPoint}, ${radiusMeters})`,
-        // Hide boards with hideLocation=true unless the board owner follows the searching user
-        sql`(${dbSchema.userBoards.hideLocation} = false${
-          ctx.isAuthenticated
-            ? sql` OR EXISTS (
-                SELECT 1 FROM user_follows
-                WHERE follower_id = ${dbSchema.userBoards.ownerId}
-                AND following_id = ${ctx.userId}
-              )`
-            : sql``
-        })`,
-      ];
-
-      if (boardType) {
-        conditions.push(eq(dbSchema.userBoards.boardType, boardType));
-      }
-      if (boardTypes && boardTypes.length > 0) {
-        conditions.push(inArray(dbSchema.userBoards.boardType, boardTypes));
-      }
-      if (layoutIds && layoutIds.length > 0) {
-        conditions.push(inArray(dbSchema.userBoards.layoutId, layoutIds));
-      }
-      if (sizeIds && sizeIds.length > 0) {
-        conditions.push(inArray(dbSchema.userBoards.sizeId, sizeIds));
-      }
-      if (query) {
-        const escapedQuery = query.replace(/[%_\\]/g, '\\$&');
-        conditions.push(
-          or(
-            ilike(dbSchema.userBoards.name, `%${escapedQuery}%`),
-            ilike(dbSchema.userBoards.locationName, `%${escapedQuery}%`),
-          )!,
-        );
-      }
-
-      const whereClause = and(...conditions);
-
-      const [countResult] = await db.select({ count: count() }).from(dbSchema.userBoards).where(whereClause);
-
-      const totalCount = Number(countResult?.count || 0);
-
-      const boards = await db
-        .select({
-          board: dbSchema.userBoards,
-          distanceMeters,
-        })
-        .from(dbSchema.userBoards)
-        .where(whereClause)
-        .orderBy(sql`distance_meters ASC`)
-        .limit(limit)
-        .offset(offset);
-
-      const enrichedBoards = await enrichBoards(
-        boards.map(({ board, distanceMeters: dist }) => ({ board, distanceMeters: dist })),
-        ctx.isAuthenticated ? ctx.userId : undefined,
-      );
-
-      return {
-        boards: enrichedBoards,
-        totalCount,
-        hasMore: offset + enrichedBoards.length < totalCount,
-      };
-    }
-
-    // Text-only search path (no proximity)
-    const conditions = [
-      eq(dbSchema.userBoards.isPublic, true),
-      eq(dbSchema.userBoards.isUnlisted, false),
-      isNull(dbSchema.userBoards.deletedAt),
-      // Same rule as the proximity path above: a public wall with nothing
-      // published is not a result (SW-14).
-      listableSprayWallCondition(ctx.isAuthenticated ? ctx.userId : undefined),
-    ];
-
-    if (boardType) {
-      conditions.push(eq(dbSchema.userBoards.boardType, boardType));
-    }
-
-    if (boardTypes && boardTypes.length > 0) {
-      conditions.push(inArray(dbSchema.userBoards.boardType, boardTypes));
-    }
-
-    if (layoutIds && layoutIds.length > 0) {
-      conditions.push(inArray(dbSchema.userBoards.layoutId, layoutIds));
-    }
-
-    if (sizeIds && sizeIds.length > 0) {
-      conditions.push(inArray(dbSchema.userBoards.sizeId, sizeIds));
-    }
-
-    if (query) {
-      // Escape SQL LIKE wildcards to prevent wildcard injection
-      const escapedQuery = query.replace(/[%_\\]/g, '\\$&');
-      conditions.push(
-        or(
-          ilike(dbSchema.userBoards.name, `%${escapedQuery}%`),
-          ilike(dbSchema.userBoards.locationName, `%${escapedQuery}%`),
-        )!,
-      );
-    }
-
-    const whereClause = and(...conditions);
-
-    const [countResult] = await db.select({ count: count() }).from(dbSchema.userBoards).where(whereClause);
-
-    const totalCount = Number(countResult?.count || 0);
-
-    const boards = await db
-      .select()
-      .from(dbSchema.userBoards)
-      .where(whereClause)
-      .orderBy(desc(dbSchema.userBoards.createdAt))
-      .limit(limit)
-      .offset(offset);
-
-    const enrichedBoards = await enrichBoards(
-      boards.map((b) => ({ board: b })),
-      ctx.isAuthenticated ? ctx.userId : undefined,
-    );
-
-    return {
-      boards: enrichedBoards,
-      totalCount,
-      hasMore: offset + boards.length < totalCount,
-    };
+  /** Public website reads share the web server's IP, so use a bounded SSR allowance. */
+  publicSprayWalls: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
+    // Charge the real caller before stripping its authority from the read.
+    await applyRateLimit(ctx, 300, 'publicSprayWalls');
+    const validatedInput = validateInput(PublicSprayWallsInputSchema, input, 'input');
+    return searchBoardPage({ ...validatedInput, boardType: 'spray' }, { isAuthenticated: false });
   },
 
   /**
@@ -1334,7 +1857,12 @@ export const socialBoardQueries = {
 
     // Get the board
     const [board] = await db
-      .select({ id: dbSchema.userBoards.id })
+      .select({
+        id: dbSchema.userBoards.id,
+        uuid: dbSchema.userBoards.uuid,
+        boardType: dbSchema.userBoards.boardType,
+        layoutId: dbSchema.userBoards.layoutId,
+      })
       .from(dbSchema.userBoards)
       .where(and(eq(dbSchema.userBoards.uuid, boardUuid), isNull(dbSchema.userBoards.deletedAt)))
       .limit(1);
@@ -1348,8 +1876,20 @@ export const socialBoardQueries = {
       throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
     }
 
-    // Anonymous callers only read public / system-shared boards' leaderboards.
-    await requireAnonReadableBoard(board.id, ctx.userId);
+    // A spray wall takes the wall's own rule INSTEAD of the anonymous mask, the
+    // same call `board(boardUuid)` makes on the same key: the leaderboard names
+    // who climbs on somebody's home wall, so a private or admin-hidden wall is
+    // its owner's (and, for private, its gym's) alone. Same NOT_FOUND as above.
+    if (isSprayBoardType(board.boardType)) {
+      const viewerId = ctx.isAuthenticated ? ctx.userId : undefined;
+      if (!(await sprayBoardRowIsReadable(board, viewerId, 'capability'))) {
+        throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+      }
+    } else {
+      // Keyed on the board's uuid, which is its link: an Unlisted board's
+      // leaderboard opens for whoever holds it, the same as `board(boardUuid)`.
+      await requireAnonReadableBoard(board.id, ctx.userId, boardUuid);
+    }
 
     // Build time filter
     let timeFilter;
@@ -1370,6 +1910,7 @@ export const socialBoardQueries = {
 
     const conditions = [
       eq(dbSchema.boardseshTicks.boardId, board.id),
+      tickPrivacyCondition(ctx.userId),
       or(eq(dbSchema.boardseshTicks.status, 'flash'), eq(dbSchema.boardseshTicks.status, 'send'))!,
     ];
 
@@ -1389,7 +1930,7 @@ export const socialBoardQueries = {
 
     // Get leaderboard entries. `hardestGrade` falls back to the climb's
     // consensus grade when the user didn't attach a personal override (NULL
-    // difficulty means "use consensus" — see docs/ascents-and-attempts.md).
+    // difficulty means "use consensus" — see docs/data/ascents-and-attempts.md).
     // board_climb_stats joined on its PK so the join doesn't multiply rows.
     const entries = await db
       .select({
@@ -1412,7 +1953,8 @@ export const socialBoardQueries = {
       )
       .where(whereClause)
       .groupBy(dbSchema.boardseshTicks.userId)
-      .orderBy(sql`COUNT(*) DESC`)
+      // userId: total order for OFFSET paging (send counts tie often)
+      .orderBy(sql`COUNT(*) DESC`, asc(dbSchema.boardseshTicks.userId))
       .limit(limit)
       .offset(offset);
 
@@ -1441,12 +1983,17 @@ export const socialBoardQueries = {
       }
     }
 
+    // Each entry is named by its climber's account. Climbers who stay anonymous
+    // on boards they don't own keep their rank and totals here, without a name,
+    // like a private account. One query for the page.
+    const visibleUserIds = await visibleActivityUserIds(userIds, ctx.userId, { boardId: board.id });
     const enrichedEntries = entries.map((entry, idx) => {
+      const showIdentity = visibleUserIds.has(entry.userId);
       const userInfo = userMap.get(entry.userId);
       return {
-        userId: entry.userId,
-        userDisplayName: userInfo?.displayName,
-        userAvatarUrl: userInfo?.avatarUrl,
+        userId: showIdentity ? entry.userId : null,
+        userDisplayName: showIdentity ? userInfo?.displayName : undefined,
+        userAvatarUrl: showIdentity ? userInfo?.avatarUrl : undefined,
         rank: offset + idx + 1,
         totalSends: Number(entry.totalSends),
         totalFlashes: Number(entry.totalFlashes),
@@ -1509,6 +2056,547 @@ export const socialBoardQueries = {
 // ============================================
 // Mutations
 // ============================================
+
+/** Preference writers commit before a merge, or explicitly refuse a stale merged identity. */
+async function mutateBoardPreference(
+  boardUuid: string,
+  requireActive: boolean,
+  work: (transaction: DbTransaction, boardUuid: string) => Promise<unknown>,
+): Promise<boolean> {
+  return db.transaction(
+    async (transaction) => {
+      const [board] = await transaction
+        .select({
+          uuid: dbSchema.userBoards.uuid,
+          deletedAt: dbSchema.userBoards.deletedAt,
+          mergedIntoBoardUuid: dbSchema.userBoards.mergedIntoBoardUuid,
+        })
+        .from(dbSchema.userBoards)
+        .where(eq(dbSchema.userBoards.uuid, boardUuid))
+        .for('share')
+        .limit(1);
+      if (board?.mergedIntoBoardUuid)
+        throw new GraphQLError('This board was merged. Refresh your boards before changing this preference.', {
+          extensions: { code: 'CONFLICT' },
+        });
+      if (!board || (requireActive && board.deletedAt)) {
+        if (requireActive) throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+        return true;
+      }
+      await work(transaction, board.uuid);
+      return true;
+    },
+    { isolationLevel: 'read committed' },
+  );
+}
+
+type ValidatedBoardUpdate = z.infer<typeof UpdateBoardInputSchema>;
+
+/** Admin authority changes metadata access, never ownership or wall publication. */
+function assertAdminBoardFields(
+  input: ValidatedBoardUpdate,
+  board: { ownerId: string; boardType: string },
+  userId: string,
+): void {
+  const ownerOnlyFields = ['isPublic', 'isUnlisted', 'hideLocation', 'serialNumber', 'timerName'] as const;
+  if (board.ownerId !== userId && ownerOnlyFields.some((field) => input[field] !== undefined)) {
+    throw new GraphQLError('Only the owner can change board privacy or credentials', {
+      extensions: { code: 'FORBIDDEN' },
+    });
+  }
+  const sprayFields = [
+    ...ownerOnlyFields,
+    'layoutId',
+    'sizeId',
+    'setIds',
+    'angle',
+    'isAngleAdjustable',
+    'hasLeds',
+  ] as const;
+  if (board.boardType === 'spray' && sprayFields.some((field) => input[field] !== undefined)) {
+    throw new GraphQLError('Change spray wall setup and visibility on the wall itself', {
+      extensions: { code: 'SPRAY_WALL_SETTINGS_ELSEWHERE' },
+    });
+  }
+}
+
+/** Input keys that steer the write rather than change the board. */
+const BOARD_EDIT_CONTROL_KEYS = new Set(['boardUuid', 'allowDuplicateConfig']);
+
+/**
+ * The board fields an edit actually changes. Edit screens echo every field
+ * back with a rename, so a field that was sent is not necessarily a change.
+ */
+function changedBoardFields(input: Record<string, unknown>, before: typeof dbSchema.userBoards.$inferSelect): string[] {
+  const previousValues: Record<string, unknown> = { ...before };
+  return Object.entries(input)
+    .filter(([field, value]) => {
+      if (value === undefined || BOARD_EDIT_CONTROL_KEYS.has(field)) return false;
+      const previous = previousValues[field];
+      if (field === 'setIds' && typeof value === 'string' && typeof previous === 'string') {
+        return normaliseSetIds(value) !== normaliseSetIds(previous);
+      }
+      return value !== previous;
+    })
+    .map(([field]) => field)
+    .sort();
+}
+
+/** Shared row writer; the admin mode is internal and authenticates its own caller. */
+export async function updateBoardRecord(
+  input: unknown,
+  ctx: ConnectionContext,
+  access: 'standard' | 'admin' = 'standard',
+  audit?: { reason: string; details?: BoardModerationEventDetails },
+): Promise<typeof dbSchema.userBoards.$inferSelect> {
+  requireAuthenticated(ctx);
+  if (access === 'admin') await requireAdmin(ctx);
+  await applyRateLimit(ctx, 20, access === 'admin' ? 'adminUpdateBoard' : 'updateBoard');
+
+  const validatedInput = validateInput(UpdateBoardInputSchema, input, 'input');
+  const userId = ctx.userId!;
+
+  const [board] = await db
+    .select()
+    .from(dbSchema.userBoards)
+    .where(eq(dbSchema.userBoards.uuid, validatedInput.boardUuid))
+    .limit(1);
+
+  if (!board) {
+    throw new Error('Board not found');
+  }
+
+  // A soft-deleted board is visible only to its owner (who can restore it by
+  // editing). Moderators/gym admins must not resurrect a board the owner
+  // deliberately removed — republishing its name, location, and serial.
+  if (
+    (access === 'admin' && (board.deletedAt || board.mergedIntoBoardUuid)) ||
+    (board.deletedAt && board.ownerId !== userId)
+  ) {
+    throw new Error('Board not found');
+  }
+
+  // Owner, community admin/leader (for this board type), or the linked gym's
+  // owner/admin may edit. Community moderators can fix outdated catalog boards.
+  if (access === 'admin') {
+    assertAdminBoardFields(validatedInput, board, userId);
+  } else {
+    await requireBoardEditAccess(ctx, board);
+    if (board.ownerId !== userId && !(await canAccessResource('board', board.uuid, userId))) {
+      throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+    }
+  }
+
+  if (!isBoardAngleSupported(board.boardType, validatedInput.angle)) {
+    throw new GraphQLError(BOARD_ANGLE_VALIDATION_MESSAGE, {
+      extensions: { code: 'BAD_USER_INPUT' },
+    });
+  }
+
+  // Editing a soft-deleted board restores it (see `updateValues.deletedAt`
+  // below), and the cap counts live rows only — so a restore is +1 live board
+  // and pays the same toll as a mint. Without this, delete-N/create-N/restore-N
+  // walks an account to cap+N. Editing an already-live board never gets here.
+  if (board.deletedAt) {
+    await assertBoardCapNotReached(board.ownerId);
+  }
+
+  // Config field changes (layoutId, sizeId, setIds). Authorized editors may
+  // change these even when the board has logged climbs — a config change
+  // reflects a real physical reconfiguration. Old boardsesh_ticks rows are
+  // left untouched: they keep referencing the climbs/config they were logged
+  // against. We do not delete, move, or modify any tick rows here.
+  const hasConfigChange =
+    validatedInput.layoutId !== undefined || validatedInput.sizeId !== undefined || validatedInput.setIds !== undefined;
+  // Build update values (only provided fields)
+  const updateValues: Record<string, unknown> = {
+    updatedAt: new Date(),
+    // A deliberate human edit — freeze the row so the location sync can never
+    // overwrite these curated values (a moderator's catalog fix, say) on its
+    // next run.
+    syncFrozenAt: new Date(),
+  };
+
+  if (validatedInput.name !== undefined) updateValues.name = validatedInput.name;
+  if (validatedInput.description !== undefined) updateValues.description = validatedInput.description;
+  if (validatedInput.locationName !== undefined) updateValues.locationName = validatedInput.locationName;
+  if (validatedInput.latitude !== undefined) updateValues.latitude = validatedInput.latitude;
+  if (validatedInput.longitude !== undefined) updateValues.longitude = validatedInput.longitude;
+  // A spray wall's visibility is not an ordinary board flag: flipping it public
+  // copies the wall photo into the world-readable bucket, and flipping it back
+  // deletes that copy and retracts the climbs already fanned out to feeds
+  // (`updateSprayWall`, SW-14). Letting it through here would set the flag and
+  // do none of that — a private wall whose photo is still on the open web, or a
+  // public one that has no photo to show. One door, and this is not it.
+  //
+  // Only a CHANGE is refused: the edit screen sends the board's current flags
+  // back unchanged with every rename, and failing those would make a wall
+  // unrenameable.
+  if (
+    ((validatedInput.isPublic !== undefined && validatedInput.isPublic !== board.isPublic) ||
+      (validatedInput.isUnlisted !== undefined && validatedInput.isUnlisted !== board.isUnlisted) ||
+      (validatedInput.hideLocation !== undefined && validatedInput.hideLocation !== board.hideLocation)) &&
+    board.ownerId !== userId
+  ) {
+    throw new GraphQLError('Only the owner can change board privacy', { extensions: { code: 'FORBIDDEN' } });
+  }
+  const changingVisibility =
+    (validatedInput.isPublic !== undefined && validatedInput.isPublic !== board.isPublic) ||
+    (validatedInput.isUnlisted !== undefined && validatedInput.isUnlisted !== board.isUnlisted);
+  if (board.boardType === 'spray' && changingVisibility) {
+    throw new GraphQLError("Change a spray wall's visibility on the wall itself", {
+      extensions: { code: 'SPRAY_WALL_VISIBILITY_ELSEWHERE' },
+    });
+  }
+
+  // The other two flags `createSprayWall` pins and this mutation would happily
+  // unpin (#5486). `has_leds` is the whole of the "no Bluetooth on a wall"
+  // contract: it routes the bulb down the take-the-wall path, keeps the device
+  // picker unmounted and the LED controls hidden, so a wall with it set offers a
+  // climber a Bluetooth scan for a photograph. `is_angle_adjustable` is the same
+  // shape of lie — a wall does not adjust, and every climb on it is recorded at
+  // the one angle it was photographed at.
+  //
+  // A CHANGE again, not the field's presence: a client that echoes the board
+  // back unchanged on a rename must not be refused.
+  const changingWallHardware =
+    (validatedInput.hasLeds !== undefined && validatedInput.hasLeds !== board.hasLeds) ||
+    (validatedInput.isAngleAdjustable !== undefined && validatedInput.isAngleAdjustable !== board.isAngleAdjustable);
+  if (board.boardType === 'spray' && changingWallHardware) {
+    throw new GraphQLError('A spray wall is a photograph — it has no lights and it does not adjust', {
+      extensions: { code: 'SPRAY_WALL_HAS_NO_HARDWARE' },
+    });
+  }
+
+  if (validatedInput.isPublic !== undefined) updateValues.isPublic = validatedInput.isPublic;
+  if (validatedInput.isUnlisted !== undefined) updateValues.isUnlisted = validatedInput.isUnlisted;
+  if (validatedInput.hideLocation !== undefined) updateValues.hideLocation = validatedInput.hideLocation;
+  if (validatedInput.isOwned !== undefined) updateValues.isOwned = validatedInput.isOwned;
+  if (validatedInput.angle !== undefined) updateValues.angle = validatedInput.angle;
+  if (validatedInput.isAngleAdjustable !== undefined) updateValues.isAngleAdjustable = validatedInput.isAngleAdjustable;
+  if (validatedInput.hasLeds !== undefined) updateValues.hasLeds = validatedInput.hasLeds;
+  // Not a spray-wall hardware lie like `hasLeds`: a laser projector lights a
+  // photographed wall as well as a catalogue board, so a wall may carry it.
+  if (validatedInput.litByWallDevice !== undefined) updateValues.litByWallDevice = validatedInput.litByWallDevice;
+  if (validatedInput.serialNumber !== undefined) updateValues.serialNumber = validatedInput.serialNumber;
+  if (validatedInput.timerName !== undefined) updateValues.timerName = validatedInput.timerName;
+
+  if (hasConfigChange) {
+    if (validatedInput.layoutId !== undefined) updateValues.layoutId = validatedInput.layoutId;
+    if (validatedInput.sizeId !== undefined) updateValues.sizeId = validatedInput.sizeId;
+    if (validatedInput.setIds !== undefined) updateValues.setIds = validatedInput.setIds;
+  }
+
+  // Handle slug update
+  if (validatedInput.slug !== undefined) {
+    // Check slug uniqueness
+    const [slugConflict] = await db
+      .select({ id: dbSchema.userBoards.id })
+      .from(dbSchema.userBoards)
+      .where(
+        and(
+          eq(dbSchema.userBoards.slug, validatedInput.slug),
+          isNull(dbSchema.userBoards.deletedAt),
+          sql`${dbSchema.userBoards.id} != ${board.id}`,
+        ),
+      )
+      .limit(1);
+
+    if (slugConflict) {
+      throw new Error('Slug is already taken');
+    }
+    updateValues.slug = validatedInput.slug;
+  }
+
+  // If board was soft-deleted, restore it
+  if (board.deletedAt) {
+    updateValues.deletedAt = null;
+  }
+
+  let updated: typeof dbSchema.userBoards.$inferSelect;
+  // Whether a board a signed-out viewer could read changed audience, for the
+  // kiosk tombstone below.
+  let kioskAudienceChanged = false;
+  try {
+    const updatedRows = await transactionWithAfterCommit(async (tx) => {
+      kioskAudienceChanged = false;
+      // Serialize partial edits to the same board before deriving the final
+      // serial+config tuple. Without this row lock, a serial-only edit could
+      // validate against C1 while a concurrent config-only edit changes the
+      // row to C2, producing an unchecked S+C2 duplicate.
+      const [lockedBoard] = rowsFromResult<{
+        serialNumber: string | null;
+        ownerId: string;
+        boardType: string;
+        layoutId: number | string;
+        sizeId: number | string;
+        setIds: string;
+        locationName: string | null;
+        latitude: number | null;
+        longitude: number | null;
+        deletedAt: Date | null;
+        mergedIntoBoardUuid: string | null;
+        isPublic: boolean;
+        isUnlisted: boolean;
+        hideLocation: boolean;
+        gymId: number | string | null;
+      }>(
+        await tx.execute(sql`
+          SELECT serial_number AS "serialNumber",
+                 owner_id AS "ownerId",
+                 gym_id AS "gymId",
+                 board_type AS "boardType",
+                 layout_id AS "layoutId",
+                 size_id AS "sizeId",
+                 set_ids AS "setIds",
+                 location_name AS "locationName",
+                 latitude,
+                 longitude,
+                 deleted_at AS "deletedAt",
+                 merged_into_board_uuid AS "mergedIntoBoardUuid",
+                 is_public AS "isPublic",
+                 is_unlisted AS "isUnlisted",
+                 hide_location AS "hideLocation"
+            FROM user_boards
+           WHERE id = ${board.id}
+           FOR UPDATE
+        `),
+      );
+      if (!lockedBoard) {
+        throw new Error('Board not found');
+      }
+      // A staged edit must not restore or repopulate an account-deletion
+      // tombstone after its owner has been detached.
+      if (
+        lockedBoard.boardType === 'spray' &&
+        (lockedBoard.ownerId !== board.ownerId || (lockedBoard.deletedAt === null) !== (board.deletedAt === null))
+      ) {
+        throw new Error('Board not found');
+      }
+
+      if (access === 'admin') {
+        if (lockedBoard.deletedAt || lockedBoard.mergedIntoBoardUuid) throw new Error('Board not found');
+        assertAdminBoardFields(validatedInput, lockedBoard, userId);
+      } else if (lockedBoard.ownerId !== userId && !(await canAccessResource('board', board.uuid, userId))) {
+        throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
+      }
+
+      const lockedLayoutId = Number(lockedBoard.layoutId);
+      const lockedSizeId = Number(lockedBoard.sizeId);
+      const resultingLayoutId = validatedInput.layoutId ?? lockedLayoutId;
+      const resultingSizeId = validatedInput.sizeId ?? lockedSizeId;
+      const resultingSetIds = validatedInput.setIds ?? lockedBoard.setIds;
+      // Older clients echo unchanged setup fields. Only an actual config
+      // change needs duplicate confirmation; location-only edits remain exempt.
+      const configActuallyChanged =
+        resultingLayoutId !== lockedLayoutId ||
+        resultingSizeId !== lockedSizeId ||
+        normaliseSetIds(resultingSetIds) !== normaliseSetIds(lockedBoard.setIds);
+      // Partial edits derive their untouched config fields from the locked row,
+      // since another editor may have changed them or the location after lookup.
+      if (hasConfigChange) {
+        await assertKnownBoardConfig(lockedBoard.boardType, resultingLayoutId, resultingSizeId, resultingSetIds, tx);
+        // Catalogue boards share their system owner across gyms. For a user's
+        // boards, compare the final tuple and place on the same transaction as
+        // the write, after a concurrent edit has released this row's lock.
+        if (configActuallyChanged && lockedBoard.ownerId !== SYSTEM_BOARD_OWNER_ID) {
+          if (validatedInput.allowDuplicateConfig) {
+            logger.info('updateBoard: duplicate-config guard bypassed by explicit confirmation', {
+              userId,
+              boardId: board.id,
+              ownerId: lockedBoard.ownerId,
+              boardType: lockedBoard.boardType,
+              layoutId: resultingLayoutId,
+              sizeId: resultingSizeId,
+            });
+          } else {
+            const existing = await findOwnedBlockingDuplicate(
+              {
+                ownerId: lockedBoard.ownerId,
+                boardType: lockedBoard.boardType,
+                layoutId: resultingLayoutId,
+                sizeId: resultingSizeId,
+                excludeBoardId: board.id,
+                incoming: {
+                  setIds: resultingSetIds,
+                  locationName:
+                    validatedInput.locationName !== undefined ? validatedInput.locationName : lockedBoard.locationName,
+                  latitude: validatedInput.latitude !== undefined ? validatedInput.latitude : lockedBoard.latitude,
+                  longitude: validatedInput.longitude !== undefined ? validatedInput.longitude : lockedBoard.longitude,
+                },
+              },
+              tx,
+            );
+            // A non-owner may not learn a private sibling's identity through an
+            // edit error. Ownership is the locked value, just like the probe.
+            if (existing)
+              throw duplicateBoardConfigError(existing, { includeIdentity: lockedBoard.ownerId === userId });
+          }
+        }
+      }
+      const resultingSerial =
+        validatedInput.serialNumber === undefined ? lockedBoard.serialNumber : validatedInput.serialNumber;
+      const serialChanged =
+        validatedInput.serialNumber !== undefined && validatedInput.serialNumber !== lockedBoard.serialNumber;
+      const serialOrConfigBecomesActive =
+        resultingSerial !== null && (serialChanged || configActuallyChanged || lockedBoard.deletedAt !== null);
+
+      if (serialOrConfigBecomesActive) {
+        await lockAndAssertBoardSerialAvailable(
+          tx,
+          {
+            serialNumber: resultingSerial,
+            boardType: lockedBoard.boardType,
+            layoutId: validatedInput.layoutId ?? lockedLayoutId,
+            sizeId: validatedInput.sizeId ?? lockedSizeId,
+            setIds: validatedInput.setIds ?? lockedBoard.setIds,
+          },
+          board.ownerId,
+          board.id,
+          // The editor making this change, who may not be the owner, reads the error.
+          userId,
+        );
+      }
+      const hasVisibility = validatedInput.isPublic !== undefined || validatedInput.isUnlisted !== undefined;
+      if (hasVisibility || validatedInput.hideLocation !== undefined) {
+        const policyCondition = and(
+          eq(dbSchema.resourcePrivacy.kind, 'board'),
+          eq(dbSchema.resourcePrivacy.resourceId, board.uuid),
+        );
+        const [policy] = await tx.select().from(dbSchema.resourcePrivacy).where(policyCondition).limit(1);
+        const privacyUpdates: Partial<typeof dbSchema.resourcePrivacy.$inferInsert> = {};
+        if (hasVisibility) {
+          const requested =
+            (validatedInput.isUnlisted ?? lockedBoard.isUnlisted)
+              ? 'unlisted'
+              : (validatedInput.isPublic ?? lockedBoard.isPublic)
+                ? 'public'
+                : 'invite_only';
+          const changed =
+            (validatedInput.isPublic !== undefined && validatedInput.isPublic !== lockedBoard.isPublic) ||
+            (validatedInput.isUnlisted !== undefined && validatedInput.isUnlisted !== lockedBoard.isUnlisted);
+          const audience = policy && !changed ? policy.audience : legacyResourceAudience(policy?.audience, requested);
+          if (policy) {
+            // Old edit screens resend every boolean with a rename. Keep both
+            // the policy and its legacy projection consistent after revocation.
+            updateValues.isPublic = audience === 'public';
+            updateValues.isUnlisted = audience === 'unlisted';
+            if (audience !== policy.audience) privacyUpdates.audience = audience;
+          }
+        }
+        if (policy && validatedInput.hideLocation !== undefined) {
+          const locationAudience = legacyLocationAudience(
+            policy.locationAudience,
+            validatedInput.hideLocation,
+            lockedBoard.hideLocation,
+          );
+          updateValues.hideLocation = locationAudience !== 'public';
+          if (locationAudience !== policy.locationAudience) privacyUpdates.locationAudience = locationAudience;
+        }
+        // Read the audience the way the read gates do. System-owned boards
+        // stay anon-readable whatever their flags say.
+        const audienceBefore = effectiveBoardAudience(policy?.audience, lockedBoard);
+        const flagAfter = (value: unknown, before: boolean) => (typeof value === 'boolean' ? value : before);
+        const audienceAfter = effectiveBoardAudience(privacyUpdates.audience ?? policy?.audience, {
+          isPublic: flagAfter(updateValues.isPublic, lockedBoard.isPublic),
+          isUnlisted: flagAfter(updateValues.isUnlisted, lockedBoard.isUnlisted),
+        });
+        kioskAudienceChanged =
+          lockedBoard.deletedAt === null &&
+          lockedBoard.ownerId !== SYSTEM_BOARD_OWNER_ID &&
+          (audienceBefore === 'public' || audienceBefore === 'unlisted') &&
+          audienceAfter !== audienceBefore;
+        const changesPrivacy =
+          (updateValues.isPublic !== undefined && updateValues.isPublic !== lockedBoard.isPublic) ||
+          (updateValues.isUnlisted !== undefined && updateValues.isUnlisted !== lockedBoard.isUnlisted) ||
+          (updateValues.hideLocation !== undefined && updateValues.hideLocation !== lockedBoard.hideLocation) ||
+          Object.keys(privacyUpdates).length > 0;
+        if (changesPrivacy && lockedBoard.ownerId !== userId)
+          throw new GraphQLError('Only the owner can change board privacy', { extensions: { code: 'FORBIDDEN' } });
+        if (Object.keys(privacyUpdates).length > 0) {
+          await tx
+            .update(dbSchema.resourcePrivacy)
+            .set({
+              ...privacyUpdates,
+              updatedAt: new Date(),
+              revision: sql`${dbSchema.resourcePrivacy.revision} + 1`,
+            })
+            .where(policyCondition);
+        }
+      }
+      const rows = await tx
+        .update(dbSchema.userBoards)
+        .set(updateValues)
+        .where(eq(dbSchema.userBoards.id, board.id))
+        .returning();
+      // Someone other than the creator changed it: on the record, in the same
+      // transaction, against the board as it is now.
+      await recordStaffBoardEdit(tx, {
+        actorUserId: userId,
+        board: {
+          id: board.id,
+          ownerId: lockedBoard.ownerId,
+          gymId: lockedBoard.gymId == null ? null : Number(lockedBoard.gymId),
+          boardType: lockedBoard.boardType,
+        },
+        mutation: access === 'admin' ? 'adminUpdateBoard' : 'updateBoard',
+        fields: changedBoardFields(validatedInput, board),
+        actorRole: access === 'admin' ? 'global_admin' : undefined,
+        reason: audit?.reason,
+        details: audit?.details,
+      });
+      return rows;
+    });
+    [updated] = updatedRows;
+  } catch (error) {
+    throwIfBoardSerialConflict(error);
+    throw error;
+  }
+
+  // A Public or Unlisted board whose audience changes may drop out of a
+  // kiosk's reach: going private takes it out of the anon-readable set, and
+  // going Unlisted takes it away from kiosks that hold only its numeric id.
+  // Either way the preview producer goes quiet and kiosks would keep the last
+  // snapshot, so publish a tombstone. Each kiosk stream treats it as a wake,
+  // rechecks access and re-derives its snapshot. The "was anon-readable" gate
+  // uses the locked pre-update row: a board that was never anon-readable must
+  // not get a publish on its channel at all (that alone would leak "something
+  // changed here" to anyone who guessed the board id).
+  if (kioskAudienceChanged) {
+    try {
+      await publishBoardQueuePreviewTombstoneForBoard(board.id);
+    } catch (error) {
+      // A pubsub hiccup must never fail the edit itself. Nothing else wakes
+      // the kiosk, so it keeps its last snapshot until it reconnects.
+      logger.error('Failed to publish board queue preview tombstone after a visibility change', {
+        boardId: board.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  // Update PostGIS location column (guarded — see syncLocationGeography)
+  if (validatedInput.latitude !== undefined || validatedInput.longitude !== undefined) {
+    await syncLocationGeography({
+      table: 'user_boards',
+      id: updated.id,
+      latitude: validatedInput.latitude ?? updated.latitude,
+      longitude: validatedInput.longitude ?? updated.longitude,
+      operation: 'updateBoard',
+    });
+  }
+
+  if (access === 'admin') {
+    logger.info('Admin updated registered board', {
+      actorId: userId,
+      boardUuid: updated.uuid,
+      changedFields: Object.keys(validatedInput).filter(
+        (field) => field !== 'boardUuid' && field !== 'allowDuplicateConfig',
+      ),
+    });
+  }
+  return updated;
+}
 
 export const socialBoardMutations = {
   /**
@@ -1599,6 +2687,25 @@ export const socialBoardMutations = {
     // what *this* connect observed. The explicit null keeps the row honest.
     const apiLevelValue = apiLevel ?? null;
 
+    // `boardUuid` is the one column this upsert must never overwrite. The board
+    // presence resolver writes the same column (rememberBoardForSerial) on the
+    // same BLE connect, and it is the writer that actually decides which wall
+    // the climber is on — this mutation only knows which board the route
+    // happened to be showing, which for most climbers is the auto-named
+    // onboarding template. Whichever landed last used to win, so a first
+    // connect could pin someone to that template permanently: the saved-board
+    // early return above means the link is then never rewritten.
+    //
+    // Fill-only-when-null settles it. The recording still establishes the link
+    // for a client that never reaches the resolver, and never fights the
+    // resolver when it does. The COALESCE reads the stored row, so the outcome
+    // is the same whichever of the two writers lands first. Omitted entirely
+    // when this connect resolved no board, so a bare reconnect can't blank the
+    // column either.
+    const boardLinkUpdate = linkedBoardUuid
+      ? { boardUuid: sql`coalesce(${dbSchema.userBoardSerials.boardUuid}, ${linkedBoardUuid})` }
+      : {};
+
     // Board row first, pointer row second — the order every other serial-pointer
     // writer follows (pointer healing, serial resolution, the explicit choice,
     // the dedupe merge). Left bare, this upsert takes the (userId, serialNumber)
@@ -1651,7 +2758,7 @@ export const socialBoardMutations = {
             sizeId,
             setIds,
             apiLevel: apiLevelValue,
-            boardUuid: linkedBoardUuid,
+            ...boardLinkUpdate,
             updatedAt: new Date(),
           },
         });
@@ -1771,21 +2878,76 @@ export const socialBoardMutations = {
     const uuid = uuidv4();
     const slug = await generateUniqueSlug(validatedInput.name);
 
+    // The existing-wall recheck (#8151, docs/product/existing-wall-check.md).
+    // Opt-in: a client that doesn't send `existingWallCheck` gets exactly the
+    // behaviour from before it existed. It only runs for a board without a
+    // serial (the serial guard already settles those) and only once the board
+    // lands on a gym. Spray walls have their own setup and never run it.
+    const wallCheckMode =
+      validatedInput.existingWallCheck != null &&
+      !validatedInput.serialNumber &&
+      !isSprayBoardType(validatedInput.boardType)
+        ? validatedInput.existingWallCheck
+        : null;
+    const wallCheckDraft = {
+      boardType: validatedInput.boardType,
+      layoutId: validatedInput.layoutId,
+      sizeId: validatedInput.sizeId,
+      setIds: validatedInput.setIds,
+    };
+    // The scope (which gyms' walls count) is read on the pool, always BEFORE the
+    // insert's transaction opens. Inside the transaction only the lock and the
+    // wall read run, on the transaction itself, so a create never holds its
+    // transaction's connection while it waits for a second one.
+    const checkExistingWalls = (scope: WallScope, transaction?: DbTransaction) =>
+      wallCheckMode == null
+        ? Promise.resolve()
+        : assertNoExistingWalls({
+            scope,
+            draft: wallCheckDraft,
+            viewerId: userId,
+            mode: wallCheckMode,
+            acknowledgedWallUuids: validatedInput.acknowledgedWallUuids ?? [],
+            transaction,
+          });
+
     // Resolve the gym this board belongs to. An explicit gymUuid goes through the
     // shared link gate (owner/admin, or a nearby public gym the caller is adding
     // their own board to); otherwise infer one from the location.
     let gymId: number | null = null;
+    // The gyms whose walls the recheck reads, once a gym is known. Null when the
+    // recheck is off or the board lands on no gym.
+    let wallCheckScope: WallScope | null = null;
     let mintGymNamed: string | null = null;
 
     if (validatedInput.gymUuid) {
+      if (wallCheckMode != null) {
+        // Before the link gate, so a create refused over an existing wall never
+        // spends the climber's 5/min foreign-gym link bucket. Only for a gym the
+        // caller may see: a missing or hidden private gym goes on to the gate,
+        // which refuses it as "Gym not found" exactly as before, rather than
+        // this check answering differently for it.
+        const requestedGym = await resolveCanonicalGymByUuid(validatedInput.gymUuid);
+        if (requestedGym && (requestedGym.isPublic || (await userCanEditGym(requestedGym, userId)))) {
+          wallCheckScope = await collectWallScope({ kind: 'gym', gym: requestedGym });
+          await checkExistingWalls(wallCheckScope);
+        }
+      }
       const gym = await requireBoardGymLinkAccess({
         ctx,
         gymUuid: validatedInput.gymUuid,
         userId,
+        boardOwnerId: userId,
         boardLatitude: incomingLocation.latitude,
         boardLongitude: incomingLocation.longitude,
       });
       gymId = gym.id;
+      // The gate resolves the same canonical gym, so the early scope is reused.
+      // It is only missing when the early run was skipped for a gym the caller
+      // can't see, which the gate has just let through for its owner or admin.
+      if (wallCheckMode != null && (wallCheckScope == null || wallCheckScope.selectedGymId !== gym.id)) {
+        wallCheckScope = await collectWallScope({ kind: 'gym', gym });
+      }
     } else {
       const resolution = await resolveAutoGymForBoard({
         userId,
@@ -1795,8 +2957,30 @@ export const socialBoardMutations = {
       });
       if (resolution.action === 'attach') {
         gymId = resolution.gymId;
+        if (wallCheckMode != null) {
+          const [attachedGym] = await db
+            .select()
+            .from(dbSchema.gyms)
+            .where(and(eq(dbSchema.gyms.id, resolution.gymId), isNull(dbSchema.gyms.deletedAt)))
+            .limit(1);
+          // The resolver just picked this gym as live. Gone a moment later means
+          // it was deleted or merged in between; fail rather than create without
+          // the check the client asked for.
+          if (!attachedGym) throw new Error('The gym for this board changed while it was being added. Try again.');
+          wallCheckScope = await collectWallScope({ kind: 'gym', gym: attachedGym });
+        }
       } else if (resolution.action === 'mint') {
         mintGymNamed = resolution.name;
+        // Minting a new gym: the walls that count are on public, listed gyms
+        // within 150 m of the typed location. Without coordinates there is no
+        // "nearby" to search.
+        if (wallCheckMode != null && incomingLocation.latitude != null && incomingLocation.longitude != null) {
+          wallCheckScope = await collectWallScope({
+            kind: 'point',
+            latitude: incomingLocation.latitude,
+            longitude: incomingLocation.longitude,
+          });
+        }
       }
     }
 
@@ -1811,6 +2995,22 @@ export const socialBoardMutations = {
     let board: typeof dbSchema.userBoards.$inferSelect;
     let mintedGymId: number | null = null;
 
+    // New boards are public unless the caller says otherwise; the exact
+    // location stays hidden until the owner shares it. Old clients send only the
+    // legacy booleans, and a create with none of them lands public with its
+    // location hidden and no policy row (see hasPrivacyInput below). An explicit
+    // isPublic: false wins over isUnlisted, as it did on the old two-switch form.
+    // A gym never changes the board's own location choice: a viewer the owner
+    // hid it from sees a public gym's listed place instead (projectBoardLocation).
+    const audience =
+      validatedInput.audience ??
+      (validatedInput.isPublic === false ? 'only_me' : validatedInput.isUnlisted ? 'unlisted' : 'public');
+    const locationAudience =
+      validatedInput.locationAudience ?? (validatedInput.hideLocation === false ? 'public' : 'only_me');
+    const privacyValues = { kind: 'board' as const, resourceId: uuid, ownerId: userId, audience, locationAudience };
+    // A policy row records a choice made with the modern privacy controls.
+    // Legacy booleans keep their original roundtrip until the owner makes one.
+    const hasPrivacyInput = validatedInput.audience !== undefined || validatedInput.locationAudience !== undefined;
     const boardValues = {
       uuid,
       slug,
@@ -1824,13 +3024,14 @@ export const socialBoardMutations = {
       locationName: incomingLocation.locationName,
       latitude: incomingLocation.latitude,
       longitude: incomingLocation.longitude,
-      isPublic: validatedInput.isPublic ?? true,
-      isUnlisted: validatedInput.isUnlisted ?? false,
-      hideLocation: validatedInput.hideLocation ?? false,
+      isPublic: audience === 'public' || (!hasPrivacyInput && audience === 'unlisted'),
+      isUnlisted: audience === 'unlisted',
+      hideLocation: locationAudience !== 'public',
       isOwned: validatedInput.isOwned ?? true,
       angle: validatedInput.angle ?? 40,
       isAngleAdjustable: validatedInput.isAngleAdjustable ?? true,
       hasLeds: validatedInput.hasLeds ?? true,
+      litByWallDevice: validatedInput.litByWallDevice ?? false,
       serialNumber: validatedInput.serialNumber ?? null,
       timerName: validatedInput.timerName ?? null,
     };
@@ -1843,11 +3044,18 @@ export const socialBoardMutations = {
     const insertGuardedBoard = async (linkedGymId: number | null) => {
       try {
         return await db.transaction(async (tx) => {
+          // The authoritative existing-wall check: under the gym-wall locks, so a
+          // concurrent create of the same wall is seen. Gym locks before the
+          // serial lock. A no-op without `existingWallCheck`.
+          if (linkedGymId != null && wallCheckScope != null) {
+            await checkExistingWalls(wallCheckScope, tx);
+          }
           await lockAndAssertBoardSerialAvailable(tx, validatedInput, userId);
           const [insertedBoard] = await tx
             .insert(dbSchema.userBoards)
             .values({ ...boardValues, gymId: linkedGymId })
             .returning();
+          if (hasPrivacyInput) await tx.insert(dbSchema.resourcePrivacy).values(privacyValues);
           return insertedBoard;
         });
       } catch (error) {
@@ -1858,10 +3066,21 @@ export const socialBoardMutations = {
 
     if (mintGymNamed != null) {
       const gymName = mintGymNamed;
+      // Set when the existing-wall recheck inside the mint's transaction throws,
+      // so the catch below can tell it apart from a gym-creation failure.
+      let wallRecheckFailed = false;
       try {
         const gymUuid = uuidv4();
         const gymSlug = await generateUniqueGymSlug(gymName);
         const result = await db.transaction(async (tx) => {
+          if (wallCheckScope != null) {
+            try {
+              await checkExistingWalls(wallCheckScope, tx);
+            } catch (error) {
+              wallRecheckFailed = true;
+              throw error;
+            }
+          }
           await lockAndAssertBoardSerialAvailable(tx, validatedInput, userId);
 
           const [newGym] = await tx
@@ -1871,7 +3090,12 @@ export const socialBoardMutations = {
               slug: gymSlug,
               ownerId: userId,
               name: gymName,
-              isPublic: validatedInput.isPublic ?? true,
+              // A gym is listed with its coordinates and name, so it is public
+              // only when the board is listed publicly AND its exact location is
+              // shown. A hidden location or an unlisted (link-only) board must
+              // never publish its address through a minted gym: a home wall's
+              // typed location mints a gym too, and stays private here.
+              isPublic: audience === 'public' && locationAudience === 'public',
               latitude: incomingLocation.latitude,
               longitude: incomingLocation.longitude,
             })
@@ -1882,6 +3106,7 @@ export const socialBoardMutations = {
             .values({ ...boardValues, gymId: newGym.id })
             .returning();
 
+          if (hasPrivacyInput) await tx.insert(dbSchema.resourcePrivacy).values(privacyValues);
           return { newGym, newBoard };
         });
         mintedGymId = result.newGym.id;
@@ -1892,6 +3117,12 @@ export const socialBoardMutations = {
         // swallow it and retry the insert below — that fallback would create the
         // very cross-owner duplicate the guard just refused.
         if (error instanceof GraphQLError && error.extensions.code === 'BOARD_SERIAL_EXISTS') throw error;
+        // Likewise ANY failure of the existing-wall recheck the client asked for:
+        // its refusal, and equally a lookup or lock that failed. The fallback
+        // inserts the board with no gym, so it never runs the check; falling back
+        // would create the board unchecked. The fallback is for gym creation
+        // failing, nothing else.
+        if (wallRecheckFailed) throw error;
         // The gym couldn't be minted; still create the board, unlinked, rather
         // than failing the whole create.
         logger.error('Auto-gym creation failed, creating board without gym:', error);
@@ -1933,332 +3164,13 @@ export const socialBoardMutations = {
    * Update a board's metadata
    */
   updateBoard: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext) => {
-    requireAuthenticated(ctx);
-    await applyRateLimit(ctx, 20, 'updateBoard');
-
-    const validatedInput = validateInput(UpdateBoardInputSchema, input, 'input');
-    const userId = ctx.userId!;
-
-    const [board] = await db
-      .select()
-      .from(dbSchema.userBoards)
-      .where(eq(dbSchema.userBoards.uuid, validatedInput.boardUuid))
-      .limit(1);
-
-    if (!board) {
-      throw new Error('Board not found');
-    }
-
-    // A soft-deleted board is visible only to its owner (who can restore it by
-    // editing). Moderators/gym admins must not resurrect a board the owner
-    // deliberately removed — republishing its name, location, and serial.
-    if (board.deletedAt && board.ownerId !== userId) {
-      throw new Error('Board not found');
-    }
-
-    // Owner, community admin/leader (for this board type), or the linked gym's
-    // owner/admin may edit. Community moderators can fix outdated catalog boards.
-    await requireBoardEditAccess(ctx, board);
-
-    if (!isBoardAngleSupported(board.boardType, validatedInput.angle)) {
-      throw new GraphQLError(BOARD_ANGLE_VALIDATION_MESSAGE, {
-        extensions: { code: 'BAD_USER_INPUT' },
-      });
-    }
-
-    // Editing a soft-deleted board restores it (see `updateValues.deletedAt`
-    // below), and the cap counts live rows only — so a restore is +1 live board
-    // and pays the same toll as a mint. Without this, delete-N/create-N/restore-N
-    // walks an account to cap+N. Editing an already-live board never gets here.
-    if (board.deletedAt) {
-      await assertBoardCapNotReached(board.ownerId);
-    }
-
-    // Config field changes (layoutId, sizeId, setIds). Authorized editors may
-    // change these even when the board has logged climbs — a config change
-    // reflects a real physical reconfiguration. Old boardsesh_ticks rows are
-    // left untouched: they keep referencing the climbs/config they were logged
-    // against. We do not delete, move, or modify any tick rows here.
-    const hasConfigChange =
-      validatedInput.layoutId !== undefined ||
-      validatedInput.sizeId !== undefined ||
-      validatedInput.setIds !== undefined;
-    const newLayoutId = validatedInput.layoutId ?? board.layoutId;
-    const newSizeId = validatedInput.sizeId ?? board.sizeId;
-    const newSetIds = validatedInput.setIds ?? board.setIds;
-
-    if (hasConfigChange) {
-      await assertKnownBoardConfig(board.boardType, newLayoutId, newSizeId, newSetIds);
-    }
-
-    // Build update values (only provided fields)
-    const updateValues: Record<string, unknown> = {
-      updatedAt: new Date(),
-      // A deliberate human edit — freeze the row so the location sync can never
-      // overwrite these curated values (a moderator's catalog fix, say) on its
-      // next run.
-      syncFrozenAt: new Date(),
-    };
-
-    if (validatedInput.name !== undefined) updateValues.name = validatedInput.name;
-    if (validatedInput.description !== undefined) updateValues.description = validatedInput.description;
-    if (validatedInput.locationName !== undefined) updateValues.locationName = validatedInput.locationName;
-    if (validatedInput.latitude !== undefined) updateValues.latitude = validatedInput.latitude;
-    if (validatedInput.longitude !== undefined) updateValues.longitude = validatedInput.longitude;
-    // A spray wall's visibility is not an ordinary board flag: flipping it public
-    // copies the wall photo into the world-readable bucket, and flipping it back
-    // deletes that copy and retracts the climbs already fanned out to feeds
-    // (`updateSprayWall`, SW-14). Letting it through here would set the flag and
-    // do none of that — a private wall whose photo is still on the open web, or a
-    // public one that has no photo to show. One door, and this is not it.
-    //
-    // Only a CHANGE is refused: the edit screen sends the board's current flags
-    // back unchanged with every rename, and failing those would make a wall
-    // unrenameable.
-    const changingVisibility =
-      (validatedInput.isPublic !== undefined && validatedInput.isPublic !== board.isPublic) ||
-      (validatedInput.isUnlisted !== undefined && validatedInput.isUnlisted !== board.isUnlisted);
-    if (board.boardType === 'spray' && changingVisibility) {
-      throw new GraphQLError("Change a spray wall's visibility on the wall itself", {
-        extensions: { code: 'SPRAY_WALL_VISIBILITY_ELSEWHERE' },
-      });
-    }
-
-    // The other two flags `createSprayWall` pins and this mutation would happily
-    // unpin (#5486). `has_leds` is the whole of the "no Bluetooth on a wall"
-    // contract: it routes the bulb down the take-the-wall path, keeps the device
-    // picker unmounted and the LED controls hidden, so a wall with it set offers a
-    // climber a Bluetooth scan for a photograph. `is_angle_adjustable` is the same
-    // shape of lie — a wall does not adjust, and every climb on it is recorded at
-    // the one angle it was photographed at.
-    //
-    // A CHANGE again, not the field's presence: a client that echoes the board
-    // back unchanged on a rename must not be refused.
-    const changingWallHardware =
-      (validatedInput.hasLeds !== undefined && validatedInput.hasLeds !== board.hasLeds) ||
-      (validatedInput.isAngleAdjustable !== undefined && validatedInput.isAngleAdjustable !== board.isAngleAdjustable);
-    if (board.boardType === 'spray' && changingWallHardware) {
-      throw new GraphQLError('A spray wall is a photograph — it has no lights and it does not adjust', {
-        extensions: { code: 'SPRAY_WALL_HAS_NO_HARDWARE' },
-      });
-    }
-
-    if (validatedInput.isPublic !== undefined) updateValues.isPublic = validatedInput.isPublic;
-    if (validatedInput.isUnlisted !== undefined) updateValues.isUnlisted = validatedInput.isUnlisted;
-    if (validatedInput.hideLocation !== undefined) updateValues.hideLocation = validatedInput.hideLocation;
-    if (validatedInput.isOwned !== undefined) updateValues.isOwned = validatedInput.isOwned;
-    if (validatedInput.angle !== undefined) updateValues.angle = validatedInput.angle;
-    if (validatedInput.isAngleAdjustable !== undefined)
-      updateValues.isAngleAdjustable = validatedInput.isAngleAdjustable;
-    if (validatedInput.hasLeds !== undefined) updateValues.hasLeds = validatedInput.hasLeds;
-    if (validatedInput.serialNumber !== undefined) updateValues.serialNumber = validatedInput.serialNumber;
-    if (validatedInput.timerName !== undefined) updateValues.timerName = validatedInput.timerName;
-
-    if (hasConfigChange) {
-      // The clients resend layout/size/setIds on every edit whenever the config
-      // section is unlocked, so `hasConfigChange` says "config fields were
-      // present", not "the config moved". Compare the effective values —
-      // set ids normalised, since the stored order is whatever the board was
-      // created with — and skip the guard when nothing actually changed.
-      // Without this skip, an owner of two same-config boards could never save
-      // ANY edit to either one: renaming a board would be rejected for
-      // colliding with its sibling.
-      const configActuallyChanged =
-        newLayoutId !== board.layoutId ||
-        newSizeId !== board.sizeId ||
-        normaliseSetIds(newSetIds) !== normaliseSetIds(board.setIds);
-
-      // Keyed off the board's OWNER, not the caller — a moderator or gym admin
-      // may be editing someone else's board. The system catalog owner is exempt:
-      // many gyms legitimately share one config there, and blocking that would
-      // break the catalog fixes moderation exists for.
-      if (configActuallyChanged && board.ownerId !== SYSTEM_BOARD_OWNER_ID) {
-        if (validatedInput.allowDuplicateConfig) {
-          // Same trail as createBoard: this is the one path that lets an edit
-          // land on a config the owner already has at the same place, so record
-          // that a human confirmed it rather than leaving it indistinguishable
-          // from a script setting the flag on every call.
-          logger.info('updateBoard: duplicate-config guard bypassed by explicit confirmation', {
-            userId,
-            boardId: board.id,
-            ownerId: board.ownerId,
-            boardType: board.boardType,
-            layoutId: newLayoutId,
-            sizeId: newSizeId,
-          });
-        } else {
-          // Probe with the POST-update location, so an edit that moves this
-          // board onto a sibling's site is caught and one that moves it away is
-          // allowed. A location-only edit is deliberately NOT guarded at all
-          // (it never reaches here): as with createBoard after #4166, we block
-          // the accident of re-submitting a wall, not every way two rows can end
-          // up looking alike.
-          const existing = await findOwnedBlockingDuplicate({
-            ownerId: board.ownerId,
-            boardType: board.boardType,
-            layoutId: newLayoutId,
-            sizeId: newSizeId,
-            excludeBoardId: board.id,
-            incoming: {
-              setIds: newSetIds,
-              locationName:
-                validatedInput.locationName !== undefined ? validatedInput.locationName : board.locationName,
-              latitude: validatedInput.latitude !== undefined ? validatedInput.latitude : board.latitude,
-              longitude: validatedInput.longitude !== undefined ? validatedInput.longitude : board.longitude,
-            },
-          });
-
-          if (existing) {
-            // The colliding board belongs to this board's OWNER. A gym admin or
-            // community moderator editing someone else's board gets the bare
-            // rejection code — enough to render "this config is taken", nothing
-            // that names or locates a board they have no read access to.
-            throw duplicateBoardConfigError(existing, { includeIdentity: board.ownerId === userId });
-          }
-        }
-      }
-
-      if (validatedInput.layoutId !== undefined) updateValues.layoutId = validatedInput.layoutId;
-      if (validatedInput.sizeId !== undefined) updateValues.sizeId = validatedInput.sizeId;
-      if (validatedInput.setIds !== undefined) updateValues.setIds = validatedInput.setIds;
-    }
-
-    // Handle slug update
-    if (validatedInput.slug !== undefined) {
-      // Check slug uniqueness
-      const [slugConflict] = await db
-        .select({ id: dbSchema.userBoards.id })
-        .from(dbSchema.userBoards)
-        .where(
-          and(
-            eq(dbSchema.userBoards.slug, validatedInput.slug),
-            isNull(dbSchema.userBoards.deletedAt),
-            sql`${dbSchema.userBoards.id} != ${board.id}`,
-          ),
-        )
-        .limit(1);
-
-      if (slugConflict) {
-        throw new Error('Slug is already taken');
-      }
-      updateValues.slug = validatedInput.slug;
-    }
-
-    // If board was soft-deleted, restore it
-    if (board.deletedAt) {
-      updateValues.deletedAt = null;
-    }
-
-    let updated: typeof dbSchema.userBoards.$inferSelect;
-    try {
-      const updatedRows = await db.transaction(async (tx) => {
-        // Serialize partial edits to the same board before deriving the final
-        // serial+config tuple. Without this row lock, a serial-only edit could
-        // validate against C1 while a concurrent config-only edit changes the
-        // row to C2, producing an unchecked S+C2 duplicate.
-        const [lockedBoard] = rowsFromResult<{
-          serialNumber: string | null;
-          boardType: string;
-          layoutId: number | string;
-          sizeId: number | string;
-          setIds: string;
-          deletedAt: Date | null;
-        }>(
-          await tx.execute(sql`
-            SELECT serial_number AS "serialNumber",
-                   board_type AS "boardType",
-                   layout_id AS "layoutId",
-                   size_id AS "sizeId",
-                   set_ids AS "setIds",
-                   deleted_at AS "deletedAt"
-              FROM user_boards
-             WHERE id = ${board.id}
-             FOR UPDATE
-          `),
-        );
-        if (!lockedBoard) {
-          throw new Error('Board not found');
-        }
-
-        const lockedLayoutId = Number(lockedBoard.layoutId);
-        const lockedSizeId = Number(lockedBoard.sizeId);
-        const resultingSerial =
-          validatedInput.serialNumber === undefined ? lockedBoard.serialNumber : validatedInput.serialNumber;
-        const serialChanged =
-          validatedInput.serialNumber !== undefined && validatedInput.serialNumber !== lockedBoard.serialNumber;
-        const serialConfigChanged =
-          (validatedInput.layoutId !== undefined && validatedInput.layoutId !== lockedLayoutId) ||
-          (validatedInput.sizeId !== undefined && validatedInput.sizeId !== lockedSizeId) ||
-          (validatedInput.setIds !== undefined &&
-            normaliseSetIds(validatedInput.setIds) !== normaliseSetIds(lockedBoard.setIds));
-        const serialOrConfigBecomesActive =
-          resultingSerial !== null && (serialChanged || serialConfigChanged || lockedBoard.deletedAt !== null);
-
-        if (serialOrConfigBecomesActive) {
-          await lockAndAssertBoardSerialAvailable(
-            tx,
-            {
-              serialNumber: resultingSerial,
-              boardType: lockedBoard.boardType,
-              layoutId: validatedInput.layoutId ?? lockedLayoutId,
-              sizeId: validatedInput.sizeId ?? lockedSizeId,
-              setIds: validatedInput.setIds ?? lockedBoard.setIds,
-            },
-            board.ownerId,
-            board.id,
-          );
-        }
-        return tx.update(dbSchema.userBoards).set(updateValues).where(eq(dbSchema.userBoards.id, board.id)).returning();
-      });
-      [updated] = updatedRows;
-    } catch (error) {
-      throwIfBoardSerialConflict(error);
-      throw error;
-    }
-
-    // A public→private flip takes the board out of the anon-readable set, so
-    // the board-queue-preview producer goes quiet — public kiosks would keep
-    // rendering the last snapshot forever. Clear them with a tombstone.
-    // The "was previously anon-readable" gate lives HERE, on the pre-update
-    // row we already hold: a board that was never anon-readable must not get a
-    // publish on its channel at all (that alone would leak "something changed
-    // here" to anyone who guessed the board id). System-owned boards stay
-    // anon-readable regardless of isPublic, so a flip there is not a
-    // transition and must not blank their kiosks.
-    if (
-      board.isPublic &&
-      validatedInput.isPublic === false &&
-      !board.deletedAt &&
-      board.ownerId !== SYSTEM_BOARD_OWNER_ID
-    ) {
-      try {
-        await publishBoardQueuePreviewTombstoneForBoard(board.id);
-      } catch (error) {
-        // A pubsub hiccup must never fail the edit itself — the kiosk clears
-        // on its next reconnect/seed instead.
-        logger.warn('Failed to publish board queue preview tombstone on private flip', {
-          boardId: board.id,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      }
-    }
-
-    // Update PostGIS location column (guarded — see syncLocationGeography)
-    if (validatedInput.latitude !== undefined || validatedInput.longitude !== undefined) {
-      await syncLocationGeography({
-        table: 'user_boards',
-        id: updated.id,
-        latitude: validatedInput.latitude ?? updated.latitude,
-        longitude: validatedInput.longitude ?? updated.longitude,
-        operation: 'updateBoard',
-      });
-    }
-
-    return enrichBoard(updated, userId);
+    const updated = await updateBoardRecord(input, ctx);
+    return enrichBoard(updated, ctx.userId!);
   },
 
   /**
-   * Soft-delete a board
+   * Soft-delete a board: its creator, the gym's owner or admin on a SYSTEM
+   * board, or a global admin (`requireBoardDeleteAccess`).
    */
   deleteBoard: async (_: unknown, { boardUuid }: { boardUuid: string }, ctx: ConnectionContext): Promise<boolean> => {
     requireAuthenticated(ctx);
@@ -2270,8 +3182,10 @@ export const socialBoardMutations = {
     const [board] = await db
       .select({
         id: dbSchema.userBoards.id,
+        uuid: dbSchema.userBoards.uuid,
         ownerId: dbSchema.userBoards.ownerId,
-        isPublic: dbSchema.userBoards.isPublic,
+        gymId: dbSchema.userBoards.gymId,
+        boardType: dbSchema.userBoards.boardType,
       })
       .from(dbSchema.userBoards)
       .where(and(eq(dbSchema.userBoards.uuid, boardUuid), isNull(dbSchema.userBoards.deletedAt)))
@@ -2281,27 +3195,63 @@ export const socialBoardMutations = {
       throw new Error('Board not found');
     }
 
-    if (board.ownerId !== userId) {
-      throw new Error('Not authorized to delete this board');
+    await requireBoardDeleteAccess(userId, board);
+
+    let retractPreview = false;
+
+    if (isSprayBoardType(board.boardType)) {
+      // Every caller, including older apps, must tombstone the wall and retract
+      // its feed and public photo. Load lazily because spray-walls uses board
+      // authorization helpers from this module. deleteSprayWall rechecks this
+      // same deletion gate after its account/wall locks, against the current
+      // gym, and records a non-owner delete.
+      const { sprayWallMutations } = await import('../board/spray-walls');
+      await sprayWallMutations.deleteSprayWall(
+        _,
+        {
+          uuid: boardUuid,
+          beforeBoardDelete: async (_currentBoard, tx) => {
+            retractPreview = await canAccessResource('board', boardUuid, null, tx);
+          },
+        },
+        ctx,
+      );
+    } else {
+      await transactionWithAfterCommit(async (tx) => {
+        const [currentBoard] = await tx
+          .select()
+          .from(dbSchema.userBoards)
+          .where(and(eq(dbSchema.userBoards.id, board.id), isNull(dbSchema.userBoards.deletedAt)))
+          .limit(1)
+          .for('update');
+        if (!currentBoard) throw new Error('Board not found');
+        const actorRole = await requireBoardDeleteAccess(userId, currentBoard, tx);
+        retractPreview = await canAccessResource('board', boardUuid, null, tx);
+
+        // Freeze it too, so a later sync cannot resurrect the removed board.
+        const deletedAt = new Date();
+        await tx
+          .update(dbSchema.userBoards)
+          .set({ deletedAt, syncFrozenAt: deletedAt })
+          .where(eq(dbSchema.userBoards.id, board.id));
+        // Reports about the board close as deleted; a creator hears when it wasn't them.
+        await onBoardDeleted(tx, { board: currentBoard, actorUserId: userId, actorRole });
+        if (actorRole !== 'board_owner') {
+          await recordBoardModerationEvent(tx, {
+            boardId: board.id,
+            gymId: currentBoard.gymId,
+            actorUserId: userId,
+            actorRole,
+            action: 'deleted',
+            details: { mutation: 'deleteBoard' },
+          });
+        }
+      });
     }
 
-    // Freeze it too, so a later sync can't resurrect the board the owner
-    // deliberately removed (the board upsert clears deletedAt).
-    await db
-      .update(dbSchema.userBoards)
-      .set({ deletedAt: new Date(), syncFrozenAt: new Date() })
-      .where(eq(dbSchema.userBoards.id, board.id));
-
-    // Same reasoning as the public→private flip in updateBoard: a soft-deleted
-    // board drops out of the anon-readable set, so the preview producer goes
-    // quiet and kiosks would keep the last snapshot. Gate on the pre-delete
-    // row's anon-readability (a private board's channel never carried a
-    // snapshot, and publishing on it would leak the deletion's timing).
-    // `isPublic` alone is the whole gate: the other half of
-    // `isBoardAnonReadable` — system-owned boards — is unreachable here,
-    // because the ownership check above only lets the authenticated owner
-    // through and nobody can authenticate as the synthetic system owner.
-    if (board.isPublic) {
+    // Use the policy before deletion, including system-owned and Unlisted
+    // boards. Private channels must not reveal the timing of a deletion.
+    if (retractPreview) {
       try {
         await publishBoardQueuePreviewTombstoneForBoard(board.id);
       } catch (error) {
@@ -2381,13 +3331,11 @@ export const socialBoardMutations = {
     const validatedInput = validateInput(FollowBoardInputSchema, input, 'input');
     const userId = ctx.userId!;
 
-    await db
-      .delete(dbSchema.boardFollows)
-      .where(
-        and(eq(dbSchema.boardFollows.userId, userId), eq(dbSchema.boardFollows.boardUuid, validatedInput.boardUuid)),
-      );
-
-    return true;
+    return mutateBoardPreference(validatedInput.boardUuid, false, async (transaction, boardUuid) => {
+      await transaction
+        .delete(dbSchema.boardFollows)
+        .where(and(eq(dbSchema.boardFollows.userId, userId), eq(dbSchema.boardFollows.boardUuid, boardUuid)));
+    });
   },
 
   /**
@@ -2405,31 +3353,21 @@ export const socialBoardMutations = {
     const validatedInput = validateInput(PinBoardInputSchema, input, 'input');
     const userId = ctx.userId!;
 
-    const [board] = await db
-      .select({ uuid: dbSchema.userBoards.uuid })
-      .from(dbSchema.userBoards)
-      .where(and(eq(dbSchema.userBoards.uuid, validatedInput.boardUuid), isNull(dbSchema.userBoards.deletedAt)))
-      .limit(1);
-
-    if (!board) {
-      throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
-    }
-
-    await db
-      .insert(dbSchema.userBoardActivity)
-      .values({ userId, boardUuid: board.uuid, pinnedAt: new Date() })
-      .onConflictDoUpdate({
-        target: [dbSchema.userBoardActivity.userId, dbSchema.userBoardActivity.boardUuid],
-        // COALESCE keeps an existing pin's original time. Only pinnedAt is
-        // touched — clobbering lastUsedAt here would reset the recency of a
-        // board you just pinned.
-        set: {
-          pinnedAt: sql`COALESCE(${dbSchema.userBoardActivity.pinnedAt}, now())`,
-          updatedAt: new Date(),
-        },
-      });
-
-    return true;
+    return mutateBoardPreference(validatedInput.boardUuid, true, async (transaction, boardUuid) => {
+      await transaction
+        .insert(dbSchema.userBoardActivity)
+        .values({ userId, boardUuid, pinnedAt: new Date() })
+        .onConflictDoUpdate({
+          target: [dbSchema.userBoardActivity.userId, dbSchema.userBoardActivity.boardUuid],
+          // COALESCE keeps an existing pin's original time. Only pinnedAt is
+          // touched — clobbering lastUsedAt here would reset the recency of a
+          // board you just pinned.
+          set: {
+            pinnedAt: sql`COALESCE(${dbSchema.userBoardActivity.pinnedAt}, now())`,
+            updatedAt: new Date(),
+          },
+        });
+    });
   },
 
   /**
@@ -2446,17 +3384,12 @@ export const socialBoardMutations = {
     const userId = ctx.userId!;
 
     // The row is kept, not deleted — it still carries last_used_at.
-    await db
-      .update(dbSchema.userBoardActivity)
-      .set({ pinnedAt: null, updatedAt: new Date() })
-      .where(
-        and(
-          eq(dbSchema.userBoardActivity.userId, userId),
-          eq(dbSchema.userBoardActivity.boardUuid, validatedInput.boardUuid),
-        ),
-      );
-
-    return true;
+    return mutateBoardPreference(validatedInput.boardUuid, false, async (transaction, boardUuid) => {
+      await transaction
+        .update(dbSchema.userBoardActivity)
+        .set({ pinnedAt: null, updatedAt: new Date() })
+        .where(and(eq(dbSchema.userBoardActivity.userId, userId), eq(dbSchema.userBoardActivity.boardUuid, boardUuid)));
+    });
   },
 
   /**
@@ -2479,31 +3412,21 @@ export const socialBoardMutations = {
     const validatedInput = validateInput(RecordBoardOpenedInputSchema, input, 'input');
     const userId = ctx.userId!;
 
-    const [board] = await db
-      .select({ uuid: dbSchema.userBoards.uuid })
-      .from(dbSchema.userBoards)
-      .where(and(eq(dbSchema.userBoards.uuid, validatedInput.boardUuid), isNull(dbSchema.userBoards.deletedAt)))
-      .limit(1);
+    return mutateBoardPreference(validatedInput.boardUuid, true, async (transaction, boardUuid) => {
+      const now = new Date();
 
-    if (!board) {
-      throw new GraphQLError('Board not found', { extensions: { code: 'NOT_FOUND' } });
-    }
-
-    const now = new Date();
-
-    await db
-      .insert(dbSchema.userBoardActivity)
-      .values({ userId, boardUuid: board.uuid, lastUsedAt: now })
-      .onConflictDoUpdate({
-        target: [dbSchema.userBoardActivity.userId, dbSchema.userBoardActivity.boardUuid],
-        // GREATEST, not a plain assignment: a delayed or replayed call must
-        // never drag the timestamp backwards. pinnedAt is untouched.
-        set: {
-          lastUsedAt: sql`GREATEST(${dbSchema.userBoardActivity.lastUsedAt}, excluded.last_used_at)`,
-          updatedAt: now,
-        },
-      });
-
-    return true;
+      await transaction
+        .insert(dbSchema.userBoardActivity)
+        .values({ userId, boardUuid, lastUsedAt: now })
+        .onConflictDoUpdate({
+          target: [dbSchema.userBoardActivity.userId, dbSchema.userBoardActivity.boardUuid],
+          // GREATEST, not a plain assignment: a delayed or replayed call must
+          // never drag the timestamp backwards. pinnedAt is untouched.
+          set: {
+            lastUsedAt: sql`GREATEST(${dbSchema.userBoardActivity.lastUsedAt}, excluded.last_used_at)`,
+            updatedAt: now,
+          },
+        });
+    });
   },
 };

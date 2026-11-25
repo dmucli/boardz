@@ -18,8 +18,7 @@ concurrency:
 
 permissions:
   contents: read
-  checks: write
-  pull-requests: write
+  pull-requests: read
   packages: read
 
 jobs:
@@ -29,7 +28,9 @@ jobs:
     outputs:
       anyJs: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.anyJs }}
       web: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.web }}
+      publicOverflow: ${{ github.event_name == 'pull_request' && steps.filter.outputs.publicOverflow || 'false' }}
       backend: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.backend }}
+      authCompatibility: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.authCompatibility }}
       mobile: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.mobile }}
       mobileDeps: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.mobileDeps }}
       ocr: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.ocr }}
@@ -42,7 +43,7 @@ jobs:
       # config + the export/build/deploy pipeline that produces it). None of
       # these match any other filter above, so without this a PR touching only
       # deploy/app-subdomain/_headers ran zero jobs and ci-status passed on
-      # `skipped`. Gates the `deploy-config` job (see below).
+      # `skipped`. Gates the deploy-config step of the `guards` job (see below).
       deployConfig: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.deployConfig }}
       # Store listing copy (fastlane/metadata/**/*.txt) and mobile InfoPlist
       # locale files (packages/mobile/locales/*.json). Both are validated by
@@ -50,9 +51,10 @@ jobs:
       # module-graph analysis can never relate to a diff of these files, and
       # neither path matches anyJs/rootCi/i18nCatalogs — so a PR touching only
       # them would run zero validators and fail post-merge on main. Gates the
-      # `listing-guards` job (see below).
+      # listing-guards step of the `guards` job (see below).
       storeMetadata: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.storeMetadata }}
       mobileLocales: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.mobileLocales }}
+      auroraCircuitArbitration: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.auroraCircuitArbitration }}
       # The two REST-surface oracles walk packages/web/app/api/** and
       # packages/web/vercel.json with readdirSync/readFileSync at run time, so
       # Vitest's `--changed` module-graph analysis can never relate them to a
@@ -60,19 +62,19 @@ jobs:
       # exist to catch. Measured on #4663: adding app/api/internal/probe-route/
       # route.ts, and separately deleting app/api/og/setter/route.tsx, each
       # selected ZERO specs under `vp test run --project web --changed`. Gates
-      # the `rest-surface` job (see below).
+      # the rest-surface step of the `guards` job (see below).
       restSurface: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.restSurface }}
       # PR-only guard signal: did this PR edit the OTA-owned changelog data file?
       # Defaults false off PRs (the OTA bot legitimately rewrites it on push).
       changelogData: ${{ github.event_name == 'pull_request' && steps.filter.outputs.changelogData || 'false' }}
       dbMigrations: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.dbMigrations }}
       staticAssets: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.staticAssets }}
-      # docs/postgres-image-digests.json and docs/*.patch are checked-in PG18
+      # docs/operations/postgres-image-digests.json and docs/*.patch are checked-in PG18
       # rollout artifacts that nothing reads at run time, so nothing notices
       # when the tree drifts under them. Their guard reads every input with
       # readFileSync/readdirSync, which `--changed` can never relate to a diff
       # of a workflow pin or of a file the patch's context depends on. No other
-      # filter matches docs/** at all. Gates the `pg18-artifacts` job below.
+      # filter matches docs/** at all. Gates the pg18-artifacts step of `guards`.
       pg18Artifacts: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.pg18Artifacts }}
       # Inputs to the www production image (Dockerfile.web). Gates the
       # `docker-web` job below — the only thing in CI that ever runs
@@ -97,12 +99,12 @@ jobs:
       # union of every downstream gate, and scripts/__tests__/
       # ci-location-sync-workflow.test.ts asserts on its terms; keep it in sync
       # with the job `if:`s below so a future job can gate on it again.
-      runAny: ${{ github.event_name != 'pull_request' || steps.filter.outputs.anyJs == 'true' || steps.filter.outputs.web == 'true' || steps.filter.outputs.i18nCatalogs == 'true' || steps.filter.outputs.sharedSchema == 'true' || steps.filter.outputs.sharedDeps == 'true' || steps.filter.outputs.backend == 'true' || steps.filter.outputs.mobile == 'true' || steps.filter.outputs.ocr == 'true' || steps.filter.outputs.locationSync == 'true' || steps.filter.outputs.rootCi == 'true' || steps.filter.outputs.staticAssets == 'true' }}
+      runAny: ${{ github.event_name != 'pull_request' || steps.filter.outputs.anyJs == 'true' || steps.filter.outputs.web == 'true' || steps.filter.outputs.i18nCatalogs == 'true' || steps.filter.outputs.sharedSchema == 'true' || steps.filter.outputs.sharedDeps == 'true' || steps.filter.outputs.backend == 'true' || steps.filter.outputs.authCompatibility == 'true' || steps.filter.outputs.mobile == 'true' || steps.filter.outputs.ocr == 'true' || steps.filter.outputs.locationSync == 'true' || steps.filter.outputs.auroraCircuitArbitration == 'true' || steps.filter.outputs.rootCi == 'true' || steps.filter.outputs.staticAssets == 'true' }}
       # NOTE: deployConfig, storeMetadata, mobileLocales, restSurface,
       # pg18Artifacts and boardRenderer are deliberately NOT part of runAny —
-      # the deploy-config, listing-guards, rest-surface, pg18-artifacts and
-      # renderer-rust jobs below gate on their own filters, so a PR touching
-      # only their files runs nothing else.
+      # the deploy-config, listing-guards, rest-surface and pg18-artifacts steps
+      # of the `guards` job and the renderer-rust job gate on their own filters,
+      # so a PR touching only their files runs nothing else.
     steps:
       # No actions/checkout here on purpose: on `pull_request` dorny/paths-filter
       # reads the changed-file list from the REST API (no working tree needed),
@@ -133,8 +135,38 @@ jobs:
               - '!embedded/**'
             web:
               - 'packages/web/**'
+            publicOverflow:
+              - 'packages/web/**'
+              - 'packages/backend/**'
+              - 'packages/db/**'
+              - 'packages/board-constants/**'
+              - 'packages/shared-schema/**'
+              - 'packages/shared/**'
+              - 'docker-compose.yml'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+              - 'vite.config.ts'
+              - 'scripts/ci/public-page-overflow.sh'
+              - 'scripts/__tests__/public-page-overflow-workflow.test.ts'
+              - '.github/workflows/ci.yml'
             backend:
               - 'packages/backend/**'
+              # The backend/web credential proofs run with the backend's disposable Postgres.
+              - 'packages/web/auth-proofs/**'
+            # Web-only auth changes need the owned auth/browser proofs without
+            # selecting the full baseline backend suite for unrelated pages.
+            authCompatibility:
+              - 'packages/web/auth-proofs/**'
+              - 'packages/web/app/lib/auth/**'
+              - 'packages/web/app/lib/partner-oauth/**'
+              - 'packages/web/app/api/auth/**'
+              - 'packages/web/app/api/internal/ws-auth/**'
+              - 'packages/web/app/lib/seo/base-url.ts'
+              - 'packages/web/vite.config.ts'
+              - 'packages/web/tsconfig.json'
+              - 'packages/web/next.config.ts'
+              - 'packages/web/middleware.ts'
             mobile:
               - 'packages/mobile/**'
               - 'packages/board-renderer/wasm/pkg/**'
@@ -156,6 +188,8 @@ jobs:
               # editing only their logic must still trigger that job.
               - 'scripts/mobile-fingerprint-inputs-check.ts'
               - 'scripts/mobile-patches-check.ts'
+              - 'scripts/__tests__/expo-sqlite-native-finalize.test.ts'
+              - 'scripts/__tests__/fixtures/expo-sqlite-native-finalize.c'
             # Renderer-agnostic packages imported by @boardsesh/mobile. Keep
             # this separate from sharedDeps: that backend-facing filter also
             # contains packages/db and every sync service, which made an
@@ -177,6 +211,16 @@ jobs:
             ocr:
               - 'packages/moonboard-ocr/**'
             locationSync:
+              - 'packages/backend/src/auth/current-store/**'
+              - 'packages/backend/src/auth/authority/**'
+              - 'packages/backend/src/auth/location-sync.integration.proof.ts'
+              - 'packages/backend/src/handlers/current-store-*'
+              - 'packages/backend/src/workers/**'
+              - 'packages/backend/scripts/bootstrap-location-proof-database.sh'
+              - 'packages/backend/vite.location-sync-proof.config.ts'
+              - 'packages/shared/auth-protocol/**'
+              - 'packages/aurora-sync/**'
+              - 'packages/moonboard-sync/**'
               - 'packages/location-sync/**'
               - 'packages/db/**'
               - 'packages/shared/board-config/**'
@@ -212,6 +256,20 @@ jobs:
             # the export/build scripts that produce it, and the workflow that
             # deploys it. See deploy/app-subdomain/README.md.
             deployConfig:
+              # OTA/browser gates read workflows and policy files through fs.
+              - 'scripts/lib/app-build-inputs.*'
+              - 'scripts/lib/expo-web-inputs.*'
+              - 'scripts/mobile-ota-preview-reuse*'
+              - 'scripts/mobile-ota-preview-refresh*'
+              - 'scripts/mobile-ota-preview-base-context.test.ts'
+              - 'scripts/mobile-ota-publish-workflow.test.ts'
+              - 'scripts/production-deploy-changes*'
+              - 'scripts/__tests__/pr-test-plan-workflow.test.ts'
+              - 'scripts/__tests__/untrusted-code-workflow-guard.test.ts'
+              - 'scripts/__tests__/expo-web-preview*.test.ts'
+              - '.github/workflows/mobile-ota-preview*.yml'
+              - '.github/workflows/pr-test-plan.yml'
+              - '.github/workflows/expo-web-preview*.yml'
               - 'deploy/app-subdomain/**'
               - 'scripts/build-expo-web-export.sh'
               - 'scripts/lib/patch-expo-web-pwa-manifest.mjs'
@@ -221,9 +279,9 @@ jobs:
               - 'packages/backend/src/build-release.ts'
               - 'scripts/__tests__/docker-build-release-stamp.test.ts'
               - '.github/workflows/production-deploy.yml'
-              # The suites added to deploy-config below. They read the workflow
-              # with readFileSync, so a change to a SUITE has no other path into
-              # CI on a PR either.
+              # The suites the deploy-config guard step runs below. They read
+              # the workflow with readFileSync, so a change to a SUITE has no
+              # other path into CI on a PR either.
               - 'scripts/__tests__/production-deploy-web-targets.test.ts'
               - 'scripts/__tests__/production-deploy-serial-plan.test.ts'
               - 'scripts/__tests__/static-asset-deploy-origin.test.ts'
@@ -251,6 +309,21 @@ jobs:
             mobileLocales:
               - 'packages/mobile/locales/**'
               - 'scripts/mobile-locales-parity.test.ts'
+            # The real-database circuit ownership assertions only need the
+            # Aurora sync paths and their direct shared database contracts.
+            # Root manifests/workflow config are already covered by rootCi.
+            auroraCircuitArbitration:
+              - 'packages/aurora-sync/**'
+              - 'packages/web/app/lib/data-sync/aurora/**'
+              - 'packages/db/src/client/**'
+              - 'packages/db/src/queries/**'
+              - 'packages/db/src/schema/**'
+              - 'packages/sync-runtime/**'
+              - 'packages/shared-schema/src/sync-error-codes.ts'
+              - 'packages/shared-schema/src/__tests__/sync-error-codes.test.ts'
+              - 'scripts/prepare-aurora-circuit-integration-db.ts'
+              - 'scripts/prepare-aurora-circuit-integration-db.test.ts'
+              - 'packages/{aurora-sync,db,sync-runtime,shared-schema,web}/package.json'
             # Everything the two REST-surface oracles read via fs at run time,
             # plus the specs themselves and the api-docs module the OpenAPI one
             # statically imports. `packages/web/app/api/**` is the load-bearing
@@ -314,6 +387,9 @@ jobs:
               - 'packages/moonboard-ocr/**'
               - 'packages/shared-schema/**'
               - 'packages/shared/analytics/**'
+              - 'packages/shared/auth-protocol/**'
+              - 'packages/shared/text-redaction/**'
+              - 'packages/shared/consent/**'
               - 'packages/shared/ble-protocol/**'
               - 'packages/shared/board-config/**'
               - 'packages/shared/board-presence/**'
@@ -321,9 +397,13 @@ jobs:
               - 'packages/shared/board-react/**'
               - 'packages/shared/board-look/**'
               - 'packages/shared/board-render/**'
+              - 'packages/shared/frosted-bokeh/**'
               - 'packages/shared/climb-actions/**'
               - 'packages/shared/climb-filters/**'
+              - 'packages/shared/community-roles/**'
+              - 'packages/shared/connected-apps/**'
               - 'packages/shared/create-climb-react/**'
+              - 'packages/shared/directory-moderation/**'
               - 'packages/shared/email/**'
               - 'packages/shared/graphql/**'
               - 'packages/shared/graphql-client/**'
@@ -338,6 +418,7 @@ jobs:
               - 'packages/shared/playlist-generator/**'
               - 'packages/shared/playlists-react/**'
               - 'packages/shared/profile-stats/**'
+              - 'packages/shared/public-api/**'
               - 'packages/shared/queue/**'
               - 'packages/shared/queue-react/**'
               - 'packages/shared/queue-runtime/**'
@@ -345,6 +426,7 @@ jobs:
               - 'packages/shared/static-assets/**'
               - 'packages/shared/velvet-tokens/**'
               - 'packages/shared/watch-pairing/**'
+              - 'packages/shared/workout-summary/**'
               - 'packages/sync-runtime/**'
               - 'Dockerfile.web'
               - '.dockerignore'
@@ -380,7 +462,7 @@ jobs:
             # entries (docs, replication scripts, dev-db-docker.yml) were
             # pruned when that patch landed as a real rename.
             pg18Artifacts:
-              - 'docs/postgres-image-digests.json'
+              - 'docs/operations/postgres-image-digests.json'
               - 'docs/*.patch'
               - 'docs/**/*.patch'
               - 'docker-compose.yml'
@@ -391,6 +473,16 @@ jobs:
             dbMigrations:
               - 'packages/db/drizzle/**'
               - 'packages/db/src/schema/**'
+              - 'packages/db/src/user-reference-catalog.ts'
+              - 'packages/db/src/__tests__/user-reference-catalog*'
+              - 'packages/db/scripts/reconcile-user-references.ts'
+              - 'packages/db/scripts/db-connection.ts'
+              - 'packages/db/docker/apply-drizzle-migrations.sh'
+              - 'packages/db/docker/legacy-aurora-schema-stub.sql'
+              - 'packages/db/docker/bootstrap-pg18-development-roles.sql'
+              - 'scripts/verify-user-reference-catalog.ts'
+              - 'scripts/lib/owned-catalog-postgres.ts'
+              - 'scripts/__tests__/verify-user-reference-catalog.test.ts'
               - 'scripts/check-db-migrations.ts'
               - 'scripts/lib/drizzle-migrations.ts'
               # The journal<->ledger verification that gates the production
@@ -401,6 +493,9 @@ jobs:
               - 'packages/db/scripts/migration-journal.ts'
               - 'packages/db/scripts/verify-migration-journal.ts'
               - 'packages/db/scripts/migration-journal-verification.integration.test.ts'
+              # The deletion cutoff bootstrap and teardown, their SQL, and the
+              # integration tests this job runs against its Postgres.
+              - 'packages/db/scripts/*sync-deletions-cutoff*'
               - 'packages/db/scripts/moonboard-reconciliation-report*'
               - 'packages/db/scripts/report-moonboard-reconciliation*'
               - 'packages/db/scripts/moonboard-catalog-helpers.ts'
@@ -438,6 +533,11 @@ jobs:
               - 'packages/db/scripts/serial-plan-default.test.ts'
               - 'packages/db/scripts/serial-plan-default.integration.test.ts'
               - 'packages/db/scripts/verify-serial-plan.ts'
+              # The dev-db snapshot loader's node:test file (#6499): its
+              # board_type filter keeps private spray rows from an older artifact
+              # out of a rebuilt image, and only this job runs it.
+              - 'packages/db/scripts/load-board-snapshots*'
+              - 'packages/db/src/catalog-snapshot.ts'
             staticAssets:
               - 'packages/web/public/images/**/*.webp'
               - 'packages/web/public/videos/**/*.mp4'
@@ -555,6 +655,13 @@ jobs:
       # patched source is actually present on this cheap Linux runner.
       - name: Check native patches are applied
         run: vp run check:mobile-patches
+      # These suites read installed SQLite and the C fixture through fs, so
+      # --changed cannot select them from a patch-only or fixture-only diff.
+      - name: Test installed SQLite lifetimes and native finalization
+        run: >-
+          vp test run --project mobile --project scripts
+          packages/mobile/src/db/__tests__/expo-sqlite-lifecycle.test.ts
+          scripts/__tests__/expo-sqlite-native-finalize.test.ts --reporter=agent
       # The resolver can return a valid fingerprint even when a source is silently
       # absent/null. Assert the four autolinking configs, every discovered native
       # module dir, the fingerprint config, and root patch bodies all contribute.
@@ -568,7 +675,7 @@ jobs:
       # @expo/ui swift-ui / jetpack-compose imports must stay in their platform
       # file (*.ios.tsx / *.android.tsx) — a misplaced one crashes the other
       # platform at runtime. The .oxlintrc rule isn't enforced by `vp check`, so
-      # this grep guard is the real backstop. See docs/expo-ui-components.md.
+      # this grep guard is the real backstop. See docs/design/expo-ui-components.md.
       - name: Check mobile @expo/ui platform imports
         run: vp run check:mobile-platform-imports
       # The offline-sync engine's drain/scheduler/pull entry points must be
@@ -589,6 +696,8 @@ jobs:
       #
       # Effective config is the `lint` block in root vite.config.ts, NOT
       # .oxlintrc.json — see issue #4548 and the comment on that block.
+      - name: Check web and native React declaration isolation
+        run: vp test run --project scripts scripts/__tests__/react-types-resolution.test.ts --reporter=agent
       - name: Lint full repo
         # vp/Vite+ panics with "failed printing to stdout: Resource temporarily
         # unavailable (os error 11)" when it flushes the full-repo warning list to the
@@ -608,39 +717,395 @@ jobs:
           fi
           exit $status
 
-  large-files:
-    # Guards against committed binary churn (screenshots, build outputs, vendored
-    # binaries) re-bloating the pack after the 2026 history cleanup. Runs on every
-    # PR regardless of which file types changed — a binary-only PR is exactly the
-    # case to catch — so it is deliberately not gated on the `changes` filter.
-    # Dependency-free (bare node), so no vp install / build artifacts needed.
+  # Eleven cheap guards, one job. Each used to be its own job, and on the
+  # GitHub Free plan's 20-slot pool every job costs a slot allocation plus ~40 s
+  # of runner setup for a minute or less of work. Here they share one checkout
+  # and one `vp install`, and each former job is one step (its `id:` is the old
+  # job name) carrying the old job-level gate as a step-level `if:`.
+  #
+  # Every guard step runs even when an earlier guard failed (`!cancelled()`), so
+  # a run reports every broken guard at once, and `Guards summary` names them in
+  # its annotation. Guard steps also require a successful install: a failed
+  # install already fails the job and should not be buried under ten
+  # derivative failures.
+  #
+  # Job-level `if: !cancelled()` rather than the default `success()`:
+  # large-files and board-render-version read no `changes` output and used to
+  # run with no `needs` at all, so they must still run when `changes` fails.
+  # The path-gated steps then see empty outputs and skip; ci-status fails on
+  # `changes` regardless. Those two guards being ungated is also why this job
+  # has no path gate of its own: the OR of the eleven old job gates is `true`.
+  guards:
+    needs: [changes]
+    if: ${{ !cancelled() }}
     runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+        id: checkout
         with:
+          # large-files and commit-lint diff against the PR base; codegen-drift
+          # reads the base's schema SDL. 50 commits covers the merge-base.
           fetch-depth: 50
       - name: Fetch base ref
+        id: fetch-base
         if: github.event_name == 'pull_request'
         env:
           BASE_REF: ${{ github.base_ref }}
         run: git fetch --depth=50 origin "$BASE_REF":"refs/remotes/origin/$BASE_REF"
-      - uses: actions/setup-node@v4
+      - uses: voidzero-dev/setup-vp@v1
+        id: setup-vp
         with:
-          node-version: 22.x
-      - name: Unit-test the guard
-        run: node --test scripts/check-large-files.test.mjs
-      - name: Check for oversized new files
+          node-version: '22.x'
+          cache: ${{ runner.environment == 'github-hosted' }}
+      - name: Install dependencies
+        id: install
+        run: vp install --frozen-lockfile
+
+      # These contracts read workflows and the historical ruleset through the
+      # filesystem, so test-default's --changed import graph cannot select them.
+      - name: required-ci-status (required context covers every CI gate)
+        id: required-ci-status
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: >-
+          vp test run --project scripts
+          scripts/__tests__/ci-status-rollup.test.ts
+          scripts/__tests__/required-checks-payload.test.ts --reporter=agent
+
+      # Guards against committed binary churn (screenshots, build outputs,
+      # vendored binaries) re-bloating the pack after the 2026 history cleanup.
+      # Runs on every run regardless of which file types changed (a binary-only
+      # PR is exactly the case to catch), so it is deliberately not gated on a
+      # `changes` output. Dependency-free: bare node.
+      - name: large-files (no oversized new files)
+        id: large-files
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
+          node --test scripts/check-large-files.test.mjs
+          if [ "$EVENT_NAME" = "pull_request" ]; then
             node scripts/check-large-files.mjs
           else
             node scripts/check-large-files.mjs --all
           fi
 
+      # Commit subjects remain advisory; free-form PR titles are accepted.
+      # The changelog defaults their category to "Improved".
+      - name: commit-lint (PR commit subjects, advisory)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && github.event_name == 'pull_request' && (needs.changes.outputs.anyJs == 'true' || needs.changes.outputs.rootCi == 'true' || needs.changes.outputs.mobile == 'true' || needs.changes.outputs.mobileDeps == 'true') }}
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: vp run check:commit-message -- --range "origin/$BASE_REF..HEAD"
+      - name: commit-lint (pushed commit subjects, advisory)
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && github.event_name != 'pull_request' && (needs.changes.outputs.anyJs == 'true' || needs.changes.outputs.rootCi == 'true' || needs.changes.outputs.mobile == 'true' || needs.changes.outputs.mobileDeps == 'true') }}
+        continue-on-error: true
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          # On a normal push, github.event.before is the previous tip; validate the
+          # newly pushed commits. On a branch's first push it can be all-zeros, so
+          # fall back to just the head commit to avoid an unbounded range.
+          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            vp run check:commit-message -- --range "$HEAD_SHA~1..$HEAD_SHA"
+          else
+            vp run check:commit-message -- --range "$BEFORE_SHA..$HEAD_SHA"
+          fi
+
+      # PR-only. Gated on the mobile dependency closure: those PRs ship via OTA,
+      # so they must carry user-facing Release Notes (escape hatch: the
+      # skip-changelog label, or the "No release note needed" checkbox).
+      - name: release-notes (PR has Release Notes)
+        id: release-notes
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && github.event_name == 'pull_request' && (needs.changes.outputs.mobile == 'true' || needs.changes.outputs.mobileDeps == 'true') }}
+        env:
+          # Write the body to a file (via env, not interpolated into the script)
+          # so a markdown body with backticks/quotes can't break the shell. The
+          # file goes under RUNNER_TEMP so it never dirties the tree the later
+          # guards diff.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          printf '%s' "$PR_BODY" > "$RUNNER_TEMP/pr-body.txt"
+          vp run check:release-notes -- --body-file "$RUNNER_TEMP/pr-body.txt"
+
+      # The Mobile OTA Production workflow is the SOLE writer of
+      # changelog.generated.json: it regenerates and pushes it on every publish.
+      # A PR must never hand-edit it (that would fight the OTA bot and could
+      # revert shipped entries). The checker rejects edits on every PR target;
+      # there is no special import exception.
+      - name: changelog-owned (no manual changelog edits)
+        id: changelog-owned
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.changes.outputs.changelogData == 'true' }}
+        env:
+          PR_BASE_BRANCH: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if ! [[ "$PR_BASE_SHA" =~ ^[0-9a-fA-F]{40}$ && "$PR_HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo '::error::Generated changelog verification requires exact PR commit SHAs.'
+            exit 1
+          fi
+          # Fetch exact commit identities before the read-only generated-file diff.
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --no-tags --unshallow origin "$PR_BASE_SHA" "$PR_HEAD_SHA" '+refs/heads/main:refs/remotes/origin/main'
+          else
+            git fetch --no-tags origin "$PR_BASE_SHA" "$PR_HEAD_SHA" '+refs/heads/main:refs/remotes/origin/main'
+          fi
+          vp exec tsx scripts/check-changelog-ownership.ts
+
+      # No path gate on purpose. The version is derived from the whole board
+      # catalogue plus the compiled renderer and every board photo the catalogue
+      # composites; a paths-filter listing those would drift from the
+      # generator's real input set, and a guard that silently stops guarding is
+      # worse than none (see the `check:db-migrations` / large-files precedents).
+      - name: board-render-version (committed version matches the tree)
+        id: board-render-version
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: vp run check:board-render-version
+
+      # No path gate: the tables read the velvet-tokens package and three mobile
+      # theme files, and a stale list of those would stop guarding.
+      - name: velvet-tokens (design-doc token tables match the code)
+        id: velvet-tokens
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: vp run check:velvet-tokens
+
+      # References can break when either their source or target moves. Check the
+      # complete inventory, including contracts that read docs as executable input.
+      - name: docs-links (maintained local references resolve)
+        id: docs-links
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          vp run check:docs
+          vp test run --project scripts scripts/__tests__/check-docs.test.ts --reporter=agent
+
+      # No path gate, for the same reason: the input is the whole
+      # @boardsesh/public-api contract, and a stale list would stop guarding.
+      - name: public-api-openapi (committed document matches the schemas)
+        id: public-api-openapi
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: vp run check:public-api-openapi
+
+      # A PR that changes that document needs a changelog entry
+      # (docs/integrations/integration-platform.md, "Versioning"). No path gate either: the
+      # newest entry must name the committed document's hash on every run, and
+      # on a PR the entries already on the base may not change.
+      - name: public-api-changelog (contract changes carry a changelog entry)
+        id: public-api-changelog
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -n "$PR_BASE_SHA" ]; then
+            git fetch --no-tags --depth=1 origin "$PR_BASE_SHA"
+          fi
+          vp run check:public-api-changelog
+
+      # `mobile` is in the gate because check:i18n:orphans scans
+      # packages/mobile/{src,app} too. #4416 shipped a raw `playView.resetZoom`
+      # label from a mobile-only commit; without it the guard would skip the
+      # exact class of PR that introduces the bug. The orphans check is two-way:
+      # orphaned catalog keys, plus keys referenced from code that exist in no
+      # catalog, and mobile files reading a namespace Metro never bundles.
+      - name: i18n (hardcoded strings, orphaned and missing keys)
+        id: i18n
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.web == 'true' || needs.changes.outputs.mobile == 'true' || needs.changes.outputs.i18nCatalogs == 'true' || needs.changes.outputs.rootCi == 'true') }}
+        run: |
+          vp run check:i18n
+          vp run check:i18n:orphans
+
+      # Deliberately not `--changed`-filtered: these suites read their inputs
+      # (_headers/_redirects, the Dockerfiles, build-expo-web-export.sh,
+      # create-service-docker-context.mjs, production-deploy.yml) via fs at run
+      # time, not a static import, so Vitest's `--changed` module-graph analysis
+      # would never mark them as related to a diff that only touches those
+      # files. On a PR, a full un-filtered run is what makes a CSP or
+      # SPA-fallback regression fail CI. (Pushes to main run these a second time
+      # inside test-default, which reads its project list off the root
+      # vite.config.ts: harmless, and no substitute for this guard on PRs.)
+      #
+      # Nothing in CI builds Dockerfile.web (branch-deploy.yml is
+      # workflow_dispatch-only), so the container build contracts are the only
+      # thing standing between #3795 and a restored /app export step (W-24 /
+      # #4438). The production-deploy suites pin production-deploy.yml's shape:
+      # the deploy-target gating and the job graph, the static-asset origin
+      # baked into the image, and the Cloudflare/web promotion wiring. Before
+      # they ran here, a PR that broke one went green and turned main red after
+      # merge: `cloudflare-apply.test.ts` once sliced a job that no longer
+      # existed (indexOf -> -1, slice(-1) -> the last character) and every
+      # assertion against it passed vacuously.
+      - name: deploy-config (app subdomain, container and production-deploy contracts)
+        id: deploy-config
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.deployConfig == 'true' || needs.changes.outputs.rootCi == 'true') }}
+        run: |
+          vp test run --project deploy-app-subdomain
+          vp test run --project scripts \
+            scripts/__tests__/dockerfile-web-no-expo-export.test.ts \
+            scripts/__tests__/build-expo-web-export.test.ts \
+            scripts/__tests__/docker-build-release-stamp.test.ts
+          vp test run --project scripts \
+            scripts/__tests__/production-deploy-web-targets.test.ts \
+            scripts/__tests__/production-deploy-serial-plan.test.ts \
+            scripts/__tests__/static-asset-deploy-origin.test.ts \
+            scripts/cloudflare-apply.test.ts \
+            scripts/__tests__/ci-docker-web-workflow.test.ts \
+            scripts/__tests__/public-page-overflow-workflow.test.ts \
+            scripts/__tests__/service-image-build-cache.test.ts \
+            scripts/__tests__/homelab-dispatch-workflow.test.ts
+          vp test run --project scripts --reporter=agent \
+            scripts/lib/app-build-inputs.test.ts \
+            scripts/lib/expo-web-inputs.test.ts \
+            scripts/mobile-ota-preview-reuse.test.ts \
+            scripts/mobile-ota-preview-refresh.test.ts \
+            scripts/mobile-ota-preview-base-context.test.ts \
+            scripts/mobile-ota-publish-workflow.test.ts \
+            scripts/__tests__/pr-test-plan-workflow.test.ts \
+            scripts/__tests__/untrusted-code-workflow-guard.test.ts \
+            scripts/__tests__/expo-web-preview-controller.test.ts \
+            scripts/__tests__/expo-web-preview-workflows.test.ts
+          vp exec node --test scripts/production-deploy-changes.test.mjs
+
+      # Same rationale as deploy-config: these two suites read their inputs
+      # (fastlane/metadata/**/*.txt, packages/mobile/locales/*.json) via fs at
+      # run time, so `--changed` never selects them for a diff that only touches
+      # those files, and no other job's gate fires for them at all. Run both
+      # unfiltered whenever either input set changes, so an over-limit store
+      # field or a malformed InfoPlist translation fails the PR instead of the
+      # post-merge run on main.
+      - name: listing-guards (store listing copy and mobile locale parity)
+        id: listing-guards
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.storeMetadata == 'true' || needs.changes.outputs.mobileLocales == 'true' || needs.changes.outputs.rootCi == 'true') }}
+        run: vp test run --project scripts scripts/store-metadata-limits.test.ts scripts/mobile-locales-parity.test.ts
+
+      # Deliberately not `--changed`-filtered, same rationale as deploy-config
+      # and listing-guards: the spec reads docs/operations/postgres-image-digests.json, any
+      # prepared patch under docs/, and each pinned consumer with
+      # readFileSync/readdirSync at run time, so Vitest's module-graph analysis
+      # never relates it to a diff that only edits a workflow pin or a file a
+      # patch's context depends on. That is exactly the diff it guards. Note
+      # `.github/workflows/ci.yml` reaches it via rootCi rather than the
+      # pg18Artifacts list.
+      - name: pg18-artifacts (image digest pins and prepared patches)
+        id: pg18-artifacts
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.pg18Artifacts == 'true' || needs.changes.outputs.rootCi == 'true') }}
+        run: vp test run --project scripts scripts/__tests__/pg18-artifact-drift.test.ts
+
+      # Deliberately not `--changed`-filtered, same rationale as deploy-config
+      # and listing-guards: both specs reconcile the REST surface against the
+      # filesystem at run time (readdirSync over packages/web/app/api/**,
+      # readFileSync of vercel.json, existsSync per registered OpenAPI path), so
+      # Vitest's module-graph analysis in test-default never selects them for a
+      # diff that only adds or deletes a route file. That is precisely the diff
+      # each one guards, so inside test-default they were inert on PRs and only
+      # ever reddened post-merge on main. Do not fold these into test-default
+      # and do not add `--changed` here.
+      #
+      # The last spec reads ci.yml itself, so nothing in test-default relates it
+      # to a diff that narrows this guard. It is what stops the gate above from
+      # being quietly reverted.
+      - name: rest-surface (REST inventory, OpenAPI spec and this guard's own gate)
+        id: rest-surface
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.restSurface == 'true' || needs.changes.outputs.rootCi == 'true') }}
+        run: |
+          vp test run --project web \
+            packages/web/app/__tests__/rest-surface-inventory.test.ts \
+            packages/web/app/lib/api-docs/__tests__/openapi-document.test.ts
+          vp test run --project scripts scripts/__tests__/ci-rest-surface-workflow.test.ts
+
+      # Deliberately not `--changed`-filtered, same rationale as deploy-config and
+      # rest-surface: the parity spec reads every X.ts / X.web.ts(x) pair and every
+      # importer with readFileSync, so Vitest's module graph never relates it to a
+      # source diff. #6067 added getQueueSnapshotGeneration to queue-snapshot-store.ts
+      # but not to its .web fork; this spec went red on main 13 min after merge while
+      # the PR's test-default never selected it, and app.boardsesh.com failed to
+      # boot for 1 h 40 min (#6110). Do not fold this into test-default and do not
+      # add `--changed`. The second command reads ci.yml itself, so a diff that
+      # narrows this gate cannot go green.
+      - name: web-fork-parity (every name a web-bundled module imports exists in its .web fork)
+        id: web-fork-parity
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.mobile == 'true' || needs.changes.outputs.rootCi == 'true') }}
+        run: |
+          vp test run --project mobile packages/mobile/src/__tests__/web-fork-export-parity.test.ts
+          vp test run --project scripts scripts/__tests__/ci-web-fork-parity-workflow.test.ts
+
+      # No path gate on purpose, and deliberately not `--changed`-filtered, same
+      # rationale as deploy-config and rest-surface: the spec finds importers with
+      # `git ls-files` and readFileSync, so Vitest's module graph never relates it
+      # to a source diff. A PR importing better-auth from production backend code,
+      # web or mobile would go green in test-default and only redden main. A paths
+      # filter would have to list every package, so it simply always runs.
+      - name: better-auth-boundary (Better Auth stays out of web, mobile and production backend code)
+        id: better-auth-boundary
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: vp test run --project scripts scripts/__tests__/better-auth-boundary.test.ts scripts/__tests__/ci-auth-mirror-workflow.test.ts scripts/__tests__/ci-auth-web-proof-workflow.test.ts scripts/__tests__/ci-auth-compatibility-workflow.test.ts scripts/__tests__/ci-credential-writer-workflow.test.ts scripts/__tests__/ci-auth-fence-workflow.test.ts --maxWorkers=2 --reporter=agent
+
+      # Last on purpose: `vp run codegen` rewrites generated files in the
+      # working tree, and no earlier guard should see that.
+      #
+      # codegen.ts pulls GraphQL documents from packages/web/app/**/*.{ts,tsx}
+      # in addition to the schema + shared/graphql, so a web-only PR that edits
+      # a gql tag can drift the generated client. `web` is in the gate for that.
+      #
+      # Installed app builds keep sending the queries they shipped with, so a
+      # removed field, argument, type or enum value fails their requests with
+      # GRAPHQL_VALIDATION_FAILED (#5370). The breaking-change check runs after
+      # the drift check, so the committed SDL compared is the regenerated one.
+      # A deliberate removal opts out with the `schema-breaking-ok` label;
+      # adding a label does not re-trigger this workflow, so re-run the job (or
+      # push) afterwards. It reads the base SDL from the base ref fetched above.
+      - name: codegen-drift (generated GraphQL is current, no client-breaking schema change)
+        id: codegen-drift
+        if: ${{ !cancelled() && steps.install.outcome == 'success' && (needs.changes.outputs.sharedSchema == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.rootCi == 'true') }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          SCHEMA_BREAKING_OK: ${{ contains(github.event.pull_request.labels.*.name, 'schema-breaking-ok') }}
+        run: |
+          vp run codegen
+          if ! git diff --exit-code -- \
+              packages/shared-schema/src/generated \
+              packages/shared/graphql/src/generated \
+              packages/web/app/lib/graphql/generated; then
+            echo "::error::Generated GraphQL files are out of date. Run 'vp run codegen' locally and commit the result."
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$SCHEMA_BREAKING_OK" != "true" ]; then
+            node --import tsx packages/shared-schema/scripts/check-breaking-changes.ts --base-ref "origin/$BASE_REF"
+          fi
+
+      # Every step with an `id:` above is setup or a guard; the advisory
+      # commit-lint steps have none, so their allowed failures never land here.
+      # Names each failed step in an annotation so the check run says which
+      # guard broke without opening the log.
+      - name: Guards summary
+        if: always()
+        env:
+          STEP_RESULTS: ${{ toJSON(steps) }}
+        run: |
+          echo "$STEP_RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.outcome)"'
+          failed=$(echo "$STEP_RESULTS" | jq -r 'to_entries[] | select(.value.outcome == "failure") | .key')
+          if [ -n "$failed" ]; then
+            {
+              echo "### Failed guards"
+              echo
+              while IFS= read -r guard; do
+                echo "- \`$guard\`"
+              done <<< "$failed"
+            } >> "$GITHUB_STEP_SUMMARY"
+            while IFS= read -r guard; do
+              echo "::error title=Guard failed::$guard failed. Open its step in this job's log for the details."
+            done <<< "$failed"
+            exit 1
+          fi
+          echo "All guards passed or were correctly skipped."
+
   typecheck:
     needs: [changes]
-    if: needs.changes.outputs.anyJs == 'true' || needs.changes.outputs.rootCi == 'true'
+    # Catalog-only changes can grow the homepage RSC payload too.
+    if: needs.changes.outputs.anyJs == 'true' || needs.changes.outputs.rootCi == 'true' || needs.changes.outputs.i18nCatalogs == 'true' || needs.changes.outputs.publicOverflow == 'true'
     # Stays GitHub-hosted: OOM-killed on the fleet, exit 137, on every run.
     # `vp run typecheck` fans out at --concurrency-limit 4, so `next build` and
     # three `tsc --noEmit` share one slot's ~3.4 GB. Same failure family as
@@ -651,7 +1116,7 @@ jobs:
     # runner -- hosted and self-hosted alike -- to work around a bound that
     # only exists on ours, and it has not been measured.
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v6
       - uses: voidzero-dev/setup-vp@v1
@@ -665,7 +1130,33 @@ jobs:
       # cache hits, so this is fast on small PRs even though it expresses the
       # full set.
       - name: Typecheck (cache-driven affected)
+        timeout-minutes: 20
         run: vp run typecheck
+      # Reuse the runnable standalone output restored by build:web's task cache.
+      # The checker fails on missing output; it never starts another build.
+      - name: Check rendered homepage gzip budget
+        timeout-minutes: 2
+        run: vp exec tsx scripts/check-homepage-budget.ts
+
+      - name: Install Chromium for public page checks
+        if: needs.changes.outputs.publicOverflow == 'true'
+        working-directory: packages/web
+        run: vp exec playwright install --with-deps chromium
+      - name: Check public pages in Chromium
+        id: public_overflow
+        if: needs.changes.outputs.publicOverflow == 'true'
+        timeout-minutes: 12
+        run: bash scripts/ci/public-page-overflow.sh
+      - name: Upload public page failure evidence
+        if: failure() && steps.public_overflow.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-page-overflow
+          path: |
+            ${{ runner.temp }}/public-page-overflow-*/
+            packages/web/test-results/
+            packages/web/playwright-report/
+          retention-days: 5
 
   db-migrations:
     needs: [changes]
@@ -674,7 +1165,7 @@ jobs:
     # board-constants and the sync packages).
     if: needs.changes.outputs.dbMigrations == 'true' || needs.changes.outputs.rootCi == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     # A stock Postgres is enough: the journal<->ledger test builds its own
     # throwaway migrations folder and database, so it needs no board data and
     # never pulls the (large) boardsesh-dev-db image.
@@ -697,6 +1188,23 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 25
+      # The full migration chain needs PostgreSQL 18 and PostGIS, which the
+      # stock service above does not have. Same pinned image as test-backend.
+      catalog-postgres:
+        image: ghcr.io/boardsesh/boardsesh-postgres-postgis@sha256:98ed9b18b9ef23d4f0aec136bab51b600b8343a19b5f39c78c2c8deab1e96c91
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: user_reference_catalog
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 25
     steps:
       - uses: actions/checkout@v6
         with:
@@ -709,9 +1217,12 @@ jobs:
       - name: Install dependencies
         run: vp install --frozen-lockfile
       - name: Validate the migration folder
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
         run: |
-          git fetch --no-tags --depth=1 origin main
-          vp run check:db-migrations -- --base origin/main
+          # Keep checkout's full history so a newer base remains a provable fast-forward.
+          git fetch --no-tags origin "$BASE_REF":"refs/remotes/origin/$BASE_REF"
+          vp run check:db-migrations -- --base "origin/$BASE_REF"
       # Guards the failure mode check:db-migrations cannot see: a migration
       # whose `when` lands below drizzle's created_at high-water mark is skipped
       # forever and silently (#2933). Drives drizzle's real migrate() against a
@@ -720,6 +1231,16 @@ jobs:
         env:
           MIGRATION_JOURNAL_DB_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: vp run test:db:migration-journal
+      # One file at a time: both create and drop the cluster-wide
+      # boardsesh_sync_cutoff_owner role.
+      - name: Verify the isolated deletion cutoff bootstrap and teardown
+        working-directory: packages/db
+        env:
+          SYNC_CUTOFF_TEST_ADMIN_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+        run: >-
+          vp exec tsx --test --test-concurrency=1
+          scripts/bootstrap-sync-deletions-cutoff.integration.test.ts
+          scripts/teardown-sync-deletions-cutoff.integration.test.ts
       # These node:test files are outside Vitest's module graph. In particular,
       # the report's projection must keep agreeing with the immutable SQL.
       - name: Replay MoonBoard reconciliation and verify report projections
@@ -742,11 +1263,38 @@ jobs:
       # A trigger function with no pinned search_path cannot resolve an
       # unqualified type or table while pg_restore holds search_path at '',
       # which aborts a --data-only restore on the first affected table with zero
-      # rows loaded (#4699). Textual, because this job's service is a stock
-      # postgres:17 with no PostGIS and cannot apply the full migration chain. The
-      # catalog counterpart runs in test-dev-db via scripts/dev-db-image-smoke.sh.
+      # rows loaded (#4699). Textual, because the stock postgres:17 service most
+      # of this job uses has no PostGIS and cannot apply the full migration chain.
+      # The catalog counterpart runs in test-dev-db via scripts/dev-db-image-smoke.sh.
       - name: Every trigger function pins search_path
         run: vp test run --project scripts scripts/__tests__/db-trigger-search-path.test.ts
+      # Pure reconciliation and actual process boundaries need no PostGIS
+      # service. The complete PG18 journal proof is a separate owned task.
+      - name: Verify user-reference reconciliation and isolated proof boundaries
+        run: |
+          vp test run --project scripts scripts/__tests__/verify-user-reference-catalog.test.ts --reporter=agent
+          vp exec node --import tsx --test packages/db/src/__tests__/user-reference-catalog.test.ts
+      # Applies every migration the way the dev-db image does, then compares the
+      # real foreign keys to public.users with the Drizzle declarations, so a
+      # future FK to users that the schema does not declare fails this job.
+      - name: Reconcile applied users foreign keys against the schema
+        env:
+          PGHOST: localhost
+          PGPORT: '5434'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: user_reference_catalog
+          DRIZZLE_MIGRATIONS_DIR: packages/db/drizzle
+          SYNC_CUTOFF_ADMIN_DATABASE_URL: postgres://postgres:postgres@localhost:5434/user_reference_catalog
+          SYNC_CUTOFF_DEVELOPMENT_BOOTSTRAP: 'true'
+          USER_REFERENCE_CATALOG_DATABASE_URL: postgres://postgres:postgres@localhost:5434/user_reference_catalog
+        run: |
+          psql -X -v ON_ERROR_STOP=1 -f packages/db/docker/legacy-aurora-schema-stub.sql
+          psql -X -v ON_ERROR_STOP=1 -v boardsesh_dev_role_bootstrap=true \
+            -f packages/db/docker/bootstrap-pg18-development-roles.sql
+          (cd packages/db && vp exec tsx scripts/bootstrap-sync-deletions-cutoff-development.ts --apply)
+          bash packages/db/docker/apply-drizzle-migrations.sh
+          (cd packages/db && vp exec tsx scripts/reconcile-user-references.ts)
       # #5352: `ALTER DATABASE ... SET max_parallel_workers_per_gather = 0` needs
       # database ownership, which the production migration role deliberately does
       # not have — so migration 0225 was a silent no-op there. The integration
@@ -763,72 +1311,27 @@ jobs:
           vp exec tsx --test
           scripts/serial-plan-default.test.ts
           scripts/serial-plan-default.integration.test.ts
+      # The fixed system-owner key's lock contract and the dedupe CLI's lock order
+      # sit outside Vitest's module graph and need no database.
+      - name: Verify the fixed system-owner key and its CLI order
+        working-directory: packages/db
+        run: >-
+          vp exec tsx --test
+          src/__tests__/fixed-system-owner-order.test.ts
+          scripts/dedupe-gym-locations-owner-order.test.ts
+      # #6499: the first dev-db image built after the exporter stopped writing
+      # spray rows still loads an older artifact that carries them, so the
+      # loader's own board_type filter is what keeps private walls out. A
+      # node:test file outside Vitest's module graph; it needs no database.
+      - name: Dev-db snapshot loader skips private spray rows
+        working-directory: packages/db
+        run: vp exec tsx --test scripts/load-board-snapshots.test.ts
 
-  codegen-drift:
-    needs: [changes]
-    # codegen.ts pulls GraphQL documents from packages/web/app/**/*.{ts,tsx}
-    # in addition to the schema + shared/graphql, so a web-only PR that edits
-    # a gql tag can drift the generated client. Include `web` in the gate.
-    if: needs.changes.outputs.sharedSchema == 'true' || needs.changes.outputs.web == 'true' || needs.changes.outputs.rootCi == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Regenerate GraphQL types
-        run: vp run codegen
-      - name: Verify committed output matches
-        run: |
-          if ! git diff --exit-code -- \
-              packages/shared-schema/src/generated \
-              packages/shared/graphql/src/generated \
-              packages/web/app/lib/graphql/generated; then
-            echo "::error::Generated GraphQL files are out of date. Run 'vp run codegen' locally and commit the result."
-            exit 1
-          fi
-      # Installed app builds keep sending the queries they shipped with, so a
-      # removed field, argument, type or enum value fails their requests with
-      # GRAPHQL_VALIDATION_FAILED (#5370). Runs after the drift check, so the
-      # committed SDL compared here is the regenerated one. A deliberate removal
-      # opts out with the `schema-breaking-ok` label; adding a label does not
-      # re-trigger this workflow, so re-run the job (or push) afterwards.
-      - name: Block client-breaking schema changes
-        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'schema-breaking-ok')
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          git fetch --no-tags --depth=1 origin "$BASE_REF"
-          node --import tsx packages/shared-schema/scripts/check-breaking-changes.ts --base-ref FETCH_HEAD
-
-  # No `if:` path gate and no `needs: [changes]` on purpose. The version is derived
-  # from the whole board catalogue plus the compiled renderer and every board photo
-  # the catalogue composites — a paths-filter listing those would drift from the
-  # generator's real input set, and a guard that silently stops guarding is worse
-  # than none (see the `check:db-migrations` / `large-files` precedents). Since it
-  # reads no `changes` output, waiting on that job would only add latency.
-  board-render-version:
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Verify the committed board-render version matches the tree
-        run: vp run check:board-render-version
-
-  # Same no-path-gate reasoning as board-render-version above, and the same
-  # inputs: the tracer walks the whole board catalogue and every board photo the
-  # catalogue composites, so a paths-filter listing those would drift from the
-  # generator's real input set. ~2 minutes of sharp + geometry for 49 configs.
+  # Same no-path-gate reasoning as the board-render-version step of `guards`,
+  # and the same inputs: the tracer walks the whole board catalogue and every
+  # board photo the catalogue composites, so a paths-filter listing those would
+  # drift from the generator's real input set. ~2 minutes of sharp + geometry
+  # for 49 configs, which is why it stays its own job rather than a guard step.
   board-art-geometry:
     runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15
@@ -842,140 +1345,6 @@ jobs:
         run: vp install --frozen-lockfile
       - name: Verify the committed hold silhouettes match the board art
         run: vp run check:board-art-geometry
-
-  i18n:
-    needs: [changes]
-    # `mobile` is in the filter because check:i18n:orphans scans
-    # packages/mobile/{src,app} too. #4416 shipped a raw `playView.resetZoom`
-    # label from a mobile-only commit — without this the guard would skip the
-    # exact class of PR that introduces the bug.
-    if: needs.changes.outputs.web == 'true' || needs.changes.outputs.mobile == 'true' || needs.changes.outputs.i18nCatalogs == 'true' || needs.changes.outputs.rootCi == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Check hardcoded user-facing strings
-        run: vp run check:i18n
-      # Two-way: orphaned catalog keys, plus keys referenced from code that exist
-      # in no catalog (they ship as raw `playView.resetZoom` strings — #4416) and
-      # mobile files reading a namespace Metro never bundles.
-      - name: Check i18n keys (orphaned + missing)
-        run: vp run check:i18n:orphans
-
-  deploy-config:
-    needs: [changes]
-    # Deliberately not `--changed`-filtered: the tests read `_headers`/`_redirects`
-    # via fs at run time (not a static import), so Vitest's `--changed` module-graph
-    # analysis would never mark them as related to a diff that only touches those
-    # files. On a PR, a full un-filtered run of this one small project is what makes
-    # a CSP or SPA-fallback regression fail CI. (Pushes to main run the project a
-    # second time inside test-default, which reads its project list off the root
-    # vite.config.ts — harmless, and no substitute for this job on PRs.)
-    if: needs.changes.outputs.deployConfig == 'true' || needs.changes.outputs.rootCi == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Validate deploy/app-subdomain config (_headers, _redirects, _routes.json, asset-404 Function, no-CSP rule)
-        run: vp test run --project deploy-app-subdomain
-      # Same fs-reading blind spot, one project over: these suites read the
-      # Dockerfiles / build-expo-web-export.sh / create-service-docker-context.mjs
-      # with readFileSync, so test-default's `--changed` never relates them to a
-      # diff that only touches those files — and a Dockerfile- or .sh-only PR
-      # matches no other job's gate at all. Nothing in CI builds Dockerfile.web
-      # (branch-deploy.yml is workflow_dispatch-only), so these pins are the only
-      # thing standing between #3795 and a restored /app export step. W-24 / #4438.
-      - name: Validate container build contracts
-        run: >-
-          vp test run --project scripts
-          scripts/__tests__/dockerfile-web-no-expo-export.test.ts
-          scripts/__tests__/build-expo-web-export.test.ts
-          scripts/__tests__/docker-build-release-stamp.test.ts
-
-      # Same fs-reading blind spot again, and these three are the suites that
-      # actually pin production-deploy.yml's shape: the deploy-target gating and
-      # the job graph, the static-asset origin baked into the image, and the
-      # Cloudflare/web promotion wiring.
-      #
-      # They had NO path into PR CI at all. `test-default` is `--changed`-filtered
-      # on PRs and these read the workflow with readFileSync, so Vitest's module
-      # graph never relates them to a workflow diff; only a push to main ran them,
-      # which means a PR that broke one of these guards went green and turned main
-      # red after merge. Found the hard way while deleting the Vercel half of the
-      # deploy: `cloudflare-apply.test.ts` sliced a job that no longer existed
-      # (indexOf -> -1, slice(-1) -> the last character) and every assertion
-      # against it passed vacuously.
-      - name: Validate the production deploy workflow contracts
-        run: >-
-          vp test run --project scripts
-          scripts/__tests__/production-deploy-web-targets.test.ts
-          scripts/__tests__/production-deploy-serial-plan.test.ts
-          scripts/__tests__/static-asset-deploy-origin.test.ts
-          scripts/cloudflare-apply.test.ts
-          scripts/__tests__/ci-docker-web-workflow.test.ts
-          scripts/__tests__/service-image-build-cache.test.ts
-          scripts/__tests__/homelab-dispatch-workflow.test.ts
-
-  listing-guards:
-    needs: [changes]
-    # Same rationale as deploy-config: these two suites read their inputs
-    # (fastlane/metadata/**/*.txt, packages/mobile/locales/*.json) via fs at run
-    # time, so Vitest's `--changed` module-graph analysis never selects them for
-    # a diff that only touches those files — and no other job's gate fires for
-    # them at all. Run both files unfiltered whenever either input set changes,
-    # so an over-limit store field or a malformed InfoPlist translation fails
-    # the PR instead of the post-merge run on main. (Pushes to main run the
-    # scripts project a second time inside test-default — harmless, and no
-    # substitute for this job on PRs.)
-    if: needs.changes.outputs.storeMetadata == 'true' || needs.changes.outputs.mobileLocales == 'true' || needs.changes.outputs.rootCi == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Validate store listing copy and mobile locale parity
-        run: vp test run --project scripts scripts/store-metadata-limits.test.ts scripts/mobile-locales-parity.test.ts
-
-  pg18-artifacts:
-    needs: [changes]
-    # Deliberately not `--changed`-filtered, same rationale as deploy-config and
-    # listing-guards: the spec reads docs/postgres-image-digests.json, any
-    # prepared patch under docs/, and each pinned consumer with
-    # readFileSync/readdirSync at run time, so Vitest's module-graph analysis
-    # never relates it to a diff that only edits a workflow pin or a file a
-    # patch's context depends on. That is exactly the diff it guards. Note
-    # `.github/workflows/ci.yml` reaches it via rootCi rather than the
-    # pg18Artifacts list.
-    if: needs.changes.outputs.pg18Artifacts == 'true' || needs.changes.outputs.rootCi == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Validate published image digest pins and any prepared patches
-        run: vp test run --project scripts scripts/__tests__/pg18-artifact-drift.test.ts
 
   renderer-rust:
     needs: [changes]
@@ -1009,47 +1378,19 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
-  rest-surface:
-    needs: [changes]
-    # Deliberately not `--changed`-filtered, same rationale as deploy-config and
-    # listing-guards one job up: both specs reconcile the REST surface against
-    # the filesystem at run time (readdirSync over packages/web/app/api/**,
-    # readFileSync of vercel.json, existsSync per registered OpenAPI path), so
-    # Vitest's module-graph analysis in test-default never selects them for a
-    # diff that only adds or deletes a route file. That is precisely the diff
-    # each one guards, so inside test-default they were inert on PRs and only
-    # ever reddened post-merge on main. Run both unfiltered whenever the API
-    # tree, vercel.json, or the specs' own inputs change. Do not fold these into
-    # test-default and do not add `--changed` here.
-    if: needs.changes.outputs.restSurface == 'true' || needs.changes.outputs.rootCi == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Validate the REST surface inventory and the published OpenAPI spec
-        run: >-
-          vp test run --project web
-          packages/web/app/__tests__/rest-surface-inventory.test.ts
-          packages/web/app/lib/api-docs/__tests__/openapi-document.test.ts
-      # Same fs-reading blind spot one level up: this spec reads ci.yml itself,
-      # so nothing in test-default relates it to a diff that narrows this job.
-      # It is what stops the gate above from being quietly reverted.
-      - name: Validate this job's own gate
-        run: vp test run --project scripts scripts/__tests__/ci-rest-surface-workflow.test.ts
-
   test-default:
     needs: [changes]
     # i18nCatalogs: a catalog-only PR (pure JSON) must still run the
     # catalog-completeness parity test, which lives in this job.
     if: needs.changes.outputs.anyJs == 'true' || needs.changes.outputs.rootCi == 'true' || needs.changes.outputs.i18nCatalogs == 'true'
     runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 20
+    # A PR that touches a package almost everything imports (shared-schema,
+    # board-config, the i18n catalogs) makes `--changed` select nearly the whole
+    # suite, split over only 2 shards. Measured shard 1/2 times on such PRs:
+    # #8093 14.5 min, #8053 16.5 min, #8101 over 19 min (cancelled twice at 20,
+    # once mid-run, once in the post-step cache save after the tests passed).
+    # 30 leaves room without hiding a real hang for long.
+    timeout-minutes: 30
     strategy:
       # Same idiom as test-backend below. fail-fast stays false so a failure in
       # one shard still reports the other's failures — a cancelled sibling costs
@@ -1118,7 +1459,7 @@ jobs:
               --reporter=verbose --reporter=github-actions \
               --reporter=junit --outputFile.junit=./test-results/junit-default-${{ matrix.shard }}.xml
           fi
-      # Shard-scoped artifact name AND file name: test-report downloads
+      # Shard-scoped artifact name AND file name: the report publisher downloads
       # `test-results-*` with merge-multiple, which flattens every artifact into
       # one directory — same-named files would clobber each other and the report
       # would silently lose a shard's worth of results.
@@ -1138,7 +1479,10 @@ jobs:
     # sharedDeps filter note in the `changes` job before narrowing that gate.
     if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sharedDeps == 'true' || needs.changes.outputs.rootCi == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # A complete 12,543-case backend run took 25m17s before its 2m12s
+    # serial pass. Keep bounded runner/setup variance here; compatibility
+    # proofs have their own independent job below.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       max-parallel: ${{ github.event_name == 'pull_request' && 1 || 2 }}
@@ -1155,6 +1499,9 @@ jobs:
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: boardsesh_backend_test
+          # Worker schema rebuilds share the cluster's relation-lock budget.
+          # Set this only on the disposable test cluster; keep tests parallel.
+          POSTGRES_INITDB_ARGS: '-c max_locks_per_transaction=256'
         ports:
           - 5433:5432
         # Finer probe grid, identical tolerance window (10s x 5 = 50s ->
@@ -1180,6 +1527,12 @@ jobs:
       - uses: actions/checkout@v6
         with:
           fetch-depth: 50
+      - name: Verify PostgreSQL reporting timezone rules
+        env:
+          TEST_POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: |
+          PYTHONDONTWRITEBYTECODE=1 python3 scripts/audit_reporting_tzdata_test.py
+          python3 scripts/audit_reporting_tzdata.py "$TEST_POSTGRES_CONTAINER" boardsesh_backend_test
       # Warn (don't fail) when shared Drizzle schema changed without a matching
       # edit to the hand-maintained test DDL. Mirrors backend-tests.yml.
       - name: Check for test schema drift
@@ -1263,6 +1616,349 @@ jobs:
           # Shard 1 also carries junit-backend-serial.xml.
           path: packages/backend/test-results/junit-backend-*.xml
           retention-days: 7
+
+  # Compatibility proofs own their database services and time budget.
+  # Run 43428016602 spent 25m17s in the full backend suite and 2m12s
+  # in serial tests, then hit the old 30-minute limit during auth proofs.
+  test-auth-compatibility:
+    needs: [changes]
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sharedDeps == 'true' || needs.changes.outputs.rootCi == 'true' || needs.changes.outputs.authCompatibility == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: ghcr.io/boardsesh/boardsesh-postgres-postgis@sha256:98ed9b18b9ef23d4f0aec136bab51b600b8343a19b5f39c78c2c8deab1e96c91
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: boardsesh_backend_test
+          POSTGRES_INITDB_ARGS: '-c max_locks_per_transaction=256'
+        ports:
+          - 5433:5432
+        # Finer probe grid, identical tolerance window (10s x 5 = 50s ->
+        # 2s x 25 = 50s). Docker's first probe fires only after one interval
+        # elapses, so the coarse grid was ~13s of idle in `Initialize
+        # containers` while the server was already accepting connections.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 25
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        # Same rescale: 10s x 5 = 50s -> 2s x 25 = 50s.
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: ${{ runner.environment == 'github-hosted' }}
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Run released native and Garmin source contracts
+        if: ${{ !cancelled() }}
+        env:
+          NATIVE_CONTRACT_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/postgres
+          NATIVE_CONTRACT_REDIS_URL: redis://localhost:6380
+        run: vp run test:native-contract
+      - name: Run unmounted production authority mapping proof
+        if: ${{ !cancelled() }}
+        env:
+          AUTH_PROTOTYPE_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/postgres
+        run: vp run test:auth-authority
+      - name: Run identity import and read-only reconciliation proof
+        if: ${{ !cancelled() }}
+        env:
+          AUTH_PROTOTYPE_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/postgres
+        run: vp run test:auth-identities
+      - name: Run backend and web credential proof
+        if: ${{ !cancelled() }}
+        env:
+          AUTH_PROTOTYPE_DATABASE_URL: postgresql://postgres:postgres@localhost:5433/postgres
+        run: vp run test:auth-web-credential-proof
+
+  # Mirror-on qualification repeats the complete current-store suite. It owns
+  # service containers so its budget is independent of baseline tests and HTTPS.
+  test-auth-mirror:
+    needs: [changes]
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sharedDeps == 'true' || needs.changes.outputs.rootCi == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: ghcr.io/boardsesh/boardsesh-postgres-postgis@sha256:98ed9b18b9ef23d4f0aec136bab51b600b8343a19b5f39c78c2c8deab1e96c91
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: boardsesh_backend_test
+          POSTGRES_INITDB_ARGS: '-c max_locks_per_transaction=256'
+        ports:
+          - 5433:5432
+        # Finer probe grid, identical tolerance window (10s x 5 = 50s ->
+        # 2s x 25 = 50s). Docker's first probe fires only after one interval
+        # elapses, so the coarse grid was ~13s of idle in `Initialize
+        # containers` while the server was already accepting connections.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 25
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6380:6379
+        # Same rescale: 10s x 5 = 50s -> 2s x 25 = 50s.
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: ${{ runner.environment == 'github-hosted' }}
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Run current-store mirror qualification
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5433/boardsesh_backend_test
+          REDIS_URL: redis://localhost:6380
+        run: vp run test:auth-mirror
+
+  # Dedicated synthetic LOGIN/catalog mutations must never share the baseline
+  # backend role cluster. Apply the real journal to this fresh PG18/PostGIS DB.
+  test-credential-writer:
+    needs: [changes]
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sharedDeps == 'true' || needs.changes.outputs.rootCi == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PGHOST: 127.0.0.1
+      PGPORT: '5432'
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: epic6975_credential_ci
+      CREDENTIAL_WRITER_PROOF_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/epic6975_credential_ci
+    services:
+      postgres:
+        image: ghcr.io/boardsesh/boardsesh-postgres-postgis@sha256:98ed9b18b9ef23d4f0aec136bab51b600b8343a19b5f39c78c2c8deab1e96c91
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: epic6975_credential_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: ${{ runner.environment == 'github-hosted' }}
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Verify pinned historical credential migration provenance
+        run: vp test run --config packages/backend/vite.auth-authority.config.ts credential-writer-historical-fixture.test.ts --reporter=agent
+      - name: Bootstrap the fixed historical0312 credential proof database
+        env:
+          PGDATABASE: epic6975_credential_historical_ci
+          CREDENTIAL_WRITER_PROOF_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/epic6975_credential_historical_ci
+        run: bash packages/backend/scripts/bootstrap-credential-writer-proof-database.sh --historical-private-browser-v1
+      - name: Run complete historical web credential proofs serially
+        env:
+          PGDATABASE: epic6975_credential_historical_ci
+          CREDENTIAL_WRITER_PROOF_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/epic6975_credential_historical_ci
+        run: |
+          mkdir -p packages/backend/test-results
+          vp run test:credential-writer --reporter=junit --outputFile.junit=./test-results/junit-credential-writer.xml
+          test -s packages/backend/test-results/junit-credential-writer.xml
+      - name: Bootstrap the fresh owned credential proof database
+        run: bash packages/backend/scripts/bootstrap-credential-writer-proof-database.sh
+      # Before any other proof connects: the suite template-copies this database.
+      - name: Run identity mirror boot and import preconditions end to end
+        run: |
+          mkdir -p packages/backend/test-results
+          vp run test:identity-import-proof --reporter=junit --outputFile.junit=./test-results/junit-identity-import-proof.xml
+          test -s packages/backend/test-results/junit-identity-import-proof.xml
+      - name: Run complete canonical0313 provider catalog and mounted HTTP proofs serially
+        run: |
+          mkdir -p packages/backend/test-results
+          vp run test:provider-credential-writer --reporter=junit --outputFile.junit=./test-results/junit-provider-credential-writer.xml
+          test -s packages/backend/test-results/junit-provider-credential-writer.xml
+      - name: Run complete canonical0314 first-password and compatible handler proofs serially
+        run: |
+          mkdir -p packages/backend/test-results
+          vp run test:first-password-credential-writer --reporter=junit --outputFile.junit=./test-results/junit-first-password-credential-writer.xml
+          test -s packages/backend/test-results/junit-first-password-credential-writer.xml
+      - name: Run compatible handler proofs under the native handoff contract serially
+        run: |
+          mkdir -p packages/backend/test-results
+          vp run test:native-handoff-credential-writer --reporter=junit --outputFile.junit=./test-results/junit-native-handoff-credential-writer.xml
+          test -s packages/backend/test-results/junit-native-handoff-credential-writer.xml
+      - name: Run credential proofs under the private-browser-renewal-v1 contract serially
+        run: |
+          mkdir -p packages/backend/test-results
+          vp run test:browser-renewal-credential-writer --reporter=junit --outputFile.junit=./test-results/junit-browser-renewal-credential-writer.xml
+          test -s packages/backend/test-results/junit-browser-renewal-credential-writer.xml
+      - name: Upload credential proof results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-credential-writer
+          path: |
+            packages/backend/test-results/junit-credential-writer.xml
+            packages/backend/test-results/junit-identity-import-proof.xml
+            packages/backend/test-results/junit-provider-credential-writer.xml
+            packages/backend/test-results/junit-first-password-credential-writer.xml
+            packages/backend/test-results/junit-native-handoff-credential-writer.xml
+            packages/backend/test-results/junit-browser-renewal-credential-writer.xml
+          retention-days: 7
+
+  # BA-04 web writer fence (docs/auth/better-auth-writer-fence-proof.md). Its own PG18
+  # cluster, not a step of test-credential-writer: roles are cluster-wide, the
+  # fence proof refuses to start while boardsesh_web or boardsesh_identity_writer
+  # exists, and the credential proofs leave both behind. It reuses that job's
+  # bootstrap to apply the canonical journal, restores a schema-only dump into a
+  # disposable database, applies the fence through the operator CLI, then proves
+  # the web login gets 42501 on every identity table while its ticks and
+  # playlists still write, and the separate identity writer still writes credentials.
+  test-auth-fence:
+    needs: [changes]
+    if: needs.changes.outputs.backend == 'true' || needs.changes.outputs.sharedDeps == 'true' || needs.changes.outputs.rootCi == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: ghcr.io/boardsesh/boardsesh-postgres-postgis@sha256:98ed9b18b9ef23d4f0aec136bab51b600b8343a19b5f39c78c2c8deab1e96c91
+        credentials:
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: epic6975_credential_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: ${{ runner.environment == 'github-hosted' }}
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Apply the canonical journal to a fresh database
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: epic6975_credential_ci
+          CREDENTIAL_WRITER_PROOF_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/epic6975_credential_ci
+        run: bash packages/backend/scripts/bootstrap-credential-writer-proof-database.sh
+      # The runner's pg_dump is older than the PG18 server and refuses to dump it;
+      # the service container's own pg_dump matches.
+      - name: Dump the migrated schema (no rows)
+        run: |
+          docker exec "${{ job.services.postgres.id }}" \
+            pg_dump --username=postgres --schema-only --dbname=epic6975_credential_ci > "$RUNNER_TEMP/auth-fence-schema.sql"
+          test -s "$RUNNER_TEMP/auth-fence-schema.sql"
+      - name: Run the full-schema writer fence proof
+        env:
+          AUTH_FENCE_TEST_SCHEMA_FILE: ${{ runner.temp }}/auth-fence-schema.sql
+          AUTH_FENCE_TEST_DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+        run: |
+          mkdir -p packages/backend/test-results
+          vp run test:auth-fence --reporter=junit --outputFile.junit=./test-results/junit-auth-fence.xml
+          test -s packages/backend/test-results/junit-auth-fence.xml
+          vp exec node --input-type=module <<'NODE'
+          import { readFileSync } from 'node:fs';
+          const xml = readFileSync('packages/backend/test-results/junit-auth-fence.xml', 'utf8');
+          const fullSchema = [...xml.matchAll(/<testcase\b[^>]*full-schema[^>]*>/g)].length;
+          if (/<skipped(?:\s|\/|>)/.test(xml)) throw new Error('A writer fence case was skipped');
+          if (fullSchema < 18) throw new Error(`Expected at least 18 full-schema fence cases, ran ${fullSchema}`);
+          NODE
+      - name: Upload writer fence proof results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-auth-fence
+          path: packages/backend/test-results/junit-auth-fence.xml
+          retention-days: 7
+
+  aurora-circuit-arbitration:
+    needs: [changes]
+    if: needs.changes.outputs.auroraCircuitArbitration == 'true' || needs.changes.outputs.rootCi == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: ghcr.io/boardsesh/boardsesh-dev-db@sha256:fa657078da26276b47ccb6f78f7227b6f6d84a1379bca9313cc1c5d9ece26139
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: main
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d main"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: ${{ runner.environment == 'github-hosted' }}
+      - name: Install dependencies
+        run: vp install --frozen-lockfile
+      - name: Prepare Aurora circuit arbitration database gate
+        env:
+          ALLOW_AURORA_CIRCUIT_SCHEMA_COMPAT: '1'
+          DATABASE_URL: postgresql://postgres:password@localhost:5433/main
+        run: vp node --import tsx scripts/prepare-aurora-circuit-integration-db.ts
+      - name: Run Aurora circuit arbitration database gate
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5433/main
+          REQUIRE_AURORA_CIRCUIT_INTEGRATION: '1'
+        run: >-
+          vp test run --project aurora-sync
+          packages/aurora-sync/src/sync/user-sync.concurrency.integration.test.ts
+          --reporter=verbose --reporter=github-actions
+      - name: Run Aurora daemon/web arbitration database gate
+        env:
+          DATABASE_URL: postgresql://postgres:password@localhost:5433/main
+          REQUIRE_AURORA_CIRCUIT_INTEGRATION: '1'
+        run: >-
+          vp test run --project web
+          packages/web/app/lib/data-sync/aurora/__tests__/user-sync.cross-writer.integration.test.ts
+          --reporter=verbose --reporter=github-actions
 
   test-ocr:
     needs: [changes]
@@ -1352,6 +2048,11 @@ jobs:
           cache: ${{ runner.environment == 'github-hosted' }}
       - name: Install dependencies
         run: vp install --frozen-lockfile
+      - name: Bootstrap the isolated deletion cutoff helper
+        env:
+          SYNC_CUTOFF_ADMIN_DATABASE_URL: postgres://postgres:password@localhost:5432/main
+          SYNC_CUTOFF_DEVELOPMENT_BOOTSTRAP: 'true'
+        run: vp exec tsx packages/db/scripts/bootstrap-sync-deletions-cutoff-development.ts --apply
       - name: Apply the full migration journal
         env:
           DATABASE_URL: postgres://postgres:password@localhost:5432/main
@@ -1366,6 +2067,21 @@ jobs:
           vp test run --project location-sync \
             --reporter=verbose --reporter=github-actions \
             --reporter=junit --outputFile.junit=./packages/location-sync/test-results/junit-location-sync.xml
+      - name: Bootstrap the owned compound location proof database
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: '5432'
+          PGUSER: postgres
+          PGPASSWORD: password
+          PGDATABASE: epic6975_location_ci
+          LOCATION_SYNC_PROOF_DATABASE_URL: postgres://postgres:password@127.0.0.1:5432/epic6975_location_ci
+        run: |
+          createdb "$PGDATABASE"
+          bash packages/backend/scripts/bootstrap-location-proof-database.sh
+      - name: Run the required selected-authority compound location proof
+        env:
+          LOCATION_SYNC_PROOF_DATABASE_URL: postgres://postgres:password@127.0.0.1:5432/epic6975_location_ci
+        run: vp test run --config packages/backend/vite.location-sync-proof.config.ts --maxWorkers=1 --reporter=agent
       - name: Upload test results
         uses: actions/upload-artifact@v4
         if: always()
@@ -1460,9 +2176,6 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}/metro-web
           BOARDSESH_EXPORT_KEEP_METRO_CACHE: '1'
-          # The eager brotli budget is a repository variable so it can be moved
-          # without a commit; empty when unset, and the script's default applies.
-          BOARDSESH_WEB_EAGER_BROTLI_BUDGET: ${{ vars.BOARDSESH_WEB_EAGER_BROTLI_BUDGET }}
         run: vp run check:mobile-web-bundle
       - name: Save Metro's Expo-web transform cache
         uses: actions/cache/save@v4
@@ -1592,164 +2305,29 @@ jobs:
             " "$openapi_path"
           '
 
-  commit-lint:
-    needs: [changes]
-    # Conventional Commit gate. The PR TITLE is the authoritative hard check — it's
-    # the merge/squash subject and the source of the changelog category. The
-    # per-commit range check is ADVISORY (continue-on-error): the repo uses merge
-    # commits, so intermediate WIP/fixup commits land on main verbatim and much of
-    # the existing history is non-conventional — blocking on it would red most PRs.
-    # The local commit-msg hook nudges new commits toward the convention.
-    # Also gate on mobile/mobileDeps so the PR-title check runs whenever the
-    # release-notes job does — a non-JS mobile/shared change still produces a
-    # changelog entry whose category comes from the (conventional) PR title.
-    if: needs.changes.outputs.anyJs == 'true' || needs.changes.outputs.rootCi == 'true' || needs.changes.outputs.mobile == 'true' || needs.changes.outputs.mobileDeps == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          fetch-depth: 50
-      - name: Fetch base ref
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: git fetch --depth=50 origin "$BASE_REF":"refs/remotes/origin/$BASE_REF"
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Lint PR title (hard gate)
-        if: github.event_name == 'pull_request'
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          # The PR title is the merge/squash subject and the source of the changelog
-          # category, so it must be conventional. This is the blocking check.
-          vp run check:commit-message -- --pr-title "$PR_TITLE"
-      - name: Lint PR commit subjects (advisory)
-        if: github.event_name == 'pull_request'
-        continue-on-error: true
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          # Surface non-conventional commits without blocking the merge (see job note).
-          vp run check:commit-message -- --range "origin/$BASE_REF..HEAD"
-      - name: Lint commit subjects (push, advisory)
-        if: github.event_name != 'pull_request'
-        continue-on-error: true
-        env:
-          BEFORE_SHA: ${{ github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          # On a normal push, github.event.before is the previous tip; validate the
-          # newly pushed commits. On a branch's first push it can be all-zeros — fall
-          # back to just the head commit to avoid an unbounded range.
-          if [ -z "$BEFORE_SHA" ] || [ "$BEFORE_SHA" = "0000000000000000000000000000000000000000" ]; then
-            vp run check:commit-message -- --range "$HEAD_SHA~1..$HEAD_SHA"
-          else
-            vp run check:commit-message -- --range "$BEFORE_SHA..$HEAD_SHA"
-          fi
-
-  release-notes:
-    needs: [changes]
-    # PR-only. Gated on the mobile dependency closure: those PRs ship via OTA, so they
-    # must carry user-facing Release Notes (escape hatch: the skip-changelog
-    # label, or `none` under the heading).
-    if: github.event_name == 'pull_request' && (needs.changes.outputs.mobile == 'true' || needs.changes.outputs.mobileDeps == 'true')
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - uses: voidzero-dev/setup-vp@v1
-        with:
-          node-version: '22.x'
-          cache: ${{ runner.environment == 'github-hosted' }}
-      - name: Install dependencies
-        run: vp install --frozen-lockfile
-      - name: Check PR has Release Notes
-        env:
-          # Write the body to a file (via env, not interpolated into the script) so
-          # a markdown body with backticks/quotes can't break the shell.
-          PR_BODY: ${{ github.event.pull_request.body }}
-          PR_LABELS: ${{ toJSON(github.event.pull_request.labels) }}
-        run: |
-          printf '%s' "$PR_BODY" > pr-body.txt
-          vp run check:release-notes -- --body-file pr-body.txt
-
-  changelog-owned:
-    needs: [changes]
-    # The Mobile OTA Production workflow is the SOLE writer of
-    # changelog.generated.json — it regenerates and pushes it on every publish. A
-    # PR must never hand-edit it (that would fight the OTA bot and could revert
-    # shipped entries). Fail if a PR touches the file.
-    if: github.event_name == 'pull_request' && needs.changes.outputs.changelogData == 'true'
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 2
-    steps:
-      - name: Reject manual changelog edits
-        run: |
-          echo "::error::The changelog files (packages/mobile/src/data/changelog.generated.json and CHANGELOG.md) are owned by the Mobile OTA Production workflow (it regenerates and pushes them on every OTA). Revert your change — they're generated from PR Release Notes, never edited in a PR."
-          exit 1
-
-  test-report:
-    needs: [test-default, test-backend, test-ocr, test-location-sync-integration]
-    # Only post a report when at least one test job actually ran. If all four
-    # were skipped (e.g. an i18n-catalog-only PR), there's nothing to
-    # download — actions/download-artifact errors on missing artifacts, so we
-    # skip the whole job instead of swallowing the failure.
-    if: |
-      always() && github.event_name == 'pull_request' && (
-        needs.test-default.result != 'skipped' ||
-        needs.test-backend.result != 'skipped' ||
-        needs.test-ocr.result != 'skipped' ||
-        needs.test-location-sync-integration.result != 'skipped'
-      )
-    runs-on: ${{ fromJSON(github.event.pull_request.head.repo.fork && '"ubuntu-latest"' || vars.CI_RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - name: Download all test results
-        uses: actions/download-artifact@v4
-        with:
-          pattern: test-results-*
-          path: test-results
-          merge-multiple: true
-      - name: Publish test report
-        uses: turing85/publish-report@v2
-        with:
-          comment-header: ci-tests
-          comment-enabled: 'true'
-          report-name: CI Tests
-          report-path: 'test-results/**/*.xml'
-          report-reporter: java-junit
-          report-fail-on-error: false
-
+  # The required context must aggregate every gating job. The guards job includes
+  # the ungated large-files check; do not restore the retired standalone jobs.
+  # scripts/__tests__/ci-status-rollup.test.ts checks the current job graph.
+  # See docs/qa/ci-required-checks.md for absent-check recovery.
   ci-status:
     needs:
       - changes
       - lint
       - typecheck
       - db-migrations
-      - codegen-drift
-      - board-render-version
+      - guards
       - board-art-geometry
-      - i18n
       - test-default
       - test-backend
+      - test-auth-compatibility
+      - test-auth-mirror
+      - test-credential-writer
+      - test-auth-fence
+      - aurora-circuit-arbitration
       - test-ocr
       - test-location-sync-integration
       - mobile-bundle
       - docker-web
-      - commit-lint
-      - release-notes
-      - changelog-owned
-      - deploy-config
-      - listing-guards
-      - rest-surface
-      - pg18-artifacts
       - renderer-rust
     if: always()
     runs-on: ubuntu-latest

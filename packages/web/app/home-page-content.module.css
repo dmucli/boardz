@@ -1,8 +1,10 @@
 .main {
+  display: flex;
+  flex-direction: column;
   width: 100%;
-  max-width: 1200px;
+  max-width: var(--page-wide);
   margin: 0 auto;
-  padding-inline: var(--spacing-8);
+  padding-inline: var(--page-gutter);
   padding-bottom: var(--spacing-16);
   gap: calc(var(--spacing-16) + var(--spacing-4));
 }
@@ -12,7 +14,7 @@
   grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr);
   align-items: center;
   gap: var(--spacing-10);
-  padding-block: var(--spacing-12) var(--spacing-4);
+  padding-top: var(--spacing-12);
   min-width: 0;
 }
 
@@ -20,20 +22,20 @@
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: var(--spacing-6);
-  padding-bottom: var(--spacing-6);
+  gap: var(--spacing-4);
+  min-width: 0;
 }
 
 .hero .heroEyebrow {
-  color: var(--color-primary);
   font-size: var(--font-size-sm);
   font-weight: 600;
   line-height: 1.5;
 }
 
 .hero .heroTitle {
-  max-width: 12ch;
-  font-size: clamp(44px, 4.8vw, 64px);
+  font-family: var(--font-display), sans-serif;
+  font-size: clamp(44px, 4.2vw, 64px);
+  font-weight: 700;
   line-height: 1.04;
   letter-spacing: -0.035em;
   text-wrap: balance;
@@ -46,18 +48,33 @@
   line-height: 1.65;
 }
 
-/* Sits between the subtitle and the buttons, quieter than both — it is evidence,
-   not a second pitch. */
-.heroProof {
-  margin-top: var(--spacing-2);
-  color: var(--neutral-500);
-}
-
 .heroActions {
   display: flex;
   flex-wrap: wrap;
   gap: var(--spacing-3);
   margin-top: var(--spacing-2);
+}
+
+/* One install block per screen. Below 1100px the hero shows this visitor's
+   store badge (a pair on a narrow laptop window); from 1100px a laptop gets the
+   QR code card with both badges, since a laptop installs nothing. Later than
+   the climb pages' 900px because the home hero is two columns from 760px: below
+   1100px its copy column leaves the card's text column too narrow for two badges
+   side by side (299px in French), and they would stack under the code. */
+.heroDesktopInstall {
+  display: none;
+  width: 100%;
+  margin-top: var(--spacing-2);
+}
+
+@media (min-width: 1100px) {
+  .heroActions {
+    display: none;
+  }
+
+  .heroDesktopInstall {
+    display: block;
+  }
 }
 
 .previewGroup {
@@ -67,79 +84,135 @@
   gap: var(--spacing-5);
   min-width: 0;
 }
+
 .previewGroup > :last-child {
   align-self: center;
 }
+
 .heroPreview {
   position: relative;
-  isolation: isolate;
   width: 100%;
   max-width: 490px;
   aspect-ratio: 490 / 680;
 }
+
 .heroPreview:has([data-preview-platform='android']) {
   aspect-ratio: 490 / 570;
 }
-.heroPreview::before {
-  content: '';
-  position: absolute;
-  z-index: -1;
-  inset: -8% 0;
-  border-radius: 50%;
-  background: radial-gradient(
-    ellipse at center,
-    color-mix(in srgb, var(--color-primary-fill) 30%, transparent),
-    color-mix(in srgb, var(--color-primary-fill) 10%, transparent) 48%,
-    transparent 72%
-  );
-  pointer-events: none;
+
+/* Two columns (761px up): the screenshot stack the other languages show in
+   place of the video is capped so it balances the copy beside it, the way the
+   video card caps itself (`home-showcase-video.module.css`). The copy is about
+   355px tall below 1100px and about 500px from 1100px, where the QR code card
+   joins it; each width keeps the taller iPhone stack plus the platform switch
+   within about 160px of the copy, so the title starts at most about 80px below
+   the stack's top. */
+@media (min-width: 761px) {
+  .heroPreview:not(.heroShowcase) {
+    max-width: 325px;
+  }
 }
+
+@media (min-width: 1100px) {
+  .heroPreview:not(.heroShowcase) {
+    max-width: 420px;
+  }
+}
+
+.heroShowcase {
+  display: flex;
+  justify-content: center;
+  max-width: none;
+  aspect-ratio: auto;
+}
+
 .previewPhone {
   position: absolute;
   display: block;
 }
+
 .previewLeft {
   width: 46%;
   top: 0;
   left: 0;
 }
+
 .previewRight {
   width: 46%;
   top: 0;
   right: 0;
 }
+
 .previewPrimary {
   width: 53%;
   top: 16%;
   left: 23.5%;
 }
 
-.onboarding {
-  border-top: 1px solid var(--separator);
-  padding-top: var(--spacing-12);
+.importBand {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: var(--spacing-10);
+  align-items: center;
+}
+
+.importBand > h2,
+.importBand > p {
+  grid-column: 1;
+}
+
+.importBand > p {
+  max-width: 64ch;
+}
+
+.importAction {
+  grid-column: 2;
+  grid-row: 1 / 4;
+}
+
+.sprayCard {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 320px);
+  gap: var(--spacing-8);
+  align-items: center;
+}
+
+.sprayPhoto {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-radius: var(--border-radius-lg);
+}
+
+.wallGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--spacing-5);
+}
+
+.proofStrip {
+  padding-block: var(--spacing-6);
+  border-block: 1px solid var(--separator);
 }
 
 @media (max-width: 760px) {
   .main {
-    padding-inline: var(--spacing-6);
     padding-bottom: var(--spacing-10);
-    gap: calc(var(--spacing-12) + var(--spacing-2));
+    gap: var(--spacing-8);
   }
 
   .hero {
     grid-template-columns: minmax(0, 1fr);
     gap: var(--spacing-8);
-    padding-block: var(--spacing-10) 0;
+    padding-top: var(--spacing-6);
   }
 
   .heroCopy {
-    gap: var(--spacing-4);
-    padding-bottom: 0;
+    gap: var(--spacing-3);
   }
 
   .hero .heroTitle {
     font-size: 40px;
-    max-width: 14ch;
   }
 
   .hero .heroLead {
@@ -152,27 +225,34 @@
     max-width: 390px;
   }
 
+  .heroShowcase {
+    max-width: none;
+  }
+
   .heroActions {
     margin-top: var(--spacing-1);
     gap: var(--spacing-2);
   }
 
-  .heroActions > a,
-  .heroActions > button {
-    font-size: var(--font-size-base);
-    padding-inline: var(--spacing-4);
+  .importBand {
+    display: block;
   }
 
-  .onboarding {
-    padding-top: var(--spacing-8);
+  .sprayCard {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--spacing-5);
+  }
+
+  .sprayPhoto {
+    max-width: 360px;
+  }
+
+  .wallGrid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
 @media (max-width: 359px) {
-  .main {
-    padding-inline: var(--spacing-4);
-  }
-
   .hero .heroTitle {
     font-size: 36px;
   }

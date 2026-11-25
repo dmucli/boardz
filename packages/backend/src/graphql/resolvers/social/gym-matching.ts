@@ -1,6 +1,7 @@
-import { and, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
+import { and, asc, desc, eq, inArray, isNull, or, sql, type SQL } from 'drizzle-orm';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { distanceMeters, isGenericGymName, normalizeGymName } from '@boardsesh/db/queries';
+import { computeCanClaimByDomain } from '@boardsesh/gym-claim';
 import { db } from '../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
@@ -8,6 +9,7 @@ import { FindSimilarGymsInputSchema } from '../../../validation/schemas';
 import { logger } from '../../../utils/logger';
 import { SYSTEM_BOARD_OWNER_ID } from '../board-presence/shared';
 import { getUserCommunityRoles, rolesGrantAdminOrLeader } from './roles';
+import { gymIdsRunByStaff } from './gym-run-by-staff';
 
 // ============================================
 // Shared gym-dedup matching helpers
@@ -33,7 +35,11 @@ export const SIMILAR_NAME_MATCH_RADIUS_METERS = 1_000;
 /** Physical-match radius for the createBoard auto-gym guard. */
 export const AUTO_GYM_MATCH_RADIUS_METERS = 150;
 
-const MAX_SIMILAR_GYMS = 5;
+/** Most gyms findSimilarGyms returns, and the most a GYM_SIMILAR_EXISTS refusal names. */
+export const MAX_SIMILAR_GYMS = 5;
+
+/** Rows the name-only search reads before its JS refine; at least createGym's read of 50. */
+const NAME_ONLY_ROW_WINDOW = 50;
 
 // Pads the lat/lng bounding box so it fully contains the target circle despite
 // metres-per-degree varying with latitude (111_320 is only an average; a degree
@@ -48,6 +54,8 @@ export type GymNameMatch = {
   name: string;
   address: string | null;
   website: string | null;
+  /** Whether the gym's OWNER put `website` on the listing — the provenance half of the domain-claim rule (#3431). */
+  websiteVouchedByOwner: boolean;
   ownerId: string;
   latitude: number | null;
   longitude: number | null;
@@ -62,6 +70,7 @@ const gymColumns = {
   name: dbSchema.gyms.name,
   address: dbSchema.gyms.address,
   website: dbSchema.gyms.website,
+  websiteVouchedByOwner: dbSchema.gyms.websiteVouchedByOwner,
   ownerId: dbSchema.gyms.ownerId,
   latitude: dbSchema.gyms.latitude,
   longitude: dbSchema.gyms.longitude,
@@ -165,7 +174,10 @@ export function decideAutoGymAttachment(
   return { action: 'mint' };
 }
 
-/** Beyond this many live gyms, stop minting new ones for a caller automatically. */
+/**
+ * Live gyms one account may own. createBoard's auto-mint stops minting at this
+ * many (the board saves without a gym); createGym refuses with GYM_LIMIT_REACHED.
+ */
 export const MAX_AUTO_MINTED_GYMS_PER_OWNER = 25;
 
 export type AutoGymResolution =
@@ -227,17 +239,34 @@ async function findOwnGymsByExactName(opts: {
     .sort((first, second) => first.id - second.id);
 }
 
-/** Live gyms of any owner within `radiusMeters`, regardless of name. Nearest-first. */
-async function findGymsWithin(opts: {
+/**
+ * Live gyms of any owner within `radiusMeters`, regardless of name. Nearest-first.
+ *
+ * `publicListedOnly` narrows to gyms anyone can find (public AND listed), the
+ * same visibility `findSimilarGymCandidates` applies to other owners' gyms. The
+ * existing-wall check sets it, because a private gym's walls must never shape
+ * what a stranger is told. The auto-gym resolver leaves it off: it only ever
+ * reuses a SYSTEM gym or the caller's own, and filters for that itself.
+ */
+export async function findGymsWithin(opts: {
   latitude: number;
   longitude: number;
   radiusMeters: number;
+  publicListedOnly?: boolean;
+  /** Read on this connection instead of the pool, e.g. the transaction the caller already holds. */
+  executor?: Pick<typeof db, 'select'>;
 }): Promise<GymNameMatch[]> {
-  const { latitude, longitude, radiusMeters } = opts;
-  const rows = await db
+  const { latitude, longitude, radiusMeters, publicListedOnly = false, executor = db } = opts;
+  const rows = await executor
     .select(gymColumns)
     .from(dbSchema.gyms)
-    .where(and(isNull(dbSchema.gyms.deletedAt), withinBoundingBox(latitude, longitude, radiusMeters)));
+    .where(
+      and(
+        isNull(dbSchema.gyms.deletedAt),
+        withinBoundingBox(latitude, longitude, radiusMeters),
+        publicListedOnly ? and(eq(dbSchema.gyms.isPublic, true), eq(dbSchema.gyms.isListed, true)) : undefined,
+      ),
+    );
 
   return rows
     .filter(
@@ -364,8 +393,16 @@ export async function findSimilarGymCandidates(opts: {
   latitude?: number | null;
   longitude?: number | null;
   viewerUserId: string;
+  /**
+   * How many to return. createGym's duplicate check reads more than the five
+   * the query shows, so gyms past the first five a climber acknowledged still
+   * get their turn.
+   */
+  limit?: number;
+  /** Read on this connection instead of the pool, e.g. createGym's transaction. */
+  executor?: Pick<typeof db, 'select'>;
 }): Promise<GymNameMatch[]> {
-  const { name, latitude, longitude, viewerUserId } = opts;
+  const { name, latitude, longitude, viewerUserId, limit = MAX_SIMILAR_GYMS, executor = db } = opts;
   const normalized = normalizeGymName(name);
   const hasCoords = latitude != null && longitude != null;
 
@@ -373,7 +410,10 @@ export async function findSimilarGymCandidates(opts: {
   // tier leaks private home walls (name + address + metre-precise distance) to any
   // authenticated caller. Public gyms and the viewer's own private gyms are fair
   // game. Mirrors the visibility gate on searchGyms / gymBoards.
-  const visibleCond: SQL = or(eq(dbSchema.gyms.isPublic, true), eq(dbSchema.gyms.ownerId, viewerUserId))!;
+  const visibleCond: SQL = or(
+    and(eq(dbSchema.gyms.isPublic, true), eq(dbSchema.gyms.isListed, true)),
+    eq(dbSchema.gyms.ownerId, viewerUserId),
+  )!;
 
   const exactNameCond: SQL = sql`${normalizedNameExpr} = ${normalized}`;
   const similarNameCond: SQL | undefined =
@@ -389,7 +429,7 @@ export async function findSimilarGymCandidates(opts: {
       : undefined;
     const tiers = [tierExact, tierProximity, tierSimilar].filter((clause): clause is SQL => clause != null);
 
-    const rows = await db
+    const rows = await executor
       .select(gymColumns)
       .from(dbSchema.gyms)
       .where(and(isNull(dbSchema.gyms.deletedAt), visibleCond, or(...tiers)!));
@@ -411,16 +451,20 @@ export async function findSimilarGymCandidates(opts: {
         );
       })
       .sort((first, second) => first.distanceMeters - second.distanceMeters)
-      .slice(0, MAX_SIMILAR_GYMS);
+      .slice(0, limit);
   }
 
   // No coordinates: name-only matching (exact + substring), no distance to sort by.
   const nameCond = similarNameCond ? or(exactNameCond, similarNameCond)! : exactNameCond;
-  const rows = await db
+  // Exact names first in SQL, before the row window: a common short name can
+  // match hundreds of listings by substring, and an exact duplicate must never
+  // fall outside the 50 rows read. Then name and id, so the window is stable.
+  const rows = await executor
     .select(gymColumns)
     .from(dbSchema.gyms)
     .where(and(isNull(dbSchema.gyms.deletedAt), visibleCond, nameCond))
-    .limit(50);
+    .orderBy(desc(exactNameCond), asc(dbSchema.gyms.name), asc(dbSchema.gyms.id))
+    .limit(NAME_ONLY_ROW_WINDOW);
 
   return (
     rows
@@ -434,7 +478,7 @@ export async function findSimilarGymCandidates(opts: {
         if (firstExact !== secondExact) return firstExact - secondExact;
         return first.name.localeCompare(second.name);
       })
-      .slice(0, MAX_SIMILAR_GYMS)
+      .slice(0, limit)
   );
 }
 
@@ -470,9 +514,10 @@ async function providerOriginsByGymId(gymIds: number[]): Promise<Map<number, str
 
 /**
  * `isClaimable` per candidate for an authenticated viewer, batched: one
- * community-roles read + one member-roles read + one board-types read for ALL
- * candidates, instead of an N+1 `userCanEditGym` per card. Mirrors enrichGym's
- * `canClaim` — a viewer who cannot already edit a gym is the one who may claim it.
+ * community-roles read + one member-roles read + one board-types read + one
+ * run-by-staff read for ALL candidates, instead of an N+1 `userCanEditGym` per
+ * card. Mirrors enrichGym's `canClaim`: a viewer who cannot already edit a gym
+ * may claim it, unless its staff run it, which nobody may.
  */
 async function computeClaimableFlags(
   candidates: Array<Pick<GymNameMatch, 'id' | 'ownerId'>>,
@@ -490,7 +535,7 @@ async function computeClaimableFlags(
     return result;
   }
 
-  const [memberRows, boardTypeRows] = await Promise.all([
+  const [memberRows, boardTypeRows, runByStaff] = await Promise.all([
     db
       .select({ gymId: dbSchema.gymMembers.gymId, role: dbSchema.gymMembers.role })
       .from(dbSchema.gymMembers)
@@ -499,6 +544,7 @@ async function computeClaimableFlags(
       .selectDistinct({ gymId: dbSchema.userBoards.gymId, boardType: dbSchema.userBoards.boardType })
       .from(dbSchema.userBoards)
       .where(and(inArray(dbSchema.userBoards.gymId, gymIds), isNull(dbSchema.userBoards.deletedAt))),
+    gymIdsRunByStaff(gymIds),
   ]);
 
   const roleByGym = new Map<number, string>();
@@ -518,7 +564,7 @@ async function computeClaimableFlags(
     const canEditAsMember = memberRole === 'admin' || memberRole === 'editor';
     const boardTypes = boardTypesByGym.get(candidate.id) ?? [];
     const hasCommunityAccess = boardTypes.some((boardType) => rolesGrantAdminOrLeader(communityRoles, boardType));
-    result.set(candidate.id, !(isOwner || canEditAsMember || hasCommunityAccess));
+    result.set(candidate.id, !(isOwner || canEditAsMember || hasCommunityAccess || runByStaff.has(candidate.id)));
   }
   return result;
 }
@@ -537,8 +583,44 @@ export type SimilarGymResult = {
   distanceMeters: number | null;
   ownerType: 'SYSTEM' | 'USER';
   isClaimable: boolean;
+  /**
+   * Whether the website on file can drive the self-service email claim — a real
+   * (non-free-provider) domain the gym's OWNER put there. Answers a different
+   * question from `isClaimable`, which is about the viewer's standing.
+   */
+  canClaimByDomain: boolean;
   providerOrigins: string[];
 };
+
+/**
+ * Candidates in the `SimilarGym` shape, as one viewer sees them: claimability
+ * and provider badges read in two batched queries. Shared by findSimilarGyms
+ * and createGym's GYM_SIMILAR_EXISTS refusal, so both name a gym the same way.
+ */
+export async function toSimilarGymResults(
+  candidates: readonly GymNameMatch[],
+  viewerUserId: string,
+): Promise<SimilarGymResult[]> {
+  if (candidates.length === 0) return [];
+
+  const [originsByGym, claimableByGym] = await Promise.all([
+    providerOriginsByGymId(candidates.map((candidate) => candidate.id)),
+    computeClaimableFlags([...candidates], viewerUserId),
+  ]);
+
+  return candidates.map((candidate) => ({
+    uuid: candidate.uuid,
+    slug: candidate.slug,
+    name: candidate.name,
+    address: candidate.address,
+    website: candidate.website,
+    distanceMeters: candidate.distanceMeters,
+    ownerType: candidate.ownerId === SYSTEM_BOARD_OWNER_ID ? 'SYSTEM' : 'USER',
+    isClaimable: claimableByGym.get(candidate.id) ?? false,
+    canClaimByDomain: computeCanClaimByDomain(candidate),
+    providerOrigins: originsByGym.get(candidate.id) ?? [],
+  }));
+}
 
 export const socialGymMatchQueries = {
   findSimilarGyms: async (
@@ -559,23 +641,6 @@ export const socialGymMatchQueries = {
       viewerUserId: userId,
     });
 
-    if (candidates.length === 0) return [];
-
-    const [originsByGym, claimableByGym] = await Promise.all([
-      providerOriginsByGymId(candidates.map((candidate) => candidate.id)),
-      computeClaimableFlags(candidates, userId),
-    ]);
-
-    return candidates.map((candidate) => ({
-      uuid: candidate.uuid,
-      slug: candidate.slug,
-      name: candidate.name,
-      address: candidate.address,
-      website: candidate.website,
-      distanceMeters: candidate.distanceMeters,
-      ownerType: candidate.ownerId === SYSTEM_BOARD_OWNER_ID ? 'SYSTEM' : 'USER',
-      isClaimable: claimableByGym.get(candidate.id) ?? false,
-      providerOrigins: originsByGym.get(candidate.id) ?? [],
-    }));
+    return toSimilarGymResults(candidates, userId);
   },
 };

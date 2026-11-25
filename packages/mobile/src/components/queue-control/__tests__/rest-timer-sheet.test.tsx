@@ -62,9 +62,13 @@ const harness = vi.hoisted(() => ({
   sessionId: null as string | null,
   isSharedSession: false,
   inAppBoardConnection: 'connectedByMe',
+  fontScale: 1,
 }));
 
 const haptics = vi.hoisted(() => ({ medium: vi.fn(), selection: vi.fn(), light: vi.fn() }));
+
+// Whether the installed binary draws the rest timer outside the app (#6513).
+const sessionPresence = vi.hoisted(() => ({ supportsRestTimer: true }));
 
 const settingsStore = vi.hoisted(() => ({
   values: {} as Record<string, unknown>,
@@ -129,7 +133,7 @@ vi.mock('react-native', () => ({
       children,
     ),
   StyleSheet: { create: (styles: Record<string, unknown>) => styles, hairlineWidth: 1 },
-  useWindowDimensions: () => ({ width: 393, height: 852, scale: 3, fontScale: 1 }),
+  useWindowDimensions: () => ({ width: 393, height: 852, scale: 3, fontScale: harness.fontScale }),
 }));
 
 vi.mock('react-native-reanimated', () => {
@@ -186,6 +190,10 @@ vi.mock('../../../settings', async () => {
       return [settingsStore.values[key], write];
     },
     getSetting: (key: string) => settingsStore.values[key],
+    setSetting: (key: string, next: unknown) => {
+      settingsStore.values[key] = next;
+      for (const listener of settingsStore.listeners) listener();
+    },
   };
 });
 
@@ -216,7 +224,9 @@ vi.mock('../../../theme/animations', () => ({ springs: { snappy: {} }, timing: {
 
 vi.mock('../../../providers/queue-provider', () => ({
   useQueueSessionId: () => ({ sessionId: harness.sessionId }),
-  useIsSharedSession: () => harness.isSharedSession,
+  // The row reads the wall-driver rule, whose crew input ignores the browse
+  // rollout flag. `harness.isSharedSession` stands for that crew here.
+  useIsCrewSession: () => harness.isSharedSession,
 }));
 
 vi.mock('../../ble/use-board-connection-state', () => ({
@@ -233,8 +243,31 @@ vi.mock('../RestTimerPill', () => ({
 }));
 
 vi.mock('../../ModalSheet', () => ({
-  ModalSheet: ({ children, visible }: { children?: ReactNode; visible: boolean }) =>
-    visible ? createElement('div', { 'data-testid': 'sheet' }, children) : null,
+  ModalSheet: ({
+    children,
+    visible,
+    scrollable,
+    snapPoints,
+    enableDynamicSizing = false,
+  }: {
+    children?: ReactNode;
+    visible: boolean;
+    scrollable?: boolean;
+    snapPoints?: (string | number)[];
+    enableDynamicSizing?: boolean;
+  }) =>
+    visible
+      ? createElement(
+          'div',
+          {
+            'data-testid': 'sheet',
+            'data-scrollable': scrollable,
+            'data-snap-points': snapPoints?.join(','),
+            'data-dynamic-sizing': enableDynamicSizing,
+          },
+          children,
+        )
+      : null,
 }));
 
 vi.mock('../../Text', () => ({
@@ -295,9 +328,35 @@ vi.mock('../../SegmentedControl', () => ({
     ),
 }));
 
+vi.mock('../../navigation/ScrollableTabs', () => ({
+  ScrollableTabs: ({ options, selectedKey, onSelect, accessibilityLabel }: SegmentedProps) =>
+    createElement(
+      'div',
+      { 'data-scrolling-tabs': accessibilityLabel },
+      options.map((option) =>
+        createElement(
+          'button',
+          {
+            key: option.key,
+            'data-tab': option.key,
+            'aria-selected': option.key === selectedKey,
+            onClick: () => onSelect(option.key),
+          },
+          option.label,
+        ),
+      ),
+    ),
+}));
+
 vi.mock('../../tick/TickDestructiveRow', () => ({
   TickDestructiveRow: ({ label, icon, onPress }: { label: string; icon?: string; onPress: () => void }) =>
     createElement('button', { 'data-destructive': label, 'data-icon': icon ?? 'delete', onClick: onPress }, label),
+}));
+
+vi.mock('../../../lib/live-activity/live-activity-plugin', () => ({
+  get sessionPresenceSupportsRestTimer() {
+    return sessionPresence.supportsRestTimer;
+  },
 }));
 
 import {
@@ -312,6 +371,7 @@ const NOW_MS = Date.parse('2026-09-11T10:00:00.000Z');
 const PAUSE_BUTTON = '[data-button="mobile.restTimer.pause"]';
 const RESET_BUTTON = '[data-button="mobile.restTimer.reset"]';
 const AUTO_ADVANCE_ROW = '[data-switch="mobile.restTimer.autoAdvance"]';
+const LOCK_SCREEN_ROW = '[data-switch="mobile.restTimer.showOnLockScreen"]';
 const LENGTH_PILL = '[data-testid="rest-length-pill"]';
 const LENGTH_SLIDER = '[data-testid="rest-length-slider"]';
 
@@ -340,14 +400,17 @@ describe('RestTimerSheet', () => {
     harness.sessionId = 'session-1';
     harness.isSharedSession = false;
     harness.inAppBoardConnection = 'connectedByMe';
+    harness.fontScale = 1;
     haptics.medium.mockClear();
     haptics.selection.mockClear();
     settingsStore.values = {
       restTimerTargetSeconds: 120,
       restTimerMode: 'afterTick',
       restTimerAutoAdvance: false,
+      restTimerShowOnLockScreen: true,
     };
     settingsStore.listeners.clear();
+    sessionPresence.supportsRestTimer = true;
     armRestTimer('afterTick', NOW_MS, 'session-1');
   });
 
@@ -356,9 +419,42 @@ describe('RestTimerSheet', () => {
     resetRestTimerStoreForTests();
   });
 
+  it('turns the Lock Screen countdown off and back on through the persisted setting', () => {
+    const { container } = renderSheet();
+    const row = () => container.querySelector(LOCK_SCREEN_ROW) as HTMLElement;
+    expect(row().getAttribute('data-value')).toBe('true');
+    expect(row().getAttribute('data-description')).toBe('mobile.restTimer.showOnLockScreenHint');
+
+    fireEvent.click(row());
+    expect(settingsStore.values.restTimerShowOnLockScreen).toBe(false);
+    expect(row().getAttribute('data-value')).toBe('false');
+
+    fireEvent.click(row());
+    expect(settingsStore.values.restTimerShowOnLockScreen).toBe(true);
+  });
+
+  it('hides the Lock Screen switch on a binary that cannot draw the timer there', () => {
+    sessionPresence.supportsRestTimer = false;
+    const { container } = renderSheet();
+    expect(container.querySelector(LOCK_SCREEN_ROW)).toBeNull();
+    // The rest of the sheet is untouched.
+    expect(container.querySelector(AUTO_ADVANCE_ROW)).not.toBeNull();
+  });
+
   it('shows the live hero clock so the sheet is not a dead settings page', () => {
     const { getByTestId } = renderSheet();
     expect(getByTestId('sheet-hero-clock')).not.toBeNull();
+  });
+
+  it('keeps the final turn-off action inside a bounded scroll body', () => {
+    const { getByTestId } = render(<RestTimerSheet visible onClose={() => {}} />);
+    const sheet = getByTestId('sheet');
+    expect(sheet.getAttribute('data-scrollable')).toBe('true');
+    expect(sheet.getAttribute('data-snap-points')).toBe('90%');
+    expect(sheet.getAttribute('data-dynamic-sizing')).toBe('false');
+    expect(sheet.textContent).toContain('mobile.restTimer.turnOff');
+    // The native screenshot flow verifies scrolling reaches this action;
+    // this mock only protects the bounded-scroll configuration it requires.
   });
 
   it('pauses and resumes the real timer from the transport, with a haptic each way', () => {
@@ -541,6 +637,26 @@ describe('RestTimerSheet', () => {
     expect(getRestTimerState().armedForSessionId).toBe('session-1');
   });
 
+  it('keeps large-text cadence selection and haptics without restarting the selected window', () => {
+    harness.fontScale = 1.5;
+    settingsStore.values.restTimerMode = 'onTheMinute';
+    armRestTimer('onTheMinute', NOW_MS, 'session-1');
+    const { anchorMs, cycleId } = getRestTimerState();
+    const { container } = renderSheet();
+    expect(container.querySelector('[data-scrolling-tabs="mobile.restTimer.modeAria"]')).not.toBeNull();
+    expect(container.querySelector('[data-segmented]')).toBeNull();
+
+    fireEvent.click(container.querySelector('[data-tab="onTheMinute"]') as HTMLElement);
+    expect(getRestTimerState()).toMatchObject({ anchorMs, cycleId });
+    expect(haptics.selection).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(container.querySelector('[data-tab="afterTick"]') as HTMLElement);
+    expect(settingsStore.values.restTimerMode).toBe('afterTick');
+    expect(getRestTimerState()).toMatchObject({ anchorMs: null, armedForSessionId: 'session-1' });
+    expect(haptics.selection).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[data-tab="afterTick"]')?.getAttribute('aria-selected')).toBe('true');
+  });
+
   it('leaves the timer alone when the already-selected cadence is tapped again (#5664)', () => {
     // Paper's SegmentedButtons (Android, web) calls back on a press of the lit
     // segment. A re-arm there would restart a fixed window mid-block.
@@ -633,5 +749,66 @@ describe('RestTimerSheet', () => {
     fireEvent.click(turnOff);
     expect(getRestTimerState().armed).toBe(false);
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The switch follows the scheduler's own wall-driver rule
+// (lib/session-timer/driver-rule.ts), so it can never offer an advance the
+// scheduler would refuse, or refuse one it would make.
+describe('RestTimerSheet auto-advance and who drives the wall', () => {
+  beforeEach(() => {
+    harness.nowMs = NOW_MS;
+    harness.sessionId = 'session-1';
+    harness.isSharedSession = false;
+    harness.inAppBoardConnection = 'connectedByMe';
+    harness.fontScale = 1;
+    settingsStore.values = {
+      restTimerTargetSeconds: 120,
+      restTimerMode: 'afterTick',
+      restTimerAutoAdvance: false,
+    };
+    settingsStore.listeners.clear();
+    armRestTimer('afterTick', NOW_MS, 'session-1');
+  });
+
+  afterEach(() => {
+    cleanup();
+    resetRestTimerStoreForTests();
+  });
+
+  it('blocks the switch in a crew while nobody holds the wall', () => {
+    harness.isSharedSession = true;
+    harness.inAppBoardConnection = 'disconnected';
+    const { container } = renderSheet();
+    const row = container.querySelector(AUTO_ADVANCE_ROW) as HTMLElement;
+
+    expect(row.getAttribute('data-disabled')).toBe('true');
+    expect(row.getAttribute('data-description')).toBe('mobile.restTimer.autoAdvanceBlocked');
+  });
+
+  it('blocks the switch for a passenger whose crewmate holds the wall', () => {
+    harness.isSharedSession = true;
+    harness.inAppBoardConnection = 'heldByPeer';
+    const { container } = renderSheet();
+
+    expect(container.querySelector(AUTO_ADVANCE_ROW)?.getAttribute('data-disabled')).toBe('true');
+  });
+
+  it('lets the crew member holding the wall switch it on', () => {
+    harness.isSharedSession = true;
+    harness.inAppBoardConnection = 'connectedByMe';
+    const { container } = renderSheet();
+    const row = container.querySelector(AUTO_ADVANCE_ROW) as HTMLElement;
+
+    expect(row.getAttribute('data-disabled')).toBe('false');
+    fireEvent.click(row);
+    expect(settingsStore.values.restTimerAutoAdvance).toBe(true);
+  });
+
+  it('lets a solo climber switch it on with no board connected', () => {
+    harness.inAppBoardConnection = 'disconnected';
+    const { container } = renderSheet();
+
+    expect(container.querySelector(AUTO_ADVANCE_ROW)?.getAttribute('data-disabled')).toBe('false');
   });
 });

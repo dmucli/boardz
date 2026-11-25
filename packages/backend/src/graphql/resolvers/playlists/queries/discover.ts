@@ -1,11 +1,16 @@
-import { eq, and, or, isNull, inArray, notInArray, desc, sql, isNotNull } from 'drizzle-orm';
+import { eq, and, or, isNull, inArray, notInArray, desc, sql, isNotNull, gte, lte } from 'drizzle-orm';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
 import { db } from '../../../../db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { validateInput } from '../../shared/helpers';
 import { DiscoverPlaylistsInputSchema, GetPlaylistCreatorsInputSchema } from '../../../../validation/schemas';
-import { formatPublicPlaylist } from '../helpers/enrichment';
+import { formatPublicPlaylist, playlistVisibilityCondition } from '../helpers/enrichment';
 import { escapeLikePattern } from '../../../../utils/like-pattern';
+import { contentVisibilityCondition } from '@boardsesh/db/queries';
+
+/** A public co-owner cannot disclose another owner's restricted association. */
+export const playlistCreatorVisibilityCondition = (viewerId: string | null | undefined) =>
+  contentVisibilityCondition('playlist', dbSchema.playlists.uuid, dbSchema.playlistOwnership.userId, viewerId);
 
 /** Shared select fields for public playlist queries (discover + search). */
 const PUBLIC_PLAYLIST_SELECT = {
@@ -62,6 +67,47 @@ function publicPlaylistCountQuery() {
     .innerJoin(dbSchema.users, eq(dbSchema.users.id, dbSchema.playlistOwnership.userId));
 }
 
+/**
+ * Discover's grade band, LEFT JOINed on the summary's primary key so it never
+ * multiplies rows: all null for a playlist with no graded climb. Discover-only;
+ * search neither returns nor filters on it, so it doesn't pay for the join.
+ */
+const PLAYLIST_GRADE_SUMMARY_JOIN = eq(dbSchema.playlistGradeSummaries.playlistId, dbSchema.playlists.id);
+
+const DISCOVER_PLAYLIST_SELECT = {
+  ...PUBLIC_PLAYLIST_SELECT,
+  gradedClimbCount: dbSchema.playlistGradeSummaries.gradedClimbCount,
+  gradeMin: dbSchema.playlistGradeSummaries.minDifficulty,
+  gradeP10: dbSchema.playlistGradeSummaries.p10Difficulty,
+  gradeMedian: dbSchema.playlistGradeSummaries.medianDifficulty,
+  gradeP90: dbSchema.playlistGradeSummaries.p90Difficulty,
+  gradeMax: dbSchema.playlistGradeSummaries.maxDifficulty,
+} as const;
+
+const DISCOVER_PLAYLIST_GROUP_BY = [
+  ...PUBLIC_PLAYLIST_GROUP_BY,
+  dbSchema.playlistGradeSummaries.gradedClimbCount,
+  dbSchema.playlistGradeSummaries.minDifficulty,
+  dbSchema.playlistGradeSummaries.p10Difficulty,
+  dbSchema.playlistGradeSummaries.medianDifficulty,
+  dbSchema.playlistGradeSummaries.p90Difficulty,
+  dbSchema.playlistGradeSummaries.maxDifficulty,
+] as const;
+
+function discoverPlaylistBaseQuery() {
+  return db
+    .select(DISCOVER_PLAYLIST_SELECT)
+    .from(dbSchema.playlists)
+    .innerJoin(dbSchema.playlistOwnership, eq(dbSchema.playlistOwnership.playlistId, dbSchema.playlists.id))
+    .innerJoin(dbSchema.playlistClimbs, eq(dbSchema.playlistClimbs.playlistId, dbSchema.playlists.id))
+    .innerJoin(dbSchema.users, eq(dbSchema.users.id, dbSchema.playlistOwnership.userId))
+    .leftJoin(dbSchema.playlistGradeSummaries, PLAYLIST_GRADE_SUMMARY_JOIN);
+}
+
+function discoverPlaylistCountQuery() {
+  return publicPlaylistCountQuery().leftJoin(dbSchema.playlistGradeSummaries, PLAYLIST_GRADE_SUMMARY_JOIN);
+}
+
 // Re-export for search.ts to reuse
 export { PUBLIC_PLAYLIST_SELECT, PUBLIC_PLAYLIST_GROUP_BY, publicPlaylistBaseQuery, publicPlaylistCountQuery };
 
@@ -84,6 +130,9 @@ export const discoverPlaylists = async (
       excludeCreatorIds?: string[];
       minClimbs?: number;
       maxClimbs?: number;
+      minGrade?: number | null;
+      maxGrade?: number | null;
+      followedOnly?: boolean | null;
       sortBy?: 'recent' | 'popular';
       generatedRecommendation?: boolean | null;
       page?: number;
@@ -96,8 +145,16 @@ export const discoverPlaylists = async (
 
   const page = input.page ?? 0;
   const pageSize = input.pageSize ?? 20;
+  const viewerId = _ctx.isAuthenticated ? _ctx.userId : null;
 
-  const conditions = [eq(dbSchema.playlists.isPublic, true)];
+  // "Following" is the viewer's own follows. Signed out there are none, so the
+  // honest answer is an empty page, not an error the Discover screen would
+  // have to tell apart from a failed load.
+  if (input.followedOnly && !viewerId) {
+    return { playlists: [], totalCount: 0, hasMore: false };
+  }
+
+  const conditions = [eq(dbSchema.playlists.isPublic, true), playlistVisibilityCondition(viewerId)];
 
   if (input.boardType) {
     conditions.push(eq(dbSchema.playlists.boardType, input.boardType));
@@ -116,6 +173,28 @@ export const discoverPlaylists = async (
   // slots and silently shrank the grid they were removed from.
   if (input.excludeCreatorIds && input.excludeCreatorIds.length > 0) {
     conditions.push(notInArray(dbSchema.playlistOwnership.userId, input.excludeCreatorIds));
+  }
+  if (input.followedOnly && viewerId) {
+    // Resolved here from user_follows, never a list the client sends.
+    conditions.push(
+      inArray(
+        dbSchema.playlistOwnership.userId,
+        db
+          .select({ followingId: dbSchema.userFollows.followingId })
+          .from(dbSchema.userFollows)
+          .where(eq(dbSchema.userFollows.followerId, viewerId)),
+      ),
+    );
+  }
+  // The grade band is the playlist's 10th..90th percentile, so one outlier at
+  // either end does not move a list in or out. A playlist with no graded climb
+  // has no summary row; the LEFT JOIN leaves these columns null and the
+  // comparison drops it.
+  if (input.minGrade != null) {
+    conditions.push(gte(dbSchema.playlistGradeSummaries.p10Difficulty, input.minGrade));
+  }
+  if (input.maxGrade != null) {
+    conditions.push(lte(dbSchema.playlistGradeSummaries.p90Difficulty, input.maxGrade));
   }
   if (input.generatedRecommendation != null) {
     conditions.push(
@@ -136,7 +215,11 @@ export const discoverPlaylists = async (
     );
   }
 
-  const whereClause = and(...conditions, eq(dbSchema.playlistOwnership.role, 'owner'));
+  const whereClause = and(
+    ...conditions,
+    eq(dbSchema.playlistOwnership.role, 'owner'),
+    playlistCreatorVisibilityCondition(viewerId),
+  );
 
   // A size band, not just a floor. The floor drops one-climb scratch lists; the
   // ceiling drops the 600-climb "favorites" dumps that are a data export with a
@@ -173,17 +256,18 @@ export const discoverPlaylists = async (
               .innerJoin(dbSchema.playlistOwnership, eq(dbSchema.playlistOwnership.playlistId, dbSchema.playlists.id))
               .innerJoin(dbSchema.playlistClimbs, eq(dbSchema.playlistClimbs.playlistId, dbSchema.playlists.id))
               .innerJoin(dbSchema.users, eq(dbSchema.users.id, dbSchema.playlistOwnership.userId))
+              .leftJoin(dbSchema.playlistGradeSummaries, PLAYLIST_GRADE_SUMMARY_JOIN)
               .where(whereClause)
               .groupBy(dbSchema.playlists.id)
               .having(havingClause)
               .as('banded'),
           )
       )[0]?.count ?? 0)
-    : ((await publicPlaylistCountQuery().where(whereClause))[0]?.count ?? 0);
+    : ((await discoverPlaylistCountQuery().where(whereClause))[0]?.count ?? 0);
 
-  const results = await publicPlaylistBaseQuery()
+  const results = await discoverPlaylistBaseQuery()
     .where(whereClause)
-    .groupBy(...PUBLIC_PLAYLIST_GROUP_BY)
+    .groupBy(...DISCOVER_PLAYLIST_GROUP_BY)
     .having(havingClause)
     .orderBy(
       // 'popular' used to mean count(climbs) DESC — biggest, not popular. It is
@@ -230,10 +314,12 @@ export const playlistCreators = async (
   validateInput(GetPlaylistCreatorsInputSchema, input, 'input');
 
   const conditions = [
+    playlistVisibilityCondition(_ctx.isAuthenticated ? _ctx.userId : null),
     eq(dbSchema.playlists.isPublic, true),
     eq(dbSchema.playlists.boardType, input.boardType),
     or(eq(dbSchema.playlists.layoutId, input.layoutId), isNull(dbSchema.playlists.layoutId)),
     eq(dbSchema.playlistOwnership.role, 'owner'),
+    playlistCreatorVisibilityCondition(_ctx.isAuthenticated ? _ctx.userId : null),
   ];
 
   if (input.searchQuery) {

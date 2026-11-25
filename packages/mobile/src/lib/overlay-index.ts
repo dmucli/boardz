@@ -10,6 +10,8 @@
 // Behaviour is unchanged from the map that used to live in the hook, plus two
 // additions the sweeper needs: an access clock and a write odometer.
 
+import { sprayOverlayLayoutId } from './spray/spray-privacy-generation';
+
 export type RenderedOverlayEntry = {
   uri: string;
   generation: number;
@@ -37,7 +39,18 @@ const renderedOverlays = new Map<string, RenderedOverlayEntry>();
  */
 const lastUsedAtMs = new Map<string, number>();
 
-export const RENDERED_OVERLAYS_MAX = 200;
+/**
+ * How many rendered overlays JS remembers. An entry is two short strings, so the
+ * cap is about bounding a Map, not memory: at 1500 it is well under a megabyte.
+ *
+ * It was 200, which one scroll session outgrows — every list row is an entry,
+ * and so is every row warmed ahead of the scroll. A climb that fell out of the
+ * index is still on disk, but the hook can no longer answer for it during
+ * render: it has to ask native (which finds the file) and gets the overlay back
+ * a commit late, so the row shows its bare board first. Scrolling back up a long
+ * list did exactly that for every row past the cap.
+ */
+export const RENDERED_OVERLAYS_MAX = 1500;
 let nextOverlayGeneration = 1;
 
 let overlayWritesSinceSweep = 0;
@@ -123,9 +136,50 @@ export function forgetOverlays(cacheKeys: Iterable<string>): number {
   return forgotten;
 }
 
+/**
+ * The generation the next insertion will get. Every entry in the index right now
+ * has a generation strictly below it.
+ *
+ * A disk walk is async and chunked, so a render can land in the index while the
+ * walk is still listing. Taking this before the walk and passing it to
+ * `forgetOverlaysMissingFromDisk` keeps that fresh write out of reach: the walk
+ * may well have listed the directory before its file appeared.
+ */
+export function getOverlayGenerationWatermark(): number {
+  return nextOverlayGeneration;
+}
+
+/**
+ * Drop indexed keys whose PNG a disk walk did not find (issue #5882).
+ *
+ * The index is filled from the directory listing at warm-up and never re-checked
+ * after that, but files leave the directory behind JS's back: the native
+ * renderer's once-per-launch prune runs on the first render, AFTER the warm-up,
+ * and iOS can purge `Library/Caches` whenever it likes. Each dead key costs a
+ * surface a failed image load and a re-render, and the hook reports it as
+ * `cache_entry_missing`.
+ *
+ * Only entries older than `generationBefore` are candidates. Anything inserted
+ * since the caller took the watermark may have been written after the listing.
+ */
+export function forgetOverlaysMissingFromDisk(presentKeys: ReadonlySet<string>, generationBefore: number): number {
+  const missingKeys: string[] = [];
+  for (const [cacheKey, entry] of renderedOverlays) {
+    if (entry.generation < generationBefore && !presentKeys.has(cacheKey)) missingKeys.push(cacheKey);
+  }
+  return forgetOverlays(missingKeys);
+}
+
 export function clearOverlayIndex(): void {
   renderedOverlays.clear();
   lastUsedAtMs.clear();
+}
+
+export function forgetSprayOverlays(layoutId?: number): void {
+  for (const key of renderedOverlays.keys()) {
+    const wallId = sprayOverlayLayoutId(key);
+    if (wallId !== null && (layoutId == null || layoutId === wallId)) dropKey(key);
+  }
 }
 
 /**

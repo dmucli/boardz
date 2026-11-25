@@ -30,18 +30,42 @@ export function liveSprayPhotoFileNames(): Set<string> {
   return new Set<string>();
 }
 
+/** A presigned GET and its expiry: where a file is fetched from. */
+export type SprayFileSource = { url: string; expiresAt: string };
+
 function presignedUrl(identity: SprayPhotoIdentity): string | null {
   const wall = getSprayWall(identity.layoutId);
-  if (!wall || wall.version !== identity.version) return null;
-  return wall.photoUrl;
+  if (!wall) return null;
+  if (!identity.variant) return wall.versionId === identity.versionId ? wall.photoUrl : null;
+  const art = wall.art;
+  return art && art.variant === identity.variant && art.versionId === identity.versionId ? art.url : null;
 }
 
 export function tryGetSprayPhotoPathSync(identity: SprayPhotoIdentity): string | null {
   return presignedUrl(identity);
 }
 
-export function ensureSprayPhotoCached(identity: SprayPhotoIdentity): Promise<string | null> {
-  return Promise.resolve(presignedUrl(identity));
+export function ensureSprayPhotoCached(identity: SprayPhotoIdentity, source?: SprayFileSource): Promise<string | null> {
+  return Promise.resolve(source?.url ?? presignedUrl(identity));
+}
+
+/** No renderer cache in a browser, so offline sync has nothing to adopt. */
+export function findCachedSprayPhotoForObjectKey(_layoutId: number, _photoKey: string): string | null {
+  return null;
+}
+
+/** Where to fetch a photo's full-resolution copy, and whose wall it is. */
+export type SprayFullPhotoRequest = { layoutId: number; wallUuid: string; url: string; expiresAt: string };
+
+/** Nothing kept, nothing to discard. */
+export function discardSprayFullPhoto(_request: SprayFullPhotoRequest): void {}
+
+/** No renderer cache in a browser. */
+export function releaseCachedSprayPhotoForObjectKey(_layoutId: number, _photoKey: string): void {}
+
+/** Nothing to keep on disk: the hold editor loads the signed URL itself. */
+export function ensureSprayFullPhotoCached(_request: SprayFullPhotoRequest): Promise<string | null> {
+  return Promise.resolve(null);
 }
 
 export function clearSprayPhotoPathCache(): void {
@@ -50,4 +74,8 @@ export function clearSprayPhotoPathCache(): void {
 
 export function resetSprayPhotoCacheForTests(): void {
   // Same: nothing is memoised in a browser.
+}
+
+export function deleteCachedSprayPhotos(_layoutId?: number): void {
+  // The browser twin reads the live registry and owns no filesystem copy.
 }

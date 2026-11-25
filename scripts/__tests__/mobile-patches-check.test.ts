@@ -4,12 +4,22 @@ import { describe, expect, it } from 'vitest';
 import {
   RULES as REAL_RULES,
   UNGUARDED_PATCHES,
+  WEB_RULES,
+  checkExpoUiAndroidPatchesBuildFromSource,
+  checkIosPatchesBuildFromSource,
   checkPatchInventory,
   checkPatchesApplied,
+  createNodeEnv,
   extractObjCMethodBody,
+  packageFromExternalDependency,
+  readAndroidModuleConfigFrom,
+  readSpmConfigFrom,
+  sourceBuildChain,
   versionFromKey,
+  type AndroidModuleConfig,
   type PatchCheckEnv,
   type PatchRule,
+  type SpmConfig,
 } from '../mobile-patches-check';
 
 const PKG = 'react-native-screens';
@@ -46,6 +56,255 @@ function makeEnv(opts: {
     },
   };
 }
+
+describe('the shipped expo-sqlite lifetime guards', () => {
+  const sqliteKey = 'expo-sqlite@58.0.18';
+  const sqliteRules = REAL_RULES.filter((rule) => rule.package === 'expo-sqlite');
+  const helperSource = `
+beginAsyncOperation();
+pendingAsyncOperations.add(operation);
+closePromise = closeWhenDrained();
+finalizeStatementWithErrorPreservation(statement, failure);
+`;
+  const finalizationFixtures = [
+    {
+      file: 'android/src/main/java/expo/modules/sqlite/NativeStatement.kt',
+      source: `
+    synchronized(connection.statementLifecycleLock) {
+        val ret = ref.sqlite3_finalize()
+        val error = if (ret != NativeDatabaseBinding.SQLITE_OK) {
+          ref.getLastErrorMessage()
+        } else {
+          null
+        }
+        // SQLite destroys the statement even when returning an earlier execution error.
+        isFinalized = true
+        connection.statements.removeAll { it === this }
+        if (releasedByJavaScript) {
+          ref.close()
+        }
+        if (error != null) {
+          throw SQLiteErrorException(error)
+        }
+    }
+`,
+    },
+    {
+      file: 'ios/NativeStatement.swift',
+      source: `
+    database.statementLifecycleLock.lock()
+      let result = sqliteResult(for: database.pointer) { exsqlite3_finalize(pointer) }
+      // SQLite destroys the statement even when returning an earlier execution error.
+      isFinalized = true
+      pointer = nil
+      database.statements.removeAll { $0 === self }
+      if let message = result.message {
+        throw SQLiteErrorException(message)
+      }
+`,
+    },
+  ];
+  const lifetimeFixtures = [
+    {
+      file: 'ios/SQLiteModule.swift',
+      source: `
+private let moduleQueue: DispatchQueue
+OnAppContextDestroys {
+      closeAllDatabases()
+}
+public override func willDestroy() {
+    closeAllDatabases()
+}
+DispatchQueue.getSpecific(key: moduleQueueKey)
+moduleQueue.async(flags: .barrier, execute: closeDatabases)
+moduleQueue.sync(flags: .barrier, execute: closeDatabases)
+UInt(bitPattern: ObjectIdentifier($0)) < UInt(bitPattern: ObjectIdentifier($1))
+databases.reversed().forEach { $0.statementLifecycleLock.unlock() }
+`,
+    },
+    {
+      file: 'ios/NativeDatabase.swift',
+      source: `private func exec(source: String) throws {
+    // Serialize connection lifetime with close;
+    statementLifecycleLock.lock()
+    defer { statementLifecycleLock.unlock() }
+}`,
+    },
+    {
+      file: 'ios/NativeSession.swift',
+      source: `private func attach(database: NativeDatabase, table: String?) throws {
+    database.statementLifecycleLock.lock()
+    defer { database.statementLifecycleLock.unlock() }
+}
+private func close(database: NativeDatabase) throws {
+    database.statementLifecycleLock.lock()
+}`,
+    },
+  ];
+
+  function checkSqliteSources(overrides: Record<string, string> = {}, version = '58.0.18') {
+    return checkPatchesApplied(
+      sqliteRules,
+      makeEnv({
+        patchedDependencies: { [sqliteKey]: `patches/${sqliteKey}.patch` },
+        versions: { 'expo-sqlite': version },
+        files: {
+          'expo-sqlite::src/SQLiteDatabase.ts': helperSource,
+          'expo-sqlite::build/SQLiteDatabase.js': helperSource,
+          ...Object.fromEntries(
+            [...finalizationFixtures, ...lifetimeFixtures].map(({ file, source }) => [`expo-sqlite::${file}`, source]),
+          ),
+          ...overrides,
+        },
+      }),
+    );
+  }
+
+  it('guards both JavaScript copies and native finalization and runtime lifetime', () => {
+    expect(sqliteRules.map(({ file }) => file)).toEqual([
+      'src/SQLiteDatabase.ts',
+      'build/SQLiteDatabase.js',
+      'android/src/main/java/expo/modules/sqlite/NativeStatement.kt',
+      'ios/NativeStatement.swift',
+      'ios/SQLiteModule.swift',
+      'ios/NativeDatabase.swift',
+      'ios/NativeSession.swift',
+    ]);
+    expect(checkSqliteSources().errors).toEqual([]);
+  });
+
+  it('rejects a version bump even when the old patch symbols remain', () => {
+    const result = checkSqliteSources({}, '58.0.15');
+    expect(result.errors).toHaveLength(7);
+    expect(result.errors.every((error) => error.includes('version drift'))).toBe(true);
+  });
+
+  it.each(['src/SQLiteDatabase.ts', 'build/SQLiteDatabase.js'])(
+    'rejects a dropped lifecycle or error-preservation helper in %s',
+    (file) => {
+      for (const helper of [
+        'beginAsyncOperation',
+        'pendingAsyncOperations',
+        'closePromise',
+        'finalizeStatementWithErrorPreservation',
+      ]) {
+        const result = checkSqliteSources({ [`expo-sqlite::${file}`]: helperSource.replace(helper, 'removedHelper') });
+        expect(result.errors).toEqual([expect.stringContaining(`is missing "${helper}"`)]);
+      }
+    },
+  );
+
+  it.each(finalizationFixtures)('rejects finalized state moved after an error in $file', ({ file, source }) => {
+    const lateFinalizedState = source
+      .replace('isFinalized = true', '')
+      .replace('throw SQLiteErrorException(', 'isFinalized = true\nthrow SQLiteErrorException(');
+    expect(lateFinalizedState).not.toBe(source);
+    const result = checkSqliteSources({ [`expo-sqlite::${file}`]: `isFinalized = true\n${lateFinalizedState}` });
+    expect(result.errors).toEqual([expect.stringContaining(`${file} is missing`)]);
+  });
+
+  it.each(finalizationFixtures)('rejects a dropped finalized state in $file', ({ file, source }) => {
+    const result = checkSqliteSources({ [`expo-sqlite::${file}`]: source.replace('isFinalized = true', '') });
+    expect(result.errors).toEqual([expect.stringContaining(`${file} is missing`)]);
+  });
+
+  it.each(lifetimeFixtures)('rejects a missing runtime lifetime guarantee in $file', ({ file }) => {
+    expect(checkSqliteSources({ [`expo-sqlite::${file}`]: '' }).errors).toEqual([
+      expect.stringContaining(`${file} is missing`),
+    ]);
+  });
+});
+
+describe('the shipped Expo runtime teardown guards', () => {
+  const coreRule = REAL_RULES.find((rule) => rule.package === 'expo-modules-core')!;
+  const source = `
+private var hasPostedAppContextDestroys = false
+if isModuleRegistryInitialized {
+      for module in moduleRegistry {
+      }
+}
+postAppContextDestroysOnce()
+    _runtime = nil
+private func postAppContextDestroysOnce() {
+  guard !hasPostedAppContextDestroys else { return }
+  hasPostedAppContextDestroys = true
+  moduleRegistry.post(event: .appContextDestroys)
+}
+`;
+
+  function checkSource(installedSource: string, version = '58.1.0') {
+    return checkPatchesApplied(
+      [coreRule],
+      makeEnv({
+        patchedDependencies: { [coreRule.patchedKey]: `patches/${coreRule.patchedKey}.patch` },
+        versions: { 'expo-modules-core': version },
+        files: { [`expo-modules-core::${coreRule.file}`]: installedSource },
+      }),
+    );
+  }
+
+  it('pins the core version and delivery before runtime release', () => {
+    expect(checkSource(source).errors).toEqual([]);
+    expect(checkSource(source, '58.0.27').errors).toEqual([expect.stringContaining('version drift')]);
+    expect(
+      checkSource(source.replace('postAppContextDestroysOnce()\n    _runtime = nil', '_runtime = nil')).errors,
+    ).toEqual([expect.stringContaining('is missing')]);
+  });
+
+  it('rejects moving the guard after reentrant lifecycle listeners', () => {
+    const unsafeSource = source.replace(
+      'hasPostedAppContextDestroys = true\n  moduleRegistry.post(event: .appContextDestroys)',
+      'moduleRegistry.post(event: .appContextDestroys)\n  hasPostedAppContextDestroys = true',
+    );
+    expect(checkSource(unsafeSource).errors).toHaveLength(1);
+  });
+});
+
+describe('the shipped Expo async-function Swift compiler guard', () => {
+  const coreRule = REAL_RULES.find(
+    (rule) => rule.package === 'expo-modules-core' && rule.file === 'ios/Core/Functions/AsyncFunctionDefinition.swift',
+  )!;
+  const source = `
+      self.call(appContext, this: this, arguments: arguments) { [promise] result in
+        switch consume result {
+        case .success(let value):
+          promise.resolve(value)
+        case .failure(let error):
+          promise.reject(error)
+        }
+      }
+`;
+
+  function checkSource(installedSource: string) {
+    return checkPatchesApplied(
+      [coreRule],
+      makeEnv({
+        patchedDependencies: { [coreRule.patchedKey]: `patches/${coreRule.patchedKey}.patch` },
+        versions: { 'expo-modules-core': '58.1.0' },
+        files: { [`expo-modules-core::${coreRule.file}`]: installedSource },
+      }),
+    );
+  }
+
+  it('accepts upstream inferred failure binding with consuming success and same-error rejection', () => {
+    expect(checkSource(source).errors).toEqual([]);
+  });
+
+  it('rejects restoring the existential pattern cast that crashes Swift SILGen', () => {
+    const unsafeSource = source.replace('case .failure(let error):', 'case .failure(let error as any Error):');
+    expect(checkSource(unsafeSource).errors).toContainEqual(expect.stringContaining('contains forbidden source'));
+  });
+
+  it.each([
+    ['switch consume result {', 'switch result {'],
+    ['promise.resolve(value)', 'promise.resolve(nil)'],
+    ['promise.reject(error)', 'promise.reject(UnexpectedException(error))'],
+  ])('rejects changing the async result contract: %s', (original, replacement) => {
+    expect(checkSource(source.replace(original, replacement)).errors).toContainEqual(
+      expect.stringContaining('patch NOT applied'),
+    );
+  });
+});
 
 describe('checkPatchesApplied', () => {
   it('passes when configured, version matches, and all sentinels are present', () => {
@@ -131,6 +390,17 @@ describe('checkPatchesApplied', () => {
 
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]).toContain('cannot read patched file');
+  });
+
+  it('rejects forbidden source even when every positive sentinel survives', () => {
+    const rules = [{ ...RULES[0], forbiddenSubstrings: ['.isEnabled'] }];
+    const env = makeEnv({
+      versions: { [PKG]: '4.25.2' },
+      files: { [`${PKG}::${FILE}`]: `${PATCHED_SOURCE}\nPostHogSDK.shared.isEnabled()` },
+    });
+    expect(checkPatchesApplied(rules, env).errors).toEqual([
+      expect.stringContaining('contains forbidden source ".isEnabled"'),
+    ]);
   });
 });
 
@@ -364,6 +634,257 @@ describe('the shipped @expo/ui iOS rule', () => {
   });
 });
 
+describe('the shipped @expo/ui shared native touch-handler leases', () => {
+  const helperFile = 'ios/ExpoUITouchHandlerHelper.mm';
+  const helperRule = REAL_RULES.find((rule) => rule.package === SCOPED_PKG && rule.file === helperFile);
+  const installedSource = readFileSync(
+    resolve(import.meta.dirname, '../../packages/mobile/node_modules/@expo/ui', helperFile),
+    'utf8',
+  );
+
+  function checkSource(source: string) {
+    if (!helperRule) throw new Error('no @expo/ui native touch-handler rule registered');
+    return checkPatchesApplied(
+      [helperRule],
+      makeEnv({
+        patchedDependencies: { [helperRule.patchedKey]: SCOPED_PATCH_PATH },
+        versions: { [helperRule.package]: versionFromKey(helperRule.patchedKey) },
+        files: { [`${helperRule.package}::${helperRule.file}`]: source },
+      }),
+    );
+  }
+
+  it('guards the installed native patch and ignores stale releases before changing leases', () => {
+    expect(checkSource(installedSource).errors).toEqual([]);
+    const releaseBody = extractObjCMethodBody(installedSource, 'detachTouchHandler');
+    if (releaseBody === null) throw new Error('native touch-handler release method missing');
+    const viewGuard = releaseBody.indexOf('touchHandler.view != view');
+    const readLease = releaseBody.indexOf('objc_getAssociatedObject');
+    const decrementLease = releaseBody.indexOf('leaseCount.unsignedIntegerValue - 1');
+    const detachHandler = releaseBody.indexOf('detachFromView:view');
+    expect(viewGuard).toBeGreaterThanOrEqual(0);
+    expect(readLease).toBeGreaterThan(viewGuard);
+    expect(decrementLease).toBeGreaterThan(readLease);
+    expect(detachHandler).toBeGreaterThan(decrementLease);
+  });
+
+  it.each([
+    ['overlapping owner acquisition', 'leaseCount.unsignedIntegerValue + 1'],
+    ['foreign handler acquisition guard', 'return nil;'],
+    ['stale-view release guard', ' || touchHandler.view != view'],
+    ['foreign handler release guard', 'if (leaseCount == nil) {\n    return;\n  }'],
+    ['shared owner release', 'leaseCount.unsignedIntegerValue - 1'],
+    ['final owner cleanup', 'objc_setAssociatedObject(touchHandler, &ExpoUITouchHandlerLeaseCountKey, nil'],
+  ])('rejects losing %s', (_name, fragment) => {
+    const regressedSource = installedSource.replace(fragment, '__REMOVED_NATIVE_LEASE_GUARD__');
+    expect(regressedSource).not.toBe(installedSource);
+    expect(checkSource(regressedSource).errors).toContainEqual(expect.stringContaining('is missing'));
+  });
+});
+
+describe('the shipped @expo/ui Android lazy-list bridge', () => {
+  const nativeFiles = new Set([
+    'LazyListScrollController.kt',
+    'LazyColumnView.kt',
+    'LazyRowView.kt',
+    'ExpoUIModule.kt',
+    'ModifierRegistry.kt',
+    'SemanticsModifier.kt',
+  ]);
+  const bridgeRules = REAL_RULES.filter(
+    (rule) => rule.package === SCOPED_PKG && nativeFiles.has(rule.file.split('/').at(-1) ?? ''),
+  );
+  const fixtures = bridgeRules.map((rule) => ({
+    rule,
+    source: readFileSync(
+      resolve(import.meta.dirname, '../../packages/mobile/node_modules/@expo/ui', rule.file),
+      'utf8',
+    ),
+  }));
+
+  function checkBridgeSource(rule: PatchRule, source: string) {
+    return checkPatchesApplied(
+      [rule],
+      makeEnv({
+        patchedDependencies: { [rule.patchedKey]: SCOPED_PATCH_PATH },
+        versions: { [rule.package]: versionFromKey(rule.patchedKey) },
+        files: { [`${rule.package}::${rule.file}`]: source },
+      }),
+    );
+  }
+
+  it('guards all six installed native bridge files', () => {
+    expect(fixtures).toHaveLength(6);
+    for (const { rule, source } of fixtures) {
+      expect(checkBridgeSource(rule, source).errors, rule.file).toEqual([]);
+    }
+  });
+
+  it.each(fixtures.flatMap(({ rule, source }) => rule.sentinels.map((fragment) => ({ rule, source, fragment }))))(
+    'rejects losing $fragment',
+    ({ rule, source, fragment }) => {
+      const regressedSource = source.replaceAll(fragment, '__REMOVED_ANDROID_LAZY_LIST_GUARD__');
+      expect(regressedSource).not.toBe(source);
+      expect(checkBridgeSource(rule, regressedSource).errors).toContainEqual(expect.stringContaining('is missing'));
+    },
+  );
+});
+
+describe('the shipped @expo/ui opt-in sheet touch recovery and native cancellation rollback', () => {
+  const nativeFile = 'android/src/main/java/expo/modules/ui/ModalBottomSheetView.kt';
+  const recoveryRule = REAL_RULES.find((rule) => rule.package === SCOPED_PKG && rule.file === nativeFile);
+  if (!recoveryRule) throw new Error('no @expo/ui settled sheet touch recovery rule registered');
+  const nativeSource = readFileSync(
+    resolve(import.meta.dirname, '../../packages/mobile/node_modules/@expo/ui', nativeFile),
+    'utf8',
+  );
+
+  function checkRecovery(source: string) {
+    return checkPatchesApplied(
+      [recoveryRule!],
+      makeEnv({
+        patchedDependencies: { [recoveryRule!.patchedKey]: SCOPED_PATCH_PATH },
+        versions: { [SCOPED_PKG]: versionFromKey(recoveryRule!.patchedKey) },
+        files: { [`${SCOPED_PKG}::${nativeFile}`]: source },
+      }),
+    ).errors;
+  }
+
+  it('keeps recovery disabled by default in native and both JS entrypoints', () => {
+    expect(checkRecovery(nativeSource)).toEqual([]);
+    const entrypointRules = REAL_RULES.filter(
+      (rule) => rule.package === SCOPED_PKG && rule.file.includes('/ModalBottomSheet/index.'),
+    );
+    expect(entrypointRules).toHaveLength(2);
+    const installed = createNodeEnv(resolve(import.meta.dirname, '../../packages/mobile/package.json'), {
+      [recoveryRule!.patchedKey]: SCOPED_PATCH_PATH,
+    });
+    expect(checkPatchesApplied(entrypointRules, installed).errors).toEqual([]);
+    for (const rule of entrypointRules) {
+      const original = installed.readInstalledFile(rule.package, rule.file);
+      const regressed = original.replace('recoverSettledTouches ?? false', 'recoverSettledTouches ?? true');
+      expect(regressed).not.toBe(original);
+      expect(
+        checkPatchesApplied([rule], {
+          ...installed,
+          readInstalledFile: () => regressed,
+        }).errors,
+      ).toContainEqual(expect.stringContaining('is missing'));
+    }
+  });
+
+  it.each([
+    ['global default', 'val recoverSettledTouches: Boolean = false', 'val recoverSettledTouches: Boolean = true'],
+    ['disabled gate', 'if (!enabled) return@LaunchedEffect', ''],
+    ['recovery composition', 'RecoverSettledSheetTouches(sheetState, touchRecovery, recoverSettledTouches)', ''],
+    ['settled trigger', 'snapshotFlow { sheetState.currentValue }', 'snapshotFlow { sheetState.targetValue }'],
+    ['transition cancellation', '.collectLatest { settled ->', '.collect { settled ->'],
+    [
+      'initial and hidden states',
+      'previous == settled || previous == SheetValue.Hidden || settled == SheetValue.Hidden',
+      'false',
+    ],
+    ['active pointer wait', 'snapshotFlow { recovery.touching }.first { touching -> !touching }', ''],
+    [
+      'native pointer tracking',
+      'recovery.pointersChanged(this, sheetState, pointerEvent.changes.any { it.pressed })',
+      '',
+    ],
+    ['current detent recheck', 'sheetState.currentValue != settled || ', ''],
+    ['target detent recheck', 'sheetState.targetValue != settled ||', 'false ||'],
+    ['animation recheck', '!sheetState.isAnimationRunning || ', ''],
+    ['command recheck', 'recovery.activeCommands != 0', 'false'],
+    ['command lifetime', 'activeCommands -= 1', 'activeCommands = 0'],
+    ['command hide exclusion', 'touchRecovery.runCommand { sheetState.hide() }', 'sheetState.hide()'],
+    ['command expand exclusion', 'touchRecovery.runCommand { sheetState.expand() }', 'sheetState.expand()'],
+    [
+      'command partial exclusion',
+      'touchRecovery.runCommand { sheetState.partialExpand() }',
+      'sheetState.partialExpand()',
+    ],
+    ['native reset cleanup', 'recovery.reset(this)', ''],
+    ['native detach cleanup', 'recovery.reset(this, detached = true)', ''],
+    ['recovery lifetime cleanup', 'recovering = false', ''],
+    ['overlapping recovery guard', ' || recovery.recovering', ''],
+    ['expanded recovery', 'SheetValue.Expanded -> sheetState.expand()', 'SheetValue.Expanded -> Unit'],
+    [
+      'partial recovery',
+      'SheetValue.PartiallyExpanded -> sheetState.partialExpand()',
+      'SheetValue.PartiallyExpanded -> Unit',
+    ],
+  ])('rejects a broken %s fixture', (_label, fragment, replacement) => {
+    const regressed = nativeSource.replaceAll(fragment, replacement);
+    expect(regressed).not.toBe(nativeSource);
+    expect(checkRecovery(regressed)).toContainEqual(expect.stringContaining('is missing'));
+  });
+
+  it.each([
+    ['cancel composition', 'RecoverCancelledSheetGesture(sheetState, touchRecovery, recoverSettledTouches)', ''],
+    ['observer attach', 'recovery.attach(this)', ''],
+    ['observer registration', 'attachedObserver = observer', ''],
+    ['real native cancel callback', 'recovery.cancelGesture(this)', ''],
+    ['normal release is not cancellation', 'if (!pressed) gesture = null', 'if (!pressed) cancelGesture(observer)'],
+    ['new DOWN invalidation', 'if (pressed && !touching) {\n      invalidateGesture()', 'if (pressed && !touching) {'],
+    ['generation invalidation', 'generation += 1', ''],
+    ['request invalidation', 'cancelledGesture = null', ''],
+    ['pointer state update', 'touching = pressed', ''],
+    ['cancellation pointer reset', 'val wasTouching = touching\n    touching = false', 'val wasTouching = touching'],
+    [
+      'explicit command invalidation',
+      'suspend fun runCommand(command: suspend () -> Unit) {\n    invalidateGesture()',
+      'suspend fun runCommand(command: suspend () -> Unit) {',
+    ],
+    [
+      'captured start detent',
+      'gesture = SheetGestureCapture(observer, sheetState, generation, startDetent)',
+      'gesture = null',
+    ],
+    ['hidden start guard', 'if (startDetent != SheetValue.Hidden)', 'if (true)'],
+    ['active gesture guard', '!wasTouching || ', ''],
+    ['cancel request emission', 'cancelledGesture = CancelledSheetGesture(cancellationEpoch, captured)', ''],
+    ['current request identity', 'cancelledGesture === request && ', ''],
+    ['gesture generation', 'request.gesture.generation == generation', 'true'],
+    ['sheet identity', 'request.gesture.sheetState === sheetState && ', ''],
+    ['observer identity', 'attachedObserver === request.gesture.observer', 'true'],
+    ['attached observer', 'request.gesture.observer.isAttached && ', ''],
+    ['released pointers', '!touching && activeCommands == 0', 'activeCommands == 0'],
+    ['command priority', 'activeCommands == 0', 'true'],
+    ['cancellation observation', 'snapshotFlow { recovery.cancelledGesture }', 'snapshotFlow { null }'],
+    ['duplicate cancellation guard', 'request.epoch <= consumedEpoch', 'false'],
+    ['overlap wait', 'snapshotFlow { !recovery.touching && !recovery.recovering }.first { it }', ''],
+    ['cancellation ownership recheck', 'if (!recovery.owns(request, sheetState)) return@collectLatest', ''],
+    [
+      'expanded anchor availability',
+      'SheetValue.Expanded -> sheetState.hasExpandedState',
+      'SheetValue.Expanded -> true',
+    ],
+    [
+      'partial anchor availability',
+      'SheetValue.PartiallyExpanded -> sheetState.hasPartiallyExpandedState',
+      'SheetValue.PartiallyExpanded -> true',
+    ],
+    ['unavailable anchor guard', 'if (!anchorAvailable) return@collectLatest', ''],
+    ['local one-shot consumption', 'consumedEpoch = request.epoch', ''],
+    ['hidden sheet priority', '!sheetState.isVisible || ', ''],
+    ['native dismissal priority', 'sheetState.targetValue == SheetValue.Hidden', 'false'],
+  ])('rejects a broken cancellation %s fixture', (_label, fragment, replacement) => {
+    const regressed = nativeSource.replaceAll(fragment, replacement);
+    expect(regressed).not.toBe(nativeSource);
+    expect(checkRecovery(regressed)).toContainEqual(expect.stringContaining('is missing'));
+  });
+
+  it.each([
+    ['consuming the touch', 'event.changes.forEach { it.consume() }'],
+    ['timed reset', 'delay(100)'],
+    ['blocking reset', 'Thread.sleep(100)'],
+    ['private-state mutation', 'sheetState.javaClass.getDeclaredField("dragTarget")'],
+    ['disabling gestures', 'sheetGesturesEnabled = false'],
+    ['temporary diagnostics', 'android.util.Log.i("Filters7312", "debug")'],
+  ])('rejects %s even when recovery sentinels remain', (_label, addition) => {
+    expect(checkRecovery(`${nativeSource}\n${addition}`)).toContainEqual(expect.stringContaining('forbidden'));
+  });
+});
+
 describe('the shipped expo-image local-asset guard', () => {
   const imageViewSource = readFileSync(
     resolve(import.meta.dirname, '../../packages/mobile/node_modules/expo-image/ios/ImageView.swift'),
@@ -496,7 +1017,7 @@ describe('versionFromKey', () => {
 // ---------------------------------------------------------------------------
 
 const TABS_FILE = 'ios/tabs/host/RNSTabsHostComponentView.mm';
-const TABS_KEY = 'react-native-screens@4.26.2';
+const TABS_KEY = 'react-native-screens@4.30.1';
 const TABS_RULES: PatchRule[] = [
   {
     package: PKG,
@@ -641,7 +1162,7 @@ const TABS_SELF_ARMING_SOURCE = TABS_FIXED_SOURCE.replace(
 const tabsEnv = (source: string) =>
   makeEnv({
     patchedDependencies: { [TABS_KEY]: `patches/${TABS_KEY}.patch` },
-    versions: { [PKG]: '4.26.2' },
+    versions: { [PKG]: '4.30.1' },
     files: { [`${PKG}::${TABS_FILE}`]: source },
   });
 
@@ -825,12 +1346,84 @@ describe('the shipped react-native-screens tab-host rule', () => {
       [shippedRule as PatchRule],
       makeEnv({
         patchedDependencies: { [TABS_KEY]: `patches/${TABS_KEY}.patch` },
-        versions: { [PKG]: '4.26.2' },
+        versions: { [PKG]: '4.30.1' },
         files: { [`${PKG}::ios/tabs/host/RNSTabsHostComponentView.mm`]: TABS_ATTACH_ONLY_SOURCE },
       }),
     );
 
     expect(result.errors.length).toBeGreaterThan(0);
+  });
+});
+
+describe('the shipped MiniPlayer width cap rule (#7083)', () => {
+  const ACCESSORY_FILE = 'ios/tabs/bottom-accessory/RNSTabsBottomAccessoryWrapperView.mm';
+  const shippedRule = REAL_RULES.find((rule) => rule.package === PKG && rule.file === ACCESSORY_FILE);
+
+  const wrap = (body: string, preamble = 'static const CGFloat RNSTabsBottomAccessoryMaxWidth = 689.0;') => `
+#import "RNSTabsBottomAccessoryWrapperView.h"
+
+${preamble}
+
+@implementation RNSTabsBottomAccessoryWrapperView
+
+- (CGSize)sizeThatFits:(CGSize)size
+{
+  // By returning the proposed size, we make sure that the accessory always
+  // takes full available width.
+${body}
+}
+
+@end
+`;
+
+  const CAPPED_SOURCE = wrap('  return CGSizeMake(MIN(size.width, RNSTabsBottomAccessoryMaxWidth), size.height);');
+
+  const check = (source: string) =>
+    checkPatchesApplied(
+      [shippedRule as PatchRule],
+      makeEnv({
+        patchedDependencies: { [TABS_KEY]: `patches/${TABS_KEY}.patch` },
+        versions: { [PKG]: '4.30.1' },
+        files: { [`${PKG}::${ACCESSORY_FILE}`]: source },
+      }),
+    );
+
+  it('is present', () => {
+    expect(shippedRule).toBeDefined();
+  });
+
+  it('passes the cap applied on every device', () => {
+    expect(check(CAPPED_SOURCE).errors).toEqual([]);
+  });
+
+  it('rejects the unpatched upstream full-width answer', () => {
+    const result = check(wrap('  return size;', ''));
+
+    expect(result.errors.join('\n')).toContain('RNSTabsBottomAccessoryMaxWidth');
+  });
+
+  it('rejects a pad-only gate that leaves the open iPhone Duo full width', () => {
+    const result = check(
+      wrap(
+        [
+          '  if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {',
+          '    return CGSizeMake(MIN(size.width, RNSTabsBottomAccessoryMaxWidth), size.height);',
+          '  }',
+          '  return size;',
+        ].join('\n'),
+      ),
+    );
+
+    expect(result.errors.join('\n')).toContain('userInterfaceIdiom');
+    expect(result.errors.join('\n')).toContain('iPhone Duo');
+  });
+
+  it('rejects an answer read from the stale bounds (#4728)', () => {
+    const result = check(
+      wrap('  return CGSizeMake(MIN(self.bounds.size.width, RNSTabsBottomAccessoryMaxWidth), size.height);'),
+    );
+
+    expect(result.errors.join('\n')).toContain('self.bounds');
   });
 });
 
@@ -864,36 +1457,53 @@ describe('checkPatchInventory', () => {
     expect(errors[0]).toContain('4.25.2');
   });
 
-  const serverKey = 'postgres@3.4.9';
-  const serverPath = 'packages/db/patches/postgres@3.4.9.patch';
+  describe.each([
+    ['postgres@3.4.9', 'packages/db/patches/postgres@3.4.9.patch'],
+    ['@mui/material@7.3.11', 'packages/web/patches/@mui__material@7.3.11.patch'],
+    ['next@16.3.5', 'packages/web/patches/next@16.3.5.patch'],
+  ])('non-native patch %s', (patchKey, patchPath) => {
+    it('accepts the explicitly registered non-native patch outside native fingerprint inputs', () => {
+      expect(
+        checkPatchInventory({
+          ...base,
+          patchedDependencies: { ...base.patchedDependencies, [patchKey]: patchPath },
+          nonNativePatchPaths: [patchPath],
+        }),
+      ).toEqual([]);
+    });
 
-  it('accepts the explicitly registered server patch outside native fingerprint inputs', () => {
-    expect(
-      checkPatchInventory({
-        ...base,
-        patchedDependencies: { ...base.patchedDependencies, [serverKey]: serverPath },
-        serverPatchPaths: [serverPath],
-      }),
-    ).toEqual([]);
-  });
+    it('rejects a missing non-native patch', () => {
+      expect(
+        checkPatchInventory({
+          ...base,
+          patchedDependencies: { ...base.patchedDependencies, [patchKey]: patchPath },
+        }),
+      ).toEqual([expect.stringContaining('non-native patch ' + patchPath + ' is missing')]);
+    });
 
-  it('rejects a missing server patch', () => {
-    expect(
-      checkPatchInventory({
-        ...base,
-        patchedDependencies: { ...base.patchedDependencies, [serverKey]: serverPath },
-      }),
-    ).toEqual([expect.stringContaining('server patch ' + serverPath + ' is missing')]);
-  });
+    it('rejects a different path even when its file exists', () => {
+      const movedPath = `packages/other/patches/${patchKey.replaceAll('/', '__')}.patch`;
+      expect(
+        checkPatchInventory({
+          ...base,
+          patchedDependencies: { ...base.patchedDependencies, [patchKey]: movedPath },
+          nonNativePatchPaths: [movedPath],
+        }),
+      ).toEqual([expect.stringContaining('non-native patch must stay at')]);
+    });
 
-  it('rejects moving a server patch into native fingerprint inputs', () => {
-    expect(
-      checkPatchInventory({
-        ...base,
-        patchedDependencies: { ...base.patchedDependencies, [serverKey]: `patches/${serverKey}.patch` },
-        patchFilenames: [...base.patchFilenames, `${serverKey}.patch`],
-      }),
-    ).toEqual([expect.stringContaining('server patch must stay at'), expect.stringContaining('orphaned')]);
+    it('rejects moving a non-native patch into native fingerprint inputs', () => {
+      expect(
+        checkPatchInventory({
+          ...base,
+          patchedDependencies: {
+            ...base.patchedDependencies,
+            [patchKey]: `patches/${patchKey.replaceAll('/', '__')}.patch`,
+          },
+          patchFilenames: [...base.patchFilenames, `${patchKey.replaceAll('/', '__')}.patch`],
+        }),
+      ).toEqual([expect.stringContaining('non-native patch must stay at'), expect.stringContaining('orphaned')]);
+    });
   });
 
   it('rejects moving a native patch outside the fingerprinted directory', () => {
@@ -901,7 +1511,7 @@ describe('checkPatchInventory', () => {
       checkPatchInventory({
         ...base,
         patchedDependencies: { [TABS_KEY]: `packages/db/patches/${TABS_KEY}.patch` },
-        serverPatchPaths: [`packages/db/patches/${TABS_KEY}.patch`],
+        nonNativePatchPaths: [`packages/db/patches/${TABS_KEY}.patch`],
       }),
     ).toEqual([expect.stringContaining('not in patches/')]);
   });
@@ -1072,5 +1682,429 @@ if url.scheme == "file" {
     expect(result.errors).toHaveLength(1);
     expect(result.errors[0]).toContain('patch NOT applied');
     expect(result.errors[0]).toContain('hasAbsoluteFilePath');
+  });
+});
+
+// #5296: the Exception.swift patch applied to node_modules and CI went green, but
+// ExpoModulesCore ships a prebuilt xcframework, so the binary never compiled it.
+describe('checkIosPatchesBuildFromSource', () => {
+  const iosRule = (pkg: string, file = 'ios/Thing.swift'): PatchRule => ({
+    package: pkg,
+    file,
+    sentinels: ['x'],
+    patchedKey: `${pkg}@1.0.0`,
+  });
+  const spm = (configs: Record<string, SpmConfig>) => (pkg: string) => configs[pkg] ?? null;
+
+  it('passes an ios/ patch whose package is listed in buildFromSource', () => {
+    expect(
+      checkIosPatchesBuildFromSource({
+        rules: [iosRule('expo-modules-core')],
+        buildFromSource: ['expo-modules-core'],
+        readSpmConfig: spm({}),
+      }),
+    ).toEqual([]);
+  });
+
+  it('fails an ios/ patch on a package nothing builds from source (the #5296 false green)', () => {
+    const errors = checkIosPatchesBuildFromSource({
+      rules: [iosRule('expo-modules-core', 'ios/Core/Exceptions/Exception.swift')],
+      buildFromSource: ['react-native-screens'],
+      readSpmConfig: spm({}),
+    });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('expo-modules-core: patch edits ios/Core/Exceptions/Exception.swift');
+    expect(errors[0]).toContain('buildFromSource');
+  });
+
+  it('passes a dependent pod that the precompile resolver cascades to source', () => {
+    const readSpmConfig = spm({
+      'expo-image': {
+        products: [{ name: 'ExpoImage', externalDependencies: ['React', 'expo-modules-core/ExpoModulesCore'] }],
+      },
+    });
+    expect(
+      checkIosPatchesBuildFromSource({
+        rules: [iosRule('expo-image', 'ios/ImageView.swift')],
+        buildFromSource: ['expo-modules-core'],
+        readSpmConfig,
+      }),
+    ).toEqual([]);
+    expect(sourceBuildChain('expo-image', { buildFromSource: ['expo-modules-core'], readSpmConfig })).toBe(
+      'expo-image → expo-modules-core (buildFromSource)',
+    );
+  });
+
+  it('fails the dependent pod once its dependency leaves buildFromSource', () => {
+    const errors = checkIosPatchesBuildFromSource({
+      rules: [iosRule('expo-image', 'ios/ImageView.swift')],
+      buildFromSource: [],
+      readSpmConfig: spm({
+        'expo-image': { products: [{ externalDependencies: ['expo-modules-core/ExpoModulesCore'] }] },
+      }),
+    });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain('expo-image: patch edits ios/ImageView.swift');
+  });
+
+  it('ignores patches that touch no ios/ file', () => {
+    expect(
+      checkIosPatchesBuildFromSource({
+        rules: [iosRule('react-native-ble-plx', 'android/src/main/java/Foo.java'), iosRule('@expo/ui', 'src/a.tsx')],
+        buildFromSource: [],
+        readSpmConfig: spm({}),
+      }),
+    ).toEqual([]);
+  });
+
+  it('treats buildFromSource entries as anchored patterns, like precompiled_modules.rb', () => {
+    const readSpmConfig = spm({});
+    expect(sourceBuildChain('expo-image', { buildFromSource: ['expo-.*'], readSpmConfig })).toBe(
+      'expo-image (buildFromSource)',
+    );
+    expect(sourceBuildChain('expo-image-manipulator', { buildFromSource: ['expo-image'], readSpmConfig })).toBeNull();
+  });
+
+  it('terminates on a dependency cycle', () => {
+    const readSpmConfig = spm({
+      a: { products: [{ externalDependencies: ['b/B'] }] },
+      b: { products: [{ externalDependencies: ['a/A'] }] },
+    });
+    expect(sourceBuildChain('a', { buildFromSource: [], readSpmConfig })).toBeNull();
+  });
+
+  it('maps externalDependencies entries to packages the way prebuilt_dependency_pods does', () => {
+    expect(packageFromExternalDependency('expo-modules-core/ExpoModulesCore')).toBe('expo-modules-core');
+    expect(packageFromExternalDependency('@scope/pkg/Product')).toBe('@scope/pkg');
+    expect(packageFromExternalDependency('RNWorklets')).toBeNull();
+    expect(packageFromExternalDependency('@scope/pkg')).toBeNull();
+  });
+});
+
+describe('checkExpoUiAndroidPatchesBuildFromSource', () => {
+  const androidRule: PatchRule = {
+    package: '@expo/ui',
+    file: 'android/src/main/java/expo/modules/ui/LazyRowView.kt',
+    sentinels: [],
+    patchedKey: '@expo/ui@58.0.29',
+  };
+  const published: AndroidModuleConfig = { android: { publication: { repository: 'local-maven-repo' } } };
+
+  function checkSelection(buildFromSource: string[], config: AndroidModuleConfig | null = published) {
+    return checkExpoUiAndroidPatchesBuildFromSource({
+      rules: [androidRule],
+      buildFromSource,
+      readAndroidModuleConfig: () => config,
+    });
+  }
+
+  it('rejects the iOS-only scoped package entry that silently ships an unpatched Android AAR', () => {
+    expect(checkSelection(['@expo/ui'])).toEqual([
+      expect.stringContaining('Android project "expo-ui" can link a prebuilt AAR'),
+    ]);
+    expect(checkSelection(['@expo/ui', 'expo-ui'])).toEqual([]);
+  });
+
+  it('matches full Gradle names and grouped regex alternatives like Regex.matches', () => {
+    expect(checkSelection(['expo'])).toHaveLength(1);
+    expect(checkSelection(['expo-ui-extra|other'])).toHaveLength(1);
+    expect(checkSelection(['expo-ui|other'])).toEqual([]);
+    expect(checkSelection(['expo-.*'])).toEqual([]);
+  });
+
+  it('honors explicit Android project names instead of guessing from the npm package', () => {
+    const config = { android: { name: 'native-filters', publication: { repository: 'local-maven-repo' } } };
+    expect(checkSelection(['expo-ui'], config)).toHaveLength(1);
+    expect(checkSelection(['native-filters'], config)).toEqual([]);
+  });
+
+  it('checks a published subproject only when the patched path belongs to it', () => {
+    const config: AndroidModuleConfig = {
+      android: {
+        projects: [
+          { name: 'filter-widgets', path: 'android/widgets', publication: { repository: 'local-maven-repo' } },
+        ],
+      },
+    };
+    const input = {
+      rules: [{ ...androidRule, file: 'android/widgets/src/Filter.kt' }],
+      buildFromSource: [],
+      readAndroidModuleConfig: () => config,
+    };
+    expect(checkExpoUiAndroidPatchesBuildFromSource(input)).toEqual([expect.stringContaining('"filter-widgets"')]);
+    expect(checkSelection([], config)).toEqual([]);
+  });
+
+  it('does not reject non-Expo libraries or Expo projects without prebuilt publications', () => {
+    expect(checkSelection([], null)).toEqual([]);
+    expect(checkSelection([], { android: { name: 'expo-ui' } })).toEqual([]);
+    expect(checkSelection([], { android: { publication: null } })).toEqual([]);
+  });
+
+  it('leaves other native libraries outside the Filters Expo UI source-selection guard', () => {
+    expect(
+      checkExpoUiAndroidPatchesBuildFromSource({
+        rules: [{ ...androidRule, package: 'expo-sqlite' }],
+        buildFromSource: [],
+        readAndroidModuleConfig: () => published,
+      }),
+    ).toEqual([]);
+  });
+
+  it('ignores iOS and JavaScript patches and reports each Android project only once', () => {
+    expect(
+      checkExpoUiAndroidPatchesBuildFromSource({
+        rules: [androidRule, androidRule, { ...androidRule, file: 'ios/Filter.swift' }],
+        buildFromSource: [],
+        readAndroidModuleConfig: () => published,
+      }),
+    ).toHaveLength(1);
+    expect(
+      checkExpoUiAndroidPatchesBuildFromSource({
+        rules: [{ ...androidRule, file: 'src/Filter.tsx' }],
+        buildFromSource: [],
+        readAndroidModuleConfig: () => published,
+      }),
+    ).toEqual([]);
+  });
+});
+
+// Reads the REAL packages/mobile/package.json and the installed spm.config.json
+// files: remove "expo-modules-core" from buildFromSource and this goes red for
+// the expo-image and expo-sqlite patches that ride its cascade.
+describe('the shipped buildFromSource list', () => {
+  const mobilePackageJsonPath = resolve(import.meta.dirname, '../../packages/mobile/package.json');
+  const mobileManifest = JSON.parse(readFileSync(mobilePackageJsonPath, 'utf8')) as {
+    expo?: { autolinking?: { buildFromSource?: string[] } };
+  };
+  const buildFromSource = mobileManifest.expo?.autolinking?.buildFromSource ?? [];
+  const env = createNodeEnv(mobilePackageJsonPath, {});
+  const readSpmConfig = (pkg: string) => readSpmConfigFrom(env, pkg);
+
+  it('builds every ios/-patched pod from source, so each patch reaches the binary', () => {
+    expect(checkIosPatchesBuildFromSource({ rules: REAL_RULES, buildFromSource, readSpmConfig })).toEqual([]);
+  });
+
+  it('builds the Filters Expo UI Kotlin patch from source on Android', () => {
+    expect(
+      checkExpoUiAndroidPatchesBuildFromSource({
+        rules: REAL_RULES,
+        buildFromSource,
+        readAndroidModuleConfig: (pkg) => readAndroidModuleConfigFrom(env, pkg),
+      }),
+    ).toEqual([]);
+  });
+
+  it('goes red when only the Android expo-ui entry is removed, despite retaining @expo/ui', () => {
+    const brokenSelection = buildFromSource.filter((name) => name !== 'expo-ui');
+    expect(brokenSelection).toContain('@expo/ui');
+    expect(
+      checkExpoUiAndroidPatchesBuildFromSource({
+        rules: REAL_RULES.filter((rule) => rule.package === '@expo/ui'),
+        buildFromSource: brokenSelection,
+        readAndroidModuleConfig: (pkg) => readAndroidModuleConfigFrom(env, pkg),
+      }),
+    ).toEqual([expect.stringContaining('Android project "expo-ui"')]);
+  });
+
+  it.each(['expo-image', 'expo-sqlite'])('builds %s from source through the expo-modules-core cascade', (pkg) => {
+    expect(sourceBuildChain(pkg, { buildFromSource, readSpmConfig })).toBe(
+      `${pkg} → expo-modules-core (buildFromSource)`,
+    );
+  });
+});
+
+describe('the shipped native privacy patches', () => {
+  const expectedKeys: Readonly<Record<string, string>> = {
+    'posthog-react-native-session-replay': 'posthog-react-native-session-replay@1.6.0',
+  };
+  const privacyRules = REAL_RULES.filter((rule) => rule.package in expectedKeys);
+  const mobilePackageJson = resolve(import.meta.dirname, '../../packages/mobile/package.json');
+  const installed = createNodeEnv(
+    mobilePackageJson,
+    Object.fromEntries(Object.values(expectedKeys).map((key) => [key, `patches/${key}.patch`])),
+  );
+
+  it.each(Object.entries(expectedKeys))('guards the exact %s patch on both native platforms', (pkg, key) => {
+    const packageRules = privacyRules.filter((rule) => rule.package === pkg);
+    expect(packageRules.some((rule) => rule.file.startsWith('ios/'))).toBe(true);
+    expect(packageRules.some((rule) => rule.file.startsWith('android/'))).toBe(true);
+    expect(packageRules.every((rule) => rule.patchedKey === key)).toBe(true);
+    expect(UNGUARDED_PATCHES[key]).toBeUndefined();
+  });
+
+  it('checks installed source, including replay JS entrypoints and its hidden package manifest', () => {
+    expect(installed.readInstalledVersion('posthog-react-native-session-replay')).toBe('1.6.0');
+    expect(
+      privacyRules.filter((rule) => rule.package === 'posthog-react-native-session-replay').map((rule) => rule.file),
+    ).toEqual(expect.arrayContaining(['src/index.tsx', 'lib/module/index.js', 'lib/commonjs/index.js']));
+    expect(checkPatchesApplied(privacyRules, installed)).toEqual({ checked: privacyRules.length, errors: [] });
+  });
+
+  it('rejects private replay SDK isEnabled calls even when lifecycle guards survive', () => {
+    const rule = privacyRules.find(
+      (candidate) => candidate.package === 'posthog-react-native-session-replay' && candidate.file.endsWith('.swift'),
+    );
+    expect(rule?.forbiddenSubstrings).toContain('.isEnabled');
+    const source = installed.readInstalledFile(rule!.package, rule!.file);
+    const result = checkPatchesApplied([rule!], {
+      ...installed,
+      readInstalledFile: () => `${source}\nPostHogSDK.shared.isEnabled()`,
+    });
+    expect(result.errors).toEqual([expect.stringContaining('contains forbidden source ".isEnabled"')]);
+  });
+
+  it.each(Object.entries(expectedKeys))('rejects %s version drift before inspecting its source', (pkg) => {
+    const result = checkPatchesApplied(
+      privacyRules.filter((rule) => rule.package === pkg),
+      {
+        ...installed,
+        readInstalledVersion: () => '999.0.0',
+      },
+    );
+    expect(result.errors.length).toBeGreaterThan(0);
+    expect(result.errors.every((error) => error.includes('version drift'))).toBe(true);
+  });
+
+  it.each([
+    [
+      'posthog-react-native-session-replay',
+      'src/index.tsx',
+      'return PosthogReactNativeSessionReplay.setOptOut(optedOut, projectToken);',
+    ],
+    ['posthog-react-native-session-replay', 'lib/module/index.js', 'export const reset = identify;'],
+    ['posthog-react-native-session-replay', 'lib/commonjs/index.js', 'exports.setOptOut = setOptOut;'],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.mm',
+      'RCT_EXTERN_METHOD(setOptOut:(BOOL)optedOut',
+    ],
+    ['posthog-react-native-session-replay', 'ios/PosthogReactNativeSessionReplay.swift', 'sealed = true'],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'self.config = nil\n        PostHogSessionManager.shared.setSessionId(sessionIdStr)',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'private var nativeInitialized = false',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'nativeInitialized = false\n            config = nil',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'nativeInitialized = true\n        setIdentify',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'guard consentAllowed, nativeInitialized else',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'private var forwardingTask: URLSessionDataTask?',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'configuration.urlSessionConfiguration = transport?.configuration()',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'let config = PostHogConfig(projectToken: nextTransport.storageToken, host: host)',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'if request.httpMethod == "POST" { throw URLError(.cannotDecodeContentData) }',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'guard consentAllowed, let storageManager = config?.storageManager else',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'ios/PosthogReactNativeSessionReplay.swift',
+      'try manager.removeItem(at: folder)',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+      'File(context.cacheDir, "boardsesh-consent-replay")',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+      '!location.deleteRecursively()',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+      'retiredPermission?.set(false)',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+      'synchronized(consentLock) {',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+      'config.replayStoragePrefix = File(generationRoot, "snapshots").absolutePath',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+      'if (!consentAllowed || recordingGeneration != consentGeneration.get()) return@Runnable',
+    ],
+    [
+      'posthog-react-native-session-replay',
+      'android/src/main/java/com/posthogreactnativesessionreplay/PosthogReactNativeSessionReplayModule.kt',
+      'if (consentAllowed) setIdentify(savedConfig?.cachePreferences, distinctId, anonymousId)',
+    ],
+  ])('rejects a partial privacy patch missing %s/%s: %s', (pkg, file, fragment) => {
+    const rule = privacyRules.find((candidate) => candidate.package === pkg && candidate.file === file);
+    expect(rule).toBeDefined();
+    const original = installed.readInstalledFile(pkg, file);
+    expect(original).toContain(fragment);
+    const result = checkPatchesApplied([rule!], {
+      ...installed,
+      readInstalledFile: () => original.replaceAll(fragment, ''),
+    });
+    expect(result.errors).toHaveLength(1);
+    expect(result.errors[0]).toContain('patch NOT applied');
+  });
+});
+
+describe('the installed web declaration patch', () => {
+  const patchedDependencies = {
+    '@mui/material@7.3.11': 'packages/web/patches/@mui__material@7.3.11.patch',
+  };
+  const installed = createNodeEnv(
+    resolve(import.meta.dirname, '../../packages/web/package.json'),
+    patchedDependencies,
+    'packages/web',
+  );
+
+  it('guards both declaration variants resolved by the web workspace', () => {
+    expect(checkPatchesApplied(WEB_RULES, installed)).toEqual({ checked: 2, errors: [] });
+  });
+
+  it.each(WEB_RULES)('rejects a dropped React import in $file', (rule) => {
+    const result = checkPatchesApplied([rule], {
+      ...installed,
+      readInstalledFile(pkg, file) {
+        return installed.readInstalledFile(pkg, file).replace(/^import type \* as React from 'react';\r?\n/m, '');
+      },
+    });
+    expect(result.errors).toEqual([expect.stringContaining(`${rule.file} is missing`)]);
   });
 });

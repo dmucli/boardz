@@ -1,0 +1,11 @@
+appId: ${APP_ID}
+name: Swipe the visible board once to the player's next climb
+---
+- assertVisible:
+    id: play-drawer-board-accessibility
+- assertVisible:
+    id: wall-control-.*-self-driving
+- swipe:
+    start: 80%,45%
+    end: 20%,45%
+    duration: 400

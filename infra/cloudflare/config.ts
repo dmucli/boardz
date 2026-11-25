@@ -1,6 +1,17 @@
 /// <reference types="node" />
 
 import {
+  MARKETING_CACHE_PATHS,
+  MARKETING_LOCALE_COOKIE,
+  MARKETING_ROUTER_HEADERS,
+  MARKETING_SESSION_COOKIE_SUBSTRINGS,
+} from '../../packages/web/app/lib/marketing-page-cache';
+
+import { OTA_HOSTING_PROVIDER, type OtaHostingProvider } from '../ota/server';
+
+import { CONSENT_REGION_EDGE_HEADER_NAME } from '../../packages/shared/consent/src/consent-region';
+
+import {
   AUTOMATION_DEFAULT_DENY_EXEMPT_PATH_PREFIXES,
   AUTOMATION_DEFAULT_DENY_EXEMPT_PATHS,
   AUTOMATION_SIGNATURE_TOKENS,
@@ -19,7 +30,7 @@ import {
 //    proxy so /og/* share cards and /render/board images edge-cache globally.
 //    Everything else on that host (/graphql, other REST, WebSocket upgrades)
 //    must bypass the cache.
-//    The manual runbook this replaces lives in docs/og-climb.md.
+//    The manual runbook this replaces lives in docs/web/og-climb.md.
 //
 // 2. www.boardsesh.com is the marketing/SEO surface. It moved from Vercel to the
 //    Railway web service in #4655 (epic #4648); the two rules below are cost
@@ -27,14 +38,13 @@ import {
 //    Railway sits behind the same proxy. Measured 2026-08-25 against Vercel:
 //    ~442,600 function invocations/day, of which /api/internal/board-render was
 //    ~215,600 and the climb-view page ~203,900, against a published sitemap of
-//    only ~60k URLs and ~2,000 homepage hits. See docs/cloudflare.md.
+//    only ~60k URLs and ~2,000 homepage hits. See docs/operations/cloudflare.md.
 //    Its DNS record is fully managed here — type, content, TTL and the proxy
 //    flag — so a future origin change is a reviewable diff rather than a
 //    dashboard click.
 //
-// 3. assets.boardsesh.com is the public, DNS-only custom domain for the Tigris
-//    static-assets bucket. Unlike ws, this tool owns the record's complete shape
-//    and creates it when it is absent.
+// 3. assets.boardsesh.com is the public R2 static-assets custom domain.
+//    R2 owns its DNS record; never recreate the legacy Tigris CNAME here.
 
 /** The Cloudflare zone this config manages. Resolved to a zone id by name when CLOUDFLARE_ZONE_ID is unset. */
 export const ZONE_NAME = 'boardsesh.com';
@@ -42,10 +52,39 @@ export const ZONE_NAME = 'boardsesh.com';
 /** The Railway-backed host we put behind the Cloudflare proxy. */
 export const WS_HOSTNAME = 'ws.boardsesh.com';
 
+/**
+ * The partner API host (#6981). The backend's host filter
+ * (packages/backend/src/handlers/api-host.ts) guards the same name, and
+ * scripts/cloudflare-apply.test.ts fails if the two ever differ.
+ *
+ * A fully managed proxied CNAME in `dnsRecords` since the owner registered the
+ * custom domain on `boardsesh-backend` (2026-11-17). See "api.boardsesh.com" in
+ * docs/operations/cloudflare.md.
+ */
+export const API_HOSTNAME = 'api.boardsesh.com';
+
+/**
+ * Railway's required CNAME target for the `api.boardsesh.com` custom domain on
+ * the `boardsesh-backend` service (domain id
+ * `26e644c0-64dc-4c9d-8eab-f4d9f1c23546`). Railway printed it when the domain
+ * was added; it is not derivable from the service name.
+ */
+export const API_RAILWAY_CNAME_TARGET = 'eas9szb6.up.railway.app';
+
+/** Where Railway looks for proof that we own API_HOSTNAME. */
+export const API_RAILWAY_VERIFY_HOSTNAME = `_railway-verify.${API_HOSTNAME}`;
+
+/**
+ * The ownership proof Railway printed with the CNAME target. Not a secret: it
+ * is published in DNS. Railway serves the host only once it has read this.
+ */
+export const API_RAILWAY_VERIFY_VALUE =
+  'railway-verify=ac3ca8cf7b95bfc99345da28df8f5e44483418ce23d064ce705f370cd66357b7';
+
 /** Public custom domain for the content-addressed static-assets bucket. */
 export const ASSETS_HOSTNAME = 'assets.boardsesh.com';
 
-/** Tigris custom-domain DNS target for the dedicated Boardsesh static-assets bucket. */
+/** Retained Tigris DNS target for rollback; absent from the desired DNS records. */
 export const ASSETS_CNAME_TARGET = 'boardsesh-static-assets.t3.tigrisbucket.io';
 
 /** Path prefix whose responses are immutable (`Cache-Control: … immutable`, 1y) and safe to edge-cache. */
@@ -152,9 +191,16 @@ export const BACKEND_BOARD_RENDER_CACHE_RULE_DESCRIPTION =
 /** Marker for the www list/climb-view HTML cache rule. Never rename without migrating the live rule. */
 export const WWW_HTML_CACHE_RULE_DESCRIPTION = 'boardsesh:www-html-edge-cache (managed by scripts/cloudflare-apply.ts)';
 
+/** Marketing has a separate rule so the board prefix expression stays below 4096 bytes. Never rename. */
+export const WWW_MARKETING_HTML_CACHE_RULE_DESCRIPTION =
+  'boardsesh:www-marketing-html-edge-cache (managed by scripts/cloudflare-apply.ts)';
+
 /** Markers for the allow and block WAF custom rules. Same never-rename contract as above. */
 export const CRAWLER_ALLOW_RULE_DESCRIPTION =
   'boardsesh:allow-search-crawlers (managed by scripts/cloudflare-apply.ts)';
+/** Marker for the narrow Perplexity public-guide bot exception. Never rename without migrating the live rule. */
+export const PERPLEXITY_PUBLIC_GUIDES_RULE_DESCRIPTION =
+  'boardsesh:perplexity-public-guides (managed by scripts/cloudflare-apply.ts)';
 export const CRAWLER_BLOCK_RULE_DESCRIPTION = 'boardsesh:block-seo-scrapers (managed by scripts/cloudflare-apply.ts)';
 /** Marker for the automation default-deny WAF rule. Same never-rename contract as above. */
 export const AUTOMATION_DEFAULT_DENY_RULE_DESCRIPTION =
@@ -214,7 +260,7 @@ export const DYNAMIC_REDIRECT_RULE_PHASE = 'http_request_dynamic_redirect';
  * R2 emits CORS headers only in response to a request that carries `Origin`
  * (Cloudflare's R2 CORS docs are explicit about this). The same objects are
  * loaded both ways: `<img src>` sends no `Origin`, while
- * `ensureImagesPreloaded` in packages/web/app/lib/board-render-worker/worker-manager.ts
+ * the Expo browser worker in packages/mobile/public/wasm/board-render.worker.js
  * does a real `fetch()` for every board background. One cache key, two possible
  * bodies-with-different-headers, and the `<img>` one wins the race as often as
  * not — after which the `fetch()` fails CORS against a response with no ACAO.
@@ -229,6 +275,47 @@ export const DYNAMIC_REDIRECT_RULE_PHASE = 'http_request_dynamic_redirect';
  * populated it.
  */
 export const RESPONSE_HEADER_RULE_PHASE = 'http_response_headers_transform';
+
+/**
+ * Compression Rules phase.
+ *
+ * Cloudflare compresses by content type, and `application/octet-stream` is not
+ * on its default list. R2 stores every OTA object under that type, so without a
+ * rule here the 20.9 MB Hermes bundle goes out byte for byte (measured
+ * 2026-10-05: the same size for identity, gzip, br and zstd requests). Brotli
+ * takes it to roughly 6 to 7 MB.
+ */
+export const COMPRESSION_RULE_PHASE = 'http_response_compression';
+
+/** Request-header rewrites sent from Cloudflare to origins. */
+export const REQUEST_HEADER_RULE_PHASE = 'http_request_late_transform';
+
+/** The proxied xprem endpoint that receives Observe telemetry and OTA traffic. */
+export const UPDATES_HOSTNAME = 'updates.boardsesh.com';
+
+/** Filled from Cloudflare's created tunnel before the controlled ownership switch. */
+export const OTA_TUNNEL_ID: string | null = null;
+
+/** Preparation leaves the serving Railway record untouched; an unconfigured cutover fails closed. */
+export function otaDnsRecords(
+  provider: OtaHostingProvider,
+  tunnelId: string | null = OTA_TUNNEL_ID,
+): DnsRecordDesired[] {
+  if (provider === 'railway') return [];
+  if (provider !== 'homelab' || !tunnelId || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(tunnelId)) {
+    throw new Error('Homelab OTA DNS requires the created Cloudflare tunnel UUID before cutover');
+  }
+  return [
+    {
+      management: 'full',
+      name: UPDATES_HOSTNAME,
+      type: 'CNAME',
+      content: `${tunnelId}.cfargotunnel.com`,
+      ttl: 1,
+      proxied: true,
+    },
+  ];
+}
 
 /** Cloudflare SSL/TLS modes ordered weakest → strongest, for the "is the live mode weaker?" check. */
 export const SSL_MODE_STRENGTH = ['off', 'flexible', 'full', 'strict'] as const;
@@ -254,9 +341,11 @@ export interface FullyManagedDnsRecordDesired extends DnsRecordDesiredBase {
    * `A`/`AAAA` are here for the originless apex, which points at a reserved
    * placeholder address rather than a hostname — see APEX_ORIGINLESS_ADDRESS.
    * `AAAA` stays in the union because Cloudflare documents both placeholder
-   * forms; nothing declares one today.
+   * forms; nothing declares one today. `TXT` is for Railway's
+   * `_railway-verify.<host>` ownership proofs: `content` is the bare value
+   * (the tool adds the quotes Cloudflare stores), and `proxied` must be false.
    */
-  type: 'A' | 'AAAA' | 'CNAME';
+  type: 'A' | 'AAAA' | 'CNAME' | 'TXT';
   content: string;
   /** Cloudflare API value 1 means automatic TTL. */
   ttl: number;
@@ -306,9 +395,8 @@ export interface SslDesired {
 }
 
 /**
- * A WAF custom rule. `skip` carries `{ ruleset: 'current' }` — skip every
- * remaining rule in this phase — which is what makes the allow rule a true
- * escape hatch. `block` needs no action parameters.
+ * A WAF custom rule. The crawler allow rule skips the remaining custom rules;
+ * the public-guide exception skips only the bot phase. `block` needs no action parameters.
  */
 export interface WafRuleDesired {
   description: string;
@@ -321,7 +409,7 @@ export interface WafRuleDesired {
    * RateLimitRuleDesired) — custom rules accept it on every plan.
    */
   action: 'block' | 'skip' | 'managed_challenge';
-  action_parameters?: { ruleset: 'current' };
+  action_parameters?: { ruleset: 'current' } | { phases: ['http_request_sbfm'] };
   enabled: boolean;
 }
 
@@ -398,15 +486,44 @@ export interface ResponseHeaderRuleDesired {
   enabled: boolean;
 }
 
+/**
+ * A Compression rule. Cloudflare picks the first listed algorithm the client's
+ * `Accept-Encoding` allows, and sends the body uncompressed when none match.
+ */
+export interface CompressionRuleDesired {
+  description: string;
+  expression: string;
+  action: 'compress_response';
+  action_parameters: {
+    algorithms: readonly { name: 'zstd' | 'brotli' | 'gzip' }[];
+  };
+  enabled: boolean;
+}
+
+/**
+ * A Request Header Transform rule. The expression value is evaluated at the
+ * edge, so the origin receives Cloudflare's country lookup rather than a value
+ * supplied by the client.
+ */
+export interface RequestHeaderRuleDesired {
+  description: string;
+  expression: string;
+  action: 'rewrite';
+  action_parameters: {
+    headers: Record<string, { operation: 'set'; expression: string }>;
+  };
+  enabled: boolean;
+}
+
 export interface CloudflareDesiredState {
   zoneName: string;
   dnsRecords: DnsRecordDesired[];
   /** Order is not significant: cache rules are matched by expression, not precedence. */
   cacheRules: CacheRuleDesired[];
   /**
-   * Order IS significant and is preserved on apply: the allow rule must be
-   * evaluated before the block rule, or a token collision would take out a
-   * search engine. See upsertManagedRules in ./plan.
+   * Order IS significant and is preserved on apply: the bot-phase exception
+   * must precede the allow rule, whose current-ruleset skip would bypass it.
+   * The allow rule must precede the block rule. See upsertManagedRules in ./plan.
    */
   wafRules: WafRuleDesired[];
   /**
@@ -416,8 +533,12 @@ export interface CloudflareDesiredState {
   rateLimitRules: RateLimitRuleDesired[];
   /** Order is not significant: Cloudflare stops at the first matching redirect and there is only one. */
   redirectRules: RedirectRuleDesired[];
+  /** Order is not significant: the rule is host-scoped and identified by description. */
+  requestHeaderRules: RequestHeaderRuleDesired[];
   /** Order is not significant: matched by expression, like cache rules. */
   responseHeaderRules: ResponseHeaderRuleDesired[];
+  /** Order is not significant: each rule is scoped to its own host. */
+  compressionRules: CompressionRuleDesired[];
   ssl: SslDesired;
 }
 
@@ -435,12 +556,12 @@ export const BACKEND_BOARD_RENDER_CACHE_EXPRESSION = `(http.host eq "${WS_HOSTNA
  *
  * The empty string is en-US, which is served UNPREFIXED (see `detectLocale` in
  * packages/web/app/lib/i18n/detect-locale.ts — it skips DEFAULT_LOCALE). The
- * other three are real path prefixes, and the middleware strips them before it
+ * others are real path prefixes, and the middleware strips them before it
  * decides whether to decorate the response, so `/es/kilter/…/list` gets the
  * same CDN-Cache-Control as `/kilter/…/list`. Cloudflare has no way to strip a
  * prefix, so the prefixes are enumerated here instead.
  */
-export const WWW_HTML_CACHE_LOCALE_PREFIXES = ['', '/es', '/fr', '/de'] as const;
+export const WWW_HTML_CACHE_LOCALE_PREFIXES = ['', '/es', '/fr', '/de', '/it', '/zh-CN'] as const;
 
 /**
  * The first path segment of every page tree that renders a board list or climb
@@ -505,6 +626,33 @@ export const SETTER_PATH_SEGMENT = '/setter/';
 export const SESSION_COOKIE_NAME_SUBSTRING = 'next-auth.session-token';
 
 /**
+ * The www auth and token endpoints: `/api/auth/*` (session read, csrf, login,
+ * sign-out) and `/api/internal/ws-auth` (the 15-minute browser token, #7596).
+ * Every answer is per browser (200 with a session or a token, 401, 503), so
+ * none may ever enter a shared cache. No cache rule's path list reaches them
+ * today; the www HTML rule also excludes all of `/api/` by name, so a later
+ * path prefix cannot bring them in by accident.
+ */
+export const WWW_API_PATH_PREFIX = '/api/';
+
+/**
+ * The substrings of the first-party session cookies a signed-in browser holds
+ * under `AUTH_BROWSER_SESSION_MODE=better-auth` (#7596): the login cookie and
+ * the bridged cookie, each written as `__Secure-<name>` in production and as
+ * the bare name outside a secure context
+ * (`packages/shared/auth-protocol/src/browser-session-cookie.ts`). Neither is
+ * a substring of the other, so both are listed. A browser keeps one of these
+ * for 400 days while its legacy cookie ends 30 days after its last write, so
+ * without them a signed-in browser would read as anonymous here. No browser
+ * sends either name before the first cutover, so until then the clauses
+ * change nothing.
+ */
+export const FIRST_PARTY_SESSION_COOKIE_NAME_SUBSTRINGS = Object.freeze([
+  'boardsesh.session_token',
+  'boardsesh.bridged_session_token',
+] as const);
+
+/**
  * Next's React Server Component request header, lowercased (Cloudflare
  * lowercases the keys of `http.request.headers`).
  *
@@ -531,6 +679,27 @@ export const RSC_REQUEST_HEADER_NAME = 'rsc';
 
 /** The query parameter Next appends to RSC fetches, and the target of that 307. */
 export const RSC_QUERY_PARAM = '_rsc';
+
+/**
+ * A spray wall's share-link capability, as it appears in a query string
+ * (`/b/{slug}/…?wall=<uuid>`). The origin already answers such a request with
+ * `CDN-Cache-Control: no-store` (packages/web/middleware.ts), and gate 5 below
+ * would defer to that. The edge bypasses it by expression as well, so a later
+ * origin change cannot put an unlisted wall's page, or the 404 it answers after
+ * a hide or a switch to private, into the edge for a day. `contains` can also
+ * match an unrelated param ending in `wall`; bypassing that is harmless.
+ */
+export const SPRAY_WALL_CAPABILITY_QUERY = 'wall=';
+
+/**
+ * A home board's share link (`/b/{slug}?invite=<token>`, and the list page that
+ * hands it to that hop). The token lets whoever holds it join, so no edge
+ * may hold a response keyed on one, and a reset has to take effect on the next
+ * request. The origin already answers with `no-store`; this is the same second
+ * lock the wall link has. `contains` also matches `uninvite=` and friends;
+ * bypassing those is harmless.
+ */
+export const BOARD_INVITE_QUERY = 'invite=';
 
 /** Every `{locale}{root}` path prefix the middleware decorates, as Cloudflare sees it. */
 export function buildWwwHtmlCachePathPrefixes(): string[] {
@@ -564,7 +733,8 @@ export function buildWwwHtmlCachePathPrefixes(): string[] {
  *    Cloudflare cannot strip. Enumerated rather than loosened so a future www
  *    route that happens to end in `/list` and sets its own public max-age
  *    cannot inherit this rule.
- * 4. Bypasses — session cookie, RSC header, `?_rsc`. See the constants above.
+ * 4. Bypasses — session cookie, RSC header, `?_rsc`, a spray wall's `?wall=`,
+ *    a home board's `?invite=`. See the constants above.
  *    `Vary` is not a substitute for any of them: Cloudflare ignores it except
  *    for Accept-Encoding.
  * 5. `edge_ttl: bypass_by_default` on the rule itself, which is the real
@@ -586,9 +756,24 @@ export const WWW_HTML_CACHE_EXPRESSION =
   ` and (${buildWwwHtmlCachePathPrefixes()
     .map((pathPrefix) => `starts_with(http.request.uri.path, "${pathPrefix}")`)
     .join(' or ')})` +
+  ` and not starts_with(http.request.uri.path, "${WWW_API_PATH_PREFIX}")` +
   ` and not (http.cookie contains "${SESSION_COOKIE_NAME_SUBSTRING}")` +
+  FIRST_PARTY_SESSION_COOKIE_NAME_SUBSTRINGS.map((name) => ` and not (http.cookie contains "${name}")`).join('') +
   ` and not (any(http.request.headers["${RSC_REQUEST_HEADER_NAME}"][*] != ""))` +
-  ` and not (http.request.uri.query contains "${RSC_QUERY_PARAM}"))`;
+  ` and not (http.request.uri.query contains "${RSC_QUERY_PARAM}")` +
+  ` and not (http.request.uri.query contains "${SPRAY_WALL_CAPABILITY_QUERY}")` +
+  ` and not (http.request.uri.query contains "${BOARD_INVITE_QUERY}"))`;
+
+/** Exact public documents; no locale aliases, queries, credentials or router requests. */
+export const WWW_MARKETING_HTML_CACHE_EXPRESSION =
+  `(http.host eq "${WWW_HOSTNAME}"` +
+  ` and http.request.method in {"GET" "HEAD"}` +
+  ` and http.request.uri.path in {${MARKETING_CACHE_PATHS.map((pathname) => `"${pathname}"`).join(' ')}}` +
+  ` and http.request.uri.query eq ""` +
+  ` and not (any(http.request.headers["authorization"][*] != ""))` +
+  MARKETING_ROUTER_HEADERS.map((header) => ` and not (any(http.request.headers["${header}"][*] != ""))`).join('') +
+  MARKETING_SESSION_COOKIE_SUBSTRINGS.map((name) => ` and not (http.cookie contains "${name}")`).join('') +
+  ` and not (http.request.uri.path eq "/" and http.cookie contains "${MARKETING_LOCALE_COOKIE}"))`;
 
 /**
  * The allow list lives in crawler-policy.ts beside the block list, so the
@@ -680,6 +865,27 @@ export const CRAWLER_ALLOW_EXPRESSION = `(http.request.method eq "GET" and (${bu
 export const CRAWLER_BLOCK_EXPRESSION = buildUserAgentExpression(CRAWLER_BLOCK_TOKENS);
 
 /**
+ * Bot Preference Sync's training rule catches PerplexityBot even while Search
+ * is allowed. Exempt only these public rollout documents from the bot phase;
+ * API, auth, climb-view and write traffic retain every existing protection.
+ * This must run before the general crawler allow rule skips the custom phase.
+ */
+export const PERPLEXITY_PUBLIC_GUIDE_PATHS = [
+  '/',
+  '/boards',
+  '/apps',
+  '/apps/kilter',
+  '/apps/aurora',
+  '/apps/moonboard',
+  '/apps/woods',
+  '/compare/spray-wall-apps',
+  '/sitemap.xml',
+  '/sitemaps/app-guides.xml',
+  '/robots.txt',
+] as const;
+export const PERPLEXITY_PUBLIC_GUIDES_EXPRESSION = `(http.request.method eq "GET" and http.host eq "${WWW_HOSTNAME}" and lower(http.user_agent) contains "perplexitybot" and http.request.uri.path in {${PERPLEXITY_PUBLIC_GUIDE_PATHS.map((path) => `"${path}"`).join(' ')}})`;
+
+/**
  * Default-deny for self-identified automation: a GET whose UA carries a
  * generic signature (`bot`, `crawler`, `curl/` … see AUTOMATION_SIGNATURE_TOKENS
  * in crawler-policy.ts) is blocked unless the agent is on CRAWLER_ALLOW_TOKENS.
@@ -703,8 +909,8 @@ export const CRAWLER_BLOCK_EXPRESSION = buildUserAgentExpression(CRAWLER_BLOCK_T
  * - Browser strings are untouched: real climbers arrive as `Mozilla/…`, and a
  *   `Mozilla/…` string only matches when it names itself (`compatible;
  *   Googlebot/2.1`).
- * - Health, `/.well-known/` and the two API surfaces are exempt — see
- *   AUTOMATION_DEFAULT_DENY_EXEMPT_PATHS in crawler-policy.ts.
+ * - Health, `/.well-known/`, the API surfaces and the partner OAuth pages are
+ *   exempt — see AUTOMATION_DEFAULT_DENY_EXEMPT_PATHS in crawler-policy.ts.
  *
  * Registered between the allow rule and the challenge, which must stay last.
  */
@@ -871,12 +1077,13 @@ export const ASSETS_CACHE_RULE_DESCRIPTION = 'boardsesh:assets-edge-cache (manag
  * move is for. The publisher's `cf-cache-status` and `cache-control` assertions
  * then mean the same thing on both hosts.
  *
- * The `/static/v1/` literal is repeated rather than imported: infra/cloudflare
+ * Next's hashed build assets are retained alongside catalogued public assets.
+ * The path literals are repeated rather than imported: infra/cloudflare
  * has no workspace dependencies, by design.
  */
 export const ASSETS_CACHE_EXPRESSION =
   `((http.host eq "${ASSETS_HOSTNAME}" or http.host eq "${ASSETS_STAGING_HOSTNAME}") ` +
-  `and starts_with(http.request.uri.path, "/static/v1/"))`;
+  `and (starts_with(http.request.uri.path, "/static/v1/") or starts_with(http.request.uri.path, "/_next/static/")))`;
 
 export const ASSETS_CORS_HEADER_RULE_DESCRIPTION =
   'boardsesh:assets-cors-header (managed by scripts/cloudflare-apply.ts)';
@@ -885,10 +1092,8 @@ export const ASSETS_CORS_HEADER_RULE_DESCRIPTION =
  * Both hostnames, so the rule is already live and proven on staging before
  * `assets.boardsesh.com` ever resolves to R2.
  *
- * Harmless on `assets.boardsesh.com` today: that record is grey-clouded, so its
- * traffic never reaches Cloudflare's proxy and the rule simply does not match.
- * It starts applying at the moment of the flip, which is exactly when it is
- * needed.
+ * The response-header rule applies on both public domains independently of
+ * whether the request includes Origin, keeping cached CORS responses safe.
  */
 export const ASSETS_CORS_HEADER_EXPRESSION = `(http.host eq "${ASSETS_HOSTNAME}" or http.host eq "${ASSETS_STAGING_HOSTNAME}")`;
 
@@ -899,6 +1104,37 @@ export const SNAPSHOTS_CACHE_EXPRESSION =
 export const SNAPSHOTS_CORS_HEADER_RULE_DESCRIPTION =
   'boardsesh:snapshots-cors-header (managed by scripts/cloudflare-apply.ts)';
 export const SNAPSHOTS_CORS_HEADER_EXPRESSION = `http.host eq "${SNAPSHOTS_HOSTNAME}"`;
+
+/**
+ * Public R2 custom domain for OTA update assets.
+ *
+ * xprem answers each asset request on `updates.boardsesh.com` with a redirect
+ * here once its `CDN_BASE_URL` points at this host (infra/railway). Objects are
+ * immutable and named by the SHA-256 of their content (`{appId}/cas/<hash>`),
+ * so a cached copy can never go stale and nothing ever needs purging.
+ */
+export const OTA_ASSETS_HOSTNAME = 'ota-assets.boardsesh.com';
+
+export const OTA_ASSETS_CACHE_RULE_DESCRIPTION =
+  'boardsesh:ota-assets-edge-cache (managed by scripts/cloudflare-apply.ts)';
+/**
+ * The whole host, because `cas/<hash>` keys have no file extension and
+ * Cloudflare only caches a fixed extension list by default.
+ */
+export const OTA_ASSETS_CACHE_EXPRESSION = `http.host eq "${OTA_ASSETS_HOSTNAME}"`;
+export const OTA_ASSETS_COMPRESSION_RULE_DESCRIPTION =
+  'boardsesh:ota-assets-compression (managed by scripts/cloudflare-apply.ts)';
+export const OTA_ASSETS_COMPRESSION_EXPRESSION = `http.host eq "${OTA_ASSETS_HOSTNAME}"`;
+
+export const OBSERVE_COUNTRY_HEADER_RULE_DESCRIPTION =
+  'boardsesh:observe-country-header (managed by scripts/cloudflare-apply.ts)';
+export const OBSERVE_COUNTRY_HEADER_EXPRESSION = `http.host eq "${UPDATES_HOSTNAME}"`;
+export const OBSERVE_COUNTRY_HEADER_NAME = 'X-Geo-Country';
+
+/** Quebec detection: one coarse province header, no city or coordinates. */
+export const CONSENT_REGION_HEADER_RULE_DESCRIPTION =
+  'boardsesh:consent-region-header (managed by scripts/cloudflare-apply.ts)';
+export const CONSENT_REGION_HEADER_EXPRESSION = `http.host eq "${WS_HOSTNAME}" and http.request.uri.path eq "/graphql" and ip.src.country eq "CA"`;
 
 /**
  * CORS for public, immutable objects fetched directly by clients.
@@ -935,6 +1171,57 @@ export interface R2Cors {
   maxAgeSeconds: number;
 }
 
+/** Keep foreign lifecycle transitions intact when updating our one managed rule. */
+export interface R2LifecycleRule {
+  id: string;
+  enabled: boolean;
+  conditions: { prefix: string };
+  deleteObjectsTransition?: { condition?: { type: string; maxAge?: number; date?: string } };
+  [property: string]: unknown;
+}
+
+export const USER_EXPORT_LIFECYCLE_RULE: R2LifecycleRule = {
+  id: 'boardsesh-user-data-exports-14d',
+  enabled: true,
+  conditions: { prefix: 'user-data-exports/' },
+  deleteObjectsTransition: { condition: { type: 'Age', maxAge: 14 * 24 * 60 * 60 } },
+};
+
+/**
+ * Every publish stores one Hermes source map per platform (44 MB for iOS on
+ * 2026-10-10), previews included, so without a rule the bucket only grows.
+ * xprem keeps each map and its index under `sourcemaps/{appId}/`, with no
+ * branch in the key, so the rule cannot spare production maps.
+ *
+ * The clock runs from the day a map was uploaded, not from the error. So this
+ * is a trade: an update still running 35 days after it was published (the last
+ * OTA of an old binary) gets raw stack traces for any error xprem has not
+ * already symbolicated. Errors grouped before then keep their trace, which is
+ * stored in ClickHouse. Lengthen the window if that tail matters more than the
+ * storage; nothing expires until 35 days after source maps are switched on.
+ */
+export const OTA_SOURCEMAP_LIFECYCLE_RULE: R2LifecycleRule = {
+  id: 'boardsesh-ota-sourcemaps-35d',
+  enabled: true,
+  conditions: { prefix: 'sourcemaps/' },
+  deleteObjectsTransition: { condition: { type: 'Age', maxAge: 35 * 24 * 60 * 60 } },
+};
+
+/** Only routine backups expire. rehearsal/ and cutover/ stay until explicit retirement. */
+export const OTA_BACKUP_LIFECYCLE_RULE: R2LifecycleRule = {
+  id: 'boardsesh-ota-scheduled-backups-14d',
+  enabled: true,
+  conditions: { prefix: 'scheduled/' },
+  deleteObjectsTransition: { condition: { type: 'Age', maxAge: 14 * 24 * 60 * 60 } },
+};
+
+export const STORE_CREATIVES_CANDIDATE_LIFECYCLE_RULE: R2LifecycleRule = {
+  id: 'boardsesh-store-creatives-candidates-30d',
+  enabled: true,
+  conditions: { prefix: 'candidates/' },
+  deleteObjectsTransition: { condition: { type: 'Age', maxAge: 30 * 24 * 60 * 60 } },
+};
+
 export interface R2BucketDesired {
   name: string;
   /** Hostname serving this bucket publicly, or null when it must stay unreachable. */
@@ -947,6 +1234,8 @@ export interface R2BucketDesired {
    * rather than silently cleared.
    */
   cors?: R2Cors;
+  /** Only this rule ID is managed; all other lifecycle rules remain untouched. */
+  lifecycleRule?: R2LifecycleRule;
   /**
    * Cloudflare location hint, applied only at creation time and immutable
    * afterwards. Omitted lets Cloudflare choose on first write.
@@ -955,58 +1244,82 @@ export interface R2BucketDesired {
 }
 
 export const desiredR2Buckets: readonly R2BucketDesired[] = [
+  // Database copies contain sealed signing keys and device telemetry. Never public.
+  {
+    name: 'boardsesh-ota-backups',
+    customDomain: null,
+    r2DevDomainEnabled: false,
+    locationHint: 'oc',
+    lifecycleRule: OTA_BACKUP_LIFECYCLE_RULE,
+  },
+  // Public review media; approved creatives and reviewed physical footage never expire.
+  {
+    name: 'boardsesh-store-creatives',
+    customDomain: 'store-creatives.boardsesh.com',
+    r2DevDomainEnabled: false,
+    lifecycleRule: STORE_CREATIVES_CANDIDATE_LIFECYCLE_RULE,
+  },
   // Avatars, gym images, beta-link thumbnails and every resize variant.
   { name: 'boardsesh-user-media', customDomain: MEDIA_HOSTNAME, r2DevDomainEnabled: false },
   // User data exports and MoonBoard OCR submissions. MUST stay domain-less.
-  { name: 'boardsesh-user-private', customDomain: null, r2DevDomainEnabled: false },
+  {
+    name: 'boardsesh-user-private',
+    customDomain: null,
+    r2DevDomainEnabled: false,
+    lifecycleRule: USER_EXPORT_LIFECYCLE_RULE,
+  },
   // Repo-owned board art, icons and brand marks — the catalogue behind
   // assets.boardsesh.com, moving off Tigris (which serves it HTTP/1.1 from a
   // single region, measured 614 ms TTFB and 4.62 s for 24 images from Sydney,
   // with no edge cache because a Tigris custom domain cannot be proxied).
   //
-  // Still pointed at the staging hostname: this entry creates the bucket and
-  // lets the publisher prove it. `assets.boardsesh.com` moves in a separate
-  // change, after that dry run passes. See docs/static-assets.md.
+  // Attach the live hostname only after the complete historical inventory
+  // passes staging verification and Production Deploy is frozen and drained.
+  // Keep the staging domain for verification. See docs/operations/static-assets.md.
   {
     name: 'boardsesh-static-assets',
-    customDomain: ASSETS_STAGING_HOSTNAME,
+    customDomain: ASSETS_HOSTNAME,
     r2DevDomainEnabled: false,
     cors: PUBLIC_READ_CORS,
   },
   // Mobile bootstrap databases and manifests. Readers stay on Tigris until a
-  // complete R2 export has passed the migration checks in docs/board-snapshots.md.
+  // complete R2 export has passed the migration checks in docs/data/board-snapshots.md.
   {
     name: 'boardsesh-board-snapshots',
     customDomain: SNAPSHOTS_HOSTNAME,
     r2DevDomainEnabled: false,
     cors: PUBLIC_READ_CORS,
   },
-  // XPRem owns object access for OTA updates. The bucket must stay private;
-  // updates.boardsesh.com is the application endpoint, not an object domain.
-  { name: 'boardsesh-ota-v3', customDomain: null, r2DevDomainEnabled: false },
+  // OTA update assets. Public by URL: an object is reachable by anyone who
+  // holds its content hash, which covers production and `pr-*` preview bundles
+  // alike. The JS is the compiled form of this public repository, so the URL
+  // being the only capability is acceptable. xprem still owns every write, and
+  // updates.boardsesh.com stays the endpoint clients are built against.
+  // No CORS: only the native expo-updates client reads these.
+  { name: 'boardsesh-ota-v3', customDomain: OTA_ASSETS_HOSTNAME, r2DevDomainEnabled: false },
+  // Hermes source maps for OTA updates, written by xprem at publish once
+  // UPLOAD_SOURCEMAPS is on. MUST stay domain-less: a map embeds the app's
+  // source with its comments, and xprem refuses to keep maps in a bucket its
+  // CDN_BASE_URL fronts, which is why they cannot share boardsesh-ota-v3.
+  {
+    name: 'boardsesh-ota-sourcemaps',
+    customDomain: null,
+    r2DevDomainEnabled: false,
+    lifecycleRule: OTA_SOURCEMAP_LIFECYCLE_RULE,
+  },
 ];
 
 export const desiredCloudflareState: CloudflareDesiredState = {
   zoneName: ZONE_NAME,
   dnsRecords: [
+    ...otaDnsRecords(OTA_HOSTING_PROVIDER),
     {
       management: 'proxied-only',
       name: WS_HOSTNAME,
       proxied: true,
     },
-    {
-      management: 'full',
-      name: ASSETS_HOSTNAME,
-      type: 'CNAME',
-      content: ASSETS_CNAME_TARGET,
-      ttl: 1,
-      proxied: false,
-      settings: {
-        flatten_cname: false,
-      },
-    },
     // The DR standby's route to the production primary. Fully managed and
-    // created when absent, exactly like assets above.
+    // created when absent.
     //
     // `proxied: false` is load-bearing and not a preference: this carries the
     // PostgreSQL wire protocol on a high port, and Cloudflare's proxy handles
@@ -1035,12 +1348,33 @@ export const desiredCloudflareState: CloudflareDesiredState = {
     // has nothing behind it. No `settings`: Cloudflare always flattens a
     // proxied CNAME, so flatten_cname is not a field this record can own (see
     // FullyManagedDnsRecordDesired.settings). See the "Flipping www to a new
-    // origin" section of docs/cloudflare.md for the full mechanics and rollback.
+    // origin" section of docs/operations/cloudflare.md for the full mechanics and rollback.
     {
       management: 'full',
       name: WWW_HOSTNAME,
       type: 'CNAME',
       content: WWW_RAILWAY_CNAME_TARGET,
+      ttl: 1,
+      proxied: true,
+    },
+    // Railway's ownership proof for the partner API host. Listed before the
+    // CNAME so one apply creates the proof first.
+    {
+      management: 'full',
+      name: API_RAILWAY_VERIFY_HOSTNAME,
+      type: 'TXT',
+      content: API_RAILWAY_VERIFY_VALUE,
+      ttl: 1,
+      proxied: false,
+    },
+    // The partner API host (#6981) points at the backend service. Proxied, so
+    // Cloudflare terminates TLS and the backend sees CF-Connecting-IP. No
+    // `settings`, for the same reason as www above.
+    {
+      management: 'full',
+      name: API_HOSTNAME,
+      type: 'CNAME',
+      content: API_RAILWAY_CNAME_TARGET,
       ttl: 1,
       proxied: true,
     },
@@ -1123,6 +1457,9 @@ export const desiredCloudflareState: CloudflareDesiredState = {
         // 307) reaches the edge with NO CDN-Cache-Control and so bypasses on
         // its own. `override_origin` would be the dangerous setting here: it
         // ignores the origin AND strips Set-Cookie in order to cache.
+        // A 4xx or 5xx also bypasses: the origin rewrites the middleware's
+        // CDN-Cache-Control to `no-store` on any error response
+        // (packages/web/app/lib/error-response-cdn-cache.server.ts).
         edge_ttl: { mode: 'bypass_by_default' },
         browser_ttl: { mode: 'respect_origin' },
       },
@@ -1160,9 +1497,42 @@ export const desiredCloudflareState: CloudflareDesiredState = {
       },
       enabled: true,
     },
+    {
+      description: OTA_ASSETS_CACHE_RULE_DESCRIPTION,
+      expression: OTA_ASSETS_CACHE_EXPRESSION,
+      action: 'set_cache_settings',
+      action_parameters: {
+        cache: true,
+        // xprem uploads `cas/` objects with `Cache-Control: max-age=31556926`,
+        // so honouring the origin gives a one-year edge TTL, and a 404 for a
+        // key that does not exist yet is never cached.
+        edge_ttl: { mode: 'bypass_by_default' },
+        browser_ttl: { mode: 'respect_origin' },
+      },
+      enabled: true,
+    },
+    {
+      description: WWW_MARKETING_HTML_CACHE_RULE_DESCRIPTION,
+      expression: WWW_MARKETING_HTML_CACHE_EXPRESSION,
+      action: 'set_cache_settings',
+      action_parameters: {
+        cache: true,
+        edge_ttl: { mode: 'bypass_by_default' },
+        browser_ttl: { mode: 'respect_origin' },
+      },
+      enabled: true,
+    },
   ],
   wafRules: [
-    // MUST stay first — see the ordering contract on CloudflareDesiredState.wafRules.
+    // MUST precede the general allow rule, which skips the remaining custom rules.
+    {
+      description: PERPLEXITY_PUBLIC_GUIDES_RULE_DESCRIPTION,
+      expression: PERPLEXITY_PUBLIC_GUIDES_EXPRESSION,
+      action: 'skip',
+      action_parameters: { phases: ['http_request_sbfm'] },
+      enabled: true,
+    },
+    // MUST precede every block rule — see CloudflareDesiredState.wafRules.
     {
       description: CRAWLER_ALLOW_RULE_DESCRIPTION,
       expression: CRAWLER_ALLOW_EXPRESSION,
@@ -1240,6 +1610,32 @@ export const desiredCloudflareState: CloudflareDesiredState = {
       enabled: true,
     },
   ],
+  requestHeaderRules: [
+    {
+      description: CONSENT_REGION_HEADER_RULE_DESCRIPTION,
+      expression: CONSENT_REGION_HEADER_EXPRESSION,
+      action: 'rewrite',
+      action_parameters: {
+        headers: {
+          // Cloudflare removes the header when the expression is empty/undefined.
+          // This overwrites or removes caller input on every Canadian GraphQL request.
+          [CONSENT_REGION_EDGE_HEADER_NAME]: { operation: 'set', expression: 'ip.src.region_code' },
+        },
+      },
+      enabled: true,
+    },
+    {
+      description: OBSERVE_COUNTRY_HEADER_RULE_DESCRIPTION,
+      expression: OBSERVE_COUNTRY_HEADER_EXPRESSION,
+      action: 'rewrite',
+      action_parameters: {
+        headers: {
+          [OBSERVE_COUNTRY_HEADER_NAME]: { operation: 'set', expression: 'ip.src.country' },
+        },
+      },
+      enabled: true,
+    },
+  ],
   responseHeaderRules: [
     {
       description: ASSETS_CORS_HEADER_RULE_DESCRIPTION,
@@ -1260,6 +1656,19 @@ export const desiredCloudflareState: CloudflareDesiredState = {
         headers: {
           'access-control-allow-origin': { operation: 'set', value: '*' },
         },
+      },
+      enabled: true,
+    },
+  ],
+  compressionRules: [
+    {
+      description: OTA_ASSETS_COMPRESSION_RULE_DESCRIPTION,
+      expression: OTA_ASSETS_COMPRESSION_EXPRESSION,
+      action: 'compress_response',
+      action_parameters: {
+        // Both native clients advertise Brotli (URLSession on iOS, OkHttp's
+        // Brotli interceptor on Android); gzip is the fallback.
+        algorithms: [{ name: 'brotli' }, { name: 'gzip' }],
       },
       enabled: true,
     },

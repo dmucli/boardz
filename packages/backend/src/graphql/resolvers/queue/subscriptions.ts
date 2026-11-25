@@ -1,6 +1,9 @@
+import { redactQueueEvent, redactQueueState } from '../../../services/privacy-queue-events';
+import { canAccessResource } from '../../../services/privacy';
 import type { ConnectionContext, QueueEvent } from '@boardsesh/shared-schema';
 import { roomManager } from '../../../services/room-manager';
 import { pubsub } from '../../../pubsub/index';
+import { movesSessionWall } from '../../../services/session-wall-refresh';
 import { requireSessionMember } from '../shared/helpers';
 import { createEagerAsyncIterator } from '../shared/async-iterators';
 import { withSubscriptionCleanup } from '../shared/managed-subscription';
@@ -29,8 +32,24 @@ export const queueSubscriptions = {
       // NOTE: We await here to ensure Redis subscription is established
       // before proceeding - this is critical for multi-instance sync.
       const asyncIterator = await lifetime.own(
-        createEagerAsyncIterator<QueueEvent>((push) => {
-          return pubsub.subscribeQueue(sessionId, push);
+        // `null` asks for a fresh FullSync.
+        createEagerAsyncIterator<QueueEvent | null>(async (push) => {
+          const unsubscribeSession = await pubsub.subscribeSession(sessionId, (event) => {
+            // Attribution depends on the current wall even when both walls are
+            // public, so a wall move re-sends the redacted queue as a FullSync.
+            // An angle change keeps the wall and needs no FullSync.
+            if (movesSessionWall(event)) push(null);
+          });
+          try {
+            const unsubscribeQueue = await pubsub.subscribeQueue(sessionId, push);
+            return () => {
+              unsubscribeQueue();
+              unsubscribeSession();
+            };
+          } catch (error) {
+            unsubscribeSession();
+            throw error;
+          }
         }, `queueUpdates:${sessionId}`),
       );
 
@@ -38,12 +57,13 @@ export const queueSubscriptions = {
       const queueState = await roomManager.getQueueState(sessionId);
       const fullSyncSequence = queueState.sequence;
 
+      if (!(await canAccessResource('session', sessionId, ctx.userId))) return;
       // Send initial FullSync
       yield {
         queueUpdates: {
           __typename: 'FullSync',
           sequence: fullSyncSequence,
-          state: queueState,
+          state: await redactQueueState(queueState, ctx.userId, sessionId),
         } as QueueEvent,
       };
 
@@ -59,8 +79,20 @@ export const queueSubscriptions = {
       // mutation. Always forward it so peers receive playback updates issued
       // immediately after subscribing.
       for await (const event of asyncIterator) {
+        if (!(await canAccessResource('session', sessionId, ctx.userId))) return;
+        if (event === null) {
+          const freshState = await roomManager.getQueueState(sessionId);
+          yield {
+            queueUpdates: {
+              __typename: 'FullSync' as const,
+              sequence: freshState.sequence,
+              state: await redactQueueState(freshState, ctx.userId, sessionId),
+            },
+          };
+          continue;
+        }
         if (event.__typename === 'PlaybackStateChanged' || event.sequence > fullSyncSequence) {
-          yield { queueUpdates: event };
+          yield { queueUpdates: await redactQueueEvent(event, ctx.userId, sessionId) };
         }
       }
     }),

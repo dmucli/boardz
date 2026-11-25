@@ -1,0 +1,1 @@
+ALTER TABLE "user_profiles" ADD COLUMN "anonymous_on_foreign_boards" boolean DEFAULT false NOT NULL;

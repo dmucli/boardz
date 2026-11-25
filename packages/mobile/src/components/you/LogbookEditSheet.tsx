@@ -1,35 +1,44 @@
-import { type RefObject, useCallback, useEffect, useMemo, useState } from 'react';
+import { ContentAudienceControl } from '../privacy/ContentAudienceControl';
+import { type RefObject, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { View, StyleSheet } from 'react-native';
-import { type BottomSheet } from '@expo/ui/community/bottom-sheet';
+import { type BottomSheet } from '../sheet-presentation';
 import { useTranslation } from 'react-i18next';
 import { useUpdateTick, useDeleteTick } from '@boardsesh/board-react';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { formatBoardDisplayName } from '@boardsesh/board-config';
 import { useBoardAngleOptions } from '../../hooks/use-board-angle-options';
-import { getGradeColor } from '@boardsesh/board-constants/grade-colors';
 import type { BoardName } from '@boardsesh/shared-schema';
 import { track } from '../../lib/analytics';
-import type { AscentFeedItem, UpdateTickInput } from '@boardsesh/graphql/operations';
+import type { AscentFeedItem, UpdateTickInput, TickBoardOption } from '@boardsesh/graphql/operations';
 import { Text } from '../Text';
+import { getGradeColor } from '@boardsesh/board-constants/grade-colors';
+import { Icon } from '../Icon';
+import { PressableSurface } from '../PressableSurface';
+import { TickBoardPicker } from './TickBoardPicker';
 import { Sheet } from '../Sheet';
+import { SheetTopBar } from '../SheetTopBar';
 import { StarRating } from '../StarRating';
 import { SegmentedControl } from '../SegmentedControl';
 import { GradeSingleSelectRail } from '../grade';
-import { AngleSlider } from '../play-drawer/AngleSlider';
 import {
   EDIT_TICK_SNAP_POINTS,
   TICK_ANGLE_ROW_HEIGHT,
   TICK_RAIL_ROW_HEIGHT,
   TICK_RAIL_TRAIL_INSET,
-  TickActionBar,
+  TickAngleControl,
   TickCountRail,
   TickDateRow,
   TickDestructiveRow,
   TickFormRow,
   TickNoteField,
-  TickSheetHeader,
+  shouldShowAngleRow,
 } from '../tick';
-import { clampToNow, toEditableDate, MAXIMUM_CLIMBED_AT_REFRESH_MS } from '../logbook/climbed-at';
+import {
+  clampToNow,
+  selectedTickReportingTime,
+  toEditableDate,
+  MAXIMUM_CLIMBED_AT_REFRESH_MS,
+} from '../logbook/climbed-at';
 import { useGrades } from '../../lib/graphql/hooks';
 import { hapticSuccess, hapticError } from '../../lib/haptics';
 import { spacing } from '../../theme/tokens';
@@ -49,8 +58,8 @@ type LogbookEditSheetProps = {
  * Edit (status / grade / angle / stars / tries / note) or delete a logged ascent.
  *
  * Shares its whole chassis with the create sheet (LogAscentSheet/QuickTickBar):
- * the same `TickSheetHeader`, the same `TickFormRow` beat and two vertical seams,
- * the same chips, stars and pinned `TickActionBar`. Row labels come from the
+ * the same `TickFormRow` beat and two vertical seams, the same chips and stars.
+ * Cancel and Save sit in a `SheetTopBar` (the create sheet keeps its bottom bar). Row labels come from the
  * shared `mobile.tick.*` family in `climbs` for the same reason — a climber who
  * logs a send and then edits it should not see the form redrawn.
  */
@@ -71,17 +80,20 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
   const gradesQuery = useGrades(ascent?.boardType ?? '', !!ascent);
   const grades = gradesQuery.data ?? [];
 
+  const [boardPickerOpen, setBoardPickerOpen] = useState(false);
+  const [selectedBoard, setSelectedBoard] = useState<TickBoardOption | null | undefined>(undefined);
   const [status, setStatus] = useState<TickStatus>('send');
   const [difficulty, setDifficulty] = useState<number | null>(null);
   const [quality, setQuality] = useState<number | undefined>(undefined);
   const [attemptCount, setAttemptCount] = useState(1);
   const [climbedAt, setClimbedAt] = useState(() => new Date());
   const [hasClimbedAtChanged, setHasClimbedAtChanged] = useState(false);
+  const hasPickedTimeRef = useRef(false);
   const [maximumClimbedAtDate, setMaximumClimbedAtDate] = useState(() => new Date());
   const [comment, setComment] = useState('');
   const [angle, setAngle] = useState(0);
-  // A failed save or delete prints here, in the action bar's always-reserved
-  // slot, instead of a toast the sheet itself covers.
+  // A failed save or delete prints here, in the top bar's always-reserved
+  // error slot, instead of a toast the sheet itself covers.
   const [lastError, setLastError] = useState<string | null>(null);
 
   // Valid angles come from the static per-board table (what web and the
@@ -92,12 +104,15 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
   // Re-seed the form whenever a different ascent opens the sheet.
   useEffect(() => {
     if (!ascent) return;
+    setBoardPickerOpen(false);
+    setSelectedBoard(undefined);
     setStatus(ascent.status);
     setDifficulty(ascent.difficulty);
     setQuality(ascent.quality ?? undefined);
     setAttemptCount(Math.max(1, ascent.attemptCount));
     setClimbedAt(toEditableDate(ascent.climbedAt));
     setHasClimbedAtChanged(false);
+    hasPickedTimeRef.current = false;
     setComment(ascent.comment ?? '');
     setAngle(ascent.angle);
     setLastError(null);
@@ -123,7 +138,8 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
     setStatus(nextStatus);
   }, []);
 
-  const handleClimbedAtChange = useCallback((next: Date) => {
+  const handleClimbedAtChange = useCallback((next: Date, editedPart: 'date' | 'time') => {
+    if (editedPart === 'time') hasPickedTimeRef.current = true;
     setHasClimbedAtChanged(true);
     setClimbedAt(next);
   }, []);
@@ -140,9 +156,9 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
     sheetRef.current?.close();
   }, [sheetRef]);
 
-  // The grade the header's identity bar paints from: what the climber has picked
-  // right now, falling back to the grade the ascent was logged at while the
-  // board's grade list is still loading.
+  // The header's grade stripe paints from what the climber has picked right now,
+  // falling back to the grade the ascent was logged at while the board's grade
+  // list is still loading.
   const selectedGradeName = useMemo(
     () => grades.find((grade) => grade.difficultyId === difficulty)?.name,
     [grades, difficulty],
@@ -160,8 +176,11 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
       comment,
       angle,
     };
+    if (selectedBoard !== undefined) input.boardUuid = selectedBoard?.uuid ?? null;
     if (hasClimbedAtChanged) {
-      input.climbedAt = clampToNow(climbedAt).toISOString();
+      const selectedDate = clampToNow(climbedAt);
+      input.climbedAt = selectedDate.toISOString();
+      input.reportingTime = selectedTickReportingTime(selectedDate, hasPickedTimeRef.current);
     }
     updateTick.mutate(
       {
@@ -190,6 +209,7 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
     hasClimbedAtChanged,
     isMutating,
     quality,
+    selectedBoard,
     sheetRef,
     status,
     t,
@@ -219,116 +239,156 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
     });
   }, [ascent, isMutating, confirm, deleteTick, sheetRef, t]);
 
+  const openBoardPicker = useCallback(() => setBoardPickerOpen(true), []);
+  const closeBoardPicker = useCallback(() => setBoardPickerOpen(false), []);
+  const chooseBoard = useCallback((board: TickBoardOption | null) => {
+    setSelectedBoard(board);
+    setBoardPickerOpen(false);
+  }, []);
+  const boardLabel = selectedBoard === undefined ? ascent?.boardDisplayName : selectedBoard?.name;
+
   const isFlash = status === 'flash';
 
   return (
     <Sheet
       ref={sheetRef}
       snapPoints={EDIT_TICK_SNAP_POINTS}
-      scrollable
-      surface="solid"
-      footerSurface="flush"
+      scrollable={!boardPickerOpen}
       // See the identical fix on the create-tick sheet (`LogAscentSheet`,
-      // #4723 / #4720): the edit sheet has the same pinned-footer-over-a-tall-
-      // form shape, so it gets the same Android content-fitting opt-in.
-      androidContentSized
+      // #4723 / #4720): the edit sheet is the same tall form, so it gets the
+      // same Android content-fitting opt-in.
+      androidContentSized={!boardPickerOpen}
       onClose={onClose}
       header={
-        <TickSheetHeader
+        <SheetTopBar
           title={ascent?.climbName ?? t('mobile.logbook.editTitle')}
           subtitle={ascent ? formatBoardDisplayName(ascent.boardType) : undefined}
-          gradeColor={getGradeColor(selectedGradeName ?? ascent?.difficultyName)}
-          onClose={handleClose}
-          closeAccessibilityLabel={tTick('mobile.tick.closeAria')}
-        />
-      }
-      footer={
-        <TickActionBar
+          accentColor={getGradeColor(selectedGradeName ?? ascent?.difficultyName) ?? null}
+          leading={{ kind: 'cancel', onPress: handleClose }}
+          trailing={
+            boardPickerOpen
+              ? undefined
+              : {
+                  kind: 'confirm',
+                  label: tTick('mobile.tick.save'),
+                  onPress: save,
+                  loading: updateTick.isPending,
+                  disabled: isMutating,
+                  prominent: true,
+                }
+          }
           error={lastError}
-          primary={{
-            title: tTick('mobile.tick.save'),
-            onPress: save,
-            loading: updateTick.isPending,
-            disabled: isMutating,
-          }}
+          reserveErrorSlot
         />
       }
     >
-      <TickFormRow label={tTick('mobile.tick.statusLabel')}>
-        <SegmentedControl
-          options={statusOptions}
-          selectedKey={status}
-          onSelect={handleStatusSelect}
-          tint={brandColors.primaryFill}
-          accessibilityLabel={tTick('mobile.tick.statusLabel')}
+      {boardPickerOpen && ascent ? (
+        <TickBoardPicker
+          tickUuid={ascent.uuid}
+          selection={selectedBoard}
+          onSelect={chooseBoard}
+          onBack={closeBoardPicker}
         />
-      </TickFormRow>
+      ) : (
+        <>
+          {ascent ? <ContentAudienceControl entityType="tick" entityId={ascent.uuid} /> : null}
+          <TickFormRow label={t('mobile.logbook.boardLabel')} disabled={isMutating}>
+            <PressableSurface
+              onPress={openBoardPicker}
+              feedback="opacity"
+              disabled={isMutating}
+              accessibilityRole="button"
+              accessibilityLabel={t('mobile.logbook.boardPickerLabel')}
+              style={styles.boardRow}
+            >
+              <Icon name="boards" size={22} color={systemColors.secondaryLabel} />
+              <Text variant="body" style={styles.boardName}>
+                {boardLabel ?? t('mobile.logbook.boardNone')}
+              </Text>
+              <Icon name="chevron.right" size={18} color={systemColors.secondaryLabel} />
+            </PressableSurface>
+          </TickFormRow>
+          <TickFormRow label={tTick('mobile.tick.statusLabel')}>
+            <SegmentedControl
+              options={statusOptions}
+              selectedKey={status}
+              onSelect={handleStatusSelect}
+              tint={brandColors.primaryFill}
+              accessibilityLabel={tTick('mobile.tick.statusLabel')}
+            />
+          </TickFormRow>
 
-      <TickFormRow label={tTick('mobile.tick.dateLabel')}>
-        <TickDateRow
-          value={climbedAt}
-          maximumDate={maximumClimbedAtDate}
-          onChange={handleClimbedAtChange}
-          onFutureAdjusted={handleFutureAdjusted}
-          dateAccessibilityLabel={tTick('mobile.tick.dateLabel')}
-          timeAccessibilityLabel={tTick('mobile.tick.timeLabel')}
-        />
-      </TickFormRow>
+          <TickFormRow label={tTick('mobile.tick.dateLabel')}>
+            <TickDateRow
+              value={climbedAt}
+              maximumDate={maximumClimbedAtDate}
+              onChange={handleClimbedAtChange}
+              onFutureAdjusted={handleFutureAdjusted}
+              dateAccessibilityLabel={tTick('mobile.tick.dateLabel')}
+              timeAccessibilityLabel={tTick('mobile.tick.timeLabel')}
+            />
+          </TickFormRow>
 
-      <TickFormRow label={tTick('mobile.tick.gradeLabel')} bleed height={TICK_RAIL_ROW_HEIGHT}>
-        <GradeSingleSelectRail
-          grades={grades}
-          selectedDifficultyId={difficulty}
-          onSelect={handleGradeSelect}
-          allowClear={false}
-          colorway="selection"
-          contentInsetLeft={0}
-          contentInsetRight={TICK_RAIL_TRAIL_INSET}
-        />
-      </TickFormRow>
+          <TickFormRow label={tTick('mobile.tick.gradeLabel')} bleed height={TICK_RAIL_ROW_HEIGHT}>
+            <GradeSingleSelectRail
+              grades={grades}
+              selectedDifficultyId={difficulty}
+              boardName={ascent?.boardType}
+              onSelect={handleGradeSelect}
+              allowClear={false}
+              colorway="selection"
+              contentInsetLeft={0}
+              contentInsetRight={TICK_RAIL_TRAIL_INSET}
+            />
+          </TickFormRow>
 
-      <TickFormRow label={tTick('mobile.tick.angleLabel')} height={TICK_ANGLE_ROW_HEIGHT}>
-        <View style={styles.angleSlider}>
-          {angles.length > 0 && <AngleSlider angles={angles} value={angle} onChange={setAngle} />}
-        </View>
-        {/* The value trails the slider instead of sitting above it as a centred
-            title3 — that readout was the same size as the sheet's own climb
-            title and gave the form a second reading axis. */}
-        <Text variant="body" color={systemColors.label} style={styles.angleValue}>
-          {angle}°
-        </Text>
-      </TickFormRow>
+          {/* Same control as the create sheet. The opening value is the angle
+          the tick was logged at, so a synced off-table angle (37°) stays
+          pickable after the climber tries another one. */}
+          {shouldShowAngleRow(ascent?.boardType, angles) ? (
+            <TickFormRow label={tTick('mobile.tick.angleLabel')} height={TICK_ANGLE_ROW_HEIGHT} testID="tick-row-angle">
+              <TickAngleControl
+                angles={angles}
+                value={angle}
+                openingValue={ascent?.angle}
+                onChange={setAngle}
+                accessibilityLabel={tTick('mobile.tick.angleLabel')}
+              />
+            </TickFormRow>
+          ) : null}
 
-      <TickFormRow label={tTick('mobile.tick.starsLabel')}>
-        <StarRating value={quality} onChange={setQuality} size={STAR_GLYPH_SIZE} />
-      </TickFormRow>
+          <TickFormRow label={tTick('mobile.tick.starsLabel')}>
+            <StarRating value={quality} onChange={setQuality} size={STAR_GLYPH_SIZE} />
+          </TickFormRow>
 
-      {/* Flash means one try. The row stays MOUNTED and dims rather than
+          {/* Flash means one try. The row stays MOUNTED and dims rather than
           unmounting ~92pt from under the climber's finger — which also makes the
           clamp visible instead of unexplained. */}
-      <TickFormRow label={tTick('mobile.tick.triesLabel')} bleed height={TICK_RAIL_ROW_HEIGHT} disabled={isFlash}>
-        <TickCountRail
-          value={isFlash ? 1 : attemptCount}
-          onSelect={setAttemptCount}
-          resetKey={ascent?.uuid}
-          disabled={isFlash}
-          accessibilityLabel={tTick('mobile.tick.triesLabel')}
-        />
-      </TickFormRow>
+          <TickFormRow label={tTick('mobile.tick.triesLabel')} bleed height={TICK_RAIL_ROW_HEIGHT} disabled={isFlash}>
+            <TickCountRail
+              value={isFlash ? 1 : attemptCount}
+              onSelect={setAttemptCount}
+              resetKey={ascent?.uuid}
+              disabled={isFlash}
+              accessibilityLabel={tTick('mobile.tick.triesLabel')}
+            />
+          </TickFormRow>
 
-      {/* `alignTop` for the same reason as the create sheet's note row (#4642). */}
-      <TickFormRow label={tTick('mobile.tick.noteLabel')} alignTop showSeparator={false} testID="tick-row-note">
-        <TickNoteField
-          value={comment}
-          onChangeText={setComment}
-          placeholder={tTick('mobile.tick.notePlaceholder')}
-          accessibilityLabel={tTick('mobile.tick.noteAria')}
-        />
-      </TickFormRow>
+          {/* `alignTop` for the same reason as the create sheet's note row (#4642). */}
+          <TickFormRow label={tTick('mobile.tick.noteLabel')} alignTop showSeparator={false} testID="tick-row-note">
+            <TickNoteField
+              value={comment}
+              onChangeText={setComment}
+              placeholder={tTick('mobile.tick.notePlaceholder')}
+              accessibilityLabel={tTick('mobile.tick.noteAria')}
+            />
+          </TickFormRow>
 
-      <View style={styles.deleteGroup}>
-        <TickDestructiveRow label={tTick('mobile.tick.deleteRow')} onPress={confirmDelete} disabled={isMutating} />
-      </View>
+          <View style={styles.deleteGroup}>
+            <TickDestructiveRow label={tTick('mobile.tick.deleteRow')} onPress={confirmDelete} disabled={isMutating} />
+          </View>
+        </>
+      )}
     </Sheet>
   );
 }
@@ -337,16 +397,8 @@ export function LogbookEditSheet({ sheetRef, ascent, onClose }: LogbookEditSheet
 const STAR_GLYPH_SIZE = 24;
 
 const styles = StyleSheet.create({
-  angleSlider: {
-    flex: 1,
-  },
-  angleValue: {
-    minWidth: 44,
-    textAlign: 'right',
-    // Digits keep their column as the angle steps, so the readout does not
-    // twitch under the thumb.
-    fontVariant: ['tabular-nums'],
-  },
+  boardRow: { flex: 1, flexDirection: 'row', alignItems: 'center', gap: spacing[2], minHeight: 48 },
+  boardName: { flex: 1 },
   deleteGroup: {
     // Off on its own, well clear of the last field row — Delete is not the next
     // step in the form.

@@ -7,6 +7,7 @@ import {
   applyStatusChange,
   toClimbSearchInput,
   newSortSeed,
+  normalizeRetiredFilters,
   type ClimbFilterState,
   type BoardSearchConfig,
   type SearchPagination,
@@ -205,6 +206,16 @@ describe('toClimbSearchInput', () => {
     const result = toClimbSearchInput({ ...DEFAULT_CLIMB_FILTER_STATE, status: 'drafts' }, board, pagination);
     expect(result.onlyDrafts).toBe(true);
     expect(result.projectsOnly).toBeUndefined();
+    expect(result.draftScope).toBeUndefined();
+  });
+
+  it('shares spray drafts without changing the ordinary collection', () => {
+    const sprayBoard = { ...board, boardName: 'spray' };
+    const draftSearch = toClimbSearchInput({ ...DEFAULT_CLIMB_FILTER_STATE, status: 'drafts' }, sprayBoard, pagination);
+    expect(draftSearch).toMatchObject({ onlyDrafts: true, draftScope: 'WALL' });
+    const publishedSearch = toClimbSearchInput(DEFAULT_CLIMB_FILTER_STATE, sprayBoard, pagination);
+    expect(publishedSearch.onlyDrafts).toBeUndefined();
+    expect(publishedSearch.draftScope).toBeUndefined();
   });
 
   it('maps status=projects to projectsOnly', () => {
@@ -341,6 +352,28 @@ describe('personal rating filters (#2645)', () => {
   });
 });
 
+describe('liked climbs filter (#6002)', () => {
+  it('counts onlyFavorited as an active filter', () => {
+    expect(hasActiveClimbFilters({ ...DEFAULT_CLIMB_FILTER_STATE, onlyFavorited: true })).toBe(true);
+    expect(hasActiveClimbFilters({ ...DEFAULT_CLIMB_FILTER_STATE, onlyFavorited: false })).toBe(false);
+  });
+
+  it('sends onlyFavorited only when it is on, so the everyday search stays cacheable', () => {
+    const on = toClimbSearchInput({ ...DEFAULT_CLIMB_FILTER_STATE, onlyFavorited: true }, board, pagination);
+    expect(on.onlyFavorited).toBe(true);
+
+    const off = toClimbSearchInput({ ...DEFAULT_CLIMB_FILTER_STATE, onlyFavorited: false }, board, pagination);
+    expect('onlyFavorited' in off).toBe(false);
+    expect('onlyFavorited' in toClimbSearchInput(DEFAULT_CLIMB_FILTER_STATE, board, pagination)).toBe(false);
+  });
+
+  it('leaves the status flags alone', () => {
+    const input = toClimbSearchInput({ ...DEFAULT_CLIMB_FILTER_STATE, onlyFavorited: true }, board, pagination);
+    expect(input.onlyDrafts).toBeUndefined();
+    expect(input.projectsOnly).toBeUndefined();
+  });
+});
+
 // #4796 / #4828: the climber's own grade drives the grade range and the
 // difficulty sort, but only where it can change the answer — the param is
 // user-specific, so sending it needlessly costs the Redis cache on the app's
@@ -367,5 +400,28 @@ describe('toClimbSearchInput personal grades', () => {
   it('stays off entirely when the kill switch is off', () => {
     expect(build({ minGrade: 24 }, false).useMyGrades).toBeUndefined();
     expect(build({ sortBy: 'difficulty' }, false).useMyGrades).toBeUndefined();
+  });
+});
+
+// The spray-wall "Holds" filter is gone. A search input built from a stored
+// state that still carries it must neither send it nor count it.
+describe('a stored filter state from before the Holds filter was removed', () => {
+  const spray: BoardSearchConfig = { boardName: 'spray', layoutId: 7, sizeId: 7, setIds: '1', angle: 25 };
+  const legacy = { ...DEFAULT_CLIMB_FILTER_STATE, holdIntegrity: 'broken' } as ClimbFilterState;
+
+  it('sends no holdIntegrity and counts as no active filter', () => {
+    expect(toClimbSearchInput(legacy, spray, pagination).holdIntegrity).toBeUndefined();
+    expect(hasActiveClimbFilters(legacy)).toBe(false);
+  });
+
+  it('drops the stored value on read and keeps everything else', () => {
+    const normalized = normalizeRetiredFilters({ ...legacy, minGrade: 12 });
+    expect('holdIntegrity' in normalized).toBe(false);
+    expect(normalized.minGrade).toBe(12);
+    expect(normalized.status).toBe('any');
+  });
+
+  it('returns the same state when nothing needs dropping', () => {
+    expect(normalizeRetiredFilters(DEFAULT_CLIMB_FILTER_STATE)).toBe(DEFAULT_CLIMB_FILTER_STATE);
   });
 });

@@ -1,6 +1,6 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback, useMemo } from 'react';
 import {
-  Pressable,
   View,
   StyleSheet,
   type AccessibilityActionEvent,
@@ -14,20 +14,20 @@ import type { BoardName } from '@boardsesh/shared-schema';
 import type { Climb } from '@boardsesh/queue';
 import { Icon } from '../Icon';
 import { ClimbListItemContent } from '../ClimbListItemContent';
-import { THUMBNAIL_WIDTH } from '../ClimbListThumbnail';
-import { iosSystemColors } from '../../theme/ios-colors';
+import { CLIMB_ROW_VERTICAL_PADDING, climbRowSeparatorInset } from '../climb-row-layout';
 import { spacing } from '../../theme/tokens';
 import { springs } from '../../theme/animations';
 import { useTheme } from '../../providers/theme-provider';
 import { hapticMedium } from '../../lib/haptics';
+import { useClimbRowField } from '../../lib/climb-row-display-preference';
 import { rowReorderShift } from '../play-drawer/queue-drag-math';
 import type { PlaylistDragControls } from './use-playlist-drag';
 
 // Leading remove control + trailing drag handle slots. The separator starts
-// under the climb name (after the remove slot + thumbnail) so it lines up with
-// the name column, matching the queue row idiom.
+// under the climb name (after the remove slot, and the thumbnail when there is
+// one) so it lines up with the name column, matching the queue row idiom.
 const CONTROL_SLOT_WIDTH = 36;
-const SEPARATOR_INSET = spacing[3] + CONTROL_SLOT_WIDTH + spacing[3] + THUMBNAIL_WIDTH + spacing[3];
+const ROW_LEADING_INSET = spacing[3] + CONTROL_SLOT_WIDTH + spacing[3];
 
 // VoiceOver / TalkBack adjustable actions on the drag handle: swipe up/down (iOS)
 // or the increment/decrement gestures (Android) move the climb one slot, so
@@ -48,6 +48,7 @@ type PlaylistEditClimbRowProps = {
   /** This row's index within the editable list (drag coordinate). */
   rowIndex: number;
   drag: PlaylistDragControls;
+  minimumHeight?: number;
   onRemove: (climbUuid: string) => void;
   /** Move this climb to a new index — used by the screen-reader adjustable
    *  actions (the pan gesture commits through `drag`). */
@@ -59,11 +60,16 @@ function PlaylistEditClimbRowComponent({
   board,
   rowIndex,
   drag,
+  minimumHeight,
   onRemove,
   onReorder,
 }: PlaylistEditClimbRowProps) {
   const { systemColors } = useTheme();
   const { t } = useTranslation('playlists');
+  // The climber's thumbnail switch moves two things in this row with it: where
+  // the separator starts, and whether the two controls may set the height.
+  const hasThumbnail = useClimbRowField('thumbnail');
+  const controlSlotStyle = hasThumbnail ? styles.controlSlot : [styles.controlSlot, styles.controlSlotWithoutThumbnail];
 
   const handleRemove = useCallback(() => {
     hapticMedium();
@@ -117,21 +123,28 @@ function PlaylistEditClimbRowComponent({
 
   return (
     <Animated.View style={dragAnimatedStyle} onLayout={handleRowLayout}>
-      <View style={[styles.row, { backgroundColor: systemColors.secondaryBackground }]}>
+      <View
+        style={[
+          styles.row,
+          { backgroundColor: systemColors.secondaryBackground },
+          minimumHeight === undefined ? null : { minHeight: minimumHeight },
+        ]}
+      >
         {/* Leading: red remove control */}
-        <Pressable
+        <PressableSurface
           onPress={handleRemove}
           hitSlop={8}
           accessibilityRole="button"
           accessibilityLabel={t('editClimbs.removeAria', { name: climb.name })}
-          style={({ pressed }) => [styles.controlSlot, pressed && styles.pressed]}
+          style={({ pressed }) => [controlSlotStyle, pressed && styles.pressed]}
         >
-          <Icon name="minus.circle" size={24} color={iosSystemColors.systemRed} />
-        </Pressable>
+          <Icon name="minus.circle" size={24} color={systemColors.error} />
+        </PressableSurface>
 
         {/* Center: shared climb visual (thumbnail + name/subtitle + grade). Ascent
             status is dropped in edit mode to keep the row focused on curation. */}
         <ClimbListItemContent
+          allowNameWrapping={false}
           climb={climb}
           boardName={board.boardName}
           layoutId={board.layoutId}
@@ -144,18 +157,26 @@ function PlaylistEditClimbRowComponent({
         {/* Trailing: drag handle */}
         <GestureDetector gesture={dragHandleGesture}>
           <View
-            style={styles.controlSlot}
+            style={controlSlotStyle}
             accessibilityRole="adjustable"
             accessibilityLabel={t('editClimbs.dragHandleAria', { name: climb.name })}
             accessibilityActions={REORDER_A11Y_ACTIONS}
             onAccessibilityAction={handleAccessibilityAction}
           >
-            <Icon name="drag.handle" size={22} color={iosSystemColors.systemGray} />
+            <Icon name="drag.handle" size={22} color={systemColors.secondaryLabel} />
           </View>
         </GestureDetector>
       </View>
 
-      <View style={[styles.separator, { marginLeft: SEPARATOR_INSET, backgroundColor: systemColors.separator }]} />
+      <View
+        style={[
+          styles.separator,
+          {
+            marginStart: climbRowSeparatorInset(hasThumbnail, ROW_LEADING_INSET),
+            backgroundColor: systemColors.separator,
+          },
+        ]}
+      />
     </Animated.View>
   );
 }
@@ -173,7 +194,7 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     columnGap: spacing[3],
-    paddingVertical: spacing[2],
+    paddingVertical: CLIMB_ROW_VERTICAL_PADDING,
     paddingHorizontal: spacing[3],
   },
   controlSlot: {
@@ -182,6 +203,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     flexShrink: 0,
+  },
+  // Without a thumbnail the row is as tall as its text. The 44pt targets reach
+  // into the row's own vertical padding instead of adding to the row.
+  controlSlotWithoutThumbnail: {
+    marginVertical: -CLIMB_ROW_VERTICAL_PADDING,
   },
   pressed: {
     opacity: 0.6,

@@ -1,8 +1,36 @@
 /// <reference types="node" />
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Only pure exports: importing the module must not (and does not) spawn gh/git.
-import { DEV_APK_FRESHNESS_PATHS, devApkFreshness, formatApkOutputs, type GitRunner } from '../mobile-android-apk';
+import {
+  DEV_APK_FRESHNESS_PATHS,
+  devApkFreshness,
+  formatApkOutputs,
+  androidApkAbi,
+  androidGradleArguments,
+  apkListingHasAbi,
+  localApkCacheKey,
+  parseApkAbi,
+  resolveAndroidApk,
+  type GitRunner,
+} from '../mobile-android-apk';
+import { runCapture } from '../lib/exec';
+
+vi.mock('../lib/exec', () => ({
+  commandExists: vi.fn(() => false),
+  runCapture: vi.fn(() => ({ status: 0, stdout: '', stderr: '' })),
+  runInherit: vi.fn(() => {
+    throw new Error('ABI archive tests must not build or install');
+  }),
+}));
+const temporaryRoots: string[] = [];
+afterEach(() => {
+  vi.clearAllMocks();
+  temporaryRoots.splice(0).forEach((root) => rmSync(root, { recursive: true, force: true }));
+});
 
 const HEAD = 'a'.repeat(40);
 const TAG_COMMIT = 'b'.repeat(40);
@@ -11,15 +39,20 @@ const TAG_COMMIT = 'b'.repeat(40);
 // this list AND the `git diff` invocation below — a self-referential assertion
 // would happily agree with a shortened list.
 const EXPECTED_FRESHNESS_PATHS = [
-  'packages/mobile/app.config.ts',
-  'packages/mobile/package.json',
   'package.json',
+  'packages/mobile/package.json',
+  'pnpm-lock.yaml',
   'pnpm-workspace.yaml',
+  'packages/mobile/app.config.ts',
+  'packages/mobile/fingerprint.config.js',
   'packages/mobile/plugins',
   'packages/mobile/modules',
+  'packages/mobile/locales',
+  'packages/mobile/eas.json',
+  'packages/mobile/assets',
   'packages/mobile/dev-assets',
+  'packages/mobile/targets',
   'patches',
-  '.github/workflows/android-apk-dev-client.yml',
 ];
 
 interface GitCall {
@@ -61,11 +94,10 @@ describe('devApkFreshness', () => {
     });
   });
 
-  it('reports not-an-ancestor when the release commit is not in this history', () => {
+  it('compares native trees even when the release is not in this history', () => {
     const calls: GitCall[] = [];
     expect(devApkFreshness(HEAD, TAG_COMMIT, fakeGit({ catFile: [0], isAncestor: 1 }, calls))).toEqual({
-      fresh: false,
-      reason: 'not-an-ancestor',
+      fresh: true,
     });
 
     // Pins the argument ORDER: `merge-base --is-ancestor <tagCommit> <headSha>`
@@ -76,10 +108,14 @@ describe('devApkFreshness', () => {
   });
 
   it('reports native-inputs-changed when git diff exits 1', () => {
-    expect(devApkFreshness(HEAD, TAG_COMMIT, fakeGit({ catFile: [0], isAncestor: 0, diff: 1 }))).toEqual({
+    expect(devApkFreshness(HEAD, TAG_COMMIT, fakeGit({ catFile: [0], isAncestor: 0, diff: 1 }), () => false)).toEqual({
       fresh: false,
       reason: 'native-inputs-changed',
     });
+  });
+
+  it('reuses an APK when version or lockfile edits keep the same fingerprint', () => {
+    expect(devApkFreshness(HEAD, TAG_COMMIT, fakeGit({ diff: 1 }), () => true)).toEqual({ fresh: true });
   });
 
   it('reports unknown when git diff fails outright (not a 0/1 answer)', () => {
@@ -108,8 +144,7 @@ describe('devApkFreshness', () => {
     expect(calls.map((call) => call.args[0])).toEqual(['cat-file', 'fetch', 'cat-file']);
   });
 
-  // A native deploy publishes a fresh rn-android-dev-* release on every push to
-  // main, so a workflow pinned to an older commit (e.g. a `workflow_run.head_sha`
+  // A native change publishes a fresh rn-android-dev-* release on main, so a workflow pinned to an older commit (e.g. a `workflow_run.head_sha`
   // from 30-50 minutes earlier) often finds the newest release is a DESCENDANT
   // of HEAD rather than an ancestor. These three cover that reversed direction.
   // Distinct from `fakeGit`: the two merge-base calls ask opposite questions and
@@ -155,15 +190,16 @@ describe('devApkFreshness', () => {
       HEAD,
       TAG_COMMIT,
       directionalGit({ tagAncestorOfHead: 1, headAncestorOfTag: 0, diff: 1 }),
+      () => false,
     );
 
     expect(verdict).toEqual({ fresh: false, reason: 'native-inputs-changed' });
   });
 
-  it('is stale (not-an-ancestor) when the release and HEAD have diverged', () => {
+  it('can reuse identical native inputs when the release and HEAD have diverged', () => {
     const verdict = devApkFreshness(HEAD, TAG_COMMIT, directionalGit({ tagAncestorOfHead: 1, headAncestorOfTag: 1 }));
 
-    expect(verdict).toEqual({ fresh: false, reason: 'not-an-ancestor' });
+    expect(verdict).toEqual({ fresh: true });
   });
 
   it('diffs every freshness path (a dropped path would silently pass a stale APK)', () => {
@@ -179,7 +215,7 @@ describe('devApkFreshness', () => {
 });
 
 describe('DEV_APK_FRESHNESS_PATHS', () => {
-  it('covers the native inputs plus the producer workflow, and skips the lockfile', () => {
+  it('covers native candidate inputs including dependency resolution', () => {
     expect([...DEV_APK_FRESHNESS_PATHS]).toEqual(EXPECTED_FRESHNESS_PATHS);
   });
 });
@@ -192,5 +228,66 @@ describe('formatApkOutputs', () => {
     expect(formatApkOutputs({ apkPath: '/cache/app-debug.apk', source: 'local-build' })).toBe(
       'apk_path=/cache/app-debug.apk\napk_source=local-build\n',
     );
+  });
+});
+
+describe('physical and emulator APK architecture', () => {
+  it('keeps the x86_64 default and requires an explicit supported physical ABI', () => {
+    expect(parseApkAbi([])).toBe('x86_64');
+    expect(androidApkAbi()).toBe('x86_64');
+    expect(parseApkAbi(['--require-fresh', '--abi', 'arm64-v8a'])).toBe('arm64-v8a');
+    expect(parseApkAbi(['--abi=arm64-v8a'])).toBe('arm64-v8a');
+    expect(parseApkAbi(['--abi=x86_64'])).toBe('x86_64');
+    expect(() => parseApkAbi(['--abi'])).toThrow('requires');
+    expect(() => parseApkAbi(['--abi='])).toThrow('requires');
+    expect(() => parseApkAbi(['--abi', '--require-fresh'])).toThrow('requires');
+    expect(() => parseApkAbi(['--abi', 'armeabi-v7a'])).toThrow('must be');
+    expect(() => parseApkAbi(['--abi=armeabi-v7a'])).toThrow('must be');
+  });
+
+  it.each(['x86_64', 'arm64-v8a'] as const)(
+    'selects %s for both React Native compilation and packaged libraries',
+    (abi) => {
+      const argumentsList = androidGradleArguments(abi);
+      expect(argumentsList).toContain(`-PreactNativeArchitectures=${abi}`);
+      expect(argumentsList).toContain(`-PboardseshAbiFilters=${abi}`);
+      expect(argumentsList[0]).toBe('assembleDebug');
+    },
+  );
+
+  it('keeps local APK cache keys separate for the same native sources', () => {
+    expect(localApkCacheKey('same-native-hash', 'arm64-v8a')).not.toBe(localApkCacheKey('same-native-hash', 'x86_64'));
+    expect(localApkCacheKey('same-native-hash', 'arm64-v8a')).toContain('arm64-v8a');
+  });
+
+  it('requires a real native library entry rather than an asset path or empty ABI directory', () => {
+    expect(apkListingHasAbi('lib/arm64-v8a/libreactnative.so\nlib/x86_64/libreactnative.so\n', 'arm64-v8a')).toBe(true);
+    expect(
+      apkListingHasAbi('assets/lib/arm64-v8a/libfake.so\nlib/arm64-v8a/\nlib/x86_64/libreactnative.so\n', 'arm64-v8a'),
+    ).toBe(false);
+  });
+
+  it('checks an explicit APK against the requested ABI before returning it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'boardsesh-apk-abi-test-'));
+    temporaryRoots.push(root);
+    const filename = join(root, 'explicit.apk');
+    writeFileSync(filename, 'archive fixture handled by unzip stub');
+    vi.mocked(runCapture).mockReturnValue({ status: 0, stdout: 'lib/arm64-v8a/libreactnative.so\n', stderr: '' });
+    expect(resolveAndroidApk({ appPath: filename, abi: 'arm64-v8a' })).toEqual({
+      apkPath: filename,
+      source: 'app-path',
+    });
+    expect(runCapture).toHaveBeenCalledWith('unzip', ['-Z1', filename]);
+    expect(() => resolveAndroidApk({ appPath: filename })).toThrow('no x86_64');
+  });
+
+  it.each([1, 127])('reports an unreadable APK archive separately from missing libraries (exit %s)', (status) => {
+    const root = mkdtempSync(join(tmpdir(), 'boardsesh-apk-list-test-'));
+    temporaryRoots.push(root);
+    const filename = join(root, 'explicit.apk');
+    writeFileSync(filename, 'unreadable archive or unavailable unzip');
+    vi.mocked(runCapture).mockReturnValue({ status, stdout: '', stderr: 'archive listing failed' });
+    expect(() => resolveAndroidApk({ appPath: filename })).toThrow('Cannot list APK archive');
+    expect(() => resolveAndroidApk({ appPath: filename })).not.toThrow('no x86_64');
   });
 });

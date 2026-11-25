@@ -9,7 +9,12 @@ import { encrypt } from '@boardsesh/crypto';
 import { createDb } from '@boardsesh/db/client';
 import { BACKGROUND_JOB_QUEUES } from '@boardsesh/db/background-jobs';
 import { auroraCredentials, backgroundJobRuns, providerSyncControls } from '@boardsesh/db/schema';
-import { acquireCredentialSyncLease, claimNextCredentialForSync, rotateLinkGeneration } from '@boardsesh/db/queries';
+import {
+  acquireCredentialSyncLease,
+  claimNextCredentialForSync,
+  rotateLinkGeneration,
+  StaleLinkGenerationError,
+} from '@boardsesh/db/queries';
 import { enqueueBackgroundJob, executeBackgroundJob, handlerForRole, type BackgroundJobPayload } from '../../jobs';
 import { InvalidJobPayloadError, type BackgroundJobContext } from '../types';
 import { providerRoutineCycleFamily } from '../provider-routine-cycle';
@@ -157,6 +162,23 @@ const controls = async () =>
     .from(providerSyncControls)
     .where(inArray(providerSyncControls.userId, [...ACCOUNTS]));
 
+/**
+ * The interactive Aurora runs queued for this file's accounts. The ledger is
+ * shared with every other serial file in the worker database, and some leave
+ * their own `aurora-user-sync` runs behind, so a read by family alone would
+ * count those too.
+ */
+const interactiveRuns = async () =>
+  database
+    .select()
+    .from(backgroundJobRuns)
+    .where(
+      and(
+        eq(backgroundJobRuns.family, 'aurora-user-sync'),
+        sql`${backgroundJobRuns.payload}->>'userId' LIKE 'routine-%'`,
+      ),
+    );
+
 /** A stand-in provider that records who it synced and marks the credential synced through the fence. */
 function recordingSync(synced: string[], afterEach?: (userId: string) => void | Promise<void>) {
   return async (
@@ -238,12 +260,21 @@ describe('provider-routine-cycle', () => {
   it('claims nothing more once ROUTINE_CYCLE_BUDGET_MS has passed', async () => {
     vi.stubEnv('ROUTINE_CYCLE_BUDGET_MS', '1');
     const synced: string[] = [];
-    adapterOverride.sync = recordingSync(synced, () => new Promise((resolve) => setTimeout(resolve, 20)));
+    // Keep setup and the first real claim inside the budget regardless of CI
+    // database latency, then exhaust it only after that credential synced.
+    let now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    adapterOverride.sync = recordingSync(synced, () => {
+      now += 2;
+    });
+    try {
+      const { result } = await runCycle();
 
-    const { result } = await runCycle();
-
-    expect(result).toBe('succeeded');
-    expect(synced).toEqual(['routine-a']);
+      expect(result).toBe('succeeded');
+      expect(synced).toEqual(['routine-a']);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it('does not count a skipped credential toward ROUTINE_CYCLE_MAX_CREDENTIALS', async () => {
@@ -386,10 +417,7 @@ describe('provider-routine-cycle', () => {
 
     // The first sync goes to the 30-minute interactive lease; the cycle moves on.
     expect(synced).toEqual(['routine-b']);
-    const interactive = await database
-      .select()
-      .from(backgroundJobRuns)
-      .where(eq(backgroundJobRuns.family, 'aurora-user-sync'));
+    const interactive = await interactiveRuns();
     expect(interactive).toHaveLength(1);
     expect(interactive[0]).toMatchObject({
       role: 'interactive-import',
@@ -405,9 +433,7 @@ describe('provider-routine-cycle', () => {
       .set({ lastSyncAttemptAt: new Date(Date.now() - 3 * 60 * 60 * 1000) })
       .where(eq(auroraCredentials.userId, 'routine-a'));
     expect((await runCycle()).result).toBe('succeeded');
-    expect(
-      await database.select().from(backgroundJobRuns).where(eq(backgroundJobRuns.family, 'aurora-user-sync')),
-    ).toHaveLength(1);
+    expect(await interactiveRuns()).toHaveLength(1);
     expect(synced).toEqual(['routine-b']);
   });
 
@@ -546,6 +572,38 @@ describe('runRoutineCredentialSync binds the run to the credential as it is now'
 
   beforeEach(() => {
     enqueued.length = 0;
+  });
+
+  it('skips a stale token when the credential deadline expires during the same attempt', async () => {
+    const claimed = await claim('routine-a');
+    const context = routineContext();
+    const deadline = new AbortController();
+    const newToken = encrypt('refreshed-session');
+    adapterOverride.sync = async () => {
+      await database
+        .update(auroraCredentials)
+        .set({ auroraToken: newToken })
+        .where(eq(auroraCredentials.id, claimed!.id));
+      deadline.abort();
+      throw new StaleLinkGenerationError();
+    };
+    const adapter = await loadProviderSyncAdapter(context, 'aurora');
+    const recordFailure = vi.spyOn(adapter, 'recordTransientFailure');
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockReturnValueOnce(deadline.signal);
+    try {
+      expect(await runRoutineCredentialSync(context, claimed!, adapter)).toEqual({
+        result: 'skipped',
+        reason: 'STALE_LINK_GENERATION',
+      });
+      expect(recordFailure).not.toHaveBeenCalled();
+      expect((await credentials())['routine-a']).toMatchObject({
+        auroraToken: newToken,
+        consecutiveFailures: 0,
+        lastSyncError: null,
+      });
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   it('skips a credential relinked between the claim and the fence, signing in with nothing', async () => {

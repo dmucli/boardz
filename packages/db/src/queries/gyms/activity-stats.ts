@@ -52,14 +52,21 @@ async function executeRowsAs<T>(db: GymActivityStatsDb, query: SQLWrapper): Prom
  * self-link their own board to a public gym within
  * `SELF_LINK_PROXIMITY_METERS`, so a gym's board set can contain climber-owned
  * home walls — some of them private, some `hide_location`.
+ *
+ * Exported for the backend's monthly community recap
+ * (`services/community-monthly-stats.ts`), which ranks gyms publicly from the
+ * same walls. A fragment selecting `board_id, gym_id`: use it as a CTE or a
+ * subquery, never with a viewer in mind, since it has none.
  */
-const ENUMERABLE_GYM_BOARDS = sql`
+export const ENUMERABLE_GYM_BOARDS = sql`
   SELECT ub.id AS board_id, ub.gym_id
   FROM user_boards ub
   WHERE ub.gym_id IS NOT NULL
     AND ub.deleted_at IS NULL
     AND ub.is_public
     AND NOT ub.is_unlisted
+    AND EXISTS (SELECT 1 FROM gyms enumerable_gym WHERE enumerable_gym.id = ub.gym_id
+      AND enumerable_gym.deleted_at IS NULL AND enumerable_gym.is_public AND enumerable_gym.is_listed)
 `;
 
 /**

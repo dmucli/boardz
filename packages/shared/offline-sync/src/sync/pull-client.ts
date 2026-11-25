@@ -1,6 +1,12 @@
-import type { OfflineDatabase, QueryInvalidator, SqlExecutor, SqlValue } from '../database';
+import type { OfflineDatabase, QueryInvalidator, SqlExecutor } from '../database';
 import type { SyncCursorInput, SyncResult, SyncDeletionsResult } from '../types';
-import { TABLE_CONFIGS, USER_DATA_TABLES, BOARD_DATA_TABLES } from './table-config';
+import {
+  TABLE_CONFIGS,
+  USER_DATA_TABLES,
+  BOARD_DATA_TABLES,
+  refreshColumnsFor,
+  refreshRevisionFor,
+} from './table-config';
 import {
   getCheckpoint,
   compareCheckpoints,
@@ -13,8 +19,10 @@ import {
   ensureScopeDownloadStartedAt,
   SCOPE_DOWNLOAD_START_MAX_AGE_MS,
   DELETIONS_CHECKPOINT_KEY,
+  getSnapshotSupplement,
 } from './checkpoints';
-import { markUserDataComplete } from './local-user-owner';
+import { removeBoardScopeRows } from './scope-teardown';
+import { isLocalDataStampedFor, isUserDataComplete, markUserDataComplete } from './local-user-owner';
 import {
   getSchemaRefreshState,
   schemaRefreshKey,
@@ -43,9 +51,16 @@ import {
   type SnapshotArtifactHandle,
   type SnapshotBootstrapErrorReport,
   type SnapshotBootstrapErrorReporter,
+  type DownloadRequestCorrelation,
 } from './snapshot-bootstrap';
 import { classifySnapshotBootstrapFailure, type SnapshotBootstrapFailureReason } from './bootstrap-failure-reason';
+import { classifySnapshotTransferFailure } from './snapshot-transfer-failure';
 import { createDownloadFunnelGuard } from './download-funnel-guard';
+import {
+  createScopeDownloadLifecycle,
+  type ScopeDownloadContext,
+  type ScopeDownloadLifecycleReporter,
+} from './download-lifecycle';
 import { noteScopeDownloadTerminal } from './download-terminal-registry';
 import {
   classifyBootstrapFailure,
@@ -60,8 +75,9 @@ import {
   rearmForNewArtifact,
   recordBackgroundPause,
   shouldSkipPagedPull,
+  hasUserRequestedBootstrapRetry,
   spendUserRequest,
-  writeBootstrapRetryState,
+  writeBootstrapRetryRows,
   type BootstrapFailureKind,
   type BootstrapRetryState,
 } from './bootstrap-retry';
@@ -87,18 +103,26 @@ import {
   resetUserDataForLostCoverage,
 } from './deletions-coverage';
 import { classifySqliteLockError } from '../db/lock-errors';
-import { buildMultiRowInsertSql, multiRowChunkSize, runPullWrite } from './pull-write';
-import { ensureHoldIndex, removeClimbFromHoldIndex, type HoldRowParser } from '../holds-index/hold-index';
+import { runGuardedPullWrite, runPullWrite } from './pull-write';
+import { writePullDocuments } from './document-writer';
+export { toSqliteValue } from './document-writer';
+import {
+  ensureHoldIndex,
+  clearLayoutHoldIndex,
+  removeClimbFromHoldIndex,
+  type HoldRowParser,
+} from '../holds-index/hold-index';
 // Re-exported: the export job and the package index have always imported it from here.
 export { multiRowChunkSize } from './pull-write';
 import { getPendingCount } from '../mutation-queue/queue';
-import { isNetworkError } from '../mutation-queue/error-classification';
 import {
   isSigningOut,
   isBackgrounded,
   onTeardown,
   capturePurgeToken,
   getWipeEpoch,
+  getPurgeEpoch,
+  beginScopePurge,
   hasPurgeLanded,
   type PurgeToken,
 } from '../mutation-queue/drainer';
@@ -114,8 +138,9 @@ import {
  * expected snapshot columns are rejected separately before rows can be changed.
  */
 export type { SchemaDriftReporter } from './schema-compatibility';
-import { reportExtraColumn, type SchemaDriftReporter } from './schema-compatibility';
-import { scopedInvalidateFilters } from './invalidate-keys';
+import { type SchemaDriftReporter } from './schema-compatibility';
+import type { BoardScopeKey, InvalidateKeys } from './invalidate-keys';
+import { createInvalidationBatch, type InvalidationBatch } from './invalidation-batch';
 
 /**
  * What a report site inside the bootstrap phase supplies. `reason` and `aborted`
@@ -125,7 +150,10 @@ import { scopedInvalidateFilters } from './invalidate-keys';
 type BootstrapErrorInput = Omit<SnapshotBootstrapErrorReport, 'reason' | 'aborted'> &
   Partial<Pick<SnapshotBootstrapErrorReport, 'reason' | 'aborted'>>;
 
+import { createScopeDownloadProgress, type ScopeDownloadPhase, type ScopeDownloadProgress } from './download-progress';
+
 export type SyncProgress = {
+  download?: ScopeDownloadProgress;
   phase: 'bootstrap' | 'user_data' | 'board_data' | 'deletions' | 'idle';
   currentTable: string | null;
   documentsProcessed: number;
@@ -231,6 +259,8 @@ export type ScopeDownloadPhaseBreakdown = {
    * meaningful only when at least one of the two is present.
    */
   gradesArtifactRows?: number;
+  /** Time waiting for grades after the layout import; transfers overlap it. */
+  gradesWaitMs?: number;
   /**
    * The whole-layout import, split (issue #4310). ABSENT — never 0 — on any
    * cycle that ran no import, which is most of them: a completion whose artifact
@@ -276,9 +306,8 @@ export type ScopeDownloadPhaseBreakdown = {
    * the other phases. Same absent-when-unknown rule: no grades artifact imported
    * this cycle means no key, not a zero.
    *
-   * `gradesLockMs` is the grades import's exclusive hold. It is still ONE
-   * unbatched transaction, so it is reported next to `importLockMaxMs` rather
-   * than folded into it.
+   * `gradesLockMs` is the longest grades batch hold, including COMMIT,
+   * reported separately from the layout's `importLockMaxMs`.
    *
    * DO NOT filter these three on `importMs IS NOT NULL`. `importGradesForScope`
    * has a second call site — the retrofit path for a scope that is already
@@ -338,7 +367,9 @@ export function emptyScopeDownloadPhases(): ScopeDownloadPhaseBreakdown {
  * device that was simply closed for a week is not a week-long download).
  */
 export type ScopeDownloadCompleteInfo = {
+  downloadContext?: ScopeDownloadContext;
   scopeKey: string;
+  downloadRequest?: DownloadRequestCorrelation;
   method: 'snapshot' | 'paged';
   /**
    * NOTE for path comparisons: a scope that was HEALED (an artifact imported
@@ -391,11 +422,21 @@ export type ScopeDownloadCompleteReporter = (info: ScopeDownloadCompleteInfo) =>
  * the size of the downloads people give up on is unknowable.
  */
 export type ScopeDownloadStartInfo = {
+  downloadContext?: ScopeDownloadContext;
   scopeKey: string;
+  downloadRequest?: DownloadRequestCorrelation;
   pathIntent: 'snapshot' | 'paged';
   artifactBytes: number | null;
 };
 export type ScopeDownloadStartReporter = (info: ScopeDownloadStartInfo) => void;
+
+/** Read-only observation of the durable completion marker, including cached scopes. */
+export type ScopeDownloadObservedInfo = {
+  scopeKey: string;
+  complete: boolean;
+  downloadRequest?: DownloadRequestCorrelation;
+};
+export type ScopeDownloadObservedReporter = (info: ScopeDownloadObservedInfo) => void;
 
 /**
  * Fired after one bootstrap scope reaches a coherent persisted decision (or is
@@ -567,8 +608,27 @@ export type RowsDeletedSink = (info: {
 }) => void | Promise<void>;
 
 export type SyncOptions = {
+  /** Captured before the FIFO wait; callbacks must never adopt a later request. */
+  getScopeDownloadContext?: (scopeKey: string) => ScopeDownloadContext | undefined;
+  onScopeDownloadLifecycle?: ScopeDownloadLifecycleReporter;
+  /** Authenticated viewer captured for this cycle; absent retains legacy snapshot replay. */
+  viewerUserId?: string;
+  /**
+   * Pull only into a database whose owner stamp names `viewerUserId` (#6824).
+   * An unclaimed database, or one still stamped for the previous account, gets
+   * no cycle at all: the account's rows would land beside the other account's,
+   * and a later sign-in of that other account would read them as its own. The
+   * owner check in the app claims the device and writes the stamp; the next
+   * cycle after that pulls. The mobile adapter always sets this. Off by default
+   * so headless callers and suites that never stamp keep pulling.
+   */
+  requireOwnedDatabase?: boolean;
   /** Encoded board scope keys ("boardType:layoutId:sizeId") to download offline. */
   enabledBoards?: string[];
+  /** Verified account-scoped capability for this exact spray-wall scope. */
+  getSprayWallUuid?: (scope: OfflineBoardScope) => string | undefined | Promise<string | undefined>;
+  /** User-started scopes go first in both bootstrap and board pulls. */
+  getPriorityBoards?: () => readonly string[];
   /** Per-page side-effect sink for board reference data. See DocumentsPulledSink. */
   onDocumentsPulled?: DocumentsPulledSink;
   /** Per-page side-effect sink for applied tombstones. See RowsDeletedSink. */
@@ -599,6 +659,10 @@ export type SyncOptions = {
   /** Telemetry for comparing the snapshot vs paged download paths. See ScopeDownloadCompleteInfo. */
   onScopeDownloadComplete?: ScopeDownloadCompleteReporter;
   onScopeDownloadStart?: ScopeDownloadStartReporter;
+  /** Captured synchronously before this request waits behind an earlier pull. */
+  getDownloadRequestContext?: (scopeKey: string) => DownloadRequestCorrelation | undefined;
+  /** Observational only: never adds a read or changes download marker semantics. */
+  onScopeDownloadObserved?: ScopeDownloadObservedReporter;
   /** Telemetry for a forced deletions-coverage resync. See CoverageResetInfo. */
   onCoverageReset?: CoverageResetReporter;
   /**
@@ -659,19 +723,28 @@ export type HoldIndexSyncOptions = {
 };
 
 /** A per-board download target: the parsed scope plus its encoded key. */
-type BoardScope = OfflineBoardScope & { scopeKey: string };
+type BoardScope = OfflineBoardScope & { scopeKey: string; sprayWallUuid?: string };
 
 const PAGE_LIMIT = 500;
 
-function buildSyncQuery(queryName: string, isPerBoard: boolean): string {
+const SNAPSHOT_SUPPLEMENT_TABLES = ['board_climbs', 'board_climb_stats', 'board_climb_grades'] as const;
+
+function buildSyncQuery(queryName: string, isPerBoard: boolean, supplemental = false): string {
   // Per-board pulls carry the board type plus optional layout/size scope so a
   // downloaded board is a fixed (boardType, layout, size) superset — all sets.
   // layoutId/sizeId are nullable server-side, so passing them undefined is a no-op.
-  const boardScopeParam = isPerBoard ? '$boardType: String!, $layoutId: Int, $sizeId: Int, ' : '';
-  const boardScopeArg = isPerBoard ? 'boardType: $boardType, layoutId: $layoutId, sizeId: $sizeId, ' : '';
+  const boardScopeParam = isPerBoard
+    ? '$boardType: String!, $layoutId: Int, $sizeId: Int, $sprayWallUuid: String, '
+    : '';
+  const boardScopeArg = isPerBoard
+    ? 'boardType: $boardType, layoutId: $layoutId, sizeId: $sizeId, sprayWallUuid: $sprayWallUuid, '
+    : '';
+  const supplementParams = supplemental ? '$audience: SyncAudience!, $snapshotClimbWatermark: SyncCursorInput!, ' : '';
+  const supplementArgs = supplemental ? 'audience: $audience, snapshotClimbWatermark: $snapshotClimbWatermark, ' : '';
+  const operationName = `${queryName[0].toUpperCase()}${queryName.slice(1)}${supplemental ? 'SnapshotSupplement' : ''}`;
   return `
-    query ${queryName[0].toUpperCase()}${queryName.slice(1)}(${boardScopeParam}$cursor: SyncCursorInput, $limit: Int! = ${PAGE_LIMIT}) {
-      ${queryName}(${boardScopeArg}cursor: $cursor, limit: $limit) {
+    query ${operationName}(${boardScopeParam}${supplementParams}$cursor: SyncCursorInput, $limit: Int! = ${PAGE_LIMIT}) {
+      ${queryName}(${boardScopeArg}${supplementArgs}cursor: $cursor, limit: $limit) {
         documents
         cursor {
           updatedAt
@@ -716,29 +789,29 @@ export type SyncPullDocument = { operationName: string; document: string };
  *
  * Pure: builds strings, sends nothing.
  */
+class SprayWallRetirementInterruptedError extends Error {}
+
+const CONFIRM_SPRAY_WALL_VISIBILITY_QUERY = `query ConfirmSprayWallVisibility($layoutId: Int!, $sprayWallUuid: String) {
+  sprayWallByLayout(layoutId: $layoutId, sprayWallUuid: $sprayWallUuid) { uuid }
+}`;
+
 export function listSyncPullDocuments(): SyncPullDocument[] {
   const tableDocuments = Object.values(TABLE_CONFIGS).map((config) => ({
     operationName: `${config.queryName[0].toUpperCase()}${config.queryName.slice(1)}`,
     document: buildSyncQuery(config.queryName, config.isPerBoard),
   }));
-  return [...tableDocuments, { operationName: 'SyncDeletions', document: SYNC_DELETIONS_QUERY }];
-}
-
-/**
- * Coerces a synced document value to what the SQLite bridge accepts:
- * booleans as 0/1 (SQLite has no BOOLEAN type), Date values as ISO strings,
- * objects/arrays as their JSON string (frames, characteristics, etc. are stored
- * as TEXT), null/undefined as NULL (undefined means "document omitted this
- * column" — same bind as an explicit null), everything else passed through
- * unchanged. Exported so the snapshot export job can reuse the exact same
- * coercion off the same synced documents without re-deriving it.
- */
-export function toSqliteValue(value: unknown): SqlValue {
-  if (value === null || value === undefined) return null;
-  if (typeof value === 'boolean') return value ? 1 : 0;
-  if (value instanceof Date) return value.toISOString();
-  if (typeof value === 'object') return JSON.stringify(value);
-  return value as SqlValue;
+  return [
+    ...tableDocuments,
+    ...SNAPSHOT_SUPPLEMENT_TABLES.map((tableName) => {
+      const config = TABLE_CONFIGS[tableName];
+      return {
+        operationName: `${config.queryName[0].toUpperCase()}${config.queryName.slice(1)}SnapshotSupplement`,
+        document: buildSyncQuery(config.queryName, true, true),
+      };
+    }),
+    { operationName: 'SyncDeletions', document: SYNC_DELETIONS_QUERY },
+    { operationName: 'ConfirmSprayWallVisibility', document: CONFIRM_SPRAY_WALL_VISIBILITY_QUERY },
+  ];
 }
 
 async function upsertDocuments(
@@ -761,75 +834,33 @@ async function upsertDocuments(
 ): Promise<boolean> {
   if (documents.length === 0) return true;
 
-  // Unknown columns are SKIPPED, not fatal: the backend deploys before OTA
-  // clients update, so a newly-added server column must not brick every older
-  // client's sync loop. SQL safety is unaffected — the statement's column list
-  // below is derived from the allowlist intersection, never from document keys.
-  // Drift still surfaces in telemetry (once per table+column per app launch),
-  // so a resolver emitting a misnamed column stays observable.
-  const allowedColumnSet = new Set(allowedColumns);
-  const transientColumnSet = new Set(transientColumns);
-  for (const document of documents) {
-    const unknownColumns = Object.keys(document).filter(
-      (column) => !allowedColumnSet.has(column) && !transientColumnSet.has(column),
-    );
-    for (const unknownColumn of unknownColumns) {
-      reportExtraColumn(onSchemaDrift, { origin: 'pull', tableName, column: unknownColumn });
-    }
-  }
-
-  // Columns are the union of allowed columns present anywhere in the page (not
-  // per-document) — this was already true before batching, since this filter
-  // ran once over the whole `documents` array. Batching depends on it: every
-  // row in a multi-row VALUES clause must bind the same column list. A
-  // document missing a page-wide column binds NULL for it below, same as the
-  // single-row INSERT OR REPLACE did (INSERT OR REPLACE still does a whole-row
-  // replace, so this matches today's semantics, not just today's SQL shape).
-  const columns = allowedColumns.filter((column) =>
-    documents.some((document) => Object.prototype.hasOwnProperty.call(document, column)),
-  );
-  if (columns.length === 0) {
-    throw new Error(`Sync document for ${tableName} did not contain any allowed columns`);
-  }
-
-  const chunkSize = multiRowChunkSize(columns.length);
-  // At most two distinct row counts occur in a page (full chunks + a smaller
-  // final chunk), so caching the built SQL by row count avoids rebuilding the
-  // same multi-row VALUES string for every full chunk.
-  const sqlByRowCount = new Map<number, string>();
-  const sqlForRowCount = (rowCount: number): string => {
-    let sql = sqlByRowCount.get(rowCount);
-    if (!sql) {
-      sql = buildMultiRowInsertSql(tableName, columns, rowCount, page?.preserveNewerRows);
-      sqlByRowCount.set(rowCount, sql);
-    }
-    return sql;
-  };
-
   // One exclusive transaction per page (≤ PAGE_LIMIT rows): a big board pull is
   // thousands of pages, and a per-50-row transaction multiplied every page's
   // commit overhead by 10 while giving the drainer no meaningful extra window —
   // it can interleave between pages either way.
   let committed = false;
-  await runPullWrite(db, async (transaction) => {
-    // A retried attempt re-runs this whole body, and the rollback of the failed one
-    // means none of its rows are there — so reset rather than carry the last
-    // attempt's verdict into this one.
-    committed = false;
-    if (page && !page.canWrite()) return;
-    for (let chunkStart = 0; chunkStart < documents.length; chunkStart += chunkSize) {
-      const chunk = documents.slice(chunkStart, chunkStart + chunkSize);
-      const values: SqlValue[] = [];
-      for (const document of chunk) {
-        for (const column of columns) {
-          values.push(toSqliteValue(document[column]));
-        }
-      }
-      await transaction.runAsync(sqlForRowCount(chunk.length), values);
-    }
-    await page?.afterUpsert(transaction);
-    committed = true;
-  });
+  await runPullWrite(
+    db,
+    async (transaction) => {
+      // A retried attempt re-runs this whole body, and the rollback of the failed one
+      // means none of its rows are there — so reset rather than carry the last
+      // attempt's verdict into this one.
+      committed = false;
+      if (page && !page.canWrite()) return;
+      await writePullDocuments(
+        transaction,
+        tableName,
+        documents,
+        allowedColumns,
+        transientColumns,
+        page?.preserveNewerRows ?? false,
+        onSchemaDrift,
+      );
+      await page?.afterUpsert(transaction);
+      committed = true;
+    },
+    { site: 'pull-page' },
+  );
   return committed;
 }
 
@@ -849,9 +880,60 @@ function assertSyncPageProgress(result: SyncResult, cursor: SyncCursorInput | un
   }
 }
 
+/** Wall identity is exact; renderer queries append viewer/version arguments. */
+function invalidateDeletedSprayWalls(invalidations: InvalidationBatch, rows: Record<string, unknown>[]): void {
+  for (const row of rows) {
+    if (typeof row.layout_id === 'number') {
+      invalidations.addFilters({ queryKey: ['sprayWallByLayout', row.layout_id], exact: true });
+    }
+    if (typeof row.board_uuid === 'string') {
+      for (const namespace of ['sprayWallRenderData', 'sprayWallWithVersions']) {
+        invalidations.addFilters({ queryKey: [namespace, row.board_uuid] });
+      }
+    }
+  }
+}
+
+/**
+ * A refresh replay's page lacks a column the replay exists to fill: the backend
+ * it reached predates that column (an OTA preview pointed at an older prod
+ * backend, or a client OTA that beat the backend deploy). Thrown before the page
+ * writes anything, so the replay's revision stays unadvanced. pullSync's replay
+ * loop catches it per table and defers that replay to a later cycle instead of
+ * failing the whole sync.
+ */
+class RefreshColumnsMissingError extends Error {
+  constructor(tableName: string, columns: string[]) {
+    super(`Sync refresh for ${tableName} is missing columns: ${columns.join(', ')}`);
+    this.name = 'RefreshColumnsMissingError';
+  }
+}
+
+/** Only schema validation can retire the optimization; transport/auth failures retain resumable coverage. */
+// GraphQL validation messages identify servers that predate these optional
+// arguments. This compatibility heuristic falls back to ordinary paging while
+// retaining the legacy cursor; it never claims missing artifact coverage.
+function rejectsSnapshotSupplement(error: unknown, depth = 0): boolean {
+  if (typeof error !== 'object' || error === null || depth > 3) return false;
+  const record = error as Record<string, unknown>;
+  if (
+    typeof record.message === 'string' &&
+    /Unknown (?:argument "(?:audience|snapshotClimbWatermark)"|type "SyncAudience")/.test(record.message)
+  )
+    return true;
+  if (
+    Array.isArray(record.errors) &&
+    record.errors.some((entry: unknown) => rejectsSnapshotSupplement(entry, depth + 1))
+  )
+    return true;
+  if (record.response && rejectsSnapshotSupplement(record.response, depth + 1)) return true;
+  return record.cause !== error && rejectsSnapshotSupplement(record.cause, depth + 1);
+}
+
 async function syncTable(
   db: OfflineDatabase,
-  queryClient: QueryInvalidator,
+  /** The cycle's batch; pullSync flushes it at the end of the phase. */
+  invalidations: InvalidationBatch,
   graphqlFetch: <T>(query: string, variables?: Record<string, unknown>) => Promise<T>,
   tableName: string,
   /** The purge token pullSync captured at CYCLE start — see `cycleAborted` there. */
@@ -862,6 +944,9 @@ async function syncTable(
   refresh?: { state: SchemaRefreshState; shouldContinue: () => Promise<boolean> },
   /** Per-page side-effect sink; see DocumentsPulledSink. */
   onDocumentsPulled?: DocumentsPulledSink,
+  onEmptyPage?: () => Promise<boolean>,
+  viewerUserId?: string,
+  shouldContinueScope?: () => Promise<boolean>,
 ): Promise<{ reachedTail: boolean; rowsProcessed: number; resumedFromCheckpoint: boolean }> {
   const config = TABLE_CONFIGS[tableName];
   if (!config) throw new Error(`No sync config for table: ${tableName}`);
@@ -875,7 +960,9 @@ async function syncTable(
 
   const checkpointKey = getCheckpointKey(tableName, boardScope?.scopeKey);
   const checkpoint = refresh?.state ?? (await getCheckpoint(db, checkpointKey));
-  const revision = boardScope ? config.refreshRevision : undefined;
+  let supplement =
+    !refresh && boardScope && boardScope.boardType !== 'spray' ? getSnapshotSupplement(checkpoint, viewerUserId) : null;
+  const revision = boardScope ? refreshRevisionFor(tableName, boardScope.boardType) : undefined;
   const previousRefresh =
     revision && boardScope ? await getSchemaRefreshState(db, tableName, boardScope.scopeKey) : null;
   let fullDownload =
@@ -891,10 +978,12 @@ async function syncTable(
   // a checkpoint behind.
   const resumedFromCheckpoint = checkpoint !== null;
   const query = buildSyncQuery(config.queryName, config.isPerBoard);
+  const supplementalQuery = buildSyncQuery(config.queryName, config.isPerBoard, true);
 
   let cursor: SyncCursorInput | undefined = checkpoint
     ? { updatedAt: checkpoint.updatedAt, syncSeq: checkpoint.syncSeq }
     : undefined;
+  if (supplement) cursor = supplement.cursor;
   let totalProcessed = 0;
   let completedAtTail = false;
   const finish = (reachedTail: boolean) => {
@@ -915,18 +1004,71 @@ async function syncTable(
 
   let hasMore = true;
   try {
+    // An older writer replaces this whole checkpoint. Missing/corrupt or another
+    // viewer's metadata always keeps the ordinary saved cursor, never artifact W.
+    if (checkpoint?.snapshotSupplement && !supplement && !refresh) {
+      let cleared = false;
+      await runPullWrite(
+        db,
+        async (transaction) => {
+          cleared = false;
+          if (!canWrite()) return;
+          await setCheckpoint(transaction, checkpointKey, {
+            updatedAt: checkpoint.updatedAt,
+            syncSeq: checkpoint.syncSeq,
+          });
+          cleared = true;
+        },
+        { site: 'supplement-clear' },
+      );
+      if (!cleared) return finish(false);
+    }
     while (hasMore) {
       // Sign-out is wiping local data: stop before this page writes the old
       // user's rows back (mirrors the drainer's guard).
-      if (!canWrite() || (refresh && !(await refresh.shouldContinue())) || !canWrite()) return finish(false);
+      if (
+        !canWrite() ||
+        (refresh && !(await refresh.shouldContinue())) ||
+        (shouldContinueScope && !(await shouldContinueScope())) ||
+        !canWrite()
+      )
+        return finish(false);
       const variables: Record<string, unknown> = { cursor, limit: PAGE_LIMIT };
       if (config.isPerBoard && boardScope) {
         variables.boardType = boardScope.boardType;
         variables.layoutId = boardScope.layoutId;
         variables.sizeId = boardScope.sizeId;
+        if (boardScope.sprayWallUuid) variables.sprayWallUuid = boardScope.sprayWallUuid;
+      }
+      if (supplement) {
+        variables.audience = 'SNAPSHOT_SUPPLEMENTAL';
+        variables.snapshotClimbWatermark = supplement.climbWatermark;
       }
 
-      const response = await graphqlFetch<Record<string, SyncResult>>(query, variables);
+      let response: Record<string, SyncResult>;
+      try {
+        response = await graphqlFetch<Record<string, SyncResult>>(supplement ? supplementalQuery : query, variables);
+      } catch (cause) {
+        if (!supplement || !rejectsSnapshotSupplement(cause)) throw cause;
+        let cleared = false;
+        await runPullWrite(
+          db,
+          async (transaction) => {
+            cleared = false;
+            if (!canWrite()) return;
+            await setCheckpoint(transaction, checkpointKey, {
+              updatedAt: checkpoint!.updatedAt,
+              syncSeq: checkpoint!.syncSeq,
+            });
+            cleared = true;
+          },
+          { site: 'supplement-clear' },
+        );
+        if (!cleared) return finish(false);
+        supplement = null;
+        cursor = { updatedAt: checkpoint!.updatedAt, syncSeq: checkpoint!.syncSeq };
+        continue;
+      }
       const result = response[config.queryName];
 
       // Re-check after the await: the wipe (or this scope's purge) may have
@@ -935,17 +1077,40 @@ async function syncTable(
       if (isSigningOut() || hasPurgeLanded(purgeToken, purgeKey) || isBackgrounded()) return finish(false);
 
       assertSyncPageProgress(result, cursor);
-      if (result.documents.length === 0) break;
-      const missingRefreshColumns = (config.refreshColumns ?? []).filter((column) =>
+      if (result.documents.length === 0) {
+        if (supplement) {
+          const artifactWatermark = supplement.artifactWatermark;
+          let promoted = false;
+          await runPullWrite(
+            db,
+            async (transaction) => {
+              promoted = false;
+              if (!canWrite()) return;
+              await setCheckpoint(transaction, checkpointKey, artifactWatermark);
+              promoted = true;
+            },
+            { site: 'supplement-promote' },
+          );
+          if (!promoted) return finish(false);
+          supplement = null;
+          cursor = artifactWatermark;
+          lastCursor = artifactWatermark;
+          continue;
+        }
+        if (onEmptyPage && (await onEmptyPage())) return finish(true);
+        break;
+      }
+      const missingRefreshColumns = refreshColumnsFor(tableName, boardScope?.boardType).filter((column) =>
         result.documents.some((document) => !Object.prototype.hasOwnProperty.call(document, column)),
       );
       if (refresh && missingRefreshColumns.length > 0) {
-        throw new Error(`Sync refresh for ${tableName} is missing columns: ${missingRefreshColumns.join(', ')}`);
+        throw new RefreshColumnsMissingError(tableName, missingRefreshColumns);
       }
       // A later ordinary delta can also erase a previously repaired field.
       // Invalidate coverage even when this catalog already completed a refresh.
       const clearDownloadCoverage = !refresh && missingRefreshColumns.length > 0;
       if (clearDownloadCoverage) fullDownload = false;
+      const pageSupplement = supplement;
 
       const committed = await upsertDocuments(
         db,
@@ -956,15 +1121,35 @@ async function syncTable(
         onSchemaDrift,
         {
           canWrite,
-          preserveNewerRows: !!refresh,
+          preserveNewerRows:
+            !!refresh ||
+            !!pageSupplement ||
+            (boardScope?.boardType === 'spray' && (tableName === 'board_climbs' || tableName === 'board_climb_stats')),
           afterUpsert: async (transaction) => {
-            if (!refresh) await setCheckpoint(transaction, checkpointKey, result.cursor);
+            if (tableName === 'board_climbs' && boardScope?.boardType === 'spray') {
+              // A targeted saved-row mirror can move the derived index ahead
+              // of delayed ordinary or refresh rows. Rebuild bounded spray
+              // layouts on next use, and fence in-flight index work atomically.
+              await clearLayoutHoldIndex(transaction, boardScope.boardType, boardScope.layoutId);
+            }
+            if (!refresh) {
+              const nextCheckpoint = pageSupplement
+                ? result.hasMore
+                  ? {
+                      updatedAt: checkpoint!.updatedAt,
+                      syncSeq: checkpoint!.syncSeq,
+                      snapshotSupplement: { ...pageSupplement, cursor: result.cursor },
+                    }
+                  : pageSupplement.artifactWatermark
+                : result.cursor;
+              await setCheckpoint(transaction, checkpointKey, nextCheckpoint);
+            }
             if (clearDownloadCoverage && boardScope) {
               await transaction.runAsync('DELETE FROM sync_meta WHERE key = ?', [
                 schemaRefreshKey(tableName, boardScope.scopeKey),
               ]);
             }
-            if (revision && boardScope && (refresh || fullDownload)) {
+            if (!pageSupplement && revision && boardScope && (refresh || fullDownload)) {
               if (!result.hasMore) {
                 await markSchemaRefreshComplete(
                   transaction,
@@ -987,7 +1172,7 @@ async function syncTable(
         },
       );
       if (!committed) return finish(false);
-      lastCursor = result.cursor;
+      lastCursor = pageSupplement && !result.hasMore ? pageSupplement.artifactWatermark : result.cursor;
 
       // Side effects that belong to the page but not to the row — today only the
       // spray-wall photo, fetched with the presigned URL the page carried and
@@ -1012,10 +1197,21 @@ async function syncTable(
       totalProcessed += result.documents.length;
       onProgress?.(totalProcessed);
 
-      cursor = { updatedAt: result.cursor.updatedAt, syncSeq: result.cursor.syncSeq };
-      hasMore = result.hasMore;
+      if (pageSupplement) {
+        supplement = result.hasMore ? { ...pageSupplement, cursor: result.cursor } : null;
+        cursor = result.hasMore ? result.cursor : pageSupplement.artifactWatermark;
+        // Artifact coverage plus supplementation is a prefix; ordinary deltas
+        // still owe the rows that changed after the artifact.
+        hasMore = true;
+      } else {
+        cursor = { updatedAt: result.cursor.updatedAt, syncSeq: result.cursor.syncSeq };
+        hasMore = result.hasMore;
+      }
     }
 
+    // A retry can arrive during the terminal page too. Its rows remain committed,
+    // but the queued snapshot retry must run before this scope declares completion.
+    if (shouldContinueScope && !(await shouldContinueScope())) return finish(false);
     if (revision && boardScope && (refresh || fullDownload) && !completedAtTail) {
       let completed = false;
       // The read-then-upgrade case runPullWrite's docblock names: in `'refresh'`
@@ -1023,18 +1219,22 @@ async function syncTable(
       // before #5302 this transaction's later write had to upgrade a READ
       // transaction and lost instantly under any contention, `busy_timeout`
       // notwithstanding.
-      await runPullWrite(db, async (transaction) => {
-        completed = false;
-        if (!canWrite()) return;
-        await markSchemaRefreshComplete(
-          transaction,
-          tableName,
-          boardScope.scopeKey,
-          lastCursor,
-          refresh ? 'refresh' : 'download',
-        );
-        completed = true;
-      });
+      await runPullWrite(
+        db,
+        async (transaction) => {
+          completed = false;
+          if (!canWrite()) return;
+          await markSchemaRefreshComplete(
+            transaction,
+            tableName,
+            boardScope.scopeKey,
+            lastCursor,
+            refresh ? 'refresh' : 'download',
+          );
+          completed = true;
+        },
+        { site: 'refresh-tail' },
+      );
       if (!completed) return finish(false);
     }
 
@@ -1045,18 +1245,16 @@ async function syncTable(
     // Those changes must become visible even if the next retry has no rows.
     if (totalProcessed > 0) {
       // A per-board table only changed this board: board-scoped keys (the
-      // heatmap, similar climbs) refresh for it alone.
-      const changedBoard = config.isPerBoard ? boardScope : undefined;
-      for (const key of config.invalidateKeys) {
-        queryClient.invalidateQueries(scopedInvalidateFilters(key, changedBoard));
-      }
+      // heatmap, similar climbs, the climb lists) refresh for it alone.
+      invalidations.add(config.invalidateKeys, config.isPerBoard ? boardScope : undefined);
     }
   }
 }
 
 async function processDeletions(
   db: OfflineDatabase,
-  queryClient: QueryInvalidator,
+  /** The cycle's batch; pullSync flushes it with the user tables. */
+  invalidations: InvalidationBatch,
   graphqlFetch: <T>(query: string, variables?: Record<string, unknown>) => Promise<T>,
   /** The purge token pullSync captured at CYCLE start — see `cycleAborted` there. */
   purgeToken: PurgeToken,
@@ -1102,131 +1300,171 @@ async function processDeletions(
     // some rows could be deleted while the page checkpoint stayed behind. One
     // exclusive transaction gives SQLite one lock/commit per page and ensures a
     // failed tombstone rolls the entire page back for a clean retry.
-    const pageInvalidatedKeys = new Set<string>();
+    // What the page has to tell the UI, queued once the page has committed.
+    const pageInvalidations: { keys: InvalidateKeys; board?: BoardScopeKey }[] = [];
     // Rows the page actually removed, per table, with the columns that table
     // asked to keep. Filled inside the transaction, used after it commits.
     const pageDeletedRows = new Map<string, Record<string, unknown>[]>();
     try {
-      await runPullWrite(db, async (transaction) => {
-        // Expo opens this wrapper with deferred BEGIN: entering the callback is
-        // NOT writer-lock ownership — `beginImmediateWrite` inside runPullWrite is
-        // what takes it, before the first statement below rather than because of
-        // it. Re-writing the page's current cursor (or creating the epoch cursor on
-        // page one) then runs with the writer lock already held, so it still
-        // waits behind a purge and the guard after it still rolls this write back
-        // if the purge won.
-        // If we won, a purge cannot finish until this transaction commits or
-        // rolls back. This closes the queue gap where a stale page could otherwise
-        // commit after a wipe that landed between callback entry and first DELETE.
-        await setCheckpoint(transaction, checkpointKey, cursor ?? epochCursor);
-        if (isSigningOut() || hasPurgeLanded(purgeToken) || isBackgrounded()) {
-          throw new DeletionPageAbortedError();
-        }
-
-        for (const deletion of result.deletions) {
-          const config = TABLE_CONFIGS[deletion.tableName];
-          if (!config) continue;
-
-          const pkColumns = config.primaryKeyColumns;
-
-          // Resurrection guard: a tombstone must not delete a row NEWER than the
-          // deletion (delete-then-re-add on another device — the re-added row and
-          // the stale tombstone can arrive in the same pull). Rows the tombstone
-          // post-dates are deleted; ties delete too (same-transaction recreate),
-          // which converges because deletions are applied BEFORE the table pulls.
-          const hasUpdatedAt = config.localColumns.includes('updated_at');
-          const guardClause = hasUpdatedAt ? ' AND (updated_at IS NULL OR updated_at <= ?)' : '';
-          const guardParams = hasUpdatedAt ? [deletion.deletedAt] : [];
-
-          if (pkColumns.length === 1) {
-            // Read what the platform will need once the row is gone. Only the
-            // single-key branch: `captureOnDelete` exists for `spray_walls`,
-            // whose key is one column, and a composite-key table would need the
-            // same split the DELETE below does — add it there when one asks.
-            let captured: Record<string, unknown> | null = null;
-            // A climb leaves the device-derived holds index with it (below). Its
-            // postings are per (board, layout), so read those now, before the row
-            // is gone.
-            const deletedClimb =
-              deletion.tableName === 'board_climbs'
-                ? await transaction.getFirstAsync<{ board_type: string | null; layout_id: number | null }>(
-                    'SELECT board_type, layout_id FROM board_climbs WHERE uuid = ?',
-                    [deletion.recordId],
-                  )
-                : null;
-            if (config.captureOnDelete && config.captureOnDelete.length > 0) {
-              captured = await transaction.getFirstAsync<Record<string, unknown>>(
-                `SELECT ${config.captureOnDelete.join(', ')} FROM ${deletion.tableName} WHERE ${pkColumns[0]} = ?`,
-                [deletion.recordId],
-              );
-            }
-            const deleteResult = await transaction.runAsync(
-              `DELETE FROM ${deletion.tableName} WHERE ${pkColumns[0]} = ?${guardClause}`,
-              [deletion.recordId, ...guardParams],
-            );
-            // Local cascade: the server's whole-playlist delete cascades
-            // playlist_climbs in Postgres but deliberately emits NO child
-            // tombstones (see 0144's NULL-parent guard), and the local SQLite has
-            // no FK cascade — without this, a deleted playlist's climb rows would
-            // accumulate as invisible orphans forever. Gated on the parent delete
-            // actually removing a row so a resurrection-guarded (stale) playlist
-            // tombstone doesn't strip a live playlist's climbs.
-            if (deletion.tableName === 'playlists' && (deleteResult?.changes ?? 0) > 0) {
-              await transaction.runAsync(`DELETE FROM playlist_climbs WHERE playlist_uuid = ?`, [deletion.recordId]);
-            }
-            // Same local cascade for the device-derived holds index: nothing on
-            // the server tombstones it, because the server never sent it. Gated
-            // the same way, so a resurrection-guarded tombstone keeps a live
-            // climb indexed.
-            if (deletedClimb?.board_type && deletedClimb.layout_id !== null && (deleteResult?.changes ?? 0) > 0) {
-              await removeClimbFromHoldIndex(transaction, {
-                uuid: deletion.recordId,
-                boardType: deletedClimb.board_type,
-                layoutId: deletedClimb.layout_id,
-              });
-            }
-            // Only when the row really went: a resurrection-guarded tombstone
-            // leaves a live row behind, and deleting its photograph would blank
-            // a wall the device still has.
-            if (captured && (deleteResult?.changes ?? 0) > 0) {
-              const rows = pageDeletedRows.get(deletion.tableName) ?? [];
-              rows.push(captured);
-              pageDeletedRows.set(deletion.tableName, rows);
-            }
-          } else {
-            // Backend encodes composite PKs as exactly N colon-separated segments
-            // matching primaryKeyColumns order (e.g. "kilter:uuid:40" for
-            // board_climb_stats with PK [board_type, climb_uuid, angle]). The split
-            // must produce exactly pkColumns.length parts — if not, skip the deletion
-            // rather than silently deleting the wrong row.
-            const recordIdParts = deletion.recordId.split(':');
-            if (recordIdParts.length !== pkColumns.length) {
-              console.warn(
-                `[Sync] Skipping deletion: expected ${pkColumns.length} PK parts for ${deletion.tableName}, got ${recordIdParts.length} from "${deletion.recordId}"`,
-              );
-              continue;
-            }
-            const whereClause = pkColumns.map((col) => `${col} = ?`).join(' AND ');
-            await transaction.runAsync(`DELETE FROM ${deletion.tableName} WHERE ${whereClause}${guardClause}`, [
-              ...recordIdParts,
-              ...guardParams,
-            ]);
+      await runPullWrite(
+        db,
+        async (transaction) => {
+          // A retried attempt starts from a rollback: nothing it found was deleted.
+          pageInvalidations.length = 0;
+          pageDeletedRows.clear();
+          // Expo opens this wrapper with deferred BEGIN: entering the callback is
+          // NOT writer-lock ownership — `beginImmediateWrite` inside runPullWrite is
+          // what takes it, before the first statement below rather than because of
+          // it. Re-writing the page's current cursor (or creating the epoch cursor on
+          // page one) then runs with the writer lock already held, so it still
+          // waits behind a purge and the guard after it still rolls this write back
+          // if the purge won.
+          // If we won, a purge cannot finish until this transaction commits or
+          // rolls back. This closes the queue gap where a stale page could otherwise
+          // commit after a wipe that landed between callback entry and first DELETE.
+          await setCheckpoint(transaction, checkpointKey, cursor ?? epochCursor);
+          if (isSigningOut() || hasPurgeLanded(purgeToken) || isBackgrounded()) {
+            throw new DeletionPageAbortedError();
           }
 
-          for (const key of config.invalidateKeys) {
-            pageInvalidatedKeys.add(JSON.stringify(key));
-          }
-        }
+          for (const deletion of result.deletions) {
+            const config = TABLE_CONFIGS[deletion.tableName];
+            if (!config) continue;
 
-        // A purge/background transition may start while we hold the writer lock.
-        // Roll back before publishing the page cursor so the purge can take the
-        // lock next; if it starts after this guard, it necessarily runs after our
-        // commit and clears this cursor itself.
-        if (isSigningOut() || hasPurgeLanded(purgeToken) || isBackgrounded()) {
-          throw new DeletionPageAbortedError();
-        }
-        await setCheckpoint(transaction, checkpointKey, result.cursor);
-      });
+            const pkColumns = config.primaryKeyColumns;
+
+            // Resurrection guard: a tombstone must not delete a row NEWER than the
+            // deletion (delete-then-re-add on another device — the re-added row and
+            // the stale tombstone can arrive in the same pull). Rows the tombstone
+            // post-dates are deleted; ties delete too (same-transaction recreate),
+            // which converges because deletions are applied BEFORE the table pulls.
+            const hasUpdatedAt = config.localColumns.includes('updated_at');
+            const guardClause = hasUpdatedAt ? ' AND (updated_at IS NULL OR updated_at <= ?)' : '';
+            const guardParams = hasUpdatedAt ? [deletion.deletedAt] : [];
+            let rowsDeleted = 0;
+            // Set for a deleted climb: the one board whose lists lost a row.
+            let changedBoard: BoardScopeKey | undefined;
+
+            if (pkColumns.length === 1) {
+              // Read what the platform will need once the row is gone. Only the
+              // single-key branch: `captureOnDelete` exists for `spray_walls`,
+              // whose key is one column, and a composite-key table would need the
+              // same split the DELETE below does — add it there when one asks.
+              let captured: Record<string, unknown> | null = null;
+              // A climb leaves the device-derived holds index with it (below). Its
+              // postings are per (board, layout), so read those now, before the row
+              // is gone.
+              const deletedClimb =
+                deletion.tableName === 'board_climbs'
+                  ? await transaction.getFirstAsync<{ board_type: string | null; layout_id: number | null }>(
+                      'SELECT board_type, layout_id FROM board_climbs WHERE uuid = ?',
+                      [deletion.recordId],
+                    )
+                  : null;
+              if (config.captureOnDelete && config.captureOnDelete.length > 0) {
+                captured = await transaction.getFirstAsync<Record<string, unknown>>(
+                  `SELECT ${config.captureOnDelete.join(', ')} FROM ${deletion.tableName} WHERE ${pkColumns[0]} = ?`,
+                  [deletion.recordId],
+                );
+              }
+              const deleteResult = await transaction.runAsync(
+                `DELETE FROM ${deletion.tableName} WHERE ${pkColumns[0]} = ?${guardClause}`,
+                [deletion.recordId, ...guardParams],
+              );
+              rowsDeleted = deleteResult?.changes ?? 0;
+              if (deletedClimb?.board_type && deletedClimb.layout_id !== null) {
+                changedBoard = { boardType: deletedClimb.board_type, layoutId: deletedClimb.layout_id };
+              }
+              // Local cascade: the server's whole-playlist delete cascades
+              // playlist_climbs in Postgres but deliberately emits NO child
+              // tombstones (see 0144's NULL-parent guard), and the local SQLite has
+              // no FK cascade — without this, a deleted playlist's climb rows would
+              // accumulate as invisible orphans forever. Gated on the parent delete
+              // actually removing a row so a resurrection-guarded (stale) playlist
+              // tombstone doesn't strip a live playlist's climbs.
+              if (deletion.tableName === 'playlists' && (deleteResult?.changes ?? 0) > 0) {
+                await transaction.runAsync(`DELETE FROM playlist_climbs WHERE playlist_uuid = ?`, [deletion.recordId]);
+              }
+              // Same local cascade for the device-derived holds index: nothing on
+              // the server tombstones it, because the server never sent it. Gated
+              // the same way, so a resurrection-guarded tombstone keeps a live
+              // climb indexed.
+              if (deletedClimb?.board_type && deletedClimb.layout_id !== null && (deleteResult?.changes ?? 0) > 0) {
+                await removeClimbFromHoldIndex(transaction, {
+                  uuid: deletion.recordId,
+                  boardType: deletedClimb.board_type,
+                  layoutId: deletedClimb.layout_id,
+                });
+              }
+              // Only when the row really went: a resurrection-guarded tombstone
+              // leaves a live row behind, and deleting its photograph would blank
+              // a wall the device still has.
+              if (captured && (deleteResult?.changes ?? 0) > 0) {
+                const rows = pageDeletedRows.get(deletion.tableName) ?? [];
+                rows.push(captured);
+                pageDeletedRows.set(deletion.tableName, rows);
+              }
+            } else {
+              // Backend encodes composite PKs as exactly N colon-separated segments
+              // matching primaryKeyColumns order (e.g. "kilter:uuid:40" for
+              // board_climb_stats with PK [board_type, climb_uuid, angle]). The split
+              // must produce exactly pkColumns.length parts — if not, skip the deletion
+              // rather than silently deleting the wrong row.
+              const recordIdParts = deletion.recordId.split(':');
+              if (recordIdParts.length !== pkColumns.length) {
+                console.warn(
+                  `[Sync] Skipping deletion: expected ${pkColumns.length} PK parts for ${deletion.tableName}, got ${recordIdParts.length} from "${deletion.recordId}"`,
+                );
+                continue;
+              }
+              const whereClause = pkColumns.map((col) => `${col} = ?`).join(' AND ');
+              const deleteResult = await transaction.runAsync(
+                `DELETE FROM ${deletion.tableName} WHERE ${whereClause}${guardClause}`,
+                [...recordIdParts, ...guardParams],
+              );
+              rowsDeleted = deleteResult?.changes ?? 0;
+              // A stats or grade row hangs off a climb, and the server deletes them
+              // ahead of it, so the climb is normally still here to say which board
+              // this was. Without it a deleted wall climb with one ascent would
+              // refresh every board's lists through its stats tombstone. Only read
+              // for a row that was really removed: most of these name boards the
+              // device never held.
+              const climbUuid = recordIdParts[pkColumns.indexOf('climb_uuid')];
+              if (config.isPerBoard && rowsDeleted > 0 && climbUuid !== undefined) {
+                const climb = await transaction.getFirstAsync<{ board_type: string | null; layout_id: number | null }>(
+                  'SELECT board_type, layout_id FROM board_climbs WHERE uuid = ?',
+                  [climbUuid],
+                );
+                if (climb?.board_type && climb.layout_id !== null) {
+                  changedBoard = { boardType: climb.board_type, layoutId: climb.layout_id };
+                }
+              }
+            }
+
+            // Board tombstones go to every device, for every board (#6302), in
+            // volume: a fresh install replays thousands of stats rows for boards it
+            // never held. One that removes nothing here says nothing, where it used
+            // to refetch every climb list on screen. The price is a board that is
+            // not downloaded: its lists come from the network, and a climb deleted
+            // there now stays until the list goes stale, like any other change made
+            // on the server. A user-table tombstone always counts. Those are the
+            // climber's own rows, few, and can be on screen from the network without
+            // ever having been pulled into SQLite.
+            if (config.isPerBoard && rowsDeleted === 0) continue;
+            pageInvalidations.push({ keys: config.invalidateKeys, board: changedBoard });
+          }
+
+          // A purge/background transition may start while we hold the writer lock.
+          // Roll back before publishing the page cursor so the purge can take the
+          // lock next; if it starts after this guard, it necessarily runs after our
+          // commit and clears this cursor itself.
+          if (isSigningOut() || hasPurgeLanded(purgeToken) || isBackgrounded()) {
+            throw new DeletionPageAbortedError();
+          }
+          await setCheckpoint(transaction, checkpointKey, result.cursor);
+        },
+        { site: 'deletions-page' },
+      );
     } catch (error) {
       if (error instanceof DeletionPageAbortedError) return { reachedTail: false };
       throw error;
@@ -1245,14 +1483,15 @@ async function processDeletions(
       }
     }
 
-    // Invalidate immediately after this page commits. Deferring all keys until
-    // the stream tail meant page N could commit and advance its checkpoint,
-    // then a later request could fail before those deleted rows were evicted
-    // from React Query. The retry resumes after page N, so that stale UI would
-    // otherwise survive for the rest of the app process.
-    for (const serializedKey of pageInvalidatedKeys) {
-      queryClient.invalidateQueries({ queryKey: JSON.parse(serializedKey) as string[] });
-    }
+    const deletedWalls = pageDeletedRows.get('spray_walls');
+    if (deletedWalls) invalidateDeletedSprayWalls(invalidations, deletedWalls);
+
+    // Queue as soon as this page commits, not at the stream tail: page N can
+    // commit and advance its checkpoint, then a later request can fail. The
+    // retry resumes after page N, so keys only gathered at the tail would leave
+    // those deleted rows in React Query for the rest of the app process. The
+    // cycle flushes the batch on every exit, a throw included.
+    for (const { keys, board } of pageInvalidations) invalidations.add(keys, board);
 
     totalProcessed += result.deletions.length;
     onProgress?.(totalProcessed);
@@ -1296,8 +1535,9 @@ const MAX_MANIFEST_WAIT_FAILURES = 2;
 const MANIFEST_FAIL_OPEN_RETRY_DELAY_MS = 5 * 60_000;
 const manifestFailureCounts = new WeakMap<OfflineDatabase, { wipeEpoch: number; count: number }>();
 
-function isBackgroundTransferDecodeError(cause: unknown): boolean {
-  return cause instanceof Error && cause.name === 'SnapshotBackgroundTransferInterruptedError';
+function isSnapshotTransferInterruption(cause: unknown): boolean {
+  const failure = classifySnapshotTransferFailure(cause);
+  return failure?.reason === 'network' || failure?.reason === 'background-transfer-decode';
 }
 
 function settleManifestPublicationStateOnce(
@@ -1360,6 +1600,10 @@ async function settleBootstrapFailure(
     builtAt: string | null;
     now: number;
     random: () => number;
+    /** Read inside the writer lock; false refuses the whole settle (a wipe landed). */
+    canWrite: () => boolean;
+    /** Stamp the paged-fallback marker even when the scope is not terminal. */
+    forcePagedFallback?: boolean;
   },
 ): Promise<{
   state: BootstrapRetryState;
@@ -1368,28 +1612,41 @@ async function settleBootstrapFailure(
   cause: unknown;
   /** False for the free manifest-transport case: nothing was written to sync_meta. */
   persisted: boolean;
+  /** True when a wipe refused the write: nothing was written, and the scope is going away. */
+  refused: boolean;
 }> {
   const { state, cause, stage, builtAt, now, random } = input;
   const failureKind = classifyBootstrapFailure({ cause, stage });
-  const expected = isNetworkError(cause) || isBackgroundTransferDecodeError(cause);
+  const expected = classifySnapshotTransferFailure(cause)?.expected ?? false;
   if (stage === 'manifest') {
     // The manifest is one global object shared by every scope in this cycle.
     // Charging a per-scope budget for a bad response can terminal every board
     // on a device from one broken publish. Keep all manifest failures cap- and
     // cooldown-exempt; the scheduler supplies the bounded-frequency retry.
-    return { state, failureKind, expected, cause, persisted: false };
+    return { state, failureKind, expected, cause, persisted: false, refused: false };
   }
   const scheduled = nextRetryState({ state, failureKind, builtAt, now, random });
-  const written = await writeBootstrapRetryState(db, scopeKey, scheduled);
-  if (isTerminal(written)) {
-    await markBootstrapPagedFallback(db, scopeKey);
-  } else {
-    // Preserve the prior fallback marker until the new attempt has a durable
-    // outcome. Clearing it here avoids an abort window where the UI observes a
-    // transient decision that this run never finished making.
-    await clearBootstrapPagedFallback(db, scopeKey);
-  }
-  return { state: written, failureKind, expected, cause, persisted: true };
+  // The budget, its legacy mirror and the fallback caption are one decision, so
+  // they commit together, behind the wipe guard (issue #5851).
+  const written = await runPullWrite(
+    db,
+    async (transaction) => {
+      if (!input.canWrite()) return null;
+      const rows = await writeBootstrapRetryRows(transaction, scopeKey, scheduled);
+      if (input.forcePagedFallback || isTerminal(rows)) {
+        await markBootstrapPagedFallback(transaction, scopeKey);
+      } else {
+        // Preserve the prior fallback marker until the new attempt has a durable
+        // outcome. Clearing it here avoids an abort window where the UI observes a
+        // transient decision that this run never finished making.
+        await clearBootstrapPagedFallback(transaction, scopeKey);
+      }
+      return rows;
+    },
+    { site: 'bootstrap-settle', refusedWhen: (rows) => rows === null },
+  );
+  if (!written) return { state, failureKind, expected, cause, persisted: false, refused: true };
+  return { state: written, failureKind, expected, cause, persisted: true, refused: false };
 }
 
 async function resolveManifestOnce(
@@ -1431,6 +1688,31 @@ async function resolveManifestOnce(
   };
   return cache.value;
 }
+
+/** Re-read tap order between scopes; current work is never interrupted. */
+function* prioritizeDownloadScopes(scopes: readonly BoardScope[], getPriorityBoards?: () => readonly string[]) {
+  const remaining = [...scopes];
+  while (remaining.length > 0) {
+    const priorityBoards = getPriorityBoards?.() ?? [];
+    let selectedIndex = 0;
+    let selectedRank = Number.POSITIVE_INFINITY;
+    for (let index = 0; index < remaining.length; index += 1) {
+      const rank = priorityBoards.indexOf(remaining[index].scopeKey);
+      if (rank >= 0 && rank < selectedRank) {
+        selectedIndex = index;
+        selectedRank = rank;
+      }
+    }
+    yield remaining.splice(selectedIndex, 1)[0];
+  }
+}
+
+type ReportScopeDownload = (
+  scopeKey: string,
+  phase: ScopeDownloadPhase,
+  phaseFraction: number | null,
+  detail?: { wireBytes?: number | null; wireBytesDone?: number | null; rowsProcessed?: number; hasGrades?: boolean },
+) => void;
 
 /**
  * Snapshot-bootstrap phase (runs BEFORE deletions). For each enabled scope the
@@ -1514,8 +1796,10 @@ async function resolveManifestOnce(
  * delta pull can land cycles after the import.
  */
 async function runBootstrapPhase(params: {
+  reportDownload: ReportScopeDownload;
   db: OfflineDatabase;
-  queryClient: QueryInvalidator;
+  /** The cycle's batch. An import flushes it at once: nothing later in the phase queues for it. */
+  invalidations: InvalidationBatch;
   source: SnapshotSource;
   scopes: BoardScope[];
   /** The purge token pullSync captured at CYCLE start — see `cycleAborted` there. */
@@ -1524,6 +1808,7 @@ async function runBootstrapPhase(params: {
   emitScopeDownloadStartOnce: (info: ScopeDownloadStartInfo) => Promise<void>;
   /** Per-scope download/import timings + payload size, read back by the Completed event. */
   bootstrapTimings: Map<string, { bytes: number; downloadMs?: number; importMs?: number; rowCount?: number }>;
+  retryRequestsAtBootstrap: Map<string, boolean>;
   stampScopeStart: (scopeKey: string) => Promise<void>;
   phaseTimings: (scopeKey: string) => ScopeDownloadPhaseBreakdown;
   options: SyncOptions | undefined;
@@ -1531,8 +1816,9 @@ async function runBootstrapPhase(params: {
   random: () => number;
 }): Promise<{ skipPagedPull: Set<string>; cycleInterrupted: boolean }> {
   const {
+    reportDownload,
     db,
-    queryClient,
+    invalidations,
     source,
     scopes,
     purgeToken,
@@ -1577,6 +1863,66 @@ async function runBootstrapPhase(params: {
     return null;
   };
 
+  /**
+   * The subset of `teardownVerdict` a WRITE must respect: a sign-out, a global
+   * wipe, or a purge of this scope's own namespace. Backgrounding is left out on
+   * purpose — it pauses new work but has never invalidated a decision this phase
+   * already reached, and the writes below have always landed in the background.
+   */
+  const wipeVerdict = (scopeKey: string): TeardownVerdict | null => {
+    if (isSigningOut() || hasPurgeLanded(purgeToken)) return { reason: 'aborted-wipe', kind: 'cycle' };
+    const namespace = purgeNamespaceForScopeKey(scopeKey);
+    if (namespace !== undefined && hasPurgeLanded(purgeToken, namespace)) {
+      return { reason: 'aborted-wipe', kind: 'scope' };
+    }
+    return null;
+  };
+  /** What a refused write leaves the caller with; `cycle` when no flag says. */
+  const refusedWriteVerdict = (scopeKey: string): TeardownVerdict =>
+    wipeVerdict(scopeKey) ?? { reason: 'aborted-wipe', kind: 'cycle' };
+
+  /**
+   * Every bootstrap-metadata write goes through here (issue #5851): its own
+   * connection opened `BEGIN IMMEDIATE`, the background retry ladder, and the
+   * wipe guard read INSIDE the writer lock. These used to be autocommit writes
+   * on the main connection, where a write is usually a read→write upgrade that
+   * SQLite fails at once rather than waiting — about 15 of them sat outside any
+   * catch and unwound the whole phase on one loss. Resolves false, having
+   * written nothing, when a wipe landed first.
+   */
+  const writeScopeMetadata = (
+    scopeKey: string,
+    site: string,
+    task: (transaction: SqlExecutor) => Promise<void>,
+  ): Promise<boolean> => runGuardedPullWrite(db, { site, canWrite: () => wipeVerdict(scopeKey) === null }, task);
+
+  /**
+   * `writeBootstrapRetryRows` in its own guarded transaction. `alsoInTransaction` puts a
+   * marker that belongs to the same decision in the same commit. Resolves the
+   * state that was written, or null when a wipe refused it.
+   */
+  const writeRetryState = (
+    scopeKey: string,
+    state: BootstrapRetryState,
+    alsoInTransaction?: (transaction: SqlExecutor, written: BootstrapRetryState) => Promise<void>,
+  ): Promise<BootstrapRetryState | null> =>
+    runPullWrite(
+      db,
+      async (transaction) => {
+        if (wipeVerdict(scopeKey) !== null) return null;
+        const written = await writeBootstrapRetryRows(transaction, scopeKey, state);
+        await alsoInTransaction?.(transaction, written);
+        return written;
+      },
+      { site: 'bootstrap-retry-state', refusedWhen: (written) => written === null },
+    );
+
+  /** `markBootstrapPagedFallback`, guarded. False when a wipe refused it. */
+  const markPagedFallback = (scopeKey: string): Promise<boolean> =>
+    writeScopeMetadata(scopeKey, 'bootstrap-paged-fallback', (transaction) =>
+      markBootstrapPagedFallback(transaction, scopeKey),
+    );
+
   // The terminal-event invariant, enforced structurally rather than site by site
   // (issue #4316). Armed at the Started emission below and closed from the
   // per-scope `finally`, so an exit nobody registered — a future `break`, a
@@ -1616,6 +1962,10 @@ async function runBootstrapPhase(params: {
           ...report,
           reason: report.reason ?? classifySnapshotBootstrapFailure(report.cause),
           aborted: report.aborted ?? false,
+          transferCompleted:
+            report.stage === 'import' ||
+            report.stage === 'grades-import' ||
+            report.cause instanceof SnapshotPermanentMissError,
         });
       }
     : undefined;
@@ -1636,6 +1986,21 @@ async function runBootstrapPhase(params: {
     // literal 0 for the same reason. A teardown spends no retry budget, so any
     // other number here would claim a scope had used up an attempt it still has.
     onSnapshotBootstrapError?.({ scopeKey, stage, attempt: 0, cause, expected: true, aborted: true, reason });
+  };
+
+  /**
+   * Close the funnel for a scope whose metadata write a wipe refused, and say
+   * whether the cycle or only this scope stops. For the writes after Started; a
+   * refusal before it exits the way the loop-top check does, without a report.
+   */
+  const abortRefusedWrite = (
+    scopeKey: string,
+    stage: BootstrapErrorInput['stage'],
+    cause: unknown,
+  ): TeardownVerdict['kind'] => {
+    const verdict = refusedWriteVerdict(scopeKey);
+    reportBootstrapAbort(scopeKey, stage, verdict.reason, cause);
+    return verdict.kind;
   };
 
   const onBootstrapMetadataChanged = options?.onBootstrapMetadataChanged;
@@ -1675,152 +2040,220 @@ async function runBootstrapPhase(params: {
   // these are deleted outright in the finally below. Re-fetching a few MB next
   // cycle is the cheaper failure.
   const gradesArtifactPaths = new Set<string>();
-  // Absent = not yet attempted for this layout; null = unavailable this cycle.
-  const gradesDownloadByLayout = new Map<string, { filePath: string } | null>();
+  type GradesDownloadRecord = {
+    controller: AbortController;
+    promise: Promise<{ file: { filePath: string } | null; cause: unknown }>;
+    startedInForeground: boolean;
+    aborted: boolean;
+    abortedReason: SnapshotBootstrapFailureReason | null;
+    suspensionWindowOpen: boolean;
+    progressScopeKey: string | null;
+    fraction: number | null;
+  };
+  const gradesDownloadByLayout = new Map<string, GradesDownloadRecord>();
+  const allGradesDownloads = new Set<GradesDownloadRecord>();
 
-  /**
-   * Import the layout's Boardsesh grades from its separate artifact, replacing
-   * the paged crawl of `board_climb_grades` — the term the whole-layout
-   * artifact never covered, and the reason a Kilter/Tension download takes ~6x
-   * a MoonBoard layout of the same size (issue #4310).
-   *
-   * Called on two paths: straight after a successful whole-layout import, and
-   * — for a scope that was bootstrapped before this shipped, or crashed between
-   * the two transactions — whenever the grades checkpoint is ABSENT on a scope
-   * whose climb catalog is already COMPLETE (`bootstrap-done` or
-   * `scope-complete`). An absent grades checkpoint is proof no grade page was
-   * ever consumed (`syncTable` checkpoints per page), so importing and stamping
-   * at the artifact's watermark cannot skip a row the crawl already had; the
-   * completeness gate is what stops the stamp landing above grade rows whose
-   * climbs a half-finished crawl has not fetched yet.
-   *
-   * Every failure here is free: it never touches the whole-layout attempt
-   * counter, and the worst case is that the scope crawls grades exactly as it
-   * does today.
-   */
+  // Start once per layout before the layout import. The promise always resolves,
+  // including a synchronous throw from an injected downloader.
+  const prefetchGrades = async (
+    scope: BoardScope,
+    entry: SnapshotManifestEntry,
+  ): Promise<GradesDownloadRecord | null> => {
+    const artifact = entry.grades;
+    if (!artifact || !source.downloadGradesArtifact || !isSnapshotEntryUsable(artifact)) return null;
+    if ((await getGradesBootstrapAttempts(db, scope.scopeKey)) >= MAX_GRADES_BOOTSTRAP_ATTEMPTS) return null;
+    const layoutKey = purgeNamespaceKey(scope);
+    const existing = gradesDownloadByLayout.get(layoutKey);
+    if (existing) return existing.aborted ? null : existing;
+    if (teardownVerdict(scope.scopeKey)) return null;
+    const record: GradesDownloadRecord = {
+      controller: new AbortController(),
+      promise: Promise.resolve({ file: null, cause: null }),
+      startedInForeground: !isBackgrounded(),
+      aborted: false,
+      abortedReason: null,
+      suspensionWindowOpen: false,
+      progressScopeKey: null,
+      fraction: 0,
+    };
+    const startedAt = Date.now();
+    let anchor = createDownloadFractionAnchor();
+    const unsubscribe = onTeardown(() => {
+      if (isSigningOut() || hasPurgeLanded(purgeToken, layoutKey)) {
+        record.aborted = true;
+        record.abortedReason = 'aborted-wipe';
+        record.controller.abort();
+      } else if (isBackgrounded()) record.suspensionWindowOpen = true;
+    });
+    record.promise = Promise.resolve()
+      .then(() =>
+        source.downloadGradesArtifact!(artifact, {
+          signal: record.controller.signal,
+          downloadRequest: options?.getDownloadRequestContext?.(scope.scopeKey),
+          onProgress: ({ bytesWritten, totalBytes }) => {
+            if (record.aborted) return;
+            if (!isBackgrounded()) record.suspensionWindowOpen = false;
+            const resolved = resolveDownloadFraction({
+              entry: artifact,
+              bytesWritten,
+              reportedTotalBytes: totalBytes,
+              anchor,
+            });
+            anchor = resolved.anchor;
+            record.fraction = resolved.fraction;
+            if (record.progressScopeKey)
+              reportDownload(
+                record.progressScopeKey,
+                'grades',
+                resolved.fraction === null ? null : resolved.fraction * 0.5,
+              );
+          },
+        }),
+      )
+      .then(
+        (file) => {
+          if (file) gradesArtifactPaths.add(file.filePath);
+          record.fraction = file ? 1 : record.fraction;
+          return { file: file ?? null, cause: null };
+        },
+        (cause: unknown) => {
+          // A foreground byte closes the suspension window. Even with the
+          // window open, HTTP, disk and programming errors spend real retries.
+          if (!record.abortedReason && record.suspensionWindowOpen && isSnapshotTransferInterruption(cause))
+            record.abortedReason = 'aborted-background';
+          return { file: null, cause };
+        },
+      )
+      .finally(() => {
+        unsubscribe();
+        const phases = phaseTimings(scope.scopeKey);
+        phases.gradesDownloadMs = (phases.gradesDownloadMs ?? 0) + Date.now() - startedAt;
+      });
+    gradesDownloadByLayout.set(layoutKey, record);
+    allGradesDownloads.add(record);
+    return record;
+  };
+
+  const gradesVerdict = (scope: BoardScope, record: GradesDownloadRecord): TeardownVerdict | null => {
+    // Background never cancels work which this foreground cycle already started.
+    if (record.aborted || isSigningOut() || hasPurgeLanded(purgeToken, purgeNamespaceKey(scope)))
+      return { reason: 'aborted-wipe', kind: hasPurgeLanded(purgeToken) || isSigningOut() ? 'cycle' : 'scope' };
+    const verdict = teardownVerdict(scope.scopeKey);
+    return verdict?.reason === 'aborted-background' && record.startedInForeground ? null : verdict;
+  };
+
   const importGradesForScope = async (
     scope: BoardScope,
     entry: SnapshotManifestEntry,
+    importedLayout?: { climbWatermark: SyncCheckpoint; artifactBuiltAt?: string },
   ): Promise<TeardownVerdict['kind'] | null> => {
-    const gradesArtifact = entry.grades;
-    if (!gradesArtifact || !source.downloadGradesArtifact) return null;
-    // A grades artifact built at an older client schema would NULL-fill columns
-    // this app added and then stamp the cursor past them — same permanent-miss
-    // rule the whole-layout artifact gets.
-    if (!isSnapshotEntryUsable(gradesArtifact)) return null;
-    if ((await getGradesBootstrapAttempts(db, scope.scopeKey)) >= MAX_GRADES_BOOTSTRAP_ATTEMPTS) return null;
-
-    // One artifact serves every size of a layout, which is exactly why the purge
-    // namespace is keyed the same way — the two must never drift.
-    const layoutKey = purgeNamespaceKey(scope);
-    let gradesDownload = gradesDownloadByLayout.get(layoutKey);
-    if (gradesDownload === undefined) {
-      const preDownloadVerdict = teardownVerdict(scope.scopeKey);
-      if (preDownloadVerdict) return preDownloadVerdict.kind;
-
-      // A background→foreground transition can complete before the native
-      // promise rejects. Latch teardown only for a DEAD transfer; a successful
-      // grades file may still be imported when the app is active again, just
-      // like the retained whole-layout download above.
-      let latchedDownloadVerdict: TeardownVerdict | null = null;
-      const unsubscribeGradesTeardown = onTeardown(() => {
-        latchedDownloadVerdict ??= teardownVerdict(scope.scopeKey);
-      });
-      let downloadCause: unknown = null;
-      const gradesDownloadStartedAt = Date.now();
-      try {
-        gradesDownload = (await source.downloadGradesArtifact(gradesArtifact)) ?? null;
-      } catch (error) {
-        gradesDownload = null;
-        downloadCause = error;
-      } finally {
-        unsubscribeGradesTeardown();
-        // Closes half of the ~11s p50 residual between `durationMs` and the sum
-        // of the other phases: this transfer never touched `phases.downloadMs`.
-        // Charged on the failure path too — a grades transfer that timed out
-        // spent that time just as surely as one that landed.
-        const gradesPhases = phaseTimings(scope.scopeKey);
-        gradesPhases.gradesDownloadMs = (gradesPhases.gradesDownloadMs ?? 0) + (Date.now() - gradesDownloadStartedAt);
-      }
-      // A NULL return counts exactly as a throw does. `SnapshotSource` lets a
-      // source signal "unusable this cycle" either way (see downloadArtifact's
-      // contract), and the whole-layout path settles a failure on both — so
-      // leaving the null arm uncounted here would let a null-returning source
-      // re-fetch the artifact on every cycle for the life of the install,
-      // straight past MAX_GRADES_BOOTSTRAP_ATTEMPTS.
-      if (!gradesDownload) {
-        // A cycle that is being torn down did not fail — it was interrupted.
-        // Charging a grades attempt here spent one of the three tries this
-        // artifact ever gets on a pocketed phone, and three screen locks left a
-        // Kilter board crawling grades over GraphQL for the life of the install
-        // (issue #4390).
-        // Scope-aware (issue #4370): another board's removal never charges this
-        // layout a grades attempt, and never masks a real grades failure as an
-        // abort either.
-        const gradesTeardown = teardownVerdict(scope.scopeKey) ?? latchedDownloadVerdict;
-        if (gradesTeardown) {
-          reportBootstrapAbort(scope.scopeKey, 'grades-download', gradesTeardown.reason, downloadCause);
-          gradesDownloadByLayout.set(layoutKey, null);
-          return gradesTeardown.kind;
-        }
-        const attempt = await recordGradesBootstrapAttempt(db, scope.scopeKey);
-        onSnapshotBootstrapError?.({
-          scopeKey: scope.scopeKey,
-          stage: 'grades-download',
-          attempt,
-          cause: downloadCause,
-          expected: isNetworkError(downloadCause),
-        });
-      }
-      gradesDownloadByLayout.set(layoutKey, gradesDownload);
-      if (gradesDownload) gradesArtifactPaths.add(gradesDownload.filePath);
-    }
-    if (!gradesDownload) return null;
-    const preImportVerdict = teardownVerdict(scope.scopeKey);
-    if (preImportVerdict) {
-      reportBootstrapAbort(scope.scopeKey, 'grades-download', preImportVerdict.reason, null);
-      return preImportVerdict.kind;
-    }
-
+    const record = await prefetchGrades(scope, entry);
+    if (!record) return teardownVerdict(scope.scopeKey)?.kind ?? null;
+    record.progressScopeKey = scope.scopeKey;
+    const emitGradeProgress = (): void =>
+      reportDownload(scope.scopeKey, 'grades', record.fraction === null ? null : record.fraction * 0.5);
+    emitGradeProgress();
+    // Heartbeats keep the screen hold alive on a long, stalled native transfer.
+    const heartbeat = setInterval(() => {
+      if (record.aborted || record.progressScopeKey === null) return;
+      onProgress?.({ phase: 'bootstrap', currentTable: scope.scopeKey, documentsProcessed: 0 });
+      emitGradeProgress();
+    }, 20_000);
+    const waitStartedAt = Date.now();
+    let result: Awaited<GradesDownloadRecord['promise']>;
     try {
-      const { rowsImported, gradesVerifyMs, gradesLockMs } = await bootstrapScopeGradesFromSnapshot({
+      result = await record.promise;
+    } finally {
+      clearInterval(heartbeat);
+    }
+    const phases = phaseTimings(scope.scopeKey);
+    phases.gradesWaitMs = (phases.gradesWaitMs ?? 0) + Date.now() - waitStartedAt;
+    const verdict = gradesVerdict(scope, record);
+    if (verdict) {
+      reportBootstrapAbort(scope.scopeKey, 'grades-download', verdict.reason, result.cause);
+      record.progressScopeKey = null;
+      return verdict.kind;
+    }
+    if (!result.file) {
+      const interrupted = record.abortedReason ? { reason: record.abortedReason, kind: 'cycle' as const } : null;
+      if (interrupted) {
+        reportBootstrapAbort(scope.scopeKey, 'grades-download', interrupted.reason, result.cause);
+        record.progressScopeKey = null;
+        return interrupted.kind;
+      }
+      // The count is read-modify-write, so it is read under the lock it is
+      // written under: from a stale main-connection read it would lose an attempt.
+      const counted = { attempt: 0 };
+      const recorded = await writeScopeMetadata(scope.scopeKey, 'grades-bootstrap-attempt', async (transaction) => {
+        counted.attempt = await recordGradesBootstrapAttempt(transaction, scope.scopeKey);
+      });
+      if (!recorded) {
+        record.progressScopeKey = null;
+        return abortRefusedWrite(scope.scopeKey, 'grades-download', result.cause);
+      }
+      onSnapshotBootstrapError?.({
+        scopeKey: scope.scopeKey,
+        stage: 'grades-download',
+        attempt: counted.attempt,
+        cause: result.cause,
+        expected: classifySnapshotTransferFailure(result.cause)?.expected ?? false,
+      });
+      record.progressScopeKey = null;
+      return null;
+    }
+    reportDownload(scope.scopeKey, 'grades', 0.5);
+    try {
+      const imported = await bootstrapScopeGradesFromSnapshot({
         db,
         scope,
         scopeKey: scope.scopeKey,
-        filePath: gradesDownload.filePath,
+        filePath: result.file.filePath,
+        replayFromEpoch: entry.privacyVersion === 1,
+        snapshotSupplement:
+          options?.viewerUserId && importedLayout?.artifactBuiltAt
+            ? {
+                viewerUserId: options.viewerUserId,
+                climbWatermark: importedLayout.climbWatermark,
+                artifactBuiltAt: importedLayout.artifactBuiltAt,
+              }
+            : undefined,
         onSchemaDrift,
+        onBatch: ({ rowsImported }) => {
+          const rowCount = entry.grades?.tables.board_climb_grades.rowCount ?? 0;
+          reportDownload(
+            scope.scopeKey,
+            'grades',
+            rowCount > 0 ? 0.5 + 0.5 * Math.min(1, rowsImported / rowCount) : 0.5,
+          );
+        },
       });
-      // The artifact's own row count, reported alongside the paged crawl's
-      // (issue #4393): it is what tells a truthful `gradesRows: 0` — the crawl
-      // behind a fresh artifact has nothing left to fetch — apart from a board
-      // that has no grades at all. Accumulating rather than assigning because
-      // the two call sites (post-import and the retrofit path) are mutually
-      // exclusive per scope today, and `+=` stays correct if that changes.
-      const phases = phaseTimings(scope.scopeKey);
-      phases.gradesArtifactRows = (phases.gradesArtifactRows ?? 0) + rowsImported;
-      phases.gradesVerifyMs = (phases.gradesVerifyMs ?? 0) + gradesVerifyMs;
-      // MAX, like importLockMaxMs: the question is the worst hold a concurrent
-      // write met, which does not add up across scopes of the same layout.
-      phases.gradesLockMs = Math.max(phases.gradesLockMs ?? 0, gradesLockMs);
-      for (const key of TABLE_CONFIGS.board_climb_grades.invalidateKeys) {
-        queryClient.invalidateQueries({ queryKey: key });
+      phases.gradesArtifactRows = (phases.gradesArtifactRows ?? 0) + imported.rowsImported;
+      phases.gradesVerifyMs = (phases.gradesVerifyMs ?? 0) + imported.gradesVerifyMs;
+      phases.gradesLockMs = Math.max(phases.gradesLockMs ?? 0, imported.gradesLockMs);
+      reportDownload(scope.scopeKey, 'grades', 1);
+      invalidations.add(TABLE_CONFIGS.board_climb_grades.invalidateKeys, scope);
+      invalidations.flush();
+    } catch (cause) {
+      const importVerdict = gradesVerdict(scope, record);
+      if (cause instanceof SnapshotWipedError || importVerdict) {
+        const resolved = importVerdict ?? { reason: 'aborted-wipe' as const, kind: 'cycle' as const };
+        reportBootstrapAbort(scope.scopeKey, 'grades-import', resolved.reason, cause);
+        return resolved.kind;
       }
-    } catch (error) {
-      // A wipe rolls the transaction back; no checkpoint, nothing to count.
-      const importVerdict = teardownVerdict(scope.scopeKey);
-      if (error instanceof SnapshotWipedError || importVerdict) {
-        const resolvedVerdict = importVerdict ?? { reason: 'aborted-wipe' as const, kind: 'cycle' as const };
-        reportBootstrapAbort(scope.scopeKey, 'grades-import', resolvedVerdict.reason, error);
-        return resolvedVerdict.kind;
-      }
-      const attempt = await recordGradesBootstrapAttempt(db, scope.scopeKey);
+      const counted = { attempt: 0 };
+      const recorded = await writeScopeMetadata(scope.scopeKey, 'grades-bootstrap-attempt', async (transaction) => {
+        counted.attempt = await recordGradesBootstrapAttempt(transaction, scope.scopeKey);
+      });
+      if (!recorded) return abortRefusedWrite(scope.scopeKey, 'grades-import', cause);
       onSnapshotBootstrapError?.({
         scopeKey: scope.scopeKey,
         stage: 'grades-import',
-        attempt,
-        cause: error,
+        attempt: counted.attempt,
+        cause,
         expected: false,
       });
+    } finally {
+      record.progressScopeKey = null;
     }
     return null;
   };
@@ -1870,7 +2303,7 @@ async function runBootstrapPhase(params: {
   };
 
   try {
-    for (const scope of scopes) {
+    for (const scope of prioritizeDownloadScopes(scopes, options?.getPriorityBoards)) {
       // Progress state belongs to one scope. Keeping the high-water mark or
       // throttle window across boards can make scope B inherit scope A's last
       // fraction if a future path omits one of today's explicit stage flushes.
@@ -1879,6 +2312,12 @@ async function runBootstrapPhase(params: {
       const progressThrottle = createSnapshotProgressThrottle({ now });
       const emitSnapshotFrame = (frame: SnapshotBootstrapProgress | null): void => {
         if (!frame) return;
+        reportDownload(
+          frame.scopeKey,
+          frame.stage === 'manifest' ? 'preparing' : frame.stage === 'download' ? 'downloading' : 'unpacking',
+          frame.stage === 'manifest' ? 1 : frame.fraction,
+          { wireBytes: frame.wireBytes, wireBytesDone: frame.wireBytesDone },
+        );
         onProgress?.({
           phase: 'bootstrap',
           currentTable: frame.scopeKey,
@@ -1919,6 +2358,7 @@ async function runBootstrapPhase(params: {
           hasBoardCheckpoint,
         );
         let retryState = migratedState;
+        params.retryRequestsAtBootstrap.set(scope.scopeKey, retryState.userRequested);
         // Persist the derived state on first touch so the spread-out post-OTA
         // retryAfter is stable across launches instead of being re-rolled every
         // cycle. The legacy ROWS survive (a rolled-back bundle still finds them),
@@ -1926,7 +2366,17 @@ async function runBootstrapPhase(params: {
         // value — the migration grants one clean pass, and the mirror has to say
         // so or a rollback would re-read the pre-migration count.
         if (migratedFromLegacy && retryState.hasPriorSnapshotFailure) {
-          retryState = await writeBootstrapRetryState(db, scope.scopeKey, retryState);
+          const persisted = await writeRetryState(scope.scopeKey, retryState);
+          if (!persisted) {
+            // A wipe refused the write. Nothing has started for this scope yet, so
+            // it exits the way the loop-top check does.
+            if (refusedWriteVerdict(scope.scopeKey).kind === 'cycle') {
+              cycleInterrupted = true;
+              break;
+            }
+            continue;
+          }
+          retryState = persisted;
           metadataSettled = true;
         }
 
@@ -1951,12 +2401,27 @@ async function runBootstrapPhase(params: {
         // cheaper than the pre-#4313 over-cap path that consulted it every cycle.
         const isRearmCandidate = !verdict.eligible && verdict.reason === 'terminal' && verdict.canRearm;
         if (!verdict.eligible && !isRearmCandidate) {
-          if (verdict.reason === 'terminal') await markBootstrapPagedFallback(db, scope.scopeKey);
+          if (verdict.reason === 'terminal' && !(await markPagedFallback(scope.scopeKey))) {
+            if (refusedWriteVerdict(scope.scopeKey).kind === 'cycle') {
+              cycleInterrupted = true;
+              break;
+            }
+            continue;
+          }
           // Set on BOTH not-eligible arms deliberately: the pre-#4313 bail did
           // the same for a checkpointed scope so My Boards re-reads the row even
           // though this run did not mutate its markers.
           metadataSettled = true;
-          if (shouldSkipPagedPull({ retryState, hasBoardCheckpoint, now: evaluatedAt })) {
+          // Only a cooldown may skip the crawl: the skip is a wait for the retry
+          // it scheduled. A `bootstrap-done` or `scope-complete` scope has no
+          // retry coming, yet it can be without a board checkpoint — a privacy
+          // revalidation resets them, and an empty table never writes one. Then
+          // `shouldSkipPagedPull` reads it as fresh and would skip it on every
+          // cycle, so the board never syncs again (issue #6306).
+          if (
+            verdict.reason === 'cooling-down' &&
+            shouldSkipPagedPull({ retryState, hasBoardCheckpoint, now: evaluatedAt })
+          ) {
             skipPagedPull.add(scope.scopeKey);
           }
           // RETRO-FIT (issue #4310): a scope with a COMPLETE climb catalog but
@@ -2060,26 +2525,35 @@ async function runBootstrapPhase(params: {
           // Only a genuinely DIFFERENT build is worth another round; the same
           // artifact would fail the same way.
           if (!isEntryUsable || entry.builtAt === retryState.failedBuiltAt) {
-            await markBootstrapPagedFallback(db, scope.scopeKey);
+            // A refused write needs no exit of its own: this scope is done either way.
+            await markPagedFallback(scope.scopeKey);
             metadataSettled = true;
             continue;
           }
-          retryState = await writeBootstrapRetryState(
-            db,
-            scope.scopeKey,
-            rearmForNewArtifact(retryState, entry.builtAt),
-          );
           // The scope was carrying a paged-fallback marker that My Boards renders
           // as "using the slower download". It is back on the snapshot path as of
-          // this line, and the download below can run for 18 minutes — leaving the
-          // marker up would tell the climber the wrong story for the whole of it.
-          // A later failure re-stamps it.
-          await clearBootstrapPagedFallback(db, scope.scopeKey);
+          // this commit, and the download below can run for 18 minutes — leaving
+          // the marker up would tell the climber the wrong story for the whole of
+          // it. A later failure re-stamps it. Same transaction as the re-arm: they
+          // are one decision.
+          const rearmed = await writeRetryState(
+            scope.scopeKey,
+            rearmForNewArtifact(retryState, entry.builtAt),
+            (transaction) => clearBootstrapPagedFallback(transaction, scope.scopeKey),
+          );
+          if (!rearmed) {
+            if (refusedWriteVerdict(scope.scopeKey).kind === 'cycle') {
+              cycleInterrupted = true;
+              break;
+            }
+            continue;
+          }
+          retryState = rearmed;
           metadataSettled = true;
         }
 
         if (resolution.status === 'absent') {
-          await markBootstrapPagedFallback(db, scope.scopeKey);
+          await markPagedFallback(scope.scopeKey);
           metadataSettled = true;
           continue; // permanent miss, no burn
         }
@@ -2091,6 +2565,7 @@ async function runBootstrapPhase(params: {
             builtAt: null,
             now: evaluatedAt,
             random,
+            canWrite: () => wipeVerdict(scope.scopeKey) === null,
           });
           retryState = settled.state;
           // A cap-exempt transport failure persists nothing, so there is no settled
@@ -2104,7 +2579,7 @@ async function runBootstrapPhase(params: {
             manifestFailurePolicy.failOpen ? MANIFEST_FAIL_OPEN_RETRY_DELAY_MS : MANIFEST_RETRY_DELAY_MS,
           );
           if (manifestFailurePolicy.failOpen) {
-            await markBootstrapPagedFallback(db, scope.scopeKey);
+            await markPagedFallback(scope.scopeKey);
             metadataSettled = true;
           } else if (shouldSkipPagedPull({ retryState, hasBoardCheckpoint, now: evaluatedAt })) {
             skipPagedPull.add(scope.scopeKey);
@@ -2112,12 +2587,12 @@ async function runBootstrapPhase(params: {
           continue;
         }
         if (!entry) {
-          await markBootstrapPagedFallback(db, scope.scopeKey);
+          await markPagedFallback(scope.scopeKey);
           metadataSettled = true;
           continue; // layout not exported yet — permanent miss, no burn
         }
         if (!isEntryUsable) {
-          await markBootstrapPagedFallback(db, scope.scopeKey);
+          await markPagedFallback(scope.scopeKey);
           metadataSettled = true;
           continue;
         }
@@ -2143,7 +2618,10 @@ async function runBootstrapPhase(params: {
         // fresh bootstrap (confirmed behind a size-disclosing dialog moments ago)
         // and a user-requested retry are consented and ignore the probe.
         if (bootstrapKind === 'heal-over-partial' && !isUserRequested && !(await isOnUnmeteredNetwork())) {
-          retryState = await writeBootstrapRetryState(db, scope.scopeKey, deferHeal(retryState, evaluatedAt));
+          const deferred = await writeRetryState(scope.scopeKey, deferHeal(retryState, evaluatedAt));
+          // Refused: a wipe owns this scope now, and it schedules nothing.
+          if (!deferred) continue;
+          retryState = deferred;
           metadataSettled = true;
           if (retryState.retryAfter !== null) {
             onBootstrapRetryDue?.({ scopeKey: scope.scopeKey, retryAt: retryState.retryAfter });
@@ -2155,7 +2633,16 @@ async function runBootstrapPhase(params: {
         // failure schedules an ordinary cooldown instead of leaving a standing
         // metered-link override that keeps pulling ~100 MB over cellular.
         if (isUserRequested) {
-          retryState = await writeBootstrapRetryState(db, scope.scopeKey, spendUserRequest(retryState));
+          const spent = await writeRetryState(scope.scopeKey, spendUserRequest(retryState));
+          if (!spent) {
+            if (refusedWriteVerdict(scope.scopeKey).kind === 'cycle') {
+              cycleInterrupted = true;
+              break;
+            }
+            continue;
+          }
+          retryState = spent;
+          params.retryRequestsAtBootstrap.set(scope.scopeKey, false);
           metadataSettled = true;
         }
 
@@ -2295,6 +2782,7 @@ async function runBootstrapPhase(params: {
             cachedDownload.file =
               (await source.downloadArtifact(entry, {
                 signal: abortController.signal,
+                downloadRequest: options?.getDownloadRequestContext?.(scope.scopeKey),
                 onProgress: ({ bytesWritten, totalBytes }) => {
                   // A byte arrived while nothing is tearing us down: this
                   // transfer demonstrably survived the pocket, so a later
@@ -2337,8 +2825,7 @@ async function runBootstrapPhase(params: {
           // HTTP 500, or programmer error still spends its real budget.
           if (!cachedDownload.file) {
             const suspensionKilledTransfer =
-              suspensionWindowOpen &&
-              (isNetworkError(cachedDownload.cause) || isBackgroundTransferDecodeError(cachedDownload.cause));
+              suspensionWindowOpen && isSnapshotTransferInterruption(cachedDownload.cause);
             cachedDownload.abortedReason =
               selfAbortedReason ?? (suspensionKilledTransfer ? 'aborted-background' : null);
           }
@@ -2398,9 +2885,18 @@ async function runBootstrapPhase(params: {
               now: evaluatedAt,
               random,
             });
-            retryState = await writeBootstrapRetryState(db, scope.scopeKey, pause.state);
-            metadataSettled = true;
-            if (pause.charged) {
+            // The terminal caption rides the same commit as the budget it describes.
+            const paused = await writeRetryState(scope.scopeKey, pause.state, async (transaction, written) => {
+              if (pause.charged && isTerminal(written)) await markBootstrapPagedFallback(transaction, scope.scopeKey);
+            });
+            if (!paused) {
+              // A wipe landed while the phone was in the pocket. That is the
+              // story this scope's funnel gets, not a pause. Always a cycle-level
+              // exit below: a background verdict is never per-scope.
+              abortRefusedWrite(scope.scopeKey, 'download', cachedDownload.cause);
+            } else if (pause.charged) {
+              retryState = paused;
+              metadataSettled = true;
               // Still `aborted: true` — the climber's phone went in a pocket,
               // that is what happened — but `attempt` tells the truth about the
               // budget, exactly as reportSettledFailure spells it, and the retry
@@ -2433,8 +2929,9 @@ async function runBootstrapPhase(params: {
               } else {
                 onBootstrapRetryCleared?.(scope.scopeKey);
               }
-              if (isTerminal(retryState)) await markBootstrapPagedFallback(db, scope.scopeKey);
             } else {
+              retryState = paused;
+              metadataSettled = true;
               reportBootstrapAbort(scope.scopeKey, 'download', downloadTeardown, cachedDownload.cause);
             }
           } else {
@@ -2470,12 +2967,20 @@ async function runBootstrapPhase(params: {
               builtAt: entry.builtAt,
               now: evaluatedAt,
               random,
+              canWrite: () => wipeVerdict(scope.scopeKey) === null,
+              // Overrides the settle's non-terminal clear: this decision is
+              // already durable — the crawl is what serves the scope now — so My
+              // Boards should say so instead of waiting a cycle.
+              forcePagedFallback: true,
             });
+            if (settled.refused) {
+              if (abortRefusedWrite(scope.scopeKey, 'download', cachedDownload.cause) === 'cycle') {
+                cycleInterrupted = true;
+                break;
+              }
+              continue;
+            }
             retryState = settled.state;
-            // Overrides settleBootstrapFailure's non-terminal clear: this
-            // decision is already durable — the crawl is what serves the scope
-            // now — so My Boards should say so instead of waiting a cycle.
-            await markBootstrapPagedFallback(db, scope.scopeKey);
             metadataSettled = true;
             reportSettledFailure(scope, 'download', settled, evaluatedAt);
             continue;
@@ -2487,7 +2992,15 @@ async function runBootstrapPhase(params: {
             builtAt: entry.builtAt,
             now: evaluatedAt,
             random,
+            canWrite: () => wipeVerdict(scope.scopeKey) === null,
           });
+          if (settled.refused) {
+            if (abortRefusedWrite(scope.scopeKey, 'download', cachedDownload.cause) === 'cycle') {
+              cycleInterrupted = true;
+              break;
+            }
+            continue;
+          }
           retryState = settled.state;
           metadataSettled = true;
           reportSettledFailure(scope, 'download', settled, evaluatedAt);
@@ -2509,7 +3022,15 @@ async function runBootstrapPhase(params: {
         // the ~2-minute cooldown — a board unreachable by both paths.
         const withTransportCleared = clearTransportFailures(retryState);
         if (withTransportCleared !== retryState) {
-          retryState = await writeBootstrapRetryState(db, scope.scopeKey, withTransportCleared);
+          const cleared = await writeRetryState(scope.scopeKey, withTransportCleared);
+          if (!cleared) {
+            if (abortRefusedWrite(scope.scopeKey, 'download', null) === 'cycle') {
+              cycleInterrupted = true;
+              break;
+            }
+            continue;
+          }
+          retryState = cleared;
           metadataSettled = true;
         }
 
@@ -2560,6 +3081,7 @@ async function runBootstrapPhase(params: {
           }),
         );
 
+        reportDownload(scope.scopeKey, 'unpacking', 0, { hasGrades: entry.grades !== undefined });
         phases.artifactBytes = entry.bytes;
         phases.artifactReused = download.reused === true;
         const importStartedAt = Date.now();
@@ -2578,11 +3100,16 @@ async function runBootstrapPhase(params: {
           // ordering rules out, and the deletions rewind rides in the same
           // transaction so the tombstone-replay window can never be narrower
           // than the rows it must cover.
+          await prefetchGrades(scope, entry);
+          const beforeImport = teardownVerdict(scope.scopeKey);
+          if (beforeImport && beforeImport.reason !== 'aborted-background') throw new SnapshotWipedError();
           const imported = await bootstrapScopeFromSnapshot({
             db,
             scope,
             scopeKey: scope.scopeKey,
             filePath: download.filePath,
+            replayFromEpoch: entry.privacyVersion === 1,
+            snapshotSupplementViewerId: options?.viewerUserId,
             onSchemaDrift,
             // Arms the watermark-regression guard on the heal path: the artifact
             // may not stamp a checkpoint BELOW what this scope already crawled.
@@ -2614,13 +3141,20 @@ async function runBootstrapPhase(params: {
           phases.importBatches = (phases.importBatches ?? 0) + imported.importBatches;
           artifactImported.set(download.filePath, true);
           // The scope imported an artifact, so any free-round marker it carries
-          // describes a build that no longer matters.
-          await clearReusedImportFailure(db, scope.scopeKey);
-          // The heal flag rides the persisted marker, not a per-cycle set: the
-          // scope usually reaches completion in a LATER cycle (board_climb_grades
-          // is not a snapshot table and still crawls), and an in-memory set
-          // reports false for exactly the runs the flag exists to filter out.
-          await markBootstrapDone(db, scope.scopeKey, { healed: hasBoardCheckpoint });
+          // describes a build that no longer matters. The heal flag rides the
+          // persisted marker, not a per-cycle set: the scope usually reaches
+          // completion in a LATER cycle (board_climb_grades is not a snapshot
+          // table and still crawls), and an in-memory set reports false for
+          // exactly the runs the flag exists to filter out.
+          //
+          // One guarded commit (issue #5851). A wipe that lands after the import
+          // committed refuses it, and the refusal takes the import's own
+          // teardown path in the catch below.
+          const markedDone = await writeScopeMetadata(scope.scopeKey, 'bootstrap-done', async (transaction) => {
+            await clearReusedImportFailure(transaction, scope.scopeKey);
+            await markBootstrapDone(transaction, scope.scopeKey, { healed: hasBoardCheckpoint });
+          });
+          if (!markedDone) throw new SnapshotWipedError();
           metadataSettled = true;
           // The one settlement the guard cannot infer from a report: the scope's
           // terminal event is the Completed the board-data loop fires once the
@@ -2631,16 +3165,22 @@ async function runBootstrapPhase(params: {
           // Bust the board-table query caches now: if the snapshot fully satisfies
           // the scope, the delta pull returns zero documents and syncTable's
           // arrivals-only invalidation never fires — an active search/detail query
-          // would keep serving the pre-import (empty) result set.
+          // would keep serving the pre-import (empty) result set. A scope that is
+          // not complete yet is still closed to local reads, so for it this
+          // refetch goes to the network; the board loop queues the same keys again
+          // when its completion marker lands. A scope that already was complete
+          // (a heal) gets no second signal, and this is the one that counts.
           for (const tableName of ['board_climbs', 'board_climb_stats'] as const) {
-            for (const key of TABLE_CONFIGS[tableName].invalidateKeys) {
-              queryClient.invalidateQueries({ queryKey: key });
-            }
+            invalidations.add(TABLE_CONFIGS[tableName].invalidateKeys, scope);
           }
+          invalidations.flush();
           // Grades ride a second, small artifact and a second short exclusive
           // transaction, right after the climbs/stats one. See
           // importGradesForScope — every failure here is free.
-          const gradesVerdict = await importGradesForScope(scope, entry);
+          const gradesVerdict = await importGradesForScope(scope, entry, {
+            climbWatermark: imported.climbsWatermark,
+            artifactBuiltAt: imported.artifactBuiltAt,
+          });
           if (gradesVerdict === 'cycle') {
             cycleInterrupted = true;
             break;
@@ -2649,6 +3189,11 @@ async function runBootstrapPhase(params: {
           // Not skipped: the board-data phase delta-pulls from the watermark
           // checkpoints and fires markScopeDownloadComplete through the tail logic.
         } catch (error) {
+          const failedGradesPrefetch = gradesDownloadByLayout.get(purgeNamespaceKey(scope));
+          if (failedGradesPrefetch) {
+            failedGradesPrefetch.aborted = true;
+            failedGradesPrefetch.controller.abort();
+          }
           phases.importMs += Date.now() - importStartedAt;
           // A wipe mid-import rolls the transaction back and bails the phase — no
           // burn (the pull is being torn down, not failing). Reported all the
@@ -2681,7 +3226,13 @@ async function runBootstrapPhase(params: {
             // structural failure, charged below. Refusing without recording the
             // refusal left the scope exactly as eligible as it was, so the same
             // ~100 MB artifact came down again on every cycle, forever.
-            await markBootstrapPagedFallback(db, scope.scopeKey);
+            if (!(await markPagedFallback(scope.scopeKey))) {
+              if (abortRefusedWrite(scope.scopeKey, 'import', error) === 'cycle') {
+                cycleInterrupted = true;
+                break;
+              }
+              continue;
+            }
             metadataSettled = true;
             onSnapshotBootstrapError?.({
               scopeKey: scope.scopeKey,
@@ -2715,12 +3266,24 @@ async function runBootstrapPhase(params: {
           // `MAX_BOOTSTRAP_LOCK_FAILURES` and, unlike transport, is NOT reset by
           // the next cycle's zero-byte reuse of this very file.
           const importLostTheLock = classifySqliteLockError(error).locked;
-          if (
-            !importLostTheLock &&
-            download.reused &&
-            (await getReusedImportFailure(db, scope.scopeKey)) !== entry.builtAt
-          ) {
-            await recordReusedImportFailure(db, scope.scopeKey, entry.builtAt);
+          // Whether this build already had its free round is read under the lock
+          // that records it: read on the main connection, a stale answer would
+          // grant the same build a second free round.
+          const freeRound = { granted: false };
+          if (!importLostTheLock && download.reused) {
+            const decided = await writeScopeMetadata(scope.scopeKey, 'reused-import-failure', async (transaction) => {
+              freeRound.granted = (await getReusedImportFailure(transaction, scope.scopeKey)) !== entry.builtAt;
+              if (freeRound.granted) await recordReusedImportFailure(transaction, scope.scopeKey, entry.builtAt);
+            });
+            if (!decided) {
+              if (abortRefusedWrite(scope.scopeKey, 'import', error) === 'cycle') {
+                cycleInterrupted = true;
+                break;
+              }
+              continue;
+            }
+          }
+          if (freeRound.granted) {
             await source.deleteArtifact(download.filePath).catch(() => {});
             artifactImported.delete(download.filePath);
             downloadByLayout.delete(layoutKey);
@@ -2753,7 +3316,15 @@ async function runBootstrapPhase(params: {
             builtAt: entry.builtAt,
             now: evaluatedAt,
             random,
+            canWrite: () => wipeVerdict(scope.scopeKey) === null,
           });
+          if (settled.refused) {
+            if (abortRefusedWrite(scope.scopeKey, 'import', error) === 'cycle') {
+              cycleInterrupted = true;
+              break;
+            }
+            continue;
+          }
           retryState = settled.state;
           metadataSettled = true;
           reportSettledFailure(scope, 'import', settled, evaluatedAt);
@@ -2784,6 +3355,11 @@ async function runBootstrapPhase(params: {
       }
     }
   } finally {
+    for (const record of allGradesDownloads) {
+      record.progressScopeKey = null;
+      record.controller.abort();
+    }
+    await Promise.allSettled([...allGradesDownloads].map((record) => record.promise));
     // Hand every artifact back rather than deleting it outright. A source with
     // no retention support falls through to deleteArtifact and behaves exactly
     // as it did before #4310; a retention-capable one keeps the files the phase
@@ -2841,13 +3417,13 @@ async function runBootstrapPhase(params: {
  *
  * `beginGlobalPurge()` is deliberately NOT called: it bumps the global wipe
  * epoch, which would abort the very cycle that is supposed to rebuild. It isn't
- * needed here — the scheduler single-flights pullSync, so no other pull page is
- * on the wire, and the drainer writes only to pending_mutations, which this
+ * needed here — the exported pullSync gate serializes cycles on this database,
+ * so no other pull page is on the wire, and the drainer writes only to pending_mutations, which this
  * reset never touches.
  */
 async function enforceDeletionsCoverage(
   db: OfflineDatabase,
-  queryClient: QueryInvalidator,
+  invalidations: InvalidationBatch,
   graphqlFetch: <T>(query: string, variables?: Record<string, unknown>) => Promise<T>,
   purgeToken: PurgeToken,
   options?: SyncOptions,
@@ -2931,16 +3507,12 @@ async function enforceDeletionsCoverage(
   // least one document and processDeletions only on arrivals, so a table the
   // user had emptied server-side re-pulls nothing and a mounted screen would
   // keep serving the pre-wipe react-query cache — the exact #3474 symptom
-  // surviving the fix. Deduped by serialized key, same shape as processDeletions.
-  const invalidatedKeys = new Set<string>();
+  // surviving the fix. Flushed here rather than with the rebuild: the bootstrap
+  // phase can run for minutes before the user tables are pulled again.
   for (const tableName of USER_DATA_TABLES) {
-    for (const key of TABLE_CONFIGS[tableName].invalidateKeys) {
-      invalidatedKeys.add(JSON.stringify(key));
-    }
+    invalidations.add(TABLE_CONFIGS[tableName].invalidateKeys);
   }
-  for (const serializedKey of invalidatedKeys) {
-    queryClient.invalidateQueries({ queryKey: JSON.parse(serializedKey) as string[] });
-  }
+  invalidations.flush();
 
   options?.onCoverageReset?.({ markerAgeDays, rowsCleared, pendingMutations });
   // Alongside the reset event, not instead of it: onCoverageReset stays the
@@ -2949,11 +3521,130 @@ async function enforceDeletionsCoverage(
   options?.onCoverageEvaluated?.({ verdict, markerAgeDays, outcome: 'reset' });
 }
 
-export async function pullSync(
+// Scheduler cycles and explicit download/publication refreshes share this gate.
+// Keep each caller's cycle: joining an older pull could miss its newer publication.
+const pullTails = new WeakMap<OfflineDatabase, Promise<void>>();
+
+/**
+ * Correlation must belong to the enqueued request, not whichever account or enable
+ * is current after a FIFO wait. Clone scalar IDs before the first await. A broken
+ * telemetry probe/reporter is never allowed to change a valid pull's outcome.
+ */
+function captureDownloadRequestOptions(options: SyncOptions): SyncOptions {
+  const enabledBoards = options.enabledBoards?.slice();
+  const contexts = new Map<string, DownloadRequestCorrelation>();
+  for (const scopeKey of new Set(enabledBoards ?? [])) {
+    try {
+      const context = options.getDownloadRequestContext?.(scopeKey);
+      if (context) contexts.set(scopeKey, { requestId: context.requestId, batchId: context.batchId });
+    } catch {
+      // This request remains uncorrelated; do not borrow a later request's IDs.
+    }
+  }
+  const correlate = <Info extends { scopeKey: string }>(reporter: ((info: Info) => void) | undefined) =>
+    reporter
+      ? (info: Info): void => {
+          const downloadRequest = contexts.get(info.scopeKey);
+          try {
+            reporter(downloadRequest ? { ...info, downloadRequest: { ...downloadRequest } } : info);
+          } catch {
+            // Analytics and observations cannot turn a successful pull into a retry.
+          }
+        }
+      : undefined;
+  return {
+    ...options,
+    enabledBoards,
+    getDownloadRequestContext: (scopeKey) => {
+      const context = contexts.get(scopeKey);
+      return context ? { ...context } : undefined;
+    },
+    onScopeDownloadStart: correlate(options.onScopeDownloadStart),
+    onScopeDownloadComplete: correlate(options.onScopeDownloadComplete),
+    onSnapshotBootstrapError: correlate(options.onSnapshotBootstrapError),
+    onScopeDownloadObserved: correlate(options.onScopeDownloadObserved),
+  };
+}
+
+export function pullSync(
   db: OfflineDatabase,
   queryClient: QueryInvalidator,
   graphqlFetch: <T>(query: string, variables?: Record<string, unknown>) => Promise<T>,
   options?: SyncOptions,
+): Promise<void> {
+  // Capture authority and scope before waiting: a queued request must never
+  // adopt a later sign-in or re-download a scope removed during that wait.
+  const purgeToken = capturePurgeToken();
+  const signingOutAtEnqueue = isSigningOut();
+  const capturedOptions = options ? captureDownloadRequestOptions(options) : undefined;
+  const contexts = new Map<string, ScopeDownloadContext>();
+  for (const scopeKey of options?.enabledBoards ?? []) {
+    try {
+      const context = options?.getScopeDownloadContext?.(scopeKey);
+      if (context) contexts.set(scopeKey, { ...context });
+    } catch {
+      // Correlation is optional; an unavailable ledger cannot stop a pull.
+    }
+  }
+  const lifecycle = createScopeDownloadLifecycle(contexts, options?.onScopeDownloadLifecycle);
+  const cycleOptions = capturedOptions
+    ? {
+        ...capturedOptions,
+        onScopeDownloadStart: (info: ScopeDownloadStartInfo) =>
+          capturedOptions.onScopeDownloadStart?.({ ...info, downloadContext: contexts.get(info.scopeKey) }),
+        onScopeDownloadComplete: (info: ScopeDownloadCompleteInfo) => {
+          capturedOptions.onScopeDownloadComplete?.({ ...info, downloadContext: contexts.get(info.scopeKey) });
+          lifecycle.complete(info.scopeKey, 'download');
+        },
+        onSnapshotBootstrapError: (report: SnapshotBootstrapErrorReport) => {
+          lifecycle.defer(report.scopeKey, report.reason, report.stage);
+          capturedOptions.onSnapshotBootstrapError?.({ ...report, downloadContext: contexts.get(report.scopeKey) });
+        },
+      }
+    : undefined;
+  const previous = pullTails.get(db);
+  const start = async () => {
+    let exitReason = 'cycle-interrupted';
+    try {
+      await performPullSync(db, queryClient, graphqlFetch, purgeToken, signingOutAtEnqueue, cycleOptions, lifecycle);
+    } catch (error) {
+      exitReason = classifySnapshotBootstrapFailure(error);
+      throw error;
+    } finally {
+      // This extra connectivity read is observational and cannot replace the
+      // original rejection if a consumer-supplied probe throws.
+      let offline = false;
+      try {
+        offline = cycleOptions?.isOnline?.() === false;
+      } catch {
+        /* Preserve the pull result. */
+      }
+      lifecycle.close(
+        isSigningOut() ? 'signed-out' : isBackgrounded() ? 'background' : offline ? 'offline' : exitReason,
+      );
+    }
+  };
+  const result = (previous ?? Promise.resolve()).then(start);
+  // Only the queue tail swallows failure; the caller retains the original rejection.
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  pullTails.set(db, tail);
+  void tail.then(() => {
+    if (pullTails.get(db) === tail) pullTails.delete(db);
+  });
+  return result;
+}
+
+async function performPullSync(
+  db: OfflineDatabase,
+  queryClient: QueryInvalidator,
+  graphqlFetch: <T>(query: string, variables?: Record<string, unknown>) => Promise<T>,
+  purgeToken: PurgeToken,
+  signingOutAtEnqueue: boolean,
+  options?: SyncOptions,
+  lifecycle?: ReturnType<typeof createScopeDownloadLifecycle>,
 ): Promise<void> {
   let totalDocuments = 0;
   const reportInterruptedCycle = (): undefined => {
@@ -2969,7 +3660,10 @@ export async function pullSync(
   // Mirrors drainMutationQueue's entry guard: don't even start the snapshot
   // bootstrap phase below (which runs before the first cycleAborted() check)
   // when the app is already backgrounded.
-  if (isBackgrounded()) return reportInterruptedCycle();
+  if (signingOutAtEnqueue || isSigningOut() || hasPurgeLanded(purgeToken) || isBackgrounded()) {
+    lifecycle?.deferAll(isBackgrounded() ? 'background' : 'authority-changed');
+    return reportInterruptedCycle();
+  }
 
   // Offline: every request this cycle would make is already lost, and the
   // bootstrap phase would spend a Sentry event per enabled-but-undownloaded
@@ -2977,30 +3671,21 @@ export async function pullSync(
   // edge and the next foreground both retrigger a cycle. Same posture as
   // drainMutationQueue's `if (!options.isOnline()) return`.
   const isOnline = options?.isOnline ?? (() => true);
-  if (!isOnline()) return reportInterruptedCycle();
+  if (!isOnline()) {
+    lifecycle?.deferAll('offline');
+    return reportInterruptedCycle();
+  }
 
-  // Captured ONCE for the whole cycle and threaded into every phase, so a wipe or a
-  // purge aborts exactly the work it can invalidate rather than just whichever table
-  // is mid-flight. The token carries the global epoch AND a copy of every
-  // per-namespace purge epoch, so one capture answers for every scope this cycle
-  // will touch (issue #4370).
-  //
-  // Capturing once matters because `enabledBoards` is a snapshot taken before the
-  // cycle began. Removing a board (see removeBoardScopeData) drops it from that
-  // setting and bumps that namespace's epoch — but this cycle is still iterating the
-  // STALE list. If each table re-baselined its own token, every table after the one
-  // that aborted would capture the post-bump value, sail through its guard, and
-  // happily re-download the scope whose rows are being deleted right now, writing
-  // checkpoints past them. The user taps Remove and the catalog comes back.
-  //
-  // Sign-out never hit this because `isSigningOut()` is a persistent flag that stays
-  // true for every subsequent table; the epoch alone is not a substitute for it.
-  //
-  // Captured immediately after the entry guard and BEFORE the coverage phase's
-  // awaits: that phase can spend a network probe plus a multi-table wipe, and a
-  // purge landing inside that window must read as "not my token" rather than be
-  // adopted as this cycle's own baseline.
-  const purgeToken = capturePurgeToken();
+  // Not this account's database (yet): see `requireOwnedDatabase`. Before the
+  // bootstrap phase, which writes catalogue rows and download markers too.
+  if (options?.requireOwnedDatabase && !(await isLocalDataStampedFor(db, options.viewerUserId))) {
+    lifecycle?.deferAll('owner-unready');
+    return reportInterruptedCycle();
+  }
+
+  // The enqueue token covers the queue wait AND every phase; never rebase per table.
+  // enabledBoards stays the captured snapshot after a namespace purge advances.
+  // A new token would let later tables re-download a removed scope.
   // GLOBAL: sign-out, a global wipe, backgrounding, or connectivity loss. A board
   // purge is deliberately absent — it cannot invalidate the user tables, the
   // deletions cursor, or another board's rows, so it ends that scope's work
@@ -3015,400 +3700,814 @@ export async function pullSync(
   const cycleAborted = (): boolean => isSigningOut() || hasPurgeLanded(purgeToken) || isBackgrounded() || !isOnline();
   /** Was THIS scope's namespace purged since the cycle started? Then skip it, only it. */
   const scopePurged = (scope: BoardScope): boolean => hasPurgeLanded(purgeToken, purgeNamespaceKey(scope));
-
-  // Phase -1: deletions-coverage guard (issue #3474). Runs BEFORE the bootstrap
-  // phase, so the reset and the rebuild that follows belong to the same cycle.
-  // See deletions-coverage.ts for the invariant and for exactly what the reset
-  // does (and does not) clear.
-  await enforceDeletionsCoverage(db, queryClient, graphqlFetch, purgeToken, options);
-  // The phase can spend a probe and a multi-table wipe; the bootstrap phase below
-  // starts downloading before the deletions phase's own cycleAborted(), so check
-  // here rather than let a teardown that landed during it kick off a download.
-  if (cycleAborted()) return reportInterruptedCycle();
-
-  const enabledBoards = options?.enabledBoards ?? [];
-  const onProgress = options?.onProgress;
-
-  // Parse the enabled scope keys once; malformed keys are dropped (a stray value
-  // can't crash the pull) so both the bootstrap phase and the paged board loop
-  // iterate the same validated set.
-  const boardScopes: BoardScope[] = [];
-  for (const scopeKey of enabledBoards) {
-    const scope = parseOfflineBoardKey(scopeKey);
-    if (scope) boardScopes.push({ ...scope, scopeKey });
-  }
-
-  // Per-scope start timestamp for ScopeDownloadCompleteInfo.durationMs, stamped
-  // when the cycle FIRST touches that scope (bootstrap eligibility check, or
-  // its turn in the board-data loop) — NOT once at cycle start, which would
-  // fold scope A's entire download time into scope B's duration whenever a
-  // cycle processes several boards.
-  //
-  // PERSISTED (issue #4310), not just held here: a 100 MB Kilter artifact
-  // routinely spans cycles — the phone backgrounds, the scheduler wakes again —
-  // and a per-run Map made every one of those report only the final cycle's
-  // work. The in-memory Map is now a read-through cache over the sync_meta
-  // stamp so a cycle costs at most one extra SELECT per scope.
-  const scopeStartedAt = new Map<string, number>();
-  const stampScopeStart = async (scopeKey: string): Promise<void> => {
-    if (scopeStartedAt.has(scopeKey)) return;
-    scopeStartedAt.set(scopeKey, await ensureScopeDownloadStartedAt(db, scopeKey, Date.now()));
-  };
-
-  // Per-scope phase breakdown for ScopeDownloadCompleteInfo.phases, accumulated
-  // across this cycle's bootstrap phase and board-data loop.
-  const phasesByScope = new Map<string, ScopeDownloadPhaseBreakdown>();
-  const phaseTimings = (scopeKey: string): ScopeDownloadPhaseBreakdown => {
-    let phases = phasesByScope.get(scopeKey);
-    if (!phases) {
-      phases = emptyScopeDownloadPhases();
-      phasesByScope.set(scopeKey, phases);
-    }
-    return phases;
-  };
-
-  // Download-funnel Started (issue #4316). Once ever per scope, guarded by the
-  // durable `scope-started:` marker rather than by anything cycle-local, so a
-  // snapshot that fails and retries emits one event and a paged crawl that spans
-  // cycles is not skipped. Both are how the naive in-cycle version broke.
-  const emitScopeDownloadStartOnce = async (info: ScopeDownloadStartInfo): Promise<void> => {
-    if (await isScopeDownloadStarted(db, info.scopeKey)) return;
-    await markScopeDownloadStarted(db, info.scopeKey);
-    // BACKFILL, NOT A START. A scope whose download already completed — every
-    // board on a device that upgrades into this build — is not starting one now,
-    // and it can never emit Completed again either (that event is guarded by the
-    // `scope-complete:` marker it already carries). Emitting here would give the
-    // funnel one unmatched Started per already-downloaded board on the first
-    // cycle after release: a phantom abandonment spike, in exactly the window
-    // the baseline is read from. Write the marker (so this is still once-ever)
-    // and stay silent.
-    if (await isScopeDownloadComplete(db, info.scopeKey)) return;
-    options?.onScopeDownloadStart?.(info);
-  };
-  // Per-scope payload size and stage timings, recorded by the bootstrap phase and
-  // read back by Completed below. Run-local on purpose: a cycle that did not do
-  // the import has nothing honest to report (see ScopeDownloadCompleteInfo).
-  const bootstrapTimings = new Map<
-    string,
-    { bytes: number; downloadMs?: number; importMs?: number; rowCount?: number }
-  >();
-
-  // Phase 0: snapshot bootstrap (BEFORE deletions). Only when an adapter injected
-  // snapshot I/O; otherwise this is a pure paged pull, byte-identical to before.
-  let skipBootstrapPagedPull: Set<string> = new Set();
-  if (options?.snapshotSource && boardScopes.length > 0) {
-    onProgress?.({ phase: 'bootstrap', currentTable: null, documentsProcessed: 0 });
-    const bootstrapPhase = await runBootstrapPhase({
-      db,
-      queryClient,
-      source: options.snapshotSource,
-      scopes: boardScopes,
-      purgeToken,
-      stampScopeStart,
-      emitScopeDownloadStartOnce,
-      bootstrapTimings,
-      phaseTimings,
-      options,
-      now: options.now ?? Date.now,
-      random: options.random ?? Math.random,
-    });
-    skipBootstrapPagedPull = bootstrapPhase.skipPagedPull;
-    // The bootstrap phase latches lifecycle teardown across its long native
-    // awaits. If the app foregrounds again before the rejected download is
-    // handled, the live outer guard is already clear; do not let that stale
-    // cycle continue into deletions or paged pulls.
-    if (bootstrapPhase.cycleInterrupted) return reportInterruptedCycle();
-  }
-
-  // Deletions FIRST, table pulls second. This ordering is what makes a
-  // delete-then-recreate on the server converge: the tombstone removes the old
-  // local row, then the same cycle's table pull upserts the recreated one.
-  // Applied after the pulls, a tombstone sharing the recreated row's timestamp
-  // would delete data this cycle just wrote, and the strict > cursor would
-  // never fetch it again.
-  if (cycleAborted()) return reportInterruptedCycle();
-  onProgress?.({ phase: 'deletions', currentTable: null, documentsProcessed: 0 });
-  const deletionsResult = await processDeletions(
-    db,
-    queryClient,
-    graphqlFetch,
-    purgeToken,
-    (deletionsProcessed) => {
-      totalDocuments = deletionsProcessed;
-      onProgress?.({ phase: 'deletions', currentTable: null, documentsProcessed: totalDocuments });
-    },
-    options?.onRowsDeleted,
-  );
-  // The coverage marker advances ONLY on a completed pass. An aborted one (sign-out,
-  // purge, backgrounding) consumed an unknown prefix of the stream, so claiming a
-  // fresh retention window off it would hide a real gap. See deletions-coverage.ts.
-  if (deletionsResult.reachedTail) await setDeletionsCoverageAt(db, Date.now());
-
-  let allUserTablesReachedTail = true;
-  for (const tableName of USER_DATA_TABLES) {
-    if (cycleAborted()) return reportInterruptedCycle();
-    onProgress?.({ phase: 'user_data', currentTable: tableName, documentsProcessed: totalDocuments });
-    const baseCount = totalDocuments;
-    const userTableResult = await syncTable(
-      db,
-      queryClient,
-      graphqlFetch,
-      tableName,
-      purgeToken,
-      undefined,
-      (tableProcessed) => {
-        totalDocuments = baseCount + tableProcessed;
-        onProgress?.({ phase: 'user_data', currentTable: tableName, documentsProcessed: totalDocuments });
-      },
-      options?.onSchemaDrift,
-    );
-    if (!userTableResult.reachedTail) allUserTablesReachedTail = false;
-  }
-
-  // Only now are the user tables complete enough for a local reader to serve
-  // from — a checkpoint alone proves the first page landed, and a logbook built
-  // from a fraction of the rows reads as "you never climbed that". Mirrors
-  // markScopeDownloadComplete for board scopes. Cleared on sign-out for free:
-  // the key is `checkpoint:`-prefixed, so deleteUserCheckpoints takes it.
-  //
-  // Guarded, symmetric to the scope-complete block below: the last user table's
-  // in-page check is one await back, so a global wipe landing in that window
-  // would otherwise stamp `user_data_complete` over data that is being deleted.
-  if (cycleAborted()) return reportInterruptedCycle();
-  if (allUserTablesReachedTail) await markUserDataComplete(db);
-
-  // Each enabled board is a "boardType:layoutId:sizeId" scope key (already parsed
-  // into boardScopes). currentTable carries the full scope key so a per-board UI
-  // can match itself.
-  for (const boardScope of boardScopes) {
-    // boardScopes is the pre-cycle snapshot of the enabled set. A GLOBAL teardown
-    // makes every remaining entry suspect, so it stops the cycle. A per-namespace
-    // purge only invalidates its own scope — the one being deleted right now,
-    // which is still in this stale list — so it skips that scope and lets every
-    // other board finish (issue #4370).
-    //
-    // NONE of the exits below reports a terminal event, and that is deliberate
-    // (issue #4406). A board-data crawl legitimately spans cycles — a 40k-climb
-    // layout is hundreds of pages, and the durable `scope-started:` marker keeps
-    // ONE Started open across all of them — so a Failed per interrupted cycle
-    // would turn every normal multi-cycle download into a stream of failures.
-    // The one exit that ends a download for good is the removal these purge
-    // checks are dodging, and `removeBoardScopeData` reports it from the other
-    // side: it is the last code that can still see the Started marker before
-    // deleting it, and it de-dups against the bootstrap phase's own
-    // `aborted-wipe` through the purge generation.
-    if (cycleAborted()) return reportInterruptedCycle();
-    if (scopePurged(boardScope)) continue;
-    const scopeKey = boardScope.scopeKey;
-    // No-op when the bootstrap phase already stamped this scope; the paged-only
-    // path (no snapshotSource) starts its duration clock here.
-    await stampScopeStart(scopeKey);
-    // `scope-download-started:` is a sync_meta write the teardown deletes and no
-    // other path can clear, so a purge landing across that await must not leave
-    // one behind for rows that are gone.
-    if (scopePurged(boardScope)) continue;
-    const phases = phaseTimings(scopeKey);
-    // Started (issue #4316), the paged half — and the catch-all. Every scope
-    // reaches this line on every path: a build with no snapshot source, a scope
-    // the bootstrap phase found ineligible or unexportable, and the resumed
-    // multi-cycle crawl the checkpoint gate above skips. A scope the bootstrap
-    // phase already announced is a no-op here thanks to the durable marker, so
-    // it keeps its 'snapshot' intent and its artifact size.
-    await emitScopeDownloadStartOnce({ scopeKey, pathIntent: 'paged', artifactBytes: null });
-    if (cycleAborted()) return reportInterruptedCycle();
-    if (scopePurged(boardScope)) continue;
-    // A scope whose bootstrap failed this cycle (with attempts still left) skips
-    // its paged pull: a first-page checkpoint would permanently disqualify the
-    // snapshot path, so the next cycle retries the snapshot instead.
-    if (skipBootstrapPagedPull.has(scopeKey)) continue;
-    let allTablesReachedTail = true;
-    for (const tableName of BOARD_DATA_TABLES) {
-      if (cycleAborted()) return reportInterruptedCycle();
-      if (scopePurged(boardScope)) {
-        // Not `continue` on the OUTER loop's terms: clearing the flag is what
-        // stops the completion block below from being reached through this
-        // loop's normal exit. It was never sufficient on its own — see the
-        // guards there.
-        allTablesReachedTail = false;
-        break;
-      }
-      const tableLabel = `${tableName}:${scopeKey}`;
-      onProgress?.({
-        phase: 'board_data',
-        currentTable: tableLabel,
-        documentsProcessed: totalDocuments,
-        currentTableProcessed: 0,
+  const retiredWalls = new Map<string, { scope: BoardScope; row: Record<string, unknown> }>();
+  let allPullsReachedTail = true;
+  let retirementInterrupted = false;
+  const retirementEpochs = new Map<string, number>();
+  // Every invalidation of this cycle goes through one batch, flushed at the end
+  // of each phase (#6302). Seven tables share the climb-search keys, and a cycle
+  // that invalidated per table refetched the list on screen once for each.
+  const invalidations = createInvalidationBatch(queryClient);
+  const unsubscribeRetirement = onTeardown(() => {
+    if (
+      cycleAborted() ||
+      [...retiredWalls.values()].some(({ scope }) => {
+        const namespace = purgeNamespaceKey(scope);
+        return (
+          getPurgeEpoch(namespace) !== (retirementEpochs.get(namespace) ?? purgeToken.namespaces.get(namespace) ?? 0)
+        );
+      })
+    )
+      retirementInterrupted = true;
+  });
+  try {
+    const confirmWallRemoval = async (scope: BoardScope): Promise<boolean> => {
+      if (scope.boardType !== 'spray') return false;
+      const row = await db.getFirstAsync<Record<string, unknown>>('SELECT * FROM spray_walls WHERE layout_id = ?', [
+        scope.layoutId,
+      ]);
+      if (!row || cycleAborted() || scopePurged(scope)) return false;
+      const response = await graphqlFetch<{ sprayWallByLayout?: unknown }>(CONFIRM_SPRAY_WALL_VISIBILITY_QUERY, {
+        layoutId: scope.layoutId,
+        ...(scope.sprayWallUuid ? { sprayWallUuid: scope.sprayWallUuid } : {}),
       });
-      const baseCount = totalDocuments;
-      // Timed per table, not per scope: the whole point of the #4310
-      // measurement is telling the artifact's tables (climbs, stats — imported
-      // in one shot) apart from board_climb_grades, which the artifact does not
-      // carry at all and which therefore crawls page by page every time.
-      const tableStartedAt = Date.now();
-      const { reachedTail, rowsProcessed, resumedFromCheckpoint } = await syncTable(
+      if (cycleAborted() || scopePurged(scope)) return false;
+      if (response?.sprayWallByLayout === null) {
+        retiredWalls.set(scope.scopeKey, { scope, row });
+        return true;
+      }
+      // Absent or malformed payloads cannot establish permission loss.
+      const wall = response?.sprayWallByLayout;
+      if (!wall || typeof wall !== 'object' || !('uuid' in wall) || typeof wall.uuid !== 'string') {
+        throw new Error('Invalid spray wall visibility confirmation');
+      }
+      return false;
+    };
+
+    // Phase -1: deletions-coverage guard (issue #3474). Runs BEFORE the bootstrap
+    // phase, so the reset and the rebuild that follows belong to the same cycle.
+    // See deletions-coverage.ts for the invariant and for exactly what the reset
+    // does (and does not) clear.
+    await enforceDeletionsCoverage(db, invalidations, graphqlFetch, purgeToken, options);
+    // The phase can spend a probe and a multi-table wipe; the bootstrap phase below
+    // starts downloading before the deletions phase's own cycleAborted(), so check
+    // here rather than let a teardown that landed during it kick off a download.
+    if (cycleAborted()) return reportInterruptedCycle();
+
+    const enabledBoards = options?.enabledBoards ?? [];
+    const onProgress = options?.onProgress;
+
+    // Parse the enabled scope keys once; malformed keys are dropped (a stray value
+    // can't crash the pull) so both the bootstrap phase and the paged board loop
+    // iterate the same validated set.
+    const boardScopes: BoardScope[] = [];
+    for (const scopeKey of enabledBoards) {
+      const scope = parseOfflineBoardKey(scopeKey);
+      if (scope) {
+        const sprayWallUuid = scope.boardType === 'spray' ? await options?.getSprayWallUuid?.(scope) : undefined;
+        boardScopes.push({ ...scope, scopeKey, ...(sprayWallUuid ? { sprayWallUuid } : {}) });
+      }
+    }
+
+    const pendingDownloads = new Set<string>();
+    const snapshotDownloads = new Set<string>();
+    for (const scope of boardScopes) {
+      const complete = await isScopeDownloadComplete(db, scope.scopeKey);
+      // A purge/account boundary may land while the marker read awaits SQLite.
+      // Guard the observation without changing the loop's existing work decisions.
+      if (complete && !isSigningOut() && !hasPurgeLanded(purgeToken) && !scopePurged(scope)) {
+        options?.onScopeDownloadObserved?.({ scopeKey: scope.scopeKey, complete });
+      }
+      if (!complete) {
+        pendingDownloads.add(scope.scopeKey);
+        if (await isBootstrapDone(db, scope.scopeKey)) snapshotDownloads.add(scope.scopeKey);
+      } else {
+        lifecycle?.complete(scope.scopeKey, 'cached');
+      }
+    }
+    if (cycleAborted()) return reportInterruptedCycle();
+    const downloadTrackers = new Map<string, ReturnType<typeof createScopeDownloadProgress>>();
+    const reportDownload: ReportScopeDownload = (scopeKey, phase, phaseFraction, detail) => {
+      const namespace = purgeNamespaceForScopeKey(scopeKey);
+      if (isSigningOut() || hasPurgeLanded(purgeToken, namespace) || !pendingDownloads.has(scopeKey)) return;
+      let tracker = downloadTrackers.get(scopeKey);
+      if (!tracker) {
+        tracker = createScopeDownloadProgress({
+          scopeKey,
+          hasGrades: detail?.hasGrades ?? true,
+          now: options?.now ?? Date.now,
+        });
+        downloadTrackers.set(scopeKey, tracker);
+      }
+      // A tap during this cycle belongs to the next pull, but is already
+      // waiting behind this scope. Union avoids counting captured taps twice.
+      const queuedScopeKeys = new Set(
+        [...pendingDownloads].filter(
+          (pendingScope) => !hasPurgeLanded(purgeToken, purgeNamespaceForScopeKey(pendingScope)),
+        ),
+      );
+      for (const requestedScope of options?.getPriorityBoards?.() ?? []) {
+        if (
+          parseOfflineBoardKey(requestedScope) &&
+          !hasPurgeLanded(purgeToken, purgeNamespaceForScopeKey(requestedScope))
+        )
+          queuedScopeKeys.add(requestedScope);
+      }
+      const download = tracker.offer({
+        phase,
+        phaseFraction,
+        ...detail,
+        queuedScopes: Math.max(0, queuedScopeKeys.size - 1),
+        pendingScopeKeys: [...queuedScopeKeys],
+      });
+      if (!download) return;
+      onProgress?.({
+        phase: phase === 'finishing' ? 'board_data' : 'bootstrap',
+        currentTable: phase === 'finishing' ? `board_climbs:${scopeKey}` : scopeKey,
+        documentsProcessed: totalDocuments,
+        download,
+      });
+    };
+    const finishGlobalStep = (): void => {
+      const scopeKey = pendingDownloads.values().next().value;
+      if (scopeKey) reportDownload(scopeKey, snapshotDownloads.has(scopeKey) ? 'finishing' : 'preparing', null);
+    };
+
+    // Per-scope start timestamp for ScopeDownloadCompleteInfo.durationMs, stamped
+    // when the cycle FIRST touches that scope (bootstrap eligibility check, or
+    // its turn in the board-data loop) — NOT once at cycle start, which would
+    // fold scope A's entire download time into scope B's duration whenever a
+    // cycle processes several boards.
+    //
+    // PERSISTED (issue #4310), not just held here: a 100 MB Kilter artifact
+    // routinely spans cycles — the phone backgrounds, the scheduler wakes again —
+    // and a per-run Map made every one of those report only the final cycle's
+    // work. The in-memory Map is now a read-through cache over the sync_meta
+    // stamp so a cycle costs at most one extra SELECT per scope.
+    const scopeStartedAt = new Map<string, number>();
+    // A board's markers may not land once its rows are being torn down: a
+    // sign-out, a global wipe, or a purge of the board's own namespace. Read
+    // inside the writer lock by every marker write below (issue #5851).
+    const scopeWritable = (scopeKey: string): boolean =>
+      !isSigningOut() && !hasPurgeLanded(purgeToken, purgeNamespaceForScopeKey(scopeKey));
+    const stampScopeStart = async (scopeKey: string): Promise<void> => {
+      if (scopeStartedAt.has(scopeKey)) return;
+      // A board already complete when the cycle began has no download to time.
+      // Stamping it anyway was a write per board per cycle that the
+      // completion marker then deleted again.
+      if (!pendingDownloads.has(scopeKey)) return;
+      lifecycle?.start(scopeKey);
+      // Read and written under one lock: the stamp is read-modify-write, and a
+      // read on the main connection can be older than the last commit.
+      const stamp: { startedAt?: number } = {};
+      const stamped = await runGuardedPullWrite(
         db,
-        queryClient,
+        { site: 'scope-download-started-at', canWrite: () => scopeWritable(scopeKey) },
+        async (transaction) => {
+          // Per attempt, like every value an attempt captures: only the attempt
+          // that commits may leave one behind.
+          stamp.startedAt = undefined;
+          stamp.startedAt = await ensureScopeDownloadStartedAt(transaction, scopeKey, Date.now());
+        },
+      );
+      // Refused: the board is being torn down, and the caller's own purge check
+      // after this await takes it from here. A value an earlier, rolled-back
+      // attempt captured is ignored with it.
+      if (stamped && stamp.startedAt !== undefined) {
+        scopeStartedAt.set(scopeKey, stamp.startedAt);
+        // A re-enable after interrupted cancellation can retain the legacy
+        // once-ever Started marker. Observe this request when work actually
+        // touches its scope, independently of that older funnel marker.
+        if (scopeWritable(scopeKey)) options?.onScopeDownloadObserved?.({ scopeKey, complete: false });
+      }
+    };
+
+    // Per-scope phase breakdown for ScopeDownloadCompleteInfo.phases, accumulated
+    // across this cycle's bootstrap phase and board-data loop.
+    const phasesByScope = new Map<string, ScopeDownloadPhaseBreakdown>();
+    const phaseTimings = (scopeKey: string): ScopeDownloadPhaseBreakdown => {
+      let phases = phasesByScope.get(scopeKey);
+      if (!phases) {
+        phases = emptyScopeDownloadPhases();
+        phasesByScope.set(scopeKey, phases);
+      }
+      return phases;
+    };
+
+    // Download-funnel Started (issue #4316). Once ever per scope, guarded by the
+    // durable `scope-started:` marker rather than by anything cycle-local, so a
+    // snapshot that fails and retries emits one event and a paged crawl that spans
+    // cycles is not skipped. Both are how the naive in-cycle version broke.
+    const emitScopeDownloadStartOnce = async (info: ScopeDownloadStartInfo): Promise<void> => {
+      // Cheap pre-check on the main connection: almost every call finds the
+      // marker. The decision itself is re-made under the writer lock below, so a
+      // stale read here can only cost a transaction, never a second Started.
+      if (await isScopeDownloadStarted(db, info.scopeKey)) return;
+      const decision = { emit: false };
+      await runGuardedPullWrite(
+        db,
+        { site: 'scope-download-started', canWrite: () => scopeWritable(info.scopeKey) },
+        async (transaction) => {
+          decision.emit = false;
+          if (await isScopeDownloadStarted(transaction, info.scopeKey)) return;
+          await markScopeDownloadStarted(transaction, info.scopeKey);
+          // BACKFILL, NOT A START. A scope whose download already completed —
+          // every board on a device that upgrades into this build — is not
+          // starting one now, and it can never emit Completed again either (that
+          // event is guarded by the `scope-complete:` marker it already carries).
+          // Emitting here would give the funnel one unmatched Started per
+          // already-downloaded board on the first cycle after release: a phantom
+          // abandonment spike, in exactly the window the baseline is read from.
+          // Write the marker (so this is still once-ever) and stay silent.
+          decision.emit = !(await isScopeDownloadComplete(transaction, info.scopeKey));
+        },
+      );
+      // Emitted after the commit, never from inside the attempt: a retried
+      // attempt must not announce the same Started twice.
+      if (decision.emit) options?.onScopeDownloadStart?.(info);
+    };
+    // Per-scope payload size and stage timings, recorded by the bootstrap phase and
+    // read back by Completed below. Run-local on purpose: a cycle that did not do
+    // the import has nothing honest to report (see ScopeDownloadCompleteInfo).
+    const bootstrapTimings = new Map<
+      string,
+      { bytes: number; downloadMs?: number; importMs?: number; rowCount?: number }
+    >();
+
+    // Phase 0: snapshot bootstrap (BEFORE deletions). Only when an adapter injected
+    // snapshot I/O; otherwise this is a pure paged pull, byte-identical to before.
+    let skipBootstrapPagedPull: Set<string> = new Set();
+    const retryRequestsAtBootstrap = new Map<string, boolean>();
+    if (options?.snapshotSource && boardScopes.length > 0) {
+      onProgress?.({ phase: 'bootstrap', currentTable: null, documentsProcessed: 0 });
+      const bootstrapPhase = await runBootstrapPhase({
+        reportDownload,
+        db,
+        invalidations,
+        source: options.snapshotSource,
+        scopes: boardScopes,
+        purgeToken,
+        stampScopeStart,
+        emitScopeDownloadStartOnce,
+        bootstrapTimings,
+        retryRequestsAtBootstrap,
+        phaseTimings,
+        options,
+        now: options.now ?? Date.now,
+        random: options.random ?? Math.random,
+      });
+      skipBootstrapPagedPull = bootstrapPhase.skipPagedPull;
+      for (const scopeKey of pendingDownloads) {
+        if (await isBootstrapDone(db, scopeKey)) snapshotDownloads.add(scopeKey);
+      }
+      // The bootstrap phase latches lifecycle teardown across its long native
+      // awaits. If the app foregrounds again before the rejected download is
+      // handled, the live outer guard is already clear; do not let that stale
+      // cycle continue into deletions or paged pulls.
+      if (bootstrapPhase.cycleInterrupted) return reportInterruptedCycle();
+    }
+
+    // Deletions FIRST, table pulls second. This ordering is what makes a
+    // delete-then-recreate on the server converge: the tombstone removes the old
+    // local row, then the same cycle's table pull upserts the recreated one.
+    // Applied after the pulls, a tombstone sharing the recreated row's timestamp
+    // would delete data this cycle just wrote, and the strict > cursor would
+    // never fetch it again.
+    if (cycleAborted()) return reportInterruptedCycle();
+    onProgress?.({ phase: 'deletions', currentTable: null, documentsProcessed: 0 });
+    const deletionsResult = await processDeletions(
+      db,
+      invalidations,
+      graphqlFetch,
+      purgeToken,
+      (deletionsProcessed) => {
+        totalDocuments = deletionsProcessed;
+        onProgress?.({ phase: 'deletions', currentTable: null, documentsProcessed: totalDocuments });
+      },
+      options?.onRowsDeleted,
+    );
+    // The coverage marker advances ONLY on a completed pass. An aborted one (sign-out,
+    // purge, backgrounding) consumed an unknown prefix of the stream, so claiming a
+    // fresh retention window off it would hide a real gap. See deletions-coverage.ts.
+    if (deletionsResult.reachedTail) {
+      // Its own transaction, never an autocommit write on the main connection
+      // (issue #5851). The main connection is shared with every local read, so a
+      // write there is usually a read→write upgrade: SQLite skips the busy
+      // handler for those and fails the write the instant another connection
+      // holds the lock or has committed since that read began (SQLITE_BUSY /
+      // SQLITE_BUSY_SNAPSHOT, both "database is locked"). This was the write
+      // behind BOARDSESH-QS, and one loss ended the whole cycle here.
+      //
+      // Guarded inside the lock: a sign-out deletes this marker, and one that
+      // landed after the wipe would vouch for the next account's tombstones.
+      const stamped = await runGuardedPullWrite(
+        db,
+        { site: 'deletions-coverage', canWrite: () => !isSigningOut() && !hasPurgeLanded(purgeToken) },
+        (transaction) => setDeletionsCoverageAt(transaction, Date.now()),
+      );
+      if (!stamped) return reportInterruptedCycle();
+    }
+    finishGlobalStep();
+
+    let allUserTablesReachedTail = true;
+    for (const tableName of USER_DATA_TABLES) {
+      if (cycleAborted()) return reportInterruptedCycle();
+      onProgress?.({ phase: 'user_data', currentTable: tableName, documentsProcessed: totalDocuments });
+      const baseCount = totalDocuments;
+      const userTableResult = await syncTable(
+        db,
+        invalidations,
         graphqlFetch,
         tableName,
         purgeToken,
-        boardScope,
+        undefined,
         (tableProcessed) => {
           totalDocuments = baseCount + tableProcessed;
-          onProgress?.({
-            phase: 'board_data',
-            currentTable: tableLabel,
-            documentsProcessed: totalDocuments,
-            currentTableProcessed: tableProcessed,
-          });
+          onProgress?.({ phase: 'user_data', currentTable: tableName, documentsProcessed: totalDocuments });
         },
         options?.onSchemaDrift,
-        undefined,
-        options?.onDocumentsPulled,
       );
-      const tableMs = Date.now() - tableStartedAt;
-      if (tableName === 'board_climbs') phases.climbsPullMs += tableMs;
-      else if (tableName === 'board_climb_stats') phases.statsPullMs += tableMs;
-      else if (tableName === 'board_climb_grades') {
-        // gradesPullMs accumulates unconditionally — it is a real measurement of
-        // this cycle either way. The row count is absent-when-unknown (#4393): a
-        // crawl that resumed from an EARLIER cycle's checkpoint consumed only a
-        // tail, so no number here is the import, and the 0 this used to emit read
-        // as "this board has no grades" in the #4310 analysis. A checkpoint THIS
-        // cycle's own grades artifact stamped is not an earlier cycle: the crawl
-        // behind it really did consume these rows, and gradesArtifactRows (set by
-        // importGradesForScope) says where the rest went.
-        phases.gradesPullMs += tableMs;
-        if (!resumedFromCheckpoint || phases.gradesArtifactRows !== undefined) {
-          phases.gradesRows = (phases.gradesRows ?? 0) + rowsProcessed;
-        }
-      }
-      if (!reachedTail) allTablesReachedTail = false;
+      if (!userTableResult.reachedTail) allUserTablesReachedTail = false;
+      finishGlobalStep();
     }
-    // Gate for local-first reads: only a scope whose climbs, stats AND grades
-    // (every BOARD_DATA_TABLES entry) have all pulled to the tail may serve
-    // searches — a first-page checkpoint would otherwise serve a sliver of the
-    // catalog as if it were everything.
+
+    // Only now are the user tables complete enough for a local reader to serve
+    // from — a checkpoint alone proves the first page landed, and a logbook built
+    // from a fraction of the rows reads as "you never climbed that". Mirrors
+    // markScopeDownloadComplete for board scopes. Cleared on sign-out for free:
+    // the key is `checkpoint:`-prefixed, so deleteUserCheckpoints takes it.
     //
-    // `scope-complete:` is the marker scope-teardown.ts's invariant #1 calls
-    // unrecoverable when it outlives its rows, and this block is the ONLY place
-    // that writes it. The last table's in-page guard (syncTable) is three awaits
-    // back — an upsert, a checkpoint write, and the read below — and
-    // removeBoardScopeData holds an exclusive transaction for seconds, so a purge
-    // landing in that window would queue this write BEHIND the delete. The
-    // table-loop's `allTablesReachedTail = false` never runs after the FINAL
-    // table, so it cannot cover this.
+    // Guarded, symmetric to the scope-complete block below: the last user table's
+    // in-page check is one await back, so a global wipe landing in that window
+    // would otherwise stamp `user_data_complete` over data that is being deleted.
     if (cycleAborted()) return reportInterruptedCycle();
-    if (scopePurged(boardScope)) continue;
-    if (allTablesReachedTail) {
-      const wasScopeComplete = await isScopeDownloadComplete(db, scopeKey);
-      // Checked again after the read, so the window between the decision and the
-      // write is one statement rather than one await.
+    if (allUserTablesReachedTail) {
+      // A cheap pre-check on the main connection: once the marker is down, every
+      // later cycle has nothing to write. A stale "already complete" can only
+      // skip a write, which is the safe direction; the decision to write is
+      // re-made under the lock.
+      const userDataWasComplete = await isUserDataComplete(db);
+      if (cycleAborted()) return reportInterruptedCycle();
+      if (!userDataWasComplete) {
+        const marker = { newlyComplete: false };
+        // Guarded inside the lock (issue #5851): a sign-out wipe that lands while
+        // this waits would otherwise find `user_data_complete` written back over
+        // the logbook it just deleted.
+        const marked = await runGuardedPullWrite(
+          db,
+          { site: 'user-data-complete', canWrite: () => !cycleAborted() },
+          async (transaction) => {
+            marker.newlyComplete = !(await isUserDataComplete(transaction));
+            if (marker.newlyComplete) await markUserDataComplete(transaction);
+          },
+        );
+        if (!marked || cycleAborted()) return reportInterruptedCycle();
+        // A local reader may have declined earlier in this cycle while the
+        // completion gate was closed. Wake it even when no tick rows changed,
+        // once per completed initial sync rather than on every empty pull.
+        if (marker.newlyComplete) invalidations.addFilters({ queryKey: ['localTicks'] });
+      }
+    } else allPullsReachedTail = false;
+    if (!deletionsResult.reachedTail) allPullsReachedTail = false;
+    // The tombstones and all seven user tables, as one refresh. After the marker
+    // on purpose: a local reader gated on `user_data_complete` (the logbook) has
+    // to find it when the refetch this starts runs.
+    invalidations.flush();
+
+    // Each enabled board is a "boardType:layoutId:sizeId" scope key (already parsed
+    // into boardScopes). currentTable carries the full scope key so a per-board UI
+    // can match itself.
+    for (const boardScope of prioritizeDownloadScopes(boardScopes, options?.getPriorityBoards)) {
+      // boardScopes is the pre-cycle snapshot of the enabled set. A GLOBAL teardown
+      // makes every remaining entry suspect, so it stops the cycle. A per-namespace
+      // purge only invalidates its own scope — the one being deleted right now,
+      // which is still in this stale list — so it skips that scope and lets every
+      // other board finish (issue #4370).
+      //
+      // NONE of the exits below reports a terminal event, and that is deliberate
+      // (issue #4406). A board-data crawl legitimately spans cycles — a 40k-climb
+      // layout is hundreds of pages, and the durable `scope-started:` marker keeps
+      // ONE Started open across all of them — so a Failed per interrupted cycle
+      // would turn every normal multi-cycle download into a stream of failures.
+      // The one exit that ends a download for good is the removal these purge
+      // checks are dodging, and `removeBoardScopeData` reports it from the other
+      // side: it is the last code that can still see the Started marker before
+      // deleting it, and it de-dups against the bootstrap phase's own
+      // `aborted-wipe` through the purge generation.
+      // One refresh per scope: whatever the previous board queued, across its
+      // four tables and its completion marker. Here rather than at the end of the
+      // body, which leaves through a dozen `continue`s; the last scope is flushed
+      // after the loop, and an early return by the cycle's `finally`.
+      invalidations.flush();
       if (cycleAborted()) return reportInterruptedCycle();
       if (scopePurged(boardScope)) continue;
-      // Clears the persisted start stamp as well as writing the complete marker.
-      await markScopeDownloadComplete(db, scopeKey);
-      if (wasScopeComplete) continue;
-      const startedAt = scopeStartedAt.get(scopeKey);
-      // Should be unreachable because stampScopeStart runs at the top of this
-      // loop for every scope. If that invariant breaks, skip telemetry rather
-      // than emit a misleading 0ms duration.
-      if (startedAt === undefined) continue;
-      // A stamp older than the plausibility window is a stamp nobody cleared,
-      // not a download that ran for days (a crash between stamp and completion,
-      // or an app the user simply did not open). Report the event with a null
-      // duration rather than poisoning the percentiles with it.
-      const elapsedMs = Date.now() - startedAt;
-      const durationMs = elapsedMs >= 0 && elapsedMs <= SCOPE_DOWNLOAD_START_MAX_AGE_MS ? elapsedMs : null;
-      // Both attributions read the persisted marker, not this run's bootstrap
-      // work: the import and the completing delta pull can land in different
-      // cycles (connectivity drop between them, or the grades crawl still
-      // running), and this event fires exactly once per scope — misreporting
-      // that one event would permanently skew the rollout comparison.
-      const timings = bootstrapTimings.get(scopeKey);
-      options?.onScopeDownloadComplete?.({
-        scopeKey,
-        method: (await isBootstrapDone(db, scopeKey)) ? 'snapshot' : 'paged',
-        durationMs,
-        // A healed scope's duration excludes the paged work earlier cycles did,
-        // so it must be filtered out of snapshot-vs-paged comparisons.
-        bootstrapHealed: await wasBootstrapHealed(db, scopeKey),
-        // Spread rather than set explicitly: absent when this cycle did not do
-        // the import, which is the honest answer (see ScopeDownloadCompleteInfo).
-        ...timings,
-        phases,
-      });
-    }
-  }
-
-  // Ordinary deltas retain priority and their own checkpoint, including on cellular.
-  // Only already-complete catalogs need this conservative replay after an upgrade.
-  for (const boardScope of boardScopes) {
-    if (cycleAborted()) return reportInterruptedCycle();
-    if (scopePurged(boardScope) || !(await isScopeDownloadComplete(db, boardScope.scopeKey))) continue;
-    for (const tableName of BOARD_DATA_TABLES) {
-      const revision = TABLE_CONFIGS[tableName].refreshRevision;
-      if (!revision) continue;
-      const state = await getSchemaRefreshState(db, tableName, boardScope.scopeKey);
-      if (state && state.revision >= revision && state.complete) continue;
-      if (cycleAborted() || scopePurged(boardScope)) break;
-      const shouldContinue = async (): Promise<boolean> =>
-        !cycleAborted() && !scopePurged(boardScope) && (await (options?.isOnUnmeteredNetwork?.() ?? false));
-      if (!(await shouldContinue())) continue;
-      await syncTable(
-        db,
-        queryClient,
-        graphqlFetch,
-        tableName,
-        purgeToken,
-        boardScope,
-        undefined,
-        options?.onSchemaDrift,
-        {
-          state:
-            state?.revision === revision
-              ? state
-              : { ...REFRESH_START_CURSOR, revision, complete: false, mode: 'refresh' },
-          shouldContinue,
-        },
-      );
-    }
-  }
-
-  // The holds index (hold heatmap + similar climbs on device), per scope, LAST:
-  // after every scope's completion marker, so a slow or failing build can never
-  // hold a download back, and after the snapshot import, the paged delta and the
-  // refresh replay above, so one placement sees all three. `ensureHoldIndex` is a
-  // single probe for a scope with nothing new, and it only builds scopes whose
-  // `scope-complete:` marker is down (a crawl mid-flight arrives out of
-  // `sync_seq` order).
-  //
-  // Never inside the bootstrap: that drives its own BEGIN EXCLUSIVE / COMMIT
-  // choreography. And never thrown: the index is derived from rows the device
-  // already has, so the next cycle, or the reader that needs it, rebuilds it.
-  const holdIndex = options?.holdIndex;
-  if (holdIndex) {
-    for (const boardScope of boardScopes) {
+      const scopeKey = boardScope.scopeKey;
+      // No-op when the bootstrap phase already stamped this scope; the paged-only
+      // path (no snapshotSource) starts its duration clock here.
+      await stampScopeStart(scopeKey);
+      // `scope-download-started:` is a sync_meta write the teardown deletes and no
+      // other path can clear, so a purge landing across that await must not leave
+      // one behind for rows that are gone.
+      if (scopePurged(boardScope)) continue;
+      const phases = phaseTimings(scopeKey);
+      // Started (issue #4316), the paged half — and the catch-all. Every scope
+      // reaches this line on every path: a build with no snapshot source, a scope
+      // the bootstrap phase found ineligible or unexportable, and the resumed
+      // multi-cycle crawl the checkpoint gate above skips. A scope the bootstrap
+      // phase already announced is a no-op here thanks to the durable marker, so
+      // it keeps its 'snapshot' intent and its artifact size.
+      await emitScopeDownloadStartOnce({ scopeKey, pathIntent: 'paged', artifactBytes: null });
       if (cycleAborted()) return reportInterruptedCycle();
       if (scopePurged(boardScope)) continue;
-      try {
-        await ensureHoldIndex(db, boardScope, {
-          parseHoldRows: holdIndex.parseHoldRows,
-          shouldContinue: () => !cycleAborted() && !scopePurged(boardScope),
-          // A snapshot import's reconcile step deletes local climbs with no
-          // tombstone, which is the one way a hold row can lose its climb.
-          sweepOrphans: bootstrapTimings.get(boardScope.scopeKey)?.importMs !== undefined,
-          queryClient,
+      // A fresh scope waiting on a snapshot retry skips its paged pull: its
+      // bootstrap failed this cycle with budget left, or a cooldown an earlier
+      // cycle scheduled is still running. The crawl would be round trips the
+      // retry throws away, and its first-page checkpoint would turn that retry
+      // into a heal. Never a scope the bootstrap has finished with (#6306).
+      if (skipBootstrapPagedPull.has(scopeKey)) continue;
+      let allTablesReachedTail = true;
+      let yieldedForRetry = false;
+      let observedNoRetryRequest = retryRequestsAtBootstrap.get(scopeKey) !== true;
+      const continuePagedScope =
+        options?.snapshotSource && pendingDownloads.has(scopeKey)
+          ? async (executor: SqlExecutor = db): Promise<boolean> => {
+              if (yieldedForRetry) return false;
+              const requested = await hasUserRequestedBootstrapRetry(executor, scopeKey);
+              if (!requested) observedNoRetryRequest = true;
+              // A request this cycle already tried may have fallen back because
+              // the artifact is absent. It must keep paging rather than yield forever.
+              if (requested && observedNoRetryRequest) yieldedForRetry = true;
+              return !yieldedForRetry;
+            }
+          : undefined;
+      let scopeRowsProcessed = 0;
+      const emitBoardProgress = (rowsProcessed = 0): void =>
+        reportDownload(scopeKey, snapshotDownloads.has(scopeKey) ? 'finishing' : 'downloading', null, {
+          rowsProcessed: scopeRowsProcessed + rowsProcessed,
         });
-      } catch (error) {
+      for (const tableName of BOARD_DATA_TABLES) {
+        if (cycleAborted()) return reportInterruptedCycle();
+        if (scopePurged(boardScope)) {
+          // Not `continue` on the OUTER loop's terms: clearing the flag is what
+          // stops the completion block below from being reached through this
+          // loop's normal exit. It was never sufficient on its own — see the
+          // guards there.
+          allTablesReachedTail = false;
+          break;
+        }
+        const tableLabel = `${tableName}:${scopeKey}`;
+        emitBoardProgress();
+        onProgress?.({
+          phase: 'board_data',
+          currentTable: tableLabel,
+          documentsProcessed: totalDocuments,
+          currentTableProcessed: 0,
+        });
+        const baseCount = totalDocuments;
+        // Timed per table, not per scope: the whole point of the #4310
+        // measurement is telling the artifact's tables (climbs, stats — imported
+        // in one shot) apart from board_climb_grades, which the artifact does not
+        // carry at all and which therefore crawls page by page every time.
+        const tableStartedAt = Date.now();
+        const { reachedTail, rowsProcessed, resumedFromCheckpoint } = await syncTable(
+          db,
+          invalidations,
+          graphqlFetch,
+          tableName,
+          purgeToken,
+          boardScope,
+          (tableProcessed) => {
+            totalDocuments = baseCount + tableProcessed;
+            emitBoardProgress(tableProcessed);
+            onProgress?.({
+              phase: 'board_data',
+              currentTable: tableLabel,
+              documentsProcessed: totalDocuments,
+              currentTableProcessed: tableProcessed,
+            });
+          },
+          options?.onSchemaDrift,
+          undefined,
+          options?.onDocumentsPulled,
+          tableName === 'spray_walls' ? () => confirmWallRemoval(boardScope) : undefined,
+          options?.viewerUserId,
+          continuePagedScope,
+        );
+        emitBoardProgress(rowsProcessed);
+        scopeRowsProcessed += rowsProcessed;
+        const tableMs = Date.now() - tableStartedAt;
+        if (tableName === 'board_climbs') phases.climbsPullMs += tableMs;
+        else if (tableName === 'board_climb_stats') phases.statsPullMs += tableMs;
+        else if (tableName === 'board_climb_grades') {
+          // gradesPullMs accumulates unconditionally — it is a real measurement of
+          // this cycle either way. The row count is absent-when-unknown (#4393): a
+          // crawl that resumed from an EARLIER cycle's checkpoint consumed only a
+          // tail, so no number here is the import, and the 0 this used to emit read
+          // as "this board has no grades" in the #4310 analysis. A checkpoint THIS
+          // cycle's own grades artifact stamped is not an earlier cycle: the crawl
+          // behind it really did consume these rows, and gradesArtifactRows (set by
+          // importGradesForScope) says where the rest went.
+          phases.gradesPullMs += tableMs;
+          if (!resumedFromCheckpoint || phases.gradesArtifactRows !== undefined) {
+            phases.gradesRows = (phases.gradesRows ?? 0) + rowsProcessed;
+          }
+        }
+        if (!reachedTail) {
+          allTablesReachedTail = false;
+          allPullsReachedTail = false;
+        }
+        // Release the single-flight owner now; another queued board must not
+        // turn the explicit snapshot retry back into a wait behind a long crawl.
+        if (yieldedForRetry) return reportInterruptedCycle();
+        if (retiredWalls.has(scopeKey)) break;
+      }
+      // Gate for local-first reads: only a scope whose climbs, stats AND grades
+      // (every BOARD_DATA_TABLES entry) have all pulled to the tail may serve
+      // searches — a first-page checkpoint would otherwise serve a sliver of the
+      // catalog as if it were everything.
+      //
+      // `scope-complete:` is the marker scope-teardown.ts's invariant #1 calls
+      // unrecoverable when it outlives its rows, and this block is the ONLY place
+      // that writes it. The last table's in-page guard (syncTable) is three awaits
+      // back — an upsert, a checkpoint write, and the read below — and
+      // removeBoardScopeData holds an exclusive transaction for seconds, so a purge
+      // landing in that window would queue this write BEHIND the delete. The
+      // table-loop's `allTablesReachedTail = false` never runs after the FINAL
+      // table, so it cannot cover this.
+      if (cycleAborted()) return reportInterruptedCycle();
+      if (scopePurged(boardScope) || retiredWalls.has(scopeKey)) continue;
+      if (allTablesReachedTail) {
+        // A cheap pre-check on the main connection. A board complete before this
+        // cycle has nothing to write, and a stale "complete" can only skip a
+        // write, which is the safe direction.
+        const completeBeforeLock = await isScopeDownloadComplete(db, scopeKey);
+        if (cycleAborted()) return reportInterruptedCycle();
+        if (scopePurged(boardScope)) continue;
+        if (completeBeforeLock && !continuePagedScope) continue;
+        // One transaction for the decision and the marker, with the teardown
+        // guards read INSIDE the writer lock (issue #5851). removeBoardScopeData
+        // holds that lock for seconds, so a completion that waited behind it (or
+        // lost an attempt to it and retried) would otherwise write
+        // `scope-complete:` back over a board that has no rows any more — the
+        // marker scope-teardown.ts's invariant #1 calls unrecoverable.
+        //
+        // Serialize the final retry read with completion: a request arriving on
+        // the terminal page must not lose to a completed marker before its queued run.
+        const completion = {
+          committed: false,
+          wasScopeComplete: completeBeforeLock,
+          method: 'paged' as ScopeDownloadCompleteInfo['method'],
+          bootstrapHealed: false,
+        };
+        await runPullWrite(
+          db,
+          async (transaction) => {
+            completion.committed = false;
+            if (cycleAborted() || scopePurged(boardScope)) return;
+            if (continuePagedScope && !(await continuePagedScope(transaction))) return;
+            if (cycleAborted() || scopePurged(boardScope)) return;
+            completion.wasScopeComplete = await isScopeDownloadComplete(transaction, scopeKey);
+            if (!completion.wasScopeComplete) {
+              // Clears the persisted start stamp as well as writing the complete marker.
+              await markScopeDownloadComplete(transaction, scopeKey);
+              // The once-ever Completed event's attribution, read under this lock
+              // too. `bootstrap-done:` commits on the import's own connection, so
+              // a main-connection read whose snapshot predates that commit would
+              // report a snapshot download as paged, for good.
+              completion.method = (await isBootstrapDone(transaction, scopeKey)) ? 'snapshot' : 'paged';
+              completion.bootstrapHealed = await wasBootstrapHealed(transaction, scopeKey);
+            }
+            completion.committed = true;
+          },
+          { site: 'scope-complete' },
+        );
+        if (!completion.committed) {
+          if (yieldedForRetry) return reportInterruptedCycle();
+          if (continuePagedScope) allPullsReachedTail = false;
+          if (cycleAborted()) return reportInterruptedCycle();
+          continue;
+        }
+        if (cycleAborted()) return reportInterruptedCycle();
+        if (scopePurged(boardScope)) continue;
+        if (completion.wasScopeComplete) continue;
+        reportDownload(scopeKey, 'finishing', 1);
+        downloadTrackers.get(scopeKey)?.cancel();
+        pendingDownloads.delete(scopeKey);
+        // The marker is what opens this board to local reads, so its queries must
+        // run again now that it is down. Rows moving is not enough of a signal: a
+        // snapshot can satisfy the scope outright, the delta pull above then
+        // moves nothing, and the import's own invalidation ran while the scope
+        // was still closed, so that refetch went to the network.
+        for (const tableName of BOARD_DATA_TABLES) {
+          invalidations.add(TABLE_CONFIGS[tableName].invalidateKeys, boardScope);
+        }
+        const startedAt = scopeStartedAt.get(scopeKey);
+        // Should be unreachable because stampScopeStart runs at the top of this
+        // loop for every scope. If that invariant breaks, skip telemetry rather
+        // than emit a misleading 0ms duration.
+        if (startedAt === undefined) continue;
+        // A stamp older than the plausibility window is a stamp nobody cleared,
+        // not a download that ran for days (a crash between stamp and completion,
+        // or an app the user simply did not open). Report the event with a null
+        // duration rather than poisoning the percentiles with it.
+        const elapsedMs = Date.now() - startedAt;
+        const durationMs = elapsedMs >= 0 && elapsedMs <= SCOPE_DOWNLOAD_START_MAX_AGE_MS ? elapsedMs : null;
+        // Both attributions read the persisted marker, not this run's bootstrap
+        // work: the import and the completing delta pull can land in different
+        // cycles (connectivity drop between them, or the grades crawl still
+        // running), and this event fires exactly once per scope — misreporting
+        // that one event would permanently skew the rollout comparison.
+        const timings = bootstrapTimings.get(scopeKey);
+        options?.onScopeDownloadComplete?.({
+          scopeKey,
+          method: completion.method,
+          durationMs,
+          // A healed scope's duration excludes the paged work earlier cycles did,
+          // so it must be filtered out of snapshot-vs-paged comparisons.
+          bootstrapHealed: completion.bootstrapHealed,
+          // Spread rather than set explicitly: absent when this cycle did not do
+          // the import, which is the honest answer (see ScopeDownloadCompleteInfo).
+          ...timings,
+          phases,
+        });
+      }
+    }
+
+    // The last scope of the loop above.
+    invalidations.flush();
+
+    // Ordinary deltas retain priority and their own checkpoint, including on cellular.
+    // Only already-complete catalogs need this conservative replay after an upgrade.
+    for (const boardScope of prioritizeDownloadScopes(boardScopes, options?.getPriorityBoards)) {
+      if (cycleAborted()) return reportInterruptedCycle();
+      if (
+        retiredWalls.has(boardScope.scopeKey) ||
+        scopePurged(boardScope) ||
+        !(await isScopeDownloadComplete(db, boardScope.scopeKey))
+      )
+        continue;
+      for (const tableName of BOARD_DATA_TABLES) {
+        const revision = refreshRevisionFor(tableName, boardScope.boardType);
+        if (!revision) continue;
+        const state = await getSchemaRefreshState(db, tableName, boardScope.scopeKey);
+        if (state && state.revision >= revision && state.complete) continue;
+        if (cycleAborted() || scopePurged(boardScope)) break;
+        const shouldContinue = async (): Promise<boolean> =>
+          !cycleAborted() &&
+          !scopePurged(boardScope) &&
+          (boardScope.boardType === 'spray' || (await (options?.isOnUnmeteredNetwork?.() ?? false)));
+        if (!(await shouldContinue())) continue;
         try {
-          if (holdIndex.onError) holdIndex.onError(error, boardScope.scopeKey);
-          else console.warn(`[Sync] holds index build failed for ${boardScope.scopeKey}:`, error);
-        } catch {
-          // A broken reporter must not turn a derived-data miss into a failed cycle.
+          await syncTable(
+            db,
+            invalidations,
+            graphqlFetch,
+            tableName,
+            purgeToken,
+            boardScope,
+            undefined,
+            options?.onSchemaDrift,
+            {
+              state:
+                state?.revision === revision
+                  ? state
+                  : { ...REFRESH_START_CURSOR, revision, complete: false, mode: 'refresh' },
+              shouldContinue,
+            },
+          );
+        } catch (error) {
+          // The backend does not serve the column this replay fills yet. The page
+          // was refused before it wrote, so the revision stays where it was and a
+          // later cycle retries once the backend has the column. Every other
+          // error (network, malformed page) still fails the cycle as before.
+          if (!(error instanceof RefreshColumnsMissingError)) throw error;
+          console.warn(`[Sync] refresh deferred for ${tableName} in ${boardScope.scopeKey}: ${error.message}`);
+        }
+      }
+      invalidations.flush();
+    }
+
+    // The holds index (hold heatmap + similar climbs on device), per scope, LAST:
+    // after every scope's completion marker, so a slow or failing build can never
+    // hold a download back, and after the snapshot import, the paged delta and the
+    // refresh replay above, so one placement sees all three. `ensureHoldIndex` is a
+    // single probe for a scope with nothing new, and it only builds scopes whose
+    // `scope-complete:` marker is down (a crawl mid-flight arrives out of
+    // `sync_seq` order).
+    //
+    // Never inside the bootstrap: that drives its own BEGIN EXCLUSIVE / COMMIT
+    // choreography. And never thrown: the index is derived from rows the device
+    // already has, so the next cycle, or the reader that needs it, rebuilds it.
+    const holdIndex = options?.holdIndex;
+    if (holdIndex) {
+      for (const boardScope of prioritizeDownloadScopes(boardScopes, options?.getPriorityBoards)) {
+        if (cycleAborted()) return reportInterruptedCycle();
+        if (scopePurged(boardScope) || retiredWalls.has(boardScope.scopeKey)) continue;
+        try {
+          await ensureHoldIndex(db, boardScope, {
+            parseHoldRows: holdIndex.parseHoldRows,
+            shouldContinue: () => !cycleAborted() && !scopePurged(boardScope),
+            // A snapshot import's reconcile step deletes local climbs with no
+            // tombstone, which is the one way a hold row can lose its climb.
+            sweepOrphans: bootstrapTimings.get(boardScope.scopeKey)?.importMs !== undefined,
+            queryClient,
+          });
+        } catch (error) {
+          try {
+            if (holdIndex.onError) holdIndex.onError(error, boardScope.scopeKey);
+            else console.warn(`[Sync] holds index build failed for ${boardScope.scopeKey}:`, error);
+          } catch {
+            // A broken reporter must not turn a derived-data miss into a failed cycle.
+          }
         }
       }
     }
-  }
 
-  onProgress?.({ phase: 'idle', currentTable: null, documentsProcessed: totalDocuments });
+    // Retirement belongs to a successfully completed cycle: even an unrelated
+    // scope failure defers these removals until a later cycle reaches every tail.
+    if (allPullsReachedTail && retiredWalls.size > 0) {
+      if (cycleAborted()) return reportInterruptedCycle();
+      const candidates = [...retiredWalls.values()].filter(({ scope }) => !scopePurged(scope));
+      const releases: (() => void)[] = [];
+      const expectedEpochs = new Map<string, number>();
+      const deletedRows: Record<string, unknown>[] = [];
+      const deletedScopes: BoardScope[] = [];
+      const assertRetirementActive = (): void => {
+        if (
+          retirementInterrupted ||
+          cycleAborted() ||
+          [...expectedEpochs].some(([namespace, epoch]) => getPurgeEpoch(namespace) !== epoch)
+        ) {
+          throw new SprayWallRetirementInterruptedError('Spray wall retirement interrupted');
+        }
+      };
+      try {
+        for (const { scope } of candidates) {
+          const namespace = purgeNamespaceKey(scope);
+          const before = getPurgeEpoch(namespace);
+          retirementEpochs.set(namespace, before + 1);
+          releases.push(beginScopePurge(namespace));
+          expectedEpochs.set(namespace, before + 1);
+        }
+        assertRetirementActive();
+        await runPullWrite(
+          db,
+          async (transaction) => {
+            deletedRows.length = 0;
+            deletedScopes.length = 0;
+            assertRetirementActive();
+            for (const { scope, row } of candidates) {
+              const current = await transaction.getFirstAsync<Record<string, unknown>>(
+                'SELECT * FROM spray_walls WHERE layout_id = ?',
+                [scope.layoutId],
+              );
+              assertRetirementActive();
+              // Both snapshots use SELECT * through the same SQLite driver. Compare
+              // the whole row: sync_seq is a stable ID, not an update generation.
+              // Any mismatch conservatively keeps a newer or differently shaped row.
+              if (!current || JSON.stringify(current) !== JSON.stringify(row)) continue;
+              await removeBoardScopeRows(transaction, scope, scope.scopeKey, []);
+              deletedRows.push(row);
+              deletedScopes.push(scope);
+              assertRetirementActive();
+            }
+            assertRetirementActive();
+          },
+          { site: 'spray-wall-retirement' },
+        );
+        if (deletedRows.length > 0) {
+          // The platform removes renderer registrations before invalidation can
+          // start an active refetch that would otherwise restore stale content.
+          try {
+            await options?.onRowsDeleted?.({ tableName: 'spray_walls', rows: deletedRows, db });
+          } catch {
+            /* next prune reclaims files */
+          }
+          for (const scope of deletedScopes) {
+            for (const tableName of BOARD_DATA_TABLES) {
+              invalidations.add(TABLE_CONFIGS[tableName].invalidateKeys, scope);
+            }
+          }
+          invalidateDeletedSprayWalls(invalidations, deletedRows);
+          invalidations.flush();
+        }
+      } catch (error) {
+        if (error instanceof SprayWallRetirementInterruptedError) return reportInterruptedCycle();
+        throw error;
+      } finally {
+        for (const release of releases) release();
+      }
+    }
+    invalidations.flush();
+    onProgress?.({ phase: 'idle', currentTable: null, documentsProcessed: totalDocuments });
+  } finally {
+    // Every other way out: a throw, a teardown, an interrupted retirement. Pages
+    // an earlier phase committed must reach the UI even when the next retry has
+    // no rows to bring.
+    try {
+      invalidations.flush();
+    } finally {
+      unsubscribeRetirement();
+    }
+  }
 }

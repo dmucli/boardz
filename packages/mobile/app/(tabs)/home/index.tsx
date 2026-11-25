@@ -1,11 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RefreshControl, StyleSheet, View } from 'react-native';
-import { FlashList, type FlashListRef, type ListRenderItemInfo } from '@shopify/flash-list';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
-import { useTranslation } from 'react-i18next';
-import { useQueryClient } from '@tanstack/react-query';
-import type { BottomSheet } from '@expo/ui/community/bottom-sheet';
+import { SMART_PLAYLIST_COUNTS_QUERY_KEY } from '@boardsesh/playlists-react';
 import type {
   CrewFeedItem,
   SessionFeedItem,
@@ -13,43 +6,55 @@ import type {
   SocialEntityType,
   UserBoard,
 } from '@boardsesh/shared-schema';
-import { Text } from '../../../src/components/Text';
-import { Icon } from '../../../src/components/Icon';
-import { Card } from '../../../src/components/Card';
-import { Button } from '../../../src/components/Button';
-import { SessionFeedCard } from '../../../src/components/you/SessionFeedCard';
-import { NewClimbFeedCard } from '../../../src/components/feed/NewClimbFeedCard';
-import { useCrewFeed } from '../../../src/lib/graphql/hooks/use-crew-feed';
-import { CommentSheet } from '../../../src/components/you/CommentSheet';
-import { HomeTopChrome, TOP_ISLAND_BAND } from '../../../src/components/feed/HomeTopChrome';
+import type { BottomSheet } from '@expo/ui/community/bottom-sheet';
+import { type FlashListRef, type ListRenderItemInfo } from '@shopify/flash-list';
+import { useQueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { type AppMenuAction } from '../../../src/components/AppMenu';
-import { useBulkVoteSummaries, useSessionGroupedFeed } from '../../../src/lib/graphql/hooks';
-import { FOLLOWED_LIVE_SESSIONS_QUERY_KEY } from '../../../src/lib/graphql/query-keys';
-import { useHomeBoard } from '../../../src/lib/graphql/hooks/use-home-board';
-import { useAuth } from '../../../src/providers/auth-provider';
-import { useTheme } from '../../../src/providers/theme-provider';
-import { useDrawerHost } from '../../../src/providers/drawer-host-provider';
-import { useBottomChromeMetrics } from '../../../src/hooks/use-bottom-chrome-metrics';
-import { useOfflineQueryState } from '../../../src/hooks/use-offline-query-state';
-import { OfflineState } from '../../../src/components/OfflineState';
-import { dedupeSessionsById } from '../../../src/lib/feed-time-buckets';
-import { deriveFeedScopeInput, type FeedMode } from '../../../src/lib/feed/feed-scope';
-import { createFeedPageGate, requiresCrewPageTap } from '../../../src/lib/feed/crew-page-state';
-import { buildVoteSummaryMap, voteSummaryKey, type VoteSummary } from '../../../src/lib/feed/vote-summary-map';
-import { openClimbInPlayDrawer } from '../../../src/lib/open-climb-in-play-drawer';
-import { hapticLight } from '../../../src/lib/haptics';
-import { navigateToSessionFeedItem } from '../../../src/lib/session-feed-navigation';
-import { iosSystemColors } from '../../../src/theme/ios-colors';
-import { borderRadius, spacing } from '../../../src/theme/tokens';
-import { LiveSessionsRail } from '../../../src/components/live-sessions/LiveSessionsRail';
+import { AppStorePrompt } from '../../../src/components/AppStorePrompt';
+import { HomeTopChrome, TOP_ISLAND_BAND } from '../../../src/components/feed/HomeTopChrome';
+import { NewClimbFeedCard } from '../../../src/components/feed/NewClimbFeedCard';
+import { HomeCustomizeSheet } from '../../../src/components/home/HomeCustomizeSheet';
+import { HomeHeaderView } from '../../../src/components/home/HomeHeaderView';
+import { HomeSections } from '../../../src/components/home/HomeSections';
+import { HomeSupportCard } from '../../../src/components/home/HomeSupportCard';
+import { HomeView } from '../../../src/components/home/HomeView';
 import { InviteSheet } from '../../../src/components/session-screen/InviteSheet';
+import { useSessionWorkoutHeadlines } from '../../../src/components/session/workout/use-session-workout-view';
+import { CommentSheet } from '../../../src/components/you/CommentSheet';
+import { SessionFeedCard } from '../../../src/components/you/SessionFeedCard';
+import { useBottomChromeMetrics } from '../../../src/hooks/use-bottom-chrome-metrics';
+import { useHideOnScroll } from '../../../src/hooks/use-hide-on-scroll';
+import { useMountedOnFirstOpen } from '../../../src/hooks/use-mounted-on-first-open';
+import { useNativeRootHeader } from '../../../src/hooks/use-native-root-header';
+import { useOfflineQueryState } from '../../../src/hooks/use-offline-query-state';
+import { useScrollEdgeBackdrop } from '../../../src/hooks/use-scroll-edge-backdrop';
+import { dedupeSessionsById } from '../../../src/lib/feed-time-buckets';
+import { createFeedPageGate, requiresCrewPageTap } from '../../../src/lib/feed/crew-page-state';
+import { deriveFeedScopeInput, type FeedMode } from '../../../src/lib/feed/feed-scope';
+import { buildVoteSummaryMap, voteSummaryKey, type VoteSummary } from '../../../src/lib/feed/vote-summary-map';
+import { useBulkVoteSummaries, useSessionGroupedFeed } from '../../../src/lib/graphql/hooks';
+import { useCrewFeed } from '../../../src/lib/graphql/hooks/use-crew-feed';
+import { useHomeBoard } from '../../../src/lib/graphql/hooks/use-home-board';
+import {
+  FOLLOWED_LIVE_SESSIONS_QUERY_KEY,
+  RECENT_BETA_LINKS_QUERY_KEY,
+  SESSION_SUMMARY_QUERY_KEY,
+} from '../../../src/lib/graphql/query-keys';
+import { hapticLight } from '../../../src/lib/haptics';
+import { useHomeSectionLayout, visibleTopHomeSections } from '../../../src/lib/home-sections';
+import { useTickListActivation } from '../../../src/lib/playlists/use-tick-list-activation';
+import { useScopedRouter as useRouter } from '../../../src/lib/routing/scoped-navigation';
+import { navigateToSessionFeedItem } from '../../../src/lib/session-feed-navigation';
+import { useAuth } from '../../../src/providers/auth-provider';
 
+import { useHasBeenFocused } from '../../../src/hooks/use-has-been-focused';
 import { HomeStartupCommit } from '../../../src/lib/profiling/HomeStartupCommit';
-import { STARTUP_PROFILING_ENABLED } from '../../../src/lib/profiling/startup-profile';
 import { homeEmptyStartupOutcome } from '../../../src/lib/profiling/startup-collector';
-
-const INITIAL_FEED_SKELETON_KEYS = ['home-feed-skeleton-1', 'home-feed-skeleton-2', 'home-feed-skeleton-3'];
-const NEXT_PAGE_FEED_SKELETON_KEYS = ['home-feed-footer-skeleton-1', 'home-feed-footer-skeleton-2'];
+import { STARTUP_PROFILING_ENABLED } from '../../../src/lib/profiling/startup-profile';
 
 type CommentTarget = {
   entityId: string;
@@ -58,26 +63,47 @@ type CommentTarget = {
 
 // Hoisted so the FlashList `keyExtractor` prop keeps a stable identity across
 // renders (perf playbook rule 3) instead of a fresh inline arrow each pass.
-const keyExtractor = (item: CrewFeedItem) => item.id;
-const getItemType = (item: CrewFeedItem) => item.__typename;
+const NO_FEED_ITEMS: CrewFeedItem[] = [];
+// A session card shows one climb, so it plays from a list of just that one.
+const NO_TICKS: SessionFeedTickHighlight[] = [];
+const NO_SESSION_ID_PAGES: readonly (readonly string[])[] = [];
 
 export default function HomeTab() {
+  const nativeRootHeader = useNativeRootHeader();
   const { t } = useTranslation('feed');
   const { t: tCommon } = useTranslation('common');
+  const { t: tSession } = useTranslation('session');
   const router = useRouter();
   const queryClient = useQueryClient();
   const { isAuthenticated } = useAuth();
-  const { systemColors, brandColors } = useTheme();
-  const { openPlayDrawer } = useDrawerHost();
   const bottomChrome = useBottomChromeMetrics();
   const insets = useSafeAreaInsets();
   const listRef = useRef<FlashListRef<CrewFeedItem>>(null);
   const commentSheetRef = useRef<BottomSheet | null>(null);
   const [commentTarget, setCommentTarget] = useState<CommentTarget | null>(null);
-  // Measured top-chrome height so the feed clears the chrome (seeded to the floating
-  // band's height — exact for Liquid Glass, corrected by the Material app bar's
-  // onLayout on the next frame).
-  const [chromeHeight, setChromeHeight] = useState(() => insets.top + TOP_ISLAND_BAND);
+  // UIKit owns its title inset. Other variants measure the floating chrome.
+  const [chromeHeight, setChromeHeight] = useState(() => (nativeRootHeader ? 0 : insets.top + TOP_ISLAND_BAND));
+  // Tells the Material app bar when the feed has scrolled under it. `list` stays
+  // undefined, and the feed listener-free, until a bar attaches.
+  const scrollEdge = useScrollEdgeBackdrop();
+  // The Android nav bar hides as the feed scrolls down (`useHideOnScroll`).
+  const handleScroll = useHideOnScroll(scrollEdge.list?.listProps.onScroll);
+
+  // Which sections the climber shows, and in what order (Customize Home). Read
+  // synchronously, so a hidden section never mounts and its queries never start.
+  // The default is today's Home: Climbing now, then the feed.
+  const sectionLayout = useHomeSectionLayout();
+  const feedVisible = sectionLayout.visible.feed;
+  const climbingNowVisible = sectionLayout.visible.climbingNow;
+  // The scope menu picks whose sessions the feed and Climbing now show; without
+  // either there is nothing for it to scope.
+  const scopeVisible = feedVisible || climbingNowVisible;
+  const topSectionIds = useMemo(() => visibleTopHomeSections(sectionLayout), [sectionLayout]);
+  const homeEmpty = topSectionIds.length === 0 && !feedVisible;
+  const [customizeOpen, setCustomizeOpen] = useState(false);
+  const mountCustomizeSheet = useMountedOnFirstOpen(customizeOpen);
+  const handleOpenCustomize = useCallback(() => setCustomizeOpen(true), []);
+  const handleCloseCustomize = useCallback(() => setCustomizeOpen(false), []);
 
   // Feed scope. `mode` chooses the view — `crew` (people you follow) is the
   // default; `gym` is everyone on the selected board. `selectedBoard` is the
@@ -85,22 +111,25 @@ export default function HomeTab() {
   // or the "Everyone" global feed). It defaults to the inferred home board once
   // it resolves; the view stays on `crew`.
   const { board: homeBoard, isResolving: isResolvingHomeBoard, boards: ownedBoards } = useHomeBoard();
-  // Screenshot builds open on the global "Everyone" feed (gym + no board) — a
-  // livelier hero shot than the test user's own crew. Inlined so it dead-strips
-  // in normal builds, where the default stays `crew`.
-  const [mode, setMode] = useState<FeedMode>(process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1' ? 'gym' : 'crew');
+  const [mode, setMode] = useState<FeedMode>('crew');
   const [selectedBoard, setSelectedBoard] = useState<UserBoard | null>(null);
   // Once home-board inference settles, point the crew/gym filter at the home
   // board. The view stays on `crew`; with no home board it's the unfiltered crew.
-  const hasDefaultedScope = useRef(false);
-  useEffect(() => {
-    if (hasDefaultedScope.current || isResolvingHomeBoard) return;
-    hasDefaultedScope.current = true;
-    // Screenshot mode stays on the global "Everyone" feed, so don't scope the
-    // gym view to the home board (that would turn it into one board's feed).
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1') return;
-    if (homeBoard) setSelectedBoard(homeBoard);
-  }, [homeBoard, isResolvingHomeBoard]);
+  // During render, not in an effect: React re-renders with the board before it
+  // commits, so nothing that waits on `scopeReady` (Fresh beta, the feeds) ever
+  // asks once for every board and again for this one.
+  // Until the climber picks a scope from the menu, the scope follows the home
+  // board: a Change board from Your board's card moves Fresh beta, the gym feed
+  // and Climbing now with it. A board or Everyone picked from the menu stays.
+  // `undefined` until inference first settles.
+  const [scopedHomeBoardUuid, setScopedHomeBoardUuid] = useState<string | null | undefined>(undefined);
+  const [hasChosenScope, setHasChosenScope] = useState(false);
+  const homeBoardUuid = homeBoard?.uuid ?? null;
+  if (!isResolvingHomeBoard && scopedHomeBoardUuid !== homeBoardUuid) {
+    setScopedHomeBoardUuid(homeBoardUuid);
+    if (!hasChosenScope) setSelectedBoard(homeBoard);
+  }
+  const hasDefaultedScope = scopedHomeBoardUuid !== undefined;
 
   const feedInput = useMemo(() => deriveFeedScopeInput(mode, selectedBoard?.uuid ?? null), [mode, selectedBoard]);
   // "Climbing now" adds the selected board's sessions only when the climber is
@@ -110,14 +139,18 @@ export default function HomeTab() {
   // Hold both queries until home-board inference settles, so a cold start never
   // fires the unscoped global feed first (initial state is gym + no board) and
   // then refetches the scoped/crew query — that double-fetch flickered the feed.
-  const scopeReady = !isResolvingHomeBoard;
-  const sessionFeed = useSessionGroupedFeed(feedInput, isAuthenticated && scopeReady && mode === 'gym');
-  const crewFeed = useCrewFeed(isAuthenticated && scopeReady && mode === 'crew');
+  // NativeTabs mounts every tab at launch, so the feeds also wait for Home's
+  // first focus (see useHasBeenFocused); a launch on Climbs no longer pays them.
+  const hasBeenFocused = useHasBeenFocused();
+  const scopeReady = hasDefaultedScope && !isResolvingHomeBoard && hasBeenFocused;
+  const feedEnabled = isAuthenticated && scopeReady && feedVisible;
+  const sessionFeed = useSessionGroupedFeed(feedInput, feedEnabled && mode === 'gym');
+  const crewFeed = useCrewFeed(feedEnabled && mode === 'crew');
   const feed = mode === 'crew' ? crewFeed : sessionFeed;
   // A visibility recheck can remove every candidate from one page. Advancing
   // that cursor needs an explicit tap, not an automatic drain of sparse pages.
   const lastCrewPage = crewFeed.data?.pages.at(-1)?.crewFeed;
-  const requiresManualPage = mode === 'crew' && requiresCrewPageTap(lastCrewPage);
+  const requiresManualPage = feedVisible && mode === 'crew' && requiresCrewPageTap(lastCrewPage);
   const pageGateRef = useRef(createFeedPageGate());
   const pageSource = mode === 'crew' ? 'crew' : `gym:${selectedBoard?.uuid ?? 'everyone'}`;
   // The feed is network-only and `networkMode: 'offlineFirst'` pauses an offline
@@ -126,6 +159,8 @@ export default function HomeTab() {
   const feedOffline = useOfflineQueryState(feed);
 
   const feedItems = useMemo<CrewFeedItem[]>(() => {
+    // A hidden feed shows nothing, even with pages still cached from before.
+    if (!feedVisible) return NO_FEED_ITEMS;
     if (mode === 'crew') {
       const items = crewFeed.data?.pages.flatMap((page) => page.crewFeed.items) ?? [];
       return [...new Map(items.map((item) => [item.id, item])).values()];
@@ -138,7 +173,7 @@ export default function HomeTab() {
         session,
       }),
     );
-  }, [mode, crewFeed.data, sessionFeed.data]);
+  }, [feedVisible, mode, crewFeed.data, sessionFeed.data]);
   const sessions = useMemo(
     () => feedItems.flatMap((item) => (item.__typename === 'CrewSessionItem' ? [item.session] : [])),
     [feedItems],
@@ -187,6 +222,30 @@ export default function HomeTab() {
   // the stable `renderItem` always closes over the current vote data.
   summaryMapRef.current = summaryMap;
 
+  // Each session card's workout line (#6903): one headline request per loaded
+  // feed page. Read through a ref like the vote map, so `renderItem` stays
+  // stable; `listExtraData` below re-invokes it when a line arrives.
+  const sessionIdPages = useMemo(() => {
+    if (!feedVisible) return NO_SESSION_ID_PAGES;
+    if (mode === 'crew') {
+      return (
+        crewFeed.data?.pages.map((page) =>
+          page.crewFeed.items.flatMap((item) =>
+            item.__typename === 'CrewSessionItem' ? [item.session.sessionId] : [],
+          ),
+        ) ?? NO_SESSION_ID_PAGES
+      );
+    }
+    return (
+      sessionFeed.data?.pages.map((page) => page.sessionGroupedFeed.sessions.map((session) => session.sessionId)) ??
+      NO_SESSION_ID_PAGES
+    );
+  }, [feedVisible, mode, crewFeed.data, sessionFeed.data]);
+  const workoutHeadlines = useSessionWorkoutHeadlines(sessionIdPages);
+  const workoutHeadlinesRef = useRef(workoutHeadlines);
+  workoutHeadlinesRef.current = workoutHeadlines;
+  const listExtraData = useMemo(() => ({ summaryMap, workoutHeadlines }), [summaryMap, workoutHeadlines]);
+
   const handleOpenComments = useCallback((entityId: string, entityType: SocialEntityType) => {
     setCommentTarget({ entityId, entityType });
     commentSheetRef.current?.snapToIndex(0);
@@ -201,30 +260,76 @@ export default function HomeTab() {
     [router],
   );
 
-  const handleOpenClimb = useCallback(
-    (tick: SessionFeedTickHighlight) => openClimbInPlayDrawer({ kind: 'tick', tick }, { openPlayDrawer, router }),
-    [openPlayDrawer, router],
-  );
+  // A session card's hardest send opens like a row of any list (issue #6665):
+  // driving the wall (a swipe, Put on board or Always drive the wall) decides
+  // whether it goes up, and it plays from a one-climb list of its own.
+  const handleOpenClimb = useTickListActivation<SessionFeedTickHighlight>({
+    sourceId: 'home-session-cards',
+    label: tSession('playView.track.hardestSend'),
+    rows: NO_TICKS,
+  });
 
   const loadNextPage = useCallback(() => {
-    if (!feed.hasNextPage || feed.isFetchingNextPage || !pageGateRef.current.claim(pageSource)) return;
+    // A disabled query still pages on request, so a hidden feed must not ask.
+    if (!feedVisible || !feed.hasNextPage || feed.isFetchingNextPage || !pageGateRef.current.claim(pageSource)) {
+      return;
+    }
     // Promise cleanup still runs after unmount. A remount owns a fresh ref, so
     // this completion can only release the old instance's gate.
     void feed.fetchNextPage().finally(() => {
       pageGateRef.current.release(pageSource);
     });
-  }, [feed.hasNextPage, feed.isFetchingNextPage, feed.fetchNextPage, pageSource]);
+  }, [feedVisible, feed.hasNextPage, feed.isFetchingNextPage, feed.fetchNextPage, pageSource]);
   const handleEndReached = useCallback(() => {
     if (!requiresManualPage) loadNextPage();
   }, [requiresManualPage, loadNextPage]);
 
+  const sessionCardVisible = sectionLayout.visible.session;
+  const playlistsVisible = sectionLayout.visible.playlists;
+  const betaVisible = sectionLayout.visible.beta;
+  // The spinner follows the feed's refetch while the feed shows, as it always
+  // has. Without the feed it follows the sections' own refetches.
+  const [sectionsRefreshing, setSectionsRefreshing] = useState(false);
+  // Which pull is the latest, so an earlier one settling can't drop the spinner
+  // while a later one is still out.
+  const latestRefreshRef = useRef(0);
   const handleRefresh = useCallback(() => {
-    // The rail subscribes to its own query, so the screen refreshes it by key.
-    void queryClient.invalidateQueries({ queryKey: FOLLOWED_LIVE_SESSIONS_QUERY_KEY });
+    // Only what is on screen. Each section subscribes to its own query, so the
+    // screen refreshes it by key; Your board reads the phone and has nothing to fetch.
+    const sectionRefetches: Promise<void>[] = [];
+    if (climbingNowVisible) {
+      sectionRefetches.push(queryClient.invalidateQueries({ queryKey: FOLLOWED_LIVE_SESSIONS_QUERY_KEY }));
+    }
+    if (sessionCardVisible)
+      sectionRefetches.push(queryClient.invalidateQueries({ queryKey: [SESSION_SUMMARY_QUERY_KEY] }));
+    if (playlistsVisible) {
+      sectionRefetches.push(queryClient.invalidateQueries({ queryKey: [SMART_PLAYLIST_COUNTS_QUERY_KEY] }));
+    }
+    if (betaVisible) sectionRefetches.push(queryClient.invalidateQueries({ queryKey: [RECENT_BETA_LINKS_QUERY_KEY] }));
+    if (sectionRefetches.length > 0) {
+      latestRefreshRef.current += 1;
+      const refresh = latestRefreshRef.current;
+      setSectionsRefreshing(true);
+      void Promise.allSettled(sectionRefetches).then(() => {
+        if (latestRefreshRef.current === refresh) setSectionsRefreshing(false);
+      });
+    }
+    if (!feedVisible) return;
     void sessionVoteSummaries.refetch();
     void tickVoteSummaries.refetch();
     if (isAuthenticated) void feed.refetch();
-  }, [queryClient, feed, isAuthenticated, sessionVoteSummaries, tickVoteSummaries]);
+  }, [
+    queryClient,
+    climbingNowVisible,
+    sessionCardVisible,
+    playlistsVisible,
+    betaVisible,
+    feedVisible,
+    feed,
+    isAuthenticated,
+    sessionVoteSummaries,
+    tickVoteSummaries,
+  ]);
 
   // The invite sheet for the viewer's own solo session on the rail. Mounted on
   // the first request and kept mounted; opening waits one frame so the native
@@ -250,12 +355,14 @@ export default function HomeTab() {
 
   const handleSelectBoard = useCallback((board: UserBoard) => {
     hapticLight();
+    setHasChosenScope(true);
     setSelectedBoard(board);
     setMode('gym');
   }, []);
 
   const handleSelectEveryone = useCallback(() => {
     hapticLight();
+    setHasChosenScope(true);
     setSelectedBoard(null);
     setMode('gym');
   }, []);
@@ -265,17 +372,18 @@ export default function HomeTab() {
   }, [router]);
 
   const handleBrowseEveryone = useCallback(() => {
+    setHasChosenScope(true);
     setSelectedBoard(null);
     setMode('gym');
   }, []);
 
   // Read the map through `summaryMapRef` (not `summaryMap`) so this stays
-  // referentially stable across vote/page updates — `extraData={summaryMap}` is
+  // referentially stable across vote/page updates — `extraData={listExtraData}` is
   // the single signal that re-invokes it. A churning `renderItem` would force
   // FlashList to re-render regardless of `extraData` (perf playbook rule 3).
   const renderItem = useCallback(
     ({ item, target }: ListRenderItemInfo<CrewFeedItem>) => (
-      <>
+      <View testID={target === 'Cell' ? 'home-feed-item' : undefined} collapsable={false}>
         {STARTUP_PROFILING_ENABLED && target === 'Cell' ? <HomeStartupCommit outcome="content" /> : null}
         {item.__typename === 'CrewClimbItem' || item.__typename === 'CrewClimbGroupItem' ? (
           <NewClimbFeedCard item={item} />
@@ -288,9 +396,10 @@ export default function HomeTab() {
             onOpenComments={handleOpenComments}
             onPress={handleSessionPress}
             onOpenClimb={handleOpenClimb}
+            workoutHeadline={workoutHeadlinesRef.current.get(item.session.sessionId)}
           />
         )}
-      </>
+      </View>
     ),
     [handleOpenComments, handleSessionPress, handleOpenClimb],
   );
@@ -299,6 +408,10 @@ export default function HomeTab() {
   // boards, "Everyone", and "Find a gym". The active scope carries a checkmark
   // and doubles as the large title. `onSelectIndex` runs the tapped item.
   const scopeMenu = useMemo(() => {
+    // Nothing to scope: the chrome shows a plain "Home" title instead of the menu.
+    if (!scopeVisible) {
+      return { title: tCommon('mobile.nav.home'), actions: [], onSelectIndex: () => {} };
+    }
     const items: { action: AppMenuAction; run: () => void }[] = [
       {
         action: { label: t('mobile.home.scope.myCrew'), systemIcon: 'person.2.fill', selected: mode === 'crew' },
@@ -353,6 +466,8 @@ export default function HomeTab() {
     };
   }, [
     t,
+    tCommon,
+    scopeVisible,
     mode,
     homeBoard,
     ownedBoards,
@@ -365,311 +480,136 @@ export default function HomeTab() {
 
   const sessionsHeading = mode === 'gym' ? t('mobile.home.sessionsTitle') : t('mobile.home.feedTitle');
 
-  // No query data in these deps: the rail polls on its own, and a dep that
-  // changed on every poll would rebuild the FlashList header each minute.
+  // No query data in these deps: every section subscribes to its own data, and a
+  // dep that changed on every poll would rebuild the FlashList header each minute.
+  // The layout changes only when the climber edits it.
   const header = useMemo(
     () => (
-      <View style={styles.header}>
-        <LiveSessionsRail boardUuid={liveBoardUuid} enabled={scopeReady} onInvite={handleOpenInvite} />
-        <Text variant="title3" style={styles.feedHeading}>
-          {sessionsHeading}
-        </Text>
-      </View>
-    ),
-    [liveBoardUuid, scopeReady, handleOpenInvite, sessionsHeading],
-  );
-
-  if (!isAuthenticated) {
-    return (
-      <View style={[styles.centered, { backgroundColor: systemColors.background }]}>
-        {STARTUP_PROFILING_ENABLED ? <HomeStartupCommit outcome="empty" /> : null}
-        <Icon name="people" size={48} color={systemColors.tertiaryLabel} />
-        <Text variant="headline" style={styles.emptyTitle}>
-          {t('mobile.home.signInTitle')}
-        </Text>
-        <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.emptyBody}>
-          {t('mobile.home.signInBody')}
-        </Text>
-        <View style={styles.emptyCta}>
-          <Button title={tCommon('userDrawer.signIn')} onPress={() => router.push('/auth/login')} />
-        </View>
-      </View>
-    );
-  }
-
-  return (
-    <View testID="home-screen" style={[styles.flex, { backgroundColor: systemColors.background }]}>
-      <FlashList
-        ref={listRef}
-        data={feedItems}
-        getItemType={getItemType}
-        extraData={summaryMap}
-        renderItem={renderItem}
-        keyExtractor={keyExtractor}
-        // The floating glass header owns the top inset on every platform (the
-        // iOS-only `automatic` behaviour left an Android gap), so pad manually.
-        contentInsetAdjustmentBehavior="never"
-        contentContainerStyle={{
-          paddingTop: chromeHeight,
-          paddingBottom: bottomChrome.scrollBottomPadding + spacing[5],
-        }}
-        scrollIndicatorInsets={{ top: chromeHeight }}
-        onEndReached={handleEndReached}
-        onEndReachedThreshold={0.5}
-        ListHeaderComponent={header}
-        refreshControl={
-          <RefreshControl refreshing={feed.isRefetching} onRefresh={handleRefresh} tintColor={brandColors.primary} />
+      <HomeHeaderView
+        scope={
+          nativeRootHeader && scopeVisible
+            ? {
+                title: scopeMenu.title,
+                actions: scopeMenu.actions,
+                onSelectIndex: scopeMenu.onSelectIndex,
+                accessibilityHint: t('mobile.home.scope.hint'),
+              }
+            : undefined
         }
-        ListEmptyComponent={
+        notices={
           <>
-            {STARTUP_PROFILING_ENABLED ? (
-              <HomeStartupCommit
-                outcome={homeEmptyStartupOutcome({
-                  authenticated: isAuthenticated,
-                  blockedReason: feedOffline.isBlocked ? feedOffline.reason : null,
-                  loading: feed.isLoading,
-                  scopeReady,
-                  error: feed.isError,
-                })}
-              />
-            ) : null}
-            {feedOffline.isBlocked && feedOffline.reason ? (
-              <OfflineState reason={feedOffline.reason} onRetry={handleRefresh} />
-            ) : feed.isLoading || !scopeReady ? (
-              <ActivitySkeletonList skeletonKeys={INITIAL_FEED_SKELETON_KEYS} />
-            ) : feed.isError ? (
-              <View style={styles.feedState}>
-                <Icon name="error" size={32} color={iosSystemColors.systemRed} />
-                <Text variant="headline" style={styles.emptyTitle}>
-                  {t('errors.loadActivity')}
-                </Text>
-                <View style={styles.emptyCta}>
-                  <Button title={tCommon('actions.retry')} onPress={() => void feed.refetch()} />
-                </View>
-              </View>
-            ) : requiresManualPage ? null : mode === 'gym' && selectedBoard != null ? (
-              <View style={styles.feedState}>
-                <Icon name="boards" size={48} color={systemColors.tertiaryLabel} />
-                <Text variant="headline" style={styles.emptyTitle}>
-                  {t('mobile.home.boardEmptyTitle', { board: selectedBoard.gymName ?? selectedBoard.name })}
-                </Text>
-                <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.emptyBody}>
-                  {t('mobile.home.boardEmptyBody')}
-                </Text>
-                <View style={styles.emptyCta}>
-                  <Button title={t('mobile.home.boardEmptyCta')} onPress={handleBrowseEveryone} />
-                </View>
-              </View>
-            ) : mode === 'crew' ? (
-              <View style={styles.feedState}>
-                <Icon name="people" size={48} color={systemColors.tertiaryLabel} />
-                <Text variant="headline" style={styles.emptyTitle}>
-                  {t('mobile.home.emptyTitle')}
-                </Text>
-                <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.emptyBody}>
-                  {t('mobile.home.emptyBody')}
-                </Text>
-              </View>
-            ) : (
-              <View style={styles.feedState}>
-                <Icon name="people" size={48} color={systemColors.tertiaryLabel} />
-                <Text variant="headline" style={styles.emptyTitle}>
-                  {t('emptyStates.noRecentActivity')}
-                </Text>
-              </View>
-            )}
+            <HomeSupportCard />
+            <AppStorePrompt surface="home" />
           </>
         }
-        ListFooterComponent={
-          feed.isFetchingNextPage ? (
-            <ActivitySkeletonList skeletonKeys={NEXT_PAGE_FEED_SKELETON_KEYS} />
-          ) : requiresManualPage ? (
-            <Button title={t('crewLoadMore')} onPress={loadNextPage} />
-          ) : null
+        sections={
+          <HomeSections
+            sectionIds={topSectionIds}
+            cardsReady={hasBeenFocused}
+            liveBoardUuid={liveBoardUuid}
+            liveEnabled={scopeReady}
+            betaBoardType={selectedBoard?.boardType ?? null}
+            betaLayoutId={selectedBoard?.layoutId ?? null}
+            onInvite={handleOpenInvite}
+          />
         }
+        showCustomize={!homeEmpty}
+        onCustomize={handleOpenCustomize}
+        heading={feedVisible ? sessionsHeading : undefined}
       />
-      <HomeTopChrome
-        scopeTitle={scopeMenu.title}
-        scopeActions={scopeMenu.actions}
-        onSelectScopeIndex={scopeMenu.onSelectIndex}
-        onOpenSearch={handleOpenSearch}
-        searchAccessibilityLabel={t('mobile.home.searchAction')}
-        scopeAccessibilityHint={t('mobile.home.scope.hint')}
-        onHeightChange={setChromeHeight}
-      />
-      <CommentSheet
-        sheetRef={commentSheetRef}
-        entityId={commentTarget?.entityId ?? null}
-        entityType={commentTarget?.entityType ?? 'tick'}
-        onClose={() => setCommentTarget(null)}
-      />
-      {inviteSessionId ? (
-        <InviteSheet visible={inviteOpen} onDismiss={handleDismissInvite} sessionId={inviteSessionId} />
-      ) : null}
-    </View>
+    ),
+    [
+      nativeRootHeader,
+      scopeVisible,
+      scopeMenu,
+      t,
+      topSectionIds,
+      hasBeenFocused,
+      liveBoardUuid,
+      scopeReady,
+      selectedBoard,
+      handleOpenInvite,
+      homeEmpty,
+      handleOpenCustomize,
+      feedVisible,
+      sessionsHeading,
+    ],
   );
-}
-
-function ActivitySkeletonList({ skeletonKeys }: { skeletonKeys: string[] }) {
-  return (
-    <View accessibilityElementsHidden importantForAccessibility="no-hide-descendants">
-      {skeletonKeys.map((skeletonKey) => (
-        <ActivityCardSkeleton key={skeletonKey} />
-      ))}
-    </View>
-  );
-}
-
-function ActivityCardSkeleton() {
-  const { systemColors } = useTheme();
-  const blockStyle = { backgroundColor: systemColors.fill };
 
   return (
-    <View style={styles.cardOuter}>
-      <Card>
-        <View style={styles.skeletonHeader}>
-          <View style={[styles.skeletonAvatar, blockStyle]} />
-          <View style={styles.skeletonHeaderText}>
-            <View style={[styles.skeletonTitleLine, blockStyle]} />
-            <View style={[styles.skeletonSmallLine, blockStyle]} />
-          </View>
-        </View>
-
-        <View style={styles.skeletonBody}>
-          <View style={[styles.skeletonThumbnail, blockStyle]} />
-          <View style={styles.skeletonDetails}>
-            <View style={[styles.skeletonClimbName, blockStyle]} />
-            <View style={[styles.skeletonMetaLine, blockStyle]} />
-            <View style={[styles.skeletonCommentLine, blockStyle]} />
-            <View style={[styles.skeletonCommentShortLine, blockStyle]} />
-          </View>
-        </View>
-
-        <View style={[styles.skeletonSocialRow, { borderTopColor: systemColors.separator }]}>
-          <View style={[styles.skeletonSocialPill, blockStyle]} />
-          <View style={[styles.skeletonSocialPill, blockStyle]} />
-        </View>
-      </Card>
-    </View>
+    <HomeView
+      isAuthenticated={isAuthenticated}
+      feedItems={feedItems}
+      renderItem={renderItem}
+      listRef={listRef}
+      listExtraData={listExtraData}
+      nativeRootHeader={nativeRootHeader}
+      chromeHeight={chromeHeight}
+      bottomInset={bottomChrome.scrollBottomPadding}
+      scrollEdge={scrollEdge.list}
+      handleScroll={handleScroll}
+      handleEndReached={handleEndReached}
+      handleRefresh={handleRefresh}
+      handleOpenCustomize={handleOpenCustomize}
+      handleBrowseEveryone={handleBrowseEveryone}
+      loadNextPage={loadNextPage}
+      onSignIn={() => router.push('/auth/login')}
+      header={header}
+      chrome={
+        <HomeTopChrome
+          showScopeMenu={scopeVisible}
+          scopeTitle={scopeMenu.title}
+          scopeActions={scopeMenu.actions}
+          onSelectScopeIndex={scopeMenu.onSelectIndex}
+          onOpenSearch={handleOpenSearch}
+          searchAccessibilityLabel={t('mobile.home.searchAction')}
+          scopeAccessibilityHint={t('mobile.home.scope.hint')}
+          onHeightChange={setChromeHeight}
+          scrollEdge={scrollEdge.backdrop}
+        />
+      }
+      overlays={
+        <>
+          <CommentSheet
+            sheetRef={commentSheetRef}
+            entityId={commentTarget?.entityId ?? null}
+            entityType={commentTarget?.entityType ?? 'tick'}
+            onClose={() => setCommentTarget(null)}
+          />
+          {inviteSessionId ? (
+            <InviteSheet visible={inviteOpen} onDismiss={handleDismissInvite} sessionId={inviteSessionId} />
+          ) : null}
+          {mountCustomizeSheet ? <HomeCustomizeSheet visible={customizeOpen} onClose={handleCloseCustomize} /> : null}
+        </>
+      }
+      feedVisible={feedVisible}
+      homeEmpty={homeEmpty}
+      sectionsRefreshing={sectionsRefreshing}
+      scopeReady={scopeReady}
+      requiresManualPage={requiresManualPage}
+      mode={mode}
+      selectedBoard={selectedBoard}
+      feedOffline={feedOffline}
+      feed={feed}
+      emptyMarker={
+        STARTUP_PROFILING_ENABLED ? (
+          <HomeStartupCommit
+            outcome={
+              !feedVisible
+                ? homeEmpty
+                  ? 'empty'
+                  : 'content'
+                : homeEmptyStartupOutcome({
+                    authenticated: isAuthenticated,
+                    blockedReason: feedOffline.isBlocked ? feedOffline.reason : null,
+                    loading: feed.isLoading,
+                    scopeReady,
+                    error: feed.isError,
+                  })
+            }
+          />
+        ) : undefined
+      }
+    />
   );
 }
-
-const styles = StyleSheet.create({
-  flex: { flex: 1 },
-  centered: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: spacing[8],
-    gap: spacing[2],
-  },
-  header: {
-    // A small gap below the floating header band (the list already insets by the
-    // band via contentContainerStyle).
-    paddingTop: spacing[2],
-  },
-  feedHeading: {
-    paddingHorizontal: spacing[4],
-    paddingBottom: spacing[2],
-  },
-  cardOuter: {
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[2],
-  },
-  skeletonHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[3],
-  },
-  skeletonAvatar: {
-    width: 40,
-    height: 40,
-    borderRadius: borderRadius.full,
-    opacity: 0.5,
-  },
-  skeletonHeaderText: {
-    flex: 1,
-    gap: spacing[2],
-  },
-  skeletonTitleLine: {
-    width: '44%',
-    height: 18,
-    borderRadius: borderRadius.full,
-    opacity: 0.55,
-  },
-  skeletonSmallLine: {
-    width: '34%',
-    height: 12,
-    borderRadius: borderRadius.full,
-    opacity: 0.4,
-  },
-  skeletonBody: {
-    flexDirection: 'row',
-    gap: spacing[3],
-    paddingTop: spacing[3],
-  },
-  skeletonThumbnail: {
-    width: 76,
-    height: 96,
-    borderRadius: borderRadius.md,
-    opacity: 0.55,
-  },
-  skeletonDetails: {
-    flex: 1,
-    gap: spacing[2],
-  },
-  skeletonClimbName: {
-    width: '74%',
-    height: 20,
-    borderRadius: borderRadius.full,
-    opacity: 0.55,
-  },
-  skeletonMetaLine: {
-    width: '64%',
-    height: 14,
-    borderRadius: borderRadius.full,
-    opacity: 0.4,
-  },
-  skeletonCommentLine: {
-    width: '92%',
-    height: 12,
-    borderRadius: borderRadius.full,
-    opacity: 0.35,
-  },
-  skeletonCommentShortLine: {
-    width: '58%',
-    height: 12,
-    borderRadius: borderRadius.full,
-    opacity: 0.32,
-  },
-  skeletonSocialRow: {
-    flexDirection: 'row',
-    gap: spacing[2],
-    marginTop: spacing[3],
-    paddingTop: spacing[2],
-    borderTopWidth: StyleSheet.hairlineWidth,
-  },
-  skeletonSocialPill: {
-    width: 52,
-    height: 28,
-    borderRadius: borderRadius.full,
-    opacity: 0.42,
-  },
-  feedState: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingTop: spacing[12],
-    paddingHorizontal: spacing[8],
-    gap: spacing[2],
-  },
-  emptyTitle: {
-    marginTop: spacing[3],
-    textAlign: 'center',
-  },
-  emptyBody: {
-    textAlign: 'center',
-  },
-  emptyCta: {
-    marginTop: spacing[4],
-  },
-});

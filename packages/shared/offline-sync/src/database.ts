@@ -44,7 +44,13 @@ export interface OfflineDatabase extends SqlExecutor {
  */
 export interface QueryInvalidator {
   invalidateQueries(
-    filters: { queryKey: readonly unknown[]; predicate?: (query: { queryKey: readonly unknown[] }) => boolean },
+    filters: {
+      queryKey: readonly unknown[];
+      exact?: boolean;
+      /** Mark stale without starting reads during background or account teardown. */
+      refetchType?: 'none';
+      predicate?: (query: { queryKey: readonly unknown[] }) => boolean;
+    },
     options?: { cancelRefetch?: boolean },
   ): unknown;
 }

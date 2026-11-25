@@ -9,9 +9,11 @@ const discord = vi.hoisted(() => ({ openDiscordInvite: vi.fn() }));
 // Donation links are region-gated (see src/lib/donation-links.ts). Flipped per
 // test: allowed renders the CTA, not-allowed renders unlinked text.
 const donationLinks = vi.hoisted(() => ({ allowed: false }));
+const supportAnalytics = vi.hoisted(() => ({ trackSupportLinkTapped: vi.fn() }));
 
 vi.mock('react-native', () => ({
   Platform: { OS: 'ios' },
+  DynamicColorIOS: (appearances: { light: string }) => appearances.light,
   PlatformColor: (colorName: string) => colorName,
   ScrollView: ({ children }: { children?: ReactNode }) => createElement('section', null, children),
   StyleSheet: { create: (styles: unknown) => styles },
@@ -53,9 +55,10 @@ vi.mock('../../src/lib/acknowledgements', () => ({
 }));
 vi.mock('../../src/lib/open-url', () => openUrl);
 vi.mock('../../src/lib/discord', () => discord);
+vi.mock('../../src/lib/analytics-support-link', () => supportAnalytics);
 vi.mock('../../src/lib/donation-links', () => ({
-  SUPPORT_URL: 'https://www.boardsesh.com/support',
   SUPPORT_URL_DISPLAY: 'boardsesh.com/support',
+  supportUrlFor: (surface: string) => `https://www.boardsesh.com/support?src=app-${surface}`,
   useDonationLinksAllowed: () => donationLinks.allowed,
 }));
 
@@ -102,11 +105,23 @@ import AcknowledgementsScreen from '../acknowledgements';
 beforeEach(() => {
   routerMock.push.mockClear();
   openUrl.openExternalUrl.mockClear();
+  supportAnalytics.trackSupportLinkTapped.mockClear();
   discord.openDiscordInvite.mockClear();
   donationLinks.allowed = false;
 });
 
 describe('AcknowledgementsScreen', () => {
+  it.each(['Climbdex', 'BoardLib'])('opens the %s repo from the open source credits', (project) => {
+    render(<AcknowledgementsScreen />);
+
+    fireEvent.click(screen.getByRole('button', { name: project }));
+
+    expect(openUrl.openExternalUrl).toHaveBeenCalledWith(
+      `https://github.com/lemeryfertitta/${project}`,
+      'acknowledgements',
+    );
+  });
+
   it('renders a contributor chip that opens the GitHub profile', () => {
     render(<AcknowledgementsScreen />);
 
@@ -179,9 +194,10 @@ describe('AcknowledgementsScreen', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Support Boardsesh' }));
 
     expect(openUrl.openExternalUrl).toHaveBeenCalledWith(
-      'https://www.boardsesh.com/support',
+      'https://www.boardsesh.com/support?src=app-acknowledgements',
       'acknowledgements-sponsor',
     );
+    expect(supportAnalytics.trackSupportLinkTapped).toHaveBeenCalledWith('acknowledgements');
   });
 
   it('shows unlinked support text with no tap target where donation links are not allowed', () => {
@@ -196,6 +212,7 @@ describe('AcknowledgementsScreen', () => {
     expect(fallback.closest('button')).toBeNull();
     expect(screen.queryByRole('button', { name: 'Support Boardsesh' })).toBeNull();
     expect(openUrl.openExternalUrl).not.toHaveBeenCalled();
+    expect(supportAnalytics.trackSupportLinkTapped).not.toHaveBeenCalled();
   });
 
   it('shows the support CTA in the empty-sponsors state when donation links are allowed', async () => {
@@ -217,9 +234,10 @@ describe('AcknowledgementsScreen', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Support Boardsesh' }));
 
     expect(openUrl.openExternalUrl).toHaveBeenCalledWith(
-      'https://www.boardsesh.com/support',
+      'https://www.boardsesh.com/support?src=app-acknowledgements',
       'acknowledgements-sponsor',
     );
+    expect(supportAnalytics.trackSupportLinkTapped).toHaveBeenCalledWith('acknowledgements');
 
     vi.doUnmock('../../src/lib/acknowledgements');
     vi.resetModules();

@@ -25,7 +25,50 @@
     "gymClaims": "Gym claims",
     "feedback": "Bug reports",
     "gymDuplicates": "Duplicate gyms",
-    "locationSync": "Location sync freezes"
+    "locationSync": "Location sync freezes",
+    "sprayWalls": "Spraywall training data",
+    "boards": "Registered boards",
+    "buildPlans": "Build-pack orders",
+    "partnerApps": "Partner apps",
+    "boardReports": "Board reports"
+  },
+  "buildPlans": {
+    "title": "Build-pack orders",
+    "subtitle": "Every order, free previews included, newest first. Read the generator's error, then requeue the pack.",
+    "previewsLastHour_one": "{{count}} preview drawn in the last hour, on the orders loaded here.",
+    "previewsLastHour_other": "{{count}} previews drawn in the last hour, on the orders loaded here.",
+    "backToAdmin": "Back to admin",
+    "statusFilter": {
+      "all": "All"
+    },
+    "table": {
+      "licence": "Licence",
+      "licensee": "Licensee",
+      "tier": "Tier",
+      "wall": "Wall",
+      "status": "Status",
+      "attempts": "Attempts",
+      "created": "Created",
+      "actions": "Actions"
+    },
+    "actions": {
+      "regenerate": "Regenerate"
+    },
+    "confirm": {
+      "title": "Rebuild this pack?",
+      "body": "{{licenceId}} is rebuilt under the same licence id and replaces the file the buyer downloads. They keep the licence they paid for.",
+      "cancel": "Keep it as it is",
+      "confirm": "Rebuild it"
+    },
+    "snackbar": {
+      "regenerated": "Back in the queue",
+      "regenerateFailed": "Couldn't requeue that pack"
+    },
+    "empty": "No orders match these filters.",
+    "error": "Couldn't load orders.",
+    "retry": "Retry",
+    "loadMore": "Load more",
+    "unknown": "Not given"
   },
   "feedback": {
     "title": "Bug reports & feedback",
@@ -63,8 +106,9 @@
     "reporter": {
       "anonymous": "Anonymous",
       "copyEmail": "Copy email",
-      "consentYes": "Contact OK",
-      "consentNo": "No consent"
+      "consentYes": "Email allowed",
+      "consentNo": "Email declined",
+      "showReports": "See this reporter’s bugs"
     },
     "rating": {
       "value": "{{rating}}/5"
@@ -85,7 +129,16 @@
       "userAgent": "User agent",
       "screenshots": "Screenshots",
       "screenshotAlt": "Screenshot {{index}}",
-      "resolvedBy": "Resolved by"
+      "resolvedBy": "Resolved by",
+      "releaseChannel": "Release channel",
+      "releaseBranch": "Running branch",
+      "updateId": "Update ID",
+      "runtimeVersion": "Runtime",
+      "automaticCanary": "Automatic canary",
+      "canaryYes": "Yes",
+      "canaryNo": "No",
+      "canaryUnknown": "Unknown",
+      "canaryCheckedAt": "Canary checked"
     },
     "empty": "No feedback matches these filters.",
     "error": "Couldn't load feedback.",
@@ -97,6 +150,26 @@
       "updateFailed": "Couldn't update status",
       "emailCopied": "Email copied",
       "copyFailed": "Couldn't copy"
+    },
+    "conversation": {
+      "title": "Conversation",
+      "open": "Read conversation",
+      "loadError": "Couldn’t load this conversation.",
+      "loadOlder": "Load earlier messages",
+      "empty": "Replies to this report will appear here.",
+      "staff": "Boardsesh",
+      "reporter": "Reporter",
+      "close": "Close",
+      "retry": "Try again",
+      "latestReply": "Latest reply",
+      "publicNotice": "Replies are shared on the linked public GitHub issue.",
+      "openGithub": "Reply on GitHub",
+      "githubHint": "To message the reporter, put /reply alone on the first line of a GitHub comment. Only authorized Boardsesh contributors can send these messages."
+    },
+    "filters": {
+      "reporter": "Reporter account ID",
+      "needsReply": "Needs reply",
+      "clearReporter": "Show all reporters"
     }
   },
   "retention": {
@@ -154,9 +227,7 @@
       "roleLabel": "Role",
       "boardTypeLabel": "Board Type (optional)",
       "boardTypeOptions": {
-        "global": "Global (all boards)",
-        "kilter": "Kilter",
-        "tension": "Tension"
+        "global": "Global (all boards)"
       },
       "roleOptions": {
         "communityLeader": "Community Leader",
@@ -234,6 +305,13 @@
       "disabled": "Auto-approval is off.",
       "saveFailed": "Couldn't save that. Try again.",
       "loadFailed": "Couldn't load gym settings."
+    },
+    "dailyCap": {
+      "label": "Daily limit",
+      "description": "How many claims can approve themselves in 24 hours, across every account. Past it, claims wait for review. 0 sends every claim to review.",
+      "save": "Save limit",
+      "invalid": "Enter a whole number from 0 to 1000.",
+      "saved": "Daily limit saved."
     }
   },
   "gymClaims": {
@@ -245,6 +323,7 @@
     "retry": "Retry",
     "approve": "Approve",
     "deny": "Deny",
+    "claimantHistory": "Account: {{days}} days · Logbook: {{ticks}} · Gyms run: {{gyms}}",
     "method": {
       "domain": "Domain",
       "admin": "Review"
@@ -252,7 +331,8 @@
     "snackbar": {
       "approved": "Claim approved — ownership transferred",
       "denied": "Claim denied",
-      "failed": "Couldn't update the claim"
+      "failed": "Couldn't update the claim",
+      "superseded": "This gym changed hands after the claim was filed. Deny it, or use Move gym ownership below."
     },
     "table": {
       "claimant": "Claimant",
@@ -262,7 +342,36 @@
       "date": "Date",
       "actions": "Actions"
     },
-    "loadMore": "Load more"
+    "loadMore": "Load more",
+    "autoApproved": {
+      "heading": "Claims that approved themselves",
+      "intro": "Each took an unclaimed gym without a review. Revert hands the gym back to public board data.",
+      "empty": "No claims have approved themselves yet.",
+      "error": "Couldn't load these claims. Try again.",
+      "approvedOn": "Approved {{date}}",
+      "reverted": "Reverted",
+      "revert": "Revert",
+      "revertAria": "Revert {{claimant}}'s claim on {{gym}}"
+    },
+    "revert": {
+      "title": "Revert {{claimant}}'s claim on {{gym}}?",
+      "body": "{{gym}} goes back to unclaimed. {{claimant}} and anyone added as a member or editor since the claim lose access, the location sync looks after the listing again, and we email {{claimant}} to say so.",
+      "notUndone": "Board changes, kiosks and the gym's description, hours and photo stay as they are. Fix those by hand.",
+      "reasonLabel": "Reason (optional)",
+      "confirm": "Revert claim",
+      "cancel": "Cancel",
+      "done": "{{gym}} is unclaimed again.",
+      "missing": "Claim {{claimId}} isn't one that approved itself, or it's gone. To hand a gym back, use Move gym ownership below.",
+      "alreadyReverted": "Claim {{claimId}} was already reverted.",
+      "errors": {
+        "notFound": "That claim or its gym is gone.",
+        "notApproved": "This claim isn't approved any more, so there's nothing to revert.",
+        "notTransferred": "This claim never moved the gym, so revert has nothing to undo. Use Move gym ownership below.",
+        "ownerChanged": "The gym changed hands after this claim. Use Move gym ownership below.",
+        "priorOwner": "This claim took the gym from a person, not from public board data. Use Move gym ownership below to give it back.",
+        "failed": "Couldn't revert the claim. Try again."
+      }
+    }
   },
   "gymOwnerReassign": {
     "title": "Move gym ownership",
@@ -428,6 +537,236 @@
     },
     "ownerReports": {
       "note": "Owners can now flag duplicates from their gym page. Those reports arrive as team email for now, so keep an eye on the inbox alongside this queue."
+    }
+  },
+  "sprayTraining": {
+    "title": "Spraywall training data",
+    "statusLabel": "Review status",
+    "status": {
+      "unreviewed": "Unreviewed ({{total}})",
+      "approved": "Approved ({{total}})",
+      "rejected": "Rejected ({{total}})"
+    },
+    "empty": "Nothing here",
+    "error": "Couldn't load the queue. Try again.",
+    "retry": "Retry",
+    "loadMore": "Load more",
+    "card": {
+      "open": "Review Spraywall version {{version}}",
+      "holds": "Holds: {{total}}",
+      "edited": "Edited: {{percent}}%",
+      "accepted": "Accepted unchecked: {{percent}}%",
+      "deleted": "Deleted suggestions: {{total}}"
+    },
+    "kind": {
+      "manual": "Marked by hand",
+      "auto": "Found, no review",
+      "accepted": "Accepted unchecked",
+      "confirmed": "Confirmed maybe",
+      "edited": "Edited",
+      "deleted": "Deleted suggestion",
+      "notShown": "Never shown"
+    },
+    "reason": {
+      "BAD_HOLDS": "Holds drawn wrong",
+      "MISSING_HOLDS": "Holds missing",
+      "PHOTO_QUALITY": "Photo quality",
+      "NOT_A_WALL": "Not a climbing wall",
+      "PEOPLE_OR_PERSONAL_INFO": "People or personal info",
+      "DUPLICATE": "Duplicate",
+      "OTHER": "Other"
+    },
+    "visibility": {
+      "PRIVATE": "Visibility: private",
+      "UNLISTED": "Visibility: link only",
+      "PUBLIC": "Visibility: public"
+    },
+    "review": {
+      "title": "Spraywall version {{version}}",
+      "close": "Close",
+      "previous": "Previous Spraywall",
+      "next": "Next Spraywall",
+      "position": "{{current}} of {{total}}",
+      "photoAlt": "Spraywall photo with marked holds",
+      "noPhoto": "This photo is no longer available.",
+      "photoLoading": "Loading the photo",
+      "loadingNext": "Loading more Spraywalls",
+      "unmappable": "Holds we couldn't place on the photo: {{total}}",
+      "model": "Detector: {{version}}",
+      "showMarks": "Show marks (H)",
+      "legend": "Legend",
+      "reason": "Reject reason",
+      "notes": "Notes (optional)",
+      "approve": "Approve (A)",
+      "reject": "Reject (R)",
+      "backToUnreviewed": "Back to unreviewed",
+      "shortcuts": "A approve, R reject, H hide marks, left and right arrows for previous and next."
+    },
+    "snackbar": {
+      "approved": "Approved",
+      "rejected": "Rejected",
+      "reset": "Back in the unreviewed queue",
+      "failed": "Couldn't save the review",
+      "notEligible": "Not saved. This Spraywall is no longer available as training data."
+    },
+    "backToAdmin": "Back to admin",
+    "noAccess": "Your admin role doesn't cover Spraywalls. This page needs Spraywall or site-wide admin access."
+  },
+  "boards": {
+    "title": "Registered boards",
+    "description": "Find and edit registered boards, including private boards and boards without a gym.",
+    "backToAdmin": "Back to admin",
+    "search": "Search boards",
+    "searchPlaceholder": "Board name, UUID, slug, or gym",
+    "boardType": "Board type",
+    "allTypes": "All types",
+    "searchAction": "Search",
+    "loading": "Loading boards",
+    "editLoadError": "Couldn't load this board for editing.",
+    "retry": "Try again",
+    "backToList": "All boards",
+    "loadError": "Couldn't load registered boards.",
+    "empty": "No boards match this search.",
+    "owner": "Owner: {{name}}",
+    "systemOwner": "Boardsesh",
+    "noGym": "No gym linked",
+    "editNamed": "Edit {{name}}",
+    "results_one": "{{count}} board",
+    "results_other": "{{count}} boards",
+    "previous": "Previous",
+    "next": "Next",
+    "visibility": {
+      "public": "Public",
+      "unlisted": "Unlisted",
+      "private": "Private"
+    }
+  },
+  "partnerApps": {
+    "title": "Partner apps",
+    "description": "Registered apps, connected climbers, and connection limits.",
+    "limitsHelp": "Limits apply to new connections. Lowering a limit keeps existing connections working. Zero blocks new connections. Changes are recorded with your admin account.",
+    "search": "Search app, publisher, or developer",
+    "searchAction": "Search",
+    "app": "App",
+    "developer": "Developer",
+    "connections": "Connections",
+    "limits": "Limits",
+    "actions": "Actions",
+    "activeLimit": "Maximum active connections",
+    "dailyLimit": "Maximum new connections per 24 hours",
+    "usage": "{{active}} active · {{recent}} new in 24 hours",
+    "invalidLimit": "Use a whole number from 0 to 2147483647.",
+    "save": "Save limits",
+    "saved": "Limits saved",
+    "saveError": "Couldn't save these limits. Try again.",
+    "loading": "Loading partner apps",
+    "loadError": "Couldn't load partner apps.",
+    "retry": "Retry",
+    "empty": "No apps match this search.",
+    "total_one": "{{count}} registered app",
+    "total_other": "{{count}} registered apps",
+    "previous": "Previous page",
+    "next": "Next page",
+    "active": "Active",
+    "suspended": "Suspended"
+  },
+  "boardReports": {
+    "title": "Board and gym reports",
+    "backToAdmin": "Back to admin",
+    "description": "Reports nobody else can act on, and any report still open after 14 days. Reports sent straight to us come first, then the oldest.",
+    "filters": {
+      "status": "Status",
+      "kind": "Showing",
+      "kindAll": "Boards and gyms",
+      "kindBoard": "Boards",
+      "kindGym": "Gyms"
+    },
+    "status": {
+      "escalated": "With our team",
+      "open": "With the creator or gym staff",
+      "fixed": "Fixed",
+      "removed": "Removed",
+      "deleted": "Deleted",
+      "kept": "Kept as it is",
+      "merged": "Merged"
+    },
+    "kind": {
+      "board": "Board",
+      "gym": "Gym"
+    },
+    "chips": {
+      "sentToTeam": "Sent straight to us",
+      "waited": "Open 14 days"
+    },
+    "meta_one": "{{count}} climber · opened {{age}}",
+    "meta_other": "{{count}} climbers · opened {{age}}",
+    "ageToday": "today",
+    "ageDays_one": "{{count}} day ago",
+    "ageDays_other": "{{count}} days ago",
+    "routedToLine": "Sent to: {{recipients}}",
+    "routedTo": {
+      "creator": "the creator",
+      "gymStaff": "gym staff",
+      "admin": "our team"
+    },
+    "duplicateOf": "Same as {{name}}",
+    "note": "{{name}}: {{note}}",
+    "reporterUnknown": "Deleted account",
+    "closedOn": "Closed {{date}}: {{outcome}}",
+    "actions": {
+      "deleteBoard": "Delete board",
+      "removeFromGym": "Remove from gym",
+      "hideGym": "Hide gym from search",
+      "keep": "Keep as it is",
+      "mergeGyms": "Merge in Duplicate gyms",
+      "openGym": "Open Manage gym"
+    },
+    "confirm": {
+      "deleteTitle": "Delete {{board}} for everyone?",
+      "deleteBody": "It disappears for every climber who saved it. Logged sends stay in their logbooks. The report closes as deleted.",
+      "removeTitle": "Remove {{board}} from {{gym}}?",
+      "removeBody": "It comes off the gym's page, kiosks and the map there. Whoever added it keeps it. The report closes as removed.",
+      "hideTitle": "Hide {{gym}} from search?",
+      "hideBody": "It stops showing in the gym directory and search. Its page stays up for anyone with the link. The report closes as removed.",
+      "keepTitle": "Keep it as it is?",
+      "keepBody": "The report closes and the climbers who sent it hear that it was kept.",
+      "keepNoteLabel": "A note for them (optional)",
+      "cancel": "Cancel"
+    },
+    "snackbar": {
+      "deleted": "Board deleted. The report is closed.",
+      "removed": "Removed from the gym. The report is closed.",
+      "hidden": "Gym hidden from search. The report is closed.",
+      "hiddenStillOpen": "Gym hidden from search, but the report is still open. Try again.",
+      "kept": "Report closed.",
+      "failed": "That didn't go through. Try again."
+    },
+    "empty": "Nothing here.",
+    "error": "Couldn't load reports. Try again.",
+    "retry": "Retry",
+    "loadMore": "Load more",
+    "tabs": {
+      "reports": "Reports",
+      "setupChanges": "Setup changes by climbers"
+    },
+    "setupChanges": {
+      "description": "Every board setup a climber's suggestion changed, newest first. This only happens at gyms nobody runs. Undo puts the old setup back while the board still has the climber's.",
+      "before": "Before",
+      "after": "After",
+      "byLine": "Changed by {{name}} {{when}}",
+      "state": {
+        "live": "Live",
+        "undone": "Undone",
+        "changedSince": "Changed since"
+      },
+      "undo": "Undo",
+      "confirmTitle": "Undo the change to {{board}}?",
+      "confirmBody": "It goes back to {{setup}} for everyone. Climbers' suggestions for this board get checked first for the next {{days}} days.",
+      "undone": "Setup put back.",
+      "changedSinceError": "Changed since: the board has another setup now, so this can't be undone.",
+      "alreadyUndone": "Someone already put the old setup back.",
+      "empty": "No climber has changed a board yet.",
+      "error": "Couldn't load setup changes. Try again."
     }
   }
 }

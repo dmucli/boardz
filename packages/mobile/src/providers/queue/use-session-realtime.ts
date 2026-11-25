@@ -1,7 +1,8 @@
+import { getCredentialGeneration } from '../../lib/privacy/privacy-cache';
 import { useContext, useEffect } from 'react';
 import { AppState } from 'react-native';
 import { QueryClientContext } from '@tanstack/react-query';
-import { computeQueueStateHash, computeQueueStateHashOrdered } from '@boardsesh/queue';
+import { computeQueueStateHash, computeQueueStateHashOrdered, queueReducer } from '@boardsesh/queue';
 import type { ClimbQueueItem, QueueAction, QueueState } from '@boardsesh/queue';
 import {
   applySessionRuntimeEvent,
@@ -14,14 +15,17 @@ import {
   type SubscriptionWireEnvelope,
 } from '@boardsesh/queue-runtime';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
+import { buildQueueUpdatesSubscription } from '@boardsesh/graphql/operations/queue-session';
 import { parseBoardPath, parseNamedBoardPath } from '@boardsesh/board-config';
 import type { PlaybackStateChangedEvent, SessionUser, UserBoard } from '@boardsesh/shared-schema';
 import { emitWallConfirm } from '@boardsesh/play-view';
-import { GraphQLOperationError, isNotSessionMemberError, subscribe } from '@boardsesh/graphql-client';
+import { GraphQLOperationError, isNotSessionMemberError, subscribe, type Client } from '@boardsesh/graphql-client';
 import { getWsClient } from '../../lib/graphql/ws-client';
+import { subscribeWsClientDisposed } from '../../lib/graphql/ws-client-lifecycle';
 import { AUTH_REFRESH_RETRY_CLOSE_CODE } from '../../lib/graphql/ws-close-codes';
 import {
   QUEUE_UPDATES_SUBSCRIPTION,
+  QUEUE_UPDATES_SUBSCRIPTION_NOW_SLOT,
   SESSION_UPDATES_SUBSCRIPTION,
   type SessionUpdateEvent,
   type SessionLiveStatsEvent,
@@ -31,9 +35,13 @@ import { getStoredActiveBoard } from '../../lib/active-board-store';
 import { clearStoredQueueSnapshot } from '../../lib/queue-snapshot-store';
 import { toClimbQueueItem, type SubscriptionQueueItem } from '../../lib/queue-conversion';
 import { toMobileSessionRuntimeEvent } from '../../lib/session-runtime-event';
+import { handleCrewCadenceChange } from '../../lib/crew-rest-cadence';
+import { nowMs } from '../../lib/clock';
+import { clearRelayReceipt, noteRelayReceipt } from '../../lib/relay-receipt';
 import { track } from '../../lib/analytics';
 import { reportHandledError } from '../../lib/error-reporting';
 import type { ToastVariant } from '../../components/Toast';
+import { clampSyncedQueue, isAttributionValidationError } from './now-slot-server';
 
 const JOIN_SESSION_RETRY_BACKOFF_MS = [1_000, 2_500, 5_000] as const;
 // ws-client remaps a rejected-auth 4401 to the retryable AUTH_REFRESH_RETRY_CLOSE_CODE
@@ -86,6 +94,25 @@ function toSyncQueueEvent(event: QueueUpdateEvent): QueueSyncGateEvent {
   return event;
 }
 
+/**
+ * A FullSync is a snapshot of THIS session, read after the stream subscribed.
+ * Saying so lets the reducer compare it with a move of ours that is still on
+ * its way to the same session, and keep that move when the snapshot predates it
+ * (a reconnect's FullSync is read before the re-sent move lands).
+ *
+ * `live` (every later change arrives as an event) also releases a re-send that
+ * waited for it, so it holds only once JOIN_SESSION has bound the connection.
+ * A stream graphql-ws kept across an auth-refresh close re-subscribes at once
+ * and can deliver its FullSync inside the server's ~350 ms reconnect grace,
+ * before the JOIN binds: a re-send released then is refused "Must be in a
+ * session" and falls back to a resync. The streams the JOIN opens bring their
+ * own FullSync. Every other action passes through untouched.
+ */
+function tagSnapshotWithSession(action: QueueAction, sessionId: string, live: boolean): QueueAction {
+  if (action.type !== 'INITIAL_QUEUE_DATA') return action;
+  return { ...action, payload: { ...action.payload, sessionId, live } };
+}
+
 export const createEmptySessionRuntimeState = (): MobileSessionRuntimeState => ({
   users: [],
   isLeader: false,
@@ -116,6 +143,7 @@ function rosterStateSignature(state: MobileSessionRuntimeState): string {
 
 type UseSessionRealtimeParams = {
   authTransportRevision: number;
+  credentialGeneration?: number;
   sessionId: string | null;
   dispatch: React.Dispatch<QueueAction>;
   coordinator: { clientId: string };
@@ -136,16 +164,32 @@ type UseSessionRealtimeParams = {
    *  FullSync guard fires, so the server catches up to local instead of local
    *  being clobbered down to the empty room. Self-joins via ensureReady. */
   reSeedQueueRef: React.RefObject<
-    (queue: ClimbQueueItem[], currentClimbQueueItem?: ClimbQueueItem | null) => Promise<void>
+    (
+      queue: ClimbQueueItem[],
+      currentClimbQueueItem?: ClimbQueueItem | null,
+      historyCount?: number | null,
+    ) => Promise<void>
   >;
+  /**
+   * F3 now-slot mode as last set for this connection (the flag AND the server
+   * probe the join ran). Picks the subscription document and the re-seed clamp.
+   */
+  nowSlotModeRef: React.RefObject<boolean>;
+  attributionServerRef: React.RefObject<boolean>;
   activeBoardRef: React.RefObject<UserBoard | null | undefined>;
-  setActiveBoardRef: React.RefObject<(board: UserBoard) => Promise<void>>;
+  setActiveBoardRef: React.RefObject<(board: UserBoard) => Promise<boolean>>;
   showToastRef: React.RefObject<(message: string, variant?: ToastVariant, duration?: number) => void>;
   tRef: React.RefObject<(key: string) => string>;
   clearSessionRef: React.RefObject<(options?: { notifyServer?: boolean }) => Promise<void>>;
   playbackEventListenersRef: React.RefObject<Set<(event: PlaybackStateChangedEvent) => void>>;
   unsubscribeRef: React.RefObject<(() => void) | null>;
   queueSyncGateRef: React.RefObject<QueueSyncGate | null>;
+  /**
+   * True once the queueUpdates stream on the bound connection has opened with
+   * its FullSync; false from every socket close, restart or teardown until the
+   * next one. The provider reads it to decide whether a re-send can go now.
+   */
+  queueStreamLiveRef: React.RefObject<boolean>;
   restartJoinedSubscriptionsRef: React.RefObject<(() => void) | null>;
   resyncQueueFromServerRef: React.RefObject<() => Promise<boolean>>;
   setLiveStats: React.Dispatch<React.SetStateAction<SessionLiveStatsEvent | null>>;
@@ -170,6 +214,7 @@ type UseSessionRealtimeParams = {
  */
 export function useSessionRealtime({
   authTransportRevision,
+  credentialGeneration,
   sessionId,
   dispatch,
   coordinator,
@@ -180,6 +225,8 @@ export function useSessionRealtime({
   stateRef,
   seedFailedSessionIdRef,
   reSeedQueueRef,
+  nowSlotModeRef,
+  attributionServerRef,
   activeBoardRef,
   setActiveBoardRef,
   showToastRef,
@@ -188,6 +235,7 @@ export function useSessionRealtime({
   playbackEventListenersRef,
   unsubscribeRef,
   queueSyncGateRef,
+  queueStreamLiveRef,
   restartJoinedSubscriptionsRef,
   resyncQueueFromServerRef,
   setLiveStats,
@@ -208,6 +256,7 @@ export function useSessionRealtime({
 
   useEffect(() => {
     if (!sessionId) {
+      queueStreamLiveRef.current = false;
       unsubscribeRef.current?.();
       unsubscribeRef.current = null;
       participantIdRef.current = null;
@@ -222,20 +271,27 @@ export function useSessionRealtime({
       return;
     }
 
-    const wsClient = getWsClient();
     // One sync gate per session — this effect re-runs (and creates a fresh
-    // gate) on every session change; `unsubClosed` below calls `gate.reset()`
-    // mid-session on a socket drop (same session, but the connection's
-    // ConnectionContext and in-flight sequence tracking are no longer valid).
+    // gate) on every session change; `handleClientClosed` below calls
+    // `gate.reset()` mid-session on a socket drop (same session, but the
+    // connection's ConnectionContext and in-flight sequence tracking are no
+    // longer valid).
     const gate = createQueueSyncGate();
     queueSyncGateRef.current = gate;
     let disposed = false;
+    const sessionCredentialGeneration = getCredentialGeneration();
+    const isCurrent = () => !disposed && sessionCredentialGeneration === getCredentialGeneration();
     let subscriptionStartToken = 0;
     let queueUpdatesCleanup: (() => void) | null = null;
     let sessionUpdatesCleanup: (() => void) | null = null;
     let joinRetryTimer: ReturnType<typeof setTimeout> | null = null;
     let joinRetryCount = 0;
     let authRefreshRejoinInProgress = false;
+    // JOIN_SESSION completed on the bound connection. A stream graphql-ws kept
+    // across an auth-refresh close re-subscribes at once and can deliver its
+    // FullSync before the JOIN binds the new connection, so the live flag
+    // waits for both.
+    let joinedOnBoundConnection = false;
 
     // Single-flight, snapshot-checked recovery for a failed session seed. The
     // empty-room FullSync guard (below) calls this to re-push the local queue so
@@ -258,7 +314,7 @@ export function useSessionRealtime({
     // queue edit that lands mid-push.
     const reSeedQueueAfterFailedSeed = (triggeredByFullSync = false) => {
       if (reSeedInFlight) return;
-      const { queue, currentClimbQueueItem } = stateRef.current;
+      const { queue, currentClimbQueueItem, historyCount } = stateRef.current;
       if (queue.length === 0 && currentClimbQueueItem == null) return;
       if (triggeredByFullSync) {
         track(SHARED_EVENTS.QueueSeedFullSyncGuarded, {
@@ -269,11 +325,15 @@ export function useSessionRealtime({
       }
       reSeedInFlight = true;
       const pushedHash = computeQueueStateHashOrdered(queue, currentClimbQueueItem?.uuid ?? null);
+      // The payload is clamped like the first seed (#6673), and the clamp follows
+      // the server probe (F3); the hash above is of the local queue, so the
+      // convergence check still compares local to local.
+      const reSeedPayload = clampSyncedQueue(queue, currentClimbQueueItem, historyCount, nowSlotModeRef.current);
       void reSeedQueueRef
-        .current(queue, currentClimbQueueItem ?? undefined)
+        .current(reSeedPayload.queue, currentClimbQueueItem ?? undefined, reSeedPayload.historyCount)
         .then(() => {
           reSeedInFlight = false;
-          if (sessionIdRef.current !== sessionId) return;
+          if (!isCurrent() || sessionIdRef.current !== sessionId) return;
           const { queue: latestQueue, currentClimbQueueItem: latestCurrent } = stateRef.current;
           const latestHash = computeQueueStateHashOrdered(latestQueue, latestCurrent?.uuid ?? null);
           if (latestHash !== pushedHash) {
@@ -318,6 +378,8 @@ export function useSessionRealtime({
     };
 
     const cleanupSubscriptions = () => {
+      queueStreamLiveRef.current = false;
+      joinedOnBoundConnection = false;
       clearJoinRetryTimer();
       authRefreshRejoinInProgress = false;
       queueUpdatesCleanup?.();
@@ -348,7 +410,7 @@ export function useSessionRealtime({
         const nextNamedAngle = named.angle;
         void (async () => {
           const stored = await getStoredActiveBoard();
-          if (sessionIdRef.current !== sessionId) return;
+          if (!isCurrent() || sessionIdRef.current !== sessionId) return;
           if (!stored || stored.angle === nextNamedAngle) return;
           if (stored.isAngleAdjustable === false) return;
           if (!stored.slug || stored.slug !== named.slug) return;
@@ -361,7 +423,7 @@ export function useSessionRealtime({
       const nextAngle = parsed.angle;
       void (async () => {
         const stored = await getStoredActiveBoard();
-        if (sessionIdRef.current !== sessionId) return;
+        if (!isCurrent() || sessionIdRef.current !== sessionId) return;
         if (!stored || stored.angle === nextAngle) return;
         // Never override a fixed-angle board (mirrors handleAngleChange's local
         // guard) — a peer can't change an angle the board can't be set to.
@@ -389,12 +451,94 @@ export function useSessionRealtime({
       joinRetryCount++;
       joinRetryTimer = setTimeout(() => {
         joinRetryTimer = null;
-        if (disposed || failedStartToken !== subscriptionStartToken || sessionIdRef.current !== sessionId) return;
+        if (!isCurrent() || failedStartToken !== subscriptionStartToken || sessionIdRef.current !== sessionId) return;
         void startJoinedSubscriptions(preserveExistingSubscriptions);
       }, retryDelayMs);
     };
 
+    // graphql-ws auto-reconnects, and every reconnect gives us a fresh
+    // per-connection ConnectionContext on the backend. Ordinary drops retain
+    // the existing join-before-new-subscriptions flow. A rejected-auth retry is
+    // different: cancelling the established operations drops the lazy client's
+    // active-operation count to zero and aborts the retry that ws-client just
+    // initiated. Preserve those operations only for that transport-remapped
+    // close; authenticated durable membership authorizes their resubscription
+    // while JOIN_SESSION rebinds the connection context in parallel.
+    let preserveSubscriptionsOnNextConnect = false;
+    const handleClientClosed = (closeEvent: unknown) => {
+      joinTracker.bumpEpoch();
+      subscriptionStartToken++;
+      joinRetryCount = 0;
+      const hasEstablishedSubscriptions = queueUpdatesCleanup !== null && sessionUpdatesCleanup !== null;
+      if (getCloseEventCode(closeEvent) === AUTH_REFRESH_RETRY_CLOSE_CODE && hasEstablishedSubscriptions) {
+        preserveSubscriptionsOnNextConnect = true;
+        authRefreshRejoinInProgress = true;
+        clearJoinRetryTimer();
+        gate.reset();
+        // The retained streams belong to the closed socket: not live until the
+        // new connection has joined and a stream on it opens with a FullSync.
+        queueStreamLiveRef.current = false;
+        joinedOnBoundConnection = false;
+        return;
+      }
+      preserveSubscriptionsOnNextConnect = false;
+      cleanupSubscriptions();
+      // The reconnect's FullSync re-baselines tracking on its own
+      // (evaluateIncoming always applies + resets a FullSync), but reset here
+      // too so a stray in-flight event from the dead connection can't be
+      // sequence-checked against the old connection's tracking in the gap
+      // before that FullSync arrives.
+      gate.reset();
+    };
+    const handleClientConnected = () => {
+      const preserveExistingSubscriptions = preserveSubscriptionsOnNextConnect;
+      preserveSubscriptionsOnNextConnect = false;
+      void startJoinedSubscriptions(preserveExistingSubscriptions);
+    };
+
+    // The client the join, both streams and the two listeners above run on.
+    // Bound per join attempt, never once per effect: `disposeWsClient()`
+    // (offline mode going on) replaces the client, and while offline mode is on
+    // `getWsClient()` hands out an inert one. Holding the effect-time client
+    // left the streams and listeners on a dead client after offline mode
+    // on → off, while every session mutation (`getWsClient()` at send time)
+    // went out on the replacement's fresh, never-joined connection — "Must be
+    // in a session", a new connectionId each time, the wall pulled back.
+    let boundClient: Client | null = null;
+    let unbindClientEvents: (() => void) | null = null;
+
+    // Forget everything that belonged to the bound client's connection: its
+    // listeners, its streams, the join cached for it, the sequence tracking.
+    const releaseBoundClient = () => {
+      unbindClientEvents?.();
+      unbindClientEvents = null;
+      boundClient = null;
+      preserveSubscriptionsOnNextConnect = false;
+      joinTracker.bumpEpoch();
+      cleanupSubscriptions();
+      gate.reset();
+    };
+
+    // Only called past both offline gates, so `getWsClient()` is the real
+    // client here. The same client as last time is the common case and a
+    // no-op; a different one means the old one was replaced without the
+    // disposal notice below (defensive), so its join cannot be trusted either.
+    const bindCurrentClient = (): Client => {
+      const client = getWsClient();
+      if (client === boundClient) return client;
+      if (boundClient !== null) releaseBoundClient();
+      boundClient = client;
+      const unsubscribeClosed = client.on('closed', handleClientClosed);
+      const unsubscribeConnected = client.on('connected', handleClientConnected);
+      unbindClientEvents = () => {
+        unsubscribeClosed();
+        unsubscribeConnected();
+      };
+      return client;
+    };
+
     const startJoinedSubscriptions = async (preserveExistingSubscriptions = false) => {
+      if (!isCurrent()) return;
       // While backgrounded the socket is suspended: defer the join instead of
       // firing one that can only time out (#3605). Supersede any in-flight join
       // (bump the token), tear down subscriptions, and let the AppState listener
@@ -432,6 +576,10 @@ export function useSessionRealtime({
       joinDeferredForBackground = false;
       joinDeferredForConnectivity = false;
 
+      // Before ensureJoined: its JOIN_SESSION goes out on `getWsClient()` too,
+      // so binding first is what keeps the join, the streams and the
+      // closed/connected listeners on one client.
+      const client = bindCurrentClient();
       const currentStartToken = ++subscriptionStartToken;
       const retainedQueueUpdatesCleanup = preserveExistingSubscriptions ? queueUpdatesCleanup : null;
       const retainedSessionUpdatesCleanup = preserveExistingSubscriptions ? sessionUpdatesCleanup : null;
@@ -444,7 +592,7 @@ export function useSessionRealtime({
       try {
         await ensureJoined(sessionId);
       } catch (joinError) {
-        if (disposed || currentStartToken !== subscriptionStartToken || sessionIdRef.current !== sessionId) return;
+        if (!isCurrent() || currentStartToken !== subscriptionStartToken || sessionIdRef.current !== sessionId) return;
         // A join in flight when the app backgrounds can't complete over the
         // suspended socket and hits the 30s timeout (#3605). That's expected,
         // not a defect: skip the toast + error report and defer — the AppState
@@ -495,17 +643,25 @@ export function useSessionRealtime({
         return;
       }
 
-      if (disposed || currentStartToken !== subscriptionStartToken || sessionIdRef.current !== sessionId) return;
+      if (!isCurrent() || currentStartToken !== subscriptionStartToken || sessionIdRef.current !== sessionId) return;
       joinRetryCount = 0;
+      joinedOnBoundConnection = true;
 
       queueUpdatesCleanup = subscribe<{ queueUpdates: QueueUpdateEvent }>(
-        wsClient,
+        client,
         {
-          query: QUEUE_UPDATES_SUBSCRIPTION,
+          // F3: the join above ran the server probe, so the mode is settled for
+          // this connection. Now-slot mode selects the line in FullSync.state.
+          query: attributionServerRef.current
+            ? buildQueueUpdatesSubscription({ nowSlot: nowSlotModeRef.current, attribution: true })
+            : nowSlotModeRef.current
+              ? QUEUE_UPDATES_SUBSCRIPTION_NOW_SLOT
+              : QUEUE_UPDATES_SUBSCRIPTION,
           variables: { sessionId },
         },
         {
           next: (data) => {
+            if (!isCurrent() || sessionIdRef.current !== sessionId) return;
             if (!data?.queueUpdates) return;
             const event = data.queueUpdates;
             // PlaybackStateChanged is a first-class wire variant but carries no
@@ -596,7 +752,53 @@ export function useSessionRealtime({
             // sequence slot).
             gate.noteApplied(gateEvent);
             if (result.kind !== 'dispatch') return;
-            dispatch({ ...result.action, serverSequence: gateEvent.sequence ?? undefined });
+            const action = {
+              ...tagSnapshotWithSession(result.action, sessionId, joinedOnBoundConnection),
+              serverSequence: gateEvent.sequence ?? undefined,
+            };
+            // #7014: stamp a server event that moves the wall, so the BLE
+            // auto-sender can time receipt → write. Read before the dispatch:
+            // the comparison is against what was current until now. A FullSync
+            // counts only on a stream that was already live: the one that opens
+            // a stream (join, reconnect, auth re-join) is a catch-up, not a
+            // crewmate's move. Under now-slot rules a crewmate's open IS a
+            // FullSync on the live stream (its trailing CurrentClimbChanged is
+            // dropped as same-sequence stale), so those still count.
+            if (
+              event.__typename === 'CurrentClimbChanged' ||
+              (event.__typename === 'FullSync' &&
+                queueStreamLiveRef.current &&
+                // A catch-up may protect a newer optimistic move. Only notify
+                // about a snapshot current the reducer will actually adopt.
+                queueReducer(stateRef.current, action).currentClimbQueueItem?.uuid ===
+                  event.state.currentClimbQueueItem?.uuid)
+            ) {
+              noteRelayReceipt({
+                eventType: event.__typename,
+                incomingQueueItemUuid:
+                  event.__typename === 'FullSync'
+                    ? event.state.currentClimbQueueItem?.uuid
+                    : (event.currentItem !== undefined ? event.currentItem : event.item)?.uuid,
+                localQueueItemUuid: stateRef.current.currentClimbQueueItem?.uuid,
+                correlationId: event.__typename === 'CurrentClimbChanged' ? event.correlationId : null,
+                currentChangedBy:
+                  event.__typename === 'FullSync' ? event.state.currentChangedBy : event.currentChangedBy,
+                participantId: participantIdRef.current,
+                // The reducer's own echo test (DELTA_UPDATE_CURRENT_CLIMB): a
+                // correlation id still pending here, or this connection's
+                // server-issued client id. Not the coordinator's id, which never
+                // reaches the server.
+                ownEcho:
+                  event.__typename === 'CurrentClimbChanged' &&
+                  ((!!event.correlationId &&
+                    stateRef.current.pendingCurrentClimbUpdates.includes(event.correlationId)) ||
+                    (!!event.clientId && event.clientId === sessionRuntimeStateRef.current?.clientId)),
+              });
+            }
+            dispatch(action);
+            // A FullSync on a joined connection is applied: from here every
+            // change in the session reaches this phone as an event.
+            if (event.__typename === 'FullSync' && joinedOnBoundConnection) queueStreamLiveRef.current = true;
             switch (result.eventType) {
               case 'QueueItemAdded': {
                 // The server echoes our own adds back to us. A locally
@@ -683,6 +885,16 @@ export function useSessionRealtime({
             }
           },
           error: (subscriptionError) => {
+            if (!isCurrent()) return;
+            if (
+              currentStartToken === subscriptionStartToken &&
+              attributionServerRef.current &&
+              isAttributionValidationError(subscriptionError)
+            ) {
+              attributionServerRef.current = false;
+              void startJoinedSubscriptions();
+              return;
+            }
             // The server denied our queue subscription because this connection
             // isn't a member of the session (NOT_SESSION_MEMBER). Post-#3695 an
             // authenticated member reconnecting is re-authorized instantly, so
@@ -713,16 +925,36 @@ export function useSessionRealtime({
       // board's angle (which cascades to the climb list, play drawer, and the
       // re-grade effect). We don't switch the whole board — only the angle.
       sessionUpdatesCleanup = subscribe<{ sessionUpdates: SessionUpdateEvent }>(
-        wsClient,
+        client,
         {
           query: SESSION_UPDATES_SUBSCRIPTION,
           variables: { sessionId },
         },
         {
           next: (data) => {
+            if (!isCurrent()) return;
             const event = data?.sessionUpdates;
             if (!event) return;
-            if (sessionIdRef.current !== sessionId) return;
+            if (!isCurrent() || sessionIdRef.current !== sessionId) return;
+
+            // The crew's shared rest clock (#5382), its subscribe seed included.
+            // Not roster state, so it never reaches the runtime mapper: the
+            // rest-timer store takes it, through the revision floor and the
+            // adoption rule in lib/crew-rest-cadence.ts.
+            if (event.__typename === 'SessionRestCadenceChanged') {
+              if (typeof event.revision !== 'number' || typeof event.serverNow !== 'string') return;
+              handleCrewCadenceChange(
+                {
+                  restCadence: event.restCadence ?? null,
+                  revision: event.revision,
+                  serverNow: event.serverNow,
+                  isSnapshot: event.isSnapshot === true,
+                  action: event.action ?? null,
+                },
+                { sessionId, ownParticipantId: participantIdRef.current, receivedAtMs: nowMs() },
+              );
+              return;
+            }
 
             // Live analytics push: flashes + flash/send/attempt grade split +
             // per-participant breakdown. Drives the in-session analytics view and
@@ -756,10 +988,12 @@ export function useSessionRealtime({
 
             if (event.__typename === 'WallConfirmedClimb') {
               // A member relayed the current climb to a physical wall — light the
-              // session lightbulb for everyone and replay the local wall-confirm
-              // bus (drives the BLE provider's dedup + confirmation animations).
+              // session lightbulb for everyone and replay it on the local
+              // wall-confirm bus as a relay. It may be a crewmate's confirm or
+              // this phone's own echo, so it never takes this phone's arming
+              // drive live or counts toward its drive (`useDriveWallConfirms`).
               setIsSessionWallLit(true);
-              if (event.climbUuid) emitWallConfirm(event.climbUuid);
+              if (event.climbUuid) emitWallConfirm(event.climbUuid, 'relay');
               return;
             }
 
@@ -790,8 +1024,8 @@ export function useSessionRealtime({
             if (runtimeEvent) {
               // Keep the functional updater so rapid consecutive deltas each
               // apply on the truly-latest roster (not a stale render snapshot).
-              setSessionRuntimeState(
-                (prev) => applySessionRuntimeEvent(prev, runtimeEvent) ?? createEmptySessionRuntimeState(),
+              setSessionRuntimeState((prev) =>
+                isCurrent() ? (applySessionRuntimeEvent(prev, runtimeEvent) ?? createEmptySessionRuntimeState()) : prev,
               );
               // Best-effort drift telemetry: a SessionRosterSnapshot is the only
               // event that can silently heal a dropped roster delta. Detect a
@@ -839,9 +1073,10 @@ export function useSessionRealtime({
             }
           },
           error: (sessionSubscriptionError) => {
+            if (!isCurrent()) return;
             // Session-update stream errors were swallowed. Surface them for
             // triage (the retained subscription still drives its own reconnect).
-            reportHandledError(sessionSubscriptionError);
+            reportHandledError(sessionSubscriptionError, { tags: { source: 'queue-sync', op: 'sessionUpdates' } });
           },
           complete: () => {},
         },
@@ -860,40 +1095,24 @@ export function useSessionRealtime({
       unsubscribeRef.current = cleanupSubscriptions;
     };
 
-    // graphql-ws auto-reconnects, and every reconnect gives us a fresh
-    // per-connection ConnectionContext on the backend. Ordinary drops retain
-    // the existing join-before-new-subscriptions flow. A rejected-auth retry is
-    // different: cancelling the established operations drops the lazy client's
-    // active-operation count to zero and aborts the retry that ws-client just
-    // initiated. Preserve those operations only for that transport-remapped
-    // close; authenticated durable membership authorizes their resubscription
-    // while JOIN_SESSION rebinds the connection context in parallel.
-    let preserveSubscriptionsOnNextConnect = false;
-    const unsubClosed = wsClient.on('closed', (closeEvent) => {
-      joinTracker.bumpEpoch();
+    // A disposed client never reconnects, so its `closed` is the last thing it
+    // says and no `connected` follows. Drop it at once, supersede any join in
+    // flight on it, and park: offline mode is the one caller that disposes
+    // mid-session and comes back, and the connectivity listener below re-joins
+    // on its edge, binding whatever client `getWsClient()` hands out then.
+    // Any other dispose arms nothing: the engine stays dormant until this
+    // effect re-runs or `resyncQueueFromServer` restarts the join, exactly as
+    // when it sat on the dead client. On Expo web the auth transport revision
+    // re-runs the effect after a credential change. A native sign-out stays
+    // dormant: the credential generation moves before the dispose, so the re-run
+    // effect binds the doomed client and lets go of it here. Re-joining a
+    // session the account just left is not this code's call.
+    const unsubscribeClientDisposed = subscribeWsClientDisposed((disposedClient) => {
+      if (disposedClient !== boundClient) return;
       subscriptionStartToken++;
       joinRetryCount = 0;
-      const hasEstablishedSubscriptions = queueUpdatesCleanup !== null && sessionUpdatesCleanup !== null;
-      if (getCloseEventCode(closeEvent) === AUTH_REFRESH_RETRY_CLOSE_CODE && hasEstablishedSubscriptions) {
-        preserveSubscriptionsOnNextConnect = true;
-        authRefreshRejoinInProgress = true;
-        clearJoinRetryTimer();
-        gate.reset();
-        return;
-      }
-      preserveSubscriptionsOnNextConnect = false;
-      cleanupSubscriptions();
-      // The reconnect's FullSync re-baselines tracking on its own
-      // (evaluateIncoming always applies + resets a FullSync), but reset here
-      // too so a stray in-flight event from the dead connection can't be
-      // sequence-checked against the old connection's tracking in the gap
-      // before that FullSync arrives.
-      gate.reset();
-    });
-    const unsubConnected = wsClient.on('connected', () => {
-      const preserveExistingSubscriptions = preserveSubscriptionsOnNextConnect;
-      preserveSubscriptionsOnNextConnect = false;
-      void startJoinedSubscriptions(preserveExistingSubscriptions);
+      releaseBoundClient();
+      if (getConnectivitySnapshot().effectiveOffline) joinDeferredForConnectivity = true;
     });
 
     // Re-run a join deferred while backgrounded once the app returns to the
@@ -936,9 +1155,13 @@ export function useSessionRealtime({
       disposed = true;
       subscriptionStartToken++;
       restartJoinedSubscriptionsRef.current = null;
+      // #7014: a receipt from the session being left is no relay for the next.
+      clearRelayReceipt();
       cleanupSubscriptions();
-      unsubConnected();
-      unsubClosed();
+      unbindClientEvents?.();
+      unbindClientEvents = null;
+      boundClient = null;
+      unsubscribeClientDisposed();
       appStateSub.remove();
       unsubscribeConnectivity();
       // Reset live analytics/presence on EVERY session change (not only on
@@ -957,7 +1180,7 @@ export function useSessionRealtime({
       // ref would otherwise suppress every snapshot angle-follow in session B.
       pendingLocalBoardPathRef.current = null;
     };
-  }, [sessionId, coordinator, ensureJoined, joinTracker, authTransportRevision]);
+  }, [sessionId, coordinator, ensureJoined, joinTracker, authTransportRevision, credentialGeneration]);
 
   // Periodic local-vs-server hash watchdog (mirrors web's 60s interval in
   // use-session-subscriptions.ts, ported into the shared gate's

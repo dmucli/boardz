@@ -8,7 +8,7 @@ export type BoardReportGate = {
   isMember: boolean;
   /** First-seen epoch-ms for the durable-history dwell gate, or null when unknown/implausible. */
   firstSeenMs: number | null;
-  /** Value of `board:{id}:lastReport` ("emitterId|climbUuid|angle"), or null when never set / expired. */
+  /** Value of `board:{id}:lastReport` (see `boardReportDedupMarker`), or null when never set / expired. */
   lastReport: string | null;
   /**
    * The board's current connection holder (`board:{id}:writer`), or null when
@@ -27,9 +27,28 @@ export type CommitBoardClimbInput = {
   climb: BoardPresenceClimb;
   climbUuid: string;
   effectiveAngle: number;
+  /** Orientation the reporter wrote to the wall; part of the dedup marker. */
+  mirrored: boolean;
   /** The reporting connection's party-session id, when it's in one. */
   sessionId: string | null;
 };
+
+/**
+ * The A2 dedup marker stored in `board:{id}:lastReport`. Orientation is part of
+ * it: flipping the climb on the wall is a real wall change, not a retry (#5238).
+ * The resolver compares against this same builder, so the two never drift.
+ * The pre-#5238 marker had no orientation suffix, so during a rolling deploy a
+ * key written by an old instance never matches a new one: at most one retry
+ * inside the 10 s TTL is accepted as a duplicate send, then the key expires.
+ */
+export function boardReportDedupMarker(input: {
+  emitterId: string;
+  climbUuid: string;
+  effectiveAngle: number;
+  mirrored: boolean;
+}): string {
+  return `${input.emitterId}|${input.climbUuid}|${input.effectiveAngle}|${input.mirrored ? 1 : 0}`;
+}
 
 export type CommitBoardClimbResult = {
   /** The writer key's previous value (from the atomic SET..GET), or null when
@@ -56,6 +75,27 @@ export type CommitBoardClimbResult = {
    * next queue mutation.
    */
   sessionBindingChanged: boolean;
+  /**
+   * True when this commit VERIFIABLY moved the session's forward binding
+   * (`session:{id}:board`) to this board: it was unbound or bound to another
+   * board. A session nothing else places is on that bound board
+   * (`resolveSessionBoards`), so `reportBoardClimb` uses it to have connected
+   * peers re-project names for the new wall. False for a re-stamp of the same
+   * board, a session-less report, or an unverifiable slot.
+   */
+  sessionBoardChanged: boolean;
+};
+
+/**
+ * A deliberate "Turn off all lights" that is still the wall's latest state
+ * (`board:{id}:cleared`). Replayed to a new `boardNowPlaying` subscriber so a
+ * late joiner's history backfill can't put the cleared climb back on the wall.
+ */
+export type StoredBoardClear = {
+  clearedAt: string;
+  seq: number;
+  /** The climb that was lit when the wall was cleared, or null when unknown. */
+  climbUuid: string | null;
 };
 
 // Board-presence durable history (Redis FIFO) configuration. The live
@@ -83,7 +123,7 @@ const BOARD_SEQ_RESEED_THRESHOLD = 50;
 // enough for a climbing session; a reconnect re-stamps it.
 const BOARD_MEMBERSHIP_TTL = 43_200; // 12 hours
 // Write-side idempotency window for reportBoardClimb: a retry of the exact
-// same (emitter, climb, angle) within this window is treated as a no-op
+// same (emitter, climb, angle, orientation) within this window is treated as a no-op
 // duplicate rather than a new send (see `getBoardReportGate` / A2 dedup).
 const REPORT_DEDUP_WINDOW_MS = 10_000;
 // Epoch-ms floor a first-seen stamp must clear to be trusted. Guards against
@@ -96,6 +136,32 @@ function parsePlausibleFirstSeenMs(raw: string | null): number | null {
   const firstSeen = Number(raw);
   if (!Number.isFinite(firstSeen) || firstSeen < PLAUSIBLE_EPOCH_MS_FLOOR) return null;
   return firstSeen;
+}
+
+/** Parse `board:{id}:cleared` (an HGETALL reply); null when absent or malformed. */
+function parseStoredBoardClear(raw: unknown): StoredBoardClear | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const fields = raw as Record<string, unknown>;
+  const seq = Number(fields.seq);
+  if (!Number.isSafeInteger(seq) || seq < 1 || typeof fields.clearedAt !== 'string') return null;
+  const climbUuid = typeof fields.climbUuid === 'string' && fields.climbUuid !== '' ? fields.climbUuid : null;
+  return { seq, clearedAt: fields.clearedAt, climbUuid };
+}
+
+/** Highest `seq` among raw history entries; unparseable entries are skipped. */
+function newestStoredClimbSeq(entries: unknown[]): number {
+  let newest = 0;
+  for (const entry of entries) {
+    if (typeof entry !== 'string') continue;
+    try {
+      const climb: unknown = JSON.parse(entry);
+      const seq = typeof climb === 'object' && climb !== null ? (climb as { seq?: unknown }).seq : undefined;
+      if (typeof seq === 'number' && Number.isSafeInteger(seq)) newest = Math.max(newest, seq);
+    } catch {
+      // A corrupt entry can't prove a climb superseded the clear; ignore it.
+    }
+  }
+  return newest;
 }
 
 /**
@@ -463,6 +529,89 @@ export class BoardPresenceStore {
   }
 
   /**
+   * Store a deliberate wall clear (`reportBoardClear`) and drop the write-side
+   * dedup marker, in one Lua script.
+   *
+   * The seq is allocated by `nextBoardSeq` BEFORE this runs (it may consult the
+   * Postgres floor, which can't happen inside Lua), so two clears can reach here
+   * out of order. The compare-and-set keeps the higher seq: a slower, older clear
+   * never overwrites a newer one. A climb set that lands between allocation and
+   * this write is safe too, because readers compare the stored clear's seq against
+   * the newest history seq (`getActiveBoardClear`).
+   *
+   * The dedup marker goes unconditionally: after a clear, re-lighting the same
+   * climb within REPORT_DEDUP_WINDOW_MS is a real wall change, not a retry, and
+   * must publish a fresh `BoardClimbSet`.
+   *
+   * TTL is BOARD_HISTORY_TTL, not the 12 h membership window: the history buffer
+   * that would otherwise re-light the cleared climb for a late joiner lives a week.
+   * Redis-only — returns false without Redis (the live event still goes out).
+   */
+  async commitBoardClear(boardId: string, clear: StoredBoardClear): Promise<boolean> {
+    if (!this.deps.isRedisAvailable()) return false;
+    try {
+      const { publisher } = redisClientManager.getClients();
+      const stored = await publisher.eval(
+        "redis.call('del', KEYS[2]); " +
+          "local current = tonumber(redis.call('hget', KEYS[1], 'seq') or '0'); " +
+          'if current >= tonumber(ARGV[1]) then return 0 end; ' +
+          "redis.call('del', KEYS[1]); " +
+          "redis.call('hset', KEYS[1], 'seq', ARGV[1], 'clearedAt', ARGV[2], 'climbUuid', ARGV[3]); " +
+          "redis.call('expire', KEYS[1], ARGV[4]); " +
+          'return 1',
+        2,
+        `board:${boardId}:cleared`,
+        `board:${boardId}:lastReport`,
+        clear.seq,
+        clear.clearedAt,
+        clear.climbUuid ?? '',
+        BOARD_HISTORY_TTL,
+      );
+      return stored === 1;
+    } catch (error) {
+      if (this.deps.isRedisRequired()) throw error;
+      this.deps.logger.error('[PubSub] Failed to store board clear:', error);
+      return false;
+    }
+  }
+
+  /**
+   * The stored clear when it is still the wall's latest native state: its seq is
+   * above every climb in the history buffer. Null when there is no clear, a later
+   * climb superseded it, or Redis is unavailable. Never throws — a replay is a
+   * convenience on top of the live feed, and must not fail a subscription.
+   *
+   * Also stale when the seq counter is missing or below the clear's seq. Both
+   * keys live a week, but the counter's TTL is set first, and an eviction or a
+   * durable-floor reseed (the floor never counts clears) can take it back. Every
+   * new climb would then number below the clear, and a late joiner would see a
+   * lit wall as dark for up to a week.
+   */
+  async getActiveBoardClear(boardId: string): Promise<StoredBoardClear | null> {
+    if (!this.deps.isRedisAvailable()) return null;
+    try {
+      const { publisher } = redisClientManager.getClients();
+      const results = await publisher
+        .pipeline()
+        .hgetall(`board:${boardId}:cleared`)
+        .lrange(`board:${boardId}:history`, 0, BOARD_HISTORY_SIZE - 1)
+        .get(`board:${boardId}:seq`)
+        .exec();
+      if (!results) return null;
+      const [[clearError, clearRaw], [historyError, historyRaw], [seqError, seqRaw]] = results;
+      if (clearError || historyError || seqError) return null;
+      const clear = parseStoredBoardClear(clearRaw);
+      if (!clear) return null;
+      if (!(Number(seqRaw) >= clear.seq)) return null;
+      const newestHistorySeq = Array.isArray(historyRaw) ? newestStoredClimbSeq(historyRaw) : 0;
+      return clear.seq > newestHistorySeq ? clear : null;
+    } catch (error) {
+      this.deps.logger.warn('[PubSub] Board clear read unavailable:', error);
+      return null;
+    }
+  }
+
+  /**
    * One atomic, bounded read for anonymous marketing snapshots. History alone
    * is never proof of current LEDs: release keeps that week-long buffer. The
    * sender must still hold the board, and a mismatched/anonymous holder cannot
@@ -484,13 +633,19 @@ export class BoardPresenceStore {
       const snapshot: unknown = await publisher.eval(
         "local writer = redis.call('get', KEYS[1]); " +
           'if not writer then return {} end; ' +
-          "return {writer, redis.call('lrange', KEYS[2], 0, 49)}",
-        2,
+          // A clear only counts while the seq counter has reached it (see
+          // getActiveBoardClear): a counter that went back makes it stale.
+          "local cleared = tonumber(redis.call('hget', KEYS[3], 'seq') or '0'); " +
+          "if cleared > tonumber(redis.call('get', KEYS[4]) or '0') then cleared = 0 end; " +
+          "return {writer, redis.call('lrange', KEYS[2], 0, 49), tostring(cleared)}",
+        4,
         `board:${boardId}:writer`,
         `board:${boardId}:history`,
+        `board:${boardId}:cleared`,
+        `board:${boardId}:seq`,
       );
-      if (!Array.isArray(snapshot) || snapshot.length !== 2) return null;
-      const [writer, entries] = snapshot;
+      if (!Array.isArray(snapshot) || snapshot.length !== 3) return null;
+      const [writer, entries, clearedSeqRaw] = snapshot;
       if (typeof writer !== 'string' || writer.startsWith('conn:') || !Array.isArray(entries)) return null;
 
       let newest: Record<string, unknown> | null = null;
@@ -518,6 +673,8 @@ export class BoardPresenceStore {
       if (
         !newest ||
         newest.sentByUserId !== writer ||
+        // The holder turned every light off after this climb: nothing is lit.
+        Number(clearedSeqRaw) > (newest.seq as number) ||
         (newest.source != null && newest.source !== 'boardsesh') ||
         typeof newest.climbUuid !== 'string' ||
         !newest.climbUuid ||
@@ -687,8 +844,12 @@ export class BoardPresenceStore {
       // binding in-memory so getSessionBoard/getBoardSession keep answering
       // (the board-queue-preview producer depends on them). The writer slot
       // and history remain Redis-only, unchanged.
+      const previousSessionBoard = input.sessionId
+        ? this.readLocalBinding(this.localSessionBoard, input.sessionId)
+        : null;
       const sessionBindingChanged = this.rememberLocalSessionBoardBinding(input.sessionId, input.boardId);
-      return { previousWriter: null, writerSlotOk: false, sessionBindingChanged };
+      const sessionBoardChanged = !!input.sessionId && previousSessionBoard !== input.boardId;
+      return { previousWriter: null, writerSlotOk: false, sessionBindingChanged, sessionBoardChanged };
     }
 
     try {
@@ -696,7 +857,7 @@ export class BoardPresenceStore {
       const historyKey = `board:${input.boardId}:history`;
       const writerKey = `board:${input.boardId}:writer`;
       const lastReportKey = `board:${input.boardId}:lastReport`;
-      const lastReportValue = `${input.emitterId}|${input.climbUuid}|${input.effectiveAngle}`;
+      const lastReportValue = boardReportDedupMarker(input);
 
       const pipeline = publisher.pipeline();
       const commandLabels: string[] = [];
@@ -709,11 +870,31 @@ export class BoardPresenceStore {
       const writerCommandIndex = commandLabels.length;
       pipeline.set(writerKey, input.emitterId, 'EX', BOARD_MEMBERSHIP_TTL, 'GET');
       commandLabels.push('writer-set');
-      pipeline.set(lastReportKey, lastReportValue, 'PX', REPORT_DEDUP_WINDOW_MS);
+      // Seq-gated against a stored clear (#7015): when a clear with a higher seq
+      // already ran its Lua (which deletes this marker), setting it again would
+      // make a re-light of this same climb inside the window read as a retry,
+      // and viewers would stay dark over a lit wall. Both scripts are atomic, so
+      // whichever order they run in, the marker ends up absent after a newer clear.
+      pipeline.eval(
+        "local cleared = tonumber(redis.call('hget', KEYS[2], 'seq') or '0'); " +
+          'if cleared > tonumber(ARGV[2]) then return 0 end; ' +
+          "redis.call('set', KEYS[1], ARGV[1], 'PX', ARGV[3]); " +
+          'return 1',
+        2,
+        lastReportKey,
+        `board:${input.boardId}:cleared`,
+        lastReportValue,
+        input.climb.seq,
+        REPORT_DEDUP_WINDOW_MS,
+      );
       commandLabels.push('last-report-set');
       let boardSessionCommandIndex = -1;
+      let sessionBoardCommandIndex = -1;
       if (input.sessionId) {
-        pipeline.set(`session:${input.sessionId}:board`, input.boardId, 'EX', BOARD_MEMBERSHIP_TTL);
+        // SET..GET so the caller learns whether this send moved the session to
+        // another wall (sessionBoardChanged).
+        sessionBoardCommandIndex = commandLabels.length;
+        pipeline.set(`session:${input.sessionId}:board`, input.boardId, 'EX', BOARD_MEMBERSHIP_TTL, 'GET');
         commandLabels.push('session-board-set');
         // Reverse binding for the board-keyed queue preview (gym kiosks):
         // `getBoardSession(boardId)` answers "which session's queue is on this
@@ -746,13 +927,24 @@ export class BoardPresenceStore {
         const [bindingError, previousBoundSession] = results[boardSessionCommandIndex];
         sessionBindingChanged = !bindingError && ((previousBoundSession as string | null) ?? null) !== input.sessionId;
       }
+      let sessionBoardChanged = false;
+      if (sessionBoardCommandIndex !== -1) {
+        const [sessionBoardError, previousSessionBoard] = results[sessionBoardCommandIndex];
+        sessionBoardChanged =
+          !sessionBoardError && ((previousSessionBoard as string | null) ?? null) !== String(input.boardId);
+      }
 
       const [writerError, writerValue] = results[writerCommandIndex];
-      if (writerError) return { previousWriter: null, writerSlotOk: false, sessionBindingChanged };
-      return { previousWriter: (writerValue as string | null) ?? null, writerSlotOk: true, sessionBindingChanged };
+      if (writerError) return { previousWriter: null, writerSlotOk: false, sessionBindingChanged, sessionBoardChanged };
+      return {
+        previousWriter: (writerValue as string | null) ?? null,
+        writerSlotOk: true,
+        sessionBindingChanged,
+        sessionBoardChanged,
+      };
     } catch (error) {
       this.deps.logger.error('[PubSub] commitBoardClimb pipeline failed:', error);
-      return { previousWriter: null, writerSlotOk: false, sessionBindingChanged: false };
+      return { previousWriter: null, writerSlotOk: false, sessionBindingChanged: false, sessionBoardChanged: false };
     }
   }
 

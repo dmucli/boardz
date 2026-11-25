@@ -119,3 +119,10 @@ describe('rollbackOptimisticTick', () => {
     expect(result.map((item) => item.uuid)).toEqual(['a', 'b']);
   });
 });
+
+describe('buildOptimisticTickEntry: climb version (#6023)', () => {
+  // Not known, so the optimistic send counts as sent (`isTickOnCurrentHolds`).
+  it('has no version key', () => {
+    expect('climb_revision' in buildOptimisticTickEntry(baseOptions, 'temp-1')).toBe(false);
+  });
+});

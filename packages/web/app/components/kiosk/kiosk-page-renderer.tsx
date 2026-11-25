@@ -12,6 +12,7 @@ import { notFound, permanentRedirect } from 'next/navigation';
 import type { Metadata } from 'next';
 import { GET_GYM_KIOSK } from '@boardsesh/graphql/operations';
 import type { GymKiosk, GymKioskBoard } from '@boardsesh/shared-schema';
+import { parseKioskLayoutLenient } from '@boardsesh/kiosk';
 import { getGraphQLHttpUrl } from '@/app/lib/graphql/client';
 import { SSR_BACKEND_FETCH_TIMEOUT_MS } from '@/app/lib/ssr-fetch-deadline';
 import { getPublicBackendHttpUrl } from '@/app/lib/backend-url';
@@ -33,6 +34,7 @@ import KioskAnalytics from './kiosk-analytics';
 import BoardSlot from './board-slot/board-slot';
 import LeaderboardRail from './leaderboard-rail/leaderboard-rail';
 import layoutStyles from './kiosk-layout.module.css';
+import { webClientIdentityHeaders } from '@/app/lib/client-identity';
 
 const KIOSK_REVALIDATE_SECONDS = 60;
 
@@ -58,7 +60,7 @@ export const fetchGymKiosk = cache(async (gymSlug: string, kioskSlug: string | n
   try {
     const response = await fetch(getGraphQLHttpUrl(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...webClientIdentityHeaders() },
       body: JSON.stringify({ query: GET_GYM_KIOSK, variables: { gymSlug, kioskSlug } }),
       signal: AbortSignal.timeout(SSR_BACKEND_FETCH_TIMEOUT_MS),
       next: { revalidate: KIOSK_REVALIDATE_SECONDS },
@@ -138,10 +140,14 @@ export default async function KioskPageRenderer({ gymSlug, kioskSlug }: { gymSlu
   const locale = await getLocale();
   const { t } = await getServerTranslation('kiosk');
 
+  // Resolve appearance before constructing the initial rasters, so connecting
+  // the live feed cannot swap a dark-washed seed into a light screen.
+  const kioskTheme = parseKioskLayoutLenient(kiosk.layout).layout.theme;
+
   const slots: RenderableSlot[] = (
     await Promise.all(
       kiosk.boards.map(async (board): Promise<RenderableSlot | null> => {
-        const slotData = await buildBoardSlotData(board);
+        const slotData = await buildBoardSlotData(board, kioskTheme);
         if (slotData === null) return null;
         return { board, ...slotData };
       }),
@@ -165,7 +171,7 @@ export default async function KioskPageRenderer({ gymSlug, kioskSlug }: { gymSlu
 
   return (
     <I18nProvider locale={locale} namespaces={['common', 'kiosk']}>
-      <KioskThemeScope gym={kiosk.gym}>
+      <KioskThemeScope gym={kiosk.gym} theme={viewModel.theme}>
         <KioskAnalytics />
         <KioskReliability
           gymSlug={gymSlug}
@@ -174,7 +180,10 @@ export default async function KioskPageRenderer({ gymSlug, kioskSlug }: { gymSlu
           gymUuid={kiosk.gym.uuid}
           initialUpdatedAt={kiosk.updatedAt}
         />
-        <KioskPresenceHub boardIds={distinctBoardIds}>
+        <KioskPresenceHub
+          boardIds={distinctBoardIds}
+          boardUuids={Object.fromEntries(renderedBoards.map((board) => [board.boardId, board.boardUuid]))}
+        >
           <div className={layoutStyles.root}>
             <KioskHeader
               gymName={kiosk.gym.name}
@@ -196,6 +205,7 @@ export default async function KioskPageRenderer({ gymSlug, kioskSlug }: { gymSlu
                   <BoardSlot
                     key={slot.board.boardUuid}
                     boardId={slot.board.boardId}
+                    boardUuid={slot.board.boardUuid}
                     boardName={slot.board.name}
                     angle={slot.board.angle}
                     boardDetails={slot.boardDetails}
@@ -204,6 +214,7 @@ export default async function KioskPageRenderer({ gymSlug, kioskSlug }: { gymSlu
                     bareBoardImageUrl={slot.bareBoardImageUrl}
                     slug={slot.board.slug}
                     showInstallQr={viewModel.showInstallQr}
+                    theme={viewModel.theme}
                   />
                 ))}
               </KioskLayout>

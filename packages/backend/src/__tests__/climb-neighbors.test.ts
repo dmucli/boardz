@@ -2,7 +2,7 @@
  * The materialised similar-climbs index end to end, against the real test
  * Postgres: the in-memory scorer, the watermark-driven refresh job, the read
  * path the `similarClimbs` resolver serves non-admins from, and the
- * `updateClimb` invalidation. Design: docs/similar-climbs.md.
+ * `updateClimb` invalidation. Design: docs/data/similar-climbs.md.
  */
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 import { and, eq, or, sql } from 'drizzle-orm';
@@ -467,12 +467,13 @@ describe('incremental runs on a busy group', () => {
       if (ticking) setImmediate(tick);
     };
     setImmediate(tick);
-    const original = ClimbNeighborIndex.prototype.neighborsOf;
+    const original = Object.getOwnPropertyDescriptor(ClimbNeighborIndex.prototype, 'neighborsOf')?.value as
+      | ClimbNeighborIndex['neighborsOf']
+      | undefined;
+    if (!original) throw new Error('Missing neighborsOf implementation');
     const seen: number[] = [];
-    const spy = vi.spyOn(ClimbNeighborIndex.prototype, 'neighborsOf').mockImplementation(function (
-      this: ClimbNeighborIndex,
-      ...args: Parameters<ClimbNeighborIndex['neighborsOf']>
-    ) {
+    const spy = vi.spyOn(ClimbNeighborIndex.prototype, 'neighborsOf');
+    spy.mockImplementation(function (this: ClimbNeighborIndex, ...args: Parameters<ClimbNeighborIndex['neighborsOf']>) {
       if (args.length === 1) seen.push(ticks);
       return original.apply(this, args);
     });
@@ -690,6 +691,7 @@ describe('getMaterializedSimilarClimbs', () => {
       qualityAverage: 2.5,
       ascensionistCount: 7,
       compatibleSizeIds: [],
+      requiredSetIds: null,
       characteristics: null,
       similarity: 9 / 11,
       sharedHoldCount: 9,

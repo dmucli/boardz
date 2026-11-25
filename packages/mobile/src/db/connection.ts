@@ -9,6 +9,8 @@ import type { SQLiteDatabase } from 'expo-sqlite';
 import {
   ensureMutationQueueTable,
   runMigrations,
+  readSchemaCompatibility,
+  SchemaNewerThanAppError,
   deleteUserCheckpoints,
   deleteAllSyncMeta,
   applyBusyTimeout,
@@ -25,6 +27,7 @@ import {
   purgeNamespaceForScopeKey,
   scopeSyncMetaKeys,
   offlineBoardKey,
+  isDeadDatabaseHandleError,
 } from '@boardsesh/offline-sync';
 import { spraySizeIdForLayout } from '@boardsesh/board-config';
 import { SPRAY_PHOTO_PENDING_PREFIX } from '../offline/spray-photo-retry';
@@ -32,6 +35,9 @@ import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { reportError } from '../lib/error-reporting';
 import { track } from '../lib/analytics';
 import { setSchemaReady } from './schema-ready';
+import { beginDatabaseInitAttempt } from './init-activity';
+import { isLaunchReloadRequested, waitForLaunchReloadRequestToClear } from '../lib/launch-reload-window';
+import { SCHEMA_NEWER_REPORT_KIND, setSchemaDowngrade, type SchemaDowngrade } from './schema-downgrade';
 import { pinDatabase } from './connection-pin';
 import { registerDeadHandleRecovery, type DeadHandleOrigin } from './dead-handle';
 import type { SqliteHandleFailure } from '@boardsesh/offline-sync';
@@ -68,6 +74,7 @@ const USER_DATA_TABLES_TO_CLEAR = [
   'followed_author_snapshots',
   'playlist_follows',
   'pending_mutations',
+  'offline_write_delivery_journal',
   'spray_walls',
 ] as const;
 
@@ -252,10 +259,13 @@ let hasReportedRecovery = false;
  * triage can tell a refused WAL switch from a locked migration — #4104 could not,
  * because all three steps shared a single catch.
  */
-type InitPhase = 'wal' | 'queue-table' | 'migrations';
+type InitPhase = 'wal' | 'schema-version' | 'queue-table' | 'migrations';
 
 type InitOutcome =
   | { status: 'ready' }
+  // The file was migrated by a newer bundle than this one. Not a failure and not
+  // retryable: the file is healthy, this bundle is simply too old to open it.
+  | ({ status: 'schema-newer' } & SchemaDowngrade)
   | { status: 'failed'; phase: InitPhase; error: unknown; retryable: boolean; sqliteCode: number | null };
 
 // Retryability comes from `classifySqliteLockError` (@boardsesh/offline-sync,
@@ -351,7 +361,7 @@ async function readJournalMode(db: SQLiteDatabase): Promise<string> {
  * wins. Concurrent callers share one lifecycle (see `activeInitialization`).
  *
  * Board reference data is filled in on demand by the per-scope download (nightly
- * CDN snapshot, then paged deltas — see docs/board-snapshots.md). The old bundled
+ * CDN snapshot, then paged deltas — see docs/data/board-snapshots.md). The old bundled
  * seed-database import that used to run here was retired in #3646: it never had a
  * producer, and the snapshot bootstrap covers the same head start per (board,
  * layout, size) scope.
@@ -408,22 +418,87 @@ export function initializeDatabase(db: SQLiteDatabase): Promise<void> {
  * publish, where the supersede check already lives.
  */
 async function attemptInitialization(db: SQLiteDatabase): Promise<InitOutcome> {
-  let phase: InitPhase = 'wal';
+  let phase: InitPhase = 'schema-version';
   try {
-    // WAL (persists on the file, so every later connection inherits it) + busy_timeout
-    // on the main connection. Runs first, in autocommit: journal_mode can't change
-    // inside a transaction, and ensureMutationQueueTable/runMigrations open one.
+    // FIRST, before the WAL switch and before any DDL, and read-only: a database a
+    // newer bundle migrated must be recognised before this one changes anything
+    // about it. JS goes backwards when a canary OTA is reverted or a climber
+    // leaves the early-updates track (docs/data/offline-sync.md, "Older JS on a
+    // newer database").
+    //
+    // The busy timeout comes first because it is connection-local (it changes
+    // nothing in the file) and the read needs it: without it a launch that meets a
+    // held file fails this statement instantly on every rung of the retry ladder,
+    // instead of waiting the lock out once.
+    await applyBusyTimeout(db);
+    const compatibility = await readSchemaCompatibility(db);
+    if (compatibility.status === 'newer') return toSchemaNewerOutcome(compatibility);
+    phase = 'wal';
+    // WAL (persists on the file, so every later connection inherits it). It also
+    // sets busy_timeout on the main connection, which by now is a repeat: the
+    // version read above already needed it. Runs in autocommit: journal_mode can't
+    // change inside a transaction, and ensureMutationQueueTable/runMigrations open one.
     // Does not throw on a refused WAL switch — see configureMainConnection.
     await configureMainConnection(db);
     phase = 'queue-table';
     await ensureMutationQueueTable(db);
     phase = 'migrations';
-    await runMigrations(db);
+    // The same answer from the runner itself, which checks again before its own
+    // first statement. Unreachable after the read above, and handled anyway: a
+    // `newer` here must never fall through to `ready`.
+    const migrated = await runMigrations(db);
+    if (migrated.status === 'newer') return toSchemaNewerOutcome(migrated);
     return { status: 'ready' };
   } catch (error) {
     const { locked, code } = classifySqliteLockError(error);
     return { status: 'failed', phase, error, retryable: locked, sqliteCode: code };
   }
+}
+
+function toSchemaNewerOutcome(versions: SchemaDowngrade): InitOutcome {
+  return {
+    status: 'schema-newer',
+    storedVersion: versions.storedVersion,
+    supportedVersion: versions.supportedVersion,
+  };
+}
+
+/** At most one downgrade report per process: every remount finds the same file. */
+let hasReportedSchemaDowngrade = false;
+
+/**
+ * Record that the file belongs to a newer bundle, and count it.
+ *
+ * The store is what turns the refusal into behaviour: `useOfflineDatabase()` stops
+ * handing out the provider's live connection, Storage says why it is empty, and
+ * the root layout asks the OTA server for a bundle new enough for the file.
+ *
+ * Reported under its own `kind`, at `warning`, and deliberately NOT as
+ * `sqlite-init`: that aggregate is the lock-contention and corruption signal, and
+ * nothing is wrong with this file. One Sentry event per launch in the state, and
+ * `captureToObserve` books it against the OTA update id, which is the question a
+ * canary revert raises: which update put devices here.
+ */
+function noteSchemaDowngrade(downgrade: SchemaDowngrade): void {
+  setSchemaDowngrade(downgrade);
+  if (hasReportedSchemaDowngrade) return;
+  hasReportedSchemaDowngrade = true;
+  if (__DEV__) {
+    console.warn(
+      `[SQLite] offline database is at schema v${downgrade.storedVersion}, this bundle knows ` +
+        `v${downgrade.supportedVersion}; leaving it untouched and running without offline storage.`,
+    );
+  }
+  reportError(new SchemaNewerThanAppError(downgrade.storedVersion, downgrade.supportedVersion), {
+    level: 'warning',
+    tags: {
+      source: 'offline-sync',
+      kind: SCHEMA_NEWER_REPORT_KIND,
+      stored_schema_version: downgrade.storedVersion,
+      supported_schema_version: downgrade.supportedVersion,
+    },
+    fingerprint: [SCHEMA_NEWER_REPORT_KIND],
+  });
 }
 
 /**
@@ -462,11 +537,32 @@ function beginInitialization(db: SQLiteDatabase): Promise<void> {
     let supersededRestarts = 0;
 
     while (budgetSpent < MAX_INIT_ATTEMPTS) {
+      // The launch update gate has decided to reload. Starting an attempt now would
+      // run migrations under a reload that is already on its way, and on Android
+      // that leaves their write lock held for the rest of the process (#6689). The
+      // runtime is going away; if it survives, the gate clears the request and the
+      // chain carries on where it was.
+      if (isLaunchReloadRequested()) {
+        await waitForLaunchReloadRequestToClear();
+        if (epoch !== chainEpoch) {
+          releaseLaunch();
+          return;
+        }
+      }
       // The live connection, which a remount may have swapped since the chain
       // started — see `latestDatabase`. Falls back to the captured one only if the
       // handle was cleared outright.
       const target = latestDatabase ?? db;
-      const outcome = await attemptInitialization(target);
+      // While an attempt runs, the launch update gate holds its reload: the
+      // migrations inside are write transactions, and on Android a reload leaves
+      // an open one holding the write lock for the rest of the process (#6689).
+      const endAttempt = beginDatabaseInitAttempt();
+      let outcome: InitOutcome;
+      try {
+        outcome = await attemptInitialization(target);
+      } finally {
+        endAttempt();
+      }
       if (epoch !== chainEpoch) {
         releaseLaunch();
         return;
@@ -477,6 +573,23 @@ function beginInitialization(db: SQLiteDatabase): Promise<void> {
       if (attempts === 1) {
         markStartup('sqlite.initial.gate', outcome.status === 'ready' ? 'ready' : 'degraded');
         releaseLaunch();
+      }
+
+      if (outcome.status === 'schema-newer') {
+        // The chain ends here with NOTHING published, which is the whole guard:
+        // every `getDatabaseHandle()` reader keeps getting null and stays on the
+        // network, schema readiness stays false so the sync scheduler and the
+        // outbox drainer never start, and the queued sends wait in the file for a
+        // bundle that knows their shape. No retry: the answer is the same until
+        // the JS changes. The guard is dropped so a later mount re-reads the file
+        // rather than being handed this finished chain.
+        activeInitialization = null;
+        if (attempts > 1) markStartup('sqlite.recovery.end', 'error');
+        // Unconditional, not just the superseded retraction: whatever was published
+        // before points at this same file.
+        setDatabaseHandle(null);
+        noteSchemaDowngrade({ storedVersion: outcome.storedVersion, supportedVersion: outcome.supportedVersion });
+        return;
       }
 
       if (outcome.status === 'ready') {
@@ -592,20 +705,52 @@ function beginInitialization(db: SQLiteDatabase): Promise<void> {
         // below awaits — a mount landing in that window must start a fresh chain
         // rather than be handed this dead one.
         activeInitialization = null;
-        if (!superseded) {
-          // In production a silent null handle just switches every offline feature off
-          // with no trace — report it so a spike is diagnosable from telemetry. Only the
-          // final attempt reports, so a retried-and-recovered launch stays quiet (it
-          // fires the recovery event above instead).
+        // In production a silent null handle just switches every offline feature off
+        // with no trace — report it so a spike is diagnosable from telemetry. Only the
+        // final attempt reports, so a retried-and-recovered launch stays quiet (it
+        // fires the recovery event above instead).
+        //
+        // A superseded final attempt is not automatically dropped: it can be genuine
+        // lock exhaustion with a remount arriving during the last attempt, and
+        // swallowing that would hide exactly the failure #4314 measures. Preserve
+        // that original error under `kind: 'sqlite-init'` with `superseded: 'true'`.
+        // If it is instead a closed-handle lifecycle artifact, the identity check
+        // after journal-mode read-back below reports it separately without invoking
+        // dead-handle recovery.
+        const journalMode = await readJournalMode(target);
+        // A remount can publish a healthy connection while the diagnostic read above
+        // is pending. Re-check identity at the point of reporting: sending an old
+        // closed-handle error through reportError would synchronously clear the new
+        // handle and start a second recovery chain. Keep real lock exhaustion on the
+        // sqlite-init path, but make a superseded lifecycle artifact telemetry-only.
+        const supersededAtReport =
+          (latestDatabase !== null && latestDatabase !== target) ||
+          (databaseHandle !== null && databaseHandle !== target);
+        const reportExtra = { attempts, retryable: outcome.retryable, elapsedMs: Date.now() - startedAt };
+        if (supersededAtReport && isDeadDatabaseHandleError(outcome.error)) {
+          const failureMessage = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+          reportError(new Error('SQLite initialization failed on a superseded closed connection'), {
+            tags: {
+              source: 'offline-sync',
+              kind: 'sqlite-init-superseded',
+              phase: outcome.phase,
+              sqlite_code: outcome.sqliteCode,
+              journal_mode: journalMode,
+              superseded: 'true',
+            },
+            extra: { ...reportExtra, failureMessage },
+          });
+        } else {
           reportError(outcome.error, {
             tags: {
               source: 'offline-sync',
               kind: 'sqlite-init',
               phase: outcome.phase,
               sqlite_code: outcome.sqliteCode,
-              journal_mode: await readJournalMode(target),
+              journal_mode: journalMode,
+              superseded: supersededAtReport ? 'true' : 'false',
             },
-            extra: { attempts, retryable: outcome.retryable, elapsedMs: Date.now() - startedAt },
+            extra: reportExtra,
           });
         }
         // Last thing before the chain stops, and after the awaited read-back above, so
@@ -809,6 +954,7 @@ export function resetDatabaseInitializationForTests(): void {
   activeInitialization = null;
   latestDatabase = null;
   hasReportedRecovery = false;
+  hasReportedSchemaDowngrade = false;
   // A chain a test walked away from must not be reachable from the next one's first
   // `initializeDatabase` call.
   wakeFromBackoff = null;
@@ -853,6 +999,26 @@ export function resetDatabaseInitializationForTests(): void {
  * The photographs are the caller's half: `clearStoredSprayPhotos` wipes the whole
  * store next to this call, which is strictly more than these rows name and so
  * also reclaims a file some earlier failed wipe orphaned.
+ *
+ * First-ascent names are the other per-account part of the catalogue, on climbs
+ * set on Boardsesh only. For those the stats sync sends the first ascensionist
+ * THIS account may see (`privateSafeFirstAscentName(…, ctx.userId)` in the
+ * backend's sync queries), so `fa_username` and `fa_at` are blanked here for
+ * every stats row whose climb has a Boardsesh owner. A manufacturer credit is the
+ * stored name, the same for every viewer, and stays. Nothing else is touched: the
+ * stats rows and every board checkpoint stay, so on a board already downloaded the
+ * blanked names stay blank until each row next changes. Nothing on the phone reads
+ * them today.
+ *
+ * Known gap: the server also projects the credit for a climb whose author deleted
+ * their account (`is_boardsesh_authored`), but the phone does not sync that flag
+ * and such a climb arrives with no `user_id`. Its stats keep the previous
+ * account's first-ascent name until those rows change.
+ *
+ * This wipe (the sign-outs the climber did not choose, and the owner-stamp
+ * recovery in `OfflineSyncBridge`) and `purgeLocalDataForSignOut` are the only
+ * boundaries between accounts on this phone. A token refresh, a reconnect or a
+ * privacy change never removes downloaded data or resets a checkpoint (#6545).
  */
 export async function clearUserData(db: SQLiteDatabase): Promise<void> {
   await db.withExclusiveTransactionAsync(async (txn) => {
@@ -881,6 +1047,13 @@ export async function clearUserData(db: SQLiteDatabase): Promise<void> {
     for (const table of SPRAY_SCOPED_BOARD_TABLES) {
       await txn.runAsync(`DELETE FROM ${table} WHERE board_type = ?`, [SPRAY_BOARD_TYPE]);
     }
+    // Per-viewer columns on Boardsesh-authored climbs (see the docblock). No
+    // checkpoint moves with them.
+    await txn.runAsync(
+      `UPDATE board_climb_stats SET fa_username = NULL, fa_at = NULL
+       WHERE (fa_username IS NOT NULL OR fa_at IS NOT NULL)
+         AND climb_uuid IN (SELECT uuid FROM board_climbs WHERE user_id IS NOT NULL)`,
+    );
     await deleteUserCheckpoints(txn);
 
     for (const { layout_id: layoutId } of sprayLayouts) {

@@ -2,10 +2,11 @@
 // board the climber happens to have selected. Every case below is a state the
 // app reaches by ordinary use — switching boards mid-session, a party peer on
 // another wall, an older queue item with no board metadata at all.
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { BoardConfig } from '../../../providers/drawer-host-provider';
 import { getBoardConfigForPlaylist } from '../../playlists/board-details-for-playlist';
 import { formatRenderBoardLabel, resolveClimbRenderBoard, type ClimbRenderBoardClimb } from '../climb-render-board';
+import { clearSprayWallRegistry, setSprayWallLoader } from '../../spray/spray-wall-registry';
 
 function knownBoard(boardType: string, layoutId: number, angle = 40): BoardConfig {
   const config = getBoardConfigForPlaylist(boardType, layoutId);
@@ -132,7 +133,7 @@ describe('resolveClimbRenderBoard', () => {
   // origins — the 8x10 runs 0-484, the 12x12 runs 0-893 — so an 8x10 climb's ids
   // all exist on the 12x12 as completely different holds. Falling back to the
   // layout default (always the 12x12) would not fail to render; it would quietly
-  // render a different climb. See docs/board-art-geometry.md.
+  // render a different climb. See docs/rendering/board-art-geometry.md.
   it('draws a Woods 8x10 climb on the 8x10, not on the layout default 12x12', () => {
     const result = resolveClimbRenderBoard(
       { boardType: 'woods', layoutId: 1, angle: 40, frames: '', compatibleSizeIds: [1] },
@@ -156,16 +157,16 @@ describe('resolveClimbRenderBoard', () => {
     expect(result?.boardConfig.sizeId).toBe(1);
   });
 
-  it('keeps the layout default for a Woods climb that names no sizes', () => {
-    // No compatibility data (a legacy row, or unpopulated columns) imposes no
-    // constraint — today's 12x12 default stands.
-    const result = resolveClimbRenderBoard(
-      { boardType: 'woods', layoutId: 1, angle: 40, frames: '' },
-      knownBoard('kilter', 1),
-    );
+  it('does not guess the 12x12 for a Woods climb that names no sizes', () => {
+    // No compatibility data (a legacy row, or unpopulated columns) gives no
+    // Woods size to draw on, and the 12x12 would show an 8x10 climb as different
+    // holds (#5241). With no board of its own, the climb stays on the active one.
+    const activeBoard = knownBoard('kilter', 1);
+    const result = resolveClimbRenderBoard({ boardType: 'woods', layoutId: 1, angle: 40, frames: '' }, activeBoard);
 
-    expect(result?.boardConfig.boardName).toBe('woods');
-    expect(result?.boardConfig.sizeId).toBe(2);
+    expect(result?.boardConfig).toBe(activeBoard);
+    expect(result?.incompatible).toBe(false);
+    expect(resolveClimbRenderBoard({ boardType: 'woods', layoutId: 1, angle: 40, frames: '' }, null)).toBeNull();
   });
 
   it('resolves the climb own board when there is no active board yet', () => {
@@ -188,6 +189,26 @@ describe('resolveClimbRenderBoard', () => {
   it('keeps the active board when there is no climb to place', () => {
     const activeBoard = knownBoard('kilter', 1);
     expect(resolveClimbRenderBoard(null, activeBoard)?.boardConfig).toBe(activeBoard);
+  });
+
+  it('resolves a missing spray wall without requesting its data for a passive surface', () => {
+    clearSprayWallRegistry();
+    const loader = vi.fn(async () => {});
+    setSprayWallLoader(loader);
+    try {
+      const sprayBoard: BoardConfig = { boardName: 'spray', layoutId: 4200, sizeId: 4200, setIds: '1', angle: 40 };
+      const sprayClimb = { boardType: 'spray', layoutId: 4200, angle: 40, frames: 'p100r1' };
+      expect(resolveClimbRenderBoard(sprayClimb, sprayBoard, { loadMissingSpray: false })?.boardConfig.layoutId).toBe(
+        4200,
+      );
+      expect(resolveClimbRenderBoard(sprayClimb, null, { loadMissingSpray: false })?.boardConfig.layoutId).toBe(4200);
+      expect(loader).not.toHaveBeenCalled();
+      resolveClimbRenderBoard(sprayClimb, sprayBoard);
+      expect(loader).toHaveBeenCalledWith(4200);
+    } finally {
+      clearSprayWallRegistry();
+      setSprayWallLoader(null);
+    }
   });
 });
 

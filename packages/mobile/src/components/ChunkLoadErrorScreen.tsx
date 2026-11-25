@@ -1,5 +1,6 @@
+import { PressableSurface } from './PressableSurface';
 import { useEffect, useRef, useState } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 import { Text } from './Text';
 import { Icon } from './Icon';
 import { brandColorsDark, materialSurfaces } from '../theme/colors';
@@ -16,7 +17,7 @@ import { recoverFromChunkLoadError, reloadPage, type ChunkRecoveryOutcome } from
 // otherwise offers exactly one button: Reload.
 //
 // Copy is hardcoded English for the same reason as the generic boundary in
-// app/_layout.tsx: it renders before any provider, so i18next is not ready.
+// CrashScreen.tsx: it renders before any provider, so i18next is not ready.
 //
 // Colours are explicit for the same reason. With no ThemeProvider above the
 // boundary, an uncoloured `Text` falls back to React Native's default black,
@@ -103,7 +104,7 @@ export function ChunkLoadErrorScreen({ error }: { error: Error }) {
         {copy.message}
       </Text>
       {showReloadButton && (
-        <Pressable
+        <PressableSurface
           onPress={reloadPage}
           accessibilityRole="button"
           accessibilityLabel="Reload"
@@ -112,7 +113,7 @@ export function ChunkLoadErrorScreen({ error }: { error: Error }) {
           <Text variant="body" color={brandColorsDark.onPrimary} style={styles.buttonLabel}>
             Reload
           </Text>
-        </Pressable>
+        </PressableSurface>
       )}
     </View>
   );

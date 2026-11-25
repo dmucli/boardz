@@ -62,6 +62,10 @@ vi.mock('react-i18next', () => ({
 
 // Heavy native children → inert stand-ins; we drive the screen via the mode
 // control + buttons, not the actual board.
+vi.mock('../../../../src/components/HeaderActionButtons', () => ({
+  HeaderTrailingButton: ({ label, onPress }: { label: string; onPress: () => void }) =>
+    createElement('button', { onClick: onPress }, label),
+}));
 vi.mock('../../../../src/components/Text', () => ({
   Text: ({ children }: { children?: ReactNode }) => createElement('span', null, children),
 }));
@@ -239,6 +243,16 @@ describe('ZoneFilterScreen', () => {
     expect(emitZoneFilterSelection).toHaveBeenCalled();
     const selection = emitZoneFilterSelection.mock.calls.at(-1)?.[0] as { zoneBox: ZoneBoxInput | null };
     expect(selection.zoneBox).toEqual({ edgeLeft: 20, edgeRight: 80, edgeBottom: 20, edgeTop: 80 });
+  });
+
+  it('echoes the handoffId route param in the handoff, and sends an empty id without one', () => {
+    routeParams.current = baseParams({ handoffId: 'filter-picker-9' });
+    render(<ZoneFilterScreen />).unmount();
+    expect(emitZoneFilterSelection.mock.calls.at(-1)?.[0]).toMatchObject({ handoffId: 'filter-picker-9' });
+
+    routeParams.current = baseParams();
+    render(<ZoneFilterScreen />).unmount();
+    expect(emitZoneFilterSelection.mock.calls.at(-1)?.[0]).toMatchObject({ handoffId: '' });
   });
 
   // Route params arrive as strings from the navigator and can be malformed

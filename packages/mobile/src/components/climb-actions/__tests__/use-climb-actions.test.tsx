@@ -1,16 +1,31 @@
 // @vitest-environment jsdom
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { act, renderHook } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, renderHook, waitFor } from '@testing-library/react';
+import type { QueryClient } from '@tanstack/react-query';
 import type { Climb } from '@boardsesh/shared-schema';
 import type { ClimbActionId } from '../use-climb-actions';
 
 // Keep the real useCreateClimbNavigation in this test so fork/edit exercise the
 // one-action and injected-dismiss handoff end to end.
 const ctrl = vi.hoisted(() => ({
-  canUpdate: false,
+  lightsOn: false,
+  generation: 0,
+  wallArchived: false,
   sessionId: null as string | null,
   moderationEnabled: true,
   activeClimbUuid: null as string | null,
+  currentItem: null as { uuid: string; climb: Climb } | null,
+  queueItems: [] as Array<{ uuid: string; climb: Climb }>,
+  boardMatches: false,
+  inSharedSession: false,
+  database: null as object | null,
+  // The History row Replay from here would replay; null hides the row (F3).
+  replayItem: null as { uuid: string; climb: unknown } | null,
+}));
+const favoriteReads = vi.hoisted(() => ({
+  queryClient: null as QueryClient | null,
+  pendingOverrides: vi.fn(async () => new Map<string, boolean>()),
+  request: vi.fn(async () => ({ favorites: [] as string[] })),
 }));
 const openers = vi.hoisted(() => ({
   openPlayDrawer: vi.fn(),
@@ -20,18 +35,43 @@ const openers = vi.hoisted(() => ({
   openReportClimb: vi.fn(),
   addToQueue: vi.fn(),
   playNext: vi.fn(),
+  setCurrentClimb: vi.fn(),
+  findReplayFromHereItem: vi.fn((_queueItemUuid: string) => ctrl.replayItem),
   toggleFavoriteMutate: vi.fn(),
+  track: vi.fn(),
   push: vi.fn(),
   shareClimb: vi.fn(async () => {}),
+  requestDelete: vi.fn(async (_climb: unknown, _boardName: string, _onDeleted?: () => void) => {}),
 }));
 
+vi.mock('@tanstack/react-query', async (importOriginal) => {
+  const original = await importOriginal<typeof import('@tanstack/react-query')>();
+  const client = new original.QueryClient({ defaultOptions: { queries: { retry: false } } });
+  favoriteReads.queryClient = client;
+  return { ...original, useQueryClient: () => client };
+});
+vi.mock('../../../lib/graphql/offline-request', () => ({
+  offlineAwareRequest: favoriteReads.request,
+}));
+vi.mock('../../../db', () => ({ getDatabaseHandle: () => ctrl.database }));
+vi.mock('../../../db/queries/get-favorite-status-local', () => ({
+  getPendingFavoriteOverridesLocal: favoriteReads.pendingOverrides,
+}));
+vi.mock('../../../lib/privacy/privacy-cache', () => ({ getCredentialGeneration: () => ctrl.generation }));
+vi.mock('../../../lib/error-reporting', () => ({ reportHandledError: vi.fn() }));
+vi.mock('../../play-drawer/use-climb-change-lights', () => ({ isDrivingWall: () => ctrl.lightsOn }));
 vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 vi.mock('expo-router', () => ({
   useRouter: () => ({ push: openers.push }),
 }));
 vi.mock('expo-crypto', () => ({ randomUUID: () => 'queue-uuid' }));
 vi.mock('expo-web-browser', () => ({ openBrowserAsync: vi.fn(async () => {}) }));
-vi.mock('@boardsesh/create-climb-react', () => ({ computeCanUpdate: () => ctrl.canUpdate }));
+// The REAL edit rule (`canEditClimb`): the gate is the thing under test. Only
+// the wall's viewer flags are stubbed, since the registry behind them has its
+// own tests.
+vi.mock('../../../lib/spray/use-spray-wall-archive', () => ({
+  useSprayWallIsArchived: (boardName: string | null | undefined) => boardName === 'spray' && ctrl.wallArchived,
+}));
 vi.mock('@boardsesh/analytics', () => ({ SHARED_EVENTS: {} }));
 vi.mock('../../../providers/drawer-host-provider', () => ({
   useDrawerHost: () => ({
@@ -46,16 +86,23 @@ vi.mock('../../../providers/drawer-host-provider', () => ({
     openReportClimb: openers.openReportClimb,
     boardConfig: null,
   }),
-  boardConfigsMatch: () => false,
+  boardConfigsMatch: () => ctrl.boardMatches,
 }));
 // The kill switch reads as ENABLED when unresolved, so the default here is true.
 vi.mock('../../../providers/feature-flags-provider', () => ({
   useClimbModerationEnabled: () => ctrl.moderationEnabled,
 }));
 vi.mock('../../../providers/queue-provider', () => ({
-  useQueueActions: () => ({ addToQueue: openers.addToQueue, playNext: openers.playNext }),
+  useQueueActions: () => ({
+    addToQueue: openers.addToQueue,
+    playNext: openers.playNext,
+    setCurrentClimb: openers.setCurrentClimb,
+    findReplayFromHereItem: openers.findReplayFromHereItem,
+    getQueueSnapshot: () => ({ currentClimbQueueItem: ctrl.currentItem, queue: ctrl.queueItems }),
+  }),
   useQueueSessionId: () => ({ sessionId: ctrl.sessionId }),
   useActiveClimbUuid: () => ctrl.activeClimbUuid,
+  useIsSharedSession: () => ctrl.inSharedSession,
 }));
 vi.mock('../../../lib/climb-to-queue-item', () => ({ climbToQueueItem: (climb: unknown) => ({ uuid: 'qi', climb }) }));
 vi.mock('../../../providers/theme-provider', () => ({
@@ -68,9 +115,22 @@ vi.mock('../../../lib/graphql/hooks', () => ({
   useFavoriteStatus: () => ({ data: false }),
 }));
 vi.mock('../../../hooks/use-share-climb', () => ({ useShareClimb: () => openers.shareClimb }));
-vi.mock('../../../lib/analytics', () => ({ track: vi.fn() }));
+vi.mock('../../../lib/analytics', () => ({ track: openers.track }));
+// This phone's Bluetooth link, read only to tag `Favorite Toggle` (#6002).
+const bluetoothCtrl = vi.hoisted(() => ({ connected: false }));
+vi.mock('../../../lib/ble/bluetooth-status-store', () => ({
+  useBluetoothConnectedStatus: () => bluetoothCtrl.connected,
+}));
+// A failed create handoff reports here; the reporting itself has its own tests.
+vi.mock('../../../lib/sentry', () => ({ captureToSentry: vi.fn() }));
+// The delete flow (confirm, mutation, toasts) has its own tests.
+vi.mock('../use-delete-climb-action', () => ({ useDeleteClimbAction: () => openers.requestDelete }));
 
 import { useClimbActions } from '../use-climb-actions';
+import { track } from '../../../lib/analytics';
+import { registerHeldQueueItemReader } from '../../../lib/held-climb-reader';
+// The real commit bar: what the preview a replay opens will offer.
+import { resolveCommitBarModel, resolveCommitButton } from '../../play-drawer/wall-state';
 
 const climb = {
   uuid: 'climb-1',
@@ -84,6 +144,7 @@ const ownerClimb = { ...climb, userId: 'user-1', is_draft: true } as unknown as 
 
 const kilterBoard = { boardName: 'kilter', layoutId: 1, sizeId: 10, setIds: '1,2', angle: 40 };
 const tensionBoard = { ...kilterBoard, boardName: 'tension' };
+const sprayBoard = { ...kilterBoard, boardName: 'spray', layoutId: 4200, sizeId: 4200, setIds: '1' };
 const woodsBoard = { ...kilterBoard, boardName: 'woods', layoutId: 1, sizeId: 2, setIds: '1' };
 
 // `onSelectPlaylist` is required on the hook — it MUST host the playlist picker
@@ -104,19 +165,30 @@ function ids(args: ActionArgs): ClimbActionId[] {
 }
 
 beforeEach(() => {
-  ctrl.canUpdate = false;
+  ctrl.lightsOn = false;
+  ctrl.generation = 0;
+  ctrl.wallArchived = false;
   ctrl.sessionId = null;
+  ctrl.currentItem = null;
+  ctrl.queueItems = [];
+  ctrl.boardMatches = false;
+  ctrl.inSharedSession = false;
+  ctrl.database = null;
   ctrl.moderationEnabled = true;
   ctrl.activeClimbUuid = null;
+  bluetoothCtrl.connected = false;
   Object.values(openers).forEach((fn) => fn.mockClear?.());
+  openers.toggleFavoriteMutate.mockReset();
+  favoriteReads.queryClient?.clear();
+  favoriteReads.pendingOverrides.mockReset().mockResolvedValue(new Map());
+  favoriteReads.request.mockReset().mockResolvedValue({ favorites: [] });
 });
 
 describe('useClimbActions gating', () => {
   it('returns the universal actions for a plain Kilter climb (no edit/beta/openInApp/editEntry)', () => {
     expect(ids({ climb, boardConfig: kilterBoard, isAuthenticated: false })).toEqual([
-      'preview',
-      'queue',
       'playNext',
+      'queue',
       'playlist',
       'favorite',
       'tick',
@@ -125,9 +197,9 @@ describe('useClimbActions gating', () => {
     ]);
   });
 
-  // #5654: the play drawer passes this while the connect-step pill has the
-  // queue button's place; everywhere else the queue has its own button.
-  it('adds "Open the queue" right after "Add to queue" only when onOpenQueue is provided', () => {
+  // The player's ⋯ passes this (and shows the row while its bar has put the
+  // queue button away); everywhere else the queue has its own button.
+  it('adds "Open the queue" right after "Play last" only when onOpenQueue is provided', () => {
     expect(ids({ climb, boardConfig: kilterBoard, isAuthenticated: false })).not.toContain('openQueue');
 
     const withQueue = ids({ climb, boardConfig: kilterBoard, isAuthenticated: false, onOpenQueue: () => {} });
@@ -147,6 +219,116 @@ describe('useClimbActions gating', () => {
     act(() => result.current.find((action) => action.id === 'openQueue')?.run());
 
     expect(order).toEqual(['closed', 'queue opened']);
+  });
+
+  // #6397: the player's section choices moved off its action bar into its ⋯.
+  // Only the play drawer passes the opener.
+  it('adds "View options" right before Share only when onOpenViewOptions is provided', () => {
+    expect(ids({ climb, boardConfig: kilterBoard, isAuthenticated: false })).not.toContain('viewOptions');
+
+    const withViewOptions = ids({
+      climb,
+      boardConfig: kilterBoard,
+      isAuthenticated: false,
+      onOpenViewOptions: () => {},
+    });
+    expect(withViewOptions.indexOf('viewOptions')).toBe(withViewOptions.indexOf('share') - 1);
+  });
+
+  it('keeps "View options" on a draft, which has no Share', () => {
+    const draft = ids({
+      climb: ownerClimb,
+      boardConfig: sprayBoard,
+      isAuthenticated: true,
+      currentUserId: 'user-1',
+      onOpenViewOptions: () => {},
+    });
+    expect(draft).not.toContain('share');
+    expect(draft).toContain('viewOptions');
+  });
+
+  it('closes the menu before it opens View options', () => {
+    const order: string[] = [];
+    const { result } = renderActions({
+      climb,
+      boardConfig: kilterBoard,
+      isAuthenticated: false,
+      onAfterAction: () => order.push('closed'),
+      onOpenViewOptions: () => order.push('view options opened'),
+    });
+
+    act(() => result.current.find((action) => action.id === 'viewOptions')?.run());
+
+    expect(order).toEqual(['closed', 'view options opened']);
+  });
+
+  it('labels View options with the sheet it opens, and gives it its own glyph', () => {
+    const { result } = renderActions({
+      climb,
+      boardConfig: kilterBoard,
+      isAuthenticated: false,
+      onOpenViewOptions: () => {},
+    });
+    const viewOptions = result.current.find((action) => action.id === 'viewOptions');
+
+    expect(viewOptions).toMatchObject({
+      title: 'common:mobile.settings.climbDrawer.sheetTitle',
+      icon: 'view.options',
+    });
+  });
+
+  // Every list tap opens a preview now, so a Preview row repeated the tap.
+  it('offers no Preview row anywhere', () => {
+    const everyOpener = ids({
+      climb,
+      boardConfig: kilterBoard,
+      isAuthenticated: true,
+      queueItemUuid: 'queue-slot-1',
+      onEditEntry: () => {},
+      onOpenQueue: () => {},
+      onOpenViewOptions: () => {},
+    });
+    expect(everyOpener as string[]).not.toContain('preview');
+    expect(everyOpener).toContain('playNext');
+  });
+
+  // #6229: the player's ⋯ stands in for its Mirror and angle buttons while the
+  // climber has them switched off. Nothing else passes these.
+  it('adds Mirror and Change angle only when the player passes them, worded by the mirror state', () => {
+    const plain = ids({ climb, boardConfig: kilterBoard, isAuthenticated: false });
+    expect(plain).not.toContain('mirror');
+    expect(plain).not.toContain('angle');
+
+    const onToggle = vi.fn();
+    const order: string[] = [];
+    const { result, rerender } = renderHook(
+      ({ isMirrored }: { isMirrored: boolean }) =>
+        useClimbActions({
+          climb,
+          boardConfig: kilterBoard,
+          isAuthenticated: false,
+          onSelectPlaylist: noopSelectPlaylist,
+          onAfterAction: () => order.push('closed'),
+          mirrorControl: { isMirrored, onToggle },
+          onOpenAngle: () => order.push('angle opened'),
+        }),
+      { initialProps: { isMirrored: false } },
+    );
+    const mirror = () => result.current.find((action) => action.id === 'mirror');
+    expect(mirror()).toMatchObject({ title: 'session:playView.actionBar.mirrorAria', icon: 'mirror' });
+    act(() => mirror()?.run());
+    expect(onToggle).toHaveBeenCalledTimes(1);
+
+    act(() => result.current.find((action) => action.id === 'angle')?.run());
+    // Closed first, like the queue: the angle sheet opens under a menu on its way out.
+    expect(order).toEqual(['closed', 'closed', 'angle opened']);
+    expect(result.current.find((action) => action.id === 'angle')).toMatchObject({
+      title: 'session:playView.actionBar.changeAngle',
+      icon: 'angle',
+    });
+
+    rerender({ isMirrored: true });
+    expect(mirror()?.title).toBe('session:playView.actionBar.unmirrorAria');
   });
 
   it('adds "Edit entry" only when onEditEntry is provided', () => {
@@ -170,6 +352,48 @@ describe('useClimbActions gating', () => {
     expect(signedIn[signedIn.length - 1]).toBe('report');
   });
 
+  // #5960: a draft is visible to its setter alone, and nobody reports themselves.
+  it("offers neither Share nor Report on the viewer's own draft", () => {
+    const own = ids({ climb: ownerClimb, boardConfig: sprayBoard, isAuthenticated: true, currentUserId: 'user-1' });
+    expect(own).not.toContain('share');
+    expect(own).not.toContain('report');
+  });
+
+  it("drops Report but keeps Share on the viewer's own published climb", () => {
+    const published = { ...ownerClimb, is_draft: false } as unknown as Climb;
+    const own = ids({ climb: published, boardConfig: kilterBoard, isAuthenticated: true, currentUserId: 'user-1' });
+    expect(own).toContain('share');
+    expect(own).not.toContain('report');
+  });
+
+  // #5971: on a spray wall a grade proposal is how the setter changes their
+  // own climb's grade, so Report stays on their published climb there.
+  it("keeps Report on the viewer's own published spray climb, never on its draft", () => {
+    const published = { ...ownerClimb, is_draft: false } as unknown as Climb;
+    const own = ids({ climb: published, boardConfig: sprayBoard, isAuthenticated: true, currentUserId: 'user-1' });
+    expect(own).toContain('report');
+  });
+
+  it('titles it "Change grade" on your own spray climb, and "Report climb" on anyone else\u2019s', () => {
+    const published = { ...ownerClimb, is_draft: false } as unknown as Climb;
+    const titleOf = (args: ActionArgs) =>
+      renderActions(args).result.current.find((action) => action.id === 'report')?.title;
+    expect(titleOf({ climb: published, boardConfig: sprayBoard, isAuthenticated: true, currentUserId: 'user-1' })).toBe(
+      'mobile.climbActions.changeGrade',
+    );
+    const theirs = { ...climb, userId: 'setter-2', is_draft: false } as unknown as Climb;
+    expect(titleOf({ climb: theirs, boardConfig: sprayBoard, isAuthenticated: true, currentUserId: 'user-1' })).toBe(
+      'mobile.climbActions.report',
+    );
+  });
+
+  it("keeps Report on somebody else's published climb", () => {
+    const theirs = { ...climb, userId: 'setter-2', is_draft: false } as unknown as Climb;
+    const viewed = ids({ climb: theirs, boardConfig: kilterBoard, isAuthenticated: true, currentUserId: 'user-1' });
+    expect(viewed).toContain('share');
+    expect(viewed).toContain('report');
+  });
+
   it('drops "Report climb" when the moderation kill switch is flipped', () => {
     ctrl.moderationEnabled = false;
     expect(ids({ climb, boardConfig: kilterBoard, isAuthenticated: true })).not.toContain('report');
@@ -187,7 +411,6 @@ describe('useClimbActions gating', () => {
   });
 
   it('adds owner-only "Edit" only when the climb is editable by the current user', () => {
-    ctrl.canUpdate = true;
     expect(
       ids({ climb: ownerClimb, boardConfig: kilterBoard, isAuthenticated: false, currentUserId: 'user-1' }),
     ).toContain('edit');
@@ -197,8 +420,103 @@ describe('useClimbActions gating', () => {
     ).not.toContain('edit');
   });
 
+  it('stops offering Edit on a catalogue board 24 hours after publishing', () => {
+    const publishedLongAgo = { ...climb, userId: 'user-1', is_draft: false, published_at: '2020-01-01T00:00:00.000Z' };
+    expect(
+      ids({
+        climb: publishedLongAgo as unknown as Climb,
+        boardConfig: kilterBoard,
+        isAuthenticated: true,
+        currentUserId: 'user-1',
+      }),
+    ).not.toContain('edit');
+  });
+
+  // A spray climb follows the catalogue rule: the setter, a draft for good, a
+  // published climb for 24 hours after first publish. Nobody else, the wall's
+  // owner included.
+  describe('spray walls', () => {
+    const publishedHoursAgo = (hoursAgo: number) =>
+      ({
+        ...climb,
+        userId: 'setter-1',
+        is_draft: false,
+        published_at: new Date(Date.now() - hoursAgo * 60 * 60 * 1000).toISOString(),
+      }) as unknown as Climb;
+    const draftClimb = { ...publishedHoursAgo(30), is_draft: true, published_at: null } as unknown as Climb;
+    const asViewer = (viewedClimb: Climb, currentUserId: string) =>
+      ids({ climb: viewedClimb, boardConfig: sprayBoard, isAuthenticated: true, currentUserId });
+
+    it('offers the setter Edit within 24 hours of publishing', () => {
+      expect(asViewer(publishedHoursAgo(2), 'setter-1')).toContain('edit');
+    });
+
+    it('stops offering the setter Edit 24 hours after publishing', () => {
+      expect(asViewer(publishedHoursAgo(30), 'setter-1')).not.toContain('edit');
+    });
+
+    it('keeps Edit on a draft for its setter', () => {
+      expect(asViewer(draftClimb, 'setter-1')).toContain('edit');
+    });
+
+    it("does not offer the wall's owner Edit on a climb somebody else set", () => {
+      expect(asViewer(publishedHoursAgo(2), 'wall-owner')).not.toContain('edit');
+      expect(asViewer(draftClimb, 'wall-owner')).not.toContain('edit');
+    });
+
+    // #5960: any age, since the server, not the clock, decides (no ticks yet).
+    it('offers the setter Delete, last, on their published climb at any age', () => {
+      for (const hours of [2, 30]) {
+        const actions = asViewer(publishedHoursAgo(hours), 'setter-1');
+        expect(actions[actions.length - 1]).toBe('delete');
+      }
+    });
+
+    it('offers Delete to nobody else, never on a draft, and never on an archived wall', () => {
+      expect(asViewer(publishedHoursAgo(2), 'wall-owner')).not.toContain('delete');
+      expect(asViewer(draftClimb, 'setter-1')).not.toContain('delete');
+      ctrl.wallArchived = true;
+      expect(asViewer(publishedHoursAgo(2), 'setter-1')).not.toContain('delete');
+    });
+
+    it('never offers Delete off a spray wall', () => {
+      expect(
+        ids({
+          climb: publishedHoursAgo(2),
+          boardConfig: kilterBoard,
+          isAuthenticated: true,
+          currentUserId: 'setter-1',
+        }),
+      ).not.toContain('delete');
+    });
+
+    it('delete.run closes the menu, then starts the delete; a success closes the player behind it', () => {
+      const onAfterAction = vi.fn();
+      const dismissPlayerAndWait = vi.fn(async () => ({ status: 'dismissed' as const }));
+      const viewed = publishedHoursAgo(2);
+      const { result } = renderActions({
+        climb: viewed,
+        boardConfig: sprayBoard,
+        isAuthenticated: true,
+        currentUserId: 'setter-1',
+        onAfterAction,
+        dismissPlayerAndWait,
+      });
+
+      act(() => result.current.find((action) => action.id === 'delete')!.run());
+
+      expect(onAfterAction).toHaveBeenCalledTimes(1);
+      expect(openers.requestDelete).toHaveBeenCalledWith(viewed, 'spray', expect.any(Function));
+      expect(onAfterAction.mock.invocationCallOrder[0]).toBeLessThan(openers.requestDelete.mock.invocationCallOrder[0]);
+      expect(dismissPlayerAndWait).not.toHaveBeenCalled();
+
+      const onDeleted = openers.requestDelete.mock.calls[0][2]!;
+      onDeleted();
+      expect(dismissPlayerAndWait).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('offers Fork and Edit on Woods with the usual ownership rules', () => {
-    ctrl.canUpdate = true;
     const woodsIds = ids({
       climb: ownerClimb,
       boardConfig: woodsBoard,
@@ -208,7 +526,21 @@ describe('useClimbActions gating', () => {
 
     expect(woodsIds).toContain('fork');
     expect(woodsIds).toContain('edit');
-    expect(woodsIds).toEqual(expect.arrayContaining(['preview', 'queue', 'playlist', 'favorite', 'tick', 'share']));
+    expect(woodsIds).toEqual(expect.arrayContaining(['queue', 'playlist', 'favorite', 'tick']));
+  });
+
+  // An archived wall keeps its climbs, but takes no new climb and no edit.
+  it('offers neither Fork nor Edit on an archived spray wall, and keeps the rest', () => {
+    ctrl.wallArchived = true;
+    const archivedIds = ids({
+      climb: ownerClimb,
+      boardConfig: sprayBoard,
+      isAuthenticated: true,
+      currentUserId: 'user-1',
+    });
+    expect(archivedIds).not.toContain('fork');
+    expect(archivedIds).not.toContain('edit');
+    expect(archivedIds).toEqual(expect.arrayContaining(['queue', 'playlist', 'tick']));
   });
 
   it('returns nothing without a climb or board config', () => {
@@ -226,12 +558,44 @@ describe('useClimbActions colours and dispatch', () => {
     expect(byId.playlist).toBe('#00f');
   });
 
-  it('queue.run enqueues the climb and fires onAfterAction', () => {
+  // #6772: the two placements sit together, Play next first, the way a music
+  // app lists them, and each says where the climb goes.
+  it('offers Play next right above Play last, labelled and drawn as the pair', () => {
+    const { result } = renderActions({ climb, boardConfig: kilterBoard, isAuthenticated: false });
+    const actionIds = result.current.map((action) => action.id);
+    expect(actionIds.indexOf('queue')).toBe(actionIds.indexOf('playNext') + 1);
+    const byId = Object.fromEntries(result.current.map((action) => [action.id, action]));
+    expect(byId.playNext).toMatchObject({ title: 'mobile.climbActions.playNext', icon: 'queue.next' });
+    expect(byId.queue).toMatchObject({ title: 'mobile.climbActions.playLast', icon: 'queue.last' });
+  });
+
+  it('queue.run (Play last) enqueues the climb at the end and fires onAfterAction', () => {
     const onAfterAction = vi.fn();
     const { result } = renderActions({ climb, boardConfig: kilterBoard, isAuthenticated: false, onAfterAction });
     result.current.find((action) => action.id === 'queue')?.run();
     expect(openers.addToQueue).toHaveBeenCalledWith({ uuid: 'queue-uuid', climb });
     expect(onAfterAction).toHaveBeenCalledTimes(1);
+  });
+
+  // A heart added away from the wall is a "save for next session" (#6002), so
+  // the event carries whether this phone was connected at the tap.
+  it.each([
+    ['away from the wall', false],
+    ['connected to a board', true],
+  ])('favorite.run tags the toggle with the Bluetooth link: %s', (_label, connected) => {
+    bluetoothCtrl.connected = connected;
+    const { result } = renderActions({ climb, boardConfig: kilterBoard, isAuthenticated: true });
+
+    result.current.find((action) => action.id === 'favorite')?.run();
+
+    // The toggle tracks the tap, in the direction it really goes.
+    expect(openers.toggleFavoriteMutate).toHaveBeenCalledTimes(1);
+    expect(openers.toggleFavoriteMutate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        currentlyFavorited: false,
+        tracking: { source: 'mobile_climb_actions', layoutId: kilterBoard.layoutId, connected },
+      }),
+    );
   });
 
   it('hides "Play next" for the climb already on the wall', () => {
@@ -243,6 +607,7 @@ describe('useClimbActions colours and dispatch', () => {
   });
 
   it('playNext.run forwards the queue slot when the menu came from a queue row', () => {
+    ctrl.queueItems = [{ uuid: 'queue-slot-7', climb }];
     const onAfterAction = vi.fn();
     const { result } = renderActions({
       climb,
@@ -259,6 +624,220 @@ describe('useClimbActions colours and dispatch', () => {
     // Fire-and-forget: the cross-board prompt sits above the dismissed sheet, so
     // the dismiss must not wait on the promise.
     expect(onAfterAction).toHaveBeenCalledTimes(1);
+  });
+
+  it('playNext.run matches by climb when the slot is not in this queue', () => {
+    // A board-sheet row carries the slot from the wall's session, which may be
+    // another climber's. planPlayNext would insert a second copy for it.
+    ctrl.queueItems = [{ uuid: 'local-copy', climb }];
+    const { result } = renderActions({
+      climb,
+      boardConfig: kilterBoard,
+      isAuthenticated: false,
+      queueItemUuid: 'their-session-slot',
+    });
+    result.current.find((action) => action.id === 'playNext')?.run();
+    expect(openers.playNext).toHaveBeenCalledWith({
+      item: { uuid: 'queue-uuid', climb },
+      queueItemUuid: undefined,
+    });
+  });
+
+  describe('Replay from here (F3)', () => {
+    const historyRow = { uuid: 'history-slot-2', climb };
+
+    afterEach(() => {
+      ctrl.replayItem = null;
+    });
+
+    it('a History row with a climb current offers it, and it sends STEP for that row', () => {
+      ctrl.replayItem = historyRow;
+      const onAfterAction = vi.fn();
+      const { result } = renderActions({
+        climb,
+        boardConfig: kilterBoard,
+        isAuthenticated: false,
+        queueItemUuid: 'history-slot-2',
+        onAfterAction,
+      });
+      expect(openers.findReplayFromHereItem).toHaveBeenCalledWith('history-slot-2');
+      ctrl.lightsOn = true;
+      const replay = result.current.find((action) => action.id === 'replayFromHere');
+      expect(replay?.title).toBe('mobile.climbActions.replayFromHere');
+      replay?.run();
+      expect(openers.setCurrentClimb).toHaveBeenCalledWith(historyRow, {
+        placement: 'STEP',
+        playlistSuggestionSource: null,
+      });
+      expect(onAfterAction).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps the queue sheet up when the replay commits, so the reordered queue shows', () => {
+      ctrl.replayItem = historyRow;
+      ctrl.lightsOn = true;
+      const dismissSourceSheet = vi.fn(() => Promise.resolve({ status: 'dismissed' as const }));
+      const { result } = renderActions({
+        climb,
+        boardConfig: kilterBoard,
+        isAuthenticated: false,
+        queueItemUuid: historyRow.uuid,
+        dismissSourceSheet,
+      });
+      act(() => result.current.find((action) => action.id === 'replayFromHere')?.run());
+      expect(openers.setCurrentClimb).toHaveBeenCalledTimes(1);
+      expect(openers.openPlayDrawer).not.toHaveBeenCalled();
+      expect(dismissSourceSheet).not.toHaveBeenCalled();
+    });
+
+    it('previews replay by default and carries the exact history placement to the board button', () => {
+      ctrl.replayItem = historyRow;
+      const { result } = renderActions({
+        climb,
+        boardConfig: kilterBoard,
+        queueItemUuid: historyRow.uuid,
+        isAuthenticated: true,
+      });
+      act(() => result.current.find((action) => action.id === 'replayFromHere')?.run());
+      expect(openers.setCurrentClimb).not.toHaveBeenCalled();
+      expect(openers.openPlayDrawer).toHaveBeenCalledWith(
+        historyRow.climb,
+        expect.objectContaining({
+          previewQueueItem: historyRow,
+          previewCommitOptions: { placement: 'STEP', playlistSuggestionSource: null },
+        }),
+      );
+    });
+
+    // The commit bar compares climbs, not slots: a preview of a History copy of
+    // the climb already up shows no Put on board, so the STEP would never land.
+    it('replays a History copy of the climb already up at once, keeping the sheet up', () => {
+      ctrl.replayItem = historyRow;
+      ctrl.currentItem = { uuid: 'now-slot', climb };
+      const dismissSourceSheet = vi.fn(() => Promise.resolve({ status: 'dismissed' as const }));
+      expect(
+        resolveCommitButton(
+          resolveCommitBarModel({
+            previewPinned: true,
+            isAnonymous: false,
+            boardMismatch: false,
+            displayedClimbUuid: historyRow.climb.uuid,
+            committedHeadUuid: ctrl.currentItem.climb.uuid,
+            wallClimbUuid: ctrl.currentItem.climb.uuid,
+            confirmArmed: false,
+            wallDriven: true,
+            tapConnects: false,
+          }),
+        ),
+      ).toBeNull();
+      const { result } = renderActions({
+        climb,
+        boardConfig: kilterBoard,
+        queueItemUuid: historyRow.uuid,
+        isAuthenticated: true,
+        dismissSourceSheet,
+      });
+      act(() => result.current.find((action) => action.id === 'replayFromHere')?.run());
+      expect(openers.setCurrentClimb).toHaveBeenCalledExactlyOnceWith(historyRow, {
+        placement: 'STEP',
+        playlistSuggestionSource: null,
+      });
+      expect(openers.openPlayDrawer).not.toHaveBeenCalled();
+      expect(dismissSourceSheet).not.toHaveBeenCalled();
+    });
+
+    // A commit would light the wall the hold keeps dark (a new current releases
+    // it), or reorder a crew's queue on a look. The climb up reopens instead.
+    it.each([
+      ['while the #4979 hold keeps the wall dark', () => registerHeldQueueItemReader(() => 'now-slot')],
+      [
+        'in a crew',
+        () => {
+          ctrl.inSharedSession = true;
+          return () => {};
+        },
+      ],
+    ])('reopens the climb up instead of replaying a History copy of it %s', (_label, arrange) => {
+      const cleanUp = arrange();
+      ctrl.replayItem = historyRow;
+      ctrl.currentItem = { uuid: 'now-slot', climb };
+      const dismissSourceSheet = vi.fn(() => Promise.resolve({ status: 'dismissed' as const }));
+      const { result } = renderActions({
+        climb,
+        boardConfig: kilterBoard,
+        queueItemUuid: historyRow.uuid,
+        isAuthenticated: true,
+        dismissSourceSheet,
+      });
+      act(() => result.current.find((action) => action.id === 'replayFromHere')?.run());
+      cleanUp();
+      expect(openers.setCurrentClimb).not.toHaveBeenCalled();
+      expect(openers.openPlayDrawer).toHaveBeenCalledExactlyOnceWith(climb, {
+        boardConfig: kilterBoard,
+        reopensCurrent: true,
+      });
+      expect(dismissSourceSheet).toHaveBeenCalledOnce();
+    });
+
+    it('previews a History row of another climb, whose preview offers Put on board', () => {
+      ctrl.replayItem = historyRow;
+      ctrl.currentItem = { uuid: 'now-slot', climb: { ...climb, uuid: 'climb-on-the-wall' } as Climb };
+      const { result } = renderActions({
+        climb,
+        boardConfig: kilterBoard,
+        queueItemUuid: historyRow.uuid,
+        isAuthenticated: true,
+      });
+      act(() => result.current.find((action) => action.id === 'replayFromHere')?.run());
+      expect(openers.setCurrentClimb).not.toHaveBeenCalled();
+      const options = openers.openPlayDrawer.mock.calls[0]?.[1] as { previewQueueItem: { climb: Climb } };
+      expect(
+        resolveCommitButton(
+          resolveCommitBarModel({
+            previewPinned: true,
+            isAnonymous: false,
+            boardMismatch: false,
+            displayedClimbUuid: options.previewQueueItem.climb.uuid,
+            committedHeadUuid: ctrl.currentItem.climb.uuid,
+            wallClimbUuid: ctrl.currentItem.climb.uuid,
+            confirmArmed: false,
+            wallDriven: true,
+            tapConnects: false,
+          }),
+        ),
+      ).toBe('putOnWall');
+    });
+
+    it('closes the queue sheet it opened over when replay previews, so the preview is not hidden', () => {
+      ctrl.replayItem = historyRow;
+      const dismissSourceSheet = vi.fn(() => Promise.resolve({ status: 'dismissed' as const }));
+      const onAfterAction = vi.fn();
+      const { result } = renderActions({
+        climb,
+        boardConfig: kilterBoard,
+        queueItemUuid: historyRow.uuid,
+        isAuthenticated: true,
+        dismissSourceSheet,
+        onAfterAction,
+      });
+      act(() => result.current.find((action) => action.id === 'replayFromHere')?.run());
+      expect(openers.openPlayDrawer).toHaveBeenCalledTimes(1);
+      expect(dismissSourceSheet).toHaveBeenCalledTimes(1);
+      expect(onAfterAction).toHaveBeenCalledTimes(1);
+    });
+
+    it('is absent when the provider has no History entry to replay (Up next, Now, nothing current, legacy)', () => {
+      ctrl.replayItem = null;
+      expect(
+        ids({ climb, boardConfig: kilterBoard, isAuthenticated: false, queueItemUuid: 'up-next-slot' }),
+      ).not.toContain('replayFromHere');
+    });
+
+    it('is absent everywhere but a queue row', () => {
+      ctrl.replayItem = historyRow;
+      openers.findReplayFromHereItem.mockClear();
+      expect(ids({ climb, boardConfig: kilterBoard, isAuthenticated: false })).not.toContain('replayFromHere');
+      expect(openers.findReplayFromHereItem).not.toHaveBeenCalled();
+    });
   });
 
   it('playNext.run omits the queue slot everywhere else', () => {
@@ -410,13 +989,6 @@ describe('useClimbActions colours and dispatch', () => {
     result.current.find((action) => action.id === 'share')?.run();
     expect(openers.shareClimb).toHaveBeenCalledTimes(1);
   });
-
-  it('preview.run opens the climb view-only in the play drawer', () => {
-    const { result } = renderActions({ climb, boardConfig: kilterBoard, isAuthenticated: false });
-    result.current.find((action) => action.id === 'preview')?.run();
-    expect(openers.openPlayDrawer).toHaveBeenCalledTimes(1);
-    expect(openers.openPlayDrawer).toHaveBeenCalledWith(climb, expect.any(Object));
-  });
 });
 
 describe('useClimbActions create-climb navigation (fork / edit)', () => {
@@ -432,9 +1004,9 @@ describe('useClimbActions create-climb navigation (fork / edit)', () => {
         forkFrames: 'p1r12',
         forkName: 'Test Climb',
         forkDescription: '',
-        // The parent's grade rides along so a remix on a board that publishes
-        // with the setter's own grade (a spray wall) opens at it (#5443).
-        forkDifficulty: 'V4',
+        // No grade: a remix is graded by its own first ascent (#5971).
+        // The parent, so the editor can draw the holds it lost.
+        forkParentUuid: climb.uuid,
         boardName: 'kilter',
         layoutId: '1',
         sizeId: '10',
@@ -445,7 +1017,6 @@ describe('useClimbActions create-climb navigation (fork / edit)', () => {
   });
 
   it('edit.run pushes create with the climb uuid, not the fork frames', () => {
-    ctrl.canUpdate = true;
     const { result } = renderActions({
       climb: ownerClimb,
       boardConfig: kilterBoard,
@@ -490,10 +1061,390 @@ describe('useClimbActions create-climb navigation (fork / edit)', () => {
     expect(openers.push).toHaveBeenCalledTimes(1);
   });
 
+  // The player's ⋯ outlives a handoff. One that threw keeps its claim, so Edit
+  // and Remix would stay dead for the player's whole life without this.
+  it('lets go of a failed handoff once another climb is shown', async () => {
+    const dismissPlayerAndWait = vi.fn(async (): Promise<{ status: 'dismissed' }> => {
+      throw new Error('transition never ended');
+    });
+    const { result, rerender } = renderHook(
+      ({ shownClimb }: { shownClimb: Climb }) =>
+        useClimbActions({
+          climb: shownClimb,
+          boardConfig: kilterBoard,
+          isAuthenticated: false,
+          onSelectPlaylist: noopSelectPlaylist,
+          dismissPlayerAndWait,
+        }),
+      { initialProps: { shownClimb: climb } },
+    );
+    const fork = () => result.current.find((action) => action.id === 'fork')?.run();
+
+    await act(async () => fork());
+    expect(dismissPlayerAndWait).toHaveBeenCalledTimes(1);
+    // Same climb: the failed handoff still holds the claim.
+    await act(async () => fork());
+    expect(dismissPlayerAndWait).toHaveBeenCalledTimes(1);
+
+    rerender({ shownClimb: { ...climb, uuid: 'climb-2' } as Climb });
+    await act(async () => fork());
+    expect(dismissPlayerAndWait).toHaveBeenCalledTimes(2);
+    expect(openers.push).not.toHaveBeenCalled();
+  });
+
   it('pushes directly when no source or player dismiss callback is present', () => {
     const { result } = renderActions({ climb, boardConfig: kilterBoard, isAuthenticated: false });
     result.current.find((action) => action.id === 'fork')?.run();
 
     expect(openers.push).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The player's ⋯ owns its own favourite (the bar heart's optimistic state) and
+// reports its own analytics surface. The long-press menu keeps both as they were.
+describe('useClimbActions for the player menu', () => {
+  it('reads and toggles a caller-owned favourite instead of its own mutation', () => {
+    vi.mocked(track).mockClear();
+    const onToggle = vi.fn();
+    const onAfterAction = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ isFavorited }: { isFavorited: boolean }) =>
+        useClimbActions({
+          climb,
+          boardConfig: kilterBoard,
+          isAuthenticated: true,
+          onSelectPlaylist: noopSelectPlaylist,
+          onAfterAction,
+          favoriteControl: { isFavorited, onToggle },
+        }),
+      { initialProps: { isFavorited: false } },
+    );
+    const favorite = () => result.current.find((action) => action.id === 'favorite');
+
+    expect(favorite()).toMatchObject({ title: 'session:playView.actionBar.addFavoriteAria', icon: 'favorite' });
+    act(() => favorite()?.run());
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    expect(onAfterAction).toHaveBeenCalledTimes(1);
+    expect(openers.toggleFavoriteMutate).not.toHaveBeenCalled();
+    // The caller tracks its own toggle; a second event here would double-count.
+    expect(track).not.toHaveBeenCalled();
+
+    rerender({ isFavorited: true });
+    expect(favorite()).toMatchObject({
+      title: 'session:playView.actionBar.removeFavoriteAria',
+      icon: 'favorite.fill',
+    });
+  });
+
+  it('keeps the toggle label and its own mutation without a caller-owned favourite', () => {
+    const { result } = renderActions({ climb, boardConfig: kilterBoard, isAuthenticated: true });
+    const favorite = result.current.find((action) => action.id === 'favorite');
+
+    expect(favorite?.title).toBe('mobile.climbRow.toggleFavorite');
+    act(() => favorite?.run());
+    expect(openers.toggleFavoriteMutate).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports share from the surface it was opened on', () => {
+    vi.mocked(track).mockClear();
+    const player = renderActions({
+      climb,
+      boardConfig: kilterBoard,
+      isAuthenticated: true,
+      analyticsSource: 'play_drawer_menu',
+    });
+    act(() => player.result.current.find((action) => action.id === 'share')?.run());
+    expect(track).toHaveBeenLastCalledWith(undefined, expect.objectContaining({ source: 'play_drawer_menu' }));
+
+    const longPress = renderActions({ climb, boardConfig: kilterBoard, isAuthenticated: true });
+    act(() => longPress.result.current.find((action) => action.id === 'share')?.run());
+    expect(track).toHaveBeenLastCalledWith(undefined, expect.objectContaining({ source: 'climb_actions_menu' }));
+  });
+});
+
+describe('native menu favorite resolution', () => {
+  const queryKey = ['favoriteStatus', 'kilter', 'climb-1', 40];
+  const args = {
+    climb,
+    boardConfig: kilterBoard,
+    isAuthenticated: true,
+    currentUserId: 'user-1',
+    resolveFavoriteOnAction: true,
+  };
+  const client = () => {
+    if (!favoriteReads.queryClient) throw new Error('Favorite query client was not initialized');
+    return favoriteReads.queryClient;
+  };
+
+  it.each([true, false])(
+    'keeps a stale cached %s instead of replacing queued intent with server state',
+    async (favorited) => {
+      client().setQueryData(queryKey, { favorites: favorited ? [climb.uuid] : [] });
+      await client().invalidateQueries({ queryKey, refetchType: 'none' });
+      const { result } = renderActions(args);
+
+      act(() => result.current.find((action) => action.id === 'favorite')?.run());
+
+      await waitFor(() =>
+        expect(openers.toggleFavoriteMutate).toHaveBeenCalledWith(
+          expect.objectContaining({ currentlyFavorited: favorited }),
+        ),
+      );
+      expect(favoriteReads.request).not.toHaveBeenCalled();
+      expect(favoriteReads.pendingOverrides).not.toHaveBeenCalled();
+      expect(client().getQueryData(queryKey)).toEqual({ favorites: favorited ? [climb.uuid] : [] });
+    },
+  );
+
+  it('removes a favorite on the next menu tap while its first add is still queued', async () => {
+    client().setQueryData(queryKey, { favorites: [] });
+    openers.toggleFavoriteMutate.mockImplementation(({ currentlyFavorited }: { currentlyFavorited: boolean }) => {
+      client().setQueryData(queryKey, { favorites: currentlyFavorited ? [] : [climb.uuid] });
+    });
+    const { result } = renderActions(args);
+    const toggle = () => result.current.find((action) => action.id === 'favorite')?.run();
+
+    act(toggle);
+    await waitFor(() => expect(openers.toggleFavoriteMutate).toHaveBeenCalledTimes(1));
+    act(toggle);
+    await waitFor(() => expect(openers.toggleFavoriteMutate).toHaveBeenCalledTimes(2));
+
+    expect(openers.toggleFavoriteMutate.mock.calls.map(([variables]) => variables.currentlyFavorited)).toEqual([
+      false,
+      true,
+    ]);
+    expect(client().getQueryData(queryKey)).toEqual({ favorites: [] });
+    expect(favoriteReads.request).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])('uses owned cold-cache pending intent %s without a stale server read', async (favorited) => {
+    ctrl.database = {};
+    favoriteReads.pendingOverrides.mockResolvedValueOnce(new Map([[climb.uuid, favorited]]));
+    const { result } = renderActions(args);
+
+    act(() => result.current.find((action) => action.id === 'favorite')?.run());
+
+    await waitFor(() =>
+      expect(openers.toggleFavoriteMutate).toHaveBeenCalledWith(
+        expect.objectContaining({ currentlyFavorited: favorited }),
+      ),
+    );
+    expect(favoriteReads.pendingOverrides).toHaveBeenCalledWith(ctrl.database, [climb.uuid], 'user-1');
+    expect(favoriteReads.request).not.toHaveBeenCalled();
+    expect(client().getQueryData(queryKey)).toEqual({ favorites: favorited ? [climb.uuid] : [] });
+  });
+
+  it('loads a cold favorite from the server when no local intent is pending', async () => {
+    ctrl.database = {};
+    favoriteReads.request.mockResolvedValueOnce({ favorites: [climb.uuid] });
+    const { result } = renderActions(args);
+
+    act(() => result.current.find((action) => action.id === 'favorite')?.run());
+
+    await waitFor(() =>
+      expect(openers.toggleFavoriteMutate).toHaveBeenCalledWith(expect.objectContaining({ currentlyFavorited: true })),
+    );
+    expect(favoriteReads.request).toHaveBeenCalledOnce();
+    expect(client().getQueryData(queryKey)).toEqual({ favorites: [climb.uuid] });
+  });
+
+  it.each([true, false])('replaces an existing cold server read with owned pending intent %s', async (favorited) => {
+    ctrl.database = {};
+    favoriteReads.pendingOverrides.mockResolvedValueOnce(new Map([[climb.uuid, favorited]]));
+    let finishExistingRead = (_response: { favorites: string[] }) => {};
+    const existingQueryFn = vi.fn(
+      () =>
+        new Promise<{ favorites: string[] }>((resolve) => {
+          finishExistingRead = resolve;
+        }),
+    );
+    const existingRead = client()
+      .fetchQuery({ queryKey, queryFn: existingQueryFn })
+      .catch(() => undefined);
+    await waitFor(() => expect(existingQueryFn).toHaveBeenCalledOnce());
+    const { result } = renderActions(args);
+
+    act(() => result.current.find((action) => action.id === 'favorite')?.run());
+
+    await waitFor(() =>
+      expect(openers.toggleFavoriteMutate).toHaveBeenCalledWith(
+        expect.objectContaining({ currentlyFavorited: favorited }),
+      ),
+    );
+    expect(favoriteReads.pendingOverrides).toHaveBeenCalledWith(ctrl.database, [climb.uuid], 'user-1');
+    expect(favoriteReads.request).not.toHaveBeenCalled();
+    await act(async () => {
+      finishExistingRead({ favorites: favorited ? [] : [climb.uuid] });
+      await existingRead;
+    });
+    expect(client().getQueryData(queryKey)).toEqual({ favorites: favorited ? [climb.uuid] : [] });
+    expect(openers.toggleFavoriteMutate).toHaveBeenCalledOnce();
+  });
+
+  it('keeps both cold menu toggles while sharing their pending lookup', async () => {
+    let finishRead = (_response: { favorites: string[] }) => {};
+    favoriteReads.request.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    openers.toggleFavoriteMutate.mockImplementation(({ currentlyFavorited }: { currentlyFavorited: boolean }) => {
+      void client().cancelQueries({ queryKey });
+      client().setQueryData(queryKey, { favorites: currentlyFavorited ? [] : [climb.uuid] });
+    });
+    const { result } = renderActions(args);
+    const toggle = () => result.current.find((action) => action.id === 'favorite')?.run();
+
+    act(toggle);
+    await waitFor(() => expect(favoriteReads.request).toHaveBeenCalledOnce());
+    act(toggle);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(favoriteReads.request).toHaveBeenCalledOnce();
+    await act(async () => finishRead({ favorites: [] }));
+
+    await waitFor(() => expect(openers.toggleFavoriteMutate).toHaveBeenCalledTimes(2));
+    expect(openers.toggleFavoriteMutate.mock.calls.map(([variables]) => variables.currentlyFavorited)).toEqual([
+      false,
+      true,
+    ]);
+    expect(client().getQueryData(queryKey)).toEqual({ favorites: [] });
+  });
+
+  it('keeps a newer heart write made while the cold server read is pending', async () => {
+    let finishRead = (_response: { favorites: string[] }) => {};
+    favoriteReads.request.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    const { result } = renderActions(args);
+    act(() => result.current.find((action) => action.id === 'favorite')?.run());
+    await waitFor(() => expect(favoriteReads.request).toHaveBeenCalledOnce());
+
+    void client().cancelQueries({ queryKey });
+    client().setQueryData(queryKey, { favorites: [climb.uuid] });
+    await act(async () => finishRead({ favorites: [] }));
+
+    await waitFor(() =>
+      expect(openers.toggleFavoriteMutate).toHaveBeenCalledWith(expect.objectContaining({ currentlyFavorited: true })),
+    );
+    expect(client().getQueryData(queryKey)).toEqual({ favorites: [climb.uuid] });
+  });
+
+  it('keeps a newer cached write made while pending local intent is being read', async () => {
+    ctrl.database = {};
+    let finishRead = (_overrides: Map<string, boolean>) => {};
+    favoriteReads.pendingOverrides.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    const { result } = renderActions(args);
+    act(() => result.current.find((action) => action.id === 'favorite')?.run());
+    await waitFor(() => expect(favoriteReads.pendingOverrides).toHaveBeenCalledOnce());
+
+    void client().cancelQueries({ queryKey });
+    client().setQueryData(queryKey, { favorites: [climb.uuid] });
+    await act(async () => finishRead(new Map([[climb.uuid, false]])));
+
+    await waitFor(() =>
+      expect(openers.toggleFavoriteMutate).toHaveBeenCalledWith(expect.objectContaining({ currentlyFavorited: true })),
+    );
+    expect(favoriteReads.request).not.toHaveBeenCalled();
+    expect(client().getQueryData(queryKey)).toEqual({ favorites: [climb.uuid] });
+  });
+
+  it('does not request, cache or toggle after credentials change during the outbox read', async () => {
+    ctrl.database = {};
+    let finishRead = (_overrides: Map<string, boolean>) => {};
+    favoriteReads.pendingOverrides.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    const { result } = renderActions(args);
+    act(() => result.current.find((action) => action.id === 'favorite')?.run());
+    await waitFor(() => expect(favoriteReads.pendingOverrides).toHaveBeenCalledOnce());
+
+    ctrl.generation += 1;
+    await act(async () => finishRead(new Map([[climb.uuid, true]])));
+
+    expect(favoriteReads.request).not.toHaveBeenCalled();
+    expect(openers.toggleFavoriteMutate).not.toHaveBeenCalled();
+    expect(client().getQueryData(queryKey)).toBeUndefined();
+  });
+
+  it('does not cache or toggle after credentials change during the server read', async () => {
+    let finishRead = (_response: { favorites: string[] }) => {};
+    favoriteReads.request.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishRead = resolve;
+        }),
+    );
+    const { result } = renderActions(args);
+    act(() => result.current.find((action) => action.id === 'favorite')?.run());
+    await waitFor(() => expect(favoriteReads.request).toHaveBeenCalledOnce());
+
+    ctrl.generation += 1;
+    await act(async () => finishRead({ favorites: [climb.uuid] }));
+
+    expect(openers.toggleFavoriteMutate).not.toHaveBeenCalled();
+    expect(client().getQueryData(queryKey)).toBeUndefined();
+  });
+});
+
+describe('Tick mirror orientation (#6993)', () => {
+  it.each([null, 'crew-session'])('logs the supplied mirrored climb in session %s', (sessionId) => {
+    ctrl.sessionId = sessionId;
+    const { result } = renderActions({
+      climb: { ...climb, mirrored: true },
+      boardConfig: tensionBoard,
+      isAuthenticated: true,
+    });
+    act(() => result.current.find((action) => action.id === 'tick')?.run());
+    expect(openers.openLogAscent).toHaveBeenCalledWith(expect.objectContaining({ isMirror: true }));
+  });
+
+  it('reads the current occurrence at tap time, including an explicit unmirror', () => {
+    ctrl.boardMatches = true;
+    const { result } = renderActions({
+      climb: { ...climb, mirrored: true },
+      boardConfig: tensionBoard,
+      isAuthenticated: true,
+    });
+    ctrl.currentItem = { uuid: 'current-slot', climb: { ...climb, mirrored: false } };
+    act(() => result.current.find((action) => action.id === 'tick')?.run());
+    expect(openers.openLogAscent).toHaveBeenLastCalledWith(expect.objectContaining({ isMirror: false }));
+    ctrl.currentItem = { uuid: 'current-slot', climb: { ...climb, mirrored: true } };
+    act(() => result.current.find((action) => action.id === 'tick')?.run());
+    expect(openers.openLogAscent).toHaveBeenLastCalledWith(expect.objectContaining({ isMirror: true }));
+  });
+
+  it('uses the named history occurrence instead of another current copy', () => {
+    ctrl.boardMatches = true;
+    ctrl.currentItem = { uuid: 'current-slot', climb: { ...climb, mirrored: false } };
+    ctrl.queueItems = [{ uuid: 'history-slot', climb: { ...climb, mirrored: true } }];
+    const { result } = renderActions({
+      climb,
+      boardConfig: tensionBoard,
+      queueItemUuid: 'history-slot',
+      isAuthenticated: true,
+    });
+    act(() => result.current.find((action) => action.id === 'tick')?.run());
+    expect(openers.openLogAscent).toHaveBeenCalledWith(expect.objectContaining({ isMirror: true }));
+  });
+
+  it('does not borrow the current orientation across board configurations', () => {
+    ctrl.currentItem = { uuid: 'current-slot', climb: { ...climb, mirrored: true } };
+    const { result } = renderActions({ climb, boardConfig: tensionBoard, isAuthenticated: true });
+    act(() => result.current.find((action) => action.id === 'tick')?.run());
+    expect(openers.openLogAscent).toHaveBeenCalledWith(expect.objectContaining({ isMirror: false }));
   });
 });

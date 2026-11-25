@@ -1,0 +1,185 @@
+name: Distribute iOS TestFlight to Discord Users
+run-name: TestFlight distribution (${{ inputs.source_run_id || 'hourly check' }})
+
+# The native build dispatches this with its own run ID after a successful
+# upload. Not workflow_run: GitHub sends no workflow_run event for a run that
+# GITHUB_TOKEN started, and Main Native Release starts recovery builds that way,
+# so 2.7.0 builds 11 and 12 never reached Discord Users. The hourly check
+# delivers any newest upload that no run has attempted, and retries deferrals.
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: 'Native TestFlight build run to distribute (no rebuild); waits for it to finish'
+        required: true
+        type: string
+
+# Independent of the native upload lock: Apple processing never holds up builds.
+concurrency:
+  group: ios-testflight-distribution
+  cancel-in-progress: false
+  queue: max
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  reject-untrusted-dispatch:
+    if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Require trusted distribution tooling
+        run: |
+          echo '::error::Dispatch this workflow from main. source_run_id selects the native build from main or release/next.'
+          exit 1
+
+  distribute:
+    if: (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Preparation has 65 minutes, leaving Pilot 45 minutes plus setup and cleanup.
+    timeout-minutes: 120
+    environment: Production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FASTLANE_SKIP_UPDATE_CHECK: '1'
+      FASTLANE_DISABLE_ANIMATION: '1'
+    steps:
+      # The native build dispatches this from one of its last steps, so its run
+      # is usually still finishing. resolve only trusts a completed run. Waiting
+      # comes before the preparation deadline so it never eats the read budget.
+      - name: Wait for the native build run to finish
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            echo '::error::source_run_id must be a positive integer.'
+            exit 1
+          fi
+          for _ in $(seq 1 60); do
+            status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" --jq .status)"
+            if [ "$status" = completed ]; then exit 0; fi
+            sleep 30
+          done
+          echo "::error::Native build run $SOURCE_RUN_ID did not finish within 30 minutes; the hourly check will pick its upload up."
+          exit 1
+      - name: Bound TestFlight preparation across GitHub reads
+        run: echo "TESTFLIGHT_PREPARATION_DEADLINE_MS=$(( $(date +%s) * 1000 + 65 * 60 * 1000 ))" >> "$GITHUB_ENV"
+      # Execute this workflow's trusted tooling, never code extracted from the
+      # build artifact or a branch that may have advanced while Apple processed.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version: '22.x'
+          cache: false
+      - name: Install workspace dependencies
+        run: vp install --frozen-lockfile
+      - name: Select the newest uploaded binary if it was never delivered or was deferred
+        if: github.event_name == 'schedule'
+        id: selection
+        run: vp exec tsx scripts/testflight-distribution.ts select
+      - name: Validate native build run and locate its receipt
+        if: github.event_name != 'schedule' || steps.selection.outputs.selected == 'true'
+        id: source
+        env:
+          SOURCE_RUN_ID: ${{ inputs.source_run_id || steps.selection.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.selection.outputs.source_run_attempt || '' }}
+        run: vp exec tsx scripts/testflight-build.ts resolve --run-id "$SOURCE_RUN_ID"
+      - name: Download exact native build receipt
+        if: steps.source.outputs.should_distribute == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ steps.source.outputs.artifact_id }}
+          run-id: ${{ steps.source.outputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/testflight-receipt
+          merge-multiple: true
+      - name: Verify receipt against the uploaded build and frozen baseline
+        if: steps.source.outputs.should_distribute == 'true'
+        id: build
+        env:
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+        run: >-
+          vp exec tsx scripts/testflight-build.ts validate --run-id "$SOURCE_RUN_ID"
+          --receipt "$RUNNER_TEMP/testflight-receipt/testflight-build.json"
+      - name: Summarize native test plans
+        if: steps.build.outputs.should_distribute == 'true'
+        run: >-
+          vp exec tsx scripts/testflight-notes.ts
+          --receipt "$RUNNER_TEMP/testflight-receipt/testflight-build.json"
+          --output "$RUNNER_TEMP/testflight-notes/what-to-test.txt"
+          --plans-output "$RUNNER_TEMP/testflight-notes/plans.json"
+      - name: Require the live backend schema before tester distribution
+        # Legacy train receipts remain recoverable under their existing policy.
+        # Every new main binary must wait for its live backend schema.
+        if: steps.build.outputs.should_distribute == 'true' && steps.build.outputs.source_ref == 'main'
+        env:
+          GITHUB_SHA: ${{ steps.build.outputs.source_sha }}
+        run: node scripts/mobile-ota-schema-ready.mjs
+      - uses: ruby/setup-ruby@v1
+        if: steps.build.outputs.should_distribute == 'true'
+        with:
+          ruby-version: '3.4'
+          working-directory: fastlane
+      - name: Install fastlane gems
+        if: steps.build.outputs.should_distribute == 'true'
+        working-directory: fastlane
+        run: |
+          bundle config set --local path "$PWD/vendor/bundle"
+          bundle config set --local deployment true
+          bundle install --jobs 4
+      - name: Set up App Store Connect API key
+        if: steps.build.outputs.should_distribute == 'true'
+        env:
+          ASC_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/testflight-auth.p8"
+          umask 077
+          printf '%s' "$ASC_KEY_BASE64" | base64 --decode > "$key_path"
+          test -s "$key_path"
+          echo "ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+      - name: Submit exact build to Discord Users
+        if: steps.build.outputs.should_distribute == 'true'
+        working-directory: fastlane
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          RELEASE_VERSION: ${{ steps.build.outputs.version }}
+          IOS_BUILD_NUMBER: ${{ steps.build.outputs.build_number }}
+          TESTFLIGHT_NOTES_PATH: ${{ runner.temp }}/testflight-notes/what-to-test.txt
+          TESTFLIGHT_DISTRIBUTION_OUTPUT: ${{ runner.temp }}/testflight-lane-result.json
+        run: bundle exec fastlane ios distribute_testflight
+      - name: Record the exact delivery outcome, including terminal failures
+        if: always() && steps.build.outcome == 'success' && steps.build.outputs.should_distribute == 'true'
+        env:
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+          TESTFLIGHT_BUILD_RECEIPT: ${{ runner.temp }}/testflight-receipt/testflight-build.json
+          TESTFLIGHT_DISTRIBUTION_OUTPUT: ${{ runner.temp }}/testflight-lane-result.json
+          TESTFLIGHT_RESULT_OUTPUT: ${{ runner.temp }}/testflight-result/distribution-result.json
+        run: vp exec tsx scripts/testflight-distribution.ts record
+      - name: Retain submitted notes and full native test plans
+        if: always() && steps.source.outputs.should_distribute == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-distribution-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/testflight-notes/
+            ${{ runner.temp }}/testflight-receipt/
+            ${{ runner.temp }}/testflight-result/
+          retention-days: 90
+          if-no-files-found: warn
+      - name: Remove App Store Connect private key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/testflight-auth.p8"

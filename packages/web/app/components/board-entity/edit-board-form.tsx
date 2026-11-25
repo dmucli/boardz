@@ -2,52 +2,30 @@
 
 import React, { useCallback, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import Dialog from '@mui/material/Dialog';
-import DialogTitle from '@mui/material/DialogTitle';
-import DialogContent from '@mui/material/DialogContent';
-import DialogContentText from '@mui/material/DialogContentText';
-import DialogActions from '@mui/material/DialogActions';
-import Button from '@mui/material/Button';
+import { useSession } from 'next-auth/react';
 import { useSnackbar } from '@/app/components/providers/snackbar-provider';
 import { useEntityMutation } from '@/app/hooks/use-entity-mutation';
 import {
   UPDATE_BOARD,
+  ADMIN_UPDATE_BOARD,
+  type AdminUpdateBoardMutationResponse,
   type UpdateBoardMutationVariables,
   type UpdateBoardMutationResponse,
 } from '@boardsesh/graphql/operations';
 import { isBoardLimitError, isDuplicateBoardError, readDuplicateBoardError } from '@boardsesh/graphql/errors';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
 import { track } from '@/app/lib/analytics';
-import type { UserBoard } from '@boardsesh/shared-schema';
+import type { AdminBoard, UserBoard } from '@boardsesh/shared-schema';
 import type { BoardName } from '@/app/lib/types';
 import { ANGLES } from '@/app/lib/board-data';
 import { getBoardSelectorOptions } from '@/app/lib/board-constants';
-import BoardForm, { type BoardFormSubmitState } from './board-form';
-
-/** The values BoardForm hands back on submit. */
-type EditBoardFormValues = {
-  name: string;
-  slug?: string;
-  description: string;
-  locationName: string;
-  latitude?: number | null;
-  longitude?: number | null;
-  isPublic: boolean;
-  isUnlisted: boolean;
-  hideLocation: boolean;
-  isOwned: boolean;
-  angle?: number;
-  isAngleAdjustable?: boolean;
-  hasLeds?: boolean;
-  layoutId?: number;
-  sizeId?: number;
-  setIds?: string;
-  serialNumber?: string;
-};
+import BoardForm, { type BoardFormFieldValues, type BoardFormSubmitState } from './board-form';
+import DuplicateBoardConfigDialog, { type DuplicateBoardConfig } from './duplicate-board-config-dialog';
+import { boardEditPermissions, buildBoardUpdateInput } from './board-edit-input';
 
 type EditBoardFormProps = {
-  board: UserBoard;
-  onSuccess?: (board: UserBoard) => void;
+  onDirtyChange?: (isDirty: boolean) => void;
+  onSavingChange?: (isSaving: boolean) => void;
   onCancel?: () => void;
   /** When hosted in a drawer, the id wired onto the form for a header-hosted submit. */
   formId?: string;
@@ -57,11 +35,18 @@ type EditBoardFormProps = {
    * form, shows the "Edit Board" title and Save button).
    */
   onSubmitStateChange?: (state: BoardFormSubmitState) => void;
-};
+} & (
+  | { mode?: 'standard'; board: UserBoard; onSuccess?: (board: UserBoard) => void }
+  | { mode: 'admin'; board: AdminBoard; onSuccess?: (board: AdminBoard) => void }
+);
 
-export default function EditBoardForm({ board, onSuccess, onCancel, formId, onSubmitStateChange }: EditBoardFormProps) {
+export default function EditBoardForm(props: EditBoardFormProps) {
+  const { board, onCancel, formId, onSubmitStateChange, onDirtyChange, onSavingChange } = props;
   const { t } = useTranslation('boards');
   const { showMessage } = useSnackbar();
+  const { data: session } = useSession();
+  const permissions = boardEditPermissions(board, session?.user?.id ?? null);
+  const [isSaving, setIsSaving] = useState(false);
 
   const availableAngles = ANGLES[board.boardType as BoardName] ?? [];
 
@@ -76,9 +61,9 @@ export default function EditBoardForm({ board, onSuccess, onCancel, formId, onSu
   // once the exit animation actually finishes. Clearing both at once (the
   // original approach) let MUI re-render the closing dialog's body against
   // `duplicate === null` mid-fade, flashing the generic fallback copy.
-  const [duplicate, setDuplicate] = useState<{ name: string | null; locationName: string | null } | null>(null);
+  const [duplicate, setDuplicate] = useState<DuplicateBoardConfig | null>(null);
   const [duplicateDialogOpen, setDuplicateDialogOpen] = useState(false);
-  const lastValuesRef = useRef<EditBoardFormValues | null>(null);
+  const lastValuesRef = useRef<BoardFormFieldValues | null>(null);
   // `runUpdate` fires from two places — the drawer's Save button and the
   // duplicate dialog's "Save anyway" retry — and neither is disabled while the
   // other is in flight. A double-click on "Save anyway" during the dialog's
@@ -115,13 +100,16 @@ export default function EditBoardForm({ board, onSuccess, onCancel, formId, onSu
     [board.boardType, showMessage, t],
   );
 
-  const { execute } = useEntityMutation<UpdateBoardMutationResponse, UpdateBoardMutationVariables>(UPDATE_BOARD, {
+  const { execute } = useEntityMutation<
+    UpdateBoardMutationResponse | AdminUpdateBoardMutationResponse,
+    UpdateBoardMutationVariables
+  >(props.mode === 'admin' ? ADMIN_UPDATE_BOARD : UPDATE_BOARD, {
     successMessage: t('editBoard.snackbar.updated'),
     onError: handleUpdateError,
   });
 
   const configEditable = useMemo(() => {
-    if (!board.canEdit) return undefined;
+    if (!board.canEdit || board.boardType === 'spray') return undefined;
     const options = getBoardSelectorOptions();
     const boardType = board.boardType as BoardName;
     const layouts = options.layouts[boardType] ?? [];
@@ -130,50 +118,34 @@ export default function EditBoardForm({ board, onSuccess, onCancel, formId, onSu
   }, [board.canEdit, board.boardType]);
 
   const runUpdate = useCallback(
-    async (values: EditBoardFormValues, allowDuplicateConfig?: boolean) => {
+    async (fields: BoardFormFieldValues, allowDuplicateConfig?: boolean) => {
       if (inFlightRef.current) return;
+      const input = buildBoardUpdateInput(board, fields, permissions);
+      if (Object.keys(input).length === 1) return;
+      if (allowDuplicateConfig) input.allowDuplicateConfig = true;
       inFlightRef.current = true;
+      setIsSaving(true);
+      onSavingChange?.(true);
       try {
-        const data = await execute({
-          input: {
-            boardUuid: board.uuid,
-            name: values.name,
-            slug: values.slug || undefined,
-            description: values.description || undefined,
-            locationName: values.locationName || undefined,
-            latitude: values.latitude ?? undefined,
-            longitude: values.longitude ?? undefined,
-            isPublic: values.isPublic,
-            isUnlisted: values.isUnlisted,
-            hideLocation: values.hideLocation,
-            isOwned: values.isOwned,
-            angle: values.angle,
-            isAngleAdjustable: values.isAngleAdjustable,
-            hasLeds: values.hasLeds,
-            ...(configEditable
-              ? {
-                  layoutId: values.layoutId,
-                  sizeId: values.sizeId,
-                  setIds: values.setIds,
-                }
-              : {}),
-            serialNumber: values.serialNumber,
-            allowDuplicateConfig,
-          },
-        });
-
-        if (data) {
-          onSuccess?.(data.updateBoard);
+        const result = await execute({ input });
+        if (result) {
+          if (props.mode === 'admin' && 'adminUpdateBoard' in result) {
+            props.onSuccess?.(result.adminUpdateBoard);
+          } else if (props.mode !== 'admin' && 'updateBoard' in result) {
+            props.onSuccess?.(result.updateBoard);
+          }
         }
       } finally {
         inFlightRef.current = false;
+        setIsSaving(false);
+        onSavingChange?.(false);
       }
     },
-    [execute, board.uuid, onSuccess, configEditable],
+    [execute, board, permissions, props, onSavingChange],
   );
 
   const handleSubmit = useCallback(
-    async (values: EditBoardFormValues) => {
+    async (values: BoardFormFieldValues) => {
       if (!values.name) {
         showMessage(t('boardForm.create.nameRequired'), 'error');
         return;
@@ -213,6 +185,7 @@ export default function EditBoardForm({ board, onSuccess, onCancel, formId, onSu
           angle: board.angle,
           isAngleAdjustable: board.isAngleAdjustable,
           hasLeds: board.hasLeds,
+          litByWallDevice: board.litByWallDevice,
           layoutId: board.layoutId,
           sizeId: board.sizeId,
           setIds: board.setIds,
@@ -225,37 +198,22 @@ export default function EditBoardForm({ board, onSuccess, onCancel, formId, onSu
         onCancel={onCancel}
         formId={formId}
         onSubmitStateChange={onSubmitStateChange}
+        onDirtyChange={onDirtyChange}
+        requireChanges
+        permissions={permissions}
+        saving={isSaving}
       />
       {/* A dialog, not a snackbar: this is a choice, and the snackbar's single
           action slot can't carry one. Before this the guard was a flat
           "Failed to update board" with no way past it. */}
-      <Dialog
+      <DuplicateBoardConfigDialog
         open={duplicateDialogOpen}
+        duplicate={duplicate}
+        saving={isSaving}
         onClose={() => setDuplicateDialogOpen(false)}
-        TransitionProps={{ onExited: () => setDuplicate(null) }}
-        maxWidth="xs"
-        fullWidth
-      >
-        <DialogTitle>{t('boardForm.edit.duplicateTitle')}</DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            {duplicate?.name && duplicate.locationName
-              ? t('boardForm.edit.duplicateBodyWithLocation', {
-                  name: duplicate.name,
-                  location: duplicate.locationName,
-                })
-              : duplicate?.name
-                ? t('boardForm.edit.duplicateBody', { name: duplicate.name })
-                : t('boardForm.edit.duplicateBodyGeneric')}
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setDuplicateDialogOpen(false)}>{t('boardForm.edit.cancel')}</Button>
-          <Button onClick={() => void handleSaveAnyway()} variant="contained">
-            {t('boardForm.edit.saveAnyway')}
-          </Button>
-        </DialogActions>
-      </Dialog>
+        onSaveAnyway={() => void handleSaveAnyway()}
+        onExited={() => setDuplicate(null)}
+      />
     </>
   );
 }

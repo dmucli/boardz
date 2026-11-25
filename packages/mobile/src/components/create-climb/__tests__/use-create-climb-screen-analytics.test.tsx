@@ -19,7 +19,7 @@ const board = vi.hoisted(() => ({
 }));
 
 const toast = vi.hoisted(() => ({ showToast: vi.fn() }));
-const queue = vi.hoisted(() => ({ setCurrentClimb: vi.fn() }));
+const queue = vi.hoisted(() => ({ setCurrentClimb: vi.fn(), refreshAuthoredClimb: vi.fn() }));
 const router = vi.hoisted(() => ({ push: vi.fn() }));
 
 // Edit mode seeds a savedClimb from `useClimb`; when set, the save flow takes
@@ -111,7 +111,10 @@ vi.mock('../../../lib/graphql/hooks', () => ({
   useClimb: () => ({ data: editClimb.data }),
 }));
 vi.mock('../../../providers/queue-provider', () => ({
-  useQueueActions: () => ({ setCurrentClimb: queue.setCurrentClimb }),
+  useQueueActions: () => ({
+    setCurrentClimb: queue.setCurrentClimb,
+    refreshAuthoredClimb: queue.refreshAuthoredClimb,
+  }),
 }));
 vi.mock('../../../providers/bluetooth-provider', () => ({
   useOptionalBluetoothContext: () => null,
@@ -170,7 +173,7 @@ beforeEach(() => {
   toast.showToast.mockClear();
   queue.setCurrentClimb.mockClear();
   router.push.mockClear();
-  reactQuery.invalidateQueries.mockClear();
+  reactQuery.invalidateQueries.mockReset();
   board.isAuthenticated = true;
   board.isDuplicateClimbError.mockReturnValue(false);
   board.saveClimb.mockReset();
@@ -191,20 +194,49 @@ describe('useCreateClimbScreen analytics', () => {
     await nameAndSave(result);
 
     expect(board.saveClimb).toHaveBeenCalledTimes(1);
-    // Same schema AND values as web's `Climb Created` (create-climb-form.tsx):
-    // { boardLayout: <resolved layout name>, isDraft, holdCount }.
+    // Web's `Climb Created` schema and values (create-climb-form.tsx):
+    // { boardLayout: <resolved layout name>, isDraft, holdCount }, plus the
+    // board type, which is what tells a spray wall's climb from any other.
     expect(analytics.track).toHaveBeenCalledWith('Climb Created', {
       boardLayout: EXPECTED_BOARD_LAYOUT,
+      boardType: 'kilter',
       isDraft: true,
       holdCount: 3,
     });
     expect(analytics.track).not.toHaveBeenCalledWith('Climb Create Failed', expect.anything());
+    // The save queues the climb, which fires `Set Active Climb`. It is marked
+    // as a save so that event still means "a climber chose this climb" (#6027).
+    expect(queue.setCurrentClimb).toHaveBeenCalledWith(expect.anything(), { trigger: 'climb_saved' });
     // #3471: create/edit/publish share one success path with useDeleteDraftClimb's
     // key set — the Open Drafts table AND the Climbs tab's infinite list must both
     // refresh, not just the plain searchClimbs cache.
     expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['searchClimbs'] });
     expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['infiniteSearchClimbs'] });
     expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['searchClimbsCount'] });
+    expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['userClimbs'] });
+    expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['smartPlaylist', 'CREATED_CLIMBS'] });
+    expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['mySmartPlaylistCounts'] });
+  });
+
+  it('refreshes created climbs after publishing', async () => {
+    board.saveClimb.mockResolvedValue({ uuid: 'published-climb', isDraft: false });
+    const { result } = renderScreen();
+    act(() => result.current.setIsDraft(false));
+    await nameAndSave(result);
+
+    expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['userClimbs'] });
+  });
+
+  it('keeps a successful save successful when refreshing created climbs fails', async () => {
+    board.saveClimb.mockResolvedValue({ uuid: 'published-climb', isDraft: false });
+    reactQuery.invalidateQueries.mockImplementation(({ queryKey }: { queryKey: string[] }) =>
+      queryKey[0] === 'userClimbs' ? Promise.reject(new Error('refresh failed')) : undefined,
+    );
+    const { result } = renderScreen();
+    await nameAndSave(result);
+
+    expect(result.current.saveState).toBe('justSaved');
+    expect(analytics.track).not.toHaveBeenCalledWith('Climb Create Failed', expect.anything());
   });
 
   it("seeds noKickboard/campus from an existing climb's characteristics in edit mode", async () => {
@@ -261,6 +293,9 @@ describe('useCreateClimbScreen analytics', () => {
     expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['searchClimbs'] });
     expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['infiniteSearchClimbs'] });
     expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['searchClimbsCount'] });
+    expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['userClimbs'] });
+    expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['smartPlaylist', 'CREATED_CLIMBS'] });
+    expect(reactQuery.invalidateQueries).toHaveBeenCalledWith({ queryKey: ['mySmartPlaylistCounts'] });
   });
 
   it('fires "Climb Create Failed" with error_reason "duplicate" on a duplicate rejection', async () => {
@@ -295,5 +330,6 @@ describe('useCreateClimbScreen analytics', () => {
     );
     // The generic-error branch surfaces a fallback toast (duplicate does not).
     expect(toast.showToast).toHaveBeenCalledWith('createClimbForm.alerts.saveFailedFallback', 'error');
+    expect(reactQuery.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ['userClimbs'] });
   });
 });

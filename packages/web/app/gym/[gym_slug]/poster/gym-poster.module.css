@@ -1,8 +1,9 @@
-/* Print sheet for the per-gym QR poster (#4379).
+/* Print sheet for the per-gym QR poster (#4379). The paper margin (`@page`),
+ * the screen wrapper and the screen-only bar are shared with the board poster
+ * and live in `components/poster/poster-sheet.module.css`.
  *
- * WHY A STYLESHEET AND NOT `sx`: `@page` is a top-level at-rule — it cannot be
- * expressed through MUI's `sx`, and the print rules below have to sit next to
- * the screen rules they override or the two drift. Same call the kiosk made for
+ * WHY A STYLESHEET AND NOT `sx`: the print rules below have to sit next to the
+ * screen rules they override or the two drift. Same call the kiosk made for
  * its install-QR tile.
  *
  * HARDCODED COLOURS ARE THE DOCUMENTED PRINT EXCEPTION (the theme-token rule
@@ -13,27 +14,9 @@
  * the same reason. What you see on screen is what comes out of the printer.
  */
 
-/* `auto`, deliberately NOT `A4`. A fixed `size: A4` clips on US Letter (216 mm
- * wide, so the driver shrinks or crops), and a fixed `size: letter` letterboxes
- * A4. `auto` prints on whatever paper is loaded; the sheet below is bounded to
- * the INTERSECTION of the two sizes so the identical layout fits either. */
-@page {
-  size: auto;
-  margin: 12mm;
-}
-
-.page {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: var(--spacing-4);
-  padding: var(--spacing-6) var(--spacing-4);
-  min-height: 100dvh;
-}
-
 .sheet {
   /* A4 is the narrower paper (210 mm) and US Letter the shorter (279.4 mm), so
-   * the printable box common to both, at the 12 mm @page margin above, is
+   * the printable box common to both, at the 12 mm @page margin (`poster-sheet.module.css`), is
    * 186 mm × 255.4 mm.
    *
    * WIDTH is enforced here by `max-width`. HEIGHT cannot be — a `max-height`
@@ -147,28 +130,7 @@
   letter-spacing: 0.02em;
 }
 
-/* The screen-only bar: the print button that opens the browser dialog, and the
- * way back to the gym page. Neither means anything on paper — @media print
- * below removes it. */
-.noPrint {
-  display: flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: var(--spacing-2);
-}
-
 @media print {
-  .page {
-    display: block;
-    padding: 0;
-    min-height: 0;
-    background: #ffffff;
-  }
-
-  .noPrint {
-    display: none;
-  }
-
   .sheet {
     /* Force the ink even where the browser would inherit a dark theme, and keep
      * the paper white when "background graphics" is off (its default) — the QR

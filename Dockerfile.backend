@@ -18,9 +18,11 @@ WORKDIR /app
 # The set is sized against what real climb names contain, not against a guess.
 # Sampling the live catalogue found Japanese katakana, Chinese, emoji and
 # symbol-only names among the 157-in-40,000 whose slug transliterates to
-# nothing. font-noto covers Latin, Cyrillic, Greek and Arabic; wqy-zenhei covers
-# CJK at 27 MB where font-noto-cjk costs 90 MB for a visually identical result.
-RUN apk add --no-cache fontconfig font-noto font-noto-emoji font-noto-hebrew font-wqy-zenhei
+# nothing. font-noto covers Latin, Cyrillic and Greek; font-noto-arabic adds 18 MB
+# because Alpine's font-noto has no Arabic and those names drew as empty boxes.
+# wqy-zenhei covers CJK at 27 MB where font-noto-cjk costs 90 MB for a visually
+# identical result.
+RUN apk add --no-cache fontconfig font-noto font-noto-arabic font-noto-emoji font-noto-hebrew font-wqy-zenhei
 
 # pnpm, pinned to package.json's `packageManager` field. npm is already in the
 # base image; avoiding corepack also avoids its independently pinned signing
@@ -38,6 +40,7 @@ COPY manifests/package.json manifests/pnpm-lock.yaml manifests/pnpm-workspace.ya
 # fetch: pnpm resolves patch hashes from the lockfile and needs the files.
 COPY manifests/patches ./patches
 COPY manifests/packages/db/patches ./packages/db/patches
+COPY manifests/packages/web/patches ./packages/web/patches
 
 # --- the NETWORK layer -------------------------------------------------------
 # `pnpm fetch` populates the store from the LOCKFILE ALONE, so this layer's

@@ -3,6 +3,9 @@ export const mutationsTypeDefs = /* GraphQL */ `
   Root mutation type for all write operations.
   """
   type Mutation {
+    requestCncLayout(config: CncBoardConfigInput!, includeHoles: Boolean): CncComputation!
+    requestCncArtworkValidation(config: CncBoardConfigInput!): CncComputation!
+
     """
     Join an existing session or create it if it doesn't exist.
     Returns the session with current state.
@@ -16,6 +19,8 @@ export const mutationsTypeDefs = /* GraphQL */ `
       initialQueue: [ClimbQueueItemInput!]
       initialCurrentClimb: ClimbQueueItemInput
       sessionName: String
+      "Entries of initialQueue before Up next when no seed climb is current in it (F3). Ignored when initialCurrentClimb is in initialQueue."
+      initialHistoryCount: Int
     ): Session!
 
     """
@@ -66,8 +71,15 @@ export const mutationsTypeDefs = /* GraphQL */ `
     """
     Set the currently displayed climb.
     Optionally adds it to the queue if not already present.
+    \`placement\` (F3) marks a client that puts the climb in the Now slot instead of copying it;
+    omit it for the shipped behaviour.
     """
-    setCurrentClimb(item: ClimbQueueItemInput, shouldAddToQueue: Boolean, correlationId: ID): ClimbQueueItem
+    setCurrentClimb(
+      item: ClimbQueueItemInput
+      shouldAddToQueue: Boolean
+      correlationId: ID
+      placement: CurrentClimbPlacement
+    ): ClimbQueueItem
 
     """
     Toggle mirrored display for the current climb.
@@ -96,11 +108,16 @@ export const mutationsTypeDefs = /* GraphQL */ `
     that point and re-appends any climb a peer added inside the window instead of
     silently overwriting it (issue #3933). Omit it for the historical wholesale
     overwrite — old clients send nothing here.
+
+    \`historyCount\` (F3) is the number of \`queue\` entries before Up next when no climb is
+    current in \`queue\`. Ignored when the current climb is in \`queue\`. Omit it to have the
+    server derive the line from the stored History.
     """
     setQueue(
       queue: [ClimbQueueItemInput!]!
       currentClimbQueueItem: ClimbQueueItemInput
       baselineSequence: Int
+      historyCount: Int
     ): QueueState!
 
     """
@@ -151,6 +168,17 @@ export const mutationsTypeDefs = /* GraphQL */ `
     """
     setSessionBoardPath(boardPath: String!): Session!
 
+    """
+    Change the session's shared rest clock (#5382). Any session participant may
+    call. The server stamps every instant, records the caller as
+    \`setByParticipantId\` on ARM and CONFIGURE, and publishes
+    \`SessionRestCadenceChanged\` to every member only when the call applied.
+    FIRE is compare-and-set on \`expectedRevision\`, so exactly one phone can
+    claim each beat. Session identity is resolved from the WebSocket connection
+    context — no \`sessionId\` argument is required.
+    """
+    setSessionRestCadence(input: SessionRestCadenceInput!): SetSessionRestCadencePayload!
+
     # ============================================
     # Board Presence Mutations ("now on the wall")
     # ============================================
@@ -168,6 +196,9 @@ export const mutationsTypeDefs = /* GraphQL */ `
     board app, so the same serial exists on controllers of different types; pass
     it and only boards of that type are candidates. Optional — clients shipped
     before this existed keep the old type-blind resolution.
+    \`selectedBoardUuid\` is the board the caller already has selected (map
+    finder / board picker); when it matches the connected config it wins over
+    serial matching — see \`resolveBoardCandidatesForSerial\`.
     """
     resolveBoardForSerial(
       serial: String!
@@ -176,6 +207,7 @@ export const mutationsTypeDefs = /* GraphQL */ `
       sizeId: Int!
       setIds: String!
       advertisedBoardType: String
+      selectedBoardUuid: ID
     ): ResolvedBoard!
 
     """
@@ -191,6 +223,12 @@ export const mutationsTypeDefs = /* GraphQL */ `
     board app, so the same serial exists on controllers of different types; pass
     it and only boards of that type are candidates. Optional — clients shipped
     before this existed keep the old type-blind resolution.
+    Pass \`selectedBoardUuid\` when the caller already has a board selected (map
+    finder / board picker). A selection whose config matches the connected
+    controller wins over serial matching, so a Bluetooth connect never silently
+    moves you off the wall you picked. If that board carries no serial yet, the
+    connect claims this one for it, which is how a synced gym board becomes
+    discoverable by serial for everyone after you.
     """
     resolveBoardCandidatesForSerial(
       serial: String!
@@ -199,6 +237,7 @@ export const mutationsTypeDefs = /* GraphQL */ `
       sizeId: Int!
       setIds: String!
       advertisedBoardType: String
+      selectedBoardUuid: ID
     ): ResolveBoardResult!
 
     """
@@ -241,6 +280,16 @@ export const mutationsTypeDefs = /* GraphQL */ `
     someone else now holds it. Auth-optional. Returns whether the slot was freed.
     """
     reportBoardDisconnect(boardId: Int!): Boolean!
+
+    """
+    Report that this client turned off every light on \`boardId\` while keeping its
+    BLE link (the "Turn off all lights" action). Publishes \`BoardClimbCleared\` so
+    every viewer stops showing the cleared climb as lit, and keeps the clear for a
+    week so a late subscriber sees it too. Requires board membership, and is refused
+    when another emitter holds the board. History is untouched. Auth-optional.
+    Returns whether the clear was accepted.
+    """
+    reportBoardClear(boardId: Int!): Boolean!
 
     # ============================================
     # User Management Mutations (require auth)
@@ -357,6 +406,16 @@ export const mutationsTypeDefs = /* GraphQL */ `
     """
     deleteDraftClimb(uuid: ID!, boardType: String!): Boolean!
 
+    """
+    Delete one of the current user's spray wall climbs, published or not, while
+    nobody (the setter included) has logged it. Refused with CLIMB_HAS_TICKS once
+    a tick exists, CLIMB_NOT_FOUND for a climb that is missing or not the
+    caller's, CLIMB_DELETE_NOT_ALLOWED off spray, and SPRAY_WALL_ARCHIVED on an
+    archived wall. Removes the climb's comments, proposals, votes, feed rows and
+    notifications, and other climbers' favourites and playlist entries.
+    """
+    deleteClimb(uuid: ID!, boardType: String!): Boolean!
+
     # ============================================
     # Playlist Mutations (require auth)
     # ============================================
@@ -409,7 +468,9 @@ export const mutationsTypeDefs = /* GraphQL */ `
     # ============================================
 
     """
-    Follow a user. Idempotent (no error if already following).
+    Follow a user. Idempotent (no error if already following). Returns true when
+    the caller now follows the user, false when the account is private and only
+    a follow request was left for its owner to approve.
     """
     followUser(input: FollowInput!): Boolean!
 
@@ -474,8 +535,14 @@ export const mutationsTypeDefs = /* GraphQL */ `
     """
     updateBoard(input: UpdateBoardInput!): UserBoard!
 
+    "Edit active board metadata as a global admin; privacy and credentials remain owner-only."
+    adminUpdateBoard(input: UpdateBoardInput!): AdminBoard!
+
     """
-    Soft-delete a board.
+    Soft-delete a board. Allowed for its owner; for the owner or an admin of its
+    linked gym on a synced (system-owned) board only; and for a global admin. A
+    non-owner must also be able to read the board. Gym staff take a climber's
+    board off their listing with detachBoardFromGym instead. See UserBoard.canDelete.
     """
     deleteBoard(boardUuid: ID!): Boolean!
 
@@ -528,6 +595,9 @@ export const mutationsTypeDefs = /* GraphQL */ `
     Update a gym's metadata.
     """
     updateGym(input: UpdateGymInput!): Gym!
+    setGymReportingTimeZone(input: SetGymReportingTimeZoneInput!): Boolean!
+    setGymReportingBoardAlias(input: SetGymReportingBoardAliasInput!): Boolean!
+    setGymGradeCollection(input: SetGymGradeCollectionInput!): Boolean!
 
     """
     Soft-delete a gym.
@@ -558,7 +628,9 @@ export const mutationsTypeDefs = /* GraphQL */ `
     Link or unlink a board you own to/from a gym. Unlinking is always yours to
     do. Linking needs either owner/admin rights on the gym, or — so a climber can
     list their board at the gym they actually climb at — a public gym within
-    150 m of the board's coordinates, subject to a per-caller cap.
+    150 m of the board's coordinates, subject to a per-caller cap. A board the
+    gym's staff took off their listing can't be self-linked back to that gym
+    (error code BOARD_REMOVED_BY_GYM) until the gym's staff put it back.
     """
     linkBoardToGym(input: LinkBoardToGymInput!): Boolean!
 
@@ -566,14 +638,19 @@ export const mutationsTypeDefs = /* GraphQL */ `
     Attach a stray board (surfaced by strayBoardsForGym) to a gym in one tap.
     Re-points the board's gym_id to this gym. The caller need not own the board;
     the gate is edit access to the target gym, and the board must be a genuine
-    stray candidate for it (a merged-twin board or a nearby unlinked/SYSTEM one).
+    stray candidate for it (a merged-twin board or a nearby unlinked/SYSTEM one),
+    or a still-unlinked board this gym's staff removed, which this puts back.
     """
     attachBoardToGym(input: AttachBoardToGymInput!): Boolean!
 
     """
     Remove a board from this gym's listing. Gated on edit access to the gym, and
-    the board must currently be listed at it. Lets gym staff undo an unwanted
-    self-link; clears gym_id only, leaving the board with its owner.
+    the board must currently be listed at it. Gym staff's tool for a climber's
+    board: clears gym_id and freezes the board against the location sync,
+    leaving the board with its owner. A removal by staff stops the owner
+    self-linking it back to this gym. A synced (system-owned) board is refused
+    with SYSTEM_BOARD_DELETE_INSTEAD unless the caller is a global admin: the
+    gym's owner or admin deletes it instead. See UserBoard.canRemoveFromGym.
     """
     detachBoardFromGym(input: DetachBoardFromGymInput!): Boolean!
 
@@ -603,6 +680,17 @@ export const mutationsTypeDefs = /* GraphQL */ `
     ownership to the claimant.
     """
     reviewGymClaim(input: ReviewGymClaimInput!): Boolean!
+
+    """
+    Take back an approved gym claim (global admin only): the gym goes back to
+    the SYSTEM account, every approved claim on it becomes \`revoked\`, the sync
+    freeze set at approval is cleared so the location sync curates the listing
+    again, and the claimant plus every gym member or editor added since the
+    claim lose their membership. Only for a claim that took the gym from the
+    SYSTEM account when nobody has moved it since; anything else is refused, and
+    reassignGymOwner is the tool for it.
+    """
+    revertGymClaim(input: RevertGymClaimInput!): RevertGymClaimResult!
 
     """
     Fold one or more duplicate gyms into a canonical survivor (admin only). Every
@@ -666,6 +754,19 @@ export const mutationsTypeDefs = /* GraphQL */ `
     createSprayWall(input: CreateSprayWallInput!): SprayWall!
 
     """
+    Start a reset of a wall by cloning it. The clone copies the wall's settings
+    (name, description, angle, gym, location, look, climb edit policy and
+    visibility) and nothing else: the owner takes a new photo and marks the holds
+    from scratch, and the clone's first publish archives the old wall. Calling it
+    again before that publish returns the same unfinished clone.
+
+    The wall's owner only. Refused on a wall with nothing published, and on an
+    archived wall. Capped at \`MAX_ARCHIVED_SPRAY_WALLS_PER_USER\` archived walls
+    per owner; the clone does not count toward \`MAX_SPRAY_WALLS_PER_USER\`.
+    """
+    resetSprayWall(input: ResetSprayWallInput!): SprayWall!
+
+    """
     Rename a wall, change its description, share it, attach it to a gym, or correct
     its angle. Owner only (through the same gate as every other wall mutation).
 
@@ -673,6 +774,22 @@ export const mutationsTypeDefs = /* GraphQL */ `
     default, because a wall is somebody's home — could never be shown to anybody.
     """
     updateSprayWall(input: UpdateSprayWallInput!): SprayWall!
+
+    """
+    Store the wall's default look — the one a climber who has never picked a
+    render mode sees — or clear it with \`renderSettings: null\`. Same edit gate as
+    \`updateSprayWall\`: the owner, a gym owner/admin, or a community leader on a
+    public wall. The blob is validated against the board-look knob set; \`mode\`
+    must be \`classic\` or \`aura\`.
+    """
+    setSprayWallRenderSettings(input: SetSprayWallRenderSettingsInput!): SprayWall!
+
+    """
+    Save part of a spray wall's LED setup. Owner only: this value reaches every
+    climber's phone at the wall. Refuses an address that is not on a local network
+    and a layout outside the shared caps.
+    """
+    saveSprayWallLedSetup(input: SaveSprayWallLedSetupInput!): SprayWallLedSetup!
 
     """
     Attach a photo to the wall as a new DRAFT version, and compute its
@@ -714,6 +831,7 @@ export const mutationsTypeDefs = /* GraphQL */ `
     Intact / Lost holds filter and the remix prompt agree. Owner only.
     """
     commitSprayWallVersion(input: CommitSprayWallVersionInput!): SprayWallResetResult!
+      @deprecated(reason: "Only a wall's first publish still works here. Use publishSprayWallVersion.")
 
     """
     Publish a draft version: it becomes the generation climbers set against, the
@@ -736,7 +854,8 @@ export const mutationsTypeDefs = /* GraphQL */ `
     """
     Soft-delete a wall. The catalogue rows and every climb ever set on it stay
     behind — a deleted wall stops being reachable, it does not un-set the climbs.
-    Owner only.
+    The same gate as deleteBoard: the wall's owner, the owner or an admin of its
+    gym on a system-owned wall, or a global admin, who must be able to read it.
     """
     deleteSprayWall(uuid: ID!): Boolean!
 
@@ -821,6 +940,15 @@ export const mutationsTypeDefs = /* GraphQL */ `
     # Notification Mutations (require auth)
     # ============================================
 
+    """
+    Register this installation's Expo push token for the signed-in account. The
+    registration lasts until the credential expires (24 hours at most).
+    """
+    registerNotificationDevice(input: RegisterNotificationDeviceInput!): Boolean!
+    """
+    Stop pushes to this installation for the signed-in account.
+    """
+    unregisterNotificationDevice(installationId: String!): Boolean!
     """
     Mark a notification as read.
     """
@@ -969,6 +1097,8 @@ export const mutationsTypeDefs = /* GraphQL */ `
     only. Moving to \`resolved\`/\`wont_fix\` stamps the resolver + timestamp;
     moving back to \`new\`/\`in_progress\` clears them. Returns the updated row.
     """
+    retryAppBugReportMessage(id: ID!): AppBugReportMessage!
+    sendAppBugReportMessage(input: SendAppBugReportMessageInput!): AppBugReportMessage!
     updateAppFeedbackStatus(input: UpdateAppFeedbackStatusInput!): AppFeedbackReport!
 
     """
@@ -1011,5 +1141,71 @@ export const mutationsTypeDefs = /* GraphQL */ `
     Caller must be a participant of the session. Requires authentication.
     """
     syncSessionToIntegration(provider: IntegrationProvider!, sessionId: ID!): IntegrationExportResult!
+
+    """
+    Ask the pack generator whether a configuration's artwork actually fits:
+    inside its panel, clear of every hole keep-out, not crossing a seam.
+
+    A mutation rather than a query because it is the authoritative verdict the
+    placement editor debounces against while the buyer drags — it is a call
+    out to the generator, not a cacheable read. Requires authentication.
+    """
+    validateCncArtwork(config: CncBoardConfigInput!): CncArtworkValidation!
+
+    """
+    Generate a free, watermarked preview of a configuration.
+
+    Nothing is charged and nothing is licensed: the order comes back in
+    \`preview_queued\`, and its \`previewImages\` fill in once the generator is
+    done. Asking again for a configuration this buyer has already previewed
+    returns THAT order rather than queueing a second job — the configuration's
+    \`configHash\` is the identity. Change anything and this writes a new order;
+    a preview is an immutable snapshot of one configuration.
+
+    Four previews per hour per buyer. Throws \`RATE_LIMITED\` past that, and
+    \`CNC_INVALID_CONFIG\` for a wall that is not on sale, an option out of
+    range or artwork that will not fit.
+
+    Requires authentication.
+    """
+    createCncPreview(config: CncBoardConfigInput!): CncOrder!
+
+    """
+    Buy a previewed order: attach the licence and open Stripe Checkout for it.
+
+    The order must be the caller's own and in \`preview_ready\` — this is the
+    only way a build pack is ever paid for, so nothing can be bought that was
+    not previewed first. It takes the tier, the licensee and the acceptance,
+    moves to \`pending_payment\` and returns the hosted page to send the buyer
+    to; nothing is queued for generation until Stripe confirms the charge. If
+    Stripe will not open a session the order goes back to \`preview_ready\` and
+    this throws \`CNC_CHECKOUT_UNAVAILABLE\`. The returned session expires 31
+    minutes after it is created.
+
+    Requires authentication.
+    """
+    finaliseCncOrder(input: FinaliseCncOrderInput!): CncCheckoutSession!
+
+    """
+    Mint a five-minute link to your own build pack, or to its free preview.
+
+    Throws \`NOT_FOUND\` for a licence that does not exist and for one belonging
+    to someone else, identically — a licence id identifies an order, it never
+    grants access to one. Throws \`CNC_PACK_NOT_DOWNLOADABLE\` when that
+    deliverable is not available yet or the order was refunded: \`FULL\` needs
+    \`ready\`, \`PREVIEW\` needs \`preview_ready\` or anything after it.
+
+    Requires authentication.
+    """
+    createCncDownloadGrant(licenceId: String!, kind: CncDownloadKind = FULL): CncDownloadGrant!
+
+    """
+    Rebuild a pack from scratch: back to \`queued\` with the generation counter
+    bumped, the same licence id and the same output key, so the new zip replaces
+    the old one instead of issuing a second licensed copy.
+
+    Allowed from \`ready\` and \`failed\` only. Requires an admin.
+    """
+    regenerateCncPack(licenceId: String!): CncOrder!
   }
 `;

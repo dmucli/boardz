@@ -1,12 +1,15 @@
-import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, Platform, ScrollView, StyleSheet, View } from 'react-native';
+import { useTypographyStyles, type TypographyScale } from '../../hooks/use-typography-styles';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Platform, StyleSheet, View, useWindowDimensions } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import { Text } from '../Text';
-import { Button } from '../Button';
+import { MoreForm } from '../MoreForm';
+import { MoreFormRN } from '../MoreForm.rn';
 import { useTheme } from '../../providers/theme-provider';
 import { useToast } from '../../providers/toast-provider';
-import { borderRadius, spacing } from '../../theme/tokens';
+import { withSettingTracking } from '../../lib/settings-analytics';
 import { remainingSeconds, requestWatchPairingCode, type WatchPairingCode } from '../../lib/watch-pairing';
+import { WATCH_PAIR_CODE_TEXT_FIT, buildWatchPairModel, watchPairCodeHeight } from './watch-pair-model';
 
 /**
  * "Pair a Garmin watch" — request a short code from the backend, show it big and
@@ -16,9 +19,13 @@ import { remainingSeconds, requestWatchPairingCode, type WatchPairingCode } from
  * bearer via `authenticatedFetch`.
  */
 export function WatchPairScreen() {
+  const styles = useTypographyStyles(createStyles);
   const { t } = useTranslation('settings');
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors, textStyles } = useTheme();
   const { showToast } = useToast();
+  // The code row is pinned in points by the native form before React Native lays
+  // it out, so its height follows the climber's text size.
+  const { fontScale } = useWindowDimensions();
 
   const [pairing, setPairing] = useState<WatchPairingCode | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -58,100 +65,60 @@ export function WatchPairScreen() {
     })();
   }, [showToast, t]);
 
-  const hasActiveCode = pairing !== null && secondsLeft > 0;
-  const isExpired = pairing !== null && secondsLeft <= 0;
-
-  return (
-    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
-      <View style={[styles.card, { backgroundColor: systemColors.secondaryBackground }]}>
-        <Text variant="body" color={systemColors.secondaryLabel}>
-          {t('watchPairing.description')}
-        </Text>
-      </View>
-
-      <View style={[styles.card, styles.codeCard, { backgroundColor: systemColors.secondaryBackground }]}>
-        {isLoading ? (
-          <View style={styles.loadingBlock}>
-            <ActivityIndicator color={brandColors.primary} />
-            <Text variant="subheadline" color={systemColors.secondaryLabel}>
-              {t('watchPairing.generating')}
-            </Text>
-          </View>
-        ) : hasActiveCode ? (
-          <>
-            <Text variant="footnote" color={systemColors.secondaryLabel} style={styles.centeredText}>
-              {t('watchPairing.codeInstruction')}
-            </Text>
-            <Text
-              accessibilityLabel={pairing.code}
-              color={systemColors.label}
-              style={[styles.codeText, { color: systemColors.label }]}
-            >
-              {pairing.code}
-            </Text>
-            <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.centeredText}>
-              {t('watchPairing.expiresIn', { seconds: secondsLeft })}
-            </Text>
-            <Button title={t('watchPairing.regenerate')} variant="text" onPress={generate} disabled={isLoading} />
-          </>
-        ) : isExpired ? (
-          <>
-            <Text variant="body" color={systemColors.label} style={styles.centeredText}>
-              {t('watchPairing.expired')}
-            </Text>
-            <Button
-              title={t('watchPairing.regenerate')}
-              variant="filled"
-              onPress={generate}
-              disabled={isLoading}
-              loading={isLoading}
-            />
-          </>
-        ) : (
-          <Button
-            title={t('watchPairing.generate')}
-            variant="filled"
-            onPress={generate}
-            disabled={isLoading}
-            loading={isLoading}
-          />
-        )}
-      </View>
-    </ScrollView>
+  const code = pairing?.code ?? null;
+  const { largeTitle } = textStyles;
+  const codeHeight = watchPairCodeHeight(
+    fontScale,
+    largeTitle.lineHeight ?? Math.ceil((largeTitle.fontSize ?? 34) * 1.2),
   );
+  const codeView = useMemo(
+    () =>
+      code ? (
+        <View style={[styles.codeRow, { height: codeHeight }]}>
+          <Text
+            accessibilityLabel={code}
+            {...WATCH_PAIR_CODE_TEXT_FIT}
+            style={[styles.codeText, { color: systemColors.label }]}
+          >
+            {code}
+          </Text>
+        </View>
+      ) : null,
+    [code, codeHeight, styles, systemColors.label],
+  );
+
+  const model = useMemo(
+    () =>
+      withSettingTracking(
+        buildWatchPairModel({
+          t,
+          isLoading,
+          code,
+          secondsLeft,
+          codeView,
+          codeHeight,
+          onGenerate: generate,
+        }),
+        'watch-pair',
+      ),
+    [t, isLoading, code, secondsLeft, codeView, codeHeight, generate],
+  );
+
+  return Platform.OS === 'android' ? <MoreFormRN model={model} /> : <MoreForm model={model} />;
 }
 
-const styles = StyleSheet.create({
-  container: {
-    flexGrow: 1,
-    paddingTop: spacing[4],
-    paddingBottom: spacing[8],
-    gap: spacing[5],
-  },
-  card: {
-    overflow: 'hidden',
-    borderRadius: borderRadius.lg,
-    marginHorizontal: spacing[4],
-    padding: spacing[4],
-  },
-  codeCard: {
-    alignItems: 'center',
-    gap: spacing[3],
-  },
-  loadingBlock: {
-    alignItems: 'center',
-    gap: spacing[3],
-    paddingVertical: spacing[3],
-  },
-  centeredText: {
-    textAlign: 'center',
-  },
-  codeText: {
-    fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }),
-    fontSize: 44,
-    lineHeight: 52,
-    fontWeight: '700',
-    letterSpacing: 8,
-    textAlign: 'center',
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    codeRow: {
+      alignItems: 'center',
+      justifyContent: 'center',
+    },
+    codeText: {
+      fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }),
+      fontSize: textStyles.largeTitle.fontSize,
+      lineHeight: textStyles.largeTitle.lineHeight,
+      fontWeight: '700',
+      letterSpacing: 8,
+      textAlign: 'center',
+    },
+  });

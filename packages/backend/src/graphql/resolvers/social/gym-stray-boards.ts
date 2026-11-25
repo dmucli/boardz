@@ -1,6 +1,7 @@
 import { and, eq, inArray, isNull, ne, or, sql, type SQL, type SQLWrapper } from 'drizzle-orm';
 import { GraphQLError } from 'graphql';
 import type { ConnectionContext } from '@boardsesh/shared-schema';
+import { rolesGrantAdmin } from '@boardsesh/community-roles';
 import {
   computeClusterSignature,
   distanceMeters,
@@ -10,12 +11,28 @@ import {
 import { executeRows } from '@boardsesh/db/client';
 import * as dbSchema from '@boardsesh/db/schema';
 import { db } from '../../../db/client';
+import { transactionWithAfterCommit } from '../../../db/after-commit';
 import { logger } from '../../../utils/logger';
+import { canViewResourceLocation, resourceAccessCondition, resourceLocationCondition } from '../../../services/privacy';
 import { requireAuthenticated, applyRateLimit, validateInput } from '../shared/helpers';
 import { AttachBoardToGymInputSchema, DetachBoardFromGymInputSchema, UUIDSchema } from '../../../validation/schemas';
 import { SYSTEM_BOARD_OWNER_ID } from '../board-presence/shared';
 import { requireGymEditAccess } from './gyms';
+import {
+  boardHeldOffGymCondition,
+  isHeldBoardRelistable,
+  recordBoardModerationEvent,
+  recordOwnerGymLinkChange,
+  resolveGymEditActorRole,
+  type ModerationExecutor,
+} from './board-moderation-events';
 import { PROXIMITY_MATCH_RADIUS_METERS } from './gym-matching';
+import { getUserCommunityRoles } from './roles';
+import type { FixedSystemOwnerOrderMode } from '@boardsesh/db/fixed-system-owner-order';
+import {
+  captureFixedSystemOwnerOrderMode,
+  lockCooperativeFixedSystemOwnerTransaction,
+} from '../../../services/fixed-system-owner-order';
 
 // ============================================
 // Stray-board discovery for the gym Boards tab
@@ -47,6 +64,8 @@ type StrayBoardCandidate = {
   currentGymId: number | null;
   uuid: string;
   name: string;
+  boardType: string;
+  angle: number;
   currentGymUuid: string | null;
   currentGymName: string | null;
   distanceMeters: number | null;
@@ -77,9 +96,11 @@ const BOUNDING_BOX_SAFETY_FACTOR = 1.02;
  * IDs of every gym whose `merged_into_gym_id` chain resolves to `canonicalGymId`
  * — the reverse of resolveCanonicalGym. Walks children (rows pointing INTO the
  * frontier) breadth-first, bounded to MAX_MERGE_HOPS with a visited guard so a
- * cyclic pointer terminates. The canonical gym itself is excluded.
+ * cyclic pointer terminates. The canonical gym itself is excluded. Exported for
+ * the existing-wall check (existing-wall-check.ts), which searches a merged
+ * listing's strays as part of the chosen gym.
  */
-async function collectMergedTwinGymIds(canonicalGymId: number): Promise<number[]> {
+export async function collectMergedTwinGymIds(canonicalGymId: number): Promise<number[]> {
   const twinIds = new Set<number>();
   let frontier: number[] = [canonicalGymId];
   for (let hop = 0; hop < MAX_MERGE_HOPS && frontier.length > 0; hop++) {
@@ -129,15 +150,47 @@ function distanceFromGym(
  *     are surfaced regardless of visibility and rank first.
  *   - NEARBY: boards within 150 m of the gym that are unlinked or on a SYSTEM
  *     listing at the same spot. Gated to boards it's legitimate to capture —
- *     SYSTEM (synced catalog) or the viewer's own — never a third party's, and
- *     never a hide-location board. A stranger's board (public or private) is
- *     excluded: attaching it would hand the gym owner edit rights over it.
+ *     SYSTEM (synced catalog) or the viewer's own. A platform admin may also
+ *     attach an unlinked public board within their board-type scope, respecting
+ *     its resource and location privacy. Ordinary gym managers cannot capture
+ *     a third party's board: attaching it grants the gym owner edit rights.
  *
  * Exported so attachBoardToGym gates on the exact same candidate set the Boards
  * tab shows — a board this wouldn't surface can't be attached.
  */
 export async function findStrayBoardCandidates(gym: GymRow, viewerUserId: string): Promise<StrayBoardCandidate[]> {
   const twinGymIds = await collectMergedTwinGymIds(gym.id);
+  const hasGymCoords = gym.latitude != null && gym.longitude != null;
+  const viewerRoles = hasGymCoords ? await getUserCommunityRoles(viewerUserId) : [];
+  const scopedAdminBoardTypes = [
+    ...new Set(
+      viewerRoles.flatMap((role) =>
+        role.boardType !== null && rolesGrantAdmin(viewerRoles, role.boardType) ? [role.boardType] : [],
+      ),
+    ),
+  ];
+  const adminBoardScope = rolesGrantAdmin(viewerRoles)
+    ? sql`true`
+    : scopedAdminBoardTypes.length > 0
+      ? inArray(dbSchema.userBoards.boardType, scopedAdminBoardTypes)
+      : undefined;
+  // Admin status never bypasses resource or location privacy, and does not
+  // authorize moving a person's board off another gym's listing.
+  const adminCandidateCondition = adminBoardScope
+    ? and(
+        adminBoardScope,
+        isNull(dbSchema.userBoards.gymId),
+        eq(dbSchema.userBoards.isPublic, true),
+        eq(dbSchema.userBoards.isUnlisted, false),
+        resourceAccessCondition('board', dbSchema.userBoards.uuid, viewerUserId, { allowUnlistedLink: false }),
+        resourceLocationCondition(dbSchema.userBoards.uuid, viewerUserId),
+      )
+    : undefined;
+
+  // A board this gym's staff took off their listing stays off "boards near your
+  // gym". Without this, a removed synced board would be offered straight back.
+  // Staff can still put it back by uuid (`attachBoardToGym`'s re-list path).
+  const notHeldOffThisGym = sql`NOT ${boardHeldOffGymCondition(dbSchema.userBoards.id, gym.id)}`;
 
   const twinRows =
     twinGymIds.length > 0
@@ -147,6 +200,8 @@ export async function findStrayBoardCandidates(gym: GymRow, viewerUserId: string
             currentGymId: dbSchema.userBoards.gymId,
             uuid: dbSchema.userBoards.uuid,
             name: dbSchema.userBoards.name,
+            boardType: dbSchema.userBoards.boardType,
+            angle: dbSchema.userBoards.angle,
             latitude: dbSchema.userBoards.latitude,
             longitude: dbSchema.userBoards.longitude,
             currentGymUuid: dbSchema.gyms.uuid,
@@ -154,11 +209,16 @@ export async function findStrayBoardCandidates(gym: GymRow, viewerUserId: string
           })
           .from(dbSchema.userBoards)
           .innerJoin(dbSchema.gyms, eq(dbSchema.userBoards.gymId, dbSchema.gyms.id))
-          .where(and(inArray(dbSchema.userBoards.gymId, twinGymIds), isNull(dbSchema.userBoards.deletedAt)))
+          .where(
+            and(
+              inArray(dbSchema.userBoards.gymId, twinGymIds),
+              isNull(dbSchema.userBoards.deletedAt),
+              notHeldOffThisGym,
+            ),
+          )
           .limit(STRAY_BOARD_LIMIT)
       : [];
 
-  const hasGymCoords = gym.latitude != null && gym.longitude != null;
   const nearbyRows = hasGymCoords
     ? await db
         .select({
@@ -166,6 +226,8 @@ export async function findStrayBoardCandidates(gym: GymRow, viewerUserId: string
           currentGymId: dbSchema.userBoards.gymId,
           uuid: dbSchema.userBoards.uuid,
           name: dbSchema.userBoards.name,
+          boardType: dbSchema.userBoards.boardType,
+          angle: dbSchema.userBoards.angle,
           latitude: dbSchema.userBoards.latitude,
           longitude: dbSchema.userBoards.longitude,
           currentGymUuid: dbSchema.gyms.uuid,
@@ -176,6 +238,7 @@ export async function findStrayBoardCandidates(gym: GymRow, viewerUserId: string
         .where(
           and(
             isNull(dbSchema.userBoards.deletedAt),
+            notHeldOffThisGym,
             // Never reuse a board whose owner asked to hide its location.
             eq(dbSchema.userBoards.hideLocation, false),
             boardWithinBoundingBox(gym.latitude!, gym.longitude!, PROXIMITY_MATCH_RADIUS_METERS),
@@ -186,27 +249,33 @@ export async function findStrayBoardCandidates(gym: GymRow, viewerUserId: string
               isNull(dbSchema.userBoards.gymId),
               and(eq(dbSchema.gyms.ownerId, SYSTEM_BOARD_OWNER_ID), ne(dbSchema.userBoards.gymId, gym.id)),
             )!,
-            // Ownership gate: only a SYSTEM (synced catalog) board or the viewer's
-            // own board is a legitimate stray to attach — never a third party's,
-            // public or private. Attaching a stranger's board would hand the gym
-            // owner/admin edit rights over it (rename, serialNumber/BLE, privacy
-            // flags) via requireBoardEditAccess's gym-admin branch. Being public
-            // does not make a board safe to capture.
-            or(eq(dbSchema.userBoards.ownerId, SYSTEM_BOARD_OWNER_ID), eq(dbSchema.userBoards.ownerId, viewerUserId))!,
+            // Preserve ordinary ownership gates; the narrow admin branch above
+            // additionally permits an unlinked public board in their scope.
+            or(
+              eq(dbSchema.userBoards.ownerId, SYSTEM_BOARD_OWNER_ID),
+              eq(dbSchema.userBoards.ownerId, viewerUserId),
+              adminCandidateCondition,
+            )!,
           ),
         )
         .limit(STRAY_BOARD_LIMIT * 2)
     : [];
 
+  // A twin's board is listed whatever its visibility, but a distance is
+  // measured from the board's own coordinates, so it goes only to an editor
+  // the board's location is shown to (projectBoardLocation's rule).
+  const twinLocationVisible = await Promise.all(twinRows.map((row) => canViewResourceLocation(row.uuid, viewerUserId)));
   const twinCandidates: StrayBoardCandidate[] = twinRows
-    .map((row) => ({
+    .map((row, rowIndex) => ({
       boardId: row.boardId,
       currentGymId: row.currentGymId ?? null,
       uuid: row.uuid,
       name: row.name,
+      boardType: row.boardType,
+      angle: row.angle,
       currentGymUuid: row.currentGymUuid ?? null,
       currentGymName: row.currentGymName ?? null,
-      distanceMeters: distanceFromGym(gym, row),
+      distanceMeters: twinLocationVisible[rowIndex] ? distanceFromGym(gym, row) : null,
       reason: 'MERGED_TWIN' as const,
       isLastBoardAtCurrentGym: false,
     }))
@@ -226,6 +295,8 @@ export async function findStrayBoardCandidates(gym: GymRow, viewerUserId: string
       currentGymId: row.currentGymId ?? null,
       uuid: row.uuid,
       name: row.name,
+      boardType: row.boardType,
+      angle: row.angle,
       currentGymUuid: row.currentGymUuid ?? null,
       currentGymName: row.currentGymName ?? null,
       distanceMeters: distance,
@@ -394,7 +465,12 @@ function toMergeCandidate(row: RetireGateRow): CanonicalGymCandidate {
  * debug log and a plain `return`: the board move has already committed, so a
  * skipped fold is a no-op, not an error.
  */
-async function retireEmptiedSourceGym(sourceGymId: number, targetGym: GymRow, actorUserId: string): Promise<void> {
+async function retireEmptiedSourceGym(
+  sourceGymId: number,
+  targetGym: GymRow,
+  actorUserId: string,
+  ownerOrderMode: FixedSystemOwnerOrderMode,
+): Promise<void> {
   if (targetGym.ownerId === SYSTEM_BOARD_OWNER_ID) {
     logger.debug('stray attach: not retiring the source listing, the target gym is itself a synced listing', {
       sourceGymId,
@@ -404,6 +480,7 @@ async function retireEmptiedSourceGym(sourceGymId: number, targetGym: GymRow, ac
   }
 
   await db.transaction(async (tx) => {
+    await lockCooperativeFixedSystemOwnerTransaction(tx, ownerOrderMode);
     const gateRows = await loadRetireGateRows(tx, [sourceGymId, targetGym.id]);
     const source = gateRows.get(sourceGymId);
     const target = gateRows.get(targetGym.id);
@@ -464,6 +541,67 @@ async function retireEmptiedSourceGym(sourceGymId: number, targetGym: GymRow, ac
 // Resolvers
 // ============================================
 
+/** What `attachBoardToGym` re-points: a stray candidate, or a held board being re-listed. */
+type AttachTarget = Pick<StrayBoardCandidate, 'boardId' | 'currentGymId' | 'currentGymUuid'> & {
+  relistsHeldBoard?: boolean;
+};
+
+/** What gym staff read when they try to remove a synced board from their gym. */
+export const SYSTEM_BOARD_REMOVE_MESSAGE = 'This board comes from public board data. Delete it instead, or report it.';
+export const SYSTEM_BOARD_REMOVE_CODE = 'SYSTEM_BOARD_DELETE_INSTEAD';
+
+/** System-owned boards require the same global-admin exception on a write or its receipt replay. */
+export async function requireBoardDetachmentAccess(
+  board: { ownerId: string },
+  userId: string,
+  executor: ModerationExecutor = db,
+): Promise<void> {
+  if (
+    board.ownerId === SYSTEM_BOARD_OWNER_ID &&
+    !rolesGrantAdmin(await getUserCommunityRoles(userId, executor), null)
+  ) {
+    throw new GraphQLError(SYSTEM_BOARD_REMOVE_MESSAGE, { extensions: { code: SYSTEM_BOARD_REMOVE_CODE } });
+  }
+}
+
+/**
+ * A board this gym's staff removed and may put back by uuid, though the stray
+ * list no longer offers it, whoever owns it: it restores the listing the board
+ * had before their own removal. Bounded so it never overrides the creator: the
+ * board is live and unlinked, its location is not hidden, and its creator has
+ * not linked or unlinked it anywhere since the removal (`isHeldBoardRelistable`).
+ * `attachBoardToGym` asks again under the board's row lock (`lockRow`) before
+ * it writes.
+ */
+async function findRelistableHeldBoard(
+  gymId: number,
+  boardCondition: SQL,
+  executor: ModerationExecutor = db,
+  lockRow = false,
+): Promise<{ id: number; ownerId: string } | undefined> {
+  const query = executor
+    .select({ id: dbSchema.userBoards.id, ownerId: dbSchema.userBoards.ownerId })
+    .from(dbSchema.userBoards)
+    .where(
+      and(
+        boardCondition,
+        isNull(dbSchema.userBoards.deletedAt),
+        isNull(dbSchema.userBoards.gymId),
+        eq(dbSchema.userBoards.hideLocation, false),
+      ),
+    )
+    .limit(1);
+  const [board] = lockRow ? await query.for('update') : await query;
+  if (!board || !(await isHeldBoardRelistable(board, gymId, executor))) return undefined;
+  return board;
+}
+
+async function findHeldOffBoardToRelist(gym: GymRow, boardUuid: string): Promise<AttachTarget | undefined> {
+  const board = await findRelistableHeldBoard(gym.id, eq(dbSchema.userBoards.uuid, boardUuid));
+  if (!board) return undefined;
+  return { boardId: board.id, currentGymId: null, currentGymUuid: null, relistsHeldBoard: true };
+}
+
 export const socialGymStrayBoardQueries = {
   strayBoardsForGym: async (
     _: unknown,
@@ -487,6 +625,7 @@ export const socialGymStrayBoardQueries = {
 
 export const socialGymStrayBoardMutations = {
   attachBoardToGym: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext): Promise<boolean> => {
+    const ownerOrderMode = captureFixedSystemOwnerOrderMode();
     requireAuthenticated(ctx);
     await applyRateLimit(ctx, 20, 'attachBoardToGym');
     const validatedInput = validateInput(AttachBoardToGymInputSchema, input, 'input');
@@ -496,56 +635,112 @@ export const socialGymStrayBoardMutations = {
 
     // Only a board the Boards tab would surface as a stray can be attached — the
     // exact same candidate set as strayBoardsForGym, so gym-edit access can't be
-    // used to pull an arbitrary board off another listing.
+    // used to pull an arbitrary board off another listing. The one addition is
+    // a board this gym's staff removed and that is still unlinked: putting it
+    // back restores the listing it had, and lifts the creator's hold. Only while
+    // its location is shown and its creator has not moved it since.
     const candidates = await findStrayBoardCandidates(gym, userId);
-    const target = candidates.find((candidate) => candidate.uuid === validatedInput.boardUuid);
+    const target: AttachTarget | undefined =
+      candidates.find((candidate) => candidate.uuid === validatedInput.boardUuid) ??
+      (await findHeldOffBoardToRelist(gym, validatedInput.boardUuid));
     if (!target) {
+      if (validatedInput.expectedCurrentGymUuid !== undefined) {
+        throw new GraphQLError('This board changed before it could be attached. Refresh and try again.', {
+          extensions: { code: 'CONFLICT' },
+        });
+      }
       throw new GraphQLError('This board is not a stray candidate for this gym.', {
         extensions: { code: 'BAD_USER_INPUT' },
       });
     }
+    if (
+      validatedInput.expectedCurrentGymUuid !== undefined &&
+      validatedInput.expectedCurrentGymUuid !== target.currentGymUuid
+    ) {
+      throw new GraphQLError('This board changed before it could be attached. Refresh and try again.', {
+        extensions: { code: 'CONFLICT' },
+      });
+    }
+
+    const relistActorRole = target.relistsHeldBoard ? await resolveGymEditActorRole(gym, userId) : null;
+    if (target.relistsHeldBoard && !relistActorRole) throw new Error('Not authorized to edit this gym');
 
     // Compare-and-swap: only re-point if the board's gym_id is still what we saw
     // when we vetted it, so a concurrent re-link (the owner moving the board
     // between the check and this write) can't be silently clobbered. `IS NOT
     // DISTINCT FROM` handles the unlinked (NULL) case; the ::bigint cast anchors
     // the bound param's type against the bigint column.
-    const updated = await db
-      .update(dbSchema.userBoards)
-      .set({
-        gymId: gym.id,
-        // A deliberate human link. Without the freeze the next location-sync run
-        // re-points the board straight back to the synced listing it came from
-        // (upsert.ts's board upsert is guarded only by
-        // `setWhere: isNull(userBoards.syncFrozenAt)`), silently undoing the
-        // attach and re-populating the listing we are about to retire. Mirrors
-        // updateBoard.
-        syncFrozenAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .where(
-        and(
-          eq(dbSchema.userBoards.id, target.boardId),
-          sql`${dbSchema.userBoards.gymId} IS NOT DISTINCT FROM ${target.currentGymId}::bigint`,
-        ),
-      )
-      .returning({ id: dbSchema.userBoards.id });
+    await transactionWithAfterCommit(async (tx) => {
+      // A re-list is decided again under the board's row lock: a creator's link
+      // or a hidden location committing since the check above wins.
+      if (
+        target.relistsHeldBoard &&
+        !(await findRelistableHeldBoard(gym.id, eq(dbSchema.userBoards.id, target.boardId), tx, true))
+      ) {
+        throw new GraphQLError('This board changed before it could be attached. Refresh and try again.', {
+          extensions: { code: 'CONFLICT' },
+        });
+      }
+      const updated = await tx
+        .update(dbSchema.userBoards)
+        .set({
+          gymId: gym.id,
+          // A deliberate human link. Without the freeze the next location-sync run
+          // re-points the board straight back to the synced listing it came from
+          // (upsert.ts's board upsert is guarded only by
+          // `setWhere: isNull(userBoards.syncFrozenAt)`), silently undoing the
+          // attach and re-populating the listing we are about to retire. Mirrors
+          // updateBoard.
+          syncFrozenAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(dbSchema.userBoards.id, target.boardId),
+            sql`${dbSchema.userBoards.gymId} IS NOT DISTINCT FROM ${target.currentGymId}::bigint`,
+          ),
+        )
+        .returning({ id: dbSchema.userBoards.id, ownerId: dbSchema.userBoards.ownerId });
 
-    if (updated.length === 0) {
-      throw new GraphQLError('This board changed before it could be attached. Refresh and try again.', {
-        extensions: { code: 'CONFLICT' },
-      });
-    }
+      if (updated.length === 0) {
+        throw new GraphQLError('This board changed before it could be attached. Refresh and try again.', {
+          extensions: { code: 'CONFLICT' },
+        });
+      }
+      if (!relistActorRole && updated[0].ownerId === userId) {
+        // Staff attaching their own board: a creator's link change, on the record.
+        await recordOwnerGymLinkChange(tx, {
+          boardId: target.boardId,
+          actorUserId: userId,
+          fromGymId: target.currentGymId,
+          toGymId: gym.id,
+          mutation: 'attachBoardToGym',
+        });
+      }
+      if (relistActorRole) {
+        await recordBoardModerationEvent(tx, {
+          boardId: target.boardId,
+          gymId: gym.id,
+          actorUserId: userId,
+          actorRole: relistActorRole,
+          action: 'relinked',
+          details: { mutation: 'attachBoardToGym' },
+        });
+      }
+    });
 
     // The board has moved and that write is committed. If it was the last board
     // on a synced listing, fold that now-empty listing into this gym so it stops
     // showing up in search as a board-less twin (#4188). A failure here must not
     // turn a successful attach into a GraphQL error.
-    if (target.currentGymId != null && target.currentGymId !== gym.id) {
+    if (validatedInput.allowSourceGymMerge !== false && target.currentGymId != null && target.currentGymId !== gym.id) {
       try {
-        await retireEmptiedSourceGym(target.currentGymId, gym, userId);
+        await retireEmptiedSourceGym(target.currentGymId, gym, userId, ownerOrderMode);
       } catch (error) {
-        logger.error('failed to retire the listing a stray attach emptied', {
+        // A busy key is an expected skip under cooperative ordering: the attach
+        // has already committed and the empty listing can be retired later.
+        const isBusyOwnerKey = error instanceof GraphQLError && error.extensions.code === 'SERVICE_UNAVAILABLE';
+        logger[isBusyOwnerKey ? 'warn' : 'error']('failed to retire the listing a stray attach emptied', {
           sourceGymId: target.currentGymId,
           targetGymId: gym.id,
           error: error instanceof Error ? error.message : String(error),
@@ -563,7 +758,15 @@ export const socialGymStrayBoardMutations = {
    * #4166 none existed — `linkBoardToGym`'s unlink branch is board-owner-only and
    * `deleteGym` was the only other thing that cleared `gym_id`.
    *
-   * Only clears the link; the board itself is untouched and stays its owner's.
+   * This is the staff tool for a climber's board (docs/product/gym-board-governance.md,
+   * decision 1): it clears the link and freezes the board against the location
+   * sync; the board itself stays its owner's. The removal is recorded, and a
+   * removal by staff holds the creator off self-linking it back to this gym.
+   *
+   * Not for a synced (SYSTEM) board, except by a global admin: removed, it would
+   * be a frozen pin with no gym that the stray list hides and only a global
+   * admin could delete. The gym's owner or admin deletes it instead
+   * (`requireBoardDeleteAccess`).
    */
   detachBoardFromGym: async (_: unknown, { input }: { input: unknown }, ctx: ConnectionContext): Promise<boolean> => {
     requireAuthenticated(ctx);
@@ -574,7 +777,7 @@ export const socialGymStrayBoardMutations = {
     const gym = await requireGymEditAccess(validatedInput.gymUuid, userId);
 
     const [board] = await db
-      .select({ id: dbSchema.userBoards.id, gymId: dbSchema.userBoards.gymId })
+      .select({ id: dbSchema.userBoards.id, gymId: dbSchema.userBoards.gymId, ownerId: dbSchema.userBoards.ownerId })
       .from(dbSchema.userBoards)
       .where(and(eq(dbSchema.userBoards.uuid, validatedInput.boardUuid), isNull(dbSchema.userBoards.deletedAt)))
       .limit(1);
@@ -584,19 +787,48 @@ export const socialGymStrayBoardMutations = {
         extensions: { code: 'BAD_USER_INPUT' },
       });
     }
+    await requireBoardDetachmentAccess(board, userId);
 
-    // Compare-and-swap so a concurrent re-link isn't silently clobbered.
-    const updated = await db
-      .update(dbSchema.userBoards)
-      .set({ gymId: null })
-      .where(and(eq(dbSchema.userBoards.id, board.id), eq(dbSchema.userBoards.gymId, gym.id)))
-      .returning({ id: dbSchema.userBoards.id });
+    // The role used, read while the board still counts toward the gym's board
+    // types (a covering community role may rest on this very board). A creator
+    // removing their own board places no hold on it.
+    const actorRole = board.ownerId === userId ? 'board_owner' : await resolveGymEditActorRole(gym, userId);
+    if (!actorRole) throw new Error('Not authorized to edit this gym');
 
-    if (updated.length === 0) {
-      throw new GraphQLError('This board changed before it could be detached. Refresh and try again.', {
-        extensions: { code: 'CONFLICT' },
+    await transactionWithAfterCommit(async (tx) => {
+      // Compare-and-swap so a concurrent re-link isn't silently clobbered, nor a
+      // board that changed hands (to SYSTEM, say) removed on the old owner's terms.
+      const now = new Date();
+      const updated = await tx
+        .update(dbSchema.userBoards)
+        // Frozen like a stray attach: otherwise the next location-sync run writes
+        // a synced board's gym link straight back (the board upsert is skipped
+        // only for frozen rows), undoing the removal within the hour.
+        .set({ gymId: null, syncFrozenAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(dbSchema.userBoards.id, board.id),
+            eq(dbSchema.userBoards.gymId, gym.id),
+            eq(dbSchema.userBoards.ownerId, board.ownerId),
+            isNull(dbSchema.userBoards.deletedAt),
+          ),
+        )
+        .returning({ id: dbSchema.userBoards.id });
+
+      if (updated.length === 0) {
+        throw new GraphQLError('This board changed before it could be detached. Refresh and try again.', {
+          extensions: { code: 'CONFLICT' },
+        });
+      }
+      await recordBoardModerationEvent(tx, {
+        boardId: board.id,
+        gymId: gym.id,
+        actorUserId: userId,
+        actorRole,
+        action: 'removed_from_gym',
+        details: { mutation: 'detachBoardFromGym' },
       });
-    }
+    });
     return true;
   },
 };

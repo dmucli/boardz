@@ -1,9 +1,12 @@
+import { once } from 'node:events';
 import { describe, it, expect, beforeAll, afterAll, afterEach } from 'vite-plus/test';
 import { type Client, createClient } from 'graphql-ws';
 // eslint-disable-next-line import/no-named-as-default -- `ws` exports both default and named `WebSocket`; default is the correct one for graphql-ws.
 import WebSocket from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 import { startServer } from '../server';
+import { db } from '../db/client';
+import { boardClimbs } from '@boardsesh/db/schema';
 import type { ClimbQueueItem } from '@boardsesh/shared-schema';
 
 type JoinSessionResult = {
@@ -38,12 +41,17 @@ type SessionQueryResult = {
 type QueueEvent =
   | {
       __typename: 'FullSync';
+      sequence?: number;
       state: { queue: Array<{ uuid: string }>; currentClimbQueueItem?: { uuid: string } | null };
     }
   | { __typename: 'QueueItemAdded'; item: { uuid: string; climb?: { name: string } } }
   | { __typename: 'QueueItemRemoved'; uuid: string }
   | { __typename: 'QueueReordered'; uuid: string; oldIndex: number; newIndex: number }
-  | { __typename: 'CurrentClimbChanged'; item: { uuid: string; climb?: { name: string } } | null }
+  | {
+      __typename: 'CurrentClimbChanged';
+      sequence?: number;
+      item: { uuid: string; climb?: { name: string } } | null;
+    }
   | { __typename: 'ClimbMirrored'; mirrored: boolean };
 
 type SessionEvent =
@@ -55,7 +63,7 @@ type SessionEvent =
 
 // Test fixtures
 const TEST_BOARD_PATH = '/kilter/1/2/3/40';
-const TEST_PORT = 8082;
+let testPort = 0;
 
 // Helper to generate unique session IDs for each test
 let testCounter = 0;
@@ -126,8 +134,17 @@ function expectTypename<T extends { __typename: string }, K extends T['__typenam
 }
 
 // Helper to wait for a specific event from a subscription
-function waitForEvent<T>(client: Client, query: string, predicate: (event: T) => boolean, timeout = 5000): Promise<T> {
-  return new Promise((resolve, reject) => {
+function waitForEvent<T>(
+  client: Client,
+  query: string,
+  predicate: (event: T) => boolean,
+  timeout = 5000,
+): Promise<T> & { ready: Promise<void> } {
+  let markReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    markReady = resolve;
+  });
+  const pending = new Promise<T>((resolve, reject) => {
     const timeoutId = setTimeout(() => {
       reject(new Error(`Timeout waiting for event (${timeout}ms)`));
     }, timeout);
@@ -138,6 +155,7 @@ function waitForEvent<T>(client: Client, query: string, predicate: (event: T) =>
         next: (data) => {
           const d = data.data as Record<string, T> | null | undefined;
           const event = d?.queueUpdates || d?.sessionUpdates;
+          if (event) markReady();
           if (event && predicate(event)) {
             clearTimeout(timeoutId);
             unsubscribe();
@@ -152,6 +170,7 @@ function waitForEvent<T>(client: Client, query: string, predicate: (event: T) =>
       },
     );
   });
+  return Object.assign(pending, { ready });
 }
 
 // Helper to collect multiple events from a subscription
@@ -168,7 +187,9 @@ function collectEvents<T>(client: Client, query: string, count: number, timeout 
         next: (data) => {
           const d = data.data as Record<string, T> | null | undefined;
           const event = d?.queueUpdates || d?.sessionUpdates;
-          if (event) {
+          // Skip the two subscribe seeds (roster, then the crew rest clock).
+          const typename = (event as { __typename?: string } | undefined)?.__typename;
+          if (event && typename !== 'SessionRosterSnapshot' && typename !== 'SessionRestCadenceChanged') {
             events.push(event);
             if (events.length >= count) {
               clearTimeout(timeoutId);
@@ -193,7 +214,7 @@ describe('Daemon Integration Tests', () => {
 
   const createTestClient = () => {
     const client = createClient({
-      url: `ws://localhost:${TEST_PORT}/graphql`,
+      url: `ws://localhost:${testPort}/graphql`,
       webSocketImpl: WebSocket,
       lazy: false,
       retryAttempts: 0,
@@ -203,8 +224,40 @@ describe('Daemon Integration Tests', () => {
   };
 
   beforeAll(async () => {
-    process.env.PORT = String(TEST_PORT);
+    // Queue payloads refer to real public catalogue entries; missing/deleted
+    // content is intentionally redacted by the GraphQL privacy projector.
+    await db.insert(boardClimbs).values(
+      [
+        'test-climb-1',
+        'current-test',
+        'mirror-test',
+        'to-remove',
+        'item-0',
+        'item-1',
+        'item-2',
+        'sync-test',
+        'current-sync',
+        'reorder-0',
+        'reorder-1',
+        'cleanup-test',
+        'persist-test',
+      ].map((label) => ({
+        uuid: `climb-${label}`,
+        boardType: 'kilter',
+        layoutId: 1,
+        name: `Test Climb ${label}`,
+        frames: 'test-frames',
+        angle: 40,
+        isListed: true,
+        isDraft: false,
+      })),
+    );
+    process.env.PORT = '0';
     server = await startServer();
+    if (!server.httpServer.listening) await once(server.httpServer, 'listening');
+    const address = server.httpServer.address();
+    if (!address || typeof address === 'string') throw new Error('Expected a TCP test server address');
+    testPort = address.port;
     // Wait for server to be ready
     await new Promise((resolve) => setTimeout(resolve, 500));
   });
@@ -514,24 +567,79 @@ describe('Daemon Integration Tests', () => {
       // Client 2 subscribes to queue updates
       const eventPromise = collectEvents<QueueEvent>(
         client2,
-        `subscription { queueUpdates(sessionId: "${sessionId}") { __typename ... on FullSync { state { currentClimbQueueItem { uuid } } } ... on CurrentClimbChanged { item { uuid } } } }`,
-        2, // FullSync + CurrentClimbChanged
+        `subscription { queueUpdates(sessionId: "${sessionId}") { __typename ... on FullSync { sequence state { queue { uuid } currentClimbQueueItem { uuid } } } ... on CurrentClimbChanged { sequence item { uuid } } } }`,
+        3, // subscribe FullSync, insert FullSync, trailing CurrentClimbChanged
       );
 
       await new Promise((resolve) => setTimeout(resolve, 100));
 
-      // Client 1 sets current climb
+      // Client 1 sets a current climb that is not in the queue, without
+      // shouldAddToQueue (the native socket's stale-item shape). F3 never stores
+      // an orphan, at any QUEUE_NOW_SLOT_PERCENT: the climb is inserted at the
+      // Now slot, published as a FullSync plus a same-sequence trailing
+      // CurrentClimbChanged (docs/product/current-climb-outside-queue.md, section 1
+      // "Invariants" item 1, and section 2 "Which event the server publishes").
       await execute(client1, {
         query: `mutation SetCurrentClimb($item: ClimbQueueItemInput) { setCurrentClimb(item: $item) { uuid } }`,
         variables: { item: createTestClimb('current-sync') },
       });
 
       const events = await eventPromise;
+      const climbUuid = getTestClimbUuid('current-sync');
 
+      expectTypename(events[0]!, 'FullSync');
+      const insert = events[1];
+      expect(insert).toBeDefined();
+      expectTypename(insert!, 'FullSync');
+      expect(insert!.state.queue.map((item) => item.uuid)).toEqual([climbUuid]);
+      expect(insert!.state.currentClimbQueueItem?.uuid).toBe(climbUuid);
+      const trailing = events[2];
+      expect(trailing).toBeDefined();
+      expectTypename(trailing!, 'CurrentClimbChanged');
+      expect(trailing!.item?.uuid).toBe(climbUuid);
+      expect(insert!.sequence).toEqual(expect.any(Number));
+      expect(trailing!.sequence).toBe(insert!.sequence);
+    });
+
+    it('should sync a pointer move onto a queued climb as one CurrentClimbChanged', async () => {
+      const sessionId = createTestSessionId();
+      const client1 = createTestClient();
+      const client2 = createTestClient();
+
+      await execute(client1, {
+        query: `mutation { joinSession(sessionId: "${sessionId}", boardPath: "${TEST_BOARD_PATH}") { id } }`,
+      });
+      await execute(client2, {
+        query: `mutation { joinSession(sessionId: "${sessionId}", boardPath: "${TEST_BOARD_PATH}") { id } }`,
+      });
+      await execute(client1, {
+        query: `mutation AddQueueItem($item: ClimbQueueItemInput!) { addQueueItem(item: $item) { uuid } }`,
+        variables: { item: createTestClimb('pointer-sync') },
+      });
+
+      const eventPromise = collectEvents<QueueEvent>(
+        client2,
+        `subscription { queueUpdates(sessionId: "${sessionId}") { __typename ... on FullSync { state { currentClimbQueueItem { uuid } } } ... on CurrentClimbChanged { item { uuid } } } }`,
+        2, // subscribe FullSync + CurrentClimbChanged
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // A well-formed room at QUEUE_NOW_SLOT_PERCENT=0 with no placement keeps
+      // today's pointer event (docs/product/current-climb-outside-queue.md, section 8
+      // "Kill switches").
+      await execute(client1, {
+        query: `mutation SetCurrentClimb($item: ClimbQueueItemInput) { setCurrentClimb(item: $item) { uuid } }`,
+        variables: { item: createTestClimb('pointer-sync') },
+      });
+
+      const events = await eventPromise;
+
+      expectTypename(events[0]!, 'FullSync');
       const second = events[1];
       expect(second).toBeDefined();
       expectTypename(second!, 'CurrentClimbChanged');
-      expect(second!.item?.uuid).toBe(getTestClimbUuid('current-sync'));
+      expect(second!.item?.uuid).toBe(getTestClimbUuid('pointer-sync'));
     });
 
     it('should sync queue reordering across clients', async () => {
@@ -605,6 +713,8 @@ describe('Daemon Integration Tests', () => {
         (e) => e.__typename === 'LeaderChanged',
       );
 
+      await eventPromise.ready;
+
       // Client 1 disconnects
       await client1.dispose();
       // Remove from activeClients so afterEach doesn't try to dispose again
@@ -640,6 +750,8 @@ describe('Daemon Integration Tests', () => {
         `subscription { sessionUpdates(sessionId: "${sessionId}") { __typename ... on UserLeft { userId } ... on LeaderChanged { leaderId leaderConnectionId } } }`,
         (e) => e.__typename === 'UserLeft',
       );
+
+      await eventPromise.ready;
 
       // Client 2 disconnects
       await client2.dispose();
@@ -845,17 +957,17 @@ describe('Daemon Integration Tests', () => {
 
   describe('HTTP path handling', () => {
     it('returns 400 for /static/beta-link-thumbnails/ with no platform segment', async () => {
-      const res = await fetch(`http://localhost:${TEST_PORT}/static/beta-link-thumbnails/`);
+      const res = await fetch(`http://localhost:${testPort}/static/beta-link-thumbnails/`);
       expect(res.status).toBe(400);
     });
 
     it('returns 400 for /static/beta-link-thumbnails/<platform> with no filename', async () => {
-      const res = await fetch(`http://localhost:${TEST_PORT}/static/beta-link-thumbnails/instagram`);
+      const res = await fetch(`http://localhost:${testPort}/static/beta-link-thumbnails/instagram`);
       expect(res.status).toBe(400);
     });
 
     it('returns 400 for /static/beta-link-thumbnails/ with empty platform segment', async () => {
-      const res = await fetch(`http://localhost:${TEST_PORT}/static/beta-link-thumbnails//filename.jpg`);
+      const res = await fetch(`http://localhost:${testPort}/static/beta-link-thumbnails//filename.jpg`);
       expect(res.status).toBe(400);
     });
   });

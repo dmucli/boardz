@@ -1,1 +1,1 @@
-Lade ein Board herunter und klettere ohne Empfang. Dazu der Boardsesh-Grad: eine Zahl, die sich auf Kilter, Tension und MoonBoard gleich liest, aus echten Begehungen.
+Trainiere mit 4x4, nimm deine Projekte wieder auf und beleuchte deine Spraywall mit WLED. Ein Routenbuch für deine Boards, eine Warteschlange für deine Crew.

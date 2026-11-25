@@ -1,11 +1,14 @@
 // Human-readable labels for the board builder. Raw board-config data is verbose
 // ("Kilter Board Original") and repeats dimensions across kits, so we clean
 // layout names and fold the size's kit description ("Full Ride") into its label.
-// Ports the display cleanup from the backend's formatDisplayName
-// (packages/backend/src/graphql/resolvers/social/boards.ts) — minus the
-// abbreviations, since a builder wants readable names, not compact ones.
+//
+// The layout, size and dimension cleanup lives in @boardsesh/board-config, where
+// the "Set up wrong" fields and www read it too, so a layout or a size reads the
+// same on the builder's chips, the setup fields and every summary. This file
+// re-exports it under the builder's names and keeps what only the builder needs.
 
 import { BOARD_TYPE_LABELS } from '@boardsesh/board-constants';
+import { cleanLayoutName, formatSizeDimensions } from '@boardsesh/board-config';
 
 /**
  * Trademark-correct board type name. Shares the brand map with web
@@ -21,31 +24,11 @@ export function boardTypeLabel(boardName: string): string {
  * "Kilter Board Original" → "Original", "Tension Board 2 Mirror" → "Mirror".
  * Strips the board-type prefix, "Board", "Layout", and a leading "2" (Tension
  * Board 2), keeping the distinctive part. Falls back to the raw name.
+ *
+ * Just the dimensions of a size, e.g. "12×12" (`formatSizeDimensions`), for use
+ * inside a board name.
  */
-export function cleanLayoutName(rawName: string, boardName: string): string {
-  const label = boardTypeLabel(boardName);
-  const cleaned = rawName
-    .replace(new RegExp(`\\b${label}\\b`, 'gi'), '')
-    .replace(/\bBoard\b/gi, '')
-    .replace(/\bLayout\b/gi, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/^2\s+/, '');
-  return cleaned || rawName;
-}
-
-function cleanDimensions(name: string): string {
-  return name
-    .replace(/\s*high\s*/gi, '')
-    .replace(/\s*wide\s*/gi, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/\s*x\s*/i, '×');
-}
-
-function cleanKitDescription(description: string | null | undefined): string {
-  return (description ?? '').replace(/\s*LED Kit\s*/i, '').trim();
-}
+export { cleanLayoutName, formatSizeDimensions };
 
 /**
  * Size chip label. The same dimensions repeat with different kits (Kilter
@@ -53,16 +36,7 @@ function cleanKitDescription(description: string | null | undefined): string {
  * description must be surfaced to disambiguate: "10×12 · Full Ride". Sizes with
  * no kit description (Tension, Kilter Original) render just the dimensions.
  */
-export function formatSizeLabel(size: { name: string; description?: string | null }): string {
-  const dimensions = cleanDimensions(size.name);
-  const kit = cleanKitDescription(size.description);
-  return kit ? `${dimensions} · ${kit}` : dimensions;
-}
-
-/** Just the dimensions of a size, e.g. "12×12" — for use inside a board name. */
-export function formatSizeDimensions(size: { name: string }): string {
-  return cleanDimensions(size.name);
-}
+export { setupSizeLabel as formatSizeLabel } from '@boardsesh/board-config';
 
 /**
  * A suggested board name from the owner + config, e.g. "Marco's Kilter Original
@@ -77,13 +51,29 @@ export function formatDefaultBoardName(params: {
   size?: { name: string } | null;
 }): string {
   const { userName, boardName, layoutName, size } = params;
+  // A spray wall's layout and size are created at runtime and have no name a
+  // climber would recognise: the layout lookup falls back to the board type, so
+  // the name read "Marco's Spray wall spray" (#5960). The board type says it all.
+  const isSprayWall = boardName === 'spray';
   const config = [
     boardTypeLabel(boardName),
-    cleanLayoutName(layoutName, boardName),
-    size ? formatSizeDimensions(size) : '',
+    isSprayWall ? '' : cleanLayoutName(layoutName, boardName),
+    size && !isSprayWall ? formatSizeDimensions(size) : '',
   ]
     .filter(Boolean)
     .join(' ');
   const owner = userName?.trim();
   return owner ? `${owner}'s ${config}` : config;
+}
+
+/**
+ * The default name for a board set up at a gym (#8151): "Boulder Space
+ * MoonBoard 2019". The gym leads, so the board reads right in the gym's wall
+ * list and on the map, where the climber's own name would mean nothing.
+ */
+export function formatGymBoardName(params: { gymName: string; boardName: string; layoutName: string }): string {
+  const { gymName, boardName, layoutName } = params;
+  return [gymName.trim(), boardTypeLabel(boardName), cleanLayoutName(layoutName, boardName)]
+    .filter((part) => part.length > 0)
+    .join(' ');
 }

@@ -65,6 +65,7 @@ async function buildParams(
     narrowerSameHeightSizeIds: tiers.narrowerSameHeightSizeIds,
     gradeBand,
     excludeUserId,
+    viewerUserId: excludeUserId,
     freshWindowDays: FRESH_WINDOW_DAYS,
   };
 }
@@ -141,11 +142,16 @@ export function recommendationCountCacheKey(params: RecommendationQueryParams): 
  *
  * The catalog half (every candidate, whoever asks) is the expensive part and is
  * the same for everyone on a board config, so it is cached in Redis for six
- * hours. The viewer half is how many of those candidates they have already
- * sent, read live from their own ticks. Catalog minus sent equals the NOT EXISTS
- * count exactly (checked on the replica across 16 config x type cases), so the
- * label stays exact per user; only the catalog half can be up to six hours old,
- * and a just-logged send lowers the label straight away.
+ * hours. A published, listed climb is public to everyone, so no account or item
+ * audience makes it differ between viewers. The viewer half is how many of
+ * those candidates they have already sent, read live from their own ticks.
+ * Catalog minus sent equals the NOT EXISTS count exactly (checked on the
+ * replica across 16 config x type cases), so the label stays exact per user;
+ * only the catalog half can be up to six hours old, and a just-logged send
+ * lowers the label straight away.
+ *
+ * A spray wall is the exception: who may see its climbs is a wall rule that
+ * depends on the viewer, so its count is never shared and is read fresh.
  *
  * The playlist page keeps `countRecommendationClimbRefs`, uncached: its hero
  * count sits above the list it pages through and must match it.
@@ -160,6 +166,7 @@ export async function countRecommendationCardClimbs(
   userId: string,
   executor?: SerialPlanDb,
 ): Promise<number> {
+  if (target.boardType === 'spray') return countRecommendationClimbRefs(type, target, userId, executor);
   return onGuardedExecutor(executor, async (tx) => {
     const params = await buildParams(type, target, userId, tx);
     if (!params) return 0;
@@ -170,7 +177,7 @@ export async function countRecommendationCardClimbs(
       label: 'RecommendationCount',
       load: async () => {
         const rows = rowsOf<{ count: number }>(
-          await tx.execute(buildRecommendationCountSql({ ...params, excludeUserId: null })),
+          await tx.execute(buildRecommendationCountSql({ ...params, excludeUserId: null, viewerUserId: null })),
         );
         return Number(rows[0]?.count ?? 0);
       },

@@ -9,9 +9,11 @@ import {
 } from 'react-native';
 import { Text } from '../Text';
 import { PressableSurface } from '../PressableSurface';
+import { GlassSurface } from '../GlassSurface';
 import { useTheme } from '../../providers/theme-provider';
 import { withAlpha } from '../../theme/colors';
 import { spacing } from '../../theme/tokens';
+import { selectByVariant } from '../../theme/variants/select-by-variant';
 import { readableTextColor } from './grade-chip-colors';
 
 export type GradeChipTone = 'neutral' | 'selected' | 'range' | 'consensus';
@@ -20,20 +22,51 @@ export type GradeChipTone = 'neutral' | 'selected' | 'range' | 'consensus';
  * Which palette the chip paints itself from.
  *
  * - `grade` (the default, and what every filter rail uses): the chip carries the
- *   grade ramp, so a selected V6 is the same red it is everywhere else in the app.
+ *   grade ramp. At rest it is a neutral pill. A selected grade is the solid
+ *   colour, so a selected V6 is the same red it is everywhere else in the app,
+ *   and a chip inside a range is a wash of its own grade colour with a coloured
+ *   ring. Each state has its own fill and its own border, so none of them rests
+ *   on hue alone.
  * - `selection`: the chip carries SELECTION state instead of grade identity —
  *   violet for "your choice", an amber ring for "the crowd's". Used by the tick
  *   sheets, where the grade ramp lives in the header's identity bar and the rail
- *   only has to answer "which one did I pick?".
+ *   only has to answer "which one did I pick?". On Material the pick is M3's tonal
+ *   container with a 1pt primary ring, so a chip stays quieter than the Flash
+ *   button and its state is not carried by fill alone.
  */
 export type GradeChipColorway = 'grade' | 'selection';
+
+/**
+ * The chip's minimum touch height, shared with the range rail. Flat chips also
+ * use this visual height; floating glass has a smaller lens inside the target.
+ */
+export const GRADE_CHIP_HEIGHT = 44;
+// Measured native controlSize('small') capsule: 84px at 3x, or 28pt.
+const GLASS_CHIP_HEIGHT = 28;
+const GLASS_CHIP_INSET = (GRADE_CHIP_HEIGHT - GLASS_CHIP_HEIGHT) / 2;
+
+// The chip's border. Every `grade` tone keeps this width, so none of them
+// resizes the box; the `selection` colorway's 2pt consensus ring on Liquid Glass
+// is the one deliberate exception. Material keeps it at this width too.
+const CHIP_BORDER_WIDTH = 1;
+// The ring round a selected `grade` chip: the label colour at just under half
+// strength, so a dark grade colour still has an edge on a dark background.
+const SELECTED_RING_ALPHA = 0.45;
 
 export type GradeChipProps = {
   label: string;
   tone?: GradeChipTone;
   colorway?: GradeChipColorway;
+  /** Individual native glass for a floating rail; hosts gate capability/accessibility. */
+  glass?: boolean;
+  /** The grade's colour. A `grade`-colorway chip that stands for no grade (the
+   *  range rail's "Any") leaves it out: selected, it keeps the neutral fill and
+   *  takes only the ring. */
   gradeColor?: string;
   onPress: () => void;
+  /** Touch and hold. The release after it does not also fire `onPress`. */
+  onLongPress?: () => void;
+  delayLongPress?: number;
   accessibilityLabel: string;
   accessibilityHint?: string;
   accessibilityState?: AccessibilityState;
@@ -45,15 +78,18 @@ export function GradeChip({
   label,
   tone = 'neutral',
   colorway = 'grade',
+  glass = false,
   gradeColor,
   onPress,
+  onLongPress,
+  delayLongPress,
   accessibilityLabel,
   accessibilityHint,
   accessibilityState,
   onLayout,
   style,
 }: GradeChipProps) {
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors, brandColors, chartColors, variant, m3 } = useTheme();
   const accentColor = gradeColor ?? brandColors.primary;
   const selected = tone === 'selected';
   const ranged = tone === 'range';
@@ -64,38 +100,100 @@ export function GradeChip({
   // affordance the chip doesn't have.
   let backgroundColor: ColorValue = systemColors.fill;
   let borderColor: ColorValue = 'transparent';
-  let borderWidth = 1;
+  let borderWidth = CHIP_BORDER_WIDTH;
   let textColor: ColorValue | undefined;
 
   if (colorway === 'selection') {
     textColor = systemColors.label;
     if (selected) {
-      backgroundColor = brandColors.primaryFill;
-      // The ring stays 1pt and matches the fill, so it is invisible but keeps the
-      // box geometry identical to the neutral tone. React Native is border-box:
+      backgroundColor = selectByVariant(variant, {
+        material: m3.secondaryContainer,
+        liquidGlass: brandColors.primaryFill,
+      });
+      // On Liquid Glass the 1pt ring matches the fill, so it is invisible but
+      // keeps the box geometry identical to the neutral tone. React Native is border-box:
       // dropping to 0 here grew the inner content box by 2pt and nudged the label
       // every time a chip went from unselected to selected.
-      borderColor = brandColors.primaryFill;
-      textColor = brandColors.onPrimary;
+      borderColor = selectByVariant(variant, { material: brandColors.primary, liquidGlass: brandColors.primaryFill });
+      textColor = selectByVariant(variant, { material: m3.onSecondaryContainer, liquidGlass: brandColors.onPrimary });
     } else if (consensus) {
       borderColor = brandColors.warning;
-      borderWidth = 2;
+      borderWidth = selectByVariant(variant, { material: CHIP_BORDER_WIDTH, liquidGlass: 2 });
     }
   } else if (selected) {
-    backgroundColor = accentColor;
-    borderColor = accentColor;
-    textColor = readableTextColor(accentColor);
-  } else if (ranged) {
-    backgroundColor = withAlpha(accentColor, 0.18);
-    borderColor = withAlpha(accentColor, 0.75);
+    // The ring is the border every tone already has, in another colour, so a
+    // selected chip is the same size as its neighbours. `chartColors` is the
+    // theme's plain-string palette: `withAlpha` reads hex, and
+    // `systemColors.label` is a `PlatformColor` on iOS.
+    borderColor = withAlpha(chartColors.label, SELECTED_RING_ALPHA);
+    // With no grade colour (the range rail's "Any") the ring is the whole
+    // selected state: the fill stays neutral, never a brand colour.
+    if (gradeColor) {
+      backgroundColor = gradeColor;
+      textColor = readableTextColor(gradeColor);
+    }
+  } else if (ranged && gradeColor) {
+    backgroundColor = withAlpha(gradeColor, 0.18);
+    borderColor = withAlpha(gradeColor, 0.75);
   } else if (consensus) {
     backgroundColor = withAlpha(accentColor, 0.11);
     borderColor = withAlpha(accentColor, 0.55);
   }
 
+  if (glass) {
+    const tintColor =
+      backgroundColor === systemColors.fill
+        ? undefined
+        : typeof backgroundColor === 'string'
+          ? selected
+            ? withAlpha(backgroundColor, 0.35)
+            : backgroundColor
+          : undefined;
+    return (
+      <View onLayout={onLayout} style={[styles.glassCarrier, style]}>
+        <GlassSurface
+          glassEffectStyle="regular"
+          borderRadius={GLASS_CHIP_HEIGHT / 2}
+          tintColor={tintColor}
+          pointerEvents="none"
+          style={[StyleSheet.absoluteFill, styles.glassSurface]}
+        />
+        <PressableSurface
+          onPress={onPress}
+          onLongPress={onLongPress}
+          delayLongPress={delayLongPress}
+          feedback="none"
+          hitSlop={4}
+          accessibilityRole="button"
+          accessibilityLabel={accessibilityLabel}
+          accessibilityHint={accessibilityHint}
+          accessibilityState={accessibilityState}
+          style={[styles.pressable, styles.glassPressable]}
+        >
+          <View style={[styles.content, styles.glassContent]}>
+            <Text
+              emphasized
+              variant="footnote"
+              // Glass tint remains translucent: its label follows the theme,
+              // rather than assuming the grade RGB is an opaque background.
+              color={tone === 'neutral' ? systemColors.secondaryLabel : systemColors.label}
+              numberOfLines={1}
+              style={styles.label}
+            >
+              {label}
+            </Text>
+          </View>
+        </PressableSurface>
+        <View pointerEvents="none" style={[StyleSheet.absoluteFill, styles.glassRing, { borderColor, borderWidth }]} />
+      </View>
+    );
+  }
+
   return (
     <PressableSurface
       onPress={onPress}
+      onLongPress={onLongPress}
+      delayLongPress={delayLongPress}
       feedback="scale"
       scaleTo={0.94}
       hitSlop={4}
@@ -108,7 +206,7 @@ export function GradeChip({
       style={[styles.pressable, { backgroundColor, borderColor, borderWidth }, style]}
     >
       <View style={styles.content}>
-        <Text variant="footnote" color={textColor} numberOfLines={1} style={styles.label}>
+        <Text emphasized variant="footnote" color={textColor} numberOfLines={1} style={styles.label}>
           {label}
         </Text>
       </View>
@@ -117,20 +215,42 @@ export function GradeChip({
 }
 
 const styles = StyleSheet.create({
-  pressable: {
-    minHeight: 44,
+  glassCarrier: {
+    minHeight: GRADE_CHIP_HEIGHT,
     minWidth: 52,
-    borderRadius: 22,
+  },
+  glassSurface: {
+    top: GLASS_CHIP_INSET,
+    bottom: GLASS_CHIP_INSET,
+  },
+  glassPressable: {
+    // Keep the full 44pt target and horizontal border-box geometry. Taller text
+    // grows the carrier and its inset lens together, without clipping glyphs.
+    paddingHorizontal: CHIP_BORDER_WIDTH,
+    paddingVertical: GLASS_CHIP_INSET + CHIP_BORDER_WIDTH,
+  },
+  glassContent: {
+    minHeight: GLASS_CHIP_HEIGHT - CHIP_BORDER_WIDTH * 2,
+  },
+  glassRing: {
+    top: GLASS_CHIP_INSET,
+    bottom: GLASS_CHIP_INSET,
+    borderRadius: GLASS_CHIP_HEIGHT / 2,
+  },
+  pressable: {
+    minHeight: GRADE_CHIP_HEIGHT,
+    minWidth: 52,
+    borderRadius: GRADE_CHIP_HEIGHT / 2,
     justifyContent: 'center',
   },
   content: {
-    minHeight: 42,
+    // The box inside the pressable's top and bottom borders.
+    minHeight: GRADE_CHIP_HEIGHT - CHIP_BORDER_WIDTH * 2,
     paddingHorizontal: spacing[3],
     alignItems: 'center',
     justifyContent: 'center',
   },
   label: {
-    fontWeight: '600',
     fontVariant: ['tabular-nums'],
   },
 });

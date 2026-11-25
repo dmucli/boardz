@@ -1,5 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vite-plus/test';
-import type { ConnectionContext } from '@boardsesh/shared-schema';
+import {
+  buildSchema,
+  getNamedType,
+  isInterfaceType,
+  isObjectType,
+  isUnionType,
+  type GraphQLObjectType,
+  type GraphQLSchema,
+} from 'graphql';
+import { typeDefs, type ConnectionContext } from '@boardsesh/shared-schema';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
 
 // Regression guard: every resolver that returns Climb objects must project the
 // same set of board_climbs columns that searchClimbs and getClimb do. The list
@@ -9,7 +20,9 @@ import type { ConnectionContext } from '@boardsesh/shared-schema';
 //
 // It covers userFavoriteClimbs, playlistClimbs (specific-board + all-boards via
 // hydrateClimbsByRefs), smartPlaylist, setterClimbsFull (both modes) and
-// userClimbs.
+// userClimbs. The coverage check at the bottom walks the live schema and fails
+// when a new query hands out a Climb without a row here (issue #5263): the table
+// only guards the producers someone remembered to list.
 //
 // The field list has now been outgrown three times: framesCount/framesPace
 // (multi-frame routes played at the wrong pace), compatibleSizeIds (threaded
@@ -27,7 +40,16 @@ const { mockDb } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('../db/client', () => ({ db: mockDb, dbRead: mockDb }));
+vi.mock('../db/client', async () => {
+  const { playlistOwnership } = await import('@boardsesh/db/schema');
+  const mockClient = {
+    ...mockDb,
+    select: (selection?: Record<string, unknown>) =>
+      // These payload/format tests use a public-playlist visitor; membership authorization has real-DB matrix coverage.
+      selection?.id === playlistOwnership.id ? makeChain([]) : mockDb.select(selection),
+  };
+  return { db: mockClient, dbRead: mockClient };
+});
 
 // `userClimbs` resolves which board to draw each climb on via its own helper,
 // which runs its own queries — stub it out so these tests keep driving only the
@@ -93,9 +115,8 @@ function makeCtx(overrides: Partial<ConnectionContext> = {}): ConnectionContext 
 }
 
 function makeChain(rows: unknown[]): Record<string, unknown> {
-  const chain: Record<string, unknown> = {};
+  const chain = Object.assign(Promise.resolve(rows), {} as Record<string, unknown>);
   const methods = ['from', 'innerJoin', 'leftJoin', 'where', 'orderBy', 'limit', 'offset', 'groupBy'];
-  chain.then = (resolve: (value: unknown) => unknown) => Promise.resolve(rows).then(resolve);
   for (const method of methods) {
     chain[method] = vi.fn(() => chain);
   }
@@ -121,6 +142,10 @@ function rawClimbRow(overrides: Record<string, unknown> = {}) {
     compatible_size_ids: [2],
     missingHoldCount: 2,
     missing_hold_count: 2,
+    revisionNumber: 4,
+    revision_number: 4,
+    holdsRevisionNumber: 3,
+    holds_revision_number: 3,
     characteristics: ['no_match'],
     statsAngle: 40,
     angle: 40,
@@ -166,6 +191,12 @@ const REQUIRED_SELECT_KEYS = [
   // three holds, opened from the queue, a playlist or the climb screen, would say
   // it was fine.
   'missing_hold_count',
+  // The climb's revision and its holds epoch (#6023). A list row opens the play
+  // drawer with the payload it was handed, and the tick logged from there sends
+  // `revisionNumber` back, so a projection that drops it leaves that tick to the
+  // server's by-date guess.
+  'revision_number',
+  'holds_revision_number',
 ] as const;
 
 /**
@@ -193,25 +224,19 @@ const REQUIRED_CLIMB_FIELDS: Record<string, unknown> = {
   // falsy, so a zero would make this assertion pass for a projection that dropped
   // the column.
   missingHoldCount: 2,
+  // Two different numbers, and neither of them 1: the column default is 1, so a
+  // fixture of 1 would pass for a mapper that crossed the two or invented one.
+  revisionNumber: 4,
+  holdsRevisionNumber: 3,
   // Where the stats on this row were read from (issue #5405). On an angle-bound
   // board it is not the browsed angle, and a list row that drops it leaves the
   // play drawer unable to say the grade beside it belongs to another angle.
   statsAngle: 40,
 };
 
-/**
- * Flatten a Drizzle `sql` template back into its literal text so a raw-SQL entry
- * point can be checked for the columns it selects. Only the string chunks matter
- * — the interpolated params are bind values, never column names.
- */
+/** Render nested QueryBuilder projections as well as literal SQL chunks. */
 function sqlText(query: unknown): string {
-  const chunks = (query as { queryChunks?: unknown[] } | undefined)?.queryChunks ?? [];
-  return chunks
-    .map((chunk) => {
-      const value = (chunk as { value?: unknown }).value;
-      return Array.isArray(value) ? value.join('') : '';
-    })
-    .join('');
+  return new PgDialect().sqlToQuery(query as SQL).sql;
 }
 
 type EntryPoint = {
@@ -342,6 +367,8 @@ const ENTRY_POINTS: EntryPoint[] = [
           frames_pace: 900,
           compatible_size_ids: [2],
           missing_hold_count: 2,
+          revision_number: 4,
+          holds_revision_number: 3,
           characteristics: ['no_match'],
           stats_angle: 40,
           ascensionist_count: 5,
@@ -388,11 +415,10 @@ for (const entryPoint of ENTRY_POINTS) {
         // so it gets its own spelling rather than the two-halves check below.
         expect(statement).toContain('AS stats_angle');
         for (const column of REQUIRED_SELECT_KEYS) {
-          // Both halves, because dropping either one is the bug: `c.<column>` is
-          // where the owned_climbs CTE reads it off board_climbs, and
-          // `owned_climbs.<column>` is where the outer SELECT carries it out to
-          // the mapper. A bare substring check would pass with one of them gone.
-          expect(statement).toContain(`c.${column}`);
+          // Both halves: the QueryBuilder projection inside owned_climbs and
+          // the raw outer SELECT that carries the field out to the mapper.
+          const ownedProjection = statement.split('best_angle AS')[0];
+          expect(ownedProjection).toContain(`"${column}"`);
           expect(statement).toContain(`owned_climbs.${column}`);
         }
       });
@@ -412,3 +438,176 @@ for (const entryPoint of ENTRY_POINTS) {
     }
   });
 }
+
+// ============================================================
+// Coverage: every root that hands out a Climb has a row above
+// ============================================================
+//
+// The table only guards producers somebody remembered to add. A new query whose
+// mapper never reads `characteristics` compiles clean, and `Climb.is_no_match`
+// quietly falls back to the description (issue #5263). So the live schema decides
+// which roots need a row, not this file.
+
+/**
+ * Field edges the walk does not follow, each with the guard that covers it
+ * instead. A queue item's climb is the client's own ClimbInput, stored and echoed
+ * back, not a board_climbs projection.
+ */
+const NON_PROJECTION_CLIMB_EDGES: Record<string, string> = {
+  'ClimbQueueItem.climb': 'client-supplied ClimbInput, pinned by queue-climb-field-contract.test.ts',
+};
+
+/**
+ * Which ENTRY_POINTS rows exercise a root's producers, or, for the two reference
+ * projections every row is measured against, the guard that covers them.
+ */
+type ClimbRootCoverage = { entryPoints: string[] } | { reference: string };
+
+const CLIMB_ROOT_COVERAGE: Record<string, ClimbRootCoverage> = {
+  'Query.searchClimbs': {
+    reference:
+      '@boardsesh/db search: ClimbRow requires `characteristics`, and search-climbs.test.ts pins the outer SELECT to statsDrivenClimbFields()',
+  },
+  'Query.climb': {
+    reference: 'getClimbByUuid: a typed drizzle select, so a dropped column fails to compile in the mapper',
+  },
+  'Query.userFavoriteClimbs': { entryPoints: ['userFavoriteClimbs'] },
+  'Query.playlistClimbs': { entryPoints: ['playlistClimbs (specific board)', 'hydrateClimbsByRefs'] },
+  'Query.smartPlaylist': { entryPoints: ['hydrateClimbsByRefs'] },
+  'Query.setterClimbsFull': { entryPoints: ['setterClimbsFull (specific board)', 'setterClimbsFull (all boards)'] },
+  'Query.userClimbs': { entryPoints: ['userClimbs'] },
+};
+
+/**
+ * `Root.field` for every Query / Mutation / Subscription field whose result can
+ * hold a `Climb`, through any depth of object fields, lists, unions and
+ * interfaces.
+ *
+ * Reachability is worked backwards from `Climb` over the whole type graph rather
+ * than by a memoised descent from each root: the schema has cycles, and a descent
+ * records a type as "no Climb" when its only way back runs through a type still
+ * on the stack — so one root would hide another depending on field order.
+ */
+function rootFieldsReturningClimb(schema: GraphQLSchema, skippedEdges: ReadonlySet<string>): string[] {
+  const rootTypes = [schema.getQueryType(), schema.getMutationType(), schema.getSubscriptionType()].filter(
+    (rootType): rootType is GraphQLObjectType => rootType != null,
+  );
+  const rootTypeNames = new Set(rootTypes.map((rootType) => rootType.name));
+
+  // Child type name → the type names that can hand it out. Root types are left
+  // out on both ends: their fields are read directly below.
+  const parentsByChild = new Map<string, Set<string>>();
+  const addEdge = (parentName: string, childName: string) => {
+    if (rootTypeNames.has(parentName) || rootTypeNames.has(childName)) return;
+    const parentNames = parentsByChild.get(childName) ?? new Set<string>();
+    parentNames.add(parentName);
+    parentsByChild.set(childName, parentNames);
+  };
+
+  for (const namedType of Object.values(schema.getTypeMap())) {
+    if (namedType.name.startsWith('__')) continue;
+    if (isObjectType(namedType) || isInterfaceType(namedType)) {
+      for (const field of Object.values(namedType.getFields())) {
+        if (skippedEdges.has(`${namedType.name}.${field.name}`)) continue;
+        addEdge(namedType.name, getNamedType(field.type).name);
+      }
+    }
+    if (isUnionType(namedType) || isInterfaceType(namedType)) {
+      for (const memberType of schema.getPossibleTypes(namedType)) addEdge(namedType.name, memberType.name);
+    }
+  }
+
+  const typesReachingClimb = new Set<string>(['Climb']);
+  const pendingTypeNames = ['Climb'];
+  while (pendingTypeNames.length > 0) {
+    const childName = pendingTypeNames.pop()!;
+    for (const parentName of parentsByChild.get(childName) ?? []) {
+      if (typesReachingClimb.has(parentName)) continue;
+      typesReachingClimb.add(parentName);
+      pendingTypeNames.push(parentName);
+    }
+  }
+
+  return rootTypes
+    .flatMap((rootType) =>
+      Object.values(rootType.getFields())
+        .filter(
+          (field) =>
+            !skippedEdges.has(`${rootType.name}.${field.name}`) &&
+            typesReachingClimb.has(getNamedType(field.type).name),
+        )
+        .map((field) => `${rootType.name}.${field.name}`),
+    )
+    .sort();
+}
+
+describe('every GraphQL root that returns a Climb has a row in ENTRY_POINTS (#5263)', () => {
+  const skippedEdges = new Set(Object.keys(NON_PROJECTION_CLIMB_EDGES));
+
+  it('hands out Climb from exactly the roots in CLIMB_ROOT_COVERAGE', () => {
+    const roots = rootFieldsReturningClimb(buildSchema(typeDefs.join('\n')), skippedEdges);
+
+    expect(
+      roots,
+      'A query now returns Climb without a row here. Add an ENTRY_POINTS row that drives its ' +
+        'producer, then list the root in CLIMB_ROOT_COVERAGE. Remove a root only once the schema dropped it.',
+    ).toEqual(Object.keys(CLIMB_ROOT_COVERAGE).sort());
+  });
+
+  it('names only ENTRY_POINTS rows that exist', () => {
+    const entryPointNames = new Set(ENTRY_POINTS.map((entryPoint) => entryPoint.name));
+
+    for (const [rootField, coverage] of Object.entries(CLIMB_ROOT_COVERAGE)) {
+      if ('reference' in coverage) continue;
+      expect(coverage.entryPoints.length, `${rootField} names no ENTRY_POINTS row`).toBeGreaterThan(0);
+      for (const entryPointName of coverage.entryPoints) {
+        expect(entryPointNames.has(entryPointName), `${rootField} → missing ENTRY_POINTS row "${entryPointName}"`).toBe(
+          true,
+        );
+      }
+    }
+  });
+
+  // The two tests above pass on a walker that finds nothing new, so prove it
+  // finds a Climb wherever a real one could hide.
+  it('finds a Climb behind a new root, through lists, unions and cycles, and skips the queue edge', () => {
+    const probeTypeDefs = /* GraphQL */ `
+      union ClimbProducerProbeResult = PlaylistClimbsResult | QueueState
+
+      type ClimbProducerProbeCycleA {
+        back: ClimbProducerProbeCycleB
+        climbs: PlaylistClimbsResult
+      }
+
+      type ClimbProducerProbeCycleB {
+        forward: ClimbProducerProbeCycleA
+      }
+
+      extend type Query {
+        climbProducerProbeDirect: PlaylistClimbsResult!
+        climbProducerProbeThroughUnion: [ClimbProducerProbeResult!]!
+        climbProducerProbeCycleEntry: ClimbProducerProbeCycleA
+        climbProducerProbeCycleBack: ClimbProducerProbeCycleB
+        climbProducerProbeQueueOnly: QueueState
+      }
+
+      extend type Mutation {
+        climbProducerProbeBareClimb: Climb
+      }
+    `;
+    const roots = rootFieldsReturningClimb(buildSchema([...typeDefs, probeTypeDefs].join('\n')), skippedEdges);
+
+    expect(roots).toEqual(
+      expect.arrayContaining([
+        ...Object.keys(CLIMB_ROOT_COVERAGE),
+        'Query.climbProducerProbeDirect',
+        'Query.climbProducerProbeThroughUnion',
+        'Query.climbProducerProbeCycleEntry',
+        'Query.climbProducerProbeCycleBack',
+        'Mutation.climbProducerProbeBareClimb',
+      ]),
+    );
+    // A queue state reaches Climb only through ClimbQueueItem.climb, which is skipped.
+    expect(roots).not.toContain('Query.climbProducerProbeQueueOnly');
+  });
+});

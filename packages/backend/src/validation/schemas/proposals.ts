@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { BOULDER_GRADES } from '@boardsesh/board-constants/boulder-grade-mapping';
+import { OptionalReleaseContextInputSchema } from './release-context';
+import { BOULDER_GRADES, MOONBOARD_BOULDER_GRADES } from '@boardsesh/board-constants/boulder-grade-mapping';
 import { UUIDSchema, ExternalUUIDSchema, BoardNameSchema } from './primitives';
 import { BOARD_ANGLE_VALIDATION_MESSAGE, isBoardAngleSupported } from './board-angles';
 
@@ -12,8 +13,11 @@ export const ProposalTypeSchema = z.enum(['grade', 'classic', 'benchmark', 'hide
  * Every grade label the grades query can hand a client, e.g. `6b+/V4`. A grade
  * proposal stores the label verbatim, so the reporter's choice has to come from
  * this list or the proposal would name a grade nothing else can resolve.
+ * MoonBoard's grades query serves its own labels ("6a/V2"), so they are valid too.
  */
-const BOULDER_GRADE_LABELS = BOULDER_GRADES.map((grade) => grade.difficulty_name);
+const BOULDER_GRADE_LABELS = [
+  ...new Set([...BOULDER_GRADES, ...MOONBOARD_BOULDER_GRADES].map((grade) => grade.difficulty_name)),
+] as [string, ...string[]];
 
 /**
  * Proposal status validation schema
@@ -160,6 +164,7 @@ export const BrowseProposalsInputSchema = z.object({
  */
 export const ReportClimbInputSchema = z
   .object({
+    releaseContext: OptionalReleaseContextInputSchema,
     climbUuid: ExternalUUIDSchema,
     boardType: BoardNameSchema,
     angle: z.number().int().min(-5).max(90).optional().nullable(),

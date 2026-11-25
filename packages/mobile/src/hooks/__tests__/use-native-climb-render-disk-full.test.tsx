@@ -71,7 +71,10 @@ vi.mock('../../lib/error-reporting', () => ({ reportError: reportErrorMock, addE
 const sweepBoardArtCache = vi.hoisted(() =>
   vi.fn(() => Promise.resolve({ beforeBytes: 0, freedBytes: 0, filesDeleted: 0 })),
 );
-vi.mock('../../lib/sweep-caches', () => ({ sweepBoardArtCache }));
+vi.mock('../../lib/sweep-caches', () => ({
+  sweepBoardArtCache,
+  reconcileOverlayIndexWithDisk: vi.fn(() => Promise.resolve(0)),
+}));
 
 vi.mock('../../lib/hold-color-overrides', async (importOriginal) => {
   const original = await importOriginal<typeof import('../../lib/hold-color-overrides')>();
@@ -222,6 +225,15 @@ describe('out-of-space render storm', () => {
     expect(backedOff.result.current.overlayUri).toBeNull();
     expect(backedOff.result.current.backgroundPaths).toEqual(['file:///bg.png']);
     expect(result.current.backgroundPaths).toEqual(['file:///bg.png']);
+  });
+
+  // A surface that holds its photo back until the holds have painted must show
+  // the photo now: while renders are backed off, no overlay is coming.
+  it('says no overlay is coming while backed off', async () => {
+    renderRow(0);
+    await waitFor(() => expect(sweepBoardArtCache).toHaveBeenCalled());
+    const backedOff = renderRow(1);
+    await waitFor(() => expect(backedOff.result.current.overlayUnavailable).toBe(true));
   });
 
   // The same storm, on a phone that isn't set to English: without the free-space

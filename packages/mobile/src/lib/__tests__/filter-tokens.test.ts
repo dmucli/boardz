@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import type { Grade } from '@boardsesh/shared-schema';
 import type { ClimbBoardFilterState } from '@boardsesh/climb-filters';
-import { getActiveFilterTokens, type FilterToken } from '../filter-tokens';
+import { buildNameFilterToken, getActiveFilterTokens, type FilterToken } from '../filter-tokens';
+import { buildGradeRailStops } from '../grade-stops';
 import { DEFAULT_FILTERS, type ClimbFilters } from '../climb-filter-types';
 
 const mockGrades: Grade[] = [
@@ -16,6 +17,7 @@ const mockFormatGradeById = (id: number | null | undefined) => (id == null ? nul
 const text = (value: unknown) => (typeof value === 'string' || typeof value === 'number' ? String(value) : '');
 
 const mockT = ((key: string, options?: Record<string, unknown>) => {
+  if (key === 'mobile.filter.nameToken') return `“${text(options?.name)}”`;
   if (key === 'mobile.search.gradeRange') return `${text(options?.min)}–${text(options?.max)}`;
   if (key === 'mobile.search.gradeMin') return `${text(options?.grade)}+`;
   if (key === 'mobile.search.gradeMax') return `≤${text(options?.grade)}`;
@@ -72,6 +74,81 @@ describe('getActiveFilterTokens', () => {
     expect(tokens[0]).toMatchObject({ key: 'grade', label: 'V2–V6' });
     tokens[0].clear();
     expect(setGrade).toHaveBeenCalledWith({ minGradeId: undefined, maxGradeId: undefined });
+  });
+
+  // The range rail draws grades that read the same as one chip: under V grades
+  // "V0" covers ids 10 to 12. The token has to name the pick as that chip does.
+  describe('with the rail stops given (#5960)', () => {
+    const FONT_SCALE: Grade[] = [
+      { difficultyId: 10, name: '4a/V0' },
+      { difficultyId: 11, name: '4b/V0' },
+      { difficultyId: 12, name: '4c/V0' },
+      { difficultyId: 13, name: '5a/V1' },
+      { difficultyId: 15, name: '5c/V2' },
+    ];
+    // V0 covers 10 to 12; V1 and V2 are one grade each.
+    const V_GRADE_STOPS = buildGradeRailStops(FONT_SCALE, 'v-grade');
+    const gradeLabel = (minGrade: number | undefined, maxGrade: number | undefined) =>
+      getActiveFilterTokens({
+        filters: { ...DEFAULT_FILTERS, minGrade, maxGrade },
+        boardFilters: {},
+        grades: FONT_SCALE,
+        t: mockT,
+        // Deliberately useless: every label below has to come from the stops.
+        formatGradeByDifficultyId: () => 'formatter',
+        gradeStops: V_GRADE_STOPS,
+        patchFilters: vi.fn(),
+        patchBoardFilters: vi.fn(),
+        setGrade: vi.fn(),
+      }).find((token) => token.key === 'grade')?.label;
+
+    it('reads a grouped stop as one grade, not "V0–V0"', () => {
+      expect(gradeLabel(10, 12)).toBe('V0');
+    });
+
+    // Saved under Font grades, or before chips were grouped: the query sends
+    // 4b only, so the token must not claim all of V0.
+    it('names a bound that covers only part of a group precisely, not by the stop', () => {
+      expect(gradeLabel(10, 10)).toBe('V0 / 4A');
+      expect(gradeLabel(11, 11)).toBe('V0 / 4B');
+      expect(gradeLabel(10, 11)).toBe('V0 / 4A–V0 / 4B');
+    });
+
+    it('reads a range between whole stops with each stop label once', () => {
+      expect(gradeLabel(10, 15)).toBe('V0–V2');
+      expect(gradeLabel(10, 13)).toBe('V0–V1');
+    });
+
+    it('names only the end that sits inside its group precisely', () => {
+      expect(gradeLabel(11, 13)).toBe('V0 / 4B–V1');
+      expect(gradeLabel(11, 15)).toBe('V0 / 4B–V2');
+    });
+
+    it('names an open-ended bound by its stop when it starts on the stop edge, precisely when not', () => {
+      expect(gradeLabel(10, undefined)).toBe('V0+');
+      expect(gradeLabel(undefined, 12)).toBe('≤V0');
+      expect(gradeLabel(12, undefined)).toBe('V0 / 4C+');
+      expect(gradeLabel(undefined, 11)).toBe('≤V0 / 4B');
+    });
+
+    it('falls back to the formatter for a grade the rail has no chip for', () => {
+      expect(gradeLabel(99, 99)).toBe('formatter');
+    });
+  });
+
+  it('reads two ends with one formatted label as one grade without the stops too', () => {
+    const sameLabel = () => 'V0';
+    const tokens = getActiveFilterTokens({
+      filters: { ...DEFAULT_FILTERS, minGrade: 5, maxGrade: 10 },
+      boardFilters: {},
+      grades: mockGrades,
+      t: mockT,
+      formatGradeByDifficultyId: sameLabel,
+      patchFilters: vi.fn(),
+      patchBoardFilters: vi.fn(),
+      setGrade: vi.fn(),
+    });
+    expect(tokens[0]).toMatchObject({ key: 'grade', label: 'V0' });
   });
 
   it('omits the grade token when grades data is unavailable', () => {
@@ -185,6 +262,14 @@ describe('getActiveFilterTokens', () => {
     expect(patchFilters).toHaveBeenCalledWith({ onlyRatedByMe: undefined });
   });
 
+  it('gives the Liked collection a token that clears only onlyFavorited (#6002)', () => {
+    const { tokens, patchFilters } = build({ ...DEFAULT_FILTERS, onlyFavorited: true });
+    const liked = tokens.find((token) => token.key === 'liked');
+    expect(liked?.label).toBe('mobile.filter.collection.liked');
+    liked?.clear();
+    expect(patchFilters).toHaveBeenCalledWith({ onlyFavorited: undefined });
+  });
+
   it('orders grade first, then refinements in summary order', () => {
     const { tokens } = build({
       ...DEFAULT_FILTERS,
@@ -195,5 +280,67 @@ describe('getActiveFilterTokens', () => {
       routes: true,
     });
     expect(keys(tokens)).toEqual(['grade', 'minAscents', 'status', 'climbType']);
+  });
+});
+
+// A list with other defaults (a playlist: both climb types on, its own sort kept
+// apart) passes them, so its own starting state never reads as a filter.
+describe('getActiveFilterTokens with a list’s own defaults', () => {
+  const PLAYLIST_DEFAULTS: ClimbFilters = { ...DEFAULT_FILTERS, routes: true };
+
+  function buildWithDefaults(filters: ClimbFilters) {
+    const patchFilters = vi.fn();
+    const tokens = getActiveFilterTokens({
+      filters,
+      boardFilters: {},
+      grades: mockGrades,
+      t: mockT,
+      formatGradeByDifficultyId: mockFormatGradeById,
+      patchFilters,
+      patchBoardFilters: vi.fn(),
+      setGrade: vi.fn(),
+      defaults: PLAYLIST_DEFAULTS,
+    });
+    return { tokens, patchFilters };
+  }
+
+  it('shows no climb-type token for both types on, the playlist default', () => {
+    expect(buildWithDefaults(PLAYLIST_DEFAULTS).tokens).toEqual([]);
+  });
+
+  it('names boulders only, and clears back to both', () => {
+    const { tokens, patchFilters } = buildWithDefaults({ ...PLAYLIST_DEFAULTS, boulders: true, routes: false });
+    expect(keys(tokens)).toEqual(['climbType']);
+    expect(tokens[0]?.label).toBe('search.summary.bouldersOnly');
+    tokens[0]?.clear();
+    expect(patchFilters).toHaveBeenCalledWith({ boulders: true, routes: true });
+  });
+
+  it('measures the sort against the given defaults', () => {
+    expect(buildWithDefaults({ ...PLAYLIST_DEFAULTS, sortBy: 'quality' }).tokens.map((token) => token.key)).toEqual([
+      'sort',
+    ]);
+  });
+
+  it('still names a both-types pick on the Climbs list', () => {
+    const { tokens } = build({ ...DEFAULT_FILTERS, routes: true });
+    expect(tokens.find((token) => token.key === 'climbType')?.label).toBe('Boulders & routes');
+  });
+});
+
+// No list has a search field: the name is typed in the Filters sheet and shows as
+// the token row's first token.
+describe('buildNameFilterToken', () => {
+  it('names a trimmed search and clears it', () => {
+    const clear = vi.fn();
+    const token = buildNameFilterToken('  crimp ', mockT, clear);
+    expect(token).toMatchObject({ key: 'name', label: '“crimp”' });
+    token?.clear();
+    expect(clear).toHaveBeenCalledTimes(1);
+  });
+
+  it('builds nothing for an empty or blank name', () => {
+    expect(buildNameFilterToken('', mockT, vi.fn())).toBeNull();
+    expect(buildNameFilterToken('   ', mockT, vi.fn())).toBeNull();
   });
 });

@@ -31,8 +31,8 @@ function boardParams(board: BoardConfig): Record<string, string> {
  *
  * A single accepted action owns the whole handoff: dismiss the custom actions overlay,
  * await any source native sheet, await the `/play` native-stack closing transition, then
- * push create. CreateDrawer intentionally remains outside the sheet coordinator, so the
- * two preceding surfaces must be physically gone before its first render presents it.
+ * push create. New climb is a native modal route outside the sheet coordinator, so the
+ * two preceding surfaces must be physically gone before it presents.
  */
 export function useCreateClimbNavigation({
   dismissSourceSheet,
@@ -57,20 +57,32 @@ export function useCreateClimbNavigation({
       actionInFlightRef.current = true;
       onActionAccepted?.();
 
+      // The claim covers the handoff, not the hook's lifetime: once the route
+      // is pushed, or the handoff stopped short (an aborted dismissal navigates
+      // nowhere), the next action is a fresh one. A surface that outlives the
+      // handoff (the play drawer's lost-hold banner, an iPad pane) would
+      // otherwise be dead until it remounted.
       const completeHandoff = async () => {
         const dismissSource = dismissSourceSheetRef.current;
         if (dismissSource) {
           const sourceResult = await dismissSource();
-          if (sourceResult.status === 'aborted') return;
+          if (sourceResult.status === 'aborted') {
+            actionInFlightRef.current = false;
+            return;
+          }
         }
 
         const dismissPlayer = dismissPlayerAndWaitRef.current;
         if (dismissPlayer) {
           const playerResult = await dismissPlayer();
-          if (playerResult.status === 'aborted') return;
+          if (playerResult.status === 'aborted') {
+            actionInFlightRef.current = false;
+            return;
+          }
         }
 
         router.push({ pathname: '/(tabs)/climbs/create', params });
+        actionInFlightRef.current = false;
       };
       void completeHandoff().catch((error: unknown) => {
         // The owning overlay is already closing, so keep this presentation's
@@ -99,13 +111,10 @@ export function useCreateClimbNavigation({
           // to the legacy `No match` description prefix, and `"[]"` (a source
           // whose rules are all at their defaults) must not read as absent.
           ...(climb.characteristics ? { forkCharacteristics: JSON.stringify(climb.characteristics) } : {}),
-          // The source's grade, as the canonical scale name ("6c/V5"). A board
-          // that publishes with the setter's own grade (a spray wall) has nowhere
-          // else to get one, so without this a remix of a graded climb opens
-          // ungraded and is blocked from publishing until the setter finds the
-          // grade again. Omitted when the source carries none, which reads as
-          // "nothing to inherit" rather than "ungraded on purpose".
-          ...(climb.difficulty ? { forkDifficulty: climb.difficulty } : {}),
+          // The parent's uuid, so the editor can draw a grey ring where each
+          // hold it lost used to be. The frames above already name them; only
+          // the server knows where they were.
+          forkParentUuid: climb.uuid,
           ...boardParams(resolveClimbRenderBoard(climb, board)?.boardConfig ?? board),
         },
         onActionAccepted,

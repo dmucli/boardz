@@ -1,5 +1,8 @@
 /// <reference types="node" />
 
+import { OTA_SERVER_VERSION, OTA_IMAGE_REPOSITORY, OTA_HOSTING_PROVIDER } from '../ota/server';
+import type { OtaHostingProvider } from '../ota/server';
+
 // Declarative desired-state for the Railway project that runs the self-hosted xprem
 // OTA server. This is plain typed data — no side effects, no API calls.
 // scripts/railway-apply.ts reads it, diffs it against the live project, and (only
@@ -8,7 +11,7 @@
 // Why this exists:
 //
 // 1. `boardsesh-ota-v3` is the Railway service every production and TestFlight
-//    binary talks to for OTA manifests (docs/mobile-ota-updates.md). Its
+//    binary talks to for OTA manifests (docs/operations/mobile-ota-updates.md). Its
 //    configuration was set by hand in the Railway dashboard, so nothing in the repo
 //    records what it is supposed to look like and nothing notices when it drifts.
 //
@@ -37,7 +40,7 @@
  */
 export const RAILWAY_ENVIRONMENT_NAME = 'production';
 
-/** The xprem OTA server. Named in docs/mobile-ota-updates.md; matched by name, not id. */
+/** The xprem OTA server. Named in docs/operations/mobile-ota-updates.md; matched by name, not id. */
 export const OTA_SERVICE_NAME = 'boardsesh-ota-v3';
 
 /** The ClickHouse service backing xprem's Observe feature. */
@@ -49,7 +52,7 @@ export const WEB_SERVICE_NAME = 'boardsesh-web';
 /**
  * The production PostgreSQL 18 primary. Declared assert-only and for its TLS
  * variables alone: its image digest, volume and networking are managed by the
- * reviewed publish flow in docs/postgres-image-publishing.md, not from here.
+ * reviewed publish flow in docs/operations/postgres-image-publishing.md, not from here.
  */
 export const POSTGRES_PRIMARY_SERVICE_NAME = 'PostGIS - PG18';
 
@@ -59,40 +62,29 @@ export const CANONICAL_WEB_ORIGIN = 'https://www.boardsesh.com';
 /** The dedicated Postgres holding xprem's control plane — and the app's signing key. */
 export const OTA_POSTGRES_SERVICE_NAME = 'Postgres';
 
-/**
- * The xprem release declared for deployment.
- *
- * This is the one place the desired server version is written down. Before it
- * lived here it was prose in four files, kept honest by a self-expiring marker in
- * scripts/__tests__/eoas-version-parity.test.ts — a convention that existed only
- * because nothing in the repo could perform the dashboard action. Now the apply
- * script can, so the constant is the source of truth and the test compares against
- * it. The declaration alone does not prove that a deployment has succeeded;
- * railway-apply reads the configured and running images before reporting sync.
- *
- * Bumping this is an upgrade. scripts/ota-image-bump.ts opens that PR, and moves
- * EOAS_PACKAGE_SPEC (scripts/lib/eoas.ts) in the same commit.
- */
-export const OTA_SERVER_VERSION = '3.2.5';
-
-/**
- * The repository path Railway pulls from.
- *
- * Deliberately the PRE-RENAME name. Upstream renamed expo-open-ota → xprem at
- * v3.1.0 and still publishes both names for the same release, and the Railway
- * service was created against the old path. So a service that does not say
- * `xprem` is not a sign the server is behind — see docs/mobile-ota-updates.md.
- */
-export const OTA_IMAGE_REPOSITORY = 'ghcr.io/mercuretechnologies/expo-open-ota';
-
-/** The exact image the OTA service must run. */
+// The portable release is the source of version/CLI parity. Railway retains its
+// existing tag reference until the hosting switch, avoiding an incidental rollout
+// while the homelab copy is rehearsed. The homelab deploys the immutable digest.
+export { OTA_SERVER_VERSION, OTA_IMAGE_REPOSITORY } from '../ota/server';
 export const OTA_IMAGE = `${OTA_IMAGE_REPOSITORY}:v${OTA_SERVER_VERSION}`;
 
 /** Public origin of the OTA server. Also the value of its own BASE_URL. */
 export const OTA_BASE_URL = 'https://updates.boardsesh.com';
 
+/**
+ * The public R2 custom domain xprem redirects asset requests to.
+ *
+ * Repeated rather than imported from infra/cloudflare, which owns the host:
+ * the two tools share no code. scripts/__tests__/railway-config-inventory.test.ts
+ * fails if the two literals drift.
+ */
+export const OTA_CDN_BASE_URL = 'https://ota-assets.boardsesh.com';
+
 /** The port xprem listens on inside the container, and the custom domain's target. */
 export const OTA_CONTAINER_PORT = 8080;
+
+/** xprem trusts this Cloudflare-authored header for Observe country attribution. */
+export const OTA_GEOIP_COUNTRY_HEADER = 'X-Geo-Country';
 
 /**
  * xprem's liveness endpoint, used as Railway's healthcheck.
@@ -115,7 +107,7 @@ export const OTA_READINESS_PATH = '/ready';
  * (built from `docker/clickhouse/Dockerfile`), which layers lean `config.d`/`users.d`
  * overrides on top to cap memory and turn off the system logs. It is published by
  * `.github/workflows/clickhouse-image.yml` on dispatch. Changing this digest is how a new
- * image is rolled out (docs/railway.md, "Rolling out a new ClickHouse image"):
+ * image is rolled out (docs/operations/railway.md, "Rolling out a new ClickHouse image"):
  * railway-apply compares it against both the configured and the serving image, deploys
  * a change only with --allow-image-change, and then probes the OTA server's readiness,
  * because xprem is the thing that has to reach ClickHouse.
@@ -213,10 +205,31 @@ export interface RequiredEnvVar {
    * values are secrets; AWS_BASE_ENDPOINT is intentionally provider-managed.
    */
   value?: string;
+  /**
+   * A URL that must answer before `--apply` may set this variable.
+   *
+   * For a value that sends clients somewhere else. The post-deploy probe only
+   * asks the service whether it is healthy, and a server redirecting every
+   * asset request to a host that does not resolve is perfectly healthy. Any
+   * HTTP status below 500 passes; a failed lookup or connection stops the run
+   * before it writes anything.
+   */
+  preflightUrl?: string;
 }
 
 /** A variable that must NOT be set, because setting it changes how xprem behaves. */
 export interface ForbiddenEnvVar {
+  name: string;
+  reason: string;
+}
+
+/**
+ * A secret variable which may be absent: an owner sets it when a rollout step
+ * calls for it. Declared by name only, like a presence-only RequiredEnvVar, so
+ * its value is never printed and never written. When present it must not be an
+ * unfilled placeholder. Absence is not drift.
+ */
+export interface OptionalEnvVar {
   name: string;
   reason: string;
 }
@@ -266,7 +279,7 @@ export interface DeploySettings {
    * Railway defaults to 0s, so both signals arrive together and an in-flight
    * manifest or asset fetch is severed mid-response on every redeploy — the same
    * root cause railway.toml's `drainingSeconds` fixes for web and backend
-   * (docs/production-deploy.md). This service has no railway.toml to carry it:
+   * (docs/operations/production-deploy.md). This service has no railway.toml to carry it:
    * Config-as-Code is read from the service's *source repository* at deploy time,
    * and this service's source is a third-party image with no repo attached.
    *
@@ -300,6 +313,7 @@ export interface ServiceDesired {
   name: string;
   management: ServiceManagement;
   requiredVars: RequiredEnvVar[];
+  optionalVars?: OptionalEnvVar[];
   optionalConstrainedVars?: OptionalConstrainedEnvVar[];
   requiredConstrainedVars?: RequiredConstrainedEnvVar[];
   requiredOneOfVars?: RequiredOneOfEnvVars[];
@@ -370,11 +384,11 @@ export interface RailwayDesiredState {
 }
 
 /**
- * Retention for the two Observe fact tables.
+ * Retention for every table xprem keeps in ClickHouse.
  *
- * xprem's ClickHouse migrations ship NO TTL on any table — verified across both
- * files in internal/database/clickhouse/migrations/. Left alone these grow without
- * bound, and the growth is invisible until a volume fills.
+ * xprem's ClickHouse migrations ship NO TTL on any table — verified across every
+ * file in internal/database/clickhouse/migrations/ at v3.2.6. Left alone these grow
+ * without bound, and the growth is invisible until a volume fills.
  *
  * Logs get the shorter window because their bodies and attribute blobs dominate the
  * bytes, while the metrics are narrow numeric rows that compress well and are the
@@ -429,6 +443,26 @@ export const CLICKHOUSE_RETENTION: TableRetentionDesired[] = [
     // summarise.
     reason: 'Raw per-device adoption events: the lowest volume here and the record the rest is derived from.',
   },
+  // The two below arrived with error tracking in xprem 3.2.6 and, like the rest,
+  // ship with no TTL. The Errors view reads at most 31 days back, so 90 days is
+  // history nothing queries, kept in step with the metrics it is read beside.
+  {
+    table: 'error_occurrences',
+    column: 'hour',
+    ttlDays: 90,
+    // Filled by the error_occurrences_mv materialized view as logs arrive, and
+    // partitioned by day: without a TTL it gains a partition every day forever.
+    reason: 'Hourly error counts per update, one partition a day; read 31 days back at most.',
+  },
+  {
+    table: 'error_groups',
+    column: 'symbolicated_at',
+    ttlDays: 90,
+    // One row per (update, error) holding a whole symbolicated trace. The sweep
+    // in ee/observe/error_groups_job.go writes a row for any counted error that
+    // lacks one, so an expired row for an error still happening is written again.
+    reason: 'One symbolicated stack trace per update and error: wide rows, rewritten on demand.',
+  },
 ];
 
 /**
@@ -461,6 +495,12 @@ export const OTA_FORBIDDEN_VARS: ForbiddenEnvVar[] = [
     name: 'EXPO_APP_ID',
     reason: 'A V2/stateless setting. V3 routes on the expo-app-id request header the binary sends.',
   },
+  {
+    name: 'BUNDLE_DIFFING_CDN_REDIRECT',
+    reason:
+      'Sends patch requests to the CDN, which does not add the im and expo-base-update-id headers. ' +
+      'Native expo-updates rejects those patches and retries the full bundle, wasting transfer and launch time.',
+  },
 ];
 
 /**
@@ -490,6 +530,23 @@ export const OTA_REQUIRED_VARS: RequiredEnvVar[] = [
     name: 'AWS_REGION',
     value: 'auto',
     reason: 'The configured S3-compatible backend uses its automatic region selector.',
+  },
+  {
+    name: 'CDN_BASE_URL',
+    value: OTA_CDN_BASE_URL,
+    // The R2 custom domain answers 404 at its root once Cloudflare has attached
+    // it; before that the name does not resolve.
+    preflightUrl: `${OTA_CDN_BASE_URL}/`,
+    reason:
+      'Asset requests redirect to the edge-cached, compressed R2 domain instead of a presigned bucket URL. ' +
+      'This tool never unsets a variable: to roll back, unset it in Railway and revert the declaration.',
+  },
+  {
+    name: 'BUNDLE_DIFFING',
+    value: 'true',
+    reason:
+      'Serves a bsdiff patch instead of the full Hermes bundle to a device at most five updates behind. ' +
+      'BUNDLE_DIFFING_CDN_REDIRECT stays unset: the edge does not add the patch headers expo-updates requires.',
   },
   {
     name: 'AWS_BASE_ENDPOINT',
@@ -548,7 +605,7 @@ export const OTA_REQUIRED_VARS: RequiredEnvVar[] = [
   // The three Redis connection variables below, plus CACHE_MODE and
   // CACHE_KEY_PREFIX in the OTA service's requiredConstrainedVars, move xprem's manifest/asset
   // cache out of the Go heap and into the project's shared Railway Redis.
-  // Rollback lives in docs/railway-cost-reduction.md ("OTA server Redis
+  // Rollback lives in docs/operations/railway-cost-reduction.md ("OTA server Redis
   // cache, September 26").
   {
     name: 'REDIS_HOST',
@@ -589,7 +646,7 @@ export const INVENTORY_SERVICES: ServiceDesired[] = [
     name: 'boardsesh-scheduler',
     management: 'inventory',
     requiredVars: [],
-    managedBy: 'the Railway dashboard; see docs/scheduler.md',
+    managedBy: 'the Railway dashboard; see docs/backend/scheduler.md',
   },
   {
     name: 'Redis',
@@ -599,7 +656,7 @@ export const INVENTORY_SERVICES: ServiceDesired[] = [
   },
 ];
 
-export const desiredRailwayState: RailwayDesiredState = {
+const railwayHostedState: RailwayDesiredState = {
   environmentName: RAILWAY_ENVIRONMENT_NAME,
   services: [
     {
@@ -627,11 +684,25 @@ export const desiredRailwayState: RailwayDesiredState = {
       // disagree on manifests, but it doubles cost and nothing needs the capacity.
       // Reported, never applied: replica count is a cost decision.
       expectedScale: { numReplicas: 1, region: 'us-west2' },
-      // The checklist docs/mobile-ota-updates.md already prescribes after any bump.
+      // The checklist docs/operations/mobile-ota-updates.md already prescribes after any bump.
       verify: { baseUrl: OTA_BASE_URL, paths: [OTA_HEALTHCHECK_PATH, OTA_READINESS_PATH] },
       requiredVars: OTA_REQUIRED_VARS,
       forbiddenVars: OTA_FORBIDDEN_VARS,
       requiredConstrainedVars: [
+        {
+          name: 'TRUST_GEOIP_HEADERS',
+          allowedValues: ['true'],
+          reason:
+            'Enables xprem country attribution from the Cloudflare request-header transform on ' +
+            'updates.boardsesh.com. This is telemetry-only and must never become an authorization signal.',
+        },
+        {
+          name: 'GEOIP_HEADER_COUNTRY',
+          allowedValues: [OTA_GEOIP_COUNTRY_HEADER],
+          reason:
+            'Pins xprem to the host-scoped X-Geo-Country header that Cloudflare overwrites from ip.src.country, ' +
+            'instead of accepting every provider-specific location header in its default catalog.',
+        },
         {
           name: 'CACHE_MODE',
           allowedValues: ['redis'],
@@ -708,12 +779,51 @@ export const desiredRailwayState: RailwayDesiredState = {
           name: 'SMTP_PASSWORD',
           reason: 'Required to authenticate the SMTP transport for credential-account emails.',
         },
+        {
+          name: 'EMAIL_FROM',
+          reason:
+            'Required so password-reset and verification emails use the configured Boardsesh sender ' +
+            'instead of falling back to the SMTP login address.',
+        },
+      ],
+      optionalVars: [
+        {
+          name: 'WEB_DATABASE_URL',
+          reason:
+            "The web's own connection string for the restricted boardsesh_web login (BA-04 writer fence). " +
+            'Unset, the web keeps DATABASE_URL. Setting it before the web identity writes move to the backend ' +
+            'breaks sign-up, password reset and email verification, so the web refuses to boot with it until then ' +
+            '(WEB_DATABASE_LOGIN_BLOCKED). Runbook #7430 owns the switch, then removing DATABASE_URL here.',
+        },
+        {
+          name: 'CLOUDFLARE_ORIGIN_PROOF_SECRET',
+          reason:
+            'The value our Cloudflare zone sets as X-Boardsesh-Origin-Proof on www /api/auth/ requests (#7766). ' +
+            'Set, the web believes CF-Connecting-IP only on requests carrying it. Unset or under 32 bytes, the ' +
+            'auth limiters behave as before and staged sign-in sends no client address. Add the Cloudflare rule ' +
+            'first, then this: docs/auth/better-auth-web-password-delegation.md, "Turning on the origin proof".',
+        },
+        {
+          name: 'CLOUDFLARE_ORIGIN_PROOF_SECRET_NEXT',
+          reason:
+            'A second accepted origin proof value, set only during a rotation so www visitors are never ' +
+            'unproven: set this to the new value, change the Cloudflare rule, then move it to ' +
+            'CLOUDFLARE_ORIGIN_PROOF_SECRET and unset this. Same 32-byte rule.',
+        },
       ],
       optionalConstrainedVars: [
         {
           name: 'BOARDSESH_WEB',
           allowedValues: ['1'],
           reason: 'The Docker image enables the www-to-app auth bridge; any other dashboard override disables it.',
+        },
+        {
+          name: 'PARTNER_OAUTH_MODE',
+          allowedValues: ['off', 'hold', 'allowlist', 'open'],
+          reason:
+            'The web reads any other value as off: it stops guarding OAuth account links and stops marking ' +
+            'sign-ins link_guarded, so partner consent on the backend asks every climber to sign in again, ' +
+            'forever. Set it to the same value as boardsesh-backend at every change, web first when turning on.',
         },
       ],
       requiredOneOfVars: [
@@ -730,3 +840,17 @@ export const desiredRailwayState: RailwayDesiredState = {
   clickhouseRetention: CLICKHOUSE_RETENTION,
   clickhouseVolumeUsageLimitPercent: CLICKHOUSE_VOLUME_USAGE_LIMIT_PERCENT,
 };
+
+/** Hosting ownership is explicit. Retained rollback resources are never reconciled. */
+export function railwayStateForHosting(provider: OtaHostingProvider): RailwayDesiredState {
+  if (provider === 'railway') return railwayHostedState;
+  if (provider !== 'homelab') throw new Error('Unknown OTA hosting provider');
+  const retired = new Set([OTA_SERVICE_NAME, CLICKHOUSE_SERVICE_NAME, OTA_POSTGRES_SERVICE_NAME]);
+  return {
+    ...railwayHostedState,
+    services: railwayHostedState.services.filter((service) => !retired.has(service.name)),
+    clickhouseRetention: [],
+  };
+}
+
+export const desiredRailwayState = railwayStateForHosting(OTA_HOSTING_PROVIDER);

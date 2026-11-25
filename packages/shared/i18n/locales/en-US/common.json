@@ -10,9 +10,35 @@
       "viewProfile": "View {{name}}'s profile",
       "thisClimber": "this climber"
     },
+    "a11y": {
+      "clearSearch": "Clear search",
+      "opensOutsideApp": "Opens outside Boardsesh"
+    },
     "settings": {
       "title": "Settings",
-      "library": "Library",
+      "pages": {
+        "general": {
+          "title": "General"
+        },
+        "board": {
+          "title": "Board"
+        },
+        "climbs": {
+          "title": "Climbs & grades"
+        },
+        "home": {
+          "title": "Home"
+        },
+        "earlyAccess": {
+          "title": "Early access"
+        },
+        "developer": {
+          "title": "Developer"
+        },
+        "timers": {
+          "title": "Timers"
+        }
+      },
       "development": "Development",
       "dev": {
         "forceServerUnreachable": "Force server unreachable",
@@ -22,7 +48,6 @@
       "metroServersSubtitle": "Switch between Tailnet bundlers",
       "boardLook": {
         "title": "Board look",
-        "rowSubtitleShort": "How your board renders, plus colours and shapes",
         "rendererUnavailable": {
           "title": "Update the app",
           "body": "This build can't draw the Aura look yet. Update Boardsesh to unlock it — for now your board renders in Classic."
@@ -40,6 +65,7 @@
           "aura": "Aura",
           "auraBold": "Aura Bold",
           "auraSubtle": "Aura Subtle",
+          "auraOutline": "Aura Outline",
           "modernClassic": "Modern Classic",
           "maxContrast": "Max contrast",
           "descriptions": {
@@ -48,6 +74,7 @@
             "modernClassic": "The circles you know, on a quietened wall.",
             "maxContrast": "The strongest wash and filled holds.",
             "auraBold": "A wider, harder glow that carries across the room.",
+            "auraOutline": "A solid outline on each hold, with a tight glow.",
             "classic": "The circle markers Boardsesh has always drawn.",
             "custom": "Tune every part of the look yourself."
           },
@@ -103,12 +130,16 @@
             "options": {
               "glow": "Glow",
               "glowFill": "Glow + fill",
-              "fill": "Fill"
+              "fill": "Fill",
+              "outline": "Outline"
             }
           },
           "fillOpacity": {
             "title": "Fill strength",
             "value": "{{value}}%"
+          },
+          "outlineOpacity": {
+            "title": "Outline strength"
           },
           "softDisc": {
             "label": "Soft disc",
@@ -132,6 +163,7 @@
         },
         "accessibility": {
           "title": "Accessibility",
+          "pageTitle": "Hold colours & shapes",
           "classicOnlyNote": "Marker shape, brush, and size only apply to the Classic render. In Boardsesh, the lit hold's own silhouette is the shape — turn on role glyphs below for a shape-based cue instead.",
           "roleGlyphs": {
             "label": "Role glyphs",
@@ -177,8 +209,25 @@
             "body": "Role glyphs put a shape on each lit hold, so start, hand, finish and foot stay apart without colour. Your board's own LEDs don't change.",
             "apply": "Turn on role glyphs"
           },
+          "differentiateWithoutColor": {
+            "title": "Differentiate Without Color is on"
+          },
           "dismiss": "Not now",
           "dismissAccessibility": "Dismiss this suggestion"
+        },
+        "sprayWalls": {
+          "title": "Spraywalls",
+          "useOwnLook": "Use my look on Spraywalls",
+          "footer": "Spraywalls show the look their creator picked for the photo. Turn this on to see your own look there instead."
+        },
+        "moonboard": {
+          "title": "MoonBoard",
+          "gridLabels": "Grid letters and numbers",
+          "footer": "Shows A to K and the row numbers around the board, so you can call holds like F5."
+        },
+        "gpuAcceleration": {
+          "title": "GPU acceleration",
+          "description": "Draws lit holds with your phone's graphics chip. Turn off if the board flickers or stutters."
         }
       },
       "accessibility": {
@@ -266,7 +315,6 @@
       },
       "storage": {
         "title": "Storage",
-        "rowLabel": "Manage storage",
         "rowSubtitle": "See what your downloads take up and clear what you don't need",
         "intro": "Boards you download take up space on this phone. Clear the ones you're not climbing on.",
         "offNote": "Offline downloads are off right now. You can still clear what's already on this phone.",
@@ -282,7 +330,7 @@
         "keptOffline": "Kept offline",
         "notKeptOffline": "Not kept offline anymore — still taking up space",
         "estimateNote": "Board sizes are estimates. Two sizes of the same layout share their climbs, so they won't add up to the total.",
-        "remove": "Remove",
+        "tapToRemove": "Tap a board to remove it from this phone.",
         "removeAria": "Remove {{name}} from this phone",
         "cancel": "Cancel",
         "removeTitle": "Remove {{name}}?",
@@ -299,6 +347,8 @@
         "errorTitle": "Couldn't measure your downloads",
         "errorSubtitle": "Something got in the way of reading what's on this phone.",
         "errorRetry": "Try again",
+        "downgradeTitle": "Offline storage is paused",
+        "downgradeSubtitle": "This phone is on an older version of the app than the one that saved your data. Your downloaded boards and any sends waiting to sync stay on this phone and come back with the next update.",
         "cachedImagesHeader": "Cached images",
         "cachedImagesArtLabel": "Board art",
         "cachedImagesPhotosLabel": "Photos",
@@ -325,11 +375,6 @@
         "both": "Both"
       },
       "displayOptions": {
-        "title": "Display",
-        "playlistTags": "Show playlist tags",
-        "playlistTagsDescription": "See which playlists each climb is in, right on the list.",
-        "quickActionsButton": "Show quick-actions button",
-        "quickActionsButtonDescription": "Add a ⋮ button to each climb that opens queue, tick, playlists and more. You can always long-press instead.",
         "boardseshGrades": "Show Boardsesh grades",
         "boardseshGradesDescription": "Grades built from real sends across boards. The setter's grade stays until enough sends come in.",
         "personalGrades": "Use my grades",
@@ -355,15 +400,13 @@
         "contributeTitle": "Help translate Boardsesh",
         "contributeSubtitle": "These come from the community. Open the {{language}} files on GitHub to fix or add a phrase."
       },
-      "diagnostics": {
-        "title": "Privacy",
-        "recording": "Help us improve",
-        "recordingDescription": "Send anonymous, masked session recordings so we can squash bugs faster. Your typing and photos stay hidden. Flip it off whenever you like."
+      "startup": {
+        "title": "Open the app on",
+        "footer": "Starts next time you open the app. Links, notifications and setup still open where they point."
       },
-      "integrations": {
-        "title": "Connected apps",
-        "subtitle": "Board accounts, Apple Health",
-        "subtitleWithStrava": "Board accounts, Apple Health, Strava"
+      "diagnostics": {
+        "recording": "Share session recordings",
+        "recordingDescription": "Records your screen in the app so we can see a bug happen. Your typing and photos stay hidden. Turn it on while you reproduce a problem for support, then switch it off."
       },
       "syncIssues": {
         "title": "Sync issues",
@@ -381,6 +424,9 @@
         "failedMessage_other": "{{count}} changes couldn't sync, and signing out deletes them. Cancel and hit Retry sync first if you want to keep them.",
         "confirm": "Sign out",
         "cancel": "Cancel",
+        "downgradeMessage": "This phone is waiting on an app update before it can open your offline data. If someone else signs in here before that update, any sends still waiting to sync on this phone are lost.",
+        "downgradeConfirm": "Sign out anyway",
+        "downgradeCancel": "Stay signed in",
         "failureTitle": "Sign-out wasn't confirmed",
         "failure": "Boardsesh couldn't confirm sign-out. Reconnect and sign out again before leaving this device."
       },
@@ -392,6 +438,231 @@
         "pickSubtitle": "Try a change before it ships and tell us how it went",
         "testPlanTitle": "Test plan #{{prNumber}}",
         "testPlanSubtitle": "What to try on the preview you're running"
+      },
+      "earlyUpdates": {
+        "sectionTitle": "App updates",
+        "title": "Get updates early",
+        "offSubtitle": "New features as soon as they land, before everyone else",
+        "onSubtitle": "You're on early updates",
+        "waitingSubtitle": "On, waiting for the next early update",
+        "leavingSubtitle": "Switched off. Regular updates take over once the next one is ready for this phone.",
+        "testingBody": "A preview is pinned on this phone. Leave it first, then change this.",
+        "footer": "Early updates can have rough edges now and then. Changes here apply next time you open the app.",
+        "joinDeferred": "Can't reach the update server. We'll try again next time you open the app; early updates start the time after.",
+        "leaveDeferred": "Can't switch back yet. We'll try again next time you open the app."
+      },
+      "climbDrawer": {
+        "description": "Choose what you see below the climb, and in what order.",
+        "settingsFooter": "Choose what you see below the climb. To change the order, open the ⋯ menu on a climb and pick View options.",
+        "loading": "Loading view options…",
+        "hideAll": "Hide all",
+        "showAll": "Show all",
+        "restoreDefaults": "Restore defaults",
+        "sections": {
+          "activeHolds": "Active holds",
+          "logbook": "Logbook",
+          "climberLogs": "Climber logs",
+          "setterNotes": "Setter’s notes",
+          "betaVideos": "Beta videos",
+          "boardseshGrade": "Boardsesh grade",
+          "community": "Community",
+          "similarClimbs": "Similar climbs"
+        },
+        "sheetTitle": "View options",
+        "groupTitle": "Below the climb",
+        "footer": "Changes apply immediately. Hide all for just the climb, without vertical scrolling.",
+        "tabs": {
+          "sections": "Below the climb",
+          "buttons": "Buttons",
+          "miniPlayer": "Mini player"
+        }
+      },
+      "sectionLayout": {
+        "moveUp": "Move {{section}} up",
+        "moveDown": "Move {{section}} down",
+        "moved": "{{section}}, {{position}} of {{count}}"
+      },
+      "homeSections": {
+        "groupTitle": "On Home",
+        "customize": "Customize Home",
+        "description": "Choose what Home shows, and in what order. Focused shows your board, session and playlists.",
+        "settingsFooter": "Choose what Home shows, and in what order. Customize Home, on Home itself, changes the same list.",
+        "footer": "Changes apply right away, on this phone only. They don't change who can see your climbing.",
+        "showAll": "Show all",
+        "focused": "Focused",
+        "restoreDefaults": "Restore defaults",
+        "sections": {
+          "week": "This week",
+          "board": "Your board",
+          "session": "Session",
+          "projects": "Your projects",
+          "playlists": "At your level",
+          "climbingNow": "Climbing now",
+          "beta": "Fresh beta",
+          "feed": "Feed"
+        },
+        "descriptions": {
+          "week": "Sessions, sends and weeks running",
+          "board": "Browse climbs or change board",
+          "session": "Your last workout, or start a session",
+          "projects": "Climbs you tried and haven't sent",
+          "playlists": "At your level, Hidden gems and Fresh",
+          "climbingNow": "Live sessions you can join",
+          "beta": "New beta videos for your board",
+          "feed": "Sessions and new climbs from your crew. Always last."
+        },
+        "presets": {
+          "default": "Default",
+          "custom": "Custom"
+        }
+      },
+      "climbList": {
+        "title": "Climb list",
+        "picture": "Picture",
+        "underName": "Under the name",
+        "yourClimbing": "Your climbing",
+        "actions": "Actions",
+        "layout": {
+          "title": "Columns",
+          "one": "One column",
+          "two": "Two columns",
+          "footer": "Two columns show when the list has room, like on an iPad in landscape."
+        },
+        "gradesTitle": "Grades",
+        "previewFooter": "Example. Sends, saves and tags show on climbs that have them.",
+        "gradeFooter": "Choose which grade is big in Settings → Climbs & grades.",
+        "personalFooter": "Personal marks and playlists need sign-in and load when online.",
+        "presetsLabel": "Quick setup",
+        "presets": {
+          "namesOnly": "Names only",
+          "textOnly": "Text only",
+          "default": "Default",
+          "everything": "Everything",
+          "custom": "Custom"
+        },
+        "fields": {
+          "thumbnail": "Board picture",
+          "communityGrade": "Community grade",
+          "sends": "Sends",
+          "rating": "Rating",
+          "setter": "Setter",
+          "sentMark": "Sent mark",
+          "playlistTags": "Show playlist tags",
+          "quickActions": "Show quick-actions button",
+          "progress": "My progress"
+        },
+        "sampleName": "Evening project",
+        "sampleSetter": "crewsetter",
+        "samplePlaylistOne": "Projects",
+        "samplePlaylistTwo": "Warm-ups",
+        "playlistTagsDescription": "See which playlists each climb is in, right on the list.",
+        "quickActionsDescription": "Add a ⋮ button to each climb that opens queue, tick, playlists and more. You can always long-press instead."
+      },
+      "playerButtons": {
+        "title": "Buttons",
+        "description": "Pick up to four buttons around Log, their order, and where they sit.",
+        "position": {
+          "label": "Position",
+          "below": "Below the board",
+          "above": "Above the board",
+          "footer": "Log and Board light always keep their places."
+        },
+        "previousNext": "Previous and next",
+        "previousNextDescription": "Show navigation arrows beside Log instead of two action buttons. Swiping the board still changes climbs.",
+        "buttons": {
+          "mirror": "Mirror",
+          "favorite": "Favorite",
+          "angle": "Angle",
+          "playNext": "Play next",
+          "share": "Share",
+          "queue": "Queue"
+        },
+        "mirrorDescription": "Only on boards that mirror",
+        "angleDescription": "Only on boards with an adjustable angle",
+        "fixed": {
+          "previous": "Previous",
+          "next": "Next",
+          "log": "Log",
+          "boardLight": "Board light"
+        },
+        "footer": "With navigation arrows off, up to four enabled buttons appear around Log. If more are available for this board, the first and last three take the places. With arrows on, only the first and last appear. The rest, and any you hide, are in the ⋯ menu.",
+        "settingsFooter": "To change the order, open the ⋯ menu on a climb and pick View options.",
+        "previewLabel": "Preview, {{position}}: {{buttons}}",
+        "boardControl": {
+          "label": "Board control",
+          "wallButton": "Wall button",
+          "lightbulb": "Lightbulb",
+          "footer": "Both controls connect, light the climb and show who holds the board. Hold while connected for board options. Read the wall button’s label: You are driving the wall means each climb you pick lights up; tap it to stop driving. Your phone stays connected unless Disconnect Bluetooth when driving ends is on. When a drive has a time limit, a clock beside the label and the shrinking frost show when it stops. The lightbulb sits at the top right."
+        }
+      },
+      "climbView": {
+        "title": "Climb view",
+        "valueDefault": "Default",
+        "valueCustom": "Custom"
+      },
+      "quickFilters": {
+        "title": "Quick filters",
+        "valueDefault": "Default",
+        "valueCustom": "Custom",
+        "climbsTitle": "Climbs",
+        "climbsFooter": "These show above the Climbs list, in this order. A filter you switch on joins the end.",
+        "playlistsTitle": "Playlists",
+        "playlistsFooter": "These show above every playlist, smart playlist and setter page, in this order.",
+        "restoreDefaults": "Restore defaults",
+        "footer": "Changes apply right away, on this phone only. Every filter stays in Filters either way."
+      },
+      "timers": {
+        "restTitle": "Rest",
+        "restLength": "Rest",
+        "restLengthOff": "Off",
+        "modeLabel": "Cadence",
+        "modeAfterTick": "After each climb",
+        "modeEvery": "Every {{length}}",
+        "modeOnTheMinute": "Fixed window",
+        "modeAfterTickHint": "Your rest restarts every time you log an attempt or a send.",
+        "modeOnTheMinuteHint": "Fixed windows from the moment you turn it on. Logging attempts or sends never resets the clock.",
+        "autoAdvance": "Move to the next climb",
+        "autoAdvanceHint": "Lights it on the wall for you, only while Boardsesh is open.",
+        "autoAdvanceBlocked": "Only the climber holding the board can move the queue.",
+        "autoAdvanceNeedsLength": "Pick a rest length to move the queue automatically.",
+        "cuesTitle": "Cues",
+        "cuesFooter": "Off, you still get one heads-up buzz before the wall moves on its own.",
+        "countdownCues": "Count down the last seconds",
+        "countdownCuesHint": "A buzz on each of the final seconds, so you are on the holds when the next climb lights up.",
+        "sound": "Sound",
+        "soundHint": "Play a tone with the cues. It plays over the silent switch and keeps your music going.",
+        "lockScreen": "Show on Lock Screen",
+        "lockScreenHint": "See your rest count down without opening the app.",
+        "rogueTitle": "Gym timer",
+        "rogueFooter": "Pair a Rogue timer to a board and its stopwatch restarts with your rest: when you log a climb, when the queue moves on and on every fixed-window beat. Only the phone connected to the board drives it.",
+        "rogueNotPaired": "Not paired",
+        "roguePairHint": "Pairs a gym timer with this board",
+        "rogueChangeHint": "Pairs a different gym timer with this board",
+        "rogueRemove": "Remove the timer from {{board}}",
+        "rogueNoBoardsTitle": "No boards of your own yet",
+        "rogueNoBoards": "Add your own board to pair a gym timer with it.",
+        "rogueConnected": "Connected",
+        "rogueConnecting": "Connecting…",
+        "rogueUnreachable": "Can't reach it. Check it's on and close by.",
+        "rogueSaveFailed": "Couldn't save the timer. Try again."
+      },
+      "miniPlayer": {
+        "title": "Mini player",
+        "description": "The bar above the tabs keeps the last climb you opened. Tap it to reopen it; Board light puts it on the board.",
+        "buttons": {
+          "next": "Next climb",
+          "previous": "Previous climb",
+          "wallDisplay": "Wall display"
+        },
+        "fixedNote": "Board light is always there, beside Log. Log is always last, under your thumb.",
+        "footer": "On a phone the bar has room for one of these beside Board light and Log: the first one that's on.",
+        "open": "Open",
+        "collapsed": "Collapsed",
+        "previewLabel": "Preview, {{shape}} bar: {{buttons}}",
+        "footerWide": "On a wide screen the bar fits as many of these as it has room for: the first ones in the list win.",
+        "shapeOpen": "open",
+        "shapeCollapsed": "collapsed",
+        "more": "More"
       }
     },
     "sendRecovery": {
@@ -414,15 +685,36 @@
       "openBody": "The project is open source so climbers can report rough edges, request features, and help steer what comes next.",
       "independentBody": "Boardsesh is not affiliated with or endorsed by Aurora Climbing, Kilter, Tension, Moon Climbing, or any board manufacturer.",
       "viewOnGithub": "View on GitHub",
+      "emailPartners": "Email us",
       "joinDiscord": "Join Discord",
       "partnerTitle": "Partner with us officially",
       "partnerBody": "Boardsesh works with Kilter, Tension, and MoonBoard from the outside. If you build boards and want to make something official together, we're keen to talk.",
       "acknowledgementsLink": "Acknowledgements",
-      "acknowledgementsLinkBody": "The people behind Boardsesh"
+      "acknowledgementsLinkBody": "The people behind Boardsesh",
+      "shareApp": {
+        "link": "Share Boardsesh",
+        "linkBody": "QR code for your crew's phones",
+        "title": "Share Boardsesh",
+        "body": "Have your crew scan this with their phone camera to get the app.",
+        "appStore": "App Store",
+        "googlePlay": "Google Play",
+        "storeToggleLabel": "Store",
+        "qrLabelIos": "QR code for Boardsesh on the App Store",
+        "qrLabelAndroid": "QR code for Boardsesh on Google Play",
+        "copyLink": "Copy link",
+        "share": "Share",
+        "copied": "Link copied",
+        "copyFailed": "Couldn't copy the link",
+        "messageCopied": "Message copied",
+        "messageCopyFailed": "Couldn't copy the message",
+        "message": "Get Boardsesh for your board sessions.\niPhone: {{iosUrl}}\nAndroid: {{androidUrl}}"
+      }
     },
     "acknowledgements": {
       "title": "Acknowledgements",
       "intro": "Boardsesh exists because of the people who build it, back it, and put up with endless board talk. Thank you.",
+      "openSourceRootsTitle": "Open source roots",
+      "openSourceRootsBody": "I started with a fork of Climbdex. As the idea grew, I started a separate repo for Boardsesh. Climbdex and BoardLib laid the groundwork for how we import climbs. Thanks to Luke Emery-Fertitta for creating both.",
       "contributorsTitle": "Contributors",
       "contributorsBody": "Everyone who's shipped code, fixes, and ideas on GitHub.",
       "sponsorsTitle": "Sponsors",
@@ -452,46 +744,56 @@
     "onboarding": {
       "replaySection": "Walkthrough",
       "replayTitle": "Replay walkthrough",
-      "replaySubtitle": "See the walkthrough again",
       "replayError": "Couldn't reopen the walkthrough. Try again.",
       "prompt": {
         "title": "See what's lit on your wall, live",
-        "body": "Follow your gym's board and Boardsesh shows what's lit right now: who lit it, the grade, who set it, recent sends. You don't start anything; it's just there.",
-        "footnote": "Plus crew sessions, the workout builder, and send tracking once you're on a wall.",
+        "body": "Follow your gym's board to see what's lit now, who set it, and recent sends.",
+        "footnote": "Crew sessions, workouts and send tracking come once you're on a wall.",
         "continue": "Pick my board"
       },
       "board": {
         "title": "Which board do you climb on?",
-        "body": "Every board keeps its own history. Pick the one you climb on and you'll see what everyone else on it has been sending.",
-        "offlineHint": "Tap the arrow to keep a board on this phone. It opens instantly and still works when the gym wifi doesn't.",
+        "body": "Every board keeps its own history. Pick yours to see what everyone on it is sending.",
+        "offlineHint": "Pick a board and we'll offer to save it on this phone. It works without gym Wi-Fi.",
         "findAnother": "Find another board",
         "findFirst": "Find my board",
-        "offlineSkip": "Skip for now",
-        "downloadAria": "Keep {{name}} on this phone"
+        "offlineSkip": "Skip for now"
       },
-      "boardRevealTip": "Tap to see what other Boardsesh users have sent to the wall.",
-      "quickActionsTip": "Long-press a climb for quick actions like queue, tick and playlists.",
+      "boardRevealTip": "Tap the clock to see what's been lit here.",
+      "quickActionsTip": "Long-press a climb to queue, tick or add it to a playlist.",
       "tips": {
-        "workout": "Build a workout: Volume, Pyramid, Ladder or Grade Focus. Set a grade, preview the burns, send them one at a time.",
-        "crew": "Climbing with people? Start a session and share one queue. Anyone sends the next burn, no passing the phone.",
-        "record": "Your sends chart out here on Progress: grade spread and hardest send. Import your Kilter and Tension logbook from Aurora to start with your history.",
-        "accessory": "The bar at the bottom is always what's on the board. Flip climbs from there.",
-        "climbsTab": "To get back to your climbs, tap the magnifier in the tab bar."
+        "workout": "Build a workout: pick a style and a grade, then climb.",
+        "crew": "Climbing with friends? Start a session and share one queue.",
+        "record": "Progress charts your sends. Import your Kilter or Tension logbook to fill it.",
+        "accessory": "The bottom bar keeps the last climb you opened. Tap it to reopen.",
+        "previewFirst": {
+          "title": "Tap a climb to preview it. Put on board lights it.",
+          "windowSeconds": "For {{seconds}} seconds after each climb lights, every climb you pick lights too.",
+          "windowMinute": "For 1 minute after each climb lights, every climb you pick lights too.",
+          "windowMinutes": "For {{minutes}} minutes after each climb lights, every climb you pick lights too.",
+          "untilStop": "After that, every climb you pick lights until you stop.",
+          "frost": "The frosted button means every climb you pick lights. Swipe it left to keep lighting until you stop. Tap it to stop.",
+          "frostScreenReader": "When the button reads You are driving the wall, every climb you pick lights. Use the Light every climb action to keep lighting until you stop. Tap the button to stop.",
+          "frostOpenEnded": "The frosted button means every climb you pick lights. Swipe it left to start. Tap it to stop.",
+          "frostOpenEndedScreenReader": "When the button reads You are driving the wall, every climb you pick lights. Use the Light every climb action to start. Tap the button to stop.",
+          "settings": "Lighting settings",
+          "done": "Got it",
+          "close": "Close tip"
+        }
       },
       "link": {
         "title": "Bring your {{boardName}} sends with you",
-        "body": "Your {{boardName}} account and Boardsesh are separate, even if you use the same email. Link your account to sync available sends into your logbook. Sync timing and history vary.",
-        "footnote": "Linking asks for your {{boardName}} username, not your email.",
+        "body": "Your {{boardName}} account is separate from Boardsesh. Link it to bring your sends into your logbook.",
+        "footnote": "Linking needs your {{boardName}} username, not your email.",
         "continue": "Link my {{boardName}} account",
         "skip": "Not now",
-        "skipHint": "You can do this any time in Settings › Connected apps."
+        "skipHint": "Do it any time in Settings › Connected apps."
       }
     },
     "nav": {
       "home": "Home",
       "boards": "Boards",
       "climbs": "Climbs",
-      "wall": "On the Wall",
       "profile": "Profile",
       "holdFilter": "Hold types",
       "zoneFilter": "Board region",
@@ -499,9 +801,9 @@
     },
     "changelog": {
       "title": "What's New",
-      "intro": "Recent updates and fixes, newest first.",
-      "currentBuild": "You're on the build from {{date}}",
-      "currentBuildVersion": "You're on version {{version}}",
+      "intro": "Latest changes",
+      "currentBuild": "Updated {{date}}",
+      "currentBuildVersion": "Version {{version}}",
       "category": {
         "new": "New",
         "improved": "Improved",
@@ -530,7 +832,36 @@
       "checkError": {
         "title": "Couldn't check for updates",
         "message": "Something went wrong getting the latest version. Try again in a bit."
+      },
+      "updates": {
+        "regular": "Regular release",
+        "canary": "Canary release",
+        "canaryBody": "Automatically selected for this rollout. Reports include your release.",
+        "statusUnknown": "Rollout status could not be confirmed.",
+        "early": "Early updates",
+        "staging": "Staging release",
+        "preview": "PR #{{prNumber}} preview",
+        "native": "Installed build",
+        "other": "{{channel}} release",
+        "changeRelease": "Release",
+        "testPreview": "Test a PR preview",
+        "finishTesting": "Finish testing PR #{{prNumber}}",
+        "options": "Update options",
+        "earlyUpdatesHelp": "Early updates may have rough edges. Changes apply next launch."
+      },
+      "previewFirstSpotlight": {
+        "title": "Browse climbs without lighting the board",
+        "tap": "Tap a climb to preview it. Put on board lights it, and your next picks too. Set how long in Settings › Board.",
+        "swipe": "Swipe the wall button left to light every climb you pick. Tap it to stop.",
+        "back": "Tap the arrow at the top left to end a preview.",
+        "cta": "See how it works",
+        "dismiss": "Got it"
       }
+    },
+    "launchUpdate": {
+      "checking": "Checking for updates",
+      "installing": "Installing the latest update",
+      "firstLaunchHint": "Only on your first launch. Takes a few seconds."
     },
     "connectivity": {
       "serverDown": {
@@ -577,6 +908,36 @@
       "errorTitle": "Couldn't load this",
       "errorBody": "That didn't come through. Give it another go.",
       "retry": "Try again"
+    },
+    "storePrompt": {
+      "title": "Get the Boardsesh app",
+      "body": "Light up your board and log every send, even with no signal.",
+      "googlePlay": "Get it on Google Play",
+      "appStore": "Download on the App Store",
+      "dismiss": "Not now"
+    },
+    "reportRelease": {
+      "title": "Release details",
+      "channel": "Channel",
+      "branch": "Branch",
+      "updateId": "Update ID",
+      "runtimeVersion": "Runtime",
+      "automaticCanary": "Automatic canary",
+      "embedded": "Embedded bundle",
+      "checkedAt": "Canary checked",
+      "yes": "Yes",
+      "no": "No",
+      "unknown": "Unknown"
+    },
+    "supportAsks": {
+      "accountRow": "Support Boardsesh",
+      "cardTitle": "Help build Boardsesh",
+      "cardBody": "Boardsesh is free for every climber. Monthly support pays for the time it takes to build it.",
+      "giveMonthly": "Give monthly",
+      "giveOnce": "Give once",
+      "hideCard": "Hide this card",
+      "settingTitle": "Show support asks",
+      "settingFooter": "A Support Boardsesh row in Account, and a card on Home in the first week of each month."
     }
   },
   "lightControl": {
@@ -587,6 +948,7 @@
   },
   "bluetooth": {
     "boardNotFound": "Couldn't find your board. Make sure it's on and nearby — and if another phone is connected to it, disconnect there first.",
+    "boardSwitchConnectFailed": "Switched boards, but couldn't connect to the new one. Move closer to it and try again.",
     "connectFailed": "Couldn't connect. Move closer to the board and try again.",
     "serviceMissing": "Connected, but the board didn't respond. Power-cycle it and try again.",
     "unavailable": "Bluetooth is off. Turn it on to connect to your board.",
@@ -598,7 +960,6 @@
     "cancel": "Cancel",
     "clear": "Clear",
     "delete": "Delete",
-    "edit": "Edit",
     "close": "Close",
     "back": "Back",
     "done": "Done",
@@ -624,16 +985,17 @@
     "statistics": "Statistics",
     "sessions": "Sessions",
     "createdClimbs": "Created Climbs",
-    "auroraMigration": "Bring your logbook",
     "startClimbing": "Start climbing",
     "signIn": "Sign in",
     "nav": {
       "gyms": "Gyms",
       "playlists": "Playlists",
-      "about": "About",
-      "help": "Help"
+      "help": "Help",
+      "boards": "Boards",
+      "spray": "Spray walls"
     },
-    "navLabel": "Main navigation"
+    "navLabel": "Main navigation",
+    "getApp": "Get the app"
   },
   "share": {
     "profileTitle": "{{name}}'s climbing profile",
@@ -643,7 +1005,7 @@
     "shareFailed": "Failed to share"
   },
   "myBoards": {
-    "title": "Manage boards"
+    "title": "Your boards"
   },
   "myGyms": {
     "roleOwner": "Owner",
@@ -667,12 +1029,15 @@
       "finishTesting": "Finish testing #{{prNumber}}",
       "testPlan": "Test plan #{{prNumber}}",
       "badge": "QA"
-    }
+    },
+    "accountTitle": "Account",
+    "myBugReports": "Your bug reports"
   },
   "qa": {
     "shared": {
       "backOnProduction": "Back on production at the next update",
-      "leaveFailed": "Could not switch off this preview — try again"
+      "leaveFailed": "Could not switch off this preview — try again",
+      "backOnEarlyUpdates": "Back on early updates next time you open the app"
     },
     "pick": {
       "title": "Test a PR",
@@ -689,9 +1054,7 @@
       "crashedChip": "Crashed on launch",
       "nothingNewToast": "Nothing new for #{{prNumber}} on this build — its next publish applies on relaunch",
       "stagingTitle": "Staging",
-      "stagingBody": "Try the next mobile update before it reaches production.",
       "productionTitle": "Production",
-      "productionBody": "Use live updates going forward; this bundle may remain until a newer one ships.",
       "stagingNextLaunch": "Staging is selected — its next update applies on relaunch",
       "productionNextLaunch": "Production is selected; this bundle may remain until a newer update ships",
       "buildingChip": "Building",
@@ -704,7 +1067,9 @@
       "noMatchBody": "Nothing published for this build matches “{{query}}”.",
       "trySurfAction": "Try #{{prNumber}} anyway",
       "trySurfHint": "It may not have a preview this build can load.",
-      "notServableToast": "No preview of #{{prNumber}} for this build — it may need a rebase onto main"
+      "notServableToast": "No preview of #{{prNumber}} for this build — it may need a rebase onto main",
+      "earlyUpdatesTitle": "Early updates",
+      "earlyUpdatesNextLaunch": "Early updates are back on next time you open the app"
     },
     "brief": {
       "screenTitle": "What to test",
@@ -725,7 +1090,7 @@
       "verdictGroupLabel": "Verdict",
       "approvePlaceholder": "Anything worth noting? (optional)",
       "declinePlaceholder": "What went wrong? Steps help.",
-      "submitLabel": "Send verdict",
+      "submitLabel": "Send",
       "leaveLabel": "Leave preview without feedback",
       "submitError": "Could not send that verdict — try again",
       "notOnPreview": "You're on production — nothing to file a verdict on.",
@@ -741,7 +1106,6 @@
     "attachedCount_one": "{{count}} screenshot attached",
     "attachedCount_other": "{{count}} screenshots attached",
     "publicWarning": "Screenshots you attach get posted publicly on GitHub.",
-    "permissionDenied": "Boardsesh needs photo access to attach a screenshot.",
     "pickFailed": "Could not read that screenshot — pick another one.",
     "uploadFailed": "Could not upload your screenshots — your report is still here."
   },
@@ -799,7 +1163,8 @@
       "delete": "Failed to delete comment",
       "reply": "Failed to post reply",
       "loadReplies": "Failed to load replies"
-    }
+    },
+    "signInToSuggestGrade": "Sign in to suggest a grade"
   },
   "vote": {
     "upvote": "Upvote",
@@ -855,10 +1220,12 @@
     "unfollow": "Unfollow"
   },
   "betaVideos": {
-    "empty": "No beta videos yet"
-  },
-  "moonboardImport": {
-    "removeConfirmTitle": "Remove this climb?"
+    "empty": "No beta videos yet",
+    "openClimb": "See {{climb}} and its beta",
+    "openVideo": "Watch {{creator}}’s beta on {{platform}}",
+    "watchOn": "Watch beta on {{platform}}",
+    "watch": "Watch the beta",
+    "showAll": "Show all {{total}} videos"
   },
   "ascents": {
     "deleteTitle": "Delete ascent",
@@ -883,28 +1250,60 @@
     "fallbackCta": "Open the store page instead"
   },
   "footer": {
-    "tagline": "Your boards. One app. Switch boards without switching apps.",
+    "tagline": "Your boards. One app. Free for your next session.",
     "navLabel": "Footer",
-    "trademarkNote": "Works with Kilter, Tension and MoonBoard. Not affiliated with Aurora Climbing or Moon Climbing.",
+    "trademarkNote": "Works with {{boards}} boards. Boardsesh is independent and is not made or endorsed by any board maker, including Aurora Climbing. Trademarks belong to their owners.",
+    "storeTrademarks": "Apple and the Apple logo are trademarks of Apple Inc., registered in the U.S. and other countries. App Store is a service mark of Apple Inc. Google Play and the Google Play logo are trademarks of Google LLC.",
     "links": {
-      "home": "Home",
       "about": "About",
       "support": "Support Boardsesh",
       "help": "Help",
-      "docs": "Developer docs",
       "playlists": "Playlists",
       "auroraMigration": "Bring your logbook",
       "legal": "Legal",
       "privacy": "Privacy",
-      "gymsKilter": "Gyms with a Kilter board",
-      "gymsTension": "Gyms with a Tension board",
-      "gymsMoonboard": "Gyms with a MoonBoard",
-      "gyms": "All gyms and walls"
+      "gyms": "All gyms"
     },
-    "groups": {
-      "findAGym": "Find a gym",
-      "explore": "Explore",
-      "smallPrint": "Small print"
-    }
+    "groups": {},
+    "journeys": {
+      "climb": "Climb",
+      "walls": "For walls",
+      "project": "Project",
+      "help": "Help",
+      "supportedBoards": "Supported boards",
+      "setupSpray": "Set up your spray wall",
+      "claimGym": "Claim your gym",
+      "partners": "Partners and hold makers",
+      "source": "Source code",
+      "roadmap": "Roadmap",
+      "discord": "Discord",
+      "developers": "Developers",
+      "bluetooth": "Board won’t connect?",
+      "reportBug": "Report a bug",
+      "appGuides": "Board app comparisons"
+    },
+    "openBrowser": "Open it in your browser"
+  },
+  "unsavedChanges": {
+    "title": "Discard changes?",
+    "message": "Your changes won't be saved.",
+    "discard": "Discard changes",
+    "keepEditing": "Keep editing"
+  },
+  "undoDelete": {
+    "removed": "Entry removed",
+    "removedMany": "{{count}} entries removed",
+    "undo": "Undo",
+    "cancelled": "Deletion cancelled. Your entry was kept."
+  },
+  "chineseTranslation": {
+    "title": "Help us speak climbing Chinese",
+    "body": "Welcome to Boardsesh in Simplified Chinese. We used AI to translate the app, and some climbing terms may sound unnatural.",
+    "terms": "What do you call a send, a flash, beta, or a Spraywall? Help us choose the words climbers actually use.",
+    "invitation": "Share your suggestions in our Google Form. It is optional, and you can find it again under Settings → General → Help translate.",
+    "openForm": "Help with climbing terms",
+    "continue": "Continue to Boardsesh",
+    "formPending": "Our terminology form is not ready yet. You can still help through Help translate in Settings → General.",
+    "formDescription": "Fill out our Google Form to help us choose natural Chinese climbing terms."
   }
 }

@@ -1,5 +1,6 @@
+import { PressableSurface } from '../PressableSurface';
 import { memo, useCallback } from 'react';
-import { Pressable, StyleSheet, View } from 'react-native';
+import { StyleSheet, View } from 'react-native';
 import { useTranslation } from 'react-i18next';
 import type { UserBoard } from '@boardsesh/shared-schema';
 import { Text } from '../Text';
@@ -26,7 +27,7 @@ type HeatmapDownloadLineProps = {
 /**
  * One line in the legend's slot while the heatmap is on for a board that is not
  * on this phone: why nothing is drawn, and a Download button. It replaces the
- * full nudge card, so the flame can stay lit without the drawer growing a card.
+ * full nudge card, so the flame can stay lit without the panel growing a card.
  * Still counted as the `hold_heatmap` nudge surface, so a download from here
  * lands in the same funnel.
  */
@@ -37,7 +38,7 @@ export const HeatmapDownloadLine = memo(function HeatmapDownloadLine({
   testID,
 }: HeatmapDownloadLineProps) {
   const { t } = useTranslation('climbs');
-  const { systemColors, brandColors } = useTheme();
+  const { systemColors } = useTheme();
   const { confirmAndDownload } = useConfirmBoardDownload();
   const nudge = useOfflineNudge({ surface: 'hold_heatmap', board });
 
@@ -62,17 +63,17 @@ export const HeatmapDownloadLine = memo(function HeatmapDownloadLine({
       <Text variant="caption1" color={systemColors.secondaryLabel} numberOfLines={numberOfLines} style={styles.text}>
         {t('mobile.heatmap.downloadLine', { name: board.name })}
       </Text>
-      <Pressable
+      <PressableSurface
         onPress={handleDownload}
         accessibilityRole="button"
         accessibilityLabel={t('mobile.heatmap.download')}
         hitSlop={12}
         style={({ pressed }) => pressed && styles.pressed}
       >
-        <Text variant="caption1" color={brandColors.primary} style={styles.action}>
+        <Text emphasized variant="caption1" color={systemColors.accent}>
           {t('mobile.heatmap.download')}
         </Text>
-      </Pressable>
+      </PressableSurface>
     </View>
   );
 });
@@ -85,9 +86,6 @@ const styles = StyleSheet.create({
   },
   text: {
     flexShrink: 1,
-  },
-  action: {
-    fontWeight: '600',
   },
   pressed: {
     opacity: 0.6,

@@ -105,6 +105,7 @@ export function useSaveTick(boardName: BoardName | null) {
           isBenchmark: options.isBenchmark,
           comment: options.comment,
           climbedAt: options.climbedAt,
+          reportingTime: options.reportingTime,
           sessionId: options.sessionId,
           layoutId: options.layoutId,
           sizeId: options.sizeId,
@@ -112,6 +113,7 @@ export function useSaveTick(boardName: BoardName | null) {
           boardUuid: options.boardUuid,
           ...(options.boardId != null ? { boardId: options.boardId } : {}),
           videoUrl: options.videoUrl,
+          privacy: options.privacy,
         },
       };
 
@@ -178,6 +180,9 @@ export function useSaveTick(boardName: BoardName | null) {
       return { tempUuid, authEpoch, statsKey, statsToken, readLifecycleGeneration };
     },
     onSuccess: ({ savedTick, delivery }, options, context) => {
+      // The SaveTick document does not select `climbRevision` (it is also the
+      // outbox document), so the saved row's version is not known and the
+      // send counts until a later read fills it in (`isTickOnCurrentHolds`).
       const savedEntry = toLogbookEntry(savedTick);
       // `setQueriesData` (not `setQueryData`) so a logbook cache that was
       // removed mid-flight (e.g. invalidate fired between mutate and

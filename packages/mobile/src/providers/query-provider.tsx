@@ -1,15 +1,12 @@
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import { AppState, Platform } from 'react-native';
 import { QueryCache, QueryClient, QueryClientProvider, MutationCache, focusManager } from '@tanstack/react-query';
 import { reportHandledError } from '../lib/error-reporting';
-import { isBackendUnavailableError } from '../lib/connectivity/backend-unavailable-error';
 import { startConnectivityStore } from '../lib/connectivity/start-connectivity';
-import { isGraphqlRateLimitedError, isGraphqlValidationFailedError } from '../lib/graphql/extract-error-message';
-// From the leaf module, not `graphql/client`: the client statically imports the
-// auth interceptor and the whole secure-store chain behind it, which has no
-// business in the query provider's graph for a one-line predicate.
-import { isGraphqlRequestTimeoutError } from '../lib/graphql/request-timeout';
-
+import { shouldRetryQuery } from '../lib/graphql/query-retry';
+import { watchBoardImportCompletion } from '../lib/integrations/board-import-completion';
+import { climbProgressCacheScopeFor } from '../lib/climb-progress-cache-owner';
+import { bindOfflineUserReadRecovery } from '../lib/graphql/offline-user-read-recovery';
 // React Query keys `refetchOnReconnect` / `refetchOnWindowFocus` off a browser's
 // `navigator.onLine` and window-focus events, neither of which exists on React
 // Native — so without these bridges it treats the app as permanently online and
@@ -73,7 +70,7 @@ export function reportMutationFailure(error: unknown, mutationKey: unknown): voi
 // defaultOptions.retry) are exhausted — a single chokepoint so API / GraphQL /
 // REST errors land in PostHog without instrumenting each call site.
 export function createQueryClient(): QueryClient {
-  return new QueryClient({
+  const queryClient = new QueryClient({
     queryCache: new QueryCache({
       onError: (error, query) => reportQueryFailure(error, query.queryKey, query.queryHash),
     }),
@@ -92,9 +89,10 @@ export function createQueryClient(): QueryClient {
         networkMode: 'offlineFirst',
         staleTime: 5 * 60 * 1000,
         gcTime: 30 * 60 * 1000,
-        // Never retry a RATE_LIMITED rejection — retrying only hammers the
+        // Default: never retry a RATE_LIMITED rejection — retrying only hammers the
         // already-throttled endpoint harder (#3285). Everything else keeps
-        // the previous retry-up-to-2-times behavior.
+        // the previous retry-up-to-2-times behavior. Discovery searches opt into
+        // bounded delayed retries with a shared server-cooldown gate.
         //
         // The two #4862 additions are the same argument for a dead server. A
         // BackendUnavailableError never reached the network at all (the client
@@ -108,23 +106,22 @@ export function createQueryClient(): QueryClient {
         // A GRAPHQL_VALIDATION_FAILED rejection means the backend's schema lacks
         // something this query asks for. The same document fails the same way
         // every time, so retrying only delays the error state (#5370).
-        retry: (failureCount, error) => {
-          if (isGraphqlValidationFailedError(error)) return false;
-          if (isGraphqlRateLimitedError(error)) return false;
-          if (isBackendUnavailableError(error)) return false;
-          if (isGraphqlRequestTimeoutError(error)) return false;
-          return failureCount < 2;
-        },
+        retry: shouldRetryQuery,
       },
       mutations: {
         networkMode: 'offlineFirst',
       },
     },
   });
+  climbProgressCacheScopeFor(queryClient);
+  // The client lives as long as the app, so the unsubscribe is never needed here.
+  watchBoardImportCompletion(queryClient);
+  return queryClient;
 }
 
 export function QueryProvider({ children }: { children: ReactNode }) {
   const [queryClient] = useState(createQueryClient);
+  useEffect(() => bindOfflineUserReadRecovery(queryClient), [queryClient]);
 
   return <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>;
 }

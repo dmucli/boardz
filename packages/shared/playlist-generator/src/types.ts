@@ -1,13 +1,27 @@
 // Playlist Generator Types and Constants
 // Pure TS, no React. Web and mobile both consume from here.
 
-export type WorkoutType = 'volume' | 'pyramid' | 'ladder' | 'gradeFocus';
+export type WorkoutType =
+  | 'volume'
+  | 'pyramid'
+  | 'ladder'
+  | 'gradeFocus'
+  | 'onTheMinute'
+  | 'fourByFour'
+  | 'limitBouldering';
 
 export type WarmUpType = 'standard' | 'extended' | 'none';
 
 export type EffortLevel = 'moderate' | 'challenging' | 'veryDifficult' | 'maxEffort';
 
-export type ClimbBias = 'unfamiliar' | 'attempted' | 'any';
+/**
+ * Which climbs of a grade a block draws from. `unfamiliar` prefers climbs the
+ * climber has not tried, and `any` takes the whole catalogue. `attempted`,
+ * `sent` and `liked` draw from the climber's own climbs: the ones they have
+ * tried or sent at this angle, or hearted at any angle (#6739). Tried but not
+ * sent is `attempted` with `skipSent`, not a value of its own.
+ */
+export type ClimbBias = 'unfamiliar' | 'attempted' | 'sent' | 'liked' | 'any';
 
 export type BaseGeneratorOptions = {
   warmUp: WarmUpType;
@@ -17,6 +31,20 @@ export type BaseGeneratorOptions = {
   minRating: number;
   onlyTallClimbs: boolean;
   onlyWideClimbs: boolean;
+  /**
+   * Leave out every climb the climber has sent at this angle. Off or absent,
+   * climbs they have not sent come first and sent ones only fill what is left.
+   * Optional, so filters stored before it existed still read.
+   */
+  skipSent?: boolean;
+  /**
+   * Leave out every climb the climber has tried or sent at this angle, so a
+   * flash block never tops up with one. Wins over `skipSent`; does nothing under
+   * the `attempted` bias. Optional like `skipSent`; absent means off.
+   */
+  skipTried?: boolean;
+  /** Only benchmark climbs. Optional like `skipSent`; absent means off. */
+  onlyBenchmarks?: boolean;
 };
 
 export type VolumeOptions = {
@@ -29,12 +57,20 @@ export type PyramidOptions = {
   type: 'pyramid';
   numberOfSteps: number;
   climbsPerStep: number;
+  /**
+   * Come back down on the climbs of the way up: every way-down slot repeats its
+   * way-up twin (`PlannedClimbSlot.repeatOfIndex`). The peak never repeats.
+   * Absent means off (the default): the way down gets climbs of its own.
+   */
+  repeatOnWayDown?: boolean;
 } & BaseGeneratorOptions;
 
 export type LadderOptions = {
   type: 'ladder';
   numberOfSteps: number;
   climbsPerStep: number;
+  /** Run the steps hardest first and ease down. Absent means up (the default). */
+  descending?: boolean;
 } & BaseGeneratorOptions;
 
 export type GradeFocusOptions = {
@@ -42,7 +78,53 @@ export type GradeFocusOptions = {
   numberOfClimbs: number;
 } & BaseGeneratorOptions;
 
-export type GeneratorOptions = VolumeOptions | PyramidOptions | LadderOptions | GradeFocusOptions;
+// The three timed types. On the minute and limit bouldering name their fields
+// after the partner API's block fields (docs/integrations/partner-api.md, "Blocks"); its
+// `climbCount` is `numberOfClimbs`. A 4x4 counts sets and reps (Marco,
+// 2026-10-25). Their rests and intervals are whole seconds, read by
+// `pacingForOptions` (pacing.ts).
+
+/** One climb per interval at the target grade; the wall moves on every `intervalSeconds`. */
+export type OnTheMinuteOptions = {
+  type: 'onTheMinute';
+  numberOfClimbs: number;
+  intervalSeconds: number;
+} & BaseGeneratorOptions;
+
+/**
+ * `sets` climbs at the target grade, each climbed `repsPerSet` times in a row:
+ * a set is one climb done for every rep, then the rest between sets, then the
+ * next climb. The plan holds one slot per set, Start queues each climb once,
+ * and the reps are the ticks logged on that one queued climb.
+ */
+export type FourByFourOptions = {
+  type: 'fourByFour';
+  sets: number;
+  repsPerSet: number;
+  /** The rest after each rep but the set's last. 0 means none: the climber goes again at once. */
+  restBetweenRepsSeconds: number;
+  /** The rest after a set's last rep, before the wall moves to the next climb. */
+  restBetweenSetsSeconds: number;
+} & BaseGeneratorOptions;
+
+/** A few climbs at the target grade, a long rest after every attempt, and on to the next climb after a send. */
+export type LimitBoulderingOptions = {
+  type: 'limitBouldering';
+  numberOfClimbs: number;
+  restSeconds: number;
+} & BaseGeneratorOptions;
+
+export type GeneratorOptions =
+  | VolumeOptions
+  | PyramidOptions
+  | LadderOptions
+  | GradeFocusOptions
+  | OnTheMinuteOptions
+  | FourByFourOptions
+  | LimitBoulderingOptions;
+
+/** The workout types that pace the rest timer themselves (see `pacingForOptions`). */
+export const TIMED_WORKOUT_TYPES: readonly WorkoutType[] = ['onTheMinute', 'fourByFour', 'limitBouldering'];
 
 /** Workout-type metadata for UI rendering. Display labels live in the
  *  consuming app's i18n catalog (web: `playlists:generator.workoutTypes.<type>.name`,
@@ -51,7 +133,7 @@ export type GeneratorOptions = VolumeOptions | PyramidOptions | LadderOptions | 
  *  English leaking through `t(variable)` patterns. */
 export type WorkoutTypeInfo = {
   type: WorkoutType;
-  icon: 'volume' | 'pyramid' | 'ladder' | 'focus';
+  icon: 'volume' | 'pyramid' | 'ladder' | 'focus' | 'minute' | 'rounds' | 'limit';
 };
 
 export const WORKOUT_TYPES: WorkoutTypeInfo[] = [
@@ -59,13 +141,16 @@ export const WORKOUT_TYPES: WorkoutTypeInfo[] = [
   { type: 'pyramid', icon: 'pyramid' },
   { type: 'ladder', icon: 'ladder' },
   { type: 'gradeFocus', icon: 'focus' },
+  { type: 'onTheMinute', icon: 'minute' },
+  { type: 'fourByFour', icon: 'rounds' },
+  { type: 'limitBouldering', icon: 'limit' },
 ];
 
 export const WARM_UP_OPTIONS: WarmUpType[] = ['none', 'standard', 'extended'];
 
 export const EFFORT_LEVELS: EffortLevel[] = ['moderate', 'challenging', 'veryDifficult', 'maxEffort'];
 
-export const CLIMB_BIAS_OPTIONS: ClimbBias[] = ['unfamiliar', 'attempted', 'any'];
+export const CLIMB_BIAS_OPTIONS: ClimbBias[] = ['unfamiliar', 'attempted', 'sent', 'liked', 'any'];
 
 export const DEFAULT_VOLUME_OPTIONS: Omit<VolumeOptions, 'targetGrade'> = {
   type: 'volume',
@@ -114,6 +199,47 @@ export const DEFAULT_GRADE_FOCUS_OPTIONS: Omit<GradeFocusOptions, 'targetGrade'>
   onlyWideClimbs: false,
 };
 
+// The timed types copy their climb filters from volume's field by field, so a
+// change to the generator's default filters reaches them too.
+
+export const DEFAULT_ON_THE_MINUTE_OPTIONS: Omit<OnTheMinuteOptions, 'targetGrade'> = {
+  type: 'onTheMinute',
+  warmUp: 'none',
+  numberOfClimbs: 10,
+  intervalSeconds: 60,
+  climbBias: DEFAULT_VOLUME_OPTIONS.climbBias,
+  minAscents: DEFAULT_VOLUME_OPTIONS.minAscents,
+  minRating: DEFAULT_VOLUME_OPTIONS.minRating,
+  onlyTallClimbs: DEFAULT_VOLUME_OPTIONS.onlyTallClimbs,
+  onlyWideClimbs: DEFAULT_VOLUME_OPTIONS.onlyWideClimbs,
+};
+
+export const DEFAULT_FOUR_BY_FOUR_OPTIONS: Omit<FourByFourOptions, 'targetGrade'> = {
+  type: 'fourByFour',
+  warmUp: 'none',
+  sets: 4,
+  repsPerSet: 4,
+  restBetweenRepsSeconds: 0,
+  restBetweenSetsSeconds: 180,
+  climbBias: DEFAULT_VOLUME_OPTIONS.climbBias,
+  minAscents: DEFAULT_VOLUME_OPTIONS.minAscents,
+  minRating: DEFAULT_VOLUME_OPTIONS.minRating,
+  onlyTallClimbs: DEFAULT_VOLUME_OPTIONS.onlyTallClimbs,
+  onlyWideClimbs: DEFAULT_VOLUME_OPTIONS.onlyWideClimbs,
+};
+
+export const DEFAULT_LIMIT_BOULDERING_OPTIONS: Omit<LimitBoulderingOptions, 'targetGrade'> = {
+  type: 'limitBouldering',
+  warmUp: 'none',
+  numberOfClimbs: 3,
+  restSeconds: 180,
+  climbBias: DEFAULT_VOLUME_OPTIONS.climbBias,
+  minAscents: DEFAULT_VOLUME_OPTIONS.minAscents,
+  minRating: DEFAULT_VOLUME_OPTIONS.minRating,
+  onlyTallClimbs: DEFAULT_VOLUME_OPTIONS.onlyTallClimbs,
+  onlyWideClimbs: DEFAULT_VOLUME_OPTIONS.onlyWideClimbs,
+};
+
 export const WARM_UP_CONFIG = {
   standard: { grades: 4, climbsPerGrade: 1 },
   extended: { grades: 6, climbsPerGrade: 2 },
@@ -122,8 +248,18 @@ export const WARM_UP_CONFIG = {
 
 export type PlannedClimbSlot = {
   grade: number;
-  section: 'warmUp' | 'increasing' | 'peak' | 'decreasing' | 'main';
+  /** `coolDown`: a warm-up after the last workout block, stepping back down from its grade. */
+  section: 'warmUp' | 'increasing' | 'peak' | 'decreasing' | 'main' | 'coolDown';
   index: number;
+  /**
+   * Set on a slot that climbs an earlier slot's climb again: that slot's
+   * `index`. The app fills it with the same climb under a queue item of its own,
+   * so a tick on each visit stays on its own item. In the preview, changing
+   * either climb changes both; once queued, the two are independent queue
+   * items. Never set on the slot right after its twin, so the player never
+   * shows one climb on two pages in a row. Absent on every other slot.
+   */
+  repeatOfIndex?: number;
 };
 
 // Minimal grade scale shape the generator needs. Matches the rows returned by

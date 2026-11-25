@@ -1,6 +1,8 @@
 'use client';
 
 import { getSession } from 'next-auth/react';
+import { beginWebSessionIntent, requestWebSessionRefresh } from './web-session-events';
+import { browserSessionGuard, type LocalChange } from './session-guard';
 
 export const NEXTAUTH_COOKIE_LOCK_NAME = 'boardsesh-nextauth-cookie-v1';
 
@@ -8,6 +10,7 @@ const LOCK_INSTALLATION_KEY = Symbol.for('boardsesh.nextauth-cookie-fetch-lock.s
 const NEXTAUTH_SESSION_PATH = '/api/auth/session';
 const NEXTAUTH_CSRF_PATH = '/api/auth/csrf';
 const NEXTAUTH_SIGNOUT_PATH = '/api/auth/signout';
+const SET_PASSWORD_COOKIE_PATH = '/api/internal/set-password';
 const NEXTAUTH_CALLBACK_PATH_PREFIX = '/api/auth/callback/';
 const NEXTAUTH_SIGNIN_PATH_PREFIX = '/api/auth/signin/';
 const EXPO_AUTH_CHANNEL_NAME = 'boardsesh-expo-web-auth-v1';
@@ -80,6 +83,7 @@ function isNextAuthCookieRequest(input: RequestInfo | URL, init?: RequestInit): 
   return (
     isMutation &&
     (pathname === NEXTAUTH_SIGNOUT_PATH ||
+      pathname === SET_PASSWORD_COOKIE_PATH ||
       pathname.startsWith(NEXTAUTH_CALLBACK_PATH_PREFIX) ||
       pathname.startsWith(NEXTAUTH_SIGNIN_PATH_PREFIX))
   );
@@ -303,6 +307,10 @@ export async function guardedNextAuthSignOut(
   const callbackUrl = options.callbackUrl ?? window.location.href;
   const boundedSignal = createBoundedAuthSignal();
   let signOutStarted = false;
+  // Claimed when this tab sends its own sign-out, which navigates itself: the
+  // session guard must not reload the page for it.
+  let localChange: LocalChange | undefined;
+  let signOutEpoch: number | undefined;
   let result: GuardedNextAuthSignOutResult;
   try {
     result = await runWithCookieLock(
@@ -312,8 +320,14 @@ export async function guardedNextAuthSignOut(
           cache: 'no-store',
           signal: boundedSignal.signal,
         });
-        if (!sessionResponse.ok) throw new Error('Unable to verify the session before signing out');
-        const currentSession = await readJson(sessionResponse);
+        // During an outage the session read answers 503. Carry on to the POST: its
+        // expected identity still binds the sign-out to the login shown in this tab.
+        if (!sessionResponse.ok && sessionResponse.status !== 503) {
+          throw new Error('Unable to verify the session before signing out');
+        }
+        const currentSession = sessionResponse.ok
+          ? await readJson(sessionResponse)
+          : { user: { id: identity.userId }, authSessionId: identity.authSessionId };
         if (isAnonymousSession(currentSession)) {
           return { status: 'signed-out' as const, url: callbackUrl };
         }
@@ -325,6 +339,7 @@ export async function guardedNextAuthSignOut(
         }
 
         signOutStarted = true;
+        signOutEpoch = beginWebSessionIntent();
         broadcastExpoAuthChange({ type: 'signout-started', identity });
         const csrfResponse = await originalFetch.call(globalThis, NEXTAUTH_CSRF_PATH, {
           headers: { 'Content-Type': 'application/json' },
@@ -334,6 +349,7 @@ export async function guardedNextAuthSignOut(
         const csrfToken = readCsrfToken(await readJson(csrfResponse));
         if (!csrfResponse.ok || !csrfToken) throw new Error('Unable to prepare sign out');
 
+        localChange = browserSessionGuard().expectLocalChange();
         const signOutResponse = await originalFetch.call(globalThis, NEXTAUTH_SIGNOUT_PATH, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -360,7 +376,10 @@ export async function guardedNextAuthSignOut(
     );
   } catch (error) {
     if (signOutStarted) {
+      // A sent POST may have cleared the cookie before the failure.
+      localChange?.extend();
       broadcastExpoAuthChange({ type: 'credential-rotation' });
+      requestWebSessionRefresh(signOutEpoch);
       await getSession();
     }
     throw error;
@@ -370,12 +389,18 @@ export async function guardedNextAuthSignOut(
 
   if (result.status === 'signed-out') {
     broadcastExpoAuthChange({ type: 'confirmed-signout', identity });
+    if (localChange) localChange.extend();
+    else browserSessionGuard().expectLocalChange();
   } else {
     broadcastExpoAuthChange({ type: 'credential-rotation' });
+    // The cookie names another login: that change came from elsewhere, and the
+    // refresh below retires this page.
+    localChange?.cancel();
   }
   // BroadcastChannel reaches Expo and the current NextAuth bridge. Always dual
   // publish NextAuth's storage refresh for already-open pre-deploy tabs and
   // browser message loss, after releasing the non-reentrant outer lock.
+  requestWebSessionRefresh(signOutEpoch);
   await getSession();
   if (options.redirect ?? true) redirectTo(result.url);
   return result;

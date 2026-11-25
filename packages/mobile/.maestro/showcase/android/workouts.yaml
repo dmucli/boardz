@@ -1,0 +1,55 @@
+appId: com.boardsesh.app.dev
+name: showcase take - a workout with a rest timer (Android)
+---
+# Take: workouts -> .boardsesh/showcase-video/work/android/footage/workouts/
+#
+# The Android twin of ../workouts.yaml; that file says what the take shows and
+# why every tap goes by label or id. The screen is shorter than the iPhone's,
+# so the generated workout preview stays below the fold.
+#
+# Marks (work/android/marks/workouts.json): pyramid-picked, rest-armed, rest-pill, started.
+
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/flow-start')}
+
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 800
+    optional: true
+
+- tapOn: 'Add a block'
+- waitForAnimationToEnd
+- tapOn: 'Block 1, Pyramid'
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/pyramid-picked')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 1000
+    optional: true
+
+- scrollUntilVisible:
+    element: 'Rest timer.*'
+    direction: UP
+    timeout: 10000
+- waitForAnimationToEnd
+- tapOn: 'Rest timer.*'
+- waitForAnimationToEnd
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/rest-armed')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 600
+    optional: true
+- tapOn: 'Fixed window'
+- tapOn:
+    id: rest-length-pill
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/rest-pill')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 1200
+    optional: true
+
+- tapOn: 'Start'
+- waitForAnimationToEnd
+- evalScript: ${http.get(SHOWCASE_SIGNAL_URL + '/mark/started')}
+- extendedWaitUntil:
+    visible: 'zzz-showcase-pause'
+    timeout: 3000
+    optional: true

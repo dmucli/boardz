@@ -7,14 +7,12 @@
  *  1. **Locale twins.** `redirects()` runs before `middleware.ts`, and its
  *     sources are matched literally against the incoming path. This repo has no
  *     Next i18n routing — locales are a middleware prefix — so `source: '/x'`
- *     never matches `/es/x`. A rule without its three twins silently 404s three
+ *     never matches `/es/x`. A rule without its locale twins silently 404s all
  *     quarters of the audience.
  *  2. **`permanent: false` for cross-origin destinations.** A permanent
  *     cross-origin redirect is cached by the browser indefinitely, and there is
  *     no server-side hatch to take it back. Until the app route is proven in
  *     production, every hop to `app.boardsesh.com` must stay recoverable.
- *  3. **Order.** Next matches these in array order, so the MoonBoard-specific
- *     `/import` rule has to come before the `/:board/…` catch-all.
  */
 import { describe, expect, it } from 'vite-plus/test';
 import { existsSync } from 'node:fs';
@@ -38,7 +36,7 @@ const redirects = (await nextConfig.redirects?.()) ?? [];
  */
 const configuredAppOrigin = configModule.APP_ORIGIN;
 
-const LOCALE_PREFIXES = ['/es', '/fr', '/de'];
+const LOCALE_PREFIXES = ['/es', '/fr', '/de', '/it'];
 
 function isLocalePrefixed(source: string): boolean {
   return LOCALE_PREFIXES.some((prefix) => source === prefix || source.startsWith(`${prefix}/`));
@@ -55,7 +53,7 @@ describe('next.config redirects', () => {
     expect(baseRedirects.length).toBeGreaterThan(0);
   });
 
-  it('gives every rule an /es, /fr and /de twin', () => {
+  it('gives every rule an /es, /fr, /de and /it twin', () => {
     const sources = new Set(redirects.map((redirect) => redirect.source));
     const missing = baseRedirects.flatMap((redirect) =>
       LOCALE_PREFIXES.filter((prefix) => !sources.has(`${prefix}${redirect.source}`)).map(
@@ -242,28 +240,73 @@ describe('next.config redirects', () => {
     ]);
   });
 
-  it('re-homes the MoonBoard import routes onto the board-agnostic importer', () => {
-    const importRules = baseRedirects.filter((redirect) => redirect.source.endsWith('/import'));
+  it('hands retired import URLs to the app integrations screen', () => {
+    const importRules = baseRedirects.filter(
+      (redirect) => redirect.source === '/moonboard-import' || redirect.source.endsWith('/import'),
+    );
 
-    // Order is the whole point: the MoonBoard rule has to be matched before the
-    // `/:board/…` catch-all, or `/kilter/1/…/import` renders the importer for
-    // MoonBoard layout 1 (`MOONBOARD_LAYOUTS` ids 1–7 collide with Aurora's).
-    expect(importRules.map((rule) => `${rule.source} -> ${rule.destination}`)).toEqual([
-      '/moonboard/:layout/:size/:set/:angle/import -> /moonboard-import?layout=:layout&sets=:set&angle=:angle',
-      '/:board/:layout/:size/:set/:angle/import -> /:board/:layout/:size/:set/:angle/list',
-      '/b/:board_slug/:angle/import -> /moonboard-import?angle=:angle',
+    expect(importRules.map((rule) => rule.source)).toEqual([
+      '/moonboard-import',
+      '/:board/:layout/:size/:set/:angle/import',
+      '/b/:board_slug/:angle/import',
     ]);
     for (const rule of importRules) {
-      expect(rule.permanent).toBe(true);
+      expect(rule.destination).toBe(`${configuredAppOrigin}/settings/integrations`);
+      expect(rule.permanent).toBe(false);
+    }
+
+    const appPath = new URL(importRules[0].destination).pathname;
+    const routeFile = resolve(dirname(fileURLToPath(import.meta.url)), '../../../mobile/app', `.${appPath}.tsx`);
+    expect(existsSync(routeFile), routeFile).toBe(true);
+  });
+
+  it('does not retain the Next MoonBoard importer or hold editor', () => {
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+    for (const deletedPath of [
+      'app/moonboard-import/page.tsx',
+      'app/components/moonboard-import/moonboard-bulk-import.tsx',
+      'app/components/moonboard-import/moonboard-edit-modal.tsx',
+      'app/components/moonboard-renderer/moonboard-renderer.tsx',
+    ]) {
+      expect(existsSync(resolve(webRoot, deletedPath)), deletedPath).toBe(false);
     }
   });
 
-  it('carries the hold sets a MoonBoard import URL named', () => {
-    // The deleted page drew only the sets the URL listed. Without `sets` the
-    // importer stacks every set for the layout — six overlays on a 2024 wall.
-    const moonBoardImportRule = baseRedirects.find((redirect) => redirect.source.startsWith('/moonboard/'));
+  it('folds the merged help pages into their parent guides, fragment included', () => {
+    const expected = {
+      '/help/climb-actions': '/help/finding-climbs#climb-menu',
+      '/help/playlists': '/help/finding-climbs#playlists',
+      '/help/beta-videos': '/help/logbook#beta-videos',
+    };
 
-    expect(moonBoardImportRule?.destination).toContain('sets=:set');
+    for (const [source, destination] of Object.entries(expected)) {
+      const rule = redirects.find((candidate) => candidate.source === source);
+      expect(rule?.destination, source).toBe(destination);
+      expect(rule?.permanent, source).toBe(true);
+
+      // /it is a supported locale; the twin keeps the `#` after the prefix.
+      for (const prefix of LOCALE_PREFIXES) {
+        const twin = redirects.find((candidate) => candidate.source === `${prefix}${source}`);
+        expect(twin?.destination, `${prefix}${source}`).toBe(`${prefix}${destination}`);
+      }
+    }
+  });
+
+  it('sends a trimmed /compare URL to the app guides hub', () => {
+    expect(redirects.find((rule) => rule.source === '/compare')).toMatchObject({
+      destination: '/apps',
+      permanent: true,
+    });
+  });
+
+  it('redirects old Aurora migration bookmarks to the export instructions in their locale', () => {
+    for (const prefix of ['', ...LOCALE_PREFIXES]) {
+      const source = `${prefix}/aurora-migration`;
+      expect(redirects.find((rule) => rule.source === source)).toMatchObject({
+        destination: `${prefix}/bring-your-logbook#old-kilter-app`,
+        permanent: true,
+      });
+    }
   });
 
   it('leaves the /play routes alone — their pages redirect with the climb name', () => {

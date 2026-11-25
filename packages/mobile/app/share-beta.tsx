@@ -1,40 +1,33 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import { StyleSheet, View, TextInput, Pressable } from 'react-native';
-import { useLocalSearchParams, useRouter } from 'expo-router';
-import { useTranslation } from 'react-i18next';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import { FlashList } from '@shopify/flash-list';
-import { Image } from 'expo-image';
-import * as Haptics from 'expo-haptics';
-import type { AscentFeedItem } from '@boardsesh/graphql/operations';
 import { SHARED_EVENTS } from '@boardsesh/analytics';
+import type { AscentFeedItem } from '@boardsesh/graphql/operations';
+import * as Haptics from 'expo-haptics';
+import { useLocalSearchParams, useRouter } from 'expo-router';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { StyleSheet } from 'react-native';
 import { Text } from '../src/components/Text';
-import { Button } from '../src/components/Button';
-import { Icon } from '../src/components/Icon';
-import { ActivityIndicator } from '../src/components/ActivityIndicator';
+import { holdUntilLaunchReady } from '../src/components/launch-update/hold-until-launch-ready';
 import { ShareBetaAscentRow } from '../src/components/share-beta/ShareBetaAscentRow';
-import { useTheme } from '../src/providers/theme-provider';
-import { useAuth } from '../src/providers/auth-provider';
-import { useToast } from '../src/providers/toast-provider';
+import { ShareBetaView } from '../src/components/share-beta/ShareBetaView';
+import { useTypographyStyles, type TypographyScale } from '../src/hooks/use-typography-styles';
+import { track } from '../src/lib/analytics';
+import { extractGraphqlMessage } from '../src/lib/graphql/extract-error-message';
 import {
-  useProfile,
-  useUserAscentsFeed,
   useAscentCaptionMatches,
   useAttachBetaLink,
   useBetaLinkPreview,
+  useProfile,
+  useUserAscentsFeed,
 } from '../src/lib/graphql/hooks';
-import { useScreenshotOwnBetaLink } from '../src/hooks/use-screenshot-own-beta-link';
-import { extractGraphqlMessage } from '../src/lib/graphql/extract-error-message';
-import { track } from '../src/lib/analytics';
 import {
   buildShareBetaListItems,
-  shareBetaListItemType,
-  shareBetaListKey,
   type ShareBetaAscentSource,
   type ShareBetaListItem,
 } from '../src/lib/share-beta-list';
-import { spacing, borderRadius } from '../src/theme/tokens';
-import { iosSystemColors } from '../src/theme/ios-colors';
+import { useAuth } from '../src/providers/auth-provider';
+import { useTheme } from '../src/providers/theme-provider';
+import { useToast } from '../src/providers/toast-provider';
+import { borderRadius, spacing } from '../src/theme/tokens';
 
 // Keep the ascents query from refiring on every keystroke; commit the search
 // term after a short pause.
@@ -47,29 +40,16 @@ const SEARCH_DEBOUNCE_MS = 300;
  * link to the climb they pick, via the existing attachBetaLink mutation. The link
  * arrives as a route param so this screen is decoupled from the native module.
  */
-export default function ShareBetaScreen() {
-  // `link` is what the share target hands over. `screenshotShareBeta` is the
-  // capture's way in — see the resolver below.
-  const { link: sharedLink, screenshotShareBeta } = useLocalSearchParams<{
-    link?: string;
-    screenshotShareBeta?: string;
-  }>();
+function ShareBetaScreen() {
+  const styles = useTypographyStyles(createStyles);
+  const { link = '' } = useLocalSearchParams<{ link?: string }>();
   const { t } = useTranslation('session');
   const { systemColors, brandColors } = useTheme();
-  const insets = useSafeAreaInsets();
   const router = useRouter();
   const { isAuthenticated } = useAuth();
   const { showToast } = useToast();
   const { data: profile } = useProfile();
   const attach = useAttachBetaLink();
-
-  // Screenshot mode: a Maestro flow can't perform an iOS share-sheet hand-off, so
-  // the capture reaches this screen by deep link and the screen re-shares a beta
-  // video the account already owns. Returns '' in every normal build, and the
-  // whole fetch dead-strips with it — see the hook for why this is not
-  // `useUserBetaLinks(..., enabled)`.
-  const screenshotOwnBetaLink = useScreenshotOwnBetaLink(profile?.id, !!screenshotShareBeta);
-  const link = sharedLink ?? screenshotOwnBetaLink;
 
   // Best-effort: fetch the reel's thumbnail + caption so we can preview the post
   // and auto-match the climb. Never blocks the manual picker.
@@ -99,15 +79,9 @@ export default function ShareBetaScreen() {
     setAttachError(null);
   }, [link]);
 
-  // Nothing to attach (shouldn't happen — the provider validates first); just
-  // dismiss rather than show a dead screen. In screenshot mode an empty link
-  // means the account's own beta link is still resolving above, not that there
-  // is nothing to attach, so hold the screen instead of popping it.
   useEffect(() => {
-    if (link) return;
-    if (process.env.EXPO_PUBLIC_SCREENSHOT_MODE === '1' && screenshotShareBeta) return;
-    router.back();
-  }, [link, router, screenshotShareBeta]);
+    if (!link) router.back();
+  }, [link, router]);
 
   // statusMode 'both' so projects/attempts show too (people post beta of climbs
   // they're still working). climbName filters the user's *logged* climbs when
@@ -154,8 +128,7 @@ export default function ShareBetaScreen() {
               viaSearch: isSearching,
               hasCaption,
             });
-            void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-            // Toast is fine on success — router.back() dismisses the modal first,
+            // Toast is fine on success (and it plays the success haptic) — router.back() dismisses the modal first,
             // so it lands on the screen underneath where the toast is visible.
             showToast(t('mobile.betaVideos.attachSuccess'), 'success');
             router.back();
@@ -181,8 +154,9 @@ export default function ShareBetaScreen() {
         const suggested = item.source === 'suggested';
         return (
           <Text
+            emphasized
             variant="footnote"
-            color={suggested ? brandColors.primary : systemColors.tertiaryLabel}
+            color={suggested ? brandColors.primary : systemColors.secondaryLabel}
             style={styles.sectionLabel}
             accessibilityRole="header"
           >
@@ -192,7 +166,7 @@ export default function ShareBetaScreen() {
       }
       return <ShareBetaAscentRow ascent={item.ascent} source={item.source} onActivate={handleAttach} />;
     },
-    [brandColors.primary, handleAttach, systemColors.tertiaryLabel, t],
+    [brandColors.primary, handleAttach, systemColors.secondaryLabel, t],
   );
 
   // One flat, fully virtualized list: section headers + suggested rows + the
@@ -202,211 +176,101 @@ export default function ShareBetaScreen() {
     () => buildShareBetaListItems({ ascents: items, suggestions, isSearching }),
     [isSearching, items, suggestions],
   );
-  const listContentStyle = useMemo(() => ({ paddingBottom: insets.bottom + spacing[6] }), [insets.bottom]);
-
-  const containerStyle = [styles.container, { backgroundColor: systemColors.background, paddingTop: insets.top }];
-
-  // Defense in depth — the provider stashes shares until login, so this is rare.
-  if (!isAuthenticated) {
-    return (
-      <View style={containerStyle}>
-        <View style={styles.centered}>
-          <Icon name="person" size={40} color={systemColors.secondaryLabel} />
-          <Text variant="title3" style={styles.centeredText}>
-            {t('mobile.betaVideos.shareSignIn')}
-          </Text>
-          <Button
-            title={t('mobile.betaVideos.shareSignInButton')}
-            variant="filled"
-            size="large"
-            onPress={() => router.replace('/auth/login')}
-          />
-        </View>
-      </View>
-    );
-  }
-
   return (
-    <View style={containerStyle}>
-      <View style={styles.header}>
-        <Pressable
-          onPress={() => router.back()}
-          accessibilityRole="button"
-          accessibilityLabel={t('mobile.betaVideos.shareClose')}
-          hitSlop={spacing[2]}
-          style={styles.closeButton}
-        >
-          <Icon name="close" size={22} color={systemColors.secondaryLabel} />
-        </Pressable>
-        <Text variant="headline">{t('mobile.betaVideos.shareTargetTitle')}</Text>
-        <View style={styles.closeButton} />
-      </View>
-
-      <View style={[styles.linkCard, { backgroundColor: systemColors.secondaryBackground }]}>
-        {thumbnail ? (
-          <Image
-            source={{ uri: thumbnail }}
-            style={styles.thumb}
-            contentFit="cover"
-            transition={150}
-            // Remote thumbnail — skip expo-image's main-thread downscale resample.
-            allowDownscaling={false}
-          />
-        ) : (
-          <View style={[styles.thumb, styles.thumbFallback]}>
-            <Icon name="video" size={20} color={brandColors.primary} />
-          </View>
-        )}
-        <View style={styles.linkText}>
-          <Text variant="subheadline" color={systemColors.label} numberOfLines={2}>
-            {caption ?? link}
-          </Text>
-          {preview.isLoading && (
-            <Text variant="caption2" color={systemColors.tertiaryLabel}>
-              {t('mobile.betaVideos.shareReadingCaption')}
-            </Text>
-          )}
-        </View>
-      </View>
-
-      <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.prompt}>
-        {t('mobile.betaVideos.shareTargetPrompt')}
-      </Text>
-
-      <TextInput
-        value={searchText}
-        onChangeText={setSearchText}
-        placeholder={t('mobile.betaVideos.shareSearchPlaceholder')}
-        placeholderTextColor={iosSystemColors.systemGray}
-        autoCapitalize="none"
-        autoCorrect={false}
-        returnKeyType="search"
-        style={[styles.input, { color: systemColors.label, borderColor: systemColors.separator }]}
-      />
-
-      {attachError && (
-        <View style={[styles.errorBanner, { backgroundColor: systemColors.secondaryBackground }]}>
-          <Icon name="error" size={18} color={brandColors.error} />
-          <Text variant="footnote" color={brandColors.error} style={styles.errorText}>
-            {attachError}
-          </Text>
-        </View>
-      )}
-
-      <View style={styles.listWrapper} pointerEvents={attach.isPending ? 'none' : 'auto'}>
-        {!profile?.id || feed.isPending ? (
-          <View style={styles.centered}>
-            <ActivityIndicator size="large" />
-          </View>
-        ) : (
-          <FlashList
-            data={listItems}
-            renderItem={renderItem}
-            keyExtractor={shareBetaListKey}
-            // Separate recycler pools for the section headers and the ascent
-            // rows. No `estimatedItemSize` — FlashList v2 self-measures and
-            // removed the prop; mixed row heights are its normal case.
-            getItemType={shareBetaListItemType}
-            keyboardShouldPersistTaps="handled"
-            onEndReached={handleEndReached}
-            onEndReachedThreshold={0.5}
-            contentContainerStyle={listContentStyle}
-            ListFooterComponent={
-              feed.isFetchingNextPage ? (
-                <View style={styles.footer}>
-                  <ActivityIndicator size="small" />
-                </View>
-              ) : null
-            }
-            ListEmptyComponent={
-              <View style={styles.empty}>
-                <Icon name="tick.outline" size={44} color={systemColors.tertiaryLabel} />
-                <Text variant="subheadline" color={systemColors.secondaryLabel} style={styles.emptyText}>
-                  {isSearching ? t('mobile.betaVideos.shareNoResults') : t('mobile.betaVideos.shareNoAscents')}
-                </Text>
-              </View>
-            }
-          />
-        )}
-      </View>
-
-      {attach.isPending && (
-        <View style={styles.overlay} pointerEvents="auto">
-          <ActivityIndicator size="large" />
-        </View>
-      )}
-    </View>
+    <ShareBetaView
+      isAuthenticated={isAuthenticated}
+      onSignIn={() => router.replace('/auth/login')}
+      onClose={() => router.back()}
+      thumbnail={thumbnail}
+      caption={caption}
+      link={link}
+      previewLoading={preview.isLoading}
+      searchText={searchText}
+      onSearchChange={setSearchText}
+      attachError={attachError}
+      attaching={attach.isPending}
+      loading={!profile?.id || feed.isPending}
+      loadingMore={feed.isFetchingNextPage}
+      listItems={listItems}
+      renderItem={renderItem}
+      handleEndReached={handleEndReached}
+      isSearching={isSearching}
+    />
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1 },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: spacing[4],
-    paddingVertical: spacing[3],
-  },
-  closeButton: { width: 32, height: 32, alignItems: 'center', justifyContent: 'center' },
-  linkCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[3],
-    marginHorizontal: spacing[4],
-    padding: spacing[3],
-    borderRadius: borderRadius.md,
-  },
-  thumb: { width: 44, height: 44, borderRadius: borderRadius.sm },
-  thumbFallback: { alignItems: 'center', justifyContent: 'center' },
-  linkText: { flex: 1, gap: 2 },
-  sectionLabel: {
-    paddingHorizontal: spacing[4],
-    paddingTop: spacing[3],
-    paddingBottom: spacing[1],
-    fontWeight: '600',
-  },
-  prompt: { paddingHorizontal: spacing[4], marginTop: spacing[4], marginBottom: spacing[2] },
-  input: {
-    marginHorizontal: spacing[4],
-    borderWidth: StyleSheet.hairlineWidth,
-    borderRadius: borderRadius.md,
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[3],
-    fontSize: 16,
-    marginBottom: spacing[2],
-  },
-  errorBanner: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing[2],
-    marginHorizontal: spacing[4],
-    marginBottom: spacing[2],
-    paddingHorizontal: spacing[3],
-    paddingVertical: spacing[2],
-    borderRadius: borderRadius.md,
-  },
-  errorText: { flex: 1 },
-  listWrapper: { flex: 1 },
-  centered: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing[4], padding: spacing[6] },
-  centeredText: { textAlign: 'center' },
-  footer: { paddingVertical: spacing[5], alignItems: 'center' },
-  empty: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingTop: 96,
-    paddingHorizontal: spacing[8],
-    gap: spacing[3],
-  },
-  emptyText: { textAlign: 'center' },
-  overlay: {
-    position: 'absolute',
-    top: 0,
-    left: 0,
-    right: 0,
-    bottom: 0,
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(0,0,0,0.15)',
-  },
-});
+const createStyles = (textStyles: TypographyScale) =>
+  StyleSheet.create({
+    container: { flex: 1 },
+    header: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      paddingHorizontal: spacing[4],
+      paddingVertical: spacing[3],
+    },
+    linkCard: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing[3],
+      marginHorizontal: spacing[4],
+      padding: spacing[3],
+      borderRadius: borderRadius.md,
+    },
+    thumb: { width: 44, height: 44, borderRadius: borderRadius.sm },
+    thumbFallback: { alignItems: 'center', justifyContent: 'center' },
+    linkText: { flex: 1, gap: 2 },
+    sectionLabel: {
+      paddingHorizontal: spacing[4],
+      paddingTop: spacing[3],
+      paddingBottom: spacing[1],
+    },
+    prompt: { paddingHorizontal: spacing[4], marginTop: spacing[4], marginBottom: spacing[2] },
+    input: {
+      marginHorizontal: spacing[4],
+      borderWidth: StyleSheet.hairlineWidth,
+      borderRadius: borderRadius.md,
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[3],
+      fontSize: textStyles.callout.fontSize,
+      marginBottom: spacing[2],
+    },
+    errorBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing[2],
+      marginHorizontal: spacing[4],
+      marginBottom: spacing[2],
+      paddingHorizontal: spacing[3],
+      paddingVertical: spacing[2],
+      borderRadius: borderRadius.md,
+    },
+    errorText: { flex: 1 },
+    listWrapper: { flex: 1 },
+    centered: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing[4], padding: spacing[6] },
+    centeredText: { textAlign: 'center' },
+    footer: { paddingVertical: spacing[5], alignItems: 'center' },
+    empty: {
+      alignItems: 'center',
+      justifyContent: 'center',
+      paddingTop: 96,
+      paddingHorizontal: spacing[8],
+      gap: spacing[3],
+    },
+    emptyText: { textAlign: 'center' },
+    overlay: {
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: 'rgba(0,0,0,0.15)',
+    },
+  });
+
+// iOS presents this route as a native modal, above the launch update
+// placeholder, and a URL can open it on a cold start. Held until launch is
+// ready so a gate reload cannot land mid-tap (#6006).
+export default holdUntilLaunchReady(ShareBetaScreen);

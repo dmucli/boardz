@@ -8,12 +8,17 @@
 // shoot the wrong data with no error at all.
 
 import { createServer, type Server } from 'node:http';
+import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
+import sharp from 'sharp';
+import { prepareIosCampaignFixtures } from '../prepare-ios-campaign-fixtures';
+import { NATIVE_CAMPAIGN_JOIN_QUERY, NATIVE_CAMPAIGN_REGISTER_QUERY } from '../lib/screenshot-campaign-session';
+import { SEARCH_CLIMBS_COUNT } from '../../packages/shared/graphql/src/operations/climb-search';
 
 import {
   createScreenshotBackend,
@@ -25,6 +30,7 @@ import {
 import {
   FIXTURE_SIZE_NOTE_BYTES,
   RE_RECORD_COMMAND,
+  REPLAY_DEFAULT_RESPONSES,
   findScreenshotBackendNotes,
   findScreenshotBackendProblems,
   fixtureSizeNote,
@@ -71,6 +77,7 @@ type UpstreamHarness = {
   origin: string;
   /** Set to make the next /graphql POST answer with this instead of the canned body. */
   nextGraphqlResponse: { status: number; body: unknown } | null;
+  nextGraphqlBarrier: Promise<void> | null;
   graphqlRequests: Array<{ operationName?: string; authorization?: string }>;
   staticRequestPaths: string[];
 };
@@ -78,6 +85,7 @@ type UpstreamHarness = {
 async function startUpstream(): Promise<UpstreamHarness> {
   const harness: Partial<UpstreamHarness> & Pick<UpstreamHarness, 'graphqlRequests' | 'staticRequestPaths'> = {
     nextGraphqlResponse: null,
+    nextGraphqlBarrier: null,
     graphqlRequests: [],
     staticRequestPaths: [],
   };
@@ -95,10 +103,14 @@ async function startUpstream(): Promise<UpstreamHarness> {
         });
         const canned = harness.nextGraphqlResponse;
         harness.nextGraphqlResponse = null;
+        const barrier = harness.nextGraphqlBarrier;
+        harness.nextGraphqlBarrier = null;
         const status = canned?.status ?? 200;
         const payload = JSON.stringify(canned?.body ?? SYNC_TICKS_RESPONSE);
-        response.writeHead(status, { 'content-type': 'application/json' });
-        response.end(payload);
+        void (barrier ?? Promise.resolve()).then(() => {
+          response.writeHead(status, { 'content-type': 'application/json' });
+          response.end(payload);
+        });
       });
       return;
     }
@@ -159,6 +171,7 @@ describe('screenshot backend', () => {
     mode: 'replay' | 'record';
     fresh?: boolean;
     pseudonymise?: boolean;
+    flow?: string;
   }): Promise<void> => {
     logLines = [];
     backend = createScreenshotBackend({
@@ -169,7 +182,7 @@ describe('screenshot backend', () => {
       log: (line) => logLines.push(line),
       fresh: options.fresh,
       ...(options.pseudonymise === undefined ? {} : { pseudonymise: options.pseudonymise }),
-      flow: 'app-store',
+      flow: options.flow ?? 'app-store',
     });
     const port = await backend.listen(0);
     backendOrigin = `http://127.0.0.1:${port}`;
@@ -237,7 +250,614 @@ describe('screenshot backend', () => {
     rmSync(fixturesDir, { recursive: true, force: true });
   });
 
+  it('replays a pre-Aurora snapshot for exact optional opt-in without changing fixture keys', async () => {
+    const legacy =
+      'query BoardRecentHistory($boardId: Int!) { boardRecentHistory(boardId: $boardId) { climbUuid source } }';
+    const current =
+      'query BoardRecentHistory($boardId: Int!, $boardUuid: ID, $includeAurora: Boolean) { boardRecentHistory(boardId: $boardId, boardUuid: $boardUuid, includeAurora: $includeAurora) { climbUuid source } }';
+    const response = { data: { boardRecentHistory: [{ climbUuid: 'recorded', source: 'kilter' }] } };
+    await start({ mode: 'record', fresh: true });
+    upstream.nextGraphqlResponse = { status: 200, body: response };
+    await postGraphql({ operationName: 'BoardRecentHistory', query: legacy, variables: { boardId: 42 } });
+    await stop();
+    const manifestBytes = readFileSync(join(fixturesDir, 'manifest.json'));
+    const requests = upstream.graphqlRequests.length;
+    await start({ mode: 'replay' });
+    expect(
+      await (
+        await postGraphql({
+          operationName: 'BoardRecentHistory',
+          query: current,
+          variables: { boardId: 42, includeAurora: true },
+        })
+      ).json(),
+    ).toEqual(response);
+    const wrongBoard = await (
+      await postGraphql({
+        operationName: 'BoardRecentHistory',
+        query: current,
+        variables: { boardId: 42, includeAurora: true, boardUuid: 'other-wall' },
+      })
+    ).json();
+    expect(wrongBoard.errors).toBeDefined();
+    const changedSelection = await (
+      await postGraphql({
+        operationName: 'BoardRecentHistory',
+        query: current.replace('climbUuid source', 'climbUuid source angle'),
+        variables: { boardId: 42, includeAurora: true },
+      })
+    ).json();
+    expect(changedSelection.errors).toBeDefined();
+    expect(upstream.graphqlRequests).toHaveLength(requests);
+    expect(readFileSync(join(fixturesDir, 'manifest.json'))).toEqual(manifestBytes);
+  });
+
+  it('does not reuse a capability-aware default-false snapshot for an unrecorded true request', async () => {
+    const query =
+      'query BoardRecentHistory($boardId: Int!, $boardUuid: ID, $includeAurora: Boolean) { boardRecentHistory(boardId: $boardId, boardUuid: $boardUuid, includeAurora: $includeAurora) { climbUuid source } }';
+    const legacyResponse = { data: { boardRecentHistory: [{ climbUuid: 'native', source: 'boardsesh' }] } };
+    const capableResponse = { data: { boardRecentHistory: [{ climbUuid: 'import', source: 'aurora' }] } };
+    await start({ mode: 'record', fresh: true });
+    upstream.nextGraphqlResponse = { status: 200, body: legacyResponse };
+    await postGraphql({ operationName: 'BoardRecentHistory', query, variables: { boardId: 42 } });
+    upstream.nextGraphqlResponse = { status: 200, body: capableResponse };
+    await postGraphql({ operationName: 'BoardRecentHistory', query, variables: { boardId: 43, includeAurora: true } });
+    await stop();
+    await start({ mode: 'replay' });
+    const unrecorded = await (
+      await postGraphql({ operationName: 'BoardRecentHistory', query, variables: { boardId: 42, includeAurora: true } })
+    ).json();
+    expect(unrecorded.errors).toBeDefined();
+    expect(
+      await (await postGraphql({ operationName: 'BoardRecentHistory', query, variables: { boardId: 42 } })).json(),
+    ).toEqual(legacyResponse);
+    expect(
+      await (
+        await postGraphql({
+          operationName: 'BoardRecentHistory',
+          query,
+          variables: { boardId: 43, includeAurora: true },
+        })
+      ).json(),
+    ).toEqual(capableResponse);
+  });
+
+  it('persists the record capture scenario and keeps it when replay has a different environment', async () => {
+    const capture = {
+      sharedSessionId: '00000000-0000-4000-8000-000000000004',
+      boards: ['Liz', 'Cherry', 'Bowlo', 'Kilter', 'Tension', 'MoonBoard'],
+      cpp: {
+        target: 'spray',
+        boardReadyText: { 'spray-liz': 'Actual Liz climb' },
+        scenes: { queue: { boardId: ACCOUNT_USER_ID, readyText: 'Actual queued climb' } },
+      },
+    };
+    try {
+      vi.stubEnv('BOARDSESH_SCREENSHOT_CAPTURE_SCENARIO', JSON.stringify(capture));
+      await start({ mode: 'record', fresh: true });
+      await postGraphql({ operationName: 'SyncTicks', query: SYNC_TICKS_QUERY, variables: { cursor: null } });
+      await stop();
+      expect(readScreenshotFixtureManifest(fixturesDir)?.capture).toEqual(capture);
+      const persisted = readFileSync(join(fixturesDir, 'manifest.json'));
+      vi.stubEnv('BOARDSESH_SCREENSHOT_CAPTURE_SCENARIO', '{invalid replay environment');
+      await start({ mode: 'replay' });
+      expect(
+        await (
+          await postGraphql({ operationName: 'SyncTicks', query: SYNC_TICKS_QUERY, variables: { cursor: null } })
+        ).json(),
+      ).toEqual(SYNC_TICKS_RESPONSE);
+      await stop();
+      expect(readScreenshotFixtureManifest(fixturesDir)?.capture).toEqual(capture);
+      expect(readFileSync(join(fixturesDir, 'manifest.json'))).toEqual(persisted);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('rejects an invalid record scenario before fresh mode removes a previous recording', async () => {
+    try {
+      vi.stubEnv('BOARDSESH_SCREENSHOT_CAPTURE_SCENARIO', '');
+      await start({ mode: 'record', fresh: true });
+      await postGraphql({ operationName: 'SyncTicks', query: SYNC_TICKS_QUERY, variables: { cursor: null } });
+      await stop();
+      const originals = new Map(
+        listFixtureFiles(fixturesDir).map((file) => [file, readFileSync(join(fixturesDir, file))]),
+      );
+      expect(originals.size).toBeGreaterThan(1);
+      vi.stubEnv(
+        'BOARDSESH_SCREENSHOT_CAPTURE_SCENARIO',
+        JSON.stringify({ sharedSessionId: 'invalid', boards: ['Liz', 'Bowlo'] }),
+      );
+      await expect(start({ mode: 'record', fresh: true })).rejects.toThrow('capture.sharedSessionId must be a UUID');
+      expect(listFixtureFiles(fixturesDir).sort()).toEqual([...originals.keys()].sort());
+      for (const [file, bytes] of originals) expect(readFileSync(join(fixturesDir, file))).toEqual(bytes);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('projects recorded native identity, refuses APNs locally, and reports corrupted session fixtures as misses', async () => {
+    await start({ mode: 'record', flow: 'app-store-campaign' });
+    upstream.nextGraphqlResponse = {
+      status: 200,
+      body: { data: { joinSession: { id: 'crew', clientId: 'recorded-client', boardPath: 'kilter/8/25/26,27/35' } } },
+    };
+    await postGraphql({
+      query:
+        'mutation JoinSession($sessionId: ID!, $boardPath: String!) { joinSession(sessionId: $sessionId, boardPath: $boardPath) { id clientId boardPath } }',
+      variables: { sessionId: 'crew', boardPath: 'kilter/8/25/26,27/35' },
+    });
+    await stop();
+    await start({ mode: 'replay', flow: 'app-store-campaign' });
+    const nativeRequest = {
+      query: NATIVE_CAMPAIGN_JOIN_QUERY,
+      variables: { sessionId: 'crew', boardPath: '/kilter/8/25/26,27/0' },
+    };
+    expect(await (await postGraphql(nativeRequest)).json()).toEqual({
+      data: { joinSession: { id: 'crew', clientId: 'recorded-client' } },
+    });
+    const upstreamCount = upstream.graphqlRequests.length;
+    const denied = await (
+      await postGraphql({
+        query: NATIVE_CAMPAIGN_REGISTER_QUERY,
+        variables: { sessionId: 'crew', token: 'private-device-token' },
+      })
+    ).json();
+    expect(denied).toEqual({ errors: [{ message: 'APNs registration is disabled in local screenshot replay' }] });
+    expect(upstream.graphqlRequests).toHaveLength(upstreamCount);
+    expect(logLines.join('\n')).not.toContain('private-device-token');
+    const manifest = readScreenshotFixtureManifest(fixturesDir)!;
+    writeFileSync(join(fixturesDir, manifest.graphql[0].file), 'corrupt');
+    await postGraphql(nativeRequest);
+    expect(hasLine('unreadable-fixture')).toBe(true);
+  });
+
+  it('prepares a portable photo and replays exact bytes over HTTP and WebSocket on a new port', async () => {
+    const wallUuid = '00000000-0000-4000-8000-000000000047';
+    const photoObjectPath = `/spray-walls/${wallUuid}/00000000-0000-4000-8000-000000000048.jpg`;
+    const photoBytes = await sharp({ create: { width: 3, height: 2, channels: 3, background: '#123456' } })
+      .png()
+      .toBuffer();
+    const photo = {
+      url: `https://bucket.r2.cloudflarestorage.com${photoObjectPath}?X-Amz-Signature=private`,
+      expiresAt: '2026-09-08T10:00:00Z',
+      width: 3,
+      height: 2,
+    };
+    const request = {
+      operationName: 'GetSprayWallRenderData',
+      query: 'query GetSprayWallRenderData($uuid: ID!) { sprayWallRenderData(uuid: $uuid) { photo { url } } }',
+      variables: { uuid: wallUuid },
+    };
+    await start({ mode: 'record', fresh: true });
+    const recordedOrigin = backendOrigin;
+    upstream.nextGraphqlResponse = {
+      status: 200,
+      body: { data: { sprayWallRenderData: { photo, wall: { uuid: wallUuid, currentVersion: { photo } } } } },
+    };
+    await postGraphql(request);
+    await stop();
+    const recordingDir = fixturesDir;
+    const candidateDir = join(recordingDir, 'candidate');
+    const download: typeof fetch = async () => new Response(new Uint8Array(photoBytes));
+    await expect(prepareIosCampaignFixtures(recordingDir, candidateDir, 'wrong-wall', 47, download)).rejects.toThrow(
+      'Uncaptured signed photo URL',
+    );
+    await prepareIosCampaignFixtures(recordingDir, candidateDir, wallUuid, 47, download);
+    fixturesDir = candidateDir;
+    try {
+      await start({ mode: 'replay' });
+      expect(backendOrigin).not.toBe(recordedOrigin);
+      const response = (await (await postGraphql(request)).json()) as {
+        data: { sprayWallRenderData: { photo: { url: string } } };
+      };
+      const photoUrl = response.data.sprayWallRenderData.photo.url;
+      expect(new URL(photoUrl).port).toBe(new URL(backendOrigin).port);
+      expect(new URL(photoUrl).pathname.endsWith(photoObjectPath)).toBe(true);
+      expect(photoUrl).not.toContain('Signature');
+      const bytes = await fetch(photoUrl);
+      expect(bytes.headers.get('content-type')).toContain('image/png');
+      expect(Buffer.from(await bytes.arrayBuffer())).toEqual(photoBytes);
+      const socket = await openGraphqlSocket();
+      try {
+        const frames = await socket.exchange({ type: 'subscribe', id: 'photo', payload: request });
+        expect(frames[0]).toMatchObject({ type: 'next', payload: response });
+      } finally {
+        await socket.close();
+      }
+      await stop();
+      const manifest = readScreenshotFixtureManifest(candidateDir)!;
+      writeFileSync(join(candidateDir, 'manifest.json'), JSON.stringify({ ...manifest, static: [] }));
+      await expect(start({ mode: 'replay' })).rejects.toThrow(
+        'invalid or unbundled reserved screenshot asset reference',
+      );
+    } finally {
+      await stop();
+      fixturesDir = recordingDir;
+    }
+  });
+
+  describe('count pagination replay compatibility', () => {
+    const input = {
+      boardName: 'spray',
+      layoutId: 720,
+      sizeId: 720,
+      setIds: '1',
+      angle: 35,
+      boardUuid: 'owned-spray-board',
+      userId: ACCOUNT_USER_ID,
+      minGrade: 10,
+      maxGrade: 20,
+      onlyOwned: true,
+    };
+    const request = (variables: unknown, query = SEARCH_CLIMBS_COUNT) => ({
+      operationName: 'SearchClimbsCount',
+      query,
+      variables,
+    });
+    const recordCount = async (variables: unknown, count: unknown, errors?: unknown) => {
+      const response = { data: { searchClimbs: { totalCount: count } }, ...(errors === undefined ? {} : { errors }) };
+      upstream.nextGraphqlResponse = { status: 200, body: response };
+      await postGraphql(request(variables));
+      return response;
+    };
+
+    it.each([0, 7])('replays genuine count %i across pagination changes without rewriting fixtures', async (count) => {
+      await start({ mode: 'record', fresh: true });
+      const response = await recordCount({ input: { ...input, page: 0, pageSize: 1 } }, count);
+      await stop();
+      const originals = new Map(
+        listFixtureFiles(fixturesDir).map((file) => [file, readFileSync(join(fixturesDir, file))]),
+      );
+      const upstreamRequests = upstream.graphqlRequests.length;
+      await start({ mode: 'replay' });
+      for (const countInput of [input, { ...input, page: 2, pageSize: 50 }, { ...input, pageSize: 25 }]) {
+        expect(await (await postGraphql(request({ input: countInput }))).json()).toEqual(response);
+      }
+      expect(upstream.graphqlRequests).toHaveLength(upstreamRequests);
+      expect(backend?.stats().misses).toBe(0);
+      expect(backend?.stats().hits).toBe(3);
+      expect(listFixtureFiles(fixturesDir).sort()).toEqual([...originals.keys()].sort());
+      for (const [file, bytes] of originals) expect(readFileSync(join(fixturesDir, file))).toEqual(bytes);
+    });
+
+    it('keeps exact recordings first and rejects contradictory paginated counts', async () => {
+      await start({ mode: 'record', fresh: true });
+      const firstVariables = { input: { ...input, page: 0, pageSize: 1 } };
+      const secondVariables = { input: { ...input, page: 1, pageSize: 1 } };
+      const firstResponse = await recordCount(firstVariables, 7);
+      const secondResponse = await recordCount(secondVariables, 8);
+      await stop();
+      await start({ mode: 'replay' });
+      expect(await (await postGraphql(request(firstVariables))).json()).toEqual(firstResponse);
+      expect(await (await postGraphql(request(secondVariables))).json()).toEqual(secondResponse);
+      expect(await (await postGraphql(request({ input }))).json()).toHaveProperty('errors');
+      expect(hasLine('MISS graphql SearchClimbsCount')).toBe(true);
+    });
+
+    it('accepts matching genuine counts and rejects all filter, board, angle and privacy drift', async () => {
+      await start({ mode: 'record', fresh: true });
+      const response = await recordCount({ input: { ...input, page: 0, pageSize: 1 } }, 7);
+      await recordCount({ input: { ...input, page: 1, pageSize: 50 } }, 7);
+      await stop();
+      await start({ mode: 'replay' });
+      expect(await (await postGraphql(request({ input }))).json()).toEqual(response);
+      for (const change of [
+        { minGrade: 11 },
+        { maxGrade: 21 },
+        { boardName: 'kilter' },
+        { layoutId: 721 },
+        { sizeId: 721 },
+        { setIds: '2' },
+        { boardUuid: 'other-board' },
+        { angle: 40 },
+        { userId: 'other-climber' },
+        { onlyOwned: false },
+        { searchQuery: 'different blocks' },
+      ]) {
+        expect(await (await postGraphql(request({ input: { ...input, ...change } }))).json()).toHaveProperty('errors');
+      }
+      expect(await (await postGraphql(request({ input, privacy: 'different' }))).json()).toHaveProperty('errors');
+      expect(
+        await (
+          await postGraphql(request({ input }, SEARCH_CLIMBS_COUNT.replace('totalCount', 'totalCount hasMore')))
+        ).json(),
+      ).toHaveProperty('errors');
+      expect(await (await postGraphql({ ...request({ input }), operationName: 'SearchClimbs' })).json()).toHaveProperty(
+        'errors',
+      );
+    });
+
+    it.each([-1, 1.5, '7', null])('rejects an invalid recorded count %j', async (count) => {
+      await start({ mode: 'record', fresh: true });
+      await recordCount({ input: { ...input, page: 0, pageSize: 1 } }, count);
+      await stop();
+      await start({ mode: 'replay' });
+      expect(await (await postGraphql(request({ input }))).json()).toHaveProperty('errors');
+    });
+
+    it('rejects an error-bearing candidate even when another count agrees', async () => {
+      await start({ mode: 'record', fresh: true });
+      await recordCount({ input: { ...input, page: 0, pageSize: 1 } }, 7);
+      await recordCount({ input: { ...input, page: 1, pageSize: 1 } }, 7, [{ message: 'Private wall unavailable' }]);
+      await stop();
+      await start({ mode: 'replay' });
+      expect(await (await postGraphql(request({ input }))).json()).toHaveProperty('errors');
+    });
+
+    it('rejects count fixture bytes whose input no longer matches the recorded key', async () => {
+      await start({ mode: 'record', fresh: true });
+      await recordCount({ input: { ...input, page: 0, pageSize: 1 } }, 7);
+      await stop();
+      const entry = readScreenshotFixtureManifest(fixturesDir)!.graphql[0];
+      const path = join(fixturesDir, entry.file);
+      const fixture = JSON.parse(readFileSync(path, 'utf8'));
+      fixture.variables.input.pageSize = 99;
+      writeFileSync(path, JSON.stringify(fixture));
+      await start({ mode: 'replay' });
+      expect(await (await postGraphql(request({ input }))).json()).toHaveProperty('errors');
+    });
+  });
+
+  it('replays the known nullable spray field without changing old recording bytes or hiding other drift', async () => {
+    const oldQuery = 'query GetBoard { board { uuid boardType } }';
+    const newQuery =
+      'query GetBoard { board { sprayImport { wallUuid versionId detectionId stage queuePosition retryAt resetOfWallUuid } uuid boardType } }';
+    const responseBody = { data: { board: { uuid: 'catalog-board', boardType: 'kilter' } } };
+    await start({ mode: 'record', fresh: true });
+    upstream.nextGraphqlResponse = { status: 200, body: responseBody };
+    await postGraphql({ operationName: 'GetBoard', query: oldQuery, variables: {} });
+    await stop();
+    const entry = readScreenshotFixtureManifest(fixturesDir)!.graphql[0];
+    const before = readFileSync(join(fixturesDir, entry.file), 'utf8');
+    await start({ mode: 'replay' });
+    expect(await (await postGraphql({ operationName: 'GetBoard', query: oldQuery, variables: {} })).json()).toEqual(
+      responseBody,
+    );
+    expect(await (await postGraphql({ operationName: 'GetBoard', query: newQuery, variables: {} })).json()).toEqual({
+      data: { board: { ...responseBody.data.board, sprayImport: null } },
+    });
+    expect(await (await postGraphql({ operationName: 'GetBoard', query: oldQuery, variables: {} })).json()).toEqual(
+      responseBody,
+    );
+    await postGraphql({
+      operationName: 'GetBoard',
+      query: newQuery.replace('uuid boardType', 'uuid boardType name'),
+      variables: {},
+    });
+    expect(hasLine('reason=document-changed')).toBe(true);
+    expect(readFileSync(join(fixturesDir, entry.file), 'utf8')).toBe(before);
+  });
+
+  it('replays GetSession’s isPermanent only from the same set’s JoinSession reply for that session (#6591)', async () => {
+    const oldQuery = 'query GetSession($sessionId: ID!) { session(sessionId: $sessionId) { id name isPublic } }';
+    const newQuery = oldQuery.replace('isPublic', 'isPublic isPermanent');
+    const joinQuery =
+      'mutation JoinSession($sessionId: ID!, $boardPath: String!) { joinSession(sessionId: $sessionId, boardPath: $boardPath) { id isPermanent } }';
+    const crew = { id: 'crew-session', name: 'Kilter crew', isPublic: false };
+    const solo = { id: 'solo-session', name: 'Solo', isPublic: false };
+    await start({ mode: 'record', fresh: true });
+    upstream.nextGraphqlResponse = { status: 200, body: { data: { session: crew } } };
+    await postGraphql({ operationName: 'GetSession', query: oldQuery, variables: { sessionId: crew.id } });
+    upstream.nextGraphqlResponse = { status: 200, body: { data: { session: solo } } };
+    await postGraphql({ operationName: 'GetSession', query: oldQuery, variables: { sessionId: solo.id } });
+    upstream.nextGraphqlResponse = { status: 200, body: { data: { joinSession: { id: crew.id, isPermanent: true } } } };
+    await postGraphql({
+      operationName: 'JoinSession',
+      query: joinQuery,
+      variables: { sessionId: crew.id, boardPath: 'kilter/8/25/26/40' },
+    });
+    await stop();
+    const manifest = readScreenshotFixtureManifest(fixturesDir)!;
+    expect(manifest.graphql.map((recorded) => recorded.operationName).sort()).toEqual([
+      'GetSession',
+      'GetSession',
+      'JoinSession',
+    ]);
+    const before = manifest.graphql.map((recorded) => readFileSync(join(fixturesDir, recorded.file), 'utf8'));
+    await start({ mode: 'replay' });
+
+    const crewReply = await postGraphql({
+      operationName: 'GetSession',
+      query: newQuery,
+      variables: { sessionId: crew.id },
+    });
+    expect(await crewReply.json()).toEqual({ data: { session: { ...crew, isPermanent: true } } });
+    expect(hasLine('reason=document-changed')).toBe(false);
+
+    // No JoinSession reply recorded this session's permanence: still a miss.
+    const soloReply = await postGraphql({
+      operationName: 'GetSession',
+      query: newQuery,
+      variables: { sessionId: solo.id },
+    });
+    expect(await soloReply.json()).toMatchObject({ errors: [{ extensions: { code: 'SCREENSHOT_FIXTURE_MISS' } }] });
+    expect(hasLine('reason=document-changed')).toBe(true);
+    expect(manifest.graphql.map((recorded) => readFileSync(join(fixturesDir, recorded.file), 'utf8'))).toEqual(before);
+  });
+
   describe('record mode', () => {
+    const profileQuery = 'query GetProfile { profile { id email displayName avatarUrl } }';
+    const profileBody = {
+      data: {
+        profile: {
+          id: ACCOUNT_USER_ID,
+          email: ACCOUNT_EMAIL,
+          displayName: 'Test User',
+          avatarUrl: 'https://cdn/own.jpg',
+        },
+      },
+    };
+
+    it('binds a cached native session from its upstream authenticated profile before persisting it', async () => {
+      await start({ mode: 'record', fresh: true });
+      upstream.nextGraphqlResponse = { status: 200, body: profileBody };
+      await postGraphql({ operationName: 'GetProfile', query: profileQuery });
+      await stop();
+      const manifest = readScreenshotFixtureManifest(fixturesDir);
+      expect(manifest).toMatchObject({ accountUserId: ACCOUNT_USER_ID, accountEmail: ACCOUNT_EMAIL });
+      const contents = readFileSync(join(fixturesDir, manifest!.graphql[0].file), 'utf8');
+      expect(contents).toContain('Test User');
+      expect(contents).toContain('https://cdn/own.jpg');
+      expect(contents).not.toContain(UPSTREAM_JWT);
+      expect(contents).not.toContain(UPSTREAM_JWT_PAYLOAD);
+    });
+
+    it.each([
+      ['public alias', 'query GetProfile { profile: publicProfile(userId: "other") { id email } }', profileBody],
+      ['email alias', 'query GetProfile { profile { id email: displayName } }', profileBody],
+      ['id alias', 'query GetProfile { profile { id: displayName email } }', profileBody],
+      ['mismatched subject', profileQuery, { data: { profile: { id: 'another-account', email: ACCOUNT_EMAIL } } }],
+      ['partial error', profileQuery, { ...profileBody, errors: [{ message: 'unavailable' }] }],
+      ['missing email', profileQuery, { data: { profile: { id: ACCOUNT_USER_ID } } }],
+    ])('does not bind cached account metadata from %s', async (_description, query, body) => {
+      await start({ mode: 'record', fresh: true });
+      upstream.nextGraphqlResponse = { status: 200, body };
+      await postGraphql({ operationName: 'GetProfile', query });
+      await stop();
+      expect(readScreenshotFixtureManifest(fixturesDir)).toMatchObject({ accountUserId: '', accountEmail: '' });
+    });
+
+    it('refuses to mix a second cached account into an established recording', async () => {
+      await start({ mode: 'record', fresh: true });
+      upstream.nextGraphqlResponse = { status: 200, body: profileBody };
+      await postGraphql({ operationName: 'GetProfile', query: profileQuery });
+      const secondId = 'aaaa1111-2222-3333-4444-555555555555';
+      const secondToken = `header.${base64Url(JSON.stringify({ sub: secondId }))}.signature`;
+      upstream.nextGraphqlResponse = {
+        status: 200,
+        body: { data: { profile: { id: secondId, email: 'second@example.com' } } },
+      };
+      await fetch(`${backendOrigin}/graphql`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${secondToken}` },
+        body: JSON.stringify({ operationName: 'GetProfile', query: profileQuery }),
+      });
+      await stop();
+      expect(readScreenshotFixtureManifest(fixturesDir)).toMatchObject({
+        accountUserId: ACCOUNT_USER_ID,
+        accountEmail: ACCOUNT_EMAIL,
+      });
+      expect(hasLine('recording-account-mismatch')).toBe(true);
+      expect(
+        listFixtureFiles(fixturesDir).some((file) =>
+          readFileSync(join(fixturesDir, file), 'utf8').includes('second@example.com'),
+        ),
+      ).toBe(false);
+    });
+
+    it('redacts a cached session token payload even without an auth proxy request', async () => {
+      await start({ mode: 'record', fresh: true });
+      upstream.nextGraphqlResponse = {
+        status: 200,
+        body: { data: { syncTicks: { documents: [{ note: UPSTREAM_JWT_PAYLOAD }] } } },
+      };
+      await postGraphql({ operationName: 'SyncTicks', query: SYNC_TICKS_QUERY });
+      await stop();
+      expect(hasLine('REDACTED graphql SyncTicks')).toBe(true);
+      expect(listFixtureFiles(fixturesDir).filter((file) => file.startsWith('graphql/'))).toHaveLength(0);
+    });
+
+    it('rejects second-account data before a profile request or upstream call', async () => {
+      await start({ mode: 'record', fresh: true });
+      upstream.nextGraphqlResponse = { status: 200, body: profileBody };
+      await postGraphql({ operationName: 'GetProfile', query: profileQuery });
+      const before = upstream.graphqlRequests.length;
+      const secondToken = `header.${base64Url(JSON.stringify({ sub: 'second-account' }))}.signature`;
+      const response = await fetch(`${backendOrigin}/graphql`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${secondToken}` },
+        body: JSON.stringify({ operationName: 'SyncTicks', query: SYNC_TICKS_QUERY }),
+      });
+      expect(await response.json()).toHaveProperty('errors');
+      await stop();
+      expect(upstream.graphqlRequests).toHaveLength(before);
+      expect(readScreenshotFixtureManifest(fixturesDir)?.graphql.map((entry) => entry.operationName)).toEqual([
+        'GetProfile',
+      ]);
+      expect(hasLine('recording-account-mismatch')).toBe(true);
+    });
+
+    it('keeps a cached identity when the auth proxy signs in another account', async () => {
+      await start({ mode: 'record', fresh: true });
+      const secondId = 'aaaa1111-2222-3333-4444-555555555555';
+      const secondToken = `header.${base64Url(JSON.stringify({ sub: secondId }))}.signature`;
+      upstream.nextGraphqlResponse = {
+        status: 200,
+        body: { data: { profile: { id: secondId, email: 'second@example.com' } } },
+      };
+      await fetch(`${backendOrigin}/graphql`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${secondToken}` },
+        body: JSON.stringify({ operationName: 'GetProfile', query: profileQuery }),
+      });
+      await fetch(`${backendOrigin}/auth/native/credentials`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email: ACCOUNT_EMAIL, password: 'hunter2' }),
+      });
+      await stop();
+      expect(readScreenshotFixtureManifest(fixturesDir)).toMatchObject({
+        accountUserId: secondId,
+        accountEmail: 'second@example.com',
+      });
+      expect(hasLine('NativeAuth')).toBe(true);
+      expect(hasLine('recording-account-mismatch')).toBe(true);
+    });
+
+    it('refuses another profile while a cached subject is in flight without trusting either identity', async () => {
+      await start({ mode: 'record', fresh: true });
+      let releaseResponse!: () => void;
+      upstream.nextGraphqlBarrier = new Promise<void>((resolve) => {
+        releaseResponse = resolve;
+      });
+      const secondToken = `header.${base64Url(JSON.stringify({ sub: 'second-account' }))}.signature`;
+      const pending = fetch(`${backendOrigin}/graphql`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${secondToken}` },
+        body: JSON.stringify({ operationName: 'SyncTicks', query: SYNC_TICKS_QUERY }),
+      });
+      try {
+        await expect.poll(() => upstream.graphqlRequests.length).toBe(1);
+        upstream.nextGraphqlResponse = { status: 200, body: profileBody };
+        const profileResponse = await postGraphql({ operationName: 'GetProfile', query: profileQuery });
+        expect(await profileResponse.json()).toHaveProperty('errors');
+      } finally {
+        releaseResponse();
+        await pending;
+      }
+      await stop();
+      expect(readScreenshotFixtureManifest(fixturesDir)).toMatchObject({ accountUserId: '', accountEmail: '' });
+      expect(readScreenshotFixtureManifest(fixturesDir)?.graphql.map((entry) => entry.operationName)).toEqual([
+        'SyncTicks',
+      ]);
+      expect(hasLine('recording-account-mismatch')).toBe(true);
+    });
+
+    it('refuses mixed bearer subjects even when neither account requests its profile', async () => {
+      await start({ mode: 'record', fresh: true });
+      await postGraphql({ operationName: 'SyncTicks', query: SYNC_TICKS_QUERY });
+      const before = upstream.graphqlRequests.length;
+      const response = await fetch(`${backendOrigin}/graphql`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer header.${base64Url(JSON.stringify({ sub: 'another-account' }))}.signature`,
+        },
+        body: JSON.stringify({
+          operationName: 'SyncTicks',
+          query: SYNC_TICKS_QUERY,
+          variables: { cursor: { different: true } },
+        }),
+      });
+      expect(await response.json()).toHaveProperty('errors');
+      await stop();
+      expect(upstream.graphqlRequests).toHaveLength(before);
+      expect(readScreenshotFixtureManifest(fixturesDir)).toMatchObject({ accountUserId: '', accountEmail: '' });
+      expect(readScreenshotFixtureManifest(fixturesDir)?.graphql).toHaveLength(1);
+      expect(hasLine('recording-account-mismatch')).toBe(true);
+    });
+
     it('records a graphql response, an auth proxy and a redirected asset without persisting a token', async () => {
       await start({ mode: 'record', fresh: true });
 
@@ -809,6 +1429,10 @@ describe('screenshot backend', () => {
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({
         mode: 'replay',
+        processInstanceId: expect.any(String),
+        fixtureManifestSHA256: createHash('sha256')
+          .update(readFileSync(join(fixturesDir, 'manifest.json')))
+          .digest('hex'),
         hits: 1,
         misses: 1,
         recorded: 0,
@@ -816,42 +1440,65 @@ describe('screenshot backend', () => {
       });
     });
 
-    it('acks a graphql-ws handshake, pongs a ping, and stays silent on a subscribe', async () => {
-      const socket = new WebSocket(`${backendOrigin.replace('http://', 'ws://')}/graphql`, 'graphql-transport-ws');
-      const received: Array<Record<string, unknown>> = [];
-      await new Promise<void>((resolve, reject) => {
-        socket.on('open', () => resolve());
-        socket.on('error', reject);
+    it('reports the loaded manifest identity when the file changes after startup', async () => {
+      const manifestPath = join(fixturesDir, 'manifest.json');
+      const loadedManifestBytes = readFileSync(manifestPath);
+      writeFileSync(manifestPath, Buffer.concat([loadedManifestBytes, Buffer.from('\n')]));
+      const response = await fetch(`${backendOrigin}/__screenshot-backend/status`);
+      expect(await response.json()).toMatchObject({
+        fixtureManifestSHA256: createHash('sha256').update(loadedManifestBytes).digest('hex'),
       });
-      socket.on('message', (frame) =>
-        received.push(JSON.parse(Buffer.from(frame as Buffer).toString('utf8')) as Record<string, unknown>),
-      );
-
-      socket.send(JSON.stringify({ type: 'connection_init' }));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(received).toEqual([{ type: 'connection_ack' }]);
-
-      socket.send(JSON.stringify({ type: 'ping' }));
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      expect(received[1]).toEqual({ type: 'pong' });
-
-      socket.send(
-        JSON.stringify({
-          id: '1',
-          type: 'subscribe',
-          payload: { operationName: 'ClimbStatsUpdated', query: 'subscription ClimbStatsUpdated { ok }' },
-        }),
-      );
-      await new Promise((resolve) => setTimeout(resolve, 200));
-      // Silence is the contract: the store screens render fine when the
-      // subscription never emits, so an inert socket is the right fixture.
-      expect(received).toHaveLength(2);
-      expect(socket.readyState).toBe(WebSocket.OPEN);
-      expect(hasLine('WS connection_init ack')).toBe(true);
-      expect(hasLine('WS subscribe ClimbStatsUpdated')).toBe(true);
-      expect(backend?.stats().misses).toBe(0);
-      socket.close();
     });
+
+    it('changes its process identity when a replay instance restarts', async () => {
+      const originalIdentity = backend?.stats().processInstanceId;
+      expect(originalIdentity).toMatch(/^[0-9a-f-]{36}$/);
+      expect(backend?.stats().processInstanceId).toBe(originalIdentity);
+      await stop();
+      await start({ mode: 'replay' });
+      expect(backend?.stats().processInstanceId).not.toBe(originalIdentity);
+    });
+
+    it.each(['ClimbStatsUpdated', 'AppBugReportChanged'])(
+      'acks a graphql-ws handshake, pongs a ping, and stays silent on %s',
+      async (operationName) => {
+        const subscriptionQuery = `subscription ${operationName} { ok }`;
+        const socket = new WebSocket(`${backendOrigin.replace('http://', 'ws://')}/graphql`, 'graphql-transport-ws');
+        const received: Array<Record<string, unknown>> = [];
+        await new Promise<void>((resolve, reject) => {
+          socket.on('open', () => resolve());
+          socket.on('error', reject);
+        });
+        socket.on('message', (frame) =>
+          received.push(JSON.parse(Buffer.from(frame as Buffer).toString('utf8')) as Record<string, unknown>),
+        );
+
+        socket.send(JSON.stringify({ type: 'connection_init' }));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(received).toEqual([{ type: 'connection_ack' }]);
+
+        socket.send(JSON.stringify({ type: 'ping' }));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(received[1]).toEqual({ type: 'pong' });
+
+        socket.send(
+          JSON.stringify({
+            id: '1',
+            type: 'subscribe',
+            payload: { operationName, query: subscriptionQuery },
+          }),
+        );
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        // Silence is the contract: the store screens render fine when the
+        // subscription never emits, so an inert socket is the right fixture.
+        expect(received).toHaveLength(2);
+        expect(socket.readyState).toBe(WebSocket.OPEN);
+        expect(hasLine('WS connection_init ack')).toBe(true);
+        expect(hasLine(`WS subscribe ${operationName}`)).toBe(true);
+        expect(backend?.stats().misses).toBe(0);
+        socket.close();
+      },
+    );
 
     describe('WebSocket fixture replay', () => {
       const joinRequest = {
@@ -1015,18 +1662,70 @@ describe('screenshot backend', () => {
         await client.close();
       });
 
-      it('does not hide a required subscription behind a passive operation name', async () => {
+      it.each(['ClimbStatsUpdated', 'AppBugReportChanged'])(
+        'does not hide a required subscription behind the passive %s name',
+        async (operationName) => {
+          const client = await openGraphqlSocket();
+          const frames = await client.exchange({
+            id: 'mismatch',
+            type: 'subscribe',
+            payload: { ...queueRequest, operationName },
+          });
+          expect(frames[0]).toMatchObject({
+            type: 'next',
+            payload: { errors: [{ extensions: { code: 'SCREENSHOT_FIXTURE_MISS' } }] },
+          });
+          expect(backend?.stats().misses).toBe(1);
+          await client.close();
+        },
+      );
+
+      const privacyRequest = { query: 'subscription PrivacyChanged { privacyChanged }', variables: {} };
+
+      // The app no longer subscribes to PrivacyChanged, so even the exact document
+      // gets no special treatment when it has no recording.
+      it.each([
+        privacyRequest,
+        { ...privacyRequest, variables: undefined },
+        { ...privacyRequest, query: 'query PrivacyChanged { privacyChanged }' },
+        { ...privacyRequest, query: 'subscription PrivacyChanged { changed: privacyChanged }' },
+        { ...privacyRequest, query: 'subscription PrivacyChanged { privacyChanged otherField }' },
+        { ...privacyRequest, variables: { changed: true } },
+        { ...queueRequest, operationName: 'PrivacyChanged' },
+      ])('treats an unrecorded privacy stream as a fixture miss: %j', async (payload) => {
         const client = await openGraphqlSocket();
-        const frames = await client.exchange({
-          id: 'mismatch',
-          type: 'subscribe',
-          payload: { ...queueRequest, operationName: 'ClimbStatsUpdated' },
-        });
-        expect(frames[0]).toMatchObject({
+        expect((await client.exchange({ id: 'privacy-drift', type: 'subscribe', payload }))[0]).toMatchObject({
           type: 'next',
           payload: { errors: [{ extensions: { code: 'SCREENSHOT_FIXTURE_MISS' } }] },
         });
         expect(backend?.stats().misses).toBe(1);
+        await client.close();
+      });
+
+      it('replays recorded privacy events and refuses document or variable drift', async () => {
+        const response = { data: { privacyChanged: true } };
+        await stop();
+        await start({ mode: 'record' });
+        upstream.nextGraphqlResponse = { status: 200, body: response };
+        await postGraphql(privacyRequest);
+        await stop();
+        await start({ mode: 'replay' });
+        const client = await openGraphqlSocket();
+        expect(await client.exchange({ id: 'privacy-recorded', type: 'subscribe', payload: privacyRequest })).toEqual([
+          { id: 'privacy-recorded', type: 'next', payload: response },
+        ]);
+        for (const [index, payload] of [
+          { ...privacyRequest, query: 'subscription PrivacyChanged { changed: privacyChanged }' },
+          { ...privacyRequest, variables: { changed: true } },
+        ].entries()) {
+          expect(
+            (await client.exchange({ id: `privacy-drift-${index}`, type: 'subscribe', payload }))[0],
+          ).toMatchObject({
+            type: 'next',
+            payload: { errors: [{ extensions: { code: 'SCREENSHOT_FIXTURE_MISS' } }] },
+          });
+        }
+        expect(backend?.stats()).toMatchObject({ hits: 1, misses: 2 });
         await client.close();
       });
 
@@ -1235,15 +1934,67 @@ describe('screenshot backend', () => {
       expect(note).toContain('ClimbStatsForClimbs answered 1 batch(es) with 1 uncovered id(s)');
     });
 
-    it('still misses when NOT ONE requested id was recorded — that is an uncaptured screen', async () => {
+    it('answers an empty list when NOT ONE requested id was recorded under a recorded scope', async () => {
+      // Which chunk an uncovered id lands in is flush timing, so a chunk made
+      // only of them must answer like any other batch (Android run 37258958437).
+      await replayBatch('kilter', ['climb-a']);
+      const hitsBefore = backend?.stats().hits ?? 0;
       const response = await replayBatch('kilter', ['climb-y', 'climb-z']);
       expect(response.status).toBe(200);
+      expect(await rowsOf(response)).toEqual([]);
+      expect(hasLine('composed=0 uncovered=2 ids=climb-y,climb-z')).toBe(true);
+      // Answered, but with no recorded id behind it: not a hit.
+      expect(backend?.stats().hits).toBe(hitsBefore);
+      // Tolerated because another batch of the operation WAS covered.
+      expect(findScreenshotBackendProblems(logLines.join('\n'), { mode: 'replay' })).toEqual([]);
+      const [note] = findScreenshotBackendNotes(logLines.join('\n'));
+      expect(note).toContain('1 of them with no recorded id at all');
+    });
+
+    it('fails the capture when no batch of the operation was covered at all', async () => {
+      await replayBatch('kilter', ['climb-y', 'climb-z']);
+      const problems = findScreenshotBackendProblems(logLines.join('\n'), { mode: 'replay' });
+      expect(problems.some((problem) => problem.includes('ClimbStatsForClimbs was asked for 1 batch(es)'))).toBe(true);
+    });
+
+    it('still misses a scope nothing was recorded under', async () => {
+      // No moonboard batch was ever recorded: that is a board the recording
+      // never reached, not draw distance, so nothing is composed for it.
+      const response = await replayBatch('moonboard', ['climb-a']);
+      expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({ errors: [{ extensions: { code: 'SCREENSHOT_FIXTURE_MISS' } }] });
-      expect(hasLine('reason=unrecorded-ids ids=climb-y,climb-z')).toBe(true);
+      expect(hasLine('MISS graphql ClimbStatsForClimbs')).toBe(true);
+      expect(hasLine('reason=no-fixture')).toBe(true);
       const [problem] = findScreenshotBackendProblems(logLines.join('\n'), { mode: 'replay' });
-      expect(problem).toContain('ClimbStatsForClimbs asked for a batch where NO id was recorded: climb-y, climb-z');
-      expect(problem).toContain('"boardName":"kilter"');
+      expect(problem).toContain('no recorded response for ClimbStatsForClimbs');
+      expect(problem).toContain('"boardName":"moonboard"');
       expect(problem).toContain(RE_RECORD_COMMAND);
+    });
+
+    it('composes a response list of bare ids, for an operation whose items are the ids themselves', async () => {
+      const favoritesQuery =
+        'query Favorites($boardName: String!, $climbUuids: [String!]!, $angle: Int!) {\n' +
+        '  favorites(boardName: $boardName, climbUuids: $climbUuids, angle: $angle)\n}';
+      const favorites = (climbUuids: string[]): Promise<Response> =>
+        postGraphql({
+          operationName: 'Favorites',
+          query: favoritesQuery,
+          variables: { boardName: 'kilter', climbUuids, angle: 40 },
+        });
+      await stop();
+      await start({ mode: 'record' });
+      upstream.nextGraphqlResponse = { status: 200, body: { data: { favorites: ['climb-a'] } } };
+      await favorites(['climb-a', 'climb-b']);
+      upstream.nextGraphqlResponse = { status: 200, body: { data: { favorites: ['climb-d'] } } };
+      await favorites(['climb-c', 'climb-d']);
+      await stop();
+      await start({ mode: 'replay' });
+
+      const response = await favorites(['climb-d', 'climb-b', 'climb-a']);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ data: { favorites: ['climb-d', 'climb-a'] } });
+      expect(hasLine('HIT graphql Favorites')).toBe(true);
+      expect(hasLine('composed=3')).toBe(true);
     });
 
     it('counts a composed hit as a graphql hit for the problem scanner', async () => {
@@ -1251,6 +2002,63 @@ describe('screenshot backend', () => {
       // A composed answer is the only graphql traffic here, so the "app never
       // reached the replay backend" check must be satisfied by it alone.
       expect(findScreenshotBackendProblems(logLines.join('\n'), { mode: 'replay' })).toEqual([]);
+    });
+  });
+
+  // An operation the recorded set holds nothing for may carry a declared
+  // answer — see REPLAY_DEFAULT_RESPONSES in scripts/lib/screenshot-fixtures.ts.
+  describe('replay defaults', () => {
+    const ADMIN_FLAG_QUERY = 'query ProfileAdminFlag {\n  profile {\n    id\n    isAdmin\n  }\n}';
+    const adminFlag = (): Promise<Response> =>
+      postGraphql({ operationName: 'ProfileAdminFlag', query: ADMIN_FLAG_QUERY, variables: {} });
+
+    const recordSomethingElse = async (): Promise<void> => {
+      upstream.nextGraphqlResponse = { status: 200, body: { data: { me: { id: 'user-1' } } } };
+      await postGraphql({ operationName: 'Me', query: 'query Me { me { id } }', variables: {} });
+    };
+
+    it('answers an operation with no fixture at all from its declared default, and says so', async () => {
+      await start({ mode: 'record', fresh: true });
+      await recordSomethingElse();
+      await stop();
+      await start({ mode: 'replay' });
+
+      const response = await adminFlag();
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual(REPLAY_DEFAULT_RESPONSES.ProfileAdminFlag.response);
+      expect(hasLine('DEFAULT graphql ProfileAdminFlag')).toBe(true);
+      expect(findScreenshotBackendNotes(logLines.join('\n'))).toEqual([
+        'ProfileAdminFlag has no recorded fixture; answered 1 request(s) with its replay default.',
+      ]);
+    });
+
+    it('replays the recorded answer once the operation has a fixture', async () => {
+      await start({ mode: 'record', fresh: true });
+      upstream.nextGraphqlResponse = {
+        status: 200,
+        body: { data: { profile: { id: 'user-1', isAdmin: true } } },
+      };
+      await adminFlag();
+      await stop();
+      await start({ mode: 'replay' });
+
+      expect(await (await adminFlag()).json()).toEqual({ data: { profile: { id: 'user-1', isAdmin: true } } });
+      expect(hasLine('DEFAULT graphql')).toBe(false);
+    });
+
+    it('misses an operation with no fixture and no declared default', async () => {
+      await start({ mode: 'record', fresh: true });
+      await recordSomethingElse();
+      await stop();
+      await start({ mode: 'replay' });
+
+      const response = await postGraphql({
+        operationName: 'GetProfile',
+        query: 'query GetProfile { profile { id } }',
+        variables: {},
+      });
+      expect(await response.json()).toMatchObject({ errors: [{ extensions: { code: 'SCREENSHOT_FIXTURE_MISS' } }] });
+      expect(hasLine('MISS graphql GetProfile')).toBe(true);
     });
   });
 
